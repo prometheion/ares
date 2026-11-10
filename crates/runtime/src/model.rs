@@ -148,6 +148,14 @@ pub struct DeviceContext<'a> {
     pub ledger: &'a mut Ledger,
     /// The most rows a step has.
     pub max_rows: u32,
+    /// The most sequences at once: slots of state that is kept per sequence.
+    pub max_slots: u32,
+    /// The pages of the pool and the cells of a page. The runtime has
+    /// reserved and allocated `pages` times the model's bytes per page.
+    pub pages: u32,
+    pub cells_per_page: u32,
+    /// Page-table entries per slot.
+    pub table_stride: u32,
 }
 
 /// What the runtime gives a device part to enqueue one step.
@@ -163,13 +171,14 @@ pub struct StepContext<'a> {
     /// The device copy of the record, uploaded on `stream` before the model
     /// is called.
     pub record_on_device: DevicePtr,
-    /// The sequences' page tables on this device, `table_stride` entries
-    /// (`u32` page numbers) per slot, updated from the record before the model
-    /// is called.
+    /// The sequences' page tables on this device, `table_stride` entries per
+    /// slot (a page number as [`Model::page_entry`] writes it), updated from
+    /// the record before the model is called.
     pub tables: DevicePtr,
     pub table_stride: u32,
-    /// The state pages on this device: page `p` is at `pages + p *
-    /// bytes_per_page`. Null when the model keeps no state in pages.
+    /// The memory of the state pages on this device: the pool's pages times
+    /// `bytes_per_page` bytes, which the model lays out (an array of pages per
+    /// part of its state). Null when the model keeps no state in pages.
     pub pages: DevicePtr,
     pub bytes_per_page: u64,
     /// The paths to the other devices.
@@ -179,7 +188,9 @@ pub struct StepContext<'a> {
 /// Where a device part left the logits of a step.
 #[derive(Clone, Copy, Debug)]
 pub struct Logits {
-    /// Row `r` of the step has its logits at `ptr + r * stride * 4`, as f32.
+    /// The `i`-th row whose logits are wanted (in the order of the record's
+    /// runs) has them at `ptr + i * stride * 4`, as f32. Rows nobody asked
+    /// for have none: a row of a real vocabulary is a megabyte.
     pub ptr: DevicePtr,
     /// Values per row.
     pub stride: u32,
@@ -195,7 +206,9 @@ pub trait DeviceModel: Send {
     /// before the first step.
     fn logits_per_row(&self) -> u32;
 
-    /// Enqueues the kernels of one step for all rows of `step` on its stream.
+    /// Enqueues the kernels of one step for all rows of `step` on its stream,
+    /// after the commit of the draft windows of the step before, whose
+    /// outcome the record carries.
     ///
     /// Must not wait for the device: not for a stream, an event or a copy.
     /// The order between devices is kept on the devices, through the links.
@@ -212,16 +225,18 @@ pub trait Model: Send + Sync + 'static {
     /// The number of tokens; picks are below it.
     fn vocab(&self) -> u32;
 
-    /// The token that ends a generation, if the model has one.
-    fn eos(&self) -> Option<u32>;
+    /// Whether `token` ends a generation.
+    fn ends(&self, token: u32) -> bool;
 
     /// The tokens of a prompt. Tokenizing is the model's business; refusing
     /// what it cannot tokenize is too.
     fn encode(&self, prompt: &Prompt) -> Result<Vec<u32>, EngineError>;
 
-    /// The text of a generated token, or `None` for a token that prints
-    /// nothing.
-    fn piece(&self, token: u32) -> Option<char>;
+    /// Appends the bytes of a generated token's text to `text`: nothing for
+    /// a token that prints nothing, and possibly a part of a character, which
+    /// the next tokens complete (the conductor holds bytes back until they
+    /// are whole characters).
+    fn piece(&self, token: u32, text: &mut Vec<u8>);
 
     /// What the host supplies per row besides sequence, position and token.
     fn context(&self) -> ContextSpec;
@@ -236,6 +251,21 @@ pub trait Model: Send + Sync + 'static {
 
     /// The most rows of one step the model's buffers hold.
     fn max_rows(&self) -> u32;
+
+    /// The most rows of one step whose logits can be wanted: every row of a
+    /// generating sequence (its newest token and its drafts) and the last
+    /// row of a prompt.
+    fn logit_rows(&self) -> u32;
+
+    /// The most rows of a step in which a sequence verifies drafts, or 0 for
+    /// a model that takes none. A model with recurrent state keeps the
+    /// inputs of such a step's rows until the next step commits the accepted
+    /// ones, so it bounds them.
+    fn draft_rows(&self) -> u32;
+
+    /// The page-table entry of pool page `page`, as the model's kernels read
+    /// it (a model may mark which of its pools a page is in).
+    fn page_entry(&self, page: u32) -> u32;
 
     /// The state the model keeps per position of a sequence, on each device,
     /// for pages of `cells_per_page` cells. The runtime reserves the pool's

@@ -56,7 +56,14 @@ pub fn delta_step(
 /// (`[cd][kk]`, the last `kk` inputs of every channel, oldest first), with the
 /// taps `taps` (`[cd][kk + 1]`, tap `kk` on the newest input). Returns `[n, cd]`.
 /// The sums are in `f64`.
-pub fn conv_silu(taps: &[f32], kk: usize, window: &[f32], qkv: &[f32], cd: usize, n: usize) -> Vec<f32> {
+pub fn conv_silu(
+    taps: &[f32],
+    kk: usize,
+    window: &[f32],
+    qkv: &[f32],
+    cd: usize,
+    n: usize,
+) -> Vec<f32> {
     let mut mixed = vec![0.0f32; n * cd];
     for ch in 0..cd {
         let tap = &taps[ch * (kk + 1)..(ch + 1) * (kk + 1)];

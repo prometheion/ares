@@ -3,6 +3,7 @@
 //! attention. The specification is `docs/reference/qwen35-architecture.md`.
 
 pub mod config;
+pub mod device;
 mod error;
 pub mod reference;
 pub mod weights;

@@ -51,6 +51,12 @@ impl<'g> Matrix<'g> {
         &self.data[row * size..(row + 1) * size]
     }
 
+    /// The stored bytes of the whole matrix, row after row: what a device
+    /// loader uploads.
+    pub fn bytes(&self) -> &'g [u8] {
+        self.data
+    }
+
     /// Decodes row `row` into `out` (`cols` values).
     ///
     /// # Panics

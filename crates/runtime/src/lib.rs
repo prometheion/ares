@@ -73,7 +73,7 @@ pub use model::{
     ContextSpec, DeviceContext, DeviceModel, LinkSpec, Logits, Model, ModelError, Split,
     StepContext,
 };
-pub use record::{RecordView, Row, TableUpdate};
+pub use record::{Commit, RecordFull, RecordView, RecordWriter, Row, TableUpdate};
 pub use sync::{WakeCounts, Woke};
 pub use synthetic::{SyntheticConfig, SyntheticModel};
 pub use text::{StopMatcher, printable, unprintable};

@@ -8,13 +8,27 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+ares-api = { path = "../api" }
 ares-core.workspace = true
+ares-cuda.workspace = true
 ares-gguf.workspace = true
 ares-quant = { path = "../quant" }
+ares-runtime = { path = "../runtime" }
+ares-state.workspace = true
+ares-tokenizer.workspace = true
 thiserror.workspace = true
 
-[dev-dependencies]
-ares-cuda.workspace = true
+[[example]]
+name = "q4synth"
+path = "tools/q4synth.rs"
+
+[[example]]
+name = "q4compare"
+path = "tools/q4compare.rs"
+
+[[example]]
+name = "q4trace"
+path = "tools/q4trace.rs"
 
 [lints]
 workspace = true

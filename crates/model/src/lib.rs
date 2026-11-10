@@ -5,3 +5,4 @@
 //! Only `qwen35` exists so far.
 
 pub mod qwen35;
+pub mod qwen4exp;

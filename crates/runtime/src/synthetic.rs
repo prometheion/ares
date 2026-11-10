@@ -376,8 +376,8 @@ impl Model for SyntheticModel {
         self.config.vocab()
     }
 
-    fn eos(&self) -> Option<u32> {
-        self.config.eos
+    fn ends(&self, token: u32) -> bool {
+        self.config.eos == Some(token)
     }
 
     /// One token per byte. A character of the model's own alphabet (what
@@ -397,8 +397,11 @@ impl Model for SyntheticModel {
         Ok(tokens)
     }
 
-    fn piece(&self, token: u32) -> Option<char> {
-        u8::try_from(token).ok().map(printable)
+    fn piece(&self, token: u32, text: &mut Vec<u8>) {
+        if let Ok(byte) = u8::try_from(token) {
+            let mut utf8 = [0u8; 4];
+            text.extend_from_slice(printable(byte).encode_utf8(&mut utf8).as_bytes());
+        }
     }
 
     fn context(&self) -> ContextSpec {
@@ -426,6 +429,20 @@ impl Model for SyntheticModel {
 
     fn max_rows(&self) -> u32 {
         self.config.max_rows
+    }
+
+    fn logit_rows(&self) -> u32 {
+        self.config.max_rows
+    }
+
+    /// The model has no state that a rejected row could spoil, so any step
+    /// may verify drafts.
+    fn draft_rows(&self) -> u32 {
+        self.config.max_rows
+    }
+
+    fn page_entry(&self, page: u32) -> u32 {
+        page
     }
 
     fn page_layout(&self, cells_per_page: u32) -> PageLayout {
@@ -697,40 +714,53 @@ impl SyntheticDevice {
         Ok(())
     }
 
-    /// Enqueues the final norm and the projection to this device's logits.
+    /// Enqueues the final norm and the projection to this device's logits
+    /// for the rows among `rows` whose logits are wanted. The logits of the
+    /// `i`-th wanted row of the step go to row `i` of the logits buffer.
     fn head(&self, cx: &StepContext<'_>, rows: std::ops::Range<u32>) -> Result<(), ModelError> {
         let (Some(head), Some(logits)) = (&self.head, &self.logits) else { return Ok(()) };
         let width = self.config.width;
-        // SAFETY: as in `block`; `logits` holds a row of `head.n_out` values per step row.
-        unsafe {
-            cx.kernels.rms_norm_f32(
-                cx.stream,
-                Self::at(&self.x, rows.start, width),
-                DevicePtr::NULL,
-                Self::at(&self.h, rows.start, width),
-                width,
-                rows.end - rows.start,
-                EPS,
-            )?;
-            for g in groups(&rows) {
-                cx.kernels.quantize_activations(
-                    cx.stream,
-                    Self::at(&self.h, g.start, width),
-                    self.q.ptr(),
-                    width,
-                    g.end - g.start,
-                )?;
-                cx.kernels.matvec(
-                    cx.stream,
-                    head.ty,
-                    head.buffer.ptr(),
-                    self.q.ptr(),
-                    Self::at(logits, g.start, head.n_out),
-                    head.n_in,
-                    head.n_out,
-                    g.end - g.start,
-                )?;
+        let mut before = 0;
+        for i in 0..cx.record.runs() {
+            let (first, count) = cx.record.run(i);
+            let wanted = first.max(rows.start)..(first + count).min(rows.end);
+            if wanted.start < wanted.end {
+                let compact = before + (wanted.start - first);
+                // SAFETY: as in `block`; `logits` holds a row of `head.n_out`
+                // values per step row, and a step has no more wanted rows
+                // than rows.
+                unsafe {
+                    cx.kernels.rms_norm_f32(
+                        cx.stream,
+                        Self::at(&self.x, wanted.start, width),
+                        DevicePtr::NULL,
+                        Self::at(&self.h, wanted.start, width),
+                        width,
+                        wanted.end - wanted.start,
+                        EPS,
+                    )?;
+                    for g in groups(&wanted) {
+                        cx.kernels.quantize_activations(
+                            cx.stream,
+                            Self::at(&self.h, g.start, width),
+                            self.q.ptr(),
+                            width,
+                            g.end - g.start,
+                        )?;
+                        cx.kernels.matvec(
+                            cx.stream,
+                            head.ty,
+                            head.buffer.ptr(),
+                            self.q.ptr(),
+                            Self::at(logits, compact + (g.start - wanted.start), head.n_out),
+                            head.n_in,
+                            head.n_out,
+                            g.end - g.start,
+                        )?;
+                    }
+                }
             }
+            before += count;
         }
         Ok(())
     }
@@ -924,7 +954,8 @@ mod tests {
         assert!(error.contains("feed-forward") && error.contains("1124"), "{error}");
 
         let mut config = SyntheticConfig::small(Split::Single, 1);
-        config.weight_type = GgmlType::Q4_0;
+        // An activation format, which no weight kernel reads as weights.
+        config.weight_type = GgmlType::Q8_K;
         assert!(
             SyntheticModel::new(config)
                 .unwrap_err()
@@ -1001,10 +1032,14 @@ mod tests {
         // A character outside the alphabet is its UTF-8 bytes.
         assert_eq!(model.encode(&Prompt::Text("\u{e9}".into())).unwrap(), [0xc3, 0xa9]);
         // A generated byte, printed and fed back, is the same token.
-        let text: String = (0..=255u8).filter_map(|b| model.piece(u32::from(b))).collect();
+        let mut bytes = Vec::new();
+        (0..=255u32).for_each(|token| model.piece(token, &mut bytes));
+        let text = String::from_utf8(bytes).unwrap();
         let tokens = model.encode(&Prompt::Text(text)).unwrap();
         assert_eq!(tokens, (0..=255u32).collect::<Vec<_>>());
-        assert_eq!(model.piece(256), None);
+        let mut nothing = Vec::new();
+        model.piece(256, &mut nothing);
+        assert!(nothing.is_empty());
     }
 
     #[test]

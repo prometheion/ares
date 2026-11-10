@@ -950,7 +950,7 @@ the installed binary (0.1.48), not by running it:
 | Output | How | Limits |
 | --- | --- | --- |
 | The residual after every layer, per position (`(L + 1) x hc x N` f32), halves, routed ids | `--dump-layers`, `--dump-halves`, `--dump-routing`, `--dump-logits` | **Not available for this model.** These are written by the token loop, and a pack with i-quant experts ("native") skips the token loop (S: `src/program/generate.cpp`, `if (native_pack) { spec_pos = pos; break; }` and "a native pack runs verify windows only") |
-| Layer outputs for chosen layers 0..46, per row of every verify window: position, token, then per layer `N` f32, the MEAN of the four streams of the residual after the layer | `STRATA_TAP_FILE=path`, `STRATA_TAP_LAYERS=0,1,...` | the whole model in one verifier, so one GPU (S: `src/core/verify.cpp` `Verifier::init`, `tap_write`) |
+| Layer outputs for chosen layers 0..46, per row of every verify window: position, token, then per layer `N` f32, the MEAN of the four streams of the residual after the layer. **Correction (2026-11-10, run with 0.1.48):** the file starts with a header that this row did not mention: `"STAP"`, `u32` version 1, `u32` `N`, `u32` number of tapped layers, then the tapped layers as `i32` each; the records follow | `STRATA_TAP_FILE=path`, `STRATA_TAP_LAYERS=0,1,...` | the whole model in one verifier, so one GPU (S: `src/core/verify.cpp` `Verifier::init`, `tap_write`) |
 | Logits of the first window's row (the prompt's last token), `V` f32 | `STRATA_DUMP_FIRST_LOGITS=path` | one row per request |
 | Log-probabilities per row | `STRATA_LOGPOS=path` (and `_TOPK`) | text lines |
 | A hash of the final residual rows and the picks of every window | `--window-hashes path` | equality only |
@@ -961,6 +961,11 @@ but the last for rows that went through verify windows, on one GPU. A run
 on one 12 GB card holds fewer experts in VRAM than the logged run; its
 speed was not measured. One tap row is 10 KiB per layer, 470 KiB for all
 47.
+
+**Run on 2026-11-10 (section 10):** without `--serve` the 0.1.48 engine
+refuses `--layer-split` ("needs --serve"), so such a run is on one card
+(`--gpu 0`); it takes 36 seconds for a 22 token prompt and 8 tokens, and the
+logits and the taps come out as described.
 
 What does not match by construction when comparing with it: difference 1
 is absent (the document follows Strata); the activation rounding of section
@@ -1024,11 +1029,15 @@ architecture needs:
   here makes the results unstable and hard to match between CPU and GPU"),
   it has 2 experts and uses both, and as many value heads as key heads: it
   leaves the block selection, the experts' top-k and the head pairing
-  untested. Constraints the fork puts on a file: one compress ratio above
+  untested. **Correction (2026-11-10):** on this machine that generator
+  does not run: the prebuilt `build/bin/test-llama-archs` is older than the
+  libraries next to it and stops with "key not found in model:
+  qwen4exp.ssm.group_count". Constraints the fork puts on a file: one compress ratio above
   1 that divides `top_k`; the indexer key not narrower than the rotated
   width; the PLE layer must be a recurrent layer; `hyper_connection.count`
   above 1. Whether a file with a small `top_k` runs stably on the fork's
-  CPU backend was not tried.
+  CPU backend was not tried. **Settled (2026-11-10):** it does, see
+  section 10.
 - **Strata cannot run a small model.** Its kernels are compiled for one
   shape and fix `S = 128`, `GK = 16`, `HD = 256`, `ROT = 64`, the indexer
   at 4 x 128, `B = 4`, `hc = 4`, a width of 1024 to 4096 in multiples of
@@ -1088,3 +1097,75 @@ architecture needs:
     expert count, top-k and vocabulary" at compile time. The loader pins
     `attention.indexer.top_k` as well (S: `gguf_reader.hpp`
     `geometry_unsupported`).
+
+## 10. Checked on 2026-11-10 with the reference in `ares-model`
+
+The reference of 8.3 exists (`crates/model/src/qwen4exp/`), with the writer
+of the small model (`synthetic.rs`), the dump program for the fork
+(`crates/model/tools/q4capture/`, whose README has the commands and the full
+numbers) and a program that runs the real file (`tools/q4trace.rs`). What
+running them showed, by the open point of section 9 it bears on:
+
+- **The formulas of section 3** (not an open point, but the premise of the
+  rest). On the small model with every tensor `f32`, `top_k = 8`, blocks of
+  4, 12 experts of which 3 are used, 6 value heads on 2 key heads and 3
+  streams, the fork's CPU backend and the reference with the selection rule
+  set to whole blocks agree to rounding in every layer: at most 1.6e-5
+  relative RMS in the worst row of the residual and of the logits over three
+  seeds and 48 to 200 tokens, the same routed experts in every row and
+  layer, the same blocks kept in all 335 rows that select, whether the
+  sequence is decoded in one call, token by token or in calls of five or
+  seven. The hash rows of 3.4 are Strata's oracle rows. On the real file the
+  reference generates sensible text under greedy picks (a German answer
+  with its reasoning, cut at 160 tokens, and an English answer that the
+  model ends itself after 80).
+- **Point 1, the selection rule.** Not settled: which rule the original
+  uses is still unread. Confirmed as described: the fork keeps whole blocks,
+  and the reference with the cell budget differs from it in exactly the rows
+  whose tail has fewer than three cells. Read from S for this
+  (`qsa_select.cu` `block_topk_kernel`): the main engine selects by a
+  threshold over cells, takes every cell above it and the cells at it
+  lowest index first, which is the rule of 3.6 including its order of equal
+  scores. What the choice does to the real model was measured once: 32 rows
+  at cells 2080 to 2111 of a 2178 token text, run from the same state under
+  both rules, differ by 0.8e-2 to 1.9e-2 relative RMS in the logits on
+  average (8e-2 at worst) and in 52 of 15360 expert picks, with the same
+  greedy pick in all 32 rows. That is no larger than the distance between
+  Strata and the exact arithmetic (point 7), so logits will not tell the two
+  rules apart.
+- **Point 5, the fork with the real file.** Not tried. A small file with a
+  realistic `top_k` runs stably on the fork's CPU backend (above).
+- **Point 6, Strata's tap output.** Settled: the installed 0.1.48 engine
+  writes the taps and the first logits on one card without `--serve`
+  (corrections in 8.1).
+- **Point 7, tolerances.** Measured for one German prompt of 22 tokens and
+  the 64 tokens after it, Strata 0.1.48 on one card with `--kv fp16`
+  against the exact reference: the 64 greedy tokens are the same; the
+  logits of the last prompt token have the same largest value (probability
+  1.0 in both), nine of the ten largest in common, a relative RMS difference
+  of 0.12 over all 248320 values and a KL divergence of 2.2e-6 nats. (An
+  English prompt of 19 tokens: the same 80 greedy tokens up to the end of
+  the answer, the ten largest logits the same, 0.058 and 1.9e-8 nats.) The
+  mean of the streams after a layer differs by 6.7e-3 relative RMS after
+  layer 0 (median of 64 cells), 1.0e-2 after layer 11, 2.4e-2 after layer
+  23, 3.3e-2 after layer 35 and 2.3e-2 after layer 46, with 1.3e-1 as the
+  worst cell; the last prompt token, whose state Strata's prompt path left,
+  is further off (up to 2.0e-1 in the middle layers). The growth is smooth,
+  with no step at the n-gram layer or at an attention layer. Strata gives
+  the same logits bit for bit when run twice. That the gap is activation
+  rounding (section 5, last paragraph) is supported, not proven: rounding the
+  reference's activations as ggml's `Q8_0` does (blocks of 32) in front of
+  every quantized matrix brings the difference after layer 0 from 7.2e-3 to
+  2.3e-3; Strata's own rounding contract was not reproduced, and the
+  remaining 2.3e-3 is not attributed. So "agreement with Strata" for a GPU
+  implementation is, by this measurement, the same greedy tokens and stream
+  means within about 1e-2 after the first layers and 3e-2 to 1e-1 further
+  up; a tighter bound needs Strata against itself on its two paths.
+- **Not an open point, but a trap when comparing with the fork on the
+  CPU:** llama.cpp's CPU matrix product converts the activations to the
+  dot-product type of the weights, which for BF16 weights is BF16 (8 bits of
+  mantissa) and for F16 weights F16. With the real file's unquantized types
+  in the small model the fork is 1e-3 away after layer 0 for that reason; a
+  model with every tensor `f32` has no such rounding.
+
+Points 2, 3 and 4 (the MTP block), 8 (images), 9 and 10 were not touched.

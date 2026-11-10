@@ -7,7 +7,8 @@
 //! 1. enqueues the upload of the record (one copy) and the changes to the
 //!    sequences' page tables,
 //! 2. calls the model, which enqueues all of its kernels for the whole step,
-//! 3. enqueues the read-back of the logits that are wanted,
+//! 3. enqueues the read-back of the logits that are wanted (one copy: the
+//!    model leaves them as consecutive rows),
 //! 4. waits once, for the end of the step on its stream, and
 //! 5. takes the arg-max of each row it brought back.
 //!
@@ -53,6 +54,8 @@ pub struct GpuConfig {
     /// device's ledger and allocated before the model is built.
     pub pages: u32,
     pub page_bytes: Vec<u64>,
+    /// The cells of a page, which the model lays its pages out for.
+    pub cells_per_page: u32,
 }
 
 impl GpuConfig {
@@ -72,6 +75,7 @@ impl GpuConfig {
                     .map(|d| layout.bytes_per_page(d) * u64::from(config.pages))
                     .collect()
             },
+            cells_per_page: config.cells_per_page,
         }
     }
 }
@@ -183,6 +187,14 @@ impl GpuExecutor {
                 devices.len()
             )));
         }
+        if model.logit_rows() < config.max_slots {
+            return Err(RuntimeError::Config(format!(
+                "the model gives the logits of {} rows per step, fewer than the {} sequences \
+                 that can each want one",
+                model.logit_rows(),
+                config.max_slots
+            )));
+        }
         let max_rows = model.max_rows();
         let record_bytes = record::max_bytes(max_rows, config.max_slots);
 
@@ -190,7 +202,8 @@ impl GpuExecutor {
         // before it is taken.
         let mut broker = Broker::new("pinned RAM", config.pinned_limit);
         let consumer = broker.register("step record and read-back", Class::Required)?;
-        let readback = devices.len() as u64 * u64::from(max_rows) * u64::from(model.vocab()) * 4;
+        let readback =
+            devices.len() as u64 * u64::from(model.logit_rows()) * u64::from(model.vocab()) * 4;
         match broker.grow(&consumer, record_bytes as u64 + readback)? {
             Growth::Granted => {}
             Growth::Reclaim(_) => unreachable!("nobody else holds page-locked memory"),
@@ -401,6 +414,8 @@ struct Worker {
     pages: Option<DeviceBuffer>,
     bytes_per_page: u64,
     logits_host: Option<PinnedBuffer>,
+    /// The most rows of a step whose logits the read-back buffer holds.
+    logit_rows: u32,
     start: Event,
     ends: [Event; 2],
     /// Which of `ends` the next step records.
@@ -502,14 +517,19 @@ impl Worker {
                 stream: &stream,
                 ledger: &mut ledger,
                 max_rows,
+                max_slots: config.max_slots,
+                pages: config.pages,
+                cells_per_page: config.cells_per_page,
+                table_stride: config.table_stride,
             })
             .map_err(|e| match e {
                 ModelError::Memory(e) => RuntimeError::Memory(e),
                 other => RuntimeError::Model(other),
             })?;
         let per_row = part.logits_per_row();
+        let logit_rows = model.logit_rows();
         let logits_host = (per_row > 0)
-            .then(|| PinnedBuffer::new(&device, max_rows as usize * per_row as usize * 4))
+            .then(|| PinnedBuffer::new(&device, logit_rows as usize * per_row as usize * 4))
             .transpose()?;
         let worker = Self {
             index,
@@ -523,6 +543,7 @@ impl Worker {
             pages: (page_bytes > 0).then(|| DeviceBuffer::new(&device, page_bytes)).transpose()?,
             bytes_per_page: page_bytes / u64::from(config.pages.max(1)),
             logits_host,
+            logit_rows,
             start: Event::timed(&device)?,
             ends: [Event::timed(&device)?, Event::timed(&device)?],
             next_end: 0,
@@ -615,25 +636,24 @@ impl Worker {
             links: &self.links,
         })?;
 
-        // The read-back of the rows whose logits are wanted, run by run.
+        // The read-back of the rows whose logits are wanted.
+        let picked = view.picked_rows();
+        if picked > self.logit_rows {
+            return Err(ModelError::Invalid(format!(
+                "the step wants the logits of {picked} rows; the model gives at most {}",
+                self.logit_rows
+            )));
+        }
         if let (Some(logits), Some(host)) = (logits, self.logits_host.as_mut()) {
-            let row_bytes = logits.stride as usize * 4;
-            let mut compact = 0usize;
-            for i in 0..view.runs() {
-                let (first, count) = view.run(i);
-                // SAFETY: the source rows are inside the model's logits
-                // buffer (the record's runs are inside its rows) and the
-                // destination inside the read-back buffer, which holds a
-                // row per step row; the buffer is not read before the step
-                // has finished.
-                unsafe {
-                    stream.copy_to_host(
-                        host.as_mut_ptr().add(compact * row_bytes),
-                        logits.ptr.offset(first as u64 * row_bytes as u64),
-                        count as usize * row_bytes,
-                    )?;
-                }
-                compact += count as usize;
+            // SAFETY: the model left a row of `stride` values per wanted
+            // row, and the read-back buffer holds `logit_rows` such rows; it
+            // is not read before the step has finished.
+            unsafe {
+                stream.copy_to_host(
+                    host.as_mut_ptr(),
+                    logits.ptr,
+                    picked as usize * logits.stride as usize * 4,
+                )?;
             }
         }
         let end = &self.ends[self.next_end];

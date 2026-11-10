@@ -32,7 +32,7 @@ use ares_state::{PagePool, Sequence};
 use crate::config::RuntimeConfig;
 use crate::exec::{Clock, ExecError, Executor, StepMeta, StepOutput};
 use crate::model::{ContextSpec, Model};
-use crate::record::{self, RecordWriter, Row, TableUpdate};
+use crate::record::{self, Commit, RecordWriter, Row, TableUpdate};
 use crate::text::StopMatcher;
 use crate::timing::{Phase, Snapshot, Stats};
 
@@ -156,6 +156,8 @@ struct Active {
     waited_steps: u32,
     /// Drafts for the coming step; cut to the rows the plan grants.
     draft: Vec<u32>,
+    /// Bytes of generated text that are not whole characters yet.
+    pending: Vec<u8>,
     /// Text produced this step, not yet delivered.
     emitted: String,
     finished: Option<FinishReason>,
@@ -185,7 +187,7 @@ impl Active {
     ) {
         for &token in picked {
             self.completion += 1;
-            if model.eos() == Some(token) {
+            if model.ends(token) {
                 self.stop.flush(&mut self.emitted);
                 self.finished = Some(FinishReason::Stop);
                 return;
@@ -194,9 +196,9 @@ impl Active {
             self.tokens.push(token);
             self.states.push(spec.advance(previous, &self.tokens));
             self.drafter.push(token);
-            if let Some(ch) = model.piece(token)
-                && self.stop.push(ch, &mut self.emitted)
-            {
+            model.piece(token, &mut self.pending);
+            let (stop, emitted) = (&mut self.stop, &mut self.emitted);
+            if take_characters(&mut self.pending, |ch| stop.push(ch, emitted)) {
                 self.finished = Some(FinishReason::Stop);
                 return;
             }
@@ -228,6 +230,39 @@ impl Drop for Conductor {
             }
         }
     }
+}
+
+/// Hands the whole characters at the start of `pending` to `push`, in order,
+/// and removes them; bytes that cannot be part of a character become U+FFFD.
+/// What is left is the start of a character that later bytes complete. Stops
+/// early, and returns true, when `push` returns true.
+fn take_characters(pending: &mut Vec<u8>, mut push: impl FnMut(char) -> bool) -> bool {
+    let mut taken = 0;
+    let mut stopped = false;
+    while taken < pending.len() && !stopped {
+        let (text, bad) = match std::str::from_utf8(&pending[taken..]) {
+            Ok(text) => (text, Some(0)),
+            Err(error) => {
+                let valid = &pending[taken..taken + error.valid_up_to()];
+                // SAFETY: `valid_up_to` bytes are valid UTF-8 by its contract.
+                (unsafe { std::str::from_utf8_unchecked(valid) }, error.error_len())
+            }
+        };
+        let len = text.len();
+        stopped = text.chars().any(&mut push);
+        taken += len;
+        match bad {
+            // The tail is an unfinished character: wait for its other bytes.
+            None => break,
+            Some(0) => {}
+            Some(n) => {
+                stopped = stopped || push(char::REPLACEMENT_CHARACTER);
+                taken += n;
+            }
+        }
+    }
+    pending.drain(..taken);
+    stopped
 }
 
 /// One sequence's rows in the step being run.
@@ -267,6 +302,8 @@ pub(crate) struct Conductor {
     parts: Vec<StepPart>,
     updates: Vec<(u32, Range<usize>)>,
     runs: Vec<(u32, u32)>,
+    /// The outcome of this step's draft windows, for the next step's record.
+    commits: Vec<Commit>,
     output: StepOutput,
     scratch_tokens: Vec<u32>,
 }
@@ -300,6 +337,7 @@ impl Conductor {
             parts: Vec::with_capacity(max_rows as usize),
             updates: Vec::with_capacity(slots),
             runs: Vec::with_capacity(max_rows as usize),
+            commits: Vec::with_capacity(slots),
             scratch_tokens: Vec::with_capacity(64),
             model,
             config,
@@ -323,11 +361,22 @@ impl Conductor {
     pub(crate) fn warm_up(&mut self) -> Result<(), ExecError> {
         for _ in 0..3 {
             let used = {
-                let mut writer = RecordWriter::new(self.exec.record(), self.step_no);
+                // One row of a sequence that starts in slot 0, on the pool's
+                // first page; the first request overwrites both.
+                let entry = self.model.page_entry(0);
+                let mut writer = RecordWriter::new(self.exec.record(), self.step_no, 1, 1)
+                    .expect("room for a row");
+                writer.segment(0, 0, 1, true).expect("room for a segment");
                 writer
                     .row(Row { slot: 0, position: 0, token: 0, context: 0 })
                     .expect("room for a row");
-                writer.run(0, 1).expect("room for a run");
+                writer.runs(&[(0, 1)]).expect("room for a run");
+                writer
+                    .updates(
+                        [TableUpdate { slot: 0, first: 0, count: 1 }].into_iter(),
+                        [entry].into_iter(),
+                    )
+                    .expect("room for a page-table entry");
                 writer.finish().expect("room for the header")
             };
             self.step_no += 1;
@@ -464,6 +513,7 @@ impl Conductor {
             reserved,
             waited_steps: 0,
             draft: Vec::with_capacity(self.config.max_draft as usize),
+            pending: Vec::new(),
             emitted: String::new(),
             finished: None,
         });
@@ -516,6 +566,9 @@ impl Conductor {
         self.requests.clear();
         let generating = self.slots.iter().flatten().filter(|a| a.generating()).count() as u32;
         let time = self.step_time.base_and_per_row();
+        // Every draft row needs its logits, like the one row every sequence
+        // may need: drafts share what the model gives beyond those.
+        let mut spare_logit_rows = self.model.logit_rows().saturating_sub(self.active as u32);
         for (slot, a) in self.slots.iter_mut().enumerate() {
             let Some(a) = a else { continue };
             let want = if a.generating() {
@@ -524,7 +577,14 @@ impl Conductor {
                 // tokens still wanted, and the room left in the context.
                 let wanted = a.max_tokens.map_or(u32::MAX, |m| m - a.completion);
                 let room = self.context_length.saturating_sub(a.tokens.len() as u32);
-                let cap = self.config.max_draft.min(wanted.saturating_sub(1)).min(room) as usize;
+                // And the model bounds the rows of a step that verifies drafts.
+                let cap = self
+                    .config
+                    .max_draft
+                    .min(wanted.saturating_sub(1))
+                    .min(room)
+                    .min(self.model.draft_rows().saturating_sub(1))
+                    .min(spare_logit_rows) as usize;
                 if self.config.speculation && cap > 0 {
                     let proposal = a.drafter.draft(cap);
                     let take = match time {
@@ -558,6 +618,7 @@ impl Conductor {
                         }
                     };
                     a.draft.extend_from_slice(&proposal[..take]);
+                    spare_logit_rows -= take as u32;
                 }
                 Want::Window { drafts: a.draft.len() as u32 }
             } else {
@@ -576,8 +637,14 @@ impl Conductor {
     fn step(&mut self, turn: Instant) {
         let t_plan = Instant::now();
         let generating = self.want();
+        let drafting =
+            self.requests.iter().any(|r| matches!(r.want, Want::Window { drafts } if drafts > 0));
         let limits = Limits {
-            max_rows: self.max_rows,
+            max_rows: if drafting {
+                self.max_rows.min(self.model.draft_rows())
+            } else {
+                self.max_rows
+            },
             prefill_rows_with_windows: prefill_rows_next_to(
                 &self.step_time,
                 generating,
@@ -671,8 +738,10 @@ impl Conductor {
     /// length in bytes.
     fn write_record(&mut self) -> Result<usize, String> {
         let full = |e: record::RecordFull| format!("{e}");
+        let rows: u32 = self.parts.iter().map(|p| p.rows).sum();
         let buffer = self.exec.record();
-        let mut writer = RecordWriter::new(buffer, self.step_no + 1);
+        let mut writer = RecordWriter::new(buffer, self.step_no + 1, self.parts.len() as u32, rows)
+            .map_err(full)?;
         self.runs.clear();
         self.updates.clear();
         let mut row_index = 0u32;
@@ -687,6 +756,9 @@ impl Conductor {
                 PartKind::Prefill { completes } => {
                     has_prompt = true;
                     counters.prefill_rows += u64::from(part.rows);
+                    // The rows of a prompt are certain: recurrent state
+                    // advances with them.
+                    writer.segment(part.slot, first_cell, part.rows, true).map_err(full)?;
                     for k in 0..part.rows {
                         let position = first_cell + k;
                         writer
@@ -707,6 +779,11 @@ impl Conductor {
                     counters.window_rows += 1;
                     counters.draft_rows += u64::from(part.rows - 1);
                     let newest = a.tokens.len() - 1;
+                    // A window with drafts leaves recurrent state alone until
+                    // the next step commits the rows that were accepted.
+                    writer
+                        .segment(part.slot, first_cell, part.rows, part.rows == 1)
+                        .map_err(full)?;
                     writer
                         .row(Row {
                             slot: part.slot,
@@ -748,9 +825,8 @@ impl Conductor {
         if has_prompt && has_generation {
             counters.mixed_steps += 1;
         }
-        for &(first, count) in &self.runs {
-            writer.run(first, count).map_err(full)?;
-        }
+        writer.runs(&self.runs).map_err(full)?;
+        writer.commits(&self.commits).map_err(full)?;
         // Page-table changes since the devices last saw the tables.
         for part in &self.parts {
             let a = self.slots[part.slot as usize].as_mut().expect("running");
@@ -759,21 +835,20 @@ impl Conductor {
                 self.updates.push((part.slot, dirty));
             }
         }
-        for (slot, range) in &self.updates {
-            writer
-                .update(TableUpdate {
+        let (slots, model) = (&self.slots, &self.model);
+        writer
+            .updates(
+                self.updates.iter().map(|(slot, range)| TableUpdate {
                     slot: *slot,
                     first: range.start as u32,
                     count: range.len() as u32,
-                })
-                .map_err(full)?;
-        }
-        for (slot, range) in &self.updates {
-            let a = self.slots[*slot as usize].as_ref().expect("running");
-            for page in &a.cells.pages()[range.clone()] {
-                writer.entry(page.0).map_err(full)?;
-            }
-        }
+                }),
+                self.updates.iter().flat_map(|(slot, range)| {
+                    let a = slots[*slot as usize].as_ref().expect("running");
+                    a.cells.pages()[range.clone()].iter().map(|page| model.page_entry(page.0))
+                }),
+            )
+            .map_err(full)?;
         writer.finish().map_err(full)
     }
 
@@ -781,7 +856,11 @@ impl Conductor {
     /// sequence.
     fn commit(&mut self) {
         let mut cursor = 0usize;
+        let mut row0 = 0u32;
+        self.commits.clear();
         for part in &self.parts {
+            let first_row = row0;
+            row0 += part.rows;
             let a = self.slots[part.slot as usize].as_mut().expect("running");
             match part.kind {
                 PartKind::Prefill { completes: false } => {}
@@ -804,6 +883,16 @@ impl Conductor {
                         a.acceptance.observe(drafts, accepted);
                         self.stats.counters.drafts_accepted += accepted as u64;
                         self.stats.counters.drafts_rejected += (drafts - accepted) as u64;
+                    }
+                    // The devices commit the newest token's row and the
+                    // accepted drafts to recurrent state with the next step.
+                    if drafts > 0 {
+                        self.commits.push(Commit {
+                            row0: first_row,
+                            rows: part.rows,
+                            slot: part.slot,
+                            accepted: 1 + accepted as u32,
+                        });
                     }
                     // The newest token's row and the accepted drafts keep
                     // their cells; the rejected rows are cut from the table.
@@ -847,6 +936,37 @@ impl Conductor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn characters_come_out_whole_whatever_the_tokens_cut() {
+        // "aü€" arriving a byte at a time: nothing comes out in the middle of a
+        // character, and nothing is lost.
+        let text = "a\u{fc}\u{20ac}";
+        let mut pending = Vec::new();
+        let mut out = String::new();
+        for (i, byte) in text.bytes().enumerate() {
+            pending.push(byte);
+            assert!(!take_characters(&mut pending, |ch| {
+                out.push(ch);
+                false
+            }));
+            assert!(text.starts_with(&out), "after byte {i}: {out:?}");
+        }
+        assert_eq!(out, text);
+        assert!(pending.is_empty());
+        // A byte that starts nothing is replaced, and what follows it is kept.
+        let mut pending = vec![b'x', 0xff, b'y', 0xe2, 0x82];
+        let mut out = String::new();
+        take_characters(&mut pending, |ch| {
+            out.push(ch);
+            false
+        });
+        assert_eq!(out, "x\u{fffd}y");
+        assert_eq!(pending, [0xe2, 0x82], "the unfinished character waits");
+        // The stop is reported and the characters before it are consumed.
+        let mut pending = b"abc".to_vec();
+        assert!(take_characters(&mut pending, |ch| ch == 'b'));
+    }
 
     #[test]
     fn a_reservation_takes_pages_and_a_slot_and_gives_both_back() {

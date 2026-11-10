@@ -218,7 +218,11 @@ impl StateStorage {
                 }
             }
             StateStorage::Int8PerHead | StateStorage::Int8PerRow => {
-                let group = if self == StateStorage::Int8PerHead { rows_per_head * head_dim } else { head_dim };
+                let group = if self == StateStorage::Int8PerHead {
+                    rows_per_head * head_dim
+                } else {
+                    head_dim
+                };
                 for chunk in matrices.chunks_mut(group) {
                     let max = chunk.iter().fold(0.0f32, |m, v| m.max(v.abs()));
                     if max == 0.0 {

@@ -11,11 +11,15 @@ repository.workspace = true
 ares-api = { path = "../api" }
 ares-core.workspace = true
 ares-cuda.workspace = true
+ares-io = { path = "../io" }
 ares-sched.workspace = true
 ares-state.workspace = true
+ares-weights.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+# The expert store is tested and measured on model files.
+ares-gguf.workspace = true
 # The HTTP example serves the synthetic engine through the real front end and
 # drives it with raw sockets.
 ares-server = { path = "../server" }
