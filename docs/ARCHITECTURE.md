@@ -141,7 +141,7 @@ machine (RTX 4070 + RTX 3060, Qwen3.8-27B) or read from the engines listed in
 | `ares-core` | Tensor element types and block geometry, byte units, memory ledgers | Done, unit tested |
 | `ares-gguf` | Zero-copy GGUF reader (version 3, split files, validation at open), a small writer for tests | Done; tested against synthetic, truncated and corrupted files and real models |
 | `ares-quant` | CPU reference decoder for every GGUF type; the specification and reference codec of the engine's own KV formats (`f16`, `q8` to `q4`, tiles with a mean, the policy of exact cells) | Done; bit-identical to ggml's C code on fixtures generated from it; the KV formats are pinned by golden files and were measured on the K and V of real models |
-| `ares-cuda` | Driver API bound at run time, devices, memory, streams, events, modules, decode weight kernels for all 28 weight types, prefill weight kernels for eleven, the layer kernels of `qwen35`, the mesh that sums across devices over peer access or the host | Device layer, decode and layer kernels done; prefill kernels verified, their pass over the weights 1.3 times as fast as the fork's whole prefill; attention kernels in progress; tested on both GPUs, with and without peer access |
+| `ares-cuda` | Driver API bound at run time, devices, memory, streams, events, modules, decode weight kernels for all 28 weight types, prefill weight kernels for eleven, the layer kernels of `qwen35`, attention over the stored K/V formats, the mesh that sums across devices over peer access or the host | Device layer, decode, layer and attention kernels done; prefill kernels verified, their pass over the weights 1.3 times as fast as the fork's whole prefill; tested on both GPUs, with and without peer access |
 | `ares-vulkan` | The same device-level surface on Vulkan, the same first kernels as compute shaders | Done; 23 device tests pass on both GPUs |
 | `ares-state` | Page pool, page tables with copy on write, prefix index with checkpoints, page layouts | Done; randomised model check |
 | `ares-store` | State on disk: pages and checkpoints by content hash in segment files, per fingerprint, with a size limit | Done as a store of opaque bytes, tested against restarts, the limit and damaged files; not yet connected to devices |
@@ -762,6 +762,45 @@ int8 with a scale per row; int8 with a scale per head is unusable. `f32`
 stays the default for the live state until `f16` is measured on the 27B and
 on long sequences; checkpoints can be `f16`.
 
+**Attention kernels** (`kernels/attention.cu`, `ares_cuda::AttentionKernels`,
+`attention::Planner`). They read K and V in the stored formats, with no
+copy in another type. On the device a sequence is a table of entries of 128
+cells, the same for every layer; an entry is either exact (K and V rows in
+`f16`) or converted (per KV head the mean and the rows of K, then of V, in
+the bytes `ares_quant::kvhead` stores). Formats without a mean (`f16`,
+`q8`) are written straight into converted entries. For `q7` to `q4` the
+first tile and the newest tiles are exact entries, and a full tile is
+converted with its mean when the policy says so. One kernel template serves
+all 36 pairs of K and V formats (a switch per chunk), in shapes for up to 8,
+16, 48 and 64 query vectors, over dense windows and over lists of ranges,
+for several sequences in a step. A planner cuts a step into items of one
+block each, and their results are merged as log-sum-exp states, so a head
+can be computed over any split of its cells.
+
+Writing is bit-exact against the golden files of the formats and against
+`KvHead` for appends, drafts and conversions. Reading is within about 1e-3
+of the largest output element of `KvHead::attend` on the same stored bytes
+(6e-3 at worst), which is the `f16` operands of the tensor cores; it does
+not depend on the format, and `q4` / `q4` on captured rows of Qwen3.8-27B
+is as close as `f16` / `f16`.
+
+Measured 2026-11-10 per attention layer (Qwen3.8-27B has 16), one sequence,
+RTX 4070 / RTX 3060:
+
+| K / V | 1 row, 4096 cells | 32768 cells | 262144 cells | 8 rows, 262144 cells | prompt of 2048 rows |
+| --- | --- | --- | --- | --- | --- |
+| `q8` / `q8` | 50 / 90 µs | 0.28 / 0.46 ms | 2.19 / 3.48 ms | 3.14 / 5.39 ms | 2.73 / 5.95 ms |
+| `q4` / `q4` | 49 / 92 µs | 0.23 / 0.51 ms | 2.11 / 3.62 ms | 3.47 / 6.08 ms | 2.41 / 5.22 ms |
+| `f16` / `f16` | 54 / 97 µs | 0.36 / 0.53 ms | 2.76 / 3.98 ms | 3.44 / 5.84 ms | 2.43 / 5.26 ms |
+
+At 262144 cells `f16` reads at 77 % of the memory limit, `q8` at 52 % and
+`q4` at 29 %: the quantized formats are bound by the work of decoding, not
+by memory, so they are not yet faster than `f16` although they read a half
+or a quarter of the bytes. Open: that decode work, accumulation in `f16`
+with a flush to `f32` on capped cards (every path accumulates in `f32`
+now, at half the rate), the item for a prefix that several sequences share,
+and a Turing path.
+
 **The tensor-core cap of GeForce cards.** GeForce cards run FP16, BF16 and
 TF32 tensor-core math with FP32 accumulation at half rate; professional cards
 with the same silicon do not, and gpu-unlock
@@ -937,7 +976,8 @@ State on 2026-11-10, on an RTX 4070 and an RTX 3060 with driver 615.78.08:
 - No model runs yet. What exists is the backbone in the table under
   [Crates](#crates).
 - The CUDA tests pass on both GPUs: 11 of the device layer, 5 of the decode
-  kernels, 9 of the prefill kernels and 12 of the layer kernels, the decode
+  kernels, 9 of the prefill kernels, 12 of the layer kernels and 7 of the
+  attention kernels, the decode
   and prefill ones also on real tensors of Qwen3.8-27B, the layer ones on a
   chain of the real blocks of Qwen3.5-0.8B.
 - Decode weight kernels exist for all 28 weight types. One row runs at 95 to
@@ -952,10 +992,12 @@ State on 2026-11-10, on an RTX 4070 and an RTX 3060 with driver 615.78.08:
   within 7e-7 of the CPU reference.
 - The KV formats are specified, pinned by golden files and measured on the K
   and V of real models, and attention over the stored formats has a CPU
-  reference (`ares_quant::kvhead`). The GPU kernels that read and write them
-  are being written.
-- Being written and not in this state yet: the attention kernels and the
-  Vulkan mirrors. Prefill kernels for the other 17 weight types are not
+  reference (`ares_quant::kvhead`). The CUDA kernels write them bit-exactly
+  and read them within 1e-3 of the reference; one row over 262144 cells
+  takes 2.2 ms per layer on the RTX 4070 in `q8`.
+- Being written and not in this state yet: the two test models on the
+  devices, the path of an expert from SSD into a VRAM slot, and the Vulkan
+  mirrors. Prefill kernels for the other 17 weight types are not
   started; the decode kernels serve those types at any row count.
 - The tokenizer gives llama.cpp's token ids and chat prompts for the three
   test models and encodes 76 to 85 MB of text per second on one core.
