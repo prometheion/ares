@@ -16,11 +16,12 @@ How the engine is built and how far each part is: [docs/ARCHITECTURE.md](docs/AR
 ## State
 
 Two test models stand in for Qwen4 until it is released. Qwen3.8-27B runs on
-two GPUs through CUDA and answers through its chat template; it is not yet
-faster than the llama.cpp fork it is measured against, because drafts from
-the model and a fast sum between the cards are still being built.
-Qwen3.8-Flash-Next, a mixture of experts streamed from SSD, runs in the CPU
-reference only. The numbers are in
+two GPUs through CUDA, with drafts from the model's own draft block and
+sampling on the device, and is ahead of the llama.cpp fork it is measured
+against in prompt processing and in generation. Qwen3.8-Flash-Next, a
+mixture of experts streamed from SSD, has every piece built and tested (the
+CPU reference, its kernels, the expert tiers with the CPU computing what is
+not on a GPU) and is being put together on the devices. The numbers are in
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#status). There is no release
 before Qwen4.
 

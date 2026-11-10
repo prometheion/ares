@@ -197,9 +197,16 @@ requests ──► plan ──► upload step record ──► window ──► 
 3. **Window.** The model enqueues its kernels on every device's stream.
    Position-addressable state is appended; recurrent layers read their base
    state and keep their inputs.
-4. **Sample.** A kernel per sequence row picks the token. Only the picks, and
-   on request a few candidates for grammar-constrained sampling, go to the
-   host.
+4. **Sample.** The sampler's kernels pick the token of every wanted row on
+   the device (`ares_cuda::SamplerKernels`): the most probable token, or
+   temperature, top-k, top-p and min-p as exact thresholds on `p / p_max`
+   (a radix descent over integer histograms) and a pick by Gumbel noise of
+   (seed, position, token) from a counter-based generator. Its arithmetic is
+   repeated bit for bit on the host (`sample_reference`), which is what its
+   tests compare with. Under a tensor split every device holds the logits of
+   a slice of the vocabulary and the devices add up small partial results
+   between the sampler's steps. Only the picks and the eight best candidates
+   of each row (80 bytes per row) go to the host.
 5. **Commit.** For each sequence the accepted prefix is replayed into its
    recurrent state and the page table is cut after the last accepted row
    (`Sequence::truncate`). Drafters and their acceptance statistics are
@@ -477,7 +484,7 @@ have, with the fork's selection on top:
 | Part | What it is | State |
 | --- | --- | --- |
 | Lookup drafter | Continues the longest earlier occurrence of the current text, in this request or another: one suffix automaton over a corpus that all sequences share (`LookupCorpus`, `LookupDrafter`; after TensorRT-LLM, SGLang and vLLM's suffix decoding), with a confidence per proposed token and a bound on memory. It replaces the n-gram lookup per sequence; llama.cpp's map and cache variants are not built | Done and measured on text; the runtime still uses `NgramDrafter` |
-| MTP | The model's own draft head or block | With the model |
+| MTP | The model's own draft head or block | Done for `qwen35` on one device and under a tensor split: the block runs on the device with the embedding table, its chain and its picks stay on the device (`device/mtp.rs`); not under a layer split |
 | DFlash, DSpark, DFlash2 | A small draft model that reads the target's hidden states at a few layers and proposes a block of tokens at once | With the runtime: it needs taps on the target's layers and a second model on the same devices |
 | Drafter selection | Per sequence and step, the drafter with the highest expected tokens per millisecond, from measured acceptance and cost; drafters that were not chosen keep learning from what was accepted | `best_draft_len` and `Acceptance` done; the selector object that holds them per drafter is next |
 | Adaptive draft length | The length that maximises the same number | `best_draft_len` done |
@@ -535,6 +542,36 @@ against 256 tokens/s at full length). On the host a token costs about 0.2
 microseconds to read and a draft 0.4, eight and thirty times the n-gram
 lookup's cost; a long prompt is therefore read into the corpus as its rows
 are committed, not at once.
+
+**The model's own drafts** (`qwen35`, the next-token-prediction block of the
+27B). A step with them is still enqueued whole: the block's chain runs first,
+on the device that holds the embedding table, each link's pick made by the
+sampler with the settings and the noise of the row that will verify it and
+written straight into the token array of the step record on the device; then
+the verify window, whose embedding reads those tokens; then, for every row of
+the step, the block's own keys and values from the hidden states the model
+just computed. The host learns the drafts with the picks, counts the accepted
+ones and puts the commit into the next record. The conductor chooses per
+sequence and step between a lookup draft and the model's own by expected
+tokens per millisecond (`best_draft_len`), with the cost of a link measured on
+the device.
+
+Measured 2026-11-10 on Qwen3.8-27B (tensor split 0.625 / 0.375, RTX 4070 and
+RTX 3060, at most three drafts, the fork's draft vocabulary of 66 343 tokens,
+300 tokens per request through the chat template with the fork's
+`reasoning_effort`): 79, 76 and 79 tokens/s for German prose, English prose
+and code with the most probable token, 76, 72 and 83 sampled (temperature 1,
+top-k 20, top-p 0.95), against 40.5 without drafts and 62 to 67 for the fork
+with its production flags on the same questions. A link of the chain costs
+1.46 ms (it reads 335 MiB of the block and 278 MiB of the head), a step 34 ms
+for 2.5 to 2.9 tokens; the first draft is accepted in 74 to 83 % of the
+steps. The block takes 335 MiB of weights and 2.1 MiB of K and V per 1000
+tokens on its device, and nothing for its head, which is rows of the output
+head. With exact products the text with drafts equals the text without, for
+the most probable token and for sampled tokens with the same seed
+(`tests/qwen35_mtp_runtime.rs`); with the fast kernels a window of several
+rows rounds differently from single rows and the texts part after 150 to 650
+characters (the margins of the picks where they part were not measured).
 
 Adaptive draft length did not pay off in the llama.cpp fork (a few percent up
 for English and code, a few percent down for German). Two of its costs there
@@ -1044,35 +1081,55 @@ over the link is a later, measured option.
 
 Measured 2026-11-10 with `crates/model/examples/qwen35_run.rs`, one
 sequence, 8-bit activations, K and V in `q8`, the peer route. The llama.cpp
-fork on the same cards: 28 ms per token without drafts, about 1180 prompt
-tokens per second at 2048 tokens.
+fork on the same cards: about 1180 prompt tokens per second at 2048 tokens,
+28 ms per token without drafts (35.7 tokens per second), and 62 to 67 tokens
+per second with drafts from the MTP block and its production flags.
 
-| Placement | Decode at 1000 tokens | at 32000 | Prompt of 2048 tokens | VRAM taken at a context of 4096 |
+| | Tensor split 0.625 / 0.375 | Tensor split 0.7 / 0.3 | Layer split 0.62 / 0.38 | Fork |
 | --- | --- | --- | --- | --- |
-| Tensor split 0.625 / 0.375 | 26.4 ms | 31.6 ms (profile on) | 554 tokens/s, steps of 512 rows | 9500 / 5410 MiB |
-| Layer split 0.62 / 0.38 (44 and 20 blocks) | 41.4 ms | | 1348 tokens/s, steps of 1024 handed over in groups of 256 | 9582 / 5940 MiB |
+| Prompt of 2048 tokens | 1218 tokens/s | 1461 to 1474 | 1348 | about 1180 |
+| Decode without drafts, 1000 tokens of context | 24.8 ms (40.4 tokens/s) | 26.2 ms | 41.4 ms | 28 ms |
+| With the model's drafts, German / English / code | 79.3 / 75.6 / 79.0 tokens/s | | not built | 62 to 67 |
+| The same, sampled | 76.4 / 72.4 / 83.4 tokens/s | | | 63 to 66 |
+| VRAM taken at a context of 4096 | 9500 / 5410 MiB, with the draft block 10064 / 5540 | 10590 / 4362 MiB | 9582 / 5940 MiB | |
 
-Where a decode step in tensor split goes, in ms on the RTX 4070 | RTX 3060
-(with the profile's timed events, which cost about 1.9 ms of the step):
+The fork's numbers with drafts were measured on the same day on the same
+questions by running it with a copy of its production preset; the other fork
+numbers are older measurements of the same setup.
 
-| Context | Weight products | Layer kernels | Attention | Sums, with waiting | Step |
-| --- | --- | --- | --- | --- | --- |
-| 1000 | 21.3 \| 21.1 | 2.3 \| 3.3 | 0.45 \| 0.71 | 3.5 \| 2.4 | 28.3 |
-| 32000 | 21.3 \| 21.0 | 2.3 \| 3.3 | 2.8 \| 3.7 | 4.3 \| 2.5 | 31.6 |
+**The tensor split.** Each card holds a share of every matrix and the cards
+add their partial results twice per block. In the first version that made
+prompt processing half as fast as the fork (554 tokens per second): 128 sums
+per step, each moving rows x 5120 `f32` values in both directions over the
+RTX 3060's PCIe 3.0 x4 link, with nothing overlapped. Now:
 
-The weight products are at the floor that the memory bandwidth of the two
-cards sets (22.0 ms for a pass over all weights). What separates a step from
-it is the small layer kernels, the 129 sums and the cards waiting for each
-other at each sum. A row of drafts adds little to the products (24.4 ms for
-four rows), which is why drafts from the model are the next gain in decode.
+- The sum, the add to the residual stream, the next norm and its 8-bit
+  quantization are one kernel per half block, where there were four
+  launches.
+- Partials travel as `f16`, each row with a power-of-two factor so that no
+  finite value overflows. Every card adds the same rounded values in the
+  same order, so all hold the same residual stream bit for bit. With exact
+  products the partials travel as `f32`.
+- A step of more than 256 rows is cut into groups; one group's partials
+  travel while the next group computes. That overlap alone took the rate at
+  0.7 / 0.3 from 964 to 1464 tokens per second.
+- Few rows (a decode step) are pushed inside the merge kernel and need no
+  order from the host.
 
-Prompt processing in tensor split is slow because of the sums: 128 per
-step, each moving rows x 5120 `f32` values in both directions over the RTX
-3060's PCIe 3.0 x4 link, and not overlapped with the cards' work. As `f32`
-that is 2.6 MB per row and direction, which alone caps the rate near 1300
-rows per second on that link *(calc)*; the weight kernels allow 1536. The
-layer split has no sums and hands a step over in groups, so both cards work
-at once.
+Prompt processing is bound by the tensor cores now (76 to 79 % of each
+card's time at 0.7 / 0.3); the link carries 1.9 of about 3.3 GB/s. Without
+peer access prompts are as fast (1213 and 1461 tokens per second through
+host memory) and a decode step takes 26.8 ms. One share has to serve both:
+0.625 costs prompts 17 %, 0.7 costs decode 6 %. The shares are parameters;
+choosing them from a measurement at load is not built.
+
+**A decode step** without drafts is 24.8 ms, of which the weight products
+are 21 (the floor the memory bandwidth of the two cards sets is 22.0 ms for
+a pass over all weights). With the model's drafts a step is 34.1 ms for 2.5
+to 2.7 tokens: the draft block's chain takes about 4 ms of it (1.46 ms per
+draft token), the sampler 0.06 ms on the RTX 4070 and 0.28 ms on the RTX
+3060, the host 0.02 ms. At 32000 tokens of context a step without drafts
+was 28.2 ms *(measured by the agent that built the tensor split)*.
 
 Against the reference, on Qwen3.5-0.8B on one card: the most likely token
 is the reference's in 725 of 725 prompt rows with exact products and in 715
@@ -1081,8 +1138,9 @@ and 40 greedy tokens are equal except at one near tie in German. llama.cpp
 itself agrees with the reference in 704 of 725 rows.
 
 The weights are loaded in 10 to 12 s. The recurrent state takes 150 MiB per
-sequence over both cards, K and V 33 MiB per 1000 tokens. Picks are made on
-the host from logits read back.
+sequence over both cards, K and V 33 MiB per 1000 tokens. The model still
+loads its matrices in the file's layout; the device layouts above, which
+are faster from four rows on and exact, are not wired into it yet.
 
 ### Vulkan
 
@@ -1155,39 +1213,52 @@ Ares still copies llama.cpp without a reason, is
 
 State on 2026-11-10, on an RTX 4070 and an RTX 3060 with driver 615.78.08:
 
-- Qwen3.8-27B runs on both cards and answers through its chat template.
-  In tensor split it decodes at 26.4 ms per token against 28 ms for the
-  llama.cpp fork without drafts, and reads a prompt at 554 tokens per second
-  against about 1180: decode is at the cards' memory bandwidth, prompt
-  processing is held back by the sums between the cards. In layer split it
-  is the other way round (41.4 ms, 1348 tokens per second). The fork runs
-  with drafts from the model's MTP block, which Ares does not have yet, so
-  today the fork is the faster engine. See
+- Qwen3.8-27B runs on both cards through its chat template and is ahead of
+  the llama.cpp fork in tensor split: 1218 prompt tokens per second against
+  about 1180 (1461 to 1474 at shares of 0.7 / 0.3), 24.8 ms per token
+  without drafts against 28, and 76 to 79 tokens per second with the model's
+  own drafts against 62 to 67. See
   [Several devices](#several-devices).
-- Qwen3.8-Flash-Next runs in the CPU reference only.
-- The CUDA tests pass on both GPUs: 11 of the device layer, 5 of the decode
-  kernels, 9 of the prefill kernels, 12 of the layer kernels and 7 of the
-  attention kernels, the decode
-  and prefill ones also on real tensors of Qwen3.8-27B, the layer ones on a
-  chain of the real blocks of Qwen3.5-0.8B.
+- Qwen3.8-Flash-Next does not run on the devices yet. Its pieces exist and
+  are tested: the CPU reference, the model's own kernels (stream mixer,
+  n-gram block, indexer, selection), the router and expert kernels, and the
+  expert store with VRAM slots, a RAM tier, reads from SSD and the CPU
+  computing what is not on a GPU. The expert path alone, on the recorded
+  routing of the real model, runs at 33 to 44 steps per second and is bound
+  by reads from the file.
+- The CUDA tests pass on both GPUs, the kernel ones also on real tensors of
+  the test models: device layer, decode, prefill and device-layout kernels,
+  layer kernels, attention, sampler, sums between devices, experts, the
+  kernels of `qwen4exp`, and the models' own tests on the devices.
 - Decode weight kernels exist for all 28 weight types. One row runs at 95 to
   100 % of the memory limit of the RTX 4070 for the types of 4 bits and more;
   the low-bit types fall off from two rows on.
-- Prefill weight kernels work for eleven types. A pass over the weights of
-  Qwen3.8-27B runs at 1536 rows per second with 2048 rows, against about 1180
-  tokens per second for the whole prefill of the llama.cpp fork. The kernels
-  reach a third of the tensor cores' integer peak and are bound by how the
-  activations reach them (see [Devices](#devices)).
+- Twelve weight types (the K quantizations, the legacy 4-, 5- and 8-bit
+  types, IQ4_XS and IQ4_NL) have a device layout: the matrix is rearranged
+  at load in the bytes of the file and one copy serves every row count on
+  the tensor cores, with exact arithmetic (0.03 to 0.09 % against the exact
+  product). A pass over the weights of Qwen3.8-27B takes 23.4 ms with one
+  row, 25.4 with eight, 31.0 with sixteen and runs at 1644 rows per second
+  with 1024, against 22.0, 34.8, 74.3 ms and 1483 rows per second in the
+  file's layout: slower by 6 % at one row, ahead from four rows on. The
+  other types have prefill kernels in the file's layout or are served by
+  the decode kernels at any row count.
 - The layer kernels of `qwen35` (everything between the matrix products) are
   within 7e-7 of the CPU reference.
 - The KV formats are specified, pinned by golden files and measured on the K
   and V of real models, and attention over the stored formats has a CPU
   reference (`ares_quant::kvhead`). The CUDA kernels write them bit-exactly
   and read them within 1e-3 of the reference; one row over 262144 cells
-  takes 2.2 ms per layer on the RTX 4070 in `q8`.
-- Being written and not in this state yet: the two test models on the
-  devices, the path of an expert from SSD into a VRAM slot, and the Vulkan
-  mirrors. Prefill kernels for the other 17 weight types are not
+  takes 1.4 ms per layer on the RTX 4070 in `q8` and 0.95 ms in `q4`. Dense
+  reads of that length matter for the dense test model only; a model that
+  attends like Flash-Next reads at most 2051 cells per row, and for those
+  short lists the kernels still need work (see [Devices](#devices)).
+- Being written and not in this state yet: Flash-Next on the devices, and
+  on Vulkan the device layouts of the weights, the layer kernels and
+  attention. Not started: the device layouts in the model's loader, drafts
+  under a layer split and for Flash-Next, penalties and grammars in the
+  sampler, and wiring admission, the prefix cache and the lookup drafter
+  into the conductor. Prefill kernels for the other 17 weight types are not
   started; the decode kernels serve those types at any row count.
 - The tokenizer gives llama.cpp's token ids and chat prompts for the three
   test models and encodes 76 to 85 MB of text per second on one core.
