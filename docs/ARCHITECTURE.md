@@ -157,18 +157,18 @@ machine (RTX 4070 + RTX 3060, Qwen3.8-27B) or read from the engines listed in
 | `ares-vulkan` | The same device-level surface on Vulkan; decode and prefill weight kernels for all 28 weight types as compute shaders, the prefill ones on cooperative matrices; sums between devices | Device layer and weight kernels done (23 device, 11 kernel and 9 mesh tests on both GPUs); no layer or attention kernels and no model yet |
 | `ares-state` | Page pool, page tables with copy on write, the prefix index (pages published as they fill, tails, announcements, priority classes), the checkpoint policy for recurrent state, page layouts | Done as bookkeeping; randomised model checks; the conductor does not use the new parts yet |
 | `ares-store` | State on disk: pages and checkpoints by content hash in segment files, per fingerprint, with a size limit | Done as a store of opaque bytes, tested against restarts, the limit and damaged files; not yet connected to devices |
-| `ares-io` | Reads of weights straight from the model file: io_uring with direct I/O, demand before prefetch, cancel and promote, copies of a file on several drives with the reads spread over them, a map from experts to file ranges, row reads behind a cache | Done, tested against real files and on two drives; 1.4 to 1.7 GiB/s of random expert-sized reads per SSD of the development machine and 2.9 to 3.0 GiB/s over both; not yet connected to devices |
-| `ares-sched` | Step planner (generation, decision rows and prompts in one step), admission (pages claimed per step, a reservation that corrects itself, a queue instead of refusals), the order of a pass for long prompts of a model with experts, step time model with a term for the context, draft length choice, the lookup drafter on a suffix automaton shared by all sequences | Done as bookkeeping; unit and model tests; admission and the lookup drafter are not wired into the conductor yet |
-| `ares-weights` | Expert heat, tiers that are elected and fed by reads (admission, protection, guesses bound late, slots given back), slots per layer by need, the waves of experts of a pass, a token table for the first layers, the lookahead distance, routing bias for pruning | Done as bookkeeping, unit tested and tried on synthetic routing; no runtime uses it yet |
-| `ares-api` | Request, event, decision and error types; the `Engine` trait between HTTP and the runtime (`submit` for generation, `decide` for decisions) | Done, unit tested |
-| `ares-server` | OpenAI-compatible HTTP server, `POST /v1/systemone` (wire-compatible with llama.cpp's, served for any model) and the `ares` binary | Done as a front end, tested against a mock engine; answers that no model architecture is implemented until the runtime exists |
-| `ares-runtime` | The conductor thread and one thread per device, the step loop that connects plan, state and kernels, speculation with the n-gram drafter, the `Model` trait a model implements, a synthetic model that drives the real kernels | Drives `qwen35` on one device, in tensor split and in layer split; implements `Engine::submit` (not `decide`), greedy picks on the host, no prefix cache, drafts from the n-gram lookup only |
-| `ares-model` | Model architectures: configuration and weight table from a GGUF, and a CPU reference of the forward pass with explicit state (window and commit) that GPU implementations are compared with block by block | `qwen35` (Qwen3.5-0.8B, Qwen3.8-27B): the reference is equal to llama.cpp to rounding on a model with f32 weights, and the device implementation (`qwen35::device`) runs both models on the GPUs, see [Several devices](#several-devices). `qwen4exp` (Qwen3.8-Flash-Next): reference done, equal to the llama.cpp fork to rounding on a small synthetic model and to Strata's greedy tokens on the real file; no device implementation yet |
+| `ares-io` | Reads of weights straight from the model file: io_uring with direct I/O, demand before prefetch, cancel and promote, copies of a file on several drives with the reads spread over them, a map from experts to file ranges, row reads behind a cache | Done, tested against real files and on two drives; 1.4 to 1.7 GiB/s of random expert-sized reads per SSD of the development machine and 2.9 to 3.0 GiB/s over both; the expert store and the n-gram rows of `qwen4exp` read through it |
+| `ares-sched` | Step planner (generation, decision rows and prompts in one step), admission (pages claimed per step, a reservation that corrects itself, a queue instead of refusals), the order of a pass for long prompts of a model with experts, step time model with a term for the context, draft length choice, the lookup drafter on a suffix automaton shared by all sequences | Done; unit and model tests; the conductor uses the planner, admission (without spill), the lookup drafter and the step cost |
+| `ares-weights` | Expert heat, tiers that are elected and fed by reads (admission, protection, guesses bound late, slots given back), slots per layer by need, the waves of experts of a pass, a token table for the first layers, the lookahead distance, routing bias for pruning | Done, unit tested; the expert store uses the slot sets, the heat and the split of slots; guesses, the token table and pruning are not used by a running model yet |
+| `ares-api` | Request, event, decision and error types; the `Engine` trait between HTTP and the runtime (`submit` for generation, `decide` for decisions, `stats`) | Done, unit tested |
+| `ares-server` | The `ares` binary: loads a model on the devices and serves it over an OpenAI-compatible HTTP API, with the plan of devices, split, shares and context made from what the devices report | Serves `qwen35` models (chat and plain completions, streamed and not, timings, metrics, staged shutdown); 101 tests without a GPU and 7 that start the real binary; no router mode, no multimodal input, no tool calls, `/v1/systemone` answers 501 |
+| `ares-runtime` | The conductor thread and one thread per device, the step loop that connects plan, state and kernels, admission, speculation with the lookup drafter and with a model's own drafts, the `Model` trait a model implements, a synthetic model that drives the real kernels, and the expert store (VRAM slots, RAM tier, reads, the CPU computing what is not on a GPU) | Drives `qwen35` on one device, in tensor split and in layer split, with picks made on the device; implements `Engine::submit` (not `decide`); no prefix cache and no spill; the expert store is driven by `qwen4exp`'s own session, not by the conductor |
+| `ares-model` | Model architectures: configuration and weight table from a GGUF, a CPU reference of the forward pass with explicit state (window and commit) that GPU implementations are compared with block by block, and the implementation on the devices | `qwen35` (Qwen3.5-0.8B, Qwen3.8-27B) runs through the runtime and the server, with the model's draft block. `qwen4exp` (Qwen3.8-Flash-Next) runs on one or two cards through a session of its own, without drafts. See [Several devices](#several-devices) |
 | `ares-tokenizer` | Text to token ids and back for byte-level BPE (`gpt2` with the `qwen35` pre-tokenizer) as llama.cpp does it, malformed UTF-8 included; control tokens in text only on request; encoding on several threads for long prompts; a streaming decoder that never cuts a character; the chat templates of the model file (Jinja, a dialect of its own that errors on what it does not support) with tools and the generation prompt | Done; token ids equal llama.cpp's on millions of generated and real texts for the three Qwen test models, chat prompts equal on thousands of conversations; about 20 times llama.cpp's encode speed on one core |
 
-The second test architecture, `qwen4exp`, is specified in
-[reference/qwen4exp-architecture.md](reference/qwen4exp-architecture.md); its
-kernels and its path for experts are being built.
+Both test architectures are specified under [reference/](reference/):
+[qwen35](reference/qwen35-architecture.md) and
+[qwen4exp](reference/qwen4exp-architecture.md).
 
 ## A step
 
@@ -1137,10 +1137,61 @@ of 725 with 8-bit activations (the widest margin missed is 0.106 logits),
 and 40 greedy tokens are equal except at one near tie in German. llama.cpp
 itself agrees with the reference in 704 of 725 rows.
 
-The weights are loaded in 10 to 12 s. The recurrent state takes 150 MiB per
-sequence over both cards, K and V 33 MiB per 1000 tokens. The model still
-loads its matrices in the file's layout; the device layouts above, which
-are faster from four rows on and exact, are not wired into it yet.
+The weights are loaded in about 4 s from a cached file. The recurrent state
+takes 150 MiB per sequence over both cards, K and V 33 MiB per 1000 tokens.
+
+**Device layouts in the model.** At load the model probes its own products
+in both layouts, for every type and shape, at the rows it decodes with and
+at a prompt group, and gives each group of matrices the layout that does not
+slow a decode step and is fastest for prompts after that. Measured
+2026-11-11 at shares of 0.625 / 0.375, every matrix in the file's layout
+against the measured choice: prompts at 1234 to 1243 against 1285 to 1291
+tokens per second, a decode step without drafts 24.7 against 24.8 ms, with
+the model's drafts 81.0 / 76.7 / 78.7 against 81.8 / 84.2 / 85.5 tokens per
+second (a step of 34.2 against 32.4 ms). The gain is in windows of drafts
+and in prompts: at one row the device-layout kernels are slower than the
+integer kernels on most matrices, so without drafts most of the model stays
+in the file's layout. With every matrix in the device layout prompts run at
+1360 tokens per second and a decode step is 7 % slower *(measured by the
+agent that built the choice)*.
+
+### Qwen3.8-Flash-Next on the two cards
+
+Measured 2026-11-11 with `crates/model/examples/qwen4exp_run.rs`, one
+sequence, no drafts, a missing expert uploaded. Strata on the same machine
+(its log of 2026-11-07): 128 tokens generated at 12 to 76 tokens per second,
+median 56, with drafts; prompts read at 42 to 201 tokens per second.
+
+The model is 63.5 GiB on a machine with 24 GB of VRAM and 31 GB of RAM. The
+dense parts (3.4 GiB) are in VRAM, 14 100 of the 24 576 experts have a VRAM
+slot (19.4 GiB), a RAM tier holds some thousands more, and the rest is read
+from the file when the router picks it. On recorded text 99 % of the picks
+find their expert in a slot.
+
+| Placement | Decode step at 1000 tokens, median | Fastest | At 8192 tokens |
+| --- | --- | --- | --- |
+| By layers (0..25 on one card, 25..48 on the other) | 25.2 ms | 21.8 ms | 31.1 ms *(agent)* |
+| Both cards on every layer | 22.3 ms (19.6 on a quiet drive *(agent)*) | 16.5 ms | 21.8 ms *(agent)* |
+
+In the first placement the cards work one after the other. In the second
+one card mixes the residual streams and runs the router, attention and the
+head, the other computes its share of the recurrent heads and of the experts
+of every layer, and one sum per half block joins them; no weight is on both.
+A step that misses no expert takes about 17 ms. The median is above that
+because an expert that is in no slot now holds both cards while it is
+fetched, and an upload to the RTX 3060 takes 0.4 ms over its link.
+
+Against the CPU reference the largest logit of a prompt's last token is the
+reference's in every run, 9 or 10 of the 10 largest agree, and the next
+token is the reference's in 159 or 160 of 160 German and 79 of 80 English
+rows; the rows that differ are near ties. The model runs through a session
+of its own, with at most eight rows per step: prompts are read at 54 to 73
+tokens per second *(agent)*, bound by experts that have to be fetched.
+
+An expert that is in no slot can be computed on the CPU instead of being
+uploaded, chosen per expert by measured cost. On the recorded routing with
+few slots that took the expert path from 33 to 44 steps per second; with 99
+% of the picks in a slot it makes no measurable difference to the model.
 
 ### Vulkan
 
@@ -1224,128 +1275,71 @@ Ares still copies llama.cpp without a reason, is
 
 ## Status
 
-State on 2026-11-10, on an RTX 4070 and an RTX 3060 with driver 615.78.08:
+State on 2026-11-11, on an RTX 4070 and an RTX 3060 with driver 615.78.08.
+Work is paused here until Qwen4 is released; nothing below is in progress.
 
-- Qwen3.8-27B runs on both cards through its chat template and is ahead of
-  the llama.cpp fork in tensor split: 1218 prompt tokens per second against
-  about 1180 (1461 to 1474 at shares of 0.7 / 0.3), 24.8 ms per token
-  without drafts against 28, and 76 to 79 tokens per second with the model's
-  own drafts against 62 to 67. See
-  [Several devices](#several-devices).
-- Qwen3.8-Flash-Next does not run on the devices yet. Its pieces exist and
-  are tested: the CPU reference, the model's own kernels (stream mixer,
-  n-gram block, indexer, selection), the router and expert kernels, and the
-  expert store with VRAM slots, a RAM tier, reads from SSD and the CPU
-  computing what is not on a GPU. The expert path alone, on the recorded
-  routing of the real model, runs at 33 to 44 steps per second and is bound
-  by reads from the file.
-- The CUDA tests pass on both GPUs, the kernel ones also on real tensors of
-  the test models: device layer, decode, prefill and device-layout kernels,
-  layer kernels, attention, sampler, sums between devices, experts, the
-  kernels of `qwen4exp`, and the models' own tests on the devices.
-- Decode weight kernels exist for all 28 weight types. One row runs at 95 to
-  100 % of the memory limit of the RTX 4070 for the types of 4 bits and more;
-  the low-bit types fall off from two rows on.
-- Twelve weight types (the K quantizations, the legacy 4-, 5- and 8-bit
-  types, IQ4_XS and IQ4_NL) have a device layout: the matrix is rearranged
-  at load in the bytes of the file and one copy serves every row count on
-  the tensor cores, with exact arithmetic (0.03 to 0.09 % against the exact
-  product). A pass over the weights of Qwen3.8-27B takes 23.4 ms with one
-  row, 25.4 with eight, 31.0 with sixteen and runs at 1644 rows per second
-  with 1024, against 22.0, 34.8, 74.3 ms and 1483 rows per second in the
-  file's layout: slower by 6 % at one row, ahead from four rows on. The
-  other types have prefill kernels in the file's layout or are served by
-  the decode kernels at any row count.
-- The layer kernels of `qwen35` (everything between the matrix products) are
-  within 7e-7 of the CPU reference.
+- **Qwen3.8-27B** runs on both cards through the runtime and the server and
+  is ahead of the llama.cpp fork in tensor split: a prompt of 2048 tokens at
+  1285 to 1291 tokens per second against about 1180, a decode step without
+  drafts in 24.8 ms against 28, and 82 to 86 tokens per second with the
+  model's own drafts against 62 to 67. Through HTTP it is as fast as without.
+  See [Several devices](#several-devices).
+- **Qwen3.8-Flash-Next** runs on both cards, agrees with the CPU reference
+  and answers in German and English. A decode step at 1000 tokens of context
+  takes a median of 22.3 ms without drafts (about 45 tokens per second; a
+  step that misses no expert takes 17 ms). Strata generates at a median of
+  56 tokens per second with drafts on this machine, so this model is not
+  ahead of its reference engine yet: it has no drafts, and prompts are read
+  at 54 to 73 tokens per second in steps of eight rows.
+- CUDA has every kernel family the two models need: weights for all 28
+  types (twelve with a device layout that serves every row count from one
+  copy), layers, attention over the stored K/V formats, sampler, sums
+  between devices, router and experts, the kernels of `qwen4exp`. The CUDA
+  tests pass on both cards, the kernel ones also on real tensors.
+- Vulkan has the weight kernels (the same device layouts, byte for byte) and
+  the layer kernels, at CUDA's speed on these cards. It has no attention, no
+  expert, sampler or `qwen4exp` kernels and no model.
 - The KV formats are specified, pinned by golden files and measured on the K
-  and V of real models, and attention over the stored formats has a CPU
-  reference (`ares_quant::kvhead`). The CUDA kernels write them bit-exactly
-  and read them within 1e-3 of the reference; one row over 262144 cells
-  takes 1.4 ms per layer on the RTX 4070 in `q8` and 0.95 ms in `q4`. Dense
-  reads of that length matter for the dense test model only; a model that
-  attends like Flash-Next reads at most 2051 cells per row, and for those
-  short lists the kernels still need work (see [Devices](#devices)).
-- Being written and not in this state yet: Flash-Next on the devices, and
-  on Vulkan the device layouts of the weights, the layer kernels and
-  attention. Not started: the device layouts in the model's loader, drafts
-  under a layer split and for Flash-Next, penalties and grammars in the
-  sampler, and wiring admission, the prefix cache and the lookup drafter
-  into the conductor. Prefill kernels for the other 17 weight types are not
-  started; the decode kernels serve those types at any row count.
-- The tokenizer gives llama.cpp's token ids and chat prompts for the three
-  test models and encodes 76 to 85 MB of text per second on one core.
-- The server crates and the quantization reference were verified through
-  their own test suites.
-- Real model files are test data and stay outside the repository. The reader
-  opens Qwen3.8-27B (14.3 GiB, architecture `qwen35`) in 22 ms and the split
-  Qwen3.8-Flash-Next (63.5 GiB in two parts, `qwen4exp`, 1 224 tensors) in
-  28 ms; the latter's metadata matches
-  [reference/strata-notes.md](reference/strata-notes.md).
+  and V of real models; the CUDA kernels write them bit-exactly and read
+  them within 1e-3 of the CPU reference. The dense model uses `q8` for K
+  and V; the formats with a tile mean (`q7` to `q4`) are not wired into a
+  model.
+- Known defects: a warm-up step that fails hangs the start of the runtime
+  instead of reporting; the first token of a prompt that arrives next to a
+  drafting sequence takes about 0.4 s; with the fast kernels the text with
+  drafts is not always the text without (with exact products it is); a
+  model that only runs on Turing has no prefill and no attention path.
+- Real model files are test data and stay outside the repository.
 
 ## Next steps
 
-The order follows the ranked list in
-[reference/serving-engines-code-survey.md](reference/serving-engines-code-survey.md);
-the source of each item is named there.
+Nothing is being worked on until Qwen4 is released. What is open, in the
+order it would be taken up; the source of each idea is in
+[reference/serving-engines-code-survey.md](reference/serving-engines-code-survey.md).
 
-1. Kernels, in progress. Weight kernels for all 28 GGUF types on a device
-   layout per class of type: the matrix is rearranged at load into the order
-   the tensor cores read it and decoded in registers, in the same number of
-   bytes. Above a measured row count, one decode of the matrix into `f16`
-   scratch and a dense product. Which kernel serves which shape and row
-   count comes from a table measured per device, not from constants.
-   Attention over the stored K/V read through page tables, and the kernels
-   that write K and V. The layer kernels of `qwen35`. A Turing path. Every
-   kernel on both backends.
-2. The sampler: one kernel per row in which every filter is a threshold on
-   `p / p_max`, exact cut-offs from a radix descent, the pick by noise keyed
-   by seed, position and token, the best candidates per row recorded for the
-   grammar, penalties as sparse lists from the host.
-3. Wiring what `ares-sched` and `ares-state` now decide into the conductor:
-   admission in place of the reservation of a request's longest possible
-   length (which is a slot under another name), the prefix index with tails
-   and held-back prompts, the checkpoint policy, the lookup drafter, the
-   step cost with its context term. The paths they need do not exist in the
-   runtime yet: spilling and restoring a sequence, storing a checkpoint, and
-   rows that are replayed without writing K and V.
-4. `ares-runtime` beyond the skeleton: wider steps through the prefill
-   kernels, decisions (`Engine::decide`), and steps that overlap. The rules
-   for overlap: the pick stays in a device table the next step reads, a
-   finish by end token is seen one step late and its row dropped, pages freed
-   by a commit are reusable only after the step in flight, and a restore is
-   issued per layer with an event the forward stream waits for. The Vulkan
-   backend.
-5. Checkpoints stored in `f16` (75 MiB for Qwen3.8-27B; measured to cost
-   nothing visible), in VRAM, RAM and on disk under the policy's budget.
-6. The two test models, side by side, each clearly ahead of the engine it
-   replaces. `qwen35`: the tensor split's sums (in `f16`, overlapped with the
-   cards' work, shares balanced per layer), drafts from the MTP block with
-   picks on the device, then the comparison with the llama.cpp fork running
-   its drafts. `qwen4exp`: the path of an expert from SSD over RAM into a
-   VRAM slot and through its kernel, measured on the experts of Flash-Next,
-   then the model's own kernels (stream mixer, n-gram rows, indexer, block
-   selection, attention over a list of cells), the model on the devices and
-   the comparison with Strata. Architecture work for the release waits for
-   Qwen4.
-7. Weight placement and the split planner; connecting `ares-io` and
-   `ares-store` to the devices; residency of pages (a fixed GPU working set
-   over K/V in pinned RAM), background writes and restores, and suspension
-   of a request as a byte copy, which doubles as the test oracle for all
-   state handling.
-8. Speculation: model drafts kept on the device, a budget of draft rows
-   across requests by survival probability, the draft heads (MTP of both
-   test models) and draft models, and a measurement of the lookup drafter on
-   German text and with a real model.
-9. Structured output with llguidance on the GPU's candidates; forced tokens
-   as rows that are neither sampled nor verified; the mask filled while the
-   device computes; requests whose grammar is compiling in their own queue;
-   tool calls as grammars with a trigger. Multimodal input (the projector
-   files that ship next to the models) comes with the first model that has
-   one.
-
-Every kernel is written for both backends and verified against the same CPU
-reference.
+1. Qwen4 itself: its architecture next to `qwen4exp`, and whatever its
+   files need.
+2. The mixture-of-experts case ahead of Strata: drafts from the model's
+   draft block; the prompt path (experts in waves, tensor-core kernels for
+   the experts' types, steps of more than eight rows); the model behind the
+   runtime's `Model` with flow control by route records, so the server can
+   serve it; owners of experts that follow the heat.
+3. Attention for models that attend a few thousand cells through lists: the
+   kernel chosen by a measurement on the device, staged loads where they
+   pay, one launch per row, items of twelve query heads, rows of a prompt
+   that share cells; and the K/V formats with a tile mean in a model.
+4. The prefix cache with checkpoints of recurrent state, spill and restore
+   of a sequence, pages that move between VRAM, RAM and `ares-store`.
+5. A kernel for one to three rows on the device layout that is not slower
+   than the integer kernels, so the dense model can hold every matrix in it;
+   shares of a tensor split from a measurement at load; device layouts for
+   the remaining types.
+6. Vulkan: attention, experts, sampler, the `qwen4exp` kernels, and the
+   models; a faster upload.
+7. The sampler's penalties and grammars (llguidance), tool calls, the
+   router mode with `models.ini`, multimodal input, `Engine::decide` and
+   `/v1/systemone` on the real engine.
+8. A path for Turing; a run on any card that is not one of the two here.
 
 ## Host memory
 
@@ -1409,11 +1403,31 @@ yet.
 
 ## Server
 
-The server is used like llama.cpp's: flags, and a router mode driven by a
-preset file (`models.ini`, one section per model) that loads and unloads
-models on request and keeps as many loaded as fit. Today the binary takes
-`--host`, `--port` and `--model`; presets and the router come with the
-runtime.
+`ares --model <file.gguf>` loads a model on the devices and serves it.
+Without options it plans for itself: the first device that holds the weights
+and a context, or else a tensor split over all devices with shares from the
+memory bandwidth each device reports, and a context from the VRAM that is
+left; the start-up report says what was chosen, why, and where the VRAM
+went. Devices, split, shares, context, K/V format, precision and drafts can
+be given instead.
+
+It answers `POST /v1/chat/completions` and `/v1/completions`, streamed and
+not, `GET /v1/models`, `/health` and `/metrics`, with timings in every answer
+(prompt tokens and time, generated tokens and time, drafts proposed and
+accepted). A field of a request that the server does not hand to the engine
+is refused by name, not ignored: grammars, logit bias, penalties, tools and
+images among them today. A client that disconnects frees its sequence. The
+first signal lets running requests finish, the second ends them, and the
+devices are released before the process exits.
+
+Measured 2026-11-11 with Qwen3.8-27B on both cards: 79.2, 75.3 and 78.8
+tokens per second for German, English and code through HTTP, which is what
+the same model gives without HTTP; the first token after 76 to 121 ms; two
+requests at once at 63 tokens per second each.
+
+A router mode driven by a preset file (`models.ini`, one section per model)
+that loads and unloads models on request, and multimodal input, are not
+built.
 
 The set of flags is the engine's own and starts from nothing. A flag exists
 only for something that is worth setting: a real choice (KV formats, context

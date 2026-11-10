@@ -15,13 +15,14 @@ How the engine is built and how far each part is: [docs/ARCHITECTURE.md](docs/AR
 
 ## State
 
-Two test models stand in for Qwen4 until it is released. Qwen3.8-27B runs on
-two GPUs through CUDA, with drafts from the model's own draft block and
-sampling on the device, and is ahead of the llama.cpp fork it is measured
-against in prompt processing and in generation. Qwen3.8-Flash-Next, a
-mixture of experts streamed from SSD, has every piece built and tested (the
-CPU reference, its kernels, the expert tiers with the CPU computing what is
-not on a GPU) and is being put together on the devices. The numbers are in
+Two test models stand in for Qwen4 until it is released. Qwen3.8-27B is
+served by the `ares` binary on two GPUs through CUDA, with drafts from the
+model's own draft block and sampling on the device, and is ahead of the
+llama.cpp fork it is measured against in prompt processing and in
+generation. Qwen3.8-Flash-Next, a mixture of experts streamed from SSD,
+runs on the same two GPUs and agrees with its CPU reference, but is not
+served yet and not yet faster than Strata, the engine it is measured
+against. Work is paused until Qwen4. The numbers are in
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#status). There is no release
 before Qwen4.
 
@@ -38,6 +39,12 @@ cargo build --release
 ```sh
 cargo run --release --bin ares -- --model model.gguf
 ```
+
+Without further options the server chooses the devices, the split and the
+context from what the GPUs report and says what it chose; `--help` lists
+the options. A build for one machine can name its GPU generations, for
+example `ARES_CUDA_ARCHS=86,89`, instead of building the kernels for all
+eight.
 
 ## Tests
 
