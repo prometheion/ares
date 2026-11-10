@@ -29,8 +29,9 @@ Scope decisions:
 - **Every GGUF weight type.** A model file may carry any of the 28 types
   that hold weights (the float types, the legacy and K quantizations, the
   i-quants, the ternary and 1-bit types, the 4-bit float types), and each has
-  its kernels on both backends. The eleven types of Qwen3.8-27B came first
-  because that file was the reference; the others are being added.
+  its kernels on both backends. Both backends have a decode kernel for every
+  type. The kernels for many rows cover the eleven types of Qwen3.8-27B, the
+  first reference file, and are being extended.
 
 - **No engine is the model for this one.** llama.cpp, vLLM, SGLang, Strata
   and the others are references, each for what it does best, and a design is
@@ -131,7 +132,7 @@ machine (RTX 4070 + RTX 3060, Qwen3.8-27B) or read from the engines listed in
 | `ares-core` | Tensor element types and block geometry, byte units, memory ledgers | Done, unit tested |
 | `ares-gguf` | Zero-copy GGUF reader (version 3, split files, validation at open), a small writer for tests | Done; tested against synthetic, truncated and corrupted files and real models |
 | `ares-quant` | CPU reference decoder for every GGUF type; the specification and reference codec of the engine's own KV formats (`f16`, `q8` to `q4`, tiles with a mean, the policy of exact cells) | Done; bit-identical to ggml's C code on fixtures generated from it; the KV formats are pinned by golden files and were measured on the K and V of real models |
-| `ares-cuda` | Driver API bound at run time, devices, memory, streams, events, modules, the decode and prefill weight kernels for eleven quantization types, the mesh that sums across devices over peer access or the host | Device layer and decode kernels done; prefill kernels work and are verified but are not yet faster than the fork; tested on both GPUs, with and without peer access |
+| `ares-cuda` | Driver API bound at run time, devices, memory, streams, events, modules, decode weight kernels for all 28 weight types and prefill weight kernels for eleven, the mesh that sums across devices over peer access or the host | Device layer and decode kernels done; prefill kernels work and are verified but are not yet faster than the fork; tested on both GPUs, with and without peer access |
 | `ares-vulkan` | The same device-level surface on Vulkan, the same first kernels as compute shaders | Done; 23 device tests pass on both GPUs |
 | `ares-state` | Page pool, page tables with copy on write, prefix index with checkpoints, page layouts | Done; randomised model check |
 | `ares-store` | State on disk: pages and checkpoints by content hash in segment files, per fingerprint, with a size limit | Done as a store of opaque bytes, tested against restarts, the limit and damaged files; not yet connected to devices |
@@ -565,32 +566,51 @@ and PTX as the baseline, and the prefill kernels for Ampere and newer only.
 - `Stream` and `Event` order work on and between devices.
 - `Kernels` gives one typed launch per kernel.
 
-**Decode weight kernels.** A quantized matrix times 1 to 8 rows of
-activations, which is what decides decode speed. The activations are
-quantized once per input to int8 with a scale per group of 32, and the kernels
-compute integer dot products (`__dp4a`) straight on the weight codes, for the
-eleven types of the test model (iq4_xs, q4_K, q5_K, q6_K, q3_K, iq3_s,
-iq4_nl, iq3_xxs, iq2_s, iq2_xs, q8_0). Each is verified tightly against a CPU
-emulation of the same arithmetic and loosely against the exact f32 product
-(about 1 % rms from quantizing the activations).
+**Decode weight kernels.** A matrix times 1 to 8 rows of activations, which
+is what decides decode speed, for all 28 weight types (`kernels/mmvq.cuh`,
+`mmvq_more.cuh`, `mmvq_float.cuh`). For the quantized types the activations
+are quantized once per input to int8 with a scale per group of 32, and the
+kernels compute integer dot products (`__dp4a`) straight on the weight codes;
+scales and offsets are applied once to the integer sum, never per value. The
+float types (f32, f16, bf16) multiply the exact activations, of which the
+prepared buffer holds an f32 copy. Each kernel is verified tightly against a
+CPU emulation of the same arithmetic and loosely against the exact f32
+product: about 1 % rms for the quantized types, from quantizing the
+activations, and nothing beyond f32 rounding for the float types. Real tensors
+of the test models cover 17 types. The other 11 (q4_0, q4_1, q5_0, q5_1,
+q2_K, iq1_s, tq1_0, tq2_0, mxfp4, nvfp4, q1_0) are tested on generated blocks
+only, because no model at hand carries them.
 
-Measured 2026-11-09 against the memory limit of each card (479 GB/s on the
+Measured 2026-11-10 against the memory limit of each card (479 GB/s on the
 RTX 4070, 341 GB/s on the RTX 3060, measured with a plain reading kernel), at
-17408 x 5120:
+17408 x 5120, in percent of the limit:
 
-- One row: 89 to 98 % of the limit on the 4070 for every type; on the 3060 97
-  to 99 % for seven types and 62 to 82 % for q3_K and the iq2/iq3 types, whose
-  decoding costs more instructions than that card has to spare.
-- Five to eight rows are much weaker (down to 26 % on the 3060): there the
-  work is arithmetic, and a tensor-core path is the fix. That is the prefill
-  kernel family below, which takes over from 7 to 21 rows depending on the
-  type.
+| Types | RTX 4070, 1 row | 8 rows | RTX 3060, 1 row | 8 rows |
+| --- | --- | --- | --- | --- |
+| 4 bits and more, floats (q4_K, q5_K, q6_K, q8_0, iq4_xs, iq4_nl, q4_0, q4_1, q5_0, q5_1, mxfp4, nvfp4, f32, f16, bf16) | 95 to 100 | 71 to 98 | 93 to 100 | 46 to 92 |
+| 3 bits (q3_K, iq3_s, iq3_xxs) | 87 to 96 | 39 to 63 | 63 to 82 | 26 to 44 |
+| 2 bits and fewer (q2_K, iq2_s, iq2_xs, iq2_xxs, iq1_s, iq1_m, tq2_0, q1_0, q2_0) | 65 to 94 | 29 to 57 | 47 to 88 | 19 to 38 |
+| tq1_0 | 14 | 10 | 9 | 7 |
+
+- One row of Q4_K takes 0.107 ms on the 4070 and 0.150 ms on the 3060.
+- The types of 4 bits and more hold 90 % or more up to four rows on the 4070.
+  The low-bit types fall off from two rows on, because their work is integer
+  arithmetic (a `dp4a` per four weights and row), not memory. They need the
+  tensor cores from about three rows on, which is the register kernel of the
+  prefill family below.
+- A weight load narrower than a 32-byte sector must not bypass the L1 cache
+  on these cards, or it requests its sector from L2 again with every
+  instruction. Fixing that took iq4_xs at eight rows from 322 to 428 GB/s on
+  the 4070 and from 163 to 244 on the 3060.
+- TQ1_0 is bound by the loads of its activations (five scattered words and
+  five scales per lane) and is the one type far from the limit at one row.
 - Hardware counters (`ncu`) are blocked for non-root users on the development
   machine, so what bounds a kernel was established by ablation and `nsys`.
 
 A pass over all weight matrices of Qwen3.8-27B (13.8 GiB, 96 % of the file,
-split 0.625 / 0.375 over the two cards) takes 21.7 ms with one row, 23.2 ms
-with three and 38.0 ms with eight. That is a lower bound for a decode step
+split 0.625 / 0.375 over the two cards) takes 22.0 ms with one row, 23.2 ms
+with three, 24.4 ms with four and 34.6 ms with eight (38.0 ms before the load
+fix). That is a lower bound for a decode step
 (no attention, recurrence, sums or sampling); the llama.cpp fork needs 28 ms
 for the whole step. Uploading those weights took 1.9 s with the file in the
 page cache and 9.5 to 12 s from a cold disk, through the simple path;
@@ -818,17 +838,19 @@ State on 2026-11-10, on an RTX 4070 and an RTX 3060 with driver 615.78.08:
   route) and with the patched one (peer routes): 11 of the device layer, 5 of
   the decode kernels, 6 of the prefill kernels, the last two also on real
   tensors of Qwen3.8-27B.
-- Decode weight kernels run one row at 89 to 98 % of the memory limit of the
-  RTX 4070. Prefill weight kernels work for all eleven types but reach only a
+- Decode weight kernels exist for all 28 weight types. One row runs at 95 to
+  100 % of the memory limit of the RTX 4070 for the types of 4 bits and more;
+  the low-bit types fall off from two rows on. Prefill weight kernels work
+  for eleven types but reach only a
   quarter of the tensor cores' integer peak and are not yet ahead of the
   llama.cpp fork (see [Devices](#devices)).
 - The KV formats are specified, pinned by golden files and measured on the K
   and V of real models, and attention over the stored formats has a CPU
   reference (`ares_quant::kvhead`). The GPU kernels that read and write them
   are being written.
-- Being written and not in this state yet: weight kernels for the other 17
-  GGUF types, prefill kernels on a device layout, the layer kernels of
-  `qwen35`, and the Vulkan mirrors.
+- Being written and not in this state yet: prefill kernels on a device
+  layout and for every type, the layer kernels of `qwen35`, and the Vulkan
+  mirrors.
 - The tokenizer gives llama.cpp's token ids and chat prompts for the three
   test models and encodes 76 to 85 MB of text per second on one core.
 - The server crates and the quantization reference were verified through
