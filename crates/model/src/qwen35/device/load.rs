@@ -2,18 +2,38 @@
 //! where they are in its arena.
 //!
 //! All weights of a device live in one allocation (the driver rounds every
-//! allocation up, and a model has hundreds of tensors). A tensor is stored as
-//! the file stores it. A device that holds a slice of a matrix gets the rows
-//! or the columns of its slice, rearranged at load into a matrix of the same
-//! type: the same bytes per value, never decoded.
+//! allocation up, and a model has hundreds of tensors). A device that holds a
+//! slice of a matrix gets the rows or the columns of its slice, gathered at
+//! load into a matrix of the same type: the same bytes per value, never
+//! decoded.
+//!
+//! A matrix lies in the arena in one of two layouts ([`Mat::layout`]): as the
+//! file stores it, or in its device layout, the same bytes rearranged for the
+//! tensor cores with the rows rounded up to 16. Which one is chosen per matrix
+//! by timing both on the device (`choose.rs`). A matrix that something else
+//! than a product reads keeps the file's layout: the embedding table (the
+//! gather decodes its rows) and a head that is the same bytes. A slice is cut
+//! in the file's layout and then rearranged, because the device layout mixes
+//! 16 rows; for the same reason a head whose first rows the draft block reads
+//! as a matrix of their own is laid out in two parts when a part takes the
+//! device layout ([`HeadW`]).
+//!
+//! The bytes are read from the model file with ordinary reads and uploaded
+//! from the loader's memory ([`MappedFiles`]); a matrix in its device layout
+//! is uploaded in the file's to a place that is free for the moment and
+//! rearranged by a kernel into its own.
 
 use std::ops::Range;
 use std::time::{Duration, Instant};
 
 use ares_core::{GgmlType, Ledger};
-use ares_cuda::{Device, DeviceBuffer, DevicePtr, RecurrentShape};
+use ares_cuda::{
+    Device, DeviceBuffer, DevicePtr, Kernels, LayerKernels, Precision, RecurrentShape, Stream,
+    WeightLayout,
+};
 use ares_runtime::ModelError;
 
+use super::choose::{Balance, Chooser, LayoutReport, Layouts, Prep, Shape, Usage};
 use super::placement::{BlockSlice, DevicePlan, DraftPlan};
 use crate::qwen35::Config;
 use crate::qwen35::weights::{Matrix, Mixer, Weights};
@@ -23,13 +43,21 @@ use crate::qwen35::weights::{Matrix, Mixer, Weights};
 const ALIGN: u64 = 64;
 
 /// A matrix on a device: `n_out` rows of `n_in` values of type `ty`, at
-/// offset `at` of the arena.
+/// offset `at` of the arena, in `layout`.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Mat {
     pub ty: GgmlType,
     pub n_in: u32,
     pub n_out: u32,
     pub at: u64,
+    pub layout: WeightLayout,
+}
+
+impl Mat {
+    /// The bytes of the matrix in the arena.
+    pub fn bytes(&self) -> u64 {
+        Kernels::layout_bytes(self.ty, self.layout, self.n_out, self.n_in).unwrap_or(0)
+    }
 }
 
 /// A device's slice of a recurrent block.
@@ -143,61 +171,184 @@ impl Source<'_> {
         }) as u64
     }
 
-    fn write(
-        &self,
-        arena: &DeviceBuffer,
-        at: u64,
-        staging: &mut Vec<u8>,
-    ) -> Result<(), ModelError> {
+    /// Writes the bytes at offset `at` of `arena`. The upload has reached
+    /// the device when this returns.
+    fn write(&self, arena: &DeviceBuffer, at: u64, reader: &mut Reader) -> Result<(), ModelError> {
         match self {
-            Source::Bytes(b) => arena.write(at, b)?,
+            Source::Bytes(b) => reader.upload(arena, at, b)?,
             Source::Rows(m, ranges) => {
                 let size = row_bytes(m);
                 let mut at = at;
                 for r in ranges {
                     let bytes = &m.bytes()[r.start * size..r.end * size];
-                    arena.write(at, bytes)?;
+                    reader.upload(arena, at, bytes)?;
                     at += bytes.len() as u64;
                 }
             }
             Source::Columns(m, ranges) => {
                 let (bv, bb) = (m.ty().block_values() as usize, m.ty().block_bytes() as usize);
                 let size = row_bytes(m);
-                staging.clear();
-                for row in m.bytes().chunks_exact(size) {
-                    for r in ranges {
-                        staging.extend_from_slice(&row[r.start / bv * bb..r.end / bv * bb]);
+                let Reader { files, staging, gathered } = reader;
+                gathered.clear();
+                // The rows of the matrix, a piece at a time, and of each row
+                // the columns' blocks.
+                let per_piece = (PIECE / size.max(1)).max(1) * size;
+                for piece in m.bytes().chunks(per_piece) {
+                    let rows = files.read(piece, staging);
+                    for row in rows.chunks_exact(size) {
+                        for r in ranges {
+                            gathered.extend_from_slice(&row[r.start / bv * bb..r.end / bv * bb]);
+                        }
                     }
                 }
-                arena.write(at, staging)?;
+                arena.write(at, gathered)?;
             }
             Source::Floats(f) => {
-                staging.clear();
-                staging.extend(f.iter().flat_map(|v| v.to_le_bytes()));
-                arena.write(at, staging)?;
+                let bytes = &mut reader.gathered;
+                bytes.clear();
+                bytes.extend(f.iter().flat_map(|v| v.to_le_bytes()));
+                arena.write(at, bytes)?;
             }
             Source::Words(w) => {
-                staging.clear();
-                staging.extend(w.iter().flat_map(|v| v.to_le_bytes()));
-                arena.write(at, staging)?;
+                let bytes = &mut reader.gathered;
+                bytes.clear();
+                bytes.extend(w.iter().flat_map(|v| v.to_le_bytes()));
+                arena.write(at, bytes)?;
             }
         }
         Ok(())
     }
 }
 
-/// The arena being laid out.
+/// The bytes read from a file at a time.
+const PIECE: usize = 16 << 20;
+
+/// The files behind the mapped bytes of a model, for reading them with
+/// ordinary reads.
+///
+/// The stored bytes of a matrix are a slice of a mapping of the model file.
+/// Uploading from the mapping makes the driver fault the file in page by
+/// page, and the kernel stops reading ahead on a mapping whose faults keep
+/// missing the page cache: on a machine short of memory a load of
+/// Qwen3.8-27B then read 38 MB per second from a drive that gives 900 to an
+/// ordinary read. So the loader reads the same bytes from the file itself, a
+/// piece at a time into its own memory, and uploads from there; reads of a
+/// file are read ahead whatever the page cache does. Which file and where is
+/// taken from the process's table of mappings, so nothing above the loader
+/// needs to know; bytes that are not a file's (a model built in memory) are
+/// uploaded from where they are.
 #[derive(Default)]
-struct Layout<'g> {
-    items: Vec<(u64, Source<'g>)>,
-    len: u64,
+struct MappedFiles {
+    /// The file mappings of the process: start and end address, the file's
+    /// offset at the start, and its path.
+    regions: Vec<(usize, usize, u64, std::path::PathBuf)>,
+    /// The files opened so far, by index of their first region.
+    open: Vec<(std::path::PathBuf, std::fs::File)>,
 }
 
-impl<'g> Layout<'g> {
+impl MappedFiles {
+    /// The file mappings of the process as they are now.
+    fn of_process() -> Self {
+        let mut regions = Vec::new();
+        // start-end perms offset dev inode path
+        for line in std::fs::read_to_string("/proc/self/maps").unwrap_or_default().lines() {
+            let mut fields = line.splitn(6, ' ');
+            let (Some(range), Some(perms), Some(offset)) =
+                (fields.next(), fields.next(), fields.next())
+            else {
+                continue;
+            };
+            let path = fields.nth(2).unwrap_or("").trim_start();
+            let Some((start, end)) = range.split_once('-') else { continue };
+            let parsed = (
+                usize::from_str_radix(start, 16),
+                usize::from_str_radix(end, 16),
+                u64::from_str_radix(offset, 16),
+            );
+            if let (Ok(start), Ok(end), Ok(offset)) = parsed
+                && perms.starts_with('r')
+                && path.starts_with('/')
+            {
+                regions.push((start, end, offset, path.into()));
+            }
+        }
+        Self { regions, open: Vec::new() }
+    }
+
+    /// The bytes of `mapped`: read from its file into `staging` when it lies
+    /// in a file mapping and the read succeeds, `mapped` itself otherwise.
+    fn read<'a>(&mut self, mapped: &'a [u8], staging: &'a mut Vec<u8>) -> &'a [u8] {
+        use std::os::unix::fs::FileExt;
+        let at = mapped.as_ptr() as usize;
+        let Some((start, _, offset, path)) =
+            self.regions.iter().find(|(start, end, ..)| at >= *start && at + mapped.len() <= *end)
+        else {
+            return mapped;
+        };
+        let known = self.open.iter().position(|(p, _)| p == path);
+        let file = match known {
+            Some(i) => &self.open[i].1,
+            None => match std::fs::File::open(path) {
+                Ok(file) => {
+                    self.open.push((path.clone(), file));
+                    &self.open.last().expect("pushed above").1
+                }
+                Err(_) => return mapped,
+            },
+        };
+        staging.resize(mapped.len(), 0);
+        match file.read_exact_at(staging, offset + (at - start) as u64) {
+            Ok(()) => staging,
+            Err(_) => mapped,
+        }
+    }
+}
+
+/// What the uploads of a load share: the files behind the model's bytes and
+/// the memory they are read and gathered into.
+#[derive(Default)]
+struct Reader {
+    files: MappedFiles,
+    staging: Vec<u8>,
+    gathered: Vec<u8>,
+}
+
+impl Reader {
+    /// Uploads `bytes` to offset `at` of `arena`, a piece at a time.
+    fn upload(&mut self, arena: &DeviceBuffer, at: u64, bytes: &[u8]) -> Result<(), ModelError> {
+        for (i, piece) in bytes.chunks(PIECE).enumerate() {
+            let read = self.files.read(piece, &mut self.staging);
+            arena.write(at + (i * PIECE) as u64, read)?;
+        }
+        Ok(())
+    }
+}
+
+/// One tensor of the arena.
+struct Item<'g> {
+    at: u64,
+    source: Source<'g>,
+    /// For a matrix in its device layout: its type, rows and columns. The
+    /// source is the matrix in the file's layout.
+    rearrange: Option<(GgmlType, u32, u32)>,
+}
+
+/// The arena being laid out.
+struct Layout<'g, 'c> {
+    items: Vec<Item<'g>>,
+    len: u64,
+    chooser: Chooser<'c>,
+    /// What the matrices of the model's blocks are used for.
+    model: Usage,
+    /// How the norm in front of a half block is prepared for its products.
+    normed: Prep,
+}
+
+impl<'g> Layout<'g, '_> {
     fn push(&mut self, source: Source<'g>) -> u64 {
         let at = self.len.next_multiple_of(ALIGN);
         self.len = at + source.len();
-        self.items.push((at, source));
+        self.items.push(Item { at, source, rearrange: None });
         at
     }
 
@@ -205,19 +356,47 @@ impl<'g> Layout<'g> {
         self.push(Source::Floats(values.to_vec()))
     }
 
-    /// Consecutive rows of `m` as a matrix of its own.
-    fn row_range(&mut self, m: &Matrix<'g>, rows: Range<usize>) -> Mat {
-        self.rows(m, std::iter::once(rows).collect())
+    /// A matrix of `n_out` rows of `n_in` values of `ty` whose bytes in the
+    /// file's layout are `source`, placed in `layout`.
+    fn matrix(
+        &mut self,
+        ty: GgmlType,
+        n_out: u32,
+        n_in: u32,
+        source: Source<'g>,
+        layout: WeightLayout,
+    ) -> Mat {
+        self.chooser.placed(ty, layout, n_out, n_in);
+        let at = self.len.next_multiple_of(ALIGN);
+        let mat = Mat { ty, n_in, n_out, at, layout };
+        let rearrange = (layout == WeightLayout::Device).then_some((ty, n_out, n_in));
+        self.len = at + mat.bytes().max(source.len());
+        self.items.push(Item { at, source, rearrange });
+        mat
     }
 
-    /// Consecutive columns of every row of `m` as a matrix of its own.
-    fn column_range(&mut self, m: &Matrix<'g>, columns: Range<usize>) -> Result<Mat, ModelError> {
-        self.columns(m, std::iter::once(columns).collect())
+    /// The layouts for matrices of `shapes` that read the same input; `half`
+    /// is the half block of the model they belong to, if any (the mixer of
+    /// block 0 is half 0).
+    fn choose(
+        &mut self,
+        shapes: &[Shape],
+        usage: Usage,
+        prep: Prep,
+        half: Option<u32>,
+    ) -> Result<Vec<WeightLayout>, ModelError> {
+        self.chooser.group(shapes, usage, prep, half)
+    }
+
+    /// A matrix that keeps the file's layout: something else than a product
+    /// reads it.
+    fn kept(&mut self, m: &Matrix<'g>, rows: Vec<Range<usize>>) -> Mat {
+        self.rows(m, rows, WeightLayout::File)
     }
 
     /// Rows `rows` of `m` (range after range) as a matrix of its own.
-    fn rows(&mut self, m: &Matrix<'g>, rows: Vec<Range<usize>>) -> Mat {
-        let n_out = rows.iter().map(|r| r.len()).sum::<usize>() as u32;
+    fn rows(&mut self, m: &Matrix<'g>, rows: Vec<Range<usize>>, layout: WeightLayout) -> Mat {
+        let (ty, n_out, n_in) = rows_shape(m, &rows);
         let source = match rows.as_slice() {
             [one] => {
                 let size = row_bytes(m);
@@ -225,25 +404,43 @@ impl<'g> Layout<'g> {
             }
             _ => Source::Rows(*m, rows),
         };
-        Mat { ty: m.ty(), n_in: m.cols() as u32, n_out, at: self.push(source) }
+        self.matrix(ty, n_out, n_in, source, layout)
     }
 
-    /// Columns `columns` of every row of `m` as a matrix of its own.
-    fn columns(&mut self, m: &Matrix<'g>, columns: Vec<Range<usize>>) -> Result<Mat, ModelError> {
-        let bv = m.ty().block_values() as usize;
-        if columns.iter().any(|r| !r.start.is_multiple_of(bv) || !r.end.is_multiple_of(bv)) {
-            return Err(ModelError::Invalid(format!(
-                "columns {columns:?} of a {} matrix are not whole blocks of {bv} values",
-                m.ty()
-            )));
-        }
+    /// Columns `columns` of every row of `m` (range after range, whole blocks
+    /// of the matrix's type: [`columns_shape`] checks it) as a matrix of its
+    /// own.
+    fn columns(&mut self, m: &Matrix<'g>, columns: Vec<Range<usize>>, layout: WeightLayout) -> Mat {
         let n_in = columns.iter().map(|r| r.len()).sum::<usize>() as u32;
         let source = match columns.as_slice() {
             [one] if one.start == 0 && one.end == m.cols() => Source::Bytes(m.bytes()),
             _ => Source::Columns(*m, columns),
         };
-        Ok(Mat { ty: m.ty(), n_in, n_out: m.rows() as u32, at: self.push(source) })
+        self.matrix(m.ty(), m.rows() as u32, n_in, source, layout)
     }
+}
+
+/// One range as a list of ranges.
+fn one(range: Range<usize>) -> Vec<Range<usize>> {
+    std::iter::once(range).collect()
+}
+
+/// The shape of rows `rows` of `m` as a matrix of their own.
+fn rows_shape(m: &Matrix<'_>, rows: &[Range<usize>]) -> Shape {
+    (m.ty(), rows.iter().map(|r| r.len()).sum::<usize>() as u32, m.cols() as u32)
+}
+
+/// The shape of columns `columns` of `m` as a matrix of their own; they must
+/// be whole blocks of the matrix's type.
+fn columns_shape(m: &Matrix<'_>, columns: &[Range<usize>]) -> Result<Shape, ModelError> {
+    let bv = m.ty().block_values() as usize;
+    if columns.iter().any(|r| !r.start.is_multiple_of(bv) || !r.end.is_multiple_of(bv)) {
+        return Err(ModelError::Invalid(format!(
+            "columns {columns:?} of a {} matrix are not whole blocks of {bv} values",
+            m.ty()
+        )));
+    }
+    Ok((m.ty(), m.rows() as u32, columns.iter().map(|r| r.len()).sum::<usize>() as u32))
 }
 
 /// The value-head ranges that belong to key heads `keys`, each head
@@ -260,6 +457,47 @@ fn gather(values: &[f32], ranges: &[Range<usize>]) -> Vec<f32> {
     ranges.iter().flat_map(|r| values[r.clone()].iter().copied()).collect()
 }
 
+/// The rows of the output head on a device.
+#[derive(Clone, Debug)]
+pub(crate) struct HeadW {
+    /// The rows as matrices, in order: one, or two when the draft block
+    /// reads the first rows as a matrix of their own and a part lies in its
+    /// device layout, of which a product cannot read the first rows alone:
+    /// the draft head, then the rest.
+    pub parts: Vec<Mat>,
+    /// All rows.
+    pub n_out: u32,
+    /// The token of the first row.
+    pub first_token: u32,
+}
+
+/// What a load needs to know of the model's options: how the layouts are
+/// chosen and which rows the products will run with.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct LoadOptions {
+    pub layouts: Layouts,
+    pub precision: Precision,
+    /// The rows of the products of a decode step of the model's blocks.
+    pub decode_rows: u32,
+    /// The rows prompts are read in at a time.
+    pub prompt_rows: u32,
+    /// The most rows of a step.
+    pub max_rows: u32,
+    /// Whether the norm in front of each half block is written by the merge
+    /// of a tensor split, in the forms the half's products read.
+    pub merged: bool,
+}
+
+/// The tables of a device's tensors: where each is in the arena.
+struct Tables {
+    blocks: Vec<BlockW>,
+    embedding: Option<Mat>,
+    output_norm: u64,
+    head: Option<HeadW>,
+    head_tokens: Option<u64>,
+    draft: Option<DraftW>,
+}
+
 /// The weights of one device.
 #[derive(Debug)]
 pub(crate) struct DeviceWeights {
@@ -268,15 +506,18 @@ pub(crate) struct DeviceWeights {
     /// The token embedding table, on the device that has it.
     pub embedding: Option<Mat>,
     pub output_norm: u64,
-    /// The rows of the output head on this device and the token of the first.
-    pub head: Option<(Mat, u32)>,
+    /// The rows of the output head on this device.
+    pub head: Option<HeadW>,
     /// The tokens of those rows (u32 each) when a draft vocabulary reorders
     /// the head: the offset of the list in the arena.
     pub head_tokens: Option<u64>,
     /// The draft block, on the device that holds it.
     pub draft: Option<DraftW>,
-    /// How long the upload took.
+    /// How long the upload took, the rearranging of the matrices in their
+    /// device layout included.
     pub upload: Duration,
+    /// Which matrices got which layout, and what choosing took.
+    pub layouts: LayoutReport,
 }
 
 impl DeviceWeights {
@@ -301,75 +542,94 @@ impl DeviceWeights {
     #[allow(clippy::too_many_arguments)]
     pub fn load(
         device: &Device,
+        kernels: &Kernels,
+        layers: &LayerKernels,
         ledger: &mut Ledger,
         c: &Config,
         w: &Weights<'_>,
         plan: &DevicePlan,
         draft: Option<&DraftPlan>,
         index: usize,
+        opts: LoadOptions,
+        balance: Option<&Balance>,
     ) -> Result<Self, ModelError> {
-        let mut layout = Layout::default();
-        let mut blocks = Vec::new();
-        for (layer, slice) in plan.blocks.iter().enumerate() {
-            let Some(slice) = slice else { continue };
-            blocks.push(block(&mut layout, c, w, layer, slice)?);
-        }
-        let embedding = plan.embedding.then(|| {
-            let m = &w.token_embd;
-            layout.row_range(m, 0..m.rows())
-        });
-        let output_norm = layout.floats(&w.output_norm);
-        let order = draft.and_then(|d| d.head_order.as_deref());
-        let mut head_tokens = None;
-        let head = if plan.head.is_empty() {
-            None
-        } else if let Some(order) = order {
-            // The rows of this device's tokens in the head's order, as runs of
-            // consecutive tokens.
-            let tokens = &order[plan.head.start as usize..plan.head.end as usize];
-            let mut runs: Vec<Range<usize>> = Vec::new();
-            for &token in tokens {
-                match runs.last_mut() {
-                    Some(run) if run.end == token as usize => run.end += 1,
-                    _ => runs.push(token as usize..token as usize + 1),
-                }
-            }
-            head_tokens = Some(layout.push(Source::Words(tokens.to_vec())));
-            Some((layout.rows(w.head(), runs), plan.head.start))
-        } else {
-            let m = w.head();
-            let rows = plan.head.start as usize..plan.head.end as usize;
-            let offset = (rows.start * row_bytes(m)) as u64;
-            // A head that is the embedding table reads the same bytes when the
-            // table is here and the slice starts at an aligned row.
-            let mat = match (&embedding, w.output.is_none()) {
-                (Some(table), true) if offset.is_multiple_of(ALIGN) => Mat {
-                    ty: table.ty,
-                    n_in: table.n_in,
-                    n_out: rows.len() as u32,
-                    at: table.at + offset,
-                },
-                _ => layout.row_range(m, rows),
-            };
-            Some((mat, plan.head.start))
-        };
-        let draft = match (draft.filter(|d| d.device == index), &head) {
-            (Some(plan), Some((head, _))) => Some(draft_block(&mut layout, c, w, plan, head)?),
-            (Some(_), None) => {
-                return Err(ModelError::Invalid(
-                    "the draft block's device holds no row of the output head".into(),
-                ));
-            }
-            (None, _) => None,
-        };
+        let chooser = Chooser::new(
+            device,
+            kernels,
+            layers,
+            opts.layouts,
+            opts.precision,
+            opts.prompt_rows,
+            opts.max_rows,
+        );
+        let model = Usage { decode_rows: opts.decode_rows.max(1), prompt: true };
+        let normed = if opts.merged { Prep::Merge } else { Prep::Launch };
+        // The tensors are laid out twice: once for the chooser to see every
+        // matrix and what the weights take in all, and, when it has probed
+        // and decided, once more with the layouts it chose.
+        let mut layout = Layout { items: Vec::new(), len: 0, chooser, model, normed };
+        tables(&mut layout, c, w, plan, draft, index)?;
+        let Layout { len, mut chooser, .. } = layout;
+        chooser.decide(len, balance.map(|b| (b, index)))?;
+        let mut layout = Layout { items: Vec::new(), len: 0, chooser, model, normed };
+        let Tables { blocks, embedding, output_norm, head, head_tokens, draft } =
+            tables(&mut layout, c, w, plan, draft, index)?;
+        let Layout { items, len, chooser, .. } = layout;
+        let layouts = chooser.finish();
 
-        let bytes = layout.len.next_multiple_of(ALIGN).max(ALIGN);
+        let bytes = len.next_multiple_of(ALIGN).max(ALIGN);
         ledger.reserve("qwen35 weights", bytes)?;
         let arena = DeviceBuffer::new(device, bytes)?;
         let begun = Instant::now();
-        let mut staging = Vec::new();
-        for (at, source) in &layout.items {
-            source.write(&arena, *at, &mut staging)?;
+        // A matrix in its device layout is uploaded in the file's and
+        // rearranged by a kernel, so its file form needs a place for a
+        // moment: the end of the arena, which the tensors written later
+        // overwrite, or for the last matrices, which reach into that end
+        // themselves, a scratch buffer of their size.
+        let tail_of = |item: &Item<'_>| {
+            let at = bytes.checked_sub(item.source.len())? / ALIGN * ALIGN;
+            let end = item.at
+                + Kernels::layout_bytes(
+                    item.rearrange?.0,
+                    WeightLayout::Device,
+                    item.rearrange?.1,
+                    item.rearrange?.2,
+                )?;
+            (at >= end).then_some(at)
+        };
+        let scratch_bytes = items
+            .iter()
+            .filter(|item| item.rearrange.is_some() && tail_of(item).is_none())
+            .map(|item| item.source.len())
+            .max();
+        let scratch = scratch_bytes.map(|b| DeviceBuffer::new(device, b.max(ALIGN))).transpose()?;
+        let stream = Stream::new(device, 0)?;
+        let mut reader = Reader { files: MappedFiles::of_process(), ..Reader::default() };
+        for item in &items {
+            let Some((ty, n_out, n_in)) = item.rearrange else {
+                item.source.write(&arena, item.at, &mut reader)?;
+                continue;
+            };
+            let from = match (tail_of(item), &scratch) {
+                (Some(at), _) => {
+                    item.source.write(&arena, at, &mut reader)?;
+                    arena.ptr().offset(at)
+                }
+                (None, Some(scratch)) => {
+                    item.source.write(scratch, 0, &mut reader)?;
+                    scratch.ptr()
+                }
+                (None, None) => unreachable!("the scratch was sized for this matrix"),
+            };
+            // SAFETY: `from` holds the matrix in the file's layout (the write
+            // above has reached the device) and the arena at `item.at` has
+            // the bytes of its device layout, which do not overlap `from`;
+            // both are aligned to `ALIGN`.
+            unsafe {
+                kernels.rearrange(&stream, ty, from, arena.ptr().offset(item.at), n_out, n_in)?;
+            }
+            // The place of the file form is written again by the next tensor.
+            stream.synchronize()?;
         }
         Ok(Self {
             arena,
@@ -380,18 +640,141 @@ impl DeviceWeights {
             head_tokens,
             draft,
             upload: begun.elapsed(),
+            layouts,
         })
     }
+}
+
+/// Lays out what `plan` gives device `index`: the head and the embedding
+/// table first (the largest matrices find room behind them in the arena to
+/// be rearranged from), then the blocks, then the draft block.
+fn tables<'g>(
+    layout: &mut Layout<'g, '_>,
+    c: &Config,
+    w: &Weights<'g>,
+    plan: &DevicePlan,
+    draft: Option<&DraftPlan>,
+    index: usize,
+) -> Result<Tables, ModelError> {
+    let model = layout.model;
+    let own_draft = draft.filter(|d| d.device == index);
+    // The head and the embedding table come first: the largest matrices
+    // find room behind them in the arena to be rearranged from.
+    let embedding = plan.embedding.then(|| {
+        let m = &w.token_embd;
+        // The gather decodes rows of the file's layout.
+        layout.kept(m, one(0..m.rows()))
+    });
+    // The head's logits are wanted for the rows of a decode step and for
+    // one row of a prompt. The draft block reads the head's first rows as
+    // a matrix of their own (the draft vocabulary): where those are not
+    // all rows of the head here, they are laid out apart from the rest.
+    let head_usage = Usage { decode_rows: model.decode_rows, prompt: false };
+    let draft_rows = own_draft.map(|d| d.head_rows as usize);
+    let order = draft.and_then(|d| d.head_order.as_deref());
+    let mut head_tokens = None;
+    let head = if plan.head.is_empty() {
+        None
+    } else if let Some(order) = order {
+        // The rows of this device's tokens in the head's order, as runs of
+        // consecutive tokens.
+        let tokens = &order[plan.head.start as usize..plan.head.end as usize];
+        let runs_of = |tokens: &[u32]| {
+            let mut runs: Vec<Range<usize>> = Vec::new();
+            for &token in tokens {
+                match runs.last_mut() {
+                    Some(run) if run.end == token as usize => run.end += 1,
+                    _ => runs.push(token as usize..token as usize + 1),
+                }
+            }
+            runs
+        };
+        head_tokens = Some(layout.push(Source::Words(tokens.to_vec())));
+        let parts = match draft_rows {
+            Some(first) if first > 0 && first < tokens.len() => {
+                vec![runs_of(&tokens[..first]), runs_of(&tokens[first..])]
+            }
+            _ => vec![runs_of(tokens)],
+        };
+        Some(head_parts(layout, w.head(), parts, head_usage, plan.head.start)?)
+    } else {
+        let m = w.head();
+        let rows = plan.head.start as usize..plan.head.end as usize;
+        let offset = (rows.start * row_bytes(m)) as u64;
+        // A head that is the embedding table reads the same bytes when the
+        // table is here and the slice starts at an aligned row.
+        match (&embedding, w.output.is_none()) {
+            (Some(table), true) if offset.is_multiple_of(ALIGN) => Some(HeadW {
+                parts: vec![Mat {
+                    ty: table.ty,
+                    n_in: table.n_in,
+                    n_out: rows.len() as u32,
+                    at: table.at + offset,
+                    layout: table.layout,
+                }],
+                n_out: rows.len() as u32,
+                first_token: plan.head.start,
+            }),
+            _ => {
+                let parts = match draft_rows {
+                    Some(first) if first > 0 && first < rows.len() => {
+                        vec![one(rows.start..rows.start + first), one(rows.start + first..rows.end)]
+                    }
+                    _ => vec![one(rows)],
+                };
+                Some(head_parts(layout, m, parts, head_usage, plan.head.start)?)
+            }
+        }
+    };
+    let mut blocks = Vec::new();
+    for (layer, slice) in plan.blocks.iter().enumerate() {
+        let Some(slice) = slice else { continue };
+        blocks.push(block(layout, c, w, layer, slice)?);
+    }
+    let output_norm = layout.floats(&w.output_norm);
+    let draft = match (own_draft, &head) {
+        (Some(plan), Some(head)) => Some(draft_block(layout, c, w, plan, head)?),
+        (Some(_), None) => {
+            return Err(ModelError::Invalid(
+                "the draft block's device holds no row of the output head".into(),
+            ));
+        }
+        (None, _) => None,
+    };
+    Ok(Tables { blocks, embedding, output_norm, head, head_tokens, draft })
+}
+
+/// Lays out the rows of the output head `m` that a device holds, given as the
+/// row ranges of one part or of two (the draft head, then the rest), each in
+/// the layout that is faster for its product; the parts read one input, which
+/// a launch of its own prepares. Two parts that both keep the file's layout
+/// are laid out as one matrix, of which the first rows can be read alone.
+fn head_parts<'g>(
+    layout: &mut Layout<'g, '_>,
+    m: &Matrix<'g>,
+    parts: Vec<Vec<Range<usize>>>,
+    usage: Usage,
+    first_token: u32,
+) -> Result<HeadW, ModelError> {
+    let shapes: Vec<Shape> = parts.iter().map(|rows| rows_shape(m, rows)).collect();
+    let n_out = shapes.iter().map(|s| s.1).sum();
+    let chosen = layout.choose(&shapes, usage, Prep::Launch, None)?;
+    let parts = if chosen.iter().all(|l| *l == WeightLayout::File) {
+        vec![layout.rows(m, parts.into_iter().flatten().collect(), WeightLayout::File)]
+    } else {
+        parts.into_iter().zip(chosen).map(|(rows, l)| layout.rows(m, rows, l)).collect()
+    };
+    Ok(HeadW { parts, n_out, first_token })
 }
 
 /// Lays out the draft block: the model's next-token-prediction block with all
 /// its heads, and the draft head as the first rows of `head`.
 fn draft_block<'g>(
-    layout: &mut Layout<'g>,
+    layout: &mut Layout<'g, '_>,
     c: &Config,
     w: &Weights<'g>,
     plan: &DraftPlan,
-    head: &Mat,
+    head: &HeadW,
 ) -> Result<DraftW, ModelError> {
     let n = w.nextn.as_ref().ok_or_else(|| {
         ModelError::Invalid("the model has no next-token-prediction block".into())
@@ -409,26 +792,77 @@ fn draft_block<'g>(
             plan.head_rows, head.n_out
         )));
     }
+    // The draft head: the first part of a head in two parts, or the first
+    // rows of a head in one, which the file's layout lets a product read
+    // alone (a head in its device layout is in one part only when the draft
+    // head is all of it).
+    let first = head.parts[0];
+    let draft_head = match (head.parts.len(), first.layout) {
+        (2, _) | (_, WeightLayout::File) => Mat { n_out: plan.head_rows, ..first },
+        _ if plan.head_rows == first.n_out => first,
+        _ => {
+            return Err(ModelError::Invalid(
+                "the draft head is a part of a head that lies in its device layout".into(),
+            ));
+        }
+    };
+    if head.parts.len() == 2 && plan.head_rows != first.n_out {
+        return Err(ModelError::Invalid("the head was not cut at the draft head".into()));
+    }
     let (d, ac) = (c.n_embd, &c.attention);
     let (a, b) = (&n.attention, &n.block);
+    // A link of a chain is one row per sequence that drafts. The projections
+    // and the keys and values also follow the model through every row of a
+    // step, a prompt's included; the rest runs in the chains only. Every
+    // input but SwiGLU's result is prepared by a launch of its own.
+    let follows = Usage { decode_rows: 1, prompt: true };
+    let chain = Usage { decode_rows: 1, prompt: false };
+    let whole = |m: &Matrix<'g>| one(0..m.rows());
+    let all = |m: &Matrix<'g>| one(0..m.cols());
+    // Queries, keys and values read one input; in the chains all three, when
+    // the block follows the model only the keys and the values.
+    let qkv = layout.choose(
+        &[
+            rows_shape(&a.q, &whole(&a.q)),
+            rows_shape(&a.k, &whole(&a.k)),
+            rows_shape(&a.v, &whole(&a.v)),
+        ],
+        chain,
+        Prep::Launch,
+        None,
+    )?;
+    let out = layout.choose(&[columns_shape(&a.out, &all(&a.out))?], chain, Prep::Launch, None)?;
     let attention = AttentionW {
         n_head: ac.n_head as u32,
         n_kv: ac.n_head_kv as u32,
-        q: layout.row_range(&a.q, 0..a.q.rows()),
-        k: layout.row_range(&a.k, 0..a.k.rows()),
-        v: layout.row_range(&a.v, 0..a.v.rows()),
-        out: layout.column_range(&a.out, 0..a.out.cols())?,
+        q: layout.rows(&a.q, whole(&a.q), qkv[0]),
+        k: layout.rows(&a.k, whole(&a.k), qkv[1]),
+        v: layout.rows(&a.v, whole(&a.v), qkv[2]),
+        out: layout.columns(&a.out, all(&a.out), out[0]),
         q_norm: layout.floats(&a.q_norm),
         k_norm: layout.floats(&a.k_norm),
     };
+    let (gate, up) = (&b.ffn_gate, &b.ffn_up);
+    let inner = layout.choose(
+        &[rows_shape(gate, &whole(gate)), rows_shape(up, &whole(up))],
+        chain,
+        Prep::Launch,
+        None,
+    )?;
+    let down_shape = columns_shape(&b.ffn_down, &all(&b.ffn_down))?;
+    let down = layout.choose(&[down_shape], chain, Prep::Swiglu, None)?;
     let ffn = FfnW {
-        gate: layout.row_range(&b.ffn_gate, 0..b.ffn_gate.rows()),
-        up: layout.row_range(&b.ffn_up, 0..b.ffn_up.rows()),
-        down: layout.column_range(&b.ffn_down, 0..b.ffn_down.cols())?,
+        gate: layout.rows(gate, whole(gate), inner[0]),
+        up: layout.rows(up, whole(up), inner[1]),
+        down: layout.columns(&b.ffn_down, all(&b.ffn_down), down[0]),
     };
+    let halves =
+        [columns_shape(&n.eh_proj, &one(0..d))?, columns_shape(&n.eh_proj, &one(d..2 * d))?];
+    let proj_e = layout.choose(&halves[..1], follows, Prep::Launch, None)?;
+    let proj_h = layout.choose(&halves[1..], follows, Prep::Launch, None)?;
     Ok(DraftW {
-        proj_e: layout.column_range(&n.eh_proj, 0..d)?,
-        proj_h: layout.column_range(&n.eh_proj, d..2 * d)?,
+        proj_e: layout.columns(&n.eh_proj, one(0..d), proj_e[0]),
+        proj_h: layout.columns(&n.eh_proj, one(d..2 * d), proj_h[0]),
         enorm: layout.floats(&n.enorm),
         hnorm: layout.floats(&n.hnorm),
         head_norm: layout.floats(n.shared_head_norm.as_deref().unwrap_or(&w.output_norm)),
@@ -439,18 +873,22 @@ fn draft_block<'g>(
             mixer: MixerW::Attention(attention),
             ffn: Some(ffn),
         },
-        head: Mat { n_out: plan.head_rows, ..*head },
+        head: draft_head,
     })
 }
 
 fn block<'g>(
-    layout: &mut Layout<'g>,
+    layout: &mut Layout<'g, '_>,
     c: &Config,
     w: &Weights<'g>,
     layer: usize,
     slice: &BlockSlice,
 ) -> Result<BlockW, ModelError> {
     let l = &w.layers[layer];
+    let (usage, normed) = (layout.model, layout.normed);
+    // The half blocks of this block: the devices of a tensor split meet
+    // after each.
+    let (mixer_half, ffn_half) = (Some(2 * layer as u32), Some(2 * layer as u32 + 1));
     let attn_norm = layout.floats(&l.block.attn_norm);
     let post_norm = layout.floats(&l.block.post_attention_norm);
     let heads = slice.heads.start as usize..slice.heads.end as usize;
@@ -470,6 +908,25 @@ fn block<'g>(
             let taps: Vec<f32> =
                 channels.iter().flat_map(|r| r.start * k..r.end * k).map(|i| r.conv[i]).collect();
             let n_k = heads.len() as u32;
+            // The four projections read the norm of the residual stream; the
+            // output projection reads what the gated norm writes for it.
+            let read = layout.choose(
+                &[
+                    rows_shape(&r.qkv, &channels),
+                    rows_shape(&r.gate, &values),
+                    rows_shape(&r.beta, &per_head),
+                    rows_shape(&r.alpha, &per_head),
+                ],
+                usage,
+                normed,
+                mixer_half,
+            )?;
+            let gated = Prep::GatedNorm {
+                heads: n_k * (rc.n_v_heads / rc.n_k_heads) as u32,
+                width: dk as u32,
+            };
+            let out =
+                layout.choose(&[columns_shape(&r.out, &values)?], usage, gated, mixer_half)?;
             MixerW::Recurrent(RecurrentW {
                 shape: RecurrentShape {
                     n_k_heads: n_k,
@@ -477,11 +934,11 @@ fn block<'g>(
                     head_dim: dk as u32,
                     conv_kernel: k as u32,
                 },
-                qkv: layout.rows(&r.qkv, channels),
-                z: layout.rows(&r.gate, values.clone()),
-                beta: layout.rows(&r.beta, per_head.clone()),
-                alpha: layout.rows(&r.alpha, per_head.clone()),
-                out: layout.columns(&r.out, values)?,
+                qkv: layout.rows(&r.qkv, channels, read[0]),
+                z: layout.rows(&r.gate, values.clone(), read[1]),
+                beta: layout.rows(&r.beta, per_head.clone(), read[2]),
+                alpha: layout.rows(&r.alpha, per_head.clone(), read[3]),
+                out: layout.columns(&r.out, values, out[0]),
                 taps: layout.floats(&taps),
                 dt_bias: layout.floats(&gather(&r.dt_bias, &per_head)),
                 ssm_a: layout.floats(&gather(&r.a, &per_head)),
@@ -492,13 +949,31 @@ fn block<'g>(
             let ac = &c.attention;
             let (h, per_kv) = (ac.head_dim, ac.n_head / ac.n_head_kv);
             let q_heads = heads.start * per_kv..heads.end * per_kv;
+            let q_rows = one(q_heads.start * 2 * h..q_heads.end * 2 * h);
+            let kv_rows = one(heads.start * h..heads.end * h);
+            let out_columns = one(q_heads.start * h..q_heads.end * h);
+            // Queries, keys and values read the norm of the residual stream;
+            // the output projection reads what attention computed, prepared
+            // by a launch of its own.
+            let read = layout.choose(
+                &[
+                    rows_shape(&a.q, &q_rows),
+                    rows_shape(&a.k, &kv_rows),
+                    rows_shape(&a.v, &kv_rows),
+                ],
+                usage,
+                normed,
+                mixer_half,
+            )?;
+            let out_shape = columns_shape(&a.out, &out_columns)?;
+            let out = layout.choose(&[out_shape], usage, Prep::Launch, mixer_half)?;
             MixerW::Attention(AttentionW {
                 n_head: q_heads.len() as u32,
                 n_kv: heads.len() as u32,
-                q: layout.row_range(&a.q, q_heads.start * 2 * h..q_heads.end * 2 * h),
-                k: layout.row_range(&a.k, heads.start * h..heads.end * h),
-                v: layout.row_range(&a.v, heads.start * h..heads.end * h),
-                out: layout.column_range(&a.out, q_heads.start * h..q_heads.end * h)?,
+                q: layout.rows(&a.q, q_rows, read[0]),
+                k: layout.rows(&a.k, kv_rows.clone(), read[1]),
+                v: layout.rows(&a.v, kv_rows, read[2]),
+                out: layout.columns(&a.out, out_columns, out[0]),
                 q_norm: layout.floats(&a.q_norm),
                 k_norm: layout.floats(&a.k_norm),
             })
@@ -508,10 +983,17 @@ fn block<'g>(
     let ffn = if rows.is_empty() {
         None
     } else {
+        let (gate, up, down) = (&l.block.ffn_gate, &l.block.ffn_up, &l.block.ffn_down);
+        let rows = one(rows);
+        // Gate and up read the norm of the residual stream; down reads what
+        // SwiGLU writes for it.
+        let inner = [rows_shape(gate, &rows), rows_shape(up, &rows)];
+        let read = layout.choose(&inner, usage, normed, ffn_half)?;
+        let fused = layout.choose(&[columns_shape(down, &rows)?], usage, Prep::Swiglu, ffn_half)?;
         Some(FfnW {
-            gate: layout.row_range(&l.block.ffn_gate, rows.clone()),
-            up: layout.row_range(&l.block.ffn_up, rows.clone()),
-            down: layout.column_range(&l.block.ffn_down, rows)?,
+            gate: layout.rows(gate, rows.clone(), read[0]),
+            up: layout.rows(up, rows.clone(), read[1]),
+            down: layout.columns(down, rows, fused[0]),
         })
     };
     Ok(BlockW { layer, attn_norm, post_norm, mixer, ffn })

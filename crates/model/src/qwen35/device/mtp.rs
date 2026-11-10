@@ -39,7 +39,7 @@ use ares_cuda::{
 use ares_runtime::ModelError;
 
 use super::super::load::{DeviceWeights, DraftW, MixerW};
-use super::{AttentionAt, Options, Part, Phase, StepEnv, geometry, invalid};
+use super::{AttentionAt, Options, Part, Phase, Prepared, StepEnv, geometry, invalid};
 use crate::qwen35::Config;
 
 /// Bytes reserved per link and sequence for the attention plan of a link.
@@ -395,10 +395,7 @@ impl Part {
     /// What the block takes on this device.
     pub fn draft_bytes(&self) -> Option<DraftBytes> {
         let m = self.mtp.as_ref()?;
-        let mat = |mat: &super::super::load::Mat| {
-            u64::from(mat.n_out) * u64::from(mat.n_in) / u64::from(mat.ty.block_values())
-                * u64::from(mat.ty.block_bytes())
-        };
+        let mat = |mat: &super::super::load::Mat| mat.bytes();
         let MixerW::Attention(a) = &m.w.block.mixer else { return None };
         let ffn = m.w.block.ffn.as_ref()?;
         let weights =
@@ -823,15 +820,15 @@ impl Part {
             )?;
             // x = proj_e e' + proj_h h'
             self.kernels.rms_norm_f32(stream, e, self.w.at(w.enorm), xn, d, n, eps)?;
-            self.prepare(stream, xn, d, n, &[&w.proj_e], false)?;
+            self.prepare(stream, xn, d, n, &[&w.proj_e], Prepared::default())?;
             self.product(stream, &w.proj_e, n, x)?;
             self.kernels.rms_norm_f32(stream, h, self.w.at(w.hnorm), xn, d, n, eps)?;
-            self.prepare(stream, xn, d, n, &[&w.proj_h], false)?;
+            self.prepare(stream, xn, d, n, &[&w.proj_h], Prepared::default())?;
             self.product(stream, &w.proj_h, n, p)?;
             self.kernels.add_f32(stream, x, p, n * d)?;
             // Attention over the block's own keys and values.
             self.kernels.rms_norm_f32(stream, x, self.w.at(w.block.attn_norm), xn, d, n, eps)?;
-            self.prepare(stream, xn, d, n, &[&a.q, &a.k, &a.v], false)?;
+            self.prepare(stream, xn, d, n, &[&a.q, &a.k, &a.v], Prepared::default())?;
             self.product(stream, &a.q, n, m.at(s.qg))?;
             self.product(stream, &a.k, n, m.at(s.k_raw))?;
             self.product(stream, &a.v, n, m.at(s.v))?;
@@ -879,22 +876,20 @@ impl Part {
                 },
                 1.0 / (self.attn_head_dim as f32).sqrt(),
             )?;
-            self.prepare(stream, m.at(s.o), a.out.n_in, n, &[&a.out], false)?;
+            self.prepare(stream, m.at(s.o), a.out.n_in, n, &[&a.out], Prepared::default())?;
             self.product(stream, &a.out, n, p)?;
             self.kernels.add_f32(stream, x, p, n * d)?;
             // The feed-forward part.
             self.kernels.rms_norm_f32(stream, x, self.w.at(w.block.post_norm), xn, d, n, eps)?;
-            self.prepare(stream, xn, d, n, &[&ffn.gate, &ffn.up], false)?;
+            self.prepare(stream, xn, d, n, &[&ffn.gate, &ffn.up], Prepared::default())?;
             self.product(stream, &ffn.gate, n, m.at(s.g1))?;
             self.product(stream, &ffn.up, n, m.at(s.g2))?;
-            let act_q = self.at(self.s.act_q);
-            self.layers.swiglu_quant(stream, m.at(s.g1), m.at(s.g2), act_q, n * inner)?;
-            self.prepare(stream, act_q, inner, n, &[&ffn.down], true)?;
+            self.swiglu(stream, m.at(s.g1), m.at(s.g2), inner, n, &ffn.down)?;
             self.product(stream, &ffn.down, n, p)?;
             self.kernels.add_f32(stream, x, p, n * d)?;
             // The output, the draft head and the picks.
             self.kernels.rms_norm_f32(stream, x, self.w.at(w.head_norm), out, d, n, eps)?;
-            self.prepare(stream, out, d, n, &[&w.head], false)?;
+            self.prepare(stream, out, d, n, &[&w.head], Prepared::default())?;
             self.product(stream, &w.head, n, m.at(s.logits))?;
             let batch = SampleBatch {
                 logits: m.at(s.logits),
@@ -982,14 +977,14 @@ impl Part {
                 p,
             )?;
             self.kernels.rms_norm_f32(stream, p, self.w.at(w.enorm), xn, d, n, eps)?;
-            self.prepare(stream, xn, d, n, &[&w.proj_e], false)?;
+            self.prepare(stream, xn, d, n, &[&w.proj_e], Prepared::default())?;
             self.product(stream, &w.proj_e, n, p)?;
             self.kernels.rms_norm_f32(stream, x, self.w.at(w.hnorm), xn, d, n, eps)?;
-            self.prepare(stream, xn, d, n, &[&w.proj_h], false)?;
+            self.prepare(stream, xn, d, n, &[&w.proj_h], Prepared::default())?;
             self.product(stream, &w.proj_h, n, x)?;
             self.kernels.add_f32(stream, x, p, n * d)?;
             self.kernels.rms_norm_f32(stream, x, self.w.at(w.block.attn_norm), xn, d, n, eps)?;
-            self.prepare(stream, xn, d, n, &[&a.k, &a.v], false)?;
+            self.prepare(stream, xn, d, n, &[&a.k, &a.v], Prepared::default())?;
             self.product(stream, &a.k, n, k_raw)?;
             self.product(stream, &a.v, n, v)?;
             self.layers.rope_table(stream, env.step, dims, self.at(s.rope), self.rope)?;

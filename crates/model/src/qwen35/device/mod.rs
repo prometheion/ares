@@ -6,6 +6,8 @@
 //! - [`Part`] is one device's share: its weights in one arena, the recurrent
 //!   state of every sequence slot, the scratch of a step, and
 //!   [`Part::enqueue`], which queues the kernels of a step and does not wait.
+//!   Every weight matrix lies there in the layout that timing both on the
+//!   device found faster for the rows the model runs ([`Layouts`]).
 //! - [`Qwen35`] is the model as the runtime drives it: it opens a part on
 //!   every device's thread and hands each step to it.
 //! - [`Harness`] drives one part on one device step by step, for tests and
@@ -15,6 +17,7 @@
 //! The CPU reference in [`crate::qwen35::reference`] is what every path here
 //! is measured against (`tests/qwen35_device.rs`).
 
+mod choose;
 mod harness;
 mod load;
 mod part;
@@ -22,6 +25,7 @@ pub mod placement;
 mod runtime;
 mod session;
 
+pub use choose::{Balance, LayoutProbe, LayoutReport, Layouts};
 pub use harness::Harness;
 pub use part::{
     DraftBytes, DraftChain, DraftStep, DraftTimes, Drafted, Exchange, Options, PAGE_ENTRY, PHASES,

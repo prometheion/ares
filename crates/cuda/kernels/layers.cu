@@ -10,6 +10,7 @@
 #include "layer_conv.cuh"
 #include "layer_delta.cuh"
 #include "layer_delta_fork.cuh"
+#include "layer_act_f16.cuh"
 #include "layer_merge.cuh"
 
 // The delta rule for the head width of both architectures (128). The default
@@ -29,3 +30,18 @@ ARES_DELTA_KERNELS(lpr8_rb32, 128, 8, 32, 16)
 ARES_DELTA_KERNELS(lpr1_rb64, 128, 1, 64, 16)
 ARES_DELTA_KERNELS(lpr2_rb64_tc8, 128, 2, 64, 8)
 ARES_DELTA_KERNELS(lpr2_rb16, 128, 2, 16, 16)
+
+// Rows of a result that was computed as some columns of a wider one, put in
+// their place: dst[r][at + i] = src[r][i] for r < n_rows, i < width, with
+// rows of `dst_width` values in `dst`. One thread per value. (A matrix that
+// lies on the device in two parts is multiplied part by part; with one row
+// each part writes its columns itself and nothing is placed.)
+ARES_KERNEL ares_place_rows(const float* src, float* dst, uint32_t n_rows, uint32_t width, uint32_t dst_width,
+                            uint32_t at) {
+    const size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= static_cast<size_t>(n_rows) * width) {
+        return;
+    }
+    const size_t r = i / width;
+    dst[r * dst_width + at + (i - r * width)] = src[i];
+}

@@ -7,7 +7,8 @@
 //!     [--chat] [--generate 48] [--capture DIR]... [--decode-at 1000,32000]
 //!     [--decode-steps 64] [--prefill 2048] [--text FILE] [--state f32|f16]
 //!     [--pipeline-rows 256] [--no-profile] [--balance FILE] [--balance-out FILE]
-//!     [--step-rows N]
+//!     [--step-rows N] [--layouts measured|file|device] [--prompt-weight 1]
+//!     [--show-layouts]
 //! ```
 //!
 //! - `--chat`: a German and an English question through the chat template,
@@ -19,6 +20,14 @@
 //!   with the device time by kind of kernel.
 //! - `--prefill N`: prompt tokens per second for `N` tokens, in steps of
 //!   `--step-rows` rows (default: `--max-rows`).
+//! - `--layouts`: how every weight matrix gets its layout on a device:
+//!   `measured` (the default) times both layouts per matrix at load and takes
+//!   the device layout where it does not make a decode step slower, and of
+//!   those assignments the one that reads prompts fastest; with
+//!   `--prompt-weight W` a percent of prompt speed buys `W` percent of decode
+//!   speed. `file` and `device` take one layout for every matrix that can
+//!   have it, for comparison. `--show-layouts` prints every probed shape
+//!   with its times.
 //! - `--balance-out FILE`: with a tensor split over two devices and
 //!   `--decode-at`, writes the share of device 0 in every half block at which
 //!   both devices would take equally long, from the device times of the
@@ -45,7 +54,9 @@ use ares_cuda::{Device, Precision, StateFormat, Wait};
 use ares_gguf::Gguf;
 use ares_model::qwen35::Config;
 use ares_model::qwen35::device::placement::{HalfShares, Placement};
-use ares_model::qwen35::device::{Options, PHASES, Profile, Qwen35, Rows, Session, Spread, Wanted};
+use ares_model::qwen35::device::{
+    Layouts, Options, PHASES, PartReport, Profile, Qwen35, Rows, Session, Spread, Wanted,
+};
 use ares_runtime::Pick;
 use ares_tokenizer::{ChatOptions, EncodeOptions, Message};
 
@@ -77,6 +88,8 @@ struct Args {
     draft_vocab: Option<PathBuf>,
     out: Option<PathBuf>,
     chat_vars: Vec<(String, String)>,
+    layouts: Layouts,
+    show_layouts: bool,
 }
 
 fn parse() -> Args {
@@ -106,6 +119,8 @@ fn parse() -> Args {
         draft_vocab: None,
         out: None,
         chat_vars: Vec::new(),
+        layouts: Layouts::default(),
+        show_layouts: false,
     };
     let mut it = std::env::args().skip(1);
     let list = |v: String| v.split(',').map(str::to_owned).collect::<Vec<_>>();
@@ -151,6 +166,19 @@ fn parse() -> Args {
             "--sample" => args.sample = true,
             "--draft-vocab" => args.draft_vocab = Some(value().into()),
             "--out" => args.out = Some(value().into()),
+            "--layouts" => {
+                args.layouts = match value().as_str() {
+                    "measured" => Layouts::default(),
+                    "file" => Layouts::File,
+                    "device" => Layouts::Device,
+                    other => panic!("--layouts: measured, file or device, not {other}"),
+                }
+            }
+            "--prompt-weight" => {
+                let weight = value().parse().expect("the weight of prompt speed");
+                args.layouts = Layouts::Measured { prompt_weight: weight };
+            }
+            "--show-layouts" => args.show_layouts = true,
             "--chat-var" => {
                 let pair = value();
                 let (name, text) = pair.split_once('=').expect("--chat-var name=value");
@@ -313,6 +341,68 @@ fn balance(profile: &Profile, placement: &Placement, config: &Config, out: Optio
     }
 }
 
+/// Prints which layouts the weight matrices of a device got and what the
+/// choice took; with `all`, every probed shape and its times.
+fn print_layouts(report: &PartReport, all: bool) {
+    let l = &report.layouts;
+    println!(
+        "RES layout device {}: {} matrices ({:.0} MiB) in the file's layout, {} ({:.0} MiB) in the \
+         device layout, padding {:.2} MiB; {} shapes probed in {:.0} ms on {:.0} MiB, kernel \
+         tables {:.0} ms",
+        report.index,
+        l.matrices[0],
+        l.bytes[0] as f64 / MIB,
+        l.matrices[1],
+        l.bytes[1] as f64 / MIB,
+        l.padding as f64 / MIB,
+        l.probes.len(),
+        l.probes_time.as_secs_f64() * 1e3,
+        l.probe_bytes as f64 / MIB,
+        l.tables.as_secs_f64() * 1e3,
+    );
+    if !l.probes.is_empty() {
+        println!(
+            "RES layout device {}: by the probes the weight products of a decode step take \
+             {:.2} ms in the file's layout and {:.2} ms as chosen, those of a group of prompt \
+             rows {:.1} and {:.1} ms; chosen knowing the times of {} other device(s)",
+            report.index,
+            l.decode_ms[0],
+            l.decode_ms[1],
+            l.prompt_ms[0],
+            l.prompt_ms[1],
+            l.balanced_with,
+        );
+    }
+    if !all {
+        return;
+    }
+    for (n_in, rows, ms) in &l.preparations {
+        println!(
+            "RES layout device {} preparing {rows} row(s) of {n_in}: 8-bit {:.4} ms, f16 {:.4} ms",
+            report.index, ms[0], ms[1]
+        );
+    }
+    for p in &l.probes {
+        println!(
+            "RES layout device {} {:>7} {:>6} x {:<5}: {} row(s) file {:.4} device {:.4} ms; {} \
+             rows file {:.3} device {:.3} ms -> {} matrices in the file's layout, {} in the \
+             device layout",
+            report.index,
+            p.ty.name(),
+            p.n_out,
+            p.n_in,
+            p.decode_rows,
+            p.file_ms[0],
+            p.device_ms[0],
+            p.prompt_rows,
+            p.file_ms[1],
+            p.device_ms[1],
+            p.matrices[0],
+            p.matrices[1],
+        );
+    }
+}
+
 fn median(values: &mut [f64]) -> f64 {
     values.sort_by(f64::total_cmp);
     values.get(values.len() / 2).copied().unwrap_or(f64::NAN)
@@ -334,6 +424,7 @@ fn main() {
     let logit_rows = 16;
     let options = Options {
         precision: args.precision,
+        layouts: args.layouts,
         state: args.state,
         max_rows: args.max_rows,
         logit_rows,
@@ -379,6 +470,7 @@ fn main() {
             (*before - free) as f64 / MIB,
             free as f64 / MIB,
         );
+        print_layouts(report, args.show_layouts);
     }
     let tokenizer = model.tokenizer();
     let chunk = args.step_rows.unwrap_or(args.max_rows as usize).min(args.max_rows as usize);
@@ -502,8 +594,10 @@ fn main() {
         // The fastest step is the one the host disturbed least: on a busy
         // machine the device threads lose their cores between kernels.
         let fastest = times[..args.decode_steps].iter().map(|t| t.0).fold(f64::INFINITY, f64::min);
+        let fastest_device =
+            times[..args.decode_steps].iter().map(|t| t.1).fold(f64::INFINITY, f64::min);
         println!(
-            "RES decode at context {context}: {wall:.2} ms per step wall (median of {}, fastest {fastest:.2}), {device:.2} ms on the slowest device, {:.1} tokens/s",
+            "RES decode at context {context}: {wall:.2} ms per step wall (median of {}, fastest {fastest:.2}), {device:.2} ms on the slowest device (fastest {fastest_device:.3}), {:.1} tokens/s",
             args.decode_steps,
             1e3 / wall
         );
@@ -582,6 +676,7 @@ fn engine(args: &Args, spread: &Spread, drafts: u32) {
     let profile = Arc::new(Profile::new());
     let options = Options {
         precision: args.precision,
+        layouts: args.layouts,
         state: args.state,
         max_rows: args.max_rows,
         logit_rows: 16,
@@ -633,6 +728,7 @@ fn engine(args: &Args, spread: &Spread, drafts: u32) {
             report.weight_bytes as f64 / MIB,
             taken as f64 / MIB
         );
+        print_layouts(report, args.show_layouts);
         if let Some(d) = &report.draft {
             println!(
                 "RES device {} draft block: weights {:.1} MiB, K/V {:.3} MiB per 1000 tokens, kept \

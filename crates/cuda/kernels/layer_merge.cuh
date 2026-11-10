@@ -6,9 +6,11 @@
 // partial sum. The residual stream of every device then needs the sum of all
 // devices' partials, and the next half its norm. These kernels do that in one
 // launch per device: add the partials, add the sum to the residual stream,
-// normalise it for the next half, and where the next products take 8-bit
-// activations quantize it for them. (TensorRT-LLM fuses the residual and the
-// norm into its sum across GPUs the same way.)
+// normalise it for the next half, and write the norm in the form the next
+// products read: quantized where they take 8-bit activations, as f16 where
+// they take those (matrices in their device layout), or both when a half has
+// matrices of each kind. (TensorRT-LLM fuses the residual and the norm into
+// its sum across GPUs the same way.)
 //
 // **On the wire a partial is f16.** A row crosses the link as `d` f16 values
 // and one f32 factor: the row is multiplied by a power of two before it is
@@ -43,6 +45,7 @@
 #include "common.cuh"
 #include "quantize_act.cuh"
 #include "layer_norm.cuh"
+#include "layer_act_f16.cuh"
 
 // float4 chunks a thread keeps in registers.
 #define ARES_MERGE_RESIDENT 6
@@ -54,7 +57,9 @@
 #define ARES_MERGE_SUM 0u    // nothing
 #define ARES_MERGE_NORM 1u   // the RMS norm of the new rows, as f32 rows
 #define ARES_MERGE_QUANT 2u  // the RMS norm, quantized for the weight kernels
-#define ARES_MERGE_MODE 3u   // the bits of `mode` that hold one of the above
+#define ARES_MERGE_F16 3u    // the RMS norm, as f16 activations (layer_act_f16.cuh)
+#define ARES_MERGE_BOTH 4u   // the RMS norm, quantized and as f16 activations
+#define ARES_MERGE_MODE 7u   // the bits of `mode` that hold one of the above
 #define ARES_MERGE_WIDE 256u // the bit of `mode` for the wide wire form
 
 // As ARES_SUM_PEER_MAX_POLLS (sum_peer.cuh): a peer that never arrives gives
@@ -144,13 +149,57 @@ static __device__ __forceinline__ float ares_block_max(float v, float* partial) 
 
 // The end of a merge: the norm of the row `v` (its sum of squares over this
 // thread's values in `ssq`), written as `mode` says. `chunk0` is the index of
-// the row's first float4 in the buffers of all rows.
-static __device__ __forceinline__ void ares_merge_norm(const float4* v, float ssq, float* partial, uint32_t chunks,
+// the row's first float4 in the buffers of all rows. The f16 activations of
+// the modes F16 and BOTH go to `xn`, which those modes do not write rows to.
+// `v` is the caller's to give up: those modes overwrite it.
+static __device__ __forceinline__ void ares_merge_norm(float4* v, float ssq, float* partial, uint32_t chunks,
                                                        size_t chunk0, uint32_t d, size_t n_values,
                                                        const float* weight, float* xn, int8_t* act, float eps,
                                                        uint32_t mode) {
     ssq = ares_block_sum(ssq, partial);
     const float scale = rsqrtf(ssq / static_cast<float>(d) + eps);
+    if (mode == ARES_MERGE_F16 || mode == ARES_MERGE_BOTH) {
+        // The row's power of two needs its largest magnitude first. The
+        // normalised row takes the place of the row in the registers.
+        float4* y = v;
+        float m = 0.0f;
+#pragma unroll
+        for (int k = 0; k < ARES_MERGE_RESIDENT; k++) {
+            const uint32_t c = threadIdx.x + k * blockDim.x;
+            float4 n = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            if (c < chunks) {
+                const float4 wt = reinterpret_cast<const float4*>(weight)[c];
+                n = make_float4(v[k].x * scale * wt.x, v[k].y * scale * wt.y, v[k].z * scale * wt.z,
+                                v[k].w * scale * wt.w);
+            }
+            y[k] = n;
+            m = fmaxf(m, ares_f16_act_max4(n));
+        }
+        // `partial` held the sum of squares until every thread had read it.
+        __syncthreads();
+        m = ares_f16_act_block_max(m, partial);
+        float down, up;
+        ares_f16_act_scale(m, &down, &up);
+        const uint32_t row = static_cast<uint32_t>(chunk0 / chunks);
+        const uint32_t n_rows = static_cast<uint32_t>(n_values / d);
+        __half* out = reinterpret_cast<__half*>(xn);
+        __half* dst = out + static_cast<size_t>(row) * ares_f16_act_pitch(d);
+#pragma unroll
+        for (int k = 0; k < ARES_MERGE_RESIDENT; k++) {
+            const uint32_t c = threadIdx.x + k * blockDim.x;
+            const bool live = c < chunks;
+            if (mode == ARES_MERGE_BOTH) {
+                ares_quant_chunk(y[k], live, chunk0 + c, act, n_values);
+            }
+            if (live) {
+                ares_f16_act_store(dst, c, y[k], down);
+            }
+        }
+        if (threadIdx.x == 0) {
+            ares_f16_act_factors(out, d, n_rows)[row] = up;
+        }
+        return;
+    }
 #pragma unroll
     for (int k = 0; k < ARES_MERGE_RESIDENT; k++) {
         const uint32_t c = threadIdx.x + k * blockDim.x;
@@ -210,10 +259,11 @@ ARES_KERNEL ares_partial_to_wire(const float* p, uint8_t* wire, uint32_t n_rows,
 //   peers        the other devices' partials, in device order, `peer_stride`
 //                bytes apart
 //   own_rank     this device's place in the device order
-//   weight       the weight of the norm (modes NORM and QUANT)
-//   xn           the normalised rows (mode NORM)
+//   weight       the weight of the norm (every mode but SUM)
+//   xn           the normalised rows (mode NORM), or the f16 activations of
+//                all rows in the layout of ares_convert_f16 (modes F16, BOTH)
 //   act          the quantized activations of all rows, in the layout of
-//                ares_quantize_act over n_rows * d values (mode QUANT)
+//                ares_quantize_act over n_rows * d values (modes QUANT, BOTH)
 ARES_KERNEL ares_merge_wire(float* x, const uint8_t* own, const uint8_t* peers, uint64_t peer_stride,
                             uint32_t n_peers, uint32_t own_rank, uint32_t n_rows, uint32_t d, const float* weight,
                             float* xn, int8_t* act, float eps, uint32_t mode) {

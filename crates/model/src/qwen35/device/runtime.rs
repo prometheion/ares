@@ -15,6 +15,7 @@ use ares_runtime::{
 use ares_state::PageLayout;
 use ares_tokenizer::{ChatOptions, EncodeOptions, Message, Tokenizer};
 
+use super::choose::{Balance, LayoutReport};
 use super::part::{
     DraftBytes, DraftChain, DraftStep, Exchange, Options, PAGE_ENTRY, Part, PartSetup, StepEnv,
     page_bytes,
@@ -57,6 +58,8 @@ pub struct PartReport {
     pub page_bytes: u64,
     /// What the model's draft block takes, on the device that holds it.
     pub draft: Option<DraftBytes>,
+    /// Which weight matrices got which layout, and what the choice took.
+    pub layouts: LayoutReport,
 }
 
 /// Why a model could not be set up.
@@ -84,6 +87,9 @@ pub struct Qwen35 {
     /// How chat prompts are rendered.
     chat: ChatOptions,
     reports: Mutex<Vec<PartReport>>,
+    /// Where the parts of a tensor split, which the runtime opens at the
+    /// same time, tell each other what the weight products cost them.
+    balance: Option<Balance>,
 }
 
 impl std::fmt::Debug for Qwen35 {
@@ -132,6 +138,8 @@ impl Qwen35 {
         let tokenizer =
             Tokenizer::from_gguf(&gguf).map_err(|e| OpenError::Tokenizer(e.to_string()))?;
         let context = context.clamp(1, config.n_ctx as u32);
+        let balance = (placement.split == Split::Tensor && placement.n_devices() > 1)
+            .then(|| Balance::new(placement.n_devices()));
         Ok(Self {
             gguf,
             config,
@@ -145,6 +153,7 @@ impl Qwen35 {
                 .map_or(0, |since| since.as_secs()),
             chat: ChatOptions::default(),
             reports: Mutex::new(Vec::new()),
+            balance,
         })
     }
 
@@ -334,7 +343,7 @@ impl Model for Qwen35 {
         let weights = Weights::load(&self.gguf, &self.config)
             .map_err(|e| ModelError::Invalid(e.to_string()))?;
         let index = cx.index;
-        let part = Part::open(
+        let part = Part::open_balanced(
             &self.config,
             &weights,
             &self.placement,
@@ -348,6 +357,7 @@ impl Model for Qwen35 {
                 pages: cx.pages,
                 table_stride: cx.table_stride,
             },
+            self.balance.as_ref(),
         )?;
         self.reports.lock().unwrap_or_else(|e| e.into_inner()).push(PartReport {
             index,
@@ -360,6 +370,7 @@ impl Model for Qwen35 {
             kept_bytes: part.kept_bytes(),
             page_bytes: part.page_bytes(),
             draft: part.draft_bytes(),
+            layouts: part.layouts().clone(),
         });
         Ok(Box::new(Qwen35Device { part, segments: Vec::new(), chains: Vec::new() }))
     }

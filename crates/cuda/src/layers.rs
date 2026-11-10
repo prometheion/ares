@@ -373,6 +373,9 @@ pub struct LayerKernels {
     attn_prep: Function,
     gated_norm_quant: Function,
     swiglu_quant: Function,
+    gated_norm_f16: Function,
+    swiglu_f16: Function,
+    place_rows: Function,
     partial_to_wire: Function,
     merge_wire: Function,
     merge_push: Function,
@@ -433,6 +436,9 @@ impl LayerKernels {
             attn_prep: module.function("ares_attn_prep")?,
             gated_norm_quant: module.function("ares_gated_norm_quant")?,
             swiglu_quant: module.function("ares_swiglu_quant")?,
+            gated_norm_f16: module.function("ares_gated_norm_f16")?,
+            swiglu_f16: module.function("ares_swiglu_f16")?,
+            place_rows: module.function("ares_place_rows")?,
             partial_to_wire: module.function("ares_partial_to_wire")?,
             merge_wire: module.function("ares_merge_wire")?,
             merge_push: module.function("ares_merge_push")?,
@@ -1140,6 +1146,164 @@ impl LayerKernels {
     }
 }
 
+/// float4 chunks a thread of `ares_swiglu_f16` keeps in registers
+/// (`ARES_SWIGLU_F16_RESIDENT`), and heads a warp of `ares_gated_norm_f16`
+/// keeps (`ARES_GATED_NORM_F16_HEADS`).
+const SWIGLU_F16_RESIDENT: u32 = 6;
+const GATED_NORM_F16_HEADS: u32 = 2;
+
+/// The fused kernels that write f16 activations: what
+/// [`LayerKernels::gated_norm_quant`] and [`LayerKernels::swiglu_quant`] are
+/// for a product that reads 8-bit activations, for one that reads f16 (a
+/// matrix in its device layout). They write what a conversion of the same
+/// values would (`Kernels::prepare_activations` for `ActivationForm::F16`,
+/// `Kernels::activation_bytes` bytes: `kernels/layer_act_f16.cuh`), in the
+/// launch that computes them.
+impl LayerKernels {
+    /// The widest row [`LayerKernels::swiglu_f16`] takes: a block of 1024
+    /// threads keeps the row in registers.
+    pub const SWIGLU_F16_MAX_WIDTH: u32 = 4 * SWIGLU_F16_RESIDENT * 1024;
+
+    /// The most heads of a row [`LayerKernels::gated_norm_f16`] takes: the 32
+    /// warps of a block keep the row in registers.
+    pub const GATED_NORM_F16_MAX_HEADS: u32 = GATED_NORM_F16_HEADS * 32;
+
+    /// The gated norm of the recurrent block as f16 activations for the
+    /// output projection: for each of `n_rows` rows its `n_heads` heads (at
+    /// most [`LayerKernels::GATED_NORM_F16_MAX_HEADS`]) of `width` values,
+    /// `rms_norm(o) * weight * gate(z)`, written as `n_rows` rows of
+    /// `n_heads * width` f16 values. `width` is 64, 128 or 256.
+    ///
+    /// # Safety
+    ///
+    /// `o` and `z` must address `n_rows * n_heads * width` f32 values,
+    /// `weight` `width` values and `act` the f16 activations of `n_rows` rows
+    /// of `n_heads * width` values, all 16-byte aligned, on the stream's
+    /// device.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn gated_norm_f16(
+        &self,
+        stream: &Stream,
+        gate: OutputGate,
+        o: DevicePtr,
+        z: DevicePtr,
+        weight: DevicePtr,
+        act: DevicePtr,
+        n_rows: u32,
+        n_heads: u32,
+        width: u32,
+        eps: f32,
+    ) -> Result<()> {
+        if !matches!(width, 64 | 128 | 256) {
+            return Err(invalid("gated norm", format!("width {width} (64, 128 or 256)")));
+        }
+        if n_heads > Self::GATED_NORM_F16_MAX_HEADS {
+            return Err(invalid(
+                "gated norm",
+                format!("{n_heads} heads (at most {})", Self::GATED_NORM_F16_MAX_HEADS),
+            ));
+        }
+        for p in [o, z, weight, act] {
+            check_align("gated norm", p, 16)?;
+        }
+        if n_rows == 0 || n_heads == 0 {
+            return Ok(());
+        }
+        let args = Args::new()
+            .ptr(o)
+            .ptr(z)
+            .ptr(weight)
+            .ptr(act)
+            .u32(n_rows)
+            .u32(n_heads)
+            .u32(width)
+            .f32(eps)
+            .u32(gate as u32);
+        // A warp per head, up to the 32 warps of a block; with more heads the
+        // warps keep several each.
+        let threads = 32 * n_heads.min(32);
+        // SAFETY: the argument list matches ares_gated_norm_f16.
+        unsafe { self.gated_norm_f16.launch(stream, [n_rows, 1, 1], [threads, 1, 1], 0, args) }
+    }
+
+    /// `silu(gate) * up` as f16 activations for the down projection: `n_rows`
+    /// rows of `n_in` values (a multiple of 32, at most
+    /// [`LayerKernels::SWIGLU_F16_MAX_WIDTH`]).
+    ///
+    /// # Safety
+    ///
+    /// `gate` and `up` must address `n_rows * n_in` f32 values and `act` the
+    /// f16 activations of `n_rows` rows of `n_in` values, all 16-byte aligned,
+    /// on the stream's device.
+    pub unsafe fn swiglu_f16(
+        &self,
+        stream: &Stream,
+        gate: DevicePtr,
+        up: DevicePtr,
+        act: DevicePtr,
+        n_rows: u32,
+        n_in: u32,
+    ) -> Result<()> {
+        if n_in == 0 || !n_in.is_multiple_of(32) || n_in > Self::SWIGLU_F16_MAX_WIDTH {
+            return Err(invalid(
+                "swiglu",
+                format!(
+                    "rows of {n_in} values (a multiple of 32 up to {})",
+                    Self::SWIGLU_F16_MAX_WIDTH
+                ),
+            ));
+        }
+        for p in [gate, up, act] {
+            check_align("swiglu", p, 16)?;
+        }
+        if n_rows == 0 {
+            return Ok(());
+        }
+        let args = Args::new().ptr(gate).ptr(up).ptr(act).u32(n_rows).u32(n_in);
+        // A thread per four values, up to the 1024 of a block, before a
+        // thread takes more: it waits for each of its loads.
+        let threads = (n_in / 4).next_multiple_of(32).min(1024);
+        // SAFETY: the argument list matches ares_swiglu_f16.
+        unsafe { self.swiglu_f16.launch(stream, [n_rows, 1, 1], [threads, 1, 1], 0, args) }
+    }
+
+    /// Puts `n_rows` rows of `width` f32 values at `src` into rows of
+    /// `dst_width` values at `dst`, from column `at` on: the place of a
+    /// result that was computed as some columns of a wider one (the logits of
+    /// a head that lies on the device in parts).
+    ///
+    /// # Safety
+    ///
+    /// `src` must address `n_rows * width` f32 values and `dst`
+    /// `n_rows * dst_width`, on the stream's device, not overlapping.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn place_rows(
+        &self,
+        stream: &Stream,
+        src: DevicePtr,
+        dst: DevicePtr,
+        n_rows: u32,
+        width: u32,
+        dst_width: u32,
+        at: u32,
+    ) -> Result<()> {
+        let fits = at.checked_add(width).is_some_and(|end| end <= dst_width);
+        let blocks = (u64::from(n_rows) * u64::from(width)).div_ceil(256);
+        if !fits || blocks > u64::from(u32::MAX) {
+            return Err(invalid(
+                "place rows",
+                format!("{n_rows} rows of {width} values at column {at} of {dst_width}"),
+            ));
+        }
+        if blocks == 0 {
+            return Ok(());
+        }
+        let args = Args::new().ptr(src).ptr(dst).u32(n_rows).u32(width).u32(dst_width).u32(at);
+        // SAFETY: the argument list matches ares_place_rows.
+        unsafe { self.place_rows.launch(stream, [blocks as u32, 1, 1], [256, 1, 1], 0, args) }
+    }
+}
+
 /// What a merge of a tensor split does with the residual stream after it
 /// added the devices' partial results to it (`kernels/layer_merge.cuh`).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1152,11 +1316,19 @@ pub enum MergeNorm {
     /// kernels: the layout of `Kernels::quantize_activations` over all rows
     /// ([`quantized_activation_bytes`] bytes).
     Quantized { weight: DevicePtr, act: DevicePtr },
+    /// The RMS norm with `weight`, as f16 activations at `act` for the
+    /// products that read those (matrices in their device layout): the layout
+    /// of `Kernels::prepare_activations` for `ActivationForm::F16`
+    /// (`Kernels::activation_bytes` bytes).
+    F16 { weight: DevicePtr, act: DevicePtr },
+    /// Both: quantized at `quantized` and as f16 at `f16`, for a half block
+    /// whose matrices read one or the other.
+    Both { weight: DevicePtr, quantized: DevicePtr, f16: DevicePtr },
 }
 
 impl MergeNorm {
-    /// The kernels' arguments: weight, rows, activations, and the mode with
-    /// the bit for the wide wire form.
+    /// The kernels' arguments: weight, rows (or f16 activations), quantized
+    /// activations, and the mode with the bit for the wide wire form.
     fn args(self, wire: Wire) -> (DevicePtr, DevicePtr, DevicePtr, u32) {
         let wide = match wire {
             Wire::F16 => 0,
@@ -1166,6 +1338,10 @@ impl MergeNorm {
             Self::None => (DevicePtr::NULL, DevicePtr::NULL, DevicePtr::NULL, wide),
             Self::Rows { weight, out } => (weight, out, DevicePtr::NULL, 1 | wide),
             Self::Quantized { weight, act } => (weight, DevicePtr::NULL, act, 2 | wide),
+            // The f16 activations travel in the argument of the rows, which
+            // these modes do not write.
+            Self::F16 { weight, act } => (weight, act, DevicePtr::NULL, 3 | wide),
+            Self::Both { weight, quantized, f16 } => (weight, f16, quantized, 4 | wide),
         }
     }
 }

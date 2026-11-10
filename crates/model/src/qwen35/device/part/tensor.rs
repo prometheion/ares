@@ -26,10 +26,10 @@
 //! pass a half in row order, which is the order the recurrent state and the
 //! K/V rows of a sequence need.
 
-use ares_cuda::{DevicePtr, MergeNorm, Precision, PrefillPath, Wire, partial_wire_bytes};
+use ares_cuda::{DevicePtr, MergeNorm, Precision, Wire, partial_wire_bytes};
 use ares_runtime::ModelError;
 
-use super::{Exchange, Group, Normed, Options, Part, Phase, StepEnv, invalid};
+use super::{Exchange, Group, Normed, Options, Part, Phase, Prepared, StepEnv, invalid};
 use crate::qwen35::device::load::{BlockW, Mat, MixerW};
 
 /// A half of a block: what a device computes between two merges.
@@ -235,8 +235,8 @@ impl Part {
 
     /// Adds the sum of all devices' partial results of the group's rows to
     /// the residual stream and, for the half that `readers` belong to,
-    /// normalises it: as quantized activations when one of the half's
-    /// products takes those, as rows otherwise.
+    /// normalises it: as the activations the half's products read (quantized,
+    /// f16 or both), or as rows where they are prepared launch by launch.
     fn collect(
         &mut self,
         env: &StepEnv<'_>,
@@ -249,18 +249,26 @@ impl Part {
         let (norm, normed) = match readers {
             None => (MergeNorm::None, Normed::No),
             Some((weight, mats)) => {
-                let mut int8 = false;
-                for m in mats {
-                    int8 |= matches!(self.path(m.ty, n)?, None | Some(PrefillPath::Int8));
-                }
-                // The decode kernels in several launches quantize the rows
-                // launch by launch (`Part::prepare`), from the rows.
-                if int8 && !self.in_batches(&mats, n) {
-                    let act = self.at(self.s.act_q);
-                    (MergeNorm::Quantized { weight, act }, Normed::Quantized)
-                } else {
-                    let out = self.rows(self.s.xn, self.d);
-                    (MergeNorm::Rows { weight, out }, Normed::Rows)
+                let forms = self.forms(&mats, n)?;
+                let (act_q, act_h) = (self.at(self.s.act_q), self.at(self.s.act_h));
+                let prepared = Prepared { int8: forms.int8, f16: forms.f16 };
+                match (forms.batched, forms.int8, forms.f16) {
+                    // The decode kernels in several launches quantize the rows
+                    // launch by launch (`Part::prepare`), from the rows.
+                    (true, ..) | (false, false, false) => {
+                        let out = self.rows(self.s.xn, self.d);
+                        (MergeNorm::Rows { weight, out }, Normed::Rows)
+                    }
+                    (false, true, false) => {
+                        (MergeNorm::Quantized { weight, act: act_q }, Normed::Prepared(prepared))
+                    }
+                    (false, false, true) => {
+                        (MergeNorm::F16 { weight, act: act_h }, Normed::Prepared(prepared))
+                    }
+                    (false, true, true) => (
+                        MergeNorm::Both { weight, quantized: act_q, f16: act_h },
+                        Normed::Prepared(prepared),
+                    ),
                 }
             }
         };

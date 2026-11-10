@@ -15,15 +15,16 @@ use std::sync::{Arc, Mutex};
 
 use ares_core::{GgmlType, Ledger};
 use ares_cuda::{
-    AttendBuffers, AttentionKernels, AttentionShape, CacheFormat, CacheGeometry, CommitSet, Device,
-    DeviceBuffer, DevicePtr, ENTRY_CELLS, Event, Kernels, LayerKernels, MAX_BATCH, OutputGate,
-    PUSH_MAX_VALUES, PinnedBuffer, PlanBuffers, PlanConfig, Planner, Precision, PrefillPath,
-    RopeParams, Segment, StateFormat, StepDims, Stream,
+    ActivationForm, AttendBuffers, AttentionKernels, AttentionShape, CacheFormat, CacheGeometry,
+    CommitSet, Device, DeviceBuffer, DevicePtr, ENTRY_CELLS, Event, Kernels, LayerKernels,
+    MAX_BATCH, OutputGate, PUSH_MAX_VALUES, PinnedBuffer, PlanBuffers, PlanConfig, Planner,
+    Precision, PrefillPath, RopeParams, Segment, StateFormat, StepDims, Stream, WeightLayout,
 };
 use ares_cuda::{PUSH_MAX_ROWS, PushSlot};
 use ares_runtime::{Logits, ModelError, Split};
 
-use super::load::{AttentionW, BlockW, DeviceWeights, FfnW, Mat, MixerW, RecurrentW};
+use super::choose::{Balance, LayoutReport, Layouts, decode_in_batches, file_path};
+use super::load::{AttentionW, BlockW, DeviceWeights, FfnW, LoadOptions, Mat, MixerW, RecurrentW};
 use super::placement::Placement;
 use crate::qwen35::Config;
 use crate::qwen35::weights::Weights;
@@ -41,11 +42,18 @@ pub const PAGE_ENTRY: u32 = 1 << 31;
 /// The choices of a device implementation.
 #[derive(Clone, Debug)]
 pub struct Options {
-    /// How the matrix products round: [`Precision::Fast`] takes the decode
-    /// kernels (8-bit activations) for steps of up to eight rows and each
-    /// type's fastest tensor-core path above; [`Precision::Exact`] takes the
-    /// f16 tensor-core path for every product.
+    /// How the matrix products round. A matrix in its device layout is
+    /// multiplied with f16 operands at any number of rows, and the two
+    /// differ only in how the tensor cores add up: [`Precision::Exact`]
+    /// always in f32. For a matrix in the file's layout
+    /// [`Precision::Fast`] takes the decode kernels (8-bit activations) for
+    /// steps of up to eight rows and each type's fastest tensor-core path
+    /// above; [`Precision::Exact`] takes the f16 tensor-core path for every
+    /// product.
     pub precision: Precision,
+    /// How each matrix gets its layout on the device: by default measured
+    /// per matrix when the model is loaded, decode steps first.
+    pub layouts: Layouts,
     /// How the delta-rule matrices are stored.
     pub state: StateFormat,
     /// The formats of K and of V. Only the formats without a tile mean (`f16`,
@@ -87,6 +95,7 @@ impl Default for Options {
     fn default() -> Self {
         Self {
             precision: Precision::Fast,
+            layouts: Layouts::default(),
             state: StateFormat::F32,
             kv: (CacheFormat::Q8, CacheFormat::Q8),
             max_rows: 512,
@@ -286,6 +295,7 @@ struct Scratch {
     act_h: u64,
     picked: u64,
     logits: u64,
+    logit_parts: u64,
     attn_state: u64,
     attn_state_bytes: u64,
     status: u64,
@@ -310,6 +320,28 @@ struct AttentionAt {
     pool: u64,
 }
 
+/// The prepared forms of an input that the products of a group of matrices
+/// read.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Forms {
+    /// Quantized, all rows in one layout at `act_q`.
+    int8: bool,
+    /// Quantized launch by launch, for the decode kernels in several
+    /// launches ([`Part::in_batches`]).
+    batched: bool,
+    /// f16, at `act_h`.
+    f16: bool,
+}
+
+/// What a merge has prepared of an input already.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Prepared {
+    /// All rows quantized in one layout at `act_q`, with their f32 copy.
+    int8: bool,
+    /// All rows as f16 at `act_h`.
+    f16: bool,
+}
+
 /// What the merge of a tensor split left of the norm of the rows being
 /// enqueued, for the half block that reads it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -319,9 +351,8 @@ enum Normed {
     No,
     /// The normalised rows.
     Rows,
-    /// The normalised rows as quantized activations, in the layout of the
-    /// fused kernels.
-    Quantized,
+    /// The normalised rows as the activations the half's products read.
+    Prepared(Prepared),
 }
 
 /// A group of consecutive rows of a step that a layer split hands over on
@@ -390,8 +421,8 @@ pub struct Part {
     parcels: Vec<DevicePtr>,
     /// What the last merge left for the half block that follows it.
     normed: Normed,
-    /// Whether the last [`Part::prepare`] prepared for the decode kernels in
-    /// several launches ([`Part::in_batches`]).
+    /// Whether the last [`Part::prepare`] or fused kernel prepared for the
+    /// decode kernels in several launches ([`Part::in_batches`]).
     batched: std::cell::Cell<bool>,
     page_bytes: u64,
     /// The model's own draft block, on the device that holds it.
@@ -459,6 +490,23 @@ impl Part {
         opts: &Options,
         setup: PartSetup<'_>,
     ) -> Result<Self, ModelError> {
+        Self::open_balanced(c, weights, placement, opts, setup, None)
+    }
+
+    /// [`Part::open`] for the parts of a tensor split that are opened at the
+    /// same time, one per device: through `balance` they tell each other
+    /// what the weight products cost them, and each chooses the layouts of
+    /// its matrices knowing where a step waits for it ([`Layouts`]). Every
+    /// part of the placement must be opened with the same `balance`, or the
+    /// ones that are wait for the others in vain before they decide alone.
+    pub fn open_balanced(
+        c: &Config,
+        weights: &Weights<'_>,
+        placement: &Placement,
+        opts: &Options,
+        setup: PartSetup<'_>,
+        balance: Option<&Balance>,
+    ) -> Result<Self, ModelError> {
         let PartSetup { index, device, kernels, ledger, max_slots, pages, table_stride } = setup;
         let plan = placement
             .devices
@@ -473,8 +521,40 @@ impl Part {
         if opts.max_rows == 0 || opts.logit_rows == 0 || max_slots == 0 {
             return Err(invalid("a part needs at least one row, one logit row and one slot"));
         }
-        let w =
-            DeviceWeights::load(device, ledger, c, weights, plan, placement.draft.as_ref(), index)?;
+        // The rows the matrices will be multiplied with, for the choice of
+        // their layouts: a decode step is one row, or a window when the model
+        // verifies its own drafts in every step; prompts are read in groups
+        // under a split (`Part::plan_groups`) and in whole steps otherwise.
+        let decode_rows = match &placement.draft {
+            Some(_) => opts.window_rows.max(1),
+            None => 1,
+        };
+        let prompt_rows = match (placement.split, opts.pipeline_rows) {
+            (Split::Single, _) | (_, 0) => opts.max_rows,
+            (Split::Layer, per) if opts.max_rows < 2 * per => opts.max_rows,
+            (_, per) => per.min(opts.max_rows),
+        };
+        let layers = LayerKernels::load(device)?;
+        let w = DeviceWeights::load(
+            device,
+            kernels,
+            &layers,
+            ledger,
+            c,
+            weights,
+            plan,
+            placement.draft.as_ref(),
+            index,
+            LoadOptions {
+                layouts: opts.layouts,
+                precision: opts.precision,
+                decode_rows,
+                prompt_rows,
+                max_rows: opts.max_rows,
+                merged: placement.split == Split::Tensor && placement.n_devices() > 1,
+            },
+            balance,
+        )?;
 
         let (d, rows) = (c.n_embd as u64, u64::from(opts.max_rows));
         let (mut cd, mut vd, mut kd, mut nv, mut hq, mut hkv, mut f) = (0u64, 0, 0, 0, 0, 0, 0);
@@ -582,8 +662,12 @@ impl Part {
             .max(draft_sizes.as_ref().map_or(0, |sizes| sizes.act_h)),
         );
         s.picked = take(logit_rows * d * 4);
-        let head_rows = w.head.as_ref().map_or(0, |(m, _)| u64::from(m.n_out));
+        let head_rows = w.head.as_ref().map_or(0, |h| u64::from(h.n_out));
         s.logits = take(logit_rows * head_rows * 4);
+        // A head in parts computes several rows part by part before they are
+        // put in their place.
+        let in_parts = w.head.as_ref().is_some_and(|h| h.parts.len() > 1);
+        s.logit_parts = take(if in_parts { logit_rows * head_rows * 4 } else { 0 });
         s.attn_state = take(state_slots);
         s.attn_state_bytes = state_slots;
         s.status = take(16);
@@ -649,7 +733,7 @@ impl Part {
             opts: opts.clone(),
             device: device.clone(),
             kernels: kernels.clone(),
-            layers: LayerKernels::load(device)?,
+            layers,
             attention,
             w,
             d: d as u32,
@@ -704,6 +788,12 @@ impl Part {
         self.w.upload
     }
 
+    /// Which matrices got which layout on this device, and what the choice
+    /// took.
+    pub fn layouts(&self) -> &LayoutReport {
+        &self.w.layouts
+    }
+
     /// Bytes of recurrent state per sequence on this device.
     pub fn state_bytes_per_slot(&self) -> u64 {
         self.slot_bytes
@@ -726,7 +816,7 @@ impl Part {
 
     /// Logits per row this part produces: its slice of the vocabulary.
     pub fn logits_per_row(&self) -> u32 {
-        self.w.head.as_ref().map_or(0, |(m, _)| m.n_out)
+        self.w.head.as_ref().map_or(0, |h| h.n_out)
     }
 
     /// The number of blocks (slices of blocks) on this device.
@@ -838,37 +928,43 @@ impl Part {
 
     // --- products ----------------------------------------------------------------
 
-    /// Which kernel family multiplies a matrix of `ty` with `n` rows: `None`
-    /// for the decode kernels.
+    /// Which kernel family multiplies a matrix of `ty` in the file's layout
+    /// with `n` rows: `None` for the decode kernels.
     fn path(&self, ty: GgmlType, n: u32) -> Result<Option<PrefillPath>, ModelError> {
-        match self.opts.precision {
-            Precision::Exact => Ok(Some(self.kernels.prefill_path(Precision::Exact)?)),
-            Precision::Fast => {
-                let decode = Kernels::decode_kernel_rows(ty)
-                    .or_else(|| Kernels::has_fast_matvec(ty).then_some(MAX_BATCH));
-                match decode {
-                    Some(limit) if n <= limit.min(MAX_BATCH) => Ok(None),
-                    _ => Ok(Some(self.kernels.prefill_path_for(ty, Precision::Fast)?)),
-                }
-            }
-        }
+        file_path(&self.kernels, self.opts.precision, ty, n)
     }
 
-    /// Whether the products of `mats` with `n` rows are taken by the decode
-    /// kernels in several launches of up to [`MAX_BATCH`] rows each: a window
-    /// of a few more rows than one launch takes, where every matrix's decode
-    /// kernel still beats its tensor-core kernel. Where that is, is not
-    /// decided here: `Kernels::decode_kernel_rows` says it per weight type.
-    /// (The tensor-core kernels decode a whole matrix whatever the rows. On
-    /// Qwen3.8-27B over an RTX 4070 and an RTX 3060 that is a step of about
-    /// 80 ms from 9 to 24 rows, while the decode kernels take 36 ms for 8.)
+    /// Whether the products of `mats` with `n` rows are taken, for those in
+    /// the file's layout, by the decode kernels in several launches of up to
+    /// [`MAX_BATCH`] rows each: a window of a few more rows than one launch
+    /// takes, where every such matrix's decode kernel still beats its
+    /// tensor-core kernel. Where that is, is not decided here:
+    /// `Kernels::decode_kernel_rows` says it per weight type. (The tile
+    /// kernels of the file's layout decode a whole matrix whatever the rows.
+    /// On Qwen3.8-27B over an RTX 4070 and an RTX 3060 that is a step of
+    /// about 80 ms from 9 to 24 rows, while the decode kernels take 36 ms for
+    /// 8. A matrix in its device layout has no such gap.)
     fn in_batches(&self, mats: &[&Mat], n: u32) -> bool {
-        matches!(self.opts.precision, Precision::Fast)
-            && n > MAX_BATCH
-            && n.next_multiple_of(MAX_BATCH) <= self.opts.max_rows
-            && mats
-                .iter()
-                .all(|m| Kernels::decode_kernel_rows(m.ty).is_some_and(|limit| n <= limit))
+        let mut file = mats.iter().filter(|m| m.layout == WeightLayout::File).peekable();
+        file.peek().is_some()
+            && decode_in_batches(self.opts.precision, self.opts.max_rows, file.map(|m| m.ty), n)
+    }
+
+    /// The forms of an input of `n` rows that the products with `mats` read.
+    fn forms(&self, mats: &[&Mat], n: u32) -> Result<Forms, ModelError> {
+        let batched = self.in_batches(mats, n);
+        let mut forms = Forms { batched, ..Forms::default() };
+        for m in mats {
+            match m.layout {
+                WeightLayout::Device => forms.f16 = true,
+                WeightLayout::File if batched => {}
+                WeightLayout::File => match self.path(m.ty, n)? {
+                    None | Some(PrefillPath::Int8) => forms.int8 = true,
+                    Some(PrefillPath::F16 | PrefillPath::F16Flush) => forms.f16 = true,
+                },
+            }
+        }
+        Ok(forms)
     }
 
     /// The rows of each launch that writes or reads the quantized activations
@@ -888,35 +984,16 @@ impl Part {
             .map(move |b| (b * per, per.min(n - b * per), act_q.offset(u64::from(b) * stride)))
     }
 
-    /// What the products with `mats` need beyond the quantized activations
-    /// that fused kernels have written at the places of [`Part::act_ranges`].
-    ///
-    /// # Safety
-    ///
-    /// The scratch must hold those activations of `n` rows of `n_in` values.
-    unsafe fn prepare_fused(
-        &self,
-        stream: &Stream,
-        n_in: u32,
-        n: u32,
-        mats: &[&Mat],
-    ) -> Result<(), ModelError> {
-        if self.in_batches(mats, n) {
-            self.batched.set(true);
-            return Ok(());
-        }
-        // SAFETY: not in batches, the activations are one layout at `act_q`.
-        unsafe { self.prepare(stream, self.at(self.s.act_q), n_in, n, mats, true) }
-    }
-
     /// Prepares `n` rows of `n_in` values at `x` for the products with
-    /// `mats`: quantized into `act_q`, as f16 into `act_h`, or both. With
-    /// `fused`, `act_q` already holds all rows in the one layout of the fused
-    /// kernels and only the f16 form may be missing.
+    /// `mats`: quantized into `act_q`, as f16 into `act_h`, or both, as their
+    /// layouts and kernels ask. What `have` names is there already (a merge
+    /// wrote it) and only the rest is made; with `have.int8` the rows are
+    /// read from the copy in the quantized layout and `x` is not used.
     ///
     /// # Safety
     ///
-    /// `x` must address `n * n_in` f32 values on the stream's device.
+    /// `x` must address `n * n_in` f32 values on the stream's device, unless
+    /// `have.int8`; the scratch must hold what `have` names.
     unsafe fn prepare(
         &self,
         stream: &Stream,
@@ -924,59 +1001,162 @@ impl Part {
         n_in: u32,
         n: u32,
         mats: &[&Mat],
-        fused: bool,
+        have: Prepared,
     ) -> Result<(), ModelError> {
-        self.batched.set(!fused && self.in_batches(mats, n));
-        if self.batched.get() {
-            for (first, rows, act) in self.act_ranges(mats, n_in, n) {
-                let at = x.offset(u64::from(first) * u64::from(n_in) * 4);
-                // SAFETY: the range is inside the caller's rows, and the
-                // scratch holds the quantized form of every launch.
-                unsafe { self.kernels.quantize_activations(stream, at, act, n_in, rows)? };
-            }
-            return Ok(());
-        }
-        let (mut int8, mut f16) = (false, false);
-        for m in mats {
-            match self.path(m.ty, n)? {
-                None | Some(PrefillPath::Int8) => int8 = true,
-                Some(PrefillPath::F16 | PrefillPath::F16Flush) => f16 = true,
-            }
-        }
+        let forms = self.forms(mats, n)?;
+        self.batched.set(forms.batched);
         let (act_q, act_h) = (self.at(self.s.act_q), self.at(self.s.act_h));
-        // SAFETY: the scratch buffers hold the prepared form of the widest
-        // input for the most rows; `x` is the caller's guarantee.
+        let rows = if have.int8 {
+            // The f32 copy at the end of the quantized layout.
+            let values = u64::from(n_in) * u64::from(n);
+            act_q.offset(ares_cuda::quantized_activation_bytes(values) - values * 4)
+        } else {
+            x
+        };
+        if (forms.batched && (have.int8 || have.f16)) || (forms.int8 && have.f16 && !have.int8) {
+            return Err(invalid(
+                "a merge prepared activations in another form than the half block reads",
+            ));
+        }
+        // SAFETY: the scratch buffers hold the prepared forms of the widest
+        // input for the most rows; the rows are the caller's guarantee.
         unsafe {
-            if int8 && !fused {
+            if forms.batched {
+                for (first, count, act) in self.act_ranges(mats, n_in, n) {
+                    let at = rows.offset(u64::from(first) * u64::from(n_in) * 4);
+                    self.kernels.quantize_activations(stream, at, act, n_in, count)?;
+                }
+            }
+            if forms.int8 && !have.int8 {
                 if n <= MAX_BATCH {
-                    self.kernels.quantize_activations(stream, x, act_q, n_in, n)?;
+                    self.kernels.quantize_activations(stream, rows, act_q, n_in, n)?;
                 } else {
                     self.kernels.prepare_prefill_activations(
                         stream,
                         PrefillPath::Int8,
-                        x,
+                        rows,
                         act_q,
                         n_in,
                         n,
                     )?;
                 }
             }
-            if f16 {
-                let source = if fused {
-                    // The f32 copy at the end of the fused layout.
-                    let values = u64::from(n_in) * u64::from(n);
-                    act_q.offset(ares_cuda::quantized_activation_bytes(values) - values * 4)
-                } else {
-                    x
-                };
-                self.kernels.prepare_prefill_activations(
+            if forms.f16 && !have.f16 {
+                self.kernels.prepare_activations(
                     stream,
-                    PrefillPath::F16,
-                    source,
+                    ActivationForm::F16,
+                    rows,
                     act_h,
                     n_in,
                     n,
                 )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The gated norm of the output `o` of a recurrent block with the gate
+    /// `z`, `n` rows, prepared for the output projection in the one form it
+    /// reads, by one fused kernel.
+    ///
+    /// # Safety
+    ///
+    /// `o` and `z` must address `n` rows of the block's value heads on the
+    /// stream's device.
+    unsafe fn gated_norm(
+        &self,
+        stream: &Stream,
+        r: &RecurrentW,
+        o: DevicePtr,
+        z: DevicePtr,
+        n: u32,
+    ) -> Result<(), ModelError> {
+        let shape = r.shape;
+        let forms = self.forms(&[&r.out], n)?;
+        self.batched.set(forms.batched);
+        let weight = self.w.at(r.ssm_norm);
+        // SAFETY: the scratch holds either form of the widest input for the
+        // most rows; the weight is in the arena.
+        unsafe {
+            if forms.f16 && shape.n_v_heads <= LayerKernels::GATED_NORM_F16_MAX_HEADS {
+                self.layers.gated_norm_f16(
+                    stream,
+                    OutputGate::Silu,
+                    o,
+                    z,
+                    weight,
+                    self.at(self.s.act_h),
+                    n,
+                    shape.n_v_heads,
+                    shape.head_dim,
+                    self.eps,
+                )?;
+                return Ok(());
+            }
+            for (first, rows, act) in self.act_ranges(&[&r.out], shape.value_dim(), n) {
+                let at = u64::from(first) * u64::from(shape.value_dim()) * 4;
+                self.layers.gated_norm_quant(
+                    stream,
+                    OutputGate::Silu,
+                    o.offset(at),
+                    z.offset(at),
+                    weight,
+                    act,
+                    rows * shape.n_v_heads,
+                    shape.head_dim,
+                    self.eps,
+                )?;
+            }
+            // More heads than the fused kernel for f16 keeps: converted from
+            // the copy the quantizing one left.
+            if forms.f16 {
+                let have = Prepared { int8: true, f16: false };
+                self.prepare(stream, o, shape.value_dim(), n, &[&r.out], have)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// `silu(gate) * up` of `n` rows of `inner` values, prepared for the
+    /// product with `down` in the one form it reads, by one fused kernel.
+    ///
+    /// # Safety
+    ///
+    /// `gate` and `up` must address `n * inner` f32 values on the stream's
+    /// device.
+    unsafe fn swiglu(
+        &self,
+        stream: &Stream,
+        gate: DevicePtr,
+        up: DevicePtr,
+        inner: u32,
+        n: u32,
+        down: &Mat,
+    ) -> Result<(), ModelError> {
+        let forms = self.forms(&[down], n)?;
+        self.batched.set(forms.batched);
+        // SAFETY: the scratch holds either form of the widest input for the
+        // most rows.
+        unsafe {
+            if forms.f16 && inner <= LayerKernels::SWIGLU_F16_MAX_WIDTH {
+                self.layers.swiglu_f16(stream, gate, up, self.at(self.s.act_h), n, inner)?;
+                return Ok(());
+            }
+            for (first, rows, act) in self.act_ranges(&[down], inner, n) {
+                let at = u64::from(first) * u64::from(inner) * 4;
+                self.layers.swiglu_quant(
+                    stream,
+                    gate.offset(at),
+                    up.offset(at),
+                    act,
+                    rows * inner,
+                )?;
+            }
+            // A wider row than the fused kernel for f16 keeps: converted from
+            // the copy the quantizing one left.
+            if forms.f16 {
+                let have = Prepared { int8: true, f16: false };
+                self.prepare(stream, gate, inner, n, &[down], have)?;
             }
         }
         Ok(())
@@ -997,24 +1177,23 @@ impl Part {
     ) -> Result<(), ModelError> {
         let (stream, n) = (env.stream, env.dims.n_rows);
         let (x, xn) = (self.rows(self.s.x, self.d), self.rows(self.s.xn, self.d));
-        // SAFETY: `x` and `xn` hold the step's rows, `act_q` the quantized
-        // form of the widest input; the weight is the caller's guarantee.
+        // SAFETY: `x` and `xn` hold the step's rows, the scratch the prepared
+        // forms of the widest input; the weight is the caller's guarantee.
         unsafe {
             match std::mem::take(&mut self.normed) {
                 Normed::No => {
                     self.kernels.rms_norm_f32(stream, x, weight, xn, self.d, n, self.eps)?;
                     self.mark(stream, Phase::Layers)?;
-                    self.prepare(stream, xn, self.d, n, mats, false)
+                    self.prepare(stream, xn, self.d, n, mats, Prepared::default())
                 }
-                Normed::Rows => self.prepare(stream, xn, self.d, n, mats, false),
-                Normed::Quantized => {
-                    self.prepare(stream, self.at(self.s.act_q), self.d, n, mats, true)
-                }
+                Normed::Rows => self.prepare(stream, xn, self.d, n, mats, Prepared::default()),
+                Normed::Prepared(have) => self.prepare(stream, xn, self.d, n, mats, have),
             }
         }
     }
 
-    /// `y = m x` for the `n` rows that [`Part::prepare`] prepared.
+    /// `y = m x` for the `n` rows that [`Part::prepare`] or a fused kernel
+    /// prepared.
     ///
     /// # Safety
     ///
@@ -1027,6 +1206,25 @@ impl Part {
         y: DevicePtr,
     ) -> Result<(), ModelError> {
         let w = self.w.mat(m);
+        if m.layout == WeightLayout::Device {
+            // SAFETY: the matrix is in the arena in its device layout and the
+            // f16 activations were prepared for it.
+            unsafe {
+                self.kernels.product(
+                    stream,
+                    m.ty,
+                    WeightLayout::Device,
+                    self.opts.precision,
+                    w,
+                    self.at(self.s.act_h),
+                    y,
+                    m.n_in,
+                    m.n_out,
+                    n,
+                )?;
+            }
+            return Ok(());
+        }
         if self.batched.get() {
             for (first, rows, act) in self.act_ranges(&[m], m.n_in, n) {
                 let at = y.offset(u64::from(first) * u64::from(m.n_out) * 4);
@@ -1509,14 +1707,16 @@ impl Part {
 
     fn enqueue_head(&mut self, env: &StepEnv<'_>) -> Result<Option<Logits>, ModelError> {
         let (stream, dims) = (env.stream, env.dims);
-        let Some((head, first_token)) = self.w.head else { return Ok(None) };
+        let Some(head) = self.w.head.clone() else { return Ok(None) };
         if dims.n_out == 0 {
             return Ok(None);
         }
         let (picked, logits) = (self.at(self.s.picked), self.at(self.s.logits));
-        // SAFETY: `picked` holds `logit_rows` rows of `d` values and `logits`
-        // as many rows of this device's slice of the vocabulary; `n_out` is
-        // at most `logit_rows` (checked in `check`).
+        let parts: Vec<&Mat> = head.parts.iter().collect();
+        // SAFETY: `picked` holds `logit_rows` rows of `d` values, `logits`
+        // as many rows of this device's slice of the vocabulary and, for a
+        // head in parts, `logit_parts` the same; `n_out` is at most
+        // `logit_rows` (checked in `check`).
         unsafe {
             self.layers.gather_rows(
                 stream,
@@ -1529,11 +1729,33 @@ impl Part {
                 self.eps,
             )?;
             self.mark(stream, Phase::Layers)?;
-            self.prepare(stream, picked, self.d, dims.n_out, &[&head], false)?;
-            self.product(stream, &head, dims.n_out, logits)?;
+            self.prepare(stream, picked, self.d, dims.n_out, &parts, Prepared::default())?;
+            match (parts.as_slice(), dims.n_out) {
+                ([whole], n) => self.product(stream, whole, n, logits)?,
+                // One row: every part writes its columns where they belong.
+                (parts, 1) => {
+                    let mut at = 0u64;
+                    for part in parts {
+                        self.product(stream, part, 1, logits.offset(at * 4))?;
+                        at += u64::from(part.n_out);
+                    }
+                }
+                // Several rows: a part's rows lie as far apart as it is wide,
+                // so they are computed aside and put in their place.
+                (parts, n) => {
+                    let (mut aside, mut at) = (self.at(self.s.logit_parts), 0u32);
+                    for part in parts {
+                        self.product(stream, part, n, aside)?;
+                        self.layers
+                            .place_rows(stream, aside, logits, n, part.n_out, head.n_out, at)?;
+                        aside = aside.offset(u64::from(n) * u64::from(part.n_out) * 4);
+                        at += part.n_out;
+                    }
+                }
+            }
         }
         self.mark(stream, Phase::Weights)?;
-        Ok(Some(Logits { ptr: logits, stride: head.n_out, first_token }))
+        Ok(Some(Logits { ptr: logits, stride: head.n_out, first_token: head.first_token }))
     }
 
     /// Enqueues block `i` of this part for the rows of the step.
@@ -1643,22 +1865,8 @@ impl Part {
                 conv_state,
                 conv_stride,
             )?;
-            for (first, rows, act) in self.act_ranges(&[&r.out], shape.value_dim(), n) {
-                let at = u64::from(first) * u64::from(shape.value_dim()) * 4;
-                self.layers.gated_norm_quant(
-                    stream,
-                    OutputGate::Silu,
-                    o.offset(at),
-                    z.offset(at),
-                    self.w.at(r.ssm_norm),
-                    act,
-                    rows * shape.n_v_heads,
-                    shape.head_dim,
-                    self.eps,
-                )?;
-            }
+            self.gated_norm(stream, r, o, z, n)?;
             self.mark(stream, Phase::Layers)?;
-            self.prepare_fused(stream, shape.value_dim(), n, &[&r.out])?;
             self.product(stream, &r.out, n, self.rows(s.p, self.d))?;
         }
         self.mark(stream, Phase::Weights)
@@ -1741,7 +1949,7 @@ impl Part {
                 1.0 / (self.attn_head_dim as f32).sqrt(),
             )?;
             self.mark(stream, Phase::Attention)?;
-            self.prepare(stream, o, a.out.n_in, n, &[&a.out], false)?;
+            self.prepare(stream, o, a.out.n_in, n, &[&a.out], Prepared::default())?;
             self.product(stream, &a.out, n, self.rows(s.p, self.d))?;
         }
         self.mark(stream, Phase::Weights)
@@ -1758,18 +1966,8 @@ impl Part {
             self.product(stream, &f.gate, n, gate)?;
             self.product(stream, &f.up, n, up)?;
             self.mark(stream, Phase::Weights)?;
-            for (first, rows, act) in self.act_ranges(&[&f.down], inner, n) {
-                let at = u64::from(first) * u64::from(inner) * 4;
-                self.layers.swiglu_quant(
-                    stream,
-                    gate.offset(at),
-                    up.offset(at),
-                    act,
-                    rows * inner,
-                )?;
-            }
+            self.swiglu(stream, gate, up, inner, n, &f.down)?;
             self.mark(stream, Phase::Layers)?;
-            self.prepare_fused(stream, inner, n, &[&f.down])?;
             self.product(stream, &f.down, n, self.rows(s.p, self.d))?;
         }
         self.mark(stream, Phase::Weights)
