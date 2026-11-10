@@ -26,6 +26,16 @@ Scope decisions:
   A GPU that cannot run the current kernels is not supported, and a model
   architecture is removed when it is superseded.
 
+- **No engine is the model for this one.** llama.cpp, vLLM, SGLang, Strata
+  and the others are references, each for what it does best, and a design is
+  taken from whichever has the better one. Two things are fixed points and
+  not up for trade: GGUF files are the input, and VRAM is not wasted. Weights
+  stay in VRAM at their quantized size (rearranged for the kernels at load
+  where that helps, never expanded), K and V are quantized and paged from
+  one pool, and nothing is preallocated per request. That is what llama.cpp
+  gets right and the serving engines do not; how fast the rest is done owes
+  it nothing.
+
 - **Server only.** One binary, `ares`. No command line tools, no GUI.
 - **Linux only.** That allows direct I/O, `io_uring` and huge pages without
   a portability layer.
@@ -35,7 +45,9 @@ Scope decisions:
 - **CUDA and Vulkan.** Everything CUDA 13 runs on is supported and tuned for;
   every other GPU goes through the generic Vulkan backend. Both device layers
   exist from the start and are held to the same tests; everything above them
-  is written once.
+  is written once. Every kernel family exists on both as far as Vulkan
+  allows, computing on the quantized data itself on both; transfers between
+  devices use whatever direct path a system has, on either backend.
 - **No CPU inference.** A model does not run on the CPU, and no layer of a
   dense model is offloaded to it. The CPU computes in one place only: the
   experts of a MoE model that are not on the GPU (see [Weights](#weights)).
