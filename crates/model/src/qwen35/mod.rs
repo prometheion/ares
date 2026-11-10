@@ -9,5 +9,5 @@ pub mod weights;
 
 pub use config::Config;
 pub use error::{Error, Result};
-pub use reference::{LogitRows, Reference, SequenceState, Window};
+pub use reference::{LogitRows, Reference, SequenceState, StateStorage, Window};
 pub use weights::Weights;

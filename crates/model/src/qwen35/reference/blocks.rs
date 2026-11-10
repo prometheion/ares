@@ -21,7 +21,7 @@ use crate::qwen35::weights::{AttentionWeights, RecurrentWeights};
 /// Sums run over `head_k_dim` in index order, in `f64`. The matrix is rounded
 /// to `f32` after the update and the output is computed from the rounded
 /// matrix, so a state that was stored and loaded again gives the same output.
-fn delta_step(
+pub fn delta_step(
     s: &mut [f32],
     q: &[f32],
     k: &[f32],
@@ -49,6 +49,26 @@ fn delta_step(
             out[j] = (o * scale) as f32;
         }
     }
+}
+
+/// The causal convolution of a recurrent block with `silu`: `n` rows of the
+/// projection `qkv` (`[n, cd]`), preceded by the committed window `window`
+/// (`[cd][kk]`, the last `kk` inputs of every channel, oldest first), with the
+/// taps `taps` (`[cd][kk + 1]`, tap `kk` on the newest input). Returns `[n, cd]`.
+/// The sums are in `f64`.
+pub fn conv_silu(taps: &[f32], kk: usize, window: &[f32], qkv: &[f32], cd: usize, n: usize) -> Vec<f32> {
+    let mut mixed = vec![0.0f32; n * cd];
+    for ch in 0..cd {
+        let tap = &taps[ch * (kk + 1)..(ch + 1) * (kk + 1)];
+        let input = |i: usize| -> f64 {
+            f64::from(if i < kk { window[ch * kk + i] } else { qkv[(i - kk) * cd + ch] })
+        };
+        for t in 0..n {
+            let sum: f64 = (0..=kk).map(|i| f64::from(tap[i]) * input(t + i)).sum();
+            mixed[t * cd + ch] = silu(sum) as f32;
+        }
+    }
+    mixed
 }
 
 /// Advances all value heads of one recurrent block over row `t` of the kept
@@ -116,17 +136,7 @@ impl Reference<'_, '_> {
 
         // Causal convolution over the inputs of the window, preceded by the
         // committed inputs; tap kk multiplies the newest input. Then silu.
-        let mut mixed = vec![0.0f32; n * cd];
-        for ch in 0..cd {
-            let taps = &w.conv[ch * (kk + 1)..(ch + 1) * (kk + 1)];
-            let input = |i: usize| -> f64 {
-                f64::from(if i < kk { conv[ch * kk + i] } else { qkv[(i - kk) * cd + ch] })
-            };
-            for t in 0..n {
-                let sum: f64 = (0..=kk).map(|i| f64::from(taps[i]) * input(t + i)).sum();
-                mixed[t * cd + ch] = silu(sum) as f32;
-            }
-        }
+        let mixed = conv_silu(&w.conv, kk, conv, &qkv, cd, n);
 
         // Split into query, key, value; normalise each query and key head.
         let mut q = vec![0.0f32; n * kd];

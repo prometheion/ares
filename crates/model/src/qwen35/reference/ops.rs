@@ -28,28 +28,28 @@ pub(crate) fn widen(x: &[f32]) -> Vec<f64> {
 }
 
 /// `1 / (1 + e^-x)`.
-pub(crate) fn sigmoid(x: f64) -> f64 {
+pub fn sigmoid(x: f64) -> f64 {
     1.0 / (1.0 + (-x).exp())
 }
 
 /// `x * sigmoid(x)`.
-pub(crate) fn silu(x: f64) -> f64 {
+pub fn silu(x: f64) -> f64 {
     x * sigmoid(x)
 }
 
 /// `ln(1 + e^x)`, which is `x` to within an `f32` for large `x`.
-pub(crate) fn softplus(x: f64) -> f64 {
+pub fn softplus(x: f64) -> f64 {
     if x > 34.0 { x } else { x.exp().ln_1p() }
 }
 
 /// The factor of an RMS norm: `1 / sqrt(mean(x^2) + eps)`.
-pub(crate) fn rms_scale(x: &[f32], eps: f32) -> f64 {
+pub fn rms_scale(x: &[f32], eps: f32) -> f64 {
     let sum: f64 = x.iter().map(|&v| f64::from(v) * f64::from(v)).sum();
     1.0 / (sum / x.len() as f64 + f64::from(eps)).sqrt()
 }
 
 /// `x * rms_scale(x) * weight`, one head or one row.
-pub(crate) fn rms_norm(x: &[f32], weight: &[f32], eps: f32, out: &mut [f32]) {
+pub fn rms_norm(x: &[f32], weight: &[f32], eps: f32, out: &mut [f32]) {
     debug_assert!(x.len() == weight.len() && x.len() == out.len());
     let scale = rms_scale(x, eps);
     for ((o, &v), &w) in out.iter_mut().zip(x).zip(weight) {
@@ -59,7 +59,7 @@ pub(crate) fn rms_norm(x: &[f32], weight: &[f32], eps: f32, out: &mut [f32]) {
 
 /// `x / sqrt(sum(x^2) + eps)`: the normalisation of queries and keys in the
 /// recurrent blocks. The epsilon is inside the root, not a floor on the norm.
-pub(crate) fn l2_norm(x: &[f32], eps: f32, out: &mut [f32]) {
+pub fn l2_norm(x: &[f32], eps: f32, out: &mut [f32]) {
     let sum: f64 = x.iter().map(|&v| f64::from(v) * f64::from(v)).sum();
     let scale = 1.0 / (sum + f64::from(eps)).sqrt();
     for (o, &v) in out.iter_mut().zip(x) {

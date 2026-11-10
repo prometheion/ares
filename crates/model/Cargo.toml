@@ -13,5 +13,8 @@ ares-gguf.workspace = true
 ares-quant = { path = "../quant" }
 thiserror.workspace = true
 
+[dev-dependencies]
+ares-cuda.workspace = true
+
 [lints]
 workspace = true

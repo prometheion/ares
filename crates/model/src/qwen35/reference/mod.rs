@@ -26,6 +26,14 @@
 mod blocks;
 mod ops;
 
+/// Pieces of the reference that GPU kernels are held to one by one: the
+/// functions of the recurrent block (`delta_step`, `conv_silu`) and the scalar
+/// operations with their `f64` arithmetic.
+pub mod pieces {
+    pub use super::blocks::{conv_silu, delta_step};
+    pub use super::ops::{l2_norm, rms_norm, rms_scale, sigmoid, silu, softplus};
+}
+
 use crate::qwen35::config::Config;
 use crate::qwen35::error::{Error, Result};
 use crate::qwen35::weights::{Matrix, Mixer, Weights};
@@ -70,6 +78,18 @@ impl SequenceState {
     /// The number of tokens the state has seen: the position of the next one.
     pub fn position(&self) -> usize {
         self.position
+    }
+
+    /// Rounds the delta-rule matrices of every recurrent block to `storage` and
+    /// back, once: what saving the state as a checkpoint in that format and
+    /// resuming from it does.
+    pub fn round_delta(&mut self, config: &Config, storage: StateStorage) {
+        let r = &config.recurrent;
+        for layer in &mut self.layers {
+            if let LayerState::Recurrent { delta, .. } = layer {
+                storage.round(delta, r.head_v_dim, r.head_k_dim);
+            }
+        }
     }
 
     /// The convolution window of a recurrent block: per channel the last
@@ -163,12 +183,64 @@ impl Window {
     }
 }
 
+/// How the delta-rule matrices are held between steps. The arithmetic of a step
+/// is the same in every case; the format only rounds the matrices once a commit
+/// has advanced them, which is what storing the state in a smaller type costs.
+/// Used to measure that cost against `F32`, the exact state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StateStorage {
+    /// `f32`, as the reference and llama.cpp hold it.
+    F32,
+    /// IEEE half precision, rounded to nearest even.
+    F16,
+    /// `bfloat16`, rounded to nearest even.
+    Bf16,
+    /// `int8` with one `f32` scale per value head (`max |S| / 127`).
+    Int8PerHead,
+    /// `int8` with one `f32` scale per row of a matrix (one value index of one head).
+    Int8PerRow,
+}
+
+impl StateStorage {
+    /// Rounds `matrices` (`[head][value index][key index]`, `head_dim` per
+    /// row, `rows_per_head` rows) to the format and back.
+    pub fn round(self, matrices: &mut [f32], rows_per_head: usize, head_dim: usize) {
+        match self {
+            StateStorage::F32 => {}
+            StateStorage::F16 => {
+                for v in matrices.iter_mut() {
+                    *v = ares_quant::f16_to_f32(ares_quant::f32_to_f16(*v));
+                }
+            }
+            StateStorage::Bf16 => {
+                for v in matrices.iter_mut() {
+                    *v = ares_quant::bf16_to_f32(ares_quant::f32_to_bf16(*v));
+                }
+            }
+            StateStorage::Int8PerHead | StateStorage::Int8PerRow => {
+                let group = if self == StateStorage::Int8PerHead { rows_per_head * head_dim } else { head_dim };
+                for chunk in matrices.chunks_mut(group) {
+                    let max = chunk.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+                    if max == 0.0 {
+                        continue;
+                    }
+                    let scale = max / 127.0;
+                    for v in chunk.iter_mut() {
+                        *v = (*v / scale).round().clamp(-127.0, 127.0) * scale;
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// The forward pass of a model.
 #[derive(Debug)]
 pub struct Reference<'a, 'g> {
     config: &'a Config,
     weights: &'a Weights<'g>,
     threads: usize,
+    storage: StateStorage,
 }
 
 impl<'a, 'g> Reference<'a, 'g> {
@@ -176,13 +248,20 @@ impl<'a, 'g> Reference<'a, 'g> {
     /// many threads as the machine has.
     pub fn new(config: &'a Config, weights: &'a Weights<'g>) -> Self {
         let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
-        Self { config, weights, threads }
+        Self { config, weights, threads, storage: StateStorage::F32 }
     }
 
     /// Uses `threads` threads for the large multiplications and the heads. The
     /// result does not depend on the number.
     pub fn threads(mut self, threads: usize) -> Self {
         self.threads = threads.max(1);
+        self
+    }
+
+    /// Holds the delta-rule matrices in `storage` between commits (default
+    /// `F32`): after a commit advanced them they are rounded to that format.
+    pub fn state_storage(mut self, storage: StateStorage) -> Self {
+        self.storage = storage;
         self
     }
 
@@ -338,6 +417,9 @@ impl<'a, 'g> Reference<'a, 'g> {
                     }
                     for t in 0..accepted {
                         blocks::advance_delta(r, delta, q, k, v, g, beta, t);
+                    }
+                    if accepted > 0 {
+                        self.storage.round(delta, r.head_v_dim, r.head_k_dim);
                     }
                 }
                 _ => unreachable!("the window was run on a state of this configuration"),
