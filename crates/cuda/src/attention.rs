@@ -28,13 +28,74 @@
 //! sequence are exact entries, and a tile becomes a converted entry
 //! ([`AttentionKernels::convert`]) when the policy says so. Without one
 //! (f16 and q8), cells are written straight into the format in converted
-//! entries, the entry that is still filling included.
+//! entries, the entry that is still filling included. A draft row of such a
+//! policy is encoded from its f32 values like any other, whereas the reference
+//! keeps a pending cell as f16 until it is settled; the stored bytes of an
+//! accepted draft then differ by that one f16 rounding of the input, and rejected
+//! drafts are forgotten by the table shrinking.
+//!
+//! The pools are one array of slots per attention layer and device. A pair of
+//! pools costs, for `D = 256` and 4 KV heads, 512 KiB per exact slot and 136 KiB
+//! (q8/q8) to 74 KiB (q4/q4) per converted slot, 128 cells each. No scratch is
+//! reserved per request; a step's scratch is [`Plan::state_bytes`]
+//! (`state_slots * q_heads * (head_dim + 1) * 4` bytes, tens of KiB for a decode
+//! step with one row, a few MiB for eight rows of four sequences against long
+//! histories) and the plan, a few KiB.
+//!
+//! # What `ares-state` has to provide
+//!
+//! - A page is one entry (`cells_per_page = 128`). Its table is the `u32` array
+//!   above; `Sequence::pages()` gives the pages in order and a map from page to
+//!   (pool, slot) turns them into entries. `Sequence::take_dirty` says which entries
+//!   of the table changed since the last upload.
+//! - The map is **per page, not per sequence**: converting a shared page converts it for
+//!   every holder. A page that becomes a converted entry moves from the exact pool to the
+//!   converted pool (a new slot, the exact one is freed when the conversion has run on the
+//!   stream), so the state manager owns two slot allocators of different slot sizes and the
+//!   ledger has two kinds of unit instead of one `bytes_per_page`: the exact pool is sized
+//!   by the most sequences that run at once times `1 + ceil(newest / 128) + 1` entries (and
+//!   the draft window), the converted pool by what is left. A cached prefix keeps its exact
+//!   tail entries in the exact pool; under pressure the cache may convert them (irreversible,
+//!   a little less precise) to give the slots back.
+//! - The conversion is decided by the sequence length the way `KvPolicy::quantized_cells`
+//!   says, after the accepted rows of a step are known (`settle`); drafts are exact entries
+//!   until then. The state manager emits (exact slot, converted slot) pairs per step, which
+//!   [`AttentionKernels::convert`] takes for every layer.
+//! - Tables of a step go to the device with the step record; the kernels only read them.
+//!
+//! # Reading
+//!
+//! [`Planner`] cuts a step into **items**, one thread block each, and
+//! [`AttentionKernels::attend`] launches one kernel per shape. An item is some rows
+//! of one sequence (their query heads of one KV head are the "vectors" of the
+//! product) and a list of ranges of cells, in entries of one kind. Rows of a decode window
+//! share the K and V they read; dense causal attention is one range per item, block-sparse
+//! attention (qwen4exp) one range per selected block. Items that are only part of a row's
+//! cells write a state (the log2 of the sum of exponentials, the weighted V in the
+//! original domain) and [`attend`](AttentionKernels::attend) merges them, then the
+//! sigmoid gate is applied as the epilogue.
+//!
+//! In a block, K and V of a chunk of 32 cells (16 for the wide kernel) are copied raw
+//! from global memory by `cp.async`, decoded to f16 tiles in shared memory (the
+//! rotated domain for the `qB` formats; the tile mean is not part of the tile and
+//! enters the scores and the accumulator once per tile) and multiplied on the tensor
+//! cores with f32 accumulation. A decode step has few vectors, so the cells are the
+//! rows of the product (16 of them) and the vectors the columns (tiles of 8); a wide
+//! step has the vectors as rows. The queries are rotated once per block.
+//!
+//! **Error.** The inputs of the tensor cores are f16: the query scaled by `scale * log2(e)`,
+//! the decoded K and V (code times scale rounded once to f16) and the softmax weights.
+//! Against `KvHead::attend` on the same stored bytes that is about 1e-3 of the largest
+//! output element at worst in the tests (5e-4 to 3e-3 on random rows and on the captured
+//! rows of Qwen3.8-27B, 2e-4 to 3e-3), and it does not depend on the format: the
+//! formats' own errors are in the stored bytes, which the kernel reads exactly. The
+//! softmax, the sums and the merges are f32.
 
-use crate::device::Device;
 mod plan;
 
 pub use plan::{AttnItem, AttnShape, Plan, PlanConfig, Planner};
 
+use crate::device::Device;
 use crate::error::{Error, Result};
 use crate::memory::{DeviceBuffer, DevicePtr};
 use crate::module::{Args, Function, Module};
@@ -165,7 +226,7 @@ impl CacheGeometry {
 
     fn check(&self) -> Result<()> {
         let bad = |detail: String| Err(Error::Invalid { what: "cache geometry", detail });
-        if self.head_dim == 0 || self.head_dim % 32 != 0 || self.head_dim > 4095 {
+        if self.head_dim == 0 || !self.head_dim.is_multiple_of(32) || self.head_dim > 4095 {
             return bad(format!("head size {} is not a multiple of 32", self.head_dim));
         }
         if self.kv_heads == 0
@@ -450,6 +511,7 @@ impl AttentionKernels {
     /// # Safety
     ///
     /// As for [`AttentionKernels::append`].
+    #[allow(clippy::too_many_arguments)]
     pub unsafe fn convert(
         &self,
         stream: &Stream,

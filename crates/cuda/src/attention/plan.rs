@@ -5,7 +5,7 @@
 //! An item is one thread block of an attention kernel:
 //!
 //! - some rows of one sequence (the query heads of one KV head of these rows
-//!   are the vectors of the product: `rows * q_per_kv` of them, at most 16, 48
+//!   are the vectors of the product: `rows * q_per_kv` of them, at most 8, 16, 48
 //!   or 64 by [`AttnShape`]),
 //! - a list of ranges of cells (one range for dense attention),
 //! - all of them in entries of one kind, exact or converted, so that a piece has
@@ -78,73 +78,92 @@ impl AttnItem {
 /// The compiled shapes of the attention kernel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum AttnShape {
-    /// Up to 16 vectors (one row of a decode step): 2 warps, 32 cells per chunk.
+    /// Up to 8 vectors (one row of a decode step): the cells are the rows of the product, the
+    /// vectors one tile of 8 columns. 2 warps do the product, 6 load and decode.
+    Decode8,
+    /// Up to 16 vectors, the same with two tiles of columns.
     Decode16,
-    /// Up to 48 vectors (up to eight rows): 6 warps.
+    /// Up to 48 vectors (eight rows of 6 heads): three warps share the vectors.
     Decode48,
-    /// Up to 64 vectors, for wide steps: 4 warps, 16 cells per chunk.
+    /// Up to 64 vectors, for wide steps: the vectors are the rows, 4 warps, 16 cells per chunk.
     Wide64,
 }
 
 impl AttnShape {
-    pub const ALL: [AttnShape; 3] = [AttnShape::Decode16, AttnShape::Decode48, AttnShape::Wide64];
+    pub const ALL: [AttnShape; 4] =
+        [AttnShape::Decode8, AttnShape::Decode16, AttnShape::Decode48, AttnShape::Wide64];
 
     pub const fn max_vecs(self) -> u32 {
         match self {
+            AttnShape::Decode8 => 8,
             AttnShape::Decode16 => 16,
             AttnShape::Decode48 => 48,
             AttnShape::Wide64 => 64,
         }
     }
 
-    /// m-tiles of 16 vectors, cell groups, cells per chunk.
-    pub const fn mt_cg_chunk(self) -> (u32, u32, u32) {
-        match self {
-            AttnShape::Decode16 => (1, 2, 32),
-            AttnShape::Decode48 => (3, 2, 32),
-            AttnShape::Wide64 => (4, 1, 16),
-        }
+    /// The smallest shape that holds `vecs` vectors.
+    pub fn for_vecs(vecs: u32) -> AttnShape {
+        AttnShape::ALL
+            .into_iter()
+            .find(|s| vecs <= s.max_vecs())
+            .expect("at most 64 vectors per item")
     }
 
-    /// Warps beyond the `mt * cg` that run the product: they load and decode.
-    pub const fn extra_warps(self) -> u32 {
+    /// (warps sharing the vectors, cell groups, cells per chunk, helper warps, tiles of 8
+    /// vectors per warp or 0 for the orientation with the vectors as rows).
+    pub const fn layout(self) -> (u32, u32, u32, u32, u32) {
         match self {
-            AttnShape::Decode16 => 6,
-            AttnShape::Decode48 => 2,
-            AttnShape::Wide64 => 4,
+            AttnShape::Decode8 => (1, 2, 32, 6, 1),
+            AttnShape::Decode16 => (1, 2, 32, 6, 2),
+            AttnShape::Decode48 => (3, 2, 32, 2, 2),
+            AttnShape::Wide64 => (4, 1, 16, 4, 0),
         }
     }
 
     pub const fn threads(self) -> u32 {
-        let (mt, cg, _) = self.mt_cg_chunk();
-        32 * (mt * cg + self.extra_warps())
+        let (mt, cg, _, xw, _) = self.layout();
+        32 * (mt * cg + xw)
     }
 
     pub fn kernel_name(self, head_dim: u32) -> String {
-        let (mt, cg, chunk) = self.mt_cg_chunk();
-        format!("ares_attn_d{head_dim}_m{mt}c{cg}k{chunk}x{}", self.extra_warps())
+        let suffix = match self {
+            AttnShape::Decode8 => "s8",
+            AttnShape::Decode16 => "s16",
+            AttnShape::Decode48 => "s48",
+            AttnShape::Wide64 => "w64",
+        };
+        format!("ares_attn_d{head_dim}_{suffix}")
     }
 
     /// Bytes of shared memory per raw stage and side: the larger of a chunk of
     /// q8 rows and 16 rows of f16.
     pub const fn rawcap(self, head_dim: u32) -> u32 {
-        let (_, _, chunk) = self.mt_cg_chunk();
+        let (_, _, chunk, _, _) = self.layout();
         let q8 = chunk * (head_dim / 32 * 34);
         let f16 = 16 * 2 * head_dim;
         (if q8 > f16 { q8 } else { f16 }).div_ceil(16) * 16
     }
 
-    /// Dynamic shared memory of a launch (the formula of `attn_smem_bytes` in
-    /// `kernels/attn_kernel.cuh`).
+    /// Dynamic shared memory of a launch: the layout of `attn_body` in
+    /// `kernels/attn_kernel.cuh`.
     pub const fn smem_bytes(self, head_dim: u32) -> u32 {
-        let (mt, _, chunk) = self.mt_cg_chunk();
-        let me = if mt == 1 { 32 } else { 4 };
-        (16 * mt + 2 * chunk) * (head_dim + 8) * 2
+        let (mt, cg, chunk, _, nvw) = self.layout();
+        let rows = if nvw > 0 {
+            let r = mt * nvw * 8;
+            if r < 16 { 16 } else { r }
+        } else {
+            16 * mt
+        };
+        let me = if rows <= 16 { 32 } else { 4 };
+        (rows + 2 * chunk) * (head_dim + 8) * 2
             + 4 * self.rawcap(head_dim)
             + 3 * chunk * 3 * 4
             + 3 * (me + 1) * 4
-            + 16 * mt * 4
-            + 16 * mt * me * 4
+            + rows * 4
+            + rows * me * 4
+            + 16
+            + mt * cg * nvw * 8 * 24 * 2
             + 64
     }
 }
@@ -290,13 +309,14 @@ impl Planner {
             let want = ((u64::from(pieces_wanted) * u64::from(n) + u64::from(total_entries) / 2)
                 / u64::from(total_entries))
             .clamp(1, u64::from(n)) as u32;
-            let per = n.div_ceil(want);
+            // `want` pieces of whole entries, the lengths differing by at most one entry.
+            let (base, extra) = (n / want, n % want);
             let mut e = e0;
-            while e < e1 {
-                let next = (e + per).min(e1);
+            for i in 0..want {
+                let next = e + base + u32::from(i < extra);
                 let start = (e * ENTRY_CELLS).max(cells.start);
                 let end = (next * ENTRY_CELLS).min(cells.end);
-                out.push(Piece { converted, ranges: vec![start..end] });
+                out.push(Piece { converted, ranges: std::iter::once(start..end).collect() });
                 e = next;
             }
         }
@@ -396,7 +416,7 @@ struct Builder {
     g: u32,
     h: u32,
     plan: Plan,
-    groups: [Vec<AttnItem>; 3],
+    groups: [Vec<AttnItem>; 4],
     next_slot: u32,
 }
 
@@ -413,13 +433,10 @@ impl Builder {
         causal: bool,
     ) {
         let vecs = n_rows * self.g;
-        let shape = if vecs <= 16 {
-            0
-        } else if vecs <= 48 {
-            1
-        } else {
-            2
-        };
+        let shape = AttnShape::ALL
+            .iter()
+            .position(|s| vecs <= s.max_vecs())
+            .expect("at most 64 vectors per item");
         let single = pieces.len() == 1;
         for i in 0..n_rows {
             let row = &mut self.plan.rows[(first_row + i) as usize];

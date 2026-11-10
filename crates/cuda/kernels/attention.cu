@@ -9,15 +9,20 @@
 #include "attn_write.cuh"
 #include "attn_kernel.cuh"
 
-// Attention kernels: D, m-tiles of 16 vectors (MT), cell groups (CG), cells per chunk.
-//   m1c2k32  up to 16 vectors (one row of a decode step), two warps per tile; xN: N more warps that only load and decode
-//   m3c2k32  up to 48 vectors (eight rows of a decode step)
-//   m4c1k16  up to 64 vectors, the wide step
-ARES_ATTN_KERNEL(ares_attn_d256_m1c2k32x6, 256, 1, 2, 32, 6)
-ARES_ATTN_KERNEL(ares_attn_d256_m3c2k32x2, 256, 3, 2, 32, 2)
-ARES_ATTN_KERNEL(ares_attn_d256_m4c1k16x4, 256, 4, 1, 16, 4)
-ARES_ATTN_KERNEL(ares_attn_d128_m1c2k32x6, 128, 1, 2, 32, 6)
-ARES_ATTN_KERNEL(ares_attn_d128_m3c2k32x2, 128, 3, 2, 32, 2)
-ARES_ATTN_KERNEL(ares_attn_d128_m4c1k16x4, 128, 4, 1, 16, 4)
+// Attention kernels (kernels/attn_kernel.cuh). Per head size: s8, s16 and s48 are the decode
+// shapes (up to 8, 16 and 48 vectors, i.e. query heads of the rows of a window), w64 the wide
+// step (up to 64 vectors). The arguments of the macro: head size, warps that share the
+// vectors, cell groups, cells per chunk, helper warps that only load and decode, and tiles of
+// 8 vectors per warp (0: the vectors are the 16 rows of the product).
+// The wide step has the vectors as the rows of the product; decode has the cells as the rows
+// and the vectors as columns in tiles of 8 (half the tensor-core work for one row of 6 heads).
+ARES_ATTN_KERNEL(ares_attn_d256_s8, 256, 1, 2, 32, 6, 1)
+ARES_ATTN_KERNEL(ares_attn_d256_s16, 256, 1, 2, 32, 6, 2)
+ARES_ATTN_KERNEL(ares_attn_d256_s48, 256, 3, 2, 32, 2, 2)
+ARES_ATTN_KERNEL(ares_attn_d256_w64, 256, 4, 1, 16, 4, 0)
+ARES_ATTN_KERNEL(ares_attn_d128_s8, 128, 1, 2, 32, 6, 1)
+ARES_ATTN_KERNEL(ares_attn_d128_s16, 128, 1, 2, 32, 6, 2)
+ARES_ATTN_KERNEL(ares_attn_d128_s48, 128, 3, 2, 32, 2, 2)
+ARES_ATTN_KERNEL(ares_attn_d128_w64, 128, 4, 1, 16, 4, 0)
 ARES_ATTN_MERGE(ares_attn_merge_d256, 256)
 ARES_ATTN_MERGE(ares_attn_merge_d128, 128)

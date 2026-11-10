@@ -171,8 +171,10 @@ fn the_encoder_kernel_reproduces_the_golden_files_byte_for_byte() {
         let stream = Stream::new(device, 0).unwrap();
         for (suffix, input_name) in [("", "input.f32"), ("_search", "input_search.f32")] {
             let input: Vec<f32> = read_golden(input_name)
-                .chunks_exact(4)
-                .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|b| f32::from_le_bytes(*b))
                 .collect();
             for format in KvFormat::ALL {
                 let file = read_golden(&format!("{}{suffix}.bin", format.name()));
@@ -196,8 +198,10 @@ fn the_encoder_kernel_reproduces_the_golden_files_byte_for_byte() {
         }
         // The tile of 5 rows of 96 values, with its mean.
         let input: Vec<f32> = read_golden("input_tile.f32")
-            .chunks_exact(4)
-            .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| f32::from_le_bytes(*b))
             .collect();
         for format in [KvFormat::Q7, KvFormat::Q6, KvFormat::Q5, KvFormat::Q4] {
             let file = read_golden(&format!("{}_tile.bin", format.name()));
@@ -219,10 +223,10 @@ fn stress_rows(rng: &mut Rng, rows: usize, d: usize, kind: usize) -> Vec<f32> {
     let channel: Vec<f32> = (0..d).map(|_| rng.gaussian()).collect();
     let mut out = Vec::with_capacity(rows * d);
     for r in 0..rows {
-        for c in 0..d {
+        for (c, &mean) in channel.iter().enumerate() {
             let v = match kind {
-                0 => rng.kv_value(channel[c]),
-                1 => channel[c],
+                0 => rng.kv_value(mean),
+                1 => mean,
                 2 => 0.0,
                 3 => 1e-6 * rng.gaussian(),
                 4 => 3e4 * rng.gaussian(),
@@ -555,8 +559,8 @@ fn rows_of(rng: &mut Rng, n: usize, h: usize, d: usize) -> Vec<f32> {
     let mut out = Vec::with_capacity(n * h * d);
     let channel: Vec<f32> = (0..h * d).map(|_| rng.gaussian()).collect();
     for _ in 0..n {
-        for c in 0..h * d {
-            out.push(rng.kv_value(channel[c]));
+        for &mean in &channel {
+            out.push(rng.kv_value(mean));
         }
     }
     out
@@ -810,15 +814,17 @@ fn attend_many_q(
     unsafe { kernels.attend(stream, geo, &buffers, &args, scale).unwrap() };
     stream.synchronize().unwrap();
     let got: Vec<f32> = download(&out_dev, n * q_total * d * 4)
-        .chunks_exact(4)
-        .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| f32::from_le_bytes(*b))
         .collect();
 
     let mut worst = Error::default();
     for (i, row, pos, sparse) in checks {
         let visible: Vec<std::ops::Range<usize>> = match (&looks[i], sparse) {
             (Look::Ranges(r), Some(_)) => r.clone(),
-            _ => vec![0..pos + 1],
+            _ => std::iter::once(0..pos + 1).collect(),
         };
         for kvh in 0..geo.kv_heads as usize {
             for gi in 0..g {
@@ -932,7 +938,10 @@ fn one_case_from_the_environment() {
         let stream = Stream::new(device, 0).unwrap();
         let mut rng = Rng(5);
         let case = Case { k, v, d, hist, rows };
-        let geo = test_geometry(k, v, d);
+        let mut geo = test_geometry(k, v, d);
+        if let Ok(g) = std::env::var("ARES_ATTN_G") {
+            geo.q_per_kv = g.parse().unwrap();
+        }
         let (pools, seq) = build(&kernels, &stream, &case, &geo, &mut rng);
         for gated in [false, true] {
             let err =
@@ -1086,8 +1095,10 @@ fn batches_of_sequences_ranges_and_wide_windows_equal_the_reference() {
 fn read_f32_file(path: &std::path::Path) -> Vec<f32> {
     std::fs::read(path)
         .unwrap_or_else(|e| panic!("{}: {e}", path.display()))
-        .chunks_exact(4)
-        .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| f32::from_le_bytes(*b))
         .collect()
 }
 
@@ -1146,10 +1157,23 @@ fn attention_on_the_captured_rows_of_a_real_model_equals_the_reference() {
                 for (p, n) in spans {
                     qs.extend_from_slice(&q[p * q_row..(p + n) * q_row]);
                 }
-                let err = attend_many_q(&kernels, &stream, &geo, &pools, &[&seq, &seq, &seq], &looks, false, 16, Some(&qs), &mut rng);
+                let err = attend_many_q(
+                    &kernels,
+                    &stream,
+                    &geo,
+                    &pools,
+                    &[&seq, &seq, &seq],
+                    &looks,
+                    false,
+                    16,
+                    Some(&qs),
+                    &mut rng,
+                );
                 println!(
                     "{} real data, layer {layer}, {kf}/{vf}: max {:.2e} rms {:.2e}",
-                    device.info().name, err.max_rel, err.rms_rel
+                    device.info().name,
+                    err.max_rel,
+                    err.rms_rel
                 );
                 assert!(err.max_rel < 5e-3, "{kf}/{vf} layer {layer}: {:.2e}", err.max_rel);
             }

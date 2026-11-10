@@ -9,11 +9,13 @@ static __device__ __forceinline__ uint32_t smem_addr(const void* p) {
 }
 
 static __device__ __forceinline__ void cp_async16(void* dst, const void* src) {
-    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(smem_addr(dst)), "l"(src));
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(smem_addr(dst)), "l"(src)
+                 : "memory");
 }
 
 static __device__ __forceinline__ void cp_async8(void* dst, const void* src) {
-    asm volatile("cp.async.ca.shared.global [%0], [%1], 8;\n" ::"r"(smem_addr(dst)), "l"(src));
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 8;\n" ::"r"(smem_addr(dst)), "l"(src)
+                 : "memory");
 }
 
 static __device__ __forceinline__ void cp_async_commit() {
@@ -29,13 +31,22 @@ static __device__ __forceinline__ void cp_async_wait() {
 static __device__ __forceinline__ void ldmatrix_x4(uint32_t (&r)[4], const void* p) {
     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                  : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
-                 : "r"(smem_addr(p)));
+                 : "r"(smem_addr(p))
+                 : "memory");
+}
+
+static __device__ __forceinline__ void ldmatrix_x2(uint32_t (&r)[4], const void* p) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0, %1}, [%2];\n"
+                 : "=r"(r[0]), "=r"(r[1])
+                 : "r"(smem_addr(p))
+                 : "memory");
 }
 
 static __device__ __forceinline__ void ldmatrix_x4_trans(uint32_t (&r)[4], const void* p) {
     asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                  : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
-                 : "r"(smem_addr(p)));
+                 : "r"(smem_addr(p))
+                 : "memory");
 }
 
 // c += a * b, a: 16x16 (row), b: 16x8 (col), f16 inputs, f32 accumulators.

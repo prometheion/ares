@@ -20,16 +20,18 @@ static __device__ __forceinline__ int sext(unsigned u, int bits) {
 
 // 8 values (rotated domain, for the qB formats) of quarter `q` of group `g` of
 // the row at `row`, as 8 halves.
-static __device__ __forceinline__ uint4 decode_unit(const uint8_t* row, int fmt, int g, int q) {
+template <int FMT>
+static __device__ __forceinline__ uint4 decode_unit(const uint8_t* row, int g, int q) {
+    constexpr int fmt = FMT;
     uint4 out;
-    if (fmt == FMT_F16) {
+    if constexpr (fmt == FMT_F16) {
         return *reinterpret_cast<const uint4*>(row + g * 64 + q * 16);
     }
-    const int bits = fmt_bits(fmt);
+    constexpr int bits = fmt_bits(fmt) > 0 ? fmt_bits(fmt) : 8;
     const uint8_t* gp = row + g * fmt_group_bytes(fmt);
     const uint8_t* codes = gp + 2;
     uint32_t res[4];
-    if (bits == 8) {
+    if constexpr (bits == 8) {
         // 8 signed bytes at gp + 2 + 8 q: two 32-bit words, built from aligned loads (the
         // codes of an odd group are 4-byte aligned, those of an even group are 2 off).
         const uint8_t* c = codes + q * 8;
@@ -115,4 +117,43 @@ static __device__ __forceinline__ uint4 decode_unit(const uint8_t* row, int fmt,
     out.z = res[2];
     out.w = res[3];
     return out;
+}
+
+// Decodes the rows of one side of a chunk, `nc` cells, to the f16 tile. Thread t of the
+// `nt` threads takes the units (group, quarter) = t % (D / 8) of the rows t / (D / 8),
+// then every (nt / (D / 8))-th row: the unit is the same for all of its rows, so the
+// address arithmetic and the choice of decoder are outside the loop.
+template <int FMT, int D, int NT, int CHUNK>
+static __device__ __forceinline__ void decode_side(
+    const uint8_t* raw, int rb, const uint32_t* meta, int nc, __half* tile, int qs, int t) {
+    constexpr int UNITS = D / 8;
+    constexpr int STEP = NT / UNITS;
+    const int ug = t % UNITS, first = t / UNITS;
+    const int g = ug >> 2, q = ug & 3;
+    // Unrolled: the rows are independent, so their loads are in flight together.
+    uint4 val[(CHUNK + STEP - 1) / STEP];
+#pragma unroll
+    for (int i = 0; i < (CHUNK + STEP - 1) / STEP; ++i) {
+        const int slot = first + i * STEP;
+        val[i] = make_uint4(0, 0, 0, 0);
+        if (slot < nc && meta[slot * 3] != 0xffffffffu) val[i] = decode_unit<FMT>(raw + (size_t)slot * rb, g, q);
+    }
+#pragma unroll
+    for (int i = 0; i < (CHUNK + STEP - 1) / STEP; ++i) {
+        const int slot = first + i * STEP;
+        if (slot < nc) *reinterpret_cast<uint4*>(tile + slot * qs + ug * 8) = val[i];
+    }
+}
+
+template <int D, int NT, int CHUNK>
+static __device__ __forceinline__ void decode_side_any(
+    int fmt, const uint8_t* raw, int rb, const uint32_t* meta, int nc, __half* tile, int qs, int t) {
+    switch (fmt) {
+        case FMT_F16: decode_side<FMT_F16, D, NT, CHUNK>(raw, rb, meta, nc, tile, qs, t); break;
+        case FMT_Q8: decode_side<FMT_Q8, D, NT, CHUNK>(raw, rb, meta, nc, tile, qs, t); break;
+        case FMT_Q7: decode_side<FMT_Q7, D, NT, CHUNK>(raw, rb, meta, nc, tile, qs, t); break;
+        case FMT_Q6: decode_side<FMT_Q6, D, NT, CHUNK>(raw, rb, meta, nc, tile, qs, t); break;
+        case FMT_Q5: decode_side<FMT_Q5, D, NT, CHUNK>(raw, rb, meta, nc, tile, qs, t); break;
+        default: decode_side<FMT_Q4, D, NT, CHUNK>(raw, rb, meta, nc, tile, qs, t); break;
+    }
 }
