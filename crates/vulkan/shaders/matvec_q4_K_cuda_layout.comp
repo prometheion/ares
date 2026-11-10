@@ -1,0 +1,137 @@
+#version 450
+#include "common.glsl"
+
+// The CUDA kernel's decomposition (`matvec_q4_K.cuh`), in GLSL, kept as the
+// reference the tuned `matvec_q4_K.comp` is compared with. One invocation per
+// unit of 64 values, so a warp reads the activations 256 bytes apart per lane:
+// one cache line per lane per load, which is what bounds it (see the example
+// `vk_matvec_bench`). Kernels does not load it; the benchmark and a test do.
+//
+// A Q4_K block holds 256 values in 144 bytes (nine 16-byte units):
+//   0   f16 d      scale of the sub-block scales
+//   2   f16 dmin   scale of the sub-block minimums
+//   4   u8[12]     8 scales and 8 minimums, 6 bits each
+//   16  u8[128]    4 bits per value: of each 32 bytes the low nibbles are
+//                  values 0..31 of a 64-value unit, the high nibbles 32..63
+// GLSL has no 16-bit load from a byte buffer without extra features, so the
+// header is read as one 16-byte unit and the two halves are decoded with
+// unpackHalf2x16, which converts them exactly.
+
+// Threads per workgroup, set when the pipeline is made (one pipeline per
+// size, all made at load): the host picks the one that fits the row.
+layout(local_size_x_id = 0) in;
+
+layout(push_constant, std430) uniform Push {
+    Vec4Ref w;
+    FloatRefRO x;
+    FloatRefRO xsum;
+    FloatRef y;
+    uint n_in;
+    uint n_out;
+    uint n_batch;
+} pc;
+
+// One float per activation row and subgroup.
+shared float partial[ARES_MAX_BATCH * 32];
+
+uint scale_byte(uvec3 s, uint i) {
+    return (s[i >> 2] >> ((i & 3u) * 8u)) & 0xFFu;
+}
+
+// The 6-bit scale and minimum of sub-block j (0..7), as ggml packs them.
+void scale_min(uint j, uvec3 s, out uint scale, out uint minimum) {
+    if (j < 4) {
+        scale = scale_byte(s, j) & 63u;
+        minimum = scale_byte(s, j + 4) & 63u;
+    } else {
+        scale = (scale_byte(s, j + 4) & 0xFu) | ((scale_byte(s, j - 4) >> 6) << 4);
+        minimum = (scale_byte(s, j + 4) >> 4) | ((scale_byte(s, j) >> 6) << 4);
+    }
+}
+
+// y[b][r] = sum over c of W[r][c] * x[b][c].
+//
+//   w     n_out rows of n_in / 256 blocks, 16-byte aligned
+//   x     n_batch rows of n_in values
+//   xsum  n_batch rows of n_in / 32 sums (sum32_f32 of x)
+//   y     n_batch rows of n_out values
+//
+// One workgroup per output row; n_batch <= ARES_MAX_BATCH. An invocation takes
+// units of 64 values: it decodes the unit's 32 weight bytes once and applies
+// them to every activation row, so the weights are read once however many
+// rows of activations there are.
+void main() {
+    const uint64_t row = ares_group();
+    // A whole workgroup returns here, so no barrier below is left half-reached.
+    if (row >= pc.n_out) {
+        return;
+    }
+    const uint tid = gl_LocalInvocationID.x;
+    const uint blocks_per_row = pc.n_in >> 8;
+    const uint n_units = blocks_per_row * 4;
+    // The row's address is computed in 64 bits (a matrix can be larger than
+    // 4 GiB); inside a row, blocks are indexed in 16-byte units, nine per block.
+    Vec4Ref wr = Vec4Ref(uint64_t(pc.w) + row * blocks_per_row * 144);
+
+    float acc[ARES_MAX_BATCH];
+    [[unroll]] for (uint b = 0; b < ARES_MAX_BATCH; b++) {
+        acc[b] = 0.0;
+    }
+
+    for (uint u = tid; u < n_units; u += gl_WorkGroupSize.x) {
+        const uint block = (u >> 2) * 9;
+        const uint j = u & 3u;
+
+        const uvec4 head = wr.v[block];
+        const vec2 dm = unpackHalf2x16(head.x);
+        uint s_lo, m_lo, s_hi, m_hi;
+        scale_min(2 * j, head.yzw, s_lo, m_lo);
+        scale_min(2 * j + 1, head.yzw, s_hi, m_hi);
+        const float d_lo = dm.x * float(s_lo);
+        const float d_hi = dm.x * float(s_hi);
+        const float o_lo = dm.y * float(m_lo);
+        const float o_hi = dm.y * float(m_hi);
+
+        const uvec4 q0 = wr.v[block + 1 + 2 * j];
+        const uvec4 q1 = wr.v[block + 2 + 2 * j];
+        const uint words[8] = uint[8](q0.x, q0.y, q0.z, q0.w, q1.x, q1.y, q1.z, q1.w);
+
+        const uint col = u * 64;
+        // Not unrolled: eight copies of the 64-value body would need more
+        // registers than a workgroup of this size has room for, and the
+        // occupancy lost costs far more than indexing `acc` does.
+        for (uint b = 0; b < pc.n_batch; b++) {
+            const uint xo = b * pc.n_in + col;
+            float lo = 0.0;
+            float hi = 0.0;
+            [[unroll]] for (uint k = 0; k < 8; k++) {
+                [[unroll]] for (uint t = 0; t < 4; t++) {
+                    const uint byte = (words[k] >> (8 * t)) & 0xFFu;
+                    lo += float(byte & 0xFu) * pc.x.v[xo + k * 4 + t];
+                    hi += float(byte >> 4) * pc.x.v[xo + 32 + k * 4 + t];
+                }
+            }
+            const uint so = b * (pc.n_in >> 5) + (col >> 5);
+            acc[b] += d_lo * lo + d_hi * hi - o_lo * pc.xsum.v[so] - o_hi * pc.xsum.v[so + 1];
+        }
+    }
+
+    [[unroll]] for (uint b = 0; b < ARES_MAX_BATCH; b++) {
+        if (b >= pc.n_batch) {
+            break;
+        }
+        const float s = subgroupAdd(acc[b]);
+        if (subgroupElect()) {
+            partial[b * 32 + gl_SubgroupID] = s;
+        }
+    }
+    memoryBarrierShared();
+    barrier();
+    if (tid < pc.n_batch) {
+        float total = 0.0;
+        for (uint s = 0; s < gl_NumSubgroups; s++) {
+            total += partial[tid * 32 + s];
+        }
+        FloatRef(uint64_t(pc.y) + (uint64_t(tid) * pc.n_out + row) * 4).v[0] = total;
+    }
+}

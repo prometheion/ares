@@ -1,0 +1,15 @@
+[package]
+name = "ares-quant"
+description = "CPU reference for GGUF tensor element types, exactly as ggml does, and the engine's own KV-cache formats (f16, q8 to q4)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+ares-core.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

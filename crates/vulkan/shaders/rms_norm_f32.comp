@@ -1,0 +1,55 @@
+#version 450
+#include "common.glsl"
+
+layout(local_size_x = 256) in;
+
+layout(push_constant, std430) uniform Push {
+    FloatRefRO x;
+    FloatRefRO weight;
+    FloatRef y;
+    uint n;
+    uint rows;
+    float eps;
+} pc;
+
+shared float partial[32];
+
+// RMS normalisation of rows: y = x / sqrt(mean(x^2) + eps) * weight.
+// `weight` may be a null address for a plain normalisation. One workgroup per
+// row. `y` may be `x`: every invocation reads a value before it writes the
+// same one, and the sum over the row is complete before any write.
+void main() {
+    const uint64_t row = ares_group();
+    // A whole workgroup returns here, so no barrier below is left half-reached.
+    if (row >= pc.rows) {
+        return;
+    }
+    const uint tid = gl_LocalInvocationID.x;
+    // The row's address is computed in 64 bits; a row itself is indexed with
+    // 32-bit values.
+    const uint64_t offset = row * pc.n * 4;
+    FloatRefRO xr = FloatRefRO(uint64_t(pc.x) + offset);
+    FloatRef yr = FloatRef(uint64_t(pc.y) + offset);
+
+    float sum = 0.0;
+    for (uint i = tid; i < pc.n; i += 256) {
+        const float v = xr.v[i];
+        sum += v * v;
+    }
+    sum = subgroupAdd(sum);
+    if (subgroupElect()) {
+        partial[gl_SubgroupID] = sum;
+    }
+    memoryBarrierShared();
+    barrier();
+    float total = 0.0;
+    for (uint s = 0; s < gl_NumSubgroups; s++) {
+        total += partial[s];
+    }
+    const float scale = inversesqrt(total / float(pc.n) + pc.eps);
+
+    const bool has_weight = uint64_t(pc.weight) != uint64_t(0);
+    for (uint i = tid; i < pc.n; i += 256) {
+        yr.v[i] = xr.v[i] * scale * (has_weight ? pc.weight.v[i] : 1.0);
+    }
+}

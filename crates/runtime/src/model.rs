@@ -1,0 +1,300 @@
+//! What an architecture implements to run in the step loop.
+//!
+//! The runtime knows steps, rows, devices and streams; it does not know what
+//! a layer is. A model tells the runtime a few facts about itself (its
+//! vocabulary, how it is spread over devices, what the host must supply per
+//! row) and then, on each device's thread, enqueues the kernels of one step
+//! for a batch of rows. [`SyntheticModel`](crate::SyntheticModel) is the one
+//! implementation today, built from kernels that exist; the first real
+//! architecture replaces it without touching the step loop.
+
+use ares_api::{EngineError, ModelCard, Prompt};
+use ares_core::Ledger;
+use ares_cuda::{Device, DevicePtr, Kernels, Stream};
+use ares_state::PageLayout;
+
+use crate::links::Links;
+use crate::record::RecordView;
+
+/// How a model is spread over the devices.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Split {
+    /// One device holds everything.
+    Single,
+    /// Every layer is on every device, each holding a slice; the devices sum
+    /// their partial results twice per layer. All devices work on the same
+    /// rows at the same time.
+    Tensor,
+    /// Each device holds a range of layers and hands the activations to the
+    /// next at the boundary. The rows of a step flow through as a pipeline.
+    Layer,
+}
+
+/// The sizes of the paths between devices that a model needs, so the runtime
+/// can build them: the biggest sum (tensor split) and the ring of a hand-over
+/// (layer split).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LinkSpec {
+    /// The most f32 values one sum across devices takes.
+    pub sum_values: u32,
+    /// Parcels in flight on each hand-over between neighbouring devices. At
+    /// least the number of groups of rows a step can be cut into.
+    pub lane_slots: u32,
+    /// The most f32 values one parcel takes.
+    pub lane_values: u32,
+}
+
+/// What the host condenses of a sequence's tokens into the one number per row
+/// that the step record carries (its *context*).
+///
+/// This exists because the synthetic model has no attention kernel to read
+/// the sequence's earlier tokens: instead, the row's context selects a row of
+/// a table that is added to the token's embedding. A model with attention
+/// leaves it unused.
+///
+/// Two settings decide how repetitive the model's text is, which in turn
+/// decides how well n-gram drafts do:
+///
+/// - `window`: the context is a function of the last `window` tokens (0: of
+///   all tokens). A short window makes the text fall into a loop quickly,
+///   because the next token is then a function of a small state.
+/// - `epoch`: the function changes every `epoch` positions. In a loop, a draft
+///   copied from earlier text is right until the epoch changes, and wrong
+///   after it, so drafts are accepted and rejected both.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ContextSpec {
+    /// How many tokens the context reads, or 0 for all of them.
+    pub window: u32,
+    /// Positions per epoch, or 0 for one epoch.
+    pub epoch: u32,
+    /// The number of distinct contexts.
+    pub buckets: u32,
+}
+
+/// The state before the first token.
+const CONTEXT_SEED: u32 = 0x9e37_79b9;
+
+fn mix(a: u32, b: u32) -> u32 {
+    let mut h = u64::from(a) << 32 | u64::from(b);
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+    h ^= h >> 33;
+    h as u32
+}
+
+impl ContextSpec {
+    /// A model that needs no context from the host.
+    pub const NONE: ContextSpec = ContextSpec { window: 1, epoch: 0, buckets: 1 };
+
+    /// The state of the token that ends `tail`, from the state of the token
+    /// before it. `tail` holds the tokens up to and including this one; at
+    /// least the last `window` of them (all of them for `window == 0` is not
+    /// needed: the previous state stands for them).
+    pub fn advance(&self, previous: u32, tail: &[u32]) -> u32 {
+        let last = *tail.last().expect("a row has a token");
+        if self.window == 0 {
+            return mix(previous, last);
+        }
+        let from = tail.len().saturating_sub(self.window as usize);
+        tail[from..].iter().fold(CONTEXT_SEED, |state, token| mix(state, *token))
+    }
+
+    /// The state before any token, for [`ContextSpec::advance`].
+    pub fn start(&self) -> u32 {
+        CONTEXT_SEED
+    }
+
+    /// The number the record carries for a row at `position` whose state is
+    /// `state`.
+    pub fn reduce(&self, state: u32, position: u32) -> u32 {
+        let state = match position.checked_div(self.epoch) {
+            Some(epoch) => mix(state, epoch),
+            None => state,
+        };
+        state % self.buckets.max(1)
+    }
+}
+
+/// Why a model's part of a step could not be built or enqueued.
+#[derive(Debug, thiserror::Error)]
+pub enum ModelError {
+    #[error(transparent)]
+    Cuda(#[from] ares_cuda::Error),
+    #[error(transparent)]
+    Memory(#[from] ares_core::LedgerError),
+    /// The configuration cannot be built on these devices.
+    #[error("{0}")]
+    Invalid(String),
+    /// A device thread of the same step failed, so the exchange this one
+    /// waited for will not happen.
+    #[error("another device failed in the same step")]
+    Aborted,
+}
+
+/// What a device part is built from.
+#[derive(Debug)]
+pub struct DeviceContext<'a> {
+    /// Which device part this is, in `0..devices`.
+    pub index: usize,
+    pub devices: usize,
+    pub device: &'a Device,
+    pub kernels: &'a Kernels,
+    pub stream: &'a Stream,
+    /// The device's memory accounts: a part reserves every allocation here
+    /// first, so a configuration that does not fit is refused at load, naming
+    /// who holds what.
+    pub ledger: &'a mut Ledger,
+    /// The most rows a step has.
+    pub max_rows: u32,
+}
+
+/// What the runtime gives a device part to enqueue one step.
+#[derive(Debug)]
+pub struct StepContext<'a> {
+    pub index: usize,
+    pub devices: usize,
+    pub device: &'a Device,
+    pub kernels: &'a Kernels,
+    pub stream: &'a Stream,
+    /// The step's rows, as the conductor wrote them.
+    pub record: RecordView<'a>,
+    /// The device copy of the record, uploaded on `stream` before the model
+    /// is called.
+    pub record_on_device: DevicePtr,
+    /// The sequences' page tables on this device, `table_stride` entries
+    /// (`u32` page numbers) per slot, updated from the record before the model
+    /// is called.
+    pub tables: DevicePtr,
+    pub table_stride: u32,
+    /// The state pages on this device: page `p` is at `pages + p *
+    /// bytes_per_page`. Null when the model keeps no state in pages.
+    pub pages: DevicePtr,
+    pub bytes_per_page: u64,
+    /// The paths to the other devices.
+    pub links: &'a Links,
+}
+
+/// Where a device part left the logits of a step.
+#[derive(Clone, Copy, Debug)]
+pub struct Logits {
+    /// Row `r` of the step has its logits at `ptr + r * stride * 4`, as f32.
+    pub ptr: DevicePtr,
+    /// Values per row.
+    pub stride: u32,
+    /// The token of the first value of a row: a device that holds a slice of
+    /// the vocabulary reports where its slice starts.
+    pub first_token: u32,
+}
+
+/// One device's part of a model.
+pub trait DeviceModel: Send {
+    /// The number of logits per row this device part produces (0 for a part
+    /// without an output head), so the runtime can size its read-back buffer
+    /// before the first step.
+    fn logits_per_row(&self) -> u32;
+
+    /// Enqueues the kernels of one step for all rows of `step` on its stream.
+    ///
+    /// Must not wait for the device: not for a stream, an event or a copy.
+    /// The order between devices is kept on the devices, through the links.
+    /// Returns where this device left the logits, or `None` for a device
+    /// that holds no output head.
+    fn enqueue(&mut self, step: &StepContext<'_>) -> Result<Option<Logits>, ModelError>;
+}
+
+/// An architecture.
+pub trait Model: Send + Sync + 'static {
+    /// The model as clients see it.
+    fn card(&self) -> ModelCard;
+
+    /// The number of tokens; picks are below it.
+    fn vocab(&self) -> u32;
+
+    /// The token that ends a generation, if the model has one.
+    fn eos(&self) -> Option<u32>;
+
+    /// The tokens of a prompt. Tokenizing is the model's business; refusing
+    /// what it cannot tokenize is too.
+    fn encode(&self, prompt: &Prompt) -> Result<Vec<u32>, EngineError>;
+
+    /// The text of a generated token, or `None` for a token that prints
+    /// nothing.
+    fn piece(&self, token: u32) -> Option<char>;
+
+    /// What the host supplies per row besides sequence, position and token.
+    fn context(&self) -> ContextSpec;
+
+    fn split(&self) -> Split;
+
+    /// The number of device parts, which is the number of devices needed.
+    fn devices(&self) -> usize;
+
+    /// The paths between devices the model needs.
+    fn links(&self) -> LinkSpec;
+
+    /// The most rows of one step the model's buffers hold.
+    fn max_rows(&self) -> u32;
+
+    /// The state the model keeps per position of a sequence, on each device,
+    /// for pages of `cells_per_page` cells. The runtime reserves the pool's
+    /// pages on each device from it, in the device's ledger, before the model
+    /// is built.
+    fn page_layout(&self, cells_per_page: u32) -> PageLayout;
+
+    /// Builds device part `cx.index`. Called on that device's thread.
+    fn open(&self, cx: DeviceContext<'_>) -> Result<Box<dyn DeviceModel>, ModelError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn spec(window: u32, epoch: u32) -> ContextSpec {
+        ContextSpec { window, epoch, buckets: 1024 }
+    }
+
+    /// The reduced contexts of every position of `tokens`, as the conductor
+    /// builds them: one `advance` per token from the state of the one before.
+    fn contexts(spec: &ContextSpec, tokens: &[u32]) -> Vec<u32> {
+        let mut state = spec.start();
+        (0..tokens.len())
+            .map(|i| {
+                state = spec.advance(state, &tokens[..=i]);
+                spec.reduce(state, i as u32)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_window_context_depends_only_on_the_last_tokens() {
+        let spec = spec(2, 0);
+        let a = contexts(&spec, &[9, 9, 5, 6, 7]);
+        let b = contexts(&spec, &[1, 2, 3, 6, 7]);
+        assert_eq!(a[4], b[4], "the same last two tokens give the same context");
+        assert_ne!(a[3], a[4]);
+        assert_ne!(a[4], contexts(&spec, &[1, 2, 3, 5, 7])[4]);
+    }
+
+    #[test]
+    fn a_full_context_depends_on_every_token() {
+        let spec = spec(0, 0);
+        let a = contexts(&spec, &[1, 2, 3, 4]);
+        assert_ne!(a[3], contexts(&spec, &[9, 2, 3, 4])[3]);
+        assert_ne!(a[3], contexts(&spec, &[1, 2, 4, 4])[3]);
+        // A prefix gives the same contexts as the longer sequence at those positions.
+        assert_eq!(a[..2], contexts(&spec, &[1, 2])[..]);
+    }
+
+    #[test]
+    fn an_epoch_changes_the_context_of_the_same_tokens() {
+        let spec = spec(1, 4);
+        let tokens = [7; 12];
+        let c = contexts(&spec, &tokens);
+        assert_eq!(c[0], c[3], "within an epoch the same token has the same context");
+        assert_ne!(c[3], c[4], "the next epoch differs");
+        assert_eq!(c[4], c[7]);
+        assert!(c.iter().all(|c| *c < 1024));
+    }
+}

@@ -1,0 +1,21 @@
+[package]
+name = "ares-vulkan"
+description = "Vulkan device layer of the engine: devices, memory, streams, events, compute kernels"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+build = "build.rs"
+
+[dependencies]
+ash = "0.38"
+ares-core = { path = "../core" }
+thiserror.workspace = true
+
+[dev-dependencies]
+ares-gguf = { path = "../gguf" }
+ares-quant = { path = "../quant" }
+
+[lints]
+workspace = true

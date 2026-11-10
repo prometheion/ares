@@ -1,0 +1,206 @@
+#version 450
+#include "common.glsl"
+
+// Matrix times vectors for Q4_K weights, with f32 activations.
+//
+// The same arithmetic as `matvec_q4_K.cuh` (and as the port of its structure,
+// `matvec_q4_K_cuda_layout.comp`), split across the invocations of a workgroup
+// differently: the CUDA kernel gives each thread a unit of 64 values, so the
+// lanes of a warp read the activations 256 bytes apart, one cache line per
+// lane per load, and that alone limits it to a small part of the memory
+// bandwidth. Here a warp reads one block at a time and each lane takes one
+// 32-bit word of the block's quantised values, so the lanes read consecutive
+// words of the weights and consecutive vec4s of the activations.
+//
+// A Q4_K block holds 256 values in 144 bytes (nine 16-byte units):
+//   0   f16 d      scale of the sub-block scales
+//   2   f16 dmin   scale of the sub-block minimums
+//   4   u8[12]     8 scales and 8 minimums, 6 bits each
+//   16  u8[128]    4 bits per value: of each 32 bytes the low nibbles are
+//                  values 0..31 of a 64-value unit, the high nibbles 32..63
+// GLSL has no 16-bit load from a byte buffer without extra features, so the
+// header is read as one 16-byte unit and the two halves are decoded with
+// unpackHalf2x16, which converts them exactly.
+
+// Threads per workgroup, set when the pipeline is made (one pipeline per
+// size, all made at load): a multiple of 32, one warp per block of the row up
+// to four (more measured slower on both test GPUs). The lane mapping below is
+// logical (`tid % 32`) and does not depend on the hardware's subgroup size.
+layout(local_size_x_id = 0) in;
+
+layout(push_constant, std430) uniform Push {
+    Vec4Ref w;
+    FloatRefRO x;
+    FloatRefRO xsum;
+    FloatRef y;
+    uint n_in;
+    uint n_out;
+    uint n_batch;
+} pc;
+
+// One float per output row, activation row and subgroup.
+shared float partial[ARES_MATVEC_ROWS * ARES_MAX_BATCH * 32];
+
+// The 6-bit scales and minimums of sub-blocks 2j and 2j+1 (j is the unit, 0..3)
+// of a block, as ggml packs them, from the 12 packed bytes `s` (three words).
+//
+// ggml's decode, per sub-block jj: for jj < 4 the scale is byte jj and the
+// minimum byte jj + 4, both masked to 6 bits; for jj >= 4 the scale is the low
+// nibble of byte jj + 4 plus the top two bits of byte jj - 4 above it, and the
+// minimum the high nibble of byte jj + 4 plus the top two bits of byte jj.
+// The two sub-blocks of a unit are neighbours, so their bytes are neighbours
+// too (a 16-bit half of a word), and both are decoded at once with a mask over
+// both bytes.
+void scales(uint j, uvec3 s, out uint s_lo, out uint s_hi, out uint m_lo, out uint m_hi) {
+    const uint shift = (j & 1u) * 16u;
+    const uint a = (s.x >> shift) & 0xFFFFu;  // bytes jj of the plain case, jj - 4 above
+    const uint b = (s.y >> shift) & 0xFFFFu;  // bytes jj + 4 of the plain case, jj above
+    const uint c = (s.z >> shift) & 0xFFFFu;  // bytes jj + 4 above
+    const bool plain = j < 2;
+    const uint scale = plain ? (a & 0x3F3Fu) : ((c & 0x0F0Fu) | (((a >> 6) & 0x0303u) << 4));
+    const uint minimum =
+        plain ? (b & 0x3F3Fu) : (((c >> 4) & 0x0F0Fu) | (((b >> 6) & 0x0303u) << 4));
+    s_lo = scale & 0xFFu;
+    s_hi = scale >> 8;
+    m_lo = minimum & 0xFFu;
+    m_hi = minimum >> 8;
+}
+
+// The four activations at float index `i` (a multiple of 4). Activations only
+// have to be 4-byte aligned; when they happen to be 16-byte aligned (they are,
+// when carved out of a scratch buffer) one 16-byte load does it.
+vec4 load4(bool aligned, uint i) {
+    if (aligned) {
+        return FloatVec4Ref(uint64_t(pc.x)).v[i >> 2];
+    }
+    return vec4(pc.x.v[i], pc.x.v[i + 1], pc.x.v[i + 2], pc.x.v[i + 3]);
+}
+
+// y[b][r] = sum over c of W[r][c] * x[b][c].
+//
+//   w     n_out rows of n_in / 256 blocks, 16-byte aligned
+//   x     n_batch rows of n_in values
+//   xsum  n_batch rows of n_in / 32 sums (sum32_f32 of x)
+//   y     n_batch rows of n_out values
+//
+// One workgroup per ARES_MATVEC_ROWS output rows; n_batch <= ARES_MAX_BATCH. The
+// warps of the workgroup take the blocks in turn. A lane decodes its word of
+// each row once and applies it to every activation row, so the weights are read
+// once however many rows of activations there are; and it loads its slice of
+// the activations once for all the rows of the workgroup, which cuts the
+// traffic every workgroup puts on the L2 cache for the activations by the same
+// factor.
+void main() {
+    const uint64_t first_row = ares_group() * ARES_MATVEC_ROWS;
+    // A whole workgroup returns here, so no barrier below is left half-reached.
+    if (first_row >= pc.n_out) {
+        return;
+    }
+    const uint tid = gl_LocalInvocationID.x;
+    const uint lane = tid & 31u;
+    const uint n_warps = gl_WorkGroupSize.x >> 5;
+    // The lane's unit of 64 values in the block, and its word of that unit's
+    // 32 bytes: bytes 4w..4w+3 hold values 4w..4w+3 (low nibbles) and 32+4w..
+    // 32+4w+3 (high nibbles) of the unit.
+    const uint j = lane >> 3;
+    const uint w = lane & 7u;
+    const uint blocks_per_row = pc.n_in >> 8;
+    // Each row's address is computed in 64 bits (a matrix can be larger than
+    // 4 GiB); inside a row, blocks are indexed in 32-bit words (36 per block)
+    // and 16-byte units (9). A row past the end of the matrix reads the last
+    // one, and its results are dropped.
+    Vec4Ref units[ARES_MATVEC_ROWS];
+    WordRef words[ARES_MATVEC_ROWS];
+    [[unroll]] for (uint r = 0; r < ARES_MATVEC_ROWS; r++) {
+        const uint64_t row = min(first_row + r, uint64_t(pc.n_out) - 1);
+        const uint64_t address = uint64_t(pc.w) + row * blocks_per_row * 144;
+        units[r] = Vec4Ref(address);
+        words[r] = WordRef(address);
+    }
+    const bool aligned = (uint64_t(pc.x) & uint64_t(15)) == uint64_t(0);
+
+    float acc[ARES_MATVEC_ROWS][ARES_MAX_BATCH];
+    [[unroll]] for (uint r = 0; r < ARES_MATVEC_ROWS; r++) {
+        [[unroll]] for (uint b = 0; b < ARES_MAX_BATCH; b++) {
+            acc[r][b] = 0.0;
+        }
+    }
+
+    for (uint block = tid >> 5; block < blocks_per_row; block += n_warps) {
+        float d_lo[ARES_MATVEC_ROWS], d_hi[ARES_MATVEC_ROWS];
+        float o_lo[ARES_MATVEC_ROWS], o_hi[ARES_MATVEC_ROWS];
+        // The 4 low and 4 high values of the lane's word of each row, as floats.
+        vec4 q_lo[ARES_MATVEC_ROWS], q_hi[ARES_MATVEC_ROWS];
+        [[unroll]] for (uint r = 0; r < ARES_MATVEC_ROWS; r++) {
+            // Every lane of the warp reads the same header: one broadcast.
+            const uvec4 head = units[r].v[block * 9];
+            const vec2 dm = unpackHalf2x16(head.x);
+            uint s_lo, s_hi, m_lo, m_hi;
+            scales(j, head.yzw, s_lo, s_hi, m_lo, m_hi);
+            d_lo[r] = dm.x * float(s_lo);
+            d_hi[r] = dm.x * float(s_hi);
+            // The minimum is subtracted once per sub-block, from the sum of all
+            // its 32 activations; the eight lanes of a unit share it, so one
+            // of them applies it and the others add nothing.
+            o_lo[r] = w == 0u ? dm.y * float(m_lo) : 0.0;
+            o_hi[r] = w == 0u ? dm.y * float(m_hi) : 0.0;
+            // Converted once here, not once per activation row below.
+            const uvec4 bytes = (uvec4(words[r].v[block * 36 + 4 + j * 8 + w]) >> uvec4(0, 8, 16, 24)) & 0xFFu;
+            q_lo[r] = vec4(bytes & 0xFu);
+            q_hi[r] = vec4(bytes >> 4);
+        }
+
+        // Index in a row of activations of the lane's low values; the high
+        // ones are 32 further on.
+        const uint col = block * 256 + j * 64 + w * 4;
+        const uint group = block * 8 + j * 2;
+        // Unrolled over the most rows a launch takes and left early: with a
+        // loop whose counter indexes `acc`, the accumulators go through local
+        // memory, which measured 2 to 4 times slower here. (The body is small
+        // enough now that eight copies do not cost the registers they did in
+        // the CUDA layout, where each invocation holds a whole unit of 64.)
+        [[unroll]] for (uint b = 0; b < ARES_MAX_BATCH; b++) {
+            if (b >= pc.n_batch) {
+                break;
+            }
+            const vec4 x_lo = load4(aligned, b * pc.n_in + col);
+            const vec4 x_hi = load4(aligned, b * pc.n_in + col + 32);
+            const uint so = b * (pc.n_in >> 5) + group;
+            const float sum_lo = pc.xsum.v[so];
+            const float sum_hi = pc.xsum.v[so + 1];
+            [[unroll]] for (uint r = 0; r < ARES_MATVEC_ROWS; r++) {
+                acc[r][b] += d_lo[r] * dot(q_lo[r], x_lo) + d_hi[r] * dot(q_hi[r], x_hi)
+                    - o_lo[r] * sum_lo - o_hi[r] * sum_hi;
+            }
+        }
+    }
+
+    // Sum each accumulator over the workgroup: over the subgroup, then over
+    // the subgroups through shared memory.
+    [[unroll]] for (uint r = 0; r < ARES_MATVEC_ROWS; r++) {
+        [[unroll]] for (uint b = 0; b < ARES_MAX_BATCH; b++) {
+            if (b >= pc.n_batch) {
+                break;
+            }
+            const float s = subgroupAdd(acc[r][b]);
+            if (subgroupElect()) {
+                partial[(r * ARES_MAX_BATCH + b) * 32 + gl_SubgroupID] = s;
+            }
+        }
+    }
+    memoryBarrierShared();
+    barrier();
+    const uint outputs = ARES_MATVEC_ROWS * pc.n_batch;
+    if (tid < outputs) {
+        const uint r = tid / pc.n_batch;
+        const uint b = tid % pc.n_batch;
+        const uint64_t row = first_row + r;
+        if (row < pc.n_out) {
+            float total = 0.0;
+            for (uint s = 0; s < gl_NumSubgroups; s++) {
+                total += partial[(r * ARES_MAX_BATCH + b) * 32 + s];
+            }
+            FloatRef(uint64_t(pc.y) + (uint64_t(b) * pc.n_out + row) * 4).v[0] = total;
+        }
+    }
+}

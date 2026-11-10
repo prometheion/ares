@@ -1,0 +1,24 @@
+#version 450
+#include "common.glsl"
+
+layout(local_size_x = 256) in;
+
+layout(push_constant, std430) uniform Push {
+    FloatRef y;
+    FloatRefRO x;
+    uint n;
+} pc;
+
+// y[i] += x[i] for i < n. One invocation per value.
+//
+// This is the combine step of a sum across devices: a device adds the partial
+// result it received from its peer to its own.
+void main() {
+    // Computed in 64 bits so that a launch near the end of the u32 range
+    // cannot wrap around into the guard.
+    const uint64_t g = ares_group() * 256 + gl_LocalInvocationID.x;
+    if (g < pc.n) {
+        const uint i = uint(g);
+        pc.y.v[i] += pc.x.v[i];
+    }
+}

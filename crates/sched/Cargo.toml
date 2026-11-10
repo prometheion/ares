@@ -1,0 +1,13 @@
+[package]
+name = "ares-sched"
+description = "What each step computes: ragged batches, prefill next to decode, draft lengths, n-gram drafts"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

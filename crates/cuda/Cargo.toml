@@ -1,0 +1,21 @@
+[package]
+name = "ares-cuda"
+description = "CUDA device layer of the engine: driver API, memory, streams, events, kernels, peer links"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+build = "build.rs"
+
+[dependencies]
+ares-core.workspace = true
+libloading.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+ares-gguf.workspace = true
+ares-quant = { path = "../quant" }
+
+[lints]
+workspace = true

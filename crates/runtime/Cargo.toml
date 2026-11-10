@@ -1,0 +1,25 @@
+[package]
+name = "ares-runtime"
+description = "The step loop of the engine: one conductor thread, one thread per device, a synthetic model to drive them, and the timing that shows where a step goes"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+ares-api = { path = "../api" }
+ares-core.workspace = true
+ares-cuda.workspace = true
+ares-sched.workspace = true
+ares-state.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+# The HTTP example serves the synthetic engine through the real front end and
+# drives it with raw sockets.
+ares-server = { path = "../server" }
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+
+[lints]
+workspace = true

@@ -1,0 +1,13 @@
+[package]
+name = "ares-weights"
+description = "Where weights live: which experts of a MoE model are kept on which tier, decided from routing"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

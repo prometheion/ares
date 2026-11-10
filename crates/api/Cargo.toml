@@ -1,0 +1,19 @@
+[package]
+name = "ares-api"
+description = "The boundary between the HTTP server and the inference runtime: requests, events, decisions and the Engine trait"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+thiserror.workspace = true
+
+[dev-dependencies]
+# Only the tests use a concrete JSON format; the crate itself stays format-agnostic.
+serde_json = "1"
+
+[lints]
+workspace = true

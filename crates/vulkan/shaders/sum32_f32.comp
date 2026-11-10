@@ -1,0 +1,28 @@
+#version 450
+#include "common.glsl"
+
+layout(local_size_x = 256) in;
+
+layout(push_constant, std430) uniform Push {
+    FloatRefRO x;
+    FloatRef sums;
+    uint n_groups;
+} pc;
+
+// sums[g] = the sum of x[32 g .. 32 g + 31] for g < n_groups. One invocation
+// per group, adding in index order like the CUDA kernel, so the results are
+// the same bits. Quantized types with an offset per sub-block need these sums
+// once per activation row, not once per weight row.
+void main() {
+    const uint64_t id = ares_group() * 256 + gl_LocalInvocationID.x;
+    if (id < pc.n_groups) {
+        // The group's 32 values start at a 64-bit byte offset: x may be far
+        // larger than 4 G values, which a 32-bit index could not reach.
+        FloatRefRO xg = FloatRefRO(uint64_t(pc.x) + id * 128);
+        float sum = 0.0;
+        for (uint l = 0; l < 32; l++) {
+            sum += xg.v[l];
+        }
+        pc.sums.v[uint(id)] = sum;
+    }
+}

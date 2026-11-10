@@ -1,0 +1,8 @@
+system 0 98
+english 98 964
+german 964 1704
+code 1704 2607
+german 2607 2707
+english 2707 2842
+german 2842 3009
+english 3009 3686

@@ -1,0 +1,16 @@
+[package]
+name = "kvreal"
+version = "0.0.1"
+edition = "2024"
+description = "Measurement of the engine's KV formats and kvarn's quantizer on captured Q, K and V (not part of the engine workspace)"
+
+[dependencies]
+ares-quant = { path = "../.." }
+
+# not a member of the engine workspace
+[workspace]
+
+[profile.release]
+opt-level = 3
+debug = false
+codegen-units = 4

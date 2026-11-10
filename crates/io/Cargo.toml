@@ -1,0 +1,18 @@
+[package]
+name = "ares-io"
+description = "SSD streaming: direct I/O reads through io_uring in priority order, expert and row addressing"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+ares-core = { path = "../core" }
+ares-gguf = { path = "../gguf" }
+io-uring = "0.7"
+libc.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

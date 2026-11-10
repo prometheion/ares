@@ -1,0 +1,15 @@
+[package]
+name = "ares-store"
+description = "Sequence state on disk: pages and checkpoints by content hash, surviving restarts"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+ares-state.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

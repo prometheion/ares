@@ -1,0 +1,45 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.95"
+license = "Apache-2.0"
+repository = "https://github.com/prometheion/ares"
+
+[workspace.dependencies]
+ares-core = { path = "crates/core" }
+ares-gguf = { path = "crates/gguf" }
+ares-cuda = { path = "crates/cuda" }
+ares-state = { path = "crates/state" }
+ares-sched = { path = "crates/sched" }
+ares-weights = { path = "crates/weights" }
+ares-store = { path = "crates/store" }
+
+thiserror = "2"
+memmap2 = "0.9"
+libloading = "0.8"
+libc = "0.2"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "warn"
+
+# Tests read real model files and run reference math, so they need optimized code.
+[profile.dev]
+opt-level = 1
+
+[profile.test]
+opt-level = 2
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = "line-tables-only"
