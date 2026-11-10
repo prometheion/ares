@@ -133,7 +133,7 @@ machine (RTX 4070 + RTX 3060, Qwen3.8-27B) or read from the engines listed in
 | `ares-store` | State on disk: pages and checkpoints by content hash in segment files, per fingerprint, with a size limit | Done as a store of opaque bytes, tested against restarts, the limit and damaged files; not yet connected to devices |
 | `ares-io` | Reads of weights straight from the model file: io_uring with direct I/O, demand before prefetch, cancel and promote, copies of a file on several drives with the reads spread over them, a map from experts to file ranges, row reads behind a cache | Done, tested against real files and on two drives; 1.4 to 1.7 GiB/s of random expert-sized reads per SSD of the development machine and 2.9 to 3.0 GiB/s over both; not yet connected to devices |
 | `ares-sched` | Step planner (generation, decision rows and prompts in one step), the order of a pass for long prompts of a model with experts, step time model, draft length choice, n-gram drafter | Done, unit tested |
-| `ares-weights` | Expert heat, tier election with two-phase swaps, the waves of experts of a pass, routing bias for pruning | Done, unit tested |
+| `ares-weights` | Expert heat, tiers that are elected and fed by reads (admission, protection, guesses bound late, slots given back), slots per layer by need, the waves of experts of a pass, a token table for the first layers, the lookahead distance, routing bias for pruning | Done as bookkeeping, unit tested and tried on synthetic routing; no runtime uses it yet |
 | `ares-api` | Request, event, decision and error types; the `Engine` trait between HTTP and the runtime (`submit` for generation, `decide` for decisions) | Done, unit tested |
 | `ares-server` | OpenAI-compatible HTTP server, `POST /v1/systemone` (wire-compatible with llama.cpp's, served for any model) and the `ares` binary | Done as a front end, tested against a mock engine; answers that no model architecture is implemented until the runtime exists |
 | `ares-runtime` | The conductor thread and one thread per device, the step loop that connects plan, state and kernels, speculation with the n-gram drafter, the `Model` trait a model implements, a synthetic model that drives the real kernels | Done as a skeleton; 71 tests and 10 GPU tests on one device, tensor split and layer split; implements `Engine::submit` (not `decide`), greedy picks only, no prefix cache, no real model |
@@ -497,16 +497,42 @@ pages) and comes with the runtime.
   pieces and keeps the hidden states of all prompt rows between them, the
   kernels that compute a wave for the rows routed to it, and a model with
   experts.
-- **More from the engines that stream experts** (planned; details and
-  numbers in [reference/moe-offload-survey.md](reference/moe-offload-survey.md)):
-  the RAM tier as a cache in front of the SSD (admission when a read
-  arrives, a victim chosen when a guessed read starts, protection of experts
-  predicted for the current token); inside a layer, experts that are present
-  first and a miss issued the moment the router has run, gate and up before
-  down; slots per layer by what the next slot gains instead of equally, and
-  a table from the last tokens to likely experts for the first MoE layers,
-  which the router prediction cannot reach; gate and up of an expert
-  adjacent in its slot and computed in one pass.
+- **More from the engines that stream experts** (details and the sources'
+  numbers in [reference/moe-offload-survey.md](reference/moe-offload-survey.md)).
+  Built as bookkeeping in `ares-weights`, with no runtime using it yet; the
+  numbers are from a synthetic workload with the properties the sources
+  report (locality in time, topics that change, early layers that route by
+  the token), not from a model:
+  - *The RAM tier as a cache in front of the SSD.* `SlotSet` takes reads as
+    well as elections: a demand read gets a slot at once, a guessed read
+    (`GuessQueue`) gets one only when it is started, experts routed or
+    predicted for the current token are protected, and slots can be given
+    back to the memory broker and taken again. Against a tier that is only
+    re-elected, the model starts 34 % fewer reads per token and waits 20 %
+    less with 4 reads in flight (58 % and 44 % with 8). Nearly all of that
+    is reading guesses at all; protection removes the evictions of experts in
+    use, binding the victim late is worth about 1 %, and admission on its own
+    gains nothing over re-election.
+  - *Slots per layer by need* (`split_slots`): a tier's bytes go to the
+    layers by what the next slot gains, with a margin and a cap on moves so
+    that slots do not go back and forth. It raises the share served from the
+    tier from 0.70 to 0.72 at 32 slots per layer and does nothing at 16; at
+    small budgets it takes slots from the early layers, which is the opposite
+    of what the sources recommend for them, so a weight for how badly a layer
+    is predicted is still to be added.
+  - *A table from the last tokens to likely experts* (`TokenTable`) for the
+    first MoE layers, which the router prediction cannot reach: 104 bytes per
+    entry for 4 layers of 8 experts, built from recorded routing. On the
+    synthetic workload the first layers are served 0.69 instead of 0.39 with
+    527 entries. It needs a recording tool and must be measured on a real
+    model before it is kept.
+  - *The lookahead distance as a measured setting* (`Lookahead`): from the
+    read time, the layer time and the recall observed per distance it picks
+    the distance with the least expected waiting, starting at two layers.
+  Still planned, with the first MoE model: inside a layer, experts that are
+  present first and a miss issued the moment the router has run, gate and up
+  before down; gate and up of an expert adjacent in its slot and computed in
+  one pass; the shared expert's output in the predictor's input.
 - **Hashed-row tables**: for models with n-gram embedding tables (28.8 GB for
   `qwen4exp`) the row ids follow from the last tokens on the host, so the
   reads are issued when the token is known and collected before the layer

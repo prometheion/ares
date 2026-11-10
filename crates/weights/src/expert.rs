@@ -109,8 +109,48 @@ pub struct Swap {
     pub load: u32,
 }
 
+/// Why a read is started, which decides what it may evict. See
+/// [`SlotSet::start_read`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Want {
+    /// The router picked the expert and the model waits for it.
+    Demand,
+    /// A prediction or the token table says the expert will be needed. It may
+    /// turn out wrong.
+    Guess,
+}
+
+/// What [`SlotSet::start_read`] decided.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Start {
+    /// The expert is in a slot already: there is nothing to read.
+    Present,
+    /// A read of the expert is on its way. A guess needs nothing more; a
+    /// demand read should promote the one that is running.
+    Loading,
+    /// No slot may be taken for it now (all are loading, or hold experts
+    /// this step still needs and this read may not evict them). A guess
+    /// waits for a later try; a demand read goes to a staging buffer and the
+    /// expert is not kept.
+    NoRoom,
+    /// Read the expert into this slot, then [`SlotSet::commit`] the swap, or
+    /// [`SlotSet::abort`] it if the read failed.
+    Slot(Swap),
+}
+
+/// A slot handed back by [`SlotSet::give_back`]. Its memory is the caller's
+/// to free.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Given {
+    pub slot: u32,
+    /// The expert that was in the slot and is gone; `None` for an empty slot.
+    pub evicted: Option<u32>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Slot {
+    /// Given back: the slot's memory belongs to someone else.
+    Gone,
     Empty,
     /// The expert's data is on its way; nobody may use the slot.
     Loading(u32),
@@ -121,26 +161,105 @@ const NO_SLOT: u32 = u32::MAX;
 
 /// One tier of one layer: a fixed number of slots and the experts in them.
 ///
-/// A swap takes effect in two steps. [`SlotSet::elect`] removes the evicted
-/// expert at once, so no kernel reads a slot that is being overwritten, and
-/// [`SlotSet::commit`] makes the new expert visible once its data is in
-/// place. Between the two the new expert is served from the tier below, as
-/// before.
+/// Who holds a slot is decided in two ways, and a tier may use both:
+///
+/// - **Elections.** [`SlotSet::elect`] looks at the heat of all experts at
+///   once, between steps, and starts the swaps that put the hottest experts
+///   in the slots. This keeps the tier in VRAM, fills any tier before the
+///   first token, and fills a tier that is idle.
+/// - **Reads.** [`SlotSet::start_read`] decides for one expert when its read
+///   starts: a free slot, or else the coldest member that this step does not
+///   need. This is how a tier in RAM in front of the SSD is fed, and a tier
+///   in VRAM can be fed the same way (an upload on a miss).
+///
+/// They are one type because they share what makes a tier work: the slots,
+/// the two-phase swap, the heat that says who is cold, and the slots'
+/// states. A second type for the tier in RAM would copy all of that, and an
+/// election is still what fills it before the first reply token. What the
+/// reads add is small: which experts the current step still needs
+/// ([`SlotSet::routed`], [`SlotSet::predicted`]), which members arrived as a
+/// guess and were not used, and slots that can be given back and taken again
+/// ([`SlotSet::give_back`], [`SlotSet::take`]). A tier in VRAM that is only
+/// elected never marks anything, and behaves as it always did.
+///
+/// A swap takes effect in two steps. [`SlotSet::elect`] and
+/// [`SlotSet::start_read`] remove the evicted expert at once, so no kernel
+/// reads a slot that is being overwritten, and [`SlotSet::commit`] makes the
+/// new expert visible once its data is in place. Between the two the new
+/// expert is served from the tier below, as before.
+///
+/// # A tier fed by reads
+///
+/// What the owner calls, and when it knows to call it, for one layer:
+///
+/// - The router of the layer has run for a step: [`SlotSet::routed`] with
+///   what it picked, then [`SlotSet::start_read`] with [`Want::Demand`] for
+///   each pick that is not [`SlotSet::contains`]ed.
+/// - The predictor (or the token table) names experts for this layer before
+///   its router has run: [`SlotSet::predicted`]. The ones that are in the
+///   tier stay; the others wait in a [`GuessQueue`](crate::GuessQueue),
+///   which calls [`SlotSet::start_read`] with [`Want::Guess`] only when an
+///   I/O lane is free.
+/// - A read has arrived: [`SlotSet::commit`].
+///
+/// ```
+/// use ares_weights::{ExpertHeat, SlotSet, Start, Want};
+///
+/// let mut heat = ExpertHeat::new(1, 16, 0.9);
+/// let mut tier = SlotSet::new(16, 2);
+///
+/// // Step 7: the router picked experts 3 and 9, and neither is in the tier.
+/// let routed = [3, 9];
+/// heat.record(0, &routed);
+/// tier.routed(&routed, 7);
+/// for expert in routed {
+///     let Start::Slot(swap) = tier.start_read(expert, Want::Demand, 7, heat.layer(0)) else {
+///         unreachable!("two free slots");
+///     };
+///     // Read the expert into the slot, wait for it, then:
+///     tier.commit(&swap);
+/// }
+/// assert!(tier.contains(3) && tier.contains(9));
+///
+/// // Step 8 needs expert 5. Both members were picked before, but only expert
+/// // 3 is still needed (it is predicted again), so expert 9 gives way.
+/// tier.predicted(&[3], 8);
+/// heat.record(0, &[5]);
+/// let Start::Slot(swap) = tier.start_read(5, Want::Demand, 8, heat.layer(0)) else {
+///     unreachable!("a member is cold");
+/// };
+/// assert_eq!(swap.evict, Some(9));
+/// ```
 #[derive(Clone, Debug)]
 pub struct SlotSet {
     /// Expert -> slot, or `NO_SLOT`. Only experts whose data is in place.
     slot_of: Vec<u32>,
+    /// Expert -> slot, or `NO_SLOT`. Only experts whose data is on its way.
+    loading_in: Vec<u32>,
+    /// Expert -> the first step that no longer needs it (0: never needed).
+    protected_until: Vec<u64>,
     slots: Vec<Slot>,
+    /// Per slot: the expert in it came as a guess and nobody has used it.
+    unused_guess: Vec<bool>,
 }
 
 impl SlotSet {
     /// An empty tier of `n_slots` slots for a layer of `n_experts` experts.
     pub fn new(n_experts: usize, n_slots: usize) -> Self {
-        Self { slot_of: vec![NO_SLOT; n_experts], slots: vec![Slot::Empty; n_slots] }
+        Self {
+            slot_of: vec![NO_SLOT; n_experts],
+            loading_in: vec![NO_SLOT; n_experts],
+            protected_until: vec![0; n_experts],
+            slots: vec![Slot::Empty; n_slots],
+            unused_guess: vec![false; n_slots],
+        }
     }
 
+    /// The slots the tier has: those not given back with
+    /// [`SlotSet::give_back`]. Slot numbers are stable, so after slots were
+    /// given back the numbers in use have gaps.
     pub fn n_slots(&self) -> usize {
-        self.slots.len()
+        self.slots.iter().filter(|s| **s != Slot::Gone).count()
     }
 
     /// The slot that holds `expert`, if its data is in place.
@@ -185,24 +304,29 @@ impl SlotSet {
         }
     }
 
+    /// How much a member is worth when it competes for its slot: its heat,
+    /// or nothing when it came as a guess and nobody used it.
+    fn worth(&self, slot: usize, expert: u32, heat: &[f32]) -> f32 {
+        if self.unused_guess[slot] { 0.0 } else { heat[expert as usize] }
+    }
+
     /// Re-decides who holds the slots from `heat` and returns the swaps to
     /// carry out. Empty slots are filled with the hottest experts that have
     /// any heat; then hot outsiders replace cold members as `rule` allows.
+    ///
+    /// A member that came as a guess and was not used competes with a worth
+    /// of 0. An election looks at the heat only, not at what the current
+    /// step needs: run it between steps, before the next step's experts are
+    /// named with [`SlotSet::predicted`].
     pub fn elect(&mut self, heat: &[f32], rule: &SwapRule) -> Vec<Swap> {
         assert_eq!(heat.len(), self.slot_of.len(), "one heat value per expert");
-        let loading: Vec<u32> = self
-            .slots
-            .iter()
-            .filter_map(|s| match s {
-                Slot::Loading(e) => Some(*e),
-                _ => None,
-            })
-            .collect();
 
         // Outsiders, hottest first; ties go to the lower number so elections
         // are reproducible.
         let mut outsiders: Vec<u32> = (0..heat.len() as u32)
-            .filter(|e| self.slot_of[*e as usize] == NO_SLOT && !loading.contains(e))
+            .filter(|e| {
+                self.slot_of[*e as usize] == NO_SLOT && self.loading_in[*e as usize] == NO_SLOT
+            })
             .collect();
         outsiders.sort_by(|a, b| heat[*b as usize].total_cmp(&heat[*a as usize]).then(a.cmp(b)));
         let mut outsiders = outsiders.into_iter().peekable();
@@ -215,7 +339,7 @@ impl SlotSet {
             match outsiders.peek() {
                 Some(&expert) if heat[expert as usize] > 0.0 => {
                     outsiders.next();
-                    self.slots[slot] = Slot::Loading(expert);
+                    self.begin(slot, expert, false);
                     swaps.push(Swap { slot: slot as u32, evict: None, load: expert });
                 }
                 _ => break,
@@ -232,24 +356,218 @@ impl SlotSet {
                 _ => None,
             })
             .collect();
-        members
-            .sort_by(|a, b| heat[a.1 as usize].total_cmp(&heat[b.1 as usize]).then(b.1.cmp(&a.1)));
+        members.sort_by(|a, b| {
+            let (worth_a, worth_b) =
+                (self.worth(a.0 as usize, a.1, heat), self.worth(b.0 as usize, b.1, heat));
+            worth_a.total_cmp(&worth_b).then(b.1.cmp(&a.1))
+        });
 
         for (slot, member) in members.into_iter().take(rule.max_swaps) {
             let Some(&candidate) = outsiders.peek() else { break };
-            let (heat_in, heat_out) = (heat[candidate as usize], heat[member as usize]);
+            let (heat_in, heat_out) =
+                (heat[candidate as usize], self.worth(slot as usize, member, heat));
             if heat_in <= rule.margin * heat_out + rule.bonus {
                 break;
             }
             outsiders.next();
             self.slot_of[member as usize] = NO_SLOT;
-            self.slots[slot as usize] = Slot::Loading(candidate);
+            self.begin(slot as usize, candidate, false);
             swaps.push(Swap { slot, evict: Some(member), load: candidate });
         }
         swaps
     }
 
-    /// Makes the expert of a finished swap visible in its slot.
+    /// The slot starts to wait for `expert`'s data.
+    fn begin(&mut self, slot: usize, expert: u32, guess: bool) {
+        self.slots[slot] = Slot::Loading(expert);
+        self.loading_in[expert as usize] = slot as u32;
+        self.unused_guess[slot] = guess;
+    }
+
+    /// Says that the router picked `experts` in this layer in step `step`:
+    /// they are needed until the step is over, and a member that came as a
+    /// guess has now been used. Call it with the router's output, before
+    /// starting the demand reads for it.
+    ///
+    /// `step` is any number that grows from step to step.
+    pub fn routed(&mut self, experts: &[u32], step: u64) {
+        self.predicted(experts, step);
+        for expert in experts {
+            let slot = match (self.slot_of[*expert as usize], self.loading_in[*expert as usize]) {
+                (NO_SLOT, NO_SLOT) => continue,
+                (NO_SLOT, loading) => loading,
+                (held, _) => held,
+            };
+            self.unused_guess[slot as usize] = false;
+        }
+    }
+
+    /// Says that `experts` are predicted for this layer in step `step`
+    /// (before its router has run): they are needed until the step is over.
+    /// A guess never evicts them, and a demand read only when nothing else is
+    /// left.
+    ///
+    /// Call it for every predicted expert, in the tier or not: one that is
+    /// read later is protected when it arrives. Protection ends with the
+    /// step, so there is nothing to undo, and a prediction for the next step
+    /// (the token table, made when a token is sampled) does not protect
+    /// anything of the step that is ending.
+    pub fn predicted(&mut self, experts: &[u32], step: u64) {
+        let until = step.saturating_add(1);
+        for expert in experts {
+            let protected = &mut self.protected_until[*expert as usize];
+            *protected = (*protected).max(until);
+        }
+    }
+
+    fn needed(&self, expert: u32, step: u64) -> bool {
+        self.protected_until[expert as usize] > step
+    }
+
+    /// Starts the read of `expert` for step `step`: finds the slot it will
+    /// be read into.
+    ///
+    /// `heat` is the layer's heat (what [`ExpertHeat::layer`] returns). The
+    /// slot is chosen now, when the read starts and not earlier: a guess
+    /// that waits for a free I/O lane has taken nothing from the tier.
+    ///
+    /// - A free slot is used first.
+    /// - Otherwise the victim is the coldest member that is in a slot, is
+    ///   not loading and is not needed by this step ([`SlotSet::routed`],
+    ///   [`SlotSet::predicted`]). A member that came as a guess and was
+    ///   never used counts as worth nothing, however hot the expert is.
+    ///   Equal heat gives way in favour of the lower expert number.
+    /// - A guess never evicts an expert this step needs: [`Start::NoRoom`].
+    /// - A demand read evicts one only when every other member is needed
+    ///   too, and then the coldest of them: the expert it waits for is more
+    ///   urgent than a prediction.
+    ///
+    /// A demand read marks the expert as needed and used, like
+    /// [`SlotSet::routed`], and turns a guess that is already on its way
+    /// into one the model waits for. The evicted expert is gone at once, as
+    /// in an election.
+    ///
+    /// A read that went to a staging buffer ([`Start::NoRoom`], or one made
+    /// before the tier had room) is admitted afterwards the same way: call
+    /// this once the data is there, copy it into the slot, and commit.
+    pub fn start_read(&mut self, expert: u32, want: Want, step: u64, heat: &[f32]) -> Start {
+        assert_eq!(heat.len(), self.slot_of.len(), "one heat value per expert");
+        if want == Want::Demand {
+            self.routed(&[expert], step);
+        }
+        if self.slot_of[expert as usize] != NO_SLOT {
+            return Start::Present;
+        }
+        if self.loading_in[expert as usize] != NO_SLOT {
+            return Start::Loading;
+        }
+
+        if let Some(slot) = self.slots.iter().position(|s| *s == Slot::Empty) {
+            self.begin(slot, expert, want == Want::Guess);
+            return Start::Slot(Swap { slot: slot as u32, evict: None, load: expert });
+        }
+        let victim = self
+            .slots
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, s)| match s {
+                Slot::Holds(e) => Some((slot, *e)),
+                _ => None,
+            })
+            .min_by(|a, b| self.eviction_order(*a, *b, step, heat));
+        let Some((slot, victim)) = victim else { return Start::NoRoom };
+        if want == Want::Guess && self.needed(victim, step) {
+            return Start::NoRoom;
+        }
+        self.slot_of[victim as usize] = NO_SLOT;
+        self.begin(slot, expert, want == Want::Guess);
+        Start::Slot(Swap { slot: slot as u32, evict: Some(victim), load: expert })
+    }
+
+    /// The first of two members to go: not needed before needed, then the
+    /// lower worth, then the higher expert number.
+    fn eviction_order(
+        &self,
+        a: (usize, u32),
+        b: (usize, u32),
+        step: u64,
+        heat: &[f32],
+    ) -> std::cmp::Ordering {
+        let (needed_a, needed_b) = (self.needed(a.1, step), self.needed(b.1, step));
+        needed_a
+            .cmp(&needed_b)
+            .then_with(|| self.worth(a.0, a.1, heat).total_cmp(&self.worth(b.0, b.1, heat)))
+            .then(b.1.cmp(&a.1))
+    }
+
+    /// Hands back up to `n` slots, because the memory broker asked for the
+    /// RAM: empty slots first, then the coldest members in the order
+    /// [`SlotSet::start_read`] would evict them (those the step still needs
+    /// last). The experts in the slots are gone at once.
+    ///
+    /// Slots that are loading are kept, since a read is writing into their
+    /// memory: when fewer than `n` come back, ask again after those reads
+    /// have arrived (or were cancelled and aborted). The caller frees the
+    /// memory of each [`Given`] slot, then reports it to the broker.
+    pub fn give_back(&mut self, n: usize, step: u64, heat: &[f32]) -> Vec<Given> {
+        assert_eq!(heat.len(), self.slot_of.len(), "one heat value per expert");
+        let mut given = Vec::new();
+        // The highest numbers go first, so the slots that stay are the low
+        // ones, the ones that `take` brings back last.
+        for slot in (0..self.slots.len()).rev() {
+            if given.len() == n {
+                return given;
+            }
+            if self.slots[slot] == Slot::Empty {
+                self.slots[slot] = Slot::Gone;
+                given.push(Given { slot: slot as u32, evicted: None });
+            }
+        }
+        let mut members: Vec<(usize, u32)> = self
+            .slots
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, s)| match s {
+                Slot::Holds(e) => Some((slot, *e)),
+                _ => None,
+            })
+            .collect();
+        members.sort_by(|a, b| self.eviction_order(*a, *b, step, heat));
+        for (slot, expert) in members.into_iter().take(n - given.len()) {
+            self.slot_of[expert as usize] = NO_SLOT;
+            self.slots[slot] = Slot::Gone;
+            self.unused_guess[slot] = false;
+            given.push(Given { slot: slot as u32, evicted: Some(expert) });
+        }
+        given
+    }
+
+    /// Takes `n` slots again, or for the first time: the memory for them is
+    /// there. Slots that were given back return first, lowest number first;
+    /// then new numbers are added. They are empty; the slot numbers come
+    /// back so the caller knows whose memory is whose.
+    pub fn take(&mut self, n: usize) -> Vec<u32> {
+        let mut taken = Vec::with_capacity(n);
+        for (slot, state) in self.slots.iter_mut().enumerate() {
+            if taken.len() == n {
+                return taken;
+            }
+            if *state == Slot::Gone {
+                *state = Slot::Empty;
+                taken.push(slot as u32);
+            }
+        }
+        while taken.len() < n {
+            taken.push(self.slots.len() as u32);
+            self.slots.push(Slot::Empty);
+            self.unused_guess.push(false);
+        }
+        taken
+    }
+
+    /// Makes the expert of a finished swap visible in its slot. An expert
+    /// that came as a guess stays marked as unused until
+    /// [`SlotSet::routed`] says otherwise.
     ///
     /// # Panics
     ///
@@ -264,11 +582,12 @@ impl SlotSet {
             swap.slot
         );
         *slot = Slot::Holds(swap.load);
+        self.loading_in[swap.load as usize] = NO_SLOT;
         self.slot_of[swap.load as usize] = swap.slot;
     }
 
     /// Gives up a swap whose data could not be brought in: the slot is empty
-    /// again and a later election may fill it.
+    /// again and a later election or read may fill it.
     pub fn abort(&mut self, swap: &Swap) {
         let slot = &mut self.slots[swap.slot as usize];
         assert_eq!(
@@ -278,6 +597,8 @@ impl SlotSet {
             swap.slot
         );
         *slot = Slot::Empty;
+        self.loading_in[swap.load as usize] = NO_SLOT;
+        self.unused_guess[swap.slot as usize] = false;
     }
 }
 
@@ -438,5 +759,186 @@ mod tests {
             "dynamic {dynamic_rate:.2}, fixed {fixed_rate:.2}"
         );
         eprintln!("served from the tier: fixed {fixed_rate:.3}, dynamic {dynamic_rate:.3}");
+    }
+
+    /// Reads one expert into the tier the way the owner would.
+    fn read(set: &mut SlotSet, expert: u32, want: Want, step: u64, heat: &[f32]) -> Option<Swap> {
+        match set.start_read(expert, want, step, heat) {
+            Start::Slot(swap) => {
+                set.commit(&swap);
+                Some(swap)
+            }
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn a_read_takes_a_free_slot_and_then_the_coldest_member_the_step_does_not_need() {
+        //                 expert: 0    1    2    3    4    5
+        let heat = [0.0, 5.0, 0.0, 2.0, 1.0, 0.0];
+        let mut set = SlotSet::new(6, 2);
+        let first = read(&mut set, 1, Want::Demand, 1, &heat).unwrap();
+        let second = read(&mut set, 3, Want::Demand, 1, &heat).unwrap();
+        assert_eq!(
+            (first, second),
+            (Swap { slot: 0, evict: None, load: 1 }, Swap { slot: 1, evict: None, load: 3 }),
+            "free slots first, lowest number first"
+        );
+
+        // Step 2 needs expert 4. Both members were needed in step 1 only.
+        let Start::Slot(swap) = set.start_read(4, Want::Demand, 2, &heat) else {
+            panic!("a member is cold")
+        };
+        assert_eq!(swap, Swap { slot: 1, evict: Some(3), load: 4 }, "the colder member goes");
+        assert!(!set.contains(3) && !set.contains(4), "the slot is in transit");
+        assert_eq!(set.start_read(4, Want::Demand, 2, &heat), Start::Loading);
+        set.commit(&swap);
+        assert_eq!(set.start_read(4, Want::Demand, 2, &heat), Start::Present);
+        assert_eq!((set.slot(1), set.slot(4)), (Some(0), Some(1)));
+    }
+
+    #[test]
+    fn a_guess_never_evicts_what_the_step_needs_and_a_demand_read_only_as_a_last_resort() {
+        //                 expert: 0    1    2    3    4
+        let heat = [0.0, 0.5, 9.0, 2.0, 0.0];
+        let mut set = SlotSet::new(5, 3);
+        for expert in [1, 2, 3] {
+            read(&mut set, expert, Want::Demand, 1, &heat).unwrap();
+        }
+
+        // Step 2: expert 1 is cold but predicted for this step; 2 is hot and 3
+        // lukewarm, and neither is needed. A guess takes the colder of the
+        // two that are not needed, not the coldest of all.
+        set.predicted(&[1], 2);
+        let Start::Slot(swap) = set.start_read(4, Want::Guess, 2, &heat) else { panic!("room") };
+        assert_eq!(swap.evict, Some(3));
+
+        // On a tier where everything is needed, a guess finds no room.
+        let mut set = SlotSet::new(5, 3);
+        for expert in [1, 2, 3] {
+            read(&mut set, expert, Want::Demand, 1, &heat).unwrap();
+        }
+        set.predicted(&[1, 2, 3], 2);
+        assert_eq!(set.start_read(4, Want::Guess, 2, &heat), Start::NoRoom);
+        // A demand read evicts the coldest of the needed ones.
+        let Start::Slot(swap) = set.start_read(4, Want::Demand, 2, &heat) else {
+            panic!("a demand read may evict as a last resort")
+        };
+        assert_eq!(swap.evict, Some(1));
+    }
+
+    #[test]
+    fn protection_ends_with_the_step() {
+        let heat = [0.0, 1.0, 5.0];
+        let mut set = SlotSet::new(3, 1);
+        read(&mut set, 1, Want::Demand, 3, &heat).unwrap();
+        // Predicted for step 4, so it survives a guess in step 4 and is
+        // fair game from step 5.
+        set.predicted(&[1], 4);
+        assert_eq!(set.start_read(2, Want::Guess, 3, &heat), Start::NoRoom);
+        assert_eq!(set.start_read(2, Want::Guess, 4, &heat), Start::NoRoom);
+        assert!(matches!(set.start_read(2, Want::Guess, 5, &heat), Start::Slot(_)));
+    }
+
+    #[test]
+    fn a_guess_nobody_used_is_worth_nothing_and_a_used_one_is_worth_its_heat() {
+        //                 expert: 0    1    2    3    4
+        let heat = [0.0, 3.0, 8.0, 0.0, 6.0];
+        let build = || {
+            let mut set = SlotSet::new(5, 2);
+            read(&mut set, 1, Want::Demand, 1, &heat).unwrap();
+            read(&mut set, 2, Want::Guess, 1, &heat).unwrap();
+            set
+        };
+
+        // Expert 2 is the hotter, but it came as a guess and no step used it.
+        let mut unused = build();
+        let Start::Slot(swap) = unused.start_read(4, Want::Demand, 2, &heat) else { panic!() };
+        assert_eq!(swap.evict, Some(2));
+
+        // The router picked it in step 1 after it had arrived: it competes by heat.
+        let mut used = build();
+        used.routed(&[2], 1);
+        let Start::Slot(swap) = used.start_read(4, Want::Demand, 2, &heat) else { panic!() };
+        assert_eq!(swap.evict, Some(1));
+
+        // A demand read of a guess that is still on its way makes it used too.
+        let mut set = SlotSet::new(5, 2);
+        let Start::Slot(on_its_way) = set.start_read(2, Want::Guess, 1, &heat) else { panic!() };
+        read(&mut set, 1, Want::Demand, 1, &heat).unwrap();
+        assert_eq!(set.start_read(2, Want::Demand, 2, &heat), Start::Loading);
+        set.commit(&on_its_way);
+        let Start::Slot(swap) = set.start_read(4, Want::Demand, 3, &heat) else { panic!() };
+        assert_eq!(swap.evict, Some(1));
+    }
+
+    #[test]
+    fn a_slot_that_is_loading_is_nobodys_victim_and_a_failed_read_frees_it() {
+        let heat = [0.0, 1.0, 2.0];
+        let mut set = SlotSet::new(3, 1);
+        let Start::Slot(swap) = set.start_read(1, Want::Guess, 1, &heat) else { panic!() };
+        assert_eq!(set.start_read(1, Want::Guess, 1, &heat), Start::Loading);
+        assert_eq!(set.start_read(2, Want::Demand, 1, &heat), Start::NoRoom);
+        set.abort(&swap);
+        assert!(matches!(set.start_read(2, Want::Demand, 1, &heat), Start::Slot(_)));
+        // A tier with no slots has no room, whatever is asked.
+        let mut none = SlotSet::new(3, 0);
+        assert_eq!(none.start_read(1, Want::Demand, 1, &heat), Start::NoRoom);
+    }
+
+    #[test]
+    fn slots_are_given_back_empty_first_then_the_coldest_and_the_needed_last() {
+        //                 expert: 0    1    2    3
+        let heat = [0.0, 9.0, 1.0, 4.0];
+        let mut set = SlotSet::new(4, 5);
+        read(&mut set, 1, Want::Demand, 1, &heat).unwrap(); // slot 0
+        read(&mut set, 2, Want::Demand, 1, &heat).unwrap(); // slot 1
+        let Start::Slot(loading) = set.start_read(3, Want::Demand, 1, &heat) else { panic!() };
+        assert_eq!(loading.slot, 2);
+        // Slots 3 and 4 are empty. Step 2 needs the cold expert 2 only.
+        set.routed(&[2], 2);
+
+        let given = set.give_back(2, 2, &heat);
+        assert_eq!(
+            given,
+            [Given { slot: 4, evicted: None }, Given { slot: 3, evicted: None }],
+            "empty slots go first, the highest numbers first"
+        );
+        assert_eq!(set.n_slots(), 3);
+        // Expert 1 is hot but the step does not need it; expert 2 is cold but needed.
+        assert_eq!(set.give_back(1, 2, &heat), [Given { slot: 0, evicted: Some(1) }]);
+        assert!(!set.contains(1), "the expert is gone at once");
+        // The slot that is loading stays, so fewer than asked come back.
+        assert_eq!(set.give_back(5, 2, &heat), [Given { slot: 1, evicted: Some(2) }]);
+        assert_eq!(set.n_slots(), 1);
+        assert!(set.give_back(1, 2, &heat).is_empty());
+
+        // Slots come back lowest number first, then new numbers are added.
+        assert_eq!(set.take(2), [0, 1]);
+        assert_eq!(set.take(3), [3, 4, 5]);
+        assert_eq!(set.take(0), [] as [u32; 0]);
+        assert_eq!(set.n_slots(), 6);
+        set.commit(&loading);
+        assert!(set.contains(3));
+        // A taken slot is empty and gets used.
+        let Start::Slot(swap) = set.start_read(1, Want::Demand, 3, &heat) else { panic!() };
+        assert_eq!(swap, Swap { slot: 0, evict: None, load: 1 });
+    }
+
+    #[test]
+    fn an_election_skips_slots_given_back_and_competes_with_unused_guesses_as_worth_nothing() {
+        //                 expert: 0     1     2     3
+        let heat = [10.0, 12.0, 9.0, 0.0];
+        let rule = SwapRule::default();
+        let mut set = SlotSet::new(4, 3);
+        read(&mut set, 0, Want::Demand, 1, &heat).unwrap();
+        read(&mut set, 1, Want::Guess, 1, &heat).unwrap();
+        assert_eq!(set.give_back(1, 2, &heat), [Given { slot: 2, evicted: None }]);
+
+        // Expert 2 (9) is not hot enough to replace expert 0 (10) ...
+        // ... but expert 1 is an unused guess and worth nothing.
+        let swaps = set.elect(&heat, &rule);
+        assert_eq!(swaps, [Swap { slot: 1, evict: Some(1), load: 2 }]);
+        assert_eq!(set.n_slots(), 2, "no election fills a slot that was given back");
     }
 }
