@@ -627,8 +627,7 @@ fn run_device_passes(
     let kernels = Kernels::load(device)?;
     let stream = Stream::new(device, 0)?;
     // More rows than a decode kernel takes go to the tensor-core kernels.
-    let path: Option<PrefillPath> =
-        if n_rows > MAX_BATCH { Some(kernels.prefill_path(precision)?) } else { None };
+    let prefill = n_rows > MAX_BATCH;
 
     // Random activations and their prepared form, per input width.
     let mut rng = 0x9e3779b97f4a7c15u64;
@@ -643,9 +642,12 @@ fn run_device_passes(
         let x: Vec<u8> = (0..n_in * u64::from(n_rows)).flat_map(|_| next().to_le_bytes()).collect();
         let dx = DeviceBuffer::new(device, x.len() as u64)?;
         dx.write(0, &x)?;
-        let bytes = match path {
-            Some(path) => Kernels::prefill_activation_bytes(path, n_in as u32, n_rows),
-            None => Kernels::quantized_activation_bytes(n_in as u32, n_rows),
+        // The prefill path of a matrix depends on its type: room for either format.
+        let bytes = if prefill {
+            Kernels::prefill_activation_bytes(PrefillPath::Int8, n_in as u32, n_rows)
+                .max(Kernels::prefill_activation_bytes(PrefillPath::F16Flush, n_in as u32, n_rows))
+        } else {
+            Kernels::quantized_activation_bytes(n_in as u32, n_rows)
         };
         inputs.insert(n_in, (dx, DeviceBuffer::new(device, bytes)?));
     }
@@ -659,7 +661,7 @@ fn run_device_passes(
         device,
         Kernels::quantized_activation_bytes(head_width.unwrap_or(32) as u32, 1),
     )?;
-    let is_head = |name: &str| path.is_some() && name == HEAD;
+    let is_head = |name: &str| prefill && name == HEAD;
     let max_out = slices
         .iter()
         .map(|s| &gguf.tensors()[s.tensor])
@@ -679,10 +681,15 @@ fn run_device_passes(
         if let Some((start, _)) = timed {
             start.record(&stream)?;
         }
-        let mut quantized: Option<(Option<String>, u64)> = None;
+        let mut quantized: Option<(Option<String>, u64, Option<PrefillPath>)> = None;
         for s in slices {
             let t = &gguf.tensors()[s.tensor];
             let n_in = t.dims.get(0);
+            // A type with no tensor-core kernel (the float matrices of the recurrent layers,
+            // 4 to 10240 values wide) is left out of a prefill pass: it is a few MB.
+            if prefill && !Kernels::has_prefill_matmul(t.ty) {
+                continue;
+            }
             let (dx, dq) = &inputs[&n_in];
             let w: DevicePtr = weights.ptr().offset(s.offset);
             if is_head(&t.name) {
@@ -709,7 +716,9 @@ fn run_device_passes(
                 }
                 continue;
             }
-            let key = (layer_of(&t.name), n_in);
+            let path: Option<PrefillPath> =
+                if prefill { Some(kernels.prefill_path_for(t.ty, precision)?) } else { None };
+            let key = (layer_of(&t.name), n_in, path);
             if quantized.as_ref() != Some(&key) {
                 // SAFETY: both buffers were sized for this width and batch above.
                 unsafe {

@@ -31,7 +31,7 @@ use ares_cuda::{Device, DeviceBuffer, DevicePtr, Kernels, MAX_BATCH, Stream, Wai
 /// The types with a fast kernel, and the byte offsets of the f16 fields of a
 /// block that must be finite for the test data to be meaningful (everything
 /// else in a block may be any bytes).
-const TYPES: [(GgmlType, &[usize]); 11] = [
+const TYPES: [(GgmlType, &[usize]); 28] = [
     (GgmlType::Q4_K, &[0, 2]),
     (GgmlType::Q5_K, &[0, 2]),
     (GgmlType::Q6_K, &[208]),
@@ -43,7 +43,62 @@ const TYPES: [(GgmlType, &[usize]); 11] = [
     (GgmlType::IQ2_S, &[0]),
     (GgmlType::IQ2_XS, &[0]),
     (GgmlType::Q8_0, &[0]),
+    // The types of the second round. The float types and the three whose scales are
+    // not plain f16 fields (IQ1_M, MXFP4, NVFP4) are made by `random_blocks`.
+    (GgmlType::F32, &[]),
+    (GgmlType::F16, &[]),
+    (GgmlType::BF16, &[]),
+    (GgmlType::Q4_0, &[0]),
+    (GgmlType::Q4_1, &[0, 2]),
+    (GgmlType::Q5_0, &[0]),
+    (GgmlType::Q5_1, &[0, 2]),
+    (GgmlType::Q2_K, &[80, 82]),
+    (GgmlType::IQ1_S, &[0]),
+    (GgmlType::IQ1_M, &[]),
+    (GgmlType::IQ2_XXS, &[0]),
+    (GgmlType::TQ1_0, &[52]),
+    (GgmlType::TQ2_0, &[64]),
+    (GgmlType::MXFP4, &[]),
+    (GgmlType::NVFP4, &[]),
+    (GgmlType::Q1_0, &[0]),
+    (GgmlType::Q2_0, &[0]),
 ];
+
+/// The types whose weights are floats: their kernels multiply the activations exactly.
+fn is_float(ty: GgmlType) -> bool {
+    matches!(ty, GgmlType::F32 | GgmlType::F16 | GgmlType::BF16)
+}
+
+/// The shapes `(n_in, n_out, n_batch)` a type is tested on: its smallest matrix (one
+/// block), one row, row counts that do not fill a thread block of 8 rows, a row
+/// longer than a warp's iteration, many thread blocks, every batch size. The float
+/// types have no blocks; theirs include row lengths that are not a multiple of 8,
+/// whose rows are not 16-byte aligned.
+fn shapes_for(ty: GgmlType) -> Vec<(usize, usize, usize)> {
+    if is_float(ty) {
+        return vec![
+            (1, 3, 1),
+            (3, 5, 2),
+            (8, 7, 3),
+            (100, 9, 4),
+            (1000, 33, 1),
+            (4100, 17, 8),
+            (5120, 20, 5),
+            (1024, 3000, 3),
+        ];
+    }
+    let bv = ty.block_values() as usize;
+    vec![
+        (bv, 1, 1),
+        (bv, 3, 8),
+        (bv * 5, 13, 4),
+        (bv * 20, 33, 1),
+        (bv * 20, 9, 7),
+        (if bv == 256 { 17408 } else { 4096 }, 17, 2),
+        // Many thread blocks.
+        (bv * 4, 3000, 3),
+    ]
+}
 
 fn gpus() -> Option<&'static [Device]> {
     static DEVICES: OnceLock<Option<Vec<Device>>> = OnceLock::new();
@@ -99,15 +154,49 @@ fn read_f32(buffer: &DeviceBuffer, n: usize) -> Vec<f32> {
 /// `n_blocks` blocks of `ty` of random bytes, with finite f16 scales of both
 /// signs (any other bytes are valid in every one of these types).
 fn random_blocks(rng: &mut Rng, ty: GgmlType, n_blocks: usize) -> Vec<u8> {
+    if is_float(ty) {
+        // n_blocks values (a block of a float type is one value), of both signs
+        let mut bytes = Vec::with_capacity(n_blocks * ty.block_bytes() as usize);
+        for _ in 0..n_blocks {
+            let v = rng.unit() * 2.0;
+            match ty {
+                GgmlType::F32 => bytes.extend_from_slice(&v.to_le_bytes()),
+                GgmlType::F16 => bytes.extend_from_slice(&ares_quant::f32_to_f16(v).to_le_bytes()),
+                _ => bytes.extend_from_slice(&ares_quant::f32_to_bf16(v).to_le_bytes()),
+            }
+        }
+        return bytes;
+    }
     let (_, scales) = TYPES.iter().find(|(t, _)| *t == ty).unwrap();
     let block = ty.block_bytes() as usize;
     let mut bytes: Vec<u8> = (0..n_blocks * block).map(|_| (rng.next() >> 32) as u8).collect();
     for b in 0..n_blocks {
+        let blk = &mut bytes[b * block..(b + 1) * block];
         for &offset in *scales {
             let scale = (0.002 + 0.02 * (rng.unit() * 0.5 + 0.5))
                 * if rng.next().is_multiple_of(4) { -1.0 } else { 1.0 };
-            let at = b * block + offset;
-            bytes[at..at + 2].copy_from_slice(&ares_quant::f32_to_f16(scale).to_le_bytes());
+            blk[offset..offset + 2].copy_from_slice(&ares_quant::f32_to_f16(scale).to_le_bytes());
+        }
+        match ty {
+            // The f16 d is spread over the top nibbles of the four u16 of the scales.
+            GgmlType::IQ1_M => {
+                let d = ares_quant::f32_to_f16(0.002 + 0.02 * (rng.unit() * 0.5 + 0.5));
+                for i in 0..4 {
+                    let at = 48 + 2 * i;
+                    let word = u16::from_le_bytes([blk[at], blk[at + 1]]);
+                    let word = (word & 0x0FFF) | (((d >> (4 * i)) & 0xF) << 12);
+                    blk[at..at + 2].copy_from_slice(&word.to_le_bytes());
+                }
+            }
+            // An E8M0 exponent around 1 (2^-9 to 2^10), not the huge ones.
+            GgmlType::MXFP4 => blk[0] = 118 + (rng.next() % 20) as u8,
+            // Four UE4M3 scales of exponent 3..10, never the NaN code.
+            GgmlType::NVFP4 => {
+                for byte in blk.iter_mut().take(4) {
+                    *byte = ((3 + rng.next() % 8) << 3 | (rng.next() % 8)) as u8;
+                }
+            }
+            _ => {}
         }
     }
     bytes
@@ -220,7 +309,12 @@ fn check_matvec(
             let (mut emulated, mut magnitude, mut exact, mut squares) = (0f64, 0f64, 0f64, 0f64);
             for (k, weight) in row.iter().enumerate() {
                 let w = f64::from(*weight);
-                let xq = f64::from(pairs[k / 32].0) * f64::from(codes[k]);
+                // The float types multiply the activations as they are.
+                let xq = if is_float(ty) {
+                    f64::from(xb[k])
+                } else {
+                    f64::from(pairs[k / 32].0) * f64::from(codes[k])
+                };
                 emulated += w * xq;
                 magnitude += (w * xq).abs();
                 exact += w * f64::from(xb[k]);
@@ -304,16 +398,7 @@ fn fast_matvec_computes_the_dequantized_product_on_every_type() {
         let kernels = Kernels::load(device).unwrap();
         for (ty, _) in TYPES {
             let bv = ty.block_values() as usize;
-            let shapes = [
-                (bv, 1, 1),
-                (bv, 3, 8),
-                (bv * 5, 13, 4),
-                (bv * 20, 33, 1),
-                (bv * 20, 9, 7),
-                (if bv == 256 { 17408 } else { 4096 }, 17, 2),
-                // Many thread blocks.
-                (bv * 4, 3000, 3),
-            ];
+            let shapes = shapes_for(ty);
             for (n_in, n_out, n_batch) in shapes {
                 let w = random_blocks(&mut rng, ty, n_in / bv * n_out);
                 let x: Vec<f32> = (0..n_in * n_batch).map(|_| rng.activation()).collect();
@@ -332,8 +417,10 @@ fn fast_matvec_computes_the_dequantized_product_on_every_type() {
                 // activations (it is a statistic over many sums), so only shapes with
                 // enough of them are held to the loose bound.
                 if n_out * n_batch >= 16 {
+                    // (a float type has nothing to quantize: its bound is f32 rounding)
+                    let bound = if is_float(ty) { 1e-5 } else { 0.03 };
                     assert!(
-                        dev.loose_scaled < 0.03,
+                        dev.loose_scaled < bound,
                         "{ty} {n_out}x{n_in} x{n_batch}: far from the f32 product: {}",
                         dev.describe()
                     );
@@ -344,7 +431,7 @@ fn fast_matvec_computes_the_dequantized_product_on_every_type() {
 }
 
 /// The same on real tensors: the smallest 2-D matrix of each fast type in the
-/// model, its first 512 rows, with activations of a normal distribution.
+/// model (of a 3-D tensor of experts, the first expert), its first 512 rows, with activations of a normal distribution.
 #[test]
 fn fast_matvec_on_real_tensors() {
     let Some(gpus) = gpus() else { return };
@@ -359,7 +446,7 @@ fn fast_matvec_on_real_tensors() {
         let Some(tensor) = gguf
             .tensors()
             .iter()
-            .filter(|t| t.ty == ty && t.dims.as_slice().len() == 2)
+            .filter(|t| t.ty == ty && matches!(t.dims.as_slice().len(), 2 | 3))
             .min_by_key(|t| t.size)
         else {
             continue;
@@ -479,7 +566,7 @@ fn bad_arguments_are_refused() {
     let p = buffer.ptr();
     let null = DevicePtr::NULL;
 
-    for ty in [GgmlType::F16, GgmlType::Q4_0, GgmlType::Q2_K, GgmlType::IQ1_S, GgmlType::MXFP4] {
+    for ty in [GgmlType::F64, GgmlType::I8, GgmlType::I32, GgmlType::Q8_1, GgmlType::Q8_K] {
         assert!(!Kernels::has_fast_matvec(ty));
         // SAFETY: refused before anything is launched.
         let error =
@@ -502,7 +589,7 @@ fn bad_arguments_are_refused() {
         assert!(kernels.matvec(&stream, GgmlType::Q4_K, p, p, p, 256, 1, MAX_BATCH + 1).is_err());
         assert!(kernels.quantize_activations(&stream, p, p, 256, 0).is_err());
         assert!(kernels.quantize_activations(&stream, p, p, 256, MAX_BATCH + 1).is_err());
-        assert!(kernels.quantize_activations(&stream, p, p, 48, 1).is_err());
+        assert!(kernels.quantize_activations(&stream, p, p, 0, 1).is_err());
         // Alignment: Q4_K needs 16 bytes of the weights, IQ4_XS 8, Q8_0 2; the activations 16.
         assert!(kernels.matvec(&stream, GgmlType::Q4_K, p.offset(8), p, p, 256, 1, 1).is_err());
         assert!(kernels.matvec(&stream, GgmlType::IQ4_XS, p.offset(4), p, p, 256, 1, 1).is_err());

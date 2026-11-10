@@ -48,6 +48,10 @@ const TYPES: [GgmlType; 11] = [
 enum Which {
     Int8,
     F16,
+    /// f16 with f16 accumulation flushed to f32 ([`PrefillPath::F16Flush`]).
+    F16Flush,
+    /// F16Flush over the rearranged form of the matrix (Q4_K only).
+    Rearranged,
     Decode,
 }
 
@@ -79,8 +83,10 @@ fn main() -> Result<()> {
                     .map(|p| match p {
                         "int8" => Which::Int8,
                         "f16" => Which::F16,
+                        "f16flush" => Which::F16Flush,
+                        "rearranged" => Which::Rearranged,
                         "decode" => Which::Decode,
-                        _ => panic!("--paths: int8, f16 or decode"),
+                        _ => panic!("--paths: int8, f16, f16flush, rearranged or decode"),
                     })
                     .collect();
             }
@@ -99,7 +105,7 @@ fn main() -> Result<()> {
             info.name,
             kernels.tensor_cores_full_rate()
         );
-        for path in [PrefillPath::Int8, PrefillPath::F16] {
+        for path in [PrefillPath::Int8, PrefillPath::F16, PrefillPath::F16Flush] {
             for shape in kernels.prefill_shapes(types[0], path)? {
                 println!(
                     "  {path:?} shape {}x{} rows of weights x activations, {} threads, {} B of shared memory (for {}), {} registers, {} block(s) per SM, up to {} rows",
@@ -162,6 +168,23 @@ fn time_type(
             Ok(buffer)
         })
         .collect::<Result<Vec<_>>>()?;
+    // The rearranged copies of the matrices, when asked for and the type has the form.
+    let rearranged = if paths.contains(&Which::Rearranged) && Kernels::has_rearranged_form(ty) {
+        let bytes = Kernels::rearranged_bytes(ty, N_OUT, N_IN).expect("has the form");
+        let buffers = weights
+            .iter()
+            .map(|w| {
+                let r = DeviceBuffer::new(device, bytes)?;
+                // SAFETY: whole matrices of `ty` and the size the function names.
+                unsafe { kernels.rearrange(stream, ty, w.ptr(), r.ptr(), N_OUT, N_IN)? };
+                Ok(r)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        stream.synchronize()?;
+        buffers
+    } else {
+        Vec::new()
+    };
     let max_rows = *rows.iter().max().unwrap_or(&1);
     let x = DeviceBuffer::new(device, u64::from(max_rows) * u64::from(N_IN) * 4)?;
     let y = DeviceBuffer::new(device, u64::from(max_rows) * u64::from(N_OUT) * 4)?;
@@ -175,10 +198,16 @@ fn time_type(
             if which == Which::Decode && n > 64 {
                 continue;
             }
+            if which == Which::Rearranged && rearranged.is_empty() {
+                continue;
+            }
             let ms = match which {
-                Which::Int8 | Which::F16 => {
-                    let path =
-                        if which == Which::Int8 { PrefillPath::Int8 } else { PrefillPath::F16 };
+                Which::Int8 | Which::F16 | Which::F16Flush | Which::Rearranged => {
+                    let path = match which {
+                        Which::Int8 => PrefillPath::Int8,
+                        Which::F16 => PrefillPath::F16,
+                        _ => PrefillPath::F16Flush,
+                    };
                     let act = DeviceBuffer::new(
                         device,
                         Kernels::prefill_activation_bytes(path, N_IN, n),
@@ -195,6 +224,22 @@ fn time_type(
                         )?
                     };
                     time(device, stream, &start, &end, |i| {
+                        if which == Which::Rearranged {
+                            // SAFETY: as above; the matrices were rearranged just before.
+                            return unsafe {
+                                kernels.matmul_rearranged(
+                                    stream,
+                                    ty,
+                                    path,
+                                    rearranged[i % copies].ptr(),
+                                    act.ptr(),
+                                    y.ptr(),
+                                    N_IN,
+                                    N_OUT,
+                                    n,
+                                )
+                            };
+                        }
                         // SAFETY: as above; the matrices are whole N_OUT x N_IN matrices of `ty`.
                         unsafe {
                             kernels.matmul(
@@ -247,6 +292,8 @@ fn time_type(
             let name = match which {
                 Which::Int8 => "int8",
                 Which::F16 => "f16",
+                Which::F16Flush => "f16h",
+                Which::Rearranged => "rearr",
                 Which::Decode => "decode",
             };
             let mark = match (which, fast) {

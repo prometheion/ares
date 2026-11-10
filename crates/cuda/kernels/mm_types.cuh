@@ -62,7 +62,7 @@ struct EngMmQ4K {
         Raw r;
         // The header is read by the four steps of the block: let it stay in L1.
         r.hdr = __ldg(reinterpret_cast<const uint4*>(blk));
-        r.qs = ares_ld_stream_v4(blk + 16 + 32 * (chunk & 3) + 16 * item);
+        r.qs = __ldg(reinterpret_cast<const uint4*>(blk + 16 + 32 * (chunk & 3) + 16 * item));
         return r;
     }
 

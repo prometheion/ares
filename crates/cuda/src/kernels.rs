@@ -38,10 +38,10 @@ const REDUCE_THREADS: u32 = 256;
 const MMVQ_THREADS: u32 = 128;
 const MMVQ_ROWS_PER_BLOCK: u32 = 8;
 
-/// The weight types that have a fast kernel (`kernels/mmvq_*.cuh`): the type,
+/// The weight types that have a decode kernel (`kernels/mmvq_*.cuh`): the type,
 /// the kernel's name in the module, and the alignment in bytes the kernel
 /// needs of the matrix (the widest load it uses).
-const FAST_TYPES: [(GgmlType, &str, u64); 11] = [
+const FAST_TYPES: [(GgmlType, &str, u64); 28] = [
     (GgmlType::Q4_K, "ares_mmvq_q4_K", 16),
     (GgmlType::Q5_K, "ares_mmvq_q5_K", 16),
     (GgmlType::Q6_K, "ares_mmvq_q6_K", 2),
@@ -53,7 +53,33 @@ const FAST_TYPES: [(GgmlType, &str, u64); 11] = [
     (GgmlType::IQ2_S, "ares_mmvq_iq2_s", 2),
     (GgmlType::IQ2_XS, "ares_mmvq_iq2_xs", 2),
     (GgmlType::Q8_0, "ares_mmvq_q8_0", 2),
+    (GgmlType::F32, "ares_mmvq_f32", 4),
+    (GgmlType::F16, "ares_mmvq_f16", 2),
+    (GgmlType::BF16, "ares_mmvq_bf16", 2),
+    (GgmlType::Q4_0, "ares_mmvq_q4_0", 2),
+    (GgmlType::Q4_1, "ares_mmvq_q4_1", 4),
+    (GgmlType::Q5_0, "ares_mmvq_q5_0", 2),
+    (GgmlType::Q5_1, "ares_mmvq_q5_1", 4),
+    (GgmlType::Q2_K, "ares_mmvq_q2_K", 4),
+    (GgmlType::IQ1_S, "ares_mmvq_iq1_s", 2),
+    (GgmlType::IQ1_M, "ares_mmvq_iq1_m", 8),
+    (GgmlType::IQ2_XXS, "ares_mmvq_iq2_xxs", 2),
+    (GgmlType::TQ1_0, "ares_mmvq_tq1_0", 2),
+    (GgmlType::TQ2_0, "ares_mmvq_tq2_0", 2),
+    (GgmlType::MXFP4, "ares_mmvq_mxfp4", 1),
+    (GgmlType::NVFP4, "ares_mmvq_nvfp4", 4),
+    (GgmlType::Q1_0, "ares_mmvq_q1_0", 2),
+    (GgmlType::Q2_0, "ares_mmvq_q2_0", 2),
 ];
+
+/// The decode types whose codebook is large (16 KiB: IQ1_S and IQ1_M). A thread
+/// block copies it once and then walks several tiles of rows, so their launches
+/// have fewer blocks than the matrix has tiles ([`DECODE_TABLE_BLOCKS_PER_SM`] per
+/// multiprocessor). The other codebooks (1 to 8 KiB) are cheap enough to copy
+/// for every tile, and a block per tile keeps more warps resident: persistent
+/// launches of those lost 10% of the speed of IQ2_XS and IQ3_S.
+const DECODE_TABLE_TYPES: [GgmlType; 2] = [GgmlType::IQ1_S, GgmlType::IQ1_M];
+const DECODE_TABLE_BLOCKS_PER_SM: u32 = 12;
 
 /// The weight types that have a prefill kernel (`kernels/mm_types.cuh`): the type,
 /// the kernels' name suffix (`ares_mm_{i8,i8m,i8s,f16,f16m,f16s}_<suffix>`), the
@@ -96,7 +122,7 @@ impl Shape {
     }
 }
 
-/// The shapes, `[int8, f16][large, medium, small]`, and the numbers of activation
+/// The shapes, `[int8, f16, f16 with f16 accumulation][large, medium, small]`, and the numbers of activation
 /// rows they take: up to [`MM_SMALL_ROWS`] the small one, up to [`MM_MEDIUM_ROWS`]
 /// the medium one, more the large one. The large shape is a block of 16 warps with
 /// the whole SM to itself, which is what lets the decoding of a weight tile be shared
@@ -104,7 +130,12 @@ impl Shape {
 /// to an SM, for the rows where there are not enough tiles to fill the large ones.
 const MM_SMALL_ROWS: u32 = 32;
 const MM_MEDIUM_ROWS: u32 = 64;
-const SHAPES: [[Shape; 3]; 2] = [
+const SHAPES: [[Shape; 3]; 3] = [
+    [
+        Shape { weight_rows: 128, batch_rows: 128, threads: 512 },
+        Shape { weight_rows: 64, batch_rows: 64, threads: 128 },
+        Shape { weight_rows: 64, batch_rows: 32, threads: 128 },
+    ],
     [
         Shape { weight_rows: 128, batch_rows: 128, threads: 512 },
         Shape { weight_rows: 64, batch_rows: 64, threads: 128 },
@@ -116,6 +147,7 @@ const SHAPES: [[Shape; 3]; 2] = [
         Shape { weight_rows: 64, batch_rows: 32, threads: 128 },
     ],
 ];
+
 /// The kernels' name part for each shape.
 const SHAPE_SUFFIX: [&str; 3] = ["", "m", "s"];
 /// What a launch gets without asking for more shared memory.
@@ -137,6 +169,10 @@ const DECODE_ROWS: [(GgmlType, u32); 11] = [
     (GgmlType::IQ2_XS, 12),
     (GgmlType::Q8_0, 8),
 ];
+
+/// The types for which [`PrefillPath::F16Flush`] is as fast as int8 on a capped card
+/// ([`Kernels::prefill_path_for`]).
+const FLUSH_AS_FAST: [GgmlType; 3] = [GgmlType::Q4_K, GgmlType::IQ2_S, GgmlType::IQ2_XS];
 
 /// The activation bytes the blocks that run together should be able to keep in
 /// L2: the grid is ordered in groups of activation tiles that take every weight
@@ -165,6 +201,14 @@ pub enum PrefillPath {
     /// activations: the direct product, which rounds nothing but the f16
     /// inputs.
     F16,
+    /// The f16 path with f16 accumulation, flushed to f32 every four `mma` (64
+    /// values of K): the same tiles and activations as [`PrefillPath::F16`], at
+    /// the rate GeForce cards give f16 accumulation (twice that of f32
+    /// accumulation). 0.04 % rms from the exact product on the test data, against
+    /// 1.1 % for [`PrefillPath::Int8`]. Partial sums are at most 64 products of a
+    /// weight and a value of magnitude below 1 (the activations are scaled per
+    /// row, see [`Kernels::prepare_prefill_activations`]), so they cannot overflow.
+    F16Flush,
 }
 
 /// How one shape of the prefill kernels runs on a device
@@ -191,17 +235,12 @@ pub struct PrefillShape {
 pub enum Precision {
     /// The path this device takes by default ([`Kernels::prefill_path`]): f16 where
     /// the tensor cores run it at full rate, since the direct product is then
-    /// both the more exact and, in principle, as fast, and int8 where they do
-    /// not (GeForce cards with the cap, where int8 is the faster of the two).
+    /// both the more exact and, in principle, as fast, and on GeForce cards with
+    /// the cap the fastest path per type ([`Kernels::prefill_path_for`]): int8, or
+    /// f16 with f16 accumulation where that is as fast.
     ///
     /// The rate of an uncapped card could not be measured on the machine the
-    /// kernels were written on (both its GPUs are capped). The f16 kernels were
-    /// timed with f16 accumulation instead, which runs at the rate an uncapped
-    /// card has for f32 accumulation: they take the same time as with f32
-    /// accumulation, so the cap is not what limits them, and int8 stays 20 to 30%
-    /// faster from 256 rows on (an RTX 4070, 17408 x 5120 Q4_K) while f16 is
-    /// about 10% faster at 64 rows. Whoever prefers speed on such a card
-    /// can take [`PrefillPath::Int8`] by choosing the path explicitly.
+    /// kernels were written on (both its GPUs are capped).
     #[default]
     Fast,
     /// Always the f16 path with f32 accumulation. More exact than int8, and on a
@@ -210,12 +249,31 @@ pub enum Precision {
     Exact,
 }
 
+/// The kernels over the rearranged form of Q4_K (`kernels/mmr.cuh`): the kernel
+/// that rearranges a matrix and the products with f16 and with f32 accumulation.
+#[derive(Debug, Clone)]
+struct RearrangedQ4k {
+    repack: Function,
+    flush: Function,
+    exact: Function,
+}
+
+/// The dynamic shared memory of the rearranged kernels: 3 stages of 128 activation
+/// rows of 64 f16 values, each row 16 bytes longer (`AresMmrLayout`).
+const MMR_SHARED: u32 = 3 * 128 * (64 * 2 + 16);
+/// The rows of weights and of activations one block of the rearranged kernels
+/// computes, and its threads.
+const MMR_ROWS: u32 = 128;
+const MMR_THREADS: u32 = 512;
+
 /// The kernels of the prefill module on one device.
 #[derive(Debug, Clone)]
 struct Prefill {
     /// Per type: the alignment, the bytes of its table and the kernels, indexed
     /// `[path][shape]`.
-    types: Vec<(GgmlType, u64, u32, [[Function; 3]; 2])>,
+    types: Vec<(GgmlType, u64, u32, [[Function; 3]; 3])>,
+    /// The kernels over the rearranged form of a Q4_K matrix.
+    rearranged: RearrangedQ4k,
     convert_f16: Function,
     /// Whether `mma` with f32 accumulation runs as fast as with f16
     /// accumulation (measured at load).
@@ -246,7 +304,7 @@ impl Prefill {
             .iter()
             .map(|(ty, suffix, align, table)| {
                 let mut paths = Vec::new();
-                for (path, (variant, elem)) in [("i8", 1u32), ("f16", 2u32)].into_iter().enumerate() {
+                for (path, (variant, elem)) in [("i8", 1u32), ("f16", 2u32), ("h", 2u32)].into_iter().enumerate() {
                     let mut shapes = Vec::new();
                     for (shape, part) in SHAPES[path].iter().zip(SHAPE_SUFFIX) {
                         let function =
@@ -267,12 +325,31 @@ impl Prefill {
                     }
                     paths.push(<[Function; 3]>::try_from(shapes).expect("three shapes"));
                 }
-                let kernels = <[[Function; 3]; 2]>::try_from(paths).expect("two paths");
+                let kernels = <[[Function; 3]; 3]>::try_from(paths).expect("three paths");
                 Ok((*ty, *align, *table, kernels))
             })
             .collect::<Result<Vec<_>>>()?;
+        let (flush, exact) =
+            (module.function("ares_mmr_h_q4_K")?, module.function("ares_mmr_f_q4_K")?);
+        if MMR_SHARED > limit {
+            return Err(Error::Invalid {
+                what: "prefill kernel",
+                detail: format!(
+                    "the rearranged kernels need {MMR_SHARED} bytes of shared memory per block, the device allows {limit}"
+                ),
+            });
+        }
+        if MMR_SHARED > DEFAULT_SHARED {
+            flush.allow_dynamic_shared(MMR_SHARED)?;
+            exact.allow_dynamic_shared(MMR_SHARED)?;
+        }
         Ok(Self {
             types,
+            rearranged: RearrangedQ4k {
+                repack: module.function("ares_repack_q4_K")?,
+                flush,
+                exact,
+            },
             convert_f16: module.function("ares_convert_f16")?,
             full_rate: probe_full_rate(device, &module)?,
         })
@@ -523,10 +600,13 @@ impl Kernels {
     /// The bytes that [`Kernels::quantize_activations`] writes for `n_batch`
     /// rows of `n_in` activations: the int8 values, then (from the next
     /// multiple of 16 bytes) one `(scale, sum)` pair of f32 per group of 32
-    /// values. See `kernels/quantize_act.cuh` for the format.
+    /// values, then (again from the next multiple of 16) the activations
+    /// themselves as f32, which the float weight types multiply exactly. See
+    /// `kernels/quantize_act.cuh` for the format.
     pub fn quantized_activation_bytes(n_in: u32, n_batch: u32) -> u64 {
         let values = u64::from(n_in) * u64::from(n_batch);
-        values.next_multiple_of(16) + values / 32 * 8
+        let pairs_end = values.next_multiple_of(16) + values.div_ceil(32) * 8;
+        pairs_end.next_multiple_of(16) + values * 4
     }
 
     /// Whether [`Kernels::matvec`] has a kernel for weights of type `ty`.
@@ -539,7 +619,9 @@ impl Kernels {
     /// serves every matrix that multiplies the same activations, whatever
     /// their types.
     ///
-    /// `n_in` must be a multiple of 32. `q` receives
+    /// The quantized weight types need `n_in` to be a multiple of their block (32 or
+    /// 256 values; [`Kernels::matvec`] checks it); the float types take any `n_in`.
+    /// `q` receives
     /// [`Kernels::quantized_activation_bytes`] bytes.
     ///
     /// # Safety
@@ -555,10 +637,10 @@ impl Kernels {
         n_in: u32,
         n_batch: u32,
     ) -> Result<()> {
-        if n_in == 0 || !n_in.is_multiple_of(32) {
+        if n_in == 0 {
             return Err(Error::Invalid {
                 what: "activation quantization",
-                detail: format!("{n_in} values per row are not a whole number of groups of 32"),
+                detail: "rows of 0 values".into(),
             });
         }
         check_batch(n_batch)?;
@@ -594,20 +676,28 @@ impl Kernels {
     /// that [`Kernels::quantize_activations`] has quantized into `q`. The
     /// weights are read once however many rows there are.
     ///
-    /// This is the decode kernel: it computes with integer dot products over
-    /// the quantized activations, so its results differ slightly from the
-    /// exact f32 kernel ([`Kernels::matvec_q4_k`] for Q4_K, which stays the
-    /// reference). A type without a fast kernel (see
-    /// [`Kernels::has_fast_matvec`]) is refused with an error.
+    /// This is the decode kernel, for every weight type a GGUF file can carry
+    /// except the integer and double types and the activation formats Q8_1 and
+    /// Q8_K. The quantized types compute with integer dot products over the
+    /// quantized activations, so their results differ from the exact product by
+    /// about 1% rms (the rounding of the activations; the weights are exact);
+    /// the float types (F32, F16, BF16) multiply the activations as they are, and
+    /// differ from it by f32 rounding only. The exact f32 kernel
+    /// ([`Kernels::matvec_q4_k`] for Q4_K) stays the reference for Q4_K. A type
+    /// without a fast kernel (see [`Kernels::has_fast_matvec`]) is refused with
+    /// an error.
     ///
     /// # Safety
     ///
     /// On the stream's device and alive until the launch has run: `w` must
     /// address the matrix as GGUF stores it (`n_out` rows of `n_in` values in
     /// whole blocks of `ty`), aligned to 16 bytes for Q4_K and Q5_K, to 8 for
-    /// IQ4_XS and to 2 for the other types (checked); `q` the quantized
-    /// activations of this `n_in` and `n_batch`, 16-byte aligned (checked);
-    /// `y` `n_batch * n_out` f32 values. `y` must not overlap the inputs.
+    /// IQ4_XS and IQ1_M, to 4 for F32, Q4_1, Q5_1, Q2_K and NVFP4, to 1 for MXFP4
+    /// and to 2 for the other types (checked); `q` the quantized activations of
+    /// this `n_in` and `n_batch`, 16-byte aligned (checked); `y`
+    /// `n_batch * n_out` f32 values. `y` must not overlap the inputs. A matrix of
+    /// MXFP4 (17-byte blocks) is read in aligned words, so the word that holds its
+    /// last byte may reach up to 3 bytes past the matrix.
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn matvec(
         &self,
@@ -644,18 +734,16 @@ impl Kernels {
         }
         check_alignment("weight matrix", w, *align)?;
         check_alignment("quantized activations", q, 16)?;
+        let tiles = n_out.div_ceil(MMVQ_ROWS_PER_BLOCK);
+        let blocks = if DECODE_TABLE_TYPES.contains(&ty) {
+            tiles.min(DECODE_TABLE_BLOCKS_PER_SM * self.device.info().multiprocessors)
+        } else {
+            tiles
+        };
         let args = Args::new().ptr(w).ptr(q).ptr(y).u32(n_in).u32(n_out).u32(n_batch);
         // SAFETY: the argument list matches the ares_mmvq_* kernels; the ranges are the
         // caller's guarantee.
-        unsafe {
-            function.launch(
-                stream,
-                [n_out.div_ceil(MMVQ_ROWS_PER_BLOCK), 1, 1],
-                [MMVQ_THREADS, 1, 1],
-                0,
-                args,
-            )
-        }
+        unsafe { function.launch(stream, [blocks, 1, 1], [MMVQ_THREADS, 1, 1], 0, args) }
     }
 
     /// Whether the tensor cores of this device run f16 `mma` with f32
@@ -726,6 +814,24 @@ impl Kernels {
         })
     }
 
+    /// The path to use for a matrix of `ty` under `precision`: [`Kernels::prefill_path`],
+    /// except that on a capped card [`Precision::Fast`] takes [`PrefillPath::F16Flush`]
+    /// for the types where it is not slower than int8 (measured at 1024 rows on an RTX
+    /// 4070 and an RTX 3060: Q4_K 1.04 and 1.02 times, IQ2_S 1.18 and 1.05, IQ2_XS
+    /// 1.08 and 1.06; for the others 0.74 to 0.91): the same speed with 0.05 % instead
+    /// of 1.1 % rms error. The activations are prepared per path
+    /// ([`Kernels::prepare_prefill_activations`]), so a caller with matrices of several
+    /// types prepares an input in each format it uses.
+    pub fn prefill_path_for(&self, ty: GgmlType, precision: Precision) -> Result<PrefillPath> {
+        let path = self.prefill_path(precision)?;
+        Ok(match (precision, path) {
+            (Precision::Fast, PrefillPath::Int8) if FLUSH_AS_FAST.contains(&ty) => {
+                PrefillPath::F16Flush
+            }
+            _ => path,
+        })
+    }
+
     fn prefill_kernels(&self) -> Result<&Prefill> {
         self.prefill.as_ref().ok_or_else(|| Error::Invalid {
             what: "prefill kernel",
@@ -752,6 +858,7 @@ impl Kernels {
         let (path_index, elem) = match path {
             PrefillPath::Int8 => (0, 1),
             PrefillPath::F16 => (1, 2),
+            PrefillPath::F16Flush => (2, 2),
         };
         let up_to = [u32::MAX, MM_MEDIUM_ROWS, MM_SMALL_ROWS];
         (0..3)
@@ -779,7 +886,12 @@ impl Kernels {
     pub fn prefill_activation_bytes(path: PrefillPath, n_in: u32, n_rows: u32) -> u64 {
         match path {
             PrefillPath::Int8 => Self::quantized_activation_bytes(n_in, n_rows),
-            PrefillPath::F16 => u64::from(n_in) * u64::from(n_rows) * 2,
+            PrefillPath::F16 | PrefillPath::F16Flush => {
+                let values = u64::from(n_in) * u64::from(n_rows) * 2;
+                // The f16 values, then at the next multiple of 16 bytes one f32 per row:
+                // the power of two the row was divided by.
+                values.next_multiple_of(16) + 4 * u64::from(n_rows)
+            }
         }
     }
 
@@ -818,24 +930,16 @@ impl Kernels {
         match path {
             // SAFETY: the caller's guarantee is the one of the function it forwards to.
             PrefillPath::Int8 => unsafe { self.quantize_rows(stream, x, out, n_in, n_rows) },
-            PrefillPath::F16 => {
+            PrefillPath::F16 | PrefillPath::F16Flush => {
                 check_alignment("prefill activations", out, 16)?;
-                let n_values = n_in.checked_mul(n_rows).ok_or(Error::Invalid {
+                n_in.checked_mul(n_rows).ok_or(Error::Invalid {
                     what: "prefill activations",
                     detail: "size overflows u32".into(),
                 })?;
-                let args = Args::new().ptr(x).ptr(out).u32(n_values);
+                let args = Args::new().ptr(x).ptr(out).u32(n_in).u32(n_rows);
                 // SAFETY: the argument list matches ares_convert_f16; the ranges are the
                 // caller's guarantee.
-                unsafe {
-                    prefill.convert_f16.launch(
-                        stream,
-                        [n_values.div_ceil(256), 1, 1],
-                        [256, 1, 1],
-                        0,
-                        args,
-                    )
-                }
+                unsafe { prefill.convert_f16.launch(stream, [n_rows, 1, 1], [256, 1, 1], 0, args) }
             }
         }
     }
@@ -849,10 +953,11 @@ impl Kernels {
     /// `kernels/mm.cuh`). It is faster than the decode kernels
     /// ([`Kernels::matvec`]) from [`Kernels::decode_kernel_rows`] + 1 rows on.
     ///
-    /// Both paths accumulate in f32 and agree with the decode kernels up to the
+    /// Int8 and f16 accumulate in f32 and agree with the decode kernels up to the
     /// rounding of what they compute with: int8 with the decode kernels'
     /// quantization of the activations, f16 with the rounding of weights and
-    /// activations to f16. A type without a prefill kernel is refused with an
+    /// activations to f16; [`PrefillPath::F16Flush`] also rounds partial sums of
+    /// 64 products to f16. A type without a prefill kernel is refused with an
     /// error, as is a device below compute capability 8.0.
     ///
     /// # Safety
@@ -910,6 +1015,7 @@ impl Kernels {
         let (path_index, elem, act_row_bytes) = match path {
             PrefillPath::Int8 => (0, 1, u64::from(n_in) * 9 / 8),
             PrefillPath::F16 => (1, 2, u64::from(n_in) * 2),
+            PrefillPath::F16Flush => (2, 2, u64::from(n_in) * 2),
         };
         let shape = shape_index(n_rows);
         let (shape_info, function) = (SHAPES[path_index][shape], &kernels[path_index][shape]);
@@ -939,6 +1045,159 @@ impl Kernels {
         // SAFETY: the argument list matches the ares_mm_* kernels; the ranges are the
         // caller's guarantee.
         unsafe { function.launch(stream, [blocks, 1, 1], [threads, 1, 1], shared, args) }
+    }
+}
+
+impl Kernels {
+    /// Whether matrices of `ty` have a rearranged form ([`Kernels::rearrange`]).
+    pub fn has_rearranged_form(ty: GgmlType) -> bool {
+        ty == GgmlType::Q4_K
+    }
+
+    /// The bytes of the rearranged form of a matrix of `ty` with `n_out` rows and
+    /// `n_in` columns: the bytes of the file's form, with the rows rounded up to a
+    /// multiple of 16 (at most 15 rows more). `None` for a type without one.
+    pub fn rearranged_bytes(ty: GgmlType, n_out: u32, n_in: u32) -> Option<u64> {
+        Self::has_rearranged_form(ty)
+            .then(|| u64::from(n_out.next_multiple_of(16)) * (u64::from(n_in) / 256) * 144)
+    }
+
+    /// Rearranges a matrix from the file's form into the one the kernels of
+    /// [`Kernels::matmul_rearranged`] read: codes in the order the tensor cores
+    /// take them, one 16-byte load per lane and 64 values of K, and the block
+    /// headers of 16 rows together (`kernels/mmr.cuh`). Done once when the matrix
+    /// is uploaded: 0.3 ms for a 17408 x 5120 matrix on an RTX 4070. A matrix in
+    /// this form is no longer one the decode kernels or the other prefill kernels
+    /// read.
+    ///
+    /// # Safety
+    ///
+    /// On the stream's device and alive until the launch has run: `src` addresses
+    /// the matrix as GGUF stores it, `dst` [`Kernels::rearranged_bytes`] bytes,
+    /// 16-byte aligned (checked), not overlapping `src`.
+    pub unsafe fn rearrange(
+        &self,
+        stream: &Stream,
+        ty: GgmlType,
+        src: DevicePtr,
+        dst: DevicePtr,
+        n_out: u32,
+        n_in: u32,
+    ) -> Result<()> {
+        let prefill = self.prefill_kernels()?;
+        if !Self::has_rearranged_form(ty) {
+            return Err(Error::Invalid {
+                what: "rearranged form",
+                detail: format!("{ty} has none"),
+            });
+        }
+        if n_in == 0 || !n_in.is_multiple_of(256) {
+            return Err(Error::Invalid {
+                what: "weight matrix",
+                detail: format!(
+                    "{n_in} columns are not a whole number of {ty} blocks of 256 values"
+                ),
+            });
+        }
+        if n_out == 0 {
+            return Ok(());
+        }
+        check_alignment("weight matrix", src, 16)?;
+        check_alignment("rearranged matrix", dst, 16)?;
+        let tiles = u64::from(n_out.div_ceil(16));
+        let threads = tiles * (u64::from(n_in) / 64) * 32 + tiles * (u64::from(n_in) / 256) * 16;
+        let blocks = u32::try_from(threads.div_ceil(256)).map_err(|_| Error::Invalid {
+            what: "rearranged form",
+            detail: format!("{n_out} x {n_in} needs more blocks than a grid has"),
+        })?;
+        let args = Args::new().ptr(src).ptr(dst).u32(n_out).u32(n_in);
+        // SAFETY: the argument list matches ares_repack_q4_K; the ranges are the caller's.
+        unsafe { prefill.rearranged.repack.launch(stream, [blocks, 1, 1], [256, 1, 1], 0, args) }
+    }
+
+    /// `y[b] = W x[b]` like [`Kernels::matmul`], for a matrix in the rearranged form
+    /// ([`Kernels::rearrange`]), which the kernel decodes in registers: no tile of
+    /// weights passes through shared memory, so the loads are whole lines. Only
+    /// the f16 paths ([`PrefillPath::F16`] with f32 accumulation,
+    /// [`PrefillPath::F16Flush`] with f16 accumulation flushed to f32); the
+    /// activations are those of [`Kernels::prepare_prefill_activations`] for the
+    /// path. Fastest from about a hundred rows on.
+    ///
+    /// # Safety
+    ///
+    /// On the stream's device and alive until the launch has run: `w` the
+    /// rearranged matrix (16-byte aligned, checked), `act` the prepared activations
+    /// (16-byte aligned, checked), `y` `n_rows * n_out` f32 values, not overlapping
+    /// the inputs.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn matmul_rearranged(
+        &self,
+        stream: &Stream,
+        ty: GgmlType,
+        path: PrefillPath,
+        w: DevicePtr,
+        act: DevicePtr,
+        y: DevicePtr,
+        n_in: u32,
+        n_out: u32,
+        n_rows: u32,
+    ) -> Result<()> {
+        let prefill = self.prefill_kernels()?;
+        if !Self::has_rearranged_form(ty) {
+            return Err(Error::Invalid {
+                what: "rearranged form",
+                detail: format!("{ty} has none"),
+            });
+        }
+        let function = match path {
+            PrefillPath::F16 => &prefill.rearranged.exact,
+            PrefillPath::F16Flush => &prefill.rearranged.flush,
+            PrefillPath::Int8 => {
+                return Err(Error::Invalid {
+                    what: "rearranged form",
+                    detail: "the rearranged kernels take f16 activations".into(),
+                });
+            }
+        };
+        if n_in == 0
+            || !n_in.is_multiple_of(256)
+            || n_rows == 0
+            || n_in.checked_mul(n_rows).is_none()
+        {
+            return Err(Error::Invalid {
+                what: "prefill kernel batch",
+                detail: format!(
+                    "{n_rows} rows of {n_in} values: not whole blocks of 256, empty or too many"
+                ),
+            });
+        }
+        if n_out == 0 {
+            return Ok(());
+        }
+        check_alignment("rearranged matrix", w, 16)?;
+        check_alignment("prepared activations", act, 16)?;
+        let n_weight_tiles = n_out.div_ceil(MMR_ROWS);
+        let n_batch_tiles = n_rows.div_ceil(MMR_ROWS);
+        let group = (MM_GROUP_BYTES / (u64::from(MMR_ROWS) * u64::from(n_in) * 2))
+            .clamp(MM_GROUP_MIN, MM_GROUP_MAX);
+        let group = u32::try_from(group).unwrap_or(2).min(n_batch_tiles);
+        // A group that divides the tiles keeps every wave of blocks on whole groups.
+        let group = (1..=group)
+            .rev()
+            .find(|g| n_batch_tiles.is_multiple_of(*g))
+            .filter(|g| *g * 2 > group)
+            .unwrap_or(group);
+        let blocks =
+            u32::try_from(u64::from(n_weight_tiles) * u64::from(n_batch_tiles)).map_err(|_| {
+                Error::Invalid {
+                    what: "prefill kernel batch",
+                    detail: format!("{n_out} x {n_rows} needs more blocks than a grid has"),
+                }
+            })?;
+        let args = Args::new().ptr(w).ptr(act).ptr(y).u32(n_in).u32(n_out).u32(n_rows).u32(group);
+        // SAFETY: the argument list matches the ares_mmr_* kernels; the ranges are the
+        // caller's guarantee.
+        unsafe { function.launch(stream, [blocks, 1, 1], [MMR_THREADS, 1, 1], MMR_SHARED, args) }
     }
 }
 

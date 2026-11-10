@@ -25,69 +25,86 @@ const N_IN: u32 = 5120;
 const N_OUT: u32 = 17408;
 
 fn main() -> Result<()> {
+    // Optional arguments: a device ordinal, and a list of type names ("q4_K,f16"); with
+    // the list the f32 baseline is skipped.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let only_device: Option<u32> = args.first().and_then(|a| a.parse().ok());
+    let only_types: Option<Vec<&str>> = args.get(1).map(|a| a.split(',').collect());
     for info in devices()? {
+        if only_device.is_some_and(|d| d != info.ordinal) {
+            continue;
+        }
         let device = Device::open(info.ordinal, Wait::Spin)?;
         let kernels = Kernels::load(&device)?;
         let stream = Stream::new(&device, 0)?;
-        let w_bytes = u64::from(N_OUT) * u64::from(N_IN / 256) * 144;
-        let w = DeviceBuffer::new(&device, w_bytes)?;
-        let x = DeviceBuffer::new(&device, 8 * u64::from(N_IN) * 4)?;
-        let scratch = DeviceBuffer::new(&device, 8 * u64::from(N_IN / 32) * 4)?;
-        let y = DeviceBuffer::new(&device, 8 * u64::from(N_OUT) * 4)?;
-        // Any bytes are a valid Q4_K matrix for timing; the scales stay finite.
-        // SAFETY: whole buffers on this device.
-        unsafe {
-            stream.fill(w.ptr(), 0x11, w_bytes as usize)?;
-            stream.fill(x.ptr(), 0, 8 * N_IN as usize * 4)?;
-        }
-        stream.synchronize()?;
-
-        println!(
-            "CUDA{} {}: {N_OUT} x {N_IN} Q4_K, {:.1} MiB",
-            info.ordinal,
-            info.name,
-            w_bytes as f64 / (1 << 20) as f64
-        );
-        for n_batch in [1u32, 2, 4, 8] {
-            let mut times = Vec::new();
-            for _ in 0..60 {
-                let start = Instant::now();
-                // SAFETY: the buffers were sized for 8 activation rows above.
-                unsafe {
-                    kernels.matvec_q4_k(
-                        &stream,
-                        w.ptr(),
-                        x.ptr(),
-                        scratch.ptr(),
-                        y.ptr(),
-                        N_IN,
-                        N_OUT,
-                        n_batch,
-                    )?;
-                }
-                stream.synchronize()?;
-                times.push(start.elapsed().as_secs_f64());
+        'baseline: {
+            if only_types.is_some() {
+                break 'baseline;
             }
-            let mut times = times.split_off(10);
-            times.sort_by(f64::total_cmp);
-            let median = times[times.len() / 2];
+            let w_bytes = u64::from(N_OUT) * u64::from(N_IN / 256) * 144;
+            let w = DeviceBuffer::new(&device, w_bytes)?;
+            let x = DeviceBuffer::new(&device, 8 * u64::from(N_IN) * 4)?;
+            let scratch = DeviceBuffer::new(&device, 8 * u64::from(N_IN / 32) * 4)?;
+            let y = DeviceBuffer::new(&device, 8 * u64::from(N_OUT) * 4)?;
+            // Any bytes are a valid Q4_K matrix for timing; the scales stay finite.
+            // SAFETY: whole buffers on this device.
+            unsafe {
+                stream.fill(w.ptr(), 0x11, w_bytes as usize)?;
+                stream.fill(x.ptr(), 0, 8 * N_IN as usize * 4)?;
+            }
+            stream.synchronize()?;
+
             println!(
-                "  {n_batch} row(s): {:>7.3} ms  {:>6.1} GB/s of weights",
-                median * 1e3,
-                w_bytes as f64 / median / 1e9
+                "CUDA{} {}: {N_OUT} x {N_IN} Q4_K, {:.1} MiB",
+                info.ordinal,
+                info.name,
+                w_bytes as f64 / (1 << 20) as f64
             );
+            for n_batch in [1u32, 2, 4, 8] {
+                let mut times = Vec::new();
+                for _ in 0..60 {
+                    let start = Instant::now();
+                    // SAFETY: the buffers were sized for 8 activation rows above.
+                    unsafe {
+                        kernels.matvec_q4_k(
+                            &stream,
+                            w.ptr(),
+                            x.ptr(),
+                            scratch.ptr(),
+                            y.ptr(),
+                            N_IN,
+                            N_OUT,
+                            n_batch,
+                        )?;
+                    }
+                    stream.synchronize()?;
+                    times.push(start.elapsed().as_secs_f64());
+                }
+                let mut times = times.split_off(10);
+                times.sort_by(f64::total_cmp);
+                let median = times[times.len() / 2];
+                println!(
+                    "  {n_batch} row(s): {:>7.3} ms  {:>6.1} GB/s of weights",
+                    median * 1e3,
+                    w_bytes as f64 / median / 1e9
+                );
+            }
         }
 
         println!("fast kernels, {N_OUT} x {N_IN} (median of 5 runs of {RUN} launches):");
         for ty in FAST_TYPES {
+            if only_types.as_ref().is_some_and(|names| !names.contains(&ty.name())) {
+                continue;
+            }
             time_fast(&device, &kernels, &stream, ty)?;
         }
     }
     Ok(())
 }
 
-/// The types with a fast kernel, in the order of their bytes in Qwen3.8-27B.
-const FAST_TYPES: [GgmlType; 11] = [
+/// The types with a fast kernel: first the eleven of Qwen3.8-27B in the order of their
+/// bytes there, then the others.
+const FAST_TYPES: [GgmlType; 28] = [
     GgmlType::IQ4_XS,
     GgmlType::Q4_K,
     GgmlType::Q5_K,
@@ -99,6 +116,23 @@ const FAST_TYPES: [GgmlType; 11] = [
     GgmlType::IQ2_S,
     GgmlType::IQ2_XS,
     GgmlType::Q8_0,
+    GgmlType::F32,
+    GgmlType::F16,
+    GgmlType::BF16,
+    GgmlType::Q4_0,
+    GgmlType::Q4_1,
+    GgmlType::Q5_0,
+    GgmlType::Q5_1,
+    GgmlType::Q2_K,
+    GgmlType::IQ1_S,
+    GgmlType::IQ1_M,
+    GgmlType::IQ2_XXS,
+    GgmlType::TQ1_0,
+    GgmlType::TQ2_0,
+    GgmlType::MXFP4,
+    GgmlType::NVFP4,
+    GgmlType::Q1_0,
+    GgmlType::Q2_0,
 ];
 
 /// Launches per timed run.

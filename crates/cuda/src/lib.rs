@@ -18,22 +18,33 @@
 //! ordinary code that enqueues kernels on streams; shapes are arguments, so a
 //! batch of any shape runs without rebuilding anything.
 
+mod attention;
 mod device;
 mod driver;
 mod error;
 mod kernels;
+mod layers;
 mod memory;
 mod mesh;
 mod module;
 mod stream;
 mod sys;
 
+pub use attention::{
+    ATTN_STATUS_DIRECT_MEAN, ATTN_STATUS_NONFINITE, ATTN_STATUS_OVERFLOW, AttendBuffers,
+    AttentionKernels, AttnItem, AttnRow, AttnShape, CacheFormat, CacheGeometry, ENTRY_CELLS, Plan,
+    PlanBuffers, PlanConfig, Planner,
+};
 pub use device::{
     Device, DeviceInfo, MemInfo, PciAddress, Wait, device_count, devices, peer_access,
 };
 pub use driver::{LIBRARY_ENV, driver_version};
 pub use error::{Error, Result};
 pub use kernels::{Kernels, MAX_BATCH, Precision, PrefillPath, PrefillShape};
+pub use layers::{
+    AttentionShape, CommitSet, LayerKernels, NormKind, OutputGate, RecurrentShape, RopeParams,
+    Segment, StateFormat, StepDims, StepRecord, quantized_activation_bytes,
+};
 pub use memory::{DeviceBuffer, DevicePtr, HostRegistration, PinnedBuffer};
 pub use mesh::{Lane, Mesh, PUSH_MAX_VALUES, Parcel, Route};
 pub use module::{Args, Function, MAX_ARGS, Module};

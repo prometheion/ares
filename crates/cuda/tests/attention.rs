@@ -1,0 +1,1158 @@
+//! Tests of the attention module (`AttentionKernels`): the kernels that write
+//! K and V into the cache and the attention kernels that read it.
+//!
+//! They open the GPUs, so they run only with `ARES_TEST_CUDA=1`:
+//!
+//! ```sh
+//! ARES_TEST_CUDA=1 cargo test -p ares-cuda --test attention -- --test-threads=1 --nocapture
+//! ```
+//!
+//! What they prove, against `ares_quant` (the specification and the reference):
+//!
+//! - *The codec*: the encoder kernel writes the bytes of `encode_tile` /
+//!   `encode_row`, for every format, equal on the golden files of
+//!   `crates/quant/tests/golden/kv` and on random and extreme tiles.
+//! - *Writing*: appending the rows of a step and converting entries leaves in
+//!   the pools exactly the bytes `KvHead` stores, for pairs of formats, with
+//!   drafts (pending cells) and settling.
+//! - *Reading*: attention equals `KvHead::attend` within the stated error.
+
+use std::path::PathBuf;
+use std::sync::OnceLock;
+
+use ares_cuda::{
+    AttendBuffers, AttentionKernels, AttnRow, CacheFormat, CacheGeometry, Device, DeviceBuffer,
+    PlanConfig, Planner, Stream, Wait, device_count,
+};
+use ares_quant::{KvFormat, KvHead, KvPolicy, encode_row, encode_tile};
+
+const TILE: usize = 128;
+
+fn gpus() -> Option<&'static [Device]> {
+    static DEVICES: OnceLock<Option<Vec<Device>>> = OnceLock::new();
+    DEVICES
+        .get_or_init(|| {
+            if std::env::var_os("ARES_TEST_CUDA").is_none() {
+                eprintln!("skipped: set ARES_TEST_CUDA=1 to run the tests that open GPUs");
+                return None;
+            }
+            let count = device_count().expect("the CUDA driver");
+            assert!(count > 0, "ARES_TEST_CUDA is set but the driver reports no device");
+            Some((0..count).map(|i| Device::open(i, Wait::Block).expect("open device")).collect())
+        })
+        .as_deref()
+}
+
+/// A small deterministic generator, so failures reproduce.
+struct Rng(u64);
+
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+
+    /// A value in [-1, 1).
+    fn unit(&mut self) -> f32 {
+        ((self.next() >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
+    }
+
+    fn gaussian(&mut self) -> f32 {
+        let u1 = (self.unit() + 1.0) * 0.5 + 1e-7;
+        let u2 = self.unit();
+        (-2.0 * u1.ln()).sqrt() * (std::f32::consts::PI * u2).cos()
+    }
+
+    /// A value like the rows of K and V: a per-channel offset (`channel`), noise,
+    /// and now and then an outlier.
+    fn kv_value(&mut self, channel: f32) -> f32 {
+        let v = 0.5 * channel + self.gaussian();
+        if self.next().is_multiple_of(300) { v * 12.0 } else { v }
+    }
+}
+
+fn cache_format(f: KvFormat) -> CacheFormat {
+    CacheFormat::ALL[KvFormat::ALL.iter().position(|x| *x == f).unwrap()]
+}
+
+fn f32_bytes(values: &[f32]) -> Vec<u8> {
+    values.iter().flat_map(|v| v.to_le_bytes()).collect()
+}
+
+fn u32_bytes(values: &[u32]) -> Vec<u8> {
+    values.iter().flat_map(|v| v.to_le_bytes()).collect()
+}
+
+fn upload(device: &Device, bytes: &[u8]) -> DeviceBuffer {
+    let buffer = DeviceBuffer::new(device, bytes.len().max(16) as u64).unwrap();
+    buffer.write(0, bytes).unwrap();
+    buffer
+}
+
+fn zeroed(device: &Device, len: u64) -> DeviceBuffer {
+    let buffer = DeviceBuffer::new(device, len.max(16)).unwrap();
+    buffer.write(0, &vec![0u8; len.max(16) as usize]).unwrap();
+    buffer
+}
+
+fn download(buffer: &DeviceBuffer, len: usize) -> Vec<u8> {
+    let mut out = vec![0u8; len];
+    buffer.read(0, &mut out).unwrap();
+    out
+}
+
+fn status_of(buffer: &DeviceBuffer) -> u32 {
+    u32::from_le_bytes(download(buffer, 4).try_into().unwrap())
+}
+
+fn first_difference(a: &[u8], b: &[u8]) -> Option<usize> {
+    if a.len() != b.len() {
+        return Some(a.len().min(b.len()));
+    }
+    a.iter().zip(b).position(|(x, y)| x != y)
+}
+
+// ---------------------------------------------------------------------------
+// The codec
+
+fn golden_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../quant/tests/golden/kv")
+}
+
+fn read_golden(name: &str) -> Vec<u8> {
+    std::fs::read(golden_dir().join(name)).unwrap_or_else(|e| panic!("{name}: {e}"))
+}
+
+/// Encodes `rows` rows of `d` values with the kernel: (mean, rows).
+fn device_encode(
+    kernels: &AttentionKernels,
+    stream: &Stream,
+    format: CacheFormat,
+    d: usize,
+    values: &[f32],
+    use_mean: bool,
+) -> (Vec<u8>, Vec<u8>) {
+    let device = kernels.device();
+    let rows = values.len() / d;
+    let src = upload(device, &f32_bytes(values));
+    let mean_len = if use_mean { format.mean_bytes(d as u32) as usize } else { 0 };
+    let mean = zeroed(device, mean_len as u64);
+    let out_len = rows * format.row_bytes(d as u32) as usize;
+    let out = zeroed(device, out_len as u64);
+    let status = zeroed(device, 4);
+    // SAFETY: the buffers have the sizes the kernel writes.
+    unsafe {
+        kernels
+            .encode_tile_f32(
+                stream,
+                src.ptr(),
+                rows as u32,
+                d as u32,
+                format,
+                use_mean,
+                mean.ptr(),
+                out.ptr(),
+                status.ptr(),
+            )
+            .unwrap();
+    }
+    stream.synchronize().unwrap();
+    assert_eq!(status_of(&status), 0, "status");
+    (download(&mean, mean_len), download(&out, out_len))
+}
+
+#[test]
+fn the_encoder_kernel_reproduces_the_golden_files_byte_for_byte() {
+    let Some(devices) = gpus() else { return };
+    for device in devices {
+        let kernels = AttentionKernels::load(device).unwrap();
+        let stream = Stream::new(device, 0).unwrap();
+        for (suffix, input_name) in [("", "input.f32"), ("_search", "input_search.f32")] {
+            let input: Vec<f32> = read_golden(input_name)
+                .chunks_exact(4)
+                .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+                .collect();
+            for format in KvFormat::ALL {
+                let file = read_golden(&format!("{}{suffix}.bin", format.name()));
+                let encoded_len = u32::from_le_bytes(file[20..24].try_into().unwrap()) as usize;
+                let expected = &file[32..32 + encoded_len];
+                let (_, got) = device_encode(
+                    &kernels,
+                    &stream,
+                    cache_format(format),
+                    input.len(),
+                    &input,
+                    false,
+                );
+                assert_eq!(
+                    first_difference(&got, expected),
+                    None,
+                    "{format}{suffix}: bytes differ on {}",
+                    device.info().name
+                );
+            }
+        }
+        // The tile of 5 rows of 96 values, with its mean.
+        let input: Vec<f32> = read_golden("input_tile.f32")
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+            .collect();
+        for format in [KvFormat::Q7, KvFormat::Q6, KvFormat::Q5, KvFormat::Q4] {
+            let file = read_golden(&format!("{}_tile.bin", format.name()));
+            let word = |i: usize| u32::from_le_bytes(file[4 * i..4 * i + 4].try_into().unwrap());
+            let (mean_len, enc_len) = (word(6) as usize, word(7) as usize);
+            let expected_mean = &file[32..32 + mean_len];
+            let expected_rows = &file[32 + mean_len..32 + mean_len + enc_len];
+            let (mean, rows) =
+                device_encode(&kernels, &stream, cache_format(format), 96, &input, true);
+            assert_eq!(first_difference(&mean, expected_mean), None, "{format} tile mean");
+            assert_eq!(first_difference(&rows, expected_rows), None, "{format} tile rows");
+        }
+    }
+}
+
+/// Rows of the kinds that stress the encoder: the realistic kind, constant rows,
+/// zeros, tiny and huge values, single large values.
+fn stress_rows(rng: &mut Rng, rows: usize, d: usize, kind: usize) -> Vec<f32> {
+    let channel: Vec<f32> = (0..d).map(|_| rng.gaussian()).collect();
+    let mut out = Vec::with_capacity(rows * d);
+    for r in 0..rows {
+        for c in 0..d {
+            let v = match kind {
+                0 => rng.kv_value(channel[c]),
+                1 => channel[c],
+                2 => 0.0,
+                3 => 1e-6 * rng.gaussian(),
+                4 => 3e4 * rng.gaussian(),
+                5 => {
+                    if c == (r * 7) % d {
+                        900.0
+                    } else {
+                        0.01 * rng.gaussian()
+                    }
+                }
+                6 => {
+                    (if rng.next().is_multiple_of(2) { 1.0 } else { -1.0 })
+                        * (1.0 + 1e-3 * rng.gaussian())
+                }
+                _ => 40.0 + rng.gaussian(),
+            };
+            out.push(v.clamp(-6.0e4, 6.0e4));
+        }
+    }
+    out
+}
+
+#[test]
+fn the_encoder_kernel_equals_encode_tile_on_random_and_extreme_tiles() {
+    let Some(devices) = gpus() else { return };
+    for device in devices {
+        let kernels = AttentionKernels::load(device).unwrap();
+        let stream = Stream::new(device, 0).unwrap();
+        let mut rng = Rng(0x9e3779b97f4a7c15);
+        for format in KvFormat::ALL {
+            for (d, rows) in [(256, 128), (128, 128), (64, 5), (256, 1)] {
+                for kind in 0..8 {
+                    let values = stress_rows(&mut rng, rows, d, kind);
+                    let n_mean = format.mean_bytes(d).unwrap();
+                    let mut mean = vec![0u8; n_mean];
+                    let mut out = vec![0u8; rows * format.row_bytes(d).unwrap()];
+                    encode_tile(format, d, &values, &mut mean, &mut out).unwrap();
+                    let (got_mean, got) =
+                        device_encode(&kernels, &stream, cache_format(format), d, &values, true);
+                    assert_eq!(
+                        first_difference(&got_mean, &mean),
+                        None,
+                        "{format} d={d} kind={kind} mean"
+                    );
+                    assert_eq!(
+                        first_difference(&got, &out),
+                        None,
+                        "{format} d={d} rows={rows} kind={kind} rows"
+                    );
+                    if rows == 1 {
+                        let mut row = vec![0u8; format.row_bytes(d).unwrap()];
+                        encode_row(format, &values, &mut row).unwrap();
+                        let (_, got) = device_encode(
+                            &kernels,
+                            &stream,
+                            cache_format(format),
+                            d,
+                            &values,
+                            false,
+                        );
+                        assert_eq!(first_difference(&got, &row), None, "{format} d={d} encode_row");
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A sequence on the device, mirrored by KvHead
+
+/// The pools of one layer and the slot bookkeeping the state crate will do.
+struct Pools {
+    geo: CacheGeometry,
+    exact: DeviceBuffer,
+    converted: DeviceBuffer,
+    free_exact: Vec<u32>,
+    free_converted: Vec<u32>,
+}
+
+impl Pools {
+    fn new(device: &Device, geo: CacheGeometry, n_exact: u32, n_converted: u32) -> Self {
+        Self {
+            geo,
+            exact: zeroed(device, n_exact as u64 * geo.exact_entry_bytes()),
+            converted: zeroed(device, n_converted as u64 * geo.converted_entry_bytes()),
+            free_exact: (0..n_exact).rev().collect(),
+            free_converted: (0..n_converted).rev().collect(),
+        }
+    }
+}
+
+/// One sequence: `KvHead` per KV head (the reference) and its table on the
+/// device. Rows are `[row][kv_heads][D]`.
+struct DevSeq {
+    policy: KvPolicy,
+    heads: Vec<KvHead>,
+    table: Vec<u32>,
+    len: usize,
+    /// Tiles already converted (device side).
+    converted_tiles: std::ops::Range<usize>,
+    table_dev: DeviceBuffer,
+}
+
+const CONVERTED: u32 = 0x8000_0000;
+
+impl DevSeq {
+    fn new(device: &Device, geo: &CacheGeometry, policy: KvPolicy, max_entries: usize) -> Self {
+        Self {
+            policy,
+            heads: (0..geo.kv_heads)
+                .map(|_| KvHead::new(policy, geo.head_dim as usize).unwrap())
+                .collect(),
+            table: Vec::new(),
+            len: 0,
+            converted_tiles: 0..0,
+            table_dev: zeroed(device, 4 * max_entries as u64),
+        }
+    }
+
+    fn upload_table(&self) {
+        self.table_dev.write(0, &u32_bytes(&self.table)).unwrap();
+    }
+
+    /// Appends `rows` rows. `pending`: draft cells, converted only by `settle`.
+    #[allow(clippy::too_many_arguments)]
+    fn append(
+        &mut self,
+        kernels: &AttentionKernels,
+        stream: &Stream,
+        pools: &mut Pools,
+        k: &[f32],
+        v: &[f32],
+        pending: bool,
+        status: &DeviceBuffer,
+    ) {
+        let geo = pools.geo;
+        let d = geo.head_dim as usize;
+        let (total, first) = (geo.kv_total as usize, geo.first_kv_head as usize);
+        let n = k.len() / (total * d);
+        let device = kernels.device();
+        let mut rows = Vec::new();
+        for i in 0..n {
+            let pos = self.len + i;
+            if pos / TILE == self.table.len() {
+                let entry = if self.policy.has_mean() {
+                    pools.free_exact.pop().expect("exact slots")
+                } else {
+                    pools.free_converted.pop().expect("converted slots") | CONVERTED
+                };
+                self.table.push(entry);
+            }
+            rows.push(AttnRow { table: 0, pos: pos as u32, slot_base: 0, n_slots: 0 });
+            for (hi, head) in self.heads.iter_mut().enumerate() {
+                let at = (i * total + first + hi) * d;
+                let (kr, vr) = (&k[at..at + d], &v[at..at + d]);
+                if pending {
+                    head.append_pending(kr, vr).unwrap();
+                } else {
+                    head.append(kr, vr).unwrap();
+                }
+            }
+        }
+        self.len += n;
+        self.upload_table();
+        let rows_dev = upload(device, &AttnRow::to_bytes(&rows));
+        let k_dev = upload(device, &f32_bytes(k));
+        let v_dev = upload(device, &f32_bytes(v));
+        // SAFETY: sizes follow the geometry; the slots were taken from the pools.
+        unsafe {
+            kernels
+                .append(
+                    stream,
+                    &geo,
+                    rows_dev.ptr(),
+                    n as u32,
+                    k_dev.ptr(),
+                    v_dev.ptr(),
+                    self.table_dev.ptr(),
+                    pools.exact.ptr(),
+                    pools.converted.ptr(),
+                    status.ptr(),
+                )
+                .unwrap();
+        }
+        stream.synchronize().unwrap();
+        if !pending {
+            self.convert_due(kernels, stream, pools, status);
+        }
+    }
+
+    fn settle(
+        &mut self,
+        kernels: &AttentionKernels,
+        stream: &Stream,
+        pools: &mut Pools,
+        status: &DeviceBuffer,
+    ) {
+        for head in &mut self.heads {
+            head.settle().unwrap();
+        }
+        self.convert_due(kernels, stream, pools, status);
+    }
+
+    /// Converts the tiles the policy converts at the current length.
+    fn convert_due(
+        &mut self,
+        kernels: &AttentionKernels,
+        stream: &Stream,
+        pools: &mut Pools,
+        status: &DeviceBuffer,
+    ) {
+        if !self.policy.has_mean() {
+            return;
+        }
+        let range = self.policy.quantized_cells(self.len);
+        let tiles = range.start / TILE..range.end / TILE;
+        let mut jobs = Vec::new();
+        for tile in tiles.clone() {
+            if self.converted_tiles.contains(&tile) || self.table[tile] & CONVERTED != 0 {
+                continue;
+            }
+            let from = self.table[tile];
+            let to = pools.free_converted.pop().expect("converted slots");
+            jobs.extend([from, to]);
+            self.table[tile] = to | CONVERTED;
+            pools.free_exact.push(from);
+        }
+        if jobs.is_empty() {
+            return;
+        }
+        let jobs_dev = upload(kernels.device(), &u32_bytes(&jobs));
+        // SAFETY: the jobs name live slots.
+        unsafe {
+            kernels
+                .convert(
+                    stream,
+                    &pools.geo,
+                    jobs_dev.ptr(),
+                    (jobs.len() / 2) as u32,
+                    pools.exact.ptr(),
+                    pools.converted.ptr(),
+                    status.ptr(),
+                )
+                .unwrap();
+        }
+        stream.synchronize().unwrap();
+        self.upload_table();
+        self.converted_tiles = tiles;
+    }
+
+    /// Compares every stored byte with the reference.
+    fn check_bytes(&self, pools: &Pools, label: &str) {
+        let geo = pools.geo;
+        let (d, h) = (geo.head_dim as usize, geo.kv_heads as usize);
+        let exact = download(&pools.exact, pools.exact.len() as usize);
+        let converted = download(&pools.converted, pools.converted.len() as usize);
+        let (ee, ce) = (geo.exact_entry_bytes() as usize, geo.converted_entry_bytes() as usize);
+        let ch = geo.converted_head_bytes() as usize;
+        let (rbk, rbv) =
+            (geo.k.row_bytes(geo.head_dim) as usize, geo.v.row_bytes(geo.head_dim) as usize);
+        let (km, vm) =
+            (geo.k.mean_bytes(geo.head_dim) as usize, geo.v.mean_bytes(geo.head_dim) as usize);
+        for (hi, head) in self.heads.iter().enumerate() {
+            assert!(hi < h);
+            for cell in 0..self.len {
+                let entry = self.table[cell / TILE];
+                let slot = (entry & !CONVERTED) as usize;
+                let r = cell % TILE;
+                if let Some((k, v)) = head.exact(cell) {
+                    assert_eq!(
+                        entry & CONVERTED,
+                        0,
+                        "{label}: exact cell {cell} is in a converted entry"
+                    );
+                    let base = slot * ee + hi * (TILE * 4 * d);
+                    let got_k = &exact[base + r * 2 * d..base + (r + 1) * 2 * d];
+                    let got_v = &exact
+                        [base + TILE * 2 * d + r * 2 * d..base + TILE * 2 * d + (r + 1) * 2 * d];
+                    assert_eq!(
+                        first_difference(got_k, k),
+                        None,
+                        "{label}: head {hi} cell {cell} exact K"
+                    );
+                    assert_eq!(
+                        first_difference(got_v, v),
+                        None,
+                        "{label}: head {hi} cell {cell} exact V"
+                    );
+                } else {
+                    assert_ne!(
+                        entry & CONVERTED,
+                        0,
+                        "{label}: converted cell {cell} is in an exact entry"
+                    );
+                    let (unit, i) = head.unit_of(cell).expect("converted cell");
+                    let base = slot * ce + hi * ch;
+                    let rk = base + km + r * rbk;
+                    assert_eq!(
+                        first_difference(&converted[rk..rk + rbk], unit.k_row(i)),
+                        None,
+                        "{label}: head {hi} cell {cell} K"
+                    );
+                    let rv = base + km + TILE * rbk + vm + r * rbv;
+                    assert_eq!(
+                        first_difference(&converted[rv..rv + rbv], unit.v_row(i)),
+                        None,
+                        "{label}: head {hi} cell {cell} V"
+                    );
+                    if r == 0 {
+                        assert_eq!(
+                            first_difference(&converted[base..base + km], &unit.k_mean),
+                            None,
+                            "{label}: head {hi} K mean"
+                        );
+                        let vb = base + km + TILE * rbk;
+                        assert_eq!(
+                            first_difference(&converted[vb..vb + vm], &unit.v_mean),
+                            None,
+                            "{label}: head {hi} V mean"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn rows_of(rng: &mut Rng, n: usize, h: usize, d: usize) -> Vec<f32> {
+    let mut out = Vec::with_capacity(n * h * d);
+    let channel: Vec<f32> = (0..h * d).map(|_| rng.gaussian()).collect();
+    for _ in 0..n {
+        for c in 0..h * d {
+            out.push(rng.kv_value(channel[c]));
+        }
+    }
+    out
+}
+
+fn pair_label(k: KvFormat, v: KvFormat) -> String {
+    format!("{k}/{v}")
+}
+
+#[test]
+fn appending_and_converting_leave_the_bytes_kvhead_stores() {
+    let Some(devices) = gpus() else { return };
+    for device in devices {
+        let kernels = AttentionKernels::load(device).unwrap();
+        let stream = Stream::new(device, 0).unwrap();
+        let mut rng = Rng(77);
+        let pairs = [
+            (KvFormat::Q8, KvFormat::Q8),
+            (KvFormat::F16, KvFormat::F16),
+            (KvFormat::F16, KvFormat::Q8),
+            (KvFormat::Q8, KvFormat::F16),
+            (KvFormat::Q4, KvFormat::Q4),
+            (KvFormat::Q7, KvFormat::Q5),
+            (KvFormat::Q6, KvFormat::Q8),
+            (KvFormat::Q8, KvFormat::Q4),
+            (KvFormat::F16, KvFormat::Q5),
+        ];
+        for (k, v) in pairs {
+            for d in [256usize, 128] {
+                let geo = CacheGeometry {
+                    k: cache_format(k),
+                    v: cache_format(v),
+                    head_dim: d as u32,
+                    kv_heads: 2,
+                    kv_total: 3,
+                    first_kv_head: 1,
+                    q_per_kv: 4,
+                };
+                let policy = KvPolicy::new(k, v);
+                let mut pools = Pools::new(device, geo, 6, 8);
+                let status = zeroed(device, 4);
+                let mut seq = DevSeq::new(device, &geo, policy, 16);
+                let label = pair_label(k, v);
+                // The model has 3 KV heads of which this device holds heads 1 and 2.
+                // Appends in steps of various sizes (a prompt, decode rows, drafts).
+                // Without a mean the device writes drafts straight into the format (the
+                // reference keeps pending cells exact until they are settled, so only
+                // `append` is comparable) and nothing is converted later.
+                let drafts = policy.has_mean();
+                for (n, pending) in
+                    [(300usize, false), (1, false), (1, false), (150, false), (5, drafts)]
+                {
+                    let full_k = rows_of(&mut rng, n, 3, d);
+                    let full_v = rows_of(&mut rng, n, 3, d);
+                    seq.append(&kernels, &stream, &mut pools, &full_k, &full_v, pending, &status);
+                    if !pending {
+                        seq.check_bytes(&pools, &format!("{label} d={d} after {n}"));
+                    }
+                }
+                seq.check_bytes(&pools, &format!("{label} d={d} with drafts"));
+                if drafts {
+                    // Accept three of the five drafts: cut the rest, settle.
+                    for head in &mut seq.heads {
+                        head.truncate(seq.len - 2).unwrap();
+                    }
+                    seq.len -= 2;
+                    seq.settle(&kernels, &stream, &mut pools, &status);
+                    seq.check_bytes(&pools, &format!("{label} d={d} settled"));
+                }
+                assert_eq!(status_of(&status), 0, "{label} status");
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Reading
+
+/// The error of the kernel against `KvHead::attend` on one case.
+#[derive(Clone, Copy, Debug, Default)]
+struct Error {
+    /// The largest |kernel - reference| over rows, heads and elements, relative to
+    /// the largest |reference| of its row and head.
+    max_rel: f64,
+    /// The rms of the same differences, relative to the rms of the reference.
+    rms_rel: f64,
+}
+
+impl Error {
+    fn worse(self, other: Error) -> Error {
+        Error { max_rel: self.max_rel.max(other.max_rel), rms_rel: self.rms_rel.max(other.rms_rel) }
+    }
+}
+
+struct Case {
+    k: KvFormat,
+    v: KvFormat,
+    d: usize,
+    hist: usize,
+    rows: usize,
+}
+
+/// A sequence built through the writing kernels, with the rows of its last step
+/// still to attend: `rows` cells appended in one step after `hist` earlier ones.
+fn build(
+    kernels: &AttentionKernels,
+    stream: &Stream,
+    case: &Case,
+    geo: &CacheGeometry,
+    rng: &mut Rng,
+) -> (Pools, DevSeq) {
+    let device = kernels.device();
+    let entries = (case.hist + case.rows).div_ceil(TILE) + 2;
+    let mut pools = Pools::new(device, *geo, entries as u32 + 6, entries as u32 + 2);
+    let status = zeroed(device, 4);
+    let mut seq = DevSeq::new(device, geo, KvPolicy::new(case.k, case.v), entries + 2);
+    let total = geo.kv_total as usize;
+    // The history in prompt-sized steps, then the rows of the window.
+    let mut left = case.hist;
+    while left > 0 {
+        let n = left.min(700);
+        let (k, v) = (rows_of(rng, n, total, case.d), rows_of(rng, n, total, case.d));
+        seq.append(kernels, stream, &mut pools, &k, &v, false, &status);
+        left -= n;
+    }
+    let (k, v) = (rows_of(rng, case.rows, total, case.d), rows_of(rng, case.rows, total, case.d));
+    seq.append(kernels, stream, &mut pools, &k, &v, false, &status);
+    assert_eq!(status_of(&status), 0);
+    (pools, seq)
+}
+
+/// What the rows of one sequence in a step see.
+enum Look {
+    /// `n` consecutive rows, the last `n` cells of the sequence, attending causally.
+    Window(usize),
+    /// `n` consecutive rows starting at the cell `pos0`, attending causally.
+    At(usize, usize),
+    /// One row, the last cell, attending to these ranges only.
+    Ranges(Vec<std::ops::Range<usize>>),
+}
+
+/// Runs attention for the rows described by `looks` (one sequence each) and
+/// compares every row with the reference. `check` limits how many rows of a wide
+/// window are compared (the reference is slow): every row up to that many, spread.
+#[allow(clippy::too_many_arguments)]
+fn attend_many(
+    kernels: &AttentionKernels,
+    stream: &Stream,
+    geo: &CacheGeometry,
+    pools: &Pools,
+    seqs: &[&DevSeq],
+    looks: &[Look],
+    gated: bool,
+    check: usize,
+    rng: &mut Rng,
+) -> Error {
+    attend_many_q(kernels, stream, geo, pools, seqs, looks, gated, check, None, rng)
+}
+
+/// As `attend_many`, with the queries given (`[row][q_heads][D]`) instead of random.
+#[allow(clippy::too_many_arguments)]
+fn attend_many_q(
+    kernels: &AttentionKernels,
+    stream: &Stream,
+    geo: &CacheGeometry,
+    pools: &Pools,
+    seqs: &[&DevSeq],
+    looks: &[Look],
+    gated: bool,
+    check: usize,
+    q_given: Option<&[f32]>,
+    rng: &mut Rng,
+) -> Error {
+    let device = kernels.device();
+    let (g, d) = (geo.q_per_kv as usize, geo.head_dim as usize);
+    let q_total = geo.kv_total as usize * g;
+    let n: usize = looks
+        .iter()
+        .map(|l| match l {
+            Look::Window(n) | Look::At(_, n) => *n,
+            Look::Ranges(_) => 1,
+        })
+        .sum();
+    let q: Vec<f32> = match q_given {
+        Some(q) => {
+            assert_eq!(q.len(), n * q_total * d);
+            q.to_vec()
+        }
+        None => (0..n * q_total * d).map(|_| rng.kv_value(0.0)).collect(),
+    };
+    let gate: Vec<f32> = (0..n * q_total * d).map(|_| 2.0 * rng.gaussian()).collect();
+    let q_dev = upload(device, &f32_bytes(&q));
+    let gate_dev = upload(device, &f32_bytes(&gate));
+    let out_dev = zeroed(device, (n * q_total * d * 4) as u64);
+
+    // One table array for all sequences.
+    let mut table = Vec::new();
+    let offsets: Vec<u32> = seqs
+        .iter()
+        .map(|s| {
+            let at = table.len() as u32;
+            table.extend_from_slice(&s.table);
+            at
+        })
+        .collect();
+    let table_dev = upload(device, &u32_bytes(&table));
+
+    let sm = device.info().multiprocessors;
+    let mut planner = Planner::new(*geo, PlanConfig::for_multiprocessors(sm), n as u32);
+    let mut row0 = 0usize;
+    let mut checks: Vec<(usize, usize, usize, Option<std::ops::Range<usize>>)> = Vec::new(); // seq, row, pos, ranges
+    for (i, look) in looks.iter().enumerate() {
+        let seq = seqs[i];
+        match look {
+            Look::Window(_) | Look::At(..) => {
+                let (w, pos0) = match look {
+                    Look::Window(w) => (w, seq.len - w),
+                    Look::At(p, w) => (w, *p),
+                    Look::Ranges(_) => unreachable!(),
+                };
+                planner.dense(offsets[i], &seq.table, row0 as u32, *w as u32, pos0 as u32);
+                let stride = (*w).div_ceil(check.max(1)).max(1);
+                for r in (0..*w).filter(|r| r % stride == 0 || *r == w - 1) {
+                    checks.push((i, row0 + r, pos0 + r, None));
+                }
+                row0 += w;
+            }
+            Look::Ranges(ranges) => {
+                let r32: Vec<std::ops::Range<u32>> =
+                    ranges.iter().map(|r| r.start as u32..r.end as u32).collect();
+                planner.sparse(offsets[i], &seq.table, row0 as u32, (seq.len - 1) as u32, &r32);
+                checks.push((i, row0, seq.len - 1, Some(0..0)));
+                row0 += 1;
+            }
+        }
+    }
+    let plan = planner.finish();
+    let scratch = zeroed(device, plan.state_bytes(geo));
+    let buffers = plan.upload(device).unwrap();
+    let args = AttendBuffers {
+        tables: table_dev.ptr(),
+        exact_pool: pools.exact.ptr(),
+        converted_pool: pools.converted.ptr(),
+        q: q_dev.ptr(),
+        gate: gated.then(|| gate_dev.ptr()),
+        out: out_dev.ptr(),
+        scratch: scratch.ptr(),
+    };
+    let scale = 1.0 / (d as f32).sqrt();
+    // SAFETY: the buffers have the sizes the plan and the geometry give.
+    unsafe { kernels.attend(stream, geo, &buffers, &args, scale).unwrap() };
+    stream.synchronize().unwrap();
+    let got: Vec<f32> = download(&out_dev, n * q_total * d * 4)
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+        .collect();
+
+    let mut worst = Error::default();
+    for (i, row, pos, sparse) in checks {
+        let visible: Vec<std::ops::Range<usize>> = match (&looks[i], sparse) {
+            (Look::Ranges(r), Some(_)) => r.clone(),
+            _ => vec![0..pos + 1],
+        };
+        for kvh in 0..geo.kv_heads as usize {
+            for gi in 0..g {
+                let hg = (geo.first_kv_head as usize + kvh) * g + gi;
+                let at = (row * q_total + hg) * d;
+                let reference = seqs[i].heads[kvh].attend(&q[at..at + d], scale, &visible).unwrap();
+                let mut want: Vec<f64> = reference.output.iter().map(|x| f64::from(*x)).collect();
+                if gated {
+                    for (w, gt) in want.iter_mut().zip(&gate[at..at + d]) {
+                        *w *= 1.0 / (1.0 + (-f64::from(*gt)).exp());
+                    }
+                }
+                let big = want.iter().fold(0.0f64, |m, x| m.max(x.abs())).max(1e-30);
+                let rms = (want.iter().map(|x| x * x).sum::<f64>() / d as f64).sqrt().max(1e-30);
+                let (mut max, mut sq) = (0.0f64, 0.0f64);
+                for (w, k) in want.iter().zip(&got[at..at + d]) {
+                    let diff = (w - f64::from(*k)).abs();
+                    max = max.max(diff);
+                    sq += diff * diff;
+                }
+                worst = worst
+                    .worse(Error { max_rel: max / big, rms_rel: (sq / d as f64).sqrt() / rms });
+            }
+        }
+    }
+    worst
+}
+
+/// Runs attention for the rows of the window of `case`.
+#[allow(clippy::too_many_arguments)]
+fn attend_and_compare(
+    kernels: &AttentionKernels,
+    stream: &Stream,
+    case: &Case,
+    geo: &CacheGeometry,
+    pools: &Pools,
+    seq: &DevSeq,
+    gated: bool,
+    rng: &mut Rng,
+) -> Error {
+    attend_many(kernels, stream, geo, pools, &[seq], &[Look::Window(case.rows)], gated, 16, rng)
+}
+
+fn test_geometry(k: KvFormat, v: KvFormat, d: usize) -> CacheGeometry {
+    CacheGeometry {
+        k: cache_format(k),
+        v: cache_format(v),
+        head_dim: d as u32,
+        kv_heads: 2,
+        kv_total: 3,
+        first_kv_head: 1,
+        q_per_kv: 6,
+    }
+}
+
+#[test]
+fn attention_equals_the_reference_for_every_pair_of_formats_in_decode() {
+    let Some(devices) = gpus() else { return };
+    let mut rng = Rng(2024);
+    for device in devices {
+        let kernels = AttentionKernels::load(device).unwrap();
+        let stream = Stream::new(device, 0).unwrap();
+        let mut worst = Error::default();
+        let mut bad = Vec::new();
+        for k in KvFormat::ALL {
+            for v in KvFormat::ALL {
+                for (hist, rows) in [(900usize, 1usize), (1500, 4)] {
+                    let case = Case { k, v, d: 256, hist, rows };
+                    let geo = test_geometry(k, v, 256);
+                    let (pools, seq) = build(&kernels, &stream, &case, &geo, &mut rng);
+                    let err = attend_and_compare(
+                        &kernels, &stream, &case, &geo, &pools, &seq, true, &mut rng,
+                    );
+                    if std::env::var_os("ARES_TEST_VERBOSE").is_some() {
+                        println!(
+                            "{} {k}/{v} hist {hist} rows {rows}: max {:.2e} rms {:.2e}",
+                            device.info().name,
+                            err.max_rel,
+                            err.rms_rel
+                        );
+                    }
+                    if err.max_rel >= 8e-3 {
+                        bad.push(format!("{k}/{v} hist {hist}: max error {:.2e}", err.max_rel));
+                    }
+                    worst = worst.worse(err);
+                }
+            }
+        }
+        println!(
+            "{}: worst over all pairs: max {:.2e}, rms {:.2e}",
+            device.info().name,
+            worst.max_rel,
+            worst.rms_rel
+        );
+        assert!(bad.is_empty(), "{bad:#?}");
+    }
+}
+
+/// One case from the environment, for investigations:
+/// `ARES_ATTN_CASE=k,v,hist,rows[,d]`.
+#[test]
+fn one_case_from_the_environment() {
+    let Some(devices) = gpus() else { return };
+    let Ok(spec) = std::env::var("ARES_ATTN_CASE") else { return };
+    let f: Vec<&str> = spec.split(',').collect();
+    let (k, v): (KvFormat, KvFormat) = (f[0].parse().unwrap(), f[1].parse().unwrap());
+    let (hist, rows): (usize, usize) = (f[2].parse().unwrap(), f[3].parse().unwrap());
+    let d: usize = f.get(4).map_or(256, |x| x.parse().unwrap());
+    for device in devices {
+        let kernels = AttentionKernels::load(device).unwrap();
+        let stream = Stream::new(device, 0).unwrap();
+        let mut rng = Rng(5);
+        let case = Case { k, v, d, hist, rows };
+        let geo = test_geometry(k, v, d);
+        let (pools, seq) = build(&kernels, &stream, &case, &geo, &mut rng);
+        for gated in [false, true] {
+            let err =
+                attend_and_compare(&kernels, &stream, &case, &geo, &pools, &seq, gated, &mut rng);
+            println!(
+                "{} {spec} gated {gated}: max {:.2e} rms {:.2e}",
+                device.info().name,
+                err.max_rel,
+                err.rms_rel
+            );
+        }
+    }
+}
+
+fn build_seq(
+    kernels: &AttentionKernels,
+    stream: &Stream,
+    geo: &CacheGeometry,
+    pools: &mut Pools,
+    len: usize,
+    step: usize,
+    rng: &mut Rng,
+) -> DevSeq {
+    let device = kernels.device();
+    let policy = KvPolicy::new(cache_to_kv(geo.k), cache_to_kv(geo.v));
+    let mut seq = DevSeq::new(device, geo, policy, len.div_ceil(TILE) + 4);
+    let status = zeroed(device, 4);
+    let total = geo.kv_total as usize;
+    let mut left = len;
+    while left > 0 {
+        let n = left.min(step);
+        let (k, v) = (
+            rows_of(rng, n, total, geo.head_dim as usize),
+            rows_of(rng, n, total, geo.head_dim as usize),
+        );
+        seq.append(kernels, stream, pools, &k, &v, false, &status);
+        left -= n;
+    }
+    assert_eq!(status_of(&status), 0);
+    seq
+}
+
+fn cache_to_kv(f: CacheFormat) -> KvFormat {
+    KvFormat::ALL[f.id() as usize]
+}
+
+#[test]
+fn batches_of_sequences_ranges_and_wide_windows_equal_the_reference() {
+    let Some(devices) = gpus() else { return };
+    let mut rng = Rng(31337);
+    let pairs = [
+        (KvFormat::F16, KvFormat::F16),
+        (KvFormat::Q8, KvFormat::Q8),
+        (KvFormat::Q4, KvFormat::Q4),
+        (KvFormat::Q6, KvFormat::Q5),
+        (KvFormat::F16, KvFormat::Q7),
+    ];
+    for device in devices {
+        let kernels = AttentionKernels::load(device).unwrap();
+        let stream = Stream::new(device, 0).unwrap();
+        let mut bad = Vec::new();
+        for (k, v) in pairs {
+            let geo = test_geometry(k, v, 256);
+            let mut pools = Pools::new(device, geo, 60, 160);
+            // Four sequences of different lengths, one of them with a window of four rows.
+            let lens = [700usize, 2100, 1300, 330, 1100];
+            let seqs: Vec<DevSeq> = lens
+                .iter()
+                .map(|&l| build_seq(&kernels, &stream, &geo, &mut pools, l, 600, &mut rng))
+                .collect();
+            let refs: Vec<&DevSeq> = seqs.iter().collect();
+            let looks = [
+                Look::Window(1),
+                Look::Window(1),
+                Look::Window(4),
+                Look::Window(1),
+                Look::Window(1),
+            ];
+            let err =
+                attend_many(&kernels, &stream, &geo, &pools, &refs, &looks, true, 16, &mut rng);
+            if err.max_rel > 8e-3 {
+                bad.push(format!("{k}/{v} batch: {:.2e}", err.max_rel));
+            }
+            println!(
+                "{} {k}/{v} batch of 5 sequences: max {:.2e} rms {:.2e}",
+                device.info().name,
+                err.max_rel,
+                err.rms_rel
+            );
+            // A row that sees selected blocks of 4 cells (and its own newest cells), the kind of
+            // list qwen4exp selects, over a sequence of 3000 cells.
+            let long = build_seq(&kernels, &stream, &geo, &mut pools, 3000, 700, &mut rng);
+            let mut ranges = Vec::new();
+            let mut block = 0usize;
+            while block < 2900 / 4 {
+                block += 1 + (rng.next() % 5) as usize;
+                if block * 4 + 4 <= 2990 {
+                    ranges.push(block * 4..block * 4 + 4);
+                }
+            }
+            ranges.dedup();
+            ranges.push(2996..3000);
+            let err = attend_many(
+                &kernels,
+                &stream,
+                &geo,
+                &pools,
+                &[&long],
+                &[Look::Ranges(ranges.clone())],
+                false,
+                1,
+                &mut rng,
+            );
+            if err.max_rel > 8e-3 {
+                bad.push(format!("{k}/{v} ranges: {:.2e}", err.max_rel));
+            }
+            println!(
+                "{} {k}/{v} {} ranges: max {:.2e} rms {:.2e}",
+                device.info().name,
+                ranges.len(),
+                err.max_rel,
+                err.rms_rel
+            );
+            // A wide window.
+            let wide = build_seq(&kernels, &stream, &geo, &mut pools, 1400, 700, &mut rng);
+            let err = attend_many(
+                &kernels,
+                &stream,
+                &geo,
+                &pools,
+                &[&wide],
+                &[Look::Window(300)],
+                true,
+                12,
+                &mut rng,
+            );
+            if err.max_rel > 8e-3 {
+                bad.push(format!("{k}/{v} wide: {:.2e}", err.max_rel));
+            }
+            println!(
+                "{} {k}/{v} wide window of 300 rows: max {:.2e} rms {:.2e}",
+                device.info().name,
+                err.max_rel,
+                err.rms_rel
+            );
+        }
+        assert!(bad.is_empty(), "{bad:#?}");
+    }
+}
+
+fn read_f32_file(path: &std::path::Path) -> Vec<f32> {
+    std::fs::read(path)
+        .unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+        .collect()
+}
+
+/// The captured Q, K and V of Qwen3.8-27B (3686 tokens, 24 query heads, 4 KV heads of 256
+/// values; `crates/quant/tools/kv_real/README.md`): attention of rows in the middle and at
+/// the end of the text, against the reference on the same stored bytes.
+#[test]
+fn attention_on_the_captured_rows_of_a_real_model_equals_the_reference() {
+    let dir = std::path::Path::new("/var/tmp/kvreal-data/q27b");
+    if !dir.exists() {
+        eprintln!("skipped: no captured data at {}", dir.display());
+        return;
+    }
+    let Some(devices) = gpus() else { return };
+    let mut rng = Rng(1);
+    let pairs = [
+        (KvFormat::F16, KvFormat::F16),
+        (KvFormat::Q8, KvFormat::Q8),
+        (KvFormat::Q6, KvFormat::Q5),
+        (KvFormat::Q4, KvFormat::Q4),
+        (KvFormat::Q4, KvFormat::Q8),
+    ];
+    for device in devices {
+        let kernels = AttentionKernels::load(device).unwrap();
+        let stream = Stream::new(device, 0).unwrap();
+        for layer in [3usize, 31, 63] {
+            let k = read_f32_file(&dir.join(format!("L{layer:02}_k.f32")));
+            let v = read_f32_file(&dir.join(format!("L{layer:02}_v.f32")));
+            let q = read_f32_file(&dir.join(format!("L{layer:02}_q.f32")));
+            let n_tokens = k.len() / (4 * 256);
+            let q_row = 24 * 256;
+            for (kf, vf) in pairs {
+                let geo = CacheGeometry {
+                    k: cache_format(kf),
+                    v: cache_format(vf),
+                    head_dim: 256,
+                    kv_heads: 4,
+                    kv_total: 4,
+                    first_kv_head: 0,
+                    q_per_kv: 6,
+                };
+                let mut pools = Pools::new(device, geo, 12, 40);
+                let mut seq = DevSeq::new(device, &geo, KvPolicy::new(kf, vf), 40);
+                let status = zeroed(device, 4);
+                let mut at = 0;
+                while at < n_tokens {
+                    let n = 700.min(n_tokens - at);
+                    let (a, b) = (at * 1024, (at + n) * 1024);
+                    seq.append(&kernels, &stream, &mut pools, &k[a..b], &v[a..b], false, &status);
+                    at += n;
+                }
+                // Rows: one and two in the middle, a window of 8 at the end.
+                let spans = [(1500usize, 1usize), (2900, 2), (n_tokens - 8, 8)];
+                let looks: Vec<Look> = spans.iter().map(|&(p, n)| Look::At(p, n)).collect();
+                let mut qs = Vec::new();
+                for (p, n) in spans {
+                    qs.extend_from_slice(&q[p * q_row..(p + n) * q_row]);
+                }
+                let err = attend_many_q(&kernels, &stream, &geo, &pools, &[&seq, &seq, &seq], &looks, false, 16, Some(&qs), &mut rng);
+                println!(
+                    "{} real data, layer {layer}, {kf}/{vf}: max {:.2e} rms {:.2e}",
+                    device.info().name, err.max_rel, err.rms_rel
+                );
+                assert!(err.max_rel < 5e-3, "{kf}/{vf} layer {layer}: {:.2e}", err.max_rel);
+            }
+        }
+    }
+}

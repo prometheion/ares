@@ -21,8 +21,14 @@
 //       heavy-tailed activations it gave 1.4 times the error at 1 row and 2.6
 //       times at 4, because it no longer cancels the rounding error that the
 //       codes' mean makes.)
-// The rows of a batch follow each other in both arrays, and the pairs start at
-// the next multiple of 16 bytes after the values (ares_act_ds_offset).
+//   x   n_in f32 values: a copy of the activations, for the weight types that
+//       are floats themselves (F32, F16, BF16), whose kernels multiply them
+//       exactly instead of the int8 codes. The copy makes a prepared buffer
+//       serve every type: all matrices that read the same activations take
+//       the same buffer, whatever their types.
+// The rows of a batch follow each other in the arrays, and each array starts
+// at the next multiple of 16 bytes after the one before (ares_act_ds_offset,
+// ares_act_x_offset).
 //
 // The scale is f32, not f16: the whole activation set is small next to the
 // weights, and the rounding of an f16 scale would cost accuracy for no speed.
@@ -33,6 +39,11 @@
 // Byte offset of the (d, s) pairs behind `n_values` = n_batch * n_in int8 values.
 static __host__ __device__ __forceinline__ size_t ares_act_ds_offset(size_t n_values) {
     return (n_values + 15) & ~static_cast<size_t>(15);
+}
+
+// Byte offset of the f32 copy of the activations, behind the (d, s) pairs.
+static __host__ __device__ __forceinline__ size_t ares_act_x_offset(size_t n_values) {
+    return (ares_act_ds_offset(n_values) + (n_values + 31) / 32 * 8 + 15) & ~static_cast<size_t>(15);
 }
 
 // One thread per value; a group of 32 values is one warp (blocks are multiples
@@ -55,6 +66,7 @@ ARES_KERNEL ares_quantize_act(const float* x, int8_t* q, uint32_t n_values) {
     const float sum_codes = ares_warp_sum(i < n_values ? code : 0.0f);
     if (i < n_values) {
         q[i] = static_cast<int8_t>(code);
+        reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(q) + ares_act_x_offset(n_values))[i] = v;
         if ((threadIdx.x & 31) == 0) {
             float2* ds = reinterpret_cast<float2*>(reinterpret_cast<uint8_t*>(q) + ares_act_ds_offset(n_values));
             ds[i >> 5] = make_float2(d, d * sum_codes);

@@ -6,6 +6,7 @@
 
 #include "common.cuh"
 #include "mm_types.cuh"
+#include "mmr.cuh"
 
 // The shapes: weight rows x activation rows per block, warps, blocks per SM.
 // Found by measurement on an RTX 4070 and an RTX 3060 (see mm.cuh); the Rust side
@@ -96,13 +97,54 @@ ARES_MM_F16_SMALL(ares_mm_f16s_iq2_s, EngMmIQ2S)
 ARES_MM_F16_SMALL(ares_mm_f16s_iq2_xs, EngMmIQ2XS)
 ARES_MM_F16_SMALL(ares_mm_f16s_q8_0, EngMmQ80)
 
-// out[i] = x[i] as f16 for i < n. The activations of the f16 variant.
-ARES_KERNEL ares_convert_f16(const float* x, __half* out, uint32_t n) {
-    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) {
-        out[i] = __float2half_rn(x[i]);
-    }
-}
+
+// The f16 variant with f16 accumulation, flushed to f32 every ARES_MM_FLUSH mma of 16
+// values of K (see mm.cuh): ares_mm_h<|m|s>_<type>. The GeForce cards run it at twice
+// the rate of the f32 accumulation.
+#define ARES_MM_FLUSH 4
+#define ARES_MM_H_LARGE(NAME, T) ARES_MM_KERNEL(NAME, 512, 1, ares_mm_f16, T, 128, 128, 4, 4, 64, __half, ARES_MM_FLUSH)
+#define ARES_MM_H_MEDIUM(NAME, T) ARES_MM_KERNEL(NAME, 128, 2, ares_mm_f16, T, 64, 64, 2, 2, 64, __half, ARES_MM_FLUSH)
+#define ARES_MM_H_SMALL(NAME, T) ARES_MM_KERNEL(NAME, 128, 3, ares_mm_f16, T, 64, 32, 2, 2, 64, __half, ARES_MM_FLUSH)
+ARES_MM_H_LARGE(ares_mm_h_q4_K, EngMmQ4K)
+ARES_MM_H_LARGE(ares_mm_h_q5_K, EngMmQ5K)
+ARES_MM_H_LARGE(ares_mm_h_q6_K, EngMmQ6K)
+ARES_MM_H_LARGE(ares_mm_h_q3_K, EngMmQ3K)
+ARES_MM_H_LARGE(ares_mm_h_iq4_xs, EngMmIQ4XS)
+ARES_MM_H_LARGE(ares_mm_h_iq4_nl, EngMmIQ4NL)
+ARES_MM_H_LARGE(ares_mm_h_iq3_s, EngMmIQ3S)
+ARES_MM_H_LARGE(ares_mm_h_iq3_xxs, EngMmIQ3XXS)
+ARES_MM_H_LARGE(ares_mm_h_iq2_s, EngMmIQ2S)
+ARES_MM_H_LARGE(ares_mm_h_iq2_xs, EngMmIQ2XS)
+ARES_MM_H_LARGE(ares_mm_h_q8_0, EngMmQ80)
+
+ARES_MM_H_MEDIUM(ares_mm_hm_q4_K, EngMmQ4K)
+ARES_MM_H_MEDIUM(ares_mm_hm_q5_K, EngMmQ5K)
+ARES_MM_H_MEDIUM(ares_mm_hm_q6_K, EngMmQ6K)
+ARES_MM_H_MEDIUM(ares_mm_hm_q3_K, EngMmQ3K)
+ARES_MM_H_MEDIUM(ares_mm_hm_iq4_xs, EngMmIQ4XS)
+ARES_MM_H_MEDIUM(ares_mm_hm_iq4_nl, EngMmIQ4NL)
+ARES_MM_H_MEDIUM(ares_mm_hm_iq3_s, EngMmIQ3S)
+ARES_MM_H_MEDIUM(ares_mm_hm_iq3_xxs, EngMmIQ3XXS)
+ARES_MM_H_MEDIUM(ares_mm_hm_iq2_s, EngMmIQ2S)
+ARES_MM_H_MEDIUM(ares_mm_hm_iq2_xs, EngMmIQ2XS)
+ARES_MM_H_MEDIUM(ares_mm_hm_q8_0, EngMmQ80)
+
+ARES_MM_H_SMALL(ares_mm_hs_q4_K, EngMmQ4K)
+ARES_MM_H_SMALL(ares_mm_hs_q5_K, EngMmQ5K)
+ARES_MM_H_SMALL(ares_mm_hs_q6_K, EngMmQ6K)
+ARES_MM_H_SMALL(ares_mm_hs_q3_K, EngMmQ3K)
+ARES_MM_H_SMALL(ares_mm_hs_iq4_xs, EngMmIQ4XS)
+ARES_MM_H_SMALL(ares_mm_hs_iq4_nl, EngMmIQ4NL)
+ARES_MM_H_SMALL(ares_mm_hs_iq3_s, EngMmIQ3S)
+ARES_MM_H_SMALL(ares_mm_hs_iq3_xxs, EngMmIQ3XXS)
+ARES_MM_H_SMALL(ares_mm_hs_iq2_s, EngMmIQ2S)
+ARES_MM_H_SMALL(ares_mm_hs_iq2_xs, EngMmIQ2XS)
+ARES_MM_H_SMALL(ares_mm_hs_q8_0, EngMmQ80)
+
+// The register-decoding kernels over the rearranged form (mmr.cuh): ares_mmr_<h|f>_<type>,
+// with f16 (h) or f32 (f) accumulation.
+ARES_MMR_KERNEL(ares_mmr_h_q4_K, q4_K, 128, 128, 8, 2, ARES_MM_FLUSH, 3)
+ARES_MMR_KERNEL(ares_mmr_f_q4_K, q4_K, 128, 128, 8, 2, 0, 3)
 
 // The probe of Kernels::load: how fast the tensor cores run `mma` with f16
 // inputs and f32 accumulation against f16 accumulation. GeForce cards run the

@@ -84,8 +84,12 @@ fn main() {
     };
     // The two modules build side by side: each nvcc run is single-threaded and
     // the prefill module is the slower one.
-    let modules =
-        [("module.cu", "kernels.fatbin", FLOOR), ("prefill.cu", "prefill.fatbin", TENSOR_FLOOR)];
+    let modules = [
+        ("module.cu", "kernels.fatbin", FLOOR),
+        ("prefill.cu", "prefill.fatbin", TENSOR_FLOOR),
+        ("layers.cu", "layers.fatbin", FLOOR),
+        ("attention.cu", "attention.fatbin", TENSOR_FLOOR),
+    ];
     let children: Vec<_> = modules
         .iter()
         .map(|(source, fatbin, floor)| {

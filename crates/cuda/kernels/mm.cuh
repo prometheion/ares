@@ -1,110 +1,108 @@
-// The prefill weight kernels: quantized matrix times a batch of activation rows
-// on the tensor cores, with the weights dequantised tile by tile on the fly.
+// The prefill weight kernels that read the file's layout: quantized matrix times a
+// batch of activation rows on the tensor cores, with the weights dequantised tile
+// by tile into shared memory. They take any type through a small per-type piece
+// (mm_types.cuh) and are the general path; mmr.cuh has the kernels that read a
+// rearranged copy of the weights and decode in registers, which are faster where
+// they exist (Q4_K so far).
 //
 // Why a second family
 // -------------------
-// The decode kernels (mmvq*.cuh) read each weight once and spend a dp4a per
-// four weights per activation row, which is the right shape up to 8 rows: the
-// time is the weights' bytes over the memory bandwidth. Past a few rows the
-// work is arithmetic, and the tensor cores are two orders of magnitude ahead
-// of the CUDA cores at it. The price of using them is that a weight must be
-// available as a tile in shared memory in the format the instruction reads,
-// so the kernels here dequantise a tile of the weights per step and amortise
-// that over every activation row of the thread block.
+// The decode kernels (mmvq*.cuh) read each weight once and spend a dp4a per four
+// weights per activation row, which is the right shape up to 8 rows: the time is
+// the weights' bytes over the memory bandwidth. Past a few rows the work is
+// arithmetic, and the tensor cores are two orders of magnitude ahead of the CUDA
+// cores at it.
 //
-// Two variants, one set of weight decoders
-// ----------------------------------------
-// - int8 (`ares_mm_i8_*`): the tile holds the weights' integer codes (Q4_K's
-//   0..15, a table value of an i-quant, ...), the activations are the int8
-//   values that ares_quantize_act produced for the decode kernels (same buffer,
-//   so one quantization serves both families), and the instruction is the
-//   integer `mma.m16n8k32` (`k16` for types with a scale per 16 values). The
-//   sub-block scales (and Q4_K's minimums) are applied to the integer result
-//   of each 32 values in f32.
-// - f16 (`ares_mm_f16_*`): the tile holds the dequantised weights as f16, the
-//   activations are f16, the instruction is `mma.m16n8k16` with f32
-//   accumulation, and nothing is applied per step. It is the direct, more exact
-//   product: no rounding of the activations to 8 bits.
-// Which one runs is decided per device (Kernels::prefill_path). GeForce cards
-// halve the rate of FP16 `mma` with f32 accumulation (but not of the integer
-// one) unless that cap is lifted; the int8 variant is the fast choice on a
-// capped card, and the f16 variant the exact one, which a card without the cap
-// runs at its full rate. Kernels::load measures which case a device is.
+// Three variants, one set of weight decoders
+// ------------------------------------------
+// - int8 (`ares_mm_i8_*`): the tile holds the weights' integer codes, the
+//   activations are the int8 values ares_quantize_act produced for the decode
+//   kernels, the instruction is the integer `mma.m16n8k32` (`k16` for types with a
+//   scale per 16 values), and the sub-block scales (and Q4_K's minimums) are applied
+//   to the integer result of each 32 values in f32. Error against the exact f32
+//   product: about 1.1 % rms (the 8-bit activations).
+// - f16 (`ares_mm_f16_*`): the tile holds the dequantised weights as f16, made from
+//   the codes and the f16 scales with packed f16x2 arithmetic (ares_mm_codes_to_f16);
+//   the activations are f16, divided per row by a power of two so that the largest
+//   value is below 1 (ares_convert_f16: no sum can overflow, any magnitude keeps its
+//   precision); `mma.m16n8k16` with f32 accumulation. 0.03 % rms.
+// - f16 with f16 accumulation (`ares_mm_h*_*`, template argument FLUSH = 4): the same
+//   tiles, but `mma` accumulates in f16 and the partial sum of every 4 `mma` (64
+//   values of K, at most 64 products of a weight and a value below 1) is added to
+//   f32 registers. GeForce cards run that at twice the rate of f32 accumulation.
+//   0.05 % rms, 0.12 % at worst on the test data.
+// Which one runs is the caller's choice (Kernels::prefill_path: int8 is the fast
+// one on a capped card, as the measurements below show).
 //
 // Structure of a thread block
 // ---------------------------
-// A block computes a tile of I weight rows by J activation rows. The weights are
-// the A operand of `mma` (16 rows), the activations the B operand (8 rows):
-// every result element then is `y[b][r]` with consecutive r in consecutive lanes
-// of a quad, which stores 32-byte segments without staging through shared
-// memory. The K dimension goes through in steps of 64 values.
+// A block computes a tile of I weight rows by J activation rows. The weights are the
+// A operand of `mma` (16 rows), the activations the B operand (8 rows): every
+// result element then is `y[b][r]` with consecutive r in consecutive lanes of a
+// quad, which stores 32-byte segments without staging through shared memory. The K
+// dimension goes through in steps of 64 values.
 //
-//   - Activations: `cp.async` straight into shared memory, double buffered; the
-//     rows of a tile are contiguous in global memory (n_in bytes per row).
-//   - Weights: a thread loads the raw bytes of its share of the next step into
-//     registers while the tensor cores work on the current one, then decodes
-//     them (T::decode) and writes the tile (int8 codes or f16) for the step
-//     after. One `__syncthreads` per step.
-//   - Shared memory per block is below 48 KB: more would need the launch
-//     attribute CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, which the
-//     Function wrapper does not set. Two blocks of that size share an SM, which
-//     is what hides the latency of one block's barriers.
-//   - The grid is 1-D and ordered so that the blocks running at the same time
-//     share weight tiles: a group of `group` activation tiles takes all weight
-//     tiles in turn. The weights then come from DRAM once per group instead of
-//     once per block (a Q4_K matrix of 17408 x 5120 with 1024 rows on an RTX
-//     4070: 4.45 ms -> 2.64 ms in the first version of the kernel), and the
-//     activations of a group stay in L2.
+//   - Activations: `cp.async` straight into shared memory, double buffered; the rows
+//     of a tile are contiguous in global memory.
+//   - Weights: a thread loads the raw bytes of a share of a step into registers two
+//     steps before they are used; in the f16 variants the decoding of the next
+//     step's tile happens inside the loop of `mma` (after the second slab of 16
+//     values) so that it overlaps the tensor cores, and all warps take part (a unit
+//     is one run of 16 values; a warp decodes one run). One `__syncthreads` per step.
+//   - Dynamic shared memory (the launch asks for AresMmLayout::BYTES): 49 KB (int8)
+//     to 74 KB (f16) for the large shape, which owns an SM; the medium and small
+//     shapes (64 x 64 and 64 x 32, blocks of 4 warps) are for batches of up to 64
+//     rows.
+//   - The grid is 1-D and ordered so that the blocks running at the same time share
+//     weight tiles: a group of `group` activation tiles takes all weight tiles in
+//     turn (ares_mm_tile).
 //
-// What bounds the kernels, and how that is known
-// ----------------------------------------------
-// Measured with ablations (a kernel with the weight path, the activation path
-// or the scaling of the results removed in turn), `cuobjdump` instruction
-// counts and the probe in prefill.cu; `ncu` counters are not available on the
-// development machine.
+// What bounds the kernels, and how that is known (RTX 4070 / RTX 3060, Q4_K,
+// 17408 x 5120, 1024 rows; no hardware counters are available, so by ablation:
+// the same kernel with a part removed)
+// ------------------------------------------------------------------------------
+// - int8: 73 to 80 TOPS (of 234) / 33.6 (of 102). The loop of a warp is 416
+//   instructions per step of which 192 scale the integer results (3 FFMA per output
+//   and 32 values), so the four warps of a scheduler issue 1664 instructions while
+//   the tensor cores need 1024 cycles: the kernel cannot reach the tensor cores'
+//   rate whatever the overlap, and the per-group float scaling is why. Removing the
+//   scaling gives 111 TOPS, removing the weight path 90, the activation path 90, an
+//   empty skeleton of `mma`, `ldmatrix` and barriers 167.
+// - f16 with f32 accumulation: 85 to 88 % of the capped rate of the tensor cores
+//   (49 of 58.6 TFLOPS / 19.8 of 25.6). With f16 accumulation (the rate an
+//   uncapped card has for f32 accumulation) the same tile kernel got 65 TFLOPS on
+//   the RTX 4070, 28 on the RTX 3060; the skeleton alone reaches 103 / 44 of 117 /
+//   51.
+// - What held the tile kernels back in that form was not arithmetic: with every
+//   weight row reading the same address (all loads hit L1) the kernel is 35 %
+//   faster. The file's layout puts the 36 to 70 bytes a row needs per step 2880
+//   bytes from the next row's, so one load of a warp touches 16 lines, and the load
+//   unit, which `ldmatrix` shares, is busy with them. That is what the rearranged
+//   form of mmr.cuh removes. (An L2 prefetch of the weights, loading three steps
+//   ahead instead of two, and a different order of the decoding changed nothing.)
+// - Types with 2-byte aligned blocks (Q6_K, Q3_K, Q8_0, IQ4_NL): their words are
+//   read from aligned addresses and shifted, several per sector; with the loads
+//   kept in L1 (ares_ld_words_a2) Q6_K is 2.6 times as fast as with the
+//   non-allocating loads of the decode kernels. Q4_K's quants are loaded into L1
+//   for the same reason (the second warp that decodes the other run of an item
+//   reads them again): on the RTX 3060 that is 22.9 against 28.7 TFLOPS.
 //
-// - Large batches (256 rows and more): no single resource. On the RTX 4070 the
-//   integer `mma` and `ldmatrix` alone reach 87% of the tensor cores' peak
-//   (204 of 234 TOPS). Adding the scaling of the results (a conversion, a
-//   multiply and two fused multiply-adds per output and 32 values of K: 260 of
-//   the 500 to 620 instructions a warp issues per step) leaves 115 TOPS; the
-//   full kernel with the weight path removed reaches 89, with the activation
-//   path removed 83, and the whole kernel about 65. The costs add instead of
-//   overlapping because a step is short (a few microseconds) and every warp of
-//   a block waits for the same barrier.
-//   Deeper prefetch of the weights (lookahead 2 and 3), more blocks per SM and
-//   a prefetch of weight lines into L2 did not change the time or made it worse;
-//   removing a fifth of the instructions (hoisting the address arithmetic out of
-//   the loop) did not change it either, so it is not the number of instructions
-//   but the latency chain of a step. The f16 variant reaches 85 to 88% of the
-//   capped rate of f16 `mma` with f32 accumulation on both GPUs (49.6 of 58.6 and
-//   22.5 of 25.6 TFLOPS for Q4_K at 1024 rows); with f16 accumulation, the rate
-//   of an uncapped card, it takes the same time (49.1 TFLOPS on the RTX 4070), so
-//   something other than the rate of the tensor cores bounds it, and why it
-//   gains nothing from the doubled rate is not settled.
-// - Small batches (up to 64 rows): the weights. The kernels read 32 to 70
-//   bytes of each of 64 to 128 rows per step, which GDDR6 serves at about a
-//   third of its bandwidth (the same kernel with every block reading the same
-//   128 rows from L2 takes 0.20 ms instead of 0.37 ms for 64 rows). A loader that
-//   reads whole blocks per row at once would need 20 to 100 more registers per
-//   thread; it is the next step for this range.
-// - Types with 2-byte aligned blocks (Q6_K, Q3_K, Q8_0, IQ4_NL): their words
-//   are read from aligned addresses and shifted, several per sector; with the
-//   loads kept in L1 (ares_ld_words_a2) Q6_K is 2.6 times as fast as with the
-//   non-allocating loads of the decode kernels.
-//
-// A type `T` provides (mm_types.cuh):// A type `T` provides (mm_types.cuh):
+// A type `T` provides (mm_types.cuh):
 //   BLOCK_VALUES, BLOCK_BYTES, SMEM_BYTES, init   as in the decode kernels
 //   HAS_MIN                the values have an offset per 32: v = sw * code - mw
 //   SPLIT16                the scale changes every 16 values (an integer scale
 //                          per half of a 32-value item)
 //   SIGNED_CODES           the codes are signed bytes (table values, grid values
 //                          with signs, Q6_K's code - 32), not 0..255
+//   MAGIC                  the integer sums of an item stay below 2^22 (the int8
+//                          scaling may use the mantissa trick)
 //   ITEM_STRIDE, RUN_STRIDE   where an item's two runs of 16 codes go in the
 //                          64-value row of the tile: item * ITEM_STRIDE + run *
 //                          RUN_STRIDE
 //   Raw load(row, chunk, item)       the global loads of an item
-//   void decode(raw, chunk, item, smem, AresMmDec&)   the decoding
+//   void decode(raw, chunk, item, smem, AresMmDec&)   the decoding: 32 codes, one
+//                          per byte, the scale entry of the int8 variant and the
+//                          scales (sw, mw) of each run for the f16 variants
 // A step of 64 values has two items per weight row (32 values each).
 #pragma once
 
@@ -127,6 +125,9 @@ struct AresMmDec {
 // bytes: the data (64 bytes of int8, 128 of f16) plus 16, so that the eight rows
 // of one `ldmatrix` matrix fall into different banks.
 #define ARES_MM_KC 64
+// The f16 variant decodes the weights of the next step after this many of the 4 slabs
+// of 16 values of the current one (the loads were asked for a step ago).
+#define ARES_MM_DECODE_AT 1
 #define ARES_MM_PITCH8 80
 #define ARES_MM_PITCH16 144
 
@@ -150,6 +151,12 @@ static __device__ __forceinline__ void ares_cp_commit() {
 
 static __device__ __forceinline__ void ares_cp_wait_all() {
     asm volatile("cp.async.wait_group 0;");
+}
+
+// Waits until at most N of the groups committed by this thread are pending.
+template <int N>
+static __device__ __forceinline__ void ares_cp_wait_group() {
+    asm volatile("cp.async.wait_group %0;" ::"n"(N));
 }
 
 // Four 8x8 matrices of 16-bit values (8 rows of 16 bytes each) from shared
@@ -180,6 +187,32 @@ static __device__ __forceinline__ void ares_mma_f16_k16(float (&c)[4], const uin
     asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
                  : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
                  : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+
+// 16x8 outputs, 16 values of K, f16 inputs and f16 accumulation: the result is
+// d (two registers of two f16) = a * b (+ c when `ACCUM`). The tensor cores of
+// the GeForce cards run this at twice the rate of the f32 accumulation.
+template <bool ACCUM>
+static __device__ __forceinline__ void ares_mma_f16acc_k16(uint32_t (&d)[2], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
+    if (ACCUM) {
+        asm volatile("mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%0,%1};"
+                     : "+r"(d[0]), "+r"(d[1])
+                     : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+    } else {
+        asm volatile("mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%8,%8};"
+                     : "=r"(d[0]), "=r"(d[1])
+                     : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1), "r"(0));
+    }
+}
+
+// c += the four f16 values of d, in f32.
+static __device__ __forceinline__ void ares_flush_f16(float (&c)[4], const uint32_t (&d)[2]) {
+    const float2 lo = __half22float2(*reinterpret_cast<const __half2*>(&d[0]));
+    const float2 hi = __half22float2(*reinterpret_cast<const __half2*>(&d[1]));
+    c[0] += lo.x;
+    c[1] += lo.y;
+    c[2] += hi.x;
+    c[3] += hi.y;
 }
 
 // N consecutive 32-bit words from an address that is only 2-byte aligned (the
@@ -241,6 +274,7 @@ struct AresMmLayout {
 };
 
 extern __shared__ __align__(16) uint8_t ares_dyn_smem[];
+
 
 // A launch that asked for less shared memory than the kernel lays out would
 // read and write beyond its block; stop it instead.
@@ -590,12 +624,74 @@ static __device__ __forceinline__ void ares_mm_i8(
 // ---------------------------------------------------------------------------
 // The f16 variant.
 //
-//   ax   n_batch rows of n_in f16 values (ares_convert_f16)
+//   ax   n_batch rows of n_in f16 values, then (16-byte aligned) one f32 per row:
+//        the factor 2^e the row was divided by so that its largest value is at
+//        most 1 (ares_convert_f16)
 //
-// The tile of the weights holds `sw * code - mw` rounded to f16, the same
-// rounding the CPU emulation in the tests applies to `ares_quant::dequantize`,
-// and the products are summed in f32.
-template <class T, int I, int J, int WM, int WN, int KC>
+// The tile of the weights holds `sw * code - mw` as f16, made by packed f16x2
+// arithmetic straight from the codes (below); the products are summed either in
+// f32 (FLUSH = 0, the rate of the tensor cores on a card without the GeForce cap)
+// or in f16 for FLUSH mma of 16 values of K, after which the f16 partial sums are
+// added to f32 registers (the capped cards run that at twice the rate). A partial
+// sum is at most 16 * FLUSH products of a weight and a value of at most 1.
+
+// Two f16 values with the bits 0x64XX are 1024 + XX; twice that many bytes to the
+// f16 pair a `prmt` makes of two codes.
+static __device__ __forceinline__ uint32_t ares_h2_sub(uint32_t a, uint32_t b) {
+    uint32_t d;
+    asm("sub.rn.f16x2 %0, %1, %2;" : "=r"(d) : "r"(a), "r"(b));
+    return d;
+}
+static __device__ __forceinline__ uint32_t ares_h2_mul(uint32_t a, uint32_t b) {
+    uint32_t d;
+    asm("mul.rn.f16x2 %0, %1, %2;" : "=r"(d) : "r"(a), "r"(b));
+    return d;
+}
+static __device__ __forceinline__ uint32_t ares_h2_fma(uint32_t a, uint32_t b, uint32_t c) {
+    uint32_t d;
+    asm("fma.rn.f16x2 %0, %1, %2, %3;" : "=r"(d) : "r"(a), "r"(b), "r"(c));
+    return d;
+}
+
+// The 16 values of one run: codes cw[0..3] (four per word, one per byte) as
+// f16 pairs out[0..7]: out = sw * code - mw, in order.
+template <bool SIGNED>
+static __device__ __forceinline__ void ares_mm_codes_to_f16(const uint32_t (&cw)[4], float sw, float mw, uint32_t (&out)[8]) {
+    const __half2 s2h = __float2half2_rn(sw), m2h = __float2half2_rn(-mw);
+    const uint32_t s2 = *reinterpret_cast<const uint32_t*>(&s2h), m2 = *reinterpret_cast<const uint32_t*>(&m2h);
+    const uint32_t bias = SIGNED ? 0x64806480u : 0x64006400u;  // 1152 or 1024
+#pragma unroll
+    for (int i = 0; i < 4; i++) {
+        const uint32_t w = SIGNED ? (cw[i] ^ 0x80808080u) : cw[i];
+        const uint32_t p0 = __byte_perm(w, 0x64646464u, 0x4140);
+        const uint32_t p1 = __byte_perm(w, 0x64646464u, 0x4342);
+        out[2 * i] = ares_h2_fma(ares_h2_sub(p0, bias), s2, m2);
+        out[2 * i + 1] = ares_h2_fma(ares_h2_sub(p1, bias), s2, m2);
+    }
+}
+
+// The decoding of one item (32 values): the f16 values of its two runs.
+template <class T>
+static __device__ __forceinline__ void ares_mm_decode_item(
+    const typename T::Raw& src, uint32_t chunk, uint32_t item, const uint8_t* table, bool valid, uint32_t (&out)[2][8]) {
+    AresMmDec dec;
+    if (valid) {
+        T::decode(src, chunk, item, table, dec);
+    } else {
+#pragma unroll
+        for (int i = 0; i < 8; i++) {
+            dec.w[i] = 0;
+        }
+        dec.sw[0] = dec.sw[1] = dec.mw[0] = dec.mw[1] = 0.0f;
+    }
+#pragma unroll
+    for (int run = 0; run < 2; run++) {
+        const uint32_t cw[4] = {dec.w[4 * run], dec.w[4 * run + 1], dec.w[4 * run + 2], dec.w[4 * run + 3]};
+        ares_mm_codes_to_f16<T::SIGNED_CODES>(cw, dec.sw[run], dec.mw[run], out[run]);
+    }
+}
+
+template <class T, int I, int J, int WM, int WN, int KC, int FLUSH = 0>
 static __device__ __forceinline__ void ares_mm_f16(
     const uint8_t* __restrict__ w, const __half* __restrict__ ax, float* __restrict__ y,
     uint32_t n_in, uint32_t n_out, uint32_t n_batch, uint32_t group, uint32_t prefetch) {
@@ -603,11 +699,16 @@ static __device__ __forceinline__ void ares_mm_f16(
     constexpr int NT = WM * WN * 32;
     constexpr int TM = I / WM, TN = J / WN, MT = TM / 16, NTL = TN / 8;
     constexpr int SUBS = Lay::SUBS, PITCH = Lay::PITCH;
-    constexpr int AITEMS = (I * SUBS + NT - 1) / NT;
+    // The items of the weight tile this thread decodes (32 values of one row, in two
+    // runs of 16); thread tid takes items tid, tid + NT ...
+    constexpr int ITEMS = I * SUBS;
+    constexpr int AUNITS = (ITEMS + NT - 1) / NT;
     constexpr int PB = KC / 8;
     constexpr int BI = (J * PB + NT - 1) / NT;
     static_assert(I % (16 * WM) == 0 && J % (16 * WN) == 0, "warp tile");
     static_assert(KC % 64 == 0, "a step holds whole chunks of 64 values");
+    
+    static_assert((KC / 16) % (FLUSH == 0 ? 1 : FLUSH) == 0, "the partial sums end with a step");
     ares_check_smem(Lay::BYTES);
 
     uint8_t* const table = ares_dyn_smem + 2 * Lay::STAGE;
@@ -640,20 +741,21 @@ static __device__ __forceinline__ void ares_mm_f16(
             }
         }
     }
+    uint32_t hacc[MT][NTL][2];
 
-    typename T::Raw raw[AITEMS];
+    typename T::Raw raw[AUNITS];
 
-    // Everything that does not change from step to step is computed once (see
-    // ares_mm_i8).
-    const uint8_t* w_row[AITEMS];
-    uint32_t a_off[AITEMS];
-    uint32_t a_sub[AITEMS];
-    bool a_on[AITEMS];
+    // Everything that does not change from step to step is computed once.
+    const uint8_t* w_row[AUNITS];
+    uint32_t a_off[AUNITS];
+    uint32_t a_sub[AUNITS];
+    bool a_on[AUNITS];
 #pragma unroll
-    for (int u = 0; u < AITEMS; u++) {
-        const uint32_t item = tid + u * NT;
+    for (int u = 0; u < AUNITS; u++) {
+        const uint32_t unit = tid + u * NT;
+        const uint32_t item = unit;
         const uint32_t r = item / SUBS, sub = item % SUBS;
-        a_on[u] = item < I * SUBS;
+        a_on[u] = unit < ITEMS;
         a_sub[u] = sub;
         w_row[u] = w + static_cast<size_t>(min(row0 + r, n_out - 1)) * row_bytes;
         a_off[u] = r * PITCH + 2 * ((sub >> 1) * 64 + (sub & 1) * T::ITEM_STRIDE);
@@ -671,9 +773,9 @@ static __device__ __forceinline__ void ares_mm_f16(
     }
     const bool whole = (n_in & (KC - 1)) == 0;
 
-    auto load_weights = [&](uint32_t step, typename T::Raw (&dst)[AITEMS]) {
+    auto load_weights = [&](uint32_t step, typename T::Raw (&dst)[AUNITS]) {
 #pragma unroll
-        for (int u = 0; u < AITEMS; u++) {
+        for (int u = 0; u < AUNITS; u++) {
             const uint32_t g32 = step * SUBS + a_sub[u];
             if (a_on[u] && (whole || 32 * g32 < n_in)) {
                 dst[u] = T::load(w_row[u], g32 >> 1, g32 & 1);
@@ -700,53 +802,20 @@ static __device__ __forceinline__ void ares_mm_f16(
             }
         }
     };
-    // A code as f32: the byte is placed in the mantissa of 2^23 (unsigned) or
-    // 1.5 * 2^23 (signed), which makes the exact integer, and the offset comes
-    // off again. No integer-to-float conversion is needed.
-    auto store_weights = [&](uint32_t step, int stage, const typename T::Raw (&src)[AITEMS]) {
+    // Decodes the runs loaded for step `step` into the tile of `stage`.
+    auto store_weights = [&](uint32_t step, int stage, const typename T::Raw (&src)[AUNITS]) {
 #pragma unroll
-        for (int u = 0; u < AITEMS; u++) {
+        for (int u = 0; u < AUNITS; u++) {
             const uint32_t g32 = step * SUBS + a_sub[u];
             if (a_on[u]) {
-                AresMmDec dec;
-                if (whole || 32 * g32 < n_in) {
-                    T::decode(src[u], g32 >> 1, g32 & 1, table, dec);
-                } else {
-#pragma unroll
-                    for (int i = 0; i < 8; i++) {
-                        dec.w[i] = 0;
-                    }
-                    dec.sw[0] = dec.sw[1] = dec.mw[0] = dec.mw[1] = 0.0f;
-                }
-                uint8_t* tile = a_s(stage) + a_off[u];
+                const bool valid = whole || 32 * g32 < n_in;
+                uint32_t out[2][8];
+                ares_mm_decode_item<T>(src[u], g32 >> 1, g32 & 1, table, valid, out);
+                uint8_t* dst = a_s(stage) + a_off[u];
 #pragma unroll
                 for (int run = 0; run < 2; run++) {
-                    uint8_t* dst = tile + 2 * run * T::RUN_STRIDE;
-#pragma unroll
-                    for (int q = 0; q < 2; q++) {
-                        // 8 codes: words 4 * run + 2 * q and + 1.
-                        uint32_t out[4];
-#pragma unroll
-                        for (int half_word = 0; half_word < 2; half_word++) {
-                            const uint32_t word = dec.w[4 * run + 2 * q + half_word];
-#pragma unroll
-                            for (int pair = 0; pair < 2; pair++) {
-                                const uint32_t b0 = (word >> (16 * pair)) & 0xFF;
-                                const uint32_t b1 = (word >> (16 * pair + 8)) & 0xFF;
-                                float f0, f1;
-                                if (T::SIGNED_CODES) {
-                                    f0 = __int_as_float(0x4B400000 + static_cast<int>(static_cast<int8_t>(b0))) - 12582912.0f;
-                                    f1 = __int_as_float(0x4B400000 + static_cast<int>(static_cast<int8_t>(b1))) - 12582912.0f;
-                                } else {
-                                    f0 = __uint_as_float(0x4B000000u | b0) - 8388608.0f;
-                                    f1 = __uint_as_float(0x4B000000u | b1) - 8388608.0f;
-                                }
-                                const __half2 v = __floats2half2_rn(fmaf(dec.sw[run], f0, -dec.mw[run]), fmaf(dec.sw[run], f1, -dec.mw[run]));
-                                out[2 * half_word + pair] = *reinterpret_cast<const uint32_t*>(&v);
-                            }
-                        }
-                        *reinterpret_cast<uint4*>(dst + 16 * q) = make_uint4(out[0], out[1], out[2], out[3]);
-                    }
+                    *reinterpret_cast<uint4*>(dst + 2 * run * T::RUN_STRIDE) = make_uint4(out[run][0], out[run][1], out[run][2], out[run][3]);
+                    *reinterpret_cast<uint4*>(dst + 2 * run * T::RUN_STRIDE + 16) = make_uint4(out[run][4], out[run][5], out[run][6], out[run][7]);
                 }
             }
         }
@@ -762,18 +831,26 @@ static __device__ __forceinline__ void ares_mm_f16(
         }
     };
 
+    // The raw bytes of the weights are loaded two steps ahead of their use: those of
+    // step + 2 are asked for at the start of step, those of step + 1 (asked for one
+    // step ago) are decoded in the middle of it into the tile of the next step.
+    typename T::Raw raw_b[AUNITS];
     load_acts(0, 0);
     ares_cp_commit();
     load_weights(0, raw);
     store_weights(0, 0, raw);
+    if (n_steps > 1) {
+        load_weights(1, raw);
+    }
 
-    for (uint32_t step = 0; step < n_steps; step++) {
-        const int stage = step & 1;
+    auto step_body = [&](uint32_t step, int stage, typename T::Raw (&rd)[AUNITS], typename T::Raw (&ld)[AUNITS]) {
         ares_cp_wait_all();
         __syncthreads();
         if (step + 1 < n_steps) {
             load_acts(step + 1, stage ^ 1);
-            load_weights(step + 1, raw);
+        }
+        if (step + 2 < n_steps) {
+            load_weights(step + 2, ld);
         }
         ares_cp_commit();
 
@@ -800,25 +877,48 @@ static __device__ __forceinline__ void ares_mm_f16(
             for (int ni = 0; ni < NTL; ni++) {
 #pragma unroll
                 for (int mi = 0; mi < MT; mi++) {
-                    ares_mma_f16_k16(acc[mi][ni], a[mi], b[ni][0], b[ni][1]);
+                    if constexpr (FLUSH == 0) {
+                        ares_mma_f16_k16(acc[mi][ni], a[mi], b[ni][0], b[ni][1]);
+                    } else {
+                        if (kk % FLUSH == 0) {
+                            ares_mma_f16acc_k16<false>(hacc[mi][ni], a[mi], b[ni][0], b[ni][1]);
+                        } else {
+                            ares_mma_f16acc_k16<true>(hacc[mi][ni], a[mi], b[ni][0], b[ni][1]);
+                        }
+                        if (kk % FLUSH == FLUSH - 1) {
+                            ares_flush_f16(acc[mi][ni], hacc[mi][ni]);
+                        }
+                    }
                 }
             }
+            if (kk == ARES_MM_DECODE_AT && step + 1 < n_steps) {
+                store_weights(step + 1, stage ^ 1, rd);
+            }
         }
+    };
+    for (uint32_t step = 0; step < n_steps; step += 2) {
+        step_body(step, 0, raw, raw_b);
         if (step + 1 < n_steps) {
-            store_weights(step + 1, stage ^ 1, raw);
+            step_body(step + 1, 1, raw_b, raw);
         }
     }
 
+    // The rows were divided by their scale (ares_convert_f16): put it back.
+    const float* const row_scale =
+        reinterpret_cast<const float*>(reinterpret_cast<const uint8_t*>(ax) + ares_act_ds_offset(static_cast<size_t>(n_batch) * n_in * 2));
 #pragma unroll
-    for (int mi = 0; mi < MT; mi++) {
+    for (int ni = 0; ni < NTL; ni++) {
+        const uint32_t c0 = col0 + wn * TN + ni * 8 + 2 * t;
+        const float s0 = c0 < n_batch ? row_scale[c0] : 0.0f;
+        const float s1 = c0 + 1 < n_batch ? row_scale[c0 + 1] : 0.0f;
 #pragma unroll
-        for (int ni = 0; ni < NTL; ni++) {
+        for (int mi = 0; mi < MT; mi++) {
 #pragma unroll
             for (int e = 0; e < 4; e++) {
                 const uint32_t r = row0 + wm * TM + mi * 16 + g + (e >> 1) * 8;
-                const uint32_t c = col0 + wn * TN + ni * 8 + 2 * t + (e & 1);
+                const uint32_t c = c0 + (e & 1);
                 if (r < n_out && c < n_batch) {
-                    y[static_cast<size_t>(c) * n_out + r] = acc[mi][ni][e];
+                    y[static_cast<size_t>(c) * n_out + r] = acc[mi][ni][e] * ((e & 1) ? s1 : s0);
                 }
             }
         }
@@ -827,9 +927,48 @@ static __device__ __forceinline__ void ares_mm_f16(
 
 // One kernel of a type and a shape. `THREADS` and `BLOCKS` (blocks per SM) go
 // to `__launch_bounds__`; the shapes are in prefill.cu.
-#define ARES_MM_KERNEL(NAME, THREADS, BLOCKS, VARIANT, T, I, J, WM, WN, KC, ACT)                \
+#define ARES_MM_KERNEL(NAME, THREADS, BLOCKS, VARIANT, T, I, J, WM, WN, KC, ACT, ...)           \
     extern "C" __global__ void __launch_bounds__(THREADS, BLOCKS) NAME(                         \
         const uint8_t* w, const ACT* act, float* y, uint32_t n_in, uint32_t n_out,              \
         uint32_t n_batch, uint32_t group, uint32_t prefetch) {                                   \
-        VARIANT<T, I, J, WM, WN, KC>(w, act, y, n_in, n_out, n_batch, group, prefetch);         \
+        VARIANT<T, I, J, WM, WN, KC, ##__VA_ARGS__>(w, act, y, n_in, n_out, n_batch, group, prefetch); \
     }
+
+// The activations of the f16 variant: row b of n_in values as f16, divided by a
+// power of two chosen so that the row's largest value is below 1 (then no sum of
+// the kernel can overflow an f16, and rows of any magnitude keep their precision),
+// and, behind the values (at the next multiple of 16 bytes), the f32 factor of each
+// row. One block of 256 threads per row.
+ARES_KERNEL ares_convert_f16(const float* x, __half* out, uint32_t n_in, uint32_t n_batch) {
+    __shared__ float peak[8];
+    const uint32_t b = blockIdx.x;
+    const float* row = x + static_cast<size_t>(b) * n_in;
+    float m = 0.0f;
+    for (uint32_t i = threadIdx.x; i < n_in; i += blockDim.x) {
+        m = fmaxf(m, fabsf(row[i]));
+    }
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, offset));
+    }
+    if ((threadIdx.x & 31) == 0) {
+        peak[threadIdx.x >> 5] = m;
+    }
+    __syncthreads();
+    m = peak[0];
+    for (int i = 1; i < 8; i++) {
+        m = fmaxf(m, peak[i]);
+    }
+    int e = 0;
+    if (m > 0.0f && isfinite(m)) {
+        frexpf(m, &e);
+        e = max(-100, min(100, e));
+    }
+    const float scale = ldexpf(1.0f, e), inv = ldexpf(1.0f, -e);
+    __half* const o = out + static_cast<size_t>(b) * n_in;
+    for (uint32_t i = threadIdx.x; i < n_in; i += blockDim.x) {
+        o[i] = __float2half_rn(row[i] * inv);
+    }
+    if (threadIdx.x == 0) {
+        reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(out) + ares_act_ds_offset(static_cast<size_t>(n_batch) * n_in * 2))[b] = scale;
+    }
+}

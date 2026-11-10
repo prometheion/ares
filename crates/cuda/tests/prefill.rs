@@ -51,7 +51,7 @@ const TYPES: [(GgmlType, &[usize]); 11] = [
     (GgmlType::Q8_0, &[0]),
 ];
 
-const PATHS: [PrefillPath; 2] = [PrefillPath::Int8, PrefillPath::F16];
+const PATHS: [PrefillPath; 3] = [PrefillPath::Int8, PrefillPath::F16, PrefillPath::F16Flush];
 
 fn gpus() -> Option<&'static [Device]> {
     static DEVICES: OnceLock<Option<Vec<Device>>> = OnceLock::new();
@@ -281,7 +281,9 @@ fn deviation(
     // The weights as the kernel computes with them.
     let used: Vec<f64> = match path {
         PrefillPath::Int8 => weights.iter().map(|v| f64::from(*v)).collect(),
-        PrefillPath::F16 => weights.iter().map(|v| through_f16(*v)).collect(),
+        PrefillPath::F16 | PrefillPath::F16Flush => {
+            weights.iter().map(|v| through_f16(*v)).collect()
+        }
     };
     let mut worst_tight = 0f64;
     let (mut err2, mut ref2, mut err_max, mut ref_max, mut scale2) = (0f64, 0f64, 0f64, 0f64, 0f64);
@@ -289,7 +291,9 @@ fn deviation(
         let xb = &x[b * n_in..][..n_in];
         let xs: Vec<f64> = match path {
             PrefillPath::Int8 => quantized_like_the_gpu(xb),
-            PrefillPath::F16 => xb.iter().map(|v| through_f16(*v)).collect(),
+            PrefillPath::F16 | PrefillPath::F16Flush => {
+                xb.iter().map(|v| through_f16(*v)).collect()
+            }
         };
         for r in 0..n_out {
             let (mut emulated, mut magnitude, mut exact, mut squares) = (0f64, 0f64, 0f64, 0f64);
@@ -325,11 +329,20 @@ fn deviation(
 /// bits per group of 32, as the decode kernels do (their tests use the same
 /// bounds); f16 rounds the weights and activations to 11 bits.
 fn assert_within(path: PrefillPath, what: &str, dev: &Deviation, enough_outputs: bool) {
-    assert!(dev.tight < 5e-5, "{what}: differs from the emulation: {}", dev.describe());
+    // The emulation rounds each weight once to f16 and sums exactly. The int8 kernel
+    // computes exactly that. The f16 kernels make the weight from f16 scales with
+    // packed f16 arithmetic (up to three roundings of 2^-11 instead of one), and
+    // the flushing one also rounds partial sums of 64 products to f16.
+    let tight = match path {
+        PrefillPath::Int8 => 5e-5,
+        PrefillPath::F16 => 2e-3,
+        PrefillPath::F16Flush => 4e-3,
+    };
+    assert!(dev.tight < tight, "{what}: differs from the emulation: {}", dev.describe());
     if enough_outputs {
         let bound = match path {
             PrefillPath::Int8 => 0.03,
-            PrefillPath::F16 => 0.003,
+            PrefillPath::F16 | PrefillPath::F16Flush => 0.003,
         };
         assert!(dev.loose_scaled < bound, "{what}: far from the f32 product: {}", dev.describe());
     }
@@ -684,6 +697,12 @@ fn the_path_follows_the_measured_tensor_core_rate() {
         assert_eq!(kernels.prefill_path(Precision::Exact).unwrap(), PrefillPath::F16);
         let fast = kernels.prefill_path(Precision::Fast).unwrap();
         assert_eq!(fast, if full { PrefillPath::F16 } else { PrefillPath::Int8 });
+        for ty in [GgmlType::Q4_K, GgmlType::IQ2_S, GgmlType::IQ2_XS, GgmlType::Q6_K] {
+            let flush = !full && ty != GgmlType::Q6_K;
+            let expected = if flush { PrefillPath::F16Flush } else { fast };
+            assert_eq!(kernels.prefill_path_for(ty, Precision::Fast).unwrap(), expected, "{ty}");
+            assert_eq!(kernels.prefill_path_for(ty, Precision::Exact).unwrap(), PrefillPath::F16);
+        }
     }
 }
 
@@ -756,5 +775,133 @@ fn bad_arguments_are_refused() {
         );
         // No weight rows is nothing to do, not an error, and a null address is not touched.
         kernels.matmul(&stream, GgmlType::Q4_K, int8, null, null, null, 256, 0, 1).unwrap();
+    }
+}
+
+/// The output of `Kernels::matmul_rearranged` for a Q4_K matrix `w` (file form,
+/// rearranged on the device first).
+#[allow(clippy::too_many_arguments)]
+fn run_matmul_rearranged(
+    device: &Device,
+    kernels: &Kernels,
+    path: PrefillPath,
+    w: &[u8],
+    x: &[f32],
+    n_in: usize,
+    n_out: usize,
+    n_rows: usize,
+) -> Vec<f32> {
+    let stream = Stream::new(device, 0).unwrap();
+    let dw = DeviceBuffer::new(device, w.len() as u64).unwrap();
+    dw.write(0, w).unwrap();
+    let bytes = Kernels::rearranged_bytes(GgmlType::Q4_K, n_out as u32, n_in as u32).unwrap();
+    let dr = DeviceBuffer::new(device, bytes).unwrap();
+    let dx = DeviceBuffer::new(device, x.len() as u64 * 4).unwrap();
+    dx.write(0, &f32_bytes(x)).unwrap();
+    let act = DeviceBuffer::new(
+        device,
+        Kernels::prefill_activation_bytes(path, n_in as u32, n_rows as u32),
+    )
+    .unwrap();
+    let dy = DeviceBuffer::new(device, (n_rows * n_out * 4) as u64).unwrap();
+    // SAFETY: the buffers were sized for these shapes just above.
+    unsafe {
+        kernels
+            .rearrange(&stream, GgmlType::Q4_K, dw.ptr(), dr.ptr(), n_out as u32, n_in as u32)
+            .unwrap();
+        kernels
+            .prepare_prefill_activations(
+                &stream,
+                path,
+                dx.ptr(),
+                act.ptr(),
+                n_in as u32,
+                n_rows as u32,
+            )
+            .unwrap();
+        kernels
+            .matmul_rearranged(
+                &stream,
+                GgmlType::Q4_K,
+                path,
+                dr.ptr(),
+                act.ptr(),
+                dy.ptr(),
+                n_in as u32,
+                n_out as u32,
+                n_rows as u32,
+            )
+            .unwrap();
+    }
+    stream.synchronize().unwrap();
+    read_f32(&dy, n_rows * n_out)
+}
+
+/// The rearranged form of Q4_K is the same number of bytes (rows rounded up to 16),
+/// and the kernel that reads it gives the product of the tile kernel on the file's
+/// form (the same f16 weights and sums; only the order of the f32 sums can differ)
+/// and is as close to the f32 product as the f16 paths are, for matrices that
+/// leave tiles of 16 and 128 rows and of 128 activation rows partly empty.
+#[test]
+fn the_rearranged_form_gives_the_product_of_the_file_form() {
+    let Some(gpus) = gpus() else { return };
+    let mut rng = Rng(0x9e3779b97f4a7c15);
+    assert_eq!(
+        Kernels::rearranged_bytes(GgmlType::Q4_K, 17408, 5120),
+        Some(17408 * 5120 / 256 * 144)
+    );
+    assert_eq!(Kernels::rearranged_bytes(GgmlType::Q4_K, 17, 256), Some(32 * 144));
+    assert_eq!(Kernels::rearranged_bytes(GgmlType::Q6_K, 16, 256), None);
+    for device in gpus {
+        let kernels = Kernels::load(device).unwrap();
+        if !kernels.has_prefill_kernels() {
+            continue;
+        }
+        let shapes = [
+            (256, 1, 1),
+            (256, 16, 8),
+            (512, 17, 3),
+            (256, 100, 65),
+            (1280, 129, 127),
+            (768, 130, 128),
+            (512, 300, 129),
+            (1024, 257, 300),
+            (2560, 512, 33),
+        ];
+        for (n_in, n_out, n_rows) in shapes {
+            let w = random_blocks(&mut rng, GgmlType::Q4_K, n_in / 256 * n_out);
+            let x: Vec<f32> = (0..n_in * n_rows).map(|_| rng.activation()).collect();
+            for path in [PrefillPath::F16, PrefillPath::F16Flush] {
+                let have =
+                    run_matmul_rearranged(device, &kernels, path, &w, &x, n_in, n_out, n_rows);
+                let tile =
+                    run_matmul(device, &kernels, GgmlType::Q4_K, path, &w, &x, n_in, n_out, n_rows);
+                let dev = deviation(path, GgmlType::Q4_K, &w, &x, &have, n_in, n_out, n_rows);
+                eprintln!(
+                    "Q4_K {n_out}x{n_in} rows {n_rows} {path:?} rearranged on {}: {}",
+                    device.info().name,
+                    dev.describe()
+                );
+                assert_within(
+                    path,
+                    &format!("rearranged Q4_K {n_out}x{n_in} x{n_rows} {path:?}"),
+                    &dev,
+                    n_out * n_rows >= 16,
+                );
+                // Against the tile kernel: relative to the size of the sums.
+                let mut worst = 0f64;
+                for b in 0..n_rows {
+                    for r in 0..n_out {
+                        let d = f64::from(have[b * n_out + r] - tile[b * n_out + r]).abs();
+                        let m = f64::from(have[b * n_out + r].abs().max(tile[b * n_out + r].abs()));
+                        worst = worst.max(d / m.max(1e-3));
+                    }
+                }
+                assert!(
+                    worst < 2e-3,
+                    "rearranged Q4_K {n_out}x{n_in} x{n_rows} {path:?}: differs from the tile kernel by {worst:.2e}"
+                );
+            }
+        }
     }
 }
