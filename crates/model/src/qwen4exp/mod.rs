@@ -5,6 +5,7 @@
 //! is `docs/reference/qwen4exp-architecture.md`.
 
 pub mod config;
+pub mod device;
 mod error;
 pub mod reference;
 pub mod synthetic;

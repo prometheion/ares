@@ -8,6 +8,8 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+# Table rows and experts are read from the model file while it runs.
+ares-io = { path = "../io" }
 ares-api = { path = "../api" }
 ares-core.workspace = true
 ares-cuda.workspace = true

@@ -77,6 +77,16 @@ ARES_KERNEL ares_q4_squash(const float* down, float* lo, uint32_t n_values, floa
     }
 }
 
+// The scalar gate of the shared expert of the mixture of experts (section 3.7):
+// out[row][i] = y[row][i] * sigmoid(s[row]) for rows of n values, one thread
+// per value. In place (out == y) is allowed.
+ARES_KERNEL ares_q4_gate_scale(const float* y, const float* s, float* out, uint32_t rows, uint32_t n) {
+    const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < rows * n) {
+        out[i] = y[i] * ares_sigmoid(s[i / n]);
+    }
+}
+
 // The largest of / the sum over the 8 lanes of an aligned group of lanes.
 static __device__ __forceinline__ float q4_group8_max(float v) {
 #pragma unroll

@@ -342,6 +342,7 @@ pub struct Q4Kernels {
     device: Device,
     stream: Function,
     squash: Function,
+    gate_scale: Function,
     mix_quant: Function,
     indexer_window: Function,
     indexer_commit: Function,
@@ -369,6 +370,7 @@ impl Q4Kernels {
             device: device.clone(),
             stream: module.function("ares_q4_stream")?,
             squash: module.function("ares_q4_squash")?,
+            gate_scale: module.function("ares_q4_gate_scale")?,
             mix_quant: module.function("ares_q4_mix_quant")?,
             indexer_window: module.function("ares_q4_indexer_window")?,
             indexer_commit: module.function("ares_q4_indexer_commit")?,
@@ -529,6 +531,37 @@ impl Q4Kernels {
         let args = Args::new().ptr(down).ptr(lo).u32(n_values).f32(hc as f32);
         // SAFETY: the argument list matches ares_q4_squash.
         unsafe { self.squash.launch(stream, [n_values.div_ceil(256), 1, 1], [256, 1, 1], 0, args) }
+    }
+
+    /// The scalar gate of the shared expert of the mixture of experts:
+    /// `out[row] = y[row] * sigmoid(s[row])` for `rows` rows of `n` values,
+    /// with one gate value per row.
+    ///
+    /// # Safety
+    ///
+    /// `y` and `out` must address `rows * n` f32 values and `s` `rows`, on
+    /// the stream's device, alive until the launch has run. In place
+    /// (`out == y`) is allowed.
+    pub unsafe fn gate_scale(
+        &self,
+        stream: &Stream,
+        y: DevicePtr,
+        s: DevicePtr,
+        out: DevicePtr,
+        rows: u32,
+        n: u32,
+    ) -> Result<()> {
+        let n_values = rows
+            .checked_mul(n)
+            .ok_or_else(|| invalid("gate", format!("{rows} rows of {n} values")))?;
+        if n_values == 0 {
+            return Ok(());
+        }
+        let args = Args::new().ptr(y).ptr(s).ptr(out).u32(rows).u32(n);
+        // SAFETY: the argument list matches ares_q4_gate_scale.
+        unsafe {
+            self.gate_scale.launch(stream, [n_values.div_ceil(256), 1, 1], [256, 1, 1], 0, args)
+        }
     }
 
     /// The gated mean of a read, `m[row] = (1 / hc) * sum_c xn[row][c] *

@@ -66,6 +66,7 @@ dependencies = [
  "ares-core",
  "ares-cuda",
  "ares-gguf",
+ "ares-io",
  "ares-quant",
  "ares-runtime",
  "ares-state",

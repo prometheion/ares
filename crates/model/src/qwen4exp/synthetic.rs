@@ -223,7 +223,25 @@ impl Synthetic {
     pub fn bytes(&self) -> Vec<u8> {
         let mut file = File::default();
         self.metadata(&mut file);
-        self.tensors(&mut file);
+        self.tensors(&mut file, None);
+        file.build()
+    }
+
+    /// The bytes of the GGUF file with the routed experts in types that
+    /// [`ares_quant::quantize`] cannot write: gate and up as `gate_ty`
+    /// (IQ2_S, IQ2_XXS or IQ1_M), down as `down_ty` (Q2_0), the types the
+    /// expert kernels of the devices compute. Their blocks are valid blocks
+    /// of made-up content, not the encoding of any float matrix: what they
+    /// decode to is the model. Everything else is as in [`Synthetic::bytes`].
+    ///
+    /// # Panics
+    ///
+    /// Panics when a type cannot hold the rows of this shape or is not one
+    /// of those named above.
+    pub fn bytes_with_experts(&self, gate_ty: GgmlType, down_ty: GgmlType) -> Vec<u8> {
+        let mut file = File::default();
+        self.metadata(&mut file);
+        self.tensors(&mut file, Some((gate_ty, down_ty)));
         file.build()
     }
 
@@ -303,7 +321,7 @@ impl Synthetic {
         file.string_array("tokenizer.ggml.merges", &[]);
     }
 
-    fn tensors(&self, file: &mut File) {
+    fn tensors(&self, file: &mut File, experts: Option<(GgmlType, GgmlType)>) {
         let s = &self.shape;
         let (n, wide, lr) = (s.n_embd, s.wide(), s.mixer_rank);
         let shipped = self.types == Types::Shipped;
@@ -343,9 +361,21 @@ impl Synthetic {
             }
             // The router's logits are spread over several units.
             matrix(file, &name("ffn_gate_inp.weight"), &[n, s.n_expert], 6.0, f32t);
-            matrix(file, &name("ffn_gate_exps.weight"), &[n, s.expert_ff, s.n_expert], 1.5, lazy);
-            matrix(file, &name("ffn_up_exps.weight"), &[n, s.expert_ff, s.n_expert], 1.5, lazy);
-            matrix(file, &name("ffn_down_exps.weight"), &[s.expert_ff, n, s.n_expert], 1.0, lazy);
+            let stack = |file: &mut File, what: &str, dims: &[usize], gain: f32, which: usize| {
+                let name = name(what);
+                match experts {
+                    Some(types) => {
+                        let ty = [types.0, types.1][which];
+                        let rms = gain / (dims[0] as f32).sqrt();
+                        let data = self.made_up_blocks(&name, ty, dims, rms);
+                        file.raw_tensor(&name, dims, ty, data);
+                    }
+                    None => matrix(file, &name, dims, gain, lazy),
+                }
+            };
+            stack(file, "ffn_gate_exps.weight", &[n, s.expert_ff, s.n_expert], 1.5, 0);
+            stack(file, "ffn_up_exps.weight", &[n, s.expert_ff, s.n_expert], 1.5, 0);
+            stack(file, "ffn_down_exps.weight", &[s.expert_ff, n, s.n_expert], 1.0, 1);
             matrix(file, &name("ffn_gate_inp_shexp.weight"), &[n], 2.0, f32t);
             matrix(file, &name("ffn_gate_shexp.weight"), &[n, s.shared_ff], 1.5, f32t);
             matrix(file, &name("ffn_up_shexp.weight"), &[n, s.shared_ff], 1.5, f32t);
@@ -417,6 +447,66 @@ impl Synthetic {
                 vector(file, &name("ple_conv1d.weight"), &[g.conv_kernel, wide], 0.5, 0.0, f16);
             }
         }
+    }
+
+    /// Valid blocks of `ty` for a tensor of `dims` whose rows have `dims[0]`
+    /// values: every byte is drawn from the seed and the tensor's name, and
+    /// the block scale is then set so that the decoded values have about the
+    /// RMS `rms`. For the types of the routed experts, in which any bytes
+    /// are a block once the scale is finite.
+    fn made_up_blocks(&self, name: &str, ty: GgmlType, dims: &[usize], rms: f32) -> Vec<u8> {
+        assert!(
+            matches!(ty, GgmlType::IQ2_S | GgmlType::IQ2_XXS | GgmlType::IQ1_M | GgmlType::Q2_0),
+            "no made-up blocks of {ty}"
+        );
+        let (values, block) = (ty.block_values() as usize, ty.block_bytes() as usize);
+        assert!(dims[0].is_multiple_of(values), "{ty} cannot hold rows of {} values", dims[0]);
+        let n_blocks = dims.iter().product::<usize>() / values;
+        let mut hash = 0xcbf2_9ce4_8422_2325u64;
+        for byte in name.bytes() {
+            hash = (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        let mut state = hash ^ self.seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ 0x5eed;
+        let mut next = move || {
+            state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            z ^ (z >> 31)
+        };
+        let mut data: Vec<u8> = (0..n_blocks * block).map(|_| (next() >> 32) as u8).collect();
+        // The scale of a block is an f16: at its start, or for IQ1_M spread
+        // over the top nibbles of the four 16-bit words at byte 48.
+        let set_scale = |blk: &mut [u8], scale: f32| {
+            let d = ares_quant::f32_to_f16(scale);
+            if ty == GgmlType::IQ1_M {
+                for i in 0..4 {
+                    let at = 48 + 2 * i;
+                    let word = u16::from_le_bytes([blk[at], blk[at + 1]]);
+                    let word = (word & 0x0fff) | (((d >> (4 * i)) & 0xf) << 12);
+                    blk[at..at + 2].copy_from_slice(&word.to_le_bytes());
+                }
+            } else {
+                blk[0..2].copy_from_slice(&d.to_le_bytes());
+            }
+        };
+        // What the bytes decode to with a scale of one, over the first blocks.
+        let sample = n_blocks.min(64);
+        for blk in data.chunks_exact_mut(block).take(sample) {
+            set_scale(blk, 1.0);
+        }
+        let mut decoded = vec![0.0f32; sample * values];
+        ares_quant::dequantize(ty, &data[..sample * block], &mut decoded)
+            .unwrap_or_else(|e| panic!("tensor '{name}' as {ty}: {e}"));
+        let unit = (decoded.iter().map(|v| f64::from(*v).powi(2)).sum::<f64>()
+            / decoded.len() as f64)
+            .sqrt() as f32;
+        for blk in data.chunks_exact_mut(block) {
+            // Between 0.75 and 1.25 times the scale that gives `rms`.
+            let jitter = 0.75 + (next() >> 40) as f32 / 16_777_216.0 * 0.5;
+            set_scale(blk, rms / unit * jitter);
+        }
+        data
     }
 
     /// `count` values of mean `mean` and standard deviation `scale`, bounded
@@ -554,6 +644,12 @@ impl File {
                 data
             }
         };
+        let dims = dims.iter().map(|&d| d as u64).collect();
+        self.tensors.push((name.to_owned(), dims, ty, data));
+    }
+
+    /// Adds a tensor whose stored bytes are `data`.
+    fn raw_tensor(&mut self, name: &str, dims: &[usize], ty: GgmlType, data: Vec<u8>) {
         let dims = dims.iter().map(|&d| d as u64).collect();
         self.tensors.push((name.to_owned(), dims, ty, data));
     }
