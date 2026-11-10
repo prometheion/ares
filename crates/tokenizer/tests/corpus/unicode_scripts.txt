@@ -1,0 +1,3 @@
+Greek: Αυτό είναι ένα τεστ. ΣΊΣΥΦΟΣ, ὁ ἄνθρωπος. Cyrillic: Привет, мир! Это тест токенизатора. Ёжик в тумане. Hebrew: זה מבחן. Arabic: هذا اختبار للنظام. Persian: این یک آزمایش است. Armenian: Սա փորձ է։ Georgian: ეს ტესტია. Amharic: ይህ ፈተና ነው።
+Turkish: İstanbul'da ışık, İI ıi, Çok güzel! Polish: Zażółć gęślą jaźń. Czech: Příliš žluťoučký kůň úpěl ďábelské ódy. Icelandic: Þetta er próf, ð æ. Vietnamese: Tiếng Việt.
+Roman numerals: Ⅰ Ⅱ Ⅲ Ⅷ ⅷ. Circled: ① ② ③ ⑩. Superscripts: x² y³ 10⁻⁹ H₂O. Fractions: ½ ¼ ¾ ⅓ ⅞. Other digits: ٠١٢٣٤٥٦٧٨٩ ۰۱۲۳ ०१२३४५ ๐๑๒๓ ０１２３ 𝟘𝟙𝟚𝟛.

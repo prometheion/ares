@@ -1,0 +1,30 @@
+<|im_start|>system
+You are a helpful assistant.<|im_end|>
+<|im_start|>user
+Hello! What is 2+2?<|im_end|>
+<|im_start|>assistant
+<think>
+The user asks a simple question.
+</think>
+
+It is 4.<|im_end|>
+<|im_start|>user
+Call a tool, please.<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+<tool_call>
+<function=get_weather>
+<parameter=city>
+Berlin
+</parameter>
+</function>
+</tool_call><|im_end|>
+<|im_start|>user
+<tool_response>
+{"temp": 12.5, "unit": "C"}
+</tool_response><|im_end|>
+<|im_start|>assistant
+<think>

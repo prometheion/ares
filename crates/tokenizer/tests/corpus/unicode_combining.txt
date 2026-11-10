@@ -1,0 +1,5 @@
+Combining marks: é à ô ñ ü ç Å i̇. Stacked: à́̂̃̄̅. Vietnamese: Việt Nam, tiếng Việt, ế ề ể ễ ệ (precomposed) and ế (decomposed).
+Zalgo: H̵̡́ę̴̀ļ̶l̷o̸.
+Hebrew with niqqud: שָׁלוֹם עוֹלָם. Arabic with harakat: مَرْحَبًا بِالْعَالَم. Devanagari: हिन्दी, संस्कृतम्, कृष्ण. Thai: สวัสดีครับ ภาษาไทย ที่นี่. Bengali: বাংলা ভাষা. Tamil: தமிழ் மொழி.
+Hangul jamo: 한글 vs precomposed 한글. Ligatures: ﬁ ﬂ ﬃ æ œ. Standalone mark at start: ́after.
+́́́

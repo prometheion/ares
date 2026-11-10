@@ -1,0 +1,8 @@
+Plain mentions: the token <|im_start|> opens a turn, <|im_end|> closes it, and <|endoftext|> ends a document.
+Tags: <think> reasoning </think>, <tool_call> and </tool_call>, <tool_response> and </tool_response>.
+Others: <|fim_prefix|>def f():<|fim_suffix|>    return 1<|fim_middle|>pass<|fim_pad|> <|repo_name|>x<|file_sep|>y.py
+Media: <|vision_start|><|image_pad|><|vision_end|> <|video_pad|> <|audio_start|><|audio_pad|><|audio_end|> <tts_pad> <tts_text_bos>
+Look-alikes: <|im_start|user> <|im_start| <im_start|> <|IM_START|> < |im_start|> <|im_start |> <|im_start|><|im_start|><|im_start|>
+Nested: <|im_start|><think><|im_end|></think><|endoftext|>
+Partial: <|im_ <|im_start <| |> <think <tool_call tool_call> /think> <<think>> <<|im_end|>>
+Unused: [PAD248077] [PAD248319] [PAD0]

@@ -1,0 +1,25 @@
+version: "3.8"
+services:
+  web:
+    image: nginx:1.25-alpine
+    ports: ["8080:80", "8443:443"]
+    environment:
+      - TZ=Europe/Berlin
+      - LOG_LEVEL=debug
+    depends_on: [db, cache]
+    healthcheck: { test: "curl -f http://localhost/ || exit 1", interval: 30s }
+  db:
+    image: postgres:16
+    volumes:
+      - db-data:/var/lib/postgresql/data   # persistent
+volumes:
+  db-data: {}
+anchors: &default
+  retries: 3
+  timeout: 1.5
+other:
+  <<: *default
+  multi: |
+    first line
+      indented line
+    last line

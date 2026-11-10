@@ -17,11 +17,16 @@ ares-state = { path = "crates/state" }
 ares-sched = { path = "crates/sched" }
 ares-weights = { path = "crates/weights" }
 ares-store = { path = "crates/store" }
+ares-tokenizer = { path = "crates/tokenizer" }
 
 thiserror = "2"
 memmap2 = "0.9"
 libloading = "0.8"
 libc = "0.2"
+# The interpreter of chat templates. The features are the ones the dialect of
+# ares-tokenizer uses; "unstable_machinery" is the syntax tree that it checks a
+# template against, and the version is pinned by Cargo.lock.
+minijinja = { version = "2", default-features = false, features = ["adjacent_loop_items", "builtins", "debug", "macros", "preserve_order", "std_collections", "unstable_machinery"] }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

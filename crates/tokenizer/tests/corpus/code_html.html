@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="utf-8">
+  <title>Beispiel &amp; Test</title>
+  <style>
+    body { font: 16px/1.5 "Helvetica Neue", sans-serif; margin: 0 auto; max-width: 40em; }
+    .card > h2::after { content: "\2192"; color: #c0ffee; }
+  </style>
+</head>
+<body>
+  <nav><a href="/">Start</a> | <a href="/about?lang=en&amp;ref=nav">About</a></nav>
+  <h1 class="title">Überschrift</h1>
+  <p>Ein Absatz mit <em>Betonung</em>, <strong>Nachdruck</strong> und einem <code>&lt;tag&gt;</code>.</p>
+  <ul>
+    <li>Erstens</li>
+    <li>Zweitens<br>mit Umbruch</li>
+  </ul>
+  <script>document.querySelectorAll('li').forEach((li, i) => li.dataset.n = i + 1);</script>
+  <!-- ein Kommentar -->
+</body>
+</html>

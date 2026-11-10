@@ -1,0 +1,16 @@
+[package]
+name = "ares-tokenizer"
+description = "Text to token ids and back for the byte-level BPE vocabularies of GGUF models, and their Jinja chat templates"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+ares-gguf.workspace = true
+minijinja.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

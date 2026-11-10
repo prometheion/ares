@@ -1,0 +1,11 @@
+https://www.example.com/path/to/page.html?query=1&other=two%20words#fragment
+http://localhost:8080/api/v1/users/42/posts?limit=10&offset=20
+ftp://user:pass@ftp.example.org:21/pub/file.tar.gz
+file:///home/user/My%20Documents/report_final(2).pdf
+mailto:someone.name+tag@sub.example.co.uk
+git@github.com:org/repo.git  ssh://git@host:2222/~user/repo
+/usr/local/bin/python3.12  ~/.config/nvim/init.lua  ./relative/../path/./file.txt  C:\Program Files\App\app.exe  \\server\share\dir
+README.md Makefile .gitignore Cargo.toml package-lock.json src/main.rs tests/test_foo.py __init__.py node_modules/.bin/tsc
+user@example.com, first.last@sub-domain.example.museum, "quoted"@example.com, x@y.z
+#hashtag @mention $VARIABLE ${BRACED} %PERCENT% &amp; &lt;tag&gt; &#x41; &#65;
+www.example.com example.com/a_b-c.d~e !$&'()*+,;=:@ [::1]:80

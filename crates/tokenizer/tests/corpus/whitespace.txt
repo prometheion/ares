@@ -1,0 +1,78 @@
+start       end
+a                                                  b                                                                                                                                 c
+x                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+after thirty newlines
+
+
+
+
+
+
+
+
+
+
+
+
+not at the end
+
+
+
+
+tabs:				four	 	 mixed 	
+	indented
+		double
+			triple
+    four spaces
+        eight spaces
+crlf line
+another
+
+
+thirdlone crtrailing spaces   
+   leading spaces
+  
+ 
+
+a 
+ b 
+  c 
+   d 
+word nbsp  two em　　ideographic ls psnel
+zero​width‌joiner‍split﻿bom­soft
+   
+   
+   
+                                                                                                    
+                                                                                                    
+end of file without newline   
