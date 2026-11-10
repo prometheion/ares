@@ -416,6 +416,32 @@ pages) and comes with the runtime.
   and 8.3 ms; a lone read takes 1.4 ms, the time of the faster drive. The
   copies must be identical: sizes are compared and contents sampled at open.
   The price is the disk space of the copy.
+- **Prefill of a MoE model, layer by layer** (planned). A long prompt uses
+  most experts of every layer. Run in chunks of rows through the whole
+  model, it fetches them again for every chunk, from the SSD or over PCIe
+  from RAM. The other order fetches each expert about once per prompt: a
+  group of layers is computed for all rows of the prompt before the next
+  group starts, and within a layer the routed experts are taken in waves
+  that fit the space for them, most used first. Every engine that streams
+  experts found this to be the largest effect on long prompts (Run My AI:
+  954 GiB read for a 4k prompt in batches of 16 tokens without it, about one
+  read per expert with it; TheCodacus: 16 to about 300 tokens/s on a 16.7k
+  prompt; none of these numbers was reproduced here). It needs a second kind
+  of step in the planner and the conductor (a range of layers for all prompt
+  rows), a wave planner in `ares-weights`, the hidden states of all prompt
+  rows kept between layer groups, and turns for generating requests between
+  groups. At the end of a prompt the tiers are elected from the prompt's own
+  routing, weighted to its end.
+- **More from the engines that stream experts** (planned; details and
+  numbers in [reference/moe-offload-survey.md](reference/moe-offload-survey.md)):
+  the RAM tier as a cache in front of the SSD (admission when a read
+  arrives, a victim chosen when a guessed read starts, protection of experts
+  predicted for the current token); inside a layer, experts that are present
+  first and a miss issued the moment the router has run, gate and up before
+  down; slots per layer by what the next slot gains instead of equally, and
+  a table from the last tokens to likely experts for the first MoE layers,
+  which the router prediction cannot reach; gate and up of an expert
+  adjacent in its slot and computed in one pass.
 - **Hashed-row tables**: for models with n-gram embedding tables (28.8 GB for
   `qwen4exp`) the row ids follow from the last tokens on the host, so the
   reads are issued when the token is known and collected before the layer
@@ -654,6 +680,7 @@ GPU that CUDA 13 does not run on.
 | TensorRT-LLM, LMDeploy, mistral.rs | 4-bit re-encoding of cold pages, sampling sharded per GPU, int8 KV with per-head ranges, transition-log rollback | Planned |
 | llguidance | Grammar-constrained output by validating the GPU's top candidates on the CPU | Planned |
 | AirLLM | Nothing beyond the expert tiers: reading whole layers per pass is bounded by disk throughput | - |
+| Run My AI, ik_llama.cpp, Fiddler, ktransformers, BELLS, AI-DER, FATE, ProMoE | Direct reads with demand before prefetch; prefill layer by layer in waves of experts; the RAM tier as a cache with admission and protection; the order of work inside a MoE layer; slots per layer by need; fused gate and up of an expert | `ares-io` (reads done); the rest planned, see [Weights](#weights) |
 
 Notes on each source are under [reference/](reference/).
 

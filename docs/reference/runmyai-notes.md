@@ -24,9 +24,18 @@ The page gives no tokens per second, no SSD throughput and no latencies.
   hidden state plus its shared-expert output; an optional trained correction
   adjusts the prediction. Recall on a model with 512 experts and top 8: 75.7 %
   one layer ahead, 67.2 % two, 61.1 % three; the default looks two ahead.
-  Demand reads per token fall from 0.87 to 0.44 with the prediction.
+  The first streamed layer of a token has no streamed layer before it and is
+  predicted from up to two of the layers that are loaded at start; that
+  halved its demand reads (0.87 to 0.44 per token). (An earlier version of
+  these notes took that number for the effect of prediction as a whole.)
 - **Eviction.** A use count that halves every 64 tokens; ties by least recent
   use, then by lower id.
-- **Prefill.** Layer by layer in waves of experts, about one read per distinct
-  expert. Without that, a 4k prompt in batches of 16 tokens read 954 GiB.
+- **Prefill.** "Layer-major": the whole prompt passes through one layer
+  before the next starts, so each layer's experts are read about once per
+  prompt (0.98 to 1.00 reads per distinct expert). A layer that needs more
+  distinct experts than it has slots is processed in waves that fit,
+  `ceil(min(n_expert, n_tokens * k) / n_slots)` of them, each expert read at
+  most once. Without that, a 4k prompt in batches of 16 tokens read 954 GiB.
+  More on this and on the engines the page credits is in
+  [moe-offload-survey.md](moe-offload-survey.md).
 - **Accuracy.** KL divergence against llama.cpp 0.010 to 0.016.
