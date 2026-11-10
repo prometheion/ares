@@ -87,7 +87,7 @@ impl Worker {
             .setup_coop_taskrun()
             .build(entries)
             .map_err(Error::Ring)?;
-        let fds: Vec<_> = shared.files.iter().map(|f| f.file.as_raw_fd()).collect();
+        let fds: Vec<_> = shared.fds.iter().map(|f| f.as_raw_fd()).collect();
         if !fds.is_empty() {
             ring.submitter().register_files(&fds).map_err(Error::Ring)?;
         }
@@ -150,8 +150,9 @@ impl Worker {
                     return true;
                 }
             }
-            while !self.free_slots.is_empty() {
-                let Some(chunk) = sched.take_chunk() else { break };
+            let now = Instant::now();
+            while self.picked.len() < self.free_slots.len() {
+                let Some(chunk) = sched.take_chunk(now) else { break };
                 self.picked.push(chunk);
             }
         }
@@ -288,7 +289,7 @@ impl Drop for Worker {
 }
 
 fn read_entry(regions: &[FixedRegion], chunk: &Picked, slot: u32) -> io_uring::squeue::Entry {
-    let file = types::Fixed(u32::from(chunk.file));
+    let file = types::Fixed(u32::from(chunk.fd));
     let addr = chunk.ptr as usize;
     let fixed = regions
         .iter()

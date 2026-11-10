@@ -13,24 +13,25 @@ use ares_core::units::{KIB, MIB};
 use ares_gguf::Gguf;
 
 use crate::error::{Error, Result};
-use crate::file::{self, FileId, FileInfo, OpenFile, Span};
+use crate::file::{self, CopyInfo, DiskKey, DriveId, DriveInfo, FileId, FileInfo, IoMode, Span};
 use crate::request::{Cancel, Completion, Key, Promote, Read, Rejected};
 use crate::sched::{Limits, Sched, finish_stats};
-use crate::stats::Stats;
+use crate::stats::{DriveStats, Stats};
 use crate::worker;
 
 /// How the reader is set up. The defaults are what the engine uses.
 #[derive(Clone, Debug)]
 pub struct Config {
-    /// The most chunks at the device at once, both classes together. On the
+    /// The most chunks at one drive at once, both classes together. On the
     /// development machine's NVMe drive, random 512 KiB reads reach their
     /// throughput at 32, 64 gains nothing and 16 gives about 60 % (the block
     /// layer splits each read into two requests); more only lengthens the
-    /// wait of a demand read that arrives behind them.
+    /// wait of a demand read that arrives behind them. Every drive the files
+    /// are on has this depth of its own.
     pub queue_depth: usize,
-    /// Of those, the most that may come from prefetches. This is what bounds
-    /// the wait of a demand read behind guesses to `prefetch_depth *
-    /// prefetch_chunk` bytes of device time.
+    /// Of those, the most that may come from prefetches, again per drive.
+    /// This is what bounds the wait of a demand read behind guesses to
+    /// `prefetch_depth * prefetch_chunk` bytes of device time.
     pub prefetch_depth: usize,
     /// Size of the pieces a prefetch is cut into (rounded up to the file's
     /// block size).
@@ -118,8 +119,11 @@ pub(crate) struct Shared {
     /// caller that queued work then writes the eventfd to wake it.
     pub(crate) sleeping: AtomicBool,
     pub(crate) wake: OwnedFd,
-    pub(crate) files: Vec<OpenFile>,
+    /// Every copy of every file, open: the copies of file 0 in their order,
+    /// then those of file 1, and so on, which is how the queues number them.
+    pub(crate) fds: Vec<std::fs::File>,
     pub(crate) infos: Arc<[FileInfo]>,
+    pub(crate) drives: Vec<DriveInfo>,
 }
 
 /// The scheduler locked. When it is released the number of finished reads is
@@ -194,8 +198,20 @@ impl Shared {
 /// submission order. A prefetch is cut into chunks (see
 /// [`Config::prefetch_chunk`]); a demand read that arrives while a long
 /// prefetch runs goes next, whatever is left of the prefetch. At most
-/// [`Config::queue_depth`] chunks are at the device, at most
+/// [`Config::queue_depth`] chunks are at a drive, at most
 /// [`Config::prefetch_depth`] of them from prefetches.
+///
+/// # Several drives
+///
+/// The files may be on different drives, and a file may have copies with the
+/// same bytes on several ([`Reader::open_copies`],
+/// [`Reader::open_gguf_mirrored`]). Every drive has its own depth, so two
+/// drives carry twice the chunks of one. A chunk of a file with copies goes
+/// to the drive that is expected to deliver it soonest: what is at the drive
+/// already, at the pace the drive has shown lately, so a faster drive gets
+/// more and an idle one is used first. A read whose drives are all busy does
+/// not hold up a later one that an idle drive can serve; within what a drive
+/// can serve, the order above holds.
 ///
 /// # Completion
 ///
@@ -222,15 +238,75 @@ impl Reader {
     /// Opens `paths` and starts the I/O thread. The files are numbered in
     /// order ([`FileId`]).
     pub fn open<P: AsRef<Path>>(paths: &[P], config: Config) -> Result<Self> {
+        let files: Vec<[&Path; 1]> = paths.iter().map(|path| [path.as_ref()]).collect();
+        Self::open_copies(&files, config)
+    }
+
+    /// Opens files of which each may have several copies, and starts the I/O
+    /// thread. `files[n]` lists the paths of file `n` ([`FileId`]): one or more
+    /// files with the same bytes, usually on different drives. Reads of a file
+    /// are spread over the drives of its copies (see "Several drives" above),
+    /// so a model that is mirrored on a second SSD is read at the speed of
+    /// both.
+    ///
+    /// The copies of a file must be identical. Their sizes are compared and
+    /// their contents sampled at open ([`Error::CopySize`],
+    /// [`Error::CopyDiffers`]); that catches a wrong or damaged copy, it is not
+    /// a proof.
+    pub fn open_copies<F, P>(files: &[F], config: Config) -> Result<Self>
+    where
+        F: AsRef<[P]>,
+        P: AsRef<Path>,
+    {
         config.validate()?;
-        if paths.len() > usize::from(u16::MAX) {
-            return Err(Error::Config("at most 65535 files"));
+        let mut disks: Vec<DiskKey> = Vec::new();
+        let mut fds = Vec::new();
+        let mut infos = Vec::with_capacity(files.len());
+        for (index, paths) in files.iter().enumerate() {
+            let paths = paths.as_ref();
+            if paths.is_empty() {
+                return Err(Error::NoCopies(index));
+            }
+            let opened = paths
+                .iter()
+                .map(|path| file::open(path.as_ref(), config.direct))
+                .collect::<Result<Vec<_>>>()?;
+            file::check_copies(&opened)?;
+            let copies = opened
+                .iter()
+                .map(|copy| {
+                    let drive = disks.iter().position(|d| *d == copy.disk).unwrap_or_else(|| {
+                        disks.push(copy.disk);
+                        disks.len() - 1
+                    });
+                    CopyInfo {
+                        path: copy.path.clone(),
+                        mode: copy.mode,
+                        direct_align: copy.direct_align,
+                        drive: DriveId(drive as u16),
+                    }
+                })
+                .collect();
+            let first = &opened[0];
+            infos.push(FileInfo {
+                path: first.path.clone(),
+                size: first.size,
+                mode: opened
+                    .iter()
+                    .map(|copy| copy.mode)
+                    .find(|mode| *mode != IoMode::Direct)
+                    .unwrap_or(IoMode::Direct),
+                direct_align: first.direct_align,
+                block: opened.iter().map(|copy| copy.block).max().unwrap_or(1),
+                copies,
+            });
+            fds.extend(opened.into_iter().map(|copy| copy.file));
         }
-        let files = paths
-            .iter()
-            .map(|path| file::open(path.as_ref(), config.direct))
-            .collect::<Result<Vec<_>>>()?;
-        let infos: Arc<[FileInfo]> = files.iter().map(|f| f.info.clone()).collect();
+        if infos.len() > usize::from(u16::MAX) || fds.len() > usize::from(u16::MAX) {
+            return Err(Error::Config("at most 65535 files, copies included"));
+        }
+        let infos: Arc<[FileInfo]> = infos.into();
+        let drives: Vec<DriveInfo> = disks.iter().map(|disk| disk.info()).collect();
 
         // SAFETY: eventfd takes plain integers and returns a new descriptor
         // or -1.
@@ -247,19 +323,21 @@ impl Reader {
             prefetch_chunk: config.prefetch_chunk,
             demand_chunk: config.demand_chunk,
         };
+        // Every drive has the depth of its own, and the ring room for all.
+        let depth = config.queue_depth * drives.len().max(1);
         let shared = Arc::new(Shared {
             sched: Mutex::new(Sched::new(limits, Arc::clone(&infos), config.record_starts)),
             done: Condvar::new(),
             done_count: AtomicUsize::new(0),
             sleeping: AtomicBool::new(false),
             wake,
-            files,
+            fds,
             infos,
+            drives,
         });
 
         let (ready_tx, ready_rx) = mpsc::channel();
         let worker_shared = Arc::clone(&shared);
-        let depth = config.queue_depth;
         let regions = config.fixed_regions.clone();
         let thread = std::thread::Builder::new()
             .name("ares-io".into())
@@ -281,8 +359,57 @@ impl Reader {
     /// Opens every part of a GGUF model. [`FileId`] `n` is part `n`, which is
     /// what `TensorInfo::part` holds, so tensors can be read without a lookup.
     pub fn open_gguf(gguf: &Gguf, config: Config) -> Result<Self> {
-        let paths: Vec<_> = (0..gguf.n_parts()).map(|part| gguf.path(part as u16)).collect();
-        Self::open(&paths, config)
+        Self::open_gguf_mirrored(gguf, &[] as &[&Path], config)
+    }
+
+    /// Opens every part of a GGUF model together with its mirrors: copies of
+    /// the model on other drives, which the reads are spread over.
+    ///
+    /// A mirror is a directory that holds a copy of every part under the same
+    /// file name. For a model of one file it may also be the path of the copy
+    /// itself. [`FileId`] `n` is part `n`, as for [`Reader::open_gguf`].
+    pub fn open_gguf_mirrored<P: AsRef<Path>>(
+        gguf: &Gguf,
+        mirrors: &[P],
+        config: Config,
+    ) -> Result<Self> {
+        let n_parts = gguf.n_parts();
+        let mut files = Vec::with_capacity(n_parts);
+        for part in 0..n_parts {
+            let path = gguf.path(part as u16);
+            let mut copies = vec![path.to_path_buf()];
+            for mirror in mirrors {
+                let mirror = mirror.as_ref();
+                let refuse = |reason| Error::Mirror { mirror: mirror.to_owned(), reason };
+                if mirror.is_dir() {
+                    let name =
+                        path.file_name().ok_or_else(|| refuse("the model has no file name"))?;
+                    copies.push(mirror.join(name));
+                } else if n_parts == 1 {
+                    copies.push(mirror.to_owned());
+                } else {
+                    return Err(refuse(
+                        "a model of several files needs a directory that holds a copy of every \
+                         part under the same file name",
+                    ));
+                }
+            }
+            files.push(copies);
+        }
+        Self::open_copies(&files, config)
+    }
+
+    /// The drives the files are on, in the order they were met at open;
+    /// [`CopyInfo::drive`] indexes this list. Two partitions or filesystems of
+    /// one disk are one drive.
+    pub fn drives(&self) -> &[DriveInfo] {
+        &self.shared.drives
+    }
+
+    /// What each drive has delivered and is doing, in the order of
+    /// [`Reader::drives`].
+    pub fn drive_stats(&self) -> Vec<DriveStats> {
+        self.shared.lock().drive_stats()
     }
 
     /// The files and how each is read. A file that could not be read with

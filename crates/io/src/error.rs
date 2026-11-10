@@ -28,6 +28,24 @@ pub enum Error {
     #[error("invalid configuration: {0}")]
     Config(&'static str),
 
+    #[error("file {0} was given no path: every file needs at least one copy")]
+    NoCopies(usize),
+
+    #[error(
+        "{other} is {other_size} bytes long but {path} is {size}: the copies of a file must be \
+         the same bytes"
+    )]
+    CopySize { path: PathBuf, size: u64, other: PathBuf, other_size: u64 },
+
+    #[error(
+        "{other} differs from {path} at offset {offset}: the copies of a file must be the same \
+         bytes"
+    )]
+    CopyDiffers { path: PathBuf, other: PathBuf, offset: u64 },
+
+    #[error("mirror {mirror}: {reason}")]
+    Mirror { mirror: PathBuf, reason: &'static str },
+
     #[error("no file with id {0} (this reader was opened with {1} files)")]
     UnknownFile(FileId, usize),
 

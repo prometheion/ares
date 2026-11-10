@@ -89,61 +89,224 @@ pub enum AlignSource {
     BlockSizes,
 }
 
-/// One file of a reader, as it was opened.
-#[derive(Clone, Debug)]
-pub struct FileInfo {
-    pub path: PathBuf,
-    pub size: u64,
-    /// How the file is read. This is the one place a fallback to cached reads
-    /// is reported.
-    pub mode: IoMode,
-    /// What the kernel reported for direct I/O on this file, if anything.
-    pub direct_align: Option<DirectAlign>,
-    /// The granule reads are widened to: file offsets, lengths and buffer
-    /// addresses are multiples of it. It is 1 when the file is read
-    /// buffered.
-    pub block: u64,
+/// Names one of the drives the files of a [`Reader`](crate::Reader) are on, in
+/// the order the drives were first met at open
+/// ([`Reader::drives`](crate::Reader::drives)).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct DriveId(pub u16);
+
+impl fmt::Display for DriveId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
 }
 
-pub(crate) struct OpenFile {
+/// A drive the reader reads from: a whole disk, whatever partitions and
+/// filesystems of it the files are on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DriveInfo {
+    /// The kernel's name of the disk (`nvme0n1`), or a description when the
+    /// files are not on a block device that could be found.
+    pub name: String,
+    /// The device number of the disk as (major, minor), if it is one.
+    pub device: Option<(u32, u32)>,
+}
+
+/// One copy of a file: where it is and how it is read.
+#[derive(Clone, Debug)]
+pub struct CopyInfo {
+    pub path: PathBuf,
+    /// How this copy is read.
+    pub mode: IoMode,
+    /// What the kernel reported for direct I/O on this copy, if anything.
+    pub direct_align: Option<DirectAlign>,
+    /// The drive this copy is on.
+    pub drive: DriveId,
+}
+
+/// One file of a reader, as it was opened.
+///
+/// A file can have several copies with the same bytes on different drives
+/// ([`Reader::open_copies`](crate::Reader::open_copies)); every read of the
+/// file then goes to whichever drive will deliver it soonest. `path`, `mode`
+/// and `direct_align` describe the file as a whole, [`FileInfo::copies`] each
+/// copy.
+#[derive(Clone, Debug)]
+pub struct FileInfo {
+    /// The path of the first copy.
+    pub path: PathBuf,
+    pub size: u64,
+    /// How the file is read: direct I/O if every copy is read that way, else
+    /// the mode of the first copy that is not. This is the one place a
+    /// fallback to cached reads is reported.
+    pub mode: IoMode,
+    /// What the kernel reported for direct I/O on the first copy, if anything.
+    pub direct_align: Option<DirectAlign>,
+    /// The granule reads are widened to: file offsets, lengths and buffer
+    /// addresses are multiples of it. It is the largest granule of the copies
+    /// that are read directly, and 1 when the file is read buffered.
+    pub block: u64,
+    /// Every copy of the file, the first one included; never empty.
+    pub copies: Vec<CopyInfo>,
+}
+
+#[cfg(test)]
+impl FileInfo {
+    /// A file with one copy.
+    pub(crate) fn single(
+        path: PathBuf,
+        size: u64,
+        mode: IoMode,
+        direct_align: Option<DirectAlign>,
+        block: u64,
+        drive: DriveId,
+    ) -> Self {
+        let copy = CopyInfo { path: path.clone(), mode, direct_align, drive };
+        Self { path, size, mode, direct_align, block, copies: vec![copy] }
+    }
+}
+
+/// What identifies the drive a file is on: the disk under its filesystem, or,
+/// when that cannot be found (tmpfs, a network share), the filesystem itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum DiskKey {
+    Disk(u32, u32),
+    Filesystem(u32, u32),
+}
+
+impl DiskKey {
+    pub(crate) fn info(self) -> DriveInfo {
+        match self {
+            DiskKey::Disk(major, minor) => {
+                let name = std::fs::read_link(format!("/sys/dev/block/{major}:{minor}"))
+                    .ok()
+                    .and_then(|link| Some(link.file_name()?.to_string_lossy().into_owned()))
+                    .unwrap_or_else(|| format!("block device {major}:{minor}"));
+                DriveInfo { name, device: Some((major, minor)) }
+            }
+            DiskKey::Filesystem(major, minor) => DriveInfo {
+                name: format!("filesystem {major}:{minor} (not on a block device)"),
+                device: None,
+            },
+        }
+    }
+}
+
+/// One copy of a file, open.
+pub(crate) struct OpenCopy {
     pub(crate) file: File,
-    pub(crate) info: FileInfo,
+    pub(crate) path: PathBuf,
+    pub(crate) size: u64,
+    pub(crate) mode: IoMode,
+    pub(crate) direct_align: Option<DirectAlign>,
+    /// The granule of direct reads of this copy, 1 if it is read buffered.
+    pub(crate) block: u64,
+    pub(crate) disk: DiskKey,
 }
 
 /// Opens `path`, with `O_DIRECT` where the filesystem supports it.
-pub(crate) fn open(path: &Path, direct: bool) -> Result<OpenFile> {
+pub(crate) fn open(path: &Path, direct: bool) -> Result<OpenCopy> {
     let open_err = |source| Error::Open { path: path.to_owned(), source };
     let file = File::open(path).map_err(open_err)?;
     let size = file.metadata().map_err(open_err)?.len();
 
-    let direct_align = dio_alignment(&file);
-    let mut info = FileInfo {
+    let probe = probe(&file);
+    let mut copy = OpenCopy {
+        file,
         path: path.to_owned(),
         size,
         mode: IoMode::Buffered(BufferedReason::Disabled),
-        direct_align,
+        direct_align: probe.align,
         block: 1,
+        disk: probe.disk,
     };
     if !direct {
-        return Ok(OpenFile { file, info });
+        return Ok(copy);
     }
-    let Some(align) = direct_align else {
-        info.mode = IoMode::Buffered(BufferedReason::Unsupported);
-        return Ok(OpenFile { file, info });
+    let Some(align) = probe.align else {
+        copy.mode = IoMode::Buffered(BufferedReason::Unsupported);
+        return Ok(copy);
     };
     // Switching the flag on the descriptor instead of reopening the path
     // keeps the file and its alignment report the same object.
-    match set_direct(&file) {
+    match set_direct(&copy.file) {
         Ok(()) => {
-            info.mode = IoMode::Direct;
+            copy.mode = IoMode::Direct;
             // One granule for everything keeps the arithmetic simple; the
             // two numbers are equal on every device seen so far (the memory
             // one is smaller, if anything).
-            info.block = u64::from(align.offset.max(align.memory));
+            copy.block = u64::from(align.offset.max(align.memory));
         }
-        Err(errno) => info.mode = IoMode::Buffered(BufferedReason::Refused(errno)),
+        Err(errno) => copy.mode = IoMode::Buffered(BufferedReason::Refused(errno)),
     }
-    Ok(OpenFile { file, info })
+    Ok(copy)
+}
+
+/// Bytes compared per place, and the number of places, when the copies of a
+/// file are checked at open.
+const SAMPLE_BYTES: u64 = 64 * 1024;
+const SAMPLES: u64 = 16;
+
+/// Checks that the copies of a file are the same bytes, as far as that is
+/// cheap at open: the sizes are equal, and so are the contents at 16 places
+/// of 64 KiB spread evenly from the start to the end (a file of up to 1 MiB
+/// is compared whole). That catches another file, another quantization and a
+/// truncated or half-written copy; it does not prove the copies equal.
+///
+/// The samples are read through the page cache with descriptors of their
+/// own: the copies' descriptors are set up for direct I/O.
+pub(crate) fn check_copies(copies: &[OpenCopy]) -> Result<()> {
+    use std::os::unix::fs::FileExt;
+
+    let Some((first, others)) = copies.split_first() else { return Ok(()) };
+    if others.is_empty() {
+        return Ok(());
+    }
+    for other in others {
+        if other.size != first.size {
+            return Err(Error::CopySize {
+                path: first.path.clone(),
+                size: first.size,
+                other: other.path.clone(),
+                other_size: other.size,
+            });
+        }
+    }
+    let size = first.size;
+    let whole = size <= SAMPLE_BYTES * SAMPLES;
+    let offsets = (0..SAMPLES)
+        .map(|i| if whole { i * SAMPLE_BYTES } else { i * (size - SAMPLE_BYTES) / (SAMPLES - 1) });
+    let offsets: Vec<u64> = offsets.filter(|offset| *offset < size).collect();
+
+    let open = |path: &Path| {
+        File::open(path).map_err(|source| Error::Open { path: path.to_owned(), source })
+    };
+    let read = |file: &File, path: &Path, offset: u64, into: &mut [u8]| {
+        file.read_exact_at(into, offset).map_err(|source| Error::Io {
+            path: path.to_owned(),
+            offset,
+            len: into.len(),
+            source,
+        })
+    };
+    let reference = open(&first.path)?;
+    let (mut want, mut got) = (vec![0u8; SAMPLE_BYTES as usize], vec![0u8; SAMPLE_BYTES as usize]);
+    for other in others {
+        let file = open(&other.path)?;
+        for &offset in &offsets {
+            let len = SAMPLE_BYTES.min(size - offset) as usize;
+            read(&reference, &first.path, offset, &mut want[..len])?;
+            read(&file, &other.path, offset, &mut got[..len])?;
+            if let Some(at) = want[..len].iter().zip(&got[..len]).position(|(a, b)| a != b) {
+                return Err(Error::CopyDiffers {
+                    path: first.path.clone(),
+                    other: other.path.clone(),
+                    offset: offset + at as u64,
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 fn set_direct(file: &File) -> std::result::Result<(), i32> {
@@ -159,8 +322,14 @@ fn set_direct(file: &File) -> std::result::Result<(), i32> {
     Ok(())
 }
 
-/// The direct I/O alignment of the file, or `None` when direct I/O cannot be
-/// used on it.
+/// What the kernel says about an open file.
+struct Probe {
+    /// The direct I/O alignment, or `None` when direct I/O cannot be used.
+    align: Option<DirectAlign>,
+    disk: DiskKey,
+}
+
+/// The direct I/O alignment of the file and the drive it is on.
 ///
 /// The kernel can say what it requires (`statx` with `STATX_DIOALIGN`), but
 /// not every filesystem does: btrfs, for one, does not. The requirement is
@@ -168,7 +337,7 @@ fn set_direct(file: &File) -> std::result::Result<(), i32> {
 /// filesystem (read from sysfs) and the filesystem's block size. A filesystem that is not on a block device (tmpfs, a
 /// network share) has none, and a file on it is read through the page cache:
 /// there is no cache to bypass on tmpfs, and the others make no promise.
-fn dio_alignment(file: &File) -> Option<DirectAlign> {
+fn probe(file: &File) -> Probe {
     // SAFETY: an all-zero `statx` is a valid value (plain integers).
     let mut st: libc::statx = unsafe { std::mem::zeroed() };
     // SAFETY: `st` is a valid out-pointer; with AT_EMPTY_PATH the empty path
@@ -183,29 +352,56 @@ fn dio_alignment(file: &File) -> Option<DirectAlign> {
         )
     };
     if rc != 0 {
-        return None;
+        return Probe { align: None, disk: DiskKey::Filesystem(0, 0) };
     }
+    let mnt_id = (st.stx_mask & libc::STATX_MNT_ID != 0).then_some(st.stx_mnt_id);
+    let device = device_of(&st, mnt_id);
+    let disk = match device {
+        Some((major, minor)) => {
+            let (major, minor) = whole_disk(major, minor);
+            DiskKey::Disk(major, minor)
+        }
+        None => DiskKey::Filesystem(st.stx_dev_major, st.stx_dev_minor),
+    };
     let valid = |n: u32| n != 0 && n.is_power_of_two();
     if st.stx_mask & libc::STATX_DIOALIGN != 0
         && valid(st.stx_dio_offset_align)
         && valid(st.stx_dio_mem_align)
     {
-        return Some(DirectAlign {
+        let align = DirectAlign {
             offset: st.stx_dio_offset_align,
             memory: st.stx_dio_mem_align,
             from: AlignSource::Statx,
-        });
+        };
+        return Probe { align: Some(align), disk };
     }
-    let mnt_id = (st.stx_mask & libc::STATX_MNT_ID != 0).then_some(st.stx_mnt_id);
-    let device =
-        device_of(&st, mnt_id).and_then(|(major, minor)| logical_block_size(major, minor))?;
+    let Some(device) = device.and_then(|(major, minor)| logical_block_size(major, minor)) else {
+        return Probe { align: None, disk };
+    };
     // A filesystem that does not report its requirement may need more than
     // the device does: btrfs reads directly only when offset, length and
     // address are multiples of its sector size (4096) and otherwise quietly
     // serves the read through the page cache. Its `st_blksize` is that size.
     let fs_block = st.stx_blksize;
     let block = if fs_block.is_power_of_two() { device.max(fs_block) } else { device };
-    Some(DirectAlign { offset: block, memory: block, from: AlignSource::BlockSizes })
+    let align = DirectAlign { offset: block, memory: block, from: AlignSource::BlockSizes };
+    Probe { align: Some(align), disk }
+}
+
+/// The disk a block device belongs to: the device itself, or for a partition
+/// the disk it is a partition of (sysfs has the partition's directory inside
+/// the disk's).
+fn whole_disk(major: u32, minor: u32) -> (u32, u32) {
+    let dir = format!("/sys/dev/block/{major}:{minor}");
+    if !Path::new(&dir).join("partition").exists() {
+        return (major, minor);
+    }
+    let parent = std::fs::read_to_string(format!("{dir}/../dev")).ok();
+    let parsed = parent.as_deref().and_then(|text| {
+        let (major, minor) = text.trim().split_once(':')?;
+        Some((major.parse().ok()?, minor.parse().ok()?))
+    });
+    parsed.unwrap_or((major, minor))
 }
 
 /// The block device the file's filesystem lives on, as (major, minor): the

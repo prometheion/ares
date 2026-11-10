@@ -18,7 +18,9 @@
 //!   which always start first, and *prefetches*, guesses that are cut into
 //!   small chunks so that a demand read never waits behind a long one, that
 //!   can be cancelled when wrong ([`Reader::cancel`]) and promoted when right
-//!   ([`Reader::promote`]).
+//!   ([`Reader::promote`]). A file may have copies on several drives
+//!   ([`Reader::open_copies`], [`Reader::open_gguf_mirrored`]); the reads are
+//!   then spread over the drives, which adds their throughput.
 //! - [`ExpertMap`] turns `(layer, expert)` into the byte ranges to read from
 //!   the stacked expert tensors of a GGUF model, split files included.
 //! - [`RowTable`], [`RowCache`] and [`RowReader`] read rows of a big 2-D
@@ -93,8 +95,11 @@ mod worker;
 pub use buffer::Buffer;
 pub use error::{Error, LayoutError, Result};
 pub use expert::{ExpertMap, ExpertRange};
-pub use file::{AlignSource, BufferedReason, DirectAlign, FileId, FileInfo, IoMode, Span};
+pub use file::{
+    AlignSource, BufferedReason, CopyInfo, DirectAlign, DriveId, DriveInfo, FileId, FileInfo,
+    IoMode, Span,
+};
 pub use reader::{Config, FixedRegion, Hold, Reader};
 pub use request::{Cancel, Class, Completion, Key, Promote, Read, Rejected};
 pub use rows::{CacheStats, PlannedRead, RowCache, RowGather, RowPlan, RowReader, RowTable};
-pub use stats::{ClassStats, Latency, Stats};
+pub use stats::{ClassStats, DriveStats, Latency, Stats};

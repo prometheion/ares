@@ -62,6 +62,27 @@ pub struct Stats {
     pub prefetch_latency: Latency,
 }
 
+/// What one drive has delivered and what it is doing
+/// ([`Reader::drive_stats`](crate::Reader::drive_stats)).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DriveStats {
+    /// Chunks that came back from the drive, failed ones included.
+    pub chunks: u64,
+    /// Bytes the drive delivered.
+    pub bytes: u64,
+    /// Chunks at the drive right now, and the most there have been.
+    pub in_flight: usize,
+    pub peak_in_flight: usize,
+    /// How long a chunk that has the drive to itself has lately taken per
+    /// MiB, in nanoseconds; 0 until one has been measured.
+    pub alone_ns_per_mib: u64,
+    /// How long chunks that shared the drive have lately taken per MiB,
+    /// divided by how many there were: the inverse of the drive's throughput
+    /// under load. 0 until it has been measured. The reader weighs the drives
+    /// by these two numbers when a file has copies on several.
+    pub shared_ns_per_mib: u64,
+}
+
 /// The last [`Latency::WINDOW`] latencies, in nanoseconds.
 #[derive(Debug)]
 pub(crate) struct LatencyRing {

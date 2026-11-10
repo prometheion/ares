@@ -13,13 +13,13 @@
 use std::collections::{HashMap, VecDeque};
 use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::buffer::Buffer;
 use crate::error::Error;
 use crate::file::FileInfo;
 use crate::request::{Cancel, Class, Completion, Key, Promote, Read, Rejected};
-use crate::stats::{ClassStats, LatencyRing, Stats, summarize};
+use crate::stats::{ClassStats, DriveStats, LatencyRing, Stats, summarize};
 
 /// A hasher for integer keys: the keys are small counters or packed ids, for
 /// which SipHash is pure overhead and a multiplicative mix is plenty.
@@ -47,10 +47,121 @@ pub(crate) type IdMap<V> = HashMap<u64, V, BuildHasherDefault<IdHasher>>;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Limits {
+    /// Chunks at one drive at once, and how many of them may be prefetches.
     pub depth: usize,
     pub prefetch_depth: usize,
     pub prefetch_chunk: usize,
     pub demand_chunk: usize,
+}
+
+/// One copy of a file as the queues see it: the descriptor to read (its index
+/// among all copies of all files, which is how the ring knows it) and the
+/// drive it is on.
+#[derive(Clone, Copy, Debug)]
+struct CopyRef {
+    index: u16,
+    fd: u16,
+    drive: u16,
+}
+
+/// How long a measurement of a drive counts. A drive that has not been
+/// measured for longer is tried again as if it never had been, so one slow
+/// moment does not keep it out for good and a change of the drive is noticed.
+const MEASUREMENT_LIFE: Duration = Duration::from_secs(1);
+
+/// A time per MiB, in nanoseconds, averaged over the chunks that were
+/// measured (each new one takes an eighth of the weight), and when the last
+/// one was.
+#[derive(Clone, Copy, Default)]
+struct Pace {
+    ns_per_mib: u64,
+    at: Option<Instant>,
+}
+
+impl Pace {
+    /// The pace, if it was measured and the measurement still counts.
+    fn get(&self, now: Instant) -> Option<u64> {
+        let at = self.at?;
+        (now.saturating_duration_since(at) <= MEASUREMENT_LIFE).then_some(self.ns_per_mib)
+    }
+
+    fn record(&mut self, ns_per_mib: u64, now: Instant) {
+        self.ns_per_mib = match self.get(now) {
+            Some(old) => (old / 8 * 7).saturating_add(ns_per_mib / 8),
+            None => ns_per_mib,
+        };
+        self.at = Some(now);
+    }
+}
+
+/// A drive: what is at it, and how it has answered lately.
+///
+/// A drive is described by two numbers, which is what a flash drive's reads
+/// look like: a chunk that is alone at the drive takes `alone` per MiB, and
+/// when several are there each takes their number times `shared` per MiB (the
+/// drive is then at its throughput). The time a chunk takes at a load of `n`
+/// is the larger of the two.
+#[derive(Default)]
+struct Drive {
+    in_flight: usize,
+    in_flight_prefetch: usize,
+    peak_in_flight: usize,
+    chunks: u64,
+    bytes: u64,
+    /// Measured by chunks that had the drive to themselves.
+    alone: Pace,
+    /// Measured by chunks that shared the drive: their time per MiB over the
+    /// number of chunks that were there.
+    shared: Pace,
+}
+
+impl Drive {
+    fn has_room(&self, class: Class, limits: &Limits) -> bool {
+        self.in_flight < limits.depth
+            && (class == Class::Demand || self.in_flight_prefetch < limits.prefetch_depth)
+    }
+
+    /// How long a chunk started now is expected to take per MiB. A number that
+    /// has not been measured (or not lately) counts as zero, so the drive is
+    /// tried under that load and measured by it.
+    fn expected(&self, now: Instant) -> u128 {
+        let load = self.in_flight as u128 + 1;
+        let alone = u128::from(self.alone.get(now).unwrap_or(0));
+        let shared = u128::from(self.shared.get(now).unwrap_or(0));
+        alone.max(load * shared)
+    }
+
+    /// A chunk goes to the drive; returns the load it meets, itself included.
+    fn started(&mut self, class: Class) -> u32 {
+        self.in_flight += 1;
+        self.peak_in_flight = self.peak_in_flight.max(self.in_flight);
+        if class == Class::Prefetch {
+            self.in_flight_prefetch += 1;
+        }
+        self.in_flight as u32
+    }
+
+    fn came_back(&mut self, chunk: &Picked, delivered: usize, now: Instant) {
+        // The load the chunk saw: the mean of what was at the drive when it
+        // started and now, itself included, counted in halves.
+        let load_x2 = u128::from(chunk.load) + self.in_flight as u128;
+        self.in_flight -= 1;
+        if chunk.class == Class::Prefetch {
+            self.in_flight_prefetch -= 1;
+        }
+        self.chunks += 1;
+        self.bytes += delivered as u64;
+        if delivered == 0 {
+            return;
+        }
+        let took = now.saturating_duration_since(chunk.started).as_nanos();
+        let ns_per_mib = took * (1 << 20) / delivered as u128;
+        if load_x2 <= 2 {
+            self.alone.record(u64::try_from(ns_per_mib).unwrap_or(u64::MAX), now);
+        } else {
+            self.shared.record(u64::try_from(ns_per_mib * 2 / load_x2).unwrap_or(u64::MAX), now);
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -97,7 +208,15 @@ pub(crate) struct Picked {
     /// The queue it came from, which decides which depth limit it counts
     /// against until it comes back.
     pub class: Class,
-    pub file: u16,
+    /// Which copy of the file is read: its index in the file, the descriptor
+    /// (index among all copies of all files) and the drive.
+    pub copy: u16,
+    pub fd: u16,
+    pub drive: u16,
+    /// When it went to the drive, and how many chunks were there then, itself
+    /// included: what the drive is measured by when it comes back.
+    pub started: Instant,
+    pub load: u32,
     pub offset: u64,
     pub ptr: *mut u8,
 }
@@ -112,6 +231,9 @@ pub(crate) enum ChunkResult {
 pub(crate) struct Sched {
     limits: Limits,
     files: Arc<[FileInfo]>,
+    /// The copies of each file.
+    copies: Vec<Vec<CopyRef>>,
+    drives: Vec<Drive>,
     slab: Vec<Option<Req>>,
     free: Vec<u32>,
     keys: IdMap<KeyState>,
@@ -120,7 +242,6 @@ pub(crate) struct Sched {
     pub(crate) done: VecDeque<Completion>,
     in_flight: usize,
     peak_in_flight: usize,
-    in_flight_prefetch: usize,
     pub(crate) held: u32,
     pub(crate) shutdown: bool,
     failed: Option<String>,
@@ -139,10 +260,28 @@ pub(crate) struct Sched {
 }
 
 impl Sched {
+    /// `files` name the drive of each copy; the descriptors of the copies are
+    /// numbered in the order of the files and, within a file, of its copies.
     pub(crate) fn new(limits: Limits, files: Arc<[FileInfo]>, trace: bool) -> Self {
+        let mut fd = 0u16;
+        let mut n_drives = 0;
+        let copies = files
+            .iter()
+            .map(|file| {
+                let refs = file.copies.iter().enumerate().map(|(index, copy)| {
+                    let copy = CopyRef { index: index as u16, fd, drive: copy.drive.0 };
+                    fd += 1;
+                    n_drives = n_drives.max(usize::from(copy.drive) + 1);
+                    copy
+                });
+                refs.collect()
+            })
+            .collect();
         Self {
             limits,
             files,
+            copies,
+            drives: (0..n_drives).map(|_| Drive::default()).collect(),
             slab: Vec::new(),
             free: Vec::new(),
             keys: IdMap::default(),
@@ -151,7 +290,6 @@ impl Sched {
             done: VecDeque::new(),
             in_flight: 0,
             peak_in_flight: 0,
-            in_flight_prefetch: 0,
             held: 0,
             shutdown: false,
             failed: None,
@@ -326,24 +464,68 @@ impl Sched {
     }
 
     /// Whether `take_chunk` would return something.
+    #[cfg(test)]
     pub(crate) fn startable(&self) -> bool {
-        self.held == 0
-            && self.in_flight < self.limits.depth
-            && (!self.demand.is_empty()
-                || (self.in_flight_prefetch < self.limits.prefetch_depth
-                    && !self.prefetch.is_empty()))
+        self.next_startable(Instant::now()).is_some()
     }
 
-    /// The next chunk to start: the oldest demand read's next piece, else
-    /// the oldest prefetch's, within the depth limits.
-    pub(crate) fn take_chunk(&mut self) -> Option<Picked> {
-        if !self.startable() {
+    /// The copy of `file` to read the next chunk from: among the drives that
+    /// have room for the class, the one expected to deliver it soonest; of
+    /// equals the one with fewer chunks, then the first. `None` when every
+    /// drive with a copy is at its limit.
+    fn pick_copy(&self, file: u16, class: Class, now: Instant) -> Option<CopyRef> {
+        let copies = &self.copies[usize::from(file)];
+        if let [only] = copies.as_slice() {
+            let room = self.drives[usize::from(only.drive)].has_room(class, &self.limits);
+            return room.then_some(*only);
+        }
+        let mut best: Option<((u128, usize), CopyRef)> = None;
+        for copy in copies {
+            let drive = &self.drives[usize::from(copy.drive)];
+            if !drive.has_room(class, &self.limits) {
+                continue;
+            }
+            let rank = (drive.expected(now), drive.in_flight);
+            if best.is_none_or(|(least, _)| rank < least) {
+                best = Some((rank, *copy));
+            }
+        }
+        best.map(|(_, copy)| copy)
+    }
+
+    /// What starts next: the oldest demand read that a drive with room can
+    /// serve, else the oldest such prefetch. Returns its place in its queue,
+    /// the request, the class and the copy to read.
+    ///
+    /// With one drive this is the head of a queue or nothing. With several, a
+    /// read whose drives are all busy does not hold up a later one that an
+    /// idle drive can serve.
+    fn next_startable(&self, now: Instant) -> Option<(usize, u32, Class, CopyRef)> {
+        if self.held > 0 {
             return None;
         }
-        let (idx, class) = match self.demand.front() {
-            Some(idx) => (*idx, Class::Demand),
-            None => (*self.prefetch.front().expect("startable"), Class::Prefetch),
-        };
+        for class in [Class::Demand, Class::Prefetch] {
+            let queue = match class {
+                Class::Demand => &self.demand,
+                Class::Prefetch => &self.prefetch,
+            };
+            if queue.is_empty() || !self.drives.iter().any(|d| d.has_room(class, &self.limits)) {
+                continue;
+            }
+            for (pos, idx) in queue.iter().enumerate() {
+                let req = self.slab[*idx as usize].as_ref().expect("a queued request exists");
+                if let Some(copy) = self.pick_copy(req.file, class, now) {
+                    return Some((pos, *idx, class, copy));
+                }
+            }
+        }
+        None
+    }
+
+    /// The next chunk to start, within the depth limits of the drives; see
+    /// `next_startable` for which one that is.
+    pub(crate) fn take_chunk(&mut self, now: Instant) -> Option<Picked> {
+        let (pos, idx, class, copy) = self.next_startable(now)?;
         let req = self.req(idx);
         let rel = req.next;
         let len = req.chunk.min(req.total - rel);
@@ -353,31 +535,42 @@ impl Sched {
         let key = req.key;
         let chunk_index = rel / req.chunk;
         let offset = req.start + rel as u64;
-        let file = req.file;
         let buffer = req.buffer.as_mut().expect("a queued request holds its buffer");
         // SAFETY: `rel + len <= total <= buffer.len()` (checked at submit),
         // so the pointer stays inside the buffer.
         let ptr = unsafe { buffer.as_mut_ptr().add(rel) };
         if finished_queueing {
-            self.queue_mut(class).pop_front();
+            self.queue_mut(class).remove(pos);
         }
         self.in_flight += 1;
         self.peak_in_flight = self.peak_in_flight.max(self.in_flight);
-        if class == Class::Prefetch {
-            self.in_flight_prefetch += 1;
-        }
+        let load = self.drives[usize::from(copy.drive)].started(class);
         if let Some(trace) = &mut self.trace {
             trace.push((key, chunk_index));
         }
-        Some(Picked { req: idx, rel, len, class, file, offset, ptr })
+        Some(Picked {
+            req: idx,
+            rel,
+            len,
+            class,
+            copy: copy.index,
+            fd: copy.fd,
+            drive: copy.drive,
+            started: now,
+            load,
+            offset,
+            ptr,
+        })
     }
 
     /// A chunk came back.
     pub(crate) fn chunk_done(&mut self, chunk: &Picked, result: ChunkResult, now: Instant) {
         self.in_flight -= 1;
-        if chunk.class == Class::Prefetch {
-            self.in_flight_prefetch -= 1;
-        }
+        let delivered = match result {
+            ChunkResult::Bytes(n) => n,
+            ChunkResult::Errno(_) => 0,
+        };
+        self.drives[usize::from(chunk.drive)].came_back(chunk, delivered, now);
         let idx = chunk.req;
         // Field-wise borrows: the path is only cloned when an error needs it.
         let req = self.slab[idx as usize].as_mut().expect("an indexed request exists");
@@ -386,7 +579,9 @@ impl Sched {
             ChunkResult::Errno(errno) => {
                 if req.error.is_none() {
                     req.error = Some(Error::Io {
-                        path: self.files[usize::from(req.file)].path.clone(),
+                        path: self.files[usize::from(req.file)].copies[usize::from(chunk.copy)]
+                            .path
+                            .clone(),
                         offset: chunk.offset,
                         len: chunk.len,
                         source: std::io::Error::from_raw_os_error(errno),
@@ -499,7 +694,10 @@ impl Sched {
             }
         }
         self.in_flight = 0;
-        self.in_flight_prefetch = 0;
+        for drive in &mut self.drives {
+            drive.in_flight = 0;
+            drive.in_flight_prefetch = 0;
+        }
         self.failed = Some(why);
     }
 
@@ -541,6 +739,19 @@ impl Sched {
         self.trace.clone().unwrap_or_default()
     }
 
+    /// What each drive has done, in the order of the drives.
+    pub(crate) fn drive_stats(&self) -> Vec<DriveStats> {
+        let stats = |d: &Drive| DriveStats {
+            chunks: d.chunks,
+            bytes: d.bytes,
+            in_flight: d.in_flight,
+            peak_in_flight: d.peak_in_flight,
+            alone_ns_per_mib: d.alone.ns_per_mib,
+            shared_ns_per_mib: d.shared.ns_per_mib,
+        };
+        self.drives.iter().map(stats).collect()
+    }
+
     /// Counters, and the latency windows to sort outside the lock.
     pub(crate) fn stats(&self) -> (Stats, [(u64, Vec<u64>); 2]) {
         let stats = Stats {
@@ -570,21 +781,35 @@ pub(crate) fn finish_stats((mut stats, windows): (Stats, [(u64, Vec<u64>); 2])) 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::file::{BufferedReason, FileId, IoMode};
+    use crate::file::{BufferedReason, CopyInfo, DriveId, FileId, IoMode};
     use std::path::PathBuf;
 
     const BLOCK: u64 = 512;
 
-    fn sched(depth: usize, prefetch_depth: usize) -> Sched {
-        let files: Arc<[FileInfo]> = Arc::new([FileInfo {
-            path: PathBuf::from("test.bin"),
-            size: 1 << 20,
-            mode: IoMode::Buffered(BufferedReason::Disabled),
-            direct_align: None,
-            block: BLOCK,
-        }]);
+    /// A file of 1 MiB with one copy on each of `drives`.
+    fn file_on(name: &str, drives: &[u16]) -> FileInfo {
+        let mode = IoMode::Buffered(BufferedReason::Disabled);
+        let mut file =
+            FileInfo::single(PathBuf::from(name), 1 << 20, mode, None, BLOCK, DriveId(drives[0]));
+        for drive in &drives[1..] {
+            file.copies.push(CopyInfo {
+                path: PathBuf::from(format!("{name}.copy-on-{drive}")),
+                mode,
+                direct_align: None,
+                drive: DriveId(*drive),
+            });
+        }
+        file
+    }
+
+    fn sched_of(files: Vec<FileInfo>, depth: usize, prefetch_depth: usize) -> Sched {
         let limits = Limits { depth, prefetch_depth, prefetch_chunk: 1024, demand_chunk: 1 << 20 };
-        Sched::new(limits, files, true)
+        Sched::new(limits, files.into(), true)
+    }
+
+    /// One file on one drive.
+    fn sched(depth: usize, prefetch_depth: usize) -> Sched {
+        sched_of(vec![file_on("test.bin", &[0])], depth, prefetch_depth)
     }
 
     fn read(key: Key, class: Class, offset: u64, len: usize) -> Read {
@@ -603,7 +828,7 @@ mod tests {
     /// Starts every chunk that may start and reports them as (key, chunk).
     fn drain_starts(s: &mut Sched) -> Vec<(Key, usize)> {
         let mut started = Vec::new();
-        while let Some(p) = s.take_chunk() {
+        while let Some(p) = s.take_chunk(Instant::now()) {
             let key = s.req(p.req).key;
             started.push((key, p.rel / s.req(p.req).chunk));
             s.chunk_done(&p, ChunkResult::Bytes(p.len), Instant::now());
@@ -635,13 +860,16 @@ mod tests {
     fn the_prefetch_limit_keeps_room_for_demand() {
         let mut s = sched(8, 2);
         s.submit(read(1, Class::Prefetch, 0, 8192), Instant::now()).unwrap();
-        let a = s.take_chunk().unwrap();
-        let b = s.take_chunk().unwrap();
-        assert!(s.take_chunk().is_none(), "only two prefetch chunks may be at the device");
+        let a = s.take_chunk(Instant::now()).unwrap();
+        let b = s.take_chunk(Instant::now()).unwrap();
+        assert!(
+            s.take_chunk(Instant::now()).is_none(),
+            "only two prefetch chunks may be at the device"
+        );
         // A demand read still starts at once, though prefetch is at its limit.
         s.submit(read(2, Class::Demand, 0, 512), Instant::now()).unwrap();
         assert!(s.startable());
-        let d = s.take_chunk().unwrap();
+        let d = s.take_chunk(Instant::now()).unwrap();
         assert_eq!(s.req(d.req).key, 2);
         s.chunk_done(&a, ChunkResult::Bytes(a.len), Instant::now());
         assert!(s.startable(), "a finished prefetch chunk frees a prefetch slot");
@@ -655,9 +883,9 @@ mod tests {
         for key in 0..5 {
             s.submit(read(key, Class::Demand, 0, 512), Instant::now()).unwrap();
         }
-        assert!(s.take_chunk().is_some());
-        assert!(s.take_chunk().is_some());
-        assert!(s.take_chunk().is_none());
+        assert!(s.take_chunk(Instant::now()).is_some());
+        assert!(s.take_chunk(Instant::now()).is_some());
+        assert!(s.take_chunk(Instant::now()).is_none());
         assert_eq!(s.in_flight(), 2);
     }
 
@@ -668,10 +896,10 @@ mod tests {
         s.submit(read(2, Class::Prefetch, 0, 2048), Instant::now()).unwrap();
         s.submit(read(3, Class::Demand, 0, 512), Instant::now()).unwrap();
         // One chunk of the first prefetch goes out before anything is decided.
-        let first = s.take_chunk().unwrap();
+        let first = s.take_chunk(Instant::now()).unwrap();
         assert_eq!(s.req(first.req).key, 3, "the demand read is first");
         s.chunk_done(&first, ChunkResult::Bytes(first.len), Instant::now());
-        let second = s.take_chunk().unwrap();
+        let second = s.take_chunk(Instant::now()).unwrap();
         assert_eq!(s.req(second.req).key, 1);
         s.chunk_done(&second, ChunkResult::Bytes(second.len), Instant::now());
 
@@ -711,11 +939,11 @@ mod tests {
     fn cancelling_a_running_read_waits_for_its_chunks_and_stops_the_rest() {
         let mut s = sched(2, 2);
         s.submit(read(7, Class::Prefetch, 0, 4096), Instant::now()).unwrap();
-        let a = s.take_chunk().unwrap();
-        let b = s.take_chunk().unwrap();
+        let a = s.take_chunk(Instant::now()).unwrap();
+        let b = s.take_chunk(Instant::now()).unwrap();
         assert_eq!(s.cancel(7, Instant::now()).unwrap(), Cancel::Cancelled);
         assert!(s.take_done(7).is_none(), "two chunks are still at the device");
-        assert!(s.take_chunk().is_none(), "the rest of the read is not started");
+        assert!(s.take_chunk(Instant::now()).is_none(), "the rest of the read is not started");
         s.chunk_done(&a, ChunkResult::Bytes(a.len), Instant::now());
         assert!(s.take_done(7).is_none());
         s.chunk_done(&b, ChunkResult::Bytes(b.len), Instant::now());
@@ -743,11 +971,14 @@ mod tests {
         // 3072 bytes wanted in three chunks of 1024; the file ends after
         // 1500 bytes, inside the second chunk.
         s.submit(read(1, Class::Prefetch, 0, 3072), Instant::now()).unwrap();
-        let a = s.take_chunk().unwrap();
-        let b = s.take_chunk().unwrap();
+        let a = s.take_chunk(Instant::now()).unwrap();
+        let b = s.take_chunk(Instant::now()).unwrap();
         s.chunk_done(&a, ChunkResult::Bytes(a.len), Instant::now());
         s.chunk_done(&b, ChunkResult::Bytes(1500 - a.len), Instant::now());
-        assert!(s.take_chunk().is_none(), "nothing after the end of the file is read");
+        assert!(
+            s.take_chunk(Instant::now()).is_none(),
+            "nothing after the end of the file is read"
+        );
         let c = s.take_done(1).unwrap();
         match c.result {
             Err(Error::ShortRead { wanted: 3072, got: 1500, size: 1048576, .. }) => {}
@@ -762,7 +993,7 @@ mod tests {
         // 600 bytes wanted at offset 100: the span is [0, 1024); the file
         // ends at 800, inside the last block, after the wanted bytes.
         s.submit(read(1, Class::Demand, 100, 600), Instant::now()).unwrap();
-        let p = s.take_chunk().unwrap();
+        let p = s.take_chunk(Instant::now()).unwrap();
         assert_eq!(p.len, 1024);
         s.chunk_done(&p, ChunkResult::Bytes(800), Instant::now());
         let c = s.take_done(1).unwrap();
@@ -775,8 +1006,8 @@ mod tests {
         let mut s = sched(4, 4);
         s.submit(read(1, Class::Demand, 0, 512), Instant::now()).unwrap();
         s.submit(read(2, Class::Demand, 512, 512), Instant::now()).unwrap();
-        let a = s.take_chunk().unwrap();
-        let b = s.take_chunk().unwrap();
+        let a = s.take_chunk(Instant::now()).unwrap();
+        let b = s.take_chunk(Instant::now()).unwrap();
         s.chunk_done(&a, ChunkResult::Errno(libc::EIO), Instant::now());
         s.chunk_done(&b, ChunkResult::Bytes(b.len), Instant::now());
         let (c1, c2) = (s.take_done(1).unwrap(), s.take_done(2).unwrap());
@@ -843,7 +1074,7 @@ mod tests {
         let mut s = sched(1, 1);
         s.submit(read(1, Class::Demand, 0, 100), Instant::now()).unwrap();
         s.submit(read(2, Class::Demand, 0, 100), Instant::now()).unwrap();
-        let running = s.take_chunk().unwrap();
+        let running = s.take_chunk(Instant::now()).unwrap();
         s.fail("test".into(), Instant::now());
         assert!(matches!(s.take_done(2).unwrap().result, Err(Error::Stopped(_))));
         assert!(s.take_done(1).is_none(), "its buffer may still be written by the kernel");
@@ -859,7 +1090,7 @@ mod tests {
         let mut s = sched(2, 2);
         s.submit(read(1, Class::Demand, 0, 512), Instant::now()).unwrap();
         s.submit(read(2, Class::Demand, 0, 512), Instant::now()).unwrap();
-        let (a, b) = (s.take_chunk().unwrap(), s.take_chunk().unwrap());
+        let (a, b) = (s.take_chunk(Instant::now()).unwrap(), s.take_chunk(Instant::now()).unwrap());
         // The second read comes back first.
         s.chunk_done(&b, ChunkResult::Bytes(b.len), Instant::now());
         s.chunk_done(&a, ChunkResult::Bytes(a.len), Instant::now());
@@ -885,5 +1116,292 @@ mod tests {
         assert_eq!(st.outstanding, 3, "completions not yet taken still hold their keys");
         let latency = finish_stats(s.stats()).demand_latency;
         assert_eq!(latency.total, 1);
+    }
+
+    // ---- several drives ----
+
+    use std::time::Duration;
+
+    /// Starts every chunk that may start, without finishing any, and returns
+    /// them.
+    fn start_all(s: &mut Sched, now: Instant) -> Vec<Picked> {
+        std::iter::from_fn(|| s.take_chunk(now)).collect()
+    }
+
+    fn demand(key: Key, file: u16, len: usize) -> Read {
+        let mut r = read(key, Class::Demand, 0, len);
+        r.file = FileId(file);
+        r
+    }
+
+    #[test]
+    fn every_drive_has_a_depth_of_its_own() {
+        let mut s = sched_of(vec![file_on("model.bin", &[0, 1])], 2, 2);
+        for key in 0..6 {
+            s.submit(demand(key, 0, 512), Instant::now()).unwrap();
+        }
+        let started = start_all(&mut s, Instant::now());
+        assert_eq!(started.len(), 4, "two chunks at each of the two drives");
+        let at = |drive| started.iter().filter(|p| p.drive == drive).count();
+        assert_eq!((at(0), at(1)), (2, 2));
+        assert_eq!(s.in_flight(), 4);
+        assert!(!s.startable());
+        // A chunk that comes back frees a place at its own drive only.
+        s.chunk_done(&started[0], ChunkResult::Bytes(512), Instant::now());
+        let next = s.take_chunk(Instant::now()).unwrap();
+        assert_eq!(next.drive, started[0].drive);
+        assert!(s.take_chunk(Instant::now()).is_none());
+    }
+
+    #[test]
+    fn chunks_of_a_file_with_copies_spread_over_idle_drives_from_the_first() {
+        // Nothing has been measured yet: the bytes at each drive decide, so
+        // the chunks alternate, starting with the first copy.
+        let mut s = sched_of(vec![file_on("model.bin", &[0, 1])], 8, 8);
+        for key in 0..6 {
+            s.submit(demand(key, 0, 512), Instant::now()).unwrap();
+        }
+        let drives: Vec<u16> = start_all(&mut s, Instant::now()).iter().map(|p| p.drive).collect();
+        assert_eq!(drives, [0, 1, 0, 1, 0, 1]);
+    }
+
+    #[test]
+    fn each_copy_is_read_through_its_own_descriptor() {
+        // Two files of two copies: descriptors 0 and 1 are the copies of the
+        // first file, 2 and 3 those of the second, on drives 0 and 1 each.
+        let files = vec![file_on("a.bin", &[0, 1]), file_on("b.bin", &[0, 1])];
+        let mut s = sched_of(files, 8, 8);
+        for (key, file) in [(0, 0), (1, 0), (2, 1), (3, 1)] {
+            s.submit(demand(key, file, 512), Instant::now()).unwrap();
+        }
+        let started = start_all(&mut s, Instant::now());
+        let seen: Vec<(u16, u16, u16)> = started.iter().map(|p| (p.fd, p.copy, p.drive)).collect();
+        assert_eq!(seen, [(0, 0, 0), (1, 1, 1), (2, 0, 0), (3, 1, 1)]);
+    }
+
+    /// A file with a copy on each of two drives, and a file on each drive
+    /// alone, with which a test puts chunks on the drive it wants: files 0
+    /// (both), 1 (drive 0 only) and 2 (drive 1 only).
+    fn mirrored_and_one_on_each() -> Sched {
+        let files =
+            vec![file_on("model.bin", &[0, 1]), file_on("on0.bin", &[0]), file_on("on1.bin", &[1])];
+        sched_of(files, 64, 64)
+    }
+
+    /// Runs `n` chunks of 512 bytes at once on the drive of `file`, all of
+    /// which come back `took` after `at`.
+    fn measure(s: &mut Sched, file: u16, n: u64, at: Instant, took: Duration) {
+        for key in 0..n {
+            s.submit(demand(10_000 + key, file, 512), at).unwrap();
+        }
+        let started = start_all(s, at);
+        assert_eq!(started.len() as u64, n);
+        for p in &started {
+            s.chunk_done(p, ChunkResult::Bytes(512), at + took);
+        }
+        for key in 0..n {
+            s.take_done(10_000 + key).unwrap();
+        }
+    }
+
+    const MS: Duration = Duration::from_millis(1);
+
+    #[test]
+    fn a_drive_is_measured_alone_and_under_load() {
+        let mut s = mirrored_and_one_on_each();
+        let t0 = Instant::now();
+        // One chunk alone at drive 0 takes 1 ms: 2048 ms per MiB for 512 bytes.
+        measure(&mut s, 1, 1, t0, MS);
+        let stats = s.drive_stats();
+        assert_eq!((stats[0].alone_ns_per_mib, stats[0].shared_ns_per_mib), (2_048_000_000, 0));
+        assert_eq!((stats[1].alone_ns_per_mib, stats[1].shared_ns_per_mib), (0, 0));
+        // Three at once take 6 ms each: each saw two chunks on average (three
+        // when it started or when it ended, one at the other end), so the
+        // drive's time per chunk and MiB is half of what one took.
+        measure(&mut s, 1, 3, t0 + 10 * MS, 6 * MS);
+        let stats = s.drive_stats();
+        assert_eq!(stats[0].alone_ns_per_mib, 2_048_000_000, "unchanged");
+        assert_eq!(stats[0].shared_ns_per_mib, 6 * 2_048_000_000 / 2);
+        assert_eq!((stats[0].chunks, stats[0].bytes), (4, 4 * 512));
+    }
+
+    #[test]
+    fn a_single_read_goes_to_the_drive_that_is_faster_alone() {
+        let mut s = mirrored_and_one_on_each();
+        let t0 = Instant::now();
+        measure(&mut s, 1, 1, t0, 3 * MS);
+        measure(&mut s, 2, 1, t0, MS);
+        for key in 0..3 {
+            let at = t0 + (10 + 2 * key as u32) * MS;
+            s.submit(demand(key, 0, 512), at).unwrap();
+            let p = s.take_chunk(at).unwrap();
+            assert_eq!(p.drive, 1, "the second drive answers a lone read in a third of the time");
+            s.chunk_done(&p, ChunkResult::Bytes(512), at + MS);
+        }
+    }
+
+    #[test]
+    fn under_load_the_drives_share_the_chunks_by_their_throughput() {
+        let mut s = mirrored_and_one_on_each();
+        let t0 = Instant::now();
+        // Three chunks at once: 2 ms each at drive 0, 7 ms each at drive 1.
+        measure(&mut s, 1, 3, t0, 2 * MS);
+        measure(&mut s, 2, 3, t0, 7 * MS);
+        let stats = s.drive_stats();
+        assert_eq!(2 * stats[1].shared_ns_per_mib, 7 * stats[0].shared_ns_per_mib);
+        // Eight chunks of the mirrored file at once: drive 0 takes chunks
+        // until a fourth there would take longer than a first at drive 1.
+        let t1 = t0 + 10 * MS;
+        for key in 0..8 {
+            s.submit(demand(key, 0, 512), t1).unwrap();
+        }
+        let drives: Vec<u16> = start_all(&mut s, t1).iter().map(|p| p.drive).collect();
+        assert_eq!(drives, [0, 0, 0, 1, 0, 0, 0, 1]);
+    }
+
+    #[test]
+    fn a_drive_that_has_not_been_measured_is_tried() {
+        let mut s = mirrored_and_one_on_each();
+        let t0 = Instant::now();
+        // Drive 0 is known alone; drive 1 not at all, so a lone read tries it.
+        measure(&mut s, 1, 1, t0, MS);
+        let t1 = t0 + 5 * MS;
+        s.submit(demand(0, 0, 512), t1).unwrap();
+        let p = s.take_chunk(t1).unwrap();
+        assert_eq!(p.drive, 1);
+        // It turns out three times as slow, and the next lone read knows.
+        s.chunk_done(&p, ChunkResult::Bytes(512), t1 + 3 * MS);
+        let t2 = t1 + 5 * MS;
+        s.submit(demand(1, 0, 512), t2).unwrap();
+        let p = s.take_chunk(t2).unwrap();
+        assert_eq!(p.drive, 0);
+        s.chunk_done(&p, ChunkResult::Bytes(512), t2 + MS);
+
+        // Neither drive has been measured under load.
+        let t3 = t2 + 5 * MS;
+        for key in 10..16 {
+            s.submit(demand(key, 0, 512), t3).unwrap();
+        }
+        let started = start_all(&mut s, t3);
+        // A lone chunk at drive 0 is expected in 1 ms and at drive 1 in 3 ms,
+        // and more chunks are not yet known to slow either: all go to drive 0.
+        assert!(started.iter().all(|p| p.drive == 0));
+        // They come back after 7 ms, which measures drive 0 under load (six
+        // chunks, 3.5 on average while each was there: 2 ms per chunk). Now a
+        // second chunk at drive 0 is expected in 4 ms and a burst goes on to
+        // drive 1, which is not yet known to slow down under load.
+        for p in &started {
+            s.chunk_done(p, ChunkResult::Bytes(512), t3 + 7 * MS);
+        }
+        assert_eq!(s.drive_stats()[0].shared_ns_per_mib, 2 * 2_048_000_000);
+        let t4 = t3 + 10 * MS;
+        for key in 20..24 {
+            s.submit(demand(key, 0, 512), t4).unwrap();
+        }
+        let drives: Vec<u16> = start_all(&mut s, t4).iter().map(|p| p.drive).collect();
+        assert_eq!(drives, [0, 1, 1, 1]);
+    }
+
+    #[test]
+    fn a_measurement_stops_counting_after_a_second() {
+        let mut s = mirrored_and_one_on_each();
+        let t0 = Instant::now();
+        measure(&mut s, 1, 1, t0, MS);
+        measure(&mut s, 2, 1, t0, 3 * MS);
+        // The slower drive is left alone while its measurement counts.
+        let lone = |s: &mut Sched, key: Key, at: Instant| {
+            s.submit(demand(key, 0, 512), at).unwrap();
+            let p = s.take_chunk(at).unwrap();
+            s.chunk_done(&p, ChunkResult::Bytes(512), at + MS);
+            p.drive
+        };
+        assert_eq!(lone(&mut s, 0, t0 + 100 * MS), 0);
+        assert_eq!(lone(&mut s, 1, t0 + 900 * MS), 0);
+        // After a second without a chunk it is tried once more, measured
+        // again (1 ms this time: it is as fast as the other now), and used.
+        let later = t0 + 3 * MS + MEASUREMENT_LIFE + MS;
+        assert_eq!(lone(&mut s, 2, later), 1);
+        let stats = s.drive_stats();
+        assert_eq!(stats[1].alone_ns_per_mib, 2_048_000_000, "replaced, not averaged in");
+    }
+
+    #[test]
+    fn a_read_whose_drive_is_busy_does_not_hold_up_one_for_an_idle_drive() {
+        // Two files without copies, each on its own drive, as the parts of a
+        // split model can be.
+        let files = vec![file_on("part1.bin", &[0]), file_on("part2.bin", &[1])];
+        let mut s = sched_of(files, 1, 1);
+        s.submit(demand(1, 0, 512), Instant::now()).unwrap();
+        s.submit(demand(2, 0, 512), Instant::now()).unwrap();
+        s.submit(demand(3, 1, 512), Instant::now()).unwrap();
+        let a = s.take_chunk(Instant::now()).unwrap();
+        assert_eq!((s.req(a.req).key, a.drive), (1, 0));
+        // Read 2 is older than read 3, but its drive is busy and the other is idle.
+        let b = s.take_chunk(Instant::now()).unwrap();
+        assert_eq!((s.req(b.req).key, b.drive), (3, 1));
+        assert!(s.take_chunk(Instant::now()).is_none());
+        s.chunk_done(&a, ChunkResult::Bytes(512), Instant::now());
+        let c = s.take_chunk(Instant::now()).unwrap();
+        assert_eq!((s.req(c.req).key, c.drive), (2, 0));
+        assert_eq!(s.trace(), [(1, 0), (3, 0), (2, 0)]);
+    }
+
+    #[test]
+    fn the_prefetch_limit_holds_at_every_drive_and_demand_still_goes_first() {
+        let mut s = sched_of(vec![file_on("model.bin", &[0, 1])], 4, 1);
+        s.submit(read(1, Class::Prefetch, 0, 8192), Instant::now()).unwrap();
+        let prefetches = start_all(&mut s, Instant::now());
+        let drives: Vec<u16> = prefetches.iter().map(|p| p.drive).collect();
+        assert_eq!(drives, [0, 1], "one prefetch chunk at each drive, no more");
+        // Demand reads use the rest of both depths, ahead of the prefetch.
+        for key in 10..20 {
+            s.submit(demand(key, 0, 512), Instant::now()).unwrap();
+        }
+        let demands = start_all(&mut s, Instant::now());
+        assert_eq!(demands.len(), 6, "three more at each drive");
+        assert!(demands.iter().all(|p| p.class == Class::Demand));
+        // A prefetch chunk that returns is replaced by a demand read while
+        // there are any, not by the next prefetch chunk.
+        s.chunk_done(&prefetches[0], ChunkResult::Bytes(1024), Instant::now());
+        let next = s.take_chunk(Instant::now()).unwrap();
+        assert_eq!((next.class, next.drive), (Class::Demand, 0));
+    }
+
+    #[test]
+    fn an_error_names_the_copy_it_came_from() {
+        let mut s = sched_of(vec![file_on("model.bin", &[0, 1])], 4, 4);
+        s.submit(demand(1, 0, 512), Instant::now()).unwrap();
+        s.submit(demand(2, 0, 512), Instant::now()).unwrap();
+        let started = start_all(&mut s, Instant::now());
+        assert_eq!(started[1].copy, 1);
+        s.chunk_done(&started[0], ChunkResult::Bytes(512), Instant::now());
+        s.chunk_done(&started[1], ChunkResult::Errno(libc::EIO), Instant::now());
+        assert!(s.take_done(1).unwrap().result.is_ok());
+        match s.take_done(2).unwrap().result {
+            Err(Error::Io { path, .. }) => assert_eq!(path, PathBuf::from("model.bin.copy-on-1")),
+            other => panic!("unexpected {other:?}"),
+        }
+        // The failed chunk counts for its drive, with no bytes.
+        let stats = s.drive_stats();
+        assert_eq!((stats[1].chunks, stats[1].bytes, stats[1].in_flight), (1, 0, 0));
+    }
+
+    #[test]
+    fn drive_statistics_follow_the_chunks() {
+        let mut s = sched_of(vec![file_on("model.bin", &[0, 1])], 4, 4);
+        assert_eq!(s.drive_stats(), [DriveStats::default(); 2]);
+        for key in 0..3 {
+            s.submit(demand(key, 0, 2048), Instant::now()).unwrap();
+        }
+        let started = start_all(&mut s, Instant::now());
+        let stats = s.drive_stats();
+        assert_eq!((stats[0].in_flight, stats[1].in_flight), (2, 1));
+        for p in &started {
+            s.chunk_done(p, ChunkResult::Bytes(p.len), Instant::now());
+        }
+        let stats = s.drive_stats();
+        assert_eq!((stats[0].chunks, stats[0].bytes, stats[0].peak_in_flight), (2, 4096, 2));
+        assert_eq!((stats[1].chunks, stats[1].bytes, stats[1].peak_in_flight), (1, 2048, 1));
+        assert_eq!((stats[0].in_flight, stats[1].in_flight), (0, 0));
     }
 }

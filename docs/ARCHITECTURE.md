@@ -100,7 +100,7 @@ machine (RTX 4070 + RTX 3060, Qwen3.8-27B) or read from the engines listed in
 | `ares-vulkan` | The same device-level surface on Vulkan, the same first kernels as compute shaders | Done; 23 device tests pass on both GPUs |
 | `ares-state` | Page pool, page tables with copy on write, prefix index with checkpoints, page layouts | Done; randomised model check |
 | `ares-store` | State on disk: pages and checkpoints by content hash in segment files, per fingerprint, with a size limit | Done as a store of opaque bytes, tested against restarts, the limit and damaged files; not yet connected to devices |
-| `ares-io` | Reads of weights straight from the model file: io_uring with direct I/O, demand before prefetch, cancel and promote, a map from experts to file ranges, row reads behind a cache | Done, tested against real files; about 1 GB/s of cold expert reads on the development SSD; not yet connected to devices |
+| `ares-io` | Reads of weights straight from the model file: io_uring with direct I/O, demand before prefetch, cancel and promote, copies of a file on several drives with the reads spread over them, a map from experts to file ranges, row reads behind a cache | Done, tested against real files and on two drives; 1.4 to 1.7 GiB/s of random expert-sized reads per SSD of the development machine and 2.9 to 3.0 GiB/s over both; not yet connected to devices |
 | `ares-sched` | Step planner (generation, decision rows and prompts in one step), step time model, draft length choice, n-gram drafter | Done, unit tested |
 | `ares-weights` | Expert heat, tier election with two-phase swaps, routing bias for pruning | Done, unit tested |
 | `ares-api` | Request, event, decision and error types; the `Engine` trait between HTTP and the runtime (`submit` for generation, `decide` for decisions) | Done, unit tested |
@@ -395,14 +395,31 @@ pages) and comes with the runtime.
   exempts; re-electing the tier every x tokens keeps the experts a run needs
   and drops the rest. This trades a bounded loss of quality for never
   fetching cold experts and is off by default.
-- **Reading from SSD** (planned): experts are read in place from the GGUF at
-  `offset + e * stride` with direct I/O through `io_uring` into pinned staging
-  buffers, demand before read-ahead. Next-layer router prediction and
-  profile-based read-ahead for prefill start reads early.
-- **Hashed-row tables** (planned): for models with n-gram embedding tables
-  (28.8 GB for `qwen4exp`) the row ids follow from the last tokens on the
-  host, so the reads are issued when the token is known and collected before
-  the layer that needs them, behind a row cache.
+- **Reading from SSD** (`ares-io`; not yet connected to the tiers): experts
+  are read in place from the GGUF at `offset + e * stride` with direct I/O
+  through `io_uring` into buffers the caller provides (pinned staging buffers
+  of a GPU backend), demand reads before read-ahead, which is cut into chunks
+  and can be cancelled or promoted. Next-layer router prediction and
+  profile-based read-ahead for prefill, which start reads early, are planned.
+- **Several SSDs.** A model can have copies on more than one drive (a mirror
+  directory per extra drive), and the parts of a split model can be on
+  different drives. Every drive has its own queue depth, and each chunk of a
+  mirrored file goes to the drive expected to deliver it soonest. Each drive
+  is described by two measured numbers, the time of a chunk that is alone
+  there and the time per chunk when several are, so a lone read goes to the
+  drive with the shorter access time and a burst is shared by throughput; a
+  drive that has not been measured for a second is tried again. Measured
+  2026-11-10 with reads of 1.44 MiB (one expert of `qwen4exp`) from a 14 GiB
+  file mirrored on the two NVMe drives of the development machine: 1.66 and
+  1.36 GiB/s for each drive alone with 8 to 64 reads in flight, 2.9 to 3.0
+  GiB/s for both; with 8 in flight the median read takes 3.8 ms against 6.1
+  and 8.3 ms; a lone read takes 1.4 ms, the time of the faster drive. The
+  copies must be identical: sizes are compared and contents sampled at open.
+  The price is the disk space of the copy.
+- **Hashed-row tables**: for models with n-gram embedding tables (28.8 GB for
+  `qwen4exp`) the row ids follow from the last tokens on the host, so the
+  reads are issued when the token is known and collected before the layer
+  that needs them, behind a row cache (`ares-io`; not yet connected).
 
 ## Devices
 

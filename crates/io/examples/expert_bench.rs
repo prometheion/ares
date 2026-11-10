@@ -15,8 +15,13 @@
 //! ```sh
 //! cargo run --release -p ares-io --example expert_bench -- MODEL.gguf \
 //!     [--mib 1024] [--depths 1,4,16,64] [--patterns ffn_gate_exps,ffn_up_exps,ffn_down_exps] \
-//!     [--seed 1] [--buffered] [--queue-depth 32] [--hot N] [--fixed] [--mixed N]
+//!     [--seed 1] [--buffered] [--queue-depth 32] [--hot N] [--fixed] [--mixed N] \
+//!     [--mirror DIR]...
 //! ```
+//!
+//! `--mirror DIR` names a directory on another drive that holds a copy of every
+//! part of the model; the reads are then spread over the drives, and the last
+//! lines say how much each delivered.
 //!
 //! `--hot N` draws the experts from a fixed set of N, so that after the first
 //! pass the drive answers from its own cache and what is left to see is the
@@ -48,6 +53,8 @@ struct Args {
     /// Also measure demand latency next to this many experts of background
     /// prefetch.
     mixed: Option<usize>,
+    /// Directories on other drives that hold a copy of the model.
+    mirrors: Vec<String>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -62,12 +69,14 @@ fn parse_args() -> Result<Args, String> {
         hot: None,
         fixed: false,
         mixed: None,
+        mirrors: Vec::new(),
     };
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         let mut value = |name: &str| it.next().ok_or(format!("{name} needs a value"));
         match arg.as_str() {
             "--mib" => args.mib = value("--mib")?.parse().map_err(|e| format!("--mib: {e}"))?,
+            "--mirror" => args.mirrors.push(value("--mirror")?),
             "--seed" => args.seed = value("--seed")?.parse().map_err(|e| format!("--seed: {e}"))?,
             "--queue-depth" => {
                 args.queue_depth =
@@ -169,7 +178,8 @@ fn run() -> Result<(), String> {
         fixed_regions,
         ..Config::default()
     };
-    let reader = Reader::open_gguf(&gguf, config).map_err(|e| e.to_string())?;
+    let reader =
+        Reader::open_gguf_mirrored(&gguf, &args.mirrors, config).map_err(|e| e.to_string())?;
 
     println!("model      {}", args.model);
     println!(
@@ -354,6 +364,17 @@ fn run() -> Result<(), String> {
         stats.demand_latency.p95.as_secs_f64() * 1e3,
         stats.demand_latency.p99.as_secs_f64() * 1e3,
     );
+    if reader.drives().len() > 1 {
+        for (drive, s) in reader.drives().iter().zip(reader.drive_stats()) {
+            println!(
+                "drive      {}: {:.0} MiB in {} chunks, peak {} in flight",
+                drive.name,
+                s.bytes as f64 / (1 << 20) as f64,
+                s.chunks,
+                s.peak_in_flight
+            );
+        }
+    }
     Ok(())
 }
 
