@@ -90,29 +90,53 @@ fn model_scale(amax: f32, bits: u32) -> u16 {
     low
 }
 
-/// The stream of 32 codes, one bit at a time.
-fn model_pack(codes: &[i32], bits: u32) -> Vec<u8> {
-    let mut stream = Vec::new();
-    for &code in codes {
-        for bit in 0..bits {
-            stream.push((code >> bit) & 1 == 1);
-        }
+/// The planes a code of `bits` bits is stored in, as (width, lowest bit).
+fn model_planes(bits: u32) -> Vec<(u32, u32)> {
+    match bits {
+        8 => vec![(8, 0)],
+        7 => vec![(4, 0), (2, 4), (1, 6)],
+        6 => vec![(4, 0), (2, 4)],
+        5 => vec![(4, 0), (1, 4)],
+        4 => vec![(4, 0)],
+        _ => panic!("no format has {bits} bits"),
     }
-    stream
-        .chunks(8)
-        .map(|byte| byte.iter().enumerate().map(|(i, &b)| u8::from(b) << i).sum())
-        .collect()
+}
+
+/// The 32 codes in their planes, one bit at a time.
+fn model_pack(codes: &[i32], bits: u32) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    for (width, lowest) in model_planes(bits) {
+        let mut plane = Vec::new();
+        for &code in codes {
+            for bit in lowest..lowest + width {
+                plane.push((code >> bit) & 1 == 1);
+            }
+        }
+        bytes.extend(
+            plane
+                .chunks(8)
+                .map(|byte| byte.iter().enumerate().map(|(i, &b)| u8::from(b) << i).sum::<u8>()),
+        );
+    }
+    bytes
 }
 
 fn model_unpack(bytes: &[u8], bits: u32) -> Vec<i32> {
-    let stream: Vec<bool> =
-        bytes.iter().flat_map(|byte| (0..8).map(move |i| (byte >> i) & 1 == 1)).collect();
-    stream
-        .chunks(bits as usize)
-        .map(|code| {
-            let raw: i32 = code.iter().enumerate().map(|(i, &b)| i32::from(b) << i).sum();
-            if raw >= 1 << (bits - 1) { raw - (1 << bits) } else { raw }
-        })
+    let mut codes = vec![0i32; 32];
+    let mut at = 0;
+    for (width, lowest) in model_planes(bits) {
+        let plane = &bytes[at..at + 4 * width as usize];
+        for (i, code) in codes.iter_mut().enumerate() {
+            for bit in 0..width {
+                let n = i * width as usize + bit as usize;
+                *code |= i32::from((plane[n / 8] >> (n % 8)) & 1) << (lowest + bit);
+            }
+        }
+        at += plane.len();
+    }
+    codes
+        .into_iter()
+        .map(|raw| if raw >= 1 << (bits - 1) { raw - (1 << bits) } else { raw })
         .collect()
 }
 
@@ -494,28 +518,37 @@ fn every_code_at_every_position_survives_encode_and_decode() {
 #[test]
 fn stored_bytes_follow_the_layout_of_the_specification() {
     // Hand-made groups decode as the layout says. The scale is the first two
-    // bytes little endian; the codes are a bit stream, least significant bit
-    // first, in two's complement. The rest of each group is zero codes.
-    let group = |format: KvFormat, scale: u16, codes: &[u8]| {
-        let mut bytes = scale.to_le_bytes().to_vec();
-        bytes.extend(codes);
-        bytes.resize(format.group_bytes(), 0);
+    // bytes little endian; the codes follow in planes (the low four bits two
+    // per byte, then the planes of the high bits), in two's complement. The
+    // pieces are (offset among the code bytes, bytes); the rest is zero.
+    let group = |format: KvFormat, scale: u16, pieces: &[(usize, &[u8])]| {
+        let mut bytes = vec![0u8; format.group_bytes()];
+        bytes[..2].copy_from_slice(&scale.to_le_bytes());
+        for (at, piece) in pieces {
+            bytes[2 + at..2 + at + piece.len()].copy_from_slice(piece);
+        }
         decode_rotated(format, &bytes)
     };
     // q4, scale 1.0: the low nibble of a byte is the earlier code.
-    let q4 = group(KvFormat::Q4, 0x3c00, &[0xf1, 0x97, 0x08]);
+    let q4 = group(KvFormat::Q4, 0x3c00, &[(0, &[0xf1, 0x97, 0x08])]);
     assert_eq!(&q4[..6], &[1.0, -1.0, 7.0, -7.0, -8.0, 0.0], "-8 is the unused pattern 1000");
     // q8, scale 0.5: one signed byte per code.
-    let q8 = group(KvFormat::Q8, 0x3800, &[0x01, 0xff, 0x7f, 0x81, 0x80]);
+    let q8 = group(KvFormat::Q8, 0x3800, &[(0, &[0x01, 0xff, 0x7f, 0x81, 0x80])]);
     assert_eq!(&q8[..6], &[0.5, -0.5, 63.5, -63.5, -64.0, 0.0]);
-    // q5, scale 2.0: codes 1, -1, 15, -15, 7, -7, 0, 3 cross the byte boundaries.
-    let q5 = group(KvFormat::Q5, 0x4000, &[0xe1, 0xbf, 0x78, 0x32, 0x18]);
+    // q5, scale 2.0: codes 1, -1, 15, -15, 7, -7, 0, 3. Their low nibbles, and
+    // in the plane of single bits at byte 16 the top bits of codes 1, 3 and 5.
+    let q5 = group(KvFormat::Q5, 0x4000, &[(0, &[0xf1, 0x1f, 0x97, 0x30]), (16, &[0x2a])]);
     assert_eq!(&q5[..9], &[2.0, -2.0, 30.0, -30.0, 14.0, -14.0, 0.0, 6.0, 0.0]);
-    // q7, scale 1.0.
-    let q7 = group(KvFormat::Q7, 0x3c00, &[0x81, 0xff, 0x2f, 0x58, 0xd8, 0x03, 0x40]);
+    // q7, scale 1.0: nibbles, then bits 4 and 5 four codes per byte at byte 16,
+    // then bit 6 at byte 24.
+    let q7 = group(
+        KvFormat::Q7,
+        0x3c00,
+        &[(0, &[0xf1, 0x1f, 0xb5]), (16, &[0x3c, 0x8c]), (24, &[0x2a])],
+    );
     assert_eq!(&q7[..9], &[1.0, -1.0, 63.0, -63.0, 5.0, -5.0, 0.0, 32.0, 0.0]);
-    // q6, scale 1.0.
-    let q6 = group(KvFormat::Q6, 0x3c00, &[0xc1, 0xff, 0x85]);
+    // q6, scale 1.0: nibbles, then bits 4 and 5 at byte 16.
+    let q6 = group(KvFormat::Q6, 0x3c00, &[(0, &[0xf1, 0x1f]), (16, &[0x9c])]);
     assert_eq!(&q6[..5], &[1.0, -1.0, 31.0, -31.0, 0.0]);
     // f16: little-endian halves; 0x3c00 is 1.0, 0xc000 is -2.0.
     let mut half = vec![0x00, 0x3c, 0x00, 0xc0];

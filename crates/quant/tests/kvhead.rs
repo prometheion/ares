@@ -898,24 +898,34 @@ fn rows_of_256_values_work_the_same_way() {
 }
 
 /// The codes of a row of `q4`..`q8` as the specification lays them out: per
-/// group of 32, an f16 scale and then the codes as a little-endian bit stream of
+/// group of 32, an f16 scale and then the codes in planes (the low four bits two
+/// per byte, then the planes of the high bits; one byte per code for `q8`), as
 /// two's complement numbers. Returns (scale, codes) per group.
 fn unpack_row(bytes: &[u8], bits: u32) -> Vec<(f32, Vec<i32>)> {
+    let planes: &[(usize, usize)] = match bits {
+        8 => &[(8, 0)],
+        7 => &[(4, 0), (2, 4), (1, 6)],
+        6 => &[(4, 0), (2, 4)],
+        5 => &[(4, 0), (1, 4)],
+        _ => &[(4, 0)],
+    };
     let group = 2 + 4 * bits as usize;
     bytes
         .chunks_exact(group)
         .map(|g| {
             let scale = f16_to_f32(u16::from_le_bytes([g[0], g[1]]));
-            let codes = (0..32)
-                .map(|i| {
-                    let mut raw = 0i32;
-                    for b in 0..bits as usize {
-                        let at = i * bits as usize + b;
-                        raw |= i32::from((g[2 + at / 8] >> (at % 8)) & 1) << b;
+            let mut codes = vec![0i32; 32];
+            let mut at = 2;
+            for &(width, lowest) in planes {
+                for (i, code) in codes.iter_mut().enumerate() {
+                    for b in 0..width {
+                        let n = i * width + b;
+                        *code |= i32::from((g[at + n / 8] >> (n % 8)) & 1) << (lowest + b);
                     }
-                    (raw << (32 - bits)) >> (32 - bits)
-                })
-                .collect();
+                }
+                at += 4 * width;
+            }
+            let codes = codes.into_iter().map(|raw| (raw << (32 - bits)) >> (32 - bits)).collect();
             (scale, codes)
         })
         .collect()

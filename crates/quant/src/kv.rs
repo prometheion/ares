@@ -178,15 +178,32 @@
 //! rotated, plus small values) be stored with the error of its small values
 //! alone, where a scale from the largest magnitude loses about five times that.
 //!
-//! **4. Layout.** A group is the scale (2 bytes) followed by the 32 codes as a
-//! bit stream of `4 * B` bytes: code `i` occupies the stream bits
-//! `[i * B, (i + 1) * B)`, where stream bit `n` is bit `n % 8` of byte `n / 8`
-//! (the least significant bit comes first), each as a B-bit two's complement
-//! number. So a group is `2 + 4 * B` bytes, `B + 0.5` bits per value: 34 bytes for
-//! `q8`, 30 for `q7`, 26 for `q6`, 22 for `q5` and 18 for `q4`. For `q4` that is
-//! the low nibble of byte `2 + j` holding code `2j` and the high nibble code
-//! `2j + 1`. The scale is an f16 pattern like any other: for `q7` to `q4` its
-//! sign bit may be set.
+//! **4. Layout.** A group is the scale (2 bytes) followed by the 32 codes in
+//! `4 * B` bytes. A code is a B-bit two's complement number, and its bits are
+//! stored in **planes** of 4, 2 and 1 bits, so that no code straddles a byte and
+//! every plane unpacks with shifts and masks on whole bytes and words:
+//!
+//! | format | planes, in the order they are stored          | bytes       |
+//! | ------ | ---------------------------------------------- | ----------- |
+//! | `q8`   | bits 0 to 7 (one byte per code)                | 32          |
+//! | `q7`   | bits 0 to 3, then bits 4 and 5, then bit 6     | 16 + 8 + 4  |
+//! | `q6`   | bits 0 to 3, then bits 4 and 5                 | 16 + 8      |
+//! | `q5`   | bits 0 to 3, then bit 4                        | 16 + 4      |
+//! | `q4`   | bits 0 to 3                                    | 16          |
+//!
+//! Within a plane of `w` bits per code, code `i` occupies the plane's bits
+//! `[i * w, (i + 1) * w)`, where bit `n` of a plane is bit `n % 8` of its byte
+//! `n / 8` (the least significant bit comes first). So the plane of bits 0 to 3
+//! holds code `2j` in the low nibble of its byte `j` and code `2j + 1` in the
+//! high nibble, the same for every width below 8; a plane of 2 bits holds four
+//! codes per byte; a plane of 1 bit is a word of 32 bits, bit `i` for code `i`.
+//! A group is `2 + 4 * B` bytes, `B + 0.5` bits per value: 34 bytes for `q8`, 30
+//! for `q7`, 26 for `q6`, 22 for `q5` and 18 for `q4`. The scale is an f16
+//! pattern like any other: for `q7` to `q4` its sign bit may be set.
+//!
+//! (Until attention kernels were written the codes of `q5` to `q7` were a
+//! stream of B-bit numbers. The planes take the same bytes and unpack without a
+//! code crossing a byte; ExLlamaV3 stores its cache this way.)
 //!
 //! ## Tiles and their mean (`q7` to `q4`)
 //!
@@ -272,9 +289,11 @@
 //!   output once per head and group.
 //! - **`f16`**: no rotation, no scale; plain halves.
 //! - **`q8`**: the codes are one signed byte each; nothing to unpack.
-//! - **`q7`, `q6`, `q5`**: the codes are a bit stream of 7, 6 or 5 bits each;
-//!   unpacking is extra work that grows with the narrowness of the stream.
 //! - **`q4`**: two codes per byte, the low nibble first.
+//! - **`q7`, `q6`, `q5`**: the low four bits of the codes as for `q4`, and one
+//!   or two more planes with the high bits (four codes per byte, or a word of
+//!   32 bits); a code is put together with shifts and masks and sign-extended
+//!   from its top bit.
 //!
 //! For `q7` to `q4` the mean of each tile adds one term per tile, not per
 //! position:
@@ -1436,48 +1455,53 @@ fn decode_group(bytes: &[u8], bits: u32, out: &mut [f32; GROUP_VALUES]) {
     }
 }
 
-/// Writes the 32 codes as the little-endian bit stream of the layout, each as a
-/// `bits`-bit two's complement number. `out` is `4 * bits` bytes.
-fn pack_codes(codes: &[i32; GROUP_VALUES], bits: u32, out: &mut [u8]) {
-    let mask = (1u32 << bits) - 1;
-    // Bits not yet written, lowest first. At most 7 are left over when a code
-    // of at most 8 bits is added, so 15 bits fit easily.
-    let mut pending = 0u32;
-    let mut count = 0;
-    let mut next = 0;
-    for &code in codes {
-        pending |= (code as u32 & mask) << count;
-        count += bits;
-        while count >= 8 {
-            out[next] = pending as u8;
-            next += 1;
-            pending >>= 8;
-            count -= 8;
-        }
+/// The widths of the planes the codes of a `bits`-bit format are stored in,
+/// from the lowest bits of a code up; 0 ends the list.
+const fn plane_widths(bits: u32) -> [u32; 3] {
+    match bits {
+        8 => [8, 0, 0],
+        7 => [4, 2, 1],
+        6 => [4, 2, 0],
+        5 => [4, 1, 0],
+        _ => [4, 0, 0],
     }
-    debug_assert_eq!(count, 0, "32 codes of any width fill whole bytes");
 }
 
-/// Reads the 32 codes back from the bit stream, sign-extending each.
-fn unpack_codes(bytes: &[u8], bits: u32) -> [i32; GROUP_VALUES] {
-    let mask = (1u32 << bits) - 1;
-    let mut codes = [0i32; GROUP_VALUES];
-    let mut pending = 0u32;
-    let mut count = 0;
-    let mut next = 0;
-    for code in &mut codes {
-        while count < bits {
-            pending |= u32::from(bytes[next]) << count;
-            next += 1;
-            count += 8;
+/// Writes the 32 codes in the planes of the layout (step 4 of the
+/// specification), each a `bits`-bit two's complement number. `out` is
+/// `4 * bits` bytes.
+fn pack_codes(codes: &[i32; GROUP_VALUES], bits: u32, out: &mut [u8]) {
+    out.fill(0);
+    let (mut plane, mut shift) = (0, 0);
+    for width in plane_widths(bits).into_iter().filter(|w| *w > 0) {
+        let mask = (1u32 << width) - 1;
+        for (i, &code) in codes.iter().enumerate() {
+            let field = (code as u32 >> shift) & mask;
+            let bit = i as u32 * width;
+            out[plane + (bit / 8) as usize] |= (field << (bit % 8)) as u8;
         }
-        let raw = pending & mask;
-        pending >>= bits;
-        count -= bits;
-        // Move the code's sign bit to bit 31 and shift back arithmetically.
-        *code = ((raw << (32 - bits)) as i32) >> (32 - bits);
+        plane += GROUP_VALUES * width as usize / 8;
+        shift += width;
     }
-    codes
+    debug_assert_eq!(plane, out.len(), "the planes of a width fill its bytes");
+}
+
+/// Reads the 32 codes back from their planes, sign-extending each.
+fn unpack_codes(bytes: &[u8], bits: u32) -> [i32; GROUP_VALUES] {
+    let mut raw = [0u32; GROUP_VALUES];
+    let (mut plane, mut shift) = (0, 0);
+    for width in plane_widths(bits).into_iter().filter(|w| *w > 0) {
+        let mask = (1u32 << width) - 1;
+        for (i, code) in raw.iter_mut().enumerate() {
+            let bit = i as u32 * width;
+            let field = (u32::from(bytes[plane + (bit / 8) as usize]) >> (bit % 8)) & mask;
+            *code |= field << shift;
+        }
+        plane += GROUP_VALUES * width as usize / 8;
+        shift += width;
+    }
+    // Move the code's sign bit to bit 31 and shift back arithmetically.
+    raw.map(|code| ((code << (32 - bits)) as i32) >> (32 - bits))
 }
 
 #[cfg(test)]

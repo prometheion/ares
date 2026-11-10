@@ -31,10 +31,9 @@ fn code_ranges_are_symmetric_and_use_the_whole_width_but_one_value() {
 #[test]
 fn every_code_survives_packing_at_every_position() {
     // Proves pack and unpack are inverse for each width, value and position,
-    // including the bit-stream boundaries where a code spans two bytes (for
-    // 5 bits: positions 1, 3, 4, 6 ...) and the unused -2^(B-1). The other 31
-    // codes are a background that would show a bleed into a neighbour: zeros,
-    // all ones in the stream, and alternating extremes.
+    // across the planes a code is split into and including the unused
+    // -2^(B-1). The other 31 codes are a background that would show a bleed
+    // into a neighbour: zeros, all ones, and alternating extremes.
     for bits in 4..=8u32 {
         let max = code_max(bits);
         let backgrounds: [Box<dyn Fn(usize) -> i32>; 3] = [
@@ -58,34 +57,59 @@ fn every_code_survives_packing_at_every_position() {
 }
 
 #[test]
-fn packing_writes_exactly_the_bytes_of_the_bit_stream() {
+fn packing_writes_exactly_the_bytes_of_the_planes() {
     // Expected bytes worked out by hand (and cross-checked with a bit-by-bit
-    // script): code i sits at stream bits [i*B, (i+1)*B), least significant bit
-    // of byte 0 first, each code in two's complement.
+    // script): the low four bits of the codes two per byte, the low nibble
+    // first, then the planes of the high bits, each code in two's complement.
     //
-    // q5, codes 1, -1, 15, -15, 7, -7, 0, 3:
-    //   byte 0 = 00001 | (111 << 5)         = 0xe1   (-1 is 11111, low 3 bits)
-    //   byte 1 = 11 | (01111 << 2) | (1<<7) = 0xbf   (15 is 01111; -15 is 10001)
-    //   ...
-    let cases: [(u32, &[i32], &[u8]); 4] = [
-        (5, &[1, -1, 15, -15, 7, -7, 0, 3], &[0xe1, 0xbf, 0x78, 0x32, 0x18]),
-        (7, &[1, -1, 63, -63, 5, -5, 0, 32], &[0x81, 0xff, 0x2f, 0x58, 0xd8, 0x03, 0x40]),
-        (6, &[1, -1, 31, -31], &[0xc1, 0xff, 0x85]),
+    // q5, codes 1, -1, 15, -15, 7, -7, 0, 3 (00001, 11111, 01111, 10001, 00111,
+    // 11001, 00000, 00011): the nibbles are 1 f f 1 7 9 0 3, and bit 4 is set
+    // for the codes 1, 3 and 5, which is 0x2a in the plane of single bits.
+    /// Bytes at an offset among the code bytes of a group.
+    type Piece = (usize, &'static [u8]);
+    let cases: [(u32, &[i32], &[Piece]); 5] = [
+        (5, &[1, -1, 15, -15, 7, -7, 0, 3], &[(0, &[0xf1, 0x1f, 0x97, 0x30]), (16, &[0x2a])]),
+        // q7: nibbles 1 f f 1 5 b 0 0; bits 4 and 5 are 0 3 3 0 and 0 3 0 2; bit
+        // 6 is set for the codes 1, 3 and 5.
+        (
+            7,
+            &[1, -1, 63, -63, 5, -5, 0, 32],
+            &[(0, &[0xf1, 0x1f, 0xb5]), (16, &[0x3c, 0x8c]), (24, &[0x2a])],
+        ),
+        // q6: nibbles 1 f f 1; bits 4 and 5 are 0 3 1 2.
+        (6, &[1, -1, 31, -31], &[(0, &[0xf1, 0x1f]), (16, &[0x9c])]),
         // q4: the low nibble of a byte is the earlier code.
-        (4, &[1, -1, 7, -7], &[0xf1, 0x97]),
+        (4, &[1, -1, 7, -7], &[(0, &[0xf1, 0x97])]),
+        // q8: one byte per code.
+        (8, &[1, -1, 127, -127, -128], &[(0, &[0x01, 0xff, 0x7f, 0x81, 0x80])]),
     ];
-    for (bits, head, expected) in cases {
+    for (bits, head, pieces) in cases {
         let mut codes = [0i32; GROUP_VALUES];
         codes[..head.len()].copy_from_slice(head);
         let mut bytes = vec![0xa5u8; 4 * bits as usize];
         pack_codes(&codes, bits, &mut bytes);
-        assert_eq!(&bytes[..expected.len()], expected, "q{bits}");
-        assert!(bytes[expected.len()..].iter().all(|&b| b == 0), "q{bits}: the rest is zero");
+        let mut expected = vec![0u8; 4 * bits as usize];
+        for (at, piece) in pieces {
+            expected[*at..*at + piece.len()].copy_from_slice(piece);
+        }
+        assert_eq!(bytes, expected, "q{bits}");
     }
 }
 
 #[test]
-fn all_minus_one_codes_fill_every_bit_of_the_stream() {
+fn the_planes_of_every_width_fill_its_bytes() {
+    for bits in 4..=8u32 {
+        let widths = plane_widths(bits);
+        assert_eq!(widths.iter().sum::<u32>(), bits, "q{bits}: the planes hold every bit");
+        assert!(widths.iter().all(|w| [0, 1, 2, 4, 8].contains(w)), "q{bits}: {widths:?}");
+        // The low four bits come first for every width below 8, so that plane
+        // is read the same way whatever the format.
+        assert_eq!(widths[0], if bits == 8 { 8 } else { 4 }, "q{bits}");
+    }
+}
+
+#[test]
+fn all_minus_one_codes_fill_every_bit_of_the_planes() {
     for bits in 4..=8u32 {
         let mut bytes = vec![0u8; 4 * bits as usize];
         pack_codes(&[-1; GROUP_VALUES], bits, &mut bytes);
