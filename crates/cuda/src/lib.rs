@@ -43,6 +43,10 @@ pub use device::{
 };
 pub use driver::{LIBRARY_ENV, driver_version};
 pub use error::{Error, Result};
+pub use experts::{
+    EXPERT_MAX_EXPERTS, EXPERT_MAX_K, ExpertKernels, ExpertShape, HostShare, RouteGroup,
+    RouteRecord,
+};
 pub use kernels::{
     ActivationForm, Kernels, LayoutKernel, LayoutRows, LayoutTable, MAX_BATCH, Precision,
     PrefillPath, PrefillShape, WeightLayout,
@@ -55,20 +59,13 @@ pub use layers::{MERGE_MAX_WIDTH, MergeNorm, Wire, partial_wire_bytes};
 pub use memory::{DeviceBuffer, DevicePtr, HostRegistration, PinnedBuffer};
 pub use mesh::{Lane, Mesh, PUSH_MAX_ROWS, PUSH_MAX_VALUES, Parcel, PushSlot, Route};
 pub use module::{Args, Function, MAX_ARGS, Module};
-pub use stream::{Event, Stream};
-
-pub use experts::{
-    EXPERT_MAX_EXPERTS, EXPERT_MAX_K, ExpertKernels, ExpertShape, HostShare, RouteGroup,
-    RouteRecord,
-};
-
 pub use q4::{
     HAND_OVER_MAX_PIECES, IndexerShape, KeyFormat, ListHandOver, NgramShape, Q4Kernels,
     SELECT_MAX_BLOCKS, SelectionRule,
 };
-
 pub use sampler::{
     SAMPLE_CANDIDATES, SAMPLE_MAX_VOCAB, SAMPLE_STATUS_EMPTY, SAMPLE_STATUS_NONFINITE, SampleBatch,
     SampleCut, SampleParams, SamplePick, SamplePlan, SampleRow, SampleStep, SamplerKernels, gumbel,
     philox4x32, sample_reference, weight_fixed,
 };
+pub use stream::{Event, Stream};
