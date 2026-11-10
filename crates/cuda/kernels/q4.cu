@@ -13,3 +13,4 @@
 #include "q4_indexer.cuh"
 #include "q4_select.cuh"
 #include "q4_ngram.cuh"
+#include "q4_fused.cuh"

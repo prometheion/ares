@@ -4,13 +4,26 @@
 //! ```text
 //! qwen4exp_run --model FIRST_PART.gguf [--devices 0,1] [--cells 4096]
 //!     [--ram-gib 8] [--headroom-mib 256] [--bounds 0,24,48] [--keys f32|f16]
-//!     [--placement] [--profile A.q4route,B.q4route]
+//!     [--spread auto|layers|tensor] [--mixer 0] [--core-share 0.6] [--shared mixer|worker]
+//!     [--owners rule|routing] [--worker-picks 0.35]
+//!     [--placement] [--read-time] [--profile A.q4route,B.q4route]
 //!     [--check DIR/NAME,...] [--chat] [--generate 64]
 //!     [--text TOKENS.txt] [--text-file A.md,B.md] [--decode-at 1000,8000]
 //!     [--decode-steps 64]
 //!     [--prefill 2048] [--breakdown] [--serve model|stream|cpu]
 //! ```
 //!
+//! - `--spread`: how two devices share the model: a range of layers each
+//!   (`layers`), or both on every layer (`tensor`; `--mixer` is the index of
+//!   the device that holds the streams, `--core-share` its share of the
+//!   recurrent heads, `--shared` who computes the shared expert; what is not
+//!   given is measured at load). `auto`, the default, takes `tensor` when
+//!   the devices can write each other's memory. `--owners routing` divides
+//!   the experts between the two by the routing `--profile` gives instead of
+//!   the fixed rule; `--worker-picks` is the share of the picks the worker's
+//!   experts are to get then.
+//! - `--read-time`: times a read of a stream mixer on every device, as the
+//!   session does at load, and ends.
 //! - `--placement`: prints where the layers would go and what every device
 //!   would hold, and ends without loading.
 //! - `--profile`: recorded routing (`q4trace` files); the tiers are filled
@@ -39,7 +52,8 @@ use std::time::{Duration, Instant};
 use ares_cuda::{Device, KeyFormat, Wait};
 use ares_gguf::Gguf;
 use ares_model::qwen4exp::device::{
-    DeviceMemory, Options, PHASES, Placement, Profile, Rows, Session, SessionOptions, Wanted,
+    DeviceMemory, Options, PHASES, Placement, Profile, Rows, Session, SessionOptions, Spread,
+    TensorChoice, Wanted, read_time,
 };
 use ares_model::qwen4exp::{Config, Weights};
 use ares_runtime::expert_store::{Serve, StoreStats};
@@ -55,8 +69,15 @@ struct Args {
     ram_gib: Option<f64>,
     headroom_mib: u64,
     bounds: Option<Vec<usize>>,
+    spread: String,
+    mixer: Option<usize>,
+    core_share: Option<f64>,
+    shared: Option<String>,
+    owners: String,
+    worker_picks: Option<f64>,
     keys: KeyFormat,
     placement: bool,
+    read_time: bool,
     profile: Vec<String>,
     check: Vec<String>,
     chat: bool,
@@ -79,8 +100,15 @@ fn parse() -> Result<Args, AnyError> {
         ram_gib: None,
         headroom_mib: 256,
         bounds: None,
+        spread: "auto".into(),
+        mixer: None,
+        core_share: None,
+        shared: None,
+        owners: "rule".into(),
+        worker_picks: None,
         keys: KeyFormat::F32,
         placement: false,
+        read_time: false,
         profile: Vec::new(),
         check: Vec::new(),
         chat: false,
@@ -117,7 +145,14 @@ fn parse() -> Result<Args, AnyError> {
                     other => return Err(format!("--keys {other}: f32 or f16").into()),
                 }
             }
+            "--spread" => args.spread = value()?,
+            "--mixer" => args.mixer = Some(value()?.parse()?),
+            "--core-share" => args.core_share = Some(value()?.parse()?),
+            "--shared" => args.shared = Some(value()?),
+            "--owners" => args.owners = value()?,
+            "--worker-picks" => args.worker_picks = Some(value()?.parse()?),
             "--placement" => args.placement = true,
+            "--read-time" => args.read_time = true,
             "--profile" => args.profile = list(value()?),
             "--check" => args.check = list(value()?),
             "--chat" => args.chat = true,
@@ -297,7 +332,15 @@ fn run() -> Result<(), AnyError> {
         // Only the decode steps that are measured for it are timed.
         profile.pause(true);
     }
+    // The recorded routing: the tiers are filled from it, and two devices
+    // that share the layers divide the experts by it.
+    let mut counts = vec![vec![0u32; c.experts.count]; c.n_layer];
+    for path in &args.profile {
+        routing(path, &mut counts)?;
+    }
     let opts = SessionOptions {
+        routing: (!args.profile.is_empty() && args.owners == "routing").then(|| counts.clone()),
+        worker_picks: args.worker_picks,
         part: Options {
             cells: args.cells,
             keys: args.keys,
@@ -306,6 +349,16 @@ fn run() -> Result<(), AnyError> {
         },
         headroom: args.headroom_mib << 20,
         ram_tier: args.ram_gib.map(|g| (g * (1u64 << 30) as f64) as u64),
+        spread: match args.spread.as_str() {
+            "auto" => Spread::Auto,
+            "layers" => Spread::Layers,
+            "tensor" => Spread::Tensor {
+                mixer: args.mixer,
+                core_share: args.core_share,
+                shared_on_mixer: args.shared.as_deref().map(|s| s == "mixer"),
+            },
+            other => return Err(format!("--spread {other}: auto, layers or tensor").into()),
+        },
         bounds: args.bounds.clone(),
         serve: args.serve,
         stall: Duration::from_secs(args.stall_s),
@@ -314,6 +367,22 @@ fn run() -> Result<(), AnyError> {
     let devices: Vec<Device> =
         args.devices.iter().map(|d| Device::open(*d, Wait::Spin)).collect::<Result<_, _>>()?;
 
+    if args.read_time {
+        // What the session measures at load to choose the mixer.
+        for device in &devices {
+            let mut us: Vec<f64> = (0..5)
+                .map(|_| read_time(device, &c, &w).map(|t| t.as_secs_f64() * 1e6))
+                .collect::<Result<_, _>>()?;
+            us.sort_by(f64::total_cmp);
+            println!(
+                "a read of a stream mixer on {}: {:.1} us (fastest of 5 times 64, slowest {:.1})",
+                device.info().name,
+                us[0],
+                us[4]
+            );
+        }
+        return Ok(());
+    }
     if args.placement {
         let memory: Vec<DeviceMemory> = devices
             .iter()
@@ -324,9 +393,22 @@ fn run() -> Result<(), AnyError> {
                 })
             })
             .collect::<Result<_, ares_cuda::Error>>()?;
-        let placement = match &opts.bounds {
-            Some(bounds) => Placement::at(&c, &w, &opts.part, &memory, bounds)?,
-            None => Placement::plan(&c, &w, &opts.part, &memory)?,
+        let placement = match (&opts.spread, &opts.bounds) {
+            // Without a session nothing is measured: what is not given is
+            // the first device and an even share.
+            (Spread::Tensor { mixer, core_share, shared_on_mixer }, _) => Placement::tensor(
+                &c,
+                &w,
+                &opts.part,
+                &memory,
+                &TensorChoice {
+                    mixer: mixer.unwrap_or(0),
+                    core_share: core_share.unwrap_or(0.5),
+                    shared_on_mixer: shared_on_mixer.unwrap_or(false),
+                },
+            )?,
+            (_, Some(bounds)) => Placement::at(&c, &w, &opts.part, &memory, bounds)?,
+            _ => Placement::plan(&c, &w, &opts.part, &memory)?,
         };
         println!("placement for {} cells:", args.cells);
         for (device, plan) in devices.iter().zip(&placement.devices) {
@@ -355,16 +437,32 @@ fn run() -> Result<(), AnyError> {
         opening.elapsed().as_secs_f64(),
         load_average(),
     );
-    let mut ram_slots = 0;
-    for layer in 0..c.n_layer {
-        ram_slots += session.store().slots(layer).1;
+    let ram_slots = session.ram_slots();
+    if let Some(tensor) = &session.placement().tensor {
+        let heads = |device: usize| -> u32 {
+            tensor.shares[device].iter().map(|share| share.heads.len() as u32).sum()
+        };
+        let shared = tensor.shares[tensor.mixer].first().is_some_and(|share| share.shared);
+        println!(
+            "  both devices on every layer: device {} holds the streams and the mixers; heads \
+             over all layers {} | {}, shares of the slots {:.3} | {:.3}, the shared expert on \
+             the {}, experts divided by {}",
+            tensor.mixer,
+            heads(0),
+            heads(1),
+            tensor.expert_share[0],
+            tensor.expert_share[1],
+            if shared { "mixer" } else { "worker" },
+            if tensor.owners.is_some() { "the recorded routing" } else { "the rule" },
+        );
     }
     for part in session.report() {
         println!(
-            "  {}: layers {:?}; dense weights {:.0} MiB (uploaded in {:.1} s), {} expert slots in \
+            "  {} ({:?}): layers {:?}; dense weights {:.0} MiB (uploaded in {:.1} s), {} expert slots in \
              {:.0} MiB, recurrent state {:.1} MiB per sequence, K/V and keys {:.2} MiB per 1000 \
              cells (keys {:.2}), scratch {:.1} MiB; reserved {:.0} MiB",
             part.device,
+            part.role,
             part.layers,
             mib(part.weights),
             part.upload.as_secs_f64(),

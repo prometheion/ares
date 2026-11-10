@@ -20,6 +20,21 @@
 //! next layer's read ([`Part::flush`] does it alone where a caller needs the
 //! residual between layers).
 //!
+//! A read of a stream mixer is two launches (`Q4Kernels::read_down`,
+//! `read_up`) when the mixer's matrices are float types, which they are in
+//! every file seen so far; the first of them also writes the output of the
+//! half block before it, so the residual alternates between two buffers.
+//!
+//! **Two devices on every layer.** A part is then a *mixer* or a *worker*
+//! ([`Role`]). The mixer holds the streams and runs every read; its read
+//! writes the mixed input of the half block into the worker's memory. The
+//! worker computes its share of the half (key heads of a recurrent layer, the
+//! shared expert, the routed experts it owns) and writes its partial output
+//! into the mixer's memory, where the next read waits for it and adds it to
+//! the mixer's own partial. The router runs on the mixer, whose split kernel
+//! gives each device the record of the experts it owns. Nothing of this
+//! passes through the host.
+//!
 //! Windows and commits: rows of a segment that is *direct* (a slice of a
 //! prompt, a generated token without drafts) advance the recurrent state in
 //! their own launches. Rows of any other segment are a window that leaves
@@ -33,17 +48,18 @@ use std::sync::{Arc, Mutex};
 
 use ares_core::{GgmlType, Ledger};
 use ares_cuda::{
-    AttendBuffers, AttentionKernels, AttentionShape, AttnItem, AttnRow, AttnShape, CacheFormat,
-    CacheGeometry, CommitSet, Device, DeviceBuffer, DevicePtr, ENTRY_CELLS, Event, ExpertKernels,
-    IndexerShape, Kernels, KeyFormat, LayerKernels, ListHandOver, MAX_BATCH, NgramShape,
-    OutputGate, PinnedBuffer, Plan, PlanConfig, Planner, Q4Kernels, RopeParams, Segment,
-    SelectionRule, StateFormat, StepRecord, Stream,
+    Arrival, AttendBuffers, AttentionKernels, AttentionShape, AttnItem, AttnRow, AttnShape,
+    CacheFormat, CacheGeometry, CommitSet, Departure, Device, DeviceBuffer, DevicePtr, ENTRY_CELLS,
+    Event, ExpertKernels, IndexerShape, Kernels, KeyFormat, LayerKernels, ListHandOver, MAX_BATCH,
+    MixerMatrix, NgramShape, OutputGate, PinnedBuffer, Plan, PlanConfig, Planner, Q4Kernels,
+    ReadWrite, RopeParams, Segment, SelectionRule, StateFormat, StepRecord, Stream,
 };
 use ares_runtime::ModelError;
 use ares_runtime::expert_store::cpu::act_bytes as cpu_act_bytes;
 
 use super::load::{
-    AttentionW, CoreW, DeviceWeights, LayerW, Mat, MixerW, MoeW, NgramW, RecurrentW,
+    AttentionW, CoreW, DeviceWeights, LayerShare, LayerW, Mat, MixerW, MoeW, NgramW, RecurrentW,
+    Role, SharedW,
 };
 use crate::qwen4exp::Config;
 use crate::qwen4exp::weights::Weights;
@@ -226,6 +242,9 @@ pub struct StepEnv<'a> {
     /// stream waits for it already), for a part that does not hold the first
     /// layer.
     pub inbound: Option<DevicePtr>,
+    /// The number of the step's first exchange between a mixer and its
+    /// worker; the exchanges of a step are numbered from it, alike on both.
+    pub xbase: u32,
 }
 
 impl std::fmt::Debug for StepEnv<'_> {
@@ -270,10 +289,82 @@ struct AttentionAt {
     kept_raw: u64,
 }
 
+/// What the peer of a part needs to know of it: where the kernels of the peer
+/// write what they send, in this part's memory.
+#[derive(Clone, Copy, Debug)]
+pub struct Ports {
+    /// The flags that announce arrivals (`u32`): one per row for a partial
+    /// output, one per block of the read for a mixed input.
+    pub flags: DevicePtr,
+    /// The flag of a route record.
+    pub record_flag: DevicePtr,
+    /// Where a partial output arrives: rows of `n_embd` f32.
+    pub partial: DevicePtr,
+    /// Where the mixed input of a recurrent half arrives, as activations.
+    pub m: DevicePtr,
+    /// Where the mixed input of each layer's mixture of experts arrives, and
+    /// the bytes from one layer to the next.
+    pub acts: DevicePtr,
+    pub act_stride: u64,
+    /// Where each layer's route record arrives, and the bytes between them.
+    pub records: DevicePtr,
+    pub record_stride: u64,
+}
+
+/// The exchanges of a layer between a mixer and its worker, in the order
+/// they happen: the number of an exchange is the step's base plus eight
+/// times the layer plus one of these.
+const X_CORE_INPUT: u32 = 0;
+const X_CORE_PARTIAL: u32 = 1;
+const X_MOE_INPUT: u32 = 2;
+const X_RECORD: u32 = 3;
+const X_MOE_PARTIAL: u32 = 4;
+
+/// The output of a half block that is not yet in the residual (mixer, whole
+/// part) or not yet sent (worker).
+#[derive(Clone, Copy, Debug)]
+enum Pending {
+    /// The recurrent or attention half: whether this part computed a share
+    /// of it, and the exchange in which the peer's share crosses.
+    Core { own: bool, exchange: Option<u32> },
+    /// The mixture of experts: the exchange in which the peer's share
+    /// crosses, and whether this part computed the shared expert.
+    Moe { exchange: Option<u32>, shared: bool },
+}
+
+/// What a part is and holds: its role and, per layer from `first` on, its
+/// share.
+#[derive(Clone, Debug)]
+pub(crate) struct PartShape {
+    pub role: Role,
+    pub first: usize,
+    pub shares: Vec<LayerShare>,
+    pub head: bool,
+}
+
+impl PartShape {
+    /// Whole layers `layers`, as a split by layers gives them to a device.
+    pub(crate) fn whole(c: &Config, layers: Range<usize>, head: bool) -> Self {
+        Self {
+            role: Role::Whole,
+            first: layers.start,
+            shares: layers.map(|l| LayerShare::whole(c, l)).collect(),
+            head,
+        }
+    }
+}
+
 /// Offsets of the step scratch.
 #[derive(Clone, Copy, Debug, Default)]
 struct Scratch {
     r: u64,
+    /// The second buffer of the residual: a read that writes goes from one
+    /// to the other.
+    r2: u64,
+    /// The partial sums between the two launches of a read.
+    partials: u64,
+    /// The router's record before it is cut between two devices.
+    rec_full: u64,
     zeros: u64,
     xn: u64,
     lo: u64,
@@ -360,6 +451,12 @@ pub(crate) struct Frame {
     ix: IndexerShape,
     ng: Option<NgramShape>,
     plan_config: PlanConfig,
+    /// The flags of the exchange with a peer and the bytes of the exchange
+    /// buffer (flags, then a partial output); 0 for a whole part.
+    x_flags: u32,
+    x_bytes: u64,
+    /// Bytes of the table that says which experts the peer owns.
+    owner_bytes: u64,
 }
 
 fn invalid(message: impl Into<String>) -> ModelError {
@@ -407,16 +504,16 @@ fn ngram_shape(c: &Config) -> Option<NgramShape> {
 }
 
 impl Frame {
-    /// The sizes of a part that holds `layers`, the output head when `head`,
-    /// on a device with `multiprocessors` multiprocessors (the attention
-    /// plans are cut by it).
+    /// The sizes of a part of `shape` on a device with `multiprocessors`
+    /// multiprocessors (the attention plans are cut by it).
     pub(crate) fn new(
         c: &Config,
         opts: &Options,
-        layers: Range<usize>,
-        head: bool,
+        shape: &PartShape,
         multiprocessors: u32,
     ) -> Result<Self, ModelError> {
+        let head = shape.head;
+        let streams = shape.role != Role::Worker;
         if opts.kv.0.has_mean() || opts.kv.1.has_mean() {
             return Err(invalid(
                 "K/V formats with a tile mean (q7 to q4) need the exact pool and its conversion, \
@@ -464,9 +561,13 @@ impl Frame {
             kept_bytes = (kept_bytes + window * bytes).next_multiple_of(64);
             at
         };
-        for layer in layers.clone() {
+        for (i, share) in shape.shares.iter().enumerate() {
+            let layer = shape.first + i;
+            let heads = u64::from(share.heads.end.saturating_sub(share.heads.start));
             let (mut r_at, mut a_at) = (None, None);
-            if c.is_attention(layer) {
+            if heads == 0 {
+                // The layer's heads are all on the peer.
+            } else if c.is_attention(layer) {
                 any_attention = true;
                 let kv_pool = pool_bytes;
                 let key_pool = (kv_pool + pages * geo.converted_entry_bytes()).next_multiple_of(64);
@@ -476,14 +577,23 @@ impl Frame {
                 a_at = Some(AttentionAt { kv_pool, key_pool, carry, kept_raw: keep(id * 4) });
             } else {
                 any_recurrent = true;
+                // The part's key heads with their value heads: a narrower
+                // layer.
+                let s = r.head_dim as u64;
+                let values = heads * (r.n_v_heads / r.n_k_heads) as u64;
+                let channels = (2 * heads + values) * s;
                 let conv = slot_bytes;
-                let delta = (conv + cd * (r.conv_kernel as u64 - 1) * 4).next_multiple_of(64);
-                slot_bytes = (delta + nv * (r.head_dim as u64).pow(2) * opts.state.bytes())
-                    .next_multiple_of(64);
-                let kept = [keep(cd * 4), keep((kd + vd) * 4), keep(nv * 4), keep(nv * 4)];
+                let delta = (conv + channels * (r.conv_kernel as u64 - 1) * 4).next_multiple_of(64);
+                slot_bytes = (delta + values * s.pow(2) * opts.state.bytes()).next_multiple_of(64);
+                let kept = [
+                    keep(channels * 4),
+                    keep((heads + values) * s * 4),
+                    keep(values * 4),
+                    keep(values * 4),
+                ];
                 r_at = Some(RecurrentAt { conv, delta, kept });
             }
-            if c.ngram.as_ref().is_some_and(|g| g.layer == layer) {
+            if streams && c.ngram.as_ref().is_some_and(|g| g.layer == layer) {
                 any_ngram = true;
                 let at = slot_bytes;
                 let history = ng.as_ref().map_or(0, NgramShape::history_len);
@@ -503,6 +613,10 @@ impl Frame {
             at
         };
         s.r = take(rows * wide * 4);
+        s.r2 = take(u64::from(streams) * rows * wide * 4);
+        s.partials = take(
+            Q4Kernels::read_partials(opts.max_rows, c.n_stream as u32, c.mixer_rank as u32) * 4,
+        );
         s.zeros = take(rows * hc * 4);
         s.xn = take(act_bytes(wide, rows));
         s.lo = take(act_bytes(rank, rows));
@@ -541,7 +655,7 @@ impl Frame {
         let state = c.attention.n_head as u64 * (u64::from(geo.head_dim) + 1) * 4;
         s.attn_state = take(att * state_slots * state);
         s.status = take(16);
-        let shape = ares_cuda::ExpertShape {
+        let expert_shape = ares_cuda::ExpertShape {
             n_embd: n as u32,
             n_ff: c.experts.ff as u32,
             n_experts: c.experts.count as u32,
@@ -549,8 +663,9 @@ impl Frame {
             gate_ty: GgmlType::IQ2_S,
             down_ty: GgmlType::Q2_0,
         };
-        s.logits = take(shape.logits_bytes(opts.max_rows));
-        s.hidden = take(shape.hidden_bytes(opts.max_rows));
+        s.rec_full = take(expert_shape.record_bytes(opts.max_rows));
+        s.logits = take(expert_shape.logits_bytes(opts.max_rows));
+        s.hidden = take(expert_shape.hidden_bytes(opts.max_rows));
         s.sg = take(rows * shared_ff * 4);
         s.su = take(rows * shared_ff * 4);
         s.ysh = take(rows * n * 4);
@@ -567,6 +682,9 @@ impl Frame {
         s.act_p = take(heads * act_bytes(n, logit_rows));
         s.head = take(heads * logit_rows * c.n_vocab as u64 * 4);
         s.len = len;
+
+        // A flag per block of a read, and one for a route record.
+        let x_flags = Q4Kernels::read_flags(opts.max_rows, c.n_embd as u32) + 16;
 
         // What the host sends with a step.
         let mut inbox = Inbox::default();
@@ -604,13 +722,24 @@ impl Frame {
             kept_bytes,
             s,
             inbox,
-            record_stride: shape.record_bytes(opts.max_rows).next_multiple_of(64),
+            record_stride: expert_shape.record_bytes(opts.max_rows).next_multiple_of(64),
             act_stride: act_bytes(n, rows).next_multiple_of(64),
             act_host_stride: (cpu_act_bytes(n as usize, rows as usize) as u64).next_multiple_of(64),
             geo,
             ix,
             ng,
             plan_config,
+            x_flags,
+            x_bytes: if shape.role == Role::Whole {
+                0
+            } else {
+                (u64::from(x_flags) * 4).next_multiple_of(64) + rows * n * 4
+            },
+            owner_bytes: if shape.role == Role::Mixer {
+                (shape.shares.len() as u64 * c.experts.count as u64).next_multiple_of(64)
+            } else {
+                0
+            },
         })
     }
 
@@ -632,6 +761,8 @@ impl Frame {
             + (self.record_stride + self.act_stride) * self.recurrent.len() as u64
             + self.inbox.len
             + self.tables_bytes(opts)
+            + self.x_bytes
+            + self.owner_bytes
     }
 
     fn tables_bytes(&self, opts: &Options) -> u64 {
@@ -652,7 +783,13 @@ struct StepPlan {
 /// One device's part of the model.
 pub struct Part {
     index: usize,
+    role: Role,
+    /// Whether the part starts the residual from the embeddings.
     first: bool,
+    /// Whether the reads run as two fused launches.
+    fused: bool,
+    /// Which of the two residual buffers holds the residual.
+    flipped: bool,
     opts: Options,
     device: Device,
     kernels: Kernels,
@@ -693,9 +830,16 @@ pub struct Part {
     expert_at: Vec<ExpertAt>,
     /// The plan of the step being enqueued.
     plan: Option<StepPlan>,
-    /// The output of the last mixture of experts and its inject values, not
-    /// yet written to the residual.
-    pending: bool,
+    /// The output of the last half block, not yet written to the residual
+    /// (or, on a worker, not yet sent).
+    pending: Option<Pending>,
+    /// The flags and the partial output a peer writes here.
+    exchange: Option<DeviceBuffer>,
+    /// Per layer and expert, whether the peer owns the expert (a mixer's).
+    owner: Option<DeviceBuffer>,
+    /// The peer's ports, and per layer whether the peer computes a share of
+    /// the recurrent or attention half.
+    peer: Option<(Ports, Vec<bool>)>,
     /// The record of a step whose deferred segments wait for their commit,
     /// and which of its segments were direct.
     deferred: Option<(StepRecord, Vec<bool>)>,
@@ -719,9 +863,13 @@ impl std::fmt::Debug for Part {
 pub struct PartSetup<'a> {
     /// Which part of the placement this is.
     pub index: usize,
-    /// The layers the part holds.
-    pub layers: Range<usize>,
-    /// Whether the part holds the output head (the last part does).
+    /// What the part is to the residual streams.
+    pub role: Role,
+    /// The first layer the part holds or shares.
+    pub first: usize,
+    /// What it holds of each layer from `first` on.
+    pub shares: Vec<LayerShare>,
+    /// Whether the part holds the final mixer and the output head.
     pub head: bool,
     pub device: &'a Device,
     /// The device's memory accounts.
@@ -737,12 +885,34 @@ impl Part {
         opts: &Options,
         setup: PartSetup<'_>,
     ) -> Result<Self, ModelError> {
-        let PartSetup { index, layers, head, device, ledger } = setup;
-        if layers.is_empty() || layers.end > c.n_layer {
-            return Err(invalid(format!("part {index} holds the layers {layers:?}")));
+        let PartSetup { index, role, first, shares, head, device, ledger } = setup;
+        if shares.is_empty() || first + shares.len() > c.n_layer {
+            return Err(invalid(format!(
+                "part {index} holds {} layers from layer {first} on",
+                shares.len()
+            )));
         }
-        let f = Frame::new(c, opts, layers.clone(), head, device.info().multiprocessors)?;
-        let w = DeviceWeights::load(device, ledger, c, weights, layers.clone(), head)?;
+        let shape = PartShape { role, first, shares, head };
+        let f = Frame::new(c, opts, &shape, device.info().multiprocessors)?;
+        let w = DeviceWeights::load(device, ledger, c, weights, role, first, &shape.shares, head)?;
+        let mut mixer_types = Vec::new();
+        let mixers = w.layers.iter().filter_map(|l| l.mixers).flat_map(|(a, b)| [a, b]);
+        for mixer in mixers.chain(w.head.map(|h| h.mixer)) {
+            mixer_types.extend([mixer.down.ty, mixer.up.ty]);
+            mixer_types.extend(mixer.inject.map(|m| m.ty));
+        }
+        let fused = Q4Kernels::reads_fused(
+            c.n_stream as u32,
+            c.n_embd as u32,
+            c.mixer_rank as u32,
+            &mixer_types,
+        );
+        if role != Role::Whole && !fused {
+            return Err(invalid(
+                "two devices share layers only when the mixers run as fused reads (float \
+                 matrices, a rank that is a multiple of 4 and at most 1024)",
+            ));
+        }
         let state_bytes = f.slot_bytes * u64::from(opts.max_slots);
         ledger.reserve("qwen4exp recurrent state", state_bytes)?;
         ledger.reserve("qwen4exp K/V and key pools", f.pool_bytes)?;
@@ -754,6 +924,22 @@ impl Part {
         ledger.reserve("qwen4exp step inputs", f.inbox.len)?;
         let tables_bytes = f.tables_bytes(opts);
         ledger.reserve("qwen4exp page tables", tables_bytes)?;
+        let exchange = if f.x_bytes > 0 {
+            ledger.reserve("qwen4exp exchange", f.x_bytes)?;
+            let buffer = DeviceBuffer::new(device, f.x_bytes)?;
+            buffer.write(0, &vec![0u8; f.x_bytes as usize])?;
+            Some(buffer)
+        } else {
+            None
+        };
+        let owner = if f.owner_bytes > 0 {
+            ledger.reserve("qwen4exp expert owners", f.owner_bytes)?;
+            let buffer = DeviceBuffer::new(device, f.owner_bytes)?;
+            buffer.write(0, &vec![0u8; f.owner_bytes as usize])?;
+            Some(buffer)
+        } else {
+            None
+        };
         if f.kept_bytes > 0 {
             ledger.reserve("qwen4exp draft window inputs", f.kept_bytes)?;
         }
@@ -791,7 +977,10 @@ impl Part {
         let a = &c.attention;
         Ok(Self {
             index,
-            first: layers.start == 0,
+            role,
+            first: first == 0 && role != Role::Worker,
+            fused,
+            flipped: false,
             opts: opts.clone(),
             device: device.clone(),
             kernels: Kernels::load(device)?,
@@ -840,7 +1029,10 @@ impl Part {
             )?,
             expert_at: Vec::new(),
             plan: None,
-            pending: false,
+            pending: None,
+            exchange,
+            owner,
+            peer: None,
             deferred: None,
             status_host: PinnedBuffer::new(device, 16)?,
             status_pending: false,
@@ -924,8 +1116,77 @@ impl Part {
         Ok(())
     }
 
+    /// What the part is to the residual streams.
+    pub fn role(&self) -> Role {
+        self.role
+    }
+
+    /// Where a peer's kernels write what they send to this part; `None` for
+    /// a part that holds whole layers.
+    pub fn ports(&self) -> Option<Ports> {
+        let exchange = self.exchange.as_ref()?;
+        let flags = u64::from(self.f.x_flags) * 4;
+        Some(Ports {
+            flags: exchange.ptr(),
+            record_flag: exchange.ptr().offset(flags - 4),
+            partial: exchange.ptr().offset(flags.next_multiple_of(64)),
+            m: self.at(self.f.s.m),
+            acts: self.acts.ptr(),
+            act_stride: self.f.act_stride,
+            records: self.records.ptr(),
+            record_stride: self.f.record_stride,
+        })
+    }
+
+    /// Tells a mixer or a worker about its peer: the peer's ports (memory of
+    /// a device this one has peer access to), and per layer whether the peer
+    /// computes a share of the recurrent or attention half.
+    pub fn set_peer(&mut self, ports: Ports, peer_core: Vec<bool>) -> Result<(), ModelError> {
+        if self.role == Role::Whole || peer_core.len() != self.w.layers.len() {
+            return Err(invalid("a peer for a part that shares no layers, or of other layers"));
+        }
+        self.peer = Some((ports, peer_core));
+        Ok(())
+    }
+
+    /// Tells a mixer which experts its worker owns: a byte per layer and
+    /// expert, not 0 for the worker's. Waits for the device.
+    pub fn set_owner(&mut self, owner: &[u8]) -> Result<(), ModelError> {
+        match &self.owner {
+            Some(buffer) if owner.len() as u64 <= buffer.len() => Ok(buffer.write(0, owner)?),
+            _ => Err(invalid("an owner table for a part that is no mixer, or of another size")),
+        }
+    }
+
+    /// Whether the part computes a share of the recurrent or attention half
+    /// of its layer `i`.
+    pub fn has_core(&self, i: usize) -> bool {
+        self.w.layers.get(i).is_some_and(|l| !matches!(l.core, CoreW::None))
+    }
+
     fn at(&self, offset: u64) -> DevicePtr {
         self.scratch.ptr().offset(offset)
+    }
+
+    /// The residual buffer that holds the residual, and the other one.
+    fn r(&self) -> DevicePtr {
+        self.at(if self.flipped { self.f.s.r2 } else { self.f.s.r })
+    }
+
+    fn r_other(&self) -> DevicePtr {
+        self.at(if self.flipped { self.f.s.r } else { self.f.s.r2 })
+    }
+
+    /// The number of exchange `kind` of the part's layer `i` in the step.
+    fn exchange_no(&self, env: &StepEnv<'_>, i: usize, kind: u32) -> u32 {
+        let layer = self.w.layers.get(i).map_or(i, |l| l.layer) as u32;
+        env.xbase.wrapping_add(layer * 8 + kind)
+    }
+
+    /// Where the peer's partial output of exchange `no` arrives here.
+    fn arrival(&self, no: u32) -> Option<Arrival> {
+        let ports = self.ports()?;
+        Some(Arrival { data: ports.partial, flags: ports.flags, token: no })
     }
 
     /// The f32 values of the activations of `rows` rows of `n_in` values at
@@ -939,21 +1200,24 @@ impl Part {
         self.inbox.ptr().offset(offset)
     }
 
-    /// The residual of the step's rows on the device, `rows * D` values.
+    /// The residual of the step's rows on the device, `rows * D` values:
+    /// where it is once everything enqueued so far has run.
     pub fn residual(&self) -> DevicePtr {
-        self.at(self.f.s.r)
+        self.r()
     }
 
     /// Reads the residual of `rows` rows back. Waits for the device: for
     /// tests and measurements, after [`Part::flush`].
     pub fn read_residual(&self, rows: usize) -> Result<Vec<f32>, ModelError> {
-        self.read_scratch(self.f.s.r, rows * self.wide as usize)
+        let at = if self.flipped { self.f.s.r2 } else { self.f.s.r };
+        self.read_scratch(at, rows * self.wide as usize)
     }
 
     /// Overwrites the residual of the step's rows. Waits for the device.
     pub fn write_residual(&self, r: &[f32]) -> Result<(), ModelError> {
         let bytes: Vec<u8> = r.iter().flat_map(|v| v.to_le_bytes()).collect();
-        Ok(self.scratch.write(self.f.s.r, &bytes)?)
+        let at = if self.flipped { self.f.s.r2 } else { self.f.s.r };
+        Ok(self.scratch.write(at, &bytes)?)
     }
 
     /// The output of the recurrent or attention part of the layer enqueued
@@ -963,9 +1227,20 @@ impl Part {
     }
 
     /// The output of the mixture of experts of the layer enqueued last
-    /// (`rows * N` values). Waits for the device.
+    /// (`rows * N` values), as far as this part computed it. Waits for the
+    /// device.
     pub fn read_ffn_out(&self, rows: usize) -> Result<Vec<f32>, ModelError> {
         self.read_scratch(self.f.s.out, rows * self.n as usize)
+    }
+
+    /// The partial output the peer sent last (`rows * N` values): after a
+    /// layer and its flush, the peer's share of the layer's mixture of
+    /// experts. Waits for the device.
+    pub fn read_peer_partial(&self, rows: usize) -> Result<Vec<f32>, ModelError> {
+        let Some(exchange) = &self.exchange else { return Ok(vec![0.0; rows * self.n as usize]) };
+        let mut bytes = vec![0u8; rows * self.n as usize * 4];
+        exchange.read((u64::from(self.f.x_flags) * 4).next_multiple_of(64), &mut bytes)?;
+        Ok(bytes.as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)).collect())
     }
 
     fn read_scratch(&self, offset: u64, n: usize) -> Result<Vec<f32>, ModelError> {
@@ -1240,8 +1515,9 @@ impl Part {
             }
         }
         self.plan = plan;
-        self.pending = false;
-        let r = self.at(self.f.s.r);
+        self.pending = None;
+        self.flipped = false;
+        let r = self.r();
         // SAFETY: the inbox and the scratch are this part's, sized for the
         // most rows; the inbound residual is the caller's guarantee.
         unsafe {
@@ -1259,7 +1535,7 @@ impl Part {
                     self.hc,
                     self.n,
                 )?;
-            } else {
+            } else if self.role == Role::Whole {
                 let from =
                     env.inbound.ok_or_else(|| invalid("no residual from the device before"))?;
                 stream.copy(r, from, (n * self.wide * 4) as usize)?;
@@ -1307,28 +1583,73 @@ impl Part {
         Ok(())
     }
 
-    /// The read of a stream mixer, after the write that is pending when
-    /// there is one: leaves the mixed input as activations at `m` and the
-    /// inject values in `inj`.
+    /// The read of a stream mixer, after the write `write` of the half block
+    /// before it: leaves the mixed input as activations at `m` (with `push`
+    /// in the peer's memory as well) and the inject values in `inj`.
+    #[allow(clippy::too_many_arguments)]
     fn read(
         &mut self,
         stream: &Stream,
         mixer: &MixerW,
-        write: Option<(DevicePtr, DevicePtr)>,
+        write: Option<ReadWrite>,
         inj: Option<DevicePtr>,
         m: DevicePtr,
+        push: Option<Departure>,
         rows: u32,
     ) -> Result<(), ModelError> {
         let s = self.f.s;
         let (hc, n, wide, rank) = (self.hc, self.n, self.wide, self.rank);
-        let r = self.at(s.r);
         let xn = self.act_values(s.xn, wide, rows);
-        let lo = self.act_values(s.lo, rank, rows);
         let norm = self.w.at(mixer.norm);
+        if self.fused {
+            let matrix = |m: &Mat| MixerMatrix { ptr: self.w.mat(m), ty: m.ty };
+            let inject = mixer.inject.as_ref().filter(|_| inj.is_some()).map(matrix);
+            // A read that writes goes from one residual buffer to the other:
+            // every block of the launch reads the streams.
+            let writes = write.is_some_and(|w| w.own.is_some() || w.peer.is_some());
+            let (src, dst) = (self.r(), if writes { self.r_other() } else { self.r() });
+            // SAFETY: scratch of this part sized for the most rows; weights
+            // in the arena; a peer's memory as `set_peer` was told.
+            unsafe {
+                self.q4.read_down(
+                    stream,
+                    src,
+                    dst,
+                    write,
+                    Some((norm, xn, matrix(&mixer.down), inject)),
+                    self.at(s.partials),
+                    rows,
+                    hc,
+                    n,
+                    rank,
+                    self.eps,
+                )?;
+                self.q4.read_up(
+                    stream,
+                    xn,
+                    self.at(s.partials),
+                    matrix(&mixer.up),
+                    m,
+                    inj.filter(|_| inject.is_some()),
+                    push,
+                    rows,
+                    hc,
+                    n,
+                    rank,
+                )?;
+            }
+            self.flipped ^= writes;
+            return self.mark(stream, Phase::Mixers);
+        }
+        if push.is_some() || write.is_some_and(|w| w.peer.is_some() || w.own.is_none()) {
+            return Err(invalid("an exchange with a peer needs the fused read"));
+        }
+        let r = self.r();
+        let lo = self.act_values(s.lo, rank, rows);
         // SAFETY: scratch of this part sized for the most rows; weights in
         // the arena.
         unsafe {
-            match write {
+            match write.and_then(|w| w.own.map(|out| (out, w.inj))) {
                 Some((out, inj)) => {
                     self.q4.stream_write_norm(stream, r, out, inj, norm, xn, rows, hc, n, self.eps)
                 }
@@ -1345,26 +1666,91 @@ impl Part {
         self.mark(stream, Phase::Mixers)
     }
 
-    /// Writes the pending output of the last mixture of experts to the
-    /// residual: for a caller that needs the residual between layers.
-    pub fn flush(&mut self, env: &StepEnv<'_>) -> Result<(), ModelError> {
-        if !std::mem::take(&mut self.pending) {
-            return Ok(());
-        }
+    /// The pending output as the write in front of a read takes it.
+    fn take_write(&mut self) -> Option<ReadWrite> {
+        let s = self.f.s;
+        Some(match self.pending.take()? {
+            Pending::Core { own, exchange } => ReadWrite {
+                own: own.then(|| self.at(s.p)),
+                inj: self.at(s.inj_a),
+                peer: exchange.and_then(|no| self.arrival(no)),
+            },
+            Pending::Moe { exchange, .. } => ReadWrite {
+                own: Some(self.at(s.out)),
+                inj: self.at(s.inj_f),
+                peer: exchange.and_then(|no| self.arrival(no)),
+            },
+        })
+    }
+
+    /// A worker's exchange: sends the pending partial output to the mixer,
+    /// then waits for the mixed input of exchange `wait`. After the wait it
+    /// computes the scalar gate of the shared expert (`gate`: its weights,
+    /// the rows that arrived, where the gate goes) and clears `zero`.
+    fn swap(
+        &mut self,
+        env: &StepEnv<'_>,
+        wait: Option<u32>,
+        gate: Option<(DevicePtr, DevicePtr, DevicePtr)>,
+        zero: Option<DevicePtr>,
+    ) -> Result<(), ModelError> {
         let s = self.f.s;
         let rows = env.record.dims().n_rows;
-        // SAFETY: scratch of this part; `out` and `inj_f` hold the last
-        // layer's results.
+        let (Some((to, _)), Some(own)) = (self.peer.as_ref(), self.ports()) else {
+            return Err(invalid("a worker without its mixer"));
+        };
+        let depart = |no: u32| Departure { data: to.partial, flags: to.flags, token: no };
+        let push = match self.pending.take() {
+            Some(Pending::Core { exchange: Some(no), .. }) => {
+                Some((Some(self.at(s.p)), None, None, depart(no)))
+            }
+            Some(Pending::Moe { exchange: Some(no), shared }) => Some((
+                Some(self.at(s.out)),
+                shared.then(|| self.at(s.ysh)),
+                shared.then(|| self.at(s.s)),
+                depart(no),
+            )),
+            _ => None,
+        };
+        let wait = wait.map(|no| (own.flags, Q4Kernels::read_flags(rows, self.n), no));
+        // SAFETY: scratch of this part; the peer's ports are memory of a
+        // device this one has peer access to (`set_peer`).
+        unsafe { self.q4.swap(env.stream, push, wait, gate, zero, rows, self.n)? };
+        self.mark(env.stream, Phase::Exchange)
+    }
+
+    /// Writes the pending output of the last half block to the residual, or
+    /// on a worker sends it to the mixer: for a caller that needs the
+    /// residual between layers, and at the end of a step.
+    pub fn flush(&mut self, env: &StepEnv<'_>) -> Result<(), ModelError> {
+        if self.role == Role::Worker {
+            return if self.pending.is_some() { self.swap(env, None, None, None) } else { Ok(()) };
+        }
+        let Some(write) = self.take_write() else { return Ok(()) };
+        let s = self.f.s;
+        let rows = env.record.dims().n_rows;
+        let r = self.r();
+        // SAFETY: scratch of this part; the write names the last half
+        // block's results, a peer's share arrives in the exchange buffer.
         unsafe {
-            self.q4.stream_write(
-                env.stream,
-                self.at(s.r),
-                self.at(s.out),
-                self.at(s.inj_f),
-                rows,
-                self.hc,
-                self.n,
-            )?;
+            if self.fused {
+                self.q4.read_down(
+                    env.stream,
+                    r,
+                    r,
+                    Some(write),
+                    None,
+                    self.at(s.partials),
+                    rows,
+                    self.hc,
+                    self.n,
+                    self.rank,
+                    self.eps,
+                )?;
+            } else {
+                let out = write.own.ok_or_else(|| invalid("nothing of this part to write"))?;
+                self.q4.stream_write(env.stream, r, out, write.inj, rows, self.hc, self.n)?;
+            }
         }
         self.mark(env.stream, Phase::Mixers)
     }
@@ -1375,9 +1761,17 @@ impl Part {
             *self.w.layers.get(i).ok_or_else(|| {
                 invalid(format!("layer {i} of a part of {}", self.w.layers.len()))
             })?;
+        if self.role == Role::Worker {
+            return self.worker_layer(env, i, &layer);
+        }
         let stream = env.stream;
         let rows = env.record.dims().n_rows;
         let s = self.f.s;
+        let (attn_mixer, ffn_mixer) =
+            layer.mixers.ok_or_else(|| invalid("a layer without its mixers"))?;
+        // The peer's ports, and whether it computes a share of this layer's
+        // first half.
+        let peer = self.peer.as_ref().map(|(ports, core)| (*ports, core[i]));
         if let Some(g) = &layer.ngram {
             // The host enqueues this layer when the rows of the table have
             // arrived; the stream may have run empty before that.
@@ -1386,19 +1780,84 @@ impl Part {
             self.flush(env)?;
             self.ngram(env, g)?;
         }
-        let pending = std::mem::take(&mut self.pending).then(|| (self.at(s.out), self.at(s.inj_f)));
-        self.read(stream, &layer.attn_mixer, pending, Some(self.at(s.inj_a)), self.at(s.m), rows)?;
-        match &layer.core {
-            CoreW::Recurrent(r) => self.recurrent(env, i, r)?,
-            CoreW::Attention(a) => self.attend(env, i, a)?,
-        }
-        let write = (self.at(s.p), self.at(s.inj_a));
-        // The input of the mixture of experts stays where the host can copy
-        // it from until the next step: a miss is computed from it.
+        // The recurrent or attention half.
+        let write = self.take_write();
+        let push = peer.filter(|(_, core)| *core).map(|(ports, _)| Departure {
+            data: ports.m,
+            flags: ports.flags,
+            token: self.exchange_no(env, i, X_CORE_INPUT),
+        });
+        self.read(stream, &attn_mixer, write, Some(self.at(s.inj_a)), self.at(s.m), push, rows)?;
+        let own = match &layer.core {
+            CoreW::Recurrent(r) => {
+                self.recurrent(env, i, r)?;
+                true
+            }
+            CoreW::Attention(a) => {
+                self.attend(env, i, a)?;
+                true
+            }
+            CoreW::None => false,
+        };
+        self.pending = Some(Pending::Core {
+            own,
+            exchange: push.map(|_| self.exchange_no(env, i, X_CORE_PARTIAL)),
+        });
+        // The mixture of experts. Its input stays where the host can copy it
+        // from until the next step: a miss is computed from it.
         let m = self.acts.ptr().offset(i as u64 * self.f.act_stride);
-        self.read(stream, &layer.ffn_mixer, Some(write), Some(self.at(s.inj_f)), m, rows)?;
+        let write = self.take_write();
+        let push = peer.map(|(ports, _)| Departure {
+            data: ports.acts.offset(i as u64 * ports.act_stride),
+            flags: ports.flags,
+            token: self.exchange_no(env, i, X_MOE_INPUT),
+        });
+        self.read(stream, &ffn_mixer, write, Some(self.at(s.inj_f)), m, push, rows)?;
         self.moe(env, i, &layer.moe)?;
-        self.pending = true;
+        self.pending = Some(Pending::Moe {
+            exchange: peer.map(|_| self.exchange_no(env, i, X_MOE_PARTIAL)),
+            shared: layer.moe.shared.is_some(),
+        });
+        Ok(())
+    }
+
+    /// A layer on a worker: its share of the two halves, each between two
+    /// exchanges with the mixer.
+    fn worker_layer(
+        &mut self,
+        env: &StepEnv<'_>,
+        i: usize,
+        layer: &LayerW,
+    ) -> Result<(), ModelError> {
+        let rows = env.record.dims().n_rows;
+        let s = self.f.s;
+        match &layer.core {
+            CoreW::Recurrent(r) => {
+                self.swap(env, Some(self.exchange_no(env, i, X_CORE_INPUT)), None, None)?;
+                self.recurrent(env, i, r)?;
+                self.pending = Some(Pending::Core {
+                    own: true,
+                    exchange: Some(self.exchange_no(env, i, X_CORE_PARTIAL)),
+                });
+            }
+            CoreW::Attention(_) => return Err(invalid("an attention layer on a worker")),
+            CoreW::None => {}
+        }
+        // The mixer writes the input of the mixture of experts straight into
+        // this layer's buffer. The shared expert's scalar gate is computed
+        // from it while the kernel that waited is still there, and the
+        // experts' output starts from zero.
+        let m = self.acts.ptr().offset(i as u64 * self.f.act_stride);
+        let values = u64::from(rows) * u64::from(self.n) * 4;
+        let m_values = m.offset(act_bytes(u64::from(self.n), u64::from(rows)) - values);
+        let gate = layer.moe.shared.map(|sh| (self.w.mat(&sh.inp), m_values, self.at(s.s)));
+        let wait = self.exchange_no(env, i, X_MOE_INPUT);
+        self.swap(env, Some(wait), gate, Some(self.at(s.out)))?;
+        self.moe(env, i, &layer.moe)?;
+        self.pending = Some(Pending::Moe {
+            exchange: Some(self.exchange_no(env, i, X_MOE_PARTIAL)),
+            shared: layer.moe.shared.is_some(),
+        });
         Ok(())
     }
 
@@ -1445,7 +1904,7 @@ impl Part {
                 self.eps,
                 self.at(s.key),
                 self.at(s.value),
-                self.at(s.r),
+                self.r(),
                 self.w.at(g.norm_key),
                 self.w.at(g.norm_query),
                 self.w.at(g.norm_conv),
@@ -1461,7 +1920,7 @@ impl Part {
                 step,
                 dims,
                 shape,
-                self.at(s.r),
+                self.r(),
                 self.at(s.gated),
                 self.at(s.nrm),
                 self.w.at(g.taps),
@@ -1739,25 +2198,58 @@ impl Part {
         let at = self.expert_at[i];
         let m = self.acts.ptr().offset(i as u64 * self.f.act_stride);
         let record = self.records.ptr().offset(i as u64 * self.f.record_stride);
-        let shared_ff = w.shared_gate.n_out;
+        let cap = w.shape.top_k * rows;
+        let peer = self.peer.as_ref().map(|(ports, _)| *ports);
         // SAFETY: scratch and weights as in `recurrent`; the slot table and
         // the pool are the expert store's, which keeps the rules of the
         // table (`kernels/expert_layout.cuh`); the record of this layer is
-        // not written again before the next step.
+        // not written again before the next step; a peer's ports are memory
+        // of a device this one has peer access to.
         unsafe {
-            // The router first: the host learns of a missing expert while
-            // the shared expert is computed.
-            self.experts.route(
-                stream,
-                &w.shape,
-                self.w.at(w.router),
-                m,
-                self.at(s.logits),
-                at.table,
-                record,
-                rows,
-                env.token,
-            )?;
+            if self.role == Role::Worker {
+                // The shared expert while the mixer routes: its output is
+                // scaled by the scalar gate when it is sent.
+                if let Some(shared) = &w.shared {
+                    self.shared(stream, shared, m, rows)?;
+                    self.mark(stream, Phase::Dense)?;
+                }
+                let flag = self.ports().ok_or_else(|| invalid("a worker without ports"))?;
+                let arrival = Arrival {
+                    data: record,
+                    flags: flag.record_flag,
+                    token: self.exchange_no(env, i, X_RECORD),
+                };
+                self.q4.route_recv(stream, arrival, at.table, cap)?;
+            } else {
+                // The router first: the host learns of a missing expert
+                // while the shared expert is computed.
+                let router = w.router.ok_or_else(|| invalid("a layer without its router"))?;
+                let full = if peer.is_some() { self.at(s.rec_full) } else { record };
+                self.experts.route(
+                    stream,
+                    &w.shape,
+                    self.w.at(router),
+                    m,
+                    self.at(s.logits),
+                    at.table,
+                    full,
+                    rows,
+                    env.token,
+                )?;
+                if let (Some(ports), Some(owner)) = (peer, &self.owner) {
+                    // Each device gets the record of the experts it owns.
+                    // Without the shared expert this part's experts add to
+                    // zero.
+                    let to = Departure {
+                        data: ports.records.offset(i as u64 * ports.record_stride),
+                        flags: ports.record_flag,
+                        token: self.exchange_no(env, i, X_RECORD),
+                    };
+                    let zero = w.shared.is_none().then(|| (self.at(s.out), rows * self.n));
+                    let owner = owner.ptr().offset(i as u64 * u64::from(w.shape.n_experts));
+                    self.q4.route_split(stream, full, owner, record, to, zero, cap)?;
+                }
+            }
             self.routed[i].record(stream)?;
             self.side.wait_event(&self.routed[i])?;
             self.side.copy_to_host(
@@ -1774,28 +2266,23 @@ impl Part {
             )?;
             self.copied[i].record(&self.side)?;
             self.mark(stream, Phase::Experts)?;
-            // The shared expert, scaled by its scalar gate: what the routed
-            // experts add their weighted outputs to.
-            self.product(stream, &w.shared_inp, m, self.at(s.s), rows)?;
-            self.product(stream, &w.shared_gate, m, self.at(s.sg), rows)?;
-            self.product(stream, &w.shared_up, m, self.at(s.su), rows)?;
-            self.layers.swiglu_quant(
-                stream,
-                self.at(s.sg),
-                self.at(s.su),
-                self.at(s.act),
-                rows * shared_ff,
-            )?;
-            self.product(stream, &w.shared_down, self.at(s.act), self.at(s.ysh), rows)?;
-            self.q4.gate_scale(
-                stream,
-                self.at(s.ysh),
-                self.at(s.s),
-                self.at(s.out),
-                rows,
-                self.n,
-            )?;
-            self.mark(stream, Phase::Dense)?;
+            if self.role != Role::Worker
+                && let Some(shared) = &w.shared
+            {
+                // The shared expert, scaled by its scalar gate: what the
+                // routed experts add their weighted outputs to.
+                self.product(stream, &shared.inp, m, self.at(s.s), rows)?;
+                self.shared(stream, shared, m, rows)?;
+                self.q4.gate_scale(
+                    stream,
+                    self.at(s.ysh),
+                    self.at(s.s),
+                    self.at(s.out),
+                    rows,
+                    self.n,
+                )?;
+                self.mark(stream, Phase::Dense)?;
+            }
             self.experts.experts(
                 stream,
                 &w.shape,
@@ -1811,6 +2298,36 @@ impl Part {
             )?;
         }
         self.mark(stream, Phase::Experts)
+    }
+
+    /// The shared expert of a layer for the rows at `m`, without its scalar
+    /// gate, into the scratch `ysh`.
+    ///
+    /// # Safety
+    ///
+    /// `m` must hold the activations of `rows` rows.
+    unsafe fn shared(
+        &self,
+        stream: &Stream,
+        shared: &SharedW,
+        m: DevicePtr,
+        rows: u32,
+    ) -> Result<(), ModelError> {
+        let s = self.f.s;
+        // SAFETY: scratch and weights of this part; `m` is the caller's.
+        unsafe {
+            self.product(stream, &shared.gate, m, self.at(s.sg), rows)?;
+            self.product(stream, &shared.up, m, self.at(s.su), rows)?;
+            self.layers.swiglu_quant(
+                stream,
+                self.at(s.sg),
+                self.at(s.su),
+                self.at(s.act),
+                rows * shared.gate.n_out,
+            )?;
+            self.product(stream, &shared.down, self.at(s.act), self.at(s.ysh), rows)?;
+        }
+        Ok(())
     }
 
     /// Ends the part's share of a step. A part without the output head
@@ -1833,7 +2350,7 @@ impl Part {
             self.deferred =
                 Some((env.record.clone(), env.segments.iter().map(|s| s.direct).collect()));
         }
-        let Some(head) = self.w.head else {
+        let Some(head) = self.w.head.filter(|_| self.role != Role::Worker) else {
             self.flush(env)?;
             return Ok(0);
         };
@@ -1842,8 +2359,8 @@ impl Part {
             return Ok(0);
         }
         let rows = dims.n_rows;
-        let pending = std::mem::take(&mut self.pending).then(|| (self.at(s.out), self.at(s.inj_f)));
-        self.read(stream, &head.mixer, pending, None, self.at(s.m), rows)?;
+        let write = self.take_write();
+        self.read(stream, &head.mixer, write, None, self.at(s.m), None, rows)?;
         let bytes = dims.n_out as usize * self.n_vocab as usize * 4;
         // SAFETY: `picked`, `act_p` and `head` hold `logit_rows` rows
         // (`check` bounds `n_out`), the pinned buffer the same.
@@ -1983,6 +2500,7 @@ impl Part {
                             self.f.slot_bytes / 4,
                         )?;
                     }
+                    (CoreW::None, _, _) => {}
                     _ => return Err(invalid("a layer without its state")),
                 }
             }

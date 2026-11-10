@@ -2,8 +2,9 @@
 //! more GPUs, the routed experts in the tiers of the expert store, and the
 //! step built from the kernels of `ares-cuda`.
 //!
-//! - [`Placement`] decides which device holds which layers and what each has
-//!   left for expert slots.
+//! - [`Placement`] decides which device holds what of which layer and what
+//!   each has left for expert slots: a range of layers per device, or both
+//!   devices on every layer.
 //! - [`Part`] is one device's share: its dense weights in one arena, the
 //!   recurrent state of every sequence slot, the K/V and key pools of its
 //!   attention layers, the scratch of a step, and [`Part::enqueue`], which
@@ -21,10 +22,16 @@ mod part;
 pub mod placement;
 mod session;
 
-pub use part::{ExpertAt, Options, PAGE_ENTRY, PHASES, Part, PartSetup, Phase, Profile, StepEnv};
-pub use placement::{DeviceMemory, DevicePlan, Placement, ram_tier_bytes};
+pub use load::{LayerShare, Role};
+pub use part::{
+    ExpertAt, Options, PAGE_ENTRY, PHASES, Part, PartSetup, Phase, Ports, Profile, StepEnv,
+};
+pub use placement::{
+    DeviceMemory, DevicePlan, Placement, TensorChoice, TensorPlan, ram_tier_bytes,
+};
 pub use session::{
-    Fill, LayerOut, PartReport, Probe, Rows, Session, SessionOptions, StepTime, Wanted,
+    Fill, LayerOut, PartReport, Probe, Rows, Session, SessionOptions, Spread, StepTime, Wanted,
+    read_time,
 };
 
 /// Why a model could not be opened on its devices or a step could not run.

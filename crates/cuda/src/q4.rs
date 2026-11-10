@@ -353,6 +353,11 @@ pub struct Q4Kernels {
     ngram_gate: Function,
     ngram_window: Function,
     ngram_commit: Function,
+    read_down: Function,
+    read_up: Function,
+    swap: Function,
+    route_split: Function,
+    route_recv: Function,
 }
 
 fn check_streams(what: &'static str, hc: u32, n: u32) -> Result<()> {
@@ -381,6 +386,11 @@ impl Q4Kernels {
             ngram_gate: module.function("ares_q4_ngram_gate")?,
             ngram_window: module.function("ares_q4_ngram_window")?,
             ngram_commit: module.function("ares_q4_ngram_commit")?,
+            read_down: module.function("ares_q4_read_down")?,
+            read_up: module.function("ares_q4_read_up")?,
+            swap: module.function("ares_q4_swap")?,
+            route_split: module.function("ares_q4_route_split")?,
+            route_recv: module.function("ares_q4_route_recv")?,
         })
     }
 
@@ -1072,5 +1082,400 @@ impl Q4Kernels {
                 args,
             )
         }
+    }
+}
+
+/// A matrix of a stream mixer on the device: `F32`, `F16` or `BF16`, the
+/// types that multiply unquantized values.
+#[derive(Clone, Copy, Debug)]
+pub struct MixerMatrix {
+    /// Where the matrix is, rows contiguous.
+    pub ptr: DevicePtr,
+    /// Its type.
+    pub ty: GgmlType,
+}
+
+impl MixerMatrix {
+    /// The number the fused kernels know the type by (`ARES_Q4_F32` and so
+    /// on), or `None` for a type they do not read.
+    fn code(&self) -> Option<u32> {
+        match self.ty {
+            GgmlType::F32 => Some(0),
+            GgmlType::F16 => Some(1),
+            GgmlType::BF16 => Some(2),
+            _ => None,
+        }
+    }
+}
+
+/// What the write in front of a read adds to the streams
+/// ([`Q4Kernels::read_down`]).
+#[derive(Clone, Copy, Debug)]
+pub struct ReadWrite {
+    /// This device's output of the last half block, `rows * n` f32, or `None`
+    /// when only the peer has one.
+    pub own: Option<DevicePtr>,
+    /// The inject values of the read before, `rows * hc` f32.
+    pub inj: DevicePtr,
+    /// The peer's partial output of the same half block, which the kernel
+    /// waits for.
+    pub peer: Option<Arrival>,
+}
+
+/// Something a peer device writes into this device's memory, and the flags
+/// that announce it.
+#[derive(Clone, Copy, Debug)]
+pub struct Arrival {
+    /// Where the data arrives.
+    pub data: DevicePtr,
+    /// The flags of the exchange (`u32`), in this device's memory.
+    pub flags: DevicePtr,
+    /// The number of the exchange.
+    pub token: u32,
+}
+
+/// Where a kernel writes into the peer's memory, and the flags it sets there
+/// when the data is written.
+#[derive(Clone, Copy, Debug)]
+pub struct Departure {
+    /// Where the data goes (peer memory: write only).
+    pub data: DevicePtr,
+    /// The peer's flags (peer memory: write only).
+    pub flags: DevicePtr,
+    /// The number of the exchange.
+    pub token: u32,
+}
+
+/// The most rows of `down` one block of the read's first launch computes
+/// (`ARES_Q4_TILE`).
+const READ_TILE: u32 = 32;
+/// The most residual streams and the largest rank the fused read takes
+/// (`ARES_Q4_MAX_STREAMS`, `ARES_Q4_MAX_RANK`).
+const READ_MAX_STREAMS: u32 = 8;
+const READ_MAX_RANK: u32 = 1024;
+
+/// Threads of a block that keeps a row of `n` values in registers, a float4
+/// per thread and resident chunk (`ARES_Q4_RESIDENT` is 2).
+fn row_block(what: &'static str, n: u32) -> Result<u32> {
+    let chunks = n / 4;
+    let threads = if chunks <= 1024 { chunks } else { chunks.div_ceil(2) };
+    let threads = threads.next_multiple_of(32).max(64);
+    if n == 0 || !n.is_multiple_of(32) || threads > 1024 {
+        return Err(invalid(what, format!("rows of {n} values (a multiple of 32, at most 8192)")));
+    }
+    Ok(threads)
+}
+
+impl Q4Kernels {
+    /// Whether [`Q4Kernels::read_down`] and [`Q4Kernels::read_up`] can run a
+    /// mixer of these sizes and types; otherwise a read takes the separate
+    /// kernels.
+    pub fn reads_fused(hc: u32, n: u32, rank: u32, matrices: &[GgmlType]) -> bool {
+        let float = |ty: &GgmlType| matches!(ty, GgmlType::F32 | GgmlType::F16 | GgmlType::BF16);
+        (1..=READ_MAX_STREAMS).contains(&hc)
+            && row_block("mixer", n).is_ok()
+            && rank > 0
+            && rank <= READ_MAX_RANK
+            && rank.is_multiple_of(4)
+            && matrices.iter().all(float)
+    }
+
+    /// The f32 values of the scratch between the two launches of a fused
+    /// read: the partial sums per stream of `down @ xn` and `inject @ xn`.
+    pub fn read_partials(rows: u32, hc: u32, rank: u32) -> u64 {
+        u64::from(rows) * u64::from(hc) * u64::from(rank + hc)
+    }
+
+    /// The flags [`Q4Kernels::read_up`] sets for `rows` rows of `n` values.
+    pub fn read_flags(rows: u32, n: u32) -> u32 {
+        rows * (n / 32)
+    }
+
+    /// The first launch of a fused read, with the write of the last half
+    /// block's output in front of it when there is one:
+    ///
+    /// - `write`: `r_dst[row][c] = r_src[row][c] + (own[row] + peer[row]) * 2
+    ///   sigmoid(inj[row][c] / hc)`; without a write `r_dst` is not written.
+    /// - `norm` (`(weights, xn, down, inject)`): `xn[row][c]` is
+    ///   `rms(r[row][c])` times `weights[c]`, and per stream the partial sums
+    ///   of `down @ xn` and of
+    ///   `inject @ xn` into `partials` ([`Q4Kernels::read_partials`] f32),
+    ///   which [`Q4Kernels::read_up`] adds up. Without `norm` the launch is
+    ///   the write alone.
+    ///
+    /// # Safety
+    ///
+    /// On the stream's device and alive until the launch has run: `r_src` and
+    /// `r_dst` `rows * hc * n` f32 (the same buffer only without a norm or
+    /// without a write), `xn` the same, the weights `hc * n` f32, `down`
+    /// `rank` rows and `inject` `hc` rows of `hc * n` values of their types,
+    /// everything 16-byte aligned; a peer's data `rows * n` f32 and `rows`
+    /// flags that a kernel of the peer sets to the token.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn read_down(
+        &self,
+        stream: &Stream,
+        r_src: DevicePtr,
+        r_dst: DevicePtr,
+        write: Option<ReadWrite>,
+        norm: Option<(DevicePtr, DevicePtr, MixerMatrix, Option<MixerMatrix>)>,
+        partials: DevicePtr,
+        rows: u32,
+        hc: u32,
+        n: u32,
+        rank: u32,
+        eps: f32,
+    ) -> Result<()> {
+        let threads = row_block("read", n)?;
+        if hc == 0 || hc > READ_MAX_STREAMS || rows == 0 {
+            return Err(invalid("read", format!("{rows} rows of {hc} streams")));
+        }
+        let null = DevicePtr::NULL;
+        let (own, inj, peer) = match write {
+            Some(w) => (w.own.unwrap_or(null), w.inj, w.peer),
+            None => (null, null, None),
+        };
+        let (peer_out, peer_flags, token) =
+            peer.map_or((null, null, 0), |p| (p.data, p.flags, p.token));
+        let (weights, xn, down, inject, types, tiles) = match norm {
+            Some((weights, xn, down, inject)) => {
+                let bad = || invalid("read", "a mixer matrix that is not F32, F16 or BF16".into());
+                let down_ty = down.code().ok_or_else(bad)?;
+                let inject_ty = inject.map(|m| m.code().ok_or_else(bad)).transpose()?;
+                if rank == 0 || rank > READ_MAX_RANK {
+                    return Err(invalid("read", format!("a mixer of rank {rank}")));
+                }
+                // The fewest tiles of `down` the kernel's 32 rows allow: a
+                // block has a fixed cost (the norm of its stream, the sums
+                // of its rows over the block), and more blocks than that
+                // made a read slower on both cards measured (27 to 45 us and
+                // 80 to 91 us with every multiprocessor filled).
+                let tiles = rank.div_ceil(READ_TILE);
+                (
+                    weights,
+                    xn,
+                    down.ptr,
+                    inject.map_or(null, |m| m.ptr),
+                    down_ty | (inject_ty.unwrap_or(0) << 8),
+                    tiles,
+                )
+            }
+            None => (null, null, null, null, 0, 1),
+        };
+        check_align("read", &[r_src, r_dst, own, peer_out, weights, xn, down, inject], 16)?;
+        let args = Args::new()
+            .ptr(r_src)
+            .ptr(r_dst)
+            .ptr(own)
+            .ptr(peer_out)
+            .ptr(peer_flags)
+            .u32(token)
+            .ptr(inj)
+            .ptr(weights)
+            .ptr(xn)
+            .ptr(down)
+            .ptr(inject)
+            .ptr(partials)
+            .u32(types | (hc << 16) | (tiles << 24))
+            .u32(n)
+            .u32(rank)
+            .f32(eps);
+        // SAFETY: the argument list matches ares_q4_read_down; the ranges are the caller's guarantee.
+        unsafe { self.read_down.launch(stream, [hc * tiles, rows, 1], [threads, 1, 1], 0, args) }
+    }
+
+    /// The second launch of a fused read: `lo = silu(down / hc)`, `gate = up
+    /// @ lo`, the gated mean of the streams, written as quantized activations
+    /// over `rows * n` values into `act` (the layout of
+    /// `Kernels::quantize_activations`), and the inject values of the read
+    /// into `inj` (`rows * hc` f32) when it is given. With `peer` the
+    /// activations are written into the peer's memory as well and
+    /// [`Q4Kernels::read_flags`] flags are set there.
+    ///
+    /// # Safety
+    ///
+    /// On the stream's device and alive until the launch has run: `xn`,
+    /// and `partials` as [`Q4Kernels::read_down`] wrote them, `up`
+    /// `hc * n` rows of `rank` values, `act` the bytes of the layout, 16-byte
+    /// aligned. A peer's data and flags must be memory of a device this one
+    /// has peer access to, of the same sizes.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn read_up(
+        &self,
+        stream: &Stream,
+        xn: DevicePtr,
+        partials: DevicePtr,
+        up: MixerMatrix,
+        act: DevicePtr,
+        inj: Option<DevicePtr>,
+        peer: Option<Departure>,
+        rows: u32,
+        hc: u32,
+        n: u32,
+        rank: u32,
+    ) -> Result<()> {
+        let up_ty = up
+            .code()
+            .ok_or_else(|| invalid("read", "a mixer matrix that is not F32, F16 or BF16".into()))?;
+        if !Self::reads_fused(hc, n, rank, &[]) || rows == 0 {
+            return Err(invalid("read", format!("{rows} rows, {hc} streams of {n}, rank {rank}")));
+        }
+        // As many threads per row of `up` as divide the rank, in blocks of
+        // up to 512 threads: more threads per row shorten the chain of reads
+        // each makes, more threads per block than that put fewer blocks on a
+        // multiprocessor at once.
+        let mut tpr = 1u32;
+        while tpr < 32 && 64 * hc * tpr <= 512 && rank.is_multiple_of(8 * tpr) {
+            tpr *= 2;
+        }
+        let null = DevicePtr::NULL;
+        let (peer_act, peer_flags, token) =
+            peer.map_or((null, null, 0), |p| (p.data, p.flags, p.token));
+        check_align("read", &[xn, up.ptr, act, peer_act], 16)?;
+        let args = Args::new()
+            .ptr(xn)
+            .ptr(partials)
+            .ptr(up.ptr)
+            .ptr(act)
+            .ptr(inj.unwrap_or(null))
+            .ptr(peer_act)
+            .ptr(peer_flags)
+            .u32(token)
+            .u32(up_ty)
+            .u32(hc)
+            .u32(n)
+            .u32(rank)
+            .u32(tpr);
+        // SAFETY: the argument list matches ares_q4_read_up.
+        unsafe { self.read_up.launch(stream, [n / 32, rows, 1], [32 * hc * tpr, 1, 1], 0, args) }
+    }
+
+    /// The worker's side of an exchange between two devices, either half or
+    /// both, in one launch:
+    ///
+    /// - `push` (`(a, b, s, to)`): writes `a[row] + b[row] * sigmoid(s[row])`
+    ///   (`rows * n` f32; a missing `a` or `b` is zero, a missing `s` a factor
+    ///   of 1) into the peer's memory and sets a flag per row there.
+    /// - `wait` (`(flags, n_flags, token)`): then waits until that many of
+    ///   this device's flags hold the token.
+    /// - `gate` (`(inp, m, s_out)`): then `s_out[row] = inp . m[row]`, the
+    ///   scalar gate of the shared expert from the mixed input that arrived.
+    /// - `zero`: then clears `rows * n` f32.
+    ///
+    /// # Safety
+    ///
+    /// Every pointer on the stream's device (the departure in memory of a
+    /// device it has peer access to), of the sizes above, 16-byte aligned,
+    /// alive until the launch has run.
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    pub unsafe fn swap(
+        &self,
+        stream: &Stream,
+        push: Option<(Option<DevicePtr>, Option<DevicePtr>, Option<DevicePtr>, Departure)>,
+        wait: Option<(DevicePtr, u32, u32)>,
+        gate: Option<(DevicePtr, DevicePtr, DevicePtr)>,
+        zero: Option<DevicePtr>,
+        rows: u32,
+        n: u32,
+    ) -> Result<()> {
+        let threads = row_block("swap", n)?;
+        if rows == 0 || (push.is_none() && wait.is_none()) {
+            return Ok(());
+        }
+        let null = DevicePtr::NULL;
+        let (a, b, s, to) = match push {
+            Some((a, b, s, to)) => {
+                (a.unwrap_or(null), b.unwrap_or(null), s.unwrap_or(null), Some(to))
+            }
+            None => (null, null, null, None),
+        };
+        let (peer_dst, peer_flags, token_out) =
+            to.map_or((null, null, 0), |d| (d.data, d.flags, d.token));
+        let (own_flags, n_flags, token_in) = wait.unwrap_or((null, 0, 0));
+        let (inp, m, s_out) = gate.unwrap_or((null, null, null));
+        check_align("swap", &[a, b, peer_dst, inp, m, zero.unwrap_or(null)], 16)?;
+        let args = Args::new()
+            .ptr(a)
+            .ptr(b)
+            .ptr(s)
+            .ptr(peer_dst)
+            .ptr(peer_flags)
+            .u32(token_out)
+            .ptr(own_flags)
+            .u32(n_flags)
+            .u32(token_in)
+            .ptr(inp)
+            .ptr(m)
+            .ptr(s_out)
+            .ptr(zero.unwrap_or(null))
+            .u32(rows)
+            .u32(n);
+        // SAFETY: the argument list matches ares_q4_swap.
+        unsafe { self.swap.launch(stream, [rows, 1, 1], [threads, 1, 1], 0, args) }
+    }
+
+    /// Cuts the route record of a layer into this device's record (`own`) and
+    /// its peer's, which is written into the peer's memory and announced by
+    /// one flag: the groups of experts whose byte in `owner` (one per expert)
+    /// is not 0 go to the peer. `zero`, when given, is cleared first
+    /// (`(buffer, f32 values)`): the buffer this device's experts add to.
+    ///
+    /// # Safety
+    ///
+    /// `record` and `own` must be records for `cap` pairs (`rows * top_k`)
+    /// on the stream's device, `owner` a byte per expert of the layer, the
+    /// departure a record of the same size in memory of a device this one
+    /// has peer access to, and its flag.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn route_split(
+        &self,
+        stream: &Stream,
+        record: DevicePtr,
+        owner: DevicePtr,
+        own: DevicePtr,
+        peer: Departure,
+        zero: Option<(DevicePtr, u32)>,
+        cap: u32,
+    ) -> Result<()> {
+        let (zero, zero_values) = zero.unwrap_or((DevicePtr::NULL, 0));
+        check_align("route split", &[record, own, peer.data, zero], 16)?;
+        let args = Args::new()
+            .ptr(record)
+            .ptr(owner)
+            .ptr(own)
+            .ptr(peer.data)
+            .ptr(peer.flags)
+            .u32(peer.token)
+            .ptr(zero)
+            .u32(zero_values)
+            .u32(cap);
+        // SAFETY: the argument list matches ares_q4_route_split.
+        unsafe { self.route_split.launch(stream, [1, 1, 1], [256, 1, 1], 0, args) }
+    }
+
+    /// Waits for the record the peer's [`Q4Kernels::route_split`] writes into
+    /// `arrival.data`, then gives every group its slot from `slot_table`
+    /// (this device's table of the layer) and counts the missing ones.
+    ///
+    /// # Safety
+    ///
+    /// `arrival.data` must be a record for `cap` pairs on the stream's
+    /// device, `slot_table` an `i32` per expert, `arrival.flags` one flag.
+    pub unsafe fn route_recv(
+        &self,
+        stream: &Stream,
+        arrival: Arrival,
+        slot_table: DevicePtr,
+        cap: u32,
+    ) -> Result<()> {
+        check_align("route record", &[arrival.data, slot_table], 4)?;
+        let args = Args::new()
+            .ptr(arrival.data)
+            .ptr(slot_table)
+            .ptr(arrival.flags)
+            .u32(arrival.token)
+            .u32(cap);
+        // SAFETY: the argument list matches ares_q4_route_recv.
+        unsafe { self.route_recv.launch(stream, [1, 1, 1], [32, 1, 1], 0, args) }
     }
 }

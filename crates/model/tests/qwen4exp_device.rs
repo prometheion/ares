@@ -3,7 +3,13 @@
 //!
 //! The tests open GPUs and are skipped unless `ARES_TEST_CUDA=1` is set.
 //! `ARES_TEST_DEVICES` names the devices by the driver's index (`0`, or `0,1`
-//! for the layer split over two; default `0`).
+//! for two; default `0`). Two devices get the layers split between them;
+//! with `ARES_TEST_SPREAD=tensor` both work on every layer instead
+//! (`ARES_TEST_MIXER` names which of the two holds the streams, default the
+//! first; `ARES_TEST_SHARED=mixer` puts the shared expert there). The model
+//! then has 96 experts per layer instead of 48, so that each device owns as
+//! many as one device holds of a layer in the other tests; `ARES_TEST_EXPERTS`
+//! sets the number for any run.
 //!
 //! What is exact and what is not: the made-up model stores its dense matrices
 //! as f32, f16 and bf16, which the weight kernels multiply with unquantized
@@ -20,11 +26,30 @@ use ares_core::GgmlType;
 use ares_cuda::{CacheFormat, Device, ExpertShape, Wait, device_count};
 use ares_gguf::Gguf;
 use ares_model::qwen4exp::device::{
-    LayerOut, Options, PHASES, Phase, Probe, Profile, Rows, Session, SessionOptions, Wanted,
+    LayerOut, Options, PHASES, Phase, Probe, Profile, Rows, Session, SessionOptions, Spread, Wanted,
 };
 use ares_model::qwen4exp::synthetic::{NgramShape, Shape, Synthetic, Types};
 use ares_model::qwen4exp::{Config, LogitRows, Recorder, Reference, SequenceState, Weights};
 use ares_runtime::expert_store::Serve;
+
+/// The spread the tests of two devices ask for: both on every layer when
+/// `ARES_TEST_SPREAD=tensor`.
+fn tensor() -> Option<Spread> {
+    let var = |name: &str| std::env::var(name).ok();
+    (var("ARES_TEST_SPREAD").as_deref() == Some("tensor")
+        && var("ARES_TEST_DEVICES").is_some_and(|d| d.contains(',')))
+    .then(|| Spread::Tensor {
+        mixer: Some(var("ARES_TEST_MIXER").and_then(|m| m.parse().ok()).unwrap_or(0)),
+        core_share: Some(0.5),
+        shared_on_mixer: Some(var("ARES_TEST_SHARED").as_deref() == Some("mixer")),
+    })
+}
+
+/// The layers whose experts one device has slots for: all of them when both
+/// devices work on every layer.
+fn layers_per_device(n_layer: usize, devices: usize) -> usize {
+    if tensor().is_some() { n_layer } else { n_layer / devices }
+}
 
 fn devices() -> Option<Vec<Device>> {
     static ENABLED: OnceLock<bool> = OnceLock::new();
@@ -63,7 +88,14 @@ fn model(seed: u64) -> Synthetic {
         n_k_heads: 2,
         n_v_heads: 4,
         state_size: 128,
-        n_expert: 48,
+        // Twice the experts when two devices share them: each then owns as
+        // many per layer as one device holds of a layer otherwise.
+        // (`ARES_TEST_EXPERTS` gives a split by layers the same model, to
+        // compare the two.)
+        n_expert: std::env::var("ARES_TEST_EXPERTS")
+            .ok()
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(if tensor().is_some() { 96 } else { 48 }),
         n_expert_used: 3,
         expert_ff: 64,
         shared_ff: 64,
@@ -100,7 +132,8 @@ fn options(devices: usize, n_layer: usize, kv: CacheFormat) -> SessionOptions {
         // The tests share the cards with whatever else runs.
         headroom: 512 << 20,
         ram_tier: Some(64 << 20),
-        bounds: (devices == 2).then(|| vec![0, n_layer / 2, n_layer]),
+        spread: tensor().unwrap_or(Spread::Layers),
+        bounds: (devices == 2 && tensor().is_none()).then(|| vec![0, n_layer / 2, n_layer]),
         // Every expert has a slot: none is to be evicted between steps.
         reserve: Some(0),
         cpu_workers: Some(2),
@@ -438,7 +471,7 @@ fn run_with_misses(devices: &[Device], serve: Serve) -> f64 {
         gate_ty: GgmlType::IQ2_S,
         down_ty: GgmlType::Q2_0,
     };
-    let layers_per_device = c.n_layer / devices.len();
+    let layers_per_device = layers_per_device(c.n_layer, devices.len());
     let opts = SessionOptions {
         slot_bytes: Some((slots * layers_per_device) as u64 * shape.slot_bytes().unwrap()),
         serve,
@@ -487,25 +520,166 @@ fn experts_uploaded_for_a_step_change_nothing() {
     assert_eq!(worst, 0.0);
 }
 
+/// What every layer of a step gave: the residual after it, the output of its
+/// recurrent or attention part, the output of its experts.
+#[derive(Default)]
+struct Kept {
+    layers: Vec<(Vec<f32>, Vec<f32>, Vec<f32>)>,
+}
+
+impl Probe for Kept {
+    fn before(&mut self, _layer: usize) -> Option<Vec<f32>> {
+        None
+    }
+
+    fn after(&mut self, _layer: usize, out: LayerOut<'_>) {
+        self.layers.push((out.residual.to_vec(), out.core.to_vec(), out.ffn.to_vec()));
+    }
+}
+
+/// Feeds every layer the residual another session had before it and keeps,
+/// per row, the largest difference of what the layer gives from what it gave
+/// there: of the experts' output, of the core's, of the residual.
+struct Fed<'a> {
+    /// What the first layer reads, and what the other session's layers gave.
+    first: &'a [f32],
+    theirs: &'a Kept,
+    n: usize,
+    wide: usize,
+    worst: [f64; 3],
+}
+
+impl Probe for Fed<'_> {
+    fn before(&mut self, layer: usize) -> Option<Vec<f32>> {
+        Some(match layer {
+            0 => self.first.to_vec(),
+            _ => self.theirs.layers[layer - 1].0.clone(),
+        })
+    }
+
+    fn after(&mut self, layer: usize, out: LayerOut<'_>) {
+        let (residual, core, ffn) = &self.theirs.layers[layer];
+        let rows = |ours: &[f32], theirs: &[f32], width: usize| -> f64 {
+            ours.chunks(width)
+                .zip(theirs.chunks(width))
+                .map(|(o, t)| rel_rms(o, t))
+                .fold(0.0, f64::max)
+        };
+        let errors = [
+            rows(out.ffn, ffn, self.n),
+            rows(out.core, core, self.n),
+            rows(out.residual, residual, self.wide),
+        ];
+        for (worst, error) in self.worst.iter_mut().zip(errors) {
+            *worst = worst.max(error);
+        }
+    }
+}
+
+/// Runs a text on two sessions, one with every expert in its slot and one
+/// where half of every layer's experts have a slot and misses are served as
+/// `serve` says, each layer of the second reading the residual the first had
+/// before that layer. Returns the largest relative RMS difference of a row
+/// of a layer between the two: of the experts' output, of the core's output
+/// and of the residual after the layer.
+fn layers_with_misses(devices: &[Device], serve: Serve) -> [f64; 3] {
+    let synthetic = model(31);
+    let name = format!("fed-{serve:?}");
+    let gguf = open(&name, &synthetic.bytes_with_experts(GgmlType::IQ2_S, GgmlType::Q2_0));
+    let c = Config::from_gguf(&gguf).unwrap();
+    let w = Weights::load(&gguf, &c).unwrap();
+    let text = synthetic.shape.tokens(56, 29);
+    let mut whole = session(&gguf, &c, &w, devices.to_vec(), CacheFormat::Q8);
+
+    let slots = c.experts.used * 8;
+    let shape = ExpertShape {
+        n_embd: c.n_embd as u32,
+        n_ff: c.experts.ff as u32,
+        n_experts: c.experts.count as u32,
+        top_k: c.experts.used as u32,
+        gate_ty: GgmlType::IQ2_S,
+        down_ty: GgmlType::Q2_0,
+    };
+    let layers_per_device = layers_per_device(c.n_layer, devices.len());
+    let opts = SessionOptions {
+        slot_bytes: Some((slots * layers_per_device) as u64 * shape.slot_bytes().unwrap()),
+        serve,
+        ..options(devices.len(), c.n_layer, CacheFormat::Q8)
+    };
+    let mut missing = Session::open(&gguf, &c, &w, devices.to_vec(), opts).unwrap();
+    let n_expert = c.experts.count as u32;
+    missing.fill(&mut |_| (0..n_expert).collect()).unwrap();
+    missing.take_store_stats();
+
+    let (n, wide) = (c.n_embd, c.wide());
+    let mut worst = [0.0f64; 3];
+    for tokens in text[..40].chunks(8).chain(text[40..].chunks(1)) {
+        let rows = [Rows { slot: 0, tokens, direct: true, wanted: Wanted::None }];
+        let mut theirs = Kept::default();
+        whole.step_probed(&rows, &mut theirs).unwrap();
+        // The first layer reads the embeddings, in every stream.
+        let mut first = vec![0.0f32; tokens.len() * wide];
+        for (row, &token) in tokens.iter().enumerate() {
+            for stream in first[row * wide..(row + 1) * wide].chunks_exact_mut(n) {
+                w.token_embd.decode_row(token as usize, stream);
+            }
+        }
+        let mut fed = Fed { first: &first, theirs: &theirs, n, wide, worst };
+        missing.step_probed(&rows, &mut fed).unwrap();
+        worst = fed.worst;
+    }
+    let stats = missing.take_store_stats();
+    let misses = stats.picks - stats.hits;
+    eprintln!(
+        "  {} device(s), {serve:?}: {misses} of {} picks had no slot, {} of them computed on the \
+         CPU ({} uploads, {} promotions between steps); fed the residuals of a run without \
+         misses, a layer's rows differ from that run's by at most {:.2e} (experts), {:.2e} \
+         (core), {:.2e} (residual), relative RMS",
+        devices.len(),
+        stats.picks,
+        stats.cpu_experts,
+        stats.uploads,
+        stats.promotions,
+        worst[0],
+        worst[1],
+        worst[2],
+    );
+    assert!(misses > 100, "the run was to miss experts: {misses}");
+    match serve {
+        Serve::Stream => assert_eq!(stats.cpu_experts, 0),
+        Serve::Cpu => assert_eq!(stats.cpu_experts, misses),
+        Serve::Measured => {}
+    }
+    worst
+}
+
 /// An expert that is in no slot may be computed on the CPU instead, in the
-/// kernels' own arithmetic with another order of the sums: the logits are
-/// those of a run with every expert in its slot to a few parts in a thousand.
+/// kernels' own arithmetic with another order of the float additions: every
+/// layer then gives what it gives with every expert in its slot, to the
+/// seventh digit (and to a rounding step of one hidden value where a value
+/// sits on the boundary between two 8-bit codes).
 ///
-/// Ignored because it fails now and then as of 2026-11-10 (in 6 of 14 runs on
-/// one device, in none of 5 on two): one row of the 56, always the same one,
-/// a step of one row, is off by 0.1 while the rows before and after it are
-/// right. It happens with every miss on the CPU and with the store's own
-/// choice, never with uploads only. The state of the sequence is not
-/// damaged, so the wrong value enters late in that step. The store promotes
-/// about 120 experts to VRAM between the steps of such a run. Not found yet;
-/// run with `--ignored` to see it.
+/// The layers are compared one by one, each fed the residual of the run
+/// without misses, because two free runs of this model cannot be: its 8-bit
+/// activation codes turn a difference in the seventh digit into one in the
+/// third within a few layers, and its discrete choices turn that into
+/// another answer where two candidates are close. Row 45 of this text is
+/// such a place (the two blocks its last attention layer chooses between
+/// score 43.09 and 42.95), and of free runs with misses on the CPU one in
+/// four gave the other answer there, 0.115 away, as a run with every expert
+/// in its slot does when its residual is disturbed by a hundredth. That is
+/// the model, not the engine: `experts_uploaded_for_a_step_change_nothing`
+/// can compare free runs only because uploads change no bit at all.
 #[test]
-#[ignore = "one row is off by 0.1 in some runs on one device; see the comment"]
 fn experts_computed_on_the_cpu_change_nothing() {
     let Some(devices) = devices() else { return };
     for serve in [Serve::Cpu, Serve::Measured] {
-        let worst = run_with_misses(&devices, serve);
-        assert!(worst < 1e-2, "{serve:?}: {worst:.2e}");
+        let [experts, core, residual] = layers_with_misses(&devices, serve);
+        // The core reads the same residual and the same state: no bit differs.
+        assert_eq!(core, 0.0, "{serve:?}");
+        // An expert left out or added twice is some tenths of a layer's rows.
+        assert!(experts < 1e-2, "{serve:?}: experts {experts:.2e}");
+        assert!(residual < 1e-2, "{serve:?}: residual {residual:.2e}");
     }
 }
 
@@ -531,7 +705,7 @@ fn the_profile_times_steps_by_kind() {
         gate_ty: GgmlType::IQ2_S,
         down_ty: GgmlType::Q2_0,
     };
-    let slots = (c.experts.used * 8 * c.n_layer / devices.len()) as u64;
+    let slots = (c.experts.used * 8 * layers_per_device(c.n_layer, devices.len())) as u64;
     opts.slot_bytes = Some(slots * shape.slot_bytes().unwrap());
     let mut session = Session::open(&gguf, &c, &w, devices.clone(), opts).unwrap();
     let n_expert = c.experts.count as u32;
@@ -553,7 +727,10 @@ fn the_profile_times_steps_by_kind() {
             PHASES.iter().map(|p| format!("{p:?} {:.3}", ms[*p as usize] / 24.0)).collect();
         eprintln!("  device {device}: ms per step: {}", per_step.join(", "));
         assert!(ms.iter().all(|ms| ms.is_finite() && *ms >= 0.0));
-        assert!(ms[Phase::Experts as usize] > 0.0 && ms[Phase::Mixers as usize] > 0.0);
+        // A worker has no mixers: it exchanges with the device that has.
+        let mixes = ms[Phase::Mixers as usize] > 0.0;
+        let works = tensor().is_some() && ms[Phase::Exchange as usize] > 0.0;
+        assert!(ms[Phase::Experts as usize] > 0.0 && (mixes || works));
     }
 }
 
@@ -577,7 +754,7 @@ fn a_long_step_that_misses_experts_ends() {
         gate_ty: GgmlType::IQ2_S,
         down_ty: GgmlType::Q2_0,
     };
-    let slots = (c.experts.used * 8 * c.n_layer / devices.len()) as u64;
+    let slots = (c.experts.used * 8 * layers_per_device(c.n_layer, devices.len())) as u64;
     let text = synthetic.shape.tokens(96, 3);
     for serve in [Serve::Stream, Serve::Measured] {
         let opts = SessionOptions {

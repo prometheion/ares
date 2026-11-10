@@ -9,6 +9,11 @@
 //! What is not here: the routed experts, which live in the slots of the
 //! expert store; the n-gram table, whose rows the host fetches per step; and
 //! the token embedding, whose rows the host decodes for the tokens of a step.
+//!
+//! A device that shares its layers with another holds a slice of each
+//! ([`LayerShare`]): of a recurrent layer some key heads with the value heads
+//! that read them, which are rows of the four projections and columns of the
+//! output projection, gathered here into matrices of their own.
 
 use std::ops::Range;
 use std::time::{Duration, Instant};
@@ -18,7 +23,42 @@ use ares_cuda::{Device, DeviceBuffer, DevicePtr, ExpertShape, RecurrentShape};
 use ares_runtime::ModelError;
 
 use crate::qwen4exp::Config;
-use crate::qwen4exp::weights::{Layer, Matrix, Mixer, StreamMixer, Weights};
+use crate::qwen4exp::weights::{Layer, Matrix, Mixer, RecurrentWeights, StreamMixer, Weights};
+
+/// What a part is to the residual streams of the model.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Role {
+    /// The part holds whole layers: the streams, the mixers and everything
+    /// the layers compute (one device, or a split by layers).
+    Whole,
+    /// The part holds the streams, every mixer, the router and the n-gram
+    /// block of layers it shares with a worker, and its share of what they
+    /// compute.
+    Mixer,
+    /// The part gets the mixed input of every half block from the mixer and
+    /// returns its share of the output. It never sees the streams.
+    Worker,
+}
+
+/// What a part holds of one layer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LayerShare {
+    /// The key heads of a recurrent layer, with the value heads that read
+    /// them, or the KV heads of an attention layer, that the part computes.
+    /// May be empty.
+    pub heads: Range<u32>,
+    /// Whether the part computes the shared expert.
+    pub shared: bool,
+}
+
+impl LayerShare {
+    /// The whole of layer `layer`.
+    pub fn whole(c: &Config, layer: usize) -> Self {
+        let heads =
+            if c.is_attention(layer) { c.attention.n_head_kv } else { c.recurrent.n_k_heads };
+        Self { heads: 0..heads as u32, shared: true }
+    }
+}
 
 /// Every tensor starts at a multiple of this in the arena: more than any
 /// weight kernel asks for (16 bytes).
@@ -90,24 +130,33 @@ pub(crate) struct NgramW {
     pub taps: u64,
 }
 
+/// The shared expert of a layer.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SharedW {
+    /// The scalar gate as a matrix of one row (F32).
+    pub inp: Mat,
+    pub gate: Mat,
+    pub up: Mat,
+    pub down: Mat,
+}
+
 /// The dense part of a layer's mixture of experts: the router and the shared
-/// expert. The routed experts are in the store's slots.
+/// expert, each where the part has it. The routed experts are in the store's
+/// slots.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct MoeW {
     pub shape: ExpertShape,
-    /// The router matrix (F32, `n_experts` rows of `n_embd`).
-    pub router: u64,
-    /// The scalar gate of the shared expert as a matrix of one row.
-    pub shared_inp: Mat,
-    pub shared_gate: Mat,
-    pub shared_up: Mat,
-    pub shared_down: Mat,
+    /// The router matrix (F32, `n_experts` rows of `n_embd`): not on a worker.
+    pub router: Option<u64>,
+    pub shared: Option<SharedW>,
 }
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum CoreW {
     Recurrent(RecurrentW),
     Attention(AttentionW),
+    /// The part has no head of the layer.
+    None,
 }
 
 /// One layer of the model on a device.
@@ -115,8 +164,8 @@ pub(crate) enum CoreW {
 pub(crate) struct LayerW {
     /// The layer's number in the model.
     pub layer: usize,
-    pub attn_mixer: MixerW,
-    pub ffn_mixer: MixerW,
+    /// The mixers in front of the two halves: not on a worker.
+    pub mixers: Option<(MixerW, MixerW)>,
     pub core: CoreW,
     pub moe: MoeW,
     pub ngram: Option<NgramW>,
@@ -135,15 +184,80 @@ enum Source<'g> {
     File(&'g [u8]),
     /// Values the reference decoded.
     Floats(Vec<f32>),
+    /// Rows of a matrix, range after range.
+    Rows(Matrix<'g>, Vec<Range<usize>>),
+    /// The same columns of every row of a matrix, range after range, in
+    /// whole blocks of the matrix's type.
+    Columns(Matrix<'g>, Vec<Range<usize>>),
+}
+
+fn row_bytes(m: &Matrix<'_>) -> usize {
+    m.bytes().len() / m.rows().max(1)
 }
 
 impl Source<'_> {
     fn len(&self) -> u64 {
-        match self {
-            Source::File(bytes) => bytes.len() as u64,
-            Source::Floats(values) => values.len() as u64 * 4,
-        }
+        (match self {
+            Source::File(bytes) => bytes.len(),
+            Source::Floats(values) => values.len() * 4,
+            Source::Rows(m, ranges) => ranges.iter().map(Range::len).sum::<usize>() * row_bytes(m),
+            Source::Columns(m, ranges) => {
+                let (bv, bb) = (m.ty().block_values() as usize, m.ty().block_bytes() as usize);
+                m.rows() * ranges.iter().map(|r| r.len() / bv * bb).sum::<usize>()
+            }
+        }) as u64
     }
+
+    /// The bytes as they go to the arena; `staging` holds them when they are
+    /// gathered.
+    fn bytes<'a>(&'a self, staging: &'a mut Vec<u8>) -> &'a [u8] {
+        staging.clear();
+        match self {
+            Source::File(bytes) => return bytes,
+            Source::Floats(values) => staging.extend(values.iter().flat_map(|v| v.to_le_bytes())),
+            Source::Rows(m, ranges) => {
+                let size = row_bytes(m);
+                for r in ranges {
+                    staging.extend_from_slice(&m.bytes()[r.start * size..r.end * size]);
+                }
+            }
+            Source::Columns(m, ranges) => {
+                let (bv, bb) = (m.ty().block_values() as usize, m.ty().block_bytes() as usize);
+                for row in m.bytes().chunks_exact(row_bytes(m)) {
+                    for r in ranges {
+                        staging.extend_from_slice(&row[r.start / bv * bb..r.end / bv * bb]);
+                    }
+                }
+            }
+        }
+        staging
+    }
+}
+
+/// The ranges of the value heads that read the key heads `keys`, each head
+/// `per_head` items wide: value head `h` reads key head `h mod n_k_heads`.
+fn value_ranges(c: &Config, keys: &Range<usize>, per_head: usize) -> Vec<Range<usize>> {
+    let r = &c.recurrent;
+    (0..r.n_v_heads / r.n_k_heads)
+        .map(|tile| {
+            (tile * r.n_k_heads + keys.start) * per_head..(tile * r.n_k_heads + keys.end) * per_head
+        })
+        .collect()
+}
+
+fn gather(values: &[f32], ranges: &[Range<usize>]) -> Vec<f32> {
+    ranges.iter().flat_map(|r| values[r.clone()].iter().copied()).collect()
+}
+
+/// The key heads a recurrent layer can be cut at: the fewest whose value
+/// columns are whole blocks of the output projection's type.
+pub(crate) fn key_head_unit(c: &Config, r: &RecurrentWeights<'_>) -> usize {
+    let (block, head) = (r.out.ty().block_values() as usize, c.recurrent.head_dim);
+    let mut unit = 1;
+    while !(unit * head).is_multiple_of(block) && unit < c.recurrent.n_k_heads {
+        unit += 1;
+    }
+    unit
 }
 
 /// An arena being laid out: what goes where.
@@ -174,6 +288,71 @@ impl<'g> Layout<'g> {
         Mat { ty: m.ty(), n_in: m.cols() as u32, n_out: m.rows() as u32, at }
     }
 
+    /// Rows `rows` of `m`, range after range, as a matrix of their own.
+    fn rows(&mut self, m: &Matrix<'g>, rows: Vec<Range<usize>>) -> Mat {
+        let n_out = rows.iter().map(Range::len).sum::<usize>() as u32;
+        let at = self.push(Source::Rows(*m, rows));
+        Mat { ty: m.ty(), n_in: m.cols() as u32, n_out, at }
+    }
+
+    /// Columns `columns` of every row of `m` as a matrix of their own.
+    fn columns(&mut self, m: &Matrix<'g>, columns: Vec<Range<usize>>) -> Result<Mat, ModelError> {
+        let bv = m.ty().block_values() as usize;
+        if columns.iter().any(|r| !r.start.is_multiple_of(bv) || !r.end.is_multiple_of(bv)) {
+            return Err(invalid(format!(
+                "columns {columns:?} of a {} matrix are not whole blocks of {bv} values",
+                m.ty()
+            )));
+        }
+        let n_in = columns.iter().map(Range::len).sum::<usize>() as u32;
+        let at = self.push(Source::Columns(*m, columns));
+        Ok(Mat { ty: m.ty(), n_in, n_out: m.rows() as u32, at })
+    }
+
+    /// The key heads `heads` of a recurrent layer with their value heads: a
+    /// narrower layer of the same kind.
+    fn recurrent(
+        &mut self,
+        c: &Config,
+        r: &RecurrentWeights<'g>,
+        heads: Range<usize>,
+    ) -> Result<RecurrentW, ModelError> {
+        let rc = &c.recurrent;
+        let whole = heads == (0..rc.n_k_heads);
+        let (s, kd) = (rc.head_dim, rc.key_dim());
+        let values = value_ranges(c, &heads, s);
+        let per_head = value_ranges(c, &heads, 1);
+        // q of the key heads, k of the key heads, v of their value heads.
+        let mut channels =
+            vec![heads.start * s..heads.end * s, kd + heads.start * s..kd + heads.end * s];
+        channels.extend(values.iter().map(|v| 2 * kd + v.start..2 * kd + v.end));
+        let k = rc.conv_kernel;
+        let taps: Vec<f32> =
+            channels.iter().flat_map(|r| r.start * k..r.end * k).map(|i| r.conv[i]).collect();
+        let n_k = heads.len() as u32;
+        Ok(RecurrentW {
+            shape: RecurrentShape {
+                n_k_heads: n_k,
+                n_v_heads: n_k * (rc.n_v_heads / rc.n_k_heads) as u32,
+                head_dim: s as u32,
+                conv_kernel: k as u32,
+            },
+            qkv: if whole { self.matrix(&r.qkv) } else { self.rows(&r.qkv, channels) },
+            z: if whole { self.matrix(&r.gate) } else { self.rows(&r.gate, values.clone()) },
+            alpha: if whole {
+                self.matrix(&r.alpha)
+            } else {
+                self.rows(&r.alpha, per_head.clone())
+            },
+            beta: if whole { self.matrix(&r.beta) } else { self.rows(&r.beta, per_head.clone()) },
+            out: if whole { self.matrix(&r.out) } else { self.columns(&r.out, values)? },
+            taps: self.floats(&taps),
+            dt_bias: self.floats(&gather(&r.dt_bias, &per_head)),
+            ssm_a: self.floats(&gather(&r.a, &per_head)),
+            ssm_norm: self.floats(&r.norm),
+        })
+    }
+
     /// A matrix of the stream mixer: these multiply the `f32` values a mixer
     /// kernel wrote, which only the float weight kernels read.
     fn float_matrix(&mut self, what: &str, m: &Matrix<'g>) -> Result<Mat, ModelError> {
@@ -196,28 +375,48 @@ impl<'g> Layout<'g> {
         })
     }
 
-    fn layer(&mut self, c: &Config, layer: usize, w: &Layer<'g>) -> Result<LayerW, ModelError> {
+    fn layer(
+        &mut self,
+        c: &Config,
+        layer: usize,
+        w: &Layer<'g>,
+        role: Role,
+        share: &LayerShare,
+    ) -> Result<LayerW, ModelError> {
         let name = |what: &str| format!("blk.{layer}.{what}");
-        let attn_mixer = self.mixer(&name("hc_attn"), &w.attn_mixer)?;
-        let ffn_mixer = self.mixer(&name("hc_ffn"), &w.ffn_mixer)?;
+        let streams = role != Role::Worker;
+        let mixers = if streams {
+            Some((
+                self.mixer(&name("hc_attn"), &w.attn_mixer)?,
+                self.mixer(&name("hc_ffn"), &w.ffn_mixer)?,
+            ))
+        } else {
+            None
+        };
+        let heads = share.heads.start as usize..share.heads.end as usize;
         let core = match &w.mixer {
-            Mixer::Recurrent(r) => CoreW::Recurrent(RecurrentW {
-                shape: RecurrentShape {
-                    n_k_heads: c.recurrent.n_k_heads as u32,
-                    n_v_heads: c.recurrent.n_v_heads as u32,
-                    head_dim: c.recurrent.head_dim as u32,
-                    conv_kernel: c.recurrent.conv_kernel as u32,
-                },
-                qkv: self.matrix(&r.qkv),
-                z: self.matrix(&r.gate),
-                alpha: self.matrix(&r.alpha),
-                beta: self.matrix(&r.beta),
-                out: self.matrix(&r.out),
-                taps: self.floats(&r.conv),
-                dt_bias: self.floats(&r.dt_bias),
-                ssm_a: self.floats(&r.a),
-                ssm_norm: self.floats(&r.norm),
-            }),
+            _ if heads.is_empty() => CoreW::None,
+            Mixer::Recurrent(r) => {
+                let unit = key_head_unit(c, r);
+                if heads.end > c.recurrent.n_k_heads
+                    || !heads.start.is_multiple_of(unit)
+                    || !heads.end.is_multiple_of(unit)
+                {
+                    return Err(invalid(format!(
+                        "{}: the key heads {heads:?} of {} are not whole units of {unit}",
+                        name("attn_qkv"),
+                        c.recurrent.n_k_heads
+                    )));
+                }
+                CoreW::Recurrent(self.recurrent(c, r, heads)?)
+            }
+            Mixer::Attention(_) if heads != (0..c.attention.n_head_kv) => {
+                return Err(invalid(format!(
+                    "{}: the KV heads {heads:?} of {}; an attention layer is not cut between                      devices yet",
+                    name("attn_q"),
+                    c.attention.n_head_kv
+                )));
+            }
             Mixer::Attention(a) => CoreW::Attention(AttentionW {
                 q: self.matrix(&a.q),
                 k: self.matrix(&a.k),
@@ -256,24 +455,23 @@ impl<'g> Layout<'g> {
                 moe.router.ty()
             )));
         }
-        let router = self.push(Source::File(moe.router.bytes()));
-        let shared_inp = Mat {
-            ty: GgmlType::F32,
-            n_in: c.n_embd as u32,
-            n_out: 1,
-            at: self.floats(&moe.shared_gate_inp),
-        };
-        let moe = MoeW {
-            shape,
-            router,
-            shared_inp,
-            shared_gate: self.matrix(&moe.shared_gate),
-            shared_up: self.matrix(&moe.shared_up),
-            shared_down: self.matrix(&moe.shared_down),
-        };
+        let router = streams.then(|| self.push(Source::File(moe.router.bytes())));
+        let shared = share.shared.then(|| SharedW {
+            inp: Mat {
+                ty: GgmlType::F32,
+                n_in: c.n_embd as u32,
+                n_out: 1,
+                at: self.floats(&moe.shared_gate_inp),
+            },
+            gate: self.matrix(&moe.shared_gate),
+            up: self.matrix(&moe.shared_up),
+            down: self.matrix(&moe.shared_down),
+        });
+        let moe = MoeW { shape, router, shared };
         let ngram = w
             .ngram
             .as_ref()
+            .filter(|_| streams)
             .map(|g| -> Result<NgramW, ModelError> {
                 Ok(NgramW {
                     key: self.float_matrix(&name("ple_key"), &g.key)?,
@@ -285,7 +483,7 @@ impl<'g> Layout<'g> {
                 })
             })
             .transpose()?;
-        Ok(LayerW { layer, attn_mixer, ffn_mixer, core, moe, ngram })
+        Ok(LayerW { layer, mixers, core, moe, ngram })
     }
 
     fn head(&mut self, w: &Weights<'g>) -> Result<HeadW, ModelError> {
@@ -296,10 +494,16 @@ impl<'g> Layout<'g> {
     }
 }
 
-/// Bytes of the dense weights of layer `layer` in an arena.
-pub(crate) fn layer_bytes(c: &Config, w: &Weights<'_>, layer: usize) -> Result<u64, ModelError> {
+/// Bytes of what a part of `role` holds of layer `layer` in an arena.
+pub(crate) fn layer_bytes(
+    c: &Config,
+    w: &Weights<'_>,
+    layer: usize,
+    role: Role,
+    share: &LayerShare,
+) -> Result<u64, ModelError> {
     let mut layout = Layout::default();
-    layout.layer(c, layer, &w.layers[layer])?;
+    layout.layer(c, layer, &w.layers[layer], role, share)?;
     Ok(layout.len)
 }
 
@@ -340,33 +544,34 @@ impl DeviceWeights {
         self.upload
     }
 
-    /// Lays out and uploads the dense weights of `layers`, and of the output
-    /// head when `head` is set, after reserving them in the ledger.
+    /// Lays out and uploads what a part of `role` holds of the layers from
+    /// `first` on (`shares` says what of each), and the final mixer and the
+    /// output head when `head` is set, after reserving them in the ledger.
+    #[allow(clippy::too_many_arguments)]
     pub fn load(
         device: &Device,
         ledger: &mut Ledger,
         c: &Config,
         w: &Weights<'_>,
-        layers: Range<usize>,
+        role: Role,
+        first: usize,
+        shares: &[LayerShare],
         head: bool,
     ) -> Result<Self, ModelError> {
         let mut layout = Layout::default();
-        let on_device = layers
-            .map(|layer| layout.layer(c, layer, &w.layers[layer]))
+        let on_device = shares
+            .iter()
+            .enumerate()
+            .map(|(i, share)| layout.layer(c, first + i, &w.layers[first + i], role, share))
             .collect::<Result<Vec<_>, _>>()?;
         let head = head.then(|| layout.head(w)).transpose()?;
         let len = layout.len.max(ALIGN);
         ledger.reserve("qwen4exp dense weights", len)?;
         let arena = DeviceBuffer::new(device, len)?;
         let started = Instant::now();
+        let mut staging = Vec::new();
         for (at, source) in &layout.parts {
-            match source {
-                Source::File(bytes) => arena.write(*at, bytes)?,
-                Source::Floats(values) => {
-                    let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
-                    arena.write(*at, &bytes)?;
-                }
-            }
+            arena.write(*at, source.bytes(&mut staging))?;
         }
         Ok(Self { arena, layers: on_device, head, upload: started.elapsed() })
     }
