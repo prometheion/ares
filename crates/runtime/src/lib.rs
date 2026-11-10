@@ -71,7 +71,7 @@ pub use exec::{Clock, ExecError, Executor, Pick, StepMeta, StepOutput};
 pub use gpu::{GpuConfig, GpuExecutor};
 pub use links::{Links, MAX_DEVICES};
 pub use model::{
-    ContextSpec, DeviceContext, DeviceModel, LinkSpec, Logits, Model, ModelError, Split,
+    ContextSpec, DeviceContext, DeviceModel, LinkSpec, Logits, Model, ModelError, OwnDrafts, Split,
     StepContext,
 };
 pub use record::{Commit, RecordFull, RecordView, RecordWriter, Row, TableUpdate};

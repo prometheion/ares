@@ -10,6 +10,7 @@
 #include "layer_conv.cuh"
 #include "layer_delta.cuh"
 #include "layer_delta_fork.cuh"
+#include "layer_merge.cuh"
 
 // The delta rule for the head width of both architectures (128). The default
 // shape: two lanes per row of the matrix (64 values each in registers), 64 rows

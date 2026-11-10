@@ -16,10 +16,19 @@
 //!   (an attention block of four KV heads has five possible cuts), so the
 //!   rounding error of one block is carried into the next and the shares hold
 //!   over the model.
+//!
+//!   The devices of a tensor split meet at every sum, twice per block, and a
+//!   device that is early waits. With one share for the whole model the
+//!   halves are not balanced one by one: the types of the matrices differ
+//!   from block to block, and so does what each card makes of them.
+//!   [`Placement::tensor_by_half`] takes a share per half block instead
+//!   ([`HalfShares`], from measured times) and cuts each half at the unit
+//!   nearest to it.
 //! - **Layer split**: each device holds a range of whole blocks, the first one
 //!   the embedding table and the last one the output head.
 
 use std::ops::Range;
+use std::sync::Arc;
 
 use ares_runtime::Split;
 
@@ -49,8 +58,19 @@ pub struct DevicePlan {
     pub blocks: Vec<Option<BlockSlice>>,
     /// Whether the device holds the token embedding table.
     pub embedding: bool,
-    /// The tokens this device computes logits for (rows of the output head).
+    /// The rows of the output head this device computes logits for. Row `r`
+    /// is token `r` unless a draft vocabulary reorders the head
+    /// ([`DraftPlan::head_order`]).
     pub head: Range<u32>,
+}
+
+/// The devices' shares of every half block of a tensor split.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HalfShares {
+    /// Per block: the devices' shares of its mixer.
+    pub mixer: Vec<Vec<f64>>,
+    /// Per block: the devices' shares of its feed-forward part.
+    pub ffn: Vec<Vec<f64>>,
 }
 
 /// Why a placement cannot be built.
@@ -65,6 +85,32 @@ pub struct Placement {
     pub split: Split,
     /// One plan per device.
     pub devices: Vec<DevicePlan>,
+    /// Where the model's own draft block is, when it drafts
+    /// ([`Placement::with_draft`]).
+    pub draft: Option<DraftPlan>,
+}
+
+/// The place of the next-token-prediction block, with which the model drafts
+/// its own next tokens.
+///
+/// The whole block is on one device, the one with the embedding table: a
+/// draft chain reads the embedding of each token it picks and must not cross
+/// to another device between its links. Its head is the first rows of the
+/// output head on that device. A draft vocabulary puts the rows of its tokens
+/// first, so the draft head reads those rows only and takes no memory of its
+/// own.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DraftPlan {
+    /// The device that holds the block.
+    pub device: usize,
+    /// The order of the output head's rows when a draft vocabulary changes
+    /// it: row `r` of the head is token `head_order[r]`. A device's
+    /// [`DevicePlan::head`] counts rows in this order. `None`: row `r` is
+    /// token `r`.
+    pub head_order: Option<Arc<[u32]>>,
+    /// The rows of the head on `device` (its first ones) that the draft head
+    /// reads.
+    pub head_rows: u32,
 }
 
 /// The cut points of `units` units over devices with the cumulative shares
@@ -143,6 +189,7 @@ impl Placement {
         Self {
             split: Split::Single,
             devices: vec![DevicePlan { blocks, embedding: true, head: 0..c.n_vocab as u32 }],
+            draft: None,
         }
     }
 
@@ -150,6 +197,36 @@ impl Placement {
     /// (the shares are normalised to add up to 1). The embedding table is on
     /// the first device; the head is cut by tokens.
     pub fn tensor(c: &Config, shares: &[f64]) -> Result<Self, PlacementError> {
+        Self::tensor_cut(c, shares, None)
+    }
+
+    /// A tensor split with a share per half block: device `i` holds about
+    /// `halves.mixer[l][i]` of the mixer of block `l` and `halves.ffn[l][i]`
+    /// of its feed-forward part, each cut at the nearest unit, and
+    /// `shares[i]` of the head.
+    pub fn tensor_by_half(
+        c: &Config,
+        shares: &[f64],
+        halves: &HalfShares,
+    ) -> Result<Self, PlacementError> {
+        let fits = |per_block: &Vec<Vec<f64>>| {
+            per_block.len() == c.n_layer && per_block.iter().all(|s| s.len() == shares.len())
+        };
+        if !fits(&halves.mixer) || !fits(&halves.ffn) {
+            return Err(PlacementError(format!(
+                "shares per half block are needed for {} blocks and {} devices",
+                c.n_layer,
+                shares.len()
+            )));
+        }
+        Self::tensor_cut(c, shares, Some(halves))
+    }
+
+    fn tensor_cut(
+        c: &Config,
+        shares: &[f64],
+        halves: Option<&HalfShares>,
+    ) -> Result<Self, PlacementError> {
         let cumulative = check_shares(shares)?;
         let n = shares.len();
         if n == 1 {
@@ -182,15 +259,27 @@ impl Placement {
             .collect();
         let (mut carry_r, mut carry_a, mut carry_f) = (vec![0.0; n], vec![0.0; n], vec![0.0; n]);
         for layer in 0..c.n_layer {
+            // A half with a share of its own is cut at the nearest unit:
+            // nothing is carried, because the next half's share is not this
+            // one's.
+            let (of_mixer, of_ffn) = match halves {
+                Some(halves) => {
+                    for carry in [&mut carry_r, &mut carry_a, &mut carry_f] {
+                        carry.fill(0.0);
+                    }
+                    (check_shares(&halves.mixer[layer])?, check_shares(&halves.ffn[layer])?)
+                }
+                None => (cumulative.clone(), cumulative.clone()),
+            };
             let heads: Vec<u32> = if c.is_attention(layer) {
-                cuts(a.n_head_kv as u32, &cumulative, &mut carry_a)
+                cuts(a.n_head_kv as u32, &of_mixer, &mut carry_a)
             } else {
-                cuts(r.n_k_heads as u32 / key_unit, &cumulative, &mut carry_r)
+                cuts(r.n_k_heads as u32 / key_unit, &of_mixer, &mut carry_r)
                     .into_iter()
                     .map(|u| u * key_unit)
                     .collect()
             };
-            let ffn = cuts(c.n_ff as u32 / FFN_UNIT, &cumulative, &mut carry_f);
+            let ffn = cuts(c.n_ff as u32 / FFN_UNIT, &of_ffn, &mut carry_f);
             for (i, device) in devices.iter_mut().enumerate() {
                 device.blocks.push(Some(BlockSlice {
                     heads: heads[i]..heads[i + 1],
@@ -202,7 +291,7 @@ impl Placement {
         for (i, device) in devices.iter_mut().enumerate() {
             device.head = head[i]..head[i + 1];
         }
-        Ok(Self { split: Split::Tensor, devices })
+        Ok(Self { split: Split::Tensor, devices, draft: None })
     }
 
     /// A layer split: device `i` holds a range of whole blocks with about
@@ -244,7 +333,68 @@ impl Placement {
                 "the shares {shares:?} leave a device without a block"
             )));
         }
-        Ok(Self { split: Split::Layer, devices })
+        Ok(Self { split: Split::Layer, devices, draft: None })
+    }
+
+    /// The same placement with the model's next-token-prediction block as a
+    /// drafter. `vocabulary` lists the tokens it may propose (in any order,
+    /// each once); without it, it proposes the tokens whose rows of the head
+    /// are on its device (all of them unless the head is cut by a tensor
+    /// split).
+    pub fn with_draft(
+        mut self,
+        c: &Config,
+        vocabulary: Option<&[u32]>,
+    ) -> Result<Self, PlacementError> {
+        if c.n_nextn == 0 {
+            return Err(PlacementError("the model has no next-token-prediction block".into()));
+        }
+        let device = self.embedding_device();
+        let on_device = self.devices[device].head.clone();
+        if on_device.start != 0 || on_device.is_empty() {
+            return Err(PlacementError(
+                "the draft block needs the embedding table and the first rows of the output \
+                 head on one device, which a layer split does not give"
+                    .into(),
+            ));
+        }
+        let (head_order, head_rows) = match vocabulary {
+            None => (None, on_device.end),
+            Some(list) => {
+                let n_vocab = c.n_vocab as u32;
+                let mut listed = vec![false; c.n_vocab];
+                for &token in list {
+                    if token >= n_vocab || std::mem::replace(&mut listed[token as usize], true) {
+                        return Err(PlacementError(format!(
+                            "draft vocabulary: token {token} is listed twice or is not one of \
+                             the {n_vocab} tokens"
+                        )));
+                    }
+                }
+                if list.is_empty() || list.len() as u32 > on_device.end {
+                    return Err(PlacementError(format!(
+                        "a draft vocabulary of {} tokens; the draft block's device holds {} \
+                         rows of the head",
+                        list.len(),
+                        on_device.end
+                    )));
+                }
+                // The listed tokens in ascending order, then the others.
+                let mut order: Vec<u32> = (0..n_vocab).filter(|t| listed[*t as usize]).collect();
+                order.extend((0..n_vocab).filter(|t| !listed[*t as usize]));
+                (Some(Arc::from(order)), list.len() as u32)
+            }
+        };
+        self.draft = Some(DraftPlan { device, head_order, head_rows });
+        Ok(self)
+    }
+
+    /// The token of row `row` of the output head.
+    pub fn head_token(&self, row: u32) -> u32 {
+        match self.draft.as_ref().and_then(|d| d.head_order.as_ref()) {
+            Some(order) => order[row as usize],
+            None => row,
+        }
     }
 
     /// The number of devices.

@@ -24,7 +24,10 @@
 //! order.
 
 mod blocks;
+mod mtp;
 mod ops;
+
+pub use mtp::{MtpDraft, MtpRows, MtpState};
 
 /// Pieces of the reference that GPU kernels are held to one by one: the
 /// functions of the recurrent block (`delta_step`, `conv_silu`) and the scalar

@@ -227,6 +227,7 @@ impl Engine for Runtime {
             prompt,
             max_tokens: request.max_tokens,
             stop: request.stop,
+            sampling: request.sampling,
             sink: events,
             reserved,
         });

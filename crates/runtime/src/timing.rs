@@ -206,7 +206,7 @@ impl DevicePhase {
             DevicePhase::Enqueue => "kernel enqueue",
             DevicePhase::Device => "device time",
             DevicePhase::Readback => "wait for device",
-            DevicePhase::Pick => "arg-max",
+            DevicePhase::Pick => "sampler",
             DevicePhase::Gap => "device idle gap",
             DevicePhase::Notice => "conductor notice",
         }
@@ -243,6 +243,19 @@ pub struct Counters {
     pub drafts_accepted: u64,
     /// Draft rows that were cut again after the picks came back.
     pub drafts_rejected: u64,
+    /// Drafts by where they came from and their position in the draft,
+    /// `[source][position]`: how many were tested (every draft before them
+    /// was accepted) and how many of those were accepted. Source 0 is the
+    /// lookup of earlier text, 1 the model's own draft block; the last
+    /// position counts the ones past it too.
+    pub drafts_tested_at: [[u64; 8]; 2],
+    pub drafts_accepted_at: [[u64; 8]; 2],
+    /// Steps in which the model's own draft block drafted, the links of its
+    /// chains (the longest chain of each step) and their device time in
+    /// microseconds.
+    pub own_draft_steps: u64,
+    pub own_draft_links: u64,
+    pub own_draft_us: u64,
     /// Steps that carried prompt rows and generating rows together.
     pub mixed_steps: u64,
     /// Tokens delivered to requests (accepted picks).

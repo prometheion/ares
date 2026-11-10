@@ -24,6 +24,7 @@
 //! | row extras | 2 per row | sequence slot, context |
 //! | wanted rows | 1 each | the rows whose logits are wanted, in order |
 //! | runs | 2 each | first row, number of rows: the wanted rows as ranges |
+//! | sampler rows | 8 each | how each wanted row is picked ([`SampleRow`]), in the order of the wanted rows |
 //! | commit record | 8 + 8 each | a kernel header and the segments of the last step whose rows were drafts, with the rows that were accepted |
 //! | updates | 3 each | sequence slot, first page-table entry, number of entries |
 //! | entries | 1 each | page-table entries, for the updates in order |
@@ -36,12 +37,18 @@
 //! kernels' layout, so its device address is the `step` argument of the commit
 //! kernels.
 //!
+//! A window whose drafts the model makes itself (flag 2 of its segment) has
+//! no tokens for its draft rows when the record is written: the model's draft
+//! block picks them on the device, before the rows are embedded, and writes
+//! them into the token array of the device's copy of the record. The host
+//! reads them back with the picks.
+//!
 //! The *context* is a number the host derives from the sequence's tokens up to
 //! and including the row's token. A real model has no use for it (attention
 //! reads the sequence's pages); the synthetic model has no attention kernel,
 //! so this is how a row's result comes to depend on its whole sequence.
 
-use ares_cuda::{Segment, StepDims};
+use ares_cuda::{SampleParams, SampleRow, Segment, StepDims};
 
 const MAGIC: u32 = 0x5354_4550;
 /// Bytes of the kernels' header.
@@ -50,6 +57,8 @@ const KERNEL_HEADER: usize = 32;
 const HEADERS: usize = KERNEL_HEADER + 64;
 const SEG_BYTES: usize = 32;
 const FLAG_DIRECT: u32 = 1;
+/// The rows after the first take the tokens the model drafts itself.
+const FLAG_OWN_DRAFTS: u32 = 2;
 
 // Word indices in the runtime header.
 const H_MAGIC: usize = 8;
@@ -65,6 +74,7 @@ const H_OFF_UPDATES: usize = 17;
 const H_OFF_ENTRIES: usize = 18;
 const H_MAX_SEG_ROWS: usize = 19;
 const H_MAX_COMMIT_ROWS: usize = 20;
+const H_OFF_SAMPLERS: usize = 21;
 
 /// One row of a step: a token of a sequence at a position.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -110,7 +120,7 @@ pub fn max_bytes(max_rows: u32, max_slots: u32) -> usize {
     let segments = slots.min(rows.max(1));
     let bytes = HEADERS
         + SEG_BYTES * segments
-        + rows * (4 + 16 + 8 + 4 + 8)
+        + rows * (4 + 16 + 8 + 4 + 8 + SampleRow::BYTES)
         + KERNEL_HEADER
         + SEG_BYTES * slots
         + slots * 12
@@ -164,7 +174,7 @@ impl<'a> RecordWriter<'a> {
         header[H_MAGIC] = MAGIC;
         header[H_STEP] = step as u32;
         header[H_OFF_EXTRA] = off_extra as u32;
-        for h in [H_OFF_RUNS, H_OFF_COMMIT, H_OFF_UPDATES, H_OFF_ENTRIES] {
+        for h in [H_OFF_RUNS, H_OFF_SAMPLERS, H_OFF_COMMIT, H_OFF_UPDATES, H_OFF_ENTRIES] {
             header[h] = end as u32;
         }
         Ok(Self {
@@ -209,6 +219,19 @@ impl<'a> RecordWriter<'a> {
         Ok(())
     }
 
+    /// Marks the segment written last as a window whose draft rows take the
+    /// tokens the model drafts itself: their tokens in this record are
+    /// placeholders.
+    pub fn own_drafts(&mut self) -> Result<(), RecordFull> {
+        assert!(self.segs_written > 0, "a segment was written");
+        let at = HEADERS + (self.segs_written as usize - 1) * SEG_BYTES + 20;
+        let capacity = self.buf.len();
+        let word = self.buf.get_mut(at..at + 4).ok_or(RecordFull { capacity })?;
+        let flags = u32::from_le_bytes([word[0], word[1], word[2], word[3]]) | FLAG_OWN_DRAFTS;
+        word.copy_from_slice(&flags.to_le_bytes());
+        Ok(())
+    }
+
     /// The next row of the segment being written.
     pub fn row(&mut self, row: Row) -> Result<(), RecordFull> {
         assert!(self.rows_written < self.n_rows, "more rows than the record was started for");
@@ -244,7 +267,42 @@ impl<'a> RecordWriter<'a> {
         self.header[7] = off_out as u32;
         self.header[H_RUNS] = runs.len() as u32;
         self.header[H_OFF_RUNS] = off_runs as u32;
+        // Every wanted row takes the most probable token until
+        // `RecordWriter::samplers` says otherwise.
+        let off_samplers = align(at);
+        let greedy = SampleParams::GREEDY.row(0).to_bytes();
+        let capacity = self.buf.len();
+        at = off_samplers;
+        for _ in 0..picked {
+            self.buf
+                .get_mut(at..at + SampleRow::BYTES)
+                .ok_or(RecordFull { capacity })?
+                .copy_from_slice(&greedy);
+            at += SampleRow::BYTES;
+        }
+        self.header[H_OFF_SAMPLERS] = off_samplers as u32;
         self.end = align(at);
+        Ok(())
+    }
+
+    /// How each wanted row is picked, in the order of the wanted rows; after
+    /// [`RecordWriter::runs`]. Rows this is not called for take the most
+    /// probable token.
+    pub fn samplers(
+        &mut self,
+        rows: impl IntoIterator<Item = SampleRow>,
+    ) -> Result<(), RecordFull> {
+        let picked = self.header[2] as usize;
+        let mut at = self.header[H_OFF_SAMPLERS] as usize;
+        let capacity = self.buf.len();
+        for (i, row) in rows.into_iter().enumerate() {
+            assert!(i < picked, "more sampler rows than wanted rows");
+            self.buf
+                .get_mut(at..at + SampleRow::BYTES)
+                .ok_or(RecordFull { capacity })?
+                .copy_from_slice(&row.to_bytes());
+            at += SampleRow::BYTES;
+        }
         Ok(())
     }
 
@@ -352,6 +410,7 @@ impl<'a> RecordView<'a> {
             header[7] as usize + header[2] as usize * 4,
             header[H_OFF_EXTRA] as usize + rows * 8,
             header[H_OFF_RUNS] as usize + header[H_RUNS] as usize * 8,
+            header[H_OFF_SAMPLERS] as usize + header[2] as usize * SampleRow::BYTES,
             header[H_OFF_COMMIT] as usize
                 + if header[H_COMMITS] > 0 {
                     KERNEL_HEADER + header[H_COMMITS] as usize * SEG_BYTES
@@ -426,6 +485,31 @@ impl<'a> RecordView<'a> {
     pub fn segment(&self, i: u32) -> Segment {
         assert!(i < self.segments(), "segment {i} of {}", self.segments());
         self.segment_at(self.header[4] as usize + i as usize * SEG_BYTES).0
+    }
+
+    /// Whether segment `i` is a window whose draft rows take the tokens the
+    /// model drafts itself.
+    pub fn own_drafts(&self, i: u32) -> bool {
+        assert!(i < self.segments(), "segment {i} of {}", self.segments());
+        self.word(self.header[4] as usize + i as usize * SEG_BYTES + 20) & FLAG_OWN_DRAFTS != 0
+    }
+
+    /// The byte offset of the token array (a u32 per row) in the record.
+    pub fn tokens_offset(&self) -> u64 {
+        u64::from(self.header[5])
+    }
+
+    /// The byte offset of the sampler rows ([`SampleRow::BYTES`] bytes per
+    /// wanted row) in the record.
+    pub fn samplers_offset(&self) -> u64 {
+        u64::from(self.header[H_OFF_SAMPLERS])
+    }
+
+    /// How wanted row `i` (in the order of the runs) is picked.
+    pub fn sampler(&self, i: u32) -> SampleRow {
+        assert!(i < self.picked_rows(), "wanted row {i} of {}", self.picked_rows());
+        let at = self.header[H_OFF_SAMPLERS] as usize + i as usize * SampleRow::BYTES;
+        SampleRow::from_bytes(self.bytes[at..at + SampleRow::BYTES].try_into().expect("a row"))
     }
 
     pub fn row(&self, i: u32) -> Row {
@@ -540,6 +624,43 @@ mod tests {
         assert_eq!(record.commit(0), Commit { row0: 4, rows: 3, slot: 3, accepted: 2 });
         let (_, dims) = record.commit_record().unwrap();
         assert_eq!((dims.n_segs, dims.max_seg_rows), (1, 3));
+    }
+
+    #[test]
+    fn the_wanted_rows_carry_how_they_are_picked() {
+        // Without a word about it every wanted row takes the most probable token.
+        let (buf, used) = sample();
+        let record = RecordView::new(&buf[..used]).unwrap();
+        let greedy = SampleParams::GREEDY.row(0);
+        assert!((0..3).all(|i| record.sampler(i) == greedy && !record.sampler(i).sampled()));
+        assert!(!record.own_drafts(0) && !record.own_drafts(1));
+
+        // A window whose drafts the model makes itself, sampled.
+        let params = SampleParams { temperature: 0.8, top_k: 20, top_p: 0.95, min_p: 0.0, seed: 7 };
+        let mut buf = vec![0x55u8; 1024];
+        let mut w = RecordWriter::new(&mut buf, 1, 2, 4).unwrap();
+        w.segment(0, 40, 3, false).unwrap();
+        w.own_drafts().unwrap();
+        w.row(Row { slot: 0, position: 40, token: 9, context: 0 }).unwrap();
+        w.row(Row { slot: 0, position: 41, token: 0, context: 0 }).unwrap();
+        w.row(Row { slot: 0, position: 42, token: 0, context: 0 }).unwrap();
+        w.segment(1, 7, 1, true).unwrap();
+        w.row(Row { slot: 1, position: 7, token: 5, context: 0 }).unwrap();
+        w.runs(&[(0, 4)]).unwrap();
+        w.samplers((40..43).map(|p| params.row(p))).unwrap();
+        let used = w.finish().unwrap();
+        let record = RecordView::new(&buf[..used]).unwrap();
+        assert!(record.own_drafts(0) && !record.own_drafts(1));
+        // The flag is not the kernels' "direct" flag.
+        assert!(!record.segment(0).direct && record.segment(1).direct);
+        assert_eq!(record.sampler(1), params.row(41));
+        assert!(record.sampler(2).sampled());
+        assert_eq!(record.sampler(3), greedy, "a row nobody set stays the most probable token");
+        // The token array is where the device writes the drafts.
+        let at = record.tokens_offset() as usize;
+        assert_eq!(u32::from_le_bytes(buf[at..at + 4].try_into().unwrap()), 9);
+        let rows = record.samplers_offset() as usize;
+        assert_eq!(buf[rows + 32..rows + 64], params.row(41).to_bytes());
     }
 
     /// The first bytes are the record the layer kernels read: the same bytes

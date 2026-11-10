@@ -45,7 +45,8 @@ pub struct StepMeta {
     pub after_idle: bool,
 }
 
-/// The pick of one row: the token with the highest logit and that logit.
+/// The pick of one row: the token, and its logit when it is the most probable
+/// one or its score (logit over temperature plus noise) when it was sampled.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Pick {
     pub token: u32,
@@ -58,6 +59,11 @@ pub struct StepOutput {
     /// One pick per row whose logits were wanted, in the order of the
     /// record's runs.
     pub picks: Vec<Pick>,
+    /// The tokens the model drafted itself for the windows that asked for
+    /// them, in the order of the record's segments, window after window.
+    pub drafts: Vec<u32>,
+    /// Device milliseconds the model's own drafter took.
+    pub draft_ms: f64,
     /// What each device measured.
     pub devices: Vec<DeviceTimes>,
 }

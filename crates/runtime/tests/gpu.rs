@@ -199,7 +199,7 @@ fn a_model_that_does_not_fit_is_refused_at_load_with_the_account() {
     config.attn_inner = 51_200;
     config.ffn_inner = 409_600;
     let model = Arc::new(SyntheticModel::new(config).unwrap());
-    let runtime = RuntimeConfig::default();
+    let runtime = RuntimeConfig { max_slots: 64, ..RuntimeConfig::default() };
     let gpu = GpuConfig::new(&runtime, &*model);
     let error = Runtime::start_gpu(model, devices[..1].to_vec(), runtime, gpu).unwrap_err();
     let text = error.to_string();
@@ -226,7 +226,7 @@ fn state_pages_are_reserved_before_the_model_is_built_and_do_not_change_the_text
     let mut config = SyntheticConfig::small(Split::Single, 1);
     config.state_bytes_per_cell = 1 << 30;
     let model = Arc::new(SyntheticModel::new(config).unwrap());
-    let runtime = RuntimeConfig::default();
+    let runtime = RuntimeConfig { max_slots: 64, ..RuntimeConfig::default() };
     let gpu = GpuConfig::new(&runtime, &*model);
     let error = Runtime::start_gpu(model, devices[..1].to_vec(), runtime, gpu).unwrap_err();
     let text = error.to_string();

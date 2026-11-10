@@ -22,7 +22,8 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender};
 use std::time::{Duration, Instant};
 
-use ares_api::{EngineError, Event, EventSink, FinishReason, RequestId, Usage};
+use ares_api::{EngineError, Event, EventSink, FinishReason, RequestId, Sampling, Usage};
+use ares_cuda::{SampleParams, SampleRow};
 use ares_sched::{
     Acceptance, DraftCost, Limits, NgramDrafter, PartKind, Request, SeqId, StepTimeModel, Want,
     best_draft_len, plan, prefill_rows_next_to,
@@ -70,6 +71,8 @@ pub(crate) struct Submission {
     pub prompt: Vec<u32>,
     pub max_tokens: Option<u32>,
     pub stop: Vec<String>,
+    /// How the request's tokens are picked.
+    pub sampling: Sampling,
     pub sink: EventSink,
     /// Pages reserved for the request's longest possible length.
     pub reserved: u32,
@@ -149,13 +152,23 @@ struct Active {
     prompt_len: u32,
     drafter: NgramDrafter,
     acceptance: Acceptance,
+    /// How the model's own drafts have done for this sequence.
+    own_acceptance: Acceptance,
+    /// How the sequence's tokens are picked.
+    sampling: SampleParams,
     stop: StopMatcher,
     max_tokens: Option<u32>,
     completion: u32,
     reserved: u32,
     waited_steps: u32,
-    /// Drafts for the coming step; cut to the rows the plan grants.
+    /// Drafts for the coming step; cut to the rows the plan grants. When the
+    /// model drafts them itself (`own`), placeholders until the step brings
+    /// the drafts back.
     draft: Vec<u32>,
+    own: bool,
+    /// What the lookup proposed for a step in which the model's own drafts
+    /// were taken: the lookup still learns from what turns out to be right.
+    lookup: Vec<u32>,
     /// Bytes of generated text that are not whole characters yet.
     pending: Vec<u8>,
     /// Text produced this step, not yet delivered.
@@ -306,6 +319,12 @@ pub(crate) struct Conductor {
     commits: Vec<Commit>,
     output: StepOutput,
     scratch_tokens: Vec<u32>,
+    /// How the wanted rows of the step are picked, in their order.
+    samplers: Vec<SampleRow>,
+    /// What a link of the model's own draft chain costs, in device
+    /// milliseconds: measured from the steps that drafted, `None` before the
+    /// first.
+    own_link_ms: Option<f64>,
 }
 
 impl Conductor {
@@ -331,8 +350,12 @@ impl Conductor {
             stats: Stats::new(exec.devices(), config.stats_window),
             output: StepOutput {
                 picks: Vec::with_capacity(max_rows as usize),
+                drafts: Vec::with_capacity(max_rows as usize),
+                draft_ms: 0.0,
                 devices: Vec::with_capacity(exec.devices()),
             },
+            samplers: Vec::with_capacity(max_rows as usize),
+            own_link_ms: None,
             requests: Vec::with_capacity(slots),
             parts: Vec::with_capacity(max_rows as usize),
             updates: Vec::with_capacity(slots),
@@ -473,7 +496,7 @@ impl Conductor {
     }
 
     fn admit(&mut self, submission: Submission) {
-        let Submission { id, prompt, max_tokens, stop, sink, reserved } = submission;
+        let Submission { id, prompt, max_tokens, stop, sampling, sink, reserved } = submission;
         let refuse = |error: EngineError| {
             let _ = sink.send(Event::Error(error));
             self.admission.release(reserved);
@@ -507,12 +530,33 @@ impl Conductor {
             states,
             drafter,
             acceptance: Acceptance::new(self.config.max_draft as usize, self.config.draft_prior),
+            own_acceptance: Acceptance::new(
+                self.config.max_draft as usize,
+                self.config.draft_prior,
+            ),
+            sampling: {
+                // What the request leaves open is the model's own setting. A
+                // request without a seed gets one of its own.
+                let model = self.model.sampling();
+                SampleParams {
+                    temperature: sampling.temperature.unwrap_or(model.temperature),
+                    top_k: sampling.top_k.unwrap_or(model.top_k),
+                    top_p: sampling.top_p.unwrap_or(model.top_p),
+                    min_p: sampling.min_p.unwrap_or(model.min_p),
+                    seed: sampling.seed.unwrap_or_else(|| {
+                        (self.clock.now_ns() ^ id.0.rotate_left(32))
+                            .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+                    }),
+                }
+            },
             stop: StopMatcher::new(&stop),
             max_tokens,
             completion: 0,
             reserved,
             waited_steps: 0,
             draft: Vec::with_capacity(self.config.max_draft as usize),
+            own: false,
+            lookup: Vec::with_capacity(self.config.max_draft as usize),
             pending: Vec::new(),
             emitted: String::new(),
             finished: None,
@@ -585,12 +629,21 @@ impl Conductor {
                     .min(room)
                     .min(self.model.draft_rows().saturating_sub(1))
                     .min(spare_logit_rows) as usize;
+                a.own = false;
+                a.lookup.clear();
                 if self.config.speculation && cap > 0 {
+                    // Two drafters: the lookup, whose proposal costs nothing
+                    // but is there only where text repeats, and the model's
+                    // own draft block, which always has one and pays for
+                    // every link. Each gets its best length; the one with
+                    // more expected tokens per millisecond drafts.
                     let proposal = a.drafter.draft(cap);
-                    let take = match time {
-                        _ if proposal.is_empty() => 0,
-                        // Before any step was measured, try the whole draft.
-                        None => proposal.len(),
+                    let own_cap = cap.min(self.model.own_drafts() as usize);
+                    let own_cost =
+                        DraftCost { fixed_ms: 0.0, per_token_ms: self.own_link_ms.unwrap_or(0.0) };
+                    let (lookup, own) = match time {
+                        // Before any step was measured, try whole drafts.
+                        None => (proposal.len(), own_cap),
                         // A step time model that has seen steps of one size
                         // only cannot tell a fixed cost per step from a cost
                         // per row: it puts everything on the rows (base 0),
@@ -600,25 +653,42 @@ impl Conductor {
                         // regardless, which varies the rows of the steps.
                         Some((base, _)) if base <= 0.0 => {
                             if (self.step_no + slot as u64).is_multiple_of(4) {
-                                proposal.len()
+                                (proposal.len(), own_cap)
                             } else {
-                                0
+                                (0, 0)
                             }
                         }
                         Some((base, per_row)) => {
-                            best_draft_len(
-                                &a.acceptance.rates()[..proposal.len()],
-                                base,
-                                per_row,
-                                generating,
-                                f64::from(generating),
-                                LOOKUP,
-                            )
-                            .len
+                            let best = |rates: &[f64], cost| {
+                                best_draft_len(
+                                    rates,
+                                    base,
+                                    per_row,
+                                    generating,
+                                    f64::from(generating),
+                                    cost,
+                                )
+                            };
+                            let lookup = best(&a.acceptance.rates()[..proposal.len()], LOOKUP);
+                            let own = best(&a.own_acceptance.rates()[..own_cap], own_cost);
+                            if own.len > 0 && own.tokens_per_ms > lookup.tokens_per_ms {
+                                (0, own.len)
+                            } else {
+                                (lookup.len, 0)
+                            }
                         }
                     };
-                    a.draft.extend_from_slice(&proposal[..take]);
-                    spare_logit_rows -= take as u32;
+                    // Where nothing decided yet, a proposal of the lookup
+                    // goes first: it is rarer and free.
+                    if lookup > 0 {
+                        a.draft.extend_from_slice(&proposal[..lookup]);
+                        spare_logit_rows -= lookup as u32;
+                    } else if own > 0 {
+                        a.own = true;
+                        a.draft.resize(own, 0);
+                        a.lookup.extend_from_slice(proposal);
+                        spare_logit_rows -= own as u32;
+                    }
                 }
                 Want::Window { drafts: a.draft.len() as u32 }
             } else {
@@ -668,6 +738,7 @@ impl Conductor {
                 Ok(grown) => {
                     debug_assert!(grown.copy.is_none(), "nothing forks a sequence in this runtime");
                     a.draft.truncate(part.rows.saturating_sub(1) as usize);
+                    a.own &= !a.draft.is_empty();
                     self.parts.push(StepPart { slot, rows: part.rows, kind: part.kind });
                 }
                 Err(error) => {
@@ -711,7 +782,28 @@ impl Conductor {
         let t_back = Instant::now();
         self.stats.record(Phase::Wait, (t_back - t_wait).as_nanos() as u64);
         self.stats.counters.conductor_wakes.record(woke);
-        self.step_time.observe(rows, (t_back - t_dispatch).as_secs_f64() * 1e3);
+        // What the model's own drafter took is not a cost of the rows: it is
+        // learned on its own, per link of the longest chain of the step.
+        let own_links = self
+            .parts
+            .iter()
+            .filter(|p| self.slots[p.slot as usize].as_ref().is_some_and(|a| a.own))
+            .map(|p| p.rows.saturating_sub(1))
+            .max()
+            .unwrap_or(0);
+        let draft_ms = self.output.draft_ms;
+        if own_links > 0 && draft_ms > 0.0 {
+            let counters = &mut self.stats.counters;
+            counters.own_draft_steps += 1;
+            counters.own_draft_links += u64::from(own_links);
+            counters.own_draft_us += (draft_ms * 1e3) as u64;
+            let per_link = draft_ms / f64::from(own_links);
+            self.own_link_ms = Some(match self.own_link_ms {
+                Some(known) => known + 0.1 * (per_link - known),
+                None => per_link,
+            });
+        }
+        self.step_time.observe(rows, (t_back - t_dispatch).as_secs_f64() * 1e3 - draft_ms);
         let last_done = self.output.devices.iter().map(|d| d.finished_at_ns).max().unwrap_or(0);
         self.last_done_ns = Some(last_done);
         for (device, times) in self.output.devices.iter().enumerate() {
@@ -743,6 +835,7 @@ impl Conductor {
         let mut writer = RecordWriter::new(buffer, self.step_no + 1, self.parts.len() as u32, rows)
             .map_err(full)?;
         self.runs.clear();
+        self.samplers.clear();
         self.updates.clear();
         let mut row_index = 0u32;
         let counters = &mut self.stats.counters;
@@ -772,6 +865,7 @@ impl Conductor {
                     }
                     if completes {
                         self.runs.push((row_index + part.rows - 1, 1));
+                        self.samplers.push(a.sampling.row(first_cell + part.rows - 1));
                     }
                 }
                 PartKind::Window | PartKind::Score { .. } => {
@@ -784,6 +878,12 @@ impl Conductor {
                     writer
                         .segment(part.slot, first_cell, part.rows, part.rows == 1)
                         .map_err(full)?;
+                    if a.own {
+                        // The draft rows' tokens below are placeholders: the
+                        // model's draft block writes them on the device.
+                        writer.own_drafts().map_err(full)?;
+                    }
+                    self.samplers.extend((0..part.rows).map(|k| a.sampling.row(first_cell + k)));
                     writer
                         .row(Row {
                             slot: part.slot,
@@ -826,6 +926,7 @@ impl Conductor {
             counters.mixed_steps += 1;
         }
         writer.runs(&self.runs).map_err(full)?;
+        writer.samplers(self.samplers.iter().copied()).map_err(full)?;
         writer.commits(&self.commits).map_err(full)?;
         // Page-table changes since the devices last saw the tables.
         for part in &self.parts {
@@ -856,6 +957,7 @@ impl Conductor {
     /// sequence.
     fn commit(&mut self) {
         let mut cursor = 0usize;
+        let mut draft_cursor = 0usize;
         let mut row0 = 0u32;
         self.commits.clear();
         for part in &self.parts {
@@ -877,12 +979,40 @@ impl Conductor {
                     // picked after the row before it, and only if all the
                     // drafts before it were.
                     let drafts = part.rows as usize - 1;
+                    if a.own {
+                        // The drafts the model made on the device came back
+                        // with the picks. A model that brings fewer than it
+                        // was asked for has none of them accepted.
+                        let end = (draft_cursor + drafts).min(self.output.drafts.len());
+                        a.draft.clear();
+                        a.draft.extend_from_slice(&self.output.drafts[draft_cursor..end]);
+                        a.draft.resize(drafts, u32::MAX);
+                        draft_cursor = end;
+                    }
                     let accepted =
                         (0..drafts).take_while(|&i| picks[i].token == a.draft[i]).count();
                     if drafts > 0 {
-                        a.acceptance.observe(drafts, accepted);
-                        self.stats.counters.drafts_accepted += accepted as u64;
-                        self.stats.counters.drafts_rejected += (drafts - accepted) as u64;
+                        let source = usize::from(a.own);
+                        let acceptance =
+                            if a.own { &mut a.own_acceptance } else { &mut a.acceptance };
+                        acceptance.observe(drafts, accepted);
+                        let counters = &mut self.stats.counters;
+                        counters.drafts_accepted += accepted as u64;
+                        counters.drafts_rejected += (drafts - accepted) as u64;
+                        // Positions up to the first rejected one were tested.
+                        for i in 0..drafts.min(accepted + 1) {
+                            let at = i.min(counters.drafts_tested_at[source].len() - 1);
+                            counters.drafts_tested_at[source][at] += 1;
+                            counters.drafts_accepted_at[source][at] += u64::from(i < accepted);
+                        }
+                    }
+                    // A proposal of the lookup that was not taken learns from
+                    // the tokens that are now known.
+                    if a.own && !a.lookup.is_empty() {
+                        let known = a.lookup.len().min(accepted + 1);
+                        let right =
+                            (0..known).take_while(|&i| picks[i].token == a.lookup[i]).count();
+                        a.acceptance.observe(known, right);
                     }
                     // The devices commit the newest token's row and the
                     // accepted drafts to recurrent state with the next step.

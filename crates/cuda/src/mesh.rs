@@ -23,8 +23,19 @@
 //! matching driver library (see [`LIBRARY_ENV`](crate::LIBRARY_ENV)). With
 //! those, a kernel can write into the other device's memory but reads from it
 //! return garbage, which is why the direct path pushes.
+//!
+//! [`Mesh::sum_f32`] makes every device wait until the sum is there. A model
+//! whose step has independent rows can do better with the two halves of a sum
+//! apart, which is what the **slots** of a mesh are for ([`Mesh::with_slots`]):
+//! a device puts its partial into its outbox and *posts* it, goes on with
+//! other rows while the copy engine carries it to the others, and later lets
+//! its stream wait for the others' partials of that slot to *arrive*. What is
+//! in a parcel and how the partials are added is the model's business (the
+//! merge kernels of [`LayerKernels`](crate::LayerKernels) send f16); the mesh
+//! moves bytes and keeps the order. A model with its own merge kernel also
+//! gets the push path as [`Mesh::push`].
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use crate::device::{Device, peer_access};
 use crate::error::{Error, Result};
@@ -36,6 +47,34 @@ use crate::stream::{Event, Stream};
 /// partials are bound by the link's bandwidth, not by latency, and the copy
 /// engine moves them without occupying the GPU's processors.
 pub const PUSH_MAX_VALUES: u32 = 131_072;
+
+/// The most rows of one sum pushed with [`Mesh::push`]: its kernel has a
+/// block and a flag per row.
+pub const PUSH_MAX_ROWS: u32 = 64;
+
+/// The bytes the host route moves at a time: a device fetches a chunk of a
+/// parcel as soon as it is in host memory, so the way in follows the way out
+/// a chunk behind instead of a parcel behind. The size is the one of the
+/// llama.cpp fork's copy-engine sum; other sizes were not measured.
+const STAGE_CHUNK: usize = 512 << 10;
+
+/// Where one device's kernel of a pushed sum writes and reads: see
+/// [`Mesh::push`] and `kernels/layer_merge.cuh`.
+#[derive(Clone, Copy, Debug)]
+pub struct PushSlot {
+    /// The peer's receive area for this sum (peer memory: write only).
+    pub peer_recv: DevicePtr,
+    /// The peer's flags, [`PUSH_MAX_ROWS`] of them (peer memory: write only).
+    pub peer_flags: DevicePtr,
+    /// This device's receive area for this sum.
+    pub own_recv: DevicePtr,
+    /// This device's flags.
+    pub own_flags: DevicePtr,
+    /// The bytes of a receive area.
+    pub bytes: u64,
+    /// The number of this sum.
+    pub token: u32,
+}
 
 /// How partial results travel between devices.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -71,8 +110,36 @@ struct PushTarget {
     /// Two slots of `push_values` f32 values; consecutive sums alternate, so
     /// the peer can write the next sum while this device still reads the last.
     recv: DeviceBuffer,
-    /// One token per kernel block.
+    /// One token per kernel block of [`Mesh::sum_f32`] or per row of
+    /// [`Mesh::push`].
     flags: DeviceBuffer,
+}
+
+/// What the slots of a mesh need on one device.
+struct SlotSide {
+    /// Carries this device's parcels away: to the other devices (peer route)
+    /// or to its staging (host route).
+    out: Stream,
+    /// Host route: fetches the others' parcels from their staging.
+    fetch: Option<Stream>,
+    /// One region of `slot_bytes` per slot: this device's parcels.
+    outbox: DeviceBuffer,
+    /// Per slot one region of `slot_bytes` per other device, in device order.
+    inbox: DeviceBuffer,
+    /// Host route: this device's parcels on their way, one buffer per slot.
+    staging: Vec<Staging>,
+    /// Per slot, on the device's own stream: the parcel is in the outbox.
+    ready: Vec<Event>,
+    /// Per slot, on `out`: the parcel has left the outbox.
+    sent: Vec<Event>,
+    /// Host route, per slot and chunk, on `out`: the chunk is in staging.
+    staged: Vec<Vec<Event>>,
+    /// Host route, per slot, on `fetch`: the others' parcels are in the inbox.
+    fetched: Vec<Event>,
+    /// Per slot, on the device's own stream: the inbox has been read.
+    consumed: Vec<Event>,
+    /// Per slot: the bytes of the parcel posted last.
+    bytes: Vec<AtomicU64>,
 }
 
 struct Member {
@@ -84,6 +151,7 @@ struct Member {
     /// Host route: where this device's partial waits for the others.
     staging: Option<Staging>,
     push: Option<PushTarget>,
+    slots: Option<SlotSide>,
     /// This device's partial is final (peer copy) or staged (host).
     ready: Event,
     /// This device has fetched every other partial.
@@ -96,8 +164,11 @@ pub struct Mesh {
     route: Route,
     max_values: u32,
     push_values: u32,
-    /// The number of the last push sum.
-    token: AtomicU32,
+    /// The bytes of a slot; the slots themselves are in the members.
+    slot_bytes: u64,
+    /// Per device: the number of its last push sum. The devices count alike
+    /// because they enqueue the same sums.
+    tokens: Vec<AtomicU32>,
 }
 
 impl std::fmt::Debug for Mesh {
@@ -154,8 +225,9 @@ impl Mesh {
             .iter()
             .map(|device| {
                 let push = if push_values > 0 {
-                    let flags = DeviceBuffer::new(device, u64::from(SUM_PEER_BLOCKS) * 4)?;
-                    flags.write(0, &[0u8; SUM_PEER_BLOCKS as usize * 4])?;
+                    let n_flags = SUM_PEER_BLOCKS.max(PUSH_MAX_ROWS) as usize;
+                    let flags = DeviceBuffer::new(device, n_flags as u64 * 4)?;
+                    flags.write(0, &vec![0u8; n_flags * 4])?;
                     let recv = DeviceBuffer::new(device, 2 * u64::from(push_values) * 4)?;
                     Some(PushTarget { recv, flags })
                 } else {
@@ -170,12 +242,55 @@ impl Mesh {
                         Route::Peer => None,
                     },
                     push,
+                    slots: None,
                     ready: Event::new(device)?,
                     pulled: Event::new(device)?,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        Ok(Self { members, route, max_values, push_values, token: AtomicU32::new(0) })
+        let tokens = devices.iter().map(|_| AtomicU32::new(0)).collect();
+        Ok(Self { members, route, max_values, push_values, slot_bytes: 0, tokens })
+    }
+
+    /// Gives the mesh `slots` slots for parcels of up to `slot_bytes` bytes:
+    /// on every device an outbox and, per other device, an inbox of that many
+    /// parcels, a stream for the copies, and on the host route the same bytes
+    /// once more in page-locked host memory.
+    pub fn with_slots(mut self, slots: u32, slot_bytes: u64) -> Result<Self> {
+        if slots == 0 || slot_bytes == 0 {
+            return Err(Error::Invalid {
+                what: "mesh slots",
+                detail: format!("{slots} slots of {slot_bytes} bytes"),
+            });
+        }
+        let slot_bytes = slot_bytes.next_multiple_of(64);
+        let others = self.members.len().saturating_sub(1).max(1) as u64;
+        let chunks = (slot_bytes as usize).div_ceil(STAGE_CHUNK);
+        let route = self.route;
+        for member in &mut self.members {
+            let device = &member.device.clone();
+            let events = || (0..slots).map(|_| Event::new(device)).collect::<Result<Vec<_>>>();
+            let host = route == Route::Host;
+            member.slots = Some(SlotSide {
+                out: Stream::new(device, 0)?,
+                fetch: host.then(|| Stream::new(device, 0)).transpose()?,
+                outbox: DeviceBuffer::new(device, slot_bytes * u64::from(slots))?,
+                inbox: DeviceBuffer::new(device, slot_bytes * u64::from(slots) * others)?,
+                staging: (0..if host { slots } else { 0 })
+                    .map(|_| Staging::new(device, slot_bytes as usize))
+                    .collect::<Result<Vec<_>>>()?,
+                ready: events()?,
+                sent: events()?,
+                staged: (0..if host { slots } else { 0 })
+                    .map(|_| (0..chunks).map(|_| Event::new(device)).collect::<Result<Vec<_>>>())
+                    .collect::<Result<Vec<_>>>()?,
+                fetched: if host { events()? } else { Vec::new() },
+                consumed: events()?,
+                bytes: (0..slots).map(|_| AtomicU64::new(0)).collect(),
+            });
+        }
+        self.slot_bytes = slot_bytes;
+        Ok(self)
     }
 
     pub fn route(&self) -> Route {
@@ -275,7 +390,8 @@ impl Mesh {
         if self.route == Route::Peer && n <= self.push_values {
             // One kernel per device. Each writes into the other's receive
             // slot and flags, then waits on its own.
-            let token = self.token.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+            let token = self.tokens[0].fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+            self.tokens[1].fetch_add(1, Ordering::Relaxed);
             let slot_offset = u64::from(token % 2) * u64::from(self.push_values) * 4;
             for d in 0..2 {
                 let own = self.members[d].push.as_ref().expect("push route has targets");
@@ -386,6 +502,209 @@ impl Mesh {
             }
         }
         Ok(())
+    }
+}
+
+/// The slots and the push of a mesh, for a model with its own merge kernels.
+///
+/// Unlike the sums above, these calls are made per device, each device's by
+/// the thread that enqueues its stream, and the threads must keep an order
+/// among them: counted per slot, a device's `k`-th [`Mesh::post`] comes after
+/// every other device's `k-1`-th [`Mesh::consumed`] has returned, and its
+/// `k`-th [`Mesh::arrive`] after every other device's `k`-th [`Mesh::post`]
+/// has returned. (An event that a stream is told to wait for must have been
+/// recorded before, and not again since.) `Links` of `ares-runtime` keeps
+/// that order with two counters per slot.
+impl Mesh {
+    /// The number of slots.
+    pub fn slots(&self) -> u32 {
+        self.members[0].slots.as_ref().map_or(0, |s| s.ready.len() as u32)
+    }
+
+    /// The bytes of a slot: the stride of the regions [`Mesh::arrive`]
+    /// returns.
+    pub fn slot_bytes(&self) -> u64 {
+        self.slot_bytes
+    }
+
+    /// The bytes one pushed sum may write per device, or 0 when the mesh has
+    /// no push path (no peer access, or not two devices).
+    pub fn push_bytes(&self) -> u64 {
+        u64::from(self.push_values) * 4
+    }
+
+    /// The next pushed sum of device `rank`: where its merge kernel
+    /// (`LayerKernels::merge_push`) writes and reads. Every device must take
+    /// the pushes of a step in the same order and enqueue a kernel for each;
+    /// nothing else is needed between the devices, the kernels wait for each
+    /// other on the devices. `None` when the mesh has no push path.
+    pub fn push(&self, rank: usize) -> Option<PushSlot> {
+        if self.push_values == 0 || rank >= 2 {
+            return None;
+        }
+        let token = self.tokens[rank].fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+        let bytes = self.push_bytes();
+        let offset = u64::from(token % 2) * bytes;
+        let own = self.members[rank].push.as_ref()?;
+        let peer = self.members[1 - rank].push.as_ref()?;
+        Some(PushSlot {
+            peer_recv: peer.recv.ptr().offset(offset),
+            peer_flags: peer.flags.ptr(),
+            own_recv: own.recv.ptr().offset(offset),
+            own_flags: own.flags.ptr(),
+            bytes,
+            token,
+        })
+    }
+
+    fn side(&self, rank: usize, slot: u32) -> Result<&SlotSide> {
+        self.members
+            .get(rank)
+            .and_then(|m| m.slots.as_ref())
+            .filter(|s| (slot as usize) < s.ready.len())
+            .ok_or_else(|| Error::Invalid {
+                what: "mesh slot",
+                detail: format!(
+                    "slot {slot} of device {rank}; the mesh has {} slots",
+                    self.slots()
+                ),
+            })
+    }
+
+    /// Where device `to` finds the parcel of device `from` in `slot`.
+    fn inbox_ptr(&self, to: usize, slot: u32, from: usize) -> Result<DevicePtr> {
+        let others = self.members.len() as u64 - 1;
+        let place = if from < to { from } else { from - 1 };
+        let region = u64::from(slot) * others + place as u64;
+        Ok(self.side(to, slot)?.inbox.ptr().offset(region * self.slot_bytes))
+    }
+
+    /// Where device `rank` writes its next parcel of `slot`. Work enqueued on
+    /// `stream` (the device's own) after this call waits until the slot's
+    /// last parcel has left.
+    pub fn outbox(&self, rank: usize, stream: &Stream, slot: u32) -> Result<DevicePtr> {
+        let side = self.side(rank, slot)?;
+        stream.wait_event(&side.sent[slot as usize])?;
+        Ok(side.outbox.ptr().offset(u64::from(slot) * self.slot_bytes))
+    }
+
+    /// Sends the first `bytes` bytes of device `rank`'s outbox of `slot` to
+    /// every other device, once the work enqueued on `stream` so far has run.
+    /// `stream` itself does not wait for the copy.
+    ///
+    /// # Safety
+    ///
+    /// `stream` must be the stream of device `rank` on which its outbox was
+    /// written, and the calls must keep the order described at this block.
+    pub unsafe fn post(&self, rank: usize, stream: &Stream, slot: u32, bytes: u64) -> Result<()> {
+        let side = self.side(rank, slot)?;
+        if bytes > self.slot_bytes {
+            return Err(Error::Invalid {
+                what: "mesh slot",
+                detail: format!("a parcel of {bytes} bytes; a slot holds {}", self.slot_bytes),
+            });
+        }
+        let s = slot as usize;
+        let source = side.outbox.ptr().offset(u64::from(slot) * self.slot_bytes);
+        side.bytes[s].store(bytes, Ordering::Release);
+        side.ready[s].record(stream)?;
+        side.out.wait_event(&side.ready[s])?;
+        let peers = (0..self.members.len()).filter(|p| *p != rank);
+        match self.route {
+            Route::Peer => {
+                for p in peers {
+                    // The peer's merge of the slot's last parcel has read it.
+                    side.out.wait_event(&self.side(p, slot)?.consumed[s])?;
+                    // SAFETY: both regions hold `slot_bytes >= bytes` bytes
+                    // and live as long as the mesh.
+                    unsafe {
+                        side.out.copy_peer(
+                            &self.members[p].device,
+                            self.inbox_ptr(p, slot, rank)?,
+                            &self.members[rank].device,
+                            source,
+                            bytes as usize,
+                        )?;
+                    }
+                }
+            }
+            Route::Host => {
+                // Every peer has fetched the slot's last parcel from staging.
+                for p in peers {
+                    side.out.wait_event(&self.side(p, slot)?.fetched[s])?;
+                }
+                let staging = side.staging[s].ptr;
+                for (c, at) in (0..bytes as usize).step_by(STAGE_CHUNK).enumerate() {
+                    let len = STAGE_CHUNK.min(bytes as usize - at);
+                    // SAFETY: the staging buffer and the outbox region hold
+                    // `slot_bytes >= bytes` bytes; only the driver touches
+                    // the staging buffer.
+                    unsafe {
+                        side.out.copy_to_host(staging.add(at), source.offset(at as u64), len)?
+                    };
+                    side.staged[s][c].record(&side.out)?;
+                }
+            }
+        }
+        side.sent[s].record(&side.out)
+    }
+
+    /// Makes work enqueued on `stream` (device `rank`'s own) after this call
+    /// wait until the other devices' parcels of `slot` are on this device,
+    /// and returns where: one region per other device, in device order,
+    /// [`Mesh::slot_bytes`] apart. They stay until [`Mesh::consumed`].
+    ///
+    /// # Safety
+    ///
+    /// `stream` must be the stream of device `rank` that reads the parcels,
+    /// and the calls must keep the order described at this block.
+    pub unsafe fn arrive(&self, rank: usize, stream: &Stream, slot: u32) -> Result<DevicePtr> {
+        let side = self.side(rank, slot)?;
+        let s = slot as usize;
+        let peers = (0..self.members.len()).filter(|p| *p != rank);
+        match (&side.fetch, self.route) {
+            (Some(fetch), Route::Host) => {
+                // This device's merge of the slot's last parcels has read them.
+                fetch.wait_event(&side.consumed[s])?;
+                for p in peers {
+                    let theirs = self.side(p, slot)?;
+                    let bytes = theirs.bytes[s].load(Ordering::Acquire) as usize;
+                    let to = self.inbox_ptr(rank, slot, p)?;
+                    for (c, at) in (0..bytes).step_by(STAGE_CHUNK).enumerate() {
+                        let len = STAGE_CHUNK.min(bytes - at);
+                        fetch.wait_event(&theirs.staged[s][c])?;
+                        // SAFETY: the inbox region and the peer's staging
+                        // buffer hold `slot_bytes >= bytes` bytes; the chunk
+                        // is complete once its event has happened.
+                        unsafe {
+                            fetch.copy_from_host(
+                                to.offset(at as u64),
+                                theirs.staging[s].ptr.add(at).cast_const(),
+                                len,
+                            )?;
+                        }
+                    }
+                }
+                side.fetched[s].record(fetch)?;
+                stream.wait_event(&side.fetched[s])?;
+            }
+            _ => {
+                for p in peers {
+                    stream.wait_event(&self.side(p, slot)?.sent[s])?;
+                }
+            }
+        }
+        Ok(side
+            .inbox
+            .ptr()
+            .offset(u64::from(slot) * (self.members.len() as u64 - 1) * self.slot_bytes))
+    }
+
+    /// Ends device `rank`'s use of the parcels of `slot` that arrived: the
+    /// work enqueued on `stream` so far has read them, and the slot may be
+    /// written again once that work has run.
+    pub fn consumed(&self, rank: usize, stream: &Stream, slot: u32) -> Result<()> {
+        self.side(rank, slot)?.consumed[slot as usize].record(stream)
     }
 }
 

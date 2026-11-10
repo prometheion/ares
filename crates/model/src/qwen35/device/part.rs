@@ -20,12 +20,19 @@ use ares_cuda::{
     PUSH_MAX_VALUES, PinnedBuffer, PlanBuffers, PlanConfig, Planner, Precision, PrefillPath,
     RopeParams, Segment, StateFormat, StepDims, Stream,
 };
+use ares_cuda::{PUSH_MAX_ROWS, PushSlot};
 use ares_runtime::{Logits, ModelError, Split};
 
 use super::load::{AttentionW, BlockW, DeviceWeights, FfnW, Mat, MixerW, RecurrentW};
 use super::placement::Placement;
 use crate::qwen35::Config;
 use crate::qwen35::weights::Weights;
+
+#[path = "mtp.rs"]
+mod mtp;
+mod tensor;
+
+pub use mtp::{DraftBytes, DraftChain, DraftStep, DraftTimes, Drafted};
 
 /// Bit 31 of a table entry: the page is in the pool of stored formats (the
 /// only pool the formats without a tile mean use).
@@ -51,10 +58,26 @@ pub struct Options {
     /// The most rows of a step that verifies drafts (a window whose rows may
     /// be rejected keeps its inputs per recurrent block); 0 for none.
     pub window_rows: u32,
+    /// The tokens the model's own draft block may propose (a model with a
+    /// next-token-prediction block drafts with it whenever `window_rows`
+    /// allows drafts): the rows of these tokens come first in the output
+    /// head, and the draft head reads only them. `None`: the tokens whose
+    /// rows are on the block's device, which are all of them unless a tensor
+    /// split cuts the head.
+    pub draft_vocabulary: Option<Arc<[u32]>>,
     /// Under a layer split, the rows a device hands to the next at a time: a
     /// step of at least twice as many certain rows is cut into groups of this
     /// size, and the devices work on different groups of the step at once.
-    /// 0 hands every step over whole.
+    /// Under a tensor split, a step of more certain rows than this is cut
+    /// into groups of this size, and a group's partial results travel while
+    /// the device computes the next group. 0 keeps every step whole.
+    ///
+    /// The default of 256 is a measurement on compute capabilities 8.6 and
+    /// 8.9 (RTX 3060 and RTX 4070, Qwen3.8-27B: 128 rows read a prompt 25 %
+    /// slower, 512 rows without a second group 34 % slower). No other class
+    /// was measured; the right size is where the tensor-core kernels of a
+    /// class reach their rate and a group's parcel still crosses the link
+    /// in less time than the next group computes.
     pub pipeline_rows: u32,
     /// Where the parts add up the device time of their kernels, by kind.
     pub profile: Option<Arc<Profile>>,
@@ -69,6 +92,7 @@ impl Default for Options {
             max_rows: 512,
             logit_rows: 8,
             window_rows: 0,
+            draft_vocabulary: None,
             pipeline_rows: 256,
             profile: None,
         }
@@ -84,16 +108,20 @@ pub enum Phase {
     Layers = 1,
     /// Attention: preparing q and k, writing K and V, the attention itself.
     Attention = 2,
-    /// Sums across devices and hand-overs, including the wait for the other
-    /// device.
+    /// Sums across devices and hand-overs. For the sums and hand-overs that
+    /// make the stream wait inside one call (the push of a few rows, a
+    /// hand-over), including the wait for the other device.
     Exchange = 3,
     /// Everything else between the start of a step and its end.
     Other = 4,
+    /// The stream idle in front of a merge of a tensor split: the other
+    /// devices' partial results are not there yet.
+    Wait = 5,
 }
 
 /// The phases, in the order of their numbers.
-pub const PHASES: [Phase; 5] =
-    [Phase::Weights, Phase::Layers, Phase::Attention, Phase::Exchange, Phase::Other];
+pub const PHASES: [Phase; 6] =
+    [Phase::Weights, Phase::Layers, Phase::Attention, Phase::Exchange, Phase::Other, Phase::Wait];
 
 /// Device time per phase and device, added up over steps.
 #[derive(Debug, Default)]
@@ -104,8 +132,11 @@ pub struct Profile {
 #[derive(Clone, Debug, Default)]
 struct ProfileData {
     /// `[device][phase]` milliseconds.
-    ms: Vec<[f64; 5]>,
+    ms: Vec<[f64; 6]>,
     steps: Vec<u64>,
+    /// `[device][merge of the step]`: the milliseconds of the device's own
+    /// work in front of the merge, and of the merge with its waiting.
+    merges: Vec<Vec<[f64; 2]>>,
 }
 
 impl Profile {
@@ -114,21 +145,40 @@ impl Profile {
         Self::default()
     }
 
-    fn add(&self, device: usize, ms: &[f64; 5]) {
+    fn add(&self, device: usize, ms: &[f64; 6], merges: &[[f64; 2]]) {
         let mut data = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if data.ms.len() <= device {
-            data.ms.resize(device + 1, [0.0; 5]);
+            data.ms.resize(device + 1, [0.0; 6]);
             data.steps.resize(device + 1, 0);
+            data.merges.resize(device + 1, Vec::new());
         }
         for (sum, v) in data.ms[device].iter_mut().zip(ms) {
             *sum += v;
         }
         data.steps[device] += 1;
+        let sums = &mut data.merges[device];
+        if sums.len() < merges.len() {
+            sums.resize(merges.len(), [0.0; 2]);
+        }
+        for (sum, v) in sums.iter_mut().zip(merges) {
+            sum[0] += v[0];
+            sum[1] += v[1];
+        }
+    }
+
+    /// Per device and merge of a step under a tensor split, summed over the
+    /// steps counted: the milliseconds of the device's own work between the
+    /// merge before and this one, and of this merge with its waiting for the
+    /// other devices. Merge `j` of a step that is not cut into groups follows
+    /// half block `j - 1` (the mixer of block 0 is half 0); merge 0 follows
+    /// the embedding.
+    pub fn merges(&self) -> Vec<Vec<[f64; 2]>> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).merges.clone()
     }
 
     /// Per device: the steps counted and the milliseconds per phase (indexed
     /// by the phase's number), summed over those steps.
-    pub fn totals(&self) -> Vec<(u64, [f64; 5])> {
+    pub fn totals(&self) -> Vec<(u64, [f64; 6])> {
         let data = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         data.steps.iter().copied().zip(data.ms.iter().copied()).collect()
     }
@@ -144,14 +194,31 @@ impl Profile {
 struct Marks {
     profile: Arc<Profile>,
     events: Vec<Event>,
+    /// The marks that end a merge of a tensor split.
+    merges: Vec<usize>,
     /// The phase that ends at each event (the first event starts the step).
     phases: Vec<Phase>,
 }
 
 /// The paths to the other devices, as a part uses them.
 pub trait Exchange {
-    /// Sums `n` f32 values at `partial` across all devices, in place on each.
-    fn sum(&self, partial: DevicePtr, n: u32) -> Result<(), ModelError>;
+    /// The bytes one pushed sum may write, or 0 when the devices have no
+    /// push path.
+    fn push_bytes(&self) -> u64;
+    /// The next pushed sum of this device, for its merge kernel.
+    fn push(&self) -> Result<PushSlot, ModelError>;
+    /// The bytes between the regions [`Exchange::arrive`] returns.
+    fn slot_bytes(&self) -> u64;
+    /// Where this device writes its next parcel of `slot`.
+    fn outbox(&self, slot: u32) -> Result<DevicePtr, ModelError>;
+    /// Sends `bytes` bytes of this device's parcel of `slot` to the other
+    /// devices; the stream does not wait for it.
+    fn post(&self, slot: u32, bytes: u64) -> Result<(), ModelError>;
+    /// Makes the stream wait for the other devices' parcels of `slot` and
+    /// returns where they are, in device order, until [`Exchange::consumed`].
+    fn arrive(&self, slot: u32) -> Result<DevicePtr, ModelError>;
+    /// Ends the use of the parcels of `slot` that arrived.
+    fn consumed(&self, slot: u32) -> Result<(), ModelError>;
     /// Hands `n` f32 values at `src` to the next device.
     fn send(&self, src: DevicePtr, n: u32) -> Result<(), ModelError>;
     /// Where the values the previous device handed over are, until
@@ -243,8 +310,23 @@ struct AttentionAt {
     pool: u64,
 }
 
+/// What the merge of a tensor split left of the norm of the rows being
+/// enqueued, for the half block that reads it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Normed {
+    /// Nothing: the half block normalises the residual stream itself.
+    #[default]
+    No,
+    /// The normalised rows.
+    Rows,
+    /// The normalised rows as quantized activations, in the layout of the
+    /// fused kernels.
+    Quantized,
+}
+
 /// A group of consecutive rows of a step that a layer split hands over on
-/// its own: a smaller step, whose record is at `record` of the group records.
+/// its own, or whose partial results a tensor split sums on their own: a
+/// smaller step, whose record is at `record` of the group records.
 #[derive(Clone, Debug)]
 struct Group {
     first_row: u32,
@@ -286,6 +368,10 @@ pub struct Part {
     plan_config: PlanConfig,
     /// The attention plans of the step, by group and number of KV heads.
     plans: Vec<(usize, u32, PlanBuffers)>,
+    /// Where the plans of a step are written on the host and where one copy
+    /// on the step's stream puts them on the device.
+    plan_host: PinnedBuffer,
+    plan_device: DeviceBuffer,
     /// The groups of the step, when it is cut into groups; their records on
     /// the host and on the device.
     groups: Vec<Group>,
@@ -298,8 +384,18 @@ pub struct Part {
     status_host: PinnedBuffer,
     status_pending: bool,
     marks: Option<Marks>,
-    rows_per_sum: u32,
+    /// The most rows of a sum that is pushed (tensor split).
+    push_rows: u32,
+    /// Per slot of the exchange: where this device's parcel is.
+    parcels: Vec<DevicePtr>,
+    /// What the last merge left for the half block that follows it.
+    normed: Normed,
+    /// Whether the last [`Part::prepare`] prepared for the decode kernels in
+    /// several launches ([`Part::in_batches`]).
+    batched: std::cell::Cell<bool>,
     page_bytes: u64,
+    /// The model's own draft block, on the device that holds it.
+    mtp: Option<mtp::Mtp>,
 }
 
 impl std::fmt::Debug for Part {
@@ -333,7 +429,11 @@ pub fn page_bytes(
             (c.is_attention(layer) && !slice.heads.is_empty())
                 .then(|| geometry(c, kv, slice.heads.len() as u32).converted_entry_bytes())
         })
-        .sum()
+        .sum::<u64>()
+        // The draft block's keys and values, on the device that holds it.
+        + placement.draft.as_ref().filter(|d| d.device == index).map_or(0, |_| {
+            geometry(c, kv, c.attention.n_head_kv as u32).converted_entry_bytes()
+        })
 }
 
 fn geometry(c: &Config, kv: (CacheFormat, CacheFormat), kv_heads: u32) -> CacheGeometry {
@@ -373,7 +473,8 @@ impl Part {
         if opts.max_rows == 0 || opts.logit_rows == 0 || max_slots == 0 {
             return Err(invalid("a part needs at least one row, one logit row and one slot"));
         }
-        let w = DeviceWeights::load(device, ledger, c, weights, plan)?;
+        let w =
+            DeviceWeights::load(device, ledger, c, weights, plan, placement.draft.as_ref(), index)?;
 
         let (d, rows) = (c.n_embd as u64, u64::from(opts.max_rows));
         let (mut cd, mut vd, mut kd, mut nv, mut hq, mut hkv, mut f) = (0u64, 0, 0, 0, 0, 0, 0);
@@ -428,6 +529,17 @@ impl Part {
             recurrent_at.push(r_at);
             attention_at.push(a_at);
         }
+        // The draft block: its pool after the blocks', and room in the step's
+        // buffers for the rows it computes there (`mtp.rs`).
+        let draft_sizes =
+            mtp::sizes(c, &w, opts, max_slots, pages, plan_config.target_blocks, pool);
+        let without_draft = (hq, hkv, state_slots);
+        if let Some(sizes) = &draft_sizes {
+            pool += sizes.pool;
+            hq = hq.max(sizes.kv_values);
+            hkv = hkv.max(sizes.kv_values);
+            state_slots = state_slots.max(sizes.attn_state);
+        }
         let page_bytes = pool / u64::from(pages.max(1));
 
         // The scratch of a step.
@@ -454,15 +566,21 @@ impl Part {
         s.rope = take(rows * rope_pairs * 8);
         let widest = d.max(vd).max(hq).max(f);
         let logit_rows = u64::from(opts.logit_rows);
+        // With room for the padding between the launches of `Part::in_batches`.
         s.act_q = take(
             Kernels::quantized_activation_bytes(widest as u32, opts.max_rows)
-                .max(Kernels::quantized_activation_bytes(d as u32, opts.logit_rows)),
+                .max(Kernels::quantized_activation_bytes(d as u32, opts.logit_rows))
+                .max(draft_sizes.as_ref().map_or(0, |sizes| sizes.act_q))
+                + 256,
         );
-        s.act_h = take(Kernels::prefill_activation_bytes(
-            PrefillPath::F16,
-            widest as u32,
-            opts.max_rows.max(opts.logit_rows),
-        ));
+        s.act_h = take(
+            Kernels::prefill_activation_bytes(
+                PrefillPath::F16,
+                widest as u32,
+                opts.max_rows.max(opts.logit_rows),
+            )
+            .max(draft_sizes.as_ref().map_or(0, |sizes| sizes.act_h)),
+        );
         s.picked = take(logit_rows * d * 4);
         let head_rows = w.head.as_ref().map_or(0, |(m, _)| u64::from(m.n_out));
         s.logits = take(logit_rows * head_rows * 4);
@@ -486,20 +604,43 @@ impl Part {
 
         // The records of the groups of a step: per group a header, its
         // segments, and a token and four positions per row.
-        let group_bytes = if placement.split == Split::Layer && opts.pipeline_rows > 0 {
+        let group_bytes = if placement.split != Split::Single && opts.pipeline_rows > 0 {
             let groups = u64::from(opts.max_rows.div_ceil(opts.pipeline_rows));
             (groups * (96 + 32 * u64::from(max_slots)) + 24 * rows).next_multiple_of(64)
         } else {
             64
         };
         ledger.reserve("qwen35 group records", group_bytes)?;
-        let has_attention = attention_at.iter().any(Option::is_some);
+        // Room for the attention plans of a step: one per group of rows and
+        // number of KV heads a block of this part has. A plan is a few dozen
+        // bytes per row and per item; one that does not fit is uploaded on
+        // its own (`Part::begin`), which makes the host wait for the device.
+        let plan_bytes = {
+            let mut heads: Vec<u32> =
+                attention_at.iter().flatten().map(|a| a.geo.kv_heads).collect();
+            heads.sort_unstable();
+            heads.dedup();
+            let groups = match (placement.split, opts.pipeline_rows) {
+                (Split::Single, _) | (_, 0) => 1,
+                (_, per) => u64::from(opts.max_rows.div_ceil(per)),
+            };
+            (heads.len() as u64 * (groups * (64 << 10) + 96 * rows)).next_multiple_of(64).max(64)
+        };
+        ledger.reserve("qwen35 attention plans", plan_bytes)?;
+        let has_attention = attention_at.iter().any(Option::is_some) || draft_sizes.is_some();
         let attention = has_attention.then(|| AttentionKernels::load(device)).transpose()?;
         let marks = opts.profile.as_ref().map(|profile| Marks {
             profile: profile.clone(),
             events: Vec::new(),
+            merges: Vec::new(),
             phases: Vec::new(),
         });
+        // What the step's buffers grew by for the draft block, at most: K and
+        // V of all its heads, queries as wide, partial states.
+        let draft_growth = rows * 4 * (2 * (hkv - without_draft.1) + 5 * (hq - without_draft.0))
+            + (state_slots - without_draft.2);
+        let mtp =
+            mtp::Mtp::open(c, device, ledger, &w, opts, max_slots, draft_sizes, draft_growth)?;
         let rope = &c.attention.rope;
         Ok(Self {
             index,
@@ -532,6 +673,8 @@ impl Part {
             tables: vec![0; max_slots as usize * table_stride as usize],
             plan_config,
             plans: Vec::new(),
+            plan_host: PinnedBuffer::new(device, plan_bytes as usize)?,
+            plan_device: DeviceBuffer::new(device, plan_bytes)?,
             groups: Vec::new(),
             group_host: PinnedBuffer::new(device, group_bytes as usize)?,
             group_records: DeviceBuffer::new(device, group_bytes)?,
@@ -540,8 +683,12 @@ impl Part {
             status_host: PinnedBuffer::new(device, 16)?,
             status_pending: false,
             marks,
-            rows_per_sum: (PUSH_MAX_VALUES / d as u32).clamp(1, opts.max_rows),
+            push_rows: (PUSH_MAX_VALUES / d as u32).clamp(1, opts.max_rows).min(PUSH_MAX_ROWS),
+            parcels: Vec::new(),
+            normed: Normed::No,
+            batched: std::cell::Cell::new(false),
             page_bytes,
+            mtp,
         })
     }
 
@@ -653,20 +800,39 @@ impl Part {
         Ok(())
     }
 
+    /// Notes that the last mark ended a merge of a tensor split.
+    fn mark_merge(&mut self) {
+        if let Some(marks) = &mut self.marks {
+            marks.merges.push(marks.phases.len().saturating_sub(1));
+        }
+    }
+
     /// Adds the marks of the last step to the profile. The step must have
     /// run: the next step's enqueue calls this, and a caller that reads the
     /// profile after the last step does.
     pub fn flush_profile(&mut self) -> Result<(), ModelError> {
+        self.draft_flush()?;
         let Some(marks) = &mut self.marks else { return Ok(()) };
         if marks.phases.len() > 1 {
-            let mut ms = [0.0f64; 5];
+            let mut ms = [0.0f64; 6];
+            let mut merges = Vec::with_capacity(marks.merges.len());
+            let (mut own, mut exchange, mut next) = (0.0f64, 0.0f64, 0);
             for i in 1..marks.phases.len() {
-                let elapsed = marks.events[i].elapsed_ms_since(&marks.events[i - 1])?;
-                ms[marks.phases[i] as usize] += f64::from(elapsed);
+                let elapsed = f64::from(marks.events[i].elapsed_ms_since(&marks.events[i - 1])?);
+                ms[marks.phases[i] as usize] += elapsed;
+                match marks.phases[i] {
+                    Phase::Exchange | Phase::Wait => exchange += elapsed,
+                    _ => own += elapsed,
+                }
+                if marks.merges.get(next) == Some(&i) {
+                    merges.push([own, exchange]);
+                    (own, exchange, next) = (0.0, 0.0, next + 1);
+                }
             }
-            marks.profile.add(self.index, &ms);
+            marks.profile.add(self.index, &ms, &merges);
         }
         marks.phases.clear();
+        marks.merges.clear();
         Ok(())
     }
 
@@ -688,9 +854,64 @@ impl Part {
         }
     }
 
+    /// Whether the products of `mats` with `n` rows are taken by the decode
+    /// kernels in several launches of up to [`MAX_BATCH`] rows each: a window
+    /// of a few more rows than one launch takes, where every matrix's decode
+    /// kernel still beats its tensor-core kernel. Where that is, is not
+    /// decided here: `Kernels::decode_kernel_rows` says it per weight type.
+    /// (The tensor-core kernels decode a whole matrix whatever the rows. On
+    /// Qwen3.8-27B over an RTX 4070 and an RTX 3060 that is a step of about
+    /// 80 ms from 9 to 24 rows, while the decode kernels take 36 ms for 8.)
+    fn in_batches(&self, mats: &[&Mat], n: u32) -> bool {
+        matches!(self.opts.precision, Precision::Fast)
+            && n > MAX_BATCH
+            && n.next_multiple_of(MAX_BATCH) <= self.opts.max_rows
+            && mats
+                .iter()
+                .all(|m| Kernels::decode_kernel_rows(m.ty).is_some_and(|limit| n <= limit))
+    }
+
+    /// The rows of each launch that writes or reads the quantized activations
+    /// of `n` rows of `n_in` values for `mats`, and where that launch's
+    /// activations are: all rows at `act_q`, or under [`Part::in_batches`]
+    /// first row, rows and place of every launch.
+    fn act_ranges(
+        &self,
+        mats: &[&Mat],
+        n_in: u32,
+        n: u32,
+    ) -> impl Iterator<Item = (u32, u32, DevicePtr)> + use<> {
+        let act_q = self.at(self.s.act_q);
+        let per = if self.in_batches(mats, n) { MAX_BATCH } else { n.max(1) };
+        let stride = Kernels::quantized_activation_bytes(n_in, per).next_multiple_of(64);
+        (0..n.div_ceil(per))
+            .map(move |b| (b * per, per.min(n - b * per), act_q.offset(u64::from(b) * stride)))
+    }
+
+    /// What the products with `mats` need beyond the quantized activations
+    /// that fused kernels have written at the places of [`Part::act_ranges`].
+    ///
+    /// # Safety
+    ///
+    /// The scratch must hold those activations of `n` rows of `n_in` values.
+    unsafe fn prepare_fused(
+        &self,
+        stream: &Stream,
+        n_in: u32,
+        n: u32,
+        mats: &[&Mat],
+    ) -> Result<(), ModelError> {
+        if self.in_batches(mats, n) {
+            self.batched.set(true);
+            return Ok(());
+        }
+        // SAFETY: not in batches, the activations are one layout at `act_q`.
+        unsafe { self.prepare(stream, self.at(self.s.act_q), n_in, n, mats, true) }
+    }
+
     /// Prepares `n` rows of `n_in` values at `x` for the products with
     /// `mats`: quantized into `act_q`, as f16 into `act_h`, or both. With
-    /// `fused`, `act_q` already holds the rows in the layout of the fused
+    /// `fused`, `act_q` already holds all rows in the one layout of the fused
     /// kernels and only the f16 form may be missing.
     ///
     /// # Safety
@@ -705,6 +926,16 @@ impl Part {
         mats: &[&Mat],
         fused: bool,
     ) -> Result<(), ModelError> {
+        self.batched.set(!fused && self.in_batches(mats, n));
+        if self.batched.get() {
+            for (first, rows, act) in self.act_ranges(mats, n_in, n) {
+                let at = x.offset(u64::from(first) * u64::from(n_in) * 4);
+                // SAFETY: the range is inside the caller's rows, and the
+                // scratch holds the quantized form of every launch.
+                unsafe { self.kernels.quantize_activations(stream, at, act, n_in, rows)? };
+            }
+            return Ok(());
+        }
         let (mut int8, mut f16) = (false, false);
         for m in mats {
             match self.path(m.ty, n)? {
@@ -751,6 +982,38 @@ impl Part {
         Ok(())
     }
 
+    /// The norm of the residual stream with `weight`, prepared for the
+    /// products with `mats`. Under a tensor split the merge in front of the
+    /// half block has normalised the rows already.
+    ///
+    /// # Safety
+    ///
+    /// `weight` must address `d` f32 values on the stream's device.
+    unsafe fn normed_input(
+        &mut self,
+        env: &StepEnv<'_>,
+        weight: DevicePtr,
+        mats: &[&Mat],
+    ) -> Result<(), ModelError> {
+        let (stream, n) = (env.stream, env.dims.n_rows);
+        let (x, xn) = (self.rows(self.s.x, self.d), self.rows(self.s.xn, self.d));
+        // SAFETY: `x` and `xn` hold the step's rows, `act_q` the quantized
+        // form of the widest input; the weight is the caller's guarantee.
+        unsafe {
+            match std::mem::take(&mut self.normed) {
+                Normed::No => {
+                    self.kernels.rms_norm_f32(stream, x, weight, xn, self.d, n, self.eps)?;
+                    self.mark(stream, Phase::Layers)?;
+                    self.prepare(stream, xn, self.d, n, mats, false)
+                }
+                Normed::Rows => self.prepare(stream, xn, self.d, n, mats, false),
+                Normed::Quantized => {
+                    self.prepare(stream, self.at(self.s.act_q), self.d, n, mats, true)
+                }
+            }
+        }
+    }
+
     /// `y = m x` for the `n` rows that [`Part::prepare`] prepared.
     ///
     /// # Safety
@@ -764,6 +1027,16 @@ impl Part {
         y: DevicePtr,
     ) -> Result<(), ModelError> {
         let w = self.w.mat(m);
+        if self.batched.get() {
+            for (first, rows, act) in self.act_ranges(&[m], m.n_in, n) {
+                let at = y.offset(u64::from(first) * u64::from(m.n_out) * 4);
+                // SAFETY: as below; the range is inside the caller's rows.
+                unsafe {
+                    self.kernels.matvec(stream, m.ty, w, act, at, m.n_in, m.n_out, rows)?;
+                }
+            }
+            return Ok(());
+        }
         // SAFETY: the matrix is in the arena as the file stores it and the
         // activations were prepared for this path by `prepare`.
         unsafe {
@@ -802,32 +1075,15 @@ impl Part {
 
     // --- exchange ----------------------------------------------------------------
 
-    /// Sums the partial result `p` of the step's rows across the devices
-    /// (tensor split) and adds it to the residual stream.
+    /// Adds the result `p` of a half block to the residual stream. (Under a
+    /// tensor split `p` is a partial result and the merges of
+    /// `Part::enqueue_tensor` do this.)
     fn merge(&mut self, env: &StepEnv<'_>) -> Result<(), ModelError> {
         let n = env.dims.n_rows;
         let (x, p) = (self.rows(self.s.x, self.d), self.rows(self.s.p, self.d));
-        if self.split == Split::Tensor {
-            self.sum(env, self.s.p)?;
-            self.mark(env.stream, Phase::Exchange)?;
-        }
         // SAFETY: `x` and `p` hold the step's rows of `d` values.
         unsafe { self.kernels.add_f32(env.stream, x, p, n * self.d)? };
         self.mark(env.stream, Phase::Layers)
-    }
-
-    fn sum(&self, env: &StepEnv<'_>, offset: u64) -> Result<(), ModelError> {
-        let exchange = env
-            .exchange
-            .ok_or_else(|| invalid("a tensor split needs the paths between devices"))?;
-        let mut row = 0;
-        while row < env.dims.n_rows {
-            let rows = self.rows_per_sum.min(env.dims.n_rows - row);
-            let at = self.at(offset).offset(u64::from(row) * u64::from(self.d) * 4);
-            exchange.sum(at, rows * self.d)?;
-            row += rows;
-        }
-        Ok(())
     }
 
     /// Zeroes the partial result: this device holds nothing of the part of the
@@ -898,6 +1154,7 @@ impl Part {
         self.flush_profile()?;
         self.plan_groups(env)?;
         self.plans.clear();
+        let mut planned = 0usize;
         let whole =
             [Group { first_row: 0, dims: env.dims, segments: env.segments.to_vec(), record: 0 }];
         let groups = if self.groups.is_empty() { &whole[..] } else { &self.groups[..] };
@@ -921,23 +1178,61 @@ impl Part {
                         self.s.attn_state_bytes
                     )));
                 }
-                self.plans.push((g, at.geo.kv_heads, plan.upload(&self.device)?));
+                // The plan goes to the device with the one copy below, which
+                // the stream orders in front of the step's kernels; nothing
+                // is allocated and the host does not wait.
+                let bytes = plan.layout().bytes as usize;
+                let buffers = match self.plan_host.get_mut(planned..planned + bytes) {
+                    Some(host) => {
+                        plan.write(host);
+                        let base = self.plan_device.ptr().offset(planned as u64);
+                        planned = (planned + bytes).next_multiple_of(64);
+                        // SAFETY: the copy below puts the plan's bytes at
+                        // `base` before any launch of the step reads them,
+                        // and the buffer lives as long as the part.
+                        unsafe { plan.on_device(base) }
+                    }
+                    None => plan.upload(&self.device)?,
+                };
+                self.plans.push((g, at.geo.kv_heads, buffers));
+            }
+        }
+        if planned > 0 {
+            // SAFETY: both buffers hold `planned` bytes (the plans were
+            // written inside the pinned one), and the pinned one is not
+            // written again before the next step, when this step has run.
+            unsafe {
+                env.stream.copy_from_host(
+                    self.plan_device.ptr(),
+                    self.plan_host.as_ptr(),
+                    planned,
+                )?;
             }
         }
         self.mark(env.stream, Phase::Other)
     }
 
-    /// Cuts a step of a layer split into groups of rows that are handed over
-    /// one by one, and enqueues the upload of their records. A step that
-    /// verifies drafts, or a short one, stays whole.
+    /// Cuts a step into groups of rows, which a layer split hands over one by
+    /// one and a tensor split sums one by one, and enqueues the upload of
+    /// their records. A step that verifies drafts, or a short one, stays
+    /// whole.
     fn plan_groups(&mut self, env: &StepEnv<'_>) -> Result<(), ModelError> {
         self.groups.clear();
-        let per = self.opts.pipeline_rows;
-        if self.split != Split::Layer
-            || per == 0
-            || env.dims.n_rows < 2 * per
-            || env.segments.iter().any(|s| !s.direct)
-        {
+        let n = env.dims.n_rows;
+        // A layer split hands over groups of `pipeline_rows` rows once there
+        // are two full ones; a tensor split cuts any step of more rows. The
+        // groups are full ones and a rest, not equal parts, so that all rows
+        // but the rest run at the size the parameter names: the tensor-core
+        // kernels are sensitive to it (Qwen3.8-27B on an RTX 4070 with an
+        // RTX 3060, the only cards measured: a prompt in groups of 171 rows
+        // is read at 1007 tokens per second and in groups of 256 at 1464).
+        let per = match (self.split, self.opts.pipeline_rows) {
+            (_, 0) | (Split::Single, _) => return Ok(()),
+            (Split::Layer, per) if n >= 2 * per => per,
+            (Split::Tensor, per) if n > per => per,
+            _ => return Ok(()),
+        };
+        if env.segments.iter().any(|s| !s.direct) {
             return Ok(());
         }
         let mut at = 0u64;
@@ -1010,7 +1305,12 @@ impl Part {
     pub fn enqueue(&mut self, env: &StepEnv<'_>) -> Result<Option<Logits>, ModelError> {
         self.begin(env)?;
         self.start_sequences(env)?;
-        if self.groups.is_empty() {
+        // The draft block's chains come first: the rows that verify their
+        // drafts read them from the step record.
+        self.draft_before(env)?;
+        if self.split == Split::Tensor {
+            self.enqueue_tensor(env)?;
+        } else if self.groups.is_empty() {
             self.enqueue_input(env)?;
             for i in 0..self.w.blocks.len() {
                 self.enqueue_block(env, i)?;
@@ -1048,6 +1348,7 @@ impl Part {
             result?;
         }
         let logits = self.enqueue_head(env)?;
+        self.draft_after(env)?;
         self.finish(env)?;
         Ok(logits)
     }
@@ -1101,6 +1402,7 @@ impl Part {
         if !std::mem::take(&mut self.has_deferred) {
             return Err(invalid("there is no draft window to commit"));
         }
+        self.draft_commit(stream, step, dims)?;
         let kept = self.kept.as_ref().ok_or_else(|| invalid("no draft windows were reserved"))?;
         let (conv_stride, delta_stride) =
             (self.slot_bytes / 4, self.slot_bytes / self.opts.state.bytes());
@@ -1164,7 +1466,6 @@ impl Part {
     fn enqueue_input(&mut self, env: &StepEnv<'_>) -> Result<(), ModelError> {
         let (stream, dims) = (env.stream, env.dims);
         let x = self.at(self.s.x);
-        let bytes = dims.n_rows as usize * self.d as usize * 4;
         if let Some(table) = &self.w.embedding {
             // SAFETY: the table is in the arena, `x` holds the step's rows.
             unsafe {
@@ -1181,21 +1482,8 @@ impl Part {
             }
             self.mark(stream, Phase::Layers)?;
         }
-        match self.split {
-            Split::Single => {}
-            Split::Tensor => {
-                if self.w.embedding.is_none() {
-                    // SAFETY: `x` holds the step's rows.
-                    unsafe { stream.fill(x, 0, bytes)? };
-                }
-                self.sum(env, self.s.x)?;
-                self.mark(stream, Phase::Exchange)?;
-            }
-            Split::Layer => {
-                if self.index > 0 {
-                    self.enqueue_receive(env)?;
-                }
-            }
+        if self.split == Split::Layer && self.index > 0 {
+            self.enqueue_receive(env)?;
         }
         self.enqueue_rope(env)
     }
@@ -1250,6 +1538,9 @@ impl Part {
 
     /// Enqueues block `i` of this part for the rows of the step.
     pub fn enqueue_block(&mut self, env: &StepEnv<'_>, i: usize) -> Result<(), ModelError> {
+        if self.split == Split::Tensor {
+            return Err(invalid("a block of a tensor split cannot be enqueued without its merges"));
+        }
         let block: BlockW = self.w.blocks[i].clone();
         match &block.mixer {
             MixerW::Recurrent(r) => {
@@ -1296,9 +1587,8 @@ impl Part {
                 self.rows(s.beta, shape.n_v_heads),
             ),
         };
-        let (x, xn) = (self.rows(s.x, self.d), self.rows(s.xn, self.d));
         let (z, o) = (self.rows(s.w2, shape.value_dim()), self.rows(s.o, shape.value_dim()));
-        let (q, act_q) = (self.rows(s.q, shape.key_dim()), self.at(s.act_q));
+        let q = self.rows(s.q, shape.key_dim());
         let conv_state = self.state.ptr().offset(at.conv);
         let delta_state = self.state.ptr().offset(at.delta);
         let (conv_stride, delta_stride) =
@@ -1308,17 +1598,7 @@ impl Part {
         // arena with a slot per sequence (segments checked in `check`); the
         // kept buffers hold `window_rows` rows, which bounds a deferred step.
         unsafe {
-            self.kernels.rms_norm_f32(
-                stream,
-                x,
-                self.w.at(block.attn_norm),
-                xn,
-                self.d,
-                n,
-                self.eps,
-            )?;
-            self.mark(stream, Phase::Layers)?;
-            self.prepare(stream, xn, self.d, n, &[&r.qkv, &r.z, &r.beta, &r.alpha], false)?;
+            self.normed_input(env, self.w.at(block.attn_norm), &[&r.qkv, &r.z, &r.beta, &r.alpha])?;
             self.product(stream, &r.qkv, n, qkv)?;
             self.product(stream, &r.z, n, z)?;
             self.product(stream, &r.beta, n, beta)?;
@@ -1363,19 +1643,22 @@ impl Part {
                 conv_state,
                 conv_stride,
             )?;
-            self.layers.gated_norm_quant(
-                stream,
-                OutputGate::Silu,
-                o,
-                z,
-                self.w.at(r.ssm_norm),
-                act_q,
-                n * shape.n_v_heads,
-                shape.head_dim,
-                self.eps,
-            )?;
+            for (first, rows, act) in self.act_ranges(&[&r.out], shape.value_dim(), n) {
+                let at = u64::from(first) * u64::from(shape.value_dim()) * 4;
+                self.layers.gated_norm_quant(
+                    stream,
+                    OutputGate::Silu,
+                    o.offset(at),
+                    z.offset(at),
+                    self.w.at(r.ssm_norm),
+                    act,
+                    rows * shape.n_v_heads,
+                    shape.head_dim,
+                    self.eps,
+                )?;
+            }
             self.mark(stream, Phase::Layers)?;
-            self.prepare(stream, act_q, shape.value_dim(), n, &[&r.out], true)?;
+            self.prepare_fused(stream, shape.value_dim(), n, &[&r.out])?;
             self.product(stream, &r.out, n, self.rows(s.p, self.d))?;
         }
         self.mark(stream, Phase::Weights)
@@ -1393,7 +1676,6 @@ impl Part {
         let kernels = self.attention.clone().ok_or_else(|| invalid("attention kernels"))?;
         let hd = at.geo.head_dim;
         let (hq, hkv) = (a.n_head * hd, a.n_kv * hd);
-        let (x, xn) = (self.rows(s.x, self.d), self.rows(s.xn, self.d));
         let (qg, k_raw, v) = (self.rows(s.w1, 2 * hq), self.rows(s.w2, hkv), self.rows(s.v, hkv));
         let (q, gate) = (self.rows(s.q, hq), self.rows(s.kv, hq));
         let (k, o) = (self.rows(s.k, hkv), self.rows(s.o, hq));
@@ -1404,17 +1686,7 @@ impl Part {
         // entries the plan names (the plan was built from their host copy)
         // and the pool the pages those entries name.
         unsafe {
-            self.kernels.rms_norm_f32(
-                stream,
-                x,
-                self.w.at(block.attn_norm),
-                xn,
-                self.d,
-                n,
-                self.eps,
-            )?;
-            self.mark(stream, Phase::Layers)?;
-            self.prepare(stream, xn, self.d, n, &[&a.q, &a.k, &a.v], false)?;
+            self.normed_input(env, self.w.at(block.attn_norm), &[&a.q, &a.k, &a.v])?;
             self.product(stream, &a.q, n, qg)?;
             self.product(stream, &a.k, n, k_raw)?;
             self.product(stream, &a.v, n, v)?;
@@ -1479,27 +1751,25 @@ impl Part {
         let (stream, n) = (env.stream, env.dims.n_rows);
         let s = self.s;
         let inner = f.gate.n_out;
-        let (x, xn) = (self.rows(s.x, self.d), self.rows(s.xn, self.d));
-        let (gate, up, act_q) = (self.rows(s.w1, inner), self.rows(s.w2, inner), self.at(s.act_q));
+        let (gate, up) = (self.rows(s.w1, inner), self.rows(s.w2, inner));
         // SAFETY: scratch and weights as in `recurrent`.
         unsafe {
-            self.kernels.rms_norm_f32(
-                stream,
-                x,
-                self.w.at(block.post_norm),
-                xn,
-                self.d,
-                n,
-                self.eps,
-            )?;
-            self.mark(stream, Phase::Layers)?;
-            self.prepare(stream, xn, self.d, n, &[&f.gate, &f.up], false)?;
+            self.normed_input(env, self.w.at(block.post_norm), &[&f.gate, &f.up])?;
             self.product(stream, &f.gate, n, gate)?;
             self.product(stream, &f.up, n, up)?;
             self.mark(stream, Phase::Weights)?;
-            self.layers.swiglu_quant(stream, gate, up, act_q, n * inner)?;
+            for (first, rows, act) in self.act_ranges(&[&f.down], inner, n) {
+                let at = u64::from(first) * u64::from(inner) * 4;
+                self.layers.swiglu_quant(
+                    stream,
+                    gate.offset(at),
+                    up.offset(at),
+                    act,
+                    rows * inner,
+                )?;
+            }
             self.mark(stream, Phase::Layers)?;
-            self.prepare(stream, act_q, inner, n, &[&f.down], true)?;
+            self.prepare_fused(stream, inner, n, &[&f.down])?;
             self.product(stream, &f.down, n, self.rows(s.p, self.d))?;
         }
         self.mark(stream, Phase::Weights)

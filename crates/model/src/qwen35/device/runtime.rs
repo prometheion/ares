@@ -6,17 +6,20 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use ares_api::{EngineError, ModelCard, Prompt, Role};
-use ares_cuda::{DevicePtr, ENTRY_CELLS, Segment, Stream};
+use ares_cuda::{DevicePtr, ENTRY_CELLS, PushSlot, Segment, Stream};
 use ares_gguf::Gguf;
 use ares_runtime::{
-    ContextSpec, DeviceContext, DeviceModel, LinkSpec, Links, Logits, Model, ModelError, Split,
-    StepContext,
+    ContextSpec, DeviceContext, DeviceModel, LinkSpec, Links, Logits, Model, ModelError, OwnDrafts,
+    Split, StepContext,
 };
 use ares_state::PageLayout;
 use ares_tokenizer::{ChatOptions, EncodeOptions, Message, Tokenizer};
 
-use super::part::{Exchange, Options, PAGE_ENTRY, Part, PartSetup, StepEnv, page_bytes};
-use super::placement::{Placement, PlacementError};
+use super::part::{
+    DraftBytes, DraftChain, DraftStep, Exchange, Options, PAGE_ENTRY, Part, PartSetup, StepEnv,
+    page_bytes,
+};
+use super::placement::{HalfShares, Placement, PlacementError};
 use crate::qwen35::{Config, Weights};
 
 /// How to spread the model over the devices.
@@ -26,6 +29,8 @@ pub enum Spread {
     Single,
     /// A tensor split with these shares per device.
     Tensor(Vec<f64>),
+    /// A tensor split with shares per half block, and these for the head.
+    TensorByHalf(Vec<f64>, HalfShares),
     /// A layer split with these shares of the weights' bytes per device.
     Layer(Vec<f64>),
 }
@@ -50,6 +55,8 @@ pub struct PartReport {
     pub kept_bytes: u64,
     /// K and V per page of 128 cells.
     pub page_bytes: u64,
+    /// What the model's draft block takes, on the device that holds it.
+    pub draft: Option<DraftBytes>,
 }
 
 /// Why a model could not be set up.
@@ -72,6 +79,8 @@ pub struct Qwen35 {
     tokenizer: Tokenizer,
     name: String,
     context: u32,
+    /// How chat prompts are rendered.
+    chat: ChatOptions,
     reports: Mutex<Vec<PartReport>>,
 }
 
@@ -103,9 +112,21 @@ impl Qwen35 {
             match spread {
                 Spread::Single => Placement::single(&config),
                 Spread::Tensor(shares) => Placement::tensor(&config, shares)?,
+                Spread::TensorByHalf(shares, halves) => {
+                    Placement::tensor_by_half(&config, shares, halves)?
+                }
                 Spread::Layer(shares) => Placement::layer(&config, &weights, shares)?,
             }
         };
+        // A model with a next-token-prediction block drafts with it wherever
+        // it can: when windows may carry drafts, and the embedding table and
+        // the first rows of the head are on one device (not a layer split).
+        let placement =
+            if config.n_nextn == 1 && options.window_rows > 1 && placement.split != Split::Layer {
+                placement.with_draft(&config, options.draft_vocabulary.as_deref())?
+            } else {
+                placement
+            };
         let tokenizer =
             Tokenizer::from_gguf(&gguf).map_err(|e| OpenError::Tokenizer(e.to_string()))?;
         let context = context.clamp(1, config.n_ctx as u32);
@@ -117,8 +138,17 @@ impl Qwen35 {
             tokenizer,
             name: name.into(),
             context,
+            chat: ChatOptions::default(),
             reports: Mutex::new(Vec::new()),
         })
+    }
+
+    /// Renders chat prompts with `options`: whether the model thinks, and the
+    /// variables a server passes to the chat template (`reasoning_effort`
+    /// and the like).
+    pub fn with_chat_options(mut self, options: ChatOptions) -> Self {
+        self.chat = options;
+        self
     }
 
     /// The model's configuration.
@@ -143,7 +173,7 @@ impl Qwen35 {
         reports
     }
 
-    /// The rows of one sum across the devices.
+    /// The most rows of a sum across the devices that is pushed.
     fn rows_per_sum(&self) -> u32 {
         (ares_cuda::PUSH_MAX_VALUES / self.config.n_embd as u32).clamp(1, self.options.max_rows)
     }
@@ -193,7 +223,7 @@ impl Model for Qwen35 {
                     .collect();
                 let text = self
                     .tokenizer
-                    .render_chat(&messages, &[], &ChatOptions::default())
+                    .render_chat(&messages, &[], &self.chat)
                     .map_err(|e| EngineError::InvalidRequest(format!("chat template: {e}")))?;
                 Ok(self
                     .tokenizer
@@ -230,6 +260,21 @@ impl Model for Qwen35 {
             0 => (1, o.max_rows),
             per => (o.max_rows.div_ceil(per), o.max_rows.min((2 * per - 1).max(o.window_rows))),
         };
+        if self.placement.split == Split::Tensor {
+            // A tensor split sums a long step in groups of at most
+            // `pipeline_rows` rows, each in a slot of its own, and any other
+            // step whole. A parcel is the wire form of a group's partial
+            // result, counted here in words of four bytes.
+            let rows = match o.pipeline_rows {
+                0 => o.max_rows,
+                per => o.max_rows.min(per.max(o.window_rows)),
+            };
+            return LinkSpec {
+                sum_values: self.rows_per_sum() * d,
+                lane_slots: parcels,
+                lane_values: ares_cuda::partial_wire_bytes(o.wire(), rows, d).div_ceil(4) as u32,
+            };
+        }
         LinkSpec {
             sum_values: self.rows_per_sum() * d,
             // A slot more than a step sends, so the sender is never held back
@@ -249,6 +294,13 @@ impl Model for Qwen35 {
 
     fn draft_rows(&self) -> u32 {
         self.options.window_rows
+    }
+
+    fn own_drafts(&self) -> u32 {
+        match self.placement.draft {
+            Some(_) => self.options.window_rows.saturating_sub(1),
+            None => 0,
+        }
     }
 
     fn page_entry(&self, page: u32) -> u32 {
@@ -302,8 +354,9 @@ impl Model for Qwen35 {
             scratch_bytes: part.scratch_bytes(),
             kept_bytes: part.kept_bytes(),
             page_bytes: part.page_bytes(),
+            draft: part.draft_bytes(),
         });
-        Ok(Box::new(Qwen35Device { part, segments: Vec::new() }))
+        Ok(Box::new(Qwen35Device { part, segments: Vec::new(), chains: Vec::new() }))
     }
 }
 
@@ -313,6 +366,8 @@ struct Qwen35Device {
     part: Part,
     /// The segments of the step, read from the record once.
     segments: Vec<Segment>,
+    /// The windows of the step whose drafts the model's draft block makes.
+    chains: Vec<DraftChain>,
 }
 
 /// The runtime's links as a part uses them.
@@ -323,8 +378,32 @@ struct LinkExchange<'a> {
 }
 
 impl Exchange for LinkExchange<'_> {
-    fn sum(&self, partial: DevicePtr, n: u32) -> Result<(), ModelError> {
-        self.links.sum(self.index, partial, n)
+    fn push_bytes(&self) -> u64 {
+        self.links.push_bytes()
+    }
+
+    fn push(&self) -> Result<PushSlot, ModelError> {
+        self.links.push(self.index)
+    }
+
+    fn slot_bytes(&self) -> u64 {
+        self.links.slot_bytes()
+    }
+
+    fn outbox(&self, slot: u32) -> Result<DevicePtr, ModelError> {
+        self.links.outbox(self.index, slot)
+    }
+
+    fn post(&self, slot: u32, bytes: u64) -> Result<(), ModelError> {
+        self.links.post(self.index, slot, bytes)
+    }
+
+    fn arrive(&self, slot: u32) -> Result<DevicePtr, ModelError> {
+        self.links.arrive(self.index, slot)
+    }
+
+    fn consumed(&self, slot: u32) -> Result<(), ModelError> {
+        self.links.consumed(self.index, slot)
     }
 
     fn send(&self, src: DevicePtr, n: u32) -> Result<(), ModelError> {
@@ -364,6 +443,31 @@ impl DeviceModel for Qwen35Device {
         }
         self.segments.clear();
         self.segments.extend((0..record.segments()).map(|i| record.segment(i)));
+        if self.part.has_draft_block() {
+            // The windows that take the block's drafts: each with its newest
+            // token and the settings of the rows that verify the drafts. All
+            // rows of a window are wanted, so the sampler rows of a window
+            // are consecutive; `wanted` counts the wanted rows before it.
+            self.chains.clear();
+            for (i, segment) in self.segments.iter().enumerate() {
+                if !record.own_drafts(i as u32) || segment.n_rows < 2 {
+                    continue;
+                }
+                let wanted: u32 = (0..record.runs())
+                    .map(|r| record.run(r))
+                    .map(|(first, count)| segment.row0.clamp(first, first + count) - first)
+                    .sum();
+                self.chains.push(DraftChain {
+                    segment: i as u32,
+                    token: record.row(segment.row0).token,
+                    rows: (0..segment.n_rows - 1).map(|j| record.sampler(wanted + j)).collect(),
+                });
+            }
+            self.part.draft_step(DraftStep {
+                tokens: step.record_on_device.offset(record.tokens_offset()),
+                chains: std::mem::take(&mut self.chains),
+            })?;
+        }
         let exchange = LinkExchange { links: step.links, index: step.index, stream: step.stream };
         self.part.enqueue(&StepEnv {
             stream: step.stream,
@@ -374,5 +478,19 @@ impl DeviceModel for Qwen35Device {
             pages: step.pages,
             exchange: (step.devices > 1).then_some(&exchange as &dyn Exchange),
         })
+    }
+
+    fn logit_tokens(&self) -> DevicePtr {
+        self.part.head_tokens()
+    }
+
+    fn own_drafts(&self) -> Option<OwnDrafts> {
+        self.part.drafted().map(|d| OwnDrafts { ptr: d.ptr, tokens: d.tokens })
+    }
+
+    fn own_draft_ms(&mut self) -> f64 {
+        // A failed read of the events is not worth failing the step for:
+        // the cost then stays what it was measured as before.
+        self.part.draft_chain_ms().unwrap_or(0.0)
     }
 }

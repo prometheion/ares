@@ -24,8 +24,9 @@ mod session;
 
 pub use harness::Harness;
 pub use part::{
-    Exchange, Options, PAGE_ENTRY, PHASES, Part, PartSetup, Phase, Profile, StepEnv, page_bytes,
+    DraftBytes, DraftChain, DraftStep, DraftTimes, Drafted, Exchange, Options, PAGE_ENTRY, PHASES,
+    Part, PartSetup, Phase, Profile, StepEnv, page_bytes,
 };
-pub use placement::{BlockSlice, DevicePlan, Placement, PlacementError};
+pub use placement::{BlockSlice, DevicePlan, DraftPlan, Placement, PlacementError};
 pub use runtime::{OpenError, PartReport, Qwen35, Spread};
 pub use session::{Rows, Session, StepTime, Wanted};

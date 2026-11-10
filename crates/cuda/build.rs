@@ -97,6 +97,7 @@ fn main() {
         ("attention.cu", "attention.fatbin", TENSOR_FLOOR),
         ("experts.cu", "experts.fatbin", FLOOR),
         ("q4.cu", "q4.fatbin", FLOOR),
+        ("sampler.cu", "sampler.fatbin", FLOOR),
     ];
     let children: Vec<_> = modules
         .iter()

@@ -14,7 +14,7 @@ use ares_core::{GgmlType, Ledger};
 use ares_cuda::{Device, DeviceBuffer, DevicePtr, RecurrentShape};
 use ares_runtime::ModelError;
 
-use super::placement::{BlockSlice, DevicePlan};
+use super::placement::{BlockSlice, DevicePlan, DraftPlan};
 use crate::qwen35::Config;
 use crate::qwen35::weights::{Matrix, Mixer, Weights};
 
@@ -91,6 +91,25 @@ pub(crate) struct BlockW {
     pub ffn: Option<FfnW>,
 }
 
+/// The model's draft block (its next-token-prediction block) on the device
+/// that holds it, whole.
+#[derive(Clone, Debug)]
+pub(crate) struct DraftW {
+    /// The projection of the embedding and the hidden state, as the two
+    /// matrices its columns make: `x = proj_e e' + proj_h h'`.
+    pub proj_e: Mat,
+    pub proj_h: Mat,
+    /// Offsets of the norm weights of the embedding, the hidden state and the
+    /// block's output.
+    pub enorm: u64,
+    pub hnorm: u64,
+    pub head_norm: u64,
+    /// The block itself: an attention block with all its heads.
+    pub block: BlockW,
+    /// The draft head: the first rows of the output head on this device.
+    pub head: Mat,
+}
+
 /// Where the bytes of a tensor on the device come from.
 enum Source<'g> {
     /// Stored bytes as they are.
@@ -102,6 +121,8 @@ enum Source<'g> {
     Columns(Matrix<'g>, Vec<Range<usize>>),
     /// f32 values.
     Floats(Vec<f32>),
+    /// u32 values.
+    Words(Vec<u32>),
 }
 
 fn row_bytes(m: &Matrix<'_>) -> usize {
@@ -118,6 +139,7 @@ impl Source<'_> {
                 m.rows() * ranges.iter().map(|r| r.len() / bv * bb).sum::<usize>()
             }
             Source::Floats(f) => f.len() * 4,
+            Source::Words(w) => w.len() * 4,
         }) as u64
     }
 
@@ -152,6 +174,11 @@ impl Source<'_> {
             Source::Floats(f) => {
                 staging.clear();
                 staging.extend(f.iter().flat_map(|v| v.to_le_bytes()));
+                arena.write(at, staging)?;
+            }
+            Source::Words(w) => {
+                staging.clear();
+                staging.extend(w.iter().flat_map(|v| v.to_le_bytes()));
                 arena.write(at, staging)?;
             }
         }
@@ -243,6 +270,11 @@ pub(crate) struct DeviceWeights {
     pub output_norm: u64,
     /// The rows of the output head on this device and the token of the first.
     pub head: Option<(Mat, u32)>,
+    /// The tokens of those rows (u32 each) when a draft vocabulary reorders
+    /// the head: the offset of the list in the arena.
+    pub head_tokens: Option<u64>,
+    /// The draft block, on the device that holds it.
+    pub draft: Option<DraftW>,
     /// How long the upload took.
     pub upload: Duration,
 }
@@ -263,13 +295,18 @@ impl DeviceWeights {
         self.arena.len()
     }
 
-    /// Lays out and uploads what `plan` gives this device.
+    /// Lays out and uploads what `plan` gives device `index`; `draft` is the
+    /// placement's draft block, whose device holds it and whose order of the
+    /// head's rows every device follows.
+    #[allow(clippy::too_many_arguments)]
     pub fn load(
         device: &Device,
         ledger: &mut Ledger,
         c: &Config,
         w: &Weights<'_>,
         plan: &DevicePlan,
+        draft: Option<&DraftPlan>,
+        index: usize,
     ) -> Result<Self, ModelError> {
         let mut layout = Layout::default();
         let mut blocks = Vec::new();
@@ -282,8 +319,23 @@ impl DeviceWeights {
             layout.row_range(m, 0..m.rows())
         });
         let output_norm = layout.floats(&w.output_norm);
+        let order = draft.and_then(|d| d.head_order.as_deref());
+        let mut head_tokens = None;
         let head = if plan.head.is_empty() {
             None
+        } else if let Some(order) = order {
+            // The rows of this device's tokens in the head's order, as runs of
+            // consecutive tokens.
+            let tokens = &order[plan.head.start as usize..plan.head.end as usize];
+            let mut runs: Vec<Range<usize>> = Vec::new();
+            for &token in tokens {
+                match runs.last_mut() {
+                    Some(run) if run.end == token as usize => run.end += 1,
+                    _ => runs.push(token as usize..token as usize + 1),
+                }
+            }
+            head_tokens = Some(layout.push(Source::Words(tokens.to_vec())));
+            Some((layout.rows(w.head(), runs), plan.head.start))
         } else {
             let m = w.head();
             let rows = plan.head.start as usize..plan.head.end as usize;
@@ -301,6 +353,15 @@ impl DeviceWeights {
             };
             Some((mat, plan.head.start))
         };
+        let draft = match (draft.filter(|d| d.device == index), &head) {
+            (Some(plan), Some((head, _))) => Some(draft_block(&mut layout, c, w, plan, head)?),
+            (Some(_), None) => {
+                return Err(ModelError::Invalid(
+                    "the draft block's device holds no row of the output head".into(),
+                ));
+            }
+            (None, _) => None,
+        };
 
         let bytes = layout.len.next_multiple_of(ALIGN).max(ALIGN);
         ledger.reserve("qwen35 weights", bytes)?;
@@ -310,8 +371,76 @@ impl DeviceWeights {
         for (at, source) in &layout.items {
             source.write(&arena, *at, &mut staging)?;
         }
-        Ok(Self { arena, blocks, embedding, output_norm, head, upload: begun.elapsed() })
+        Ok(Self {
+            arena,
+            blocks,
+            embedding,
+            output_norm,
+            head,
+            head_tokens,
+            draft,
+            upload: begun.elapsed(),
+        })
     }
+}
+
+/// Lays out the draft block: the model's next-token-prediction block with all
+/// its heads, and the draft head as the first rows of `head`.
+fn draft_block<'g>(
+    layout: &mut Layout<'g>,
+    c: &Config,
+    w: &Weights<'g>,
+    plan: &DraftPlan,
+    head: &Mat,
+) -> Result<DraftW, ModelError> {
+    let n = w.nextn.as_ref().ok_or_else(|| {
+        ModelError::Invalid("the model has no next-token-prediction block".into())
+    })?;
+    if n.embed_tokens.is_some() || n.shared_head_head.is_some() {
+        return Err(ModelError::Invalid(
+            "a next-token-prediction block with an embedding table or a head of its own is not \
+             implemented"
+                .into(),
+        ));
+    }
+    if plan.head_rows == 0 || plan.head_rows > head.n_out {
+        return Err(ModelError::Invalid(format!(
+            "a draft head of {} rows; the device holds {} rows of the head",
+            plan.head_rows, head.n_out
+        )));
+    }
+    let (d, ac) = (c.n_embd, &c.attention);
+    let (a, b) = (&n.attention, &n.block);
+    let attention = AttentionW {
+        n_head: ac.n_head as u32,
+        n_kv: ac.n_head_kv as u32,
+        q: layout.row_range(&a.q, 0..a.q.rows()),
+        k: layout.row_range(&a.k, 0..a.k.rows()),
+        v: layout.row_range(&a.v, 0..a.v.rows()),
+        out: layout.column_range(&a.out, 0..a.out.cols())?,
+        q_norm: layout.floats(&a.q_norm),
+        k_norm: layout.floats(&a.k_norm),
+    };
+    let ffn = FfnW {
+        gate: layout.row_range(&b.ffn_gate, 0..b.ffn_gate.rows()),
+        up: layout.row_range(&b.ffn_up, 0..b.ffn_up.rows()),
+        down: layout.column_range(&b.ffn_down, 0..b.ffn_down.cols())?,
+    };
+    Ok(DraftW {
+        proj_e: layout.column_range(&n.eh_proj, 0..d)?,
+        proj_h: layout.column_range(&n.eh_proj, d..2 * d)?,
+        enorm: layout.floats(&n.enorm),
+        hnorm: layout.floats(&n.hnorm),
+        head_norm: layout.floats(n.shared_head_norm.as_deref().unwrap_or(&w.output_norm)),
+        block: BlockW {
+            layer: c.n_layer,
+            attn_norm: layout.floats(&b.attn_norm),
+            post_norm: layout.floats(&b.post_attention_norm),
+            mixer: MixerW::Attention(attention),
+            ffn: Some(ffn),
+        },
+        head: Mat { n_out: plan.head_rows, ..*head },
+    })
 }
 
 fn block<'g>(

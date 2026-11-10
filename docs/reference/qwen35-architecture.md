@@ -204,7 +204,15 @@ x    = x + ffn(rms_norm(x) * post_attention_norm)             (4.5)
 logits = head( rms_norm(x) * (shared_head_norm, or output_norm when absent) )
 ```
 
-The reference parses and checks these tensors and does not run the block.
+The block's keys and values at a position depend on that position's input only, so it is
+run in two ways (**read**: `common_speculative_impl_draft_mtp`): over every position the
+model has computed, with the model's own `h` (zeros before position 0), which fills its
+cache; and as a chain that drafts, where link 0 reads the newest token and the `h` it was
+picked from, and each further link reads the token the link before picked and, in place
+of the model's `h`, the block's own output after its head norm. The reference runs both
+(`reference/mtp.rs`); on the hidden states of a llama.cpp run of the 27B its outputs are
+within 3 % (relative L2, what llama.cpp's 8-bit activations cost) of what the fork's block
+computes from the same hidden states, and its chains are the fork's token for token.
 
 ## 3. Conventions
 

@@ -10,7 +10,7 @@
 
 use ares_api::{EngineError, ModelCard, Prompt};
 use ares_core::Ledger;
-use ares_cuda::{Device, DevicePtr, Kernels, Stream};
+use ares_cuda::{Device, DevicePtr, Kernels, SampleParams, Stream};
 use ares_state::PageLayout;
 
 use crate::links::Links;
@@ -199,6 +199,16 @@ pub struct Logits {
     pub first_token: u32,
 }
 
+/// Where a device part left the tokens it drafted itself for the windows of a
+/// step: `tokens` u32 on the device, the drafts of each window with the
+/// record's own-drafts flag in the order of the record's segments, window
+/// after window. `u32::MAX` is a draft the part could not make.
+#[derive(Clone, Copy, Debug)]
+pub struct OwnDrafts {
+    pub ptr: DevicePtr,
+    pub tokens: u32,
+}
+
 /// One device's part of a model.
 pub trait DeviceModel: Send {
     /// The number of logits per row this device part produces (0 for a part
@@ -215,6 +225,25 @@ pub trait DeviceModel: Send {
     /// Returns where this device left the logits, or `None` for a device
     /// that holds no output head.
     fn enqueue(&mut self, step: &StepContext<'_>) -> Result<Option<Logits>, ModelError>;
+
+    /// The tokens of the columns of this part's logits, a u32 per column on
+    /// the device, when column `i` is not token `first_token + i`; null
+    /// otherwise.
+    fn logit_tokens(&self) -> DevicePtr {
+        DevicePtr::NULL
+    }
+
+    /// Where the step enqueued last left the tokens this part drafted itself
+    /// (a model with a draft block of its own); `None` when it drafted none.
+    fn own_drafts(&self) -> Option<OwnDrafts> {
+        None
+    }
+
+    /// Device milliseconds the part's own drafter took in the step that ran
+    /// last. Asked after that step has ended.
+    fn own_draft_ms(&mut self) -> f64 {
+        0.0
+    }
 }
 
 /// An architecture.
@@ -262,6 +291,20 @@ pub trait Model: Send + Sync + 'static {
     /// inputs of such a step's rows until the next step commits the accepted
     /// ones, so it bounds them.
     fn draft_rows(&self) -> u32;
+
+    /// How a request's tokens are picked where the request does not say: the
+    /// sampling settings that suit a model are the model's.
+    fn sampling(&self) -> SampleParams {
+        SampleParams::GREEDY
+    }
+
+    /// The most tokens the model drafts itself per sequence and step, with a
+    /// draft block of its own that runs on the devices; 0 for a model
+    /// without one. A window that takes them has the record's own-drafts
+    /// flag and no tokens for its draft rows.
+    fn own_drafts(&self) -> u32 {
+        0
+    }
 
     /// The page-table entry of pool page `page`, as the model's kernels read
     /// it (a model may mark which of its pools a page is in).

@@ -25,13 +25,16 @@ use std::time::{Duration, Instant};
 
 use ares_core::units::MIB;
 use ares_core::{Broker, Class, Growth, Ledger};
-use ares_cuda::{Device, DeviceBuffer, Event, Kernels, PinnedBuffer, Stream};
+use ares_cuda::{
+    Device, DeviceBuffer, Event, Kernels, PinnedBuffer, SampleBatch, SamplePick, SamplePlan,
+    SampleRow, SamplerKernels, Stream,
+};
 
 use crate::config::RuntimeConfig;
 use crate::error::RuntimeError;
 use crate::exec::{Clock, ExecError, Executor, Pick, StepMeta, StepOutput};
 use crate::links::Links;
-use crate::model::{DeviceContext, DeviceModel, Model, ModelError, StepContext};
+use crate::model::{DeviceContext, DeviceModel, Model, ModelError, Split, StepContext};
 use crate::record::{self, RecordView};
 use crate::sync::{Bell, WakeCounts, Woke};
 use crate::timing::DeviceTimes;
@@ -116,6 +119,8 @@ struct DeviceResult {
     /// One pick per wanted row, when this device has an output head.
     picks: Vec<Pick>,
     has_picks: bool,
+    drafts: Vec<u32>,
+    draft_ms: f64,
 }
 
 /// The hand-over between the conductor and one device thread.
@@ -202,8 +207,7 @@ impl GpuExecutor {
         // before it is taken.
         let mut broker = Broker::new("pinned RAM", config.pinned_limit);
         let consumer = broker.register("step record and read-back", Class::Required)?;
-        let readback =
-            devices.len() as u64 * u64::from(model.logit_rows()) * u64::from(model.vocab()) * 4;
+        let readback = devices.len() as u64 * read_back_bytes(model.logit_rows(), max_rows) as u64;
         match broker.grow(&consumer, record_bytes as u64 + readback)? {
             Growth::Granted => {}
             Growth::Reclaim(_) => unreachable!("nobody else holds page-locked memory"),
@@ -213,7 +217,15 @@ impl GpuExecutor {
             .iter()
             .map(|d| Stream::new(d, 0).map(Arc::new))
             .collect::<Result<Vec<_>, _>>()?;
-        let links = Arc::new(Links::new(model.split(), &devices, &streams, model.links())?);
+        // The devices of a tensor split also add up the sampler's partial
+        // results (each holds the logits of a slice of the vocabulary).
+        let mut link_spec = model.links();
+        if model.split() == Split::Tensor {
+            link_spec.sum_values = link_spec
+                .sum_values
+                .max(SamplerKernels::exchange_values(model.logit_rows(), devices.len() as u32));
+        }
+        let links = Arc::new(Links::new(model.split(), &devices, &streams, link_spec)?);
         let record = Arc::new(PinnedRecord::new(&devices[0], record_bytes)?);
         let shared = Arc::new(Shared {
             done: Bell::new(),
@@ -318,6 +330,8 @@ impl Executor for GpuExecutor {
         self.seen = count;
         self.in_flight = false;
         out.picks.clear();
+        out.drafts.clear();
+        out.draft_ms = 0.0;
         out.devices.clear();
         let mut have_picks = false;
         for (device, handle) in self.handles.iter().enumerate() {
@@ -326,14 +340,16 @@ impl Executor for GpuExecutor {
                 return Err(ExecError::Device { device, message: message.clone() });
             }
             out.devices.push(result.times);
-            if result.has_picks {
-                if have_picks {
-                    merge_picks(&mut out.picks, &result.picks);
-                } else {
-                    out.picks.extend_from_slice(&result.picks);
-                    have_picks = true;
-                }
+            // The devices of a tensor split all end with the same picks (the
+            // sampler joins their slices of the vocabulary on the devices).
+            if result.has_picks && !have_picks {
+                out.picks.extend_from_slice(&result.picks);
+                have_picks = true;
             }
+            if !result.drafts.is_empty() {
+                out.drafts.extend_from_slice(&result.drafts);
+            }
+            out.draft_ms += result.draft_ms;
         }
         Ok(woke)
     }
@@ -367,31 +383,10 @@ impl Drop for GpuExecutor {
     }
 }
 
-/// The best pick of two devices that each hold a slice of the vocabulary:
-/// the higher logit, the lower token on a tie.
-fn merge_picks(into: &mut [Pick], other: &[Pick]) {
-    assert_eq!(into.len(), other.len(), "devices bring back the same rows");
-    for (mine, theirs) in into.iter_mut().zip(other) {
-        if theirs.logit > mine.logit || (theirs.logit == mine.logit && theirs.token < mine.token) {
-            *mine = *theirs;
-        }
-    }
-}
-
-/// The arg-max of one row of logits. A value that is not finite means a sum
-/// or a kernel went wrong, and is an error rather than a pick.
-fn arg_max(row: &[u8], first_token: u32) -> Result<Pick, String> {
-    let mut best = Pick { token: first_token, logit: f32::NEG_INFINITY };
-    for (i, bytes) in row.as_chunks::<4>().0.iter().enumerate() {
-        let value = f32::from_le_bytes(*bytes);
-        if !value.is_finite() {
-            return Err(format!("logit {} is {value}", first_token as usize + i));
-        }
-        if value > best.logit {
-            best = Pick { token: first_token + i as u32, logit: value };
-        }
-    }
-    Ok(best)
+/// The bytes a device brings back from a step at most: the pick of every
+/// wanted row, and the tokens the model drafted itself.
+fn read_back_bytes(logit_rows: u32, max_rows: u32) -> usize {
+    logit_rows as usize * SamplePick::BYTES + max_rows as usize * 4
 }
 
 // --- the device thread ---------------------------------------------------
@@ -413,16 +408,35 @@ struct Worker {
     /// The state pages, if the model keeps any.
     pages: Option<DeviceBuffer>,
     bytes_per_page: u64,
-    logits_host: Option<PinnedBuffer>,
-    /// The most rows of a step whose logits the read-back buffer holds.
+    /// The sampler: the picks are made on the device, from the logits the
+    /// model's part left there.
+    sampler: SamplerKernels,
+    /// Its scratch, the partial results the devices of a tensor split add
+    /// up, and the picks.
+    sample_scratch: DeviceBuffer,
+    sample_exchange: DeviceBuffer,
+    sample_out: DeviceBuffer,
+    /// The devices that each hold a slice of the vocabulary, and which of
+    /// them this is.
+    sample_devices: u32,
+    sample_rank: u32,
+    sample_rows: Vec<SampleRow>,
+    /// What comes back: the picks, then the model's own drafts.
+    back: PinnedBuffer,
+    /// The most rows of a step whose logits are wanted.
     logit_rows: u32,
+    max_rows: u32,
     start: Event,
+    /// In front of the sampler's kernels.
+    sample_start: Event,
     ends: [Event; 2],
     /// Which of `ends` the next step records.
     next_end: usize,
     have_previous: bool,
     clock: Clock,
     picks: Vec<Pick>,
+    drafts: Vec<u32>,
+    draft_ms: f64,
 }
 
 fn worker_main(init: Init, ready: mpsc::Sender<Result<(), RuntimeError>>) {
@@ -461,6 +475,8 @@ fn worker_main(init: Init, ready: mpsc::Sender<Result<(), RuntimeError>>) {
                             result.times = times;
                             result.has_picks = produced;
                             std::mem::swap(&mut result.picks, &mut worker.picks);
+                            std::mem::swap(&mut result.drafts, &mut worker.drafts);
+                            result.draft_ms = worker.draft_ms;
                         }
                         Err(error) => {
                             result.error = Some(error.to_string());
@@ -526,11 +542,23 @@ impl Worker {
                 ModelError::Memory(e) => RuntimeError::Memory(e),
                 other => RuntimeError::Model(other),
             })?;
-        let per_row = part.logits_per_row();
         let logit_rows = model.logit_rows();
-        let logits_host = (per_row > 0)
-            .then(|| PinnedBuffer::new(&device, logit_rows as usize * per_row as usize * 4))
-            .transpose()?;
+        let tensor = model.split() == Split::Tensor;
+        if tensor && part.logits_per_row() == 0 {
+            return Err(RuntimeError::Config(format!(
+                "device {index} of a tensor split holds no slice of the vocabulary"
+            )));
+        }
+        let sample_devices = if tensor { devices as u32 } else { 1 };
+        let scratch_bytes = SamplerKernels::scratch_bytes(logit_rows);
+        let exchange_bytes =
+            u64::from(SamplerKernels::exchange_values(logit_rows, sample_devices)) * 4;
+        let out_bytes = u64::from(logit_rows) * SamplePick::BYTES as u64;
+        ledger.reserve("sampler", scratch_bytes + exchange_bytes + out_bytes)?;
+        let sampler = SamplerKernels::load(&device)?;
+        let sample_scratch = DeviceBuffer::new(&device, scratch_bytes)?;
+        // SAFETY: the buffer has the size the sampler asks for.
+        unsafe { sampler.clear(&stream, sample_scratch.ptr(), logit_rows)? };
         let worker = Self {
             index,
             devices,
@@ -542,13 +570,24 @@ impl Worker {
             max_slots: config.max_slots,
             pages: (page_bytes > 0).then(|| DeviceBuffer::new(&device, page_bytes)).transpose()?,
             bytes_per_page: page_bytes / u64::from(config.pages.max(1)),
-            logits_host,
+            sampler,
+            sample_scratch,
+            sample_exchange: DeviceBuffer::new(&device, exchange_bytes)?,
+            sample_out: DeviceBuffer::new(&device, out_bytes)?,
+            sample_devices,
+            sample_rank: if tensor { index as u32 } else { 0 },
+            sample_rows: Vec::with_capacity(logit_rows as usize),
+            back: PinnedBuffer::new(&device, read_back_bytes(logit_rows, max_rows))?,
             logit_rows,
+            max_rows,
             start: Event::timed(&device)?,
+            sample_start: Event::timed(&device)?,
             ends: [Event::timed(&device)?, Event::timed(&device)?],
             next_end: 0,
             have_previous: false,
             picks: Vec::with_capacity(max_rows as usize),
+            drafts: Vec::with_capacity(max_rows as usize),
+            draft_ms: 0.0,
             device,
             stream,
             kernels,
@@ -636,7 +675,8 @@ impl Worker {
             links: &self.links,
         })?;
 
-        // The read-back of the rows whose logits are wanted.
+        // The picks of the rows whose logits are wanted, made on the device,
+        // and their read-back with the tokens the model drafted itself.
         let picked = view.picked_rows();
         if picked > self.logit_rows {
             return Err(ModelError::Invalid(format!(
@@ -644,15 +684,61 @@ impl Worker {
                 self.logit_rows
             )));
         }
-        if let (Some(logits), Some(host)) = (logits, self.logits_host.as_mut()) {
-            // SAFETY: the model left a row of `stride` values per wanted
-            // row, and the read-back buffer holds `logit_rows` such rows; it
-            // is not read before the step has finished.
+        let produced = logits.is_some() && picked > 0;
+        if let (Some(logits), true) = (logits, picked > 0) {
+            self.sample_rows.clear();
+            self.sample_rows.extend((0..picked).map(|i| view.sampler(i)));
+            let tokens = self.model.logit_tokens();
+            let batch = SampleBatch {
+                logits: logits.ptr,
+                stride: logits.stride,
+                n_rows: picked,
+                capacity: self.logit_rows,
+                n_local: logits.stride,
+                tokens,
+                first: if tokens == ares_cuda::DevicePtr::NULL { logits.first_token } else { 0 },
+                params: self.record_device.ptr().offset(view.samplers_offset()),
+                out: self.sample_out.ptr(),
+                scratch: self.sample_scratch.ptr(),
+                exchange: self.sample_exchange.ptr(),
+                devices: self.sample_devices,
+                rank: self.sample_rank,
+            };
+            let (links, rank) = (&self.links, self.index);
+            self.sample_start.record(stream)?;
+            // SAFETY: the model left a row of `stride` logits per wanted row
+            // (and a token per column when it has a list); the record on the
+            // device holds a sampler row per wanted row; the sampler's
+            // buffers were sized for `logit_rows` rows.
+            unsafe {
+                self.sampler.sample(
+                    stream,
+                    &batch,
+                    SamplePlan::of(&self.sample_rows),
+                    |ptr, n| links.sum(rank, ptr, n),
+                )?;
+                stream.copy_to_host(
+                    self.back.as_mut_ptr(),
+                    self.sample_out.ptr(),
+                    picked as usize * SamplePick::BYTES,
+                )?;
+            }
+        }
+        let own = self.model.own_drafts().filter(|own| own.tokens > 0);
+        if let Some(own) = own {
+            if own.tokens > self.max_rows {
+                return Err(ModelError::Invalid(format!(
+                    "the model drafted {} tokens in a step of at most {} rows",
+                    own.tokens, self.max_rows
+                )));
+            }
+            // SAFETY: the model left `tokens` u32 there; the read-back buffer
+            // holds a draft per row of a step after the picks.
             unsafe {
                 stream.copy_to_host(
-                    host.as_mut_ptr(),
-                    logits.ptr,
-                    picked as usize * logits.stride as usize * 4,
+                    self.back.as_mut_ptr().add(self.logit_rows as usize * SamplePick::BYTES),
+                    own.ptr,
+                    own.tokens as usize * 4,
                 )?;
             }
         }
@@ -674,65 +760,40 @@ impl Worker {
         self.have_previous = true;
         self.next_end = 1 - self.next_end;
 
-        // The arg-max of each row that came back.
+        // What came back. The time of the picks is the sampler's on the
+        // device (to the end of the step: its read-back follows it) and the
+        // host's to read them.
+        let sampler_ns = if produced {
+            (f64::from(end.elapsed_ms_since(&self.sample_start)?) * 1e6) as u64
+        } else {
+            0
+        };
         let pick_begun = Instant::now();
         self.picks.clear();
-        let produced = logits.is_some() && self.logits_host.is_some();
-        if let (Some(logits), Some(host)) = (logits, self.logits_host.as_ref()) {
-            let row_bytes = logits.stride as usize * 4;
-            for row in 0..view.picked_rows() as usize {
-                let pick =
-                    arg_max(&host[row * row_bytes..(row + 1) * row_bytes], logits.first_token)
-                        .map_err(|e| ModelError::Invalid(format!("row {row}: {e}")))?;
-                self.picks.push(pick);
+        self.drafts.clear();
+        if produced {
+            for row in 0..picked as usize {
+                let pick = SamplePick::from_bytes(&self.back[row * SamplePick::BYTES..]);
+                // A logit that is not finite means a sum or a kernel went
+                // wrong, and is an error rather than a pick.
+                if pick.status != 0 || pick.token == u32::MAX {
+                    return Err(ModelError::Invalid(format!(
+                        "row {row}: the sampler reported status {:#x} (1: a logit that is not \
+                         finite, 2: no token to pick)",
+                        pick.status
+                    )));
+                }
+                self.picks.push(Pick { token: pick.token, logit: pick.value });
             }
         }
-        times.pick_ns = pick_begun.elapsed().as_nanos() as u64;
+        if let Some(own) = own {
+            let at = self.logit_rows as usize * SamplePick::BYTES;
+            let bytes = &self.back[at..at + own.tokens as usize * 4];
+            self.drafts.extend(bytes.as_chunks::<4>().0.iter().map(|b| u32::from_le_bytes(*b)));
+        }
+        self.draft_ms = self.model.own_draft_ms();
+        times.pick_ns = sampler_ns + pick_begun.elapsed().as_nanos() as u64;
         times.finished_at_ns = self.clock.now_ns();
         Ok((times, produced))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn bytes(values: &[f32]) -> Vec<u8> {
-        values.iter().flat_map(|v| v.to_le_bytes()).collect()
-    }
-
-    #[test]
-    fn the_pick_is_the_largest_logit_and_the_lowest_token_on_a_tie() {
-        let pick = arg_max(&bytes(&[0.5, -1.0, 3.0, 3.0, 2.0]), 100).unwrap();
-        assert_eq!(pick, Pick { token: 102, logit: 3.0 });
-        assert_eq!(arg_max(&bytes(&[-5.0, -2.0]), 0).unwrap().token, 1, "all negative still picks");
-    }
-
-    #[test]
-    fn a_logit_that_is_not_a_number_is_an_error_and_not_a_pick() {
-        let error = arg_max(&bytes(&[1.0, f32::NAN, 2.0]), 10).unwrap_err();
-        assert!(error.contains("11") && error.contains("NaN"), "{error}");
-        assert!(arg_max(&bytes(&[f32::INFINITY]), 0).is_err());
-    }
-
-    #[test]
-    fn devices_with_slices_of_the_vocabulary_agree_on_the_best_of_all() {
-        // Two devices, three rows. Device 1's slice starts at token 100.
-        let mut best = vec![
-            Pick { token: 5, logit: 1.0 },
-            Pick { token: 7, logit: 2.0 },
-            Pick { token: 9, logit: 3.0 },
-        ];
-        let other = [
-            Pick { token: 105, logit: 4.0 },
-            Pick { token: 107, logit: 2.0 },
-            Pick { token: 109, logit: 0.0 },
-        ];
-        merge_picks(&mut best, &other);
-        assert_eq!(best.iter().map(|p| p.token).collect::<Vec<_>>(), [105, 7, 9]);
-        // On an equal logit the lower token wins, whichever device has it.
-        let mut best = vec![Pick { token: 105, logit: 2.0 }];
-        merge_picks(&mut best, &[Pick { token: 5, logit: 2.0 }]);
-        assert_eq!(best[0].token, 5);
     }
 }

@@ -154,8 +154,8 @@ pub struct Layer<'g> {
 }
 
 /// The block that predicts the token after next (multi-token prediction), the
-/// last block of a file whose `nextn_predict_layers` is 1. The reference does
-/// not run it; the table only checks that it is there as described.
+/// last block of a file whose `nextn_predict_layers` is 1. The reference runs
+/// it in `reference/mtp.rs`.
 #[derive(Clone, Debug)]
 pub struct NextnWeights<'g> {
     /// An attention block with its norms and feed-forward part.

@@ -51,6 +51,7 @@ use ares_core::GgmlType;
 use crate::device::Device;
 use crate::error::{Error, Result};
 use crate::memory::DevicePtr;
+use crate::mesh::{PUSH_MAX_ROWS, PushSlot};
 use crate::module::{Args, Function, Module};
 use crate::stream::Stream;
 
@@ -372,6 +373,9 @@ pub struct LayerKernels {
     attn_prep: Function,
     gated_norm_quant: Function,
     swiglu_quant: Function,
+    partial_to_wire: Function,
+    merge_wire: Function,
+    merge_push: Function,
     conv_window: Function,
     conv_commit: Function,
     delta_fork: Function,
@@ -429,6 +433,9 @@ impl LayerKernels {
             attn_prep: module.function("ares_attn_prep")?,
             gated_norm_quant: module.function("ares_gated_norm_quant")?,
             swiglu_quant: module.function("ares_swiglu_quant")?,
+            partial_to_wire: module.function("ares_partial_to_wire")?,
+            merge_wire: module.function("ares_merge_wire")?,
+            merge_push: module.function("ares_merge_push")?,
             conv_window: module.function("ares_conv_window")?,
             conv_commit: module.function("ares_conv_commit")?,
             delta_fork: module.function("ares_delta_window_fork_f32")?,
@@ -1130,6 +1137,232 @@ impl LayerKernels {
         unsafe {
             self.swiglu_quant.launch(stream, [threads.div_ceil(256), 1, 1], [256, 1, 1], 0, args)
         }
+    }
+}
+
+/// What a merge of a tensor split does with the residual stream after it
+/// added the devices' partial results to it (`kernels/layer_merge.cuh`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum MergeNorm {
+    /// Nothing.
+    None,
+    /// The RMS norm with `weight`, as f32 rows at `out`.
+    Rows { weight: DevicePtr, out: DevicePtr },
+    /// The RMS norm with `weight`, quantized into `act` for the weight
+    /// kernels: the layout of `Kernels::quantize_activations` over all rows
+    /// ([`quantized_activation_bytes`] bytes).
+    Quantized { weight: DevicePtr, act: DevicePtr },
+}
+
+impl MergeNorm {
+    /// The kernels' arguments: weight, rows, activations, and the mode with
+    /// the bit for the wide wire form.
+    fn args(self, wire: Wire) -> (DevicePtr, DevicePtr, DevicePtr, u32) {
+        let wide = match wire {
+            Wire::F16 => 0,
+            Wire::F32 => 256,
+        };
+        match self {
+            Self::None => (DevicePtr::NULL, DevicePtr::NULL, DevicePtr::NULL, wide),
+            Self::Rows { weight, out } => (weight, out, DevicePtr::NULL, 1 | wide),
+            Self::Quantized { weight, act } => (weight, DevicePtr::NULL, act, 2 | wide),
+        }
+    }
+}
+
+/// How a partial result crosses between the devices of a tensor split.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Wire {
+    /// As f16, each row with a power of two that keeps it in range: half the
+    /// bytes, and every value rounded to 11 bits.
+    F16,
+    /// As f32: the exact sum.
+    F32,
+}
+
+/// The bytes `n_rows` rows of `d` values take on the wire between the devices
+/// of a tensor split: the rows and one f32 factor per row.
+pub fn partial_wire_bytes(wire: Wire, n_rows: u32, d: u32) -> u64 {
+    let values = u64::from(n_rows) * u64::from(d);
+    let rows = match wire {
+        Wire::F16 => (values * 2).next_multiple_of(4),
+        Wire::F32 => values * 4,
+    };
+    rows + u64::from(n_rows) * 4
+}
+
+/// The widest row the merge kernels take.
+pub const MERGE_MAX_WIDTH: u32 = 16 * MERGE_RESIDENT * 1024;
+
+/// float4 chunks a thread of the merge kernels keeps in registers
+/// (`ARES_MERGE_RESIDENT`).
+const MERGE_RESIDENT: u32 = 6;
+
+/// The threads per row of the merge kernels for rows of `d` values.
+fn merge_threads(what: &'static str, d: u32) -> Result<u32> {
+    if d == 0 || !d.is_multiple_of(32) || d > MERGE_MAX_WIDTH {
+        return Err(invalid(
+            what,
+            format!("rows of {d} values (a multiple of 32 up to {MERGE_MAX_WIDTH})"),
+        ));
+    }
+    Ok((d / 4).div_ceil(MERGE_RESIDENT).next_multiple_of(32).max(256))
+}
+
+/// The merges of a tensor split.
+impl LayerKernels {
+    /// Writes the wire form `form` of `n_rows` rows of `d` f32 values at `p`
+    /// to `wire` ([`partial_wire_bytes`] bytes).
+    ///
+    /// # Safety
+    ///
+    /// `p` must address `n_rows * d` f32 values and `wire` the bytes above,
+    /// both 16-byte aligned, on the stream's device.
+    pub unsafe fn partial_to_wire(
+        &self,
+        stream: &Stream,
+        form: Wire,
+        p: DevicePtr,
+        wire: DevicePtr,
+        n_rows: u32,
+        d: u32,
+    ) -> Result<()> {
+        let threads = merge_threads("partial to wire", d)?;
+        check_align("partial to wire", p, 16)?;
+        check_align("partial to wire", wire, 16)?;
+        if n_rows == 0 {
+            return Ok(());
+        }
+        let args =
+            Args::new().ptr(p).ptr(wire).u32(n_rows).u32(d).u32(u32::from(form == Wire::F32));
+        // SAFETY: the argument list matches ares_partial_to_wire.
+        unsafe { self.partial_to_wire.launch(stream, [n_rows, 1, 1], [threads, 1, 1], 0, args) }
+    }
+
+    /// `x += ` the sum of all devices' partials of `n_rows` rows of `d`
+    /// values, then what `norm` says. The partials are in wire form `form`: this
+    /// device's at `own`, the `n_peers` others' in device order at `peers`,
+    /// `peer_stride` bytes apart; `own_rank` is this device's place in that
+    /// order. Every device that merges the same partials gets the same bits.
+    ///
+    /// # Safety
+    ///
+    /// `x` must address `n_rows * d` f32 values, `own` and every peer region
+    /// [`partial_wire_bytes`] bytes, and the buffers of `norm` what it says,
+    /// all 16-byte aligned, on the stream's device.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn merge_wire(
+        &self,
+        stream: &Stream,
+        form: Wire,
+        x: DevicePtr,
+        own: DevicePtr,
+        peers: DevicePtr,
+        peer_stride: u64,
+        n_peers: u32,
+        own_rank: u32,
+        n_rows: u32,
+        d: u32,
+        norm: MergeNorm,
+        eps: f32,
+    ) -> Result<()> {
+        let threads = merge_threads("merge", d)?;
+        if n_peers >= 8 || own_rank > n_peers || !peer_stride.is_multiple_of(16) {
+            return Err(invalid(
+                "merge",
+                format!(
+                    "device {own_rank} of {} with regions {peer_stride} bytes apart",
+                    n_peers + 1
+                ),
+            ));
+        }
+        let (weight, xn, act, mode) = norm.args(form);
+        for ptr in [x, own, peers, weight, xn, act] {
+            check_align("merge", ptr, 16)?;
+        }
+        if n_rows == 0 {
+            return Ok(());
+        }
+        let args = Args::new()
+            .ptr(x)
+            .ptr(own)
+            .ptr(peers)
+            .u64(peer_stride)
+            .u32(n_peers)
+            .u32(own_rank)
+            .u32(n_rows)
+            .u32(d)
+            .ptr(weight)
+            .ptr(xn)
+            .ptr(act)
+            .f32(eps)
+            .u32(mode);
+        // SAFETY: the argument list matches ares_merge_wire.
+        unsafe { self.merge_wire.launch(stream, [n_rows, 1, 1], [threads, 1, 1], 0, args) }
+    }
+
+    /// `x += p + ` the peer's `p`, both rounded as the wire form `form` rounds,
+    /// then what `norm` says: the merge of two devices with peer access in one
+    /// kernel per device, for up to [`PUSH_MAX_ROWS`] rows. `slot` is this
+    /// device's [`Mesh::push`](crate::Mesh::push) of the sum and `own_first`
+    /// whether this device is the first of the two.
+    ///
+    /// # Safety
+    ///
+    /// `p` and `x` must address `n_rows * d` f32 values and the buffers of
+    /// `norm` what it says, all 16-byte aligned, on the stream's device. The
+    /// peer must enqueue the same merge with its push of the same number.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn merge_push(
+        &self,
+        stream: &Stream,
+        form: Wire,
+        p: DevicePtr,
+        x: DevicePtr,
+        slot: PushSlot,
+        own_first: bool,
+        n_rows: u32,
+        d: u32,
+        norm: MergeNorm,
+        eps: f32,
+    ) -> Result<()> {
+        let threads = merge_threads("merge push", d)?;
+        if n_rows > PUSH_MAX_ROWS || partial_wire_bytes(form, n_rows, d) > slot.bytes {
+            return Err(invalid(
+                "merge push",
+                format!(
+                    "{n_rows} rows of {d} values; a push takes {PUSH_MAX_ROWS} rows and {} bytes",
+                    slot.bytes
+                ),
+            ));
+        }
+        let (weight, xn, act, mode) = norm.args(form);
+        for ptr in [p, x, weight, xn, act] {
+            check_align("merge push", ptr, 16)?;
+        }
+        if n_rows == 0 {
+            return Ok(());
+        }
+        let args = Args::new()
+            .ptr(p)
+            .ptr(x)
+            .ptr(slot.peer_recv)
+            .ptr(slot.peer_flags)
+            .ptr(slot.own_recv)
+            .ptr(slot.own_flags)
+            .u32(PUSH_MAX_ROWS)
+            .u32(slot.token)
+            .u32(u32::from(own_first))
+            .u32(n_rows)
+            .u32(d)
+            .ptr(weight)
+            .ptr(xn)
+            .ptr(act)
+            .f32(eps)
+            .u32(mode);
+        // SAFETY: the argument list matches ares_merge_push; the slot's
+        // pointers are the mesh's buffers on this device and its peer.
+        unsafe { self.merge_push.launch(stream, [n_rows, 1, 1], [threads, 1, 1], 0, args) }
     }
 }
 
