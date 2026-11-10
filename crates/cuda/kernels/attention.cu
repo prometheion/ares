@@ -8,9 +8,10 @@
 #include "attn_layout.cuh"
 #include "attn_write.cuh"
 #include "attn_kernel.cuh"
+#include "attn_direct.cuh"
 
-// Attention kernels (kernels/attn_kernel.cuh). Per head size: s8, s16 and s48 are the decode
-// shapes (up to 8, 16 and 48 vectors, i.e. query heads of the rows of a window), w64 the wide
+// The tensor-core attention kernels (kernels/attn_kernel.cuh). Per head size: s8, s16 and s48
+// are the decode shapes (up to 8, 16 and 48 vectors, i.e. query heads of the rows of a window), w64 the wide
 // step (up to 64 vectors). The arguments of the macro: head size, warps that share the
 // vectors, cell groups, cells per chunk, helper warps that only load and decode, and tiles of
 // 8 vectors per warp (0: the vectors are the 16 rows of the product).
@@ -26,3 +27,18 @@ ARES_ATTN_KERNEL(ares_attn_d128_s48, 128, 3, 2, 32, 2, 2)
 ARES_ATTN_KERNEL(ares_attn_d128_w64, 128, 4, 1, 16, 4, 0)
 ARES_ATTN_MERGE(ares_attn_merge_d256, 256)
 ARES_ATTN_MERGE(ares_attn_merge_d128, 128)
+
+// The direct kernels (kernels/attn_direct.cuh), for items of up to 8 vectors over quantized K
+// and V: integer dot products for the scores, f32 products in registers for the output, no
+// tensor cores. Per head size and number of vectors the registers hold (the launch takes the
+// smallest that fits). Blocks of 4 warps, 3 blocks per SM: src/attention.rs has the same 4.
+#define ATTN_DIRECT_WARPS 4
+#define ATTN_DIRECT_PER_SM 3
+ARES_ATTN_DIRECT(ares_attn_d256_r2, 256, 2, ATTN_DIRECT_WARPS, ATTN_DIRECT_PER_SM)
+ARES_ATTN_DIRECT(ares_attn_d256_r4, 256, 4, ATTN_DIRECT_WARPS, ATTN_DIRECT_PER_SM)
+ARES_ATTN_DIRECT(ares_attn_d256_r6, 256, 6, ATTN_DIRECT_WARPS, ATTN_DIRECT_PER_SM)
+ARES_ATTN_DIRECT(ares_attn_d256_r8, 256, 8, ATTN_DIRECT_WARPS, ATTN_DIRECT_PER_SM)
+ARES_ATTN_DIRECT(ares_attn_d128_r2, 128, 2, ATTN_DIRECT_WARPS, ATTN_DIRECT_PER_SM)
+ARES_ATTN_DIRECT(ares_attn_d128_r4, 128, 4, ATTN_DIRECT_WARPS, ATTN_DIRECT_PER_SM)
+ARES_ATTN_DIRECT(ares_attn_d128_r6, 128, 6, ATTN_DIRECT_WARPS, ATTN_DIRECT_PER_SM)
+ARES_ATTN_DIRECT(ares_attn_d128_r8, 128, 8, ATTN_DIRECT_WARPS, ATTN_DIRECT_PER_SM)

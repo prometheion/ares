@@ -257,10 +257,13 @@ fn time_step(
     stream: &Stream,
     setup: &Setup,
     rows: usize,
+    views: usize,
     iters: usize,
 ) -> Result<Timing> {
     let geo = &setup.geo;
-    let n_rows = rows * setup.seqs.len();
+    // `views` > 1: the first sequence seen at that many lengths, 200 cells apart, as so many
+    // sequences with a common prefix would be.
+    let n_rows = rows * setup.seqs.len().max(views);
     let q_total = KV * G;
     let mut rng = Rng(7);
     let q: Vec<f32> = (0..n_rows * q_total * D).map(|_| rng.gaussian()).collect();
@@ -271,9 +274,18 @@ fn time_step(
         PlanConfig::for_multiprocessors(device.info().multiprocessors),
         n_rows as u32,
     );
-    for (s, &(off, len)) in setup.seqs.iter().enumerate() {
-        let entries = &setup.table[off as usize..off as usize + len.div_ceil(TILE)];
-        planner.dense(off, entries, (s * rows) as u32, rows as u32, (len - rows) as u32);
+    if views > 1 {
+        let (off, len) = setup.seqs[0];
+        for s in 0..views {
+            let len = len - 200 * s;
+            let entries = &setup.table[off as usize..off as usize + len.div_ceil(TILE)];
+            planner.dense(off, entries, (s * rows) as u32, rows as u32, (len - rows) as u32);
+        }
+    } else {
+        for (s, &(off, len)) in setup.seqs.iter().enumerate() {
+            let entries = &setup.table[off as usize..off as usize + len.div_ceil(TILE)];
+            planner.dense(off, entries, (s * rows) as u32, rows as u32, (len - rows) as u32);
+        }
     }
     let plan = planner.finish();
     let bytes: f64 = plan.items.iter().map(|i| item_bytes(geo, i.flags & 1 != 0, i.total)).sum();
@@ -336,6 +348,8 @@ fn main() -> Result<()> {
         list("--prompt", "1024,2048").iter().map(|x| x.parse().unwrap()).collect();
     let only = arg("--device").map(|d| d.parse::<u32>().unwrap());
     let iters: usize = arg("--iters").map_or(30, |x| x.parse().unwrap());
+    // `--views N`: every decode case also with N sequences that share their prefix.
+    let views: usize = arg("--views").map_or(1, |x| x.parse().unwrap());
 
     for info in devices()? {
         if only.is_some_and(|d| d != info.ordinal) {
@@ -397,7 +411,20 @@ fn main() -> Result<()> {
                         t0.elapsed().as_secs_f64()
                     );
                     for &r in &rows {
-                        let t = time_step(&device, &kernels, &stream, &setup, r, iters)?;
+                        if views > 1 && n_seqs == 1 {
+                            let t = time_step(&device, &kernels, &stream, &setup, r, views, iters)?;
+                            println!(
+                                "| shared x{views} | {}/{} | {r} | {n_seqs} | {h} | {} | {:.1} | {:.2} | {:.0} | {:.0} |",
+                                name(k),
+                                name(v),
+                                t.pieces,
+                                t.us,
+                                t.us * 16.0 / 1e3,
+                                t.gbps,
+                                100.0 * t.gbps / bandwidth
+                            );
+                        }
+                        let t = time_step(&device, &kernels, &stream, &setup, r, 1, iters)?;
                         println!(
                             "| decode | {}/{} | {r} | {n_seqs} | {h} | {} | {:.1} | {:.2} | {:.0} | {:.0} |",
                             name(k),
@@ -413,7 +440,7 @@ fn main() -> Result<()> {
             }
             for &p in &prompts {
                 let setup = build(&device, &kernels, &stream, geo, 1, p, 2, false)?;
-                let t = time_step(&device, &kernels, &stream, &setup, p, iters.min(8))?;
+                let t = time_step(&device, &kernels, &stream, &setup, p, 1, iters.min(8))?;
                 println!(
                     "| prompt | {}/{} | {p} | 1 | 0 | {} | {:.0} | {:.2} | {:.0} | {:.0} |",
                     name(k),

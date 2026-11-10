@@ -66,30 +66,48 @@
 //! # Reading
 //!
 //! [`Planner`] cuts a step into **items**, one thread block each, and
-//! [`AttentionKernels::attend`] launches one kernel per shape. An item is some rows
-//! of one sequence (their query heads of one KV head are the "vectors" of the
-//! product) and a list of ranges of cells, in entries of one kind. Rows of a decode window
-//! share the K and V they read; dense causal attention is one range per item, block-sparse
-//! attention (qwen4exp) one range per selected block. Items that are only part of a row's
-//! cells write a state (the log2 of the sum of exponentials, the weighted V in the
-//! original domain) and [`attend`](AttentionKernels::attend) merges them, then the
-//! sigmoid gate is applied as the epilogue.
+//! [`AttentionKernels::attend`] launches one kernel per shape and kind of entry. An item
+//! is some rows (their query heads of one KV head are the "vectors" of the product) and a
+//! list of ranges of cells, in entries of one kind. Rows of a decode window share the K and
+//! V they read, and so do the rows of several sequences over a prefix they have in common;
+//! dense causal attention is one range per item, block-sparse attention (qwen4exp) one range
+//! per selected block. Items that are only part of a row's cells write a state (the log2 of
+//! the sum of exponentials, the weighted V in the original domain) and
+//! [`attend`](AttentionKernels::attend) merges them, then the sigmoid gate is applied as the
+//! epilogue. A tile gets pieces in proportion to its cells, and a launch never has more
+//! blocks than the device holds at once: a few blocks too many wait for a second wave that
+//! runs almost alone, which cost the first version of these kernels a fifth of its time.
 //!
-//! In a block, K and V of a chunk of 32 cells (16 for the wide kernel) are copied raw
-//! from global memory by `cp.async`, decoded to f16 tiles in shared memory (the
-//! rotated domain for the `qB` formats; the tile mean is not part of the tile and
-//! enters the scores and the accumulator once per tile) and multiplied on the tensor
-//! cores with f32 accumulation. A decode step has few vectors, so the cells are the
-//! rows of the product (16 of them) and the vectors the columns (tiles of 8); a wide
-//! step has the vectors as rows. The queries are rotated once per block.
+//! There are two kernel families, chosen per launch inside `attend`:
 //!
-//! **Error.** The inputs of the tensor cores are f16: the query scaled by `scale * log2(e)`,
-//! the decoded K and V (code times scale rounded once to f16) and the softmax weights.
-//! Against `KvHead::attend` on the same stored bytes that is about 1e-3 of the largest
-//! output element at worst in the tests (5e-4 to 3e-3 on random rows and on the captured
-//! rows of Qwen3.8-27B, 2e-4 to 3e-3), and it does not depend on the format: the
-//! formats' own errors are in the stored bytes, which the kernel reads exactly. The
-//! softmax, the sums and the merges are f32.
+//! - **Direct** (`kernels/attn_direct.cuh`), for items of up to 8 vectors (one row of a
+//!   decode step) in converted entries with K and V both quantized. No tensor cores and no
+//!   staging. For the scores every lane takes the row of its own cell and the integer dot
+//!   product of its codes with the queries, which are rotated and quantized to 15 bits and
+//!   a scale per group once per block; the sum of a group is scaled once. For the output
+//!   every lane holds 8 values of every vector and adds weight times code times scale in
+//!   f32, one cell after the other. Three blocks of four warps per multiprocessor.
+//! - **Tensor cores** (`kernels/attn_kernel.cuh`), for everything else: exact entries, an
+//!   `f16` format, more than 8 vectors. K and V of a chunk of 32 cells (16 for the wide
+//!   kernel) are copied raw from global memory by `cp.async`, decoded to f16 tiles in
+//!   shared memory (the rotated domain for the `qB` formats; the tile mean is not part of
+//!   the tile and enters the scores and the accumulator once per tile) and multiplied with
+//!   f32 accumulation. A decode step has few vectors, so the cells are the rows of the
+//!   product (16 of them) and the vectors the columns (tiles of 8); a wide step has the
+//!   vectors as rows. The queries are rotated once per block.
+//!
+//! **Error**, against `KvHead::attend` on the same stored bytes, relative to the largest
+//! output element. The direct kernel: 2e-5 to 1e-4 (its only inexact operand is the query,
+//! 15 bits per group; codes times scales and the output are exact f32). The tensor-core
+//! kernels: about 1e-3 (5e-4 to 3e-3 on random rows and on the captured rows of
+//! Qwen3.8-27B, 6e-3 at worst), from their f16 operands: the scaled query, the decoded K
+//! and V (code times scale rounded once to f16) and the softmax weights. Neither depends on
+//! the format: the formats' own errors are in the stored bytes, which the kernels read
+//! exactly. A row of a policy with exact entries (`q7` to `q4`) is a merge of both.
+//! Accumulating the products in f16 with a flush to f32, which doubles the rate of the
+//! tensor cores on capped GeForce cards, was built and measured: for the scores it costs up
+//! to 3e-2, and for the output it is slower than f32 accumulation (the kernels are not
+//! bound by the tensor cores), so there is no such path.
 
 mod plan;
 
@@ -275,17 +293,23 @@ pub struct AttentionKernels {
     encode_tile_f32: Function,
     /// The attention kernels by head size and shape.
     attend: Vec<(u32, AttnShape, Function)>,
+    /// The direct kernels by head size and the vectors their registers hold.
+    direct: Vec<(u32, u32, Function)>,
     merge: Vec<(u32, Function)>,
 }
 
 /// A plan on the device.
 #[derive(Debug)]
 pub struct PlanBuffers {
-    items: DeviceBuffer,
-    ranges: DeviceBuffer,
-    rows: DeviceBuffer,
-    row_ids: DeviceBuffer,
-    groups: Vec<(AttnShape, usize, usize)>,
+    items: DevicePtr,
+    ranges: DevicePtr,
+    rows: DevicePtr,
+    row_ids: DevicePtr,
+    /// The buffer [`Plan::upload`] allocated; `None` when the caller owns the memory.
+    _owned: Option<DeviceBuffer>,
+    /// Per launch: the shape, the first item, the number of items, the most rows of an
+    /// item, and whether the items read converted entries.
+    groups: Vec<(AttnShape, usize, usize, u32, bool)>,
     n_rows: u32,
     state_slots: u64,
     needs_merge: bool,
@@ -294,30 +318,129 @@ pub struct PlanBuffers {
 impl PlanBuffers {
     /// The rows of the plan on the device (for the append kernel).
     pub fn rows(&self) -> DevicePtr {
-        self.rows.ptr()
+        self.rows
     }
 }
 
+/// Where the four arrays of a plan lie in one block of bytes: offsets from its start,
+/// each a multiple of 16, and the length of the block.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PlanLayout {
+    /// Offset of the items (48 bytes each).
+    pub items: u64,
+    /// Offset of the ranges of cells (three `u32` each: start, end, cells before).
+    pub ranges: u64,
+    /// Offset of the rows (16 bytes each).
+    pub rows: u64,
+    /// Offset of the row lists of the items (`u32` each).
+    pub row_ids: u64,
+    /// Length of the block.
+    pub bytes: u64,
+}
+
 impl Plan {
-    /// Uploads the plan (synchronously; the step loop writes the same bytes into
-    /// its step record).
-    pub fn upload(&self, device: &Device) -> Result<PlanBuffers> {
-        let put = |bytes: Vec<u8>| -> Result<DeviceBuffer> {
-            let buffer = DeviceBuffer::new(device, bytes.len().max(16) as u64)?;
-            buffer.write(0, &bytes)?;
-            Ok(buffer)
+    /// The layout of the plan's arrays in one block of bytes ([`Plan::write`]).
+    pub fn layout(&self) -> PlanLayout {
+        let pad = |n: usize| (n as u64).next_multiple_of(16);
+        let items = 0;
+        let ranges = items + pad(self.items.len() * 48);
+        let rows = ranges + pad(self.ranges.len() * 4);
+        let row_ids = rows + pad(self.rows.len() * 16);
+        let bytes = (row_ids + pad(self.row_ids.len() * 4)).max(16);
+        PlanLayout { items, ranges, rows, row_ids, bytes }
+    }
+
+    /// Writes the plan's arrays into `dst` as the kernels read them, at the offsets of
+    /// [`Plan::layout`]. `dst` is memory of the caller, for example a part of the
+    /// page-locked record of a step that goes to the device with one copy.
+    ///
+    /// # Panics
+    ///
+    /// If `dst` is shorter than `layout().bytes`.
+    pub fn write(&self, dst: &mut [u8]) {
+        let layout = self.layout();
+        assert!(dst.len() as u64 >= layout.bytes, "the plan needs {} bytes", layout.bytes);
+        let mut at = layout.items as usize;
+        for item in &self.items {
+            let words = [
+                item.table,
+                item.row0,
+                item.n_rows,
+                item.kv_head,
+                item.ranges_off,
+                item.n_ranges,
+                item.total,
+                item.flags,
+                item.slot,
+                item.pad[0],
+                item.pad[1],
+                item.pad[2],
+            ];
+            for w in words {
+                dst[at..at + 4].copy_from_slice(&w.to_le_bytes());
+                at += 4;
+            }
+        }
+        let mut put = |offset: u64, words: &mut dyn Iterator<Item = u32>| {
+            let mut at = offset as usize;
+            for w in words {
+                dst[at..at + 4].copy_from_slice(&w.to_le_bytes());
+                at += 4;
+            }
         };
-        let words = |w: &[u32]| w.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
-        Ok(PlanBuffers {
-            items: put(AttnItem::to_bytes(&self.items))?,
-            ranges: put(words(&self.ranges))?,
-            rows: put(AttnRow::to_bytes(&self.rows))?,
-            row_ids: put(words(&self.row_ids))?,
-            groups: self.groups.iter().map(|(s, r)| (*s, r.start, r.end - r.start)).collect(),
+        put(layout.ranges, &mut self.ranges.iter().copied());
+        put(
+            layout.rows,
+            &mut self.rows.iter().flat_map(|r| [r.table, r.pos, r.slot_base, r.n_slots]),
+        );
+        put(layout.row_ids, &mut self.row_ids.iter().copied());
+    }
+
+    /// The plan with its arrays in device memory the caller owns: the bytes of
+    /// [`Plan::write`] at `base`. Nothing is allocated or copied here, so a step loop
+    /// that carries the plan in its step record pays nothing per step.
+    ///
+    /// # Safety
+    ///
+    /// When a launch that was given the returned buffers runs, `base` must address
+    /// `layout().bytes` bytes of live memory on the launch's device that hold the bytes
+    /// [`Plan::write`] produced for this plan.
+    pub unsafe fn on_device(&self, base: DevicePtr) -> PlanBuffers {
+        let layout = self.layout();
+        PlanBuffers {
+            items: base.offset(layout.items),
+            ranges: base.offset(layout.ranges),
+            rows: base.offset(layout.rows),
+            row_ids: base.offset(layout.row_ids),
+            _owned: None,
+            groups: self
+                .groups
+                .iter()
+                .map(|(s, r)| {
+                    let items = &self.items[r.clone()];
+                    let rows = items.iter().map(|i| i.n_rows).max().unwrap_or(0);
+                    let converted = items.iter().all(|i| i.flags & plan::ITEM_CONVERTED != 0);
+                    (*s, r.start, r.end - r.start, rows, converted)
+                })
+                .collect(),
             n_rows: self.rows.len() as u32,
             state_slots: u64::from(self.state_slots),
             needs_merge: self.needs_merge,
-        })
+        }
+    }
+
+    /// Uploads the plan into a buffer of its own (synchronously: an allocation and a
+    /// copy that waits for the device). A step loop avoids both with [`Plan::write`]
+    /// and [`Plan::on_device`].
+    pub fn upload(&self, device: &Device) -> Result<PlanBuffers> {
+        let mut bytes = vec![0u8; self.layout().bytes as usize];
+        self.write(&mut bytes);
+        let buffer = DeviceBuffer::new(device, bytes.len() as u64)?;
+        buffer.write(0, &bytes)?;
+        // SAFETY: the buffer holds the plan's bytes and lives as long as the result.
+        let mut buffers = unsafe { self.on_device(buffer.ptr()) };
+        buffers._owned = Some(buffer);
+        Ok(buffers)
     }
 }
 
@@ -362,19 +485,29 @@ impl AttentionKernels {
             }
             merge.push((d, module.function(&format!("ares_attn_merge_d{d}"))?));
         }
+        let mut direct = Vec::new();
+        for d in [256u32, 128] {
+            for nv in DIRECT_VECS {
+                let f = module.function(&format!("ares_attn_d{d}_r{nv}"))?;
+                direct.push((d, nv, f));
+            }
+        }
         Ok(Self {
             device: device.clone(),
             append: module.function("ares_attn_append")?,
             convert: module.function("ares_attn_convert")?,
             encode_tile_f32: module.function("ares_attn_encode_tile_f32")?,
             attend,
+            direct,
             merge,
         })
     }
 
-    /// Attention of the rows of a plan: one launch per kernel shape the plan uses, then
-    /// the merge of partial states if any row has more than one piece. `scale` is
-    /// the factor on the scores (`1 / sqrt(head_dim)`).
+    /// Attention of the rows of a plan: one launch per kernel shape and kind of entry the
+    /// plan uses, then the merge of partial states if any row has more than one piece.
+    /// Items of up to 8 vectors in converted entries with K and V both quantized run on
+    /// the direct kernel, everything else on the tensor-core kernels. `scale` is the
+    /// factor on the scores (`1 / sqrt(head_dim)`).
     ///
     /// # Safety
     ///
@@ -395,7 +528,46 @@ impl AttentionKernels {
         let st_acc = buffers.scratch;
         let st_lse = buffers.scratch.offset(acc_bytes);
         let gate = buffers.gate.unwrap_or(DevicePtr::NULL);
-        for (shape, first, count) in &plan.groups {
+        for (shape, first, count, max_rows, converted) in &plan.groups {
+            let vecs = max_rows * geo.q_per_kv;
+            let quantized = *converted && geo.k != CacheFormat::F16 && geo.v != CacheFormat::F16;
+            if quantized && vecs <= DIRECT_MAX_VECS {
+                let nv = DIRECT_VECS.into_iter().find(|nv| vecs <= *nv).unwrap_or(DIRECT_MAX_VECS);
+                let function = self
+                    .direct
+                    .iter()
+                    .find(|(dd, n, _)| *dd == d && *n == nv)
+                    .map(|(_, _, f)| f)
+                    .ok_or_else(|| Error::Invalid {
+                        what: "attention",
+                        detail: format!("no kernel for a head size of {d}"),
+                    })?;
+                let args = Args::new()
+                    .ptr(plan.items.offset(*first as u64 * 48))
+                    .ptr(plan.ranges)
+                    .ptr(plan.rows)
+                    .ptr(plan.row_ids)
+                    .ptr(buffers.tables)
+                    .ptr(buffers.converted_pool)
+                    .ptr(buffers.q)
+                    .ptr(gate)
+                    .ptr(buffers.out)
+                    .ptr(st_acc)
+                    .ptr(st_lse)
+                    .u64(geo.config())
+                    .f32(scale * std::f32::consts::LOG2_E);
+                // SAFETY: the caller's contract.
+                unsafe {
+                    function.launch(
+                        stream,
+                        [*count as u32, 1, 1],
+                        [32 * DIRECT_WARPS, 1, 1],
+                        direct_smem_bytes(d, DIRECT_WARPS),
+                        args,
+                    )?;
+                }
+                continue;
+            }
             let function = self
                 .attend
                 .iter()
@@ -406,10 +578,10 @@ impl AttentionKernels {
                     detail: format!("no kernel for a head size of {d}"),
                 })?;
             let args = Args::new()
-                .ptr(plan.items.ptr().offset(*first as u64 * 48))
-                .ptr(plan.ranges.ptr())
-                .ptr(plan.rows.ptr())
-                .ptr(plan.row_ids.ptr())
+                .ptr(plan.items.offset(*first as u64 * 48))
+                .ptr(plan.ranges)
+                .ptr(plan.rows)
+                .ptr(plan.row_ids)
                 .ptr(buffers.tables)
                 .ptr(buffers.exact_pool)
                 .ptr(buffers.converted_pool)
@@ -441,7 +613,7 @@ impl AttentionKernels {
                     }
                 })?;
             let args = Args::new()
-                .ptr(plan.rows.ptr())
+                .ptr(plan.rows)
                 .ptr(st_acc)
                 .ptr(st_lse)
                 .ptr(gate)
@@ -572,6 +744,19 @@ impl AttentionKernels {
         // SAFETY: the caller's contract.
         unsafe { self.encode_tile_f32.launch(stream, [1, 1, 1], [256, 1, 1], head_dim * 4, args) }
     }
+}
+
+/// The vectors the registers of the compiled direct kernels hold.
+const DIRECT_VECS: [u32; 4] = [2, 4, 6, 8];
+/// The most vectors of an item the direct kernels take.
+const DIRECT_MAX_VECS: u32 = 8;
+/// Warps of a block of the direct kernels (`ATTN_DIRECT_WARPS` in `kernels/attention.cu`).
+const DIRECT_WARPS: u32 = 4;
+
+/// Shared memory of a block of the direct kernel: the layout of `attn_direct_body` in
+/// `kernels/attn_direct.cuh`.
+const fn direct_smem_bytes(head_dim: u32, warps: u32) -> u32 {
+    head_dim * (32 + 16 + 2) + warps * (32 * 8 * 4 + 8 * 4 + 32 * 8 + 32 * 4) + warps * 64
 }
 
 /// Floats of partial outputs in the scratch (the log sums follow).

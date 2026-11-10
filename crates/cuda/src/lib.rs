@@ -34,7 +34,7 @@ mod sys;
 pub use attention::{
     ATTN_STATUS_DIRECT_MEAN, ATTN_STATUS_NONFINITE, ATTN_STATUS_OVERFLOW, AttendBuffers,
     AttentionKernels, AttnItem, AttnRow, AttnShape, CacheFormat, CacheGeometry, ENTRY_CELLS, Plan,
-    PlanBuffers, PlanConfig, Planner,
+    PlanBuffers, PlanConfig, PlanLayout, Planner,
 };
 pub use device::{
     Device, DeviceInfo, MemInfo, PciAddress, Wait, device_count, devices, peer_access,

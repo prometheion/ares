@@ -923,6 +923,55 @@ fn attention_equals_the_reference_for_every_pair_of_formats_in_decode() {
     }
 }
 
+/// The head size of 128 (rows of 4 groups, 8-byte aligned in the converted pool): one row
+/// (the direct kernel where K and V are quantized), a window of 4 rows and a wide window.
+#[test]
+fn attention_with_a_head_size_of_128_equals_the_reference() {
+    let Some(devices) = gpus() else { return };
+    let mut rng = Rng(128);
+    let pairs = [
+        (KvFormat::F16, KvFormat::F16),
+        (KvFormat::Q8, KvFormat::Q8),
+        (KvFormat::Q4, KvFormat::Q4),
+        (KvFormat::Q6, KvFormat::Q5),
+        (KvFormat::Q7, KvFormat::F16),
+        (KvFormat::F16, KvFormat::Q5),
+    ];
+    for device in devices {
+        let kernels = AttentionKernels::load(device).unwrap();
+        let stream = Stream::new(device, 0).unwrap();
+        let mut worst = Error::default();
+        let mut bad = Vec::new();
+        for (k, v) in pairs {
+            for (hist, rows) in [(901usize, 1usize), (1500, 4), (700, 40)] {
+                let case = Case { k, v, d: 128, hist, rows };
+                let geo = test_geometry(k, v, 128);
+                let (pools, seq) = build(&kernels, &stream, &case, &geo, &mut rng);
+                let err = attend_and_compare(
+                    &kernels, &stream, &case, &geo, &pools, &seq, true, &mut rng,
+                );
+                println!(
+                    "{} head 128 {k}/{v} hist {hist} rows {rows}: max {:.2e} rms {:.2e}",
+                    device.info().name,
+                    err.max_rel,
+                    err.rms_rel
+                );
+                if err.max_rel >= 8e-3 {
+                    bad.push(format!("{k}/{v} hist {hist} rows {rows}: {:.2e}", err.max_rel));
+                }
+                worst = worst.worse(err);
+            }
+        }
+        println!(
+            "{}: head 128, worst: max {:.2e}, rms {:.2e}",
+            device.info().name,
+            worst.max_rel,
+            worst.rms_rel
+        );
+        assert!(bad.is_empty(), "{bad:#?}");
+    }
+}
+
 /// One case from the environment, for investigations:
 /// `ARES_ATTN_CASE=k,v,hist,rows[,d]`.
 #[test]
@@ -1062,6 +1111,29 @@ fn batches_of_sequences_ranges_and_wide_windows_equal_the_reference() {
                 "{} {k}/{v} {} ranges: max {:.2e} rms {:.2e}",
                 device.info().name,
                 ranges.len(),
+                err.max_rel,
+                err.rms_rel
+            );
+            // Sequences with a common prefix (the same entries, seen at three lengths, one of
+            // them with two rows): the planner reads the prefix once, as items with the rows
+            // of all three, and each tail on its own.
+            let err = attend_many(
+                &kernels,
+                &stream,
+                &geo,
+                &pools,
+                &[&long, &long, &long],
+                &[Look::At(2990, 1), Look::At(2600, 1), Look::At(1500, 2)],
+                true,
+                4,
+                &mut rng,
+            );
+            if err.max_rel > 8e-3 {
+                bad.push(format!("{k}/{v} shared prefix: {:.2e}", err.max_rel));
+            }
+            println!(
+                "{} {k}/{v} shared prefix: max {:.2e} rms {:.2e}",
+                device.info().name,
                 err.max_rel,
                 err.rms_rel
             );
