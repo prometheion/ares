@@ -36,14 +36,20 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 /// Compute capabilities that get their own machine code, each only if the
-/// toolkit supports it. 75 is Turing (GTX 16, RTX 20), the oldest generation
-/// CUDA 13.4 can target. 86 covers RTX 30 (and runs on 87 and 89), 89 is RTX
-/// 40, 120 is RTX 50.
-const ARCHS: &[u32] = &[75, 86, 89, 120];
+/// toolkit supports it. Machine code runs on a newer device only within the
+/// same major version, so every major version CUDA 13 knows has an entry:
+/// 75 is Turing (GTX 16, RTX 20), the oldest generation CUDA 13.4 can
+/// target; 80 is the first Ampere (A100) and runs on every 8.x; 86 (RTX 30)
+/// and 89 (RTX 40) get their own code because the kernels are tuned per
+/// class; 90 is Hopper; 100 and 110 are the data-centre Blackwell families
+/// (100 also runs on 10.3 and 10.7); 120 is RTX 50 (and runs on 12.1). Only
+/// 86 and 89 have been run; the others are compiled and untested. A build for
+/// one machine can name its own classes in `ARES_CUDA_ARCHS`.
+const ARCHS: &[u32] = &[75, 80, 86, 89, 90, 100, 110, 120];
 
-/// The lowest compute capability the kernels can be built for: `__dp4a`, the
-/// integer dot product of the weight kernels, starts at 6.1.
-const FLOOR: u32 = 61;
+/// The lowest compute capability the kernels are built for: the oldest
+/// generation CUDA 13 supports.
+const FLOOR: u32 = 75;
 
 /// The lowest compute capability of the prefill module: the integer
 /// `mma.m16n8k32`, the f16 `mma.m16n8k16` and `cp.async` start with Ampere.
