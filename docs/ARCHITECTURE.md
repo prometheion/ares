@@ -323,6 +323,23 @@ measure is the error of attention, not of logits;
 What is still missing is a measurement on logits at a long context: with 3.7k
 tokens the exact cells are an eighth to a fifth of what a query reads.
 
+**The reference for attention.** `ares_quant::kvhead` is what the attention
+kernels of both backends are held to. `KvHead` is the stored sequence of one
+KV head under a policy, byte for byte as a kernel must write it: new cells as
+`f16`, tiles converted from the stored `f16` values when the policy says so
+(on the real data that costs nothing measurable against converting from the
+originals). Draft cells are appended as pending, which converts nothing, so
+rejected ones can always be cut and accepted ones are settled. Attention is
+defined the way FlashInfer builds it: the attention of a query over a range of
+cells is a state (the log of the summed exponentials of its scores, and the
+weighted sum of V), and the states of disjoint ranges merge into the state of
+their union, in any order. Dense attention is one range, block-sparse
+attention the selected blocks. This is what lets a kernel compute pages
+independently, lets K and V of a sequence lie on two devices with only states
+crossing, and lets a prefix shared by many rows of a step be attended to
+once. A plain f32 implementation agrees with the reference to 2e-6; the
+tolerance for kernels is ten times that.
+
 **On disk.** `ares-store` keeps full pages, and the checkpoint that belongs
 to a page's end, under the same chain hash in a directory per fingerprint
 (model, quantization, state formats, page size; nothing that leaves the state

@@ -1283,3 +1283,88 @@ Inferred, not measured here:
   the policy as `KvPolicy` states it. How tiles map onto pages, onto prefix
   sharing, and what attention kernels do with the per-tile terms was not
   looked at.
+
+## 14. The reference attention over the stored sequence
+
+Added 2026-11-10. The reference that the attention kernels will be held to is
+`ares_quant::kvhead` (`crates/quant/src/kvhead/`): `KvHead` stores the cells of
+one KV head under a `KvPolicy` (exact cells as `f16`, tiles converted as the
+policy says, from the stored `f16` values, since the originals are gone), and
+`KvHead::attend` computes the attention over a list of ranges of cells the way a
+kernel does, as the merge of the states (log-sum-exp and normalised V sum) of the
+ranges. This section runs the captured data through it and compares it with
+`built|KbVb|policy` of section 13. The two differ in exactly two ways: the
+tiles of the stored sequence are encoded from the `f16` values of the cells and
+those of the arrays from the `f32` originals, and the attention is the `f64`
+reference over states against `f32` arithmetic over arrays. The policy, the
+exact cells and the codec are the same. The tool candidate is `head|KbVb|policy`
+(`--set head`, README section 7): the head is fed cell by cell, and at each
+sampled position `t` the query attends over cells `0..=t`.
+
+Mean values over all samples (output error x 1e-3, KL x 1e-4, p99 x 1e-3, score
+error x 1e-3 nats). The last column is the relative L2 distance between the output
+of the stored sequence and that of the arrays for the same query, over all queries.
+0.8B (stride 2):
+
+| pair | output error: arrays / head / change | KL: arrays / head / change | p99 output error: arrays / head | score error: arrays / head | distance of the outputs, query by query: mean / p99 / max |
+|---|---|---|---|---|---|
+| K8/V8 | 3.618 / 3.618 / +0.00% | 0.506 / 0.506 / +0.00% | 10.333 / 10.333 | 10.877 / 10.877 | 5.0e-07 / 2.9e-06 / 1.3e-05 |
+| K6/V6 | 3.072 / 3.075 / +0.10% | 1.510 / 1.509 / -0.04% | 15.796 / 15.795 | 26.272 / 26.266 | 7.8e-04 / 4.9e-03 / 2.0e-02 |
+| K5/V5 | 5.061 / 5.060 / -0.01% | 5.097 / 5.100 / +0.06% | 29.360 / 29.316 | 51.286 / 51.305 | 8.3e-04 / 6.1e-03 / 1.9e-02 |
+| K4/V4 | 7.422 / 7.425 / +0.04% | 15.567 / 15.582 / +0.10% | 52.269 / 52.320 | 97.595 / 97.605 | 6.5e-04 / 5.5e-03 / 3.7e-02 |
+| K6/V5 | 3.872 / 3.877 / +0.13% | 1.268 / 1.268 / +0.07% | 23.865 / 23.995 | 25.625 / 25.619 | 7.2e-04 / 5.2e-03 / 2.1e-02 |
+| K5/V4 | 5.425 / 5.426 / +0.02% | 3.738 / 3.742 / +0.10% | 40.600 / 40.470 | 48.353 / 48.374 | 6.2e-04 / 5.0e-03 / 3.6e-02 |
+| K8/V4 | 4.683 / 4.683 / +0.00% | 0.141 / 0.141 / +0.02% | 36.804 / 36.783 | 9.195 / 9.203 | 4.3e-04 / 3.6e-03 / 3.7e-02 |
+| K4/V8 | 5.540 / 5.544 / +0.07% | 15.567 / 15.582 / +0.10% | 38.509 / 38.624 | 97.595 / 97.605 | 5.0e-04 / 4.2e-03 / 3.0e-02 |
+
+27B (stride 4):
+
+| pair | output error: arrays / head / change | KL: arrays / head / change | p99 output error: arrays / head | score error: arrays / head | distance of the outputs, query by query: mean / p99 / max |
+|---|---|---|---|---|---|
+| K8/V8 | 3.474 / 3.474 / -0.00% | 0.420 / 0.420 / -0.00% | 8.728 / 8.728 | 9.987 / 9.987 | 5.5e-07 / 3.4e-06 / 1.1e-05 |
+| K6/V6 | 3.557 / 3.562 / +0.15% | 1.379 / 1.382 / +0.28% | 17.103 / 17.141 | 24.905 / 24.916 | 8.8e-04 / 5.2e-03 / 1.7e-02 |
+| K5/V5 | 5.877 / 5.876 / -0.01% | 4.657 / 4.654 / -0.07% | 31.954 / 31.863 | 48.787 / 48.765 | 8.8e-04 / 6.3e-03 / 2.7e-02 |
+| K4/V4 | 8.838 / 8.839 / +0.02% | 14.256 / 14.260 / +0.03% | 56.818 / 56.695 | 92.766 / 92.802 | 7.7e-04 / 6.5e-03 / 4.9e-02 |
+| K6/V5 | 4.516 / 4.519 / +0.07% | 1.163 / 1.167 / +0.32% | 26.306 / 26.385 | 24.293 / 24.304 | 8.0e-04 / 5.5e-03 / 2.1e-02 |
+| K5/V4 | 6.523 / 6.523 / +0.00% | 3.477 / 3.474 / -0.09% | 44.849 / 44.698 | 46.050 / 46.030 | 6.9e-04 / 5.6e-03 / 3.3e-02 |
+| K8/V4 | 5.618 / 5.621 / +0.05% | 0.117 / 0.118 / +0.63% | 40.381 / 40.396 | 8.437 / 8.446 | 5.3e-04 / 4.3e-03 / 3.3e-02 |
+| K4/V8 | 6.535 / 6.538 / +0.04% | 14.256 / 14.260 / +0.03% | 41.561 / 41.424 | 92.766 / 92.802 | 5.7e-04 / 4.9e-03 / 4.9e-02 |
+
+Measured:
+
+- **Converting from `f16` costs nothing measurable.** The mean output error of the
+  stored sequence is between -0.01% and +0.13% (0.8B) and -0.01% and +0.15% (27B)
+  of the arrays' error, the KL between -0.09% and +0.32% (and +0.63% for K8/V4 on
+  the 27B, where the KL itself is 0.1e-4), the 99th percentile of the output
+  error between -0.34% and +0.54%, the score error within 0.1%. The signs are
+  mixed. At K4/V4: 7.425 against 7.422 on the 0.8B, 8.839 against 8.838 on the
+  27B. Of the 416 (0.8B) and 384 (27B) combinations of pair, scope and measure
+  nine and five differ by more than 1%; all are a 99th percentile in a single
+  layer or part of the text (a tail statistic of 2 000 to 19 000 samples, signs
+  mixed, up to 3%), or the tiny KL of K8/V4.
+- **Query by query the outputs are not the same numbers.** The relative L2
+  distance is 4e-4 to 9e-4 on average (99th percentile 4e-3 to 7e-3, maximum
+  up to 5e-2) at 6 to 4 bits, mixed pairs included: converting from the rounded values moves some codes by a
+  step. That is about a tenth of the output error against the exact attention
+  (7e-3 at K4/V4), of random sign, and it does not change the average error.
+- **At K8/V8 the distance is 5e-7.** There, no cell is converted from `f16` (a
+  `q8` cell without exact windows is encoded straight from the `f32` row, as the
+  codec's tests and `KvHead` say), so what is left is the `f32` arrays against the
+  `f64` reference and the merge: they compute the same attention.
+
+Inferred, not measured separately: the `f16` rounding (2^-11 of a value) is small
+next to the step of `q6` to `q4`, and shows only where the format is fine, in the
+KL of a `q8` K tile (K8/V4, +0.6% on the 27B). The conclusion for the engine:
+encoding a tile from its stored `f16` rows loses nothing that the policy's
+measurements in sections 4 to 13 did not already contain.
+
+What was tested of the reference itself is in `crates/quant/tests/kvhead.rs`
+(33 tests): the stored bytes against a model written from the policy and the
+codec for every pair of formats at the lengths where tiles are converted, the
+conversion from `f16` and the one `q8` exception, truncation and the pending
+protocol, the kernel way against the plain way for every pair across tile and
+window boundaries and selections that cut tiles and exact runs, any split of the
+visible cells into pieces (per tile, per page of 16 or 64, exact cells apart from
+tiles, halves) merged in four orders, pieces far below the others and empty
+pieces, and a naive `f32` kernel (whole and in pieces) within the documented
+tolerances.

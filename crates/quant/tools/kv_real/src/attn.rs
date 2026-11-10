@@ -146,6 +146,34 @@ pub struct Sample {
     pub score: f32,
 }
 
+/// The output row of query `t` of query head `h` over the stored rows of a
+/// candidate, computed as `evaluate` does (`f32` dot products and softmax).
+pub fn stored_output(task: &Task, st: &Stored, h: usize, t: usize) -> Vec<f32> {
+    let hd = task.hd;
+    let scale = 1.0 / (hd as f32).sqrt();
+    let q = &task.q[h][t * hd..(t + 1) * hd];
+    let (lo, hi) = st.mask.range(t);
+    let mut e = vec![0.0f32; t + 1];
+    let mut s = vec![0.0f32; t + 1];
+    for j in 0..=t {
+        let row = if j >= lo && j < hi { st.kq } else { st.ke };
+        s[j] = scale * dot(q, &row[j * hd..(j + 1) * hd]);
+    }
+    let m = s.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let mut z = 0.0f64;
+    for j in 0..=t {
+        e[j] = (s[j] - m).exp();
+        z += f64::from(e[j]);
+    }
+    let inv = (1.0 / z) as f32;
+    let mut o = vec![0.0f32; hd];
+    for j in 0..=t {
+        let row = if j >= lo && j < hi { st.vq } else { st.ve };
+        axpy(&mut o, e[j] * inv, &row[j * hd..(j + 1) * hd]);
+    }
+    o
+}
+
 pub fn evaluate(task: &Task, gt: &Gt, st: &Stored) -> Vec<Sample> {
     let hd = task.hd;
     let scale = 1.0 / (hd as f32).sqrt();

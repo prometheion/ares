@@ -14,6 +14,9 @@ OLD, NEW = args[:i], args[i + 1]
 section = args[i + 2] if len(args) > i + 2 else "all"
 
 
+D = {}
+
+
 def load(paths):
     R, S, E = {}, {}, {}
     for p in paths:
@@ -25,6 +28,8 @@ def load(paths):
                 S[(f[1], int(f[2]), f[3], f[4])] = float(f[5])
             elif f[0] == "E":
                 E[(f[1], f[2])] = (float(f[3]), float(f[4]))
+            elif f[0] == "D":
+                D[f[1]] = (float(f[2]), float(f[3]), float(f[4]))
     return R, S, E
 
 
@@ -121,6 +126,42 @@ def steps_table(key):
     return "\n".join(out)
 
 
+def head_table(model_scopes=("all",)):
+    """built|policy (arrays) against head|policy (the stored sequence and its reference attention)."""
+    out = ["| pair | output error: arrays / head / change | KL: arrays / head / change | p99 output error: arrays / head | score error: arrays / head | distance of the outputs, query by query: mean / p99 / max |", "|---|---|---|---|---|---|"]
+    for kb, vb in PAIRS:
+        cells = []
+        for key, with_change in (("rel", True), ("kl", True), ("rel99", False), ("sc", False)):
+            a, b = val("built", kb, vb, "policy", "all", key), val("head", kb, vb, "policy", "all", key)
+            if a is None or b is None:
+                cells.append("-")
+                continue
+            text = f"{a * UNIT[key]:.3f} / {b * UNIT[key]:.3f}"
+            if with_change:
+                text += f" / {(b / a - 1) * 100:+.2f}%"
+            cells.append(text)
+        d = D.get(f"head|K{kb}V{vb}|policy")
+        dist = "-" if d is None else f"{d[0]:.1e} / {d[1]:.1e} / {d[2]:.1e}"
+        out.append(f"| K{kb}/V{vb} | " + " | ".join(cells) + f" | {dist} |")
+    return "\n".join(out)
+
+
+def head_worse():
+    """Every scope and measure in which the stored sequence is worse than the arrays by more than 1%."""
+    scopes = sorted({s[1] for s in R if s[0].startswith("head|")})
+    lines, n = [], 0
+    for kb, vb in PAIRS:
+        for sc in scopes:
+            for key in ("rel", "kl", "rel99", "sc"):
+                a, b = val("built", kb, vb, "policy", sc, key), val("head", kb, vb, "policy", sc, key)
+                if a is None or b is None:
+                    continue
+                n += 1
+                if abs(b / a - 1) > 0.01:
+                    lines.append(f"K{kb}/V{vb} {sc} {key}: arrays {a * UNIT[key]:.3f}, head {b * UNIT[key]:.3f} ({(b / a - 1) * 100:+.2f}%)")
+    return n, lines
+
+
 def worse():
     """Every scope, pair and measure in which built is worse than rows under the tile policy."""
     scopes = sorted({s[1] for s in Rn})
@@ -188,6 +229,12 @@ if section in ("all", "scopes"):
 if section in ("all", "steps"):
     for key, title in (("rel", "output error (x 1e-3)"), ("kl", "KL (x 1e-4)")):
         print(f"\n{title}\n\n{steps_table(key)}")
+if section in ("all", "head"):
+    print("\n" + head_table())
+    n, lines = head_worse()
+    print(f"\nthe stored sequence differs from the arrays by more than 1%: {len(lines)} of {n} (pair, scope, measure) combinations")
+    for l in lines[:40]:
+        print("  " + l)
 if section in ("all", "worse"):
     n, lines = worse()
     print(f"\nbuilt worse than rows under the tile policy: {len(lines)} of {n} (pair, scope, measure) combinations")

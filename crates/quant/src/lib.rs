@@ -45,6 +45,7 @@ mod half;
 mod iquants;
 mod kquants;
 pub mod kv;
+pub mod kvhead;
 mod legacy;
 #[rustfmt::skip]
 mod tables;
@@ -59,6 +60,7 @@ pub use kv::{
     decode_row_rotated, decode_tile, decode_tile_rotated, encode_row, encode_tile,
     kv_bytes_per_cell, kv_mean_bytes_per_tile, rotate_groups,
 };
+pub use kvhead::{Attention, AttnState, KvHead, KvHeadError, KvUnit};
 
 /// Decodes `src`, a stream of whole blocks of type `ty`, into `dst`.
 ///

@@ -63,6 +63,10 @@ pub enum Fam {
     PrevMeanN(u16),
     /// The built codec: `encode_tile`/`decode_tile` with the mean per tile of 128 cells.
     Built,
+    /// The stored sequence of `ares_quant::KvHead` under the tile policy,
+    /// attended through `KvHead::attend` (the reference of the kernels). It is
+    /// not an array: `run_task` feeds a head cell by cell.
+    Head,
     /// The row codec (`encode_row`/`decode_row`, no mean): the same arrays as
     /// `Engine`, named separately for the comparison under the tile policy.
     Rows,
@@ -91,6 +95,7 @@ impl Fam {
             Fam::PrevMeanN(n) => return format!("engine+prev-mean({n})"),
             Fam::Built => "built",
             Fam::Rows => "rows",
+            Fam::Head => "head",
         }
         .to_string()
     }
@@ -176,6 +181,10 @@ pub struct Spec {
 }
 
 impl Spec {
+    fn dists_wanted(&self) -> bool {
+        self.kfam == Fam::Head
+    }
+
     fn name(&self) -> String {
         let fam = if self.kfam == self.vfam {
             self.kfam.name()
@@ -183,7 +192,7 @@ impl Spec {
             format!("K:{}+V:{}", self.kfam.name(), self.vfam.name())
         };
         // the built codec under the tile policy is simply "policy"
-        let mask = if self.kfam == Fam::Built && self.vfam == Fam::Built && self.mask == MaskKind::TilePolicy {
+        let mask = if (self.kfam == Fam::Built || self.kfam == Fam::Head) && self.vfam == self.kfam && self.mask == MaskKind::TilePolicy {
             "policy".to_string()
         } else {
             self.mask.name()
@@ -209,6 +218,17 @@ fn specs_built() -> Vec<Spec> {
         }
         v.push(Spec { kfam: Fam::Built, vfam: Fam::Built, kb, vb, mask: MaskKind::TilePolicy });
         v.push(Spec { kfam: Fam::Rows, vfam: Fam::Rows, kb, vb, mask: MaskKind::TilePolicy });
+    }
+    v
+}
+
+/// The built codec with arrays against the same policy through the stored
+/// sequence and its reference attention (`KvHead`).
+fn specs_head() -> Vec<Spec> {
+    let mut v = Vec::new();
+    for (kb, vb) in PAIRS_BUILT {
+        v.push(Spec { kfam: Fam::Built, vfam: Fam::Built, kb, vb, mask: MaskKind::TilePolicy });
+        v.push(Spec { kfam: Fam::Head, vfam: Fam::Head, kb, vb, mask: MaskKind::TilePolicy });
     }
     v
 }
@@ -293,6 +313,9 @@ struct TaskOut {
     /// (family, bits, is_k) -> (signal, error) sums over the whole groups.
     snr: HashMap<(Fam, u32, bool), (f64, f64)>,
     gt_rows: Vec<(u32, f32, f32, f32)>,
+    /// Per spec through a `KvHead`: relative distance of its output from that
+    /// of the built codec's arrays, per (head, position).
+    dists: Vec<Option<Vec<f32>>>,
 }
 
 struct Arrays {
@@ -350,6 +373,7 @@ fn build_arrays(
                     Fam::GroupMid => codecs::engine_group_offset(x, hd, bits),
                     Fam::Built => codecs::built(x, hd, bits),
                     Fam::Rows => codecs::engine(x, hd, bits),
+                    Fam::Head => unreachable!("a stored sequence is not an array"),
                     Fam::TileMean => codecs::engine_tile_mean(x, hd, bits, 128, false),
                     Fam::TileMeanN(n) => codecs::engine_tile_mean(x, hd, bits, n.into(), false),
                     Fam::PrevMeanN(n) => codecs::engine_tile_mean(x, hd, bits, n.into(), true),
@@ -383,13 +407,34 @@ fn run_task(layer: &Layer, hk: usize, specs: &[Spec], ts: &[usize]) -> TaskOut {
             gt_rows.push((t as u32, gt.mass_first[i], gt.mass_new[i], gt.entropy[i]));
         }
     }
-    let mut fams: Vec<Fam> = specs.iter().flat_map(|s| [s.kfam, s.vfam]).collect();
+    let mut fams: Vec<Fam> = specs.iter().flat_map(|s| [s.kfam, s.vfam]).filter(|f| *f != Fam::Head).collect();
+    if specs.iter().any(|s| s.kfam == Fam::Head) {
+        fams.push(Fam::Built);
+    }
     fams.sort_by_key(|f| f.name());
     fams.dedup();
     let mut snr = HashMap::new();
     let arrays = build_arrays(&k, &v, dims.hd, &fams, &mut snr);
     let mut samples = Vec::with_capacity(specs.len());
+    let mut dists = Vec::with_capacity(specs.len());
     for spec in specs {
+        if spec.kfam == Fam::Head {
+            // the same policy and the same pair through the built codec's arrays
+            let exact = &arrays.exact_engine;
+            let st = Stored {
+                kq: &arrays.dec[&(Fam::Built, spec.kb, true)],
+                ke: &exact[0],
+                vq: &arrays.dec[&(Fam::Built, spec.vb, false)],
+                ve: &exact[1],
+                mask: spec.mask.mask(spec.kb, spec.vb),
+            };
+            let policy = KvPolicy::new(KvFormat::quantized(spec.kb).unwrap(), KvFormat::quantized(spec.vb).unwrap());
+            let (s, d) = evaluate_head(&task, &gt, policy, &st);
+            samples.push(s);
+            dists.push(Some(d));
+            continue;
+        }
+        dists.push(None);
         let exact = |fam: Fam, side: usize| if fam == Fam::Kvarn { &arrays.exact_kvarn[side] } else { &arrays.exact_engine[side] };
         let st = Stored {
             kq: &arrays.dec[&(spec.kfam, spec.kb, true)],
@@ -400,7 +445,66 @@ fn run_task(layer: &Layer, hk: usize, specs: &[Spec], ts: &[usize]) -> TaskOut {
         };
         samples.push(attn::evaluate(&task, &gt, &st));
     }
-    TaskOut { layer: layer.il, samples, snr, gt_rows }
+    TaskOut { layer: layer.il, samples, snr, gt_rows, dists }
+}
+
+/// The queries of a task through a `KvHead` that is fed cell by cell: at a
+/// sampled position `t` it holds the `t + 1` cells and `attend` runs over all
+/// of them. Returns the samples against the exact attention and, per sample,
+/// the relative distance of the output from `stored_output` of the built
+/// codec's arrays under the same policy.
+fn evaluate_head(task: &Task, gt: &attn::Gt, policy: KvPolicy, built: &Stored) -> (Vec<Sample>, Vec<f32>) {
+    let hd = task.hd;
+    let nq = task.ts.len();
+    let scale = 1.0 / (hd as f32).sqrt();
+    let mut head = ares_quant::KvHead::new(policy, hd).unwrap();
+    let mut samples = Vec::new();
+    let mut dists = Vec::new();
+    let mut fed = 0;
+    for (qi, &t) in task.ts.iter().enumerate() {
+        while fed <= t {
+            head.append(&task.k[fed * hd..(fed + 1) * hd], &task.v[fed * hd..(fed + 1) * hd]).unwrap();
+            fed += 1;
+        }
+        for (h, qh) in task.q.iter().enumerate() {
+            let q = &qh[t * hd..(t + 1) * hd];
+            let got = head.attend(q, scale, &[0..t + 1]).unwrap();
+            let idx = h * nq + qi;
+            let (s, o) = (&gt.s[idx], &gt.o[idx * hd..(idx + 1) * hd]);
+            let (mut sum, mut sum_sq, mut kl) = (0.0f64, 0.0f64, 0.0f64);
+            let max = got.scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            let z: f64 = got.scores.iter().map(|x| (x - max).exp()).sum();
+            for (j, p) in gt.p[idx].iter().enumerate() {
+                let d = got.scores[j] - f64::from(s[j]);
+                sum += d;
+                sum_sq += d * d;
+                kl += f64::from(*p) * (-d);
+            }
+            kl += max + z.ln() - gt.lse[idx];
+            let cnt = (t + 1) as f64;
+            let var = (sum_sq / cnt - (sum / cnt).powi(2)).max(0.0);
+            let (mut num, mut den) = (0.0f64, 0.0f64);
+            for c in 0..hd {
+                num += (f64::from(got.output[c]) - f64::from(o[c])).powi(2);
+                den += f64::from(o[c]).powi(2);
+            }
+            samples.push(Sample {
+                head: h as u8,
+                t: t as u32,
+                rel: (num / den.max(1e-30)).sqrt() as f32,
+                kl: kl.max(0.0) as f32,
+                score: var.sqrt() as f32,
+            });
+            let theirs = attn::stored_output(task, built, h, t);
+            let (mut num, mut den) = (0.0f64, 0.0f64);
+            for c in 0..hd {
+                num += (f64::from(got.output[c]) - f64::from(theirs[c])).powi(2);
+                den += f64::from(theirs[c]).powi(2);
+            }
+            dists.push((num / den.max(1e-30)).sqrt() as f32);
+        }
+    }
+    (samples, dists)
 }
 
 fn percentile(v: &mut [f32], p: f64) -> f32 {
@@ -443,6 +547,7 @@ fn cmd_run(args: &[String]) {
         Some("sweep") => specs_sweep(),
         Some("tilemean") => specs_tilemean(),
         Some("built") => specs_built(),
+        Some("head") => specs_head(),
         _ => specs(),
     };
     if let Some(masks) = arg(args, "--masks") {
@@ -570,6 +675,16 @@ fn cmd_run(args: &[String]) {
             }
             let m = |f: fn(&&&(u32, f32, f32, f32)) -> f32| sel.iter().map(|r| f64::from(f(r))).sum::<f64>() / sel.len() as f64;
             let _ = writeln!(report, "G\tL{il:02}\t{scope}\t{}\t{:.4}\t{:.4}\t{:.4}", sel.len(), m(|r| r.1), m(|r| r.2), m(|r| r.3));
+        }
+    }
+    // the stored sequence against the built codec's arrays, query by query
+    for (si, spec) in specs.iter().enumerate() {
+        if spec.dists_wanted() {
+            let mut d: Vec<f32> = results.iter().flat_map(|r| r.dists[si].iter().flatten().copied()).collect();
+            let mean_d = mean(&d);
+            let max_d = d.iter().copied().fold(0.0f32, f32::max);
+            let p99 = percentile(&mut d, 0.99);
+            let _ = writeln!(report, "D\t{}\t{:.6e}\t{:.6e}\t{:.6e}", spec.name(), mean_d, p99, max_d);
         }
     }
     // exact cells per query under the tails of the old sliding policy, the tile

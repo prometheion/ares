@@ -124,3 +124,22 @@ python3 -I $T/built_tables.py results_q08.tsv results_q08_tilemean.tsv results_q
 
 `kvreal validate` also compares the built codec with the row codec (8 bits:
 bit-identical) and with the what-if of section 6 (SNR, rms difference).
+
+## 7. The stored sequence through the reference attention (`--set head`)
+
+Section 14 of the notes. `head|KbVb|policy` stores the captured K and V of a
+head in `ares_quant::KvHead` under `KvPolicy::new(k, v)` (cell by cell, so a
+tile is converted from its stored `f16` values) and runs every sampled query
+through `KvHead::attend` over cells `0..=t`, the reference the attention
+kernels are held to. It is compared with `built|KbVb|policy`, the same codec
+and policy on arrays (tiles encoded from the `f32` originals, `f32`
+attention). `run` also prints `D` lines: the distance of the head's output
+from the arrays' output, query by query (relative L2: mean, 99th percentile,
+maximum). Pairs as in section 6.
+
+```sh
+$K run --data $W/q08 --set head --stride 2 --threads 6 --out results_head_q08.tsv
+$K run --data $W/q27b --heads 24 --kv 4 --hd 256 --set head --stride 4 --threads 6 \
+   --out results_head_q27b.tsv
+python3 -I $T/built_tables.py results_q08.tsv -- results_head_q08.tsv head
+```
