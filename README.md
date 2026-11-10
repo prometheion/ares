@@ -74,6 +74,8 @@ at that library with `ARES_LIBCUDA=<path>/libcuda.so.1`.
 | `crates/sched` | Step planning, draft policy, n-gram drafter |
 | `crates/weights` | Expert tiers and pruning policy |
 | `crates/runtime` | Conductor and device threads: the step loop |
+| `crates/model` | Model architectures and their CPU reference |
+| `crates/tokenizer` | Tokenizer and chat templates |
 | `crates/api` | Types between the HTTP server and the runtime |
 | `crates/server` | The `ares` binary |
 | `docs/` | Architecture and notes on the engines studied |

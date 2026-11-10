@@ -112,13 +112,17 @@ machine (RTX 4070 + RTX 3060, Qwen3.8-27B) or read from the engines listed in
    different kernels, a capped GeForce card accumulates differently from an
    uncapped one, and where a different arithmetic is faster it is taken.
    What every kernel is held to is its error against the exact arithmetic of
-   the model, measured and written down next to its speed, and that error
-   must not be worse than what the engines it replaces have (about 1 % rms
-   per product from 8-bit activations in llama.cpp's quantized kernels).
-   Output is therefore not guaranteed to be identical between runs that
-   batch differently, as it is not in the engines this one learns from. The
-   CPU references in `ares-quant` and `ares-model` are the exact arithmetic
-   that kernels are compared with.
+   the model, measured and written down next to its speed. Exact arithmetic
+   is the default wherever it costs nothing: at the few rows where a kernel
+   waits for memory anyway, activations stay `f16` (Marlin) or the rounding
+   error of 8-bit activations is removed by a second product (ExLlamaV3).
+   An error is accepted only where it buys speed, and then at most what the
+   engines this one replaces have (about 1 % rms per product from 8-bit
+   activations in llama.cpp's quantized kernels). That number is a ceiling,
+   not a target. Output is therefore not guaranteed to be identical between
+   runs that batch differently, as it is not in the engines this one learns
+   from. The CPU references in `ares-quant` and `ares-model` are the exact
+   arithmetic that kernels are compared with.
 
 ## Crates
 
@@ -380,12 +384,12 @@ Qwen4 handover map as follows.
 
 ## Speculation
 
-The engine carries the full drafter stack of llama.cpp, with the selection of
-Piggidragon's fork on top:
+The engine has every kind of drafter that llama.cpp and Piggidragon's fork
+have, with the fork's selection on top:
 
 | Part | What it is | State |
 | --- | --- | --- |
-| N-gram drafters | Continue an earlier occurrence of the current text. The simple lookup exists; the map and cache variants follow | `NgramDrafter` done |
+| Lookup drafter | Continues an earlier occurrence of the current text. A simple n-gram lookup per sequence exists. It is to become one suffix automaton over a corpus that all sequences share (TensorRT-LLM, SGLang, vLLM's suffix decoding), which finds the longest match and matches across requests; llama.cpp's map and cache variants are not built | `NgramDrafter` done; the automaton is next |
 | MTP | The model's own draft head or block | With the model |
 | DFlash, DSpark, DFlash2 | A small draft model that reads the target's hidden states at a few layers and proposes a block of tokens at once | With the runtime: it needs taps on the target's layers and a second model on the same devices |
 | Drafter selection | Per sequence and step, the drafter with the highest expected tokens per millisecond, from measured acceptance and cost; drafters that were not chosen keep learning from what was accepted | `best_draft_len` and `Acceptance` done; the selector object that holds them per drafter is next |
@@ -394,7 +398,12 @@ Piggidragon's fork on top:
 
 All drafters produce the same thing, a list of proposed tokens with an
 optional confidence per token, so selection and verification do not depend on
-where a draft comes from.
+where a draft comes from. A lookup draft is written into the step record by
+the host. The draft of a head or a draft model is to stay on the device, in a
+table the verify window reads (SGLang), and reach the host together with the
+picks; carrying it through the host would put a copy out and back between two
+kernels of the same device at every step. A draft is cut at the first token
+the grammar refuses before it is verified (vLLM).
 
 Adaptive draft length did not pay off in the llama.cpp fork (a few percent up
 for English and code, a few percent down for German). Two of its costs there
@@ -786,11 +795,18 @@ GPU that CUDA 13 does not run on.
 | TokenSpeed | Checkpoints of recurrent state under the chained hash, suspension of a request as a byte copy (also the test oracle), one decode path | `ares-state` (checkpoints attach to hashes; policy planned), runtime (planned) |
 | ExLlamaV3 | Rotated low-bit KV with separate K and V widths, pages on RAM and disk tiers with fingerprints, a sort-free GPU sampler | Kernels and `ares-state` residency (planned) |
 | TensorRT-LLM, LMDeploy, mistral.rs | 4-bit re-encoding of cold pages, sampling sharded per GPU, int8 KV with per-head ranges, transition-log rollback | Planned |
+| Marlin, ExLlamaV3, LMDeploy, TensorRT-LLM (their kernels) | Weights rearranged at load into the order the tensor cores read them and decoded in registers; `f16` accumulators folded into `f32` on capped cards; one decode of a matrix and a dense product for wide steps; the shape of the attention kernels; bit planes for K/V codes | `ares-quant` (planes done); `ares-cuda` prefill and attention kernels (in progress) |
+| FlashInfer | Attention as states that merge (`lse`, `v`), so a head is computed over any split of its cells; block-sparse attention over a block table | `ares-quant::kvhead` (reference done); kernels in progress |
+| vLLM, SGLang, TGI, TokenSpeed (their schedulers) | Pages claimed per step with a reservation for the output still expected; a request waits when it does not fit; prefix pages published when they fill, with tails; checkpoint intervals for recurrent state | Planned, see [Next steps](#next-steps) |
+| MiniJinja | The interpreter of chat templates | `ares-tokenizer` |
 | llguidance | Grammar-constrained output by validating the GPU's top candidates on the CPU | Planned |
 | AirLLM | Nothing beyond the expert tiers: reading whole layers per pass is bounded by disk throughput | - |
 | Run My AI, ik_llama.cpp, Fiddler, ktransformers, BELLS, AI-DER, FATE, ProMoE | Direct reads with demand before prefetch; prefill layer by layer in waves of experts; the RAM tier as a cache with admission and protection; the order of work inside a MoE layer; slots per layer by need; fused gate and up of an expert | `ares-io` (reads done); the rest planned, see [Weights](#weights) |
 
-Notes on each source are under [reference/](reference/).
+Notes on each source are under [reference/](reference/). The reading of the
+other engines' code, with a ranked list of what to take and a list of where
+Ares still copies llama.cpp without a reason, is
+[reference/serving-engines-code-survey.md](reference/serving-engines-code-survey.md).
 
 ## Status
 
@@ -807,7 +823,14 @@ State on 2026-11-10, on an RTX 4070 and an RTX 3060 with driver 615.78.08:
   quarter of the tensor cores' integer peak and are not yet ahead of the
   llama.cpp fork (see [Devices](#devices)).
 - The KV formats are specified, pinned by golden files and measured on the K
-  and V of real models; the attention kernels that read them do not exist yet.
+  and V of real models, and attention over the stored formats has a CPU
+  reference (`ares_quant::kvhead`). The GPU kernels that read and write them
+  are being written.
+- Being written and not in this state yet: weight kernels for the other 17
+  GGUF types, prefill kernels on a device layout, the layer kernels of
+  `qwen35`, and the Vulkan mirrors.
+- The tokenizer gives llama.cpp's token ids and chat prompts for the three
+  test models and encodes 76 to 85 MB of text per second on one core.
 - The server crates and the quantization reference were verified through
   their own test suites.
 - Real model files are test data and stay outside the repository. The reader
@@ -818,30 +841,61 @@ State on 2026-11-10, on an RTX 4070 and an RTX 3060 with driver 615.78.08:
 
 ## Next steps
 
-1. `ares-runtime` beyond the skeleton: wider steps through the prefill
-   kernels (and more than eight rows per decode launch), sums and hand-overs
-   that a device thread can queue for its own half without a rendezvous on
-   the host, overlapped steps, decisions (`Engine::decide`), the prefix
-   cache, sampling on the device, and the Vulkan backend.
-2. Kernels that every current model needs: faster prefill weight kernels (the
-   open points are listed under [Devices](#devices), a Turing path among
-   them), attention over quantized K/V read through page tables (rotated
-   formats, separate K and V widths, the mean of a tile once per tile, exact
-   cells in `f16` pages), the kernels that write K and V in those formats, a
-   sort-free GPU sampler, and the Vulkan mirrors of the weight kernels.
-3. Weight placement and the split planner; connecting `ares-io` and
-   `ares-store` to the devices.
-4. Tokenizer and chat templates; structured output with llguidance.
-   Multimodal input (the projector files that ship next to the models) comes
-   with the first model that has one.
-5. The first model. Architecture-specific work waits for the Qwen4 release;
-   until then `qwen35` (Qwen3.8-27B, the current production model) and
-   `qwen4exp` are the test targets.
-6. Residency of pages (a fixed GPU working set over K/V in pinned RAM),
-   writing pages to and restoring them from `ares-store` in the
-   background, the checkpoint policy for recurrent
-   state, and suspension of a request as a byte copy, which doubles as the
-   test oracle for all state handling.
+The order follows the ranked list in
+[reference/serving-engines-code-survey.md](reference/serving-engines-code-survey.md);
+the source of each item is named there.
+
+1. Kernels, in progress. Weight kernels for all 28 GGUF types on a device
+   layout per class of type: the matrix is rearranged at load into the order
+   the tensor cores read it and decoded in registers, in the same number of
+   bytes. Above a measured row count, one decode of the matrix into `f16`
+   scratch and a dense product. Which kernel serves which shape and row
+   count comes from a table measured per device, not from constants.
+   Attention over the stored K/V read through page tables, and the kernels
+   that write K and V. The layer kernels of `qwen35`. A Turing path. Every
+   kernel on both backends.
+2. The sampler: one kernel per row in which every filter is a threshold on
+   `p / p_max`, exact cut-offs from a radix descent, the pick by noise keyed
+   by seed, position and token, the best candidates per row recorded for the
+   grammar, penalties as sparse lists from the host.
+3. Admission in `ares-sched` and `ares-runtime`. Today a request reserves
+   its longest possible length and is refused when that does not fit, which
+   is a slot under another name. Instead: pages are claimed per step, a
+   reservation covers the output that running requests are expected to
+   produce and corrects itself, a new request is charged only for the rows
+   after its prefix match and waits when it does not fit, and when the pool
+   is short the sequence with the fewest generated tokens is spilled.
+4. `ares-runtime` beyond the skeleton: wider steps through the prefill
+   kernels, decisions (`Engine::decide`), and steps that overlap. The rules
+   for overlap: the pick stays in a device table the next step reads, a
+   finish by end token is seen one step late and its row dropped, pages freed
+   by a commit are reusable only after the step in flight, and a restore is
+   issued per layer with an event the forward stream waits for. The step-time
+   model gets a term for the context length. The Vulkan backend.
+5. The prefix cache: a page enters the index when it fills, tails let a
+   prompt resume at the real end of the cached text, and a prompt is held
+   back while another computes the page it misses. The checkpoint policy for
+   recurrent state (150 MiB per checkpoint for Qwen3.8-27B): dense intervals
+   while generating, sparse in a prompt, always one at the prompt's last page
+   boundary; replay over cached pages without K/V writes; stored compressed
+   if the measurement of narrower state holds.
+6. The first model: `qwen35` assembled in the runtime from the kernels and
+   compared with the llama.cpp fork, then `qwen4exp`. Architecture-specific
+   work for release waits for Qwen4.
+7. Weight placement and the split planner; connecting `ares-io` and
+   `ares-store` to the devices; residency of pages (a fixed GPU working set
+   over K/V in pinned RAM), background writes and restores, and suspension
+   of a request as a byte copy, which doubles as the test oracle for all
+   state handling.
+8. Speculation: the suffix automaton, model drafts kept on the device, a
+   budget of draft rows across requests by survival probability, then the
+   draft heads and draft models.
+9. Structured output with llguidance on the GPU's candidates; forced tokens
+   as rows that are neither sampled nor verified; the mask filled while the
+   device computes; requests whose grammar is compiling in their own queue;
+   tool calls as grammars with a trigger. Multimodal input (the projector
+   files that ship next to the models) comes with the first model that has
+   one.
 
 Every kernel is written for both backends and verified against the same CPU
 reference.
