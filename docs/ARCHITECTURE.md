@@ -21,6 +21,18 @@ Scope decisions:
   GB of RAM, a 63.5 GiB file) Flash-Next can only run with streaming, so the
   case without it is not measured there.
 
+- **Nothing is tuned to one machine.** The CUDA backend serves every GPU
+  that CUDA 13 supports, the Vulkan backend every other. Which kernel, block
+  shape or row-count boundary a device gets may depend on its class (its
+  compute capability on CUDA: "Ampere and Ada use this"; what the device
+  reports on Vulkan) or on something measured on the device at load (the
+  tensor cores' rate with `f32` against `f16` accumulation, memory
+  bandwidth, the link to another device), never on a device name, a vendor
+  string, an ordinal, or a constant that is only the result of a measurement
+  on the development machine. The numbers in this document come from an RTX
+  4070 and an RTX 3060; a class that could not be run there is compiled and
+  marked untested.
+
 - **Current models have recurrent layers.** Every architecture the engine
   targets mixes recurrent layers with attention that is either dense (Spark)
   or sparse (Flash-Next, Qwen4). State that is not addressable by position is
