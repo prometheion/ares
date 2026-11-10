@@ -25,7 +25,11 @@
 //
 // An expert that was picked and has no slot yet is waited for in step 1, by
 // the blocks of that expert only, on the device (see expert_layout.cuh); the
-// blocks of the experts that are there compute meanwhile.
+// blocks of the experts that are there compute meanwhile. The wait ends with
+// the expert's slot, or with the host's claim of the group: then the CPU
+// computes the expert, both kernels leave it out, and the down kernel adds
+// the host's sum for the rows at its end, waiting for it if it must. A record
+// without a missing expert never looks at the host share.
 #pragma once
 
 #include "common.cuh"
@@ -121,11 +125,14 @@ static_assert(ARES_EXPERT_GU_WARPS * ARES_EXPERT_GU_VALUES == 32, "a block is on
 //   hq, hds                   out: the hidden values of every pair, quantized:
 //                             pair p has n_ff int8 at hq + p * n_ff and n_ff / 32
 //                             (d, s) at hds + p * (n_ff / 32)
+//   host                      the layer's host share, or null: without one a
+//                             missing expert can only arrive in a slot
 template <class T>
 static __device__ __forceinline__ void ares_expert_gate_up(
     const uint8_t* __restrict__ pool, uint64_t stride, uint32_t up_offset, const int32_t* slot_of,
     const uint8_t* __restrict__ record, const int8_t* __restrict__ aq, int8_t* __restrict__ hq,
-    float2* __restrict__ hds, uint32_t n_in, uint32_t n_ff, uint32_t n_rows, uint32_t k) {
+    float2* __restrict__ hds, const AresHostShare* host, uint32_t n_in, uint32_t n_ff, uint32_t n_rows,
+    uint32_t k) {
     static_assert(32 % T::LANES == 0, "a block is shared by whole lanes of a warp");
     __shared__ __align__(16) uint8_t smem[T::SMEM_BYTES > 0 ? T::SMEM_BYTES : 1];
     __shared__ float hidden[ARES_MAX_BATCH][32];
@@ -140,12 +147,22 @@ static __device__ __forceinline__ void ares_expert_gate_up(
     const uint32_t first_pair = group->first_pair;
 
     if (threadIdx.x == 0) {
-        // The expert's slot, waited for if the expert is still on its way.
+        // The expert's slot, waited for if the expert is still on its way,
+        // until it has one or the host says that it computes the expert.
         const volatile int32_t* entry = reinterpret_cast<const volatile int32_t*>(&slot_of[expert]);
         int32_t slot = *entry;
-        uint32_t polls = 0;
-        while (slot < 0 && ++polls != ARES_EXPERT_MAX_POLLS) {
-            slot = *entry;
+        if (slot < 0) {
+            const uint32_t mine = ares_route_header(record)->token + 1u;
+            const volatile uint32_t* claim =
+                host != nullptr ? reinterpret_cast<const volatile uint32_t*>(&host->claim[blockIdx.y]) : nullptr;
+            uint32_t polls = 0;
+            while (slot < 0 && ++polls != ARES_EXPERT_MAX_POLLS) {
+                if (claim != nullptr && *claim == mine) {
+                    slot = ARES_EXPERT_ON_HOST;
+                    break;
+                }
+                slot = *entry;
+            }
         }
         slot_found = slot;
     }
@@ -154,6 +171,10 @@ static __device__ __forceinline__ void ares_expert_gate_up(
     }
     __syncthreads();
     const int32_t slot = slot_found;
+    if (slot == ARES_EXPERT_ON_HOST) {
+        // The host computes this expert: nothing of it is needed here.
+        return;
+    }
 
     const uint32_t warp = threadIdx.x >> 5;
     const uint32_t lane = threadIdx.x & 31;
@@ -221,11 +242,13 @@ static __device__ __forceinline__ void ares_expert_gate_up(
 //   pool, stride, down_offset, slot_of, record   as above
 //   hq, hds   the pairs' hidden values, as ares_expert_gate_up wrote them
 //   out       n_rows rows of n_out f32; the experts' weighted sum is added
+//   host      the layer's host share, or null
 template <class T>
 static __device__ __forceinline__ void ares_expert_down(
     const uint8_t* __restrict__ pool, uint64_t stride, uint32_t down_offset, const int32_t* slot_of,
     const uint8_t* __restrict__ record, const int8_t* __restrict__ hq, const float2* __restrict__ hds,
-    float* __restrict__ out, uint32_t n_ff, uint32_t n_out, uint32_t n_rows, uint32_t k) {
+    float* __restrict__ out, const AresHostShare* host, uint32_t n_ff, uint32_t n_out, uint32_t n_rows,
+    uint32_t k) {
     static_assert(32 % T::LANES == 0, "a block is shared by whole lanes of a warp");
     constexpr int ROWS = ARES_MMVQ_ROWS;
     __shared__ __align__(16) uint8_t smem[T::SMEM_BYTES > 0 ? T::SMEM_BYTES : 1];
@@ -250,10 +273,20 @@ static __device__ __forceinline__ void ares_expert_down(
         }
     }
 
+    // Whether the host computes any of the groups: only a group without a
+    // slot can say so, so a record whose experts are all there reads nothing
+    // of the host share.
+    const uint32_t mine = ares_route_header(record)->token + 1u;
+    bool on_host = false;
+
     for (uint32_t g = 0; g < n_groups; g++) {
         const AresExpertGroup group = groups[g];
         const int32_t slot = slot_of[group.expert];
         const uint32_t mask = group.rows;
+        if (slot < 0 && host != nullptr && host->claim[g] == mine) {
+            on_host = true;
+            continue;
+        }
         float part[ROWS][ARES_MAX_BATCH];
 #pragma unroll
         for (int r = 0; r < ROWS; r++) {
@@ -288,13 +321,30 @@ static __device__ __forceinline__ void ares_expert_down(
         }
     }
 
+    // The host's sums, waited for like a slot: by the one thread of the warp
+    // that writes the outputs. Sums that never arrive poison the rows.
+    const float* host_sum = nullptr;
+    bool host_lost = false;
+    if (on_host && lane == 0) {
+        const volatile uint32_t* done = reinterpret_cast<const volatile uint32_t*>(&host->done);
+        uint32_t polls = 0;
+        while (*done != mine && ++polls != ARES_EXPERT_MAX_POLLS) {
+        }
+        host_lost = *done != mine;
+        host_sum = reinterpret_cast<const float*>(reinterpret_cast<const uint8_t*>(host) + ARES_HOST_SUM_OFFSET);
+    }
+
 #pragma unroll
     for (int r = 0; r < ROWS; r++) {
 #pragma unroll
         for (int b = 0; b < ARES_MAX_BATCH; b++) {
             if (b < static_cast<int>(n_rows)) {
-                const float total = ares_warp_sum(acc[r][b]);
+                float total = ares_warp_sum(acc[r][b]);
                 if (lane == 0 && row0 + r < n_out) {
+                    if (host_sum != nullptr) {
+                        total += host_lost ? __int_as_float(0x7fc00000)
+                                           : host_sum[static_cast<size_t>(b) * n_out + row0 + r];
+                    }
                     out[static_cast<size_t>(b) * n_out + row0 + r] += total;
                 }
             }
@@ -306,18 +356,18 @@ static __device__ __forceinline__ void ares_expert_down(
 #define ARES_EXPERT_GATE_UP_KERNEL(NAME, T)                                                     \
     extern "C" __global__ void __launch_bounds__(ARES_EXPERT_GU_WARPS * 32) NAME(              \
         const uint8_t* pool, uint64_t stride, uint32_t up_offset, const int32_t* slot_of,       \
-        const uint8_t* record, const int8_t* aq, int8_t* hq, float2* hds, uint32_t n_in,        \
-        uint32_t n_ff, uint32_t n_rows, uint32_t k) {                                           \
-        ares_expert_gate_up<T>(pool, stride, up_offset, slot_of, record, aq, hq, hds, n_in,     \
-                               n_ff, n_rows, k);                                                \
+        const uint8_t* record, const int8_t* aq, int8_t* hq, float2* hds,                       \
+        const AresHostShare* host, uint32_t n_in, uint32_t n_ff, uint32_t n_rows, uint32_t k) { \
+        ares_expert_gate_up<T>(pool, stride, up_offset, slot_of, record, aq, hq, hds, host,     \
+                               n_in, n_ff, n_rows, k);                                          \
     }
 
 // Defines the down kernel `NAME` for the weight type `T`.
 #define ARES_EXPERT_DOWN_KERNEL(NAME, T)                                                        \
     extern "C" __global__ void __launch_bounds__(ARES_MMVQ_WARPS * 32) NAME(                   \
         const uint8_t* pool, uint64_t stride, uint32_t down_offset, const int32_t* slot_of,     \
-        const uint8_t* record, const int8_t* hq, const float2* hds, float* out, uint32_t n_ff,  \
-        uint32_t n_out, uint32_t n_rows, uint32_t k) {                                          \
-        ares_expert_down<T>(pool, stride, down_offset, slot_of, record, hq, hds, out, n_ff,     \
-                            n_out, n_rows, k);                                                  \
+        const uint8_t* record, const int8_t* hq, const float2* hds, float* out,                 \
+        const AresHostShare* host, uint32_t n_ff, uint32_t n_out, uint32_t n_rows, uint32_t k) {\
+        ares_expert_down<T>(pool, stride, down_offset, slot_of, record, hq, hds, out, host,     \
+                            n_ff, n_out, n_rows, k);                                            \
     }

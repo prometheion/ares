@@ -19,6 +19,24 @@
 // expert that the router picked and that has no entry yet will get one: the
 // kernel waits for it on the device (expert_ffn.cuh). The host never has to
 // synchronise with the step to repair a miss.
+//
+// The host may also compute a missing expert itself, on the CPU, instead of
+// uploading it. Each layer then has a **host share** on the device
+// (AresHostShare below): the host claims groups of the layer's record in it,
+// the kernels leave those groups out, and the down kernel adds the host's
+// weighted sum of them to the rows' outputs, waiting for it on the device as
+// it would for a slot. Three more rules:
+//
+// - A missing expert of the running step gets a table entry or a claim,
+//   never both: the host does not write an entry for an expert it has
+//   claimed until the step is past the layer.
+// - A claim and a sum are marked with the token of the record they answer
+//   (plus one, so that zeroed memory claims nothing), and the tokens of two
+//   records that use the same share one after the other differ. Marks of an
+//   earlier record are then never taken for the running one.
+// - The sum is on the device before its mark is written.
+//
+// A layer whose record has no missing expert reads nothing of the share.
 #pragma once
 
 #include "common.cuh"
@@ -35,6 +53,29 @@
 // of the caller; the rows that wanted it then get NaN instead of a device
 // that hangs for good.
 #define ARES_EXPERT_MAX_POLLS 0xF0000000u
+
+// The most groups a record can have: ARES_MAX_BATCH rows of
+// ARES_EXPERT_MAX_K picks.
+#define ARES_HOST_MAX_GROUPS 128
+
+// What the kernels' wait for a missing expert ends with instead of a slot,
+// when the host has claimed the expert's group.
+#define ARES_EXPERT_ON_HOST (-2)
+
+// The host share of a layer. Behind it, at ARES_HOST_SUM_OFFSET, are the sums:
+// n_rows rows of n_out f32, row b's being the sum over the claimed groups
+// that row b picked of weight * expert output.
+struct AresHostShare {
+    // claim[g] == token + 1: the host computes group g of the record `token`.
+    uint32_t claim[ARES_HOST_MAX_GROUPS];
+    // done == token + 1: the sums for the record `token` are behind this.
+    uint32_t done;
+    uint32_t reserved[3];
+};
+
+#define ARES_HOST_SUM_OFFSET 528
+
+static_assert(sizeof(AresHostShare) == ARES_HOST_SUM_OFFSET, "the host writes the share by offsets");
 
 // The head of a route record. The record of a layer and step is, in this
 // order (cap = n_rows * k):

@@ -1,19 +1,20 @@
 //! The expert store: the way of an expert of a mixture-of-experts model from
 //! the file over RAM into a VRAM slot, and what happens when a step needs an
-//! expert that is not in one.
+//! expert that is not in one: it is streamed to the device or computed on
+//! the CPU, whichever is sooner.
 //!
 //! # Tiers
 //!
 //! - **VRAM.** Each device has pools of slots, one pool per slot size, and
 //!   each layer on the device has a number of them ([`ares_weights::SlotSet`],
-//!   divided by [`ares_weights::split_slots`]). An expert is computed only
-//!   from a slot: nothing is ever computed on the CPU. The kernels find it
-//!   through the layer's slot table on the device
-//!   (`ares_cuda::ExpertKernels`).
+//!   divided by [`ares_weights::split_slots`]). The device computes an
+//!   expert from its slot, which the kernels find through the layer's slot
+//!   table on the device (`ares_cuda::ExpertKernels`).
 //! - **RAM.** One page-locked region, cut into slots the same way. Reads from
 //!   the file land here, in place and in the file's bytes (a read covers
 //!   whole blocks, so a slot is the expert plus at most two blocks per
-//!   matrix), and uploads go from here. The tier holds what VRAM does not:
+//!   matrix), uploads go from here, and the CPU computes from here
+//!   ([`cpu`]). The tier holds what VRAM does not:
 //!   an expert that VRAM holds is worth nothing here and gives way first, and
 //!   an expert that VRAM evicts comes down into it.
 //! - **SSD.** The file itself, read through `ares-io`: demand reads for
@@ -22,10 +23,16 @@
 //! # A step
 //!
 //! The step is enqueued whole and never waits for the host. The router of a
-//! layer writes a route record that reaches the host on a side stream
-//! ([`ExpertStore::routed`]). For every pick that has no slot, the kernels of
-//! that expert wait on the device for its table entry, and the store brings
-//! it: from RAM with an upload, or from the file into RAM first. Whatever
+//! layer writes a route record that reaches the host on a side stream, with
+//! the layer's input rows ([`ExpertStore::routed_rows`]). For every pick
+//! that has no slot, the kernels of that expert wait on the device, and the
+//! store serves it one of two ways, by what its measured costs say
+//! (`hybrid.rs`): it uploads the expert (from RAM, or from the file into RAM
+//! first) and writes its table entry, or it claims the expert for the CPU,
+//! whose workers compute it from the bytes in RAM, and delivers the sum of
+//! the claimed experts' outputs for each row, which the device adds where
+//! it would have added theirs. What VRAM holds is decided apart from that,
+//! between steps, from the heat, and never makes a step wait. Whatever
 //! names experts before their layer runs (the routers of later layers applied
 //! early, the token table) calls [`ExpertStore::predicted`], and the store
 //! starts on them at lower priority.
@@ -42,7 +49,9 @@
 //! One thread owns the store and calls it; the store never blocks. Reads run
 //! on the I/O thread of `ares-io`, copies on the device.
 
+pub mod cpu;
 mod device;
+mod hybrid;
 mod tier;
 
 use std::any::Any;
@@ -57,7 +66,8 @@ use ares_weights::{
     split_slots,
 };
 
-pub use device::{CudaSlots, HostSlots, SlotDevice};
+pub use device::{CudaSlots, HostShareState, HostSlots, SlotDevice};
+pub use hybrid::{CostModel, Miss, PromoteRule, Serve};
 pub use tier::Pool;
 use tier::Tier;
 
@@ -266,6 +276,9 @@ struct Wanted {
     demand: bool,
     since: Instant,
     source: Source,
+    /// The CPU computes it once its bytes are in RAM; otherwise it is
+    /// uploaded.
+    cpu: bool,
 }
 
 #[derive(Debug)]
@@ -276,12 +289,17 @@ struct ReadOp {
     parts_left: u8,
     failed: bool,
     demand: bool,
+    since: Instant,
 }
 
 #[derive(Clone, Copy, Debug)]
 enum DeviceOp {
-    /// RAM to VRAM: commit the slot, release the RAM copy.
-    Upload { layer: usize, swap: Swap },
+    /// RAM to VRAM, the table entry behind the bytes: commit the slot,
+    /// release the RAM copy.
+    Upload { layer: usize, swap: Swap, since: Instant },
+    /// RAM to VRAM, the bytes only: the entry is written when no step is at
+    /// the layer (`hybrid.rs`).
+    Promotion { layer: usize, swap: Swap, since: Instant },
     /// VRAM to RAM: commit the RAM slot.
     Demote { layer: usize, swap: Swap },
 }
@@ -332,6 +350,25 @@ pub struct StoreStats {
     pub disk_miss_ms: Vec<f32>,
     /// And for those that were in RAM: the time of an upload.
     pub ram_miss_ms: Vec<f32>,
+    /// Experts the CPU computed, the (expert, row) pairs that was, and the
+    /// jobs it was done in.
+    pub cpu_experts: u64,
+    pub cpu_pairs: u64,
+    pub cpu_jobs: u64,
+    /// Milliseconds the workers spent in those jobs, summed over the workers.
+    pub cpu_busy_ms: f64,
+    /// For every layer the CPU had a part in: milliseconds from the arrival
+    /// of the record to the delivery of the sums.
+    pub cpu_ms: Vec<f32>,
+    /// Experts that took a VRAM slot between steps, by heat.
+    pub promotions: u64,
+    /// Milliseconds the reads of experts a step waited for took, from their
+    /// start to the bytes being in RAM, summed over the experts.
+    pub demand_read_ms: f64,
+    /// Milliseconds layers waited for what they missed, summed over the
+    /// layers: from the arrival of a record to the last of its misses being
+    /// in a slot or delivered.
+    pub wait_ms: f64,
 }
 
 /// The expert tiers of a model and the work that feeds them.
@@ -363,6 +400,9 @@ pub struct ExpertStore<D: SlotDevice> {
     /// each in the order of its stream.
     device_ops: Vec<[VecDeque<(u64, DeviceOp)>; 2]>,
     wants: Vec<Wanted>,
+    /// Layers of the running step that miss something, and since when.
+    waits: Vec<(usize, Instant)>,
+    hybrid: Option<hybrid::Hybrid>,
     stats: StoreStats,
 }
 
@@ -517,6 +557,8 @@ impl<D: SlotDevice> ExpertStore<D> {
             completions: Vec::new(),
             device_ops: devices.iter().map(|_| [VecDeque::new(), VecDeque::new()]).collect(),
             wants: Vec::new(),
+            waits: Vec::new(),
+            hybrid: None,
             stats: StoreStats::default(),
             config,
             map,
@@ -579,7 +621,7 @@ impl<D: SlotDevice> ExpertStore<D> {
 
     /// Experts a step waits for that are not in their slot yet.
     pub fn waiting(&self) -> usize {
-        self.wants.iter().filter(|w| w.demand).count()
+        self.wants.iter().filter(|w| w.demand).count() + self.cpu_waiting()
     }
 
     /// Whether nothing is on its way: no read, no copy, nothing wanted.
@@ -588,6 +630,7 @@ impl<D: SlotDevice> ExpertStore<D> {
             && self.reads.is_empty()
             && self.guesses.is_empty()
             && self.device_ops.iter().flatten().all(VecDeque::is_empty)
+            && self.cpu_is_settled()
     }
 
     /// A step starts: its routers have not run. Call it before the step is
@@ -597,6 +640,7 @@ impl<D: SlotDevice> ExpertStore<D> {
         self.filling = false;
         self.in_step = true;
         self.phase.fill(Phase::Ahead);
+        self.cpu_begin_step();
     }
 
     /// The route record of `layer` of the running step has arrived: `picks`
@@ -640,10 +684,18 @@ impl<D: SlotDevice> ExpertStore<D> {
                 self.stats.miss_from_disk += 1;
                 Source::Disk
             };
-            self.wants.push(Wanted { layer, expert: *expert, demand: true, since: now, source });
+            self.wants.push(Wanted {
+                layer,
+                expert: *expert,
+                demand: true,
+                since: now,
+                source,
+                cpu: false,
+            });
             missing += 1;
         }
         if missing > 0 {
+            self.waits.push((layer, now));
             self.poll()?;
         }
         Ok(missing)
@@ -750,6 +802,7 @@ impl<D: SlotDevice> ExpertStore<D> {
                     demand: false,
                     since: now,
                     source: Source::OnItsWay,
+                    cpu: false,
                 });
             }
             let ram = &self.ram.sets[layer];
@@ -786,14 +839,20 @@ impl<D: SlotDevice> ExpertStore<D> {
         {
             self.rebalance()?;
         }
-        // All removals first, then the copies down: the next step waits for
-        // the removals only.
-        let mut evicted = Vec::new();
-        for layer in 0..self.layers.len() {
-            self.refill_reserve(layer, &mut evicted)?;
-        }
-        for (layer, expert, slot) in evicted {
-            self.demote(layer, expert, slot)?;
+        if self.serve() == Serve::Stream {
+            // All removals first, then the copies down: the next step waits
+            // for the removals only.
+            let mut evicted = Vec::new();
+            for layer in 0..self.layers.len() {
+                self.refill_reserve(layer, &mut evicted)?;
+            }
+            for (layer, expert, slot) in evicted {
+                self.demote(layer, expert, slot)?;
+            }
+        } else {
+            // With a CPU half no miss needs a free slot: what moves into
+            // VRAM is what the heat says, and it moves now.
+            self.promote_hot()?;
         }
         self.poll()
     }
@@ -817,6 +876,9 @@ impl<D: SlotDevice> ExpertStore<D> {
                 self.ram.sets[op.layer].abort(&op.swap);
             } else {
                 self.ram.sets[op.layer].commit(&op.swap);
+                if op.demand {
+                    self.stats.demand_read_ms += op.since.elapsed().as_secs_f64() * 1e3;
+                }
             }
         }
 
@@ -828,13 +890,17 @@ impl<D: SlotDevice> ExpertStore<D> {
                 }
                 self.device_ops[device][queue].pop_front();
                 match op {
-                    DeviceOp::Upload { layer, swap } => {
+                    DeviceOp::Upload { layer, swap, since } => {
                         self.vram.sets[layer].commit(&swap);
                         // The copy in RAM has done its work: it may give
                         // way to the next read.
                         self.ram.sets[layer].release(swap.load);
                         self.ram.sets[layer].unprotect(swap.load);
                         self.worth_stale[layer] = true;
+                        self.upload_done(device, since, None);
+                    }
+                    DeviceOp::Promotion { layer, swap, since } => {
+                        self.upload_done(device, since, Some((layer, swap)));
                     }
                     DeviceOp::Demote { layer, swap } => self.ram.sets[layer].commit(&swap),
                 }
@@ -846,6 +912,30 @@ impl<D: SlotDevice> ExpertStore<D> {
         while at < self.wants.len() {
             let want = self.wants[at];
             let (layer, expert) = (want.layer, want.expert);
+            if want.cpu {
+                // The CPU waits for its bytes in RAM, nothing else.
+                if self.ram.sets[layer].contains(expert) {
+                    self.late_job(layer, expert)?;
+                    self.wants.swap_remove(at);
+                    continue;
+                }
+                if self.ram.sets[layer].is_loading(expert) {
+                    self.hurry(layer, expert);
+                } else {
+                    self.refresh_worth(layer);
+                    let started = self.ram.sets[layer].start_read(
+                        expert,
+                        Want::Demand,
+                        self.step,
+                        self.ram_worth.layer(layer),
+                    );
+                    if let Start::Slot(swap) = started {
+                        self.read(layer, swap, true)?;
+                    }
+                }
+                at += 1;
+                continue;
+            }
             if self.vram.sets[layer].contains(expert) {
                 if want.demand {
                     let ms = want.since.elapsed().as_secs_f32() * 1e3;
@@ -893,6 +983,20 @@ impl<D: SlotDevice> ExpertStore<D> {
                 break;
             };
             self.read(started.layer, started.swap, self.filling)?;
+        }
+
+        self.poll_cpu()?;
+
+        // Layers that have everything they missed.
+        let mut at = 0;
+        while at < self.waits.len() {
+            let (layer, since) = self.waits[at];
+            if self.wants.iter().any(|w| w.demand && w.layer == layer) || self.cpu_is_open(layer) {
+                at += 1;
+            } else {
+                self.stats.wait_ms += since.elapsed().as_secs_f64() * 1e3;
+                self.waits.swap_remove(at);
+            }
         }
         Ok(())
     }
@@ -975,7 +1079,15 @@ impl<D: SlotDevice> ExpertStore<D> {
         }
         self.reads.insert(
             id,
-            ReadOp { layer, expert: swap.load, swap, parts_left: 3, failed: false, demand },
+            ReadOp {
+                layer,
+                expert: swap.load,
+                swap,
+                parts_left: 3,
+                failed: false,
+                demand,
+                since: Instant::now(),
+            },
         );
         Ok(())
     }
@@ -997,50 +1109,10 @@ impl<D: SlotDevice> ExpertStore<D> {
     }
 
     /// Starts the upload of an expert that is in RAM into a VRAM slot, if a
-    /// slot can be had now.
+    /// slot can be had now, with its table entry behind it.
     fn promote(&mut self, layer: usize, expert: u32, demand: bool) -> Result<(), StoreError> {
-        if self.vram.sets[layer].n_free() == 0 && !self.can_evict(layer) {
-            return Ok(());
-        }
         let want = if demand { Want::Demand } else { Want::Guess };
-        let Start::Slot(swap) =
-            self.vram.sets[layer].start_read(expert, want, self.step, self.heat.layer(layer))
-        else {
-            return Ok(());
-        };
-        let g = self.layers[layer];
-        let slot = self.vram.slot(layer, swap.slot);
-        // The RAM copy stays where it is until the device has read it.
-        self.ram.sets[layer].hold(expert);
-        if let Some(evicted) = swap.evict {
-            self.stats.evictions += 1;
-            self.devices[g.device].set_entry(layer, evicted, -1)?;
-            self.demote(layer, evicted, slot)?;
-        }
-        let Some(ram_slot) = self.ram.sets[layer].slot(expert) else {
-            return Err(StoreError::Plan("a held expert left the RAM tier".into()));
-        };
-        let skips = self.ram_skip[self.ram.pool_of[layer]][self.ram.slot(layer, ram_slot) as usize];
-        for (part, skip) in skips.iter().enumerate() {
-            // SAFETY: the source is the expert's bytes in its RAM slot,
-            // which the hold keeps in place until the mark below is passed.
-            unsafe {
-                let src = self.ram_part(layer, ram_slot, part).add(*skip as usize);
-                self.devices[g.device].upload(
-                    g.device_pool,
-                    slot,
-                    g.offsets[part],
-                    src,
-                    g.lens[part],
-                )?;
-            }
-            self.stats.upload_bytes += g.lens[part] as u64;
-        }
-        self.devices[g.device].set_entry(layer, expert, slot as i32)?;
-        let mark = self.devices[g.device].mark(false)?;
-        self.device_ops[g.device][0].push_back((mark, DeviceOp::Upload { layer, swap }));
-        self.stats.uploads += 1;
-        if !demand {
+        if self.upload(layer, expert, want, true)? && !demand {
             self.stats.early_uploads += 1;
         }
         Ok(())

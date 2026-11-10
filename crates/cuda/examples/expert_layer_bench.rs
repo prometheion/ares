@@ -120,6 +120,7 @@ impl Bench<'_> {
                 self.act.ptr(),
                 self.hidden.ptr(),
                 self.out.ptr(),
+                None,
                 self.n_rows,
                 groups,
             )

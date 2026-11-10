@@ -23,6 +23,13 @@
 //! need; the host follows the copies of the route records and repairs what is
 //! missing. The rules for changing the table under running kernels are in
 //! `kernels/expert_layout.cuh`.
+//!
+//! The host may repair a miss in a second way: it computes the expert on the
+//! CPU. A layer then has a **host share** on the device ([`HostShare`] says
+//! how it is laid out): the host marks the groups of the record it computes,
+//! the kernels leave them out, and the down kernel adds the host's sums to
+//! the rows' outputs, waiting for them on the device. A layer whose experts
+//! are all in slots never reads its share.
 
 use ares_core::GgmlType;
 
@@ -52,6 +59,49 @@ const GATE_UP_TYPES: [(GgmlType, &str, u64); 3] = [
 
 /// The types down may have.
 const DOWN_TYPES: [(GgmlType, &str, u64); 1] = [(GgmlType::Q2_0, "ares_expert_down_q2_0", 2)];
+
+/// The host share of a layer (`AresHostShare` in
+/// `kernels/expert_layout.cuh`): where the host writes which groups of a
+/// record it computes on the CPU, and their sums.
+///
+/// The share is `claim[HostShare::MAX_GROUPS]` (`u32`), a `done` word, and
+/// from [`HostShare::SUM_OFFSET`] on the sums: `n_rows` rows of `n_embd`
+/// `f32`, row `b`'s the sum over the claimed experts it picked of weight
+/// times expert output. For the record with token `t`:
+///
+/// 1. the host writes [`HostShare::mark`]`(t)` into `claim[g]` of every
+///    group `g` it computes: the kernels that waited for those experts stop
+///    waiting and leave them out;
+/// 2. it writes the sums, and after them the same mark into `done`: the
+///    down kernel, which waits for that, adds the sums.
+///
+/// The rules the kernels rely on: a missing expert of the running step gets
+/// a table entry or a claim, never both; the sums are on the device before
+/// `done` is marked; and two records that use a share one after the other
+/// have different tokens.
+#[derive(Clone, Copy, Debug)]
+pub struct HostShare;
+
+impl HostShare {
+    /// The most groups a record has (`ARES_HOST_MAX_GROUPS`).
+    pub const MAX_GROUPS: u32 = 128;
+    /// Byte offset of the `done` word.
+    pub const DONE_OFFSET: u64 = 4 * Self::MAX_GROUPS as u64;
+    /// Byte offset of the sums (`ARES_HOST_SUM_OFFSET`).
+    pub const SUM_OFFSET: u64 = Self::DONE_OFFSET + 16;
+
+    /// What marks a claim or the sums as those of the record with `token`.
+    /// It is never 0 for a token below `u32::MAX`, so a zeroed share marks
+    /// nothing.
+    pub fn mark(token: u32) -> u32 {
+        token.wrapping_add(1)
+    }
+
+    /// Byte offset of the claim word of group `group` of a record.
+    pub fn claim_offset(group: u32) -> u64 {
+        4 * u64::from(group)
+    }
+}
 
 /// Bytes of the record's header and of one group (`AresRouteHeader`,
 /// `AresExpertGroup`).
@@ -142,6 +192,11 @@ impl ExpertShape {
     pub fn record_bytes(&self, n_rows: u32) -> u64 {
         let cap = u64::from(self.top_k) * u64::from(n_rows);
         HEADER_BYTES as u64 + cap * (8 + GROUP_BYTES as u64)
+    }
+
+    /// Bytes of a layer's [`HostShare`] for steps of up to `n_rows` rows.
+    pub fn host_share_bytes(&self, n_rows: u32) -> u64 {
+        HostShare::SUM_OFFSET + 4 * u64::from(n_rows) * u64::from(self.n_embd)
     }
 
     /// Bytes of the logits scratch for `n_rows` rows.
@@ -491,7 +546,10 @@ impl ExpertKernels {
     /// have, and the surplus blocks return at once.
     ///
     /// An expert of the record whose table entry is -1 is waited for on the
-    /// device until the entry is written; only its own blocks wait.
+    /// device until the entry is written, or, with a `host` share, until the
+    /// host has claimed its group there; only its own blocks wait. If any
+    /// group was claimed, the launch ends with a wait for the host's sums,
+    /// which it adds to `out` ([`HostShare`]).
     ///
     /// # Safety
     ///
@@ -503,8 +561,10 @@ impl ExpertKernels {
     /// the rules of `kernels/expert_layout.cuh`; `record` the record that
     /// [`ExpertKernels::route`] wrote for these rows and this table; `act` the
     /// same activations; `hidden` [`ExpertShape::hidden_bytes`] bytes of
-    /// scratch, 16-byte aligned; `out` `n_rows * n_embd` f32. `hidden` and
-    /// `out` must not overlap anything else named here.
+    /// scratch, 16-byte aligned; `out` `n_rows * n_embd` f32; `host`, if
+    /// given, [`ExpertShape::host_share_bytes`] bytes, 16-byte aligned, that
+    /// only change by the rules of [`HostShare`]. `hidden` and `out` must not
+    /// overlap anything else named here.
     #[allow(clippy::too_many_arguments)]
     pub unsafe fn experts(
         &self,
@@ -516,11 +576,14 @@ impl ExpertKernels {
         act: DevicePtr,
         hidden: DevicePtr,
         out: DevicePtr,
+        host: Option<DevicePtr>,
         n_rows: u32,
         groups: Option<u32>,
     ) -> Result<()> {
         shape.check()?;
         check_rows(n_rows)?;
+        let host = host.unwrap_or(DevicePtr::NULL);
+        check_align("host share", host, 16)?;
         let geometry = || invalid("expert shape", "sizes overflow".into());
         let stride = shape.slot_bytes().ok_or_else(geometry)?;
         let up_offset =
@@ -557,6 +620,7 @@ impl ExpertKernels {
             .ptr(act)
             .ptr(hidden)
             .ptr(hidden_scales)
+            .ptr(host)
             .u32(shape.n_embd)
             .u32(shape.n_ff)
             .u32(n_rows)
@@ -575,6 +639,7 @@ impl ExpertKernels {
             .ptr(hidden)
             .ptr(hidden_scales)
             .ptr(out)
+            .ptr(host)
             .u32(shape.n_ff)
             .u32(shape.n_embd)
             .u32(n_rows)
@@ -622,6 +687,9 @@ mod tests {
         assert_eq!(flash_next(GgmlType::IQ2_XXS).slot_bytes(), Some(1_305_600));
         assert_eq!(flash_next(GgmlType::IQ1_M).slot_bytes(), Some(1_177_600));
         assert!(shape.check().is_ok());
+        assert_eq!(HostShare::SUM_OFFSET, 528);
+        assert_eq!(shape.host_share_bytes(2), 528 + 2 * 2560 * 4);
+        assert_eq!(HostShare::mark(0), 1);
     }
 
     #[test]

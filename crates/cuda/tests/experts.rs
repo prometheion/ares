@@ -30,8 +30,8 @@ use std::sync::OnceLock;
 
 use ares_core::GgmlType;
 use ares_cuda::{
-    Device, DeviceBuffer, ExpertKernels, ExpertShape, Kernels, PinnedBuffer, RouteRecord, Stream,
-    Wait, device_count,
+    Device, DeviceBuffer, ExpertKernels, ExpertShape, HostShare, Kernels, PinnedBuffer,
+    RouteRecord, Stream, Wait, device_count,
 };
 
 fn gpus() -> Option<&'static [Device]> {
@@ -224,9 +224,68 @@ struct Rig {
     hidden: DeviceBuffer,
     out: DeviceBuffer,
     pool: DeviceBuffer,
+    /// The layer's host share, for the tests in which the host computes,
+    /// and what the host sends through: a stream and pinned memory.
+    host: Option<DeviceBuffer>,
+    reply: Option<(Stream, PinnedBuffer)>,
 }
 
 impl Rig {
+    /// A rig whose experts may be claimed by the host.
+    fn with_host(device: &Device, layer: &Layer<'_>, n_rows: u32, n_slots: u64) -> Self {
+        let mut rig = Self::new(device, layer, n_rows, n_slots);
+        let bytes = layer.shape.host_share_bytes(n_rows);
+        let host = DeviceBuffer::new(device, bytes).unwrap();
+        host.write(0, &vec![0u8; bytes as usize]).unwrap();
+        rig.host = Some(host);
+        rig.reply = Some((
+            Stream::new(device, 0).unwrap(),
+            PinnedBuffer::new(device, 20 + bytes as usize).unwrap(),
+        ));
+        rig
+    }
+
+    /// The host's side of a step: claims `groups` of the record with
+    /// `token`. Like everything the host sends while a step runs, the words
+    /// go from pinned memory on a stream of their own: a synchronous copy
+    /// would wait for the very kernels that wait for it, and so would
+    /// freeing pinned memory, which is why the rig keeps both for its
+    /// lifetime. `cell` is the word of the staging memory to send from (0 to
+    /// 3), one per call, so that no call rewrites what a copy may still read.
+    fn claim(&self, token: u32, groups: &[u32], cell: usize) {
+        let host = self.host.as_ref().unwrap();
+        let (reply, staging) = self.reply.as_ref().unwrap();
+        // SAFETY: the pinned word lives as long as the rig, nothing else
+        // writes it, and every claim word is inside the share.
+        unsafe {
+            let word = staging.as_ptr().add(4 * cell).cast_mut();
+            std::ptr::copy_nonoverlapping(HostShare::mark(token).to_le_bytes().as_ptr(), word, 4);
+            for group in groups {
+                reply
+                    .copy_from_host(host.ptr().offset(HostShare::claim_offset(*group)), word, 4)
+                    .unwrap();
+            }
+        }
+    }
+
+    /// Delivers `sums` for the record with `token`: the sums, then the mark.
+    fn deliver(&self, token: u32, sums: &[f32]) {
+        let host = self.host.as_ref().unwrap();
+        let (reply, staging) = self.reply.as_ref().unwrap();
+        let bytes = f32_bytes(sums);
+        // SAFETY: the pinned bytes (behind the four claim words) live as
+        // long as the rig, and both ranges are inside the share.
+        unsafe {
+            let base = staging.as_ptr().add(16).cast_mut();
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), base.add(4), bytes.len());
+            std::ptr::copy_nonoverlapping(HostShare::mark(token).to_le_bytes().as_ptr(), base, 4);
+            reply
+                .copy_from_host(host.ptr().offset(HostShare::SUM_OFFSET), base.add(4), bytes.len())
+                .unwrap();
+            reply.copy_from_host(host.ptr().offset(HostShare::DONE_OFFSET), base, 4).unwrap();
+        }
+    }
+
     fn new(device: &Device, layer: &Layer<'_>, n_rows: u32, n_slots: u64) -> Self {
         let shape = &layer.shape;
         let router = DeviceBuffer::new(device, shape.router_bytes()).unwrap();
@@ -251,6 +310,8 @@ impl Rig {
             hidden: DeviceBuffer::new(device, shape.hidden_bytes(n_rows)).unwrap(),
             out: DeviceBuffer::new(device, values * 4).unwrap(),
             pool: DeviceBuffer::new(device, n_slots * shape.slot_bytes().unwrap()).unwrap(),
+            host: None,
+            reply: None,
         }
     }
 
@@ -315,6 +376,7 @@ impl Rig {
                     self.act.ptr(),
                     self.hidden.ptr(),
                     self.out.ptr(),
+                    self.host.as_ref().map(DeviceBuffer::ptr),
                     n_rows,
                     groups,
                 )
@@ -634,6 +696,81 @@ fn a_missing_expert_is_waited_for_on_the_device() {
         upload.synchronize().unwrap();
         let (_, out) = rig.read_out(shape, 2);
         assert_eq!(out, reference.out, "waiting must not change the result");
+    }
+}
+
+/// The host computes an expert instead of uploading it: the kernels leave
+/// the claimed group out, wait for the host's sums and add them.
+#[test]
+fn a_claimed_expert_comes_from_the_host() {
+    let Some(gpus) = gpus() else { return };
+    let layer = synthetic_layer(GgmlType::IQ2_S, 47);
+    let shape = &layer.shape;
+    let n = shape.n_embd as usize;
+    let mut rng = Rng(11);
+    let x: Vec<f32> = (0..2 * n).map(|_| rng.activation()).collect();
+    for device in gpus {
+        let reference = run_layer(device, &layer, &x, 2, true);
+
+        // One step with the experts in `resident` in slots and the others
+        // claimed, the host delivering `sums`. Returns the output and
+        // whether the step waited for the host.
+        let run = |token: u32, resident: &dyn Fn(usize, usize) -> bool, sums: &[f32]| {
+            let rig = Rig::with_host(device, &layer, 2, 16);
+            let record = rig.route(shape, &x, 2, token);
+            let picked: Vec<u32> = RouteRecord::parse(&record, shape.top_k, 2)
+                .unwrap()
+                .groups()
+                .map(|g| g.expert)
+                .collect();
+            let mut claimed = Vec::new();
+            for (group, expert) in picked.iter().enumerate() {
+                if resident(group, picked.len()) {
+                    rig.put_expert(shape, group as u32, &(layer.expert)(*expert));
+                    rig.set_entry(*expert, group as i32);
+                } else {
+                    claimed.push(group as u32);
+                }
+            }
+            rig.enqueue_experts(shape, 2, None);
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            let waited_for_claim = !rig.stream.is_idle().unwrap();
+            // A claim of an earlier record must not count.
+            rig.claim(token.wrapping_sub(1), &claimed, 0);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            assert_eq!(waited_for_claim, !rig.stream.is_idle().unwrap());
+            rig.claim(token, &claimed, 1);
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            let waited_for_sums = !rig.stream.is_idle().unwrap();
+            rig.deliver(token, sums);
+            rig.stream.synchronize().unwrap();
+            let (_, out) = rig.read_out(shape, 2);
+            (out, waited_for_claim, waited_for_sums)
+        };
+
+        let zeros = vec![0.0f32; 2 * n];
+        let sums: Vec<f32> = (0..2 * n).map(|_| rng.activation()).collect();
+        let last = |group: usize, groups: usize| group + 1 < groups;
+        // Everything in slots: the share is never read, nothing waits.
+        let (all, waited, waited_for_sums) = run(5, &|_, _| true, &sums);
+        assert!(!waited && !waited_for_sums, "a layer without a miss must not wait for the host");
+        assert_eq!(all, reference.out, "a host share must not change a layer without a miss");
+        // The last group claimed: the step waits for the claim, then for
+        // the sums, and adds exactly them.
+        let (without, waited, waited_for_sums) = run(6, &last, &zeros);
+        assert!(waited && waited_for_sums, "the step must wait for the claim and for the sums");
+        let (with, _, _) = run(7, &last, &sums);
+        let expected: Vec<f32> = without.iter().zip(&sums).map(|(o, s)| o + s).collect();
+        assert_eq!(with, expected, "the host's sums are added to the rows as they are");
+        // The claimed group alone, by the device: both halves together are
+        // the whole layer, to the rounding of a different order of additions.
+        let (only, _, _) = run(8, &|group, groups| group + 1 == groups, &zeros);
+        let norm = reference.out.iter().map(|v| f64::from(*v).powi(2)).sum::<f64>();
+        let err = (reference.out.iter().zip(without.iter().zip(&only)))
+            .map(|(r, (a, b))| (f64::from(*r) - f64::from(*a) - f64::from(*b)).powi(2))
+            .sum::<f64>();
+        assert!((err / norm).sqrt() < 1e-6, "the claimed and the computed part do not add up");
+        assert!(only.iter().any(|v| *v != 0.0), "the claimed expert contributes something");
     }
 }
 

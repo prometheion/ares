@@ -90,10 +90,12 @@ dependencies = [
  "ares-cuda",
  "ares-gguf",
  "ares-io",
+ "ares-quant",
  "ares-sched",
  "ares-server",
  "ares-state",
  "ares-weights",
+ "libc",
  "thiserror",
  "tokio",
 ]

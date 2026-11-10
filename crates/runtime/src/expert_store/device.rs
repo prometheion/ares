@@ -9,7 +9,7 @@
 use std::collections::{HashMap, VecDeque};
 
 use ares_core::Ledger;
-use ares_cuda::{Device, DeviceBuffer, DevicePtr, Event, PinnedBuffer, Stream};
+use ares_cuda::{Device, DeviceBuffer, DevicePtr, Event, HostShare, PinnedBuffer, Stream};
 
 use super::StoreError;
 
@@ -58,6 +58,17 @@ pub trait SlotDevice {
 
     /// Whether the device has done everything enqueued before `mark`.
     fn passed(&mut self, mark: u64) -> Result<bool, StoreError>;
+
+    /// Enqueues the host's claim of `groups` of the record `token` of
+    /// `layer`: the CPU computes those experts, and the kernels that wait
+    /// for them stop waiting (`ares_cuda::HostShare`). The store keeps the
+    /// rule that goes with it: no table entry for a claimed expert while the
+    /// step is at the layer.
+    fn claim(&mut self, layer: usize, token: u32, groups: &[u32]) -> Result<(), StoreError>;
+
+    /// Enqueues the host's sums for the record `token` of `layer` (rows of
+    /// `n_embd` values), and behind them the mark that lets the layer go on.
+    fn deliver(&mut self, layer: usize, token: u32, sums: &[f32]) -> Result<(), StoreError>;
 }
 
 /// Table entries on their way to the device: a ring in pinned memory. An
@@ -97,6 +108,25 @@ pub struct CudaSlots {
     fence: Event,
     /// Whether `fence` has been recorded at all.
     removed: bool,
+    shares: Option<Shares>,
+}
+
+/// The host shares of the layers on a device, and what feeds them.
+#[derive(Debug)]
+struct Shares {
+    /// Claims and sums go on a stream of their own: they are a few
+    /// kilobytes that a step waits for, and on the upload stream they
+    /// would queue behind megabytes of experts (the promotions that are on
+    /// their way while a step runs): measured once that way, a layer's sums
+    /// took 1.8 ms from its record at the median instead of 0.2 to 0.3 ms.
+    reply: Stream,
+    /// One share per layer, `bytes` apart.
+    device: DeviceBuffer,
+    /// The same layout in pinned memory: what the copies read. A layer's
+    /// part is written once per step, when the step is at the layer, so a
+    /// copy of the step before has long run.
+    staging: PinnedBuffer,
+    bytes: u64,
 }
 
 impl CudaSlots {
@@ -144,7 +174,44 @@ impl CudaSlots {
             passed: [0, 0],
             fence: Event::new(device)?,
             removed: false,
+            shares: None,
         })
+    }
+
+    /// Gives every layer a host share of `share_bytes` bytes
+    /// (`ExpertShape::host_share_bytes` for the most rows of a step), after
+    /// reserving them in the ledgers: the device's memory and the pinned
+    /// copy the host writes. Without shares the device can only be streamed
+    /// to.
+    pub fn add_host_shares(
+        &mut self,
+        vram: &mut Ledger,
+        pinned: &mut Ledger,
+        share_bytes: u64,
+    ) -> Result<(), StoreError> {
+        let device = self.stream.device();
+        let n_layers = self.tables.len() / (4 * u64::from(self.n_experts));
+        let bytes = share_bytes.next_multiple_of(16);
+        let total = n_layers * bytes;
+        vram.reserve("expert host shares", total)?;
+        pinned.reserve(format!("expert host shares CUDA{}", device.ordinal()), total)?;
+        let buffer = DeviceBuffer::new(device, total.max(16))?;
+        // SAFETY: the whole buffer, on this stream's device.
+        unsafe { self.stream.fill(buffer.ptr(), 0, total as usize)? };
+        self.stream.synchronize()?;
+        self.shares = Some(Shares {
+            reply: Stream::new(device, 0)?,
+            device: buffer,
+            staging: PinnedBuffer::new(device, total.max(16) as usize)?,
+            bytes,
+        });
+        Ok(())
+    }
+
+    /// The host share of `layer`, for the expert kernels; `None` when the
+    /// device has none.
+    pub fn host_share(&self, layer: usize) -> Option<DevicePtr> {
+        self.shares.as_ref().map(|s| s.device.ptr().offset(layer as u64 * s.bytes))
     }
 
     /// Where pool `pool` starts, and the bytes from one slot to the next.
@@ -268,12 +335,78 @@ impl SlotDevice for CudaSlots {
         }
         Ok(mark <= self.passed[queue])
     }
+
+    fn claim(&mut self, layer: usize, token: u32, groups: &[u32]) -> Result<(), StoreError> {
+        let Some(shares) = self.shares.as_mut() else {
+            return Err(StoreError::Plan("a claim on a device without host shares".into()));
+        };
+        let Some(words) = groups.iter().max().map(|g| *g as usize + 1) else { return Ok(()) };
+        if words > HostShare::MAX_GROUPS as usize {
+            return Err(StoreError::Plan(format!("a claim of group {} of a record", words - 1)));
+        }
+        let at = layer * shares.bytes as usize;
+        // SAFETY: the claim words of this layer are inside the pinned copy
+        // and inside the share, and no enqueued copy reads them any more
+        // (they were last written a step ago).
+        unsafe {
+            let cells = shares.staging.as_mut_ptr().add(at).cast::<u32>();
+            for word in 0..words {
+                cells.add(word).write(0);
+            }
+            for group in groups {
+                cells.add(*group as usize).write(HostShare::mark(token));
+            }
+            shares.reply.copy_from_host(
+                shares.device.ptr().offset(at as u64),
+                cells.cast::<u8>().cast_const(),
+                4 * words,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn deliver(&mut self, layer: usize, token: u32, sums: &[f32]) -> Result<(), StoreError> {
+        let Some(shares) = self.shares.as_mut() else {
+            return Err(StoreError::Plan("sums for a device without host shares".into()));
+        };
+        let len = size_of_val(sums);
+        if HostShare::SUM_OFFSET + len as u64 > shares.bytes {
+            return Err(StoreError::Plan(format!("{} sums do not fit a host share", sums.len())));
+        }
+        let at = layer * shares.bytes as usize;
+        // SAFETY: the sums and the mark of this layer are inside the pinned
+        // copy and inside the share; as in `claim`, nothing reads them now.
+        unsafe {
+            let base = shares.staging.as_mut_ptr().add(at);
+            let staged = base.add(HostShare::SUM_OFFSET as usize);
+            std::ptr::copy_nonoverlapping(sums.as_ptr().cast::<u8>(), staged, len);
+            let done = base.add(HostShare::DONE_OFFSET as usize);
+            done.cast::<u32>().write(HostShare::mark(token));
+            let share = shares.device.ptr().offset(at as u64);
+            // The sums first, then their mark: the kernels read the sums
+            // once they see the mark.
+            shares.reply.copy_from_host(share.offset(HostShare::SUM_OFFSET), staged, len)?;
+            shares.reply.copy_from_host(share.offset(HostShare::DONE_OFFSET), done, 4)?;
+        }
+        Ok(())
+    }
 }
 
 enum HostOp {
     Upload { pool: usize, at: usize, src: *const u8, len: usize },
     Download { pool: usize, at: usize, dst: *mut u8, len: usize },
     Entry { layer: usize, expert: u32, slot: i32 },
+    Claim { layer: usize, token: u32, groups: Vec<u32> },
+    Deliver { layer: usize, token: u32, sums: Vec<f32> },
+}
+
+/// What the mock device has of a layer's host share.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct HostShareState {
+    /// The claims of the latest record: its token and the claimed groups.
+    pub claimed: Option<(u32, Vec<u32>)>,
+    /// The sums that were delivered last, and for which token.
+    pub delivered: Option<(u32, Vec<f32>)>,
 }
 
 /// Expert slots in ordinary memory: a [`SlotDevice`] without a device, for
@@ -282,6 +415,7 @@ enum HostOp {
 pub struct HostSlots {
     pools: Vec<(Vec<u8>, u64)>,
     tables: Vec<Vec<i32>>,
+    shares: Vec<HostShareState>,
     queue: VecDeque<(u64, HostOp)>,
     enqueued: u64,
     done: u64,
@@ -303,6 +437,7 @@ impl HostSlots {
                 .map(|(stride, slots)| (vec![0; (*stride * u64::from(*slots)) as usize], *stride))
                 .collect(),
             tables: vec![vec![-1; n_experts as usize]; n_layers],
+            shares: vec![HostShareState::default(); n_layers],
             queue: VecDeque::new(),
             enqueued: 0,
             done: 0,
@@ -327,6 +462,12 @@ impl HostSlots {
                     dst.copy_from_slice(&self.pools[pool].0[at..at + len]);
                 }
                 HostOp::Entry { layer, expert, slot } => self.tables[layer][expert as usize] = slot,
+                HostOp::Claim { layer, token, groups } => {
+                    self.shares[layer].claimed = Some((token, groups));
+                }
+                HostOp::Deliver { layer, token, sums } => {
+                    self.shares[layer].delivered = Some((token, sums));
+                }
             }
             self.done = id;
             ran += 1;
@@ -337,6 +478,11 @@ impl HostSlots {
     /// The table entry of an expert as the device has it now.
     pub fn entry(&self, layer: usize, expert: u32) -> i32 {
         self.tables[layer][expert as usize]
+    }
+
+    /// The host share of a layer as the device has it now.
+    pub fn share(&self, layer: usize) -> &HostShareState {
+        &self.shares[layer]
     }
 
     /// The bytes of a slot as the device has them now.
@@ -394,5 +540,15 @@ impl SlotDevice for HostSlots {
 
     fn passed(&mut self, mark: u64) -> Result<bool, StoreError> {
         Ok(mark <= self.done)
+    }
+
+    fn claim(&mut self, layer: usize, token: u32, groups: &[u32]) -> Result<(), StoreError> {
+        self.push(HostOp::Claim { layer, token, groups: groups.to_vec() });
+        Ok(())
+    }
+
+    fn deliver(&mut self, layer: usize, token: u32, sums: &[f32]) -> Result<(), StoreError> {
+        self.push(HostOp::Deliver { layer, token, sums: sums.to_vec() });
+        Ok(())
     }
 }

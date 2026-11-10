@@ -53,7 +53,8 @@ pub use module::{Args, Function, MAX_ARGS, Module};
 pub use stream::{Event, Stream};
 
 pub use experts::{
-    EXPERT_MAX_EXPERTS, EXPERT_MAX_K, ExpertKernels, ExpertShape, RouteGroup, RouteRecord,
+    EXPERT_MAX_EXPERTS, EXPERT_MAX_K, ExpertKernels, ExpertShape, HostShare, RouteGroup,
+    RouteRecord,
 };
 
 pub use q4::{

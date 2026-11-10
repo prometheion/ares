@@ -389,3 +389,254 @@ impl Rig {
         }
     }
 }
+
+/// The CPU half of the store, on a model whose experts have the types the
+/// CPU kernels compute (IQ2_S gate and up, Q2_0 down) and a mock device.
+mod hybrid {
+    use std::sync::Arc;
+
+    use ares_cuda::{ExpertShape, RouteGroup};
+    use ares_runtime::expert_store::Serve;
+    use ares_runtime::expert_store::cpu::{
+        CpuExpert, CpuPool, Features, LayerJob, Placement, quantize_activations,
+    };
+
+    use super::*;
+
+    const LAYERS: usize = 2;
+    const EXPERTS: u32 = 16;
+    const SHAPE: ExpertShape = ExpertShape {
+        n_embd: 256,
+        n_ff: 64,
+        n_experts: EXPERTS,
+        top_k: 2,
+        gate_ty: GgmlType::IQ2_S,
+        down_ty: GgmlType::Q2_0,
+    };
+
+    /// Matrix `part` of an expert: bytes that differ everywhere and keep
+    /// every scale small (all below 0x40).
+    fn matrix(layer: usize, part: usize, expert: u32) -> Vec<u8> {
+        let len = if part < 2 { SHAPE.gate_bytes() } else { SHAPE.down_bytes() }.unwrap() as usize;
+        let seed = layer * 131 + part * 71 + expert as usize * 29;
+        (0..len).map(|i| ((i * 31 + seed * 17) ^ (i >> 5)) as u8 & 0x3f).collect()
+    }
+
+    struct Rig {
+        store: ExpertStore<HostSlots>,
+        act: Vec<u8>,
+        _dir: Scratch,
+    }
+
+    fn rig(vram_slots: u64, ram_slots: u64, serve: Serve) -> Rig {
+        let dir = Scratch::new();
+        let mut builder = GgufBuilder::new().str("general.architecture", "test");
+        for layer in 0..LAYERS {
+            for (part, (name, dims)) in [
+                ("ffn_gate_exps", [256u64, 64, u64::from(EXPERTS)]),
+                ("ffn_up_exps", [256, 64, u64::from(EXPERTS)]),
+                ("ffn_down_exps", [64, 256, u64::from(EXPERTS)]),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let data: Vec<u8> = (0..EXPERTS).flat_map(|e| matrix(layer, part, e)).collect();
+                let ty = if part < 2 { SHAPE.gate_ty } else { SHAPE.down_ty };
+                builder = builder.tensor(&format!("blk.{layer}.{name}.weight"), &dims, ty, data);
+            }
+        }
+        let path = dir.0.join("model.gguf");
+        builder.write(&path).unwrap();
+        let gguf = Gguf::open(&path).unwrap();
+        let map =
+            ExpertMap::discover(&gguf, &["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"]).unwrap();
+        let reader = Reader::open_gguf(&gguf, Config::default()).unwrap();
+        let slot_bytes = SHAPE.slot_bytes().unwrap();
+        let spec = LayerSpec {
+            device: 0,
+            offsets: [0, SHAPE.up_offset().unwrap(), SHAPE.down_offset().unwrap()],
+            slot_bytes,
+        };
+        let layers = [spec; LAYERS];
+        let mut config =
+            StoreConfig::new(1, 2, vec![vram_slots * slot_bytes * LAYERS as u64], u64::MAX / 4);
+        config.vram_reserve = 0;
+        config.rebalance_every = 0;
+        let probe = StorePlan::new(config.clone(), &map, &reader, &layers, None).unwrap();
+        let ram_slot = probe.ram_bytes() / (probe.slots(0).1 * LAYERS);
+        config.ram_bytes = ram_slots * (ram_slot * LAYERS) as u64;
+        let plan = StorePlan::new(config, &map, &reader, &layers, None).unwrap();
+        assert_eq!(plan.slots(0), (vram_slots as usize, ram_slots as usize));
+        let device = HostSlots::new(&plan.device_pools(0), LAYERS, EXPERTS);
+        let region = HostRegion::unpinned(plan.ram_bytes(), plan.block());
+        let mut store = ExpertStore::new(plan, map, reader, vec![device], region, None).unwrap();
+        let pool = CpuPool::new(&Placement::unpinned(2), Duration::from_millis(1)).unwrap();
+        store.enable_cpu(pool, vec![SHAPE; LAYERS], serve).unwrap();
+        let x: Vec<f32> = (0..256).map(|i| ((i * 37 % 255) as f32 - 127.0) / 64.0).collect();
+        Rig { store, act: quantize_activations(&x, 256), _dir: dir }
+    }
+
+    fn group(expert: u32, weight: f32) -> RouteGroup {
+        let mut weights = [0.0; 8];
+        weights[0] = weight;
+        RouteGroup { expert, slot: None, rows: 1, weight: weights }
+    }
+
+    /// What the kernels give for `groups` of `layer`, computed here from the
+    /// file's bytes on this thread.
+    fn reference(layer: usize, act: &[u8], groups: &[RouteGroup]) -> Vec<f32> {
+        let matrices: Vec<[Vec<u8>; 3]> = groups
+            .iter()
+            .map(|g| {
+                [matrix(layer, 0, g.expert), matrix(layer, 1, g.expert), matrix(layer, 2, g.expert)]
+            })
+            .collect();
+        let experts: Vec<CpuExpert> = groups
+            .iter()
+            .zip(&matrices)
+            .map(|(g, m)| CpuExpert {
+                gate: m[0].as_ptr(),
+                up: m[1].as_ptr(),
+                down: m[2].as_ptr(),
+                rows: g.rows,
+                weight: g.weight,
+            })
+            .collect();
+        let features = Features::detect().unwrap();
+        // SAFETY: the matrices are whole and outlive the job.
+        let job = Arc::new(unsafe { LayerJob::new(features, &SHAPE, 1, act, &experts) }.unwrap());
+        job.work();
+        job.sums().unwrap().to_vec()
+    }
+
+    impl Rig {
+        /// Polls, and lets the device run, until `done` says so.
+        fn until(&mut self, what: &str, done: impl Fn(&ExpertStore<HostSlots>) -> bool) {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            loop {
+                self.store.poll().unwrap();
+                self.store.device_mut(0).run(usize::MAX);
+                self.store.poll().unwrap();
+                if done(&self.store) {
+                    return;
+                }
+                assert!(Instant::now() < deadline, "never {what}: {:?}", self.store);
+                std::thread::sleep(Duration::from_micros(200));
+            }
+        }
+
+        fn delivered(&mut self, layer: usize, token: u32) -> Vec<f32> {
+            self.until("delivered", |store| {
+                store.device(0).share(layer).delivered.as_ref().is_some_and(|(t, _)| *t == token)
+            });
+            self.store.device(0).share(layer).delivered.clone().unwrap().1
+        }
+    }
+
+    fn assert_close(got: &[f32], want: &[f32]) {
+        let err: f64 = got.iter().zip(want).map(|(g, w)| f64::from(g - w).powi(2)).sum();
+        let norm: f64 = want.iter().map(|w| f64::from(*w).powi(2)).sum();
+        assert!(
+            norm > 0.0 && (err / norm).sqrt() < 1e-5,
+            "sums differ by {:e}",
+            (err / norm).sqrt()
+        );
+    }
+
+    #[test]
+    fn the_cpu_computes_what_a_step_misses() {
+        let mut rig = rig(4, 4, Serve::Cpu);
+        let act = rig.act.clone();
+        let groups = [group(3, 0.25), group(5, 0.75)];
+        rig.store.begin_step();
+        // Both experts are only in the file: claimed at once, computed
+        // when their bytes are in RAM.
+        assert_eq!(rig.store.routed_rows(0, 7, 1, &groups, &act).unwrap(), 2);
+        let sums = rig.delivered(0, 7);
+        assert_close(&sums, &reference(0, &act, &groups));
+        let device = rig.store.device(0);
+        assert_eq!(device.share(0).claimed, Some((7, vec![0, 1])));
+        assert_eq!(
+            (device.entry(0, 3), device.entry(0, 5)),
+            (-1, -1),
+            "a claimed expert gets no slot"
+        );
+        assert!(rig.store.in_ram(0, 3) && rig.store.in_ram(0, 5));
+        assert_eq!(rig.store.stats().cpu_experts, 2);
+        rig.store.end_step().unwrap();
+
+        // Between the steps the heat promotes them: the bytes, then the entry.
+        rig.until("settled", |store| store.is_settled() && store.device(0).waiting() == 0);
+        let device = rig.store.device(0);
+        for expert in [3, 5] {
+            let entry = device.entry(0, expert);
+            assert!(entry >= 0, "expert {expert} was not promoted");
+            let slot = device.slot(rig.store.place(0).1, entry as u32);
+            assert_eq!(slot[..64], matrix(0, 0, expert)[..64]);
+        }
+        // The next step finds them in their slots.
+        rig.store.begin_step();
+        assert_eq!(rig.store.routed_rows(0, 8, 1, &groups, &act).unwrap(), 0);
+        rig.store.end_step().unwrap();
+    }
+
+    #[test]
+    fn a_promotion_shows_only_when_no_step_is_at_its_layer() {
+        let mut rig = rig(4, 4, Serve::Cpu);
+        let act = rig.act.clone();
+        let groups = [group(9, 1.0)];
+        rig.store.begin_step();
+        rig.store.routed_rows(1, 1, 1, &groups, &act).unwrap();
+        let first = rig.delivered(1, 1);
+        // The step ends and the promotion starts, but the device has not
+        // run the copy when the next step is already at the layer.
+        rig.store.end_step().unwrap();
+        assert_eq!(rig.store.stats().promotions, 1);
+        rig.store.begin_step();
+        assert_eq!(
+            rig.store.routed_rows(1, 2, 1, &groups, &act).unwrap(),
+            1,
+            "not on the device yet"
+        );
+        // The CPU serves it again, and although the bytes land meanwhile,
+        // the entry does not appear while the layer is open.
+        let second = rig.delivered(1, 2);
+        assert_eq!(first, second);
+        assert_eq!(rig.store.device(0).share(1).claimed, Some((2, vec![0])));
+        rig.until("idle device", |store| store.device(0).waiting() == 0);
+        assert_eq!(
+            rig.store.device(0).entry(1, 9),
+            -1,
+            "an entry for a claimed expert of an open layer"
+        );
+        rig.store.end_step().unwrap();
+        rig.until("settled", |store| store.is_settled() && store.device(0).waiting() == 0);
+        assert!(rig.store.device(0).entry(1, 9) >= 0);
+    }
+
+    #[test]
+    fn the_cost_model_serves_a_miss_one_way_or_the_other() {
+        let mut rig = rig(4, 4, Serve::Measured);
+        let act = rig.act.clone();
+        for (step, expert) in [2u32, 6, 11, 2, 13].into_iter().enumerate() {
+            let token = 10 + step as u32;
+            let groups = [group(expert, 1.0)];
+            rig.store.begin_step();
+            let missing = rig.store.routed_rows(0, token, 1, &groups, &act).unwrap();
+            // The layer goes on when the expert has a slot or the sums came.
+            rig.until("served", |store| {
+                let device = store.device(0);
+                device.entry(0, expert) >= 0
+                    || device.share(0).delivered.as_ref().is_some_and(|(t, _)| *t == token)
+            });
+            if rig.store.device(0).entry(0, expert) < 0 {
+                assert_eq!(missing, 1);
+                assert_close(&rig.delivered(0, token), &reference(0, &act, &groups));
+            }
+            rig.store.end_step().unwrap();
+        }
+        let stats = rig.store.stats();
+        assert_eq!(stats.picks, 5);
+        assert!(stats.cpu_experts + stats.uploads >= 4, "every miss was served: {stats:?}");
+    }
+}

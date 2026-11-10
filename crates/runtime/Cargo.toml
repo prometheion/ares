@@ -12,9 +12,13 @@ ares-api = { path = "../api" }
 ares-core.workspace = true
 ares-cuda.workspace = true
 ares-io = { path = "../io" }
+# The exact reference that the tables of the CPU expert kernels are read from.
+ares-quant = { path = "../quant" }
 ares-sched.workspace = true
 ares-state.workspace = true
 ares-weights.workspace = true
+# Worker threads of the CPU expert kernels are bound to cores.
+libc.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
