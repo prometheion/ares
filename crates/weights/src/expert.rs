@@ -74,7 +74,10 @@ impl ExpertHeat {
         &self.heat[layer * self.n_experts..][..self.n_experts]
     }
 
-    fn layer_mut(&mut self, layer: usize) -> &mut [f32] {
+    /// The heat of each expert of `layer`, to set it: a tier below another
+    /// keeps its own copy of the heat in which the experts the upper tier
+    /// holds are worth nothing, so that they give way first.
+    pub fn layer_mut(&mut self, layer: usize) -> &mut [f32] {
         &mut self.heat[layer * self.n_experts..][..self.n_experts]
     }
 }
@@ -241,6 +244,9 @@ pub struct SlotSet {
     slots: Vec<Slot>,
     /// Per slot: the expert in it came as a guess and nobody has used it.
     unused_guess: Vec<bool>,
+    /// Expert -> how many copies out of its slot are running
+    /// ([`SlotSet::hold`]).
+    held: Vec<u32>,
 }
 
 impl SlotSet {
@@ -252,7 +258,43 @@ impl SlotSet {
             protected_until: vec![0; n_experts],
             slots: vec![Slot::Empty; n_slots],
             unused_guess: vec![false; n_slots],
+            held: vec![0; n_experts],
         }
+    }
+
+    /// The number of slots that hold nothing and wait for nothing.
+    pub fn n_free(&self) -> usize {
+        self.slots.iter().filter(|s| **s == Slot::Empty).count()
+    }
+
+    /// Whether a read of `expert` is on its way into a slot.
+    pub fn is_loading(&self, expert: u32) -> bool {
+        self.loading_in.get(expert as usize).is_some_and(|slot| *slot != NO_SLOT)
+    }
+
+    /// Keeps `expert` in its slot until [`SlotSet::release`]: its bytes are
+    /// being copied out of the slot (to the tier above), so nothing may be
+    /// read into the slot meanwhile. No read, election or
+    /// [`SlotSet::give_back`] evicts a held member. Holds count: every hold
+    /// needs its release.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the expert is not in a slot.
+    pub fn hold(&mut self, expert: u32) {
+        assert!(self.contains(expert), "only a member can be held");
+        self.held[expert as usize] += 1;
+    }
+
+    /// Ends one [`SlotSet::hold`] of `expert`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the expert is not held.
+    pub fn release(&mut self, expert: u32) {
+        let held = &mut self.held[expert as usize];
+        assert!(*held > 0, "the expert is not held");
+        *held -= 1;
     }
 
     /// The slots the tier has: those not given back with
@@ -352,7 +394,7 @@ impl SlotSet {
             .iter()
             .enumerate()
             .filter_map(|(slot, s)| match s {
-                Slot::Holds(e) => Some((slot as u32, *e)),
+                Slot::Holds(e) if self.held[*e as usize] == 0 => Some((slot as u32, *e)),
                 _ => None,
             })
             .collect();
@@ -420,6 +462,14 @@ impl SlotSet {
         }
     }
 
+    /// Says that no step needs `expert` in this tier any more: its data has
+    /// been copied to the tier above, so the copy here may give way like any
+    /// other member. It ends what [`SlotSet::routed`] and
+    /// [`SlotSet::predicted`] said about the expert.
+    pub fn unprotect(&mut self, expert: u32) {
+        self.protected_until[expert as usize] = 0;
+    }
+
     fn needed(&self, expert: u32, step: u64) -> bool {
         self.protected_until[expert as usize] > step
     }
@@ -471,7 +521,7 @@ impl SlotSet {
             .iter()
             .enumerate()
             .filter_map(|(slot, s)| match s {
-                Slot::Holds(e) => Some((slot, *e)),
+                Slot::Holds(e) if self.held[*e as usize] == 0 => Some((slot, *e)),
                 _ => None,
             })
             .min_by(|a, b| self.eviction_order(*a, *b, step, heat));
@@ -528,7 +578,7 @@ impl SlotSet {
             .iter()
             .enumerate()
             .filter_map(|(slot, s)| match s {
-                Slot::Holds(e) => Some((slot, *e)),
+                Slot::Holds(e) if self.held[*e as usize] == 0 => Some((slot, *e)),
                 _ => None,
             })
             .collect();
@@ -605,6 +655,52 @@ impl SlotSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_held_member_is_never_evicted() {
+        let heat = [0.0, 5.0, 9.0, 7.0];
+        let mut set = SlotSet::new(4, 2);
+        for expert in [0, 1] {
+            let Start::Slot(swap) = set.start_read(expert, Want::Demand, 1, &heat) else {
+                unreachable!("free slots");
+            };
+            set.commit(&swap);
+        }
+        assert_eq!(set.n_free(), 0);
+        // Expert 0 is the coldest, but its bytes are being copied out.
+        set.hold(0);
+        let Start::Slot(swap) = set.start_read(2, Want::Demand, 5, &heat) else {
+            unreachable!("expert 1 can go");
+        };
+        assert_eq!(swap.evict, Some(1));
+        assert!(set.is_loading(2) && !set.is_loading(0));
+        set.commit(&swap);
+        assert!(set.elect(&heat, &SwapRule { margin: 1.0, bonus: 0.0, max_swaps: 8 }).is_empty());
+        assert_eq!(set.give_back(2, 9, &heat), [Given { slot: 1, evicted: Some(2) }]);
+        set.release(0);
+        assert_eq!(set.give_back(1, 9, &heat), [Given { slot: 0, evicted: Some(0) }]);
+    }
+
+    #[test]
+    fn an_expert_that_went_to_the_tier_above_gives_way_to_a_guess() {
+        let heat = [5.0, 5.0, 5.0];
+        let mut set = SlotSet::new(3, 1);
+        set.predicted(&[0], 4);
+        let Start::Slot(swap) = set.start_read(0, Want::Guess, 4, &heat) else {
+            unreachable!("a free slot");
+        };
+        set.commit(&swap);
+        assert_eq!(
+            set.start_read(1, Want::Guess, 4, &heat),
+            Start::NoRoom,
+            "the step needs expert 0"
+        );
+        set.unprotect(0);
+        let Start::Slot(swap) = set.start_read(1, Want::Guess, 4, &heat) else {
+            unreachable!("expert 0 is no longer needed here");
+        };
+        assert_eq!(swap.evict, Some(0));
+    }
 
     fn elect_and_commit(set: &mut SlotSet, heat: &[f32], rule: &SwapRule) -> Vec<Swap> {
         let swaps = set.elect(heat, rule);

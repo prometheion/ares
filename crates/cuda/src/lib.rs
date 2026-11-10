@@ -22,6 +22,7 @@ mod attention;
 mod device;
 mod driver;
 mod error;
+mod experts;
 mod kernels;
 mod layers;
 mod memory;
@@ -49,3 +50,7 @@ pub use memory::{DeviceBuffer, DevicePtr, HostRegistration, PinnedBuffer};
 pub use mesh::{Lane, Mesh, PUSH_MAX_VALUES, Parcel, Route};
 pub use module::{Args, Function, MAX_ARGS, Module};
 pub use stream::{Event, Stream};
+
+pub use experts::{
+    EXPERT_MAX_EXPERTS, EXPERT_MAX_K, ExpertKernels, ExpertShape, RouteGroup, RouteRecord,
+};

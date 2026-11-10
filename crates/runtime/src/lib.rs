@@ -52,6 +52,7 @@ mod config;
 mod engine;
 mod error;
 mod exec;
+pub mod expert_store;
 mod gpu;
 mod links;
 mod model;

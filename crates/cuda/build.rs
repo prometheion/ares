@@ -89,6 +89,7 @@ fn main() {
         ("prefill.cu", "prefill.fatbin", TENSOR_FLOOR),
         ("layers.cu", "layers.fatbin", FLOOR),
         ("attention.cu", "attention.fatbin", TENSOR_FLOOR),
+        ("experts.cu", "experts.fatbin", FLOOR),
     ];
     let children: Vec<_> = modules
         .iter()
