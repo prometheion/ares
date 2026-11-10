@@ -482,9 +482,14 @@ mod hybrid {
         RouteGroup { expert, slot: None, rows: 1, weight: weights }
     }
 
-    /// What the kernels give for `groups` of `layer`, computed here from the
-    /// file's bytes on this thread.
+    /// What the kernels give for `groups` of `layer` and one row, computed
+    /// here from the file's bytes on this thread.
     fn reference(layer: usize, act: &[u8], groups: &[RouteGroup]) -> Vec<f32> {
+        reference_rows(layer, act, groups, 1)
+    }
+
+    /// [`reference`] for a step of `n_rows` rows.
+    fn reference_rows(layer: usize, act: &[u8], groups: &[RouteGroup], n_rows: usize) -> Vec<f32> {
         let matrices: Vec<[Vec<u8>; 3]> = groups
             .iter()
             .map(|g| {
@@ -504,7 +509,8 @@ mod hybrid {
             .collect();
         let features = Features::detect().unwrap();
         // SAFETY: the matrices are whole and outlive the job.
-        let job = Arc::new(unsafe { LayerJob::new(features, &SHAPE, 1, act, &experts) }.unwrap());
+        let job =
+            Arc::new(unsafe { LayerJob::new(features, &SHAPE, n_rows, act, &experts) }.unwrap());
         job.work();
         job.sums().unwrap().to_vec()
     }
@@ -614,6 +620,160 @@ mod hybrid {
         assert!(rig.store.device(0).entry(1, 9) >= 0);
     }
 
+    /// One step that claims `expert` of `layer` and ends: its promotion is
+    /// then enqueued on the device, which has not run it.
+    fn step_that_promotes(rig: &mut Rig, layer: usize, token: u32, expert: u32) {
+        let act = rig.act.clone();
+        rig.store.begin_step();
+        assert_eq!(rig.store.routed_rows(layer, token, 1, &[group(expert, 1.0)], &act).unwrap(), 1);
+        rig.delivered(layer, token);
+        let before = rig.store.stats().promotions;
+        rig.store.end_step().unwrap();
+        assert_eq!(rig.store.stats().promotions, before + 1);
+        assert_eq!(rig.store.device(0).entry(layer, expert), -1, "the device has not run");
+    }
+
+    /// An expert of the running step gets a table entry or a claim, never
+    /// both. Here the promotion lands, and the store hears of it, before the
+    /// record of its layer arrives: the entry is written, and the record
+    /// then finds a hit, so nothing is claimed and no sums are sent.
+    #[test]
+    fn a_promotion_that_lands_before_its_layers_record_is_a_hit() {
+        let mut rig = rig(4, 4, Serve::Cpu);
+        let act = rig.act.clone();
+        step_that_promotes(&mut rig, 1, 1, 9);
+        rig.store.begin_step();
+        rig.until("the entry", |store| store.device(0).entry(1, 9) >= 0);
+        let hits = rig.store.stats().hits;
+        assert_eq!(rig.store.routed_rows(1, 2, 1, &[group(9, 1.0)], &act).unwrap(), 0);
+        assert_eq!(rig.store.stats().hits, hits + 1);
+        rig.until("idle device", |store| store.device(0).waiting() == 0);
+        let share = rig.store.device(0).share(1);
+        assert_eq!(share.claimed, Some((1, vec![0])), "a claim for an expert with an entry");
+        assert_eq!(share.delivered.as_ref().map(|d| d.0), Some(1), "sums nobody waits for");
+        rig.store.end_step().unwrap();
+    }
+
+    /// The other order: the record arrives first, so the expert is claimed,
+    /// and its entry is held back while the kernels of the layer may run. It
+    /// is written when the record of the next layer says that they have,
+    /// which is before the step ends.
+    #[test]
+    fn a_claimed_experts_entry_follows_when_the_step_is_past_the_layer() {
+        let mut rig = rig(4, 4, Serve::Cpu);
+        let act = rig.act.clone();
+        step_that_promotes(&mut rig, 0, 1, 9);
+        rig.store.begin_step();
+        assert_eq!(rig.store.routed_rows(0, 2, 1, &[group(9, 1.0)], &act).unwrap(), 1);
+        rig.delivered(0, 2);
+        rig.until("idle device", |store| store.device(0).waiting() == 0);
+        assert_eq!(rig.store.device(0).entry(0, 9), -1, "an entry while the layer is open");
+        // The record of layer 1: the step is past layer 0.
+        assert_eq!(rig.store.routed_rows(1, 2, 1, &[group(4, 1.0)], &act).unwrap(), 1);
+        rig.until("the entry", |store| store.device(0).entry(0, 9) >= 0);
+        rig.delivered(1, 2);
+        rig.store.end_step().unwrap();
+    }
+
+    /// A claim names groups by their place in the record, also when groups
+    /// before them are in slots, and the sums are those of the claimed
+    /// experts alone.
+    #[test]
+    fn a_claim_names_the_groups_of_the_record_that_have_no_slot() {
+        let mut rig = rig(4, 4, Serve::Cpu);
+        let act = rig.act.clone();
+        step_that_promotes(&mut rig, 0, 1, 3);
+        rig.until("settled", |store| store.is_settled() && store.device(0).waiting() == 0);
+        assert!(rig.store.device(0).entry(0, 3) >= 0);
+        let groups = [group(3, 0.25), group(5, 0.75)];
+        rig.store.begin_step();
+        assert_eq!(rig.store.routed_rows(0, 2, 1, &groups, &act).unwrap(), 1);
+        let sums = rig.delivered(0, 2);
+        assert_eq!(rig.store.device(0).share(0).claimed, Some((2, vec![1])));
+        assert_close(&sums, &reference(0, &act, &groups[1..]));
+        rig.store.end_step().unwrap();
+    }
+
+    /// A claimed expert keeps its RAM slot until the layer's sums are
+    /// delivered, and the sums wait for every claimed expert: were the CPU
+    /// to claim more experts that must be read than the layer has RAM slots,
+    /// the last of them would wait for a slot that only its own delivery
+    /// frees, and the layer would never end. The store claims what RAM can
+    /// keep and uploads the rest.
+    #[test]
+    fn the_cpu_claims_no_more_than_ram_can_keep() {
+        // Two RAM slots per layer; a step of two rows that needs three
+        // experts, all of them only in the file.
+        let mut rig = rig(4, 2, Serve::Cpu);
+        let x: Vec<f32> = (0..512).map(|i| ((i * 37 % 255) as f32 - 127.0) / 64.0).collect();
+        let act = quantize_activations(&x, 256);
+        let pick = |expert: u32, rows: u32| {
+            let mut weight = [0.0; 8];
+            for (b, w) in weight.iter_mut().enumerate().take(2) {
+                if rows >> b & 1 != 0 {
+                    *w = 0.5;
+                }
+            }
+            RouteGroup { expert, slot: None, rows, weight }
+        };
+        let groups = [pick(3, 0b01), pick(5, 0b10), pick(7, 0b11)];
+        rig.store.begin_step();
+        assert_eq!(rig.store.routed_rows(0, 1, 2, &groups, &act).unwrap(), 3);
+        let sums = rig.delivered(0, 1);
+        assert_eq!(rig.store.device(0).share(0).claimed, Some((1, vec![0, 1])));
+        assert_close(&sums, &reference_rows(0, &act, &groups[..2], 2));
+        // The third comes in a slot, as a miss does without a CPU half.
+        rig.until("the third expert's entry", |store| store.device(0).entry(0, 7) >= 0);
+        let stats = rig.store.stats();
+        assert_eq!((stats.cpu_experts, stats.picks), (2, 3));
+        assert!(stats.uploads >= 1);
+        rig.store.end_step().unwrap();
+    }
+
+    /// Two promotions chosen at the end of one step, in a layer whose RAM
+    /// tier is as small as it may be: the first evicts a VRAM member that
+    /// RAM no longer has, and the copy down takes the RAM slot of the second
+    /// expert. The second promotion then finds nothing to upload and does
+    /// not happen (the store used to stop here: it held a RAM copy that was
+    /// gone); the expert stays with the CPU until it is read again.
+    #[test]
+    fn a_promotion_whose_ram_copy_gave_way_does_not_start() {
+        let mut rig = rig(4, 2, Serve::Cpu);
+        let act = rig.act.clone();
+        // One step that claims two experts and ends; `settled` says whether
+        // to let the device and the reads run empty afterwards.
+        let step = |rig: &mut Rig, token: u32, experts: [u32; 2]| {
+            let groups = [group(experts[0], 0.5), group(experts[1], 0.5)];
+            rig.store.begin_step();
+            rig.store.routed_rows(0, token, 1, &groups, &act).unwrap();
+            rig.delivered(0, token);
+            rig.store.end_step().unwrap();
+            rig.until("settled", |store| store.is_settled() && store.device(0).waiting() == 0);
+        };
+        // Four experts fill the VRAM slots of the layer, two per step.
+        step(&mut rig, 1, [1, 2]);
+        step(&mut rig, 2, [3, 4]);
+        for expert in 1..=4 {
+            assert!(rig.store.device(0).entry(0, expert) >= 0, "expert {expert} was not promoted");
+        }
+        // Two more, used twice: hot enough to take slots from two of them.
+        step(&mut rig, 3, [5, 6]);
+        assert_eq!(rig.store.stats().evictions, 0, "as hot as the members: no slot yet");
+        step(&mut rig, 4, [5, 6]);
+        let stats = rig.store.stats();
+        assert_eq!((stats.evictions, stats.demotions), (1, 1), "{stats:?}");
+        let device = rig.store.device(0);
+        let promoted: Vec<u32> = [5, 6].into_iter().filter(|e| device.entry(0, *e) >= 0).collect();
+        assert_eq!(promoted.len(), 1, "one promotion, and one that had lost its bytes");
+        // The other is still served: read again and computed on the CPU.
+        let left = if promoted[0] == 5 { 6 } else { 5 };
+        let groups = [group(left, 1.0)];
+        rig.store.begin_step();
+        assert_eq!(rig.store.routed_rows(0, 5, 1, &groups, &act).unwrap(), 1);
+        assert_close(&rig.delivered(0, 5), &reference(0, &act, &groups));
+        rig.store.end_step().unwrap();
+    }
+
     #[test]
     fn the_cost_model_serves_a_miss_one_way_or_the_other() {
         let mut rig = rig(4, 4, Serve::Measured);
@@ -638,5 +798,505 @@ mod hybrid {
         let stats = rig.store.stats();
         assert_eq!(stats.picks, 5);
         assert!(stats.cpu_experts + stats.uploads >= 4, "every miss was served: {stats:?}");
+    }
+}
+
+/// The CPU half next to the real kernels: layers of experts on a GPU, the
+/// store with slots for half of them, and every layer of every step compared
+/// with the same kernels on a pool that holds every expert.
+///
+/// This is the place where "an expert computed on the CPU changes nothing"
+/// can be asked sharply. The rows a layer reads here do not depend on what
+/// another layer gave, so the two results differ by the rounding of the
+/// CPU's arithmetic against the device's and by nothing else: an expert that
+/// is added twice or not at all, sums of another record, bytes of another
+/// expert in a slot, all show at the layer and step where they happen, at
+/// the size of an expert's output. A whole model cannot be asked that way:
+/// its discrete choices (a router's pick, the blocks an attention layer
+/// reads) turn a difference of rounding into another answer now and then,
+/// with every expert on the device as well.
+///
+/// The tests open a GPU and are skipped unless `ARES_TEST_CUDA=1` is set;
+/// `ARES_TEST_DEVICES` names the device (the first of a list; default 0).
+mod device {
+    use ares_core::Ledger;
+    use ares_cuda::{
+        Device, DeviceBuffer, Event, ExpertKernels, ExpertShape, Kernels, PinnedBuffer, RouteGroup,
+        RouteRecord, Stream, Wait,
+    };
+    use ares_runtime::expert_store::cpu::{CpuPool, Placement, act_bytes};
+    use ares_runtime::expert_store::{CudaSlots, Serve};
+
+    use super::*;
+
+    const LAYERS: usize = 4;
+    const EXPERTS: u32 = 48;
+    const MAX_ROWS: u32 = 8;
+    const N: usize = 256;
+    const SHAPE: ExpertShape = ExpertShape {
+        n_embd: N as u32,
+        n_ff: 64,
+        n_experts: EXPERTS,
+        top_k: 3,
+        gate_ty: GgmlType::IQ2_S,
+        down_ty: GgmlType::Q2_0,
+    };
+
+    /// A small generator with a fixed sequence (xorshift64*).
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+
+        fn unit(&mut self) -> f32 {
+            (self.next() >> 40) as f32 / (1u64 << 24) as f32
+        }
+
+        /// Roughly normal, with a rare value ten times as large.
+        fn activation(&mut self) -> f32 {
+            let v: f32 = (0..6).map(|_| self.unit() - 0.5).sum();
+            if self.next().is_multiple_of(61) { 10.0 * v } else { v }
+        }
+    }
+
+    /// Matrix `part` of an expert: random blocks with scales between 1/64
+    /// and 1/8 (both types keep an f16 scale at the start of a block).
+    fn matrix(layer: usize, part: usize, expert: u32) -> Vec<u8> {
+        let (len, block) = if part < 2 {
+            (SHAPE.gate_bytes().unwrap() as usize, 82)
+        } else {
+            (SHAPE.down_bytes().unwrap() as usize, 18)
+        };
+        let mut rng =
+            Rng(0x9E37_79B9 ^ ((layer * 131 + part * 71 + expert as usize * 29) as u64) << 20);
+        let mut bytes: Vec<u8> = (0..len).map(|_| rng.next() as u8).collect();
+        for blk in bytes.chunks_exact_mut(block) {
+            let d = 0x2400u16 + (rng.next() % 0xC00) as u16;
+            blk[..2].copy_from_slice(&d.to_le_bytes());
+        }
+        bytes
+    }
+
+    fn f32_bytes(values: &[f32]) -> Vec<u8> {
+        values.iter().flat_map(|v| v.to_le_bytes()).collect()
+    }
+
+    fn bytes_f32(bytes: &[u8]) -> Vec<f32> {
+        bytes.as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)).collect()
+    }
+
+    fn rel_rms(got: &[f32], want: &[f32]) -> f64 {
+        let err: f64 =
+            got.iter().zip(want).map(|(g, w)| (f64::from(*g) - f64::from(*w)).powi(2)).sum();
+        let norm: f64 = want.iter().map(|w| f64::from(*w).powi(2)).sum();
+        (err / norm.max(1e-30)).sqrt()
+    }
+
+    /// A step that stands still: kernels wait on the device for the host,
+    /// and unwinding would free the buffers under them, which waits for the
+    /// very kernels that wait. So the process says what it knows and ends.
+    fn stuck(what: String) -> ! {
+        eprintln!("{what}");
+        std::process::abort()
+    }
+
+    /// What a run found.
+    #[derive(Debug, Default)]
+    struct Found {
+        steps: usize,
+        /// Rows of layers with a claimed expert, and without.
+        rows_with_claims: usize,
+        rows_without: usize,
+        /// The largest relative difference of a row of a layer with claims
+        /// from the same row with every expert on the device, and where.
+        worst: f64,
+        worst_at: (usize, usize, usize),
+        /// Rows of layers with claims that came out bit for bit the same,
+        /// and rows that differ by more than the order of float additions
+        /// explains (a hidden value on the boundary between two codes).
+        equal_with_claims: usize,
+        beyond_float_order: usize,
+        cpu_experts: u64,
+        promotions: u64,
+        uploads: u64,
+        demotions: u64,
+        demand_reads: u64,
+    }
+
+    /// Runs `steps` steps of `LAYERS` layers with `ram_slots` RAM slots per
+    /// layer and misses served as `serve` says. The rows of a layer change
+    /// every second step, so that what one step missed is on its way into a
+    /// slot, or has just arrived, when the next step picks it again.
+    fn run(device: &Device, serve: Serve, ram_slots: u64, steps: usize) -> Found {
+        let dir = Scratch::new();
+        let mut builder = GgufBuilder::new().str("general.architecture", "test");
+        for layer in 0..LAYERS {
+            for (part, (name, dims)) in [
+                ("ffn_gate_exps", [N as u64, 64, u64::from(EXPERTS)]),
+                ("ffn_up_exps", [N as u64, 64, u64::from(EXPERTS)]),
+                ("ffn_down_exps", [64, N as u64, u64::from(EXPERTS)]),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let data: Vec<u8> = (0..EXPERTS).flat_map(|e| matrix(layer, part, e)).collect();
+                let ty = if part < 2 { SHAPE.gate_ty } else { SHAPE.down_ty };
+                builder = builder.tensor(&format!("blk.{layer}.{name}.weight"), &dims, ty, data);
+            }
+        }
+        let path = dir.0.join("model.gguf");
+        builder.write(&path).unwrap();
+        let gguf = Gguf::open(&path).unwrap();
+        let map =
+            ExpertMap::discover(&gguf, &["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"]).unwrap();
+        let reader = Reader::open_gguf(&gguf, Config::default()).unwrap();
+        let slot_bytes = SHAPE.slot_bytes().unwrap();
+        let (up_offset, down_offset) = (SHAPE.up_offset().unwrap(), SHAPE.down_offset().unwrap());
+        let spec = LayerSpec { device: 0, offsets: [0, up_offset, down_offset], slot_bytes };
+        let layers = [spec; LAYERS];
+        // Slots for what one step of eight rows can pick, which is half of
+        // a layer's experts.
+        let vram_slots = u64::from(MAX_ROWS * SHAPE.top_k);
+        let mut config = StoreConfig::new(
+            MAX_ROWS,
+            SHAPE.top_k,
+            vec![vram_slots * slot_bytes * LAYERS as u64],
+            u64::MAX / 4,
+        );
+        config.vram_reserve = 0;
+        config.rebalance_every = 0;
+        let probe = StorePlan::new(config.clone(), &map, &reader, &layers, None).unwrap();
+        let ram_slot = probe.ram_bytes() / (probe.slots(0).1 * LAYERS);
+        config.ram_bytes = ram_slots * (ram_slot * LAYERS) as u64;
+        let plan = StorePlan::new(config, &map, &reader, &layers, None).unwrap();
+        assert_eq!(plan.slots(0), (vram_slots as usize, ram_slots as usize));
+
+        let mut vram = Ledger::new("CUDA", 1 << 30);
+        let mut pinned = Ledger::new("pinned RAM", 1 << 30);
+        let mut slots =
+            CudaSlots::new(device, &mut vram, &mut pinned, &plan.device_pools(0), LAYERS, EXPERTS)
+                .unwrap();
+        slots.add_host_shares(&mut vram, &mut pinned, SHAPE.host_share_bytes(MAX_ROWS)).unwrap();
+        let region = HostRegion::pinned(device, &mut pinned, plan.ram_bytes()).unwrap();
+        let mut store = ExpertStore::new(plan, map, reader, vec![slots], region, None).unwrap();
+        let pool = CpuPool::new(&Placement::unpinned(2), Duration::from_millis(1)).unwrap();
+        store.enable_cpu(pool, vec![SHAPE; LAYERS], serve).unwrap();
+
+        // The step's side of the device: one router for all layers (their
+        // rows differ), per layer the rows, the record and the output, and a
+        // second pool that holds every expert of every layer.
+        let kernels = Kernels::load(device).unwrap();
+        let experts = ExpertKernels::load(device).unwrap();
+        let stream = Stream::new(device, 0).unwrap();
+        let side = Stream::new(device, 0).unwrap();
+        let mut rng = Rng(0xC0FF_EE11);
+        let router = DeviceBuffer::new(device, SHAPE.router_bytes()).unwrap();
+        let weights: Vec<f32> = (0..EXPERTS as usize * N).map(|_| rng.unit() - 0.5).collect();
+        router.write(0, &f32_bytes(&weights)).unwrap();
+        let row_bytes = (MAX_ROWS as usize * N * 4) as u64;
+        let buffer = |bytes: u64| DeviceBuffer::new(device, bytes).unwrap();
+        let x: Vec<DeviceBuffer> = (0..LAYERS).map(|_| buffer(row_bytes)).collect();
+        let act: Vec<DeviceBuffer> = (0..LAYERS)
+            .map(|_| buffer(Kernels::quantized_activation_bytes(N as u32, MAX_ROWS)))
+            .collect();
+        let record: Vec<DeviceBuffer> =
+            (0..LAYERS).map(|_| buffer(SHAPE.record_bytes(MAX_ROWS))).collect();
+        let out: Vec<DeviceBuffer> = (0..LAYERS).map(|_| buffer(row_bytes)).collect();
+        let out_all = buffer(row_bytes);
+        let logits = buffer(SHAPE.logits_bytes(MAX_ROWS));
+        let hidden = buffer(SHAPE.hidden_bytes(MAX_ROWS));
+        let all_pool = buffer(LAYERS as u64 * u64::from(EXPERTS) * slot_bytes);
+        let all_table = buffer(4 * LAYERS as u64 * u64::from(EXPERTS));
+        for layer in 0..LAYERS {
+            let mut entries = Vec::new();
+            for expert in 0..EXPERTS {
+                let slot = layer as u64 * u64::from(EXPERTS) + u64::from(expert);
+                for (part, offset) in [0, up_offset, down_offset].into_iter().enumerate() {
+                    all_pool
+                        .write(slot * slot_bytes + offset, &matrix(layer, part, expert))
+                        .unwrap();
+                }
+                entries.extend((slot as i32).to_le_bytes());
+            }
+            all_table.write(4 * layer as u64 * u64::from(EXPERTS), &entries).unwrap();
+        }
+        let record_stride = SHAPE.record_bytes(MAX_ROWS) as usize;
+        let act_stride = act_bytes(N, MAX_ROWS as usize).next_multiple_of(64);
+        let records_host = PinnedBuffer::new(device, LAYERS * record_stride).unwrap();
+        let acts_host = PinnedBuffer::new(device, LAYERS * act_stride).unwrap();
+        let event = || Event::new(device).unwrap();
+        let routed: Vec<Event> = (0..LAYERS).map(|_| event()).collect();
+        let copied: Vec<Event> = (0..LAYERS).map(|_| event()).collect();
+        let done = event();
+
+        // Every expert is asked for, as a session's fill does: the tiers
+        // take what fits (the first reads to arrive get the VRAM slots), and
+        // the fill is over when nothing has moved for a while.
+        let all: Vec<u32> = (0..EXPERTS).collect();
+        for layer in 0..LAYERS {
+            store.fill(layer, &all).unwrap();
+        }
+        let patience = Duration::from_secs(30);
+        let progress = |store: &ExpertStore<CudaSlots>| {
+            let stats = store.stats();
+            (stats.uploads, stats.demand_reads, stats.guess_reads)
+        };
+        let mut last = (progress(&store), Instant::now());
+        while !store.is_settled() && last.1.elapsed() < Duration::from_millis(300) {
+            store.poll().unwrap();
+            let now = progress(&store);
+            if now != last.0 {
+                last = (now, Instant::now());
+            }
+        }
+        assert_eq!(store.stats().uploads, vram_slots * LAYERS as u64, "every slot was filled");
+        store.take_stats();
+
+        let mut found = Found::default();
+        for step in 0..steps {
+            // The rows of the layers: new every second step, one row or eight.
+            let rows: u32 = if (step / 2).is_multiple_of(3) { MAX_ROWS } else { 1 };
+            for (layer, x) in x.iter().enumerate() {
+                let mut rng = Rng(0xA5A5_0000 + ((step / 2) * LAYERS + layer) as u64);
+                let values: Vec<f32> = (0..rows as usize * N).map(|_| rng.activation()).collect();
+                x.write(0, &f32_bytes(&values)).unwrap();
+            }
+            let token = step as u32 + 1;
+            let n_record = SHAPE.record_bytes(rows) as usize;
+            let n_act = act_bytes(N, rows as usize);
+            store.begin_step();
+            store.device_mut(0).fence(&stream).unwrap();
+            for layer in 0..LAYERS {
+                let slots = store.device(0);
+                let (pool, _) = slots.pool(store.place(layer).1);
+                // SAFETY: every buffer was sized for eight rows of this
+                // shape; the table, the pool and the host share are the
+                // store's, which keeps their rules; the pinned copies are
+                // read after the event behind them.
+                unsafe {
+                    stream.fill(out[layer].ptr(), 0, row_bytes as usize).unwrap();
+                    kernels
+                        .quantize_activations(
+                            &stream,
+                            x[layer].ptr(),
+                            act[layer].ptr(),
+                            N as u32,
+                            rows,
+                        )
+                        .unwrap();
+                    experts
+                        .route(
+                            &stream,
+                            &SHAPE,
+                            router.ptr(),
+                            act[layer].ptr(),
+                            logits.ptr(),
+                            slots.table(layer),
+                            record[layer].ptr(),
+                            rows,
+                            token,
+                        )
+                        .unwrap();
+                    routed[layer].record(&stream).unwrap();
+                    side.wait_event(&routed[layer]).unwrap();
+                    side.copy_to_host(
+                        records_host.as_ptr().add(layer * record_stride).cast_mut(),
+                        record[layer].ptr(),
+                        n_record,
+                    )
+                    .unwrap();
+                    side.copy_to_host(
+                        acts_host.as_ptr().add(layer * act_stride).cast_mut(),
+                        act[layer].ptr(),
+                        n_act,
+                    )
+                    .unwrap();
+                    copied[layer].record(&side).unwrap();
+                    experts
+                        .experts(
+                            &stream,
+                            &SHAPE,
+                            pool,
+                            slots.table(layer),
+                            record[layer].ptr(),
+                            act[layer].ptr(),
+                            hidden.ptr(),
+                            out[layer].ptr(),
+                            slots.host_share(layer),
+                            rows,
+                            None,
+                        )
+                        .unwrap();
+                }
+            }
+            done.record(&stream).unwrap();
+
+            // The host follows the records, as a session does, while the
+            // device is up to four layers ahead of it.
+            let started = Instant::now();
+            let mut claimed = [false; LAYERS];
+            for layer in 0..LAYERS {
+                while !copied[layer].is_done().unwrap() {
+                    store.poll().unwrap();
+                    if started.elapsed() > patience {
+                        stuck(format!("step {step}: no record of layer {layer}: {store:?}"));
+                    }
+                }
+                // SAFETY: the copies of this layer's record and rows have run.
+                let (bytes, rows_host) = unsafe {
+                    (
+                        std::slice::from_raw_parts(
+                            records_host.as_ptr().add(layer * record_stride),
+                            n_record,
+                        ),
+                        std::slice::from_raw_parts(
+                            acts_host.as_ptr().add(layer * act_stride),
+                            n_act,
+                        ),
+                    )
+                };
+                let parsed = RouteRecord::parse(bytes, SHAPE.top_k, rows).expect("a record");
+                assert_eq!(parsed.token(), token);
+                let groups: Vec<RouteGroup> = parsed.groups().collect();
+                let before = store.stats().cpu_experts;
+                store.routed_rows(layer, token, rows as usize, &groups, rows_host).unwrap();
+                claimed[layer] = store.stats().cpu_experts > before;
+            }
+            while !done.is_done().unwrap() {
+                store.poll().unwrap();
+                if started.elapsed() > patience {
+                    stuck(format!(
+                        "step {step} of {rows} rows does not end: {store:?}, {:?}",
+                        store.stats()
+                    ));
+                }
+            }
+            store.end_step().unwrap();
+
+            // The same records and rows on the pool that holds everything.
+            let mut got = vec![0u8; rows as usize * N * 4];
+            let mut want = vec![0u8; rows as usize * N * 4];
+            for layer in 0..LAYERS {
+                // SAFETY: as above, with the table and pool of all experts
+                // and no host share.
+                unsafe {
+                    stream.fill(out_all.ptr(), 0, row_bytes as usize).unwrap();
+                    experts
+                        .experts(
+                            &stream,
+                            &SHAPE,
+                            all_pool.ptr(),
+                            all_table.ptr().offset(4 * layer as u64 * u64::from(EXPERTS)),
+                            record[layer].ptr(),
+                            act[layer].ptr(),
+                            hidden.ptr(),
+                            out_all.ptr(),
+                            None,
+                            rows,
+                            None,
+                        )
+                        .unwrap();
+                }
+                stream.synchronize().unwrap();
+                out[layer].read(0, &mut got).unwrap();
+                out_all.read(0, &mut want).unwrap();
+                let (got, want) = (bytes_f32(&got), bytes_f32(&want));
+                for row in 0..rows as usize {
+                    let (g, w) = (&got[row * N..(row + 1) * N], &want[row * N..(row + 1) * N]);
+                    assert!(w.iter().any(|v| *v != 0.0), "a row without experts");
+                    if !claimed[layer] {
+                        // Uploaded or resident: the device computed it all.
+                        assert!(
+                            g == w,
+                            "step {step} layer {layer} row {row}: no claim, another result"
+                        );
+                        found.rows_without += 1;
+                        continue;
+                    }
+                    found.rows_with_claims += 1;
+                    let error = rel_rms(g, w);
+                    found.equal_with_claims += usize::from(g == w);
+                    found.beyond_float_order += usize::from(error > 1e-5);
+                    if error > found.worst {
+                        (found.worst, found.worst_at) = (error, (step, layer, row));
+                    }
+                }
+            }
+            found.steps += 1;
+        }
+        let stats = store.take_stats();
+        found.cpu_experts = stats.cpu_experts;
+        found.promotions = stats.promotions;
+        found.uploads = stats.uploads;
+        found.demotions = stats.demotions;
+        found.demand_reads = stats.demand_reads;
+        found
+    }
+
+    fn gpu() -> Option<Device> {
+        if std::env::var_os("ARES_TEST_CUDA").is_none() {
+            eprintln!("skipped: set ARES_TEST_CUDA=1 to run the tests that open GPUs");
+            return None;
+        }
+        let wanted = std::env::var("ARES_TEST_DEVICES").unwrap_or_else(|_| "0".into());
+        let ordinal: u32 =
+            wanted.split(',').next().and_then(|d| d.trim().parse().ok()).unwrap_or(0);
+        Some(Device::open(ordinal, Wait::Spin).expect("open device"))
+    }
+
+    fn check(serve: Serve, ram_slots: u64, steps: usize) -> Option<Found> {
+        let device = gpu()?;
+        let found = run(&device, serve, ram_slots, steps);
+        eprintln!("  {serve:?}, {ram_slots} RAM slots per layer: {found:?}");
+        assert!(found.cpu_experts > 100, "the run was to compute experts on the CPU: {found:?}");
+        assert!(found.promotions > 20, "and to promote some between the steps: {found:?}");
+        // An expert left out, added twice or computed from other bytes is
+        // some hundredths of a row at the least. The CPU's rounding against
+        // the device's is the order of float additions, seven digits down,
+        // and where a hidden value sits on the boundary between two 8-bit
+        // codes, one step of that value, three digits down.
+        assert!(
+            found.worst < 1e-2,
+            "step {} layer {} row {}: {:.2e} from the result with every expert on the device",
+            found.worst_at.0,
+            found.worst_at.1,
+            found.worst_at.2,
+            found.worst
+        );
+        Some(found)
+    }
+
+    /// Every miss on the CPU, the bytes of every expert in RAM: claims, and
+    /// promotions that are on their way or land while the next step runs.
+    #[test]
+    fn a_layer_with_experts_from_the_cpu_is_the_devices_layer() {
+        check(Serve::Cpu, u64::from(EXPERTS), 120);
+    }
+
+    /// The store's own choice between the CPU and the link.
+    #[test]
+    fn a_layer_served_both_ways_is_the_devices_layer() {
+        check(Serve::Measured, u64::from(EXPERTS), 120);
+    }
+
+    /// A RAM tier of six slots per layer, fewer than a step of eight rows
+    /// misses in a layer: experts are read from the file for a claim, copied
+    /// down when VRAM evicts them, give way in RAM while other claims keep
+    /// theirs, and what the CPU cannot keep until its sums are delivered is
+    /// uploaded instead.
+    #[test]
+    fn a_small_ram_tier_changes_nothing_either() {
+        for serve in [Serve::Cpu, Serve::Measured] {
+            let Some(found) = check(serve, 6, 120) else { return };
+            assert!(found.demand_reads > 100 && found.demotions > 20, "{found:?}");
+            if serve == Serve::Cpu {
+                assert!(found.uploads > found.promotions, "nothing went to the link: {found:?}");
+            }
+        }
     }
 }

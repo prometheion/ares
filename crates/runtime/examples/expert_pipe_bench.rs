@@ -472,6 +472,12 @@ struct Options {
     /// timing): two runs over the same tokens that serve misses differently
     /// must agree in it to rounding.
     verify: bool,
+    /// With `verify`: write every step's output of every device to this
+    /// file, or compare every step's with the file another run wrote. A
+    /// checksum over a run says that the runs agree in the sum; this says
+    /// which step does not.
+    verify_save: Option<String>,
+    verify_against: Option<String>,
     /// In the measured phase, serve misses streamed, on the CPU and by the
     /// cost model in turns of this many steps, on one store: the three then
     /// see the same drive and the same machine, which runs after each other
@@ -517,6 +523,8 @@ impl Options {
             cpus: None,
             spin_ms: 20,
             verify: false,
+            verify_save: None,
+            verify_against: None,
             alternate: 0,
             idle_pool: false,
         };
@@ -578,6 +586,8 @@ impl Options {
                 }
                 "spin-ms" => options.spin_ms = value.parse()?,
                 "verify" => options.verify = value != "0",
+                "verify-save" => options.verify_save = Some(value.to_owned()),
+                "verify-against" => options.verify_against = Some(value.to_owned()),
                 "idle-pool" => options.idle_pool = value != "0",
                 "alternate" => options.alternate = value.parse()?,
                 _ => return Err(format!("unknown option '{key}'").into()),
@@ -1498,6 +1508,17 @@ fn main() -> Result<(), AnyError> {
     // The outputs of every step, summed per device in f64, and their bytes.
     let mut checksum: Vec<Vec<f64>> = lanes.iter().map(|_| vec![0.0; rows * n as usize]).collect();
     let mut out_bytes = vec![0u8; rows * n as usize * 4];
+    let mut verify_save = match &options.verify_save {
+        Some(path) if options.verify => Some(std::io::BufWriter::new(std::fs::File::create(path)?)),
+        _ => None,
+    };
+    let mut verify_against = match &options.verify_against {
+        Some(path) if options.verify => Some(std::io::BufReader::new(std::fs::File::open(path)?)),
+        _ => None,
+    };
+    let mut other_bytes = vec![0u8; out_bytes.len()];
+    // Per step and device: the relative difference from the other run.
+    let mut step_differences: Vec<(f64, u32, usize)> = Vec::new();
     for lane in &lanes {
         // SAFETY: the whole buffer, before any step.
         unsafe { lane.stream.fill(lane.out.ptr(), 0, out_bytes.len())? };
@@ -1674,10 +1695,29 @@ fn main() -> Result<(), AnyError> {
                 by_turn[turn].0.push(step_started.elapsed().as_secs_f32() * 1e3);
             }
             if options.verify {
-                for (lane, sum) in lanes.iter().zip(&mut checksum) {
+                for (index, (lane, sum)) in lanes.iter().zip(&mut checksum).enumerate() {
                     lane.out.read(0, &mut out_bytes)?;
                     for (total, v) in sum.iter_mut().zip(out_bytes.as_chunks::<4>().0.iter()) {
                         *total += f64::from(f32::from_le_bytes([v[0], v[1], v[2], v[3]]));
+                    }
+                    if let Some(file) = &mut verify_save {
+                        std::io::Write::write_all(file, &out_bytes)?;
+                    }
+                    if let Some(file) = &mut verify_against {
+                        std::io::Read::read_exact(file, &mut other_bytes)?;
+                        let value = |b: &[u8; 4]| f64::from(f32::from_le_bytes(*b));
+                        let (mut diff, mut size) = (0.0f64, 0.0f64);
+                        for (ours, theirs) in
+                            out_bytes.as_chunks::<4>().0.iter().zip(other_bytes.as_chunks::<4>().0)
+                        {
+                            diff += (value(ours) - value(theirs)).powi(2);
+                            size += value(theirs).powi(2);
+                        }
+                        step_differences.push((
+                            (diff / size.max(1e-30)).sqrt(),
+                            step_number,
+                            index,
+                        ));
                     }
                     // SAFETY: the whole buffer; the step has ended.
                     unsafe { lane.stream.fill(lane.out.ptr(), 0, out_bytes.len())? };
@@ -1756,6 +1796,29 @@ fn main() -> Result<(), AnyError> {
                 100.0 * named_right as f64 / wanted_named.max(1) as f64
             );
         }
+    }
+    if let Some(file) = &mut verify_save {
+        std::io::Write::flush(file)?;
+    }
+    if !step_differences.is_empty() {
+        // An expert left out or added twice is about a fiftieth of a
+        // device's sum over its layers; rounding is five digits below that.
+        let mut sorted: Vec<f64> = step_differences.iter().map(|d| d.0).collect();
+        sorted.sort_by(f64::total_cmp);
+        let worst = step_differences
+            .iter()
+            .copied()
+            .fold((0.0, 0, 0), |worst, d| if d.0 > worst.0 { d } else { worst });
+        println!(
+            "against the other run, per step and device ({} sums): worst {:.3e} (step {}, device {}), median {:.3e}, 99th percentile {:.3e}, {} above 1e-3",
+            sorted.len(),
+            worst.0,
+            worst.1,
+            worst.2,
+            sorted[sorted.len() / 2],
+            sorted[sorted.len() * 99 / 100],
+            sorted.iter().filter(|d| **d > 1e-3).count(),
+        );
     }
     if options.verify {
         for (index, sum) in checksum.iter().enumerate() {

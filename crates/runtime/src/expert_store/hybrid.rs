@@ -41,7 +41,8 @@ use super::{DeviceOp, ExpertStore, Phase, SlotDevice, Source, StoreError, Wanted
 pub enum Serve {
     /// Every miss is uploaded and the device waits for it.
     Stream,
-    /// Every miss is computed on the CPU.
+    /// Every miss is computed on the CPU, as far as the layer's RAM slots
+    /// can keep the experts of one step; what is beyond that is uploaded.
     Cpu,
     /// Per layer and step, whichever the cost model says is sooner.
     Measured,
@@ -441,6 +442,19 @@ impl<D: SlotDevice> ExpertStore<D> {
             _ => vec![true; misses.len()],
         };
 
+        // What the CPU claims stays in its RAM slot until the layer's sums
+        // are delivered, and the sums wait for every claimed expert. So the
+        // CPU may claim only as many experts that are yet to be read as the
+        // layer has RAM slots beside what is kept there anyway: the claimed
+        // experts that are in RAM and the promotions on their way. An expert
+        // beyond that is uploaded, like a miss the cost model gives to the
+        // link; claimed, it would wait for a slot that only its own
+        // delivery frees, and the layer would never end.
+        let in_ram = |c: &(usize, Miss, Source)| c.2 == Source::Ram;
+        let kept = candidates.iter().zip(&on_cpu).filter(|(c, cpu)| **cpu && in_ram(c)).count()
+            + hybrid.promoting.iter().filter(|(l, _)| *l == layer).count();
+        let mut room = self.ram.sets[layer].n_slots().saturating_sub(kept);
+
         let mut claimed: Vec<u32> = Vec::new();
         let mut claimed_experts: Vec<u32> = Vec::new();
         let mut ready: Vec<CpuExpert> = Vec::new();
@@ -449,7 +463,11 @@ impl<D: SlotDevice> ExpertStore<D> {
         for ((g, _, source), cpu) in candidates.iter().zip(&on_cpu) {
             let group = &groups[*g];
             self.wants.retain(|w| w.layer != layer || w.expert != group.expert);
-            if !*cpu {
+            let cpu = *cpu && (*source == Source::Ram || room > 0);
+            if cpu && *source != Source::Ram {
+                room -= 1;
+            }
+            if !cpu {
                 self.wants.push(Wanted {
                     layer,
                     expert: group.expert,
@@ -793,8 +811,8 @@ impl<D: SlotDevice> ExpertStore<D> {
         self.hybrid.as_ref().is_none_or(|h| h.open.is_empty() && h.promoting.is_empty())
     }
 
-    /// Starts the upload of an expert that is in RAM into a VRAM slot, if a
-    /// slot can be had now; returns whether it did. With `entry` the table
+    /// Starts the upload of an expert into a VRAM slot, if RAM holds it and
+    /// a slot can be had now; returns whether it did. With `entry` the table
     /// entry follows the bytes at once (an upload a step waits for);
     /// without, it is written later, by [`ExpertStore::poll`] (a promotion).
     pub(super) fn upload(
@@ -804,6 +822,12 @@ impl<D: SlotDevice> ExpertStore<D> {
         want: Want,
         entry: bool,
     ) -> Result<bool, StoreError> {
+        // Asked here and not by the caller alone: of several promotions that
+        // were chosen together, the first may have copied its victim down
+        // into the RAM slot of the second.
+        if !self.ram.sets[layer].contains(expert) {
+            return Ok(false);
+        }
         if self.vram.sets[layer].n_free() == 0 && !self.can_evict(layer) {
             return Ok(false);
         }
