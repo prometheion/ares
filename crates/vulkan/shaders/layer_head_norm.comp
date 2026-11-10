@@ -1,0 +1,52 @@
+#version 450
+#include "layer_common.glsl"
+
+// RMS norm (or L2 norm) of rows of `w` values with an optional weight shared by all rows:
+// the per-head norms of q and k and the delta rule's L2 norm.
+//   mean != 0: y = x / sqrt(mean(x^2) + eps) * weight
+//   mean == 0: y = x / sqrt(sum(x^2) + eps) * weight
+// w is a multiple of 4 and at most 1024. In place is allowed (y == x).
+//
+// A cluster of 32 invocations takes a row, an invocation up to 8 chunks of 4 values.
+// Grid: ceil(rows / 8) workgroups.
+layout(local_size_x = 256) in;
+
+layout(push_constant, std430) uniform Push {
+    uint64_t x;
+    uint64_t weight;
+    uint64_t y;
+    uint rows;
+    uint w;
+    float eps;
+    uint mean;
+} pc;
+
+void main() {
+    const uint lane = gl_LocalInvocationID.x & 31u;
+    const uint64_t row = ares_group() * 8 + (gl_LocalInvocationID.x >> 5);
+    if (row >= pc.rows) {
+        return;  // a whole cluster
+    }
+    const uint chunks = pc.w >> 2;
+    const uint64_t xr = pc.x + 4 * row * pc.w;
+    const uint64_t yr = pc.y + 4 * row * pc.w;
+    vec4 v[8];
+    float ssq = 0.0;
+    [[unroll]] for (uint k = 0; k < 8; k++) {
+        const uint c = lane + 32 * k;
+        v[k] = c < chunks ? ldv4(xr + 16 * c) : vec4(0.0);
+        ssq += dot(v[k], v[k]);
+    }
+    ssq = subgroupClusteredAdd(ssq, 32);
+    const float scale = inversesqrt((pc.mean != 0u ? ssq / float(pc.w) : ssq) + pc.eps);
+    [[unroll]] for (uint k = 0; k < 8; k++) {
+        const uint c = lane + 32 * k;
+        if (c < chunks) {
+            vec4 o = v[k] * scale;
+            if (pc.weight != 0ul) {
+                o *= ldv4(pc.weight + 16 * c);
+            }
+            LVec4(yr + 16 * c).v[0] = o;
+        }
+    }
+}

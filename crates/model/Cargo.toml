@@ -32,5 +32,8 @@ path = "tools/q4compare.rs"
 name = "q4trace"
 path = "tools/q4trace.rs"
 
+[dev-dependencies]
+ares-vulkan = { path = "../vulkan" }
+
 [lints]
 workspace = true

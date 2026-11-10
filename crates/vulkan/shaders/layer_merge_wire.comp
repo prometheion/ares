@@ -1,0 +1,103 @@
+#version 450
+#include "layer_merge.glsl"
+
+// The merge of a tensor split: x += the sum of the devices' partials, all in wire form
+// (layer_merge.glsl), added in device order so that every device that merges the same
+// partials holds the same bits, and then what `mode` says:
+//   0  nothing
+//   1  the RMS norm of the new rows by `weight`, as f32 rows at `xn`
+//   2  the RMS norm, quantized into `act` for the weight kernels (the layout of
+//      quantize_act.comp over n_rows * d values, with the f32 values behind)
+//   +256  the partials are in the wide wire form
+//
+//   own          this device's partial
+//   peers        the other devices' partials, in device order, `peer_stride` bytes apart
+//   own_rank     this device's place in the device order
+//
+// One workgroup per row; an invocation takes every 256th chunk of 4 values, first for the
+// sum and then, with the sum of squares of the whole row, for the norm.
+layout(local_size_x = 256) in;
+
+layout(push_constant, std430) uniform Push {
+    uint64_t x;
+    uint64_t own;
+    uint64_t peers;
+    uint64_t peer_stride;
+    uint64_t weight;
+    uint64_t xn;
+    uint64_t act;
+    uint n_peers;
+    uint own_rank;
+    uint n_rows;
+    uint d;
+    float eps;
+    uint mode;
+} pc;
+
+const uint MAX_DEVICES = 8;
+shared float partial[8];
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint64_t row = ares_group();
+    const bool live = row < uint64_t(pc.n_rows);
+    const uint chunks = pc.d >> 2;
+    const uint64_t chunk0 = row * chunks;
+    const bool wide = (pc.mode & 256u) != 0u;
+    const uint mode = pc.mode & 3u;
+    const uint64_t factors = wire_factors(pc.n_rows, pc.d, wide);
+
+    uint64_t src[MAX_DEVICES];
+    float up[MAX_DEVICES];
+    const uint n = min(pc.n_peers + 1, MAX_DEVICES);
+    for (uint r = 0; r < n; r++) {
+        src[r] = r == pc.own_rank ? pc.own
+                                  : pc.peers + uint64_t(r < pc.own_rank ? r : r - 1) * pc.peer_stride;
+        up[r] = live ? ldf(src[r] + factors + 4 * row) : 1.0;
+    }
+
+    float ssq = 0.0;
+    if (live) {
+        for (uint c = tid; c < chunks; c += 256) {
+            vec4 s = wire_load(src[0], chunk0 + c, up[0], wide);
+            for (uint r = 1; r < n; r++) {
+                s += wire_load(src[r], chunk0 + c, up[r], wide);
+            }
+            const vec4 y = ldv4(pc.x + 16 * (chunk0 + c)) + s;
+            LVec4(pc.x + 16 * (chunk0 + c)).v[0] = y;
+            ssq += dot(y, y);
+        }
+    }
+    if (mode == 0u) {
+        return;
+    }
+    ssq = subgroupClusteredAdd(ssq, 32);
+    if ((tid & 31u) == 0u) {
+        partial[tid >> 5] = ssq;
+    }
+    barrier();
+    if (!live) {
+        return;
+    }
+    float total = 0.0;
+    [[unroll]] for (uint k = 0; k < 8; k++) {
+        total += partial[k];
+    }
+    const float scale = inversesqrt(total / float(pc.d) + pc.eps);
+    const uint64_t n_values = uint64_t(pc.n_rows) * pc.d;
+    // Every invocation makes the same number of trips: the quantization reduces over
+    // clusters of 8 of them.
+    for (uint c0 = 0; c0 < chunks; c0 += 256) {
+        const uint c = c0 + tid;
+        const bool have = c < chunks;
+        vec4 y = vec4(0.0);
+        if (have) {
+            y = ldv4(pc.x + 16 * (chunk0 + c)) * scale * ldv4(pc.weight + 16 * uint64_t(c));
+        }
+        if (mode == 2u) {
+            quant_chunk(y, have, chunk0 + c, pc.act, n_values);
+        } else if (have) {
+            LVec4(pc.xn + 16 * (chunk0 + c)).v[0] = y;
+        }
+    }
+}

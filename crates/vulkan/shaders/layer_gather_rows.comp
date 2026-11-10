@@ -1,0 +1,56 @@
+#version 450
+#include "layer_common.glsl"
+
+// The rows whose logits are wanted: y[i] = norm(x[out_rows[i]]) for i < n_out, with an RMS
+// norm by `weight` when it is not null and a plain copy otherwise. One workgroup per
+// output row.
+layout(local_size_x = 256) in;
+
+layout(push_constant, std430) uniform Push {
+    uint64_t step;
+    uint64_t x;
+    uint64_t weight;
+    uint64_t y;
+    uint d;
+    float eps;
+} pc;
+
+shared float partial[8];
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint64_t i = ares_group();
+    const bool live = i < step_n_out(pc.step);
+    const uint64_t xr = pc.x + 4 * uint64_t(live ? step_out_row(pc.step, uint(i)) : 0u) * pc.d;
+    const uint64_t yr = pc.y + 4 * i * pc.d;
+    float sum = 0.0;
+    if (live && pc.weight != 0ul) {
+        for (uint j = tid; j < pc.d; j += 256) {
+            const float v = ldf(xr + 4 * uint64_t(j));
+            sum += v * v;
+        }
+    }
+    sum = subgroupClusteredAdd(sum, 32);
+    if ((tid & 31u) == 0u) {
+        partial[tid >> 5] = sum;
+    }
+    barrier();
+    if (!live) {
+        return;
+    }
+    if (pc.weight == 0ul) {
+        for (uint j = tid; j < pc.d; j += 256) {
+            FloatRef(yr + 4 * uint64_t(j)).v[0] = ldf(xr + 4 * uint64_t(j));
+        }
+        return;
+    }
+    float total = 0.0;
+    [[unroll]] for (uint k = 0; k < 8; k++) {
+        total += partial[k];
+    }
+    const float scale = inversesqrt(total / float(pc.d) + pc.eps);
+    for (uint j = tid; j < pc.d; j += 256) {
+        FloatRef(yr + 4 * uint64_t(j)).v[0] =
+            ldf(xr + 4 * uint64_t(j)) * scale * ldf(pc.weight + 4 * uint64_t(j));
+    }
+}

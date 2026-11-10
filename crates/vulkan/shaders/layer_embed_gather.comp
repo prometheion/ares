@@ -1,0 +1,209 @@
+#version 450
+#include "mmvq_common.glsl"
+#define ARES_COMMON_INCLUDED
+#include "layer_common.glsl"
+
+// Embedding gather: the row `token_embd[token]` decoded to f32, for the rows of the step.
+//
+// The table is stored as GGUF stores it, and the layouts are those of ggml's
+// dequantize_row_* functions, which `ares_quant::dequantize` reproduces. A gather touches a
+// few rows per step, so the decoder is a plain function of (row, value index) and each
+// invocation decodes the values it writes: a handful of byte loads per value, no shared
+// memory. Types whose decoding needs a codebook (the iq1/iq2/iq3 families, ternary, mxfp4)
+// are not here; the host refuses them by name. The type ids are ggml's.
+//
+// One workgroup per gathered row. A token past the table writes zeros.
+layout(local_size_x = 256) in;
+
+layout(push_constant, std430) uniform Push {
+    uint64_t step;
+    uint64_t table;
+    uint64_t row_bytes;
+    uint64_t out_;
+    uint ty;
+    uint n_vocab;
+    uint n_embd;
+} pc;
+
+const int KVALUES_IQ4NL[16] =
+    int[16](-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113);
+
+float f16_at(uint64_t a) { return half_of(ld2(a)); }
+int s8(uint b) { return int(b << 24) >> 24; }
+// Four bytes from any address.
+uint ld4_b(uint64_t a) { return ld1(a) | (ld1(a + 1) << 8) | (ld1(a + 2) << 16) | (ld1(a + 3) << 24); }
+
+// The 6-bit scale of sub-block s (0..15) of a Q3_K block: four low bits from `scales[s % 8]`
+// (low nibble for s < 8, high nibble after) and two high bits from `scales[8 + s % 4]`.
+int q3k_scale(uint64_t scales, uint s) {
+    const uint low = s < 8 ? (ld1(scales + s) & 0xFu) : (ld1(scales + s - 8) >> 4);
+    const uint high = (ld1(scales + 8 + (s & 3u)) >> (2 * (s >> 2))) & 3u;
+    return int(low | (high << 4)) - 32;
+}
+
+// Scale and minimum of sub-block j (0..7) of a Q4_K or Q5_K block (ggml's get_scale_min_k4).
+void k4_scale_min(uint64_t q, uint j, out uint sc, out uint mn) {
+    if (j < 4) {
+        sc = ld1(q + j) & 63u;
+        mn = ld1(q + j + 4) & 63u;
+    } else {
+        sc = (ld1(q + j + 4) & 0xFu) | ((ld1(q + j - 4) >> 6) << 4);
+        mn = (ld1(q + j + 4) >> 4) | ((ld1(q + j) >> 6) << 4);
+    }
+}
+
+// Value `j` of the row at `row` stored in type `ty`.
+float embed_value(uint64_t row, uint ty, uint j) {
+    switch (ty) {
+    case 0u:  // F32
+        return uintBitsToFloat(ld4_a2(row + 4 * uint64_t(j)));
+    case 1u:  // F16
+        return f16_at(row + 2 * uint64_t(j));
+    case 30u:  // BF16
+        return uintBitsToFloat(ld2(row + 2 * uint64_t(j)) << 16);
+    case 2u: {  // Q4_0: 18 bytes, d, 16 bytes of nibbles (low nibbles are values 0..15)
+        const uint64_t b = row + uint64_t(j >> 5) * 18;
+        const uint jj = j & 31u;
+        const uint q = ld1(b + 2 + (jj & 15u));
+        const int nib = int(jj < 16 ? (q & 0xFu) : (q >> 4));
+        return float(nib - 8) * f16_at(b);
+    }
+    case 3u: {  // Q4_1: 20 bytes, d, m
+        const uint64_t b = row + uint64_t(j >> 5) * 20;
+        const uint jj = j & 31u;
+        const uint q = ld1(b + 4 + (jj & 15u));
+        const uint nib = jj < 16 ? (q & 0xFu) : (q >> 4);
+        return float(nib) * f16_at(b) + f16_at(b + 2);
+    }
+    case 6u: {  // Q5_0: 22 bytes, d, qh (32 bits), 16 bytes of nibbles
+        const uint64_t b = row + uint64_t(j >> 5) * 22;
+        const uint jj = j & 31u;
+        const uint qh = ld4_b(b + 2);
+        const uint q = ld1(b + 6 + (jj & 15u));
+        const uint nib = jj < 16 ? (q & 0xFu) : (q >> 4);
+        const uint hi = (qh >> jj) & 1u;
+        return float(int(nib | (hi << 4)) - 16) * f16_at(b);
+    }
+    case 7u: {  // Q5_1: 24 bytes, d, m, qh, nibbles
+        const uint64_t b = row + uint64_t(j >> 5) * 24;
+        const uint jj = j & 31u;
+        const uint qh = ld4_b(b + 4);
+        const uint q = ld1(b + 8 + (jj & 15u));
+        const uint nib = jj < 16 ? (q & 0xFu) : (q >> 4);
+        const uint hi = (qh >> jj) & 1u;
+        return float(nib | (hi << 4)) * f16_at(b) + f16_at(b + 2);
+    }
+    case 8u: {  // Q8_0: 34 bytes, d, 32 int8
+        const uint64_t b = row + uint64_t(j >> 5) * 34;
+        return float(s8(ld1(b + 2 + (j & 31u)))) * f16_at(b);
+    }
+    case 10u: {  // Q2_K: 84 bytes, scales[16], qs[64], d, dmin
+        const uint64_t b = row + uint64_t(j >> 8) * 84;
+        const uint jj = j & 255u;
+        const uint half_ = jj >> 7;
+        const uint within = jj & 127u;
+        const uint group = within >> 5;
+        const uint l = within & 31u;
+        const uint sc = ld1(b + half_ * 8 + group * 2 + (l >> 4));
+        const uint q = (ld1(b + 16 + half_ * 32 + l) >> (2 * group)) & 3u;
+        const float d = f16_at(b + 80);
+        const float dmin = f16_at(b + 82);
+        return d * float(sc & 0xFu) * float(q) - dmin * float(sc >> 4);
+    }
+    case 11u: {  // Q3_K: 110 bytes, hmask[32], qs[64], scales[12], d
+        const uint64_t b = row + uint64_t(j >> 8) * 110;
+        const uint jj = j & 255u;
+        const uint half_ = jj >> 7;
+        const uint within = jj & 127u;
+        const uint group = within >> 5;
+        const uint l = within & 31u;
+        const uint s = half_ * 8 + group * 2 + (l >> 4);
+        const float dl = f16_at(b + 108) * float(q3k_scale(b + 96, s));
+        const int low = int((ld1(b + 32 + half_ * 32 + l) >> (2 * group)) & 3u);
+        const uint high = (ld1(b + l) >> (half_ * 4 + group)) & 1u;
+        return dl * float(low - (high != 0u ? 0 : 4));
+    }
+    case 12u: {  // Q4_K: 144 bytes, d, dmin, scales[12], qs[128]
+        const uint64_t b = row + uint64_t(j >> 8) * 144;
+        const uint jj = j & 255u;
+        const uint chunk = jj >> 6;
+        const uint within = jj & 63u;
+        const bool high = within >= 32;
+        uint sc, mn;
+        k4_scale_min(b + 4, 2 * chunk + (high ? 1u : 0u), sc, mn);
+        const uint q = ld1(b + 16 + chunk * 32 + (within & 31u));
+        const float v = float(high ? (q >> 4) : (q & 0xFu));
+        return f16_at(b) * float(sc) * v - f16_at(b + 2) * float(mn);
+    }
+    case 13u: {  // Q5_K: 176 bytes, d, dmin, scales[12], qh[32], qs[128]
+        const uint64_t b = row + uint64_t(j >> 8) * 176;
+        const uint jj = j & 255u;
+        const uint chunk = jj >> 6;
+        const uint within = jj & 63u;
+        const bool high = within >= 32;
+        const uint l = within & 31u;
+        uint sc, mn;
+        k4_scale_min(b + 4, 2 * chunk + (high ? 1u : 0u), sc, mn);
+        const uint q = ld1(b + 48 + chunk * 32 + l);
+        const uint bit = (ld1(b + 16 + l) >> (2 * chunk + (high ? 1u : 0u))) & 1u;
+        const float v = float((high ? (q >> 4) : (q & 0xFu)) + (bit != 0u ? 16u : 0u));
+        return f16_at(b) * float(sc) * v - f16_at(b + 2) * float(mn);
+    }
+    case 14u: {  // Q6_K: 210 bytes, ql[128], qh[64], scales[16] (int8), d
+        const uint64_t b = row + uint64_t(j >> 8) * 210;
+        const uint jj = j & 255u;
+        const uint half_ = jj >> 7;
+        const uint within = jj & 127u;
+        const uint part = within >> 5;  // 0..3: values l, l + 32, l + 64, l + 96
+        const uint l = within & 31u;
+        const uint64_t ql = b + half_ * 64;
+        const uint64_t qh = b + 128 + half_ * 32;
+        const uint lo = (part & 1u) != 0u ? ld1(ql + l + 32) : ld1(ql + l);
+        const uint nib = part >= 2 ? (lo >> 4) : (lo & 0xFu);
+        const uint hi = (ld1(qh + l) >> (2 * part)) & 3u;
+        const int q = int(nib | (hi << 4)) - 32;
+        const int sc = s8(ld1(b + 192 + half_ * 8 + (l >> 4) + 2 * part));
+        return f16_at(b + 208) * float(sc) * float(q);
+    }
+    case 20u: {  // IQ4_NL: 18 bytes, d, 16 bytes of nibbles through a table
+        const uint64_t b = row + uint64_t(j >> 5) * 18;
+        const uint jj = j & 31u;
+        const uint q = ld1(b + 2 + (jj & 15u));
+        const uint nib = jj < 16 ? (q & 0xFu) : (q >> 4);
+        return f16_at(b) * float(KVALUES_IQ4NL[nib]);
+    }
+    case 23u: {  // IQ4_XS: 136 bytes, d, scales_h (16 bits), scales_l[4], qs[128]
+        const uint64_t b = row + uint64_t(j >> 8) * 136;
+        const uint jj = j & 255u;
+        const uint ib = jj >> 5;
+        const uint jb = jj & 31u;
+        const uint scales_h = ld2(b + 2);
+        const int ls = int(((ld1(b + 4 + (ib >> 1)) >> (4 * (ib & 1u))) & 0xFu) |
+                           (((scales_h >> (2 * ib)) & 3u) << 4));
+        const uint q = ld1(b + 8 + ib * 16 + (jb & 15u));
+        const uint nib = jb < 16 ? (q & 0xFu) : (q >> 4);
+        return f16_at(b) * float(ls - 32) * float(KVALUES_IQ4NL[nib]);
+    }
+    default:
+        return uintBitsToFloat(0x7fc00000u);  // NaN: the host refuses unsupported types
+    }
+}
+
+void main() {
+    const uint64_t r = ares_group();
+    if (r >= uint64_t(step_n_rows(pc.step))) {
+        return;
+    }
+    const uint token = step_token(pc.step, uint(r));
+    const uint64_t dst = pc.out_ + 4 * r * pc.n_embd;
+    if (token >= pc.n_vocab) {
+        for (uint j = gl_LocalInvocationID.x; j < pc.n_embd; j += 256) {
+            FloatRef(dst + 4 * uint64_t(j)).v[0] = 0.0;
+        }
+        return;
+    }
+    const uint64_t src = pc.table + uint64_t(token) * pc.row_bytes;
+    for (uint j = gl_LocalInvocationID.x; j < pc.n_embd; j += 256) {
+        FloatRef(dst + 4 * uint64_t(j)).v[0] = embed_value(src, pc.ty, j);
+    }
+}

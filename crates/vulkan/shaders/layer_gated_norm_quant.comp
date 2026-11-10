@@ -1,0 +1,53 @@
+#version 450
+#include "layer_common.glsl"
+
+// The gated norm of the recurrent block with the quantization of what follows: for every
+// (row, head) item of `w` values (64, 128 or 256)
+//   y = o / sqrt(mean(o^2) + eps) * weight * gate(z),  gate = silu (0) or sigmoid (1)
+// and y quantized for the output projection into `q` in the layout of quantize_act.comp
+// over all items * w values, with the f32 values behind (layer_common.glsl). A cluster of
+// 32 invocations takes an item. Grid: ceil(items / 8) workgroups.
+layout(local_size_x = 256) in;
+
+layout(push_constant, std430) uniform Push {
+    uint64_t o;
+    uint64_t z;
+    uint64_t weight;
+    uint64_t q;
+    uint items;
+    uint w;
+    float eps;
+    uint gate_kind;
+} pc;
+
+void main() {
+    const uint lane = gl_LocalInvocationID.x & 31u;
+    const uint64_t item = ares_group() * 8 + (gl_LocalInvocationID.x >> 5);
+    // Whole clusters stay in the reductions; a cluster past the end does nothing at all.
+    if (item >= pc.items) {
+        return;
+    }
+    const uint chunks = pc.w >> 2;
+    const uint64_t n_values = uint64_t(pc.items) * pc.w;
+    const uint64_t orow = pc.o + 4 * item * pc.w;
+    const uint64_t zrow = pc.z + 4 * item * pc.w;
+    vec4 v[2];
+    float ssq = 0.0;
+    [[unroll]] for (uint k = 0; k < 2; k++) {
+        const uint c = lane + 32 * k;
+        v[k] = c < chunks ? ldv4(orow + 16 * c) : vec4(0.0);
+        ssq += dot(v[k], v[k]);
+    }
+    ssq = subgroupClusteredAdd(ssq, 32);
+    const float scale = inversesqrt(ssq / float(pc.w) + pc.eps);
+    [[unroll]] for (uint k = 0; k < 2; k++) {
+        const uint c = lane + 32 * k;
+        vec4 y = vec4(0.0);
+        if (c < chunks) {
+            const vec4 zz = ldv4(zrow + 16 * c);
+            const vec4 wt = ldv4(pc.weight + 16 * c);
+            y = v[k] * scale * wt * (pc.gate_kind == 0u ? l_silu(zz) : l_sigmoid(zz));
+        }
+        quant_chunk(y, c < chunks, item * chunks + c, pc.q, n_values);
+    }
+}

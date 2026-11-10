@@ -8,12 +8,19 @@
 //!   on it and next to it.
 //! - [`Stream`] and [`Event`] order work on a device, by recording commands
 //!   into batches (see the [`Stream`] docs for the design).
-//! - [`Kernels`] holds the engine's compute shaders on a device: the decode
-//!   weight kernels for every type a GGUF file can carry (integer dot products on
-//!   the quantized data, one pipeline per number of activation rows), and the
-//!   prefill kernels on the tensor cores (`VK_KHR_cooperative_matrix`), which are
-//!   chosen by [`Kernels::prefill_path`] when the device is loaded; a device
-//!   without cooperative matrices runs [`Kernels::matmul_decode`] instead.
+//! - [`Kernels`] holds the engine's weight kernels on a device, behind one call
+//!   ([`Kernels::product`]) for a matrix in either [`Layout`]. In the file's layout:
+//!   the decode kernels for every type a GGUF file can carry (integer dot products
+//!   on the quantized data, one pipeline per number of activation rows) and the
+//!   tile kernels on the tensor cores (`VK_KHR_cooperative_matrix`). In the device
+//!   layout (twelve types, the bytes `ares_quant::layout` specifies and CUDA makes
+//!   too): one family on the tensor cores for every number of rows, from one copy
+//!   of the matrix, where the device's cooperative matrices allow it
+//!   ([`Kernels::layout_for`]). A device without cooperative matrices keeps the
+//!   file's layout and runs [`Kernels::matmul_decode`] for many rows.
+//! - [`LayerKernels`] holds what a model computes between its products (embedding
+//!   gather, norms, convolution window, the gated delta rule, the fused norm and
+//!   SwiGLU, the rotary table), driven by the same step record as CUDA's.
 //!
 //! It deliberately has no tensor type and no graph. A model's forward pass is
 //! ordinary code that enqueues kernels on streams; shapes are arguments, so a
@@ -30,7 +37,10 @@
 //! and `read`), `DevicePtr`, `Stream` (`synchronize`, `is_idle`, `wait_event`,
 //! `copy`, `fill`), `Event` (`new`, `timed`, `record`, `is_done`,
 //! `synchronize`, `elapsed_ms_since`), `Module`, `Function`, `Args`, `Kernels`
-//! with the same four kernels, arguments, limits and results.
+//! with the same first four kernels, arguments, limits and results, the weight
+//! layouts ([`Layout`], [`ActivationForm`], `layout_for`, `layout_bytes`,
+//! `rearrange`, `measure_layout`, `activation_form`, `prepare_activations`,
+//! `product`) and [`LayerKernels`] with CUDA's step record.
 //!
 //! Different, because Vulkan is:
 //!
@@ -46,6 +56,14 @@
 //!   part of the shader).
 //! - `PciAddress` has a `function`; `DeviceInfo` has the vendor, the device
 //!   type, the Vulkan version, the driver version and the subgroup width.
+//! - [`ActivationForm::F32`] exists: the decode kernels of the float types read the
+//!   f32 rows as they are (CUDA's int8 form carries that copy inside). One launch of
+//!   a decode kernel takes at most [`MAX_BATCH`] rows, so on a device without
+//!   cooperative matrices [`Kernels::product`] refuses more rows for a matrix in the
+//!   file's layout and [`Kernels::matmul_decode`] runs them in batches.
+//! - Pipelines of the weight and layer kernels are made on first use;
+//!   [`Kernels::prepare`] and [`LayerKernels::prepare`] make them ahead of a step.
+//! - There are no attention, expert, sampler or `qwen4exp` kernels yet.
 //! - Dropping a [`DeviceBuffer`], [`StagingBuffer`] or [`Function`] waits for
 //!   the whole device (the way `cuMemFree` does), after flushing every stream.
 //!
@@ -67,6 +85,7 @@ mod device;
 mod error;
 mod instance;
 mod kernels;
+mod layers;
 mod memory;
 mod mesh;
 mod module;
@@ -81,7 +100,14 @@ pub use device::{
     device_count, devices,
 };
 pub use error::{Error, Result};
-pub use kernels::{Kernels, MAX_BATCH};
+pub use kernels::{
+    ActivationForm, Kernels, Layout, LayoutKernel, LayoutRows, LayoutTable, MAX_BATCH,
+};
+pub use layers::{
+    AttentionShape, CommitSet, LayerKernels, MergeNorm, NormKind, OutputGate, RecurrentShape,
+    RopeParams, Segment, StateFormat, StepDims, StepRecord, Wire, partial_wire_bytes,
+    quantized_activation_bytes, quantized_activation_copy_offset,
+};
 pub use memory::{DeviceBuffer, DevicePtr, HostPages, ShareKind, SharedMemory, StagingBuffer};
 pub use mesh::{Lane, MAX_DEVICES, Mesh, PUSH_MAX_VALUES, Parcel, Route, device_groups};
 pub use module::{Args, Function, MAX_ARGS, Module};

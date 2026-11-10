@@ -1,0 +1,60 @@
+#version 450
+#include "layer_merge.glsl"
+
+// The wire form (layer_merge.glsl) of `n_rows` rows of `d` f32 values at `p`, wide or not.
+// One workgroup per row; an invocation takes every 256th chunk of 4 values.
+layout(local_size_x = 256) in;
+
+layout(push_constant, std430) uniform Push {
+    uint64_t p;
+    uint64_t wire;
+    uint n_rows;
+    uint d;
+    uint wide;
+} pc;
+
+shared float partial[8];
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint64_t row = ares_group();
+    const bool live = row < uint64_t(pc.n_rows);
+    const uint chunks = pc.d >> 2;
+    const uint64_t chunk0 = row * chunks;
+    float m = 0.0;
+    if (live) {
+        for (uint c = tid; c < chunks; c += 256) {
+            m = max(m, max4(ldv4(pc.p + 16 * (chunk0 + c))));
+        }
+    }
+    m = subgroupClusteredMax(m, 32);
+    if ((tid & 31u) == 0u) {
+        partial[tid >> 5] = m;
+    }
+    barrier();
+    if (!live) {
+        return;
+    }
+    m = 0.0;
+    [[unroll]] for (uint k = 0; k < 8; k++) {
+        m = max(m, partial[k]);
+    }
+    const bool wide = pc.wide != 0u;
+    float down = 1.0;
+    float up = 1.0;
+    if (!wide) {
+        wire_scale(m, down, up);
+    }
+    for (uint c = tid; c < chunks; c += 256) {
+        const vec4 v = ldv4(pc.p + 16 * (chunk0 + c));
+        if (wide) {
+            LVec4(pc.wire + 16 * (chunk0 + c)).v[0] = v;
+        } else {
+            LHalf4(pc.wire + 8 * (chunk0 + c)).v[0] =
+                uvec2(packHalf2x16(v.xy * down), packHalf2x16(v.zw * down));
+        }
+    }
+    if (tid == 0u) {
+        FloatRef(pc.wire + wire_factors(pc.n_rows, pc.d, wide) + 4 * row).v[0] = up;
+    }
+}

@@ -71,6 +71,7 @@ dependencies = [
  "ares-runtime",
  "ares-state",
  "ares-tokenizer",
+ "ares-vulkan",
  "thiserror",
 ]
 

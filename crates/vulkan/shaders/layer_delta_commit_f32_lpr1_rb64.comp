@@ -1,0 +1,7 @@
+#version 450
+#define DELTA_WINDOW 0
+#define DELTA_F16 0
+#define DELTA_LPR 1
+#define DELTA_RB 64
+#define DELTA_TC 8
+#include "layer_delta.glsl"

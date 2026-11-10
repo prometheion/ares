@@ -1,0 +1,71 @@
+#version 450
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_control_flow_attributes : require
+
+// Which elements of a cooperative matrix of use B (f16, 16 x 8) and of an accumulator (f32,
+// 16 x 8) each invocation holds, for the weight kernels of few activation rows
+// (`mml_near.glsl`): they read their elements of the B operand straight from the
+// activations and write their elements of the accumulator straight to the result, in the
+// order of the `mma` m16n8k16 fragments. For lane (g = lane / 4, t = lane % 4):
+//   B            element 2 c + h is the matrix element in row 2 t + h + 8 c, column g
+//   accumulator  element 2 r + h is the matrix element in row g + 8 r, column 2 t + h
+// with r, c, h = 0 or 1. The specification leaves the order to the implementation, so this
+// kernel tests the rule:
+//   out[0 .. 128)    the product of the identity (16 x 16) with a B operand whose elements
+//                    are set by the rule to 8 row + column + 1, stored row-major: the host
+//                    expects 8 row + column + 1 at row * 8 + column
+//   out[128 .. 256)  an accumulator loaded with 8 row + column + 1, read by the rule and
+//                    written by each lane to 128 + 8 row + column: the same values
+// One subgroup.
+
+layout(local_size_x = 32) in;
+
+layout(push_constant, std430) uniform Push {
+    uint64_t out_;
+} pc;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) writeonly buffer Out { float v[]; };
+
+shared float16_t eye[256];
+shared float result[128];
+shared float pattern[128];
+
+void main() {
+    const uint lane = gl_LocalInvocationID.x;
+    for (uint i = lane; i < 256; i += 32) {
+        eye[i] = (i / 16 == i % 16) ? 1.0hf : 0.0hf;
+    }
+    for (uint i = lane; i < 128; i += 32) {
+        pattern[i] = float(i + 1);
+    }
+    barrier();
+    const uint g = lane / 4;
+    const uint t = lane % 4;
+    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> a;
+    coopMatLoad(a, eye, 0, 16, gl_CooperativeMatrixLayoutRowMajor);
+    coopmat<float16_t, gl_ScopeSubgroup, 16, 8, gl_MatrixUseB> b;
+    [[unroll]] for (uint e = 0; e < 4; e++) {
+        const uint row = 2 * t + (e & 1u) + 8 * (e >> 1);
+        b[e] = float16_t(8 * row + g + 1);
+    }
+    coopmat<float, gl_ScopeSubgroup, 16, 8, gl_MatrixUseAccumulator> c =
+        coopmat<float, gl_ScopeSubgroup, 16, 8, gl_MatrixUseAccumulator>(0.0);
+    c = coopMatMulAdd(a, b, c);
+    coopMatStore(c, result, 0, 8, gl_CooperativeMatrixLayoutRowMajor);
+    coopmat<float, gl_ScopeSubgroup, 16, 8, gl_MatrixUseAccumulator> p;
+    coopMatLoad(p, pattern, 0, 8, gl_CooperativeMatrixLayoutRowMajor);
+    barrier();
+    for (uint i = lane; i < 128; i += 32) {
+        Out(pc.out_).v[i] = result[i];
+    }
+    [[unroll]] for (uint e = 0; e < 4; e++) {
+        const uint row = g + 8 * (e >> 1);
+        const uint col = 2 * t + (e & 1u);
+        Out(pc.out_).v[128 + 8 * row + col] = p[e];
+    }
+}

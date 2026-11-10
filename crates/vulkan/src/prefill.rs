@@ -1,8 +1,7 @@
 //! The prefill weight kernels: a quantized matrix times many rows of activations on the
-//! tensor cores (`VK_KHR_cooperative_matrix`). The counterpart of the CUDA layer's
-//! `PrefillPath`, `Kernels::prepare_prefill_activations`, `Kernels::matmul`,
-//! `Kernels::rearrange` and `Kernels::matmul_rearranged`, with the same activation formats
-//! and the same rearranged form of a Q4_K matrix, so that one upload serves both backends.
+//! tensor cores (`VK_KHR_cooperative_matrix`), for a matrix in the file's layout. The
+//! counterpart of the CUDA layer's `PrefillPath`, `Kernels::prepare_prefill_activations` and
+//! `Kernels::matmul`. (The kernels over the device layouts are in `kernels/layout.rs`.)
 //!
 //! Three ways to compute the product, chosen by the caller (see [`PrefillPath`]) and, for
 //! the common case, by [`Precision`] and what the device does fastest:
@@ -12,7 +11,8 @@
 //! - f16: weights decoded to f16, f16 activations, f32 accumulation;
 //! - f16 with f16 accumulation, flushed to f32 every 64 values of K.
 //!
-//! `shaders/mm_q4_K.comp` is the int8 kernel, `shaders/mm_f16_core.glsl and mmw_q4_K_r.glsl` the f16 ones.
+//! `shaders/mm_q4_K.comp` is the int8 kernel, `shaders/mm_f16_core.glsl` with a decoder per
+//! type (`mmd_<type>.glsl`) the f16 ones.
 
 use ares_core::GgmlType;
 
@@ -67,9 +67,6 @@ const GENERIC: [(GgmlType, &str, u64); 28] = [
     (GgmlType::IQ1_M, "iq1_m", 4),
 ];
 static CONVERT_F16: &[u8] = spv!("convert_act_f16");
-static REPACK_Q4_K: &[u8] = spv!("repack_q4_K");
-static MM_F_Q4_K_R: &[u8] = spv!("mm_f_q4_K_r");
-static MM_H_Q4_K_R: &[u8] = spv!("mm_h_q4_K_r");
 
 /// The weight rows and activation rows one workgroup of the prefill kernels computes.
 const TILE: u32 = 64;
@@ -108,7 +105,6 @@ pub enum Precision {
 pub(crate) struct Prefill {
     int8: Vec<(GgmlType, Function)>,
     convert_f16: Option<Function>,
-    rearranged: Option<Rearranged>,
     /// The f16 kernels for the file's layout: type, alignment, f32 and flushed f16
     /// accumulation.
     generic: Vec<(GgmlType, u64, Arc<Lazy>, Arc<Lazy>)>,
@@ -124,19 +120,8 @@ pub(crate) struct Prefill {
     register_operand: bool,
 }
 
-#[derive(Debug, Clone)]
-struct Rearranged {
-    repack: Arc<Lazy>,
-    /// The kernels with the weights in shared memory (64 weight rows per workgroup).
-    exact: Arc<Lazy>,
-    flush: Arc<Lazy>,
-    /// The kernels that build the A operand in registers (128 weight rows per workgroup),
-    /// on a device whose cooperative matrices allow it.
-    registers: Option<(Arc<Lazy>, Arc<Lazy>)>,
-}
-
 /// Whether the device has a cooperative matrix of the given shape and types.
-fn has_shape(
+pub(crate) fn has_shape(
     device: &Device,
     shape: (u32, u32, u32),
     a: ComponentType,
@@ -176,19 +161,7 @@ impl Prefill {
             ComponentType::F16,
             ComponentType::F32,
         );
-        let (convert_f16, rearranged) = if f16_product {
-            (
-                Some(main(CONVERT_F16)?),
-                Some(Rearranged {
-                    repack: Lazy::new(device, REPACK_Q4_K),
-                    exact: Lazy::new(device, MM_F_Q4_K_R),
-                    flush: Lazy::new(device, MM_H_Q4_K_R),
-                    registers: None,
-                }),
-            )
-        } else {
-            (None, None)
-        };
+        let convert_f16 = if f16_product { Some(main(CONVERT_F16)?) } else { None };
         let generic = if f16_product {
             GENERIC
                 .iter()
@@ -206,39 +179,17 @@ impl Prefill {
         };
         let full_rate = f16_product && measure_full_rate(device).unwrap_or(false);
         let register_operand = f16_product && check_register_operand(device).unwrap_or(false);
-        // ARES_VK_PREFILL_SHARED=1 keeps the kernels with the weights in shared memory, for
-        // comparing the two.
-        let rearranged = match rearranged {
-            Some(mut re)
-                if register_operand && std::env::var_os("ARES_VK_PREFILL_SHARED").is_none() =>
-            {
-                re.registers = Some((
-                    Lazy::new(device, image("mm_f_q4_K_r2")?),
-                    Lazy::new(device, image("mm_h_q4_K_r2")?),
-                ));
-                Some(re)
-            }
-            other => other,
-        };
-        Ok(Self { int8, convert_f16, rearranged, generic, tables, full_rate, register_operand })
+        Ok(Self { int8, convert_f16, generic, tables, full_rate, register_operand })
     }
 
     /// Makes the f16 prefill kernels of `types` now, on all cores.
     pub(crate) fn prepare(&self, types: &[GgmlType]) -> Result<()> {
-        let mut all: Vec<&Arc<Lazy>> = self
+        let all: Vec<&Arc<Lazy>> = self
             .generic
             .iter()
             .filter(|(ty, ..)| types.contains(ty))
             .flat_map(|(_, _, exact, flush)| [exact, flush])
             .collect();
-        if types.contains(&GgmlType::Q4_K)
-            && let Some(re) = &self.rearranged
-        {
-            all.extend([&re.repack, &re.exact, &re.flush]);
-            if let Some((exact, flush)) = &re.registers {
-                all.extend([exact, flush]);
-            }
-        }
         crate::kernels::parallel_map(&all, |lazy| lazy.get().map(|_| ())).map(|_| ())
     }
 
@@ -256,7 +207,7 @@ impl Prefill {
     pub(crate) fn has_path(&self, path: PrefillPath) -> bool {
         match path {
             PrefillPath::Int8 => !self.int8.is_empty(),
-            PrefillPath::F16 | PrefillPath::F16Flush => self.rearranged.is_some(),
+            PrefillPath::F16 | PrefillPath::F16Flush => self.convert_f16.is_some(),
         }
     }
 
@@ -266,10 +217,6 @@ impl Prefill {
             PrefillPath::Int8 => self.int8.iter().any(|(t, _)| *t == ty),
             PrefillPath::F16 | PrefillPath::F16Flush => self.generic.iter().any(|(t, ..)| *t == ty),
         }
-    }
-
-    pub(crate) fn has_rearranged_form(&self, ty: GgmlType) -> bool {
-        ty == GgmlType::Q4_K && self.rearranged.is_some()
     }
 
     /// The bytes of `prepare_activations` for the path.
@@ -319,123 +266,6 @@ impl Prefill {
         // SAFETY: the argument list matches convert_act_f16.comp; the ranges are the caller's
         // guarantee.
         unsafe { function.launch(stream, crate::kernels::grid_1d(n_rows, grid_limit), args) }
-    }
-
-    /// The bytes of a rearranged matrix.
-    pub(crate) fn rearranged_bytes(ty: GgmlType, n_out: u32, n_in: u32) -> Option<u64> {
-        (ty == GgmlType::Q4_K)
-            .then(|| u64::from(n_out.next_multiple_of(16)) * (u64::from(n_in) / 256) * 144)
-    }
-
-    /// # Safety
-    ///
-    /// As `Kernels::rearrange`.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) unsafe fn rearrange(
-        &self,
-        stream: &Stream,
-        ty: GgmlType,
-        src: DevicePtr,
-        dst: DevicePtr,
-        n_out: u32,
-        n_in: u32,
-        grid_limit: u32,
-    ) -> Result<()> {
-        let Some(re) = self.rearranged.as_ref().filter(|_| ty == GgmlType::Q4_K) else {
-            return Err(Error::invalid("rearranged form", format!("{ty} has none here")));
-        };
-        if n_in == 0 || !n_in.is_multiple_of(256) {
-            return Err(Error::invalid(
-                "weight matrix",
-                format!("{n_in} columns are not a whole number of Q4_K blocks of 256 values"),
-            ));
-        }
-        if n_out == 0 {
-            return Ok(());
-        }
-        check_alignment("weight matrix", src, 16)?;
-        check_alignment("rearranged matrix", dst, 16)?;
-        let tiles = u64::from(n_out.div_ceil(16));
-        let threads = tiles * (u64::from(n_in) / 64) * 32 + tiles * (u64::from(n_in) / 256) * 16;
-        let groups = u32::try_from(threads.div_ceil(256)).map_err(|_| {
-            Error::invalid("rearranged form", format!("{n_out} x {n_in} needs too many workgroups"))
-        })?;
-        let args = Args::new().ptr(src).ptr(dst).u32(n_out).u32(n_in);
-        // SAFETY: the argument list matches repack_q4_K.comp; the ranges are the caller's.
-        unsafe {
-            re.repack.get()?.launch(stream, crate::kernels::grid_1d(groups, grid_limit), args)
-        }
-    }
-
-    /// # Safety
-    ///
-    /// As `Kernels::matmul_rearranged`.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) unsafe fn matmul_rearranged(
-        &self,
-        stream: &Stream,
-        ty: GgmlType,
-        path: PrefillPath,
-        w: DevicePtr,
-        act: DevicePtr,
-        y: DevicePtr,
-        n_in: u32,
-        n_out: u32,
-        n_rows: u32,
-        grid_limit: u32,
-    ) -> Result<()> {
-        let Some(re) = self.rearranged.as_ref().filter(|_| ty == GgmlType::Q4_K) else {
-            return Err(Error::invalid("rearranged form", format!("{ty} has none here")));
-        };
-        let (function, rows_per_group) = match (path, &re.registers) {
-            (PrefillPath::F16, Some((exact, _))) => (exact.get()?, 128),
-            (PrefillPath::F16Flush, Some((_, flush))) => (flush.get()?, 128),
-            (PrefillPath::F16, None) => (re.exact.get()?, TILE),
-            (PrefillPath::F16Flush, None) => (re.flush.get()?, TILE),
-            (PrefillPath::Int8, _) => {
-                return Err(Error::invalid(
-                    "rearranged form",
-                    "the rearranged kernels take f16 activations",
-                ));
-            }
-        };
-        if n_in == 0
-            || !n_in.is_multiple_of(256)
-            || n_rows == 0
-            || n_in.checked_mul(n_rows).is_none()
-        {
-            return Err(Error::invalid(
-                "prefill kernel batch",
-                format!(
-                    "{n_rows} rows of {n_in} values: not whole blocks of 256, empty or too many"
-                ),
-            ));
-        }
-        if n_out == 0 {
-            return Ok(());
-        }
-        check_alignment("rearranged matrix", w, 16)?;
-        check_alignment("prepared activations", act, 16)?;
-        let n_wt = n_out.div_ceil(rows_per_group);
-        let n_bt = n_rows.div_ceil(TILE);
-        let group = group_of(n_in, n_bt);
-        let groups = u32::try_from(u64::from(n_wt) * u64::from(n_bt)).map_err(|_| {
-            Error::invalid(
-                "prefill kernel batch",
-                format!("{n_out} x {n_rows} needs too many workgroups"),
-            )
-        })?;
-        let args = Args::new()
-            .ptr(w)
-            .ptr(act)
-            .ptr(y)
-            .ptr(self.tables)
-            .u32(n_in)
-            .u32(n_out)
-            .u32(n_rows)
-            .u32(group);
-        // SAFETY: the argument list matches mm_*_q4_K_r.comp; the ranges are the caller's.
-        unsafe { function.launch(stream, crate::kernels::grid_1d(groups, grid_limit), args) }
     }
 
     /// # Safety

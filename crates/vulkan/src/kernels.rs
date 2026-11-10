@@ -22,6 +22,10 @@ use crate::prefill::{Precision, Prefill, PrefillPath};
 use crate::stream::Stream;
 use crate::weights::{self, Quantized};
 
+mod layout;
+
+pub use layout::{ActivationForm, Layout, LayoutKernel, LayoutRows, LayoutTable};
+
 static ADD_F32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/add_f32.spv"));
 static RMS_NORM_F32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rms_norm_f32.spv"));
 static SUM32_F32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/sum32_f32.spv"));
@@ -55,6 +59,9 @@ struct Set {
     quantized: Option<Quantized>,
     /// The tensor-core kernels for many rows, on a device that has cooperative matrices.
     prefill: Option<Prefill>,
+    /// The kernels over the device layouts, on a device whose cooperative matrices can be
+    /// built in registers.
+    layouts: Option<layout::Layouts>,
 }
 
 /// The kernels of the engine on one device.
@@ -147,6 +154,10 @@ impl Kernels {
             }
             _ => None,
         };
+        let layouts = match &prefill {
+            Some(p) if p.register_operand() => Some(layout::Layouts::load(device, p.full_rate())?),
+            _ => None,
+        };
         Ok(Self(Arc::new(Set {
             device: device.clone(),
             add_f32: main(ADD_F32)?,
@@ -155,6 +166,7 @@ impl Kernels {
             matvec_q4_k,
             quantized,
             prefill,
+            layouts,
         })))
     }
 
@@ -190,6 +202,9 @@ impl Kernels {
         }
         if let Some(p) = &self.0.prefill {
             p.prepare(types)?;
+        }
+        if let Some(l) = &self.0.layouts {
+            l.prepare(types)?;
         }
         Ok(())
     }
@@ -371,8 +386,9 @@ impl Kernels {
     }
 
     /// Whether the elements of a cooperative matrix of use A are held in the order of an
-    /// `mma` fragment on this device (checked when the kernels were loaded): the kernels that
-    /// decode the weights straight into the operand need it.
+    /// `mma` fragment on this device (checked when the kernels were loaded): the kernels over
+    /// the device layouts, which decode the weights straight into the operand, need it
+    /// ([`Kernels::has_layout_kernels`]).
     pub fn cooperative_operand_in_registers(&self) -> bool {
         self.0.prefill.as_ref().is_some_and(Prefill::register_operand)
     }
@@ -459,83 +475,6 @@ impl Kernels {
         // SAFETY: the caller's guarantee is the one of the function it forwards to.
         unsafe {
             self.prefill()?.matmul(
-                stream,
-                ty,
-                path,
-                w,
-                act,
-                y,
-                n_in,
-                n_out,
-                n_rows,
-                self.grid_limit(),
-            )
-        }
-    }
-
-    /// Whether matrices of `ty` have a rearranged form on this device
-    /// ([`Kernels::rearrange`]).
-    pub fn has_rearranged_form(&self, ty: GgmlType) -> bool {
-        self.0.prefill.as_ref().is_some_and(|p| p.has_rearranged_form(ty))
-    }
-
-    /// The bytes of a rearranged matrix of `n_out` rows and `n_in` columns: those of the
-    /// file's form, with the rows rounded up to a multiple of 16. `None` for a type without
-    /// a rearranged form.
-    pub fn rearranged_bytes(ty: GgmlType, n_out: u32, n_in: u32) -> Option<u64> {
-        Prefill::rearranged_bytes(ty, n_out, n_in)
-    }
-
-    /// Rearranges a Q4_K matrix from the file's form into the one the kernels of
-    /// [`Kernels::matmul_rearranged`] read: codes in the order the tensor cores take them,
-    /// one 16-byte load per lane and 64 values of K, and the block headers of 16 rows
-    /// together (`shaders/repack_q4_K.comp`; the form is CUDA's, see `kernels/mmr.cuh`
-    /// there). Done once when the matrix is uploaded. A matrix in this form is no longer
-    /// one the decode kernels or [`Kernels::matmul`] read.
-    ///
-    /// # Safety
-    ///
-    /// On the stream's device and alive until the launch has run: `src` addresses the matrix
-    /// as GGUF stores it, `dst` [`Kernels::rearranged_bytes`] bytes, both 16-byte aligned
-    /// (checked), not overlapping.
-    pub unsafe fn rearrange(
-        &self,
-        stream: &Stream,
-        ty: GgmlType,
-        src: DevicePtr,
-        dst: DevicePtr,
-        n_out: u32,
-        n_in: u32,
-    ) -> Result<()> {
-        // SAFETY: the caller's guarantee is the one of the function it forwards to.
-        unsafe { self.prefill()?.rearrange(stream, ty, src, dst, n_out, n_in, self.grid_limit()) }
-    }
-
-    /// `y[b] = W x[b]` for a matrix in the rearranged form ([`Kernels::rearrange`]) and
-    /// activations prepared for `path` (an f16 path), which the kernel decodes in registers:
-    /// no tile of weights passes through shared memory, so the loads are whole lines.
-    ///
-    /// # Safety
-    ///
-    /// On the stream's device and alive until the launch has run: `w` the rearranged matrix
-    /// (16-byte aligned, checked), `act` the prepared activations (16-byte aligned,
-    /// checked), `y` `n_rows * n_out` f32 values, not overlapping the inputs.
-    #[allow(clippy::too_many_arguments)]
-    pub unsafe fn matmul_rearranged(
-        &self,
-        stream: &Stream,
-        ty: GgmlType,
-        path: PrefillPath,
-        w: DevicePtr,
-        act: DevicePtr,
-        y: DevicePtr,
-        n_in: u32,
-        n_out: u32,
-        n_rows: u32,
-    ) -> Result<()> {
-        // SAFETY: the caller's guarantee is the one of the function it forwards to.
-        unsafe {
-            self.prefill()?.matmul_rearranged(
                 stream,
                 ty,
                 path,

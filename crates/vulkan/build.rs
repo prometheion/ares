@@ -12,6 +12,11 @@
 //! loop (`-DARES_UNROLL`). `$OUT_DIR/shader_images.rs` lists every shader with its variants
 //! for the host.
 //!
+//! The kernels over the device layouts (`mml_repack.glsl`, `mml_near.glsl`, `mml_wide.glsl`)
+//! are templates: one source compiled once per weight type that has a device layout
+//! (`-DLT_TYPE`) and, for the products, per shape (`LAYOUT_SHAPES`), into
+//! `mml_<shape>_<type>.spv`.
+//!
 //! Environment:
 //! - `GLSLC`: path of the compiler (default: `glslc` on `PATH`, then
 //!   `$VULKAN_SDK/bin/glslc`, `/usr/bin/glslc`, `/usr/local/bin/glslc`).
@@ -78,6 +83,27 @@ const SHAPES: [(&str, u32, bool, u32); 14] = [
     ("mmvf_bf16", 4, true, 2),
 ];
 
+/// The weight types with a device layout, in the order of `LT_TYPE` in
+/// `shaders/mml_types.glsl` (`ares_quant::layout::spec` lists the same twelve).
+const LAYOUT_TYPES: [&str; 12] = [
+    "q4_K", "q5_K", "q6_K", "q3_K", "q2_K", "q4_0", "q4_1", "q5_0", "q5_1", "q8_0", "iq4_xs",
+    "iq4_nl",
+];
+
+/// The kernels over a device layout: the name of the shape, the template and its
+/// definitions. The shapes are those of CUDA's `kernels/mmr.cuh`: up to 8, 16, 32 and 64
+/// activation rows per workgroup, with f32 accumulation (`f`) or, for the wide ones, f16
+/// accumulation added to f32 every 64 values (`h`).
+const LAYOUT_SHAPES: [(&str, &str, &[&str]); 7] = [
+    ("repack", "mml_repack.glsl", &[]),
+    ("r8f", "mml_near.glsl", &["-DARES_NB=1"]),
+    ("r16f", "mml_near.glsl", &["-DARES_NB=2"]),
+    ("r32f", "mml_wide.glsl", &["-DARES_NBT=2", "-DARES_ACC32=1"]),
+    ("r32h", "mml_wide.glsl", &["-DARES_NBT=2", "-DARES_ACC32=0"]),
+    ("r64f", "mml_wide.glsl", &["-DARES_NBT=4", "-DARES_ACC32=1"]),
+    ("r64h", "mml_wide.glsl", &["-DARES_NBT=4", "-DARES_ACC32=0"]),
+];
+
 /// The shape of the kernel `name` (`mmvq_q4_K`, ...). `ARES_SWEEP=rows,per_batch,unroll`
 /// (for example `4,1,0`) gives it to every kernel, for measuring the choices.
 fn shape_of(name: &str) -> Shape {
@@ -95,6 +121,9 @@ fn main() {
     println!("cargo:rerun-if-changed=shaders");
     println!("cargo:rerun-if-env-changed=GLSLC");
     println!("cargo:rerun-if-env-changed=ARES_SWEEP");
+    println!("cargo:rerun-if-env-changed=ARES_LT_STREAM");
+    println!("cargo:rerun-if-env-changed=ARES_LT_KS");
+    println!("cargo:rerun-if-env-changed=ARES_LT_DEPTH");
     println!("cargo:rerun-if-env-changed=VULKAN_SDK");
 
     let out = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR"));
@@ -143,6 +172,8 @@ fn main() {
         rows: u32,
         batch: u32,
         unroll: u32,
+        /// Definitions of a template's variant; they replace the weight kernels' own.
+        defines: Vec<String>,
     }
     let mut jobs = Vec::new();
     let mut listing = Vec::new();
@@ -160,10 +191,39 @@ fn main() {
                 rows: shape.rows,
                 batch: n,
                 unroll: shape.unroll,
+                defines: Vec::new(),
             });
             variants.push(file);
         }
         listing.push((name, shape.rows, variants));
+    }
+    for (id, ty) in LAYOUT_TYPES.iter().enumerate() {
+        for (shape, template, defines) in LAYOUT_SHAPES {
+            let name = format!("mml_{shape}_{ty}");
+            let mut defines: Vec<String> = defines.iter().map(|d| (*d).to_owned()).collect();
+            defines.push(format!("-DLT_TYPE={id}"));
+            // ARES_LT_STREAM=0 or 1 overrides how a template loads the planes, for measuring.
+            if let Ok(stream) = env::var("ARES_LT_STREAM") {
+                defines.push(format!("-DLT_STREAM={stream}"));
+            }
+            // ARES_LT_DEPTH=n: how many steps ahead the codes are asked for, for measuring.
+            if let Ok(depth) = env::var("ARES_LT_DEPTH") {
+                defines.push(format!("-DLT_DEPTH={depth}"));
+            }
+            // ARES_LT_KS=n: the stripes of K of the kernels of few rows, for measuring.
+            if let Ok(stripes) = env::var("ARES_LT_KS") {
+                defines.push(format!("-DARES_KS={stripes}"));
+            }
+            jobs.push(Job {
+                source: Path::new("shaders").join(template),
+                target: out.join(format!("{name}.spv")),
+                rows: 0,
+                batch: 0,
+                unroll: 0,
+                defines,
+            });
+            listing.push((name.clone(), 0, vec![name]));
+        }
     }
     let next = AtomicUsize::new(0);
     let failure: Mutex<Option<String>> = Mutex::new(None);
@@ -183,11 +243,15 @@ fn main() {
                     // -Werror makes a shader warning fail the build instead of scrolling by.
                     cmd.args(["--target-env=vulkan1.2", "-fshader-stage=compute", "-O", "-Werror"]);
                     cmd.arg("-I").arg("shaders");
-                    cmd.arg(format!("-DARES_MATVEC_ROWS={MATVEC_ROWS}"));
-                    cmd.arg(format!("-DARES_MMVQ_WARPS={MMVQ_WARPS}"));
-                    cmd.arg(format!("-DARES_MMVQ_ROWS={}", job.rows));
-                    cmd.arg(format!("-DARES_NB={}", job.batch));
-                    cmd.arg(format!("-DARES_UNROLL={}", job.unroll));
+                    if job.defines.is_empty() {
+                        cmd.arg(format!("-DARES_MATVEC_ROWS={MATVEC_ROWS}"));
+                        cmd.arg(format!("-DARES_MMVQ_WARPS={MMVQ_WARPS}"));
+                        cmd.arg(format!("-DARES_MMVQ_ROWS={}", job.rows));
+                        cmd.arg(format!("-DARES_NB={}", job.batch));
+                        cmd.arg(format!("-DARES_UNROLL={}", job.unroll));
+                    } else {
+                        cmd.args(&job.defines);
+                    }
                     cmd.arg("-o").arg(&job.target).arg(&job.source);
                     let output = cmd
                         .output()

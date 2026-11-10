@@ -1,0 +1,114 @@
+#version 450
+#include "layer_common.glsl"
+
+// The causal convolution of the recurrent block over the kept window of a sequence, with
+// SiLU, the split into q / k / v and the normalisation of q and k per head.
+//
+// Per channel c of the projection `qkv` (conv_dim channels) the convolution has K taps
+// w[c][0..K-1], tap K-1 on the newest input:
+//   conv_t[c] = silu(sum_i w[c][i] * e_{t-(K-1)+i}[c])
+// where e_j are the raw projections of the rows and, before the first row, the K-1 inputs
+// the sequence's slot keeps (`conv_state`, [slot][channel][K-1], oldest first). The window
+// kernel reads that state and never writes it.
+//
+// Output: the first key_dim channels (queries) go to `q_out` [rows][key_dim], the rest
+// (keys, then values) to `kv_out` [rows][conv_dim - key_dim]; the channels of queries and
+// keys are normalised per head of 128 channels when `norm_eps >= 0`:
+// x / sqrt(sum(x^2) + eps).
+//
+// A cluster of 32 invocations handles 128 channels (a head) of a chunk of consecutive rows
+// of one segment, 4 channels per invocation. Rows are independent, so a chunk begins from
+// the raw inputs before it (or from the state for the first K-1 rows of the segment); the
+// chunks of a long prompt run in parallel.
+// Grid: (ceil(conv_dim / 512), ceil(longest segment / chunk_rows), n_segs).
+layout(local_size_x = 128) in;
+
+layout(push_constant, std430) uniform Push {
+    uint64_t step;
+    uint64_t qkv;
+    uint64_t taps;
+    uint64_t conv_state;
+    uint64_t slot_stride;
+    uint64_t q_out;
+    uint64_t kv_out;
+    uint conv_dim;
+    uint key_dim;
+    uint kernel;
+    uint chunk_rows;
+    float norm_eps;
+} pc;
+
+const uint MAX_TAPS = 8;
+
+void main() {
+    const Seg seg = step_seg(pc.step, gl_WorkGroupID.z);
+    const uint t0 = gl_WorkGroupID.y * pc.chunk_rows;
+    if (t0 >= seg.n_rows) {
+        return;
+    }
+    const uint t1 = min(t0 + pc.chunk_rows, seg.n_rows);
+    const uint lane = gl_LocalInvocationID.x & 31u;
+    const uint tile = gl_WorkGroupID.x * 4 + (gl_LocalInvocationID.x >> 5);
+    const uint c0 = tile * 128 + lane * 4;
+    if (c0 >= pc.conv_dim) {
+        return;  // a whole cluster: tiles are 128 channels and conv_dim is a multiple of 128
+    }
+    const uint kk = pc.kernel - 1;
+    const bool normed = pc.norm_eps >= 0.0 && c0 < 2 * pc.key_dim;
+
+    // w[i] holds tap i of the four channels.
+    vec4 w[MAX_TAPS];
+    [[unroll]] for (uint i = 0; i < MAX_TAPS; i++) {
+        w[i] = vec4(0.0);
+        if (i < pc.kernel) {
+            [[unroll]] for (uint ch = 0; ch < 4; ch++) {
+                w[i][ch] = ldf(pc.taps + 4 * (uint64_t(c0 + ch) * pc.kernel + i));
+            }
+        }
+    }
+    // win[j] is the input j places after the first of the chunk's tap window.
+    vec4 win[MAX_TAPS - 1];
+    const uint64_t state = pc.conv_state + 4 * uint64_t(seg.slot) * pc.slot_stride;
+    [[unroll]] for (uint j = 0; j < MAX_TAPS - 1; j++) {
+        win[j] = vec4(0.0);
+        if (j < kk) {
+            // Input number (t0 - kk + j) of the segment; negative numbers are in the state.
+            const int at = int(t0) - int(kk) + int(j);
+            if (at >= 0) {
+                win[j] = ldv4(pc.qkv + 4 * ((uint64_t(seg.row0) + uint(at)) * pc.conv_dim + c0));
+            } else {
+                [[unroll]] for (uint ch = 0; ch < 4; ch++) {
+                    win[j][ch] = ldf(state + 4 * (uint64_t(c0 + ch) * kk + uint(at + int(kk))));
+                }
+            }
+        }
+    }
+
+    for (uint t = t0; t < t1; t++) {
+        const uint64_t row = uint64_t(seg.row0) + t;
+        const vec4 x = ldv4(pc.qkv + 4 * (row * pc.conv_dim + c0));
+        vec4 acc = vec4(0.0);
+        [[unroll]] for (uint i = 0; i < MAX_TAPS; i++) {
+            const vec4 input_ = i < kk ? win[min(i, MAX_TAPS - 2)] : (i == kk ? x : vec4(0.0));
+            acc = fma(w[i], input_, acc);
+        }
+        vec4 y = l_silu(acc);
+        // Shift the window: the oldest input leaves, this one enters.
+        [[unroll]] for (uint i = 0; i < MAX_TAPS - 1; i++) {
+            if (i + 1 < kk) {
+                win[i] = win[i + 1];
+            } else if (i + 1 == kk) {
+                win[i] = x;
+            }
+        }
+        if (normed) {
+            const float ssq = subgroupClusteredAdd(dot(y, y), 32);
+            y *= inversesqrt(ssq + pc.norm_eps);
+        }
+        if (c0 < pc.key_dim) {
+            LVec4(pc.q_out + 4 * (row * pc.key_dim + c0)).v[0] = y;
+        } else {
+            LVec4(pc.kv_out + 4 * (row * (pc.conv_dim - pc.key_dim) + (c0 - pc.key_dim))).v[0] = y;
+        }
+    }
+}

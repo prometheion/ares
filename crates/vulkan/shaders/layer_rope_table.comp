@@ -1,0 +1,155 @@
+#version 450
+#include "layer_common.glsl"
+
+// The rotary table of a step: for every row and every rotated pair p < rot / 2,
+// (cos, sin) of pos * freq_base^(-2p / rot), with the position kind of the pair chosen by
+// the sections (interleaved layout: sector = p mod (s0 + s1 + s2 + s3); kind 0 (time) for
+// sector % 3 == 0 below 3 * s0, kind 1 (height) below 3 * s1, kind 2 (width) below
+// 3 * s2, the extra position otherwise). Built once per step; every attention layer reads
+// it.
+//
+// Positions reach hundreds of thousands, where an f32 angle is off by 1e-2 rad. The CUDA
+// kernel computes the angle in f64; GLSL has no sine of a double, and a device need not
+// have doubles at all, so this kernel computes in 64-bit integers, which every device of
+// the engine has:
+// - the angle is kept in turns as a fraction of 2^64, so the multiplication by the position
+//   wraps around the circle by itself and loses nothing;
+// - the frequency of pair p is r^p with r = freq_base^(-2 / rot), which the host passes as
+//   a fraction of 2^64 (`r64`), raised by squaring;
+// - sine and cosine of the remainder in [-pi/4, pi/4] are their Taylor series in fixed
+//   point with 63 fraction bits, rounded once to f32.
+// The result is the correctly rounded f32 of the exact value up to about 1e-10, on every
+// driver.
+//
+// One invocation per (row, pair). Grid: ceil(n_rows * rot / 2 / 256) workgroups.
+layout(local_size_x = 256) in;
+
+layout(push_constant, std430) uniform Push {
+    uint64_t step;
+    uint64_t table;
+    uint64_t r64;
+    uint rot;
+    uint s0;
+    uint s1;
+    uint s2;
+    uint s3;
+} pc;
+
+// The high 64 bits of a * b.
+uint64_t mulhi64(uint64_t a, uint64_t b) {
+    const uint64_t al = a & 0xFFFFFFFFul;
+    const uint64_t ah = a >> 32;
+    const uint64_t bl = b & 0xFFFFFFFFul;
+    const uint64_t bh = b >> 32;
+    const uint64_t ll = al * bl;
+    const uint64_t lh = al * bh;
+    const uint64_t hl = ah * bl;
+    const uint64_t mid = (ll >> 32) + (lh & 0xFFFFFFFFul) + (hl & 0xFFFFFFFFul);
+    return ah * bh + (lh >> 32) + (hl >> 32) + (mid >> 32);
+}
+
+// 1 with 63 fraction bits, and the product of two numbers of that form (both at most 1).
+const uint64_t ONE = 1ul << 63;
+uint64_t mul63(uint64_t a, uint64_t b) { return mulhi64(a, b) << 1; }
+
+// 1 / (2 pi) and pi / 4 as fractions of 2^64.
+const uint64_t INV_TWO_PI = 0x28BE60DB9391054Aul;
+const uint64_t QUARTER_PI = 0xC90FDAA22168C235ul;
+
+// A number with 63 fraction bits (at most 1) as the nearest f32.
+float from_q63(uint64_t v) {
+    if (v == 0ul) {
+        return 0.0;
+    }
+    const uint hi = uint(v >> 32);
+    const int msb = hi != 0u ? 32 + findMSB(hi) : findMSB(uint(v));
+    const float unit = uintBitsToFloat(uint(127 - 63) << 23);  // 2^-63
+    if (msb <= 23) {
+        return float(uint(v)) * unit;
+    }
+    const int shift = msb - 23;
+    const uint64_t m = (v + (1ul << (shift - 1))) >> shift;  // 2^23 .. 2^24, exact as f32
+    return float(uint(m)) * uintBitsToFloat(uint(127 + shift - 63) << 23);
+}
+
+void main() {
+    const uint half_ = pc.rot >> 1;
+    const uint64_t id = ares_group() * 256 + gl_LocalInvocationID.x;
+    const uint64_t row = id / half_;
+    const uint p = uint(id % half_);
+    if (row >= uint64_t(step_n_rows(pc.step))) {
+        return;
+    }
+    const uint total = pc.s0 + pc.s1 + pc.s2 + pc.s3;
+    const uint sector = p % total;
+    const uint kind = sector % 3;
+    uint which = 3;
+    if (kind == 0 && sector < 3 * pc.s0) {
+        which = 0;
+    } else if (kind == 1 && sector < 3 * pc.s1) {
+        which = 1;
+    } else if (kind == 2 && sector < 3 * pc.s2) {
+        which = 2;
+    }
+    const int position = step_pos(pc.step, uint(row), which);
+
+    // Turns per position of pair p: r^p / (2 pi).
+    uint64_t power = 0;
+    bool is_one = true;
+    uint64_t square = pc.r64;
+    for (uint e = p; e != 0u; e >>= 1) {
+        if ((e & 1u) != 0u) {
+            power = is_one ? square : mulhi64(power, square);
+            is_one = false;
+        }
+        square = mulhi64(square, square);
+    }
+    const uint64_t turns = is_one ? INV_TWO_PI : mulhi64(power, INV_TWO_PI);
+    // The angle in turns, modulo one turn: the product wraps. A negative position is its
+    // two's complement, which is the same modulo 2^64.
+    const uint64_t phase = uint64_t(int64_t(position)) * turns;
+
+    // angle = quadrant * pi/2 + r with r in [-pi/4, pi/4).
+    const uint64_t eighth = 1ul << 61;
+    const uint64_t shifted = phase + eighth;
+    const uint quadrant = uint(shifted >> 62);
+    const uint64_t rem = shifted & ((1ul << 62) - 1ul);
+    const bool negative = rem < eighth;
+    const uint64_t magnitude = negative ? eighth - rem : rem - eighth;  // of r, in 2^-64 turns
+    // |r| in radians with 63 fraction bits: (magnitude / 2^61) * pi / 4.
+    const uint64_t x = mulhi64(magnitude << 2, QUARTER_PI);
+    const uint64_t x2 = mul63(x, x);
+
+    uint64_t s = ONE - mul63(x2, ONE / 156ul);
+    s = ONE - mul63(mul63(x2, ONE / 110ul), s);
+    s = ONE - mul63(mul63(x2, ONE / 72ul), s);
+    s = ONE - mul63(mul63(x2, ONE / 42ul), s);
+    s = ONE - mul63(mul63(x2, ONE / 20ul), s);
+    s = ONE - mul63(mul63(x2, ONE / 6ul), s);
+    const float sin_r = from_q63(mul63(x, s)) * (negative ? -1.0 : 1.0);
+
+    uint64_t c = ONE - mul63(x2, ONE / 182ul);
+    c = ONE - mul63(mul63(x2, ONE / 132ul), c);
+    c = ONE - mul63(mul63(x2, ONE / 90ul), c);
+    c = ONE - mul63(mul63(x2, ONE / 56ul), c);
+    c = ONE - mul63(mul63(x2, ONE / 30ul), c);
+    c = ONE - mul63(mul63(x2, ONE / 12ul), c);
+    const float cos_r = from_q63(ONE - mul63(x2 >> 1, c));
+
+    vec2 cs;
+    switch (quadrant) {
+    case 0u:
+        cs = vec2(cos_r, sin_r);
+        break;
+    case 1u:
+        cs = vec2(-sin_r, cos_r);
+        break;
+    case 2u:
+        cs = vec2(-cos_r, -sin_r);
+        break;
+    default:
+        cs = vec2(sin_r, -cos_r);
+        break;
+    }
+    LVec2(pc.table + 8 * id).v[0] = cs;
+}

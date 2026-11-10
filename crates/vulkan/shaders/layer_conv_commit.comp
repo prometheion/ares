@@ -1,0 +1,57 @@
+#version 450
+#include "layer_common.glsl"
+
+// The commit of the convolution window: after the first `m` rows of a segment the window is
+// the last K-1 of (old window, then the first m raw inputs).
+//   which = 0: the segments that are not direct, with m = accepted (the deferred commit)
+//   which = 1: the direct segments, with m = n_rows (right after their window)
+//   which = 2: both
+// One invocation per channel; the window is read completely before it is written, so the
+// update is in place. Grid: (ceil(conv_dim / 128), n_segs).
+layout(local_size_x = 128) in;
+
+layout(push_constant, std430) uniform Push {
+    uint64_t step;
+    uint64_t qkv;
+    uint64_t conv_state;
+    uint64_t slot_stride;
+    uint conv_dim;
+    uint kernel;
+    uint which;
+} pc;
+
+const uint MAX_TAPS = 8;
+
+void main() {
+    const Seg seg = step_seg(pc.step, gl_WorkGroupID.y);
+    const bool direct = (seg.flags & SEG_DIRECT) != 0u;
+    if ((pc.which == 0u && direct) || (pc.which == 1u && !direct)) {
+        return;
+    }
+    const uint m = direct ? seg.n_rows : min(seg.accepted, seg.n_rows);
+    const uint c = gl_WorkGroupID.x * 128 + gl_LocalInvocationID.x;
+    if (m == 0u || c >= pc.conv_dim) {
+        return;
+    }
+    const uint kk = pc.kernel - 1;
+    const uint64_t state =
+        pc.conv_state + 4 * (uint64_t(seg.slot) * pc.slot_stride + uint64_t(c) * kk);
+    float old[MAX_TAPS - 1];
+    [[unroll]] for (uint i = 0; i < MAX_TAPS - 1; i++) {
+        old[i] = i < kk ? ldf(state + 4 * i) : 0.0;
+    }
+    [[unroll]] for (uint i = 0; i < MAX_TAPS - 1; i++) {
+        if (i < kk) {
+            const uint at = m + i;
+            float kept = 0.0;
+            [[unroll]] for (uint j = 0; j < MAX_TAPS - 1; j++) {
+                if (j == at) {
+                    kept = old[j];
+                }
+            }
+            FloatRef(state + 4 * i).v[0] =
+                at < kk ? kept
+                        : ldf(pc.qkv + 4 * ((uint64_t(seg.row0) + (at - kk)) * pc.conv_dim + c));
+        }
+    }
+}

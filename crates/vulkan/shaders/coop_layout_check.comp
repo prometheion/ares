@@ -8,7 +8,7 @@
 #extension GL_EXT_control_flow_attributes : require
 
 // Which element of a cooperative matrix of use A (f16, 16 x 16) each invocation holds, for
-// the register-resident weight kernels (`mm_*_r2`): they build the A operand from the codes
+// the kernels over the device layouts (`mml_near.glsl`, `mml_wide.glsl`): they build the A operand from the codes
 // of the weights in registers, in the order of an `mma` m16n8k16 A fragment:
 //   element 4 r + 2 c + h of lane (g = lane / 4, t = lane % 4), r, c, h = 0 or 1, is the
 //   matrix element in row g + 8 r, column 2 t + h + 8 c.

@@ -1,4 +1,4 @@
-//! Times the tensor-core prefill kernels (`Kernels::matmul`, `Kernels::matmul_rearranged`) on
+//! Times the tensor-core prefill kernels (`Kernels::matmul`, `Kernels::product_with`) on
 //! each Vulkan device, the way `crates/cuda/examples/prefill_bench.rs` times CUDA's: a
 //! 17408 x 5120 matrix (the FFN of Qwen3.8-27B) times `rows` activation rows by each path,
 //! 10 launches in a row between two events, over copies of the matrix that together are
@@ -13,13 +13,14 @@
 //!     [--device N]
 //! ```
 //!
-//! `re-f16` and `re-flush` run on the rearranged form (Q4_K only), the others on the file's.
+//! `re-f16` and `re-flush` run on the device layout (the kernels `r64f` and `r64h`, for the
+//! types that have one; `vk_layout_bench` times the whole family), the others on the file's.
 
 use std::time::Instant;
 
 use ares_core::GgmlType;
 use ares_vulkan::{
-    Device, DeviceBuffer, Event, Kernels, MAX_BATCH, PrefillPath, Result, Stream, devices,
+    Device, DeviceBuffer, Event, Kernels, Layout, MAX_BATCH, PrefillPath, Result, Stream, devices,
 };
 
 const N_IN: u32 = 5120;
@@ -106,9 +107,9 @@ fn main() -> Result<()> {
                     Ok(buffer)
                 })
                 .collect::<Result<Vec<_>>>()?;
-            let re_bytes = Kernels::rearranged_bytes(ty, N_OUT, N_IN);
+            let re_bytes = Kernels::layout_bytes(ty, Layout::Device, N_OUT, N_IN);
             let rearranged = match re_bytes {
-                Some(bytes) if kernels.has_rearranged_form(ty) => Some(
+                Some(bytes) if kernels.has_layout_kernels() => Some(
                     weights
                         .iter()
                         .map(|src| {
@@ -203,10 +204,10 @@ fn main() -> Result<()> {
                                     }
                                     Ok(())
                                 }
-                                Some(p) if rearranged_form => kernels.matmul_rearranged(
+                                Some(p) if rearranged_form => kernels.product_with(
                                     &stream,
                                     ty,
-                                    p,
+                                    if p == PrefillPath::F16 { "r64f" } else { "r64h" },
                                     rearranged.as_ref().unwrap()[i % copies].ptr(),
                                     act.ptr(),
                                     y.ptr(),

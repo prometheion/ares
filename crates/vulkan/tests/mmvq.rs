@@ -94,25 +94,39 @@ struct Gpu {
     kernels: Kernels,
 }
 
-/// The devices every test shares, opened once. They are dropped when the process exits
-/// (`drop_gpus`, registered with `atexit`): the NVIDIA driver (615.78) crashes in a compiler
-/// thread of its own when a process exits with devices that were never destroyed and
-/// pipelines it was still compiling for, as happens here when the shaders are not in its disk
-/// cache.
+/// The devices every test shares, opened once and never closed: the process leaves through
+/// [`leave`].
 static GPUS: OnceLock<Option<&'static [Gpu]>> = OnceLock::new();
 
-extern "C" fn drop_gpus() {
-    if let Some(Some(gpus)) = GPUS.get() {
-        // SAFETY: the slice was leaked from a `Box` in `gpus` and nothing runs any more
-        // that could use it: this is the exit of the process.
-        drop(unsafe { Box::from_raw(std::ptr::from_ref::<[Gpu]>(gpus).cast_mut()) });
+/// Ends the process at once when it exits, with the status it exits with (glibc's `on_exit`
+/// hands it over): no exit handler of the driver runs and no device is destroyed. The NVIDIA
+/// driver (615.78) compiles pipelines on threads of its own, and it crashes there when a
+/// device is destroyed or its exit handlers run while one of them still works: seen as a
+/// segmentation fault with devices that were never destroyed, and as an abort ("corrupted
+/// size vs. prev_size" in `libnvidia-gpucomp`) with devices dropped by a handler at exit
+/// after a long run that had made hundreds of pipelines. The kernel frees what the process
+/// held.
+extern "C" fn leave(status: i32, _: *mut std::ffi::c_void) {
+    unsafe extern "C" {
+        fn _exit(status: i32) -> !;
     }
+    // SAFETY: `_exit` takes any status and does not return.
+    unsafe { _exit(status) }
+}
+
+/// Registers [`leave`] for the exit of the process.
+fn leave_at_exit() {
+    unsafe extern "C" {
+        fn on_exit(
+            callback: extern "C" fn(i32, *mut std::ffi::c_void),
+            arg: *mut std::ffi::c_void,
+        ) -> i32;
+    }
+    // SAFETY: registering a function that ends the process; it uses no argument.
+    unsafe { on_exit(leave, std::ptr::null_mut()) };
 }
 
 fn gpus() -> Option<&'static [Gpu]> {
-    unsafe extern "C" {
-        fn atexit(callback: extern "C" fn()) -> i32;
-    }
     *GPUS.get_or_init(|| {
         if std::env::var_os("ARES_TEST_VULKAN").is_none() {
             eprintln!("skipped: set ARES_TEST_VULKAN=1 to run the tests that open GPUs");
@@ -128,8 +142,7 @@ fn gpus() -> Option<&'static [Gpu]> {
                 Gpu { device, kernels }
             })
             .collect();
-        // SAFETY: registering a function that takes and returns nothing.
-        unsafe { atexit(drop_gpus) };
+        leave_at_exit();
         Some(Box::leak(opened.into_boxed_slice()) as &'static [Gpu])
     })
 }
@@ -816,119 +829,6 @@ fn relative_error(have: &[f32], exact: &[f64], size: &[f64]) -> (f64, f64) {
     )
 }
 
-/// The f16 prefill kernels on a rearranged Q4_K matrix: the error against the exact f32
-/// product must be the f16 rounding of weights and activations and nothing more (a tenth of
-/// a percent), well under the 1 % of 8-bit activations, for shapes with partial tiles on
-/// both sides, rows of any magnitude, and both accumulations.
-#[test]
-fn f16_prefill_on_the_rearranged_form_is_close_to_the_exact_product() {
-    let Some(gpus) = gpus() else { return };
-    let mut rng = Rng(0x51de_cafe_f00d_0001);
-    let mut failures = Vec::new();
-    for Gpu { device, kernels } in gpus {
-        if !kernels.has_prefill_path(PrefillPath::F16) {
-            eprintln!("skipped on {}: no f16 cooperative matrices", device.info().name);
-            continue;
-        }
-        assert!(kernels.has_rearranged_form(GgmlType::Q4_K));
-        eprintln!(
-            "{}: operand in registers {}, f16 accumulation at full rate {}, Fast takes {:?}",
-            device.info().name,
-            kernels.cooperative_operand_in_registers(),
-            kernels.tensor_cores_full_rate(),
-            kernels.prefill_path(ares_vulkan::Precision::Fast).unwrap()
-        );
-        let stream = Stream::new(device).unwrap();
-        for (n_in, n_out, n_rows) in [
-            (256usize, 1usize, 1usize),
-            (256, 64, 64),
-            (512, 70, 65),
-            (1280, 130, 3),
-            (5120, 129, 200),
-            (2560, 64, 1000),
-            (17408, 77, 70),
-        ] {
-            let w = random_blocks(&mut rng, GgmlType::Q4_K, blocks_of(GgmlType::Q4_K, n_in, n_out));
-            // Rows of different magnitudes: the kernels divide each by a power of two.
-            let x: Vec<f32> = (0..n_in * n_rows)
-                .map(|i| rng.activation() * 4f32.powi(((i / n_in) % 7) as i32 - 3))
-                .collect();
-            let (exact, size) = exact_product(GgmlType::Q4_K, &w, &x, n_in, n_out, n_rows);
-            let dw = DeviceBuffer::new(device, w.len() as u64).unwrap();
-            dw.write(0, &w).unwrap();
-            let re_bytes =
-                Kernels::rearranged_bytes(GgmlType::Q4_K, n_out as u32, n_in as u32).unwrap();
-            let dre = DeviceBuffer::new(device, re_bytes).unwrap();
-            let dx = DeviceBuffer::new(device, x.len() as u64 * 4).unwrap();
-            dx.write(0, &f32_bytes(&x)).unwrap();
-            // SAFETY: the buffers are sized for these shapes below.
-            unsafe {
-                kernels
-                    .rearrange(
-                        &stream,
-                        GgmlType::Q4_K,
-                        dw.ptr(),
-                        dre.ptr(),
-                        n_out as u32,
-                        n_in as u32,
-                    )
-                    .unwrap();
-            }
-            for path in [PrefillPath::F16, PrefillPath::F16Flush] {
-                let act = DeviceBuffer::new(
-                    device,
-                    Kernels::prefill_activation_bytes(path, n_in as u32, n_rows as u32),
-                )
-                .unwrap();
-                let dy = DeviceBuffer::new(device, (n_rows * n_out * 4) as u64).unwrap();
-                // SAFETY: as above.
-                unsafe {
-                    kernels
-                        .prepare_prefill_activations(
-                            &stream,
-                            path,
-                            dx.ptr(),
-                            act.ptr(),
-                            n_in as u32,
-                            n_rows as u32,
-                        )
-                        .unwrap();
-                    kernels
-                        .matmul_rearranged(
-                            &stream,
-                            GgmlType::Q4_K,
-                            path,
-                            dre.ptr(),
-                            act.ptr(),
-                            dy.ptr(),
-                            n_in as u32,
-                            n_out as u32,
-                            n_rows as u32,
-                        )
-                        .unwrap();
-                }
-                stream.synchronize().unwrap();
-                let have = read_f32(&dy, n_rows * n_out);
-                let (scaled, rel) = relative_error(&have, &exact, &size);
-                eprintln!(
-                    "q4_K {path:?} rearranged {n_out}x{n_in} rows {n_rows} on {}: {:.4}% of a sum's size, {:.4}% of the rms",
-                    device.info().name,
-                    scaled * 100.0,
-                    rel * 100.0
-                );
-                if scaled.is_nan() || scaled >= 1.5e-3 {
-                    failures.push(format!(
-                        "{path:?} {n_out}x{n_in} x{n_rows}: {scaled}; have {:?} exact {:?}",
-                        &have[..have.len().min(4)],
-                        &exact[..exact.len().min(4)]
-                    ));
-                }
-            }
-        }
-    }
-    assert!(failures.is_empty(), "{} failures:\n{}", failures.len(), failures.join("\n"));
-}
-
 /// The f16 prefill kernels on the file's layout, for every type that has one: the error
 /// against the exact f32 product must be the rounding of weights and activations to f16
 /// (and of partial sums, with f16 accumulation) and nothing more, for shapes with partial
@@ -1006,101 +906,6 @@ fn f16_prefill_on_the_file_layout_is_close_to_the_exact_product() {
         }
     }
     assert!(failures.is_empty(), "{} failures:\n{}", failures.len(), failures.join("\n"));
-}
-
-/// The rearranged form of a Q4_K matrix, built on the CPU the way CUDA's `ares_repack_q4_K`
-/// (kernels/mmr.cuh) does: for each tile of 16 rows and step of 64 values 32 lanes of 16
-/// bytes in the order of an `mma` m16n8k16 A fragment (nibble i of word kk of lane (g, t)
-/// is the even and nibble i + 4 the odd value of the pair register a_i of slab kk holds),
-/// then the 16-byte headers of the 16 rows for each super-block.
-fn rearrange_q4_k_like_cuda(w: &[u8], n_out: usize, n_in: usize) -> Vec<u8> {
-    let (n_tiles, n_steps, n_sb) = (n_out.div_ceil(16), n_in / 64, n_in / 256);
-    let row_bytes = n_sb * 144;
-    let mut out = vec![0u8; n_tiles * 16 * n_in / 2 + n_tiles * n_sb * 16 * 16];
-    for mt in 0..n_tiles {
-        for ks in 0..n_steps {
-            for lane in 0..32 {
-                let (g, t) = (lane / 4, lane % 4);
-                let (sb, j) = (ks / 4, ks % 4);
-                let mut words = [0u32; 4];
-                for (kk, word) in words.iter_mut().enumerate() {
-                    for i in 0..4 {
-                        let row = mt * 16 + g + 8 * (i & 1);
-                        let mut q = [0u32; 2];
-                        if row < n_out {
-                            let blk = &w[row * row_bytes + sb * 144..][..144];
-                            for (e, qe) in q.iter_mut().enumerate() {
-                                let kp = kk * 16 + 2 * t + 8 * (i >> 1) + e;
-                                let byte = u32::from(blk[16 + 32 * j + (kp & 31)]);
-                                *qe = if kp >= 32 { byte >> 4 } else { byte & 0xF };
-                            }
-                        }
-                        *word |= (q[0] << (4 * i)) | (q[1] << (4 * i + 16));
-                    }
-                }
-                let at = ((mt * n_steps + ks) * 32 + lane) * 16;
-                for (k, word) in words.iter().enumerate() {
-                    out[at + 4 * k..at + 4 * k + 4].copy_from_slice(&word.to_le_bytes());
-                }
-            }
-        }
-    }
-    let codes = n_tiles * 16 * n_in / 2;
-    for mt in 0..n_tiles {
-        for sb in 0..n_sb {
-            for r in 0..16 {
-                let row = mt * 16 + r;
-                if row < n_out {
-                    let at = codes + ((mt * n_sb + sb) * 16 + r) * 16;
-                    out[at..at + 16].copy_from_slice(&w[row * row_bytes + sb * 144..][..16]);
-                }
-            }
-        }
-    }
-    out
-}
-
-/// The rearranged form the device makes is the form CUDA makes, byte for byte (one upload
-/// format for both backends).
-#[test]
-fn the_rearranged_form_is_the_one_cuda_makes() {
-    let Some(gpus) = gpus() else { return };
-    let mut rng = Rng(0x0dd5_a11e_feed_0003);
-    for Gpu { device, kernels } in gpus {
-        if !kernels.has_rearranged_form(GgmlType::Q4_K) {
-            continue;
-        }
-        let stream = Stream::new(device).unwrap();
-        for (n_in, n_out) in [(256usize, 1usize), (512, 16), (1280, 70), (5120, 129)] {
-            let w = random_blocks(&mut rng, GgmlType::Q4_K, blocks_of(GgmlType::Q4_K, n_in, n_out));
-            let want = rearrange_q4_k_like_cuda(&w, n_out, n_in);
-            assert_eq!(
-                want.len() as u64,
-                Kernels::rearranged_bytes(GgmlType::Q4_K, n_out as u32, n_in as u32).unwrap()
-            );
-            let dw = DeviceBuffer::new(device, w.len() as u64).unwrap();
-            dw.write(0, &w).unwrap();
-            let dre = DeviceBuffer::new(device, want.len() as u64).unwrap();
-            // SAFETY: the buffers are sized for this shape just above.
-            unsafe {
-                kernels
-                    .rearrange(
-                        &stream,
-                        GgmlType::Q4_K,
-                        dw.ptr(),
-                        dre.ptr(),
-                        n_out as u32,
-                        n_in as u32,
-                    )
-                    .unwrap();
-            }
-            stream.synchronize().unwrap();
-            let mut got = vec![0u8; want.len()];
-            dre.read(0, &mut got).unwrap();
-            let first = (0..want.len()).find(|&i| got[i] != want[i]);
-            assert!(first.is_none(), "{n_out}x{n_in}: first difference at byte {first:?}");
-        }
-    }
 }
 
 /// What a device without cooperative matrices runs for a prompt: the decode kernels in

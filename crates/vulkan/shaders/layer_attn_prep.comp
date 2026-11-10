@@ -1,0 +1,94 @@
+#version 450
+#include "layer_common.glsl"
+
+// Preparation of the attention input of a step, one cluster of 32 invocations per
+// (row, head), q heads first and then k heads:
+//   q head:  the query is the first `hd` values of the head's `2 hd` of the projection
+//            `qg`, the gate the second `hd`; query = rope(rms(query) * q_norm)
+//   k head:  rope(rms(k) * k_norm)
+//   v is not touched here.
+// The gate is copied to `gate_out` unless that is null. hd is a multiple of 32 and at
+// most 256; the first `rot` values of a head are rotated, in pairs (p, p + rot / 2).
+// Grid: ceil(n_rows * (n_head + n_kv_head) / 8) workgroups.
+layout(local_size_x = 256) in;
+
+layout(push_constant, std430) uniform Push {
+    uint64_t step;
+    uint64_t qg;
+    uint64_t k;
+    uint64_t q_norm;
+    uint64_t k_norm;
+    uint64_t table;
+    uint64_t q_out;
+    uint64_t gate_out;
+    uint64_t k_out;
+    uint n_head;
+    uint n_kv_head;
+    uint hd;
+    uint rot;
+    float eps;
+} pc;
+
+shared float stage[8][256];
+
+void main() {
+    const uint warp = gl_LocalInvocationID.x >> 5;
+    const uint lane = gl_LocalInvocationID.x & 31u;
+    const uint64_t item = ares_group() * 8 + warp;
+    const uint slots = pc.n_head + pc.n_kv_head;
+    const uint64_t row = item / slots;
+    const uint slot = uint(item % slots);
+    // Every invocation reaches the barriers; one past the end reads and writes nothing.
+    const bool live = row < uint64_t(step_n_rows(pc.step));
+    const bool is_q = slot < pc.n_head;
+    const uint hd = pc.hd;
+    const uint64_t src = is_q ? pc.qg + 4 * (row * pc.n_head * 2 * hd + uint64_t(slot) * 2 * hd)
+                              : pc.k + 4 * (row * pc.n_kv_head * hd + uint64_t(slot - pc.n_head) * hd);
+    const uint64_t weight = is_q ? pc.q_norm : pc.k_norm;
+    const uint64_t dst = is_q ? pc.q_out + 4 * (row * pc.n_head * hd + uint64_t(slot) * hd)
+                              : pc.k_out + 4 * (row * pc.n_kv_head * hd + uint64_t(slot - pc.n_head) * hd);
+    float value[8];
+    float ssq = 0.0;
+    [[unroll]] for (uint j = 0; j < 8; j++) {
+        const uint i = lane + 32 * j;
+        value[j] = (live && i < hd) ? ldf(src + 4 * uint64_t(i)) : 0.0;
+        ssq += value[j] * value[j];
+    }
+    ssq = subgroupClusteredAdd(ssq, 32);
+    const float scale = inversesqrt(ssq / float(hd) + pc.eps);
+    // Normalised values go to the stage so that the rotation reads normalised pairs.
+    [[unroll]] for (uint j = 0; j < 8; j++) {
+        const uint i = lane + 32 * j;
+        if (live && i < hd) {
+            stage[warp][i] = value[j] * scale * ldf(weight + 4 * uint64_t(i));
+        }
+    }
+    barrier();
+    if (!live) {
+        return;
+    }
+    const uint half_ = pc.rot >> 1;
+    [[unroll]] for (uint j = 0; j < 8; j++) {
+        const uint i = lane + 32 * j;
+        if (i < hd) {
+            float o = stage[warp][i];
+            if (i < pc.rot) {
+                const uint p = i < half_ ? i : i - half_;
+                const vec2 cs = LVec2(pc.table + 8 * (row * half_ + p)).v[0];
+                const float a = stage[warp][p];
+                const float b = stage[warp][p + half_];
+                o = i < half_ ? a * cs.x - b * cs.y : a * cs.y + b * cs.x;
+            }
+            FloatRef(dst + 4 * uint64_t(i)).v[0] = o;
+        }
+    }
+    if (is_q && pc.gate_out != 0ul) {
+        const uint64_t g = pc.gate_out + 4 * (row * pc.n_head * hd + uint64_t(slot) * hd);
+        [[unroll]] for (uint j = 0; j < 8; j++) {
+            const uint i = lane + 32 * j;
+            if (i < hd) {
+                FloatRef(g + 4 * uint64_t(i)).v[0] = ldf(src + 4 * uint64_t(hd + i));
+            }
+        }
+    }
+}

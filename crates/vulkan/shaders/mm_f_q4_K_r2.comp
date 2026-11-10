@@ -1,3 +1,0 @@
-#version 450
-#define ARES_ACC32 1
-#include "mm_r2_q4_K.glsl"

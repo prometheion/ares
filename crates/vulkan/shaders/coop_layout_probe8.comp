@@ -1,0 +1,58 @@
+#version 450
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_control_flow_attributes : require
+
+// Probe for `vk_coop_layout`: which elements of a cooperative matrix of use B (f16, 16 x 8)
+// and of an accumulator (f32, 16 x 8) each invocation holds.
+//   out[0 .. 128)    the matrix B whose element e of lane l was set to 4 l + e + 1, row-major
+//                    (8 values per row), found by multiplying the identity with it
+//   out[128 .. 256)  for lane l and element e, at 128 + 4 l + e: the value the lane reads from
+//                    an accumulator whose element (m, n) holds 8 m + n + 1
+// One subgroup.
+
+layout(local_size_x = 32) in;
+
+layout(push_constant, std430) uniform Push {
+    uint64_t out_;
+} pc;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) writeonly buffer Out { float v[]; };
+
+shared float16_t eye[256];
+shared float result[128];
+shared float pattern[128];
+
+void main() {
+    const uint lane = gl_LocalInvocationID.x;
+    for (uint i = lane; i < 256; i += 32) {
+        eye[i] = (i / 16 == i % 16) ? 1.0hf : 0.0hf;
+    }
+    for (uint i = lane; i < 128; i += 32) {
+        pattern[i] = float(i + 1);
+    }
+    barrier();
+    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> a;
+    coopMatLoad(a, eye, 0, 16, gl_CooperativeMatrixLayoutRowMajor);
+    coopmat<float16_t, gl_ScopeSubgroup, 16, 8, gl_MatrixUseB> b;
+    [[unroll]] for (uint e = 0; e < 4; e++) {
+        b[e] = float16_t(lane * 4 + e + 1);
+    }
+    coopmat<float, gl_ScopeSubgroup, 16, 8, gl_MatrixUseAccumulator> c =
+        coopmat<float, gl_ScopeSubgroup, 16, 8, gl_MatrixUseAccumulator>(0.0);
+    c = coopMatMulAdd(a, b, c);
+    coopMatStore(c, result, 0, 8, gl_CooperativeMatrixLayoutRowMajor);
+    coopmat<float, gl_ScopeSubgroup, 16, 8, gl_MatrixUseAccumulator> p;
+    coopMatLoad(p, pattern, 0, 8, gl_CooperativeMatrixLayoutRowMajor);
+    barrier();
+    for (uint i = lane; i < 128; i += 32) {
+        Out(pc.out_).v[i] = result[i];
+    }
+    [[unroll]] for (uint e = 0; e < 4; e++) {
+        Out(pc.out_).v[128 + lane * 4 + e] = p[e];
+    }
+}

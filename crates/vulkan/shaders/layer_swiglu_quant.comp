@@ -1,0 +1,25 @@
+#version 450
+#include "layer_common.glsl"
+
+// SwiGLU with the quantization of its result for the down projection:
+// y = silu(gate) * up over n_values (a multiple of 32), quantized into `q` in the layout
+// of quantize_act.comp with the f32 values behind (layer_common.glsl). One invocation per
+// 4 values. Grid: ceil(n_values / 1024) workgroups.
+layout(local_size_x = 256) in;
+
+layout(push_constant, std430) uniform Push {
+    uint64_t gate;
+    uint64_t up;
+    uint64_t q;
+    uint n_values;
+} pc;
+
+void main() {
+    const uint64_t chunk = ares_group() * 256 + gl_LocalInvocationID.x;
+    const bool live = chunk < uint64_t(pc.n_values >> 2);
+    vec4 y = vec4(0.0);
+    if (live) {
+        y = l_silu(ldv4(pc.gate + 16 * chunk)) * ldv4(pc.up + 16 * chunk);
+    }
+    quant_chunk(y, live, chunk, pc.q, uint64_t(pc.n_values));
+}
