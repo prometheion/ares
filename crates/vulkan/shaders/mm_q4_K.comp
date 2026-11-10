@@ -1,0 +1,199 @@
+#version 450
+#include "mmvq_common.glsl"
+#include "mmvq_q4_K.glsl"
+
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+
+// Prefill for Q4_K: a quantized matrix times many rows of activations on the tensor cores
+// (VK_KHR_cooperative_matrix), with the arithmetic of the decode kernel (mmvq_q4_K.glsl)
+// and of CUDA's int8 prefill path: integer products of the weights' codes with the
+// activations quantized to int8 (quantize_act.comp's format), scaled per sub-block of 32
+// values in f32:
+//   y[b][r] = sum over sub-blocks j of  d sc_j dx_j isum_j  -  dmin m_j s_j
+// where isum_j is the int32 dot product of the 32 codes with the 32 activation codes.
+//
+// A workgroup (4 subgroups) computes a tile of 64 weight rows by 64 activation rows, each
+// subgroup 32 x 32 of it as 2 x 2 matrices of 16 x 16. Per block of 256 values of K the
+// workgroup decodes its 64 weight blocks to int8 codes in shared memory (codes 0..15, the
+// scales and offsets as floats beside them), copies the 64 activation slices, and each
+// subgroup multiplies, per sub-block, 16 x 32 by 32 x 16 into a fresh int32 matrix.
+// Cooperative matrices do not say which element is which, so each int32 matrix goes
+// through shared memory (one of 1 KiB per subgroup) and the lanes that read it back know
+// where they are and scale and accumulate it into their f32 registers.
+//
+//   w   n_out rows of n_in / 256 Q4_K blocks, 16-byte aligned
+//   aq  n_rows quantized rows of n_in (quantize_activation_rows), 16-byte aligned
+//   y   n_rows rows of n_out f32 values
+// Grid: ceil(n_out / 64) * ceil(n_rows / 64) workgroups, the weight tiles varying fastest,
+// so the workgroups that run together read the same activations.
+
+layout(local_size_x = 128) in;
+
+layout(push_constant, std430) uniform Push {
+    uint64_t w;
+    uint64_t aq;
+    uint64_t y;
+    uint n_in;
+    uint n_out;
+    uint n_rows;
+} pc;
+
+const uint MT = 64;  // weight rows per workgroup
+const uint NT = 64;  // activation rows per workgroup
+// Rows of codes in shared memory are 272 bytes, 16 more than 256, so that the loads of
+// the matrices (16 rows at a time) do not all hit the same banks. In 16-byte units: 17.
+const uint ROW16 = 17;
+
+shared uvec4 wq[MT * ROW16];   // codes of the weight tile, row r at wq[r * 17]
+shared uvec4 aqs[NT * ROW16];  // activation codes, row n at aqs[n * 17]
+shared float wdsc[8 * MT];     // d * sc of sub-block j of row r at [j * 64 + r]
+shared float wdm[8 * MT];      // dmin * m
+shared float adx[8 * NT];      // dx of sub-block j of activation row n at [j * 64 + n]
+shared float asum[8 * NT];     // s
+shared int stage[4 * 256];     // one int32 matrix per subgroup
+
+void main() {
+    const uint tiles_w = (pc.n_out + MT - 1) / MT;
+    const uint group = uint(ares_group());
+    const uint wt = group % tiles_w;
+    const uint bt = group / tiles_w;
+    if (bt * NT >= pc.n_rows) {
+        return;
+    }
+    const uint tid = gl_LocalInvocationID.x;
+    const uint sg = tid >> 5;
+    const uint lane = tid & 31u;
+    const uint blocks_per_row = pc.n_in >> 8;
+    const uint64_t row_bytes = uint64_t(blocks_per_row) * 144;
+    const uint groups_per_row = pc.n_in >> 5;
+    const uint64_t ad = pc.aq + act_ds_offset(uint64_t(pc.n_rows) * pc.n_in);
+
+    // This subgroup's 32 x 32 corner of the tile.
+    const uint m_base = (sg >> 1) * 32;
+    const uint n_base = (sg & 1u) * 32;
+
+    float acc[2][2][8];
+    [[unroll]] for (uint a = 0; a < 2; a++) {
+        [[unroll]] for (uint b = 0; b < 2; b++) {
+            [[unroll]] for (uint i = 0; i < 8; i++) {
+                acc[a][b][i] = 0.0;
+            }
+        }
+    }
+
+    // The thread's weight row and half of its block for the decode below.
+    const uint wr = tid >> 1;
+    const uint wh = tid & 1u;
+    const uint64_t w_row = pc.w + uint64_t(min(wt * MT + wr, pc.n_out - 1)) * row_bytes;
+
+    for (uint kb = 0; kb < blocks_per_row; kb++) {
+        barrier();
+        // --- the weight tile: one row and half a block per thread ---------------------
+        {
+            const uint64_t blk = w_row + uint64_t(kb) * 144;
+            // 64 bytes of qs: two groups of 32 bytes, each giving two sub-blocks (low and
+            // high nibbles) of 32 codes.
+            [[unroll]] for (uint g = 0; g < 2; g++) {
+                const uint64_t q = blk + 16 + 64 * wh + 32 * g;
+                const uvec4 q0 = ld16(q);
+                const uvec4 q1 = ld16(q + 16);
+                const uint sb = 2 * (2 * wh + g);  // the low-nibble sub-block
+                wq[wr * ROW16 + 2 * sb] = q0 & 0x0F0F0F0Fu;
+                wq[wr * ROW16 + 2 * sb + 1] = q1 & 0x0F0F0F0Fu;
+                wq[wr * ROW16 + 2 * (sb + 1)] = (q0 >> 4) & 0x0F0F0F0Fu;
+                wq[wr * ROW16 + 2 * (sb + 1) + 1] = (q1 >> 4) & 0x0F0F0F0Fu;
+            }
+            if (wh == 0u) {
+                const uvec4 hdr = ld16(blk);
+                const vec2 dd = unpackHalf2x16(hdr.x);
+                [[unroll]] for (uint j = 0; j < 4; j++) {
+                    uint sc, mn;
+                    scales_k(j, hdr.yzw, sc, mn);
+                    wdsc[(2 * j) * 64 + wr] = dd.x * float(sc & 0xFFu);
+                    wdsc[(2 * j + 1) * 64 + wr] = dd.x * float(sc >> 8);
+                    wdm[(2 * j) * 64 + wr] = dd.y * float(mn & 0xFFu);
+                    wdm[(2 * j + 1) * 64 + wr] = dd.y * float(mn >> 8);
+                }
+            }
+        }
+        // --- the activation tile: 64 rows of 256 codes and 8 (d, s) pairs ----------------
+        [[unroll]] for (uint i = 0; i < 8; i++) {
+            const uint idx = tid + 128 * i;  // 0..1023: row idx / 16, 16-byte piece idx % 16
+            const uint n = idx >> 4;
+            const uint piece = idx & 15u;
+            const uint row = min(bt * NT + n, pc.n_rows - 1);
+            aqs[n * ROW16 + piece] = ld16(pc.aq + uint64_t(row) * pc.n_in + uint64_t(kb) * 256 + 16 * piece);
+        }
+        [[unroll]] for (uint i = 0; i < 4; i++) {
+            const uint idx = tid + 128 * i;  // 0..511: row idx / 8, group idx % 8
+            const uint n = idx >> 3;
+            const uint j = idx & 7u;
+            const uint row = min(bt * NT + n, pc.n_rows - 1);
+            const vec2 pair = ldf2(ad + 8 * (uint64_t(row) * groups_per_row + uint64_t(kb) * 8 + j));
+            adx[j * 64 + n] = pair.x;
+            asum[j * 64 + n] = pair.y;
+        }
+        barrier();
+
+        // --- the products ------------------------------------------------------------
+        [[unroll]] for (uint j = 0; j < 8; j++) {
+            coopmat<int8_t, gl_ScopeSubgroup, 16, 32, gl_MatrixUseA> ma[2];
+            coopmat<int8_t, gl_ScopeSubgroup, 32, 16, gl_MatrixUseB> mb[2];
+            [[unroll]] for (uint a = 0; a < 2; a++) {
+                coopMatLoad(ma[a], wq, (m_base + 16 * a) * ROW16 + 2 * j, ROW16,
+                            gl_CooperativeMatrixLayoutRowMajor);
+                coopMatLoad(mb[a], aqs, (n_base + 16 * a) * ROW16 + 2 * j, ROW16,
+                            gl_CooperativeMatrixLayoutColumnMajor);
+            }
+            [[unroll]] for (uint a = 0; a < 2; a++) {
+                [[unroll]] for (uint b = 0; b < 2; b++) {
+                    coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> mc =
+                        coopmat<int32_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0);
+                    mc = coopMatMulAdd(ma[a], mb[b], mc);
+                    coopMatStore(mc, stage, sg * 256, 16, gl_CooperativeMatrixLayoutRowMajor);
+                    subgroupMemoryBarrierShared();
+                    subgroupBarrier();
+                    // This lane's 8 elements: columns 4 (lane % 4) .. +3 of rows lane / 4 and
+                    // lane / 4 + 8. Reading the matrix as two 128-bit pieces per lane covers it
+                    // in 512 contiguous bytes with no bank conflict.
+                    const uint cl = (lane & 3u) * 4;
+                    const uint n = n_base + 16 * b + cl;
+                    const vec4 dxv = vec4(adx[j * 64 + n], adx[j * 64 + n + 1], adx[j * 64 + n + 2], adx[j * 64 + n + 3]);
+                    const vec4 sv = vec4(asum[j * 64 + n], asum[j * 64 + n + 1], asum[j * 64 + n + 2], asum[j * 64 + n + 3]);
+                    [[unroll]] for (uint h = 0; h < 2; h++) {
+                        const uint r = (lane >> 2) + 8 * h;
+                        const uint m = m_base + 16 * a + r;
+                        const float dsc = wdsc[j * 64 + m];
+                        const float dm = wdm[j * 64 + m];
+                        const ivec4 v = ivec4(stage[sg * 256 + r * 16 + cl], stage[sg * 256 + r * 16 + cl + 1],
+                                              stage[sg * 256 + r * 16 + cl + 2], stage[sg * 256 + r * 16 + cl + 3]);
+                        [[unroll]] for (uint i = 0; i < 4; i++) {
+                            acc[a][b][4 * h + i] = fma(float(v[i]), dsc * dxv[i], acc[a][b][4 * h + i]);
+                            acc[a][b][4 * h + i] = fma(-dm, sv[i], acc[a][b][4 * h + i]);
+                        }
+                    }
+                    subgroupBarrier();
+                }
+            }
+        }
+    }
+
+    // --- the result ---------------------------------------------------------------
+    [[unroll]] for (uint a = 0; a < 2; a++) {
+        [[unroll]] for (uint b = 0; b < 2; b++) {
+            [[unroll]] for (uint h = 0; h < 2; h++) {
+                const uint m = wt * MT + m_base + 16 * a + (lane >> 2) + 8 * h;
+                if (m < pc.n_out) {
+                    [[unroll]] for (uint i = 0; i < 4; i++) {
+                        const uint n = bt * NT + n_base + 16 * b + (lane & 3u) * 4 + i;
+                        if (n < pc.n_rows) {
+                            FloatRef(pc.y + 4 * (uint64_t(n) * pc.n_out + m)).v[0] = acc[a][b][4 * h + i];
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

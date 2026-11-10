@@ -19,6 +19,7 @@ use crate::error::{Error, Result};
 use crate::memory::DevicePtr;
 use crate::module::{Args, Function, Module};
 use crate::stream::Stream;
+use crate::weights::{self, Quantized};
 
 static ADD_F32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/add_f32.spv"));
 static RMS_NORM_F32: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rms_norm_f32.spv"));
@@ -49,6 +50,8 @@ struct Set {
     sum32_f32: Function,
     /// Index `i` has workgroups of `32 * (i + 1)` invocations.
     matvec_q4_k: Vec<Function>,
+    /// The quantized weight kernels, on a device that can run them.
+    quantized: Option<Quantized>,
 }
 
 /// The kernels of the engine on one device.
@@ -88,12 +91,18 @@ impl Kernels {
         let matvec_q4_k = (1..=MATVEC_SIZES as u32)
             .map(|i| matvec.function_with("main", &[(0, 32 * i)]))
             .collect::<Result<Vec<_>>>()?;
+        let quantized = if device.physical().quantized_unsupported.is_none() {
+            Some(Quantized::load(device)?)
+        } else {
+            None
+        };
         Ok(Self(Arc::new(Set {
             device: device.clone(),
             add_f32: main(ADD_F32)?,
             rms_norm_f32: main(RMS_NORM_F32)?,
             sum32_f32: main(SUM32_F32)?,
             matvec_q4_k,
+            quantized,
         })))
     }
 
@@ -103,6 +112,167 @@ impl Kernels {
 
     fn grid(&self, groups: u32) -> [u32; 3] {
         grid_1d(groups, self.0.device.physical().max_work_group_count[0])
+    }
+
+    fn quantized(&self) -> Result<&Quantized> {
+        self.0.quantized.as_ref().ok_or_else(|| Error::Unsupported {
+            device: self.0.device.info().name.clone(),
+            reason: self
+                .0
+                .device
+                .physical()
+                .quantized_unsupported
+                .clone()
+                .unwrap_or_else(|| "the quantized weight kernels are not loaded".into()),
+        })
+    }
+
+    /// Whether this device runs the quantized weight kernels
+    /// ([`Kernels::quantize_activations`], [`Kernels::matvec`]): they need integer
+    /// dot products, 8- and 16-bit buffer access and 32-wide clustered subgroup
+    /// operations, which every current desktop GPU has.
+    pub fn has_quantized_kernels(&self) -> bool {
+        self.0.quantized.is_some()
+    }
+
+    /// The bytes that [`Kernels::quantize_activations`] writes for `n_batch` rows
+    /// of `n_in` activations: the int8 values, then (from the next multiple of 16
+    /// bytes) one `(scale, sum)` pair of f32 per group of 32 values. The format is
+    /// the CUDA layer's (`kernels/quantize_act.cuh`), byte for byte.
+    pub fn quantized_activation_bytes(n_in: u32, n_batch: u32) -> u64 {
+        weights::quantized_activation_bytes(n_in, n_batch)
+    }
+
+    /// Whether [`Kernels::matvec`] has a kernel for weights of type `ty`: every type a
+    /// GGUF file can carry as a weight (F32, F16, BF16 and the 25 quantized ones).
+    pub fn has_fast_matvec(ty: GgmlType) -> bool {
+        weights::has_fast_matvec(ty)
+    }
+
+    /// Whether the kernel of `ty` reads activations quantized by
+    /// [`Kernels::quantize_activations`] (every type but F32, F16 and BF16, whose
+    /// kernels read the f32 activations as they are).
+    pub fn needs_quantized_activations(ty: GgmlType) -> bool {
+        weights::needs_quantized_activations(ty)
+    }
+
+    /// Quantizes `n_batch` rows of `n_in` f32 activations to the int8 format the
+    /// fast weight kernels read ([`Kernels::matvec`]). One quantization serves every
+    /// matrix that multiplies the same activations, whatever their types. The codes
+    /// and scales are exactly those the CUDA kernel produces.
+    ///
+    /// `n_in` must be a multiple of 32. `q` receives
+    /// [`Kernels::quantized_activation_bytes`] bytes.
+    ///
+    /// # Safety
+    ///
+    /// On the stream's device and alive until the launch has run: `x` must address
+    /// `n_batch * n_in` f32 values and `q` the bytes above, 16-byte aligned, not
+    /// overlapping `x`.
+    pub unsafe fn quantize_activations(
+        &self,
+        stream: &Stream,
+        x: DevicePtr,
+        q: DevicePtr,
+        n_in: u32,
+        n_batch: u32,
+    ) -> Result<()> {
+        let limit = self.0.device.physical().max_work_group_count[0];
+        // SAFETY: the caller's guarantee is the one of the function it forwards to.
+        unsafe { self.quantized()?.quantize_activations(stream, x, q, n_in, n_batch, limit) }
+    }
+
+    /// Quantizes `n_rows` (any number, at least 1) rows of `n_in` f32 activations to the
+    /// format of [`Kernels::quantize_activations`], which the tensor-core kernels
+    /// ([`Kernels::matmul`]) read too: one quantization serves both kernel families.
+    ///
+    /// # Safety
+    ///
+    /// As [`Kernels::quantize_activations`], for `n_rows` rows.
+    pub unsafe fn quantize_activation_rows(
+        &self,
+        stream: &Stream,
+        x: DevicePtr,
+        q: DevicePtr,
+        n_in: u32,
+        n_rows: u32,
+    ) -> Result<()> {
+        let limit = self.0.device.physical().max_work_group_count[0];
+        // SAFETY: the caller's guarantee is the one of the function it forwards to.
+        unsafe { self.quantized()?.quantize_rows(stream, x, q, n_in, n_rows, limit) }
+    }
+
+    /// Whether [`Kernels::matmul`] has a tensor-core kernel for weights of type `ty` on
+    /// this device: it needs `VK_KHR_cooperative_matrix` with int8 products of 16 x 32 by
+    /// 32 x 16 into int32.
+    pub fn has_matmul(&self, ty: GgmlType) -> bool {
+        self.0.quantized.as_ref().is_some_and(|q| q.has_matmul(ty))
+    }
+
+    /// `y[b] = W x[b]` for a matrix `w` of type `ty` with `n_out` rows and `n_in` columns
+    /// and `n_rows` (1 or more) rows of activations that
+    /// [`Kernels::quantize_activation_rows`] has quantized into `q`: the prefill
+    /// kernel, on the tensor cores. It computes with the same arithmetic as
+    /// [`Kernels::matvec`] (integer products of the weight codes with int8 activations,
+    /// scaled per sub-block in f32), so a row gives the same result in either; it
+    /// reads the weights once per 64 rows. Q4_K only so far; check
+    /// [`Kernels::has_matmul`].
+    ///
+    /// # Safety
+    ///
+    /// As [`Kernels::matvec`], for `n_rows` rows of activations and `y` of `n_rows * n_out`
+    /// f32 values; the weights are aligned to 16 bytes.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn matmul(
+        &self,
+        stream: &Stream,
+        ty: GgmlType,
+        w: DevicePtr,
+        q: DevicePtr,
+        y: DevicePtr,
+        n_in: u32,
+        n_out: u32,
+        n_rows: u32,
+    ) -> Result<()> {
+        let limit = self.0.device.physical().max_work_group_count[0];
+        // SAFETY: the caller's guarantee is the one of the function it forwards to.
+        unsafe { self.quantized()?.matmul(stream, ty, w, q, y, n_in, n_out, n_rows, limit) }
+    }
+
+    /// `y[b] = W x[b]` for a matrix `w` of type `ty` with `n_out` rows and `n_in`
+    /// columns and `n_batch` (1 to [`MAX_BATCH`]) rows of activations that
+    /// [`Kernels::quantize_activations`] has quantized into `q`. The weights are
+    /// read once however many rows there are.
+    ///
+    /// This is the decode kernel: integer dot products over the quantized
+    /// activations, on the weight codes, with the arithmetic of the CUDA layer's
+    /// `matvec`: the same activations give the same results up to f32 rounding of
+    /// the sums. A type without a fast kernel (see [`Kernels::has_fast_matvec`]) is
+    /// refused with an error.
+    ///
+    /// # Safety
+    ///
+    /// On the stream's device and alive until the launch has run: `w` must address
+    /// the matrix as GGUF stores it (`n_out` rows of `n_in` values in whole blocks
+    /// of `ty`), aligned to 16 bytes for Q4_K and Q5_K, to 8 for IQ4_XS and to 2
+    /// for the other types (checked); `q` the quantized activations of this `n_in`
+    /// and `n_batch`, 16-byte aligned (checked); `y` `n_batch * n_out` f32 values.
+    /// `y` must not overlap the inputs.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn matvec(
+        &self,
+        stream: &Stream,
+        ty: GgmlType,
+        w: DevicePtr,
+        q: DevicePtr,
+        y: DevicePtr,
+        n_in: u32,
+        n_out: u32,
+        n_batch: u32,
+    ) -> Result<()> {
+        let limit = self.0.device.physical().max_work_group_count[0];
+        // SAFETY: the caller's guarantee is the one of the function it forwards to.
+        unsafe { self.quantized()?.matvec(stream, ty, w, q, y, n_in, n_out, n_batch, limit) }
     }
 
     /// `y[i] += x[i]` for `n` f32 values.

@@ -1,0 +1,15 @@
+#version 450
+#include "mmvq_common.glsl"
+
+const uint BYTES_PER_VALUE = 2;
+
+void load8(uint64_t address, out float v[8]) {
+    const uvec4 a = ldw16(address);
+    [[unroll]] for (uint i = 0; i < 4; i++) {
+        const vec2 pair = unpackHalf2x16(a[i]);
+        v[2 * i] = pair.x;
+        v[2 * i + 1] = pair.y;
+    }
+}
+
+#include "mmvf.glsl"

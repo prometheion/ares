@@ -58,9 +58,11 @@ mod memory;
 mod module;
 mod stream;
 mod transfer;
+mod weights;
 
 pub use device::{
-    Device, DeviceInfo, DeviceType, MemInfo, PciAddress, Wait, device_count, devices,
+    ComponentType, CooperativeMatrix, Device, DeviceInfo, DeviceType, MemInfo, PciAddress, Wait,
+    device_count, devices,
 };
 pub use error::{Error, Result};
 pub use kernels::{Kernels, MAX_BATCH};

@@ -1,0 +1,83 @@
+#version 450
+#include "mmvq_common.glsl"
+
+// Quantization of activations for the integer weight kernels (mmvq_*.comp), the
+// same as `quantize_act.cuh` and with the same layout, bit for bit.
+//
+// Per activation row of n_in values (n_in a multiple of 32):
+//   q   n_in int8 values
+//   ds  n_in / 32 pairs of f32: ds[g] = (d, s) for the group g of 32 values,
+//       d = max|x| / 127, q = round-half-away-from-zero(x / d), s = d * sum(q)
+// The rows of a batch follow each other in both arrays, and the pairs start at the
+// next multiple of 16 bytes after the values. See quantize_act.cuh for why s is the
+// sum of the codes and not of the values.
+//
+// CUDA gives each value a thread and a group a warp. Here an invocation takes 4
+// consecutive values and a group is 8 invocations, a cluster of the subgroup: the
+// maximum and the sum are clustered reductions, the codes are written as words.
+
+layout(local_size_x = 256) in;
+
+layout(push_constant, std430) uniform Push {
+    uint64_t x;
+    uint64_t q;
+    uint n_values;
+} pc;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) writeonly buffer WordOut { uint v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 8) writeonly buffer PairOut { vec2 v[]; };
+
+// round-half-away-from-zero, as roundf: x - trunc(x) is exact, so a half is seen
+// as one (adding 0.5 and flooring would round 0.49999997 up).
+float round_away(float x) {
+    const float t = trunc(x);
+    return abs(x - t) >= 0.5 ? t + sign(x) : t;
+}
+
+// a / b correctly rounded, as CUDA's and the CPU's division are. GLSL only promises
+// 2.5 ulp for `/`, and the driver here is off by one ulp for some operands, which
+// would change `d` and, now and then, a code. This is the usual sequence: a reciprocal
+// improved by one Newton step, the quotient from it, and the quotient corrected
+// by its own remainder (computed exactly by fma).
+float div_rn(float a, float b) {
+    precise float r = 1.0 / b;
+    precise float e = fma(-b, r, 1.0);
+    r = fma(e, r, r);
+    precise float q = a * r;
+    precise float rem = fma(-q, b, a);
+    return fma(rem, r, q);
+}
+
+void main() {
+    const uint64_t index = ares_group() * 256 + gl_LocalInvocationID.x;
+    const bool live = index * 4 < pc.n_values;
+    vec4 v = vec4(0.0);
+    if (live) {
+        const uint64_t at = pc.x + index * 16;
+        v = vec4(ldf1(at), ldf1(at + 4), ldf1(at + 8), ldf1(at + 12));
+    }
+
+    float amax = max(max(abs(v.x), abs(v.y)), max(abs(v.z), abs(v.w)));
+    amax = subgroupClusteredMax(amax, 8);
+
+    const float d = div_rn(amax, 127.0);
+    vec4 code = vec4(0.0);
+    if (amax != 0.0) {
+        code = vec4(
+            round_away(div_rn(v.x, d)), round_away(div_rn(v.y, d)), round_away(div_rn(v.z, d)),
+            round_away(div_rn(v.w, d)));
+    }
+    // The codes are integers of at most 127 in magnitude, so this f32 sum is exact in
+    // any order.
+    const float sum_codes = subgroupClusteredAdd(code.x + code.y + code.z + code.w, 8);
+
+    if (live) {
+        const ivec4 c = ivec4(code);
+        WordOut(pc.q).v[uint(index)] =
+            (uint(c.x) & 0xFFu) | ((uint(c.y) & 0xFFu) << 8) | ((uint(c.z) & 0xFFu) << 16) | (uint(c.w) << 24);
+        if ((gl_SubgroupInvocationID & 7u) == 0u) {
+            const uint64_t ds = pc.q + act_ds_offset(pc.n_values);
+            PairOut(ds).v[uint(index >> 3)] = vec2(d, d * sum_codes);
+        }
+    }
+}

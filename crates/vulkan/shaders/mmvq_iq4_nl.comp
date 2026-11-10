@@ -1,0 +1,4 @@
+#version 450
+#include "mmvq_common.glsl"
+#include "mmvq_iq4_nl.glsl"
+#include "mmvq.glsl"

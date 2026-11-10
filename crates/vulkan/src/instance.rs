@@ -9,7 +9,7 @@ use std::sync::OnceLock;
 
 use ash::{Entry, vk};
 
-use crate::device::{DeviceInfo, DeviceType, PciAddress};
+use crate::device::{ComponentType, CooperativeMatrix, DeviceInfo, DeviceType, PciAddress};
 use crate::error::{Check, Error, Result};
 
 /// The Vulkan version this crate is written against. Buffer device addresses,
@@ -52,6 +52,13 @@ pub(crate) struct Physical {
     pub(crate) memory_budget: bool,
     /// Why the engine cannot use this device, if it cannot.
     pub(crate) unusable: Option<String>,
+    /// Why the quantized weight kernels (`mmvq_*`, `quantize_act`) cannot run
+    /// here, if they cannot. They need integer dot products, 8- and 16-bit
+    /// buffer access and clustered subgroup operations; every desktop GPU of the
+    /// last few years has them, so this is `None` there.
+    pub(crate) quantized_unsupported: Option<String>,
+    /// Every device extension the driver lists.
+    pub(crate) extensions: Vec<String>,
 }
 
 static INSTANCE: OnceLock<std::result::Result<Instance, Error>> = OnceLock::new();
@@ -89,7 +96,7 @@ impl Instance {
         let handles =
             unsafe { raw.enumerate_physical_devices() }.check("vkEnumeratePhysicalDevices")?;
         let mut physical: Vec<Physical> =
-            handles.into_iter().filter_map(|handle| describe(&raw, handle)).collect();
+            handles.into_iter().filter_map(|handle| describe(&entry, &raw, handle)).collect();
         for (ordinal, device) in physical.iter_mut().enumerate() {
             device.info.ordinal = ordinal as u32;
         }
@@ -110,7 +117,7 @@ fn version_string(version: u32) -> String {
 /// Reads everything about a physical device that does not need a logical one.
 /// Returns `None` for processor-based implementations (llvmpipe and the like),
 /// which the engine never uses.
-fn describe(instance: &ash::Instance, raw: vk::PhysicalDevice) -> Option<Physical> {
+fn describe(entry: &Entry, instance: &ash::Instance, raw: vk::PhysicalDevice) -> Option<Physical> {
     // SAFETY: `raw` was enumerated from this live instance; the queries only
     // write the structures passed to them.
     let props = unsafe { instance.get_physical_device_properties(raw) };
@@ -135,14 +142,20 @@ fn describe(instance: &ash::Instance, raw: vk::PhysicalDevice) -> Option<Physica
     let has_pci = has_extension(ash::ext::pci_bus_info::NAME);
     let memory_budget = has_extension(ash::ext::memory_budget::NAME);
 
+    let has_dot_product = has_extension(ash::khr::shader_integer_dot_product::NAME);
+    let has_coop = has_extension(ash::khr::cooperative_matrix::NAME);
     let mut id = vk::PhysicalDeviceIDProperties::default();
     let mut subgroup = vk::PhysicalDeviceSubgroupProperties::default();
     let mut pci = vk::PhysicalDevicePCIBusInfoPropertiesEXT::default();
+    let mut dot = vk::PhysicalDeviceShaderIntegerDotProductProperties::default();
     {
         let mut props2 =
             vk::PhysicalDeviceProperties2::default().push_next(&mut id).push_next(&mut subgroup);
         if has_pci {
             props2 = props2.push_next(&mut pci);
+        }
+        if has_dot_product {
+            props2 = props2.push_next(&mut dot);
         }
         // SAFETY: the chain holds only structures of properties this device
         // reports (the PCI one only when its extension is listed).
@@ -175,14 +188,57 @@ fn describe(instance: &ash::Instance, raw: vk::PhysicalDevice) -> Option<Physica
     let mut fail = |reason: String| {
         unusable.get_or_insert(reason);
     };
+    let mut coop_supported = false;
+    let mut quantized_unsupported = None;
+    let mut no_quantized = |reason: String| {
+        quantized_unsupported.get_or_insert(reason);
+    };
     if props.api_version < REQUIRED_API {
         fail(format!("it implements Vulkan {}, 1.2 is needed", version_string(props.api_version)));
+        no_quantized("the device is not usable at all".into());
     } else {
+        let mut v11 = vk::PhysicalDeviceVulkan11Features::default();
         let mut v12 = vk::PhysicalDeviceVulkan12Features::default();
-        let mut features = vk::PhysicalDeviceFeatures2::default().push_next(&mut v12);
-        // SAFETY: the device reports Vulkan 1.2, which defines the structure.
+        let mut dot_features = vk::PhysicalDeviceShaderIntegerDotProductFeatures::default();
+        let mut coop_features = vk::PhysicalDeviceCooperativeMatrixFeaturesKHR::default();
+        let mut features =
+            vk::PhysicalDeviceFeatures2::default().push_next(&mut v11).push_next(&mut v12);
+        if has_dot_product {
+            features = features.push_next(&mut dot_features);
+        }
+        if has_coop {
+            features = features.push_next(&mut coop_features);
+        }
+        // SAFETY: the device reports Vulkan 1.2, which defines the structures
+        // (the dot product one only when its extension is listed).
         unsafe { instance.get_physical_device_features2(raw, &mut features) };
         let int64 = features.features.shader_int64 == vk::TRUE;
+        let int16 = features.features.shader_int16 == vk::TRUE;
+        coop_supported = has_coop && coop_features.cooperative_matrix == vk::TRUE;
+        if !has_dot_product || dot_features.shader_integer_dot_product != vk::TRUE {
+            no_quantized(
+                "it lacks shaderIntegerDotProduct (VK_KHR_shader_integer_dot_product)".into(),
+            );
+        }
+        if v12.vulkan_memory_model != vk::TRUE {
+            no_quantized("it lacks vulkanMemoryModel".into());
+        }
+        if v12.shader_int8 != vk::TRUE || v12.storage_buffer8_bit_access != vk::TRUE {
+            no_quantized("it lacks shaderInt8 or storageBuffer8BitAccess".into());
+        }
+        if !int16 || v11.storage_buffer16_bit_access != vk::TRUE {
+            no_quantized("it lacks shaderInt16 or storageBuffer16BitAccess".into());
+        }
+        if !subgroup.supported_operations.contains(vk::SubgroupFeatureFlags::CLUSTERED)
+            || subgroup.subgroup_size < 32
+            || subgroup.subgroup_size % 32 != 0
+        {
+            no_quantized(format!(
+                "the weight kernels need clustered subgroup operations and subgroups of 32 or 64 \
+                 invocations (this device: {})",
+                subgroup.subgroup_size
+            ));
+        }
         if v12.buffer_device_address != vk::TRUE {
             fail("it lacks bufferDeviceAddress".into());
         }
@@ -217,6 +273,29 @@ fn describe(instance: &ash::Instance, raw: vk::PhysicalDevice) -> Option<Physica
         ));
     }
 
+    // The shapes of matrix the tensor cores multiply for a whole subgroup, if the device
+    // exposes them through VK_KHR_cooperative_matrix.
+    let cooperative_matrix = if coop_supported {
+        let loader = ash::khr::cooperative_matrix::Instance::new(entry, instance);
+        // SAFETY: the extension is supported and `raw` belongs to the instance.
+        unsafe { loader.get_physical_device_cooperative_matrix_properties(raw) }
+            .unwrap_or_default()
+            .iter()
+            .filter(|p| p.scope == vk::ScopeKHR::SUBGROUP)
+            .map(|p| CooperativeMatrix {
+                m: p.m_size,
+                n: p.n_size,
+                k: p.k_size,
+                a: ComponentType::from_raw(p.a_type),
+                b: ComponentType::from_raw(p.b_type),
+                c: ComponentType::from_raw(p.c_type),
+                result: ComponentType::from_raw(p.result_type),
+                saturating: p.saturating_accumulation == vk::TRUE,
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
     let device_heap = device_heap.unwrap_or(0);
     let family_index = family.unwrap_or(0);
     let info = DeviceInfo {
@@ -236,6 +315,10 @@ fn describe(instance: &ash::Instance, raw: vk::PhysicalDevice) -> Option<Physica
         }),
         uuid: id.device_uuid,
         subgroup_size: subgroup.subgroup_size,
+        cooperative_matrix,
+        integer_dot_product: has_dot_product
+            && dot.integer_dot_product4x8_bit_packed_mixed_signedness_accelerated == vk::TRUE
+            && dot.integer_dot_product4x8_bit_packed_signed_accelerated == vk::TRUE,
     };
     Some(Physical {
         raw,
@@ -248,5 +331,11 @@ fn describe(instance: &ash::Instance, raw: vk::PhysicalDevice) -> Option<Physica
         max_work_group_count: props.limits.max_compute_work_group_count,
         memory_budget,
         unusable,
+        quantized_unsupported,
+        extensions: extensions
+            .iter()
+            .filter_map(|e| e.extension_name_as_c_str().ok())
+            .map(|name| name.to_string_lossy().into_owned())
+            .collect(),
     })
 }

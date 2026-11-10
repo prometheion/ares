@@ -1,0 +1,7 @@
+#version 450
+#define CM_M 16
+#define CM_N 16
+#define CM_K 16
+#define TA float16_t
+#define TC float
+#include "coop_rate.glsl"

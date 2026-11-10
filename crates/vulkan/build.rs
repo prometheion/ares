@@ -20,6 +20,14 @@ use std::process::Command;
 /// here so that the two cannot disagree.
 const MATVEC_ROWS: u32 = 4;
 
+/// The launch shape of the quantized weight kernels (`ARES_MMVQ_WARPS` and
+/// `ARES_MMVQ_ROWS` in `shaders/mmvq.glsl`): a workgroup of this many warps of 32
+/// lanes, each warp computing this many output rows. The same two numbers as the
+/// CUDA kernels' `ARES_MMVQ_WARPS` / `ARES_MMVQ_ROWS`; defined here so that the
+/// shaders and the launch cannot disagree.
+const MMVQ_WARPS: u32 = 4;
+const MMVQ_ROWS: u32 = 2;
+
 fn main() {
     println!("cargo:rerun-if-changed=shaders");
     println!("cargo:rerun-if-env-changed=GLSLC");
@@ -35,7 +43,18 @@ fn main() {
 
     fs::write(
         out.join("shader_constants.rs"),
-        format!("/// Output rows per workgroup of `matvec_q4_K`.\npub(crate) const MATVEC_ROWS: u32 = {MATVEC_ROWS};\n"),
+        format!(
+            "/// Output rows per workgroup of `matvec_q4_K`.\n\
+             #[allow(dead_code)]\n\
+             pub(crate) const MATVEC_ROWS: u32 = {MATVEC_ROWS};\n\
+             /// Threads and output rows per workgroup of the quantized weight kernels.\n\
+             #[allow(dead_code)]\n\
+             pub(crate) const MMVQ_THREADS: u32 = {};\n\
+             #[allow(dead_code)]\n\
+             pub(crate) const MMVQ_ROWS_PER_BLOCK: u32 = {};\n",
+            MMVQ_WARPS * 32,
+            MMVQ_WARPS * MMVQ_ROWS
+        ),
     )
     .expect("write shader_constants.rs");
 
@@ -57,6 +76,8 @@ fn main() {
         cmd.args(["--target-env=vulkan1.2", "-fshader-stage=compute", "-O", "-Werror"]);
         cmd.arg("-I").arg("shaders");
         cmd.arg(format!("-DARES_MATVEC_ROWS={MATVEC_ROWS}"));
+        cmd.arg(format!("-DARES_MMVQ_WARPS={MMVQ_WARPS}"));
+        cmd.arg(format!("-DARES_MMVQ_ROWS={MMVQ_ROWS}"));
         cmd.arg("-o").arg(&target).arg(&source);
         let output = cmd.output().unwrap_or_else(|e| panic!("cannot run {}: {e}", glslc.display()));
         if !output.status.success() {

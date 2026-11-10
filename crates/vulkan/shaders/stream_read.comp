@@ -1,0 +1,31 @@
+#version 450
+#include "common.glsl"
+
+// The speed of a plain read of device memory, as the yardstick for the weight
+// kernels (which are bound by how fast they read the weights): every invocation of
+// a workgroup reads 16-byte units a workgroup apart, a workgroup a contiguous chunk
+// of 64 KiB, and the XOR of what an invocation read is written, so that the loads
+// cannot be dropped. Only the benchmark loads this one.
+
+layout(local_size_x = 256) in;
+
+layout(push_constant, std430) uniform Push {
+    uint64_t src;
+    uint64_t sink;
+    uint n_chunks;
+} pc;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) writeonly buffer SinkRef { uint v[]; };
+
+void main() {
+    const uint64_t chunk = ares_group();
+    if (chunk >= pc.n_chunks) {
+        return;
+    }
+    const uint64_t base = pc.src + chunk * 65536;
+    uvec4 acc = uvec4(0u);
+    [[unroll]] for (uint i = 0; i < 16; i++) {
+        acc ^= Vec4Ref(base + uint64_t(i) * 4096 + uint64_t(gl_LocalInvocationID.x) * 16).v[0];
+    }
+    SinkRef(pc.sink).v[0] = acc.x ^ acc.y ^ acc.z ^ acc.w;
+}

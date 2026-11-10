@@ -73,6 +73,81 @@ pub struct DeviceInfo {
     /// Invocations per subgroup (warp). The kernels' reductions use subgroup
     /// operations and need at least 8.
     pub subgroup_size: u32,
+    /// The matrix products the tensor cores run for a subgroup
+    /// (`VK_KHR_cooperative_matrix`, subgroup scope); empty if the device has no such
+    /// extension.
+    pub cooperative_matrix: Vec<CooperativeMatrix>,
+    /// Whether the driver runs the packed 8-bit integer dot products (signed and
+    /// signed-by-unsigned) as single hardware instructions
+    /// (`VK_KHR_shader_integer_dot_product`'s `integerDotProduct4x8BitPacked*Accelerated`).
+    /// The quantized weight kernels use them; without the hardware they would
+    /// still give the same results, with four multiplications.
+    pub integer_dot_product: bool,
+}
+
+/// The element type of a cooperative matrix.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ComponentType {
+    F16,
+    F32,
+    F64,
+    Bf16,
+    /// 8-bit floats (4 exponent and 3 mantissa bits, and 5 and 2).
+    E4M3,
+    E5M2,
+    I8,
+    I16,
+    I32,
+    I64,
+    U8,
+    U16,
+    U32,
+    U64,
+    /// Anything else: the raw `VkComponentTypeKHR`.
+    Other(i32),
+}
+
+/// Component types newer than the bindings this crate builds on.
+const BFLOAT16: vk::ComponentTypeKHR = vk::ComponentTypeKHR::from_raw(1_000_141_000);
+const FLOAT_E4M3: vk::ComponentTypeKHR = vk::ComponentTypeKHR::from_raw(1_000_491_002);
+const FLOAT_E5M2: vk::ComponentTypeKHR = vk::ComponentTypeKHR::from_raw(1_000_491_003);
+
+impl ComponentType {
+    pub(crate) fn from_raw(raw: vk::ComponentTypeKHR) -> Self {
+        match raw {
+            vk::ComponentTypeKHR::FLOAT16 => Self::F16,
+            vk::ComponentTypeKHR::FLOAT32 => Self::F32,
+            vk::ComponentTypeKHR::FLOAT64 => Self::F64,
+            BFLOAT16 => Self::Bf16,
+            FLOAT_E4M3 => Self::E4M3,
+            FLOAT_E5M2 => Self::E5M2,
+            vk::ComponentTypeKHR::SINT8 => Self::I8,
+            vk::ComponentTypeKHR::SINT16 => Self::I16,
+            vk::ComponentTypeKHR::SINT32 => Self::I32,
+            vk::ComponentTypeKHR::SINT64 => Self::I64,
+            vk::ComponentTypeKHR::UINT8 => Self::U8,
+            vk::ComponentTypeKHR::UINT16 => Self::U16,
+            vk::ComponentTypeKHR::UINT32 => Self::U32,
+            vk::ComponentTypeKHR::UINT64 => Self::U64,
+            other => Self::Other(other.as_raw()),
+        }
+    }
+}
+
+/// One shape of matrix product the tensor cores run for a whole subgroup
+/// (`VkCooperativeMatrixPropertiesKHR`): `result = a * b + c` with `a` of `m x k`, `b` of
+/// `k x n`, `c` and the result of `m x n`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CooperativeMatrix {
+    pub m: u32,
+    pub n: u32,
+    pub k: u32,
+    pub a: ComponentType,
+    pub b: ComponentType,
+    pub c: ComponentType,
+    pub result: ComponentType,
+    /// Whether the integer accumulation saturates.
+    pub saturating: bool,
 }
 
 /// How a thread waits for the device when it synchronises.
@@ -198,17 +273,43 @@ impl Device {
         let queues = [vk::DeviceQueueCreateInfo::default()
             .queue_family_index(physical.queue_family)
             .queue_priorities(&priorities)];
+        // The quantized weight kernels' needs are switched on where the device has
+        // them; a device without them still runs everything else.
+        let quantized = physical.quantized_unsupported.is_none();
+        let cooperative = !physical.info.cooperative_matrix.is_empty();
+        let mut v11 =
+            vk::PhysicalDeviceVulkan11Features::default().storage_buffer16_bit_access(quantized);
         let mut v12 = vk::PhysicalDeviceVulkan12Features::default()
             .buffer_device_address(true)
-            .timeline_semaphore(true);
+            .timeline_semaphore(true)
+            .shader_int8(quantized)
+            .storage_buffer8_bit_access(quantized)
+            // Cooperative matrices are used under the Vulkan memory model, with f16 operands.
+            .vulkan_memory_model(quantized || cooperative)
+            .shader_float16(cooperative);
+        let mut dot_features = vk::PhysicalDeviceShaderIntegerDotProductFeatures::default()
+            .shader_integer_dot_product(true);
         let mut features = vk::PhysicalDeviceFeatures2::default()
-            .features(vk::PhysicalDeviceFeatures::default().shader_int64(true))
+            .features(
+                vk::PhysicalDeviceFeatures::default().shader_int64(true).shader_int16(quantized),
+            )
+            .push_next(&mut v11)
             .push_next(&mut v12);
-        let extensions: Vec<*const c_char> = if physical.memory_budget {
+        let mut extensions: Vec<*const c_char> = if physical.memory_budget {
             vec![ash::ext::memory_budget::NAME.as_ptr()]
         } else {
             vec![]
         };
+        if quantized {
+            extensions.push(ash::khr::shader_integer_dot_product::NAME.as_ptr());
+            features = features.push_next(&mut dot_features);
+        }
+        let mut coop_features =
+            vk::PhysicalDeviceCooperativeMatrixFeaturesKHR::default().cooperative_matrix(true);
+        if !physical.info.cooperative_matrix.is_empty() {
+            extensions.push(ash::khr::cooperative_matrix::NAME.as_ptr());
+            features = features.push_next(&mut coop_features);
+        }
         let info = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queues)
             .enabled_extension_names(&extensions)
