@@ -13,7 +13,7 @@
 //! The runtime reserves the pages of sequence state before the model's parts
 //! are built, and the model has no plan of its sizes that can be asked
 //! without a device. So the context that fits, when the operator names none,
-//! comes from an estimate of what the model takes ([`footprint`]): weights
+//! comes from an estimate of what the model takes (`footprint`): weights
 //! from the placement and the tensor table, recurrent state and the scratch
 //! of a step from the model's dimensions. After the load the log states what
 //! each part really took next to what was estimated.
