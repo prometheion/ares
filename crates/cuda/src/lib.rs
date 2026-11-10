@@ -33,7 +33,7 @@ pub use device::{
 };
 pub use driver::{LIBRARY_ENV, driver_version};
 pub use error::{Error, Result};
-pub use kernels::{Kernels, MAX_BATCH, Precision, PrefillPath};
+pub use kernels::{Kernels, MAX_BATCH, Precision, PrefillPath, PrefillShape};
 pub use memory::{DeviceBuffer, DevicePtr, HostRegistration, PinnedBuffer};
 pub use mesh::{Lane, Mesh, PUSH_MAX_VALUES, Parcel, Route};
 pub use module::{Args, Function, MAX_ARGS, Module};

@@ -56,25 +56,25 @@ const FAST_TYPES: [(GgmlType, &str, u64); 11] = [
 ];
 
 /// The weight types that have a prefill kernel (`kernels/mm_types.cuh`): the type,
-/// the kernels' name suffix (`ares_mm_{i8,i8s,f16,f16s}_<suffix>`) and the
-/// alignment in bytes it needs of the matrix (the same as the decode kernel's).
-const PREFILL_TYPES: [(GgmlType, &str, u64); 11] = [
-    (GgmlType::Q4_K, "q4_K", 16),
-    (GgmlType::Q5_K, "q5_K", 16),
-    (GgmlType::Q6_K, "q6_K", 2),
-    (GgmlType::Q3_K, "q3_K", 2),
-    (GgmlType::IQ4_XS, "iq4_xs", 8),
-    (GgmlType::IQ4_NL, "iq4_nl", 2),
-    (GgmlType::IQ3_S, "iq3_s", 2),
-    (GgmlType::IQ3_XXS, "iq3_xxs", 2),
-    (GgmlType::IQ2_S, "iq2_s", 2),
-    (GgmlType::IQ2_XS, "iq2_xs", 2),
-    (GgmlType::Q8_0, "q8_0", 2),
+/// the kernels' name suffix (`ares_mm_{i8,i8m,i8s,f16,f16m,f16s}_<suffix>`), the
+/// alignment in bytes it needs of the matrix (the same as the decode kernel's) and
+/// the bytes of shared memory its codebook takes (`SMEM_BYTES` of the type).
+const PREFILL_TYPES: [(GgmlType, &str, u64, u32); 11] = [
+    (GgmlType::Q4_K, "q4_K", 16, 0),
+    (GgmlType::Q5_K, "q5_K", 16, 0),
+    (GgmlType::Q6_K, "q6_K", 2, 0),
+    (GgmlType::Q3_K, "q3_K", 2, 0),
+    (GgmlType::IQ4_XS, "iq4_xs", 8, 0),
+    (GgmlType::IQ4_NL, "iq4_nl", 2, 0),
+    (GgmlType::IQ3_S, "iq3_s", 2, 512 * 4),
+    (GgmlType::IQ3_XXS, "iq3_xxs", 2, 256 * 4),
+    (GgmlType::IQ2_S, "iq2_s", 2, 1024 * 8),
+    (GgmlType::IQ2_XS, "iq2_xs", 2, 512 * 8),
+    (GgmlType::Q8_0, "q8_0", 2, 0),
 ];
 
-/// The shapes of the prefill kernels (`ARES_MM_*_KERNEL` in `kernels/mm.cuh`):
-/// weight rows and activation rows per thread block, and threads. The small
-/// shape takes up to [`MM_SMALL_ROWS`] activation rows, the large one more.
+/// One shape of the prefill kernels (`kernels/prefill.cu`): the weight rows and
+/// activation rows a thread block computes, and its threads.
 #[derive(Clone, Copy, Debug)]
 struct Shape {
     weight_rows: u32,
@@ -82,19 +82,44 @@ struct Shape {
     threads: u32,
 }
 
+impl Shape {
+    /// The dynamic shared memory of a block (`AresMmLayout` in `kernels/mm.cuh`): two
+    /// stages of a weight tile and an activation tile of 64 values per row, each row
+    /// 16 bytes longer than its data so that `ldmatrix` finds no bank conflicts, with
+    /// the (d, s) scales of both tiles in the int8 variant, then the type's table.
+    /// `elem` is the bytes of a value in the tile: 1 for int8, 2 for f16.
+    const fn shared_bytes(self, elem: u32, table: u32) -> u32 {
+        let rows = self.weight_rows + self.batch_rows;
+        let tiles = rows * (64 * elem + 16);
+        let scales = if elem == 1 { 2 * rows * 8 } else { 0 };
+        2 * (tiles + scales) + table
+    }
+}
+
+/// The shapes, `[int8, f16][large, medium, small]`, and the numbers of activation
+/// rows they take: up to [`MM_SMALL_ROWS`] the small one, up to [`MM_MEDIUM_ROWS`]
+/// the medium one, more the large one. The large shape is a block of 16 warps with
+/// the whole SM to itself, which is what lets the decoding of a weight tile be shared
+/// by 128 activation rows; the others are blocks of 4 warps, three (int8) or two (f16)
+/// to an SM, for the rows where there are not enough tiles to fill the large ones.
 const MM_SMALL_ROWS: u32 = 32;
-const SHAPES: [[Shape; 2]; 2] = [
-    // int8: large, small
+const MM_MEDIUM_ROWS: u32 = 64;
+const SHAPES: [[Shape; 3]; 2] = [
     [
-        Shape { weight_rows: 128, batch_rows: 64, threads: 256 },
-        Shape { weight_rows: 64, batch_rows: 16, threads: 128 },
-    ],
-    // f16: large, small
-    [
+        Shape { weight_rows: 128, batch_rows: 128, threads: 512 },
         Shape { weight_rows: 64, batch_rows: 64, threads: 128 },
-        Shape { weight_rows: 32, batch_rows: 32, threads: 64 },
+        Shape { weight_rows: 64, batch_rows: 32, threads: 128 },
+    ],
+    [
+        Shape { weight_rows: 128, batch_rows: 128, threads: 512 },
+        Shape { weight_rows: 64, batch_rows: 64, threads: 128 },
+        Shape { weight_rows: 64, batch_rows: 32, threads: 128 },
     ],
 ];
+/// The kernels' name part for each shape.
+const SHAPE_SUFFIX: [&str; 3] = ["", "m", "s"];
+/// What a launch gets without asking for more shared memory.
+const DEFAULT_SHARED: u32 = 48 << 10;
 
 /// For each weight type, up to how many activation rows the decode kernels (in
 /// launches of [`MAX_BATCH`] rows) are the faster family; above it the tensor-core
@@ -103,21 +128,30 @@ const DECODE_ROWS: [(GgmlType, u32); 11] = [
     (GgmlType::Q4_K, 16),
     (GgmlType::Q5_K, 16),
     (GgmlType::Q6_K, 8),
-    (GgmlType::Q3_K, 6),
-    (GgmlType::IQ4_XS, 20),
-    (GgmlType::IQ4_NL, 16),
-    (GgmlType::IQ3_S, 20),
-    (GgmlType::IQ3_XXS, 20),
-    (GgmlType::IQ2_S, 8),
-    (GgmlType::IQ2_XS, 8),
+    (GgmlType::Q3_K, 8),
+    (GgmlType::IQ4_XS, 12),
+    (GgmlType::IQ4_NL, 12),
+    (GgmlType::IQ3_S, 16),
+    (GgmlType::IQ3_XXS, 16),
+    (GgmlType::IQ2_S, 12),
+    (GgmlType::IQ2_XS, 12),
     (GgmlType::Q8_0, 8),
 ];
 
 /// The activation bytes the blocks that run together should be able to keep in
 /// L2: the grid is ordered in groups of activation tiles that take every weight
-/// tile in turn (see `kernels/mm.cuh`), and a group is as many tiles as fit in
-/// this many bytes (at least one, at most 16). An RTX 3060 has 3 MiB of L2.
-const MM_GROUP_BYTES: u64 = 2 << 20;
+/// tile in turn (see `kernels/mm.cuh`), and a group is as many tiles as fit in this
+/// many bytes, at least 2 (a group of 1 costs the RTX 4070 10% on the 128-row
+/// shape) and at most 8. The RTX 3060, whose L2 is 3 MiB, does not care.
+const MM_GROUP_BYTES: u64 = 4 << 20;
+const MM_GROUP_MIN: u64 = 2;
+const MM_GROUP_MAX: u64 = 8;
+
+/// The smallest L2 cache, in bytes, for which the small and medium shapes ask L2 to
+/// prefetch the next group of four steps of every row they read (see
+/// `kernels/mm.cuh`). On an RTX 4070 (36 MiB) it takes the small shape from 0.34 to
+/// 0.19 ms at 32 rows; on an RTX 3060 (3 MiB) it costs about 10%.
+const MM_PREFETCH_L2_BYTES: u32 = 16 << 20;
 
 /// How the prefill family reads its activations and which of its two kernels it
 /// runs. See [`Kernels::prefill_path`].
@@ -131,6 +165,25 @@ pub enum PrefillPath {
     /// activations: the direct product, which rounds nothing but the f16
     /// inputs.
     F16,
+}
+
+/// How one shape of the prefill kernels runs on a device
+/// ([`Kernels::prefill_shapes`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PrefillShape {
+    /// The weight rows and the activation rows one thread block computes.
+    pub weight_rows: u32,
+    pub batch_rows: u32,
+    pub threads: u32,
+    /// Dynamic shared memory per block, in bytes.
+    pub shared_bytes: u32,
+    /// Registers per thread, as the compiler allocated them.
+    pub registers: u32,
+    /// Blocks of this kernel one multiprocessor holds at once (registers and shared
+    /// memory permitting).
+    pub blocks_per_sm: u32,
+    /// The most activation rows this shape is used for (`u32::MAX` for the last).
+    pub up_to_rows: u32,
 }
 
 /// What a caller of the prefill family asks for.
@@ -160,8 +213,9 @@ pub enum Precision {
 /// The kernels of the prefill module on one device.
 #[derive(Debug, Clone)]
 struct Prefill {
-    /// Per type: the alignment and the kernels, indexed `[path][small]`.
-    types: Vec<(GgmlType, u64, [[Function; 2]; 2])>,
+    /// Per type: the alignment, the bytes of its table and the kernels, indexed
+    /// `[path][shape]`.
+    types: Vec<(GgmlType, u64, u32, [[Function; 3]; 2])>,
     convert_f16: Function,
     /// Whether `mma` with f32 accumulation runs as fast as with f16
     /// accumulation (measured at load).
@@ -187,14 +241,34 @@ pub struct Kernels {
 impl Prefill {
     fn load(device: &Device) -> Result<Self> {
         let module = Module::load(device, PREFILL_IMAGE)?;
+        let limit = device.info().max_shared_per_block_optin;
         let types = PREFILL_TYPES
             .iter()
-            .map(|(ty, suffix, align)| {
-                let function =
-                    |variant: &str| module.function(&format!("ares_mm_{variant}_{suffix}"));
-                let kernels =
-                    [[function("i8")?, function("i8s")?], [function("f16")?, function("f16s")?]];
-                Ok((*ty, *align, kernels))
+            .map(|(ty, suffix, align, table)| {
+                let mut paths = Vec::new();
+                for (path, (variant, elem)) in [("i8", 1u32), ("f16", 2u32)].into_iter().enumerate() {
+                    let mut shapes = Vec::new();
+                    for (shape, part) in SHAPES[path].iter().zip(SHAPE_SUFFIX) {
+                        let function =
+                            module.function(&format!("ares_mm_{variant}{part}_{suffix}"))?;
+                        let bytes = shape.shared_bytes(elem, *table);
+                        if bytes > limit {
+                            return Err(Error::Invalid {
+                                what: "prefill kernel",
+                                detail: format!(
+                                    "{ty} needs {bytes} bytes of shared memory per block, the device allows {limit}"
+                                ),
+                            });
+                        }
+                        if bytes > DEFAULT_SHARED {
+                            function.allow_dynamic_shared(bytes)?;
+                        }
+                        shapes.push(function);
+                    }
+                    paths.push(<[Function; 3]>::try_from(shapes).expect("three shapes"));
+                }
+                let kernels = <[[Function; 3]; 2]>::try_from(paths).expect("two paths");
+                Ok((*ty, *align, *table, kernels))
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
@@ -602,21 +676,20 @@ impl Kernels {
     /// ([`Kernels::matmul`]) are. `None` for a type that has no kernels.
     ///
     /// The decode kernels read the weights once per launch, so their time grows
-    /// by a launch with every 8 rows; the tensor-core kernels take about the
-    /// same time for any number of rows up to 64, since they read the weights once
-    /// and the time is the weights' decoding. They cross at 16 to 20 rows for the
-    /// types whose decode kernels reach the memory bandwidth (Q4_K, Q5_K, IQ4_XS,
-    /// IQ4_NL, IQ3_S, IQ3_XXS: 12 to 24 on an RTX 4070 and 12 to 28 on an RTX
-    /// 3060, as the first row count at which the tensor-core kernels are faster
-    /// in `examples/prefill_bench.rs`) and at 8 or fewer for the types whose
-    /// decode kernels are arithmetic-bound already at a few rows (Q3_K, Q6_K,
-    /// IQ2_S, IQ2_XS) and for Q8_0 (the 3060 crosses at 12, the 4070 at 20). The
-    /// table holds, per type, the row count that gives the least total loss over
-    /// both GPUs and 8, 12, ..., 32 rows: following it costs at most 27% against
-    /// the faster family at any of those row counts (IQ4_NL at 16 rows), at most
-    /// 15% for the other types. It was measured with the int8 path of the
-    /// prefill kernels, the one both GPUs take; the f16 path of a device whose
-    /// tensor cores run at full rate has its own crossover, not measured.
+    /// by a launch with every 8 rows; the tensor-core kernels take about the same
+    /// time (0.2 to 0.3 ms for a 17408 x 5120 matrix on an RTX 4070, 0.45 to 0.75 on
+    /// an RTX 3060) for any number of rows up to 48, since the time of the small
+    /// shapes is that of reading and decoding the weights. They cross at 12 to 20
+    /// rows (the first row count, of 8, 12, 16, 20 ..., at which the tensor-core
+    /// kernels are faster in `examples/prefill_bench.rs`): 12 or 16 for the types
+    /// whose decode kernels reach the memory bandwidth (the K-quants of 4 and 5 bits,
+    /// IQ4_XS, IQ4_NL, IQ3_S, IQ3_XXS), 8 for Q6_K, Q3_K and Q8_0, whose decode
+    /// kernels turn arithmetic-bound at a few rows, and 12 for IQ2_S and IQ2_XS. The
+    /// table holds, per type, the row count with the least total loss over both GPUs
+    /// and the row counts 8, 12, ..., 32: following it costs at most 13% against
+    /// the faster family at any of them. It was measured with the int8 path, the one
+    /// both GPUs take; the f16 path of a device with full-rate tensor cores has its
+    /// own crossover, not measured.
     pub fn decode_kernel_rows(ty: GgmlType) -> Option<u32> {
         DECODE_ROWS.iter().find(|(t, _)| *t == ty).map(|(_, rows)| *rows)
     }
@@ -663,6 +736,42 @@ impl Kernels {
                 self.device.info().compute_capability.1
             ),
         })
+    }
+
+    /// The shapes the prefill kernels of `ty` come in for `path`, largest first: what
+    /// each needs and how it sits on this device, and up to how many activation rows
+    /// [`Kernels::matmul`] uses it.
+    pub fn prefill_shapes(&self, ty: GgmlType, path: PrefillPath) -> Result<Vec<PrefillShape>> {
+        let prefill = self.prefill_kernels()?;
+        let Some((_, _, table, kernels)) = prefill.types.iter().find(|(t, ..)| *t == ty) else {
+            return Err(Error::Invalid {
+                what: "prefill kernel type",
+                detail: format!("{ty} has no prefill kernel"),
+            });
+        };
+        let (path_index, elem) = match path {
+            PrefillPath::Int8 => (0, 1),
+            PrefillPath::F16 => (1, 2),
+        };
+        let up_to = [u32::MAX, MM_MEDIUM_ROWS, MM_SMALL_ROWS];
+        (0..3)
+            .map(|shape| {
+                let info = SHAPES[path_index][shape];
+                let function = &kernels[path_index][shape];
+                let shared_bytes = info.shared_bytes(elem, *table);
+                let (registers, _) = function.resources()?;
+                Ok(PrefillShape {
+                    weight_rows: info.weight_rows,
+                    batch_rows: info.batch_rows,
+                    threads: info.threads,
+                    shared_bytes,
+                    registers,
+                    blocks_per_sm: function
+                        .blocks_per_multiprocessor(info.threads, shared_bytes)?,
+                    up_to_rows: up_to[shape],
+                })
+            })
+            .collect()
     }
 
     /// The bytes [`Kernels::prepare_prefill_activations`] writes for `n_rows`
@@ -769,7 +878,7 @@ impl Kernels {
         n_rows: u32,
     ) -> Result<()> {
         let prefill = self.prefill_kernels()?;
-        let Some((_, align, kernels)) = prefill.types.iter().find(|(t, ..)| *t == ty) else {
+        let Some((_, align, table, kernels)) = prefill.types.iter().find(|(t, ..)| *t == ty) else {
             return Err(Error::Invalid {
                 what: "prefill kernel type",
                 detail: format!(
@@ -798,26 +907,49 @@ impl Kernels {
         }
         check_alignment("weight matrix", w, *align)?;
         check_alignment("prepared activations", act, 16)?;
-        let (path_index, act_row_bytes) = match path {
-            PrefillPath::Int8 => (0, u64::from(n_in) * 9 / 8),
-            PrefillPath::F16 => (1, u64::from(n_in) * 2),
+        let (path_index, elem, act_row_bytes) = match path {
+            PrefillPath::Int8 => (0, 1, u64::from(n_in) * 9 / 8),
+            PrefillPath::F16 => (1, 2, u64::from(n_in) * 2),
         };
-        let small = usize::from(n_rows <= MM_SMALL_ROWS);
-        let Shape { weight_rows, batch_rows, threads } = SHAPES[path_index][small];
-        let function = &kernels[path_index][small];
+        let shape = shape_index(n_rows);
+        let (shape_info, function) = (SHAPES[path_index][shape], &kernels[path_index][shape]);
+        let Shape { weight_rows, batch_rows, threads } = shape_info;
+        let shared = shape_info.shared_bytes(elem, *table);
         let n_weight_tiles = n_out.div_ceil(weight_rows);
         let n_batch_tiles = n_rows.div_ceil(batch_rows);
-        let group = (MM_GROUP_BYTES / (u64::from(batch_rows) * act_row_bytes)).clamp(1, 16);
-        let group = u32::try_from(group).unwrap_or(16).min(n_batch_tiles);
+        let group = (MM_GROUP_BYTES / (u64::from(batch_rows) * act_row_bytes))
+            .clamp(MM_GROUP_MIN, MM_GROUP_MAX);
+        let group = u32::try_from(group).unwrap_or(2).min(n_batch_tiles);
         let blocks = u64::from(n_weight_tiles) * u64::from(n_batch_tiles);
         let blocks = u32::try_from(blocks).map_err(|_| Error::Invalid {
             what: "prefill kernel batch",
             detail: format!("{n_out} x {n_rows} needs more blocks than a grid has"),
         })?;
-        let args = Args::new().ptr(w).ptr(act).ptr(y).u32(n_in).u32(n_out).u32(n_rows).u32(group);
+        let prefetch =
+            u32::from(shape != 0 && self.device.info().l2_cache_bytes >= MM_PREFETCH_L2_BYTES);
+        let args = Args::new()
+            .ptr(w)
+            .ptr(act)
+            .ptr(y)
+            .u32(n_in)
+            .u32(n_out)
+            .u32(n_rows)
+            .u32(group)
+            .u32(prefetch);
         // SAFETY: the argument list matches the ares_mm_* kernels; the ranges are the
         // caller's guarantee.
-        unsafe { function.launch(stream, [blocks, 1, 1], [threads, 1, 1], 0, args) }
+        unsafe { function.launch(stream, [blocks, 1, 1], [threads, 1, 1], shared, args) }
+    }
+}
+
+/// Which of the shapes takes `n_rows` rows of activations.
+const fn shape_index(n_rows: u32) -> usize {
+    if n_rows <= MM_SMALL_ROWS {
+        2
+    } else if n_rows <= MM_MEDIUM_ROWS {
+        1
+    } else {
+        0
     }
 }
 

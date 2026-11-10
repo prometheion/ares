@@ -32,8 +32,14 @@ pub(crate) const CU_DEVICE_ATTRIBUTE_PCI_DEVICE_ID: c_int = 34;
 pub(crate) const CU_DEVICE_ATTRIBUTE_MEMORY_CLOCK_RATE: c_int = 36;
 pub(crate) const CU_DEVICE_ATTRIBUTE_GLOBAL_MEMORY_BUS_WIDTH: c_int = 37;
 pub(crate) const CU_DEVICE_ATTRIBUTE_PCI_DOMAIN_ID: c_int = 50;
+pub(crate) const CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE: c_int = 38;
+pub(crate) const CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN: c_int = 97;
 pub(crate) const CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR: c_int = 75;
 pub(crate) const CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR: c_int = 76;
+
+pub(crate) const CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES: c_int = 1;
+pub(crate) const CU_FUNC_ATTRIBUTE_NUM_REGS: c_int = 4;
+pub(crate) const CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES: c_int = 8;
 
 pub(crate) const CU_DEVICE_P2P_ATTRIBUTE_PERFORMANCE_RANK: c_int = 1;
 pub(crate) const CU_DEVICE_P2P_ATTRIBUTE_ACCESS_SUPPORTED: c_int = 2;
@@ -126,6 +132,11 @@ driver_api! {
         CUfunction, c_uint, c_uint, c_uint, c_uint, c_uint, c_uint, c_uint, CUstream,
         *mut *mut c_void, *mut *mut c_void
     );
+
+    fn func_set_attribute = "cuFuncSetAttribute"(CUfunction, c_int, c_int);
+    fn func_get_attribute = "cuFuncGetAttribute"(*mut c_int, c_int, CUfunction);
+    fn occupancy_max_active_blocks =
+        "cuOccupancyMaxActiveBlocksPerMultiprocessor"(*mut c_int, CUfunction, c_int, usize);
 
     fn stream_create = "cuStreamCreateWithPriority"(*mut CUstream, c_uint, c_int);
     fn stream_destroy = "cuStreamDestroy_v2"(CUstream);

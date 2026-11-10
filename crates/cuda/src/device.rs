@@ -44,6 +44,12 @@ pub struct DeviceInfo {
     /// product bounds the memory bandwidth, which bounds decode speed.
     pub memory_bus_width_bits: u32,
     pub memory_clock_khz: u32,
+    /// The most shared memory in bytes one thread block can ask for when the
+    /// kernel opts in (`Function::allow_dynamic_shared`): 48 KiB is what a
+    /// launch gets without it. 99 KiB on an RTX 30, 40 or 50 card.
+    pub max_shared_per_block_optin: u32,
+    /// Size of the L2 cache in bytes: 36 MiB on an RTX 4070, 3 MiB on an RTX 3060.
+    pub l2_cache_bytes: u32,
 }
 
 /// How a thread waits for the device when it synchronises.
@@ -126,6 +132,10 @@ fn describe(driver: &Driver, ordinal: u32) -> Result<(CUdevice, DeviceInfo)> {
         multiprocessors: attribute(CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)?,
         memory_bus_width_bits: attribute(CU_DEVICE_ATTRIBUTE_GLOBAL_MEMORY_BUS_WIDTH)?,
         memory_clock_khz: attribute(CU_DEVICE_ATTRIBUTE_MEMORY_CLOCK_RATE)?,
+        max_shared_per_block_optin: attribute(
+            CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN,
+        )?,
+        l2_cache_bytes: attribute(CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE)?,
     };
     Ok((handle, info))
 }

@@ -133,6 +133,59 @@ impl Args {
 }
 
 impl Function {
+    /// Lets launches of this kernel ask for up to `bytes` of dynamic shared
+    /// memory per block. A launch gets 48 KiB without this; the limit of the
+    /// device is [`DeviceInfo::max_shared_per_block_optin`](crate::DeviceInfo)
+    /// (less the kernel's static shared memory). Call it once per function, before
+    /// the first launch that needs more.
+    pub fn allow_dynamic_shared(&self, bytes: u32) -> Result<()> {
+        let driver = self._module.0.device.bind()?;
+        let value = i32::try_from(bytes).map_err(|_| Error::Invalid {
+            what: "dynamic shared memory",
+            detail: format!("{bytes} bytes do not fit the driver's int"),
+        })?;
+        // SAFETY: the handle came from cuModuleGetFunction and its module is alive.
+        driver.check("cuFuncSetAttribute", unsafe {
+            (driver.api.func_set_attribute)(
+                self.raw,
+                CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                value,
+            )
+        })
+    }
+
+    /// How the compiler laid the kernel out: registers per thread and static
+    /// shared bytes per block.
+    pub fn resources(&self) -> Result<(u32, u32)> {
+        let driver = self._module.0.device.bind()?;
+        let get = |attribute: i32| -> Result<u32> {
+            let mut value: i32 = 0;
+            // SAFETY: the pointer is valid for the write of one int.
+            driver.check("cuFuncGetAttribute", unsafe {
+                (driver.api.func_get_attribute)(&mut value, attribute, self.raw)
+            })?;
+            Ok(value.max(0) as u32)
+        };
+        Ok((get(CU_FUNC_ATTRIBUTE_NUM_REGS)?, get(CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES)?))
+    }
+
+    /// How many blocks of `threads` threads with `dynamic_shared` bytes of
+    /// dynamic shared memory the driver can keep on one multiprocessor at once.
+    pub fn blocks_per_multiprocessor(&self, threads: u32, dynamic_shared: u32) -> Result<u32> {
+        let driver = self._module.0.device.bind()?;
+        let mut blocks: i32 = 0;
+        // SAFETY: the pointer is valid for the write of one int.
+        driver.check("cuOccupancyMaxActiveBlocksPerMultiprocessor", unsafe {
+            (driver.api.occupancy_max_active_blocks)(
+                &mut blocks,
+                self.raw,
+                threads as i32,
+                dynamic_shared as usize,
+            )
+        })?;
+        Ok(blocks.max(0) as u32)
+    }
+
     /// Enqueues one launch of the kernel on `stream`.
     ///
     /// `grid` and `block` are the grid size in blocks and the block size in

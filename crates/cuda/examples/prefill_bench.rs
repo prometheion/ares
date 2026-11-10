@@ -14,7 +14,7 @@
 //!
 //! ```sh
 //! cargo run --release -p ares-cuda --example prefill_bench -- \
-//!     [--rows 64,256,1024] [--types q4_K,iq4_xs] [--paths int8,f16,decode]
+//!     [--rows 64,256,1024] [--types q4_K,iq4_xs] [--paths int8,f16,decode] [--device N]
 //! ```
 
 use std::time::Instant;
@@ -55,6 +55,7 @@ fn main() -> Result<()> {
     let mut rows = vec![64u32, 256, 1024];
     let mut types: Vec<GgmlType> = TYPES.to_vec();
     let mut paths = vec![Which::Int8, Which::F16, Which::Decode];
+    let mut only_device: Option<u32> = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         let value = args.next().unwrap_or_else(|| panic!("{arg} needs a value"));
@@ -71,6 +72,7 @@ fn main() -> Result<()> {
                     })
                     .collect();
             }
+            "--device" => only_device = Some(value.parse().expect("--device")),
             "--paths" => {
                 paths = value
                     .split(',')
@@ -86,7 +88,7 @@ fn main() -> Result<()> {
         }
     }
 
-    for info in devices()? {
+    for info in devices()?.into_iter().filter(|i| only_device.is_none_or(|d| d == i.ordinal)) {
         let device = Device::open(info.ordinal, Wait::Spin)?;
         let kernels = Kernels::load(&device)?;
         let stream = Stream::new(&device, 0)?;
@@ -97,6 +99,25 @@ fn main() -> Result<()> {
             info.name,
             kernels.tensor_cores_full_rate()
         );
+        for path in [PrefillPath::Int8, PrefillPath::F16] {
+            for shape in kernels.prefill_shapes(types[0], path)? {
+                println!(
+                    "  {path:?} shape {}x{} rows of weights x activations, {} threads, {} B of shared memory (for {}), {} registers, {} block(s) per SM, up to {} rows",
+                    shape.weight_rows,
+                    shape.batch_rows,
+                    shape.threads,
+                    shape.shared_bytes,
+                    types[0].name(),
+                    shape.registers,
+                    shape.blocks_per_sm,
+                    if shape.up_to_rows == u32::MAX {
+                        "any".to_string()
+                    } else {
+                        shape.up_to_rows.to_string()
+                    }
+                );
+            }
+        }
         for &ty in &types {
             time_type(&device, &kernels, &stream, ty, &rows, &paths, fast)?;
         }

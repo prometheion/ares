@@ -104,7 +104,7 @@
 //                          64-value row of the tile: item * ITEM_STRIDE + run *
 //                          RUN_STRIDE
 //   Raw load(row, chunk, item)       the global loads of an item
-//   void decode(raw, chunk, item, smem, EngMmDec&)   the decoding
+//   void decode(raw, chunk, item, smem, AresMmDec&)   the decoding
 // A step of 64 values has two items per weight row (32 values each).
 #pragma once
 
@@ -112,7 +112,7 @@
 #include "mmvq.cuh"
 
 // What an item decodes to.
-struct EngMmDec {
+struct AresMmDec {
     uint32_t w[8];  // 32 codes, one per byte: run 0 = w[0..3], run 1 = w[4..7]
     float sw[2];    // f16 variant: value of a code = sw[run] * code - mw[run]
     float mw[2];
@@ -163,10 +163,10 @@ static __device__ __forceinline__ void ares_ldmatrix_x4(uint32_t (&r)[4], const 
 
 // The integer products: 16x8 outputs, 32 (or 16) values of K, accumulated from
 // zero.
-static __device__ __forceinline__ void ares_mma_s8_k32(int (&c)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
+static __device__ __forceinline__ void ares_mma_s8_k32(int (&c)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1, int init) {
     asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%10,%10,%10};"
                  : "=r"(c[0]), "=r"(c[1]), "=r"(c[2]), "=r"(c[3])
-                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1), "r"(0));
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1), "r"(init));
 }
 
 static __device__ __forceinline__ void ares_mma_s8_k16(int (&c)[4], uint32_t a0, uint32_t a1, uint32_t b0) {
@@ -219,6 +219,51 @@ static __device__ __forceinline__ void ares_mm_tile(uint32_t n_wt, uint32_t n_bt
 }
 
 // ---------------------------------------------------------------------------
+// The shared memory of a block, in both variants: two stages (the weight tile,
+// the activation tile and, for the int8 variant, the scales of both), then the
+// table of the type. It is dynamic shared memory, so a launch must ask for
+// `BYTES` of it (Kernels does, from the same formula).
+//
+//   T            the weight type (its table)
+//   I, J         weight rows and activation rows of the block
+//   KC           values of K per step (a multiple of 64)
+//   ELEM_BYTES   1 for the int8 tiles, 2 for f16
+template <class T, int I, int J, int KC, int ELEM_BYTES>
+struct AresMmLayout {
+    static constexpr int SUBS = KC / 32;
+    static constexpr int PITCH = KC * ELEM_BYTES + 16;
+    static constexpr uint32_t A_TILE = I * PITCH;
+    static constexpr uint32_t B_TILE = J * PITCH;
+    static constexpr uint32_t A_SC = ELEM_BYTES == 1 ? SUBS * I * 8 : 0;
+    static constexpr uint32_t B_SC = ELEM_BYTES == 1 ? SUBS * J * 8 : 0;
+    static constexpr uint32_t STAGE = A_TILE + B_TILE + A_SC + B_SC;
+    static constexpr uint32_t BYTES = 2 * STAGE + T::SMEM_BYTES;
+};
+
+extern __shared__ __align__(16) uint8_t ares_dyn_smem[];
+
+// A launch that asked for less shared memory than the kernel lays out would
+// read and write beyond its block; stop it instead.
+static __device__ __forceinline__ void ares_check_smem(uint32_t needed) {
+    uint32_t have;
+    asm volatile("mov.u32 %0, %%dynamic_smem_size;" : "=r"(have));
+    if (have < needed) {
+        __trap();
+    }
+}
+
+// Asks L2 for the line that holds `p`.
+static __device__ __forceinline__ void ares_prefetch_l2(const void* p) {
+    asm volatile("prefetch.global.L2 [%0];" ::"l"(p));
+}
+
+// 1.5 * 2^23. A 32-bit integer c with |c| < 2^22 placed in the mantissa of this
+// number (the bits of M + c, which `mma` gives when it starts from the bits of M)
+// is the float M + c exactly; M comes off again exactly.
+#define ARES_MM_MAGIC_BITS 0x4B400000
+#define ARES_MM_MAGIC 12582912.0f
+
+// ---------------------------------------------------------------------------
 // The int8 variant.
 //
 //   w    n_out rows of n_in / BLOCK_VALUES blocks
@@ -234,20 +279,41 @@ static __device__ __forceinline__ void ares_mm_tile(uint32_t n_wt, uint32_t n_bt
 // where the sums are the integer results of `mma`, converted to f32. This is
 // the arithmetic of the decode kernels, so the two families agree up to f32
 // rounding.
-template <class T, int I, int J, int WM, int WN, int L>
+//
+// The conversion of the integer sum c to f32 is where the instructions go (one
+// per output and 32 values of K, and `I2F` is not a full-rate instruction), so
+// where |c| is below 2^22 (T::MAGIC; the bounds are with the types) it is done
+// by the mantissa trick: `mma` starts from the bits of M = 1.5 * 2^23, which
+// makes its result the bits of the float M + c, and
+//     u = fma(M + c, sw, -(M * sw))
+// is sw * c rounded once, exactly as sw * (float)c would be, because the scale
+// of every type is an f16 times an integer of at most 6 bits (17 bits), so
+// M * sw is exact. One fused multiply-add takes the place of the conversion and
+// the multiplication; y += u * dx follows.
+template <class T, int I, int J, int WM, int WN, int KC>
 static __device__ __forceinline__ void ares_mm_i8(
     const uint8_t* __restrict__ w, const int8_t* __restrict__ aq, float* __restrict__ y,
-    uint32_t n_in, uint32_t n_out, uint32_t n_batch, uint32_t group) {
+    uint32_t n_in, uint32_t n_out, uint32_t n_batch, uint32_t group, uint32_t prefetch) {
+    using Lay = AresMmLayout<T, I, J, KC, 1>;
     constexpr int NT = WM * WN * 32;
     constexpr int TM = I / WM, TN = J / WN, MT = TM / 16, NTL = TN / 8;
-    constexpr int AITEMS = (2 * I + NT - 1) / NT;
-    static_assert(MT >= 1 && NTL >= 2 && NTL % 2 == 0, "warp tile");
+    constexpr int SUBS = Lay::SUBS, PITCH = Lay::PITCH;
+    constexpr int AITEMS = (I * SUBS + NT - 1) / NT;
+    constexpr int PB = KC / 16;
+    constexpr int BI = (J * PB + NT - 1) / NT;
+    constexpr int SI = (J * SUBS + NT - 1) / NT;
+    static_assert(I % (16 * WM) == 0 && J % (16 * WN) == 0, "warp tile");
+    static_assert(KC % 64 == 0, "a step holds whole chunks of 64 values");
+    constexpr bool MAGIC = T::MAGIC;
+    ares_check_smem(Lay::BYTES);
 
-    __shared__ __align__(16) uint8_t a_s[2][I * ARES_MM_PITCH8];
-    __shared__ __align__(16) uint8_t b_s[2][J * ARES_MM_PITCH8];
-    __shared__ __align__(16) float2 a_sc[2][2][I];
-    __shared__ __align__(16) float2 b_sc[2][2][J];
-    __shared__ __align__(16) uint8_t table[T::SMEM_BYTES > 0 ? T::SMEM_BYTES : 1];
+    uint8_t* const table = ares_dyn_smem + 2 * Lay::STAGE;
+    auto a_s = [&](int stage) { return ares_dyn_smem + stage * Lay::STAGE; };
+    auto b_s = [&](int stage) { return ares_dyn_smem + stage * Lay::STAGE + Lay::A_TILE; };
+    auto a_sc = [&](int stage) {
+        return reinterpret_cast<float2*>(ares_dyn_smem + stage * Lay::STAGE + Lay::A_TILE + Lay::B_TILE);
+    };
+    auto b_sc = [&](int stage) { return a_sc(stage) + SUBS * I; };
 
     const uint32_t tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const uint32_t wm = warp / WN, wn = warp % WN;
@@ -256,7 +322,7 @@ static __device__ __forceinline__ void ares_mm_i8(
     ares_mm_tile((n_out + I - 1) / I, (n_batch + J - 1) / J, group, wt, bt);
     const uint32_t row0 = wt * I, col0 = bt * J;
 
-    const uint32_t n_chunks = (n_in + ARES_MM_KC - 1) / ARES_MM_KC;
+    const uint32_t n_steps = (n_in + KC - 1) / KC;
     const uint32_t groups_per_row = n_in >> 5;
     const size_t row_bytes = static_cast<size_t>(n_in / T::BLOCK_VALUES) * T::BLOCK_BYTES;
     const float2* __restrict__ ds =
@@ -279,39 +345,42 @@ static __device__ __forceinline__ void ares_mm_i8(
         }
     }
 
-    typename T::Raw raw[L][AITEMS];
+    typename T::Raw raw[AITEMS];
 
     // Everything that does not change from step to step is computed once.
     //
-    // The items of the weight tile this thread decodes: the row of the matrix, the
-    // half of the row's 64 values, where in the tile they go.
+    // The items of the weight tile this thread decodes (32 values of one row):
+    // the row of the matrix, which 32 values of the step, where they go in the tile.
     const uint8_t* w_row[AITEMS];
-    uint32_t a_off[AITEMS];  // byte offset in a stage of the tile
-    uint32_t sc_off[AITEMS];  // index of the scale entry in a stage
+    uint32_t a_off[AITEMS];
+    uint32_t sc_off[AITEMS];
+    uint32_t a_sub[AITEMS];
     bool a_on[AITEMS];
 #pragma unroll
     for (int u = 0; u < AITEMS; u++) {
         const uint32_t item = tid + u * NT;
-        const uint32_t r = item >> 1, h = item & 1;
-        a_on[u] = item < 2 * I;
+        const uint32_t r = item / SUBS, sub = item % SUBS;
+        a_on[u] = item < I * SUBS;
+        a_sub[u] = sub;
         w_row[u] = w + static_cast<size_t>(min(row0 + r, n_out - 1)) * row_bytes;
-        a_off[u] = r * ARES_MM_PITCH8 + h * T::ITEM_STRIDE;
-        sc_off[u] = h * I + r;
+        a_off[u] = r * PITCH + (sub >> 1) * 64 + (sub & 1) * T::ITEM_STRIDE;
+        sc_off[u] = sub * I + r;
     }
     // The pieces of the activation tile this thread copies: 16 bytes of one row, and
     // the (d, s) pair of one group of 32 values of one row.
-    constexpr int BI = (4 * J + NT - 1) / NT;
-    constexpr int SI = (2 * J + NT - 1) / NT;
     const int8_t* b_src[BI];
     uint32_t b_dst[BI];
+    uint32_t b_k[BI];
     const float2* s_src[SI];
     uint32_t s_dst[SI];
+    uint32_t s_sub[SI];
 #pragma unroll
     for (int u = 0; u < BI; u++) {
         const uint32_t item = tid + u * NT;
-        const uint32_t c = item >> 2, s = item & 3;
+        const uint32_t c = item / PB, s = item % PB;
         b_src[u] = aq + static_cast<size_t>(min(col0 + c, n_batch - 1)) * n_in + 16 * s;
-        b_dst[u] = c * ARES_MM_PITCH8 + 16 * s;
+        b_dst[u] = c * PITCH + 16 * s;
+        b_k[u] = 16 * s;
     }
 #pragma unroll
     for (int u = 0; u < SI; u++) {
@@ -319,29 +388,50 @@ static __device__ __forceinline__ void ares_mm_i8(
         const uint32_t c = item % J, s = item / J;
         s_src[u] = ds + static_cast<size_t>(min(col0 + c, n_batch - 1)) * groups_per_row + s;
         s_dst[u] = s * J + c;
+        s_sub[u] = 32 * s;
     }
     // Whether every step is whole: only rows of 32-value blocks can end in the middle of one.
-    const bool whole = (n_in & (ARES_MM_KC - 1)) == 0;
+    const bool whole = (n_in & (KC - 1)) == 0;
 
-    // The raw bytes of the items this thread decodes for step `chunk`.
-    auto load_weights = [&](uint32_t chunk, typename T::Raw (&dst)[AITEMS]) {
+    // The raw bytes of the items this thread decodes for step `step`.
+    auto load_weights = [&](uint32_t step, typename T::Raw (&dst)[AITEMS]) {
 #pragma unroll
         for (int u = 0; u < AITEMS; u++) {
-            const uint32_t h = (tid + u * NT) & 1;
-            if (a_on[u] && (whole || ARES_MM_KC * chunk + 32 * h < n_in)) {
-                dst[u] = T::load(w_row[u], chunk, h);
+            const uint32_t g32 = step * SUBS + a_sub[u];
+            if (a_on[u] && (whole || 32 * g32 < n_in)) {
+                dst[u] = T::load(w_row[u], g32 >> 1, g32 & 1);
+                if (prefetch != 0) {
+                    // Once per group of four steps and row, ask L2 for the bytes of the
+                    // next group: the loads of a step are 32 to 70 bytes of each row, which
+                    // GDDR6 serves badly; a request for the whole group makes it read lines.
+                    const uint32_t chunk = g32 >> 1;
+                    const uint32_t ahead = 64 * (chunk + 4);
+                    if ((chunk & 3) == 0 && ahead < n_in) {
+                        const uint8_t* start = w_row[u] + static_cast<size_t>(ahead / T::BLOCK_VALUES) * T::BLOCK_BYTES;
+                        constexpr int GROUP_BYTES = 256 / T::BLOCK_VALUES * T::BLOCK_BYTES;
+                        // The two threads of a row share the lines: first, middle and last.
+                        if ((g32 & 1) == 0) {
+                            ares_prefetch_l2(start);
+                            if (GROUP_BYTES > 128) {
+                                ares_prefetch_l2(start + GROUP_BYTES - 1);
+                            }
+                        } else if (GROUP_BYTES > 128) {
+                            ares_prefetch_l2(start + 128);
+                        }
+                    }
+                }
             }
         }
     };
     // Decodes them into the tile of `stage`.
-    auto store_weights = [&](uint32_t chunk, int stage, const typename T::Raw (&src)[AITEMS]) {
+    auto store_weights = [&](uint32_t step, int stage, const typename T::Raw (&src)[AITEMS]) {
 #pragma unroll
         for (int u = 0; u < AITEMS; u++) {
-            const uint32_t h = (tid + u * NT) & 1;
+            const uint32_t g32 = step * SUBS + a_sub[u];
             if (a_on[u]) {
-                EngMmDec dec;
-                if (whole || ARES_MM_KC * chunk + 32 * h < n_in) {
-                    T::decode(src[u], chunk, h, table, dec);
+                AresMmDec dec;
+                if (whole || 32 * g32 < n_in) {
+                    T::decode(src[u], g32 >> 1, g32 & 1, table, dec);
                 } else {
 #pragma unroll
                     for (int i = 0; i < 8; i++) {
@@ -349,134 +439,135 @@ static __device__ __forceinline__ void ares_mm_i8(
                     }
                     dec.ent = make_float2(0.0f, 0.0f);
                 }
-                uint8_t* tile = &a_s[stage][0] + a_off[u];
+                uint8_t* tile = a_s(stage) + a_off[u];
                 *reinterpret_cast<uint4*>(tile) = make_uint4(dec.w[0], dec.w[1], dec.w[2], dec.w[3]);
                 *reinterpret_cast<uint4*>(tile + T::RUN_STRIDE) = make_uint4(dec.w[4], dec.w[5], dec.w[6], dec.w[7]);
-                (&a_sc[stage][0][0])[sc_off[u]] = dec.ent;
+                a_sc(stage)[sc_off[u]] = dec.ent;
             }
         }
     };
-    // The activations of step `chunk`: 64 bytes per row in 4 pieces, and the
-    // two (d, s) pairs of the row.
-    auto load_acts = [&](uint32_t chunk, int stage) {
+    // The activations of step `step`: KC bytes per row in pieces of 16, and the
+    // (d, s) pairs of the row.
+    auto load_acts = [&](uint32_t step, int stage) {
 #pragma unroll
         for (int u = 0; u < BI; u++) {
-            const uint32_t item = tid + u * NT;
-            if (item < 4 * J) {
-                const bool on = whole || ARES_MM_KC * chunk + 16 * (item & 3) < n_in;
-                ares_cp_async16(&b_s[stage][0] + b_dst[u], b_src[u] + ARES_MM_KC * chunk, on ? 16u : 0u);
+            if (tid + u * NT < J * PB) {
+                const bool on = whole || KC * step + b_k[u] < n_in;
+                ares_cp_async16(b_s(stage) + b_dst[u], b_src[u] + KC * step, on ? 16u : 0u);
             }
         }
 #pragma unroll
         for (int u = 0; u < SI; u++) {
-            const uint32_t item = tid + u * NT;
-            if (item < 2 * J) {
-                const bool on = whole || ARES_MM_KC * chunk + 32 * (item / J) < n_in;
-                ares_cp_async8(&b_sc[stage][0][0] + s_dst[u], s_src[u] + 2 * chunk, on ? 8u : 0u);
+            if (tid + u * NT < J * SUBS) {
+                const bool on = whole || KC * step + s_sub[u] < n_in;
+                ares_cp_async8(b_sc(stage) + s_dst[u], s_src[u] + SUBS * step, on ? 8u : 0u);
             }
         }
     };
 
     load_acts(0, 0);
     ares_cp_commit();
-#pragma unroll
-    for (int k = 0; k < L; k++) {
-        if (k < static_cast<int>(n_chunks)) {
-            load_weights(k, raw[k]);
+    load_weights(0, raw);
+    store_weights(0, 0, raw);
+
+    for (uint32_t step = 0; step < n_steps; step++) {
+        const int stage = step & 1;
+        ares_cp_wait_all();
+        __syncthreads();
+        if (step + 1 < n_steps) {
+            load_acts(step + 1, stage ^ 1);
+            load_weights(step + 1, raw);
         }
-    }
-    store_weights(0, 0, raw[0]);
+        ares_cp_commit();
 
-    // Unrolled by L so that the ring of raw loads is indexed by constants.
-    for (uint32_t base = 0; base < n_chunks; base += L) {
+        const uint8_t* const a_base = a_s(stage);
+        const uint8_t* const b_base = b_s(stage);
+        const float2* const asc = a_sc(stage);
+        const float2* const bsc = b_sc(stage);
 #pragma unroll
-        for (int slot = 0; slot < L; slot++) {
-            const uint32_t chunk = base + slot;
-            if (chunk >= n_chunks) {
-                break;
-            }
-            const int stage = chunk & 1;
-            ares_cp_wait_all();
-            __syncthreads();
-            if (chunk + 1 < n_chunks) {
-                load_acts(chunk + 1, stage ^ 1);
-            }
-            if (chunk + L < n_chunks) {
-                load_weights(chunk + L, raw[slot]);
-            }
-            ares_cp_commit();
-
+        for (int sub = 0; sub < SUBS; sub++) {
+            uint32_t a[MT][4];
 #pragma unroll
-            for (int sub = 0; sub < 2; sub++) {
-                uint32_t a[MT][4];
+            for (int mi = 0; mi < MT; mi++) {
+                ares_ldmatrix_x4(a[mi], a_base + (wm * TM + mi * 16 + (lane & 7) + ((lane >> 3) & 1) * 8) * PITCH + sub * 32 + (lane >> 4) * 16);
+            }
+            uint32_t b[NTL][2];
+#pragma unroll
+            for (int nj = 0; nj < NTL / 2; nj++) {
+                uint32_t r4[4];
+                ares_ldmatrix_x4(r4, b_base + (wn * TN + nj * 16 + (lane & 7) + ((lane >> 4) & 1) * 8) * PITCH + sub * 32 + ((lane >> 3) & 1) * 16);
+                b[2 * nj][0] = r4[0];
+                b[2 * nj][1] = r4[1];
+                b[2 * nj + 1][0] = r4[2];
+                b[2 * nj + 1][1] = r4[3];
+            }
+            float2 sa[MT][2];
+            float neg_m[MT][2];
+#pragma unroll
+            for (int mi = 0; mi < MT; mi++) {
+                sa[mi][0] = asc[sub * I + wm * TM + mi * 16 + g];
+                sa[mi][1] = asc[sub * I + wm * TM + mi * 16 + g + 8];
+                neg_m[mi][0] = -ARES_MM_MAGIC * sa[mi][0].x;
+                neg_m[mi][1] = -ARES_MM_MAGIC * sa[mi][1].x;
+            }
+            int s0[MT][2], s1[MT][2];
+            if (T::SPLIT16) {
 #pragma unroll
                 for (int mi = 0; mi < MT; mi++) {
-                    ares_ldmatrix_x4(a[mi], &a_s[stage][(wm * TM + mi * 16 + (lane & 7) + ((lane >> 3) & 1) * 8) * ARES_MM_PITCH8 + sub * 32 + (lane >> 4) * 16]);
-                }
-                uint32_t b[NTL][2];
 #pragma unroll
-                for (int nj = 0; nj < NTL / 2; nj++) {
-                    uint32_t r4[4];
-                    ares_ldmatrix_x4(r4, &b_s[stage][(wn * TN + nj * 16 + (lane & 7) + ((lane >> 4) & 1) * 8) * ARES_MM_PITCH8 + sub * 32 + ((lane >> 3) & 1) * 16]);
-                    b[2 * nj][0] = r4[0];
-                    b[2 * nj][1] = r4[1];
-                    b[2 * nj + 1][0] = r4[2];
-                    b[2 * nj + 1][1] = r4[3];
-                }
-                float2 sa[MT][2];
-#pragma unroll
-                for (int mi = 0; mi < MT; mi++) {
-                    sa[mi][0] = a_sc[stage][sub][wm * TM + mi * 16 + g];
-                    sa[mi][1] = a_sc[stage][sub][wm * TM + mi * 16 + g + 8];
-                }
-                int s0[MT][2], s1[MT][2];
-                if (T::SPLIT16) {
-#pragma unroll
-                    for (int mi = 0; mi < MT; mi++) {
-#pragma unroll
-                        for (int hi = 0; hi < 2; hi++) {
-                            const int packed = __float_as_int(sa[mi][hi].y);
-                            s0[mi][hi] = static_cast<int>(static_cast<int16_t>(packed & 0xFFFF));
-                            s1[mi][hi] = packed >> 16;
-                        }
+                    for (int hi = 0; hi < 2; hi++) {
+                        const int packed = __float_as_int(sa[mi][hi].y);
+                        s0[mi][hi] = static_cast<int>(static_cast<int16_t>(packed & 0xFFFF));
+                        s1[mi][hi] = packed >> 16;
                     }
                 }
+            }
 #pragma unroll
-                for (int ni = 0; ni < NTL; ni++) {
-                    // (d, s) of the two activation rows this thread holds in column pair ni.
-                    const float4 sb = *reinterpret_cast<const float4*>(&b_sc[stage][sub][wn * TN + ni * 8 + 2 * t]);
+            for (int ni = 0; ni < NTL; ni++) {
+                // (d, s) of the two activation rows this thread holds in column pair ni.
+                const float4 sb = *reinterpret_cast<const float4*>(&bsc[sub * J + wn * TN + ni * 8 + 2 * t]);
 #pragma unroll
-                    for (int mi = 0; mi < MT; mi++) {
-                        if (T::SPLIT16) {
-                            int c0[4], c1[4];
-                            ares_mma_s8_k16(c0, a[mi][0], a[mi][1], b[ni][0]);
-                            ares_mma_s8_k16(c1, a[mi][2], a[mi][3], b[ni][1]);
+                for (int mi = 0; mi < MT; mi++) {
+                    if (T::SPLIT16) {
+                        int c0[4], c1[4];
+                        ares_mma_s8_k16(c0, a[mi][0], a[mi][1], b[ni][0]);
+                        ares_mma_s8_k16(c1, a[mi][2], a[mi][3], b[ni][1]);
 #pragma unroll
-                            for (int e = 0; e < 4; e++) {
-                                const int hi = e >> 1;
+                        for (int e = 0; e < 4; e++) {
+                            const int hi = e >> 1;
+                            const float dx = (e & 1) ? sb.z : sb.x;
+                            if (MAGIC) {
+                                const int total = s1[mi][hi] * c1[e] + (s0[mi][hi] * c0[e] + ARES_MM_MAGIC_BITS);
+                                const float u = fmaf(__int_as_float(total), sa[mi][hi].x, neg_m[mi][hi]);
+                                acc[mi][ni][e] = fmaf(u, dx, acc[mi][ni][e]);
+                            } else {
                                 const int total = s0[mi][hi] * c0[e] + s1[mi][hi] * c1[e];
-                                const float dx = (e & 1) ? sb.z : sb.x;
                                 acc[mi][ni][e] = fmaf(static_cast<float>(total), sa[mi][hi].x * dx, acc[mi][ni][e]);
                             }
-                        } else {
-                            int c[4];
-                            ares_mma_s8_k32(c, a[mi], b[ni][0], b[ni][1]);
+                        }
+                    } else {
+                        int c[4];
+                        ares_mma_s8_k32(c, a[mi], b[ni][0], b[ni][1], MAGIC ? ARES_MM_MAGIC_BITS : 0);
 #pragma unroll
-                            for (int e = 0; e < 4; e++) {
-                                const int hi = e >> 1;
-                                const float dx = (e & 1) ? sb.z : sb.x;
+                        for (int e = 0; e < 4; e++) {
+                            const int hi = e >> 1;
+                            const float dx = (e & 1) ? sb.z : sb.x;
+                            if (MAGIC) {
+                                const float u = fmaf(__int_as_float(c[e]), sa[mi][hi].x, neg_m[mi][hi]);
+                                acc[mi][ni][e] = fmaf(u, dx, acc[mi][ni][e]);
+                            } else {
                                 acc[mi][ni][e] = fmaf(static_cast<float>(c[e]), sa[mi][hi].x * dx, acc[mi][ni][e]);
-                                if (T::HAS_MIN) {
-                                    acc[mi][ni][e] = fmaf(-sa[mi][hi].y, (e & 1) ? sb.w : sb.y, acc[mi][ni][e]);
-                                }
+                            }
+                            if (T::HAS_MIN) {
+                                acc[mi][ni][e] = fmaf(-sa[mi][hi].y, (e & 1) ? sb.w : sb.y, acc[mi][ni][e]);
                             }
                         }
                     }
                 }
             }
-            if (chunk + 1 < n_chunks) {
-                store_weights(chunk + 1, stage ^ 1, raw[(slot + 1) % L]);
-            }
+        }
+        if (step + 1 < n_steps) {
+            store_weights(step + 1, stage ^ 1, raw);
         }
     }
 
@@ -504,18 +595,24 @@ static __device__ __forceinline__ void ares_mm_i8(
 // The tile of the weights holds `sw * code - mw` rounded to f16, the same
 // rounding the CPU emulation in the tests applies to `ares_quant::dequantize`,
 // and the products are summed in f32.
-template <class T, int I, int J, int WM, int WN, int L>
+template <class T, int I, int J, int WM, int WN, int KC>
 static __device__ __forceinline__ void ares_mm_f16(
     const uint8_t* __restrict__ w, const __half* __restrict__ ax, float* __restrict__ y,
-    uint32_t n_in, uint32_t n_out, uint32_t n_batch, uint32_t group) {
+    uint32_t n_in, uint32_t n_out, uint32_t n_batch, uint32_t group, uint32_t prefetch) {
+    using Lay = AresMmLayout<T, I, J, KC, 2>;
     constexpr int NT = WM * WN * 32;
     constexpr int TM = I / WM, TN = J / WN, MT = TM / 16, NTL = TN / 8;
-    constexpr int AITEMS = (2 * I + NT - 1) / NT;
-    static_assert(MT >= 1 && NTL >= 2 && NTL % 2 == 0, "warp tile");
+    constexpr int SUBS = Lay::SUBS, PITCH = Lay::PITCH;
+    constexpr int AITEMS = (I * SUBS + NT - 1) / NT;
+    constexpr int PB = KC / 8;
+    constexpr int BI = (J * PB + NT - 1) / NT;
+    static_assert(I % (16 * WM) == 0 && J % (16 * WN) == 0, "warp tile");
+    static_assert(KC % 64 == 0, "a step holds whole chunks of 64 values");
+    ares_check_smem(Lay::BYTES);
 
-    __shared__ __align__(16) uint8_t a_s[2][I * ARES_MM_PITCH16];
-    __shared__ __align__(16) uint8_t b_s[2][J * ARES_MM_PITCH16];
-    __shared__ __align__(16) uint8_t table[T::SMEM_BYTES > 0 ? T::SMEM_BYTES : 1];
+    uint8_t* const table = ares_dyn_smem + 2 * Lay::STAGE;
+    auto a_s = [&](int stage) { return ares_dyn_smem + stage * Lay::STAGE; };
+    auto b_s = [&](int stage) { return ares_dyn_smem + stage * Lay::STAGE + Lay::A_TILE; };
 
     const uint32_t tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const uint32_t wm = warp / WN, wn = warp % WN;
@@ -524,7 +621,7 @@ static __device__ __forceinline__ void ares_mm_f16(
     ares_mm_tile((n_out + I - 1) / I, (n_batch + J - 1) / J, group, wt, bt);
     const uint32_t row0 = wt * I, col0 = bt * J;
 
-    const uint32_t n_chunks = (n_in + ARES_MM_KC - 1) / ARES_MM_KC;
+    const uint32_t n_steps = (n_in + KC - 1) / KC;
     const size_t row_bytes = static_cast<size_t>(n_in / T::BLOCK_VALUES) * T::BLOCK_BYTES;
 
     if (T::SMEM_BYTES > 0) {
@@ -544,54 +641,76 @@ static __device__ __forceinline__ void ares_mm_f16(
         }
     }
 
-    typename T::Raw raw[L][AITEMS];
+    typename T::Raw raw[AITEMS];
 
     // Everything that does not change from step to step is computed once (see
     // ares_mm_i8).
     const uint8_t* w_row[AITEMS];
     uint32_t a_off[AITEMS];
+    uint32_t a_sub[AITEMS];
     bool a_on[AITEMS];
 #pragma unroll
     for (int u = 0; u < AITEMS; u++) {
         const uint32_t item = tid + u * NT;
-        const uint32_t r = item >> 1, h = item & 1;
-        a_on[u] = item < 2 * I;
+        const uint32_t r = item / SUBS, sub = item % SUBS;
+        a_on[u] = item < I * SUBS;
+        a_sub[u] = sub;
         w_row[u] = w + static_cast<size_t>(min(row0 + r, n_out - 1)) * row_bytes;
-        a_off[u] = r * ARES_MM_PITCH16 + 2 * h * T::ITEM_STRIDE;
+        a_off[u] = r * PITCH + 2 * ((sub >> 1) * 64 + (sub & 1) * T::ITEM_STRIDE);
     }
-    constexpr int BI = (8 * J + NT - 1) / NT;
     const __half* b_src[BI];
     uint32_t b_dst[BI];
+    uint32_t b_k[BI];
 #pragma unroll
     for (int u = 0; u < BI; u++) {
         const uint32_t item = tid + u * NT;
-        const uint32_t c = item >> 3, s = item & 7;
+        const uint32_t c = item / PB, s = item % PB;
         b_src[u] = ax + static_cast<size_t>(min(col0 + c, n_batch - 1)) * n_in + 8 * s;
-        b_dst[u] = c * ARES_MM_PITCH16 + 16 * s;
+        b_dst[u] = c * PITCH + 16 * s;
+        b_k[u] = 8 * s;
     }
-    const bool whole = (n_in & (ARES_MM_KC - 1)) == 0;
+    const bool whole = (n_in & (KC - 1)) == 0;
 
-    auto load_weights = [&](uint32_t chunk, typename T::Raw (&dst)[AITEMS]) {
+    auto load_weights = [&](uint32_t step, typename T::Raw (&dst)[AITEMS]) {
 #pragma unroll
         for (int u = 0; u < AITEMS; u++) {
-            const uint32_t h = (tid + u * NT) & 1;
-            if (a_on[u] && (whole || ARES_MM_KC * chunk + 32 * h < n_in)) {
-                dst[u] = T::load(w_row[u], chunk, h);
+            const uint32_t g32 = step * SUBS + a_sub[u];
+            if (a_on[u] && (whole || 32 * g32 < n_in)) {
+                dst[u] = T::load(w_row[u], g32 >> 1, g32 & 1);
+                if (prefetch != 0) {
+                    // Once per group of four steps and row, ask L2 for the bytes of the
+                    // next group: the loads of a step are 32 to 70 bytes of each row, which
+                    // GDDR6 serves badly; a request for the whole group makes it read lines.
+                    const uint32_t chunk = g32 >> 1;
+                    const uint32_t ahead = 64 * (chunk + 4);
+                    if ((chunk & 3) == 0 && ahead < n_in) {
+                        const uint8_t* start = w_row[u] + static_cast<size_t>(ahead / T::BLOCK_VALUES) * T::BLOCK_BYTES;
+                        constexpr int GROUP_BYTES = 256 / T::BLOCK_VALUES * T::BLOCK_BYTES;
+                        // The two threads of a row share the lines: first, middle and last.
+                        if ((g32 & 1) == 0) {
+                            ares_prefetch_l2(start);
+                            if (GROUP_BYTES > 128) {
+                                ares_prefetch_l2(start + GROUP_BYTES - 1);
+                            }
+                        } else if (GROUP_BYTES > 128) {
+                            ares_prefetch_l2(start + 128);
+                        }
+                    }
+                }
             }
         }
     };
     // A code as f32: the byte is placed in the mantissa of 2^23 (unsigned) or
     // 1.5 * 2^23 (signed), which makes the exact integer, and the offset comes
-    // off again. No integer-to-float conversion is needed, which runs at a
-    // quarter of the rate of the other floating-point instructions.
-    auto store_weights = [&](uint32_t chunk, int stage, const typename T::Raw (&src)[AITEMS]) {
+    // off again. No integer-to-float conversion is needed.
+    auto store_weights = [&](uint32_t step, int stage, const typename T::Raw (&src)[AITEMS]) {
 #pragma unroll
         for (int u = 0; u < AITEMS; u++) {
-            const uint32_t h = (tid + u * NT) & 1;
+            const uint32_t g32 = step * SUBS + a_sub[u];
             if (a_on[u]) {
-                EngMmDec dec;
-                if (whole || ARES_MM_KC * chunk + 32 * h < n_in) {
-                    T::decode(src[u], chunk, h, table, dec);
+                AresMmDec dec;
+                if (whole || 32 * g32 < n_in) {
+                    T::decode(src[u], g32 >> 1, g32 & 1, table, dec);
                 } else {
 #pragma unroll
                     for (int i = 0; i < 8; i++) {
@@ -599,7 +718,7 @@ static __device__ __forceinline__ void ares_mm_f16(
                     }
                     dec.sw[0] = dec.sw[1] = dec.mw[0] = dec.mw[1] = 0.0f;
                 }
-                uint8_t* tile = &a_s[stage][0] + a_off[u];
+                uint8_t* tile = a_s(stage) + a_off[u];
 #pragma unroll
                 for (int run = 0; run < 2; run++) {
                     uint8_t* dst = tile + 2 * run * T::RUN_STRIDE;
@@ -632,75 +751,61 @@ static __device__ __forceinline__ void ares_mm_f16(
             }
         }
     };
-    // 64 f16 values per row in 8 pieces of 16 bytes.
-    auto load_acts = [&](uint32_t chunk, int stage) {
+    // KC f16 values per row in pieces of 16 bytes.
+    auto load_acts = [&](uint32_t step, int stage) {
 #pragma unroll
         for (int u = 0; u < BI; u++) {
-            const uint32_t item = tid + u * NT;
-            if (item < 8 * J) {
-                const bool on = whole || ARES_MM_KC * chunk + 8 * (item & 7) < n_in;
-                ares_cp_async16(&b_s[stage][0] + b_dst[u], b_src[u] + ARES_MM_KC * chunk, on ? 16u : 0u);
+            if (tid + u * NT < J * PB) {
+                const bool on = whole || KC * step + b_k[u] < n_in;
+                ares_cp_async16(b_s(stage) + b_dst[u], b_src[u] + KC * step, on ? 16u : 0u);
             }
         }
     };
 
     load_acts(0, 0);
     ares_cp_commit();
-#pragma unroll
-    for (int k = 0; k < L; k++) {
-        if (k < static_cast<int>(n_chunks)) {
-            load_weights(k, raw[k]);
+    load_weights(0, raw);
+    store_weights(0, 0, raw);
+
+    for (uint32_t step = 0; step < n_steps; step++) {
+        const int stage = step & 1;
+        ares_cp_wait_all();
+        __syncthreads();
+        if (step + 1 < n_steps) {
+            load_acts(step + 1, stage ^ 1);
+            load_weights(step + 1, raw);
         }
-    }
-    store_weights(0, 0, raw[0]);
+        ares_cp_commit();
 
-    // Unrolled by L so that the ring of raw loads is indexed by constants.
-    for (uint32_t base = 0; base < n_chunks; base += L) {
+        const uint8_t* const a_base = a_s(stage);
+        const uint8_t* const b_base = b_s(stage);
 #pragma unroll
-        for (int slot = 0; slot < L; slot++) {
-            const uint32_t chunk = base + slot;
-            if (chunk >= n_chunks) {
-                break;
-            }
-            const int stage = chunk & 1;
-            ares_cp_wait_all();
-            __syncthreads();
-            if (chunk + 1 < n_chunks) {
-                load_acts(chunk + 1, stage ^ 1);
-            }
-            if (chunk + L < n_chunks) {
-                load_weights(chunk + L, raw[slot]);
-            }
-            ares_cp_commit();
-
+        for (int kk = 0; kk < KC / 16; kk++) {
+            uint32_t a[MT][4];
 #pragma unroll
-            for (int kk = 0; kk < 4; kk++) {
-                uint32_t a[MT][4];
+            for (int mi = 0; mi < MT; mi++) {
+                ares_ldmatrix_x4(a[mi], a_base + (wm * TM + mi * 16 + (lane & 7) + ((lane >> 3) & 1) * 8) * PITCH + kk * 32 + (lane >> 4) * 16);
+            }
+            uint32_t b[NTL][2];
+#pragma unroll
+            for (int nj = 0; nj < NTL / 2; nj++) {
+                uint32_t r4[4];
+                ares_ldmatrix_x4(r4, b_base + (wn * TN + nj * 16 + (lane & 7) + ((lane >> 4) & 1) * 8) * PITCH + kk * 32 + ((lane >> 3) & 1) * 16);
+                b[2 * nj][0] = r4[0];
+                b[2 * nj][1] = r4[1];
+                b[2 * nj + 1][0] = r4[2];
+                b[2 * nj + 1][1] = r4[3];
+            }
+#pragma unroll
+            for (int ni = 0; ni < NTL; ni++) {
 #pragma unroll
                 for (int mi = 0; mi < MT; mi++) {
-                    ares_ldmatrix_x4(a[mi], &a_s[stage][(wm * TM + mi * 16 + (lane & 7) + ((lane >> 3) & 1) * 8) * ARES_MM_PITCH16 + kk * 32 + (lane >> 4) * 16]);
-                }
-                uint32_t b[NTL][2];
-#pragma unroll
-                for (int nj = 0; nj < NTL / 2; nj++) {
-                    uint32_t r4[4];
-                    ares_ldmatrix_x4(r4, &b_s[stage][(wn * TN + nj * 16 + (lane & 7) + ((lane >> 4) & 1) * 8) * ARES_MM_PITCH16 + kk * 32 + ((lane >> 3) & 1) * 16]);
-                    b[2 * nj][0] = r4[0];
-                    b[2 * nj][1] = r4[1];
-                    b[2 * nj + 1][0] = r4[2];
-                    b[2 * nj + 1][1] = r4[3];
-                }
-#pragma unroll
-                for (int ni = 0; ni < NTL; ni++) {
-#pragma unroll
-                    for (int mi = 0; mi < MT; mi++) {
-                        ares_mma_f16_k16(acc[mi][ni], a[mi], b[ni][0], b[ni][1]);
-                    }
+                    ares_mma_f16_k16(acc[mi][ni], a[mi], b[ni][0], b[ni][1]);
                 }
             }
-            if (chunk + 1 < n_chunks) {
-                store_weights(chunk + 1, stage ^ 1, raw[(slot + 1) % L]);
-            }
+        }
+        if (step + 1 < n_steps) {
+            store_weights(step + 1, stage ^ 1, raw);
         }
     }
 
@@ -720,34 +825,11 @@ static __device__ __forceinline__ void ares_mm_f16(
     }
 }
 
-// The tile shapes of the kernels of every type, found by measurement on an RTX
-// 4070 and an RTX 3060 (examples/prefill_bench.rs and a harness that swept
-// tile, warp layout, lookahead and blocks per SM): a "large" shape for more
-// than 32 activation rows and a "small" one for up to 32. All use less than
-// 48 KB of shared memory and fit 2 to 4 blocks on an SM.
-//
-//   shape                 I (weight rows)  J (activation rows)  warps  lookahead
-//   int8 large            128              64                   4 x 2  1
-//   int8 small            64               16                   4 x 1  3
-//   f16 large             64               64                   2 x 2  1
-//   f16 small             32               32                   1 x 2  3
-#define ARES_MM_I8_THREADS 256
-#define ARES_MM_I8S_THREADS 128
-#define ARES_MM_F16_THREADS 128
-#define ARES_MM_F16S_THREADS 64
-
-#define ARES_MM_KERNEL(NAME, THREADS, BLOCKS, VARIANT, T, I, J, WM, WN, L, ACT)                  \
+// One kernel of a type and a shape. `THREADS` and `BLOCKS` (blocks per SM) go
+// to `__launch_bounds__`; the shapes are in prefill.cu.
+#define ARES_MM_KERNEL(NAME, THREADS, BLOCKS, VARIANT, T, I, J, WM, WN, KC, ACT)                \
     extern "C" __global__ void __launch_bounds__(THREADS, BLOCKS) NAME(                         \
         const uint8_t* w, const ACT* act, float* y, uint32_t n_in, uint32_t n_out,              \
-        uint32_t n_batch, uint32_t group) {                                                      \
-        VARIANT<T, I, J, WM, WN, L>(w, act, y, n_in, n_out, n_batch, group);                    \
+        uint32_t n_batch, uint32_t group, uint32_t prefetch) {                                   \
+        VARIANT<T, I, J, WM, WN, KC>(w, act, y, n_in, n_out, n_batch, group, prefetch);         \
     }
-
-#define ARES_MM_I8_KERNEL(NAME, T) \
-    ARES_MM_KERNEL(NAME, ARES_MM_I8_THREADS, 2, ares_mm_i8, T, 128, 64, 4, 2, 1, int8_t)
-#define ARES_MM_I8S_KERNEL(NAME, T) \
-    ARES_MM_KERNEL(NAME, ARES_MM_I8S_THREADS, 3, ares_mm_i8, T, 64, 16, 4, 1, 3, int8_t)
-#define ARES_MM_F16_KERNEL(NAME, T) \
-    ARES_MM_KERNEL(NAME, ARES_MM_F16_THREADS, 2, ares_mm_f16, T, 64, 64, 2, 2, 1, __half)
-#define ARES_MM_F16S_KERNEL(NAME, T) \
-    ARES_MM_KERNEL(NAME, ARES_MM_F16S_THREADS, 4, ares_mm_f16, T, 32, 32, 1, 2, 3, __half)

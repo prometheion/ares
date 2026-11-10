@@ -15,20 +15,20 @@
 #include "mm.cuh"
 #include "mmvq_iquants.cuh"
 
-// Scale and minimum of sub-block s (0..7) of a Q4_K or Q5_K block, from the
-// 12 bytes of packed 6-bit values that sit in the words y, z, w of the header.
-static __device__ __forceinline__ void ares_mm_scale_min_k4(const uint4& hdr, uint32_t s, uint32_t& scale, uint32_t& minimum) {
-    auto byte = [&](uint32_t i) {
-        const uint32_t word = (i >> 2) == 0 ? hdr.y : ((i >> 2) == 1 ? hdr.z : hdr.w);
-        return (word >> (8 * (i & 3))) & 0xFF;
-    };
-    if (s < 4) {
-        scale = byte(s) & 63;
-        minimum = byte(s + 4) & 63;
-    } else {
-        scale = (byte(s + 4) & 0xF) | ((byte(s - 4) >> 6) << 4);
-        minimum = (byte(s + 4) >> 4) | ((byte(s) >> 6) << 4);
-    }
+// The eight 6-bit scales and the eight minimums of a Q4_K or Q5_K block, one per
+// byte, from the 12 packed bytes in the words y, z, w of the header: scales of
+// sub-blocks 0..3 and 4..7 in sc[0] and sc[1], minimums in mn[0] and mn[1]. About
+// ten instructions for all of them, without a branch.
+static __device__ __forceinline__ void ares_mm_scales_k4(const uint4& hdr, uint32_t (&sc)[2], uint32_t (&mn)[2]) {
+    sc[0] = hdr.y & 0x3F3F3F3Fu;
+    mn[0] = hdr.z & 0x3F3F3F3Fu;
+    sc[1] = (hdr.w & 0x0F0F0F0Fu) | (((hdr.y >> 6) & 0x03030303u) << 4);
+    mn[1] = ((hdr.w >> 4) & 0x0F0F0F0Fu) | (((hdr.z >> 6) & 0x03030303u) << 4);
+}
+
+// Byte s (0..7) of two words.
+static __device__ __forceinline__ uint32_t ares_mm_byte8(const uint32_t (&v)[2], uint32_t s) {
+    return ((s & 4) != 0 ? v[1] : v[0]) >> (8 * (s & 3)) & 0xFF;
 }
 
 static __device__ __forceinline__ float ares_mm_f16_of(uint32_t bits) {
@@ -46,6 +46,9 @@ struct EngMmQ4K {
     static constexpr bool HAS_MIN = true;
     static constexpr bool SPLIT16 = false;
     static constexpr bool SIGNED_CODES = false;
+    // The integer sum of an item stays below 2^22 in magnitude (sum of 32 products of a code (0..15) and an activation (127): 60 960), or not:
+    // whether the scaling may use the mantissa trick (mm.cuh).
+    static constexpr bool MAGIC = true;
     static constexpr int ITEM_STRIDE = 16;
     static constexpr int RUN_STRIDE = 32;
     static __device__ __forceinline__ void init(uint8_t*, uint32_t, uint32_t) {}
@@ -63,7 +66,7 @@ struct EngMmQ4K {
         return r;
     }
 
-    static __device__ __forceinline__ void decode(const Raw& r, uint32_t chunk, uint32_t item, const uint8_t*, EngMmDec& o) {
+    static __device__ __forceinline__ void decode(const Raw& r, uint32_t chunk, uint32_t item, const uint8_t*, AresMmDec& o) {
         o.w[0] = r.qs.x & 0x0F0F0F0Fu;
         o.w[1] = r.qs.y & 0x0F0F0F0Fu;
         o.w[2] = r.qs.z & 0x0F0F0F0Fu;
@@ -75,16 +78,15 @@ struct EngMmQ4K {
         const float d = ares_mm_f16_of(r.hdr.x);
         const float dmin = ares_mm_f16_of(r.hdr.x >> 16);
         const uint32_t s = 2 * (chunk & 3);
-        uint32_t sc, mn;
+        uint32_t sc[2], mn[2];
+        ares_mm_scales_k4(r.hdr, sc, mn);
         // The scale entry is that of the item's own sub-block ...
-        ares_mm_scale_min_k4(r.hdr, s + item, sc, mn);
-        o.ent = make_float2(d * static_cast<float>(sc), dmin * static_cast<float>(mn));
+        o.ent = make_float2(d * static_cast<float>(ares_mm_byte8(sc, s + item)), dmin * static_cast<float>(ares_mm_byte8(mn, s + item)));
         // ... the f16 tile needs the scales of both runs.
 #pragma unroll
         for (int run = 0; run < 2; run++) {
-            ares_mm_scale_min_k4(r.hdr, s + run, sc, mn);
-            o.sw[run] = d * static_cast<float>(sc);
-            o.mw[run] = dmin * static_cast<float>(mn);
+            o.sw[run] = d * static_cast<float>(ares_mm_byte8(sc, s + run));
+            o.mw[run] = dmin * static_cast<float>(ares_mm_byte8(mn, s + run));
         }
     }
 };
@@ -98,6 +100,9 @@ struct EngMmQ5K {
     static constexpr bool HAS_MIN = true;
     static constexpr bool SPLIT16 = false;
     static constexpr bool SIGNED_CODES = false;
+    // The integer sum of an item stays below 2^22 in magnitude (codes 0..31: 125 984), or not:
+    // whether the scaling may use the mantissa trick (mm.cuh).
+    static constexpr bool MAGIC = true;
     static constexpr int ITEM_STRIDE = 16;
     static constexpr int RUN_STRIDE = 32;
     static __device__ __forceinline__ void init(uint8_t*, uint32_t, uint32_t) {}
@@ -115,7 +120,7 @@ struct EngMmQ5K {
         return r;
     }
 
-    static __device__ __forceinline__ void decode(const Raw& r, uint32_t chunk, uint32_t item, const uint8_t*, EngMmDec& o) {
+    static __device__ __forceinline__ void decode(const Raw& r, uint32_t chunk, uint32_t item, const uint8_t*, AresMmDec& o) {
         const uint32_t j = chunk & 3;
         const uint32_t qs[4] = {r.qs.x, r.qs.y, r.qs.z, r.qs.w};
         const uint32_t qh[4] = {r.qh.x, r.qh.y, r.qh.z, r.qh.w};
@@ -127,14 +132,13 @@ struct EngMmQ5K {
         const float d = ares_mm_f16_of(r.hdr.x);
         const float dmin = ares_mm_f16_of(r.hdr.x >> 16);
         const uint32_t s = 2 * j;
-        uint32_t sc, mn;
-        ares_mm_scale_min_k4(r.hdr, s + item, sc, mn);
-        o.ent = make_float2(d * static_cast<float>(sc), dmin * static_cast<float>(mn));
+        uint32_t sc[2], mn[2];
+        ares_mm_scales_k4(r.hdr, sc, mn);
+        o.ent = make_float2(d * static_cast<float>(ares_mm_byte8(sc, s + item)), dmin * static_cast<float>(ares_mm_byte8(mn, s + item)));
 #pragma unroll
         for (int run = 0; run < 2; run++) {
-            ares_mm_scale_min_k4(r.hdr, s + run, sc, mn);
-            o.sw[run] = d * static_cast<float>(sc);
-            o.mw[run] = dmin * static_cast<float>(mn);
+            o.sw[run] = d * static_cast<float>(ares_mm_byte8(sc, s + run));
+            o.mw[run] = dmin * static_cast<float>(ares_mm_byte8(mn, s + run));
         }
     }
 };
@@ -150,6 +154,9 @@ struct EngMmQ6K {
     static constexpr bool HAS_MIN = false;
     static constexpr bool SPLIT16 = true;
     static constexpr bool SIGNED_CODES = true;
+    // The integer sum of an item stays below 2^22 in magnitude (scales up to 128 times 16 products of 32 and 127 per half: 8.3 million, past 2^22), or not:
+    // whether the scaling may use the mantissa trick (mm.cuh).
+    static constexpr bool MAGIC = false;
     static constexpr int ITEM_STRIDE = 32;
     static constexpr int RUN_STRIDE = 16;
     static __device__ __forceinline__ void init(uint8_t*, uint32_t, uint32_t) {}
@@ -171,7 +178,7 @@ struct EngMmQ6K {
         return r;
     }
 
-    static __device__ __forceinline__ void decode(const Raw& r, uint32_t chunk, uint32_t item, const uint8_t*, EngMmDec& o) {
+    static __device__ __forceinline__ void decode(const Raw& r, uint32_t chunk, uint32_t item, const uint8_t*, AresMmDec& o) {
         const uint32_t k = 2 * (chunk & 1) + item;
 #pragma unroll
         for (int i = 0; i < 8; i++) {
@@ -198,6 +205,9 @@ struct EngMmQ3K {
     static constexpr bool HAS_MIN = false;
     static constexpr bool SPLIT16 = true;
     static constexpr bool SIGNED_CODES = true;
+    // The integer sum of an item stays below 2^22 in magnitude (scales up to 32 times 16 products of 4 and 127 per half, two halves: 520 192), or not:
+    // whether the scaling may use the mantissa trick (mm.cuh).
+    static constexpr bool MAGIC = true;
     static constexpr int ITEM_STRIDE = 32;
     static constexpr int RUN_STRIDE = 16;
     static __device__ __forceinline__ void init(uint8_t*, uint32_t, uint32_t) {}
@@ -219,7 +229,7 @@ struct EngMmQ3K {
         return r;
     }
 
-    static __device__ __forceinline__ void decode(const Raw& r, uint32_t chunk, uint32_t item, const uint8_t*, EngMmDec& o) {
+    static __device__ __forceinline__ void decode(const Raw& r, uint32_t chunk, uint32_t item, const uint8_t*, AresMmDec& o) {
         const uint32_t hh = (chunk >> 1) & 1;
         const uint32_t k = 2 * (chunk & 1) + item;
 #pragma unroll
@@ -254,6 +264,9 @@ struct EngMmIQ4XS {
     static constexpr bool HAS_MIN = false;
     static constexpr bool SPLIT16 = false;
     static constexpr bool SIGNED_CODES = true;
+    // The integer sum of an item stays below 2^22 in magnitude (table values up to 127: 516 128), or not:
+    // whether the scaling may use the mantissa trick (mm.cuh).
+    static constexpr bool MAGIC = true;
     static constexpr int ITEM_STRIDE = 32;
     static constexpr int RUN_STRIDE = 16;
     static __device__ __forceinline__ void init(uint8_t*, uint32_t, uint32_t) {}
@@ -272,7 +285,7 @@ struct EngMmIQ4XS {
         return r;
     }
 
-    static __device__ __forceinline__ void decode(const Raw& r, uint32_t chunk, uint32_t item, const uint8_t*, EngMmDec& o) {
+    static __device__ __forceinline__ void decode(const Raw& r, uint32_t chunk, uint32_t item, const uint8_t*, AresMmDec& o) {
         const uint32_t ib = 2 * (chunk & 3) + item;
         const uint32_t qw[4] = {r.q01.x, r.q01.y, r.q23.x, r.q23.y};
 #pragma unroll
@@ -297,6 +310,9 @@ struct EngMmIQ4NL {
     static constexpr bool HAS_MIN = false;
     static constexpr bool SPLIT16 = false;
     static constexpr bool SIGNED_CODES = true;
+    // The integer sum of an item stays below 2^22 in magnitude (table values up to 127: 516 128), or not:
+    // whether the scaling may use the mantissa trick (mm.cuh).
+    static constexpr bool MAGIC = true;
     static constexpr int ITEM_STRIDE = 32;
     static constexpr int RUN_STRIDE = 16;
     static __device__ __forceinline__ void init(uint8_t*, uint32_t, uint32_t) {}
@@ -314,7 +330,7 @@ struct EngMmIQ4NL {
         return r;
     }
 
-    static __device__ __forceinline__ void decode(const Raw& r, uint32_t, uint32_t, const uint8_t*, EngMmDec& o) {
+    static __device__ __forceinline__ void decode(const Raw& r, uint32_t, uint32_t, const uint8_t*, AresMmDec& o) {
 #pragma unroll
         for (int i = 0; i < 4; i++) {
             const int2 v = ares_table16(r.q[i]);
@@ -335,6 +351,9 @@ struct EngMmQ80 {
     static constexpr bool HAS_MIN = false;
     static constexpr bool SPLIT16 = false;
     static constexpr bool SIGNED_CODES = true;
+    // The integer sum of an item stays below 2^22 in magnitude (codes down to -128: 520 192), or not:
+    // whether the scaling may use the mantissa trick (mm.cuh).
+    static constexpr bool MAGIC = true;
     static constexpr int ITEM_STRIDE = 32;
     static constexpr int RUN_STRIDE = 16;
     static __device__ __forceinline__ void init(uint8_t*, uint32_t, uint32_t) {}
@@ -352,7 +371,7 @@ struct EngMmQ80 {
         return r;
     }
 
-    static __device__ __forceinline__ void decode(const Raw& r, uint32_t, uint32_t, const uint8_t*, EngMmDec& o) {
+    static __device__ __forceinline__ void decode(const Raw& r, uint32_t, uint32_t, const uint8_t*, AresMmDec& o) {
 #pragma unroll
         for (int i = 0; i < 8; i++) {
             o.w[i] = r.q[i];
@@ -375,6 +394,9 @@ struct EngMmIQ3XXS {
     static constexpr bool HAS_MIN = false;
     static constexpr bool SPLIT16 = false;
     static constexpr bool SIGNED_CODES = true;
+    // The integer sum of an item stays below 2^22 in magnitude (grid magnitudes up to 62: 251 968), or not:
+    // whether the scaling may use the mantissa trick (mm.cuh).
+    static constexpr bool MAGIC = true;
     static constexpr int ITEM_STRIDE = 32;
     static constexpr int RUN_STRIDE = 16;
     static __device__ __forceinline__ void init(uint8_t* smem, uint32_t t, uint32_t n) {
@@ -396,7 +418,7 @@ struct EngMmIQ3XXS {
         return r;
     }
 
-    static __device__ __forceinline__ void decode(const Raw& r, uint32_t, uint32_t, const uint8_t* smem, EngMmDec& o) {
+    static __device__ __forceinline__ void decode(const Raw& r, uint32_t, uint32_t, const uint8_t* smem, AresMmDec& o) {
         const uint32_t* grid = reinterpret_cast<const uint32_t*>(smem);
 #pragma unroll
         for (int l = 0; l < 4; l++) {
@@ -422,6 +444,9 @@ struct EngMmIQ3S {
     static constexpr bool HAS_MIN = false;
     static constexpr bool SPLIT16 = false;
     static constexpr bool SIGNED_CODES = true;
+    // The integer sum of an item stays below 2^22 in magnitude (grid magnitudes up to 15: 60 960), or not:
+    // whether the scaling may use the mantissa trick (mm.cuh).
+    static constexpr bool MAGIC = true;
     static constexpr int ITEM_STRIDE = 32;
     static constexpr int RUN_STRIDE = 16;
     static __device__ __forceinline__ void init(uint8_t* smem, uint32_t t, uint32_t n) {
@@ -445,7 +470,7 @@ struct EngMmIQ3S {
         return r;
     }
 
-    static __device__ __forceinline__ void decode(const Raw& r, uint32_t chunk, uint32_t item, const uint8_t* smem, EngMmDec& o) {
+    static __device__ __forceinline__ void decode(const Raw& r, uint32_t chunk, uint32_t item, const uint8_t* smem, AresMmDec& o) {
         const uint32_t ib = 2 * (chunk & 3) + item;
         const uint32_t* grid = reinterpret_cast<const uint32_t*>(smem);
 #pragma unroll
@@ -472,6 +497,9 @@ struct EngMmIQ2XS {
     static constexpr bool HAS_MIN = false;
     static constexpr bool SPLIT16 = true;
     static constexpr bool SIGNED_CODES = true;
+    // The integer sum of an item stays below 2^22 in magnitude (scales up to 31 times 16 products of 43 and 127 per half, two halves: 5.4 million, past 2^22), or not:
+    // whether the scaling may use the mantissa trick (mm.cuh).
+    static constexpr bool MAGIC = false;
     static constexpr int ITEM_STRIDE = 32;
     static constexpr int RUN_STRIDE = 16;
     static __device__ __forceinline__ void init(uint8_t* smem, uint32_t t, uint32_t n) {
@@ -493,7 +521,7 @@ struct EngMmIQ2XS {
         return r;
     }
 
-    static __device__ __forceinline__ void decode(const Raw& r, uint32_t, uint32_t, const uint8_t* smem, EngMmDec& o) {
+    static __device__ __forceinline__ void decode(const Raw& r, uint32_t, uint32_t, const uint8_t* smem, AresMmDec& o) {
         const uint2* grid = reinterpret_cast<const uint2*>(smem);
 #pragma unroll
         for (int l = 0; l < 4; l++) {
@@ -508,7 +536,7 @@ struct EngMmIQ2XS {
     }
 
     // (0.5 + scale) * 0.25 = (2 scale + 1) / 8
-    static __device__ __forceinline__ void finish(const Raw& r, EngMmDec& o) {
+    static __device__ __forceinline__ void finish(const Raw& r, AresMmDec& o) {
         const int s0 = static_cast<int>(2 * (r.sc & 0xF) + 1);
         const int s1 = static_cast<int>(2 * (r.sc >> 4) + 1);
         const float d = 0.125f * ares_mm_f16_of(r.d);
@@ -526,6 +554,9 @@ struct EngMmIQ2S {
     static constexpr bool HAS_MIN = false;
     static constexpr bool SPLIT16 = true;
     static constexpr bool SIGNED_CODES = true;
+    // The integer sum of an item stays below 2^22 in magnitude (as IQ2_XS), or not:
+    // whether the scaling may use the mantissa trick (mm.cuh).
+    static constexpr bool MAGIC = false;
     static constexpr int ITEM_STRIDE = 32;
     static constexpr int RUN_STRIDE = 16;
     static __device__ __forceinline__ void init(uint8_t* smem, uint32_t t, uint32_t n) {
@@ -548,7 +579,7 @@ struct EngMmIQ2S {
         return r;
     }
 
-    static __device__ __forceinline__ void decode(const Raw& r, uint32_t, uint32_t, const uint8_t* smem, EngMmDec& o) {
+    static __device__ __forceinline__ void decode(const Raw& r, uint32_t, uint32_t, const uint8_t* smem, AresMmDec& o) {
         const uint2* grid = reinterpret_cast<const uint2*>(smem);
 #pragma unroll
         for (int l = 0; l < 4; l++) {

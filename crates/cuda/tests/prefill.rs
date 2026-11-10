@@ -386,6 +386,58 @@ fn prefill_matmul_computes_the_emulated_product_on_every_type() {
     }
 }
 
+/// The edges of every shape: the numbers of activation rows around each limit
+/// where the choice of shape changes (32, 64) and around the tiles of the shapes
+/// (32, 64 and 128 columns of the output), and the numbers of weight rows around
+/// the tiles (64 and 128), each on its own and crossing the other. Partial tiles in
+/// both dimensions, for both paths and every type.
+#[test]
+fn prefill_matmul_is_right_around_every_shape_boundary() {
+    let Some(gpus) = gpus() else { return };
+    let mut rng = Rng(0x5851f42d4c957f2d);
+    for device in gpus {
+        let kernels = Kernels::load(device).unwrap();
+        if !kernels.has_prefill_kernels() {
+            continue;
+        }
+        for (ty, _) in TYPES {
+            let bv = ty.block_values() as usize;
+            let n_in = 512usize;
+            let mut cases: Vec<(usize, usize)> = [
+                1usize, 2, 15, 16, 17, 31, 32, 33, 47, 63, 64, 65, 96, 127, 128, 129, 130, 191,
+                255, 257,
+            ]
+            .iter()
+            .map(|rows| (130usize, *rows))
+            .collect();
+            for n_out in [1usize, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129, 191, 192, 193, 257] {
+                for rows in [5usize, 40, 100] {
+                    cases.push((n_out, rows));
+                }
+            }
+            let w = random_blocks(&mut rng, ty, n_in / bv * 257);
+            let x_all: Vec<f32> = (0..n_in * 257).map(|_| rng.activation()).collect();
+            for (n_out, n_rows) in cases {
+                let w = &w[..n_in / bv * n_out * ty.block_bytes() as usize];
+                let x = &x_all[..n_in * n_rows];
+                for path in PATHS {
+                    let have = run_matmul(device, &kernels, ty, path, w, x, n_in, n_out, n_rows);
+                    let dev = deviation(path, ty, w, x, &have, n_in, n_out, n_rows);
+                    assert_within(
+                        path,
+                        &format!(
+                            "{ty} {n_out}x{n_in} x{n_rows} {path:?} on {}",
+                            device.info().name
+                        ),
+                        &dev,
+                        n_out * n_rows >= 16,
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// The same on real tensors: the smallest 2-D matrix of each type in the model,
 /// its first 200 rows, with activations of a normal distribution and a batch
 /// that fills no tile.
@@ -525,9 +577,10 @@ fn the_int8_path_agrees_with_the_decode_kernels() {
 }
 
 /// A row of the result does not depend on the other rows of the batch, or on
-/// where in the grid it is computed: row `b` of a batch of 130 equals the same
-/// row alone, for both paths. (The sums of an output are formed in the same
-/// order whatever the shape.)
+/// where in the grid it is computed, or on which shape computes it: rows 0 to 19
+/// of a batch of 130 (the large shape), of 40 (medium) and of 20 (small) are the
+/// same bits, and so are single rows, for both paths. (The sums of an output are
+/// formed in the same order whatever the shape.)
 #[test]
 fn a_row_gives_the_same_result_alone_and_in_a_batch() {
     let Some(gpus) = gpus() else { return };
@@ -544,7 +597,25 @@ fn a_row_gives_the_same_result_alone_and_in_a_batch() {
             let x: Vec<f32> = (0..n_in * n_rows).map(|_| rng.activation()).collect();
             for path in PATHS {
                 let batch = run_matmul(device, &kernels, ty, path, &w, &x, n_in, n_out, n_rows);
-                for b in [0usize, 63, 64, 129] {
+                for rows in [40usize, 20] {
+                    let part = run_matmul(
+                        device,
+                        &kernels,
+                        ty,
+                        path,
+                        &w,
+                        &x[..rows * n_in],
+                        n_in,
+                        n_out,
+                        rows,
+                    );
+                    assert_eq!(
+                        &batch[..rows * n_out],
+                        &part[..],
+                        "{ty} {path:?}, first {rows} rows of 130"
+                    );
+                }
+                for b in [0usize, 31, 32, 63, 64, 129] {
                     let alone = run_matmul(
                         device,
                         &kernels,
@@ -562,6 +633,33 @@ fn a_row_gives_the_same_result_alone_and_in_a_batch() {
                         "{ty} {path:?}, batch row {b}"
                     );
                 }
+            }
+        }
+    }
+}
+
+/// The shapes are described as they sit on the device: every one holds at least a
+/// block of an SM, the shared memory fits the opt-in limit, and the rows they take
+/// grow from the small shape to the large.
+#[test]
+fn the_shapes_fit_the_device() {
+    let Some(gpus) = gpus() else { return };
+    for device in gpus {
+        let kernels = Kernels::load(device).unwrap();
+        if !kernels.has_prefill_kernels() {
+            continue;
+        }
+        for (ty, _) in TYPES {
+            for path in PATHS {
+                let shapes = kernels.prefill_shapes(ty, path).unwrap();
+                assert_eq!(shapes.len(), 3);
+                for shape in &shapes {
+                    assert!(shape.blocks_per_sm >= 1, "{ty} {path:?} {shape:?}");
+                    assert!(shape.shared_bytes <= device.info().max_shared_per_block_optin);
+                    assert!(shape.registers * shape.threads <= 65536, "{ty} {path:?} {shape:?}");
+                }
+                assert!(shapes[0].up_to_rows > shapes[1].up_to_rows);
+                assert!(shapes[1].up_to_rows > shapes[2].up_to_rows);
             }
         }
     }
