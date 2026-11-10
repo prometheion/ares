@@ -26,6 +26,12 @@ Scope decisions:
   A GPU that cannot run the current kernels is not supported, and a model
   architecture is removed when it is superseded.
 
+- **Every GGUF weight type.** A model file may carry any of the 28 types
+  that hold weights (the float types, the legacy and K quantizations, the
+  i-quants, the ternary and 1-bit types, the 4-bit float types), and each has
+  its kernels on both backends. The eleven types of Qwen3.8-27B came first
+  because that file was the reference; the others are being added.
+
 - **No engine is the model for this one.** llama.cpp, vLLM, SGLang, Strata
   and the others are references, each for what it does best, and a design is
   taken from whichever has the better one. Two things are fixed points and
