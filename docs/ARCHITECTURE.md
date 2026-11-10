@@ -80,14 +80,27 @@ machine (RTX 4070 + RTX 3060, Qwen3.8-27B) or read from the engines listed in
    table. There is no snapshot and restore of recurrent state per step.
 6. **Sample on the device.** Logits stay on the GPU; penalties, top-k, top-p,
    min-p and the pick run there. The random number for a position comes from a
-   counter-based generator keyed by (seed, position), so verifying a draft is
-   an exact comparison with what plain decoding would have produced, and
-   results do not depend on batch composition.
+   counter-based generator keyed by (seed, position), so the randomness of a
+   pick does not depend on what else is in the step, and verifying a draft
+   compares it with the pick the model makes for that position.
 7. **One thread decides.** All bookkeeping (pages, plans, expert tiers) is
    plain data owned by the step loop, with no locks. Other threads do work
    that waits: one per device to enqueue, a pool for file I/O, the HTTP
    runtime. This is the answer to "actually good multithreading": threads
    never contend for the engine's state because only one of them owns it.
+8. **Quality is held, agreement is not.** The engine does not reproduce
+   llama.cpp's numbers, and its own kernels need not agree with each other
+   to the last bit: a step of three rows and a step of three thousand use
+   different kernels, a capped GeForce card accumulates differently from an
+   uncapped one, and where a different arithmetic is faster it is taken.
+   What every kernel is held to is its error against the exact arithmetic of
+   the model, measured and written down next to its speed, and that error
+   must not be worse than what the engines it replaces have (about 1 % rms
+   per product from 8-bit activations in llama.cpp's quantized kernels).
+   Output is therefore not guaranteed to be identical between runs that
+   batch differently, as it is not in the engines this one learns from. The
+   CPU references in `ares-quant` and `ares-model` are the exact arithmetic
+   that kernels are compared with.
 
 ## Crates
 
