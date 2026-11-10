@@ -46,6 +46,7 @@ mod iquants;
 mod kquants;
 pub mod kv;
 pub mod kvhead;
+pub mod layout;
 mod legacy;
 #[rustfmt::skip]
 mod tables;

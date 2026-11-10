@@ -1,261 +1,288 @@
-// The prefill weight kernels that read a rearranged copy of the weights and decode
-// them in registers (Marlin's way, vLLM csrc/quantization/marlin; see mm.cuh for
-// the kernels that read the file's layout and decode to a tile in shared memory).
+// The weight kernels over a device layout: one family for every number of activation
+// rows, from one copy of the matrix.
 //
-// Why: the file's layout puts the 144 bytes of one block of one row 2880 bytes
-// from the next row's, so a step of 64 values asks the memory system for 128
-// different lines per thread block. That, not arithmetic, was what bound the tile
-// kernels (an ablation with every row reading the same address was 35 % faster):
-// the load/store unit is shared with `ldmatrix`, and 16 lines per warp-wide load
-// keep it busy. Here a warp reads 512 contiguous bytes with one load per step and
-// holds exactly the weights its `mma` instructions need, so nothing is staged:
-// the decoded weights go from registers to the tensor cores, and only the
-// activations pass through shared memory.
+// A device layout (mmr_codes.cuh) is a matrix
+// rearranged once at load, in the same number of bytes as the file's, into the order
+// the tensor cores read it: the codes of a tile of 16 rows and a step of 64 values of
+// K lie together, each lane's share in the order of the registers of its `mma`
+// A fragment, and the scales of the 16 rows lie together beside them. A warp reads
+// its weights with one load per lane, tile and step, decodes them in registers
+// (Marlin's way, vLLM csrc/quantization/marlin) and hands them to `mma`; nothing of
+// the weights passes through shared memory. The file's layout cannot do that: there
+// the 144 bytes of one Q4_K block of one row lie 2880 bytes from the next row's, so
+// the load of a warp touches 16 lines.
 //
-// The rearranged form of a Q4_K matrix (same number of bytes as the file's, with
-// the rows rounded up to a multiple of 16):
-//   codes   for each tile of 16 rows and each step of 64 values of K: 32 lanes x 16
-//           bytes. Lane (g = lane / 4, t = lane % 4) holds four 32-bit words, one
-//           per slab of 16 values (kk); nibble i (0..3) of a word is the code of the
-//           even and nibble i + 4 that of the odd value of the pair that register
-//           a_i of the `mma.m16n8k16` A fragment holds:
-//             a0: row g, values 2t, 2t+1        a1: row g+8, values 2t, 2t+1
-//             a2: row g, values 2t+8, 2t+9      a3: row g+8, values 2t+8, 2t+9
-//           so that `lop3(w >> 4i, 0x000F000F, 0x64006400)` is the f16 pair
-//           (1024 + even, 1024 + odd) of register a_i.
-//   headers for each tile of 16 rows and super-block of 256 values: the 16 rows'
-//           16-byte headers (d, dmin, the 12 bytes of 6-bit scales) as in the file.
-// The codes come first (n_out16 * n_in / 2 bytes), then the headers.
+// The kernel is `mma.m16n8k16` with the weights as the 16-row operand and 8
+// activation rows as the other (so one to eight rows pad nothing), f16 inputs. What
+// changes with the number of rows is only how many fragments of activations a warp
+// multiplies its weights with and how they reach it:
+//
+//   rows     block               a warp computes          activations
+//   1..8     4 warps,  32 x 8    2 tiles x 1 fragment     read by each lane (L1)
+//   9..16    4 warps,  32 x 16   2 tiles x 2 fragments    read by each lane (L1)
+//   17..32   4 warps, 128 x 32   2 tiles x 4 fragments    cp.async to shared, ldmatrix
+//   33..     4 warps, 128 x 64   2 tiles x 8 fragments    cp.async to shared, ldmatrix
+//
+// In the two shapes of up to 16 rows the four warps of a block compute the same two
+// tiles, each a quarter of K, and add their parts at the end. A warp waits for one
+// load per step, so a tile computed by one warp over all of K takes the latency of a
+// load times the steps of K however little else the device has to do: a pass over
+// the matrices of Qwen3.8-27B with one row took 34.9 ms that way (its matrices of
+// 5120 rows by 17408 values are 272 steps long) against 22.0 ms with the integer
+// kernels, which split K over the lanes of a warp.
+//
+// Up to 16 rows the kernel waits for the weights: it runs at the speed of the memory
+// like the integer kernels of mmvq.cuh, with f32 accumulation, so its result is the
+// exact product of the f16 weights and f16 activations. Above, the tensor cores
+// bound it; there each shape exists with f32 accumulation (the rate of a card
+// without the GeForce cap) and with f16 accumulation added to f32 registers after
+// every 4 `mma` (64 values of K), which the capped cards run at twice the rate.
+// Which shape serves which number of rows is measured per device (src/kernels.rs).
+//
+// What was measured on the way (RTX 4070 / RTX 3060, Q4_K 17408 x 5120):
+// - Two tiles per warp, each fragment of activations multiplied with both: half the
+//   `ldmatrix` per `mma` of one tile per warp, 86 against 78 TFLOPS at 1024 rows.
+//   Four tiles per warp need more registers than a thread has.
+// - Activations: `cp.async` in three stages beat 16-byte loads into registers that
+//   are stored to shared memory a step later (86 against 81).
+// - Rows past the end of the batch are filled with zeros (`cp.async` of size 0), not
+//   read again from the last row: 24 rows took 0.120 ms instead of 0.098 otherwise.
+// - Up to 16 rows the codes are read past L1 (`no_allocate`): the weights are used
+//   once and would evict the activations (0.109 -> 0.096 ms at one row).
+// - Blocks of a wide product that share a weight tile (`group`, see mm.cuh) read
+//   their codes two steps ahead through L1.
+// - The kernel of 1 to 8 rows is held to 102 registers (5 blocks of 4 warps per SM):
+//   more resident warps keep more loads in flight on the RTX 3060 (0.154 -> 0.152 ms
+//   at one row); fewer registers than that spill.
+// - A block computes its tile over all of K, and the grid has a block per tile. When
+//   there are more blocks than the device holds at once, the ones that do not fit
+//   run when the others are done, each at the speed of one stream of loads and not
+//   of the memory: a 20480 x 4096 Q4_K matrix at 16 rows (320 blocks, 276 at once
+//   on the RTX 4070) takes 0.123 ms where a matrix whose blocks all fit takes 0.092
+//   for the same bytes. Blocks that walk several tiles with a grid that is an even
+//   share of them fixed that (0.095) and cost the kernels that the tensor cores
+//   bound a quarter of their speed (fewer blocks at once), so it was not kept. What
+//   would fix both is Marlin's stripes: blocks that walk K in pieces and add their
+//   parts. Not built.
+// - When the f16 sums are added to f32 (right after each `mma`, after the slab, or a
+//   period later from a second set of registers) made no difference.
 #pragma once
 
 #include <type_traits>
 
 #include "mm_types.cuh"
 
-// Bytes of the rearranged form: the same as the file's, with n_out rounded up to a
-// multiple of 16 rows.
-static __host__ __device__ __forceinline__ size_t ares_mmr_q4k_codes_bytes(uint32_t n_out, uint32_t n_in) {
-    return static_cast<size_t>((n_out + 15) / 16) * 16 * n_in / 2;
+static __device__ __forceinline__ void ares_ldmatrix_x2(uint32_t (&r)[2], const void* p) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];" : "=r"(r[0]), "=r"(r[1]) : "r"(ares_smem_addr(p)));
 }
 
-// One thread per (tile of 16 rows, step of 64 values, lane) for the codes, then one
-// per (row, super-block) for the headers. The file's block of a row is 144 bytes:
-// header (16), then four groups of 32 bytes whose low nibbles are the 32 values of
-// sub-block 2j and the high nibbles those of sub-block 2j + 1.
-ARES_KERNEL ares_repack_q4_K(const uint8_t* src, uint8_t* dst, uint32_t n_out, uint32_t n_in) {
-    const uint32_t n_tiles = (n_out + 15) / 16, n_steps = n_in / 64, n_sb = n_in / 256;
-    const size_t row_bytes = static_cast<size_t>(n_sb) * 144;
-    const size_t n_codes = static_cast<size_t>(n_tiles) * n_steps * 32;
-    const size_t id = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (id < n_codes) {
-        const uint32_t lane = id % 32;
-        const size_t unit = id / 32;
-        const uint32_t ks = unit % n_steps, mt = unit / n_steps;
-        const uint32_t g = lane / 4, t = lane % 4;
-        const uint32_t sb = ks / 4, j = ks % 4;
-        uint32_t word[4];
-        for (int kk = 0; kk < 4; kk++) {
-            uint32_t w = 0;
-            for (int i = 0; i < 4; i++) {
-                const uint32_t row = mt * 16 + g + 8 * (i & 1);
-                uint32_t q[2] = {0, 0};
-                if (row < n_out) {
-                    const uint8_t* blk = src + row * row_bytes + static_cast<size_t>(sb) * 144;
-                    for (int e = 0; e < 2; e++) {
-                        const uint32_t kp = kk * 16 + 2 * t + 8 * (i >> 1) + e;  // 0..63 within the step
-                        const uint8_t byte = blk[16 + 32 * j + (kp & 31)];
-                        q[e] = (kp >= 32) ? (byte >> 4) : (byte & 0xF);
-                    }
-                }
-                w |= (q[0] << (4 * i)) | (q[1] << (4 * i + 16));
-            }
-            word[kk] = w;
-        }
-        *reinterpret_cast<uint4*>(dst + (unit * 32 + lane) * 16) = make_uint4(word[0], word[1], word[2], word[3]);
-    } else {
-        const size_t h = id - n_codes;  // (tile, super-block, row of the tile)
-        if (h < static_cast<size_t>(n_tiles) * n_sb * 16) {
-            const uint32_t r16 = h % 16;
-            const size_t ts = h / 16;
-            const uint32_t sb = ts % n_sb, mt = ts / n_sb;
-            const uint32_t row = mt * 16 + r16;
-            uint4 hdr = make_uint4(0, 0, 0, 0);
-            if (row < n_out) {
-                hdr = *reinterpret_cast<const uint4*>(src + row * row_bytes + static_cast<size_t>(sb) * 144);
-            }
-            *reinterpret_cast<uint4*>(dst + ares_mmr_q4k_codes_bytes(n_out, n_in) + h * 16) = hdr;
-        }
-    }
-}
-
-// The grid of the repack kernel: threads to launch.
-static __host__ __device__ __forceinline__ size_t ares_repack_q4_K_threads(uint32_t n_out, uint32_t n_in) {
-    const size_t n_tiles = (n_out + 15) / 16;
-    return n_tiles * (n_in / 64) * 32 + n_tiles * (n_in / 256) * 16;
-}
-
-// Dynamic shared memory of ares_mmr_q4_K: STAGES tiles of J activation rows.
-template <int J, int STAGES>
-struct AresMmrLayout {
+// The dynamic shared memory of a block: three stages of J activation rows of 64 f16
+// values, each row 16 bytes longer so that `ldmatrix` finds no bank conflicts. None
+// when the lanes read the activations themselves.
+template <int J, bool DIRECT>
+struct AresMmrShared {
+    static constexpr int STAGES = 3;
     static constexpr int PITCH = 64 * 2 + 16;
-    static constexpr uint32_t BYTES = STAGES * J * PITCH;
+    static constexpr uint32_t BYTES = DIRECT ? 0 : STAGES * J * PITCH;
 };
 
-// y[b][r] = sum over k of W[r][k] * x[b][k], W in the rearranged form of Q4_K, x
-// the f16 activations of ares_convert_f16 (row-scaled; the scale is put back at
-// the end). I x J outputs per block, WM x WN warps; a warp computes 16 rows x
-// J / WN columns, so the A fragment it decodes serves J / WN / 8 mma per slab.
-// FLUSH as in ares_mm_f16 (0: f32 accumulation).
-template <int I, int J, int WM, int WN, int FLUSH, int STAGES = 2>
-static __device__ __forceinline__ void ares_mmr_q4_K(
+// y[b][r] = sum over k of W[r][k] * x[b][k].
+//
+//   w    the matrix in the device layout of `T`
+//   ax   n_batch rows of n_in f16 values, ares_act_f16_pitch(n_in) values apart, then
+//        (16-byte aligned) one f32 per row: the power of two the row was divided by
+//        (ares_convert_f16)
+//   y    n_batch rows of n_out f32 values
+//
+// A block is WM warps and computes NB * 8 activation rows; a warp TA tiles of 16
+// weight rows by all NB fragments. With the activations in shared memory the warps
+// of a block compute different tiles (WM * TA * 16 weight rows) in step; DIRECT, they
+// compute the same TA tiles, warp w the super-blocks of K from w / WM to (w + 1) / WM
+// of them, and the block adds their parts. FLUSH = 0: f32 accumulation; else f16
+// accumulation, added to f32 after every FLUSH `mma`.
+// Grid: ceil(n_out / I) * ceil(n_batch / J) blocks, in groups of `group` activation
+// tiles that take every weight tile in turn (ares_mm_tile).
+//
+// A layout `T` provides, for what one lane holds:
+//   struct Warp                 where the lane's share of the warp's first tile is
+//   struct Tile                 the registers of one tile
+//   open_warp(Warp&, w, n_out, n_in, first, lane)
+//   open(Tile&, const Warp&, delta, sb)    the tile `first + delta`, to start at
+//                                          super-block sb
+//   super_block(Tile&, const Warp&, sb)    before step 4 sb
+//   step(Tile&, const Warp&, step)         before the products of a step
+//   fragment<j, kk>(Tile&, a)   the A fragment of slab kk (16 values of K) of step j
+//                               of the super-block, as four f16x2 registers
+template <class T, int WM, int TA, int NB, int FLUSH, bool DIRECT>
+static __device__ __forceinline__ void ares_mmr(
     const uint8_t* __restrict__ w, const __half* __restrict__ ax, float* __restrict__ y,
     uint32_t n_in, uint32_t n_out, uint32_t n_batch, uint32_t group) {
-    constexpr int NT = WM * WN * 32;
-    constexpr int TN = J / WN, NTL = TN / 8;
-    constexpr int PITCH = AresMmrLayout<J, STAGES>::PITCH;
-    constexpr int PB = 8;  // pieces of 16 bytes per activation row and step (64 f16 values)
-    constexpr int BI = (J * PB + NT - 1) / NT;
-    static_assert(I == 16 * WM && J % (16 * WN) == 0, "a warp is 16 rows");
-    static_assert((4 % (FLUSH == 0 ? 1 : FLUSH)) == 0, "flush ends with a step");
-    ares_check_smem(AresMmrLayout<J, STAGES>::BYTES);
+    constexpr int NT = WM * 32;
+    constexpr int I = (DIRECT ? 1 : WM) * TA * 16, J = NB * 8;
+    constexpr int STAGES = AresMmrShared<J, DIRECT>::STAGES;
+    constexpr int PITCH = AresMmrShared<J, DIRECT>::PITCH;
+    constexpr int PIECES = J * 8;  // pieces of 16 bytes of activations per step
+    constexpr int BI = (PIECES + NT - 1) / NT;
+    static_assert(FLUSH == 0 || 4 % FLUSH == 0, "a flush ends with a step");
+    static_assert(NB == 1 || NB % 2 == 0, "fragments are loaded in pairs");
+    static_assert(NT % 8 == 0, "a thread moves the same part of each of its rows");
+    if constexpr (!DIRECT) {
+        ares_check_smem(AresMmrShared<J, DIRECT>::BYTES);
+    }
 
     const uint32_t tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
-    const uint32_t wm = warp / WN, wn = warp % WN;
     const uint32_t g = lane >> 2, t = lane & 3;
     uint32_t wt, bt;
     ares_mm_tile((n_out + I - 1) / I, (n_batch + J - 1) / J, group, wt, bt);
     const uint32_t col0 = bt * J;
     const uint32_t n_tiles = (n_out + 15) / 16, n_steps = n_in / 64, n_sb = n_in / 256;
-    const uint32_t mt = min(wt * WM + wm, n_tiles - 1);  // this warp's tile of 16 rows
-    const uint32_t row0 = (wt * WM + wm) * 16;
+    const uint32_t tile0 = (DIRECT ? wt : wt * WM + warp) * TA;
+    // The super-blocks of K this warp computes.
+    const uint32_t sb_lo = DIRECT ? warp * n_sb / WM : 0;
+    const uint32_t sb_hi = DIRECT ? (warp + 1) * n_sb / WM : n_sb;
+    uint8_t* const bs = ares_dyn_smem;
+    const size_t pitch = ares_act_f16_pitch(n_in);
 
-    const uint4* __restrict__ codes = reinterpret_cast<const uint4*>(w) + (static_cast<size_t>(mt) * n_steps) * 32 + lane;
-    const uint4* __restrict__ hdrs =
-        reinterpret_cast<const uint4*>(w + ares_mmr_q4k_codes_bytes(n_out, n_in)) + (static_cast<size_t>(mt) * n_sb) * 16 + g;
-
-    uint8_t* const bs = ares_dyn_smem;  // stage s: bs + s * J * PITCH
-    const __half* b_src[BI];
-    uint32_t b_dst[BI];
+    // The tiles past the end of the matrix repeat the last one; their results are not
+    // written.
+    typename T::Warp wp;
+    typename T::Tile tl[TA];
+    const uint32_t first = min(tile0, n_tiles - 1);
+    T::open_warp(wp, w, n_out, n_in, first, lane);
+    if (sb_lo < sb_hi) {
 #pragma unroll
-    for (int u = 0; u < BI; u++) {
-        const uint32_t item = tid + u * NT;
-        const uint32_t c = item / PB, s = item % PB;
-        b_src[u] = ax + static_cast<size_t>(min(col0 + c, n_batch - 1)) * n_in + 8 * s;
-        b_dst[u] = c * PITCH + 16 * s;
+        for (int a = 0; a < TA; a++) {
+            T::open(tl[a], wp, min(tile0 + a, n_tiles - 1) - first, sb_lo);
+        }
+    }
+
+    // The activations of a step are PIECES pieces of 16 bytes, piece i the part i % 8 of
+    // row i / 8. Thread tid moves the pieces tid + u NT: the same part of rows NT / 8
+    // apart. Rows past the end of the batch are filled with zeros.
+    const __half* b_src[BI];
+    uint32_t b_dst0 = 0, b_valid = 0;
+    const __half* arow[NB];
+    if constexpr (DIRECT) {
+        // Lane (g, t) holds of fragment ni the values 2t, 2t + 1, 2t + 8, 2t + 9 of each
+        // slab of row 8 ni + g.
+#pragma unroll
+        for (int ni = 0; ni < NB; ni++) {
+            arow[ni] = ax + static_cast<size_t>(min(col0 + ni * 8 + g, n_batch - 1)) * pitch + 2 * t;
+        }
+    } else {
+        b_dst0 = (tid / 8) * PITCH + 16 * (tid % 8);
+#pragma unroll
+        for (int u = 0; u < BI; u++) {
+            const uint32_t c = (tid + u * NT) / 8;
+            b_src[u] = ax + static_cast<size_t>(min(col0 + c, n_batch - 1)) * pitch + 8 * (tid % 8);
+            b_valid |= (tid + u * NT < PIECES && col0 + c < n_batch) ? (1u << u) : 0u;
+        }
     }
     auto load_acts = [&](uint32_t step, int stage) {
 #pragma unroll
         for (int u = 0; u < BI; u++) {
-            if (tid + u * NT < J * PB) {
-                ares_cp_async16(bs + stage * J * PITCH + b_dst[u], b_src[u] + 64 * step, 16u);
+            if (tid + u * NT < PIECES) {
+                ares_cp_async16(bs + stage * J * PITCH + b_dst0 + u * (NT / 8) * PITCH, b_src[u] + 64 * step, ((b_valid >> u) & 1) * 16u);
             }
         }
     };
 
-    float acc[NTL][4];
-    uint32_t hacc[NTL][2];
+    float acc[TA][NB][4];
+    uint32_t hacc[TA][NB][2];
 #pragma unroll
-    for (int ni = 0; ni < NTL; ni++) {
+    for (int a = 0; a < TA; a++) {
 #pragma unroll
-        for (int e = 0; e < 4; e++) {
-            acc[ni][e] = 0.0f;
+        for (int ni = 0; ni < NB; ni++) {
+#pragma unroll
+            for (int e = 0; e < 4; e++) {
+                acc[a][ni][e] = 0.0f;
+            }
         }
     }
 
-    uint4 cw[2];     // codes of this and the next step
-    uint4 hd_next[2];  // headers (rows g and g + 8) of the next super-block
-    uint32_t sc[2][2], mn[2][2];  // scales and minimums as bytes, rows g and g + 8
-    uint32_t dd2[2];              // (d, -dmin) as f16x2, rows g and g + 8
-
+    if constexpr (!DIRECT) {
 #pragma unroll
-    for (int p = 0; p < STAGES - 1; p++) {
-        if (p < n_steps) {
-            load_acts(p, p);
+        for (int p = 0; p < STAGES - 1; p++) {
+            if (p < n_steps) {
+                load_acts(p, p);
+            }
+            ares_cp_commit();
         }
-        ares_cp_commit();
     }
-    cw[0] = __ldg(codes);
-    hd_next[0] = __ldg(hdrs);
-    hd_next[1] = __ldg(hdrs + 8);
 
-    const uint32_t kBias = 0x64006400u, kMagic = 0x64646464u;
-    for (uint32_t sb = 0; sb < n_sb; sb++) {
-        // The headers of this super-block: expand the 6-bit scales to bytes.
+    for (uint32_t sb = sb_lo; sb < sb_hi; sb++) {
 #pragma unroll
-        for (int h = 0; h < 2; h++) {
-            ares_mm_scales_k4(hd_next[h], sc[h], mn[h]);
-            dd2[h] = (hd_next[h].x & 0xFFFFu) | ((hd_next[h].x & 0xFFFF0000u) ^ 0x80000000u);
+        for (int a = 0; a < TA; a++) {
+            T::super_block(tl[a], wp, sb);
         }
-        if (sb + 1 < n_sb) {
-            hd_next[0] = __ldg(hdrs + (sb + 1) * 16);
-            hd_next[1] = __ldg(hdrs + (sb + 1) * 16 + 8);
-        }
+        // One step of 64 values of K; j, its place in the super-block, is a constant so
+        // that a layout selects its scales with constant shifts.
         auto step_fn = [&](auto jc) {
             constexpr int j = decltype(jc)::value;
             const uint32_t step = sb * 4 + j;
-            const int stage = step % STAGES;
-            ares_cp_wait_group<STAGES - 2>();
-            __syncthreads();
-            if (step + STAGES - 1 < n_steps) {
-                load_acts(step + STAGES - 1, (step + STAGES - 1) % STAGES);
-            }
-            ares_cp_commit();
-            if (step + 1 < n_steps) {
-                cw[(j + 1) & 1] = __ldg(codes + (static_cast<size_t>(step) + 1) * 32);
-            }
-
-            // The scales of the two sub-blocks (2j, 2j+1) of rows g and g+8, as f16 pairs
-            // (sw, sw) and (-mw, -mw).
-            uint32_t sw2[2][2], nmw2[2][2];  // [row][sub-block]
-#pragma unroll
-            for (int h = 0; h < 2; h++) {
-                constexpr int o = 2 * (j & 1);
-                const uint32_t pair = __byte_perm(sc[h][j >> 1], mn[h][j >> 1],
-                                                  ((4 + o + 1) << 12) | ((o + 1) << 8) | ((4 + o) << 4) | o);
-#pragma unroll
-                for (int sub = 0; sub < 2; sub++) {
-                    const uint32_t x = __byte_perm(pair, kMagic, sub == 0 ? 0x4140 : 0x4342);
-                    const uint32_t v = ares_h2_mul(ares_h2_sub(x, kBias), dd2[h]);
-                    sw2[h][sub] = __byte_perm(v, v, 0x1010);
-                    nmw2[h][sub] = __byte_perm(v, v, 0x3232);
+            if constexpr (!DIRECT) {
+                ares_cp_wait_group<STAGES - 2>();
+                __syncthreads();
+                if (step + STAGES - 1 < n_steps) {
+                    load_acts(step + STAGES - 1, (step + STAGES - 1) % STAGES);
                 }
+                ares_cp_commit();
             }
-
-            const uint4 c4 = cw[j & 1];
-            const uint32_t words[4] = {c4.x, c4.y, c4.z, c4.w};
-            const uint8_t* const b_base = bs + stage * (J * PITCH);
+#pragma unroll
+            for (int a = 0; a < TA; a++) {
+                T::step(tl[a], wp, step);
+            }
+            const uint8_t* const b_base = bs + (step % STAGES) * (J * PITCH);
 #pragma unroll
             for (int kk = 0; kk < 4; kk++) {
-                // Decode the A fragment: a0, a2 are row g; a1, a3 row g + 8.
-                const int sub = kk >> 1;
-                uint32_t a[4];
+                // The B fragments of the slab: register 0 holds the values 2t, 2t + 1 and
+                // register 1 the values 2t + 8, 2t + 9 of activation row g of the fragment.
+                uint32_t b[NB][2];
+                if constexpr (DIRECT) {
 #pragma unroll
-                for (int i = 0; i < 4; i++) {
-                    const uint32_t pair_codes = ((words[kk] >> (4 * i)) & 0x000F000Fu) | kBias;
-                    a[i] = ares_h2_fma(ares_h2_sub(pair_codes, kBias), sw2[i & 1][sub], nmw2[i & 1][sub]);
+                    for (int ni = 0; ni < NB; ni++) {
+                        const uint32_t* p = reinterpret_cast<const uint32_t*>(arow[ni] + step * 64 + kk * 16);
+                        b[ni][0] = __ldg(p);
+                        b[ni][1] = __ldg(p + 4);
+                    }
+                } else if constexpr (NB == 1) {
+                    ares_ldmatrix_x2(b[0], b_base + (lane & 7) * PITCH + kk * 32 + ((lane >> 3) & 1) * 16);
+                } else {
+#pragma unroll
+                    for (int nj = 0; nj < NB / 2; nj++) {
+                        uint32_t r4[4];
+                        ares_ldmatrix_x4(r4, b_base + (nj * 16 + (lane & 7) + ((lane >> 4) & 1) * 8) * PITCH + kk * 32 + ((lane >> 3) & 1) * 16);
+                        b[2 * nj][0] = r4[0];
+                        b[2 * nj][1] = r4[1];
+                        b[2 * nj + 1][0] = r4[2];
+                        b[2 * nj + 1][1] = r4[3];
+                    }
                 }
-                uint32_t b[NTL][2];
 #pragma unroll
-                for (int nj = 0; nj < NTL / 2; nj++) {
-                    uint32_t r4[4];
-                    ares_ldmatrix_x4(r4, b_base + (wn * TN + nj * 16 + (lane & 7) + ((lane >> 4) & 1) * 8) * PITCH + kk * 32 + ((lane >> 3) & 1) * 16);
-                    b[2 * nj][0] = r4[0];
-                    b[2 * nj][1] = r4[1];
-                    b[2 * nj + 1][0] = r4[2];
-                    b[2 * nj + 1][1] = r4[3];
-                }
-#pragma unroll
-                for (int ni = 0; ni < NTL; ni++) {
-                    if constexpr (FLUSH == 0) {
-                        ares_mma_f16_k16(acc[ni], a, b[ni][0], b[ni][1]);
+                for (int a = 0; a < TA; a++) {
+                    uint32_t af[4];
+                    if (kk == 0) {
+                        T::template fragment<j, 0>(tl[a], af);
+                    } else if (kk == 1) {
+                        T::template fragment<j, 1>(tl[a], af);
+                    } else if (kk == 2) {
+                        T::template fragment<j, 2>(tl[a], af);
                     } else {
-                        if (kk % FLUSH == 0) {
-                            ares_mma_f16acc_k16<false>(hacc[ni], a, b[ni][0], b[ni][1]);
+                        T::template fragment<j, 3>(tl[a], af);
+                    }
+#pragma unroll
+                    for (int ni = 0; ni < NB; ni++) {
+                        if constexpr (FLUSH == 0) {
+                            ares_mma_f16_k16(acc[a][ni], af, b[ni][0], b[ni][1]);
                         } else {
-                            ares_mma_f16acc_k16<true>(hacc[ni], a, b[ni][0], b[ni][1]);
-                        }
-                        if (kk % FLUSH == FLUSH - 1) {
-                            ares_flush_f16(acc[ni], hacc[ni]);
+                            if (kk % FLUSH == 0) {
+                                ares_mma_f16acc_k16<false>(hacc[a][ni], af, b[ni][0], b[ni][1]);
+                            } else {
+                                ares_mma_f16acc_k16<true>(hacc[a][ni], af, b[ni][0], b[ni][1]);
+                            }
+                            if (kk % FLUSH == FLUSH - 1) {
+                                ares_flush_f16(acc[a][ni], hacc[a][ni]);
+                            }
                         }
                     }
                 }
@@ -267,28 +294,78 @@ static __device__ __forceinline__ void ares_mmr_q4_K(
         step_fn(std::integral_constant<int, 3>{});
     }
 
-    // The rows were divided by their scale (ares_convert_f16): put it back.
-    const float* const row_scale =
-        reinterpret_cast<const float*>(reinterpret_cast<const uint8_t*>(ax) + ares_act_ds_offset(static_cast<size_t>(n_batch) * n_in * 2));
+    // The parts of K that the warps of the block computed, added in the first.
+    if constexpr (DIRECT && WM > 1) {
+        __shared__ float parts[WM][TA * NB * 4][32];
 #pragma unroll
-    for (int ni = 0; ni < NTL; ni++) {
-        const uint32_t c0 = col0 + wn * TN + ni * 8 + 2 * t;
+        for (int a = 0; a < TA; a++) {
+#pragma unroll
+            for (int ni = 0; ni < NB; ni++) {
+#pragma unroll
+                for (int e = 0; e < 4; e++) {
+                    parts[warp][(a * NB + ni) * 4 + e][lane] = acc[a][ni][e];
+                }
+            }
+        }
+        __syncthreads();
+        if (warp != 0) {
+            return;
+        }
+#pragma unroll
+        for (int a = 0; a < TA; a++) {
+#pragma unroll
+            for (int ni = 0; ni < NB; ni++) {
+#pragma unroll
+                for (int e = 0; e < 4; e++) {
+#pragma unroll
+                    for (int v = 1; v < WM; v++) {
+                        acc[a][ni][e] += parts[v][(a * NB + ni) * 4 + e][lane];
+                    }
+                }
+            }
+        }
+    }
+
+    // The rows were divided by their scale (ares_convert_f16): put it back. Element e of
+    // an accumulator is weight row g + 8 (e / 2), activation row 2t + e % 2 of the fragment.
+    const float* const row_scale =
+        reinterpret_cast<const float*>(reinterpret_cast<const uint8_t*>(ax) + ares_act_ds_offset(static_cast<size_t>(n_batch) * pitch * 2));
+#pragma unroll
+    for (int ni = 0; ni < NB; ni++) {
+        const uint32_t c0 = col0 + ni * 8 + 2 * t;
         const float s0 = c0 < n_batch ? row_scale[c0] : 0.0f;
         const float s1 = c0 + 1 < n_batch ? row_scale[c0 + 1] : 0.0f;
 #pragma unroll
-        for (int e = 0; e < 4; e++) {
-            const uint32_t r = row0 + g + (e >> 1) * 8;
-            const uint32_t c = c0 + (e & 1);
-            if (r < n_out && c < n_batch) {
-                y[static_cast<size_t>(c) * n_out + r] = acc[ni][e] * ((e & 1) ? s1 : s0);
+        for (int a = 0; a < TA; a++) {
+#pragma unroll
+            for (int e = 0; e < 4; e++) {
+                const uint32_t r = (tile0 + a) * 16 + g + (e >> 1) * 8;
+                const uint32_t c = c0 + (e & 1);
+                if (r < n_out && c < n_batch) {
+                    y[static_cast<size_t>(c) * n_out + r] = acc[a][ni][e] * ((e & 1) ? s1 : s0);
+                }
             }
         }
     }
 }
 
-#define ARES_MMR_KERNEL(NAME, TYPE, I, J, WM, WN, FLUSH, ...)                                               \
-    extern "C" __global__ void __launch_bounds__(WM * WN * 32, 1) NAME(                                      \
+// One kernel: the layout `T`, the shape and at least `BLOCKS` blocks per SM.
+#define ARES_MMR_KERNEL(NAME, T, WM, TA, NB, FLUSH, DIRECT, BLOCKS)                                         \
+    extern "C" __global__ void __launch_bounds__(WM * 32, BLOCKS) NAME(                                      \
         const uint8_t* w, const __half* act, float* y, uint32_t n_in, uint32_t n_out, uint32_t n_batch,     \
         uint32_t group) {                                                                                     \
-        ares_mmr_##TYPE<I, J, WM, WN, FLUSH, ##__VA_ARGS__>(w, act, y, n_in, n_out, n_batch, group);                       \
+        ares_mmr<T, WM, TA, NB, FLUSH, DIRECT>(w, act, y, n_in, n_out, n_batch, group);                      \
     }
+
+// The six kernels of a layout, `ares_mmr_<shape>_<type>`: the shapes of the table
+// above with f32 accumulation (f), and the two wide ones with f16 accumulation (h).
+// `NEAR` is the layout as the kernels of up to 32 rows read it, `WIDE` as the grouped
+// blocks of a wide product do.
+#define ARES_MMR_FLUSH 4
+#define ARES_MMR_KERNELS(TYPE, NEAR, WIDE)                                          \
+    ARES_MMR_KERNEL(ares_mmr_r8f_##TYPE, NEAR, 4, 2, 1, 0, true, 5)                 \
+    ARES_MMR_KERNEL(ares_mmr_r16f_##TYPE, NEAR, 4, 2, 2, 0, true, 3)                \
+    ARES_MMR_KERNEL(ares_mmr_r32f_##TYPE, NEAR, 4, 2, 4, 0, false, 3)               \
+    ARES_MMR_KERNEL(ares_mmr_r32h_##TYPE, NEAR, 4, 2, 4, ARES_MMR_FLUSH, false, 3)  \
+    ARES_MMR_KERNEL(ares_mmr_r64f_##TYPE, WIDE, 4, 2, 8, 0, false, 2)               \
+    ARES_MMR_KERNEL(ares_mmr_r64h_##TYPE, WIDE, 4, 2, 8, ARES_MMR_FLUSH, false, 2)

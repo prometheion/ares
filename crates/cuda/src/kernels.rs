@@ -13,6 +13,10 @@ use crate::memory::{DeviceBuffer, DevicePtr};
 use crate::module::{Args, Function, Module};
 use crate::stream::{Event, Stream};
 
+mod layout;
+
+pub use layout::{ActivationForm, LayoutKernel, LayoutRows, LayoutTable, WeightLayout};
+
 /// The kernel module `build.rs` compiled from `kernels/module.cu`: every GPU
 /// the toolkit builds for can load it.
 static IMAGE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/kernels.fatbin"));
@@ -249,31 +253,14 @@ pub enum Precision {
     Exact,
 }
 
-/// The kernels over the rearranged form of Q4_K (`kernels/mmr.cuh`): the kernel
-/// that rearranges a matrix and the products with f16 and with f32 accumulation.
-#[derive(Debug, Clone)]
-struct RearrangedQ4k {
-    repack: Function,
-    flush: Function,
-    exact: Function,
-}
-
-/// The dynamic shared memory of the rearranged kernels: 3 stages of 128 activation
-/// rows of 64 f16 values, each row 16 bytes longer (`AresMmrLayout`).
-const MMR_SHARED: u32 = 3 * 128 * (64 * 2 + 16);
-/// The rows of weights and of activations one block of the rearranged kernels
-/// computes, and its threads.
-const MMR_ROWS: u32 = 128;
-const MMR_THREADS: u32 = 512;
-
 /// The kernels of the prefill module on one device.
 #[derive(Debug, Clone)]
 struct Prefill {
     /// Per type: the alignment, the bytes of its table and the kernels, indexed
     /// `[path][shape]`.
     types: Vec<(GgmlType, u64, u32, [[Function; 3]; 3])>,
-    /// The kernels over the rearranged form of a Q4_K matrix.
-    rearranged: RearrangedQ4k,
+    /// The kernels over the device layouts and their tables.
+    layouts: layout::Layouts,
     convert_f16: Function,
     /// Whether `mma` with f32 accumulation runs as fast as with f16
     /// accumulation (measured at load).
@@ -329,27 +316,9 @@ impl Prefill {
                 Ok((*ty, *align, *table, kernels))
             })
             .collect::<Result<Vec<_>>>()?;
-        let (flush, exact) =
-            (module.function("ares_mmr_h_q4_K")?, module.function("ares_mmr_f_q4_K")?);
-        if MMR_SHARED > limit {
-            return Err(Error::Invalid {
-                what: "prefill kernel",
-                detail: format!(
-                    "the rearranged kernels need {MMR_SHARED} bytes of shared memory per block, the device allows {limit}"
-                ),
-            });
-        }
-        if MMR_SHARED > DEFAULT_SHARED {
-            flush.allow_dynamic_shared(MMR_SHARED)?;
-            exact.allow_dynamic_shared(MMR_SHARED)?;
-        }
         Ok(Self {
             types,
-            rearranged: RearrangedQ4k {
-                repack: module.function("ares_repack_q4_K")?,
-                flush,
-                exact,
-            },
+            layouts: layout::Layouts::load(&module, limit)?,
             convert_f16: module.function("ares_convert_f16")?,
             full_rate: probe_full_rate(device, &module)?,
         })
@@ -887,9 +856,13 @@ impl Kernels {
         match path {
             PrefillPath::Int8 => Self::quantized_activation_bytes(n_in, n_rows),
             PrefillPath::F16 | PrefillPath::F16Flush => {
-                let values = u64::from(n_in) * u64::from(n_rows) * 2;
-                // The f16 values, then at the next multiple of 16 bytes one f32 per row:
-                // the power of two the row was divided by.
+                // The rows lie a whole, odd number of lines of 128 bytes apart
+                // (`ares_act_f16_pitch` in `kernels/mm.cuh`), so that the same place of
+                // many rows does not fall into one set of the caches.
+                let pitch = ((u64::from(n_in) * 2).div_ceil(128) + 1) | 1;
+                let values = pitch * 128 * u64::from(n_rows);
+                // Then, at the next multiple of 16 bytes, one f32 per row: the power of
+                // two the row was divided by.
                 values.next_multiple_of(16) + 4 * u64::from(n_rows)
             }
         }
@@ -939,7 +912,7 @@ impl Kernels {
                 let args = Args::new().ptr(x).ptr(out).u32(n_in).u32(n_rows);
                 // SAFETY: the argument list matches ares_convert_f16; the ranges are the
                 // caller's guarantee.
-                unsafe { prefill.convert_f16.launch(stream, [n_rows, 1, 1], [256, 1, 1], 0, args) }
+                unsafe { prefill.convert_f16.launch(stream, [n_rows, 1, 1], [1024, 1, 1], 0, args) }
             }
         }
     }
@@ -1045,159 +1018,6 @@ impl Kernels {
         // SAFETY: the argument list matches the ares_mm_* kernels; the ranges are the
         // caller's guarantee.
         unsafe { function.launch(stream, [blocks, 1, 1], [threads, 1, 1], shared, args) }
-    }
-}
-
-impl Kernels {
-    /// Whether matrices of `ty` have a rearranged form ([`Kernels::rearrange`]).
-    pub fn has_rearranged_form(ty: GgmlType) -> bool {
-        ty == GgmlType::Q4_K
-    }
-
-    /// The bytes of the rearranged form of a matrix of `ty` with `n_out` rows and
-    /// `n_in` columns: the bytes of the file's form, with the rows rounded up to a
-    /// multiple of 16 (at most 15 rows more). `None` for a type without one.
-    pub fn rearranged_bytes(ty: GgmlType, n_out: u32, n_in: u32) -> Option<u64> {
-        Self::has_rearranged_form(ty)
-            .then(|| u64::from(n_out.next_multiple_of(16)) * (u64::from(n_in) / 256) * 144)
-    }
-
-    /// Rearranges a matrix from the file's form into the one the kernels of
-    /// [`Kernels::matmul_rearranged`] read: codes in the order the tensor cores
-    /// take them, one 16-byte load per lane and 64 values of K, and the block
-    /// headers of 16 rows together (`kernels/mmr.cuh`). Done once when the matrix
-    /// is uploaded: 0.3 ms for a 17408 x 5120 matrix on an RTX 4070. A matrix in
-    /// this form is no longer one the decode kernels or the other prefill kernels
-    /// read.
-    ///
-    /// # Safety
-    ///
-    /// On the stream's device and alive until the launch has run: `src` addresses
-    /// the matrix as GGUF stores it, `dst` [`Kernels::rearranged_bytes`] bytes,
-    /// 16-byte aligned (checked), not overlapping `src`.
-    pub unsafe fn rearrange(
-        &self,
-        stream: &Stream,
-        ty: GgmlType,
-        src: DevicePtr,
-        dst: DevicePtr,
-        n_out: u32,
-        n_in: u32,
-    ) -> Result<()> {
-        let prefill = self.prefill_kernels()?;
-        if !Self::has_rearranged_form(ty) {
-            return Err(Error::Invalid {
-                what: "rearranged form",
-                detail: format!("{ty} has none"),
-            });
-        }
-        if n_in == 0 || !n_in.is_multiple_of(256) {
-            return Err(Error::Invalid {
-                what: "weight matrix",
-                detail: format!(
-                    "{n_in} columns are not a whole number of {ty} blocks of 256 values"
-                ),
-            });
-        }
-        if n_out == 0 {
-            return Ok(());
-        }
-        check_alignment("weight matrix", src, 16)?;
-        check_alignment("rearranged matrix", dst, 16)?;
-        let tiles = u64::from(n_out.div_ceil(16));
-        let threads = tiles * (u64::from(n_in) / 64) * 32 + tiles * (u64::from(n_in) / 256) * 16;
-        let blocks = u32::try_from(threads.div_ceil(256)).map_err(|_| Error::Invalid {
-            what: "rearranged form",
-            detail: format!("{n_out} x {n_in} needs more blocks than a grid has"),
-        })?;
-        let args = Args::new().ptr(src).ptr(dst).u32(n_out).u32(n_in);
-        // SAFETY: the argument list matches ares_repack_q4_K; the ranges are the caller's.
-        unsafe { prefill.rearranged.repack.launch(stream, [blocks, 1, 1], [256, 1, 1], 0, args) }
-    }
-
-    /// `y[b] = W x[b]` like [`Kernels::matmul`], for a matrix in the rearranged form
-    /// ([`Kernels::rearrange`]), which the kernel decodes in registers: no tile of
-    /// weights passes through shared memory, so the loads are whole lines. Only
-    /// the f16 paths ([`PrefillPath::F16`] with f32 accumulation,
-    /// [`PrefillPath::F16Flush`] with f16 accumulation flushed to f32); the
-    /// activations are those of [`Kernels::prepare_prefill_activations`] for the
-    /// path. Fastest from about a hundred rows on.
-    ///
-    /// # Safety
-    ///
-    /// On the stream's device and alive until the launch has run: `w` the
-    /// rearranged matrix (16-byte aligned, checked), `act` the prepared activations
-    /// (16-byte aligned, checked), `y` `n_rows * n_out` f32 values, not overlapping
-    /// the inputs.
-    #[allow(clippy::too_many_arguments)]
-    pub unsafe fn matmul_rearranged(
-        &self,
-        stream: &Stream,
-        ty: GgmlType,
-        path: PrefillPath,
-        w: DevicePtr,
-        act: DevicePtr,
-        y: DevicePtr,
-        n_in: u32,
-        n_out: u32,
-        n_rows: u32,
-    ) -> Result<()> {
-        let prefill = self.prefill_kernels()?;
-        if !Self::has_rearranged_form(ty) {
-            return Err(Error::Invalid {
-                what: "rearranged form",
-                detail: format!("{ty} has none"),
-            });
-        }
-        let function = match path {
-            PrefillPath::F16 => &prefill.rearranged.exact,
-            PrefillPath::F16Flush => &prefill.rearranged.flush,
-            PrefillPath::Int8 => {
-                return Err(Error::Invalid {
-                    what: "rearranged form",
-                    detail: "the rearranged kernels take f16 activations".into(),
-                });
-            }
-        };
-        if n_in == 0
-            || !n_in.is_multiple_of(256)
-            || n_rows == 0
-            || n_in.checked_mul(n_rows).is_none()
-        {
-            return Err(Error::Invalid {
-                what: "prefill kernel batch",
-                detail: format!(
-                    "{n_rows} rows of {n_in} values: not whole blocks of 256, empty or too many"
-                ),
-            });
-        }
-        if n_out == 0 {
-            return Ok(());
-        }
-        check_alignment("rearranged matrix", w, 16)?;
-        check_alignment("prepared activations", act, 16)?;
-        let n_weight_tiles = n_out.div_ceil(MMR_ROWS);
-        let n_batch_tiles = n_rows.div_ceil(MMR_ROWS);
-        let group = (MM_GROUP_BYTES / (u64::from(MMR_ROWS) * u64::from(n_in) * 2))
-            .clamp(MM_GROUP_MIN, MM_GROUP_MAX);
-        let group = u32::try_from(group).unwrap_or(2).min(n_batch_tiles);
-        // A group that divides the tiles keeps every wave of blocks on whole groups.
-        let group = (1..=group)
-            .rev()
-            .find(|g| n_batch_tiles.is_multiple_of(*g))
-            .filter(|g| *g * 2 > group)
-            .unwrap_or(group);
-        let blocks =
-            u32::try_from(u64::from(n_weight_tiles) * u64::from(n_batch_tiles)).map_err(|_| {
-                Error::Invalid {
-                    what: "prefill kernel batch",
-                    detail: format!("{n_out} x {n_rows} needs more blocks than a grid has"),
-                }
-            })?;
-        let args = Args::new().ptr(w).ptr(act).ptr(y).u32(n_in).u32(n_out).u32(n_rows).u32(group);
-        // SAFETY: the argument list matches the ares_mmr_* kernels; the ranges are the
-        // caller's guarantee.
-        unsafe { function.launch(stream, [blocks, 1, 1], [MMR_THREADS, 1, 1], MMR_SHARED, args) }
     }
 }
 

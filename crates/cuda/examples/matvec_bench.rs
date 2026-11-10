@@ -9,7 +9,10 @@
 //! the fast integer kernels of every type, `quantize_activations` once and
 //! `matvec` after it, the way a step uses them: 40 launches in a row between
 //! two events, over several copies of the matrix that together are larger than
-//! any L2 cache, so that every launch reads its weights from memory.
+//! any L2 cache, so that every launch reads its weights from memory. For a type
+//! with a device layout a second line times the same products over the rearranged
+//! matrix (`Kernels::product`, the kernel of the device's measured table), which
+//! is what a model that holds the matrix in that layout runs.
 //!
 //! ```sh
 //! cargo run --release -p ares-cuda --example matvec_bench
@@ -18,7 +21,10 @@
 use std::time::Instant;
 
 use ares_core::GgmlType;
-use ares_cuda::{Device, DeviceBuffer, Event, Kernels, Result, Stream, Wait, devices};
+use ares_cuda::{
+    ActivationForm, Device, DeviceBuffer, Event, Kernels, Precision, Result, Stream, Wait,
+    WeightLayout, devices,
+};
 
 /// The largest matrix of Qwen3.8-27B: the FFN of a layer.
 const N_IN: u32 = 5120;
@@ -187,26 +193,7 @@ fn time_fast(device: &Device, kernels: &Kernels, stream: &Stream, ty: GgmlType) 
         };
         // SAFETY: as above.
         unsafe { kernels.quantize_activations(stream, x.ptr(), q.ptr(), N_IN, n_batch)? };
-        // Warm up: module load and the clocks ramping up, for at least 300 ms.
-        let warm = Instant::now();
-        while warm.elapsed().as_millis() < 300 {
-            for i in 0..RUN {
-                launch(i)?;
-            }
-            stream.synchronize()?;
-        }
-        let mut times = Vec::new();
-        for _ in 0..5 {
-            start.record(stream)?;
-            for i in 0..RUN {
-                launch(i)?;
-            }
-            end.record(stream)?;
-            end.synchronize()?;
-            times.push(f64::from(end.elapsed_ms_since(&start)?) / RUN as f64);
-        }
-        times.sort_by(f64::total_cmp);
-        let ms = times[times.len() / 2];
+        let ms = median_ms(stream, &start, &end, &launch)?;
         line += &format!(
             " | {n_batch} row(s) {:>7.3} ms {:>6.1} GB/s",
             ms,
@@ -214,5 +201,85 @@ fn time_fast(device: &Device, kernels: &Kernels, stream: &Stream, ty: GgmlType) 
         );
     }
     println!("{line}");
+
+    if kernels.layout_for(ty, N_IN) != WeightLayout::Device {
+        return Ok(());
+    }
+    // The same matrices in the device layout, in place of the file's.
+    let table = kernels.measure_layout(ty)?;
+    let bytes =
+        Kernels::layout_bytes(ty, WeightLayout::Device, N_OUT, N_IN).expect("has the layout");
+    let rearranged = weights
+        .iter()
+        .map(|w| {
+            let r = DeviceBuffer::new(device, bytes)?;
+            // SAFETY: whole matrices of `ty` and the size the function names.
+            unsafe { kernels.rearrange(stream, ty, w.ptr(), r.ptr(), N_OUT, N_IN)? };
+            Ok(r)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    stream.synchronize()?;
+    drop(weights);
+    let mut line = format!("  {:<8}", format!("  {}", table.rows[0].fast.name));
+    for n_batch in [1u32, 2, 4, 8] {
+        let form = kernels.activation_form(ty, WeightLayout::Device, Precision::Fast, n_batch)?;
+        debug_assert_eq!(form, ActivationForm::F16);
+        let act = DeviceBuffer::new(device, Kernels::activation_bytes(form, N_IN, n_batch))?;
+        // SAFETY: the buffers were sized for these rows.
+        unsafe { kernels.prepare_activations(stream, form, x.ptr(), act.ptr(), N_IN, n_batch)? };
+        let launch = |i: usize| -> Result<()> {
+            // SAFETY: as above; the matrices were rearranged just before.
+            unsafe {
+                kernels.product(
+                    stream,
+                    ty,
+                    WeightLayout::Device,
+                    Precision::Fast,
+                    rearranged[i % copies].ptr(),
+                    act.ptr(),
+                    y.ptr(),
+                    N_IN,
+                    N_OUT,
+                    n_batch,
+                )
+            }
+        };
+        let ms = median_ms(stream, &start, &end, &launch)?;
+        line += &format!(
+            " | {n_batch} row(s) {:>7.3} ms {:>6.1} GB/s",
+            ms,
+            bytes as f64 / (ms * 1e-3) / 1e9
+        );
+    }
+    println!("{line}");
     Ok(())
+}
+
+/// The median over 5 runs of `RUN` launches of the time of one launch, in ms, after
+/// a warm-up of at least 300 ms (module load and the clocks ramping up).
+fn median_ms(
+    stream: &Stream,
+    start: &Event,
+    end: &Event,
+    launch: &dyn Fn(usize) -> Result<()>,
+) -> Result<f64> {
+    let warm = Instant::now();
+    while warm.elapsed().as_millis() < 300 {
+        for i in 0..RUN {
+            launch(i)?;
+        }
+        stream.synchronize()?;
+    }
+    let mut times = Vec::new();
+    for _ in 0..5 {
+        start.record(stream)?;
+        for i in 0..RUN {
+            launch(i)?;
+        }
+        end.record(stream)?;
+        end.synchronize()?;
+        times.push(f64::from(end.elapsed_ms_since(start)?) / RUN as f64);
+    }
+    times.sort_by(f64::total_cmp);
+    Ok(times[times.len() / 2])
 }

@@ -42,7 +42,10 @@ pub use device::{
 };
 pub use driver::{LIBRARY_ENV, driver_version};
 pub use error::{Error, Result};
-pub use kernels::{Kernels, MAX_BATCH, Precision, PrefillPath, PrefillShape};
+pub use kernels::{
+    ActivationForm, Kernels, LayoutKernel, LayoutRows, LayoutTable, MAX_BATCH, Precision,
+    PrefillPath, PrefillShape, WeightLayout,
+};
 pub use layers::{
     AttentionShape, CommitSet, LayerKernels, NormKind, OutputGate, RecurrentShape, RopeParams,
     Segment, StateFormat, StepDims, StepRecord, quantized_activation_bytes,

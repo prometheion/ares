@@ -12,25 +12,32 @@
 //! L2 cache. The decode kernels are timed for comparison at up to 64 rows (in
 //! launches of 8). The fast path of the device is marked.
 //!
+//! For a type with a device layout (`Kernels::has_device_layout`), `layout` and
+//! `layout-exact` time `Kernels::product` over the rearranged matrix with the kernel
+//! the device's measured table names, and a kernel's name (`r8f`, `r64h`, ...) times
+//! that kernel whatever the table says.
+//!
 //! ```sh
 //! cargo run --release -p ares-cuda --example prefill_bench -- \
-//!     [--rows 64,256,1024] [--types q4_K,iq4_xs] [--paths int8,f16,decode] [--device N]
+//!     [--rows 64,256,1024] [--types q4_K,iq4_xs] [--device N] \
+//!     [--paths int8,f16,f16flush,decode,layout,layout-exact,r8f,...]
 //! ```
 
 use std::time::Instant;
 
 use ares_core::GgmlType;
 use ares_cuda::{
-    Device, DeviceBuffer, Event, Kernels, MAX_BATCH, Precision, PrefillPath, Result, Stream, Wait,
-    devices,
+    ActivationForm, Device, DeviceBuffer, Event, Kernels, MAX_BATCH, Precision, PrefillPath,
+    Result, Stream, Wait, WeightLayout, devices,
 };
 
 /// The largest matrix of Qwen3.8-27B: the FFN of a layer.
 const N_IN: u32 = 5120;
 const N_OUT: u32 = 17408;
 
-/// The types with a prefill kernel, in the order of their bytes in Qwen3.8-27B.
-const TYPES: [GgmlType; 11] = [
+/// The types with a tile kernel over the file's layout, in the order of their bytes
+/// in Qwen3.8-27B, then the others that have a device layout.
+const TYPES: [GgmlType; 16] = [
     GgmlType::IQ4_XS,
     GgmlType::Q4_K,
     GgmlType::Q5_K,
@@ -42,6 +49,11 @@ const TYPES: [GgmlType; 11] = [
     GgmlType::IQ2_S,
     GgmlType::IQ2_XS,
     GgmlType::Q8_0,
+    GgmlType::Q2_K,
+    GgmlType::Q4_0,
+    GgmlType::Q4_1,
+    GgmlType::Q5_0,
+    GgmlType::Q5_1,
 ];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -50,8 +62,10 @@ enum Which {
     F16,
     /// f16 with f16 accumulation flushed to f32 ([`PrefillPath::F16Flush`]).
     F16Flush,
-    /// F16Flush over the rearranged form of the matrix (Q4_K only).
-    Rearranged,
+    /// The device layout, with the kernel of the device's table for a precision.
+    Layout(Precision),
+    /// The device layout, with one kernel of the family by name.
+    Kernel(&'static str),
     Decode,
 }
 
@@ -84,9 +98,20 @@ fn main() -> Result<()> {
                         "int8" => Which::Int8,
                         "f16" => Which::F16,
                         "f16flush" => Which::F16Flush,
-                        "rearranged" => Which::Rearranged,
+                        "layout" => Which::Layout(Precision::Fast),
+                        "layout-exact" => Which::Layout(Precision::Exact),
                         "decode" => Which::Decode,
-                        _ => panic!("--paths: int8, f16, f16flush, rearranged or decode"),
+                        name => Which::Kernel(
+                            Kernels::layout_kernel_names()
+                                .into_iter()
+                                .find(|n| *n == name)
+                                .unwrap_or_else(|| {
+                                    panic!(
+                                        "--paths: int8, f16, f16flush, decode, layout, layout-exact or one of {:?}",
+                                        Kernels::layout_kernel_names()
+                                    )
+                                }),
+                        ),
                     })
                     .collect();
             }
@@ -105,15 +130,17 @@ fn main() -> Result<()> {
             info.name,
             kernels.tensor_cores_full_rate()
         );
+        let tiled = types.iter().copied().find(|t| Kernels::has_prefill_matmul(*t));
         for path in [PrefillPath::Int8, PrefillPath::F16, PrefillPath::F16Flush] {
-            for shape in kernels.prefill_shapes(types[0], path)? {
+            let Some(tiled) = tiled else { break };
+            for shape in kernels.prefill_shapes(tiled, path)? {
                 println!(
                     "  {path:?} shape {}x{} rows of weights x activations, {} threads, {} B of shared memory (for {}), {} registers, {} block(s) per SM, up to {} rows",
                     shape.weight_rows,
                     shape.batch_rows,
                     shape.threads,
                     shape.shared_bytes,
-                    types[0].name(),
+                    tiled.name(),
                     shape.registers,
                     shape.blocks_per_sm,
                     if shape.up_to_rows == u32::MAX {
@@ -168,9 +195,24 @@ fn time_type(
             Ok(buffer)
         })
         .collect::<Result<Vec<_>>>()?;
-    // The rearranged copies of the matrices, when asked for and the type has the form.
-    let rearranged = if paths.contains(&Which::Rearranged) && Kernels::has_rearranged_form(ty) {
-        let bytes = Kernels::rearranged_bytes(ty, N_OUT, N_IN).expect("has the form");
+    // The rearranged copies of the matrices, when asked for and the type has the layout,
+    // and the table of the device.
+    let wants_layout = paths.iter().any(|p| matches!(p, Which::Layout(_) | Which::Kernel(_)));
+    let rearranged = if wants_layout && Kernels::has_device_layout(ty, N_IN) {
+        let table = kernels.measure_layout(ty)?;
+        for rows in table.rows {
+            println!(
+                "  {} table: up to {} rows fast {} ({:.3} ms on the probe), exact {} ({:.3} ms)",
+                ty.name(),
+                rows.up_to_rows,
+                rows.fast.name,
+                rows.fast.probe_ms,
+                rows.exact.name,
+                rows.exact.probe_ms
+            );
+        }
+        let bytes =
+            Kernels::layout_bytes(ty, WeightLayout::Device, N_OUT, N_IN).expect("has the layout");
         let buffers = weights
             .iter()
             .map(|w| {
@@ -198,11 +240,65 @@ fn time_type(
             if which == Which::Decode && n > 64 {
                 continue;
             }
-            if which == Which::Rearranged && rearranged.is_empty() {
+            if matches!(which, Which::Layout(_) | Which::Kernel(_)) && rearranged.is_empty() {
+                continue;
+            }
+            if matches!(which, Which::Int8 | Which::F16 | Which::F16Flush)
+                && !Kernels::has_prefill_matmul(ty)
+            {
                 continue;
             }
             let ms = match which {
-                Which::Int8 | Which::F16 | Which::F16Flush | Which::Rearranged => {
+                Which::Layout(_) | Which::Kernel(_) => {
+                    let act = DeviceBuffer::new(
+                        device,
+                        Kernels::activation_bytes(ActivationForm::F16, N_IN, n),
+                    )?;
+                    // SAFETY: the buffers were sized for these shapes just above.
+                    unsafe {
+                        kernels.prepare_activations(
+                            stream,
+                            ActivationForm::F16,
+                            x.ptr(),
+                            act.ptr(),
+                            N_IN,
+                            n,
+                        )?
+                    };
+                    time(device, stream, &start, &end, |i| {
+                        let w = rearranged[i % copies].ptr();
+                        // SAFETY: as above; the matrices were rearranged just before.
+                        unsafe {
+                            match which {
+                                Which::Kernel(name) => kernels.product_with(
+                                    stream,
+                                    ty,
+                                    name,
+                                    w,
+                                    act.ptr(),
+                                    y.ptr(),
+                                    N_IN,
+                                    N_OUT,
+                                    n,
+                                ),
+                                Which::Layout(precision) => kernels.product(
+                                    stream,
+                                    ty,
+                                    WeightLayout::Device,
+                                    precision,
+                                    w,
+                                    act.ptr(),
+                                    y.ptr(),
+                                    N_IN,
+                                    N_OUT,
+                                    n,
+                                ),
+                                _ => unreachable!("the arm is the two layout paths"),
+                            }
+                        }
+                    })?
+                }
+                Which::Int8 | Which::F16 | Which::F16Flush => {
                     let path = match which {
                         Which::Int8 => PrefillPath::Int8,
                         Which::F16 => PrefillPath::F16,
@@ -224,22 +320,6 @@ fn time_type(
                         )?
                     };
                     time(device, stream, &start, &end, |i| {
-                        if which == Which::Rearranged {
-                            // SAFETY: as above; the matrices were rearranged just before.
-                            return unsafe {
-                                kernels.matmul_rearranged(
-                                    stream,
-                                    ty,
-                                    path,
-                                    rearranged[i % copies].ptr(),
-                                    act.ptr(),
-                                    y.ptr(),
-                                    N_IN,
-                                    N_OUT,
-                                    n,
-                                )
-                            };
-                        }
                         // SAFETY: as above; the matrices are whole N_OUT x N_IN matrices of `ty`.
                         unsafe {
                             kernels.matmul(
@@ -293,7 +373,9 @@ fn time_type(
                 Which::Int8 => "int8",
                 Which::F16 => "f16",
                 Which::F16Flush => "f16h",
-                Which::Rearranged => "rearr",
+                Which::Layout(Precision::Fast) => "layout",
+                Which::Layout(Precision::Exact) => "layout-exact",
+                Which::Kernel(name) => name,
                 Which::Decode => "decode",
             };
             let mark = match (which, fast) {
@@ -343,9 +425,10 @@ fn time(
 /// The byte offsets of the f16 scales of a block of `ty`.
 fn scale_offsets(ty: GgmlType) -> &'static [usize] {
     match ty {
-        GgmlType::Q4_K | GgmlType::Q5_K => &[0, 2],
+        GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q4_1 | GgmlType::Q5_1 => &[0, 2],
         GgmlType::Q6_K => &[208],
         GgmlType::Q3_K => &[108],
+        GgmlType::Q2_K => &[80, 82],
         _ => &[0],
     }
 }

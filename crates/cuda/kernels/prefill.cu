@@ -7,6 +7,7 @@
 #include "common.cuh"
 #include "mm_types.cuh"
 #include "mmr.cuh"
+#include "mmr_codes.cuh"
 
 // The shapes: weight rows x activation rows per block, warps, blocks per SM.
 // Found by measurement on an RTX 4070 and an RTX 3060 (see mm.cuh); the Rust side
@@ -141,10 +142,21 @@ ARES_MM_H_SMALL(ares_mm_hs_iq2_s, EngMmIQ2S)
 ARES_MM_H_SMALL(ares_mm_hs_iq2_xs, EngMmIQ2XS)
 ARES_MM_H_SMALL(ares_mm_hs_q8_0, EngMmQ80)
 
-// The register-decoding kernels over the rearranged form (mmr.cuh): ares_mmr_<h|f>_<type>,
-// with f16 (h) or f32 (f) accumulation.
-ARES_MMR_KERNEL(ares_mmr_h_q4_K, q4_K, 128, 128, 8, 2, ARES_MM_FLUSH, 3)
-ARES_MMR_KERNEL(ares_mmr_f_q4_K, q4_K, 128, 128, 8, 2, 0, 3)
+// The kernels over the device layouts (mmr.cuh, mmr_codes.cuh): ares_mmr_<shape>_<type>
+// and the rearrangement ares_repack_<type>. The Rust side (src/kernels/layout.rs)
+// lists the same types.
+ARES_MMR_CODES(q4_K, AresCodesQ4K)
+ARES_MMR_CODES(q5_K, AresCodesQ5K)
+ARES_MMR_CODES(q6_K, AresCodesQ6K)
+ARES_MMR_CODES(q3_K, AresCodesQ3K)
+ARES_MMR_CODES(q2_K, AresCodesQ2K)
+ARES_MMR_CODES(q4_0, AresCodesQ40)
+ARES_MMR_CODES(q4_1, AresCodesQ41)
+ARES_MMR_CODES(q5_0, AresCodesQ50)
+ARES_MMR_CODES(q5_1, AresCodesQ51)
+ARES_MMR_CODES(q8_0, AresCodesQ80)
+ARES_MMR_CODES(iq4_xs, AresCodesIQ4XS)
+ARES_MMR_CODES(iq4_nl, AresCodesIQ4NL)
 
 // The probe of Kernels::load: how fast the tensor cores run `mma` with f16
 // inputs and f32 accumulation against f16 accumulation. GeForce cards run the

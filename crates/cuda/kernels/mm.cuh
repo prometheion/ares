@@ -286,6 +286,18 @@ static __device__ __forceinline__ void ares_check_smem(uint32_t needed) {
     }
 }
 
+// The f16 activations (ares_convert_f16): the f16 values from one row to the next.
+// A row is rounded up to whole lines of 128 bytes and one or two more, so that the
+// pitch is an odd number of lines: the kernels read the same place of 8 to 64 rows
+// together, and with rows a power of two apart (4096 values are 8192 bytes) those
+// places compete for the same sets of the caches. Measured on an RTX 4070 with a
+// 20480 x 4096 Q4_K matrix: 16 rows 0.123 ms with rows 8192 bytes apart, against
+// 0.097 ms for the same bytes of a 17408 x 5120 matrix.
+static __host__ __device__ __forceinline__ size_t ares_act_f16_pitch(uint32_t n_in) {
+    const size_t lines = (static_cast<size_t>(n_in) * 2 + 127) / 128 + 1;
+    return (lines | 1) * 64;
+}
+
 // Asks L2 for the line that holds `p`.
 static __device__ __forceinline__ void ares_prefetch_l2(const void* p) {
     asm volatile("prefetch.global.L2 [%0];" ::"l"(p));
@@ -624,7 +636,8 @@ static __device__ __forceinline__ void ares_mm_i8(
 // ---------------------------------------------------------------------------
 // The f16 variant.
 //
-//   ax   n_batch rows of n_in f16 values, then (16-byte aligned) one f32 per row:
+//   ax   n_batch rows of n_in f16 values, ares_act_f16_pitch(n_in) values apart, then
+//        (16-byte aligned) one f32 per row:
 //        the factor 2^e the row was divided by so that its largest value is at
 //        most 1 (ares_convert_f16)
 //
@@ -767,7 +780,7 @@ static __device__ __forceinline__ void ares_mm_f16(
     for (int u = 0; u < BI; u++) {
         const uint32_t item = tid + u * NT;
         const uint32_t c = item / PB, s = item % PB;
-        b_src[u] = ax + static_cast<size_t>(min(col0 + c, n_batch - 1)) * n_in + 8 * s;
+        b_src[u] = ax + static_cast<size_t>(min(col0 + c, n_batch - 1)) * ares_act_f16_pitch(n_in) + 8 * s;
         b_dst[u] = c * PITCH + 16 * s;
         b_k[u] = 8 * s;
     }
@@ -905,7 +918,7 @@ static __device__ __forceinline__ void ares_mm_f16(
 
     // The rows were divided by their scale (ares_convert_f16): put it back.
     const float* const row_scale =
-        reinterpret_cast<const float*>(reinterpret_cast<const uint8_t*>(ax) + ares_act_ds_offset(static_cast<size_t>(n_batch) * n_in * 2));
+        reinterpret_cast<const float*>(reinterpret_cast<const uint8_t*>(ax) + ares_act_ds_offset(static_cast<size_t>(n_batch) * ares_act_f16_pitch(n_in) * 2));
 #pragma unroll
     for (int ni = 0; ni < NTL; ni++) {
         const uint32_t c0 = col0 + wn * TN + ni * 8 + 2 * t;
@@ -938,9 +951,11 @@ static __device__ __forceinline__ void ares_mm_f16(
 // power of two chosen so that the row's largest value is below 1 (then no sum of
 // the kernel can overflow an f16, and rows of any magnitude keep their precision),
 // and, behind the values (at the next multiple of 16 bytes), the f32 factor of each
-// row. One block of 256 threads per row.
+// row. One block per row, of up to 1024 threads: a thread waits for each of its
+// loads, so with 256 threads a row of 17408 values took 12 microseconds on an RTX
+// 4070, which a decode step pays once per input of every layer.
 ARES_KERNEL ares_convert_f16(const float* x, __half* out, uint32_t n_in, uint32_t n_batch) {
-    __shared__ float peak[8];
+    __shared__ float peak[32];
     const uint32_t b = blockIdx.x;
     const float* row = x + static_cast<size_t>(b) * n_in;
     float m = 0.0f;
@@ -955,7 +970,7 @@ ARES_KERNEL ares_convert_f16(const float* x, __half* out, uint32_t n_in, uint32_
     }
     __syncthreads();
     m = peak[0];
-    for (int i = 1; i < 8; i++) {
+    for (uint32_t i = 1; i < blockDim.x / 32; i++) {
         m = fmaxf(m, peak[i]);
     }
     int e = 0;
@@ -964,11 +979,11 @@ ARES_KERNEL ares_convert_f16(const float* x, __half* out, uint32_t n_in, uint32_
         e = max(-100, min(100, e));
     }
     const float scale = ldexpf(1.0f, e), inv = ldexpf(1.0f, -e);
-    __half* const o = out + static_cast<size_t>(b) * n_in;
+    __half* const o = out + static_cast<size_t>(b) * ares_act_f16_pitch(n_in);
     for (uint32_t i = threadIdx.x; i < n_in; i += blockDim.x) {
         o[i] = __float2half_rn(row[i] * inv);
     }
     if (threadIdx.x == 0) {
-        reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(out) + ares_act_ds_offset(static_cast<size_t>(n_batch) * n_in * 2))[b] = scale;
+        reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(out) + ares_act_ds_offset(static_cast<size_t>(n_batch) * ares_act_f16_pitch(n_in) * 2))[b] = scale;
     }
 }

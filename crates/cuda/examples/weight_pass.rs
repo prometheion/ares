@@ -8,13 +8,18 @@
 //! fast kernel, and then times passes in which each matrix is multiplied with
 //! `n` rows of random activations once.
 //!
-//! - 1 to 8 rows run the decode kernels (`Kernels::matvec`): the result is a
-//!   LOWER BOUND for a decode step, to set next to the step time of another
-//!   engine.
-//! - More rows run the prefill kernels (`Kernels::matmul`, tensor cores): the
-//!   result is a LOWER BOUND for the time of a chunk of that many prompt
-//!   tokens, and `rows / pass time` an UPPER BOUND for prompt processing in
-//!   tokens per second, to set next to the figure of another engine's whole
+//! Every matrix is one buffer in one layout, and every product one call
+//! (`Kernels::product`). A matrix whose type has a device layout is rearranged
+//! into it at load and multiplied by the kernels over that layout whatever the
+//! number of rows; the others stay in the file's layout, where 1 to 8 rows run
+//! the decode kernels and more the tile kernels. `--layout file` keeps every
+//! matrix in the file's layout, for comparison.
+//!
+//! - With 1 to 8 rows the result is a LOWER BOUND for a decode step, to set next
+//!   to the step time of another engine.
+//! - With more rows it is a LOWER BOUND for the time of a chunk of that many
+//!   prompt tokens, and `rows / pass time` an UPPER BOUND for prompt processing
+//!   in tokens per second, to set next to the figure of another engine's whole
 //!   forward pass. The output head multiplies only the last row of a chunk
 //!   (the logits of the next token), so it runs with one row.
 //!
@@ -25,7 +30,7 @@
 //! ```sh
 //! cargo run --release -p ares-cuda --example weight_pass -- <model.gguf> \
 //!     [--split 0.625,0.375] [--rows 1,3,8] [--passes N] [--device 0] \
-//!     [--precision fast|exact]
+//!     [--precision fast|exact] [--layout device|file]
 //! ```
 //!
 //! - `--split a,b,...`: the shares of every matrix's rows that devices 0, 1,
@@ -36,9 +41,12 @@
 //!   memory of a device does not allow (the weights take most of it) is skipped
 //!   and says so.
 //! - `--passes`: passes per measurement (default 20 for up to 8 rows, 5 for more).
-//! - `--precision`: which prefill kernels run (`Precision`): `fast` (the default)
-//!   takes the fastest of the device, `exact` always the f16 kernels with f32
+//! - `--precision`: which kernels run (`Precision`): `fast` (the default) takes
+//!   the fastest of the device, `exact` always the f16 kernels with f32
 //!   accumulation.
+//! - `--layout`: `device` (the default) rearranges the matrices of the types that
+//!   have a device layout; the table of which kernel serves which number of rows
+//!   is measured per device before the weights are placed and printed.
 //! - Peer access is not needed: the devices do not exchange data here.
 //!
 //! Loading is timed too, because it is part of what a user waits for: the
@@ -50,7 +58,9 @@
 //! (pageable) memory, copied with `DeviceBuffer::write`, so the driver stages
 //! every copy through its own pinned buffers; one host thread per device. It
 //! is not tuned: page-locked staging on a stream, or locking the mapped pages in
-//! place, would be the next steps.
+//! place, would be the next steps. A matrix that gets a device layout is copied
+//! to a scratch buffer as large as the largest of them and rearranged from there
+//! into its place, so the device never holds a matrix twice.
 //!
 //! Not every tensor is a matrix product with a fast kernel. The report says
 //! what was covered and what was skipped and why: the token embedding is a
@@ -64,14 +74,14 @@ use std::time::{Duration, Instant};
 
 use ares_core::GgmlType;
 use ares_cuda::{
-    Device, DeviceBuffer, DevicePtr, Event, Kernels, MAX_BATCH, Precision, PrefillPath, Result,
-    Stream, Wait, device_count,
+    ActivationForm, Device, DeviceBuffer, DevicePtr, Event, Kernels, MAX_BATCH, Precision, Result,
+    Stream, Wait, WeightLayout, device_count,
 };
 use ares_gguf::{Gguf, TensorInfo};
 
-/// Rows of a split are multiples of this, so a thread block of the weight
-/// kernels (8 rows) is never split across devices.
-const ROW_GRANULE: u64 = 8;
+/// Rows of a split are multiples of this: a tile of a device layout, which is two
+/// thread blocks of the decode kernels, is never split across devices.
+const ROW_GRANULE: u64 = 16;
 /// Matrices start at multiples of this in a device's weight buffer.
 const MATRIX_ALIGN: u64 = 256;
 /// The output head: in a prefill pass only the last row of a chunk goes through it.
@@ -91,6 +101,8 @@ struct Options {
     rows: Vec<u32>,
     passes: Option<usize>,
     precision: Precision,
+    /// Whether the types that have a device layout get it.
+    device_layout: bool,
 }
 
 fn parse_args() -> std::result::Result<Options, String> {
@@ -100,6 +112,7 @@ fn parse_args() -> std::result::Result<Options, String> {
     let mut rows = vec![1, 3, 8];
     let mut passes = None;
     let mut precision = Precision::Fast;
+    let mut device_layout = true;
     let mut device = 0;
     while let Some(arg) = args.next() {
         let mut value = |what: &str| args.next().ok_or(format!("{what} needs a value"));
@@ -126,6 +139,13 @@ fn parse_args() -> std::result::Result<Options, String> {
                     other => return Err(format!("--precision '{other}': fast or exact")),
                 };
             }
+            "--layout" => {
+                device_layout = match value("--layout")?.as_str() {
+                    "device" => true,
+                    "file" => false,
+                    other => return Err(format!("--layout: device or file, not {other}")),
+                };
+            }
             "--device" => {
                 device = value("--device")?.parse().map_err(|e| format!("--device: {e}"))?;
             }
@@ -135,7 +155,7 @@ fn parse_args() -> std::result::Result<Options, String> {
     }
     let path = path.ok_or(
         "usage: weight_pass <model.gguf> [--split a,b] [--rows 1,3,8] [--passes N] [--device N] \
-         [--precision fast|exact]",
+         [--precision fast|exact] [--layout device|file]",
     )?;
     if rows.contains(&0) || rows.is_empty() {
         return Err("--rows takes values of 1 or more".into());
@@ -150,7 +170,7 @@ fn parse_args() -> std::result::Result<Options, String> {
     if shares.is_empty() {
         shares.push(1.0);
     }
-    Ok(Options { path, shares, first_device, rows, passes, precision })
+    Ok(Options { path, shares, first_device, rows, passes, precision, device_layout })
 }
 
 /// For each pass of one device: when it started and ended (since the start of
@@ -198,6 +218,8 @@ struct Slice {
     row0: u64,
     rows: u64,
     offset: u64,
+    /// How the slice lies on the device.
+    layout: WeightLayout,
 }
 
 /// The rows each device gets of a matrix of `n_out` rows.
@@ -293,8 +315,16 @@ fn run() -> std::result::Result<(), String> {
                 continue;
             }
             let offset = device_bytes[d].next_multiple_of(MATRIX_ALIGN);
-            slices[d].push(Slice { tensor: i, row0, rows, offset });
-            device_bytes[d] = offset + rows * row_bytes;
+            let layout = if options.device_layout && Kernels::has_device_layout(t.ty, n_in as u32) {
+                WeightLayout::Device
+            } else {
+                WeightLayout::File
+            };
+            // The device layout rounds the rows of the slice up to a tile of 16.
+            let bytes = Kernels::layout_bytes(t.ty, layout, rows as u32, n_in as u32)
+                .unwrap_or(rows * row_bytes);
+            slices[d].push(Slice { tensor: i, row0, rows, offset, layout });
+            device_bytes[d] = offset + bytes;
         }
     }
     for (d, bytes) in device_bytes.iter().enumerate() {
@@ -319,13 +349,46 @@ fn run() -> std::result::Result<(), String> {
         devices.push(device);
     }
 
+    // The kernels of each device, and for the types that get a device layout the table
+    // of which kernel serves which number of rows, measured while the memory is free.
+    let kernels =
+        devices.iter().map(Kernels::load).collect::<Result<Vec<_>>>().map_err(|e| e.to_string())?;
+    for (d, kernels) in kernels.iter().enumerate() {
+        let mut types: Vec<GgmlType> = slices[d]
+            .iter()
+            .filter(|s| s.layout == WeightLayout::Device)
+            .map(|s| tensors[s.tensor].ty)
+            .collect();
+        types.sort_by_key(|t| t.id());
+        types.dedup();
+        for ty in types {
+            let table = kernels.measure_layout(ty).map_err(|e| e.to_string())?;
+            let row = |r: &ares_cuda::LayoutRows| {
+                let upto = if r.up_to_rows == u32::MAX {
+                    "more".to_string()
+                } else {
+                    format!("<={}", r.up_to_rows)
+                };
+                format!("{upto}: {} / {}", r.fast.name, r.exact.name)
+            };
+            println!(
+                "device {} {:<7} kernels by rows (fast / exact): {}",
+                options.first_device + d as u32,
+                ty.name(),
+                table.rows.iter().map(row).collect::<Vec<_>>().join(", ")
+            );
+        }
+    }
+
     // Upload, free, upload again: the first upload reads the file from wherever it
     // is (the page cache, or the disk), the second surely from the page cache.
     println!();
     println!("loading (ordinary memory through DeviceBuffer::write, one host thread per device):");
-    let first = upload(&devices, &slices, &device_bytes, &gguf, &options, "first upload ")?;
+    let first =
+        upload(&devices, &kernels, &slices, &device_bytes, &gguf, &options, "first upload ")?;
     free("free after the first upload", first);
-    let buffers = upload(&devices, &slices, &device_bytes, &gguf, &options, "second upload")?;
+    let buffers =
+        upload(&devices, &kernels, &slices, &device_bytes, &gguf, &options, "second upload")?;
 
     // Per device: the launch list. A launch is one matrix slice; before the
     // first matrix of each (layer, input width) the activations of that width
@@ -381,7 +444,7 @@ fn run() -> std::result::Result<(), String> {
             let handles: Vec<_> = (0..n_dev)
                 .map(|d| {
                     let (device, buffer, slices, barrier) =
-                        (&devices[d], &buffers[d], &slices[d], &barrier);
+                        (&kernels[d], &buffers[d], &slices[d], &barrier);
                     let (widths, gguf, options) = (&widths, &gguf, &options);
                     scope.spawn(move || -> std::result::Result<PassTimes, String> {
                         run_device(
@@ -486,6 +549,7 @@ fn run() -> std::result::Result<(), String> {
 /// per device, and prints the bytes, seconds and GB/s per device and in total.
 fn upload(
     devices: &[Device],
+    kernels: &[Kernels],
     slices: &[Vec<Slice>],
     device_bytes: &[u64],
     gguf: &Gguf,
@@ -498,18 +562,57 @@ fn upload(
             let handles: Vec<_> = (0..devices.len())
                 .map(|d| {
                     let (device, slices, bytes) = (&devices[d], &slices[d], device_bytes[d]);
+                    let kernels = &kernels[d];
                     scope.spawn(move || -> std::result::Result<(DeviceBuffer, f64, f64), String> {
                         let copy = || -> Result<(DeviceBuffer, f64, f64)> {
+                            let file_bytes = |s: &Slice| {
+                                let tensor = &gguf.tensors()[s.tensor];
+                                s.rows * tensor.ty.bytes_for(tensor.dims.get(0)).unwrap()
+                            };
                             let t = Instant::now();
                             let buffer = DeviceBuffer::new(device, bytes.max(1))?;
+                            // The slices that get a device layout pass through here.
+                            let largest = slices
+                                .iter()
+                                .filter(|s| s.layout == WeightLayout::Device)
+                                .map(file_bytes)
+                                .max();
+                            let scratch = match largest {
+                                Some(bytes) => Some((
+                                    DeviceBuffer::new(device, bytes)?,
+                                    Stream::new(device, 0)?,
+                                )),
+                                None => None,
+                            };
                             let allocated = t.elapsed().as_secs_f64();
                             for s in slices {
                                 let tensor = &gguf.tensors()[s.tensor];
-                                let row_bytes = tensor.ty.bytes_for(tensor.dims.get(0)).unwrap();
+                                let n_in = tensor.dims.get(0);
+                                let row_bytes = tensor.ty.bytes_for(n_in).unwrap();
                                 let data = gguf.data(tensor);
                                 let range = (s.row0 * row_bytes) as usize
                                     ..((s.row0 + s.rows) * row_bytes) as usize;
-                                buffer.write(s.offset, &data[range])?;
+                                match (s.layout, &scratch) {
+                                    (WeightLayout::Device, Some((staged, stream))) => {
+                                        staged.write(0, &data[range])?;
+                                        // SAFETY: the scratch buffer holds the slice in the
+                                        // file's layout and the plan gave its device layout
+                                        // room at `offset`.
+                                        unsafe {
+                                            kernels.rearrange(
+                                                stream,
+                                                tensor.ty,
+                                                staged.ptr(),
+                                                buffer.ptr().offset(s.offset),
+                                                s.rows as u32,
+                                                n_in as u32,
+                                            )?;
+                                        }
+                                        // The scratch buffer is written again right after.
+                                        stream.synchronize()?;
+                                    }
+                                    _ => buffer.write(s.offset, &data[range])?,
+                                }
                             }
                             Ok((buffer, allocated, t.elapsed().as_secs_f64()))
                         };
@@ -584,7 +687,7 @@ fn free(label: &str, buffers: Vec<DeviceBuffer>) {
 /// waiting for it and the error is reported.
 #[allow(clippy::too_many_arguments)]
 fn run_device(
-    device: &Device,
+    kernels: &Kernels,
     weights: &DeviceBuffer,
     slices: &[Slice],
     widths: &[u64],
@@ -598,7 +701,7 @@ fn run_device(
 ) -> Result<PassTimes> {
     let waited = Cell::new(0usize);
     let result = run_device_passes(
-        device, weights, slices, widths, gguf, n_rows, passes, precision, barrier, t0, layer_of,
+        kernels, weights, slices, widths, gguf, n_rows, passes, precision, barrier, t0, layer_of,
         &waited,
     );
     if result.is_err() {
@@ -611,7 +714,7 @@ fn run_device(
 
 #[allow(clippy::too_many_arguments)]
 fn run_device_passes(
-    device: &Device,
+    kernels: &Kernels,
     weights: &DeviceBuffer,
     slices: &[Slice],
     widths: &[u64],
@@ -624,12 +727,16 @@ fn run_device_passes(
     layer_of: &dyn Fn(&str) -> Option<String>,
     waited: &Cell<usize>,
 ) -> Result<PassTimes> {
-    let kernels = Kernels::load(device)?;
+    let device = kernels.device();
     let stream = Stream::new(device, 0)?;
-    // More rows than a decode kernel takes go to the tensor-core kernels.
+    // In a pass of more rows than a decode step has, only the last row goes through the
+    // output head.
     let prefill = n_rows > MAX_BATCH;
+    let is_head = |name: &str| prefill && name == HEAD;
+    let rows_of = |name: &str| if is_head(name) { 1 } else { n_rows };
 
-    // Random activations and their prepared form, per input width.
+    // Random activations per input width, and room for their two prepared forms: which
+    // one a product reads depends on the type and the layout of its matrix.
     let mut rng = 0x9e3779b97f4a7c15u64;
     let mut next = || {
         rng ^= rng << 13;
@@ -637,138 +744,103 @@ fn run_device_passes(
         rng ^= rng << 17;
         ((rng >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
     };
-    let mut inputs: BTreeMap<u64, (DeviceBuffer, DeviceBuffer)> = BTreeMap::new();
+    let mut inputs: BTreeMap<u64, (DeviceBuffer, [DeviceBuffer; 2])> = BTreeMap::new();
     for &n_in in widths {
         let x: Vec<u8> = (0..n_in * u64::from(n_rows)).flat_map(|_| next().to_le_bytes()).collect();
         let dx = DeviceBuffer::new(device, x.len() as u64)?;
         dx.write(0, &x)?;
-        // The prefill path of a matrix depends on its type: room for either format.
-        let bytes = if prefill {
-            Kernels::prefill_activation_bytes(PrefillPath::Int8, n_in as u32, n_rows)
-                .max(Kernels::prefill_activation_bytes(PrefillPath::F16Flush, n_in as u32, n_rows))
-        } else {
-            Kernels::quantized_activation_bytes(n_in as u32, n_rows)
-        };
-        inputs.insert(n_in, (dx, DeviceBuffer::new(device, bytes)?));
+        let prepared = [ActivationForm::Int8, ActivationForm::F16].map(|form| {
+            DeviceBuffer::new(device, Kernels::activation_bytes(form, n_in as u32, n_rows))
+        });
+        let [int8, f16] = prepared;
+        inputs.insert(n_in, (dx, [int8?, f16?]));
     }
-    // The head of a prefill pass has one row, quantized for the decode kernel.
+    // The head of a prefill pass has one row, prepared apart.
     let head_width = slices
         .iter()
         .map(|s| &gguf.tensors()[s.tensor])
         .find(|t| t.name == HEAD)
         .map(|t| t.dims.get(0));
-    let head_q = DeviceBuffer::new(
+    let head_act = DeviceBuffer::new(
         device,
-        Kernels::quantized_activation_bytes(head_width.unwrap_or(32) as u32, 1),
+        Kernels::activation_bytes(ActivationForm::Int8, head_width.unwrap_or(32) as u32, 1).max(
+            Kernels::activation_bytes(ActivationForm::F16, head_width.unwrap_or(32) as u32, 1),
+        ),
     )?;
-    let is_head = |name: &str| prefill && name == HEAD;
     let max_out = slices
         .iter()
-        .map(|s| &gguf.tensors()[s.tensor])
-        .filter(|t| !is_head(&t.name))
-        .map(|t| t.dims.get(1))
+        .map(|s| (s.rows, rows_of(&gguf.tensors()[s.tensor].name)))
+        .map(|(rows, n)| rows * u64::from(n))
         .max()
         .unwrap_or(1);
-    let max_head_out = slices
-        .iter()
-        .filter(|s| is_head(&gguf.tensors()[s.tensor].name))
-        .map(|s| s.rows)
-        .max()
-        .unwrap_or(1);
-    let y = DeviceBuffer::new(device, max_out.max(max_head_out) * u64::from(n_rows) * 4)?;
+    let y = DeviceBuffer::new(device, max_out * 4)?;
 
     let one_pass = |timed: Option<(&Event, &Event)>| -> Result<()> {
         if let Some((start, _)) = timed {
             start.record(&stream)?;
         }
-        let mut quantized: Option<(Option<String>, u64, Option<PrefillPath>)> = None;
+        let mut prepared: Option<(Option<String>, u64, ActivationForm)> = None;
         for s in slices {
             let t = &gguf.tensors()[s.tensor];
             let n_in = t.dims.get(0);
-            // A type with no tensor-core kernel (the float matrices of the recurrent layers,
-            // 4 to 10240 values wide) is left out of a prefill pass: it is a few MB.
-            if prefill && !Kernels::has_prefill_matmul(t.ty) {
+            let rows = rows_of(&t.name);
+            // A type with no kernel for this many rows in its layout (the float matrices of
+            // the recurrent layers, 4 to 10240 values wide, in a prefill pass) is left out:
+            // it is a few MB.
+            let Ok(form) = kernels.activation_form(t.ty, s.layout, precision, rows) else {
                 continue;
-            }
-            let (dx, dq) = &inputs[&n_in];
+            };
+            let (dx, both) = &inputs[&n_in];
             let w: DevicePtr = weights.ptr().offset(s.offset);
-            if is_head(&t.name) {
-                // SAFETY: `head_q` holds one row of the head's width, `dx` has at least that
-                // many values, and `y` has room for the head's rows.
+            let act = if is_head(&t.name) {
+                // SAFETY: `head_act` holds one row of the head's width in either form, and
+                // `dx` has at least that many values.
                 unsafe {
-                    kernels.quantize_activations(
+                    kernels.prepare_activations(
                         &stream,
+                        form,
                         dx.ptr(),
-                        head_q.ptr(),
+                        head_act.ptr(),
                         n_in as u32,
                         1,
-                    )?;
-                    kernels.matvec(
-                        &stream,
-                        t.ty,
-                        w,
-                        head_q.ptr(),
-                        y.ptr(),
-                        n_in as u32,
-                        s.rows as u32,
-                        1,
-                    )?;
-                }
-                continue;
-            }
-            let path: Option<PrefillPath> =
-                if prefill { Some(kernels.prefill_path_for(t.ty, precision)?) } else { None };
-            let key = (layer_of(&t.name), n_in, path);
-            if quantized.as_ref() != Some(&key) {
-                // SAFETY: both buffers were sized for this width and batch above.
-                unsafe {
-                    match path {
-                        Some(path) => kernels.prepare_prefill_activations(
-                            &stream,
-                            path,
-                            dx.ptr(),
-                            dq.ptr(),
-                            n_in as u32,
-                            n_rows,
-                        )?,
-                        None => kernels.quantize_activations(
-                            &stream,
-                            dx.ptr(),
-                            dq.ptr(),
-                            n_in as u32,
-                            n_rows,
-                        )?,
-                    }
+                    )?
                 };
-                quantized = Some(key);
-            }
-            // SAFETY: the slice lies inside the uploaded weights, `dq` holds the
-            // activations of this width prepared for this path, and `y` has room for
-            // the largest output.
-            unsafe {
-                match path {
-                    Some(path) => kernels.matmul(
-                        &stream,
-                        t.ty,
-                        path,
-                        w,
-                        dq.ptr(),
-                        y.ptr(),
-                        n_in as u32,
-                        s.rows as u32,
-                        n_rows,
-                    )?,
-                    None => kernels.matvec(
-                        &stream,
-                        t.ty,
-                        w,
-                        dq.ptr(),
-                        y.ptr(),
-                        n_in as u32,
-                        s.rows as u32,
-                        n_rows,
-                    )?,
+                head_act.ptr()
+            } else {
+                let dq = &both[usize::from(form == ActivationForm::F16)];
+                let key = (layer_of(&t.name), n_in, form);
+                if prepared.as_ref() != Some(&key) {
+                    // SAFETY: both buffers were sized for this width, batch and form above.
+                    unsafe {
+                        kernels.prepare_activations(
+                            &stream,
+                            form,
+                            dx.ptr(),
+                            dq.ptr(),
+                            n_in as u32,
+                            n_rows,
+                        )?
+                    };
+                    prepared = Some(key);
                 }
+                dq.ptr()
+            };
+            // SAFETY: the slice lies inside the uploaded weights in the layout the plan
+            // gave it, `act` holds the activations of this width in the form the product
+            // reads, and `y` has room for the largest output.
+            unsafe {
+                kernels.product(
+                    &stream,
+                    t.ty,
+                    s.layout,
+                    precision,
+                    w,
+                    act,
+                    y.ptr(),
+                    n_in as u32,
+                    s.rows as u32,
+                    rows,
+                )?
             };
         }
         if let Some((_, end)) = timed {
