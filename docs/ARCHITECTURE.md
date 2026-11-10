@@ -137,8 +137,11 @@ machine (RTX 4070 + RTX 3060, Qwen3.8-27B) or read from the engines listed in
 | `ares-api` | Request, event, decision and error types; the `Engine` trait between HTTP and the runtime (`submit` for generation, `decide` for decisions) | Done, unit tested |
 | `ares-server` | OpenAI-compatible HTTP server, `POST /v1/systemone` (wire-compatible with llama.cpp's, served for any model) and the `ares` binary | Done as a front end, tested against a mock engine; answers that no model architecture is implemented until the runtime exists |
 | `ares-runtime` | The conductor thread and one thread per device, the step loop that connects plan, state and kernels, speculation with the n-gram drafter, the `Model` trait a model implements, a synthetic model that drives the real kernels | Done as a skeleton; 71 tests and 10 GPU tests on one device, tensor split and layer split; implements `Engine::submit` (not `decide`), greedy picks only, no prefix cache, no real model |
+| `ares-model` | Model architectures: configuration and weight table from a GGUF, and a CPU reference of the forward pass with explicit state (window and commit) that GPU implementations are compared with block by block | `qwen35` (Qwen3.5-0.8B, Qwen3.8-27B) done as reference: equal to llama.cpp to rounding on a model with f32 weights, and within what llama.cpp's own 8-bit activations cost on the real 0.8B; no GPU implementation yet |
 
-Not started: `ares-model` (architecture implementations), `ares-tokenizer`.
+In progress: `ares-tokenizer`. The second test architecture, `qwen4exp`, is
+specified ([reference/qwen4exp-architecture.md](reference/qwen4exp-architecture.md))
+and not implemented.
 
 ## A step
 

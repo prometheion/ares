@@ -1,0 +1,33 @@
+import heapq
+
+
+def shortest_paths(graph, source):
+    """Dijkstra's algorithm: graph[u][v] is the weight of the edge u -> v."""
+    dist = {source: 0.0}
+    parent = {source: None}
+    queue = [(0.0, source)]
+    done = set()
+
+    while queue:
+        d, u = heapq.heappop(queue)
+        if u in done:
+            continue
+        done.add(u)
+        for v, w in graph.get(u, {}).items():
+            if w < 0:
+                raise ValueError(f"negative edge {u} -> {v}: {w}")
+            nd = d + w
+            if nd < dist.get(v, float("inf")):
+                dist[v] = nd
+                parent[v] = u
+                heapq.heappush(queue, (nd, v))
+
+    return dist, parent
+
+
+def path_to(parent, target):
+    path = []
+    while target is not None:
+        path.append(target)
+        target = parent.get(target)
+    return path[::-1]

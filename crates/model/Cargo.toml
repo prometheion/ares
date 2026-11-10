@@ -1,0 +1,17 @@
+[package]
+name = "ares-model"
+description = "Model architectures: their configuration, weights and CPU reference"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+ares-core.workspace = true
+ares-gguf.workspace = true
+ares-quant = { path = "../quant" }
+thiserror.workspace = true
+
+[lints]
+workspace = true

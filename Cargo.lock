@@ -59,6 +59,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ares-model"
+version = "0.0.1"
+dependencies = [
+ "ares-core",
+ "ares-gguf",
+ "ares-quant",
+ "thiserror",
+]
+
+[[package]]
 name = "ares-quant"
 version = "0.0.1"
 dependencies = [
