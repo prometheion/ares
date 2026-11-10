@@ -59,7 +59,52 @@ pub(crate) struct Physical {
     pub(crate) quantized_unsupported: Option<String>,
     /// Every device extension the driver lists.
     pub(crate) extensions: Vec<String>,
+    /// What the device can share with other devices and with host memory.
+    pub(crate) sharing: Sharing,
 }
+
+/// What a device can export and import, as the loader reports it (reading it
+/// opens nothing). That a handle type is listed does not mean data crosses:
+/// the mesh checks that with a real exchange when it is made.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Sharing {
+    /// Buffers of device memory can be exported to and imported from a file
+    /// descriptor of the driver's own kind (`OPAQUE_FD`).
+    pub(crate) opaque_fd: bool,
+    /// The same for `DMA_BUF`.
+    pub(crate) dma_buf: bool,
+    /// Page-aligned host memory can be imported as a buffer
+    /// (`VK_EXT_external_memory_host`).
+    pub(crate) host_pointer: bool,
+    /// The alignment host memory must have to be imported.
+    pub(crate) host_alignment: u64,
+    /// A timeline semaphore can be exported to and imported from a file
+    /// descriptor (`OPAQUE_FD`).
+    pub(crate) timeline_fd: bool,
+    /// `VkPhysicalDeviceIDProperties::driverUUID`: memory and semaphores can only
+    /// be shared between devices of one driver.
+    pub(crate) driver_uuid: [u8; 16],
+}
+
+/// The usage every buffer of this crate is made with.
+pub(crate) const BUFFER_USAGE: vk::BufferUsageFlags = vk::BufferUsageFlags::from_raw(
+    vk::BufferUsageFlags::STORAGE_BUFFER.as_raw()
+        | vk::BufferUsageFlags::TRANSFER_SRC.as_raw()
+        | vk::BufferUsageFlags::TRANSFER_DST.as_raw()
+        | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS.as_raw(),
+);
+
+/// Device extensions that only share memory and semaphores. They are enabled
+/// whenever the driver lists them: they change nothing for a device that
+/// shares nothing.
+pub(crate) const SHARING_EXTENSIONS: &[&std::ffi::CStr] = &[
+    ash::khr::external_memory::NAME,
+    ash::khr::external_memory_fd::NAME,
+    ash::ext::external_memory_dma_buf::NAME,
+    ash::ext::external_memory_host::NAME,
+    ash::khr::external_semaphore::NAME,
+    ash::khr::external_semaphore_fd::NAME,
+];
 
 static INSTANCE: OnceLock<std::result::Result<Instance, Error>> = OnceLock::new();
 
@@ -148,9 +193,14 @@ fn describe(entry: &Entry, instance: &ash::Instance, raw: vk::PhysicalDevice) ->
     let mut subgroup = vk::PhysicalDeviceSubgroupProperties::default();
     let mut pci = vk::PhysicalDevicePCIBusInfoPropertiesEXT::default();
     let mut dot = vk::PhysicalDeviceShaderIntegerDotProductProperties::default();
+    let has_host_memory = has_extension(ash::ext::external_memory_host::NAME);
+    let mut host_properties = vk::PhysicalDeviceExternalMemoryHostPropertiesEXT::default();
     {
         let mut props2 =
             vk::PhysicalDeviceProperties2::default().push_next(&mut id).push_next(&mut subgroup);
+        if has_host_memory {
+            props2 = props2.push_next(&mut host_properties);
+        }
         if has_pci {
             props2 = props2.push_next(&mut pci);
         }
@@ -296,6 +346,13 @@ fn describe(entry: &Entry, instance: &ash::Instance, raw: vk::PhysicalDevice) ->
     } else {
         Vec::new()
     };
+    let sharing = describe_sharing(
+        instance,
+        raw,
+        &has_extension,
+        id.driver_uuid,
+        has_host_memory.then_some(host_properties.min_imported_host_pointer_alignment),
+    );
     let device_heap = device_heap.unwrap_or(0);
     let family_index = family.unwrap_or(0);
     let info = DeviceInfo {
@@ -337,5 +394,61 @@ fn describe(entry: &Entry, instance: &ash::Instance, raw: vk::PhysicalDevice) ->
             .filter_map(|e| e.extension_name_as_c_str().ok())
             .map(|name| name.to_string_lossy().into_owned())
             .collect(),
+        sharing,
     })
+}
+
+/// What the device can export and import, read from the loader's capability
+/// queries.
+fn describe_sharing(
+    instance: &ash::Instance,
+    raw: vk::PhysicalDevice,
+    has_extension: &dyn Fn(&std::ffi::CStr) -> bool,
+    driver_uuid: [u8; 16],
+    host_alignment: Option<u64>,
+) -> Sharing {
+    let buffer = |handle: vk::ExternalMemoryHandleTypeFlags,
+                  wanted: vk::ExternalMemoryFeatureFlags| {
+        let info =
+            vk::PhysicalDeviceExternalBufferInfo::default().usage(BUFFER_USAGE).handle_type(handle);
+        let mut props = vk::ExternalBufferProperties::default();
+        // SAFETY: `raw` belongs to the instance; the query only writes `props`.
+        unsafe { instance.get_physical_device_external_buffer_properties(raw, &info, &mut props) };
+        props.external_memory_properties.external_memory_features.contains(wanted)
+    };
+    let both =
+        vk::ExternalMemoryFeatureFlags::EXPORTABLE | vk::ExternalMemoryFeatureFlags::IMPORTABLE;
+    let fd = has_extension(ash::khr::external_memory_fd::NAME);
+    let mut timeline =
+        vk::SemaphoreTypeCreateInfo::default().semaphore_type(vk::SemaphoreType::TIMELINE);
+    let semaphore_info = vk::PhysicalDeviceExternalSemaphoreInfo::default()
+        .handle_type(vk::ExternalSemaphoreHandleTypeFlags::OPAQUE_FD)
+        .push_next(&mut timeline);
+    let mut semaphore = vk::ExternalSemaphoreProperties::default();
+    // SAFETY: as above.
+    unsafe {
+        instance.get_physical_device_external_semaphore_properties(
+            raw,
+            &semaphore_info,
+            &mut semaphore,
+        )
+    };
+    Sharing {
+        opaque_fd: fd && buffer(vk::ExternalMemoryHandleTypeFlags::OPAQUE_FD, both),
+        dma_buf: fd
+            && has_extension(ash::ext::external_memory_dma_buf::NAME)
+            && buffer(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT, both),
+        host_pointer: host_alignment.is_some()
+            && buffer(
+                vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT,
+                vk::ExternalMemoryFeatureFlags::IMPORTABLE,
+            ),
+        host_alignment: host_alignment.unwrap_or(0),
+        timeline_fd: has_extension(ash::khr::external_semaphore_fd::NAME)
+            && semaphore.external_semaphore_features.contains(
+                vk::ExternalSemaphoreFeatureFlags::EXPORTABLE
+                    | vk::ExternalSemaphoreFeatureFlags::IMPORTABLE,
+            ),
+        driver_uuid,
+    }
 }

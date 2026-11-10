@@ -1,0 +1,60 @@
+#version 450
+#include "mmvq_common.glsl"
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+
+// The activations of the f16 prefill kernels (`convert_act_f16.comp` is the counterpart of
+// `ares_convert_f16` in CUDA's mm.cuh, with the same layout): row b of n_in values as f16,
+// divided by a power of two chosen so that the row's largest value is below 1 (then no sum
+// of the kernels can overflow an f16, and rows of any magnitude keep their precision), and,
+// behind the values (at the next multiple of 16 bytes), the f32 factor of each row.
+//
+// One workgroup of 256 invocations per row; an invocation converts 2 values at a time.
+
+layout(local_size_x = 256) in;
+
+layout(push_constant, std430) uniform Push {
+    uint64_t x;
+    uint64_t out_;
+    uint n_in;
+    uint n_rows;
+} pc;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) writeonly buffer HalfPairs { uint v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) writeonly buffer Scales { float v[]; };
+
+shared float peak[8];
+
+void main() {
+    const uint row = uint(ares_group());
+    const uint64_t src = pc.x + 4 * uint64_t(row) * pc.n_in;
+    float m = 0.0;
+    for (uint i = gl_LocalInvocationID.x; i < pc.n_in; i += 256) {
+        m = max(m, abs(ldf1(src + 4 * uint64_t(i))));
+    }
+    m = subgroupMax(m);
+    if (gl_SubgroupInvocationID == 0) {
+        peak[gl_SubgroupID] = m;
+    }
+    barrier();
+    m = 0.0;
+    for (uint i = 0; i < gl_NumSubgroups; i++) {
+        m = max(m, peak[i]);
+    }
+    int e = 0;
+    if (m > 0.0 && !isinf(m) && !isnan(m)) {
+        float f = frexp(m, e);
+        e = clamp(e, -100, 100);
+    }
+    const float scale = ldexp(1.0, e);
+    const float inv = ldexp(1.0, -e);
+    // n_in is a multiple of 32 (checked by the host), so a pair never straddles the row.
+    for (uint i = gl_LocalInvocationID.x; i < pc.n_in / 2; i += 256) {
+        const vec2 v = ldf2(src + 8 * uint64_t(i));
+        const f16vec2 h = f16vec2(v * inv);
+        HalfPairs(pc.out_ + 2 * uint64_t(row) * pc.n_in).v[i] = packFloat2x16(h);
+    }
+    if (gl_LocalInvocationID.x == 0) {
+        const uint64_t at = pc.out_ + act_ds_offset(uint64_t(pc.n_rows) * pc.n_in * 2);
+        Scales(at).v[row] = scale;
+    }
+}

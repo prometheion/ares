@@ -15,7 +15,7 @@
 //! only when that is free:
 //!
 //! ```sh
-//! cargo run --release -p ares-vulkan --example vk_mmvq_bench [device [type]]
+//! cargo run --release -p ares-vulkan --example vk_mmvq_bench [device [type,type,...]]
 //! ```
 
 use std::time::Instant;
@@ -154,7 +154,8 @@ fn plain_read(
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     let only: Option<u32> = args.next().and_then(|arg| arg.parse().ok());
-    let only_type = args.next();
+    let only_types: Option<Vec<String>> =
+        args.next().map(|list| list.split(',').map(str::to_owned).collect());
     for info in devices()? {
         if only.is_some_and(|ordinal| ordinal != info.ordinal) {
             continue;
@@ -196,7 +197,7 @@ fn main() -> Result<()> {
             "  quantized kernels (median of 5 runs of {RUN} launches; share of the plain read / of CUDA's limit):"
         );
         for ty in FAST_TYPES {
-            if only_type.as_deref().is_some_and(|t| t != ty.name()) {
+            if only_types.as_ref().is_some_and(|list| !list.iter().any(|t| t == ty.name())) {
                 continue;
             }
             let w_bytes = ty.bytes_for(u64::from(N_OUT) * u64::from(N_IN)).expect("whole blocks");

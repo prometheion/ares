@@ -1,0 +1,84 @@
+#version 450
+#include "mmvq_common.glsl"
+
+// The rearrangement of a Q4_K matrix for the f16 prefill kernels (`mm_h_q4_K_r.comp`), the
+// same form as CUDA's `ares_repack_q4_K` (kernels/mmr.cuh) so that one upload serves both
+// backends. The form has the bytes of the file's, with the rows rounded up to a multiple of
+// 16:
+//   codes    for each tile of 16 rows and each step of 64 values of K: 32 lanes x 16 bytes.
+//            Lane (g = lane / 4, t = lane % 4) holds four 32-bit words, one per slab of 16
+//            values (kk); nibble i (0..3) of a word is the code of the even and nibble
+//            i + 4 that of the odd value of the pair that register a_i of an `mma`
+//            m16n8k16 A fragment holds:
+//              a0: row g, values 2t, 2t+1        a1: row g+8, values 2t, 2t+1
+//              a2: row g, values 2t+8, 2t+9      a3: row g+8, values 2t+8, 2t+9
+//   headers  for each tile of 16 rows and super-block of 256 values: the 16 rows' 16-byte
+//            headers (d, dmin, the 12 bytes of 6-bit scales) as in the file.
+// The codes come first (n_out16 * n_in / 2 bytes), then the headers.
+//
+// One invocation per (tile of 16 rows, step of 64 values, lane) for the codes, then one
+// per (row, super-block) for the headers.
+
+layout(local_size_x = 256) in;
+
+layout(push_constant, std430) uniform Push {
+    uint64_t src;
+    uint64_t dst;
+    uint n_out;
+    uint n_in;
+} pc;
+
+layout(buffer_reference, std430, buffer_reference_align = 16) writeonly buffer Out16 { uvec4 v[]; };
+
+void main() {
+    const uint n_tiles = (pc.n_out + 15) / 16;
+    const uint n_steps = pc.n_in / 64;
+    const uint n_sb = pc.n_in / 256;
+    const uint64_t row_bytes = uint64_t(n_sb) * 144;
+    const uint64_t n_codes = uint64_t(n_tiles) * n_steps * 32;
+    const uint64_t id = ares_group() * 256 + gl_LocalInvocationID.x;
+    if (id < n_codes) {
+        const uint lane = uint(id % 32);
+        const uint64_t unit = id / 32;
+        const uint ks = uint(unit % n_steps);
+        const uint mt = uint(unit / n_steps);
+        const uint g = lane / 4;
+        const uint t = lane % 4;
+        const uint sb = ks / 4;
+        const uint j = ks % 4;
+        uint word[4];
+        for (uint kk = 0; kk < 4; kk++) {
+            uint w = 0;
+            for (uint i = 0; i < 4; i++) {
+                const uint row = mt * 16 + g + 8 * (i & 1);
+                uint q0 = 0;
+                uint q1 = 0;
+                if (row < pc.n_out) {
+                    const uint64_t blk = pc.src + uint64_t(row) * row_bytes + uint64_t(sb) * 144;
+                    const uint kp0 = kk * 16 + 2 * t + 8 * (i >> 1);
+                    const uint b0 = ld1(blk + 16 + 32 * j + (kp0 & 31));
+                    const uint b1 = ld1(blk + 16 + 32 * j + ((kp0 + 1) & 31));
+                    q0 = kp0 >= 32 ? b0 >> 4 : b0 & 0xFu;
+                    q1 = kp0 + 1 >= 32 ? b1 >> 4 : b1 & 0xFu;
+                }
+                w |= (q0 << (4 * i)) | (q1 << (4 * i + 16));
+            }
+            word[kk] = w;
+        }
+        Out16(pc.dst).v[uint(unit) * 32 + lane] = uvec4(word[0], word[1], word[2], word[3]);
+    } else {
+        const uint64_t h = id - n_codes;  // (tile, super-block, row of the tile)
+        if (h < uint64_t(n_tiles) * n_sb * 16) {
+            const uint r16 = uint(h % 16);
+            const uint64_t ts = h / 16;
+            const uint sb = uint(ts % n_sb);
+            const uint mt = uint(ts / n_sb);
+            const uint row = mt * 16 + r16;
+            uvec4 hdr = uvec4(0);
+            if (row < pc.n_out) {
+                hdr = ld16(pc.src + uint64_t(row) * row_bytes + uint64_t(sb) * 144);
+            }
+            Out16(pc.dst + uint64_t(n_tiles) * 16 * pc.n_in / 2).v[uint(h)] = hdr;
+        }
+    }
+}

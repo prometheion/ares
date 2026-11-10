@@ -131,16 +131,61 @@ impl Module {
             .module(self.0.raw)
             .name(&c_name)
             .specialization_info(&specialization);
-        let info =
-            vk::ComputePipelineCreateInfo::default().stage(stage).layout(self.0.device.0.layout);
         let device = &self.0.device;
-        // SAFETY: the module and layout are alive; the specialization data
-        // outlives the call.
+        let mut info =
+            vk::ComputePipelineCreateInfo::default().stage(stage).layout(self.0.device.0.layout);
+        if device.0.pipeline_stats.is_some() {
+            info = info.flags(vk::PipelineCreateFlags::CAPTURE_STATISTICS_KHR);
+        }
+        // SAFETY: the module and layout are alive; the specialization data outlives the call.
         let pipelines = unsafe {
             device.raw().create_compute_pipelines(vk::PipelineCache::null(), &[info], None)
         }
         .map_err(|(_, code)| Error::vk("vkCreateComputePipelines", code))?;
+        if let Some(stats) = &device.0.pipeline_stats {
+            print_pipeline_stats(stats, pipelines[0], name);
+        }
         Ok(Function(Arc::new(FunctionInner { module: self.clone(), raw: pipelines[0] })))
+    }
+}
+
+/// Prints what the driver's compiler says about a pipeline (`ARES_VK_PIPELINE_STATS`): its
+/// statistics, which on NVIDIA are the register count, the size of the machine code and the
+/// shared memory. (The driver gives no disassembly.)
+fn print_pipeline_stats(
+    stats: &ash::khr::pipeline_executable_properties::Device,
+    pipeline: vk::Pipeline,
+    name: &str,
+) {
+    let text = |c: std::result::Result<&std::ffi::CStr, std::ffi::FromBytesUntilNulError>| {
+        c.map_or_else(|_| String::new(), |n| n.to_string_lossy().into_owned())
+    };
+    let info = vk::PipelineInfoKHR::default().pipeline(pipeline);
+    // SAFETY: the pipeline was created with the capture flags on this device.
+    let Ok(executables) = (unsafe { stats.get_pipeline_executable_properties(&info) }) else {
+        return;
+    };
+    for index in 0..executables.len() {
+        let exe = vk::PipelineExecutableInfoKHR::default()
+            .pipeline(pipeline)
+            .executable_index(index as u32);
+        // SAFETY: as above; the index is one the driver listed.
+        let statistics =
+            unsafe { stats.get_pipeline_executable_statistics(&exe) }.unwrap_or_default();
+        let mut line = format!("pipeline {name}:");
+        for s in &statistics {
+            // SAFETY: the union member read is the one the statistic's format names.
+            let value = unsafe {
+                match s.format {
+                    vk::PipelineExecutableStatisticFormatKHR::BOOL32 => s.value.b32.to_string(),
+                    vk::PipelineExecutableStatisticFormatKHR::INT64 => s.value.i64.to_string(),
+                    vk::PipelineExecutableStatisticFormatKHR::UINT64 => s.value.u64.to_string(),
+                    _ => s.value.f64.to_string(),
+                }
+            };
+            line.push_str(&format!(" {}={value}", text(s.name_as_c_str())));
+        }
+        eprintln!("{line}");
     }
 }
 
@@ -263,6 +308,44 @@ impl Function {
     /// GPU.
     pub unsafe fn launch(&self, stream: &Stream, grid: [u32; 3], args: Args) -> Result<()> {
         stream.dispatch(self, grid, &args)
+    }
+}
+
+/// A kernel whose pipeline is made on first use. The driver compiles a shader for the GPU
+/// when a pipeline is made, which takes milliseconds for a small kernel and tens of them
+/// for a large one; a device has hundreds (a weight kernel for each type and number of
+/// activation rows, the prefill kernels), and most of them a model never runs. The runtime
+/// that knows which it needs asks for them ahead of the first step ([`Lazy::get`] is the
+/// same call), so that no step pays for a compilation.
+pub(crate) struct Lazy {
+    device: Device,
+    image: &'static [u8],
+    cell: std::sync::OnceLock<Function>,
+}
+
+impl std::fmt::Debug for Lazy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Lazy(made: {})", self.cell.get().is_some())
+    }
+}
+
+impl Lazy {
+    pub(crate) fn new(device: &Device, image: &'static [u8]) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            device: device.clone(),
+            image,
+            cell: std::sync::OnceLock::new(),
+        })
+    }
+
+    /// The pipeline, made now if it was not yet. Two threads that ask at the same time may
+    /// both make it; one is kept.
+    pub(crate) fn get(&self) -> Result<&Function> {
+        if let Some(function) = self.cell.get() {
+            return Ok(function);
+        }
+        let made = Module::load(&self.device, self.image)?.function("main")?;
+        Ok(self.cell.get_or_init(|| made))
     }
 }
 

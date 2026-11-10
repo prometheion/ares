@@ -3,11 +3,17 @@
 //! what really happens when memory of one device is imported by the other, or both
 //! import the same host pages. It prints every call that fails with its result code.
 //!
+//! The first half uses the raw Vulkan calls and prints every failing call with its result
+//! code. The second half ([`data`]) moves real data through each way of sharing that the
+//! first half found to be accepted, with the engine's own device layer, because a call that
+//! succeeds does not prove that the other device sees what was written (or reads what was
+//! there).
+//!
 //! ```sh
 //! cargo run --release -p ares-vulkan --example vk_mesh_probe
 //! ```
 
-use std::ffi::{CStr, c_void};
+use std::ffi::c_void;
 
 use ash::vk;
 
@@ -398,7 +404,8 @@ fn main() {
         }
         let _ = gpu.queue_family;
     }
-    let _ = CStr::from_bytes_with_nul(b"\0");
+    drop(gpus);
+    data::run();
 }
 
 /// A zeroed anonymous mapping of `len` bytes (page aligned).
@@ -420,4 +427,328 @@ unsafe fn libc_mmap(len: usize) -> *mut c_void {
     // PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS
     // SAFETY: the arguments describe a fresh anonymous mapping.
     unsafe { mmap(std::ptr::null_mut(), len, 3, 0x22, -1, 0) }
+}
+
+/// What really crosses between the devices: data written and read through kernels and through
+/// the copy engine, and ordering through a shared timeline semaphore.
+mod data {
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    use ares_vulkan::{
+        Args, Device, DeviceBuffer, DevicePtr, Function, HostPages, Module, ShareKind,
+        SharedTimeline, Stream, Wait, device_count,
+    };
+
+    const N: usize = 1 << 16;
+
+    /// `out[i] = in[i]` as a kernel (the sum kernel with one operand).
+    struct Copier(Function);
+
+    impl Copier {
+        fn new(device: &Device) -> Self {
+            let image = include_bytes!(concat!(env!("OUT_DIR"), "/mesh_sum.spv"));
+            Self(Module::load(device, image).unwrap().function("main").unwrap())
+        }
+
+        fn copy(&self, stream: &Stream, dst: DevicePtr, src: DevicePtr, n: usize) {
+            let mut args = Args::new().ptr(dst).ptr(src);
+            for _ in 1..8 {
+                args = args.ptr(DevicePtr::NULL);
+            }
+            let args = args.u32(1).u32(n as u32);
+            // SAFETY: the sum kernel with one operand; both ranges hold `n` values.
+            unsafe { self.0.launch(stream, [(n as u32).div_ceil(256), 1, 1], args).unwrap() };
+        }
+    }
+
+    fn pattern(seed: f32) -> Vec<u8> {
+        (0..N).flat_map(|i| (seed + i as f32).to_le_bytes()).collect()
+    }
+
+    fn check(label: &str, got: &[u8], seed: f32) {
+        let want = pattern(seed);
+        let (got_words, want_words) = (got.as_chunks::<4>().0, want.as_chunks::<4>().0);
+        let wrong = got_words.iter().zip(want_words).filter(|(a, b)| a != b).count();
+        let first = got_words.iter().zip(want_words).position(|(a, b)| a != b);
+        if wrong == 0 {
+            println!("    {label}: correct");
+        } else {
+            println!(
+                "    {label}: WRONG, {wrong} of {N} values differ (first at {first:?}, got {:?})",
+                &got[..16.min(got.len())]
+            );
+        }
+    }
+
+    fn zeros() -> Vec<u8> {
+        vec![0u8; N * 4]
+    }
+
+    pub fn run() {
+        if device_count().unwrap_or(0) < 2 {
+            return;
+        }
+        let devices: Vec<Device> =
+            (0..2).map(|i| Device::open_with(i, Wait::Spin).unwrap()).collect();
+        let streams: Vec<Stream> = devices.iter().map(|d| Stream::new(d).unwrap()).collect();
+        let copiers: Vec<Copier> = devices.iter().map(Copier::new).collect();
+        let bytes = N * 4;
+
+        for kind in [ShareKind::OpaqueFd, ShareKind::DmaBuf] {
+            println!("\n== video memory of one device imported by the other ({kind:?}), data");
+            for (owner, user) in [(0usize, 1usize), (1, 0)] {
+                println!(
+                    "  memory of {} used from {}",
+                    devices[owner].info().name,
+                    devices[user].info().name
+                );
+                let exported =
+                    match DeviceBuffer::new_exportable(&devices[owner], bytes as u64, kind) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            println!("    export failed: {e}");
+                            continue;
+                        }
+                    };
+                let shared = match exported.export() {
+                    Ok(s) => s,
+                    Err(e) => {
+                        println!("    export fd failed: {e}");
+                        continue;
+                    }
+                };
+                let view = match DeviceBuffer::import(&devices[user], shared) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        println!("    import failed: {e}");
+                        continue;
+                    }
+                };
+                println!(
+                    "    import: ok (view at {:#x}, owner at {:#x})",
+                    view.ptr().as_raw(),
+                    exported.ptr().as_raw()
+                );
+                let own_src = DeviceBuffer::new(&devices[owner], bytes as u64).unwrap();
+                let user_src = DeviceBuffer::new(&devices[user], bytes as u64).unwrap();
+                let user_dst = DeviceBuffer::new(&devices[user], bytes as u64).unwrap();
+                // The user writes into the owner's memory: with a kernel, and with a copy.
+                for (label, kernel) in
+                    [("user kernel writes", true), ("user copy engine writes", false)]
+                {
+                    exported.write(0, &zeros()).unwrap();
+                    user_src.write(0, &pattern(1.0)).unwrap();
+                    if kernel {
+                        copiers[user].copy(&streams[user], view.ptr(), user_src.ptr(), N);
+                    } else {
+                        // SAFETY: whole buffers of the stream's device.
+                        unsafe { streams[user].copy(view.ptr(), user_src.ptr(), bytes).unwrap() };
+                    }
+                    streams[user].synchronize().unwrap();
+                    let mut got = vec![0u8; bytes];
+                    exported.read(0, &mut got).unwrap();
+                    check(label, &got, 1.0);
+                }
+                // The user reads the owner's memory.
+                for (label, kernel) in
+                    [("user kernel reads", true), ("user copy engine reads", false)]
+                {
+                    exported.write(0, &pattern(7.0)).unwrap();
+                    user_dst.write(0, &zeros()).unwrap();
+                    if kernel {
+                        copiers[user].copy(&streams[user], user_dst.ptr(), view.ptr(), N);
+                    } else {
+                        // SAFETY: whole buffers of the stream's device.
+                        unsafe { streams[user].copy(user_dst.ptr(), view.ptr(), bytes).unwrap() };
+                    }
+                    streams[user].synchronize().unwrap();
+                    let mut got = vec![0u8; bytes];
+                    user_dst.read(0, &mut got).unwrap();
+                    check(label, &got, 7.0);
+                }
+                let _ = &own_src;
+            }
+        }
+
+        println!("\n== host pages imported by both devices, data");
+        let refs: Vec<&Device> = devices.iter().collect();
+        let pages = Arc::new(HostPages::new(&refs, bytes).unwrap());
+        let views: Vec<DeviceBuffer> =
+            devices.iter().map(|d| DeviceBuffer::import_host(d, &pages).unwrap()).collect();
+        println!(
+            "  import: ok (views at {:#x} and {:#x}, {} bytes)",
+            views[0].ptr().as_raw(),
+            views[1].ptr().as_raw(),
+            pages.len()
+        );
+        let local: Vec<DeviceBuffer> =
+            devices.iter().map(|d| DeviceBuffer::new(d, bytes as u64).unwrap()).collect();
+        let host_read = || -> Vec<u8> {
+            let mut out = vec![0u8; bytes];
+            for (i, b) in out.iter_mut().enumerate() {
+                // SAFETY: inside the pages; the devices are idle.
+                *b = unsafe { pages.as_ptr().add(i).read_volatile() };
+            }
+            out
+        };
+        for d in 0..2 {
+            let name = &devices[d].info().name;
+            for (label, kernel) in [("kernel", true), ("copy engine", false)] {
+                // device writes, host reads
+                // SAFETY: inside the pages; the devices are idle.
+                unsafe { pages.as_ptr().write_bytes(0, bytes) };
+                local[d].write(0, &pattern(3.0)).unwrap();
+                if kernel {
+                    copiers[d].copy(&streams[d], views[d].ptr(), local[d].ptr(), N);
+                } else {
+                    // SAFETY: whole buffers of the stream's device.
+                    unsafe { streams[d].copy(views[d].ptr(), local[d].ptr(), bytes).unwrap() };
+                }
+                streams[d].synchronize().unwrap();
+                check(&format!("{name}: {label} writes, host reads"), &host_read(), 3.0);
+                // host writes, device reads
+                let want = pattern(5.0);
+                for (i, b) in want.iter().enumerate() {
+                    // SAFETY: inside the pages; the devices are idle.
+                    unsafe { pages.as_ptr().add(i).write_volatile(*b) };
+                }
+                local[d].write(0, &zeros()).unwrap();
+                if kernel {
+                    copiers[d].copy(&streams[d], local[d].ptr(), views[d].ptr(), N);
+                } else {
+                    // SAFETY: as above.
+                    unsafe { streams[d].copy(local[d].ptr(), views[d].ptr(), bytes).unwrap() };
+                }
+                streams[d].synchronize().unwrap();
+                let mut got = vec![0u8; bytes];
+                local[d].read(0, &mut got).unwrap();
+                check(&format!("{name}: host writes, {label} reads"), &got, 5.0);
+            }
+        }
+        // One device writes, the other reads, with the host out of the middle.
+        for (w, r) in [(0usize, 1usize), (1, 0)] {
+            // SAFETY: the devices are idle.
+            unsafe { pages.as_ptr().write_bytes(0, bytes) };
+            local[w].write(0, &pattern(9.0)).unwrap();
+            local[r].write(0, &zeros()).unwrap();
+            copiers[w].copy(&streams[w], views[w].ptr(), local[w].ptr(), N);
+            streams[w].synchronize().unwrap();
+            copiers[r].copy(&streams[r], local[r].ptr(), views[r].ptr(), N);
+            streams[r].synchronize().unwrap();
+            let mut got = vec![0u8; bytes];
+            local[r].read(0, &mut got).unwrap();
+            check(
+                &format!(
+                    "{} kernel writes, {} kernel reads",
+                    devices[w].info().name,
+                    devices[r].info().name
+                ),
+                &got,
+                9.0,
+            );
+        }
+
+        println!("\n== a kernel polling host memory that the host writes while it polls");
+        // The ways a kernel can read a word again and again: a plain load of a `volatile
+        // coherent` buffer, the same on the upper half of a 64-bit word, and two atomics.
+        // The host writes the awaited value 50 ms after the kernel starts. 16 million polls
+        // take 0.2 s for a load that is answered by a cache, 2 s or more for one that is not.
+        let module_poll = |device: &Device| {
+            Module::load(device, include_bytes!(concat!(env!("OUT_DIR"), "/mesh_poll_test.spv")))
+                .unwrap()
+                .function("main")
+                .unwrap()
+        };
+        for (mode, label) in [
+            (0u32, "volatile coherent 64-bit load"),
+            (1, "volatile coherent 32-bit load"),
+            (2, "atomicAdd(word, 0)"),
+            (3, "atomicLoad, device scope"),
+        ] {
+            for d in 0..2 {
+                let function = module_poll(&devices[d]);
+                let out = DeviceBuffer::new(&devices[d], 4096).unwrap();
+                out.write(0, &[0u8; 64]).unwrap();
+                let p = views[d].ptr();
+                let args =
+                    Args::new().ptr(p).ptr(p).ptr(p).ptr(out.ptr()).u32(mode).u32(1 << 24).u32(7);
+                // SAFETY: the host pages hold two words; the output buffer four.
+                unsafe { function.launch(&streams[d], [1, 1, 1], args).unwrap() };
+                // SAFETY: inside the pages; the kernel only reads.
+                unsafe { (pages.as_ptr().add(4) as *mut u32).write_volatile(0) };
+                let start = Instant::now();
+                streams[d].flush().unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                // SAFETY: as above.
+                unsafe { (pages.as_ptr().add(4) as *mut u32).write_volatile(7) };
+                streams[d].synchronize().unwrap();
+                let mut got = [0u8; 8];
+                out.read(0, &mut got).unwrap();
+                println!(
+                    "    {label} on {}: {} after {} polls, {:?}",
+                    devices[d].info().name,
+                    if got[0] == 1 { "saw the write" } else { "never saw the write" },
+                    u32::from_le_bytes(got[4..8].try_into().unwrap()),
+                    start.elapsed()
+                );
+            }
+        }
+        // SAFETY: the devices are idle.
+        unsafe { (pages.as_ptr().add(4) as *mut u32).write_volatile(0) };
+
+        println!("\n== a timeline semaphore shared by both devices");
+        match SharedTimeline::new(&devices) {
+            Err(e) => println!("  share failed: {e}"),
+            Ok(timeline) => {
+                println!("  export / import: ok");
+                for s in &streams {
+                    s.link(&streams[0]);
+                }
+                // Device 0 writes into the host pages and signals 1; device 1 waits for 1 and
+                // copies the pages. The order is only right if the wait works.
+                for (w, r) in [(0usize, 1usize), (1, 0)] {
+                    // SAFETY: the devices are idle.
+                    unsafe { pages.as_ptr().write_bytes(0, bytes) };
+                    local[w].write(0, &pattern(11.0)).unwrap();
+                    local[r].write(0, &zeros()).unwrap();
+                    let base = timeline.value(&devices[0]).unwrap();
+                    // A long kernel chain before the signal makes a missing wait show up.
+                    for _ in 0..200 {
+                        copiers[w].copy(&streams[w], views[w].ptr(), local[w].ptr(), N);
+                    }
+                    timeline.signal(&streams[w], base + 1).unwrap();
+                    timeline.wait(&streams[r], base + 1).unwrap();
+                    copiers[r].copy(&streams[r], local[r].ptr(), views[r].ptr(), N);
+                    streams[r].synchronize().unwrap();
+                    streams[w].synchronize().unwrap();
+                    let mut got = vec![0u8; bytes];
+                    local[r].read(0, &mut got).unwrap();
+                    check(&format!("signal on {w}, wait on {r}"), &got, 11.0);
+                    println!(
+                        "    counter seen from device 0: {}, from device 1: {}",
+                        timeline.value(&devices[0]).unwrap(),
+                        timeline.value(&devices[1]).unwrap()
+                    );
+                }
+                // The cost of a hand-over between the two devices, back and forth.
+                let base = timeline.value(&devices[0]).unwrap();
+                let hops = 400u64;
+                let start = Instant::now();
+                for k in 0..hops / 2 {
+                    let t = base + 2 * k;
+                    timeline.wait(&streams[0], t).unwrap();
+                    timeline.signal(&streams[0], t + 1).unwrap();
+                    timeline.wait(&streams[1], t + 1).unwrap();
+                    timeline.signal(&streams[1], t + 2).unwrap();
+                }
+                streams[0].synchronize().unwrap();
+                streams[1].synchronize().unwrap();
+                println!(
+                    "    ping-pong: {:.1} us per hand-over (host submits included)",
+                    start.elapsed().as_secs_f64() * 1e6 / hops as f64
+                );
+            }
+        }
+    }
 }

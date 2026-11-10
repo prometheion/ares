@@ -1,0 +1,64 @@
+#version 450
+#include "common.glsl"
+
+layout(local_size_x = 256) in;
+
+// The words that carry data between two devices: the low half is an f32 and
+// the high half the number of the sum it belongs to. A receiver knows that a
+// word is the one it waits for when its high half is the token, so no flag and
+// no memory fence orders the data: the data is its own flag. A writer stores a
+// word with one aligned 64-bit access, which is one memory transaction, so the
+// halves arrive together.
+//
+// The receiver reads the two halves with atomic operations. Only an atomic is
+// certain to be done again on every poll (a plain or `volatile` load through a
+// buffer reference is not: the compiler hoists it out of the loop), and it is
+// done in the L2 cache, where the other device's writes to this device's video
+// memory arrive.
+layout(buffer_reference, std430, buffer_reference_align = 8) buffer WordsOut { uint64_t v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 8) buffer WordsIn { uint v[]; };
+
+layout(push_constant, std430) uniform Push {
+    FloatRefRO data;
+    FloatRef out_;
+    WordsOut peer;   // where this device writes its partial: the peer's receive words
+    WordsIn own;     // where the peer writes its partial: this device's receive words
+    uint n;
+    uint token;
+    uint polls;      // how many polls of a word to give up after
+} pc;
+
+// The sum of two devices' partial results with one kernel per device and no
+// copy: each writes its partial to the other, waits for the other's, and adds.
+//
+// A launch has a few workgroups, each going through the values in strides, and
+// every workgroup writes all of its words before it waits for any, so
+// no workgroup waits for a value that a workgroup which is not running yet
+// would have to write.
+//
+// A peer that never arrives (a bug in the caller) makes the result NaN after
+// `polls` polls instead of leaving the device waiting for good.
+void main() {
+    const uint stride = gl_NumWorkGroups.x * 256;
+    const uint start = gl_WorkGroupID.x * 256 + gl_LocalInvocationID.x;
+    const uint64_t tag = uint64_t(pc.token) << 32;
+
+    for (uint i = start; i < pc.n; i += stride) {
+        pc.peer.v[i] = tag | uint64_t(floatBitsToUint(pc.data.v[i]));
+    }
+
+    bool ok = true;
+    for (uint i = start; i < pc.n; i += stride) {
+        uint left = ok ? pc.polls : 0;
+        while (atomicAdd(pc.own.v[2 * i + 1], 0) != pc.token && left > 0) {
+            --left;
+        }
+        const bool arrived = atomicAdd(pc.own.v[2 * i + 1], 0) == pc.token;
+        ok = ok && arrived;
+        const float theirs = uintBitsToFloat(atomicAdd(pc.own.v[2 * i], 0));
+        const float mine = pc.data.v[i];
+        // Addition of two f32 values commutes bit for bit, so both devices
+        // get the same result with the operands in their own order.
+        pc.out_.v[i] = ok ? mine + theirs : uintBitsToFloat(0x7fc00000u);
+    }
+}

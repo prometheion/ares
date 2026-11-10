@@ -1,0 +1,6 @@
+#version 450
+#define ARES_ACC32 1
+#include "mm_f16_head.glsl"
+#include "mmd_q2_K.glsl"
+#include "mmw_unit.glsl"
+#include "mm_f16_core.glsl"

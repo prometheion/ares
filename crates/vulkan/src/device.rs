@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, Weak};
 use ash::vk;
 
 use crate::error::{Check, Error, Result};
-use crate::instance::{Instance, PUSH_CONSTANT_BYTES, Physical, instance};
+use crate::instance::{Instance, PUSH_CONSTANT_BYTES, Physical, SHARING_EXTENSIONS, instance};
 use crate::memory::DevicePtr;
 use crate::stream::StreamInner;
 use crate::transfer::Transfer;
@@ -210,6 +210,14 @@ pub(crate) struct Inner {
     /// Bytes of device memory allocated through this crate, for `mem_info`
     /// on a device without `VK_EXT_memory_budget`.
     allocated: AtomicU64,
+    /// The compiler statistics of pipelines (`ARES_VK_PIPELINE_STATS`), when asked for.
+    pub(crate) pipeline_stats: Option<ash::khr::pipeline_executable_properties::Device>,
+    /// File descriptors of memory (`VK_KHR_external_memory_fd`), when the device has them.
+    pub(crate) memory_fd: Option<ash::khr::external_memory_fd::Device>,
+    /// Imports of host pages (`VK_EXT_external_memory_host`).
+    pub(crate) host_memory: Option<ash::ext::external_memory_host::Device>,
+    /// File descriptors of semaphores (`VK_KHR_external_semaphore_fd`).
+    pub(crate) semaphore_fd: Option<ash::khr::external_semaphore_fd::Device>,
 }
 
 impl Drop for Inner {
@@ -310,6 +318,26 @@ impl Device {
             extensions.push(ash::khr::cooperative_matrix::NAME.as_ptr());
             features = features.push_next(&mut coop_features);
         }
+        // The compiler's statistics of a pipeline (registers, instructions), when asked
+        // for with `ARES_VK_PIPELINE_STATS` and the driver has them.
+        let mut executable_features =
+            vk::PhysicalDevicePipelineExecutablePropertiesFeaturesKHR::default()
+                .pipeline_executable_info(true);
+        let pipeline_stats = std::env::var_os("ARES_VK_PIPELINE_STATS").is_some()
+            && physical.extensions.iter().any(|e| {
+                e.as_str() == ash::khr::pipeline_executable_properties::NAME.to_str().unwrap_or("")
+            });
+        if pipeline_stats {
+            extensions.push(ash::khr::pipeline_executable_properties::NAME.as_ptr());
+            features = features.push_next(&mut executable_features);
+        }
+        // What lets this device share memory and semaphores with another one.
+        let listed = |name: &std::ffi::CStr| {
+            physical.extensions.iter().any(|e| e.as_bytes() == name.to_bytes())
+        };
+        for name in SHARING_EXTENSIONS.iter().filter(|name| listed(name)) {
+            extensions.push(name.as_ptr());
+        }
         let info = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queues)
             .enabled_extension_names(&extensions)
@@ -334,6 +362,14 @@ impl Device {
         };
         // SAFETY: the family was requested with one queue just above.
         let queue = unsafe { raw.get_device_queue(physical.queue_family, 0) };
+        let pipeline_stats = pipeline_stats
+            .then(|| ash::khr::pipeline_executable_properties::Device::new(&instance.raw, &raw));
+        let memory_fd = listed(ash::khr::external_memory_fd::NAME)
+            .then(|| ash::khr::external_memory_fd::Device::new(&instance.raw, &raw));
+        let host_memory = listed(ash::ext::external_memory_host::NAME)
+            .then(|| ash::ext::external_memory_host::Device::new(&instance.raw, &raw));
+        let semaphore_fd = listed(ash::khr::external_semaphore_fd::NAME)
+            .then(|| ash::khr::external_semaphore_fd::Device::new(&instance.raw, &raw));
 
         Ok(Self(Arc::new(Inner {
             instance,
@@ -346,6 +382,10 @@ impl Device {
             streams: Mutex::new(Vec::new()),
             transfer: Mutex::new(None),
             allocated: AtomicU64::new(0),
+            pipeline_stats,
+            memory_fd,
+            host_memory,
+            semaphore_fd,
         })))
     }
 
@@ -404,33 +444,29 @@ impl Device {
     }
 
     /// Submits one batch to the device's queue. `waits` are timeline
-    /// semaphore values the batch waits for before it starts; `signal` is a
-    /// timeline value the batch sets when it has finished; `fence` is
-    /// signalled too when it is not null.
+    /// semaphore values the batch waits for before it starts; `signals` are
+    /// timeline values the batch sets when it has finished (the stream's own
+    /// first); `fence` is signalled too when it is not null.
     pub(crate) fn submit(
         &self,
         command_buffers: &[vk::CommandBuffer],
         waits: &[(vk::Semaphore, u64)],
-        signal: Option<(vk::Semaphore, u64)>,
+        signals: &[(vk::Semaphore, u64)],
         fence: vk::Fence,
     ) -> Result<()> {
         let wait_semaphores: Vec<vk::Semaphore> = waits.iter().map(|w| w.0).collect();
         let wait_values: Vec<u64> = waits.iter().map(|w| w.1).collect();
         let wait_stages = vec![vk::PipelineStageFlags::ALL_COMMANDS; waits.len()];
-        let (signal_semaphores, signal_values): (&[vk::Semaphore], &[u64]) = match &signal {
-            Some((semaphore, value)) => {
-                (std::slice::from_ref(semaphore), std::slice::from_ref(value))
-            }
-            None => (&[], &[]),
-        };
+        let signal_semaphores: Vec<vk::Semaphore> = signals.iter().map(|s| s.0).collect();
+        let signal_values: Vec<u64> = signals.iter().map(|s| s.1).collect();
         let mut timeline = vk::TimelineSemaphoreSubmitInfo::default()
             .wait_semaphore_values(&wait_values)
-            .signal_semaphore_values(signal_values);
+            .signal_semaphore_values(&signal_values);
         let submit = vk::SubmitInfo::default()
             .wait_semaphores(&wait_semaphores)
             .wait_dst_stage_mask(&wait_stages)
             .command_buffers(command_buffers)
-            .signal_semaphores(signal_semaphores)
+            .signal_semaphores(&signal_semaphores)
             .push_next(&mut timeline);
         let queue = lock(&self.0.queue);
         // SAFETY: the queue is externally synchronised by the lock; every
@@ -492,6 +528,17 @@ impl Device {
             }
         }
         first_error.map_or(Ok(()), Err)
+    }
+
+    /// Submits what every stream of the device has recorded, without waiting.
+    pub(crate) fn flush_streams(&self) {
+        let streams: Vec<Arc<StreamInner>> = {
+            let registry = lock(&self.0.streams);
+            registry.iter().filter_map(Weak::upgrade).collect()
+        };
+        for stream in &streams {
+            let _ = stream.flush(true);
+        }
     }
 
     pub(crate) fn register_stream(&self, stream: &Arc<StreamInner>) {

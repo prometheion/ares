@@ -1,0 +1,54 @@
+#version 450
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_KHR_shader_subgroup_basic : require
+#include "common.glsl"
+
+layout(local_size_x = 32) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 8) volatile coherent buffer W64 { uint64_t v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) volatile coherent buffer W32 { uint v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer A32 { uint v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer Out { uint v[]; };
+
+layout(push_constant, std430) uniform Push {
+    W64 w64;
+    W32 w32;
+    A32 a32;
+    Out o;
+    uint mode;
+    uint limit;
+    uint want;
+} pc;
+
+void main() {
+    if (gl_LocalInvocationID.x != 0) return;
+    uint polls = 0;
+    uint seen = 0;
+    if (pc.mode == 0) {
+        while (polls < pc.limit) {
+            uint64_t w = pc.w64.v[0];
+            if (uint(w >> 32) == pc.want) { seen = 1; break; }
+            polls++;
+        }
+    } else if (pc.mode == 1) {
+        while (polls < pc.limit) {
+            uint w = pc.w32.v[1];
+            if (w == pc.want) { seen = 1; break; }
+            polls++;
+        }
+    } else if (pc.mode == 2) {
+        while (polls < pc.limit) {
+            uint w = atomicAdd(pc.a32.v[1], 0);
+            if (w == pc.want) { seen = 1; break; }
+            polls++;
+        }
+    } else {
+        while (polls < pc.limit) {
+            uint w = atomicLoad(pc.a32.v[1], gl_ScopeDevice, gl_StorageSemanticsBuffer, gl_SemanticsAcquire);
+            if (w == pc.want) { seen = 1; break; }
+            polls++;
+        }
+    }
+    pc.o.v[0] = seen;
+    pc.o.v[1] = polls;
+}

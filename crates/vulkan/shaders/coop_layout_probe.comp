@@ -1,0 +1,45 @@
+#version 450
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_control_flow_attributes : require
+
+// Probe for `vk_coop_layout`: element e of the A operand of lane l is set to l * 8 + e and
+// the matrix is multiplied by the identity and stored row-major, so that the host can read
+// where each element went. One subgroup.
+
+layout(local_size_x = 32) in;
+
+layout(push_constant, std430) uniform Push {
+    uint64_t out_;
+} pc;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) writeonly buffer Out { float v[]; };
+
+shared float16_t eye[256];
+shared float result[256];
+
+void main() {
+    const uint lane = gl_LocalInvocationID.x;
+    for (uint i = lane; i < 256; i += 32) {
+        eye[i] = (i / 16 == i % 16) ? 1.0hf : 0.0hf;
+    }
+    barrier();
+    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> a;
+    [[unroll]] for (uint e = 0; e < 8; e++) {
+        a[e] = float16_t(lane * 8 + e);
+    }
+    coopmat<float16_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> b;
+    coopMatLoad(b, eye, 0, 16, gl_CooperativeMatrixLayoutRowMajor);
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> c =
+        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+    c = coopMatMulAdd(a, b, c);
+    coopMatStore(c, result, 0, 16, gl_CooperativeMatrixLayoutRowMajor);
+    barrier();
+    for (uint i = lane; i < 256; i += 32) {
+        Out(pc.out_).v[i] = result[i];
+    }
+}

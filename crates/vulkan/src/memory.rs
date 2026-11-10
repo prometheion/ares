@@ -7,14 +7,17 @@
 //! engine uses that stays far below the driver's allocation count limit, and it
 //! keeps every buffer a plain range of one address space.
 
+use std::alloc::Layout;
 use std::ops::{Deref, DerefMut};
+use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
 use std::ptr::NonNull;
+use std::sync::Arc;
 
 use ash::vk;
 
 use crate::device::Device;
 use crate::error::{Check, Error, Result};
-use crate::instance::Physical;
+use crate::instance::{BUFFER_USAGE, Physical};
 use crate::transfer;
 
 /// An address in device memory (`VK_KHR_buffer_device_address`).
@@ -101,10 +104,150 @@ const HOST_RULES: &[(vk::MemoryPropertyFlags, vk::MemoryPropertyFlags)] = {
     &[(CACHED, DEVICE_LOCAL), (COHERENT, DEVICE_LOCAL), (CACHED, NONE), (COHERENT, NONE)]
 };
 
+/// How memory of one device is handed to another one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShareKind {
+    /// A file descriptor in the driver's own format (`VK_KHR_external_memory_fd`,
+    /// `OPAQUE_FD`). Only devices of one driver can import it.
+    OpaqueFd,
+    /// A `dma-buf` (`VK_EXT_external_memory_dma_buf`), which other drivers
+    /// can import as well.
+    DmaBuf,
+}
+
+impl ShareKind {
+    fn flag(self) -> vk::ExternalMemoryHandleTypeFlags {
+        match self {
+            ShareKind::OpaqueFd => vk::ExternalMemoryHandleTypeFlags::OPAQUE_FD,
+            ShareKind::DmaBuf => vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            ShareKind::OpaqueFd => "OPAQUE_FD",
+            ShareKind::DmaBuf => "DMA_BUF",
+        }
+    }
+
+    /// Whether `device` lists this kind as importable and exportable for
+    /// buffers.
+    pub fn supported_by(self, device: &Device) -> bool {
+        let sharing = &device.physical().sharing;
+        device.0.memory_fd.is_some()
+            && match self {
+                ShareKind::OpaqueFd => sharing.opaque_fd,
+                ShareKind::DmaBuf => sharing.dma_buf,
+            }
+    }
+}
+
+/// A buffer of one device, exported, on its way to be imported by another.
+/// Dropping it before it is imported closes the descriptor.
+#[derive(Debug)]
+pub struct SharedMemory {
+    fd: OwnedFd,
+    kind: ShareKind,
+    len: u64,
+    /// The size of the allocation behind the buffer.
+    allocation: u64,
+}
+
+/// Page-aligned host memory that several devices can import
+/// (`VK_EXT_external_memory_host`) and the host reads and writes through
+/// plain pointers.
+///
+/// The memory is zeroed when made. A device that imports it keeps a
+/// [`DeviceBuffer`] over the same physical pages, so a write by one device or
+/// by the host is visible to the others once it has left the writer's caches;
+/// it is only ever accessed through raw pointers, because devices write it
+/// behind the host's back.
+pub struct HostPages {
+    ptr: NonNull<u8>,
+    len: usize,
+    layout: Layout,
+}
+
+// SAFETY: the pages are plain memory owned by this value; the type hands out
+// only raw pointers, and accesses to them are the callers' responsibility.
+unsafe impl Send for HostPages {}
+// SAFETY: as above.
+unsafe impl Sync for HostPages {}
+
+impl std::fmt::Debug for HostPages {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HostPages").field("len", &self.len).finish()
+    }
+}
+
+impl HostPages {
+    /// The pages of one import: 4 KiB, the alignment every device accepts that
+    /// this crate has seen, raised to the largest of `devices`.
+    fn alignment(devices: &[&Device]) -> usize {
+        devices.iter().map(|d| d.physical().sharing.host_alignment as usize).fold(4096, usize::max)
+    }
+
+    /// `len` zeroed bytes (rounded up to the alignment) that all of `devices`
+    /// can import.
+    pub fn new(devices: &[&Device], len: usize) -> Result<Self> {
+        let alignment = Self::alignment(devices);
+        let len = len.max(1).next_multiple_of(alignment);
+        let layout = Layout::from_size_align(len, alignment)
+            .map_err(|e| Error::invalid("host pages", e.to_string()))?;
+        // SAFETY: the layout has a non-zero size.
+        let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+        let ptr = NonNull::new(ptr)
+            .ok_or_else(|| Error::vk("host pages", vk::Result::ERROR_OUT_OF_HOST_MEMORY))?;
+        Ok(Self { ptr, len, layout })
+    }
+
+    /// The size in bytes.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether the pages hold no bytes (never: they are at least a page).
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// The start of the pages. Devices write here behind the host's back: read
+    /// and write through volatile accesses, never through references.
+    pub fn as_ptr(&self) -> *mut u8 {
+        self.ptr.as_ptr()
+    }
+}
+
+impl Drop for HostPages {
+    fn drop(&mut self) {
+        // SAFETY: allocated in `new` with this layout; the devices that
+        // imported the pages hold an `Arc` of this value, so none is left.
+        unsafe { std::alloc::dealloc(self.ptr.as_ptr(), self.layout) };
+    }
+}
+
+/// Where the memory of a [`DeviceBuffer`] comes from.
+enum Source {
+    /// Fresh video memory.
+    Local,
+    /// Fresh video memory that can be exported.
+    Export(ShareKind),
+    /// Video memory of another device, imported.
+    ImportFd(SharedMemory),
+    /// Host pages, imported.
+    ImportHost(Arc<HostPages>),
+}
+
 /// An allocation of device memory, freed when dropped.
 ///
 /// Dropping a buffer first waits for everything enqueued on its device (the
 /// way `cuMemFree` does), so commands that use it cannot outlive it.
+///
+/// A buffer can also be a view of memory that lives elsewhere: video memory
+/// of another device ([`DeviceBuffer::import`]) or host pages
+/// ([`DeviceBuffer::import_host`]). It has an address on this device like any
+/// other, kernels and copies use it the same way, and what they read and write
+/// is the other memory.
 #[derive(Debug)]
 pub struct DeviceBuffer {
     device: Device,
@@ -114,23 +257,99 @@ pub struct DeviceBuffer {
     len: u64,
     /// Bytes the driver reserved, for the device's allocation count.
     reserved: u64,
+    /// The kind this buffer was made exportable as.
+    export: Option<ShareKind>,
+    /// The size of the allocation, which an importer needs to know.
+    allocation: u64,
+    /// The host pages this buffer is a view of.
+    _pages: Option<Arc<HostPages>>,
 }
 
 impl DeviceBuffer {
     /// Allocates `len` bytes of video memory on `device`. The contents are
     /// undefined.
     pub fn new(device: &Device, len: u64) -> Result<Self> {
+        Self::allocate(device, len, Source::Local)
+    }
+
+    /// Allocates `len` bytes of video memory that another device can import
+    /// (see [`DeviceBuffer::export`]).
+    pub fn new_exportable(device: &Device, len: u64, kind: ShareKind) -> Result<Self> {
+        if !kind.supported_by(device) {
+            return Err(Error::Unsupported {
+                device: device.info().name.clone(),
+                reason: format!("it cannot export and import buffers as {}", kind.name()),
+            });
+        }
+        Self::allocate(device, len, Source::Export(kind))
+    }
+
+    /// A buffer on `device` over the video memory that `shared` came from,
+    /// which belongs to another device. Fails when the driver refuses the
+    /// import; that the call succeeds does not say that the other device's
+    /// memory can really be read and written from here (the mesh checks that
+    /// with data).
+    pub fn import(device: &Device, shared: SharedMemory) -> Result<Self> {
+        if !shared.kind.supported_by(device) {
+            return Err(Error::Unsupported {
+                device: device.info().name.clone(),
+                reason: format!("it cannot import buffers as {}", shared.kind.name()),
+            });
+        }
+        Self::allocate(device, shared.len, Source::ImportFd(shared))
+    }
+
+    /// A buffer on `device` over the host `pages`: the memory of the buffer is
+    /// the pages, also for every other device that imports them. Its address is
+    /// valid in kernels of `device` (the device reads and writes host memory
+    /// over the bus through it).
+    pub fn import_host(device: &Device, pages: &Arc<HostPages>) -> Result<Self> {
+        if !device.physical().sharing.host_pointer || device.0.host_memory.is_none() {
+            return Err(Error::Unsupported {
+                device: device.info().name.clone(),
+                reason: "it cannot import host memory (VK_EXT_external_memory_host)".into(),
+            });
+        }
+        Self::allocate(device, pages.len() as u64, Source::ImportHost(pages.clone()))
+    }
+
+    /// Exports the memory of a buffer made with
+    /// [`DeviceBuffer::new_exportable`]. Every call gives a new descriptor, to
+    /// be imported once by [`DeviceBuffer::import`].
+    pub fn export(&self) -> Result<SharedMemory> {
+        let Some(kind) = self.export else {
+            return Err(Error::invalid("export", "the buffer was not made exportable"));
+        };
+        let loader = self.device.0.memory_fd.as_ref().ok_or_else(|| Error::Unsupported {
+            device: self.device.info().name.clone(),
+            reason: "VK_KHR_external_memory_fd is not enabled".into(),
+        })?;
+        let info = vk::MemoryGetFdInfoKHR::default().memory(self.memory).handle_type(kind.flag());
+        // SAFETY: the memory was allocated exportable as this handle type.
+        let fd = unsafe { loader.get_memory_fd(&info) }.check("vkGetMemoryFdKHR")?;
+        // SAFETY: the driver returned a new descriptor that nothing else owns.
+        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        Ok(SharedMemory { fd, kind, len: self.len, allocation: self.allocation })
+    }
+
+    fn allocate(device: &Device, len: u64, source: Source) -> Result<Self> {
         if len == 0 {
             return Err(Error::invalid("device allocation", "a buffer of 0 bytes was requested"));
         }
         let raw = device.raw();
         // Storage and the address are for kernels; both transfer bits for the
         // copy commands of streams and of `write` and `read`.
-        let usage = vk::BufferUsageFlags::STORAGE_BUFFER
-            | vk::BufferUsageFlags::TRANSFER_SRC
-            | vk::BufferUsageFlags::TRANSFER_DST
-            | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS;
-        let info = vk::BufferCreateInfo::default().size(len).usage(usage);
+        let handle_type = match &source {
+            Source::Local => vk::ExternalMemoryHandleTypeFlags::empty(),
+            Source::Export(kind) => kind.flag(),
+            Source::ImportFd(shared) => shared.kind.flag(),
+            Source::ImportHost(_) => vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT,
+        };
+        let mut external = vk::ExternalMemoryBufferCreateInfo::default().handle_types(handle_type);
+        let mut info = vk::BufferCreateInfo::default().size(len).usage(BUFFER_USAGE);
+        if !handle_type.is_empty() {
+            info = info.push_next(&mut external);
+        }
         // SAFETY: the device is alive and `info` is a valid description.
         let buffer = unsafe { raw.create_buffer(&info, None) }.check("vkCreateBuffer")?;
         // SAFETY: the buffer was created just above.
@@ -139,40 +358,136 @@ impl DeviceBuffer {
             // SAFETY: the buffer was created above and is not in use yet.
             unsafe { raw.destroy_buffer(buffer, None) };
         };
-        let Some(memory_type) = pick_memory_type(
-            &device.physical().memory,
-            requirements.memory_type_bits,
-            DEVICE_RULES,
-        ) else {
+        // The memory types the buffer may use, and the rules to choose by.
+        let mut type_bits = requirements.memory_type_bits;
+        let mut rules = DEVICE_RULES;
+        let mut fd_properties = None;
+        match &source {
+            Source::ImportFd(shared) if shared.kind == ShareKind::DmaBuf => {
+                let loader = device.0.memory_fd.as_ref().expect("checked by import");
+                let mut props = vk::MemoryFdPropertiesKHR::default();
+                // SAFETY: the descriptor is a dma-buf, which this call is for.
+                let result = unsafe {
+                    (loader.fp().get_memory_fd_properties_khr)(
+                        raw.handle(),
+                        vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT,
+                        std::os::fd::AsRawFd::as_raw_fd(&shared.fd),
+                        &mut props,
+                    )
+                };
+                if result != vk::Result::SUCCESS {
+                    destroy_buffer();
+                    return Err(Error::vk("vkGetMemoryFdPropertiesKHR", result));
+                }
+                type_bits &= props.memory_type_bits;
+                fd_properties = Some(props.memory_type_bits);
+            }
+            Source::ImportHost(pages) => {
+                let loader = device.0.host_memory.as_ref().expect("checked by import_host");
+                let mut props = vk::MemoryHostPointerPropertiesEXT::default();
+                // SAFETY: the pointer is page aligned and the pages live as long as `pages`.
+                let result = unsafe {
+                    (loader.fp().get_memory_host_pointer_properties_ext)(
+                        raw.handle(),
+                        vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT,
+                        pages.as_ptr().cast(),
+                        &mut props,
+                    )
+                };
+                if result != vk::Result::SUCCESS {
+                    destroy_buffer();
+                    return Err(Error::vk("vkGetMemoryHostPointerPropertiesEXT", result));
+                }
+                type_bits &= props.memory_type_bits;
+                rules = HOST_RULES;
+            }
+            _ => {}
+        }
+        let Some(memory_type) = pick_memory_type(&device.physical().memory, type_bits, rules)
+        else {
             destroy_buffer();
             return Err(Error::invalid(
                 "device allocation",
-                "the device has no device-local memory type for buffers",
+                format!(
+                    "the device has no suitable memory type for this buffer (types allowed by the \
+                     buffer {:#x}, by the import {fd_properties:x?})",
+                    requirements.memory_type_bits
+                ),
             ));
         };
-        if let Err(error) = check_fits_heap(
-            &device.physical().memory,
-            memory_type,
-            requirements.size,
-            "vkAllocateMemory",
-        ) {
+        let imported = matches!(source, Source::ImportFd(_) | Source::ImportHost(_));
+        if !imported
+            && let Err(error) = check_fits_heap(
+                &device.physical().memory,
+                memory_type,
+                requirements.size,
+                "vkAllocateMemory",
+            )
+        {
             destroy_buffer();
             return Err(error);
         }
         let mut flags =
             vk::MemoryAllocateFlagsInfo::default().flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
-        let allocate = vk::MemoryAllocateInfo::default()
-            .allocation_size(requirements.size)
+        let mut export_info = vk::ExportMemoryAllocateInfo::default().handle_types(handle_type);
+        let mut dedicated = vk::MemoryDedicatedAllocateInfo::default().buffer(buffer);
+        let mut allocation_size = requirements.size;
+        // The descriptor and the pointer are taken by the call when it succeeds.
+        let mut import_fd = None;
+        let mut import_host = None;
+        match &source {
+            Source::ImportFd(shared) => {
+                allocation_size = shared.allocation.max(requirements.size);
+                import_fd = Some(
+                    vk::ImportMemoryFdInfoKHR::default()
+                        .handle_type(shared.kind.flag())
+                        .fd(std::os::fd::AsRawFd::as_raw_fd(&shared.fd)),
+                );
+            }
+            Source::ImportHost(pages) => {
+                allocation_size = (pages.len() as u64).max(requirements.size);
+                import_host = Some(
+                    vk::ImportMemoryHostPointerInfoEXT::default()
+                        .handle_type(vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT)
+                        .host_pointer(pages.as_ptr().cast()),
+                );
+            }
+            _ => {}
+        }
+        let mut allocate = vk::MemoryAllocateInfo::default()
+            .allocation_size(allocation_size)
             .memory_type_index(memory_type)
             .push_next(&mut flags);
+        if matches!(source, Source::Export(_)) {
+            allocate = allocate.push_next(&mut export_info);
+        }
+        if matches!(source, Source::Export(_) | Source::ImportFd(_)) {
+            allocate = allocate.push_next(&mut dedicated);
+        }
+        if let Some(import) = import_fd.as_mut() {
+            allocate = allocate.push_next(import);
+        }
+        if let Some(import) = import_host.as_mut() {
+            allocate = allocate.push_next(import);
+        }
         // SAFETY: valid allocation info; the memory type came from the buffer's
-        // own requirements.
+        // own requirements, restricted by what the import allows.
         let memory = match unsafe { raw.allocate_memory(&allocate, None) } {
             Ok(memory) => memory,
             Err(code) => {
                 destroy_buffer();
                 return Err(Error::vk("vkAllocateMemory", code));
             }
+        };
+        let (export, pages) = match source {
+            Source::Export(kind) => (Some(kind), None),
+            Source::ImportHost(pages) => (None, Some(pages)),
+            Source::ImportFd(shared) => {
+                // The driver owns the descriptor now.
+                let _ = shared.fd.into_raw_fd();
+                (None, None)
+            }
+            Source::Local => (None, None),
         };
         // SAFETY: the memory is at least as large as the buffer requires and
         // is bound once, at offset 0.
@@ -187,9 +502,20 @@ impl DeviceBuffer {
         // bufferDeviceAddress feature is enabled.
         let address = unsafe { raw.get_buffer_device_address(&address_info) };
         let ptr = DevicePtr(address);
+        let reserved = if imported { 0 } else { requirements.size };
         device.register_buffer(ptr, buffer, len);
-        device.count_allocation(requirements.size);
-        Ok(Self { device: device.clone(), buffer, memory, ptr, len, reserved: requirements.size })
+        device.count_allocation(reserved);
+        Ok(Self {
+            device: device.clone(),
+            buffer,
+            memory,
+            ptr,
+            len,
+            reserved,
+            export,
+            allocation: allocation_size,
+            _pages: pages,
+        })
     }
 
     pub fn device(&self) -> &Device {

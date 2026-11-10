@@ -18,6 +18,7 @@ use crate::device::Device;
 use crate::error::{Error, Result};
 use crate::memory::DevicePtr;
 use crate::module::{Args, Function, Module};
+use crate::prefill::{Precision, Prefill, PrefillPath};
 use crate::stream::Stream;
 use crate::weights::{self, Quantized};
 
@@ -52,6 +53,8 @@ struct Set {
     matvec_q4_k: Vec<Function>,
     /// The quantized weight kernels, on a device that can run them.
     quantized: Option<Quantized>,
+    /// The tensor-core kernels for many rows, on a device that has cooperative matrices.
+    prefill: Option<Prefill>,
 }
 
 /// The kernels of the engine on one device.
@@ -62,6 +65,40 @@ impl std::fmt::Debug for Kernels {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "Kernels(on {:?})", self.0.device)
     }
+}
+
+/// `f` over `items` on all cores, in order. Making a pipeline compiles a shader for the GPU, which
+/// takes milliseconds, and Vulkan allows pipelines to be made on several threads at once; a
+/// device has hundreds (a weight kernel for each type and number of activation rows), so
+/// loading them one after the other would take seconds.
+pub(crate) fn parallel_map<T: Sync, R: Send>(
+    items: &[T],
+    f: impl Fn(&T) -> Result<R> + Sync,
+) -> Result<Vec<R>> {
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(items.len());
+    let slots: Vec<std::sync::Mutex<Option<Result<R>>>> =
+        items.iter().map(|_| std::sync::Mutex::new(None)).collect();
+    std::thread::scope(|scope| {
+        for _ in 0..threads {
+            scope.spawn(|| {
+                loop {
+                    let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some(item) = items.get(i) else { break };
+                    *slots[i].lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+                        Some(f(item));
+                }
+            });
+        }
+    });
+    slots
+        .into_iter()
+        .map(|slot| {
+            slot.into_inner()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .expect("every item was visited")
+        })
+        .collect()
 }
 
 /// A launch of `groups` workgroups along one logical dimension. A device may
@@ -82,9 +119,13 @@ pub(crate) fn matvec_threads(n_in: u32) -> u32 {
 }
 
 impl Kernels {
-    /// Compiles the kernels for `device`: one pipeline per kernel, and one per
-    /// workgroup size for the matrix kernel. The driver compiles the shaders
-    /// for the GPU here, which takes a moment; do it once per device.
+    /// Compiles the small kernels for `device` (one pipeline per kernel, and one per
+    /// workgroup size for the matrix kernel), measures what its tensor cores do (the speed
+    /// of f16 accumulation, the element order of an operand: about 50 ms) and uploads the
+    /// codebooks. The driver compiles the shaders for the GPU as pipelines are made, which
+    /// takes a moment; do it once per device. The weight kernels (hundreds: each type has
+    /// a pipeline for each number of activation rows, and the prefill kernels) are made when
+    /// they are first launched, or ahead of that by [`Kernels::prepare`].
     pub fn load(device: &Device) -> Result<Self> {
         let main = |image: &[u8]| Module::load(device, image)?.function("main");
         let matvec = Module::load(device, MATVEC_Q4_K)?;
@@ -96,6 +137,16 @@ impl Kernels {
         } else {
             None
         };
+        let prefill = match &quantized {
+            // The prefill kernels take a subgroup for 32 invocations (four to a workgroup).
+            Some(q)
+                if !device.info().cooperative_matrix.is_empty()
+                    && device.info().subgroup_size == 32 =>
+            {
+                Some(Prefill::load(device, q.tables())?)
+            }
+            _ => None,
+        };
         Ok(Self(Arc::new(Set {
             device: device.clone(),
             add_f32: main(ADD_F32)?,
@@ -103,6 +154,7 @@ impl Kernels {
             sum32_f32: main(SUM32_F32)?,
             matvec_q4_k,
             quantized,
+            prefill,
         })))
     }
 
@@ -125,6 +177,21 @@ impl Kernels {
                 .clone()
                 .unwrap_or_else(|| "the quantized weight kernels are not loaded".into()),
         })
+    }
+
+    /// Makes the weight kernels for the types in `types` now, on all cores: the decode kernels
+    /// (a pipeline for each number of activation rows) and the prefill kernels. A kernel is
+    /// otherwise made when it is first launched, which takes milliseconds (tens for a
+    /// prefill kernel) in the step that launches it: the runtime calls this with the types of
+    /// the model when it loads it. [`Kernels::load`] itself makes only the small kernels.
+    pub fn prepare(&self, types: &[GgmlType]) -> Result<()> {
+        if let Some(q) = &self.0.quantized {
+            q.prepare(types)?;
+        }
+        if let Some(p) = &self.0.prefill {
+            p.prepare(types)?;
+        }
+        Ok(())
     }
 
     /// Whether this device runs the quantized weight kernels
@@ -202,41 +269,285 @@ impl Kernels {
         unsafe { self.quantized()?.quantize_rows(stream, x, q, n_in, n_rows, limit) }
     }
 
-    /// Whether [`Kernels::matmul`] has a tensor-core kernel for weights of type `ty` on
-    /// this device: it needs `VK_KHR_cooperative_matrix` with int8 products of 16 x 32 by
-    /// 32 x 16 into int32.
-    pub fn has_matmul(&self, ty: GgmlType) -> bool {
-        self.0.quantized.as_ref().is_some_and(|q| q.has_matmul(ty))
+    fn prefill(&self) -> Result<&Prefill> {
+        self.0.prefill.as_ref().ok_or_else(|| Error::Unsupported {
+            device: self.0.device.info().name.clone(),
+            reason:
+                "the prefill kernels need cooperative matrices and the quantized weight kernels"
+                    .into(),
+        })
     }
 
-    /// `y[b] = W x[b]` for a matrix `w` of type `ty` with `n_out` rows and `n_in` columns
-    /// and `n_rows` (1 or more) rows of activations that
-    /// [`Kernels::quantize_activation_rows`] has quantized into `q`: the prefill
-    /// kernel, on the tensor cores. It computes with the same arithmetic as
-    /// [`Kernels::matvec`] (integer products of the weight codes with int8 activations,
-    /// scaled per sub-block in f32), so a row gives the same result in either; it
-    /// reads the weights once per 64 rows. Q4_K only so far; check
-    /// [`Kernels::has_matmul`].
+    fn grid_limit(&self) -> u32 {
+        self.0.device.physical().max_work_group_count[0]
+    }
+
+    /// Whether this device has the prefill kernels of `path` at all: they need
+    /// `VK_KHR_cooperative_matrix` with int8 products of 16 x 32 by 32 x 16 into int32
+    /// ([`PrefillPath::Int8`]) or f16 products of 16 x 16 by 16 x 16 into f16 and f32
+    /// ([`PrefillPath::F16`], [`PrefillPath::F16Flush`]).
+    pub fn has_prefill_path(&self, path: PrefillPath) -> bool {
+        self.0.prefill.as_ref().is_some_and(|p| p.has_path(path))
+    }
+
+    /// Whether [`Kernels::matmul`] has a tensor-core kernel for weights of type `ty` on
+    /// `path` on this device.
+    pub fn has_matmul(&self, ty: GgmlType, path: PrefillPath) -> bool {
+        self.0.prefill.as_ref().is_some_and(|p| p.has_matmul(ty, path))
+    }
+
+    /// The bytes [`Kernels::prepare_prefill_activations`] writes for `n_rows` rows of
+    /// `n_in` activations in the format of `path`.
+    pub fn prefill_activation_bytes(path: PrefillPath, n_in: u32, n_rows: u32) -> u64 {
+        Prefill::activation_bytes(path, n_in, n_rows)
+    }
+
+    /// Prepares `n_rows` rows of `n_in` f32 activations for the prefill kernels of `path`:
+    /// quantizes them to int8 ([`PrefillPath::Int8`], the format of
+    /// [`Kernels::quantize_activations`], so the same bytes serve the decode kernels) or
+    /// converts them to f16 divided per row by a power of two ([`PrefillPath::F16`] and
+    /// [`PrefillPath::F16Flush`]). One preparation serves every matrix that multiplies the
+    /// same activations.
+    ///
+    /// `n_in` must be a multiple of 32 and `n_in * n_rows` must fit in 32 bits.
     ///
     /// # Safety
     ///
-    /// As [`Kernels::matvec`], for `n_rows` rows of activations and `y` of `n_rows * n_out`
-    /// f32 values; the weights are aligned to 16 bytes.
+    /// On the stream's device and alive until the launch has run: `x` must address
+    /// `n_rows * n_in` f32 values and `out` the [`Kernels::prefill_activation_bytes`] of
+    /// the path, 16-byte aligned (checked), not overlapping `x`.
+    pub unsafe fn prepare_prefill_activations(
+        &self,
+        stream: &Stream,
+        path: PrefillPath,
+        x: DevicePtr,
+        out: DevicePtr,
+        n_in: u32,
+        n_rows: u32,
+    ) -> Result<()> {
+        // SAFETY: the caller's guarantee is the one of the functions it forwards to.
+        unsafe {
+            match path {
+                PrefillPath::Int8 => self.quantize_activation_rows(stream, x, out, n_in, n_rows),
+                PrefillPath::F16 | PrefillPath::F16Flush => {
+                    self.prefill()?.convert_f16(stream, x, out, n_in, n_rows, self.grid_limit())
+                }
+            }
+        }
+    }
+
+    /// The path the prefill family takes on this device for the requested precision, chosen
+    /// when the kernels were loaded. [`Precision::Exact`] is [`PrefillPath::F16`] where the
+    /// device has the f16 kernels (else [`PrefillPath::Int8`]). [`Precision::Fast`] is the
+    /// fastest path whose error is no worse than the decode kernels' (about 1 % rms):
+    /// [`PrefillPath::F16`] where the tensor cores run f16 products with f32 accumulation
+    /// as fast as with f16 accumulation ([`Kernels::tensor_cores_full_rate`]: measured at
+    /// load), else [`PrefillPath::F16Flush`], which is as fast as int8 on the cards measured
+    /// and 20 times more exact; [`PrefillPath::Int8`] on a device that has only int8
+    /// cooperative matrices. Refused on a device without cooperative matrices: the decode
+    /// kernels in batches of 8 rows ([`Kernels::matmul_decode`]) are what it has instead.
+    pub fn prefill_path(&self, precision: Precision) -> Result<PrefillPath> {
+        let prefill = self.prefill()?;
+        let f16 = prefill.has_path(PrefillPath::F16);
+        if !f16 && !prefill.has_path(PrefillPath::Int8) {
+            return Err(Error::Unsupported {
+                device: self.0.device.info().name.clone(),
+                reason: "no cooperative matrix shape the prefill kernels use".into(),
+            });
+        }
+        Ok(match precision {
+            Precision::Exact | Precision::Fast if !f16 => PrefillPath::Int8,
+            Precision::Exact => PrefillPath::F16,
+            Precision::Fast if prefill.full_rate() => PrefillPath::F16,
+            Precision::Fast => PrefillPath::F16Flush,
+        })
+    }
+
+    /// Whether the tensor cores of this device run f16 products with f32 accumulation as
+    /// fast as with f16 accumulation (measured when the kernels were loaded). GeForce cards
+    /// run the second at twice the rate of the first.
+    pub fn tensor_cores_full_rate(&self) -> bool {
+        self.0.prefill.as_ref().is_some_and(Prefill::full_rate)
+    }
+
+    /// Whether the elements of a cooperative matrix of use A are held in the order of an
+    /// `mma` fragment on this device (checked when the kernels were loaded): the kernels that
+    /// decode the weights straight into the operand need it.
+    pub fn cooperative_operand_in_registers(&self) -> bool {
+        self.0.prefill.as_ref().is_some_and(Prefill::register_operand)
+    }
+
+    /// `y[b] = W x[b]` for `n_rows` (any number) rows of f32 activations `x`, with the decode
+    /// kernels: the rows are quantized and multiplied in batches of [`MAX_BATCH`], each batch
+    /// through `scratch` (at least [`Kernels::quantized_activation_bytes`] of `n_in` and
+    /// [`MAX_BATCH`] rows, 16-byte aligned). What a device without cooperative matrices runs
+    /// for a prompt, and the reference for the tensor-core paths: the weights are read once
+    /// per batch of 8, so it is memory-bound up to 8 rows and not beyond. The float types
+    /// read `x` as it is.
+    ///
+    /// # Safety
+    ///
+    /// As [`Kernels::matvec`] for the matrix, `x` `n_rows * n_in` f32 values, `y`
+    /// `n_rows * n_out` f32 values, `scratch` as above; all alive until the launches have run.
     #[allow(clippy::too_many_arguments)]
-    pub unsafe fn matmul(
+    pub unsafe fn matmul_decode(
         &self,
         stream: &Stream,
         ty: GgmlType,
         w: DevicePtr,
-        q: DevicePtr,
+        x: DevicePtr,
+        scratch: DevicePtr,
         y: DevicePtr,
         n_in: u32,
         n_out: u32,
         n_rows: u32,
     ) -> Result<()> {
-        let limit = self.0.device.physical().max_work_group_count[0];
+        let float = !Self::needs_quantized_activations(ty);
+        let mut done = 0;
+        while done < n_rows {
+            let n = (n_rows - done).min(MAX_BATCH);
+            let x_chunk = x.offset(u64::from(done) * u64::from(n_in) * 4);
+            let y_chunk = y.offset(u64::from(done) * u64::from(n_out) * 4);
+            // SAFETY: the caller's guarantee covers the rows of this chunk.
+            unsafe {
+                let act = if float {
+                    x_chunk
+                } else {
+                    self.quantize_activations(stream, x_chunk, scratch, n_in, n)?;
+                    scratch
+                };
+                self.matvec(stream, ty, w, act, y_chunk, n_in, n_out, n)?;
+            }
+            done += n;
+        }
+        Ok(())
+    }
+
+    /// `y[b] = W x[b]` for a matrix `w` of type `ty` with `n_out` rows and `n_in` columns as
+    /// the file stores it, and `n_rows` (1 or more) rows of activations that
+    /// [`Kernels::prepare_prefill_activations`] has prepared in the format of `path` into
+    /// `act`: the prefill kernel, on the tensor cores. It reads the weights once per 64 rows.
+    ///
+    /// [`PrefillPath::Int8`] computes with the same arithmetic as [`Kernels::matvec`]
+    /// (integer products of the weight codes with int8 activations, scaled per sub-block in
+    /// f32), so a row gives the same result in either; Q4_K only so far. The f16 paths
+    /// decode the weights to f16 (`shaders/mmd_<type>.glsl`) and multiply f16 activations:
+    /// they differ from the exact product by the rounding of weights and activations to f16
+    /// (and, for [`PrefillPath::F16Flush`], of partial sums of 64 products). Check
+    /// [`Kernels::has_matmul`]; `n_in` must be a whole number of blocks and of 64 values.
+    ///
+    /// # Safety
+    ///
+    /// As [`Kernels::matvec`], for `n_rows` rows of activations prepared for this `path`
+    /// (16-byte aligned, checked) and `y` of `n_rows * n_out` f32 values; the alignment of
+    /// the weights is that of [`Kernels::matvec`] for the int8 path and 16 bytes for Q4_K and
+    /// Q5_K and the float types, 4 for Q4_1, Q5_1 and Q2_K and 2 for the others on the f16
+    /// paths (checked).
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn matmul(
+        &self,
+        stream: &Stream,
+        ty: GgmlType,
+        path: PrefillPath,
+        w: DevicePtr,
+        act: DevicePtr,
+        y: DevicePtr,
+        n_in: u32,
+        n_out: u32,
+        n_rows: u32,
+    ) -> Result<()> {
         // SAFETY: the caller's guarantee is the one of the function it forwards to.
-        unsafe { self.quantized()?.matmul(stream, ty, w, q, y, n_in, n_out, n_rows, limit) }
+        unsafe {
+            self.prefill()?.matmul(
+                stream,
+                ty,
+                path,
+                w,
+                act,
+                y,
+                n_in,
+                n_out,
+                n_rows,
+                self.grid_limit(),
+            )
+        }
+    }
+
+    /// Whether matrices of `ty` have a rearranged form on this device
+    /// ([`Kernels::rearrange`]).
+    pub fn has_rearranged_form(&self, ty: GgmlType) -> bool {
+        self.0.prefill.as_ref().is_some_and(|p| p.has_rearranged_form(ty))
+    }
+
+    /// The bytes of a rearranged matrix of `n_out` rows and `n_in` columns: those of the
+    /// file's form, with the rows rounded up to a multiple of 16. `None` for a type without
+    /// a rearranged form.
+    pub fn rearranged_bytes(ty: GgmlType, n_out: u32, n_in: u32) -> Option<u64> {
+        Prefill::rearranged_bytes(ty, n_out, n_in)
+    }
+
+    /// Rearranges a Q4_K matrix from the file's form into the one the kernels of
+    /// [`Kernels::matmul_rearranged`] read: codes in the order the tensor cores take them,
+    /// one 16-byte load per lane and 64 values of K, and the block headers of 16 rows
+    /// together (`shaders/repack_q4_K.comp`; the form is CUDA's, see `kernels/mmr.cuh`
+    /// there). Done once when the matrix is uploaded. A matrix in this form is no longer
+    /// one the decode kernels or [`Kernels::matmul`] read.
+    ///
+    /// # Safety
+    ///
+    /// On the stream's device and alive until the launch has run: `src` addresses the matrix
+    /// as GGUF stores it, `dst` [`Kernels::rearranged_bytes`] bytes, both 16-byte aligned
+    /// (checked), not overlapping.
+    pub unsafe fn rearrange(
+        &self,
+        stream: &Stream,
+        ty: GgmlType,
+        src: DevicePtr,
+        dst: DevicePtr,
+        n_out: u32,
+        n_in: u32,
+    ) -> Result<()> {
+        // SAFETY: the caller's guarantee is the one of the function it forwards to.
+        unsafe { self.prefill()?.rearrange(stream, ty, src, dst, n_out, n_in, self.grid_limit()) }
+    }
+
+    /// `y[b] = W x[b]` for a matrix in the rearranged form ([`Kernels::rearrange`]) and
+    /// activations prepared for `path` (an f16 path), which the kernel decodes in registers:
+    /// no tile of weights passes through shared memory, so the loads are whole lines.
+    ///
+    /// # Safety
+    ///
+    /// On the stream's device and alive until the launch has run: `w` the rearranged matrix
+    /// (16-byte aligned, checked), `act` the prepared activations (16-byte aligned,
+    /// checked), `y` `n_rows * n_out` f32 values, not overlapping the inputs.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn matmul_rearranged(
+        &self,
+        stream: &Stream,
+        ty: GgmlType,
+        path: PrefillPath,
+        w: DevicePtr,
+        act: DevicePtr,
+        y: DevicePtr,
+        n_in: u32,
+        n_out: u32,
+        n_rows: u32,
+    ) -> Result<()> {
+        // SAFETY: the caller's guarantee is the one of the function it forwards to.
+        unsafe {
+            self.prefill()?.matmul_rearranged(
+                stream,
+                ty,
+                path,
+                w,
+                act,
+                y,
+                n_in,
+                n_out,
+                n_rows,
+                self.grid_limit(),
+            )
+        }
     }
 
     /// `y[b] = W x[b]` for a matrix `w` of type `ty` with `n_out` rows and `n_in`

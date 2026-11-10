@@ -1,0 +1,32 @@
+#version 450
+#include "common.glsl"
+
+layout(local_size_x = 256) in;
+
+layout(push_constant, std430) uniform Push {
+    FloatRef out_;
+    FloatRefRO operand[8];
+    uint count;
+    uint n;
+} pc;
+
+// out[i] = operand[0][i] + operand[1][i] + ... for i < n, added in this order.
+//
+// This is the combine step of a sum across devices. Every device calls it with
+// the partials in the same order (device 0's first), so that all of them get
+// the bitwise same f32 sum however many devices there are; with one operand it
+// is a copy. `out_` may be one of the operands (the same value, element by
+// element).
+void main() {
+    const uint64_t g = ares_group() * 256 + gl_LocalInvocationID.x;
+    if (g < pc.n) {
+        const uint i = uint(g);
+        float sum = pc.operand[0].v[i];
+        [[unroll]] for (uint k = 1; k < 8; ++k) {
+            if (k < pc.count) {
+                sum += pc.operand[k].v[i];
+            }
+        }
+        pc.out_.v[i] = sum;
+    }
+}

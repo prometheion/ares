@@ -8,17 +8,29 @@ use ares_core::GgmlType;
 
 use std::sync::Arc;
 
-use crate::device::{ComponentType, Device};
+use crate::device::Device;
 use crate::error::{Error, Result};
 use crate::kernels::MAX_BATCH;
 use crate::memory::{DeviceBuffer, DevicePtr};
-use crate::module::{Args, Function, Module};
+use crate::module::{Args, Function, Lazy, Module};
 use crate::stream::Stream;
 
-// The shape of the launch of every weight kernel is `MMVQ_THREADS` and
-// `MMVQ_ROWS_PER_BLOCK` (defined by build.rs, which hands the same numbers to the
-// shaders): as in CUDA, a workgroup of 4 warps computes 8 output rows.
+// The shape of the launch of every weight kernel is `MMVQ_THREADS` threads and
+// `MMVQ_WARPS` times the rows per warp of the shader's `Shape` output rows (build.rs hands
+// the same numbers to the shaders): as in CUDA, a workgroup of 4 warps.
 include!(concat!(env!("OUT_DIR"), "/shader_constants.rs"));
+
+// The weight kernels, in the variants build.rs made of them (`Shape` there).
+include!(concat!(env!("OUT_DIR"), "/shader_images.rs"));
+
+/// The SPIR-V of the shader `name` (the first variant, for the shaders that have several).
+pub(crate) fn image(name: &str) -> Result<&'static [u8]> {
+    IMAGES
+        .iter()
+        .find(|i| i.name == name)
+        .and_then(|i| i.variants.first().copied())
+        .ok_or_else(|| Error::NoSuchKernel(name.to_owned()))
+}
 
 macro_rules! spv {
     ($name:literal) => {
@@ -27,7 +39,6 @@ macro_rules! spv {
 }
 
 static QUANTIZE_ACT: &[u8] = spv!("quantize_act");
-static MM_Q4_K: &[u8] = spv!("mm_q4_K");
 
 /// The large codebooks of the i-quants, in the layout of `shaders/iq_tables.glsl`
 /// (generated from the CPU decoder's tables by `shaders/gen_iq_tables.py`). They are
@@ -43,57 +54,62 @@ enum Acts {
     Float,
 }
 
-/// The weight types that have a kernel: the type, its SPIR-V, the alignment in bytes the
+/// The weight types that have a kernel: the type, the name of its shader, the alignment in bytes the
 /// kernel needs of the matrix (the widest load it uses) and how it reads the activations.
 /// Every type a GGUF file can carry (the 28 that `ares-quant` decodes) but the integer
 /// ones and f64, which are not weights.
-const FAST_TYPES: [(GgmlType, &[u8], u64, Acts); 28] = [
-    (GgmlType::Q4_K, spv!("mmvq_q4_K"), 16, Acts::Quantized),
-    (GgmlType::Q5_K, spv!("mmvq_q5_K"), 16, Acts::Quantized),
-    (GgmlType::Q6_K, spv!("mmvq_q6_K"), 2, Acts::Quantized),
-    (GgmlType::Q3_K, spv!("mmvq_q3_K"), 2, Acts::Quantized),
-    (GgmlType::Q2_K, spv!("mmvq_q2_K"), 4, Acts::Quantized),
-    (GgmlType::IQ4_XS, spv!("mmvq_iq4_xs"), 8, Acts::Quantized),
-    (GgmlType::IQ4_NL, spv!("mmvq_iq4_nl"), 2, Acts::Quantized),
-    (GgmlType::IQ3_S, spv!("mmvq_iq3_s"), 2, Acts::Quantized),
-    (GgmlType::IQ3_XXS, spv!("mmvq_iq3_xxs"), 2, Acts::Quantized),
-    (GgmlType::IQ2_S, spv!("mmvq_iq2_s"), 2, Acts::Quantized),
-    (GgmlType::IQ2_XS, spv!("mmvq_iq2_xs"), 2, Acts::Quantized),
-    (GgmlType::IQ2_XXS, spv!("mmvq_iq2_xxs"), 2, Acts::Quantized),
-    (GgmlType::IQ1_S, spv!("mmvq_iq1_s"), 2, Acts::Quantized),
-    (GgmlType::IQ1_M, spv!("mmvq_iq1_m"), 4, Acts::Quantized),
-    (GgmlType::Q8_0, spv!("mmvq_q8_0"), 2, Acts::Quantized),
-    (GgmlType::Q5_1, spv!("mmvq_q5_1"), 4, Acts::Quantized),
-    (GgmlType::Q5_0, spv!("mmvq_q5_0"), 2, Acts::Quantized),
-    (GgmlType::Q4_1, spv!("mmvq_q4_1"), 4, Acts::Quantized),
-    (GgmlType::Q4_0, spv!("mmvq_q4_0"), 2, Acts::Quantized),
-    (GgmlType::TQ1_0, spv!("mmvq_tq1_0"), 2, Acts::Quantized),
-    (GgmlType::TQ2_0, spv!("mmvq_tq2_0"), 2, Acts::Quantized),
-    (GgmlType::MXFP4, spv!("mmvq_mxfp4"), 1, Acts::Quantized),
-    (GgmlType::NVFP4, spv!("mmvq_nvfp4"), 4, Acts::Quantized),
-    (GgmlType::Q1_0, spv!("mmvq_q1_0"), 2, Acts::Quantized),
-    (GgmlType::Q2_0, spv!("mmvq_q2_0"), 2, Acts::Quantized),
-    (GgmlType::F32, spv!("mmvf_f32"), 16, Acts::Float),
-    (GgmlType::F16, spv!("mmvf_f16"), 16, Acts::Float),
-    (GgmlType::BF16, spv!("mmvf_bf16"), 16, Acts::Float),
+const FAST_TYPES: [(GgmlType, &str, u64, Acts); 28] = [
+    (GgmlType::Q4_K, "mmvq_q4_K", 16, Acts::Quantized),
+    (GgmlType::Q5_K, "mmvq_q5_K", 16, Acts::Quantized),
+    (GgmlType::Q6_K, "mmvq_q6_K", 2, Acts::Quantized),
+    (GgmlType::Q3_K, "mmvq_q3_K", 2, Acts::Quantized),
+    (GgmlType::Q2_K, "mmvq_q2_K", 4, Acts::Quantized),
+    (GgmlType::IQ4_XS, "mmvq_iq4_xs", 8, Acts::Quantized),
+    (GgmlType::IQ4_NL, "mmvq_iq4_nl", 2, Acts::Quantized),
+    (GgmlType::IQ3_S, "mmvq_iq3_s", 2, Acts::Quantized),
+    (GgmlType::IQ3_XXS, "mmvq_iq3_xxs", 2, Acts::Quantized),
+    (GgmlType::IQ2_S, "mmvq_iq2_s", 2, Acts::Quantized),
+    (GgmlType::IQ2_XS, "mmvq_iq2_xs", 2, Acts::Quantized),
+    (GgmlType::IQ2_XXS, "mmvq_iq2_xxs", 2, Acts::Quantized),
+    (GgmlType::IQ1_S, "mmvq_iq1_s", 2, Acts::Quantized),
+    (GgmlType::IQ1_M, "mmvq_iq1_m", 4, Acts::Quantized),
+    (GgmlType::Q8_0, "mmvq_q8_0", 2, Acts::Quantized),
+    (GgmlType::Q5_1, "mmvq_q5_1", 4, Acts::Quantized),
+    (GgmlType::Q5_0, "mmvq_q5_0", 2, Acts::Quantized),
+    (GgmlType::Q4_1, "mmvq_q4_1", 4, Acts::Quantized),
+    (GgmlType::Q4_0, "mmvq_q4_0", 2, Acts::Quantized),
+    (GgmlType::TQ1_0, "mmvq_tq1_0", 2, Acts::Quantized),
+    (GgmlType::TQ2_0, "mmvq_tq2_0", 2, Acts::Quantized),
+    (GgmlType::MXFP4, "mmvq_mxfp4", 1, Acts::Quantized),
+    (GgmlType::NVFP4, "mmvq_nvfp4", 4, Acts::Quantized),
+    (GgmlType::Q1_0, "mmvq_q1_0", 2, Acts::Quantized),
+    (GgmlType::Q2_0, "mmvq_q2_0", 2, Acts::Quantized),
+    (GgmlType::F32, "mmvf_f32", 16, Acts::Float),
+    (GgmlType::F16, "mmvf_f16", 16, Acts::Float),
+    (GgmlType::BF16, "mmvf_bf16", 16, Acts::Float),
 ];
+
+/// The kernel of one weight type on one device.
+#[derive(Debug, Clone)]
+struct Weight {
+    ty: GgmlType,
+    /// The alignment in bytes the kernel needs of the matrix.
+    align: u64,
+    acts: Acts,
+    /// Output rows one workgroup computes.
+    rows_per_group: u32,
+    /// One pipeline, or one for each number of activation rows (1 to 8).
+    functions: Vec<Arc<Lazy>>,
+}
 
 /// The kernels of this module on one device.
 #[derive(Debug, Clone)]
 pub(crate) struct Quantized {
     quantize_act: Function,
-    types: Vec<(GgmlType, u64, Acts, Function)>,
+    types: Vec<Weight>,
     /// The codebooks (`IQ_TABLES`) in device memory.
     tables: Arc<DeviceBuffer>,
-    /// The tensor-core kernels, on a device whose cooperative matrices have the shape
-    /// they use.
-    matmul: Vec<(GgmlType, Function)>,
 }
-
-/// The weight rows and activation rows one workgroup of the prefill kernels computes
-/// (`MT` and `NT` in `shaders/mm_q4_K.comp`).
-const MM_WEIGHT_ROWS: u32 = 64;
-const MM_BATCH_ROWS: u32 = 64;
 
 /// The bytes that `quantize_activations` writes for `n_batch` rows of `n_in`
 /// activations: the int8 values, then (from the next multiple of 16 bytes) one
@@ -122,7 +138,7 @@ fn check_batch(n_batch: u32) -> Result<()> {
     Ok(())
 }
 
-fn check_alignment(what: &'static str, ptr: DevicePtr, align: u64) -> Result<()> {
+pub(crate) fn check_alignment(what: &'static str, ptr: DevicePtr, align: u64) -> Result<()> {
     if !ptr.as_raw().is_multiple_of(align) {
         return Err(Error::invalid(
             what,
@@ -135,22 +151,35 @@ fn check_alignment(what: &'static str, ptr: DevicePtr, align: u64) -> Result<()>
 impl Quantized {
     pub(crate) fn load(device: &Device) -> Result<Self> {
         let main = |image: &[u8]| Module::load(device, image)?.function("main");
+        // The weight kernels are made on first use (`Lazy`), or ahead of it by `prepare`.
         let types = FAST_TYPES
             .iter()
-            .map(|(ty, image, align, acts)| Ok((*ty, *align, *acts, main(image)?)))
-            .collect::<Result<Vec<_>>>()?;
+            .map(|(ty, name, align, acts)| {
+                let image = IMAGES.iter().find(|i| i.name == *name).expect("a shader per type");
+                Weight {
+                    ty: *ty,
+                    align: *align,
+                    acts: *acts,
+                    rows_per_group: MMVQ_WARPS * image.rows,
+                    functions: image.variants.iter().map(|v| Lazy::new(device, v)).collect(),
+                }
+            })
+            .collect();
         let tables = DeviceBuffer::new(device, IQ_TABLES.len() as u64)?;
         tables.write(0, IQ_TABLES)?;
-        // The prefill kernels multiply int8 matrices of 16 x 32 by 32 x 16 into int32.
-        let int8_product = device.info().cooperative_matrix.iter().any(|c| {
-            (c.m, c.n, c.k) == (16, 16, 32)
-                && c.a == ComponentType::I8
-                && c.b == ComponentType::I8
-                && c.c == ComponentType::I32
-                && c.result == ComponentType::I32
-        });
-        let matmul = if int8_product { vec![(GgmlType::Q4_K, main(MM_Q4_K)?)] } else { Vec::new() };
-        Ok(Self { quantize_act: main(QUANTIZE_ACT)?, types, tables: Arc::new(tables), matmul })
+        Ok(Self { quantize_act: main(QUANTIZE_ACT)?, types, tables: Arc::new(tables) })
+    }
+
+    /// Makes the decode kernels of `types` now, on all cores, so that no step pays for it.
+    pub(crate) fn prepare(&self, types: &[GgmlType]) -> Result<()> {
+        let wanted: Vec<&Weight> = self.types.iter().filter(|w| types.contains(&w.ty)).collect();
+        let all: Vec<&Arc<Lazy>> = wanted.iter().flat_map(|w| w.functions.iter()).collect();
+        crate::kernels::parallel_map(&all, |lazy| lazy.get().map(|_| ())).map(|_| ())
+    }
+
+    /// The device address of the codebooks.
+    pub(crate) fn tables(&self) -> DevicePtr {
+        self.tables.ptr()
     }
 
     /// # Safety
@@ -207,70 +236,6 @@ impl Quantized {
         }
     }
 
-    /// Whether the tensor-core kernel of `ty` is loaded.
-    pub(crate) fn has_matmul(&self, ty: GgmlType) -> bool {
-        self.matmul.iter().any(|(t, _)| *t == ty)
-    }
-
-    /// # Safety
-    ///
-    /// As `Kernels::matmul`.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) unsafe fn matmul(
-        &self,
-        stream: &Stream,
-        ty: GgmlType,
-        w: DevicePtr,
-        q: DevicePtr,
-        y: DevicePtr,
-        n_in: u32,
-        n_out: u32,
-        n_rows: u32,
-        grid_limit: u32,
-    ) -> Result<()> {
-        let Some((_, function)) = self.matmul.iter().find(|(t, _)| *t == ty) else {
-            let have: Vec<&str> = self.matmul.iter().map(|(t, _)| t.name()).collect();
-            return Err(Error::invalid(
-                "prefill kernel type",
-                format!(
-                    "{ty} has no tensor-core kernel on this device (it has one for {})",
-                    if have.is_empty() { "no type".to_owned() } else { have.join(", ") }
-                ),
-            ));
-        };
-        let block_values = ty.block_values();
-        if n_in == 0 || !n_in.is_multiple_of(block_values) {
-            return Err(Error::invalid(
-                "weight matrix",
-                format!(
-                    "{n_in} columns are not a whole number of {ty} blocks of {block_values} values"
-                ),
-            ));
-        }
-        if n_rows == 0 || n_in.checked_mul(n_rows).is_none() {
-            return Err(Error::invalid(
-                "prefill kernel batch",
-                format!("{n_rows} rows of {n_in} values: not 1 or more, or too many"),
-            ));
-        }
-        if n_out == 0 {
-            return Ok(());
-        }
-        check_alignment("weight matrix", w, 16)?;
-        check_alignment("quantized activations", q, 16)?;
-        let args = Args::new().ptr(w).ptr(q).ptr(y).u32(n_in).u32(n_out).u32(n_rows);
-        let groups =
-            u64::from(n_out.div_ceil(MM_WEIGHT_ROWS)) * u64::from(n_rows.div_ceil(MM_BATCH_ROWS));
-        let groups = u32::try_from(groups).map_err(|_| {
-            Error::invalid(
-                "prefill kernel batch",
-                format!("{n_out} x {n_rows} needs too many workgroups"),
-            )
-        })?;
-        // SAFETY: the argument list matches mm_q4_K.comp; the ranges are the caller's guarantee.
-        unsafe { function.launch(stream, crate::kernels::grid_1d(groups, grid_limit), args) }
-    }
-
     /// # Safety
     ///
     /// As `Kernels::matvec`.
@@ -287,7 +252,9 @@ impl Quantized {
         n_batch: u32,
         grid_limit: u32,
     ) -> Result<()> {
-        let Some((_, align, acts, function)) = self.types.iter().find(|(t, ..)| *t == ty) else {
+        let Some(Weight { align, acts, rows_per_group, functions, .. }) =
+            self.types.iter().find(|w| w.ty == ty)
+        else {
             return Err(Error::invalid(
                 "weight kernel type",
                 format!(
@@ -307,6 +274,8 @@ impl Quantized {
             ));
         }
         check_batch(n_batch)?;
+        let function =
+            functions[if functions.len() > 1 { n_batch as usize - 1 } else { 0 }].get()?;
         if n_out == 0 {
             return Ok(());
         }
@@ -319,7 +288,7 @@ impl Quantized {
             Args::new().ptr(w).ptr(q).ptr(y).ptr(self.tables.ptr())
         };
         let args = args.u32(n_in).u32(n_out).u32(n_batch);
-        let groups = n_out.div_ceil(MMVQ_ROWS_PER_BLOCK);
+        let groups = n_out.div_ceil(*rows_per_group);
         // SAFETY: the argument list matches the mmvq_* shaders; the ranges are the
         // caller's guarantee.
         unsafe { function.launch(stream, crate::kernels::grid_1d(groups, grid_limit), args) }

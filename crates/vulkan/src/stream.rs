@@ -51,15 +51,27 @@
 //! # Events
 //!
 //! An [`Event`] marks a point in a stream; another stream **of the same
-//! device** can wait for it. Vulkan has no event that spans two logical devices
-//! (an exported timeline semaphore could carry one, which is future work), so
-//! unlike the CUDA layer's, a Vulkan event cannot order work between GPUs:
-//! the host orders those, with `synchronize` and a staging buffer. Recording an
-//! event submits the stream's batch, so that whatever waits for the event can
-//! be sure the work it names is on its way.
+//! device** can wait for it. Vulkan has no event that spans two logical devices,
+//! so unlike the CUDA layer's, a Vulkan event cannot order work between GPUs.
+//! What does is a timeline semaphore shared between the devices
+//! ([`SharedTimeline`](crate::SharedTimeline)), or a flag in memory that both
+//! devices see, which a kernel polls (the [`mesh`](crate::Mesh) uses both).
+//! Recording an event submits the stream's batch, so that whatever waits for
+//! the event can be sure the work it names is on its way.
+//!
+//! # Streams that wait for each other across devices
+//!
+//! A batch that waits on another device has to be able to start: the other
+//! device's work it waits for must have been submitted. Streams of one device
+//! are flushed together when it is synchronised, but a stream on the other
+//! device is not, so a mesh **links** the streams it orders. Waiting for one
+//! of them ([`Stream::synchronize`], [`Stream::is_idle`]) first submits what the
+//! linked streams have recorded, and a mesh flushes the other streams when one
+//! of them submitted on its own, so a device never waits for a batch the host
+//! has not sent yet.
 
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use ash::vk;
 
@@ -89,9 +101,22 @@ struct State {
     /// The value of the last submission; the timeline reaches it when
     /// everything submitted has finished.
     submitted: u64,
-    /// Events the next submission waits for. The streams are held so that the
-    /// semaphores stay alive until the wait has been submitted.
-    waits: Vec<(Arc<StreamInner>, u64)>,
+    /// What the next submission waits for. The streams of events are held so
+    /// that their semaphores stay alive until the wait has been submitted.
+    waits: Vec<Pending>,
+    /// Shared timeline values the next submission sets, after the work before it.
+    signals: Vec<(vk::Semaphore, u64)>,
+    /// Streams on other devices that this one waits for or is waited for by.
+    linked: Vec<Weak<StreamInner>>,
+}
+
+/// One thing a submission waits for.
+enum Pending {
+    /// A point in a stream of this device.
+    Stream(Arc<StreamInner>, u64),
+    /// A value of a timeline semaphore shared with another device (kept alive
+    /// by the [`SharedTimeline`](crate::SharedTimeline) that owns it).
+    Shared(vk::Semaphore, u64),
 }
 
 pub(crate) struct StreamInner {
@@ -143,6 +168,8 @@ impl StreamInner {
                 in_flight: VecDeque::new(),
                 submitted: 0,
                 waits: Vec::new(),
+                signals: Vec::new(),
+                linked: Vec::new(),
             }),
         })
     }
@@ -244,7 +271,8 @@ impl StreamInner {
     /// for pending waits even when no command was recorded after them.
     fn flush_in(&self, state: &mut State, force: bool) -> Result<()> {
         let cb = state.open.take();
-        if cb.is_none() && !(force && !state.waits.is_empty()) {
+        let pending = !state.waits.is_empty() || !state.signals.is_empty();
+        if cb.is_none() && !(force && pending) {
             return Ok(());
         }
         state.commands = 0;
@@ -275,17 +303,24 @@ impl StreamInner {
             }
         }
         let value = state.submitted + 1;
-        let waits: Vec<(vk::Semaphore, u64)> =
-            state.waits.iter().map(|(stream, value)| (stream.timeline, *value)).collect();
+        let waits: Vec<(vk::Semaphore, u64)> = state
+            .waits
+            .iter()
+            .map(|wait| match wait {
+                Pending::Stream(stream, value) => (stream.timeline, *value),
+                Pending::Shared(semaphore, value) => (*semaphore, *value),
+            })
+            .collect();
+        let mut signals = vec![(self.timeline, value)];
+        signals.extend_from_slice(&state.signals);
         let buffers = cb.as_slice();
-        if let Err(error) =
-            self.device.submit(buffers, &waits, Some((self.timeline, value)), vk::Fence::null())
-        {
+        if let Err(error) = self.device.submit(buffers, &waits, &signals, vk::Fence::null()) {
             state.free.extend(cb);
             return Err(error);
         }
         state.submitted = value;
         state.waits.clear();
+        state.signals.clear();
         if let Some(cb) = cb {
             state.in_flight.push_back((cb, value));
         }
@@ -300,21 +335,32 @@ impl StreamInner {
     /// Submits everything recorded and waits for it, without holding the
     /// state lock while waiting, so other threads can keep recording.
     pub(crate) fn drain(&self) -> Result<()> {
-        let value = {
-            let mut state = lock(&self.state);
-            self.flush_in(&mut state, true)?;
-            state.submitted
-        };
+        let value = self.flush_with_linked()?;
         self.device.wait_timeline(self.timeline, value)
     }
 
     fn is_idle(&self) -> Result<bool> {
-        let value = {
+        let value = self.flush_with_linked()?;
+        Ok(self.device.timeline_value(self.timeline)? >= value)
+    }
+
+    /// Submits everything recorded here and on the linked streams, and returns
+    /// the value of this stream's last submission. The linked streams are
+    /// flushed because this stream's work may wait for theirs.
+    fn flush_with_linked(&self) -> Result<u64> {
+        let (value, linked) = {
             let mut state = lock(&self.state);
             self.flush_in(&mut state, true)?;
-            state.submitted
+            state.linked.retain(|stream| stream.strong_count() > 0);
+            (state.submitted, state.linked.iter().filter_map(Weak::upgrade).collect::<Vec<_>>())
         };
-        Ok(self.device.timeline_value(self.timeline)? >= value)
+        let mut first_error = None;
+        for stream in linked {
+            if let Err(error) = stream.flush(true) {
+                first_error.get_or_insert(error);
+            }
+        }
+        first_error.map_or(Ok(value), Err)
     }
 }
 
@@ -409,8 +455,54 @@ impl Stream {
         // A wait holds back the whole batch it is submitted with, so the
         // commands recorded before it go out first.
         self.inner.flush_in(&mut state, false)?;
-        state.waits.push((source, value));
+        state.waits.push(Pending::Stream(source, value));
         Ok(())
+    }
+
+    /// Makes work enqueued after this call wait until the shared timeline
+    /// `semaphore` (a handle of this stream's device) has reached `value`. The
+    /// batch recorded so far is submitted first.
+    pub(crate) fn wait_shared(&self, semaphore: vk::Semaphore, value: u64) -> Result<()> {
+        let mut state = lock(&self.inner.state);
+        self.inner.flush_in(&mut state, false)?;
+        state.waits.push(Pending::Shared(semaphore, value));
+        Ok(())
+    }
+
+    /// Sets the shared timeline `semaphore` (a handle of this stream's device)
+    /// to `value` when everything enqueued so far has finished. The batch is
+    /// submitted at once, so that whoever waits for the value can rely on it
+    /// being on its way.
+    pub(crate) fn signal_shared(&self, semaphore: vk::Semaphore, value: u64) -> Result<()> {
+        let mut state = lock(&self.inner.state);
+        state.signals.push((semaphore, value));
+        self.inner.flush_in(&mut state, true)
+    }
+
+    /// Records that this stream's work may wait for work of `other` (a stream
+    /// of another device), and the other way round: synchronising either then
+    /// submits what both have recorded. Linking twice does nothing.
+    pub fn link(&self, other: &Stream) {
+        self.link_inner(&other.inner);
+    }
+
+    /// [`Stream::link`] with the other stream's internals, for the code that
+    /// keeps only a weak handle of a stream.
+    pub(crate) fn link_inner(&self, other: &Arc<StreamInner>) {
+        if Arc::ptr_eq(&self.inner, other) {
+            return;
+        }
+        for (a, b) in [(&self.inner, other), (other, &self.inner)] {
+            let mut state = lock(&a.state);
+            if !state.linked.iter().any(|l| l.as_ptr() == Arc::as_ptr(b)) {
+                state.linked.push(Arc::downgrade(b));
+            }
+        }
+    }
+
+    /// A weak handle of the stream's internals, to link it later.
+    pub(crate) fn weak(&self) -> Weak<StreamInner> {
+        Arc::downgrade(&self.inner)
     }
 
     /// Enqueues a copy from a staging buffer to the device: the counterpart of

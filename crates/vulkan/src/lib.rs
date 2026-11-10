@@ -8,7 +8,12 @@
 //!   on it and next to it.
 //! - [`Stream`] and [`Event`] order work on a device, by recording commands
 //!   into batches (see the [`Stream`] docs for the design).
-//! - [`Kernels`] holds the engine's compute shaders on a device.
+//! - [`Kernels`] holds the engine's compute shaders on a device: the decode
+//!   weight kernels for every type a GGUF file can carry (integer dot products on
+//!   the quantized data, one pipeline per number of activation rows), and the
+//!   prefill kernels on the tensor cores (`VK_KHR_cooperative_matrix`), which are
+//!   chosen by [`Kernels::prefill_path`] when the device is loaded; a device
+//!   without cooperative matrices runs [`Kernels::matmul_decode`] instead.
 //!
 //! It deliberately has no tensor type and no graph. A model's forward pass is
 //! ordinary code that enqueues kernels on streams; shapes are arguments, so a
@@ -44,19 +49,30 @@
 //! - Dropping a [`DeviceBuffer`], [`StagingBuffer`] or [`Function`] waits for
 //!   the whole device (the way `cuMemFree` does), after flushing every stream.
 //!
-//! Left out: `peer_access`, `enable_peer_access`, `Stream::copy_peer` and
-//! events between devices (a logical Vulkan device cannot name another's memory
-//! or events; exported external memory and semaphores could carry them, which
-//! is not built), and `HostRegistration` (`VK_EXT_external_memory_host` could
-//! import page-aligned host memory, also not built).
+//! Several devices: [`Mesh`] sums partial results across devices and [`Lane`]
+//! hands activations from one to the next, in the way of the CUDA layer's
+//! `Mesh` and `Lane`, over whichever route the drivers allow (see the `mesh`
+//! module's docs for what each route needs and what this machine's driver
+//! does). What the layers below provide: [`SharedTimeline`] (a timeline
+//! semaphore several devices share, the one cross-device event Vulkan has),
+//! [`DeviceBuffer::import_host`] and [`HostPages`] (page-aligned host memory
+//! imported by several devices), [`DeviceBuffer::new_exportable`],
+//! [`DeviceBuffer::export`] and [`DeviceBuffer::import`] (video memory of one
+//! device used by another, where the driver honours it). There is still no
+//! `peer_access`, `enable_peer_access` or `Stream::copy_peer`: Vulkan has no
+//! peer copy between logical devices (device groups would, see
+//! [`device_groups`]; they are not built).
 
 mod device;
 mod error;
 mod instance;
 mod kernels;
 mod memory;
+mod mesh;
 mod module;
+mod prefill;
 mod stream;
+mod timeline;
 mod transfer;
 mod weights;
 
@@ -66,6 +82,9 @@ pub use device::{
 };
 pub use error::{Error, Result};
 pub use kernels::{Kernels, MAX_BATCH};
-pub use memory::{DeviceBuffer, DevicePtr, StagingBuffer};
+pub use memory::{DeviceBuffer, DevicePtr, HostPages, ShareKind, SharedMemory, StagingBuffer};
+pub use mesh::{Lane, MAX_DEVICES, Mesh, PUSH_MAX_VALUES, Parcel, Route, device_groups};
 pub use module::{Args, Function, MAX_ARGS, Module};
+pub use prefill::{Precision, PrefillPath};
 pub use stream::{DEFAULT_BATCH, Event, MAX_IN_FLIGHT, Stream};
+pub use timeline::SharedTimeline;

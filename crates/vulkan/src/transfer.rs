@@ -219,7 +219,7 @@ impl Transfer {
             );
             raw.end_command_buffer(cb).check("vkEndCommandBuffer")?;
         }
-        device.submit(&[cb], &[], None, self.fences[slot])?;
+        device.submit(&[cb], &[], &[], self.fences[slot])?;
         self.slots[slot] = Slot::Busy((!is_write).then_some((host_start, len)));
         Ok(())
     }

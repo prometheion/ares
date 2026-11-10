@@ -2,7 +2,11 @@
 // activation rows, with integer dot products over activations that
 // quantize_act.comp has quantized to int8. The GLSL counterpart of `mmvq.cuh`, with
 // the same structure and the same arithmetic; read its comment for why it looks
-// like this.
+// like this. What differs: the loop over the activation rows is unrolled to exactly the
+// number of rows (a pipeline per number, ARES_NB) because the activation loads are what
+// bound the multi-row case on the 3060 (replacing them by constants made 8 rows as fast as
+// 1), and the rows per warp are 4 or 8 where CUDA's are 2 (an activation load then serves
+// more rows).
 //
 // A kernel file defines a type (a `mmvq_<type>.glsl`) and includes this file:
 //   BLOCK_VALUES, BLOCK_BYTES    the geometry of a block (GGUF layout)
@@ -24,7 +28,8 @@
 //   y   n_batch rows of n_out f32 values
 //   tables  the codebooks of the i-quants (iq_tables.bin)
 //
-// A workgroup is 4 warps of 32 lanes and computes 8 output rows, 2 to a warp. On a
+// A workgroup is 4 warps of 32 lanes and computes 4 ARES_MMVQ_ROWS output rows (build.rs
+// chooses the number per kernel, 2 to 8 in the shapes measured), that many to a warp. On a
 // device whose subgroup is 64 wide a subgroup is two warps. The warp is a logical
 // unit here (the 32 lanes of a cluster of the subgroup); the sum over its lanes is
 // a clustered reduction.
@@ -40,6 +45,16 @@ layout(push_constant, std430) uniform Push {
     uint n_out;
     uint n_batch;
 } pc;
+
+// The number of activation rows when the kernel is built for one (ARES_NB, 1 to 8), so
+// that the loop over them is unrolled to exactly that many and every load of the loop can
+// be issued before the first is used; else 0, and a branch on the push constant cuts the
+// loop of 8.
+const uint SPEC_BATCH = ARES_NB;
+const uint NB = SPEC_BATCH == 0 ? ARES_MAX_BATCH : SPEC_BATCH;
+
+// Blocks of a row a lane loads before it uses any (ARES_UNROLL).
+const uint UNROLL = ARES_UNROLL;
 
 const uint WARPS = ARES_MMVQ_WARPS;
 const uint ROWS = ARES_MMVQ_ROWS;
@@ -78,13 +93,41 @@ void main() {
         }
     }
 
-    for (uint kb = lane / LANES; kb < blocks_per_row; kb += kb_step) {
+    uint kb = lane / LANES;
+    if (UNROLL > 1) {
+        // The loads of UNROLL blocks of a row are issued before any is used, which keeps
+        // more bytes in flight per warp for the types that need few bytes per step.
+        for (; kb + (UNROLL - 1) * kb_step < blocks_per_row; kb += UNROLL * kb_step) {
+            W wr[UNROLL][ROWS];
+            [[unroll]] for (uint u = 0; u < UNROLL; u++) {
+                [[unroll]] for (uint r = 0; r < ROWS; r++) {
+                    wr[u][r] = load_w(wrow[r] + uint64_t(kb + u * kb_step) * BLOCK_BYTES, slot);
+                }
+            }
+            [[unroll]] for (uint b = 0; b < NB; b++) {
+                if (SPEC_BATCH == 0 && b >= pc.n_batch) {
+                    break;
+                }
+                [[unroll]] for (uint u = 0; u < UNROLL; u++) {
+                    const uint k = kb + u * kb_step;
+                    const A a = load_a(
+                        pc.aq + uint64_t(b) * pc.n_in + uint64_t(k) * BLOCK_VALUES,
+                        ad + 8 * (uint64_t(b) * groups_per_row + uint64_t(k) * (BLOCK_VALUES / 32)),
+                        slot);
+                    [[unroll]] for (uint r = 0; r < ROWS; r++) {
+                        dot_acc(acc[r][b], wr[u][r], a);
+                    }
+                }
+            }
+        }
+    }
+    for (; kb < blocks_per_row; kb += kb_step) {
         W wr[ROWS];
         [[unroll]] for (uint r = 0; r < ROWS; r++) {
             wr[r] = load_w(wrow[r] + uint64_t(kb) * BLOCK_BYTES, slot);
         }
-        [[unroll]] for (uint b = 0; b < ARES_MAX_BATCH; b++) {
-            if (b >= pc.n_batch) {
+        [[unroll]] for (uint b = 0; b < NB; b++) {
+            if (SPEC_BATCH == 0 && b >= pc.n_batch) {
                 break;
             }
             const A a = load_a(
@@ -99,8 +142,8 @@ void main() {
 
     // Sum over the lanes of the warp; lane 0 writes.
     [[unroll]] for (uint r = 0; r < ROWS; r++) {
-        [[unroll]] for (uint b = 0; b < ARES_MAX_BATCH; b++) {
-            if (b >= pc.n_batch) {
+        [[unroll]] for (uint b = 0; b < NB; b++) {
+            if (SPEC_BATCH == 0 && b >= pc.n_batch) {
                 break;
             }
             const float total = subgroupClusteredAdd(acc[r][b], 32);

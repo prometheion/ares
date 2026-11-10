@@ -24,6 +24,11 @@ layout(push_constant, std430) uniform Push {
     uint n_batch;
 } pc;
 
+// The number of activation rows when the kernel is built for one (ARES_NB, 1 to 8), else
+// 0: the loop over the rows is then cut by a branch on the push constant.
+const uint SPEC_BATCH = ARES_NB;
+const uint NB = SPEC_BATCH == 0 ? ARES_MAX_BATCH : SPEC_BATCH;
+
 const uint WARPS = ARES_MMVQ_WARPS;
 const uint ROWS = ARES_MMVQ_ROWS;
 
@@ -58,8 +63,8 @@ void main() {
                 wv[r][k] = v[k];
             }
         }
-        [[unroll]] for (uint b = 0; b < ARES_MAX_BATCH; b++) {
-            if (b >= pc.n_batch) {
+        [[unroll]] for (uint b = 0; b < NB; b++) {
+            if (SPEC_BATCH == 0 && b >= pc.n_batch) {
                 break;
             }
             const uint64_t at = pc.x + 4 * (uint64_t(b) * pc.n_in + uint64_t(c) * 8);
@@ -81,8 +86,8 @@ void main() {
     }
 
     [[unroll]] for (uint r = 0; r < ROWS; r++) {
-        [[unroll]] for (uint b = 0; b < ARES_MAX_BATCH; b++) {
-            if (b >= pc.n_batch) {
+        [[unroll]] for (uint b = 0; b < NB; b++) {
+            if (SPEC_BATCH == 0 && b >= pc.n_batch) {
                 break;
             }
             const float total = subgroupClusteredAdd(acc[r][b], 32);

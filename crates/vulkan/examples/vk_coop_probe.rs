@@ -129,10 +129,10 @@ fn main() {
             let query = loader.fp().get_physical_device_cooperative_matrix_properties_nv;
             let mut count = 0u32;
             // SAFETY: the extension is supported; a count query, then the list.
-            unsafe { query(pd, &mut count, std::ptr::null_mut()) };
+            let _ = unsafe { query(pd, &mut count, std::ptr::null_mut()) };
             let mut list = vec![vk::CooperativeMatrixPropertiesNV::default(); count as usize];
             // SAFETY: `list` has `count` entries with their structure types set.
-            unsafe { query(pd, &mut count, list.as_mut_ptr()) };
+            let _ = unsafe { query(pd, &mut count, list.as_mut_ptr()) };
             println!("  VK_NV_cooperative_matrix: {} shapes (subgroup scope)", list.len());
             for c in list.iter().filter(|c| c.scope == vk::ScopeNV::SUBGROUP) {
                 println!(
@@ -162,7 +162,7 @@ fn main() {
                 let f: FlexibleFn = unsafe { std::mem::transmute(f) };
                 let mut count = 0u32;
                 // SAFETY: a count query.
-                unsafe { f(pd, &mut count, std::ptr::null_mut()) };
+                let _ = unsafe { f(pd, &mut count, std::ptr::null_mut()) };
                 let mut list = vec![
                     Flexible {
                         s_type: 1_000_593_001,
@@ -181,7 +181,7 @@ fn main() {
                     count as usize
                 ];
                 // SAFETY: `list` has `count` entries with the right structure type.
-                unsafe { f(pd, &mut count, list.as_mut_ptr()) };
+                let _ = unsafe { f(pd, &mut count, list.as_mut_ptr()) };
                 println!("  VK_NV_cooperative_matrix2 flexible dimensions: {count} entries");
                 for c in list.iter().take(count as usize) {
                     println!(
