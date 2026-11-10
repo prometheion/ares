@@ -32,7 +32,10 @@ this engine that must fit Qwen4 when it is released.
 | `embedding_length_per_layer_input` | 160 |
 
 Strata pins everything except expert count, top-k and vocabulary at compile
-time (`include/strata/core/geometry.hpp`). Its split engine also carries a
+time (`include/strata/core/geometry.hpp`). (The later, closer reading for
+[qwen4exp-architecture.md](qwen4exp-architecture.md) found that its loader
+does pin `attention.indexer.top_k`; where the two documents differ, that one
+is the more careful.) Its split engine also carries a
 dense variant `FNX_27B` ("Qwen3.8-27B, dense": width 5120, 64 layers, 24 query
 and 4 KV heads, dense FFN 17408, a draft layer in the file, no indexer). Both
 shapes are candidates for Qwen4 27B and Qwen4 Flash.
