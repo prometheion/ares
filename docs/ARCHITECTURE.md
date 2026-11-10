@@ -142,7 +142,7 @@ machine (RTX 4070 + RTX 3060, Qwen3.8-27B) or read from the engines listed in
 | `ares-gguf` | Zero-copy GGUF reader (version 3, split files, validation at open), a small writer for tests | Done; tested against synthetic, truncated and corrupted files and real models |
 | `ares-quant` | CPU reference decoder for every GGUF type; the specification and reference codec of the engine's own KV formats (`f16`, `q8` to `q4`, tiles with a mean, the policy of exact cells) | Done; bit-identical to ggml's C code on fixtures generated from it; the KV formats are pinned by golden files and were measured on the K and V of real models |
 | `ares-cuda` | Driver API bound at run time, devices, memory, streams, events, modules, decode weight kernels for all 28 weight types, prefill weight kernels for eleven, the layer kernels of `qwen35`, attention over the stored K/V formats, the mesh that sums across devices over peer access or the host | Device layer, decode, layer and attention kernels done; prefill kernels verified, their pass over the weights 1.3 times as fast as the fork's whole prefill; tested on both GPUs, with and without peer access |
-| `ares-vulkan` | The same device-level surface on Vulkan, the same first kernels as compute shaders | Done; 23 device tests pass on both GPUs |
+| `ares-vulkan` | The same device-level surface on Vulkan; decode and prefill weight kernels for all 28 weight types as compute shaders, the prefill ones on cooperative matrices; sums between devices | Device layer and weight kernels done (23 device, 11 kernel and 9 mesh tests on both GPUs); no layer or attention kernels and no model yet |
 | `ares-state` | Page pool, page tables with copy on write, the prefix index (pages published as they fill, tails, announcements, priority classes), the checkpoint policy for recurrent state, page layouts | Done as bookkeeping; randomised model checks; the conductor does not use the new parts yet |
 | `ares-store` | State on disk: pages and checkpoints by content hash in segment files, per fingerprint, with a size limit | Done as a store of opaque bytes, tested against restarts, the limit and damaged files; not yet connected to devices |
 | `ares-io` | Reads of weights straight from the model file: io_uring with direct I/O, demand before prefetch, cancel and promote, copies of a file on several drives with the reads spread over them, a map from experts to file ranges, row reads behind a cache | Done, tested against real files and on two drives; 1.4 to 1.7 GiB/s of random expert-sized reads per SSD of the development machine and 2.9 to 3.0 GiB/s over both; not yet connected to devices |
@@ -150,13 +150,13 @@ machine (RTX 4070 + RTX 3060, Qwen3.8-27B) or read from the engines listed in
 | `ares-weights` | Expert heat, tiers that are elected and fed by reads (admission, protection, guesses bound late, slots given back), slots per layer by need, the waves of experts of a pass, a token table for the first layers, the lookahead distance, routing bias for pruning | Done as bookkeeping, unit tested and tried on synthetic routing; no runtime uses it yet |
 | `ares-api` | Request, event, decision and error types; the `Engine` trait between HTTP and the runtime (`submit` for generation, `decide` for decisions) | Done, unit tested |
 | `ares-server` | OpenAI-compatible HTTP server, `POST /v1/systemone` (wire-compatible with llama.cpp's, served for any model) and the `ares` binary | Done as a front end, tested against a mock engine; answers that no model architecture is implemented until the runtime exists |
-| `ares-runtime` | The conductor thread and one thread per device, the step loop that connects plan, state and kernels, speculation with the n-gram drafter, the `Model` trait a model implements, a synthetic model that drives the real kernels | Done as a skeleton; 71 tests and 10 GPU tests on one device, tensor split and layer split; implements `Engine::submit` (not `decide`), greedy picks only, no prefix cache, no real model |
-| `ares-model` | Model architectures: configuration and weight table from a GGUF, and a CPU reference of the forward pass with explicit state (window and commit) that GPU implementations are compared with block by block | `qwen35` (Qwen3.5-0.8B, Qwen3.8-27B) done as reference: equal to llama.cpp to rounding on a model with f32 weights, and within what llama.cpp's own 8-bit activations cost on the real 0.8B; no GPU implementation yet |
+| `ares-runtime` | The conductor thread and one thread per device, the step loop that connects plan, state and kernels, speculation with the n-gram drafter, the `Model` trait a model implements, a synthetic model that drives the real kernels | Drives `qwen35` on one device, in tensor split and in layer split; implements `Engine::submit` (not `decide`), greedy picks on the host, no prefix cache, drafts from the n-gram lookup only |
+| `ares-model` | Model architectures: configuration and weight table from a GGUF, and a CPU reference of the forward pass with explicit state (window and commit) that GPU implementations are compared with block by block | `qwen35` (Qwen3.5-0.8B, Qwen3.8-27B): the reference is equal to llama.cpp to rounding on a model with f32 weights, and the device implementation (`qwen35::device`) runs both models on the GPUs, see [Several devices](#several-devices). `qwen4exp` (Qwen3.8-Flash-Next): reference done, equal to the llama.cpp fork to rounding on a small synthetic model and to Strata's greedy tokens on the real file; no device implementation yet |
 | `ares-tokenizer` | Text to token ids and back for byte-level BPE (`gpt2` with the `qwen35` pre-tokenizer) as llama.cpp does it, malformed UTF-8 included; control tokens in text only on request; encoding on several threads for long prompts; a streaming decoder that never cuts a character; the chat templates of the model file (Jinja, a dialect of its own that errors on what it does not support) with tools and the generation prompt | Done; token ids equal llama.cpp's on millions of generated and real texts for the three Qwen test models, chat prompts equal on thousands of conversations; about 20 times llama.cpp's encode speed on one core |
 
-The second test architecture, `qwen4exp`, is
-specified ([reference/qwen4exp-architecture.md](reference/qwen4exp-architecture.md))
-and not implemented.
+The second test architecture, `qwen4exp`, is specified in
+[reference/qwen4exp-architecture.md](reference/qwen4exp-architecture.md); its
+kernels and its path for experts are being built.
 
 ## A step
 
@@ -1028,6 +1028,50 @@ bound by the link (the 3060's PCIe 3.0 x4) and leaves the processors free.
 Every route gives every device the bitwise same f32 sum; sending fewer bits
 over the link is a later, measured option.
 
+### Qwen3.8-27B on the two cards
+
+Measured 2026-11-10 with `crates/model/examples/qwen35_run.rs`, one
+sequence, 8-bit activations, K and V in `q8`, the peer route. The llama.cpp
+fork on the same cards: 28 ms per token without drafts, about 1180 prompt
+tokens per second at 2048 tokens.
+
+| Placement | Decode at 1000 tokens | at 32000 | Prompt of 2048 tokens | VRAM taken at a context of 4096 |
+| --- | --- | --- | --- | --- |
+| Tensor split 0.625 / 0.375 | 26.4 ms | 31.6 ms (profile on) | 554 tokens/s, steps of 512 rows | 9500 / 5410 MiB |
+| Layer split 0.62 / 0.38 (44 and 20 blocks) | 41.4 ms | | 1348 tokens/s, steps of 1024 handed over in groups of 256 | 9582 / 5940 MiB |
+
+Where a decode step in tensor split goes, in ms on the RTX 4070 | RTX 3060
+(with the profile's timed events, which cost about 1.9 ms of the step):
+
+| Context | Weight products | Layer kernels | Attention | Sums, with waiting | Step |
+| --- | --- | --- | --- | --- | --- |
+| 1000 | 21.3 \| 21.1 | 2.3 \| 3.3 | 0.45 \| 0.71 | 3.5 \| 2.4 | 28.3 |
+| 32000 | 21.3 \| 21.0 | 2.3 \| 3.3 | 2.8 \| 3.7 | 4.3 \| 2.5 | 31.6 |
+
+The weight products are at the floor that the memory bandwidth of the two
+cards sets (22.0 ms for a pass over all weights). What separates a step from
+it is the small layer kernels, the 129 sums and the cards waiting for each
+other at each sum. A row of drafts adds little to the products (24.4 ms for
+four rows), which is why drafts from the model are the next gain in decode.
+
+Prompt processing in tensor split is slow because of the sums: 128 per
+step, each moving rows x 5120 `f32` values in both directions over the RTX
+3060's PCIe 3.0 x4 link, and not overlapped with the cards' work. As `f32`
+that is 2.6 MB per row and direction, which alone caps the rate near 1300
+rows per second on that link *(calc)*; the weight kernels allow 1536. The
+layer split has no sums and hands a step over in groups, so both cards work
+at once.
+
+Against the reference, on Qwen3.5-0.8B on one card: the most likely token
+is the reference's in 725 of 725 prompt rows with exact products and in 715
+of 725 with 8-bit activations (the widest margin missed is 0.106 logits),
+and 40 greedy tokens are equal except at one near tie in German. llama.cpp
+itself agrees with the reference in 704 of 725 rows.
+
+The weights are loaded in 10 to 12 s. The recurrent state takes 150 MiB per
+sequence over both cards, K and V 33 MiB per 1000 tokens. Picks are made on
+the host from logits read back.
+
 ### Vulkan
 
 `ares-vulkan` gives the same surface (devices, buffers, ordered work,
@@ -1051,6 +1095,22 @@ GPU that CUDA 13 does not run on.
   3060 (194 GB/s). The straight port of the CUDA baseline's layout measures
   69 and 30 GB/s on Vulkan, which points at that layout, not at the backend,
   as what holds the CUDA baseline back.
+- Prefill runs on the tensor cores through cooperative matrices, for all 28
+  weight types through a decoder per type, and for Q4_K also on the
+  rearranged form, which has the same bytes as CUDA's, so one upload format
+  serves both backends. Measured 2026-11-10 at 1024 rows, 17408 x 5120, RTX
+  4070 / RTX 3060: rearranged Q4_K with `f16` accumulation 87.2 / 39.0 TOPS
+  (CUDA: 79 / 34), IQ4_XS 45.4 / 19.7 (CUDA: 82.8 / 37.4), Q6_K 34.0 / 15.4
+  (CUDA: 56.7 / 24.9). The register kernel for Q4_K is the fastest prefill
+  kernel in the engine and is to be carried back to CUDA; the types without
+  a rearranged form are behind CUDA on Vulkan.
+- No direct route between the two cards works on this driver: an exported
+  allocation is imported by the other card without an error and carries no
+  data. Sums go through host pages that both cards import, at the speed of
+  CUDA's host route (55 against 47 µs for 10240 values; CUDA's peer route
+  takes 18). Direct routes are built and untested for lack of hardware.
+- The NVIDIA driver crashes at process exit when Vulkan devices are still
+  alive, so the engine drops its devices before it exits.
 
 ## What is taken from where
 
@@ -1083,8 +1143,16 @@ Ares still copies llama.cpp without a reason, is
 
 State on 2026-11-10, on an RTX 4070 and an RTX 3060 with driver 615.78.08:
 
-- No model runs yet. What exists is the backbone in the table under
-  [Crates](#crates).
+- Qwen3.8-27B runs on both cards and answers through its chat template.
+  In tensor split it decodes at 26.4 ms per token against 28 ms for the
+  llama.cpp fork without drafts, and reads a prompt at 554 tokens per second
+  against about 1180: decode is at the cards' memory bandwidth, prompt
+  processing is held back by the sums between the cards. In layer split it
+  is the other way round (41.4 ms, 1348 tokens per second). The fork runs
+  with drafts from the model's MTP block, which Ares does not have yet, so
+  today the fork is the faster engine. See
+  [Several devices](#several-devices).
+- Qwen3.8-Flash-Next runs in the CPU reference only.
 - The CUDA tests pass on both GPUs: 11 of the device layer, 5 of the decode
   kernels, 9 of the prefill kernels, 12 of the layer kernels and 7 of the
   attention kernels, the decode
@@ -1154,15 +1222,16 @@ the source of each item is named there.
    backend.
 5. Checkpoints stored in `f16` (75 MiB for Qwen3.8-27B; measured to cost
    nothing visible), in VRAM, RAM and on disk under the policy's budget.
-6. The two test models, side by side. `qwen35`: Qwen3.8-27B assembled from
-   the kernels on both cards and compared with the llama.cpp fork (35.7
-   tokens per second without drafts, about 1180 tokens per second of
-   prefill). `qwen4exp`: a CPU reference checked on a small synthetic model,
-   the path of an expert from SSD over RAM into a VRAM slot and through its
-   kernel, measured on the experts of Flash-Next, then the model's own
-   kernels (stream mixer, n-gram rows, indexer, block selection, attention
-   over a list of cells) and the comparison with Strata. Architecture work
-   for the release waits for Qwen4.
+6. The two test models, side by side, each clearly ahead of the engine it
+   replaces. `qwen35`: the tensor split's sums (in `f16`, overlapped with the
+   cards' work, shares balanced per layer), drafts from the MTP block with
+   picks on the device, then the comparison with the llama.cpp fork running
+   its drafts. `qwen4exp`: the path of an expert from SSD over RAM into a
+   VRAM slot and through its kernel, measured on the experts of Flash-Next,
+   then the model's own kernels (stream mixer, n-gram rows, indexer, block
+   selection, attention over a list of cells), the model on the devices and
+   the comparison with Strata. Architecture work for the release waits for
+   Qwen4.
 7. Weight placement and the split planner; connecting `ares-io` and
    `ares-store` to the devices; residency of pages (a fixed GPU working set
    over K/V in pinned RAM), background writes and restores, and suspension

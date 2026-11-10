@@ -15,10 +15,14 @@ How the engine is built and how far each part is: [docs/ARCHITECTURE.md](docs/AR
 
 ## State
 
-The backbone exists: the model file reader, the device layers with the weight
-kernels, the bookkeeping for sequence state, scheduling and expert placement,
-and a runtime that drives the devices with a synthetic model. No real model
-runs yet. Architecture-specific work waits for the Qwen4 release.
+Two test models stand in for Qwen4 until it is released. Qwen3.8-27B runs on
+two GPUs through CUDA and answers through its chat template; it is not yet
+faster than the llama.cpp fork it is measured against, because drafts from
+the model and a fast sum between the cards are still being built.
+Qwen3.8-Flash-Next, a mixture of experts streamed from SSD, runs in the CPU
+reference only. The numbers are in
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#status). There is no release
+before Qwen4.
 
 ## Build
 
@@ -74,7 +78,7 @@ at that library with `ARES_LIBCUDA=<path>/libcuda.so.1`.
 | `crates/sched` | Step planning, draft policy, n-gram drafter |
 | `crates/weights` | Expert tiers and pruning policy |
 | `crates/runtime` | Conductor and device threads: the step loop |
-| `crates/model` | Model architectures and their CPU reference |
+| `crates/model` | Model architectures: CPU reference and device implementation |
 | `crates/tokenizer` | Tokenizer and chat templates |
 | `crates/api` | Types between the HTTP server and the runtime |
 | `crates/server` | The `ares` binary |
