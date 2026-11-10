@@ -12,6 +12,15 @@ cache.
 
 Scope decisions:
 
+- **Two test cases stand for Qwen4.** Until Qwen4 is released the engine is
+  built and measured on its two closest relatives, one for each way weights
+  are held: Qwen3.8-27B (`qwen35`), dense and entirely on the GPUs, on both
+  cards; and Qwen3.8-Flash-Next (`qwen4exp`), a mixture of experts with the
+  experts in tiers and streamed from SSD. A part of the engine is done when
+  it has run in both. On the development machine (two cards with 12 GB, 31
+  GB of RAM, a 63.5 GiB file) Flash-Next can only run with streaming, so the
+  case without it is not measured there.
+
 - **Current models have recurrent layers.** Every architecture the engine
   targets mixes recurrent layers with attention that is either dense (Spark)
   or sparse (Flash-Next, Qwen4). State that is not addressable by position is
@@ -132,7 +141,7 @@ machine (RTX 4070 + RTX 3060, Qwen3.8-27B) or read from the engines listed in
 | `ares-core` | Tensor element types and block geometry, byte units, memory ledgers | Done, unit tested |
 | `ares-gguf` | Zero-copy GGUF reader (version 3, split files, validation at open), a small writer for tests | Done; tested against synthetic, truncated and corrupted files and real models |
 | `ares-quant` | CPU reference decoder for every GGUF type; the specification and reference codec of the engine's own KV formats (`f16`, `q8` to `q4`, tiles with a mean, the policy of exact cells) | Done; bit-identical to ggml's C code on fixtures generated from it; the KV formats are pinned by golden files and were measured on the K and V of real models |
-| `ares-cuda` | Driver API bound at run time, devices, memory, streams, events, modules, decode weight kernels for all 28 weight types and prefill weight kernels for eleven, the mesh that sums across devices over peer access or the host | Device layer and decode kernels done; prefill kernels work and are verified but are not yet faster than the fork; tested on both GPUs, with and without peer access |
+| `ares-cuda` | Driver API bound at run time, devices, memory, streams, events, modules, decode weight kernels for all 28 weight types, prefill weight kernels for eleven, the layer kernels of `qwen35`, the mesh that sums across devices over peer access or the host | Device layer, decode and layer kernels done; prefill kernels verified, their pass over the weights 1.3 times as fast as the fork's whole prefill; attention kernels in progress; tested on both GPUs, with and without peer access |
 | `ares-vulkan` | The same device-level surface on Vulkan, the same first kernels as compute shaders | Done; 23 device tests pass on both GPUs |
 | `ares-state` | Page pool, page tables with copy on write, prefix index with checkpoints, page layouts | Done; randomised model check |
 | `ares-store` | State on disk: pages and checkpoints by content hash in segment files, per fingerprint, with a size limit | Done as a store of opaque bytes, tested against restarts, the limit and damaged files; not yet connected to devices |
@@ -618,74 +627,167 @@ freeing them 4 to 8 ms. Launching a kernel costs the host under a
 microsecond and nothing in the path synchronises.
 
 **Prefill weight kernels.** A quantized matrix times many rows of
-activations, on the tensor cores, for the same eleven types. There are two
-paths, and `Kernels::prefill_path` picks one per device (see the cap below):
+activations, on the tensor cores, for the same eleven types
+(`kernels/mm.cuh`, `mm_types.cuh`, `mmr.cuh`, `prefill.cu`). Three paths,
+which `Kernels::prefill_path_for(ty, precision)` chooses per type and device:
 
 - **int8**: `mma` on int8 tiles of the weight codes, reading the same int8
-  activations the decode kernels use, so one quantization of the activations
-  serves both families. About 1.1 % rms from the exact f32 product, like the
-  decode kernels.
-- **f16**: the weights decoded to f16 tiles, f16 `mma` with f32 accumulation.
-  This is the exact path: 0.03 % rms from the exact product.
+  activations the decode kernels use. The integer result of every 32 values
+  is scaled in f32. 1.05 % rms from the exact f32 product (1.5 % at worst) on
+  the test data.
+- **f16**: the weights decoded to f16 tiles (packed f16x2 arithmetic from the
+  codes and the f16 scales), f16 `mma` with f32 accumulation. The activations
+  are divided per row by a power of two so that their largest value is below
+  1, and the factor is put back at the end. 0.03 % rms.
+- **f16 with f16 accumulation** (`PrefillPath::F16Flush`): the same tiles, but
+  `mma` accumulates in f16 and the partial sum of every 4 `mma` (64 values of
+  K: at most 64 products of a weight and a value below 1, so no overflow) is
+  added to f32 registers. GeForce cards run that at twice the rate of f32
+  accumulation. 0.05 % rms, 0.12 % at worst.
+
+On a capped card (below) `Precision::Fast` takes F16Flush for Q4_K, IQ2_S and
+IQ2_XS, where it is as fast as int8 (1.02 to 1.18 times, measured on both
+cards at 1024 rows) and 20 times more exact, and int8 for the other types
+(F16Flush is 0.74 to 0.91 times as fast there); `Precision::Exact` is always
+f16. A row gives the same bits alone and inside a batch within a path.
+
+Measured 2026-11-10, 17408 x 5120, TOPS (2 * n_out * n_in * rows per
+second), RTX 4070 (peaks: int8 234, f16 with f16 accumulation 117, with f32
+58.6) / RTX 3060 (102, 51.2, 25.6):
+
+|              | 64 rows   | 256       | 1024      | 2048      |
+|--------------|-----------|-----------|-----------|-----------|
+| q4_K int8    | 45 / 24   | 76.5 / 33.7 | 78.1 / 34.3 | 78.0 / 34.5 |
+| q4_K f16     | 46 / 22   | 54.8 / 23.0 | 55.2 / 23.7 | 55.3 / 23.7 |
+| q4_K F16Flush | 46 / 22  | 75.4 / 33.5 | 77.9 / 34.1 | 77.7 / 34.1 |
+| iq4_xs int8  | 45 / 21   | 81.8 / 36.2 | 81.9 / 37.1 | 81.6 / 36.9 |
+| iq4_xs F16Flush | 44 / 22 | 69.8 / 30.2 | 69.7 / 30.8 | 69.5 / 30.8 |
+| q6_K int8    | 28 / 13   | 54.2 / 23.8 | 55.7 / 24.8 | 55.9 / 24.8 |
+| q6_K F16Flush | 30 / 14  | 43.3 / 19.4 | 44.2 / 20.1 | 44.6 / 20.1 |
+
+(First-round values at 1024 rows: q4_K int8 62.4 / 26.4, f16 49.3 / 22.5;
+iq4_xs int8 52.8 / 22.8; q6_K int8 33.4 / 14.7. The f16 path on the RTX
+3060 was slower than in the first round after the large 128 x 128 shape
+(19.5 against 22.5); it is 23.7 now.) Which type is slowest depends on the
+path: q6_K, in both.
+
+What bounds them, by ablation (the same kernel with a part removed; the
+hardware counters are not available): int8 issues 416 instructions per warp
+and step of which 192 scale the integer results, four warps per scheduler
+1664 for 1024 cycles of tensor work, so it cannot get near the tensor cores
+whatever the overlap; removing the scaling gives 111 TOPS. The f16 kernels
+have no such cost, and an empty skeleton of `mma`, `ldmatrix` and barriers
+reaches 103 of 117 TFLOPS with f16 accumulation (RTX 4070; 44 of 51.2 on the
+RTX 3060). What held the first version of them back was the weights' loads:
+with every weight row reading the same address the kernel was 35 % faster.
+The file's layout puts the 36 to 70 bytes a row needs per step 2880 bytes from
+the next row's, so one load of a warp touches 16 lines, and the load unit
+(which `ldmatrix` shares) is busy with them. Decoding the next tile inside the
+loop of `mma`, loading the quants into L1, and decoding with packed f16x2
+instructions (Marlin's `prmt`/`hsub2`/`hfma2`) took Q4_K from 49 to 55 TFLOPS
+with f32 accumulation and to 78 with f16 accumulation. Now the activations
+bound them: without their `cp.async` the kernel reaches 98 TFLOPS (RTX 4070).
+
+**Rearranged Q4_K** (`Kernels::rearrange`, `matmul_rearranged`,
+`kernels/mmr.cuh`). A Q4_K matrix can be rearranged once at upload into the
+order the tensor cores read it (codes in `mma` fragment order, 16 bytes per
+lane and 64 values; the 16-byte block headers of 16 rows together): the same
+number of bytes (rows rounded up to 16), 0.3 ms for a 17408 x 5120 matrix on
+the RTX 4070 (about 80 ms for the 13.8 GiB of the 27B model), and a kernel that
+decodes in registers like Marlin's, with no weight tile in shared memory. It
+is correct and as fast as the tile kernel from 256 rows on (78.7 / 33.9
+TFLOPS at 256 to 2048 rows), faster at 128 rows on the RTX 4070 (76.7 against
+60.1), and slower below (29 at 64 rows). So Marlin's layout and register
+decoding did not beat the improved tile kernel at prompt sizes, because
+both are bound by the activations now; the form is kept for 128 rows and as the
+base for the next step. A rearranged matrix is read by nothing else: the decode
+kernels and the other prefill kernels need the file's form, so a model that
+decodes with the same matrix cannot keep only the rearranged one (until a decode
+kernel reads it).
 
 `Kernels::decode_kernel_rows(ty)` is the number of rows up to which the decode
 kernels are the faster family (6 to 20, by type); above it `matmul` is used.
-A row gives the same bits alone and inside a batch.
+Re-measured with all paths: Q4_K 16, IQ4_XS 12, Q6_K 8 to 12 on the RTX 4070
+(unchanged); the RTX 3060 keeps decode ahead up to about 16 for Q6_K.
 
-Measured 2026-11-10, 17408 x 5120 q4_K, 1024 rows: 3.06 ms on the RTX 4070
-and 6.91 ms on the RTX 3060 with int8 (60 and 26 TOPS), 3.68 and 8.10 ms
-with f16. The other types take 1.0 to 1.7 times as long. That is a quarter
-of the integer peak of the tensor cores (234 and 102 TOPS): the loop is not
-bound by them but by its own instructions (about half of them scale the
-integer results) and by the weight loads; below 64 rows the weights alone
-bound it at about 0.3 ms per matrix.
+A pass over all weight matrices of Qwen3.8-27B (Q4_K_S file, 13.8 GiB) at
+the split 0.625 / 0.375 takes 92 ms with 64 rows, 221 ms with 256, 694 ms
+with 1024 and 1339 ms with 2048: 1529 rows per second at 2048 rows (first
+round: 1054), at a split of 0.7 / 0.3 1787 rows per second at 1024 rows (the
+2048-row pass no longer fits the RTX 4070's memory since the prepared
+activations carry an f32 copy). The llama.cpp fork prefills about 1180 tokens
+per second at 2048 tokens for its whole forward pass, so the weights alone are
+now about 1.3 to 1.5 times as fast as the fork's whole pass; attention and the
+rest still come on top. The f32 copy is of use only to the decode kernels of
+the float types and is to leave the buffer the prefill kernels size.
 
-A pass over all weight matrices of Qwen3.8-27B at the split 0.625 / 0.375
-takes 108 ms with 64 rows, 281 ms with 256, 980 ms with 1024 and 1943 ms with
-2048: 1054 rows per second, with the RTX 4070 idle for 29 % of the pass. At a
-split of 0.7 / 0.3, which balances the compute, it is 1319 rows per second.
-The llama.cpp fork prefills about 1180 tokens per second at 2048 tokens for
-its whole forward pass, so these kernels are **not yet ahead of the fork**:
-weights alone take about as long as the fork's whole pass. What is open:
-the scaling part of the loop, weight access for small batches, what limits
-the f16 kernel, kernels for Turing (the prefill binary needs compute
-capability 8.0; `matmul` refuses below it), and more than 48 KB of shared
-memory per block (the launcher cannot ask for it yet).
+**Layer kernels** (`kernels/layers.cu`, `ares_cuda::LayerKernels`).
+Everything a block of `qwen35` does between its matrix products: the
+embedding gather (15 weight types), the norms per head, the causal
+convolution with its window of earlier rows, the gated delta rule as a
+window that reads the state and a commit that writes the accepted prefix,
+the gated output norm and SwiGLU fused with the quantization of the next
+product's activations, the rotary table and the preparation of queries and
+keys. The rotary table is built once per step in f64, because an f32 angle
+is off by about 0.01 rad at position 262k. A step record, uploaded once per
+step, tells the kernels which rows belong to which sequence and state slot,
+their positions, how many rows were accepted, and which rows are certain: a
+prompt row or a row without a draft writes its state directly and needs no
+commit. The same kernels serve `qwen4exp`, whose recurrent layers differ
+only in the gate of the output norm.
+
+Against the f64 CPU reference every kernel is within 7e-7. A chain of all 18
+recurrent blocks of Qwen3.5-0.8B on the GPU, with the weight kernels in
+between, is within 1.0e-3 to 1.5e-3 of the reference with exact products and
+within 1.6e-2 to 1.9e-2 with 8-bit activations; the second number is the
+rounding of the weight kernels.
+
+Measured 2026-11-10 at the shapes of Qwen3.8-27B. A decode row costs a
+recurrent block about 21 µs on the RTX 4070 outside its products, of which
+the delta rule takes 10 to 14: it moves the 3 MiB of state of the block and
+is bound by memory. A prompt of 2048 rows costs the delta rule 1.16 ms per
+block (2.44 ms on the RTX 3060), which is 2.3 times as fast as the thread
+mapping of the llama.cpp fork's kernel in the same harness. The rule is
+sequential in the rows; a chunked form on the tensor cores is not built.
+
+The state of the delta rule can be held in `f16` (`StateFormat::F16`), which
+halves the 150 MiB per sequence of the 27B and takes the delta rule of four
+sequences from 55 to 32 µs. Measured on the CPU reference with the 0.8B over
+1000 tokens of real text, rounding the state to `f16` after every step moves
+the logits by a KL divergence of 1e-6 to 3e-6 and never changes the most
+likely token, but the error grows with the length (the hidden state is off
+by 7e-4 over the first 250 tokens and by 1.8e-3 over the last). Rounded
+once, as a checkpoint would be, it is 1e-8 for `f16` and 1e-4 to 2e-4 for
+int8 with a scale per row; int8 with a scale per head is unusable. `f32`
+stays the default for the live state until `f16` is measured on the 27B and
+on long sequences; checkpoints can be `f16`.
 
 **The tensor-core cap of GeForce cards.** GeForce cards run FP16, BF16 and
 TF32 tensor-core math with FP32 accumulation at half rate; professional cards
 with the same silicon do not, and gpu-unlock
 (https://github.com/Zagitta/gpu-unlock) removes the cap on RTX 20, 30 and 40
 at boot. Kernels can work around the cap (integer tiles, or accumulating in
-FP16, as the llama.cpp fork does for attention), at the price of a small loss
-of exactness. Without the cap the direct path is both the fast one and the
-exact one, so the workaround and its divergence are simply gone.
+FP16 and flushing to FP32, as above), at the price of a small loss of
+exactness. Without the cap the direct path is both the fast one and the exact
+one, so the workaround and its divergence are simply gone.
 
 There is no build option for this. Each device is probed for a few
 milliseconds when the kernels are loaded and the result is reported at start:
 
-- **Tensor cores at full rate:** the direct path is used. The workaround is
-  not available.
+- **Tensor cores at full rate:** the direct path (f16, f32 accumulation) is
+  used.
 - **Capped:** the workaround is the default, because it is faster there, and
-  the report says so and names the remedy. The direct path can be chosen
-  instead, as the exact but slower setting.
+  the report says so and names the remedy. The exact path can be chosen
+  instead.
 
 The development machine's cards are capped, and the probe shows it exactly:
 f16 `mma` with f32 accumulation runs at 58.6 TFLOPS on the RTX 4070 and 25.6
 on the RTX 3060, with f16 accumulation at 117.0 and 51.2, and int8 at 234 and
 102 TOPS. The probe takes about 10 ms in `Kernels::load`
-(`tensor_cores_full_rate()`). For the prefill kernels the workaround is the
-int8 path and the direct path is f16: `prefill_path(Precision::Fast)` gives
-f16 on a full-rate device and int8 on a capped one, `Precision::Exact` always
-f16.
-
-One thing is not as the rule assumes. No uncapped card was at hand, so the
-f16 kernel was timed with f16 accumulation, which runs at the rate an uncapped
-card has for f32 accumulation, and it got no faster (49.1 against 49.4
-TFLOPS): today's f16 kernel is not bound by the tensor cores. On an uncapped
-card it would therefore still be 20 to 30 % slower than int8 from 256 rows
-on. The policy is in place; the f16 kernel has to get faster before the
-direct path is free.
+(`tensor_cores_full_rate()`). No uncapped card was at hand, so the f16 kernel
+with f32 accumulation could not be timed at the full rate; with f16
+accumulation (the rate an uncapped card has for f32) it is the F16Flush path
+above.
 
 `ares_matvec_q4_K` stays as the exact f32 reference. It is slow because each
 lane reads activations 256 bytes apart, not because of its arithmetic.
@@ -834,23 +936,27 @@ State on 2026-11-10, on an RTX 4070 and an RTX 3060 with driver 615.78.08:
 
 - No model runs yet. What exists is the backbone in the table under
   [Crates](#crates).
-- The CUDA tests pass on both GPUs, with the stock driver library (host
-  route) and with the patched one (peer routes): 11 of the device layer, 5 of
-  the decode kernels, 6 of the prefill kernels, the last two also on real
-  tensors of Qwen3.8-27B.
+- The CUDA tests pass on both GPUs: 11 of the device layer, 5 of the decode
+  kernels, 9 of the prefill kernels and 12 of the layer kernels, the decode
+  and prefill ones also on real tensors of Qwen3.8-27B, the layer ones on a
+  chain of the real blocks of Qwen3.5-0.8B.
 - Decode weight kernels exist for all 28 weight types. One row runs at 95 to
   100 % of the memory limit of the RTX 4070 for the types of 4 bits and more;
-  the low-bit types fall off from two rows on. Prefill weight kernels work
-  for eleven types but reach only a
-  quarter of the tensor cores' integer peak and are not yet ahead of the
-  llama.cpp fork (see [Devices](#devices)).
+  the low-bit types fall off from two rows on.
+- Prefill weight kernels work for eleven types. A pass over the weights of
+  Qwen3.8-27B runs at 1536 rows per second with 2048 rows, against about 1180
+  tokens per second for the whole prefill of the llama.cpp fork. The kernels
+  reach a third of the tensor cores' integer peak and are bound by how the
+  activations reach them (see [Devices](#devices)).
+- The layer kernels of `qwen35` (everything between the matrix products) are
+  within 7e-7 of the CPU reference.
 - The KV formats are specified, pinned by golden files and measured on the K
   and V of real models, and attention over the stored formats has a CPU
   reference (`ares_quant::kvhead`). The GPU kernels that read and write them
   are being written.
-- Being written and not in this state yet: prefill kernels on a device
-  layout and for every type, the layer kernels of `qwen35`, and the Vulkan
-  mirrors.
+- Being written and not in this state yet: the attention kernels and the
+  Vulkan mirrors. Prefill kernels for the other 17 weight types are not
+  started; the decode kernels serve those types at any row count.
 - The tokenizer gives llama.cpp's token ids and chat prompts for the three
   test models and encodes 76 to 85 MB of text per second on one core.
 - The server crates and the quantization reference were verified through
@@ -901,9 +1007,15 @@ the source of each item is named there.
    while generating, sparse in a prompt, always one at the prompt's last page
    boundary; replay over cached pages without K/V writes; stored compressed
    if the measurement of narrower state holds.
-6. The first model: `qwen35` assembled in the runtime from the kernels and
-   compared with the llama.cpp fork, then `qwen4exp`. Architecture-specific
-   work for release waits for Qwen4.
+6. The two test models, side by side. `qwen35`: Qwen3.8-27B assembled from
+   the kernels on both cards and compared with the llama.cpp fork (35.7
+   tokens per second without drafts, about 1180 tokens per second of
+   prefill). `qwen4exp`: a CPU reference checked on a small synthetic model,
+   the path of an expert from SSD over RAM into a VRAM slot and through its
+   kernel, measured on the experts of Flash-Next, then the model's own
+   kernels (stream mixer, n-gram rows, indexer, block selection, attention
+   over a list of cells) and the comparison with Strata. Architecture work
+   for the release waits for Qwen4.
 7. Weight placement and the split planner; connecting `ares-io` and
    `ares-store` to the devices; residency of pages (a fixed GPU working set
    over K/V in pinned RAM), background writes and restores, and suspension
