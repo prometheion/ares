@@ -153,7 +153,7 @@ struct Geometry {
     ram_pool_base: usize,
 }
 
-/// The slots a store will have: what [`ExpertStore::plan`] works out, for
+/// The slots a store will have: what [`StorePlan::new`] works out, for
 /// the caller to allocate the devices' pools and the RAM region from.
 #[derive(Debug)]
 pub struct StorePlan {
