@@ -1,36 +1,58 @@
 //! The thread that decides.
 //!
 //! Everything the engine knows about its requests lives here, as plain data
-//! that only this thread touches: sequences and their page tables, the plan
-//! of each step, the step time model, the drafters and their acceptance
-//! statistics, the state of every request. Other threads reach it through one
-//! channel ([`Command`]) and are reached through sinks and the executor, so
-//! there is nothing to lock.
+//! that only this thread touches: sequences and their page tables, the
+//! admission accounting and the line of requests that wait, the plan of each
+//! step, the step time model, the corpus the drafts are looked up in, the
+//! state of every request. Other threads reach it through one channel
+//! ([`Command`]) and are reached through sinks and the executor, so there is
+//! nothing to lock.
 //!
 //! One turn of the loop is one step:
 //!
 //! ```text
-//! intake -> plan -> write record -> dispatch ... wait ... collect -> commit -> events
-//!           (drafts decided first)                (devices work)    (accept, cut,   (sinks)
-//!                                                                    update)
+//! intake -> admit -> plan -> claim pages -> write record -> dispatch ... collect -> commit -> events
+//!           (who     (drafts  (drafts cut,                  (devices work)         (accept, cut,
+//!            starts)  first)   someone gives way)                                   corpus, update)
 //! ```
+//!
+//! # Who runs
+//!
+//! Nothing is reserved for a request's longest possible length and nothing is
+//! refused for load. A request is put in line ([`ares_sched::Admission`]) and
+//! starts when the pages of its prompt and the output it is expected to
+//! produce fit next to what the running requests are expected to need; a
+//! request that is alone always starts. Every step claims the pages its rows
+//! write. When they do not fit, draft rows are dropped first; then the request
+//! with the fewest generated tokens gives way: it lets go of its pages and
+//! its place on the devices and waits at the front of the line. The runtime
+//! cannot move a sequence's state to host memory yet, so a request that gave
+//! way computes its rows again when it comes back, as a prompt made of
+//! everything it has read and written. The one request left in the pool is
+//! never made to wait: when the pool cannot hold it any longer it ends, as it
+//! would at the end of the context.
+//!
+//! What bounds the number of requests: the ones that run are bounded by the
+//! places the devices have ([`RuntimeConfig::max_slots`]: a recurrent state,
+//! a page table and a row of logits each) and by the pool; the ones that wait
+//! are not bounded.
 
 use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::mpsc::{Receiver, SyncSender};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender};
 use std::time::{Duration, Instant};
 
 use ares_api::{EngineError, Event, EventSink, FinishReason, RequestId, Sampling, Usage};
 use ares_cuda::{SampleParams, SampleRow};
 use ares_sched::{
-    Acceptance, DraftCost, Limits, NgramDrafter, PartKind, Request, SeqId, StepTimeModel, Want,
-    best_draft_len, plan, prefill_rows_next_to,
+    Acceptance, Admission, AdmissionConfig, Arrival, DraftCost, Limits, Load, LookupCorpus,
+    LookupDrafter, Outcome, PartKind, PoolView, Request, SeqId, StepTimeModel, Want,
+    best_draft_len, plan, prefill_rows_at,
 };
 use ares_state::{PagePool, Sequence};
 
-use crate::config::RuntimeConfig;
+use crate::config::{Drafters, RuntimeConfig};
 use crate::exec::{Clock, ExecError, Executor, StepMeta, StepOutput};
 use crate::model::{ContextSpec, Model};
 use crate::record::{self, Commit, RecordWriter, Row, TableUpdate};
@@ -39,6 +61,11 @@ use crate::timing::{Phase, Snapshot, Stats};
 
 /// Drafts cost the model nothing to produce: a lookup.
 const LOOKUP: DraftCost = DraftCost { fixed_ms: 0.0, per_token_ms: 0.0 };
+
+/// How long the conductor sleeps on its channel when requests wait and none
+/// can start. Admission starts the first in line whenever nothing runs, so
+/// this is a guard against spinning and not a path a request takes.
+const STALLED: Duration = Duration::from_millis(1);
 
 /// What other threads ask of the conductor.
 pub(crate) enum Command {
@@ -57,15 +84,16 @@ pub(crate) struct StatsCopy {
     pages_free: u32,
     pages_capacity: u32,
     active: u32,
+    waiting: u32,
 }
 
 impl StatsCopy {
     pub(crate) fn into_snapshot(self) -> Snapshot {
-        Snapshot::new(&self.stats, self.pages_free, self.pages_capacity, self.active)
+        Snapshot::new(&self.stats, self.pages_free, self.pages_capacity, self.active, self.waiting)
     }
 }
 
-/// A request that has been checked and holds a reservation.
+/// A request that has been checked.
 pub(crate) struct Submission {
     pub id: RequestId,
     pub prompt: Vec<u32>,
@@ -74,8 +102,6 @@ pub(crate) struct Submission {
     /// How the request's tokens are picked.
     pub sampling: Sampling,
     pub sink: EventSink,
-    /// Pages reserved for the request's longest possible length.
-    pub reserved: u32,
 }
 
 /// What the conductor knows about a running sequence, for tests and logs.
@@ -91,55 +117,22 @@ pub struct SequenceInfo {
     pub pages: Vec<u32>,
 }
 
-/// The books that let [`Engine::submit`](ares_api::Engine::submit) refuse a
-/// request at once, without asking the conductor: pages and slots are
-/// reserved for a request's longest possible length when it is accepted and
-/// given back when it ends, so a running request cannot run out of either.
-#[derive(Debug)]
-pub(crate) struct Admission {
-    pages: AtomicI64,
-    slots: AtomicI64,
+/// Where a request is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Place {
+    /// Running, in this slot of the devices.
+    Slot(u32),
+    /// In line.
+    Waiting,
 }
 
-impl Admission {
-    pub fn new(pages: u32, slots: u32) -> Self {
-        Self { pages: AtomicI64::new(i64::from(pages)), slots: AtomicI64::new(i64::from(slots)) }
-    }
-
-    /// Takes `pages` and a slot, or takes nothing and says no.
-    pub fn try_reserve(&self, pages: u32) -> bool {
-        if self.slots.fetch_sub(1, Ordering::AcqRel) <= 0 {
-            self.slots.fetch_add(1, Ordering::AcqRel);
-            return false;
-        }
-        let need = i64::from(pages);
-        let mut free = self.pages.load(Ordering::Acquire);
-        loop {
-            if free < need {
-                self.slots.fetch_add(1, Ordering::AcqRel);
-                return false;
-            }
-            match self.pages.compare_exchange_weak(
-                free,
-                free - need,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => return true,
-                Err(now) => free = now,
-            }
-        }
-    }
-
-    pub fn release(&self, pages: u32) {
-        self.pages.fetch_add(i64::from(pages), Ordering::AcqRel);
-        self.slots.fetch_add(1, Ordering::AcqRel);
-    }
-}
-
-/// A request that is running.
+/// A request the engine holds: running in a slot of the devices, or waiting
+/// in line.
 struct Active {
     id: RequestId,
+    /// The request's name in the admission accounting, while it waits and
+    /// while it runs.
+    seq: SeqId,
     sink: EventSink,
     /// The page table. Its length is the number of cells computed, which is
     /// the number of tokens less one once the prompt is read: the newest
@@ -150,8 +143,14 @@ struct Active {
     /// Per token, the host-side context state (see [`ContextSpec`]).
     states: Vec<u32>,
     prompt_len: u32,
-    drafter: NgramDrafter,
-    acceptance: Acceptance,
+    /// How many of `tokens` are computed as certain rows before the sequence
+    /// generates: the prompt, and for a request that gave way and came back
+    /// everything it had read and written by then.
+    known: u32,
+    /// The sequence's place in the corpus of all text. Its tokens enter the
+    /// corpus when they are certain: prompt tokens when the step that
+    /// computed their rows is back, generated tokens when they are accepted.
+    drafter: LookupDrafter,
     /// How the model's own drafts have done for this sequence.
     own_acceptance: Acceptance,
     /// How the sequence's tokens are picked.
@@ -159,8 +158,9 @@ struct Active {
     stop: StopMatcher,
     max_tokens: Option<u32>,
     completion: u32,
-    reserved: u32,
     waited_steps: u32,
+    /// Whether the request was counted as one that had to wait.
+    counted_waiting: bool,
     /// Drafts for the coming step; cut to the rows the plan grants. When the
     /// model drafts them itself (`own`), placeholders until the step brings
     /// the drafts back.
@@ -178,7 +178,7 @@ struct Active {
 
 impl Active {
     fn generating(&self) -> bool {
-        self.cells.len() >= u64::from(self.prompt_len)
+        self.cells.len() >= u64::from(self.known)
     }
 
     fn usage(&self) -> Usage {
@@ -196,6 +196,7 @@ impl Active {
         model: &dyn Model,
         spec: &ContextSpec,
         context_length: u32,
+        corpus: &mut LookupCorpus,
         picked: &[u32],
     ) {
         for &token in picked {
@@ -208,7 +209,7 @@ impl Active {
             let previous = self.states.last().copied().unwrap_or_else(|| spec.start());
             self.tokens.push(token);
             self.states.push(spec.advance(previous, &self.tokens));
-            self.drafter.push(token);
+            self.drafter.push(corpus, token);
             model.piece(token, &mut self.pending);
             let (stop, emitted) = (&mut self.stop, &mut self.emitted);
             if take_characters(&mut self.pending, |ch| stop.push(ch, emitted)) {
@@ -236,6 +237,10 @@ impl Drop for Conductor {
                 let _ = a.sink.send(Event::Error(gone.clone()));
                 a.cells.release(&mut self.pool);
             }
+        }
+        for a in self.waiting.drain(..) {
+            let _ = a.sink.send(Event::Error(gone.clone()));
+            a.cells.release(&mut self.pool);
         }
         while let Ok(command) = self.rx.try_recv() {
             if let Command::Submit(submission) = command {
@@ -282,8 +287,41 @@ fn take_characters(pending: &mut Vec<u8>, mut push: impl FnMut(char) -> bool) ->
 #[derive(Clone, Copy, Debug)]
 struct StepPart {
     slot: u32,
+    /// The sequence that was in the slot when the step was planned.
+    seq: SeqId,
     rows: u32,
     kind: PartKind,
+}
+
+/// The load of `rows` consecutive rows of a sequence that start at position
+/// `context`, for a model whose rows read at most `span` cells each.
+fn load_of(span: u32, context: u64, rows: u32) -> Load {
+    let span = u64::from(span);
+    // The rows that still read less than the span, and the ones at it.
+    let below = span.saturating_sub(context).min(u64::from(rows)) as u32;
+    let head = Load::chunk(context, below);
+    Load { rows, cells: head.cells + u64::from(rows - below) * span }
+}
+
+/// What the admission accounting may ask about the pool.
+struct View<'a> {
+    pool: &'a PagePool,
+    slots: &'a [Option<Active>],
+}
+
+impl PoolView for View<'_> {
+    fn evictable(&mut self) -> u32 {
+        // Nothing is cached yet: every page has a sequence that holds it.
+        0
+    }
+
+    fn releasable(&mut self, seq: SeqId) -> u32 {
+        self.slots
+            .iter()
+            .flatten()
+            .find(|a| a.seq == seq)
+            .map_or(0, |a| a.cells.releasable(self.pool))
+    }
 }
 
 pub(crate) struct Conductor {
@@ -292,17 +330,26 @@ pub(crate) struct Conductor {
     config: RuntimeConfig,
     context_length: u32,
     max_rows: u32,
+    /// The most cells a row reads through attention.
+    span: u32,
     exec: Box<dyn Executor>,
     /// The executor's clock: device threads stamp their events with it.
     clock: Clock,
     rx: Receiver<Command>,
-    admission: Arc<Admission>,
     pool: PagePool,
+    /// Who runs, who waits and who gives way.
+    admission: Admission,
+    /// The running requests, by their slot on the devices.
     slots: Vec<Option<Active>>,
     free_slots: Vec<u32>,
-    by_id: HashMap<RequestId, u32>,
+    /// The requests in line. Their order is the accounting's business.
+    waiting: Vec<Active>,
+    by_id: HashMap<RequestId, Place>,
+    next_seq: u32,
     active: usize,
     step_time: StepTimeModel,
+    /// The text of all sequences, which drafts are looked up in.
+    corpus: LookupCorpus,
     stats: Stats,
     step_no: u64,
     after_idle: bool,
@@ -310,6 +357,8 @@ pub(crate) struct Conductor {
     last_done_ns: Option<u64>,
     failed: Option<String>,
     shutting_down: bool,
+    /// Requests wait and the last pass could start none of them.
+    stalled: bool,
     // Scratch that lives across steps so that a step allocates nothing for it.
     requests: Vec<Request>,
     parts: Vec<StepPart>,
@@ -319,6 +368,10 @@ pub(crate) struct Conductor {
     commits: Vec<Commit>,
     output: StepOutput,
     scratch_tokens: Vec<u32>,
+    /// The lookup's proposal for the sequence being looked at, and the
+    /// confidence of each of its tokens.
+    proposal: Vec<u32>,
+    confidence: Vec<f64>,
     /// How the wanted rows of the step are picked, in their order.
     samplers: Vec<SampleRow>,
     /// What a link of the model's own draft chain costs, in device
@@ -333,20 +386,30 @@ impl Conductor {
         config: RuntimeConfig,
         exec: Box<dyn Executor>,
         rx: Receiver<Command>,
-        admission: Arc<Admission>,
     ) -> Self {
         let max_rows = match config.max_rows {
             0 => model.max_rows(),
             n => n.min(model.max_rows()),
         };
         let slots = config.max_slots as usize;
+        let admission = AdmissionConfig {
+            output_clip: config.output_clip,
+            initial_ratio: config.output_ratio,
+            max_running: config.max_slots,
+            ..AdmissionConfig::new(config.pages, config.cells_per_page)
+        };
         Self {
             spec: model.context(),
             context_length: model.card().context_length,
+            span: model.attention_span(),
             pool: PagePool::new(config.pages, config.cells_per_page),
+            admission: Admission::new(admission),
             slots: (0..slots).map(|_| None).collect(),
             free_slots: (0..config.max_slots).rev().collect(),
+            waiting: Vec::new(),
             by_id: HashMap::with_capacity(slots),
+            next_seq: 0,
+            corpus: LookupCorpus::new(config.lookup),
             stats: Stats::new(exec.devices(), config.stats_window),
             output: StepOutput {
                 picks: Vec::with_capacity(max_rows as usize),
@@ -362,13 +425,14 @@ impl Conductor {
             runs: Vec::with_capacity(max_rows as usize),
             commits: Vec::with_capacity(slots),
             scratch_tokens: Vec::with_capacity(64),
+            proposal: Vec::with_capacity(config.max_draft as usize),
+            confidence: Vec::with_capacity(config.max_draft as usize),
             model,
             config,
             max_rows,
             clock: exec.clock(),
             exec,
             rx,
-            admission,
             active: 0,
             step_time: StepTimeModel::default(),
             step_no: 0,
@@ -376,6 +440,7 @@ impl Conductor {
             last_done_ns: None,
             failed: None,
             shutting_down: false,
+            stalled: false,
         }
     }
 
@@ -418,13 +483,24 @@ impl Conductor {
     pub(crate) fn run(mut self) {
         loop {
             if self.active == 0 && !self.shutting_down {
-                // Nothing to do: sleep until somebody asks for something.
-                match self.rx.recv() {
-                    Ok(command) => {
+                // Nothing runs. With nobody in line either, sleep until
+                // somebody asks for something.
+                let command = if self.waiting.is_empty() {
+                    self.rx.recv().map(Some).map_err(|_| RecvTimeoutError::Disconnected)
+                } else if self.stalled {
+                    self.rx.recv_timeout(STALLED).map(Some)
+                } else {
+                    // The last running request has just ended: the next in
+                    // line starts in this turn.
+                    Ok(None)
+                };
+                match command {
+                    Ok(Some(command)) => {
                         self.after_idle = true;
                         self.handle(command);
                     }
-                    Err(_) => break,
+                    Ok(None) | Err(RecvTimeoutError::Timeout) => {}
+                    Err(RecvTimeoutError::Disconnected) => break,
                 }
             }
             let turn = Instant::now();
@@ -435,7 +511,7 @@ impl Conductor {
                 break;
             }
             self.stats.record(Phase::Intake, turn.elapsed().as_nanos() as u64);
-            if self.active == 0 {
+            if self.active == 0 && self.waiting.is_empty() {
                 continue;
             }
             self.step(turn);
@@ -453,12 +529,16 @@ impl Conductor {
 
     fn handle(&mut self, command: Command) {
         match command {
-            Command::Submit(submission) => self.admit(*submission),
-            Command::Cancel(id) => {
-                if let Some(&slot) = self.by_id.get(&id) {
-                    self.retire(slot, FinishReason::Cancelled);
+            Command::Submit(submission) => self.enqueue(*submission),
+            Command::Cancel(id) => match self.by_id.get(&id) {
+                Some(Place::Slot(slot)) => self.retire(*slot, FinishReason::Cancelled),
+                Some(Place::Waiting) => {
+                    if let Some(i) = self.waiting.iter().position(|a| a.id == id) {
+                        self.dismiss(i, FinishReason::Cancelled);
+                    }
                 }
-            }
+                None => {}
+            },
             Command::Stats { reset, reply } => {
                 self.stats.counters.device_wakes = self.exec.device_wakes();
                 let copy = StatsCopy {
@@ -466,6 +546,7 @@ impl Conductor {
                     pages_free: self.pool.free_pages(),
                     pages_capacity: self.pool.capacity(),
                     active: self.active as u32,
+                    waiting: self.waiting.len() as u32,
                 };
                 if reset {
                     self.stats.reset();
@@ -495,11 +576,25 @@ impl Conductor {
             .collect()
     }
 
-    fn admit(&mut self, submission: Submission) {
-        let Submission { id, prompt, max_tokens, stop, sampling, sink, reserved } = submission;
+    /// A name for the admission accounting that no request the engine holds
+    /// has.
+    fn fresh_seq(&mut self) -> SeqId {
+        loop {
+            self.next_seq = self.next_seq.wrapping_add(1);
+            let seq = SeqId(self.next_seq);
+            let taken = |a: &Active| a.seq == seq;
+            if !self.slots.iter().flatten().any(taken) && !self.waiting.iter().any(taken) {
+                return seq;
+            }
+        }
+    }
+
+    /// Puts a new request in line. It starts at the next pass of the
+    /// admission accounting in which it fits.
+    fn enqueue(&mut self, submission: Submission) {
+        let Submission { id, prompt, max_tokens, stop, sampling, sink } = submission;
         let refuse = |error: EngineError| {
             let _ = sink.send(Event::Error(error));
-            self.admission.release(reserved);
         };
         if let Some(why) = &self.failed {
             return refuse(EngineError::Internal(why.clone()));
@@ -507,29 +602,42 @@ impl Conductor {
         if self.by_id.contains_key(&id) {
             return refuse(EngineError::InvalidRequest(format!("request id {id} is in use")));
         }
-        let Some(slot) = self.free_slots.pop() else {
-            self.stats.counters.requests_refused += 1;
-            return refuse(EngineError::Overloaded);
+        let prompt_len = prompt.len() as u32;
+        let seq = self.fresh_seq();
+        let room = self.context_length.saturating_sub(prompt_len);
+        let arrival = Arrival {
+            seq,
+            prompt_cells: prompt_len,
+            cached_cells: 0,
+            idle_cached_pages: 0,
+            max_new_tokens: max_tokens.map_or(room, |max| max.min(room)),
         };
+        if self.admission.enqueue(arrival).is_err() {
+            // The one refusal: the whole pool cannot hold the prompt and the
+            // first token after it.
+            return refuse(EngineError::ContextOverflow {
+                prompt_tokens: prompt_len,
+                limit: self.pool.capacity().saturating_mul(self.pool.cells_per_page()),
+            });
+        }
         let mut states = Vec::with_capacity(prompt.len() + 64);
         let mut state = self.spec.start();
         for i in 0..prompt.len() {
             state = self.spec.advance(state, &prompt[..=i]);
             states.push(state);
         }
-        let mut drafter = NgramDrafter::new(self.config.ngram);
-        drafter.extend(&prompt);
         let mut tokens = Vec::with_capacity(prompt.len() + 64);
         tokens.extend_from_slice(&prompt);
-        self.slots[slot as usize] = Some(Active {
+        self.waiting.push(Active {
             id,
+            seq,
             sink,
             cells: Sequence::new(),
-            prompt_len: prompt.len() as u32,
+            prompt_len,
+            known: prompt_len,
             tokens,
             states,
-            drafter,
-            acceptance: Acceptance::new(self.config.max_draft as usize, self.config.draft_prior),
+            drafter: LookupDrafter::new(),
             own_acceptance: Acceptance::new(
                 self.config.max_draft as usize,
                 self.config.draft_prior,
@@ -552,8 +660,8 @@ impl Conductor {
             stop: StopMatcher::new(&stop),
             max_tokens,
             completion: 0,
-            reserved,
             waited_steps: 0,
+            counted_waiting: false,
             draft: Vec::with_capacity(self.config.max_draft as usize),
             own: false,
             lookup: Vec::with_capacity(self.config.max_draft as usize),
@@ -561,12 +669,59 @@ impl Conductor {
             emitted: String::new(),
             finished: None,
         });
-        self.by_id.insert(id, slot);
+        self.by_id.insert(id, Place::Waiting);
+    }
+
+    /// Gives the request with the name `seq` a slot on the devices: it runs
+    /// from the next plan on.
+    fn start(&mut self, seq: SeqId) {
+        let Some(i) = self.waiting.iter().position(|a| a.seq == seq) else { return };
+        let Some(slot) = self.free_slots.pop() else {
+            // The accounting never starts more requests than there are
+            // slots, so this is a bookkeeping bug and not load.
+            let a = self.waiting.swap_remove(i);
+            let _ = a.sink.send(Event::Error(EngineError::Internal(
+                "a request was started without a free slot".into(),
+            )));
+            self.by_id.remove(&a.id);
+            self.admission.remove(seq);
+            return;
+        };
+        let a = self.waiting.swap_remove(i);
+        self.by_id.insert(a.id, Place::Slot(slot));
+        self.slots[slot as usize] = Some(a);
         self.active += 1;
     }
 
+    /// Takes the running request with the name `seq` off the devices: it
+    /// lets go of its pages and its slot and waits at the front of the line.
+    /// Its state is not kept anywhere, so it computes everything it has read
+    /// and written again when it comes back.
+    fn suspend(&mut self, seq: SeqId) {
+        let Some(slot) = self.slots.iter().position(|a| a.as_ref().is_some_and(|a| a.seq == seq))
+        else {
+            return;
+        };
+        let Some(mut a) = self.slots[slot].take() else { return };
+        std::mem::take(&mut a.cells).release(&mut self.pool);
+        a.known = a.tokens.len() as u32;
+        a.draft.clear();
+        a.lookup.clear();
+        a.own = false;
+        a.waited_steps = 0;
+        // Nothing is brought back when it returns; its rows are claimed
+        // again step by step, as a prompt's are.
+        self.admission.set_restore(seq, 0, 0);
+        self.admission.set_recompute(seq, a.known);
+        self.by_id.insert(a.id, Place::Waiting);
+        self.waiting.push(a);
+        self.free_slots.push(slot as u32);
+        self.active -= 1;
+        self.stats.counters.requests_suspended += 1;
+    }
+
     /// Ends the request in `slot`: tells its sink (if it still listens),
-    /// gives its pages and its reservation back.
+    /// gives its pages and its slot back.
     fn retire(&mut self, slot: u32, finish: FinishReason) {
         let Some(mut a) = self.slots[slot as usize].take() else { return };
         self.by_id.remove(&a.id);
@@ -577,39 +732,107 @@ impl Conductor {
             a.sink.send(Event::Done { finish, usage: a.usage() });
         }
         a.cells.release(&mut self.pool);
-        self.admission.release(a.reserved);
         self.free_slots.push(slot);
         self.active -= 1;
         match finish {
-            FinishReason::Cancelled => self.stats.counters.requests_cancelled += 1,
-            _ => self.stats.counters.requests_finished += 1,
+            FinishReason::Cancelled => {
+                self.admission.remove(a.seq);
+                self.stats.counters.requests_cancelled += 1;
+            }
+            _ => {
+                // What it produced of what it was allowed teaches the
+                // accounting what to expect of the others.
+                self.admission.finished(a.seq);
+                self.stats.counters.requests_finished += 1;
+            }
         }
+    }
+
+    /// Ends the waiting request at index `i` of the line.
+    fn dismiss(&mut self, i: usize, finish: FinishReason) {
+        let mut a = self.waiting.swap_remove(i);
+        self.by_id.remove(&a.id);
+        self.admission.remove(a.seq);
+        if !a.sink.is_closed() {
+            if !a.emitted.is_empty() {
+                a.sink.send(Event::Text(std::mem::take(&mut a.emitted)));
+            }
+            a.sink.send(Event::Done { finish, usage: a.usage() });
+        }
+        a.cells.release(&mut self.pool);
+        self.stats.counters.requests_cancelled += 1;
     }
 
     fn finish_everything(&mut self, finish: FinishReason) {
         for slot in 0..self.slots.len() as u32 {
             self.retire(slot, finish);
         }
+        while !self.waiting.is_empty() {
+            self.dismiss(self.waiting.len() - 1, finish);
+        }
     }
 
     /// Ends every request with an error, after the devices failed. The
     /// engine accepts no more requests.
     fn fail(&mut self, message: String) {
+        let error = EngineError::Internal(message.clone());
         for slot in 0..self.slots.len() as u32 {
             if let Some(a) = &self.slots[slot as usize] {
-                let _ = a.sink.send(Event::Error(EngineError::Internal(message.clone())));
+                let _ = a.sink.send(Event::Error(error.clone()));
                 self.retire(slot, FinishReason::Cancelled);
             }
+        }
+        while let Some(a) = self.waiting.last() {
+            let _ = a.sink.send(Event::Error(error.clone()));
+            self.dismiss(self.waiting.len() - 1, FinishReason::Cancelled);
         }
         self.failed = Some(message);
     }
 
+    /// One pass of the admission accounting: the pages the parts in
+    /// `self.parts` claim, then who starts.
+    fn settle(&mut self) -> Outcome {
+        let mut claims = self.admission.begin(self.pool.free_pages());
+        for part in &self.parts {
+            let Some(a) = &self.slots[part.slot as usize] else { continue };
+            // A prompt's rows and a sequence's newest token must run; draft
+            // rows are given up before anybody has to wait.
+            let (must, prompt_rows) = match part.kind {
+                PartKind::Prefill { .. } => (part.rows, part.rows),
+                PartKind::Window | PartKind::Score { .. } => (1, 0),
+            };
+            let required = a.cells.pages_to_append(&self.pool, u64::from(must));
+            let all = a.cells.pages_to_append(&self.pool, u64::from(part.rows));
+            claims.claim(part.seq, required, all.saturating_sub(required), prompt_rows);
+        }
+        claims.settle(&mut View { pool: &self.pool, slots: &self.slots })
+    }
+
+    /// Carries out who gives way and who starts.
+    fn seat(&mut self, outcome: &Outcome) {
+        for seq in &outcome.spill {
+            self.suspend(*seq);
+        }
+        for seq in outcome.resume.iter().chain(&outcome.admit) {
+            self.start(*seq);
+        }
+    }
+
     /// Decides how many drafts each generating sequence asks for, and
-    /// fills `requests` for the planner.
-    fn want(&mut self) -> u32 {
+    /// fills `requests` for the planner. Returns the load of the step's
+    /// rows that are not optional and not a prompt's: the newest token of
+    /// every generating sequence.
+    fn want(&mut self) -> Load {
         self.requests.clear();
-        let generating = self.slots.iter().flatten().filter(|a| a.generating()).count() as u32;
-        let time = self.step_time.base_and_per_row();
+        let span = self.span;
+        let reads = |a: &Active| a.cells.len().min(u64::from(span));
+        let mut generating = 0u32;
+        let mut windows = Load::default();
+        for a in self.slots.iter().flatten().filter(|a| a.generating()) {
+            generating += 1;
+            windows = windows.plus(load_of(span, a.cells.len(), 1));
+        }
+        let cost = self.step_time.cost();
         // Every draft row needs its logits, like the one row every sequence
         // may need: drafts share what the model gives beyond those.
         let mut spare_logit_rows = self.model.logit_rows().saturating_sub(self.active as u32);
@@ -637,13 +860,26 @@ impl Conductor {
                     // own draft block, which always has one and pays for
                     // every link. Each gets its best length; the one with
                     // more expected tokens per millisecond drafts.
-                    let proposal = a.drafter.draft(cap);
-                    let own_cap = cap.min(self.model.own_drafts() as usize);
+                    if self.config.drafters == Drafters::Own {
+                        self.proposal.clear();
+                        self.confidence.clear();
+                    } else {
+                        a.drafter.draft(
+                            &self.corpus,
+                            cap,
+                            &mut self.proposal,
+                            &mut self.confidence,
+                        );
+                    }
+                    let own_cap = match self.config.drafters {
+                        Drafters::Lookup => 0,
+                        Drafters::Both | Drafters::Own => cap.min(self.model.own_drafts() as usize),
+                    };
                     let own_cost =
                         DraftCost { fixed_ms: 0.0, per_token_ms: self.own_link_ms.unwrap_or(0.0) };
-                    let (lookup, own) = match time {
+                    let (lookup, own) = match cost {
                         // Before any step was measured, try whole drafts.
-                        None => (proposal.len(), own_cap),
+                        None => (self.proposal.len(), own_cap),
                         // A step time model that has seen steps of one size
                         // only cannot tell a fixed cost per step from a cost
                         // per row: it puts everything on the rows (base 0),
@@ -651,25 +887,34 @@ impl Conductor {
                         // and it never learns better. A steady batch gets
                         // stuck there. So every fourth sequence in turn drafts
                         // regardless, which varies the rows of the steps.
-                        Some((base, _)) if base <= 0.0 => {
+                        Some(cost) if cost.base_ms <= 0.0 => {
                             if (self.step_no + slot as u64).is_multiple_of(4) {
-                                (proposal.len(), own_cap)
+                                (self.proposal.len(), own_cap)
                             } else {
                                 (0, 0)
                             }
                         }
-                        Some((base, per_row)) => {
-                            let best = |rates: &[f64], cost| {
+                        Some(cost) => {
+                            // A draft row of this sequence costs what a row
+                            // at its depth costs; the step without drafts is
+                            // the newest token of every generating sequence,
+                            // each at its own depth.
+                            let per_row = cost.row_ms(reads(a));
+                            let base = cost.ms(windows) - per_row * f64::from(generating);
+                            let best = |rates: &[f64], drafter| {
                                 best_draft_len(
                                     rates,
                                     base,
                                     per_row,
                                     generating,
                                     f64::from(generating),
-                                    cost,
+                                    drafter,
                                 )
                             };
-                            let lookup = best(&a.acceptance.rates()[..proposal.len()], LOOKUP);
+                            // The lookup says how sure it is of each token:
+                            // from how long the match is and how its earlier
+                            // occurrences went on.
+                            let lookup = best(&self.confidence, LOOKUP);
                             let own = best(&a.own_acceptance.rates()[..own_cap], own_cost);
                             if own.len > 0 && own.tokens_per_ms > lookup.tokens_per_ms {
                                 (0, own.len)
@@ -681,18 +926,18 @@ impl Conductor {
                     // Where nothing decided yet, a proposal of the lookup
                     // goes first: it is rarer and free.
                     if lookup > 0 {
-                        a.draft.extend_from_slice(&proposal[..lookup]);
+                        a.draft.extend_from_slice(&self.proposal[..lookup]);
                         spare_logit_rows -= lookup as u32;
                     } else if own > 0 {
                         a.own = true;
                         a.draft.resize(own, 0);
-                        a.lookup.extend_from_slice(proposal);
+                        a.lookup.extend_from_slice(&self.proposal);
                         spare_logit_rows -= own as u32;
                     }
                 }
                 Want::Window { drafts: a.draft.len() as u32 }
             } else {
-                Want::Prefill { tokens: a.prompt_len - a.cells.len() as u32 }
+                Want::Prefill { tokens: a.known - a.cells.len() as u32 }
             };
             self.requests.push(Request {
                 seq: SeqId(slot as u32),
@@ -700,57 +945,121 @@ impl Conductor {
                 waited_steps: a.waited_steps,
             });
         }
-        generating
+        windows
     }
 
     /// One turn of the loop with something to do.
     fn step(&mut self, turn: Instant) {
         let t_plan = Instant::now();
-        let generating = self.want();
+        // Those who wait come in before the plan, so that a request that
+        // fits shares this step.
+        self.parts.clear();
+        if !self.waiting.is_empty() {
+            let outcome = self.settle();
+            self.seat(&outcome);
+            for a in self.waiting.iter_mut().filter(|a| !a.counted_waiting) {
+                a.counted_waiting = true;
+                self.stats.counters.requests_waited += 1;
+            }
+        }
+        self.stalled = self.active == 0;
+        if self.stalled {
+            return;
+        }
+        let windows = self.want();
         let drafting =
             self.requests.iter().any(|r| matches!(r.want, Want::Window { drafts } if drafts > 0));
+        // The prompt rows next to generation are sized for the deepest
+        // prompt, whose rows cost most: the planner picks among the prompts
+        // by other rules, and whichever it serves stays inside the slowdown.
+        let deepest = self
+            .slots
+            .iter()
+            .flatten()
+            .filter(|a| !a.generating())
+            .map(|a| a.cells.len().min(u64::from(self.span)))
+            .max()
+            .unwrap_or(0);
         let limits = Limits {
             max_rows: if drafting {
                 self.max_rows.min(self.model.draft_rows())
             } else {
                 self.max_rows
             },
-            prefill_rows_with_windows: prefill_rows_next_to(
+            prefill_rows_with_windows: prefill_rows_at(
                 &self.step_time,
-                generating,
+                windows,
+                deepest,
                 self.config.prefill_slowdown,
                 self.config.prefill_fallback_rows,
             ),
             starvation_steps: self.config.starvation_steps,
         };
         let planned = plan(&self.requests, &limits);
+        for request in &self.requests {
+            if let Some(a) = self.slots[request.seq.0 as usize].as_mut() {
+                a.waited_steps = a.waited_steps.saturating_add(1);
+            }
+        }
+        for part in &planned.parts {
+            if let Some(a) = &self.slots[part.seq.0 as usize] {
+                let (slot, seq) = (part.seq.0, a.seq);
+                self.parts.push(StepPart { slot, seq, rows: part.rows, kind: part.kind });
+            }
+        }
+
+        // The pages this step writes. Draft rows that do not fit are
+        // dropped; when the rows that must run do not fit, somebody gives
+        // way.
+        let outcome = self.settle();
         self.stats.record(Phase::Plan, t_plan.elapsed().as_nanos() as u64);
 
-        // Pages first: a sequence that cannot grow is dropped from the step
-        // before anything is written.
         let t_write = Instant::now();
-        self.parts.clear();
-        for part in &planned.parts {
-            let slot = part.seq.0;
-            let a = self.slots[slot as usize].as_mut().expect("planned sequences are running");
+        if let Some(slot) = outcome.exhausted.and_then(|seq| {
+            self.slots.iter().position(|a| a.as_ref().is_some_and(|a| a.seq == seq))
+        }) {
+            // The pool holds this one sequence and has no page left for it:
+            // the request ends where a full context would end it.
+            if let Some(a) = &mut self.slots[slot] {
+                a.stop.flush(&mut a.emitted);
+            }
+            self.stats.counters.requests_exhausted += 1;
+            self.retire(slot as u32, FinishReason::Length);
+        }
+        self.seat(&outcome);
+        let mut kept = 0;
+        for i in 0..self.parts.len() {
+            let mut part = self.parts[i];
+            // A sequence that gave way or ended has no part in the step, and
+            // one that took its slot in this pass has none yet.
+            let Some(a) = self.slots[part.slot as usize].as_mut().filter(|a| a.seq == part.seq)
+            else {
+                continue;
+            };
             a.waited_steps = 0;
+            if outcome.cut.contains(&part.seq) {
+                self.stats.counters.draft_rows_cut += u64::from(part.rows - 1);
+                part.rows = 1;
+            }
             match a.cells.append(&mut self.pool, u64::from(part.rows)) {
                 Ok(grown) => {
                     debug_assert!(grown.copy.is_none(), "nothing forks a sequence in this runtime");
                     a.draft.truncate(part.rows.saturating_sub(1) as usize);
                     a.own &= !a.draft.is_empty();
-                    self.parts.push(StepPart { slot, rows: part.rows, kind: part.kind });
+                    self.parts[kept] = part;
+                    kept += 1;
                 }
                 Err(error) => {
-                    // Admission reserves every sequence's longest length, so
-                    // this is a bookkeeping bug and not load.
+                    // The accounting granted these pages, so this is a
+                    // bookkeeping bug and not load.
                     let _ = a.sink.send(Event::Error(EngineError::Internal(format!(
-                        "the page pool ran out under a reservation: {error}"
+                        "the page pool ran out under a granted claim: {error}"
                     ))));
-                    self.retire(slot, FinishReason::Cancelled);
+                    self.retire(part.slot, FinishReason::Cancelled);
                 }
             }
         }
+        self.parts.truncate(kept);
         if self.parts.is_empty() {
             return;
         }
@@ -769,7 +1078,11 @@ impl Conductor {
             self.stats.record(Phase::Turnaround, self.clock.now_ns().saturating_sub(done));
         }
         self.after_idle = false;
-        let rows: u32 = self.parts.iter().map(|p| p.rows).sum();
+        // What the step carries: every row and the cells it reads.
+        let load = self.parts.iter().fold(Load::default(), |load, part| {
+            let cells = self.slots[part.slot as usize].as_ref().map_or(0, |a| a.cells.len());
+            load.plus(load_of(self.span, cells - u64::from(part.rows), part.rows))
+        });
         if let Err(error) = self.exec.dispatch(&meta) {
             return self.fail(error.to_string());
         }
@@ -803,7 +1116,7 @@ impl Conductor {
                 None => per_link,
             });
         }
-        self.step_time.observe(rows, (t_back - t_dispatch).as_secs_f64() * 1e3 - draft_ms);
+        self.step_time.observe_load(load, (t_back - t_dispatch).as_secs_f64() * 1e3 - draft_ms);
         let last_done = self.output.devices.iter().map(|d| d.finished_at_ns).max().unwrap_or(0);
         self.last_done_ns = Some(last_done);
         for (device, times) in self.output.devices.iter().enumerate() {
@@ -964,13 +1277,26 @@ impl Conductor {
             let first_row = row0;
             row0 += part.rows;
             let a = self.slots[part.slot as usize].as_mut().expect("running");
+            let before = a.completion;
             match part.kind {
-                PartKind::Prefill { completes: false } => {}
-                PartKind::Prefill { completes: true } => {
-                    let pick = self.output.picks[cursor];
-                    cursor += 1;
-                    a.accept(&*self.model, &self.spec, self.context_length, &[pick.token]);
-                    self.stats.counters.tokens += 1;
+                PartKind::Prefill { completes } => {
+                    // The rows that ran are certain: their tokens are text
+                    // now, for every sequence to draft from. A request that
+                    // came back computes rows whose tokens are there already.
+                    for at in a.drafter.len()..a.cells.len() as usize {
+                        a.drafter.push(&mut self.corpus, a.tokens[at]);
+                    }
+                    if completes {
+                        let pick = self.output.picks[cursor];
+                        cursor += 1;
+                        a.accept(
+                            &*self.model,
+                            &self.spec,
+                            self.context_length,
+                            &mut self.corpus,
+                            &[pick.token],
+                        );
+                    }
                 }
                 PartKind::Window | PartKind::Score { .. } => {
                     let picks = &self.output.picks[cursor..cursor + part.rows as usize];
@@ -993,9 +1319,13 @@ impl Conductor {
                         (0..drafts).take_while(|&i| picks[i].token == a.draft[i]).count();
                     if drafts > 0 {
                         let source = usize::from(a.own);
-                        let acceptance =
-                            if a.own { &mut a.own_acceptance } else { &mut a.acceptance };
-                        acceptance.observe(drafts, accepted);
+                        if a.own {
+                            a.own_acceptance.observe(drafts, accepted);
+                        } else {
+                            // The corpus learns what matches like this one
+                            // are worth.
+                            a.drafter.observe(&mut self.corpus, drafts, accepted);
+                        }
                         let counters = &mut self.stats.counters;
                         counters.drafts_accepted += accepted as u64;
                         counters.drafts_rejected += (drafts - accepted) as u64;
@@ -1012,7 +1342,7 @@ impl Conductor {
                         let known = a.lookup.len().min(accepted + 1);
                         let right =
                             (0..known).take_while(|&i| picks[i].token == a.lookup[i]).count();
-                        a.acceptance.observe(known, right);
+                        a.drafter.observe(&mut self.corpus, known, right);
                     }
                     // The devices commit the newest token's row and the
                     // accepted drafts to recurrent state with the next step.
@@ -1030,10 +1360,19 @@ impl Conductor {
                     a.cells.truncate(&mut self.pool, keep);
                     self.scratch_tokens.clear();
                     self.scratch_tokens.extend(picks[..=accepted].iter().map(|p| p.token));
-                    let before = a.completion;
-                    a.accept(&*self.model, &self.spec, self.context_length, &self.scratch_tokens);
-                    self.stats.counters.tokens += u64::from(a.completion - before);
+                    a.accept(
+                        &*self.model,
+                        &self.spec,
+                        self.context_length,
+                        &mut self.corpus,
+                        &self.scratch_tokens,
+                    );
                 }
+            }
+            let produced = a.completion - before;
+            if produced > 0 {
+                self.stats.counters.tokens += u64::from(produced);
+                self.admission.generated(a.seq, produced);
             }
         }
     }
@@ -1099,51 +1438,13 @@ mod tests {
     }
 
     #[test]
-    fn a_reservation_takes_pages_and_a_slot_and_gives_both_back() {
-        let admission = Admission::new(10, 2);
-        assert!(admission.try_reserve(6));
-        assert!(!admission.try_reserve(5), "only 4 pages are left");
-        assert!(admission.try_reserve(4));
-        assert!(!admission.try_reserve(0), "no slot is left, however few pages are asked for");
-        admission.release(6);
-        assert!(admission.try_reserve(6), "the pages and the slot are back");
-        assert!(!admission.try_reserve(1));
-    }
-
-    #[test]
-    fn a_refused_reservation_takes_nothing() {
-        let admission = Admission::new(4, 3);
-        assert!(!admission.try_reserve(5));
-        // All three slots and all four pages must still be there.
-        assert!(admission.try_reserve(1));
-        assert!(admission.try_reserve(1));
-        assert!(admission.try_reserve(2));
-    }
-
-    #[test]
-    fn threads_racing_for_pages_never_hold_more_than_exist() {
-        use std::sync::atomic::AtomicU32;
-        let admission = Arc::new(Admission::new(100, 1000));
-        let held = Arc::new(AtomicU32::new(0));
-        let threads: Vec<_> = (0..8)
-            .map(|_| {
-                let (admission, held) = (admission.clone(), held.clone());
-                std::thread::spawn(move || {
-                    let mut most = 0;
-                    for _ in 0..20_000 {
-                        if admission.try_reserve(7) {
-                            most = most.max(held.fetch_add(7, Ordering::SeqCst) + 7);
-                            held.fetch_sub(7, Ordering::SeqCst);
-                            admission.release(7);
-                        }
-                    }
-                    most
-                })
-            })
-            .collect();
-        for thread in threads {
-            assert!(thread.join().unwrap() <= 100);
-        }
-        assert!(admission.try_reserve(100), "everything was given back");
+    fn the_load_of_rows_follows_what_the_model_reads() {
+        // Dense attention: row i of a chunk at 100 reads 100 + i cells.
+        assert_eq!(load_of(u32::MAX, 100, 3), Load::chunk(100, 3));
+        // No attention: rows and no cells.
+        assert_eq!(load_of(0, 100, 3), Load { rows: 3, cells: 0 });
+        // A span of 10: rows at 8, 9 read their context, the rest the span.
+        assert_eq!(load_of(10, 8, 5), Load { rows: 5, cells: 8 + 9 + 3 * 10 });
+        assert_eq!(load_of(10, 50, 5), Load { rows: 5, cells: 50 });
     }
 }

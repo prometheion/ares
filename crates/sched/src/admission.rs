@@ -66,6 +66,11 @@ pub struct AdmissionConfig {
     /// A waiting request that was passed over this many times goes first and
     /// blocks the requests behind it.
     pub starvation_passes: u32,
+    /// The most requests that run at once: what the devices keep per running
+    /// sequence (recurrent state, a page table, a row of logits) exists this
+    /// many times. A request that finds none of it free waits like one that
+    /// finds no pages, and is not counted as passed over.
+    pub max_running: u32,
 }
 
 impl AdmissionConfig {
@@ -85,6 +90,7 @@ impl AdmissionConfig {
             ratio_step: 0.1,
             shortage_margin: 20,
             starvation_passes: 32,
+            max_running: u32::MAX,
         }
     }
 }
@@ -340,6 +346,19 @@ impl Admission {
         }
     }
 
+    /// Says how many rows a spilled sequence computes again when it comes
+    /// back, for a runtime that has not kept them: they are held back for it
+    /// like the rows of a prompt that are not computed yet, and its claims
+    /// name them as prompt rows. Unknown, running and waiting requests that
+    /// were not spilled are ignored.
+    pub fn set_recompute(&mut self, seq: SeqId, rows: u32) {
+        if let Some(w) = self.waiting.iter_mut().find(|w| w.arrival.seq == seq)
+            && let Some((was, _)) = &mut w.spilled
+        {
+            was.prompt_rows_left = rows;
+        }
+    }
+
     /// Records tokens a running request generated (accepted, after a commit).
     pub fn generated(&mut self, seq: SeqId, tokens: u32) {
         if let Some(r) = self.running.iter_mut().find(|r| r.seq == seq) {
@@ -401,6 +420,9 @@ impl Admission {
         view: &mut dyn PoolView,
         out: &mut Outcome,
     ) -> bool {
+        if self.running.len() >= self.config.max_running as usize {
+            return false;
+        }
         let w = self.waiting[i];
         let charge = self.charge(&w);
         let mut fits = self.running.is_empty();
@@ -452,6 +474,10 @@ impl Admission {
     /// first of these that does not fit ends the pass. Then the others, the
     /// fewest uncached rows first, each on its own merits.
     fn admit(&mut self, tally: &mut Tally, view: &mut dyn PoolView, out: &mut Outcome) {
+        // With every place taken nobody can start, whatever the pool holds.
+        if self.running.len() >= self.config.max_running as usize {
+            return;
+        }
         let starvation = self.config.starvation_passes;
         let uncached = |w: &Waiting| w.arrival.prompt_cells.saturating_sub(w.arrival.cached_cells);
         loop {
@@ -508,6 +534,9 @@ impl Admission {
         let waiting = &self.waiting;
         self.order.sort_by_key(|i| (uncached(&waiting[*i]), waiting[*i].order));
         for k in 0..self.order.len() {
+            if self.running.len() >= self.config.max_running as usize {
+                break;
+            }
             let i = self.order[k];
             self.try_admit(i, tally, view, out);
         }
@@ -1025,5 +1054,59 @@ mod tests {
         assert_eq!(out.spill.len(), 1);
         let expected = (3000.0 + 3000.0 + 40.0) / 8192.0;
         assert!((c.ratio() - expected).abs() < 1e-9, "{}", c.ratio());
+    }
+
+    #[test]
+    fn a_spilled_sequence_whose_rows_are_computed_again_is_charged_for_them() {
+        let mut a = Admission::new(config(20));
+        for seq in 1..=2 {
+            a.enqueue(arrival(seq, PER_PAGE, 0, 64)).unwrap();
+        }
+        assert_eq!(pass(&mut a, 20, 0).admit.len(), 2);
+        // The pool is short; the one with fewer tokens gives way.
+        a.generated(SeqId(1), 50);
+        let mut p = a.begin(0);
+        p.claim(SeqId(1), 1, 0, 0);
+        let mut view = View::new(0);
+        view.releasable = vec![(1, 9), (2, 9)];
+        assert_eq!(p.settle(&mut view).spill, [SeqId(2)]);
+        // Its runtime kept nothing of it: no page is brought back, and five
+        // pages of rows are computed again.
+        a.set_restore(SeqId(2), 0, 0);
+        a.set_recompute(SeqId(2), 5 * PER_PAGE);
+        // The other is held back two pages (its prompt was never claimed and
+        // a page of output); the one that comes back needs five and one.
+        assert!(pass(&mut a, 7, 0).resume.is_empty());
+        assert_eq!(pass(&mut a, 8, 0).resume, [SeqId(2)]);
+        assert_eq!(a.reserved_pages(), 2 + 6);
+        // Its claims name the rows as prompt rows, and what is held back for
+        // it shrinks with them.
+        let mut p = a.begin(8);
+        p.claim(SeqId(2), 3, 0, 3 * PER_PAGE);
+        assert_eq!(p.settle(&mut View::new(0)), Outcome::default());
+        assert_eq!(a.reserved_pages(), 2 + 3);
+    }
+
+    #[test]
+    fn no_more_requests_run_than_the_devices_have_places_for() {
+        // Pages for everybody, places for two.
+        let mut a = Admission::new(AdmissionConfig { max_running: 2, ..config(1000) });
+        for seq in 1..=4 {
+            a.enqueue(arrival(seq, PER_PAGE, 0, 16)).unwrap();
+        }
+        assert_eq!(pass(&mut a, 1000, 0).admit, [SeqId(1), SeqId(2)]);
+        assert_eq!((a.running(), a.waiting()), (2, 2));
+        // Waiting for a place is not being passed over: after any number of
+        // passes the two that wait are still in arrival order behind a
+        // shorter request that came later.
+        for _ in 0..100 {
+            assert!(pass(&mut a, 1000, 0).admit.is_empty());
+        }
+        a.enqueue(arrival(5, 8, 0, 16)).unwrap();
+        a.finished(SeqId(1));
+        assert_eq!(pass(&mut a, 1000, 0).admit, [SeqId(5)], "the fewest uncached rows go first");
+        a.finished(SeqId(2));
+        a.finished(SeqId(5));
+        assert_eq!(pass(&mut a, 1000, 0).admit, [SeqId(3), SeqId(4)]);
     }
 }

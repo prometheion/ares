@@ -306,6 +306,57 @@ async fn shutdown_gives_up_on_a_stuck_request_after_the_grace_period() {
 }
 
 #[tokio::test]
+async fn a_second_signal_ends_running_requests_and_tells_their_clients() {
+    let engine = MockEngine::script(vec![text("one"), Step::UntilCancelled]);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (drain, drained) = oneshot::channel::<()>();
+    let (hurry, hurried) = oneshot::channel::<()>();
+    // The grace period alone would keep the server up for half a minute.
+    let task = tokio::spawn(ares_server::serve_until(
+        listener,
+        engine.clone(),
+        Config::default(),
+        async {
+            let _ = drained.await;
+        },
+        async {
+            let _ = hurried.await;
+        },
+    ));
+
+    let mut client = TcpStream::connect(addr).await.unwrap();
+    client
+        .write_all(&request_bytes(
+            "POST",
+            "/v1/chat/completions",
+            Some(&chat(json!({"stream": true}))),
+        ))
+        .await
+        .unwrap();
+    let mut seen = read_until(&mut client, "\"one\"").await;
+
+    drain.send(()).unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(!task.is_finished(), "the first signal waits for the running request");
+    assert!(engine.cancelled().is_empty());
+
+    let started = Instant::now();
+    hurry.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), task).await.unwrap().unwrap().unwrap();
+    assert!(started.elapsed() < Duration::from_secs(3), "the second one does not");
+    assert_eq!(engine.cancelled().len(), 1, "the request left the engine");
+
+    // The client is told: an error object ends its stream, and no [DONE].
+    let mut rest = Vec::new();
+    client.read_to_end(&mut rest).await.unwrap();
+    seen.extend(rest);
+    let stream = parse_sse(&parse_reply(&seen).text());
+    assert!(!stream.done);
+    assert_eq!(stream.chunks.last().unwrap()["error"]["code"], "cancelled");
+}
+
+#[tokio::test]
 async fn an_error_status_line_reaches_a_real_client() {
     let engine =
         MockEngine::reject(EngineError::ContextOverflow { prompt_tokens: 9000, limit: 4096 });

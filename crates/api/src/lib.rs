@@ -31,6 +31,7 @@ mod message;
 mod request;
 mod sampling;
 mod sink;
+mod stats;
 
 pub use answer::{Answer, DecisionOutcome, DecisionResult, Verdict};
 pub use decision::{
@@ -45,3 +46,4 @@ pub use message::{Message, Role};
 pub use request::{GenerateRequest, Prompt, RequestId};
 pub use sampling::{Sampling, SamplingError};
 pub use sink::{DecisionSink, EventSink};
+pub use stats::EngineStats;

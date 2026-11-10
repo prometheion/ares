@@ -14,7 +14,7 @@
 //! reported match, memory stays within its bound, and text that was written
 //! within one automaton's capacity is still found.
 
-use ares_sched::{LookupConfig, LookupCorpus, LookupDrafter, LookupMatch, NgramDrafter};
+use ares_sched::{LookupConfig, LookupCorpus, LookupDrafter, LookupMatch};
 
 struct Rng(u64);
 
@@ -234,27 +234,23 @@ fn drafts_are_real_text_with_little_memory_a_capped_walk_and_rollbacks() {
 }
 
 #[test]
-fn the_ngram_drafter_and_the_lookup_drafter_agree_where_only_one_place_matches() {
-    // Text without ambiguity: a long run of distinct tokens, repeated. Both
-    // drafters must propose the same continuation at every point of the
-    // second pass (from the third token on, which is the n-gram's length).
+fn text_with_one_place_to_continue_from_is_drafted_from_the_third_token_on() {
+    // Text without ambiguity: a long run of distinct tokens, repeated. The
+    // drafter must propose the continuation at every point of the second
+    // pass, from the third token on, which is the shortest match here.
     let passage: Vec<u32> = (0..200).map(|i| (i * 7919) % 1000 + 10).collect();
     let config = LookupConfig { min_match: 3, ..LookupConfig::default() };
     let mut corpus = LookupCorpus::new(config);
     let mut lookup = LookupDrafter::new();
-    let mut ngram = NgramDrafter::new(3);
     lookup.extend(&mut corpus, &passage);
-    ngram.extend(&passage);
     let (mut tokens, mut confidence) = (Vec::new(), Vec::new());
     for (i, token) in passage.iter().enumerate().take(150) {
         lookup.push(&mut corpus, *token);
-        ngram.push(*token);
         lookup.draft(&corpus, 8, &mut tokens, &mut confidence);
         if i >= 2 {
-            assert_eq!(tokens, ngram.draft(8), "after {} tokens of the second pass", i + 1);
-            assert_eq!(tokens, passage[i + 1..i + 9]);
+            assert_eq!(tokens, passage[i + 1..i + 9], "after {} tokens of the second pass", i + 1);
         } else {
-            assert!(tokens.is_empty() && ngram.draft(8).is_empty());
+            assert!(tokens.is_empty());
         }
     }
 }

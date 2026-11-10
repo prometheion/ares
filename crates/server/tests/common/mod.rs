@@ -6,8 +6,8 @@ use std::thread;
 use std::time::Duration;
 
 use ares_api::{
-    DecisionOutcome, DecisionRequest, DecisionSink, Engine, EngineError, Event, EventSink,
-    FinishReason, GenerateRequest, ModelCard, RequestId, Usage,
+    DecisionOutcome, DecisionRequest, DecisionSink, Engine, EngineError, EngineStats, Event,
+    EventSink, FinishReason, GenerateRequest, ModelCard, RequestId, Usage,
 };
 use ares_server::Config;
 use axum::Router;
@@ -122,6 +122,8 @@ struct Book {
     cancelled: Vec<RequestId>,
     /// What every `sink.send` returned, in order.
     sends: Vec<bool>,
+    /// What `stats` answers; `None` for an engine that keeps none.
+    stats: Option<EngineStats>,
 }
 
 /// The part of the engine its threads share with the test.
@@ -255,6 +257,11 @@ impl MockEngine {
     pub fn sends(&self) -> Vec<bool> {
         self.shared.book.lock().unwrap().sends.clone()
     }
+
+    /// Makes the engine one that keeps statistics, and sets what they say.
+    pub fn set_stats(&self, stats: EngineStats) {
+        self.shared.book.lock().unwrap().stats = Some(stats);
+    }
 }
 
 impl Engine for MockEngine {
@@ -298,6 +305,10 @@ impl Engine for MockEngine {
 
     fn cancel(&self, id: RequestId) {
         self.shared.record(|book| book.cancelled.push(id));
+    }
+
+    fn stats(&self) -> Option<EngineStats> {
+        self.shared.book.lock().unwrap().stats
     }
 }
 

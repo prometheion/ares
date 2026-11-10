@@ -121,6 +121,23 @@ fn text_that_does_not_repeat_gets_few_drafts_accepted() {
 }
 
 #[test]
+fn a_text_another_request_wrote_is_drafted_from_the_corpus_all_requests_share() {
+    // A model whose text never repeats inside a request: a draft can only
+    // come from what another request read and wrote.
+    let model = model(|_| {});
+    let rt = runtime_with(&model, config(true, 4096), |e| e.with_delay(Duration::from_micros(200)));
+    let first = alone(&rt, "written twice", Some(200));
+    let before = snapshot(&rt);
+    assert!(before.counters.steps >= 190, "the first request found nothing to copy");
+    let second = alone(&rt, "written twice", Some(200));
+    assert_eq!(second, first);
+    let d = since(&snapshot(&rt), &before);
+    assert!(d["accepted"] > 150, "the second request copies the first: {d:?}");
+    assert!(d["steps"] < 80, "{d:?}");
+    assert_eq!(d["rejected"], 0, "{d:?}");
+}
+
+#[test]
 fn cancelling_frees_the_pages_at_once() {
     let model = model(|_| {});
     let rt = runtime_with(&model, config(true, 4096), |e| e.with_delay(Duration::from_micros(500)));
@@ -128,28 +145,121 @@ fn cancelling_frees_the_pages_at_once() {
 }
 
 #[test]
-fn a_full_pool_refuses_with_overloaded_and_recovers() {
-    // 32 pages of 16 cells hold two sequences of the longest length (16 pages each).
+fn more_requests_than_the_pool_holds_wait_in_line_and_say_the_same() {
+    // 32 pages of 16 cells. A request of 40 prompt tokens and 100 of output
+    // is charged 3 pages and 7: three of them fit next to each other.
     let model = model(|c| c.context_length = 256);
-    let rt = runtime_with(&model, config(true, 32), |e| e.with_delay(Duration::from_millis(1)));
-    a_full_pool_refuses_and_recovers(&rt, 2);
+    for speculation in [false, true] {
+        let rt = runtime_with(&model, config(speculation, 32), |e| {
+            e.with_delay(Duration::from_micros(300))
+        });
+        more_requests_than_fit_wait_and_say_the_same(&rt, 3);
+    }
 }
 
 #[test]
-fn requests_that_need_few_pages_fit_where_long_ones_do_not() {
+fn more_requests_than_the_devices_have_slots_for_wait_in_line() {
+    // Pages for everybody, slots for four.
+    let model = model(|_| {});
+    let config = RuntimeConfig { max_slots: 4, ..config(true, 4096) };
+    let rt = runtime_with(&model, config, |e| e.with_delay(Duration::from_micros(300)));
+    more_requests_than_fit_wait_and_say_the_same(&rt, 4);
+}
+
+#[test]
+fn a_request_that_writes_more_than_expected_gives_way_and_comes_back() {
+    // 24 pages of 16 cells; a request of 26 prompt tokens and 180 of output
+    // ends with 13 pages. The accounting is told to expect a twentieth of
+    // the output, so it lets four in where two fit.
+    for repetitive in [false, true] {
+        let model = model(|c| {
+            c.context_length = 256;
+            if repetitive {
+                repeating(c)
+            }
+        });
+        let config = RuntimeConfig { output_ratio: 0.05, ..config(true, 24) };
+        let rt = runtime_with(&model, config, |e| e.with_delay(Duration::from_micros(100)));
+        a_request_that_gives_way_comes_back_and_says_the_same(&rt);
+    }
+}
+
+#[test]
+fn a_request_alone_runs_to_the_end_of_the_pool_and_its_drafts_are_cut_there() {
+    // A model whose text falls into a loop and stays there, so that drafts
+    // are proposed up to the last cell.
+    let model = model(|c| {
+        c.context.window = 1;
+        c.context.epoch = 0;
+        c.context.buckets = 512;
+    });
+    // Prompts of several lengths, so that the windows of some of them reach
+    // past the pool's last cell.
+    let prompts: Vec<String> =
+        (0..6).map(|n| format!("alone in a small pool{}", ".".repeat(n))).collect();
+    let run = |speculation| {
+        // 6 pages of 16 cells in a context of 512.
+        let rt = runtime_with(&model, config(speculation, 6), |e| {
+            e.with_delay(Duration::from_micros(200))
+        });
+        let runs: Vec<Run> = prompts
+            .iter()
+            .map(|prompt| the_last_request_runs_to_the_end_of_the_pool(&rt, prompt, 96))
+            .collect();
+        (runs, snapshot(&rt).counters)
+    };
+    let ((plain, plain_counters), (drafted, counters)) = (run(false), run(true));
+    assert_eq!(drafted, plain, "the text is the same to the last cell");
+    assert_eq!(plain_counters.draft_rows_cut, 0);
+    assert!(counters.drafts_accepted > 0, "{counters:?}");
+    // Drafts that reach past the pool are dropped, and the request goes on
+    // a row at a time to the pool's end.
+    assert!(counters.draft_rows_cut > 0, "{counters:?}");
+}
+
+#[test]
+fn a_request_in_line_can_be_cancelled_and_the_others_go_on() {
     let model = model(|c| c.context_length = 256);
     let gate = Gate::new();
-    let rt = runtime_with(&model, config(true, 32), |e| e.with_gate(gate.clone()));
+    // Two slots: the third and fourth request wait.
+    let config = RuntimeConfig { max_slots: 2, ..config(true, 4096) };
+    let rt = runtime_with(&model, config, |e| e.with_gate(gate.clone()));
+    let expected = alone(&rt, "in line 3", Some(20));
     gate.close();
-    // Each asks for 20 tokens of context: 2 pages. Sixteen fit in 32 pages.
-    let handles: Vec<Handle> = (0..16)
-        .map(|i| start(&rt, request(&format!("short {i}"), Some(12))).expect("fits"))
-        .collect();
-    assert_eq!(start(&rt, request("one more", Some(12))).unwrap_err(), EngineError::Overloaded);
+    let handles: Vec<Handle> =
+        (0..4).map(|i| start(&rt, request(&format!("in line {i}"), Some(20))).unwrap()).collect();
+    let mut handles = handles.into_iter();
+    let (first, second) = (handles.next().unwrap(), handles.next().unwrap());
+    let (third, fourth) = (handles.next().unwrap(), handles.next().unwrap());
+    rt.cancel(third.id);
     gate.open();
-    for handle in handles {
-        assert_eq!(handle.finish().usage.completion_tokens, 12);
+    let cancelled = third.finish();
+    assert_eq!(cancelled.finish, FinishReason::Cancelled);
+    assert_eq!(cancelled.usage.completion_tokens, 0, "it never ran");
+    assert_eq!(cancelled.text, "");
+    for handle in [first, second] {
+        assert_eq!(handle.finish().usage.completion_tokens, 20);
     }
+    assert_eq!(fourth.finish(), expected);
+    let s = snapshot(&rt);
+    assert_eq!((s.active, s.waiting), (0, 0));
+    assert_eq!(s.pages_free, s.pages_capacity);
+}
+
+#[test]
+fn a_prompt_the_pool_cannot_hold_is_the_one_refusal() {
+    // 4 pages of 16 cells in a context of 512: a prompt of 64 tokens leaves
+    // no cell for the first token after it.
+    let model = model(|_| {});
+    let rt = runtime_with(&model, config(true, 4), |e| e);
+    let long = "y".repeat(64);
+    assert_eq!(
+        start(&rt, request(&long, Some(1))).unwrap_err(),
+        EngineError::ContextOverflow { prompt_tokens: 64, limit: 64 }
+    );
+    let fits = "y".repeat(63);
+    let run = run_one(&rt, request(&fits, None));
+    assert_eq!((run.finish, run.usage.completion_tokens), (FinishReason::Length, 2));
 }
 
 #[test]
@@ -166,7 +276,11 @@ fn shutdown_ends_requests_in_flight_and_joins_the_conductor() {
 fn shutting_down_while_a_step_is_held_waits_for_it_and_then_ends_everything() {
     let model = model(|_| {});
     let gate = Gate::new();
-    let rt = runtime_with(&model, config(true, 4096), |e| e.with_gate(gate.clone()));
+    // A little delay per step, so that the request is still running when
+    // the gate closes.
+    let rt = runtime_with(&model, config(true, 4096), |e| {
+        e.with_gate(gate.clone()).with_delay(Duration::from_micros(200))
+    });
     let handle = start(&rt, request("held", None)).unwrap();
     handle.wait_for_text(1);
     gate.close();
@@ -236,7 +350,11 @@ fn a_sink_that_refuses_cancels_the_request_and_frees_its_pages() {
     let mut r = request("slow client", None);
     r.id = RequestId(900_001);
     rt.submit(r, sink).unwrap();
-    wait_until("the request is gone", &rt, |s| s.is_empty());
+    let deadline = std::time::Instant::now() + LIMIT;
+    while snapshot(&rt).counters.requests_cancelled == 0 {
+        assert!(std::time::Instant::now() < deadline, "the request was never cancelled");
+        std::thread::sleep(Duration::from_millis(1));
+    }
     assert_eq!(snapshot(&rt).pages_free, total);
     assert_eq!(
         delivered.load(Ordering::SeqCst),

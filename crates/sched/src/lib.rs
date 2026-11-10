@@ -26,9 +26,7 @@
 //!   suffix automaton over everything the engine has read and written, with
 //!   a confidence per proposed token. This is what makes copying (file
 //!   edits, quoted code, a document sent again) several times faster than
-//!   generating. [`NgramDrafter`] is the lookup it replaces, per sequence
-//!   and by the last few tokens only; it stays until the runtime has
-//!   switched.
+//!   generating.
 //! - [`Admission`] decides who runs, who waits and who gives way: pages are
 //!   claimed per step, a reservation covers the output that is expected, a
 //!   request that does not fit waits, and a step's claims are settled against
@@ -37,7 +35,6 @@
 mod admission;
 mod draft;
 mod lookup;
-mod ngram;
 mod pass;
 mod plan;
 mod timing;
@@ -45,9 +42,6 @@ mod timing;
 pub use admission::{Admission, AdmissionConfig, Arrival, Claims, ExceedsPool, Outcome, PoolView};
 pub use draft::{Acceptance, DraftChoice, DraftCost, best_draft_len};
 pub use lookup::{LookupConfig, LookupCorpus, LookupDrafter, LookupMatch};
-pub use ngram::NgramDrafter;
 pub use pass::{Pass, PassStep, Point, pass_rows_between, runs_as_pass};
-pub use plan::{
-    Limits, Part, PartKind, Plan, Request, SeqId, Want, plan, prefill_rows_at, prefill_rows_next_to,
-};
+pub use plan::{Limits, Part, PartKind, Plan, Request, SeqId, Want, plan, prefill_rows_at};
 pub use timing::{Load, StepCost, StepTimeModel};

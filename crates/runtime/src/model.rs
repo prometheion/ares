@@ -298,6 +298,15 @@ pub trait Model: Send + Sync + 'static {
         SampleParams::GREEDY
     }
 
+    /// The most cells of its sequence a row reads through attention:
+    /// everything before it for dense attention (the default), the cells a
+    /// sparse attention selects at most, 0 for a model without attention.
+    /// The step time model counts the cells a step reads with it, so that a
+    /// row deep in a long context is known to cost more than one at its start.
+    fn attention_span(&self) -> u32 {
+        u32::MAX
+    }
+
     /// The most tokens the model drafts itself per sequence and step, with a
     /// draft block of its own that runs on the devices; 0 for a model
     /// without one. A window that takes them has the record's own-drafts

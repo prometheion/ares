@@ -147,13 +147,25 @@ fn cancelling_frees_the_pages_on_every_placement() {
 }
 
 #[test]
-fn a_full_pool_refuses_and_recovers_on_every_placement() {
+fn more_requests_than_the_pool_holds_wait_in_line_on_every_placement() {
     on_every_placement(|split, devices| {
         let mut s = setup(split, devices);
-        s.model.context_length = 4096;
-        // 4096 cells of context are 256 pages: two sequences of full length.
-        s.runtime.pages = 512;
-        a_full_pool_refuses_and_recovers(&start(s), 2);
+        s.model.context_length = 256;
+        // A request of up to 40 prompt tokens and 100 of output is charged
+        // 3 pages and 7: three of them fit in 32 pages.
+        s.runtime.pages = 32;
+        more_requests_than_fit_wait_and_say_the_same(&start(s), 3);
+    });
+}
+
+#[test]
+fn a_request_that_gives_way_comes_back_on_every_placement() {
+    on_every_placement(|split, devices| {
+        let mut s = setup(split, devices);
+        s.model.context_length = 256;
+        s.runtime.pages = 24;
+        s.runtime.output_ratio = 0.05;
+        a_request_that_gives_way_comes_back_and_says_the_same(&start(s));
     });
 }
 

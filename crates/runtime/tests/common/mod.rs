@@ -269,41 +269,100 @@ fn doomed_id_again() -> RequestId {
     RequestId(u64::MAX)
 }
 
-/// A full pool refuses a request and takes it again when pages are freed.
-/// `fit` is how many requests of the longest length the pool holds.
-pub fn a_full_pool_refuses_and_recovers(rt: &Runtime, fit: usize) {
-    let mut held = Vec::new();
-    for i in 0..fit {
-        held.push(start(rt, request(&format!("long runner {i}"), None)).expect("room"));
-    }
-    let refused = start(rt, request("one too many", None)).unwrap_err();
-    assert_eq!(refused, EngineError::Overloaded);
-    // A short request needs fewer pages, and may still fit or not; one that
-    // asks for the whole context does not.
-    assert!(matches!(start(rt, request("another", None)), Err(EngineError::Overloaded)));
-
-    let victim = held.pop().unwrap();
-    rt.cancel(victim.id);
-    assert_eq!(victim.finish().finish, FinishReason::Cancelled);
-    // The cancel is handled at a step boundary; the pages are free right
-    // after, and the request that was refused is taken.
+/// More requests than the pool holds at once: none is refused, the ones that
+/// do not fit wait in line, and every one says what it says alone. Every
+/// request has a prompt of 40 tokens and writes 100; `fit` is the most of
+/// them the pool can run next to each other.
+pub fn more_requests_than_fit_wait_and_say_the_same(rt: &Runtime, fit: usize) {
+    let mut rng = Rng(0x0dd_ba11);
+    let jobs: Vec<(String, u32)> = (0..3 * fit + 2).map(|_| (rng.prompt(40), 100)).collect();
+    let expected: Vec<Run> = jobs.iter().map(|(p, m)| alone(rt, p, Some(*m))).collect();
+    let before = snapshot(rt).counters;
+    let handles: Vec<Handle> = jobs
+        .iter()
+        .map(|(prompt, max)| start(rt, request(prompt, Some(*max))).expect("nothing is refused"))
+        .collect();
+    let mut most = 0;
+    let mut in_line = 0;
     let deadline = Instant::now() + LIMIT;
-    let retry = loop {
-        match start(rt, request("now there is room", Some(8))) {
-            Ok(handle) => break handle,
-            Err(EngineError::Overloaded) => {
-                assert!(Instant::now() < deadline, "the pool never recovered");
-                thread::sleep(Duration::from_millis(2));
-            }
-            Err(other) => panic!("{other}"),
+    loop {
+        let now = snapshot(rt);
+        most = most.max(now.active);
+        in_line = in_line.max(now.waiting);
+        if now.active == 0 && now.waiting == 0 {
+            break;
         }
+        assert!(Instant::now() < deadline, "the line never emptied");
+        thread::sleep(Duration::from_micros(200));
+    }
+    for (i, handle) in handles.into_iter().enumerate() {
+        assert_eq!(handle.finish(), expected[i], "request {i}");
+    }
+    let after = snapshot(rt);
+    assert!(most as usize <= fit, "{most} requests ran at once in a pool for {fit}");
+    assert!(in_line >= 1, "nobody was seen waiting");
+    let waited = after.counters.requests_waited - before.requests_waited;
+    assert!(waited as usize >= jobs.len() - fit - 1, "{waited} of {} requests waited", jobs.len());
+    assert_eq!(after.counters.requests_suspended, before.requests_suspended, "nobody gave way");
+    assert_eq!(after.pages_free, after.pages_capacity, "every page is back");
+}
+
+/// Requests that write more than the accounting expected of them: when the
+/// pool is full the one with the fewest tokens gives way, comes back when
+/// there is room and still says what it says alone. Needs a runtime whose
+/// `output_ratio` is far below what requests really use, and a pool that
+/// holds two of these requests and not three.
+pub fn a_request_that_gives_way_comes_back_and_says_the_same(rt: &Runtime) {
+    let jobs: Vec<(String, u32)> =
+        (0..4).map(|i| (format!("writes more than expected {i}"), 180)).collect();
+    let expected: Vec<Run> = {
+        // Alone they teach the accounting that requests use what they may;
+        // it is told otherwise again below, by requests that end at once.
+        jobs.iter().map(|(p, m)| alone(rt, p, Some(*m))).collect()
     };
-    assert_eq!(retry.finish().usage.completion_tokens, 8);
-    for handle in held {
-        rt.cancel(handle.id);
-        handle.finish();
+    for i in 0..60 {
+        let mut short = request(&format!("ends early {i}"), Some(200));
+        // Every character the model can write is a stop string: the
+        // request ends with its first token.
+        short.stop = (0..=255u8).map(|b| ares_runtime::printable(b).to_string()).collect();
+        run_one(rt, short);
+    }
+    let before = snapshot(rt).counters;
+    let handles: Vec<Handle> = jobs
+        .iter()
+        .map(|(prompt, max)| start(rt, request(prompt, Some(*max))).expect("nothing is refused"))
+        .collect();
+    for (i, handle) in handles.into_iter().enumerate() {
+        assert_eq!(handle.finish(), expected[i], "request {i}");
     }
     wait_until("everything is idle", rt, |s| s.is_empty());
+    let after = snapshot(rt);
+    let gave_way = after.counters.requests_suspended - before.requests_suspended;
+    assert!(gave_way >= 1, "the pool never ran short: {:?}", after.counters);
+    assert_eq!(after.pages_free, after.pages_capacity, "every page is back");
+    assert_eq!(after.waiting, 0);
+}
+
+/// A request alone in a pool that is smaller than what it may write runs to
+/// the last cell of the pool and ends there, as at the end of a context.
+/// `pool_cells` is the pool's size. Returns what the request wrote.
+pub fn the_last_request_runs_to_the_end_of_the_pool(
+    rt: &Runtime,
+    prompt: &str,
+    pool_cells: u32,
+) -> Run {
+    let before = snapshot(rt).counters;
+    let run = alone(rt, prompt, None);
+    assert_eq!(run.finish, FinishReason::Length);
+    // Every cell holds a token's row, and the last token picked has none.
+    assert_eq!(run.usage.prompt_tokens + run.usage.completion_tokens, pool_cells + 1, "{run:?}");
+    assert_eq!(run.text.chars().count() as u32, run.usage.completion_tokens);
+    let after = snapshot(rt);
+    assert_eq!(after.counters.requests_exhausted - before.requests_exhausted, 1);
+    assert_eq!(after.pages_free, after.pages_capacity);
+    // The engine goes on.
+    assert_eq!(alone(rt, "after it", Some(5)).usage.completion_tokens, 5);
+    run
 }
 
 /// Shutting down with requests in flight ends each with a terminal event,

@@ -7,12 +7,12 @@ use std::thread::{self, JoinHandle, ThreadId};
 use std::time::Duration;
 
 use ares_api::{
-    DecisionRequest, DecisionSink, Engine, EngineError, EventSink, GenerateRequest, ModelCard,
-    RequestId,
+    DecisionRequest, DecisionSink, Engine, EngineError, EngineStats, EventSink, GenerateRequest,
+    ModelCard, RequestId,
 };
 use ares_cuda::Device;
 
-use crate::conductor::{Admission, Command, Conductor, SequenceInfo, StatsCopy, Submission};
+use crate::conductor::{Command, Conductor, SequenceInfo, StatsCopy, Submission};
 use crate::config::RuntimeConfig;
 use crate::error::RuntimeError;
 use crate::exec::Executor;
@@ -27,17 +27,19 @@ const ASK_TIMEOUT: Duration = Duration::from_secs(30);
 /// behind the [`Engine`] trait.
 ///
 /// [`Engine::submit`] and [`Engine::cancel`] never block. They check the
-/// request on the calling thread, reserve its pages against the pool, and
-/// put it in the conductor's channel; the conductor does the rest at the next
-/// step boundary. Dropping the runtime shuts it down.
+/// request on the calling thread and put it in the conductor's channel. The
+/// conductor puts it in line and starts it when the pool has room for it:
+/// nothing is reserved for the longest a request may get, and nothing is
+/// refused because the engine is busy. Dropping the runtime shuts it down.
 pub struct Runtime {
     model: Arc<dyn Model>,
     card: ModelCard,
-    cells_per_page: u32,
+    /// The longest prompt a request may have, in tokens, plus one: what the
+    /// model's context and the whole page pool hold.
+    limit: u32,
     /// `None` after shutdown. Sending happens under the lock, so a request
     /// is either in the channel before the shutdown command or refused.
     commands: Mutex<Option<Sender<Command>>>,
-    admission: Arc<Admission>,
     conductor: Mutex<Option<JoinHandle<()>>>,
     conductor_id: ThreadId,
     /// Cleared when the conductor thread has ended, and with it the device
@@ -74,12 +76,11 @@ impl Runtime {
             ));
         }
         let card = model.card();
-        let admission = Arc::new(Admission::new(config.pages, config.max_slots));
         let (tx, rx) = mpsc::channel();
         let (ready_tx, ready_rx) = mpsc::channel();
-        let cells_per_page = config.cells_per_page;
+        let limit = card.context_length.min(config.pages.saturating_mul(config.cells_per_page));
         let warm_up = config.warm_up;
-        let mut conductor = Conductor::new(model.clone(), config, executor, rx, admission.clone());
+        let mut conductor = Conductor::new(model.clone(), config, executor, rx);
         let running = Arc::new(AtomicBool::new(true));
         let alive = running.clone();
         let thread = thread::Builder::new()
@@ -110,9 +111,8 @@ impl Runtime {
         Ok(Self {
             model,
             card,
-            cells_per_page,
+            limit,
             commands: Mutex::new(Some(tx)),
-            admission,
             conductor_id: thread.thread().id(),
             conductor: Mutex::new(Some(thread)),
             running,
@@ -177,13 +177,6 @@ impl Runtime {
             let _ = handle.join();
         }
     }
-
-    /// The pages a request of `prompt` tokens may need at most.
-    fn worst_case_pages(&self, prompt: usize, max_tokens: Option<u32>) -> u32 {
-        let limit = u64::from(self.card.context_length);
-        let cells = (prompt as u64 + u64::from(max_tokens.unwrap_or(u32::MAX))).min(limit);
-        cells.div_ceil(u64::from(self.cells_per_page)) as u32
-    }
 }
 
 impl Drop for Runtime {
@@ -202,6 +195,22 @@ impl Engine for Runtime {
             return Err(EngineError::ModelNotFound(request.model));
         }
         request.sampling.validate()?;
+        // The sampler on the devices has no penalties yet. A value that
+        // switches a penalty off asks for nothing; any other is refused, so
+        // that no request gets text that ignores what it asked for.
+        let sampling = &request.sampling;
+        for (name, value, off) in [
+            ("presence_penalty", sampling.presence_penalty, 0.0),
+            ("frequency_penalty", sampling.frequency_penalty, 0.0),
+            ("repeat_penalty", sampling.repeat_penalty, 1.0),
+        ] {
+            if value.is_some_and(|v| v != off) {
+                return Err(EngineError::InvalidRequest(format!(
+                    "{name} is not implemented: the sampler has temperature, top_k, top_p, \
+                     min_p and seed. Leave {name} out or set it to {off}"
+                )));
+            }
+        }
         if request.max_tokens == Some(0) {
             return Err(EngineError::InvalidRequest("max_tokens must be at least 1".into()));
         }
@@ -211,16 +220,14 @@ impl Engine for Runtime {
                 "the prompt is empty: there is nothing to continue".into(),
             ));
         }
-        // At least one token must fit after the prompt.
-        if prompt.len() >= self.card.context_length as usize {
+        // At least one token must fit after the prompt, in the model's
+        // context and in the page pool. This is the one refusal that depends
+        // on a size, and it does not depend on what else is running.
+        if prompt.len() >= self.limit as usize {
             return Err(EngineError::ContextOverflow {
                 prompt_tokens: u32::try_from(prompt.len()).unwrap_or(u32::MAX),
-                limit: self.card.context_length,
+                limit: self.limit,
             });
-        }
-        let reserved = self.worst_case_pages(prompt.len(), request.max_tokens);
-        if !self.admission.try_reserve(reserved) {
-            return Err(EngineError::Overloaded);
         }
         let submission = Box::new(Submission {
             id: request.id,
@@ -229,14 +236,12 @@ impl Engine for Runtime {
             stop: request.stop,
             sampling: request.sampling,
             sink: events,
-            reserved,
         });
         let sent = match self.commands.lock().expect("commands").as_ref() {
             Some(sender) => sender.send(Command::Submit(submission)).is_ok(),
             None => false,
         };
         if !sent {
-            self.admission.release(reserved);
             return Err(EngineError::Internal("the engine has shut down".into()));
         }
         Ok(())
@@ -254,5 +259,24 @@ impl Engine for Runtime {
         if let Some(sender) = self.commands.lock().expect("commands").as_ref() {
             let _ = sender.send(Command::Cancel(id));
         }
+    }
+
+    fn stats(&self) -> Option<EngineStats> {
+        let snapshot = self.snapshot()?;
+        let c = &snapshot.counters;
+        Some(EngineStats {
+            steps: c.steps,
+            prompt_tokens: c.prefill_rows,
+            generated_tokens: c.tokens,
+            drafts_proposed: c.draft_rows,
+            drafts_accepted: c.drafts_accepted,
+            requests_finished: c.requests_finished,
+            requests_cancelled: c.requests_cancelled,
+            // Nothing is refused for lack of room: a request waits in line.
+            requests_refused: 0,
+            sequences: snapshot.active,
+            pages_free: snapshot.pages_free,
+            pages: snapshot.pages_capacity,
+        })
     }
 }

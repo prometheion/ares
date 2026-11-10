@@ -2,7 +2,9 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{DecisionRequest, DecisionSink, EngineError, EventSink, GenerateRequest, RequestId};
+use crate::{
+    DecisionRequest, DecisionSink, EngineError, EngineStats, EventSink, GenerateRequest, RequestId,
+};
 
 /// A model the engine serves.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -17,9 +19,9 @@ pub struct ModelCard {
 
 /// The inference runtime as the server sees it.
 ///
-/// All four methods are called from async code, so none may block: the
-/// engine does its work on its own threads and reports back through the
-/// [`EventSink`] or the [`DecisionSink`].
+/// `models`, `submit`, `decide` and `cancel` are called from async code, so
+/// none of them may block: the engine does its work on its own threads and
+/// reports back through the [`EventSink`] or the [`DecisionSink`].
 ///
 /// # Generation and decisions share steps
 ///
@@ -82,4 +84,13 @@ pub trait Engine: Send + Sync + 'static {
     /// cancelling a finished, cancelled or unknown request does nothing. Must
     /// not block.
     fn cancel(&self, id: RequestId);
+
+    /// What the engine has done since it started and what it holds now, or
+    /// `None` for an engine that keeps no such books (or has shut down).
+    ///
+    /// Unlike the other methods this one may wait, for the end of the step
+    /// the engine is in: async code calls it from a thread that may block.
+    fn stats(&self) -> Option<EngineStats> {
+        None
+    }
 }

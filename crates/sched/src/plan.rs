@@ -38,7 +38,7 @@ pub struct Limits {
     /// The most rows a step can hold (the size of the step's scratch memory).
     pub max_rows: u32,
     /// The most prompt rows in a step that also carries generating
-    /// sequences or decisions. See [`prefill_rows_next_to`].
+    /// sequences or decisions. See [`prefill_rows_at`].
     pub prefill_rows_with_windows: u32,
     /// A prompt that waited this many steps goes before shorter prompts.
     pub starvation_steps: u32,
@@ -189,41 +189,15 @@ pub fn plan(requests: &[Request], limits: &Limits) -> Plan {
     Plan { parts }
 }
 
-/// How many prompt rows a step may carry next to `window_rows` rows of
-/// generating sequences and decisions (the rows of every part that is not a
-/// prompt), when they may run `slowdown` times slower than they would alone
-/// (2.0: half speed while a prompt is read).
-///
-/// The cost of a step is `base + per_row * rows`, so the rows that fit in the
-/// allowed extra time are `(slowdown - 1) * time(window_rows) / per_row`. At
-/// least one row is always allowed, or a prompt would never finish. Before
-/// any step was measured the answer is `fallback`.
-pub fn prefill_rows_next_to(
-    model: &StepTimeModel,
-    window_rows: u32,
-    slowdown: f64,
-    fallback: u32,
-) -> u32 {
-    let Some((base, per_row)) = model.base_and_per_row() else {
-        return fallback.max(1);
-    };
-    if per_row <= 0.0 {
-        return u32::MAX;
-    }
-    let alone = base + per_row * f64::from(window_rows);
-    let rows = (slowdown - 1.0).max(0.0) * alone / per_row;
-    if rows >= f64::from(u32::MAX) { u32::MAX } else { (rows as u32).max(1) }
-}
-
 /// How many rows of a prompt that has `prompt_context` cells computed a step
 /// may carry next to `windows`, the load of every part that is not a prompt
 /// (generating sequences and decisions), when those may run `slowdown` times
 /// slower than they would alone.
 ///
-/// This is [`prefill_rows_next_to`] with the context term of the step cost
-/// ([`StepTimeModel::cost`]): the allowed extra time is `(slowdown - 1) *
-/// time(windows)`, and the rows that fit in it are fewer the deeper the prompt
-/// is, because each reads its whole context
+/// The cost of a step is [`StepTimeModel::cost`], with its term for the
+/// context: the allowed extra time is `(slowdown - 1) * time(windows)`, and
+/// the rows that fit in it are fewer the deeper the prompt is, because each
+/// reads its whole context
 /// ([`StepCost::rows_within`](crate::StepCost::rows_within)). At least one row
 /// is always allowed, or a prompt would never finish. Before any step was
 /// measured the answer is `fallback`.
@@ -439,16 +413,19 @@ mod tests {
     #[test]
     fn the_prompt_share_follows_the_allowed_slowdown() {
         let mut model = StepTimeModel::new(1.0);
-        assert_eq!(prefill_rows_next_to(&model, 3, 2.0, 32), 32);
+        let windows = Load { rows: 3, cells: 0 };
+        assert_eq!(prefill_rows_at(&model, windows, 0, 2.0, 32), 32);
         for rows in [1u32, 8, 64, 256] {
             model.observe(rows, 33.0 + 1.14 * f64::from(rows));
         }
         // Alone, a 3-row step takes 36.4 ms; at half speed there are 36.4 ms
         // more, which is 31 rows.
-        assert_eq!(prefill_rows_next_to(&model, 3, 2.0, 32), 31);
-        assert_eq!(prefill_rows_next_to(&model, 3, 1.5, 32), 15);
+        assert_eq!(prefill_rows_at(&model, windows, 0, 2.0, 32), 31);
+        assert_eq!(prefill_rows_at(&model, windows, 0, 1.5, 32), 15);
         // No slowdown allowed still lets a prompt move.
-        assert_eq!(prefill_rows_next_to(&model, 3, 1.0, 32), 1);
+        assert_eq!(prefill_rows_at(&model, windows, 0, 1.0, 32), 1);
+        // Steps that told nothing about contexts give a deep prompt the same.
+        assert_eq!(prefill_rows_at(&model, windows, 100_000, 2.0, 32), 31);
     }
 
     #[test]

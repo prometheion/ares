@@ -1,0 +1,890 @@
+//! Loading a model: from a GGUF file and what the operator asked for to a
+//! running [`Runtime`] on the devices, with an account of every decision and
+//! of where the memory went.
+//!
+//! The order is: read the file, look at the devices, decide (which devices,
+//! which split, which shares, how many sequences, how much context), log the
+//! decision with its reasons, load, log what it took. What the operator named
+//! is taken as it is and judged by the devices' ledgers at load; what was
+//! left open comes from numbers the devices and the model give (`plan`).
+//!
+//! # What is estimated
+//!
+//! The runtime reserves the pages of sequence state before the model's parts
+//! are built, and the model has no plan of its sizes that can be asked
+//! without a device. So the context that fits, when the operator names none,
+//! comes from an estimate of what the model takes ([`footprint`]): weights
+//! from the placement and the tensor table, recurrent state and the scratch
+//! of a step from the model's dimensions. After the load the log states what
+//! each part really took next to what was estimated.
+
+use std::path::Path;
+use std::sync::Arc;
+use std::time::Instant;
+
+use ares_api::Engine;
+use ares_core::units::{Bytes, MIB};
+use ares_cuda::{Device, DeviceInfo, Wait};
+use ares_gguf::Gguf;
+use ares_model::qwen35::device::{Options, Placement, Qwen35, Spread, page_bytes};
+use ares_model::qwen35::weights::{Matrix, Mixer};
+use ares_model::qwen35::{Config, Weights};
+use ares_runtime::{GpuConfig, Runtime, RuntimeConfig, Split};
+use ares_tokenizer::ChatOptions;
+
+use crate::plan::{
+    self, CELLS_PER_PAGE, DEFAULT_DRAFTS, DEFAULT_PARALLEL, LoadOptions, Room,
+    SINGLE_DEVICE_MIN_CONTEXT, SplitKind,
+};
+
+/// Memory of every device that the engine leaves unreserved: for what the
+/// driver takes besides the engine's own buffers (its context, the kernels'
+/// code) and for whatever else lives on the card.
+const VRAM_HEADROOM: u64 = 256 * MIB;
+
+/// The architectures that have an implementation on the devices.
+pub const IMPLEMENTED: &[&str] = &[ares_model::qwen35::config::ARCHITECTURE];
+
+/// Why a model could not be loaded.
+#[derive(Debug, thiserror::Error)]
+pub enum LoadError {
+    #[error("cannot open the model: {0}")]
+    Open(#[from] ares_gguf::Error),
+    #[error(
+        "the model file declares no architecture (general.architecture), so there is nothing \
+         to run it with"
+    )]
+    NoArchitecture,
+    /// The file is a model this build has no device implementation for.
+    #[error(
+        "the model architecture '{0}' has no implementation on the devices: this build runs \
+         {implemented}",
+        implemented = IMPLEMENTED.join(", ")
+    )]
+    Architecture(String),
+    /// What the operator asked for cannot be done; the message says why.
+    #[error("{0}")]
+    Options(String),
+    #[error("devices: {0}")]
+    Cuda(#[from] ares_cuda::Error),
+    #[error("the model cannot be set up: {0}")]
+    Model(String),
+    #[error("the model could not be loaded onto the devices: {0}")]
+    Start(String),
+}
+
+fn refuse(message: impl Into<String>) -> LoadError {
+    LoadError::Options(message.into())
+}
+
+/// A device that was opened, and what it had free then.
+struct Held {
+    device: Device,
+    free: u64,
+}
+
+/// A model on the devices, being served.
+pub struct Loaded {
+    runtime: Arc<Runtime>,
+    name: String,
+    held: Vec<Held>,
+}
+
+impl std::fmt::Debug for Loaded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Loaded").field("name", &self.name).finish_non_exhaustive()
+    }
+}
+
+impl Loaded {
+    /// The engine to serve.
+    pub fn engine(&self) -> Arc<dyn Engine> {
+        self.runtime.clone()
+    }
+
+    /// The name the model is served under.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Ends every request that still runs, joins the conductor and the device
+    /// threads, and gives the devices back. Returns when all of that is done.
+    pub fn unload(self) {
+        let begun = Instant::now();
+        self.runtime.shutdown();
+        // The device threads have ended and dropped what they held; these
+        // are the last handles, and with them the driver contexts go.
+        for held in &self.held {
+            let info = held.device.info();
+            match held.device.mem_info() {
+                Ok(memory) => tracing::info!(
+                    "device {} ({}): released, {} free ({} when the server started)",
+                    info.ordinal,
+                    info.name,
+                    Bytes(memory.free),
+                    Bytes(held.free),
+                ),
+                Err(error) => tracing::warn!("device {}: {error}", info.ordinal),
+            }
+        }
+        drop(self.held);
+        tracing::info!(
+            running = self.runtime.is_running(),
+            "the engine has stopped in {:.0} ms: threads joined, devices released",
+            begun.elapsed().as_secs_f64() * 1e3
+        );
+    }
+}
+
+/// What the parts of a model take on one device, by estimate.
+#[derive(Debug, Clone, Copy, Default)]
+struct Footprint {
+    weights: u64,
+    /// The scratch of a step and the small buffers.
+    step: u64,
+    per_sequence: u64,
+    per_page: u64,
+}
+
+fn matrix_bytes(m: &Matrix<'_>) -> u64 {
+    m.bytes().len() as u64
+}
+
+fn part_of(bytes: u64, have: usize, of: usize) -> u64 {
+    (bytes * have as u64).div_ceil(of.max(1) as u64)
+}
+
+/// The stored bytes of block `layer`: its mixer and its feed-forward part.
+fn block_bytes(w: &Weights<'_>, layer: usize) -> (u64, u64) {
+    let l = &w.layers[layer];
+    let ffn = matrix_bytes(&l.block.ffn_gate)
+        + matrix_bytes(&l.block.ffn_up)
+        + matrix_bytes(&l.block.ffn_down);
+    let mixer = match &l.mixer {
+        Mixer::Recurrent(r) => {
+            matrix_bytes(&r.qkv)
+                + matrix_bytes(&r.gate)
+                + matrix_bytes(&r.beta)
+                + matrix_bytes(&r.alpha)
+                + matrix_bytes(&r.out)
+        }
+        Mixer::Attention(a) => {
+            matrix_bytes(&a.q) + matrix_bytes(&a.k) + matrix_bytes(&a.v) + matrix_bytes(&a.out)
+        }
+    };
+    (mixer, ffn)
+}
+
+/// What `placement` puts on each device, estimated without a device.
+///
+/// The weights follow the loader (`qwen35::device::load`): a device's slice of
+/// every block, the embedding table, its rows of the head, the draft block.
+/// The scratch of a step follows `Part::open` with the widths of the whole
+/// model, which a slice does not exceed. Both are estimates: the loader
+/// aligns and rearranges, and the part has more small buffers than are
+/// counted here, for which a margin is added.
+fn footprint(
+    c: &Config,
+    w: &Weights<'_>,
+    placement: &Placement,
+    options: &Options,
+) -> Vec<Footprint> {
+    let r = &c.recurrent;
+    let a = &c.attention;
+    let (d, f) = (c.n_embd as u64, c.n_ff as u64);
+    let (kd, vd, cd) = (r.key_dim() as u64, r.value_dim() as u64, r.conv_dim() as u64);
+    let (hq, hkv) = ((a.n_head * a.head_dim) as u64, (a.n_head_kv * a.head_dim) as u64);
+    let rows = u64::from(options.max_rows);
+    let widest = d.max(vd).max(hq).max(f);
+    let per_row = 4
+        * (3 * d
+            + cd.max(2 * hq).max(f)
+            + vd.max(hkv).max(f)
+            + 2 * r.n_v_heads as u64
+            + kd.max(hq)
+            + (kd + vd).max(hq)
+            + vd.max(hq)
+            + 2 * hkv)
+        + 4 * a.rope.dim as u64
+        + 3 * widest;
+    let values_per_key = (r.n_v_heads / r.n_k_heads.max(1)) as u64;
+
+    placement
+        .devices
+        .iter()
+        .enumerate()
+        .map(|(index, plan)| {
+            let mut weights = 0u64;
+            let mut per_sequence = 0u64;
+            for (layer, slice) in plan.blocks.iter().enumerate() {
+                let Some(slice) = slice else { continue };
+                let (mixer, ffn) = block_bytes(w, layer);
+                let heads = slice.heads.len();
+                weights += part_of(ffn, slice.ffn.len(), c.n_ff);
+                if c.is_attention(layer) {
+                    weights += part_of(mixer, heads, a.n_head_kv);
+                } else {
+                    weights += part_of(mixer, heads, r.n_k_heads);
+                    // The convolution's window and the delta-rule matrices of
+                    // the heads this device computes.
+                    let keys = heads as u64 * r.head_k_dim as u64;
+                    let value_heads = heads as u64 * values_per_key;
+                    let values = value_heads * r.head_v_dim as u64;
+                    let conv = (2 * keys + values) * (r.conv_kernel as u64).saturating_sub(1);
+                    let delta = value_heads * (r.head_k_dim * r.head_v_dim) as u64;
+                    per_sequence += (conv + delta) * options.state.bytes();
+                }
+            }
+            if plan.embedding {
+                weights += matrix_bytes(&w.token_embd);
+            }
+            // A head that is the embedding table is stored once where both are.
+            let shared = plan.embedding && w.output.is_none() && placement.draft.is_none();
+            if !shared {
+                weights += part_of(matrix_bytes(w.head()), plan.head.len(), c.n_vocab);
+            }
+            if let (Some(_), Some(nextn)) =
+                (placement.draft.as_ref().filter(|draft| draft.device == index), &w.nextn)
+            {
+                let at = &nextn.attention;
+                weights += matrix_bytes(&nextn.block.ffn_gate)
+                    + matrix_bytes(&nextn.block.ffn_up)
+                    + matrix_bytes(&nextn.block.ffn_down)
+                    + matrix_bytes(&at.q)
+                    + matrix_bytes(&at.k)
+                    + matrix_bytes(&at.v)
+                    + matrix_bytes(&at.out)
+                    + matrix_bytes(&nextn.eh_proj);
+            }
+            let logits = u64::from(options.logit_rows) * 4 * (d + plan.head.len() as u64);
+            Footprint {
+                weights,
+                // The margin: alignment of the arena, the sampler, records,
+                // attention plans, links, the draft block's buffers.
+                step: rows * per_row + logits + weights / 64 + 64 * MIB,
+                per_sequence,
+                per_page: page_bytes(c, placement, index, options.kv),
+            }
+        })
+        .collect()
+}
+
+/// The link of a device to its slot, as Linux reports it.
+fn pci_link(info: &DeviceInfo) -> Option<String> {
+    let base = format!("/sys/bus/pci/devices/{}", info.pci);
+    let read = |name: &str| {
+        std::fs::read_to_string(format!("{base}/{name}")).ok().map(|s| s.trim().to_owned())
+    };
+    Some(format!("{} x{}", read("current_link_speed")?, read("current_link_width")?))
+}
+
+/// The bound on a device's memory bandwidth that it reports, in bits per
+/// second: only its ratio between devices is used.
+fn bandwidth(info: &DeviceInfo) -> f64 {
+    f64::from(info.memory_bus_width_bits) * f64::from(info.memory_clock_khz) * 1e3
+}
+
+fn describe(held: &Held) {
+    let info = held.device.info();
+    tracing::info!(
+        "device {}: {}, compute capability {}.{}, {} of {} free, memory interface {} bit at {} \
+         MHz, PCI {}{}",
+        info.ordinal,
+        info.name,
+        info.compute_capability.0,
+        info.compute_capability.1,
+        Bytes(held.free),
+        Bytes(info.total_memory),
+        info.memory_bus_width_bits,
+        info.memory_clock_khz / 1000,
+        info.pci,
+        pci_link(info).map(|link| format!(" ({link})")).unwrap_or_default(),
+    );
+}
+
+/// Says how the devices of a split reach each other. This is the rule of
+/// `ares_cuda::Mesh::new`: the direct route when every pair has peer access.
+fn describe_links(held: &[Held]) -> Result<(), LoadError> {
+    if held.len() < 2 {
+        return Ok(());
+    }
+    let mut all = true;
+    for a in held {
+        for b in held {
+            let (from, to) = (a.device.ordinal(), b.device.ordinal());
+            if from != to {
+                let (access, rank) = ares_cuda::peer_access(from, to)?;
+                all &= access;
+                tracing::info!(
+                    "link {from} -> {to}: {}",
+                    if access {
+                        format!("peer access (the driver's rank of the link: {rank})")
+                    } else {
+                        "no peer access".to_owned()
+                    }
+                );
+            }
+        }
+    }
+    if all {
+        tracing::info!("the devices exchange directly, from device to device");
+    } else {
+        tracing::warn!(
+            "the devices exchange through page-locked host memory, which is slower for a tensor \
+             split: {} names a driver library with peer access, if the system has one",
+            ares_cuda::LIBRARY_ENV
+        );
+    }
+    Ok(())
+}
+
+fn join<T: ToString>(items: impl IntoIterator<Item = T>, with: &str) -> String {
+    items.into_iter().map(|item| item.to_string()).collect::<Vec<_>>().join(with)
+}
+
+fn shares_text(shares: &[f64]) -> String {
+    join(shares.iter().map(|share| format!("{share:.3}")), " / ")
+}
+
+/// The token ids of a draft vocabulary file: one per line, `#` for comments.
+fn read_vocabulary(path: &Path) -> Result<Arc<[u32]>, LoadError> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| refuse(format!("cannot read the draft vocabulary {}: {e}", path.display())))?;
+    let mut tokens = Vec::new();
+    for (number, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        tokens.push(line.parse::<u32>().map_err(|_| {
+            refuse(format!(
+                "draft vocabulary {}, line {}: '{line}' is not a token id",
+                path.display(),
+                number + 1
+            ))
+        })?);
+    }
+    if tokens.is_empty() {
+        return Err(refuse(format!("the draft vocabulary {} is empty", path.display())));
+    }
+    Ok(tokens.into())
+}
+
+/// The placement of `spread`, with the draft block where `Qwen35::new` puts
+/// it, to estimate with.
+fn place(
+    c: &Config,
+    w: &Weights<'_>,
+    spread: &Spread,
+    options: &Options,
+) -> Result<Placement, LoadError> {
+    let model = |e: ares_model::qwen35::device::PlacementError| LoadError::Model(e.to_string());
+    let placement = match spread {
+        Spread::Single => Placement::single(c),
+        Spread::Tensor(shares) => Placement::tensor(c, shares).map_err(model)?,
+        Spread::TensorByHalf(shares, halves) => {
+            Placement::tensor_by_half(c, shares, halves).map_err(model)?
+        }
+        Spread::Layer(shares) => Placement::layer(c, w, shares).map_err(model)?,
+    };
+    if c.n_nextn == 1 && options.window_rows > 1 && placement.split != Split::Layer {
+        placement.with_draft(c, options.draft_vocabulary.as_deref()).map_err(model)
+    } else {
+        Ok(placement)
+    }
+}
+
+fn rooms(held: &[Held], footprint: &[Footprint], headroom: u64) -> Vec<Room> {
+    held.iter()
+        .zip(footprint)
+        .map(|(held, f)| Room {
+            usable: held.free.saturating_sub(headroom),
+            fixed: f.weights + f.step,
+            per_sequence: f.per_sequence,
+            per_page: f.per_page,
+        })
+        .collect()
+}
+
+/// Loads the model of `options` and starts the runtime over it. Takes as
+/// long as the weights take to reach the devices; call it from a thread that
+/// may block.
+pub fn load(options: &LoadOptions) -> Result<Loaded, LoadError> {
+    let begun = Instant::now();
+    let gguf = Gguf::open(&options.model)?;
+    let architecture = gguf.architecture().map(str::to_owned);
+    tracing::info!(
+        path = %options.model.display(),
+        architecture = architecture.as_deref().unwrap_or("(none declared)"),
+        size = %Bytes(gguf.file_size()),
+        parts = gguf.n_parts(),
+        tensors = gguf.tensors().len(),
+        "opened the model file"
+    );
+    let architecture = architecture.ok_or(LoadError::NoArchitecture)?;
+    if !IMPLEMENTED.contains(&architecture.as_str()) {
+        return Err(LoadError::Architecture(architecture));
+    }
+    let config = Config::from_gguf(&gguf).map_err(|e| LoadError::Model(e.to_string()))?;
+    let weights = Weights::load(&gguf, &config).map_err(|e| LoadError::Model(e.to_string()))?;
+    tracing::info!(
+        "model: {} blocks of width {}, {} tokens, trained for a context of {}, {}",
+        config.n_layer,
+        config.n_embd,
+        config.n_vocab,
+        config.n_ctx,
+        if config.n_nextn == 1 { "with a draft block" } else { "no draft block" },
+    );
+
+    // What can be refused before a device is touched.
+    let kv = options.kv.unwrap_or(Options::default().kv);
+    if kv.0.has_mean() || kv.1.has_mean() {
+        return Err(refuse(format!(
+            "K/V in {}, {}: the formats q7 to q4 need the pool of exact cells and its \
+             conversion, which the runtime does not manage yet; use f16 or q8",
+            plan::format_name(kv.0),
+            plan::format_name(kv.1)
+        )));
+    }
+    let parallel = options.parallel.unwrap_or(DEFAULT_PARALLEL);
+    if parallel == 0 {
+        return Err(refuse("--parallel must be at least 1"));
+    }
+    let drafts = options.drafts.unwrap_or(DEFAULT_DRAFTS);
+    let vocabulary = match &options.draft_vocabulary {
+        Some(_) if drafts == 0 => {
+            return Err(refuse("a draft vocabulary without drafts does nothing: --drafts is 0"));
+        }
+        Some(_) if config.n_nextn == 0 => {
+            return Err(refuse(
+                "a draft vocabulary is for a model with a draft block, and this model has none",
+            ));
+        }
+        Some(path) => Some(read_vocabulary(path)?),
+        None => None,
+    };
+    if options.context == Some(0) {
+        return Err(refuse("--context must be at least 1"));
+    }
+
+    // The devices.
+    let known = ares_cuda::devices()?;
+    if known.is_empty() {
+        return Err(refuse("the driver reports no CUDA device"));
+    }
+    if let Ok((major, minor)) = ares_cuda::driver_version() {
+        tracing::info!(
+            "CUDA driver {major}.{minor}, {} device(s){}",
+            known.len(),
+            match std::env::var_os(ares_cuda::LIBRARY_ENV) {
+                Some(path) =>
+                    format!(", library {} ({})", path.to_string_lossy(), ares_cuda::LIBRARY_ENV),
+                None => String::new(),
+            }
+        );
+    }
+    let ordinals: Vec<u32> = match &options.devices {
+        Some(list) => {
+            for (i, ordinal) in list.iter().enumerate() {
+                if !known.iter().any(|info| info.ordinal == *ordinal) {
+                    return Err(refuse(format!(
+                        "--devices: there is no device {ordinal}; the driver reports {}",
+                        join(known.iter().map(|info| info.ordinal), ", ")
+                    )));
+                }
+                if list[..i].contains(ordinal) {
+                    return Err(refuse(format!("--devices names device {ordinal} twice")));
+                }
+            }
+            list.clone()
+        }
+        None => known.iter().map(|info| info.ordinal).collect(),
+    };
+    if ordinals.is_empty() {
+        return Err(refuse("--devices names no device"));
+    }
+    let mut held = Vec::new();
+    for ordinal in &ordinals {
+        let device = Device::open(*ordinal, Wait::Block)?;
+        let free = device.mem_info()?.free;
+        held.push(Held { device, free });
+        describe(&held[held.len() - 1]);
+    }
+
+    // The model's settings that do not depend on the placement.
+    let window_rows = if drafts > 0 { parallel.saturating_mul(drafts + 1) } else { 0 };
+    let part_options = Options {
+        precision: options.precision,
+        kv,
+        logit_rows: window_rows.max(parallel),
+        window_rows,
+        draft_vocabulary: vocabulary.clone(),
+        ..Options::default()
+    };
+    if part_options.max_rows < window_rows {
+        return Err(refuse(format!(
+            "{parallel} sequences with {drafts} drafts each are {window_rows} rows in a step, \
+             more than the {} a step has: lower --parallel or --drafts",
+            part_options.max_rows
+        )));
+    }
+    let headroom = VRAM_HEADROOM;
+    let smallest = options.context.unwrap_or(SINGLE_DEVICE_MIN_CONTEXT.min(config.n_ctx as u32));
+
+    // Which devices, and how the model is spread over them.
+    let holds = |held: &[Held], spread: &Spread| -> Result<bool, LoadError> {
+        let placement = place(&config, &weights, spread, &part_options)?;
+        let footprint = footprint(&config, &weights, &placement, &part_options);
+        let pages = plan::pages_that_fit(&rooms(held, &footprint, headroom), parallel);
+        Ok(pages >= plan::pool_pages(smallest, parallel))
+    };
+    let split = match options.split {
+        Some(SplitKind::Single) if options.devices.as_ref().is_some_and(|list| list.len() > 1) => {
+            return Err(refuse(
+                "--split single takes one device and --devices names several: name one, or \
+                 choose tensor or layer",
+            ));
+        }
+        Some(kind @ (SplitKind::Tensor | SplitKind::Layer)) if held.len() < 2 => {
+            return Err(refuse(format!(
+                "--split {} needs at least two devices and there is one",
+                kind.name()
+            )));
+        }
+        Some(kind) => kind,
+        None if held.len() == 1 => SplitKind::Single,
+        None => {
+            // One device, if one holds the model with a useful context.
+            let mut alone = false;
+            for candidate in &held {
+                alone |= holds(std::slice::from_ref(candidate), &Spread::Single)?;
+            }
+            if alone { SplitKind::Single } else { SplitKind::Tensor }
+        }
+    };
+    let why_split = match (options.split, split) {
+        (Some(_), _) => "as asked",
+        (None, SplitKind::Single) if ordinals.len() == 1 => "one device to place it on",
+        (None, SplitKind::Single) => "one device holds the model and its context",
+        (None, _) => "no single device holds the model and its context",
+    };
+    if split == SplitKind::Single {
+        if options.shares.is_some() {
+            return Err(refuse("--shares is for a split over several devices, and there is one"));
+        }
+        if held.len() > 1 {
+            // The first device, in the order given, that holds the model; the
+            // first one if none does, so that its ledger says what is missing.
+            let mut chosen = 0;
+            for (i, candidate) in held.iter().enumerate() {
+                if holds(std::slice::from_ref(candidate), &Spread::Single)? {
+                    chosen = i;
+                    break;
+                }
+            }
+            let keep = held.swap_remove(chosen);
+            held = vec![keep];
+        }
+    }
+    let (spread, why_shares) = match split {
+        SplitKind::Single => (Spread::Single, ""),
+        SplitKind::Tensor | SplitKind::Layer => {
+            let (shares, why) = match &options.shares {
+                Some(shares) if shares.len() != held.len() => {
+                    return Err(refuse(format!(
+                        "--shares has {} values for {} devices",
+                        shares.len(),
+                        held.len()
+                    )));
+                }
+                Some(shares) => {
+                    let total: f64 = shares.iter().sum();
+                    if shares.iter().any(|s| !s.is_finite() || *s <= 0.0) || total <= 0.0 {
+                        return Err(refuse("--shares must be positive numbers"));
+                    }
+                    (shares.iter().map(|s| s / total).collect::<Vec<_>>(), "as asked")
+                }
+                None => {
+                    let wanted = plan::shares_by_bandwidth(
+                        &held.iter().map(|h| bandwidth(h.device.info())).collect::<Vec<_>>(),
+                    );
+                    // What a device can take of a model that is shared out
+                    // evenly in everything: weights, state and context.
+                    let whole = whole(&config, &weights, &part_options, parallel, smallest);
+                    let most: Vec<f64> = held
+                        .iter()
+                        .map(|h| {
+                            let usable = h.free.saturating_sub(headroom + whole.per_device);
+                            usable as f64 / whole.shared.max(1) as f64
+                        })
+                        .collect();
+                    match plan::fit_shares(&wanted, &most) {
+                        Some(shares) if shares == wanted => {
+                            (shares, "by the memory bandwidth the devices report")
+                        }
+                        Some(shares) => (
+                            shares,
+                            "by the memory bandwidth the devices report, lowered where a \
+                             device's memory is too small for its share",
+                        ),
+                        None => {
+                            return Err(refuse(format!(
+                                "the model does not fit on the devices: it needs about {} with \
+                                 a context of {smallest} tokens, and they have {} free",
+                                Bytes(whole.shared + whole.per_device * held.len() as u64),
+                                Bytes(held.iter().map(|h| h.free.saturating_sub(headroom)).sum()),
+                            )));
+                        }
+                    }
+                }
+            };
+            match split {
+                SplitKind::Tensor => (Spread::Tensor(shares), why),
+                _ => (Spread::Layer(shares), why),
+            }
+        }
+    };
+    describe_links(&held)?;
+    let placement = place(&config, &weights, &spread, &part_options)?;
+    if vocabulary.is_some() && placement.draft.is_none() {
+        return Err(refuse(
+            "a draft vocabulary is for the model's draft block, which is not built for a layer \
+             split",
+        ));
+    }
+    let footprint = footprint(&config, &weights, &placement, &part_options);
+    let fit = plan::pages_that_fit(&rooms(&held, &footprint, headroom), parallel);
+
+    // Context: tokens of state for all sequences together.
+    let model_context = config.n_ctx as u32;
+    let (context, why_context) = match options.context {
+        Some(context) => (context, "as asked"),
+        None => {
+            let context = plan::default_context(fit, parallel, model_context);
+            if context == 0 {
+                return Err(refuse(format!(
+                    "the devices have no room for sequence state next to the model (by \
+                     estimate: {}); name fewer sequences with --parallel, another split, or a \
+                     context with --context to try it anyway",
+                    join(
+                        held.iter().zip(&footprint).map(|(h, f)| format!(
+                            "device {} has {} free and the model takes {}",
+                            h.device.ordinal(),
+                            Bytes(h.free),
+                            Bytes(f.weights + f.step + f.per_sequence * u64::from(parallel))
+                        )),
+                        ", "
+                    )
+                )));
+            }
+            if context < model_context.saturating_mul(parallel) {
+                (context, "what the devices' free memory holds, by estimate")
+            } else {
+                (context, "the model's own context for every sequence")
+            }
+        }
+    };
+    let longest = context.min(model_context);
+    let pages = plan::pool_pages(context, parallel);
+
+    tracing::info!(
+        "plan: {} on device{} {} ({why_split}){}",
+        match split {
+            SplitKind::Single => "everything",
+            SplitKind::Tensor => "tensor split",
+            SplitKind::Layer => "layer split",
+        },
+        if held.len() == 1 { "" } else { "s" },
+        join(held.iter().map(|h| h.device.ordinal()), ", "),
+        match &spread {
+            Spread::Tensor(shares) | Spread::Layer(shares) =>
+                format!(", shares {} ({why_shares})", shares_text(shares)),
+            _ => String::new(),
+        }
+    );
+    tracing::info!(
+        "plan: context of {context} tokens for all sequences together ({why_context}), {pages} \
+         pages; a request holds at most {longest} tokens; {parallel} sequence{} at once ({})",
+        if parallel == 1 { "" } else { "s" },
+        if options.parallel.is_some() { "as asked" } else { "the default" },
+    );
+    tracing::info!(
+        "plan: K in {}, V in {}; products {}; {}",
+        plan::format_name(kv.0),
+        plan::format_name(kv.1),
+        match options.precision {
+            ares_cuda::Precision::Fast => "fast (8-bit activations for a few rows)",
+            ares_cuda::Precision::Exact => "exact (f16 on the tensor cores for every product)",
+        },
+        match (drafts, &placement.draft) {
+            (0, _) => "no drafts".to_owned(),
+            (n, Some(draft)) => format!(
+                "at most {n} drafts per sequence and step, from the model's draft block on \
+                 device {} ({}) or from earlier text",
+                held[draft.device].device.ordinal(),
+                match &vocabulary {
+                    Some(list) => format!("a vocabulary of {} tokens", list.len()),
+                    None => format!("the {} tokens whose head rows are there", draft.head_rows),
+                }
+            ),
+            (n, None) if config.n_nextn == 1 => format!(
+                "at most {n} drafts per sequence and step, from earlier text only (the model's \
+                 draft block is not built for a layer split)"
+            ),
+            (n, None) => format!(
+                "at most {n} drafts per sequence and step, from earlier text (the model has no \
+                 draft block)"
+            ),
+        }
+    );
+    for (h, f) in held.iter().zip(&footprint) {
+        tracing::info!(
+            "estimate, device {}: weights {}, step scratch and small buffers {}, recurrent \
+             state {} per sequence, K and V {} per 1000 tokens; with this plan {} of {} free",
+            h.device.ordinal(),
+            Bytes(f.weights),
+            Bytes(f.step),
+            Bytes(f.per_sequence),
+            Bytes(f.per_page * 1000 / u64::from(CELLS_PER_PAGE)),
+            Bytes(
+                f.weights
+                    + f.step
+                    + f.per_sequence * u64::from(parallel)
+                    + f.per_page * u64::from(pages)
+            ),
+            Bytes(h.free),
+        );
+    }
+
+    // Load.
+    let name = options
+        .model
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .filter(|stem| !stem.is_empty())
+        .unwrap_or_else(|| "model".to_owned());
+    let chat = ChatOptions { variables: options.chat_variables.clone(), ..ChatOptions::default() };
+    drop(weights);
+    let model = Arc::new(
+        Qwen35::new(gguf, name.clone(), &spread, part_options, longest)
+            .map_err(|e| LoadError::Model(e.to_string()))?
+            .with_chat_options(chat),
+    );
+    if !model.tokenizer().has_chat_template() {
+        tracing::warn!(
+            "the model file has no chat template: /v1/chat/completions will refuse requests, \
+             /v1/completions works"
+        );
+    }
+    let runtime_config = RuntimeConfig {
+        pages,
+        cells_per_page: CELLS_PER_PAGE,
+        max_slots: parallel,
+        speculation: drafts > 0,
+        max_draft: drafts.max(1),
+        ..RuntimeConfig::default()
+    };
+    let gpu = GpuConfig { vram_headroom: headroom, ..GpuConfig::new(&runtime_config, &*model) };
+    tracing::info!("loading the weights");
+    let loading = Instant::now();
+    let devices: Vec<Device> = held.iter().map(|h| h.device.clone()).collect();
+    let runtime = Runtime::start_gpu(model.clone(), devices, runtime_config, gpu).map_err(|e| {
+        let error = e.to_string();
+        // A context that was estimated to fit and did not is the server's
+        // mistake, and the operator should know the way around it.
+        let short_of_memory = error.to_lowercase().contains("memory");
+        LoadError::Start(if options.context.is_none() && short_of_memory {
+            format!(
+                "{error}. The context of {context} tokens was chosen from an estimate of \
+                     what the model takes; name a smaller one with --context"
+            )
+        } else {
+            error
+        })
+    })?;
+    tracing::info!(
+        "loaded in {:.1} s ({:.1} s since the start)",
+        loading.elapsed().as_secs_f64(),
+        begun.elapsed().as_secs_f64()
+    );
+
+    // What it took.
+    for ((h, report), f) in held.iter().zip(model.reports()).zip(&footprint) {
+        let state = report.state_bytes_per_slot * u64::from(parallel);
+        let kv_bytes = report.page_bytes * u64::from(pages);
+        let draft = report.draft.as_ref().map_or(0, |d| d.carry + d.scratch + d.records);
+        let known = report.weight_bytes
+            + state
+            + kv_bytes
+            + report.scratch_bytes
+            + report.kept_bytes
+            + draft;
+        let free = h.device.mem_info()?.free;
+        let taken = h.free.saturating_sub(free);
+        tracing::info!(
+            "device {} ({}): weights {} in {:.1} s{}, recurrent state {} ({} per sequence), K \
+             and V {} ({} per 1000 tokens), step scratch {}, inputs kept for draft windows {}, \
+             draft block buffers {}, everything else {}; taken {}, free {}",
+            h.device.ordinal(),
+            report.device,
+            Bytes(report.weight_bytes),
+            report.upload.as_secs_f64(),
+            report
+                .draft
+                .as_ref()
+                .map(|d| format!(" (of which the draft block {})", Bytes(d.weights)))
+                .unwrap_or_default(),
+            Bytes(state),
+            Bytes(report.state_bytes_per_slot),
+            Bytes(kv_bytes),
+            Bytes(report.page_bytes * 1000 / u64::from(CELLS_PER_PAGE)),
+            Bytes(report.scratch_bytes),
+            Bytes(report.kept_bytes),
+            Bytes(draft),
+            Bytes(taken.saturating_sub(known)),
+            Bytes(taken),
+            Bytes(free),
+        );
+        let fixed = f.weights + f.step + f.per_sequence * u64::from(parallel);
+        let really = taken.saturating_sub(kv_bytes);
+        tracing::info!(
+            "device {}: the model without K and V took {} (estimated {}); {} are free beyond \
+             the {} left unreserved, room for about {} more tokens of context",
+            h.device.ordinal(),
+            Bytes(really),
+            Bytes(fixed),
+            Bytes(free.saturating_sub(headroom)),
+            Bytes(headroom),
+            (free.saturating_sub(headroom) / report.page_bytes.max(1))
+                .saturating_mul(u64::from(CELLS_PER_PAGE)),
+        );
+    }
+    tracing::info!(
+        "context: {context} tokens of sequence state, all of it in VRAM (state is not moved to \
+         RAM yet, so a context that does not fit is refused at load)"
+    );
+    Ok(Loaded { runtime: Arc::new(runtime), name, held })
+}
+
+/// What the whole model takes when it is shared out: the part that is
+/// divided among the devices by their shares, and what every device takes
+/// besides.
+struct Whole {
+    shared: u64,
+    per_device: u64,
+}
+
+fn whole(c: &Config, w: &Weights<'_>, options: &Options, parallel: u32, context: u32) -> Whole {
+    // One device with everything gives the totals. A split divides weights,
+    // recurrent state and K/V by the shares, near enough, and repeats the
+    // scratch of a step on every device.
+    let all = footprint(c, w, &Placement::single(c), options)[0];
+    let margin = all.weights / 64;
+    Whole {
+        shared: all.weights
+            + margin
+            + all.per_sequence * u64::from(parallel)
+            + all.per_page * u64::from(plan::pool_pages(context, parallel)),
+        per_device: all.step - margin,
+    }
+}

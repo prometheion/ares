@@ -2,25 +2,55 @@
 
 use std::time::Duration;
 
+use ares_sched::LookupConfig;
+
+/// Which drafters propose tokens.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Drafters {
+    /// The lookup in earlier text and the model's own draft block: for every
+    /// sequence and step, the one that promises more tokens per millisecond.
+    #[default]
+    Both,
+    /// Only the lookup in earlier text, which costs the devices nothing.
+    Lookup,
+    /// Only the model's own draft block, for a model that has one.
+    Own,
+}
+
 /// The settings of the conductor and its bookkeeping.
 #[derive(Clone, Debug)]
 pub struct RuntimeConfig {
     /// Pages in the pool and cells per page: together the most context all
-    /// sequences can hold. Requests are admitted against this, for their
-    /// longest possible length, so no running request can run out of pages.
+    /// running sequences can hold. Pages are claimed step by step; a request
+    /// starts when its prompt and the output it is expected to produce fit,
+    /// and waits in line until then.
     pub pages: u32,
     pub cells_per_page: u32,
-    /// The most sequences at once.
+    /// The most sequences that run at once: the devices keep a recurrent
+    /// state, a page table and a row of logits for each. Requests beyond
+    /// that wait in line; the line has no limit.
     pub max_slots: u32,
+    /// The most output tokens a request is counted with when it is decided
+    /// whether another fits next to it. A request that names no limit may
+    /// write until the context is full, and hardly any does.
+    pub output_clip: u32,
+    /// The share of that allowance a running request is expected to use,
+    /// before any request has finished. The accounting corrects it from
+    /// what finished requests really used.
+    pub output_ratio: f64,
     /// The most rows of a step; 0 for the model's own maximum.
     pub max_rows: u32,
-    /// Whether n-gram drafts are proposed and verified.
+    /// Whether drafts are proposed and verified.
     pub speculation: bool,
+    /// Which drafters propose them.
+    pub drafters: Drafters,
     /// The most draft tokens verified for one sequence in a step.
     pub max_draft: u32,
-    /// The n-gram length drafts are matched on.
-    pub ngram: usize,
-    /// The acceptance a new sequence's drafter is assumed to have.
+    /// The corpus that drafts are looked up in: its memory and the shortest
+    /// match it drafts from.
+    pub lookup: LookupConfig,
+    /// The acceptance the model's own drafts are assumed to have for a new
+    /// sequence.
     pub draft_prior: f64,
     /// How much slower generating sequences may get while a prompt is read
     /// (2.0: half speed), which bounds the prompt rows of a step.
@@ -50,10 +80,13 @@ impl Default for RuntimeConfig {
             pages: 4096,
             cells_per_page: 16,
             max_slots: 256,
+            output_clip: 4096,
+            output_ratio: 0.7,
             max_rows: 0,
             speculation: true,
+            drafters: Drafters::Both,
             max_draft: 8,
-            ngram: 3,
+            lookup: LookupConfig::default(),
             draft_prior: 0.6,
             prefill_slowdown: 2.0,
             prefill_fallback_rows: 32,

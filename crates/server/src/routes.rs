@@ -15,7 +15,7 @@ use axum::response::{IntoResponse, Response};
 use futures_util::StreamExt;
 
 use crate::Config;
-use crate::bridge::{DecisionRun, Item, Run};
+use crate::bridge::{DecisionRun, Flight, Item, Run, Stop};
 use crate::error::ApiError;
 use crate::systemone;
 use crate::wire::{self, Endpoint, Head};
@@ -25,6 +25,8 @@ use crate::wire::{self, Endpoint, Head};
 pub(crate) struct App {
     pub engine: Arc<dyn Engine>,
     pub config: Config,
+    pub flight: Arc<Flight>,
+    pub stop: Stop,
 }
 
 pub(crate) async fn health() -> Json<serde_json::Value> {
@@ -33,6 +35,22 @@ pub(crate) async fn health() -> Json<serde_json::Value> {
 
 pub(crate) async fn models(State(app): State<App>) -> Json<serde_json::Value> {
     Json(wire::model_list(&app.engine.models()))
+}
+
+/// `GET /metrics`: what the engine has done and holds, in the text format
+/// monitoring systems scrape.
+pub(crate) async fn metrics(State(app): State<App>) -> Response {
+    // The engine may wait for the end of its step before it answers.
+    let engine = app.engine.clone();
+    let stats = tokio::task::spawn_blocking(move || engine.stats()).await.ok().flatten();
+    match stats {
+        Some(stats) => (
+            [(header::CONTENT_TYPE, HeaderValue::from_static("text/plain; version=0.0.4"))],
+            wire::metrics(&stats),
+        )
+            .into_response(),
+        None => ApiError::unsupported("the engine keeps no statistics").into_response(),
+    }
 }
 
 pub(crate) async fn chat_completions(State(app): State<App>, request: Request) -> Response {
@@ -83,7 +101,13 @@ async fn try_completion(
         "request"
     );
 
-    let run = Run::start(&app.engine, parsed.request, app.config.event_buffer)?;
+    let run = Run::start(
+        &app.engine,
+        parsed.request,
+        app.config.event_buffer,
+        &app.flight,
+        app.stop.clone(),
+    )?;
     if parsed.stream {
         stream(run, head, parsed.include_usage).await
     } else {
@@ -107,7 +131,8 @@ async fn try_systemone(app: App, request: Request) -> Result<Response, ApiError>
         "decision request"
     );
 
-    let result = DecisionRun::start(&app.engine, parsed.request)?.finish().await?;
+    let result =
+        DecisionRun::start(&app.engine, parsed.request, app.stop.clone())?.finish().await?;
     Ok(json_response(parsed.reply.render(&result)?))
 }
 
@@ -160,8 +185,8 @@ async fn collect(mut run: Run, head: Head) -> Result<Response, ApiError> {
     loop {
         match run.next().await? {
             Item::Text(piece) => text.push_str(&piece),
-            Item::Done { finish, usage } => {
-                return Ok(json_response(head.complete(&text, finish, usage)));
+            Item::Done { finish, usage, timings } => {
+                return Ok(json_response(head.complete(&text, finish, usage, timings)));
             }
         }
     }
@@ -241,10 +266,10 @@ impl Chunks {
                         return Some(self.head.text_chunk(&text));
                     }
                 }
-                Phase::Ready(Item::Done { finish, usage }) => {
+                Phase::Ready(Item::Done { finish, usage, timings }) => {
                     self.phase =
                         if self.include_usage { Phase::Usage(usage) } else { Phase::Marker };
-                    return Some(self.head.finish_chunk(finish));
+                    return Some(self.head.finish_chunk(finish, timings));
                 }
                 Phase::Pull => match self.run.next().await {
                     Ok(item) => self.phase = Phase::Ready(item),

@@ -79,6 +79,8 @@ pub struct Qwen35 {
     tokenizer: Tokenizer,
     name: String,
     context: u32,
+    /// When the model was set up, in seconds since the Unix epoch.
+    created: u64,
     /// How chat prompts are rendered.
     chat: ChatOptions,
     reports: Mutex<Vec<PartReport>>,
@@ -138,6 +140,9 @@ impl Qwen35 {
             tokenizer,
             name: name.into(),
             context,
+            created: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |since| since.as_secs()),
             chat: ChatOptions::default(),
             reports: Mutex::new(Vec::new()),
         })
@@ -181,7 +186,7 @@ impl Qwen35 {
 
 impl Model for Qwen35 {
     fn card(&self) -> ModelCard {
-        ModelCard { id: self.name.clone(), context_length: self.context, created: 0 }
+        ModelCard { id: self.name.clone(), context_length: self.context, created: self.created }
     }
 
     fn vocab(&self) -> u32 {

@@ -3,8 +3,10 @@
 
 mod common;
 
-use ares_api::{EngineError, Event, FinishReason, GenerateRequest, Prompt, Role, Usage};
-use ares_server::{Config, NoModelEngine};
+use ares_api::{
+    EngineError, EngineStats, Event, FinishReason, GenerateRequest, Prompt, Role, Usage,
+};
+use ares_server::Config;
 use axum::http::{StatusCode, header};
 use common::*;
 use futures_util::StreamExt;
@@ -169,7 +171,7 @@ async fn the_engine_receives_everything_the_client_sent_and_nothing_else() {
         "presence_penalty": 0.5, "frequency_penalty": -0.25, "repeat_penalty": 1.5, "seed": 42,
         "max_tokens": 100, "max_completion_tokens": 50,
         "stop": ["\n\n", "END"],
-        "logit_bias": {"1": 5}, "response_format": {"type": "text"}, "user": "u", "something_new": [1, 2]
+        "response_format": {"type": "text"}, "user": "u"
     }"#;
     let request = submitted_from(CHAT, body).await;
 
@@ -594,6 +596,26 @@ async fn bad_requests_are_refused_before_the_engine_sees_them() {
         chat(json!({"n": 2})).into_case(Some("n"), "n must be 1"),
         chat(json!({"stream": "yes"})).into_case(Some("stream"), "stream must be a boolean"),
         chat(json!({"stream_options": 5})).into_case(Some("stream_options"), "must be an object"),
+        // What the server does not do is refused by name, never dropped.
+        chat(json!({"logit_bias": {"1": 5}})).into_case(Some("logit_bias"), "logit_bias is not supported: the sampler has no logit bias"),
+        chat(json!({"grammar": "root ::= \"a\""})).into_case(Some("grammar"), "structured output"),
+        chat(json!({"json_schema": {"type": "object"}})).into_case(Some("json_schema"), "structured output"),
+        chat(json!({"response_format": {"type": "json_object"}})).into_case(Some("response_format"), "structured output"),
+        chat(json!({"logprobs": true})).into_case(Some("logprobs"), "token probabilities"),
+        chat(json!({"top_logprobs": 5})).into_case(Some("top_logprobs"), "token probabilities"),
+        chat(json!({"tool_choice": "required"})).into_case(Some("tool_choice"), "tool calls are not built"),
+        chat(json!({"functions": []})).into_case(Some("functions"), "tool calls are not built"),
+        chat(json!({"reasoning_effort": "high"})).into_case(Some("reasoning_effort"), "--chat-var"),
+        chat(json!({"chat_template_kwargs": {"enable_thinking": false}})).into_case(Some("chat_template_kwargs"), "--chat-var"),
+        chat(json!({"typical_p": 0.9})).into_case(Some("typical_p"), "typical_p is not supported: it is not a parameter of this server"),
+        chat(json!({"mirostat": 2})).into_case(Some("mirostat"), "not a parameter of this server"),
+        chat(json!({"something_new": [1, 2]})).into_case(Some("something_new"), "something_new is not supported"),
+        (COMPLETIONS, completion_body(json!({"best_of": 3})), Some("best_of"), "one completion per request"),
+        (COMPLETIONS, completion_body(json!({"echo": true})), Some("echo"), "returned on its own"),
+        (COMPLETIONS, completion_body(json!({"suffix": "end"})), Some("suffix"), "returned on its own"),
+        (COMPLETIONS, completion_body(json!({"messages": []})), Some("messages"), "messages is not supported"),
+        (COMPLETIONS, completion_body(json!({"max_completion_tokens": 5})), Some("max_completion_tokens"), "not supported"),
+        chat(json!({"prompt": "x"})).into_case(Some("prompt"), "prompt is not supported"),
         (COMPLETIONS, r#"{"model": "mock"}"#.into(), Some("prompt"), "prompt is required"),
         (COMPLETIONS, completion_body(json!({"prompt": 5})), Some("prompt"), "prompt must be a string"),
         (COMPLETIONS, completion_body(json!({"prompt": []})), Some("prompt"), "one string"),
@@ -615,6 +637,30 @@ async fn bad_requests_are_refused_before_the_engine_sees_them() {
         assert!(message.contains(words), "{body}: '{message}' should contain '{words}'");
     }
     assert!(engine.submitted().is_empty(), "no invalid request may reach the engine");
+}
+
+#[tokio::test]
+async fn a_field_that_asks_for_nothing_is_not_a_reason_to_refuse() {
+    // `null`, the value that switches a feature off, and the bookkeeping
+    // fields of the API: none of them changes what is generated.
+    let quiet = json!({
+        "logit_bias": {}, "logprobs": false, "top_logprobs": 0, "n": 1,
+        "response_format": {"type": "text"}, "tool_choice": "auto", "parallel_tool_calls": true,
+        "grammar": null, "json_schema": null, "typical_p": null, "something_new": null,
+        "user": "u", "metadata": {"k": "v"}, "store": false, "service_tier": "auto",
+    });
+    let request = submitted_from(CHAT, &chat_body(quiet)).await;
+    assert_eq!(request.sampling, Default::default());
+
+    let quiet = json!({"best_of": 1, "echo": false, "suffix": null, "logprobs": null, "user": "u"});
+    let request = submitted_from(COMPLETIONS, &completion_body(quiet)).await;
+    assert_eq!(request.sampling, Default::default());
+
+    // Penalties cross to the engine, which knows whether its sampler has them.
+    let request =
+        submitted_from(CHAT, &chat_body(json!({"presence_penalty": 0, "repeat_penalty": 1}))).await;
+    assert_eq!(request.sampling.presence_penalty, Some(0.0));
+    assert_eq!(request.sampling.repeat_penalty, Some(1.0));
 }
 
 /// Lets the table above read `chat(..).into_case(..)` instead of repeating the path.
@@ -662,30 +708,181 @@ async fn an_oversized_body_is_refused_with_413() {
     assert_eq!(post(&app, CHAT, &small).await.status(), StatusCode::OK);
 }
 
-// --- no model ----------------------------------------------------------------
+// --- timings and statistics ----------------------------------------------------
 
 #[tokio::test]
-async fn the_engine_without_models_lists_none_and_refuses_with_501() {
-    let app = ares_server::router(std::sync::Arc::new(NoModelEngine::new()));
-    let (status, body) = json(get(&app, "/v1/models").await).await;
+async fn a_finished_request_reports_where_its_time_went() {
+    let (first, second) = (Gate::default(), Gate::default());
+    let engine = MockEngine::script(vec![
+        Step::Wait(first.clone()),
+        text("a"),
+        Step::Wait(second.clone()),
+        text("b"),
+        Step::Send(Event::Done {
+            finish: FinishReason::Stop,
+            usage: Usage { prompt_tokens: 12, completion_tokens: 5, cached_prompt_tokens: 4 },
+        }),
+    ]);
+    let app = app(&engine);
+    let request = tokio::spawn({
+        let app = app.clone();
+        async move { json(post(&app, CHAT, &chat_body(json!({}))).await).await }
+    });
+    eventually("the request to reach the engine", || engine.submitted().len() == 1).await;
+    let pause = std::time::Duration::from_millis(30);
+    tokio::time::sleep(pause).await;
+    first.open();
+    tokio::time::sleep(pause).await;
+    second.open();
+    let (status, body) = request.await.unwrap();
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body, json!({"object": "list", "data": []}));
-    assert_eq!(json(get(&app, "/health").await).await.0, StatusCode::OK);
 
-    for (path, body) in
-        [(CHAT, chat_body(json!({}))), (COMPLETIONS, completion_body(json!({"stream": true})))]
-    {
-        let (status, value) = json(post(&app, path, &body).await).await;
-        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
-        assert_eq!(value["error"]["code"], "not_implemented");
-        let message = value["error"]["message"].as_str().unwrap();
-        assert!(message.contains("no model architecture is implemented yet"), "{message}");
+    // The prompt's time ends with the first text, the generation's starts there.
+    let timings = &body["timings"];
+    assert_eq!(timings["prompt_n"], 8, "the cached part of the prompt was not computed");
+    assert_eq!(timings["predicted_n"], 5);
+    let prompt_ms = timings["prompt_ms"].as_f64().unwrap();
+    assert!((25.0..5000.0).contains(&prompt_ms), "the wait before the first text: {timings}");
+    let predicted_ms = timings["predicted_ms"].as_f64().unwrap();
+    assert!((25.0..5000.0).contains(&predicted_ms), "the wait after it: {timings}");
+    let per_second = timings["prompt_per_second"].as_f64().unwrap();
+    assert!((per_second - 8.0 * 1e3 / prompt_ms).abs() < 0.01 * per_second, "{timings}");
+    // Four tokens came after the first, in `predicted_ms`.
+    let per_second = timings["predicted_per_second"].as_f64().unwrap();
+    assert!((per_second - 4.0 * 1e3 / predicted_ms).abs() < 0.01 * per_second, "{timings}");
+    // This engine keeps no statistics, so nothing is said about drafts.
+    assert!(timings.get("draft_n").is_none() && timings.get("draft_n_accepted").is_none());
+}
+
+#[tokio::test]
+async fn a_stream_carries_the_timings_in_its_finish_chunk() {
+    let engine = MockEngine::script(vec![text("Hi"), done(FinishReason::Length, 7, 1)]);
+    let body = body_text(post(&app(&engine), CHAT, &chat_body(json!({"stream": true}))).await);
+    let stream = parse_sse(&body.await);
+    let finish = stream.chunks.last().unwrap();
+    assert_eq!(finish["choices"][0]["finish_reason"], "length");
+    assert_eq!(finish["timings"]["prompt_n"], 7);
+    assert_eq!(finish["timings"]["predicted_n"], 1);
+    assert_eq!(
+        finish["timings"]["predicted_per_second"],
+        Value::Null,
+        "one token: none came after the first"
+    );
+    for chunk in &stream.chunks[..stream.chunks.len() - 1] {
+        assert!(chunk.get("timings").is_none(), "{chunk}");
+    }
+}
+
+fn drafted(proposed: u64, accepted: u64) -> EngineStats {
+    EngineStats { drafts_proposed: proposed, drafts_accepted: accepted, ..EngineStats::default() }
+}
+
+#[tokio::test]
+async fn a_request_that_ran_alone_gets_the_drafts_the_engine_counted_meanwhile() {
+    let gate = Gate::default();
+    let engine = MockEngine::script(vec![
+        text("a"),
+        Step::Wait(gate.clone()),
+        done(FinishReason::Stop, 3, 9),
+    ]);
+    engine.set_stats(drafted(100, 60));
+    let app = app(&engine);
+
+    let ask = |app: axum::Router| {
+        tokio::spawn(async move { json(post(&app, CHAT, &chat_body(json!({}))).await).await.1 })
+    };
+    let first = ask(app.clone());
+    eventually("the request to reach the engine", || engine.submitted().len() == 1).await;
+    engine.set_stats(drafted(112, 67));
+    gate.open();
+    let body = first.await.unwrap();
+    assert_eq!(body["timings"]["draft_n"], 12, "{body}");
+    assert_eq!(body["timings"]["draft_n_accepted"], 7);
+
+    // The next one starts from the totals the first one ended with. The gate
+    // is open, so it runs through at once.
+    engine.set_stats(drafted(120, 70));
+    let body = ask(app.clone()).await.unwrap();
+    assert_eq!(body["timings"]["draft_n"], 8, "{body}");
+    assert_eq!(body["timings"]["draft_n_accepted"], 3);
+}
+
+#[tokio::test]
+async fn requests_that_ran_together_get_no_draft_counts() {
+    let gate = Gate::default();
+    let engine = MockEngine::script(vec![
+        text("a"),
+        Step::Wait(gate.clone()),
+        done(FinishReason::Stop, 3, 9),
+    ]);
+    engine.set_stats(drafted(0, 0));
+    let app = app(&engine);
+    let ask = |app: axum::Router| {
+        tokio::spawn(async move { json(post(&app, CHAT, &chat_body(json!({}))).await).await.1 })
+    };
+    let (first, second) = (ask(app.clone()), ask(app.clone()));
+    eventually("both requests to reach the engine", || engine.submitted().len() == 2).await;
+    engine.set_stats(drafted(40, 30));
+    gate.open();
+    for body in [first.await.unwrap(), second.await.unwrap()] {
+        let timings = &body["timings"];
+        assert_eq!(timings["predicted_n"], 9);
+        assert!(
+            timings.get("draft_n").is_none(),
+            "the engine's count is not one request's: {body}"
+        );
     }
 
-    let named = NoModelEngine::new().with_architecture(Some("qwen3".into()));
-    let app = ares_server::router(std::sync::Arc::new(named));
-    let (_, value) = json(post(&app, CHAT, &chat_body(json!({}))).await).await;
-    assert!(value["error"]["message"].as_str().unwrap().contains("'qwen3'"));
+    // Counting resumes: the first request alone after the pair leaves totals
+    // behind (whether it has some to start from depends on how the pair
+    // ended), and the one after it is counted.
+    ask(app.clone()).await.unwrap();
+    engine.set_stats(drafted(50, 31));
+    let counted = ask(app.clone()).await.unwrap();
+    assert_eq!(counted["timings"]["draft_n"], 10, "{counted}");
+    assert_eq!(counted["timings"]["draft_n_accepted"], 1);
+}
+
+#[tokio::test]
+async fn metrics_are_the_engines_statistics_as_text() {
+    let engine = instant();
+    let (status, body) = json(get(&app(&engine), "/metrics").await).await;
+    assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "an engine without statistics: {body}");
+
+    engine.set_stats(EngineStats {
+        steps: 5,
+        prompt_tokens: 40,
+        generated_tokens: 9,
+        drafts_proposed: 6,
+        drafts_accepted: 4,
+        requests_finished: 2,
+        requests_cancelled: 1,
+        requests_refused: 0,
+        sequences: 1,
+        pages_free: 30,
+        pages: 34,
+    });
+    let response = get(&app(&engine), "/metrics").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(response.headers()[header::CONTENT_TYPE].to_str().unwrap().starts_with("text/plain"));
+    let text = body_text(response).await;
+    for line in [
+        "ares_requests_finished_total 2",
+        "ares_requests_cancelled_total 1",
+        "ares_requests_refused_total 0",
+        "ares_steps_total 5",
+        "ares_prompt_tokens_total 40",
+        "ares_generated_tokens_total 9",
+        "ares_drafts_proposed_total 6",
+        "ares_drafts_accepted_total 4",
+        "ares_sequences 1",
+        "ares_pages_free 30",
+        "ares_pages 34",
+        "# TYPE ares_pages gauge",
+        "# TYPE ares_steps_total counter",
+    ] {
+        assert!(text.lines().any(|l| l == line), "'{line}' is missing:\n{text}");
+    }
 }
 
 // --- cancellation ------------------------------------------------------------

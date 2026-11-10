@@ -64,15 +64,15 @@ mod text;
 mod timing;
 
 pub use conductor::SequenceInfo;
-pub use config::RuntimeConfig;
+pub use config::{Drafters, RuntimeConfig};
 pub use engine::Runtime;
 pub use error::RuntimeError;
 pub use exec::{Clock, ExecError, Executor, Pick, StepMeta, StepOutput};
 pub use gpu::{GpuConfig, GpuExecutor};
 pub use links::{Links, MAX_DEVICES};
 pub use model::{
-    ContextSpec, DeviceContext, DeviceModel, LinkSpec, Logits, Model, ModelError, OwnDrafts,
-    Split, StepContext,
+    ContextSpec, DeviceContext, DeviceModel, LinkSpec, Logits, Model, ModelError, OwnDrafts, Split,
+    StepContext,
 };
 pub use record::{Commit, RecordFull, RecordView, RecordWriter, Row, TableUpdate};
 pub use sync::{WakeCounts, Woke};

@@ -404,6 +404,11 @@ impl Model for SyntheticModel {
         }
     }
 
+    fn attention_span(&self) -> u32 {
+        // No kernel of this model reads a sequence's earlier cells.
+        0
+    }
+
     fn context(&self) -> ContextSpec {
         self.config.context
     }

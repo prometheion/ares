@@ -14,6 +14,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use ares_api::{GenerateRequest, Json, Message, Prompt, RequestId, Role, Sampling, Usage};
 use serde::Serialize;
 
+use crate::bridge::Timings;
 use crate::error::ApiError;
 
 /// Which of the two endpoints a request came in on.
@@ -64,6 +65,99 @@ pub(crate) fn members(json: &Json) -> Result<&[(String, Json)], ApiError> {
     }
 }
 
+/// The fields of a request that are read and handed to the engine. The
+/// engine refuses what it cannot do among them (penalties, tools).
+const SERVED: &[&str] = &[
+    "model",
+    "stream",
+    "stream_options",
+    "max_tokens",
+    "stop",
+    "n",
+    "temperature",
+    "top_k",
+    "top_p",
+    "min_p",
+    "seed",
+    "presence_penalty",
+    "frequency_penalty",
+    "repeat_penalty",
+];
+
+/// Fields that carry no instruction for the generation: bookkeeping of the
+/// client or of the service it was written for. They are accepted and have no
+/// effect by their own definition.
+const BOOKKEEPING: &[&str] =
+    &["user", "metadata", "store", "service_tier", "prompt_cache_key", "safety_identifier"];
+
+/// Refuses every field that asks for something the server does not do.
+///
+/// A request must not get an answer that silently ignores part of it, so a
+/// field is served, or says nothing by its value (`null`, or the value that
+/// switches the feature off), or the request is refused with the field's
+/// name. That holds for fields nobody has heard of as well: an option of
+/// another server would otherwise be dropped without a word.
+fn refuse_unserved(endpoint: Endpoint, fields: &Fields<'_>) -> Result<(), ApiError> {
+    for (name, value) in fields.0 {
+        let name = name.as_str();
+        let own = match endpoint {
+            Endpoint::Chat => ["messages", "tools", "max_completion_tokens"].contains(&name),
+            Endpoint::Completions => name == "prompt",
+        };
+        if value.is_null() || own || SERVED.contains(&name) || BOOKKEEPING.contains(&name) {
+            continue;
+        }
+        if let Some(why) = unserved(name, value) {
+            return Err(ApiError::invalid_param(name, format!("{name} is not supported: {why}")));
+        }
+    }
+    Ok(())
+}
+
+/// Why the field `name` with `value` cannot be served, or `None` when the
+/// value asks for nothing.
+fn unserved(name: &str, value: &Json) -> Option<&'static str> {
+    let number = |off: f64| match value {
+        Json::Int(i) => *i as f64 == off,
+        Json::Uint(u) => *u as f64 == off,
+        Json::Float(f) => *f == off,
+        _ => false,
+    };
+    let structured = "structured output (grammars, JSON schemas) is not built";
+    let tools = "tool calls are not built";
+    let off = match name {
+        "logit_bias" => matches!(value, Json::Object(members) if members.is_empty()),
+        "logprobs" => matches!(value, Json::Bool(false)),
+        "top_logprobs" => number(0.0),
+        "best_of" => number(1.0),
+        "echo" => matches!(value, Json::Bool(false)),
+        "response_format" => value.get("type").and_then(Json::as_str) == Some("text"),
+        "tool_choice" => matches!(value.as_str(), Some("none" | "auto")),
+        // It says how tools are called, and a request with tools is the
+        // engine's to refuse.
+        "parallel_tool_calls" => matches!(value, Json::Bool(_)),
+        _ => false,
+    };
+    if off {
+        return None;
+    }
+    Some(match name {
+        "logit_bias" => "the sampler has no logit bias",
+        "logprobs" | "top_logprobs" => "token probabilities are not returned",
+        "best_of" => "this server returns one completion per request",
+        "echo" | "suffix" => "the completion is returned on its own",
+        "response_format" | "grammar" | "json_schema" => structured,
+        "tool_choice" | "parallel_tool_calls" | "functions" | "function_call" => tools,
+        "reasoning_effort" | "chat_template_kwargs" => {
+            "variables of the chat template are set when the server starts (--chat-var)"
+        }
+        _ => {
+            "it is not a parameter of this server, which samples with temperature, top_k, \
+             top_p, min_p and seed"
+        }
+    })
+}
+
 /// [`parse`] after the JSON syntax is dealt with.
 fn from_json(endpoint: Endpoint, json: &Json, id: RequestId) -> Result<Parsed, ApiError> {
     let fields = Fields(members(json)?);
@@ -90,6 +184,7 @@ fn from_json(endpoint: Endpoint, json: &Json, id: RequestId) -> Result<Parsed, A
 
     let sampling = sampling(&fields)?;
     sampling.validate().map_err(|e| ApiError::invalid_param(e.field, e.to_string()))?;
+    refuse_unserved(endpoint, &fields)?;
 
     let request = GenerateRequest {
         model,
@@ -407,7 +502,13 @@ impl Head {
     }
 
     /// The whole answer of a non-streaming request.
-    pub fn complete(&self, text: &str, finish: &'static str, usage: Usage) -> String {
+    pub fn complete(
+        &self,
+        text: &str,
+        finish: &'static str,
+        usage: Usage,
+        timings: Timings,
+    ) -> String {
         let choice = match self.endpoint {
             Endpoint::Chat => Choice {
                 index: 0,
@@ -424,13 +525,13 @@ impl Head {
                 finish_reason: Some(finish),
             },
         };
-        self.render(false, vec![choice], Some(usage))
+        self.render(false, vec![choice], Some(usage), Some(timings))
     }
 
     /// The first chunk of a chat stream: it announces the role.
     pub fn role_chunk(&self) -> String {
         let delta = Delta { role: Some("assistant"), content: Some("") };
-        self.render(true, vec![chunk_choice(Some(delta), None, None)], None)
+        self.render(true, vec![chunk_choice(Some(delta), None, None)], None, None)
     }
 
     /// A piece of output text.
@@ -441,25 +542,32 @@ impl Head {
             }
             Endpoint::Completions => chunk_choice(None, Some(text), None),
         };
-        self.render(true, vec![choice], None)
+        self.render(true, vec![choice], None, None)
     }
 
-    /// The last chunk of the text: carries `finish_reason` and no content.
-    pub fn finish_chunk(&self, finish: &'static str) -> String {
+    /// The last chunk of the text: carries `finish_reason`, the timings and
+    /// no content.
+    pub fn finish_chunk(&self, finish: &'static str, timings: Timings) -> String {
         let choice = match self.endpoint {
             Endpoint::Chat => chunk_choice(Some(Delta::default()), None, Some(finish)),
             Endpoint::Completions => chunk_choice(None, Some(""), Some(finish)),
         };
-        self.render(true, vec![choice], None)
+        self.render(true, vec![choice], None, Some(timings))
     }
 
     /// The chunk after the last one when the client asked for usage: no
     /// choices, only the totals.
     pub fn usage_chunk(&self, usage: Usage) -> String {
-        self.render(true, Vec::new(), Some(usage))
+        self.render(true, Vec::new(), Some(usage), None)
     }
 
-    fn render(&self, streaming: bool, choices: Vec<Choice<'_>>, usage: Option<Usage>) -> String {
+    fn render(
+        &self,
+        streaming: bool,
+        choices: Vec<Choice<'_>>,
+        usage: Option<Usage>,
+        timings: Option<Timings>,
+    ) -> String {
         let body = Completion {
             id: &self.id,
             object: self.object(streaming),
@@ -467,6 +575,7 @@ impl Head {
             model: &self.model,
             choices,
             usage: usage.map(UsageBody::from),
+            timings: timings.map(TimingsBody::from),
         };
         serde_json::to_string(&body).expect("response objects serialize")
     }
@@ -489,6 +598,48 @@ struct Completion<'a> {
     choices: Vec<Choice<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     usage: Option<UsageBody>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    timings: Option<TimingsBody>,
+}
+
+/// The timings of a request under the names llama.cpp's server gives them,
+/// so that tools written for one read the other.
+///
+/// `prompt_ms` runs from the arrival of the request to the first token and
+/// `predicted_ms` from the first token to the end. `predicted_per_second` is
+/// therefore the tokens after the first over `predicted_ms`: the first token
+/// comes out of the step that ends the prompt and is paid for there. The
+/// draft counts are left out for a request that did not run alone, because
+/// the engine counts drafts for all requests together.
+#[derive(Serialize)]
+struct TimingsBody {
+    prompt_n: u32,
+    prompt_ms: f64,
+    prompt_per_second: Option<f64>,
+    predicted_n: u32,
+    predicted_ms: f64,
+    predicted_per_second: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    draft_n: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    draft_n_accepted: Option<u64>,
+}
+
+impl From<Timings> for TimingsBody {
+    fn from(timings: Timings) -> Self {
+        // Microseconds are as fine as the times are meaningful.
+        let round = |value: f64| (value * 1e3).round() / 1e3;
+        Self {
+            prompt_n: timings.prompt_tokens,
+            prompt_ms: round(timings.prompt_ms),
+            prompt_per_second: timings.prompt_per_second().map(round),
+            predicted_n: timings.generated_tokens,
+            predicted_ms: round(timings.generated_ms),
+            predicted_per_second: timings.generated_per_second().map(round),
+            draft_n: timings.drafts.map(|drafts| drafts.0),
+            draft_n_accepted: timings.drafts.map(|drafts| drafts.1),
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -556,6 +707,45 @@ pub(crate) fn model_list(models: &[ares_api::ModelCard]) -> serde_json::Value {
         })
         .collect();
     serde_json::json!({ "object": "list", "data": data })
+}
+
+/// The body of `GET /metrics`.
+pub(crate) fn metrics(stats: &ares_api::EngineStats) -> String {
+    let rows: [(&str, &str, &str, u64); 11] = [
+        (
+            "requests_finished_total",
+            "counter",
+            "Requests that ran to their end",
+            stats.requests_finished,
+        ),
+        (
+            "requests_cancelled_total",
+            "counter",
+            "Requests that were cancelled",
+            stats.requests_cancelled,
+        ),
+        (
+            "requests_refused_total",
+            "counter",
+            "Requests refused for lack of room",
+            stats.requests_refused,
+        ),
+        ("steps_total", "counter", "Steps of the engine", stats.steps),
+        ("prompt_tokens_total", "counter", "Prompt tokens computed", stats.prompt_tokens),
+        ("generated_tokens_total", "counter", "Tokens generated", stats.generated_tokens),
+        ("drafts_proposed_total", "counter", "Draft tokens put to the test", stats.drafts_proposed),
+        ("drafts_accepted_total", "counter", "Draft tokens accepted", stats.drafts_accepted),
+        ("sequences", "gauge", "Sequences running", u64::from(stats.sequences)),
+        ("pages_free", "gauge", "Free pages of sequence state", u64::from(stats.pages_free)),
+        ("pages", "gauge", "Pages of sequence state", u64::from(stats.pages)),
+    ];
+    let mut text = String::new();
+    for (name, kind, help, value) in rows {
+        text.push_str(&format!(
+            "# HELP ares_{name} {help}\n# TYPE ares_{name} {kind}\nares_{name} {value}\n"
+        ));
+    }
+    text
 }
 
 #[cfg(test)]

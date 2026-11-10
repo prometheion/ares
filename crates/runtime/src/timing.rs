@@ -262,8 +262,17 @@ pub struct Counters {
     pub tokens: u64,
     pub requests_finished: u64,
     pub requests_cancelled: u64,
-    /// Requests refused for lack of pages or slots.
-    pub requests_refused: u64,
+    /// Requests that did not start in the first pass after they arrived.
+    pub requests_waited: u64,
+    /// Times a running request gave way to the others: it let go of its
+    /// pages and its slot and came back later.
+    pub requests_suspended: u64,
+    /// Requests that ended because the pool had no page left for them and
+    /// nobody else was left to give way.
+    pub requests_exhausted: u64,
+    /// Draft rows that were dropped from a step because their pages did not
+    /// fit.
+    pub draft_rows_cut: u64,
     /// How the conductor's waits for the devices ended.
     pub conductor_wakes: crate::sync::WakeCounts,
     /// How the device threads' waits for work ended.
@@ -325,14 +334,22 @@ pub struct Snapshot {
     pub phases: Vec<(Phase, Summary)>,
     /// Per device, its phases in [`DevicePhase::ALL`] order.
     pub devices: Vec<Vec<(DevicePhase, Summary)>>,
-    /// Pages free and in all, and sequences running, when the copy was made.
+    /// Pages free and in all, sequences running and requests in line, when
+    /// the copy was made.
     pub pages_free: u32,
     pub pages_capacity: u32,
     pub active: u32,
+    pub waiting: u32,
 }
 
 impl Snapshot {
-    pub(crate) fn new(stats: &Stats, pages_free: u32, pages_capacity: u32, active: u32) -> Self {
+    pub(crate) fn new(
+        stats: &Stats,
+        pages_free: u32,
+        pages_capacity: u32,
+        active: u32,
+        waiting: u32,
+    ) -> Self {
         Self {
             counters: stats.counters,
             phases: Phase::ALL.iter().map(|p| (*p, stats.phases[*p as usize].summary())).collect(),
@@ -346,6 +363,7 @@ impl Snapshot {
             pages_free,
             pages_capacity,
             active,
+            waiting,
         }
     }
 
@@ -415,12 +433,17 @@ impl fmt::Display for Snapshot {
         )?;
         writeln!(
             f,
-            "pages {}/{} free  active {}  refused {}  conductor waits for devices: {} spun, {} parked  \
+            "pages {}/{} free  active {}  in line {} ({} waited, {} gave way, {} ended by a full pool, \
+             {} draft rows cut)  conductor waits for devices: {} spun, {} parked  \
              device threads' waits for work: {} spun, {} parked",
             self.pages_free,
             self.pages_capacity,
             self.active,
-            c.requests_refused,
+            self.waiting,
+            c.requests_waited,
+            c.requests_suspended,
+            c.requests_exhausted,
+            c.draft_rows_cut,
             c.conductor_wakes.spun,
             c.conductor_wakes.parked,
             c.device_wakes.spun,
@@ -539,16 +562,16 @@ mod tests {
                 DeviceTimes { device_ns: 9_000_000, gap_ns: Some(1_000_000), ..Default::default() };
             stats.record_device(0, &t, 0);
         }
-        let snapshot = Snapshot::new(&stats, 0, 0, 0);
+        let snapshot = Snapshot::new(&stats, 0, 0, 0, 0);
         assert!((snapshot.gpu_wait_share(0) - 0.1).abs() < 1e-9, "{}", snapshot.gpu_wait_share(0));
         stats.reset();
-        assert_eq!(Snapshot::new(&stats, 0, 0, 0).gpu_wait_share(0), 0.0);
+        assert_eq!(Snapshot::new(&stats, 0, 0, 0, 0).gpu_wait_share(0), 0.0);
     }
 
     #[test]
     fn the_table_names_every_phase() {
         let stats = Stats::new(2, 8);
-        let text = Snapshot::new(&stats, 3, 4, 1).to_string();
+        let text = Snapshot::new(&stats, 3, 4, 1, 0).to_string();
         for phase in Phase::ALL {
             assert!(text.contains(phase.name()), "{text}");
         }

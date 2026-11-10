@@ -35,6 +35,16 @@
 //! last. A generation that has finished must not be reported as a slow client
 //! just because its `Done` found the queue full.
 //!
+//! # Timings
+//!
+//! The times of a request are taken where its events arrive, on the engine's
+//! thread, so that neither the channel nor a slow client is in them: when the
+//! request was handed to the engine, when its first output came (the model's
+//! first token ends the prompt), and when it ended. The counts of draft
+//! tokens are the engine's totals before and after ([`Flight`]), which are
+//! this request's own only when no other request ran in between; the engine
+//! does not report them per request yet.
+//!
 //! # Decisions
 //!
 //! A decision has no stream, so [`DecisionRun`] needs none of this: the
@@ -43,15 +53,15 @@
 //! that goes away cancels it the same way, by dropping the handler's future,
 //! which drops the [`CancelGuard`].
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use ares_api::{
-    DecisionOutcome, DecisionRequest, DecisionResult, DecisionSink, Engine, Event, EventSink,
-    FinishReason, GenerateRequest, RequestId, Usage,
+    DecisionOutcome, DecisionRequest, DecisionResult, DecisionSink, Engine, EngineStats, Event,
+    EventSink, FinishReason, GenerateRequest, RequestId, Usage,
 };
-use tokio::sync::{Notify, mpsc, oneshot};
+use tokio::sync::{Notify, mpsc, oneshot, watch};
 
 use crate::error::ApiError;
 
@@ -59,7 +69,176 @@ use crate::error::ApiError;
 #[derive(Debug)]
 pub(crate) enum Item {
     Text(String),
-    Done { finish: &'static str, usage: Usage },
+    Done { finish: &'static str, usage: Usage, timings: Timings },
+}
+
+/// Where the time of a finished request went, in a form that can be set next
+/// to other engines' numbers.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Timings {
+    /// Tokens of the prompt that were computed.
+    pub prompt_tokens: u32,
+    /// From the hand-over to the engine to the first output: tokenizing, any
+    /// wait for room, and the prompt. The first token comes out of the step
+    /// that ends the prompt.
+    pub prompt_ms: f64,
+    /// All generated tokens, the first one included.
+    pub generated_tokens: u32,
+    /// From the first output to the end: the time of every generated token
+    /// but the first.
+    pub generated_ms: f64,
+    /// Draft tokens put to the test and accepted for this request, when the
+    /// engine's totals can be read as this request's: it ran alone.
+    pub drafts: Option<(u64, u64)>,
+}
+
+impl Timings {
+    /// Prompt tokens per second.
+    pub fn prompt_per_second(&self) -> Option<f64> {
+        (self.prompt_ms > 0.0).then(|| f64::from(self.prompt_tokens) * 1e3 / self.prompt_ms)
+    }
+
+    /// Generated tokens per second: the tokens after the first over the time
+    /// after the first, because the first is paid for by the prompt.
+    pub fn generated_per_second(&self) -> Option<f64> {
+        (self.generated_tokens > 1 && self.generated_ms > 0.0)
+            .then(|| f64::from(self.generated_tokens - 1) * 1e3 / self.generated_ms)
+    }
+}
+
+/// When the events of a request arrived, in nanoseconds after its start.
+/// Written on the engine's thread, read by the handler after the end.
+#[derive(Debug)]
+struct Marks {
+    started: Instant,
+    /// The first output; 0 while there was none.
+    first: AtomicU64,
+    /// The terminal event.
+    end: AtomicU64,
+}
+
+impl Marks {
+    fn note(&self, event: &Event) {
+        let now = (self.started.elapsed().as_nanos() as u64).max(1);
+        if !matches!(event, Event::Error(_)) {
+            let _ = self.first.compare_exchange(0, now, Ordering::AcqRel, Ordering::Acquire);
+        }
+        if event.is_terminal() {
+            self.end.store(now, Ordering::Release);
+        }
+    }
+}
+
+/// The requests in flight, to know which of them ran alone.
+///
+/// The engine counts drafts for all requests together. A request that ran
+/// from start to end with no other one next to it can take the difference of
+/// the totals as its own; any other gets no draft counts. The totals after a
+/// request that ran alone serve as the totals before the next one, so the
+/// engine is asked once per request, after its text has gone out.
+#[derive(Debug)]
+pub(crate) struct Flight {
+    running: AtomicUsize,
+    /// How many requests have started so far.
+    started: AtomicU64,
+    /// The engine's totals after request number `.0` ended, having run alone.
+    last: Mutex<Option<(u64, EngineStats)>>,
+}
+
+impl Flight {
+    /// Reads the engine's totals once, as the start of the first request.
+    pub fn new(engine: &dyn Engine) -> Self {
+        Self {
+            running: AtomicUsize::new(0),
+            started: AtomicU64::new(0),
+            last: Mutex::new(engine.stats().map(|stats| (0, stats))),
+        }
+    }
+
+    fn last(&self) -> std::sync::MutexGuard<'_, Option<(u64, EngineStats)>> {
+        self.last.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+/// One request's place in a [`Flight`]; gives it up when dropped.
+#[derive(Debug)]
+struct Seat {
+    flight: Arc<Flight>,
+    number: u64,
+    /// The engine's totals when the request started, if nothing else ran then
+    /// and they are known.
+    before: Option<EngineStats>,
+    released: bool,
+}
+
+impl Seat {
+    fn take(flight: &Arc<Flight>) -> Self {
+        let number = flight.started.fetch_add(1, Ordering::AcqRel) + 1;
+        let alone = flight.running.fetch_add(1, Ordering::AcqRel) == 0;
+        let before = match *flight.last() {
+            Some((previous, stats)) if alone && previous + 1 == number => Some(stats),
+            _ => None,
+        };
+        Self { flight: flight.clone(), number, before, released: false }
+    }
+
+    /// Whether no request has started since this one did.
+    fn latest(&self) -> bool {
+        self.flight.started.load(Ordering::Acquire) == self.number
+    }
+
+    /// The drafts of the request that just ended in `engine`, if it ran alone.
+    async fn drafts(&self, engine: &Arc<dyn Engine>) -> Option<(u64, u64)> {
+        // Others ran next to it when it started, or have started since.
+        if self.flight.running.load(Ordering::Acquire) != 1 || !self.latest() {
+            return None;
+        }
+        let engine = engine.clone();
+        let after = tokio::task::spawn_blocking(move || engine.stats()).await.ok().flatten()?;
+        if !self.latest() {
+            return None;
+        }
+        *self.flight.last() = Some((self.number, after));
+        self.before.map(|before| after.drafts_since(&before))
+    }
+
+    /// Gives the place up: the request has left the engine. The next request
+    /// may start before this one's response is written out, and it then runs
+    /// alone all the same.
+    fn release(&mut self) {
+        if !std::mem::replace(&mut self.released, true) {
+            self.flight.running.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+}
+
+impl Drop for Seat {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+/// Tells running requests that the server is stopping and will not wait for
+/// them any longer. The handlers then cancel them in the engine and end
+/// their responses with an error.
+#[derive(Debug, Clone)]
+pub(crate) struct Stop(watch::Receiver<bool>);
+
+impl Stop {
+    /// A signal and the sender that raises it by sending `true`. While the
+    /// sender lives and has not sent, and after it is dropped without having
+    /// sent, the signal stays down.
+    pub fn new() -> (watch::Sender<bool>, Self) {
+        let (tx, rx) = watch::channel(false);
+        (tx, Self(rx))
+    }
+
+    /// Completes when the signal is raised.
+    async fn raised(&mut self) {
+        if self.0.wait_for(|stop| *stop).await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
 }
 
 /// Set by the sink (on an engine thread), read by the handler.
@@ -109,7 +288,9 @@ pub(crate) struct Run {
     overflow: Arc<Overflow>,
     guard: CancelGuard,
     engine: Arc<dyn Engine>,
-    started: Instant,
+    marks: Arc<Marks>,
+    seat: Seat,
+    stop: Stop,
     model: String,
 }
 
@@ -126,15 +307,25 @@ impl Run {
         engine: &Arc<dyn Engine>,
         request: GenerateRequest,
         buffer: usize,
+        flight: &Arc<Flight>,
+        stop: Stop,
     ) -> Result<Self, ApiError> {
         let id = request.id;
         let model = request.model.clone();
         // One extra slot for the terminal event, see the module documentation.
         let (tx, rx) = mpsc::channel(buffer.max(1) + 1);
         let overflow = Arc::new(Overflow::default());
+        let seat = Seat::take(flight);
+        let marks = Arc::new(Marks {
+            started: Instant::now(),
+            first: AtomicU64::new(0),
+            end: AtomicU64::new(0),
+        });
 
         let flag = overflow.clone();
+        let clock = marks.clone();
         let sink = EventSink::new(move |event| {
+            clock.note(&event);
             if !event.is_terminal() && tx.capacity() <= 1 {
                 flag.flagged.store(true, Ordering::Release);
                 flag.wake.notify_one();
@@ -152,7 +343,9 @@ impl Run {
             overflow,
             guard: CancelGuard { engine: engine.clone(), id, armed: true },
             engine: engine.clone(),
-            started: Instant::now(),
+            marks,
+            seat,
+            stop,
             model,
         })
     }
@@ -169,6 +362,11 @@ impl Run {
             biased;
             event = self.rx.recv() => event,
             () = self.overflow.wake.notified() => return Err(self.slow()),
+            () = self.stop.raised() => {
+                tracing::info!(id = %self.guard.id, "the server is stopping: ending the request");
+                self.guard.cancel_now();
+                return Err(ApiError::cancelled());
+            }
         };
         let Some(event) = event else {
             // The sender is gone and nothing terminal came: either the sink
@@ -185,19 +383,27 @@ impl Run {
             Event::Text(text) => Ok(Item::Text(text)),
             Event::Done { finish, usage } => {
                 self.guard.disarm();
+                let timings = self.timings(usage).await;
+                let rate = |rate: Option<f64>| rate.map_or("-".to_owned(), |r| format!("{r:.1}"));
+                let count = |n: Option<u64>| n.map_or("-".to_owned(), |n| n.to_string());
                 tracing::info!(
                     id = %self.guard.id,
                     model = %self.model,
                     ?finish,
                     prompt_tokens = usage.prompt_tokens,
                     cached_prompt_tokens = usage.cached_prompt_tokens,
+                    prompt_ms = format_args!("{:.1}", timings.prompt_ms),
+                    prompt_tokens_per_s = %rate(timings.prompt_per_second()),
                     completion_tokens = usage.completion_tokens,
-                    elapsed_ms = self.started.elapsed().as_millis() as u64,
+                    generation_ms = format_args!("{:.1}", timings.generated_ms),
+                    tokens_per_s = %rate(timings.generated_per_second()),
+                    drafts = %count(timings.drafts.map(|d| d.0)),
+                    drafts_accepted = %count(timings.drafts.map(|d| d.1)),
                     "request finished"
                 );
                 match finish {
-                    FinishReason::Stop => Ok(Item::Done { finish: "stop", usage }),
-                    FinishReason::Length => Ok(Item::Done { finish: "length", usage }),
+                    FinishReason::Stop => Ok(Item::Done { finish: "stop", usage, timings }),
+                    FinishReason::Length => Ok(Item::Done { finish: "length", usage, timings }),
                     FinishReason::Cancelled => Err(ApiError::cancelled()),
                 }
             }
@@ -206,6 +412,24 @@ impl Run {
                 tracing::info!(id = %self.guard.id, %error, "request failed");
                 Err(ApiError::from_engine(&*self.engine, error))
             }
+        }
+    }
+
+    /// The times of the request that just ended with `usage`.
+    async fn timings(&mut self, usage: Usage) -> Timings {
+        let end = self.marks.end.load(Ordering::Acquire);
+        let first = match self.marks.first.load(Ordering::Acquire) {
+            0 => end,
+            first => first,
+        };
+        let drafts = self.seat.drafts(&self.engine).await;
+        self.seat.release();
+        Timings {
+            prompt_tokens: usage.prompt_tokens.saturating_sub(usage.cached_prompt_tokens),
+            prompt_ms: first as f64 / 1e6,
+            generated_tokens: usage.completion_tokens,
+            generated_ms: end.saturating_sub(first) as f64 / 1e6,
+            drafts,
         }
     }
 
@@ -222,6 +446,7 @@ pub(crate) struct DecisionRun {
     guard: CancelGuard,
     engine: Arc<dyn Engine>,
     started: Instant,
+    stop: Stop,
     model: String,
 }
 
@@ -233,7 +458,11 @@ impl std::fmt::Debug for DecisionRun {
 
 impl DecisionRun {
     /// Hands `request` to the engine.
-    pub fn start(engine: &Arc<dyn Engine>, request: DecisionRequest) -> Result<Self, ApiError> {
+    pub fn start(
+        engine: &Arc<dyn Engine>,
+        request: DecisionRequest,
+        stop: Stop,
+    ) -> Result<Self, ApiError> {
         let id = request.id;
         let model = request.model.clone();
         let (tx, rx) = oneshot::channel();
@@ -249,6 +478,7 @@ impl DecisionRun {
             guard: CancelGuard { engine: engine.clone(), id, armed: true },
             engine: engine.clone(),
             started: Instant::now(),
+            stop,
             model,
         })
     }
@@ -258,7 +488,16 @@ impl DecisionRun {
     /// If the future is dropped while waiting (the client went away) the
     /// request is cancelled in the engine.
     pub async fn finish(mut self) -> Result<DecisionResult, ApiError> {
-        let Ok(outcome) = (&mut self.rx).await else {
+        let outcome = tokio::select! {
+            biased;
+            outcome = &mut self.rx => outcome,
+            () = self.stop.raised() => {
+                tracing::info!(id = %self.guard.id, "the server is stopping: ending the decision");
+                self.guard.cancel_now();
+                return Err(ApiError::cancelled());
+            }
+        };
+        let Ok(outcome) = outcome else {
             // The sink was dropped and nothing was sent: the engine lost the
             // request.
             tracing::error!(id = %self.guard.id, "the engine dropped the decision without an outcome");

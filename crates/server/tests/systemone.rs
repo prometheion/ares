@@ -11,7 +11,6 @@ use ares_api::{
     Answer, ChoiceOption, DecisionOutcome, DecisionRequest, DecisionResult, EngineError,
     FinishReason, ModelCard, Prompt, QuestionKind, Usage, Verdict,
 };
-use ares_server::NoModelEngine;
 use axum::http::{StatusCode, header};
 use common::*;
 use futures_util::StreamExt;
@@ -735,34 +734,6 @@ async fn an_answer_that_does_not_match_the_questions_is_an_error_and_not_a_respo
         let message = body["error"]["message"].as_str().unwrap();
         assert!(message.contains(words), "'{message}' should contain '{words}'");
     }
-}
-
-// --- no model ------------------------------------------------------------------
-
-#[tokio::test]
-async fn the_engine_without_models_refuses_decisions_with_501_like_completions() {
-    let app = ares_server::router(Arc::new(NoModelEngine::new()));
-    // With a model named, as for completions, and without one, as llama.cpp's
-    // clients send it: the engine is asked in both cases, so the answer says
-    // why nothing can run instead of complaining about a field.
-    for body in
-        [decision_body(json!({})), decision_body(json!({})).replace(r#""model":"mock","#, "")]
-    {
-        let (status, value) = json(post(&app, SYSTEMONE, &body).await).await;
-        assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{body}: {value}");
-        assert_eq!(value["error"]["code"], "not_implemented");
-        let message = value["error"]["message"].as_str().unwrap();
-        assert!(message.contains("no model architecture is implemented yet"), "{message}");
-    }
-
-    let named = NoModelEngine::new().with_architecture(Some("qwen3".into()));
-    let app = ares_server::router(Arc::new(named));
-    let (_, value) = json(post(&app, SYSTEMONE, &decision_body(json!({}))).await).await;
-    assert!(value["error"]["message"].as_str().unwrap().contains("'qwen3'"));
-
-    // A request that is wrong is still told so first.
-    let (status, _) = json(post(&app, SYSTEMONE, r#"{"model":"m"}"#).await).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
 // --- cancellation ----------------------------------------------------------------

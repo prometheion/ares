@@ -1,4 +1,5 @@
-//! Measures the lookup drafter against the n-gram drafter on real text.
+//! Measures the lookup drafter on real text, against a lookup by the last
+//! three tokens of one request (what the engine had before it).
 //!
 //! ```sh
 //! cargo run --release -p ares-sched --example lookup_bench -- <model.gguf> [repository]
@@ -23,13 +24,12 @@
 //!   with an empty prompt writes it again with the same edits. Only a corpus
 //!   that is shared between requests can help here.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use ares_gguf::Gguf;
-use ares_sched::{
-    DraftCost, LookupConfig, LookupCorpus, LookupDrafter, NgramDrafter, best_draft_len,
-};
+use ares_sched::{DraftCost, LookupConfig, LookupCorpus, LookupDrafter, best_draft_len};
 use ares_tokenizer::{EncodeOptions, Tokenizer};
 
 const MAX_DRAFT: usize = 16;
@@ -76,6 +76,62 @@ impl Tally {
 const HEADER: &str = "| drafter | proposals per token | proposed length | accepted length | \
 tokens from drafts | wasted rows per token | tokens per step | tokens/s at 33 + 1.1 ms |\n\
 | --- | --- | --- | --- | --- | --- | --- | --- |";
+
+/// The baseline: a lookup by the last `n` tokens of one sequence, continuing
+/// the most recent earlier occurrence of them.
+struct NgramDrafter {
+    n: usize,
+    tokens: Vec<u32>,
+    /// Hash of a run of `n` tokens to the index of its last token, for the
+    /// most recent run that ended before the current end.
+    last_end: HashMap<u64, u32>,
+}
+
+impl NgramDrafter {
+    fn new(n: usize) -> Self {
+        Self { n, tokens: Vec::new(), last_end: HashMap::new() }
+    }
+
+    fn key(run: &[u32]) -> u64 {
+        run.iter().fold(0xcbf2_9ce4_8422_2325, |hash, token| {
+            (hash ^ u64::from(*token)).wrapping_mul(0x0000_0100_0000_01b3).rotate_left(17)
+        })
+    }
+
+    fn push(&mut self, token: u32) {
+        // The run that ended at the previous token becomes findable now that
+        // it is no longer the end of the sequence.
+        let len = self.tokens.len();
+        if len >= self.n {
+            let key = Self::key(&self.tokens[len - self.n..]);
+            self.last_end.insert(key, (len - 1) as u32);
+        }
+        self.tokens.push(token);
+    }
+
+    fn extend(&mut self, tokens: &[u32]) {
+        for token in tokens {
+            self.push(*token);
+        }
+    }
+
+    fn draft(&self, max: usize) -> &[u32] {
+        let len = self.tokens.len();
+        if len < self.n {
+            return &[];
+        }
+        let suffix = &self.tokens[len - self.n..];
+        let Some(&end) = self.last_end.get(&Self::key(suffix)) else {
+            return &[];
+        };
+        let end = end as usize;
+        // A hash collision: the tokens decide.
+        if end + 1 >= len || end + 1 < self.n || self.tokens[end + 1 - self.n..=end] != *suffix {
+            return &[];
+        }
+        &self.tokens[end + 1..len.min(end + 1 + max)]
+    }
+}
 
 fn accepted(draft: &[u32], rest: &[u32]) -> usize {
     draft.iter().zip(rest).take_while(|(a, b)| a == b).count()

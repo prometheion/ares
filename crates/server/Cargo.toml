@@ -1,6 +1,6 @@
 [package]
 name = "ares-server"
-description = "HTTP front end of the engine: OpenAI-compatible completions and the System One decision API over an Engine"
+description = "The ares binary: loads a model onto the devices and serves it over an OpenAI-compatible HTTP API"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -17,7 +17,13 @@ path = "src/main.rs"
 [dependencies]
 ares-api = { path = "../api" }
 ares-core = { path = "../core" }
+# Devices are chosen, opened and described here before the runtime gets them.
+ares-cuda.workspace = true
 ares-gguf = { path = "../gguf" }
+ares-model = { path = "../model" }
+ares-runtime = { path = "../runtime" }
+# The variables of a chat template that are set at start.
+ares-tokenizer.workspace = true
 
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
 futures-util = { version = "0.3", default-features = false }

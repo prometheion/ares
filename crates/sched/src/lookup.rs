@@ -9,9 +9,9 @@
 //! and [`LookupDrafter`] is one sequence's place in it. For the current end
 //! of a sequence it finds the **longest** suffix that occurred before,
 //! anywhere, in this request or another, and proposes what followed its most
-//! recent occurrence. [`NgramDrafter`](crate::NgramDrafter) looks at the last
-//! `n` tokens of its own sequence only: it cannot tell two places apart that
-//! end in the same `n` tokens, and it knows nothing of other requests.
+//! recent occurrence. A lookup by the last `n` tokens of one sequence, which
+//! this replaced, cannot tell two places apart that end in the same `n`
+//! tokens, and it knows nothing of other requests.
 //!
 //! # Why an automaton
 //!
@@ -479,10 +479,8 @@ impl LookupCorpus {
     }
 }
 
-/// One sequence's place in a [`LookupCorpus`]: what [`NgramDrafter`] is for
-/// one sequence alone, with the corpus passed to every call.
-///
-/// [`NgramDrafter`]: crate::NgramDrafter
+/// One sequence's place in a [`LookupCorpus`], with the corpus passed to
+/// every call.
 #[derive(Clone, Debug)]
 pub struct LookupDrafter {
     len: usize,
@@ -776,12 +774,6 @@ mod tests {
         // the first function, which went on with 100.
         assert_eq!(draft(&mut drafter, &corpus, 2), [100, 101]);
         assert_eq!(drafter.matched(&corpus).map(|m| m.len), Some(6));
-
-        let mut ngram = crate::NgramDrafter::new(3);
-        ngram.extend(&first);
-        ngram.extend(&second);
-        ngram.extend(&[50, 1, 2, 3, 7, 8, 9]);
-        assert_eq!(ngram.draft(2), [200, 201], "the n-gram lookup takes the wrong place");
     }
 
     #[test]
@@ -844,10 +836,6 @@ mod tests {
         third.extend(&mut corpus, &document);
         assert_eq!(draft(&mut third, &corpus, 5), answer[..5]);
         assert_eq!(third.matched(&corpus).map(|m| m.len), Some(40));
-        // The n-gram lookup of that request knows only its own text.
-        let mut ngram = crate::NgramDrafter::new(3);
-        ngram.extend(&document);
-        assert!(ngram.draft(5).is_empty());
 
         // Requests that run at the same time keep their texts apart: each
         // continues its own, token by token, in any interleaving.
