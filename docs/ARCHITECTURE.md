@@ -629,11 +629,24 @@ held back, on the device, only when it is a whole ring ahead. In both, the
 order between devices is kept on the devices; the host does not wait. Two
 routes:
 
-- **Peer**: directly between the devices over PCIe. Consumer cards need
-  patched NVIDIA kernel modules and the matching driver library, which is
-  selected with `ARES_LIBCUDA=<path>/libcuda.so.1`. The mesh uses this route
-  whenever every pair of devices has peer access.
+- **Peer**: directly between the devices. The mesh takes this route whenever
+  the driver reports peer access for every pair of devices, however the
+  system comes by it: an NVLink bridge, cards and drivers that allow
+  peer-to-peer over PCIe as they are, or consumer cards with patched NVIDIA
+  kernel modules and the matching driver library (selected with
+  `ARES_LIBCUDA=<path>/libcuda.so.1`). Nothing in the engine is specific to
+  the patched driver, but that is the only kind of peer access the
+  development machine has: NVLink and unpatched peer-to-peer are untested.
 - **Host**: through a page-locked buffer.
+
+Peer transfers are not a CUDA matter alone. The Vulkan backend, which is
+what AMD and Intel cards run on, has no mesh yet; it gets the same two
+things with the routes Vulkan offers (memory of one device imported by
+another, device groups, shared page-locked host memory), chosen by probing.
+Still to do on the CUDA side: a route per pair of devices instead of one for
+the whole mesh, the kind of link in the start-up report, and a probe of
+whether kernels can read peer memory (they can with real peer-to-peer, which
+would allow pulling instead of pushing).
 
 Measured on RTX 4070 (PCIe x16) + RTX 3060 (PCIe 3.0 x4), `examples/linkbench`,
 2026-11-09:

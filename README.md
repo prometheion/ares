@@ -53,10 +53,11 @@ ARES_TEST_VULKAN=1 cargo test -p ares-vulkan --test gpu -- --test-threads=1
 
 `ARES_TEST_GGUF=<model.gguf>` adds checks against a real model.
 
-Peer-to-peer transfers between consumer cards need patched NVIDIA kernel
-modules and the matching driver library. Point the engine at that library with
-`ARES_LIBCUDA=<path>/libcuda.so.1`; without it, transfers between devices go
-through host memory.
+Transfers between GPUs go directly from device to device when the driver
+reports peer access (NVLink, or cards and drivers that allow peer-to-peer over
+PCIe), and through host memory otherwise. Consumer NVIDIA cards get peer access
+with patched kernel modules and the matching driver library; point the engine
+at that library with `ARES_LIBCUDA=<path>/libcuda.so.1`.
 
 ## Layout
 
