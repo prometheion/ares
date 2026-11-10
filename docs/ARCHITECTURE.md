@@ -1165,22 +1165,35 @@ GPU that CUDA 13 does not run on.
   3060 (194 GB/s). The straight port of the CUDA baseline's layout measures
   69 and 30 GB/s on Vulkan, which points at that layout, not at the backend,
   as what holds the CUDA baseline back.
-- Prefill runs on the tensor cores through cooperative matrices, for all 28
-  weight types through a decoder per type, and for Q4_K also on the
-  rearranged form, which has the same bytes as CUDA's, so one upload format
-  serves both backends. Measured 2026-11-10 at 1024 rows, 17408 x 5120, RTX
-  4070 / RTX 3060: rearranged Q4_K with `f16` accumulation 87.2 / 39.0 TOPS
-  (CUDA: 79 / 34), IQ4_XS 45.4 / 19.7 (CUDA: 82.8 / 37.4), Q6_K 34.0 / 15.4
-  (CUDA: 56.7 / 24.9). The register kernel for Q4_K is the fastest prefill
-  kernel in the engine and is to be carried back to CUDA; the types without
-  a rearranged form are behind CUDA on Vulkan.
+- The twelve weight types that have a device layout on CUDA have it on
+  Vulkan too, rearranged by a shader into the same bytes
+  (`ares_quant::layout` is the specification both are tested against byte
+  for byte), so one upload format serves both backends. One family of
+  kernels on cooperative matrices serves every row count from that copy,
+  from the first row, with a table per device from a measurement at load
+  and the same API as CUDA's. The other types run their file-layout kernels
+  (integer dot products for few rows, cooperative matrices through a decoder
+  per type for many). Measured 2026-11-11, a pass over all weights of
+  Qwen3.8-27B on the two cards (split 0.625 / 0.375), device layout against
+  file layout: one row 21.9 against 21.6 ms, eight rows 24.0 against 40.7,
+  sixteen 33.6 against 96.8, sixty-four 68.1 against 102.4. CUDA's device
+  layout takes 23.4, 25.4, 31.0 and 69.7 ms for the same passes. At 1024
+  rows a Q4_K matrix runs at 88.5 / 39.9 TOPS on the RTX 4070 / RTX 3060
+  and Q6_K at 75.5 / 34.3 *(measured by the agent that built the kernels;
+  CUDA: 88.8 / 39.3 and 74.5)*.
+- The layer kernels exist with CUDA's semantics and are held to the same
+  references. Attention, the expert and sampler kernels, the kernels of
+  `qwen4exp` and a model on Vulkan do not exist yet.
 - No direct route between the two cards works on this driver: an exported
   allocation is imported by the other card without an error and carries no
   data. Sums go through host pages that both cards import, at the speed of
   CUDA's host route (55 against 47 µs for 10240 values; CUDA's peer route
   takes 18). Direct routes are built and untested for lack of hardware.
-- The NVIDIA driver crashes at process exit when Vulkan devices are still
-  alive, so the engine drops its devices before it exits.
+- The NVIDIA driver (615.78) has crashed at process exit in both
+  directions: with devices still alive, and while destroying a device whose
+  shader compiler thread was still working after hundreds of pipelines had
+  been created. The tests leave without destroying their devices; the
+  engine needs the same care at shutdown.
 
 ## What is taken from where
 
