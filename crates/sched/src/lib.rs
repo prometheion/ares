@@ -14,6 +14,9 @@
 //!   generating sequences their newest token first, then the option rows of
 //!   decisions, then drafts, and prompts the rest, bounded so that a long
 //!   prompt slows generation and decisions by a chosen factor and no more.
+//! - [`Pass`] is the other order for long prompts of a model whose experts
+//!   are fetched: all rows up to a layer's router, then that layer's experts
+//!   for all rows, then on, so that a prompt fetches each expert once.
 //! - [`StepTimeModel`] learns what a step costs from the steps that ran.
 //! - [`best_draft_len`] picks how many draft tokens to verify, from measured
 //!   acceptance and cost, and with that also which drafter to use.
@@ -23,10 +26,12 @@
 
 mod draft;
 mod ngram;
+mod pass;
 mod plan;
 mod timing;
 
 pub use draft::{Acceptance, DraftChoice, DraftCost, best_draft_len};
 pub use ngram::NgramDrafter;
+pub use pass::{Pass, PassStep, Point, pass_rows_between, runs_as_pass};
 pub use plan::{Limits, Part, PartKind, Plan, Request, SeqId, Want, plan, prefill_rows_next_to};
 pub use timing::StepTimeModel;

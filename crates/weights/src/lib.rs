@@ -13,6 +13,9 @@
 //! - [`SlotSet`] is one tier of one layer: a fixed number of slots, filled
 //!   with the hottest experts and re-elected as the heat moves, with swaps
 //!   that only take effect once their data has arrived.
+//! - [`ExpertWaves`] divides the experts a layer needs for a whole prompt into
+//!   waves that fit the space for them, so that a prompt fetches each expert
+//!   once.
 //! - [`SlotSet::write_route_bias`] turns a tier into a routing constraint:
 //!   the router may be told to prefer or to use only the experts that are
 //!   already there. Re-deciding that set every few tokens is dynamic expert
@@ -24,5 +27,7 @@
 //! files; they act on the [`Swap`]s decided here.
 
 mod expert;
+mod waves;
 
 pub use expert::{ExpertHeat, SlotSet, Swap, SwapRule};
+pub use waves::{ExpertWaves, Place, Wave, recency_weight};

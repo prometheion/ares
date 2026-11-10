@@ -50,6 +50,18 @@ impl ExpertHeat {
         }
     }
 
+    /// Records the picks of many rows at once: `counts[e]` picks of expert
+    /// `e` in `layer`, each counting `weight`. A prefill pass has the routing
+    /// of a whole prompt per layer in this form; weighting the prompt's chunks
+    /// by their distance from its end
+    /// ([`recency_weight`](crate::recency_weight)) makes the tiers that are
+    /// elected before the reply follow what the end of the prompt used.
+    pub fn record_counts(&mut self, layer: usize, counts: &[u32], weight: f32) {
+        for (heat, count) in self.layer_mut(layer).iter_mut().zip(counts) {
+            *heat += *count as f32 * weight;
+        }
+    }
+
     /// Ages all heat by one step.
     pub fn decay(&mut self) {
         for heat in &mut self.heat {

@@ -101,8 +101,8 @@ machine (RTX 4070 + RTX 3060, Qwen3.8-27B) or read from the engines listed in
 | `ares-state` | Page pool, page tables with copy on write, prefix index with checkpoints, page layouts | Done; randomised model check |
 | `ares-store` | State on disk: pages and checkpoints by content hash in segment files, per fingerprint, with a size limit | Done as a store of opaque bytes, tested against restarts, the limit and damaged files; not yet connected to devices |
 | `ares-io` | Reads of weights straight from the model file: io_uring with direct I/O, demand before prefetch, cancel and promote, copies of a file on several drives with the reads spread over them, a map from experts to file ranges, row reads behind a cache | Done, tested against real files and on two drives; 1.4 to 1.7 GiB/s of random expert-sized reads per SSD of the development machine and 2.9 to 3.0 GiB/s over both; not yet connected to devices |
-| `ares-sched` | Step planner (generation, decision rows and prompts in one step), step time model, draft length choice, n-gram drafter | Done, unit tested |
-| `ares-weights` | Expert heat, tier election with two-phase swaps, routing bias for pruning | Done, unit tested |
+| `ares-sched` | Step planner (generation, decision rows and prompts in one step), the order of a pass for long prompts of a model with experts, step time model, draft length choice, n-gram drafter | Done, unit tested |
+| `ares-weights` | Expert heat, tier election with two-phase swaps, the waves of experts of a pass, routing bias for pruning | Done, unit tested |
 | `ares-api` | Request, event, decision and error types; the `Engine` trait between HTTP and the runtime (`submit` for generation, `decide` for decisions) | Done, unit tested |
 | `ares-server` | OpenAI-compatible HTTP server, `POST /v1/systemone` (wire-compatible with llama.cpp's, served for any model) and the `ares` binary | Done as a front end, tested against a mock engine; answers that no model architecture is implemented until the runtime exists |
 | `ares-runtime` | The conductor thread and one thread per device, the step loop that connects plan, state and kernels, speculation with the n-gram drafter, the `Model` trait a model implements, a synthetic model that drives the real kernels | Done as a skeleton; 71 tests and 10 GPU tests on one device, tensor split and layer split; implements `Engine::submit` (not `decide`), greedy picks only, no prefix cache, no real model |
@@ -416,7 +416,8 @@ pages) and comes with the runtime.
   and 8.3 ms; a lone read takes 1.4 ms, the time of the faster drive. The
   copies must be identical: sizes are compared and contents sampled at open.
   The price is the disk space of the copy.
-- **Prefill of a MoE model, layer by layer** (planned). A long prompt uses
+- **Prefill of a MoE model, layer by layer** (the order and the waves are
+  built, running them is not). A long prompt uses
   most experts of every layer. Run in chunks of rows through the whole
   model, it fetches them again for every chunk, from the SSD or over PCIe
   from RAM. The other order fetches each expert about once per prompt: a
@@ -426,12 +427,28 @@ pages) and comes with the runtime.
   experts found this to be the largest effect on long prompts (Run My AI:
   954 GiB read for a 4k prompt in batches of 16 tokens without it, about one
   read per expert with it; TheCodacus: 16 to about 300 tokens/s on a 16.7k
-  prompt; none of these numbers was reproduced here). It needs a second kind
-  of step in the planner and the conductor (a range of layers for all prompt
-  rows), a wave planner in `ares-weights`, the hidden states of all prompt
-  rows kept between layer groups, and turns for generating requests between
-  groups. At the end of a prompt the tiers are elected from the prompt's own
-  routing, weighted to its end.
+  prompt; none of these numbers was reproduced here).
+
+  `ares_sched::Pass` is that order: all rows of the prompt, in chunks that
+  fit a step, up to the router of the first layer with experts; then that
+  layer's experts for all rows; then all rows on to the next router. A
+  prompt runs as a pass when the model's experts are fetched and the prompt
+  does not fit into one step (`runs_as_pass`); `pass_rows_between` sizes the
+  pieces so that generating sequences, which get their ordinary steps
+  between the pieces, are slowed by the chosen factor and no more.
+  `ares_weights::ExpertWaves` divides the experts a layer needs into waves
+  that fit the room for them: what is in host memory before what is on disk,
+  the most used first, each expert in one wave. At the end of a prompt the
+  tiers are elected from the prompt's own routing, its end weighing most
+  (`ExpertHeat::record_counts` with `recency_weight`). On a synthetic prompt
+  of 4096 tokens over 256 experts with room for 32 at a time, a layer
+  fetches 224 experts once when it sees the whole prompt, and 5243 times one
+  (23 times each) when the prompt comes in chunks of 64 rows.
+
+  What is missing is everything that computes: the conductor that runs the
+  pieces and keeps the hidden states of all prompt rows between them, the
+  kernels that compute a wave for the rows routed to it, and a model with
+  experts.
 - **More from the engines that stream experts** (planned; details and
   numbers in [reference/moe-offload-survey.md](reference/moe-offload-survey.md)):
   the RAM tier as a cache in front of the SSD (admission when a read
