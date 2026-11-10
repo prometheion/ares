@@ -143,10 +143,10 @@ machine (RTX 4070 + RTX 3060, Qwen3.8-27B) or read from the engines listed in
 | `ares-quant` | CPU reference decoder for every GGUF type; the specification and reference codec of the engine's own KV formats (`f16`, `q8` to `q4`, tiles with a mean, the policy of exact cells) | Done; bit-identical to ggml's C code on fixtures generated from it; the KV formats are pinned by golden files and were measured on the K and V of real models |
 | `ares-cuda` | Driver API bound at run time, devices, memory, streams, events, modules, decode weight kernels for all 28 weight types, prefill weight kernels for eleven, the layer kernels of `qwen35`, attention over the stored K/V formats, the mesh that sums across devices over peer access or the host | Device layer, decode, layer and attention kernels done; prefill kernels verified, their pass over the weights 1.3 times as fast as the fork's whole prefill; tested on both GPUs, with and without peer access |
 | `ares-vulkan` | The same device-level surface on Vulkan, the same first kernels as compute shaders | Done; 23 device tests pass on both GPUs |
-| `ares-state` | Page pool, page tables with copy on write, prefix index with checkpoints, page layouts | Done; randomised model check |
+| `ares-state` | Page pool, page tables with copy on write, the prefix index (pages published as they fill, tails, announcements, priority classes), the checkpoint policy for recurrent state, page layouts | Done as bookkeeping; randomised model checks; the conductor does not use the new parts yet |
 | `ares-store` | State on disk: pages and checkpoints by content hash in segment files, per fingerprint, with a size limit | Done as a store of opaque bytes, tested against restarts, the limit and damaged files; not yet connected to devices |
 | `ares-io` | Reads of weights straight from the model file: io_uring with direct I/O, demand before prefetch, cancel and promote, copies of a file on several drives with the reads spread over them, a map from experts to file ranges, row reads behind a cache | Done, tested against real files and on two drives; 1.4 to 1.7 GiB/s of random expert-sized reads per SSD of the development machine and 2.9 to 3.0 GiB/s over both; not yet connected to devices |
-| `ares-sched` | Step planner (generation, decision rows and prompts in one step), the order of a pass for long prompts of a model with experts, step time model, draft length choice, n-gram drafter | Done, unit tested |
+| `ares-sched` | Step planner (generation, decision rows and prompts in one step), admission (pages claimed per step, a reservation that corrects itself, a queue instead of refusals), the order of a pass for long prompts of a model with experts, step time model with a term for the context, draft length choice, the lookup drafter on a suffix automaton shared by all sequences | Done as bookkeeping; unit and model tests; admission and the lookup drafter are not wired into the conductor yet |
 | `ares-weights` | Expert heat, tiers that are elected and fed by reads (admission, protection, guesses bound late, slots given back), slots per layer by need, the waves of experts of a pass, a token table for the first layers, the lookahead distance, routing bias for pruning | Done as bookkeeping, unit tested and tried on synthetic routing; no runtime uses it yet |
 | `ares-api` | Request, event, decision and error types; the `Engine` trait between HTTP and the runtime (`submit` for generation, `decide` for decisions) | Done, unit tested |
 | `ares-server` | OpenAI-compatible HTTP server, `POST /v1/systemone` (wire-compatible with llama.cpp's, served for any model) and the `ares` binary | Done as a front end, tested against a mock engine; answers that no model architecture is implemented until the runtime exists |
@@ -174,7 +174,10 @@ requests ──► plan ──► upload step record ──► window ──► 
    shortest first, starved ones before that. While anyone generates, the
    prompt share is capped at the rows that fit in an allowed slowdown
    (`prefill_rows_next_to`, from the measured cost line `base + per_row *
-   rows`).
+   rows`). `StepTimeModel` now also fits a cost per attended cell, because
+   attention grows with the context and a prompt chunk at 100 000 tokens
+   costs more than one at 1 000 (`prefill_rows_at`); the conductor still
+   calls the older form.
 2. **Step record.** Everything that varies per step (row to sequence and
    position, page-table changes, draft tokens) is written to one pinned
    buffer and uploaded with one copy per device. Kernels read it there, so
@@ -259,15 +262,77 @@ one array per part, indexed by page number.
   tool calls, n-best) cost only their own tails.
 - `PrefixIndex`: every full page is named by a chain hash of the context and
   all tokens up to its end. A new prompt walks its pages from the start and
-  takes the cached ones. The index holds pages after their sequence ended and
-  gives them up oldest first, from the ends of chains, when the pool runs
-  short. This one mechanism replaces per-slot prompt caches, slot similarity
-  matching and a separate conversation cache, and it is the key under which
-  pages will be written to disk.
+  takes the cached ones. This one mechanism replaces per-slot prompt caches,
+  slot similarity matching and a separate conversation cache, and it is the
+  key under which pages will be written to disk.
+  - A page enters the index when it fills, not when its sequence ends
+    (`publish`, called from the commit with the number of settled cells), so
+    two requests that start with the same prompt at the same time share from
+    the first full page. A sequence that finds its page cached already takes
+    the cached one and frees its own.
+  - A sequence announces the pages its prompt will fill. A second prompt
+    whose first missing page is announced is told so and is held back until
+    the page is published or the announcement withdrawn, instead of computing
+    the same rows next to the first. Only running sequences announce, so two
+    prompts cannot wait for each other.
+  - Tails: the partly used last page of a sequence is published under the
+    hash of the page before it, with its tokens; at most 8 per page, least
+    recently used first. A prompt that continues a tail starts at the real
+    end of the cached text and copies the tail's page before its first write,
+    which the page table does for any shared partly used page. A prompt may
+    take any leading part of a tail, so a tail may hold only cells whose
+    stored form depends on no later cell: any row of `f16` and `q8`, and with
+    `q7` to `q4` exact cells only. A page is one tile there, and a tile is
+    converted only when it is full and has left the newest window, so the
+    partly used last page is always exact and is published at the commit
+    that ends in it. A full page that was converted cannot serve a part of
+    itself: its rows hang on the tile's mean and cannot be continued.
+  - The last token of a prompt is always computed, because its logits are
+    needed: the prompt is looked up without it.
+  - Eviction takes pages nobody holds from the ends of chains, a lower
+    priority class before a higher one whatever their age, and within a
+    class the least recently used. `evictable` counts what can go.
 - Checkpoints: state that is not addressable by position (recurrent layers)
-  can only be resumed where a checkpoint exists, so checkpoints attach to
-  index entries and `PrefixMatch::last_checkpoint` says how far a prompt can
-  resume.
+  can only be resumed where a copy of it was kept, and a copy is large (75
+  MiB as `f16` for Qwen3.8-27B), so `CheckpointPolicy` decides where copies
+  go and which are dropped. Storing them is not built.
+  - Where: only at page boundaries and at the end of a tail. Inside a prompt
+    at least 32 768 cells apart, while generating at least 2 048, measured
+    from the last checkpoint on the sequence's own path; always at the
+    prompt's anchor, the last page boundary at least one row before the
+    prompt's end, where the next turn of a conversation resumes; and the live
+    state at the end of a request becomes the checkpoint of its tail. The
+    commit takes a checkpoint when it crosses one of these positions.
+  - What a prompt replays: K and V are taken from every cached page and from
+    a tail, however far the last checkpoint is behind them. The rows between
+    that checkpoint and the end of the cached cells run again to rebuild the
+    recurrent state; they read K and V and write none. That keeps the pages
+    shared and saves the writes (and the scale search of the low-bit
+    formats), not the rows' time: `Resume` names the checkpoint, the replayed
+    rows and the computed rows.
+  - Which go when the byte budget is full: first the checkpoints that later
+    requests have left behind (more than a set number of later requests have
+    checkpoints below them, on one branch; a checkpoint where texts branch
+    is never such), then the one with the least distance to the next
+    checkpoint toward the start of the text, which is the rows a resume
+    replays more without it, then the least recently used. A checkpoint goes
+    without its K/V page; a page evicted from the end of a chain takes its
+    checkpoint along.
+- Admission (`ares_sched::Admission`): nothing is reserved for a request's
+  longest possible length. Pages are claimed per step. A reservation covers
+  the rest of the running prompts and the output they are expected to
+  produce: `min(tokens left, 4096)` times a ratio that every finished request
+  moves toward the share of its allowance it really used and that a shortage
+  raises. A new request is charged for the pages of its prompt after the
+  prefix match and its clipped allowance in full, and waits when that does
+  not fit; nothing is refused for load, and a request that is alone always
+  starts. Waiting requests are tried with the fewest uncached rows first; one
+  that was passed over too often goes first and holds the others back. A
+  step's claims are settled against a copy of the counters: cached pages are
+  evicted first, draft rows are cut before anyone gives way, then the
+  sequence with the fewest generated tokens is spilled, and victims that
+  turn out not to be needed stay. The object decides and reports; the
+  conductor does not use it yet.
 - Decisions ("Jev mode"): choosing among fixed options (a label, a tool, the
   fields of a schema) needs no generation. The options are scored from the
   logits after the shared prompt, and options longer than one token are
@@ -399,7 +464,7 @@ have, with the fork's selection on top:
 
 | Part | What it is | State |
 | --- | --- | --- |
-| Lookup drafter | Continues an earlier occurrence of the current text. A simple n-gram lookup per sequence exists. It is to become one suffix automaton over a corpus that all sequences share (TensorRT-LLM, SGLang, vLLM's suffix decoding), which finds the longest match and matches across requests; llama.cpp's map and cache variants are not built | `NgramDrafter` done; the automaton is next |
+| Lookup drafter | Continues the longest earlier occurrence of the current text, in this request or another: one suffix automaton over a corpus that all sequences share (`LookupCorpus`, `LookupDrafter`; after TensorRT-LLM, SGLang and vLLM's suffix decoding), with a confidence per proposed token and a bound on memory. It replaces the n-gram lookup per sequence; llama.cpp's map and cache variants are not built | Done and measured on text; the runtime still uses `NgramDrafter` |
 | MTP | The model's own draft head or block | With the model |
 | DFlash, DSpark, DFlash2 | A small draft model that reads the target's hidden states at a few layers and proposes a block of tokens at once | With the runtime: it needs taps on the target's layers and a second model on the same devices |
 | Drafter selection | Per sequence and step, the drafter with the highest expected tokens per millisecond, from measured acceptance and cost; drafters that were not chosen keep learning from what was accepted | `best_draft_len` and `Acceptance` done; the selector object that holds them per drafter is next |
@@ -414,6 +479,50 @@ table the verify window reads (SGLang), and reach the host together with the
 picks; carrying it through the host would put a copy out and back between two
 kernels of the same device at every step. A draft is cut at the first token
 the grammar refuses before it is verified (vLLM).
+
+**The lookup drafter.** An automaton and not a trie of runs, because the
+longest match of a sequence's end is then not searched for at all: it is
+where the suffix links of the sequence's own state lead, an insertion is
+constant work, and a token costs two states and three transitions whatever
+the match length, where a trie of runs up to `d` tokens costs `d` nodes and
+`d` lookups per token and never matches more than `d`. An automaton cannot
+forget, so the corpus is two of them: when the young one is full the old one
+is dropped and the young one becomes the old. Text is found for one to two
+automata's worth of tokens (64 MiB hold 260 000 to 520 000). Each state
+keeps where its most recent occurrence went on and how many of its
+occurrences went on, and the confidence of a proposed token is read from a
+table by the length of the matched context and by how its earlier
+occurrences went on (once; always this way; mostly; seldom). The table
+starts from measured acceptance and follows what verification reports.
+
+Measured 2026-11-10 by replaying this repository's own text (153 000 tokens
+of documentation, 629 000 of Rust, 598 of German; vocabulary of Qwen3.5), a
+proposal counted as accepted as far as it equals the text. No model ran, and
+the tokens per second are computed from the step cost of Qwen3.8-27B on the
+development machine (33 ms and 1.1 ms per row, 29.3 tokens/s without
+drafts), drafts of at most 16 tokens:
+
+| Text and replay | n-gram of 3, per request | Lookup, shared corpus, length by confidence |
+| --- | --- | --- |
+| English, written from nothing | 0.19 proposals per token, 0.98 accepted per proposal, 2.78 wasted rows per token, 32.3 tokens/s | 0.32, 0.72, 0.79, 36.7 tokens/s |
+| English, the prompt written again with edits | 0.14, 5.91, 1.37, 121 tokens/s | 0.08, 11.7, 0.24, 223 tokens/s |
+| English, a file an earlier request wrote | 32.0 tokens/s (it knows one request) | 223 tokens/s |
+| Rust, written from nothing | 0.16, 1.65, 2.23, 36.1 tokens/s | 0.41, 1.07, 1.41, 46.9 tokens/s |
+| Rust, the prompt written again with edits | 0.11, 7.72, 0.89, 147 tokens/s | 0.08, 12.1, 0.25, 223 tokens/s |
+| German, the prompt written again with edits | 0.06, 15.1, 0.03, 240 tokens/s | 0.07, 13.2, 0.06, 238 tokens/s |
+
+The gain in copied text comes from taking the right place: the last three
+tokens often end several places, and the n-gram lookup continues the most
+recent one. In text written from nothing the automaton proposes more often
+and is wrong more often per proposal; it pays only because the confidence
+cuts those drafts short (with every draft at full length it gives 30.5
+tokens/s on English, less than the n-gram lookup). The German sample is two
+short files and says nothing about German: there the confidence, which was
+measured on English and code, cuts drafts that would have been accepted (238
+against 256 tokens/s at full length). On the host a token costs about 0.2
+microseconds to read and a draft 0.4, eight and thirty times the n-gram
+lookup's cost; a long prompt is therefore read into the corpus as its rows
+are committed, not at once.
 
 Adaptive draft length did not pay off in the llama.cpp fork (a few percent up
 for English and code, a few percent down for German). Two of its costs there
@@ -958,7 +1067,8 @@ GPU that CUDA 13 does not run on.
 | TensorRT-LLM, LMDeploy, mistral.rs | 4-bit re-encoding of cold pages, sampling sharded per GPU, int8 KV with per-head ranges, transition-log rollback | Planned |
 | Marlin, ExLlamaV3, LMDeploy, TensorRT-LLM (their kernels) | Weights rearranged at load into the order the tensor cores read them and decoded in registers; `f16` accumulators folded into `f32` on capped cards; one decode of a matrix and a dense product for wide steps; the shape of the attention kernels; bit planes for K/V codes | `ares-quant` (planes done); `ares-cuda` prefill and attention kernels (in progress) |
 | FlashInfer | Attention as states that merge (`lse`, `v`), so a head is computed over any split of its cells; block-sparse attention over a block table | `ares-quant::kvhead` (reference done); kernels in progress |
-| vLLM, SGLang, TGI, TokenSpeed (their schedulers) | Pages claimed per step with a reservation for the output still expected; a request waits when it does not fit; prefix pages published when they fill, with tails; checkpoint intervals for recurrent state | Planned, see [Next steps](#next-steps) |
+| vLLM, SGLang, TGI, TokenSpeed, LMDeploy, ExLlamaV3 (their schedulers and caches) | Pages claimed per step with a reservation for the output still expected; a request waits when it does not fit; prefix pages published when they fill, with tails; checkpoint intervals and eviction for recurrent state; a context term in the step cost | `ares-sched`, `ares-state` (done as bookkeeping, not wired into the conductor) |
+| TensorRT-LLM, SGLang, vLLM (suffix decoding) | One lookup drafter on a suffix automaton over a corpus shared by all requests | `ares-sched` (done, not wired) |
 | MiniJinja | The interpreter of chat templates | `ares-tokenizer` |
 | llguidance | Grammar-constrained output by validating the GPU's top candidates on the CPU | Planned |
 | AirLLM | Nothing beyond the expert tiers: reading whole layers per pass is bounded by disk throughput | - |
@@ -1028,27 +1138,22 @@ the source of each item is named there.
    `p / p_max`, exact cut-offs from a radix descent, the pick by noise keyed
    by seed, position and token, the best candidates per row recorded for the
    grammar, penalties as sparse lists from the host.
-3. Admission in `ares-sched` and `ares-runtime`. Today a request reserves
-   its longest possible length and is refused when that does not fit, which
-   is a slot under another name. Instead: pages are claimed per step, a
-   reservation covers the output that running requests are expected to
-   produce and corrects itself, a new request is charged only for the rows
-   after its prefix match and waits when it does not fit, and when the pool
-   is short the sequence with the fewest generated tokens is spilled.
+3. Wiring what `ares-sched` and `ares-state` now decide into the conductor:
+   admission in place of the reservation of a request's longest possible
+   length (which is a slot under another name), the prefix index with tails
+   and held-back prompts, the checkpoint policy, the lookup drafter, the
+   step cost with its context term. The paths they need do not exist in the
+   runtime yet: spilling and restoring a sequence, storing a checkpoint, and
+   rows that are replayed without writing K and V.
 4. `ares-runtime` beyond the skeleton: wider steps through the prefill
    kernels, decisions (`Engine::decide`), and steps that overlap. The rules
    for overlap: the pick stays in a device table the next step reads, a
    finish by end token is seen one step late and its row dropped, pages freed
    by a commit are reusable only after the step in flight, and a restore is
-   issued per layer with an event the forward stream waits for. The step-time
-   model gets a term for the context length. The Vulkan backend.
-5. The prefix cache: a page enters the index when it fills, tails let a
-   prompt resume at the real end of the cached text, and a prompt is held
-   back while another computes the page it misses. The checkpoint policy for
-   recurrent state (150 MiB per checkpoint for Qwen3.8-27B): dense intervals
-   while generating, sparse in a prompt, always one at the prompt's last page
-   boundary; replay over cached pages without K/V writes; stored compressed
-   if the measurement of narrower state holds.
+   issued per layer with an event the forward stream waits for. The Vulkan
+   backend.
+5. Checkpoints stored in `f16` (75 MiB for Qwen3.8-27B; measured to cost
+   nothing visible), in VRAM, RAM and on disk under the policy's budget.
 6. The two test models, side by side. `qwen35`: Qwen3.8-27B assembled from
    the kernels on both cards and compared with the llama.cpp fork (35.7
    tokens per second without drafts, about 1180 tokens per second of
@@ -1063,9 +1168,10 @@ the source of each item is named there.
    over K/V in pinned RAM), background writes and restores, and suspension
    of a request as a byte copy, which doubles as the test oracle for all
    state handling.
-8. Speculation: the suffix automaton, model drafts kept on the device, a
-   budget of draft rows across requests by survival probability, then the
-   draft heads and draft models.
+8. Speculation: model drafts kept on the device, a budget of draft rows
+   across requests by survival probability, the draft heads (MTP of both
+   test models) and draft models, and a measurement of the lookup drafter on
+   German text and with a real model.
 9. Structured output with llguidance on the GPU's candidates; forced tokens
    as rows that are neither sampled nor verified; the mask filled while the
    device computes; requests whose grammar is compiling in their own queue;

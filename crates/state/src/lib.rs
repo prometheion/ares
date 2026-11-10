@@ -17,7 +17,14 @@
 //! - **Shared prefixes.** Pages are reference counted. A [`Sequence`] forked
 //!   from another, or started from a cached prompt through the
 //!   [`PrefixIndex`], reads the same pages and copies only the page it writes
-//!   into ([`CopyOnWrite`]).
+//!   into ([`CopyOnWrite`]). A page enters the index when it fills
+//!   ([`PrefixIndex::publish`]), a partly used last page as a tail
+//!   ([`PrefixIndex::insert_tail`]), and a prompt is told when the page it
+//!   misses is being computed by another sequence
+//!   ([`PrefixMatch::computing`]).
+//! - **Checkpoints of recurrent state.** Where they are taken, which are
+//!   dropped when their budget is full, and which rows a prompt replays from
+//!   the last one is the [`CheckpointPolicy`].
 //! - **Sparse reads and offload.** Attention that selects blocks of cells
 //!   (Qwen4-style indexers) reads through the page table, so only the pages a
 //!   step selects must be on the GPU. Pages are the unit that moves between
@@ -28,12 +35,17 @@
 //! (the arrays, the copies a [`CopyOnWrite`] asks for, the page-table upload)
 //! belongs to the backends.
 
+mod checkpoint;
 mod layout;
 mod pool;
 mod prefix;
 mod sequence;
 
+pub use checkpoint::{CheckpointPolicy, CheckpointRank, Resume};
 pub use layout::PageLayout;
 pub use pool::{PageId, PagePool};
-pub use prefix::{ChainHash, CheckpointId, Evicted, PrefixIndex, PrefixMatch};
+pub use prefix::{
+    Chain, ChainHash, CheckpointId, Evicted, MAX_TAILS, Owner, PageState, PrefixIndex, PrefixMatch,
+    Priority, TailMatch,
+};
 pub use sequence::{CopyOnWrite, Grown, OutOfPages, Sequence};

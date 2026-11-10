@@ -14,6 +14,8 @@ pub struct PageId(pub u32);
 pub struct PagePool {
     cells_per_page: u32,
     refcount: Vec<u32>,
+    /// Whether the prefix index is one of the holders of a page.
+    cached: Vec<bool>,
     /// Free pages; the last entry is handed out next. Low numbers go out
     /// first, so a pool that is mostly empty stays compact at the front.
     free: Vec<u32>,
@@ -30,6 +32,7 @@ impl PagePool {
         Self {
             cells_per_page,
             refcount: vec![0; n_pages as usize],
+            cached: vec![false; n_pages as usize],
             free: (0..n_pages).rev().collect(),
         }
     }
@@ -49,6 +52,18 @@ impl PagePool {
     /// How many holders page `id` has.
     pub fn refcount(&self, id: PageId) -> u32 {
         self.refcount[id.0 as usize]
+    }
+
+    /// Whether the prefix index holds page `id` (as a cached page or as a
+    /// tail).
+    pub fn is_cached(&self, id: PageId) -> bool {
+        self.cached[id.0 as usize]
+    }
+
+    /// Records whether the prefix index is among the holders of page `id`.
+    pub(crate) fn set_cached(&mut self, id: PageId, cached: bool) {
+        debug_assert!(self.refcount[id.0 as usize] > 0, "a free page is not cached");
+        self.cached[id.0 as usize] = cached;
     }
 
     /// Takes a free page with one holder, or `None` when the pool is empty.
@@ -72,6 +87,7 @@ impl PagePool {
         assert!(*count > 0, "page {} was released more often than held", id.0);
         *count -= 1;
         if *count == 0 {
+            debug_assert!(!self.cached[id.0 as usize], "the index let go without saying so");
             self.free.push(id.0);
         }
     }

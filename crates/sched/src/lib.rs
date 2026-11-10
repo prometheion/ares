@@ -17,21 +17,37 @@
 //! - [`Pass`] is the other order for long prompts of a model whose experts
 //!   are fetched: all rows up to a layer's router, then that layer's experts
 //!   for all rows, then on, so that a prompt fetches each expert once.
-//! - [`StepTimeModel`] learns what a step costs from the steps that ran.
+//! - [`StepTimeModel`] learns what a step costs from the steps that ran: a
+//!   base, a cost per row and a cost per cell of context that a row reads.
 //! - [`best_draft_len`] picks how many draft tokens to verify, from measured
 //!   acceptance and cost, and with that also which drafter to use.
-//! - [`NgramDrafter`] proposes drafts by continuing an earlier occurrence of
-//!   the current text, which is what makes copying (file edits, quoted code)
-//!   several times faster than generating.
+//! - [`LookupCorpus`] and [`LookupDrafter`] propose drafts by continuing the
+//!   longest earlier occurrence of the current text, in any sequence: one
+//!   suffix automaton over everything the engine has read and written, with
+//!   a confidence per proposed token. This is what makes copying (file
+//!   edits, quoted code, a document sent again) several times faster than
+//!   generating. [`NgramDrafter`] is the lookup it replaces, per sequence
+//!   and by the last few tokens only; it stays until the runtime has
+//!   switched.
+//! - [`Admission`] decides who runs, who waits and who gives way: pages are
+//!   claimed per step, a reservation covers the output that is expected, a
+//!   request that does not fit waits, and a step's claims are settled against
+//!   a copy of the counters.
 
+mod admission;
 mod draft;
+mod lookup;
 mod ngram;
 mod pass;
 mod plan;
 mod timing;
 
+pub use admission::{Admission, AdmissionConfig, Arrival, Claims, ExceedsPool, Outcome, PoolView};
 pub use draft::{Acceptance, DraftChoice, DraftCost, best_draft_len};
+pub use lookup::{LookupConfig, LookupCorpus, LookupDrafter, LookupMatch};
 pub use ngram::NgramDrafter;
 pub use pass::{Pass, PassStep, Point, pass_rows_between, runs_as_pass};
-pub use plan::{Limits, Part, PartKind, Plan, Request, SeqId, Want, plan, prefill_rows_next_to};
-pub use timing::StepTimeModel;
+pub use plan::{
+    Limits, Part, PartKind, Plan, Request, SeqId, Want, plan, prefill_rows_at, prefill_rows_next_to,
+};
+pub use timing::{Load, StepCost, StepTimeModel};

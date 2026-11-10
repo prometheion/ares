@@ -93,6 +93,62 @@ impl Sequence {
         Some((self.pages[(cell / per_page) as usize], (cell % per_page) as u32))
     }
 
+    /// What appending `n` cells takes: the new pages, and whether the write
+    /// starts inside a partly used page that others hold too, which this
+    /// sequence then copies.
+    fn growth(&self, pool: &PagePool, n: u64) -> (u64, bool) {
+        if n == 0 {
+            return (0, false);
+        }
+        let per_page = u64::from(pool.cells_per_page());
+        let used_in_last = self.len % per_page;
+        let new_pages = (self.len + n).div_ceil(per_page) - self.pages.len() as u64;
+        let shared_tail =
+            used_in_last != 0 && pool.refcount(*self.pages.last().expect("a partly used page")) > 1;
+        (new_pages, shared_tail)
+    }
+
+    /// How many pages [`Sequence::append`] of `n` cells would take from the
+    /// pool: what a step claims for this sequence.
+    pub fn pages_to_append(&self, pool: &PagePool, n: u64) -> u32 {
+        let (new_pages, shared_tail) = self.growth(pool, n);
+        u32::try_from(new_pages + u64::from(shared_tail)).unwrap_or(u32::MAX)
+    }
+
+    /// How many of this sequence's pages no other sequence holds: the pages
+    /// that become free, or evictable where the prefix index holds them too,
+    /// when this sequence lets go of everything.
+    ///
+    /// The count is what eviction can really free as long as sequences enter
+    /// their pages through [`PrefixIndex::publish`](crate::PrefixIndex::publish):
+    /// then a sequence that holds a cached page holds the cached pages before
+    /// it as well, and no cached page it leaves behind has a holder below it.
+    pub fn releasable(&self, pool: &PagePool) -> u32 {
+        self.pages
+            .iter()
+            .filter(|page| pool.refcount(**page) == 1 + u32::from(pool.is_cached(**page)))
+            .count() as u32
+    }
+
+    /// Replaces page-table entry `index` by `page`, which holds the same
+    /// content and gains a holder; the page that was there loses one. This is
+    /// how a sequence gives up its own copy of a page that turned out to be
+    /// cached already.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `index` is not a full page of this sequence.
+    pub fn adopt(&mut self, pool: &mut PagePool, index: usize, page: PageId) {
+        let full = (self.len / u64::from(pool.cells_per_page())) as usize;
+        assert!(index < full, "page {index} of a sequence with {full} full pages");
+        if self.pages[index] == page {
+            return;
+        }
+        pool.retain(page);
+        pool.release(std::mem::replace(&mut self.pages[index], page));
+        self.clean = self.clean.min(index);
+    }
+
     /// Adds `n` cells at the end. Either everything needed is allocated or
     /// nothing changes.
     pub fn append(&mut self, pool: &mut PagePool, n: u64) -> Result<Grown, OutOfPages> {
@@ -102,11 +158,9 @@ impl Sequence {
         }
         let per_page = u64::from(pool.cells_per_page());
         let used_in_last = (self.len % per_page) as u32;
-        let new_pages = (self.len + n).div_ceil(per_page) - self.pages.len() as u64;
         // Writing starts inside the last page when it is partly used. If
         // others hold that page too, this sequence gets its own copy.
-        let shared_tail =
-            used_in_last != 0 && pool.refcount(*self.pages.last().expect("a partly used page")) > 1;
+        let (new_pages, shared_tail) = self.growth(pool, n);
 
         let needed = new_pages + u64::from(shared_tail);
         if needed > u64::from(pool.free_pages()) {
@@ -262,6 +316,53 @@ mod tests {
         assert_eq!(grown.copy.map(|c| (c.from, c.cells)), Some((a.pages()[1], 1)));
         // a still reads its 8 cells from untouched pages.
         assert_eq!(a.len(), 8);
+        a.release(&mut pool);
+        b.release(&mut pool);
+        assert_eq!(pool.free_pages(), 8);
+    }
+
+    #[test]
+    fn a_claim_is_what_an_append_takes() {
+        let mut pool = PagePool::new(8, 4);
+        let mut a = Sequence::new();
+        assert_eq!(a.pages_to_append(&pool, 0), 0);
+        assert_eq!(a.pages_to_append(&pool, 5), 2);
+        a.append(&mut pool, 5).unwrap();
+        assert_eq!(a.pages_to_append(&pool, 3), 0, "the second page has room");
+        assert_eq!(a.pages_to_append(&pool, 4), 1);
+        // A fork writes into a copy of the shared, partly used page.
+        let mut b = a.fork(&mut pool);
+        assert_eq!(b.pages_to_append(&pool, 1), 1);
+        assert_eq!(b.pages_to_append(&pool, 4), 2);
+        for n in [1u64, 3, 4, 9] {
+            let before = pool.free_pages();
+            let claim = b.pages_to_append(&pool, n);
+            b.append(&mut pool, n).unwrap();
+            assert_eq!(before - pool.free_pages(), claim, "{n} cells");
+        }
+        // What each would free: a shares its first page with b and no other.
+        assert_eq!(a.releasable(&pool), 1);
+        a.release(&mut pool);
+        assert_eq!(b.releasable(&pool), b.pages().len() as u32);
+        b.release(&mut pool);
+        assert_eq!(pool.free_pages(), 8);
+    }
+
+    #[test]
+    fn adopting_a_page_swaps_one_table_entry() {
+        let mut pool = PagePool::new(8, 4);
+        let (mut a, mut b) = (Sequence::new(), Sequence::new());
+        a.append(&mut pool, 9).unwrap();
+        b.append(&mut pool, 9).unwrap();
+        b.take_dirty();
+        // b computed the same first page as a: it reads a's from now on.
+        let own = b.pages()[0];
+        b.adopt(&mut pool, 0, a.pages()[0]);
+        assert_eq!(b.pages()[0], a.pages()[0]);
+        assert_eq!((pool.refcount(a.pages()[0]), pool.refcount(own)), (2, 0));
+        assert_eq!(b.take_dirty(), 0..3, "the table is uploaded again from the swapped entry");
+        b.adopt(&mut pool, 0, a.pages()[0]);
+        assert_eq!(pool.refcount(a.pages()[0]), 2, "adopting the page it has changes nothing");
         a.release(&mut pool);
         b.release(&mut pool);
         assert_eq!(pool.free_pages(), 8);
