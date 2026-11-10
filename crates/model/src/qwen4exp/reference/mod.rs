@@ -327,6 +327,7 @@ pub struct Reference<'a, 'g> {
     threads: usize,
     rule: SelectionRule,
     keep_residual: bool,
+    depth: usize,
 }
 
 impl<'a, 'g> Reference<'a, 'g> {
@@ -335,7 +336,14 @@ impl<'a, 'g> Reference<'a, 'g> {
     /// specification, and keeps the residual after every layer.
     pub fn new(config: &'a Config, weights: &'a Weights<'g>) -> Self {
         let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
-        Self { config, weights, threads, rule: SelectionRule::default(), keep_residual: true }
+        Self {
+            config,
+            weights,
+            threads,
+            rule: SelectionRule::default(),
+            keep_residual: true,
+            depth: usize::MAX,
+        }
     }
 
     /// Uses `threads` threads for the large multiplications, the experts and
@@ -356,6 +364,17 @@ impl<'a, 'g> Reference<'a, 'g> {
     /// ([`Window::residual`]); a row of a large model is megabytes.
     pub fn keep_residual(mut self, keep: bool) -> Self {
         self.keep_residual = keep;
+        self
+    }
+
+    /// Runs only the first `layers` layers of every window (all of them by
+    /// default; at least through the layer of the n-gram block). A commit of
+    /// such a window advances the state of those layers only, so what the
+    /// first layers compute and select over a long text can be read without
+    /// the cost of the others. Residual, final mix and logits of such a
+    /// window are not the model's.
+    pub fn first_layers(mut self, layers: usize) -> Self {
+        self.depth = layers;
         self
     }
 
@@ -417,7 +436,7 @@ impl<'a, 'g> Reference<'a, 'g> {
         let mut layers = Vec::with_capacity(c.n_layer);
         let mut routing = Vec::with_capacity(c.n_layer);
         let mut ngram = Vec::new();
-        for layer in 0..c.n_layer {
+        for layer in 0..c.n_layer.min(self.depth) {
             let kept = self.run_layer(layer, state, tokens, &mut r, observer);
             if self.keep_residual {
                 residual.push(r.clone());

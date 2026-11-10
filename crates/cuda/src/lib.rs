@@ -28,6 +28,7 @@ mod layers;
 mod memory;
 mod mesh;
 mod module;
+mod q4;
 mod stream;
 mod sys;
 
@@ -53,4 +54,9 @@ pub use stream::{Event, Stream};
 
 pub use experts::{
     EXPERT_MAX_EXPERTS, EXPERT_MAX_K, ExpertKernels, ExpertShape, RouteGroup, RouteRecord,
+};
+
+pub use q4::{
+    HAND_OVER_MAX_PIECES, IndexerShape, KeyFormat, ListHandOver, NgramShape, Q4Kernels,
+    SELECT_MAX_BLOCKS, SelectionRule,
 };

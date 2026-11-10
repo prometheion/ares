@@ -196,8 +196,9 @@ pub struct Synthetic {
     /// The element types of its tensors.
     pub types: Types,
     /// The type of the routed experts and of the n-gram table when it is not
-    /// `f32`: any type [`ares_quant::quantize`] writes whose block divides
-    /// the row widths. `None` leaves them `f32`.
+    /// `f32`: any type [`ares_quant::quantize`] writes, or IQ4_NL (the type
+    /// of the real n-gram table), whose block divides the row widths. `None`
+    /// leaves them `f32`.
     pub lazy_type: Option<GgmlType>,
 }
 
@@ -537,6 +538,7 @@ impl File {
             GgmlType::BF16 => {
                 values.iter().flat_map(|&v| ares_quant::f32_to_bf16(v).to_le_bytes()).collect()
             }
+            GgmlType::IQ4_NL => iq4_nl_rows(dims[0], values),
             other => {
                 // Row by row, so that every row is whole blocks.
                 let (cols, mut data) = (dims[0], Vec::new());
@@ -582,4 +584,32 @@ impl File {
         }
         out
     }
+}
+
+/// Rows of `cols` values as IQ4_NL blocks: per block of 32 values an f16 scale
+/// that maps the largest magnitude to the end of the code table, and for every
+/// value the nearest of the 16 codes. [`ares_quant::quantize`] has no encoder
+/// for this type, and a made-up table needs valid blocks, not the best ones.
+fn iq4_nl_rows(cols: usize, values: &[f32]) -> Vec<u8> {
+    const CODES: [f32; 16] = [
+        -127.0, -104.0, -83.0, -65.0, -49.0, -35.0, -22.0, -10.0, 1.0, 13.0, 25.0, 38.0, 53.0,
+        69.0, 89.0, 113.0,
+    ];
+    assert!(cols.is_multiple_of(32), "iq4_nl cannot hold rows of {cols} values");
+    let mut data = Vec::with_capacity(values.len() / 32 * 18);
+    for block in values.as_chunks::<32>().0 {
+        let largest = block.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        let stored = ares_quant::f32_to_f16(largest / 127.0);
+        let scale = ares_quant::f16_to_f32(stored);
+        let code = |v: f32| -> u8 {
+            let nearest = CODES
+                .iter()
+                .enumerate()
+                .min_by(|a, b| (v - scale * a.1).abs().total_cmp(&(v - scale * b.1).abs()));
+            nearest.map_or(0, |(i, _)| i as u8)
+        };
+        data.extend_from_slice(&stored.to_le_bytes());
+        data.extend((0..16).map(|j| code(block[j]) | code(block[j + 16]) << 4));
+    }
+    data
 }
