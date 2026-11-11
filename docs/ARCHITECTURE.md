@@ -174,11 +174,11 @@ machine (RTX 4070 + RTX 3060, Qwen3.8-27B) or read from the engines listed in
 | `ares-io` | Reads of weights straight from the model file: io_uring with direct I/O, demand before prefetch, cancel and promote, copies of a file on several drives with the reads spread over them, a map from experts to file ranges, row reads behind a cache | Done, tested against real files and on two drives; 1.4 to 1.7 GiB/s of random expert-sized reads per SSD of the development machine and 2.9 to 3.0 GiB/s over both; the expert store and the n-gram rows of `qwen4exp` read through it |
 | `ares-sched` | Step planner (generation, decision rows and prompts in one step), admission (pages claimed per step, a reservation that corrects itself, a queue instead of refusals), the order of a pass for long prompts of a model with experts, step time model with a term for the context, draft length choice, the lookup drafter on a suffix automaton shared by all sequences | Done; unit and model tests; the conductor uses the planner, admission (without spill), the lookup drafter and the step cost |
 | `ares-weights` | Expert heat, tiers that are elected and fed by reads (admission, protection, guesses bound late, slots given back), slots per layer by need, the waves of experts of a pass, a token table for the first layers, the lookahead distance, routing bias for pruning | Done, unit tested; the expert store uses the slot sets, the heat and the split of slots; guesses, the token table and pruning are not used by a running model yet |
-| `ares-api` | Request, event, decision and error types; the `Engine` trait between HTTP and the runtime (`submit` for generation, `decide` for decisions, `stats`) | Done, unit tested |
-| `ares-server` | The `ares` binary: loads a model on the devices and serves it over an OpenAI-compatible HTTP API, with the plan of devices, split, shares and context made from what the devices report | Serves `qwen35` models (chat and plain completions, streamed and not, timings, metrics, staged shutdown); 96 tests without a GPU and 9 that start the real binary; the prefix cache is on, with `--ram` for the engine's RAM; no router mode, no multimodal input, no tool calls, `/v1/systemone` answers 501 |
+| `ares-api` | Request, event, decision and error types; the `Engine` trait between HTTP and the runtime (`submit` for generation, `decide` for decisions, `stats`, `chat_format` for what a model's chat template declares about thinking) | Done, unit tested |
+| `ares-server` | The `ares` binary: loads a model on the devices and serves it over an OpenAI-compatible HTTP API, with the plan of devices, split, shares and context made from what the devices report | Serves `qwen35` models (chat and plain completions, streamed and not, timings, metrics, staged shutdown, the reasoning of a reply apart from its content and in the history, with llama-server's controls for thinking); 136 tests without a GPU, 9 that start the real binary and 3 that run the engine in the test's process; the prefix cache is on, with `--ram` for the engine's RAM; no router mode, no multimodal input, no tool calls, `/v1/systemone` answers 501 |
 | `ares-runtime` | The conductor thread and one thread per device, the step loop that connects plan, state and kernels, admission, speculation with the lookup drafter and with a model's own drafts, the `Model` trait a model implements, a synthetic model that drives the real kernels, and the expert store (VRAM slots, RAM tier, reads, the CPU computing what is not on a GPU) | Drives `qwen35` on one device, in tensor split and in layer split, with picks made on the device; implements `Engine::submit` (not `decide`); the prefix cache is in the conductor, checked against the host executor as an oracle and carried out by `qwen35` on the devices (checkpoints in page-locked RAM within one RAM limit, `PinnedRam`), and there is no spill of pages to RAM (a request that gives way stays in the pool's cache); the expert store is driven by `qwen4exp`'s own session, not by the conductor |
 | `ares-model` | Model architectures: configuration and weight table from a GGUF, a CPU reference of the forward pass with explicit state (window and commit) that GPU implementations are compared with block by block, and the implementation on the devices | `qwen35` (Qwen3.5-0.8B, Qwen3.8-27B) runs through the runtime and the server, with the model's draft block. `qwen4exp` (Qwen3.8-Flash-Next) runs on one or two cards through a session of its own, without drafts. See [Several devices](#several-devices) |
-| `ares-tokenizer` | Text to token ids and back for byte-level BPE (`gpt2` with the `qwen35` pre-tokenizer) as llama.cpp does it, malformed UTF-8 included; control tokens in text only on request; encoding on several threads for long prompts; a streaming decoder that never cuts a character; the chat templates of the model file (Jinja, a dialect of its own that errors on what it does not support) with tools and the generation prompt | Done; token ids equal llama.cpp's on millions of generated and real texts for the three Qwen test models, chat prompts equal on thousands of conversations; about 20 times llama.cpp's encode speed on one core |
+| `ares-tokenizer` | Text to token ids and back for byte-level BPE (`gpt2` with the `qwen35` pre-tokenizer) as llama.cpp does it, malformed UTF-8 included; control tokens in text only on request; encoding on several threads for long prompts; a streaming decoder that never cuts a character; the chat templates of the model file (Jinja, a dialect of its own that errors on what it does not support) with tools and the generation prompt, and the format of a template's thinking read off it by comparing renderings (`ReasoningFormat`) | Done; token ids equal llama.cpp's on millions of generated and real texts for the three Qwen test models, chat prompts equal on thousands of conversations; about 20 times llama.cpp's encode speed on one core |
 
 Both test architectures are specified under [reference/](reference/):
 [qwen35](reference/qwen35-architecture.md) and
@@ -1611,6 +1611,124 @@ is refused by name, not ignored: grammars, logit bias, penalties, tools and
 images among them today. A client that disconnects frees its sequence. The
 first signal lets running requests finish, the second ends them, and the
 devices are released before the process exits.
+
+**Thinking.** Qwen3.8 thinks before it answers: the template ends the prompt
+with `<think>\n`, and the model writes its reasoning, `\n</think>\n\n` and the
+answer. The server returns the reasoning in `reasoning_content` of the message
+(and of the deltas of a stream, as their own chunks) and the answer in `content`;
+a reply that `max_tokens` cuts inside the thinking has reasoning and an empty
+content. An assistant message of a request may carry `reasoning_content` back,
+and the chat template writes it into the prompt. What marks the reasoning is
+read off the model's own template, not looked up by the name of a model: when a
+model is set up, `ReasoningFormat::detect` (`ares-tokenizer`) renders small
+conversations and compares the texts, as llama.cpp's autoparser does. An
+assistant message with and without `reasoning_content` gives the pair of tags
+and the white space the template writes around them; the end of the prompt with
+`enable_thinking` on and off says whether the model continues inside the block
+or the template closes an empty one; earlier turns with `preserve_reasoning` and
+a few values of `reasoning_effort` say which of the two variables the template
+reads. The result travels as `ares_api::ChatFormat` (`Model::chat_format`,
+`Engine::chat_format`) and the server's `Splitter` sorts the text with it as it
+streams: it holds back what may still be a tag and the white space the template
+writes around the reasoning, and gives the same text however the pieces are cut.
+A template with no pair of tags around the reasoning has no thinking, and its
+replies stay whole. The newline the template writes before the closing tag is
+not part of `reasoning_content` (llama-server leaves it in, which a template
+that does not trim would write twice).
+
+The controls are llama-server's, under its names and defaults:
+
+| Control | Start | Request | Here |
+| --- | --- | --- | --- |
+| Thinking on, off or left to the template | `--reasoning on\|off\|auto` (`-rea`) | `chat_template_kwargs.enable_thinking`; `reasoning_effort: "none"` is off | the variable `enable_thinking`; `auto` sets nothing |
+| Format of the reply | `--reasoning-format` (default `auto`) | `reasoning_format` | `none` leaves the text whole in `content`, the end of the prompt from the opening tag on included, as llama-server does; `auto`, `deepseek` and `deepseek-legacy` extract (llama-server parses the three the same way) |
+| Effort | `--reasoning-effort` | `reasoning_effort` | the variable `reasoning_effort`; refused if the template does not read it |
+| Thinking of earlier turns stays in the prompt | `--reasoning-preserve` (default on), `--no-reasoning-preserve` | `chat_template_kwargs.preserve_reasoning` | the variable `preserve_reasoning` |
+| Any other variable of the template | `--chat-var` | `chat_template_kwargs` | the variable; `messages`, `tools`, `add_generation_prompt`, `bos_token` and `eos_token` are the server's |
+| A budget of thinking tokens and the message injected when it is spent | `--reasoning-budget`, `--reasoning-budget-message` | `reasoning_budget_tokens`, `thinking_budget_tokens`, `reasoning_budget_message`, `reasoning_control` | not built: only -1, an empty message and `false` are accepted |
+
+llama-server keeps the budget in its sampler, which forces the tokens of the
+message and of the closing tag into the sequence once the budget is spent. The
+engine cannot put a token into a sequence that the model did not sample, so a
+request that asks for a budget is refused by name and is not answered without
+one. A request is refused, too, for an effort the template does not read, for
+`reasoning_effort: "none"` when `enable_thinking` does not change the prompt, and
+for `reasoning_format`, `reasoning_effort` and `chat_template_kwargs` on
+`/v1/completions`, which has no template.
+
+**A conversation that continues from the cache.** The prefix cache continues a
+conversation at the end of the last reply only if the next prompt, rendered from
+what the client sends back, begins with the prompt and the tokens the model
+generated. That is why the reasoning has to come back: the template of
+Qwen3.8 writes `<think>\n`, the reasoning, `\n</think>\n\n` and the content
+into the prompt for an assistant message, and without `reasoning_content` it
+writes an empty block where the model had begun to think, so that the new
+prompt parts from the cached sequence at the last token of the old prompt
+(the newline of `<think>\n` is one token with the next, `<think>\n\n`). The
+server does not cut or reshape what it returns for this: the reasoning is the
+text between the tags without the layout the template writes itself, and the
+content is the rest, both exactly as generated, so that the template writes the
+turn back as the model generated it. `reasoning/templates.rs` in `ares-server`
+plays that through the real templates and vocabularies of Qwen3.8-27B and of
+Qwen3.8-Flash-Next (their templates declare the same and give the same
+numbers) and counts the tokens of the sequence that the next prompt does not
+repeat:
+
+- None, for a reply with thinking (German with umlauts and emoji, code blocks,
+  blank lines, tags that are only text), for a reply without thinking (the
+  template closes an empty block in the prompt), for a reply the limit of
+  tokens cut inside the answer or inside the thinking (also right after a full
+  stop), and over four turns in a row, one with thinking off.
+- Where the template trims or lays out the text other than the model did:
+  a model that thinks of nothing (`\n</think>` right after `<think>\n`) parts at
+  the last token of the prompt and the reply is computed again (the two
+  newlines are two tokens for the model and one for the tokenizer); a newline
+  after the answer costs it and `<|im_end|>` (2 tokens), a newline before the
+  reasoning the whole reply, an empty line at the end of the reasoning 6
+  tokens, an extra empty line or a single newline after the closing tag 4, a
+  closing tag without the newline before it 5 (the replies of the test, 66 to
+  68 tokens in all).
+- Tokens the model sampled that are not the tokenizer's tokens for their own
+  text: a sampled reply of 1500 tokens in the test through the server wrote
+  `...` and `"?` where the tokenizer makes `..."` and `?`, and the next prompt
+  parted there (at token 1128 of 1867, so the engine cached the 1024 of the
+  whole pages before it). Greedy replies did not do it in the tests; a
+  test with the real vocabularies (`tokens_that_are_not_the_tokenizers_own...`)
+  holds the arithmetic of such a parting.
+- Qwen3.5-0.8B's own template is another one: it writes the thinking of a turn
+  into the prompt only after the last user message, `preserve_reasoning` or
+  not, so no reply is ever repeated: the new prompt parts 2 tokens before the
+  end of the old one (4 with thinking off), whatever the client sends back.
+
+Through the server, with the 0.8B on a GPU and served with the template of
+Qwen3.8-27B (read from its file; `tests/reasoning_cache.rs`, asked greedily), a client that sends
+`reasoning_content` back gets this from the engine's report of each request
+(`Snapshot::requests`) and `/metrics`:
+
+| Conversation | Turn | Prompt tokens | Cached | Computed | Replayed |
+| --- | --- | --- | --- | --- | --- |
+| Short questions, 314, 259 and 158 tokens generated | 1 | 66 | 0 | 66 | 0 |
+| | 2 | 406 | 379 | 27 | 0 |
+| | 3 | 691 | 664 | 27 | 0 |
+| A system message first; the first two replies cut by the limit of 600 tokens | 1 | 405 | 0 | 405 | 0 |
+| | 2 | 1035 | 1004 | 31 | 0 |
+| | 3 | 1665 | 1634 | 31 | 0 |
+
+The cached tokens of a turn are the prompt and the tokens generated in the turn
+before but the last, which is generated and never computed (the end token, or
+the token that the limit cut off); what is computed is that token, the line
+break after the reply, the new message and the start of the next reply. The same
+long conversation with a client that sends back only `content` (turn 2: 434
+prompt tokens, 384 cached, 50 computed; turn 3: 463, 384, 79 computed; a
+sampled run had 128 rows replayed in turn 3) reads the cached whole pages
+before the last token of the old prompt and computes the rest again, up to a
+page, with a replay of the rows between the last checkpoint and the cached
+cells when the two do not meet. Measured
+through the server before the reasoning came back, Qwen3.8-27B with a history
+of 28 000 tokens computed 80 to 165 rows again in every turn, the first token
+after 0.34 to 0.55 s where the continued sequence gives about 0.15 s. A resume
+point at the end of the prompt, which would shrink that cost for a client that
+drops the reasoning, is another piece of work and is not built here.
 
 Measured 2026-11-11 with Qwen3.8-27B on both cards: 79.2, 75.3 and 78.8
 tokens per second for German, English and code through HTTP, which is what
