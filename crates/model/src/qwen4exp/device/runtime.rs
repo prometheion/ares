@@ -30,7 +30,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, TryLockError};
 use std::time::{Duration, Instant};
 
-use ares_api::{EngineError, ExpertStats, ModelCard, Prompt};
+use ares_api::{ChatFormat, EngineError, ExpertStats, ModelCard, Prompt};
 use ares_core::Ledger;
 use ares_cuda::{Device, ENTRY_CELLS, Event, Segment, StepRecord, Stream};
 use ares_gguf::Gguf;
@@ -49,6 +49,7 @@ use super::ngram::NgramFeed;
 use super::part::{ExpertAt, Frame, PAGE_ENTRY, Part, PartSetup, PartShape, Ports, StepEnv};
 use super::placement::{MARGIN, PartPlan, Placement, ram_tier_bytes};
 use super::session::{Chosen, Fill, PartReport, SessionOptions, choose};
+use crate::chat;
 use crate::qwen4exp::weights::Weights;
 use crate::qwen4exp::{Config, Error as FileError};
 
@@ -457,6 +458,8 @@ pub struct Qwen4Exp {
     context: u32,
     created: u64,
     chat: ChatOptions,
+    /// What the chat template declares, read with `chat`.
+    format: ChatFormat,
     meeting: Meeting<Build>,
     flow: OnceLock<Arc<Flow>>,
     reports: Mutex<Vec<PartReport>>,
@@ -529,6 +532,7 @@ impl Qwen4Exp {
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |since| since.as_secs());
         let n = placement.n_devices();
+        let format = chat::chat_format(&tokenizer, &ChatOptions::default());
         Ok(Self {
             gguf: Arc::new(gguf),
             config,
@@ -539,6 +543,7 @@ impl Qwen4Exp {
             name: name.into(),
             context,
             created,
+            format,
             chat: ChatOptions::default(),
             meeting: Meeting::new(Build {
                 room: vec![0; n],
@@ -562,6 +567,7 @@ impl Qwen4Exp {
     /// Renders chat prompts with `options`: whether the model thinks, and the
     /// variables a server passes to the chat template.
     pub fn with_chat_options(mut self, options: ChatOptions) -> Self {
+        self.format = chat::chat_format(&self.tokenizer, &options);
         self.chat = options;
         self
     }
@@ -875,11 +881,15 @@ impl Model for Qwen4Exp {
     }
 
     fn encode(&self, prompt: &Prompt) -> Result<Vec<u32>, EngineError> {
-        crate::chat::encode(&self.tokenizer, &self.chat, prompt)
+        chat::encode(&self.tokenizer, &self.chat, prompt)
+    }
+
+    fn chat_format(&self) -> Option<ChatFormat> {
+        Some(self.format.clone())
     }
 
     fn piece(&self, token: u32, text: &mut Vec<u8>) {
-        crate::chat::piece(&self.tokenizer, token, text);
+        chat::piece(&self.tokenizer, token, text);
     }
 
     fn context(&self) -> ContextSpec {

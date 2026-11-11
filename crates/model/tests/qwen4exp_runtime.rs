@@ -13,7 +13,8 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
 use ares_api::{
-    Engine, EngineError, Event, EventSink, GenerateRequest, ModelCard, Prompt, RequestId, Sampling,
+    ChatFormat, Engine, EngineError, Event, EventSink, GenerateRequest, ModelCard, Prompt,
+    RequestId, Sampling,
 };
 use ares_core::GgmlType;
 use ares_cuda::{CacheFormat, Device, Wait, device_count};
@@ -28,7 +29,7 @@ use ares_runtime::{
     Runtime, RuntimeConfig, Split,
 };
 use ares_state::PageLayout;
-use ares_tokenizer::Tokenizer;
+use ares_tokenizer::{ChatOptions, Json, Tokenizer};
 
 const MAX_ROWS: u32 = 8;
 const CELLS: u32 = 512;
@@ -139,8 +140,9 @@ fn options(placement: Placement, n_layer: usize, pages: u32, window_rows: u32) -
 }
 
 /// A tokenizer of the 256 bytes alone, which the model needs to exist and the
-/// tests do not use: their prompts are token ids.
-fn byte_tokenizer() -> Tokenizer {
+/// tests do not use: their prompts are token ids. It has the chat template
+/// `template`, if any.
+fn byte_tokenizer(template: Option<&str>) -> Tokenizer {
     // The characters of GPT-2's byte-level alphabet.
     let tokens: Vec<String> = (0..=255u8)
         .map(|byte| {
@@ -151,15 +153,22 @@ fn byte_tokenizer() -> Tokenizer {
             char::from_u32(at).unwrap().to_string()
         })
         .collect();
-    let bytes = GgufBuilder::new()
+    let mut file = GgufBuilder::new()
         .str("general.architecture", "qwen4exp")
         .str("tokenizer.ggml.model", "gpt2")
         .str("tokenizer.ggml.pre", "qwen35")
         .str_array("tokenizer.ggml.tokens", &tokens)
         .i32_array("tokenizer.ggml.token_type", &vec![1; 256])
-        .str_array::<&str>("tokenizer.ggml.merges", &[])
-        .build();
-    let path = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("q4rt-tokenizer.gguf");
+        .str_array::<&str>("tokenizer.ggml.merges", &[]);
+    if let Some(template) = template {
+        file = file.str("tokenizer.chat_template", template);
+    }
+    let bytes = file.build();
+    let path = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(if template.is_some() {
+        "q4rt-tokenizer-chat.gguf"
+    } else {
+        "q4rt-tokenizer.gguf"
+    });
     std::fs::write(&path, bytes).unwrap();
     Tokenizer::from_gguf(&Gguf::open(&path).unwrap()).expect("a tokenizer of bytes")
 }
@@ -247,7 +256,7 @@ fn start(
     let n_layer = Config::from_gguf(&gguf).unwrap().n_layer;
     let opts = options(placement, n_layer, pages, MAX_ROWS);
     let inner =
-        Arc::new(Qwen4Exp::new(gguf, byte_tokenizer(), "made", &devices, opts, CELLS).unwrap());
+        Arc::new(Qwen4Exp::new(gguf, byte_tokenizer(None), "made", &devices, opts, CELLS).unwrap());
     let config = RuntimeConfig { pages, cells_per_page: 128, max_slots: SLOTS, ..config };
     let model: Arc<dyn Model> = Arc::new(Made(inner.clone()));
     let mut gpu = GpuConfig::new(&config, &*model);
@@ -368,6 +377,68 @@ fn session_answer(seed: u64, placement: Placement, prompt: &[u32], n: usize) -> 
 /// A prompt of `n` tokens of the vocabulary, from a seed.
 fn prompt(n: usize, seed: u64) -> Vec<u32> {
     Shape::small().tokens(n, seed).into_iter().map(|t| t % 80 + 10).collect()
+}
+
+/// A chat template with the structure of the Qwen3.x ones as far as thinking
+/// goes: the reasoning of an assistant turn between think tags, and a prompt
+/// that opens the block or closes an empty one.
+const THINKING_TEMPLATE: &str = r#"
+{%- for message in messages %}
+    {%- if message.role == "user" %}
+        {{- '<|im_start|>user\n' + message.content + '<|im_end|>\n' }}
+    {%- else %}
+        {%- set reasoning = (message.reasoning_content if message.reasoning_content is string else '')|trim %}
+        {{- '<|im_start|>assistant\n<think>\n' + reasoning + '\n</think>\n\n' + message.content + '<|im_end|>\n' }}
+    {%- endif %}
+{%- endfor %}
+{%- if add_generation_prompt %}
+    {{- '<|im_start|>assistant\n' }}
+    {%- if enable_thinking is defined and enable_thinking is false %}
+        {{- '<think>\n\n</think>\n\n' }}
+    {%- else %}
+        {{- '<think>\n' }}
+    {%- endif %}
+{%- endif %}
+"#;
+
+/// What a model with `template` says about its chat when it is set up with
+/// `chat`.
+fn declared(template: Option<&str>, chat: ChatOptions) -> Option<ChatFormat> {
+    let devices = open_devices(Placement::One);
+    let gguf = Gguf::open(gguf_path(1)).unwrap();
+    let n_layer = Config::from_gguf(&gguf).unwrap().n_layer;
+    let opts = options(Placement::One, n_layer, 16, MAX_ROWS);
+    Qwen4Exp::new(gguf, byte_tokenizer(template), "made", &devices, opts, CELLS)
+        .unwrap()
+        .with_chat_options(chat)
+        .chat_format()
+}
+
+#[test]
+fn the_model_declares_what_its_template_says_about_thinking() {
+    if !enabled() {
+        return;
+    }
+    let ChatFormat { thinking } = declared(Some(THINKING_TEMPLATE), ChatOptions::default())
+        .expect("a model with a template declares its format");
+    let format = thinking.expect("the template thinks");
+    assert_eq!(format.start, "<think>\n");
+    assert_eq!(format.end, "\n</think>\n\n");
+    assert_eq!(format.prompt_on, "<think>\n");
+    assert_eq!(format.prompt_off, "<think>\n\n</think>\n\n");
+    assert!(format.on_by_default && format.switchable());
+
+    // Whether the model thinks when a request does not say is what the server
+    // started it with.
+    let off = ChatOptions {
+        variables: vec![("enable_thinking".to_owned(), Json::Bool(false))],
+        ..ChatOptions::default()
+    };
+    let format = declared(Some(THINKING_TEMPLATE), off).unwrap().thinking.unwrap();
+    assert!(!format.on_by_default);
+
+    // A file without a template declares no thinking.
+    assert_eq!(declared(None, ChatOptions::default()).unwrap().thinking, None);
 }
 
 #[test]
