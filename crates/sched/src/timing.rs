@@ -42,34 +42,6 @@ impl StepCost {
     pub fn ms(&self, load: Load) -> f64 {
         self.base_ms + self.per_row_ms * f64::from(load.rows) + self.per_cell_ms * load.cells as f64
     }
-
-    /// What one more row at position `context` adds to a step. This is the
-    /// `per_row_ms` to give [`best_draft_len`](crate::best_draft_len) for a
-    /// sequence that deep.
-    pub fn row_ms(&self, context: u64) -> f64 {
-        self.per_row_ms + self.per_cell_ms * context as f64
-    }
-
-    /// How many consecutive rows of a sequence at position `context` fit in
-    /// `extra_ms`. The rows of a chunk read each other, so the cost of `x`
-    /// rows is a quadratic in `x`, `per_cell / 2 * x^2 + (per_row + per_cell
-    /// * (context - 1/2)) * x`, and this is its positive root.
-    pub fn rows_within(&self, extra_ms: f64, context: u64) -> u32 {
-        if extra_ms.is_nan() || extra_ms <= 0.0 {
-            return 0;
-        }
-        let a = self.per_cell_ms / 2.0;
-        let b = self.per_row_ms + self.per_cell_ms * (context as f64 - 0.5);
-        let rows = if a > 0.0 {
-            // The form that does not cancel when `a` is tiny against `b`.
-            2.0 * extra_ms / (b + (b * b + 4.0 * a * extra_ms).sqrt())
-        } else if b > 0.0 {
-            extra_ms / b
-        } else {
-            f64::INFINITY
-        };
-        if rows >= f64::from(u32::MAX) { u32::MAX } else { rows as u32 }
-    }
 }
 
 /// A running estimate of step time as `base + per_row * rows + per_cell *
@@ -398,25 +370,6 @@ mod tests {
     }
 
     #[test]
-    fn rows_within_is_the_inverse_of_the_cost_of_a_chunk() {
-        for context in [0u64, 3_000, 100_000, 260_000] {
-            for extra in [0.5, 7.0, 36.4, 900.0] {
-                let rows = TRUE.rows_within(extra, context);
-                let cost_of = |rows: u32| TRUE.ms(Load::chunk(context, rows)) - TRUE.base_ms;
-                assert!(cost_of(rows) <= extra * (1.0 + 1e-9), "{rows} rows at {context}");
-                assert!(cost_of(rows + 1) > extra, "{rows} rows at {context} leave room");
-            }
-        }
-        assert_eq!(TRUE.rows_within(0.0, 5), 0);
-        assert_eq!(TRUE.rows_within(f64::NAN, 5), 0);
-        // Without a context term the answer is the old division.
-        let line = StepCost { base_ms: 33.0, per_row_ms: 1.14, per_cell_ms: 0.0 };
-        assert_eq!(line.rows_within(36.42, 123_456), 31);
-        let free = StepCost { base_ms: 33.0, per_row_ms: 0.0, per_cell_ms: 0.0 };
-        assert_eq!(free.rows_within(1.0, 0), u32::MAX);
-    }
-
-    #[test]
     fn without_contexts_the_cost_is_the_line() {
         let mut model = StepTimeModel::new(1.0);
         assert_eq!(model.cost(), None);
@@ -488,6 +441,7 @@ mod tests {
         }
         let cost = model.cost().unwrap();
         assert!((cost.per_cell_ms - 12e-6).abs() < 2e-7, "{cost:?}");
-        assert!((cost.row_ms(100_000) - 2.3).abs() < 0.05, "{cost:?}");
+        // A row at 100 000 tokens costs 2.3 ms now: 1.1 and 12e-6 per cell.
+        assert!((cost.per_row_ms + cost.per_cell_ms * 100_000.0 - 2.3).abs() < 0.05, "{cost:?}");
     }
 }

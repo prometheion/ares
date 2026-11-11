@@ -19,10 +19,14 @@
 //! - [`Pass`] is the other order for long prompts of a model whose experts
 //!   are fetched: all rows up to a layer's router, then that layer's experts
 //!   for all rows, then on, so that a prompt fetches each expert once.
-//! - [`StepTimeModel`] learns what a step costs from the steps that ran: a
-//!   base, a cost per row and a cost per cell of context that a row reads.
-//! - [`best_draft_len`] picks how many draft tokens to verify, from measured
-//!   acceptance and cost, and with that also which drafter to use.
+//! - [`PriceTable`] is what a step costs by its rows, as a table (the weight
+//!   kernels take their rows in launches, so the price has edges), measured on
+//!   the devices at load and corrected by every step that runs, with a term
+//!   for the cells the rows read ([`StepTimeModel`] fits that term).
+//! - [`Acceptance`] is how often a drafter's drafts are accepted, per
+//!   position, for a sequence, starting from what the engine has seen.
+//!   [`choose`] picks, for the whole step, whose drafts go into each
+//!   sequence's window and how many, by the expected tokens per millisecond.
 //! - [`LookupCorpus`] and [`LookupDrafter`] propose drafts by continuing the
 //!   longest earlier occurrence of the current text, in any sequence: one
 //!   suffix automaton over everything the engine has read and written, with
@@ -39,13 +43,17 @@ mod draft;
 mod lookup;
 mod pass;
 mod plan;
+mod price;
 mod share;
 mod timing;
+mod window;
 
 pub use admission::{Admission, AdmissionConfig, Arrival, Claims, ExceedsPool, Outcome, PoolView};
-pub use draft::{Acceptance, DraftChoice, DraftCost, best_draft_len};
+pub use draft::{Acceptance, BELIEF};
 pub use lookup::{LookupConfig, LookupCorpus, LookupDrafter, LookupMatch};
 pub use pass::{Pass, PassStep, Point, pass_rows_between, runs_as_pass};
 pub use plan::{Limits, Part, PartKind, Plan, Request, SeqId, Want, plan};
+pub use price::{Curve, PriceTable};
 pub use share::{Pending, Share, Turn};
 pub use timing::{Load, StepCost, StepTimeModel};
+pub use window::{Choice, Offer, Prices, Wish, choose};

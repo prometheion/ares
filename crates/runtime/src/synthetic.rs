@@ -103,6 +103,16 @@ pub struct SyntheticConfig {
     /// copies, to check what the conductor does with them; the model's device
     /// part has none and refuses to open with this set.
     pub prefix_cache: Option<u64>,
+    /// The links of a chain of drafts the model makes itself, like the draft
+    /// block of a real one: 0 for none. Only the host executor drafts (the
+    /// device part has no draft block and refuses to open with this set), and
+    /// the context must read one token (`context.window == 1`) so that a
+    /// draft's context follows from the draft alone.
+    pub own_drafts: u32,
+    /// The chance that link `i` of a chain makes the draft the model itself
+    /// would pick, given that the links before it did; the last number serves
+    /// the links after it. Empty: every link is right.
+    pub own_accuracy: Vec<f64>,
     pub seed: u64,
 }
 
@@ -130,6 +140,8 @@ impl SyntheticConfig {
             tensor_shares: Vec::new(),
             state_bytes_per_cell: 0,
             prefix_cache: None,
+            own_drafts: 0,
+            own_accuracy: Vec::new(),
             seed: 0x5eed,
         }
     }
@@ -155,6 +167,16 @@ impl SyntheticConfig {
     pub fn repetitive(mut self, window: u32, epoch: u32) -> Self {
         self.context.window = window;
         self.context.epoch = epoch;
+        self
+    }
+
+    /// Gives the model a draft block of its own with `links` links, of which
+    /// link `i` is right with the chance `accuracy[i]` (see
+    /// [`SyntheticConfig::own_accuracy`]). Needs a context of one token.
+    pub fn with_own_drafts(mut self, links: u32, accuracy: &[f64]) -> Self {
+        self.own_drafts = links;
+        self.own_accuracy = accuracy.to_vec();
+        self.context.window = 1;
         self
     }
 
@@ -316,6 +338,14 @@ impl SyntheticConfig {
                 self.layers_per_device, self.layers, self.devices
             ));
         }
+        if self.own_drafts > 0 && self.context.window != 1 {
+            return bad(
+                "a draft's context follows from the draft alone only if it reads one token".into(),
+            );
+        }
+        if self.own_accuracy.iter().any(|p| !(0.0..=1.0).contains(p)) {
+            return bad(format!("accuracies {:?} are not chances", self.own_accuracy));
+        }
         if self.eos.is_some_and(|t| t >= self.vocab()) {
             return bad(format!(
                 "end token {:?} is not a token of {} tokens",
@@ -358,6 +388,38 @@ impl SyntheticModel {
         h = (h ^ (h >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
         h ^= h >> 31;
         ((h % u64::from(self.config.vocab())) as u32, (h >> 40) as f32)
+    }
+
+    /// The context the row of `token` at `position` has: what the conductor
+    /// derives from the tokens, for a model whose context reads one token.
+    pub fn context_of(&self, token: u32, position: u32) -> u32 {
+        let spec = self.config.context;
+        spec.reduce(spec.advance(spec.start(), &[token]), position)
+    }
+
+    /// What the model's draft block would draft for the window whose newest
+    /// token is `token` at `position` with `context`: `links` tokens. Link `j`
+    /// is the token the model itself picks after the ones before it when a
+    /// hash of where it is falls under the link's accuracy, and another token
+    /// when it does not. For the executors that stand in for a device.
+    pub fn host_drafts(&self, token: u32, context: u32, position: u32, links: u32) -> Vec<u32> {
+        let c = &self.config;
+        let accuracy = |j: u32| {
+            c.own_accuracy.get(j as usize).or(c.own_accuracy.last()).copied().unwrap_or(1.0)
+        };
+        let (mut token, mut context) = (token, context);
+        let mut drafts = Vec::with_capacity(links as usize);
+        for j in 0..links {
+            let truth = self.host_pick(token, context).0;
+            let at = position + 1 + j;
+            let mut h = u64::from(truth) << 32 | u64::from(at);
+            h = (h ^ (h >> 33)).wrapping_mul(0xff51_afd7_ed55_8ccd) ^ c.seed;
+            h = (h ^ (h >> 33)).wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+            let unit = (h >> 11) as f64 / (1u64 << 53) as f64;
+            drafts.push(if unit < accuracy(j) { truth } else { (truth + 1) % c.vocab() });
+            (token, context) = (truth, self.context_of(truth, at));
+        }
+        drafts
     }
 
     fn render(prompt: &Prompt) -> String {
@@ -461,6 +523,10 @@ impl Model for SyntheticModel {
         self.config.max_rows
     }
 
+    fn own_drafts(&self) -> u32 {
+        self.config.own_drafts
+    }
+
     fn prefix_cache(&self) -> Option<PrefixCache> {
         self.config
             .prefix_cache
@@ -534,6 +600,13 @@ impl SyntheticDevice {
             return Err(ModelError::Invalid(
                 "this model pretends to a prefix cache, which only the host executor can carry \
                  out: its device part keeps no state"
+                    .into(),
+            ));
+        }
+        if c.own_drafts > 0 {
+            return Err(ModelError::Invalid(
+                "this model drafts for itself, which only the host executor can do: its device \
+                 part has no draft block"
                     .into(),
             ));
         }

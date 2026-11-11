@@ -22,9 +22,10 @@ use ares_runtime::{GpuConfig, Runtime, RuntimeConfig, required_ram};
 use ares_tokenizer::{ChatOptions, Tokenizer};
 
 use crate::load::{
-    LoadError, Loaded, VRAM_HEADROOM, describe_links, hold_devices, join, ram_limit, refuse,
+    LoadError, Loaded, VRAM_HEADROOM, describe_links, draft_block_takes_part, hold_devices, join,
+    ram_limit, refuse,
 };
-use crate::plan::{self, CELLS_PER_PAGE, DEFAULT_DRAFTS, DEFAULT_PARALLEL, LoadOptions, SplitKind};
+use crate::plan::{self, CELLS_PER_PAGE, DEFAULT_PARALLEL, LoadOptions, SplitKind};
 
 /// The most rows of a step: what the expert kernels take.
 const MAX_ROWS: u32 = ares_cuda::MAX_BATCH;
@@ -80,21 +81,26 @@ pub(crate) fn load(gguf: Gguf, options: &LoadOptions, begun: Instant) -> Result<
              arithmetic",
         ));
     }
+    // The model has no draft head built yet, and the lookup in earlier text
+    // takes part only next to a model drafter: nothing speculates, so no
+    // window is reserved, and the options of drafting mean nothing.
+    draft_block_takes_part(
+        options,
+        false,
+        "the draft head of this model is not built yet, so no model drafter takes part",
+    )?;
+    if options.window.is_some() {
+        return Err(refuse(
+            "--window does nothing for this model: it has no drafter of its own yet, so no \
+             window is reserved",
+        ));
+    }
     if options.draft_vocabulary.is_some() {
         return Err(refuse(
-            "--draft-vocab is for a model's own draft block, which this model does not use yet \
-             (its drafts come from earlier text)",
+            "--draft-vocab is for a model's own draft block, which this model does not use yet",
         ));
     }
     let parallel = options.parallel.unwrap_or(DEFAULT_PARALLEL);
-    let drafts = options.drafts.unwrap_or(DEFAULT_DRAFTS);
-    let window_rows = if drafts > 0 { parallel.saturating_mul(drafts + 1) } else { 0 };
-    if window_rows > MAX_ROWS {
-        return Err(refuse(format!(
-            "{parallel} sequences with {drafts} drafts each are {window_rows} rows in a step, \
-             more than the {MAX_ROWS} a step has: lower --parallel or --drafts"
-        )));
-    }
     if parallel > MAX_ROWS {
         return Err(refuse(format!(
             "--parallel {parallel}: a step has {MAX_ROWS} rows at most, one for each sequence"
@@ -155,8 +161,8 @@ pub(crate) fn load(gguf: Gguf, options: &LoadOptions, begun: Instant) -> Result<
         part: Options {
             kv,
             max_rows: MAX_ROWS,
-            logit_rows: window_rows.max(parallel),
-            window_rows,
+            logit_rows: parallel,
+            window_rows: 0,
             max_slots: parallel,
             cells: context.min(model_context),
             pool_pages: pages,
@@ -237,16 +243,10 @@ pub(crate) fn load(gguf: Gguf, options: &LoadOptions, begun: Instant) -> Result<
         if options.parallel.is_some() { "as asked" } else { "the default" },
     );
     tracing::info!(
-        "plan: K in {}, V in {}; {}",
+        "plan: K in {}, V in {}; no speculation: the model's draft head is not built yet, and \
+         earlier text alone is not a drafter",
         plan::format_name(kv.0),
         plan::format_name(kv.1),
-        match drafts {
-            0 => "no drafts".to_owned(),
-            n => format!(
-                "at most {n} drafts per sequence and step, from earlier text (the model's own \
-                 draft head is not used yet)"
-            ),
-        }
     );
     for ((plan, h), per_page) in placement.devices.iter().zip(&held).zip(&page_bytes) {
         tracing::info!(
@@ -296,8 +296,7 @@ pub(crate) fn load(gguf: Gguf, options: &LoadOptions, begun: Instant) -> Result<
         pages,
         cells_per_page: CELLS_PER_PAGE,
         max_slots: parallel,
-        speculation: drafts > 0,
-        max_draft: drafts.max(1),
+        window_rows: 1,
         checkpoint_budget: 0,
         ..RuntimeConfig::default()
     };
@@ -405,6 +404,7 @@ fn warm_up(runtime: &Runtime, model: &str) -> Result<(), LoadError> {
         sampling: Sampling::default(),
         max_tokens: Some(32),
         stop: Vec::new(),
+        draft: true,
         id: RequestId(0),
     };
     runtime.submit(request, sink).map_err(|e| LoadError::Start(format!("warm-up: {e}")))?;

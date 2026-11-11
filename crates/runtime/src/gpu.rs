@@ -569,7 +569,9 @@ fn worker_main(init: Init, ready: mpsc::Sender<Result<(), RuntimeError>>) {
                 // A step that failed leaves the other devices with threads
                 // and kernels that wait for this one: they are told to give
                 // up, and the error says if that did not work.
-                let released = outcome.is_err().then(|| worker.links.abort());
+                let released = outcome
+                    .is_err()
+                    .then(|| worker.links.abort_until_idle(&worker.stream, STOP_PATIENCE));
                 {
                     let mut result = mailbox.result.lock().expect("result slot");
                     match outcome {

@@ -232,6 +232,10 @@ pub struct DeviceTimes {
     pub finished_at_ns: u64,
 }
 
+/// The positions of a draft that [`Counters`] tells apart; later ones count as
+/// the last.
+pub const DRAFT_POSITIONS: usize = 16;
+
 /// Counts that go with the times.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Counters {
@@ -251,8 +255,11 @@ pub struct Counters {
     /// was accepted) and how many of those were accepted. Source 0 is the
     /// lookup of earlier text, 1 the model's own draft block; the last
     /// position counts the ones past it too.
-    pub drafts_tested_at: [[u64; 8]; 2],
-    pub drafts_accepted_at: [[u64; 8]; 2],
+    pub drafts_tested_at: [[u64; DRAFT_POSITIONS]; 2],
+    pub drafts_accepted_at: [[u64; DRAFT_POSITIONS]; 2],
+    /// Windows by where their drafts came from and how many drafts they
+    /// verified, `[source][drafts]`: the chain lengths the policy chose.
+    pub draft_lengths: [[u64; DRAFT_POSITIONS + 1]; 2],
     /// Steps in which the model's own draft block drafted, the links of its
     /// chains (the longest chain of each step) and their device time in
     /// microseconds.
@@ -383,6 +390,22 @@ impl Stats {
     }
 }
 
+/// What the warm-up measured before the first request: the price of a step by
+/// its rows and the time of the model's own draft chain by its links, with
+/// no context to speak of, and what the measuring cost. The tables the
+/// conductor decides drafts and pieces of prompt from start as these.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Calibration {
+    /// Steps run, the warm-up's first three included.
+    pub steps: u32,
+    pub seconds: f64,
+    /// `(rows, milliseconds)` of the steps measured.
+    pub step_ms: Vec<(u32, f64)>,
+    /// `(links, milliseconds)` of the chains measured: empty for a model
+    /// that does not draft with a block of its own.
+    pub chain_ms: Vec<(u32, f64)>,
+}
+
 /// A copy of the measurements with percentiles computed, printable as a
 /// table.
 #[derive(Clone, Debug)]
@@ -406,6 +429,8 @@ pub struct Snapshot {
     /// The last requests that ended, the oldest first: at most
     /// [`REPORTED_REQUESTS`].
     pub requests: Vec<RequestReport>,
+    /// What the warm-up measured; `None` for a runtime that ran none.
+    pub calibration: Option<Calibration>,
 }
 
 impl Snapshot {
@@ -435,6 +460,7 @@ impl Snapshot {
             active,
             waiting,
             requests: stats.requests.iter().copied().collect(),
+            calibration: None,
         }
     }
 

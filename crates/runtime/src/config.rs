@@ -4,19 +4,6 @@ use std::time::Duration;
 
 use ares_sched::LookupConfig;
 
-/// Which drafters propose tokens.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Drafters {
-    /// The lookup in earlier text and the model's own draft block: for every
-    /// sequence and step, the one that promises more tokens per millisecond.
-    #[default]
-    Both,
-    /// Only the lookup in earlier text, which costs the devices nothing.
-    Lookup,
-    /// Only the model's own draft block, for a model that has one.
-    Own,
-}
-
 /// The settings of the conductor and its bookkeeping.
 #[derive(Clone, Debug)]
 pub struct RuntimeConfig {
@@ -53,17 +40,19 @@ pub struct RuntimeConfig {
     pub checkpoint_generation_interval: u32,
     /// The most rows of a step; 0 for the model's own maximum.
     pub max_rows: u32,
-    /// Whether drafts are proposed and verified.
-    pub speculation: bool,
-    /// Which drafters propose them.
-    pub drafters: Drafters,
-    /// The most draft tokens verified for one sequence in a step.
-    pub max_draft: u32,
+    /// The most rows of one sequence's window in a step: its newest token and
+    /// up to `window_rows - 1` drafts. How many of them a step really has
+    /// is chosen per step from the price of the step and the acceptance
+    /// measured so far; this is the room, which the model reserves memory
+    /// for (a row of a window keeps its inputs, its logits and a link of the
+    /// draft block's chain). A model with no drafter of its own
+    /// ([`crate::Model::own_drafts`]) does not draft at all, whatever this is.
+    pub window_rows: u32,
     /// The corpus that drafts are looked up in: its memory and the shortest
     /// match it drafts from.
     pub lookup: LookupConfig,
-    /// The acceptance the model's own drafts are assumed to have for a new
-    /// sequence.
+    /// The chance that a draft is accepted before the engine has seen any of
+    /// that drafter at that position: where every estimate starts from.
     pub draft_prior: f64,
     /// How much slower generating sequences may get while a prompt is read,
     /// above 1 (2.0: they get half of the time, the prompt the other half):
@@ -83,8 +72,13 @@ pub struct RuntimeConfig {
     pub conductor_spin: Duration,
     /// Samples kept per timing series for percentiles.
     pub stats_window: usize,
-    /// Run a few steps before taking requests, so lazy loading of kernels
-    /// and the first use of each path are not in the first request's time.
+    /// Run steps before taking requests: the first ones pay for the lazy
+    /// loading of kernels and the first use of each path, so it is not in the
+    /// first request's time; and then steps of every row count a window can
+    /// have and of a few above it, which measure the price of a step on the
+    /// devices (and, for a model with a draft block, of every length of its
+    /// chain), where drafts and the pieces of a prompt are decided from. The
+    /// measurements are kept up to date by every step that runs.
     pub warm_up: bool,
 }
 
@@ -100,9 +94,7 @@ impl Default for RuntimeConfig {
             checkpoint_prompt_interval: 32_768,
             checkpoint_generation_interval: 2048,
             max_rows: 0,
-            speculation: true,
-            drafters: Drafters::Both,
-            max_draft: 8,
+            window_rows: 8,
             lookup: LookupConfig::default(),
             draft_prior: 0.6,
             prefill_slowdown: 2.0,

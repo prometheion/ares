@@ -43,7 +43,7 @@
 //!
 //! Every proposed token comes with a probability that it is accepted, given
 //! that the ones before it were, which is what
-//! [`best_draft_len`](crate::best_draft_len) takes. It is read from a small
+//! [`choose`](crate::choose) takes. It is read from a small
 //! table by two things the automaton knows: how long the matched context is
 //! at that token, and how the earlier occurrences of that context went on
 //! (it occurred once; several times and always like this; mostly; seldom).

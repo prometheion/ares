@@ -23,9 +23,12 @@
 //! A step is a *round* of generation or a *piece* of prompt, never both
 //! kinds of rows at their full size ([`ares_sched::Share`] decides which, and
 //! the module docs there say why). A round carries the newest token of every
-//! generating sequence and its drafts; a piece carries up to
-//! [`Model::prompt_rows`] rows of the prompts that have started, shortest
-//! first, and the newest token of every generating sequence without drafts.
+//! generating sequence and the drafts that pay ([`ares_sched::choose`], from
+//! the price of a step by its rows and the acceptance measured); a piece
+//! carries up to [`Model::prompt_rows`] rows of the prompts that have started,
+//! shortest first, and the newest token of every generating sequence without
+//! drafts. Before the first request [`Conductor::warm_up`] measures the price
+//! of a step for every row count a window can have, and of a few above.
 //!
 //! # Who runs
 //!
@@ -84,24 +87,36 @@ use std::time::{Duration, Instant};
 use ares_api::{EngineError, Event, EventSink, FinishReason, RequestId, Sampling, Usage};
 use ares_cuda::{SampleParams, SampleRow};
 use ares_sched::{
-    Acceptance, Admission, AdmissionConfig, Arrival, DraftCost, Limits, Load, LookupCorpus,
-    LookupDrafter, Outcome, PartKind, Pending, PoolView, Request, SeqId, Share, StepTimeModel,
-    Turn, Want, best_draft_len, plan,
+    Acceptance, Admission, AdmissionConfig, Arrival, Choice, Curve, Limits, Load, LookupCorpus,
+    LookupDrafter, Offer, Outcome, PartKind, Pending, PoolView, PriceTable, Prices, Request, SeqId,
+    Share, Turn, Want, Wish, choose, plan,
 };
 use ares_state::{
     Chain, ChainHash, Owner, PagePool, PageState, PrefixIndex, Priority, Resume, Sequence,
 };
 
 use crate::cache::Cache;
-use crate::config::{Drafters, RuntimeConfig};
+use crate::config::RuntimeConfig;
 use crate::exec::{Clock, ExecError, Executor, StepMeta, StepOutput};
 use crate::model::{ContextSpec, Model};
 use crate::record::{self, Commit, RecordWriter, Row, TableUpdate};
 use crate::text::StopMatcher;
-use crate::timing::{Phase, RequestReport, Snapshot, Stats};
+use crate::timing::{Calibration, DRAFT_POSITIONS, Phase, RequestReport, Snapshot, Stats};
 
-/// Drafts cost the model nothing to produce: a lookup.
-const LOOKUP: DraftCost = DraftCost { fixed_ms: 0.0, per_token_ms: 0.0 };
+/// The drafters, as the choice of a window numbers them: the lookup in earlier
+/// text, which costs nothing to ask, and the model's own draft block, whose
+/// chain costs device time per link. A block drafter from a file of its own
+/// will be the next.
+const LOOKUP: usize = 0;
+const OWN: usize = 1;
+
+/// What a round leaves of the measured acceptance of the model's own drafter
+/// for a sequence that was offered it and did not take it, and of the
+/// engine's: a drafter that nobody asks measures nothing, and what it measured
+/// when it was poor would keep it out for ever. The sequence's fades quickly
+/// (it is the text that changed, usually), the engine's slowly.
+const UNASKED_SEQUENCE: f64 = 0.995;
+const UNASKED_ENGINE: f64 = 0.999;
 
 /// How long the conductor sleeps on its channel when requests wait and none
 /// can start. Admission starts the first in line whenever nothing runs, so
@@ -122,6 +137,7 @@ pub(crate) enum Command {
 /// conductor's time.
 pub(crate) struct StatsCopy {
     stats: Stats,
+    calibration: Option<Calibration>,
     pages_free: u32,
     pages_capacity: u32,
     cached_pages: u32,
@@ -132,7 +148,7 @@ pub(crate) struct StatsCopy {
 
 impl StatsCopy {
     pub(crate) fn into_snapshot(self) -> Snapshot {
-        Snapshot::new(
+        let mut snapshot = Snapshot::new(
             &self.stats,
             self.pages_free,
             self.pages_capacity,
@@ -140,7 +156,9 @@ impl StatsCopy {
             self.checkpoint_ram,
             self.active,
             self.waiting,
-        )
+        );
+        snapshot.calibration = self.calibration;
+        snapshot
     }
 }
 
@@ -152,6 +170,8 @@ pub(crate) struct Submission {
     pub stop: Vec<String>,
     /// How the request's tokens are picked.
     pub sampling: Sampling,
+    /// Whether drafts may be verified for the request.
+    pub draft: bool,
     pub sink: EventSink,
 }
 
@@ -231,8 +251,10 @@ struct Active {
     /// corpus when they are certain: prompt tokens when the step that
     /// computed their rows is back, generated tokens when they are accepted.
     drafter: LookupDrafter,
-    /// How the model's own drafts have done for this sequence.
+    /// How the model's own drafts have done for this sequence, per position.
     own_acceptance: Acceptance,
+    /// Whether the request lets drafts be verified for it.
+    draft_allowed: bool,
     /// How the sequence's tokens are picked.
     sampling: SampleParams,
     stop: StopMatcher,
@@ -246,9 +268,13 @@ struct Active {
     /// the drafts back.
     draft: Vec<u32>,
     own: bool,
-    /// What the lookup proposed for a step in which the model's own drafts
-    /// were taken: the lookup still learns from what turns out to be right.
+    /// What the lookup proposes for the coming step, with the chance of each
+    /// token (the lookup still learns from what turns out to be right when
+    /// the model's own drafts were taken instead), and the chance of each
+    /// position of the model's own draft for the step.
     lookup: Vec<u32>,
+    lookup_chances: Vec<f64>,
+    own_chances: Vec<f64>,
     /// Bytes of generated text that are not whole characters yet.
     pending: Vec<u8>,
     /// Text produced this step, not yet delivered.
@@ -266,6 +292,7 @@ impl Active {
             prompt_tokens: self.prompt_len,
             completion_tokens: self.completion,
             cached_prompt_tokens: self.cached_prompt,
+            output_hash: token_hash(&self.tokens[self.prompt_len as usize..]),
         }
     }
 
@@ -352,6 +379,14 @@ impl Drop for Conductor {
     }
 }
 
+/// A hash of token ids (FNV-1a over their four bytes each, little end first):
+/// what two replies are compared by without keeping their tokens.
+pub fn token_hash(tokens: &[u32]) -> u64 {
+    tokens.iter().flat_map(|t| t.to_le_bytes()).fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
+}
+
 /// Hands the whole characters at the start of `pending` to `push`, in order,
 /// and removes them; bytes that cannot be part of a character become U+FFFD.
 /// What is left is the start of a character that later bytes complete. Stops
@@ -432,6 +467,17 @@ impl PoolView for View<'_> {
     }
 }
 
+/// What a step of the warm-up is shaped like.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Probe {
+    /// Rows of a prompt: certain, and the last one wanted.
+    Prompt,
+    /// A window that verifies drafts: not certain, every row wanted.
+    Window,
+    /// A window whose draft rows the model's draft block fills in.
+    Chain,
+}
+
 pub(crate) struct Conductor {
     model: Arc<dyn Model>,
     spec: ContextSpec,
@@ -457,7 +503,14 @@ pub(crate) struct Conductor {
     by_id: HashMap<RequestId, Place>,
     next_seq: u32,
     active: usize,
-    step_time: StepTimeModel,
+    /// What a step costs by its rows, measured at load and kept up to date.
+    prices: PriceTable,
+    /// What the model's own draft chain costs by its links, in device
+    /// milliseconds.
+    chain: Curve,
+    /// How the model's own drafts have been accepted by every sequence, per
+    /// position: where a new sequence's estimate starts.
+    own_engine: Acceptance,
     /// Whose turn it is, rounds of generation or pieces of prompt.
     share: Share,
     /// The rows of each prompt that has started and is not read yet, for the
@@ -481,18 +534,14 @@ pub(crate) struct Conductor {
     runs: Vec<(u32, u32)>,
     /// The outcome of this step's draft windows, for the next step's record.
     commits: Vec<Commit>,
+    /// The window a step of the warm-up left uncommitted.
+    pending_probe: Option<Commit>,
+    /// What the warm-up measured, for the snapshot.
+    calibration: Option<Calibration>,
     output: StepOutput,
     scratch_tokens: Vec<u32>,
-    /// The lookup's proposal for the sequence being looked at, and the
-    /// confidence of each of its tokens.
-    proposal: Vec<u32>,
-    confidence: Vec<f64>,
     /// How the wanted rows of the step are picked, in their order.
     samplers: Vec<SampleRow>,
-    /// What a link of the model's own draft chain costs, in device
-    /// milliseconds: measured from the steps that drafted, `None` before the
-    /// first.
-    own_link_ms: Option<f64>,
 }
 
 impl Conductor {
@@ -508,6 +557,7 @@ impl Conductor {
         };
         let slots = config.max_slots as usize;
         let share = Share::new(config.prefill_slowdown);
+        let own_engine = Acceptance::new(config.window_rows as usize, 0.999);
         let admission = AdmissionConfig {
             output_clip: config.output_clip,
             initial_ratio: config.output_ratio,
@@ -537,15 +587,14 @@ impl Conductor {
                 devices: Vec::with_capacity(exec.devices()),
             },
             samplers: Vec::with_capacity(max_rows as usize),
-            own_link_ms: None,
             requests: Vec::with_capacity(slots),
             parts: Vec::with_capacity(max_rows as usize),
             updates: Vec::with_capacity(slots),
             runs: Vec::with_capacity(max_rows as usize),
             commits: Vec::with_capacity(slots),
+            pending_probe: None,
+            calibration: None,
             scratch_tokens: Vec::with_capacity(64),
-            proposal: Vec::with_capacity(config.max_draft as usize),
-            confidence: Vec::with_capacity(config.max_draft as usize),
             model,
             config,
             max_rows,
@@ -553,7 +602,9 @@ impl Conductor {
             exec,
             rx,
             active: 0,
-            step_time: StepTimeModel::default(),
+            prices: PriceTable::new(),
+            chain: Curve::new(),
+            own_engine,
             share,
             prompt_rows: Vec::with_capacity(slots),
             step_no: 0,
@@ -565,39 +616,131 @@ impl Conductor {
         }
     }
 
-    /// Runs a few steps of one row, so lazily loaded kernels and first-use
-    /// costs are paid before the first request, and forgets their timing.
+    /// Runs steps before the first request: a few of one row, so lazily
+    /// loaded kernels and first-use costs are paid, and then steps of every
+    /// row count a window can have and of the sizes a prompt's piece comes
+    /// in, which measure what a step costs on these devices (and, for a model
+    /// with a draft block, what each length of its chain costs). The
+    /// measurements are the table that drafts and pieces are decided from;
+    /// every step that runs corrects it afterwards. The steps work in slot 0
+    /// on the first pages of the pool, which the first request overwrites.
     pub(crate) fn warm_up(&mut self) -> Result<(), ExecError> {
+        let (begun, first_step) = (Instant::now(), self.step_no);
         for _ in 0..3 {
-            let used = {
-                // One row of a sequence that starts in slot 0, on the pool's
-                // first page; the first request overwrites both.
-                let entry = self.model.page_entry(0);
-                let mut writer = RecordWriter::new(self.exec.record(), self.step_no, 1, 1)
-                    .expect("room for a row");
-                writer.segment(0, 0, 1, true).expect("room for a segment");
-                writer
-                    .row(Row { slot: 0, position: 0, token: 0, context: 0 })
-                    .expect("room for a row");
-                writer.runs(&[(0, 1)]).expect("room for a run");
-                writer
-                    .updates(
-                        [TableUpdate { slot: 0, first: 0, count: 1 }].into_iter(),
-                        [entry].into_iter(),
-                    )
-                    .expect("room for a page-table entry");
-                writer.finish().expect("room for the header")
-            };
-            self.step_no += 1;
-            self.exec.dispatch(&StepMeta {
-                step: self.step_no,
-                record_bytes: used,
-                after_idle: true,
-            })?;
-            self.exec.collect(Duration::from_millis(1), &mut self.output)?;
+            self.probe(1, Probe::Prompt)?;
         }
+        let window = if self.model.own_drafts() > 0 {
+            self.model.draft_rows().min(self.max_rows)
+        } else {
+            0
+        };
+        // The rows of the windows and of the rounds without drafts that the
+        // sequences make up together, then the doublings up to a piece of
+        // prompt. Prompts are read a piece at a time, so nothing above is run.
+        let piece = self.model.prompt_rows().min(self.max_rows);
+        let capacity = self.config.pages.saturating_mul(self.config.cells_per_page);
+        let top = piece.min(capacity).min(self.context_length);
+        let mut sizes: Vec<u32> = (1..=window.max(self.config.max_slots.min(8)).min(top)).collect();
+        let mut rows = 16;
+        while rows < top {
+            if rows > *sizes.last().expect("one row at least") {
+                sizes.push(rows);
+            }
+            rows *= 2;
+        }
+        if top > *sizes.last().expect("one row at least") {
+            sizes.push(top);
+        }
+        // The fastest of two for the steps the policy chooses between, which
+        // are short and many; the long ones are measured once. What other work
+        // on the machine adds is not the price of a step, and the steps that
+        // run correct the table anyway.
+        for rows in sizes {
+            let reps = if rows <= 24 { 2 } else { 1 };
+            let shape = if rows <= window { Probe::Window } else { Probe::Prompt };
+            let mut fastest = f64::INFINITY;
+            for _ in 0..reps {
+                fastest = fastest.min(self.probe(rows, shape)?.0);
+            }
+            self.prices.measured(rows, fastest);
+        }
+        // The chain: windows of 2 rows to the longest one sequence has, whose
+        // first row is the newest token and the others the drafts the chain
+        // makes.
+        let longest = self.config.window_rows.min(window).min(top);
+        for links in 1..longest {
+            let mut fastest = f64::INFINITY;
+            for _ in 0..2 {
+                fastest = fastest.min(self.probe(links + 1, Probe::Chain)?.1);
+            }
+            self.chain.set(links, fastest);
+        }
+        // The last probe left a window that nothing has committed.
+        self.probe(1, Probe::Prompt)?;
+        self.calibration = Some(Calibration {
+            steps: (self.step_no - first_step) as u32,
+            seconds: begun.elapsed().as_secs_f64(),
+            step_ms: self.prices.points().collect(),
+            chain_ms: self.chain.points().collect(),
+        });
         self.stats.reset();
         Ok(())
+    }
+
+    /// One step of `rows` rows of the sequence in slot 0, from position 0,
+    /// shaped as `shape` says. Returns the time of the step in milliseconds
+    /// and what the model's own draft chain took of it.
+    fn probe(&mut self, rows: u32, shape: Probe) -> Result<(f64, f64), ExecError> {
+        let cells = self.config.cells_per_page;
+        let used = {
+            let pages = rows.div_ceil(cells);
+            let entries: Vec<u32> = (0..pages).map(|page| self.model.page_entry(page)).collect();
+            let mut writer = RecordWriter::new(self.exec.record(), self.step_no + 1, 1, rows)
+                .expect("room for the rows");
+            // A window of one row is certain, as it is in a round.
+            let deferred = shape != Probe::Prompt && rows > 1;
+            writer.segment(0, 0, rows, !deferred).expect("room for a segment");
+            if shape == Probe::Chain && deferred {
+                writer.own_drafts().expect("room for the flag");
+            }
+            for position in 0..rows {
+                writer
+                    .row(Row { slot: 0, position, token: 0, context: 0 })
+                    .expect("room for a row");
+            }
+            if deferred {
+                writer.runs(&[(0, rows)]).expect("room for a run");
+                writer
+                    .samplers((0..rows).map(|position| SampleParams::GREEDY.row(position)))
+                    .expect("room for samplers");
+            } else {
+                writer.runs(&[(rows - 1, 1)]).expect("room for a run");
+                writer.samplers([SampleParams::GREEDY.row(rows - 1)]).expect("room for a sampler");
+            }
+            // The window of the step before is committed by this one.
+            let previous: Vec<Commit> = self.pending_probe.take().into_iter().collect();
+            writer.commits(&previous).expect("room for a commit");
+            writer
+                .updates(
+                    [TableUpdate { slot: 0, first: 0, count: pages }].into_iter(),
+                    entries.into_iter(),
+                )
+                .expect("room for the page-table entries");
+            writer.finish().expect("room for the header")
+        };
+        if shape != Probe::Prompt && rows > 1 {
+            self.pending_probe = Some(Commit { row0: 0, rows, slot: 0, accepted: 1 });
+        }
+        self.step_no += 1;
+        let begun = Instant::now();
+        self.exec.dispatch(&StepMeta {
+            step: self.step_no,
+            record_bytes: used,
+            after_idle: true,
+        })?;
+        self.exec.collect(self.config.conductor_spin, &mut self.output)?;
+        let ms = begun.elapsed().as_secs_f64() * 1e3;
+        Ok((ms - self.output.draft_ms, self.output.draft_ms))
     }
 
     /// The loop. Returns after a shutdown, when every request has ended.
@@ -664,6 +807,7 @@ impl Conductor {
                 self.stats.counters.device_wakes = self.exec.device_wakes();
                 let copy = StatsCopy {
                     stats: self.stats.clone(),
+                    calibration: self.calibration.clone(),
                     pages_free: self.pool.free_pages(),
                     pages_capacity: self.pool.capacity(),
                     cached_pages: self.cache.as_ref().map_or(0, |cache| cache.index.len() as u32),
@@ -715,7 +859,7 @@ impl Conductor {
     /// Puts a new request in line. It starts at the next pass of the
     /// admission accounting in which it fits.
     fn enqueue(&mut self, submission: Submission) {
-        let Submission { id, prompt, max_tokens, stop, sampling, sink } = submission;
+        let Submission { id, prompt, max_tokens, stop, sampling, draft, sink } = submission;
         let refuse = |error: EngineError| {
             let _ = sink.send(Event::Error(error));
         };
@@ -788,10 +932,8 @@ impl Conductor {
             tokens,
             states,
             drafter: LookupDrafter::new(),
-            own_acceptance: Acceptance::new(
-                self.config.max_draft as usize,
-                self.config.draft_prior,
-            ),
+            own_acceptance: Acceptance::new(self.config.window_rows as usize, 0.95),
+            draft_allowed: draft,
             sampling: {
                 // What the request leaves open is the model's own setting. A
                 // request without a seed gets one of its own.
@@ -812,9 +954,11 @@ impl Conductor {
             completion: 0,
             waited_steps: 0,
             counted_waiting: false,
-            draft: Vec::with_capacity(self.config.max_draft as usize),
+            draft: Vec::with_capacity(self.config.window_rows as usize),
             own: false,
-            lookup: Vec::with_capacity(self.config.max_draft as usize),
+            lookup: Vec::with_capacity(self.config.window_rows as usize),
+            lookup_chances: Vec::with_capacity(self.config.window_rows as usize),
+            own_chances: Vec::with_capacity(self.config.window_rows as usize),
             pending: Vec::new(),
             emitted: String::new(),
             finished: None,
@@ -1158,39 +1302,62 @@ impl Conductor {
 
     /// Decides how many drafts each generating sequence asks for, and
     /// fills `requests` for the planner. A round of generation asks for the
-    /// windows, a piece of prompt for the prompts and the newest token of
-    /// each generating sequence, without drafts.
+    /// windows (`prompts` false), a piece of prompt for the prompts and the
+    /// newest token of each generating sequence, without drafts.
+    ///
+    /// The drafts of the windows are chosen together, by the rate of the
+    /// whole step ([`ares_sched::choose`]): each sequence offers what the
+    /// lookup in earlier text proposes (with its confidence in each token) and
+    /// what the model's own draft block is likely to get right at each
+    /// position (measured for this sequence, from what the engine saw where it
+    /// has none yet), and the step takes the rows that pay, from the drafter
+    /// that pays, by the price of a step of that many rows.
     fn want(&mut self, turn: Turn) {
         self.requests.clear();
         let round = turn == Turn::Round;
-        let span = self.span;
-        let reads = |a: &Active| a.cells.len().min(u64::from(span));
-        let mut generating = 0u32;
-        let mut windows = Load::default();
-        for a in self.slots.iter().flatten().filter(|a| a.generating()) {
-            generating += 1;
-            windows = windows.plus(load_of(span, a.cells.len(), 1));
-        }
-        let cost = self.step_time.cost();
+        let span = u64::from(self.span);
+        let generating = self.slots.iter().flatten().filter(|a| a.generating()).count() as u32;
         // Every draft row needs its logits, like the one row every sequence
-        // may need: drafts share what the model gives beyond those.
-        let mut spare_logit_rows = self.model.logit_rows().saturating_sub(self.active as u32);
+        // may need: drafts share what the model gives beyond those, and the
+        // rows of a step that verifies drafts are bounded by the model.
+        let spare_rows = self
+            .model
+            .logit_rows()
+            .saturating_sub(self.active as u32)
+            .min(self.model.draft_rows().saturating_sub(generating));
+        let drafting = round && self.model.own_drafts() > 0 && self.config.window_rows > 1;
+        // The windows that offer nothing are rows of the step all the same:
+        // the price of the step counts them in.
+        let (mut quiet, mut quiet_cells) = (0u32, 0u64);
         for (slot, a) in self.slots.iter_mut().enumerate() {
             let Some(a) = a else { continue };
-            let want = if a.generating() {
-                a.draft.clear();
+            if !a.generating() {
+                // Prompts wait for their piece.
+                if !round {
+                    self.requests.push(Request {
+                        seq: SeqId(slot as u32),
+                        want: Want::Prefill { tokens: a.prefill_left() },
+                        waited_steps: a.waited_steps,
+                    });
+                }
+                continue;
+            }
+            a.draft.clear();
+            a.own = false;
+            a.lookup.clear();
+            a.lookup_chances.clear();
+            a.own_chances.clear();
+            if drafting && a.draft_allowed {
                 // A window never needs rows past the end of the request: the
                 // tokens still wanted, and the room left in the context.
                 let wanted = a.max_tokens.map_or(u32::MAX, |m| m - a.completion);
                 let room = self.context_length.saturating_sub(a.tokens.len() as u32);
-                // And the model bounds the rows of a step that verifies drafts.
                 let cap = self
                     .config
-                    .max_draft
+                    .window_rows
+                    .saturating_sub(1)
                     .min(wanted.saturating_sub(1))
-                    .min(room)
-                    .min(self.model.draft_rows().saturating_sub(1))
-                    .min(spare_logit_rows) as usize;
+                    .min(room) as usize;
                 // The window ends where a checkpoint is due, so that the
                 // state is exactly there when all of it is accepted.
                 let cap = match &self.cache {
@@ -1204,101 +1371,89 @@ impl Conductor {
                     }
                     None => cap,
                 };
-                a.own = false;
-                a.lookup.clear();
-                if round && self.config.speculation && cap > 0 {
-                    // Two drafters: the lookup, whose proposal costs nothing
-                    // but is there only where text repeats, and the model's
-                    // own draft block, which always has one and pays for
-                    // every link. Each gets its best length; the one with
-                    // more expected tokens per millisecond drafts.
-                    if self.config.drafters == Drafters::Own {
-                        self.proposal.clear();
-                        self.confidence.clear();
-                    } else {
-                        a.drafter.draft(
-                            &self.corpus,
-                            cap,
-                            &mut self.proposal,
-                            &mut self.confidence,
-                        );
-                    }
-                    let own_cap = match self.config.drafters {
-                        Drafters::Lookup => 0,
-                        Drafters::Both | Drafters::Own => cap.min(self.model.own_drafts() as usize),
-                    };
-                    let own_cost =
-                        DraftCost { fixed_ms: 0.0, per_token_ms: self.own_link_ms.unwrap_or(0.0) };
-                    let (lookup, own) = match cost {
-                        // Before any step was measured, try whole drafts.
-                        None => (self.proposal.len(), own_cap),
-                        // A step time model that has seen steps of one size
-                        // only cannot tell a fixed cost per step from a cost
-                        // per row: it puts everything on the rows (base 0),
-                        // and then no draft ever pays, so the rows never vary
-                        // and it never learns better. A steady batch gets
-                        // stuck there. So every fourth sequence in turn drafts
-                        // regardless, which varies the rows of the steps.
-                        Some(cost) if cost.base_ms <= 0.0 => {
-                            if (self.step_no + slot as u64).is_multiple_of(4) {
-                                (self.proposal.len(), own_cap)
-                            } else {
-                                (0, 0)
-                            }
-                        }
-                        Some(cost) => {
-                            // A draft row of this sequence costs what a row
-                            // at its depth costs; the step without drafts is
-                            // the newest token of every generating sequence,
-                            // each at its own depth.
-                            let per_row = cost.row_ms(reads(a));
-                            let base = cost.ms(windows) - per_row * f64::from(generating);
-                            let best = |rates: &[f64], drafter| {
-                                best_draft_len(
-                                    rates,
-                                    base,
-                                    per_row,
-                                    generating,
-                                    f64::from(generating),
-                                    drafter,
-                                )
-                            };
-                            // The lookup says how sure it is of each token:
-                            // from how long the match is and how its earlier
-                            // occurrences went on.
-                            let lookup = best(&self.confidence, LOOKUP);
-                            let own = best(&a.own_acceptance.rates()[..own_cap], own_cost);
-                            if own.len > 0 && own.tokens_per_ms > lookup.tokens_per_ms {
-                                (0, own.len)
-                            } else {
-                                (lookup.len, 0)
-                            }
-                        }
-                    };
-                    // Where nothing decided yet, a proposal of the lookup
-                    // goes first: it is rarer and free.
-                    if lookup > 0 {
-                        a.draft.extend_from_slice(&self.proposal[..lookup]);
-                        spare_logit_rows -= lookup as u32;
-                    } else if own > 0 {
-                        a.own = true;
-                        a.draft.resize(own, 0);
-                        a.lookup.extend_from_slice(&self.proposal);
-                        spare_logit_rows -= own as u32;
-                    }
+                if cap > 0 {
+                    // The lookup first: its proposal costs nothing, and it
+                    // learns from what is right whether it is taken or not.
+                    a.drafter.draft(&self.corpus, cap, &mut a.lookup, &mut a.lookup_chances);
+                    let own = cap.min(self.model.own_drafts() as usize);
+                    a.own_acceptance.rates(
+                        &self.own_engine,
+                        self.config.draft_prior,
+                        own,
+                        &mut a.own_chances,
+                    );
                 }
-                Want::Window { drafts: a.draft.len() as u32 }
-            } else if round {
-                // Prompts wait for their piece.
-                continue;
-            } else {
-                Want::Prefill { tokens: a.prefill_left() }
-            };
+            }
+            if a.lookup_chances.is_empty() && a.own_chances.is_empty() {
+                quiet += 1;
+                quiet_cells += a.cells.len().min(span);
+            }
             self.requests.push(Request {
                 seq: SeqId(slot as u32),
-                want,
+                want: Want::Window { drafts: 0 },
                 waited_steps: a.waited_steps,
             });
+        }
+        if !drafting {
+            return;
+        }
+        // The offers of every generating sequence that has any.
+        let mut offers: Vec<[Offer<'_>; 2]> = Vec::new();
+        let mut asking: Vec<usize> = Vec::new();
+        for (slot, a) in self.slots.iter().enumerate() {
+            let Some(a) = a.as_ref().filter(|a| a.generating() && a.draft_allowed) else {
+                continue;
+            };
+            if a.lookup_chances.is_empty() && a.own_chances.is_empty() {
+                continue;
+            }
+            offers.push([
+                Offer { drafter: LOOKUP, chances: &a.lookup_chances },
+                Offer { drafter: OWN, chances: &a.own_chances },
+            ]);
+            asking.push(slot);
+        }
+        let wishes: Vec<Wish<'_>> = asking
+            .iter()
+            .zip(&offers)
+            .map(|(slot, offers)| {
+                let a = self.slots[*slot].as_ref().expect("asked");
+                Wish { reads: a.cells.len().min(span), offers }
+            })
+            .collect();
+        let step = |load: Load| {
+            self.prices.ms(Load { rows: load.rows + quiet, cells: load.cells + quiet_cells })
+        };
+        let chain = |drafter: usize, links: u32| match drafter {
+            OWN => self.chain.ms(links).unwrap_or(0.0),
+            _ => 0.0,
+        };
+        let prices = Prices { step: &step, chain: &chain, spare_rows };
+        let choices = choose(&wishes, &prices);
+        drop(wishes);
+        let mut own_asked = false;
+        for (slot, choice) in asking.iter().zip(choices) {
+            let a = self.slots[*slot].as_mut().expect("asked");
+            let Choice { drafter, drafts } = choice;
+            let drafts = drafts as usize;
+            match drafter {
+                Some(LOOKUP) => a.draft.extend_from_slice(&a.lookup[..drafts]),
+                Some(OWN) => {
+                    a.own = true;
+                    a.draft.resize(drafts, 0);
+                }
+                _ => {}
+            }
+            own_asked |= a.own;
+            if !a.own && !a.own_chances.is_empty() {
+                a.own_acceptance.fade(UNASKED_SEQUENCE);
+            }
+            if let Some(request) = self.requests.iter_mut().find(|r| r.seq.0 == *slot as u32) {
+                request.want = Want::Window { drafts: drafts as u32 };
+            }
+        }
+        if !own_asked {
+            self.own_engine.fade(UNASKED_ENGINE);
         }
     }
 
@@ -1336,7 +1491,7 @@ impl Conductor {
             .map(|a| a.cells.len())
             .max()
             .unwrap_or(0);
-        let (span, cost) = (self.span, self.step_time.cost());
+        let (span, prices) = (self.span, &self.prices);
         let pending = Pending {
             generating,
             prompts: &self.prompt_rows,
@@ -1345,7 +1500,7 @@ impl Conductor {
         };
         let turn = self
             .share
-            .next(&pending, |rows| cost.map_or(0.0, |cost| cost.ms(load_of(span, deepest, rows))));
+            .next(&pending, |rows| prices.ms(load_of(span, deepest, rows)).unwrap_or(0.0));
         self.want(turn);
         let drafting =
             self.requests.iter().any(|r| matches!(r.want, Want::Window { drafts } if drafts > 0));
@@ -1503,7 +1658,7 @@ impl Conductor {
         self.stats.record(Phase::Wait, (t_back - t_wait).as_nanos() as u64);
         self.stats.counters.conductor_wakes.record(woke);
         // What the model's own drafter took is not a cost of the rows: it is
-        // learned on its own, per link of the longest chain of the step.
+        // learned on its own, by the links of the longest chain of the step.
         let own_links = self
             .parts
             .iter()
@@ -1517,14 +1672,10 @@ impl Conductor {
             counters.own_draft_steps += 1;
             counters.own_draft_links += u64::from(own_links);
             counters.own_draft_us += (draft_ms * 1e3) as u64;
-            let per_link = draft_ms / f64::from(own_links);
-            self.own_link_ms = Some(match self.own_link_ms {
-                Some(known) => known + 0.1 * (per_link - known),
-                None => per_link,
-            });
+            self.chain.observe(own_links, draft_ms);
         }
         let step_ms = (t_back - t_dispatch).as_secs_f64() * 1e3;
-        self.step_time.observe_load(load, step_ms - draft_ms);
+        self.prices.observe(load, step_ms - draft_ms);
         self.share.spent(turn, step_ms, generating, self.prompt_rows.iter().any(|rows| *rows > 0));
         let last_done = self.output.devices.iter().map(|d| d.finished_at_ns).max().unwrap_or(0);
         self.last_done_ns = Some(last_done);
@@ -1749,12 +1900,14 @@ impl Conductor {
                         let source = usize::from(a.own);
                         if a.own {
                             a.own_acceptance.observe(drafts, accepted);
+                            self.own_engine.observe(drafts, accepted);
                         } else {
                             // The corpus learns what matches like this one
                             // are worth.
                             a.drafter.observe(&mut self.corpus, drafts, accepted);
                         }
                         let counters = &mut self.stats.counters;
+                        counters.draft_lengths[source][drafts.min(DRAFT_POSITIONS)] += 1;
                         counters.drafts_accepted += accepted as u64;
                         counters.drafts_rejected += (drafts - accepted) as u64;
                         // Positions up to the first rejected one were tested.
@@ -1764,9 +1917,10 @@ impl Conductor {
                             counters.drafts_accepted_at[source][at] += u64::from(i < accepted);
                         }
                     }
-                    // A proposal of the lookup that was not taken learns from
-                    // the tokens that are now known.
-                    if a.own && !a.lookup.is_empty() {
+                    // A proposal of the lookup that was not taken (the model's
+                    // drafts were, or none) learns from the tokens that are now
+                    // known: the first of them is known in every window.
+                    if (a.own || drafts == 0) && !a.lookup.is_empty() {
                         let known = a.lookup.len().min(accepted + 1);
                         let right =
                             (0..known).take_while(|&i| picks[i].token == a.lookup[i]).count();

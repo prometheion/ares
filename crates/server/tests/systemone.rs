@@ -43,7 +43,7 @@ fn chat_body(extra: Value) -> String {
 }
 
 fn usage(prompt_tokens: u32) -> Usage {
-    Usage { prompt_tokens, completion_tokens: 0, cached_prompt_tokens: 0 }
+    Usage { prompt_tokens, completion_tokens: 0, cached_prompt_tokens: 0, ..Usage::default() }
 }
 
 /// Scores that favour the first option of every question: option `i` gets

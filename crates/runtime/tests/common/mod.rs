@@ -53,6 +53,7 @@ pub fn request(prompt: &str, max_tokens: Option<u32>) -> GenerateRequest {
         sampling: Sampling::default(),
         max_tokens,
         stop: Vec::new(),
+        draft: true,
         id: fresh_id(),
     }
 }
@@ -434,11 +435,22 @@ pub fn bad_requests_are_refused_at_once(rt: &Runtime, context_length: u32) {
 /// the right reason and the right counts.
 pub fn requests_end_for_the_right_reason(rt: &Runtime, context_length: u32) {
     let run = alone(rt, "count me", Some(25));
+    // The hash of the reply is the hash of its tokens.
+    let tokens: Vec<u32> = run
+        .text
+        .chars()
+        .map(|c| u32::from(ares_runtime::unprintable(c).expect("a printable token")))
+        .collect();
     assert_eq!(
         (run.finish, run.usage),
         (
             FinishReason::Length,
-            Usage { prompt_tokens: 8, completion_tokens: 25, cached_prompt_tokens: 0 }
+            Usage {
+                prompt_tokens: 8,
+                completion_tokens: 25,
+                cached_prompt_tokens: 0,
+                output_hash: ares_runtime::token_hash(&tokens)
+            }
         )
     );
     assert_eq!(run.text.chars().count(), 25);
@@ -500,6 +512,13 @@ pub fn the_end_token_ends_a_request_where_it_first_comes_up(make: &dyn Fn(Option
             prompt_tokens: prompt.len() as u32,
             completion_tokens: first as u32 + 1,
             cached_prompt_tokens: 0,
+            // The end token is not part of the reply.
+            output_hash: ares_runtime::token_hash(
+                &chars[..first]
+                    .iter()
+                    .map(|c| u32::from(ares_runtime::unprintable(*c).expect("a token")))
+                    .collect::<Vec<_>>(),
+            ),
         },
     };
     assert_eq!(alone(&rt, prompt, Some(60)), expected);

@@ -90,6 +90,8 @@ pub(crate) struct Timings {
     /// Draft tokens put to the test and accepted for this request, when the
     /// engine's totals can be read as this request's: it ran alone.
     pub drafts: Option<(u64, u64)>,
+    /// A hash of the reply's token ids ([`Usage::output_hash`]).
+    pub output_hash: u64,
 }
 
 impl Timings {
@@ -430,6 +432,7 @@ impl Run {
             generated_tokens: usage.completion_tokens,
             generated_ms: end.saturating_sub(first) as f64 / 1e6,
             drafts,
+            output_hash: usage.output_hash,
         }
     }
 

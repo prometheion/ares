@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use ares_cuda::Precision;
 use ares_server::ReasoningFormat;
-use ares_server::plan::{self, LoadOptions, SplitKind};
+use ares_server::plan::{self, Drafter, LoadOptions, SplitKind};
 use ares_tokenizer::Json;
 
 pub const USAGE: &str = "\
@@ -56,8 +56,21 @@ OPTIONS:
                                exact: f16 products everywhere, same text whatever
                                       else runs in a step
                                [default: fast]
-        --drafts <N>           Most tokens drafted and verified per sequence and
-                               step, 0 for none [default: 3]
+        --drafters <LIST>      The model drafters that take part, such as mtp (the
+                               model's own draft block) or none; a file name is
+                               a block drafter from a file of its own (DFlash2,
+                               not built yet). The lookup in earlier text takes
+                               part with them and never alone; with none the
+                               server does not speculate. The length of a draft
+                               and whose it is are chosen for every step from
+                               the price of a step and the acceptance measured
+                               [default: all the model has: mtp if the file has
+                               a draft block]
+        --window <ROWS>        Most rows of one sequence's window, its newest
+                               token and the drafts verified with it. The room
+                               for them is VRAM (about 5 MiB a row for the 27B,
+                               for every sequence) [default: 8, the rows one
+                               launch of the few-row weight kernels takes]
         --draft-vocab <FILE>   Token ids (one per line) the model's draft block may
                                propose: a shorter list makes a draft cheaper
                                [default: every token whose head row is on the
@@ -156,6 +169,29 @@ fn list<T: std::str::FromStr>(
     expected: &'static str,
 ) -> Result<Vec<T>, CliError> {
     value.split(',').map(|item| number(flag, item, expected)).collect()
+}
+
+/// The model drafters of `--drafters`: names separated by commas. `mtp` is
+/// the model's own draft block, `none` (alone) is no drafter, anything else is
+/// the file of a block drafter.
+fn drafters(value: &str) -> Result<Vec<Drafter>, CliError> {
+    let expected = "mtp, none, or a drafter file; several separated by commas";
+    if value.trim() == "none" {
+        return Ok(Vec::new());
+    }
+    let mut list = Vec::new();
+    for name in value.split(',').map(str::trim) {
+        let drafter = match name {
+            "" | "none" => return Err(invalid("--drafters", value, expected)),
+            "mtp" => Drafter::Mtp,
+            file => Drafter::Block(PathBuf::from(file)),
+        };
+        if list.contains(&drafter) {
+            return Err(invalid("--drafters", value, expected));
+        }
+        list.push(drafter);
+    }
+    Ok(list)
 }
 
 /// A variable of the chat template: a JSON value where the text is one
@@ -296,10 +332,20 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, CliErr
                 };
                 "--precision"
             }
-            "--drafts" => {
-                let value = text(value("--drafts")?)?;
-                load.drafts = Some(number("--drafts", &value, "a number of tokens (0 for none)")?);
-                "--drafts"
+            "--drafters" => {
+                let value = text(value("--drafters")?)?;
+                load.drafters = Some(drafters(&value)?);
+                "--drafters"
+            }
+            "--window" => {
+                let value = text(value("--window")?)?;
+                let expected = "a number of rows, at least 2";
+                let rows: u32 = number("--window", &value, expected)?;
+                if rows < 2 {
+                    return Err(invalid("--window", &value, expected));
+                }
+                load.window = Some(rows);
+                "--window"
             }
             "--draft-vocab" => {
                 load.draft_vocabulary = Some(PathBuf::from(value("--draft-vocab")?));
@@ -429,8 +475,10 @@ mod tests {
             "12G",
             "--precision",
             "exact",
-            "--drafts",
-            "0",
+            "--drafters",
+            "none",
+            "--window",
+            "12",
             "--chat-var",
             "enable_thinking=false",
             "--chat-var=reasoning_effort=medium",
@@ -446,7 +494,8 @@ mod tests {
         assert_eq!(load.kv, Some((CacheFormat::F16, CacheFormat::F16)));
         assert_eq!(load.ram, Some(12 << 30));
         assert_eq!(load.precision, Precision::Exact);
-        assert_eq!(load.drafts, Some(0));
+        assert_eq!(load.drafters, Some(Vec::new()));
+        assert_eq!(load.window, Some(12));
         assert_eq!(
             load.chat_variables,
             vec![
@@ -461,6 +510,27 @@ mod tests {
         assert_eq!(load.kv, Some((CacheFormat::Q8, CacheFormat::F16)));
         assert_eq!(load.draft_vocabulary, Some(PathBuf::from("v.txt")));
         assert_eq!(run(&["--model=m", "--split=layer"]).load.split, Some(SplitKind::Layer));
+    }
+
+    #[test]
+    fn drafters_are_named_one_by_one_and_a_file_is_a_block_drafter() {
+        let drafters = |list: &str| run(&["--model=m", "--drafters", list]).load.drafters;
+        assert_eq!(drafters("mtp"), Some(vec![Drafter::Mtp]));
+        assert_eq!(drafters("none"), Some(Vec::new()));
+        assert_eq!(
+            drafters("mtp, /models/dflash2.gguf"),
+            Some(vec![Drafter::Mtp, Drafter::Block(PathBuf::from("/models/dflash2.gguf"))])
+        );
+        assert_eq!(run(&["--model=m"]).load.drafters, None, "all that are available");
+        for list in ["", "none,mtp", "mtp,mtp", "mtp,,x"] {
+            assert!(
+                matches!(
+                    parse_strs(&["--model=m", "--drafters", list]),
+                    Err(CliError::InvalidValue { flag: "--drafters", .. })
+                ),
+                "{list:?}"
+            );
+        }
     }
 
     #[test]
@@ -561,12 +631,14 @@ mod tests {
             (&["--context", "0"], "--context"),
             (&["--context", "lots"], "--context"),
             (&["--parallel", "0"], "--parallel"),
+            (&["--window", "1"], "--window"),
+            (&["--window", "wide"], "--window"),
             (&["--kv", "q3"], "--kv"),
             (&["--kv", "q8,q8,q8"], "--kv"),
             (&["--ram", "lots"], "--ram"),
             (&["--ram", "-1"], "--ram"),
             (&["--precision", "sloppy"], "--precision"),
-            (&["--drafts", "-1"], "--drafts"),
+            (&["--drafters", "none,mtp"], "--drafters"),
             (&["--chat-var", "novalue"], "--chat-var"),
             (&["--chat-var", "=x"], "--chat-var"),
         ] {

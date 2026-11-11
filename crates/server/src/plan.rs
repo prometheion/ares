@@ -14,11 +14,17 @@ use ares_tokenizer::Json;
 /// per page-table entry.
 pub const CELLS_PER_PAGE: u32 = ares_cuda::ENTRY_CELLS;
 
-/// The most draft tokens a sequence verifies in a step when the operator
-/// names no number. The conductor picks the length of every draft from the
-/// acceptance it measures, so this is a cap, and a cap of two to six made no
-/// difference where it was measured (Qwen3.8-27B with its own draft block).
-pub const DEFAULT_DRAFTS: u32 = 3;
+/// The most rows one sequence's window has when the operator names no number:
+/// the rows one launch of the few-row weight kernels takes. Up to that many
+/// rows a step reads the weights once; a ninth row is a second launch of
+/// them, and the price of that is measured on the devices at load and decides
+/// whether a longer window pays (it did not in the measurements of the model's
+/// own draft block). Rows of windows are VRAM, which is why the room for them
+/// is a choice: each takes the inputs the model keeps for the commit, its
+/// logits and a link of the draft block's chain, about 5 MiB of the 27B
+/// together. The window is not how long a draft is: that is chosen for every
+/// step from the measured price and acceptance.
+pub const DEFAULT_WINDOW: u32 = ares_cuda::MAX_BATCH;
 
 /// The sequences that run at once when the operator names no number: one
 /// conversation and one request next to it. Every sequence takes memory for
@@ -52,6 +58,15 @@ impl SplitKind {
     }
 }
 
+/// A model drafter, as the operator names it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Drafter {
+    /// The model's own draft block (multi-token prediction).
+    Mtp,
+    /// A block drafter from a file of its own (DFlash2). Not built yet.
+    Block(PathBuf),
+}
+
 /// What the operator asked for. `None` means "decide from the devices and
 /// the model".
 #[derive(Debug, Clone, PartialEq)]
@@ -73,8 +88,13 @@ pub struct LoadOptions {
     pub ram: Option<u64>,
     /// How the matrix products round.
     pub precision: Precision,
-    /// The most draft tokens a sequence verifies in a step; 0 for none.
-    pub drafts: Option<u32>,
+    /// The model drafters that take part. `None`: every one that is
+    /// available (the model's own draft block, if the file has one). An empty
+    /// list: none, and with none the engine does not speculate at all. The
+    /// lookup in earlier text takes part with them and never alone.
+    pub drafters: Option<Vec<Drafter>>,
+    /// The most rows of one sequence's window ([`DEFAULT_WINDOW`]).
+    pub window: Option<u32>,
     /// A file with the token ids the model's draft block may propose.
     pub draft_vocabulary: Option<PathBuf>,
     /// Variables of the chat template.
@@ -94,7 +114,8 @@ impl LoadOptions {
             kv: None,
             ram: None,
             precision: Precision::Fast,
-            drafts: None,
+            drafters: None,
+            window: None,
             draft_vocabulary: None,
             chat_variables: Vec::new(),
         }

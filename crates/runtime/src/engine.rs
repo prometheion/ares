@@ -75,6 +75,11 @@ impl Runtime {
                 "pages, cells per page and slots must be at least 1".into(),
             ));
         }
+        if config.window_rows == 0 {
+            return Err(RuntimeError::Config(
+                "a window has at least one row, its newest token (1: no drafts)".into(),
+            ));
+        }
         if !(config.prefill_slowdown > 1.0 && config.prefill_slowdown.is_finite()) {
             return Err(RuntimeError::Config(format!(
                 "the slowdown of generation while a prompt is read must be above 1, got {}",
@@ -259,6 +264,7 @@ impl Engine for Runtime {
             max_tokens: request.max_tokens,
             stop: request.stop,
             sampling: request.sampling,
+            draft: request.draft,
             sink: events,
         });
         let sent = match self.commands.lock().expect("commands").as_ref() {

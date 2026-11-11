@@ -112,10 +112,15 @@ pub struct HostExecutor {
     record: Vec<u8>,
     picks: Vec<Pick>,
     delay: Duration,
-    /// A base and a time per row, in place of `delay`.
-    row_cost: Option<(Duration, Duration)>,
+    /// The time of a step by its rows, in place of `delay`.
+    step_cost: Option<Box<dyn Fn(u32) -> Duration + Send>>,
     /// How long the step that was dispatched takes.
     step_delay: Duration,
+    /// What a link of the model's draft chain takes on the device, and what
+    /// the chain of the step that was dispatched drafted and took.
+    link: Duration,
+    drafts: Vec<u32>,
+    draft_ms: f64,
     gate: Option<Gate>,
     observer: Option<Observer>,
     dispatched_at: Instant,
@@ -143,8 +148,11 @@ impl HostExecutor {
             record: vec![0; crate::record::max_bytes(max_rows, max_slots)],
             picks: Vec::new(),
             delay: Duration::ZERO,
-            row_cost: None,
+            step_cost: None,
             step_delay: Duration::ZERO,
+            link: Duration::ZERO,
+            drafts: Vec::new(),
+            draft_ms: 0.0,
             gate: None,
             observer: None,
             dispatched_at: Instant::now(),
@@ -187,8 +195,23 @@ impl HostExecutor {
     /// Makes a step take `base` and `per_row` for each of its rows, as a device
     /// does (a pass over the weights, and a cost for every row), instead of
     /// the same time whatever it carries.
-    pub fn with_row_cost(mut self, base: Duration, per_row: Duration) -> Self {
-        self.row_cost = Some((base, per_row));
+    pub fn with_row_cost(self, base: Duration, per_row: Duration) -> Self {
+        self.with_step_cost(move |rows| base + per_row * rows)
+    }
+
+    /// Makes a step take what `cost` says of its rows, as a device does:
+    /// not a line, but a table with edges, such as a second launch of the
+    /// weight kernels from the ninth row on.
+    pub fn with_step_cost(mut self, cost: impl Fn(u32) -> Duration + Send + 'static) -> Self {
+        self.step_cost = Some(Box::new(cost));
+        self
+    }
+
+    /// Makes each link of the model's own draft chain take `link` on the
+    /// device, in addition to the step: the chain of a step is as long as its
+    /// longest window's.
+    pub fn with_link_cost(mut self, link: Duration) -> Self {
+        self.link = link;
         self
     }
 
@@ -230,16 +253,49 @@ impl Executor for HostExecutor {
     }
 
     fn dispatch(&mut self, meta: &StepMeta) -> Result<(), ExecError> {
-        let view = RecordView::new(&self.record[..meta.record_bytes])
-            .map_err(|e| ExecError::Device { device: 0, message: e.to_string() })?;
+        let broken =
+            |e: crate::record::RecordError| ExecError::Device { device: 0, message: e.to_string() };
+        // The model's own drafts: the device fills in the draft rows of the
+        // windows that take them before the blocks read them, and hands the
+        // drafts back with the picks.
+        self.drafts.clear();
+        let mut longest = 0;
+        let mut patches = Vec::new();
+        {
+            let view = RecordView::new(&self.record[..meta.record_bytes]).map_err(broken)?;
+            for i in (0..view.segments()).filter(|i| view.own_drafts(*i)) {
+                let segment = view.segment(i);
+                let newest = view.row(segment.row0);
+                let links = segment.n_rows - 1;
+                longest = longest.max(links);
+                let drafts =
+                    self.model.host_drafts(newest.token, newest.context, newest.position, links);
+                for (j, draft) in drafts.iter().enumerate() {
+                    let position = newest.position + 1 + j as u32;
+                    patches.push((
+                        segment.row0 + 1 + j as u32,
+                        *draft,
+                        self.model.context_of(*draft, position),
+                    ));
+                }
+                self.drafts.extend(drafts);
+            }
+        }
+        for (row, token, context) in patches {
+            RecordView::set_row_inputs(&mut self.record, row, token, context);
+        }
+        let draft_time = self.link * longest;
+        self.draft_ms = draft_time.as_secs_f64() * 1e3;
+        let view = RecordView::new(&self.record[..meta.record_bytes]).map_err(broken)?;
         if let Some(observer) = &mut self.observer {
             observer(&view);
         }
         self.failing = self.fail_at_step == Some(meta.step);
-        self.step_delay = match self.row_cost {
-            Some((base, per_row)) => base + per_row * view.rows(),
-            None => self.delay,
-        };
+        self.step_delay = draft_time
+            + match &self.step_cost {
+                Some(cost) => cost(view.rows()),
+                None => self.delay,
+            };
         self.picks.clear();
         let mut tables = self.tables.lock().expect("tables");
         // The page-table updates, as the device copies them.
@@ -298,6 +354,9 @@ impl Executor for HostExecutor {
         }
         out.picks.clear();
         out.picks.extend_from_slice(&self.picks);
+        out.drafts.clear();
+        out.drafts.extend_from_slice(&self.drafts);
+        out.draft_ms = self.draft_ms;
         out.devices.clear();
         let finished_at_ns = self.clock.now_ns();
         out.devices.resize(self.devices, DeviceTimes { finished_at_ns, ..DeviceTimes::default() });

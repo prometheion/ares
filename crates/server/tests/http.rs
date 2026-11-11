@@ -90,7 +90,12 @@ async fn chat_completion_returns_one_json_object() {
         text("lo"),
         Step::Send(Event::Done {
             finish: FinishReason::Stop,
-            usage: Usage { prompt_tokens: 12, completion_tokens: 2, cached_prompt_tokens: 8 },
+            usage: Usage {
+                prompt_tokens: 12,
+                completion_tokens: 2,
+                cached_prompt_tokens: 8,
+                ..Usage::default()
+            },
         }),
     ]);
     let (status, body) = json(post(&app(&engine), CHAT, &chat_body(json!({}))).await).await;
@@ -290,7 +295,12 @@ async fn usage_chunk_follows_the_last_chunk_when_asked_for() {
         text("Hi"),
         Step::Send(Event::Done {
             finish: FinishReason::Length,
-            usage: Usage { prompt_tokens: 7, completion_tokens: 1, cached_prompt_tokens: 4 },
+            usage: Usage {
+                prompt_tokens: 7,
+                completion_tokens: 1,
+                cached_prompt_tokens: 4,
+                ..Usage::default()
+            },
         }),
     ]);
     let body = chat_body(json!({"stream": true, "stream_options": {"include_usage": true}}));
@@ -724,7 +734,12 @@ async fn a_finished_request_reports_where_its_time_went() {
         text("b"),
         Step::Send(Event::Done {
             finish: FinishReason::Stop,
-            usage: Usage { prompt_tokens: 12, completion_tokens: 5, cached_prompt_tokens: 4 },
+            usage: Usage {
+                prompt_tokens: 12,
+                completion_tokens: 5,
+                cached_prompt_tokens: 4,
+                ..Usage::default()
+            },
         }),
     ]);
     let app = app(&engine);

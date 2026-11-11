@@ -341,7 +341,12 @@ impl Mesh {
     /// the mesh does no sum that can be trusted.
     ///
     /// It waits only for its own copies, never for a stream of the devices'
-    /// work, so it returns even while a kernel spins.
+    /// work, so it returns even while a kernel spins. Work that the failed
+    /// device had already queued still runs after it, and each of its pushes
+    /// writes a flag of the other device with the token it had, which undoes
+    /// the release for the kernels that wait for a later token:
+    /// [`Mesh::release_waiters_until_idle`] is the call for the thread that
+    /// failed.
     pub fn release_waiters(&self) -> Result<()> {
         for (rank, member) in self.members.iter().enumerate() {
             let (Some(push), Some(escape)) = (&member.push, &member.escape) else { continue };
@@ -564,6 +569,34 @@ impl Mesh {
             }
         }
         Ok(())
+    }
+}
+
+impl Mesh {
+    /// [`Mesh::release_waiters`], again and again until everything `stream`
+    /// had queued has run (or `patience` is out): the pushes it had queued
+    /// before the failure write the other device's flags with the tokens they
+    /// carry, one by one, and each of those writes is answered by the next
+    /// release. After the last of them the flags stay ahead for good. Returns
+    /// whether the stream went idle.
+    pub fn release_waiters_until_idle(
+        &self,
+        stream: &Stream,
+        patience: std::time::Duration,
+    ) -> Result<bool> {
+        let until = std::time::Instant::now() + patience;
+        loop {
+            self.release_waiters()?;
+            if stream.is_idle()? {
+                // Whatever it wrote last is answered now.
+                self.release_waiters()?;
+                return Ok(true);
+            }
+            if std::time::Instant::now() >= until {
+                return Ok(false);
+            }
+            std::thread::sleep(std::time::Duration::from_micros(200));
+        }
     }
 }
 

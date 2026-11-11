@@ -62,6 +62,7 @@ pub fn done(finish: FinishReason, prompt: u32, completion: u32) -> Step {
             prompt_tokens: prompt,
             completion_tokens: completion,
             cached_prompt_tokens: 0,
+            ..Usage::default()
         },
     })
 }

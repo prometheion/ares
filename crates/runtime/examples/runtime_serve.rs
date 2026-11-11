@@ -37,7 +37,9 @@ OPTIONS
   --rounds R            requests per client with --load (default 3)
   --tokens N            tokens per request with --load (default 128)
   --prompt N            prompt characters with --load (default 24)
-  --speculation on|off  n-gram drafts (default off)
+  --speculation on|off  drafts: the model's own draft block and the lookup in earlier
+                        text (default off; only with --fake, a device part of the
+                        synthetic model has no draft block)
 ";
 
 struct Options {
@@ -180,14 +182,26 @@ async fn main() {
             std::process::exit(2);
         }
     };
+    if o.speculation && !o.fake {
+        eprintln!(
+            "--speculation needs --fake: a device part of the synthetic model has no draft block"
+        );
+        std::process::exit(2);
+    }
     let mut sc = SyntheticConfig::realistic(split, used);
     sc.layers = o.layers;
     if o.fake {
         sc.layers = 1;
     }
+    if o.speculation {
+        sc = sc.with_own_drafts(7, &[0.9, 0.85, 0.8, 0.7, 0.6, 0.5, 0.4]);
+    }
     let model = Arc::new(SyntheticModel::new(sc).expect("a valid model"));
-    let config =
-        RuntimeConfig { speculation: o.speculation, pages: 16384, ..RuntimeConfig::default() };
+    let config = RuntimeConfig {
+        window_rows: if o.speculation { 8 } else { 1 },
+        pages: 16384,
+        ..RuntimeConfig::default()
+    };
     let runtime = if o.fake {
         let host = HostExecutor::new(model.clone(), model.config().max_rows, config.max_slots)
             .with_devices(used)

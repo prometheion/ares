@@ -33,7 +33,7 @@ use ares_runtime::{GpuConfig, Model, Runtime, RuntimeConfig, Split, required_ram
 use ares_tokenizer::ChatOptions;
 
 use crate::plan::{
-    self, CELLS_PER_PAGE, DEFAULT_DRAFTS, DEFAULT_PARALLEL, LoadOptions, Room,
+    self, CELLS_PER_PAGE, DEFAULT_PARALLEL, DEFAULT_WINDOW, Drafter, LoadOptions, Room,
     SINGLE_DEVICE_MIN_CONTEXT, SplitKind,
 };
 
@@ -76,6 +76,34 @@ pub enum LoadError {
 
 pub(crate) fn refuse(message: impl Into<String>) -> LoadError {
     LoadError::Options(message.into())
+}
+
+/// Whether the model's own draft block takes part in speculation: when
+/// `--drafters` names `mtp`, or names nothing and the model has one
+/// (`has_block`). `--drafters mtp` for a model with none is refused, saying
+/// `no_block`, and so is a drafter from a file, which is not built yet.
+pub(crate) fn draft_block_takes_part(
+    options: &LoadOptions,
+    has_block: bool,
+    no_block: &str,
+) -> Result<bool, LoadError> {
+    let Some(list) = &options.drafters else {
+        return Ok(has_block);
+    };
+    for drafter in list {
+        if let Drafter::Block(path) = drafter {
+            return Err(refuse(format!(
+                "--drafters {}: block drafters from a file of their own (DFlash2) are not \
+                 built yet",
+                path.display()
+            )));
+        }
+    }
+    let asked = list.contains(&Drafter::Mtp);
+    if asked && !has_block {
+        return Err(refuse(format!("--drafters mtp: {no_block}")));
+    }
+    Ok(asked)
 }
 
 /// A device that was opened, and what it had free then.
@@ -553,14 +581,39 @@ fn load_qwen35(gguf: Gguf, options: &LoadOptions, begun: Instant) -> Result<Load
     if parallel == 0 {
         return Err(refuse("--parallel must be at least 1"));
     }
-    let drafts = options.drafts.unwrap_or(DEFAULT_DRAFTS);
+    // The model drafters that take part: all the model has unless the operator
+    // names them. Nothing speculates without one, the lookup in earlier text
+    // included.
+    let mtp = draft_block_takes_part(
+        options,
+        config.n_nextn == 1,
+        "this model file has no draft block (multi-token prediction)",
+    )?;
+    // The model's draft block is not built for a layer split (the block, the
+    // embedding table and the first rows of the head must be on one device).
+    let layer = options.split == Some(SplitKind::Layer);
+    if mtp && layer && options.drafters.is_some() {
+        return Err(refuse(
+            "--drafters mtp: the model's draft block is not built for a layer split; use a \
+             single device or a tensor split",
+        ));
+    }
+    let blocked_by_layer = mtp && layer;
+    let mtp = mtp && !layer;
+    let window = options.window.unwrap_or(DEFAULT_WINDOW);
+    if options.window.is_some() && !mtp {
+        return Err(refuse(if blocked_by_layer {
+            "--window: the model's draft block is not built for a layer split, so no window is \
+             reserved"
+        } else {
+            "--window without a model drafter does nothing"
+        }));
+    }
     let vocabulary = match &options.draft_vocabulary {
-        Some(_) if drafts == 0 => {
-            return Err(refuse("a draft vocabulary without drafts does nothing: --drafts is 0"));
-        }
-        Some(_) if config.n_nextn == 0 => {
+        Some(_) if !mtp => {
             return Err(refuse(
-                "a draft vocabulary is for a model with a draft block, and this model has none",
+                "a draft vocabulary is for the model's draft block, and no drafter of that kind \
+                 takes part",
             ));
         }
         Some(path) => Some(read_vocabulary(path)?),
@@ -574,7 +627,7 @@ fn load_qwen35(gguf: Gguf, options: &LoadOptions, begun: Instant) -> Result<Load
     let (ordinals, mut held) = hold_devices(options)?;
 
     // The model's settings that do not depend on the placement.
-    let window_rows = if drafts > 0 { parallel.saturating_mul(drafts + 1) } else { 0 };
+    let window_rows = if mtp { parallel.saturating_mul(window) } else { 0 };
     let part_options = Options {
         precision: options.precision,
         kv,
@@ -585,8 +638,8 @@ fn load_qwen35(gguf: Gguf, options: &LoadOptions, begun: Instant) -> Result<Load
     };
     if part_options.max_rows < window_rows {
         return Err(refuse(format!(
-            "{parallel} sequences with {drafts} drafts each are {window_rows} rows in a step, \
-             more than the {} a step has: lower --parallel or --drafts",
+            "{parallel} sequences with windows of {window} rows are {window_rows} rows in a \
+             step, more than the {} a step has: lower --parallel or --window",
             part_options.max_rows
         )));
     }
@@ -778,25 +831,29 @@ fn load_qwen35(gguf: Gguf, options: &LoadOptions, begun: Instant) -> Result<Load
             ares_cuda::Precision::Fast => "fast (8-bit activations for a few rows)",
             ares_cuda::Precision::Exact => "exact (f16 on the tensor cores for every product)",
         },
-        match (drafts, &placement.draft) {
-            (0, _) => "no drafts".to_owned(),
-            (n, Some(draft)) => format!(
-                "at most {n} drafts per sequence and step, from the model's draft block on \
-                 device {} ({}) or from earlier text",
+        match (mtp, &placement.draft) {
+            (false, _) if blocked_by_layer => "no speculation: the model's draft block is not \
+                 built for a layer split, and earlier text alone is not a drafter"
+                .to_owned(),
+            (false, _) => match options.drafters {
+                Some(_) => "no drafters (--drafters none): no speculation".to_owned(),
+                None => "no model drafter (the file has no draft block): no speculation".to_owned(),
+            },
+            (true, Some(draft)) => format!(
+                "drafts from the model's draft block on device {} ({}) and from earlier text, \
+                 windows of up to {window} rows; whose drafts and how many are chosen for every \
+                 step from the price of a step, measured at load, and the acceptance, measured \
+                 while running",
                 held[draft.device].device.ordinal(),
                 match &vocabulary {
                     Some(list) => format!("a vocabulary of {} tokens", list.len()),
                     None => format!("the {} tokens whose head rows are there", draft.head_rows),
                 }
             ),
-            (n, None) if config.n_nextn == 1 => format!(
-                "at most {n} drafts per sequence and step, from earlier text only (the model's \
-                 draft block is not built for a layer split)"
-            ),
-            (n, None) => format!(
-                "at most {n} drafts per sequence and step, from earlier text (the model has no \
-                 draft block)"
-            ),
+            (true, None) => {
+                "no speculation: the model has no draft block on a device of this placement"
+                    .to_owned()
+            }
         }
     );
     for (h, f) in held.iter().zip(&footprint) {
@@ -848,8 +905,7 @@ fn load_qwen35(gguf: Gguf, options: &LoadOptions, begun: Instant) -> Result<Load
         pages,
         cells_per_page: CELLS_PER_PAGE,
         max_slots: parallel,
-        speculation: drafts > 0,
-        max_draft: drafts.max(1),
+        window_rows: if mtp { window } else { 1 },
         checkpoint_budget: ram - required,
         ..RuntimeConfig::default()
     };
@@ -890,6 +946,22 @@ fn load_qwen35(gguf: Gguf, options: &LoadOptions, begun: Instant) -> Result<Load
         loading.elapsed().as_secs_f64(),
         begun.elapsed().as_secs_f64()
     );
+    if let Some(calibration) = runtime.snapshot().and_then(|snapshot| snapshot.calibration) {
+        let table = |points: &[(u32, f64)]| {
+            points.iter().map(|(n, ms)| format!("{n}: {ms:.1}")).collect::<Vec<_>>().join(", ")
+        };
+        tracing::info!(
+            "the price of a step was measured in {:.1} s ({} steps), in ms by rows: {}{}",
+            calibration.seconds,
+            calibration.steps,
+            table(&calibration.step_ms),
+            if calibration.chain_ms.is_empty() {
+                String::new()
+            } else {
+                format!("; the draft block's chain, by links: {}", table(&calibration.chain_ms))
+            }
+        );
+    }
 
     // What it took.
     for ((h, report), f) in held.iter().zip(model.reports()).zip(&footprint) {

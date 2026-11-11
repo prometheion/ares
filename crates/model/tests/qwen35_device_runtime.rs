@@ -234,6 +234,7 @@ fn ask(runtime: &Runtime, id: u64, question: &str, max_tokens: u32) -> String {
                 sampling: Sampling::default(),
                 max_tokens: Some(max_tokens),
                 stop: Vec::new(),
+                draft: true,
                 id: RequestId(id),
             },
             sink,
@@ -243,11 +244,11 @@ fn ask(runtime: &Runtime, id: u64, question: &str, max_tokens: u32) -> String {
     std::mem::take(&mut *text.lock().unwrap())
 }
 
-/// The whole engine: chat requests through the conductor, with and without
-/// n-gram drafts. Drafts go through draft windows and their commits, so the
-/// text with them is the text without them.
+/// The whole engine: chat requests through the conductor, alone and two at
+/// once. (The 0.8B has no draft block, so nothing is drafted: the drafts of the
+/// 27B are checked in `qwen35_mtp_runtime`.)
 #[test]
-fn the_engine_answers_and_drafts_do_not_change_the_answer() {
+fn the_engine_answers_alone_and_two_at_once() {
     let (true, Some(path)) = (enabled(), env_path("ARES_TEST_QWEN35_MODEL")) else {
         return;
     };
@@ -255,70 +256,50 @@ fn the_engine_answers_and_drafts_do_not_change_the_answer() {
         "Z\u{e4}hle von eins bis zwanzig, jede Zahl als Wort in einer eigenen Zeile, und dann noch einmal.",
         "Write the line 'the quick brown fox jumps over the lazy dog' four times, numbered.",
     ];
-    let mut answers: Vec<Vec<String>> = Vec::new();
-    for speculation in [false, true] {
-        let model = Arc::new(
-            Qwen35::new(
-                Gguf::open(&path).unwrap(),
-                "q",
-                &Spread::Single,
-                options(Precision::Exact),
-                1024,
-            )
-            .unwrap(),
-        );
-        let config = RuntimeConfig {
-            pages: 32,
-            cells_per_page: 128,
-            max_slots: 2,
-            speculation,
-            max_draft: 6,
-            ..RuntimeConfig::default()
-        };
-        let gpu = GpuConfig::new(&config, &*model);
-        let device = Device::open(0, Wait::Block).unwrap();
-        let runtime = Runtime::start_gpu(model, vec![device], config, gpu).unwrap();
-        let mut texts = Vec::new();
-        for (i, question) in questions.iter().enumerate() {
-            let text = ask(&runtime, i as u64 + 1, question, 120);
-            eprintln!("RES speculation {speculation}: {question}\n--- answer ---\n{text}\n---");
-            assert!(text.chars().count() > 20, "an answer of a few words: {text:?}");
-            texts.push(text);
-        }
-        // Both questions again, at once: two sequences share every step.
-        if !speculation {
-            let together: Vec<String> = std::thread::scope(|scope| {
-                let handles: Vec<_> = questions
-                    .iter()
-                    .enumerate()
-                    .map(|(i, question)| {
-                        let runtime = &runtime;
-                        scope.spawn(move || ask(runtime, 10 + i as u64, question, 120))
-                    })
-                    .collect();
-                handles.into_iter().map(|h| h.join().unwrap()).collect()
-            });
-            for (alone, shared) in texts.iter().zip(&together) {
-                let same = alone.chars().zip(shared.chars()).take_while(|(a, b)| a == b).count();
-                eprintln!(
-                    "RES two sequences at once: {same} of {} characters equal the text of the sequence alone",
-                    alone.chars().count()
-                );
-                assert!(same >= 60, "a sequence next to another says something else: {shared:?}");
-            }
-        }
-        if let Some(snapshot) = runtime.snapshot() {
-            eprintln!("RES speculation {speculation} counters: {:?}", snapshot.counters);
-        }
-        runtime.shutdown();
-        answers.push(texts);
+    let model = Arc::new(
+        Qwen35::new(
+            Gguf::open(&path).unwrap(),
+            "q",
+            &Spread::Single,
+            options(Precision::Exact),
+            1024,
+        )
+        .unwrap(),
+    );
+    let config =
+        RuntimeConfig { pages: 32, cells_per_page: 128, max_slots: 2, ..RuntimeConfig::default() };
+    let gpu = GpuConfig::new(&config, &*model);
+    let device = Device::open(0, Wait::Block).unwrap();
+    let runtime = Runtime::start_gpu(model, vec![device], config, gpu).unwrap();
+    let mut texts = Vec::new();
+    for (i, question) in questions.iter().enumerate() {
+        let text = ask(&runtime, i as u64 + 1, question, 120);
+        eprintln!("RES alone: {question}\n--- answer ---\n{text}\n---");
+        assert!(text.chars().count() > 20, "an answer of a few words: {text:?}");
+        texts.push(text);
     }
-    for (plain, drafted) in answers[0].iter().zip(&answers[1]) {
-        let same = plain.chars().zip(drafted.chars()).take_while(|(a, b)| a == b).count();
+    // Both questions again, at once: two sequences share every step.
+    let together: Vec<String> = std::thread::scope(|scope| {
+        let handles: Vec<_> = questions
+            .iter()
+            .enumerate()
+            .map(|(i, question)| {
+                let runtime = &runtime;
+                scope.spawn(move || ask(runtime, 10 + i as u64, question, 120))
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    for (alone, shared) in texts.iter().zip(&together) {
+        let same = alone.chars().zip(shared.chars()).take_while(|(a, b)| a == b).count();
         eprintln!(
-            "RES drafts: {same} of {} characters equal the text without drafts",
-            plain.chars().count()
+            "RES two sequences at once: {same} of {} characters equal the text of the sequence alone",
+            alone.chars().count()
         );
-        assert_eq!(plain, drafted, "drafts changed the text");
+        assert!(same >= 60, "a sequence next to another says something else: {shared:?}");
     }
+    if let Some(snapshot) = runtime.snapshot() {
+        eprintln!("RES counters: {:?}", snapshot.counters);
+    }
+    runtime.shutdown();
 }

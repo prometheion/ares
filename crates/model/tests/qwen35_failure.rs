@@ -105,6 +105,7 @@ fn say(runtime: &Runtime, text: &str) -> Result<String, EngineError> {
             sampling: Sampling::default(),
             max_tokens: Some(20),
             stop: Vec::new(),
+            draft: true,
             id: RequestId(1),
         },
         sink,
@@ -170,17 +171,30 @@ fn a_device_that_panics_in_a_step_is_named_and_the_start_ends() {
     names(&error, 1, "panicked in a step: injected panic in step 2");
 }
 
+/// The steps the warm-up of the runtime takes with this model. It measures the
+/// price of a step for every row count the model's windows and pieces of prompt
+/// can have, so the number depends on the model's limits; a failure meant for
+/// a request's own step has to come after them.
+fn warm_up_steps(path: &PathBuf) -> u64 {
+    let nothing = Fault { device: 99, step: 0, how: Failure::Error };
+    let runtime = start(path, nothing).expect("a start without a failure");
+    let calibration = runtime.snapshot().and_then(|snapshot| snapshot.calibration);
+    runtime.shutdown();
+    u64::from(calibration.expect("the warm-up measured the price of a step").steps)
+}
+
 #[test]
 fn a_device_that_fails_while_serving_ends_the_request_with_an_error_and_the_runtime_stops() {
     let Some(path) = model_path() else { return };
-    // The warm-up takes three steps; the request's own steps come after.
+    // The request's own steps come after the warm-up's.
+    let step = warm_up_steps(&path) + 3;
     for device in [0, 1] {
-        let fault = Fault { device, step: 6, how: Failure::Error };
+        let fault = Fault { device, step, how: Failure::Error };
         let runtime = start(&path, fault).expect("the warm-up steps do not fail");
         let error = say(&runtime, "Say hello.").unwrap_err();
         let EngineError::Internal(text) = &error else { panic!("{error:?}") };
         assert!(text.starts_with(&format!("device {device}: ")), "{text}");
-        assert!(text.contains("injected failure in step 6"), "{text}");
+        assert!(text.contains(&format!("injected failure in step {step}")), "{text}");
         // Nothing else is accepted, and the shutdown ends.
         assert!(matches!(say(&runtime, "Again."), Err(EngineError::Internal(_))));
         let begun = Instant::now();

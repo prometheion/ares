@@ -335,6 +335,7 @@ fn submit(
                 sampling: Sampling::default(),
                 max_tokens: Some(max_tokens),
                 stop: Vec::new(),
+                draft: true,
                 id: RequestId(id),
             },
             sink,
@@ -468,52 +469,36 @@ fn the_runtime_answers_as_the_session_does_in_every_placement() {
 }
 
 #[test]
-fn drafts_do_not_change_the_answer() {
+fn a_model_with_no_drafter_of_its_own_is_not_drafted_for_even_from_a_text_that_repeats() {
     if !enabled() {
         return;
     }
     for placement in placements() {
-        // A made-up model repeats itself by chance only, and the lookup has
-        // something to accept only where it does. The texts are tried one
-        // after the other until drafts have been accepted and rejected both;
-        // with every one the answer must be what it is without drafts.
-        let (mut accepted, mut rejected) = (0, 0);
-        for seed in 5..13 {
-            // A text that repeats, so that the lookup has something to propose.
-            let mut prompt = prompt(12, seed);
-            prompt.extend_from_within(..);
-            prompt.extend_from_within(..12);
-            let mut answers = Vec::new();
-            for speculation in [false, true] {
-                let config =
-                    RuntimeConfig { speculation, max_draft: 3, ..RuntimeConfig::default() };
-                let (runtime, model) = start(2, placement, 16, config);
-                warm(&model);
-                let answer = ask(&runtime, 1, &prompt, 160);
-                assert_nothing_missed(&model, "an answer with filled tiers");
-                let counters = runtime.snapshot().map(|s| s.counters);
-                runtime.shutdown();
-                if let (true, Some(c)) = (speculation, counters) {
-                    eprintln!(
-                        "RES {placement:?} text {seed}: drafts accepted {}, rejected {}, window \
-                         rows {}",
-                        c.drafts_accepted, c.drafts_rejected, c.window_rows
-                    );
-                    accepted += c.drafts_accepted;
-                    rejected += c.drafts_rejected;
-                }
-                answers.push(answer);
-            }
-            assert_eq!(
-                answers[0], answers[1],
-                "{placement:?} text {seed}: drafts changed the answer"
-            );
-            if accepted > 0 && rejected > 0 {
-                break;
-            }
-        }
-        assert!(accepted > 0, "{placement:?}: no draft was accepted in any text");
-        assert!(rejected > 0, "{placement:?}: no draft was rejected in any text");
+        // The model has no draft head built yet, and the lookup in earlier
+        // text takes part only next to a model drafter, never alone. The
+        // text repeats, so that the lookup would have drafts to offer, and
+        // the runtime has the room for windows of eight rows all the same.
+        let mut prompt = prompt(12, 5);
+        prompt.extend_from_within(..);
+        prompt.extend_from_within(..12);
+        let config = RuntimeConfig { window_rows: 8, ..RuntimeConfig::default() };
+        let (runtime, model) = start(2, placement, 16, config);
+        warm(&model);
+        let answer = ask(&runtime, 1, &prompt, 160);
+        assert_nothing_missed(&model, "an answer with filled tiers");
+        let counters = runtime.snapshot().expect("the runtime is running").counters;
+        runtime.shutdown();
+        eprintln!(
+            "RES {placement:?}: {} tokens, draft rows {}, drafts accepted {}, rejected {}",
+            answer.len(),
+            counters.draft_rows,
+            counters.drafts_accepted,
+            counters.drafts_rejected
+        );
+        assert!(answer.len() > 12, "{placement:?}: the answer is {} tokens", answer.len());
+        assert_eq!(counters.draft_rows, 0, "{placement:?}: draft rows in a step");
+        assert_eq!(counters.drafts_accepted, 0, "{placement:?}");
+        assert_eq!(counters.drafts_rejected, 0, "{placement:?}");
     }
 }
 
@@ -606,6 +591,7 @@ fn a_cancelled_request_frees_its_place_for_the_next() {
                     sampling: Sampling::default(),
                     max_tokens: Some(400),
                     stop: Vec::new(),
+                    draft: true,
                     id: RequestId(2),
                 },
                 sink,

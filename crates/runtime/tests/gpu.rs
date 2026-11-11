@@ -103,26 +103,6 @@ fn output_is_independent_of_the_batch_on_every_placement() {
 }
 
 #[test]
-fn speculation_changes_the_steps_and_not_the_text_on_every_placement() {
-    on_every_placement(|split, devices| {
-        let make = |speculation| {
-            let mut s = setup(split, devices);
-            s.model = s.model.repetitive(1, 40);
-            s.runtime.speculation = speculation;
-            start(s)
-        };
-        let (plain, drafted) = (make(false), make(true));
-        let expected = outputs_of(&plain, 31, 10);
-        let before = snapshot(&drafted);
-        assert_eq!(outputs_of(&drafted, 31, 10), expected);
-        let d = since(&snapshot(&drafted), &before);
-        assert!(d["accepted"] > 20 && d["rejected"] > 0, "drafts are both accepted and cut: {d:?}");
-        // Drafts that ran really were verified rows of the same step as others.
-        assert!(d["draft_rows"] >= d["accepted"] + d["rejected"]);
-    });
-}
-
-#[test]
 fn the_text_depends_on_the_whole_history_on_every_placement() {
     on_every_placement(|split, devices| {
         let rt = start(setup(split, devices));

@@ -55,6 +55,11 @@ pub struct Usage {
     /// The part of the prompt that was served from the engine's cache instead
     /// of being computed.
     pub cached_prompt_tokens: u32,
+    /// A hash of the token ids of the reply (FNV-1a over their four bytes
+    /// each, little end first), so that two replies can be compared without
+    /// keeping their tokens: the text with drafts is the text without, or it
+    /// is not.
+    pub output_hash: u64,
 }
 
 #[cfg(test)]

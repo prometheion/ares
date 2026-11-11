@@ -57,6 +57,9 @@ pub struct GenerateRequest {
     /// Generation ends before any of these strings would be emitted; the
     /// matched string itself is not part of the output.
     pub stop: Vec<String>,
+    /// Whether the engine may verify drafts for this request. `false` makes
+    /// the request a plain one-token-per-step generation, to compare with.
+    pub draft: bool,
     pub id: RequestId,
 }
 
@@ -86,6 +89,7 @@ mod tests {
             sampling: Sampling { seed: Some(7), ..Sampling::default() },
             max_tokens: Some(16),
             stop: vec!["\n\n".into()],
+            draft: true,
             id: RequestId(9),
         };
         let text = serde_json::to_string(&request).unwrap();

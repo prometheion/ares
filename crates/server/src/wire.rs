@@ -83,6 +83,7 @@ const SERVED: &[&str] = &[
     "top_p",
     "min_p",
     "seed",
+    "draft",
     "presence_penalty",
     "frequency_penalty",
     "repeat_penalty",
@@ -203,6 +204,7 @@ fn from_json(endpoint: Endpoint, json: &Json, id: RequestId) -> Result<Parsed, A
         sampling,
         max_tokens: max_tokens(&fields, endpoint)?,
         stop: stop(&fields)?,
+        draft: fields.bool("draft")?.unwrap_or(true),
         id,
     };
     let include_usage = match fields.get("stream_options") {
@@ -650,6 +652,9 @@ struct TimingsBody {
     draft_n: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     draft_n_accepted: Option<u64>,
+    /// A hash of the reply's token ids, 16 hex digits: two replies are the
+    /// same tokens when it is the same.
+    token_hash: String,
 }
 
 impl From<Timings> for TimingsBody {
@@ -665,6 +670,7 @@ impl From<Timings> for TimingsBody {
             predicted_per_second: timings.generated_per_second().map(round),
             draft_n: timings.drafts.map(|drafts| drafts.0),
             draft_n_accepted: timings.drafts.map(|drafts| drafts.1),
+            token_hash: format!("{:016x}", timings.output_hash),
         }
     }
 }

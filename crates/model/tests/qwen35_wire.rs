@@ -21,7 +21,7 @@ use ares_api::{
 use ares_cuda::{Device, Precision, Wait, device_count};
 use ares_gguf::Gguf;
 use ares_model::qwen35::device::{Options, Qwen35, Spread};
-use ares_runtime::{Drafters, GpuConfig, Runtime, RuntimeConfig};
+use ares_runtime::{GpuConfig, Runtime, RuntimeConfig};
 use ares_tokenizer::ChatOptions;
 
 fn enabled() -> bool {
@@ -87,6 +87,7 @@ fn ask(runtime: &Runtime, id: u64, question: &str, sampling: Sampling, max_token
                 sampling,
                 max_tokens: Some(max_tokens),
                 stop: Vec::new(),
+                draft: true,
                 id: RequestId(id),
             },
             sink,
@@ -241,12 +242,15 @@ fn draft_vocabulary() -> Option<Arc<[u32]>> {
 
 /// Tokens per second of a request that writes from nothing and of one that
 /// writes its prompt again with edits, in German and in English, with the
-/// drafters `ARES_WIRE_CASE` names. The model runs as it is served: a tensor
-/// split over both devices, the fast kernels, the most probable token.
+/// window `ARES_WIRE_CASE` names (none, or w4, w8, w16: the rows of a
+/// sequence's window, the model's draft block and the lookup in earlier text
+/// as the policy chooses them for every step). The model runs as it is
+/// served: a tensor split over both devices, the fast kernels, the most
+/// probable token.
 #[test]
 fn what_each_drafter_is_worth_on_the_27b() {
     let Some(case) = std::env::var("ARES_WIRE_CASE").ok() else {
-        eprintln!("skipped: set ARES_WIRE_CASE to one of none, own3, own16, lookup16, both16");
+        eprintln!("skipped: set ARES_WIRE_CASE to one of none, w4, w8, w16");
         return;
     };
     if !enabled() {
@@ -257,18 +261,17 @@ fn what_each_drafter_is_worth_on_the_27b() {
         eprintln!("skipped: the 27B needs two devices");
         return;
     }
-    let (drafts, drafters) = match case.as_str() {
-        "none" => (0, Drafters::Both),
-        "own3" => (3, Drafters::Own),
-        "own16" => (16, Drafters::Own),
-        "lookup16" => (16, Drafters::Lookup),
-        "both16" => (16, Drafters::Both),
+    let window = match case.as_str() {
+        "none" => 0,
+        "w4" => 4,
+        "w8" => 8,
+        "w16" => 16,
         other => panic!("no case {other}"),
     };
     let options = Options {
         precision: Precision::Fast,
         logit_rows: 32,
-        window_rows: if drafts > 0 { drafts + 1 } else { 0 },
+        window_rows: 2 * window,
         draft_vocabulary: draft_vocabulary(),
         ..Options::default()
     };
@@ -288,9 +291,7 @@ fn what_each_drafter_is_worth_on_the_27b() {
         pages: 2 * context.div_ceil(128) + 2,
         cells_per_page: 128,
         max_slots: 2,
-        speculation: drafts > 0,
-        drafters,
-        max_draft: drafts.max(1),
+        window_rows: window.max(1),
         ..RuntimeConfig::default()
     };
     let gpu = GpuConfig::new(&config, &*model);
@@ -363,7 +364,7 @@ fn more_requests_than_fit_wait_in_line_and_all_answer() {
         pages: 6,
         cells_per_page: 128,
         max_slots: 4,
-        max_draft: 6,
+        window_rows: 7,
         ..RuntimeConfig::default()
     };
     let gpu = GpuConfig::new(&config, &*model);

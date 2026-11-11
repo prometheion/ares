@@ -390,7 +390,12 @@ fn decision(extra: Value) -> String {
 fn ties(request: &DecisionRequest) -> DecisionOutcome {
     let answers =
         request.questions.iter().map(|q| q.answer(&vec![0.0; q.n_options()]).unwrap()).collect();
-    let usage = Usage { prompt_tokens: 12, completion_tokens: 0, cached_prompt_tokens: 0 };
+    let usage = Usage {
+        prompt_tokens: 12,
+        completion_tokens: 0,
+        cached_prompt_tokens: 0,
+        ..Usage::default()
+    };
     DecisionOutcome::Decided(DecisionResult { answers, usage })
 }
 

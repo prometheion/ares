@@ -168,7 +168,7 @@ impl Model for Uncached {
 /// No drafts: a request's steps are then the same whatever else runs, so that
 /// two requests at once are answered as they are alone.
 fn no_drafts(config: &mut RuntimeConfig, _: u64) {
-    config.speculation = false;
+    config.window_rows = 1;
 }
 
 /// What the test changes in the engine's settings: the bytes of a checkpoint
@@ -246,8 +246,7 @@ fn rig(path: &PathBuf, layout: Layout, cached: bool, tweak: Tweak<'_>) -> Rig {
         pages: 64,
         cells_per_page: PAGE,
         max_slots: 2,
-        speculation: true,
-        max_draft: 3,
+        window_rows: 4,
         // Checkpoints inside a prompt and while generating are as dense as a
         // page, so that a short test crosses several of them.
         checkpoint_prompt_interval: PAGE,
@@ -313,6 +312,7 @@ impl Rig {
                     sampling: Sampling { temperature: Some(0.0), ..Sampling::default() },
                     max_tokens: Some(max_tokens),
                     stop: Vec::new(),
+                    draft: true,
                     id: RequestId(self.next.fetch_add(1, Ordering::Relaxed)),
                 },
                 sink,
@@ -556,7 +556,7 @@ fn requests_that_give_way_under_a_small_page_pool_come_back_from_the_cache() {
         // of ten pages together, but the accounting lets both start: it
         // expects answers of 8 tokens. One gives way and comes back.
         let small = |config: &mut RuntimeConfig, _: u64| {
-            config.speculation = false;
+            config.window_rows = 1;
             config.pages = 10;
             config.output_clip = 8;
         };

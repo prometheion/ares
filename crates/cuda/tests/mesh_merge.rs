@@ -374,3 +374,92 @@ fn a_merge_that_waits_for_a_device_that_never_comes_is_released() {
     enqueue(0);
     side.stream.synchronize().unwrap();
 }
+
+/// The pushes the failed device had queued before it failed still run after
+/// the release, and each writes the other device's flag with its own token,
+/// which can be behind the kernels that wait for a later one. One release is
+/// not always enough for the thread that failed; `release_waiters_until_idle`
+/// repeats it until the stream of that thread is idle.
+#[test]
+fn a_release_is_repeated_while_the_pushes_the_failed_device_queued_still_write_flags() {
+    let Some(gpus) = gpus() else { return };
+    if !(peer_access(0, 1).unwrap().0 && peer_access(1, 0).unwrap().0) {
+        eprintln!("skipped: the push path needs peer access between the devices");
+        return;
+    }
+    let weight = vec![1.0f32; D as usize];
+    let sides = [Side::new(&gpus[0], 8, &weight), Side::new(&gpus[1], 8, &weight)];
+    let queue = |mesh: &Mesh, rank: usize, pushes: usize| {
+        for _ in 0..pushes {
+            let side = &sides[rank];
+            let target = mesh.push(rank).expect("a push path");
+            // SAFETY: the buffers hold 3 rows of `D` values on the side's
+            // device; the other device's matching pushes are not queued (or
+            // fewer): that is the point.
+            unsafe {
+                side.layers
+                    .merge_push(
+                        &side.stream,
+                        Wire::F32,
+                        side.p.ptr(),
+                        side.x.ptr(),
+                        target,
+                        rank == 0,
+                        3,
+                        D,
+                        MergeNorm::Rows { weight: side.weight.ptr(), out: side.xn.ptr() },
+                        EPS,
+                    )
+                    .unwrap();
+            }
+        }
+    };
+    let wait_idle = |rank: usize, limit: std::time::Duration| {
+        let until = std::time::Instant::now() + limit;
+        while !sides[rank].stream.is_idle().unwrap() {
+            if std::time::Instant::now() >= until {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        true
+    };
+    let patience = std::time::Duration::from_secs(10);
+
+    // One device queued three pushes and failed. A single release lets them
+    // run, and they write tokens 1 to 3 into the flags of the other device,
+    // over the release of those flags if the release wrote them first (it
+    // goes by rank, so that is what happens when the device that failed is
+    // the last one): a push that the other device queues after that, a fourth,
+    // waits for a token nobody writes. Repeated until the stream of the device
+    // that failed is idle, the last release is answered by nothing, and the
+    // flags stay ahead for good: no push of the other device waits, whichever
+    // device failed.
+    for failed in [0usize, 1] {
+        let other = 1 - failed;
+        // What a single release leaves is reported and not asserted.
+        let mesh = Mesh::with_route(&gpus, 16 * D, Route::Peer).unwrap();
+        queue(&mesh, failed, 3);
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        mesh.release_waiters().unwrap();
+        assert!(wait_idle(failed, patience), "device {failed} went on");
+        queue(&mesh, other, 4);
+        let waits = !wait_idle(other, std::time::Duration::from_millis(500));
+        eprintln!(
+            "RES one release, device {failed} failed: the fourth push of device {other} {}",
+            if waits { "waits" } else { "goes on" }
+        );
+        // (Let it go, so that it does not spin until the process ends.)
+        mesh.release_waiters_until_idle(&sides[other].stream, patience).unwrap();
+        for round in 0..20 {
+            let mesh = Mesh::with_route(&gpus, 16 * D, Route::Peer).unwrap();
+            queue(&mesh, failed, 3);
+            std::thread::sleep(std::time::Duration::from_millis(5 * (round % 4)));
+            let idle = mesh.release_waiters_until_idle(&sides[failed].stream, patience).unwrap();
+            assert!(idle, "device {failed}, round {round}: the stream did not end");
+            queue(&mesh, other, 4);
+            let ended = wait_idle(other, patience);
+            assert!(ended, "device {failed}, round {round}: a push of device {other} waits");
+        }
+    }
+}

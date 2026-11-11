@@ -551,6 +551,20 @@ impl<'a> RecordView<'a> {
         u32::from_le_bytes(self.bytes[byte..byte + 4].try_into().expect("4 bytes"))
     }
 
+    /// Overwrites the token and the context of row `row` in the bytes of a
+    /// record, as the device's draft chain overwrites the tokens of the draft
+    /// rows of a window before the model's blocks read them. For an executor
+    /// that stands in for a device.
+    pub fn set_row_inputs(bytes: &mut [u8], row: u32, token: u32, context: u32) {
+        let word = |bytes: &[u8], at: usize| {
+            u32::from_le_bytes(bytes[at..at + 4].try_into().expect("4 bytes")) as usize
+        };
+        let (tokens, extra) = (word(bytes, 5 * 4), word(bytes, H_OFF_EXTRA * 4));
+        let (at_token, at_context) = (tokens + row as usize * 4, extra + row as usize * 8 + 4);
+        bytes[at_token..at_token + 4].copy_from_slice(&token.to_le_bytes());
+        bytes[at_context..at_context + 4].copy_from_slice(&context.to_le_bytes());
+    }
+
     /// The low 32 bits of the step number.
     pub fn step(&self) -> u32 {
         self.header[H_STEP]

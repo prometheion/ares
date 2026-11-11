@@ -29,7 +29,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use ares_gguf::Gguf;
-use ares_sched::{DraftCost, LookupConfig, LookupCorpus, LookupDrafter, best_draft_len};
+use ares_sched::{Load, LookupConfig, LookupCorpus, LookupDrafter, Offer, Prices, Wish, choose};
 use ares_tokenizer::{EncodeOptions, Tokenizer};
 
 const MAX_DRAFT: usize = 16;
@@ -158,7 +158,7 @@ fn replay_ngram(prompt: &[u32], output: &[u32], tally: &mut Tally) {
 type Cells = [[u64; 2]; 40];
 
 /// The same with the lookup drafter. `by_confidence` cuts every draft to the
-/// length that [`best_draft_len`] chooses from the drafter's confidences.
+/// length that [`choose`] picks from the drafter's confidences.
 fn replay_lookup(
     corpus: &mut LookupCorpus,
     prompt: &[u32],
@@ -175,9 +175,11 @@ fn replay_lookup(
         drafter.push(corpus, output[at]);
         drafter.draft(corpus, MAX_DRAFT.min(output.len() - at - 1), &mut draft, &mut confidence);
         if by_confidence {
-            let free = DraftCost { fixed_ms: 0.0, per_token_ms: 0.0 };
-            let len = best_draft_len(&confidence, BASE_MS, PER_ROW_MS, 1, 1.0, free).len;
-            draft.truncate(len);
+            let step = |load: Load| Some(BASE_MS + PER_ROW_MS * f64::from(load.rows));
+            let prices = Prices { step: &step, chain: &|_, _| 0.0, spare_rows: MAX_DRAFT as u32 };
+            let offers = [Offer { drafter: 0, chances: &confidence }];
+            let len = choose(&[Wish { reads: 0, offers: &offers }], &prices)[0].drafts;
+            draft.truncate(len as usize);
         }
         let ok = accepted(&draft, &output[at + 1..]);
         for (i, cell) in drafter.cells().iter().take(draft.len()).enumerate() {

@@ -61,6 +61,7 @@ fn ask(runtime: &Runtime, id: u64, question: &str, sampling: Sampling, max_token
                 sampling,
                 max_tokens: Some(max_tokens),
                 stop: Vec::new(),
+                draft: true,
                 id: RequestId(id),
             },
             sink,
@@ -101,8 +102,7 @@ fn answers(
         pages: 20,
         cells_per_page: 128,
         max_slots: 2,
-        speculation: drafts > 0,
-        max_draft: drafts.max(1),
+        window_rows: drafts + 1,
         ..RuntimeConfig::default()
     };
     let gpu = GpuConfig::new(&config, &*model);

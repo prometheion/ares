@@ -86,15 +86,19 @@ fn options_that_mean_nothing_for_a_mixture_of_experts_are_refused_by_name() {
     assert!(stderr.contains("--split"), "it says what to use instead: {stderr}");
     refuses(&["--precision", "exact"], "--precision");
     refuses(&["--draft-vocab", "tokens.txt"], "--draft-vocab");
+    // The model has no draft head built yet: no model drafter takes part, so
+    // nothing speculates and a window would be room for nothing.
+    let stderr = refuses(&["--drafters", "mtp"], "--drafters");
+    assert!(stderr.contains("not built yet"), "{stderr}");
+    let stderr = refuses(&["--drafters", "mtp,/models/dflash2.gguf"], "--drafters");
+    assert!(stderr.contains("not built yet"), "{stderr}");
+    refuses(&["--window", "8"], "--window");
     let stderr = refuses(&["--kv", "q4"], "q4");
     assert!(stderr.contains("f16 or q8"), "{stderr}");
 }
 
 #[test]
-fn rows_that_do_not_fit_a_step_are_refused_with_the_options_that_make_them() {
-    let stderr = refuses(&["--parallel", "9", "--drafts", "0"], "--parallel");
+fn rows_that_do_not_fit_a_step_are_refused_with_the_option_that_makes_them() {
+    let stderr = refuses(&["--parallel", "9"], "--parallel");
     assert!(stderr.contains("8 rows"), "{stderr}");
-    let stderr = refuses(&["--parallel", "4", "--drafts", "3"], "--parallel");
-    assert!(stderr.contains("--drafts"), "{stderr}");
-    assert!(stderr.contains("16 rows"), "{stderr}");
 }

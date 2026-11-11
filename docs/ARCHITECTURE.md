@@ -177,7 +177,7 @@ machine (RTX 4070 + RTX 3060, Qwen3.8-27B) or read from the engines listed in
 | `ares-api` | Request, event, decision and error types; the `Engine` trait between HTTP and the runtime (`submit` for generation, `decide` for decisions, `stats`, `chat_format` for what a model's chat template declares about thinking) | Done, unit tested |
 | `ares-server` | The `ares` binary: loads a model on the devices and serves it over an OpenAI-compatible HTTP API, with the plan of devices, split, shares and context made from what the devices report | Serves `qwen35` and `qwen4exp` models (chat and plain completions, streamed and not, timings, metrics, staged shutdown, the reasoning of a reply apart from its content and in the history, with llama-server's controls for thinking); 154 tests without a GPU, 10 that start the real binary and 3 that run the engine in the test's process; for `qwen35` the prefix cache is on, with `--ram` for the engine's RAM, for `qwen4exp` the RAM is mostly the tier of experts; no router mode, no multimodal input, no tool calls, `/v1/systemone` answers 501 |
 | `ares-runtime` | The conductor thread and one thread per device, the step loop that connects plan, state and kernels, admission, speculation with the lookup drafter and with a model's own drafts, the `Model` trait a model implements, a synthetic model that drives the real kernels, and the expert store (VRAM slots, RAM tier, reads, the CPU computing what is not on a GPU) | Drives `qwen35` on one device, in tensor split and in layer split, with picks made on the device; implements `Engine::submit` (not `decide`); the prefix cache is in the conductor, checked against the host executor as an oracle and carried out by `qwen35` on the devices (checkpoints in page-locked RAM within one RAM limit, `PinnedRam`), and there is no spill of pages to RAM (a request that gives way stays in the pool's cache); the expert store is driven by the device threads of `qwen4exp` (see [Qwen3.8-Flash-Next through the runtime](#qwen38-flash-next-through-the-runtime)) |
-| `ares-model` | Model architectures: configuration and weight table from a GGUF, a CPU reference of the forward pass with explicit state (window and commit) that GPU implementations are compared with block by block, and the implementation on the devices | `qwen35` (Qwen3.5-0.8B, Qwen3.8-27B) runs through the runtime and the server, with the model's draft block. `qwen4exp` (Qwen3.8-Flash-Next) runs through the runtime and the server on one or two cards, with drafts from earlier text, and through a session of its own that tests and measurements use. See [Several devices](#several-devices) |
+| `ares-model` | Model architectures: configuration and weight table from a GGUF, a CPU reference of the forward pass with explicit state (window and commit) that GPU implementations are compared with block by block, and the implementation on the devices | `qwen35` (Qwen3.5-0.8B, Qwen3.8-27B) runs through the runtime and the server, with the model's draft block. `qwen4exp` (Qwen3.8-Flash-Next) runs through the runtime and the server on one or two cards, without speculation (it has no draft head built, and the lookup in earlier text takes part only next to a model drafter), and through a session of its own that tests and measurements use. See [Several devices](#several-devices) |
 
 
 Both test architectures are specified under [reference/](reference/):
@@ -241,6 +241,39 @@ requests ──► plan ──► upload step record ──► window ──► 
    (`Sequence::truncate`). Drafters and their acceptance statistics are
    updated.
 
+**A prompt next to sequences that generate** (one or two sequences generating
+with drafts, a prompt of 77 to 110 tokens or of 2,000 tokens arriving beside
+them; first token seen by the client, medians of 8 and of 3 requests;
+measured 2026-11-12 at a load of 2 to 5, `--parallel 3`, before and after back
+to back):
+
+| First token of | alone | next to 1 generating | next to 2 generating |
+| --- | --- | --- | --- |
+| two cards (Q4_K_S, tensor split 0.625 / 0.375): | | | |
+| a short prompt, before (the step capped at the draft window) | 154 ms | 490 ms | 653 ms |
+| a short prompt, now | 162 ms | 189 ms | 186 ms |
+| a prompt of 2,000 tokens, before | 1.64 s | 9.6 s | 12.2 s |
+| a prompt of 2,000 tokens, now | 1.68 s | 4.2 s | 4.0 s |
+| one card (the 4070, IQ2_XXS): | | | |
+| a short prompt, before | 327 ms | 674 ms | 850 ms |
+| a short prompt, now | 342 ms | 379 ms | 388 ms |
+| a prompt of 2,000 tokens, before | 7.2 s | 17.6 s | 17.2 s |
+| a prompt of 2,000 tokens, now | 7.5 s | 13.7 s | 12.9 s |
+
+A short prompt waits for the step in flight (35 ms at most on two cards) and
+then runs whole in a step of its own, so it is 24 to 46 ms behind what the
+cards need for it alone. The generating sequences pay for it in a pause: on
+two cards the longest gap in their stream went from 57 to 75 ms to 184 ms for
+a short prompt (a step of its own, about 100 ms, with the newest token of each
+riding along) and to 280 ms for the pieces of a long one (a piece of 256 rows
+is a step of 200 to 300 ms); on one card, where a piece of 256 rows takes 0.9 s
+of the IQ2_XXS weights, the gap is 0.4 s for a short prompt and 0.95 s for the
+pieces of a long one. Their rate while a long prompt is read fell to 48 and
+49 % of what it was on two cards, which is the slowdown of 2 that is set
+(before: 75 and 69 % of it, for six and seven times as long), and to 41 and 47 % on
+one card. A long prompt takes 2.4 to 2.5 times what it takes alone on two
+cards and 1.7 to 1.8 times on one.
+
 ### Threads
 
 `ares-runtime` runs this loop with one **conductor** thread and one thread
@@ -281,8 +314,12 @@ for a flag nobody sets (it gives up after four billion polls), and with it
 the end of the step and the wait for the thread to stop. A thread that fails
 now writes every flag ahead of any token from the host, over a stream of
 its own and a copy engine that the waiting kernel does not hold
-(`Mesh::release_waiters`, called by `Links::abort`); the released kernels
-add up meaningless values in a step nobody reads. A part that fails to build
+(`Mesh::release_waiters`, called by `Links::abort`), and the thread that
+failed repeats that until the stream it had enqueued on is idle, because the
+pushes it had queued before the failure still run and each writes the other
+device's flag with a token that is behind the later kernels
+(`Mesh::release_waiters_until_idle`); the released kernels add up meaningless
+values in a step nobody reads. A part that fails to build
 tells the model (`Model::abandon`) so that the parts that wait for its
 measurements (`qwen35`'s layout choice, which waited two minutes) go on at
 once. A thread that has not stopped ten seconds after it was told to is left
@@ -642,34 +679,97 @@ Qwen4 handover map as follows.
 | Sparse KV offload (K/V in pinned RAM, keys and a page cache on the GPU, fetch only missing selected pages) | Pages are the unit of residency. The selection needs only the pooled keys on the GPU (1.5 KB per token for `qwen4exp`), so K/V pages can live in pinned RAM behind a VRAM page cache. The residency layer is the next piece of `ares-state`. |
 | Ragged one-pass verification (drafts of unequal length in one batch) | `plan` puts windows of any lengths in one step. Recurrent kernels take per-sequence segments from the step record. |
 | Graph cache for batch shapes | Not needed: there is no per-shape graph. |
-| Adaptive draft length | `best_draft_len` maximises expected tokens per millisecond from measured acceptance per position (or the draft head's confidence) and the measured step cost. The same number chooses between drafters and accounts for the rows a draft costs other sequences. |
+| Adaptive draft length | `choose` maximises expected tokens per millisecond of the whole step from measured acceptance per position (or the lookup's confidence) and the measured price of a step by its rows. The same number chooses between drafters and accounts for the rows a draft costs other sequences. |
 | Rollback rows independent of draft length | Verify and commit removes rollback: nothing recurrent is modified before acceptance. |
 | Draft vocabulary without extra VRAM | Planned in weight placement: the output head's rows are ordered by frequency at load, so a draft head is a prefix of the same tensor. |
 | VRAM as the binding limit | Ledgers and the three kinds of device memory. |
-| Prefill next to generation | `prefill_rows_next_to`. |
+| Prefill next to generation | Pieces of prompt between rounds of generation, paid back by time (`Share`). |
 
 ## Speculation
 
 The engine has every kind of drafter that llama.cpp and Piggidragon's fork
-have, with the fork's selection on top:
+have, with the fork's selection on top, and the selection is not a setting:
+it is how the engine drafts.
 
 | Part | What it is | State |
 | --- | --- | --- |
-| Lookup drafter | Continues the longest earlier occurrence of the current text, in this request or another: one suffix automaton over a corpus that all sequences share (`LookupCorpus`, `LookupDrafter`; after TensorRT-LLM, SGLang and vLLM's suffix decoding), with a confidence per proposed token and a bound on memory. It replaces the n-gram lookup per sequence; llama.cpp's map and cache variants are not built | Done and measured on text; the runtime still uses `NgramDrafter` |
-| MTP | The model's own draft head or block | Done for `qwen35` on one device and under a tensor split: the block runs on the device with the embedding table, its chain and its picks stay on the device (`device/mtp.rs`); not under a layer split |
-| DFlash, DSpark, DFlash2 | A small draft model that reads the target's hidden states at a few layers and proposes a block of tokens at once | With the runtime: it needs taps on the target's layers and a second model on the same devices |
-| Drafter selection | Per sequence and step, the drafter with the highest expected tokens per millisecond, from measured acceptance and cost; drafters that were not chosen keep learning from what was accepted | `best_draft_len` and `Acceptance` done; the selector object that holds them per drafter is next |
-| Adaptive draft length | The length that maximises the same number | `best_draft_len` done |
-| Verification | Windows of any length for any number of sequences in one step, then commit | Planner done; kernels with the model |
+| Lookup drafter | Continues the longest earlier occurrence of the current text, in this request or another: one suffix automaton over a corpus that all sequences share (`LookupCorpus`, `LookupDrafter`; after TensorRT-LLM, SGLang and vLLM's suffix decoding), with a confidence per proposed token and a bound on memory. It replaces the n-gram lookup per sequence; llama.cpp's map and cache variants are not built | Done and measured on text; the conductor uses it, next to a model drafter and never alone |
+| MTP | The model's own draft head or block | Done for `qwen35` on one device and under a tensor split: the block runs on the device with the embedding table, its chain and its picks stay on the device (`device/mtp.rs`); not under a layer split. Chains of up to the window's rows less one (7 by default) |
+| DFlash, DSpark, DFlash2 | A small draft model that reads the target's hidden states at a few layers and proposes a block of tokens at once | Not built: it needs taps on the target's layers and a second model on the same devices. `--drafters FILE` is refused with "not built yet" (the file is not opened); the choice of a window takes any number of drafters |
+| Drafter selection | Per step and for all sequences together, whose drafts go into each window, by expected tokens per millisecond of the whole step, from the price of a step and the acceptance measured per drafter, position and sequence; a proposal that was not taken learns from what turned out right | Done: `ares_sched::choose` |
+| Adaptive draft length | The length that maximises the same number | Done, in the same call |
+| Draft trees | Several branches verified in one window | Not built; the choice is made over rows ranked by their chance, which is a tree's ranking (see `crates/sched/src/window.rs`) |
+| Verification | Windows of any length for any number of sequences in one step, then commit | Done |
 
-All drafters produce the same thing, a list of proposed tokens with an
-optional confidence per token, so selection and verification do not depend on
-where a draft comes from. A lookup draft is written into the step record by
-the host. The draft of a head or a draft model is to stay on the device, in a
-table the verify window reads (SGLang), and reach the host together with the
-picks; carrying it through the host would put a copy out and back between two
+All drafters produce the same thing, a list of proposed tokens with a chance
+that each is accepted, so selection and verification do not depend on where a
+draft comes from. A lookup draft is written into the step record by the host.
+The draft of a head or a draft model stays on the device, in a table the
+verify window reads (SGLang), and reaches the host together with the picks;
+carrying it through the host would put a copy out and back between two
 kernels of the same device at every step. A draft is cut at the first token
 the grammar refuses before it is verified (vLLM).
+
+**The policy.** Four decisions, made as the user decided them and none of them
+a flag or a constant of this machine:
+
+- *Drafting is always on.* The operator chooses which **model** drafters take
+  part (`--drafters`: the model's own draft block, `mtp`, by default if the
+  file has one; `none`; later a block drafter from a file of its own) and the
+  room for windows (`--window`). The lookup in earlier text costs nothing to
+  ask and takes part as soon as at least one model drafter does, never on its
+  own: a server with no model drafter (`--drafters none`, a file without a
+  draft block, a layer split, which has no draft block) does not speculate,
+  and says so in the plan.
+- *The price of a step is a table*, by its rows, because the weight kernels
+  read their rows in launches of eight and a ninth row is a second launch
+  (25.4 ms of weights for 8 rows of the 27B, 31.0 for 16). `Conductor::warm_up`
+  measures it on the devices at load: steps of every row count a window can
+  have, shaped as the steps are (windows of several rows that keep their
+  inputs, prompt rows that are certain), then the doublings up to a piece of
+  prompt, the fastest of two (one above 24 rows), and windows whose draft
+  rows the block fills, from 2 rows to the longest window, for the time of its
+  chain by length. Every step that runs corrects the entry for its rows by a
+  fifth of the difference, so a device that slows down or a context that gets
+  deep is followed; a context term (per cell a row reads) is fitted
+  separately (`ares_sched::PriceTable`).
+- *Acceptance is measured per drafter, per position and per sequence*
+  (`ares_sched::Acceptance`): position `i` is accepted *given* that the ones
+  before it were, so a draft that failed at position 2 says nothing about
+  position 3. A sequence that is new starts from what the engine has seen of
+  that drafter at that position (and that from a prior of 0.6 before it has
+  seen any), and its own counts, which forget gradually, outweigh the start
+  as they come. The lookup's chances are its confidence per token
+  (match length and how earlier occurrences went on), which verification
+  corrects as it always did.
+- *The choice is one number*, tokens per millisecond of the whole step: every
+  draft row is worth the chance that it and the rows before it are accepted,
+  rows are ranked by that chance across all windows of the step, and the
+  step takes the first `m` of them, for the `m` at which the rate is highest.
+  The price has edges, so every `m` is tried. A drafter that runs on the
+  devices pays its chain once for all windows that use it, however long the
+  longest is; which drafter a sequence uses is tried one sequence at a time
+  and kept when the rate of the step rises, and lengths are then tried one
+  shorter and one longer. In 300 random cases of two sequences, two drafters
+  and chains of up to five rows it is the best of all choices in 293 and
+  never below 97.9 % of it.
+
+**What limited the chain.** In order: the default of three drafts
+(`--drafts`), which was a cap on every sequence's window whatever the text;
+the step cost as a line, `base + per_row * rows`, which cannot see that the
+ninth row costs a launch and so could not decide where a longer chain stops
+paying; the whole step capped at the rows of the windows while anyone drafted,
+which is also what made a prompt crawl; and the room the model reserves per
+row of a window (the inputs it keeps for the commit, 3.6 MB; the logits,
+1 MB; a link of the chain's scratch and the carry of the hidden states: about
+5 MiB for the 27B together, for every sequence), which is the one real limit
+and so the one option, `--window`. Its default is the rows of one launch of
+the few-row weight kernels (`ares_cuda::MAX_BATCH`, 8): inside a launch a
+longer window costs rows and no weights, and the table measured at load says
+what a second launch costs, so a window longer than a launch is only worth
+reserving for text that is copied for many tokens in a row. Everything below
+it is the policy's: a window of 8 rows is a possible chain of 7 links, and a
+step uses as many as pay.
 
 **The lookup drafter.** An automaton and not a trie of runs, because the
 longest match of a sequence's end is then not searched for at all: it is
@@ -745,12 +845,48 @@ the most probable token and for sampled tokens with the same seed
 rows rounds differently from single rows and the texts part after 150 to 650
 characters (the margins of the picks where they part were not measured).
 
+Measured 2026-11-11 with the policy on Qwen3.8-27B (tensor split 0.625 / 0.375,
+`qwen35_run --engine`, 400 tokens per request through the chat template with
+the fork's `reasoning_effort`, the fork's draft vocabulary, most probable
+token and sampled with temperature 1, top-k 20, top-p 0.95; the machine at a
+load of 12 to 20 from other work). "Today" is the build before this work with
+at most three drafts, which is the policy with a window of 4 rows less the
+price table and the per-position estimates:
+
+| Tokens per second | no drafts | today | window 4 | window 8 | window 16 |
+| --- | --- | --- | --- | --- | --- |
+| German prose, greedy / sampled | 38.4 / 40.3 | 78.9 / 77.1 | 79.0 / 78.8 | 79.1 / 85.7 | 76.6 / 75.4 |
+| English prose | 40.7 / 40.3 | 73.4 / 74.5 | 83.3 / 67.5 | 86.2 / 70.6 | 87.3 / 69.4 |
+| New code | 40.6 / 40.1 | 83.8 / 79.1 | 80.2 / 76.8 | 78.8 / 78.3 | 80.1 / 80.3 |
+| A rewrite of a given file | 40.5 / 39.9 | - | 111.0 / 108.7 | 142.3 / 147.8 | 137.7 / 144.5 |
+
+(The numbers without drafts are through HTTP, the others from the tool, which
+runs the same engine; the run to run spread of a cell is about 5 %.) The
+windows of 4 and 8 rows differ where text is copied: the rewrite verifies
+chains of 7 links in six steps of ten and of 6 in three (the draft block is
+right 0.85 to 1.00 at each of the seven positions there, the lookup as well)
+and gains 28 to 36 % over 3 links, with 5.6 tokens a step against 3.6. Prose
+and code gain nothing from a longer chain: their draft block is right 0.6 to
+0.8 at each position, so the chance of a whole chain falls with its length
+(0.7 to the fifth is 0.17), and the policy chooses chains of 3 to 6 from the
+price it measured (a link of the chain costs 1.5 ms, a row a fraction of a
+millisecond, next to the 25 ms of the weights). English prose gains 13 to 17 %
+greedy over three links; the sampled cells are within the spread. A window of
+16 rows is no better than one of 8, so the second launch of the weight
+kernels that a ninth row costs does not pay for the room it takes (VRAM for
+another 8 rows of every sequence); this is the measurement behind the default
+of 8. The study's prediction of +20 % on new code from chains of 7 links did
+not appear: the code question's drafts are right 0.72, 0.74, 0.65, 0.67 and
+0.70 at the first five positions, and the policy stops at 5.
+
 Adaptive draft length did not pay off in the llama.cpp fork (a few percent up
 for English and code, a few percent down for German). Two of its costs there
 do not exist here: a new batch shape built a new graph (about 18 ms, and 26
 MiB of VRAM per GPU for each cached shape), and a rejected draft past the
-rollback rows forced a replay. Whether the gain is real must be measured
-again on this engine with a real model, in German as well as English.
+rollback rows forced a replay. Measured on this engine, the gain over three
+links is where text is copied (the rewrite) and for English prose, and zero
+or inside the spread for German and code; nothing is lost where it does not
+pay, because the policy drafts what the price and the acceptance say pay.
 
 ## Weights
 
@@ -1595,11 +1731,21 @@ few slots that took the expert path from 33 to 44 steps per second; with 99
 ### Qwen3.8-Flash-Next through the runtime
 
 `ares --model <first part of the file>` serves Qwen3.8-Flash-Next like the
-27B: the same endpoints, timings and metrics, the conductor's lookup drafts,
-cancellation, a request that gives way and comes back, several sequences in a
-step. The model is `ares_model::qwen4exp::device::Qwen4Exp`, its parts
-`Qwen4ExpDevice`; `Session` stays as the tool's and the tests' way to step it
-by hand (and for the probes that compare layer by layer).
+27B: the same endpoints, timings and metrics, cancellation, a request that
+gives way and comes back, several sequences in a step. The model is
+`ares_model::qwen4exp::device::Qwen4Exp`, its parts `Qwen4ExpDevice`; `Session`
+stays as the tool's and the tests' way to step it by hand (and for the probes
+that compare layer by layer).
+
+**It does not speculate.** The draft policy gives a model drafts only when it
+has a drafter of its own (`Model::own_drafts`): the lookup in earlier text
+takes part as soon as one does and never alone (see [Speculation](#speculation)).
+Flash-Next has no draft head built, so its windows are one row, its parts
+reserve no room for windows, and the server refuses `--drafters mtp` (and a
+drafter from a file), `--window` and `--draft-vocab` by name; `--drafters
+none` is what it does anyway. The measurements below that speak of drafts were
+taken before the policy, when the lookup ran by itself on this model, and
+were not repeated: the column without drafts is what the server does now.
 
 **A step that has to wait for experts.** The experts a layer needs are known
 when its router has run, so a step cannot be enqueued whole and left alone:
@@ -1656,7 +1802,7 @@ English, 1034 Rust; load average 12 to 18 from other agents' builds unless
 said; the numbers are of the second and third of three rounds of the same
 three prompts, after the warm-up and a round that fills the slots):
 
-| | Both on every layer, drafts | The same, `--drafts 0` | A range of layers each, drafts |
+| | Both on every layer, lookup drafts | The same, no drafts (`--drafts 0` then; what the server does now) | A range of layers each, lookup drafts |
 | --- | --- | --- | --- |
 | Generation, German / English / code | 46 and 45 / 44 and 110 / 70 and 73 tokens/s | 44 and 46 / 48 and 43 / 42 and 42 | 27 and 45 / 16 and 42 / 56 and 74 |
 | A short question (25 tokens), German / English / code | 59 and 68 / 45 and 60 / 54 and 57 | 39 and 37 / 42 and 40 / 33 and 33 | 29 and 69 / 61 and 46 / 38 and 55 |
@@ -1668,7 +1814,7 @@ three prompts, after the warm-up and a round that fills the slots):
 
 Without drafts a token takes 20.7 to 23.9 ms, the tool's step (21.5 to 23.1
 ms), so the server adds nothing to it. The median over the six warm runs with
-drafts is 58 tokens per second, and 48 and 51 over the twelve runs of each of
+the lookup drafts was 58 tokens per second, and 48 and 51 over the twelve runs of each of
 the two servers measured again below, against Strata's 56 with drafts: level
 within the spread of the runs, which is wider than the difference (44 to 110
 in the first series; what the drafts gain depends on the text, as everywhere:
@@ -1729,7 +1875,8 @@ thirty-second of the room for slots (17 408 to 18 432 tokens for two sequences
 on this machine) where the 27B gets what is left. Options that mean nothing for the
 model are errors that name them: `--shares`, `--precision exact`,
 `--draft-vocab`, K/V formats with a tile mean, and rows that do not fit a step
-of eight (`--parallel`, `--drafts`).
+of eight (`--parallel`), and the options of drafting (`--drafters mtp`,
+`--window`).
 
 **The RAM.** The tier of experts is a user of the one RAM limit (`--ram`,
 `PinnedRam`): elastic, with a priority above the checkpoints, so the limit
@@ -1775,7 +1922,8 @@ of 6 to 7; the second pair, 21.5 and 37.0 ms, ran at loads of 8 and 14 and
 says only that the load decides). Through the server, with a new text every
 request, the size decides a great deal. The same
 prompts in a server per tier, load average 12 to 13 (15 to 18 for the
-second), round 1 of 2 or 3, tokens per second with the lookup drafts:
+second), round 1 of 2 or 3, tokens per second with the lookup drafts the
+server had then:
 
 | Tier (`--ram`) | RAM slots | Experts with a slot | File reads per step, prompt rows | File reads per step, decode | Generation: German / English / code | Prompt, 1000 tokens |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -1912,16 +2060,24 @@ Work is paused here until Qwen4 is released; nothing below is in progress.
   1285 to 1291 tokens per second against about 1180, a decode step without
   drafts in 24.8 ms against 28, and 82 to 86 tokens per second with the
   model's own drafts against 62 to 67. Through HTTP it is as fast as without.
-  See [Several devices](#several-devices).
+  Drafts are chosen for every step from a price of a step measured at load
+  and acceptance measured while running (see [Speculation](#speculation)):
+  chains of 7 links where text is copied (142 to 163 tokens per second for a
+  rewrite of a file), of 3 to 6 on prose and code. A prompt that arrives next
+  to generating sequences gets its first token about 25 ms after what the
+  cards need alone (see "A step"). See [Several devices](#several-devices).
 - **Qwen3.8-Flash-Next** runs on both cards, agrees with the CPU reference
   and answers in German and English, and is served by the `ares` binary like
-  the 27B, in both placements, with drafts from earlier text: 48 to 58 tokens
-  per second at the median of a series of runs at about 1000 tokens of context
-  (three series; 20 to 110 by text and run), 43 to 48 without drafts (a decode step takes 22 to 23 ms, 17 ms
-  when it misses no expert), prompts of 1000 tokens at 63 to 139 tokens per
-  second. Strata generates at a median of 56 tokens per second with drafts on
-  this machine, so the two are level within the spread. The model's own draft block is not used yet, and prompts are
-  read in steps of eight rows, on the eight-row expert kernels (the many-row
+  the 27B, in both placements, without speculation: it has no draft head
+  built, and the lookup in earlier text takes part only next to a model
+  drafter. 43 to 48 tokens per second at the median of a series of runs at
+  about 1000 tokens of context (a decode step takes 22 to 23 ms, 17 ms when it
+  misses no expert), prompts of 1000 tokens at 63 to 139 tokens per second.
+  With the lookup drafts it had before the draft policy, which have not been
+  measured since, it was at 48 to 58 (three series; 20 to 110 by text and
+  run), level with Strata's median of 56 with drafts on this machine within
+  the spread; without them it is behind that until its draft head is built.
+  Prompts are read in steps of eight rows, on the eight-row expert kernels (the many-row
   ones are built and not wired; see [Qwen3.8-Flash-Next through the
   runtime](#qwen38-flash-next-through-the-runtime)).
 - CUDA has every kernel family the two models need: weights for all 28
@@ -1945,9 +2101,11 @@ Work is paused here until Qwen4 is released; nothing below is in progress.
   RAM is one setting (`--ram`).
 - Known defects: a long prompt next to a generating Flash-Next sequence slows
   it by the misses of the prompt's rows (nothing separates the two inside a
-  step); with the fast kernels the text with
-  drafts is not always the text without (with exact products it is, for
-  steps of the same size: see "Rounding" under "Sequence state"); a prompt
+  step); with the fast kernels the text with drafts is not always
+  the text without (with exact products it is, for steps of the same size:
+  see "Rounding" under "Sequence state"; the hash of a reply's tokens, which
+  the server returns, and `"draft": false` check it over HTTP, and the test
+  of that for the fast kernels is switched off until they agree); a prompt
   that shares only the start of the chat template with an earlier request
   (three tokens) now runs a step of its own to replay them before its rows
   (one more step in the counts of `--engine`, not timed); a model that only
@@ -1963,7 +2121,8 @@ order it would be taken up; the source of each idea is in
 1. Qwen4 itself: its architecture next to `qwen4exp`, and whatever its
    files need.
 2. The mixture-of-experts case ahead of Strata: drafts from the model's
-   draft block; the prompt path (experts in waves and steps of more than
+   draft block (and with it the lookup in earlier text, which the model had
+   before the draft policy and has not while it has no drafter); the prompt path (experts in waves and steps of more than
    eight rows, on the many-row expert kernels, which are built; where it plugs
    in is described under "Qwen3.8-Flash-Next through the runtime"); reading the
    experts the next layers will pick before their routers have run; owners of
@@ -2089,8 +2248,9 @@ Without options it plans for itself: the first device that holds the weights
 and a context, or else a tensor split over all devices with shares from the
 memory bandwidth each device reports, and a context from the VRAM that is
 left; the start-up report says what was chosen, why, and where the VRAM
-went. Devices, split, shares, context, K/V format, precision, drafts and the
-RAM the engine may use (`--ram`) can be given instead. The RAM defaults to half
+went. Devices, split, shares, context, K/V format, precision, the model
+drafters that take part (`--drafters`) and the room for their windows
+(`--window`), and the RAM the engine may use (`--ram`) can be given instead. The RAM defaults to half
 of what the machine reports as available when the server starts; the
 engine's step buffers are taken from it, and the rest is the budget of the
 checkpoints that let a conversation continue from what was computed (see
@@ -2099,7 +2259,12 @@ checkpoints that let a conversation continue from what was computed (see
 It answers `POST /v1/chat/completions` and `/v1/completions`, streamed and
 not, `GET /v1/models`, `/health` and `/metrics`, with timings in every answer
 (prompt tokens and time, generated tokens and time, drafts proposed and
-accepted). The prefix cache is on for `qwen35` without a flag: a prompt that
+accepted, and `token_hash`, a hash of the reply's token ids in the final message
+and in the last event of a stream). A request can switch drafting off for itself
+with `"draft": false`; the two replies of one request, with and without drafts,
+are then compared by their hashes over HTTP (they are equal with
+`--precision exact`; with the fast kernels they are not always, see Status).
+The prefix cache is on for `qwen35` without a flag: a prompt that
 starts with text the engine has computed reads the cached part from the pages
 and the checkpoint instead of computing it, the answer's `usage` says how much
 (`prompt_tokens_details.cached_tokens`, as OpenAI does), `timings.prompt_n` counts
@@ -2242,8 +2407,9 @@ context (without `--context`, what a thirty-second of the room for expert slots
 holds), and the RAM (`--ram`, whose limit less what the engine needs is the
 tier of experts). The server reads a short text of German, English and code
 before it listens, so that the first request does not find every slot empty. It
-has no prefix cache, no `--shares`, no `--precision exact`, no `--draft-vocab`;
-asking for one is an error that names the option. Thinking is handled as for the
+has no prefix cache, no `--shares`, no `--precision exact`, no `--draft-vocab`,
+no `--window` and no model drafter (`--drafters mtp`), and it does not
+speculate; asking for one of the options is an error that names it. Thinking is handled as for the
 27B: the model declares what its chat template says (`Model::chat_format`), so
 the reasoning of a reply comes apart from the content, in streams too, and
 `--reasoning` and the controls of a request work the same way; a reply that

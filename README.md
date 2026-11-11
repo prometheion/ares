@@ -18,14 +18,19 @@ How the engine is built and how far each part is: [docs/ARCHITECTURE.md](docs/AR
 Ares supports two models until Qwen4 replaces them: Qwen3.8-27B, dense, and
 Qwen3.8-Flash-Next, a mixture of experts streamed from SSD. The 27B is
 served by the `ares` binary on one or two GPUs through CUDA, with drafts
-from the model's own draft block, sampling on the device and a prefix cache
+from the model's own draft block and from earlier text (whose drafts and how
+long are chosen for every step from the price of a step, measured at load, and
+the acceptance, measured while running), prompts that are read in pieces
+between rounds of generation, sampling on the device and a prefix cache
 that lets a conversation continue from what was computed; on two GPUs it is
 ahead of the llama.cpp fork it is measured against in prompt processing and
-in generation. Flash-Next is served by the same binary on two GPUs, with
-drafts from earlier text; it agrees with its CPU reference and generates at
-48 to 58 tokens per second at the median with drafts (three series), level with
-Strata's 56 within the spread of the runs. It has no prefix cache, and reads
-prompts in steps of eight rows. The numbers are in
+in generation. Flash-Next is served by the same binary on two GPUs, without
+speculation (its draft head is not built, and the lookup in earlier text takes
+part only next to a model drafter); it agrees with its CPU reference and
+generates at 43 to 48 tokens per second at the median. With the lookup drafts
+it had before the draft policy it made 48 to 58 (three series), level with
+Strata's 56 with drafts within the spread of the runs. It has no prefix cache,
+and reads prompts in steps of eight rows. The numbers are in
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#status).
 
 There is no release yet. The first release is the complete engine: every

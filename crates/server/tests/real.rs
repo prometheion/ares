@@ -171,13 +171,15 @@ impl Server {
     /// until it listens.
     fn start(model: &PathBuf, port: u16, flags: &[&str]) -> Self {
         let device = std::env::var("ARES_TEST_DEVICE").unwrap_or_else(|_| "0".to_owned());
-        Self::start_with(
-            model,
-            port,
-            &["--devices", &device, "--precision", "exact", "--context", "8192"],
-            flags,
-            LIMIT,
-        )
+        // Exact products and a context of 8192 unless the test says otherwise.
+        let mut base = vec!["--devices", device.as_str()];
+        if !flags.contains(&"--precision") {
+            base.extend(["--precision", "exact"]);
+        }
+        if !flags.contains(&"--context") {
+            base.extend(["--context", "8192"]);
+        }
+        Self::start_with(model, port, &base, flags, LIMIT)
     }
 
     /// Starts `ares` with the model and exactly the flags given, and waits
@@ -834,6 +836,136 @@ fn a_server_with_no_ram_to_spare_keeps_no_checkpoints_and_answers_as_one_with() 
     );
     assert_eq!(without_second.2, with_second.2, "the second answer, with and without checkpoints");
     without.stop();
+}
+
+/// The server run with `flags` on the small model, which is refused before
+/// any device is touched: its exit status and what it said.
+fn refused(model: &PathBuf, flags: &[&str]) -> (ExitStatus, String) {
+    let output = Command::new(BIN)
+        .arg("--model")
+        .arg(model)
+        .args(flags)
+        .env_remove("RUST_LOG")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    (output.status, String::from_utf8_lossy(&output.stderr).into_owned())
+}
+
+#[test]
+fn the_choice_of_drafters_is_refused_by_name_before_a_device_is_touched() {
+    let Some(model) = std::env::var_os("ARES_TEST_QWEN35_MODEL").map(PathBuf::from) else {
+        eprintln!("skipped: set ARES_TEST_QWEN35_MODEL to a small qwen35 model file");
+        return;
+    };
+    // A block drafter from a file is accepted by the option and not built.
+    let (status, said) = refused(&model, &["--drafters", "mtp,/models/dflash2.gguf"]);
+    assert!(!status.success() && said.contains("not built yet"), "{said}");
+    // The small model has no draft block of its own.
+    let (status, said) = refused(&model, &["--drafters", "mtp"]);
+    assert!(!status.success() && said.contains("no draft block"), "{said}");
+    // A window, or a vocabulary, for no drafter does nothing.
+    let (status, said) = refused(&model, &["--drafters", "none", "--window", "8"]);
+    assert!(!status.success() && said.contains("without a model drafter"), "{said}");
+    let (status, said) = refused(&model, &["--drafters", "none", "--draft-vocab", "v.txt"]);
+    assert!(!status.success() && said.contains("no drafter of that kind"), "{said}");
+}
+
+// --- drafts -------------------------------------------------------------------
+//
+// These need a model with a draft block: `ARES_TEST_DRAFT_MODEL`, a
+// quantization of the 27B that fits one card, such as
+// `Qwen3.8-27B-UD-IQ2_XXS-with-draft-block.gguf`.
+
+fn draft_model() -> Option<PathBuf> {
+    std::env::var_os("ARES_TEST_CUDA")?;
+    match std::env::var_os("ARES_TEST_DRAFT_MODEL") {
+        Some(path) => Some(path.into()),
+        None => {
+            eprintln!("skipped: set ARES_TEST_DRAFT_MODEL to a model file with a draft block");
+            None
+        }
+    }
+}
+
+/// The reply to `question`, greedy, with drafts or without (`"draft": false`):
+/// the hash of its token ids as the last chunk of the stream and the final
+/// message of a plain request give it, and the drafts verified for it.
+fn reply_tokens(server: &Client, question: &str, drafts: bool) -> (String, String, Option<u64>) {
+    let mut extra = json!({"max_tokens": 160, "temperature": 0});
+    if !drafts {
+        extra["draft"] = json!(false);
+    }
+    let plain = server.post("/v1/chat/completions", &server.chat(question, extra.clone()));
+    assert_eq!(plain.status, 200, "{}", plain.body);
+    let body = plain.json();
+    let hash = body["timings"]["token_hash"].as_str().expect("a token hash").to_owned();
+    let text = body["choices"][0]["message"]["content"].as_str().unwrap().to_owned();
+    // The stream carries the same hash in its last event with timings.
+    extra["stream"] = json!(true);
+    let streamed = server.post("/v1/chat/completions", &server.chat(question, extra));
+    let (chunks, done) = streamed.events();
+    assert!(done);
+    let last = chunks.iter().rev().find(|c| c["timings"].is_object()).expect("timings at the end");
+    assert_eq!(last["timings"]["token_hash"].as_str(), Some(hash.as_str()), "plain and stream");
+    assert_eq!(streamed_text(&chunks), text);
+    (hash, text, body["timings"]["draft_n"].as_u64())
+}
+
+#[test]
+fn a_request_can_switch_drafts_off_and_the_reply_has_a_hash_of_its_tokens() {
+    let Some(model) = draft_model() else { return };
+    let server = Server::start(&model, port(9), &["--parallel", "1"]);
+    let (_, _, drafted) = reply_tokens(&server, ENGLISH, true);
+    assert!(drafted.unwrap_or(0) > 0, "the draft block and the lookup draft: {drafted:?}");
+    let (_, _, none) = reply_tokens(&server, ENGLISH, false);
+    assert_eq!(none, Some(0), "no draft row for a request that asks for none");
+    // The hash is a function of the tokens.
+    let (a, ..) = reply_tokens(&server, GERMAN, false);
+    let (b, ..) = reply_tokens(&server, GERMAN, false);
+    assert_eq!(a, b);
+    let (c, ..) = reply_tokens(&server, ENGLISH, false);
+    assert_ne!(a, c);
+    server.stop();
+}
+
+/// With exact products a window of several rows and single rows round alike,
+/// so the tokens with drafts are the tokens without them, and the hash of the
+/// reply says so over HTTP.
+#[test]
+fn with_exact_products_the_reply_with_drafts_is_the_reply_without() {
+    let Some(model) = draft_model() else { return };
+    let server = Server::start(&model, port(9), &["--parallel", "1", "--precision", "exact"]);
+    for question in [GERMAN, ENGLISH, "Write a Rust function that reverses a string, with a test."]
+    {
+        let (with, with_text, drafted) = reply_tokens(&server, question, true);
+        let (without, without_text, _) = reply_tokens(&server, question, false);
+        assert!(drafted.unwrap_or(0) > 0, "{question}: drafts were verified");
+        assert_eq!(with_text, without_text, "{question}");
+        assert_eq!(with, without, "{question}: the hashes of the tokens");
+    }
+    server.stop();
+}
+
+/// With the fast kernels (8-bit activations for a few rows) a window of
+/// several rows rounds differently from single rows, and the tokens with
+/// drafts are not always the tokens without them: a known defect that another
+/// piece of work (the kernels) is to remove. This states what is true today
+/// and is switched on to see whether it still is; when the kernels agree, it
+/// becomes the check of the exact-products test above, for the default
+/// products.
+#[test]
+#[ignore = "known defect: the tokens with drafts differ from the tokens without them with the fast kernels"]
+fn with_the_fast_kernels_the_reply_with_drafts_is_the_reply_without() {
+    let Some(model) = draft_model() else { return };
+    let server = Server::start(&model, port(9), &["--parallel", "1", "--precision", "fast"]);
+    for question in [GERMAN, ENGLISH, "Write a Rust function that reverses a string, with a test."]
+    {
+        let (with, ..) = reply_tokens(&server, question, true);
+        let (without, ..) = reply_tokens(&server, question, false);
+        assert_eq!(with, without, "{question}");
+    }
+    server.stop();
 }
 
 // --- Qwen3.8-Flash-Next ----------------------------------------------------

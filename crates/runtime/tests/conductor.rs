@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use ares_api::{Engine, EngineError, Event, EventSink, FinishReason, RequestId};
 use ares_runtime::testing::{Gate, HostExecutor};
-use ares_runtime::{Runtime, RuntimeConfig, Split, SyntheticConfig, SyntheticModel};
+use ares_runtime::{Model, Runtime, RuntimeConfig, Split, SyntheticConfig, SyntheticModel};
 use common::*;
 
 fn model(configure: impl FnOnce(&mut SyntheticConfig)) -> Arc<SyntheticModel> {
@@ -28,7 +28,8 @@ fn config(speculation: bool, pages: u32) -> RuntimeConfig {
         pages,
         cells_per_page: 16,
         max_slots: 64,
-        speculation,
+        // A window of one row is no drafts at all.
+        window_rows: if speculation { 8 } else { 1 },
         warm_up: false,
         ..RuntimeConfig::default()
     }
@@ -47,10 +48,29 @@ fn runtime(model: &Arc<SyntheticModel>, speculation: bool) -> Runtime {
     runtime_with(model, config(speculation, 4096), |e| e)
 }
 
-/// A model whose text loops and changes its loop every 40 positions.
+/// A model whose text loops and changes its loop every 40 positions, and whose
+/// draft block gets the first links right more often than the last.
 fn repeating(c: &mut SyntheticConfig) {
     c.context.window = 1;
     c.context.epoch = 40;
+    c.context.buckets = 512;
+    c.own_drafts = 7;
+    c.own_accuracy = vec![0.9, 0.85, 0.8, 0.7, 0.6, 0.5, 0.4];
+}
+
+/// Gives the model a draft block with these chances for its links.
+fn drafter(c: &mut SyntheticConfig, accuracy: &[f64]) {
+    c.context.window = 1;
+    c.own_drafts = 7;
+    c.own_accuracy = accuracy.to_vec();
+}
+
+/// A model whose text never repeats inside a request (its next token depends
+/// on the position, which changes at every token) and whose draft block is
+/// never right: only text another request wrote can be drafted.
+fn never_repeating(c: &mut SyntheticConfig) {
+    drafter(c, &[0.0]);
+    c.context.epoch = 1;
     c.context.buckets = 512;
 }
 
@@ -110,7 +130,7 @@ fn speculation_changes_the_number_of_steps_and_not_the_text() {
 
 #[test]
 fn text_that_does_not_repeat_gets_few_drafts_accepted() {
-    let model = model(|_| {});
+    let model = model(never_repeating);
     let rt = runtime(&model, true);
     let before = snapshot(&rt);
     outputs_of(&rt, 5, 8);
@@ -122,9 +142,8 @@ fn text_that_does_not_repeat_gets_few_drafts_accepted() {
 
 #[test]
 fn a_text_another_request_wrote_is_drafted_from_the_corpus_all_requests_share() {
-    // A model whose text never repeats inside a request: a draft can only
-    // come from what another request read and wrote.
-    let model = model(|_| {});
+    // A draft can only come from what another request read and wrote.
+    let model = model(never_repeating);
     let rt = runtime_with(&model, config(true, 4096), |e| e.with_delay(Duration::from_micros(200)));
     let first = alone(&rt, "written twice", Some(200));
     let before = snapshot(&rt);
@@ -189,7 +208,7 @@ fn a_request_alone_runs_to_the_end_of_the_pool_and_its_drafts_are_cut_there() {
     // A model whose text falls into a loop and stays there, so that drafts
     // are proposed up to the last cell.
     let model = model(|c| {
-        c.context.window = 1;
+        drafter(c, &[0.9, 0.8, 0.7]);
         c.context.epoch = 0;
         c.context.buckets = 512;
     });
@@ -537,7 +556,7 @@ fn a_steady_batch_still_finds_out_that_drafts_are_cheap() {
     // step from a cost per row (it has seen one step size only). Drafting must
     // not stay off for ever because of that.
     let model = model(|c| {
-        c.context.window = 1;
+        drafter(c, &[0.9, 0.8, 0.7]);
         c.context.epoch = 0;
         c.context.buckets = 512;
     });
@@ -682,4 +701,175 @@ fn a_slowdown_that_leaves_generation_no_time_is_refused_at_start() {
         let error = Runtime::start(model.clone(), Box::new(host), config).unwrap_err();
         assert!(error.to_string().contains("must be above 1"), "{slowdown}: {error}");
     }
+}
+
+// --- the draft policy -------------------------------------------------------
+
+/// A device whose weight kernels read their rows in launches of eight: a step
+/// costs 3 ms and 0.03 ms a row, and 3 ms more from the ninth row on and again
+/// from the seventeenth. A link of the draft block's chain costs 0.3 ms.
+fn launches(rows: u32) -> Duration {
+    Duration::from_micros(3000 + 30 * u64::from(rows) + 3000 * u64::from(rows.div_ceil(8) - 1))
+}
+
+fn drafting_runtime(
+    accuracy: &[f64],
+    window: u32,
+    warm_up: bool,
+    steps: Option<&Steps>,
+) -> (Runtime, Arc<SyntheticModel>) {
+    let model = model(|c| {
+        never_repeating(c);
+        c.own_drafts = 15;
+        c.own_accuracy = accuracy.to_vec();
+        c.max_rows = 64;
+        c.context_length = 2048;
+    });
+    let observer = steps.map(watch);
+    let config = RuntimeConfig { window_rows: window, warm_up, ..config(true, 4096) };
+    let rt = runtime_with(&model, config, |e| {
+        let e = e.with_step_cost(launches).with_link_cost(Duration::from_micros(300));
+        match observer {
+            Some(observer) => e.with_observer(observer),
+            None => e,
+        }
+    });
+    (rt, model)
+}
+
+/// The windows the policy made, by the number of drafts they verified: `[source][drafts]`.
+fn lengths(rt: &Runtime) -> [[u64; 17]; 2] {
+    snapshot_of(rt).counters.draft_lengths
+}
+
+fn snapshot_of(rt: &Runtime) -> ares_runtime::Snapshot {
+    rt.snapshot().expect("the conductor runs")
+}
+
+#[test]
+fn a_model_with_no_drafter_does_not_speculate_and_the_lookup_does_not_run_alone() {
+    // Text that repeats exactly, which the lookup would copy.
+    let model = model(|c| {
+        c.context.window = 1;
+        c.context.epoch = 0;
+        c.context.buckets = 512;
+    });
+    let rt = runtime_with(&model, RuntimeConfig { window_rows: 8, ..config(true, 4096) }, |e| e);
+    alone(&rt, "a text that loops", Some(300));
+    let c = snapshot_of(&rt).counters;
+    assert_eq!((c.draft_rows, c.drafts_accepted), (0, 0), "{c:?}");
+    // A token a row: the first came from the prompt's last row.
+    assert_eq!(c.tokens, c.window_rows + 1, "{c:?}");
+}
+
+#[test]
+fn the_lookup_joins_the_model_drafter_when_there_is_one() {
+    let model = model(never_repeating);
+    let rt = runtime_with(&model, RuntimeConfig { window_rows: 8, ..config(true, 4096) }, |e| e);
+    alone(&rt, "written twice", Some(200));
+    let before = snapshot_of(&rt).counters;
+    alone(&rt, "written twice", Some(200));
+    let c = snapshot_of(&rt).counters;
+    // The draft block is never right here: what is drafted and accepted
+    // comes from the lookup in the first request's text.
+    assert!(c.drafts_accepted_at[0].iter().sum::<u64>() > 150, "{c:?}");
+    assert_eq!(c.drafts_accepted_at[1].iter().sum::<u64>(), 0, "{c:?}");
+    assert!(c.steps - before.steps < 80, "{c:?}");
+}
+
+#[test]
+fn drafts_are_as_long_as_they_pay_and_stop_at_the_edge_of_a_launch() {
+    // A draft block that is right nearly always: seven links fill the eight
+    // rows of a launch, and a second launch costs more than the rows after it
+    // are worth.
+    let (rt, _) = drafting_runtime(&[0.97], 16, true, None);
+    alone(&rt, "a long and easy text", Some(400));
+    let l = lengths(&rt)[1];
+    // (Nearly all: the price of a step is measured with sleeps on a machine
+    // that may be busy, and a window in a hundred may be longer or shorter.)
+    let windows: u64 = l.iter().sum();
+    assert!(l[5..8].iter().sum::<u64>() * 10 >= windows * 8, "{l:?}");
+    assert!(l[8..].iter().sum::<u64>() * 20 <= windows, "{l:?}");
+
+    // One that is right a third of the time stops sooner, from the first
+    // window on.
+    let (rt, _) = drafting_runtime(&[0.33], 16, true, None);
+    alone(&rt, "a hard text", Some(400));
+    let l = lengths(&rt)[1];
+    let windows: u64 = l.iter().sum();
+    let long: u64 = l[4..].iter().sum();
+    assert!(windows > 0 && long * 10 < windows, "{l:?}");
+
+    // One that is never right is not asked for long (the back-off is checked
+    // against exact prices in the scheduler's tests: here the price of a step
+    // is measured with sleeps, and the rarer a draft that pays, the more the
+    // noise of that price decides how often one is tried).
+    let (rt, _) = drafting_runtime(&[0.0], 16, true, None);
+    alone(&rt, "an impossible text", Some(400));
+    let c = snapshot_of(&rt).counters;
+    assert!(c.draft_rows * 2 < c.tokens, "{c:?}");
+}
+
+#[test]
+fn the_window_is_the_room_and_not_the_length() {
+    let (rt, _) = drafting_runtime(&[0.97], 4, true, None);
+    alone(&rt, "a long and easy text", Some(300));
+    let l = lengths(&rt)[1];
+    assert!(l[3] > 20 && l[4..].iter().all(|n| *n == 0), "{l:?}");
+}
+
+#[test]
+fn the_warm_up_measures_every_window_size_and_every_link_of_the_chain() {
+    let steps: Steps = Arc::default();
+    let (rt, model) = drafting_runtime(&[0.97], 8, true, Some(&steps));
+    drop(rt);
+    let seen = steps.lock().unwrap().clone();
+    // The rows of a window, one to the most a step with drafts has, and a few
+    // above up to a piece of prompt.
+    let rows: std::collections::BTreeSet<u32> = seen.iter().map(|s| s.rows).collect();
+    assert!((1..=model.max_rows().min(24)).all(|n| rows.contains(&n)), "{rows:?}");
+    assert!(rows.contains(&32) && rows.contains(&model.prompt_rows()), "{rows:?}");
+    // And chains of 1 to 7 links: windows of 2 to 8 rows whose drafts the
+    // model fills in.
+    assert!(seen.iter().filter(|s| s.windows > 0).count() >= 7, "{seen:?}");
+}
+
+#[test]
+fn the_calibration_finds_the_edge_of_a_launch_and_the_cost_of_a_link() {
+    let (rt, _) = drafting_runtime(&[0.97], 8, true, None);
+    let calibration = snapshot_of(&rt).calibration.expect("the warm-up measured");
+    let step = |rows: u32| calibration.step_ms.iter().find(|(n, _)| *n == rows).unwrap().1;
+    // Eight rows are one launch and nine two: 3 ms more, with the sleeps of a
+    // test executor on top.
+    assert!((step(9) - step(8) - 3.0).abs() < 1.0, "{:?}", calibration.step_ms);
+    assert!((step(8) - step(1)).abs() < 1.0, "{:?}", calibration.step_ms);
+    // A link of the chain costs 0.3 ms, however long the chain.
+    assert_eq!(calibration.chain_ms.len(), 7, "{:?}", calibration.chain_ms);
+    assert!(
+        calibration.chain_ms.iter().all(|(links, ms)| (ms / f64::from(*links) - 0.3).abs() < 0.01)
+    );
+    assert!(calibration.steps > 30 && calibration.seconds > 0.0, "{calibration:?}");
+}
+
+#[test]
+fn a_request_that_asks_for_no_drafts_gets_none_and_says_the_same() {
+    let (rt, _) = drafting_runtime(&[0.97], 8, false, None);
+    let with = alone(&rt, "the same words", Some(120));
+    let drafted = snapshot_of(&rt).counters.draft_rows;
+    assert!(drafted > 0);
+    let mut plain = request("the same words", Some(120));
+    plain.draft = false;
+    let without = run_one(&rt, plain);
+    assert_eq!(snapshot_of(&rt).counters.draft_rows, drafted, "no draft rows for the request");
+    assert_eq!(without, with, "the text, and the hash of its tokens, are the same");
+    assert_ne!(with.usage.output_hash, 0);
+}
+
+#[test]
+fn a_window_of_no_rows_is_refused_at_start() {
+    let model = model(|_| {});
+    let host = HostExecutor::new(model.clone(), model.config().max_rows, 4);
+    let config = RuntimeConfig { max_slots: 4, window_rows: 0, ..config(true, 64) };
+    let error = Runtime::start(model.clone(), Box::new(host), config).unwrap_err();
+    assert!(error.to_string().contains("at least one row"), "{error}");
 }

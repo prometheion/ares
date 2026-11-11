@@ -33,16 +33,19 @@
 //!   both devices would take equally long, from the device times of the
 //!   decode steps. `--balance FILE` places the model by such a file.
 //!
-//! - `--engine N`: the whole engine instead of the session (conductor, picks
-//!   on the device, drafts): three chat requests (German prose, English prose,
-//!   code) of `--generate` tokens, each most-probable-token and, with
-//!   `--sample`, sampled, with at most `N` drafts per window (0: none). With
-//!   a model that has a draft block the drafts are its own; `--draft-vocab
-//!   FILE` restricts them to the tokens of a list (an id per line). `--out
-//!   DIR` keeps the answers, to compare runs. `--chat-var name=value` sets a
-//!   variable of the chat template (`reasoning_effort=medium`). Reports
-//!   tokens per second, acceptance by draft position and the time of a step
-//!   by kind.
+//! - `--engine W`: the whole engine instead of the session (conductor, picks
+//!   on the device, drafts): four chat requests (German prose, English prose,
+//!   new code, a rewrite of a given file) of `--generate` tokens, each
+//!   most-probable-token and, with `--sample`, sampled, with windows of up to
+//!   `W` rows (0: no drafts). With a model that has a draft block the engine
+//!   drafts with it and with the lookup in earlier text, and chooses for every
+//!   step whose drafts and how many from the price of a step (measured at
+//!   load) and the acceptance (measured while running); `--draft-vocab FILE`
+//!   restricts the block's drafts to the tokens of a list (an id per line).
+//!   `--out DIR` keeps the answers, to compare runs. `--chat-var name=value`
+//!   sets a variable of the chat template (`reasoning_effort=medium`). Reports
+//!   tokens per second, acceptance by draft position, the lengths of the
+//!   drafts and the time of a step by kind.
 //! - `--conversation TOKENS`: the prefix cache on the devices. A conversation
 //!   whose history is about `TOKENS` tokens (a slice of `--text`) has a second
 //!   turn, and a conversation of the same size that the engine has never seen
@@ -51,7 +54,7 @@
 //!   (copies of the device's recurrent state to and from page-locked RAM),
 //!   and the RAM locked are reported. `--checkpoints N` is the number of
 //!   checkpoints the engine keeps (16 for `--conversation`, none otherwise);
-//!   `--drafts N` the drafts per window (3).
+//!   `--window W` the rows of a sequence's window (8).
 //!
 //! Lines that start with `RES` are results.
 
@@ -70,6 +73,51 @@ use ares_runtime::Pick;
 use ares_tokenizer::{ChatOptions, EncodeOptions, Message};
 
 const MIB: f64 = 1024.0 * 1024.0;
+
+/// The file of the rewrite task of `--engine`.
+const REWRITE_SOURCE: &str = "use std::collections::HashMap;
+
+/// A least-recently-used cache with a fixed capacity.
+pub struct Lru<K, V> {
+    capacity: usize,
+    tick: u64,
+    items: HashMap<K, (V, u64)>,
+}
+
+impl<K: std::hash::Hash + Eq + Clone, V> Lru<K, V> {
+    pub fn new(capacity: usize) -> Self {
+        Self { capacity, tick: 0, items: HashMap::with_capacity(capacity) }
+    }
+
+    pub fn get(&mut self, key: &K) -> Option<&V> {
+        self.tick += 1;
+        let tick = self.tick;
+        self.items.get_mut(key).map(|entry| {
+            entry.1 = tick;
+            &entry.0
+        })
+    }
+
+    pub fn put(&mut self, key: K, value: V) {
+        self.tick += 1;
+        if self.items.len() >= self.capacity && !self.items.contains_key(&key) {
+            let oldest = self.items.iter().min_by_key(|(_, (_, used))| *used).map(|(k, _)| k.clone());
+            if let Some(oldest) = oldest {
+                self.items.remove(&oldest);
+            }
+        }
+        self.items.insert(key, (value, self.tick));
+    }
+
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+}
+";
 
 struct Args {
     model: PathBuf,
@@ -95,7 +143,7 @@ struct Args {
     engine: Option<u32>,
     conversation: Option<usize>,
     checkpoints: Option<u64>,
-    drafts: u32,
+    window: u32,
     sample: bool,
     draft_vocab: Option<PathBuf>,
     out: Option<PathBuf>,
@@ -129,7 +177,7 @@ fn parse() -> Args {
         engine: None,
         conversation: None,
         checkpoints: None,
-        drafts: 3,
+        window: 8,
         sample: false,
         draft_vocab: None,
         out: None,
@@ -177,10 +225,10 @@ fn parse() -> Args {
             "--balance" => args.balance = Some(value().into()),
             "--balance-out" => args.balance_out = Some(value().into()),
             "--step-rows" => args.step_rows = Some(value().parse().expect("rows")),
-            "--engine" => args.engine = Some(value().parse().expect("drafts")),
+            "--engine" => args.engine = Some(value().parse().expect("rows of a window")),
             "--conversation" => args.conversation = Some(value().parse().expect("tokens")),
             "--checkpoints" => args.checkpoints = Some(value().parse().expect("checkpoints")),
-            "--drafts" => args.drafts = value().parse().expect("drafts"),
+            "--window" => args.window = value().parse().expect("rows of a window"),
             "--sample" => args.sample = true,
             "--draft-vocab" => args.draft_vocab = Some(value().into()),
             "--out" => args.out = Some(value().into()),
@@ -435,8 +483,8 @@ fn main() {
         ("layer", _) => Spread::Layer(args.shares.clone()),
         (other, _) => panic!("unknown split {other}"),
     };
-    if let Some(drafts) = args.engine {
-        return engine(&args, &spread, drafts);
+    if let Some(window) = args.engine {
+        return engine(&args, &spread, window);
     }
     if let Some(history) = args.conversation {
         return conversation(&args, &spread, history);
@@ -673,6 +721,7 @@ fn ask(
                 sampling,
                 max_tokens: Some(max_tokens),
                 stop: Vec::new(),
+                draft: true,
                 id: RequestId(id),
             },
             sink,
@@ -685,7 +734,7 @@ fn ask(
 
 /// `--engine`: chat requests through the conductor, with the picks made on
 /// the devices and, when the model has a draft block, its own drafts.
-fn engine(args: &Args, spread: &Spread, drafts: u32) {
+fn engine(args: &Args, spread: &Spread, window: u32) {
     use ares_runtime::{DevicePhase, GpuConfig, Model, Phase, Runtime, RuntimeConfig};
     let vocabulary: Option<Arc<[u32]>> = args.draft_vocab.as_ref().map(|path| {
         let text = std::fs::read_to_string(path).expect("the draft vocabulary");
@@ -701,8 +750,8 @@ fn engine(args: &Args, spread: &Spread, drafts: u32) {
         layouts: args.layouts,
         state: args.state,
         max_rows: args.max_rows,
-        logit_rows: 16,
-        window_rows: if drafts > 0 { drafts + 1 } else { 0 },
+        logit_rows: (2 * window).max(16),
+        window_rows: if window > 1 { 2 * window } else { 0 },
         draft_vocabulary: vocabulary,
         pipeline_rows: args.pipeline_rows,
         profile: args.profile.then(|| profile.clone()),
@@ -731,8 +780,7 @@ fn engine(args: &Args, spread: &Spread, drafts: u32) {
         pages: 2 * args.context.div_ceil(128) + 2,
         cells_per_page: 128,
         max_slots: 2,
-        speculation: drafts > 0,
-        max_draft: drafts.max(1),
+        window_rows: window.max(1),
         checkpoint_budget: args.checkpoints.unwrap_or(0)
             * model.prefix_cache().map_or(0, |c| c.bytes()),
         ..RuntimeConfig::default()
@@ -740,7 +788,7 @@ fn engine(args: &Args, spread: &Spread, drafts: u32) {
     let gpu = GpuConfig::new(&config, &*model);
     let runtime = Runtime::start_gpu(model.clone(), devices.clone(), config, gpu).expect("start");
     println!(
-        "RES engine: loaded in {:.1} s, at most {drafts} drafts",
+        "RES engine: loaded in {:.1} s, windows of at most {window} rows",
         begun.elapsed().as_secs_f64()
     );
     for (report, (device, before)) in model.reports().iter().zip(devices.iter().zip(&free_before)) {
@@ -769,7 +817,12 @@ fn engine(args: &Args, spread: &Spread, drafts: u32) {
         }
     }
 
-    let questions = [
+    // A file to write again with two names changed: text to copy.
+    let rewrite = format!(
+        "Rewrite the following Rust file so that `Lru` is called `Cache` and `tick` is called \
+         `clock`, and change nothing else. Give the whole file.\n\n```rust\n{REWRITE_SOURCE}```"
+    );
+    let questions: [(&str, &str); 4] = [
         (
             "german",
             "Schreibe einen ausf\u{fc}hrlichen Aufsatz \u{fc}ber die Geschichte der Eisenbahn in \
@@ -785,6 +838,7 @@ fn engine(args: &Args, spread: &Spread, drafts: u32) {
             "Write a Rust module that implements an LRU cache with get, put and a capacity limit, \
              with unit tests.",
         ),
+        ("rewrite", &rewrite),
     ];
     let greedy = ares_api::Sampling { temperature: Some(0.0), ..ares_api::Sampling::default() };
     let sampled = ares_api::Sampling {
@@ -842,6 +896,22 @@ fn engine(args: &Args, spread: &Spread, drafts: u32) {
                 println!(
                     "RES {name} {how}: {label} drafts accepted by position: {}",
                     rates.join(", ")
+                );
+            }
+            for (source, label) in [(0, "lookup"), (1, "own")] {
+                let lengths = c.draft_lengths[source];
+                if lengths.iter().all(|n| *n == 0) {
+                    continue;
+                }
+                let shown: Vec<String> = lengths
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, n)| **n > 0)
+                    .map(|(len, n)| format!("{len}: {n}"))
+                    .collect();
+                println!(
+                    "RES {name} {how}: {label} windows by drafts verified: {}",
+                    shown.join(", ")
                 );
             }
             if c.own_draft_steps > 0 {
@@ -925,6 +995,7 @@ fn converse(
                 sampling: ares_api::Sampling { temperature: Some(0.0), ..Default::default() },
                 max_tokens: Some(max_tokens),
                 stop: Vec::new(),
+                draft: true,
                 id: RequestId(id),
             },
             sink,
@@ -948,8 +1019,8 @@ fn conversation(args: &Args, spread: &Spread, history: usize) {
         layouts: args.layouts,
         state: args.state,
         max_rows: args.max_rows,
-        logit_rows: 16,
-        window_rows: if args.drafts > 0 { args.drafts + 1 } else { 0 },
+        logit_rows: (2 * args.window).max(16),
+        window_rows: if args.window > 1 { 2 * args.window } else { 0 },
         pipeline_rows: args.pipeline_rows,
         profile: args.profile.then(|| profile.clone()),
         ..Options::default()
@@ -986,8 +1057,7 @@ fn conversation(args: &Args, spread: &Spread, history: usize) {
         pages: 2 * (history + 1024).div_ceil(per_page) as u32 + 16,
         cells_per_page: per_page as u32,
         max_slots: 2,
-        speculation: args.drafts > 0,
-        max_draft: args.drafts.max(1),
+        window_rows: args.window.max(1),
         checkpoint_budget: checkpoints * model.prefix_cache().map_or(0, |c| c.bytes()),
         ..RuntimeConfig::default()
     };

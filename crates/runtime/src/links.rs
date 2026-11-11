@@ -155,6 +155,29 @@ impl Links {
         }
     }
 
+    /// [`Links::abort`] for the thread of a device that failed in a step, with
+    /// the stream that thread had enqueued on: the release is repeated until
+    /// the work that stream had queued has run, because the pushes among it
+    /// undo a single release for the other device's later kernels. Returns why
+    /// the kernels could not be released, if they could not, and also if the
+    /// stream was still busy when `patience` ran out.
+    pub(crate) fn abort_until_idle(
+        &self,
+        stream: &Stream,
+        patience: std::time::Duration,
+    ) -> Result<(), ares_cuda::Error> {
+        self.abort.store(true, Ordering::SeqCst);
+        match &self.collective {
+            Some(c) => c.mesh.release_waiters_until_idle(stream, patience).and_then(|idle| {
+                idle.then_some(()).ok_or_else(|| ares_cuda::Error::Invalid {
+                    what: "stream",
+                    detail: format!("still busy after {patience:?}"),
+                })
+            }),
+            None => Ok(()),
+        }
+    }
+
     /// Waits, spinning, until `done` holds. Yields the core after a while so
     /// that a partner that was descheduled can run.
     fn wait_until(&self, mut done: impl FnMut() -> bool) -> Result<(), ModelError> {

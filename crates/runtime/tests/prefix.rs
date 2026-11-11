@@ -47,6 +47,13 @@ fn repeating(c: &mut SyntheticConfig) {
     c.context.window = 1;
     c.context.epoch = 40;
     c.context.buckets = 512;
+    c.own_drafts = 7;
+    c.own_accuracy = vec![0.9, 0.85, 0.8, 0.7, 0.6, 0.5, 0.4];
+}
+
+/// The rows of a window: drafts or none.
+fn window(speculation: bool) -> u32 {
+    if speculation { 8 } else { 1 }
 }
 
 /// A recurrent model whose checkpoints are taken at every page boundary of a
@@ -56,7 +63,7 @@ fn config(pages: u32, checkpoints: u64) -> RuntimeConfig {
         pages,
         cells_per_page: PAGE,
         max_slots: 16,
-        speculation: false,
+        window_rows: 1,
         warm_up: false,
         checkpoint_budget: checkpoints * CHECKPOINT,
         checkpoint_prompt_interval: PAGE,
@@ -127,7 +134,7 @@ fn fresh(model_config: impl Fn(&mut SyntheticConfig), prompt: &str, max_tokens: 
     let rt = Runtime::start(
         model.clone(),
         Box::new(HostExecutor::new(model.clone(), model.config().max_rows, 16)),
-        RuntimeConfig { speculation: false, warm_up: false, ..config(4096, 0) },
+        RuntimeConfig { window_rows: 1, warm_up: false, ..config(4096, 0) },
     )
     .unwrap();
     let mut run = alone(&rt, prompt, Some(max_tokens));
@@ -433,7 +440,7 @@ fn a_request_held_for_a_page_that_is_given_up_computes_it_itself() {
 fn rejected_drafts_inside_a_tail_are_cut_and_the_next_turn_takes_exactly_what_was_accepted() {
     let mut rng = Rng(19);
     let model = model(Some(CHECKPOINT), repeating);
-    let cfg = RuntimeConfig { speculation: true, ..config(512, 24) };
+    let cfg = RuntimeConfig { window_rows: 8, ..config(512, 24) };
     let e = engine_with(&model, cfg, |host| host.with_delay(Duration::from_micros(100)));
     let mut ended_in_a_window = 0;
     for max_tokens in 20..70u32 {
@@ -526,7 +533,11 @@ fn a_request_that_gives_way_goes_into_the_cache_and_comes_back_as_a_hit() {
             shape(c);
         };
         let model = model(Some(CHECKPOINT), shape_of);
-        let cfg = RuntimeConfig { output_ratio: 0.05, speculation, ..config(24, 16) };
+        let cfg = RuntimeConfig {
+            output_ratio: 0.05,
+            window_rows: window(speculation),
+            ..config(24, 16)
+        };
         let e = engine_with(&model, cfg, |host| host.with_delay(Duration::from_micros(100)));
         let jobs: Vec<String> = (0..4).map(|i| format!("writes more than expected {i}")).collect();
         let expected: Vec<Run> = jobs.iter().map(|p| fresh(shape_of, p, 180)).collect();
@@ -570,9 +581,11 @@ fn a_window_ends_where_a_checkpoint_is_due_whatever_it_drafts() {
     let mut rng = Rng(22);
     let model = model(Some(CHECKPOINT), repeating);
     for speculation in [false, true] {
-        let e = engine_with(&model, RuntimeConfig { speculation, ..config(256, 24) }, |host| {
-            host.with_delay(Duration::from_micros(100))
-        });
+        let e = engine_with(
+            &model,
+            RuntimeConfig { window_rows: window(speculation), ..config(256, 24) },
+            |host| host.with_delay(Duration::from_micros(100)),
+        );
         let prompt = text_of(&mut rng, 20);
         let before = e.snapshot();
         let said = e.ask(&prompt, 200);
@@ -733,7 +746,7 @@ fn jobs(shape: Shape, rng: &mut Rng, n: usize, longest: u64) -> Vec<Job> {
     let reference = Runtime::start(
         model.clone(),
         Box::new(HostExecutor::new(model.clone(), model.config().max_rows, 16)),
-        RuntimeConfig { speculation: false, warm_up: false, ..config(4096, 0) },
+        RuntimeConfig { window_rows: 1, warm_up: false, ..config(4096, 0) },
     )
     .unwrap();
     let documents: Vec<String> = (0..4)
@@ -811,7 +824,7 @@ fn many_requests_with_shared_prefixes_edits_and_tight_memory_all_say_what_they_s
         ] {
             let model = model(Some(CHECKPOINT), shape);
             let cfg = RuntimeConfig {
-                speculation: true,
+                window_rows: 8,
                 max_slots: slots,
                 output_ratio: ratio,
                 ..config(pages, checkpoints)
@@ -872,13 +885,14 @@ fn the_scenarios_of_an_engine_without_a_cache_run_clean_under_the_oracle() {
     // well: a model without a cache is a model without recurrent state to it.
     for speculation in [false, true] {
         let model = model(None, repeating);
-        let cfg = RuntimeConfig { speculation, max_slots: 64, ..config(4096, 0) };
+        let cfg =
+            RuntimeConfig { window_rows: window(speculation), max_slots: 64, ..config(4096, 0) };
         let e = engine_with(&model, cfg, |host| host.with_delay(Duration::from_micros(300)));
         output_is_independent_of_the_batch(&e.rt, Duration::from_micros(400));
         assert_consistent(&e);
     }
     let small = model(None, |c| c.context_length = 256);
-    let cfg = RuntimeConfig { speculation: true, max_slots: 64, ..config(4096, 0) };
+    let cfg = RuntimeConfig { window_rows: 8, max_slots: 64, ..config(4096, 0) };
     let e = engine_with(&small, cfg, |host| host.with_delay(Duration::from_micros(500)));
     cancel_frees_pages_and_spares_the_others(&e.rt);
     assert_consistent(&e);
@@ -887,7 +901,7 @@ fn the_scenarios_of_an_engine_without_a_cache_run_clean_under_the_oracle() {
         c.context_length = 256;
         repeating(c);
     });
-    let cfg = RuntimeConfig { output_ratio: 0.05, speculation: true, ..config(24, 0) };
+    let cfg = RuntimeConfig { output_ratio: 0.05, window_rows: 8, ..config(24, 0) };
     let e = engine_with(&looping, cfg, |host| host.with_delay(Duration::from_micros(100)));
     a_request_that_gives_way_comes_back_and_says_the_same(&e.rt);
     assert_consistent(&e);

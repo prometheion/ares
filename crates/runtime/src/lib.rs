@@ -70,8 +70,8 @@ pub mod testing;
 mod text;
 mod timing;
 
-pub use conductor::SequenceInfo;
-pub use config::{Drafters, RuntimeConfig};
+pub use conductor::{SequenceInfo, token_hash};
+pub use config::RuntimeConfig;
 pub use engine::Runtime;
 pub use error::RuntimeError;
 pub use exec::{Clock, ExecError, Executor, Pick, StepMeta, StepOutput};
@@ -90,6 +90,6 @@ pub use sync::{WakeCounts, Woke};
 pub use synthetic::{SyntheticConfig, SyntheticModel};
 pub use text::{StopMatcher, printable, unprintable};
 pub use timing::{
-    Counters, DEFAULT_WINDOW, DevicePhase, DeviceTimes, Phase, REPORTED_REQUESTS, RequestReport,
-    Series, Snapshot, Stats, Summary,
+    Calibration, Counters, DEFAULT_WINDOW, DRAFT_POSITIONS, DevicePhase, DeviceTimes, Phase,
+    REPORTED_REQUESTS, RequestReport, Series, Snapshot, Stats, Summary,
 };
