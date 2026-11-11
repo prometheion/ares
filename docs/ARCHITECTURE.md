@@ -842,11 +842,42 @@ tokens on its device, and nothing for its head, which is rows of the output
 head. With exact products the text with drafts equals the text without, for
 the most probable token and for sampled tokens with the same seed
 (`tests/qwen35_mtp_runtime.rs`, and over HTTP by the hash of the reply's tokens,
-`ares-server`'s `tests/real.rs` on the 27B and both cards); with the fast
-kernels a window of several rows rounds differently from single rows and the
-texts part after 150 to 650 characters (the margins of the picks where they
-part were not measured; `tests/real.rs` has two of three questions parting
-after 300 and 430 characters on one card).
+`ares-server`'s `tests/real.rs` on the 27B and both cards). With the fast
+kernels the texts are not guaranteed to agree: a window of several rows rounds
+differently from single rows. Before the few-row kernels the texts parted after
+150 to 650 characters (the margins of the picks where they part were not
+measured; `tests/real.rs` had two of three questions parting after 300 and 430
+characters on one card). Measured 2026-11-12 on the same questions (three
+drafts, 300 tokens, the most probable token and sampled with seed 20261110):
+with every matrix in the device layout all six texts are the same token for token
+(23 and 22 matrices, the i-quants of 2 and 3 bits among them, have no device
+layout and run through the integer decode kernels), with every matrix in the
+file's layout two of six are, and with the measured choice two of six in one
+load and four of six in another, which are not the same model: the choice of
+layouts differs from load to load, and more matrices stay in the file's layout
+when the model has its draft block (96 and 100 on the RTX 4070 against 37 and
+40; the cause was not found).
+
+The cause is not a matrix kernel. A row of a matrix has the same bits alone
+and in a step of up to eight rows (sixteen in the device layout), in a launch
+of any shape, and so have the norms, merges and activations: rows of different
+sequences in one step give the top logit of the rows alone bit for bit, in
+either layout, on one card and on two, and launching every product of the
+file's layout one row at a time changes no bit. The rows of *one* sequence in
+a step do change each other's result: the top logit of a row in a window of
+four differs from the row alone by 1.7e-4 of the logit on average in the
+device layout, 1.1e-3 in the file's layout and 8.8e-5 with exact products
+(Qwen3.8-27B, 16 rows each; 6.3e-4, 2.6e-3 and 2.2e-4 on the 0.8B). It does
+not grow with the context (at 8, 100 and 700 tokens: 2.5e-4, 1.7e-4 and 1.8e-4
+in the device layout, 3.0e-3, 1.1e-3 and 1.3e-3 in the file's), so it is how
+the recurrent or the attention layers take several rows of one sequence (not
+isolated further), not the reading of a long cache. The activations are
+rounded to f16 or to 8 bits before the next product, which turns a difference
+in the last bits of a float into a step of that rounding now and then; the
+8-bit step is larger, so the file's layout carries the difference four to
+seven times further than the device layout and picks another token more often.
+In the device layout the six texts are the same because the difference is
+below the margin of their picks, not because it is zero.
 
 Measured 2026-11-11 with the policy on Qwen3.8-27B (tensor split 0.625 / 0.375,
 `qwen35_run --engine`, 400 tokens per request through the chat template with
@@ -1095,6 +1126,35 @@ for the whole step. Uploading those weights took 1.9 s with the file in the
 page cache and 9.5 to 12 s from a cold disk, through the simple path;
 freeing them 4 to 8 ms. Launching a kernel costs the host under a
 microsecond and nothing in the path synchronises.
+
+**Few rows on the device layout** (`ares_mmr_few` in `kernels/mmr.cuh`, called by
+`Kernels::product` for up to 16 rows of a matrix in the device layout). One
+tile of 16 weight rows at a time on `mma` with f32 accumulation, the codes
+decoded in registers and the next step's weights asked for one step ahead.
+Its arithmetic is a function of the matrix and of the row's own activations
+and nothing else: K is cut into 8 parts of whole super-blocks (fewer
+non-empty ones for a matrix of fewer than 8), each part is summed from zero by
+`mma`, and the parts are added in the order of K. A tile is computed by 1, 2,
+4 or 8 warps, each taking an equal share of the parts (the others' parts reach
+the first warp through shared memory), a block holds 4 or 8 warps, and which
+of the four launches is the fastest depends on the shape and the card:
+`Kernels::tune_layout` times them for each shape at load (the model's chooser
+does it over its probe buffer, as large as the weights, because a small matrix
+timed over a few dozen megabytes finds its address translations and the
+launches that wait for them look better than they are). None of the launches
+changes a bit: a row has the same bits alone, in a window of up to 16 rows, with
+other rows beside it, in each launch, tuned or not
+(`tests/layout.rs::a_row_is_the_same_bits_in_any_batch_and_launch`). 0.04 %
+rms from the exact f32 product, as before (the f16 operands). Against the
+integer decode kernels of the file's layout, one row, in the model's probes
+(cold address translations, 59 shapes per card), the sum over the matrices of
+a step is 98.7 % (RTX 4070) and 95.4 % (RTX 3060) of the integer kernels'
+time, and single shapes run from 89 % to 111 %: a few i-quant and Q5_K shapes
+of the RTX 3060 and the matrices of 256 to 768 rows are 2 to 11 % slower;
+the walk of `examples/few_rows_bench.rs` (one shape, rows 1 to 16, `--plans`
+for each launch) is the tool for a single shape. Cutting K the same way for
+every launch costs nothing measurable: the same launch with a cut per
+launch was 0 to 5 % slower at the median.
 
 **Prefill weight kernels.** A quantized matrix times many rows of
 activations, on the tensor cores, for eleven types (`kernels/mm.cuh`,
@@ -1677,20 +1737,63 @@ itself agrees with the reference in 704 of 725 rows.
 The weights are loaded in about 4 s from a cached file. The recurrent state
 takes 150 MiB per sequence over both cards, K and V 33 MiB per 1000 tokens.
 
-**Device layouts in the model.** At load the model probes its own products
-in both layouts, for every type and shape, at the rows it decodes with and
-at a prompt group, and gives each group of matrices the layout that does not
-slow a decode step and is fastest for prompts after that. Measured
-2026-11-11 at shares of 0.625 / 0.375, every matrix in the file's layout
-against the measured choice: prompts at 1234 to 1243 against 1285 to 1291
-tokens per second, a decode step without drafts 24.7 against 24.8 ms, with
-the model's drafts 81.0 / 76.7 / 78.7 against 81.8 / 84.2 / 85.5 tokens per
-second (a step of 34.2 against 32.4 ms). The gain is in windows of drafts
-and in prompts: at one row the device-layout kernels are slower than the
-integer kernels on most matrices, so without drafts most of the model stays
-in the file's layout. With every matrix in the device layout prompts run at
-1360 tokens per second and a decode step is 7 % slower *(measured by the
-agent that built the choice)*.
+**Device layouts in the model.** At load the model first measures how the
+few-row kernels launch for every shape of a matrix that can have the device
+layout (`Kernels::tune_layout`, four launches timed over the probe buffer: a
+second and a half of load on each card), then probes its own products in both
+layouts, for every type and shape, at one row and at a prompt group, and gives
+each group of matrices the layout that does not slow a decode step by more
+than the noise of a probe (2 % of the group) and is fastest for prompts after
+that. The rows of the decode probe are one whether or not the model drafts: a
+choice that depended on the window could change the text with drafts.
+Measured 2026-11-12 at shares of 0.625 / 0.375, prompt of 2048 tokens and a
+decode step at 1000 tokens of context, with the binary of the commit before
+the few-row kernels beside it, back to back (that commit in brackets):
+
+| | every matrix in the file's layout | every matrix in the device layout | measured choice |
+| --- | --- | --- | --- |
+| Prompt, tokens per second | 1232 to 1234 (1232 to 1233) | 1356 to 1359 (1311 to 1322) | 1351 to 1366 (1267 to 1283) |
+| Decode step | 24.76 ms (24.74) | 24.75 ms (26.5 to 28.7) | 24.75 to 24.78 ms (24.81 to 24.86) |
+
+The measured choice puts 458 to 461 of 498 matrices in the device layout on
+the RTX 4070 and 432 to 469 of 497 on the RTX 3060, a little different in
+every load: the probes of shapes within 2 % of each other go either way. Of
+the ones it leaves in the file's layout, 22 on each card are the i-quants of 2
+and 3 bits, which have no device layout, and the rest are shapes for which one
+row is still slower in the device layout: 512 and 768 rows of Q4_K and Q5_K
+(+6 to +13 % on the RTX 4070, +4 to +5 % on the RTX 3060 for 256 and 512
+rows), IQ4_XS and IQ4_NL of 3072 and 4608 columns (+3 to +6 %), Q4_K of 3072
+columns on the RTX 3060 (+4 %), Q5_K of 10752 rows on the RTX 4070 (+4 %) and
+IQ4_XS of 6400 and 6656 rows on the RTX 3060 (+1 to +3 %).
+
+With the model's own drafts (three, the fork's draft vocabulary, 300 tokens)
+German, English and code give, in two loads each, 85.2 / 78.2 / 89.8 and 86.6
+/ 80.5 / 86.6 tokens per second for the most probable token and 81.6 / 77.3 /
+93.9 and 82.4 / 76.8 / 91.5 sampled; the start commit gave 82.0 / 81.1 / 82.2
+and 81.4 / 80.4 / 79.5, and 78.4 / 76.2 / 88.0 and 82.6 / 74.7 / 87.7 sampled.
+That is +5 % for German, -2 % for English (inside the difference between two
+loads) and +9 % for code on the averages. A step with drafts takes 31.2 to
+31.3 ms against 32.4; the tokens per step (2.40 to 2.78 against 2.50 to 2.65)
+depend on which matrices the load left in the file's layout, so the rates of
+two loads differ by up to 4 %. Qwen3.5-0.8B on one card reads prompts at 26
+700 to 29 700 tokens per second on the RTX 4070 (21 300 to 26 700 at the start
+commit) and 13 100 to 14 500 on the RTX 3060 (11 900 to 12 400); a decode step
+takes 2.41 to 2.42 ms of device time on the RTX 4070 (2.30 to 2.31: 5 % more,
+with 156 to 168 of 187 matrices in the device layout) and 3.30 to 3.33 ms on
+the RTX 3060 (3.28 to 3.35). The machine ran other builds during these
+measurements (load average 3 to 5 of 16 threads, 7 to 13 for the 0.8B).
+
+The same two runs with the branch rebased onto the tile kernels for more weight
+types, the draft policy and Flash-Next, against the binary of the commit under
+it (two loads each, the measured choice): the 27B in Q4_K_S on both cards reads
+prompts at 1347 to 1366 tokens per second against 1257 to 1282, and a decode
+step takes 24.73 and 24.77 ms against 25.06 and 24.87. The IQ2_XXS file of the
+27B on the RTX 4070 alone (context 32768), where the tile kernels for the 2-bit
+types and the few-row kernels meet, reads prompts at 1168 to 1171 against 1157
+to 1160 and a decode step takes 20.90 and 20.91 ms against 21.03 and 21.00. The
+choice puts 99 of the 498 matrices in the device layout there and leaves 399 in
+the file's; the commit under it left all 498 in the file's. The 2-bit i-quants
+have no device layout, and their few rows run on the integer kernels as before.
 
 ### Qwen3.8-Flash-Next on the two cards
 
@@ -2008,7 +2111,8 @@ GPU that CUDA 13 does not run on.
   Qwen3.8-27B on the two cards (split 0.625 / 0.375), device layout against
   file layout: one row 21.9 against 21.6 ms, eight rows 24.0 against 40.7,
   sixteen 33.6 against 96.8, sixty-four 68.1 against 102.4. CUDA's device
-  layout takes 23.4, 25.4, 31.0 and 69.7 ms for the same passes. At 1024
+  layout took 23.4, 25.4, 31.0 and 69.7 ms for the same passes (before its
+  few-row kernels). At 1024
   rows a Q4_K matrix runs at 88.5 / 39.9 TOPS on the RTX 4070 / RTX 3060
   and Q6_K at 75.5 / 34.3 *(measured by the agent that built the kernels;
   CUDA: 88.8 / 39.3 and 74.5)*.
@@ -2203,10 +2307,13 @@ Work is paused here until Qwen4 is released; nothing below is in progress.
 - Known defects: a long prompt next to a generating Flash-Next sequence slows
   it by the misses of the prompt's rows (nothing separates the two inside a
   step); with the fast kernels the text with drafts is not always
-  the text without (with exact products it is, for steps of the same size:
-  see "Rounding" under "Sequence state"; the hash of a reply's tokens, which
-  the server returns, and `"draft": false` check it over HTTP, and the test
-  of that for the fast kernels is switched off until they agree); a prompt
+  the text without (the rows of one sequence in a step change each other's
+  logits by 2e-4 to 1e-3 of the logit, more in the file's layout than in the
+  device layout: see "Speculation"; with exact products it is the same, for
+  steps of the same size: see "Rounding" under "Sequence state"; the hash of a
+  reply's tokens, which the server returns, and `"draft": false` check it over
+  HTTP, and the test of that for the fast kernels is switched off until they
+  agree); a prompt
   that shares only the start of the chat template with an earlier request
   (three tokens) now runs a step of its own to replay them before its rows
   (one more step in the counts of `--engine`, not timed); a model that only
@@ -2244,10 +2351,12 @@ order it would be taken up; the source of each idea is in
    (and so survive a restart), locking the RAM of the next chunk of places
    ahead of its first use, and `qwen4exp` with a cache (what that needs is
    under "Qwen3.8-Flash-Next through the runtime").
-5. A kernel for one to three rows on the device layout that is not slower
-   than the integer kernels, so the dense model can hold every matrix in it;
-   shares of a tensor split from a measurement at load; device layouts for
-   the remaining types.
+5. Shares of a tensor split from a measurement at load; device layouts for
+   the remaining types (the i-quants of 2 and 3 bits stay in the file's layout,
+   and with them the integer kernels for few rows); a choice of layouts that
+   does not change with the draft block or from one load to the next; a row
+   of a draft window computed with the bits it has alone, in the recurrent
+   and attention layers too, so that drafts cannot change the text.
 6. Vulkan: experts, the `qwen4exp` kernels, and the models; attention for
    windows of many rows on the cooperative matrices, and a faster decode of
    the `q8` and `q4` rows; a faster upload.
