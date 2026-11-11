@@ -2,15 +2,19 @@
 #include "mmvq_common.glsl"
 #define ARES_COMMON_INCLUDED
 #include "layer_common.glsl"
+#include "iq_tables.glsl"
+#include "fp4_scales.glsl"
 
 // Embedding gather: the row `token_embd[token]` decoded to f32, for the rows of the step.
 //
 // The table is stored as GGUF stores it, and the layouts are those of ggml's
-// dequantize_row_* functions, which `ares_quant::dequantize` reproduces. A gather touches a
-// few rows per step, so the decoder is a plain function of (row, value index) and each
-// invocation decodes the values it writes: a handful of byte loads per value, no shared
-// memory. Types whose decoding needs a codebook (the iq1/iq2/iq3 families, ternary, mxfp4)
-// are not here; the host refuses them by name. The type ids are ggml's.
+// dequantize_row_* functions, which `ares_quant::dequantize` reproduces; every weight type
+// has a decoder. A gather touches a few rows per step, so the decoder is a plain function of
+// (row, value index) and each invocation decodes the values it writes: a handful of byte
+// loads per value, no shared memory. The codebooks are those of the weight kernels
+// (iq_tables.glsl; the large ones are read from `tables`, the buffer the host uploads for
+// them) and the scales of the 4-bit floats are theirs too (fp4_scales.glsl). The type ids are
+// ggml's.
 //
 // One workgroup per gathered row. A token past the table writes zeros.
 layout(local_size_x = 256) in;
@@ -20,13 +24,11 @@ layout(push_constant, std430) uniform Push {
     uint64_t table;
     uint64_t row_bytes;
     uint64_t out_;
+    uint64_t tables;
     uint ty;
     uint n_vocab;
     uint n_embd;
 } pc;
-
-const int KVALUES_IQ4NL[16] =
-    int[16](-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113);
 
 float f16_at(uint64_t a) { return half_of(ld2(a)); }
 int s8(uint b) { return int(b << 24) >> 24; }
@@ -52,8 +54,31 @@ void k4_scale_min(uint64_t q, uint j, out uint sc, out uint mn) {
     }
 }
 
+// Byte k (0..7) of an entry of a codebook of 8 magnitudes.
+float grid_byte(uvec2 entry, uint k) {
+    return float(((k < 4u ? entry.x : entry.y) >> (8u * (k & 3u))) & 0xFFu);
+}
+
+// -1 or +1 by bit k of the sign byte (ggml's kmask_iq2xs).
+float sign_of(uint signs, uint k) { return ((signs >> k) & 1u) != 0u ? -1.0 : 1.0; }
+
+// The sign byte for a 7-bit index (the table of ggml's ksigns_iq2xs, as the kernels compute it):
+// bit 7 makes the number of negative values even.
+uint ksigns(uint v7) { return v7 ^ ((bitCount(v7) & 1u) << 7); }
+
+// The scale of the 16 values l (0..3 is the group of 8) of a 32-value sub-block of IQ2_XS and
+// IQ2_S: two 4-bit scales in a byte, the low one for the first 16 values.
+float iq2_scale(float d, uint scales, uint l) {
+    return d * (0.5 + float((scales >> (4u * (l >> 1))) & 0xFu)) * 0.25;
+}
+
+// Value k (0..7) of an IQ1 codebook entry: the table keeps 2 bits per value, value + 1.
+float iq1_grid(uint64_t tables, uint index, uint k) {
+    return float(int((ld2(tables + TBL_IQ1S + 2 * uint64_t(index)) >> (2u * k)) & 3u) - 1);
+}
+
 // Value `j` of the row at `row` stored in type `ty`.
-float embed_value(uint64_t row, uint ty, uint j) {
+float embed_value(uint64_t row, uint ty, uint j, uint64_t tables) {
     switch (ty) {
     case 0u:  // F32
         return uintBitsToFloat(ld4_a2(row + 4 * uint64_t(j)));
@@ -170,7 +195,7 @@ float embed_value(uint64_t row, uint ty, uint j) {
         const uint jj = j & 31u;
         const uint q = ld1(b + 2 + (jj & 15u));
         const uint nib = jj < 16 ? (q & 0xFu) : (q >> 4);
-        return f16_at(b) * float(KVALUES_IQ4NL[nib]);
+        return f16_at(b) * float(ares_kvalues_iq4nl[nib]);
     }
     case 23u: {  // IQ4_XS: 136 bytes, d, scales_h (16 bits), scales_l[4], qs[128]
         const uint64_t b = row + uint64_t(j >> 8) * 136;
@@ -182,7 +207,151 @@ float embed_value(uint64_t row, uint ty, uint j) {
                            (((scales_h >> (2 * ib)) & 3u) << 4));
         const uint q = ld1(b + 8 + ib * 16 + (jb & 15u));
         const uint nib = jb < 16 ? (q & 0xFu) : (q >> 4);
-        return f16_at(b) * float(ls - 32) * float(KVALUES_IQ4NL[nib]);
+        return f16_at(b) * float(ls - 32) * float(ares_kvalues_iq4nl[nib]);
+    }
+    case 16u: {  // IQ2_XXS: 66 bytes, d, per 32 values 4 codebook indices and a word of 4 sign indices + scale
+        const uint64_t b = row + uint64_t(j >> 8) * 66;
+        const uint jj = j & 255u;
+        const uint ib32 = jj >> 5;
+        const uint l = (jj >> 3) & 3u;
+        const uint k = jj & 7u;
+        const uint aux = ld4_a2(b + 6 + 8 * ib32);
+        const float db = f16_at(b) * (0.5 + float(aux >> 28)) * 0.25;
+        const uvec2 grid = ld8(tables + TBL_IQ2XXS + 8 * uint64_t(ld1(b + 2 + 8 * ib32 + l)));
+        return db * grid_byte(grid, k) * sign_of(ksigns((aux >> (7 * l)) & 127u), k);
+    }
+    case 17u: {  // IQ2_XS: 74 bytes, d, 32 x (9-bit index, 7-bit sign index), 8 scale bytes
+        const uint64_t b = row + uint64_t(j >> 8) * 74;
+        const uint jj = j & 255u;
+        const uint ib32 = jj >> 5;
+        const uint l = (jj >> 3) & 3u;
+        const uint k = jj & 7u;
+        const uint q = ld2(b + 2 + 2 * (4 * ib32 + l));
+        const float db = iq2_scale(f16_at(b), ld1(b + 66 + ib32), l);
+        const uvec2 grid = ld8(tables + TBL_IQ2XS + 8 * uint64_t(q & 511u));
+        return db * grid_byte(grid, k) * sign_of(ksigns(q >> 9), k);
+    }
+    case 22u: {  // IQ2_S: 82 bytes, d, qs[64] (indices, then sign bytes), qh[8], scales[8]
+        const uint64_t b = row + uint64_t(j >> 8) * 82;
+        const uint jj = j & 255u;
+        const uint ib32 = jj >> 5;
+        const uint l = (jj >> 3) & 3u;
+        const uint k = jj & 7u;
+        const uint idx = ld1(b + 2 + 4 * ib32 + l) | ((ld1(b + 66 + ib32) << (8 - 2 * l)) & 0x300u);
+        const float db = iq2_scale(f16_at(b), ld1(b + 74 + ib32), l);
+        const uvec2 grid = ld8(tables + TBL_IQ2S + 8 * uint64_t(idx));
+        return db * grid_byte(grid, k) * sign_of(ld1(b + 34 + 4 * ib32 + l), k);
+    }
+    case 18u: {  // IQ3_XXS: 98 bytes, d, qs[64] (indices), per 32 values a word of 4 sign indices + scale
+        const uint64_t b = row + uint64_t(j >> 8) * 98;
+        const uint jj = j & 255u;
+        const uint ib32 = jj >> 5;
+        const uint l = (jj >> 3) & 3u;
+        const uint k = jj & 7u;
+        const uint aux = ld4_a2(b + 66 + 4 * ib32);
+        const float db = f16_at(b) * (0.5 + float(aux >> 28)) * 0.5;
+        const uint grid = ld4(tables + TBL_IQ3XXS + 4 * uint64_t(ld1(b + 2 + 8 * ib32 + 2 * l + (k >> 2))));
+        return db * float((grid >> (8u * (k & 3u))) & 0xFFu) * sign_of(ksigns((aux >> (7 * l)) & 127u), k);
+    }
+    case 21u: {  // IQ3_S: 110 bytes, d, qs[64], qh[8], signs[32], scales[4]
+        const uint64_t b = row + uint64_t(j >> 8) * 110;
+        const uint jj = j & 255u;
+        const uint ib32 = jj >> 5;
+        const uint l = (jj >> 3) & 3u;
+        const uint k = jj & 7u;
+        const uint part = k >> 2;
+        const uint scale = (ld1(b + 106 + (ib32 >> 1)) >> (4 * (ib32 & 1u))) & 0xFu;
+        const float db = f16_at(b) * float(1 + 2 * scale);
+        const uint idx = ld1(b + 2 + 8 * ib32 + 2 * l + part) | ((ld1(b + 66 + ib32) << (8 - 2 * l - part)) & 256u);
+        const uint grid = ld4(tables + TBL_IQ3S + 4 * uint64_t(idx));
+        return db * float((grid >> (8u * (k & 3u))) & 0xFFu) * sign_of(ld1(b + 74 + 4 * ib32 + l), k);
+    }
+    case 19u: {  // IQ1_S: 50 bytes, d, qs[32], qh[8] (u16: 4 x 3 index bits, 3-bit scale, delta sign)
+        const uint64_t b = row + uint64_t(j >> 8) * 50;
+        const uint jj = j & 255u;
+        const uint ib = jj >> 5;
+        const uint l = (jj >> 3) & 3u;
+        const uint k = jj & 7u;
+        const uint qh = ld2(b + 34 + 2 * ib);
+        const float dl = f16_at(b) * float(2 * ((qh >> 12) & 7u) + 1);
+        const float delta = (qh & 0x8000u) != 0u ? -0.125 : 0.125;
+        const uint idx = ld1(b + 2 + 4 * ib + l) | (((qh >> (3 * l)) & 7u) << 8);
+        return dl * (iq1_grid(tables, idx, k) + delta);
+    }
+    case 29u: {  // IQ1_M: 56 bytes, qs[32], qh[16], scales[8] (four u16 that also carry the f16 d)
+        const uint64_t b = row + uint64_t(j >> 8) * 56;
+        const uint jj = j & 255u;
+        const uint ib = jj >> 5;
+        const uint l = (jj >> 3) & 3u;
+        const uint k = jj & 7u;
+        const uint sc0 = ld2(b + 48);
+        const uint sc1 = ld2(b + 50);
+        const uint sc2 = ld2(b + 52);
+        const uint sc3 = ld2(b + 54);
+        const uint d_bits = (sc0 >> 12) | ((sc1 >> 8) & 0x00F0u) | ((sc2 >> 4) & 0x0F00u) | (sc3 & 0xF000u);
+        const uint sc = ld2(b + 48 + 2 * (ib >> 1));
+        const float dl = half_of(d_bits) * float(2 * ((sc >> (6 * (ib & 1u) + 3 * (l >> 1))) & 7u) + 1);
+        const uint h = ld1(b + 32 + 2 * ib + (l >> 1));
+        const uint idx = ld1(b + 4 * ib + l) | (((l & 1u) != 0u ? (h << 4) : (h << 8)) & 0x700u);
+        const float delta = (h & ((l & 1u) != 0u ? 0x80u : 0x08u)) != 0u ? -0.125 : 0.125;
+        return dl * (iq1_grid(tables, idx, k) + delta);
+    }
+    case 34u: {  // TQ1_0: 54 bytes, qs[48] (5 base-3 digits a byte), qh[4] (4 digits a byte), d
+        const uint64_t b = row + uint64_t(j >> 8) * 54;
+        const uint jj = j & 255u;
+        // The digit planes: 5 of 32 bytes (values 0..159), 5 of 16 bytes (160..239), 4 of 4 bytes.
+        uint digit, byte_;
+        if (jj < 160u) {
+            digit = jj >> 5;
+            byte_ = ld1(b + (jj & 31u));
+        } else if (jj < 240u) {
+            digit = (jj - 160u) >> 4;
+            byte_ = ld1(b + 32 + ((jj - 160u) & 15u));
+        } else {
+            digit = (jj - 240u) >> 2;
+            byte_ = ld1(b + 48 + ((jj - 240u) & 3u));
+        }
+        uint pow3 = 1u;
+        for (uint i = 0; i < digit; i++) {
+            pow3 *= 3u;
+        }
+        // Times 3^digit moves the digit to the top of the byte's fraction; * 3 >> 8 reads it.
+        const int trit = int((((byte_ * pow3) & 0xFFu) * 3u) >> 8) - 1;
+        return float(trit) * f16_at(b + 52);
+    }
+    case 35u: {  // TQ2_0: 66 bytes, qs[64] (4 codes a byte, in planes of 32 bytes), d
+        const uint64_t b = row + uint64_t(j >> 8) * 66;
+        const uint jj = j & 255u;
+        const uint code = (ld1(b + 32 * (jj >> 7) + (jj & 31u)) >> (2 * ((jj >> 5) & 3u))) & 3u;
+        return float(int(code) - 1) * f16_at(b + 64);
+    }
+    case 39u: {  // MXFP4: 17 bytes, E8M0 scale, 16 bytes of nibbles through the E2M1 levels
+        const uint64_t b = row + uint64_t(j >> 5) * 17;
+        const uint jj = j & 31u;
+        const uint q = ld1(b + 1 + (jj & 15u));
+        const uint nib = jj < 16 ? (q & 0xFu) : (q >> 4);
+        return float(ares_kvalues_mxfp4[nib]) * e8m0_half(ld1(b));
+    }
+    case 40u: {  // NVFP4: 36 bytes, 4 UE4M3 scales, 4 sub-blocks of 16 values in 8 bytes of nibbles
+        const uint64_t b = row + uint64_t(j >> 6) * 36;
+        const uint jj = j & 63u;
+        const uint s = jj >> 4;
+        const uint r = jj & 15u;
+        const uint q = ld1(b + 4 + 8 * s + (r & 7u));
+        const uint nib = r < 8 ? (q & 0xFu) : (q >> 4);
+        return float(ares_kvalues_mxfp4[nib]) * ue4m3_half(ld1(b + s));
+    }
+    case 41u: {  // Q1_0: 18 bytes, d, 128 sign bits (set is +d)
+        const uint64_t b = row + uint64_t(j >> 7) * 18;
+        const uint jj = j & 127u;
+        const float d = f16_at(b);
+        return ((ld1(b + 2 + (jj >> 3)) >> (jj & 7u)) & 1u) != 0u ? d : -d;
+    }
+    case 42u: {  // Q2_0: 18 bytes, d, 64 codes of 2 bits (-1, 0, 1, 2 times d)
+        const uint64_t b = row + uint64_t(j >> 6) * 18;
+        const uint jj = j & 63u;
+        const uint code = (ld1(b + 2 + (jj >> 2)) >> (2 * (jj & 3u))) & 3u;
+        return float(int(code) - 1) * f16_at(b);
     }
     default:
         return uintBitsToFloat(0x7fc00000u);  // NaN: the host refuses unsupported types
@@ -204,6 +373,6 @@ void main() {
     }
     const uint64_t src = pc.table + uint64_t(token) * pc.row_bytes;
     for (uint j = gl_LocalInvocationID.x; j < pc.n_embd; j += 256) {
-        FloatRef(dst + 4 * uint64_t(j)).v[0] = embed_value(src, pc.ty, j);
+        FloatRef(dst + 4 * uint64_t(j)).v[0] = embed_value(src, pc.ty, j, pc.tables);
     }
 }

@@ -8,6 +8,7 @@
 
 #define KV_TABLE ares_kvalues_mxfp4
 #include "mmvq_iq_common.glsl"
+#include "fp4_scales.glsl"
 
 const uint BLOCK_VALUES = 64;
 const uint BLOCK_BYTES = 36;
@@ -27,19 +28,6 @@ struct A {
 
 void mmvq_init(uint t, uint64_t tables) {
     iq4_init(t);
-}
-
-// The UE4M3 byte (4 exponent bits with bias 7, 3 mantissa bits) as a float, halved
-// for the doubled table. 0 and the NaN code 0x7F give 0.
-float ue4m3_half(uint x) {
-    if (x == 0u || x == 0x7Fu) {
-        return 0.0;
-    }
-    const uint e = (x >> 3) & 0xFu;
-    const float man = float(x & 7u);
-    const float raw = e == 0u ? man * uintBitsToFloat(0x3b000000u)
-                              : (1.0 + man / 8.0) * uintBitsToFloat((e + 120u) << 23);
-    return raw * 0.5;
 }
 
 W load_w(uint64_t blk, uint s) {

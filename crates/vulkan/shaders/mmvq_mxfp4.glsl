@@ -8,6 +8,7 @@
 
 #define KV_TABLE ares_kvalues_mxfp4
 #include "mmvq_iq_common.glsl"
+#include "fp4_scales.glsl"
 
 const uint BLOCK_VALUES = 32;
 const uint BLOCK_BYTES = 17;
@@ -27,12 +28,6 @@ struct A {
 
 void mmvq_init(uint t, uint64_t tables) {
     iq4_init(t);
-}
-
-// 2^(e - 127) / 2 for the E8M0 byte e (e = 0 is the subnormal 2^-128; 255, which is
-// NaN in the format, is taken as the large finite 2^127, as the reference does).
-float e8m0_half(uint e) {
-    return uintBitsToFloat(e < 2u ? (0x00200000u << e) : ((e - 1u) << 23));
 }
 
 W load_w(uint64_t blk, uint s) {

@@ -4,22 +4,10 @@
 // 4-bit float table of MXFP4. A unit is two sub-blocks (half of a block).
 #define MD_TABLE16 ares_kvalues_mxfp4
 #include "mmd_common.glsl"
+#include "fp4_scales.glsl"
 
 const uint BLOCK_VALUES = 64;
 const uint BLOCK_BYTES = 36;
-
-// The UE4M3 byte (4 exponent bits with bias 7, 3 mantissa bits) as a float, halved for the
-// doubled table. 0 and the NaN code 0x7F give 0.
-float ue4m3_half(uint x) {
-    if (x == 0u || x == 0x7Fu) {
-        return 0.0;
-    }
-    const uint e = (x >> 3) & 0xFu;
-    const float man = float(x & 7u);
-    const float raw = e == 0u ? man * uintBitsToFloat(0x3b000000u)
-                              : (1.0 + man / 8.0) * uintBitsToFloat((e + 120u) << 23);
-    return raw * 0.5;
-}
 
 void md_unit(uint64_t row, uint u, out uint o[16]) {
     const uint64_t blk = row + uint64_t(u >> 1) * BLOCK_BYTES;

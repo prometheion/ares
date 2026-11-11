@@ -4,15 +4,10 @@
 // outside the range of an f16 (2^-24 .. 65504) is not represented.
 #define MD_TABLE16 ares_kvalues_mxfp4
 #include "mmd_common.glsl"
+#include "fp4_scales.glsl"
 
 const uint BLOCK_VALUES = 32;
 const uint BLOCK_BYTES = 17;
-
-// 2^(e - 127) / 2 for the E8M0 byte e (e = 0 is the subnormal 2^-128; 255, which is NaN in
-// the format, is taken as the large finite 2^127, as the reference does).
-float e8m0_half(uint e) {
-    return uintBitsToFloat(e < 2u ? (0x00200000u << e) : ((e - 1u) << 23));
-}
 
 void md_unit(uint64_t row, uint u, out uint o[16]) {
     const uint64_t blk = row + uint64_t(u) * BLOCK_BYTES;

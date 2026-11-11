@@ -393,17 +393,7 @@ mod tests {
         }
         // Every weight type of a GGUF file that is not an integer or f64.
         for ty in ares_core::ggml_type::ALL_TYPES {
-            let weight = !matches!(
-                ty,
-                GgmlType::I8
-                    | GgmlType::I16
-                    | GgmlType::I32
-                    | GgmlType::I64
-                    | GgmlType::F64
-                    | GgmlType::Q8_1
-                    | GgmlType::Q8_K
-            );
-            assert_eq!(has_fast_matvec(ty), weight, "{ty}");
+            assert_eq!(has_fast_matvec(ty), ty.is_weight(), "{ty}");
         }
     }
 }

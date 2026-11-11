@@ -24,9 +24,9 @@
 
 use ares_core::GgmlType;
 use ares_vulkan::{
-    AttentionShape, CommitSet, Device, DeviceBuffer, Event, LayerKernels, NormKind, OutputGate,
-    RecurrentShape, Result, RopeParams, Segment, StateFormat, StepDims, StepRecord, Stream,
-    devices, quantized_activation_bytes,
+    AttentionShape, CommitSet, Device, DeviceBuffer, Event, Kernels, LayerKernels, NormKind,
+    OutputGate, RecurrentShape, Result, RopeParams, Segment, StateFormat, StepDims, StepRecord,
+    Stream, devices, quantized_activation_bytes,
 };
 
 const D: u32 = 5120;
@@ -515,9 +515,10 @@ fn main() -> Result<()> {
             continue;
         }
         let device = Device::open(info.ordinal)?;
+        let kernels = Kernels::load(&device)?;
         let mut rig = Rig {
             stream: Stream::new(&device)?,
-            layers: LayerKernels::load(&device)?,
+            layers: LayerKernels::load(&kernels)?,
             start: Event::timed(&device)?,
             stop: Event::timed(&device)?,
             device: device.clone(),

@@ -127,11 +127,12 @@ struct Gpu {
 
 impl Gpu {
     fn new(device: &Device) -> Self {
+        let kernels = Kernels::load(device).unwrap();
         Self {
             device: device.clone(),
             stream: Stream::new(device).unwrap(),
-            layers: LayerKernels::load(device).unwrap(),
-            kernels: Kernels::load(device).unwrap(),
+            layers: LayerKernels::load(&kernels).unwrap(),
+            kernels,
         }
     }
     fn bytes(&self, data: &[u8]) -> DeviceBuffer {

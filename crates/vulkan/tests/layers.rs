@@ -100,11 +100,12 @@ struct Gpu {
 
 impl Gpu {
     fn new(device: &Device) -> Self {
+        let kernels = Kernels::load(device).unwrap();
         Self {
             device: device.clone(),
             stream: Stream::new(device).unwrap(),
-            layers: LayerKernels::load(device).unwrap(),
-            kernels: Kernels::load(device).unwrap(),
+            layers: LayerKernels::load(&kernels).unwrap(),
+            kernels,
         }
     }
     fn bytes(&self, data: &[u8]) -> DeviceBuffer {
@@ -205,78 +206,50 @@ fn the_step_record_is_checked_and_laid_out() {
 
 // ---------------------------------------------------------------------------
 
-/// Offsets of the f16 scales in a block of `ty`, so random bytes can be made
-/// into a block with finite scales.
-fn scale_offsets(ty: GgmlType) -> &'static [usize] {
-    use GgmlType::*;
-    match ty {
-        Q4_0 | Q5_0 | Q8_0 | IQ4_NL | IQ4_XS => &[0],
-        Q4_1 | Q5_1 | Q4_K | Q5_K => &[0, 2],
-        Q2_K => &[80, 82],
-        Q3_K => &[108],
-        Q6_K => &[208],
-        _ => &[],
-    }
-}
-
-fn random_table(ty: GgmlType, rows: usize, n_embd: usize, rng: &mut Rng) -> Vec<u8> {
-    let row_bytes = ty.bytes_for(n_embd as u64).unwrap() as usize;
-    let mut bytes: Vec<u8> = (0..rows * row_bytes).map(|_| rng.next() as u8).collect();
-    match ty {
-        GgmlType::F32 => {
-            for (i, c) in bytes.as_chunks_mut::<4>().0.iter_mut().enumerate() {
-                c.copy_from_slice(&(rng.unit() * 3.0 + (i % 7) as f32 * 0.01).to_le_bytes());
-            }
-        }
-        GgmlType::F16 | GgmlType::BF16 => {
-            for c in bytes.as_chunks_mut::<2>().0.iter_mut() {
-                let v = rng.unit() * 3.0;
-                let bits = if ty == GgmlType::F16 {
-                    ares_quant::f32_to_f16(v)
-                } else {
-                    ares_quant::f32_to_bf16(v)
-                };
-                c.copy_from_slice(&bits.to_le_bytes());
-            }
-        }
-        _ => {
-            let block = ty.block_bytes() as usize;
-            for b in bytes.chunks_exact_mut(block) {
-                for &at in scale_offsets(ty) {
-                    // A finite half of magnitude 2^-8 .. 2^2.
-                    let sign = (rng.next() & 1) as u16;
-                    let exp = 7 + (rng.next() % 11) as u16;
-                    let mant = (rng.next() & 0x3FF) as u16;
-                    b[at..at + 2]
-                        .copy_from_slice(&((sign << 15) | (exp << 10) | mant).to_le_bytes());
-                }
-            }
-        }
-    }
-    bytes
+/// The blocks of the golden fixture of `ty` in `ares-quant` (`tests/golden/dequant_<type>.bin`),
+/// which ggml's own code produced: blocks its quantizer made from float data, then raw random
+/// ones whose index fields reach every entry of the type's codebooks and whose scales have
+/// the values the format allows (f16 scales of the whole finite range, every E8M0 and UE4M3
+/// byte, all the digits of a TQ1_0 byte). `ares_quant::dequantize` is held to ggml's values
+/// for them bit for bit.
+fn golden_blocks(ty: GgmlType) -> Vec<u8> {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../quant/tests/golden")
+        .join(format!("dequant_{}.bin", ty.name()));
+    let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    let word = |i: usize| u32::from_le_bytes(bytes[4 + 4 * i..8 + 4 * i].try_into().unwrap());
+    assert_eq!(&bytes[..4], b"EQGD", "{}", path.display());
+    assert_eq!((word(1), word(2), word(3)), (ty.id(), ty.block_values(), ty.block_bytes()));
+    let n_blocks = word(4) as usize;
+    bytes[32..32 + n_blocks * ty.block_bytes() as usize].to_vec()
 }
 
 #[test]
-fn the_embedding_gather_decodes_every_supported_type() {
+fn the_embedding_gather_decodes_every_weight_type() {
     let Some(gpus) = gpus() else { return };
-    use GgmlType::*;
-    let types = [
-        F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ4_NL, IQ4_XS,
-    ];
+    let types: Vec<GgmlType> =
+        ares_core::ggml_type::ALL_TYPES.into_iter().filter(|t| t.is_weight()).collect();
+    assert_eq!(types.len(), 28);
     for device in gpus {
         let gpu = Gpu::new(device);
-        let mut rng = Rng(0x5EED_0001);
         let mut seen = 0.0f64;
-        for ty in types {
-            assert!(LayerKernels::can_gather(ty));
-            let (n_vocab, n_embd) = (9usize, 768usize);
-            let table = random_table(ty, n_vocab, n_embd, &mut rng);
+        for &ty in &types {
+            // Rows of three blocks (of 32 values for the float types, whose blocks are one
+            // value), made of the blocks of the fixture in order.
+            let n_embd = if ty.block_values() == 1 { 32 } else { 3 * ty.block_values() as usize };
             let row_bytes = ty.bytes_for(n_embd as u64).unwrap() as usize;
-            // Repeated rows, the first and the last row, and a token past the table.
-            let tokens = [3u32, 0, 8, 3, 5, 77];
-            let segments = [Segment { row0: 0, n_rows: 6, slot: 0, pos0: 0, direct: false }];
+            let blocks = golden_blocks(ty);
+            let n_vocab = blocks.len() / row_bytes;
+            assert!(n_vocab >= 8, "{ty}: the fixture has {} rows of {n_embd} values", n_vocab);
+            let table = &blocks[..n_vocab * row_bytes];
+            // Every row once, backwards, then a repeated row, the first one and two tokens
+            // past the table.
+            let mut tokens: Vec<u32> = (0..n_vocab as u32).rev().collect();
+            tokens.extend([3, 0, n_vocab as u32, 77 + n_vocab as u32]);
+            let segments =
+                [Segment { row0: 0, n_rows: tokens.len() as u32, slot: 0, pos0: 0, direct: false }];
             let record = StepRecord::new(&segments, &tokens, None, &[]).unwrap();
-            let (step, table_buf) = (gpu.step(&record), gpu.bytes(&table));
+            let (step, table_buf) = (gpu.step(&record), gpu.bytes(table));
             let out = gpu.empty((tokens.len() * n_embd * 4) as u64);
             unsafe {
                 gpu.layers
@@ -299,36 +272,44 @@ fn the_embedding_gather_decodes_every_supported_type() {
                     let src = &table[token as usize * row_bytes..][..row_bytes];
                     ares_quant::dequantize(ty, src, &mut want).unwrap();
                 }
-                let scale = want.iter().fold(0.0f32, |m, v| m.max(v.abs())).max(1e-6);
-                let worst = got[r * n_embd..][..n_embd]
-                    .iter()
-                    .zip(&want)
-                    .fold(0.0f32, |m, (g, w)| m.max((g - w).abs()));
-                seen = seen.max(f64::from(worst / scale));
-                assert!(
-                    worst <= 2e-6 * scale,
-                    "{ty} row {r} (token {token}): error {worst} of scale {scale}"
-                );
+                // The kernel may fuse a multiply and an add where the reference does not: a
+                // tolerance of the largest finite value of the row. Infinities (the largest
+                // MXFP4 scales overflow) and the NaNs of the float types must be the same.
+                let scale =
+                    want.iter().filter(|v| v.is_finite()).fold(0.0f32, |m, v| m.max(v.abs()));
+                for (i, (g, w)) in got[r * n_embd..][..n_embd].iter().zip(&want).enumerate() {
+                    let ok = if w.is_finite() {
+                        seen = seen.max(f64::from((g - w).abs() / scale.max(f32::MIN_POSITIVE)));
+                        (g - w).abs() <= 2e-6 * scale
+                    } else {
+                        g == w || (g.is_nan() && w.is_nan())
+                    };
+                    assert!(
+                        ok,
+                        "{ty} row {r} (token {token}) value {i}: {g} for {w}, scale {scale}"
+                    );
+                }
             }
         }
         report(&gpu, "embed_gather", seen);
-        // A type without a decoder is refused by name.
-        assert!(!LayerKernels::can_gather(IQ2_XXS));
+        // A type that holds no weights is refused by name.
         let record = StepRecord::new(&[], &[], None, &[]).unwrap();
         let buf = gpu.bytes(&[0u8; 64]);
-        let err = unsafe {
-            gpu.layers.embed_gather(
-                &gpu.stream,
-                buf.ptr(),
-                record.dims(),
-                buf.ptr(),
-                IQ2_XXS,
-                1,
-                256,
-                buf.ptr(),
-            )
-        };
-        assert!(err.is_err());
+        for ty in [GgmlType::Q8_K, GgmlType::I8, GgmlType::F64] {
+            let err = unsafe {
+                gpu.layers.embed_gather(
+                    &gpu.stream,
+                    buf.ptr(),
+                    record.dims(),
+                    buf.ptr(),
+                    ty,
+                    1,
+                    256,
+                    buf.ptr(),
+                )
+            };
+            assert!(err.unwrap_err().to_string().contains(ty.name()), "{ty}");
+        }
     }
 }
 

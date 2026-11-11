@@ -178,7 +178,7 @@ impl Kernels {
         grid_1d(groups, self.0.device.physical().max_work_group_count[0])
     }
 
-    fn quantized(&self) -> Result<&Quantized> {
+    pub(crate) fn quantized(&self) -> Result<&Quantized> {
         self.0.quantized.as_ref().ok_or_else(|| Error::Unsupported {
             device: self.0.device.info().name.clone(),
             reason: self

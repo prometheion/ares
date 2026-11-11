@@ -66,7 +66,7 @@ use ares_core::GgmlType;
 
 use crate::device::Device;
 use crate::error::{Error, Result};
-use crate::kernels::{grid_1d, parallel_map};
+use crate::kernels::{Kernels, grid_1d, parallel_map};
 use crate::memory::DevicePtr;
 use crate::module::{Args, Function, Lazy};
 use crate::stream::Stream;
@@ -406,6 +406,8 @@ const DELTA_VARIANTS: [(&str, &str, u32); 6] = [
 #[derive(Clone, Debug)]
 pub struct LayerKernels {
     device: Device,
+    /// The weight kernels of the device: the embedding gather reads their codebooks.
+    kernels: Kernels,
     embed_gather: Arc<Lazy>,
     head_norm: Arc<Lazy>,
     gather_rows: Arc<Lazy>,
@@ -445,14 +447,16 @@ pub fn quantized_activation_bytes(n_values: u64) -> u64 {
 }
 
 impl LayerKernels {
-    /// Loads the layer kernels on `device`. No pipeline is made yet: a kernel's is made when
-    /// it is first launched, or by [`LayerKernels::prepare`].
+    /// Loads the layer kernels on the device of `kernels`, whose codebooks the embedding
+    /// gather decodes the i-quants with. No pipeline is made yet: a kernel's is made when it is
+    /// first launched, or by [`LayerKernels::prepare`].
     ///
     /// The kernels give rows and heads to clusters of 8 and 32 invocations and reduce over
     /// them with clustered subgroup operations, and the embedding gather reads single bytes:
     /// what the quantized weight kernels need too ([`crate::Kernels::has_quantized_kernels`]).
     /// A device without it is refused here, with the reason.
-    pub fn load(device: &Device) -> Result<Self> {
+    pub fn load(kernels: &Kernels) -> Result<Self> {
+        let device = kernels.device();
         if let Some(reason) = &device.physical().quantized_unsupported {
             return Err(Error::Unsupported {
                 device: device.info().name.clone(),
@@ -477,6 +481,7 @@ impl LayerKernels {
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             device: device.clone(),
+            kernels: kernels.clone(),
             embed_gather: lazy("layer_embed_gather")?,
             head_norm: lazy("layer_head_norm")?,
             gather_rows: lazy("layer_gather_rows")?,
@@ -566,32 +571,10 @@ impl LayerKernels {
         Ok(())
     }
 
-    /// Whether [`LayerKernels::embed_gather`] can decode rows of type `ty`.
-    pub fn can_gather(ty: GgmlType) -> bool {
-        use GgmlType::*;
-        matches!(
-            ty,
-            F32 | F16
-                | BF16
-                | Q4_0
-                | Q4_1
-                | Q5_0
-                | Q5_1
-                | Q8_0
-                | Q2_K
-                | Q3_K
-                | Q4_K
-                | Q5_K
-                | Q6_K
-                | IQ4_NL
-                | IQ4_XS
-        )
-    }
-
     /// Embedding gather: `out[r] = table[token_r]` decoded to f32 for the
     /// `dims.n_rows` rows of the step. `table` is the tensor as GGUF stores it
-    /// (`n_vocab` rows of `n_embd` values of type `ty`), aligned to 4 bytes.
-    /// A token past `n_vocab` gives a row of zeros.
+    /// (`n_vocab` rows of `n_embd` values of type `ty`, any of the 28 weight types),
+    /// aligned to 4 bytes. A token past `n_vocab` gives a row of zeros.
     ///
     /// # Safety
     ///
@@ -610,8 +593,8 @@ impl LayerKernels {
         n_embd: u32,
         out: DevicePtr,
     ) -> Result<()> {
-        if !Self::can_gather(ty) {
-            return Err(invalid("embedding gather", format!("no decoder for {ty}")));
+        if !ty.is_weight() {
+            return Err(invalid("embedding gather", format!("{ty} is not a weight type")));
         }
         if !n_embd.is_multiple_of(ty.block_values()) {
             return Err(invalid(
@@ -629,6 +612,7 @@ impl LayerKernels {
             .ptr(table)
             .u64(row_bytes)
             .ptr(out)
+            .ptr(self.kernels.quantized()?.tables())
             .u32(ty.id())
             .u32(n_vocab)
             .u32(n_embd);
