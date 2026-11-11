@@ -33,10 +33,11 @@
 use ares_core::Ledger;
 use ares_cuda::{
     AttendBuffers, AttentionShape, AttnRow, DeviceBuffer, DevicePtr, ENTRY_CELLS, Event, Kernels,
-    PinnedBuffer, Planner, PrefillPath, SampleBatch, SamplePick, SamplePlan, SampleRow,
-    SamplerKernels, Segment, StepDims, StepRecord,
+    PinnedBuffer, Planner, PrefillPath, SampleBatch, SamplePlan, SamplerKernels, Segment, StepDims,
+    StepRecord,
 };
 use ares_runtime::ModelError;
+use ares_sampler::{SamplePick, SampleRow};
 
 use super::super::load::{DeviceWeights, DraftW, MixerW};
 use super::{AttentionAt, Options, Part, Phase, Prepared, StepEnv, geometry, invalid};
@@ -916,8 +917,16 @@ impl Part {
                 n_local: w.head.n_out,
                 tokens: m.head_tokens,
                 first: 0,
+                // A draft is picked from the logits as they are: no corrections,
+                // masks or probabilities (see `SampleRow::for_draft`).
+                inverse: DevicePtr::NULL,
+                vocab: 0,
                 params: rec.offset(link.params),
+                entries: DevicePtr::NULL,
+                masks: DevicePtr::NULL,
+                mask_words: 0,
                 out: picks,
+                logprobs: DevicePtr::NULL,
                 scratch: m.at(s.sampler),
                 exchange: m.at(s.exchange),
                 devices: 1,

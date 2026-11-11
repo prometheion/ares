@@ -59,7 +59,7 @@ use std::time::Instant;
 
 use ares_api::{
     DecisionOutcome, DecisionRequest, DecisionResult, DecisionSink, Engine, EngineStats, Event,
-    EventSink, FinishReason, GenerateRequest, RequestId, Usage,
+    EventSink, FinishReason, GenerateRequest, RequestId, TokenProbs, Usage,
 };
 use tokio::sync::{Notify, mpsc, oneshot, watch};
 
@@ -69,7 +69,13 @@ use crate::error::ApiError;
 #[derive(Debug)]
 pub(crate) enum Item {
     Text(String),
-    Done { finish: &'static str, usage: Usage, timings: Timings },
+    /// The probabilities of the tokens whose text went out.
+    Probs(Vec<TokenProbs>),
+    Done {
+        finish: &'static str,
+        usage: Usage,
+        timings: Timings,
+    },
 }
 
 /// Where the time of a finished request went, in a form that can be set next
@@ -383,6 +389,7 @@ impl Run {
         };
         match event {
             Event::Text(text) => Ok(Item::Text(text)),
+            Event::Logprobs(probs) => Ok(Item::Probs(probs)),
             Event::Done { finish, usage } => {
                 self.guard.disarm();
                 let timings = self.timings(usage).await;

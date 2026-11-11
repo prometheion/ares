@@ -606,25 +606,22 @@ async fn bad_requests_are_refused_before_the_engine_sees_them() {
         chat(json!({"stop": 5})).into_case(Some("stop"), "string or an array"),
         chat(json!({"stop": ["ok", 5]})).into_case(Some("stop"), "must hold strings"),
         chat(json!({"stop": ""})).into_case(Some("stop"), "must not be empty"),
-        chat(json!({"n": 2})).into_case(Some("n"), "n must be 1"),
+        chat(json!({"n": 0})).into_case(Some("n"), "n must be between 1 and 16"),
         chat(json!({"stream": "yes"})).into_case(Some("stream"), "stream must be a boolean"),
         chat(json!({"stream_options": 5})).into_case(Some("stream_options"), "must be an object"),
         // What the server does not do is refused by name, never dropped.
-        chat(json!({"logit_bias": {"1": 5}})).into_case(Some("logit_bias"), "logit_bias is not supported: the sampler has no logit bias"),
         chat(json!({"grammar": "root ::= \"a\""})).into_case(Some("grammar"), "structured output"),
         chat(json!({"json_schema": {"type": "object"}})).into_case(Some("json_schema"), "structured output"),
         chat(json!({"response_format": {"type": "json_object"}})).into_case(Some("response_format"), "structured output"),
-        chat(json!({"logprobs": true})).into_case(Some("logprobs"), "token probabilities"),
-        chat(json!({"top_logprobs": 5})).into_case(Some("top_logprobs"), "token probabilities"),
+        chat(json!({"top_logprobs": 5})).into_case(Some("top_logprobs"), "requires logprobs"),
         chat(json!({"tool_choice": "required"})).into_case(Some("tool_choice"), "tool calls are not built"),
         chat(json!({"functions": []})).into_case(Some("functions"), "tool calls are not built"),
         // The engine of these tests declares no template, so it has no effort to set.
         chat(json!({"reasoning_effort": "high"})).into_case(Some("reasoning_effort"), "does not use it"),
         (COMPLETIONS, completion_body(json!({"chat_template_kwargs": {"enable_thinking": false}})), Some("chat_template_kwargs"), "no chat template"),
-        chat(json!({"typical_p": 0.9})).into_case(Some("typical_p"), "typical_p is not supported: it is not a parameter of this server"),
-        chat(json!({"mirostat": 2})).into_case(Some("mirostat"), "not a parameter of this server"),
+        chat(json!({"adaptive_target": 0.5})).into_case(Some("adaptive_target"), "adaptive-p is not served"),
         chat(json!({"something_new": [1, 2]})).into_case(Some("something_new"), "something_new is not supported"),
-        (COMPLETIONS, completion_body(json!({"best_of": 3})), Some("best_of"), "one completion per request"),
+        (COMPLETIONS, completion_body(json!({"best_of": 3})), Some("best_of"), "not the best of several"),
         (COMPLETIONS, completion_body(json!({"echo": true})), Some("echo"), "returned on its own"),
         (COMPLETIONS, completion_body(json!({"suffix": "end"})), Some("suffix"), "returned on its own"),
         (COMPLETIONS, completion_body(json!({"messages": []})), Some("messages"), "messages is not supported"),
@@ -658,7 +655,7 @@ async fn a_field_that_asks_for_nothing_is_not_a_reason_to_refuse() {
     // `null`, the value that switches a feature off, and the bookkeeping
     // fields of the API: none of them changes what is generated.
     let quiet = json!({
-        "logit_bias": {}, "logprobs": false, "top_logprobs": 0, "n": 1,
+        "logit_bias": {}, "logprobs": false, "n": 1,
         "response_format": {"type": "text"}, "tool_choice": "auto", "parallel_tool_calls": true,
         "grammar": null, "json_schema": null, "typical_p": null, "something_new": null,
         "user": "u", "metadata": {"k": "v"}, "store": false, "service_tier": "auto",

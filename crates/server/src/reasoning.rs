@@ -296,7 +296,7 @@ impl Split {
 /// told so far; text that may still turn out to be part of a tag, or white
 /// space the template writes around the reasoning, is held back until the
 /// next piece decides it. [`finish`](Splitter::finish) returns what is left.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct Splitter {
     state: State,
     /// Text that has come and has not been sorted.
@@ -323,7 +323,7 @@ enum State {
 }
 
 /// The tags and the white space the template writes around the reasoning.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct Layout {
     start_tag: String,
     after_start: String,

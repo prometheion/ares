@@ -24,7 +24,9 @@
 //! | row extras | 2 per row | sequence slot, context |
 //! | wanted rows | 1 each | the rows whose logits are wanted, in order |
 //! | runs | 2 each | first row, number of rows: the wanted rows as ranges |
-//! | sampler rows | 8 each | how each wanted row is picked ([`SampleRow`]), in the order of the wanted rows |
+//! | sampler rows | 32 each | how each wanted row is picked ([`SampleRow`]), in the order of the wanted rows |
+//! | corrections | 4 each | the logit corrections of the wanted rows ([`Entry`]); a sampler row names its own |
+//! | masks | mask words each | the sets of tokens the wanted rows may pick, a bit per token; a sampler row names its own |
 //! | commit record | 8 + 8 each | a kernel header and the segments of the last step whose rows were drafts, with the rows that were accepted |
 //! | updates | 3 each | sequence slot, first page-table entry, number of entries |
 //! | entries | 1 each | page-table entries, for the updates in order |
@@ -79,7 +81,8 @@
 //! reads the sequence's pages); the synthetic model has no attention kernel,
 //! so this is how a row's result comes to depend on its whole sequence.
 
-use ares_cuda::{SampleParams, SampleRow, Segment, StepDims};
+use ares_cuda::{Segment, StepDims};
+use ares_sampler::{ENTRIES_PER_ROW, Entry, SampleParams, SampleRow, TokenMask};
 
 const MAGIC: u32 = 0x5354_4550;
 /// Bytes of the kernels' header.
@@ -114,6 +117,11 @@ const H_STATE_COPIES: usize = 22;
 const H_OFF_STATE_COPIES: usize = 23;
 const H_PAGE_COPIES: usize = 24;
 const H_OFF_PAGE_COPIES: usize = 25;
+const H_CORRECTIONS: usize = 26;
+const H_OFF_CORRECTIONS: usize = 27;
+const H_MASKS: usize = 28;
+const H_OFF_MASKS: usize = 29;
+const H_MASK_WORDS: usize = 30;
 
 /// One row of a step: a token of a sequence at a position.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -176,19 +184,25 @@ fn align(n: usize) -> usize {
     n.next_multiple_of(16)
 }
 
-/// The bytes the record can take at most, for buffer sizes.
-pub fn max_bytes(max_rows: u32, max_slots: u32) -> usize {
+/// The bytes the record can take at most, for buffer sizes: a step of up to
+/// `max_rows` rows of at most `max_slots` sequences, of which `wanted` rows
+/// at most have their logits wanted, with a vocabulary of `vocab` tokens.
+pub fn max_bytes(max_rows: u32, max_slots: u32, wanted: u32, vocab: u32) -> usize {
     let (rows, slots) = (max_rows as usize, max_slots as usize);
-    // A segment and a commit per sequence at worst, a run per row; a step
-    // creates at most one page per row and re-dirties at most one entry per
-    // sequence, and a sequence has at most one update. A slot has at most a
-    // save at a position it reached, a save of the state it ends with and the
-    // restore of the sequence that takes it next, between two records; a
-    // sequence copies at most one page.
+    let wanted = (wanted as usize).min(rows);
+    // A segment and a commit per sequence at worst, a run per wanted row; a
+    // step creates at most one page per row and re-dirties at most one entry
+    // per sequence, and a sequence has at most one update. A slot has at most
+    // a save at a position it reached, a save of the state it ends with and
+    // the restore of the sequence that takes it next, between two records; a
+    // sequence copies at most one page. Every wanted row may have the most
+    // corrections and a mask.
     let segments = slots.min(rows.max(1));
     let bytes = HEADERS
         + SEG_BYTES * segments
-        + rows * (4 + 16 + 8 + 4 + 8 + SampleRow::BYTES)
+        + rows * (4 + 16 + 8)
+        + wanted * (4 + 8 + SampleRow::BYTES + ENTRIES_PER_ROW * Entry::BYTES)
+        + wanted * TokenMask::words_for(vocab) * 4
         + KERNEL_HEADER
         + SEG_BYTES * slots
         + slots * 12
@@ -252,6 +266,8 @@ impl<'a> RecordWriter<'a> {
             H_OFF_ENTRIES,
             H_OFF_STATE_COPIES,
             H_OFF_PAGE_COPIES,
+            H_OFF_CORRECTIONS,
+            H_OFF_MASKS,
         ] {
             header[h] = end as u32;
         }
@@ -398,6 +414,41 @@ impl<'a> RecordWriter<'a> {
         Ok(())
     }
 
+    /// The logit corrections of the wanted rows, one list after the other: a
+    /// sampler row names its own as a range of these.
+    pub fn corrections(&mut self, entries: &[Entry]) -> Result<(), RecordFull> {
+        let off = self.end;
+        let mut at = off;
+        let capacity = self.buf.len();
+        for entry in entries {
+            self.buf
+                .get_mut(at..at + Entry::BYTES)
+                .ok_or(RecordFull { capacity })?
+                .copy_from_slice(&entry.to_bytes());
+            at += Entry::BYTES;
+        }
+        self.header[H_CORRECTIONS] = entries.len() as u32;
+        self.header[H_OFF_CORRECTIONS] = off as u32;
+        self.end = align(at);
+        Ok(())
+    }
+
+    /// The masks of the wanted rows: `words` words each, a bit per token; a
+    /// sampler row names its own by its number here.
+    pub fn masks(&mut self, masks: &[u32], words: usize) -> Result<(), RecordFull> {
+        let off = self.end;
+        let capacity = self.buf.len();
+        let dst = self.buf.get_mut(off..off + masks.len() * 4).ok_or(RecordFull { capacity })?;
+        for (chunk, word) in dst.as_chunks_mut::<4>().0.iter_mut().zip(masks) {
+            *chunk = word.to_le_bytes();
+        }
+        self.header[H_MASKS] = masks.len().checked_div(words).unwrap_or(0) as u32;
+        self.header[H_MASK_WORDS] = words as u32;
+        self.header[H_OFF_MASKS] = off as u32;
+        self.end = align(off + masks.len() * 4);
+        Ok(())
+    }
+
     /// The outcomes of the draft windows of the step before.
     pub fn commits(&mut self, commits: &[Commit]) -> Result<(), RecordFull> {
         if commits.is_empty() {
@@ -540,6 +591,9 @@ impl<'a> RecordView<'a> {
             header[H_OFF_ENTRIES] as usize + header[H_ENTRIES] as usize * 4,
             header[H_OFF_STATE_COPIES] as usize + header[H_STATE_COPIES] as usize * 12,
             header[H_OFF_PAGE_COPIES] as usize + header[H_PAGE_COPIES] as usize * 12,
+            header[H_OFF_CORRECTIONS] as usize + header[H_CORRECTIONS] as usize * Entry::BYTES,
+            header[H_OFF_MASKS] as usize
+                + header[H_MASKS] as usize * header[H_MASK_WORDS] as usize * 4,
         ];
         if ends.iter().any(|end| *end > bytes.len()) {
             return Err(RecordError::Truncated);
@@ -652,6 +706,45 @@ impl<'a> RecordView<'a> {
         assert!(i < self.picked_rows(), "wanted row {i} of {}", self.picked_rows());
         let at = self.header[H_OFF_SAMPLERS] as usize + i as usize * SampleRow::BYTES;
         SampleRow::from_bytes(self.bytes[at..at + SampleRow::BYTES].try_into().expect("a row"))
+    }
+
+    /// The byte offset of the corrections ([`Entry::BYTES`] bytes each) in
+    /// the record.
+    pub fn corrections_offset(&self) -> u64 {
+        u64::from(self.header[H_OFF_CORRECTIONS])
+    }
+
+    /// The number of corrections of all rows.
+    pub fn corrections(&self) -> u32 {
+        self.header[H_CORRECTIONS]
+    }
+
+    /// Correction `i` of the record.
+    pub fn correction(&self, i: u32) -> Entry {
+        assert!(i < self.corrections(), "correction {i} of {}", self.corrections());
+        let at = self.header[H_OFF_CORRECTIONS] as usize + i as usize * Entry::BYTES;
+        let f = |k: usize| f32::from_bits(self.word(at + 4 * k));
+        Entry { token: self.word(at), bias: f(1), rep: f(2), sub: f(3) }
+    }
+
+    /// The byte offset of the masks in the record.
+    pub fn masks_offset(&self) -> u64 {
+        u64::from(self.header[H_OFF_MASKS])
+    }
+
+    /// The number of masks, and the words of each.
+    pub fn masks(&self) -> (u32, u32) {
+        (self.header[H_MASKS], self.header[H_MASK_WORDS])
+    }
+
+    /// Word `word` of mask `slot`.
+    pub fn mask_word(&self, slot: u32, word: u32) -> u32 {
+        let (count, words) = self.masks();
+        assert!(slot < count && word < words, "word {word} of mask {slot} ({count} of {words})");
+        self.word(
+            self.header[H_OFF_MASKS] as usize
+                + (slot as usize * words as usize + word as usize) * 4,
+        )
     }
 
     pub fn row(&self, i: u32) -> Row {
@@ -806,7 +899,13 @@ mod tests {
         assert!(!record.own_drafts(0) && !record.own_drafts(1));
 
         // A window whose drafts the model makes itself, sampled.
-        let params = SampleParams { temperature: 0.8, top_k: 20, top_p: 0.95, min_p: 0.0, seed: 7 };
+        let params = SampleParams {
+            temperature: 0.8,
+            top_k: 20,
+            top_p: 0.95,
+            seed: 7,
+            ..SampleParams::GREEDY
+        };
         let mut buf = vec![0x55u8; 1024];
         let mut w = RecordWriter::new(&mut buf, 1, 2, 4).unwrap();
         w.segment(0, 40, 3, false).unwrap();
@@ -830,7 +929,10 @@ mod tests {
         let at = record.tokens_offset() as usize;
         assert_eq!(u32::from_le_bytes(buf[at..at + 4].try_into().unwrap()), 9);
         let rows = record.samplers_offset() as usize;
-        assert_eq!(buf[rows + 32..rows + 64], params.row(41).to_bytes());
+        assert_eq!(
+            buf[rows + SampleRow::BYTES..rows + 2 * SampleRow::BYTES],
+            params.row(41).to_bytes()
+        );
     }
 
     /// The first bytes are the record the layer kernels read: the same bytes
@@ -894,7 +996,7 @@ mod tests {
         // 64 rows of 64 sequences, every row wanted on its own, each sequence
         // with a new page, a commit and a table update: the worst case the
         // planner can build.
-        let bytes = max_bytes(64, 256);
+        let bytes = max_bytes(64, 256, 64, 248_320);
         let mut buf = vec![0u8; bytes];
         let mut w = RecordWriter::new(&mut buf, 1, 64, 64).unwrap();
         for i in 0..64 {
@@ -957,5 +1059,41 @@ mod tests {
         assert_eq!((plain.state_copies(), plain.page_copies()), (0, 0));
         assert!(!plain.replay(0));
         assert_eq!(RecordView::new(&buf[..with_copies - 16]).unwrap_err(), RecordError::Truncated);
+    }
+
+    #[test]
+    fn corrections_and_masks_read_back_as_written() {
+        let mut buf = vec![0x66u8; 4096];
+        let mut w = RecordWriter::new(&mut buf, 3, 1, 2).unwrap();
+        w.segment(0, 10, 2, false).unwrap();
+        w.row(Row { slot: 0, position: 10, token: 4, context: 0 }).unwrap();
+        w.row(Row { slot: 0, position: 11, token: 5, context: 0 }).unwrap();
+        w.runs(&[(0, 2)]).unwrap();
+        let entries = [
+            Entry { token: 7, bias: -1.5, rep: 1.25, sub: 0.5 },
+            Entry { token: 9, bias: f32::NEG_INFINITY, rep: 1.0, sub: 0.0 },
+        ];
+        w.corrections(&entries).unwrap();
+        let masks = [0b1010u32, 7, 1, 0xffff_ffff];
+        w.masks(&masks, 2).unwrap();
+        let params = SampleParams { temperature: 1.0, top_k: 3, ..SampleParams::GREEDY };
+        w.samplers([params.row(10).with_entries(0, 2), params.row(11).with_mask(1)]).unwrap();
+        w.commits(&[]).unwrap();
+        let used = w.finish().unwrap();
+        assert_eq!(used % 16, 0);
+        let record = RecordView::new(&buf[..used]).unwrap();
+        assert_eq!(record.corrections(), 2);
+        assert_eq!((record.correction(0), record.correction(1)), (entries[0], entries[1]));
+        assert_eq!(record.masks(), (2, 2));
+        assert_eq!((record.mask_word(0, 1), record.mask_word(1, 0)), (7, 1));
+        assert_eq!(record.sampler(0).entries(), (0, 2));
+        assert_eq!(record.sampler(1).mask(), Some(1));
+        // The sections are where the device finds them.
+        let at = record.corrections_offset() as usize;
+        assert_eq!(buf[at..at + Entry::BYTES], entries[0].to_bytes());
+        let at = record.masks_offset() as usize;
+        assert_eq!(u32::from_le_bytes(buf[at..at + 4].try_into().unwrap()), 0b1010);
+        // A record cut short of them is refused.
+        assert_eq!(RecordView::new(&buf[..used - 16]).unwrap_err(), RecordError::Truncated);
     }
 }

@@ -1,39 +1,16 @@
-//! The sampler: the pick of each row from its logits, on the device.
+//! The sampler's kernels on a device: the pick of each row from its logits.
 //!
 //! Logits stay on the device. Per row, the kernels of `kernels/sampler.cu`
-//! find the best few tokens (the greedy pick and the candidates a grammar may
-//! fall back to), the exact cut-offs of top-k, top-p and min-p, and the pick,
-//! and only an 80-byte record per row reaches the host ([`SamplePick`]).
+//! correct the logits (the entries and the mask of the row), find the best few
+//! tokens (the greedy pick and the candidates a grammar may fall back to), run
+//! the stages of the row's program that cut the set of tokens or scale the
+//! temperature, draw the pick, and report the probabilities the row asks for.
+//! Only an 80-byte record per row ([`SamplePick`]) and, when asked, a record of
+//! probabilities ([`LogprobOut`]) reach the host.
 //!
-//! # What a pick is
-//!
-//! With `p` the softmax of a row's logits and `p_max` its largest value, every
-//! cut is a threshold on `p / p_max`, which is `exp(-d)` for the distance `d`
-//! of a logit below the best one:
-//!
-//! - **top-k** keeps the tokens at least as probable as the `k`-th;
-//! - **top-p** keeps the most probable tokens that together hold the share
-//!   `top_p` of what top-k left;
-//! - **min-p** keeps the tokens with `p / p_max >= min_p`.
-//!
-//! The cuts apply in that order at temperature 1, as in llama.cpp's default
-//! chain, and tokens tied at a cut are all kept. Among the tokens left, the
-//! pick is the one with the largest `logit / temperature + g`, where `g` is
-//! the Gumbel noise of (seed, position, token) from a counter-based generator
-//! (Philox 4x32-10). That is a draw from the distribution of the kept tokens
-//! at that temperature, and because a token's noise depends on nothing but
-//! those three numbers, a row's pick is the same alone and in any batch, on
-//! one device and on several, and verifying a draft is comparing it with the
-//! pick for its position.
-//!
-//! # Exactness
-//!
-//! The cut-offs come from a radix descent over the bit patterns of `d` with
-//! integer counts and fixed-point weights, the exponential and the logarithm
-//! are polynomials of IEEE operations, so the order in which threads, blocks
-//! and devices add does not matter and the host can repeat a pick bit for bit:
-//! [`sample_reference`] is the same arithmetic, written from the definitions
-//! above with a sort instead of the descent.
+//! What a pick is, the arithmetic and the reference that the kernels are
+//! compared with bit for bit are in the `ares-sampler` crate; its
+//! documentation defines every stage.
 //!
 //! # Several devices
 //!
@@ -42,7 +19,12 @@
 //! so the devices run the same kernels on their slices and exchange small
 //! partial results between the steps of a pick ([`SampleStep`]); the exchange
 //! is the sum across devices the model has anyway (f32 values that add
-//! exactly). All devices end with the same record.
+//! exactly: numbers are split into limbs of 16 or 20 bits). All devices end
+//! with the same record.
+
+use ares_sampler::{
+    ENTRIES_PER_ROW, LOGPROBS_MAX, MAX_STAGES, SAMPLE_CANDIDATES, SampleRow, Stage,
+};
 
 use crate::device::Device;
 use crate::error::{Error, Result};
@@ -51,14 +33,6 @@ use crate::module::{Args, Function, Module};
 use crate::stream::Stream;
 
 static IMAGE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/sampler.fatbin"));
-
-/// The candidates recorded per row: its best tokens by logit.
-pub const SAMPLE_CANDIDATES: usize = 8;
-/// Status bit of a [`SamplePick`]: a logit of the row was NaN or plus
-/// infinity; the pick is not valid.
-pub const SAMPLE_STATUS_NONFINITE: u32 = 1;
-/// Status bit of a [`SamplePick`]: no token was left to pick.
-pub const SAMPLE_STATUS_EMPTY: u32 = 2;
 
 /// The most logits one device holds per row: the histograms' limbs are sized
 /// for it.
@@ -69,371 +43,65 @@ const BINS: u32 = 2048;
 const BIN_WORDS: u32 = 4;
 const CHUNK: u32 = 4096;
 const MAX_CHUNKS: u32 = SAMPLE_MAX_VOCAB / CHUNK;
-const LIST: u32 = SAMPLE_CANDIDATES as u32 + 1;
-const TOP_VALUES: u32 = 2 * SAMPLE_CANDIDATES as u32 + 2;
+/// Entries per chunk in the list of a top kernel with the most candidates.
+const LIST: u32 = LOGPROBS_MAX as u32 + 1;
+/// f32 values per device and row in the exchange of the candidates: a logit
+/// and a token each, and two words of status.
+const fn top_values(candidates: usize) -> u32 {
+    2 * candidates as u32 + 2
+}
 const PICK_VALUES: u32 = 2;
-const STATE_BYTES: u64 = 64;
+const PASS_VALUES: u32 = 24;
+/// The tokens mirostat 1 estimates its exponent from.
+const GATHER: u32 = ares_sampler::MIROSTAT_M as u32;
+const GATHER_VALUES: u32 = 1 + 2 * GATHER;
+const STATE_BYTES: u64 = 256;
+/// The blocks that cover the entries of a row.
+const ENTRY_BLOCKS: u32 = (ENTRIES_PER_ROW as u32).div_ceil(THREADS);
 
-const F_SAMPLE: u32 = 1;
-const F_TOP_K: u32 = 2;
-const F_TOP_P: u32 = 4;
-const KEY_MAX: u32 = 0x7f7f_ffff;
-
-/// How a sequence's tokens are picked.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct SampleParams {
-    /// 0 picks the most probable token.
-    pub temperature: f32,
-    /// 0 is off.
-    pub top_k: u32,
-    /// 1 (or more) is off.
-    pub top_p: f32,
-    /// 0 is off.
-    pub min_p: f32,
-    pub seed: u64,
-}
-
-impl SampleParams {
-    /// The most probable token.
-    pub const GREEDY: SampleParams =
-        SampleParams { temperature: 0.0, top_k: 0, top_p: 1.0, min_p: 0.0, seed: 0 };
-
-    /// The device's form of these settings for a row at `position`.
-    pub fn row(&self, position: u32) -> SampleRow {
-        let sampled = self.temperature > 0.0;
-        let mut flags = 0;
-        let mut row = SampleRow {
-            flags: 0,
-            inv_temperature: 1.0,
-            top_k: 0,
-            top_p_q32: 0,
-            min_p_key: KEY_MAX,
-            seed_lo: self.seed as u32,
-            seed_hi: (self.seed >> 32) as u32,
-            position,
-        };
-        if sampled {
-            flags |= F_SAMPLE;
-            row.inv_temperature = 1.0 / self.temperature;
-            if self.top_k > 0 {
-                flags |= F_TOP_K;
-                row.top_k = self.top_k;
-            }
-            if self.top_p > 0.0 && self.top_p < 1.0 {
-                flags |= F_TOP_P;
-                let q = (f64::from(self.top_p) * 4_294_967_296.0).round();
-                row.top_p_q32 = q.clamp(1.0, 4_294_967_295.0) as u32;
-            }
-            if self.min_p > 0.0 {
-                let d = (-self.min_p.ln()).max(0.0);
-                row.min_p_key = d.to_bits().min(KEY_MAX);
-            }
-        }
-        row.flags = flags;
-        row
-    }
-}
-
-/// One row's settings as the kernels read them (`AresSampleParams`).
-#[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct SampleRow {
-    flags: u32,
-    inv_temperature: f32,
-    top_k: u32,
-    top_p_q32: u32,
-    min_p_key: u32,
-    seed_lo: u32,
-    seed_hi: u32,
-    position: u32,
-}
-
-impl SampleRow {
-    /// The bytes of a row on the device.
-    pub const BYTES: usize = 32;
-
-    /// Whether the row is sampled (and not the most probable token).
-    pub fn sampled(&self) -> bool {
-        self.flags & F_SAMPLE != 0
-    }
-
-    /// Reads a row as [`SampleRow::to_bytes`] wrote it.
-    pub fn from_bytes(bytes: &[u8; Self::BYTES]) -> Self {
-        let word =
-            |i: usize| u32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().expect("4 bytes"));
-        Self {
-            flags: word(0),
-            inv_temperature: f32::from_bits(word(1)),
-            top_k: word(2),
-            top_p_q32: word(3),
-            min_p_key: word(4),
-            seed_lo: word(5),
-            seed_hi: word(6),
-            position: word(7),
-        }
-    }
-
-    /// The row as the device reads it.
-    pub fn to_bytes(&self) -> [u8; Self::BYTES] {
-        let words = [
-            self.flags,
-            self.inv_temperature.to_bits(),
-            self.top_k,
-            self.top_p_q32,
-            self.min_p_key,
-            self.seed_lo,
-            self.seed_hi,
-            self.position,
-        ];
-        let mut bytes = [0u8; Self::BYTES];
-        for (chunk, word) in bytes.as_chunks_mut::<4>().0.iter_mut().zip(words) {
-            *chunk = word.to_le_bytes();
-        }
-        bytes
-    }
-}
-
-/// What the device reports per row (`AresSampleOut`).
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct SamplePick {
-    /// The picked token, or `u32::MAX` when there is none (see `status`).
-    pub token: u32,
-    /// 0, or `SAMPLE_STATUS_*` bits.
-    pub status: u32,
-    /// The logit of a greedy pick; the score (`logit / temperature + noise`)
-    /// of a sampled one.
-    pub value: f32,
-    /// The row's best tokens by logit, best first, the lower token first
-    /// among equal logits. `u32::MAX` where the row has fewer tokens.
-    pub cand_token: [u32; SAMPLE_CANDIDATES],
-    pub cand_logit: [f32; SAMPLE_CANDIDATES],
-}
-
-impl SamplePick {
-    /// The bytes of a record on the device.
-    pub const BYTES: usize = 16 + 8 * SAMPLE_CANDIDATES;
-
-    /// Reads a record as the device wrote it.
-    pub fn from_bytes(bytes: &[u8]) -> Self {
-        let word =
-            |i: usize| u32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().expect("4 bytes"));
-        let mut pick = SamplePick {
-            token: word(0),
-            status: word(1),
-            value: f32::from_bits(word(2)),
-            cand_token: [0; SAMPLE_CANDIDATES],
-            cand_logit: [0.0; SAMPLE_CANDIDATES],
-        };
-        for c in 0..SAMPLE_CANDIDATES {
-            pick.cand_token[c] = word(4 + c);
-            pick.cand_logit[c] = f32::from_bits(word(4 + SAMPLE_CANDIDATES + c));
-        }
-        pick
-    }
-}
-
-// --- the arithmetic, on the host --------------------------------------------
-
-fn sortable(v: f32) -> u32 {
-    let b = v.to_bits();
-    if b & 0x8000_0000 != 0 { !b } else { b | 0x8000_0000 }
-}
-
-fn unsortable(s: u32) -> f32 {
-    f32::from_bits(if s & 0x8000_0000 != 0 { s & 0x7fff_ffff } else { !s })
-}
-
-fn pack(value: f32, token: u32) -> u64 {
-    u64::from(sortable(value)) << 32 | u64::from(u32::MAX - token)
-}
-
-/// The key of a logit: the bits of its distance below the best logit.
-fn key_of(l_max: f32, logit: f32) -> u32 {
-    let d = l_max - logit;
-    if d > 0.0 { d.to_bits() } else { 0 }
-}
-
-/// `exp(-d)` for the distance with bit pattern `key`, as a fixed-point number
-/// with 40 fractional bits. The polynomial of `ares_sample_weight`.
-pub fn weight_fixed(key: u32) -> u64 {
-    let d = f32::from_bits(key);
-    let t = d * std::f32::consts::LOG2_E;
-    // Written this way so that a NaN gives 0 too.
-    #[allow(clippy::neg_cmp_op_on_partial_ord)]
-    if !(t < 41.0) {
-        return 0;
-    }
-    let n = t as u32;
-    let f = t - n as f32;
-    let r = f * std::f32::consts::LN_2;
-    let mut p = -1.0f32 / 362_880.0;
-    for c in [
-        1.0f32 / 40_320.0,
-        -1.0 / 5_040.0,
-        1.0 / 720.0,
-        -1.0 / 120.0,
-        1.0 / 24.0,
-        -1.0 / 6.0,
-        0.5,
-        -1.0,
-        1.0,
-    ] {
-        p = p * r + c;
-    }
-    ((p * 1_099_511_627_776.0) as u64) >> n
-}
-
-/// `ln(x)` for a positive normal `x`: the polynomial of `ares_sample_ln`.
-fn ln_exact(x: f32) -> f32 {
-    let b = x.to_bits();
-    let mut e = (b >> 23) as i32 - 127;
-    let mant = b & 0x007f_ffff;
-    let m = if mant > 0x0035_04f3 {
-        e += 1;
-        f32::from_bits(mant | 0x3f00_0000)
-    } else {
-        f32::from_bits(mant | 0x3f80_0000)
-    };
-    let s = (m - 1.0) / (m + 1.0);
-    let z = s * s;
-    let mut p = 1.0f32 / 9.0;
-    for c in [1.0f32 / 7.0, 1.0 / 5.0, 1.0 / 3.0, 1.0] {
-        p = p * z + c;
-    }
-    let lm = (2.0 * s) * p;
-    e as f32 * std::f32::consts::LN_2 + lm
-}
-
-/// Philox 4x32 with 10 rounds: the output words for a counter and a key.
-pub fn philox4x32(counter: [u32; 4], key: [u32; 2]) -> [u32; 4] {
-    let [mut c0, mut c1, mut c2, mut c3] = counter;
-    let [mut k0, mut k1] = key;
-    for _ in 0..10 {
-        let p0 = 0xD251_1F53u64 * u64::from(c0);
-        let p1 = 0xCD9E_8D57u64 * u64::from(c2);
-        let next = [(p1 >> 32) as u32 ^ c1 ^ k0, p1 as u32, (p0 >> 32) as u32 ^ c3 ^ k1, p0 as u32];
-        [c0, c1, c2, c3] = next;
-        k0 = k0.wrapping_add(0x9E37_79B9);
-        k1 = k1.wrapping_add(0xBB67_AE85);
-    }
-    [c0, c1, c2, c3]
-}
-
-/// The Gumbel noise of `token` at `position` for `seed`.
-pub fn gumbel(seed: u64, position: u32, token: u32) -> f32 {
-    let x = philox4x32([token, position, 0, 0], [seed as u32, (seed >> 32) as u32])[0];
-    let u = ((x >> 9) as f32 + 0.5) * (1.0 / 8_388_608.0);
-    let e = -ln_exact(u);
-    -ln_exact(e)
-}
-
-/// The pick of one row on the host: the arithmetic of the kernels, written
-/// from the definitions (a sort where the kernels descend by radix).
-///
-/// `logits[i]` is the logit of token `token_of(i)`.
-pub fn sample_reference(
-    logits: &[f32],
-    token_of: impl Fn(usize) -> u32,
-    row: &SampleRow,
-) -> SamplePick {
-    let mut status = 0;
-    let canon: Vec<f32> = logits
-        .iter()
-        .map(|&l| {
-            let l = l + 0.0;
-            if l <= f32::MAX {
-                l
-            } else {
-                status |= SAMPLE_STATUS_NONFINITE;
-                f32::NEG_INFINITY
-            }
-        })
-        .collect();
-    let mut packed: Vec<u64> =
-        canon.iter().enumerate().map(|(i, &l)| pack(l, token_of(i))).collect();
-    packed.sort_unstable_by(|a, b| b.cmp(a));
-    let mut pick = SamplePick {
-        token: u32::MAX,
-        status: 0,
-        value: f32::NEG_INFINITY,
-        cand_token: [u32::MAX; SAMPLE_CANDIDATES],
-        cand_logit: [f32::NEG_INFINITY; SAMPLE_CANDIDATES],
-    };
-    for (c, &p) in packed.iter().take(SAMPLE_CANDIDATES).enumerate() {
-        pick.cand_token[c] = u32::MAX - p as u32;
-        pick.cand_logit[c] = unsortable((p >> 32) as u32);
-    }
-    let l_max = pick.cand_logit[0];
-    if l_max == f32::NEG_INFINITY {
-        status |= SAMPLE_STATUS_EMPTY;
-    }
-    pick.status = status;
-    pick.value = l_max;
-    if row.flags & F_SAMPLE == 0 {
-        pick.token = pick.cand_token[0];
-        return pick;
-    }
-
-    // Keys ascending: most probable first.
-    let mut keyed: Vec<(u32, u64)> = canon
-        .iter()
-        .map(|&l| {
-            let key = key_of(l_max, l);
-            (key, weight_fixed(key))
-        })
-        .collect();
-    keyed.sort_unstable_by_key(|(key, _)| *key);
-    let mut cut = row.min_p_key.min(KEY_MAX);
-    let total: u64 = keyed.iter().map(|(_, w)| w).sum();
-    let mut z = total;
-    if row.flags & F_TOP_K != 0 && (row.top_k as usize) <= keyed.len() {
-        let k_key = keyed[row.top_k as usize - 1].0;
-        cut = cut.min(k_key);
-        z = keyed.iter().take_while(|(key, _)| *key <= k_key).map(|(_, w)| w).sum();
-    }
-    if row.flags & F_TOP_P != 0 {
-        let target = ((u128::from(z) * u128::from(row.top_p_q32)) >> 32) as u64;
-        let target = target.max(1);
-        let mut run = 0u64;
-        let mut i = 0;
-        while i < keyed.len() {
-            let key = keyed[i].0;
-            while i < keyed.len() && keyed[i].0 == key {
-                run += keyed[i].1;
-                i += 1;
-            }
-            if run >= target {
-                cut = cut.min(key);
-                break;
-            }
-        }
-    }
-    let seed = u64::from(row.seed_hi) << 32 | u64::from(row.seed_lo);
-    let mut best = 0u64;
-    for (i, &l) in canon.iter().enumerate() {
-        if key_of(l_max, l) > cut {
-            continue;
-        }
-        let token = token_of(i);
-        let score = l * row.inv_temperature + gumbel(seed, row.position, token);
-        best = best.max(pack(score, token));
-    }
-    if best == 0 {
-        pick.status |= SAMPLE_STATUS_EMPTY;
-        return pick;
-    }
-    pick.token = u32::MAX - best as u32;
-    pick.value = unsortable((best >> 32) as u32);
-    pick
-}
-
-// --- the kernels ----------------------------------------------------------------
-
-/// Which cut a level of the descent works on.
+/// Which cut a level of the radix descent works on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SampleCut {
+pub enum Descent {
+    /// The `k` most probable tokens, by count.
     TopK = 0,
+    /// The most probable tokens that hold a share, by weight.
     TopP = 1,
+    /// The radius of locally typical sampling, by weight.
+    Typical = 2,
+    /// The hundredth most probable token (mirostat 1), by count.
+    K100 = 3,
+}
+
+/// What a pass over the row's tokens adds up.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PassMode {
+    /// The sums of the set: count, weight, entropy term, deviation terms.
+    Stats = 0,
+    /// The tokens above XTC's threshold.
+    Xtc = 1,
+    /// The keys within the radius of typical sampling.
+    Typical = 2,
+    /// The keys below the hundredth (mirostat 1).
+    Gather = 3,
+    /// The sums of the set that is left, after the draw.
+    Tail = 4,
+    /// The sums of all tokens as the model gave their logits.
+    Raw = 5,
+}
+
+/// What the kernel after a pass does with its totals.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Phase {
+    NSigma = 0,
+    TypicalMean = 1,
+    TypicalSet = 2,
+    XtcTarget = 3,
+    XtcCut = 4,
+    Temperature = 5,
+    Mirostat2 = 6,
+    Mirostat1 = 7,
+    Tail = 8,
+    Raw = 9,
 }
 
 /// One part of the picks of a batch. The parts run in the order of
@@ -441,58 +109,190 @@ pub enum SampleCut {
 /// devices must add up, [`SamplerKernels::enqueue`] says how many values.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SampleStep {
+    /// The best tokens of this device's slice of the model's own logits (for
+    /// the rows that report the model's probabilities).
+    RawTop,
+    /// The best tokens of all devices, the same (several devices only).
+    RawJoin,
+    /// A pass at `position`: this device's partial result.
+    Pass(PassMode, u32),
+    /// What a stage at `position` does with the totals of its pass.
+    Stage(Phase, u32),
+    /// The corrections of the rows: entries, then masks.
+    Correct,
     /// The best tokens of this device's slice.
     Top,
     /// The best tokens of all devices (several devices only).
     Join,
-    /// A level of a descent: this device's histogram.
-    Level(SampleCut, u32),
+    /// A level of a descent at `position`: this device's histogram.
+    Level(Descent, u32, u32),
     /// The same level: one level down from the histogram of all devices.
-    Decide(SampleCut, u32),
+    Decide(Descent, u32, u32),
+    /// Mirostat 1 at `position`: the first hundred keys of this device.
+    Gather(u32),
+    /// Mirostat 1 at `position`: the `k` of the keys of all devices.
+    Mirostat1(u32),
     /// The best score of this device's slice.
     Pick,
     /// The pick.
     Finish,
+    /// The best tokens of the set the chain left (after the chain).
+    PostTop,
+    /// The same for all devices (several devices only).
+    PostJoin,
+    /// The logit of the pick, from the device that holds it.
+    PickLogit,
+    /// The probabilities and the surprise of the pick.
+    Report,
 }
 
 /// What the rows of a batch need, which decides the kernels that run: a batch
 /// of greedy rows takes two launches.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SamplePlan {
-    pub sampled: bool,
-    pub top_k: bool,
-    pub top_p: bool,
+    /// Some row is drawn and not the most probable token.
+    sampled: bool,
+    /// Some row has entries or a mask.
+    entries: bool,
+    mask: bool,
+    /// Some row reports the model's own probabilities / those after the chain.
+    raw: bool,
+    post: bool,
+    /// Some row reports a surprise.
+    surprise: bool,
+    /// For each position of the programs, a bit for every stage some row has
+    /// there (bit `n` for the stage with code `n`, bit 10 for a dynamic
+    /// temperature).
+    stages: [u16; MAX_STAGES],
+}
+
+const DYNAMIC: u16 = 1 << 10;
+
+fn bit(stage: Stage) -> u16 {
+    1 << (stage as u16)
 }
 
 impl SamplePlan {
     /// The plan of a batch with these rows.
     pub fn of<'a>(rows: impl IntoIterator<Item = &'a SampleRow>) -> Self {
-        rows.into_iter().fold(Self::default(), |plan, row| Self {
-            sampled: plan.sampled || row.flags & F_SAMPLE != 0,
-            top_k: plan.top_k || row.flags & F_TOP_K != 0,
-            top_p: plan.top_p || row.flags & F_TOP_P != 0,
-        })
+        let mut plan = Self::default();
+        for row in rows {
+            plan.sampled |= row.sampled();
+            plan.entries |= row.entries().1 > 0;
+            plan.mask |= row.mask().is_some();
+            if let Some((after_chain, _)) = row.logprobs() {
+                plan.raw |= !after_chain;
+                plan.post |= after_chain;
+            }
+            plan.surprise |= row.mirostat();
+            if row.sampled() {
+                for (i, stage) in row.program().into_iter().enumerate() {
+                    plan.stages[i] |= bit(stage);
+                    if stage == Stage::Temperature && row.dynamic_temperature() {
+                        plan.stages[i] |= DYNAMIC;
+                    }
+                }
+            }
+        }
+        plan
+    }
+
+    /// Whether any row reports probabilities, which come back in a record of
+    /// their own.
+    pub fn logprobs(&self) -> bool {
+        self.raw || self.post
+    }
+
+    /// Whether any row reports a probability or a surprise after its pick.
+    fn reports(&self) -> bool {
+        self.raw || self.post || self.surprise
     }
 
     /// The parts of the picks, in order, for `devices` devices.
     pub fn steps(&self, devices: u32) -> Vec<SampleStep> {
-        let mut steps = vec![SampleStep::Top];
-        if devices > 1 {
+        let several = devices > 1;
+        let mut steps = Vec::new();
+        if self.raw {
+            steps.push(SampleStep::RawTop);
+            if several {
+                steps.push(SampleStep::RawJoin);
+            }
+            steps.push(SampleStep::Pass(PassMode::Raw, 0));
+            steps.push(SampleStep::Stage(Phase::Raw, 0));
+        }
+        if self.entries || self.mask {
+            steps.push(SampleStep::Correct);
+        }
+        steps.push(SampleStep::Top);
+        if several {
             steps.push(SampleStep::Join);
         }
-        for (wanted, cut) in [(self.top_k, SampleCut::TopK), (self.top_p, SampleCut::TopP)] {
-            if self.sampled && wanted {
-                for level in 0..3 {
-                    steps.push(SampleStep::Level(cut, level));
-                    steps.push(SampleStep::Decide(cut, level));
+        if self.sampled {
+            for (position, kinds) in self.stages.iter().enumerate() {
+                let position = position as u32;
+                let has = |stage: Stage| kinds & bit(stage) != 0;
+                if has(Stage::Mirostat1) {
+                    self.levels(&mut steps, Descent::K100, position);
+                    steps.push(SampleStep::Gather(position));
+                    steps.push(SampleStep::Mirostat1(position));
+                }
+                if has(Stage::TopK) || has(Stage::Mirostat1) {
+                    self.levels(&mut steps, Descent::TopK, position);
+                }
+                if has(Stage::TopNSigma) {
+                    steps.push(SampleStep::Pass(PassMode::Stats, position));
+                    steps.push(SampleStep::Stage(Phase::NSigma, position));
+                }
+                if has(Stage::Typical) {
+                    steps.push(SampleStep::Pass(PassMode::Stats, position));
+                    steps.push(SampleStep::Stage(Phase::TypicalMean, position));
+                    self.levels(&mut steps, Descent::Typical, position);
+                    steps.push(SampleStep::Pass(PassMode::Typical, position));
+                    steps.push(SampleStep::Stage(Phase::TypicalSet, position));
+                }
+                if has(Stage::TopP) {
+                    self.levels(&mut steps, Descent::TopP, position);
+                }
+                if has(Stage::Xtc) {
+                    steps.push(SampleStep::Pass(PassMode::Stats, position));
+                    steps.push(SampleStep::Stage(Phase::XtcTarget, position));
+                    steps.push(SampleStep::Pass(PassMode::Xtc, position));
+                    steps.push(SampleStep::Stage(Phase::XtcCut, position));
+                }
+                if has(Stage::Temperature) && kinds & DYNAMIC != 0 {
+                    steps.push(SampleStep::Pass(PassMode::Stats, position));
+                    steps.push(SampleStep::Stage(Phase::Temperature, position));
+                }
+                if has(Stage::Mirostat2) {
+                    steps.push(SampleStep::Pass(PassMode::Stats, position));
+                    steps.push(SampleStep::Stage(Phase::Mirostat2, position));
                 }
             }
-        }
-        if self.sampled {
             steps.push(SampleStep::Pick);
             steps.push(SampleStep::Finish);
         }
+        if self.post || self.surprise {
+            steps.push(SampleStep::Pass(PassMode::Tail, 0));
+            steps.push(SampleStep::Stage(Phase::Tail, 0));
+        }
+        if self.post {
+            steps.push(SampleStep::PostTop);
+            if several {
+                steps.push(SampleStep::PostJoin);
+            }
+        }
+        if self.reports() {
+            steps.push(SampleStep::PickLogit);
+            steps.push(SampleStep::Report);
+        }
         steps
+    }
+
+    fn levels(&self, steps: &mut Vec<SampleStep>, descent: Descent, position: u32) {
+        for level in 0..3 {
+            steps.push(SampleStep::Level(descent, position, level));
+            steps.push(SampleStep::Decide(descent, position, level));
+        }
     }
 }
 
@@ -500,6 +300,7 @@ impl SamplePlan {
 #[derive(Clone, Copy, Debug)]
 pub struct SampleBatch {
     /// Row `r` has its logits at `logits + r * stride * 4`, `n_local` f32.
+    /// Rows that have corrections are changed in place.
     pub logits: DevicePtr,
     pub stride: u32,
     pub n_rows: u32,
@@ -513,10 +314,27 @@ pub struct SampleBatch {
     /// this is null.
     pub tokens: DevicePtr,
     pub first: u32,
+    /// For the columns of a token list: column of every token of the
+    /// vocabulary (u32, `u32::MAX` where this device holds none), see
+    /// [`SamplerKernels::invert`]. Null without a token list.
+    pub inverse: DevicePtr,
+    /// The number of tokens of the vocabulary.
+    pub vocab: u32,
     /// [`SampleRow::BYTES`] bytes per row.
     pub params: DevicePtr,
-    /// [`SamplePick::BYTES`] bytes per row, written by the kernels.
+    /// The corrections of the rows (16 bytes each, `Entry`); the rows name
+    /// theirs. Null when no row has any.
+    pub entries: DevicePtr,
+    /// The masks of the rows: [`SampleBatch::mask_words`] u32 each, a bit
+    /// per token. Null when no row has one.
+    pub masks: DevicePtr,
+    pub mask_words: u32,
+    /// [`SamplePick::BYTES`](ares_sampler::SamplePick::BYTES) bytes per row,
+    /// written by the kernels.
     pub out: DevicePtr,
+    /// [`LogprobOut::BYTES`](ares_sampler::LogprobOut::BYTES) bytes per row,
+    /// written for the rows that report probabilities. Null when none does.
+    pub logprobs: DevicePtr,
     /// [`SamplerKernels::scratch_bytes`]`(capacity)` bytes that the caller
     /// cleared once ([`SamplerKernels::clear`]) and that nothing else writes.
     pub scratch: DevicePtr,
@@ -535,12 +353,26 @@ pub struct SamplerKernels {
     top: Function,
     top_merge: Function,
     top_join: Function,
+    raw_top: Function,
+    post_top: Function,
+    lp_merge: Function,
+    lp_join: Function,
+    scatter: Function,
+    mask: Function,
     hist: Function,
     export: Function,
     decide: Function,
+    pass: Function,
+    pass_export: Function,
+    stage_decide: Function,
+    gather_export: Function,
+    miro1_decide: Function,
     pick: Function,
     pick_export: Function,
     finish: Function,
+    pick_logit: Function,
+    report: Function,
+    invert: Function,
     draft_put: Function,
     draft_rows: Function,
     draft_shift: Function,
@@ -557,12 +389,26 @@ impl SamplerKernels {
             top: module.function("ares_sample_top")?,
             top_merge: module.function("ares_sample_top_merge")?,
             top_join: module.function("ares_sample_top_join")?,
+            raw_top: module.function("ares_lp_top_raw")?,
+            post_top: module.function("ares_lp_top_post")?,
+            lp_merge: module.function("ares_lp_top_merge")?,
+            lp_join: module.function("ares_lp_top_join")?,
+            scatter: module.function("ares_sample_scatter")?,
+            mask: module.function("ares_sample_mask")?,
             hist: module.function("ares_sample_hist")?,
             export: module.function("ares_sample_export")?,
             decide: module.function("ares_sample_decide")?,
+            pass: module.function("ares_sample_pass")?,
+            pass_export: module.function("ares_sample_pass_export")?,
+            stage_decide: module.function("ares_sample_stage_decide")?,
+            gather_export: module.function("ares_sample_gather_export")?,
+            miro1_decide: module.function("ares_sample_miro1_decide")?,
             pick: module.function("ares_sample_pick")?,
             pick_export: module.function("ares_sample_pick_export")?,
             finish: module.function("ares_sample_finish")?,
+            pick_logit: module.function("ares_lp_pick_logit")?,
+            report: module.function("ares_lp_finish")?,
+            invert: module.function("ares_sample_invert")?,
             draft_put: module.function("ares_draft_put")?,
             draft_rows: module.function("ares_draft_rows")?,
             draft_shift: module.function("ares_draft_shift")?,
@@ -592,7 +438,8 @@ impl SamplerKernels {
     /// The f32 values of the exchange buffer for up to `rows` rows on
     /// `devices` devices.
     pub fn exchange_values(rows: u32, devices: u32) -> u32 {
-        rows * (BINS * BIN_WORDS).max(devices * TOP_VALUES)
+        let per_device = top_values(LOGPROBS_MAX).max(PASS_VALUES).max(GATHER_VALUES);
+        rows * (BINS * BIN_WORDS).max(devices * per_device)
     }
 
     /// Enqueues clearing a scratch area for `rows` rows. Once, before its
@@ -605,6 +452,36 @@ impl SamplerKernels {
     pub unsafe fn clear(&self, stream: &Stream, scratch: DevicePtr, rows: u32) -> Result<()> {
         // SAFETY: the caller's guarantee.
         unsafe { stream.fill(scratch, 0, Self::scratch_bytes(rows) as usize) }
+    }
+
+    /// Enqueues the table of the columns of a device that holds a token list:
+    /// `inverse[token]` is the column of the token, or `u32::MAX`. Once, when
+    /// the device part is built.
+    ///
+    /// # Safety
+    ///
+    /// `tokens` must address `n_local` u32 and `inverse` `vocab` u32 of live
+    /// memory on the stream's device, every token below `vocab`.
+    pub unsafe fn invert(
+        &self,
+        stream: &Stream,
+        tokens: DevicePtr,
+        n_local: u32,
+        inverse: DevicePtr,
+        vocab: u32,
+    ) -> Result<()> {
+        let blocks = n_local.div_ceil(THREADS);
+        // SAFETY: the arguments match ares_sample_invert; the memory is the caller's guarantee.
+        unsafe {
+            stream.fill(inverse, 0xff, vocab as usize * 4)?;
+            self.invert.launch(
+                stream,
+                [blocks, 1, 1],
+                [THREADS, 1, 1],
+                0,
+                Args::new().ptr(tokens).u32(n_local).ptr(inverse).u32(vocab),
+            )
+        }
     }
 
     /// Enqueues one part of the picks of `batch` and returns the number of
@@ -648,6 +525,7 @@ impl SamplerKernels {
             });
         }
         let rows = batch.n_rows;
+        let devices = batch.devices;
         let chunks = batch.n_local.div_ceil(CHUNK);
         let state = batch.scratch;
         // The histograms rely on being left clear by the batch before, so
@@ -656,18 +534,107 @@ impl SamplerKernels {
         let capacity = u64::from(batch.capacity);
         let lists = state.offset(capacity * STATE_BYTES);
         let hist = lists.offset(capacity * Self::lists_bytes());
-        let several = batch.devices > 1;
+        let lists_words = (Self::lists_bytes() / 4) as u32;
+        let several = devices > 1;
         let block = [THREADS, 1, 1];
         let small = [32, 1, 1];
+        let chunk_grid = [chunks, rows, 1];
+        // The sum across devices has to cover this many values.
+        let sum = |per_row: u32| if several { rows * per_row } else { 0 };
         // SAFETY: the arguments of every launch below match its kernel's
         // parameter list in kernels/sampler_*.cuh, and the caller guarantees
         // the memory behind the pointers.
         unsafe {
             match step {
+                SampleStep::RawTop => {
+                    self.raw_top.launch(
+                        stream,
+                        chunk_grid,
+                        block,
+                        0,
+                        Args::new()
+                            .ptr(batch.logits)
+                            .u32(batch.stride)
+                            .u32(batch.n_local)
+                            .ptr(batch.tokens)
+                            .u32(batch.first)
+                            .u32(CHUNK)
+                            .ptr(lists)
+                            .ptr(batch.params),
+                    )?;
+                    self.top_list(stream, batch, lists, chunks, true)?;
+                    Ok(sum(devices * top_values(LOGPROBS_MAX)))
+                }
+                SampleStep::RawJoin => {
+                    self.join_list(stream, batch, true)?;
+                    Ok(0)
+                }
+                SampleStep::PostTop => {
+                    self.post_top.launch(
+                        stream,
+                        chunk_grid,
+                        block,
+                        0,
+                        Args::new()
+                            .ptr(batch.logits)
+                            .u32(batch.stride)
+                            .u32(batch.n_local)
+                            .ptr(batch.tokens)
+                            .u32(batch.first)
+                            .u32(CHUNK)
+                            .ptr(lists)
+                            .ptr(batch.params)
+                            .ptr(state),
+                    )?;
+                    self.top_list(stream, batch, lists, chunks, false)?;
+                    Ok(sum(devices * top_values(LOGPROBS_MAX)))
+                }
+                SampleStep::PostJoin => {
+                    self.join_list(stream, batch, false)?;
+                    Ok(0)
+                }
+                SampleStep::Correct => {
+                    if batch.entries != DevicePtr::NULL {
+                        self.scatter.launch(
+                            stream,
+                            [ENTRY_BLOCKS, rows, 1],
+                            block,
+                            0,
+                            Args::new()
+                                .ptr(batch.logits)
+                                .u32(batch.stride)
+                                .u32(batch.n_local)
+                                .u32(batch.first)
+                                .ptr(batch.inverse)
+                                .u32(batch.vocab)
+                                .ptr(batch.params)
+                                .ptr(batch.entries),
+                        )?;
+                    }
+                    if batch.masks != DevicePtr::NULL {
+                        self.mask.launch(
+                            stream,
+                            chunk_grid,
+                            block,
+                            0,
+                            Args::new()
+                                .ptr(batch.logits)
+                                .u32(batch.stride)
+                                .u32(batch.n_local)
+                                .ptr(batch.tokens)
+                                .u32(batch.first)
+                                .u32(CHUNK)
+                                .ptr(batch.params)
+                                .ptr(batch.masks)
+                                .u32(batch.mask_words),
+                        )?;
+                    }
+                    Ok(0)
+                }
                 SampleStep::Top => {
                     self.top.launch(
                         stream,
-                        [chunks, rows, 1],
+                        chunk_grid,
                         block,
                         0,
                         Args::new()
@@ -687,14 +654,14 @@ impl SamplerKernels {
                         Args::new()
                             .ptr(lists)
                             .u32(chunks)
-                            .u32(batch.devices)
+                            .u32(devices)
                             .u32(batch.rank)
                             .ptr(batch.exchange)
                             .ptr(batch.params)
                             .ptr(state)
                             .ptr(batch.out),
                     )?;
-                    Ok(if several { rows * batch.devices * TOP_VALUES } else { 0 })
+                    Ok(sum(devices * top_values(SAMPLE_CANDIDATES)))
                 }
                 SampleStep::Join => {
                     self.top_join.launch(
@@ -704,17 +671,17 @@ impl SamplerKernels {
                         0,
                         Args::new()
                             .ptr(batch.exchange)
-                            .u32(batch.devices)
+                            .u32(devices)
                             .ptr(batch.params)
                             .ptr(state)
                             .ptr(batch.out),
                     )?;
                     Ok(0)
                 }
-                SampleStep::Level(cut, level) => {
+                SampleStep::Level(descent, position, level) => {
                     self.hist.launch(
                         stream,
-                        [chunks, rows, 1],
+                        chunk_grid,
                         block,
                         0,
                         Args::new()
@@ -725,8 +692,9 @@ impl SamplerKernels {
                             .ptr(batch.params)
                             .ptr(state)
                             .ptr(hist)
-                            .u32(cut as u32)
-                            .u32(level),
+                            .u32(descent as u32)
+                            .u32(level)
+                            .u32(position),
                     )?;
                     let bins = if level == 1 { BINS } else { BINS / 2 };
                     self.export.launch(
@@ -734,11 +702,17 @@ impl SamplerKernels {
                         [bins / THREADS, rows, 1],
                         block,
                         0,
-                        Args::new().ptr(hist).ptr(batch.exchange).ptr(batch.params).u32(cut as u32),
+                        Args::new()
+                            .ptr(hist)
+                            .ptr(batch.exchange)
+                            .ptr(batch.params)
+                            .ptr(state)
+                            .u32(descent as u32)
+                            .u32(position),
                     )?;
-                    Ok(if several { rows * BINS * BIN_WORDS } else { 0 })
+                    Ok(sum(BINS * BIN_WORDS))
                 }
-                SampleStep::Decide(cut, level) => {
+                SampleStep::Decide(descent, position, level) => {
                     self.decide.launch(
                         stream,
                         [rows, 1, 1],
@@ -748,15 +722,116 @@ impl SamplerKernels {
                             .ptr(batch.exchange)
                             .ptr(batch.params)
                             .ptr(state)
-                            .u32(cut as u32)
-                            .u32(level),
+                            .u32(descent as u32)
+                            .u32(level)
+                            .u32(position),
+                    )?;
+                    Ok(0)
+                }
+                SampleStep::Pass(mode, position) => {
+                    self.pass.launch(
+                        stream,
+                        chunk_grid,
+                        block,
+                        0,
+                        Args::new()
+                            .ptr(batch.logits)
+                            .u32(batch.stride)
+                            .u32(batch.n_local)
+                            .u32(CHUNK)
+                            .ptr(batch.params)
+                            .ptr(state)
+                            .ptr(lists)
+                            .u32(lists_words)
+                            .u32(mode as u32)
+                            .u32(position),
+                    )?;
+                    self.pass_export.launch(
+                        stream,
+                        [rows, 1, 1],
+                        small,
+                        0,
+                        Args::new()
+                            .ptr(state)
+                            .ptr(batch.params)
+                            .ptr(batch.exchange)
+                            .u32(devices)
+                            .u32(batch.rank)
+                            .u32(mode as u32)
+                            .u32(position),
+                    )?;
+                    Ok(sum(devices * PASS_VALUES))
+                }
+                SampleStep::Stage(phase, position) => {
+                    self.stage_decide.launch(
+                        stream,
+                        [rows, 1, 1],
+                        small,
+                        0,
+                        Args::new()
+                            .ptr(batch.exchange)
+                            .ptr(batch.params)
+                            .ptr(state)
+                            .u32(devices)
+                            .u32(phase as u32)
+                            .u32(position),
+                    )?;
+                    Ok(0)
+                }
+                SampleStep::Gather(position) => {
+                    self.pass.launch(
+                        stream,
+                        chunk_grid,
+                        block,
+                        0,
+                        Args::new()
+                            .ptr(batch.logits)
+                            .u32(batch.stride)
+                            .u32(batch.n_local)
+                            .u32(CHUNK)
+                            .ptr(batch.params)
+                            .ptr(state)
+                            .ptr(lists)
+                            .u32(lists_words)
+                            .u32(PassMode::Gather as u32)
+                            .u32(position),
+                    )?;
+                    self.gather_export.launch(
+                        stream,
+                        [rows, 1, 1],
+                        small,
+                        0,
+                        Args::new()
+                            .ptr(state)
+                            .ptr(batch.params)
+                            .ptr(lists)
+                            .u32(lists_words)
+                            .ptr(batch.exchange)
+                            .u32(devices)
+                            .u32(batch.rank)
+                            .u32(position),
+                    )?;
+                    Ok(sum(devices * GATHER_VALUES))
+                }
+                SampleStep::Mirostat1(position) => {
+                    self.miro1_decide.launch(
+                        stream,
+                        [rows, 1, 1],
+                        small,
+                        0,
+                        Args::new()
+                            .ptr(batch.exchange)
+                            .ptr(batch.params)
+                            .ptr(state)
+                            .u32(devices)
+                            .u32(position),
                     )?;
                     Ok(0)
                 }
                 SampleStep::Pick => {
                     self.pick.launch(
                         stream,
-                        [chunks, rows, 1],
+                        chunk_grid,
                         block,
                         0,
                         Args::new()
@@ -781,10 +856,10 @@ impl SamplerKernels {
                             .ptr(state)
                             .ptr(batch.params)
                             .ptr(batch.exchange)
-                            .u32(batch.devices)
+                            .u32(devices)
                             .u32(batch.rank),
                     )?;
-                    Ok(rows * batch.devices * PICK_VALUES)
+                    Ok(rows * devices * PICK_VALUES)
                 }
                 SampleStep::Finish => {
                     self.finish.launch(
@@ -795,13 +870,110 @@ impl SamplerKernels {
                         Args::new()
                             .ptr(state)
                             .ptr(batch.exchange)
-                            .u32(batch.devices)
+                            .u32(devices)
                             .ptr(batch.params)
                             .ptr(batch.out),
                     )?;
                     Ok(0)
                 }
+                SampleStep::PickLogit => {
+                    self.pick_logit.launch(
+                        stream,
+                        [rows, 1, 1],
+                        small,
+                        0,
+                        Args::new()
+                            .ptr(batch.logits)
+                            .u32(batch.stride)
+                            .u32(batch.n_local)
+                            .u32(batch.first)
+                            .ptr(batch.inverse)
+                            .u32(batch.vocab)
+                            .ptr(batch.params)
+                            .ptr(batch.entries)
+                            .ptr(batch.out)
+                            .ptr(batch.exchange)
+                            .u32(devices)
+                            .u32(batch.rank),
+                    )?;
+                    Ok(sum(devices * PASS_VALUES))
+                }
+                SampleStep::Report => {
+                    self.report.launch(
+                        stream,
+                        [rows, 1, 1],
+                        small,
+                        0,
+                        Args::new()
+                            .ptr(batch.exchange)
+                            .u32(devices)
+                            .ptr(batch.params)
+                            .ptr(state)
+                            .ptr(batch.out)
+                            .ptr(batch.logprobs),
+                    )?;
+                    Ok(0)
+                }
             }
+        }
+    }
+
+    /// The merge of the chunks' lists of the rows that report probabilities
+    /// (`raw`: the model's own, else after the chain).
+    ///
+    /// # Safety
+    ///
+    /// As [`SamplerKernels::enqueue`].
+    unsafe fn top_list(
+        &self,
+        stream: &Stream,
+        batch: &SampleBatch,
+        lists: DevicePtr,
+        chunks: u32,
+        raw: bool,
+    ) -> Result<()> {
+        // SAFETY: the arguments match ares_lp_top_merge; the memory is the caller's guarantee.
+        unsafe {
+            self.lp_merge.launch(
+                stream,
+                [batch.n_rows, 1, 1],
+                [THREADS, 1, 1],
+                0,
+                Args::new()
+                    .ptr(lists)
+                    .u32(chunks)
+                    .u32(batch.devices)
+                    .u32(batch.rank)
+                    .ptr(batch.exchange)
+                    .ptr(batch.params)
+                    .ptr(batch.scratch)
+                    .ptr(batch.logprobs)
+                    .u32(u32::from(raw)),
+            )
+        }
+    }
+
+    /// The join of the devices' lists of the rows that report probabilities.
+    ///
+    /// # Safety
+    ///
+    /// As [`SamplerKernels::enqueue`].
+    unsafe fn join_list(&self, stream: &Stream, batch: &SampleBatch, raw: bool) -> Result<()> {
+        // SAFETY: the arguments match ares_lp_top_join; the memory is the caller's guarantee.
+        unsafe {
+            self.lp_join.launch(
+                stream,
+                [batch.n_rows, 1, 1],
+                [32, 1, 1],
+                0,
+                Args::new()
+                    .ptr(batch.exchange)
+                    .u32(batch.devices)
+                    .ptr(batch.params)
+                    .ptr(batch.scratch)
+                    .ptr(batch.logprobs)
+                    .u32(u32::from(raw)),
+            )
         }
     }
 
@@ -842,7 +1014,7 @@ impl SamplerKernels {
 /// 0. So before a step's kernels, row 0 is the hidden state the sequence's
 /// newest token was picked from, which is what a draft chain starts from.
 impl SamplerKernels {
-    /// The tokens of `n` picks at `picks` ([`SamplePick`] records) go where
+    /// The tokens of `n` picks at `picks` (`ares_sampler::SamplePick` records) go where
     /// the next kernels read them: pick `c` to `next_tokens[c]` for `c <
     /// n_next` (the token array of the next link's step record), to
     /// `record_tokens[record_rows[c]]` (the token of the row that verifies
@@ -990,145 +1162,5 @@ impl SamplerKernels {
         let args = Args::new().ptr(commit).ptr(carry).u32(carry_rows).u32(d);
         // SAFETY: the arguments match ares_draft_commit; the memory is the caller's guarantee.
         unsafe { self.draft_commit.launch(stream, [segments, 1, 1], [THREADS, 1, 1], 0, args) }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn philox_gives_the_known_answers() {
-        // The known-answer tests of Random123 (kat_vectors, philox4x32 10).
-        assert_eq!(
-            philox4x32([0; 4], [0; 2]),
-            [0x6627_e8d5, 0xe169_c58d, 0xbc57_ac4c, 0x9b00_dbd8]
-        );
-        assert_eq!(
-            philox4x32([u32::MAX; 4], [u32::MAX; 2]),
-            [0x408f_276d, 0x41c8_3b0e, 0xa20b_c7c6, 0x6d54_51fd]
-        );
-    }
-
-    #[test]
-    fn the_fixed_point_weight_is_the_exponential() {
-        assert_eq!(weight_fixed(0), 1 << 40);
-        let mut worst = 0f64;
-        let mut d = 1e-6f32;
-        while d < 27.0 {
-            let exact = (-f64::from(d)).exp() * (1u64 << 40) as f64;
-            let got = weight_fixed(d.to_bits()) as f64;
-            // The polynomial's error, beyond the unit the fixed point cuts.
-            let error = ((got - exact).abs() - 1.0).max(0.0) / exact;
-            worst = worst.max(error);
-            d *= 1.01;
-        }
-        assert!(worst < 1e-6, "relative error {worst}");
-        assert_eq!(weight_fixed(f32::INFINITY.to_bits()), 0);
-        assert_eq!(weight_fixed(40.0f32.to_bits()), 0);
-        // Never above the weight of the best token.
-        assert!((0..2000).all(|i| weight_fixed((i as f32 * 1e-9).to_bits()) <= 1 << 40));
-    }
-
-    #[test]
-    fn the_logarithm_is_the_logarithm() {
-        let mut x = 5e-8f32;
-        while x < 20.0 {
-            let exact = f64::from(x).ln();
-            let got = f64::from(ln_exact(x));
-            assert!((got - exact).abs() < 2e-6 * exact.abs().max(1.0), "ln({x}) = {got}, {exact}");
-            x *= 1.003;
-        }
-    }
-
-    fn params(temperature: f32, top_k: u32, top_p: f32, min_p: f32) -> SampleParams {
-        SampleParams { temperature, top_k, top_p, min_p, seed: 42 }
-    }
-
-    /// How often each token of `logits` is picked over `n` positions.
-    fn frequencies(logits: &[f32], params: &SampleParams, n: u32) -> Vec<f64> {
-        let mut counts = vec![0u32; logits.len()];
-        for position in 0..n {
-            let pick = sample_reference(logits, |i| i as u32, &params.row(position));
-            assert_eq!(pick.status, 0);
-            counts[pick.token as usize] += 1;
-        }
-        counts.iter().map(|c| f64::from(*c) / f64::from(n)).collect()
-    }
-
-    #[test]
-    fn greedy_takes_the_best_logit_and_the_lower_token_on_a_tie() {
-        let logits = [0.5, 3.0, -1.0, 3.0, 2.0, f32::NEG_INFINITY];
-        let pick = sample_reference(&logits, |i| 10 + i as u32, &SampleParams::GREEDY.row(7));
-        assert_eq!((pick.token, pick.value, pick.status), (11, 3.0, 0));
-        assert_eq!(pick.cand_token[..6], [11, 13, 14, 10, 12, 15]);
-        assert_eq!(pick.cand_token[6], u32::MAX);
-        // A token map decides the tie, not the column.
-        let pick = sample_reference(&logits, |i| 20 - i as u32, &SampleParams::GREEDY.row(7));
-        assert_eq!(pick.token, 17);
-    }
-
-    #[test]
-    fn a_logit_that_is_not_a_number_is_reported() {
-        let pick = sample_reference(&[1.0, f32::NAN], |i| i as u32, &SampleParams::GREEDY.row(0));
-        assert_eq!(pick.status, SAMPLE_STATUS_NONFINITE);
-        let none = [f32::NEG_INFINITY; 3];
-        let pick = sample_reference(&none, |i| i as u32, &params(1.0, 0, 1.0, 0.0).row(0));
-        assert_eq!(pick.status, SAMPLE_STATUS_EMPTY);
-    }
-
-    #[test]
-    fn sampling_draws_from_the_softmax_at_the_temperature() {
-        let logits = [1.0f32, 0.0, -1.0, 2.0, -3.0];
-        for temperature in [1.0f32, 0.5, 2.0] {
-            let z: f64 =
-                logits.iter().map(|l| (f64::from(*l) / f64::from(temperature)).exp()).sum();
-            let got = frequencies(&logits, &params(temperature, 0, 1.0, 0.0), 40_000);
-            for (l, f) in logits.iter().zip(&got) {
-                let p = (f64::from(*l) / f64::from(temperature)).exp() / z;
-                assert!((f - p).abs() < 0.012, "T {temperature}: p {p:.4}, drawn {f:.4}");
-            }
-        }
-    }
-
-    #[test]
-    fn the_cuts_keep_what_they_say() {
-        // Probabilities 0.4, 0.3, 0.2, 0.1 (logits are their logarithms).
-        let logits: Vec<f32> = [0.4f32, 0.3, 0.2, 0.1].iter().map(|p| p.ln()).collect();
-        let kept = |p: &SampleParams| -> Vec<bool> {
-            frequencies(&logits, p, 4000).iter().map(|f| *f > 0.0).collect()
-        };
-        assert_eq!(kept(&params(1.0, 2, 1.0, 0.0)), [true, true, false, false]);
-        // The smallest set that holds 0.75 is the first three.
-        assert_eq!(kept(&params(1.0, 0, 0.75, 0.0)), [true, true, true, false]);
-        assert_eq!(kept(&params(1.0, 0, 0.65, 0.0)), [true, true, false, false]);
-        // top-p counts within what top-k left: 0.75 of (0.4 + 0.3 + 0.2).
-        assert_eq!(kept(&params(1.0, 3, 0.75, 0.0)), [true, true, false, false]);
-        // min-p 0.6 of the best (0.4) is 0.24.
-        assert_eq!(kept(&params(1.0, 0, 1.0, 0.6)), [true, true, false, false]);
-        // The cuts are made at temperature 1, whatever the temperature.
-        assert_eq!(kept(&params(5.0, 2, 1.0, 0.0)), [true, true, false, false]);
-        // Ties at the cut are all kept.
-        let tied = [0.0f32, 0.0, 0.0, -5.0];
-        let f = frequencies(&tied, &params(1.0, 1, 1.0, 0.0), 4000);
-        assert!(f[..3].iter().all(|f| *f > 0.25) && f[3] == 0.0, "{f:?}");
-        // After the cut the draw is from the kept tokens' own distribution.
-        let f = frequencies(&logits, &params(1.0, 2, 1.0, 0.0), 40_000);
-        assert!((f[0] - 4.0 / 7.0).abs() < 0.012, "{f:?}");
-    }
-
-    #[test]
-    fn a_pick_depends_on_seed_position_and_token_only() {
-        let logits: Vec<f32> = (0..500).map(|i| ((i * 37 % 101) as f32) * 0.05).collect();
-        let p = params(1.0, 40, 0.95, 0.02);
-        let a = sample_reference(&logits, |i| i as u32, &p.row(11));
-        // The same row with its columns in another order.
-        let reversed: Vec<f32> = logits.iter().rev().copied().collect();
-        let b = sample_reference(&reversed, |i| (499 - i) as u32, &p.row(11));
-        assert_eq!(a, b);
-        let other = sample_reference(&logits, |i| i as u32, &p.row(12));
-        let seeded =
-            sample_reference(&logits, |i| i as u32, &SampleParams { seed: 43, ..p }.row(11));
-        assert!(a.token != other.token || a.token != seeded.token, "the noise does not vary");
     }
 }

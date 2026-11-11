@@ -10,6 +10,7 @@ build = "build.rs"
 
 [dependencies]
 ares-core.workspace = true
+ares-sampler.workspace = true
 libloading.workspace = true
 thiserror.workspace = true
 

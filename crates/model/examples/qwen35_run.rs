@@ -694,6 +694,7 @@ fn ask(
         let state = state.clone();
         EventSink::new(move |event| {
             match event {
+                Event::Logprobs(_) => {}
                 Event::Text(piece) => {
                     let mut state = state.lock().unwrap();
                     state.0.push_str(&piece);
@@ -971,6 +972,7 @@ fn converse(
         let state = state.clone();
         EventSink::new(move |event| {
             match event {
+                Event::Logprobs(_) => {}
                 Event::Text(piece) => {
                     let mut state = state.lock().unwrap();
                     state.0.push_str(&piece);

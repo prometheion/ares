@@ -24,8 +24,12 @@ mod common;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
+use ares_api::{BiasKey, LogitBias, LogprobRequest, SamplerKind, Sampling};
 use ares_cuda::{Device, Wait, device_count};
-use ares_runtime::{GpuConfig, Runtime, RuntimeConfig, Split, SyntheticConfig, SyntheticModel};
+use ares_runtime::{
+    GpuConfig, Runtime, RuntimeConfig, Split, SyntheticConfig, SyntheticModel, TokenFilter,
+};
+use ares_sampler::TokenMask;
 use common::*;
 
 fn gpus() -> Option<&'static [Device]> {
@@ -156,6 +160,12 @@ fn shutdown_with_requests_in_flight_joins_every_thread_on_every_placement() {
         s.model.context_length = 4096;
         s.runtime.pages = 64 * 256;
         shutdown_ends_everything(&start(s));
+        // A thread that has been joined is listed for a few microseconds more,
+        // until the kernel has reaped it.
+        let begun = std::time::Instant::now();
+        while !engine_threads().is_empty() && begun.elapsed() < Duration::from_secs(2) {
+            std::thread::sleep(Duration::from_micros(200));
+        }
         assert!(engine_threads().is_empty(), "threads left: {:?}", engine_threads());
     });
 }
@@ -223,4 +233,245 @@ fn state_pages_are_reserved_before_the_model_is_built_and_do_not_change_the_text
     let error = Runtime::start_gpu(model, devices[..1].to_vec(), runtime, gpu).unwrap_err();
     let text = error.to_string();
     assert!(text.contains("state pages") && text.contains("CUDA0"), "{text}");
+}
+
+/// Allows a window of 40 byte tokens that slides with the number of tokens
+/// the reply and the drafts so far hold.
+struct Sliding;
+
+impl TokenFilter for Sliding {
+    fn mask(&mut self, reply: &[u32], drafts: &[u32], mask: &mut TokenMask) -> bool {
+        let start = 40 + ((reply.len() + drafts.len()) % 25) as u32;
+        mask.fill(false);
+        for token in start..start + 40 {
+            mask.set(token, true);
+        }
+        true
+    }
+}
+
+/// The settings a request can ask for, one kind of feature each: whether the
+/// request is of a kind that verifies drafts, its settings, and whether it
+/// has a filter.
+fn features() -> Vec<(&'static str, bool, Sampling)> {
+    let order = |kinds: &[SamplerKind]| Some(kinds.to_vec());
+    let sampled = |f: &dyn Fn(&mut Sampling)| {
+        let mut s = Sampling { temperature: Some(0.8), seed: Some(77), ..Sampling::default() };
+        f(&mut s);
+        s
+    };
+    vec![
+        (
+            "penalties",
+            true,
+            sampled(&|s| {
+                s.top_k = Some(40);
+                s.repeat_penalty = Some(1.3);
+                s.frequency_penalty = Some(0.4);
+                s.presence_penalty = Some(0.3);
+                s.repeat_last_n = Some(48);
+            }),
+        ),
+        (
+            "dry",
+            true,
+            sampled(&|s| {
+                s.dry_multiplier = Some(0.8);
+                s.dry_allowed_length = Some(2);
+                s.dry_penalty_last_n = Some(64);
+                s.dry_sequence_breakers = Some(vec![" ".into()]);
+            }),
+        ),
+        (
+            "a bias and a ban",
+            true,
+            sampled(&|s| {
+                s.logit_bias = vec![
+                    LogitBias { key: BiasKey::Token(65), bias: Some(4.0) },
+                    LogitBias { key: BiasKey::Token(66), bias: None },
+                ];
+            }),
+        ),
+        (
+            "typical, top-n-sigma, xtc and a dynamic temperature",
+            true,
+            sampled(&|s| {
+                s.typical_p = Some(0.9);
+                s.top_n_sigma = Some(2.5);
+                s.xtc_probability = Some(0.5);
+                s.xtc_threshold = Some(0.2);
+                s.dynatemp_range = Some(0.4);
+                s.dynatemp_exponent = Some(1.5);
+            }),
+        ),
+        (
+            "an order of its own",
+            true,
+            sampled(&|s| {
+                s.top_p = Some(0.9);
+                s.min_p = Some(0.02);
+                s.top_k = Some(100);
+                s.samplers = order(&[
+                    SamplerKind::Temperature,
+                    SamplerKind::MinP,
+                    SamplerKind::TopP,
+                    SamplerKind::TopK,
+                ]);
+            }),
+        ),
+        (
+            "the model's own probabilities",
+            true,
+            sampled(&|s| {
+                s.top_p = Some(0.9);
+                s.logprobs = Some(LogprobRequest { top: 5, after_chain: false });
+            }),
+        ),
+        (
+            "the probabilities after the chain",
+            true,
+            sampled(&|s| {
+                s.top_p = Some(0.9);
+                s.min_p = Some(0.05);
+                s.logprobs = Some(LogprobRequest { top: 5, after_chain: true });
+            }),
+        ),
+        (
+            "greedy with penalties and probabilities",
+            true,
+            Sampling {
+                temperature: Some(0.0),
+                repeat_penalty: Some(1.4),
+                repeat_last_n: Some(16),
+                logprobs: Some(LogprobRequest { top: 3, after_chain: false }),
+                ..Sampling::default()
+            },
+        ),
+        ("mirostat 1", false, sampled(&|s| s.mirostat = Some(1))),
+        (
+            "mirostat 2 with probabilities",
+            false,
+            sampled(&|s| {
+                s.mirostat = Some(2);
+                s.mirostat_tau = Some(3.0);
+                s.logprobs = Some(LogprobRequest { top: 4, after_chain: true });
+            }),
+        ),
+        (
+            "everything at once",
+            true,
+            sampled(&|s| {
+                s.top_k = Some(60);
+                s.top_p = Some(0.95);
+                s.typical_p = Some(0.95);
+                s.repeat_penalty = Some(1.2);
+                s.frequency_penalty = Some(0.2);
+                s.repeat_last_n = Some(32);
+                s.dry_multiplier = Some(0.5);
+                s.logit_bias = vec![LogitBias { key: BiasKey::Text("ab".into()), bias: Some(1.5) }];
+                s.logprobs = Some(LogprobRequest { top: 2, after_chain: false });
+            }),
+        ),
+    ]
+}
+
+fn feature_request(prompt: &str, sampling: Sampling) -> ares_api::GenerateRequest {
+    let mut r = request(prompt, Some(150));
+    r.sampling = sampling;
+    r
+}
+
+/// A synthetic model with text that repeats and a draft block of its own, which
+/// is what lets a window verify drafts at all (the lookup in earlier text
+/// takes part next to a model drafter).
+fn drafting(split: Split, devices: usize) -> Setup {
+    let mut s = setup(split, devices);
+    s.model = s.model.repetitive(1, 40).with_own_drafts(4, &[]);
+    s
+}
+
+/// A request that has every feature runs the same with drafts and without
+/// (`draft: false`): the tokens, the text, the probabilities, on every
+/// placement.
+#[test]
+fn every_sampler_feature_gives_the_same_tokens_with_and_without_drafts_on_every_placement() {
+    on_every_placement(|split, devices| {
+        let runtime = start(drafting(split, devices));
+        let prompt = "the same words, the same words, the same words again";
+        let mut accepted = 0;
+        for (name, drafts, sampling) in features() {
+            let mut plain = feature_request(prompt, sampling.clone());
+            plain.draft = false;
+            let before = snapshot(&runtime);
+            let expected = run_one(&runtime, plain);
+            assert_eq!(expected.usage.completion_tokens, 150, "{name}");
+            assert_eq!(
+                since(&snapshot(&runtime), &before)["draft_rows"],
+                0,
+                "{name}: draft: false"
+            );
+            if sampling.logprobs.is_some() {
+                assert!(
+                    expected.probs.len() >= 140,
+                    "{name}: {} probabilities",
+                    expected.probs.len()
+                );
+            }
+            let before = snapshot(&runtime);
+            let got = run_one(&runtime, feature_request(prompt, sampling));
+            assert_eq!(got, expected, "{name}");
+            let d = since(&snapshot(&runtime), &before);
+            if drafts {
+                assert!(d["draft_rows"] > 0, "{name}: windows verified drafts ({d:?})");
+                accepted += d["accepted"];
+            } else {
+                assert_eq!(d["draft_rows"], 0, "{name}: this kind takes no drafts");
+            }
+        }
+        assert!(accepted > 30, "drafts were accepted under the features ({accepted})");
+        // A rule that restricts the picks.
+        let mut r = feature_request(
+            prompt,
+            Sampling { temperature: Some(0.9), seed: Some(5), ..Sampling::default() },
+        );
+        r.id = fresh_id();
+        r.draft = false;
+        let expected = start_filtered(&runtime, r.clone(), Sliding).unwrap().finish();
+        assert!(
+            expected.text.chars().all(|c| (c as u32) >= 40 && (c as u32) < 105),
+            "{}",
+            expected.text
+        );
+        let before = snapshot(&runtime);
+        r.id = fresh_id();
+        r.draft = true;
+        assert_eq!(start_filtered(&runtime, r, Sliding).unwrap().finish(), expected);
+        let d = since(&snapshot(&runtime), &before);
+        assert!(d["accepted"] > 10, "drafts are accepted under a filter ({d:?})");
+    });
+}
+
+/// Requests with different settings in one step do not touch each other.
+#[test]
+fn requests_with_different_settings_in_one_step_do_not_affect_each_other_on_every_placement() {
+    on_every_placement(|split, devices| {
+        let rt = start(drafting(split, devices));
+        let prompt = |i: usize| format!("prompt number {i}, with some words in it");
+        let kinds = features();
+        let alone: Vec<Run> = kinds
+            .iter()
+            .enumerate()
+            .map(|(i, (_, _, s))| run_one(&rt, feature_request(&prompt(i), s.clone())))
+            .collect();
+        // All of them at once, and plain requests among them.
+        let mut handles = Vec::new();
+        for (i, (_, _, s)) in kinds.iter().enumerate() {
+            handles.push(common::start(&rt, feature_request(&prompt(i), s.clone())).unwrap());
+            handles.push(common::start(&rt, request(&prompt(100 + i), Some(60))).unwrap());
+        }
+        let together: Vec<Run> = handles.into_iter().map(Handle::finish).collect();
+        for (i, (name, _, _)) in kinds.iter().enumerate() {
+            assert_eq!(together[2 * i], alone[i], "{name}");
+        }
+    });
 }

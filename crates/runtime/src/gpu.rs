@@ -28,9 +28,10 @@ use std::time::{Duration, Instant};
 use ares_core::Ledger;
 use ares_core::units::MIB;
 use ares_cuda::{
-    Device, DeviceBuffer, Event, Kernels, PinnedBuffer, SampleBatch, SamplePick, SamplePlan,
-    SampleRow, SamplerKernels, Stream,
+    Device, DeviceBuffer, DevicePtr, Event, Kernels, PinnedBuffer, SampleBatch, SamplePlan,
+    SamplerKernels, Stream,
 };
+use ares_sampler::{LogprobOut, SamplePick, SampleRow};
 
 use crate::cache::Cache;
 use crate::config::RuntimeConfig;
@@ -75,7 +76,7 @@ pub struct GpuConfig {
 /// record and the read-back buffers of every device.
 pub fn required_ram(model: &dyn Model, max_slots: u32) -> u64 {
     let max_rows = model.max_rows();
-    record::max_bytes(max_rows, max_slots) as u64
+    record::max_bytes(max_rows, max_slots, model.logit_rows(), model.vocab()) as u64
         + model.devices() as u64 * read_back_bytes(model.logit_rows(), max_rows) as u64
         + model.pinned_ram()
 }
@@ -145,6 +146,8 @@ struct DeviceResult {
     times: DeviceTimes,
     /// One pick per wanted row, when this device has an output head.
     picks: Vec<Pick>,
+    /// The probabilities of the wanted rows, when any row asked for them.
+    logprobs: Vec<LogprobOut>,
     has_picks: bool,
     drafts: Vec<u32>,
     draft_ms: f64,
@@ -230,7 +233,8 @@ impl GpuExecutor {
             )));
         }
         let max_rows = model.max_rows();
-        let record_bytes = record::max_bytes(max_rows, config.max_slots);
+        let record_bytes =
+            record::max_bytes(max_rows, config.max_slots, model.logit_rows(), model.vocab());
 
         // Page-locked memory is the host's scarcest kind; it is reserved
         // before it is taken.
@@ -356,6 +360,7 @@ impl Executor for GpuExecutor {
         self.seen = count;
         self.in_flight = false;
         out.picks.clear();
+        out.logprobs.clear();
         out.drafts.clear();
         out.draft_ms = 0.0;
         out.devices.clear();
@@ -382,6 +387,7 @@ impl Executor for GpuExecutor {
             // sampler joins their slices of the vocabulary on the devices).
             if result.has_picks && !have_picks {
                 out.picks.extend_from_slice(&result.picks);
+                out.logprobs.extend_from_slice(&result.logprobs);
                 have_picks = true;
             }
             if !result.drafts.is_empty() {
@@ -443,9 +449,12 @@ impl Drop for GpuExecutor {
 const STOP_PATIENCE: Duration = Duration::from_secs(10);
 
 /// The bytes a device brings back from a step at most: the pick of every
-/// wanted row, and the tokens the model drafted itself.
+/// wanted row, the tokens the model drafted itself, and the probabilities the
+/// wanted rows report.
 fn read_back_bytes(logit_rows: u32, max_rows: u32) -> usize {
-    logit_rows as usize * SamplePick::BYTES + max_rows as usize * 4
+    logit_rows as usize * SamplePick::BYTES
+        + max_rows as usize * 4
+        + logit_rows as usize * LogprobOut::BYTES
 }
 
 // --- the device thread ---------------------------------------------------
@@ -475,6 +484,12 @@ struct Worker {
     sample_scratch: DeviceBuffer,
     sample_exchange: DeviceBuffer,
     sample_out: DeviceBuffer,
+    /// The probabilities the rows report.
+    logprob_out: DeviceBuffer,
+    /// For a part whose logit columns are not in the order of the tokens:
+    /// the column of every token.
+    inverse: Option<DeviceBuffer>,
+    vocab: u32,
     /// The devices that each hold a slice of the vocabulary, and which of
     /// them this is.
     sample_devices: u32,
@@ -494,6 +509,7 @@ struct Worker {
     have_previous: bool,
     clock: Clock,
     picks: Vec<Pick>,
+    logprobs: Vec<LogprobOut>,
     drafts: Vec<u32>,
     draft_ms: f64,
 }
@@ -580,6 +596,7 @@ fn worker_main(init: Init, ready: mpsc::Sender<Result<(), RuntimeError>>) {
                             result.times = times;
                             result.has_picks = produced;
                             std::mem::swap(&mut result.picks, &mut worker.picks);
+                            std::mem::swap(&mut result.logprobs, &mut worker.logprobs);
                             std::mem::swap(&mut result.drafts, &mut worker.drafts);
                             result.draft_ms = worker.draft_ms;
                         }
@@ -628,7 +645,9 @@ impl Worker {
             format!("CUDA{}", device.ordinal()),
             free.saturating_sub(config.vram_headroom),
         );
-        let record_len = record::max_bytes(max_rows, config.max_slots) as u64;
+        let vocab = model.vocab();
+        let record_len =
+            record::max_bytes(max_rows, config.max_slots, model.logit_rows(), vocab) as u64;
         let tables_len = u64::from(config.max_slots) * u64::from(config.table_stride) * 4;
         ledger.reserve("step record (device copy)", record_len)?;
         ledger.reserve("page tables", tables_len)?;
@@ -668,11 +687,29 @@ impl Worker {
         let exchange_bytes =
             u64::from(SamplerKernels::exchange_values(logit_rows, sample_devices)) * 4;
         let out_bytes = u64::from(logit_rows) * SamplePick::BYTES as u64;
-        ledger.reserve("sampler", scratch_bytes + exchange_bytes + out_bytes)?;
+        let logprob_bytes = u64::from(logit_rows) * LogprobOut::BYTES as u64;
+        // A part whose columns are a list of tokens needs the column of each.
+        let columns = part.logit_tokens();
+        let inverse_bytes = if columns == DevicePtr::NULL { 0 } else { u64::from(vocab) * 4 };
+        ledger.reserve(
+            "sampler",
+            scratch_bytes + exchange_bytes + out_bytes + logprob_bytes + inverse_bytes,
+        )?;
         let sampler = SamplerKernels::load(&device)?;
         let sample_scratch = DeviceBuffer::new(&device, scratch_bytes)?;
         // SAFETY: the buffer has the size the sampler asks for.
         unsafe { sampler.clear(&stream, sample_scratch.ptr(), logit_rows)? };
+        let inverse = if columns == DevicePtr::NULL {
+            None
+        } else {
+            let inverse = DeviceBuffer::new(&device, inverse_bytes)?;
+            // SAFETY: the part's list holds a token per column and the table
+            // a column per token.
+            unsafe {
+                sampler.invert(&stream, columns, part.logits_per_row(), inverse.ptr(), vocab)?
+            };
+            Some(inverse)
+        };
         let worker = Self {
             index,
             devices,
@@ -688,6 +725,9 @@ impl Worker {
             sample_scratch,
             sample_exchange: DeviceBuffer::new(&device, exchange_bytes)?,
             sample_out: DeviceBuffer::new(&device, out_bytes)?,
+            logprob_out: DeviceBuffer::new(&device, logprob_bytes)?,
+            inverse,
+            vocab,
             sample_devices,
             sample_rank: if tensor { index as u32 } else { 0 },
             sample_rows: Vec::with_capacity(logit_rows as usize),
@@ -700,6 +740,7 @@ impl Worker {
             next_end: 0,
             have_previous: false,
             picks: Vec::with_capacity(max_rows as usize),
+            logprobs: Vec::with_capacity(logit_rows as usize),
             drafts: Vec::with_capacity(max_rows as usize),
             draft_ms: 0.0,
             device,
@@ -716,6 +757,12 @@ impl Worker {
         unsafe { worker.stream.fill(worker.tables.ptr(), 0, tables_len as usize)? };
         worker.stream.synchronize()?;
         Ok(worker)
+    }
+
+    /// Where the probabilities start in the read-back buffer: after the picks
+    /// and the model's own drafts.
+    fn logprobs_at(&self) -> usize {
+        self.logit_rows as usize * SamplePick::BYTES + self.max_rows as usize * 4
     }
 
     /// Tells the conductor this device has finished the step; the last one to
@@ -799,10 +846,15 @@ impl Worker {
             )));
         }
         let produced = logits.is_some() && picked > 0;
+        let mut wants_logprobs = false;
         if let (Some(logits), true) = (logits, picked > 0) {
             self.sample_rows.clear();
             self.sample_rows.extend((0..picked).map(|i| view.sampler(i)));
+            let plan = SamplePlan::of(&self.sample_rows);
+            wants_logprobs = plan.logprobs();
             let tokens = self.model.logit_tokens();
+            let record = self.record_device.ptr();
+            let (masks, mask_words) = view.masks();
             let batch = SampleBatch {
                 logits: logits.ptr,
                 stride: logits.stride,
@@ -810,9 +862,19 @@ impl Worker {
                 capacity: self.logit_rows,
                 n_local: logits.stride,
                 tokens,
-                first: if tokens == ares_cuda::DevicePtr::NULL { logits.first_token } else { 0 },
-                params: self.record_device.ptr().offset(view.samplers_offset()),
+                first: if tokens == DevicePtr::NULL { logits.first_token } else { 0 },
+                inverse: self.inverse.as_ref().map_or(DevicePtr::NULL, DeviceBuffer::ptr),
+                vocab: self.vocab,
+                params: record.offset(view.samplers_offset()),
+                entries: if view.corrections() > 0 {
+                    record.offset(view.corrections_offset())
+                } else {
+                    DevicePtr::NULL
+                },
+                masks: if masks > 0 { record.offset(view.masks_offset()) } else { DevicePtr::NULL },
+                mask_words,
                 out: self.sample_out.ptr(),
+                logprobs: self.logprob_out.ptr(),
                 scratch: self.sample_scratch.ptr(),
                 exchange: self.sample_exchange.ptr(),
                 devices: self.sample_devices,
@@ -822,20 +884,23 @@ impl Worker {
             self.sample_start.record(stream)?;
             // SAFETY: the model left a row of `stride` logits per wanted row
             // (and a token per column when it has a list); the record on the
-            // device holds a sampler row per wanted row; the sampler's
-            // buffers were sized for `logit_rows` rows.
+            // device holds a sampler row per wanted row, and the corrections
+            // and masks they name; the sampler's buffers were sized for
+            // `logit_rows` rows.
             unsafe {
-                self.sampler.sample(
-                    stream,
-                    &batch,
-                    SamplePlan::of(&self.sample_rows),
-                    |ptr, n| links.sum(rank, ptr, n),
-                )?;
+                self.sampler.sample(stream, &batch, plan, |ptr, n| links.sum(rank, ptr, n))?;
                 stream.copy_to_host(
                     self.back.as_mut_ptr(),
                     self.sample_out.ptr(),
                     picked as usize * SamplePick::BYTES,
                 )?;
+                if wants_logprobs {
+                    stream.copy_to_host(
+                        self.back.as_mut_ptr().add(self.logprobs_at()),
+                        self.logprob_out.ptr(),
+                        picked as usize * LogprobOut::BYTES,
+                    )?;
+                }
             }
         }
         let own = self.model.own_drafts().filter(|own| own.tokens > 0);
@@ -884,6 +949,7 @@ impl Worker {
         };
         let pick_begun = Instant::now();
         self.picks.clear();
+        self.logprobs.clear();
         self.drafts.clear();
         if produced {
             for row in 0..picked as usize {
@@ -897,7 +963,11 @@ impl Worker {
                         pick.status
                     )));
                 }
-                self.picks.push(Pick { token: pick.token, logit: pick.value });
+                self.picks.push(Pick { token: pick.token, logit: pick.value, aux: pick.aux });
+                if wants_logprobs {
+                    let at = self.logprobs_at() + row * LogprobOut::BYTES;
+                    self.logprobs.push(LogprobOut::from_bytes(&self.back[at..]));
+                }
             }
         }
         if let Some(own) = own {

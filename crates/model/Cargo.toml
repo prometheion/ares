@@ -16,6 +16,7 @@ ares-cuda.workspace = true
 ares-gguf.workspace = true
 ares-quant = { path = "../quant" }
 ares-runtime = { path = "../runtime" }
+ares-sampler.workspace = true
 ares-state.workspace = true
 ares-tokenizer.workspace = true
 thiserror.workspace = true

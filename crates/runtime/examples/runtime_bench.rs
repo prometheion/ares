@@ -43,8 +43,7 @@ OPTIONS
   --type NAME           weight type: q4_K, q5_K, q6_K, q8_0, iq4_xs ... (default q4_K)
   --distinct N          distinct layers of weights (default 4)
   --speculation on|off  drafts from the model's own draft block and the lookup in earlier
-                        text (default off: the text does not repeat; only with --fake,
-                        a device part of the synthetic model has no draft block)
+                        text (default off: the text does not repeat)
   --repeating           make the text loop (window 1, epoch 40) so drafts are accepted
   --device-spin US      device threads spin this long for work before parking (default 2000)
   --conductor-spin US   conductor spins this long for the devices before parking (default 100000)
@@ -166,12 +165,6 @@ fn parse() -> Result<Options, String> {
             "--detail" => o.detail = true,
             other => return Err(format!("unknown option '{other}' (see --help)")),
         }
-    }
-    if o.speculation && !o.fake {
-        return Err(
-            "--speculation needs --fake: a device part of the synthetic model has no draft block"
-                .into(),
-        );
     }
     Ok(o)
 }

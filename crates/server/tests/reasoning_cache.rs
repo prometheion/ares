@@ -28,7 +28,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use ares_api::{ChatFormat, EngineError, ModelCard, Prompt, Role};
-use ares_cuda::{Device, Precision, SampleParams, Wait};
+use ares_cuda::{Device, Precision, Wait};
 use ares_gguf::Gguf;
 use ares_model::chat;
 use ares_model::qwen35::device::{Options, Qwen35, Spread};
@@ -36,6 +36,7 @@ use ares_runtime::{
     ContextSpec, DeviceContext, DeviceModel, GpuConfig, GpuExecutor, LinkSpec, Model, ModelError,
     PrefixCache, RequestReport, Runtime, RuntimeConfig, Split,
 };
+use ares_sampler::SampleParams;
 use ares_state::PageLayout;
 use ares_tokenizer::{
     ChatOptions, ChatTemplate, EncodeOptions, Json, Message, ReasoningFormat, Tokenizer,

@@ -499,7 +499,9 @@ impl DeviceModel for Qwen35Device {
                 self.chains.push(DraftChain {
                     segment: i as u32,
                     token: record.row(segment.row0).token,
-                    rows: (0..segment.n_rows - 1).map(|j| record.sampler(wanted + j)).collect(),
+                    rows: (0..segment.n_rows - 1)
+                        .map(|j| record.sampler(wanted + j).for_draft())
+                        .collect(),
                 });
             }
             self.part.draft_step(DraftStep {

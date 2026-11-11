@@ -100,7 +100,7 @@ impl<M: Model> Model for Faulty<M> {
         self.inner.draft_rows()
     }
 
-    fn sampling(&self) -> ares_cuda::SampleParams {
+    fn sampling(&self) -> ares_sampler::SampleParams {
         self.inner.sampling()
     }
 

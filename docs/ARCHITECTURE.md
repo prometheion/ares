@@ -168,7 +168,7 @@ machine (RTX 4070 + RTX 3060, Qwen3.8-27B) or read from the engines listed in
 | `ares-gguf` | Zero-copy GGUF reader (version 3, split files, validation at open), a small writer for tests | Done; tested against synthetic, truncated and corrupted files and real models |
 | `ares-quant` | CPU reference decoder for every GGUF type; the specification and reference codec of the engine's own KV formats (`f16`, `q8` to `q4`, tiles with a mean, the policy of exact cells) | Done; bit-identical to ggml's C code on fixtures generated from it; the KV formats are pinned by golden files and were measured on the K and V of real models |
 | `ares-cuda` | Driver API bound at run time, devices, memory, streams, events, modules, decode weight kernels for all 28 weight types, prefill weight kernels for eleven, the layer kernels of `qwen35`, attention over the stored K/V formats, the mesh that sums across devices over peer access or the host | Device layer, decode, layer and attention kernels done; prefill kernels verified, their pass over the weights 1.3 times as fast as the fork's whole prefill; tested on both GPUs, with and without peer access |
-| `ares-vulkan` | The same device-level surface on Vulkan; decode and prefill weight kernels for all 28 weight types as compute shaders, the prefill ones on cooperative matrices; the layer kernels; attention over the stored K/V formats; the sampler; sums between devices | Device layer and weight, layer, attention and sampler kernels done (23 device, 9 kernel, 8 layer, 4 layout, 9 mesh, 9 attention and 6 sampler tests on both GPUs); no expert or `qwen4exp` kernels and no model yet |
+| `ares-vulkan` | The same device-level surface on Vulkan; decode and prefill weight kernels for all 28 weight types as compute shaders, the prefill ones on cooperative matrices; the layer kernels; attention over the stored K/V formats; sums between devices | Device layer and weight, layer and attention kernels done (23 device, 9 kernel, 8 layer, 4 layout, 9 mesh and 9 attention tests on both GPUs); no sampler (to be rebuilt against `ares-sampler`), no expert or `qwen4exp` kernels and no model yet |
 | `ares-state` | Page pool, page tables with copy on write, the prefix index (pages published as they fill, tails, announcements, priority classes), the checkpoint policy for recurrent state, page layouts | Done as bookkeeping; randomised model checks; the conductor's prefix cache uses them (see `ares-runtime`) |
 | `ares-store` | State on disk: pages and checkpoints by content hash in segment files, per fingerprint, with a size limit | Done as a store of opaque bytes, tested against restarts, the limit and damaged files; not yet connected to devices |
 | `ares-io` | Reads of weights straight from the model file: io_uring with direct I/O, demand before prefetch, cancel and promote, copies of a file on several drives with the reads spread over them, a map from experts to file ranges, row reads behind a cache | Done, tested against real files and on two drives; 1.4 to 1.7 GiB/s of random expert-sized reads per SSD of the development machine and 2.9 to 3.0 GiB/s over both; the expert store and the n-gram rows of `qwen4exp` read through it |
@@ -2197,21 +2197,17 @@ GPU that CUDA 13 does not run on.
   or 138 workgroups, as it did in four earlier runs of the whole table, so it
   is not the plan; it depends on what ran before or where the pools lie, and
   the cause is not found.
-- The sampler exists with the same arithmetic as CUDA's, operation for
-  operation (no fused multiply-add, correctly rounded division, the
-  exponential and logarithm as polynomials, the radix descent for top-k and
-  top-p, the Philox draw), so that a request gets the same tokens on either
-  backend: every record equals the host reference's bit for bit
-  (`ares_cuda::sample_reference`) for vocabularies from one token to Qwen's,
-  four shapes of rows, every combination of the cuts, with a token map, in
-  slices as several devices hold them, and in batches of different sizes
-  sharing one scratch. The pick of Qwen's vocabulary (248320 logits) takes
-  15 / 26 / 71 us for 1 / 4 / 16 greedy rows on the RTX 4070 against CUDA's
-  25 / 65 / 225, and 107 / 168 / 420 us with top-k 20 and top-p 0.95 against
-  107 / 194 / 539 (RTX 3060: 23 / 49 / 154 against 34 / 112 / 360, and
-  150 / 339 / 951 against 148 / 380 / 1118; best of two runs). It has no 64-bit atomic (an
-  optional feature on Vulkan): every chunk writes its best score and one
-  more kernel takes the maximum. Its histograms need 32 KiB of shared memory.
+- The sampler does not exist on Vulkan yet. A mirror of CUDA's first sampler
+  was built (commit `f857acb`: kernels in `shaders/sample_*.comp`, a host
+  side in `crates/vulkan/src/sampler.rs`, an agreement test against the host
+  reference and a benchmark next to CUDA's; it was as fast as CUDA's or
+  faster, and had no 64-bit atomic, which is optional on Vulkan, so every
+  chunk wrote its best score and one more kernel took the maximum). It
+  implemented the definitions that `ares_cuda` held then (`SampleParams`,
+  `sample_reference`), which moved into `ares-sampler` and were rewritten
+  with penalties, DRY, masks, logprobs and more samplers, so the mirror was
+  removed. Vulkan's sampler is to be rebuilt against `ares-sampler`, with
+  that commit as a starting point.
 - The expert and `qwen4exp` kernels and a model on Vulkan do not exist yet.
 - No direct route between the two cards works on this driver: an exported
   allocation is imported by the other card without an error and carries no
@@ -2287,11 +2283,12 @@ Work is paused here until Qwen4 is released; nothing below is in progress.
   between devices, router and experts, the kernels of `qwen4exp`. The CUDA
   tests pass on both cards, the kernel ones also on real tensors.
 - Vulkan has the weight kernels (the same device layouts, byte for byte) and
-  the layer kernels, at CUDA's speed on these cards, the attention kernels
-  over all stored K/V formats and the sampler. Attention is within 20 % of
+  the layer kernels, at CUDA's speed on these cards, and the attention kernels
+  over all stored K/V formats. Attention is within 20 % of
   CUDA's for one row of `f16`, 1.3 to 3.3 times as slow for one row of `q8`
   or `q4` and 2 to 6.5 times for windows of 8 and 64 rows (no tensor cores,
-  items of 16 vectors); the sampler is as fast as CUDA's or faster. It has no
+  items of 16 vectors). It has no sampler (to be rebuilt against
+  `ares-sampler`; commit `f857acb` holds the mirror of CUDA's first one), no
   expert or `qwen4exp` kernels and no model.
 - The KV formats are specified, pinned by golden files and measured on the K
   and V of real models; the CUDA kernels write them bit-exactly and read
@@ -2317,12 +2314,7 @@ Work is paused here until Qwen4 is released; nothing below is in progress.
   that shares only the start of the chat template with an earlier request
   (three tokens) now runs a step of its own to replay them before its rows
   (one more step in the counts of `--engine`, not timed); a model that only
-  runs on Turing has no prefill and no attention path; CUDA's sampler
-  keeps a state of 72 bytes (`AresSampleState`) in 64 bytes per row of its
-  scratch, so for a batch of four or more rows the state of the last rows
-  overlaps the candidate lists of row 0 (a race that shows rarely; found
-  while mirroring the sampler on Vulkan, whose state is 64 bytes, and not
-  reproduced on a device).
+  runs on Turing has no prefill and no attention path.
 - Real model files are test data and stay outside the repository.
 
 ## Next steps
@@ -2357,7 +2349,8 @@ order it would be taken up; the source of each idea is in
    does not change with the draft block or from one load to the next; a row
    of a draft window computed with the bits it has alone, in the recurrent
    and attention layers too, so that drafts cannot change the text.
-6. Vulkan: experts, the `qwen4exp` kernels, and the models; attention for
+6. Vulkan: the sampler against `ares-sampler` (commit `f857acb` is the
+   starting point), experts, the `qwen4exp` kernels, and the models; attention for
    windows of many rows on the cooperative matrices, and a faster decode of
    the `q8` and `q4` rows; a faster upload.
 7. The sampler's penalties and grammars (llguidance), tool calls, the

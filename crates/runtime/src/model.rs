@@ -10,7 +10,8 @@
 
 use ares_api::{ChatFormat, EngineError, ModelCard, Prompt};
 use ares_core::Ledger;
-use ares_cuda::{Device, DevicePtr, Event, Kernels, SampleParams, Stream};
+use ares_cuda::{Device, DevicePtr, Event, Kernels, Stream};
+use ares_sampler::SampleParams;
 use ares_state::PageLayout;
 
 use crate::exec::Pick;

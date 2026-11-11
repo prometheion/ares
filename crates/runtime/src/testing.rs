@@ -142,10 +142,12 @@ impl HostExecutor {
     /// An executor for `model`, which sizes the record for `max_rows` rows and
     /// `max_slots` sequences.
     pub fn new(model: Arc<SyntheticModel>, max_rows: u32, max_slots: u32) -> Self {
+        let record_bytes =
+            crate::record::max_bytes(max_rows, max_slots, model.logit_rows(), model.vocab());
         Self {
             model,
             devices: 1,
-            record: vec![0; crate::record::max_bytes(max_rows, max_slots)],
+            record: vec![0; record_bytes],
             picks: Vec::new(),
             delay: Duration::ZERO,
             step_cost: None,
@@ -327,7 +329,7 @@ impl Executor for HostExecutor {
                     for row in first..first + count {
                         let row = view.row(row);
                         let (token, logit) = self.model.host_pick(row.token, row.context);
-                        self.picks.push(Pick { token, logit });
+                        self.picks.push(Pick { token, logit, aux: 0.0 });
                     }
                 }
             }
@@ -711,7 +713,7 @@ impl Oracle {
             let (first, count) = view.run(i);
             for row in first..first + count {
                 let (token, logit) = results[row as usize];
-                picks.push(Pick { token, logit });
+                picks.push(Pick { token, logit, aux: 0.0 });
             }
         }
     }

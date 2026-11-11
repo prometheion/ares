@@ -36,7 +36,7 @@ use ares_api::{
     Engine as _, EngineError, Event, EventSink, FinishReason, GenerateRequest, Message, ModelCard,
     Prompt, RequestId, Role, Sampling, Usage,
 };
-use ares_cuda::{Device, Precision, SampleParams, Wait, device_count};
+use ares_cuda::{Device, Precision, Wait, device_count};
 use ares_gguf::Gguf;
 use ares_model::qwen35::device::{Options, Qwen35, Rows, Session, Spread, Wanted};
 use ares_runtime::{
@@ -44,6 +44,7 @@ use ares_runtime::{
     LinkSpec, Model, ModelError, Pick, PrefixCache, Runtime, RuntimeConfig, Snapshot, Split,
     StepMeta, StepOutput, WakeCounts, Woke,
 };
+use ares_sampler::SampleParams;
 use ares_state::PageLayout;
 use ares_tokenizer::ChatOptions;
 
@@ -291,6 +292,7 @@ impl Rig {
         let text = Arc::new(Mutex::new(String::new()));
         let sink = EventSink::new(move |event| {
             match event {
+                Event::Logprobs(_) => {}
                 Event::Text(piece) => text.lock().unwrap().push_str(&piece),
                 Event::Done { finish, usage } => {
                     let text = std::mem::take(&mut *text.lock().unwrap());

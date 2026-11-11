@@ -11,7 +11,10 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use ares_api::{GenerateRequest, Json, Message, Prompt, RequestId, Role, Sampling, Usage};
+use ares_api::{
+    BiasKey, GenerateRequest, Json, LogitBias, LogprobRequest, Message, Prompt, RequestId, Role,
+    SamplerKind, Sampling, TOP_LOGPROBS_MAX, TokenProbs, Usage,
+};
 use serde::Serialize;
 
 use crate::bridge::Timings;
@@ -36,6 +39,21 @@ impl Endpoint {
     }
 }
 
+/// How the probabilities a request asked for are written in the answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LogprobFormat {
+    /// `choices[].logprobs.content[]` with `logprob` and `top_logprobs`
+    /// (OpenAI's chat format, which llama.cpp's server writes with a token
+    /// `id` added).
+    Content,
+    /// The same with `prob` and `top_probs`: llama.cpp's
+    /// `post_sampling_probs`.
+    ContentProbs,
+    /// OpenAI's completions format: `tokens`, `token_logprobs`,
+    /// `top_logprobs` and `text_offset`.
+    Legacy,
+}
+
 /// A request body, understood.
 #[derive(Debug)]
 pub(crate) struct Parsed {
@@ -45,7 +63,13 @@ pub(crate) struct Parsed {
     /// What a chat request says about thinking: the variables of the chat
     /// template are not in `request` yet.
     pub reasoning: Asked,
+    /// How many completions to make of the prompt.
+    pub n: u32,
+    pub logprobs: Option<LogprobFormat>,
 }
+
+/// The most completions one request may ask for.
+pub(crate) const N_MAX: u32 = 16;
 
 /// Parses and checks the body of a completion request.
 pub(crate) fn parse(endpoint: Endpoint, body: &[u8], id: RequestId) -> Result<Parsed, ApiError> {
@@ -76,8 +100,10 @@ const SERVED: &[&str] = &[
     "stream",
     "stream_options",
     "max_tokens",
+    "n_predict",
     "stop",
     "n",
+    "n_cmpl",
     "temperature",
     "top_k",
     "top_p",
@@ -87,6 +113,31 @@ const SERVED: &[&str] = &[
     "presence_penalty",
     "frequency_penalty",
     "repeat_penalty",
+    "repetition_penalty",
+    "repeat_last_n",
+    "typical_p",
+    "typical",
+    "top_n_sigma",
+    "xtc_probability",
+    "xtc_threshold",
+    "dynatemp_range",
+    "dynatemp_exponent",
+    "mirostat",
+    "mirostat_tau",
+    "mirostat_eta",
+    "dry_multiplier",
+    "dry_base",
+    "dry_allowed_length",
+    "dry_penalty_last_n",
+    "dry_sequence_breakers",
+    "logit_bias",
+    "ignore_eos",
+    "samplers",
+    "logprobs",
+    "top_logprobs",
+    "n_probs",
+    "post_sampling_probs",
+    "min_keep",
 ];
 
 /// Fields that carry no instruction for the generation: bookkeeping of the
@@ -134,9 +185,6 @@ fn unserved(name: &str, value: &Json) -> Option<&'static str> {
     let structured = "structured output (grammars, JSON schemas) is not built";
     let tools = "tool calls are not built";
     let off = match name {
-        "logit_bias" => matches!(value, Json::Object(members) if members.is_empty()),
-        "logprobs" => matches!(value, Json::Bool(false)),
-        "top_logprobs" => number(0.0),
         "best_of" => number(1.0),
         "echo" => matches!(value, Json::Bool(false)),
         "response_format" => value.get("type").and_then(Json::as_str) == Some("text"),
@@ -150,19 +198,20 @@ fn unserved(name: &str, value: &Json) -> Option<&'static str> {
         return None;
     }
     Some(match name {
-        "logit_bias" => "the sampler has no logit bias",
-        "logprobs" | "top_logprobs" => "token probabilities are not returned",
-        "best_of" => "this server returns one completion per request",
+        "best_of" => {
+            "this server returns the completions of a prompt as n, not the best of several"
+        }
+        "adaptive_target" | "adaptive_decay" => {
+            "adaptive-p is not served: like mirostat it follows the probability of each token it \
+             picks, and unlike mirostat it has no draw that the sampler can do without drafts"
+        }
         "echo" | "suffix" => "the completion is returned on its own",
         "response_format" | "grammar" | "json_schema" => structured,
         "tool_choice" | "parallel_tool_calls" | "functions" | "function_call" => tools,
         name if reasoning::FIELDS.contains(&name) => {
             "thinking belongs to chat requests: /v1/completions has no chat template"
         }
-        _ => {
-            "it is not a parameter of this server, which samples with temperature, top_k, \
-             top_p, min_p and seed"
-        }
+        _ => "it is not a parameter of this server",
     })
 }
 
@@ -181,16 +230,9 @@ fn from_json(endpoint: Endpoint, json: &Json, id: RequestId) -> Result<Parsed, A
         Endpoint::Completions => text_prompt(&fields)?,
     };
 
-    if let Some(n) = fields.int("n")?
-        && n != 1
-    {
-        return Err(ApiError::invalid_param(
-            "n",
-            format!("n must be 1, got {n}: this server returns one completion per request"),
-        ));
-    }
-
-    let sampling = sampling(&fields)?;
+    let n = completions(&fields)?;
+    let (logprobs, format) = logprobs(endpoint, &fields)?;
+    let sampling = Sampling { logprobs, ..sampling(&fields)? };
     sampling.validate().map_err(|e| ApiError::invalid_param(e.field, e.to_string()))?;
     refuse_unserved(endpoint, &fields)?;
 
@@ -217,7 +259,105 @@ fn from_json(endpoint: Endpoint, json: &Json, id: RequestId) -> Result<Parsed, A
         stream: fields.bool("stream")?.unwrap_or(false),
         include_usage,
         reasoning,
+        n,
+        logprobs: format,
     })
+}
+
+/// How many completions the request asks for: `n` of OpenAI or llama.cpp's
+/// `n_cmpl`.
+fn completions(fields: &Fields<'_>) -> Result<u32, ApiError> {
+    let (name, n) = match (fields.int("n_cmpl")?, fields.int("n")?) {
+        (Some(n), _) => ("n_cmpl", n),
+        (None, Some(n)) => ("n", n),
+        (None, None) => return Ok(1),
+    };
+    u32::try_from(n).ok().filter(|n| (1..=N_MAX).contains(n)).ok_or_else(|| {
+        ApiError::invalid_param(name, format!("{name} must be between 1 and {N_MAX}, got {n}"))
+    })
+}
+
+/// The probabilities a request asks for, and the format of the answer.
+///
+/// OpenAI's chat `logprobs: true` with `top_logprobs`, its completions
+/// `logprobs: n`, and llama.cpp's `n_probs` (which wins when both are there,
+/// as it does in llama-server) with `post_sampling_probs`. The probabilities
+/// are the model's own unless `post_sampling_probs` says they belong to the
+/// distribution the token is drawn from.
+fn logprobs(
+    endpoint: Endpoint,
+    fields: &Fields<'_>,
+) -> Result<(Option<LogprobRequest>, Option<LogprobFormat>), ApiError> {
+    let post = fields.bool("post_sampling_probs")?.unwrap_or(false);
+    let top = |name: &str, value: i64| {
+        u32::try_from(value).ok().filter(|top| *top <= TOP_LOGPROBS_MAX).ok_or_else(|| {
+            ApiError::invalid_param(
+                name,
+                format!("{name} must be between 0 and {TOP_LOGPROBS_MAX}, got {value}"),
+            )
+        })
+    };
+    // llama.cpp's n_probs: 0 asks for nothing.
+    if let Some(n) = fields.int("n_probs")? {
+        if n == 0 {
+            if post {
+                return Err(ApiError::invalid_param(
+                    "post_sampling_probs",
+                    "post_sampling_probs needs n_probs to be greater than 0",
+                ));
+            }
+            return Ok((None, None));
+        }
+        let format = if post { LogprobFormat::ContentProbs } else { LogprobFormat::Content };
+        return Ok((
+            Some(LogprobRequest { top: top("n_probs", n)?, after_chain: post }),
+            Some(format),
+        ));
+    }
+    if post {
+        return Err(ApiError::invalid_param(
+            "post_sampling_probs",
+            "post_sampling_probs needs n_probs to be greater than 0",
+        ));
+    }
+    match (endpoint, fields.get("logprobs")) {
+        (_, None) => {
+            if fields.get("top_logprobs").is_some() {
+                return Err(ApiError::invalid_param(
+                    "top_logprobs",
+                    "top_logprobs requires logprobs to be set to true",
+                ));
+            }
+            Ok((None, None))
+        }
+        (Endpoint::Chat, Some(Json::Bool(false))) => {
+            if fields.get("top_logprobs").is_some() {
+                return Err(ApiError::invalid_param(
+                    "top_logprobs",
+                    "top_logprobs requires logprobs to be set to true",
+                ));
+            }
+            Ok((None, None))
+        }
+        (Endpoint::Chat, Some(Json::Bool(true))) => {
+            let n = fields.int("top_logprobs")?.unwrap_or(0);
+            let request = LogprobRequest { top: top("top_logprobs", n)?, after_chain: false };
+            Ok((Some(request), Some(LogprobFormat::Content)))
+        }
+        (Endpoint::Chat, Some(other)) => Err(wrong_type("logprobs", "a boolean", other)),
+        (Endpoint::Completions, Some(_)) => {
+            if fields.get("top_logprobs").is_some() {
+                return Err(ApiError::invalid_param(
+                    "top_logprobs",
+                    "top_logprobs belongs to the chat endpoint; /v1/completions takes the \
+                     number in logprobs",
+                ));
+            }
+            let n = fields.int("logprobs")?.expect("present");
+            let request = LogprobRequest { top: top("logprobs", n)?, after_chain: false };
+            Ok((Some(request), Some(LogprobFormat::Legacy)))
+        }
+    }
 }
 
 /// The members of a JSON object, with typed access that names the field in
@@ -273,6 +413,55 @@ impl<'a> Fields<'a> {
     fn f32(&self, name: &str) -> Result<Option<f32>, ApiError> {
         Ok(self.float(name)?.map(|v| v as f32))
     }
+
+    /// An `f32` parameter that goes by several names (llama.cpp's and
+    /// another engine's): the first one given, and a request that gives two
+    /// with different values is refused.
+    fn f32_alias(&self, names: &[&str]) -> Result<Option<f32>, ApiError> {
+        let mut found: Option<(&str, f32)> = None;
+        for name in names {
+            if let Some(value) = self.f32(name)? {
+                match found {
+                    Some((first, other)) if other != value => {
+                        return Err(ApiError::invalid_param(
+                            *name,
+                            format!("{first} and {name} are the same parameter and differ"),
+                        ));
+                    }
+                    Some(_) => {}
+                    None => found = Some((name, value)),
+                }
+            }
+        }
+        Ok(found.map(|(_, value)| value))
+    }
+
+    /// A whole number of at least 0.
+    fn uint(&self, name: &str) -> Result<Option<u32>, ApiError> {
+        match self.int(name)? {
+            None => Ok(None),
+            Some(n) => u32::try_from(n).map(Some).map_err(|_| {
+                ApiError::invalid_param(name, format!("{name} must be at least 0, got {n}"))
+            }),
+        }
+    }
+
+    /// The number of tokens of history a penalty looks at. llama.cpp writes
+    /// "the whole context" as -1, which this server does not serve.
+    fn window(&self, name: &str) -> Result<Option<u32>, ApiError> {
+        match self.int(name)? {
+            None => Ok(None),
+            Some(n) if n < 0 => Err(ApiError::invalid_param(
+                name,
+                format!(
+                    "{name} must be between 0 and {}, got {n}: the history the penalties look \
+                     at is bounded, and the whole context is not served",
+                    ares_api::PENALTY_WINDOW_MAX
+                ),
+            )),
+            Some(n) => Ok(Some(u32::try_from(n).unwrap_or(u32::MAX))),
+        }
+    }
 }
 
 pub(crate) fn wrong_type(name: &str, expected: &str, got: &Json) -> ApiError {
@@ -284,6 +473,19 @@ pub(crate) fn expect_str<'a>(name: &str, value: &'a Json) -> Result<&'a str, Api
 }
 
 fn sampling(fields: &Fields<'_>) -> Result<Sampling, ApiError> {
+    let min_keep = fields.int("min_keep")?;
+    if let Some(n) = min_keep
+        && n > 1
+    {
+        return Err(ApiError::invalid_param(
+            "min_keep",
+            format!(
+                "min_keep must be 0 or 1, got {n}: every cut keeps the most probable token, and \
+                 keeping more would take a count of the tokens a cut left, which the cuts do not \
+                 make"
+            ),
+        ));
+    }
     Ok(Sampling {
         temperature: fields.f32("temperature")?,
         // llama.cpp and vLLM write "no top-k" as 0 or -1.
@@ -292,9 +494,179 @@ fn sampling(fields: &Fields<'_>) -> Result<Sampling, ApiError> {
         min_p: fields.f32("min_p")?,
         presence_penalty: fields.f32("presence_penalty")?,
         frequency_penalty: fields.f32("frequency_penalty")?,
-        repeat_penalty: fields.f32("repeat_penalty")?,
+        repeat_penalty: fields.f32_alias(&["repeat_penalty", "repetition_penalty"])?,
+        repeat_last_n: fields.window("repeat_last_n")?,
+        typical_p: fields.f32_alias(&["typical_p", "typical"])?,
+        top_n_sigma: fields.f32("top_n_sigma")?,
+        xtc_probability: fields.f32("xtc_probability")?,
+        xtc_threshold: fields.f32("xtc_threshold")?,
+        dynatemp_range: fields.f32("dynatemp_range")?,
+        dynatemp_exponent: fields.f32("dynatemp_exponent")?,
+        mirostat: fields
+            .int("mirostat")?
+            .map(|m| {
+                u8::try_from(m).ok().filter(|m| *m <= 2).ok_or_else(|| {
+                    ApiError::invalid_param(
+                        "mirostat",
+                        format!("mirostat must be 0, 1 or 2, got {m}"),
+                    )
+                })
+            })
+            .transpose()?,
+        mirostat_tau: fields.f32("mirostat_tau")?,
+        mirostat_eta: fields.f32("mirostat_eta")?,
+        dry_multiplier: fields.f32("dry_multiplier")?,
+        dry_base: fields.f32("dry_base")?,
+        dry_allowed_length: fields.uint("dry_allowed_length")?,
+        dry_penalty_last_n: fields.window("dry_penalty_last_n")?,
+        dry_sequence_breakers: breakers(fields)?,
+        logit_bias: logit_bias(fields)?,
+        ignore_eos: fields.bool("ignore_eos")?.unwrap_or(false),
+        samplers: samplers(fields)?,
+        logprobs: None,
         seed: seed(fields)?,
     })
+}
+
+/// DRY's sequence breakers: an array of strings.
+fn breakers(fields: &Fields<'_>) -> Result<Option<Vec<String>>, ApiError> {
+    match fields.get("dry_sequence_breakers") {
+        None => Ok(None),
+        Some(Json::Array(items)) => items
+            .iter()
+            .map(|item| match item {
+                Json::String(s) => Ok(s.clone()),
+                other => Err(ApiError::invalid_param(
+                    "dry_sequence_breakers",
+                    format!("dry_sequence_breakers must hold strings, found {}", other.kind()),
+                )),
+            })
+            .collect::<Result<_, _>>()
+            .map(Some),
+        Some(other) => Err(wrong_type("dry_sequence_breakers", "an array of strings", other)),
+    }
+}
+
+/// The logit bias, in OpenAI's form (an object from a token to a bias) or in
+/// llama.cpp's (a list of `[token, bias]`), where a token is a number, or a
+/// string of which every token gets the bias, and a bias is a number, or
+/// `false` for a token that must never be picked.
+fn logit_bias(fields: &Fields<'_>) -> Result<Vec<LogitBias>, ApiError> {
+    let bias = |at: &str, value: &Json| -> Result<Option<f32>, ApiError> {
+        match value {
+            Json::Bool(false) => Ok(None),
+            Json::Int(i) => Ok(Some(*i as f32)),
+            Json::Uint(u) => Ok(Some(*u as f32)),
+            Json::Float(f) => Ok(Some(*f as f32)),
+            other => Err(ApiError::invalid_param(
+                "logit_bias",
+                format!("{at}: a bias is a number or false, got {}", other.kind()),
+            )),
+        }
+    };
+    match fields.get("logit_bias") {
+        None => Ok(Vec::new()),
+        Some(Json::Array(items)) => items
+            .iter()
+            .enumerate()
+            .map(|(i, item)| {
+                let at = format!("logit_bias[{i}]");
+                let Json::Array(pair) = item else {
+                    return Err(ApiError::invalid_param(
+                        "logit_bias",
+                        format!("{at} must be [token, bias], got {}", item.kind()),
+                    ));
+                };
+                let [key, value] = pair.as_slice() else {
+                    return Err(ApiError::invalid_param(
+                        "logit_bias",
+                        format!("{at} must be [token, bias]"),
+                    ));
+                };
+                let key = match key {
+                    Json::Int(t) if *t >= 0 => {
+                        BiasKey::Token(u32::try_from(*t).unwrap_or(u32::MAX))
+                    }
+                    Json::Uint(t) => BiasKey::Token(u32::try_from(*t).unwrap_or(u32::MAX)),
+                    Json::String(text) => BiasKey::Text(text.clone()),
+                    other => {
+                        return Err(ApiError::invalid_param(
+                            "logit_bias",
+                            format!(
+                                "{at}: the token is a non-negative number or a string, got {}",
+                                other.kind()
+                            ),
+                        ));
+                    }
+                };
+                Ok(LogitBias { key, bias: bias(&at, value)? })
+            })
+            .collect(),
+        Some(Json::Object(members)) => members
+            .iter()
+            .map(|(name, value)| {
+                // A key that is a number is a token; any other is a text.
+                let key = match name.parse::<u32>() {
+                    Ok(token) => BiasKey::Token(token),
+                    Err(_) => BiasKey::Text(name.clone()),
+                };
+                Ok(LogitBias { key, bias: bias(&format!("logit_bias[\"{name}\"]"), value)? })
+            })
+            .collect(),
+        Some(other) => Err(wrong_type("logit_bias", "an object or a list of pairs", other)),
+    }
+}
+
+/// llama.cpp's `samplers`: the names in the order they apply in, or a string
+/// of their letters.
+fn samplers(fields: &Fields<'_>) -> Result<Option<Vec<SamplerKind>>, ApiError> {
+    let refuse = |what: &str| {
+        ApiError::invalid_param(
+            "samplers",
+            format!(
+                "samplers: {what} is not served (infill completes code around a gap; \
+                 adaptive_p follows the probability of each token it picks)"
+            ),
+        )
+    };
+    match fields.get("samplers") {
+        None => Ok(None),
+        Some(Json::Array(items)) => items
+            .iter()
+            .map(|item| {
+                let Json::String(name) = item else {
+                    return Err(ApiError::invalid_param(
+                        "samplers",
+                        format!("samplers must hold strings, found {}", item.kind()),
+                    ));
+                };
+                SamplerKind::from_name(name).ok_or_else(|| match name.as_str() {
+                    "infill" | "adaptive_p" => refuse(name),
+                    _ => ApiError::invalid_param(
+                        "samplers",
+                        format!("samplers: '{name}' is not the name of a sampler"),
+                    ),
+                })
+            })
+            .collect::<Result<_, _>>()
+            .map(Some),
+        Some(Json::String(letters)) => letters
+            .chars()
+            .map(|letter| {
+                SamplerKind::from_letter(letter).ok_or_else(|| match letter {
+                    'i' | 'a' => refuse(&letter.to_string()),
+                    _ => ApiError::invalid_param(
+                        "samplers",
+                        format!("samplers: '{letter}' is not the letter of a sampler"),
+                    ),
+                })
+            })
+            .collect::<Result<_, _>>()
+            .map(Some),
+        Some(other) => {
+            Err(wrong_type("samplers", "an array of names or a string of letters", other))
+        }
+    }
 }
 
 fn seed(fields: &Fields<'_>) -> Result<Option<u64>, ApiError> {
@@ -306,8 +678,10 @@ fn seed(fields: &Fields<'_>) -> Result<Option<u64>, ApiError> {
 }
 
 fn max_tokens(fields: &Fields<'_>, endpoint: Endpoint) -> Result<Option<u32>, ApiError> {
-    // `max_completion_tokens` replaces `max_tokens` on the chat endpoint.
+    // llama.cpp's `n_predict` is the same limit; `max_completion_tokens`
+    // replaces `max_tokens` on the chat endpoint.
     let (name, value) = match endpoint {
+        _ if fields.get("n_predict").is_some() => ("n_predict", fields.int("n_predict")?),
         Endpoint::Chat if fields.get("max_completion_tokens").is_some() => {
             ("max_completion_tokens", fields.int("max_completion_tokens")?)
         }
@@ -500,6 +874,10 @@ pub(crate) struct Head {
     pub id: String,
     pub created: u64,
     pub model: String,
+    /// How the probabilities are written, when the request asked for them.
+    pub logprobs: Option<LogprobFormat>,
+    /// The completion this head belongs to, of the `n` of the request.
+    pub index: u32,
 }
 
 impl Head {
@@ -509,7 +887,14 @@ impl Head {
             id: format!("{}-{id}", endpoint.id_prefix()),
             created: unix_time(),
             model: model.to_owned(),
+            logprobs: None,
+            index: 0,
         }
+    }
+
+    /// The same head for the completion `index`.
+    pub fn choice(&self, index: u32) -> Self {
+        Self { index, ..self.clone() }
     }
 
     fn object(&self, streaming: bool) -> &'static str {
@@ -520,17 +905,17 @@ impl Head {
         }
     }
 
-    /// The whole answer of a non-streaming request.
-    pub fn complete(
+    /// One completion of a non-streaming request.
+    pub fn complete_choice<'a>(
         &self,
-        text: &Split,
+        text: &'a Split,
         finish: &'static str,
-        usage: Usage,
-        timings: Timings,
-    ) -> String {
-        let choice = match self.endpoint {
+        probs: &[TokenProbs],
+    ) -> Choice<'a> {
+        let logprobs = self.logprobs_value(probs, 0);
+        match self.endpoint {
             Endpoint::Chat => Choice {
-                index: 0,
+                index: self.index,
                 message: Some(FullMessage {
                     role: "assistant",
                     content: &text.content,
@@ -538,29 +923,59 @@ impl Head {
                 }),
                 text: None,
                 delta: None,
+                logprobs,
                 finish_reason: Some(finish),
             },
             Endpoint::Completions => Choice {
-                index: 0,
+                index: self.index,
                 message: None,
                 text: Some(&text.content),
                 delta: None,
+                logprobs,
                 finish_reason: Some(finish),
             },
+        }
+    }
+
+    /// The whole answer of a non-streaming request.
+    pub fn complete(&self, choices: Vec<Choice<'_>>, usage: Usage, timings: Timings) -> String {
+        self.render(false, choices, Some(usage), Some(timings))
+    }
+
+    /// The probabilities of tokens, as a chunk of a stream. `offset` is how
+    /// many characters of the text have gone out before them.
+    pub fn probs_chunk(&self, probs: &[TokenProbs], offset: usize) -> String {
+        let mut choice = match self.endpoint {
+            Endpoint::Chat => self.chunk_choice(Some(Delta::default()), None, None),
+            Endpoint::Completions => self.chunk_choice(None, Some(""), None),
         };
-        self.render(false, vec![choice], Some(usage), Some(timings))
+        choice.logprobs = self.logprobs_value(probs, offset);
+        self.render(true, vec![choice], None, None)
+    }
+
+    fn logprobs_value(&self, probs: &[TokenProbs], offset: usize) -> Option<serde_json::Value> {
+        self.logprobs.map(|format| render_logprobs(format, probs, offset))
+    }
+
+    fn chunk_choice<'a>(
+        &self,
+        delta: Option<Delta<'a>>,
+        text: Option<&'a str>,
+        finish_reason: Option<&'static str>,
+    ) -> Choice<'a> {
+        Choice { index: self.index, message: None, text, delta, logprobs: None, finish_reason }
     }
 
     /// The first chunk of a chat stream: it announces the role.
     pub fn role_chunk(&self) -> String {
         let delta = Delta { role: Some("assistant"), content: Some(""), reasoning_content: None };
-        self.render(true, vec![chunk_choice(Some(delta), None, None)], None, None)
+        self.render(true, vec![self.chunk_choice(Some(delta), None, None)], None, None)
     }
 
     /// A piece of output text.
     pub fn text_chunk(&self, text: &Split) -> String {
         let choice = match self.endpoint {
-            Endpoint::Chat => chunk_choice(
+            Endpoint::Chat => self.chunk_choice(
                 Some(Delta {
                     role: None,
                     content: non_empty(&text.content),
@@ -569,7 +984,7 @@ impl Head {
                 None,
                 None,
             ),
-            Endpoint::Completions => chunk_choice(None, Some(&text.content), None),
+            Endpoint::Completions => self.chunk_choice(None, Some(&text.content), None),
         };
         self.render(true, vec![choice], None, None)
     }
@@ -578,8 +993,8 @@ impl Head {
     /// no content.
     pub fn finish_chunk(&self, finish: &'static str, timings: Timings) -> String {
         let choice = match self.endpoint {
-            Endpoint::Chat => chunk_choice(Some(Delta::default()), None, Some(finish)),
-            Endpoint::Completions => chunk_choice(None, Some(""), Some(finish)),
+            Endpoint::Chat => self.chunk_choice(Some(Delta::default()), None, Some(finish)),
+            Endpoint::Completions => self.chunk_choice(None, Some(""), Some(finish)),
         };
         self.render(true, vec![choice], None, Some(timings))
     }
@@ -610,12 +1025,77 @@ impl Head {
     }
 }
 
-fn chunk_choice<'a>(
-    delta: Option<Delta<'a>>,
-    text: Option<&'a str>,
-    finish_reason: Option<&'static str>,
-) -> Choice<'a> {
-    Choice { index: 0, message: None, text, delta, finish_reason }
+/// The text of a token's bytes. A token that is part of a character prints as
+/// replacement characters, and its `bytes` say what it is.
+fn token_text(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+/// The probabilities of `probs` as the format says. `offset` is the number of
+/// characters of the completion before them (for the completions format).
+fn render_logprobs(
+    format: LogprobFormat,
+    probs: &[TokenProbs],
+    offset: usize,
+) -> serde_json::Value {
+    use serde_json::{Value, json};
+    let post = format == LogprobFormat::ContentProbs;
+    // llama.cpp writes a probability under `prob` after the chain and a
+    // logarithm under `logprob` before it.
+    let measure = |logprob: f32| -> (&'static str, f64) {
+        if post { ("prob", f64::from(logprob).exp()) } else { ("logprob", f64::from(logprob)) }
+    };
+    match format {
+        LogprobFormat::Content | LogprobFormat::ContentProbs => {
+            let content: Vec<Value> = probs
+                .iter()
+                .map(|p| {
+                    let alternatives: Vec<Value> = p
+                        .alternatives
+                        .iter()
+                        .map(|a| {
+                            let (key, value) = measure(a.logprob);
+                            json!({ "id": a.token, "token": token_text(&a.bytes), "bytes": a.bytes, key: value })
+                        })
+                        .collect();
+                    let (key, value) = measure(p.logprob);
+                    let list = if post { "top_probs" } else { "top_logprobs" };
+                    json!({
+                        "id": p.token,
+                        "token": token_text(&p.bytes),
+                        "bytes": p.bytes,
+                        key: value,
+                        list: alternatives,
+                    })
+                })
+                .collect();
+            json!({ "content": content })
+        }
+        LogprobFormat::Legacy => {
+            let mut at = offset;
+            let mut offsets = Vec::with_capacity(probs.len());
+            for p in probs {
+                offsets.push(at);
+                at += token_text(&p.bytes).chars().count();
+            }
+            let top: Vec<Value> = probs
+                .iter()
+                .map(|p| {
+                    let mut map = serde_json::Map::new();
+                    for a in &p.alternatives {
+                        map.insert(token_text(&a.bytes), json!(a.logprob));
+                    }
+                    Value::Object(map)
+                })
+                .collect();
+            json!({
+                "tokens": probs.iter().map(|p| token_text(&p.bytes)).collect::<Vec<_>>(),
+                "token_logprobs": probs.iter().map(|p| p.logprob).collect::<Vec<_>>(),
+                "top_logprobs": top,
+                "text_offset": offsets,
+            })
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -676,7 +1156,7 @@ impl From<Timings> for TimingsBody {
 }
 
 #[derive(Serialize)]
-struct Choice<'a> {
+pub(crate) struct Choice<'a> {
     index: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     message: Option<FullMessage<'a>>,
@@ -684,6 +1164,8 @@ struct Choice<'a> {
     delta: Option<Delta<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     text: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    logprobs: Option<serde_json::Value>,
     finish_reason: Option<&'static str>,
 }
 

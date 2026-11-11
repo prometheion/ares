@@ -10,9 +10,9 @@ use std::time::{Duration, Instant};
 
 use ares_api::{
     Engine, EngineError, Event, EventSink, FinishReason, GenerateRequest, Prompt, RequestId,
-    Sampling, Usage,
+    Sampling, TokenProbs, Usage,
 };
-use ares_runtime::{Runtime, Snapshot};
+use ares_runtime::{Runtime, Snapshot, TokenFilter};
 
 /// How long a test waits for the engine before it fails, so that a broken
 /// engine ends a test instead of hanging it.
@@ -59,11 +59,13 @@ pub fn request(prompt: &str, max_tokens: Option<u32>) -> GenerateRequest {
 }
 
 /// What a request produced.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Run {
     pub text: String,
     pub finish: FinishReason,
     pub usage: Usage,
+    /// The probabilities reported with the text, in order.
+    pub probs: Vec<TokenProbs>,
 }
 
 /// The receiving end of a request.
@@ -80,12 +82,17 @@ impl Handle {
     pub fn finish(self) -> Run {
         let deadline = Instant::now() + LIMIT;
         let mut text = String::new();
+        let mut probs = Vec::new();
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
             match self.rx.recv_timeout(left) {
                 Ok(Event::Text(piece)) => {
                     assert!(!piece.is_empty(), "an empty text event");
                     text.push_str(&piece);
+                }
+                Ok(Event::Logprobs(more)) => {
+                    assert!(!more.is_empty(), "an empty event of probabilities");
+                    probs.extend(more);
                 }
                 Ok(Event::Done { finish, usage }) => {
                     // The sink is closed after the terminal event, so the
@@ -94,7 +101,7 @@ impl Handle {
                         self.rx.recv_timeout(Duration::from_millis(50)).is_err(),
                         "events after the terminal one"
                     );
-                    return Run { text, finish, usage };
+                    return Run { text, finish, usage, probs };
                 }
                 Ok(Event::Error(error)) => panic!("request {} failed: {error}", self.id),
                 Err(_) => panic!("request {} did not end within {LIMIT:?}", self.id),
@@ -108,7 +115,7 @@ impl Handle {
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
             match self.rx.recv_timeout(left) {
-                Ok(Event::Text(_)) => {}
+                Ok(Event::Text(_) | Event::Logprobs(_)) => {}
                 Ok(Event::Done { .. }) => panic!("request {} did not fail", self.id),
                 Ok(Event::Error(error)) => return error,
                 Err(_) => panic!("request {} did not end within {LIMIT:?}", self.id),
@@ -135,6 +142,22 @@ pub fn start(rt: &Runtime, request: GenerateRequest) -> Result<Handle, EngineErr
     let id = request.id;
     let (tx, rx) = mpsc::channel();
     rt.submit(request, EventSink::new(move |event| tx.send(event).is_ok()))?;
+    Ok(Handle { id, rx })
+}
+
+/// Starts a request whose picks `filter` restricts.
+pub fn start_filtered(
+    rt: &Runtime,
+    request: GenerateRequest,
+    filter: impl TokenFilter + 'static,
+) -> Result<Handle, EngineError> {
+    let id = request.id;
+    let (tx, rx) = mpsc::channel();
+    rt.submit_filtered(
+        request,
+        EventSink::new(move |event| tx.send(event).is_ok()),
+        Box::new(filter),
+    )?;
     Ok(Handle { id, rx })
 }
 
@@ -520,6 +543,7 @@ pub fn the_end_token_ends_a_request_where_it_first_comes_up(make: &dyn Fn(Option
                     .collect::<Vec<_>>(),
             ),
         },
+        probs: Vec::new(),
     };
     assert_eq!(alone(&rt, prompt, Some(60)), expected);
     let handles: Vec<Handle> =

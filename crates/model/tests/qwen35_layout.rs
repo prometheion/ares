@@ -651,6 +651,7 @@ fn ask(runtime: &Runtime, id: u64, question: &str, sampling: Sampling, max_token
         EventSink::new(move |event| {
             match event {
                 Event::Text(piece) => text.lock().unwrap().push_str(&piece),
+                Event::Logprobs(_) => {}
                 Event::Done { .. } => {
                     let _ = tx.send(Ok(()));
                 }

@@ -51,6 +51,8 @@ pub struct StepMeta {
 pub struct Pick {
     pub token: u32,
     pub logit: f32,
+    /// For a mirostat row, the surprise of the token in bits.
+    pub aux: f32,
 }
 
 /// What the devices brought back from a step.
@@ -59,6 +61,9 @@ pub struct StepOutput {
     /// One pick per row whose logits were wanted, in the order of the
     /// record's runs.
     pub picks: Vec<Pick>,
+    /// The probabilities those rows report, one record per pick, when any row
+    /// asked for them; empty otherwise.
+    pub logprobs: Vec<ares_sampler::LogprobOut>,
     /// The tokens the model drafted itself for the windows that asked for
     /// them, in the order of the record's segments, window after window.
     pub drafts: Vec<u32>,

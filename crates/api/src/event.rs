@@ -6,7 +6,7 @@ use crate::EngineError;
 
 /// One step of a request's life, as seen by the front end.
 ///
-/// A request produces any number of [`Event::Text`] events followed by exactly
+/// A request produces any number of [`Event::Text`] and [`Event::Logprobs`] events followed by exactly
 /// one terminal event, [`Event::Done`] or [`Event::Error`]. Nothing follows the
 /// terminal event.
 #[derive(Debug, Clone, PartialEq)]
@@ -19,6 +19,11 @@ pub enum Event {
     /// pieces as they are, so a split character would reach the client as
     /// two broken halves.
     Text(String),
+    /// The probabilities of the tokens whose text has been sent with the
+    /// [`Event::Text`] events so far (and not reported before), for a request
+    /// that asked for them. A token's probability is reported once the text
+    /// of the token has gone out whole.
+    Logprobs(Vec<TokenProbs>),
     /// Generation ended.
     Done { finish: FinishReason, usage: Usage },
     /// The request failed. Text sent before this stays valid but incomplete.
@@ -28,8 +33,29 @@ pub enum Event {
 impl Event {
     /// Whether this event ends the request.
     pub fn is_terminal(&self) -> bool {
-        !matches!(self, Event::Text(_))
+        !matches!(self, Event::Text(_) | Event::Logprobs(_))
     }
+}
+
+/// The probability of a generated token and of the alternatives it had.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TokenProbs {
+    pub token: u32,
+    /// The bytes the token prints: part of a character where a character
+    /// spans tokens.
+    pub bytes: Vec<u8>,
+    /// The natural logarithm of its probability.
+    pub logprob: f32,
+    /// The most probable tokens, most probable first, with the same measure.
+    pub alternatives: Vec<Alternative>,
+}
+
+/// A token that could have been generated instead.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Alternative {
+    pub token: u32,
+    pub bytes: Vec<u8>,
+    pub logprob: f32,
 }
 
 /// Why a generation ended.
@@ -67,8 +93,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_text_is_non_terminal() {
+    fn only_text_and_probabilities_are_non_terminal() {
         assert!(!Event::Text("a".into()).is_terminal());
+        assert!(!Event::Logprobs(Vec::new()).is_terminal());
         assert!(Event::Done { finish: FinishReason::Stop, usage: Usage::default() }.is_terminal());
         assert!(Event::Error(EngineError::Overloaded).is_terminal());
     }

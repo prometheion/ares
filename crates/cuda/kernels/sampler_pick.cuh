@@ -1,4 +1,4 @@
-// The pick of a sampled row: among the tokens the cuts left, the one with
+// The pick of a sampled row: among the tokens the stages left, the one with
 // the largest `logit / temperature + noise`, where the noise is the Gumbel
 // number of (seed, position, token). That is a draw from the distribution of
 // those tokens at that temperature, and because a token's noise depends on
@@ -6,7 +6,7 @@
 // one device or on several.
 #pragma once
 
-#include "sampler_math.cuh"
+#include "sampler_pass.cuh"
 
 // f32 values per device and row in the exchange of the picks.
 #define ARES_SAMPLE_PICK_VALUES 2
@@ -19,23 +19,23 @@ ARES_KERNEL ares_sample_pick(const float* logits, uint32_t stride, uint32_t n_lo
     __shared__ unsigned long long partial[ARES_SAMPLE_THREADS / 32];
     const uint32_t r = blockIdx.y;
     const AresSampleParams p = params[r];
-    if (!(p.flags & ARES_SAMPLE_F_SAMPLE)) {
+    if (!(p.flags & ARES_SAMPLE_F_SAMPLE) || (state[r].status & ARES_SAMPLE_S_EMPTY)) {
         return;
     }
-    const float l_max = state[r].l_max;
-    const uint32_t cut = state[r].cut_key;
+    const AresSampleState s = state[r];
     const uint32_t begin = blockIdx.x * chunk;
     const uint32_t end = min(begin + chunk, n_local);
     const float* row = logits + (size_t)r * stride;
     unsigned long long best = 0ull;
     for (uint32_t i = begin + threadIdx.x; i < end; i += ARES_SAMPLE_THREADS) {
-        const float l = __fadd_rn(row[i], 0.0f);
-        if (ares_sample_key(l_max, l) > cut) {
+        bool bad = false;
+        const float l = ares_sample_logit(row[i], &bad);
+        if (!ares_sample_present(l) || !ares_in_set(s, ares_sample_key(s.l_max, l))) {
             continue;
         }
         const uint32_t token = tokens ? tokens[first + i] : first + i;
         const float g = ares_sample_gumbel(p.seed_lo, p.seed_hi, p.position, token);
-        const float score = __fadd_rn(__fmul_rn(l, p.inv_temperature), g);
+        const float score = __fadd_rn(__fmul_rn(l, s.inv_t), g);
         const unsigned long long v = ares_sample_pack(score, token);
         best = v > best ? v : best;
     }
@@ -69,7 +69,7 @@ ARES_KERNEL ares_sample_pick_export(const AresSampleState* state, const AresSamp
 }
 
 // Grid (rows), 32 threads: the pick of a sampled row into its record.
-ARES_KERNEL ares_sample_finish(const AresSampleState* state, const float* exchange, uint32_t devices,
+ARES_KERNEL ares_sample_finish(AresSampleState* state, const float* exchange, uint32_t devices,
                                const AresSampleParams* params, AresSampleOut* out) {
     if (threadIdx.x != 0) {
         return;

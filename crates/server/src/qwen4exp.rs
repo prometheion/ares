@@ -394,7 +394,7 @@ fn warm_up(runtime: &Runtime, model: &str) -> Result<(), LoadError> {
             Event::Error(error) => {
                 let _ = done.send(Err(error.to_string()));
             }
-            Event::Text(_) => {}
+            Event::Text(_) | Event::Logprobs(_) => {}
         }
         true
     });

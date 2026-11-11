@@ -42,10 +42,13 @@ pub use decision::{
 };
 pub use engine::{Engine, ModelCard};
 pub use error::EngineError;
-pub use event::{Event, FinishReason, Usage};
+pub use event::{Alternative, Event, FinishReason, TokenProbs, Usage};
 pub use json::Json;
 pub use message::{Message, Role};
 pub use request::{GenerateRequest, Prompt, RequestId};
-pub use sampling::{Sampling, SamplingError};
+pub use sampling::{
+    BiasKey, LOGIT_BIAS_MAX, LogitBias, LogprobRequest, PENALTY_WINDOW_MAX, SamplerKind, Sampling,
+    SamplingError, TOP_LOGPROBS_MAX,
+};
 pub use sink::{DecisionSink, EventSink};
 pub use stats::{EngineStats, ExpertStats};

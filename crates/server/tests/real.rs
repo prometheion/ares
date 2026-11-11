@@ -2,7 +2,7 @@
 //!
 //! Needs `ARES_TEST_CUDA=1` and `ARES_TEST_QWEN35_MODEL` (a small `qwen35`
 //! file, Qwen3.5-0.8B); `ARES_TEST_DEVICE` names the device (default 0) and
-//! `ARES_TEST_PORT` the first of the nine ports on 127.0.0.1 the tests
+//! `ARES_TEST_PORT` the first of the ten ports on 127.0.0.1 the tests
 //! listen on (default 18951). Every test starts its own server, so they can
 //! run one after the other or together. The tests of Qwen3.8-Flash-Next at the
 //! end need `ARES_TEST_QWEN4EXP_MODEL` (the first part of its split file) and
@@ -597,17 +597,15 @@ fn what_the_engine_cannot_do_is_refused_by_name() {
     let chat = |extra: Value| server.chat("Hi", extra);
     let chat_path = "/v1/chat/completions";
 
-    // The sampler on the device has no penalties.
-    for (name, value) in
-        [("presence_penalty", 0.5), ("frequency_penalty", -0.5), ("repeat_penalty", 1.1)]
-    {
-        refused(chat_path, chat(json!({name: value})), 400, &[name, "not implemented"]);
-    }
+    // The sampler has its limits, and a request past them is told which.
+    refused(chat_path, chat(json!({"repeat_last_n": 5000})), 400, &["repeat_last_n", "1024"]);
+    refused(chat_path, chat(json!({"adaptive_target": 0.5})), 400, &["adaptive_target"]);
+    refused(chat_path, chat(json!({"logit_bias": {"99999999": -100}})), 400, &["logit_bias"]);
+    refused(chat_path, chat(json!({"samplers": ["top_k", "penalties"]})), 400, &["penalties"]);
+    refused(chat_path, chat(json!({"top_logprobs": 2})), 400, &["top_logprobs"]);
     // Nor has the server what these ask for.
-    let error = refused(chat_path, chat(json!({"logit_bias": {"5": -100}})), 400, &["logit_bias"]);
-    assert_eq!(error["param"], "logit_bias");
     refused(chat_path, chat(json!({"grammar": "root ::= \"yes\""})), 400, &["grammar"]);
-    refused(chat_path, chat(json!({"n": 2})), 400, &["n must be 1"]);
+    refused(chat_path, chat(json!({"n": 17})), 400, &["n must be between 1 and 16"]);
     refused(
         chat_path,
         chat(json!({"response_format": {"type": "json_object"}})),
@@ -646,7 +644,7 @@ fn what_the_engine_cannot_do_is_refused_by_name() {
     assert_eq!(server.metric("steps_total"), 0);
     let quiet = chat(json!({
         "presence_penalty": 0, "frequency_penalty": 0, "repeat_penalty": 1.0, "logit_bias": {},
-        "n": 1, "max_tokens": 4, "user": "someone",
+        "n": 1, "max_tokens": 4, "user": "someone", "logprobs": false,
     }));
     let reply = server.post(chat_path, &quiet);
     assert_eq!(reply.status, 200, "{}", reply.body);
@@ -1231,4 +1229,124 @@ fn flash_next_answers_in_both_placements() {
         assert!(client.metric("steps_total") > 100);
         server.stop();
     }
+}
+
+/// The text of the first choice of an answer, and the ids of its tokens with
+/// the probabilities (`logprob`) the answer reports.
+fn first_choice(reply: &Reply) -> (String, Vec<Value>) {
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    let value = reply.json();
+    let choice = &value["choices"][0];
+    let tokens = choice["logprobs"]["content"].as_array().cloned().unwrap_or_default();
+    (choice["message"]["content"].as_str().unwrap_or_default().to_owned(), tokens)
+}
+
+#[test]
+fn the_sampler_serves_what_a_request_sets_and_reports_the_probabilities() {
+    let Some(model) = model() else { return };
+    let server = Server::start(&model, port(9), &[]);
+    let chat_path = "/v1/chat/completions";
+    let question = "Name three colours.";
+    let greedy = |extra: Value| {
+        let mut body = server.chat(question, json!({"temperature": 0, "max_tokens": 16}));
+        for (key, value) in extra.as_object().unwrap() {
+            body[key] = value.clone();
+        }
+        body
+    };
+
+    // The probabilities of a greedy answer: the token with the best
+    // probability is the one that came out, and the alternatives are in order.
+    let (plain, tokens) = first_choice(
+        &server.post(chat_path, &greedy(json!({"logprobs": true, "top_logprobs": 5}))),
+    );
+    assert!(tokens.len() >= 8, "{tokens:?}");
+    for token in &tokens {
+        let top = token["top_logprobs"].as_array().unwrap();
+        assert_eq!(top.len(), 5);
+        assert_eq!(top[0]["id"], token["id"], "the greedy token is the most probable");
+        assert_eq!(top[0]["logprob"], token["logprob"]);
+        let lp: Vec<f64> = top.iter().map(|t| t["logprob"].as_f64().unwrap()).collect();
+        assert!(lp.windows(2).all(|w| w[0] >= w[1]) && lp[0] <= 0.0);
+        assert!(lp.iter().map(|l| l.exp()).sum::<f64>() <= 1.0 + 1e-4);
+    }
+    // After the chain a greedy row has one token left, with probability 1.
+    let (_, after) = first_choice(
+        &server.post(chat_path, &greedy(json!({"n_probs": 3, "post_sampling_probs": true}))),
+    );
+    assert!(
+        after.iter().all(|t| t["prob"] == 1.0 && t["top_probs"].as_array().unwrap().len() == 1)
+    );
+
+    // A banned token is not picked, and the best of the rest is: the first
+    // token of the answer becomes the second best of the first answer.
+    let first = &tokens[0];
+    let second = first["top_logprobs"][1]["id"].clone();
+    let (banned, banned_tokens) =
+        first_choice(&server.post(
+            chat_path,
+            &greedy(json!({"logit_bias": [[first["id"], false]], "logprobs": true})),
+        ));
+    assert_eq!(banned_tokens[0]["id"], second, "the answer {plain:?} then {banned:?}");
+    // The probabilities are the model's own, so they do not move with the ban.
+    assert_eq!(banned_tokens[0]["logprob"], first["top_logprobs"][1]["logprob"]);
+
+    // A penalty and a seed: the same request says the same twice, and
+    // a strong penalty says something else than none.
+    let penalised = |seed: u64| {
+        let body = greedy(json!({
+            "temperature": 0.7, "seed": seed, "repeat_penalty": 1.5, "frequency_penalty": 0.8,
+            "max_tokens": 40,
+        }));
+        first_choice(&server.post(chat_path, &body)).0
+    };
+    assert_eq!(penalised(5), penalised(5));
+    let free = first_choice(
+        &server.post(chat_path, &greedy(json!({"temperature": 0.7, "seed": 5, "max_tokens": 40}))),
+    )
+    .0;
+    assert_ne!(penalised(5), free);
+
+    // Every other sampler answers.
+    for extra in [
+        json!({"mirostat": 2, "mirostat_tau": 3.0}),
+        json!({"mirostat": 1}),
+        json!({"typical_p": 0.9, "top_n_sigma": 3.0}),
+        json!({"xtc_probability": 0.5, "xtc_threshold": 0.2}),
+        json!({"dynatemp_range": 0.5, "dynatemp_exponent": 1.5}),
+        json!({"dry_multiplier": 0.8, "dry_penalty_last_n": 64}),
+        json!({"samplers": ["temperature", "min_p", "top_p"], "min_p": 0.05, "top_p": 0.9}),
+        json!({"samplers": "ktpmt", "top_k": 40}),
+        json!({"ignore_eos": true, "logit_bias": {"Hello": 1.5}}),
+    ] {
+        let mut body = greedy(extra.clone());
+        body["temperature"] = json!(0.8);
+        body["seed"] = json!(3);
+        let (text, _) = first_choice(&server.post(chat_path, &body));
+        assert!(!text.is_empty(), "{extra}");
+    }
+
+    // The completions of one prompt are requests of their own with their own
+    // seeds, and the engine reads the prompt once.
+    let steps = server.metric("prefix_hits_total");
+    let mut body = greedy(json!({"temperature": 0.9, "seed": 40, "n": 3, "max_tokens": 24}));
+    body["messages"][0]["content"] = json!("Tell me a very short story about a lighthouse keeper.");
+    let reply = server.post(chat_path, &body);
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    let choices = reply.json()["choices"].as_array().unwrap().clone();
+    assert_eq!(choices.len(), 3);
+    let texts: Vec<&str> =
+        choices.iter().map(|c| c["message"]["content"].as_str().unwrap()).collect();
+    assert!(texts[0] != texts[1] || texts[1] != texts[2], "{texts:?}");
+    for (i, text) in texts.iter().enumerate() {
+        let mut one = body.clone();
+        one["n"] = json!(1);
+        one["seed"] = json!(40 + i as u64);
+        assert_eq!(first_choice(&server.post(chat_path, &one)).0, *text, "choice {i}");
+    }
+    assert!(
+        server.metric("prefix_hits_total") >= steps + 2,
+        "the other completions read the cache"
+    );
+    server.stop();
 }

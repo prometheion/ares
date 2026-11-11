@@ -6,7 +6,7 @@ use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use ares_api::{Engine, RequestId, Usage};
+use ares_api::{Engine, RequestId, TokenProbs, Usage};
 use axum::Json;
 use axum::extract::{Request, State};
 use axum::http::{HeaderName, HeaderValue, header};
@@ -19,7 +19,7 @@ use crate::bridge::{DecisionRun, Flight, Item, Run, Stop, Timings};
 use crate::error::ApiError;
 use crate::reasoning::{self, Split, Splitter};
 use crate::systemone;
-use crate::wire::{self, Endpoint, Head};
+use crate::wire::{self, Choice, Endpoint, Head};
 
 /// What every handler needs.
 #[derive(Clone)]
@@ -93,27 +93,41 @@ async fn try_completion(
     let id = next_request_id();
     let mut parsed = wire::parse(endpoint, &body, id)?;
     let splitter = reasoning::apply(&mut parsed, &*app.engine, app.config.reasoning_format)?;
-    let head = Head::new(endpoint, id, &parsed.request.model);
+    let mut head = Head::new(endpoint, id, &parsed.request.model);
+    head.logprobs = parsed.logprobs;
     tracing::info!(
         %id,
         model = %parsed.request.model,
         ?endpoint,
         stream = parsed.stream,
+        n = parsed.n,
         max_tokens = ?parsed.request.max_tokens,
         "request"
     );
 
-    let run = Run::start(
-        &app.engine,
-        parsed.request,
-        app.config.event_buffer,
-        &app.flight,
-        app.stop.clone(),
-    )?;
+    // The completions of a prompt are requests of their own, with their own
+    // seeds: the engine computes the prompt once and the other requests start
+    // from what it cached.
+    let mut runs = Vec::with_capacity(parsed.n as usize);
+    for i in 0..parsed.n {
+        let mut request = parsed.request.clone();
+        if i > 0 {
+            request.id = next_request_id();
+            request.sampling.seed =
+                request.sampling.seed.map(|seed| seed.wrapping_add(u64::from(i)));
+        }
+        runs.push(Run::start(
+            &app.engine,
+            request,
+            app.config.event_buffer,
+            &app.flight,
+            app.stop.clone(),
+        )?);
+    }
     if parsed.stream {
-        stream(run, head, parsed.include_usage, splitter).await
+        stream(runs, head, parsed.include_usage, splitter).await
     } else {
-        collect(run, head, splitter).await
+        collect(runs, head, splitter).await
     }
 }
 
@@ -177,13 +191,18 @@ fn next_request_id() -> RequestId {
     RequestId(NEXT.fetch_add(1, Ordering::Relaxed))
 }
 
-/// The non-streaming answer: collect everything, then reply once.
-///
-/// The text is held in memory until the end. Its size is bounded by the
-/// request's token limit (or the context length), which is what the engine
-/// would have spent on it anyway.
-async fn collect(mut run: Run, head: Head, mut splitter: Splitter) -> Result<Response, ApiError> {
+/// What one completion of a non-streaming request came to.
+struct Collected {
+    text: Split,
+    probs: Vec<TokenProbs>,
+    finish: &'static str,
+    usage: Usage,
+    timings: Timings,
+}
+
+async fn collect_one(mut run: Run, mut splitter: Splitter) -> Result<Collected, ApiError> {
     let mut text = Split::default();
+    let mut probs = Vec::new();
     loop {
         match run.next().await? {
             Item::Text(piece) => {
@@ -191,14 +210,40 @@ async fn collect(mut run: Run, head: Head, mut splitter: Splitter) -> Result<Res
                 text.reasoning.push_str(&sorted.reasoning);
                 text.content.push_str(&sorted.content);
             }
+            Item::Probs(more) => probs.extend(more),
             Item::Done { finish, usage, timings } => {
                 let rest = splitter.finish();
                 text.reasoning.push_str(&rest.reasoning);
                 text.content.push_str(&rest.content);
-                return Ok(json_response(head.complete(&text, finish, usage, timings)));
+                return Ok(Collected { text, probs, finish, usage, timings });
             }
         }
     }
+}
+
+/// The non-streaming answer: collect everything, then reply once.
+///
+/// The text is held in memory until the end. Its size is bounded by the
+/// request's token limit (or the context length), which is what the engine
+/// would have spent on it anyway. The completions of an `n` above 1 are
+/// collected side by side, so that none of them waits in its queue while
+/// another is being read.
+async fn collect(runs: Vec<Run>, head: Head, splitter: Splitter) -> Result<Response, ApiError> {
+    let done = futures_util::future::try_join_all(
+        runs.into_iter().map(|run| collect_one(run, splitter.clone())),
+    )
+    .await?;
+    let choices: Vec<Choice<'_>> = done
+        .iter()
+        .enumerate()
+        .map(|(i, c)| head.choice(i as u32).complete_choice(&c.text, c.finish, &c.probs))
+        .collect();
+    // One prompt, however many completions of it.
+    let usage = Usage {
+        completion_tokens: done.iter().map(|c| c.usage.completion_tokens).sum(),
+        ..done[0].usage
+    };
+    Ok(json_response(head.complete(choices, usage, done[0].timings)))
 }
 
 fn json_response(body: String) -> Response {
@@ -212,24 +257,93 @@ fn json_response(body: String) -> Response {
 /// model does not exist) fails while the engine is still looking at it, and
 /// that failure then becomes a proper HTTP status instead of an error message
 /// inside a `200`. Clients and proxies handle the two very differently.
+///
+/// The completions of an `n` above 1 are streamed side by side, their chunks
+/// told apart by `index`; the usage and the end marker come once, after all.
 async fn stream(
-    mut run: Run,
+    runs: Vec<Run>,
     head: Head,
     include_usage: bool,
     splitter: Splitter,
 ) -> Result<Response, ApiError> {
-    let first = run.next().await?;
-    let state = Chunks { run, head, include_usage, splitter, phase: Phase::Start(first) };
-    let events = futures_util::stream::unfold(state, |mut state| async move {
-        let data = state.step().await?;
-        Some((Ok::<_, Infallible>(SseEvent::default().data(data)), state))
-    });
+    let many = runs.len() > 1;
+    let firsts = futures_util::future::try_join_all(runs.into_iter().map(|mut run| async move {
+        let first = run.next().await?;
+        Ok::<_, ApiError>((run, first))
+    }))
+    .await?;
+    let shared = many.then(|| Arc::new(Shared::default()));
+    let parts: Vec<_> = firsts
+        .into_iter()
+        .enumerate()
+        .map(|(i, (run, first))| {
+            let state = Chunks {
+                run,
+                head: head.choice(i as u32),
+                include_usage,
+                splitter: splitter.clone(),
+                phase: Phase::Start(first),
+                sent: 0,
+                shared: shared.clone(),
+            };
+            futures_util::stream::unfold(state, |mut state| async move {
+                let data = state.step().await?;
+                Some((Ok::<_, Infallible>(SseEvent::default().data(data)), state))
+            })
+            .boxed()
+        })
+        .collect();
+    let merged = futures_util::stream::select_all(parts);
+    let events = match shared {
+        // The end of several streams is one: the usage, then the marker.
+        Some(shared) => merged
+            .chain(
+                futures_util::stream::once(async move { shared.end(&head, include_usage) })
+                    .flat_map(futures_util::stream::iter),
+            )
+            .boxed(),
+        None => merged.boxed(),
+    };
     let mut response = Sse::new(events).keep_alive(KeepAlive::default()).into_response();
     // Reverse proxies that buffer would hold the tokens back.
     response
         .headers_mut()
         .insert(HeaderName::from_static("x-accel-buffering"), HeaderValue::from_static("no"));
     Ok(response)
+}
+
+/// What the completions of one request share while they stream.
+#[derive(Default)]
+struct Shared {
+    usage: std::sync::Mutex<Option<Usage>>,
+    failed: std::sync::atomic::AtomicBool,
+}
+
+impl Shared {
+    fn add(&self, usage: Usage) {
+        let mut total = self.usage.lock().unwrap_or_else(|p| p.into_inner());
+        *total = Some(match *total {
+            None => usage,
+            Some(sum) => {
+                Usage { completion_tokens: sum.completion_tokens + usage.completion_tokens, ..sum }
+            }
+        });
+    }
+
+    /// The chunks after the last completion: the usage if it was asked for,
+    /// and the marker; none if a completion failed.
+    fn end(&self, head: &Head, include_usage: bool) -> Vec<Result<SseEvent, Infallible>> {
+        if self.failed.load(Ordering::Acquire) {
+            return Vec::new();
+        }
+        let mut events = Vec::new();
+        if include_usage && let Some(usage) = *self.usage.lock().unwrap_or_else(|p| p.into_inner())
+        {
+            events.push(Ok(SseEvent::default().data(head.usage_chunk(usage))));
+        }
+        events.push(Ok(SseEvent::default().data("[DONE]")));
+        events
+    }
 }
 
 /// Where the SSE state machine is. Every `step` produces one `data:` line.
@@ -259,6 +373,10 @@ struct Chunks {
     include_usage: bool,
     splitter: Splitter,
     phase: Phase,
+    /// Characters of text sent so far, for the offsets of probabilities.
+    sent: usize,
+    /// Set when this is one of several completions.
+    shared: Option<Arc<Shared>>,
 }
 
 impl Chunks {
@@ -285,24 +403,39 @@ impl Chunks {
                     // A piece that is held back or empty would only add an empty chunk.
                     let sorted = self.splitter.push(&text);
                     if !sorted.is_empty() {
+                        self.sent += sorted.content.chars().count();
                         return Some(self.head.text_chunk(&sorted));
                     }
+                }
+                Phase::Ready(Item::Probs(probs)) => {
+                    self.phase = Phase::Pull;
+                    return Some(self.head.probs_chunk(&probs, self.sent));
                 }
                 Phase::Ready(Item::Done { finish, usage, timings }) => {
                     self.phase = Phase::Finish { finish, usage, timings };
                     let rest = self.splitter.finish();
                     if !rest.is_empty() {
+                        self.sent += rest.content.chars().count();
                         return Some(self.head.text_chunk(&rest));
                     }
                 }
                 Phase::Finish { finish, usage, timings } => {
-                    self.phase =
-                        if self.include_usage { Phase::Usage(usage) } else { Phase::Marker };
+                    self.phase = match &self.shared {
+                        Some(shared) => {
+                            shared.add(usage);
+                            Phase::End
+                        }
+                        None if self.include_usage => Phase::Usage(usage),
+                        None => Phase::Marker,
+                    };
                     return Some(self.head.finish_chunk(finish, timings));
                 }
                 Phase::Pull => match self.run.next().await {
                     Ok(item) => self.phase = Phase::Ready(item),
                     Err(error) => {
+                        if let Some(shared) = &self.shared {
+                            shared.failed.store(true, Ordering::Release);
+                        }
                         return Some(
                             serde_json::to_string(&error.body()).expect("errors serialize"),
                         );

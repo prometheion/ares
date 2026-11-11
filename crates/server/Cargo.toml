@@ -35,7 +35,9 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
-# The page layout a test model reports (tests/reasoning_cache.rs).
+# The sampler settings and the page layout a test model reports
+# (tests/reasoning_cache.rs).
+ares-sampler.workspace = true
 ares-state.workspace = true
 # `ServiceExt::oneshot` drives the router in-process, without a socket.
 tower = { version = "0.5", features = ["util"] }

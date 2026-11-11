@@ -18,6 +18,7 @@ use crate::error::RuntimeError;
 use crate::exec::{ExecError, Executor};
 use crate::gpu::{GpuConfig, GpuExecutor};
 use crate::model::Model;
+use crate::sampling::TokenFilter;
 use crate::timing::Snapshot;
 
 /// How long a question to the conductor (statistics, inspection) may take.
@@ -155,6 +156,66 @@ impl Runtime {
         Self::start(model, Box::new(executor), config)
     }
 
+    /// Starts a request whose picks are restricted by `filter` (see
+    /// [`TokenFilter`]): what [`Engine::submit`] does for a request that has
+    /// none.
+    pub fn submit_filtered(
+        &self,
+        request: GenerateRequest,
+        events: EventSink,
+        filter: Box<dyn TokenFilter>,
+    ) -> Result<(), EngineError> {
+        self.start_request(request, events, Some(filter))
+    }
+
+    fn start_request(
+        &self,
+        request: GenerateRequest,
+        events: EventSink,
+        filter: Option<Box<dyn TokenFilter>>,
+    ) -> Result<(), EngineError> {
+        if request.model != self.card.id {
+            return Err(EngineError::ModelNotFound(request.model));
+        }
+        request.sampling.validate()?;
+        if request.max_tokens == Some(0) {
+            return Err(EngineError::InvalidRequest("max_tokens must be at least 1".into()));
+        }
+        let prompt = self.model.encode(&request.prompt)?;
+        if prompt.is_empty() {
+            return Err(EngineError::InvalidRequest(
+                "the prompt is empty: there is nothing to continue".into(),
+            ));
+        }
+        // At least one token must fit after the prompt, in the model's
+        // context and in the page pool. This is the one refusal that depends
+        // on a size, and it does not depend on what else is running.
+        if prompt.len() >= self.limit as usize {
+            return Err(EngineError::ContextOverflow {
+                prompt_tokens: u32::try_from(prompt.len()).unwrap_or(u32::MAX),
+                limit: self.limit,
+            });
+        }
+        let submission = Box::new(Submission {
+            id: request.id,
+            prompt,
+            max_tokens: request.max_tokens,
+            stop: request.stop,
+            sampling: request.sampling,
+            draft: request.draft,
+            filter,
+            sink: events,
+        });
+        let sent = match self.commands.lock().expect("commands").as_ref() {
+            Some(sender) => sender.send(Command::Submit(submission)).is_ok(),
+            None => false,
+        };
+        if !sent {
+            return Err(EngineError::Internal("the engine has shut down".into()));
+        }
+        Ok(())
+    }
+
     /// Whether the conductor and the device threads are still alive. False
     /// once [`Runtime::shutdown`] has returned.
     pub fn is_running(&self) -> bool {
@@ -220,61 +281,7 @@ impl Engine for Runtime {
     }
 
     fn submit(&self, request: GenerateRequest, events: EventSink) -> Result<(), EngineError> {
-        if request.model != self.card.id {
-            return Err(EngineError::ModelNotFound(request.model));
-        }
-        request.sampling.validate()?;
-        // The sampler on the devices has no penalties yet. A value that
-        // switches a penalty off asks for nothing; any other is refused, so
-        // that no request gets text that ignores what it asked for.
-        let sampling = &request.sampling;
-        for (name, value, off) in [
-            ("presence_penalty", sampling.presence_penalty, 0.0),
-            ("frequency_penalty", sampling.frequency_penalty, 0.0),
-            ("repeat_penalty", sampling.repeat_penalty, 1.0),
-        ] {
-            if value.is_some_and(|v| v != off) {
-                return Err(EngineError::InvalidRequest(format!(
-                    "{name} is not implemented: the sampler has temperature, top_k, top_p, \
-                     min_p and seed. Leave {name} out or set it to {off}"
-                )));
-            }
-        }
-        if request.max_tokens == Some(0) {
-            return Err(EngineError::InvalidRequest("max_tokens must be at least 1".into()));
-        }
-        let prompt = self.model.encode(&request.prompt)?;
-        if prompt.is_empty() {
-            return Err(EngineError::InvalidRequest(
-                "the prompt is empty: there is nothing to continue".into(),
-            ));
-        }
-        // At least one token must fit after the prompt, in the model's
-        // context and in the page pool. This is the one refusal that depends
-        // on a size, and it does not depend on what else is running.
-        if prompt.len() >= self.limit as usize {
-            return Err(EngineError::ContextOverflow {
-                prompt_tokens: u32::try_from(prompt.len()).unwrap_or(u32::MAX),
-                limit: self.limit,
-            });
-        }
-        let submission = Box::new(Submission {
-            id: request.id,
-            prompt,
-            max_tokens: request.max_tokens,
-            stop: request.stop,
-            sampling: request.sampling,
-            draft: request.draft,
-            sink: events,
-        });
-        let sent = match self.commands.lock().expect("commands").as_ref() {
-            Some(sender) => sender.send(Command::Submit(submission)).is_ok(),
-            None => false,
-        };
-        if !sent {
-            return Err(EngineError::Internal("the engine has shut down".into()));
-        }
-        Ok(())
+        self.start_request(request, events, None)
     }
 
     fn decide(&self, _: DecisionRequest, _: DecisionSink) -> Result<(), EngineError> {

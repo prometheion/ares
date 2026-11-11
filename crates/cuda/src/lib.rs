@@ -64,8 +64,6 @@ pub use q4::{
     NgramShape, Q4Kernels, ReadWrite, SELECT_MAX_BLOCKS, SelectionRule,
 };
 pub use sampler::{
-    SAMPLE_CANDIDATES, SAMPLE_MAX_VOCAB, SAMPLE_STATUS_EMPTY, SAMPLE_STATUS_NONFINITE, SampleBatch,
-    SampleCut, SampleParams, SamplePick, SamplePlan, SampleRow, SampleStep, SamplerKernels, gumbel,
-    philox4x32, sample_reference, weight_fixed,
+    Descent, PassMode, Phase, SAMPLE_MAX_VOCAB, SampleBatch, SamplePlan, SampleStep, SamplerKernels,
 };
 pub use stream::{Event, Stream};

@@ -27,8 +27,7 @@ use std::sync::Arc;
 
 use ares_core::Ledger;
 use ares_cuda::{
-    Device, DeviceBuffer, ENTRY_CELLS, Kernels, Precision, SAMPLE_CANDIDATES, SampleParams,
-    SamplePick, SampleRow, Segment, StepRecord, Stream, Wait, sample_reference,
+    Device, DeviceBuffer, ENTRY_CELLS, Kernels, Precision, Segment, StepRecord, Stream, Wait,
 };
 use ares_gguf::Gguf;
 use ares_model::qwen35::device::{
@@ -37,6 +36,7 @@ use ares_model::qwen35::device::{
 };
 use ares_model::qwen35::{Config, MtpState, Reference, Weights};
 use ares_runtime::PinnedRam;
+use ares_sampler::{SAMPLE_CANDIDATES, SampleParams, SamplePick, SampleRow, sample_reference};
 
 fn env_path(name: &str) -> Option<PathBuf> {
     match std::env::var_os(name) {
@@ -426,12 +426,17 @@ fn the_draft_block_on_the_device_drafts_what_the_reference_drafts() {
             }
 
             // With sampling a link's pick is the sampler's pick from its logits.
-            let sampled =
-                SampleParams { temperature: 1.0, top_k: 20, top_p: 0.95, min_p: 0.0, seed: 77 };
+            let sampled = SampleParams {
+                temperature: 1.0,
+                top_k: 20,
+                top_p: 0.95,
+                seed: 77,
+                ..SampleParams::GREEDY
+            };
             let rows: Vec<SampleRow> =
                 (0..1).map(|j| sampled.row((n + WINDOW + j) as u32)).collect();
             let got = rig.chain((n + WINDOW) as u32, generated[WINDOW], &rows);
-            let host = sample_reference(&got.logits, |i| draft_tokens[i], &rows[0]);
+            let host = sample_reference(&got.logits, |i| draft_tokens[i], &rows[0], &[], None).pick;
             assert_eq!(got.picks[0].token, host.token, "the sampled draft");
             assert_eq!(got.picks[0].value.to_bits(), host.value.to_bits());
             assert_eq!(got.picks[0].cand_token[..SAMPLE_CANDIDATES], host.cand_token[..]);

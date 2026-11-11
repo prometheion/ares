@@ -23,8 +23,7 @@ use std::path::PathBuf;
 
 use ares_core::Ledger;
 use ares_cuda::{
-    Device, DeviceBuffer, ENTRY_CELLS, Kernels, Precision, SampleParams, Segment, StepRecord,
-    Stream, Wait,
+    Device, DeviceBuffer, ENTRY_CELLS, Kernels, Precision, Segment, StepRecord, Stream, Wait,
 };
 use ares_gguf::Gguf;
 use ares_model::qwen35::device::{
@@ -32,6 +31,7 @@ use ares_model::qwen35::device::{
 };
 use ares_model::qwen35::{Config, Weights};
 use ares_runtime::PinnedRam;
+use ares_sampler::SampleParams;
 
 const PAGE: u32 = ENTRY_CELLS;
 

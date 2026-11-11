@@ -1,0 +1,13 @@
+[package]
+name = "ares-sampler"
+description = "The definitions of the sampler: the settings of a row, the arithmetic every backend repeats bit for bit, the reference of a pick, and the penalties the host works out"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

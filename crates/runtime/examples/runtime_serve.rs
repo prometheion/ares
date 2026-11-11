@@ -38,8 +38,7 @@ OPTIONS
   --tokens N            tokens per request with --load (default 128)
   --prompt N            prompt characters with --load (default 24)
   --speculation on|off  drafts: the model's own draft block and the lookup in earlier
-                        text (default off; only with --fake, a device part of the
-                        synthetic model has no draft block)
+                        text (default off)
 ";
 
 struct Options {
@@ -182,12 +181,6 @@ async fn main() {
             std::process::exit(2);
         }
     };
-    if o.speculation && !o.fake {
-        eprintln!(
-            "--speculation needs --fake: a device part of the synthetic model has no draft block"
-        );
-        std::process::exit(2);
-    }
     let mut sc = SyntheticConfig::realistic(split, used);
     sc.layers = o.layers;
     if o.fake {

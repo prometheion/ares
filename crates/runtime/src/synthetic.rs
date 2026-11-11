@@ -31,16 +31,18 @@
 //! own alphabet map to their byte), and a picked byte prints as a printable
 //! character ([`printable`](crate::printable)).
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use ares_api::{EngineError, ModelCard, Prompt};
 use ares_core::GgmlType;
-use ares_cuda::{DeviceBuffer, DevicePtr, Kernels, MAX_BATCH, PUSH_MAX_VALUES};
+use ares_cuda::{DeviceBuffer, DevicePtr, Kernels, MAX_BATCH, PUSH_MAX_VALUES, PinnedBuffer};
 use ares_state::PageLayout;
 
+use crate::exec::Pick;
 use crate::model::{
-    ContextSpec, DeviceContext, DeviceModel, LinkSpec, Logits, Model, ModelError, PrefixCache,
-    Split, StepContext,
+    ContextSpec, DeviceContext, DeviceModel, LinkSpec, Logits, Model, ModelError, OwnDrafts,
+    PrefixCache, Split, StepContext,
 };
 use crate::text::{printable, unprintable};
 
@@ -104,14 +106,16 @@ pub struct SyntheticConfig {
     /// part has none and refuses to open with this set.
     pub prefix_cache: Option<u64>,
     /// The links of a chain of drafts the model makes itself, like the draft
-    /// block of a real one: 0 for none. Only the host executor drafts (the
-    /// device part has no draft block and refuses to open with this set), and
-    /// the context must read one token (`context.window == 1`) so that a
-    /// draft's context follows from the draft alone.
+    /// block of a real one: 0 for none. The context must read one token
+    /// (`context.window == 1`) so that a draft's context follows from the
+    /// draft alone. The host executor drafts by [`SyntheticConfig::own_accuracy`]; the
+    /// device part drafts what it has seen the model pick after the same token
+    /// in the same context ([`SyntheticModel`]), which is right wherever the
+    /// text repeats and the sampler picks as it did.
     pub own_drafts: u32,
-    /// The chance that link `i` of a chain makes the draft the model itself
-    /// would pick, given that the links before it did; the last number serves
-    /// the links after it. Empty: every link is right.
+    /// For the host executor: the chance that link `i` of a chain makes the
+    /// draft the model itself would pick, given that the links before it did;
+    /// the last number serves the links after it. Empty: every link is right.
     pub own_accuracy: Vec<f64>,
     pub seed: u64,
 }
@@ -178,6 +182,13 @@ impl SyntheticConfig {
         self.own_accuracy = accuracy.to_vec();
         self.context.window = 1;
         self
+    }
+
+    /// The context of the row of `token` at `position`, for a model whose
+    /// context reads one token.
+    pub fn context_of(&self, token: u32, position: u32) -> u32 {
+        let spec = self.context;
+        spec.reduce(spec.advance(spec.start(), &[token]), position)
     }
 
     /// The number of tokens: the bytes, and token 256 if it is the end token.
@@ -364,6 +375,10 @@ impl SyntheticConfig {
 #[derive(Debug)]
 pub struct SyntheticModel {
     config: Arc<SyntheticConfig>,
+    /// What the device parts have seen the model pick after a token in a
+    /// context: their draft block drafts from it. The parts share it, so that
+    /// all of them draft the same tokens.
+    seen: Arc<Mutex<HashMap<(u32, u32), u32>>>,
 }
 
 impl SyntheticModel {
@@ -371,7 +386,7 @@ impl SyntheticModel {
     /// opens the device parts.
     pub fn new(config: SyntheticConfig) -> Result<Self, ModelError> {
         config.validate()?;
-        Ok(Self { config: Arc::new(config) })
+        Ok(Self { config: Arc::new(config), seen: Arc::default() })
     }
 
     pub fn config(&self) -> &SyntheticConfig {
@@ -393,8 +408,7 @@ impl SyntheticModel {
     /// The context the row of `token` at `position` has: what the conductor
     /// derives from the tokens, for a model whose context reads one token.
     pub fn context_of(&self, token: u32, position: u32) -> u32 {
-        let spec = self.config.context;
-        spec.reduce(spec.advance(spec.start(), &[token]), position)
+        self.config.context_of(token, position)
     }
 
     /// What the model's draft block would draft for the window whose newest
@@ -545,7 +559,7 @@ impl Model for SyntheticModel {
     }
 
     fn open(&self, cx: DeviceContext<'_>) -> Result<Box<dyn DeviceModel>, ModelError> {
-        Ok(Box::new(SyntheticDevice::build(&self.config, cx)?))
+        Ok(Box::new(SyntheticDevice::build(&self.config, &self.seen, cx)?))
     }
 }
 
@@ -591,22 +605,39 @@ struct SyntheticDevice {
     /// The quantized activations, one group of rows at a time.
     q: DeviceBuffer,
     logits: Option<DeviceBuffer>,
+    /// The token and the context every row of the step reads: the record's,
+    /// except for the draft rows of a window whose drafts the model makes.
+    inputs: Vec<(u32, u32)>,
+    /// The inputs of the rows whose logits are wanted, in the order of the
+    /// record's runs, to learn the picks by.
+    wanted: Vec<(u32, u32)>,
+    drafter: Option<Drafter>,
+}
+
+/// The draft block of a device part: it drafts what the model picked the last
+/// time it read the same token in the same context.
+#[derive(Debug)]
+struct Drafter {
+    seen: Arc<Mutex<HashMap<(u32, u32), u32>>>,
+    /// The drafts of the step on the device, for the runtime to read back.
+    on_device: DeviceBuffer,
+    /// Where they come from: page-locked, so that the copy does not block.
+    staged: PinnedBuffer,
+    /// How many drafts the step that was enqueued has.
+    count: u32,
 }
 
 impl SyntheticDevice {
-    fn build(config: &Arc<SyntheticConfig>, cx: DeviceContext<'_>) -> Result<Self, ModelError> {
+    fn build(
+        config: &Arc<SyntheticConfig>,
+        seen: &Arc<Mutex<HashMap<(u32, u32), u32>>>,
+        cx: DeviceContext<'_>,
+    ) -> Result<Self, ModelError> {
         let c = config;
         if c.prefix_cache.is_some() {
             return Err(ModelError::Invalid(
                 "this model pretends to a prefix cache, which only the host executor can carry \
                  out: its device part keeps no state"
-                    .into(),
-            ));
-        }
-        if c.own_drafts > 0 {
-            return Err(ModelError::Invalid(
-                "this model drafts for itself, which only the host executor can do: its device \
-                 part has no draft block"
                     .into(),
             ));
         }
@@ -678,7 +709,72 @@ impl SyntheticDevice {
             u: scratch(4 * rows * widest_inner)?,
             p: scratch(4 * rows * width)?,
             q: scratch(q_bytes)?,
+            inputs: Vec::new(),
+            wanted: Vec::new(),
+            drafter: (c.own_drafts > 0)
+                .then(|| -> Result<Drafter, ModelError> {
+                    let bytes = 4 * rows;
+                    Ok(Drafter {
+                        seen: seen.clone(),
+                        on_device: DeviceBuffer::new(cx.device, bytes)?,
+                        staged: PinnedBuffer::new(cx.device, bytes as usize)?,
+                        count: 0,
+                    })
+                })
+                .transpose()?,
         })
+    }
+
+    /// Reads the inputs of the rows of the step from the record, and makes
+    /// the drafts of the windows that take the model's own: link `j` is what
+    /// the model was seen to pick after the draft before it (the newest token
+    /// for the first), or `u32::MAX` where it was not seen, and the rows after
+    /// such a draft read token 0.
+    fn read_inputs(&mut self, cx: &StepContext<'_>) -> Result<(), ModelError> {
+        let record = &cx.record;
+        self.inputs.clear();
+        self.inputs
+            .extend((0..record.rows()).map(|r| (record.row(r).token, record.row(r).context)));
+        self.wanted.clear();
+        for i in 0..record.runs() {
+            let (first, count) = record.run(i);
+            self.wanted.extend_from_slice(&self.inputs[first as usize..(first + count) as usize]);
+        }
+        let Some(drafter) = &mut self.drafter else { return Ok(()) };
+        let mut drafts = Vec::new();
+        {
+            let seen = drafter.seen.lock().expect("what the model picked");
+            for i in (0..record.segments()).filter(|i| record.own_drafts(*i)) {
+                let segment = record.segment(i);
+                let newest = record.row(segment.row0);
+                let mut input = Some((newest.token, newest.context));
+                for link in 1..segment.n_rows {
+                    let draft = input.and_then(|at| seen.get(&at).copied());
+                    drafts.push(draft.unwrap_or(u32::MAX));
+                    input = draft.map(|d| (d, self.config.context_of(d, newest.position + link)));
+                    self.inputs[(segment.row0 + link) as usize] = input.unwrap_or((0, 0));
+                }
+            }
+        }
+        // Only the first device hands the drafts to the runtime: the others
+        // have made the same ones for their own rows.
+        drafter.count = if self.index == 0 { drafts.len() as u32 } else { 0 };
+        if drafter.count > 0 {
+            for (bytes, draft) in drafter.staged.as_chunks_mut::<4>().0.iter_mut().zip(&drafts) {
+                *bytes = draft.to_le_bytes();
+            }
+            // SAFETY: `staged` holds the drafts (at most a row each) and is
+            // not written again before the step has ended; `on_device` holds
+            // a u32 for every row of a step.
+            unsafe {
+                cx.stream.copy_from_host(
+                    drafter.on_device.ptr(),
+                    drafter.staged.as_ptr(),
+                    drafts.len() * 4,
+                )?;
+            }
+        }
+        Ok(())
     }
 
     fn at(buffer: &DeviceBuffer, row: u32, stride: u32) -> DevicePtr {
@@ -690,9 +786,9 @@ impl SyntheticDevice {
     fn embed(&self, cx: &StepContext<'_>, rows: std::ops::Range<u32>) -> Result<(), ModelError> {
         let width = self.config.width;
         for r in rows {
-            let row = cx.record.row(r);
-            let token = Self::at(&self.token_table, row.token, width);
-            let context = Self::at(&self.context_table, row.context, width);
+            let (token, context) = self.inputs[r as usize];
+            let token = Self::at(&self.token_table, token, width);
+            let context = Self::at(&self.context_table, context, width);
             // SAFETY: the tables hold a row per token and per context (the
             // conductor only writes tokens below the vocabulary and contexts
             // below the bucket count) and `x` a row per step row, all alive
@@ -889,11 +985,24 @@ impl DeviceModel for SyntheticDevice {
         self.head.as_ref().map_or(0, |h| h.n_out)
     }
 
+    fn picked(&mut self, picks: &[Pick]) {
+        if let Some(drafter) = &self.drafter {
+            let mut seen = drafter.seen.lock().expect("what the model picked");
+            seen.extend(self.wanted.iter().copied().zip(picks.iter().map(|pick| pick.token)));
+        }
+    }
+
+    fn own_drafts(&self) -> Option<OwnDrafts> {
+        let drafter = self.drafter.as_ref()?;
+        Some(OwnDrafts { ptr: drafter.on_device.ptr(), tokens: drafter.count })
+    }
+
     fn enqueue(&mut self, cx: &StepContext<'_>) -> Result<Option<Logits>, ModelError> {
         let n = cx.record.rows();
         if n == 0 {
             return Ok(None);
         }
+        self.read_inputs(cx)?;
         match self.config.split {
             Split::Shared => {
                 return Err(ModelError::Invalid("the synthetic model has no shared split".into()));

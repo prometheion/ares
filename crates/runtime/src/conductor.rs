@@ -85,7 +85,7 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender};
 use std::time::{Duration, Instant};
 
 use ares_api::{EngineError, Event, EventSink, FinishReason, RequestId, Sampling, Usage};
-use ares_cuda::{SampleParams, SampleRow};
+use ares_sampler::{SampleParams, SampleRow, TokenMask};
 use ares_sched::{
     Acceptance, Admission, AdmissionConfig, Arrival, Choice, Curve, Limits, Load, LookupCorpus,
     LookupDrafter, Offer, Outcome, PartKind, Pending, PoolView, PriceTable, Prices, Request, SeqId,
@@ -100,6 +100,7 @@ use crate::config::RuntimeConfig;
 use crate::exec::{Clock, ExecError, Executor, StepMeta, StepOutput};
 use crate::model::{ContextSpec, Model};
 use crate::record::{self, Commit, RecordWriter, Row, TableUpdate};
+use crate::sampling::{Context, RequestSampler, StepRows, TokenFilter};
 use crate::text::StopMatcher;
 use crate::timing::{Calibration, DRAFT_POSITIONS, Phase, RequestReport, Snapshot, Stats};
 
@@ -172,6 +173,8 @@ pub(crate) struct Submission {
     pub sampling: Sampling,
     /// Whether drafts may be verified for the request.
     pub draft: bool,
+    /// A rule about which tokens the request may pick, if it has one.
+    pub filter: Option<Box<dyn TokenFilter>>,
     pub sink: EventSink,
 }
 
@@ -255,8 +258,9 @@ struct Active {
     own_acceptance: Acceptance,
     /// Whether the request lets drafts be verified for it.
     draft_allowed: bool,
-    /// How the sequence's tokens are picked.
-    sampling: SampleParams,
+    /// How the sequence's tokens are picked, and what that keeps from step
+    /// to step.
+    sampler: RequestSampler,
     stop: StopMatcher,
     max_tokens: Option<u32>,
     completion: u32,
@@ -328,7 +332,7 @@ impl Active {
         corpus: &mut LookupCorpus,
         picked: &[u32],
     ) {
-        for &token in picked {
+        for (i, &token) in picked.iter().enumerate() {
             self.completion += 1;
             if model.ends(token) {
                 self.stop.flush(&mut self.emitted);
@@ -339,7 +343,11 @@ impl Active {
             self.tokens.push(token);
             self.states.push(spec.advance(previous, &self.tokens));
             self.drafter.push(corpus, token);
+            let piece_at = self.pending.len();
             model.piece(token, &mut self.pending);
+            if self.sampler.wants_probs() {
+                self.sampler.token_taken(model, i, token, &self.pending[piece_at..]);
+            }
             let (stop, emitted) = (&mut self.stop, &mut self.emitted);
             if take_characters(&mut self.pending, |ch| stop.push(ch, emitted)) {
                 self.finished = Some(FinishReason::Stop);
@@ -540,8 +548,14 @@ pub(crate) struct Conductor {
     calibration: Option<Calibration>,
     output: StepOutput,
     scratch_tokens: Vec<u32>,
-    /// How the wanted rows of the step are picked, in their order.
+    /// How the wanted rows of the step are picked, in their order, and the
+    /// corrections and masks they name.
     samplers: Vec<SampleRow>,
+    step_rows: StepRows,
+    /// The words of one mask.
+    mask_words: usize,
+    /// What requests share that takes a pass over the vocabulary to find.
+    sampling_context: Context,
 }
 
 impl Conductor {
@@ -582,11 +596,15 @@ impl Conductor {
             stats: Stats::new(exec.devices(), config.stats_window),
             output: StepOutput {
                 picks: Vec::with_capacity(max_rows as usize),
+                logprobs: Vec::new(),
                 drafts: Vec::with_capacity(max_rows as usize),
                 draft_ms: 0.0,
                 devices: Vec::with_capacity(exec.devices()),
             },
             samplers: Vec::with_capacity(max_rows as usize),
+            step_rows: StepRows::default(),
+            mask_words: TokenMask::words_for(model.vocab()),
+            sampling_context: Context::default(),
             requests: Vec::with_capacity(slots),
             parts: Vec::with_capacity(max_rows as usize),
             updates: Vec::with_capacity(slots),
@@ -859,7 +877,7 @@ impl Conductor {
     /// Puts a new request in line. It starts at the next pass of the
     /// admission accounting in which it fits.
     fn enqueue(&mut self, submission: Submission) {
-        let Submission { id, prompt, max_tokens, stop, sampling, draft, sink } = submission;
+        let Submission { id, prompt, max_tokens, stop, sampling, draft, filter, sink } = submission;
         let refuse = |error: EngineError| {
             let _ = sink.send(Event::Error(error));
         };
@@ -869,6 +887,18 @@ impl Conductor {
         if self.by_id.contains_key(&id) {
             return refuse(EngineError::InvalidRequest(format!("request id {id} is in use")));
         }
+        // A request without a seed gets one of its own.
+        let seed = (self.clock.now_ns() ^ id.0.rotate_left(32)).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        let sampler = match RequestSampler::new(
+            &sampling,
+            &*self.model,
+            &mut self.sampling_context,
+            seed,
+            filter,
+        ) {
+            Ok(sampler) => sampler,
+            Err(error) => return refuse(error),
+        };
         let prompt_len = prompt.len() as u32;
         let seq = self.fresh_seq();
         let room = self.context_length.saturating_sub(prompt_len);
@@ -934,21 +964,7 @@ impl Conductor {
             drafter: LookupDrafter::new(),
             own_acceptance: Acceptance::new(self.config.window_rows as usize, 0.95),
             draft_allowed: draft,
-            sampling: {
-                // What the request leaves open is the model's own setting. A
-                // request without a seed gets one of its own.
-                let model = self.model.sampling();
-                SampleParams {
-                    temperature: sampling.temperature.unwrap_or(model.temperature),
-                    top_k: sampling.top_k.unwrap_or(model.top_k),
-                    top_p: sampling.top_p.unwrap_or(model.top_p),
-                    min_p: sampling.min_p.unwrap_or(model.min_p),
-                    seed: sampling.seed.unwrap_or_else(|| {
-                        (self.clock.now_ns() ^ id.0.rotate_left(32))
-                            .wrapping_mul(0x9e37_79b9_7f4a_7c15)
-                    }),
-                }
-            },
+            sampler,
             stop: StopMatcher::new(&stop),
             max_tokens,
             completion: 0,
@@ -1357,7 +1373,11 @@ impl Conductor {
                     .window_rows
                     .saturating_sub(1)
                     .min(wanted.saturating_sub(1))
-                    .min(room) as usize;
+                    .min(room)
+                    // A sequence whose next pick depends on the picks before
+                    // it by a state only a pick can advance verifies no drafts.
+                    .min(if a.sampler.allows_drafts() { u32::MAX } else { 0 })
+                    as usize;
                 // The window ends where a checkpoint is due, so that the
                 // state is exactly there when all of it is accepted.
                 let cap = match &self.cache {
@@ -1375,7 +1395,14 @@ impl Conductor {
                     // The lookup first: its proposal costs nothing, and it
                     // learns from what is right whether it is taken or not.
                     a.drafter.draft(&self.corpus, cap, &mut a.lookup, &mut a.lookup_chances);
-                    let own = cap.min(self.model.own_drafts() as usize);
+                    // The model's own drafts are made on the device while the
+                    // step runs, so a row cannot be corrected for the drafts
+                    // before it, which it must be for some requests.
+                    let own = if a.sampler.allows_own_drafts() {
+                        cap.min(self.model.own_drafts() as usize)
+                    } else {
+                        0
+                    };
                     a.own_acceptance.rates(
                         &self.own_engine,
                         self.config.draft_prior,
@@ -1709,6 +1736,7 @@ impl Conductor {
             .map_err(full)?;
         self.runs.clear();
         self.samplers.clear();
+        self.step_rows.clear();
         self.updates.clear();
         let mut row_index = 0u32;
         let counters = &mut self.stats.counters;
@@ -1716,7 +1744,7 @@ impl Conductor {
         let mut has_prompt = false;
         let mut has_generation = false;
         for part in &self.parts {
-            let a = self.slots[part.slot as usize].as_ref().expect("running");
+            let a = self.slots[part.slot as usize].as_mut().expect("running");
             // The position of the first row.
             let first_cell = part.from as u32;
             match part.kind {
@@ -1746,7 +1774,15 @@ impl Conductor {
                     }
                     if completes {
                         self.runs.push((row_index + part.rows - 1, 1));
-                        self.samplers.push(a.sampling.row(first_cell + part.rows - 1));
+                        let row = a.sampler.row(
+                            first_cell + part.rows - 1,
+                            &a.tokens,
+                            a.prompt_len as usize,
+                            &[],
+                            0,
+                            &mut self.step_rows,
+                        );
+                        self.samplers.push(row);
                     }
                 }
                 PartKind::Window | PartKind::Score { .. } => {
@@ -1764,7 +1800,17 @@ impl Conductor {
                         // model's draft block writes them on the device.
                         writer.own_drafts().map_err(full)?;
                     }
-                    self.samplers.extend((0..part.rows).map(|k| a.sampling.row(first_cell + k)));
+                    for k in 0..part.rows as usize {
+                        let row = a.sampler.row(
+                            first_cell + k as u32,
+                            &a.tokens,
+                            a.prompt_len as usize,
+                            &a.draft,
+                            k,
+                            &mut self.step_rows,
+                        );
+                        self.samplers.push(row);
+                    }
                     writer
                         .row(Row {
                             slot: part.slot,
@@ -1807,6 +1853,8 @@ impl Conductor {
             counters.mixed_steps += 1;
         }
         writer.runs(&self.runs).map_err(full)?;
+        writer.corrections(&self.step_rows.entries).map_err(full)?;
+        writer.masks(&self.step_rows.masks, self.mask_words).map_err(full)?;
         writer.samplers(self.samplers.iter().copied()).map_err(full)?;
         writer.commits(&self.commits).map_err(full)?;
         // Page-table changes since the devices last saw the tables.
@@ -1867,6 +1915,8 @@ impl Conductor {
                     }
                     if completes {
                         let pick = self.output.picks[cursor];
+                        let probs = self.output.logprobs.get(cursor..=cursor).unwrap_or(&[]);
+                        a.sampler.picked(&[pick], probs);
                         cursor += 1;
                         a.accept(
                             &*self.model,
@@ -1879,6 +1929,7 @@ impl Conductor {
                 }
                 PartKind::Window | PartKind::Score { .. } => {
                     let picks = &self.output.picks[cursor..cursor + part.rows as usize];
+                    let probs_at = cursor;
                     cursor += part.rows as usize;
                     // Draft `i` is accepted when it equals what the model
                     // picked after the row before it, and only if all the
@@ -1928,6 +1979,9 @@ impl Conductor {
                     }
                     self.scratch_tokens.clear();
                     self.scratch_tokens.extend(picks[..=accepted].iter().map(|p| p.token));
+                    let probs =
+                        self.output.logprobs.get(probs_at..probs_at + accepted + 1).unwrap_or(&[]);
+                    a.sampler.picked(&picks[..=accepted], probs);
                     a.accept(
                         &*self.model,
                         &self.spec,
@@ -1995,7 +2049,16 @@ impl Conductor {
             let slot = self.parts[i].slot;
             let a = self.slots[slot as usize].as_mut().expect("running");
             let mut listening = true;
-            if !a.emitted.is_empty() {
+            // The probabilities of the tokens whose text goes out now go out
+            // first (a token that prints nothing goes out with the text
+            // before it).
+            if a.sampler.wants_probs() {
+                let probs = a.sampler.text_sent(a.emitted.len());
+                if !probs.is_empty() {
+                    listening = a.sink.send(Event::Logprobs(probs));
+                }
+            }
+            if listening && !a.emitted.is_empty() {
                 listening = a.sink.send(Event::Text(std::mem::take(&mut a.emitted)));
             }
             match a.finished {

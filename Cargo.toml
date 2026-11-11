@@ -18,6 +18,7 @@ ares-sched = { path = "crates/sched" }
 ares-weights = { path = "crates/weights" }
 ares-store = { path = "crates/store" }
 ares-tokenizer = { path = "crates/tokenizer" }
+ares-sampler = { path = "crates/sampler" }
 
 thiserror = "2"
 memmap2 = "0.9"

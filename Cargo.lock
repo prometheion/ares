@@ -34,6 +34,7 @@ dependencies = [
  "ares-core",
  "ares-gguf",
  "ares-quant",
+ "ares-sampler",
  "libloading",
  "thiserror",
 ]
@@ -69,6 +70,7 @@ dependencies = [
  "ares-io",
  "ares-quant",
  "ares-runtime",
+ "ares-sampler",
  "ares-state",
  "ares-tokenizer",
  "ares-vulkan",
@@ -93,6 +95,7 @@ dependencies = [
  "ares-gguf",
  "ares-io",
  "ares-quant",
+ "ares-sampler",
  "ares-sched",
  "ares-server",
  "ares-state",
@@ -101,6 +104,10 @@ dependencies = [
  "thiserror",
  "tokio",
 ]
+
+[[package]]
+name = "ares-sampler"
+version = "0.0.1"
 
 [[package]]
 name = "ares-sched"
@@ -120,6 +127,7 @@ dependencies = [
  "ares-gguf",
  "ares-model",
  "ares-runtime",
+ "ares-sampler",
  "ares-state",
  "ares-tokenizer",
  "axum",

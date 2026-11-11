@@ -13,8 +13,8 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
 use ares_api::{
-    ChatFormat, Engine, EngineError, Event, EventSink, GenerateRequest, ModelCard, Prompt,
-    RequestId, Sampling,
+    BiasKey, ChatFormat, Engine, EngineError, Event, EventSink, GenerateRequest, LogitBias,
+    LogprobRequest, ModelCard, Prompt, RequestId, Sampling, TokenProbs,
 };
 use ares_core::GgmlType;
 use ares_cuda::{CacheFormat, Device, Wait, device_count};
@@ -276,6 +276,54 @@ fn ask(runtime: &Runtime, id: u64, prompt: &[u32], max_tokens: u32) -> Vec<u32> 
     rx.recv_timeout(Duration::from_secs(300)).expect("an answer in time").unwrap()
 }
 
+/// The tokens a request with the sampler settings `sampling` wrote, with the
+/// probabilities it reported, and whether drafts were allowed for it.
+fn ask_sampled(
+    runtime: &Runtime,
+    id: u64,
+    prompt: &[u32],
+    max_tokens: u32,
+    sampling: Sampling,
+    draft: bool,
+) -> (Vec<u32>, Vec<TokenProbs>) {
+    let (tx, rx) = mpsc::channel();
+    let said = Arc::new(Mutex::new((String::new(), Vec::new())));
+    let sink = {
+        let said = said.clone();
+        EventSink::new(move |event| {
+            match event {
+                Event::Text(piece) => said.lock().unwrap().0.push_str(&piece),
+                Event::Logprobs(probs) => said.lock().unwrap().1.extend(probs),
+                Event::Done { .. } => {
+                    let _ = tx.send(Ok(()));
+                }
+                Event::Error(error) => {
+                    let _ = tx.send(Err(error.to_string()));
+                }
+            }
+            true
+        })
+    };
+    let words: Vec<String> = prompt.iter().map(|t| format!("t{t}")).collect();
+    runtime
+        .submit(
+            GenerateRequest {
+                model: "made".into(),
+                prompt: Prompt::Text(words.join(" ")),
+                sampling,
+                max_tokens: Some(max_tokens),
+                stop: Vec::new(),
+                draft,
+                id: RequestId(id),
+            },
+            sink,
+        )
+        .unwrap();
+    rx.recv_timeout(Duration::from_secs(300)).expect("an answer in time").unwrap();
+    let (text, probs) = std::mem::take(&mut *said.lock().unwrap());
+    (tokens_of(&text), probs)
+}
+
 /// Puts every expert into a VRAM slot.
 ///
 /// An expert that is in no slot is computed on the CPU or uploaded, whichever
@@ -322,6 +370,7 @@ fn submit(
                 Event::Error(error) => {
                     let _ = tx.send(Err(error.to_string()));
                 }
+                Event::Logprobs(_) => {}
             }
             true
         })
@@ -465,6 +514,51 @@ fn the_runtime_answers_as_the_session_does_in_every_placement() {
         );
         assert_eq!(got, want, "{placement:?}: the runtime says something else than the session");
         assert_eq!(first[..5], want[..5], "{placement:?}: the answer with fetched experts");
+    }
+}
+
+#[test]
+fn the_samplers_settings_of_a_request_reach_this_model_too() {
+    if !enabled() {
+        return;
+    }
+    let prompt = prompt(21, 3);
+    let greedy = Sampling { temperature: Some(0.0), ..Sampling::default() };
+    for placement in placements() {
+        let (runtime, model) = start(1, placement, 16, RuntimeConfig::default());
+        warm(&model);
+        let (plain, none) = ask_sampled(&runtime, 1, &prompt, 24, greedy.clone(), true);
+        assert!(none.is_empty(), "{placement:?}: probabilities nobody asked for");
+        // The model's own probabilities come with every token of the reply,
+        // and the most probable alternative of a greedy reply is its token.
+        // The request says no drafts, which this model does not make anyway:
+        // the two work together.
+        let asking = Sampling {
+            logprobs: Some(LogprobRequest { top: 3, after_chain: false }),
+            ..greedy.clone()
+        };
+        let (again, probs) = ask_sampled(&runtime, 2, &prompt, 24, asking, false);
+        assert_eq!(again, plain, "{placement:?}: asking for probabilities changed the reply");
+        assert_eq!(probs.len(), plain.len(), "{placement:?}");
+        for (token, said) in plain.iter().zip(&probs) {
+            assert_eq!(said.token, *token, "{placement:?}");
+            assert_eq!(said.alternatives[0].token, *token, "{placement:?}");
+            assert!(said.logprob <= 0.0 && said.alternatives.len() == 3, "{placement:?}");
+        }
+        // A token that must not be picked is not, and the best of the rest is.
+        // The probabilities are the model's own, so the banned token is still
+        // the most probable and the one picked is the next.
+        let banned = Sampling {
+            logit_bias: vec![LogitBias { key: BiasKey::Token(plain[0]), bias: None }],
+            logprobs: Some(LogprobRequest { top: 2, after_chain: false }),
+            ..greedy.clone()
+        };
+        let (after_ban, probs) = ask_sampled(&runtime, 3, &prompt, 24, banned, true);
+        assert_ne!(after_ban[0], plain[0], "{placement:?}: the ban");
+        assert_eq!(probs[0].alternatives[0].token, plain[0], "{placement:?}");
+        assert_eq!(after_ban[0], probs[0].alternatives[1].token, "{placement:?}");
+        assert_nothing_missed(&model, "the answers with filled tiers");
+        runtime.shutdown();
     }
 }
 

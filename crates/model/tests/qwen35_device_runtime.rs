@@ -10,13 +10,15 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, mpsc};
 
 use ares_api::{
-    Engine, Event, EventSink, GenerateRequest, Message, Prompt, RequestId, Role, Sampling,
+    BiasKey, Engine, Event, EventSink, GenerateRequest, LogitBias, LogprobRequest, Message, Prompt,
+    RequestId, Role, SamplerKind, Sampling, TokenProbs,
 };
 use ares_cuda::{Device, Precision, Wait, device_count};
 use ares_gguf::Gguf;
 use ares_model::qwen35::device::{Options, Qwen35, Rows, Session, Spread, Wanted};
 use ares_model::qwen35::{Config, LogitRows, Reference, SequenceState, Weights};
-use ares_runtime::{GpuConfig, Runtime, RuntimeConfig};
+use ares_runtime::{GpuConfig, Runtime, RuntimeConfig, TokenFilter};
+use ares_sampler::TokenMask;
 
 fn enabled() -> bool {
     if std::env::var_os("ARES_TEST_CUDA").is_none() {
@@ -211,6 +213,7 @@ fn ask(runtime: &Runtime, id: u64, question: &str, max_tokens: u32) -> String {
         let text = text.clone();
         EventSink::new(move |event| {
             match event {
+                Event::Logprobs(_) => {}
                 Event::Text(piece) => text.lock().unwrap().push_str(&piece),
                 Event::Done { .. } => {
                     let _ = tx.send(Ok(()));
@@ -301,5 +304,220 @@ fn the_engine_answers_alone_and_two_at_once() {
     if let Some(snapshot) = runtime.snapshot() {
         eprintln!("RES counters: {:?}", snapshot.counters);
     }
+    runtime.shutdown();
+}
+
+/// What a request said and the probabilities it reported.
+type Answer = (String, Vec<TokenProbs>);
+
+/// A request with the sampler settings `sampling`, restricted by `filter`
+/// when there is one.
+fn ask_with(
+    runtime: &Runtime,
+    id: u64,
+    question: &str,
+    sampling: Sampling,
+    filter: Option<Box<dyn TokenFilter>>,
+    max_tokens: u32,
+) -> Answer {
+    let (tx, rx) = mpsc::channel();
+    let said = Arc::new(Mutex::new((String::new(), Vec::new())));
+    let sink = {
+        let said = said.clone();
+        EventSink::new(move |event| {
+            match event {
+                Event::Logprobs(probs) => said.lock().unwrap().1.extend(probs),
+                Event::Text(piece) => said.lock().unwrap().0.push_str(&piece),
+                Event::Done { .. } => {
+                    let _ = tx.send(Ok(()));
+                }
+                Event::Error(error) => {
+                    let _ = tx.send(Err(error.to_string()));
+                }
+            }
+            true
+        })
+    };
+    let request = GenerateRequest {
+        model: "q".into(),
+        prompt: Prompt::Chat {
+            messages: vec![Message::new(Role::User, question)],
+            tools: None,
+            variables: Vec::new(),
+        },
+        sampling,
+        max_tokens: Some(max_tokens),
+        stop: Vec::new(),
+        draft: true,
+        id: RequestId(id),
+    };
+    match filter {
+        Some(filter) => runtime.submit_filtered(request, sink, filter).unwrap(),
+        None => runtime.submit(request, sink).unwrap(),
+    }
+    rx.recv().unwrap().unwrap();
+    std::mem::take(&mut *said.lock().unwrap())
+}
+
+/// Allows the tokens below 100 000 and, for every other row, only the even ones.
+struct Evens(u32);
+
+impl TokenFilter for Evens {
+    fn mask(&mut self, reply: &[u32], drafts: &[u32], mask: &mut TokenMask) -> bool {
+        let n = reply.len() + drafts.len();
+        mask.fill(false);
+        for token in (0..self.0).step_by(1 + n % 2) {
+            mask.set(token, true);
+        }
+        true
+    }
+}
+
+/// The probabilities of an answer that asked for `top` alternatives per token
+/// (or for none), and the rule they follow.
+fn check_probabilities(name: &str, probs: &[TokenProbs], top: Option<usize>) {
+    let Some(top) = top else {
+        assert!(probs.is_empty(), "{name}: probabilities nobody asked for");
+        return;
+    };
+    assert!(probs.len() >= 20, "{name}: {} probabilities", probs.len());
+    for token in probs {
+        assert!(token.logprob <= 0.0 && token.logprob.is_finite(), "{name}: {token:?}");
+        let n = token.alternatives.len();
+        assert!((1..=top).contains(&n), "{name}: {n} alternatives of at most {top}: {token:?}");
+        let best = token.alternatives.iter().map(|a| a.logprob).fold(f32::MIN, f32::max);
+        assert!(token.logprob <= best + 1e-6, "{name}: no alternative is more probable: {token:?}");
+    }
+}
+
+/// Every kind of sampler setting through the whole engine on the real model:
+/// each answers, and the probabilities that were asked for come with it. (This
+/// model has no draft block, so nothing is drafted; that drafts do not change
+/// the answer under these settings is checked on the 27B, in
+/// `qwen35_mtp_runtime`.)
+#[test]
+fn every_kind_of_sampler_setting_answers_on_the_real_model() {
+    let (true, Some(path)) = (enabled(), env_path("ARES_TEST_QWEN35_MODEL")) else {
+        return;
+    };
+    let question =
+        "Write the line 'the quick brown fox jumps over the lazy dog' four times, numbered.";
+    let sampled = |f: &dyn Fn(&mut Sampling)| {
+        let mut s = Sampling { temperature: Some(0.8), seed: Some(99), ..Sampling::default() };
+        f(&mut s);
+        s
+    };
+    let settings: Vec<(&str, Sampling)> = vec![
+        ("nothing set but a temperature", sampled(&|_| {})),
+        (
+            "penalties",
+            sampled(&|s| {
+                s.repeat_penalty = Some(1.15);
+                s.frequency_penalty = Some(0.2);
+                s.presence_penalty = Some(0.1);
+                s.repeat_last_n = Some(64);
+            }),
+        ),
+        (
+            "dry",
+            sampled(&|s| {
+                s.dry_multiplier = Some(0.8);
+                s.dry_penalty_last_n = Some(128);
+            }),
+        ),
+        (
+            "a ban and a bias by text",
+            sampled(&|s| {
+                s.logit_bias = vec![
+                    LogitBias { key: BiasKey::Text(" the".into()), bias: None },
+                    LogitBias { key: BiasKey::Text(" fox".into()), bias: Some(2.0) },
+                ];
+            }),
+        ),
+        (
+            "typical, top-n-sigma, xtc and a dynamic temperature",
+            sampled(&|s| {
+                s.typical_p = Some(0.9);
+                s.top_n_sigma = Some(3.0);
+                s.xtc_probability = Some(0.3);
+                s.dynatemp_range = Some(0.3);
+            }),
+        ),
+        (
+            "an order of its own",
+            sampled(&|s| {
+                s.top_k = Some(60);
+                s.top_p = Some(0.9);
+                s.min_p = Some(0.02);
+                s.samplers = Some(vec![
+                    SamplerKind::Temperature,
+                    SamplerKind::MinP,
+                    SamplerKind::TopK,
+                    SamplerKind::TopP,
+                ]);
+            }),
+        ),
+        (
+            "the model's own probabilities",
+            sampled(&|s| {
+                s.top_k = Some(40);
+                s.logprobs = Some(LogprobRequest { top: 5, after_chain: false });
+            }),
+        ),
+        (
+            "the probabilities after the chain",
+            sampled(&|s| {
+                s.top_k = Some(40);
+                s.top_p = Some(0.9);
+                s.logprobs = Some(LogprobRequest { top: 5, after_chain: true });
+            }),
+        ),
+        (
+            "greedy with penalties",
+            Sampling {
+                temperature: Some(0.0),
+                repeat_penalty: Some(1.3),
+                repeat_last_n: Some(32),
+                ..Sampling::default()
+            },
+        ),
+        ("mirostat 2", sampled(&|s| s.mirostat = Some(2))),
+        ("mirostat 1", sampled(&|s| s.mirostat = Some(1))),
+    ];
+    let model = Arc::new(
+        Qwen35::new(
+            Gguf::open(&path).unwrap(),
+            "q",
+            &Spread::Single,
+            options(Precision::Exact),
+            1024,
+        )
+        .unwrap(),
+    );
+    let vocab = ares_runtime::Model::vocab(&*model);
+    let config =
+        RuntimeConfig { pages: 32, cells_per_page: 128, max_slots: 2, ..RuntimeConfig::default() };
+    let gpu = GpuConfig::new(&config, &*model);
+    let device = Device::open(0, Wait::Block).unwrap();
+    let runtime = Runtime::start_gpu(model, vec![device], config, gpu).unwrap();
+    for (i, (name, sampling)) in settings.iter().enumerate() {
+        let asks = sampling.logprobs.map(|asked| asked.top as usize);
+        let (text, probs) =
+            ask_with(&runtime, 10 + i as u64, question, sampling.clone(), None, 100);
+        eprintln!("RES {name}: {text:?}");
+        assert!(text.chars().count() > 20, "{name}: {text:?}");
+        check_probabilities(name, &probs, asks);
+    }
+    let (text, probs) = ask_with(
+        &runtime,
+        99,
+        question,
+        sampled(&|s| s.top_k = Some(50)),
+        Some(Box::new(Evens(100_000.min(vocab)))),
+        60,
+    );
+    eprintln!("RES a filter: {text:?}");
+    assert!(text.chars().count() > 10, "a filter: {text:?}");
+    check_probabilities("a filter", &probs, None);
     runtime.shutdown();
 }

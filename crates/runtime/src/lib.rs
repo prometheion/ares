@@ -64,6 +64,7 @@ mod links;
 mod model;
 mod ram;
 mod record;
+mod sampling;
 mod sync;
 mod synthetic;
 pub mod testing;
@@ -86,6 +87,7 @@ pub use record::{
     Commit, PageCopy, RecordFull, RecordView, RecordWriter, Row, StateCopy, StateCopyKind,
     TableUpdate,
 };
+pub use sampling::TokenFilter;
 pub use sync::{WakeCounts, Woke};
 pub use synthetic::{SyntheticConfig, SyntheticModel};
 pub use text::{StopMatcher, printable, unprintable};
