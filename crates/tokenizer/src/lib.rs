@@ -84,6 +84,7 @@ mod error;
 mod jinja;
 mod json;
 mod pretok;
+mod reasoning;
 mod tokenizer;
 mod unicode;
 #[rustfmt::skip]
@@ -94,5 +95,6 @@ pub use chat::{ChatError, ChatOptions, ChatTemplate, Content, Message, Tool, Too
 pub use decode::Detokenizer;
 pub use error::{Error, Result};
 pub use json::{Json, JsonError};
+pub use reasoning::ReasoningFormat;
 pub use tokenizer::{EncodeOptions, TokenKind, Tokenizer};
 pub use vocab::SpecialTokens;

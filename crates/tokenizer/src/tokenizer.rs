@@ -10,6 +10,7 @@ use crate::cache::{MAX_WORD, WordCache};
 use crate::chat::{ChatError, ChatOptions, ChatTemplate, Message, Tool};
 use crate::error::{Error, Result};
 use crate::pretok;
+use crate::reasoning::ReasoningFormat;
 use crate::unicode::{classes, cpt_at, sanitize};
 use crate::unicode_table::SPACE;
 use crate::vocab::{Pre, SpecialTokens, Vocab, attr};
@@ -526,6 +527,13 @@ impl Tokenizer {
     /// Whether the model file has a chat template.
     pub fn has_chat_template(&self) -> bool {
         self.chat.is_some() || self.chat_tool_use.is_some()
+    }
+
+    /// How the model's chat template handles thinking, or `None` if it has
+    /// none (or no chat template, or one that cannot be used).
+    pub fn reasoning_format(&self) -> Option<ReasoningFormat> {
+        let template = self.chat.as_ref().or(self.chat_tool_use.as_ref())?.as_ref().ok()?;
+        ReasoningFormat::detect(template)
     }
 
     /// The prompt for a conversation, made by the model's chat template.
