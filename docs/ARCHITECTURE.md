@@ -12,14 +12,25 @@ cache.
 
 Scope decisions:
 
-- **Two test cases stand for Qwen4.** Until Qwen4 is released the engine is
-  built and measured on its two closest relatives, one for each way weights
-  are held: Qwen3.8-27B (`qwen35`), dense and entirely on the GPUs, on both
-  cards; and Qwen3.8-Flash-Next (`qwen4exp`), a mixture of experts with the
-  experts in tiers and streamed from SSD. A part of the engine is done when
-  it has run in both. On the development machine (two cards with 12 GB, 31
-  GB of RAM, a 63.5 GiB file) Flash-Next can only run with streaming, so the
-  case without it is not measured there.
+- **Two supported models until Qwen4.** Qwen3.8-27B (`qwen35`), dense and
+  entirely on the GPUs, and Qwen3.8-Flash-Next (`qwen4exp`), a mixture of
+  experts with the experts in tiers and streamed from SSD, are the models
+  the engine supports. They are also the two cases every part is built and
+  measured on, one for each way weights are held: a part of the engine is
+  done when it has run in both. Both are deprecated when Qwen4 is released
+  and removed when it has replaced them. On the development machine (two
+  cards with 12 GB, 31 GB of RAM, a 63.5 GiB file) Flash-Next can only run
+  with streaming, so the case without it is not measured there.
+
+- **The first release is complete.** There is no release before the engine
+  has everything: what the llama.cpp fork it replaces has and what the other
+  engines have, inside the limits listed here, ready for use, with the same
+  features on CUDA and on Vulkan. That includes drafts from block drafters
+  with draft trees, image input, the decision endpoint, a path for Turing
+  cards and the prompt cache on SSD. The list of features, who has each and
+  how far Ares is, is
+  [reference/feature-checklist.md](reference/feature-checklist.md); a
+  release date is not a reason to leave a row out.
 
 - **Nothing is tuned to one machine.** The CUDA backend serves every GPU
   that CUDA 13 supports, the Vulkan backend every other. Which kernel, block
@@ -267,7 +278,7 @@ request, medians):
   half of the time, and 320 for 32, where the two halves overlap. Steps do
   not overlap yet: the next step is planned only when the current one has
   ended.
-- **Speculation** with the n-gram drafter on repeating text doubles one
+- **Speculation** with a drafter that copies from earlier text doubles one
   request (205 to 425 tokens/s on a 16-layer model) and gives nothing at
   eight requests, where a ninth row costs a second launch.
 - Through HTTP with 32 streaming clients the single device gives 300
@@ -1397,7 +1408,7 @@ GPU that CUDA 13 does not run on.
 | Marlin, ExLlamaV3, LMDeploy, TensorRT-LLM (their kernels) | Weights rearranged at load into the order the tensor cores read them and decoded in registers; `f16` accumulators folded into `f32` on capped cards; one decode of a matrix and a dense product for wide steps; the shape of the attention kernels; bit planes for K/V codes | `ares-quant` (planes done); `ares-cuda` prefill and attention kernels (in progress) |
 | FlashInfer | Attention as states that merge (`lse`, `v`), so a head is computed over any split of its cells; block-sparse attention over a block table | `ares-quant::kvhead` (reference done); kernels in progress |
 | vLLM, SGLang, TGI, TokenSpeed, LMDeploy, ExLlamaV3 (their schedulers and caches) | Pages claimed per step with a reservation for the output still expected; a request waits when it does not fit; prefix pages published when they fill, with tails; checkpoint intervals and eviction for recurrent state; a context term in the step cost | `ares-sched`, `ares-state` (done as bookkeeping, not wired into the conductor) |
-| TensorRT-LLM, SGLang, vLLM (suffix decoding) | One lookup drafter on a suffix automaton over a corpus shared by all requests | `ares-sched` (done, not wired) |
+| TensorRT-LLM, SGLang, vLLM (suffix decoding) | One lookup drafter on a suffix automaton over a corpus shared by all requests | `ares-sched`, used by the conductor |
 | MiniJinja | The interpreter of chat templates | `ares-tokenizer` |
 | llguidance | Grammar-constrained output by validating the GPU's top candidates on the CPU | Planned |
 | AirLLM | Nothing beyond the expert tiers: reading whole layers per pass is bounded by disk throughput | - |

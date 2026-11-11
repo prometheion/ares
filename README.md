@@ -15,16 +15,20 @@ How the engine is built and how far each part is: [docs/ARCHITECTURE.md](docs/AR
 
 ## State
 
-Two test models stand in for Qwen4 until it is released. Qwen3.8-27B is
-served by the `ares` binary on two GPUs through CUDA, with drafts from the
-model's own draft block and sampling on the device, and is ahead of the
-llama.cpp fork it is measured against in prompt processing and in
-generation. Qwen3.8-Flash-Next, a mixture of experts streamed from SSD,
-runs on the same two GPUs and agrees with its CPU reference, but is not
-served yet and not yet faster than Strata, the engine it is measured
-against. Work is paused until Qwen4. The numbers are in
-[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#status). There is no release
-before Qwen4.
+Ares supports two models until Qwen4 replaces them: Qwen3.8-27B, dense, and
+Qwen3.8-Flash-Next, a mixture of experts streamed from SSD. The 27B is
+served by the `ares` binary on one or two GPUs through CUDA, with drafts
+from the model's own draft block, sampling on the device and a prefix cache
+that lets a conversation continue from what was computed; on two GPUs it is
+ahead of the llama.cpp fork it is measured against in prompt processing and
+in generation. Flash-Next runs on two GPUs and agrees with its CPU
+reference, but is not served yet and not yet faster than the engines it is
+measured against. The numbers are in
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#status).
+
+There is no release yet. The first release is the complete engine: every
+row of [docs/reference/feature-checklist.md](docs/reference/feature-checklist.md)
+that is inside the engine's scope, on CUDA and on Vulkan.
 
 ## Build
 
@@ -83,7 +87,7 @@ at that library with `ARES_LIBCUDA=<path>/libcuda.so.1`.
 | `crates/state` | Sequence state: pages, prefix sharing, checkpoints |
 | `crates/store` | Sequence state on disk (the prompt cache that survives restarts) |
 | `crates/io` | Reads of weights straight from the model file (io_uring, direct I/O) |
-| `crates/sched` | Step planning, draft policy, n-gram drafter |
+| `crates/sched` | Step planning, admission, draft policy, lookup drafter |
 | `crates/weights` | Expert tiers and pruning policy |
 | `crates/runtime` | Conductor and device threads: the step loop |
 | `crates/model` | Model architectures: CPU reference and device implementation |
