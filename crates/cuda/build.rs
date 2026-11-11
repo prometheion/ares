@@ -21,7 +21,8 @@
 //! are therefore built for compute capability 8.0 and newer only (PTX for the
 //! lowest such target the toolkit lists, 8.0 with CUDA 13.4). A GPU below that
 //! loads the first module and not the second; there are no prefill kernels
-//! for it and nothing stands in for them.
+//! for it and nothing stands in for them. The many-row expert kernels
+//! (`kernels/expertrows.cu`) are built the same way and for the same reason.
 //!
 //! Environment:
 //! - `NVCC`: path of the compiler (default: `$CUDA_PATH/bin/nvcc`,
@@ -96,6 +97,7 @@ fn main() {
         ("layers.cu", "layers.fatbin", FLOOR),
         ("attention.cu", "attention.fatbin", TENSOR_FLOOR),
         ("experts.cu", "experts.fatbin", FLOOR),
+        ("expertrows.cu", "expertrows.fatbin", TENSOR_FLOOR),
         ("q4.cu", "q4.fatbin", FLOOR),
         ("sampler.cu", "sampler.fatbin", FLOOR),
     ];

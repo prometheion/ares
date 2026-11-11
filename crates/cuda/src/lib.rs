@@ -44,8 +44,8 @@ pub use device::{
 pub use driver::{LIBRARY_ENV, driver_version};
 pub use error::{Error, Result};
 pub use experts::{
-    EXPERT_MAX_EXPERTS, EXPERT_MAX_K, ExpertKernels, ExpertShape, HostShare, RouteGroup,
-    RouteRecord,
+    Accumulate, EXPERT_MAX_EXPERTS, EXPERT_MAX_K, ExpertKernels, ExpertRowKernels, ExpertShape,
+    HostShare, ROWS_TILES, RouteGroup, RouteRecord, RowsItem, RowsPlan, RowsPlanLayout,
 };
 pub use kernels::{
     ActivationForm, Kernels, LayoutKernel, LayoutRows, LayoutTable, MAX_BATCH, Precision,
