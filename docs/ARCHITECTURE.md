@@ -809,10 +809,10 @@ pages) and comes with the runtime.
   fetches 224 experts once when it sees the whole prompt, and 5243 times one
   (23 times each) when the prompt comes in chunks of 64 rows.
 
-  What is missing is everything that computes: the conductor that runs the
-  pieces and keeps the hidden states of all prompt rows between them, the
-  kernels that compute a wave for the rows routed to it, and a model with
-  experts.
+  What is missing is the conductor that runs the pieces and keeps the hidden
+  states of all prompt rows between them, and a model with experts. The
+  kernels that compute a wave for the rows routed to it are built (see
+  "Many-row expert kernels" under "Devices").
 - **More from the engines that stream experts** (details and the sources'
   numbers in [reference/moe-offload-survey.md](reference/moe-offload-survey.md)).
   Built as bookkeeping in `ares-weights`, with no runtime using it yet; the
@@ -1024,6 +1024,168 @@ per second at 2048 tokens for its whole forward pass, so the weights alone are
 now about 1.3 to 1.5 times as fast as the fork's whole pass; attention and the
 rest still come on top. The f32 copy is of use only to the decode kernels of
 the float types and is to leave the buffer the prefill kernels size.
+
+**Many-row expert kernels** (`kernels/expertrows*.cuh`,
+`ares_cuda::ExpertRowKernels`). The experts of a MoE layer for any number of rows,
+on the tensor cores, for the types of Qwen3.8-Flash-Next (gate and up IQ2_S,
+IQ2_XXS, IQ1_M; down Q2_0). The decode kernels above take eight rows; these take
+as many as there is memory for, and are meant for prompts and windows of drafts.
+Four stages, all on the device, none needing the host to read the picks:
+
+- **Plan** (`plan_rows`). From a route record of any number of rows (the ids and
+  weights the router writes, `n_rows * top_k` of each) a stable counting sort by
+  expert: the pairs (row, pick) of an expert follow each other in the order of
+  their numbers, and each expert's run is cut into items of at most `tile` pairs
+  (8, 16, 32 or 64). One launch for up to 1024 pairs, three above (a block per
+  1024 pairs counts and ranks with `__match_any_sync`, one block turns the counts
+  into positions and items, a block per 1024 pairs scatters). The plan lists the
+  first position of each expert, the items `(expert, first, count)`, the row and
+  router weight at each position and the position of each pair; a pair whose id
+  is out of range is dropped. The kernels are launched for the most items a plan
+  can have and the surplus blocks return at once, so nothing waits for the count.
+- **Gate and up** (`rows_gate_up`). A block takes an item and 64 of the expert's
+  hidden values, a warp 16: 16 rows of gate and the same 16 of up against all the
+  pairs of the item, so the weights are read once for all of them, from the
+  address a table of one `u64` per expert gives (0: not present). The weights are
+  the A operand of `mma.m16n8k16` and are decoded in registers from the file's
+  bytes into f16 (the codebook magnitudes come out of the bytes as `1024 + m`
+  with the trick of Marlin and one fused multiply-add with the scale; the signs
+  are XORed into the sign bits from a table of masks in shared memory), the
+  activations the B operand, gathered by `cp.async` from the f16 rows of
+  `Kernels::prepare_prefill_activations`. A thread of a quad takes one sub-block of
+  32 values of every 128, which is what its two `mma` of a step need, since the
+  order of K inside an `mma` is free if both operands use the same. The epilogue
+  makes `silu(gate) * up` in f32, divides it by a power of two per pair and 64
+  values (so nothing overflows an f16) and stores f16.
+- **Down** (`rows_down`). The same with Q2_0: a word of 16 codes gives the pairs
+  (value j, value j + 8) of the operand with one shift and mask, so the hidden
+  values are stored in that order. The product of a block of 64 is multiplied by
+  the pair's scale as it is added to the accumulators.
+- **Sum** (`Accumulate`). `Atomic` adds the weighted output to the row with
+  `red.add` (no scratch; the order in which a row's picks are added depends on the
+  schedule). `Ordered` writes it to a scratch of `top_k * n_embd` f32 per row
+  (102 KB a row for Flash-Next) and `rows_combine` adds a row's picks in the order
+  of the router: a row then has the same bits alone, in a batch and in any other
+  place of a batch (tested), as the decode kernels guarantee.
+
+An expert of the plan without an address is not read: its pairs add nothing, are
+counted in the plan (`missing_pairs`) and the expert is flagged, so the caller
+knows what to fetch. One plan serves several calls with different tables, which is
+how the waves of a layer run.
+
+Needs compute capability 8.0 (the module is built like the prefill module; a
+Turing card has no tile kernels for experts either).
+
+These kernels do not wait for an expert on the device and have no host share: they skip
+an expert without an address and report it. The decode kernels therefore stay for the
+steps of a generating sequence, which depend on both, and for the windows below the
+break-even. What becomes dead once a prompt pass uses the new ones is the prompt's path
+through `ExpertKernels::experts` in steps of eight rows (and the `check_rows` limit that
+keeps a prompt to them).
+
+Against the exact result (f64 on the dequantized weights and the f32 activations) the
+output is 0.05 to 0.07 % rms off, and the hidden values the same, on generated blocks of
+all four types and on the real tensors of one layer of each type (the same figures on both
+cards). Rows scaled by 1e-4 to 1e5 within one call stay within 0.2 %. The decode
+kernels, which quantize the activations and the hidden values to int8, are at about 1 % in
+the matrices of their family (their expert test allows 5 %).
+
+**f16 or int8 activations.** f16, with f32 accumulation. The reasons, measured: the dense
+kernels of the same cards and the same type (`prefill_bench`, IQ2_S, 17408 x 5120, 1024
+rows) reach 66.5 TOPS with int8 and 52.0 TFLOPS with f16 and f32 accumulation on the RTX
+4070 (29.5 and 22.6 on the RTX 3060), and 73.4 (31.5) with f16 accumulation, so int8 is not
+the fast path for this type. For the experts it would also need the scale of every 16 values
+(IQ2_S) or 32 (IQ2_XXS) applied to the integer sum of each `mma`: either the four threads of
+a quad share one sub-block and each loads the same words (four times the load instructions
+of the layout above), or the scale is applied to every result at about three instructions
+per output. Accumulating in f16 and flushing to f32 every 64 values was built and measured
+on the experts: gate and up at 4096 rows 14 % faster (8.1 against 7.0 ms on the RTX 4070,
+synthetic weights), the output 8e-4 off from the f32 accumulation; it was not kept, since
+the kernels are not bound by the tensor cores (a loop of `mma` alone gets 58.6 of 58.6
+TFLOPS here; the kernels get 33 useful, 40 counting the padding of the last item of an
+expert).
+
+Measured 2026-11-11 on the recorded routes of `qwen4exp` (`examples/expert_rows_bench.rs`:
+`long`, `mixed`, `german` and `english` of `/var/tmp/ares-qwen4exp-trace`, token after token),
+the real experts of one layer, all that the rows pick in device memory, random activations.
+Microseconds for one layer's block (IQ2_S gate and up, Q2_0 down), "block" being plan, gate
+and up, down and, for the ordered sum, the combine, run one after the other; the tile is
+the best of 8, 16, 32 and 64. "Decode kernels" are `ExpertKernels::experts` in launches of
+eight rows (the router and the host-built record are not in their time). GB/s are the weights
+read once (every expert the rows pick) over the block time, TFLOPS are the useful products
+of the three matrices over it; the cards read 473 and 337 GB/s in a loop of coalesced
+reads and compute 58.6 and 25.7 TFLOPS in a loop of `mma` (f16 with f32 accumulation).
+
+RTX 4070, IQ2_S gate and up (blk.0):
+
+| rows | tile | plan | gate and up | down | combine | block, atomic | block, ordered | rows/s | GB/s | TFLOPS | decode kernels | times faster |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 8 | 7.4 | 62 | 19 | 10 | 83 | 94 | 12106 | 183 | 1.2 | 62 | 0.76 |
+| 2 | 8 | 6.7 | 105 | 32 | 9 | 144 | 153 | 13896 | 199 | 1.4 | 101 | 0.70 |
+| 4 | 8 | 6.8 | 178 | 54 | 10 | 242 | 252 | 16512 | 231 | 1.6 | 213 | 0.88 |
+| 8 | 8 | 7.0 | 288 | 80 | 10 | 390 | 403 | 20506 | 244 | 2.0 | 361 | 0.93 |
+| 16 | 8 | 7.3 | 503 | 175 | 10 | 690 | 713 | 23182 | 241 | 2.3 | 737 | 1.07 |
+| 64 | 16 | 9.4 | 1101 | 409 | 10 | 1537 | 1651 | 41634 | 208 | 4.1 | 2901 | 1.89 |
+| 256 | 16 | 16.2 | 1904 | 772 | 22 | 2606 | 2774 | 98243 | 191 | 9.7 | 11814 | 4.53 |
+| 1024 | 32 | 18.4 | 3571 | 1583 | 280 | 4849 | 5368 | 211178 | 145 | 20.8 | 49310 | 10.17 |
+| 4096 | 32 | 26.3 | 8153 | 6587 | 1101 | 13772 | 15663 | 297426 | 53 | 29.2 | 196319 | 14.26 |
+
+RTX 3060, the same:
+
+| rows | tile | plan | gate and up | down | combine | block, atomic | block, ordered | rows/s | GB/s | TFLOPS | decode kernels | times faster |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 8 | 10.0 | 126 | 40 | 12 | 172 | 185 | 5827 | 88 | 0.6 | 144 | 0.84 |
+| 2 | 8 | 9.3 | 214 | 65 | 10 | 292 | 307 | 6845 | 98 | 0.7 | 231 | 0.79 |
+| 4 | 8 | 9.5 | 407 | 121 | 11 | 542 | 560 | 7377 | 103 | 0.7 | 438 | 0.81 |
+| 8 | 8 | 9.7 | 676 | 216 | 12 | 897 | 921 | 8920 | 106 | 0.9 | 759 | 0.85 |
+| 16 | 8 | 10.2 | 1190 | 384 | 12 | 1566 | 1608 | 10219 | 106 | 1.0 | 1540 | 0.98 |
+| 64 | 16 | 13.9 | 2282 | 881 | 30 | 3074 | 3212 | 20822 | 104 | 2.0 | 6014 | 1.96 |
+| 256 | 16 | 21.7 | 3943 | 1849 | 101 | 5706 | 5916 | 44867 | 87 | 4.4 | 24704 | 4.33 |
+| 1024 | 32 | 23.9 | 7847 | 3828 | 395 | 11538 | 12089 | 88750 | 61 | 8.7 | 103300 | 8.95 |
+| 4096 | 64 | 44.4 | 18968 | 11911 | 1523 | 30940 | 32339 | 132386 | 24 | 13.0 | 409562 | 13.24 |
+
+The other two types are faster in proportion to their bytes. Block time with the best tile and
+the atomic sum, RTX 4070 / RTX 3060, in microseconds: IQ2_XXS (blk.1) 73 / 132 at 1 row, 350 / 656
+at 8, 1855 / 4243 at 256, 12998 / 28900 at 4096; IQ1_M (blk.8) 66 / 114, 194 / 404, 1398 / 3551,
+12934 / 28763. The decode kernels at 4096 rows take 183 and 148 ms (RTX 4070), 383 and 296 ms
+(RTX 3060) for the two.
+
+- **From 16 rows on they are as fast or faster than the decode kernels**: 1.9 times as fast at
+  64 rows, 4.3 to 4.5 at 256, 9 to 10 at 1024, 13 to 14 at 4096 (IQ2_S; the others more). Below
+  16 rows the decode kernels still win for IQ2_S (0.7 to 0.93 times as fast on the RTX 4070, 0.8
+  to 0.85 on the RTX 3060 up to 8 rows) and for IQ2_XXS at 1 and 2 rows on the RTX 4070; IQ1_M is
+  ahead from 2 rows, and from 1 row on the RTX 3060. So the family cannot be chosen by a constant:
+  `ExpertRowKernels::few_rows_break_even` times both on the device for the shape (about 100 ms, once
+  at load) and says up to how many rows the decode kernels are faster. The test run found 8 rows
+  for IQ2_S on both cards, 5 (RTX 4070) and 1 (RTX 3060) for IQ2_XXS and none for IQ1_M. A verify
+  window of 2 to 16 rows is therefore not faster than today's kernels for the 34 IQ2_S layers; for
+  the 14 others it is up to 1.4 (IQ2_XXS) to 2 (IQ1_M) times as fast at 16 rows.
+- **What bounds them.** Below 1024 rows the weights' loads: gate and up read 190 to 245 GB/s of
+  the 473 the card can (RTX 3060 90 to 106 of 337), because each lane of a warp reads 2 and 4
+  bytes of 41 bytes of a row per step, eight rows at a time, a pattern that streams at 189 GB/s
+  (149 on the RTX 3060) in a loop of those loads alone, where a warp reading rows in order reads
+  473 (337). Above that the product: 33 TFLOPS of useful products in gate and up (RTX 4070, 4096
+  rows), 20 in down, of the 58.6 of the tensor cores. Branching around unused columns, deeper
+  pipelines, activations resident in shared memory, L2 prefetch hints, and accumulating in f16
+  (14 % faster for 8e-4 more error) were tried and are in the comments of the kernels with
+  their numbers; none closed the gap. The layout of the loads is the open lead.
+- **Atomic or ordered.** `red.add` into the output is 3 to 15 % faster than the scratch and the
+  combine (more above 1024 rows, where the scratch is 100 KB a row), and needs no scratch; the
+  ordered sum is what gives a row the same bits alone, in a batch and in any place of a batch.
+- **The plan** costs 7 us for one row, 9 us at 64, 16 at 256, 26 at 4096 (RTX 4070; 10, 14, 22, 44
+  on the RTX 3060): a few percent of a block at 256 rows and above.
+- **What a prompt pass could reach.** Experts only, all resident, 48 layers (34 of IQ2_S, 11 of
+  IQ2_XXS, 3 of IQ1_M) at the best tile: RTX 4070 650 ms for 4096 rows (6300 rows per second),
+  220 ms for 1024 rows (4640); RTX 3060 1456 ms (2810) and 536 ms (1910); the decode kernels in
+  batches of eight take 9.1 s and 19 s for 4096 rows, 449 and 215 rows per second. Two cards on a
+  layer split can add up to about 9100 rows per second for the experts. The rest of a layer is
+  not in these numbers. The dense parts of the model are 3.4 GiB, which by their bytes is
+  roughly 7 to 13 GFLOP of work per row against the 4.7 of the experts, so a whole pass would take
+  about twice as long at the dense kernels' rates (an estimate, not a measurement). The experts that
+  are not in memory, which the pass has to stream, come on top.
+- **Memory a call needs**, per row for Qwen3.8-Flash-Next (ten picks): 5.2 KB of f16
+  activations, 13.2 KB of hidden values, 102 KB of scratch for the ordered sum (none for the
+  atomic one), 0.12 KB of plan and 10 KB of output; the plan is 0.6 MB for 4096 rows.
 
 **Layer kernels** (`kernels/layers.cu`, `ares_cuda::LayerKernels`).
 Everything a block of `qwen35` does between its matrix products: the
@@ -1436,7 +1598,9 @@ Work is paused here until Qwen4 is released; nothing below is in progress.
   step that misses no expert takes 17 ms). Strata generates at a median of
   56 tokens per second with drafts on this machine, so this model is not
   ahead of its reference engine yet: it has no drafts, and prompts are read
-  at 54 to 73 tokens per second in steps of eight rows.
+  at 54 to 73 tokens per second in steps of eight rows (the session still
+  calls the eight-row expert kernels; the many-row ones are built and not
+  wired).
 - CUDA has every kernel family the two models need: weights for all 28
   types (twelve with a device layout that serves every row count from one
   copy), layers, attention over the stored K/V formats, sampler, sums
@@ -1476,8 +1640,8 @@ order it would be taken up; the source of each idea is in
 1. Qwen4 itself: its architecture next to `qwen4exp`, and whatever its
    files need.
 2. The mixture-of-experts case ahead of Strata: drafts from the model's
-   draft block; the prompt path (experts in waves, tensor-core kernels for
-   the experts' types, steps of more than eight rows); the model behind the
+   draft block; the prompt path (experts in waves and steps of more than
+   eight rows, on the many-row expert kernels, which are built); the model behind the
    runtime's `Model` with flow control by route records, so the server can
    serve it; owners of experts that follow the heat.
 3. Attention for models that attend a few thousand cells through lists: the
