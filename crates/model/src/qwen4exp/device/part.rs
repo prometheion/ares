@@ -262,7 +262,7 @@ pub struct StepEnv<'a> {
     /// worker; the exchanges of a step are numbered from it, alike on both.
     pub xbase: u32,
     /// The memory of the pools of K/V and keys on this device: the pages
-    /// times [`Part::page_bytes`] bytes, laid out as [`Frame`] says.
+    /// times [`Part::page_bytes`] bytes; the part lays out what is in it.
     pub pools: DevicePtr,
 }
 

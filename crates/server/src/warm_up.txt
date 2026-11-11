@@ -1,0 +1,30 @@
+Ein Wörterbuch im Computer ist selten ein Buch, sondern meistens eine Tabelle, in der zu jedem Schlüssel ein Wert gespeichert wird. Damit man einen Eintrag schnell wiederfindet, berechnet das Programm aus dem Schlüssel eine Zahl, den sogenannten Hashwert, und benutzt sie als Adresse in einem großen Feld. Wenn zwei verschiedene Schlüssel dieselbe Adresse ergeben, spricht man von einer Kollision. Dann legt man die Einträge entweder in einer kleinen Liste an derselben Stelle ab oder sucht der Reihe nach den nächsten freien Platz. Solange das Feld nicht zu voll wird, bleibt der Zugriff so gut wie unabhängig davon, wie viele Einträge schon darin stehen. Deshalb vergrößert das Programm die Tabelle rechtzeitig und verteilt alle Einträge neu, was zwar einmal teuer ist, sich aber über viele Zugriffe wieder ausgleicht.
+
+A lighthouse lens works by collecting the light of a small flame and sending it out in one direction instead of letting it spread in all of them. The glass is cut into rings, each of which bends the light by a slightly different amount, so that a lens as tall as a person weighs far less than a solid block of glass of the same power would. In the older lighthouses the whole lens turned slowly on a bed of mercury, and a keeper wound the clockwork every few hours. To a ship far out at sea the beam appears as a short flash each time it sweeps past, and because every lighthouse has its own pattern of flashes and pauses, a sailor with a chart can tell which one he is looking at, even in fog, and know where he is.
+
+```rust
+/// Returns the index of `needle` in the sorted slice, or the place where it
+/// would have to be inserted to keep the slice sorted.
+pub fn search(sorted: &[i64], needle: i64) -> Result<usize, usize> {
+    let (mut low, mut high) = (0, sorted.len());
+    while low < high {
+        let middle = low + (high - low) / 2;
+        match sorted[middle].cmp(&needle) {
+            std::cmp::Ordering::Equal => return Ok(middle),
+            std::cmp::Ordering::Less => low = middle + 1,
+            std::cmp::Ordering::Greater => high = middle,
+        }
+    }
+    Err(low)
+}
+```
+
+```python
+def moving_average(values, window):
+    total = sum(values[:window])
+    result = [total / window]
+    for i in range(window, len(values)):
+        total += values[i] - values[i - window]
+        result.append(total / window)
+    return result
+```

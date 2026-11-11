@@ -10,8 +10,10 @@
 //! layers go (a range per device, or both devices on every layer), how much
 //! context costs slots, and how much of the RAM limit the tier takes.
 
-use std::time::Instant;
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
+use ares_api::{Engine, Event, EventSink, GenerateRequest, Prompt, RequestId, Sampling};
 use ares_core::units::Bytes;
 use ares_gguf::Gguf;
 use ares_model::qwen4exp::Config;
@@ -26,6 +28,14 @@ use crate::plan::{self, CELLS_PER_PAGE, DEFAULT_DRAFTS, DEFAULT_PARALLEL, LoadOp
 
 /// The most rows of a step: what the expert kernels take.
 const MAX_ROWS: u32 = ares_cuda::MAX_BATCH;
+
+/// A text of German, English and code, about 700 tokens, that the model reads
+/// once at the start (see [`warm_up`]).
+const WARM_UP: &str = include_str!("warm_up.txt");
+
+/// How long the warm-up may take: the experts of a text come from the drive,
+/// and the drive may be busy with something else.
+const WARM_UP_LIMIT: Duration = Duration::from_secs(1800);
 
 /// The tokens of K/V a first plan counts with to learn what a page costs on
 /// each device, before the context is decided.
@@ -308,10 +318,16 @@ pub(crate) fn load(gguf: Gguf, options: &LoadOptions, begun: Instant) -> Result<
     let runtime = Runtime::start_gpu(model.clone(), devices, runtime_config, gpu).map_err(|e| {
         let error = e.to_string();
         let short_of_memory = error.to_lowercase().contains("memory");
-        LoadError::Start(if options.context.is_none() && short_of_memory {
+        LoadError::Start(if error.contains("RAM budget") {
+            format!(
+                "{error}. The tier of experts is what --ram leaves after the {} the engine \
+                 needs for its buffers: name a larger --ram",
+                Bytes(required)
+            )
+        } else if options.context.is_none() && short_of_memory {
             format!(
                 "{error}. The context of {context} tokens was chosen from an estimate of \
-                     what the model takes; name a smaller one with --context"
+                 what the model takes; name a smaller one with --context"
             )
         } else {
             error
@@ -322,6 +338,7 @@ pub(crate) fn load(gguf: Gguf, options: &LoadOptions, begun: Instant) -> Result<
         loading.elapsed().as_secs_f64(),
         begun.elapsed().as_secs_f64()
     );
+    warm_up(&runtime, &name)?;
 
     // What it took.
     for (h, report) in held.iter().zip(model.reports()) {
@@ -360,6 +377,45 @@ pub(crate) fn load(gguf: Gguf, options: &LoadOptions, begun: Instant) -> Result<
          RAM yet, so a context that does not fit is refused at load)"
     );
     Ok(Loaded::new(runtime, name, held))
+}
+
+/// Reads [`WARM_UP`] and writes a few tokens after it, so that the tiers of
+/// experts hold what a text of German, English and code needs before the first
+/// request comes: the slots start empty, and the first text a model reads
+/// otherwise waits for the drive at nearly every layer (a minute for a prompt
+/// of a thousand tokens, against ten seconds once the slots are filled).
+fn warm_up(runtime: &Runtime, model: &str) -> Result<(), LoadError> {
+    let begun = Instant::now();
+    let (done, wait) = mpsc::channel();
+    let sink = EventSink::new(move |event| {
+        match event {
+            Event::Done { .. } => {
+                let _ = done.send(Ok(()));
+            }
+            Event::Error(error) => {
+                let _ = done.send(Err(error.to_string()));
+            }
+            Event::Text(_) => {}
+        }
+        true
+    });
+    let request = GenerateRequest {
+        model: model.to_owned(),
+        prompt: Prompt::Text(WARM_UP.to_owned()),
+        sampling: Sampling::default(),
+        max_tokens: Some(32),
+        stop: Vec::new(),
+        id: RequestId(0),
+    };
+    runtime.submit(request, sink).map_err(|e| LoadError::Start(format!("warm-up: {e}")))?;
+    wait.recv_timeout(WARM_UP_LIMIT)
+        .map_err(|_| LoadError::Start("the warm-up did not end in time".into()))?
+        .map_err(|e| LoadError::Start(format!("warm-up: {e}")))?;
+    tracing::info!(
+        "warm-up: read a text of German, English and code to fill the tiers of experts, {:.1} s",
+        begun.elapsed().as_secs_f64()
+    );
+    Ok(())
 }
 
 fn ordinals_of(held: &[crate::load::Held]) -> String {

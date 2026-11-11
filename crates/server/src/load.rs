@@ -117,9 +117,15 @@ impl Loaded {
     pub fn unload(self) {
         let begun = Instant::now();
         self.runtime.shutdown();
-        // The device threads have ended and dropped what they held; these
-        // are the last handles, and with them the driver contexts go.
-        for held in &self.held {
+        let running = self.runtime.is_running();
+        // The device threads have ended and dropped what they held. A model
+        // that holds device memory of its own (the slots of experts) frees it
+        // with the runtime, whose last handle this is.
+        let Self { runtime, held, .. } = self;
+        drop(runtime);
+        // These are the last handles of the devices, and with them the driver
+        // contexts go.
+        for held in &held {
             let info = held.device.info();
             match held.device.mem_info() {
                 Ok(memory) => tracing::info!(
@@ -132,9 +138,9 @@ impl Loaded {
                 Err(error) => tracing::warn!("device {}: {error}", info.ordinal),
             }
         }
-        drop(self.held);
+        drop(held);
         tracing::info!(
-            running = self.runtime.is_running(),
+            running,
             "the engine has stopped in {:.0} ms: threads joined, devices released",
             begun.elapsed().as_secs_f64() * 1e3
         );

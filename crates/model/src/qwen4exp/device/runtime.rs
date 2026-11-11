@@ -571,21 +571,6 @@ impl Qwen4Exp {
         &self.config
     }
 
-    /// Where the model's parts are.
-    pub fn placement(&self) -> &Placement {
-        &self.placement
-    }
-
-    /// The tokenizer of the model file.
-    pub fn tokenizer(&self) -> &Tokenizer {
-        &self.tokenizer
-    }
-
-    /// The choices the model was set up with.
-    pub fn options(&self) -> &SessionOptions {
-        &self.opts
-    }
-
     /// What the parts took, by device, once the runtime has opened them.
     pub fn reports(&self) -> Vec<PartReport> {
         let mut reports = self.reports.lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -645,12 +630,6 @@ impl Qwen4Exp {
                 )
                 .map_err(model_error),
         )
-    }
-
-    /// The bytes of page-locked memory the parts and the store hold besides
-    /// the tier of experts.
-    pub fn pinned_bytes(&self) -> u64 {
-        self.pinned
     }
 
     fn open_part(&self, cx: DeviceContext<'_>) -> Result<Box<dyn DeviceModel>, ModelError> {
@@ -1119,6 +1098,10 @@ impl Qwen4ExpDevice {
         let (segments, x) = (&self.segments, &self.x);
 
         // The step: every layer, with the host serving the store behind it.
+        // The number of the step marks its route records and its exchanges: a
+        // kernel waits for a flag that is behind the number, and the flags
+        // start at 0, so no step may be numbered 0 (the conductor's first
+        // warm-up record is).
         let number = u64::from(record.step()) + 1;
         let (token, xbase) =
             (number as u32, (number as u32).wrapping_mul(self.per_step).wrapping_add(1));
