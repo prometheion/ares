@@ -74,6 +74,14 @@ pub(crate) struct Cache {
 }
 
 impl Cache {
+    /// The checkpoint places the budget of `config` holds for a model of this
+    /// `spec`. The conductor and the device parts both use this number.
+    pub(crate) fn places(spec: &PrefixCache, config: &RuntimeConfig) -> u32 {
+        let policy =
+            CheckpointPolicy::new(config.cells_per_page, spec.bytes(), config.checkpoint_budget);
+        u32::try_from(policy.capacity()).unwrap_or(u32::MAX)
+    }
+
     pub(crate) fn new(
         model_name: &str,
         spec: &PrefixCache,
@@ -90,7 +98,7 @@ impl Cache {
             root: ChainHash::root(model_name.as_bytes()),
             cells_per_page,
             recurrent: spec.bytes() > 0,
-            capacity: u32::try_from(policy.capacity()).unwrap_or(u32::MAX),
+            capacity: Self::places(spec, config),
             policy,
             next_place: 0,
             free_places: Vec::new(),

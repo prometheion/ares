@@ -711,7 +711,7 @@ pub(crate) fn model_list(models: &[ares_api::ModelCard]) -> serde_json::Value {
 
 /// The body of `GET /metrics`.
 pub(crate) fn metrics(stats: &ares_api::EngineStats) -> String {
-    let rows: [(&str, &str, &str, u64); 11] = [
+    let rows: [(&str, &str, &str, u64); 20] = [
         (
             "requests_finished_total",
             "counter",
@@ -735,9 +735,63 @@ pub(crate) fn metrics(stats: &ares_api::EngineStats) -> String {
         ("generated_tokens_total", "counter", "Tokens generated", stats.generated_tokens),
         ("drafts_proposed_total", "counter", "Draft tokens put to the test", stats.drafts_proposed),
         ("drafts_accepted_total", "counter", "Draft tokens accepted", stats.drafts_accepted),
+        (
+            "prefix_hits_total",
+            "counter",
+            "Starts of a request from cells the prefix cache held",
+            stats.prefix_hits,
+        ),
+        (
+            "cached_cells_total",
+            "counter",
+            "Cells taken from the prefix cache instead of computed",
+            stats.cached_cells,
+        ),
+        (
+            "replayed_rows_total",
+            "counter",
+            "Rows run again to rebuild recurrent state from cached cells",
+            stats.replayed_rows,
+        ),
+        (
+            "checkpoints_saved_total",
+            "counter",
+            "Checkpoints of recurrent state taken",
+            stats.checkpoints_saved,
+        ),
+        (
+            "checkpoints_restored_total",
+            "counter",
+            "Checkpoints restored by the start of a request",
+            stats.checkpoints_restored,
+        ),
+        (
+            "checkpoints_dropped_total",
+            "counter",
+            "Checkpoints given up for the budget or with their page",
+            stats.checkpoints_dropped,
+        ),
+        (
+            "page_copies_total",
+            "counter",
+            "Pages copied before a sequence wrote into a page that others read",
+            stats.page_copies,
+        ),
         ("sequences", "gauge", "Sequences running", u64::from(stats.sequences)),
         ("pages_free", "gauge", "Free pages of sequence state", u64::from(stats.pages_free)),
         ("pages", "gauge", "Pages of sequence state", u64::from(stats.pages)),
+        (
+            "cached_pages",
+            "gauge",
+            "Pages and tails the prefix cache holds",
+            u64::from(stats.cached_pages),
+        ),
+        (
+            "checkpoint_ram_bytes",
+            "gauge",
+            "Page-locked RAM held for checkpoints of recurrent state",
+            stats.checkpoint_ram,
+        ),
     ];
     let mut text = String::new();
     for (name, kind, help, value) in rows {

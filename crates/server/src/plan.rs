@@ -69,6 +69,8 @@ pub struct LoadOptions {
     pub parallel: Option<u32>,
     /// The storage formats of K and of V.
     pub kv: Option<(CacheFormat, CacheFormat)>,
+    /// The most host RAM the engine may use, in bytes.
+    pub ram: Option<u64>,
     /// How the matrix products round.
     pub precision: Precision,
     /// The most draft tokens a sequence verifies in a step; 0 for none.
@@ -90,6 +92,7 @@ impl LoadOptions {
             context: None,
             parallel: None,
             kv: None,
+            ram: None,
             precision: Precision::Fast,
             drafts: None,
             draft_vocabulary: None,
@@ -208,6 +211,45 @@ pub fn default_context(pages_fit: u32, parallel: u32, model_context: u32) -> u32
     if context >= 2048 { context / 1024 * 1024 } else { context }
 }
 
+/// The host RAM the engine may use when the operator names no limit: half of
+/// what the machine reports as available when the server starts, so that the
+/// engine never takes what the rest of the system is using. Nothing when the
+/// machine reports nothing (the engine then keeps to what it needs to run).
+pub fn default_ram(available: Option<u64>) -> u64 {
+    available.unwrap_or(0) / 2
+}
+
+/// The bytes of memory available for new programs in the text of
+/// `/proc/meminfo` (`MemAvailable`), or `None` when it is not there.
+pub fn parse_available_ram(meminfo: &str) -> Option<u64> {
+    let line = meminfo.lines().find_map(|line| line.strip_prefix("MemAvailable:"))?;
+    let kib: u64 = line.trim().strip_suffix("kB")?.trim().parse().ok()?;
+    kib.checked_mul(1024)
+}
+
+/// Parses a size on the command line: a number of bytes, or a number with a
+/// binary unit (`512M`, `16G`, `1.5G`; K, M, G and T, upper or lower case,
+/// with an optional `iB` or `B` after it).
+pub fn parse_size(text: &str) -> Option<u64> {
+    let text = text.trim();
+    let unit_at = text.find(|c: char| !(c.is_ascii_digit() || c == '.')).unwrap_or(text.len());
+    let (number, unit) = text.split_at(unit_at);
+    let scale: u64 = match unit.to_ascii_lowercase().trim_end_matches("ib").trim_end_matches('b') {
+        "" => 1,
+        "k" => 1 << 10,
+        "m" => 1 << 20,
+        "g" => 1 << 30,
+        "t" => 1 << 40,
+        _ => return None,
+    };
+    if number.is_empty() || number.starts_with('.') || number.ends_with('.') {
+        return None;
+    }
+    let value: f64 = number.parse().ok()?;
+    let bytes = value * scale as f64;
+    (bytes.is_finite() && bytes < u64::MAX as f64).then_some(bytes as u64)
+}
+
 /// Parses a K/V format name.
 pub fn cache_format(name: &str) -> Option<CacheFormat> {
     CacheFormat::ALL.into_iter().find(|format| format_name(*format) == name)
@@ -231,6 +273,33 @@ mod tests {
 
     fn close(a: &[f64], b: &[f64]) -> bool {
         a.len() == b.len() && a.iter().zip(b).all(|(x, y)| (x - y).abs() < 1e-9)
+    }
+
+    #[test]
+    fn sizes_are_numbers_with_a_binary_unit() {
+        assert_eq!(parse_size("0"), Some(0));
+        assert_eq!(parse_size("4096"), Some(4096));
+        assert_eq!(parse_size("512M"), Some(512 << 20));
+        assert_eq!(parse_size("16G"), Some(16 << 30));
+        assert_eq!(parse_size("16GiB"), Some(16 << 30));
+        assert_eq!(parse_size("1.5g"), Some(3 << 29));
+        assert_eq!(parse_size("2kB"), Some(2048));
+        assert_eq!(parse_size(" 1T "), Some(1 << 40));
+        for bad in ["", "G", "-1", "1.", ".5G", "1x", "1 000", "nan", "1GB2", "99999999999T"] {
+            assert_eq!(parse_size(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn the_ram_default_is_half_of_what_the_machine_has_available() {
+        let meminfo = "MemTotal:       32768000 kB\nMemFree:         1000000 kB\n\
+                       MemAvailable:   20000000 kB\nBuffers:           10000 kB\n";
+        assert_eq!(parse_available_ram(meminfo), Some(20_000_000 * 1024));
+        assert_eq!(default_ram(parse_available_ram(meminfo)), 10_000_000 * 1024);
+        // A machine that says nothing: no spare RAM.
+        assert_eq!(parse_available_ram("MemTotal: 1 kB\n"), None);
+        assert_eq!(parse_available_ram("MemAvailable: lots\n"), None);
+        assert_eq!(default_ram(None), 0);
     }
 
     #[test]

@@ -116,6 +116,7 @@ pub(crate) struct StatsCopy {
     pages_free: u32,
     pages_capacity: u32,
     cached_pages: u32,
+    checkpoint_ram: u64,
     active: u32,
     waiting: u32,
 }
@@ -127,6 +128,7 @@ impl StatsCopy {
             self.pages_free,
             self.pages_capacity,
             self.cached_pages,
+            self.checkpoint_ram,
             self.active,
             self.waiting,
         )
@@ -648,6 +650,7 @@ impl Conductor {
                     pages_free: self.pool.free_pages(),
                     pages_capacity: self.pool.capacity(),
                     cached_pages: self.cache.as_ref().map_or(0, |cache| cache.index.len() as u32),
+                    checkpoint_ram: self.exec.checkpoint_ram(),
                     active: self.active as u32,
                     waiting: self.waiting.len() as u32,
                 };

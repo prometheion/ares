@@ -41,6 +41,15 @@ OPTIONS:
         --kv <FORMAT>          Storage format of K and V: f16 or q8, or two names
                                (K,V) [default: q8]
 
+    Host memory.
+        --ram <SIZE>           The most RAM the whole engine may use, such as 16G or
+                               512M. What the engine needs to run is taken from it
+                               first; the rest is for the checkpoints of recurrent
+                               state that let a conversation continue from what was
+                               computed, locked as they are taken [default: half of
+                               what the machine has available when the server
+                               starts]
+
     Speed against exactness.
         --precision <KIND>     fast:  8-bit activations where they are faster
                                exact: f16 products everywhere, same text whatever
@@ -236,6 +245,14 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, CliErr
                 });
                 "--kv"
             }
+            "--ram" => {
+                let value = text(value("--ram")?)?;
+                let expected = "a size such as 16G or 512M";
+                load.ram = Some(
+                    plan::parse_size(&value).ok_or_else(|| invalid("--ram", &value, expected))?,
+                );
+                "--ram"
+            }
             "--precision" => {
                 let value = text(value("--precision")?)?;
                 load.precision = match value.as_str() {
@@ -335,6 +352,8 @@ mod tests {
             "3",
             "--kv",
             "f16",
+            "--ram",
+            "12G",
             "--precision",
             "exact",
             "--drafts",
@@ -352,6 +371,7 @@ mod tests {
         assert_eq!(load.context, Some(4096));
         assert_eq!(load.parallel, Some(3));
         assert_eq!(load.kv, Some((CacheFormat::F16, CacheFormat::F16)));
+        assert_eq!(load.ram, Some(12 << 30));
         assert_eq!(load.precision, Precision::Exact);
         assert_eq!(load.drafts, Some(0));
         assert_eq!(
@@ -402,6 +422,8 @@ mod tests {
             (&["--parallel", "0"], "--parallel"),
             (&["--kv", "q3"], "--kv"),
             (&["--kv", "q8,q8,q8"], "--kv"),
+            (&["--ram", "lots"], "--ram"),
+            (&["--ram", "-1"], "--ram"),
             (&["--precision", "sloppy"], "--precision"),
             (&["--drafts", "-1"], "--drafts"),
             (&["--chat-var", "novalue"], "--chat-var"),

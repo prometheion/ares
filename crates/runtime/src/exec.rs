@@ -101,6 +101,12 @@ pub trait Executor: Send {
     /// How the devices' waits for work have ended so far, summed.
     fn device_wakes(&self) -> crate::sync::WakeCounts;
 
+    /// Bytes of page-locked RAM the devices hold for checkpoints of recurrent
+    /// state now. An executor that keeps no checkpoints holds none.
+    fn checkpoint_ram(&self) -> u64 {
+        0
+    }
+
     /// Stops the devices and joins their threads. Idempotent.
     fn shutdown(&mut self);
 }

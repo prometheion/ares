@@ -28,8 +28,9 @@ mod session;
 pub use choose::{Balance, LayoutProbe, LayoutReport, Layouts};
 pub use harness::Harness;
 pub use part::{
-    DraftBytes, DraftChain, DraftStep, DraftTimes, Drafted, Exchange, Options, PAGE_ENTRY, PHASES,
-    Part, PartSetup, Phase, Profile, StepEnv, page_bytes,
+    CopyTimes, DraftBytes, DraftChain, DraftStep, DraftTimes, Drafted, Exchange, Options,
+    PAGE_ENTRY, PHASES, Part, PartSetup, Phase, Profile, StepEnv, checkpoint_bytes, page_bytes,
+    state_slot_bytes,
 };
 pub use placement::{BlockSlice, DevicePlan, DraftPlan, Placement, PlacementError};
 pub use runtime::{OpenError, PartReport, Qwen35, Spread};

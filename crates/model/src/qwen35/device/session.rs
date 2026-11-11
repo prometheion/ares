@@ -88,12 +88,15 @@ impl Session {
             table_stride,
             spin: Duration::from_millis(2),
             vram_headroom: headroom,
-            pinned_limit: 1 << 30,
+            ram_limit: 1 << 30,
             pages,
             page_bytes: (0..model.devices())
                 .map(|d| layout.bytes_per_page(d) * u64::from(pages))
                 .collect(),
             cells_per_page: ENTRY_CELLS,
+            // A session steps by hand, without a conductor that takes
+            // checkpoints.
+            checkpoints: 0,
         };
         let exec = GpuExecutor::start(model.clone(), devices, config)?;
         Ok(Self {

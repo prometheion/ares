@@ -2,6 +2,7 @@
 //! what it is and builds a [`Part`] on each device's thread, and the
 //! [`DeviceModel`] that turns the runtime's step into the part's.
 
+use std::ops::Range;
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -10,7 +11,7 @@ use ares_cuda::{DevicePtr, ENTRY_CELLS, PushSlot, Segment, Stream};
 use ares_gguf::Gguf;
 use ares_runtime::{
     ContextSpec, DeviceContext, DeviceModel, LinkSpec, Links, Logits, Model, ModelError, OwnDrafts,
-    Split, StepContext,
+    PrefixCache, Split, StepContext,
 };
 use ares_state::PageLayout;
 use ares_tokenizer::{ChatOptions, EncodeOptions, Message, Tokenizer};
@@ -18,7 +19,7 @@ use ares_tokenizer::{ChatOptions, EncodeOptions, Message, Tokenizer};
 use super::choose::{Balance, LayoutReport};
 use super::part::{
     DraftBytes, DraftChain, DraftStep, Exchange, Options, PAGE_ENTRY, Part, PartSetup, StepEnv,
-    page_bytes,
+    checkpoint_bytes, page_bytes,
 };
 use super::placement::{HalfShares, Placement, PlacementError};
 use crate::qwen35::{Config, Weights};
@@ -50,6 +51,9 @@ pub struct PartReport {
     pub upload: Duration,
     /// Recurrent state per sequence.
     pub state_bytes_per_slot: u64,
+    /// One checkpoint of this device's share: the recurrent state of a
+    /// sequence and, where the draft block is, its carry row.
+    pub checkpoint_bytes: u64,
     /// The scratch of a step of the most rows.
     pub scratch_bytes: u64,
     /// The kept inputs of draft windows.
@@ -317,6 +321,16 @@ impl Model for Qwen35 {
         }
     }
 
+    fn prefix_cache(&self) -> Option<PrefixCache> {
+        Some(PrefixCache {
+            checkpoint_bytes: (0..self.placement.n_devices())
+                .map(|device| {
+                    checkpoint_bytes(&self.config, &self.placement, device, self.options.state)
+                })
+                .collect(),
+        })
+    }
+
     fn page_entry(&self, page: u32) -> u32 {
         page | PAGE_ENTRY
     }
@@ -356,6 +370,8 @@ impl Model for Qwen35 {
                 max_slots: cx.max_slots,
                 pages: cx.pages,
                 table_stride: cx.table_stride,
+                checkpoints: cx.checkpoints,
+                ram: cx.ram,
             },
             self.balance.as_ref(),
         )?;
@@ -366,13 +382,19 @@ impl Model for Qwen35 {
             weight_bytes: part.weight_bytes(),
             upload: part.upload_time(),
             state_bytes_per_slot: part.state_bytes_per_slot(),
+            checkpoint_bytes: part.checkpoint_bytes(),
             scratch_bytes: part.scratch_bytes(),
             kept_bytes: part.kept_bytes(),
             page_bytes: part.page_bytes(),
             draft: part.draft_bytes(),
             layouts: part.layouts().clone(),
         });
-        Ok(Box::new(Qwen35Device { part, segments: Vec::new(), chains: Vec::new() }))
+        Ok(Box::new(Qwen35Device {
+            part,
+            segments: Vec::new(),
+            replay: Vec::new(),
+            chains: Vec::new(),
+        }))
     }
 }
 
@@ -382,6 +404,8 @@ struct Qwen35Device {
     part: Part,
     /// The segments of the step, read from the record once.
     segments: Vec<Segment>,
+    /// The rows of the step that are replays.
+    replay: Vec<Range<u32>>,
     /// The windows of the step whose drafts the model's draft block makes.
     chains: Vec<DraftChain>,
 }
@@ -453,12 +477,21 @@ impl DeviceModel for Qwen35Device {
             self.part.update_table(update.slot, update.first, entries)?;
             taken += update.count;
         }
-        // The draft windows of the step before, then this step.
+        // The draft windows of the step before; then the copies of the prefix
+        // cache (saves, page copies, restores: the record's documentation has
+        // the order and the reasons); then this step.
         if let Some((offset, dims)) = record.commit_record() {
             self.part.enqueue_commit(step.stream, step.record_on_device.offset(offset), dims)?;
         }
+        self.part.enqueue_copies(step.stream, step.pages, record)?;
         self.segments.clear();
         self.segments.extend((0..record.segments()).map(|i| record.segment(i)));
+        self.replay.clear();
+        for (i, segment) in self.segments.iter().enumerate() {
+            if record.replay(i as u32) {
+                self.replay.push(segment.row0..segment.row0 + segment.n_rows);
+            }
+        }
         if self.part.has_draft_block() {
             // The windows that take the block's drafts: each with its newest
             // token and the settings of the rows that verify the drafts. All
@@ -493,6 +526,7 @@ impl DeviceModel for Qwen35Device {
             tables: step.tables,
             pages: step.pages,
             exchange: (step.devices > 1).then_some(&exchange as &dyn Exchange),
+            replay: &self.replay,
         })
     }
 

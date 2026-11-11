@@ -11,6 +11,7 @@
 //! rows) whose two outputs per block are partial sums; under a layer split it
 //! is a range of whole blocks.
 
+use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
 use ares_core::{GgmlType, Ledger};
@@ -21,7 +22,7 @@ use ares_cuda::{
     Precision, PrefillPath, RopeParams, Segment, StateFormat, StepDims, Stream, WeightLayout,
 };
 use ares_cuda::{PUSH_MAX_ROWS, PushSlot};
-use ares_runtime::{Logits, ModelError, Split};
+use ares_runtime::{Logits, ModelError, PinnedRam, Split};
 
 use super::choose::{Balance, LayoutReport, Layouts, decode_in_batches, file_path};
 use super::load::{AttentionW, BlockW, DeviceWeights, FfnW, LoadOptions, Mat, MixerW, RecurrentW};
@@ -31,9 +32,11 @@ use crate::qwen35::weights::Weights;
 
 #[path = "mtp.rs"]
 mod mtp;
+mod resume;
 mod tensor;
 
 pub use mtp::{DraftBytes, DraftChain, DraftStep, DraftTimes, Drafted};
+pub use resume::{CopyTimes, checkpoint_bytes, state_slot_bytes};
 
 /// Bit 31 of a table entry: the page is in the pool of stored formats (the
 /// only pool the formats without a tile mean use).
@@ -146,6 +149,8 @@ struct ProfileData {
     /// `[device][merge of the step]`: the milliseconds of the device's own
     /// work in front of the merge, and of the merge with its waiting.
     merges: Vec<Vec<[f64; 2]>>,
+    /// `[device]` what the copies of the prefix cache took.
+    copies: Vec<CopyTimes>,
 }
 
 impl Profile {
@@ -252,6 +257,10 @@ pub struct PartSetup<'a> {
     pub pages: u32,
     /// Entries per sequence in the page tables.
     pub table_stride: u32,
+    /// The places for checkpoints of recurrent state, locked in `ram` when
+    /// they are first used.
+    pub checkpoints: u32,
+    pub ram: &'a PinnedRam,
 }
 
 /// One step, as a part needs it.
@@ -267,6 +276,9 @@ pub struct StepEnv<'a> {
     pub tables: DevicePtr,
     pub pages: DevicePtr,
     pub exchange: Option<&'a dyn Exchange>,
+    /// The rows of the step that are a replay (rows of the whole step): they
+    /// read the cells their sequence has cached already and append none.
+    pub replay: &'a [Range<u32>],
 }
 
 impl std::fmt::Debug for StepEnv<'_> {
@@ -389,6 +401,10 @@ pub struct Part {
     attention_at: Vec<Option<AttentionAt>>,
     state: DeviceBuffer,
     slot_bytes: u64,
+    /// The places for checkpoints on the host (`resume.rs`).
+    places: resume::Places,
+    /// Pages of the pool.
+    n_pages: u32,
     kept: Option<DeviceBuffer>,
     /// The step whose deferred segments wait for their commit.
     has_deferred: bool,
@@ -507,7 +523,17 @@ impl Part {
         setup: PartSetup<'_>,
         balance: Option<&Balance>,
     ) -> Result<Self, ModelError> {
-        let PartSetup { index, device, kernels, ledger, max_slots, pages, table_stride } = setup;
+        let PartSetup {
+            index,
+            device,
+            kernels,
+            ledger,
+            max_slots,
+            pages,
+            table_stride,
+            checkpoints,
+            ram,
+        } = setup;
         let plan = placement
             .devices
             .get(index)
@@ -573,10 +599,8 @@ impl Part {
                     vd = vd.max(u64::from(s.value_dim()));
                     kd = kd.max(u64::from(s.key_dim()));
                     nv = nv.max(u64::from(s.n_v_heads));
-                    let conv = slot_bytes;
-                    let delta = (conv + s.conv_state_len() * 4).next_multiple_of(64);
-                    slot_bytes =
-                        (delta + s.delta_state_len() * opts.state.bytes()).next_multiple_of(64);
+                    let (conv, delta, end) = resume::state_extent(&s, opts.state, slot_bytes);
+                    slot_bytes = end;
                     let mut kept = [0u64; 4];
                     let sizes = [
                         u64::from(s.conv_dim()),
@@ -725,6 +749,11 @@ impl Part {
             + (state_slots - without_draft.2);
         let mtp =
             mtp::Mtp::open(c, device, ledger, &w, opts, max_slots, draft_sizes, draft_growth)?;
+        // A checkpoint is the slot's recurrent state and, where the draft
+        // block is, one row of its carry.
+        let checkpoint = slot_bytes + if mtp.is_some() { d * 4 } else { 0 };
+        let places =
+            resume::Places::new(device, ram, checkpoint, checkpoints, opts.profile.is_some())?;
         let rope = &c.attention.rope;
         Ok(Self {
             index,
@@ -750,6 +779,8 @@ impl Part {
             attention_at,
             state,
             slot_bytes,
+            places,
+            n_pages: pages,
             kept,
             has_deferred: false,
             table_stride,
@@ -1534,6 +1565,7 @@ impl Part {
                     tables: env.tables,
                     pages: env.pages,
                     exchange: env.exchange,
+                    replay: env.replay,
                 };
                 (self.group, self.row_base) = (g, group.first_row);
                 result = self.enqueue_group(&group_env);
@@ -1921,17 +1953,21 @@ impl Part {
                 .find(|(group, heads, _)| *group == self.group && *heads == a.n_kv)
                 .map(|(_, _, plan)| plan)
                 .ok_or_else(|| invalid("the step has no attention plan"))?;
-            kernels.append(
+            // The rows of a replay read cells that are cached already and
+            // append none.
+            resume::append_writing(
+                &kernels,
                 stream,
                 &at.geo,
                 plan.rows(),
-                n,
                 k,
                 v,
                 env.tables,
-                DevicePtr::NULL,
                 pool,
                 self.at(s.status),
+                env.replay,
+                self.row_base,
+                n,
             )?;
             kernels.attend(
                 stream,

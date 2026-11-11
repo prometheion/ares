@@ -161,8 +161,8 @@ machine (RTX 4070 + RTX 3060, Qwen3.8-27B) or read from the engines listed in
 | `ares-sched` | Step planner (generation, decision rows and prompts in one step), admission (pages claimed per step, a reservation that corrects itself, a queue instead of refusals), the order of a pass for long prompts of a model with experts, step time model with a term for the context, draft length choice, the lookup drafter on a suffix automaton shared by all sequences | Done; unit and model tests; the conductor uses the planner, admission (without spill), the lookup drafter and the step cost |
 | `ares-weights` | Expert heat, tiers that are elected and fed by reads (admission, protection, guesses bound late, slots given back), slots per layer by need, the waves of experts of a pass, a token table for the first layers, the lookahead distance, routing bias for pruning | Done, unit tested; the expert store uses the slot sets, the heat and the split of slots; guesses, the token table and pruning are not used by a running model yet |
 | `ares-api` | Request, event, decision and error types; the `Engine` trait between HTTP and the runtime (`submit` for generation, `decide` for decisions, `stats`) | Done, unit tested |
-| `ares-server` | The `ares` binary: loads a model on the devices and serves it over an OpenAI-compatible HTTP API, with the plan of devices, split, shares and context made from what the devices report | Serves `qwen35` models (chat and plain completions, streamed and not, timings, metrics, staged shutdown); 101 tests without a GPU and 7 that start the real binary; no router mode, no multimodal input, no tool calls, `/v1/systemone` answers 501 |
-| `ares-runtime` | The conductor thread and one thread per device, the step loop that connects plan, state and kernels, admission, speculation with the lookup drafter and with a model's own drafts, the `Model` trait a model implements, a synthetic model that drives the real kernels, and the expert store (VRAM slots, RAM tier, reads, the CPU computing what is not on a GPU) | Drives `qwen35` on one device, in tensor split and in layer split, with picks made on the device; implements `Engine::submit` (not `decide`); the prefix cache is in the conductor and checked against the host executor as an oracle, but `qwen35` has none yet because its device side does not carry out the step record's copies, and there is no spill to RAM (a request that gives way stays in the pool's cache); the expert store is driven by `qwen4exp`'s own session, not by the conductor |
+| `ares-server` | The `ares` binary: loads a model on the devices and serves it over an OpenAI-compatible HTTP API, with the plan of devices, split, shares and context made from what the devices report | Serves `qwen35` models (chat and plain completions, streamed and not, timings, metrics, staged shutdown); 96 tests without a GPU and 9 that start the real binary; the prefix cache is on, with `--ram` for the engine's RAM; no router mode, no multimodal input, no tool calls, `/v1/systemone` answers 501 |
+| `ares-runtime` | The conductor thread and one thread per device, the step loop that connects plan, state and kernels, admission, speculation with the lookup drafter and with a model's own drafts, the `Model` trait a model implements, a synthetic model that drives the real kernels, and the expert store (VRAM slots, RAM tier, reads, the CPU computing what is not on a GPU) | Drives `qwen35` on one device, in tensor split and in layer split, with picks made on the device; implements `Engine::submit` (not `decide`); the prefix cache is in the conductor, checked against the host executor as an oracle and carried out by `qwen35` on the devices (checkpoints in page-locked RAM within one RAM limit, `PinnedRam`), and there is no spill of pages to RAM (a request that gives way stays in the pool's cache); the expert store is driven by `qwen4exp`'s own session, not by the conductor |
 | `ares-model` | Model architectures: configuration and weight table from a GGUF, a CPU reference of the forward pass with explicit state (window and commit) that GPU implementations are compared with block by block, and the implementation on the devices | `qwen35` (Qwen3.5-0.8B, Qwen3.8-27B) runs through the runtime and the server, with the model's draft block. `qwen4exp` (Qwen3.8-Flash-Next) runs on one or two cards through a session of its own, without drafts. See [Several devices](#several-devices) |
 | `ares-tokenizer` | Text to token ids and back for byte-level BPE (`gpt2` with the `qwen35` pre-tokenizer) as llama.cpp does it, malformed UTF-8 included; control tokens in text only on request; encoding on several threads for long prompts; a streaming decoder that never cuts a character; the chat templates of the model file (Jinja, a dialect of its own that errors on what it does not support) with tools and the generation prompt | Done; token ids equal llama.cpp's on millions of generated and real texts for the three Qwen test models, chat prompts equal on thousands of conversations; about 20 times llama.cpp's encode speed on one core |
 
@@ -322,7 +322,9 @@ one array per part, indexed by page number.
   MiB as `f16` for Qwen3.8-27B), so `CheckpointPolicy` decides where copies
   go and which are dropped. The conductor keeps them as places within a budget
   of bytes (`RuntimeConfig::checkpoint_budget`); the copies themselves are the
-  device's part, which only the host executor does so far.
+  device's part (`qwen35` does them, see below). The state is `f32` today: 150
+  MiB for Qwen3.8-27B over both cards (94 and 56 MiB at shares of 0.625 /
+  0.375), plus 20 KiB for the draft block's carry.
   - Where: only at page boundaries and at the end of a tail. Inside a prompt
     at least 32 768 cells apart, while generating at least 2 048, measured
     from the last checkpoint on the sequence's own path; always at the
@@ -388,10 +390,89 @@ one array per part, indexed by page number.
   - Per request the runtime reports the prompt tokens that came from the
     cache (`Usage::cached_prompt_tokens`) and the rows it replayed and
     computed (`Snapshot::requests`); the counters add them up.
-  - Nothing of this runs for `qwen35` yet: its device side restores no state
-    and copies no page. The host executor does, as an oracle: it keeps the
-    cells of every page and the state of every slot as hashes of all tokens
-    in order, and a row that reads a wrong one picks another token.
+  - The host executor plays a device as an oracle: it keeps the cells of every
+    page and the state of every slot as hashes of all tokens in order, and a
+    row that reads a wrong one picks another token.
+- On the devices (`qwen35`, `crates/model/src/qwen35/device/part/resume.rs`),
+  in the order the record's documentation gives (the commit of the step
+  before, the saves, the page copies, the restores, the rows):
+  - **A checkpoint** of a device part is its slot of the recurrent state (the
+    convolution windows and delta-rule matrices of its blocks) and, on the
+    device that holds the draft block, one row of the block's carry. It lies
+    in **page-locked host memory**, not in VRAM: a save is a copy from the
+    device and a restore a copy to it, queued on the step's stream, so the
+    stream orders them against the kernels. The places are locked in chunks
+    (at least 32 MiB) when one is first used, within the engine's RAM limit
+    (see "Host memory").
+  - **A page copy** copies the whole entry of the page, for every attention
+    block and for the draft block's own array (the cells of an entry lie in
+    planes per head, and cells past those the sequence has are written before
+    they are read).
+  - **A replay** is a prompt step whose rows append nothing: the K/V append of
+    every attention block and of the draft block's follow of the model runs
+    per run of rows that write, and the rows of a replay are left out. All
+    else runs as for a prompt, which advances the recurrent state and leaves
+    the carry at the last row.
+  - **The draft block's state per sequence** is its carry (the final hidden
+    state of the sequence's last row: the first row of a segment reads it for
+    the block's keys and values at its position, and the next chain of drafts
+    starts from it) and its keys and values, which lie in the pool's pages
+    (one more array of entries), written by the follow of every row of every
+    step. Both are therefore in a checkpoint and in a page copy, and a
+    replay must not write the cells.
+  - **Measured** 2026-11-11 with `qwen35_run --conversation` (the second turn
+    of a conversation whose history is the given number of tokens, with the
+    chat template's thinking off; a conversation of the same size that the
+    engine has never seen as the cold control), Qwen3.8-27B, tensor split
+    0.625 / 0.375, 150 MiB of checkpoint over both cards:
+
+    | History | Prompt of the second turn | Cold, first token after | From the cache, first token after | Cached / replayed / computed rows |
+    | --- | --- | --- | --- | --- |
+    | 8k | 8278 tokens | 7070 and 7042 ms (1167 tokens/s) | 138 and 111 ms | 8255 / 0 / 23 |
+    | 24k | 24 662 tokens | 25 239 and 25 258 ms (975 tokens/s) | 150 and 122 ms | 24 639 / 0 / 23 |
+
+    The checkpoint of the first turn's end is exactly where the second turn
+    starts, so no row is replayed. A save of one checkpoint takes 3.7 ms on the
+    RTX 4070 (93.5 MiB, 25 GB/s) and 17.6 to 17.9 ms on the RTX 3060 (56.1
+    MiB, PCIe 3.0 x4, 3.2 GB/s); a restore 3.9 and 17.7 ms; a copy of a page
+    0.03 to 0.05 ms. The cards work in step, so a step with a save or a restore
+    takes the 3060's 17.7 ms longer, once per checkpoint: a request that ends
+    leaves one save (and the anchor of a long prompt another), a request that
+    starts from a checkpoint one restore. Against the seconds a start from
+    nothing costs this is no problem, and a staging area in VRAM
+    (which the copies could use to overlap with the step) is not built. The
+    first use of a place waits for its lock: 21 to 22.5 ms for the RTX 4070's
+    93.5 MiB and 11.8 ms for the RTX 3060's 56.1 MiB, once per place (the
+    first two places of a run cost 52 and 49 ms of waiting on the host). RAM
+    locked: 748 MiB after the first conversation (5 places) and 1048 MiB after
+    the second (7 places). The same second turn of 8192 tokens of the 0.8B on
+    each card alone (8274 prompt tokens, 8220 cached, 28 replayed, 54
+    computed): RTX 4070 cold 361 and 357 ms, from the cache 21 and 17 ms, save
+    0.77 ms, restore 0.82 ms (19.3 MiB); RTX 3060 cold 810 and 806 ms, from
+    the cache 41 and 37 ms, save 6.15 ms, restore 6.11 ms. Generation is as
+    fast as before: with the same flags on the same day a prompt of 2048
+    tokens reads at 1228 to 1241 tokens per second before and 1227 to 1241
+    after, a decode step without drafts at 1000 tokens takes 26.0 and 25.9 ms
+    before and 26.0 and 26.1 ms after (the 24.8 ms of an earlier day is not
+    this machine's today), and with the model's own drafts (3 per window, the
+    fork's draft vocabulary, 300 tokens, most probable token) German, English
+    and code give 79.5 / 76.2, 73.3 / 76.5 and 75.9 / 74.4 tokens per second
+    before and 77.8 / 77.6, 76.5 / 80.3 and 78.3 / 81.5 after (78.4, 75.2 and
+    80.8 with 16 checkpoints kept), a step of 34.2 to 34.6 ms throughout.
+  - **Rounding.** A row's result depends on the size of the step that
+    computes it, also with exact products (measured on the 0.8B, one prompt of
+    480 tokens in steps of several sizes against steps of 128 rows: steps of
+    32 and 64 rows give the same logits bit for bit; steps of 1, 7 and 100
+    rows give logits that differ by 2.0e-3, 1.6e-3 and 1.2e-3 of the logit at
+    most, with 2, 1 and 0 of the 480 top tokens different). The cache changes
+    the steps that compute a prompt (rows replayed from a checkpoint, the last
+    row alone), so a run from the cache is not bit for bit the run without it:
+    the logits of 40 generated tokens differ by 0.7e-3 to 0.9e-3 of the logit
+    at most (one card, each card alone, tensor split, layer split), the tokens
+    are the same. Texts are the same in every test that copies a text, whose
+    words follow with a wide margin; a text with near ties (a list whose order
+    the model is unsure of) can part at one, as can two requests that decode
+    together instead of alone.
 - Decisions ("Jev mode"): choosing among fixed options (a label, a tool, the
   fields of a schema) needs no generation. The options are scored from the
   logits after the shared prompt, and options longer than one token are
@@ -1344,11 +1425,21 @@ Work is paused here until Qwen4 is released; nothing below is in progress.
   them within 1e-3 of the CPU reference. The dense model uses `q8` for K
   and V; the formats with a tile mean (`q7` to `q4`) are not wired into a
   model.
+- The prefix cache runs on the devices for `qwen35`, in every placement: a
+  conversation's next turn starts from the pages and the checkpoint of the
+  last one (on Qwen3.8-27B a second turn after a history of 24k tokens gives
+  its first token after about 0.14 s instead of 25 s; see "Sequence state"),
+  the usage of an answer says how much came from the cache, and the engine's
+  RAM is one setting (`--ram`).
 - Known defects: a warm-up step that fails hangs the start of the runtime
   instead of reporting; the first token of a prompt that arrives next to a
   drafting sequence takes about 0.4 s; with the fast kernels the text with
-  drafts is not always the text without (with exact products it is); a
-  model that only runs on Turing has no prefill and no attention path.
+  drafts is not always the text without (with exact products it is, for
+  steps of the same size: see "Rounding" under "Sequence state"); a prompt
+  that shares only the start of the chat template with an earlier request
+  (three tokens) now runs a step of its own to replay them before its rows
+  (one more step in the counts of `--engine`, not timed); a model that only
+  runs on Turing has no prefill and no attention path.
 - Real model files are test data and stay outside the repository.
 
 ## Next steps
@@ -1368,10 +1459,12 @@ order it would be taken up; the source of each idea is in
    kernel chosen by a measurement on the device, staged loads where they
    pay, one launch per row, items of twelve query heads, rows of a prompt
    that share cells; and the K/V formats with a tile mean in a model.
-4. The prefix cache on the devices (checkpoint places and the copies of the
-   step record for `qwen35`; the conductor's side is done and checked against
-   the host oracle), spill of a sequence to RAM, pages and checkpoints that
-   move between VRAM, RAM and `ares-store`.
+4. The prefix cache beyond the first pass: checkpoints at the message
+   boundaries the server names (the anchor is a page boundary before the end
+   of the prompt now), a warm pass in the background, spill of a sequence to
+   RAM, pages and checkpoints that move between VRAM, RAM and `ares-store`
+   (and so survive a restart), locking the RAM of the next chunk of places
+   ahead of its first use, and `qwen4exp` with a cache.
 5. A kernel for one to three rows on the device layout that is not slower
    than the integer kernels, so the dense model can hold every matrix in it;
    shares of a tensor split from a measurement at load; device layouts for
@@ -1403,6 +1496,24 @@ therefore only fail when the limit is too small for the requests themselves,
 not because a cache holds the memory. VRAM is handled the same way in spirit
 but is planned ahead (ledgers), because moving things there is costly.
 
+**What is built.** The broker is `PinnedRam` (`crates/runtime/src/ram.rs`),
+shared by the executor and the device threads. It has two users so far: the
+step record and the read-back buffers of the devices (required, booked at
+start: `required_ram`) and the checkpoints of recurrent state of the prefix
+cache (elastic, the lowest priority, floor 0), which a device part locks in
+chunks of at least 32 MiB when a place is first used and keeps locked while
+the engine runs. The limit is `GpuConfig::ram_limit`, which the server sets
+from `--ram` (default: half of what the machine reports as available when it
+starts; the log states it and the reason); what the limit leaves after the
+required memory is the checkpoint budget of the conductor
+(`RuntimeConfig::checkpoint_budget`), so the places the conductor hands out
+never lock more than the limit. Nobody asks the checkpoints to give memory
+back yet, as nothing competes with them; a lock that does not fit fails the
+step with the books in the message. The first use of a place waits for the
+lock on the device's thread (21 to 22.5 ms for 93.5 MiB, 11.8 ms for 56.1
+MiB, measured with the 27B); locking ahead in the background is not built. `GET /metrics` reports the
+bytes locked (`ares_checkpoint_ram_bytes`).
+
 Nothing that costs speed happens silently:
 
 - **At load**, the engine states what the configured context means: how many
@@ -1414,7 +1525,8 @@ Nothing that costs speed happens silently:
 - **When the expert tier in RAM has to shrink**, that is a warning, because
   generation gets slower: experts that were in RAM now come from the SSD.
 - **When the prompt cache in RAM shrinks**, that is routine and only counted;
-  its pages are on SSD.
+  its pages are on SSD. (Pages are not in RAM yet; the checkpoints are the
+  prompt cache's only RAM today.)
 
 The same facts are available as counters to whoever monitors the server.
 
@@ -1436,7 +1548,9 @@ engine. What that needs:
   allocations. Pages are never cleared, because a page table decides what is
   valid, and there are no warm-up passes, because there are no graphs to
   build. Page-locked host memory, which is slow to lock, is taken in chunks
-  in the background and only as far as offload needs it.
+  in the background and only as far as offload needs it. (Today the only such
+  memory is the checkpoints' places, which a device thread locks in chunks
+  when one is first used, not in the background; see "Host memory".)
 - **Unloading frees and returns.** Nothing is written at unload: state on
   disk is written as it is produced.
 
@@ -1450,13 +1564,24 @@ Without options it plans for itself: the first device that holds the weights
 and a context, or else a tensor split over all devices with shares from the
 memory bandwidth each device reports, and a context from the VRAM that is
 left; the start-up report says what was chosen, why, and where the VRAM
-went. Devices, split, shares, context, K/V format, precision and drafts can
-be given instead.
+went. Devices, split, shares, context, K/V format, precision, drafts and the
+RAM the engine may use (`--ram`) can be given instead. The RAM defaults to half
+of what the machine reports as available when the server starts; the
+engine's step buffers are taken from it, and the rest is the budget of the
+checkpoints that let a conversation continue from what was computed (see
+"Host memory").
 
 It answers `POST /v1/chat/completions` and `/v1/completions`, streamed and
 not, `GET /v1/models`, `/health` and `/metrics`, with timings in every answer
 (prompt tokens and time, generated tokens and time, drafts proposed and
-accepted). A field of a request that the server does not hand to the engine
+accepted). The prefix cache is on for `qwen35` without a flag: a prompt that
+starts with text the engine has computed reads the cached part from the pages
+and the checkpoint instead of computing it, the answer's `usage` says how much
+(`prompt_tokens_details.cached_tokens`, as OpenAI does), `timings.prompt_n` counts
+the tokens that were computed, and `/metrics` has the counters (starts from the
+cache, cells taken from it, rows replayed, checkpoints saved, restored and
+dropped, pages copied, pages cached, RAM locked for checkpoints). A field of a
+request that the server does not hand to the engine
 is refused by name, not ignored: grammars, logit bias, penalties, tools and
 images among them today. A client that disconnects frees its sequence. The
 first signal lets running requests finish, the second ends them, and the

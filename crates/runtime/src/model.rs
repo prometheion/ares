@@ -14,6 +14,7 @@ use ares_cuda::{Device, DevicePtr, Kernels, SampleParams, Stream};
 use ares_state::PageLayout;
 
 use crate::links::Links;
+use crate::ram::PinnedRam;
 use crate::record::RecordView;
 
 /// How a model is spread over the devices.
@@ -175,6 +176,14 @@ pub struct DeviceContext<'a> {
     pub cells_per_page: u32,
     /// Page-table entries per slot.
     pub table_stride: u32,
+    /// The places for checkpoints of recurrent state that the conductor uses
+    /// (the number [`GpuConfig::checkpoints`](crate::GpuConfig) names): a
+    /// place holds [`PrefixCache::checkpoint_bytes`] of this device. 0 for a
+    /// model without a prefix cache or a budget of none.
+    pub checkpoints: u32,
+    /// The engine's page-locked RAM. The places are locked here, in chunks, as
+    /// they come into use ([`PinnedRam::lock_checkpoints`]).
+    pub ram: &'a PinnedRam,
 }
 
 /// What the runtime gives a device part to enqueue one step.

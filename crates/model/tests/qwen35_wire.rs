@@ -409,7 +409,11 @@ fn more_requests_than_fit_wait_in_line_and_all_answer() {
     assert_eq!(before.requests_waited, 0, "alone nobody waits");
     assert!(c.requests_waited >= 2, "{c:?}");
     assert_eq!((snapshot.active, snapshot.waiting), (0, 0));
-    assert_eq!(snapshot.pages_free, snapshot.pages_capacity, "every page is back");
+    assert_eq!(
+        snapshot.pages_free + snapshot.cached_pages,
+        snapshot.pages_capacity,
+        "every page is back: free, or held by the prefix cache"
+    );
     for (i, (alone, shared)) in alone.iter().zip(&together).enumerate() {
         let same = alone.chars().zip(shared.text.chars()).take_while(|(a, b)| a == b).count();
         eprintln!(

@@ -455,6 +455,23 @@ impl Part {
         (m.drafted > 0).then(|| Drafted { ptr: m.at(m.s.drafts), tokens: m.drafted })
     }
 
+    /// Where the block's array of K/V entries is in a page of the pool: its
+    /// offset from the start of the pool's pages and the bytes of one entry.
+    /// `None` on a device without the block.
+    pub(super) fn draft_pool(&self) -> Option<(u64, u64)> {
+        let m = self.mtp.as_ref()?;
+        Some((m.at.pool, m.at.geo.converted_entry_bytes()))
+    }
+
+    /// The row of the carry that `slot`'s next chain starts from (the final
+    /// hidden state of its last row) and its bytes: what a checkpoint keeps
+    /// of the block. `None` on a device without the block.
+    pub(super) fn carry_row(&self, slot: u32) -> Option<(DevicePtr, u64)> {
+        let m = self.mtp.as_ref()?;
+        let row = u64::from(self.d) * 4;
+        Some((m.carry.ptr().offset(u64::from(slot) * u64::from(m.carry_rows) * row), row))
+    }
+
     /// The hidden states kept per sequence and the rows per sequence, for
     /// tests that put a hidden state on the device.
     pub fn draft_carry(&self) -> Option<(&DeviceBuffer, u32)> {
@@ -1004,17 +1021,20 @@ impl Part {
                 None,
                 k,
             )?;
-            attention.append(
+            // The rows of a replay have their cells in the pool already.
+            super::resume::append_writing(
+                &attention,
                 stream,
                 &geo,
                 m.records.ptr().offset(m.follow_rows),
-                n,
                 k,
                 v,
                 env.tables,
-                DevicePtr::NULL,
                 env.pages.offset(m.at.pool),
                 self.at(s.status),
+                env.replay,
+                0,
+                n,
             )?;
         }
         Ok(())

@@ -36,6 +36,7 @@ use ares_model::qwen35::device::{
     page_bytes,
 };
 use ares_model::qwen35::{Config, MtpState, Reference, Weights};
+use ares_runtime::PinnedRam;
 
 fn env_path(name: &str) -> Option<PathBuf> {
     match std::env::var_os(name) {
@@ -108,6 +109,7 @@ impl Rig {
         let mut ledger =
             Ledger::new(format!("CUDA{}", device.ordinal()), device.mem_info().unwrap().free);
         let pool = u64::from(table_stride) * page_bytes(c, placement, 0, opts.kv);
+        let ram = PinnedRam::new(0);
         let part = Part::open(
             c,
             w,
@@ -121,6 +123,8 @@ impl Rig {
                 max_slots: 1,
                 pages: table_stride,
                 table_stride,
+                checkpoints: 0,
+                ram: &ram,
             },
         )
         .unwrap();
@@ -164,6 +168,7 @@ impl Rig {
             tables: self.tables.ptr(),
             pages: self.pages.ptr(),
             exchange: None,
+            replay: &[],
         };
         self.part.enqueue_drafts(&env).unwrap();
         self.part.enqueue_follow(&env, hidden).unwrap();
@@ -189,6 +194,7 @@ impl Rig {
             tables: self.tables.ptr(),
             pages: self.pages.ptr(),
             exchange: None,
+            replay: &[],
         };
         self.part
             .draft_step(DraftStep {

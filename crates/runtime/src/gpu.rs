@@ -23,18 +23,20 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use ares_core::Ledger;
 use ares_core::units::MIB;
-use ares_core::{Broker, Class, Growth, Ledger};
 use ares_cuda::{
     Device, DeviceBuffer, Event, Kernels, PinnedBuffer, SampleBatch, SamplePick, SamplePlan,
     SampleRow, SamplerKernels, Stream,
 };
 
+use crate::cache::Cache;
 use crate::config::RuntimeConfig;
 use crate::error::RuntimeError;
 use crate::exec::{Clock, ExecError, Executor, Pick, StepMeta, StepOutput};
 use crate::links::Links;
 use crate::model::{DeviceContext, DeviceModel, Model, ModelError, Split, StepContext};
+use crate::ram::PinnedRam;
 use crate::record::{self, RecordView};
 use crate::sync::{Bell, WakeCounts, Woke};
 use crate::timing::DeviceTimes;
@@ -50,8 +52,11 @@ pub struct GpuConfig {
     pub spin: Duration,
     /// VRAM left unreserved on each device.
     pub vram_headroom: u64,
-    /// The most page-locked RAM the executor takes.
-    pub pinned_limit: u64,
+    /// The engine's RAM limit: the most page-locked RAM the executor and the
+    /// models' device parts lock together. What the executor needs to run
+    /// ([`required_ram`]) is booked first; the rest is for the checkpoints of
+    /// recurrent state, which are locked as they come into use.
+    pub ram_limit: u64,
     /// The pool's pages, and the bytes of state they take on each device
     /// (the pages times the model's bytes per page there): reserved in the
     /// device's ledger and allocated before the model is built.
@@ -59,18 +64,35 @@ pub struct GpuConfig {
     pub page_bytes: Vec<u64>,
     /// The cells of a page, which the model lays its pages out for.
     pub cells_per_page: u32,
+    /// The places for checkpoints of recurrent state on each device: as many
+    /// as the conductor uses, which follow from its checkpoint budget.
+    pub checkpoints: u32,
+}
+
+/// The page-locked RAM an executor over `model` needs to run at all: the step
+/// record and the read-back buffers of every device.
+pub fn required_ram(model: &dyn Model, max_slots: u32) -> u64 {
+    let max_rows = model.max_rows();
+    record::max_bytes(max_rows, max_slots) as u64
+        + model.devices() as u64 * read_back_bytes(model.logit_rows(), max_rows) as u64
 }
 
 impl GpuConfig {
     /// The defaults for a runtime of `config` over `model`: page tables for
-    /// every slot, long enough for the model's whole context.
+    /// every slot, long enough for the model's whole context, and a RAM limit
+    /// that holds what the executor needs and every checkpoint the budget of
+    /// `config` allows.
     pub fn new(config: &RuntimeConfig, model: &dyn Model) -> Self {
+        let cache = model.prefix_cache();
+        let checkpoints = cache.as_ref().map_or(0, |spec| Cache::places(spec, config));
+        let checkpoint_ram = cache.as_ref().map_or(0, |spec| spec.bytes()) * u64::from(checkpoints);
         Self {
             max_slots: config.max_slots,
             table_stride: model.card().context_length.div_ceil(config.cells_per_page),
             spin: Duration::from_millis(2),
             vram_headroom: 256 * MIB,
-            pinned_limit: 256 * MIB,
+            ram_limit: required_ram(model, config.max_slots) + checkpoint_ram,
+            checkpoints,
             pages: config.pages,
             page_bytes: {
                 let layout = model.page_layout(config.cells_per_page);
@@ -152,8 +174,9 @@ pub struct GpuExecutor {
     links: Arc<Links>,
     seen: u64,
     in_flight: bool,
-    /// Held so the page-locked memory stays accounted for as long as it exists.
-    _broker: Broker,
+    /// The books of the page-locked memory, which the device parts lock their
+    /// checkpoint places in.
+    ram: PinnedRam,
 }
 
 impl std::fmt::Debug for GpuExecutor {
@@ -173,6 +196,7 @@ struct Init {
     record: Arc<PinnedRecord>,
     mailbox: Arc<Mailbox>,
     shared: Arc<Shared>,
+    ram: PinnedRam,
     config: GpuConfig,
     max_rows: u32,
 }
@@ -205,13 +229,8 @@ impl GpuExecutor {
 
         // Page-locked memory is the host's scarcest kind; it is reserved
         // before it is taken.
-        let mut broker = Broker::new("pinned RAM", config.pinned_limit);
-        let consumer = broker.register("step record and read-back", Class::Required)?;
-        let readback = devices.len() as u64 * read_back_bytes(model.logit_rows(), max_rows) as u64;
-        match broker.grow(&consumer, record_bytes as u64 + readback)? {
-            Growth::Granted => {}
-            Growth::Reclaim(_) => unreachable!("nobody else holds page-locked memory"),
-        }
+        let ram = PinnedRam::new(config.ram_limit);
+        ram.require(required_ram(&*model, config.max_slots))?;
 
         let streams = devices
             .iter()
@@ -257,6 +276,7 @@ impl GpuExecutor {
                 record: record.clone(),
                 mailbox: mailbox.clone(),
                 shared: shared.clone(),
+                ram: ram.clone(),
                 config: config.clone(),
                 max_rows,
             };
@@ -269,8 +289,7 @@ impl GpuExecutor {
         }
         drop(ready_tx);
 
-        let mut executor =
-            Self { handles, shared, record, links, seen: 0, in_flight: false, _broker: broker };
+        let mut executor = Self { handles, shared, record, links, seen: 0, in_flight: false, ram };
         let mut failure = None;
         for _ in 0..executor.handles.len() {
             match ready_rx.recv() {
@@ -352,6 +371,10 @@ impl Executor for GpuExecutor {
             out.draft_ms += result.draft_ms;
         }
         Ok(woke)
+    }
+
+    fn checkpoint_ram(&self) -> u64 {
+        self.ram.checkpoints()
     }
 
     fn device_wakes(&self) -> WakeCounts {
@@ -506,6 +529,7 @@ impl Worker {
             links,
             record,
             shared,
+            ram,
             config,
             max_rows,
             ..
@@ -537,6 +561,8 @@ impl Worker {
                 pages: config.pages,
                 cells_per_page: config.cells_per_page,
                 table_stride: config.table_stride,
+                checkpoints: config.checkpoints,
+                ram: &ram,
             })
             .map_err(|e| match e {
                 ModelError::Memory(e) => RuntimeError::Memory(e),
@@ -795,5 +821,37 @@ impl Worker {
         times.pick_ns = sampler_ns + pick_begun.elapsed().as_nanos() as u64;
         times.finished_at_ns = self.clock.now_ns();
         Ok((times, produced))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{SyntheticConfig, SyntheticModel};
+
+    use super::*;
+
+    fn model(prefix_cache: Option<u64>) -> SyntheticModel {
+        let mut config = SyntheticConfig::small(Split::Single, 1);
+        config.prefix_cache = prefix_cache;
+        SyntheticModel::new(config).unwrap()
+    }
+
+    #[test]
+    fn the_devices_get_as_many_places_as_the_conductor_counts_and_room_in_the_ram_limit() {
+        let config = RuntimeConfig { checkpoint_budget: 10_250, ..RuntimeConfig::default() };
+        let cached = model(Some(1000));
+        let gpu = GpuConfig::new(&config, &cached);
+        // Ten whole checkpoints fit the budget; the conductor counts the same.
+        assert_eq!(gpu.checkpoints, 10);
+        assert_eq!(gpu.checkpoints, Cache::places(&cached.prefix_cache().unwrap(), &config));
+        let needed = required_ram(&cached, config.max_slots);
+        assert!(needed > 0);
+        assert_eq!(gpu.ram_limit, needed + 10_000, "what the executor needs and the places");
+
+        // A model without a cache, or a budget of none, has no places.
+        assert_eq!(GpuConfig::new(&config, &model(None)).checkpoints, 0);
+        let none = RuntimeConfig { checkpoint_budget: 0, ..config };
+        let gpu = GpuConfig::new(&none, &cached);
+        assert_eq!((gpu.checkpoints, gpu.ram_limit), (0, needed));
     }
 }

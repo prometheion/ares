@@ -398,6 +398,9 @@ pub struct Snapshot {
     pub pages_free: u32,
     pub pages_capacity: u32,
     pub cached_pages: u32,
+    /// Bytes of page-locked RAM the devices hold for checkpoints of recurrent
+    /// state.
+    pub checkpoint_ram: u64,
     pub active: u32,
     pub waiting: u32,
     /// The last requests that ended, the oldest first: at most
@@ -411,6 +414,7 @@ impl Snapshot {
         pages_free: u32,
         pages_capacity: u32,
         cached_pages: u32,
+        checkpoint_ram: u64,
         active: u32,
         waiting: u32,
     ) -> Self {
@@ -427,6 +431,7 @@ impl Snapshot {
             pages_free,
             pages_capacity,
             cached_pages,
+            checkpoint_ram,
             active,
             waiting,
             requests: stats.requests.iter().copied().collect(),
@@ -649,16 +654,16 @@ mod tests {
                 DeviceTimes { device_ns: 9_000_000, gap_ns: Some(1_000_000), ..Default::default() };
             stats.record_device(0, &t, 0);
         }
-        let snapshot = Snapshot::new(&stats, 0, 0, 0, 0, 0);
+        let snapshot = Snapshot::new(&stats, 0, 0, 0, 0, 0, 0);
         assert!((snapshot.gpu_wait_share(0) - 0.1).abs() < 1e-9, "{}", snapshot.gpu_wait_share(0));
         stats.reset();
-        assert_eq!(Snapshot::new(&stats, 0, 0, 0, 0, 0).gpu_wait_share(0), 0.0);
+        assert_eq!(Snapshot::new(&stats, 0, 0, 0, 0, 0, 0).gpu_wait_share(0), 0.0);
     }
 
     #[test]
     fn the_table_names_every_phase() {
         let stats = Stats::new(2, 8);
-        let text = Snapshot::new(&stats, 3, 4, 0, 1, 0).to_string();
+        let text = Snapshot::new(&stats, 3, 4, 0, 0, 1, 0).to_string();
         for phase in Phase::ALL {
             assert!(text.contains(phase.name()), "{text}");
         }

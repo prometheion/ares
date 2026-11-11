@@ -85,6 +85,7 @@ impl Part {
                 tables: env.tables,
                 pages: env.pages,
                 exchange: env.exchange,
+                replay: env.replay,
             };
         };
         (self.group, self.row_base) = (g, group.first_row);
@@ -96,6 +97,7 @@ impl Part {
             tables: env.tables,
             pages: env.pages,
             exchange: env.exchange,
+            replay: env.replay,
         }
     }
 

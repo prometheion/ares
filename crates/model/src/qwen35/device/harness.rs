@@ -8,7 +8,7 @@ use ares_cuda::{
     Device, DeviceBuffer, ENTRY_CELLS, Event, Kernels, Segment, StateFormat, StepDims, StepRecord,
     Stream,
 };
-use ares_runtime::ModelError;
+use ares_runtime::{ModelError, PinnedRam};
 
 use super::part::{Options, PAGE_ENTRY, Part, PartSetup, StepEnv};
 use super::placement::Placement;
@@ -66,6 +66,8 @@ impl Harness {
         ledger.reserve("state pages", pool_bytes)?;
         ledger.reserve("page tables", u64::from(pages) * 4)?;
         ledger.reserve("step record", record_bytes)?;
+        // A harness has no conductor and keeps no checkpoints.
+        let ram = PinnedRam::new(0);
         let part = Part::open(
             c,
             w,
@@ -79,6 +81,8 @@ impl Harness {
                 max_slots: slots,
                 pages,
                 table_stride,
+                checkpoints: 0,
+                ram: &ram,
             },
         )?;
         let mut harness = Self {
@@ -159,6 +163,7 @@ impl Harness {
             tables: self.tables.ptr(),
             pages: self.pages.ptr(),
             exchange: None,
+            replay: &[],
         };
         self.start.record(&self.stream)?;
         let logits = self.part.enqueue(&env)?;
@@ -207,6 +212,7 @@ impl Harness {
             tables: self.tables.ptr(),
             pages: self.pages.ptr(),
             exchange: None,
+            replay: &[],
         };
         self.part.enqueue_begin(&env)?;
         // The rotary table of the step, which `enqueue` builds with the input.

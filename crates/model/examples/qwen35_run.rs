@@ -43,6 +43,15 @@
 //!   variable of the chat template (`reasoning_effort=medium`). Reports
 //!   tokens per second, acceptance by draft position and the time of a step
 //!   by kind.
+//! - `--conversation TOKENS`: the prefix cache on the devices. A conversation
+//!   whose history is about `TOKENS` tokens (a slice of `--text`) has a second
+//!   turn, and a conversation of the same size that the engine has never seen
+//!   has one too; the time to the first token of each, the rows replayed and
+//!   computed, what a save and a restore of a checkpoint took on each device
+//!   (copies of the device's recurrent state to and from page-locked RAM),
+//!   and the RAM locked are reported. `--checkpoints N` is the number of
+//!   checkpoints the engine keeps (16 for `--conversation`, none otherwise);
+//!   `--drafts N` the drafts per window (3).
 //!
 //! Lines that start with `RES` are results.
 
@@ -84,6 +93,9 @@ struct Args {
     balance_out: Option<PathBuf>,
     step_rows: Option<usize>,
     engine: Option<u32>,
+    conversation: Option<usize>,
+    checkpoints: Option<u64>,
+    drafts: u32,
     sample: bool,
     draft_vocab: Option<PathBuf>,
     out: Option<PathBuf>,
@@ -115,6 +127,9 @@ fn parse() -> Args {
         balance_out: None,
         step_rows: None,
         engine: None,
+        conversation: None,
+        checkpoints: None,
+        drafts: 3,
         sample: false,
         draft_vocab: None,
         out: None,
@@ -163,6 +178,9 @@ fn parse() -> Args {
             "--balance-out" => args.balance_out = Some(value().into()),
             "--step-rows" => args.step_rows = Some(value().parse().expect("rows")),
             "--engine" => args.engine = Some(value().parse().expect("drafts")),
+            "--conversation" => args.conversation = Some(value().parse().expect("tokens")),
+            "--checkpoints" => args.checkpoints = Some(value().parse().expect("checkpoints")),
+            "--drafts" => args.drafts = value().parse().expect("drafts"),
             "--sample" => args.sample = true,
             "--draft-vocab" => args.draft_vocab = Some(value().into()),
             "--out" => args.out = Some(value().into()),
@@ -420,6 +438,9 @@ fn main() {
     if let Some(drafts) = args.engine {
         return engine(&args, &spread, drafts);
     }
+    if let Some(history) = args.conversation {
+        return conversation(&args, &spread, history);
+    }
     let profile = Arc::new(Profile::new());
     let logit_rows = 16;
     let options = Options {
@@ -664,7 +685,7 @@ fn ask(
 /// `--engine`: chat requests through the conductor, with the picks made on
 /// the devices and, when the model has a draft block, its own drafts.
 fn engine(args: &Args, spread: &Spread, drafts: u32) {
-    use ares_runtime::{DevicePhase, GpuConfig, Phase, Runtime, RuntimeConfig};
+    use ares_runtime::{DevicePhase, GpuConfig, Model, Phase, Runtime, RuntimeConfig};
     let vocabulary: Option<Arc<[u32]>> = args.draft_vocab.as_ref().map(|path| {
         let text = std::fs::read_to_string(path).expect("the draft vocabulary");
         text.lines()
@@ -711,6 +732,8 @@ fn engine(args: &Args, spread: &Spread, drafts: u32) {
         max_slots: 2,
         speculation: drafts > 0,
         max_draft: drafts.max(1),
+        checkpoint_budget: args.checkpoints.unwrap_or(0)
+            * model.prefix_cache().map_or(0, |c| c.bytes()),
         ..RuntimeConfig::default()
     };
     let gpu = GpuConfig::new(&config, &*model);
@@ -856,6 +879,228 @@ fn engine(args: &Args, spread: &Spread, drafts: u32) {
             }
             let shown: String = text.chars().take(160).collect();
             println!("RES {name} {how} text: {}", shown.replace('\n', " "));
+        }
+    }
+    runtime.shutdown();
+}
+
+/// One request of a conversation: the messages, the seconds from the submit to
+/// the first piece of text, the answer and the usage.
+fn converse(
+    runtime: &ares_runtime::Runtime,
+    id: u64,
+    messages: Vec<ares_api::Message>,
+    max_tokens: u32,
+) -> (f64, String, ares_api::Usage) {
+    use ares_api::{Engine, Event, EventSink, GenerateRequest, Prompt, RequestId};
+    use std::sync::{Mutex, mpsc};
+    let (tx, rx) = mpsc::channel();
+    let state = Arc::new(Mutex::new((String::new(), None::<Instant>)));
+    let sink = {
+        let state = state.clone();
+        EventSink::new(move |event| {
+            match event {
+                Event::Text(piece) => {
+                    let mut state = state.lock().unwrap();
+                    state.0.push_str(&piece);
+                    state.1.get_or_insert_with(Instant::now);
+                }
+                Event::Done { usage, .. } => {
+                    let _ = tx.send(Ok(usage));
+                }
+                Event::Error(error) => {
+                    let _ = tx.send(Err(error.to_string()));
+                }
+            }
+            true
+        })
+    };
+    let begun = Instant::now();
+    runtime
+        .submit(
+            GenerateRequest {
+                model: String::new(),
+                prompt: Prompt::Chat { messages, tools: None },
+                sampling: ares_api::Sampling { temperature: Some(0.0), ..Default::default() },
+                max_tokens: Some(max_tokens),
+                stop: Vec::new(),
+                id: RequestId(id),
+            },
+            sink,
+        )
+        .expect("submit");
+    let usage = rx.recv().expect("the request ends").expect("the request");
+    let (text, first) = std::mem::take(&mut *state.lock().unwrap());
+    (first.map_or(f64::NAN, |t| (t - begun).as_secs_f64()), text, usage)
+}
+
+/// `--conversation`: the second turn of a conversation from the cache, and
+/// the second turn of one the engine has never seen.
+fn conversation(args: &Args, spread: &Spread, history: usize) {
+    use ares_api::{Message, Role};
+    use ares_runtime::{GpuConfig, Model, Runtime, RuntimeConfig};
+    let text = std::fs::read_to_string(args.text.as_ref().expect("--text FILE is needed"))
+        .expect("the text");
+    let profile = Arc::new(Profile::new());
+    let options = Options {
+        precision: args.precision,
+        layouts: args.layouts,
+        state: args.state,
+        max_rows: args.max_rows,
+        logit_rows: 16,
+        window_rows: if args.drafts > 0 { args.drafts + 1 } else { 0 },
+        pipeline_rows: args.pipeline_rows,
+        profile: args.profile.then(|| profile.clone()),
+        ..Options::default()
+    };
+    let devices: Vec<Device> =
+        args.devices.iter().map(|d| Device::open(*d, Wait::Block).expect("open device")).collect();
+    let chat = ChatOptions { enable_thinking: false, ..ChatOptions::default() };
+    let model = Arc::new(
+        Qwen35::new(
+            Gguf::open(&args.model).expect("the model file"),
+            String::new(),
+            spread,
+            options,
+            args.context,
+        )
+        .expect("model")
+        .with_chat_options(chat),
+    );
+    let tokenizer = model.tokenizer();
+    let ids = tokenizer.encode(&text, EncodeOptions { add_special: false, parse_special: false });
+    assert!(
+        ids.len() >= 2 * history + 64,
+        "--text has {} tokens, two conversations of {history} need more",
+        ids.len()
+    );
+    let document = |from: usize| -> String {
+        let bytes = tokenizer.decode(&ids[from..from + history], false).expect("decodable tokens");
+        String::from_utf8_lossy(&bytes).into_owned()
+    };
+    let checkpoints = args.checkpoints.unwrap_or(16);
+    let per_page = 128;
+    let config = RuntimeConfig {
+        // The two conversations, their answers and room to run.
+        pages: 2 * (history + 1024).div_ceil(per_page) as u32 + 16,
+        cells_per_page: per_page as u32,
+        max_slots: 2,
+        speculation: args.drafts > 0,
+        max_draft: args.drafts.max(1),
+        checkpoint_budget: checkpoints * model.prefix_cache().map_or(0, |c| c.bytes()),
+        ..RuntimeConfig::default()
+    };
+    let gpu = GpuConfig::new(&config, &*model);
+    let begun = Instant::now();
+    let runtime = Runtime::start_gpu(model.clone(), devices.clone(), config, gpu).expect("start");
+    println!(
+        "RES conversation: loaded in {:.1} s, {checkpoints} checkpoints of {:.1} MiB",
+        begun.elapsed().as_secs_f64(),
+        model.prefix_cache().map_or(0, |c| c.bytes()) as f64 / MIB
+    );
+    let reports = model.reports();
+    for r in &reports {
+        println!(
+            "RES conversation device {} ({}): one checkpoint is {:.1} MiB ({:.1} MiB recurrent state per sequence)",
+            r.index,
+            r.device,
+            r.checkpoint_bytes as f64 / MIB,
+            r.state_bytes_per_slot as f64 / MIB
+        );
+    }
+    // What it takes to lock the memory of one checkpoint on each device.
+    for (device, r) in devices.iter().zip(&reports) {
+        let begun = Instant::now();
+        let locked =
+            ares_cuda::PinnedBuffer::new(device, r.checkpoint_bytes as usize).expect("lock");
+        println!(
+            "RES conversation device {}: locking {:.1} MiB of RAM took {:.1} ms",
+            r.index,
+            r.checkpoint_bytes as f64 / MIB,
+            begun.elapsed().as_secs_f64() * 1e3
+        );
+        drop(locked);
+    }
+
+    let first_question = |doc: &str| {
+        format!(
+            "Below is a document.\n\n{doc}\n\nSummarize the first section of the document in two sentences."
+        )
+    };
+    let second_question = "List three key terms of the document.";
+    let _ = converse(&runtime, 1, vec![Message::new(Role::User, "Say hello.")], 8);
+    let mut id = 1;
+    for round in 0..2 {
+        // A conversation the engine has not seen: the second turn from nothing.
+        let other = first_question(&document(history + 32 * round));
+        id += 1;
+        let cold_prompt = vec![
+            Message::new(Role::User, other),
+            Message::new(Role::Assistant, "This is the answer to the first question."),
+            Message::new(Role::User, second_question),
+        ];
+        let _ = runtime.take_snapshot();
+        profile.reset();
+        let (cold_ttft, _, cold) = converse(&runtime, id, cold_prompt, 24);
+        let snapshot = runtime.snapshot().expect("the engine runs");
+        let report = *snapshot.request(ares_api::RequestId(id)).expect("reported");
+        println!(
+            "RES conversation {history} tokens, second turn cold: {} prompt tokens, {} cached, {} replayed, {} computed; first token after {:.0} ms ({:.0} prompt tokens/s)",
+            cold.prompt_tokens,
+            cold.cached_prompt_tokens,
+            report.replayed_rows,
+            report.computed_rows,
+            cold_ttft * 1e3,
+            f64::from(cold.prompt_tokens) / cold_ttft
+        );
+
+        // A conversation of the same size: the first turn, then the second.
+        let doc = document(32 * round);
+        let first = vec![Message::new(Role::User, first_question(&doc))];
+        id += 1;
+        let (first_ttft, answer, one) = converse(&runtime, id, first.clone(), 32);
+        println!(
+            "RES conversation {history} tokens, first turn: {} prompt tokens, first token after {:.0} ms",
+            one.prompt_tokens,
+            first_ttft * 1e3
+        );
+        let mut next = first;
+        next.push(Message::new(Role::Assistant, answer));
+        next.push(Message::new(Role::User, second_question));
+        id += 1;
+        let _ = runtime.take_snapshot();
+        profile.reset();
+        let (ttft, _, two) = converse(&runtime, id, next, 24);
+        let snapshot = runtime.snapshot().expect("the engine runs");
+        let report = *snapshot.request(ares_api::RequestId(id)).expect("reported");
+        let c = snapshot.counters;
+        println!(
+            "RES conversation {history} tokens, second turn from the cache: {} prompt tokens, {} cached, {} replayed, {} computed; first token after {:.0} ms (cold: {:.0} ms); checkpoints restored {}, page copies {}, RAM locked {:.0} MiB",
+            two.prompt_tokens,
+            two.cached_prompt_tokens,
+            report.replayed_rows,
+            report.computed_rows,
+            ttft * 1e3,
+            cold_ttft * 1e3,
+            c.checkpoints_restored,
+            c.page_copies,
+            snapshot.checkpoint_ram as f64 / MIB
+        );
+        // The copies of the two turns, per device: the saves of the first
+        // turn belong to the step before and are counted with the next.
+        let _ = converse(&runtime, 1_000_000 + id, vec![Message::new(Role::User, "Say hello.")], 4);
+        for (device, times) in profile.copies().iter().enumerate() {
+            println!(
+                "RES conversation device {device}: {} saves of {:.2} ms each, {} restores of {:.2} ms each, {} page copies of {:.3} ms each; {} places locked on first use, {:.1} ms of host waiting in all",
+                times.saves,
+                times.save_ms / times.saves.max(1) as f64,
+                times.restores,
+                times.restore_ms / times.restores.max(1) as f64,
+                times.page_copies,
+                times.page_ms / times.page_copies.max(1) as f64,
+                times.locks,
+                times.lock_ms,
+            );
         }
     }
     runtime.shutdown();

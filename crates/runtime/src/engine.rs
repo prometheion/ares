@@ -283,9 +283,18 @@ impl Engine for Runtime {
             requests_cancelled: c.requests_cancelled,
             // Nothing is refused for lack of room: a request waits in line.
             requests_refused: 0,
+            prefix_hits: c.prefix_hits,
+            cached_cells: c.cached_cells,
+            replayed_rows: c.replay_rows,
+            checkpoints_saved: c.checkpoints_saved,
+            checkpoints_restored: c.checkpoints_restored,
+            checkpoints_dropped: c.checkpoints_dropped,
+            page_copies: c.page_copies,
             sequences: snapshot.active,
             pages_free: snapshot.pages_free,
             pages: snapshot.pages_capacity,
+            cached_pages: snapshot.cached_pages,
+            checkpoint_ram: snapshot.checkpoint_ram,
         })
     }
 }

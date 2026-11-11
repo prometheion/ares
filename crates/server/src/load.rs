@@ -29,7 +29,7 @@ use ares_gguf::Gguf;
 use ares_model::qwen35::device::{Options, Placement, Qwen35, Spread, page_bytes};
 use ares_model::qwen35::weights::{Matrix, Mixer};
 use ares_model::qwen35::{Config, Weights};
-use ares_runtime::{GpuConfig, Runtime, RuntimeConfig, Split};
+use ares_runtime::{GpuConfig, Model, Runtime, RuntimeConfig, Split, required_ram};
 use ares_tokenizer::ChatOptions;
 
 use crate::plan::{
@@ -776,15 +776,63 @@ pub fn load(options: &LoadOptions) -> Result<Loaded, LoadError> {
              /v1/completions works"
         );
     }
+    // Host RAM: one limit for the engine. What it needs to run is taken from
+    // it first; the rest is the budget of the checkpoints of recurrent state
+    // (the only other user today), which are locked as they come into use.
+    let available = std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|text| plan::parse_available_ram(&text));
+    let required = required_ram(&*model, parallel);
+    let (ram, why_ram) = match options.ram {
+        Some(ram) => (ram, "as asked".to_owned()),
+        None => match available {
+            Some(available) => (
+                plan::default_ram(Some(available)).max(required),
+                format!(
+                    "half of the {} the machine has available now; --ram changes it",
+                    Bytes(available)
+                ),
+            ),
+            None => (
+                required,
+                "the machine reports no available memory, so none is spared for checkpoints; \
+                 --ram sets it"
+                    .to_owned(),
+            ),
+        },
+    };
+    if ram < required {
+        return Err(refuse(format!(
+            "--ram {} is less than the {} the engine needs for its step buffers",
+            Bytes(ram),
+            Bytes(required)
+        )));
+    }
+    let checkpoint = model.prefix_cache().map_or(0, |cache| cache.bytes());
     let runtime_config = RuntimeConfig {
         pages,
         cells_per_page: CELLS_PER_PAGE,
         max_slots: parallel,
         speculation: drafts > 0,
         max_draft: drafts.max(1),
+        checkpoint_budget: ram - required,
         ..RuntimeConfig::default()
     };
-    let gpu = GpuConfig { vram_headroom: headroom, ..GpuConfig::new(&runtime_config, &*model) };
+    let gpu = GpuConfig {
+        vram_headroom: headroom,
+        ram_limit: ram,
+        ..GpuConfig::new(&runtime_config, &*model)
+    };
+    tracing::info!(
+        "plan: RAM, at most {} for the engine ({why_ram}): {} for its step buffers, the rest for          checkpoints of recurrent state, {} each over all devices, {}; the memory is page-locked          as checkpoints are taken",
+        Bytes(ram),
+        Bytes(required),
+        Bytes(checkpoint),
+        match checkpoint {
+            0 => "none for this model".to_owned(),
+            bytes => format!("room for {}", (ram - required) / bytes),
+        }
+    );
     tracing::info!("loading the weights");
     let loading = Instant::now();
     let devices: Vec<Device> = held.iter().map(|h| h.device.clone()).collect();

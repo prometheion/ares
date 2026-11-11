@@ -2,7 +2,7 @@
 //!
 //! Needs `ARES_TEST_CUDA=1` and `ARES_TEST_QWEN35_MODEL` (a small `qwen35`
 //! file, Qwen3.5-0.8B); `ARES_TEST_DEVICE` names the device (default 0) and
-//! `ARES_TEST_PORT` the first of the seven ports on 127.0.0.1 the tests
+//! `ARES_TEST_PORT` the first of the nine ports on 127.0.0.1 the tests
 //! listen on (default 18951). Every test starts its own server, so they can
 //! run one after the other or together:
 //!
@@ -349,8 +349,12 @@ fn a_chat_gives_the_same_text_streamed_and_plain_for_the_same_seed() {
         let prompt_tokens = usage["prompt_tokens"].as_u64().unwrap();
         assert!((10..80).contains(&prompt_tokens), "the question through the template: {usage}");
         assert_eq!(usage["total_tokens"], prompt_tokens + 48);
+        // What the engine computed before may start the prompt: the start of
+        // the template, at least, is the same for every question.
+        let cached = usage["prompt_tokens_details"]["cached_tokens"].as_u64().unwrap();
+        assert!(cached < prompt_tokens, "the last token is always computed: {usage}");
         let timings = &plain["timings"];
-        assert_eq!(timings["prompt_n"], prompt_tokens);
+        assert_eq!(timings["prompt_n"], prompt_tokens - cached, "the cached part is not computed");
         assert_eq!(timings["predicted_n"], 48);
         assert!(timings["prompt_ms"].as_f64().unwrap() > 0.0, "{timings}");
         assert!(timings["predicted_per_second"].as_f64().unwrap() > 1.0, "{timings}");
@@ -369,7 +373,13 @@ fn a_chat_gives_the_same_text_streamed_and_plain_for_the_same_seed() {
         let finish = &chunks[chunks.len() - 2];
         assert_eq!(finish["choices"][0]["finish_reason"], "length");
         assert_eq!(finish["timings"]["predicted_n"], 48);
-        assert_eq!(chunks[chunks.len() - 1]["usage"], *usage, "the usage chunk");
+        // The same prompt a second time comes from the cache, all but its
+        // last token; the rest of the usage is the same.
+        let mut streamed_usage = chunks[chunks.len() - 1]["usage"].clone();
+        let streamed_cached = streamed_usage["prompt_tokens_details"]["cached_tokens"].as_u64();
+        assert_eq!(streamed_cached, Some(prompt_tokens - 1), "{streamed_usage}");
+        streamed_usage["prompt_tokens_details"] = usage["prompt_tokens_details"].clone();
+        assert_eq!(streamed_usage, *usage, "the usage chunk");
 
         // Another seed is another text; the most probable token needs none.
         let mut other = sampled.clone();
@@ -447,7 +457,9 @@ fn a_client_that_leaves_frees_its_sequence() {
     let Some(model) = model() else { return };
     let server = Server::start(&model, port(2), &[]);
     let pages = server.metric("pages");
-    assert_eq!(server.metric("pages_free"), pages);
+    // A page is free, or the prefix cache holds what was computed on it.
+    let unused = || server.metric("pages_free") + server.metric("cached_pages");
+    assert_eq!(unused(), pages);
     assert_eq!(server.metric("sequences"), 0);
 
     // No token limit: the request would run until the context is full.
@@ -459,7 +471,8 @@ fn a_client_that_leaves_frees_its_sequence() {
     drop(stream);
 
     eventually("the sequence to leave the engine", || server.metric("sequences") == 0);
-    assert_eq!(server.metric("pages_free"), pages, "all pages are back");
+    assert_eq!(unused(), pages, "all pages are back, free or cached");
+    assert!(server.metric("cached_pages") >= 1, "what it computed stays in the cache");
     assert_eq!(server.metric("requests_cancelled_total"), 1);
     assert_eq!(server.metric("requests_finished_total"), 0);
 
@@ -469,7 +482,7 @@ fn a_client_that_leaves_frees_its_sequence() {
     eventually("the request to run", || server.metric("sequences") == 1);
     drop(waiting);
     eventually("the sequence to leave the engine", || server.metric("sequences") == 0);
-    assert_eq!(server.metric("pages_free"), pages);
+    assert_eq!(unused(), pages);
     assert_eq!(server.metric("requests_cancelled_total"), 2);
 
     // The engine is as good as new for the next request.
@@ -522,7 +535,7 @@ fn two_requests_run_at_once_and_each_gets_its_own_text() {
     }
     assert_eq!(server.metric("requests_finished_total"), 4);
     assert_eq!(server.metric("sequences"), 0);
-    assert_eq!(server.metric("pages_free"), server.metric("pages"));
+    assert_eq!(server.metric("pages_free") + server.metric("cached_pages"), server.metric("pages"));
     process.stop();
 }
 
@@ -655,4 +668,136 @@ fn a_second_signal_ends_a_running_request_and_still_stops_in_order() {
     assert!(log.contains("the server is stopping: ending the request"), "{log}");
     assert!(log.contains("threads joined, devices released"), "{log}");
     assert!(log.contains("running=false"), "{log}");
+}
+
+/// The sentences of a text that a model copies without a doubt: no two are
+/// alike.
+fn passage(sentences: usize) -> String {
+    const THINGS: [&str; 8] = [
+        "lanterns",
+        "marshes",
+        "apples",
+        "weather vanes",
+        "letters",
+        "paper boats",
+        "keys",
+        "timetables",
+    ];
+    const PEOPLE: [&str; 8] = [
+        "The harbour master",
+        "A courier",
+        "Our engineer",
+        "The baker",
+        "Her grandmother",
+        "The clockmaker",
+        "A botanist",
+        "The watchman",
+    ];
+    (0..sentences)
+        .map(|i| {
+            format!(
+                "{} counted {} {} on day {}.",
+                PEOPLE[i * 5 % 8],
+                11 + i * 7 % 90,
+                THINGS[i * 3 % 8],
+                i + 1
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Two turns of a conversation on `server`: the first message to copy a text,
+/// then its answer and a second message. Returns the usage, the timings and
+/// the answer of each turn.
+fn two_turns(server: &Client) -> [(Value, Value, String); 2] {
+    let first = format!("{}\n\nCopy the text above word for word.", passage(60));
+    let ask = |messages: Value| {
+        let body = json!({
+            "model": server.model, "messages": messages, "max_tokens": 48, "temperature": 0,
+        });
+        let reply = server.post("/v1/chat/completions", &body);
+        assert_eq!(reply.status, 200, "{}", reply.body);
+        let reply = reply.json();
+        let text = reply["choices"][0]["message"]["content"].as_str().unwrap().to_owned();
+        (reply["usage"].clone(), reply["timings"].clone(), text)
+    };
+    let one = ask(json!([{"role": "user", "content": first}]));
+    let two = ask(json!([
+        {"role": "user", "content": first},
+        {"role": "assistant", "content": one.2},
+        {"role": "user", "content": "Now copy the first sentence again."},
+    ]));
+    [one, two]
+}
+
+#[test]
+fn a_second_turn_starts_from_what_the_first_turn_computed_and_says_so() {
+    let Some(model) = model() else { return };
+    let mut server = Server::start(&model, port(7), &["--chat-var", "enable_thinking=false"]);
+    let [(usage, timings, answer), (usage2, timings2, answer2)] = two_turns(&server);
+
+    // The first turn computes its whole prompt.
+    let prompt = usage["prompt_tokens"].as_u64().unwrap();
+    assert!(prompt > 5 * 128, "five pages and a bit: {usage}");
+    let first_cached = usage["prompt_tokens_details"]["cached_tokens"].as_u64().unwrap();
+    assert!(first_cached < 16, "nothing but the start of the template: {usage}");
+    assert_eq!(timings["prompt_n"], prompt - first_cached);
+
+    // The second turn reads the first one's pages and goes on from its
+    // checkpoint: the whole pages of the first prompt at least.
+    let prompt2 = usage2["prompt_tokens"].as_u64().unwrap();
+    let cached = usage2["prompt_tokens_details"]["cached_tokens"].as_u64().unwrap();
+    assert!(prompt2 > prompt, "the second prompt holds the first, the answer and a question");
+    assert!(cached >= prompt / 128 * 128, "{usage2} after a prompt of {prompt} tokens");
+    assert_eq!(timings2["prompt_n"], prompt2 - cached, "the cached part is not computed");
+    eprintln!(
+        "RES second turn: {prompt2} prompt tokens, {cached} from the cache, {} computed",
+        prompt2 - cached
+    );
+    assert!(answer.contains("harbour master"), "a copy of the text: {answer:?}");
+    assert!(answer2.chars().count() > 10, "an answer: {answer2:?}");
+
+    // The counters say the same.
+    assert_eq!(server.metric("prefix_hits_total"), 1 + u64::from(first_cached > 0));
+    assert!(server.metric("cached_cells_total") >= cached);
+    assert!(server.metric("checkpoints_saved_total") >= 1);
+    assert_eq!(server.metric("checkpoints_restored_total"), 1);
+    assert!(server.metric("replayed_rows_total") < prompt2, "not everything is read again");
+    let held = server.metric("checkpoint_ram_bytes");
+    assert!(held > 0 && held < 1 << 30, "page-locked memory for the checkpoints: {held} bytes");
+    assert!(server.logged().iter().any(|l| l.contains("plan: RAM")), "{:#?}", server.logged());
+    server.stop();
+}
+
+#[test]
+fn a_server_with_no_ram_to_spare_keeps_no_checkpoints_and_answers_as_one_with() {
+    let Some(model) = model() else { return };
+    let flags = ["--chat-var", "enable_thinking=false"];
+    let with = Server::start(&model, port(7), &flags);
+    let [_, with_second] = two_turns(&with);
+    with.stop();
+
+    // The 0.8B's checkpoint is 20 MB: 4 MB of RAM holds none, so a start from
+    // cached pages replays every cached row.
+    let mut few = Vec::from(flags);
+    few.extend(["--ram", "4M"]);
+    let mut without = Server::start(&model, port(8), &few);
+    assert!(
+        without.logged().iter().any(|l| l.contains("plan: RAM") && l.contains("as asked")),
+        "{:#?}",
+        without.logged()
+    );
+    let [_, without_second] = two_turns(&without);
+    let cached = without_second.0["prompt_tokens_details"]["cached_tokens"].as_u64().unwrap();
+    assert!(cached >= 5 * 128, "the pages are cached all the same: {}", without_second.0);
+    assert_eq!(without.metric("checkpoints_saved_total"), 0);
+    assert_eq!(without.metric("checkpoints_restored_total"), 0);
+    assert_eq!(without.metric("checkpoint_ram_bytes"), 0);
+    assert!(
+        without.metric("replayed_rows_total") >= cached - 1,
+        "all {cached} cached rows were replayed"
+    );
+    assert_eq!(without_second.2, with_second.2, "the second answer, with and without checkpoints");
+    without.stop();
 }

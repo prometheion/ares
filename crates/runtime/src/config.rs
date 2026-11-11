@@ -42,7 +42,10 @@ pub struct RuntimeConfig {
     /// all devices. A checkpoint is where a prompt that starts from the prefix
     /// cache restores the state of the model's recurrent layers; without one
     /// it replays every cached row. 0 keeps none. Only a model whose
-    /// [`crate::Model::prefix_cache`] says it has recurrent state uses it.
+    /// [`crate::Model::prefix_cache`] says it has recurrent state uses it. On
+    /// devices the places this holds are locked in RAM as they are used, within
+    /// [`crate::GpuConfig::ram_limit`], which [`crate::GpuConfig::new`] sets to
+    /// what the executor needs and this budget together.
     pub checkpoint_budget: u64,
     /// The least distance in cells between checkpoints inside a prompt, and
     /// while generating (`ares_state::CheckpointPolicy`).

@@ -62,6 +62,7 @@ pub mod expert_store;
 mod gpu;
 mod links;
 mod model;
+mod ram;
 mod record;
 mod sync;
 mod synthetic;
@@ -74,12 +75,13 @@ pub use config::{Drafters, RuntimeConfig};
 pub use engine::Runtime;
 pub use error::RuntimeError;
 pub use exec::{Clock, ExecError, Executor, Pick, StepMeta, StepOutput};
-pub use gpu::{GpuConfig, GpuExecutor};
+pub use gpu::{GpuConfig, GpuExecutor, required_ram};
 pub use links::{Links, MAX_DEVICES};
 pub use model::{
     ContextSpec, DeviceContext, DeviceModel, LinkSpec, Logits, Model, ModelError, OwnDrafts,
     PrefixCache, Split, StepContext,
 };
+pub use ram::{LockedChunk, PinnedRam};
 pub use record::{
     Commit, PageCopy, RecordFull, RecordView, RecordWriter, Row, StateCopy, StateCopyKind,
     TableUpdate,

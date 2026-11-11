@@ -25,12 +25,30 @@ pub struct EngineStats {
     pub requests_cancelled: u64,
     /// Requests refused for lack of room.
     pub requests_refused: u64,
+    /// Starts of a request from cells the prefix cache held, and the cells
+    /// those starts took from it instead of computing them (a request that
+    /// gave way and came back counts again).
+    pub prefix_hits: u64,
+    pub cached_cells: u64,
+    /// Rows run again to rebuild recurrent state from cached cells.
+    pub replayed_rows: u64,
+    /// Checkpoints of recurrent state taken, restored by a start of a request,
+    /// and dropped again.
+    pub checkpoints_saved: u64,
+    pub checkpoints_restored: u64,
+    pub checkpoints_dropped: u64,
+    /// Pages copied before a sequence wrote into a page that others read.
+    pub page_copies: u64,
     /// Sequences running when the copy was made.
     pub sequences: u32,
     /// Pages of sequence state that are free.
     pub pages_free: u32,
     /// All pages of sequence state.
     pub pages: u32,
+    /// Pages and tails the prefix cache holds.
+    pub cached_pages: u32,
+    /// Bytes of page-locked RAM held for checkpoints of recurrent state.
+    pub checkpoint_ram: u64,
 }
 
 impl EngineStats {
