@@ -2,6 +2,8 @@
 //
 // Codebooks of the i-quant types, as the CPU decoder has them: a grid entry is 8 (u64)
 // or 4 (u32) magnitudes, one per byte, least significant byte first.
+// `ares_kvalues_mxfp4` is not an i-quant table: it holds the 16 levels of the 4-bit float
+// types (doubled E2M1 values).
 #pragma once
 
 #include "common.cuh"
@@ -19,6 +21,10 @@ static __device__ __align__(16) const uint8_t ares_ksigns_iq2xs[128] = {
 
 static __device__ __align__(16) const int8_t ares_kvalues_iq4nl[16] = {
     -127, -104, -83, -65, -49, -35, -22, -10, 0x01, 0x0d, 0x19, 0x26, 0x35, 0x45, 0x59, 0x71,
+};
+
+static __device__ __align__(16) const int8_t ares_kvalues_mxfp4[16] = {
+    0x00, 0x01, 0x02, 0x03, 0x04, 0x06, 0x08, 0x0c, 0x00, -1, -2, -3, -4, -6, -8, -12,
 };
 
 static __device__ __align__(16) const uint64_t ares_iq2xxs_grid[256] = {

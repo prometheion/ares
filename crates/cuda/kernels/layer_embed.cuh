@@ -1,18 +1,20 @@
 // Embedding gather: the row `token_embd[token]` decoded to f32.
 //
 // The table is stored as GGUF stores it (q6_K in the 0.8B, q3_K in the 27B,
-// iq4_xs in qwen4exp), and the layouts are those of ggml's dequantize_row_*
-// functions, which `ares_quant::dequantize` reproduces. A gather touches a few
-// rows per step, so the decoder is a plain function of (row, value index) and
-// each thread decodes the values it writes: coalesced stores, a handful of
-// byte loads per value, no shared memory. Types whose decoding needs a
-// codebook (the iq1/iq2/iq3 families, ternary, mxfp4) are not here; the host
-// wrapper refuses them by name.
+// iq4_xs in qwen4exp, iq2_xxs in the 2-bit file of the 27B), and the layouts
+// are those of ggml's dequantize_row_* functions, which `ares_quant::dequantize`
+// reproduces; every weight type has a decoder. A gather touches a few rows per
+// step, so the decoder is a plain function of (row, value index) and each
+// thread decodes the values it writes: coalesced stores, a handful of byte
+// loads per value, no shared memory. The codebooks are those of the weight
+// kernels (iq_tables.cuh) and the scales of the 4-bit floats are theirs too
+// (fp4_scales.cuh).
 #pragma once
 
 #include <cstring>
 
 #include "common.cuh"
+#include "fp4_scales.cuh"
 #include "layer_step.cuh"
 #include "iq_tables.cuh"
 
@@ -38,6 +40,34 @@ static __device__ __forceinline__ void ares_k4_scale_min(const uint8_t* q, int j
         sc = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4);
         mn = (q[j + 4] >> 4) | ((q[j] >> 6) << 4);
     }
+}
+
+// Four bytes at any alignment, little endian (the blocks of most types start 2 bytes off a
+// word boundary).
+static __device__ __forceinline__ uint32_t ares_u32_at(const uint8_t* p) {
+    uint32_t v;
+    memcpy(&v, p, 4);
+    return v;
+}
+
+static __device__ __forceinline__ uint32_t ares_u16_at(const uint8_t* p) {
+    return static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8);
+}
+
+// Byte `k` (0..7) of a codebook entry, as a magnitude.
+static __device__ __forceinline__ float ares_grid_byte(uint64_t entry, uint32_t k) {
+    return static_cast<float>(static_cast<uint32_t>(entry >> (8 * k)) & 0xFF);
+}
+
+// -1 or +1 by bit `k` of the sign byte (ggml's kmask_iq2xs).
+static __device__ __forceinline__ float ares_sign_of(uint32_t signs, uint32_t k) {
+    return ((signs >> k) & 1) ? -1.0f : 1.0f;
+}
+
+// The 4-bit scale of the 16 values `l` (0..3) of a 32-value sub-block of IQ2_XS and IQ2_S:
+// two scales in a byte, the low one for the first 16 values.
+static __device__ __forceinline__ float ares_iq2_scale(float d, uint32_t scales, uint32_t l) {
+    return d * (0.5f + static_cast<float>((scales >> (4 * (l >> 1))) & 0xF)) * 0.25f;
 }
 
 // Value `j` of a row stored in type `ty` (a ggml type id). `row` is the first
@@ -163,6 +193,124 @@ static __device__ float ares_embed_value(const uint8_t* row, uint32_t ty, uint32
         const uint32_t q = b[8 + ib * 16 + (jb & 15)];
         const uint32_t nib = jb < 16 ? (q & 0xF) : (q >> 4);
         return ares_f16_at(b) * static_cast<float>(ls - 32) * static_cast<float>(ares_kvalues_iq4nl[nib]);
+    }
+    case 16: {  // IQ2_XXS: 66 bytes, d, per 32 values 4 codebook indices and a word of 4 sign indices + scale
+        const uint8_t* b = row + (j >> 8) * 66;
+        const uint32_t jj = j & 255, ib32 = jj >> 5, l = (jj >> 3) & 3, k = jj & 7;
+        const uint32_t aux = ares_u32_at(b + 6 + 8 * ib32);
+        const float db = ares_f16_at(b) * (0.5f + static_cast<float>(aux >> 28)) * 0.25f;
+        const float g = ares_grid_byte(ares_iq2xxs_grid[b[2 + 8 * ib32 + l]], k);
+        return db * g * ares_sign_of(ares_ksigns_iq2xs[(aux >> (7 * l)) & 127], k);
+    }
+    case 17: {  // IQ2_XS: 74 bytes, d, 32 x (9-bit index, 7-bit sign index), 8 scale bytes
+        const uint8_t* b = row + (j >> 8) * 74;
+        const uint32_t jj = j & 255, ib32 = jj >> 5, l = (jj >> 3) & 3, k = jj & 7;
+        const uint32_t q = ares_u16_at(b + 2 + 2 * (4 * ib32 + l));
+        const float db = ares_iq2_scale(ares_f16_at(b), b[66 + ib32], l);
+        return db * ares_grid_byte(ares_iq2xs_grid[q & 511], k) * ares_sign_of(ares_ksigns_iq2xs[q >> 9], k);
+    }
+    case 22: {  // IQ2_S: 82 bytes, d, qs[64] (indices, then sign bytes), qh[8], scales[8]
+        const uint8_t* b = row + (j >> 8) * 82;
+        const uint32_t jj = j & 255, ib32 = jj >> 5, l = (jj >> 3) & 3, k = jj & 7;
+        const uint32_t idx = b[2 + 4 * ib32 + l] | ((static_cast<uint32_t>(b[66 + ib32]) << (8 - 2 * l)) & 0x300);
+        const float db = ares_iq2_scale(ares_f16_at(b), b[74 + ib32], l);
+        return db * ares_grid_byte(ares_iq2s_grid[idx], k) * ares_sign_of(b[34 + 4 * ib32 + l], k);
+    }
+    case 18: {  // IQ3_XXS: 98 bytes, d, qs[64] (indices), per 32 values a word of 4 sign indices + scale
+        const uint8_t* b = row + (j >> 8) * 98;
+        const uint32_t jj = j & 255, ib32 = jj >> 5, l = (jj >> 3) & 3, k = jj & 7;
+        const uint32_t aux = ares_u32_at(b + 66 + 4 * ib32);
+        const float db = ares_f16_at(b) * (0.5f + static_cast<float>(aux >> 28)) * 0.5f;
+        const uint32_t grid = ares_iq3xxs_grid[b[2 + 8 * ib32 + 2 * l + (k >> 2)]];
+        const float g = static_cast<float>((grid >> (8 * (k & 3))) & 0xFF);
+        return db * g * ares_sign_of(ares_ksigns_iq2xs[(aux >> (7 * l)) & 127], k);
+    }
+    case 21: {  // IQ3_S: 110 bytes, d, qs[64], qh[8], signs[32], scales[4]
+        const uint8_t* b = row + (j >> 8) * 110;
+        const uint32_t jj = j & 255, ib32 = jj >> 5, l = (jj >> 3) & 3, k = jj & 7, part = k >> 2;
+        const uint32_t scale = (b[106 + (ib32 >> 1)] >> (4 * (ib32 & 1))) & 0xF;
+        const float db = ares_f16_at(b) * static_cast<float>(1 + 2 * scale);
+        const uint32_t idx = b[2 + 8 * ib32 + 2 * l + part] | ((static_cast<uint32_t>(b[66 + ib32]) << (8 - 2 * l - part)) & 256);
+        const float g = static_cast<float>((ares_iq3s_grid[idx] >> (8 * (k & 3))) & 0xFF);
+        return db * g * ares_sign_of(b[74 + 4 * ib32 + l], k);
+    }
+    case 19: {  // IQ1_S: 50 bytes, d, qs[32], qh[8] (u16: 4 x 3 index bits, 3-bit scale, delta sign)
+        const uint8_t* b = row + (j >> 8) * 50;
+        const uint32_t jj = j & 255, ib = jj >> 5, l = (jj >> 3) & 3, k = jj & 7;
+        const uint32_t qh = ares_u16_at(b + 34 + 2 * ib);
+        const float dl = ares_f16_at(b) * static_cast<float>(2 * ((qh >> 12) & 7) + 1);
+        const float delta = (qh & 0x8000) ? -0.125f : 0.125f;
+        const uint32_t idx = b[2 + 4 * ib + l] | (((qh >> (3 * l)) & 7) << 8);
+        return dl * (static_cast<float>(static_cast<int8_t>(ares_iq1s_grid[idx] >> (8 * k))) + delta);
+    }
+    case 29: {  // IQ1_M: 56 bytes, qs[32], qh[16], scales[8] (four u16 that also carry the f16 d)
+        const uint8_t* b = row + (j >> 8) * 56;
+        const uint32_t jj = j & 255, ib = jj >> 5, l = (jj >> 3) & 3, k = jj & 7;
+        const uint32_t sc0 = ares_u16_at(b + 48), sc1 = ares_u16_at(b + 50), sc2 = ares_u16_at(b + 52),
+                       sc3 = ares_u16_at(b + 54);
+        const uint32_t d_bits = (sc0 >> 12) | ((sc1 >> 8) & 0x00F0) | ((sc2 >> 4) & 0x0F00) | (sc3 & 0xF000);
+        const uint32_t sc = ares_u16_at(b + 48 + 2 * (ib >> 1));
+        const float dl = __half2float(__ushort_as_half(static_cast<unsigned short>(d_bits))) *
+                         static_cast<float>(2 * ((sc >> (6 * (ib & 1) + 3 * (l >> 1))) & 7) + 1);
+        const uint32_t h = b[32 + 2 * ib + (l >> 1)];
+        const uint32_t idx = b[4 * ib + l] | (((l & 1) ? (h << 4) : (h << 8)) & 0x700);
+        const float delta = (h & ((l & 1) ? 0x80 : 0x08)) ? -0.125f : 0.125f;
+        return dl * (static_cast<float>(static_cast<int8_t>(ares_iq1s_grid[idx] >> (8 * k))) + delta);
+    }
+    case 34: {  // TQ1_0: 54 bytes, qs[48] (5 base-3 digits a byte), qh[4] (4 digits a byte), d
+        const uint8_t* b = row + (j >> 8) * 54;
+        const uint32_t jj = j & 255;
+        // The digit planes: 5 of 32 bytes (values 0..159), 5 of 16 bytes (160..239), 4 of 4 bytes.
+        uint32_t digit, byte;
+        if (jj < 160) {
+            digit = jj >> 5;
+            byte = b[jj & 31];
+        } else if (jj < 240) {
+            digit = (jj - 160) >> 4;
+            byte = b[32 + ((jj - 160) & 15)];
+        } else {
+            digit = (jj - 240) >> 2;
+            byte = b[48 + ((jj - 240) & 3)];
+        }
+        uint32_t pow3 = 1;
+        for (uint32_t i = 0; i < digit; i++) {
+            pow3 *= 3;
+        }
+        // Times 3^digit moves the digit to the top of the byte's fraction; * 3 >> 8 reads it.
+        const int trit = static_cast<int>(((byte * pow3) & 0xFF) * 3 >> 8) - 1;
+        return static_cast<float>(trit) * ares_f16_at(b + 52);
+    }
+    case 35: {  // TQ2_0: 66 bytes, qs[64] (4 codes a byte, in planes of 32 bytes), d
+        const uint8_t* b = row + (j >> 8) * 66;
+        const uint32_t jj = j & 255;
+        const uint32_t code = (b[32 * (jj >> 7) + (jj & 31)] >> (2 * ((jj >> 5) & 3))) & 3;
+        return static_cast<float>(static_cast<int>(code) - 1) * ares_f16_at(b + 64);
+    }
+    case 39: {  // MXFP4: 17 bytes, E8M0 scale, 16 bytes of nibbles through the E2M1 levels
+        const uint8_t* b = row + (j >> 5) * 17;
+        const uint32_t jj = j & 31;
+        const uint32_t q = b[1 + (jj & 15)];
+        const uint32_t nib = jj < 16 ? (q & 0xF) : (q >> 4);
+        return static_cast<float>(ares_kvalues_mxfp4[nib]) * ares_e8m0_half(b[0]);
+    }
+    case 40: {  // NVFP4: 36 bytes, 4 UE4M3 scales, 4 sub-blocks of 16 values in 8 bytes of nibbles
+        const uint8_t* b = row + (j >> 6) * 36;
+        const uint32_t jj = j & 63, s = jj >> 4, r = jj & 15;
+        const uint32_t q = b[4 + 8 * s + (r & 7)];
+        const uint32_t nib = r < 8 ? (q & 0xF) : (q >> 4);
+        return static_cast<float>(ares_kvalues_mxfp4[nib]) * ares_ue4m3_half(b[s]);
+    }
+    case 41: {  // Q1_0: 18 bytes, d, 128 sign bits (set is +d)
+        const uint8_t* b = row + (j >> 7) * 18;
+        const uint32_t jj = j & 127;
+        const float d = ares_f16_at(b);
+        return ((b[2 + (jj >> 3)] >> (jj & 7)) & 1) ? d : -d;
+    }
+    case 42: {  // Q2_0: 18 bytes, d, 64 codes of 2 bits (-1, 0, 1, 2 times d)
+        const uint8_t* b = row + (j >> 6) * 18;
+        const uint32_t jj = j & 63;
+        const uint32_t code = (b[2 + (jj >> 2)] >> (2 * (jj & 3))) & 3;
+        return static_cast<float>(static_cast<int>(code) - 1) * ares_f16_at(b);
     }
     default:
         return __int_as_float(0x7fc00000);  // NaN: the host refuses unsupported types

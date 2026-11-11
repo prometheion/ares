@@ -471,32 +471,10 @@ impl LayerKernels {
         Ok(())
     }
 
-    /// Whether [`LayerKernels::embed_gather`] can decode rows of type `ty`.
-    pub fn can_gather(ty: GgmlType) -> bool {
-        use GgmlType::*;
-        matches!(
-            ty,
-            F32 | F16
-                | BF16
-                | Q4_0
-                | Q4_1
-                | Q5_0
-                | Q5_1
-                | Q8_0
-                | Q2_K
-                | Q3_K
-                | Q4_K
-                | Q5_K
-                | Q6_K
-                | IQ4_NL
-                | IQ4_XS
-        )
-    }
-
     /// Embedding gather: `out[r] = table[token_r]` decoded to f32 for the
     /// `dims.n_rows` rows of the step. `table` is the tensor as GGUF stores it
-    /// (`n_vocab` rows of `n_embd` values of type `ty`), aligned to 4 bytes.
-    /// A token past `n_vocab` gives a row of zeros.
+    /// (`n_vocab` rows of `n_embd` values of type `ty`, any of the 28 weight types),
+    /// aligned to 4 bytes. A token past `n_vocab` gives a row of zeros.
     ///
     /// # Safety
     ///
@@ -515,8 +493,8 @@ impl LayerKernels {
         n_embd: u32,
         out: DevicePtr,
     ) -> Result<()> {
-        if !Self::can_gather(ty) {
-            return Err(invalid("embedding gather", format!("no decoder for {ty}")));
+        if !ty.is_weight() {
+            return Err(invalid("embedding gather", format!("{ty} is not a weight type")));
         }
         if !n_embd.is_multiple_of(ty.block_values()) {
             return Err(invalid(

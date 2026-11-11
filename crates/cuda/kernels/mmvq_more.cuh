@@ -13,6 +13,7 @@
 // through a `dp4a` against bytes of 1, never per value.
 #pragma once
 
+#include "fp4_scales.cuh"
 #include "mmvq.cuh"
 #include "mmvq_iquants.cuh"
 #include "mmvq_kquants.cuh"
@@ -203,8 +204,7 @@ struct EngMXFP4 {
         w.y[0] = v0.y;
         w.x[1] = v1.x;
         w.y[1] = v1.y;
-        // 2^(e - 127) / 2, with e = 0 the subnormal 2^-128 and e = 255 read as 2^127
-        w.d = __uint_as_float(e < 2 ? (0x00200000u << e) : ((e - 1) << 23));
+        w.d = ares_e8m0_half(e);
         return w;
     }
 
@@ -240,18 +240,6 @@ struct EngNVFP4 {
         float2 ds;
     };
 
-    // A UE4M3 byte as a float, halved for the doubled levels (0 and the NaN code give 0).
-    static __device__ __forceinline__ float ue4m3_half(uint32_t x) {
-        if (x == 0 || x == 0x7f) {
-            return 0.0f;
-        }
-        const uint32_t exp = (x >> 3) & 0xF;
-        const float man = static_cast<float>(x & 7);
-        const float raw = exp == 0 ? man * __uint_as_float(0x3b000000u)
-                                   : (1.0f + man * 0.125f) * __uint_as_float((exp + 120) << 23);
-        return raw * 0.5f;
-    }
-
     static __device__ __forceinline__ W load_w(const uint8_t* blk, uint32_t s, const uint8_t*) {
         const uint32_t q0 = ares_ld_stream_u32(blk + 4 + 8 * s);
         const uint32_t q1 = ares_ld_stream_u32(blk + 8 + 8 * s);
@@ -264,7 +252,7 @@ struct EngNVFP4 {
         w.x[1] = v1.x;  // 4..7
         w.y[0] = v0.y;  // 8..11
         w.y[1] = v1.y;  // 12..15
-        w.d = ue4m3_half(ares_ld_stream_u8(blk + s));
+        w.d = ares_ue4m3_half(ares_ld_stream_u8(blk + s));
         return w;
     }
 
