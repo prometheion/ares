@@ -193,17 +193,29 @@ requests ──► plan ──► upload step record ──► window ──► 
               └── what each sequence wants: prompt rows, or newest token + drafts
 ```
 
-1. **Plan** (`ares_sched::plan`). This is continuous batching as vLLM does
-   it: prompts and generation share steps, and there is no separate mode for
-   reading a prompt next to a generating request. Every generating sequence gets a row for
-   its newest token, then drafts while rows are left; prompts take the rest,
-   shortest first, starved ones before that. While anyone generates, the
-   prompt share is capped at the rows that fit in an allowed slowdown
-   (`prefill_rows_next_to`, from the measured cost line `base + per_row *
-   rows`). `StepTimeModel` now also fits a cost per attended cell, because
-   attention grows with the context and a prompt chunk at 100 000 tokens
-   costs more than one at 1 000 (`prefill_rows_at`); the conductor still
-   calls the older form.
+1. **Plan** (`ares_sched`). Prompts and generation take turns
+   (`ares_sched::Share`). A step is a *round* of generation (the newest
+   token of every generating sequence, with the drafts that pay: below) or a
+   *piece* of prompt (up to the rows at which the model's prompt kernels
+   reach their rate, 256 for `qwen35`, shortest prompt first and starved ones
+   before that, with the newest token of every generating sequence riding
+   along without drafts, so that they go on at a token a step). A round that
+   verifies drafts keeps the inputs of its rows for the commit and has room
+   for the rows of windows and no more, which is why prompt rows never share
+   a step with draft rows. The one setting is the *slowdown* `s`
+   (`prefill_slowdown`, 2 by default): while prompts and generation both
+   wait, generation gets `1 / s` of the time. A step of prompt that takes `t`
+   ms leaves `t / (s - 1)` ms of rounds owed before the next one, and a round
+   pays back what it takes; a round that overshoots is a credit, so the
+   share holds over time whatever the size of a round. A prompt that a piece
+   completes does not wait for the debt of a long one, as long as the debt
+   is no more than one whole piece leaves, so the first token of a short
+   prompt comes after the step in flight and one step of its own; a burst of
+   short prompts is read in one piece. While nobody generates a prompt takes
+   the widest step. (The scheme is TensorFold's lanes, whose "a long prompt's
+   step owes the decoders" this takes; it replaces the cap of the rows of a
+   prompt next to windows at `prefill_rows_at`, under which a prompt next to
+   a drafting sequence trickled in a few rows a step.)
 2. **Step record.** Everything that varies per step (row to sequence and
    position, page-table changes, draft tokens) is written to one pinned
    buffer and uploaded with one copy per device. Kernels read it there, so
@@ -1615,15 +1627,17 @@ running. What was chosen:
 - The conductor sees none of this. It dispatches a step and collects it when
   every device has ended; a step that misses experts is a longer step, and
   cancellation and new requests are handled between steps as for any model.
-  The only protection of other sequences is the planner's: the prompt rows
-  next to generating ones are bounded by the cost line it measures. A step of
-  eight prompt rows takes about 70 ms (a prompt of 1000 tokens, 125 steps, 8.7
-  s) against 22 ms for a step of one row, because every row routes to experts
-  of its own, so a sequence that generates while a prompt is read is slowed to
-  about that step time per token; whether the planner's linear cost line
-  holds the prompt's share down well for this model was not checked. Taking
-  the missing experts of a step's rows apart, to let the rows that have theirs
-  run first, is not built.
+  The only protection of other sequences is the planner's: a prompt is read
+  in pieces of eight rows (`Model::prompt_rows`, which for this model is its
+  whole step), each with the newest token of every generating sequence riding
+  along, and the share owes the generating sequences rounds for the time a
+  piece took. A step of eight prompt rows takes about 70 ms (a prompt of 1000
+  tokens, 125 steps, 8.7 s) against 22 ms for a step of one row, because every
+  row routes to experts of its own, so the token that rides along with a piece
+  comes after those 70 ms, and the rounds owed between pieces go at a token
+  each; whether generation gets the half of the time that the share promises
+  was not measured for this model. Taking the missing experts of a step's rows
+  apart, to let the rows that have theirs run first, is not built.
 
 Both placements work through the same code. By layers, the second device
 receives the residual through the runtime's links; with both cards on every
@@ -1931,8 +1945,7 @@ Work is paused here until Qwen4 is released; nothing below is in progress.
   RAM is one setting (`--ram`).
 - Known defects: a long prompt next to a generating Flash-Next sequence slows
   it by the misses of the prompt's rows (nothing separates the two inside a
-  step); the first token of a prompt that arrives next to a
-  drafting sequence takes about 0.4 s; with the fast kernels the text with
+  step); with the fast kernels the text with
   drafts is not always the text without (with exact products it is, for
   steps of the same size: see "Rounding" under "Sequence state"); a prompt
   that shares only the start of the chat template with an earlier request

@@ -75,6 +75,12 @@ impl Runtime {
                 "pages, cells per page and slots must be at least 1".into(),
             ));
         }
+        if !(config.prefill_slowdown > 1.0 && config.prefill_slowdown.is_finite()) {
+            return Err(RuntimeError::Config(format!(
+                "the slowdown of generation while a prompt is read must be above 1, got {}",
+                config.prefill_slowdown
+            )));
+        }
         if let Some(cache) = model.prefix_cache()
             && cache.checkpoint_bytes.len() != model.devices()
         {

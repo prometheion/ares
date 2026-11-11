@@ -278,6 +278,15 @@ impl Model for Qwen35 {
         self.options.max_rows
     }
 
+    fn prompt_rows(&self) -> u32 {
+        // The group in which a long step is run: where the prompt kernels
+        // reach their rate (see `Options::pipeline_rows`).
+        match self.options.pipeline_rows {
+            0 => self.options.max_rows,
+            rows => rows.min(self.options.max_rows),
+        }
+    }
+
     fn logit_rows(&self) -> u32 {
         self.options.logit_rows
     }

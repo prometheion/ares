@@ -561,3 +561,125 @@ fn a_steady_batch_still_finds_out_that_drafts_are_cheap() {
         plain.steps
     );
 }
+
+// --- prompts next to generation ----------------------------------------------
+
+/// What a step carried, as the observer sees the record.
+#[derive(Clone, Copy, Debug)]
+struct Seen {
+    rows: u32,
+    /// The rows of segments that are a prompt's: certain, and more than one.
+    prompt_rows: u32,
+    /// Segments that are the newest token of a sequence, without drafts.
+    riders: u32,
+    /// Windows that verify drafts (their rows are not certain).
+    windows: u32,
+}
+
+type Steps = Arc<Mutex<Vec<Seen>>>;
+
+fn watch(steps: &Steps) -> impl FnMut(&ares_runtime::RecordView<'_>) + Send + 'static {
+    let steps = steps.clone();
+    move |record| {
+        let mut seen = Seen { rows: record.rows(), prompt_rows: 0, riders: 0, windows: 0 };
+        for i in 0..record.segments() {
+            let segment = record.segment(i);
+            match (segment.direct, segment.n_rows) {
+                (false, _) => seen.windows += 1,
+                (true, 1) => seen.riders += 1,
+                (true, n) => seen.prompt_rows += n,
+            }
+        }
+        steps.lock().unwrap().push(seen);
+    }
+}
+
+/// A runtime whose steps cost what a device's do, a pass over the weights and
+/// a little for every row, with a sequence that is generating (and drafting).
+fn generating(steps: &Steps) -> (Runtime, Handle) {
+    let model = model(|c| {
+        repeating(c);
+        c.max_rows = 128;
+        c.context_length = 4096;
+    });
+    let observer = watch(steps);
+    let rt = runtime_with(&model, config(true, 4096), |e| {
+        e.with_row_cost(Duration::from_micros(3000), Duration::from_micros(30))
+            .with_observer(observer)
+    });
+    let generating = start(&rt, request("a sequence that goes on", Some(2000))).unwrap();
+    generating.wait_for_text(60);
+    (rt, generating)
+}
+
+#[test]
+fn a_prompt_next_to_a_drafting_sequence_is_read_in_pieces_without_draft_rows() {
+    let steps: Steps = Arc::default();
+    let (rt, generating) = generating(&steps);
+    let before = steps.lock().unwrap().len();
+    let long = start(&rt, request(&Rng(5).prompt(1000), Some(1))).unwrap();
+    long.finish();
+    let after = steps.lock().unwrap().len();
+    let ours: Vec<Seen> = steps.lock().unwrap()[before..after].to_vec();
+    let pieces: Vec<&Seen> = ours.iter().filter(|s| s.prompt_rows > 0).collect();
+    assert_eq!(pieces.iter().map(|s| s.prompt_rows).sum::<u32>(), 1000, "the whole prompt");
+    // A piece is a step of its own: the prompt's rows and the newest token of
+    // the sequence that generates, never a window of drafts.
+    assert!(pieces.iter().all(|s| s.windows == 0), "{pieces:?}");
+    assert!(pieces.iter().all(|s| s.rows <= 128), "{pieces:?}");
+    assert!(
+        pieces.iter().all(|s| s.riders == 1),
+        "the sequence goes on in every piece: {pieces:?}"
+    );
+    // The sequence went on in rounds of drafts between the pieces.
+    assert!(ours.iter().any(|s| s.windows > 0 && s.rows > 1), "{ours:?}");
+    generating.finish();
+    rt.shutdown();
+}
+
+#[test]
+fn a_long_prompt_takes_half_of_the_time_next_to_a_sequence_that_generates() {
+    let steps: Steps = Arc::default();
+    let (rt, generating) = generating(&steps);
+    let before = steps.lock().unwrap().len();
+    start(&rt, request(&Rng(6).prompt(2400), Some(1))).unwrap().finish();
+    let after = steps.lock().unwrap().len();
+    // The cost the executor charges.
+    let ms = |s: &Seen| 3.0 + 0.03 * f64::from(s.rows);
+    let ours: Vec<Seen> = steps.lock().unwrap()[before..after].to_vec();
+    let prompt: f64 = ours.iter().filter(|s| s.prompt_rows > 0).map(ms).sum();
+    let rounds: f64 = ours.iter().filter(|s| s.prompt_rows == 0).map(ms).sum();
+    // The default slowdown is 2: the sequence gets as much time as the prompt.
+    let owed = rounds / prompt;
+    assert!((0.8..1.25).contains(&owed), "the sequence had {rounds:.0} ms, the prompt {prompt:.0}");
+    generating.finish();
+    rt.shutdown();
+}
+
+#[test]
+fn a_short_prompt_next_to_a_drafting_sequence_is_read_whole_in_the_next_step() {
+    let steps: Steps = Arc::default();
+    let (rt, generating) = generating(&steps);
+    for round in 0..4 {
+        let before = steps.lock().unwrap().len();
+        let short = start(&rt, request(&Rng(7 + round).prompt(60), Some(2))).unwrap();
+        short.finish();
+        let after = steps.lock().unwrap().len();
+        let pieces =
+            steps.lock().unwrap()[before..after].iter().filter(|s| s.prompt_rows > 0).count();
+        assert_eq!(pieces, 1, "round {round}: a prompt of 60 rows is one piece");
+    }
+    generating.finish();
+    rt.shutdown();
+}
+
+#[test]
+fn a_slowdown_that_leaves_generation_no_time_is_refused_at_start() {
+    let model = model(|_| {});
+    for slowdown in [1.0, 0.5, f64::NAN, f64::INFINITY] {
+        let host = HostExecutor::new(model.clone(), model.config().max_rows, 4);
+        let config = RuntimeConfig { max_slots: 4, prefill_slowdown: slowdown, ..config(true, 64) };
+        let error = Runtime::start(model.clone(), Box::new(host), config).unwrap_err();
+        assert!(error.to_string().contains("must be above 1"), "{slowdown}: {error}");
+    }
+}

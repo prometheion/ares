@@ -1,7 +1,5 @@
 //! Composing a step.
 
-use crate::timing::{Load, StepTimeModel};
-
 /// Identifies a sequence to the scheduler.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SeqId(pub u32);
@@ -38,7 +36,7 @@ pub struct Limits {
     /// The most rows a step can hold (the size of the step's scratch memory).
     pub max_rows: u32,
     /// The most prompt rows in a step that also carries generating
-    /// sequences or decisions. See [`prefill_rows_at`].
+    /// sequences or decisions: a piece of prompt (see [`Share`](crate::Share)).
     pub prefill_rows_with_windows: u32,
     /// A prompt that waited this many steps goes before shorter prompts.
     pub starvation_steps: u32,
@@ -187,32 +185,6 @@ pub fn plan(requests: &[Request], limits: &Limits) -> Plan {
         });
     }
     Plan { parts }
-}
-
-/// How many rows of a prompt that has `prompt_context` cells computed a step
-/// may carry next to `windows`, the load of every part that is not a prompt
-/// (generating sequences and decisions), when those may run `slowdown` times
-/// slower than they would alone.
-///
-/// The cost of a step is [`StepTimeModel::cost`], with its term for the
-/// context: the allowed extra time is `(slowdown - 1) * time(windows)`, and
-/// the rows that fit in it are fewer the deeper the prompt is, because each
-/// reads its whole context
-/// ([`StepCost::rows_within`](crate::StepCost::rows_within)). At least one row
-/// is always allowed, or a prompt would never finish. Before any step was
-/// measured the answer is `fallback`.
-pub fn prefill_rows_at(
-    model: &StepTimeModel,
-    windows: Load,
-    prompt_context: u64,
-    slowdown: f64,
-    fallback: u32,
-) -> u32 {
-    let Some(cost) = model.cost() else {
-        return fallback.max(1);
-    };
-    let extra = (slowdown - 1.0).max(0.0) * cost.ms(windows);
-    cost.rows_within(extra, prompt_context).max(1)
 }
 
 #[cfg(test)]
@@ -408,49 +380,5 @@ mod tests {
     fn nothing_to_do_is_an_empty_plan() {
         assert_eq!(plan(&[], &LIMITS), Plan::default());
         assert_eq!(plan(&[prefill(1, 0, 0)], &LIMITS).rows(), 0);
-    }
-
-    #[test]
-    fn the_prompt_share_follows_the_allowed_slowdown() {
-        let mut model = StepTimeModel::new(1.0);
-        let windows = Load { rows: 3, cells: 0 };
-        assert_eq!(prefill_rows_at(&model, windows, 0, 2.0, 32), 32);
-        for rows in [1u32, 8, 64, 256] {
-            model.observe(rows, 33.0 + 1.14 * f64::from(rows));
-        }
-        // Alone, a 3-row step takes 36.4 ms; at half speed there are 36.4 ms
-        // more, which is 31 rows.
-        assert_eq!(prefill_rows_at(&model, windows, 0, 2.0, 32), 31);
-        assert_eq!(prefill_rows_at(&model, windows, 0, 1.5, 32), 15);
-        // No slowdown allowed still lets a prompt move.
-        assert_eq!(prefill_rows_at(&model, windows, 0, 1.0, 32), 1);
-        // Steps that told nothing about contexts give a deep prompt the same.
-        assert_eq!(prefill_rows_at(&model, windows, 100_000, 2.0, 32), 31);
-    }
-
-    #[test]
-    fn a_deep_prompt_gets_fewer_rows_next_to_generation_than_a_shallow_one() {
-        let mut model = StepTimeModel::new(1.0);
-        let windows = Load::chunk(2_000, 3);
-        assert_eq!(prefill_rows_at(&model, windows, 0, 2.0, 32), 32);
-        // 33 ms, 1.14 ms per row, 5e-6 ms per cell read; steps of every kind.
-        let ms = |load: Load| 33.0 + 1.14 * f64::from(load.rows) + 5e-6 * load.cells as f64;
-        for context in [0u64, 4_000, 60_000, 250_000] {
-            for rows in [1u32, 8, 64, 256] {
-                let load = Load::chunk(context, rows);
-                model.observe_load(load, ms(load));
-            }
-        }
-        // Alone the windows take 36.45 ms; at half speed there are 36.45 ms
-        // more. At the start of a prompt that is 31 rows, as without the term.
-        assert_eq!(prefill_rows_at(&model, windows, 0, 2.0, 32), 31);
-        // At 100 000 tokens a row costs 1.64 ms, at 250 000 2.39 ms.
-        assert_eq!(prefill_rows_at(&model, windows, 100_000, 2.0, 32), 22);
-        assert_eq!(prefill_rows_at(&model, windows, 250_000, 2.0, 32), 15);
-        // Deep generating sequences take longer alone, so the same slowdown
-        // leaves a prompt more rows.
-        let deep_windows = Load::chunk(200_000, 3);
-        assert!(prefill_rows_at(&model, deep_windows, 0, 2.0, 32) > 31);
-        assert_eq!(prefill_rows_at(&model, windows, 250_000, 1.0, 32), 1);
     }
 }

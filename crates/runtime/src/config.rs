@@ -65,11 +65,12 @@ pub struct RuntimeConfig {
     /// The acceptance the model's own drafts are assumed to have for a new
     /// sequence.
     pub draft_prior: f64,
-    /// How much slower generating sequences may get while a prompt is read
-    /// (2.0: half speed), which bounds the prompt rows of a step.
+    /// How much slower generating sequences may get while a prompt is read,
+    /// above 1 (2.0: they get half of the time, the prompt the other half):
+    /// the one setting of how prompts and generation take turns
+    /// ([`ares_sched::Share`]). A prompt that is read faster is read at the
+    /// cost of the sequences that generate.
     pub prefill_slowdown: f64,
-    /// Prompt rows next to generation before any step has been measured.
-    pub prefill_fallback_rows: u32,
     /// Steps a prompt may wait before it goes ahead of shorter ones.
     pub starvation_steps: u32,
     /// How long the conductor spins for the devices to finish a step before
@@ -105,7 +106,6 @@ impl Default for RuntimeConfig {
             lookup: LookupConfig::default(),
             draft_prior: 0.6,
             prefill_slowdown: 2.0,
-            prefill_fallback_rows: 32,
             starvation_steps: 8,
             conductor_spin: Duration::from_millis(100),
             stats_window: crate::timing::DEFAULT_WINDOW,

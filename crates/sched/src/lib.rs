@@ -12,8 +12,10 @@
 //!
 //! - [`plan`] composes a step from what the sequences want ([`Want`]), giving
 //!   generating sequences their newest token first, then the option rows of
-//!   decisions, then drafts, and prompts the rest, bounded so that a long
-//!   prompt slows generation and decisions by a chosen factor and no more.
+//!   decisions, then drafts, and prompts the rest.
+//! - [`Share`] decides whether the next step is a round of generation or a
+//!   piece of prompt, so that a long prompt slows generation by a chosen
+//!   factor and no more, and a short one is read at once.
 //! - [`Pass`] is the other order for long prompts of a model whose experts
 //!   are fetched: all rows up to a layer's router, then that layer's experts
 //!   for all rows, then on, so that a prompt fetches each expert once.
@@ -37,11 +39,13 @@ mod draft;
 mod lookup;
 mod pass;
 mod plan;
+mod share;
 mod timing;
 
 pub use admission::{Admission, AdmissionConfig, Arrival, Claims, ExceedsPool, Outcome, PoolView};
 pub use draft::{Acceptance, DraftChoice, DraftCost, best_draft_len};
 pub use lookup::{LookupConfig, LookupCorpus, LookupDrafter, LookupMatch};
 pub use pass::{Pass, PassStep, Point, pass_rows_between, runs_as_pass};
-pub use plan::{Limits, Part, PartKind, Plan, Request, SeqId, Want, plan, prefill_rows_at};
+pub use plan::{Limits, Part, PartKind, Plan, Request, SeqId, Want, plan};
+pub use share::{Pending, Share, Turn};
 pub use timing::{Load, StepCost, StepTimeModel};

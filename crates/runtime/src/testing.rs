@@ -112,6 +112,10 @@ pub struct HostExecutor {
     record: Vec<u8>,
     picks: Vec<Pick>,
     delay: Duration,
+    /// A base and a time per row, in place of `delay`.
+    row_cost: Option<(Duration, Duration)>,
+    /// How long the step that was dispatched takes.
+    step_delay: Duration,
     gate: Option<Gate>,
     observer: Option<Observer>,
     dispatched_at: Instant,
@@ -139,6 +143,8 @@ impl HostExecutor {
             record: vec![0; crate::record::max_bytes(max_rows, max_slots)],
             picks: Vec::new(),
             delay: Duration::ZERO,
+            row_cost: None,
+            step_delay: Duration::ZERO,
             gate: None,
             observer: None,
             dispatched_at: Instant::now(),
@@ -175,6 +181,14 @@ impl HostExecutor {
     /// Makes every step take at least `delay`, as a device would.
     pub fn with_delay(mut self, delay: Duration) -> Self {
         self.delay = delay;
+        self
+    }
+
+    /// Makes a step take `base` and `per_row` for each of its rows, as a device
+    /// does (a pass over the weights, and a cost for every row), instead of
+    /// the same time whatever it carries.
+    pub fn with_row_cost(mut self, base: Duration, per_row: Duration) -> Self {
+        self.row_cost = Some((base, per_row));
         self
     }
 
@@ -222,6 +236,10 @@ impl Executor for HostExecutor {
             observer(&view);
         }
         self.failing = self.fail_at_step == Some(meta.step);
+        self.step_delay = match self.row_cost {
+            Some((base, per_row)) => base + per_row * view.rows(),
+            None => self.delay,
+        };
         self.picks.clear();
         let mut tables = self.tables.lock().expect("tables");
         // The page-table updates, as the device copies them.
@@ -272,7 +290,7 @@ impl Executor for HostExecutor {
                 message: "the test never opened the gate".into(),
             });
         }
-        if let Some(left) = self.delay.checked_sub(self.dispatched_at.elapsed()) {
+        if let Some(left) = self.step_delay.checked_sub(self.dispatched_at.elapsed()) {
             std::thread::sleep(left);
         }
         if self.failing {

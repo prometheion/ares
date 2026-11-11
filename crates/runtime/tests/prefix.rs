@@ -803,8 +803,11 @@ fn many_requests_with_shared_prefixes_edits_and_tight_memory_all_say_what_they_s
             ("tight, 3 checkpoints", 64, 3, 6, 0.1, false, &short),
             ("tight, no checkpoints", 48, 0, 4, 0.1, false, &short),
             ("tight, 2 checkpoints", 64, 2, 8, 0.1, false, &short),
-            ("long answers, 2 checkpoints", 40, 2, 8, 0.05, true, &long),
-            ("long answers, 5 checkpoints", 40, 5, 8, 0.05, true, &long),
+            // Prompts are read in pieces at full speed, so fewer are half read
+            // at once than when they trickled in: it takes more slots than
+            // the pool can feed for requests to give way.
+            ("long answers, 2 checkpoints", 36, 2, 16, 0.02, true, &long),
+            ("long answers, 5 checkpoints", 36, 5, 16, 0.02, true, &long),
         ] {
             let model = model(Some(CHECKPOINT), shape);
             let cfg = RuntimeConfig {

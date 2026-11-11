@@ -353,6 +353,16 @@ pub trait Model: Send + Sync + 'static {
     /// The most rows of one step the model's buffers hold.
     fn max_rows(&self) -> u32;
 
+    /// The rows of a piece of prompt: where the model's prompt kernels reach
+    /// their rate. The conductor reads a prompt next to generating sequences
+    /// in steps of this many rows (a smaller step pays the pass over the
+    /// weights again and reads the prompt slower, a larger one stops the
+    /// generating sequences for longer), and a prompt with no more rows left
+    /// is read whole. At most [`Model::max_rows`]; that is the default.
+    fn prompt_rows(&self) -> u32 {
+        self.max_rows()
+    }
+
     /// The most rows of one step whose logits can be wanted: every row of a
     /// generating sequence (its newest token and its drafts) and the last
     /// row of a prompt.

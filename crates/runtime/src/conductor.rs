@@ -18,6 +18,15 @@
 //!                                                                                   corpus, update)
 //! ```
 //!
+//! # Rounds and pieces
+//!
+//! A step is a *round* of generation or a *piece* of prompt, never both
+//! kinds of rows at their full size ([`ares_sched::Share`] decides which, and
+//! the module docs there say why). A round carries the newest token of every
+//! generating sequence and its drafts; a piece carries up to
+//! [`Model::prompt_rows`] rows of the prompts that have started, shortest
+//! first, and the newest token of every generating sequence without drafts.
+//!
 //! # Who runs
 //!
 //! Nothing is reserved for a request's longest possible length and nothing is
@@ -76,8 +85,8 @@ use ares_api::{EngineError, Event, EventSink, FinishReason, RequestId, Sampling,
 use ares_cuda::{SampleParams, SampleRow};
 use ares_sched::{
     Acceptance, Admission, AdmissionConfig, Arrival, DraftCost, Limits, Load, LookupCorpus,
-    LookupDrafter, Outcome, PartKind, PoolView, Request, SeqId, StepTimeModel, Want,
-    best_draft_len, plan, prefill_rows_at,
+    LookupDrafter, Outcome, PartKind, Pending, PoolView, Request, SeqId, Share, StepTimeModel,
+    Turn, Want, best_draft_len, plan,
 };
 use ares_state::{
     Chain, ChainHash, Owner, PagePool, PageState, PrefixIndex, Priority, Resume, Sequence,
@@ -449,6 +458,11 @@ pub(crate) struct Conductor {
     next_seq: u32,
     active: usize,
     step_time: StepTimeModel,
+    /// Whose turn it is, rounds of generation or pieces of prompt.
+    share: Share,
+    /// The rows of each prompt that has started and is not read yet, for the
+    /// share's decision.
+    prompt_rows: Vec<u32>,
     /// The text of all sequences, which drafts are looked up in.
     corpus: LookupCorpus,
     stats: Stats,
@@ -493,6 +507,7 @@ impl Conductor {
             n => n.min(model.max_rows()),
         };
         let slots = config.max_slots as usize;
+        let share = Share::new(config.prefill_slowdown);
         let admission = AdmissionConfig {
             output_clip: config.output_clip,
             initial_ratio: config.output_ratio,
@@ -539,6 +554,8 @@ impl Conductor {
             rx,
             active: 0,
             step_time: StepTimeModel::default(),
+            share,
+            prompt_rows: Vec::with_capacity(slots),
             step_no: 0,
             after_idle: true,
             last_done_ns: None,
@@ -607,18 +624,18 @@ impl Conductor {
                     Err(RecvTimeoutError::Disconnected) => break,
                 }
             }
-            let turn = Instant::now();
+            let began = Instant::now();
             while let Ok(command) = self.rx.try_recv() {
                 self.handle(command);
             }
             if self.shutting_down {
                 break;
             }
-            self.stats.record(Phase::Intake, turn.elapsed().as_nanos() as u64);
+            self.stats.record(Phase::Intake, began.elapsed().as_nanos() as u64);
             if self.active == 0 && self.waiting.is_empty() {
                 continue;
             }
-            self.step(turn);
+            self.step(began);
         }
         self.finish_everything(FinishReason::Cancelled);
         // `Runtime::shutdown` stops the front end from sending before it
@@ -1140,11 +1157,12 @@ impl Conductor {
     }
 
     /// Decides how many drafts each generating sequence asks for, and
-    /// fills `requests` for the planner. Returns the load of the step's
-    /// rows that are not optional and not a prompt's: the newest token of
-    /// every generating sequence.
-    fn want(&mut self) -> Load {
+    /// fills `requests` for the planner. A round of generation asks for the
+    /// windows, a piece of prompt for the prompts and the newest token of
+    /// each generating sequence, without drafts.
+    fn want(&mut self, turn: Turn) {
         self.requests.clear();
+        let round = turn == Turn::Round;
         let span = self.span;
         let reads = |a: &Active| a.cells.len().min(u64::from(span));
         let mut generating = 0u32;
@@ -1188,7 +1206,7 @@ impl Conductor {
                 };
                 a.own = false;
                 a.lookup.clear();
-                if self.config.speculation && cap > 0 {
+                if round && self.config.speculation && cap > 0 {
                     // Two drafters: the lookup, whose proposal costs nothing
                     // but is there only where text repeats, and the model's
                     // own draft block, which always has one and pays for
@@ -1270,6 +1288,9 @@ impl Conductor {
                     }
                 }
                 Want::Window { drafts: a.draft.len() as u32 }
+            } else if round {
+                // Prompts wait for their piece.
+                continue;
             } else {
                 Want::Prefill { tokens: a.prefill_left() }
             };
@@ -1279,11 +1300,10 @@ impl Conductor {
                 waited_steps: a.waited_steps,
             });
         }
-        windows
     }
 
     /// One turn of the loop with something to do.
-    fn step(&mut self, turn: Instant) {
+    fn step(&mut self, began: Instant) {
         let t_plan = Instant::now();
         // Those who wait come in before the plan, so that a request that
         // fits shares this step.
@@ -1301,33 +1321,44 @@ impl Conductor {
         if self.stalled {
             return;
         }
-        let windows = self.want();
-        let drafting =
-            self.requests.iter().any(|r| matches!(r.want, Want::Window { drafts } if drafts > 0));
-        // The prompt rows next to generation are sized for the deepest
-        // prompt, whose rows cost most: the planner picks among the prompts
-        // by other rules, and whichever it serves stays inside the slowdown.
+        // Whose turn it is. The price of a piece for the share is a step of
+        // that many rows at the depth of the deepest prompt.
+        self.prompt_rows.clear();
+        self.prompt_rows.extend(
+            self.slots.iter().flatten().filter(|a| !a.generating()).map(Active::prefill_left),
+        );
+        let generating = self.slots.iter().flatten().filter(|a| a.generating()).count() as u32;
         let deepest = self
             .slots
             .iter()
             .flatten()
             .filter(|a| !a.generating())
-            .map(|a| a.cells.len().min(u64::from(self.span)))
+            .map(|a| a.cells.len())
             .max()
             .unwrap_or(0);
+        let (span, cost) = (self.span, self.step_time.cost());
+        let pending = Pending {
+            generating,
+            prompts: &self.prompt_rows,
+            piece_rows: self.model.prompt_rows().min(self.max_rows),
+            max_rows: self.max_rows,
+        };
+        let turn = self
+            .share
+            .next(&pending, |rows| cost.map_or(0.0, |cost| cost.ms(load_of(span, deepest, rows))));
+        self.want(turn);
+        let drafting =
+            self.requests.iter().any(|r| matches!(r.want, Want::Window { drafts } if drafts > 0));
         let limits = Limits {
             max_rows: if drafting {
                 self.max_rows.min(self.model.draft_rows())
             } else {
                 self.max_rows
             },
-            prefill_rows_with_windows: prefill_rows_at(
-                &self.step_time,
-                windows,
-                deepest,
-                self.config.prefill_slowdown,
-                self.config.prefill_fallback_rows,
-            ),
+            prefill_rows_with_windows: match turn {
+                Turn::Piece { rows } => rows,
+                Turn::Round => 0,
+            },
             starvation_steps: self.config.starvation_steps,
         };
         let planned = plan(&self.requests, &limits);
@@ -1492,7 +1523,9 @@ impl Conductor {
                 None => per_link,
             });
         }
-        self.step_time.observe_load(load, (t_back - t_dispatch).as_secs_f64() * 1e3 - draft_ms);
+        let step_ms = (t_back - t_dispatch).as_secs_f64() * 1e3;
+        self.step_time.observe_load(load, step_ms - draft_ms);
+        self.share.spent(turn, step_ms, generating, self.prompt_rows.iter().any(|rows| *rows > 0));
         let last_done = self.output.devices.iter().map(|d| d.finished_at_ns).max().unwrap_or(0);
         self.last_done_ns = Some(last_done);
         for (device, times) in self.output.devices.iter().enumerate() {
@@ -1511,7 +1544,7 @@ impl Conductor {
         let t_events = Instant::now();
         self.deliver();
         self.stats.record(Phase::Events, t_events.elapsed().as_nanos() as u64);
-        self.stats.record(Phase::Step, turn.elapsed().as_nanos() as u64);
+        self.stats.record(Phase::Step, began.elapsed().as_nanos() as u64);
         self.stats.counters.steps += 1;
     }
 
