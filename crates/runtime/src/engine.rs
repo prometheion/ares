@@ -15,7 +15,7 @@ use ares_cuda::Device;
 use crate::conductor::{Command, Conductor, SequenceInfo, StatsCopy, Submission};
 use crate::config::RuntimeConfig;
 use crate::error::RuntimeError;
-use crate::exec::Executor;
+use crate::exec::{ExecError, Executor};
 use crate::gpu::{GpuConfig, GpuExecutor};
 use crate::model::Model;
 use crate::timing::Snapshot;
@@ -110,7 +110,12 @@ impl Runtime {
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
                 let _ = thread.join();
-                return Err(RuntimeError::Device { device: 0, message: error.to_string() });
+                return Err(match error {
+                    ExecError::Device { device, message } => {
+                        RuntimeError::Device { device, message }
+                    }
+                    other => RuntimeError::Thread(other.to_string()),
+                });
             }
             Err(_) => {
                 let _ = thread.join();

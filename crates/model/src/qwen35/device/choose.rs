@@ -302,6 +302,19 @@ impl Balance {
         }
     }
 
+    /// Tells the others that device `index` will tell nothing, because it
+    /// failed before it could: they decide on their own at once, where they
+    /// would wait for it for two minutes. Does not wait.
+    pub fn give_up(&self, index: usize) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(slot) = state.told.get_mut(index)
+            && slot.is_none()
+        {
+            *slot = Some(Told::default());
+            self.changed.notify_all();
+        }
+    }
+
     /// Tells the others what device `index` measured and returns what every
     /// device told, once all have; `None` when one does not tell in time.
     fn exchange(&self, index: usize, told: Told) -> Option<Vec<Told>> {
@@ -1244,5 +1257,25 @@ mod tests {
             assert_eq!(all[1].prompt, theirs);
             assert_eq!(thread.join().unwrap().expect("both told")[0].prompt, 1.0);
         }
+    }
+
+    #[test]
+    fn a_device_that_gives_up_does_not_keep_the_others_waiting() {
+        let balance = std::sync::Arc::new(Balance::new(2));
+        let other = balance.clone();
+        let begun = Instant::now();
+        let waiting =
+            std::thread::spawn(move || other.exchange(1, Told { prompt: 2.0, known: true }));
+        // The device that fails first tells nothing; the other is let go with
+        // what it knows, long before the patience of two minutes.
+        std::thread::sleep(Duration::from_millis(50));
+        balance.give_up(0);
+        let all = waiting.join().unwrap().expect("let go, not timed out");
+        assert!(!all[0].known && all[1].known);
+        assert!(begun.elapsed() < Duration::from_secs(10));
+        // A device that has told is not undone by giving up afterwards.
+        let balance = Balance::new(1);
+        balance.exchange(0, Told { prompt: 3.0, known: true });
+        balance.give_up(0);
     }
 }

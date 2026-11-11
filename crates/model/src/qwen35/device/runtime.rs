@@ -319,6 +319,15 @@ impl Model for Qwen35 {
         )
     }
 
+    fn abandon(&self, part: usize) {
+        // The parts of a tensor split open at the same time and tell each
+        // other what they measured: one that fails first must not keep the
+        // others waiting for it.
+        if let Some(balance) = &self.balance {
+            balance.give_up(part);
+        }
+    }
+
     fn open(&self, cx: DeviceContext<'_>) -> Result<Box<dyn DeviceModel>, ModelError> {
         if cx.cells_per_page != ENTRY_CELLS {
             return Err(ModelError::Invalid(format!(

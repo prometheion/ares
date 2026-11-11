@@ -455,6 +455,15 @@ fn a_failing_device_ends_every_request_with_an_error_and_stops_taking_new_ones()
 }
 
 #[test]
+fn a_failing_warm_up_step_reports_the_device_and_the_cause() {
+    let model = model(|_| {});
+    let host = HostExecutor::new(model.clone(), model.config().max_rows, 4).failing_at(2);
+    let config = RuntimeConfig { max_slots: 4, ..RuntimeConfig::default() };
+    let error = Runtime::start(model.clone(), Box::new(host), config).unwrap_err();
+    assert_eq!(error.to_string(), "device 0: injected failure");
+}
+
+#[test]
 fn decisions_are_not_implemented_and_say_so() {
     use ares_api::{DecisionRequest, DecisionSink, Prompt};
     let model = model(|_| {});

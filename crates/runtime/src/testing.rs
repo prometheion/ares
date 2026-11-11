@@ -44,6 +44,8 @@
 //! what it says, a slot that was taken before its state was saved: each of
 //! them changes the generated tokens.
 
+mod faulty;
+
 use std::collections::HashMap;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -54,6 +56,8 @@ use crate::record::{RecordView, StateCopyKind};
 use crate::sync::{WakeCounts, Woke};
 use crate::synthetic::SyntheticModel;
 use crate::timing::DeviceTimes;
+
+pub use faulty::{Failure, Fault, Faulty};
 
 /// A latch a test closes to hold steps back and opens to let them finish.
 #[derive(Clone, Debug)]

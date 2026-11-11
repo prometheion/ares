@@ -82,6 +82,25 @@ struct Side {
     weight: DeviceBuffer,
 }
 
+impl Side {
+    /// The buffers of a device for merges of up to `max_rows` rows.
+    fn new(device: &Device, max_rows: u32, weight: &[f32]) -> Self {
+        let values = u64::from(max_rows * D) * 4;
+        let act_bytes = Kernels::quantized_activation_bytes(D, max_rows);
+        Side {
+            stream: Stream::new(device, 0).unwrap(),
+            kernels: Kernels::load(device).unwrap(),
+            layers: LayerKernels::load(device).unwrap(),
+            p: DeviceBuffer::new(device, values).unwrap(),
+            x: DeviceBuffer::new(device, values).unwrap(),
+            xn: DeviceBuffer::new(device, values).unwrap(),
+            act: DeviceBuffer::new(device, act_bytes).unwrap(),
+            act_ref: DeviceBuffer::new(device, act_bytes).unwrap(),
+            weight: upload(device, weight),
+        }
+    }
+}
+
 /// Enqueues one merge of `n` rows on both devices: pushed when `push`, through
 /// slot `slot` otherwise.
 fn merge(
@@ -175,22 +194,8 @@ fn merges_give_every_device_the_same_sum_and_its_norm() {
                 .unwrap()
                 .with_slots(2, partial_wire_bytes(wire, MAX_ROWS, D))
                 .unwrap();
-            let values = (MAX_ROWS * D) as usize;
-            let act_bytes = Kernels::quantized_activation_bytes(D, MAX_ROWS);
-            let sides: Vec<Side> = gpus
-                .iter()
-                .map(|device| Side {
-                    stream: Stream::new(device, 0).unwrap(),
-                    kernels: Kernels::load(device).unwrap(),
-                    layers: LayerKernels::load(device).unwrap(),
-                    p: DeviceBuffer::new(device, values as u64 * 4).unwrap(),
-                    x: DeviceBuffer::new(device, values as u64 * 4).unwrap(),
-                    xn: DeviceBuffer::new(device, values as u64 * 4).unwrap(),
-                    act: DeviceBuffer::new(device, act_bytes).unwrap(),
-                    act_ref: DeviceBuffer::new(device, act_bytes).unwrap(),
-                    weight: upload(device, &weight),
-                })
-                .collect();
+            let sides: Vec<Side> =
+                gpus.iter().map(|device| Side::new(device, MAX_ROWS, &weight)).collect();
             let sync = || sides.iter().for_each(|s| s.stream.synchronize().unwrap());
 
             // Rounds of different sizes on alternating slots, so that slots,
@@ -310,4 +315,62 @@ fn merges_give_every_device_the_same_sum_and_its_norm() {
             }
         }
     }
+}
+
+/// A merge is enqueued by one thread per device, and each device's kernel
+/// waits for the other's flag. When one thread fails before it has enqueued
+/// its half, the stream of the other holds a kernel that waits for nobody,
+/// and so does everything behind it: the end of the step, the synchronise
+/// that comes before the device's buffers are freed. The kernel gives up
+/// after about four billion polls. `release_waiters` ends the wait from the
+/// host without waiting for the stream.
+#[test]
+fn a_merge_that_waits_for_a_device_that_never_comes_is_released() {
+    let Some(gpus) = gpus() else { return };
+    if !(peer_access(0, 1).unwrap().0 && peer_access(1, 0).unwrap().0) {
+        eprintln!("skipped: the push path needs peer access between the devices");
+        return;
+    }
+    let mesh = Mesh::with_route(&gpus, 16 * D, Route::Peer).unwrap();
+    assert!(mesh.push_bytes() > 0, "two devices with peer access have the push path");
+    let weight = vec![1.0f32; D as usize];
+    let side = Side::new(&gpus[0], 8, &weight);
+    let enqueue = |rank: usize| {
+        let target = mesh.push(rank).expect("a push path");
+        // SAFETY: the buffers hold 3 rows of `D` values on the side's device.
+        // The other device's half is never enqueued: that is the point.
+        unsafe {
+            side.layers
+                .merge_push(
+                    &side.stream,
+                    Wire::F32,
+                    side.p.ptr(),
+                    side.x.ptr(),
+                    target,
+                    true,
+                    3,
+                    D,
+                    MergeNorm::Rows { weight: side.weight.ptr(), out: side.xn.ptr() },
+                    EPS,
+                )
+                .unwrap();
+        }
+    };
+    enqueue(0);
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    assert!(!side.stream.is_idle().unwrap(), "the kernel waits for a peer that is not there");
+
+    let released = std::time::Instant::now();
+    mesh.release_waiters().unwrap();
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !side.stream.is_idle().unwrap() {
+        assert!(std::time::Instant::now() < until, "the released kernel did not end in 10 s");
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    eprintln!("RES the stream was idle {:?} after the release", released.elapsed());
+
+    // Merges enqueued after the release do not wait either.
+    enqueue(0);
+    enqueue(0);
+    side.stream.synchronize().unwrap();
 }

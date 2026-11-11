@@ -409,6 +409,14 @@ pub trait Model: Send + Sync + 'static {
     /// is built.
     fn page_layout(&self, cells_per_page: u32) -> PageLayout;
 
+    /// Device part `part` could not be built (or its thread ended before it
+    /// was): a model whose parts wait for each other while they open, to tell
+    /// each other what they measured, lets the others go. Called on the
+    /// thread of the part that failed, once, and not for a part that is open.
+    fn abandon(&self, part: usize) {
+        let _ = part;
+    }
+
     /// Builds device part `cx.index`. Called on that device's thread.
     fn open(&self, cx: DeviceContext<'_>) -> Result<Box<dyn DeviceModel>, ModelError>;
 }

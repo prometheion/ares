@@ -256,6 +256,27 @@ token is a pure function of a sequence's own tokens, so the tests can check
 that a request gets the same text alone and next to 1, 7 and 31 others, with
 speculation on and off, on every placement.
 
+**When a device fails.** The error reaches the caller with the device's index,
+name and driver number and the cause (`device 1: NVIDIA GeForce RTX 3060 (CUDA
+1): ...`), whether the part could not be built, a step returned an error or a
+thread panicked (where panics unwind; the release profile aborts). The device
+that failed is the one named, not the ones that were left waiting for it. What
+used to hang the start, and could hang a step, was a kernel of the push
+path: one thread per device enqueues its half of a merge and each device's
+kernel waits on the device for the other's flag, so a thread that failed
+before it enqueued its half left the other's stream with a kernel that waits
+for a flag nobody sets (it gives up after four billion polls), and with it
+the end of the step and the wait for the thread to stop. A thread that fails
+now writes every flag ahead of any token from the host, over a stream of
+its own and a copy engine that the waiting kernel does not hold
+(`Mesh::release_waiters`, called by `Links::abort`); the released kernels
+add up meaningless values in a step nobody reads. A part that fails to build
+tells the model (`Model::abandon`) so that the parts that wait for its
+measurements (`qwen35`'s layout choice, which waited two minutes) go on at
+once. A thread that has not stopped ten seconds after it was told to is left
+behind and the shutdown ends. `ares_runtime::testing::Faulty` makes a model
+fail on purpose, and `qwen35_failure` runs it on two cards.
+
 Measured 2026-11-10 with that model (RTX 4070 and RTX 3060, 128 tokens per
 request, medians):
 
@@ -1910,8 +1931,7 @@ Work is paused here until Qwen4 is released; nothing below is in progress.
   RAM is one setting (`--ram`).
 - Known defects: a long prompt next to a generating Flash-Next sequence slows
   it by the misses of the prompt's rows (nothing separates the two inside a
-  step); a warm-up step that fails hangs the start of the runtime
-  instead of reporting; the first token of a prompt that arrives next to a
+  step); the first token of a prompt that arrives next to a
   drafting sequence takes about 0.4 s; with the fast kernels the text with
   drafts is not always the text without (with exact products it is, for
   steps of the same size: see "Rounding" under "Sequence state"); a prompt

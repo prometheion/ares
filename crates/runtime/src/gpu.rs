@@ -17,6 +17,8 @@
 //! meeting is [`Links`], which exists because `ares-cuda`'s sum and
 //! hand-over are single calls over several streams.
 
+use std::any::Any;
+use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -138,6 +140,8 @@ enum Job {
 #[derive(Default)]
 struct DeviceResult {
     error: Option<String>,
+    /// The error is only that another device failed: the cause is theirs.
+    secondary: bool,
     times: DeviceTimes,
     /// One pick per wanted row, when this device has an output head.
     picks: Vec<Pick>,
@@ -296,9 +300,11 @@ impl GpuExecutor {
             match ready_rx.recv() {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => failure = failure.or(Some(error)),
+                // Every thread reports before it ends, a panic included
+                // (`worker_main`), so a closed channel is not expected.
                 Err(_) => {
                     failure = failure.or(Some(RuntimeError::Thread(
-                        "a device thread ended while starting".into(),
+                        "a device thread ended without saying why while starting".into(),
                     )));
                 }
             }
@@ -354,11 +360,23 @@ impl Executor for GpuExecutor {
         out.draft_ms = 0.0;
         out.devices.clear();
         let mut have_picks = false;
+        // The device that failed is the one to name: the others only report
+        // that they were left waiting for it.
+        let mut failed: Option<(usize, String, bool)> = None;
         for (device, handle) in self.handles.iter().enumerate() {
             let result = handle.mailbox.result.lock().expect("result slot");
             if let Some(message) = &result.error {
-                return Err(ExecError::Device { device, message: message.clone() });
+                let better = failed.as_ref().is_none_or(|(_, _, secondary)| *secondary);
+                if better && (!result.secondary || failed.is_none()) {
+                    failed = Some((device, message.clone(), result.secondary));
+                }
             }
+        }
+        if let Some((device, message, _)) = failed {
+            return Err(ExecError::Device { device, message });
+        }
+        for handle in &self.handles {
+            let result = handle.mailbox.result.lock().expect("result slot");
             out.devices.push(result.times);
             // The devices of a tensor split all end with the same picks (the
             // sampler joins their slices of the vocabulary on the devices).
@@ -388,14 +406,25 @@ impl Executor for GpuExecutor {
     fn shutdown(&mut self) {
         // Let any thread that waits on another give up first, so that a step
         // that failed on one device does not keep the others from quitting.
-        self.links.abort();
+        // (If the kernels cannot be released, the bounded wait below ends
+        // the shutdown all the same.)
+        let _ = self.links.abort();
         for handle in &self.handles {
             *handle.mailbox.job.lock().expect("job slot") = Some(Job::Quit);
             handle.mailbox.bell.ring();
         }
+        let until = Instant::now() + STOP_PATIENCE;
         for handle in &mut self.handles {
             if let Some(thread) = handle.thread.take() {
-                let _ = thread.join();
+                while !thread.is_finished() && Instant::now() < until {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                // A thread that is still stuck in the driver is left behind:
+                // waiting for it would hang the caller for good, and the
+                // failure that led here has been reported already.
+                if thread.is_finished() {
+                    let _ = thread.join();
+                }
             }
         }
     }
@@ -406,6 +435,12 @@ impl Drop for GpuExecutor {
         self.shutdown();
     }
 }
+
+/// How long a device thread may take to stop once it is told to. A thread
+/// that has nothing left to run stops at once, one that failed in a step is
+/// released from the kernels that waited for a peer ([`Links::abort`]), so
+/// the time is only for a device that has stopped answering.
+const STOP_PATIENCE: Duration = Duration::from_secs(10);
 
 /// The bytes a device brings back from a step at most: the pick of every
 /// wanted row, and the tokens the model drafted itself.
@@ -463,17 +498,45 @@ struct Worker {
     draft_ms: f64,
 }
 
+/// A device in an error message: its name and the driver's number for it.
+fn device_text(device: &Device) -> String {
+    format!("{} (CUDA {})", device.info().name, device.ordinal())
+}
+
+/// What a panic carried, as text.
+fn panic_text(payload: &(dyn Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|text| (*text).to_owned())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "without a message".to_owned())
+}
+
 fn worker_main(init: Init, ready: mpsc::Sender<Result<(), RuntimeError>>) {
     init.mailbox.bell.bind();
     let mailbox = init.mailbox.clone();
     let spin = init.config.spin;
-    let mut worker = match Worker::new(init) {
-        Ok(worker) => {
+    let (index, name, model) = (init.index, device_text(&init.device), init.model.clone());
+    // Whatever goes wrong in this thread reaches the caller as an error that
+    // names the device: a failure in the usual way, and a panic where panics
+    // unwind (the release profile aborts instead, and the process says where).
+    let start_failed = |cause: String| RuntimeError::Device {
+        device: index,
+        message: format!("{name}: could not be set up: {cause}"),
+    };
+    let mut worker = match panic::catch_unwind(AssertUnwindSafe(|| Worker::new(init))) {
+        Ok(Ok(worker)) => {
             let _ = ready.send(Ok(()));
             worker
         }
-        Err(error) => {
-            let _ = ready.send(Err(error));
+        Ok(Err(error)) => {
+            model.abandon(index);
+            let _ = ready.send(Err(start_failed(error.to_string())));
+            return;
+        }
+        Err(payload) => {
+            model.abandon(index);
+            let _ = ready.send(Err(start_failed(format!("panicked: {}", panic_text(&*payload)))));
             return;
         }
     };
@@ -490,7 +553,23 @@ fn worker_main(init: Init, ready: mpsc::Sender<Result<(), RuntimeError>>) {
         let job = mailbox.job.lock().expect("job slot").take();
         match job {
             Some(Job::Step { meta, dispatched_ns }) => {
-                let outcome = worker.run_step(&meta, dispatched_ns);
+                let outcome =
+                    panic::catch_unwind(AssertUnwindSafe(|| worker.run_step(&meta, dispatched_ns)));
+                // What a failure is: its cause, and whether it is only that
+                // another device failed first.
+                let outcome = match outcome {
+                    Ok(Ok(done)) => Ok(done),
+                    Ok(Err(error)) => {
+                        Err((error.to_string(), matches!(error, ModelError::Aborted)))
+                    }
+                    Err(payload) => {
+                        Err((format!("panicked in a step: {}", panic_text(&*payload)), false))
+                    }
+                };
+                // A step that failed leaves the other devices with threads
+                // and kernels that wait for this one: they are told to give
+                // up, and the error says if that did not work.
+                let released = outcome.is_err().then(|| worker.links.abort());
                 {
                     let mut result = mailbox.result.lock().expect("result slot");
                     match outcome {
@@ -502,9 +581,15 @@ fn worker_main(init: Init, ready: mpsc::Sender<Result<(), RuntimeError>>) {
                             std::mem::swap(&mut result.drafts, &mut worker.drafts);
                             result.draft_ms = worker.draft_ms;
                         }
-                        Err(error) => {
-                            result.error = Some(error.to_string());
-                            worker.links.abort();
+                        Err((cause, secondary)) => {
+                            let note = match released {
+                                Some(Err(e)) => format!(
+                                    " (the kernels that wait for it could not be released: {e})"
+                                ),
+                                _ => String::new(),
+                            };
+                            result.error = Some(format!("{name}: {cause}{note}"));
+                            result.secondary = secondary;
                         }
                     }
                 }

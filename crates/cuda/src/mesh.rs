@@ -35,6 +35,7 @@
 //! moves bytes and keeps the order. A model with its own merge kernel also
 //! gets the push path as [`Mesh::push`].
 
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use crate::device::{Device, peer_access};
@@ -142,6 +143,14 @@ struct SlotSide {
     bytes: Vec<AtomicU64>,
 }
 
+/// What [`Mesh::release_waiters`] writes the flags with: a stream of the
+/// device that nothing else uses, and the values to write, in page-locked
+/// memory, so that the copy needs nothing the device's own streams hold.
+struct Escape {
+    stream: Stream,
+    values: PinnedBuffer,
+}
+
 struct Member {
     device: Device,
     kernels: Kernels,
@@ -151,6 +160,9 @@ struct Member {
     /// Host route: where this device's partial waits for the others.
     staging: Option<Staging>,
     push: Option<PushTarget>,
+    /// Where the push flags are written from when a kernel waits for a peer
+    /// that will not come; present with the push flags.
+    escape: Option<Mutex<Escape>>,
     slots: Option<SlotSide>,
     /// This device's partial is final (peer copy) or staged (host).
     ready: Event,
@@ -233,6 +245,15 @@ impl Mesh {
                 } else {
                     None
                 };
+                let escape = if push.is_some() {
+                    let n_flags = SUM_PEER_BLOCKS.max(PUSH_MAX_ROWS) as usize;
+                    Some(Mutex::new(Escape {
+                        stream: Stream::new(device, 0)?,
+                        values: PinnedBuffer::new(device, n_flags * 4)?,
+                    }))
+                } else {
+                    None
+                };
                 Ok(Member {
                     device: device.clone(),
                     kernels: Kernels::load(device)?,
@@ -242,6 +263,7 @@ impl Mesh {
                         Route::Peer => None,
                     },
                     push,
+                    escape,
                     slots: None,
                     ready: Event::new(device)?,
                     pulled: Event::new(device)?,
@@ -299,6 +321,46 @@ impl Mesh {
 
     pub fn devices(&self) -> impl Iterator<Item = &Device> {
         self.members.iter().map(|m| &m.device)
+    }
+
+    /// Lets every kernel of the push path that waits for another device's
+    /// flag go on, now and for the sums enqueued after it, with whatever the
+    /// other device has (or has not) written.
+    ///
+    /// The kernels of a push (`Mesh::sum_f32` of a few values, [`Mesh::push`])
+    /// are enqueued by one host thread per device and wait on the device for
+    /// their peer's. When a thread fails before it has enqueued its half, its
+    /// peer's kernel waits for a flag that nobody sets, and everything behind
+    /// it in the stream, the end of the step and the destruction of the
+    /// device's buffers included, waits with it: the kernel gives up only
+    /// after about 4 billion polls. This writes every flag ahead of every
+    /// token that is likely to be asked for (a billion sums ahead), from the
+    /// host, over a stream and a copy engine that the waiting kernel does not
+    /// hold. The values the released kernels then add are meaningless, so it
+    /// is for a step that has failed and whose results nobody reads; after it
+    /// the mesh does no sum that can be trusted.
+    ///
+    /// It waits only for its own copies, never for a stream of the devices'
+    /// work, so it returns even while a kernel spins.
+    pub fn release_waiters(&self) -> Result<()> {
+        for (rank, member) in self.members.iter().enumerate() {
+            let (Some(push), Some(escape)) = (&member.push, &member.escape) else { continue };
+            // The device waits for tokens counted by its own rank; a thread
+            // that has failed counts no more, one that goes on counts a few
+            // hundred more before it gives up.
+            let ahead = self.tokens[rank].load(Ordering::Relaxed).wrapping_add(1 << 30);
+            let mut escape = escape.lock().unwrap_or_else(|e| e.into_inner());
+            let Escape { stream, values } = &mut *escape;
+            for word in values.as_chunks_mut::<4>().0 {
+                *word = ahead.to_le_bytes();
+            }
+            // SAFETY: the pinned buffer holds as many bytes as the flags
+            // (one u32 per kernel block or row) and stays unchanged until
+            // the stream has synchronised, which is below.
+            unsafe { stream.copy_from_host(push.flags.ptr(), values.as_ptr(), values.len())? };
+            stream.synchronize()?;
+        }
+        Ok(())
     }
 
     /// Enqueues the sum of the devices' partial results: afterwards each

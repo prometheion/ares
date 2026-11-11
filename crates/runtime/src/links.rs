@@ -140,9 +140,19 @@ impl Links {
     }
 
     /// Makes every thread that waits in a rendezvous or for a parcel give up
-    /// with [`ModelError::Aborted`], and every later wait too.
-    pub(crate) fn abort(&self) {
+    /// with [`ModelError::Aborted`], and every later wait too. The kernels
+    /// that wait on a device for a flag of another are let go as well
+    /// ([`Mesh::release_waiters`]): a thread that fails leaves its peer's
+    /// stream with a kernel that waits for a flag nobody sets, and the peer
+    /// can neither finish its step nor stop. What a released sum computes is
+    /// meaningless, so this is for steps whose results nobody reads. Returns
+    /// why the kernels could not be released, if they could not.
+    pub(crate) fn abort(&self) -> Result<(), ares_cuda::Error> {
         self.abort.store(true, Ordering::SeqCst);
+        match &self.collective {
+            Some(c) => c.mesh.release_waiters(),
+            None => Ok(()),
+        }
     }
 
     /// Waits, spinning, until `done` holds. Yields the core after a while so
@@ -201,7 +211,7 @@ impl Links {
         let result = unsafe { c.mesh.sum_f32(&stream_refs[..devices], &pointers[..devices], n) };
         c.arrived.store(0, Ordering::Release);
         if result.is_err() {
-            self.abort();
+            let _ = self.abort();
         }
         c.generation.fetch_add(1, Ordering::Release);
         result.map_err(ModelError::from)
@@ -260,7 +270,7 @@ impl Links {
         // last parcel has returned (the wait above).
         let result = unsafe { c.mesh.post(rank, &c.streams[rank], slot, bytes) };
         if result.is_err() {
-            self.abort();
+            let _ = self.abort();
         }
         c.posted[c.slot(rank, slot)].store(sent + 1, Ordering::Release);
         Ok(result?)
@@ -291,7 +301,7 @@ impl Links {
         let c = self.collective()?;
         let result = c.mesh.consumed(rank, &c.streams[rank], slot);
         if result.is_err() {
-            self.abort();
+            let _ = self.abort();
         }
         c.consumed[c.slot(rank, slot)].fetch_add(1, Ordering::AcqRel);
         Ok(result?)
