@@ -84,8 +84,8 @@ pub use model::{
 };
 pub use ram::{LockedChunk, PinnedRam};
 pub use record::{
-    Commit, PageCopy, RecordFull, RecordView, RecordWriter, Row, StateCopy, StateCopyKind,
-    TableUpdate,
+    Commit, FREED_PER_RECORD, PageCopy, RecordFull, RecordView, RecordWriter, Row, StateCopy,
+    StateCopyKind, TableUpdate,
 };
 pub use sampling::TokenFilter;
 pub use sync::{WakeCounts, Woke};

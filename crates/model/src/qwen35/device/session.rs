@@ -9,8 +9,8 @@ use std::time::{Duration, Instant};
 
 use ares_cuda::{Device, ENTRY_CELLS};
 use ares_runtime::{
-    Commit, Executor, GpuConfig, GpuExecutor, Model, Pick, RecordWriter, Row, RuntimeError,
-    StepMeta, StepOutput, TableUpdate,
+    Commit, Executor, FREED_PER_RECORD, GpuConfig, GpuExecutor, Model, Pick, RecordWriter, Row,
+    RuntimeError, StepMeta, StepOutput, TableUpdate,
 };
 
 use super::runtime::Qwen35;
@@ -137,6 +137,7 @@ impl Session {
             .map_err(full)?;
             let mut runs = Vec::new();
             let mut updates = Vec::new();
+            let mut freed = Vec::new();
             let mut row0 = 0u32;
             for part in parts {
                 let n = part.tokens.len() as u32;
@@ -169,6 +170,15 @@ impl Session {
                         self.table_stride * ENTRY_CELLS
                     )));
                 }
+                // A sequence that starts again in a slot leaves its pages.
+                if part.position == 0 {
+                    freed.extend(
+                        (0..self.entries_sent[slot])
+                            .map(|entry| part.slot * self.table_stride + entry),
+                    );
+                    self.entries_sent[slot] = 0;
+                    freed.truncate(FREED_PER_RECORD);
+                }
                 let sent = self.entries_sent[slot];
                 if need > sent {
                     updates.push(TableUpdate { slot: part.slot, first: sent, count: need - sent });
@@ -191,6 +201,7 @@ impl Session {
                     }),
                 )
                 .map_err(full)?;
+            writer.freed(&freed).map_err(full)?;
             writer.finish().map_err(full)?
         };
         self.commits.clear();

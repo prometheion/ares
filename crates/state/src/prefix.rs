@@ -335,6 +335,8 @@ pub struct PrefixIndex {
     pub(crate) checkpoints: usize,
     pub(crate) clock: u64,
     epoch: u64,
+    /// The most tails the index keeps in all.
+    tail_limit: usize,
 }
 
 impl std::fmt::Debug for PrefixIndex {
@@ -351,7 +353,16 @@ impl std::fmt::Debug for PrefixIndex {
 impl PrefixIndex {
     /// An index that knows nothing.
     pub fn new() -> Self {
-        Self::default()
+        Self { tail_limit: usize::MAX, ..Self::default() }
+    }
+
+    /// Limits the tails the index keeps in all (apart from the [`MAX_TAILS`]
+    /// under one page) to `limit`: the least recently used goes when a new one
+    /// would be the `limit + 1`-th. A device that keeps something per partly
+    /// used page, such as exact K/V entries, sizes it for this.
+    pub fn with_tail_limit(mut self, limit: usize) -> Self {
+        self.tail_limit = limit;
+        self
     }
 
     /// The number of pages the index holds: cached pages and tails.
@@ -675,9 +686,10 @@ impl PrefixIndex {
     ///   ends there. A page that is full is never a tail: once converted, its
     ///   leading cells cannot be continued.
     ///
-    /// At most [`MAX_TAILS`] tails are kept under one page. Returns the tail
-    /// that was dropped to make room, if any. Publishing a tail that is
-    /// known changes nothing but its age.
+    /// At most [`MAX_TAILS`] tails are kept under one page, and at most the
+    /// limit of [`PrefixIndex::with_tail_limit`] in all. Returns the tail that
+    /// was dropped to make room, if any. Publishing a tail that is known
+    /// changes nothing but its age.
     ///
     /// # Panics
     ///
@@ -711,9 +723,15 @@ impl PrefixIndex {
             checkpoint_by: None,
             extended_by: Vec::new(),
         });
-        let oldest = (tails.len() > MAX_TAILS)
-            .then(|| tails.iter().min_by_key(|tail| tail.last_used).map(|tail| tail.hash))
-            .flatten();
+        // One tail goes at most: a page with too many, or the index with too
+        // many (a new tail is one more of either).
+        let oldest = if tails.len() > MAX_TAILS {
+            tails.iter().min_by_key(|tail| tail.last_used).map(|tail| tail.hash)
+        } else if self.tail_prior.len() >= self.tail_limit {
+            self.tails.values().flatten().min_by_key(|tail| tail.last_used).map(|tail| tail.hash)
+        } else {
+            None
+        };
         self.tail_prior.insert(hash, prior);
         self.leaves.insert((class, self.clock, hash));
         oldest.map(|oldest| self.remove_tail(pool, oldest))
@@ -1304,6 +1322,38 @@ mod tests {
         assert_eq!(index.lookup(root, &[1, 200, 201, 5], PER_PAGE).tail.map(|t| t.cells), Some(3));
         // Tails are chain ends: eviction takes them, oldest first.
         assert_eq!(index.evict(&mut pool).map(|e| e.page), Some(pages[2]));
+        index.clear(&mut pool);
+        assert_eq!(pool.free_pages(), 32);
+    }
+
+    #[test]
+    fn the_index_keeps_no_more_tails_than_its_limit_whatever_pages_they_hang_under() {
+        let mut pool = PagePool::new(32, PER_PAGE);
+        let mut index = PrefixIndex::new().with_tail_limit(2);
+        let mut pages = Vec::new();
+        // Three tails under three different roots.
+        for i in 0..3u32 {
+            let root = ChainHash::root(&[i as u8]);
+            let mut seq = Sequence::new();
+            seq.append(&mut pool, 2).unwrap();
+            let dropped =
+                index.insert_tail(&mut pool, root, &[1, 2], seq.pages()[0], Priority::NORMAL);
+            pages.push(seq.pages()[0]);
+            seq.release(&mut pool);
+            // The third one makes the first go.
+            assert_eq!(dropped.map(|e| e.page), (i == 2).then_some(pages[0]), "tail {i}");
+        }
+        assert_eq!(index.tails(), 2);
+        assert_eq!(pool.free_pages(), 32 - 2);
+        // A tail that is used is not the one to go.
+        let first = ChainHash::root(&[1]);
+        assert_eq!(index.lookup(first, &[1, 2, 9], PER_PAGE).tail.map(|t| t.cells), Some(2));
+        let root = ChainHash::root(&[3]);
+        let mut seq = Sequence::new();
+        seq.append(&mut pool, 2).unwrap();
+        let dropped = index.insert_tail(&mut pool, root, &[7, 8], seq.pages()[0], Priority::NORMAL);
+        seq.release(&mut pool);
+        assert_eq!(dropped.map(|e| e.page), Some(pages[2]), "the tail unused longest");
         index.clear(&mut pool);
         assert_eq!(pool.free_pages(), 32);
     }

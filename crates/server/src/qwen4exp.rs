@@ -63,7 +63,7 @@ pub(crate) fn load(gguf: Gguf, options: &LoadOptions, begun: Instant) -> Result<
     if kv.0.has_mean() || kv.1.has_mean() {
         return Err(refuse(format!(
             "K/V in {}, {}: the formats q7 to q4 need the pool of exact cells and its \
-             conversion, which the runtime does not manage yet; use f16 or q8",
+             conversion, which this model does not have; use f16 or q8",
             plan::format_name(kv.0),
             plan::format_name(kv.1)
         )));

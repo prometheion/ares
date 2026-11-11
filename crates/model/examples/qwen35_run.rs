@@ -8,9 +8,13 @@
 //!     [--decode-steps 64] [--prefill 2048] [--text FILE] [--state f32|f16]
 //!     [--pipeline-rows 256] [--no-profile] [--balance FILE] [--balance-out FILE]
 //!     [--step-rows N] [--layouts measured|file|device] [--prompt-weight 1]
-//!     [--show-layouts]
+//!     [--show-layouts] [--kv q8,q8] [--draft-kv q8,q8]
 //! ```
 //!
+//! - `--kv K,V`: the formats of K and of V of the attention blocks (`f16`, `q8`
+//!   to `q4`; the default is `q8,q8`), `--draft-kv` those of the draft block.
+//!   With `q7` to `q4` a second, small pool of exact entries holds the first
+//!   tile of a sequence and its newest cells.
 //! - `--chat`: a German and an English question through the chat template,
 //!   greedy, decoded with the tokenizer.
 //! - `--capture DIR`: a directory of `tools/capture` (`prompt.tokens`,
@@ -34,8 +38,9 @@
 //!   decode steps. `--balance FILE` places the model by such a file.
 //!
 //! - `--engine W`: the whole engine instead of the session (conductor, picks
-//!   on the device, drafts): four chat requests (German prose, English prose,
-//!   new code, a rewrite of a given file) of `--generate` tokens, each
+//!   on the device, drafts): seven chat requests (German prose, English prose,
+//!   new code, a rewrite of a given file, then two more of each of the first
+//!   three kinds) of `--generate` tokens, each
 //!   most-probable-token and, with `--sample`, sampled, with windows of up to
 //!   `W` rows (0: no drafts). With a model that has a draft block the engine
 //!   drafts with it and with the lookup in earlier text, and chooses for every
@@ -62,7 +67,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use ares_cuda::{Device, Precision, StateFormat, Wait};
+use ares_cuda::{CacheFormat, Device, Precision, StateFormat, Wait};
 use ares_gguf::Gguf;
 use ares_model::qwen35::Config;
 use ares_model::qwen35::device::placement::{HalfShares, Placement};
@@ -126,6 +131,8 @@ struct Args {
     devices: Vec<u32>,
     precision: Precision,
     state: StateFormat,
+    kv: (CacheFormat, CacheFormat),
+    draft_kv: (CacheFormat, CacheFormat),
     max_rows: u32,
     context: u32,
     chat: bool,
@@ -160,6 +167,8 @@ fn parse() -> Args {
         devices: vec![0],
         precision: Precision::Fast,
         state: StateFormat::F32,
+        kv: (CacheFormat::Q8, CacheFormat::Q8),
+        draft_kv: Options::default().draft_kv,
         max_rows: 512,
         context: 4096,
         chat: false,
@@ -209,6 +218,8 @@ fn parse() -> Args {
                     _ => StateFormat::F32,
                 }
             }
+            "--kv" => args.kv = formats(&value()),
+            "--draft-kv" => args.draft_kv = formats(&value()),
             "--max-rows" => args.max_rows = value().parse().expect("rows"),
             "--context" => args.context = value().parse().expect("cells"),
             "--chat" => args.chat = true,
@@ -256,6 +267,20 @@ fn parse() -> Args {
     }
     assert!(!args.model.as_os_str().is_empty(), "usage: qwen35_run <model.gguf> [options]");
     args
+}
+
+/// `K,V` as two K/V formats.
+fn formats(text: &str) -> (CacheFormat, CacheFormat) {
+    let name = |name: &str| {
+        CacheFormat::ALL
+            .into_iter()
+            .find(|f| format!("{f:?}").eq_ignore_ascii_case(name))
+            .unwrap_or_else(|| panic!("a K/V format (f16, q8 to q4), not {name}"))
+    };
+    match text.split_once(',') {
+        Some((k, v)) => (name(k), name(v)),
+        None => (name(text), name(text)),
+    }
 }
 
 fn read_ids(path: &Path) -> Vec<u32> {
@@ -327,6 +352,25 @@ fn generate(
         tokens.push(pick.token);
     }
     (tokens, times)
+}
+
+/// Prints every reservation of a device's ledger, and what the ledger does not
+/// know of the memory the device holds.
+fn print_ledger(report: &PartReport, held: u64, taken: u64) {
+    let total: u64 = report.ledger.iter().map(|(_, bytes)| bytes).sum();
+    for (name, bytes) in &report.ledger {
+        println!("RES ledger device {}: {:>9.2} MiB  {name}", report.index, *bytes as f64 / MIB);
+    }
+    println!(
+        "RES ledger device {}: {:>9.2} MiB reserved in all; taken {:.2} MiB, so {:.2} MiB are \
+         not in the ledger (the sampler, allocation granularity, kernels loaded); the device \
+         holds {:.2} MiB in all",
+        report.index,
+        total as f64 / MIB,
+        taken as f64 / MIB,
+        (taken as f64 - total as f64) / MIB,
+        held as f64 / MIB,
+    );
 }
 
 /// Prints the device time per step and kind of kernel that `profile` holds.
@@ -495,6 +539,8 @@ fn main() {
         precision: args.precision,
         layouts: args.layouts,
         state: args.state,
+        kv: args.kv,
+        draft_kv: args.draft_kv,
         max_rows: args.max_rows,
         logit_rows,
         window_rows: 0,
@@ -525,9 +571,10 @@ fn main() {
         args.context
     );
     for (report, (device, before)) in model.reports().iter().zip(devices.iter().zip(&free_before)) {
-        let free = device.mem_info().expect("memory").free;
+        let memory = device.mem_info().expect("memory");
+        let free = memory.free;
         println!(
-            "RES device {} {}: {} blocks, weights {:.0} MiB (upload {:.2} s), recurrent state {:.1} MiB per sequence, K/V {:.2} MiB per 1000 tokens, step scratch {:.1} MiB, all VRAM taken {:.0} MiB, free {:.0} MiB",
+            "RES device {} {}: {} blocks, weights {:.0} MiB (upload {:.2} s), recurrent state {:.1} MiB per sequence, K/V {:.2} MiB per 1000 tokens, exact K/V entries {:.1} MiB, step scratch {:.1} MiB, all VRAM taken {:.0} MiB (the device holds {:.0} MiB in all), free {:.0} MiB",
             report.index,
             report.device,
             report.blocks,
@@ -535,10 +582,13 @@ fn main() {
             report.upload.as_secs_f64(),
             report.state_bytes_per_slot as f64 / MIB,
             report.page_bytes as f64 / 128.0 * 1000.0 / MIB,
+            (report.exact_bytes + report.draft.as_ref().map_or(0, |d| d.exact)) as f64 / MIB,
             report.scratch_bytes as f64 / MIB,
             (*before - free) as f64 / MIB,
+            (memory.total - free) as f64 / MIB,
             free as f64 / MIB,
         );
+        print_ledger(report, memory.total - free, *before - free);
         print_layouts(report, args.show_layouts);
     }
     let tokenizer = model.tokenizer();
@@ -750,13 +800,14 @@ fn engine(args: &Args, spread: &Spread, window: u32) {
         precision: args.precision,
         layouts: args.layouts,
         state: args.state,
+        kv: args.kv,
+        draft_kv: args.draft_kv,
         max_rows: args.max_rows,
         logit_rows: (2 * window).max(16),
         window_rows: if window > 1 { 2 * window } else { 0 },
         draft_vocabulary: vocabulary,
         pipeline_rows: args.pipeline_rows,
         profile: args.profile.then(|| profile.clone()),
-        ..Options::default()
     };
     let devices: Vec<Device> =
         args.devices.iter().map(|d| Device::open(*d, Wait::Block).expect("open device")).collect();
@@ -793,23 +844,27 @@ fn engine(args: &Args, spread: &Spread, window: u32) {
         begun.elapsed().as_secs_f64()
     );
     for (report, (device, before)) in model.reports().iter().zip(devices.iter().zip(&free_before)) {
-        let taken = before - device.mem_info().expect("memory").free;
+        let memory = device.mem_info().expect("memory");
+        let taken = before - memory.free;
         println!(
-            "RES device {} ({}): weights {:.0} MiB, all taken {:.0} MiB",
+            "RES device {} ({}): weights {:.0} MiB, all taken {:.0} MiB (the device holds {:.0} MiB in all)",
             report.index,
             report.device,
             report.weight_bytes as f64 / MIB,
-            taken as f64 / MIB
+            taken as f64 / MIB,
+            (memory.total - memory.free) as f64 / MIB,
         );
+        print_ledger(report, memory.total - memory.free, taken);
         print_layouts(report, args.show_layouts);
         if let Some(d) = &report.draft {
             println!(
-                "RES device {} draft block: weights {:.1} MiB, K/V {:.3} MiB per 1000 tokens, kept \
-                 hidden states {:.2} MiB, chain scratch {:.2} MiB, records {:.2} MiB, step scratch \
-                 grown by at most {:.2} MiB",
+                "RES device {} draft block: weights {:.1} MiB, K/V {:.3} MiB per 1000 tokens, exact \
+                 K/V entries {:.2} MiB, kept hidden states {:.2} MiB, chain scratch {:.2} MiB, \
+                 records {:.2} MiB, step scratch grown by at most {:.2} MiB",
                 report.index,
                 d.weights as f64 / MIB,
                 d.page as f64 / 128.0 * 1000.0 / MIB,
+                d.exact as f64 / MIB,
                 d.carry as f64 / MIB,
                 d.scratch as f64 / MIB,
                 d.records as f64 / MIB,
@@ -823,7 +878,7 @@ fn engine(args: &Args, spread: &Spread, window: u32) {
         "Rewrite the following Rust file so that `Lru` is called `Cache` and `tick` is called \
          `clock`, and change nothing else. Give the whole file.\n\n```rust\n{REWRITE_SOURCE}```"
     );
-    let questions: [(&str, &str); 4] = [
+    let questions: [(&str, &str); 7] = [
         (
             "german",
             "Schreibe einen ausf\u{fc}hrlichen Aufsatz \u{fc}ber die Geschichte der Eisenbahn in \
@@ -840,6 +895,17 @@ fn engine(args: &Args, spread: &Spread, window: u32) {
              with unit tests.",
         ),
         ("rewrite", &rewrite),
+        (
+            "german2",
+            "Erkl\u{e4}re ausf\u{fc}hrlich, wie ein Compiler Quelltext in Maschinencode \u{fc}bersetzt, \
+             Phase f\u{fc}r Phase.",
+        ),
+        ("english2", "Explain in detail how TCP congestion control works and why it was needed."),
+        (
+            "code2",
+            "Write a Python program that reads a CSV file, groups the rows by a column and prints \
+             the mean of another column per group, with argument parsing and error handling.",
+        ),
     ];
     let greedy = ares_api::Sampling { temperature: Some(0.0), ..ares_api::Sampling::default() };
     let sampled = ares_api::Sampling {
@@ -1020,6 +1086,8 @@ fn conversation(args: &Args, spread: &Spread, history: usize) {
         precision: args.precision,
         layouts: args.layouts,
         state: args.state,
+        kv: args.kv,
+        draft_kv: args.draft_kv,
         max_rows: args.max_rows,
         logit_rows: (2 * args.window).max(16),
         window_rows: if args.window > 1 { 2 * args.window } else { 0 },

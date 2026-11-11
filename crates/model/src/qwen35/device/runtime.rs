@@ -19,7 +19,7 @@ use ares_tokenizer::{ChatOptions, Tokenizer};
 use super::choose::{Balance, LayoutReport};
 use super::part::{
     DraftBytes, DraftChain, DraftStep, Exchange, Options, PAGE_ENTRY, Part, PartSetup, StepEnv,
-    checkpoint_bytes, page_bytes,
+    TAILS_PER_SLOT, checkpoint_bytes, page_bytes,
 };
 use super::placement::{HalfShares, Placement, PlacementError};
 use crate::chat;
@@ -61,10 +61,16 @@ pub struct PartReport {
     pub kept_bytes: u64,
     /// K and V per page of 128 cells.
     pub page_bytes: u64,
+    /// The exact K/V entries of the attention blocks, when their formats have a
+    /// tile mean: the second, small pool.
+    pub exact_bytes: u64,
     /// What the model's draft block takes, on the device that holds it.
     pub draft: Option<DraftBytes>,
     /// Which weight matrices got which layout, and what the choice took.
     pub layouts: LayoutReport,
+    /// Every reservation in the device's ledger once the part was built: the
+    /// runtime's (step record, page tables, pool of pages) and the part's own.
+    pub ledger: Vec<(String, u64)>,
 }
 
 /// Why a model could not be set up.
@@ -309,6 +315,7 @@ impl Model for Qwen35 {
                     checkpoint_bytes(&self.config, &self.placement, device, self.options.state)
                 })
                 .collect(),
+            tails_per_slot: Some(TAILS_PER_SLOT),
         })
     }
 
@@ -322,7 +329,7 @@ impl Model for Qwen35 {
         (0..self.placement.n_devices()).fold(
             PageLayout::new(self.placement.n_devices(), cells_per_page),
             |layout, device| {
-                let bytes = page_bytes(&self.config, &self.placement, device, self.options.kv);
+                let bytes = page_bytes(&self.config, &self.placement, device, &self.options);
                 layout.per_page(device, "K and V", bytes)
             },
         )
@@ -376,8 +383,10 @@ impl Model for Qwen35 {
             scratch_bytes: part.scratch_bytes(),
             kept_bytes: part.kept_bytes(),
             page_bytes: part.page_bytes(),
+            exact_bytes: part.exact_bytes(),
             draft: part.draft_bytes(),
             layouts: part.layouts().clone(),
+            ledger: cx.ledger.entries().map(|(name, bytes)| (name.to_owned(), bytes)).collect(),
         });
         Ok(Box::new(Qwen35Device {
             part,
@@ -456,6 +465,14 @@ impl DeviceModel for Qwen35Device {
 
     fn enqueue(&mut self, step: &StepContext<'_>) -> Result<Option<Logits>, ModelError> {
         let record = &step.record;
+        // The draft windows of the step before settle the cells they accepted
+        // (in the tables of that step, which this record's updates may replace),
+        // and the pages the pool freed give back what the part keeps for them.
+        self.part.commit_windows((0..record.commits()).map(|i| {
+            let commit = record.commit(i);
+            (commit.slot, commit.accepted)
+        }));
+        self.part.release_pages((0..record.freed()).map(|i| record.freed_page(i)));
         if record.rows() == 0 {
             return Ok(None);
         }
@@ -467,9 +484,9 @@ impl DeviceModel for Qwen35Device {
             self.part.update_table(update.slot, update.first, entries)?;
             taken += update.count;
         }
-        // The draft windows of the step before; then the copies of the prefix
-        // cache (saves, page copies, restores: the record's documentation has
-        // the order and the reasons); then this step.
+        // Those windows are committed to recurrent state, and the copies of the
+        // prefix cache follow (saves, page copies, restores: the record's
+        // documentation has the order and the reasons); then this step.
         if let Some((offset, dims)) = record.commit_record() {
             self.part.enqueue_commit(step.stream, step.record_on_device.offset(offset), dims)?;
         }

@@ -26,7 +26,7 @@ use ares_api::Engine;
 use ares_core::units::{Bytes, MIB};
 use ares_cuda::{Device, DeviceInfo, Wait};
 use ares_gguf::Gguf;
-use ares_model::qwen35::device::{Options, Placement, Qwen35, Spread, page_bytes};
+use ares_model::qwen35::device::{Options, Placement, Qwen35, Spread, exact_bytes, page_bytes};
 use ares_model::qwen35::weights::{Matrix, Mixer};
 use ares_model::qwen35::{Config, Weights};
 use ares_runtime::{GpuConfig, Model, Runtime, RuntimeConfig, Split, required_ram};
@@ -183,6 +183,9 @@ struct Footprint {
     step: u64,
     per_sequence: u64,
     per_page: u64,
+    /// The exact K/V entries of the formats with a tile mean, for the
+    /// sequences that run at once: a pool of its own, whatever the context.
+    exact: u64,
 }
 
 fn matrix_bytes(m: &Matrix<'_>) -> u64 {
@@ -227,6 +230,7 @@ fn footprint(
     w: &Weights<'_>,
     placement: &Placement,
     options: &Options,
+    parallel: u32,
 ) -> Vec<Footprint> {
     let r = &c.recurrent;
     let a = &c.attention;
@@ -302,7 +306,8 @@ fn footprint(
                 // attention plans, links, the draft block's buffers.
                 step: rows * per_row + logits + weights / 64 + 64 * MIB,
                 per_sequence,
-                per_page: page_bytes(c, placement, index, options.kv),
+                per_page: page_bytes(c, placement, index, options),
+                exact: exact_bytes(c, placement, index, options, parallel),
             }
         })
         .collect()
@@ -438,7 +443,7 @@ fn rooms(held: &[Held], footprint: &[Footprint], headroom: u64) -> Vec<Room> {
         .zip(footprint)
         .map(|(held, f)| Room {
             usable: held.free.saturating_sub(headroom),
-            fixed: f.weights + f.step,
+            fixed: f.weights + f.step + f.exact,
             per_sequence: f.per_sequence,
             per_page: f.per_page,
         })
@@ -569,14 +574,6 @@ fn load_qwen35(gguf: Gguf, options: &LoadOptions, begun: Instant) -> Result<Load
 
     // What can be refused before a device is touched.
     let kv = options.kv.unwrap_or(Options::default().kv);
-    if kv.0.has_mean() || kv.1.has_mean() {
-        return Err(refuse(format!(
-            "K/V in {}, {}: the formats q7 to q4 need the pool of exact cells and its \
-             conversion, which the runtime does not manage yet; use f16 or q8",
-            plan::format_name(kv.0),
-            plan::format_name(kv.1)
-        )));
-    }
     let parallel = options.parallel.unwrap_or(DEFAULT_PARALLEL);
     if parallel == 0 {
         return Err(refuse("--parallel must be at least 1"));
@@ -649,7 +646,7 @@ fn load_qwen35(gguf: Gguf, options: &LoadOptions, begun: Instant) -> Result<Load
     // Which devices, and how the model is spread over them.
     let holds = |held: &[Held], spread: &Spread| -> Result<bool, LoadError> {
         let placement = place(&config, &weights, spread, &part_options)?;
-        let footprint = footprint(&config, &weights, &placement, &part_options);
+        let footprint = footprint(&config, &weights, &placement, &part_options, parallel);
         let pages = plan::pages_that_fit(&rooms(held, &footprint, headroom), parallel);
         Ok(pages >= plan::pool_pages(smallest, parallel))
     };
@@ -767,7 +764,7 @@ fn load_qwen35(gguf: Gguf, options: &LoadOptions, begun: Instant) -> Result<Load
              split",
         ));
     }
-    let footprint = footprint(&config, &weights, &placement, &part_options);
+    let footprint = footprint(&config, &weights, &placement, &part_options, parallel);
     let fit = plan::pages_that_fit(&rooms(&held, &footprint, headroom), parallel);
 
     // Context: tokens of state for all sequences together.
@@ -786,7 +783,9 @@ fn load_qwen35(gguf: Gguf, options: &LoadOptions, begun: Instant) -> Result<Load
                             "device {} has {} free and the model takes {}",
                             h.device.ordinal(),
                             Bytes(h.free),
-                            Bytes(f.weights + f.step + f.per_sequence * u64::from(parallel))
+                            Bytes(
+                                f.weights + f.step + f.exact + f.per_sequence * u64::from(parallel)
+                            )
                         )),
                         ", "
                     )
@@ -868,6 +867,7 @@ fn load_qwen35(gguf: Gguf, options: &LoadOptions, begun: Instant) -> Result<Load
             Bytes(
                 f.weights
                     + f.step
+                    + f.exact
                     + f.per_sequence * u64::from(parallel)
                     + f.per_page * u64::from(pages)
             ),
@@ -968,9 +968,11 @@ fn load_qwen35(gguf: Gguf, options: &LoadOptions, begun: Instant) -> Result<Load
         let state = report.state_bytes_per_slot * u64::from(parallel);
         let kv_bytes = report.page_bytes * u64::from(pages);
         let draft = report.draft.as_ref().map_or(0, |d| d.carry + d.scratch + d.records);
+        let exact = report.exact_bytes + report.draft.as_ref().map_or(0, |d| d.exact);
         let known = report.weight_bytes
             + state
             + kv_bytes
+            + exact
             + report.scratch_bytes
             + report.kept_bytes
             + draft;
@@ -978,8 +980,8 @@ fn load_qwen35(gguf: Gguf, options: &LoadOptions, begun: Instant) -> Result<Load
         let taken = h.free.saturating_sub(free);
         tracing::info!(
             "device {} ({}): weights {} in {:.1} s{}, recurrent state {} ({} per sequence), K \
-             and V {} ({} per 1000 tokens), step scratch {}, inputs kept for draft windows {}, \
-             draft block buffers {}, everything else {}; taken {}, free {}",
+             and V {} ({} per 1000 tokens), exact K/V entries {}, step scratch {}, inputs kept \
+             for draft windows {}, draft block buffers {}, everything else {}; taken {}, free {}",
             h.device.ordinal(),
             report.device,
             Bytes(report.weight_bytes),
@@ -993,6 +995,7 @@ fn load_qwen35(gguf: Gguf, options: &LoadOptions, begun: Instant) -> Result<Load
             Bytes(report.state_bytes_per_slot),
             Bytes(kv_bytes),
             Bytes(report.page_bytes * 1000 / u64::from(CELLS_PER_PAGE)),
+            Bytes(exact),
             Bytes(report.scratch_bytes),
             Bytes(report.kept_bytes),
             Bytes(draft),
@@ -1000,7 +1003,19 @@ fn load_qwen35(gguf: Gguf, options: &LoadOptions, begun: Instant) -> Result<Load
             Bytes(taken),
             Bytes(free),
         );
-        let fixed = f.weights + f.step + f.per_sequence * u64::from(parallel);
+        tracing::info!(
+            "device {}: the ledger holds {} in {} reservations: {}; {} of what the device took \
+             are in no reservation (the sampler's buffers, allocation granularity)",
+            h.device.ordinal(),
+            Bytes(report.ledger.iter().map(|(_, bytes)| bytes).sum()),
+            report.ledger.len(),
+            join(
+                report.ledger.iter().map(|(name, bytes)| format!("{name} {}", Bytes(*bytes))),
+                "; "
+            ),
+            Bytes(taken.saturating_sub(report.ledger.iter().map(|(_, bytes)| bytes).sum())),
+        );
+        let fixed = f.weights + f.step + f.exact + f.per_sequence * u64::from(parallel);
         let really = taken.saturating_sub(kv_bytes);
         tracing::info!(
             "device {}: the model without K and V took {} (estimated {}); {} are free beyond \
@@ -1033,10 +1048,11 @@ fn whole(c: &Config, w: &Weights<'_>, options: &Options, parallel: u32, context:
     // One device with everything gives the totals. A split divides weights,
     // recurrent state and K/V by the shares, near enough, and repeats the
     // scratch of a step on every device.
-    let all = footprint(c, w, &Placement::single(c), options)[0];
+    let all = footprint(c, w, &Placement::single(c), options, parallel)[0];
     let margin = all.weights / 64;
     Whole {
         shared: all.weights
+            + all.exact
             + margin
             + all.per_sequence * u64::from(parallel)
             + all.per_page * u64::from(plan::pool_pages(context, parallel)),

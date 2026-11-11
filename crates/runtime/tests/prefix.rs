@@ -906,3 +906,54 @@ fn the_scenarios_of_an_engine_without_a_cache_run_clean_under_the_oracle() {
     a_request_that_gives_way_comes_back_and_says_the_same(&e.rt);
     assert_consistent(&e);
 }
+
+/// The pages the records name as freed, and the pages their updates table, as
+/// a device that keeps something per page would see them.
+#[derive(Default)]
+struct Pages {
+    freed: Vec<u32>,
+    tabled: std::collections::HashSet<u32>,
+}
+
+#[test]
+fn every_page_a_request_used_is_named_as_freed_once_it_ended() {
+    let mut rng = Rng(77);
+    // No prefix cache: a request's pages are free when it ends.
+    let model = model(None, |_| {});
+    let seen = Arc::new(Mutex::new(Pages::default()));
+    let log = seen.clone();
+    let e = engine_with(&model, config(256, 0), move |host| {
+        host.with_observer(move |record| {
+            let mut pages = log.lock().unwrap();
+            let mut taken = 0;
+            for i in 0..record.updates() {
+                let update = record.update(i);
+                for k in 0..update.count {
+                    pages.tabled.insert(record.entry(taken + k));
+                }
+                taken += update.count;
+            }
+            for i in 0..record.freed() {
+                let page = record.freed_page(i);
+                pages.freed.push(page);
+            }
+        })
+    });
+    let mut first_batch = std::collections::HashSet::new();
+    for n in 0..6 {
+        let prompt = text_of(&mut rng, 20 + 25 * n);
+        e.ask(&prompt, 12);
+        if n == 4 {
+            first_batch = seen.lock().unwrap().tabled.clone();
+        }
+    }
+    // One more request, so that a record follows the last of the others.
+    e.ask("again", 2);
+    let pages = seen.lock().unwrap();
+    assert!(!pages.freed.is_empty());
+    for page in &first_batch {
+        assert!(pages.freed.contains(page), "page {page} was used and never named as freed");
+    }
+    assert!(pages.freed.iter().all(|p| pages.tabled.contains(p)), "only pages that were used");
+    assert_consistent(&e);
+}

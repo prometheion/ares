@@ -108,7 +108,7 @@ impl Rig {
         let kernels = Kernels::load(device).unwrap();
         let mut ledger =
             Ledger::new(format!("CUDA{}", device.ordinal()), device.mem_info().unwrap().free);
-        let pool = u64::from(table_stride) * page_bytes(c, placement, 0, opts.kv);
+        let pool = u64::from(table_stride) * page_bytes(c, placement, 0, opts);
         let ram = PinnedRam::new(0);
         let part = Part::open(
             c,

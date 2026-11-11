@@ -93,8 +93,14 @@ impl Cache {
             generation_interval: config.checkpoint_generation_interval,
             ..CheckpointPolicy::new(cells_per_page, spec.bytes(), config.checkpoint_budget)
         };
+        let index = match spec.tails_per_slot {
+            Some(per_slot) => {
+                PrefixIndex::new().with_tail_limit(per_slot as usize * config.max_slots as usize)
+            }
+            None => PrefixIndex::new(),
+        };
         Self {
-            index: PrefixIndex::new(),
+            index,
             root: ChainHash::root(model_name.as_bytes()),
             cells_per_page,
             recurrent: spec.bytes() > 0,
@@ -288,7 +294,12 @@ mod tests {
     /// `places` of them.
     fn cache(places: u64) -> Cache {
         let config = RuntimeConfig { checkpoint_budget: places * 100, ..RuntimeConfig::default() };
-        Cache::new("m", &PrefixCache { checkpoint_bytes: vec![100] }, &config, PER_PAGE)
+        Cache::new(
+            "m",
+            &PrefixCache { checkpoint_bytes: vec![100], tails_per_slot: None },
+            &config,
+            PER_PAGE,
+        )
     }
 
     /// Three pages of one sequence in the index, which has let go of them.
@@ -355,6 +366,48 @@ mod tests {
         assert!(cache.save(1, hashes[1], Owner(2)).taken);
         let (copies, _) = written(&mut cache);
         assert_eq!(copies, [StateCopy { kind: StateCopyKind::Save, slot: 1, place: 0 }]);
+    }
+
+    #[test]
+    fn a_model_that_keeps_state_per_tail_limits_the_tails_per_slot() {
+        let config = RuntimeConfig { max_slots: 2, ..RuntimeConfig::default() };
+        let spec = PrefixCache { checkpoint_bytes: vec![100], tails_per_slot: Some(1) };
+        let mut cache = Cache::new("m", &spec, &config, PER_PAGE);
+        let mut pool = PagePool::new(16, PER_PAGE);
+        let root = ChainHash::root(b"m");
+        let mut dropped = Vec::new();
+        for i in 0..3u32 {
+            let mut seq = Sequence::new();
+            seq.append(&mut pool, 2).unwrap();
+            let prior = root.extend(&[i]);
+            dropped.push(cache.index.insert_tail(
+                &mut pool,
+                prior,
+                &[7, 8],
+                seq.pages()[0],
+                Priority::NORMAL,
+            ));
+            seq.release(&mut pool);
+        }
+        assert_eq!(cache.index.tails(), 2, "one tail for each of the two slots");
+        assert_eq!(dropped.iter().filter(|d| d.is_some()).count(), 1);
+
+        // No limit without the model asking for one.
+        let spec = PrefixCache { checkpoint_bytes: vec![100], tails_per_slot: None };
+        let mut cache = Cache::new("m", &spec, &config, PER_PAGE);
+        for i in 0..3u32 {
+            let mut seq = Sequence::new();
+            seq.append(&mut pool, 2).unwrap();
+            cache.index.insert_tail(
+                &mut pool,
+                root.extend(&[i]),
+                &[7, 8],
+                seq.pages()[0],
+                Priority::NORMAL,
+            );
+            seq.release(&mut pool);
+        }
+        assert_eq!(cache.index.tails(), 3);
     }
 
     #[test]

@@ -29,8 +29,8 @@ pub use choose::{Balance, LayoutProbe, LayoutReport, Layouts};
 pub use harness::Harness;
 pub use part::{
     CopyTimes, DraftBytes, DraftChain, DraftStep, DraftTimes, Drafted, Exchange, Options,
-    PAGE_ENTRY, PHASES, Part, PartSetup, Phase, Profile, StepEnv, checkpoint_bytes, page_bytes,
-    state_slot_bytes,
+    PAGE_ENTRY, PHASES, Part, PartSetup, Phase, Profile, StepEnv, TAILS_PER_SLOT, checkpoint_bytes,
+    exact_bytes, page_bytes, state_slot_bytes,
 };
 pub use placement::{BlockSlice, DevicePlan, DraftPlan, Placement, PlacementError};
 pub use runtime::{OpenError, PartReport, Qwen35, Spread};

@@ -48,6 +48,9 @@ use ares_sampler::SampleParams;
 use ares_state::PageLayout;
 use ares_tokenizer::ChatOptions;
 
+#[path = "common/kv_env.rs"]
+mod kv_env;
+
 const PAGE: u32 = 128;
 
 fn model_path() -> Option<PathBuf> {
@@ -223,14 +226,14 @@ struct Rig {
 }
 
 fn rig(path: &PathBuf, layout: Layout, cached: bool, tweak: Tweak<'_>) -> Rig {
-    let options = Options {
+    let options = kv_env::with_env(Options {
         precision: Precision::Exact,
         max_rows: 128,
         logit_rows: 16,
         window_rows: 4,
         pipeline_rows: 32,
         ..Options::default()
-    };
+    });
     // The model answers at once, without thinking aloud: a text to copy has
     // words that follow with a wide margin, which the rounding of a row does
     // not tip.

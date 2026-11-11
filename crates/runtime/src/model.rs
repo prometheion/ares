@@ -151,6 +151,11 @@ pub struct PrefixCache {
     /// device, in the order of the device parts. All zero for a model without
     /// recurrent state, which needs no checkpoints and replays nothing.
     pub checkpoint_bytes: Vec<u64>,
+    /// The most partly used pages (tails) the cache keeps for each slot of the
+    /// runtime, or `None` for no limit. A model that keeps something on its
+    /// devices for each of them, which cannot be dropped without the page, sizes
+    /// it for this.
+    pub tails_per_slot: Option<u32>,
 }
 
 impl PrefixCache {

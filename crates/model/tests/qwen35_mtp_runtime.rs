@@ -21,6 +21,9 @@ use ares_gguf::Gguf;
 use ares_model::qwen35::device::{Options, Qwen35, Spread};
 use ares_runtime::{Counters, GpuConfig, Runtime, RuntimeConfig};
 
+#[path = "common/kv_env.rs"]
+mod kv_env;
+
 fn env_path(name: &str) -> Option<PathBuf> {
     match std::env::var_os(name) {
         Some(path) => Some(path.into()),
@@ -80,14 +83,14 @@ fn answers(
     drafts: u32,
     questions: &[&str],
 ) -> (Vec<String>, Counters) {
-    let options = Options {
+    let options = kv_env::with_env(Options {
         precision: Precision::Exact,
         max_rows: 128,
         logit_rows: 16,
         window_rows: if drafts > 0 { drafts + 1 } else { 0 },
         draft_vocabulary: vocabulary.cloned(),
         ..Options::default()
-    };
+    });
     let model = Arc::new(
         Qwen35::new(
             Gguf::open(model).unwrap(),

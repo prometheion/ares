@@ -40,7 +40,10 @@ use ares_runtime::ModelError;
 use ares_sampler::{SamplePick, SampleRow};
 
 use super::super::load::{DeviceWeights, DraftW, MixerW};
-use super::{AttentionAt, Options, Part, Phase, Prepared, StepEnv, geometry, invalid};
+use super::kv;
+use super::{
+    AttentionAt, Options, Part, Phase, Prepared, StepEnv, TAILS_PER_SLOT, geometry, invalid,
+};
 use crate::qwen35::Config;
 
 /// Bytes reserved per link and sequence for the attention plan of a link.
@@ -85,6 +88,9 @@ pub struct DraftBytes {
     pub weights: u64,
     /// Its K and V per page of 128 cells.
     pub page: u64,
+    /// Its exact K/V entries and the page table they need, when its formats
+    /// have a tile mean.
+    pub exact: u64,
     /// The hidden states kept from step to step, for all sequence slots.
     pub carry: u64,
     /// The chain's scratch, the sampler's included.
@@ -107,6 +113,17 @@ pub struct DraftTimes {
     pub chain_ms: f64,
     /// Milliseconds of following the model.
     pub follow_ms: f64,
+}
+
+/// What the block needs to know of the part it is in.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Setup {
+    pub max_slots: u32,
+    pub pages: u32,
+    pub table_stride: u32,
+    /// The attention blocks keep exact K/V entries, so the step's page table
+    /// names exact slots that the block's layer must not read.
+    pub main_exact: bool,
 }
 
 /// What the block adds to the sizes a part plans its memory from.
@@ -137,12 +154,12 @@ pub(super) fn sizes(
 ) -> Option<DraftSizes> {
     let draft = w.draft.as_ref()?;
     let MixerW::Attention(a) = &draft.block.mixer else { return None };
-    let geo = geometry(c, opts.kv, a.n_kv);
+    let geo = geometry(c, opts.draft_kv, a.n_kv);
     let rows = max_slots;
     let widest = draft.block.ffn.as_ref().map_or(0, |f| f.gate.n_out).max(a.out.n_in).max(a.q.n_in);
     let slots = 20 * u64::from(target_blocks) / u64::from(a.n_kv) + 64;
     Some(DraftSizes {
-        at: AttentionAt { geo, pool },
+        at: AttentionAt { geo, pool, exact: 0 },
         pool: u64::from(pages) * geo.converted_entry_bytes(),
         kv_values: u64::from(a.n_kv) * u64::from(geo.head_dim),
         attn_state: slots * u64::from(a.n_head) * (u64::from(geo.head_dim) + 1) * 4,
@@ -200,7 +217,9 @@ struct Clock {
 #[derive(Debug)]
 pub(super) struct Mtp {
     sampler: SamplerKernels,
-    at: AttentionAt,
+    pub(super) at: AttentionAt,
+    /// The exact pool and the table of the block's layer.
+    pub(super) kv: kv::Pages,
     w: DraftW,
     /// Per slot `carry_rows` rows of `d` values (see `sampler_draft.cuh`).
     carry: DeviceBuffer,
@@ -236,10 +255,11 @@ impl Mtp {
         ledger: &mut Ledger,
         w: &DeviceWeights,
         opts: &Options,
-        max_slots: u32,
+        setup: Setup,
         sizes: Option<DraftSizes>,
         step_scratch: u64,
     ) -> Result<Option<Self>, ModelError> {
+        let Setup { max_slots, pages, table_stride, main_exact } = setup;
         let (Some(sizes), Some(draft)) = (sizes, w.draft.as_ref()) else { return Ok(None) };
         let MixerW::Attention(a) = &draft.block.mixer else {
             return Err(invalid("the draft block is an attention block"));
@@ -300,6 +320,21 @@ impl Mtp {
         let scratch = DeviceBuffer::new(device, s.len)?;
         carry.write(0, &vec![0u8; carry_bytes as usize])?;
         scratch.write(s.sampler, &vec![0u8; SamplerKernels::scratch_bytes(max_slots) as usize])?;
+        let sizing =
+            kv::Sizing { slots: max_slots, rows: opts.max_rows, tails: max_slots * TAILS_PER_SLOT };
+        let exact_slots = kv::slots_for(opts.draft_kv.0, opts.draft_kv.1, sizing);
+        let pages_kv = kv::Pages::new(
+            device,
+            ledger,
+            "draft block",
+            &[sizes.at.geo],
+            exact_slots,
+            kv::newest_cells(opts.draft_kv.0, opts.draft_kv.1),
+            pages,
+            max_slots,
+            table_stride,
+            exact_slots > 0 || main_exact,
+        )?;
         let clock = Clock {
             chain: [Event::timed(device)?, Event::timed(device)?],
             follow: match opts.profile {
@@ -314,6 +349,7 @@ impl Mtp {
         Ok(Some(Self {
             sampler: SamplerKernels::load(device)?,
             at: sizes.at,
+            kv: pages_kv,
             w: draft.clone(),
             carry,
             carry_rows,
@@ -373,6 +409,11 @@ struct Link {
     sample: SamplePlan,
 }
 
+/// Where the block's exact entries are: null when its formats have none.
+fn exact_pool(m: &Mtp) -> DevicePtr {
+    if m.kv.has_exact() { m.kv.exact().offset(m.at.exact) } else { DevicePtr::NULL }
+}
+
 fn words(buf: &mut [u8], at: u64, values: impl IntoIterator<Item = u32>) -> u64 {
     let mut end = at as usize;
     for v in values {
@@ -408,6 +449,7 @@ impl Part {
         Some(DraftBytes {
             weights,
             page: m.at.geo.converted_entry_bytes(),
+            exact: m.kv.bytes(),
             carry: m.carry.len(),
             scratch: m.scratch.len(),
             records: m.records.len(),
@@ -454,14 +496,6 @@ impl Part {
     pub fn drafted(&self) -> Option<Drafted> {
         let m = self.mtp.as_ref()?;
         (m.drafted > 0).then(|| Drafted { ptr: m.at(m.s.drafts), tokens: m.drafted })
-    }
-
-    /// Where the block's array of K/V entries is in a page of the pool: its
-    /// offset from the start of the pool's pages and the bytes of one entry.
-    /// `None` on a device without the block.
-    pub(super) fn draft_pool(&self) -> Option<(u64, u64)> {
-        let m = self.mtp.as_ref()?;
-        Some((m.at.pool, m.at.geo.converted_entry_bytes()))
     }
 
     /// The row of the carry that `slot`'s next chain starts from (the final
@@ -684,7 +718,7 @@ impl Part {
             for (row, segment) in segments.iter().enumerate() {
                 let table = segment.slot * self.table_stride;
                 let need = (segment.pos0 as u32 + 1).div_ceil(ENTRY_CELLS) as usize;
-                let entries = &self.tables[table as usize..table as usize + need];
+                let entries = &m.kv.entries(&self.page_tab)[table as usize..table as usize + need];
                 planner.dense(table, entries, row as u32, 1, segment.pos0 as u32);
             }
             let plan = planner.finish();
@@ -819,6 +853,7 @@ impl Part {
         let out = out_of(j);
         let picks = m.at(s.picks + u64::from(j) * rows * SamplePick::BYTES as u64);
         let pool = env.pages.offset(m.at.pool);
+        let (tables, exact) = (m.kv.table(env.tables), exact_pool(m));
         let shape = AttentionShape { n_head: a.n_head, n_kv_head: a.n_kv, head_dim: geo.head_dim };
         let inner = ffn.gate.n_out;
         // SAFETY: the chain's scratch holds `max_chains` rows of every buffer
@@ -874,8 +909,8 @@ impl Part {
                 n,
                 m.at(s.k),
                 m.at(s.v),
-                env.tables,
-                DevicePtr::NULL,
+                tables,
+                exact,
                 pool,
                 self.at(self.s.status),
             )?;
@@ -884,8 +919,8 @@ impl Part {
                 &geo,
                 &plan,
                 &AttendBuffers {
-                    tables: env.tables,
-                    exact_pool: DevicePtr::NULL,
+                    tables,
+                    exact_pool: exact,
                     converted_pool: pool,
                     q: m.at(s.q),
                     gate: Some(m.at(s.gate)),
@@ -1038,7 +1073,8 @@ impl Part {
                 m.records.ptr().offset(m.follow_rows),
                 k,
                 v,
-                env.tables,
+                m.kv.table(env.tables),
+                exact_pool(m),
                 env.pages.offset(m.at.pool),
                 self.at(s.status),
                 env.replay,

@@ -20,6 +20,9 @@ use ares_model::qwen35::{Config, LogitRows, Reference, SequenceState, Weights};
 use ares_runtime::{GpuConfig, Runtime, RuntimeConfig, TokenFilter};
 use ares_sampler::TokenMask;
 
+#[path = "common/kv_env.rs"]
+mod kv_env;
+
 fn enabled() -> bool {
     if std::env::var_os("ARES_TEST_CUDA").is_none() {
         eprintln!("skipped: set ARES_TEST_CUDA=1 to run the tests that open GPUs");
@@ -58,7 +61,13 @@ fn argmax(x: &[f32]) -> (u32, f32) {
 }
 
 fn options(precision: Precision) -> Options {
-    Options { precision, max_rows: 64, logit_rows: 16, window_rows: 16, ..Options::default() }
+    kv_env::with_env(Options {
+        precision,
+        max_rows: 64,
+        logit_rows: 16,
+        window_rows: 16,
+        ..Options::default()
+    })
 }
 
 /// The picks of every prompt row (steps of 16 rows) and 40 greedy tokens.

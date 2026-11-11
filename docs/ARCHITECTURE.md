@@ -618,6 +618,37 @@ Any K format combines with any V format. A page has to hold whole tiles: the
 stored rows of a tile depend on all of its cells, and a page is shared
 between sequences by the tokens up to its own end.
 
+**Where the tile formats keep their exact cells** (`qwen35`, `part/forms.rs`
+and `part/kv.rs`). The engine's pool holds converted entries only: page `p` is
+slot `p` of the converted pool of every attention layer, 128 cells in the
+format. The exact entries (a tile in `f16`) are a second pool on each device,
+for the attention blocks and for the draft block separately, which a page
+holds a slot of while it is exact: from its first write until it is full and
+has left the newest cells of every sequence that reads it. The conductor knows
+nothing of this beyond one thing, the pages the pool freed, which every step
+record names (see "Sequence state" below); the device decides the rest, the
+same way on every device, from the segments of the record:
+
+- At the start of a step, for every sequence in it, the tiles that left its
+  window are converted into their pages (`AttentionKernels::convert`), the
+  pages its rows write get exact slots, and the group's page table is brought
+  up to date (entries of exact tiles name the slot, the others the page). The
+  step's own rows then append to exact tiles and attend to both kinds.
+- A page shared by two sequences is converted for both, when either's window
+  has left it; each finds its table brought up to date when it next runs. A
+  sequence that starts from the cache therefore reads the cached tiles in the
+  form they have: converted where the sequence that computed them went on,
+  exact where it ended.
+- The pool has `slots * (2 + ceil(newest / 128)) + ceil(rows / 128) + slots +
+  tails` slots (`exact_slots`): the first tile and the window of every
+  sequence that runs, the tiles a step begins, and the tails of the prefix
+  cache. When it is short the full page that was used least recently and that
+  no sequence of the step reads is converted for room (a cached page loses its
+  exactness, never its text); a partly used page never is, which is why the
+  cache keeps at most one tail per slot (`PrefixCache::tails_per_slot`).
+- Page copies copy the exact entry; a page that is copied is always partly
+  used, hence exact.
+
 The formats were chosen on synthetic rows and then measured on the K and V of
 two real models (Qwen3.5-0.8B and Qwen3.8-27B, one text of 3.7k tokens; the
 measure is the error of attention, not of logits;
@@ -2519,9 +2550,10 @@ Work is paused here until Qwen4 is released; nothing below is in progress.
   expert or `qwen4exp` kernels and no model.
 - The KV formats are specified, pinned by golden files and measured on the K
   and V of real models; the CUDA kernels write them bit-exactly and read
-  them within 1e-3 of the CPU reference. The dense model uses `q8` for K
-  and V; the formats with a tile mean (`q7` to `q4`) are not wired into a
-  model.
+  them within 1e-3 of the CPU reference. The dense model serves all of
+  them for K and V apart, in every placement and with the prefix cache
+  (`q8` is the default); the formats with a tile mean (`q7` to `q4`) keep a
+  second, small pool of exact entries (see "Sequence state").
 - The prefix cache runs on the devices for `qwen35`, in every placement: a
   conversation's next turn starts from the pages and the checkpoint of the
   last one (on Qwen3.8-27B a second turn after a history of 24k tokens gives
@@ -2562,7 +2594,7 @@ order it would be taken up; the source of each idea is in
 3. Attention for models that attend a few thousand cells through lists: the
    kernel chosen by a measurement on the device, staged loads where they
    pay, one launch per row, items of twelve query heads, rows of a prompt
-   that share cells; and the K/V formats with a tile mean in a model.
+   that share cells; and the K/V formats with a tile mean in `qwen4exp`.
 4. The prefix cache beyond the first pass: checkpoints at the message
    boundaries the server names (the anchor is a page boundary before the end
    of the prompt now), a warm pass in the background, spill of a sequence to

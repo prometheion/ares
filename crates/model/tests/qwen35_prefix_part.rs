@@ -99,7 +99,7 @@ impl Rig {
             },
         )
         .unwrap();
-        let pool = u64::from(pages) * page_bytes(c, placement, 0, options.kv);
+        let pool = u64::from(pages) * page_bytes(c, placement, 0, &options);
         Self {
             stream: Stream::new(device, 0).unwrap(),
             part,

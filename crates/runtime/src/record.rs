@@ -17,7 +17,7 @@
 //! | section | words | content |
 //! | --- | --- | --- |
 //! | kernel header | 8 | rows, segments, wanted rows, 0, byte offsets of segments, tokens, positions, wanted rows |
-//! | runtime header | 16 | magic, step number, counts of runs, updates, entries and commits, byte offsets of the sections below, the longest segment, the longest commit |
+//! | runtime header | 28 | magic, step number, counts of runs, updates, entries, commits, copies, corrections, masks and freed pages, byte offsets of the sections below, the longest segment, the longest commit, the words of a mask |
 //! | segments | 8 each | first row, rows, sequence slot, accepted rows, first position, flags (1: direct), 0, 0 |
 //! | tokens | 1 per row | |
 //! | positions | 4 per row | time, height, width, extra: `(p, p, p, 0)` for text |
@@ -32,6 +32,7 @@
 //! | entries | 1 each | page-table entries, for the updates in order |
 //! | state copies | 3 each | 0 save or 1 restore, sequence slot, checkpoint place |
 //! | page copies | 3 each | page to copy from, page to copy to, cells to copy |
+//! | freed pages | 1 each | pages the pool freed since the last record |
 //!
 //! A segment is **direct** when all of its rows are certain to be accepted (a
 //! slice of a prompt, a generation row without drafts): the recurrent kernels
@@ -76,6 +77,14 @@
 //! that a later save of the same record overwrites, and a restore may read
 //! a place that an earlier save of the same record wrote.
 //!
+//! **Freed pages** tell a device that keeps state of its own for a page (a
+//! second pool of exact K/V entries, for the formats with a tile mean) that the
+//! page is gone: it gives that state back before the record's copies and rows,
+//! which may use the page again. The list is complete: every page that is free
+//! when a record is written and was not when the one before it was written is
+//! named, at most [`FREED_PER_RECORD`] of them (the rest follow in the next
+//! records), and a page that has an owner again is not named.
+//!
 //! The *context* is a number the host derives from the sequence's tokens up to
 //! and including the row's token. A real model has no use for it (attention
 //! reads the sequence's pages); the synthetic model has no attention kernel,
@@ -87,8 +96,8 @@ use ares_sampler::{ENTRIES_PER_ROW, Entry, SampleParams, SampleRow, TokenMask};
 const MAGIC: u32 = 0x5354_4550;
 /// Bytes of the kernels' header.
 const KERNEL_HEADER: usize = 32;
-/// Words of both headers.
-const HEADER_WORDS: usize = 32;
+/// Words of both headers, a multiple of four so the segments start at a multiple of 16 bytes.
+const HEADER_WORDS: usize = 36;
 /// Bytes of both headers.
 const HEADERS: usize = HEADER_WORDS * 4;
 const SEG_BYTES: usize = 32;
@@ -122,6 +131,11 @@ const H_OFF_CORRECTIONS: usize = 27;
 const H_MASKS: usize = 28;
 const H_OFF_MASKS: usize = 29;
 const H_MASK_WORDS: usize = 30;
+const H_FREED: usize = 31;
+const H_OFF_FREED: usize = 32;
+
+/// The most freed pages one record names.
+pub const FREED_PER_RECORD: usize = 1024;
 
 /// One row of a step: a token of a sequence at a position.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -209,7 +223,8 @@ pub fn max_bytes(max_rows: u32, max_slots: u32, wanted: u32, vocab: u32) -> usiz
         + (rows + 2 * slots) * 4
         + slots * 3 * 12
         + segments * 12
-        + 16 * 8;
+        + 16 * 8
+        + FREED_PER_RECORD * 4;
     bytes.next_multiple_of(256)
 }
 
@@ -268,6 +283,7 @@ impl<'a> RecordWriter<'a> {
             H_OFF_PAGE_COPIES,
             H_OFF_CORRECTIONS,
             H_OFF_MASKS,
+            H_OFF_FREED,
         ] {
             header[h] = end as u32;
         }
@@ -528,6 +544,21 @@ impl<'a> RecordWriter<'a> {
         Ok(())
     }
 
+    /// The pages the pool freed since the last record.
+    ///
+    /// # Panics
+    ///
+    /// Panics with more than [`FREED_PER_RECORD`] pages.
+    pub fn freed(&mut self, pages: &[u32]) -> Result<(), RecordFull> {
+        assert!(pages.len() <= FREED_PER_RECORD, "{} freed pages in one record", pages.len());
+        let off = self.end;
+        self.put(off, pages)?;
+        self.header[H_FREED] = pages.len() as u32;
+        self.header[H_OFF_FREED] = off as u32;
+        self.end = align(off + pages.len() * 4);
+        Ok(())
+    }
+
     /// Writes the headers and returns the bytes used, a multiple of 16 so the
     /// copy is a whole number of the device's transfer units.
     pub fn finish(mut self) -> Result<usize, RecordFull> {
@@ -594,6 +625,7 @@ impl<'a> RecordView<'a> {
             header[H_OFF_CORRECTIONS] as usize + header[H_CORRECTIONS] as usize * Entry::BYTES,
             header[H_OFF_MASKS] as usize
                 + header[H_MASKS] as usize * header[H_MASK_WORDS] as usize * 4,
+            header[H_OFF_FREED] as usize + header[H_FREED] as usize * 4,
         ];
         if ends.iter().any(|end| *end > bytes.len()) {
             return Err(RecordError::Truncated);
@@ -825,6 +857,17 @@ impl<'a> RecordView<'a> {
         PageCopy { from: self.word(at), to: self.word(at + 4), cells: self.word(at + 8) }
     }
 
+    /// The number of pages the pool freed since the record before.
+    pub fn freed(&self) -> u32 {
+        self.header[H_FREED]
+    }
+
+    /// Freed page `i`.
+    pub fn freed_page(&self, i: u32) -> u32 {
+        assert!(i < self.freed(), "freed page {i} of {}", self.freed());
+        self.word(self.header[H_OFF_FREED] as usize + i as usize * 4)
+    }
+
     pub fn update(&self, i: u32) -> TableUpdate {
         assert!(i < self.updates(), "update {i} of {}", self.updates());
         let at = self.header[H_OFF_UPDATES] as usize + i as usize * 12;
@@ -986,7 +1029,7 @@ mod tests {
     #[test]
     fn bytes_that_are_not_a_record_are_refused() {
         assert_eq!(RecordView::new(&[0; 8]).unwrap_err(), RecordError::Short);
-        assert_eq!(RecordView::new(&[0; 128]).unwrap_err(), RecordError::BadMagic);
+        assert_eq!(RecordView::new(&[0; HEADERS]).unwrap_err(), RecordError::BadMagic);
         let (buf, used) = sample();
         assert_eq!(RecordView::new(&buf[..used - 16]).unwrap_err(), RecordError::Truncated);
     }
@@ -1095,5 +1138,37 @@ mod tests {
         assert_eq!(u32::from_le_bytes(buf[at..at + 4].try_into().unwrap()), 0b1010);
         // A record cut short of them is refused.
         assert_eq!(RecordView::new(&buf[..used - 16]).unwrap_err(), RecordError::Truncated);
+    }
+
+    #[test]
+    fn the_freed_pages_of_a_step_read_back_as_written() {
+        let mut buf = vec![0x77u8; 4096];
+        let mut w = RecordWriter::new(&mut buf, 5, 1, 1).unwrap();
+        w.segment(2, 32, 1, true).unwrap();
+        w.row(Row { slot: 2, position: 32, token: 1, context: 1 }).unwrap();
+        w.runs(&[(0, 1)]).unwrap();
+        w.freed(&[7, 3, 900]).unwrap();
+        w.copies(&[], &[PageCopy { from: 1, to: 2, cells: 3 }]).unwrap();
+        let used = w.finish().unwrap();
+        let record = RecordView::new(&buf[..used]).unwrap();
+        assert_eq!(record.freed(), 3);
+        assert_eq!((record.freed_page(0), record.freed_page(1), record.freed_page(2)), (7, 3, 900));
+        assert_eq!(record.page_copy(0), PageCopy { from: 1, to: 2, cells: 3 });
+        assert_eq!(RecordView::new(&buf[..used - 16]).unwrap_err(), RecordError::Truncated);
+
+        let (plain, used) = sample();
+        assert_eq!(RecordView::new(&plain[..used]).unwrap().freed(), 0);
+    }
+
+    #[test]
+    fn a_record_has_room_for_the_freed_pages_it_may_name() {
+        let mut buf = vec![0u8; max_bytes(8, 2, 8, 64)];
+        let mut w = RecordWriter::new(&mut buf, 1, 1, 1).unwrap();
+        w.segment(0, 0, 1, true).unwrap();
+        w.row(Row { slot: 0, position: 0, token: 0, context: 0 }).unwrap();
+        w.runs(&[(0, 1)]).unwrap();
+        w.freed(&vec![5; FREED_PER_RECORD]).unwrap();
+        w.copies(&[], &[]).unwrap();
+        w.finish().unwrap();
     }
 }

@@ -542,9 +542,10 @@ impl Model for SyntheticModel {
     }
 
     fn prefix_cache(&self) -> Option<PrefixCache> {
-        self.config
-            .prefix_cache
-            .map(|bytes| PrefixCache { checkpoint_bytes: vec![bytes; self.config.devices] })
+        self.config.prefix_cache.map(|bytes| PrefixCache {
+            checkpoint_bytes: vec![bytes; self.config.devices],
+            tails_per_slot: None,
+        })
     }
 
     fn page_entry(&self, page: u32) -> u32 {

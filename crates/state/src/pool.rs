@@ -19,6 +19,10 @@ pub struct PagePool {
     /// Free pages; the last entry is handed out next. Low numbers go out
     /// first, so a pool that is mostly empty stays compact at the front.
     free: Vec<u32>,
+    /// Pages that were freed since the devices were last told, each once.
+    freed: Vec<u32>,
+    /// Whether a page is in `freed`.
+    unreported: Vec<bool>,
 }
 
 impl PagePool {
@@ -34,6 +38,8 @@ impl PagePool {
             refcount: vec![0; n_pages as usize],
             cached: vec![false; n_pages as usize],
             free: (0..n_pages).rev().collect(),
+            freed: Vec::new(),
+            unreported: vec![false; n_pages as usize],
         }
     }
 
@@ -89,7 +95,27 @@ impl PagePool {
         if *count == 0 {
             debug_assert!(!self.cached[id.0 as usize], "the index let go without saying so");
             self.free.push(id.0);
+            if !std::mem::replace(&mut self.unreported[id.0 as usize], true) {
+                self.freed.push(id.0);
+            }
         }
+    }
+
+    /// Takes up to `max` pages that were freed since the last call and are
+    /// still free, for the devices to give back what they keep per page. A
+    /// page that has a holder again is not named: whatever a device kept for it
+    /// belongs to the new holder. The pages beyond `max` stay for the next call.
+    pub fn take_freed(&mut self, max: usize, out: &mut Vec<u32>) {
+        let mut taken = 0;
+        while taken < self.freed.len() && out.len() < max {
+            let id = self.freed[taken];
+            taken += 1;
+            self.unreported[id as usize] = false;
+            if self.refcount[id as usize] == 0 {
+                out.push(id);
+            }
+        }
+        self.freed.drain(..taken);
     }
 }
 
@@ -111,6 +137,49 @@ mod tests {
         pool.release(a);
         assert_eq!(pool.free_pages(), 1);
         assert_eq!(pool.alloc(), Some(a));
+    }
+
+    #[test]
+    fn pages_are_named_as_freed_once_and_only_while_they_are_free() {
+        let mut pool = PagePool::new(4, 4);
+        let (a, b, c) = (pool.alloc().unwrap(), pool.alloc().unwrap(), pool.alloc().unwrap());
+        let mut out = Vec::new();
+        pool.take_freed(8, &mut out);
+        assert!(out.is_empty(), "nothing was freed yet");
+
+        pool.release(a);
+        pool.release(b);
+        pool.release(c);
+        // `a` has an owner again before the devices are told.
+        assert_eq!(pool.alloc(), Some(c), "the last page freed is handed out first");
+        pool.take_freed(8, &mut out);
+        assert_eq!(out, [a.0, b.0]);
+        out.clear();
+        pool.take_freed(8, &mut out);
+        assert!(out.is_empty(), "each page is named once");
+
+        // Freed again after being named: named again.
+        pool.release(c);
+        pool.take_freed(8, &mut out);
+        assert_eq!(out, [c.0]);
+    }
+
+    #[test]
+    fn what_does_not_fit_in_one_record_waits_for_the_next() {
+        let mut pool = PagePool::new(8, 4);
+        let ids: Vec<PageId> = (0..5).map(|_| pool.alloc().unwrap()).collect();
+        for id in &ids {
+            pool.release(*id);
+        }
+        let mut out = Vec::new();
+        pool.take_freed(3, &mut out);
+        assert_eq!(out.len(), 3);
+        let mut rest = Vec::new();
+        pool.take_freed(3, &mut rest);
+        assert_eq!(rest.len(), 2);
+        out.extend(rest);
+        out.sort_unstable();
+        assert_eq!(out, [0, 1, 2, 3, 4]);
     }
 
     #[test]

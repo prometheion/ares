@@ -603,6 +603,22 @@ impl Oracle {
             }
         }
 
+        // A page the record names as freed is not one the step reads: a device
+        // that keeps something per page gives it back when it is told.
+        let freed: Vec<u32> = (0..view.freed()).map(|i| view.freed_page(i)).collect();
+        if !freed.is_empty() {
+            for s in 0..view.segments() {
+                let seg = view.segment(s);
+                let table: &[u32] = tables.get(seg.slot as usize).map_or(&[], Vec::as_slice);
+                let reads = (seg.pos0 as usize + seg.n_rows as usize).div_ceil(per_page);
+                for page in table.iter().take(reads).filter(|page| freed.contains(page)) {
+                    complain(format!(
+                        "page {page} is freed in the record of a step whose segment {s} reads it"
+                    ));
+                }
+            }
+        }
+
         // The rows.
         let mut results: Vec<(u32, f32)> = vec![(0, 0.0); view.rows() as usize];
         for s in 0..view.segments() {

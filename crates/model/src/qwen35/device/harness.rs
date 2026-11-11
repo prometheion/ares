@@ -59,7 +59,7 @@ impl Harness {
         let table_stride = cells.div_ceil(ENTRY_CELLS).max(1);
         let pages = slots * table_stride;
         let mut ledger = Ledger::new(format!("CUDA{}", device.ordinal()), device.mem_info()?.free);
-        let page_bytes = super::part::page_bytes(c, &placement, 0, opts.kv);
+        let page_bytes = super::part::page_bytes(c, &placement, 0, opts);
         let pool_bytes = (u64::from(pages) * page_bytes).max(64);
         let record_bytes =
             (128 + 32 * u64::from(slots) + 24 * u64::from(opts.max_rows)).next_multiple_of(64);

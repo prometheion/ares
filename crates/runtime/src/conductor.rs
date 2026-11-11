@@ -541,6 +541,8 @@ pub(crate) struct Conductor {
     requests: Vec<Request>,
     parts: Vec<StepPart>,
     updates: Vec<(u32, Range<usize>)>,
+    /// The pages the pool freed since the last record, for the devices.
+    freed: Vec<u32>,
     runs: Vec<(u32, u32)>,
     /// The outcome of this step's draft windows, for the next step's record.
     commits: Vec<Commit>,
@@ -610,6 +612,7 @@ impl Conductor {
             requests: Vec::with_capacity(slots),
             parts: Vec::with_capacity(max_rows as usize),
             updates: Vec::with_capacity(slots),
+            freed: Vec::with_capacity(record::FREED_PER_RECORD),
             runs: Vec::with_capacity(max_rows as usize),
             commits: Vec::with_capacity(slots),
             pending_probe: None,
@@ -1881,6 +1884,9 @@ impl Conductor {
                 }),
             )
             .map_err(full)?;
+        self.freed.clear();
+        self.pool.take_freed(record::FREED_PER_RECORD, &mut self.freed);
+        writer.freed(&self.freed).map_err(full)?;
         if let Some(cache) = &mut self.cache {
             cache.write_copies(&mut writer).map_err(full)?;
         }

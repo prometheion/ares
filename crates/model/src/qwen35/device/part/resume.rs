@@ -141,6 +141,7 @@ pub(super) unsafe fn append_writing(
     k: DevicePtr,
     v: DevicePtr,
     tables: DevicePtr,
+    exact_pool: DevicePtr,
     pool: DevicePtr,
     status: DevicePtr,
     replay: &[Range<u32>],
@@ -161,7 +162,7 @@ pub(super) unsafe fn append_writing(
                 k.offset(at * kv_row),
                 v.offset(at * kv_row),
                 tables,
-                DevicePtr::NULL,
+                exact_pool,
                 pool,
                 status,
             )?;
@@ -349,10 +350,11 @@ impl Part {
         u64::from(slot) * self.slot_bytes
     }
 
-    /// Copies the entry of page `from` into the entry of page `to`, in the
-    /// pool of every attention block and of the draft block.
+    /// Copies page `from` into page `to`, in every attention block and in the
+    /// draft block: the converted entry, or, where the formats have a tile
+    /// mean, the exact entry (see `Pages::copy_page` in `part/kv.rs`).
     pub fn copy_page(
-        &self,
+        &mut self,
         stream: &Stream,
         pages: DevicePtr,
         from: u32,
@@ -364,17 +366,13 @@ impl Part {
                 self.n_pages
             )));
         }
-        let pools = self
-            .attention_at
-            .iter()
-            .flatten()
-            .map(|at| (at.pool, at.geo.converted_entry_bytes()))
-            .chain(self.draft_pool());
-        for (pool, entry) in pools {
-            let at = |page: u32| pages.offset(pool + u64::from(page) * entry);
-            // SAFETY: both entries are inside the block's pool, which has
-            // `n_pages` entries, and they are different entries.
-            unsafe { stream.copy(at(to), at(from), entry as usize)? };
+        let kernels = self.attention.clone().ok_or_else(|| super::invalid("attention kernels"))?;
+        let status = self.at(self.s.status);
+        let main = self.layers_of(super::Which::Attention);
+        self.kv.copy_page(&kernels, stream, pages, status, &main, from, to)?;
+        if let Some(m) = &mut self.mtp {
+            let layer = [super::kv::Layer { geo: m.at.geo, pool: m.at.pool, exact: m.at.exact }];
+            m.kv.copy_page(&kernels, stream, pages, status, &layer, from, to)?;
         }
         Ok(())
     }

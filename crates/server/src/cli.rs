@@ -39,8 +39,11 @@ OPTIONS:
         --parallel <N>         Sequences that run at once; each takes memory for
                                its recurrent state, further requests wait
                                [default: 2]
-        --kv <FORMAT>          Storage format of K and V: f16 or q8, or two names
-                               (K,V) [default: q8]
+        --kv <FORMAT>          Storage format of K and V: f16, q8, q7, q6, q5 or q4,
+                               or two names (K,V). The formats from q7 on store a
+                               tile of 128 cells relative to its mean and keep the
+                               first tile and the newest cells exact; Qwen3.8-Flash-Next
+                               takes f16 and q8 only [default: q8]
 
     Host memory.
         --ram <SIZE>           The most RAM the whole engine may use, such as 16G or
@@ -510,6 +513,13 @@ mod tests {
         assert_eq!(load.kv, Some((CacheFormat::Q8, CacheFormat::F16)));
         assert_eq!(load.draft_vocabulary, Some(PathBuf::from("v.txt")));
         assert_eq!(run(&["--model=m", "--split=layer"]).load.split, Some(SplitKind::Layer));
+        // The formats that keep exact cells are accepted, for K and V apart.
+        let load = run(&["--model=m", "--kv", "q5,q4"]).load;
+        assert_eq!(load.kv, Some((CacheFormat::Q5, CacheFormat::Q4)));
+        assert_eq!(
+            run(&["--model=m", "--kv=q7"]).load.kv,
+            Some((CacheFormat::Q7, CacheFormat::Q7))
+        );
     }
 
     #[test]
