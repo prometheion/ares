@@ -481,8 +481,6 @@ pub(crate) struct LoadOptions {
     pub decode_rows: u32,
     /// The rows prompts are read in at a time.
     pub prompt_rows: u32,
-    /// The most rows of a step.
-    pub max_rows: u32,
     /// Whether the norm in front of each half block is written by the merge
     /// of a tensor split, in the forms the half's products read.
     pub merged: bool,
@@ -553,15 +551,8 @@ impl DeviceWeights {
         opts: LoadOptions,
         balance: Option<&Balance>,
     ) -> Result<Self, ModelError> {
-        let chooser = Chooser::new(
-            device,
-            kernels,
-            layers,
-            opts.layouts,
-            opts.precision,
-            opts.prompt_rows,
-            opts.max_rows,
-        );
+        let chooser =
+            Chooser::new(device, kernels, layers, opts.layouts, opts.precision, opts.prompt_rows);
         let model = Usage { decode_rows: opts.decode_rows.max(1), prompt: true };
         let normed = if opts.merged { Prep::Merge } else { Prep::Launch };
         // The tensors are laid out twice: once for the chooser to see every

@@ -576,7 +576,6 @@ impl Part {
                 precision: opts.precision,
                 decode_rows,
                 prompt_rows,
-                max_rows: opts.max_rows,
                 merged: placement.split == Split::Tensor && placement.n_devices() > 1,
             },
             balance,
@@ -670,11 +669,19 @@ impl Part {
         s.rope = take(rows * rope_pairs * 8);
         let widest = d.max(vd).max(hq).max(f);
         let logit_rows = u64::from(opts.logit_rows);
-        // With room for the padding between the launches of `Part::in_batches`.
+        // The decode kernels in several launches (`Part::in_batches`) read the rows in batches
+        // of `MAX_BATCH`, each batch with its scales behind it: room for the last, partial one
+        // as for a whole batch, and for the padding between the batches.
         s.act_q = take(
-            Kernels::quantized_activation_bytes(widest as u32, opts.max_rows)
-                .max(Kernels::quantized_activation_bytes(d as u32, opts.logit_rows))
-                .max(draft_sizes.as_ref().map_or(0, |sizes| sizes.act_q))
+            Kernels::quantized_activation_bytes(
+                widest as u32,
+                opts.max_rows.next_multiple_of(MAX_BATCH),
+            )
+            .max(Kernels::quantized_activation_bytes(
+                d as u32,
+                opts.logit_rows.next_multiple_of(MAX_BATCH),
+            ))
+            .max(draft_sizes.as_ref().map_or(0, |sizes| sizes.act_q))
                 + 256,
         );
         s.act_h = take(
@@ -969,16 +976,18 @@ impl Part {
     /// the file's layout, by the decode kernels in several launches of up to
     /// [`MAX_BATCH`] rows each: a window of a few more rows than one launch
     /// takes, where every such matrix's decode kernel still beats its
-    /// tensor-core kernel. Where that is, is not decided here:
-    /// `Kernels::decode_kernel_rows` says it per weight type. (The tile
-    /// kernels of the file's layout decode a whole matrix whatever the rows.
-    /// On Qwen3.8-27B over an RTX 4070 and an RTX 3060 that is a step of
-    /// about 80 ms from 9 to 24 rows, while the decode kernels take 36 ms for
-    /// 8. A matrix in its device layout has no such gap.)
+    /// tensor-core kernel, and any number of rows when one of the matrices
+    /// has no tensor-core kernel. Where that is, is not decided here:
+    /// `Kernels::decode_kernel_rows` and `Kernels::has_prefill_matmul` say
+    /// it per weight type. (The tile kernels of the file's layout decode a
+    /// whole matrix whatever the rows. On Qwen3.8-27B over an RTX 4070 and
+    /// an RTX 3060 that is a step of about 80 ms from 9 to 24 rows, while the
+    /// decode kernels take 36 ms for 8. A matrix in its device layout has no
+    /// such gap.) The decision is the group's: the matrices that read the
+    /// same input are all multiplied in launches or none.
     fn in_batches(&self, mats: &[&Mat], n: u32) -> bool {
         let mut file = mats.iter().filter(|m| m.layout == WeightLayout::File).peekable();
-        file.peek().is_some()
-            && decode_in_batches(self.opts.precision, self.opts.max_rows, file.map(|m| m.ty), n)
+        file.peek().is_some() && decode_in_batches(self.opts.precision, file.map(|m| m.ty), n)
     }
 
     /// The forms of an input of `n` rows that the products with `mats` read.
@@ -999,17 +1008,18 @@ impl Part {
     }
 
     /// The rows of each launch that writes or reads the quantized activations
-    /// of `n` rows of `n_in` values for `mats`, and where that launch's
-    /// activations are: all rows at `act_q`, or under [`Part::in_batches`]
+    /// of `n` rows of `n_in` values, and where that launch's activations are:
+    /// all rows at `act_q`, or, for a group of matrices that [`Part::in_batches`]
+    /// decided on (`batched`, the group's decision, not any one matrix's), the
     /// first row, rows and place of every launch.
     fn act_ranges(
         &self,
-        mats: &[&Mat],
+        batched: bool,
         n_in: u32,
         n: u32,
     ) -> impl Iterator<Item = (u32, u32, DevicePtr)> + use<> {
         let act_q = self.at(self.s.act_q);
-        let per = if self.in_batches(mats, n) { MAX_BATCH } else { n.max(1) };
+        let per = if batched { MAX_BATCH } else { n.max(1) };
         let stride = Kernels::quantized_activation_bytes(n_in, per).next_multiple_of(64);
         (0..n.div_ceil(per))
             .map(move |b| (b * per, per.min(n - b * per), act_q.offset(u64::from(b) * stride)))
@@ -1053,7 +1063,7 @@ impl Part {
         // input for the most rows; the rows are the caller's guarantee.
         unsafe {
             if forms.batched {
-                for (first, count, act) in self.act_ranges(mats, n_in, n) {
+                for (first, count, act) in self.act_ranges(forms.batched, n_in, n) {
                     let at = rows.offset(u64::from(first) * u64::from(n_in) * 4);
                     self.kernels.quantize_activations(stream, at, act, n_in, count)?;
                 }
@@ -1124,7 +1134,7 @@ impl Part {
                 )?;
                 return Ok(());
             }
-            for (first, rows, act) in self.act_ranges(&[&r.out], shape.value_dim(), n) {
+            for (first, rows, act) in self.act_ranges(forms.batched, shape.value_dim(), n) {
                 let at = u64::from(first) * u64::from(shape.value_dim()) * 4;
                 self.layers.gated_norm_quant(
                     stream,
@@ -1173,7 +1183,7 @@ impl Part {
                 self.layers.swiglu_f16(stream, gate, up, self.at(self.s.act_h), n, inner)?;
                 return Ok(());
             }
-            for (first, rows, act) in self.act_ranges(&[down], inner, n) {
+            for (first, rows, act) in self.act_ranges(forms.batched, inner, n) {
                 let at = u64::from(first) * u64::from(inner) * 4;
                 self.layers.swiglu_quant(
                     stream,
@@ -1257,7 +1267,7 @@ impl Part {
             return Ok(());
         }
         if self.batched.get() {
-            for (first, rows, act) in self.act_ranges(&[m], m.n_in, n) {
+            for (first, rows, act) in self.act_ranges(true, m.n_in, n) {
                 let at = y.offset(u64::from(first) * u64::from(m.n_out) * 4);
                 // SAFETY: as below; the range is inside the caller's rows.
                 unsafe {

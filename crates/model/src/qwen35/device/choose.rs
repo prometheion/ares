@@ -165,19 +165,28 @@ pub(crate) fn file_path(
 }
 
 /// Whether matrices of `types` in the file's layout take `n` rows through
-/// the decode kernels in several launches of up to [`MAX_BATCH`] rows: a few
-/// more rows than one launch takes, where every type's decode kernel still
-/// beats its tile kernel (`Kernels::decode_kernel_rows`).
+/// the decode kernels in several launches of up to [`MAX_BATCH`] rows. That
+/// is so for a few more rows than one launch takes, where every type's
+/// decode kernel still beats its tile kernel (`Kernels::decode_kernel_rows`),
+/// and for any number of rows as soon as one of the types has no tile kernel
+/// at all (`Kernels::has_prefill_matmul`): its decode kernel is the only one
+/// that reads the file's layout, and the matrices that read the same input
+/// are multiplied the same way. (`Precision::Exact` multiplies with the tile
+/// kernels' f16 path and has no such way.)
 pub(crate) fn decode_in_batches(
     precision: Precision,
-    max_rows: u32,
-    mut types: impl Iterator<Item = GgmlType>,
+    types: impl Iterator<Item = GgmlType>,
     n: u32,
 ) -> bool {
-    matches!(precision, Precision::Fast)
-        && n > MAX_BATCH
-        && n.next_multiple_of(MAX_BATCH) <= max_rows
-        && types.all(|ty| Kernels::decode_kernel_rows(ty).is_some_and(|limit| n <= limit))
+    if !matches!(precision, Precision::Fast) || n <= MAX_BATCH {
+        return false;
+    }
+    let (mut all_within, mut any_decode_only) = (true, false);
+    for ty in types {
+        any_decode_only |= !Kernels::has_prefill_matmul(ty);
+        all_within &= Kernels::decode_kernel_rows(ty).is_some_and(|limit| n <= limit);
+    }
+    any_decode_only || all_within
 }
 
 /// What a matrix is used for, as far as its layout depends on it.
@@ -427,7 +436,6 @@ pub(crate) struct Chooser<'a> {
     layers: &'a LayerKernels,
     policy: Layouts,
     precision: Precision,
-    max_rows: u32,
     /// The rows of a group of prompt rows.
     prompt_rows: u32,
     groups: Vec<Group>,
@@ -446,7 +454,7 @@ pub(crate) struct Chooser<'a> {
 impl<'a> Chooser<'a> {
     /// A chooser for matrices on `device`, whose products run with
     /// `precision`; `prompt_rows` is the number of rows prompts are read in
-    /// at a time and `max_rows` the most rows of a step.
+    /// at a time.
     pub fn new(
         device: &'a Device,
         kernels: &'a Kernels,
@@ -454,7 +462,6 @@ impl<'a> Chooser<'a> {
         policy: Layouts,
         precision: Precision,
         prompt_rows: u32,
-        max_rows: u32,
     ) -> Self {
         Self {
             device,
@@ -462,7 +469,6 @@ impl<'a> Chooser<'a> {
             layers,
             policy,
             precision,
-            max_rows,
             prompt_rows: prompt_rows.clamp(1, PROBE_PROMPT_ROWS),
             groups: Vec::new(),
             decided: None,
@@ -766,7 +772,7 @@ impl<'a> Chooser<'a> {
         self.report.probes_time += begun.elapsed();
         let mut file_f16 = [false; 2];
         for (f16, n) in file_f16.iter_mut().zip(rows) {
-            let batched = decode_in_batches(self.precision, self.max_rows, std::iter::once(ty), n);
+            let batched = decode_in_batches(self.precision, std::iter::once(ty), n);
             *f16 = n > 0
                 && !batched
                 && matches!(
@@ -969,7 +975,7 @@ impl<'a> Chooser<'a> {
             let burst = if n <= 2 * MAX_BATCH { BURST_FEW } else { BURST_MANY };
             // The file's layout: the decode kernels in one launch or several,
             // or the tile kernels, as a step multiplies it.
-            let batched = decode_in_batches(precision, self.max_rows, std::iter::once(ty), n);
+            let batched = decode_in_batches(precision, std::iter::once(ty), n);
             let path = file_path(kernels, precision, ty, n)?;
             let per = if batched { MAX_BATCH } else { n };
             let stride = Kernels::quantized_activation_bytes(n_in, per).next_multiple_of(64);
@@ -1182,6 +1188,42 @@ mod tests {
         let none = [1.0, f64::INFINITY];
         assert!(relative_cost([1.0, 3.0], none, 0.0, 1.0).is_finite());
         assert!(relative_cost(none, none, 0.0, 1.0).is_infinite());
+    }
+
+    #[test]
+    fn matrices_without_a_tile_kernel_take_any_number_of_rows_in_launches_of_the_decode_kernels() {
+        let fast =
+            |types: &[GgmlType], n| decode_in_batches(Precision::Fast, types.iter().copied(), n);
+        for ty in ares_core::ggml_type::ALL_TYPES.into_iter().filter(|t| t.is_weight()) {
+            // One launch takes up to eight rows, so there is nothing to split.
+            assert!(!fast(&[ty], 1) && !fast(&[ty], MAX_BATCH), "{ty}");
+            for n in [MAX_BATCH + 1, 16, 17, 100, 512] {
+                let expected = match Kernels::decode_kernel_rows(ty) {
+                    _ if !Kernels::has_prefill_matmul(ty) => true,
+                    Some(limit) => n <= limit,
+                    None => false,
+                };
+                assert_eq!(fast(&[ty], n), expected, "{ty} with {n} rows");
+            }
+        }
+        // The eleven types with tile kernels are split only where their decode kernels are
+        // faster; the other seventeen always.
+        let tile = ares_core::ggml_type::ALL_TYPES
+            .into_iter()
+            .filter(|t| t.is_weight() && Kernels::has_prefill_matmul(*t))
+            .count();
+        assert_eq!(tile, 11);
+        assert!(fast(&[GgmlType::IQ2_XXS], 512) && fast(&[GgmlType::IQ1_S], 9));
+        assert!(!fast(&[GgmlType::Q4_K], 17) && fast(&[GgmlType::Q4_K], 16));
+        // Matrices that read one input are multiplied the same way: one without a tile
+        // kernel brings the others along, and one that is faster on the tile kernels keeps
+        // the others off the decode kernels.
+        assert!(fast(&[GgmlType::Q4_K, GgmlType::IQ2_XXS], 100));
+        assert!(fast(&[GgmlType::Q8_0, GgmlType::Q2_K], 100));
+        assert!(fast(&[GgmlType::Q4_K, GgmlType::IQ4_XS], 12));
+        assert!(!fast(&[GgmlType::Q4_K, GgmlType::Q8_0], 12));
+        // The exact products are the tile kernels' f16 path: no launches of decode kernels.
+        assert!(!decode_in_batches(Precision::Exact, [GgmlType::IQ2_XXS].into_iter(), 100));
     }
 
     #[test]
