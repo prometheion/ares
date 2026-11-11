@@ -39,8 +39,8 @@ use ares_cuda::{DeviceBuffer, DevicePtr, Kernels, MAX_BATCH, PUSH_MAX_VALUES};
 use ares_state::PageLayout;
 
 use crate::model::{
-    ContextSpec, DeviceContext, DeviceModel, LinkSpec, Logits, Model, ModelError, Split,
-    StepContext,
+    ContextSpec, DeviceContext, DeviceModel, LinkSpec, Logits, Model, ModelError, PrefixCache,
+    Split, StepContext,
 };
 use crate::text::{printable, unprintable};
 
@@ -93,6 +93,16 @@ pub struct SyntheticConfig {
     /// through the context of each row), so this only makes the runtime
     /// reserve and allocate the page arrays a real model would use.
     pub state_bytes_per_cell: u64,
+    /// Whether the model takes part in the prefix cache, which makes the
+    /// runtime cache the pages and checkpoints of prompts and start new
+    /// prompts from them. `None`: it does not (the default, as for a model whose
+    /// device side does not implement the step record's copies). `Some(bytes)`:
+    /// it does, and it pretends to a recurrent state of `bytes` per checkpoint
+    /// on every device; `Some(0)` pretends to none. Only the host executor
+    /// ([`crate::testing::HostExecutor`]) keeps such a state and carries out the
+    /// copies, to check what the conductor does with them; the model's device
+    /// part has none and refuses to open with this set.
+    pub prefix_cache: Option<u64>,
     pub seed: u64,
 }
 
@@ -119,6 +129,7 @@ impl SyntheticConfig {
             layers_per_device: Vec::new(),
             tensor_shares: Vec::new(),
             state_bytes_per_cell: 0,
+            prefix_cache: None,
             seed: 0x5eed,
         }
     }
@@ -446,6 +457,12 @@ impl Model for SyntheticModel {
         self.config.max_rows
     }
 
+    fn prefix_cache(&self) -> Option<PrefixCache> {
+        self.config
+            .prefix_cache
+            .map(|bytes| PrefixCache { checkpoint_bytes: vec![bytes; self.config.devices] })
+    }
+
     fn page_entry(&self, page: u32) -> u32 {
         page
     }
@@ -509,6 +526,13 @@ struct SyntheticDevice {
 impl SyntheticDevice {
     fn build(config: &Arc<SyntheticConfig>, cx: DeviceContext<'_>) -> Result<Self, ModelError> {
         let c = config;
+        if c.prefix_cache.is_some() {
+            return Err(ModelError::Invalid(
+                "this model pretends to a prefix cache, which only the host executor can carry \
+                 out: its device part keeps no state"
+                    .into(),
+            ));
+        }
         let index = cx.index;
         let layers = c.layer_range(index);
         let sets = c.distinct_layers.min(layers.end - layers.start).max(1);

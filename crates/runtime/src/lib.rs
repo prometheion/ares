@@ -44,9 +44,15 @@
 //! - [`Model`] is what an architecture implements; [`SyntheticModel`] is built
 //!   from the kernels that exist.
 //! - [`GpuExecutor`] runs steps on devices; [`testing::HostExecutor`] runs
-//!   them without, for tests and for measuring the conductor alone.
+//!   them without, for tests and for measuring the conductor alone. Given the
+//!   pool's shape it also plays a device that keeps state, to check what the
+//!   conductor does with the prefix cache.
+//! - The prefix cache (cached pages, tails, checkpoints of recurrent state,
+//!   replayed rows) is the conductor's, for a model whose device side carries
+//!   out the step record's copies ([`Model::prefix_cache`]).
 //! - [`Snapshot`] is the timing: where every step went.
 
+mod cache;
 mod conductor;
 mod config;
 mod engine;
@@ -71,13 +77,17 @@ pub use exec::{Clock, ExecError, Executor, Pick, StepMeta, StepOutput};
 pub use gpu::{GpuConfig, GpuExecutor};
 pub use links::{Links, MAX_DEVICES};
 pub use model::{
-    ContextSpec, DeviceContext, DeviceModel, LinkSpec, Logits, Model, ModelError, OwnDrafts, Split,
-    StepContext,
+    ContextSpec, DeviceContext, DeviceModel, LinkSpec, Logits, Model, ModelError, OwnDrafts,
+    PrefixCache, Split, StepContext,
 };
-pub use record::{Commit, RecordFull, RecordView, RecordWriter, Row, TableUpdate};
+pub use record::{
+    Commit, PageCopy, RecordFull, RecordView, RecordWriter, Row, StateCopy, StateCopyKind,
+    TableUpdate,
+};
 pub use sync::{WakeCounts, Woke};
 pub use synthetic::{SyntheticConfig, SyntheticModel};
 pub use text::{StopMatcher, printable, unprintable};
 pub use timing::{
-    Counters, DEFAULT_WINDOW, DevicePhase, DeviceTimes, Phase, Series, Snapshot, Stats, Summary,
+    Counters, DEFAULT_WINDOW, DevicePhase, DeviceTimes, Phase, REPORTED_REQUESTS, RequestReport,
+    Series, Snapshot, Stats, Summary,
 };

@@ -75,6 +75,15 @@ impl Runtime {
                 "pages, cells per page and slots must be at least 1".into(),
             ));
         }
+        if let Some(cache) = model.prefix_cache()
+            && cache.checkpoint_bytes.len() != model.devices()
+        {
+            return Err(RuntimeError::Config(format!(
+                "the model names checkpoint bytes for {} devices and has {}",
+                cache.checkpoint_bytes.len(),
+                model.devices()
+            )));
+        }
         let card = model.card();
         let (tx, rx) = mpsc::channel();
         let (ready_tx, ready_rx) = mpsc::channel();

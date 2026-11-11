@@ -13,7 +13,9 @@
 //! ```text
 //! intake -> admit -> plan -> claim pages -> write record -> dispatch ... collect -> commit -> events
 //!           (who     (drafts  (drafts cut,                  (devices work)         (accept, cut,
-//!            starts)  first)   someone gives way)                                   corpus, update)
+//!            starts)  first)   someone gives way,                                   publish pages,
+//!                              cached pages evicted)                                capture state,
+//!                                                                                   corpus, update)
 //! ```
 //!
 //! # Who runs
@@ -23,19 +25,46 @@
 //! starts when the pages of its prompt and the output it is expected to
 //! produce fit next to what the running requests are expected to need; a
 //! request that is alone always starts. Every step claims the pages its rows
-//! write. When they do not fit, draft rows are dropped first; then the request
-//! with the fewest generated tokens gives way: it lets go of its pages and
-//! its place on the devices and waits at the front of the line. The runtime
-//! cannot move a sequence's state to host memory yet, so a request that gave
-//! way computes its rows again when it comes back, as a prompt made of
-//! everything it has read and written. The one request left in the pool is
-//! never made to wait: when the pool cannot hold it any longer it ends, as it
-//! would at the end of the context.
+//! write. When they do not fit, cached pages nobody holds are evicted, then
+//! draft rows are dropped; then the request with the fewest generated tokens
+//! gives way: it lets go of its place on the devices and waits at the front of
+//! the line, and what it computed stays in the prefix cache, so that it comes
+//! back as a prefix hit. The one request left in the pool is never made to
+//! wait: when the pool cannot hold it any longer it ends, as it would at the
+//! end of the context.
 //!
 //! What bounds the number of requests: the ones that run are bounded by the
 //! places the devices have ([`RuntimeConfig::max_slots`]: a recurrent state,
 //! a page table and a row of logits each) and by the pool; the ones that wait
 //! are not bounded.
+//!
+//! # The prefix cache
+//!
+//! For a model that takes part ([`Model::prefix_cache`]) the pages and the
+//! recurrent state a request computes outlive it, and a request whose prompt
+//! starts with text the engine has computed starts from them.
+//!
+//! - **Lookup.** A request is looked up when it arrives (the prompt without
+//!   its last token, whose logits are needed) and again when it starts. It
+//!   shares the cached pages and a tail, restores the recurrent state from the
+//!   last checkpoint on that path, **replays** the rows between that checkpoint
+//!   and the end of the cached cells (they read the cells and write none) and
+//!   computes the rest. A prompt whose first missing page is being computed by
+//!   a sequence that runs is held back in line until that page is published or
+//!   the sequence lets go of it.
+//! - **Publish.** At the commit that fills a page it enters the index, so a
+//!   second prompt shares it at once. A prefill step ends where a checkpoint is
+//!   due ([`ares_state::CheckpointPolicy`]), and so does the window of a
+//!   generating sequence, so that the state is exactly there when the
+//!   checkpoint is taken.
+//! - **Retire.** When a request ends, gives way or is cancelled its partly used
+//!   last page is published as a tail and its live state becomes that tail's
+//!   checkpoint. The copy of the state runs with the next record, before
+//!   anything of that record writes a slot, so the slot is free at once.
+//! - **Evict.** When a step's claims need room, cached pages nobody holds go
+//!   from the ends of chains, after the requests that start took the pages they
+//!   share. Checkpoints go when their budget is full
+//!   ([`RuntimeConfig::checkpoint_budget`]) or with the page they hang on.
 
 use std::collections::HashMap;
 use std::ops::Range;
@@ -50,14 +79,17 @@ use ares_sched::{
     LookupDrafter, Outcome, PartKind, PoolView, Request, SeqId, StepTimeModel, Want,
     best_draft_len, plan, prefill_rows_at,
 };
-use ares_state::{PagePool, Sequence};
+use ares_state::{
+    Chain, ChainHash, Owner, PagePool, PageState, PrefixIndex, Priority, Resume, Sequence,
+};
 
+use crate::cache::Cache;
 use crate::config::{Drafters, RuntimeConfig};
 use crate::exec::{Clock, ExecError, Executor, StepMeta, StepOutput};
 use crate::model::{ContextSpec, Model};
 use crate::record::{self, Commit, RecordWriter, Row, TableUpdate};
 use crate::text::StopMatcher;
-use crate::timing::{Phase, Snapshot, Stats};
+use crate::timing::{Phase, RequestReport, Snapshot, Stats};
 
 /// Drafts cost the model nothing to produce: a lookup.
 const LOOKUP: DraftCost = DraftCost { fixed_ms: 0.0, per_token_ms: 0.0 };
@@ -83,13 +115,21 @@ pub(crate) struct StatsCopy {
     stats: Stats,
     pages_free: u32,
     pages_capacity: u32,
+    cached_pages: u32,
     active: u32,
     waiting: u32,
 }
 
 impl StatsCopy {
     pub(crate) fn into_snapshot(self) -> Snapshot {
-        Snapshot::new(&self.stats, self.pages_free, self.pages_capacity, self.active, self.waiting)
+        Snapshot::new(
+            &self.stats,
+            self.pages_free,
+            self.pages_capacity,
+            self.cached_pages,
+            self.active,
+            self.waiting,
+        )
     }
 }
 
@@ -136,7 +176,8 @@ struct Active {
     sink: EventSink,
     /// The page table. Its length is the number of cells computed, which is
     /// the number of tokens less one once the prompt is read: the newest
-    /// token has no cell until a step computes it.
+    /// token has no cell until a step computes it. A request that starts from
+    /// the prefix cache starts with the cells it shares.
     cells: Sequence,
     /// The prompt and the output.
     tokens: Vec<u32>,
@@ -147,6 +188,34 @@ struct Active {
     /// generates: the prompt, and for a request that gave way and came back
     /// everything it had read and written by then.
     known: u32,
+    /// The names of the pages the sequence has, for the prefix index.
+    chain: Chain,
+    /// The sequence's name in the prefix index, for its announcements and
+    /// the checkpoints it publishes.
+    owner: Owner,
+    /// Whether the request has run (started once at least).
+    ran: bool,
+    /// The cells that start shared, and of them the rows that are replayed
+    /// and still to run: the recurrent state is at `replay_end - replay_left`
+    /// until the replay is done, and at the end of the cells after.
+    replay_end: u32,
+    replay_left: u32,
+    /// Where the last checkpoint on this sequence's own path is: restored or
+    /// taken; 0 for none.
+    checkpoint_at: u64,
+    /// The first page of the prompt that is not cached is being computed by
+    /// another sequence: the request is held back until that changes.
+    waits_for: Option<ChainHash>,
+    /// Whether the request was held back once at least.
+    was_held: bool,
+    /// The number of evictions the accounting was last told about the cache
+    /// at.
+    looked_at: u64,
+    /// For the request's report: what its first start took from the cache,
+    /// and the rows it replayed and computed itself.
+    cached_prompt: u32,
+    replayed: u32,
+    computed: u32,
     /// The sequence's place in the corpus of all text. Its tokens enter the
     /// corpus when they are certain: prompt tokens when the step that
     /// computed their rows is back, generated tokens when they are accepted.
@@ -185,8 +254,30 @@ impl Active {
         Usage {
             prompt_tokens: self.prompt_len,
             completion_tokens: self.completion,
-            cached_prompt_tokens: 0,
+            cached_prompt_tokens: self.cached_prompt,
         }
+    }
+
+    /// Where the recurrent state is: the end of the cells, or while cached
+    /// cells are replayed, where the replay has got to.
+    fn state_pos(&self) -> u64 {
+        if self.replay_left > 0 {
+            u64::from(self.replay_end - self.replay_left)
+        } else {
+            self.cells.len()
+        }
+    }
+
+    /// The rows of the prompt that are left to run: replayed and computed.
+    fn prefill_left(&self) -> u32 {
+        self.known.saturating_sub(self.cells.len() as u32) + self.replay_left
+    }
+
+    /// The most tokens the request may still generate in a context of
+    /// `context_length`: its limit, or the room the context leaves.
+    fn max_new_tokens(&self, context_length: u32) -> u32 {
+        let room = context_length.saturating_sub(self.prompt_len);
+        self.max_tokens.map_or(room, |max| max.min(room))
     }
 
     /// Takes the tokens the model produced for this request, in order, up to
@@ -291,6 +382,12 @@ struct StepPart {
     seq: SeqId,
     rows: u32,
     kind: PartKind,
+    /// Where the sequence's recurrent state is before the rows, which is the
+    /// position of the first row.
+    from: u64,
+    /// The rows are a replay: they rebuild recurrent state from cached cells
+    /// and write no cell.
+    replay: bool,
 }
 
 /// The load of `rows` consecutive rows of a sequence that start at position
@@ -307,12 +404,12 @@ fn load_of(span: u32, context: u64, rows: u32) -> Load {
 struct View<'a> {
     pool: &'a PagePool,
     slots: &'a [Option<Active>],
+    index: Option<&'a mut PrefixIndex>,
 }
 
 impl PoolView for View<'_> {
     fn evictable(&mut self) -> u32 {
-        // Nothing is cached yet: every page has a sequence that holds it.
-        0
+        self.index.as_mut().map_or(0, |index| index.evictable(self.pool))
     }
 
     fn releasable(&mut self, seq: SeqId) -> u32 {
@@ -337,6 +434,8 @@ pub(crate) struct Conductor {
     clock: Clock,
     rx: Receiver<Command>,
     pool: PagePool,
+    /// The prefix cache, for a model that takes part in it.
+    cache: Option<Cache>,
     /// Who runs, who waits and who gives way.
     admission: Admission,
     /// The running requests, by their slot on the devices.
@@ -403,6 +502,9 @@ impl Conductor {
             context_length: model.card().context_length,
             span: model.attention_span(),
             pool: PagePool::new(config.pages, config.cells_per_page),
+            cache: model
+                .prefix_cache()
+                .map(|spec| Cache::new(&model.card().id, &spec, &config, config.cells_per_page)),
             admission: Admission::new(admission),
             slots: (0..slots).map(|_| None).collect(),
             free_slots: (0..config.max_slots).rev().collect(),
@@ -545,6 +647,7 @@ impl Conductor {
                     stats: self.stats.clone(),
                     pages_free: self.pool.free_pages(),
                     pages_capacity: self.pool.capacity(),
+                    cached_pages: self.cache.as_ref().map_or(0, |cache| cache.index.len() as u32),
                     active: self.active as u32,
                     waiting: self.waiting.len() as u32,
                 };
@@ -605,11 +708,22 @@ impl Conductor {
         let prompt_len = prompt.len() as u32;
         let seq = self.fresh_seq();
         let room = self.context_length.saturating_sub(prompt_len);
+        // What the cache has for the prompt now. A request whose first
+        // missing page another sequence is computing is held back.
+        let (chain, cached, idle, waits_for) = match &mut self.cache {
+            Some(cache) => {
+                let chain = cache.chain(&prompt);
+                let probe = cache.probe(&self.pool, &chain, &prompt);
+                let waits = probe.found.computing.map(|(hash, _)| hash);
+                (chain, probe.resume.cached_cells as u32, probe.idle, waits)
+            }
+            None => (Chain::new(ChainHash::root(&[]), self.config.cells_per_page), 0, 0, None),
+        };
         let arrival = Arrival {
             seq,
             prompt_cells: prompt_len,
-            cached_cells: 0,
-            idle_cached_pages: 0,
+            cached_cells: cached,
+            idle_cached_pages: idle,
             max_new_tokens: max_tokens.map_or(room, |max| max.min(room)),
         };
         if self.admission.enqueue(arrival).is_err() {
@@ -628,6 +742,10 @@ impl Conductor {
         }
         let mut tokens = Vec::with_capacity(prompt.len() + 64);
         tokens.extend_from_slice(&prompt);
+        if waits_for.is_some() {
+            self.admission.hold(seq);
+            self.stats.counters.requests_held += 1;
+        }
         self.waiting.push(Active {
             id,
             seq,
@@ -635,6 +753,18 @@ impl Conductor {
             cells: Sequence::new(),
             prompt_len,
             known: prompt_len,
+            chain,
+            owner: Owner(u64::from(seq.0)),
+            ran: false,
+            replay_end: 0,
+            replay_left: 0,
+            checkpoint_at: 0,
+            waits_for,
+            was_held: waits_for.is_some(),
+            looked_at: self.cache.as_ref().map_or(0, |cache| cache.evictions),
+            cached_prompt: 0,
+            replayed: 0,
+            computed: 0,
             tokens,
             states,
             drafter: LookupDrafter::new(),
@@ -676,6 +806,42 @@ impl Conductor {
     /// from the next plan on.
     fn start(&mut self, seq: SeqId) {
         let Some(i) = self.waiting.iter().position(|a| a.seq == seq) else { return };
+        // What the cache has for it now, which may be more or less than when
+        // it was put in line.
+        let probe = match &mut self.cache {
+            Some(cache) => {
+                let a = &self.waiting[i];
+                Some(cache.probe(&self.pool, &a.chain, &a.tokens[..a.known as usize]))
+            }
+            None => None,
+        };
+        if let Some(probe) = &probe
+            && let Some((hash, _)) = probe.found.computing
+            && !self.waiting[i].ran
+        {
+            // A sequence that started a moment ago computes the page this
+            // prompt misses first. The accounting let the request in, and
+            // only sequences that run announce pages, so it goes back in
+            // line and waits for the page.
+            let a = &mut self.waiting[i];
+            a.waits_for = Some(hash);
+            if !a.was_held {
+                a.was_held = true;
+                self.stats.counters.requests_held += 1;
+            }
+            let arrival = Arrival {
+                seq,
+                prompt_cells: a.prompt_len,
+                cached_cells: probe.resume.cached_cells as u32,
+                idle_cached_pages: probe.idle,
+                max_new_tokens: a.max_new_tokens(self.context_length),
+            };
+            self.admission.remove(seq);
+            // It passed the one refusal when it arrived.
+            let _ = self.admission.enqueue(arrival);
+            self.admission.hold(seq);
+            return;
+        }
         let Some(slot) = self.free_slots.pop() else {
             // The accounting never starts more requests than there are
             // slots, so this is a bookkeeping bug and not load.
@@ -687,32 +853,117 @@ impl Conductor {
             self.admission.remove(seq);
             return;
         };
-        let a = self.waiting.swap_remove(i);
+        let mut a = self.waiting.swap_remove(i);
+        if let (Some(cache), Some(probe)) = (&mut self.cache, probe) {
+            let counters = &mut self.stats.counters;
+            let Resume { cached_cells: cached, restore, replay, .. } = probe.resume;
+            a.cells = Sequence::from_shared(&mut self.pool, &probe.found.table(), cached);
+            a.chain = cache.chain_after(&probe.found, &a.tokens[..a.known as usize]);
+            // The pages this sequence will fill are its to announce.
+            cache.index.announce(a.owner, a.chain.unpublished());
+            a.replay_end = cached as u32;
+            a.replay_left = (replay.end - replay.start) as u32;
+            a.checkpoint_at = 0;
+            if let Some(id) = restore {
+                cache.restore(slot, id);
+                a.checkpoint_at = replay.start;
+                counters.checkpoints_restored += 1;
+            }
+            if cached > 0 {
+                counters.prefix_hits += 1;
+                counters.cached_cells += cached;
+            }
+            if !a.ran {
+                a.cached_prompt = cached.min(u64::from(a.prompt_len)) as u32;
+            }
+        }
+        a.ran = true;
+        a.waits_for = None;
         self.by_id.insert(a.id, Place::Slot(slot));
         self.slots[slot as usize] = Some(a);
         self.active += 1;
     }
 
+    /// Lets what a sequence computed stay in the prefix cache, as it ends,
+    /// gives way or is cancelled: the pages that are full and not published
+    /// yet, the partly used last page as a tail, and the live state as the
+    /// checkpoint of that tail (or of the last full page, when the cells end
+    /// on a page boundary). The copy of the state runs with the next record,
+    /// before anything of it writes a slot.
+    fn keep(&mut self, a: &mut Active, slot: u32) {
+        let Some(cache) = &mut self.cache else { return };
+        cache.index.withdraw(a.owner);
+        // A sequence that leaves before the record that restores its state
+        // never had that state in its slot.
+        let restored = cache.cancel_restore(slot);
+        let cells = a.cells.len();
+        let per_page = u64::from(self.pool.cells_per_page());
+        cache.index.publish(
+            &mut self.pool,
+            &mut a.cells,
+            &mut a.chain,
+            &a.tokens,
+            cells,
+            Priority::NORMAL,
+        );
+        let full = (cells / per_page) as usize;
+        let rest = &a.tokens[full * per_page as usize..cells as usize];
+        let target = if rest.is_empty() {
+            full.checked_sub(1).map(|page| a.chain.hashes()[page])
+        } else {
+            let prior = a.chain.before(full);
+            let page = a.cells.pages()[full];
+            if let Some(evicted) =
+                cache.index.insert_tail(&mut self.pool, prior, rest, page, Priority::NORMAL)
+            {
+                self.stats.counters.checkpoints_dropped += u64::from(cache.forget(evicted));
+            }
+            Some(PrefixIndex::tail_hash(prior, rest))
+        };
+        if let Some(hash) = target
+            && !restored
+            && a.state_pos() == cells
+        {
+            let saved = cache.save(slot, hash, a.owner);
+            self.stats.counters.checkpoints_saved += u64::from(saved.taken);
+            self.stats.counters.checkpoints_dropped += u64::from(saved.dropped);
+        }
+    }
+
     /// Takes the running request with the name `seq` off the devices: it
     /// lets go of its pages and its slot and waits at the front of the line.
-    /// Its state is not kept anywhere, so it computes everything it has read
-    /// and written again when it comes back.
+    /// What it computed stays in the prefix cache (when the model has one), so
+    /// it comes back as a prefix hit; without one it computes everything it has
+    /// read and written again, as a prompt made of all its tokens.
     fn suspend(&mut self, seq: SeqId) {
         let Some(slot) = self.slots.iter().position(|a| a.as_ref().is_some_and(|a| a.seq == seq))
         else {
             return;
         };
         let Some(mut a) = self.slots[slot].take() else { return };
+        self.keep(&mut a, slot as u32);
         std::mem::take(&mut a.cells).release(&mut self.pool);
         a.known = a.tokens.len() as u32;
+        a.replay_left = 0;
         a.draft.clear();
         a.lookup.clear();
         a.own = false;
         a.waited_steps = 0;
-        // Nothing is brought back when it returns; its rows are claimed
-        // again step by step, as a prompt's are.
-        self.admission.set_restore(seq, 0, 0);
-        self.admission.set_recompute(seq, a.known);
+        // What it needs to come back: the rows the cache does not hold, which
+        // are claimed again step by step, as a prompt's are.
+        let (rows, idle) = match &mut self.cache {
+            Some(cache) => {
+                a.looked_at = cache.evictions;
+                let probe = cache.probe(&self.pool, &a.chain, &a.tokens[..a.known as usize]);
+                (
+                    probe.resume.compute.end.saturating_sub(probe.resume.compute.start) as u32,
+                    probe.idle,
+                )
+            }
+            None => (a.known, 0),
+        };
+        self.admission.set_restore(seq, 0, idle);
+        self.admission.set_recompute(seq, rows);
         self.by_id.insert(a.id, Place::Waiting);
         self.waiting.push(a);
         self.free_slots.push(slot as u32);
@@ -721,8 +972,16 @@ impl Conductor {
     }
 
     /// Ends the request in `slot`: tells its sink (if it still listens),
-    /// gives its pages and its slot back.
+    /// leaves what it computed in the prefix cache, gives its pages and its
+    /// slot back.
     fn retire(&mut self, slot: u32, finish: FinishReason) {
+        self.retire_with(slot, finish, true);
+    }
+
+    /// [`Conductor::retire`], with or without leaving the request's pages and
+    /// state in the cache: not when the engine is going down or a device
+    /// failed, and the state is not there.
+    fn retire_with(&mut self, slot: u32, finish: FinishReason, keep: bool) {
         let Some(mut a) = self.slots[slot as usize].take() else { return };
         self.by_id.remove(&a.id);
         if !a.sink.is_closed() {
@@ -731,6 +990,18 @@ impl Conductor {
             }
             a.sink.send(Event::Done { finish, usage: a.usage() });
         }
+        if keep {
+            self.keep(&mut a, slot);
+        } else if let Some(cache) = &mut self.cache {
+            cache.index.withdraw(a.owner);
+        }
+        self.stats.report(RequestReport {
+            id: a.id,
+            prompt_tokens: a.prompt_len,
+            cached_tokens: a.cached_prompt,
+            replayed_rows: a.replayed,
+            computed_rows: a.computed,
+        });
         a.cells.release(&mut self.pool);
         self.free_slots.push(slot);
         self.active -= 1;
@@ -765,7 +1036,7 @@ impl Conductor {
 
     fn finish_everything(&mut self, finish: FinishReason) {
         for slot in 0..self.slots.len() as u32 {
-            self.retire(slot, finish);
+            self.retire_with(slot, finish, false);
         }
         while !self.waiting.is_empty() {
             self.dismiss(self.waiting.len() - 1, finish);
@@ -779,7 +1050,7 @@ impl Conductor {
         for slot in 0..self.slots.len() as u32 {
             if let Some(a) = &self.slots[slot as usize] {
                 let _ = a.sink.send(Event::Error(error.clone()));
-                self.retire(slot, FinishReason::Cancelled);
+                self.retire_with(slot, FinishReason::Cancelled, false);
             }
         }
         while let Some(a) = self.waiting.last() {
@@ -795,17 +1066,59 @@ impl Conductor {
         let mut claims = self.admission.begin(self.pool.free_pages());
         for part in &self.parts {
             let Some(a) = &self.slots[part.slot as usize] else { continue };
+            // A replay writes no cell, so it claims no page.
+            let writes = if part.replay { 0 } else { part.rows };
             // A prompt's rows and a sequence's newest token must run; draft
             // rows are given up before anybody has to wait.
             let (must, prompt_rows) = match part.kind {
-                PartKind::Prefill { .. } => (part.rows, part.rows),
+                PartKind::Prefill { .. } => (writes, writes),
                 PartKind::Window | PartKind::Score { .. } => (1, 0),
             };
             let required = a.cells.pages_to_append(&self.pool, u64::from(must));
-            let all = a.cells.pages_to_append(&self.pool, u64::from(part.rows));
+            let all = a.cells.pages_to_append(&self.pool, u64::from(writes));
             claims.claim(part.seq, required, all.saturating_sub(required), prompt_rows);
         }
-        claims.settle(&mut View { pool: &self.pool, slots: &self.slots })
+        let index = self.cache.as_mut().map(|cache| &mut cache.index);
+        claims.settle(&mut View { pool: &self.pool, slots: &self.slots, index })
+    }
+
+    /// Gives up `pages` cached pages that no sequence holds, from the ends of
+    /// chains, and the checkpoints that hung on them.
+    fn evict(&mut self, pages: u32) {
+        let Some(cache) = &mut self.cache else { return };
+        let given = cache.evict(&mut self.pool, pages);
+        self.stats.counters.cache_pages_evicted += u64::from(given.pages);
+        self.stats.counters.checkpoints_dropped += u64::from(given.checkpoints);
+    }
+
+    /// Tells the accounting what the cache has now for the requests in line,
+    /// where that changed: a held request whose page was published or given
+    /// up, and every request after pages were evicted.
+    fn refresh_waiting(&mut self) {
+        let Some(cache) = &mut self.cache else { return };
+        for a in &mut self.waiting {
+            let changed = match a.waits_for {
+                Some(hash) => !matches!(cache.index.state(hash), PageState::Computing(_)),
+                None => a.looked_at != cache.evictions,
+            };
+            if !changed {
+                continue;
+            }
+            a.looked_at = cache.evictions;
+            let probe = cache.probe(&self.pool, &a.chain, &a.tokens[..a.known as usize]);
+            if a.ran {
+                // It gave way and comes back: the rows the cache does not hold.
+                let rows = probe.resume.compute.end.saturating_sub(probe.resume.compute.start);
+                self.admission.set_recompute(a.seq, rows as u32);
+                self.admission.set_restore(a.seq, 0, probe.idle);
+                continue;
+            }
+            self.admission.refresh(a.seq, probe.resume.cached_cells as u32, probe.idle);
+            a.waits_for = probe.found.computing.map(|(hash, _)| hash);
+            if a.waits_for.is_some() {
+                self.admission.hold(a.seq);
+            }
+        }
     }
 
     /// Carries out who gives way and who starts.
@@ -815,6 +1128,11 @@ impl Conductor {
         }
         for seq in outcome.resume.iter().chain(&outcome.admit) {
             self.start(*seq);
+        }
+        // The requests that start have taken the cached pages they share, so
+        // what is given up now is not theirs.
+        if outcome.evict > 0 {
+            self.evict(outcome.evict);
         }
     }
 
@@ -852,6 +1170,19 @@ impl Conductor {
                     .min(room)
                     .min(self.model.draft_rows().saturating_sub(1))
                     .min(spare_logit_rows) as usize;
+                // The window ends where a checkpoint is due, so that the
+                // state is exactly there when all of it is accepted.
+                let cap = match &self.cache {
+                    Some(cache) => {
+                        let from = a.cells.len();
+                        let to = from + 1 + cap as u64;
+                        match cache.capture(u64::from(a.prompt_len), a.checkpoint_at, from, to) {
+                            Some(at) => cap.min((at - from - 1) as usize),
+                            None => cap,
+                        }
+                    }
+                    None => cap,
+                };
                 a.own = false;
                 a.lookup.clear();
                 if self.config.speculation && cap > 0 {
@@ -937,7 +1268,7 @@ impl Conductor {
                 }
                 Want::Window { drafts: a.draft.len() as u32 }
             } else {
-                Want::Prefill { tokens: a.known - a.cells.len() as u32 }
+                Want::Prefill { tokens: a.prefill_left() }
             };
             self.requests.push(Request {
                 seq: SeqId(slot as u32),
@@ -955,6 +1286,7 @@ impl Conductor {
         // fits shares this step.
         self.parts.clear();
         if !self.waiting.is_empty() {
+            self.refresh_waiting();
             let outcome = self.settle();
             self.seat(&outcome);
             for a in self.waiting.iter_mut().filter(|a| !a.counted_waiting) {
@@ -1002,10 +1334,35 @@ impl Conductor {
             }
         }
         for part in &planned.parts {
-            if let Some(a) = &self.slots[part.seq.0 as usize] {
-                let (slot, seq) = (part.seq.0, a.seq);
-                self.parts.push(StepPart { slot, seq, rows: part.rows, kind: part.kind });
+            let Some(a) = &self.slots[part.seq.0 as usize] else { continue };
+            let mut step = StepPart {
+                slot: part.seq.0,
+                seq: a.seq,
+                rows: part.rows,
+                kind: part.kind,
+                from: a.state_pos(),
+                replay: false,
+            };
+            if let PartKind::Prefill { .. } = part.kind {
+                // Replayed rows and rows that write are steps of their own: a
+                // segment is one or the other. And a step ends where a
+                // checkpoint is due, so that the state is exactly there.
+                step.replay = a.replay_left > 0;
+                if step.replay {
+                    step.rows = step.rows.min(a.replay_left);
+                }
+                let to = step.from + u64::from(step.rows);
+                if let Some(cache) = &self.cache
+                    && let Some(at) =
+                        cache.capture(u64::from(a.prompt_len), a.checkpoint_at, step.from, to)
+                {
+                    step.rows = step.rows.min((at - step.from) as u32);
+                }
+                let completes =
+                    !step.replay && a.cells.len() + u64::from(step.rows) == u64::from(a.known);
+                step.kind = PartKind::Prefill { completes };
             }
+            self.parts.push(step);
         }
 
         // The pages this step writes. Draft rows that do not fit are
@@ -1041,9 +1398,26 @@ impl Conductor {
                 self.stats.counters.draft_rows_cut += u64::from(part.rows - 1);
                 part.rows = 1;
             }
-            match a.cells.append(&mut self.pool, u64::from(part.rows)) {
+            let writes = if part.replay { 0 } else { u64::from(part.rows) };
+            let mut grown = a.cells.append(&mut self.pool, writes);
+            if let (Err(short), Some(cache)) = (&grown, &mut self.cache) {
+                // The accounting counted on cached pages that turned out to be
+                // held by a sequence: give up others.
+                let given = cache.evict(&mut self.pool, short.needed.saturating_sub(short.free));
+                self.stats.counters.cache_pages_evicted += u64::from(given.pages);
+                self.stats.counters.cache_pages_evicted_late += u64::from(given.pages);
+                self.stats.counters.checkpoints_dropped += u64::from(given.checkpoints);
+                grown = a.cells.append(&mut self.pool, writes);
+            }
+            match grown {
                 Ok(grown) => {
-                    debug_assert!(grown.copy.is_none(), "nothing forks a sequence in this runtime");
+                    if let Some(copy) = grown.copy {
+                        // The sequence writes into a page that others read, so it
+                        // writes into a copy.
+                        let cache = self.cache.as_mut().expect("only a cache shares pages");
+                        cache.copy_page(copy.from, copy.to, copy.cells);
+                        self.stats.counters.page_copies += 1;
+                    }
                     a.draft.truncate(part.rows.saturating_sub(1) as usize);
                     a.own &= !a.draft.is_empty();
                     self.parts[kept] = part;
@@ -1080,8 +1454,7 @@ impl Conductor {
         self.after_idle = false;
         // What the step carries: every row and the cells it reads.
         let load = self.parts.iter().fold(Load::default(), |load, part| {
-            let cells = self.slots[part.slot as usize].as_ref().map_or(0, |a| a.cells.len());
-            load.plus(load_of(self.span, cells - u64::from(part.rows), part.rows))
+            load.plus(load_of(self.span, part.from, part.rows))
         });
         if let Err(error) = self.exec.dispatch(&meta) {
             return self.fail(error.to_string());
@@ -1157,14 +1530,22 @@ impl Conductor {
         let mut has_generation = false;
         for part in &self.parts {
             let a = self.slots[part.slot as usize].as_ref().expect("running");
-            let first_cell = (a.cells.len() - u64::from(part.rows)) as u32;
+            // The position of the first row.
+            let first_cell = part.from as u32;
             match part.kind {
                 PartKind::Prefill { completes } => {
                     has_prompt = true;
-                    counters.prefill_rows += u64::from(part.rows);
+                    if part.replay {
+                        counters.replay_rows += u64::from(part.rows);
+                    } else {
+                        counters.prefill_rows += u64::from(part.rows);
+                    }
                     // The rows of a prompt are certain: recurrent state
                     // advances with them.
                     writer.segment(part.slot, first_cell, part.rows, true).map_err(full)?;
+                    if part.replay {
+                        writer.replay().map_err(full)?;
+                    }
                     for k in 0..part.rows {
                         let position = first_cell + k;
                         writer
@@ -1263,6 +1644,9 @@ impl Conductor {
                 }),
             )
             .map_err(full)?;
+        if let Some(cache) = &mut self.cache {
+            cache.write_copies(&mut writer).map_err(full)?;
+        }
         writer.finish().map_err(full)
     }
 
@@ -1278,8 +1662,16 @@ impl Conductor {
             row0 += part.rows;
             let a = self.slots[part.slot as usize].as_mut().expect("running");
             let before = a.completion;
+            // Where the recurrent state is after the rows.
+            let mut reached = part.from + u64::from(part.rows);
             match part.kind {
                 PartKind::Prefill { completes } => {
+                    if part.replay {
+                        a.replay_left -= part.rows;
+                        a.replayed += part.rows;
+                    } else {
+                        a.computed += part.rows;
+                    }
                     // The rows that ran are certain: their tokens are text
                     // now, for every sequence to draft from. A request that
                     // came back computes rows whose tokens are there already.
@@ -1344,20 +1736,6 @@ impl Conductor {
                             (0..known).take_while(|&i| picks[i].token == a.lookup[i]).count();
                         a.drafter.observe(&mut self.corpus, known, right);
                     }
-                    // The devices commit the newest token's row and the
-                    // accepted drafts to recurrent state with the next step.
-                    if drafts > 0 {
-                        self.commits.push(Commit {
-                            row0: first_row,
-                            rows: part.rows,
-                            slot: part.slot,
-                            accepted: 1 + accepted as u32,
-                        });
-                    }
-                    // The newest token's row and the accepted drafts keep
-                    // their cells; the rejected rows are cut from the table.
-                    let keep = a.cells.len() - u64::from(part.rows) + 1 + accepted as u64;
-                    a.cells.truncate(&mut self.pool, keep);
                     self.scratch_tokens.clear();
                     self.scratch_tokens.extend(picks[..=accepted].iter().map(|p| p.token));
                     a.accept(
@@ -1367,12 +1745,55 @@ impl Conductor {
                         &mut self.corpus,
                         &self.scratch_tokens,
                     );
+                    // A request that ends inside the accepted rows keeps
+                    // those that came before its end: its state and its cells
+                    // stop there.
+                    let consumed = (a.completion - before) as usize;
+                    // The devices commit the newest token's row and the
+                    // accepted drafts to recurrent state with the next step.
+                    if drafts > 0 {
+                        self.commits.push(Commit {
+                            row0: first_row,
+                            rows: part.rows,
+                            slot: part.slot,
+                            accepted: consumed as u32,
+                        });
+                    }
+                    // The newest token's row and the accepted drafts keep
+                    // their cells; the rejected rows are cut from the table.
+                    let keep = a.cells.len() - u64::from(part.rows) + consumed as u64;
+                    a.cells.truncate(&mut self.pool, keep);
+                    reached = part.from + consumed as u64;
                 }
             }
             let produced = a.completion - before;
             if produced > 0 {
                 self.stats.counters.tokens += u64::from(produced);
                 self.admission.generated(a.seq, produced);
+            }
+            // The cache: the pages that are full now enter the index, and a
+            // checkpoint is taken where the rows ended on a position that is
+            // due one (the rows were cut to end there).
+            if let Some(cache) = &mut self.cache {
+                let settled = a.cells.len();
+                cache.index.publish(
+                    &mut self.pool,
+                    &mut a.cells,
+                    &mut a.chain,
+                    &a.tokens,
+                    settled,
+                    Priority::NORMAL,
+                );
+                if let Some(at) =
+                    cache.capture(u64::from(a.prompt_len), a.checkpoint_at, part.from, reached)
+                    && at == reached
+                {
+                    let page = (at / u64::from(self.pool.cells_per_page())) as usize;
+                    let saved = cache.save(part.slot, a.chain.hashes()[page - 1], a.owner);
+                    self.stats.counters.checkpoints_saved += u64::from(saved.taken);
+                    self.stats.counters.checkpoints_dropped += u64::from(saved.dropped);
+                    a.checkpoint_at = at;
+                }
             }
         }
     }

@@ -133,6 +133,25 @@ pub enum ModelError {
     Aborted,
 }
 
+/// What a model offers the prefix cache: its device side carries out the
+/// copies and the replay segments of the step record (see [`RecordView`](crate::RecordView)),
+/// so that a prompt can start from pages and checkpoints that earlier requests
+/// left.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PrefixCache {
+    /// The bytes one checkpoint of the model's recurrent state takes on each
+    /// device, in the order of the device parts. All zero for a model without
+    /// recurrent state, which needs no checkpoints and replays nothing.
+    pub checkpoint_bytes: Vec<u64>,
+}
+
+impl PrefixCache {
+    /// The bytes of one checkpoint on all devices together.
+    pub fn bytes(&self) -> u64 {
+        self.checkpoint_bytes.iter().sum()
+    }
+}
+
 /// What a device part is built from.
 #[derive(Debug)]
 pub struct DeviceContext<'a> {
@@ -313,6 +332,18 @@ pub trait Model: Send + Sync + 'static {
     /// flag and no tokens for its draft rows.
     fn own_drafts(&self) -> u32 {
         0
+    }
+
+    /// `Some` when the model's device side carries out the state copies, the
+    /// page copies and the replay segments of the step record and keeps the
+    /// places for checkpoints, which makes the runtime cache the pages and
+    /// the recurrent state of prompts and start new prompts from them. The
+    /// default is `None`: a model whose device side does not do this has no
+    /// prefix cache, and every prompt is computed from its first token. A model
+    /// with recurrent state must not answer `Some` before its device side
+    /// restores, saves and replays: it would resume from state that is not there.
+    fn prefix_cache(&self) -> Option<PrefixCache> {
+        None
     }
 
     /// The page-table entry of pool page `page`, as the model's kernels read

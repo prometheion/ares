@@ -38,6 +38,16 @@ pub struct RuntimeConfig {
     /// before any request has finished. The accounting corrects it from
     /// what finished requests really used.
     pub output_ratio: f64,
+    /// The most bytes all checkpoints of recurrent state may take together, on
+    /// all devices. A checkpoint is where a prompt that starts from the prefix
+    /// cache restores the state of the model's recurrent layers; without one
+    /// it replays every cached row. 0 keeps none. Only a model whose
+    /// [`crate::Model::prefix_cache`] says it has recurrent state uses it.
+    pub checkpoint_budget: u64,
+    /// The least distance in cells between checkpoints inside a prompt, and
+    /// while generating (`ares_state::CheckpointPolicy`).
+    pub checkpoint_prompt_interval: u32,
+    pub checkpoint_generation_interval: u32,
     /// The most rows of a step; 0 for the model's own maximum.
     pub max_rows: u32,
     /// Whether drafts are proposed and verified.
@@ -82,6 +92,9 @@ impl Default for RuntimeConfig {
             max_slots: 256,
             output_clip: 4096,
             output_ratio: 0.7,
+            checkpoint_budget: 0,
+            checkpoint_prompt_interval: 32_768,
+            checkpoint_generation_interval: 2048,
             max_rows: 0,
             speculation: true,
             drafters: Drafters::Both,

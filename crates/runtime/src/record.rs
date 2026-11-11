@@ -28,6 +28,8 @@
 //! | commit record | 8 + 8 each | a kernel header and the segments of the last step whose rows were drafts, with the rows that were accepted |
 //! | updates | 3 each | sequence slot, first page-table entry, number of entries |
 //! | entries | 1 each | page-table entries, for the updates in order |
+//! | state copies | 3 each | 0 save or 1 restore, sequence slot, checkpoint place |
+//! | page copies | 3 each | page to copy from, page to copy to, cells to copy |
 //!
 //! A segment is **direct** when all of its rows are certain to be accepted (a
 //! slice of a prompt, a generation row without drafts): the recurrent kernels
@@ -43,6 +45,35 @@
 //! them into the token array of the device's copy of the record. The host
 //! reads them back with the picks.
 //!
+//! # The prefix cache
+//!
+//! A prompt that starts from cached pages carries three more things.
+//!
+//! - A **replay** segment (flag 4, always direct too): rows of a prompt whose
+//!   cells are cached already. They rebuild the recurrent state: each row
+//!   attends the cells of its own sequence, its own cell included, and appends
+//!   nothing to the pages, which other sequences read. They have no logits
+//!   wanted. A segment is replay or it is not; the conductor never puts
+//!   replay rows and rows that append in one segment, nor two segments of one
+//!   slot in one step.
+//! - **State copies**: a *save* copies the recurrent state of a slot into a
+//!   checkpoint place, a *restore* copies a place into the slot. A place is
+//!   a number below the budget of checkpoints; the model's device part holds
+//!   that many places.
+//! - **Page copies**: the first `cells` cells of page `from` go into page
+//!   `to`, for every part of the state that lives in pages. This is the copy
+//!   on write of a shared, partly used page ([`ares_state::CopyOnWrite`]).
+//!
+//! **The order on a device** is: the commit of the step before (its record
+//! is this one's commit record), the saves, the page copies, the restores, the
+//! rows. The saves come after the commit because a save names the position the
+//! committed rows reached; they come before everything that writes a slot, so
+//! that a slot a finished request left may be taken by the next request in
+//! the very record that saves the state it left; the restores come before
+//! the rows that read the restored state. The conductor never restores a place
+//! that a later save of the same record overwrites, and a restore may read
+//! a place that an earlier save of the same record wrote.
+//!
 //! The *context* is a number the host derives from the sequence's tokens up to
 //! and including the row's token. A real model has no use for it (attention
 //! reads the sequence's pages); the synthetic model has no attention kernel,
@@ -53,12 +84,16 @@ use ares_cuda::{SampleParams, SampleRow, Segment, StepDims};
 const MAGIC: u32 = 0x5354_4550;
 /// Bytes of the kernels' header.
 const KERNEL_HEADER: usize = 32;
+/// Words of both headers.
+const HEADER_WORDS: usize = 32;
 /// Bytes of both headers.
-const HEADERS: usize = KERNEL_HEADER + 64;
+const HEADERS: usize = HEADER_WORDS * 4;
 const SEG_BYTES: usize = 32;
 const FLAG_DIRECT: u32 = 1;
 /// The rows after the first take the tokens the model drafts itself.
 const FLAG_OWN_DRAFTS: u32 = 2;
+/// The rows rebuild recurrent state from cached cells and append nothing.
+const FLAG_REPLAY: u32 = 4;
 
 // Word indices in the runtime header.
 const H_MAGIC: usize = 8;
@@ -75,6 +110,10 @@ const H_OFF_ENTRIES: usize = 18;
 const H_MAX_SEG_ROWS: usize = 19;
 const H_MAX_COMMIT_ROWS: usize = 20;
 const H_OFF_SAMPLERS: usize = 21;
+const H_STATE_COPIES: usize = 22;
+const H_OFF_STATE_COPIES: usize = 23;
+const H_PAGE_COPIES: usize = 24;
+const H_OFF_PAGE_COPIES: usize = 25;
 
 /// One row of a step: a token of a sequence at a position.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -94,6 +133,32 @@ pub struct TableUpdate {
     pub slot: u32,
     pub first: u32,
     pub count: u32,
+}
+
+/// What a state copy does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StateCopyKind {
+    /// The slot's recurrent state goes into the place.
+    Save,
+    /// The place goes into the slot's recurrent state.
+    Restore,
+}
+
+/// A copy of the recurrent state of the sequence in `slot` to or from a
+/// checkpoint place; see the module documentation for where it runs in a step.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StateCopy {
+    pub kind: StateCopyKind,
+    pub slot: u32,
+    pub place: u32,
+}
+
+/// The first `cells` cells of page `from` go into page `to`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PageCopy {
+    pub from: u32,
+    pub to: u32,
+    pub cells: u32,
 }
 
 /// The outcome of a draft window of the step before: of the rows
@@ -116,7 +181,10 @@ pub fn max_bytes(max_rows: u32, max_slots: u32) -> usize {
     let (rows, slots) = (max_rows as usize, max_slots as usize);
     // A segment and a commit per sequence at worst, a run per row; a step
     // creates at most one page per row and re-dirties at most one entry per
-    // sequence, and a sequence has at most one update.
+    // sequence, and a sequence has at most one update. A slot has at most a
+    // save at a position it reached, a save of the state it ends with and the
+    // restore of the sequence that takes it next, between two records; a
+    // sequence copies at most one page.
     let segments = slots.min(rows.max(1));
     let bytes = HEADERS
         + SEG_BYTES * segments
@@ -125,6 +193,8 @@ pub fn max_bytes(max_rows: u32, max_slots: u32) -> usize {
         + SEG_BYTES * slots
         + slots * 12
         + (rows + 2 * slots) * 4
+        + slots * 3 * 12
+        + segments * 12
         + 16 * 8;
     bytes.next_multiple_of(256)
 }
@@ -150,7 +220,7 @@ pub struct RecordWriter<'a> {
     off_extra: usize,
     /// The end of what is written after the row arrays.
     end: usize,
-    header: [u32; 24],
+    header: [u32; HEADER_WORDS],
 }
 
 impl<'a> RecordWriter<'a> {
@@ -164,7 +234,7 @@ impl<'a> RecordWriter<'a> {
         if end > buf.len() {
             return Err(RecordFull { capacity: buf.len() });
         }
-        let mut header = [0u32; 24];
+        let mut header = [0u32; HEADER_WORDS];
         header[0] = n_rows;
         header[1] = n_segs;
         header[4] = off_segs as u32;
@@ -174,7 +244,15 @@ impl<'a> RecordWriter<'a> {
         header[H_MAGIC] = MAGIC;
         header[H_STEP] = step as u32;
         header[H_OFF_EXTRA] = off_extra as u32;
-        for h in [H_OFF_RUNS, H_OFF_SAMPLERS, H_OFF_COMMIT, H_OFF_UPDATES, H_OFF_ENTRIES] {
+        for h in [
+            H_OFF_RUNS,
+            H_OFF_SAMPLERS,
+            H_OFF_COMMIT,
+            H_OFF_UPDATES,
+            H_OFF_ENTRIES,
+            H_OFF_STATE_COPIES,
+            H_OFF_PAGE_COPIES,
+        ] {
             header[h] = end as u32;
         }
         Ok(Self {
@@ -228,6 +306,20 @@ impl<'a> RecordWriter<'a> {
         let capacity = self.buf.len();
         let word = self.buf.get_mut(at..at + 4).ok_or(RecordFull { capacity })?;
         let flags = u32::from_le_bytes([word[0], word[1], word[2], word[3]]) | FLAG_OWN_DRAFTS;
+        word.copy_from_slice(&flags.to_le_bytes());
+        Ok(())
+    }
+
+    /// Marks the segment written last as a replay: its rows rebuild recurrent
+    /// state from cells that are cached already and append nothing. A replay
+    /// is direct.
+    pub fn replay(&mut self) -> Result<(), RecordFull> {
+        assert!(self.segs_written > 0, "a segment was written");
+        let at = HEADERS + (self.segs_written as usize - 1) * SEG_BYTES + 20;
+        let capacity = self.buf.len();
+        let word = self.buf.get_mut(at..at + 4).ok_or(RecordFull { capacity })?;
+        let flags =
+            u32::from_le_bytes([word[0], word[1], word[2], word[3]]) | FLAG_REPLAY | FLAG_DIRECT;
         word.copy_from_slice(&flags.to_le_bytes());
         Ok(())
     }
@@ -358,6 +450,33 @@ impl<'a> RecordWriter<'a> {
         Ok(())
     }
 
+    /// The copies of recurrent state and of pages that run before the rows of
+    /// this step, in the order the module documentation gives.
+    pub fn copies(&mut self, states: &[StateCopy], pages: &[PageCopy]) -> Result<(), RecordFull> {
+        let off_states = self.end;
+        let mut at = off_states;
+        for copy in states {
+            let kind = match copy.kind {
+                StateCopyKind::Save => 0,
+                StateCopyKind::Restore => 1,
+            };
+            self.put(at, &[kind, copy.slot, copy.place])?;
+            at += 12;
+        }
+        let off_pages = align(at);
+        at = off_pages;
+        for copy in pages {
+            self.put(at, &[copy.from, copy.to, copy.cells])?;
+            at += 12;
+        }
+        self.header[H_STATE_COPIES] = states.len() as u32;
+        self.header[H_OFF_STATE_COPIES] = off_states as u32;
+        self.header[H_PAGE_COPIES] = pages.len() as u32;
+        self.header[H_OFF_PAGE_COPIES] = off_pages as u32;
+        self.end = align(at);
+        Ok(())
+    }
+
     /// Writes the headers and returns the bytes used, a multiple of 16 so the
     /// copy is a whole number of the device's transfer units.
     pub fn finish(mut self) -> Result<usize, RecordFull> {
@@ -386,7 +505,7 @@ pub enum RecordError {
 #[derive(Clone, Copy, Debug)]
 pub struct RecordView<'a> {
     bytes: &'a [u8],
-    header: [u32; 24],
+    header: [u32; HEADER_WORDS],
 }
 
 impl<'a> RecordView<'a> {
@@ -394,7 +513,7 @@ impl<'a> RecordView<'a> {
         if bytes.len() < HEADERS {
             return Err(RecordError::Short);
         }
-        let mut header = [0u32; 24];
+        let mut header = [0u32; HEADER_WORDS];
         for (slot, chunk) in header.iter_mut().zip(bytes.as_chunks::<4>().0) {
             *slot = u32::from_le_bytes(*chunk);
         }
@@ -419,6 +538,8 @@ impl<'a> RecordView<'a> {
                 },
             header[H_OFF_UPDATES] as usize + header[H_UPDATES] as usize * 12,
             header[H_OFF_ENTRIES] as usize + header[H_ENTRIES] as usize * 4,
+            header[H_OFF_STATE_COPIES] as usize + header[H_STATE_COPIES] as usize * 12,
+            header[H_OFF_PAGE_COPIES] as usize + header[H_PAGE_COPIES] as usize * 12,
         ];
         if ends.iter().any(|end| *end > bytes.len()) {
             return Err(RecordError::Truncated);
@@ -494,6 +615,13 @@ impl<'a> RecordView<'a> {
         self.word(self.header[4] as usize + i as usize * SEG_BYTES + 20) & FLAG_OWN_DRAFTS != 0
     }
 
+    /// Whether segment `i` is a replay: its rows rebuild recurrent state from
+    /// cached cells and append nothing.
+    pub fn replay(&self, i: u32) -> bool {
+        assert!(i < self.segments(), "segment {i} of {}", self.segments());
+        self.word(self.header[4] as usize + i as usize * SEG_BYTES + 20) & FLAG_REPLAY != 0
+    }
+
     /// The byte offset of the token array (a u32 per row) in the record.
     pub fn tokens_offset(&self) -> u64 {
         u64::from(self.header[5])
@@ -560,6 +688,34 @@ impl<'a> RecordView<'a> {
                 },
             )
         })
+    }
+
+    /// The number of copies of recurrent state this step starts with.
+    pub fn state_copies(&self) -> u32 {
+        self.header[H_STATE_COPIES]
+    }
+
+    /// State copy `i`, in the order they run.
+    pub fn state_copy(&self, i: u32) -> StateCopy {
+        assert!(i < self.state_copies(), "state copy {i} of {}", self.state_copies());
+        let at = self.header[H_OFF_STATE_COPIES] as usize + i as usize * 12;
+        let kind = match self.word(at) {
+            0 => StateCopyKind::Save,
+            _ => StateCopyKind::Restore,
+        };
+        StateCopy { kind, slot: self.word(at + 4), place: self.word(at + 8) }
+    }
+
+    /// The number of page copies this step starts with.
+    pub fn page_copies(&self) -> u32 {
+        self.header[H_PAGE_COPIES]
+    }
+
+    /// Page copy `i`, in the order they run.
+    pub fn page_copy(&self, i: u32) -> PageCopy {
+        assert!(i < self.page_copies(), "page copy {i} of {}", self.page_copies());
+        let at = self.header[H_OFF_PAGE_COPIES] as usize + i as usize * 12;
+        PageCopy { from: self.word(at), to: self.word(at + 4), cells: self.word(at + 8) }
     }
 
     pub fn update(&self, i: u32) -> TableUpdate {
@@ -738,6 +894,54 @@ mod tests {
         w.commits(&commits).unwrap();
         w.updates((0..256).map(|slot| TableUpdate { slot, first: 0, count: 1 }), 0..(64 + 2 * 256))
             .unwrap();
+        // Every slot saves twice and restores once, and every sequence of the
+        // step copies a page.
+        let states: Vec<StateCopy> = (0..256)
+            .flat_map(|slot| {
+                [StateCopyKind::Save, StateCopyKind::Save, StateCopyKind::Restore]
+                    .map(|kind| StateCopy { kind, slot, place: slot })
+            })
+            .collect();
+        let pages: Vec<PageCopy> =
+            (0..64).map(|i| PageCopy { from: i, to: 64 + i, cells: 3 }).collect();
+        w.copies(&states, &pages).unwrap();
         assert!(w.finish().unwrap() <= bytes);
+    }
+
+    #[test]
+    fn replay_segments_and_the_copies_of_a_step_read_back_as_written() {
+        let mut buf = vec![0x77u8; 2048];
+        let mut w = RecordWriter::new(&mut buf, 5, 3, 4).unwrap();
+        w.segment(2, 32, 2, true).unwrap();
+        w.replay().unwrap();
+        w.row(Row { slot: 2, position: 32, token: 1, context: 1 }).unwrap();
+        w.row(Row { slot: 2, position: 33, token: 2, context: 2 }).unwrap();
+        w.segment(3, 40, 1, false).unwrap();
+        w.row(Row { slot: 3, position: 40, token: 3, context: 3 }).unwrap();
+        w.segment(4, 0, 1, true).unwrap();
+        w.row(Row { slot: 4, position: 0, token: 4, context: 4 }).unwrap();
+        w.runs(&[(2, 2)]).unwrap();
+        let states = [
+            StateCopy { kind: StateCopyKind::Save, slot: 3, place: 9 },
+            StateCopy { kind: StateCopyKind::Restore, slot: 2, place: 4 },
+        ];
+        let pages = [PageCopy { from: 12, to: 30, cells: 5 }];
+        w.copies(&states, &pages).unwrap();
+        let with_copies = w.finish().unwrap();
+        let record = RecordView::new(&buf[..with_copies]).unwrap();
+        assert_eq!(with_copies % 16, 0);
+        assert!(record.replay(0) && !record.replay(1) && !record.replay(2));
+        assert!(record.segment(0).direct, "a replay is direct");
+        assert!(!record.own_drafts(0));
+        assert_eq!((record.state_copies(), record.page_copies()), (2, 1));
+        assert_eq!((record.state_copy(0), record.state_copy(1)), (states[0], states[1]));
+        assert_eq!(record.page_copy(0), pages[0]);
+
+        // A record without copies has none, and one cut short of them is refused.
+        let (plain, used) = sample();
+        let plain = RecordView::new(&plain[..used]).unwrap();
+        assert_eq!((plain.state_copies(), plain.page_copies()), (0, 0));
+        assert!(!plain.replay(0));
+        assert_eq!(RecordView::new(&buf[..with_copies - 16]).unwrap_err(), RecordError::Truncated);
     }
 }

@@ -641,7 +641,9 @@ impl Claims<'_> {
                     arrival: Arrival {
                         seq: victim,
                         prompt_cells: was.prompt_cells,
-                        cached_cells: was.prompt_cells - was.prompt_rows_left,
+                        // A request that comes back from an earlier spill may owe more
+                        // rows than its prompt has (`set_recompute`).
+                        cached_cells: was.prompt_cells.saturating_sub(was.prompt_rows_left),
                         idle_cached_pages: 0,
                         max_new_tokens: was.max_new_tokens,
                     },
@@ -1108,5 +1110,32 @@ mod tests {
         a.finished(SeqId(2));
         a.finished(SeqId(5));
         assert_eq!(pass(&mut a, 1000, 0).admit, [SeqId(3), SeqId(4)]);
+    }
+
+    #[test]
+    fn a_request_that_gives_way_again_while_it_recomputes_more_rows_than_its_prompt_has() {
+        let mut a = Admission::new(config(10));
+        a.enqueue(arrival(1, 4, 0, 64)).unwrap();
+        a.enqueue(arrival(2, 4 * PER_PAGE, 0, 64)).unwrap();
+        assert_eq!(pass(&mut a, 10, 0).admit.len(), 2);
+        // The second has produced more, so the first gives way.
+        a.generated(SeqId(2), 5);
+        let mut claims = a.begin(0);
+        claims.claim(SeqId(1), 1, 0, 0);
+        claims.claim(SeqId(2), 1, 0, 0);
+        assert_eq!(claims.settle(&mut View::new(0)).spill, [SeqId(1)]);
+
+        // It comes back owing 40 rows of a prompt of 4 cells: what it wrote
+        // while it ran, which the runtime computes again.
+        a.set_recompute(SeqId(1), 40);
+        assert_eq!(pass(&mut a, 10, 0).resume, [SeqId(1)]);
+
+        // And gives way again before it has computed them.
+        a.generated(SeqId(2), 50);
+        let mut claims = a.begin(0);
+        claims.claim(SeqId(1), 1, 0, 0);
+        claims.claim(SeqId(2), 1, 0, 0);
+        assert_eq!(claims.settle(&mut View::new(0)).spill, [SeqId(1)]);
+        assert_eq!(a.waiting(), 1);
     }
 }

@@ -12,8 +12,11 @@
 //! All times are wall-clock time of the host, except those named `device`,
 //! which come from timed events on the device's stream.
 
+use std::collections::VecDeque;
 use std::fmt;
 use std::time::Duration;
+
+use ares_api::RequestId;
 
 /// The most recent samples kept per series for percentiles.
 pub const DEFAULT_WINDOW: usize = 8192;
@@ -273,10 +276,53 @@ pub struct Counters {
     /// Draft rows that were dropped from a step because their pages did not
     /// fit.
     pub draft_rows_cut: u64,
+    /// Starts of a request that took cells from the prefix cache, and the
+    /// cells they took (a request that gave way and came back counts again).
+    pub prefix_hits: u64,
+    pub cached_cells: u64,
+    /// Rows run again to rebuild recurrent state from cached cells.
+    pub replay_rows: u64,
+    /// Checkpoints of recurrent state taken, restored by a start, and dropped
+    /// again (for the budget, or with the page they were on).
+    pub checkpoints_saved: u64,
+    pub checkpoints_restored: u64,
+    pub checkpoints_dropped: u64,
+    /// Cached pages given up because a step needed the room, and of them the
+    /// pages given up late: a claim the accounting had granted found the pool
+    /// short, because it had counted pages as evictable that a sequence held.
+    /// That is a miscount, which the pass makes good; it stays 0 when the
+    /// accounting is right.
+    pub cache_pages_evicted: u64,
+    pub cache_pages_evicted_late: u64,
+    /// Pages copied before a sequence wrote into a page that others read.
+    pub page_copies: u64,
+    /// Requests that were held back, once or more, because another sequence
+    /// was computing the first page of their prompt that was not cached.
+    pub requests_held: u64,
     /// How the conductor's waits for the devices ended.
     pub conductor_wakes: crate::sync::WakeCounts,
     /// How the device threads' waits for work ended.
     pub device_wakes: crate::sync::WakeCounts,
+}
+
+/// How many requests that ended a [`Snapshot`] reports.
+pub const REPORTED_REQUESTS: usize = 256;
+
+/// What one request that ended took from the prefix cache and what it
+/// computed itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RequestReport {
+    pub id: RequestId,
+    pub prompt_tokens: u32,
+    /// The prompt tokens whose cells came from the prefix cache when the
+    /// request first started: what the request's usage calls cached.
+    pub cached_tokens: u32,
+    /// Rows run again to rebuild recurrent state from cached cells, over all
+    /// the times the request started.
+    pub replayed_rows: u32,
+    /// Rows computed and written for the prompt, and for what a request that
+    /// gave way had written, over all the times the request started.
+    pub computed_rows: u32,
 }
 
 /// The conductor's measurements: owned by the conductor thread, copied out on
@@ -286,6 +332,8 @@ pub struct Stats {
     pub(crate) phases: Vec<Series>,
     pub(crate) devices: Vec<Vec<Series>>,
     pub counters: Counters,
+    /// The last [`REPORTED_REQUESTS`] requests that ended, the oldest first.
+    pub(crate) requests: VecDeque<RequestReport>,
 }
 
 impl Stats {
@@ -296,7 +344,16 @@ impl Stats {
                 .map(|_| DevicePhase::ALL.iter().map(|_| Series::new(window)).collect())
                 .collect(),
             counters: Counters::default(),
+            requests: VecDeque::with_capacity(REPORTED_REQUESTS),
         }
+    }
+
+    /// Notes a request that ended.
+    pub(crate) fn report(&mut self, report: RequestReport) {
+        if self.requests.len() == REPORTED_REQUESTS {
+            self.requests.pop_front();
+        }
+        self.requests.push_back(report);
     }
 
     pub(crate) fn record(&mut self, phase: Phase, ns: u64) {
@@ -322,6 +379,7 @@ impl Stats {
         self.phases.iter_mut().for_each(Series::clear);
         self.devices.iter_mut().flatten().for_each(Series::clear);
         self.counters = Counters::default();
+        self.requests.clear();
     }
 }
 
@@ -334,12 +392,17 @@ pub struct Snapshot {
     pub phases: Vec<(Phase, Summary)>,
     /// Per device, its phases in [`DevicePhase::ALL`] order.
     pub devices: Vec<Vec<(DevicePhase, Summary)>>,
-    /// Pages free and in all, sequences running and requests in line, when
-    /// the copy was made.
+    /// Pages free and in all, the pages and tails the prefix index holds (they
+    /// are not free; a request that needs room evicts them), sequences running
+    /// and requests in line, when the copy was made.
     pub pages_free: u32,
     pub pages_capacity: u32,
+    pub cached_pages: u32,
     pub active: u32,
     pub waiting: u32,
+    /// The last requests that ended, the oldest first: at most
+    /// [`REPORTED_REQUESTS`].
+    pub requests: Vec<RequestReport>,
 }
 
 impl Snapshot {
@@ -347,6 +410,7 @@ impl Snapshot {
         stats: &Stats,
         pages_free: u32,
         pages_capacity: u32,
+        cached_pages: u32,
         active: u32,
         waiting: u32,
     ) -> Self {
@@ -362,9 +426,16 @@ impl Snapshot {
                 .collect(),
             pages_free,
             pages_capacity,
+            cached_pages,
             active,
             waiting,
+            requests: stats.requests.iter().copied().collect(),
         }
+    }
+
+    /// The report of the request `id`, if it ended lately.
+    pub fn request(&self, id: RequestId) -> Option<&RequestReport> {
+        self.requests.iter().rev().find(|report| report.id == id)
     }
 
     /// The summary of a conductor phase.
@@ -448,6 +519,22 @@ impl fmt::Display for Snapshot {
             c.conductor_wakes.parked,
             c.device_wakes.spun,
             c.device_wakes.parked
+        )?;
+        writeln!(
+            f,
+            "prefix cache: {} starts took {} cells, {} rows replayed, {} requests held back, \
+             {} pages copied, {} pages evicted ({} late); checkpoints: {} saved, {} restored, \
+             {} dropped",
+            c.prefix_hits,
+            c.cached_cells,
+            c.replay_rows,
+            c.requests_held,
+            c.page_copies,
+            c.cache_pages_evicted,
+            c.cache_pages_evicted_late,
+            c.checkpoints_saved,
+            c.checkpoints_restored,
+            c.checkpoints_dropped
         )?;
         writeln!(
             f,
@@ -562,16 +649,16 @@ mod tests {
                 DeviceTimes { device_ns: 9_000_000, gap_ns: Some(1_000_000), ..Default::default() };
             stats.record_device(0, &t, 0);
         }
-        let snapshot = Snapshot::new(&stats, 0, 0, 0, 0);
+        let snapshot = Snapshot::new(&stats, 0, 0, 0, 0, 0);
         assert!((snapshot.gpu_wait_share(0) - 0.1).abs() < 1e-9, "{}", snapshot.gpu_wait_share(0));
         stats.reset();
-        assert_eq!(Snapshot::new(&stats, 0, 0, 0, 0).gpu_wait_share(0), 0.0);
+        assert_eq!(Snapshot::new(&stats, 0, 0, 0, 0, 0).gpu_wait_share(0), 0.0);
     }
 
     #[test]
     fn the_table_names_every_phase() {
         let stats = Stats::new(2, 8);
-        let text = Snapshot::new(&stats, 3, 4, 1, 0).to_string();
+        let text = Snapshot::new(&stats, 3, 4, 0, 1, 0).to_string();
         for phase in Phase::ALL {
             assert!(text.contains(phase.name()), "{text}");
         }

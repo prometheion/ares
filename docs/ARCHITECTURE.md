@@ -155,14 +155,14 @@ machine (RTX 4070 + RTX 3060, Qwen3.8-27B) or read from the engines listed in
 | `ares-quant` | CPU reference decoder for every GGUF type; the specification and reference codec of the engine's own KV formats (`f16`, `q8` to `q4`, tiles with a mean, the policy of exact cells) | Done; bit-identical to ggml's C code on fixtures generated from it; the KV formats are pinned by golden files and were measured on the K and V of real models |
 | `ares-cuda` | Driver API bound at run time, devices, memory, streams, events, modules, decode weight kernels for all 28 weight types, prefill weight kernels for eleven, the layer kernels of `qwen35`, attention over the stored K/V formats, the mesh that sums across devices over peer access or the host | Device layer, decode, layer and attention kernels done; prefill kernels verified, their pass over the weights 1.3 times as fast as the fork's whole prefill; tested on both GPUs, with and without peer access |
 | `ares-vulkan` | The same device-level surface on Vulkan; decode and prefill weight kernels for all 28 weight types as compute shaders, the prefill ones on cooperative matrices; sums between devices | Device layer and weight kernels done (23 device, 11 kernel and 9 mesh tests on both GPUs); no layer or attention kernels and no model yet |
-| `ares-state` | Page pool, page tables with copy on write, the prefix index (pages published as they fill, tails, announcements, priority classes), the checkpoint policy for recurrent state, page layouts | Done as bookkeeping; randomised model checks; the conductor does not use the new parts yet |
+| `ares-state` | Page pool, page tables with copy on write, the prefix index (pages published as they fill, tails, announcements, priority classes), the checkpoint policy for recurrent state, page layouts | Done as bookkeeping; randomised model checks; the conductor's prefix cache uses them (see `ares-runtime`) |
 | `ares-store` | State on disk: pages and checkpoints by content hash in segment files, per fingerprint, with a size limit | Done as a store of opaque bytes, tested against restarts, the limit and damaged files; not yet connected to devices |
 | `ares-io` | Reads of weights straight from the model file: io_uring with direct I/O, demand before prefetch, cancel and promote, copies of a file on several drives with the reads spread over them, a map from experts to file ranges, row reads behind a cache | Done, tested against real files and on two drives; 1.4 to 1.7 GiB/s of random expert-sized reads per SSD of the development machine and 2.9 to 3.0 GiB/s over both; the expert store and the n-gram rows of `qwen4exp` read through it |
 | `ares-sched` | Step planner (generation, decision rows and prompts in one step), admission (pages claimed per step, a reservation that corrects itself, a queue instead of refusals), the order of a pass for long prompts of a model with experts, step time model with a term for the context, draft length choice, the lookup drafter on a suffix automaton shared by all sequences | Done; unit and model tests; the conductor uses the planner, admission (without spill), the lookup drafter and the step cost |
 | `ares-weights` | Expert heat, tiers that are elected and fed by reads (admission, protection, guesses bound late, slots given back), slots per layer by need, the waves of experts of a pass, a token table for the first layers, the lookahead distance, routing bias for pruning | Done, unit tested; the expert store uses the slot sets, the heat and the split of slots; guesses, the token table and pruning are not used by a running model yet |
 | `ares-api` | Request, event, decision and error types; the `Engine` trait between HTTP and the runtime (`submit` for generation, `decide` for decisions, `stats`) | Done, unit tested |
 | `ares-server` | The `ares` binary: loads a model on the devices and serves it over an OpenAI-compatible HTTP API, with the plan of devices, split, shares and context made from what the devices report | Serves `qwen35` models (chat and plain completions, streamed and not, timings, metrics, staged shutdown); 101 tests without a GPU and 7 that start the real binary; no router mode, no multimodal input, no tool calls, `/v1/systemone` answers 501 |
-| `ares-runtime` | The conductor thread and one thread per device, the step loop that connects plan, state and kernels, admission, speculation with the lookup drafter and with a model's own drafts, the `Model` trait a model implements, a synthetic model that drives the real kernels, and the expert store (VRAM slots, RAM tier, reads, the CPU computing what is not on a GPU) | Drives `qwen35` on one device, in tensor split and in layer split, with picks made on the device; implements `Engine::submit` (not `decide`); no prefix cache and no spill; the expert store is driven by `qwen4exp`'s own session, not by the conductor |
+| `ares-runtime` | The conductor thread and one thread per device, the step loop that connects plan, state and kernels, admission, speculation with the lookup drafter and with a model's own drafts, the `Model` trait a model implements, a synthetic model that drives the real kernels, and the expert store (VRAM slots, RAM tier, reads, the CPU computing what is not on a GPU) | Drives `qwen35` on one device, in tensor split and in layer split, with picks made on the device; implements `Engine::submit` (not `decide`); the prefix cache is in the conductor and checked against the host executor as an oracle, but `qwen35` has none yet because its device side does not carry out the step record's copies, and there is no spill to RAM (a request that gives way stays in the pool's cache); the expert store is driven by `qwen4exp`'s own session, not by the conductor |
 | `ares-model` | Model architectures: configuration and weight table from a GGUF, a CPU reference of the forward pass with explicit state (window and commit) that GPU implementations are compared with block by block, and the implementation on the devices | `qwen35` (Qwen3.5-0.8B, Qwen3.8-27B) runs through the runtime and the server, with the model's draft block. `qwen4exp` (Qwen3.8-Flash-Next) runs on one or two cards through a session of its own, without drafts. See [Several devices](#several-devices) |
 | `ares-tokenizer` | Text to token ids and back for byte-level BPE (`gpt2` with the `qwen35` pre-tokenizer) as llama.cpp does it, malformed UTF-8 included; control tokens in text only on request; encoding on several threads for long prompts; a streaming decoder that never cuts a character; the chat templates of the model file (Jinja, a dialect of its own that errors on what it does not support) with tools and the generation prompt | Done; token ids equal llama.cpp's on millions of generated and real texts for the three Qwen test models, chat prompts equal on thousands of conversations; about 20 times llama.cpp's encode speed on one core |
 
@@ -193,7 +193,10 @@ requests ──► plan ──► upload step record ──► window ──► 
 2. **Step record.** Everything that varies per step (row to sequence and
    position, page-table changes, draft tokens) is written to one pinned
    buffer and uploaded with one copy per device. Kernels read it there, so
-   launches carry only pointers and sizes.
+   launches carry only pointers and sizes. A prompt that starts from the
+   prefix cache adds replay segments, copies of recurrent state (saved at a
+   position, restored into a slot) and copies of pages (the copy on write of
+   a shared page); the record documents the order they run in.
 3. **Window.** The model enqueues its kernels on every device's stream.
    Position-addressable state is appended; recurrent layers read their base
    state and keep their inputs.
@@ -225,6 +228,9 @@ wait for the end of its step.
 A model plugs in through the `Model` trait (what it is, its split over
 devices, its page layout, and `open` on each device's thread) and
 `DeviceModel::enqueue`, which queues the kernels of a step and never waits.
+A model whose device side carries out the step record's copies and replay
+segments says so (`Model::prefix_cache`, with the bytes of one checkpoint on
+each device) and takes part in the prefix cache; one that does not has none.
 Until a real model exists a synthetic one drives the real kernels: 64 layers
 of two q4_K matrices of 5120 x 17408 each, with sums between devices for the
 tensor split and a hand-over per group of rows for the layer split. Its next
@@ -314,7 +320,9 @@ one array per part, indexed by page number.
 - Checkpoints: state that is not addressable by position (recurrent layers)
   can only be resumed where a copy of it was kept, and a copy is large (75
   MiB as `f16` for Qwen3.8-27B), so `CheckpointPolicy` decides where copies
-  go and which are dropped. Storing them is not built.
+  go and which are dropped. The conductor keeps them as places within a budget
+  of bytes (`RuntimeConfig::checkpoint_budget`); the copies themselves are the
+  device's part, which only the host executor does so far.
   - Where: only at page boundaries and at the end of a tail. Inside a prompt
     at least 32 768 cells apart, while generating at least 2 048, measured
     from the last checkpoint on the sequence's own path; always at the
@@ -351,7 +359,39 @@ one array per part, indexed by page number.
   evicted first, draft rows are cut before anyone gives way, then the
   sequence with the fewest generated tokens is spilled, and victims that
   turn out not to be needed stay. The object decides and reports; the
-  conductor does not use it yet.
+  conductor carries it out.
+- In the conductor (`crates/runtime/src/conductor.rs`, `cache.rs`), for a
+  model that takes part (`Model::prefix_cache`):
+  - A request is looked up when it arrives and again when it starts. It
+    shares the cached pages and a tail, restores the state from the last
+    checkpoint on its path, replays the rows from there to the end of the
+    cached cells (a segment of its own with the replay flag; they read the
+    cells and write none) and computes the rest. A prompt whose first missing
+    page a sequence that already runs has announced is put back in line,
+    held, until the page is published or the announcement withdrawn; a
+    request that arrives in the same pass as the one that computes the page
+    is held after it started.
+  - A page enters the index at the commit that fills it. A prefill step ends
+    at the next position where the policy wants a checkpoint, and so does the
+    window of a generating sequence (its drafts are cut), so the state is
+    exactly there when the save is queued; the save runs with the next
+    record. Replayed rows and rows that write are separate steps.
+  - When a request ends, is cancelled or gives way, its partly used last page
+    is published as a tail and its live state becomes that tail's checkpoint
+    (or the last full page's, on a page boundary). Tails are not published
+    while a request runs: the index would hold a reference that makes it copy
+    its last page at every step. A request that gives way comes back as a
+    prefix hit.
+  - When a step's claims need room, cached pages go from the ends of chains
+    after the requests that start have taken what they share; checkpoints go
+    when their budget is full and with their page.
+  - Per request the runtime reports the prompt tokens that came from the
+    cache (`Usage::cached_prompt_tokens`) and the rows it replayed and
+    computed (`Snapshot::requests`); the counters add them up.
+  - Nothing of this runs for `qwen35` yet: its device side restores no state
+    and copies no page. The host executor does, as an oracle: it keeps the
+    cells of every page and the state of every slot as hashes of all tokens
+    in order, and a row that reads a wrong one picks another token.
 - Decisions ("Jev mode"): choosing among fixed options (a label, a tool, the
   fields of a schema) needs no generation. The options are scored from the
   logits after the shared prompt, and options longer than one token are
@@ -1328,8 +1368,10 @@ order it would be taken up; the source of each idea is in
    kernel chosen by a measurement on the device, staged loads where they
    pay, one launch per row, items of twelve query heads, rows of a prompt
    that share cells; and the K/V formats with a tile mean in a model.
-4. The prefix cache with checkpoints of recurrent state, spill and restore
-   of a sequence, pages that move between VRAM, RAM and `ares-store`.
+4. The prefix cache on the devices (checkpoint places and the copies of the
+   step record for `qwen35`; the conductor's side is done and checked against
+   the host oracle), spill of a sequence to RAM, pages and checkpoints that
+   move between VRAM, RAM and `ares-store`.
 5. A kernel for one to three rows on the device layout that is not slower
    than the integer kernels, so the dense model can hold every matrix in it;
    shares of a tensor split from a measurement at load; device layouts for
