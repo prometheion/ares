@@ -188,6 +188,29 @@ pub fn pages_that_fit(rooms: &[Room], parallel: u32) -> u32 {
         .unwrap_or(0)
 }
 
+/// How much of the VRAM that could hold experts the K/V of the context may
+/// take when the operator names no context, as a divisor: a thirty-second.
+/// Every page of K/V is slots fewer for experts, and a step that misses an
+/// expert waits for the drive; a mixture-of-experts model gets the context
+/// that costs that little, where a dense model gets what is left.
+pub const KV_SHARE_OF_SLOTS: u64 = 32;
+
+/// The pages of K/V and keys that fit in the share of `slot_bytes[d]`, the
+/// bytes device `d` has for expert slots, that [`KV_SHARE_OF_SLOTS`] gives
+/// them, `page_bytes[d]` being a page's bytes there. A device without
+/// attention blocks (0 bytes a page) does not bound the pool.
+pub fn pages_beside_experts(slot_bytes: &[u64], page_bytes: &[u64]) -> u32 {
+    slot_bytes
+        .iter()
+        .zip(page_bytes)
+        .filter(|(_, per_page)| **per_page > 0)
+        .map(|(slots, per_page)| {
+            u32::try_from(slots / KV_SHARE_OF_SLOTS / per_page).unwrap_or(u32::MAX)
+        })
+        .min()
+        .unwrap_or(0)
+}
+
 /// The pages a pool needs to hold `tokens` tokens of state in `parallel`
 /// sequences: the last page of every sequence may be partly used.
 pub fn pool_pages(tokens: u32, parallel: u32) -> u32 {
@@ -339,6 +362,22 @@ mod tests {
         // A device without attention blocks does not bound the pool.
         assert_eq!(pages_that_fit(&[big, Room { per_page: 0, ..small }], 2), 80);
         assert_eq!(pages_that_fit(&[], 1), 0);
+    }
+
+    #[test]
+    fn the_context_of_a_model_with_experts_takes_a_share_of_what_experts_could_use() {
+        let gib = 1u64 << 30;
+        // 19 GiB of slots on two devices, pages of 1.7 MiB on one of them.
+        let pages = pages_beside_experts(&[8 * gib, 11 * gib], &[1_800_000, 0]);
+        assert_eq!(pages, (8 * gib / 32 / 1_800_000) as u32);
+        // The tighter device decides when both hold pages.
+        assert_eq!(
+            pages_beside_experts(&[8 * gib, 11 * gib], &[1_000_000, 4_000_000]),
+            (11 * gib / 32 / 4_000_000) as u32
+        );
+        // No attention anywhere, or no device: nothing bounds, nothing fits.
+        assert_eq!(pages_beside_experts(&[gib], &[0]), 0);
+        assert_eq!(pages_beside_experts(&[], &[]), 0);
     }
 
     #[test]

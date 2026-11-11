@@ -40,10 +40,11 @@ use crate::plan::{
 /// Memory of every device that the engine leaves unreserved: for what the
 /// driver takes besides the engine's own buffers (its context, the kernels'
 /// code) and for whatever else lives on the card.
-const VRAM_HEADROOM: u64 = 256 * MIB;
+pub(crate) const VRAM_HEADROOM: u64 = 256 * MIB;
 
 /// The architectures that have an implementation on the devices.
-pub const IMPLEMENTED: &[&str] = &[ares_model::qwen35::config::ARCHITECTURE];
+pub const IMPLEMENTED: &[&str] =
+    &[ares_model::qwen35::config::ARCHITECTURE, ares_model::qwen4exp::config::ARCHITECTURE];
 
 /// Why a model could not be loaded.
 #[derive(Debug, thiserror::Error)]
@@ -73,14 +74,14 @@ pub enum LoadError {
     Start(String),
 }
 
-fn refuse(message: impl Into<String>) -> LoadError {
+pub(crate) fn refuse(message: impl Into<String>) -> LoadError {
     LoadError::Options(message.into())
 }
 
 /// A device that was opened, and what it had free then.
-struct Held {
-    device: Device,
-    free: u64,
+pub(crate) struct Held {
+    pub(crate) device: Device,
+    pub(crate) free: u64,
 }
 
 /// A model on the devices, being served.
@@ -97,6 +98,10 @@ impl std::fmt::Debug for Loaded {
 }
 
 impl Loaded {
+    pub(crate) fn new(runtime: Runtime, name: String, held: Vec<Held>) -> Self {
+        Self { runtime: Arc::new(runtime), name, held }
+    }
+
     /// The engine to serve.
     pub fn engine(&self) -> Arc<dyn Engine> {
         self.runtime.clone()
@@ -280,11 +285,11 @@ fn pci_link(info: &DeviceInfo) -> Option<String> {
 
 /// The bound on a device's memory bandwidth that it reports, in bits per
 /// second: only its ratio between devices is used.
-fn bandwidth(info: &DeviceInfo) -> f64 {
+pub(crate) fn bandwidth(info: &DeviceInfo) -> f64 {
     f64::from(info.memory_bus_width_bits) * f64::from(info.memory_clock_khz) * 1e3
 }
 
-fn describe(held: &Held) {
+pub(crate) fn describe(held: &Held) {
     let info = held.device.info();
     tracing::info!(
         "device {}: {}, compute capability {}.{}, {} of {} free, memory interface {} bit at {} \
@@ -304,7 +309,7 @@ fn describe(held: &Held) {
 
 /// Says how the devices of a split reach each other. This is the rule of
 /// `ares_cuda::Mesh::new`: the direct route when every pair has peer access.
-fn describe_links(held: &[Held]) -> Result<(), LoadError> {
+pub(crate) fn describe_links(held: &[Held]) -> Result<(), LoadError> {
     if held.len() < 2 {
         return Ok(());
     }
@@ -338,7 +343,7 @@ fn describe_links(held: &[Held]) -> Result<(), LoadError> {
     Ok(())
 }
 
-fn join<T: ToString>(items: impl IntoIterator<Item = T>, with: &str) -> String {
+pub(crate) fn join<T: ToString>(items: impl IntoIterator<Item = T>, with: &str) -> String {
     items.into_iter().map(|item| item.to_string()).collect::<Vec<_>>().join(with)
 }
 
@@ -406,6 +411,92 @@ fn rooms(held: &[Held], footprint: &[Footprint], headroom: u64) -> Vec<Room> {
         .collect()
 }
 
+/// Opens the devices the operator named, or all the driver reports, and says
+/// in the log what each is.
+pub(crate) fn hold_devices(options: &LoadOptions) -> Result<(Vec<u32>, Vec<Held>), LoadError> {
+    let known = ares_cuda::devices()?;
+    if known.is_empty() {
+        return Err(refuse("the driver reports no CUDA device"));
+    }
+    if let Ok((major, minor)) = ares_cuda::driver_version() {
+        tracing::info!(
+            "CUDA driver {major}.{minor}, {} device(s){}",
+            known.len(),
+            match std::env::var_os(ares_cuda::LIBRARY_ENV) {
+                Some(path) =>
+                    format!(", library {} ({})", path.to_string_lossy(), ares_cuda::LIBRARY_ENV),
+                None => String::new(),
+            }
+        );
+    }
+    let ordinals: Vec<u32> = match &options.devices {
+        Some(list) => {
+            for (i, ordinal) in list.iter().enumerate() {
+                if !known.iter().any(|info| info.ordinal == *ordinal) {
+                    return Err(refuse(format!(
+                        "--devices: there is no device {ordinal}; the driver reports {}",
+                        join(known.iter().map(|info| info.ordinal), ", ")
+                    )));
+                }
+                if list[..i].contains(ordinal) {
+                    return Err(refuse(format!("--devices names device {ordinal} twice")));
+                }
+            }
+            list.clone()
+        }
+        None => known.iter().map(|info| info.ordinal).collect(),
+    };
+    if ordinals.is_empty() {
+        return Err(refuse("--devices names no device"));
+    }
+    let mut held = Vec::new();
+    for ordinal in &ordinals {
+        let device = Device::open(*ordinal, Wait::Block)?;
+        let free = device.mem_info()?.free;
+        held.push(Held { device, free });
+        describe(&held[held.len() - 1]);
+    }
+    Ok((ordinals, held))
+}
+
+/// The most host RAM the engine may use: what the operator named, or half of
+/// what the machine has available now. `required` is what the engine needs to
+/// run at all; `nothing` says what is not spared when the machine reports no
+/// available memory.
+pub(crate) fn ram_limit(
+    options: &LoadOptions,
+    required: u64,
+    nothing: &str,
+) -> Result<(u64, String), LoadError> {
+    let available = std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|text| plan::parse_available_ram(&text));
+    let (ram, why_ram) = match options.ram {
+        Some(ram) => (ram, "as asked".to_owned()),
+        None => match available {
+            Some(available) => (
+                plan::default_ram(Some(available)).max(required),
+                format!(
+                    "half of the {} the machine has available now; --ram changes it",
+                    Bytes(available)
+                ),
+            ),
+            None => (
+                required,
+                format!("the machine reports no available memory, so {nothing}; --ram sets it"),
+            ),
+        },
+    };
+    if ram < required {
+        return Err(refuse(format!(
+            "--ram {} is less than the {} the engine needs for its step buffers",
+            Bytes(ram),
+            Bytes(required)
+        )));
+    }
+    Ok((ram, why_ram))
+}
+
 /// Loads the model of `options` and starts the runtime over it. Takes as
 /// long as the weights take to reach the devices; call it from a thread that
 /// may block.
@@ -422,9 +513,15 @@ pub fn load(options: &LoadOptions) -> Result<Loaded, LoadError> {
         "opened the model file"
     );
     let architecture = architecture.ok_or(LoadError::NoArchitecture)?;
-    if !IMPLEMENTED.contains(&architecture.as_str()) {
-        return Err(LoadError::Architecture(architecture));
+    match architecture.as_str() {
+        ares_model::qwen35::config::ARCHITECTURE => load_qwen35(gguf, options, begun),
+        ares_model::qwen4exp::config::ARCHITECTURE => crate::qwen4exp::load(gguf, options, begun),
+        _ => Err(LoadError::Architecture(architecture)),
     }
+}
+
+/// Loads a `qwen35` model: dense, all of it on the devices.
+fn load_qwen35(gguf: Gguf, options: &LoadOptions, begun: Instant) -> Result<Loaded, LoadError> {
     let config = Config::from_gguf(&gguf).map_err(|e| LoadError::Model(e.to_string()))?;
     let weights = Weights::load(&gguf, &config).map_err(|e| LoadError::Model(e.to_string()))?;
     tracing::info!(
@@ -468,48 +565,7 @@ pub fn load(options: &LoadOptions) -> Result<Loaded, LoadError> {
     }
 
     // The devices.
-    let known = ares_cuda::devices()?;
-    if known.is_empty() {
-        return Err(refuse("the driver reports no CUDA device"));
-    }
-    if let Ok((major, minor)) = ares_cuda::driver_version() {
-        tracing::info!(
-            "CUDA driver {major}.{minor}, {} device(s){}",
-            known.len(),
-            match std::env::var_os(ares_cuda::LIBRARY_ENV) {
-                Some(path) =>
-                    format!(", library {} ({})", path.to_string_lossy(), ares_cuda::LIBRARY_ENV),
-                None => String::new(),
-            }
-        );
-    }
-    let ordinals: Vec<u32> = match &options.devices {
-        Some(list) => {
-            for (i, ordinal) in list.iter().enumerate() {
-                if !known.iter().any(|info| info.ordinal == *ordinal) {
-                    return Err(refuse(format!(
-                        "--devices: there is no device {ordinal}; the driver reports {}",
-                        join(known.iter().map(|info| info.ordinal), ", ")
-                    )));
-                }
-                if list[..i].contains(ordinal) {
-                    return Err(refuse(format!("--devices names device {ordinal} twice")));
-                }
-            }
-            list.clone()
-        }
-        None => known.iter().map(|info| info.ordinal).collect(),
-    };
-    if ordinals.is_empty() {
-        return Err(refuse("--devices names no device"));
-    }
-    let mut held = Vec::new();
-    for ordinal in &ordinals {
-        let device = Device::open(*ordinal, Wait::Block)?;
-        let free = device.mem_info()?.free;
-        held.push(Held { device, free });
-        describe(&held[held.len() - 1]);
-    }
+    let (ordinals, mut held) = hold_devices(options)?;
 
     // The model's settings that do not depend on the placement.
     let window_rows = if drafts > 0 { parallel.saturating_mul(drafts + 1) } else { 0 };
@@ -779,35 +835,8 @@ pub fn load(options: &LoadOptions) -> Result<Loaded, LoadError> {
     // Host RAM: one limit for the engine. What it needs to run is taken from
     // it first; the rest is the budget of the checkpoints of recurrent state
     // (the only other user today), which are locked as they come into use.
-    let available = std::fs::read_to_string("/proc/meminfo")
-        .ok()
-        .and_then(|text| plan::parse_available_ram(&text));
     let required = required_ram(&*model, parallel);
-    let (ram, why_ram) = match options.ram {
-        Some(ram) => (ram, "as asked".to_owned()),
-        None => match available {
-            Some(available) => (
-                plan::default_ram(Some(available)).max(required),
-                format!(
-                    "half of the {} the machine has available now; --ram changes it",
-                    Bytes(available)
-                ),
-            ),
-            None => (
-                required,
-                "the machine reports no available memory, so none is spared for checkpoints; \
-                 --ram sets it"
-                    .to_owned(),
-            ),
-        },
-    };
-    if ram < required {
-        return Err(refuse(format!(
-            "--ram {} is less than the {} the engine needs for its step buffers",
-            Bytes(ram),
-            Bytes(required)
-        )));
-    }
+    let (ram, why_ram) = ram_limit(options, required, "none is spared for checkpoints")?;
     let checkpoint = model.prefix_cache().map_or(0, |cache| cache.bytes());
     let runtime_config = RuntimeConfig {
         pages,

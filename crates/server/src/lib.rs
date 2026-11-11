@@ -39,6 +39,7 @@ mod bridge;
 mod error;
 pub mod load;
 pub mod plan;
+mod qwen4exp;
 mod reasoning;
 mod routes;
 mod systemone;

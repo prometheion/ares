@@ -4,7 +4,10 @@
 //! file, Qwen3.5-0.8B); `ARES_TEST_DEVICE` names the device (default 0) and
 //! `ARES_TEST_PORT` the first of the nine ports on 127.0.0.1 the tests
 //! listen on (default 18951). Every test starts its own server, so they can
-//! run one after the other or together:
+//! run one after the other or together. The tests of Qwen3.8-Flash-Next at the
+//! end need `ARES_TEST_QWEN4EXP_MODEL` (the first part of its split file) and
+//! two devices, and are slow: a server loads in about 15 seconds, and the
+//! first answer comes from experts that are still being fetched.
 //!
 //! ```sh
 //! ARES_TEST_CUDA=1 ARES_TEST_QWEN35_MODEL=Qwen3.5-0.8B-Q4_K_M.gguf \
@@ -64,6 +67,8 @@ struct Client {
     address: String,
     /// The name the model is served under.
     model: String,
+    /// How long the server may take for anything before a test fails.
+    limit: Duration,
 }
 
 impl std::ops::Deref for Server {
@@ -166,11 +171,29 @@ impl Server {
     /// until it listens.
     fn start(model: &PathBuf, port: u16, flags: &[&str]) -> Self {
         let device = std::env::var("ARES_TEST_DEVICE").unwrap_or_else(|_| "0".to_owned());
+        Self::start_with(
+            model,
+            port,
+            &["--devices", &device, "--precision", "exact", "--context", "8192"],
+            flags,
+            LIMIT,
+        )
+    }
+
+    /// Starts `ares` with the model and exactly the flags given, and waits
+    /// until it listens; nothing it does takes longer than `limit`.
+    fn start_with(
+        model: &PathBuf,
+        port: u16,
+        base: &[&str],
+        flags: &[&str],
+        limit: Duration,
+    ) -> Self {
         let mut child = Command::new(BIN)
             .arg("--model")
             .arg(model)
-            .args(["--port", &port.to_string(), "--devices", &device])
-            .args(["--precision", "exact", "--context", "8192"])
+            .args(["--port", &port.to_string()])
+            .args(base)
             .args(flags)
             .env_remove("RUST_LOG")
             .stdin(Stdio::null())
@@ -188,7 +211,7 @@ impl Server {
                 }
             }
         });
-        let client = Client { address: format!("127.0.0.1:{port}"), model: String::new() };
+        let client = Client { address: format!("127.0.0.1:{port}"), model: String::new(), limit };
         let mut server = Self { child, lines, log: Vec::new(), client };
         server.wait_for_log("listening");
         let models = server.get("/v1/models").json();
@@ -202,7 +225,7 @@ impl Server {
         loop {
             let line = self
                 .lines
-                .recv_timeout(LIMIT)
+                .recv_timeout(self.limit)
                 .unwrap_or_else(|e| panic!("no log line with {needle:?} ({e}): {:#?}", self.log));
             self.log.push(line.clone());
             if line.contains(needle) {
@@ -228,7 +251,7 @@ impl Server {
     }
 
     fn wait_exit(&mut self) -> ExitStatus {
-        let deadline = Instant::now() + LIMIT;
+        let deadline = Instant::now() + self.limit;
         loop {
             if let Some(status) = self.child.try_wait().unwrap() {
                 return status;
@@ -251,7 +274,7 @@ impl Server {
 impl Client {
     fn connect(&self) -> std::io::Result<TcpStream> {
         let stream = TcpStream::connect(&self.address)?;
-        stream.set_read_timeout(Some(LIMIT))?;
+        stream.set_read_timeout(Some(self.limit))?;
         Ok(stream)
     }
 
@@ -811,4 +834,126 @@ fn a_server_with_no_ram_to_spare_keeps_no_checkpoints_and_answers_as_one_with() 
     );
     assert_eq!(without_second.2, with_second.2, "the second answer, with and without checkpoints");
     without.stop();
+}
+
+// --- Qwen3.8-Flash-Next ----------------------------------------------------
+
+/// How long anything may take with the real Flash-Next: a server loads in
+/// about 15 seconds, and an answer from experts that are still being fetched
+/// can take a minute.
+const SLOW: Duration = Duration::from_secs(900);
+
+/// The first part of the split file of Qwen3.8-Flash-Next, or `None` (and a
+/// note) when the tests of it are not enabled.
+fn flash_model() -> Option<PathBuf> {
+    if std::env::var_os("ARES_TEST_CUDA").is_none() {
+        eprintln!("skipped: set ARES_TEST_CUDA=1 to run the tests that open GPUs");
+        return None;
+    }
+    match std::env::var_os("ARES_TEST_QWEN4EXP_MODEL") {
+        Some(path) => Some(path.into()),
+        None => {
+            eprintln!("skipped: set ARES_TEST_QWEN4EXP_MODEL to the first part of Flash-Next");
+            None
+        }
+    }
+}
+
+/// A server on two devices (`ARES_TEST_DEVICES`, default `0,1`) that spread
+/// the model as `split` says.
+fn flash_server(model: &PathBuf, port: u16, split: &str) -> Server {
+    let devices = std::env::var("ARES_TEST_DEVICES").unwrap_or_else(|_| "0,1".to_owned());
+    Server::start_with(
+        model,
+        port,
+        &["--devices", &devices, "--split", split, "--chat-var", "enable_thinking=false"],
+        &[],
+        SLOW,
+    )
+}
+
+/// The text of a chat answer, checked to be one.
+fn answer(reply: &Reply) -> String {
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    reply.json()["choices"][0]["message"]["content"].as_str().expect("a text").to_owned()
+}
+
+/// Whether `text` says one of `words`, in any case.
+fn mentions(text: &str, words: &[&str]) -> bool {
+    let text = text.to_lowercase();
+    words.iter().any(|w| text.contains(w))
+}
+
+const GERMAN_WORDS: &[&str] = &["licht", "streu", "rayleigh", "wellenl", "atmosph"];
+const ENGLISH_WORDS: &[&str] = &["light", "scatter", "rayleigh", "wavelength", "atmosphere"];
+
+/// Flash-Next through the binary on both devices, in both placements: it
+/// answers in German and in English, two requests at once and a request that
+/// is cancelled while it streams leave the server able to answer, and the
+/// counters say how the experts were found.
+#[test]
+fn flash_next_answers_in_both_placements() {
+    let Some(model) = flash_model() else { return };
+    for (offset, split, placement) in
+        [(0, "tensor", "both devices on every layer"), (1, "layer", "layers 0..")]
+    {
+        let mut server = flash_server(&model, port(offset), split);
+        let log = server.logged().join("\n");
+        assert!(log.contains(placement), "{split}: the plan says where the layers are: {log}");
+        assert!(log.contains("plan: RAM"), "{split}: the plan says where the RAM goes: {log}");
+        let client: &Client = &server;
+        assert_eq!(client.get("/health").body, r#"{"status":"ok"}"#);
+
+        let ask = |question: &str| {
+            let body = client.chat(question, json!({"max_tokens": 80, "temperature": 0}));
+            client.post("/v1/chat/completions", &body)
+        };
+        let german = ask(GERMAN);
+        let text = answer(&german);
+        eprintln!("RES {split}: German answer {text:?}");
+        assert!(mentions(&text, GERMAN_WORDS), "{split}: a German answer about light: {text:?}");
+        let timings = &german.json()["timings"];
+        assert!(timings["predicted_n"].as_u64().unwrap_or(0) >= 10, "{split}: {timings}");
+        let text = answer(&ask(ENGLISH));
+        eprintln!("RES {split}: English answer {text:?}");
+        assert!(mentions(&text, ENGLISH_WORDS), "{split}: an English answer about light: {text:?}");
+
+        // Two requests at once share the steps.
+        let together: Vec<String> = thread::scope(|scope| {
+            let handles: Vec<_> = [GERMAN, ENGLISH]
+                .into_iter()
+                .map(|question| scope.spawn(move || answer(&ask(question))))
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        assert!(mentions(&together[0], GERMAN_WORDS), "{split}: {:?}", together[0]);
+        assert!(mentions(&together[1], ENGLISH_WORDS), "{split}: {:?}", together[1]);
+
+        // A client that goes away in the middle of an answer frees its place.
+        let body = client.chat(ENGLISH, json!({"max_tokens": 400, "stream": true}));
+        let mut stream = client.send("POST", "/v1/chat/completions", &body.to_string());
+        read_events(&mut stream, 3);
+        drop(stream);
+        eventually("the cancelled request to be counted", || {
+            client.metric("requests_cancelled_total") == 1
+        });
+        let text = answer(&ask(GERMAN));
+        assert!(mentions(&text, GERMAN_WORDS), "{split}: after a cancelled request: {text:?}");
+
+        // How the experts were found.
+        let (picks, hits) =
+            (client.metric("expert_picks_total"), client.metric("expert_hits_total"));
+        let misses = client.metric("expert_misses_ram_total")
+            + client.metric("expert_misses_disk_total")
+            + client.metric("expert_misses_on_their_way_total");
+        eprintln!(
+            "RES {split}: {picks} picks, {hits} in a slot, {misses} not; {} computed on the CPU, {} uploaded",
+            client.metric("expert_cpu_total"),
+            client.metric("expert_uploads_total"),
+        );
+        assert!(picks > 1000 && hits > 0 && hits <= picks, "{split}: {picks} picks, {hits} hits");
+        assert_eq!(picks, hits + misses, "{split}: every pick was a hit or a miss");
+        assert!(client.metric("steps_total") > 100);
+        server.stop();
+    }
 }
