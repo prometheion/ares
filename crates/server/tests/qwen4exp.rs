@@ -5,6 +5,7 @@
 
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
+use std::sync::LazyLock;
 
 use ares_core::GgmlType;
 use ares_model::qwen4exp::synthetic::{Shape, Synthetic, Types};
@@ -36,19 +37,23 @@ fn made_up() -> Synthetic {
     Synthetic { shape, seed: 1, types: Types::Shipped, lazy_type: None }
 }
 
-/// A small model of the architecture, in a file of its own.
-fn model() -> PathBuf {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("qwen4exp-binary");
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("made.gguf");
-    std::fs::write(&path, made_up().bytes_with_experts(GgmlType::IQ2_S, GgmlType::Q2_0)).unwrap();
-    path
+/// A small model of the architecture, in a file of its own. The tests run at
+/// once and share it, so it is written once.
+fn model() -> &'static PathBuf {
+    static PATH: LazyLock<PathBuf> = LazyLock::new(|| {
+        let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("qwen4exp-binary");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("made.gguf");
+        std::fs::write(&path, made_up().bytes_with_experts(GgmlType::IQ2_S, GgmlType::Q2_0))
+            .unwrap();
+        path
+    });
+    &PATH
 }
 
 fn ares(args: &[&str]) -> Output {
-    let path = model();
     Command::new(BIN)
-        .args(["--port", "0", "--model", path.to_str().unwrap()])
+        .args(["--port", "0", "--model", model().to_str().unwrap()])
         .args(args)
         .env_remove("RUST_LOG")
         .stdin(Stdio::null())
