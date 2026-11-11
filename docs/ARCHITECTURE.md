@@ -51,8 +51,11 @@ Scope decisions:
   that hold weights (the float types, the legacy and K quantizations, the
   i-quants, the ternary and 1-bit types, the 4-bit float types), and each has
   its kernels on both backends. Both backends have a decode kernel for every
-  type. The kernels for many rows cover the eleven types of Qwen3.8-27B, the
-  first reference file, and are being extended.
+  type, and the embedding gather decodes every type on both. The Vulkan
+  kernels for many rows cover every type; the CUDA ones cover the eleven
+  types of Qwen3.8-27B, the first reference file, and are being extended.
+  Until they are, the dense model multiplies a matrix of any other type with
+  the decode kernels in launches of eight rows.
 
 - **No engine is the model for this one.** llama.cpp, vLLM, SGLang, Strata
   and the others are references, each for what it does best, and a design is
@@ -989,6 +992,17 @@ kernels are the faster family (6 to 20, by type); above it `matmul` is used.
 Re-measured with all paths: Q4_K 16, IQ4_XS 12, Q6_K 8 to 12 on the RTX 4070
 (unchanged); the RTX 3060 keeps decode ahead up to about 16 for Q6_K.
 
+The other seventeen weight types have no prefill kernel yet (q2_K, the legacy
+types but q8_0, iq2_xxs, iq1_s, iq1_m, the ternary, 4-bit float, 1-bit and
+2-bit types, and the float types). A dense model that has such a matrix takes
+the rows of a prompt through the decode kernels in launches of eight rows
+(`decode_in_batches` in `qwen35/device/choose.rs`): the weights are read once
+for every eight rows, and the matrices that read the same input are
+multiplied that way too, whatever their types. The 2-bit file of Qwen3.8-27B
+(iq2_xxs, iq1_s and q2_K in most blocks) prefills like that. `Precision::Exact`
+has no such way: it is the tile kernels' f16 path, and refuses a matrix in the
+file's layout of one of these types.
+
 A pass over all weight matrices of Qwen3.8-27B (Q4_K_S file, 13.8 GiB) at
 the split 0.625 / 0.375 takes 92 ms with 64 rows, 221 ms with 256, 694 ms
 with 1024 and 1339 ms with 2048: 1529 rows per second at 2048 rows (first
@@ -1002,7 +1016,7 @@ the float types and is to leave the buffer the prefill kernels size.
 
 **Layer kernels** (`kernels/layers.cu`, `ares_cuda::LayerKernels`).
 Everything a block of `qwen35` does between its matrix products: the
-embedding gather (15 weight types), the norms per head, the causal
+embedding gather (all 28 weight types), the norms per head, the causal
 convolution with its window of earlier rows, the gated delta rule as a
 window that reads the state and a commit that writes the accepted prefix,
 the gated output norm and SwiGLU fused with the quantization of the next
