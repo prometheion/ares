@@ -153,6 +153,20 @@ impl GgmlType {
         self.block().1
     }
 
+    /// Whether a model file can hold weights in this type: the float types (F32, F16, BF16),
+    /// the legacy and K quantizations, the i-quants, the ternary and 1-bit types and the 4-bit
+    /// floats. Not the integer types and F64 (not weights), nor Q8_1 and Q8_K (formats of
+    /// activations).
+    pub const fn is_weight(self) -> bool {
+        use GgmlType::*;
+        match self {
+            F32 | F16 | BF16 | Q4_0 | Q4_1 | Q5_0 | Q5_1 | Q8_0 | Q2_K | Q3_K | Q4_K | Q5_K
+            | Q6_K | IQ2_XXS | IQ2_XS | IQ2_S | IQ3_XXS | IQ3_S | IQ1_S | IQ1_M | IQ4_NL
+            | IQ4_XS | TQ1_0 | TQ2_0 | MXFP4 | NVFP4 | Q1_0 | Q2_0 => true,
+            Q8_1 | Q8_K | I8 | I16 | I32 | I64 | F64 => false,
+        }
+    }
+
     /// Whether values are stored in quantized blocks.
     pub const fn is_quantized(self) -> bool {
         self.block_values() > 1
@@ -248,6 +262,18 @@ mod tests {
             seen += 1;
         }
         assert_eq!(seen, ALL_TYPES.len());
+    }
+
+    #[test]
+    fn twenty_eight_types_hold_weights() {
+        let weights: Vec<_> = ALL_TYPES.iter().filter(|t| t.is_weight()).collect();
+        assert_eq!(weights.len(), 28);
+        for ty in [GgmlType::Q8_1, GgmlType::Q8_K, GgmlType::I8, GgmlType::I64, GgmlType::F64] {
+            assert!(!ty.is_weight(), "{ty}");
+        }
+        for ty in [GgmlType::F32, GgmlType::BF16, GgmlType::Q1_0, GgmlType::NVFP4] {
+            assert!(ty.is_weight(), "{ty}");
+        }
     }
 
     #[test]
