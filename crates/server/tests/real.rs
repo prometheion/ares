@@ -884,6 +884,7 @@ fn mentions(text: &str, words: &[&str]) -> bool {
     words.iter().any(|w| text.contains(w))
 }
 
+const HASH_TABLE: &str = "Explain in three sentences how a hash table works.";
 const GERMAN_WORDS: &[&str] = &["licht", "streu", "rayleigh", "wellenl", "atmosph"];
 const ENGLISH_WORDS: &[&str] = &["light", "scatter", "rayleigh", "wavelength", "atmosphere"];
 
@@ -917,6 +918,17 @@ fn flash_next_answers_in_both_placements() {
         let text = answer(&ask(ENGLISH));
         eprintln!("RES {split}: English answer {text:?}");
         assert!(mentions(&text, ENGLISH_WORDS), "{split}: an English answer about light: {text:?}");
+        // And the answer to another question is the CPU reference's, as far
+        // as its first sentence (the reference's greedy tokens are in
+        // `/var/tmp/ares-qwen4exp-trace/english.txt`).
+        let text = answer(&ask(HASH_TABLE));
+        assert!(
+            text.starts_with(
+                "A hash table stores data by mapping keys to specific indices in an array using a \
+                 hash function."
+            ),
+            "{split}: the reference's first sentence: {text:?}"
+        );
 
         // Two requests at once share the steps.
         let together: Vec<String> = thread::scope(|scope| {
