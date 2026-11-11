@@ -109,6 +109,19 @@ pub struct TensorChoice {
     pub shared_on_mixer: bool,
 }
 
+/// What one device's part is built as.
+#[derive(Clone, Debug)]
+pub struct PartPlan {
+    /// What the part is to the residual streams.
+    pub role: Role,
+    /// The first layer it holds or shares.
+    pub first: usize,
+    /// What it holds of each layer from `first` on.
+    pub shares: Vec<LayerShare>,
+    /// Whether it holds the final mixer and the output head.
+    pub head: bool,
+}
+
 /// The split of a model over devices.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Placement {
@@ -121,7 +134,7 @@ pub struct Placement {
 /// Device memory that is set aside next to what the model counts: the
 /// driver rounds every allocation up, and the expert store has tables and
 /// staging of its own.
-const MARGIN: u64 = 32 << 20;
+pub(super) const MARGIN: u64 = 32 << 20;
 
 fn invalid(message: impl Into<String>) -> ModelError {
     ModelError::Invalid(message.into())
@@ -435,6 +448,26 @@ impl Placement {
         tensor.owners = Some(owners);
     }
 
+    /// What device `index` is built as: its role, the layers it holds or
+    /// shares and what it holds of each.
+    pub fn part(&self, c: &Config, index: usize) -> PartPlan {
+        let plan = &self.devices[index];
+        match &self.tensor {
+            Some(tensor) => PartPlan {
+                role: if index == tensor.mixer { Role::Mixer } else { Role::Worker },
+                first: plan.layers.start,
+                shares: tensor.shares[index].clone(),
+                head: plan.head,
+            },
+            None => PartPlan {
+                role: Role::Whole,
+                first: plan.layers.start,
+                shares: plan.layers.clone().map(|layer| LayerShare::whole(c, layer)).collect(),
+                head: plan.head,
+            },
+        }
+    }
+
     /// The number of devices.
     pub fn n_devices(&self) -> usize {
         self.devices.len()
@@ -475,14 +508,15 @@ impl Placement {
 }
 
 /// The bytes of page-locked RAM for the experts' tier in host memory: `want`
-/// when given, otherwise a third of what the system reports available, and
-/// never more than `limit`.
-pub fn ram_tier_bytes(want: Option<u64>, limit: u64) -> u64 {
+/// when given, otherwise half of what the system reports available (the
+/// default of the engine's RAM limit), and never more than `wanted`, what the
+/// experts that VRAM has no slot for take.
+pub fn ram_tier_bytes(want: Option<u64>, wanted: u64) -> u64 {
     let available = || {
         let text = std::fs::read_to_string("/proc/meminfo").ok()?;
         let line = text.lines().find(|l| l.starts_with("MemAvailable:"))?;
         let kib: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
         Some(kib * 1024)
     };
-    want.unwrap_or_else(|| available().map_or(1 << 30, |bytes| bytes / 3)).min(limit)
+    want.unwrap_or_else(|| available().map_or(1 << 30, |bytes| bytes / 2)).min(wanted)
 }

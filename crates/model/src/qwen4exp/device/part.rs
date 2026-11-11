@@ -57,6 +57,7 @@ use ares_cuda::{
 use ares_runtime::ModelError;
 use ares_runtime::expert_store::cpu::act_bytes as cpu_act_bytes;
 
+use super::board::Board;
 use super::load::{
     AttentionW, CoreW, DeviceWeights, LayerShare, LayerW, Mat, MixerW, MoeW, NgramW, RecurrentW,
     Role, SharedW,
@@ -93,8 +94,16 @@ pub struct Options {
     pub window_rows: u32,
     /// Sequences at once: the slots of recurrent state.
     pub max_slots: u32,
-    /// The most cells of a sequence: decides the K/V and key pools.
+    /// The most cells of a sequence: decides the length of a page table.
     pub cells: u32,
+    /// Pages in the pools of K/V and keys, which the driver of the part lays
+    /// out (`StepEnv::pools`); 0 for as many as the page tables have entries,
+    /// so that every sequence slot can own pages of its own.
+    pub pool_pages: u32,
+    /// Whether the logits of the wanted rows are copied to the host
+    /// ([`Part::logits`]). A driver whose sampler reads them on the device
+    /// ([`Part::head_logits`]) leaves it off: a row is a megabyte.
+    pub host_logits: bool,
     /// Where the parts add up the device time of their kernels, by kind.
     pub profile: Option<Arc<Profile>>,
 }
@@ -111,6 +120,8 @@ impl Default for Options {
             window_rows: 0,
             max_slots: 1,
             cells: 4096,
+            pool_pages: 0,
+            host_logits: true,
             profile: None,
         }
     }
@@ -122,9 +133,14 @@ impl Options {
         self.cells.div_ceil(ENTRY_CELLS).max(1)
     }
 
-    /// Pages of the pools: every sequence slot owns its pages from the start.
-    pub fn pages(&self) -> u32 {
+    /// Table entries of all sequence slots together.
+    pub fn table_entries(&self) -> u32 {
         self.max_slots * self.table_stride()
+    }
+
+    /// Pages of the pools.
+    pub fn pages(&self) -> u32 {
+        if self.pool_pages == 0 { self.table_entries() } else { self.pool_pages }
     }
 }
 
@@ -245,6 +261,9 @@ pub struct StepEnv<'a> {
     /// The number of the step's first exchange between a mixer and its
     /// worker; the exchanges of a step are numbered from it, alike on both.
     pub xbase: u32,
+    /// The memory of the pools of K/V and keys on this device: the pages
+    /// times [`Part::page_bytes`] bytes, laid out as [`Frame`] says.
+    pub pools: DevicePtr,
 }
 
 impl std::fmt::Debug for StepEnv<'_> {
@@ -765,8 +784,18 @@ impl Frame {
             + self.owner_bytes
     }
 
+    /// Bytes of page-locked host memory the part holds: the route records
+    /// and rows of `layers` layers, the step's inputs, the mirror of the
+    /// tables and the status word.
+    pub(crate) fn pinned_bytes(&self, opts: &Options, layers: usize) -> u64 {
+        (self.record_stride + self.act_host_stride) * layers as u64
+            + self.inbox.len
+            + self.tables_bytes(opts)
+            + 16
+    }
+
     fn tables_bytes(&self, opts: &Options) -> u64 {
-        (2 * 4 * u64::from(opts.pages())).next_multiple_of(64)
+        (2 * 4 * u64::from(opts.table_entries())).next_multiple_of(64)
     }
 }
 
@@ -811,19 +840,19 @@ pub struct Part {
     attn_shape: AttentionShape,
     scratch: DeviceBuffer,
     state: DeviceBuffer,
-    pools: DeviceBuffer,
     tables: DeviceBuffer,
-    /// The host copy of the attention tables.
+    /// The tables as the host last wrote them, in page-locked memory, which
+    /// the copies of an update read; and the entries of the attention tables
+    /// for the planner.
+    tables_host: PinnedBuffer,
     entries: Vec<u32>,
     kept: Option<DeviceBuffer>,
     records: DeviceBuffer,
-    records_host: PinnedBuffer,
-    /// Per layer the input rows of its mixture of experts as activations,
-    /// and the host's copy of what the CPU reads of them.
+    /// Per layer the input rows of its mixture of experts as activations.
     acts: DeviceBuffer,
-    acts_host: PinnedBuffer,
+    /// What the host reads of the routers: the records and the rows.
+    board: Arc<Board>,
     routed: Vec<Event>,
-    copied: Vec<Event>,
     inbox_host: PinnedBuffer,
     inbox: DeviceBuffer,
     logits_host: PinnedBuffer,
@@ -915,7 +944,6 @@ impl Part {
         }
         let state_bytes = f.slot_bytes * u64::from(opts.max_slots);
         ledger.reserve("qwen4exp recurrent state", state_bytes)?;
-        ledger.reserve("qwen4exp K/V and key pools", f.pool_bytes)?;
         ledger.reserve("qwen4exp step scratch", f.s.len)?;
         let records_bytes = (f.record_stride * w.layers.len() as u64).max(64);
         ledger.reserve("qwen4exp route records", records_bytes)?;
@@ -945,7 +973,6 @@ impl Part {
         }
         let scratch = DeviceBuffer::new(device, f.s.len)?;
         let state = DeviceBuffer::new(device, state_bytes)?;
-        let pools = DeviceBuffer::new(device, f.pool_bytes)?;
         let tables = DeviceBuffer::new(device, tables_bytes)?;
         let kept =
             (f.kept_bytes > 0).then(|| DeviceBuffer::new(device, f.kept_bytes)).transpose()?;
@@ -954,14 +981,21 @@ impl Part {
         state.write(0, &vec![0u8; state_bytes as usize])?;
         scratch.write(f.s.zeros, &vec![0u8; (f.s.xn - f.s.zeros) as usize])?;
         scratch.write(f.s.status, &[0u8; 16])?;
-        // Every sequence slot owns its pages: entry `i` of slot `s` is page
-        // `s * stride + i`, in the pool of stored formats; the key pool has
-        // the same slots.
-        let pages = opts.pages();
-        let entries: Vec<u32> = (0..pages).map(|page| PAGE_ENTRY | page).collect();
-        let mut bytes: Vec<u8> = entries.iter().flat_map(|e| e.to_le_bytes()).collect();
-        bytes.extend((0..pages).flat_map(u32::to_le_bytes));
-        tables.write(0, &bytes)?;
+        // The page tables start as page 0 everywhere: a row that reads an
+        // entry nobody wrote reads a page that exists. A driver writes the
+        // entries of the pages its sequences own ([`Part::update_table`], or
+        // [`Part::own_pages`] for a session without a page pool).
+        let entries = vec![PAGE_ENTRY; opts.table_entries() as usize];
+        let mut start = vec![0u8; tables_bytes as usize];
+        for (word, entry) in start.as_chunks_mut::<4>().0.iter_mut().zip(&entries) {
+            word.copy_from_slice(&entry.to_le_bytes());
+        }
+        tables.write(0, &start)?;
+        let mut tables_host = PinnedBuffer::new(device, tables_bytes as usize)?;
+        // SAFETY: the buffer is `tables_bytes` long and nothing reads it yet.
+        unsafe {
+            std::ptr::copy_nonoverlapping(start.as_ptr(), tables_host.as_mut_ptr(), start.len());
+        }
 
         let stream_events = |n: usize| -> Result<Vec<Event>, ModelError> {
             (0..n).map(|_| Event::new(device).map_err(ModelError::from)).collect()
@@ -1007,25 +1041,29 @@ impl Part {
             },
             scratch,
             state,
-            pools,
             tables,
+            tables_host,
             entries,
             kept,
             records: DeviceBuffer::new(device, records_bytes)?,
-            records_host: PinnedBuffer::new(device, records_bytes as usize)?,
             acts: DeviceBuffer::new(device, acts_bytes)?,
-            acts_host: PinnedBuffer::new(
+            board: Arc::new(Board::new(
                 device,
-                (f.act_host_stride * w.layers.len() as u64).max(64) as usize,
-            )?,
+                w.layers.len(),
+                f.record_stride as usize,
+                f.act_host_stride as usize,
+                c.n_embd,
+            )?),
             routed: stream_events(w.layers.len())?,
-            copied: stream_events(w.layers.len())?,
             inbox_host: PinnedBuffer::new(device, f.inbox.len as usize)?,
             inbox: DeviceBuffer::new(device, f.inbox.len)?,
             logits_host: PinnedBuffer::new(
                 device,
-                (u64::from(opts.logit_rows) * c.n_vocab as u64 * 4 * u64::from(head)).max(16)
-                    as usize,
+                (u64::from(opts.logit_rows)
+                    * c.n_vocab as u64
+                    * 4
+                    * u64::from(head && opts.host_logits))
+                .max(16) as usize,
             )?,
             expert_at: Vec::new(),
             plan: None,
@@ -1084,6 +1122,17 @@ impl Part {
     /// and the step's inputs.
     pub fn scratch_bytes(&self) -> u64 {
         self.f.step_bytes(&self.opts)
+    }
+
+    /// The width of a residual stream, `N`.
+    pub fn n_embd(&self) -> u32 {
+        self.n
+    }
+
+    /// Whether the part holds attention layers, and with them pages of K/V and
+    /// keys in the pools.
+    pub fn has_attention(&self) -> bool {
+        self.attention.is_some()
     }
 
     /// Whether the part holds the output head.
@@ -1249,30 +1298,103 @@ impl Part {
         Ok(bytes.as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)).collect())
     }
 
-    /// The route record of the part's layer `i` as the host has it: valid
-    /// once [`Part::record_arrived`] is true for the step.
+    /// What the host reads of the part's routers, shared with whoever feeds
+    /// the expert store.
+    pub fn board(&self) -> Arc<Board> {
+        self.board.clone()
+    }
+
+    /// The route record of the part's layer `i` as the host has it (see
+    /// [`Board::record`]).
     pub fn route_record(&self, i: usize) -> &[u8] {
-        let stride = self.f.record_stride as usize;
-        // SAFETY: the buffer holds a record per layer, `stride` apart, and
-        // the caller reads it after the copy has finished.
-        unsafe { std::slice::from_raw_parts(self.records_host.as_ptr().add(i * stride), stride) }
+        self.board.record(i)
     }
 
-    /// The input rows of the mixture of experts of the part's layer `i`, as
-    /// the CPU reads them for `rows` rows (the codes and scales of the
-    /// quantized activations): valid with the layer's route record.
-    pub fn route_rows(&self, i: usize, rows: usize) -> &[u8] {
-        let stride = self.f.act_host_stride as usize;
-        let len = cpu_act_bytes(self.n as usize, rows).min(stride);
-        // SAFETY: the buffer holds `stride` bytes per layer, and the caller
-        // reads them after the copy has finished.
-        unsafe { std::slice::from_raw_parts(self.acts_host.as_ptr().add(i * stride), len) }
+    /// Bytes of the pools of K/V and keys the part needs on its device
+    /// (`StepEnv::pools`), for [`Options::pages`] pages.
+    pub fn pool_bytes(&self) -> u64 {
+        self.f.pool_bytes
     }
 
-    /// Whether the route record of the part's layer `i` of the step being
-    /// run has reached the host, with the layer's input rows. Never waits.
-    pub fn record_arrived(&self, i: usize) -> Result<bool, ModelError> {
-        Ok(self.copied[i].is_done()?)
+    /// Entries `first..` of the page table of `slot` are now `entries` (pages
+    /// as the model's `page_entry` writes them); the copies to the device are
+    /// enqueued on `stream` and run before what is enqueued after them.
+    pub fn update_table(
+        &mut self,
+        stream: &Stream,
+        slot: u32,
+        first: u32,
+        entries: impl IntoIterator<Item = u32>,
+    ) -> Result<(), ModelError> {
+        let stride = self.opts.table_stride();
+        let total = self.opts.table_entries() as usize;
+        let at = (slot * stride + first) as usize;
+        let mut count = 0usize;
+        // SAFETY: the mirror holds the kv entries and then the key pages,
+        // `total` words each (`tables_bytes`); `at + count` is checked against
+        // the slot's table before each word is written; the copies of the
+        // step before have run (its stream ran empty).
+        let words = unsafe {
+            std::slice::from_raw_parts_mut(
+                self.tables_host.as_mut_ptr().cast::<u32>(),
+                self.tables_host.len() / 4,
+            )
+        };
+        for entry in entries {
+            if slot >= self.opts.max_slots || first as usize + count >= stride as usize {
+                return Err(invalid(format!(
+                    "page-table entry {} of slot {slot} ({} slots of {stride} entries)",
+                    first as usize + count,
+                    self.opts.max_slots
+                )));
+            }
+            let i = at + count;
+            self.entries[i] = entry;
+            words[i] = entry;
+            words[total + i] = entry & !PAGE_ENTRY;
+            count += 1;
+        }
+        if count > 0 {
+            // SAFETY: both ranges are inside the tables and the mirror.
+            unsafe {
+                stream.copy_from_host(
+                    self.tables.ptr().offset(4 * at as u64),
+                    self.tables_host.as_ptr().add(4 * at),
+                    4 * count,
+                )?;
+                stream.copy_from_host(
+                    self.tables.ptr().offset(4 * (total + at) as u64),
+                    self.tables_host.as_ptr().add(4 * (total + at)),
+                    4 * count,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Gives every sequence slot pages of its own: entry `i` of slot `s` is
+    /// page `s * stride + i`. For a session without a page pool; waits for
+    /// the device.
+    pub fn own_pages(&mut self) -> Result<(), ModelError> {
+        let total = self.opts.table_entries() as usize;
+        if self.opts.pages() as usize != total {
+            return Err(invalid("pages of their own need as many pages as table entries"));
+        }
+        let mut bytes = Vec::with_capacity(8 * total);
+        for i in 0..total as u32 {
+            self.entries[i as usize] = PAGE_ENTRY | i;
+            bytes.extend((PAGE_ENTRY | i).to_le_bytes());
+        }
+        bytes.extend((0..total as u32).flat_map(u32::to_le_bytes));
+        // SAFETY: the mirror is `bytes.len()` long, up to its padding.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                self.tables_host.as_mut_ptr(),
+                bytes.len(),
+            );
+        }
+        Ok(self.tables.write(0, &bytes)?)
     }
 
     /// The logits of the wanted rows of the step that ran last, `n_vocab`
@@ -1284,8 +1406,15 @@ impl Part {
         unsafe { std::slice::from_raw_parts(self.logits_host.as_ptr().cast::<f32>(), n) }
     }
 
+    /// Where the part left the logits of the wanted rows of the step being
+    /// enqueued, on the device: a row of `n_vocab` f32 values each, valid
+    /// once [`Part::end`] has enqueued the head.
+    pub fn head_logits(&self) -> DevicePtr {
+        self.at(self.f.s.head)
+    }
+
     fn logits_host_len(&self) -> usize {
-        if self.w.head.is_some() {
+        if self.w.head.is_some() && self.opts.host_logits {
             self.opts.logit_rows as usize * self.n_vocab as usize * 4
         } else {
             0
@@ -2054,9 +2183,9 @@ impl Part {
         let ib = self.f.inbox;
         let step = self.inbox_at(ib.record);
         let tables = self.tables.ptr();
-        let key_table = self.tables.ptr().offset(4 * u64::from(self.opts.pages()));
-        let kv_pool = self.pools.ptr().offset(at.kv_pool);
-        let key_pool = self.pools.ptr().offset(at.key_pool);
+        let key_table = self.tables.ptr().offset(4 * u64::from(self.opts.table_entries()));
+        let kv_pool = env.pools.offset(at.kv_pool);
+        let key_pool = env.pools.offset(at.key_pool);
         let carry = self.state.ptr().offset(at.carry);
         let carry_stride = self.f.slot_bytes / 4;
         // Taken out for the launches and put back: the marks need the part.
@@ -2253,18 +2382,18 @@ impl Part {
             self.routed[i].record(stream)?;
             self.side.wait_event(&self.routed[i])?;
             self.side.copy_to_host(
-                self.records_host.as_mut_ptr().add(i * self.f.record_stride as usize),
+                self.board.record_dst(i),
                 record,
                 w.shape.record_bytes(rows) as usize,
             )?;
             // The rows as the kernels read them, behind the record: what the
             // CPU needs if it computes an expert the layer misses.
             self.side.copy_to_host(
-                self.acts_host.as_mut_ptr().add(i * self.f.act_host_stride as usize),
+                self.board.rows_dst(i),
                 m,
                 cpu_act_bytes(self.n as usize, rows as usize),
             )?;
-            self.copied[i].record(&self.side)?;
+            self.board.copies_enqueued(i, &self.side)?;
             self.mark(stream, Phase::Experts)?;
             if self.role != Role::Worker
                 && let Some(shared) = &w.shared
@@ -2385,7 +2514,9 @@ impl Part {
             self.mark(stream, Phase::Other)?;
             self.product(stream, &head.output, self.at(s.act_p), self.at(s.head), dims.n_out)?;
             self.mark(stream, Phase::Dense)?;
-            stream.copy_to_host(self.logits_host.as_mut_ptr(), self.at(s.head), bytes)?;
+            if self.opts.host_logits {
+                stream.copy_to_host(self.logits_host.as_mut_ptr(), self.at(s.head), bytes)?;
+            }
         }
         self.mark(stream, Phase::Exchange)?;
         Ok(dims.n_out)

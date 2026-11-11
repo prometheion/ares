@@ -17,18 +17,24 @@
 //! The CPU reference in [`crate::qwen4exp::reference`] is what every path
 //! here is measured against (`tests/qwen4exp_device.rs`).
 
+mod board;
+mod feed;
 mod load;
+mod ngram;
 mod part;
 pub mod placement;
+mod runtime;
 mod session;
 
+pub use board::Board;
 pub use load::{LayerShare, Role};
 pub use part::{
     ExpertAt, Options, PAGE_ENTRY, PHASES, Part, PartSetup, Phase, Ports, Profile, StepEnv,
 };
 pub use placement::{
-    DeviceMemory, DevicePlan, Placement, TensorChoice, TensorPlan, ram_tier_bytes,
+    DeviceMemory, DevicePlan, PartPlan, Placement, TensorChoice, TensorPlan, ram_tier_bytes,
 };
+pub use runtime::{OpenError, Qwen4Exp, place};
 pub use session::{
     Fill, LayerOut, PartReport, Probe, Rows, Session, SessionOptions, Spread, StepTime, Wanted,
     read_time,

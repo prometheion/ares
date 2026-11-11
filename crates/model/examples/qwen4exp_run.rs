@@ -270,6 +270,35 @@ fn store_line(stats: &StoreStats, steps: usize) -> String {
     )
 }
 
+/// What the decode steps cost by what they missed: steps that picked no
+/// expert outside a slot, steps whose misses all came from RAM (or were
+/// computed by the CPU), and steps with at least one expert read from the file.
+fn step_classes(steps: &[(f64, u64, u64, u64, f64)]) -> String {
+    let class = |keep: &dyn Fn(&(f64, u64, u64, u64, f64)) -> bool| {
+        let picked: Vec<_> = steps.iter().filter(|s| keep(s)).collect();
+        if picked.is_empty() {
+            return "none".to_owned();
+        }
+        let n = picked.len() as f64;
+        let mut ms: Vec<f64> = picked.iter().map(|s| s.0).collect();
+        format!(
+            "{} steps ({:.0} %), median {:.2} ms, {:.1} misses and {:.2} ms of n-gram rows each",
+            picked.len(),
+            100.0 * n / steps.len() as f64,
+            median(&mut ms),
+            picked.iter().map(|s| s.1 as f64).sum::<f64>() / n,
+            picked.iter().map(|s| s.4).sum::<f64>() / n,
+        )
+    };
+    format!(
+        "  steps by what they missed: no expert outside a slot: {}; misses served from RAM or the \
+         CPU only: {}; at least one read from the file: {}",
+        class(&|s| s.1 == 0),
+        class(&|s| s.1 > 0 && s.2 == 0),
+        class(&|s| s.2 > 0),
+    )
+}
+
 /// Reads `tokens` as certain rows, eight to a step, and returns the pick
 /// after the last one when `want_last`.
 fn read(
@@ -699,8 +728,13 @@ fn run() -> Result<(), AnyError> {
             session.take_store_stats();
             let mut host = [Duration::ZERO; 4];
             let mut ms = Vec::new();
+            // Per step: its milliseconds, the experts it picked outside a
+            // slot, of which from the file and which the CPU computed, and
+            // the milliseconds the n-gram rows kept it waiting.
+            let mut kinds: Vec<(f64, u64, u64, u64, f64)> = Vec::new();
             let first = tokens.len() - 1;
             for _ in 0..args.decode_steps {
+                let before = session.store().stats().clone();
                 let token = [tokens[tokens.len() - 1]];
                 let picks = session.step(&[Rows {
                     slot: 0,
@@ -711,6 +745,14 @@ fn run() -> Result<(), AnyError> {
                 tokens.push(picks[0]);
                 let time = session.last_time();
                 ms.push(time.wall.as_secs_f64() * 1e3);
+                let after = session.store().stats();
+                kinds.push((
+                    time.wall.as_secs_f64() * 1e3,
+                    (after.picks - after.hits) - (before.picks - before.hits),
+                    after.miss_from_disk - before.miss_from_disk,
+                    after.cpu_experts - before.cpu_experts,
+                    time.rows.as_secs_f64() * 1e3,
+                ));
                 for (total, part) in
                     host.iter_mut().zip([time.prepare, time.rows, time.enqueue, time.wait])
                 {
@@ -743,6 +785,7 @@ fn run() -> Result<(), AnyError> {
                 if timed { ", with timed events" } else { "" },
             );
             println!("  store: {}", store_line(&stats, ms.len()));
+            println!("{}", step_classes(&kinds));
             if timed {
                 breakdown(profile.as_deref(), &session);
             }

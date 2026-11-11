@@ -6,7 +6,7 @@ use std::ops::Range;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use ares_api::{ChatFormat, EngineError, ModelCard, Prompt, Role};
+use ares_api::{ChatFormat, EngineError, ModelCard, Prompt};
 use ares_cuda::{DevicePtr, ENTRY_CELLS, PushSlot, Segment, Stream};
 use ares_gguf::Gguf;
 use ares_runtime::{
@@ -14,7 +14,7 @@ use ares_runtime::{
     PrefixCache, Split, StepContext,
 };
 use ares_state::PageLayout;
-use ares_tokenizer::{ChatOptions, EncodeOptions, Message, Tokenizer};
+use ares_tokenizer::{ChatOptions, Tokenizer};
 
 use super::choose::{Balance, LayoutReport};
 use super::part::{
@@ -217,44 +217,7 @@ impl Model for Qwen35 {
     }
 
     fn encode(&self, prompt: &Prompt) -> Result<Vec<u32>, EngineError> {
-        match prompt {
-            Prompt::Text(text) => Ok(self
-                .tokenizer
-                .encode(text, EncodeOptions { add_special: true, parse_special: false })),
-            Prompt::Chat { messages, tools, variables } => {
-                if tools.as_ref().is_some_and(|t| !t.is_empty())
-                    || messages.iter().any(|m| m.tool_calls.as_ref().is_some_and(|c| !c.is_empty()))
-                {
-                    return Err(EngineError::Unsupported(
-                        "tool definitions and tool calls are not passed to the chat template yet"
-                            .into(),
-                    ));
-                }
-                let messages: Vec<Message> = messages
-                    .iter()
-                    .map(|m| {
-                        let role = match m.role {
-                            Role::System => "system",
-                            Role::User => "user",
-                            Role::Assistant => "assistant",
-                            Role::Tool => "tool",
-                        };
-                        let mut message = Message::new(role, m.content.clone());
-                        message.name = m.name.clone().unwrap_or_default();
-                        message.tool_call_id = m.tool_call_id.clone().unwrap_or_default();
-                        message.reasoning_content = m.reasoning_content.clone().unwrap_or_default();
-                        message
-                    })
-                    .collect();
-                let text = self
-                    .tokenizer
-                    .render_chat(&messages, &[], &chat::with_variables(&self.chat, variables))
-                    .map_err(|e| EngineError::InvalidRequest(format!("chat template: {e}")))?;
-                Ok(self
-                    .tokenizer
-                    .encode(&text, EncodeOptions { add_special: true, parse_special: true }))
-            }
-        }
+        chat::encode(&self.tokenizer, &self.chat, prompt)
     }
 
     fn chat_format(&self) -> Option<ChatFormat> {
@@ -262,9 +225,7 @@ impl Model for Qwen35 {
     }
 
     fn piece(&self, token: u32, text: &mut Vec<u8>) {
-        if let Ok(bytes) = self.tokenizer.piece(token, false) {
-            text.extend_from_slice(bytes);
-        }
+        chat::piece(&self.tokenizer, token, text);
     }
 
     fn context(&self) -> ContextSpec {
