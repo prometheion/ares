@@ -15,7 +15,9 @@ use crate::stream::{Event, Stream};
 
 mod layout;
 
-pub use layout::{ActivationForm, LayoutKernel, LayoutRows, LayoutTable, WeightLayout};
+pub use layout::{
+    ActivationForm, FEW_ROWS, FewPlan, LayoutKernel, LayoutRows, LayoutTable, WeightLayout,
+};
 
 /// The kernel module `build.rs` compiled from `kernels/module.cu`: every GPU
 /// the toolkit builds for can load it.

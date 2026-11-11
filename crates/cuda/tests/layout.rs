@@ -25,8 +25,8 @@ use std::sync::OnceLock;
 
 use ares_core::GgmlType;
 use ares_cuda::{
-    ActivationForm, Device, DeviceBuffer, DevicePtr, Kernels, Precision, Stream, Wait,
-    WeightLayout, device_count,
+    ActivationForm, Device, DeviceBuffer, DevicePtr, FEW_ROWS, FewPlan, Kernels, Precision, Stream,
+    Wait, WeightLayout, device_count,
 };
 use ares_quant::{f16_to_f32, f32_to_f16};
 
@@ -133,8 +133,10 @@ fn through_f16(v: f32) -> f64 {
 enum How<'a> {
     /// The one the device's table names.
     Table(Precision),
-    /// One kernel of the family by name.
+    /// One kernel of the family above [`FEW_ROWS`] rows by name.
     Kernel(&'a str),
+    /// One launch of the few-row kernels.
+    Few(FewPlan),
     /// The kernels over the file's layout.
     File(Precision),
 }
@@ -163,7 +165,7 @@ fn run(
     dx.write(0, &f32_bytes(x)).unwrap();
     let (layout, precision) = match how {
         How::Table(p) => (WeightLayout::Device, p),
-        How::Kernel(_) => (WeightLayout::Device, Precision::Exact),
+        How::Kernel(_) | How::Few(_) => (WeightLayout::Device, Precision::Exact),
         How::File(p) => (WeightLayout::File, p),
     };
     let form = kernels.activation_form(ty, layout, precision, n_rows32).unwrap();
@@ -181,6 +183,19 @@ fn run(
                     &stream,
                     ty,
                     name,
+                    rearranged.ptr(),
+                    act.ptr(),
+                    y.ptr(),
+                    n_in32,
+                    n_out32,
+                    n_rows32,
+                )
+                .unwrap(),
+            How::Few(plan) => kernels
+                .product_few(
+                    &stream,
+                    ty,
+                    plan,
                     rearranged.ptr(),
                     act.ptr(),
                     y.ptr(),
@@ -339,16 +354,19 @@ fn the_rearrangement_is_the_reference_layout() {
 /// Every kernel of the family around its edges: one weight row, rows that do not
 /// fill a tile of 16 or a block, one activation row and counts that do not fill a
 /// fragment of 8 or the block's rows, more than one activation tile, one
-/// super-block and many.
+/// super-block and many (the few-row kernels cut K into 8 parts: fewer super-blocks
+/// than parts leave parts empty, 10 give them one or two).
 #[test]
 fn every_kernel_computes_the_product() {
-    let shapes: [(usize, usize, &[usize]); 6] = [
+    let shapes: [(usize, usize, &[usize]); 8] = [
         (1, 256, &[1, 9]),
         (17, 256, &[3, 17]),
         (130, 512, &[8, 33]),
         (64, 768, &[16, 65]),
         (129, 1024, &[1, 32, 70]),
         (300, 256, &[7, 130]),
+        (33, 2560, &[1, 2, 8, 16, 20]),
+        (200, 1536, &[4, 9]),
     ];
     let mut rng = Rng(0x9e3779b97f4a7c15);
     for (ty, _) in TYPES {
@@ -358,18 +376,18 @@ fn every_kernel_computes_the_product() {
                 let x: Vec<f32> = (0..n_in * n_rows).map(|_| rng.activation()).collect();
                 for (device, kernels) in loaded() {
                     let mut worst = (0f64, 0f64);
-                    for name in Kernels::layout_kernel_names() {
-                        let have = run(
-                            device,
-                            &kernels,
-                            ty,
-                            How::Kernel(name),
-                            &w,
-                            &x,
-                            n_in,
-                            n_out,
-                            n_rows,
+                    let mut hows: Vec<(String, How)> = Kernels::layout_kernel_names()
+                        .into_iter()
+                        .map(|name| (name.to_string(), How::Kernel(name)))
+                        .collect();
+                    if n_rows <= FEW_ROWS as usize {
+                        hows.extend(
+                            FewPlan::all().into_iter().map(|p| (format!("{p:?}"), How::Few(p))),
                         );
+                    }
+                    let mut kernels_run = 0;
+                    for (name, how) in hows {
+                        let have = run(device, &kernels, ty, how, &w, &x, n_in, n_out, n_rows);
                         let dev = deviation(ty, &w, &x, &have, n_in, n_out, n_rows);
                         let what = format!(
                             "{ty} {n_out} x {n_in}, {n_rows} rows, {name} on {}",
@@ -377,9 +395,10 @@ fn every_kernel_computes_the_product() {
                         );
                         dev.assert_within(&what, n_out * n_rows >= 64);
                         worst = (worst.0.max(dev.tight), worst.1.max(dev.loose));
+                        kernels_run += 1;
                     }
                     eprintln!(
-                        "{ty} {n_out} x {n_in}, {n_rows} rows on {}: worst of the six kernels {:.1e} of the magnitude, {:.4}% of a sum's size",
+                        "{ty} {n_out} x {n_in}, {n_rows} rows on {}: worst of the {kernels_run} kernels {:.1e} of the magnitude, {:.4}% of a sum's size",
                         device.info().name,
                         worst.0,
                         worst.1 * 100.0
@@ -464,6 +483,118 @@ fn the_table_serves_every_number_of_rows() {
                             dev.assert_within(&format!("{what}, file layout"), true);
                         }
                     }
+                }
+            }
+        }
+    }
+}
+
+fn bits(values: &[f32]) -> Vec<u32> {
+    values.iter().map(|v| v.to_bits()).collect()
+}
+
+/// The product of a row up to [`FEW_ROWS`] rows is the same bits whatever the other rows
+/// of the batch are, how many there are, which kernel and which launch computes it, and
+/// whether the launch was measured: a verify window of drafts computes the rows it shares
+/// with a decode step as that step does, so that drafts cannot change the text.
+#[test]
+fn a_row_is_the_same_bits_in_any_batch_and_launch() {
+    let mut rng = Rng(0x6a09e667f3bcc908);
+    // Shapes of 5 super-blocks (parts of one or two), a ragged tile, and 17 super-blocks.
+    for (n_out, n_in) in [(70usize, 1280usize), (33, 4352), (16, 256)] {
+        for (ty, _) in TYPES {
+            let w = random_blocks(&mut rng, ty, n_out * n_in / ty.block_values() as usize);
+            let x: Vec<f32> = (0..n_in * FEW_ROWS as usize).map(|_| rng.activation()).collect();
+            for (device, kernels) in loaded() {
+                let all =
+                    run(device, &kernels, ty, How::Table(Precision::Fast), &w, &x, n_in, n_out, 16);
+                let what = format!("{ty} {n_out} x {n_in} on {}", device.info().name);
+                for n_rows in [1usize, 2, 3, 4, 5, 8, 9, 12, 16] {
+                    let part = run(
+                        device,
+                        &kernels,
+                        ty,
+                        How::Table(Precision::Fast),
+                        &w,
+                        &x[..n_rows * n_in],
+                        n_in,
+                        n_out,
+                        n_rows,
+                    );
+                    assert_eq!(
+                        bits(&part),
+                        bits(&all[..n_rows * n_out]),
+                        "{what}: {n_rows} rows differ from the first {n_rows} of 16"
+                    );
+                    let exact = run(
+                        device,
+                        &kernels,
+                        ty,
+                        How::Table(Precision::Exact),
+                        &w,
+                        &x[..n_rows * n_in],
+                        n_in,
+                        n_out,
+                        n_rows,
+                    );
+                    assert_eq!(bits(&exact), bits(&part), "{what}: exact and fast differ");
+                }
+                // One row alone, in every launch, with 1 and 16 rows.
+                for plan in FewPlan::all() {
+                    for n_rows in [1usize, 16] {
+                        let have = run(
+                            device,
+                            &kernels,
+                            ty,
+                            How::Few(plan),
+                            &w,
+                            &x[..n_rows * n_in],
+                            n_in,
+                            n_out,
+                            n_rows,
+                        );
+                        assert_eq!(
+                            bits(&have),
+                            bits(&all[..n_rows * n_out]),
+                            "{what}: {plan:?} with {n_rows} rows"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Measuring the launch of a shape keeps a launch of the family and changes no bit: the product
+/// after it is the one before, and so is the product of every launch the measurement could have
+/// chosen (the untuned table's launch need not be of the same kind as the measured one).
+#[test]
+fn tuning_a_shape_changes_no_bit() {
+    let mut rng = Rng(0xbb67ae8584caa73b);
+    for (n_out, n_in) in [(144usize, 2048usize), (2000, 1024)] {
+        for (ty, _) in [TYPES[0], TYPES[2], TYPES[9], TYPES[10]] {
+            let w = random_blocks(&mut rng, ty, n_out * n_in / ty.block_values() as usize);
+            let x: Vec<f32> = (0..n_in * 4).map(|_| rng.activation()).collect();
+            for (device, kernels) in loaded() {
+                let (n_out32, n_in32) = (n_out as u32, n_in as u32);
+                let before =
+                    run(device, &kernels, ty, How::Table(Precision::Fast), &w, &x, n_in, n_out, 4);
+                let plan = kernels.tune_layout(ty, n_out32, n_in32).unwrap();
+                assert!(FewPlan::all().contains(&plan));
+                assert_eq!(kernels.few_plan(ty, n_out32, n_in32).unwrap(), plan);
+                assert_eq!(kernels.tune_layout(ty, n_out32, n_in32).unwrap(), plan);
+                eprintln!("{ty} {n_out} x {n_in} on {}: {plan:?}", device.info().name);
+                let after =
+                    run(device, &kernels, ty, How::Table(Precision::Fast), &w, &x, n_in, n_out, 4);
+                assert_eq!(bits(&before), bits(&after), "{ty} {n_out} x {n_in}");
+                for candidate in FewPlan::all() {
+                    let have =
+                        run(device, &kernels, ty, How::Few(candidate), &w, &x, n_in, n_out, 4);
+                    assert_eq!(
+                        bits(&before),
+                        bits(&have),
+                        "{ty} {n_out} x {n_in}: {candidate:?} differs from the untuned table"
+                    );
                 }
             }
         }
@@ -584,8 +715,18 @@ fn bad_arguments_are_refused() {
                     .product(&stream, q4, WeightLayout::Device, fast, p, odd, p, 256, 16, 1)
                     .is_err()
             );
-            // A kernel that does not exist.
+            // A kernel that does not exist, a launch that is not one of the family, and the
+            // few-row kernels with more rows than they take.
             assert!(kernels.product_with(&stream, q4, "r7", p, p, p, 256, 16, 1).is_err());
+            let plan = FewPlan::all()[0];
+            assert!(
+                kernels.product_few(&stream, q4, plan, p, p, p, 256, 16, FEW_ROWS + 1).is_err()
+            );
+            let odd_plan = FewPlan { block_warps: 6, log2_warps_per_tile: 1 };
+            assert!(kernels.product_few(&stream, q4, odd_plan, p, p, p, 256, 16, 1).is_err());
+            assert!(kernels.product_few(&stream, q4, plan, p, p, p, 96, 16, 1).is_err());
+            assert!(kernels.tune_layout(q4, 16, 96).is_err());
+            assert!(kernels.tune_layout(GgmlType::IQ3_S, 16, 256).is_err());
             // No weight rows is nothing to do, and a null address is not touched.
             kernels.rearrange(&stream, q4, null, null, 0, 256).unwrap();
             kernels

@@ -14,12 +14,15 @@
 //!
 //! For a type with a device layout (`Kernels::has_device_layout`), `layout` and
 //! `layout-exact` time `Kernels::product` over the rearranged matrix with the kernel
-//! the device's measured table names, and a kernel's name (`r8f`, `r64h`, ...) times
-//! that kernel whatever the table says.
+//! the device's measured table names (from 17 rows on; up to 16 the few-row kernels, as
+//! `Kernels::tune_layout` measured the shape), and a kernel's name (`r32f`, `r64h`, ...)
+//! times that kernel whatever the table says; `few-<warps in a block>-<log2 of warps on a
+//! tile>` (`few-4-0`, `few-4-2`, `few-8-3`) times one launch of the few-row kernels (up
+//! to 16 rows).
 //!
 //! ```sh
 //! cargo run --release -p ares-cuda --example prefill_bench -- \
-//!     [--rows 64,256,1024] [--types q4_K,iq4_xs] [--device N] \
+//!     [--rows 64,256,1024] [--types q4_K,iq4_xs] [--device N] [--shape 17408x5120] \
 //!     [--paths int8,f16,f16flush,decode,layout,layout-exact,r8f,...]
 //! ```
 
@@ -27,13 +30,20 @@ use std::time::Instant;
 
 use ares_core::GgmlType;
 use ares_cuda::{
-    ActivationForm, Device, DeviceBuffer, Event, Kernels, MAX_BATCH, Precision, PrefillPath,
-    Result, Stream, Wait, WeightLayout, devices,
+    ActivationForm, Device, DeviceBuffer, Event, FewPlan, Kernels, MAX_BATCH, Precision,
+    PrefillPath, Result, Stream, Wait, WeightLayout, devices,
 };
 
-/// The largest matrix of Qwen3.8-27B: the FFN of a layer.
-const N_IN: u32 = 5120;
-const N_OUT: u32 = 17408;
+/// The largest matrix of Qwen3.8-27B, the FFN of a layer, unless `--shape` says another.
+static SHAPE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(17408 << 32 | 5120);
+
+fn n_in() -> u32 {
+    SHAPE.load(std::sync::atomic::Ordering::Relaxed) as u32
+}
+
+fn n_out() -> u32 {
+    (SHAPE.load(std::sync::atomic::Ordering::Relaxed) >> 32) as u32
+}
 
 /// The types with a tile kernel over the file's layout, in the order of their bytes
 /// in Qwen3.8-27B, then the others that have a device layout.
@@ -73,8 +83,10 @@ enum Which {
     F16Flush,
     /// The device layout, with the kernel of the device's table for a precision.
     Layout(Precision),
-    /// The device layout, with one kernel of the family by name.
+    /// The device layout, with one kernel of the family above 16 rows by name.
     Kernel(&'static str),
+    /// The device layout, with one launch of the few-row kernels (up to 16 rows).
+    Few(FewPlan),
     Decode,
 }
 
@@ -100,6 +112,11 @@ fn main() -> Result<()> {
                     .collect();
             }
             "--device" => only_device = Some(value.parse().expect("--device")),
+            "--shape" => {
+                let (o, i) = value.split_once('x').expect("--shape <rows>x<columns>");
+                let (o, i): (u64, u64) = (o.parse().expect("--shape"), i.parse().expect("--shape"));
+                SHAPE.store(o << 32 | i, std::sync::atomic::Ordering::Relaxed);
+            }
             "--paths" => {
                 paths = value
                     .split(',')
@@ -110,6 +127,16 @@ fn main() -> Result<()> {
                         "layout" => Which::Layout(Precision::Fast),
                         "layout-exact" => Which::Layout(Precision::Exact),
                         "decode" => Which::Decode,
+                        name if name.starts_with("few-") => {
+                            let parts: Vec<u32> =
+                                name[4..].split('-').filter_map(|p| p.parse().ok()).collect();
+                            let plan = FewPlan::all()
+                                .into_iter()
+                                .find(|p| parts == [p.block_warps, p.log2_warps_per_tile]);
+                            Which::Few(plan.unwrap_or_else(|| {
+                                panic!("--paths: few-<warps>-<log2 per tile> of {:?}", FewPlan::all())
+                            }))
+                        }
                         name => Which::Kernel(
                             Kernels::layout_kernel_names()
                                 .into_iter()
@@ -134,9 +161,11 @@ fn main() -> Result<()> {
         let stream = Stream::new(&device, 0)?;
         let fast = kernels.prefill_path(Precision::Fast)?;
         println!(
-            "CUDA{} {}: {N_OUT} x {N_IN}; f16 mma with f32 accumulation at full rate: {} (fast path {fast:?})",
+            "CUDA{} {}: {} x {}; f16 mma with f32 accumulation at full rate: {} (fast path {fast:?})",
             info.ordinal,
             info.name,
+            n_out(),
+            n_in(),
             kernels.tensor_cores_full_rate()
         );
         let tiled = types.iter().copied().find(|t| kernels.has_prefill_path(*t, PrefillPath::Int8));
@@ -179,7 +208,7 @@ fn time_type(
     paths: &[Which],
     fast: PrefillPath,
 ) -> Result<()> {
-    let w_bytes = ty.bytes_for(u64::from(N_OUT) * u64::from(N_IN)).expect("whole blocks");
+    let w_bytes = ty.bytes_for(u64::from(n_out()) * u64::from(n_in())).expect("whole blocks");
     let copies = ((320u64 << 20) / w_bytes + 1).max(2) as usize;
     // Random bytes: any block is a valid block of these types, and uniform data
     // would draw less power than weights do. The f16 scales stay finite.
@@ -214,8 +243,11 @@ fn time_type(
         .collect::<Result<Vec<_>>>()?;
     // The rearranged copies of the matrices, when asked for and the type has the layout,
     // and the table of the device.
-    let wants_layout = paths.iter().any(|p| matches!(p, Which::Layout(_) | Which::Kernel(_)));
-    let rearranged = if wants_layout && Kernels::has_device_layout(ty, N_IN) {
+    let wants_layout =
+        paths.iter().any(|p| matches!(p, Which::Layout(_) | Which::Kernel(_) | Which::Few(_)));
+    let rearranged = if wants_layout && Kernels::has_device_layout(ty, n_in()) {
+        let plan = kernels.tune_layout(ty, n_out(), n_in())?;
+        println!("  {} few-row launch: {plan:?}", ty.name());
         let table = kernels.measure_layout(ty)?;
         for rows in table.rows {
             println!(
@@ -228,14 +260,14 @@ fn time_type(
                 rows.exact.probe_ms
             );
         }
-        let bytes =
-            Kernels::layout_bytes(ty, WeightLayout::Device, N_OUT, N_IN).expect("has the layout");
+        let bytes = Kernels::layout_bytes(ty, WeightLayout::Device, n_out(), n_in())
+            .expect("has the layout");
         let buffers = weights
             .iter()
             .map(|w| {
                 let r = DeviceBuffer::new(device, bytes)?;
                 // SAFETY: whole matrices of `ty` and the size the function names.
-                unsafe { kernels.rearrange(stream, ty, w.ptr(), r.ptr(), N_OUT, N_IN)? };
+                unsafe { kernels.rearrange(stream, ty, w.ptr(), r.ptr(), n_out(), n_in())? };
                 Ok(r)
             })
             .collect::<Result<Vec<_>>>()?;
@@ -245,10 +277,10 @@ fn time_type(
         Vec::new()
     };
     let max_rows = *rows.iter().max().unwrap_or(&1);
-    let x = DeviceBuffer::new(device, u64::from(max_rows) * u64::from(N_IN) * 4)?;
-    let y = DeviceBuffer::new(device, u64::from(max_rows) * u64::from(N_OUT) * 4)?;
+    let x = DeviceBuffer::new(device, u64::from(max_rows) * u64::from(n_in()) * 4)?;
+    let y = DeviceBuffer::new(device, u64::from(max_rows) * u64::from(n_out()) * 4)?;
     // SAFETY: whole buffers on this device.
-    unsafe { stream.fill(x.ptr(), 0x3c, (u64::from(max_rows) * u64::from(N_IN) * 4) as usize)? };
+    unsafe { stream.fill(x.ptr(), 0x3c, (u64::from(max_rows) * u64::from(n_in()) * 4) as usize)? };
     let (start, end) = (Event::timed(device)?, Event::timed(device)?);
 
     for &n in rows {
@@ -257,7 +289,9 @@ fn time_type(
             if which == Which::Decode && n > 64 {
                 continue;
             }
-            if matches!(which, Which::Layout(_) | Which::Kernel(_)) && rearranged.is_empty() {
+            if matches!(which, Which::Layout(_) | Which::Kernel(_) | Which::Few(_))
+                && rearranged.is_empty()
+            {
                 continue;
             }
             if matches!(which, Which::Int8 | Which::F16 | Which::F16Flush)
@@ -269,10 +303,10 @@ fn time_type(
                 continue;
             }
             let ms = match which {
-                Which::Layout(_) | Which::Kernel(_) => {
+                Which::Layout(_) | Which::Kernel(_) | Which::Few(_) => {
                     let act = DeviceBuffer::new(
                         device,
-                        Kernels::activation_bytes(ActivationForm::F16, N_IN, n),
+                        Kernels::activation_bytes(ActivationForm::F16, n_in(), n),
                     )?;
                     // SAFETY: the buffers were sized for these shapes just above.
                     unsafe {
@@ -281,7 +315,7 @@ fn time_type(
                             ActivationForm::F16,
                             x.ptr(),
                             act.ptr(),
-                            N_IN,
+                            n_in(),
                             n,
                         )?
                     };
@@ -297,8 +331,19 @@ fn time_type(
                                     w,
                                     act.ptr(),
                                     y.ptr(),
-                                    N_IN,
-                                    N_OUT,
+                                    n_in(),
+                                    n_out(),
+                                    n,
+                                ),
+                                Which::Few(plan) => kernels.product_few(
+                                    stream,
+                                    ty,
+                                    plan,
+                                    w,
+                                    act.ptr(),
+                                    y.ptr(),
+                                    n_in(),
+                                    n_out(),
                                     n,
                                 ),
                                 Which::Layout(precision) => kernels.product(
@@ -309,8 +354,8 @@ fn time_type(
                                     w,
                                     act.ptr(),
                                     y.ptr(),
-                                    N_IN,
-                                    N_OUT,
+                                    n_in(),
+                                    n_out(),
                                     n,
                                 ),
                                 _ => unreachable!("the arm is the two layout paths"),
@@ -326,7 +371,7 @@ fn time_type(
                     };
                     let act = DeviceBuffer::new(
                         device,
-                        Kernels::prefill_activation_bytes(path, N_IN, n),
+                        Kernels::prefill_activation_bytes(path, n_in(), n),
                     )?;
                     // SAFETY: the buffers were sized for these shapes just above.
                     unsafe {
@@ -335,12 +380,12 @@ fn time_type(
                             path,
                             x.ptr(),
                             act.ptr(),
-                            N_IN,
+                            n_in(),
                             n,
                         )?
                     };
                     time(device, stream, &start, &end, |i| {
-                        // SAFETY: as above; the matrices are whole N_OUT x N_IN matrices of `ty`.
+                        // SAFETY: as above; the matrices are whole n_out() x n_in() matrices of `ty`.
                         unsafe {
                             kernels.matmul(
                                 stream,
@@ -349,8 +394,8 @@ fn time_type(
                                 weights[i % copies].ptr(),
                                 act.ptr(),
                                 y.ptr(),
-                                N_IN,
-                                N_OUT,
+                                n_in(),
+                                n_out(),
                                 n,
                             )
                         }
@@ -359,11 +404,11 @@ fn time_type(
                 Which::Decode => {
                     let q = DeviceBuffer::new(
                         device,
-                        Kernels::quantized_activation_bytes(N_IN, MAX_BATCH),
+                        Kernels::quantized_activation_bytes(n_in(), MAX_BATCH),
                     )?;
                     // SAFETY: as above.
                     unsafe {
-                        kernels.quantize_activations(stream, x.ptr(), q.ptr(), N_IN, MAX_BATCH)?
+                        kernels.quantize_activations(stream, x.ptr(), q.ptr(), n_in(), MAX_BATCH)?
                     };
                     time(device, stream, &start, &end, |i| {
                         let mut left = n;
@@ -377,8 +422,8 @@ fn time_type(
                                     weights[i % copies].ptr(),
                                     q.ptr(),
                                     y.ptr(),
-                                    N_IN,
-                                    N_OUT,
+                                    n_in(),
+                                    n_out(),
                                     chunk,
                                 )?
                             };
@@ -388,7 +433,8 @@ fn time_type(
                     })?
                 }
             };
-            let tops = 2.0 * f64::from(N_OUT) * f64::from(N_IN) * f64::from(n) / (ms * 1e-3) / 1e12;
+            let tops =
+                2.0 * f64::from(n_out()) * f64::from(n_in()) * f64::from(n) / (ms * 1e-3) / 1e12;
             let name = match which {
                 Which::Int8 => "int8",
                 Which::F16 => "f16",
@@ -396,6 +442,12 @@ fn time_type(
                 Which::Layout(Precision::Fast) => "layout",
                 Which::Layout(Precision::Exact) => "layout-exact",
                 Which::Kernel(name) => name,
+                Which::Few(plan) => match (plan.block_warps, plan.log2_warps_per_tile) {
+                    (4, 0) => "few-4-0",
+                    (4, 1) => "few-4-1",
+                    (4, 2) => "few-4-2",
+                    _ => "few-8-3",
+                },
                 Which::Decode => "decode",
             };
             let mark = match (which, fast) {

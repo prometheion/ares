@@ -6,11 +6,15 @@
 //! A model holds one buffer per matrix and says in which [`WeightLayout`] it lies. Which
 //! prepared form of the activations a product reads, and which kernel computes it,
 //! is this module's business ([`Kernels::activation_form`], [`Kernels::product`]):
-//! for a matrix in the device layout a table measured on the device
-//! ([`Kernels::measure_layout`]), for one in the file's layout the decode kernels up
-//! to a few rows and the tile kernels above.
+//! for a matrix in the device layout the few-row kernels up to 16 rows (the rows of a
+//! decode step and of a window of drafts; their launch is [`FewPlan`], measured per
+//! matrix shape by [`Kernels::tune_layout`]) and a table measured on the device for more
+//! ([`Kernels::measure_layout`]), for one in the file's layout the decode kernels up to
+//! a few rows and the tile kernels above.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use ares_core::GgmlType;
 
@@ -43,8 +47,9 @@ pub enum ActivationForm {
     F16,
 }
 
-/// One kernel of the family over a device layout: the weight rows and activation
-/// rows a block computes, its threads, and whether it accumulates in f32.
+/// One of the kernels of the family over a device layout for 17 rows and more: the weight
+/// rows and activation rows a block computes, its threads, and whether it accumulates in
+/// f32.
 #[derive(Clone, Copy, Debug)]
 struct Shape {
     name: &'static str,
@@ -55,51 +60,48 @@ struct Shape {
 }
 
 impl Shape {
-    /// The dynamic shared memory of a block (`AresMmrShared` in `kernels/mmr.cuh`):
-    /// three stages of the activation rows of a step, each row 16 bytes longer than
-    /// its 64 f16 values. The shapes of up to 16 rows read their activations from
-    /// global memory and use none.
+    /// The dynamic shared memory of a block (`AresMmrShared` in `kernels/mmr.cuh`): three
+    /// stages of the activation rows of a step, each row 16 bytes longer than its 64 f16
+    /// values.
     const fn shared_bytes(self) -> u32 {
-        if self.batch_rows <= 16 { 0 } else { 3 * self.batch_rows * (64 * 2 + 16) }
+        3 * self.batch_rows * (64 * 2 + 16)
     }
 }
 
-/// The kernels of a layout, `ares_mmr_<name>_<type>` (`ARES_MMR_KERNELS` in
-/// `kernels/mmr.cuh`), ordered by activation rows.
-const SHAPES: [Shape; 6] = [
-    Shape { name: "r8f", weight_rows: 32, batch_rows: 8, threads: 128, exact: true },
-    Shape { name: "r16f", weight_rows: 32, batch_rows: 16, threads: 128, exact: true },
+/// The kernels of a layout for 17 rows and more, `ares_mmr_<name>_<type>`
+/// (`ARES_MMR_KERNELS` in `kernels/mmr.cuh`), ordered by activation rows.
+const SHAPES: [Shape; 4] = [
     Shape { name: "r32f", weight_rows: 128, batch_rows: 32, threads: 128, exact: true },
     Shape { name: "r32h", weight_rows: 128, batch_rows: 32, threads: 128, exact: false },
     Shape { name: "r64f", weight_rows: 128, batch_rows: 64, threads: 128, exact: true },
     Shape { name: "r64h", weight_rows: 128, batch_rows: 64, threads: 128, exact: false },
 ];
 
-/// The numbers of activation rows a table distinguishes: up to 8, 16 and 32 rows,
+/// The most rows the few-row kernels take: a decode step and a window of drafts. Their
+/// arithmetic is one, whatever the number of rows and the launch ([`FewPlan`]); with more
+/// rows the table below serves.
+pub const FEW_ROWS: u32 = 16;
+/// The numbers of activation rows the table distinguishes above [`FEW_ROWS`]: up to 32 rows,
 /// and more.
-const BUCKETS: [u32; 4] = [8, 16, 32, u32::MAX];
-/// The rows each bucket is measured with. The last is two activation tiles of the
-/// widest shape, so that it runs grouped as a prompt does.
-const PROBE_ROWS: [u32; 4] = [8, 16, 32, 128];
-/// The shapes that can serve each bucket in one activation tile, narrowest first;
-/// the next wider ones are measured with it, since a wider block is sometimes the
-/// faster one.
-const CANDIDATES: [&[usize]; 4] = [&[0, 1], &[1, 2, 3], &[2, 3, 4, 5], &[4, 5]];
+const BUCKETS: [u32; 2] = [32, u32::MAX];
+/// The rows each bucket is measured with. The last is two activation tiles of the widest
+/// shape, so that it runs grouped as a prompt does.
+const PROBE_ROWS: [u32; 2] = [32, 128];
+/// The shapes that can serve each bucket in one activation tile, narrowest first; the next
+/// wider ones are measured with it, since a wider block is sometimes the faster one.
+const CANDIDATES: [&[usize]; 2] = [&[0, 1, 2, 3], &[2, 3]];
 /// A kernel within this factor of the fastest of its bucket is as good as it: the
-/// differences below that are the probe's noise and its shape. Of the kernels that
-/// are as good, [`Precision::Fast`] takes one with f32 accumulation (exact arithmetic
-/// where it costs nothing) and the narrowest: it has the most blocks on the device
-/// at once, so the fewest matrices leave blocks over that run alone at the end
-/// (`kernels/mmr.cuh`). On an RTX 3060 the kernels of 8 and of 16 rows are equal on
-/// the probe at 8 rows, and on a matrix of 17408 rows the first takes 0.153 ms and
-/// the second, whose blocks do not all fit, 0.181.
+/// differences below that are the probe's noise and its shape. Of the kernels that are as
+/// good, [`Precision::Fast`] takes one with f32 accumulation (exact arithmetic where it
+/// costs nothing) and the narrowest: it has the most blocks on the device at once, so the
+/// fewest matrices leave blocks over that run alone at the end (`kernels/mmr.cuh`).
 const AS_GOOD_WITHIN: f32 = 1.05;
-/// Activation tiles that take a weight tile together (`group` of the kernels) share
-/// its weights through L2 and must keep their own activations there too: a group is
-/// as many tiles as put their activations into this share of the device's L2 cache,
-/// within the bounds below. On an RTX 4070 (36 MiB of L2) that is 8 to 13 tiles of 64
-/// rows of 5120 values, where 8 and 16 measured 87 TFLOPS against 84 for 2; on an RTX
-/// 3060 (3 MiB) it is 2, which measured the same as 8 and better than 16.
+/// Activation tiles that take a weight tile together (`group` of the kernels) share its
+/// weights through L2 and must keep their own activations there too: a group is as many
+/// tiles as put their activations into this share of the device's L2 cache, within the
+/// bounds below. On an RTX 4070 (36 MiB of L2) that is 8 to 13 tiles of 64 rows of 5120
+/// values, where 8 and 16 measured 87 TFLOPS against 84 for 2; on an RTX 3060 (3 MiB) it is
+/// 2, which measured the same as 8 and better than 16.
 const GROUP_L2_SHARE: u64 = 4;
 const GROUP_MIN: u64 = 2;
 const GROUP_MAX: u64 = 16;
@@ -149,22 +151,23 @@ pub struct LayoutRows {
     pub exact: LayoutKernel,
 }
 
-/// Which kernel serves which number of activation rows for one type on one device.
+/// Which kernel serves which number of activation rows above [`FEW_ROWS`] for one type on
+/// one device.
 #[derive(Clone, Debug, PartialEq)]
 pub struct LayoutTable {
     pub ty: GgmlType,
     /// Whether the table was measured on this device ([`Kernels::measure_layout`]).
-    /// Otherwise it is the one kept from the cards the kernels were written on:
-    /// f32 accumulation up to 16 rows, and above that too where the tensor cores run
-    /// it at full rate.
+    /// Otherwise it is the one kept from the cards the kernels were written on: f32
+    /// accumulation where the tensor cores run it at full rate, f16 accumulation where
+    /// they do not.
     pub measured: bool,
-    pub rows: [LayoutRows; 4],
+    pub rows: [LayoutRows; 2],
     /// The shape of each bucket, `[fast, exact]`.
-    picks: [[usize; 2]; 4],
+    picks: [[usize; 2]; 2],
 }
 
 impl LayoutTable {
-    fn new(ty: GgmlType, measured: bool, picks: [[usize; 2]; 4], ms: [[f32; 2]; 4]) -> Self {
+    fn new(ty: GgmlType, measured: bool, picks: [[usize; 2]; 2], ms: [[f32; 2]; 2]) -> Self {
         let kernel = |shape: usize, probe_ms: f32| LayoutKernel {
             name: SHAPES[shape].name,
             weight_rows: SHAPES[shape].weight_rows,
@@ -182,8 +185,8 @@ impl LayoutTable {
 
     /// The table of a device that was not measured.
     fn kept(ty: GgmlType, full_rate: bool) -> Self {
-        let wide = if full_rate { [2, 4] } else { [3, 5] };
-        Self::new(ty, false, [[0, 0], [1, 1], [wide[0], 2], [wide[1], 4]], [[0.0; 2]; 4])
+        let wide = if full_rate { [0, 2] } else { [1, 3] };
+        Self::new(ty, false, [[wide[0], 0], [wide[1], 2]], [[0.0; 2]; 2])
     }
 
     fn shape(&self, precision: Precision, n_rows: u32) -> Shape {
@@ -192,20 +195,91 @@ impl LayoutTable {
     }
 }
 
+/// The parts K is cut into by the few-row kernels (`ARES_MMF_PARTS`): their arithmetic.
+const FEW_PARTS: u32 = 8;
+
+/// How a few-row kernel is launched: the warps of a thread block, and how many of them
+/// compute one tile of 16 weight rows, each over its share of the `FEW_PARTS` parts of K.
+/// Which is the fastest depends on the shape of the matrix and the device (a matrix of a
+/// few tiles wants all of the device's warps on them, one of many tiles wants no sum
+/// between warps); none changes a bit of the result.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct FewPlan {
+    /// Warps in a block: 4 or 8.
+    pub block_warps: u32,
+    /// The base-2 logarithm of the warps that compute a tile, at most that of the block
+    /// and of `FEW_PARTS`.
+    pub log2_warps_per_tile: u32,
+}
+
+impl FewPlan {
+    /// The launches that are measured, narrowest block first.
+    const ALL: [FewPlan; 4] = [
+        FewPlan { block_warps: 4, log2_warps_per_tile: 0 },
+        FewPlan { block_warps: 4, log2_warps_per_tile: 1 },
+        FewPlan { block_warps: 4, log2_warps_per_tile: 2 },
+        FewPlan { block_warps: 8, log2_warps_per_tile: 3 },
+    ];
+
+    /// Every launch the few-row kernels have.
+    pub fn all() -> [FewPlan; 4] {
+        Self::ALL
+    }
+
+    /// What a matrix of `tiles` tiles of 16 weight rows gets before
+    /// [`Kernels::tune_layout`] has measured it, on a device that keeps `device_warps` warps
+    /// of these kernels resident at once: as many warps on a tile (1, 2, 4 or 8) as the
+    /// device can still hold for all the tiles.
+    pub fn untuned(tiles: u32, device_warps: u32) -> Self {
+        let mut log2 = 0;
+        while log2 < 3 && u64::from(tiles) << (log2 + 1) <= u64::from(device_warps) {
+            log2 += 1;
+        }
+        Self::ALL[log2]
+    }
+
+    fn block(self) -> usize {
+        usize::from(self.block_warps == 8)
+    }
+
+    fn is_valid(self) -> bool {
+        Self::ALL.contains(&self)
+    }
+
+    /// The dynamic shared memory of a block (`ares_mmf_smem_bytes` in `kernels/mmr.cuh`):
+    /// the parts of K the warps of a tile hand to each other.
+    const fn shared_bytes(self, nb: u32) -> u32 {
+        if self.log2_warps_per_tile == 0 {
+            0
+        } else {
+            (self.block_warps >> self.log2_warps_per_tile) * FEW_PARTS * nb * 4 * 32 * 4
+        }
+    }
+}
+
 /// The kernels of one type with a device layout.
 #[derive(Debug, Clone)]
 struct TypeKernels {
     ty: GgmlType,
     repack: Function,
-    shapes: [Function; 6],
+    shapes: [Function; 4],
+    /// The few-row kernels, `[rows 8 or 16][block of 4 or 8 warps]`.
+    few: [[Function; 2]; 2],
+    /// The warps of the few-row kernels one multiprocessor keeps resident at once.
+    warps_per_multiprocessor: u32,
 }
 
-/// The kernels over the device layouts on one device, and the tables measured so
-/// far.
+/// The launches measured so far, by type and the rows and columns of the matrix.
+type Plans = HashMap<(GgmlType, u32, u32), FewPlan>;
+
+/// The kernels over the device layouts on one device, and what was measured so far.
 #[derive(Debug, Clone)]
 pub(super) struct Layouts {
     types: Vec<TypeKernels>,
     tables: Arc<Mutex<Vec<LayoutTable>>>,
+    plans: Arc<Mutex<Plans>>,
+    /// When the last launch was measured: the clocks of a device that has been idle are low.
+    tuned_at: Arc<Mutex<Option<Instant>>>,
 }
 
 impl Layouts {
@@ -232,14 +306,18 @@ impl Layouts {
                     }
                     shapes.push(function);
                 }
+                let few = |rows: u32, warps: u32| module.function(&format!("ares_mmf_{rows}_w{warps}_{suffix}"));
+                let few = [[few(8, 4)?, few(8, 8)?], [few(16, 4)?, few(16, 8)?]];
                 Ok(TypeKernels {
                     ty: *ty,
                     repack: module.function(&format!("ares_repack_{suffix}"))?,
-                    shapes: <[Function; 6]>::try_from(shapes).expect("six shapes"),
+                    shapes: <[Function; 4]>::try_from(shapes).expect("four shapes"),
+                    warps_per_multiprocessor: few[0][0].blocks_per_multiprocessor(128, 0)? * 4,
+                    few,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        Ok(Self { types, tables: Arc::default() })
+        Ok(Self { types, tables: Arc::default(), plans: Arc::default(), tuned_at: Arc::default() })
     }
 
     fn of(&self, ty: GgmlType) -> Result<&TypeKernels> {
@@ -490,12 +568,15 @@ impl Kernels {
     /// whatever the type and the layout. `act` is the rows in the form
     /// [`Kernels::activation_form`] names for the same arguments.
     ///
-    /// For a matrix in the device layout the kernel comes from the table of the
-    /// device ([`Kernels::layout_table`]): up to 16 rows it is bound by memory and
-    /// accumulates in f32 (0.04 % rms from the exact f32 product, the rounding of
-    /// the f16 operands), above that [`Precision::Fast`] takes f16 accumulation on a
-    /// capped card (0.06 %). For one in the file's layout it is a decode kernel up
-    /// to [`Kernels::decode_kernel_rows`] rows and a tile kernel above.
+    /// For a matrix in the device layout up to [`FEW_ROWS`] rows are the few-row kernels,
+    /// launched as [`Kernels::few_plan`] says: the result of a row is the same bits whatever
+    /// else the batch holds and whichever launch it is, so a step of one row and a verify
+    /// window of drafts compute the same numbers for the row they share; it is the exact
+    /// product of the f16 operands, summed in f32 (0.04 % rms from the exact f32 product,
+    /// the rounding of the f16 operands). Above that the kernel comes from the table of the
+    /// device ([`Kernels::layout_table`]): [`Precision::Fast`] takes f16 accumulation on a
+    /// capped card (0.06 %). For one in the file's layout it is a decode kernel up to
+    /// [`Kernels::decode_kernel_rows`] rows and a tile kernel above.
     ///
     /// # Safety
     ///
@@ -526,6 +607,11 @@ impl Kernels {
                     self.matmul(stream, ty, path, w, act, y, n_in, n_out, n_rows)
                 },
             },
+            WeightLayout::Device if n_rows <= FEW_ROWS => {
+                let plan = self.few_plan(ty, n_out, n_in)?;
+                // SAFETY: the caller's guarantee.
+                unsafe { self.few_launch(stream, ty, plan, w, act, y, n_in, n_out, n_rows) }
+            }
             WeightLayout::Device => {
                 let shape = self.layout_table(ty)?.shape(precision, n_rows);
                 // SAFETY: the caller's guarantee.
@@ -534,7 +620,30 @@ impl Kernels {
         }
     }
 
-    /// Launches one kernel of the family over the device layout.
+    /// Checks what both kinds of launch need and returns the kernels of the type.
+    fn layout_checked(
+        &self,
+        ty: GgmlType,
+        w: DevicePtr,
+        act: DevicePtr,
+        n_in: u32,
+        n_rows: u32,
+    ) -> Result<&TypeKernels> {
+        let kernels = self.prefill_kernels()?.layouts.of(ty)?;
+        if !Self::has_device_layout(ty, n_in) || n_rows == 0 || n_in.checked_mul(n_rows).is_none() {
+            return Err(Error::Invalid {
+                what: "layout kernel batch",
+                detail: format!(
+                    "{n_rows} rows of {n_in} values of {ty}: not whole steps, empty or too many"
+                ),
+            });
+        }
+        check_alignment("rearranged matrix", w, 16)?;
+        check_alignment("prepared activations", act, 16)?;
+        Ok(kernels)
+    }
+
+    /// Launches one kernel of the family over the device layout for 17 rows and more.
     #[allow(clippy::too_many_arguments)]
     unsafe fn layout_launch(
         &self,
@@ -548,20 +657,10 @@ impl Kernels {
         n_out: u32,
         n_rows: u32,
     ) -> Result<()> {
-        let kernels = self.prefill_kernels()?.layouts.of(ty)?;
-        if !Self::has_device_layout(ty, n_in) || n_rows == 0 || n_in.checked_mul(n_rows).is_none() {
-            return Err(Error::Invalid {
-                what: "layout kernel batch",
-                detail: format!(
-                    "{n_rows} rows of {n_in} values of {ty}: not whole steps, empty or too many"
-                ),
-            });
-        }
+        let kernels = self.layout_checked(ty, w, act, n_in, n_rows)?;
         if n_out == 0 {
             return Ok(());
         }
-        check_alignment("rearranged matrix", w, 16)?;
-        check_alignment("prepared activations", act, 16)?;
         let index = SHAPES.iter().position(|s| s.name == shape.name).expect("a shape of SHAPES");
         let n_weight_tiles = n_out.div_ceil(shape.weight_rows);
         let n_batch_tiles = n_rows.div_ceil(shape.batch_rows);
@@ -591,8 +690,288 @@ impl Kernels {
         }
     }
 
-    /// The product with one named kernel of the family, for benchmarks and tests
-    /// that compare them: `kernel` is a [`LayoutKernel::name`].
+    /// Launches a few-row kernel (`n_rows` up to [`FEW_ROWS`]) as `plan` says.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn few_launch(
+        &self,
+        stream: &Stream,
+        ty: GgmlType,
+        plan: FewPlan,
+        w: DevicePtr,
+        act: DevicePtr,
+        y: DevicePtr,
+        n_in: u32,
+        n_out: u32,
+        n_rows: u32,
+    ) -> Result<()> {
+        let kernels = self.layout_checked(ty, w, act, n_in, n_rows)?;
+        if !plan.is_valid() || n_rows > FEW_ROWS {
+            return Err(Error::Invalid {
+                what: "few-row kernel",
+                detail: format!("{plan:?} with {n_rows} rows: not a launch of the family"),
+            });
+        }
+        if n_out == 0 {
+            return Ok(());
+        }
+        let nb = n_rows.div_ceil(8);
+        let tiles = n_out.div_ceil(16);
+        let blocks = tiles.div_ceil(plan.block_warps >> plan.log2_warps_per_tile);
+        let args = Args::new()
+            .ptr(w)
+            .ptr(act)
+            .ptr(y)
+            .u32(n_in)
+            .u32(n_out)
+            .u32(n_rows)
+            .u32(plan.log2_warps_per_tile);
+        // SAFETY: the argument list matches the ares_mmf_* kernels; the ranges are the
+        // caller's guarantee.
+        unsafe {
+            kernels.few[usize::from(nb == 2)][plan.block()].launch(
+                stream,
+                [blocks, 1, 1],
+                [plan.block_warps * 32, 1, 1],
+                plan.shared_bytes(nb),
+                args,
+            )
+        }
+    }
+
+    fn prefill_tuned_at(&self) -> Result<Arc<Mutex<Option<Instant>>>> {
+        Ok(self.prefill_kernels()?.layouts.tuned_at.clone())
+    }
+
+    /// The launch a few-row product of a matrix of `n_out` rows of `n_in` values takes:
+    /// the one [`Kernels::tune_layout`] measured for the shape, or [`FewPlan::untuned`].
+    pub fn few_plan(&self, ty: GgmlType, n_out: u32, n_in: u32) -> Result<FewPlan> {
+        let prefill = self.prefill_kernels()?;
+        let kernels = prefill.layouts.of(ty)?;
+        let plans = prefill.layouts.plans.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(plans.get(&(ty, n_out, n_in)).copied().unwrap_or_else(|| {
+            let device_warps =
+                kernels.warps_per_multiprocessor * self.device.info().multiprocessors;
+            FewPlan::untuned(n_out.div_ceil(16), device_warps)
+        }))
+    }
+
+    /// Measures which launch ([`FewPlan::all`]) is the fastest for the few-row products of
+    /// matrices of `ty` with `n_out` rows of `n_in` values on this device and keeps it for
+    /// [`Kernels::product`]; it returns the plan, and the same without measuring again if it
+    /// has been measured. A loader calls it once per shape of its model, before the weights
+    /// are placed: it walks as many copies of a matrix of that shape as make 64 MiB or twice
+    /// the L2 cache, at most 256 MiB (freed on return), in a few milliseconds. The first
+    /// call on a device that has been idle also keeps it busy for 150 ms, for its clocks to
+    /// rise.
+    ///
+    /// The plan is a matter of speed only: the product of a row is the same bits whichever
+    /// launch computes it.
+    ///
+    /// The device should be idle: a product of another context that runs at the same
+    /// time is measured into the plan.
+    pub fn tune_layout(&self, ty: GgmlType, n_out: u32, n_in: u32) -> Result<FewPlan> {
+        self.tuned(ty, n_out, n_in, None)
+    }
+
+    /// [`Kernels::tune_layout`] over a region of the device's memory that the caller
+    /// lends instead of the copies it would allocate: the products walk through it, a
+    /// launch after the other, from its start to its end. A caller that holds a region as
+    /// large as its weights will be lends the translations of addresses the weights will
+    /// need, and the plan is then the one of a step that reads each matrix from its own
+    /// place; a matrix of a few megabytes measured over a few dozen finds them all, and
+    /// the launches that wait on a translation, the small ones, look better than they are.
+    /// What the region holds does not matter.
+    pub fn tune_layout_over(
+        &self,
+        ty: GgmlType,
+        n_out: u32,
+        n_in: u32,
+        region: &DeviceBuffer,
+    ) -> Result<FewPlan> {
+        self.tuned(ty, n_out, n_in, Some(region))
+    }
+
+    fn tuned(
+        &self,
+        ty: GgmlType,
+        n_out: u32,
+        n_in: u32,
+        region: Option<&DeviceBuffer>,
+    ) -> Result<FewPlan> {
+        let prefill = self.prefill_kernels()?;
+        prefill.layouts.of(ty)?;
+        let Some(bytes) = Self::layout_bytes(ty, WeightLayout::Device, n_out, n_in) else {
+            return Err(Error::Invalid {
+                what: "weight matrix",
+                detail: format!(
+                    "{n_in} columns of {ty} are not a whole number of {COLUMNS_MULTIPLE} values"
+                ),
+            });
+        };
+        {
+            let plans = prefill.layouts.plans.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(plan) = plans.get(&(ty, n_out, n_in)) {
+                return Ok(*plan);
+            }
+        }
+        let plan = if n_out == 0 {
+            FewPlan::ALL[0]
+        } else {
+            self.measure_few(ty, bytes, n_out, n_in, region)?
+        };
+        let mut plans = prefill.layouts.plans.lock().unwrap_or_else(|e| e.into_inner());
+        plans.insert((ty, n_out, n_in), plan);
+        Ok(plan)
+    }
+
+    fn measure_few(
+        &self,
+        ty: GgmlType,
+        bytes: u64,
+        n_out: u32,
+        n_in: u32,
+        region: Option<&DeviceBuffer>,
+    ) -> Result<FewPlan> {
+        /// Every candidate is timed this many times, in turn with the others, as a run
+        /// of `BURST` launches; its fastest run counts.
+        const ROUNDS: usize = 4;
+        const BURST: u32 = 6;
+        /// The copies of the matrix a launch walks through: together larger than the L2
+        /// cache, so that every launch reads its weights from memory, as a step does.
+        const MIN_BYTES: u64 = 64 << 20;
+        const MAX_BYTES: u64 = 256 << 20;
+        /// How long a device that was idle for longer than `RAMP_AFTER` is kept busy.
+        const RAMP: Duration = Duration::from_millis(150);
+        const RAMP_AFTER: Duration = Duration::from_millis(200);
+
+        let device = &self.device;
+        // The memory the launches walk: lent, or as many copies as it takes.
+        let own;
+        let (base, span) = match region {
+            Some(region) if region.len() >= bytes => (region.ptr(), region.len()),
+            _ => {
+                let want =
+                    (2 * u64::from(device.info().l2_cache_bytes)).clamp(MIN_BYTES, MAX_BYTES);
+                let copies = want.div_ceil(bytes.max(1)).clamp(1, 64);
+                own = DeviceBuffer::new(device, bytes * copies)?;
+                // What the buffer holds does not matter to the time of a product (no kernel
+                // branches on or addresses by a value) as long as it is numbers.
+                let stream = Stream::new(device, 0)?;
+                // SAFETY: the whole buffer of this device.
+                unsafe { stream.fill(own.ptr(), 0x11, (bytes * copies) as usize)? };
+                stream.synchronize()?;
+                (own.ptr(), bytes * copies)
+            }
+        };
+        let act_bytes = Kernels::activation_bytes(ActivationForm::F16, n_in, 1);
+        let act = DeviceBuffer::new(device, act_bytes)?;
+        let y = DeviceBuffer::new(device, u64::from(n_out) * 4)?;
+        let stream = Stream::new(device, 0)?;
+        // SAFETY: the whole buffer of this device.
+        unsafe { stream.fill(act.ptr(), 0x3c, act_bytes as usize)? };
+        let (start, end) = (Event::timed(device)?, Event::timed(device)?);
+        // Where the next launch reads: behind the one before, from the start again at the end.
+        let stride = bytes.next_multiple_of(256);
+        let mut cursor = 0u64;
+        let mut place = move || {
+            if cursor + bytes > span {
+                cursor = 0;
+            }
+            let at = base.offset(cursor);
+            cursor += stride;
+            at
+        };
+        // A device that has been idle runs at low clocks, which a few launches do not
+        // raise: run for a while first.
+        let idle = {
+            let tuned_at = self.prefill_tuned_at()?;
+            let mut tuned_at = tuned_at.lock().unwrap_or_else(|e| e.into_inner());
+            let idle = tuned_at.is_none_or(|t| t.elapsed() > RAMP_AFTER);
+            *tuned_at = Some(Instant::now());
+            idle
+        };
+        let begun = Instant::now();
+        while idle && begun.elapsed() < RAMP {
+            for _ in 0..64 {
+                // SAFETY: as below.
+                unsafe {
+                    self.few_launch(
+                        &stream,
+                        ty,
+                        FewPlan::ALL[0],
+                        place(),
+                        act.ptr(),
+                        y.ptr(),
+                        n_in,
+                        n_out,
+                        1,
+                    )?;
+                }
+            }
+            stream.synchronize()?;
+        }
+        let mut best = [f32::INFINITY; FewPlan::ALL.len()];
+        for round in 0..=ROUNDS {
+            for (plan, best) in FewPlan::ALL.iter().zip(best.iter_mut()) {
+                start.record(&stream)?;
+                for _ in 0..BURST {
+                    // SAFETY: the region holds a matrix of n_out x n_in at every place
+                    // `place` names, `act` a row in the f16 form and `y` its products.
+                    unsafe {
+                        self.few_launch(
+                            &stream,
+                            ty,
+                            *plan,
+                            place(),
+                            act.ptr(),
+                            y.ptr(),
+                            n_in,
+                            n_out,
+                            1,
+                        )?;
+                    }
+                }
+                end.record(&stream)?;
+                end.synchronize()?;
+                // The first round warms the caches up.
+                if round > 0 {
+                    *best = best.min(end.elapsed_ms_since(&start)? / BURST as f32);
+                }
+            }
+        }
+        // The fastest; of equals the first, which has the fewest warps on a tile.
+        let fastest = best.iter().copied().fold(f32::INFINITY, f32::min);
+        let pick = best.iter().position(|ms| *ms <= fastest).unwrap_or(0);
+        Ok(FewPlan::ALL[pick])
+    }
+
+    /// The product with one launch of the few-row kernels, for benchmarks and tests that
+    /// compare them.
+    ///
+    /// # Safety
+    ///
+    /// As [`Kernels::product`] with [`WeightLayout::Device`], f16 activations and at most
+    /// [`FEW_ROWS`] rows.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn product_few(
+        &self,
+        stream: &Stream,
+        ty: GgmlType,
+        plan: FewPlan,
+        w: DevicePtr,
+        act: DevicePtr,
+        y: DevicePtr,
+        n_in: u32,
+        n_out: u32,
+        n_rows: u32,
+    ) -> Result<()> {
+        // SAFETY: the caller's guarantee.
+        unsafe { self.few_launch(stream, ty, plan, w, act, y, n_in, n_out, n_rows) }
+    }
+
+    /// The product with one named kernel of the family above [`FEW_ROWS`] rows, for
+    /// benchmarks and tests that compare them: `kernel` is a [`LayoutKernel::name`]. (It
+    /// takes any number of rows.)
     ///
     /// # Safety
     ///
@@ -618,8 +997,9 @@ impl Kernels {
         unsafe { self.layout_launch(stream, ty, *shape, w, act, y, n_in, n_out, n_rows) }
     }
 
-    /// The names of the kernels of the family ([`Kernels::product_with`]).
-    pub fn layout_kernel_names() -> [&'static str; 6] {
+    /// The names of the kernels of the family above [`FEW_ROWS`] rows
+    /// ([`Kernels::product_with`]).
+    pub fn layout_kernel_names() -> [&'static str; 4] {
         SHAPES.map(|s| s.name)
     }
 }
@@ -647,7 +1027,7 @@ fn measure(device: &Device, kernels: &TypeKernels) -> Result<LayoutTable> {
     // would time that tail and not the kernel (a model's matrices meet it too, some
     // with one kernel and some with another; see `kernels/mmr.cuh`).
     let mut n_out = u32::MAX;
-    for shape in [1, 2, 3] {
+    for shape in [0, 1] {
         let held = kernels.shapes[shape]
             .blocks_per_multiprocessor(SHAPES[shape].threads, SHAPES[shape].shared_bytes())?;
         n_out = n_out.min(held * device_info.multiprocessors * SHAPES[shape].weight_rows);
@@ -732,8 +1112,8 @@ fn measure(device: &Device, kernels: &TypeKernels) -> Result<LayoutTable> {
         }
     }
 
-    let mut picks = [[0usize; 2]; 4];
-    let mut ms = [[0.0f32; 2]; 4];
+    let mut picks = [[0usize; 2]; 2];
+    let mut ms = [[0.0f32; 2]; 2];
     for (bucket, candidates) in CANDIDATES.iter().enumerate() {
         let timed: Vec<(usize, f32)> =
             candidates.iter().copied().zip(times[bucket].iter().copied()).collect();
@@ -759,4 +1139,47 @@ fn measure(device: &Device, kernels: &TypeKernels) -> Result<LayoutTable> {
         ms[bucket] = [fast.1, exact.1];
     }
     Ok(LayoutTable::new(ty, true, picks, ms))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every launch of the few-row kernels fits what its kernels are built for: the warps of
+    /// a tile divide the block and the parts of K, and the parts the warps of a block hand
+    /// to each other fit the shared memory a launch gets without asking.
+    #[test]
+    fn the_launches_of_the_few_row_kernels_fit_their_kernels() {
+        for plan in FewPlan::all() {
+            let warps = 1u32 << plan.log2_warps_per_tile;
+            assert!(plan.is_valid());
+            assert!(plan.block_warps.is_multiple_of(warps), "{plan:?}");
+            assert!(FEW_PARTS.is_multiple_of(warps), "{plan:?}");
+            for nb in [1, 2] {
+                assert!(plan.shared_bytes(nb) <= DEFAULT_SHARED, "{plan:?} with {nb} fragments");
+            }
+            // One warp on a tile adds its parts in registers.
+            assert_eq!(plan.shared_bytes(1) == 0, plan.log2_warps_per_tile == 0);
+        }
+        assert!(!FewPlan { block_warps: 4, log2_warps_per_tile: 3 }.is_valid());
+        assert!(!FewPlan { block_warps: 6, log2_warps_per_tile: 0 }.is_valid());
+    }
+
+    /// The launch of a shape that was not measured puts more warps on a tile the fewer
+    /// tiles the device has per warp it holds, and no more than it can hold.
+    #[test]
+    fn an_untuned_launch_uses_the_warps_of_the_device() {
+        let mut last = u32::MAX;
+        for tiles in [1, 20, 60, 100, 300, 1000, 5000] {
+            let plan = FewPlan::untuned(tiles, 700);
+            assert!(plan.is_valid());
+            assert!(plan.log2_warps_per_tile <= last, "{tiles} tiles: {plan:?}");
+            last = plan.log2_warps_per_tile;
+            let warps = 1u32 << plan.log2_warps_per_tile;
+            assert!(warps == 1 || tiles * warps <= 700, "{tiles} tiles: {plan:?}");
+        }
+        assert_eq!(FewPlan::untuned(1, 700).log2_warps_per_tile, 3);
+        assert_eq!(FewPlan::untuned(5000, 700).log2_warps_per_tile, 0);
+        assert!(FewPlan::untuned(0, 0).is_valid());
+    }
 }

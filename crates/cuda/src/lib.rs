@@ -48,8 +48,8 @@ pub use experts::{
     HostShare, ROWS_TILES, RouteGroup, RouteRecord, RowsItem, RowsPlan, RowsPlanLayout,
 };
 pub use kernels::{
-    ActivationForm, Kernels, LayoutKernel, LayoutRows, LayoutTable, MAX_BATCH, Precision,
-    PrefillPath, PrefillShape, WeightLayout,
+    ActivationForm, FEW_ROWS, FewPlan, Kernels, LayoutKernel, LayoutRows, LayoutTable, MAX_BATCH,
+    Precision, PrefillPath, PrefillShape, WeightLayout,
 };
 pub use layers::{
     AttentionShape, CommitSet, LayerKernels, NormKind, OutputGate, RecurrentShape, RopeParams,

@@ -1,10 +1,10 @@
 #version 450
 // The weight kernel over a device layout for few activation rows: a matrix in the layout of
 // `ares_quant::layout` (mml_types.glsl, mml_codes.glsl) times 1 to 8 (ARES_NB = 1) or up to
-// 16 (ARES_NB = 2) rows of f16 activations, on the tensor cores with f32 accumulation. The
-// counterpart of the shapes r8f and r16f of CUDA's `kernels/mmr.cuh`: it serves decode from
-// the same copy of the matrix the prefill kernel (mml_wide.glsl) reads, at the speed of the
-// memory, and its result is the exact product of the f16 weights and f16 activations.
+// 16 (ARES_NB = 2) rows of f16 activations, on the tensor cores with f32 accumulation. It
+// serves decode from the same copy of the matrix the prefill kernel (mml_wide.glsl) reads, at
+// the speed of the memory, and its result is the exact product of the f16 weights and f16
+// activations. (CUDA's counterpart is `ares_mmr_few` in `kernels/mmr.cuh`.)
 // build.rs compiles it per type and shape into `mml_r8f_<type>.spv` and `mml_r16f_<type>.spv`.
 //
 // A workgroup computes 32 weight rows (2 tiles of 16) by 8 ARES_NB activation rows, and its

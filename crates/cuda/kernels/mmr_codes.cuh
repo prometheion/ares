@@ -112,6 +112,26 @@ static __host__ __device__ constexpr uint32_t ares_h2_const(int v) {
     bits |= v < 0 ? 0x8000u : 0u;
     return bits | bits << 16;
 }
+// The bits of an f16 pair as `__half2` and back (a move), and the pair (x, x) of the low
+// (H = 0) or high (H = 1) half of one: an operand of `HFMA2` that costs no instruction.
+static __device__ __forceinline__ __half2 ares_h2_of(uint32_t bits) {
+    return *reinterpret_cast<__half2*>(&bits);
+}
+static __device__ __forceinline__ uint32_t ares_h2_bits(__half2 v) {
+    return *reinterpret_cast<uint32_t*>(&v);
+}
+template <int H>
+static __device__ __forceinline__ __half2 ares_h2_lane(uint32_t bits) {
+    if constexpr (H == 0) {
+        return __low2half2(ares_h2_of(bits));
+    } else {
+        return __high2half2(ares_h2_of(bits));
+    }
+}
+// 2^-s as an f16 pair, 0 <= s < 15.
+static __host__ __device__ constexpr uint32_t ares_h2_pow2_down(int s) {
+    return (static_cast<uint32_t>(15 - s) << 10) * 0x00010001u;
+}
 
 // ---------------------------------------------------------------------------
 // The headers. Each `Hdr` says how the scales of a tile lie in the layout
@@ -171,6 +191,31 @@ struct AresHdrK4 {
             S[h] = ares_h2_dup_lo(v);
             C[h] = ares_h2_dup_hi(v);
         }
+    }
+    // What the few-row kernels (AresFewCodes) use instead of `scales`: a weight is
+    // `S * code + C` (MIN) or `S * (code - OFFSET)`, `scale<j, kk>` keeps per row of the
+    // lane (g: h = 0, g + 8: h = 1) the pair (S, C), and `weight<h>` makes the f16 pair of
+    // the row's two values from the pair of codes (code - OFFSET for the types without a
+    // minimum), the scale as an operand of its `HFMA2` that costs no instruction.
+    static constexpr bool MIN = true;
+    static constexpr int OFFSET = 0;
+    struct Scale {
+        uint32_t v[2];
+    };
+    template <int j, int kk>
+    static __device__ __forceinline__ Scale scale(const State& s) {
+        constexpr int o = 2 * (j & 1) + kk / 2;
+        Scale r;
+#pragma unroll
+        for (int h = 0; h < 2; h++) {
+            const uint32_t x = ares_h2_of_bytes(s.sc[h][j >> 1], s.mn[h][j >> 1], o, o);
+            r.v[h] = ares_h2_mul(ares_h2_sub(x, 0x64006400u), s.dd2[h]);
+        }
+        return r;
+    }
+    template <int h>
+    static __device__ __forceinline__ uint32_t weight(const Scale& r, uint32_t c) {
+        return ares_h2_bits(__hfma2(ares_h2_of(c), ares_h2_lane<0>(r.v[h]), ares_h2_lane<1>(r.v[h])));
     }
 };
 
@@ -286,6 +331,37 @@ struct AresHdrK16 {
             C[1] = ares_h2_mul(S[1], ares_h2_const(-CODE_OFFSET));
         }
     }
+    // For the few-row kernels, see AresHdrK4: (S of row g, of row g + 8), for Q2_K also
+    // (C of row g, of row g + 8).
+    static constexpr bool MIN = MIN_NIBBLE;
+    static constexpr int OFFSET = MIN_NIBBLE ? 0 : CODE_OFFSET;
+    struct Scale {
+        uint32_t v[2];
+    };
+    template <int j, int kk>
+    static __device__ __forceinline__ Scale scale(const State& s) {
+        Scale r;
+        if constexpr (MIN_NIBBLE) {
+            const uint32_t b = __byte_perm(s.sc[0][j], s.sc[1][j], ((4 + kk) << 4) | kk);
+            const uint32_t xs = __byte_perm(b & 0x0F0Fu, 0x64646464u, 0x4140);
+            const uint32_t xm = __byte_perm((b >> 4) & 0x0F0Fu, 0x64646464u, 0x4140);
+            r.v[0] = ares_h2_mul(ares_h2_sub(xs, 0x64006400u), s.dd);
+            r.v[1] = ares_h2_mul(ares_h2_sub(xm, 0x64006400u), s.ndmin);
+        } else {
+            const uint32_t x = ares_h2_of_bytes(s.sc[0][j], s.sc[1][j], kk, kk);
+            r.v[0] = ares_h2_mul(ares_h2_sub(x, ares_h2_const(1024 + SCALE_BIAS)), s.dd);
+            r.v[1] = 0;
+        }
+        return r;
+    }
+    template <int h>
+    static __device__ __forceinline__ uint32_t weight(const Scale& r, uint32_t c) {
+        if constexpr (MIN_NIBBLE) {
+            return ares_h2_bits(__hfma2(ares_h2_of(c), ares_h2_lane<h>(r.v[0]), ares_h2_lane<h>(r.v[1])));
+        } else {
+            return ares_h2_bits(__hmul2(ares_h2_of(c), ares_h2_lane<h>(r.v[0])));
+        }
+    }
 };
 
 // Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, IQ4_NL: an f16 scale d, and for Q4_1 and Q5_1 an f16
@@ -340,6 +416,28 @@ struct AresHdrB {
         } else {
             C[0] = ares_h2_mul(S[0], ares_h2_const(-CODE_OFFSET));
             C[1] = ares_h2_mul(S[1], ares_h2_const(-CODE_OFFSET));
+        }
+    }
+    // For the few-row kernels, see AresHdrK4: (d of row g, of row g + 8) and for Q4_1
+    // and Q5_1 (m of row g, of row g + 8).
+    static constexpr bool MIN = M_AT >= 0;
+    static constexpr int OFFSET = M_AT >= 0 ? 0 : CODE_OFFSET;
+    struct Scale {
+        uint32_t v[2];
+    };
+    template <int j, int kk>
+    static __device__ __forceinline__ Scale scale(const State& s) {
+        Scale r;
+        r.v[0] = s.cur[(kk / 2) * MW];
+        r.v[1] = M_AT >= 0 ? s.cur[(kk / 2) * MW + 1] : 0u;
+        return r;
+    }
+    template <int h>
+    static __device__ __forceinline__ uint32_t weight(const Scale& r, uint32_t c) {
+        if constexpr (M_AT >= 0) {
+            return ares_h2_bits(__hfma2(ares_h2_of(c), ares_h2_lane<h>(r.v[0]), ares_h2_lane<h>(r.v[1])));
+        } else {
+            return ares_h2_bits(__hmul2(ares_h2_of(c), ares_h2_lane<h>(r.v[0])));
         }
     }
 };
@@ -401,6 +499,25 @@ struct AresHdrX4 {
         S[1] = ares_h2_dup_hi(v);
         C[0] = ares_h2_mul(S[0], ares_h2_const(-128));
         C[1] = ares_h2_mul(S[1], ares_h2_const(-128));
+    }
+    // For the few-row kernels, see AresHdrK4: (S of row g, of row g + 8).
+    static constexpr bool MIN = false;
+    static constexpr int OFFSET = 128;
+    struct Scale {
+        uint32_t v[2];
+    };
+    template <int j, int kk>
+    static __device__ __forceinline__ Scale scale(const State& s) {
+        constexpr int ib = 2 * j + kk / 2;
+        Scale r;
+        const uint32_t x = ares_h2_of_bytes(s.sc[0][ib / 4], s.sc[1][ib / 4], ib % 4, ib % 4);
+        r.v[0] = ares_h2_mul(ares_h2_sub(x, ares_h2_const(1024 + 32)), s.dd);
+        r.v[1] = 0;
+        return r;
+    }
+    template <int h>
+    static __device__ __forceinline__ uint32_t weight(const Scale& r, uint32_t c) {
+        return ares_h2_bits(__hmul2(ares_h2_of(c), ares_h2_lane<h>(r.v[0])));
     }
 };
 
@@ -726,12 +843,164 @@ struct AresMmrCodes {
     }
 };
 
+// What a lane holds of a matrix for the few-row kernels (`ares_mmr_few`, mmr.cuh): one tile
+// per `Warp`, the planes of the step in work and of the next steps in registers (SETS sets,
+// the step j of a super-block uses set j % SETS, so that no register is ever moved), the
+// header of the super-block in work, and the weights of a slab made with the fewest
+// instructions that keep the arithmetic: the code of a value is cut out of its word where it
+// lies (a mask, in place whenever the field and the bits above it stay in the 10 bits of an
+// f16 mantissa below 1024), put into the mantissa of 1024 and brought back to the exact
+// code (minus the offset of the type) by one `HFMA2` that scales by the power of two it
+// was left at, then `weight` of the header makes the value.
+template <class P, int SETS>
+struct AresFewCodes {
+    using H = typename P::Hdr;
+    static constexpr int LB = P::LB, HB = P::HB, LW = P::LB, HW = P::HB;
+    static constexpr int HN = HW > 0 ? HW : 1;
+    static_assert(SETS == 2 || SETS == 4, "the set of a step is a constant of the 4 steps of a super-block");
+
+    struct Warp {
+        const uint32_t* low;
+        const uint32_t* high;
+        const uint8_t* hdr;
+        size_t n_tiles;
+        uint32_t tile, n_in, lane;
+        // The warp's part of K ends before this super-block.
+        uint32_t sb_end;
+    };
+    struct Tile {
+        uint32_t lx[SETS][LW];
+        uint32_t hx[SETS][HN];
+        typename H::State h;
+        typename H::Scale sc;
+    };
+
+    static __device__ __forceinline__ void open_warp(Warp& wp, const uint8_t* w, uint32_t n_out, uint32_t n_in, uint32_t tile, uint32_t lane) {
+        wp.n_tiles = (n_out + 15) / 16;
+        const uint32_t n_steps = n_in / 64;
+        wp.tile = tile;
+        wp.n_in = n_in;
+        wp.lane = lane;
+        wp.sb_end = n_in / 256;
+        const size_t units = wp.n_tiles * n_steps * 32;
+        const size_t at = static_cast<size_t>(tile) * n_steps * 32 + lane;
+        const uint32_t* base = reinterpret_cast<const uint32_t*>(w);
+        wp.low = base + at * LW;
+        wp.high = base + units * LW + at * HW;
+        wp.hdr = w + units * (LW + HW) * 4;
+    }
+
+    static __device__ __forceinline__ void load(Tile& tl, const Warp& wp, uint32_t step, int set) {
+        ares_ld_plane<LW, true>(wp.low + static_cast<size_t>(step) * 32 * LW, tl.lx[set]);
+        if constexpr (HW > 0) {
+            ares_ld_plane<HW, true>(wp.high + static_cast<size_t>(step) * 32 * HW, tl.hx[set]);
+        }
+    }
+
+    // Starts at super-block sb: its first SETS - 1 steps are asked for.
+    static __device__ __forceinline__ void open(Tile& tl, const Warp& wp, uint32_t sb) {
+#pragma unroll
+        for (int d = 0; d < SETS - 1; d++) {
+            if (4 * sb + d < 4 * wp.sb_end) {
+                load(tl, wp, 4 * sb + d, d);
+            }
+        }
+        H::open(tl.h, wp.hdr, wp.n_tiles, wp.tile, wp.n_in, wp.lane, sb);
+    }
+
+    // `__syncwarp` after a load keeps it where it was written: left to itself the compiler
+    // moves the loads of a step to where their registers are first needed, and every super-block
+    // then waits for its weights.
+    static __device__ __forceinline__ void super_block(Tile& tl, const Warp& wp, uint32_t sb) {
+        H::super_block(tl.h, sb, wp.sb_end);
+        __syncwarp();
+    }
+
+    // The start of step j of the super-block: asks for the step SETS - 1 on, into the set
+    // the step before used.
+    template <int j>
+    static __device__ __forceinline__ void begin(Tile& tl, const Warp& wp, uint32_t step) {
+        if (step + SETS - 1 < 4 * wp.sb_end) {
+            load(tl, wp, step + SETS - 1, (j + SETS - 1) % SETS);
+        }
+        H::step(tl.h, step, 4 * wp.sb_end);
+        __syncwarp();
+    }
+
+    // The f16 pair of the codes of register i of slab kk, minus the offset of the type.
+    template <int kk, int i>
+    static __device__ __forceinline__ uint32_t code_pair(const uint32_t (&lw)[LW], const uint32_t (&hw)[HN]) {
+        constexpr int OFFSET = H::OFFSET;
+        constexpr int wl = ares_plane_word(LB, kk, i), sh = ares_plane_shift(LB, kk, i);
+        constexpr uint32_t bias = 0x64006400u;
+        if constexpr (LB == 8) {
+            // Whole bytes: `prmt` puts the byte and 0x64 together.
+            const uint32_t x = __byte_perm(lw[wl], 0x64646464u, (i % 2 == 0) ? 0x4240u : 0x4341u);
+            return ares_h2_sub(x, ares_h2_const(1024 + OFFSET));
+        } else {
+            constexpr bool in_place = sh + LB + HB <= 10;
+            constexpr int at = in_place ? sh : 0;
+            constexpr uint32_t low_mask = ((1u << LB) - 1) * 0x00010001u;
+            uint32_t x = (in_place ? (lw[wl] & (low_mask << sh)) : ((lw[wl] >> sh) & low_mask)) | bias;
+            if constexpr (HB > 0) {
+                constexpr int hp = ares_plane_shift(HB, kk, i), hi = ares_plane_word(HB, kk, i);
+                constexpr int to = at + LB;
+                constexpr int d = hp - to;
+                constexpr uint32_t high_mask = (((1u << HB) - 1) * 0x00010001u) << to;
+                const uint32_t moved = d >= 0 ? (hw[hi] >> (d >= 0 ? d : 0)) : (hw[hi] << (d < 0 ? -d : 0));
+                x |= moved & high_mask;
+            }
+            if constexpr (at == 0) {
+                return ares_h2_sub(x, ares_h2_const(1024 + OFFSET));
+            } else {
+                // x = 1024 + code 2^at: (x / 2^at) - (1024 / 2^at + OFFSET) is exact.
+                return ares_h2_fma(x, ares_h2_pow2_down(at), ares_h2_const(-((1024 >> at) + OFFSET)));
+            }
+        }
+    }
+
+    template <int j, int kk>
+    static __device__ __forceinline__ void fragment(Tile& tl, uint32_t (&a)[4]) {
+        constexpr int set = j % SETS;
+        if constexpr (kk % (H::GROUP / 16) == 0) {
+            tl.sc = H::template scale<j, kk>(tl.h);
+        }
+        if constexpr (P::TABLE) {
+            // The 16 levels of IQ4_NL + 128, four to a word. `prmt` looks four codes up at once
+            // in eight of them (the low three bits of a nibble of the selector pick a byte); a
+            // second one takes each byte from the low or the high eight by the fourth bit of
+            // its code.
+            const uint32_t t0 = 0x3F2D1801u, t1 = 0x766A5D4Fu, t2 = 0xA6998D81u, t3 = 0xF1D9C5B5u;
+            const uint32_t w = tl.lx[set][kk];
+            const uint32_t even = __byte_perm(__byte_perm(t0, t1, w), __byte_perm(t2, t3, w), 0x3210u | ((w >> 1) & 0x4444u));
+            const uint32_t wo = w >> 16;
+            const uint32_t odd = __byte_perm(__byte_perm(t0, t1, wo), __byte_perm(t2, t3, wo), 0x3210u | ((wo >> 1) & 0x4444u));
+            // Register i is the pair (even byte i, odd byte i): two `prmt` bring the pairs of
+            // registers 0, 1 and 2, 3 together, one more per register puts the 0x64 behind each
+            // byte (the f16 pair 1024 + byte).
+            constexpr uint32_t bias = ares_h2_const(1024 + H::OFFSET);
+            const uint32_t pairs01 = __byte_perm(even, odd, 0x5140), pairs23 = __byte_perm(even, odd, 0x7362);
+            a[0] = H::template weight<0>(tl.sc, ares_h2_sub(__byte_perm(pairs01, 0x64646464u, 0x4140), bias));
+            a[1] = H::template weight<1>(tl.sc, ares_h2_sub(__byte_perm(pairs01, 0x64646464u, 0x4342), bias));
+            a[2] = H::template weight<0>(tl.sc, ares_h2_sub(__byte_perm(pairs23, 0x64646464u, 0x4140), bias));
+            a[3] = H::template weight<1>(tl.sc, ares_h2_sub(__byte_perm(pairs23, 0x64646464u, 0x4342), bias));
+        } else {
+            a[0] = H::template weight<0>(tl.sc, code_pair<kk, 0>(tl.lx[set], tl.hx[set]));
+            a[1] = H::template weight<1>(tl.sc, code_pair<kk, 1>(tl.lx[set], tl.hx[set]));
+            a[2] = H::template weight<0>(tl.sc, code_pair<kk, 2>(tl.lx[set], tl.hx[set]));
+            a[3] = H::template weight<1>(tl.sc, code_pair<kk, 3>(tl.lx[set], tl.hx[set]));
+        }
+    }
+};
+
 // The layout of a type as the kernels of up to 32 rows read it (`Near`) and as the
 // grouped blocks of a wide product do (`Wide`), and its rearrangement kernel.
 #define ARES_MMR_CODES(TYPE, P)                                                                      \
     using AresMmrNear_##TYPE = AresMmrCodes<P, true, 1>;                                             \
     using AresMmrWide_##TYPE = AresMmrCodes<P, false, 2>;                                            \
+    using AresMmrFew_##TYPE = AresFewCodes<P, 2>;                                                    \
     ARES_KERNEL ares_repack_##TYPE(const uint8_t* src, uint8_t* dst, uint32_t n_out, uint32_t n_in) { \
         ares_repack_codes<P>(src, dst, n_out, n_in);                                                 \
     }                                                                                                \
-    ARES_MMR_KERNELS(TYPE, AresMmrNear_##TYPE, AresMmrWide_##TYPE)
+    ARES_MMR_KERNELS(TYPE, AresMmrNear_##TYPE, AresMmrWide_##TYPE)                                   \
+    ARES_MMF_KERNELS(TYPE, AresMmrFew_##TYPE)

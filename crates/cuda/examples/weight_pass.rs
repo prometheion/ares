@@ -372,11 +372,24 @@ fn run() -> std::result::Result<(), String> {
                 format!("{upto}: {} / {}", r.fast.name, r.exact.name)
             };
             println!(
-                "device {} {:<7} kernels by rows (fast / exact): {}",
+                "device {} {:<7} kernels by rows above {} (fast / exact): {}",
                 options.first_device + d as u32,
                 ty.name(),
+                ares_cuda::FEW_ROWS,
                 table.rows.iter().map(row).collect::<Vec<_>>().join(", ")
             );
+        }
+        // And for every shape of a matrix in the device layout the launch of the few-row
+        // kernels that is the fastest, as a model's loader does.
+        let mut shapes: Vec<(GgmlType, u32, u32)> = slices[d]
+            .iter()
+            .filter(|s| s.layout == WeightLayout::Device)
+            .map(|s| (tensors[s.tensor].ty, s.rows as u32, tensors[s.tensor].dims.get(0) as u32))
+            .collect();
+        shapes.sort_by_key(|(ty, rows, columns)| (ty.id(), *rows, *columns));
+        shapes.dedup();
+        for (ty, rows, columns) in shapes {
+            kernels.tune_layout(ty, rows, columns).map_err(|e| e.to_string())?;
         }
     }
 
