@@ -21,9 +21,10 @@ served by the `ares` binary on one or two GPUs through CUDA, with drafts
 from the model's own draft block, sampling on the device and a prefix cache
 that lets a conversation continue from what was computed; on two GPUs it is
 ahead of the llama.cpp fork it is measured against in prompt processing and
-in generation. Flash-Next runs on two GPUs and agrees with its CPU
-reference, but is not served yet and not yet faster than the engines it is
-measured against. The numbers are in
+in generation. Flash-Next is served by the same binary on two GPUs, with
+drafts from earlier text; it agrees with its CPU reference and generates at
+about 58 tokens per second at the median with drafts, against Strata's 56. It
+has no prefix cache, and reads prompts in steps of eight rows. The numbers are in
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#status).
 
 There is no release yet. The first release is the complete engine: every

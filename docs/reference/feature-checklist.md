@@ -43,7 +43,7 @@ or no-op options; Ares may do a thing differently as long as the result is not w
 
 | ID | Feature | Engines | What it is | Ares | Frame | Need |
 | --- | --- | --- | --- | --- | --- | --- |
-| A01 | Chat completions (OpenAI), streamed and not | llama, ik, kobold, ollama, vllm, sglang, tgi, trt, lmdeploy, tabby, mistralrs, mlc, sonar, localai, strata, tfold, lmstudio | `POST /v1/chat/completions`; SSE chunks with a role chunk, deltas, `finish_reason`, `[DONE]` | done (qwen35 models, text parts only) | yes | essential |
+| A01 | Chat completions (OpenAI), streamed and not | llama, ik, kobold, ollama, vllm, sglang, tgi, trt, lmdeploy, tabby, mistralrs, mlc, sonar, localai, strata, tfold, lmstudio | `POST /v1/chat/completions`; SSE chunks with a role chunk, deltas, `finish_reason`, `[DONE]` | done (qwen35 and qwen4exp models, text parts only) | yes | essential |
 | A02 | Text completions (OpenAI) | llama, kobold, ollama, vllm, sglang, trt, lmdeploy, tabby, tfold, tgi? | `POST /v1/completions` with one string prompt, no chat template | done | yes | common |
 | A03 | Prompt as token ids; several prompts in one request | llama, sglang, tfold (ids), vllm? | `prompt` as a list of ids, or a list of prompts answered as several choices | not started (refused by name) | yes | niche |
 | A04 | Responses API (OpenAI), stateless | llama, ik, vllm, trt, ollama, strata, tfold, mistralrs, lmstudio, swap | `POST /v1/responses` run as the equivalent chat request; typed SSE events, function tools, reasoning items, `text.format` | not started | yes | common |
@@ -177,7 +177,7 @@ or no-op options; Ares may do a thing differently as long as the result is not w
 
 | ID | Feature | Engines | What it is | Ares | Frame | Need |
 | --- | --- | --- | --- | --- | --- | --- |
-| S01 | Continuous batching | llama, fork, vllm, sglang, tgi, trt, lmdeploy, tabby, mistralrs, mlc, sonar, strata, tfold, ollama? | requests join and leave between steps; prompt rows and generation rows share a step | done (qwen35) | yes | essential |
+| S01 | Continuous batching | llama, fork, vllm, sglang, tgi, trt, lmdeploy, tabby, mistralrs, mlc, sonar, strata, tfold, ollama? | requests join and leave between steps; prompt rows and generation rows share a step | done (qwen35, qwen4exp) | yes | essential |
 | S02 | Limit of concurrent sequences | llama, fork, ollama, vllm, sglang, tgi, trt, lmdeploy, tabby, mlc, strata, tfold | `--parallel`, `max_batch_size`, `--max-num-seqs` | done | yes | essential |
 | S03 | Waiting instead of refusing | llama, ollama, tgi, vllm, sglang, tfold, strata | a request that does not fit waits for room | done (pages claimed per step) | yes | essential |
 | S04 | Bounded queue and a refusal that says when to retry | ollama, tgi, vllm, sglang, tfold | limits on queued requests or tokens; 503 or 429 with `Retry-After` and a code | not started | yes | common |
@@ -224,12 +224,12 @@ or no-op options; Ares may do a thing differently as long as the result is not w
 | P16 | K/V of a running sequence beyond VRAM | llama, sglang, strata?, tabby? | a context larger than VRAM holds, the rest in RAM | not started (designed in the RAM broker) | yes | common |
 | P17 | Sparse attention over selected cells | strata, tfold, ik, sglang, trt | for sparse-attention models only the selected cells are read | partly: runs in qwen4exp; kernel choice by measurement and many-row items are open | yes | essential |
 | P18 | Every GGUF weight type on the GPU | llama, ik | all 28 types computed on the quantized data | partly: decode kernels for all 28 on CUDA and Vulkan; many-row kernels with a device layout for 12 | yes | essential |
-| P19 | Expert tiers: VRAM, RAM, SSD | strata, avalon, ik, sglang, tfold | hot experts in VRAM slots, more in RAM the engine owns, the rest read from the file | partly: runs for qwen4exp in a session of its own; not behind the runtime, not served | yes | essential |
+| P19 | Expert tiers: VRAM, RAM, SSD | strata, avalon, ik, sglang, tfold | hot experts in VRAM slots, more in RAM the engine owns, the rest read from the file | partly: runs for qwen4exp behind the runtime and the server, the RAM tier within the one RAM limit; the tier does not give memory back, and experts are not read ahead of their routers | yes | essential |
 | P20 | The CPU computes experts that are not on a GPU | llama, ik, kobold, avalon, strata, tabby | missed experts run on the CPU while the GPU runs the cached ones | partly: in the expert store of P19, with its limits | yes | essential |
-| P21 | Expert election by heat, prefetch | strata, avalon, ik | the cached set follows use; the next experts are fetched ahead | partly: heat and the split of slots are used; guesses and the token table are not used by a running model | yes | common |
+| P21 | Expert election by heat, prefetch | strata, avalon, ik | the cached set follows use; the next experts are fetched ahead | partly: heat and the split of slots are used by qwen4exp; guesses and the token table are not used by a running model | yes | common |
 | P22 | Expert pruning | ik, avalon, strata | low-ranked experts are skipped: speed for quality (SER, tail skip) | partly: the routing bias is built and not used | yes | niche |
 | P23 | Expert statistics export | sglang, vllm | record and dump how often each expert is routed; routed experts returned with a reply | not started | yes | niche |
-| P24 | Layer split across GPUs | llama, kobold, ollama, strata, avalon, tabby | each GPU holds a range of blocks | partly: qwen35 runs; the model's drafts do not run under a layer split | yes | common |
+| P24 | Layer split across GPUs | llama, kobold, ollama, strata, avalon, tabby | each GPU holds a range of blocks | partly: qwen35 and qwen4exp run; the model's drafts do not run under a layer split | yes | common |
 | P25 | Tensor split across unequal GPUs | fork, llama, ik, tabby; vllm, sglang, trt, tgi, lmdeploy, mlc with equal shards | each GPU holds a slice of every block, shares by speed and memory, sums over peer access or the host | done (qwen35; shares from the bandwidth the devices report) | yes | essential |
 | P26 | Automatic placement | llama, ollama, kobold, ik, tabby, mistralrs, strata | devices, split, shares and context chosen from what the GPUs report (`--fit`, autosplit, `tune`) | done | yes | essential |
 | P27 | Manual placement | llama, fork, tabby, kobold | devices, split kind and shares can be given; llama and fork also per tensor and per attention head (`-ot`, `attn-split`) | done (`--devices`, `--split`, `--shares`; no per-tensor override) | yes | common |
@@ -382,9 +382,9 @@ S16, S18 to S20, S23; P02, P05, P07, P08, P12, P23, P32, P34; M07, M09, M12, M13
 X03, X06, X11; Q05.
 
 The rows that are `partly` are not in this list; the largest of them are Vulkan (H02: no attention, sampler,
-expert kernels and no model, against the frame's "full parity"), the mixture-of-experts model behind the server
-(P19 to P21, S10), the low-bit K/V formats (P14), the RAM and disk tiers of the cache (S12, S13), the per-request
-thinking switch (K02) and the prompt next to generation (S05).
+expert kernels and no model, against the frame's "full parity"), the mixture-of-experts model without a prefix cache
+(S10) and the open parts of its tiers (P19 to P21), the low-bit K/V formats (P14), the RAM and disk tiers of the
+cache (S12, S13), the per-request thinking switch (K02) and the prompt next to generation (S05).
 
 ## List 2: outside the frame, in many engines (for the user to decide)
 

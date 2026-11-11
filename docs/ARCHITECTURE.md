@@ -175,10 +175,10 @@ machine (RTX 4070 + RTX 3060, Qwen3.8-27B) or read from the engines listed in
 | `ares-sched` | Step planner (generation, decision rows and prompts in one step), admission (pages claimed per step, a reservation that corrects itself, a queue instead of refusals), the order of a pass for long prompts of a model with experts, step time model with a term for the context, draft length choice, the lookup drafter on a suffix automaton shared by all sequences | Done; unit and model tests; the conductor uses the planner, admission (without spill), the lookup drafter and the step cost |
 | `ares-weights` | Expert heat, tiers that are elected and fed by reads (admission, protection, guesses bound late, slots given back), slots per layer by need, the waves of experts of a pass, a token table for the first layers, the lookahead distance, routing bias for pruning | Done, unit tested; the expert store uses the slot sets, the heat and the split of slots; guesses, the token table and pruning are not used by a running model yet |
 | `ares-api` | Request, event, decision and error types; the `Engine` trait between HTTP and the runtime (`submit` for generation, `decide` for decisions, `stats`, `chat_format` for what a model's chat template declares about thinking) | Done, unit tested |
-| `ares-server` | The `ares` binary: loads a model on the devices and serves it over an OpenAI-compatible HTTP API, with the plan of devices, split, shares and context made from what the devices report | Serves `qwen35` models (chat and plain completions, streamed and not, timings, metrics, staged shutdown, the reasoning of a reply apart from its content and in the history, with llama-server's controls for thinking); 136 tests without a GPU, 9 that start the real binary and 3 that run the engine in the test's process; the prefix cache is on, with `--ram` for the engine's RAM; no router mode, no multimodal input, no tool calls, `/v1/systemone` answers 501 |
-| `ares-runtime` | The conductor thread and one thread per device, the step loop that connects plan, state and kernels, admission, speculation with the lookup drafter and with a model's own drafts, the `Model` trait a model implements, a synthetic model that drives the real kernels, and the expert store (VRAM slots, RAM tier, reads, the CPU computing what is not on a GPU) | Drives `qwen35` on one device, in tensor split and in layer split, with picks made on the device; implements `Engine::submit` (not `decide`); the prefix cache is in the conductor, checked against the host executor as an oracle and carried out by `qwen35` on the devices (checkpoints in page-locked RAM within one RAM limit, `PinnedRam`), and there is no spill of pages to RAM (a request that gives way stays in the pool's cache); the expert store is driven by `qwen4exp`'s own session, not by the conductor |
-| `ares-model` | Model architectures: configuration and weight table from a GGUF, a CPU reference of the forward pass with explicit state (window and commit) that GPU implementations are compared with block by block, and the implementation on the devices | `qwen35` (Qwen3.5-0.8B, Qwen3.8-27B) runs through the runtime and the server, with the model's draft block. `qwen4exp` (Qwen3.8-Flash-Next) runs on one or two cards through a session of its own, without drafts. See [Several devices](#several-devices) |
-| `ares-tokenizer` | Text to token ids and back for byte-level BPE (`gpt2` with the `qwen35` pre-tokenizer) as llama.cpp does it, malformed UTF-8 included; control tokens in text only on request; encoding on several threads for long prompts; a streaming decoder that never cuts a character; the chat templates of the model file (Jinja, a dialect of its own that errors on what it does not support) with tools and the generation prompt, and the format of a template's thinking read off it by comparing renderings (`ReasoningFormat`) | Done; token ids equal llama.cpp's on millions of generated and real texts for the three Qwen test models, chat prompts equal on thousands of conversations; about 20 times llama.cpp's encode speed on one core |
+| `ares-server` | The `ares` binary: loads a model on the devices and serves it over an OpenAI-compatible HTTP API, with the plan of devices, split, shares and context made from what the devices report | Serves `qwen35` and `qwen4exp` models (chat and plain completions, streamed and not, timings, metrics, staged shutdown, the reasoning of a reply apart from its content and in the history, with llama-server's controls for thinking); TESTS_NO_GPU tests without a GPU, TESTS_REAL that start the real binary and 3 that run the engine in the test's process; for `qwen35` the prefix cache is on, with `--ram` for the engine's RAM, for `qwen4exp` the RAM is mostly the tier of experts; no router mode, no multimodal input, no tool calls, `/v1/systemone` answers 501 |
+| `ares-runtime` | The conductor thread and one thread per device, the step loop that connects plan, state and kernels, admission, speculation with the lookup drafter and with a model's own drafts, the `Model` trait a model implements, a synthetic model that drives the real kernels, and the expert store (VRAM slots, RAM tier, reads, the CPU computing what is not on a GPU) | Drives `qwen35` on one device, in tensor split and in layer split, with picks made on the device; implements `Engine::submit` (not `decide`); the prefix cache is in the conductor, checked against the host executor as an oracle and carried out by `qwen35` on the devices (checkpoints in page-locked RAM within one RAM limit, `PinnedRam`), and there is no spill of pages to RAM (a request that gives way stays in the pool's cache); the expert store is driven by the device threads of `qwen4exp` (see [Qwen3.8-Flash-Next through the runtime](#qwen38-flash-next-through-the-runtime)) |
+| `ares-model` | Model architectures: configuration and weight table from a GGUF, a CPU reference of the forward pass with explicit state (window and commit) that GPU implementations are compared with block by block, and the implementation on the devices | `qwen35` (Qwen3.5-0.8B, Qwen3.8-27B) runs through the runtime and the server, with the model's draft block. `qwen4exp` (Qwen3.8-Flash-Next) runs through the runtime and the server on one or two cards, with drafts from earlier text, and through a session of its own that tests and measurements use. See [Several devices](#several-devices) |
+
 
 Both test architectures are specified under [reference/](reference/):
 [qwen35](reference/qwen35-architecture.md) and
@@ -241,7 +241,11 @@ wait for the end of its step.
 
 A model plugs in through the `Model` trait (what it is, its split over
 devices, its page layout, and `open` on each device's thread) and
-`DeviceModel::enqueue`, which queues the kernels of a step and never waits.
+`DeviceModel::enqueue`, which queues the kernels of a step and never waits. A
+model whose step needs the host to go on while the device runs, because a layer
+waits for an expert that the host brings, also serves that in
+`DeviceModel::wait`, where the thread would otherwise block in the driver for the
+end of its step.
 A model whose device side carries out the step record's copies and replay
 segments says so (`Model::prefix_cache`, with the bytes of one checkpoint on
 each device) and takes part in the prefix cache; one that does not has none.
@@ -759,7 +763,8 @@ pages) and comes with the runtime.
   exempts; re-electing the tier every x tokens keeps the experts a run needs
   and drops the rest. This trades a bounded loss of quality for never
   fetching cold experts and is off by default.
-- **Reading from SSD** (`ares-io`; not yet connected to the tiers): experts
+- **Reading from SSD** (`ares-io`; the expert store and the n-gram rows of
+  `qwen4exp` read through it): experts
   are read in place from the GGUF at `offset + e * stride` with direct I/O
   through `io_uring` into buffers the caller provides (pinned staging buffers
   of a GPU backend), demand reads before read-ahead, which is cut into chunks
@@ -852,7 +857,7 @@ pages) and comes with the runtime.
 - **Hashed-row tables**: for models with n-gram embedding tables (28.8 GB for
   `qwen4exp`) the row ids follow from the last tokens on the host, so the
   reads are issued when the token is known and collected before the layer
-  that needs them, behind a row cache (`ares-io`; not yet connected).
+  that needs them, behind a row cache (`ares-io`; `qwen4exp` does this).
 
 ## Devices
 
@@ -1492,14 +1497,223 @@ fetched, and an upload to the RTX 3060 takes 0.4 ms over its link.
 Against the CPU reference the largest logit of a prompt's last token is the
 reference's in every run, 9 or 10 of the 10 largest agree, and the next
 token is the reference's in 159 or 160 of 160 German and 79 of 80 English
-rows; the rows that differ are near ties. The model runs through a session
-of its own, with at most eight rows per step: prompts are read at 54 to 73
-tokens per second *(agent)*, bound by experts that have to be fetched.
+rows; the rows that differ are near ties. The tool steps the model through a
+session of its own, with at most eight rows per step: prompts are read at 54 to
+73 tokens per second *(agent)*, bound by experts that have to be fetched. The
+server runs it through the runtime (see below).
 
 An expert that is in no slot can be computed on the CPU instead of being
 uploaded, chosen per expert by measured cost. On the recorded routing with
 few slots that took the expert path from 33 to 44 steps per second; with 99
 % of the picks in a slot it makes no measurable difference to the model.
+
+### Qwen3.8-Flash-Next through the runtime
+
+`ares --model <first part of the file>` serves Qwen3.8-Flash-Next like the
+27B: the same endpoints, timings and metrics, the conductor's lookup drafts,
+cancellation, a request that gives way and comes back, several sequences in a
+step. The model is `ares_model::qwen4exp::device::Qwen4Exp`, its parts
+`Qwen4ExpDevice`; `Session` stays as the tool's and the tests' way to step it
+by hand (and for the probes that compare layer by layer).
+
+**A step that has to wait for experts.** The experts a layer needs are known
+when its router has run, so a step cannot be enqueued whole and left alone:
+an expert that is in no slot is brought (uploaded, or computed by the CPU)
+while the device waits for it, and the host that brings it must still be
+running. What was chosen:
+
+- A device thread enqueues its part layer by layer and stays at most six
+  layers ahead of the route records the store has handled. A host that went
+  on would fill the driver's queue, block inside a launch and then no longer be
+  able to bring the expert its device waits for; the session found that, and
+  the number is the session's.
+- The store has one owner at a time and sits behind a lock that no thread waits
+  for in a step. Whoever finds it free serves it for all parts (hands over the
+  records that arrived, polls reads and copies), and whoever does not goes on.
+  A thread serves it whenever it would wait: for the lead, for the rows of the
+  n-gram table, and for the end of its step. For that last one the runtime has
+  a hook, `DeviceModel::wait`, where it used to block in the driver; the
+  default still blocks, and `picked` tells the device with the head what was
+  picked, so that the rows of the n-gram table for the next token are read
+  while the conductor still decides.
+- The first part to reach a step begins it for the store, the last to end it
+  ends it. A part that fails makes the others give up, and a step that stands
+  still for 30 s ends with an error that says what it waited for.
+- The conductor sees none of this. It dispatches a step and collects it when
+  every device has ended; a step that misses experts is a longer step, and
+  cancellation and new requests are handled between steps as for any model.
+  The only protection of other sequences is the planner's: the prompt rows
+  next to generating ones are bounded by the cost line it measures. A step of
+  eight prompt rows takes about 70 ms (a prompt of 1000 tokens, 125 steps, 8.7
+  s) against 22 ms for a step of one row, because every row routes to experts
+  of its own, so a sequence that generates while a prompt is read is slowed to
+  about that step time per token; whether the planner's linear cost line
+  holds the prompt's share down well for this model was not checked. Taking
+  the missing experts of a step's rows apart, to let the rows that have theirs
+  run first, is not built.
+
+Both placements work through the same code. By layers, the second device
+receives the residual through the runtime's links; with both cards on every
+layer the two parts exchange partial results in memory they write to each
+other, and the runtime builds no path (`Split::Shared`). Page tables follow the
+conductor's updates (a part keeps a mirror of them in page-locked memory and
+copies the ranges that changed), K and V and the keys of the indexer live in
+the pages the runtime allocates (`Frame`'s layout, 13.9 MiB per 1000 cells on
+the card with the attention layers), and the logits of the wanted rows stay on
+the device for the sampler.
+
+**Measured through the server** (2026-11-11, RTX 4070 and RTX 3060, the
+engine started with `--chat-var enable_thinking=false` and otherwise its
+defaults, greedy, 128 tokens, a prompt of about 1000 tokens: 1000 German, 1070
+English, 1034 Rust; load average 12 to 18 from other agents' builds unless
+said; the numbers are of the second and third of three rounds of the same
+three prompts, after the warm-up and a round that fills the slots):
+
+| | Both on every layer, drafts | The same, `--drafts 0` | A range of layers each, drafts |
+| --- | --- | --- | --- |
+| Generation, German / English / code | 46 and 45 / 44 and 110 / 70 and 73 tokens/s | 44 and 46 / 48 and 43 / 42 and 42 | 27 and 45 / 16 and 42 / 56 and 74 |
+| A short question (25 tokens), German / English / code | 59 and 68 / 45 and 60 / 54 and 57 | 39 and 37 / 42 and 40 / 33 and 33 | 29 and 69 / 61 and 46 / 38 and 55 |
+| Time to the first token, prompt of 1000 tokens | 8.4 to 15.8 s | 8.7 to 13.4 s | 10.1 to 20.6 s |
+| Time to the first token, short question | 0.30 to 0.43 s | 0.30 to 0.46 s | 0.29 to 0.52 s |
+| Prompt, 1000 tokens | 63 to 128 tokens/s | 77 to 123 | 50 to 106 |
+| Prompt, 2000 tokens | 126 tokens/s | 108 | 72 |
+| The tool, same machine, load 17 to 23 | decode step at 1000 tokens: 23.1 ms median (21.5 to 23.1 at lower loads); prompt of 2000 tokens: 71 tokens/s in steps of eight rows | | |
+
+Without drafts a token takes 20.7 to 23.9 ms, the tool's step (21.5 to 23.1
+ms), so the server adds nothing to it. The median over the six warm runs with
+drafts is 58 tokens per second against Strata's 56 with drafts (44 to 110; what
+the drafts gain depends on the text, as everywhere: English prose at 110
+accepted 95 of 95). Prompts are read at 63 to 139 tokens per second, in steps
+of eight rows, where the tool's earlier measurements were 54 to 73 and Strata's
+42 to 201.
+
+Where the experts were found, per decode step without drafts (480 picks, 10
+experts of 48 layers), second and third round: 6.0 to 15.6 outside a slot for
+English and German prose (1.3 to 3.3 %) and 34 to 37 for code (7 to 8 %), of
+which 0.7 to 2.0 from the file and 5 to 35 from the RAM tier (each miss is
+then computed by the CPU or uploaded, 4.5 to 32 and 2.0 to 17 per step); the
+layers waited 2.3 to 6.6 ms per step in all. Prompt steps (eight rows) pick
+about 40 distinct experts per layer and miss 4 to 15 % of them: 80 to 300 per
+step, 7 to 21 of them from the file. A run of the engine takes 11.4 GiB of each
+card (11 689 and 11 663 MiB in use of 12 GiB: the dense parts are 2.9 GiB on the
+first card and 0.4 on the second, 13 824 expert slots, 5 808 and 8 016, are 56 %
+of the experts, K and V are 13.9 MiB per 1000 tokens, 18 432 tokens in all) and
+10.6 to 11.9 GB of RAM (10.2 GiB of them the tier of 7 488 slots, 30 % of the
+experts), so 87 % of the experts have a slot. Starting takes 11 to 15 s to load and 41 to 44 s
+for the warm-up; the first request after a start without the warm-up took 77
+s for a prompt of 1000 tokens (13 tokens/s), with it 13 to 23 s in four
+sessions and 53 s in one at a load of 15 to 18; a text the warm-up did not
+resemble keeps being slow until its experts have slots.
+
+Against the tool's chat on its two questions the server writes the same
+English text (64 tokens, the second time; the first time it parted after 30
+tokens at a near tie) and, in German, a text of the same kind that starts with
+"Das Sonnenlicht" where the tool's starts with "Sonnenlicht" (a near tie: the
+reference's own text, in `/var/tmp/ares-qwen4exp-trace/german.txt`, has "Das
+Sonnenlicht"). The engine's own test pins the first sentence of the English
+answer to the reference's.
+
+**What the plan decides.** Where the layers go (`--split tensor` or `layer`, by
+default both cards on every layer when each can write the other's memory), the
+context, and the RAM. The dense parts take 2.9 GiB on the first card and 0.4
+on the second; what the cards have left is slots for experts. The context
+costs slots, so without `--context` the K and V of the pool take a
+thirty-second of the room for slots (17 408 to 18 432 tokens for two sequences
+on this machine) where the 27B gets what is left. Options that mean nothing for the
+model are errors that name them: `--shares`, `--precision exact`,
+`--draft-vocab`, K/V formats with a tile mean, and rows that do not fit a step
+of eight (`--parallel`, `--drafts`).
+
+**The RAM.** The tier of experts is a user of the one RAM limit (`--ram`,
+`PinnedRam`): elastic, with a priority above the checkpoints, so the limit
+minus what the engine needs to run (the step buffers and the parts'
+page-locked buffers, 19 MiB) is the tier, as far as the experts that have no
+VRAM slot can use it. The number of RAM slots is what that gives: with the
+default limit (half of the RAM the machine has available when the server
+starts) and 22 GiB available, 10.9 GiB, 7 970 experts. Before this change the
+tier was a third of the available RAM, at most 8 GiB, whatever the RAM limit
+said, and the page-locked buffers of the parts were outside the books.
+
+**What the gap between 17 and 22 ms is made of, and what the size of the tier
+did.** The tool counts, for every decode step at 1000 tokens, the experts the
+routers picked that were in no slot, and splits the steps by what they missed
+(on the recorded routing, 192 steps per run, five runs, load average 6 to 23
+from other agents' builds, so the milliseconds differ between runs and the
+classes within a run are what to read; the ranges leave out the run at a load
+of 14, whose medians were 25.1, 31.5 and 42.6 ms):
+
+| Steps | Share | Median |
+| --- | --- | --- |
+| No expert outside a slot | 2 to 6 % | 17.3 to 20.4 ms |
+| Misses served from the RAM tier or computed by the CPU only (3 to 5 of them) | 23 to 31 % | 17.5 to 19.1 ms |
+| At least one expert read from the file (2 to 3 of them, among 6 to 17 misses) | 62 to 72 % | 24.2 to 29.5 ms |
+
+A miss served from RAM costs an upload of 0.1 ms at the median and the CPU
+computes the others while the device runs, so neither shows in the step: the
+steps with such misses take as long as the steps with none. The 5 to 12 ms
+above that belong to the experts read from the file, 2 to 3 per step at 2.4 to
+3.3 ms at the median and 3.7 to 11 ms at the 99th percentile each, which the
+device waits for in the layer that needs them, both cards at once. Most steps
+have one, which is why the median (21 to 23 ms) is far above the 17 ms of the
+steps that have none and the mean (24 to 30 ms) above the median. The rows of
+the n-gram table were not part of it (0.07 to 1.0 ms per step below a load of
+9, read ahead from the picks).
+
+Those reads are experts used for the first time in a run, or used again after
+a tier let them go, so the size of the tier decides how many of them there are
+only when the text comes back to experts it has left. With the profile loaded
+the tool reads the same 3.0 experts per step with a tier of 5 472 slots and
+with 8 064 (22.6 and 22.8 ms at the median in two runs back to back at a load
+of 6 to 7; the second pair, 21.5 and 37.0 ms, ran at loads of 8 and 14 and
+says only that the load decides). Through the server, with a new text every
+request, the size decides a great deal. The same
+prompts in a server per tier, load average 12 to 13 (15 to 18 for the
+second), round 1 of 2 or 3, tokens per second with the lookup drafts:
+
+| Tier (`--ram`) | RAM slots | Experts with a slot | File reads per step, prompt rows | File reads per step, decode | Generation: German / English / code | Prompt, 1000 tokens |
+| --- | --- | --- | --- | --- | --- | --- |
+| 7.5G, the third of the available RAM the tier took before | 5 472 | 78.5 % | 20.8 / 14.1 / 46.1 | 4.7 / 2.1 / 13.5 | 37.7 / 43.1 / 51.2 | 69 / 101 / 57 |
+| default, half of the available RAM as the limit | 7 488 | 86.7 % | 11.0 / 6.9 / 20.6 | 3.3 / 0.9 / 6.1 | 46.4 / 43.9 / 69.6 | 63 / 102 / 81 |
+| 16G | 11 712 | all | 0.2 / 0.1 / 0.7 | 0.6 / 0.2 / 0.2 | 75.5 / 44.2 / 103.9 | 139 / 137 / 127 |
+
+The default now takes the limit less the engine's buffers (10.3 GiB of 20.65
+GiB available when the server started) where it took a third of the available
+RAM, 7.5 GiB, outside the books of the limit; that is 37 % more slots and about
+half the reads from the file. With a limit that lets the tier hold every
+expert the VRAM has no slot for (about 16 GiB on this machine), reads from the
+file stop after the first use of an expert. Raising `--ram` is the lever, and
+how much RAM is free is the user's to say; the limit is not raised by itself.
+The tier does not shrink if another user of the machine needs the memory.
+
+**Taking part in the prefix cache** (`prefix_cache()` is `None`: every prompt
+is computed from its first token, a request that gives way comes back as a
+prompt of all its tokens) needs the device side to carry out what the step
+record asks: the saves and restores of the recurrent state of a slot (the
+convolution windows and delta matrices of 36 layers, the n-gram history and the
+carried indexer state of the attention layers: 112 MiB over both cards per
+slot, which would be a checkpoint), the copies of a page's entry (K, V and the
+keys of every attention layer), and replay segments, rows that rebuild
+recurrent state from cached cells and append nothing (the K/V append, the
+indexer's window and the n-gram commit would skip them). The host side needs
+the n-gram feed to be told what the cached prefix's last tokens were, because
+it keeps them per sequence for the hash of the rows of the table. The
+conductor's part, and the places for checkpoints in `PinnedRam`, exist.
+
+**Where a faster prompt path plugs in.** A step has at most eight rows
+(`Model::max_rows`, the expert kernels' bound; `Frame` sizes the scratch by
+it), and every row routes to its own experts, so a prompt of N tokens is N / 8
+steps that each miss. The kernels with many rows go in `Part::moe` (the
+`ExpertKernels::experts` call, which takes 1 to 8 rows) and in the scratch
+sizes of `Frame`. The prompt pass that streams whole layers (`ares_sched::Pass`
+and `ExpertStore::plan_waves` / `wave`, built and unused) goes where the
+per-layer follow of the route records is now: `Flow::pump` hands a layer's
+record to the store, and a pass would hand it the layer's counts for all rows
+of the prompt instead and enqueue the waves; `Part::begin`, `enqueue_layer`
+and `end` are already per layer, the hidden states of the prompt's rows would
+need a buffer of their own on the device, and the conductor would run the
+pass's pieces between ordinary steps. Nothing of that is in this change, and
+nothing here makes the prompt path slower than the session's: prompts of 1000 and 2000 tokens read at 63 to 139 and 72 to 126 tokens per second
+through the server against 71 for the tool, in steps of eight rows.
 
 ### Vulkan
 
@@ -1593,14 +1807,16 @@ Work is paused here until Qwen4 is released; nothing below is in progress.
   model's own drafts against 62 to 67. Through HTTP it is as fast as without.
   See [Several devices](#several-devices).
 - **Qwen3.8-Flash-Next** runs on both cards, agrees with the CPU reference
-  and answers in German and English. A decode step at 1000 tokens of context
-  takes a median of 22.3 ms without drafts (about 45 tokens per second; a
-  step that misses no expert takes 17 ms). Strata generates at a median of
-  56 tokens per second with drafts on this machine, so this model is not
-  ahead of its reference engine yet: it has no drafts, and prompts are read
-  at 54 to 73 tokens per second in steps of eight rows (the session still
-  calls the eight-row expert kernels; the many-row ones are built and not
-  wired).
+  and answers in German and English, and is served by the `ares` binary like
+  the 27B, in both placements, with drafts from earlier text: 58 tokens per
+  second at the median of six runs at about 1000 tokens of context (44 to 110
+  by text), 43 to 48 without drafts (a decode step takes 22 to 23 ms, 17 ms
+  when it misses no expert), prompts of 1000 tokens at 63 to 139 tokens per
+  second. Strata generates at a median of 56 tokens per second with drafts on
+  this machine. The model's own draft block is not used yet, and prompts are
+  read in steps of eight rows, on the eight-row expert kernels (the many-row
+  ones are built and not wired; see [Qwen3.8-Flash-Next through the
+  runtime](#qwen38-flash-next-through-the-runtime)).
 - CUDA has every kernel family the two models need: weights for all 28
   types (twelve with a device layout that serves every row count from one
   copy), layers, attention over the stored K/V formats, sampler, sums
@@ -1620,7 +1836,9 @@ Work is paused here until Qwen4 is released; nothing below is in progress.
   its first token after about 0.14 s instead of 25 s; see "Sequence state"),
   the usage of an answer says how much came from the cache, and the engine's
   RAM is one setting (`--ram`).
-- Known defects: a warm-up step that fails hangs the start of the runtime
+- Known defects: a long prompt next to a generating Flash-Next sequence slows
+  it by the misses of the prompt's rows (nothing separates the two inside a
+  step); a warm-up step that fails hangs the start of the runtime
   instead of reporting; the first token of a prompt that arrives next to a
   drafting sequence takes about 0.4 s; with the fast kernels the text with
   drafts is not always the text without (with exact products it is, for
@@ -1641,9 +1859,10 @@ order it would be taken up; the source of each idea is in
    files need.
 2. The mixture-of-experts case ahead of Strata: drafts from the model's
    draft block; the prompt path (experts in waves and steps of more than
-   eight rows, on the many-row expert kernels, which are built); the model behind the
-   runtime's `Model` with flow control by route records, so the server can
-   serve it; owners of experts that follow the heat.
+   eight rows, on the many-row expert kernels, which are built; where it plugs
+   in is described under "Qwen3.8-Flash-Next through the runtime"); reading the
+   experts the next layers will pick before their routers have run; owners of
+   experts that follow the heat; the tier of experts giving memory back.
 3. Attention for models that attend a few thousand cells through lists: the
    kernel chosen by a measurement on the device, staged loads where they
    pay, one launch per row, items of twelve query heads, rows of a prompt
@@ -1653,7 +1872,8 @@ order it would be taken up; the source of each idea is in
    of the prompt now), a warm pass in the background, spill of a sequence to
    RAM, pages and checkpoints that move between VRAM, RAM and `ares-store`
    (and so survive a restart), locking the RAM of the next chunk of places
-   ahead of its first use, and `qwen4exp` with a cache.
+   ahead of its first use, and `qwen4exp` with a cache (what that needs is
+   under "Qwen3.8-Flash-Next through the runtime").
 5. A kernel for one to three rows on the device layout that is not slower
    than the integer kernels, so the dense model can hold every matrix in it;
    shares of a tensor split from a measurement at load; device layouts for
@@ -1674,7 +1894,7 @@ share.
 | User | Kind | When memory is short |
 | --- | --- | --- |
 | K/V pages of running sequences that do not fit in VRAM (KV offload) | Required | Never gives way; everything below shrinks for it |
-| RAM tier of MoE experts | Elastic, high | Shrinks to the working set the running requests need |
+| RAM tier of MoE experts | Elastic, high | Shrinks to the working set the running requests need (it does not shrink yet: nobody competes with it) |
 | Row caches and staging | Elastic, middle | Shrink to a small floor |
 | Prompt cache in RAM (pages of finished conversations) | Elastic, low | Goes first; its pages are on SSD as well |
 
@@ -1686,22 +1906,33 @@ not because a cache holds the memory. VRAM is handled the same way in spirit
 but is planned ahead (ledgers), because moving things there is costly.
 
 **What is built.** The broker is `PinnedRam` (`crates/runtime/src/ram.rs`),
-shared by the executor and the device threads. It has two users so far: the
-step record and the read-back buffers of the devices (required, booked at
-start: `required_ram`) and the checkpoints of recurrent state of the prefix
-cache (elastic, the lowest priority, floor 0), which a device part locks in
-chunks of at least 32 MiB when a place is first used and keeps locked while
-the engine runs. The limit is `GpuConfig::ram_limit`, which the server sets
-from `--ram` (default: half of what the machine reports as available when it
-starts; the log states it and the reason); what the limit leaves after the
-required memory is the checkpoint budget of the conductor
+shared by the executor and the device threads. It has three users so far:
+
+- the step record and the read-back buffers of the devices, with the
+  page-locked buffers a model's parts hold (required, booked at start:
+  `required_ram`, `Model::pinned_ram`);
+- the tier of experts of a mixture-of-experts model (elastic, priority 100,
+  floor 0), which the model locks once at load: as much as the limit leaves
+  and the experts that have no VRAM slot can use. It does not give anything
+  back yet, since nothing ranks above it that could ask;
+- the checkpoints of recurrent state of the prefix cache (elastic, the lowest
+  priority, floor 0), which a device part locks in chunks of at least 32 MiB
+  when a place is first used and keeps locked while the engine runs. They
+  give way to the tier when both are asked for.
+
+The limit is `GpuConfig::ram_limit`, which the server sets from `--ram`
+(default: half of what the machine reports as available when it starts; the
+log states it and the reason). For a model with a prefix cache, what the limit
+leaves after the required memory is the checkpoint budget of the conductor
 (`RuntimeConfig::checkpoint_budget`), so the places the conductor hands out
-never lock more than the limit. Nobody asks the checkpoints to give memory
-back yet, as nothing competes with them; a lock that does not fit fails the
-step with the books in the message. The first use of a place waits for the
-lock on the device's thread (21 to 22.5 ms for 93.5 MiB, 11.8 ms for 56.1
-MiB, measured with the 27B); locking ahead in the background is not built. `GET /metrics` reports the
-bytes locked (`ares_checkpoint_ram_bytes`).
+never lock more than the limit; for a mixture of experts it is the tier. Nobody
+asks the checkpoints to give memory back yet, as nothing competes with them; a
+lock that does not fit fails the step with the books in the message. The first
+use of a place waits for the lock on the device's thread (21 to 22.5 ms for
+93.5 MiB, 11.8 ms for 56.1 MiB, measured with the 27B); locking ahead in the
+background is not built. `GET /metrics` reports the bytes locked
+(`ares_checkpoint_ram_bytes`) and the counters of the expert store
+(`ares_expert_*`).
 
 Nothing that costs speed happens silently:
 
@@ -1898,6 +2129,16 @@ Measured 2026-11-11 with Qwen3.8-27B on both cards: 79.2, 75.3 and 78.8
 tokens per second for German, English and code through HTTP, which is what
 the same model gives without HTTP; the first token after 76 to 121 ms; two
 requests at once at 63 tokens per second each.
+
+For a mixture of experts (`qwen4exp`) the plan is another one: where the
+layers go (`--split tensor`: both devices on every layer, `layer`: a range
+each, by default the first when each device can write the other's memory), the
+context (without `--context`, what a thirty-second of the room for expert slots
+holds), and the RAM (`--ram`, whose limit less what the engine needs is the
+tier of experts). The server reads a short text of German, English and code
+before it listens, so that the first request does not find every slot empty. It
+has no prefix cache, no `--shares`, no `--precision exact`, no `--draft-vocab`;
+asking for one is an error that names the option.
 
 A router mode driven by a preset file (`models.ini`, one section per model)
 that loads and unloads models on request, and multimodal input, are not
