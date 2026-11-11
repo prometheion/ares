@@ -735,14 +735,18 @@ fn answers(
 }
 
 /// With the default products, is the text with the model's own drafts the
-/// text without them? With exact products it is (`qwen35_mtp_runtime.rs`): a
-/// row computes the same alone and in a window. The device layout has that
-/// property at any precision (one kernel serves one row and a window), the
-/// decode kernels of the file's layout round a row differently by the rows
-/// of the launch. This test reports how far the texts agree for every matrix
-/// in its device layout where it can have one, and for the measured choice,
-/// which may keep small matrices in the file's layout and chooses for a step
-/// of one row in one model and for a window in the other.
+/// text without them? With exact products it is (`qwen35_mtp_runtime.rs`).
+/// The few-row kernels compute a row as the same bits whatever the rows beside
+/// it and however they launch, but the rows of one sequence in a step still
+/// change each other's logits a little through the recurrent or the attention
+/// layers (2e-4 of the logit on the 27B with every matrix in its device
+/// layout, 1e-3 in the file's layout: see "Speculation" in
+/// `docs/ARCHITECTURE.md`), so the texts agree as far as that stays below the
+/// margin of their picks, which it did for the two questions here with
+/// every matrix in its device layout. The measured choice puts other matrices in
+/// the file's layout in every load (more with a draft block), so its two
+/// models are not one model, and in the file's layout the difference above is
+/// four to seven times larger: its texts are reported, not compared.
 #[test]
 fn the_text_with_drafts_and_fast_products() {
     if std::env::var_os("ARES_TEST_CUDA").is_none() {
@@ -775,6 +779,8 @@ fn the_text_with_drafts_and_fast_products() {
             "RES drafts fast {name}: matrices [file, device] per device without drafts \
              {plain_layouts:?}, with drafts {drafted_layouts:?}"
         );
+        // Every matrix in the device layout is one assignment in both models.
+        let comparable = matches!(layouts, Layouts::Device);
         for (i, (a, b)) in plain.iter().zip(&drafted).enumerate() {
             let same = a.chars().zip(b.chars()).take_while(|(x, y)| x == y).count();
             eprintln!(
@@ -784,6 +790,9 @@ fn the_text_with_drafts_and_fast_products() {
                 if a == b { " (the same text)" } else { "" }
             );
             assert!(!a.is_empty() && !b.is_empty(), "{name}: an answer is empty");
+            if comparable {
+                assert_eq!(a, b, "{name}: answer {i} with drafts is not the text without");
+            }
         }
     }
 }

@@ -548,13 +548,14 @@ impl Part {
             return Err(invalid("a part needs at least one row, one logit row and one slot"));
         }
         // The rows the matrices will be multiplied with, for the choice of
-        // their layouts: a decode step is one row, or a window when the model
-        // verifies its own drafts in every step; prompts are read in groups
-        // under a split (`Part::plan_groups`) and in whole steps otherwise.
-        let decode_rows = match &placement.draft {
-            Some(_) => opts.window_rows.max(1),
-            None => 1,
-        };
+        // their layouts: a decode step is one row, and so is the probe of a
+        // model that verifies windows of drafts. The layout decides the
+        // arithmetic of a product (the device layout's is the same for a row
+        // in any window, the file's integer kernels' is not that of its tile
+        // kernels), so a choice that depended on the window would let drafts
+        // change the text; prompts are read in groups under a split
+        // (`Part::plan_groups`) and in whole steps otherwise.
+        let decode_rows = 1;
         let prompt_rows = match (placement.split, opts.pipeline_rows) {
             (Split::Single, _) | (_, 0) => opts.max_rows,
             (Split::Layer, per) if opts.max_rows < 2 * per => opts.max_rows,

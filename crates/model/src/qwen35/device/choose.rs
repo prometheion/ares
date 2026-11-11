@@ -3,16 +3,17 @@
 //!
 //! A matrix whose type has a device layout (`ares_cuda::WeightLayout::Device`)
 //! can lie on the device as the file stores it or rearranged for the tensor
-//! cores. Neither is the faster one for every matrix: the kernels over the
-//! device layout serve every number of rows from one copy, at the exact
-//! arithmetic of f16 operands, and are far ahead from a few rows on; with one
-//! row the decode kernels of the file's layout are quicker for a small
-//! matrix, whose launch has the lower floor, and by a few percent for most
-//! large ones. Which it is depends on the type, the shape and the card, so it
-//! is measured, before the weights are placed:
+//! cores. The kernels over the device layout serve every number of rows from
+//! one copy, at the exact arithmetic of f16 operands, are far ahead from a few
+//! rows on, and with one row are within a few percent of the integer decode
+//! kernels of the file's layout either way: slightly behind on a few shapes of
+//! a card, ahead on others. Which it is depends on the type, the shape and the
+//! card, so it is measured, before the weights are placed:
 //!
 //! - once per type, which kernel of the device layout serves which number of
-//!   rows (`Kernels::measure_layout`, about 50 ms);
+//!   rows above those of a decode step (`Kernels::measure_layout`, about 50 ms),
+//!   and once per type and shape how the kernels for a decode step launch
+//!   (`Kernels::tune_layout`, a few milliseconds);
 //! - once per type and shape, the product in both layouts with the rows the
 //!   model will run: those of a decode step and those of a group of prompt
 //!   rows. The probe is a matrix of that shape (cut to [`PROBE_WEIGHT_BYTES`]
@@ -50,7 +51,7 @@
 //! layout. Decode steps come first: a token is waited for one step at a
 //! time, so by default an assignment is taken only if it does not make the
 //! decode step slower, and of those the one that reads prompts fastest. What
-//! "not slower" means is [`AS_GOOD_WITHIN`], half a percent of the group's
+//! "not slower" means is [`AS_GOOD_WITHIN`], two percent of the group's
 //! time; of assignments that are equal in both, the one with the most
 //! matrices in the device layout is taken, because there the exact
 //! arithmetic costs nothing. The decode rows are one, or the rows of a
@@ -121,9 +122,12 @@ impl Default for Layouts {
 /// the weighted sum of two) is within this of the cheapest counts as as
 /// good; of those the one that reads prompts fastest is taken, and of equals
 /// the one with the most matrices in the device layout. It is what the
-/// choice may cost a group's decode time at most, and about the noise of a
-/// probe.
-const AS_GOOD_WITHIN: f64 = 0.005;
+/// choice may cost a group's decode time at most, and the noise of a probe:
+/// the same shape measured in two loads differs by one to three percent
+/// (clocks, and whatever else ran), and at half a percent a third of the
+/// matrices were left in the file's layout by that noise, a different third
+/// in every load, which made the numbers of two loads of a model differ.
+const AS_GOOD_WITHIN: f64 = 0.02;
 /// The most bytes of weights (or the L2 cache and a quarter, if that is more)
 /// and of results a probe product moves. A larger matrix is probed with fewer
 /// rows; both layouts are bound by memory there.
@@ -565,6 +569,7 @@ impl<'a> Chooser<'a> {
             }
             Layouts::Device => {
                 nothing_to_tell();
+                self.tune_launches()?;
                 self.decided = Some(self.all(WeightLayout::Device));
                 return Ok(());
             }
@@ -714,6 +719,21 @@ impl<'a> Chooser<'a> {
         self.report.decode_ms = decode_ms.map(|ms| ms as f32);
         self.report.prompt_ms = prompt_ms.map(|ms| ms as f32);
         self.decided = Some(decided);
+        Ok(())
+    }
+
+    /// How the few-row kernels launch for every shape that can have the device
+    /// layout, when nothing else is measured (a matter of speed only: none of the
+    /// launches changes a bit of a product).
+    fn tune_launches(&self) -> Result<(), ModelError> {
+        if self.precision != Precision::Fast {
+            return Ok(());
+        }
+        for &(ty, n_out, n_in) in self.groups.iter().flat_map(|g| g.shapes.iter()) {
+            if self.eligible((ty, n_out, n_in)) {
+                self.kernels.tune_layout(ty, n_out, n_in)?;
+            }
+        }
         Ok(())
     }
 
@@ -952,6 +972,7 @@ impl<'a> Chooser<'a> {
         let row_bytes =
             Kernels::layout_bytes(ty, WeightLayout::File, 1, n_in).ok_or_else(invalid)?;
         let most_rows = rows[0].max(rows[1]);
+        let full_rows = n_out;
         let l2 = u64::from(device.info().l2_cache_bytes);
         // The rows of the probe matrix: the matrix's, as far as the bounds allow.
         let n_out = n_out
@@ -961,6 +982,13 @@ impl<'a> Chooser<'a> {
         let w_bytes = u64::from(n_out.next_multiple_of(16)) * row_bytes;
         let f16_kernels = kernels.has_prefill_kernels();
         let probe = Self::probe(&mut self.probe, device, room, &mut self.report)?;
+        if eligible {
+            // How the few-row kernels launch for this shape and for the probe matrix, which
+            // may be cut (a matter of speed only: none changes a bit of the product), over
+            // the probe's weights, so that the products below are timed as they will run.
+            kernels.tune_layout_over(ty, full_rows, n_in, &probe.w)?;
+            kernels.tune_layout_over(ty, n_out, n_in, &probe.w)?;
+        }
         let x_bytes = u64::from(most_rows) * u64::from(n_in) * 4;
         let fresh_x = probe.x.len() < x_bytes;
         let x = probe.x.ensure(device, x_bytes)?;
