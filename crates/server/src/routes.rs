@@ -15,8 +15,9 @@ use axum::response::{IntoResponse, Response};
 use futures_util::StreamExt;
 
 use crate::Config;
-use crate::bridge::{DecisionRun, Flight, Item, Run, Stop};
+use crate::bridge::{DecisionRun, Flight, Item, Run, Stop, Timings};
 use crate::error::ApiError;
+use crate::reasoning::{self, Split, Splitter};
 use crate::systemone;
 use crate::wire::{self, Endpoint, Head};
 
@@ -90,7 +91,8 @@ async fn try_completion(
 ) -> Result<Response, ApiError> {
     let body = read_body(request, app.config.max_body_bytes).await?;
     let id = next_request_id();
-    let parsed = wire::parse(endpoint, &body, id)?;
+    let mut parsed = wire::parse(endpoint, &body, id)?;
+    let splitter = reasoning::apply(&mut parsed, &*app.engine, app.config.reasoning_format)?;
     let head = Head::new(endpoint, id, &parsed.request.model);
     tracing::info!(
         %id,
@@ -109,9 +111,9 @@ async fn try_completion(
         app.stop.clone(),
     )?;
     if parsed.stream {
-        stream(run, head, parsed.include_usage).await
+        stream(run, head, parsed.include_usage, splitter).await
     } else {
-        collect(run, head).await
+        collect(run, head, splitter).await
     }
 }
 
@@ -180,12 +182,19 @@ fn next_request_id() -> RequestId {
 /// The text is held in memory until the end. Its size is bounded by the
 /// request's token limit (or the context length), which is what the engine
 /// would have spent on it anyway.
-async fn collect(mut run: Run, head: Head) -> Result<Response, ApiError> {
-    let mut text = String::new();
+async fn collect(mut run: Run, head: Head, mut splitter: Splitter) -> Result<Response, ApiError> {
+    let mut text = Split::default();
     loop {
         match run.next().await? {
-            Item::Text(piece) => text.push_str(&piece),
+            Item::Text(piece) => {
+                let sorted = splitter.push(&piece);
+                text.reasoning.push_str(&sorted.reasoning);
+                text.content.push_str(&sorted.content);
+            }
             Item::Done { finish, usage, timings } => {
+                let rest = splitter.finish();
+                text.reasoning.push_str(&rest.reasoning);
+                text.content.push_str(&rest.content);
                 return Ok(json_response(head.complete(&text, finish, usage, timings)));
             }
         }
@@ -203,9 +212,14 @@ fn json_response(body: String) -> Response {
 /// model does not exist) fails while the engine is still looking at it, and
 /// that failure then becomes a proper HTTP status instead of an error message
 /// inside a `200`. Clients and proxies handle the two very differently.
-async fn stream(mut run: Run, head: Head, include_usage: bool) -> Result<Response, ApiError> {
+async fn stream(
+    mut run: Run,
+    head: Head,
+    include_usage: bool,
+    splitter: Splitter,
+) -> Result<Response, ApiError> {
     let first = run.next().await?;
-    let state = Chunks { run, head, include_usage, phase: Phase::Start(first) };
+    let state = Chunks { run, head, include_usage, splitter, phase: Phase::Start(first) };
     let events = futures_util::stream::unfold(state, |mut state| async move {
         let data = state.step().await?;
         Some((Ok::<_, Infallible>(SseEvent::default().data(data)), state))
@@ -226,6 +240,12 @@ enum Phase {
     Ready(Item),
     /// Waiting for the engine.
     Pull,
+    /// The text is out; the finish chunk is next.
+    Finish {
+        finish: &'static str,
+        usage: Usage,
+        timings: Timings,
+    },
     /// The finish chunk went out; the usage chunk is next.
     Usage(Usage),
     /// Everything went out; `[DONE]` is next.
@@ -237,6 +257,7 @@ struct Chunks {
     run: Run,
     head: Head,
     include_usage: bool,
+    splitter: Splitter,
     phase: Phase,
 }
 
@@ -261,12 +282,20 @@ impl Chunks {
                 }
                 Phase::Ready(Item::Text(text)) => {
                     self.phase = Phase::Pull;
-                    // An empty piece would only add an empty chunk.
-                    if !text.is_empty() {
-                        return Some(self.head.text_chunk(&text));
+                    // A piece that is held back or empty would only add an empty chunk.
+                    let sorted = self.splitter.push(&text);
+                    if !sorted.is_empty() {
+                        return Some(self.head.text_chunk(&sorted));
                     }
                 }
                 Phase::Ready(Item::Done { finish, usage, timings }) => {
+                    self.phase = Phase::Finish { finish, usage, timings };
+                    let rest = self.splitter.finish();
+                    if !rest.is_empty() {
+                        return Some(self.head.text_chunk(&rest));
+                    }
+                }
+                Phase::Finish { finish, usage, timings } => {
                     self.phase =
                         if self.include_usage { Phase::Usage(usage) } else { Phase::Marker };
                     return Some(self.head.finish_chunk(finish, timings));

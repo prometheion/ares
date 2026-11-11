@@ -17,6 +17,12 @@
 //! the server or the engine does not do is an error that names the field,
 //! never dropped (the `wire` module).
 //!
+//! A model that thinks has its reasoning returned apart from its answer, in
+//! `reasoning_content`, and an assistant message of a request may carry it
+//! back. What marks the reasoning is what the model's chat template declares
+//! ([`ares_api::Engine::chat_format`]); the `reasoning` module sorts the text
+//! by it and has the controls of llama-server for thinking.
+//!
 //! `/v1/systemone` has the request and response of llama.cpp's endpoint of
 //! that name (the TypeSafe System One API): typed questions about a `state`,
 //! answered by choosing among options. It is served for every model ("Jev
@@ -33,6 +39,7 @@ mod bridge;
 mod error;
 pub mod load;
 pub mod plan;
+mod reasoning;
 mod routes;
 mod systemone;
 mod wire;
@@ -49,6 +56,7 @@ use tokio::net::TcpListener;
 use tokio::sync::{Notify, watch};
 
 use crate::bridge::{Flight, Stop};
+pub use crate::reasoning::ReasoningFormat;
 
 /// Limits of the server. [`Config::default`] suits production; tests shrink
 /// them to hit the limits cheaply.
@@ -63,6 +71,9 @@ pub struct Config {
     /// After a shutdown signal the server stops accepting connections and lets
     /// running requests finish for this long, then ends them.
     pub shutdown_grace: Duration,
+    /// How the reasoning of a reply is returned when a request does not say
+    /// (`--reasoning-format`).
+    pub reasoning_format: ReasoningFormat,
 }
 
 impl Default for Config {
@@ -71,6 +82,7 @@ impl Default for Config {
             event_buffer: 1024,
             max_body_bytes: 64 << 20,
             shutdown_grace: Duration::from_secs(30),
+            reasoning_format: ReasoningFormat::default(),
         }
     }
 }

@@ -120,6 +120,7 @@ dependencies = [
  "ares-gguf",
  "ares-model",
  "ares-runtime",
+ "ares-state",
  "ares-tokenizer",
  "axum",
  "futures-util",

@@ -668,6 +668,7 @@ fn ask(
                 prompt: Prompt::Chat {
                     messages: vec![ares_api::Message::new(Role::User, question)],
                     tools: None,
+                    variables: Vec::new(),
                 },
                 sampling,
                 max_tokens: Some(max_tokens),
@@ -920,7 +921,7 @@ fn converse(
         .submit(
             GenerateRequest {
                 model: String::new(),
-                prompt: Prompt::Chat { messages, tools: None },
+                prompt: Prompt::Chat { messages, tools: None, variables: Vec::new() },
                 sampling: ares_api::Sampling { temperature: Some(0.0), ..Default::default() },
                 max_tokens: Some(max_tokens),
                 stop: Vec::new(),

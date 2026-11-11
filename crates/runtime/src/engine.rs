@@ -7,8 +7,8 @@ use std::thread::{self, JoinHandle, ThreadId};
 use std::time::Duration;
 
 use ares_api::{
-    DecisionRequest, DecisionSink, Engine, EngineError, EngineStats, EventSink, GenerateRequest,
-    ModelCard, RequestId,
+    ChatFormat, DecisionRequest, DecisionSink, Engine, EngineError, EngineStats, EventSink,
+    GenerateRequest, ModelCard, RequestId,
 };
 use ares_cuda::Device;
 
@@ -197,6 +197,10 @@ impl Drop for Runtime {
 impl Engine for Runtime {
     fn models(&self) -> Vec<ModelCard> {
         vec![self.card.clone()]
+    }
+
+    fn chat_format(&self, model: &str) -> Option<ChatFormat> {
+        (model == self.card.id).then(|| self.model.chat_format()).flatten()
     }
 
     fn submit(&self, request: GenerateRequest, events: EventSink) -> Result<(), EngineError> {

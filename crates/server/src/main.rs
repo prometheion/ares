@@ -62,6 +62,7 @@ async fn run(options: cli::Options) -> Result<(), String> {
     let address =
         listener.local_addr().map_err(|e| format!("cannot read the listen address: {e}"))?;
 
+    let config = Config { reasoning_format: options.reasoning_format, ..Config::default() };
     let load_options = options.load;
     let mut loading = tokio::task::spawn_blocking(move || load::load(&load_options));
     let mut stop_after_load = false;
@@ -104,7 +105,7 @@ async fn run(options: cli::Options) -> Result<(), String> {
     let served = serve_until(
         listener,
         loaded.engine(),
-        Config::default(),
+        config,
         async {
             let _ = drained.await;
         },

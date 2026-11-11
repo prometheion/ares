@@ -229,6 +229,7 @@ fn ask(runtime: &Runtime, id: u64, question: &str, max_tokens: u32) -> String {
                 prompt: Prompt::Chat {
                     messages: vec![Message::new(Role::User, question)],
                     tools: None,
+                    variables: Vec::new(),
                 },
                 sampling: Sampling::default(),
                 max_tokens: Some(max_tokens),

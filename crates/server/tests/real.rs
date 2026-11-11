@@ -111,13 +111,24 @@ fn events(body: &str) -> (Vec<Value>, bool) {
     (chunks, done)
 }
 
-/// The text of a streamed answer: its deltas put together.
+/// The text of a streamed answer: its deltas put together, the reasoning of a
+/// model that thinks (its own field) before the content.
 fn streamed_text(chunks: &[Value]) -> String {
     chunks
         .iter()
         .filter_map(|chunk| {
             let choice = chunk["choices"].get(0)?;
-            choice["delta"]["content"].as_str().or_else(|| choice["text"].as_str())
+            let delta = &choice["delta"];
+            Some(
+                [
+                    delta["reasoning_content"].as_str(),
+                    delta["content"].as_str(),
+                    choice["text"].as_str(),
+                ]
+                .into_iter()
+                .flatten()
+                .collect::<String>(),
+            )
         })
         .collect()
 }

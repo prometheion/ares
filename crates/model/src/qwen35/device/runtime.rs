@@ -6,7 +6,7 @@ use std::ops::Range;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use ares_api::{EngineError, ModelCard, Prompt, Role};
+use ares_api::{ChatFormat, EngineError, ModelCard, Prompt, Role};
 use ares_cuda::{DevicePtr, ENTRY_CELLS, PushSlot, Segment, Stream};
 use ares_gguf::Gguf;
 use ares_runtime::{
@@ -22,6 +22,7 @@ use super::part::{
     checkpoint_bytes, page_bytes,
 };
 use super::placement::{HalfShares, Placement, PlacementError};
+use crate::chat;
 use crate::qwen35::{Config, Weights};
 
 /// How to spread the model over the devices.
@@ -90,6 +91,8 @@ pub struct Qwen35 {
     created: u64,
     /// How chat prompts are rendered.
     chat: ChatOptions,
+    /// What the chat template declares, read with `chat`.
+    format: ChatFormat,
     reports: Mutex<Vec<PartReport>>,
     /// Where the parts of a tensor split, which the runtime opens at the
     /// same time, tell each other what the weight products cost them.
@@ -144,6 +147,7 @@ impl Qwen35 {
         let context = context.clamp(1, config.n_ctx as u32);
         let balance = (placement.split == Split::Tensor && placement.n_devices() > 1)
             .then(|| Balance::new(placement.n_devices()));
+        let format = chat::chat_format(&tokenizer, &ChatOptions::default());
         Ok(Self {
             gguf,
             config,
@@ -155,6 +159,7 @@ impl Qwen35 {
             created: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |since| since.as_secs()),
+            format,
             chat: ChatOptions::default(),
             reports: Mutex::new(Vec::new()),
             balance,
@@ -165,6 +170,7 @@ impl Qwen35 {
     /// variables a server passes to the chat template (`reasoning_effort`
     /// and the like).
     pub fn with_chat_options(mut self, options: ChatOptions) -> Self {
+        self.format = chat::chat_format(&self.tokenizer, &options);
         self.chat = options;
         self
     }
@@ -215,7 +221,7 @@ impl Model for Qwen35 {
             Prompt::Text(text) => Ok(self
                 .tokenizer
                 .encode(text, EncodeOptions { add_special: true, parse_special: false })),
-            Prompt::Chat { messages, tools } => {
+            Prompt::Chat { messages, tools, variables } => {
                 if tools.as_ref().is_some_and(|t| !t.is_empty())
                     || messages.iter().any(|m| m.tool_calls.as_ref().is_some_and(|c| !c.is_empty()))
                 {
@@ -236,18 +242,23 @@ impl Model for Qwen35 {
                         let mut message = Message::new(role, m.content.clone());
                         message.name = m.name.clone().unwrap_or_default();
                         message.tool_call_id = m.tool_call_id.clone().unwrap_or_default();
+                        message.reasoning_content = m.reasoning_content.clone().unwrap_or_default();
                         message
                     })
                     .collect();
                 let text = self
                     .tokenizer
-                    .render_chat(&messages, &[], &self.chat)
+                    .render_chat(&messages, &[], &chat::with_variables(&self.chat, variables))
                     .map_err(|e| EngineError::InvalidRequest(format!("chat template: {e}")))?;
                 Ok(self
                     .tokenizer
                     .encode(&text, EncodeOptions { add_special: true, parse_special: true }))
             }
         }
+    }
+
+    fn chat_format(&self) -> Option<ChatFormat> {
+        Some(self.format.clone())
     }
 
     fn piece(&self, token: u32, text: &mut Vec<u8>) {

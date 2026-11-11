@@ -22,6 +22,7 @@
 //! boundary untouched as [`Json`].
 
 mod answer;
+mod chat;
 mod decision;
 mod engine;
 mod error;
@@ -34,6 +35,7 @@ mod sink;
 mod stats;
 
 pub use answer::{Answer, DecisionOutcome, DecisionResult, Verdict};
+pub use chat::{ChatFormat, ThinkingFormat};
 pub use decision::{
     ChoiceOption, DecisionError, DecisionRequest, MAX_SCORE_LEVELS, MIN_SCORE_LEVELS, Question,
     QuestionKind,

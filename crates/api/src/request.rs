@@ -33,6 +33,10 @@ pub enum Prompt {
         /// Tool definitions as the client sent them, for the template.
         /// `None` when the client sent none.
         tools: Option<Vec<Json>>,
+        /// Variables of the chat template for this request
+        /// (`chat_template_kwargs`): they come on top of the ones the engine
+        /// was started with and win over them.
+        variables: Vec<(String, Json)>,
     },
     /// Text to continue as it is: no template, no added roles. Special tokens
     /// the model needs (a beginning-of-text token, say) are still the
@@ -77,6 +81,7 @@ mod tests {
                     "type".into(),
                     Json::String("function".into()),
                 )])]),
+                variables: vec![("enable_thinking".into(), Json::Bool(false))],
             },
             sampling: Sampling { seed: Some(7), ..Sampling::default() },
             max_tokens: Some(16),

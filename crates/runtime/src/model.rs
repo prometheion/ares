@@ -8,7 +8,7 @@
 //! implementation today, built from kernels that exist; the first real
 //! architecture replaces it without touching the step loop.
 
-use ares_api::{EngineError, ModelCard, Prompt};
+use ares_api::{ChatFormat, EngineError, ModelCard, Prompt};
 use ares_core::Ledger;
 use ares_cuda::{Device, DevicePtr, Kernels, SampleParams, Stream};
 use ares_state::PageLayout;
@@ -288,6 +288,15 @@ pub trait Model: Send + Sync + 'static {
     /// The tokens of a prompt. Tokenizing is the model's business; refusing
     /// what it cannot tokenize is too.
     fn encode(&self, prompt: &Prompt) -> Result<Vec<u32>, EngineError>;
+
+    /// What the model's chat template declares: how the model marks its
+    /// thinking, which the front end needs to tell the reasoning in a reply
+    /// from the answer. The default is `None`, a model whose template is not
+    /// read: its replies are one text. Cheap, since it is asked for every
+    /// chat request.
+    fn chat_format(&self) -> Option<ChatFormat> {
+        None
+    }
 
     /// Appends the bytes of a generated token's text to `text`: nothing for
     /// a token that prints nothing, and possibly a part of a character, which

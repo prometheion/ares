@@ -16,6 +16,7 @@ use serde::Serialize;
 
 use crate::bridge::Timings;
 use crate::error::ApiError;
+use crate::reasoning::{self, Asked, Split};
 
 /// Which of the two endpoints a request came in on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,6 +42,9 @@ pub(crate) struct Parsed {
     pub request: GenerateRequest,
     pub stream: bool,
     pub include_usage: bool,
+    /// What a chat request says about thinking: the variables of the chat
+    /// template are not in `request` yet.
+    pub reasoning: Asked,
 }
 
 /// Parses and checks the body of a completion request.
@@ -101,7 +105,10 @@ fn refuse_unserved(endpoint: Endpoint, fields: &Fields<'_>) -> Result<(), ApiErr
     for (name, value) in fields.0 {
         let name = name.as_str();
         let own = match endpoint {
-            Endpoint::Chat => ["messages", "tools", "max_completion_tokens"].contains(&name),
+            Endpoint::Chat => {
+                ["messages", "tools", "max_completion_tokens"].contains(&name)
+                    || reasoning::FIELDS.contains(&name)
+            }
             Endpoint::Completions => name == "prompt",
         };
         if value.is_null() || own || SERVED.contains(&name) || BOOKKEEPING.contains(&name) {
@@ -148,8 +155,8 @@ fn unserved(name: &str, value: &Json) -> Option<&'static str> {
         "echo" | "suffix" => "the completion is returned on its own",
         "response_format" | "grammar" | "json_schema" => structured,
         "tool_choice" | "parallel_tool_calls" | "functions" | "function_call" => tools,
-        "reasoning_effort" | "chat_template_kwargs" => {
-            "variables of the chat template are set when the server starts (--chat-var)"
+        name if reasoning::FIELDS.contains(&name) => {
+            "thinking belongs to chat requests: /v1/completions has no chat template"
         }
         _ => {
             "it is not a parameter of this server, which samples with temperature, top_k, \
@@ -186,6 +193,10 @@ fn from_json(endpoint: Endpoint, json: &Json, id: RequestId) -> Result<Parsed, A
     sampling.validate().map_err(|e| ApiError::invalid_param(e.field, e.to_string()))?;
     refuse_unserved(endpoint, &fields)?;
 
+    let reasoning = match endpoint {
+        Endpoint::Chat => reasoning::asked(&fields)?,
+        Endpoint::Completions => Asked::default(),
+    };
     let request = GenerateRequest {
         model,
         prompt,
@@ -199,7 +210,12 @@ fn from_json(endpoint: Endpoint, json: &Json, id: RequestId) -> Result<Parsed, A
         Some(Json::Object(members)) => Fields(members).bool("include_usage")?.unwrap_or(false),
         Some(other) => return Err(wrong_type("stream_options", "an object", other)),
     };
-    Ok(Parsed { request, stream: fields.bool("stream")?.unwrap_or(false), include_usage })
+    Ok(Parsed {
+        request,
+        stream: fields.bool("stream")?.unwrap_or(false),
+        include_usage,
+        reasoning,
+    })
 }
 
 /// The members of a JSON object, with typed access that names the field in
@@ -351,7 +367,7 @@ fn chat_prompt(fields: &Fields<'_>) -> Result<Prompt, ApiError> {
         Some(Json::Array(tools)) => Some(tools.clone()),
         Some(other) => return Err(wrong_type("tools", "an array", other)),
     };
-    Ok(Prompt::Chat { messages, tools })
+    Ok(Prompt::Chat { messages, tools, variables: Vec::new() })
 }
 
 fn message(index: usize, value: &Json) -> Result<Message, ApiError> {
@@ -410,6 +426,7 @@ fn message(index: usize, value: &Json) -> Result<Message, ApiError> {
         name: string_field("name")?,
         tool_call_id: string_field("tool_call_id")?,
         tool_calls,
+        reasoning_content: string_field("reasoning_content")?,
     })
 }
 
@@ -504,7 +521,7 @@ impl Head {
     /// The whole answer of a non-streaming request.
     pub fn complete(
         &self,
-        text: &str,
+        text: &Split,
         finish: &'static str,
         usage: Usage,
         timings: Timings,
@@ -512,7 +529,11 @@ impl Head {
         let choice = match self.endpoint {
             Endpoint::Chat => Choice {
                 index: 0,
-                message: Some(FullMessage { role: "assistant", content: text }),
+                message: Some(FullMessage {
+                    role: "assistant",
+                    content: &text.content,
+                    reasoning_content: non_empty(&text.reasoning),
+                }),
                 text: None,
                 delta: None,
                 finish_reason: Some(finish),
@@ -520,7 +541,7 @@ impl Head {
             Endpoint::Completions => Choice {
                 index: 0,
                 message: None,
-                text: Some(text),
+                text: Some(&text.content),
                 delta: None,
                 finish_reason: Some(finish),
             },
@@ -530,17 +551,23 @@ impl Head {
 
     /// The first chunk of a chat stream: it announces the role.
     pub fn role_chunk(&self) -> String {
-        let delta = Delta { role: Some("assistant"), content: Some("") };
+        let delta = Delta { role: Some("assistant"), content: Some(""), reasoning_content: None };
         self.render(true, vec![chunk_choice(Some(delta), None, None)], None, None)
     }
 
     /// A piece of output text.
-    pub fn text_chunk(&self, text: &str) -> String {
+    pub fn text_chunk(&self, text: &Split) -> String {
         let choice = match self.endpoint {
-            Endpoint::Chat => {
-                chunk_choice(Some(Delta { role: None, content: Some(text) }), None, None)
-            }
-            Endpoint::Completions => chunk_choice(None, Some(text), None),
+            Endpoint::Chat => chunk_choice(
+                Some(Delta {
+                    role: None,
+                    content: non_empty(&text.content),
+                    reasoning_content: non_empty(&text.reasoning),
+                }),
+                None,
+                None,
+            ),
+            Endpoint::Completions => chunk_choice(None, Some(&text.content), None),
         };
         self.render(true, vec![choice], None, None)
     }
@@ -658,6 +685,8 @@ struct Choice<'a> {
 struct FullMessage<'a> {
     role: &'static str,
     content: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_content: Option<&'a str>,
 }
 
 #[derive(Serialize, Default)]
@@ -666,6 +695,13 @@ struct Delta<'a> {
     role: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     content: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_content: Option<&'a str>,
+}
+
+/// `text`, or nothing for the empty text: a field that has no text is left out.
+fn non_empty(text: &str) -> Option<&str> {
+    (!text.is_empty()).then_some(text)
 }
 
 #[derive(Serialize)]

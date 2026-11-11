@@ -55,6 +55,10 @@ fn help_prints_every_option_and_exits_cleanly() {
         "--drafts",
         "--draft-vocab",
         "--chat-var",
+        "--reasoning",
+        "--reasoning-format",
+        "--reasoning-effort",
+        "--reasoning-preserve",
         "--help",
     ] {
         assert!(stdout.contains(flag), "{flag} is documented:\n{stdout}");

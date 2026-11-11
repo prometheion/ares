@@ -188,7 +188,9 @@ async fn the_engine_receives_everything_the_client_sent_and_nothing_else() {
     assert_eq!(sampling.repeat_penalty, Some(1.5));
     assert_eq!(sampling.seed, Some(42));
 
-    let Prompt::Chat { messages, tools } = request.prompt else { panic!("chat prompt expected") };
+    let Prompt::Chat { messages, tools, .. } = request.prompt else {
+        panic!("chat prompt expected")
+    };
     let roles: Vec<_> = messages.iter().map(|m| m.role).collect();
     assert_eq!(roles, [Role::System, Role::User, Role::Assistant, Role::Tool, Role::System]);
     assert_eq!(messages[1].content, "Hello", "text parts are joined");
@@ -605,8 +607,9 @@ async fn bad_requests_are_refused_before_the_engine_sees_them() {
         chat(json!({"top_logprobs": 5})).into_case(Some("top_logprobs"), "token probabilities"),
         chat(json!({"tool_choice": "required"})).into_case(Some("tool_choice"), "tool calls are not built"),
         chat(json!({"functions": []})).into_case(Some("functions"), "tool calls are not built"),
-        chat(json!({"reasoning_effort": "high"})).into_case(Some("reasoning_effort"), "--chat-var"),
-        chat(json!({"chat_template_kwargs": {"enable_thinking": false}})).into_case(Some("chat_template_kwargs"), "--chat-var"),
+        // The engine of these tests declares no template, so it has no effort to set.
+        chat(json!({"reasoning_effort": "high"})).into_case(Some("reasoning_effort"), "does not use it"),
+        (COMPLETIONS, completion_body(json!({"chat_template_kwargs": {"enable_thinking": false}})), Some("chat_template_kwargs"), "no chat template"),
         chat(json!({"typical_p": 0.9})).into_case(Some("typical_p"), "typical_p is not supported: it is not a parameter of this server"),
         chat(json!({"mirostat": 2})).into_case(Some("mirostat"), "not a parameter of this server"),
         chat(json!({"something_new": [1, 2]})).into_case(Some("something_new"), "something_new is not supported"),

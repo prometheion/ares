@@ -305,7 +305,11 @@ impl Rig {
             .submit(
                 GenerateRequest {
                     model: "q".into(),
-                    prompt: Prompt::Chat { messages: messages.to_vec(), tools: None },
+                    prompt: Prompt::Chat {
+                        messages: messages.to_vec(),
+                        tools: None,
+                        variables: Vec::new(),
+                    },
                     sampling: Sampling { temperature: Some(0.0), ..Sampling::default() },
                     max_tokens: Some(max_tokens),
                     stop: Vec::new(),

@@ -1074,7 +1074,11 @@ mod tests {
     #[test]
     fn a_chat_is_rendered_with_its_roles() {
         let model = SyntheticModel::new(SyntheticConfig::small(Split::Single, 1)).unwrap();
-        let prompt = Prompt::Chat { messages: vec![Message::new(Role::User, "hi")], tools: None };
+        let prompt = Prompt::Chat {
+            messages: vec![Message::new(Role::User, "hi")],
+            tools: None,
+            variables: Vec::new(),
+        };
         let tokens = model.encode(&prompt).unwrap();
         let text: String = tokens.iter().map(|t| char::from(*t as u8)).collect();
         assert_eq!(text, "user: hi\nassistant: ");

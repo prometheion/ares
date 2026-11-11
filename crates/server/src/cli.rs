@@ -4,6 +4,7 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 
 use ares_cuda::Precision;
+use ares_server::ReasoningFormat;
 use ares_server::plan::{self, LoadOptions, SplitKind};
 use ares_tokenizer::Json;
 
@@ -64,8 +65,30 @@ OPTIONS:
 
     Prompts.
         --chat-var <NAME=VALUE>  A variable of the model's chat template, such as
-                               enable_thinking=false or reasoning_effort=medium;
-                               may be given several times
+                               add_vision_id=true; may be given several times
+
+    Thinking, under the names llama-server gives these. A request can change
+    each of them for itself: enable_thinking and the other variables in
+    chat_template_kwargs, reasoning_effort, reasoning_format.
+    -rea, --reasoning <on|off|auto>
+                               Whether the model thinks before it answers: auto
+                               leaves it to the chat template [default: auto]
+        --reasoning-format <FORMAT>
+                               none: the thinking stays in content, tags and all
+                               auto, deepseek, deepseek-legacy: the thinking goes
+                               to reasoning_content, in streamed deltas too
+                               [default: auto]
+        --reasoning-effort <LEVEL>
+                               A level the chat template knows, such as low or
+                               medium, or default to leave it to the template
+                               [default: default]
+        --reasoning-preserve, --no-reasoning-preserve
+                               Whether the thinking of earlier turns stays in the
+                               prompt, as a client sends it back in
+                               reasoning_content: it must for a conversation to
+                               continue from what was computed [default: on]
+    A budget for the thinking tokens is not built: the engine cannot put the
+    tokens that end the thinking into a sequence.
 
     -h, --help                 Print this help
 
@@ -78,6 +101,7 @@ pub struct Options {
     pub host: String,
     pub port: u16,
     pub load: LoadOptions,
+    pub reasoning_format: ReasoningFormat,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -147,11 +171,21 @@ fn chat_variable(value: &str) -> Result<(String, Json), CliError> {
     Ok((name.to_owned(), value))
 }
 
+/// Sets a variable of the chat template; the later setting of a name wins, as
+/// on any command line.
+fn set_chat_variable(load: &mut LoadOptions, name: &str, value: Json) {
+    load.chat_variables.retain(|(known, _)| known != name);
+    load.chat_variables.push((name.to_owned(), value));
+}
+
 /// Parses the arguments after the program name. `--name value` and
 /// `--name=value` are both accepted.
 pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, CliError> {
     let (mut host, mut port) = ("127.0.0.1".to_owned(), 8000);
     let mut load = LoadOptions::new("");
+    let mut reasoning_format = ReasoningFormat::default();
+    // The thinking of earlier turns stays in the prompt unless asked otherwise.
+    set_chat_variable(&mut load, "preserve_reasoning", Json::Bool(true));
     let mut seen: Vec<&'static str> = Vec::new();
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
@@ -274,10 +308,45 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, CliErr
             "--chat-var" => {
                 let value = text(value("--chat-var")?)?;
                 let (name, value) = chat_variable(&value)?;
-                // The later one of a name wins, as on any command line.
-                load.chat_variables.retain(|(known, _)| *known != name);
-                load.chat_variables.push((name, value));
+                set_chat_variable(&mut load, &name, value);
                 continue;
+            }
+            "-rea" | "--reasoning" => {
+                let value = text(value("--reasoning")?)?;
+                match value.as_str() {
+                    "on" => set_chat_variable(&mut load, "enable_thinking", Json::Bool(true)),
+                    "off" => set_chat_variable(&mut load, "enable_thinking", Json::Bool(false)),
+                    "auto" => load.chat_variables.retain(|(name, _)| name != "enable_thinking"),
+                    _ => return Err(invalid("--reasoning", &value, "on, off or auto")),
+                }
+                "--reasoning"
+            }
+            "--reasoning-format" => {
+                let value = text(value("--reasoning-format")?)?;
+                reasoning_format = ReasoningFormat::from_name(&value).ok_or_else(|| {
+                    invalid("--reasoning-format", &value, "none, auto, deepseek or deepseek-legacy")
+                })?;
+                "--reasoning-format"
+            }
+            "--reasoning-effort" => {
+                let value = text(value("--reasoning-effort")?)?;
+                if value.is_empty() {
+                    return Err(invalid("--reasoning-effort", &value, "a level, or default"));
+                }
+                if value == "default" {
+                    load.chat_variables.retain(|(name, _)| name != "reasoning_effort");
+                } else {
+                    set_chat_variable(&mut load, "reasoning_effort", Json::String(value));
+                }
+                "--reasoning-effort"
+            }
+            "--reasoning-preserve" | "--no-reasoning-preserve" => {
+                if inline.is_some() {
+                    return Err(CliError::UnexpectedValue("--reasoning-preserve"));
+                }
+                let on = name == "--reasoning-preserve";
+                set_chat_variable(&mut load, "preserve_reasoning", Json::Bool(on));
+                "--reasoning-preserve"
             }
             _ => return Err(CliError::UnknownOption(whole.to_owned())),
         };
@@ -290,7 +359,7 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, CliErr
     if load.model.as_os_str().is_empty() {
         return Err(CliError::NoModel);
     }
-    Ok(Command::Run(Box::new(Options { host, port, load })))
+    Ok(Command::Run(Box::new(Options { host, port, load, reasoning_format })))
 }
 
 #[cfg(test)]
@@ -315,7 +384,11 @@ mod tests {
         let options = run(&["--model", "m.gguf"]);
         assert_eq!(options.host, "127.0.0.1");
         assert_eq!(options.port, 8000);
-        assert_eq!(options.load, LoadOptions::new("m.gguf"));
+        // The thinking of earlier turns stays in the prompt, as in llama-server.
+        let mut expected = LoadOptions::new("m.gguf");
+        expected.chat_variables = vec![("preserve_reasoning".to_owned(), Json::Bool(true))];
+        assert_eq!(options.load, expected);
+        assert_eq!(options.reasoning_format, ReasoningFormat::Auto);
     }
 
     #[test]
@@ -377,6 +450,7 @@ mod tests {
         assert_eq!(
             load.chat_variables,
             vec![
+                ("preserve_reasoning".to_owned(), Json::Bool(true)),
                 ("enable_thinking".to_owned(), Json::Bool(false)),
                 ("reasoning_effort".to_owned(), Json::String("medium".into())),
                 ("depth".to_owned(), Json::Int(3)),
@@ -392,7 +466,74 @@ mod tests {
     #[test]
     fn a_chat_variable_given_again_replaces_the_earlier_one() {
         let load = run(&["--model=m", "--chat-var", "a=1", "--chat-var", "a=two"]).load;
-        assert_eq!(load.chat_variables, vec![("a".to_owned(), Json::String("two".into()))]);
+        let a = ("a".to_owned(), Json::String("two".into()));
+        assert_eq!(load.chat_variables.last(), Some(&a));
+        assert_eq!(load.chat_variables.iter().filter(|(name, _)| name == "a").count(), 1);
+    }
+
+    fn variable(load: &LoadOptions, name: &str) -> Option<Json> {
+        load.chat_variables.iter().find(|(known, _)| known == name).map(|(_, value)| value.clone())
+    }
+
+    #[test]
+    fn the_thinking_flags_set_chat_variables_under_the_names_of_llama_server() {
+        let off = run(&["--model=m", "--reasoning", "off", "--reasoning-effort", "low"]).load;
+        assert_eq!(variable(&off, "enable_thinking"), Some(Json::Bool(false)));
+        assert_eq!(variable(&off, "reasoning_effort"), Some(Json::String("low".into())));
+        let on = run(&["--model=m", "-rea", "on"]).load;
+        assert_eq!(variable(&on, "enable_thinking"), Some(Json::Bool(true)));
+        // `auto` and `default` leave it to the template, over an earlier --chat-var.
+        let auto = run(&[
+            "--model=m",
+            "--chat-var",
+            "enable_thinking=false",
+            "--chat-var",
+            "reasoning_effort=high",
+            "--reasoning=auto",
+            "--reasoning-effort=default",
+        ])
+        .load;
+        assert_eq!(variable(&auto, "enable_thinking"), None);
+        assert_eq!(variable(&auto, "reasoning_effort"), None);
+        // The default keeps the thinking of earlier turns; the flags say the same both ways.
+        assert_eq!(
+            variable(&run(&["--model=m"]).load, "preserve_reasoning"),
+            Some(Json::Bool(true))
+        );
+        let dropped = run(&["--model=m", "--no-reasoning-preserve"]).load;
+        assert_eq!(variable(&dropped, "preserve_reasoning"), Some(Json::Bool(false)));
+        let kept = run(&["--model=m", "--reasoning-preserve"]).load;
+        assert_eq!(variable(&kept, "preserve_reasoning"), Some(Json::Bool(true)));
+    }
+
+    #[test]
+    fn the_reasoning_format_is_one_of_the_four_names() {
+        for (name, format) in [
+            ("none", ReasoningFormat::None),
+            ("auto", ReasoningFormat::Auto),
+            ("deepseek", ReasoningFormat::Deepseek),
+            ("deepseek-legacy", ReasoningFormat::DeepseekLegacy),
+        ] {
+            assert_eq!(run(&["--model=m", "--reasoning-format", name]).reasoning_format, format);
+        }
+        for (args, flag) in [
+            (&["--reasoning", "maybe"][..], "--reasoning"),
+            (&["--reasoning-format", "think"], "--reasoning-format"),
+            (&["--reasoning-effort", ""], "--reasoning-effort"),
+        ] {
+            match parse_strs(args) {
+                Err(CliError::InvalidValue { flag: named, .. }) => assert_eq!(named, flag),
+                other => panic!("{args:?}: {other:?}"),
+            }
+        }
+        assert_eq!(
+            parse_strs(&["--reasoning-preserve=yes"]),
+            Err(CliError::UnexpectedValue("--reasoning-preserve"))
+        );
+        assert_eq!(
+            parse_strs(&["--model=m", "--reasoning-preserve", "--no-reasoning-preserve"]),
+            Err(CliError::Repeated("--reasoning-preserve"))
+        );
     }
 
     #[test]

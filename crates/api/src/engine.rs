@@ -3,7 +3,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    DecisionRequest, DecisionSink, EngineError, EngineStats, EventSink, GenerateRequest, RequestId,
+    ChatFormat, DecisionRequest, DecisionSink, EngineError, EngineStats, EventSink,
+    GenerateRequest, RequestId,
 };
 
 /// A model the engine serves.
@@ -19,7 +20,7 @@ pub struct ModelCard {
 
 /// The inference runtime as the server sees it.
 ///
-/// `models`, `submit`, `decide` and `cancel` are called from async code, so
+/// `models`, `chat_format`, `submit`, `decide` and `cancel` are called from async code, so
 /// none of them may block: the engine does its work on its own threads and
 /// reports back through the [`EventSink`] or the [`DecisionSink`].
 ///
@@ -38,6 +39,13 @@ pub struct ModelCard {
 pub trait Engine: Send + Sync + 'static {
     /// The models that can be requested right now.
     fn models(&self) -> Vec<ModelCard>;
+
+    /// What the chat template of `model` declares, or `None` for a model the
+    /// engine does not serve or one that has no chat template. It is asked
+    /// for every chat request, so it only reads what the engine already has.
+    fn chat_format(&self, _model: &str) -> Option<ChatFormat> {
+        None
+    }
 
     /// Starts a request.
     ///

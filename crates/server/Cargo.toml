@@ -35,6 +35,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
+# The page layout a test model reports (tests/reasoning_cache.rs).
+ares-state.workspace = true
 # `ServiceExt::oneshot` drives the router in-process, without a socket.
 tower = { version = "0.5", features = ["util"] }
 # The end-to-end tests speak raw HTTP over a TcpStream.
