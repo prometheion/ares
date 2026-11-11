@@ -4,10 +4,16 @@
 //! `docs/ARCHITECTURE.md`), and the users of that memory make room for each
 //! other through an [`ares_core::Broker`]. Page-locked memory is what the
 //! devices copy to and from without a bounce buffer, so it is where state that
-//! lives in RAM has to be; today there are two users:
+//! lives in RAM has to be; today there are three users:
 //!
 //! - the step record and the read-back buffers, which the executor needs to
-//!   run at all (required);
+//!   run at all (required), and whatever else a model's parts must have
+//!   ([`crate::Model::pinned_ram`]);
+//! - the tier of experts in host memory (elastic, high priority: it is what
+//!   keeps a mixture-of-experts model from reading its experts from disk, and
+//!   it gives way to nothing but what is required). The model takes it at
+//!   load, as much as the limit leaves and its experts can use
+//!   ([`PinnedRam::obtainable_experts`]);
 //! - the checkpoints of recurrent state that the prefix cache keeps (elastic,
 //!   low priority: a cache gives way to whatever needs the memory). A device
 //!   part locks them in chunks, when a place is first used, so the memory
@@ -29,12 +35,18 @@ use crate::model::ModelError;
 /// replays more rows, and nothing else suffers.
 const CHECKPOINT_PRIORITY: u32 = 1;
 
+/// The tier of experts ranks above every cache: a step that misses an expert
+/// waits for the drive, which is the one thing that makes such a model slow.
+const EXPERT_PRIORITY: u32 = 100;
+
 struct Books {
     broker: Broker,
     /// The step record and the read-back buffers.
     required: Consumer,
     /// The checkpoints of recurrent state.
     checkpoints: Consumer,
+    /// The tier of experts.
+    experts: Consumer,
 }
 
 /// The page-locked RAM of an engine and what it holds. Clones share the books.
@@ -68,7 +80,10 @@ impl PinnedRam {
                 Class::Elastic { priority: CHECKPOINT_PRIORITY, floor: 0 },
             )
             .expect("a fresh broker takes a consumer");
-        Self { books: Arc::new(Mutex::new(Books { broker, required, checkpoints })) }
+        let experts = broker
+            .register("RAM tier of experts", Class::Elastic { priority: EXPERT_PRIORITY, floor: 0 })
+            .expect("a fresh broker takes a consumer");
+        Self { books: Arc::new(Mutex::new(Books { broker, required, checkpoints, experts })) }
     }
 
     fn books(&self) -> MutexGuard<'_, Books> {
@@ -89,6 +104,56 @@ impl PinnedRam {
     pub fn checkpoints(&self) -> u64 {
         let books = self.books();
         books.broker.info(books.checkpoints.id()).map_or(0, |info| info.usage)
+    }
+
+    /// Bytes the tier of experts holds now.
+    pub fn experts(&self) -> u64 {
+        let books = self.books();
+        books.broker.info(books.experts.id()).map_or(0, |info| info.usage)
+    }
+
+    /// The most the tier of experts could lock now: what the limit leaves
+    /// after the required users, counting what the checkpoints could give
+    /// back.
+    pub fn obtainable_experts(&self) -> u64 {
+        let books = self.books();
+        books.broker.obtainable(&books.experts).unwrap_or(0)
+    }
+
+    /// Locks `bytes` of RAM for the tier of experts, in the form the store
+    /// reads the file into, or says who holds the memory the limit does not
+    /// leave. The bytes are booked until the region is dropped.
+    pub fn lock_experts(
+        &self,
+        device: &Device,
+        bytes: u64,
+    ) -> Result<crate::expert_store::HostRegion, ModelError> {
+        let len = bytes.max(1).next_multiple_of(4096);
+        {
+            let mut books = self.books();
+            let Books { broker, experts, .. } = &mut *books;
+            match broker.grow(experts, len) {
+                Ok(Growth::Granted) => {}
+                Ok(Growth::Reclaim(plan)) => {
+                    return Err(ModelError::Invalid(format!(
+                        "the RAM limit of {} bytes has no room for {len} bytes for the tier of \
+                         experts: {} would have to come from others",
+                        broker.capacity(),
+                        plan.total()
+                    )));
+                }
+                Err(error) => return Err(ModelError::Invalid(error.to_string())),
+            }
+        }
+        let booking = ExpertsBooking { ram: self.clone(), bytes: len };
+        crate::expert_store::HostRegion::locked(device, len as usize, booking)
+            .map_err(|e| ModelError::Invalid(e.to_string()))
+    }
+
+    fn release_experts(&self, bytes: u64) {
+        let mut books = self.books();
+        let Books { broker, experts, .. } = &mut *books;
+        let _ = broker.shrink(experts, bytes);
     }
 
     /// Books `bytes` for what the executor cannot run without.
@@ -145,6 +210,19 @@ impl PinnedRam {
     }
 }
 
+/// What a region of the tier of experts gives back to the books when it is
+/// dropped.
+struct ExpertsBooking {
+    ram: PinnedRam,
+    bytes: u64,
+}
+
+impl Drop for ExpertsBooking {
+    fn drop(&mut self) {
+        self.ram.release_experts(self.bytes);
+    }
+}
+
 /// Page-locked memory booked for the checkpoint cache; the booking ends with
 /// the chunk.
 #[derive(Debug)]
@@ -178,6 +256,36 @@ mod tests {
     use ares_core::units::MIB;
 
     use super::*;
+
+    #[test]
+    fn the_tier_of_experts_may_take_all_the_limit_leaves_and_the_checkpoints_give_way_to_it() {
+        let ram = PinnedRam::new(100 * MIB);
+        ram.require(10 * MIB).unwrap();
+        assert_eq!((ram.obtainable_experts(), ram.experts()), (90 * MIB, 0));
+        // The checkpoints hold 40 MiB; the tier of experts, which ranks above
+        // them, could still have all 90.
+        {
+            let mut books = ram.books();
+            let Books { broker, checkpoints, .. } = &mut *books;
+            assert_eq!(broker.grow(checkpoints, 40 * MIB).unwrap(), Growth::Granted);
+        }
+        assert_eq!(ram.obtainable_experts(), 90 * MIB);
+        {
+            let mut books = ram.books();
+            let Books { broker, experts, .. } = &mut *books;
+            match broker.grow(experts, 90 * MIB).unwrap() {
+                Growth::Reclaim(plan) => {
+                    assert_eq!(plan.total(), 40 * MIB, "the checkpoints give back what they hold");
+                }
+                other => panic!("the checkpoints hold memory the tier needs: {other:?}"),
+            }
+            assert_eq!(broker.grow(experts, 50 * MIB).unwrap(), Growth::Granted);
+        }
+        // And the checkpoints cannot take memory back from the tier.
+        let mut books = ram.books();
+        let Books { broker, checkpoints, .. } = &mut *books;
+        assert!(broker.grow(checkpoints, 20 * MIB).is_err());
+    }
 
     #[test]
     fn the_executors_memory_and_the_checkpoints_share_one_limit() {

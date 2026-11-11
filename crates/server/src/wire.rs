@@ -747,7 +747,7 @@ pub(crate) fn model_list(models: &[ares_api::ModelCard]) -> serde_json::Value {
 
 /// The body of `GET /metrics`.
 pub(crate) fn metrics(stats: &ares_api::EngineStats) -> String {
-    let rows: [(&str, &str, &str, u64); 20] = [
+    let rows: [(&str, &str, &str, u64); 29] = [
         (
             "requests_finished_total",
             "counter",
@@ -827,6 +827,55 @@ pub(crate) fn metrics(stats: &ares_api::EngineStats) -> String {
             "gauge",
             "Page-locked RAM held for checkpoints of recurrent state",
             stats.checkpoint_ram,
+        ),
+        ("expert_picks_total", "counter", "Experts the routers picked", stats.experts.picks),
+        (
+            "expert_hits_total",
+            "counter",
+            "Picked experts that were in a VRAM slot",
+            stats.experts.hits,
+        ),
+        (
+            "expert_misses_ram_total",
+            "counter",
+            "Picked experts that were not in a slot and were in the RAM tier",
+            stats.experts.from_ram,
+        ),
+        (
+            "expert_misses_disk_total",
+            "counter",
+            "Picked experts that were not in a slot and only in the model file",
+            stats.experts.from_disk,
+        ),
+        (
+            "expert_misses_on_their_way_total",
+            "counter",
+            "Picked experts that were not in a slot and already on their way",
+            stats.experts.on_their_way,
+        ),
+        (
+            "expert_cpu_total",
+            "counter",
+            "Experts the CPU computed instead of the device",
+            stats.experts.cpu_experts,
+        ),
+        (
+            "expert_uploads_total",
+            "counter",
+            "Experts uploaded to a VRAM slot",
+            stats.experts.uploads,
+        ),
+        (
+            "expert_read_bytes_total",
+            "counter",
+            "Bytes of experts read from the model file",
+            stats.experts.read_bytes,
+        ),
+        (
+            "expert_wait_microseconds_total",
+            "counter",
+            "Time layers waited for the experts they missed, summed over layers",
+            stats.experts.wait_us,
         ),
     ];
     let mut text = String::new();

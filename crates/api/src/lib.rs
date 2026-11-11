@@ -48,4 +48,4 @@ pub use message::{Message, Role};
 pub use request::{GenerateRequest, Prompt, RequestId};
 pub use sampling::{Sampling, SamplingError};
 pub use sink::{DecisionSink, EventSink};
-pub use stats::EngineStats;
+pub use stats::{EngineStats, ExpertStats};

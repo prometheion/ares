@@ -75,6 +75,7 @@ pub fn required_ram(model: &dyn Model, max_slots: u32) -> u64 {
     let max_rows = model.max_rows();
     record::max_bytes(max_rows, max_slots) as u64
         + model.devices() as u64 * read_back_bytes(model.logit_rows(), max_rows) as u64
+        + model.pinned_ram()
 }
 
 impl GpuConfig {
@@ -774,7 +775,7 @@ impl Worker {
 
         // The one wait of the step.
         let wait_begun = Instant::now();
-        end.synchronize()?;
+        self.model.wait(end)?;
         times.readback_ns = wait_begun.elapsed().as_nanos() as u64;
 
         times.device_ns = (f64::from(end.elapsed_ms_since(&self.start)?) * 1e6) as u64;
@@ -816,6 +817,9 @@ impl Worker {
             let at = self.logit_rows as usize * SamplePick::BYTES;
             let bytes = &self.back[at..at + own.tokens as usize * 4];
             self.drafts.extend(bytes.as_chunks::<4>().0.iter().map(|b| u32::from_le_bytes(*b)));
+        }
+        if produced {
+            self.model.picked(&self.picks);
         }
         self.draft_ms = self.model.own_draft_ms();
         times.pick_ns = sampler_ns + pick_begun.elapsed().as_nanos() as u64;

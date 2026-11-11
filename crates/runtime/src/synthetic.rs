@@ -241,11 +241,15 @@ impl SyntheticConfig {
                     0..0
                 }
             }
+            Split::Shared => 0..0,
         }
     }
 
     fn validate(&self) -> Result<(), ModelError> {
         let bad = |text: String| Err(ModelError::Invalid(text));
+        if self.split == Split::Shared {
+            return bad("the synthetic model has no shared split".into());
+        }
         if self.devices == 0 || (self.split == Split::Single && self.devices != 1) {
             return bad(format!("{:?} over {} devices", self.split, self.devices));
         }
@@ -818,6 +822,9 @@ impl DeviceModel for SyntheticDevice {
             return Ok(None);
         }
         match self.config.split {
+            Split::Shared => {
+                return Err(ModelError::Invalid("the synthetic model has no shared split".into()));
+            }
             Split::Single | Split::Tensor => {
                 // Every device holds the residual stream of all rows; under a
                 // tensor split they compute the same rows at the same time.

@@ -299,6 +299,7 @@ impl Engine for Runtime {
             pages: snapshot.pages_capacity,
             cached_pages: snapshot.cached_pages,
             checkpoint_ram: snapshot.checkpoint_ram,
+            experts: self.model.expert_stats().unwrap_or_default(),
         })
     }
 }

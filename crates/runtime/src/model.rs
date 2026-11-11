@@ -10,9 +10,10 @@
 
 use ares_api::{ChatFormat, EngineError, ModelCard, Prompt};
 use ares_core::Ledger;
-use ares_cuda::{Device, DevicePtr, Kernels, SampleParams, Stream};
+use ares_cuda::{Device, DevicePtr, Event, Kernels, SampleParams, Stream};
 use ares_state::PageLayout;
 
+use crate::exec::Pick;
 use crate::links::Links;
 use crate::ram::PinnedRam;
 use crate::record::RecordView;
@@ -29,6 +30,11 @@ pub enum Split {
     /// Each device holds a range of layers and hands the activations to the
     /// next at the boundary. The rows of a step flow through as a pipeline.
     Layer,
+    /// Every layer is on every device, which exchange what they need among
+    /// themselves, in memory they write to each other directly, ordered by
+    /// the model's own kernels. The runtime builds no path between them, and
+    /// the picks are made on the one device that holds the output head.
+    Shared,
 }
 
 /// The sizes of the paths between devices that a model needs, so the runtime
@@ -254,6 +260,21 @@ pub trait DeviceModel: Send {
     /// that holds no output head.
     fn enqueue(&mut self, step: &StepContext<'_>) -> Result<Option<Logits>, ModelError>;
 
+    /// Waits until the step has ended on the device: `end` is recorded behind
+    /// everything the step enqueued, the sampler's kernels and the read-back
+    /// included. The default blocks in the driver. A model whose step needs
+    /// the host to go on while the device runs (kernels that wait for an
+    /// expert the host brings) serves it here and returns when `end` has
+    /// happened and the host has nothing left to do for the step.
+    fn wait(&mut self, end: &Event) -> Result<(), ModelError> {
+        Ok(end.synchronize()?)
+    }
+
+    /// The tokens picked for the wanted rows of the step that has just ended,
+    /// in the order of the record's runs, before the conductor has seen them.
+    /// Only the device that holds the output head is told.
+    fn picked(&mut self, _picks: &[Pick]) {}
+
     /// The tokens of the columns of this part's logits, a u32 per column on
     /// the device, when column `i` is not token `first_token + i`; null
     /// otherwise.
@@ -314,6 +335,20 @@ pub trait Model: Send + Sync + 'static {
 
     /// The paths between devices the model needs.
     fn links(&self) -> LinkSpec;
+
+    /// How the experts the routers picked were found since the engine
+    /// started, for a model that streams them; `None` for any other.
+    fn expert_stats(&self) -> Option<ares_api::ExpertStats> {
+        None
+    }
+
+    /// The page-locked RAM the model's device parts hold besides what the
+    /// runtime books for the step record and the read-back (the buffers a
+    /// step needs, whatever the cache of checkpoints or a tier of experts
+    /// holds), so that the engine's RAM limit counts it.
+    fn pinned_ram(&self) -> u64 {
+        0
+    }
 
     /// The most rows of one step the model's buffers hold.
     fn max_rows(&self) -> u32;

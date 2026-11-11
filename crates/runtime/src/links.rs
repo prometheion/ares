@@ -105,7 +105,7 @@ impl Links {
         }
         let (mut collective, mut lanes) = (None, Vec::new());
         match split {
-            Split::Single => {}
+            Split::Single | Split::Shared => {}
             Split::Tensor => {
                 // The slots hold the parcels of the model's own merges: as
                 // many as a step has groups of rows, each of the size the

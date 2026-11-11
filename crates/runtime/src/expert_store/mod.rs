@@ -205,8 +205,12 @@ impl StorePlan {
 pub struct HostRegion {
     ptr: NonNull<u8>,
     len: usize,
-    _owner: Box<dyn Any>,
+    _owner: Box<dyn Any + Send>,
 }
+
+// SAFETY: the region is memory that only the store uses, and the store is used
+// by one thread at a time.
+unsafe impl Send for HostRegion {}
 
 impl std::fmt::Debug for HostRegion {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -226,13 +230,24 @@ impl HostRegion {
         ledger: &mut Ledger,
         len: usize,
     ) -> Result<Self, StoreError> {
-        /// Dropped in this order: unlocked, then freed.
+        let len = len.max(1).next_multiple_of(4096);
+        ledger.reserve("expert RAM tier", len as u64)?;
+        Self::locked(device, len, ())
+    }
+
+    /// `len` page-locked bytes (a multiple of 4096) that `booking` accounts
+    /// for and that give the booking back when the region is dropped.
+    pub(crate) fn locked(
+        device: &ares_cuda::Device,
+        len: usize,
+        booking: impl Any + Send,
+    ) -> Result<Self, StoreError> {
+        /// Dropped in this order: unlocked, freed, unbooked.
         struct Locked {
             _registration: ares_cuda::HostRegistration,
             _buffer: Buffer,
+            _booking: Box<dyn Any + Send>,
         }
-        let len = len.max(1).next_multiple_of(4096);
-        ledger.reserve("expert RAM tier", len as u64)?;
         let mut buffer = Buffer::aligned(len, 2 << 20);
         let ptr = NonNull::new(buffer.as_mut_ptr())
             .ok_or_else(|| StoreError::Plan("an allocation without an address".into()))?;
@@ -244,7 +259,11 @@ impl HostRegion {
         Ok(Self {
             ptr,
             len,
-            _owner: Box::new(Locked { _registration: registration, _buffer: buffer }),
+            _owner: Box::new(Locked {
+                _registration: registration,
+                _buffer: buffer,
+                _booking: Box::new(booking),
+            }),
         })
     }
 

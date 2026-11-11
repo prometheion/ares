@@ -2,6 +2,32 @@
 
 use serde::{Deserialize, Serialize};
 
+/// What a model whose experts do not all fit in VRAM counted since the
+/// engine started: how the experts the routers picked were found.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExpertStats {
+    /// Experts the routers picked (one per layer and distinct expert of a
+    /// step), and how many of them were in a VRAM slot when the router's
+    /// record reached the host.
+    pub picks: u64,
+    pub hits: u64,
+    /// The misses, by where the expert's bytes were: in the RAM tier, only in
+    /// the file, or already on their way.
+    pub from_ram: u64,
+    pub from_disk: u64,
+    pub on_their_way: u64,
+    /// Experts the CPU computed instead of the device, and experts uploaded
+    /// to a VRAM slot.
+    pub cpu_experts: u64,
+    pub uploads: u64,
+    /// Bytes read from the model file for experts.
+    pub read_bytes: u64,
+    /// Microseconds layers waited for what they missed, summed over layers.
+    pub wait_us: u64,
+    /// Bytes of page-locked RAM the tier of experts holds.
+    pub ram_tier_bytes: u64,
+}
+
 /// Totals of an engine since it started, and what it holds right now.
 ///
 /// The counts only grow, so the difference of two copies says what happened
@@ -49,6 +75,8 @@ pub struct EngineStats {
     pub cached_pages: u32,
     /// Bytes of page-locked RAM held for checkpoints of recurrent state.
     pub checkpoint_ram: u64,
+    /// How the experts were found, for a model that streams them.
+    pub experts: ExpertStats,
 }
 
 impl EngineStats {

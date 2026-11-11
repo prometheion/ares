@@ -4,7 +4,8 @@
 mod common;
 
 use ares_api::{
-    EngineError, EngineStats, Event, FinishReason, GenerateRequest, Prompt, Role, Usage,
+    EngineError, EngineStats, Event, ExpertStats, FinishReason, GenerateRequest, Prompt, Role,
+    Usage,
 };
 use ares_server::Config;
 use axum::http::{StatusCode, header};
@@ -873,6 +874,17 @@ async fn metrics_are_the_engines_statistics_as_text() {
         pages: 34,
         cached_pages: 7,
         checkpoint_ram: 157_286_400,
+        experts: ExpertStats {
+            picks: 480,
+            hits: 470,
+            from_ram: 6,
+            from_disk: 4,
+            cpu_experts: 2,
+            uploads: 8,
+            read_bytes: 5_000_000,
+            wait_us: 12_000,
+            ..ExpertStats::default()
+        },
     });
     let response = get(&app(&engine), "/metrics").await;
     assert_eq!(response.status(), StatusCode::OK);
@@ -899,6 +911,14 @@ async fn metrics_are_the_engines_statistics_as_text() {
         "ares_page_copies_total 4",
         "ares_cached_pages 7",
         "ares_checkpoint_ram_bytes 157286400",
+        "ares_expert_picks_total 480",
+        "ares_expert_hits_total 470",
+        "ares_expert_misses_ram_total 6",
+        "ares_expert_misses_disk_total 4",
+        "ares_expert_cpu_total 2",
+        "ares_expert_uploads_total 8",
+        "ares_expert_read_bytes_total 5000000",
+        "ares_expert_wait_microseconds_total 12000",
         "# TYPE ares_pages gauge",
         "# TYPE ares_steps_total counter",
     ] {
