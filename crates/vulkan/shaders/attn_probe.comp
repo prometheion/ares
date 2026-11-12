@@ -1,28 +1,21 @@
 #version 450
 #include "common.glsl"
 
-// Spins on dependent arithmetic for a fixed time while holding shared memory, so that the host
-// can find how many workgroups of the attention kernel's size the device runs at once
-// (`AttentionKernels::load`). Workgroup 128; the shared memory is `SHARED` vec4 (a
-// specialization constant) and every workgroup writes one float.
-layout(local_size_x = 128) in;
-layout(constant_id = 0) const uint SHARED = 1024;
+// Spins on dependent arithmetic for a fixed time in the largest workgroups the device runs, so
+// that the host can find how many of them it runs at once (`AttentionKernels::load`): on a
+// multiprocessor that holds fewer than two of them, that is one for each. The workgroup size is
+// a specialization constant. Every workgroup writes one float.
+layout(local_size_x_id = 0) in;
 
 layout(push_constant, std430) uniform Push {
     uint64_t out_;
     uint iterations;
 } pc;
 
-shared vec4 hold[SHARED];
-
 void main() {
     float x = float(gl_LocalInvocationID.x);
-    for (uint i = gl_LocalInvocationID.x; i < SHARED; i += 128u) {
-        hold[i] = vec4(x);
-    }
-    barrier();
     for (uint i = 0u; i < pc.iterations; ++i) {
-        x = fma(x, 1.0001, hold[(i * 7u + gl_LocalInvocationID.x) % SHARED].x * 1e-9);
+        x = fma(x, 1.0001, 1e-9);
     }
     if (gl_LocalInvocationID.x == 0u) {
         FloatRef(pc.out_ + 4ul * ares_group()).v[0] = x;

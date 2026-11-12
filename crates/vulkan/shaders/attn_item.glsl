@@ -38,6 +38,7 @@
 #error "ATTN_NV (the capacity in vectors) is not defined"
 #endif
 
+
 layout(local_size_x = 128) in;
 
 layout(constant_id = 0) const uint KF = 1;
@@ -85,8 +86,11 @@ shared float WM[4u * NV];
 shared float WS[4u * NV];
 // The last visible cell of every vector.
 shared uint Lim[NV];
-shared float MFin[NV];
-shared float LFin[NV];
+// The running maximum and sum of the weights of every vector. One invocation per vector
+// updates them between the chunks: in registers they would be 2 * NV more of the registers
+// that the accumulators and the scores need.
+shared float MS[NV];
+shared float LS[NV];
 
 // The 32 values of the group at `grp` of a row in a `qB` format as f32, in the rotated domain:
 // code * scale, plus the group's slice of the tile mean at `mean` for the formats that have
@@ -288,15 +292,15 @@ void main() {
         Lim[tid] = lim;
     }
 
-    float m[NV];
-    float l[NV];
     float acc[NV][DPT];
     [[unroll]] for (uint v = 0u; v < NV; ++v) {
-        m[v] = NEG_INF;
-        l[v] = 0.0;
         [[unroll]] for (uint k = 0u; k < DPT; ++k) {
             acc[v][k] = 0.0;
         }
+    }
+    if (tid < NV) {
+        MS[tid] = NEG_INF;
+        LS[tid] = 0.0;
     }
     const uint col0 = tid * DPT;
     barrier();
@@ -357,14 +361,14 @@ void main() {
         [[unroll]] for (uint v = 0u; v < NV; ++v) {
             const float chunk_max =
                 max(max(WM[v], WM[NV + v]), max(WM[2u * NV + v], WM[3u * NV + v]));
-            const float next = max(m[v], chunk_max);
+            const float m_old = MS[v];
+            const float next = max(m_old, chunk_max);
             float p = 0.0;
             alpha[v] = 1.0;
             if (next != NEG_INF) {
-                alpha[v] = exp2(m[v] - next);
+                alpha[v] = exp2(m_old - next);
                 p = exp2(s[v] - next);
             }
-            m[v] = next;
             s[v] = p;
             const float cluster_sum = subgroupClusteredAdd(p, 32);
             if (lane == 0u) {
@@ -376,15 +380,31 @@ void main() {
         }
         barrier();
 
+        // The vector `tid` takes the chunk into its running maximum and sum (the other
+        // invocations are in the loop over the cells below).
+        if (tid < NV) {
+            const float chunk_max = max(
+                max(WM[tid], WM[NV + tid]), max(WM[2u * NV + tid], WM[3u * NV + tid]));
+            const float m_old = MS[tid];
+            const float next = max(m_old, chunk_max);
+            if (next != NEG_INF) {
+                LS[tid] = LS[tid] * exp2(m_old - next)
+                    + ((WS[tid] + WS[NV + tid]) + (WS[2u * NV + tid] + WS[3u * NV + tid]));
+                MS[tid] = next;
+            }
+        }
         [[unroll]] for (uint v = 0u; v < NV; ++v) {
-            l[v] = l[v] * alpha[v] + ((WS[v] + WS[NV + v]) + (WS[2u * NV + v] + WS[3u * NV + v]));
             [[unroll]] for (uint k = 0u; k < DPT; ++k) {
                 acc[v][k] *= alpha[v];
             }
         }
-        const uint cells = (min(CH, total - j0) + 3u) & ~3u;
-        for (uint c = 0u; c < cells; c += 4u) {
-            [[unroll]] for (uint u = 0u; u < 4u; ++u) {
+        // Eight cells at a time: their rows are asked for before any is used. (Four cells, and m
+        // and l in registers, were measured on the same plan: within 5 % for q8 and q4, 13 % slower
+        // for f16 with 8 rows over 262144 cells on the RTX 4070; the kernel for 16 vectors takes
+        // 143 registers with m and l in shared memory against 165.)
+        const uint cells = (min(CH, total - j0) + 7u) & ~7u;
+        for (uint c = 0u; c < cells; c += 8u) {
+            [[unroll]] for (uint u = 0u; u < 8u; ++u) {
                 float val[DPT];
                 decode_v(conv, VRow[c + u], VMean[c + u], col0, val);
                 [[unroll]] for (uint vq = 0u; vq < NV / 4u; ++vq) {
@@ -403,12 +423,6 @@ void main() {
 
     // The accumulators to shared memory (the queries are no longer needed), then one cluster
     // per vector: un-rotate, divide by the sum of the weights, write.
-    if (tid == 0u) {
-        [[unroll]] for (uint v = 0u; v < NV; ++v) {
-            MFin[v] = m[v];
-            LFin[v] = l[v];
-        }
-    }
     [[unroll]] for (uint v = 0u; v < NV; ++v) {
         // Four consecutive columns are one vec4, written by the invocation that holds the first.
         const uint next = cluster_lane((lane + 1u) & 31u);
@@ -432,7 +446,7 @@ void main() {
     for (uint v = warp; v < nvec; v += 4u) {
         const uint64_t row = ld4(pc.row_ids + 4ul * (row0 + v / G));
         const uint hl = kv_head * G + v % G;
-        const float lv = LFin[v];
+        const float lv = LS[v];
         const float inv = lv > 0.0 ? 1.0 / lv : 0.0;
         const uint64_t piece =
             uint64_t(attn_row(pc.rows, uint(row)).slot_base + it_slot) * hq + hl;
@@ -454,7 +468,7 @@ void main() {
             }
         }
         if (!is_final && lane == 0u) {
-            FloatRef(pc.st_lse + 4ul * piece).v[0] = lv > 0.0 ? MFin[v] + log2(lv) : NEG_INF;
+            FloatRef(pc.st_lse + 4ul * piece).v[0] = lv > 0.0 ? MS[v] + log2(lv) : NEG_INF;
         }
     }
 }

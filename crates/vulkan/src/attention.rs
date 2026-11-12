@@ -47,7 +47,8 @@
 //! only part of a row's cells write a state (the log2 of the sum of exponentials, the weighted
 //! V in the original domain) and [`attend`](AttentionKernels::attend) merges them, then the
 //! sigmoid gate is applied as the epilogue. A tile gets pieces in proportion to its cells, and
-//! a launch never has more workgroups than the device holds at once ([`AttentionKernels::plan_config`]).
+//! a launch never has many more workgroups than the device holds at once
+//! ([`AttentionKernels::plan_config`]).
 //!
 //! # Against `ares_cuda`
 //!
@@ -262,7 +263,7 @@ struct Set {
     items: Mutex<HashMap<(u32, AttnShape, u32, u32), Function>>,
     /// The largest shape the device's shared memory holds.
     max_shape: AttnShape,
-    /// Workgroups of an attention kernel the device runs at once.
+    /// The workgroups a launch aims for: three for each of the device's multiprocessors.
     resident: u32,
 }
 
@@ -432,8 +433,8 @@ impl AttentionKernels {
     /// Refused where the kernels cannot run: a device without what the quantized weight kernels
     /// need (integer dot products, 8- and 16-bit buffer access, clustered subgroup operations,
     /// subgroups that are a multiple of 32 wide), without shuffles within a subgroup, or with
-    /// too little shared memory for the smallest kernel. The number of workgroups the device
-    /// runs at once is measured here (about a millisecond): [`plan_config`](Self::plan_config).
+    /// too little shared memory for the smallest kernel. The size of the device (how many large
+    /// workgroups it runs at once) is measured here (about 0.2 s): [`plan_config`](Self::plan_config).
     pub fn load(device: &Device) -> Result<Self> {
         if let Some(reason) = &device.physical().attention_unsupported {
             return Err(Error::Unsupported {
@@ -456,7 +457,7 @@ impl AttentionKernels {
                 ),
             })?;
         let lazy = |name: &str| -> Result<Arc<Lazy>> { Ok(Lazy::new(device, image(name)?)) };
-        let resident = resident_workgroups(device, max_shape.shared_bytes(256))?;
+        let resident = 3 * resident_workgroups(device)?;
         Ok(Self(Arc::new(Set {
             device: device.clone(),
             append: lazy("attn_append")?,
@@ -479,8 +480,9 @@ impl AttentionKernels {
         self.0.max_shape.max_vecs()
     }
 
-    /// The configuration of the planner for this device: the workgroups it runs at once (measured
-    /// at load) as the number a decode step is cut into, and the vectors an item holds.
+    /// The configuration of the planner for this device: three workgroups for each of its
+    /// multiprocessors (the size of the device is measured at load, see `resident_workgroups`) as
+    /// the number a decode step is cut into, and the vectors an item holds.
     pub fn plan_config(&self) -> PlanConfig {
         PlanConfig::new(self.0.resident, self.max_vectors())
     }
@@ -725,25 +727,35 @@ impl AttentionKernels {
     }
 }
 
-/// How many workgroups of the attention kernels' size the device runs at once, measured: a
-/// kernel that spins on dependent arithmetic and holds `shared_bytes` of shared memory (as the
-/// attention kernel does, which is what limits how many sit on a multiprocessor next to the
-/// registers) is launched with a growing number of workgroups; while they all fit, the launch
-/// takes as long as one, and past that it takes a second wave.
-fn resident_workgroups(device: &Device, shared_bytes: u32) -> Result<u32> {
-    let probe = Module::load(device, image("attn_probe")?)?
-        .function_with("main", &[(0, shared_bytes / 16)])?;
-    let out = DeviceBuffer::new(device, 4 * 65536)?;
+/// How many of the largest workgroups (up to 1024 invocations) the device runs at once, measured:
+/// a kernel that spins on dependent arithmetic is launched with a growing number of workgroups;
+/// while they all fit, the launch takes as long as one, and past that it takes a second wave. A
+/// multiprocessor holds one or two such workgroups, whatever the registers and the shared memory
+/// of a kernel, so the number follows the count of multiprocessors (or compute units), which
+/// Vulkan does not report. The planner aims for three times that, as the CUDA planner does for
+/// each multiprocessor ([`PlanConfig::new`]).
+///
+/// The clocks of a card that was idle are low for the first moments, so the measurement starts
+/// after 100 ms of work, takes the best of seven launches at each number, and compares with the
+/// best time of the whole series; the number is the one before two in a row that take half as long
+/// again. (A first version spun with the shared memory of the attention kernel, to find how many of
+/// those sit on a multiprocessor next to its registers: the driver gave two or three per
+/// multiprocessor, 92 or 138 on the RTX 4070, in runs a minute apart, and the plan, and with it
+/// the speed of the kernels, followed by up to 45 %.)
+fn resident_workgroups(device: &Device) -> Result<u32> {
+    let size = device.physical().max_workgroup_size.min(1024) / 32 * 32;
+    let probe = Module::load(device, image("attn_probe")?)?.function_with("main", &[(0, size)])?;
+    let out = DeviceBuffer::new(device, 4 * 4096)?;
     let stream = Stream::new(device)?;
     let (start, stop) = (Event::timed(device)?, Event::timed(device)?);
-    let limit = device.physical().max_work_group_count[0].min(65536);
+    let limit = device.physical().max_work_group_count[0].min(1024);
     let time = |groups: u32| -> Result<f32> {
         let mut best = f32::MAX;
-        for _ in 0..5 {
+        for _ in 0..7 {
             start.record(&stream)?;
-            // SAFETY: the kernel writes one float per workgroup into `out`, which holds 65536.
+            // SAFETY: the kernel writes one float per workgroup into `out`, which holds 4096.
             unsafe {
-                probe.launch(&stream, [groups, 1, 1], Args::new().ptr(out.ptr()).u32(4096))?;
+                probe.launch(&stream, [groups, 1, 1], Args::new().ptr(out.ptr()).u32(8192))?;
             }
             stop.record(&stream)?;
             stop.synchronize()?;
@@ -751,19 +763,21 @@ fn resident_workgroups(device: &Device, shared_bytes: u32) -> Result<u32> {
         }
         Ok(best)
     };
-    // Warm the clocks and the pipeline.
-    for _ in 0..4 {
-        time(64)?;
+    let warm = std::time::Instant::now();
+    while warm.elapsed() < std::time::Duration::from_millis(100) {
+        time(16)?;
     }
-    let one = time(1)?;
-    let mut fits = 1u32;
-    let mut groups = 2u32;
-    while groups <= limit.min(4096) {
-        if time(groups)? > 1.5 * one {
-            break;
-        }
-        fits = groups;
-        groups += (groups / 4).max(1);
+    let mut ladder = vec![1u32];
+    while ladder.last().is_some_and(|n| *n < limit) {
+        let n = *ladder.last().unwrap_or(&1);
+        ladder.push((n + (n / 8).max(1)).min(limit));
     }
-    Ok(fits)
+    let times = ladder.iter().map(|n| time(*n)).collect::<Result<Vec<f32>>>()?;
+    let base = times.iter().copied().fold(f32::MAX, f32::min);
+    let slow = |i: usize| times[i] > 1.5 * base;
+    let first_slow = (0..times.len().saturating_sub(1)).find(|i| slow(*i) && slow(i + 1));
+    Ok(match first_slow {
+        Some(i) => ladder[i.saturating_sub(1)],
+        None => *ladder.last().unwrap_or(&1),
+    })
 }

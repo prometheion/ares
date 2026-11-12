@@ -126,7 +126,7 @@ impl AttnShape {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PlanConfig {
     /// Workgroups to aim for in a launch; a decode step is cut into pieces until there are
-    /// about this many (what the device runs at once, see
+    /// about this many (two to four per multiprocessor, see
     /// [`AttentionKernels::plan_config`](super::AttentionKernels::plan_config)).
     pub target_blocks: u32,
     /// The fewest cells a piece of a range list is cut into.

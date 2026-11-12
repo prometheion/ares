@@ -1002,6 +1002,21 @@ fn attention_with_a_head_size_of_128_equals_the_reference() {
     }
 }
 
+/// The planner aims for as many workgroups as the device runs at once, which is measured at
+/// load: the number must not depend on the moment (a first version gave 78 and 121 on one card).
+#[test]
+fn the_workgroups_the_device_runs_at_once_are_measured_the_same_every_time() {
+    let Some(devices) = gpus() else { return };
+    for device in devices {
+        let counts: Vec<u32> = (0..6)
+            .map(|_| AttentionKernels::load(device).unwrap().plan_config().target_blocks)
+            .collect();
+        println!("{}: workgroups at once: {counts:?}", device.info().name);
+        let (lo, hi) = (*counts.iter().min().unwrap(), *counts.iter().max().unwrap());
+        assert!(lo > 0 && f64::from(hi) <= 1.2 * f64::from(lo), "{counts:?}");
+    }
+}
+
 /// One case from the environment, for investigations:
 /// `ARES_ATTN_CASE=k,v,hist,rows[,d]`.
 #[test]

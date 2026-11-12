@@ -284,6 +284,10 @@ pub fn run(ordinal: u32, opts: &Opts, cases: &[BenchCase]) -> Result<Vec<Option<
     let device = open(ordinal)?;
     let kernels = AttentionKernels::load(&device)?;
     let stream = new_stream(&device)?;
+    eprintln!(
+        "[{BACKEND}] the planner aims for {} workgroups per launch",
+        plan_config(&device, &kernels).target_blocks
+    );
     let mut results = Vec::new();
     // Consecutive cases of one pair and history share their sequence.
     let mut built: Option<((CacheFormat, CacheFormat, usize), Setup)> = None;

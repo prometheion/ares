@@ -63,6 +63,9 @@ pub(crate) struct Physical {
     pub(crate) attention_unsupported: Option<String>,
     /// Bytes of shared memory a workgroup may use (`maxComputeSharedMemorySize`).
     pub(crate) max_shared_memory: u32,
+    /// Invocations in the largest workgroup of one dimension the device runs
+    /// (`maxComputeWorkGroupInvocations` and `maxComputeWorkGroupSize[0]`).
+    pub(crate) max_workgroup_size: u32,
     /// Every device extension the driver lists.
     pub(crate) extensions: Vec<String>,
     /// What the device can share with other devices and with host memory.
@@ -400,6 +403,10 @@ fn describe(entry: &Entry, instance: &ash::Instance, raw: vk::PhysicalDevice) ->
         unusable,
         attention_unsupported,
         max_shared_memory: props.limits.max_compute_shared_memory_size,
+        max_workgroup_size: props
+            .limits
+            .max_compute_work_group_invocations
+            .min(props.limits.max_compute_work_group_size[0]),
         quantized_unsupported,
         extensions: extensions
             .iter()
