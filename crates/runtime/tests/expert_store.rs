@@ -109,11 +109,23 @@ fn rig(vram_slots: u64, ram_slots: u64, tune: impl FnOnce(&mut StoreConfig)) -> 
     config.vram_reserve = 1;
     config.rebalance_every = 0;
     tune(&mut config);
-    let probe = StorePlan::new(config.clone(), &map, &reader, &layers, None).unwrap();
+    // Transit and staging are room of their own, next to the tiers'.
+    let (transit, staging) =
+        (config.transit_slots.first().copied().unwrap_or(0), config.staging_slots);
+    config.vram_bytes[0] += u64::from(transit) * SLOT_BYTES;
+    let probe = StorePlan::new(
+        StoreConfig { staging_slots: 0, ..config.clone() },
+        &map,
+        &reader,
+        &layers,
+        None,
+    )
+    .unwrap();
     let ram_slot = probe.ram_bytes() / (probe.slots(0).1 * LAYERS);
-    config.ram_bytes = ram_slots * (ram_slot * LAYERS) as u64;
+    config.ram_bytes = (ram_slots * LAYERS as u64 + u64::from(staging)) * ram_slot as u64;
     let plan = StorePlan::new(config, &map, &reader, &layers, None).unwrap();
     assert_eq!(plan.slots(0), (vram_slots as usize, ram_slots as usize));
+    assert_eq!(plan.transit_slots(0), (transit, staging));
     let device = HostSlots::new(&plan.device_pools(0), LAYERS, EXPERTS);
     let region = HostRegion::unpinned(plan.ram_bytes(), plan.block());
     Rig {
@@ -1311,4 +1323,310 @@ mod device {
             }
         }
     }
+}
+
+/// A store with `transit` transit slots and `staging` staging slots besides its tiers.
+fn transit_rig(transit: u32, staging: u32) -> Rig {
+    rig(4, 4, |config| {
+        config.transit_slots = vec![transit];
+        config.staging_slots = staging;
+    })
+}
+
+impl Rig {
+    /// What has arrived in transit for `layer`, each checked against the file.
+    fn take_transit(&mut self, layer: usize) -> Vec<u32> {
+        let mut arrived = Vec::new();
+        self.store.transit_take(layer, &mut arrived);
+        let (pool, stride, _) = self.store.transit_pool(layer).unwrap();
+        assert_eq!(stride, SLOT_BYTES);
+        for (expert, slot) in &arrived {
+            assert_eq!(
+                self.store.device(0).slot(pool, *slot),
+                expert_bytes(layer, *expert),
+                "layer {layer} expert {expert} in transit slot {slot}"
+            );
+        }
+        arrived.into_iter().map(|(expert, _)| expert).collect()
+    }
+}
+
+#[test]
+fn a_wanted_expert_passes_through_transit_and_the_tiers_stay() {
+    let mut rig = transit_rig(2, 2);
+    rig.step(&[&[1, 2]]);
+    rig.store.take_stats();
+
+    rig.store.begin_step();
+    // Three experts for two transit slots: the third waits for a slot.
+    rig.store.transit_want(0, &[7, 9, 11]).unwrap();
+    assert_eq!(rig.store.transit_pending(0), 3);
+    rig.settle();
+    assert_eq!(rig.take_transit(0), [7, 9]);
+    assert_eq!(rig.store.transit_pending(0), 1);
+    // Asking again changes nothing.
+    rig.store.transit_want(0, &[9, 11]).unwrap();
+    rig.settle();
+    assert!(rig.take_transit(0).is_empty());
+    rig.store.transit_release(0, &[7, 9]).unwrap();
+    rig.settle();
+    assert_eq!(rig.take_transit(0), [11]);
+    assert_eq!(rig.store.transit_pending(0), 0);
+    rig.store.transit_release(0, &[11]).unwrap();
+    rig.store.end_step().unwrap();
+    rig.settle();
+
+    // No tier took them, and the tiers hold what they held.
+    for expert in [7, 9, 11] {
+        assert!(!rig.store.in_vram(0, expert) && !rig.store.in_ram(0, expert));
+    }
+    rig.assert_usable(0, 1);
+    rig.assert_usable(0, 2);
+    let stats = rig.store.take_stats();
+    assert_eq!((stats.transit_uploads, stats.transit_from_ram, stats.transit_reads), (3, 0, 3));
+    assert_eq!(stats.transit_upload_bytes, 3 * 352);
+    assert_eq!((stats.demand_reads, stats.uploads, stats.evictions, stats.demotions), (0, 0, 0, 0));
+    assert_eq!((stats.transit_ahead_reads, stats.transit_ahead_used), (0, 0));
+}
+
+#[test]
+fn an_expert_in_ram_goes_into_transit_from_its_ram_slot_and_stays_there() {
+    // The members of the VRAM tier are far hotter than expert 7, which a
+    // step brings from the file and leaves in the RAM tier.
+    let mut rig = full_rig(100);
+    let mut counts = [0u32; EXPERTS as usize];
+    counts[7] = 5;
+    for from_ram in [false, true] {
+        rig.store.begin_step();
+        rig.store.transit_want(0, &[7]).unwrap();
+        rig.settle();
+        assert_eq!(rig.take_transit(0), [7]);
+        rig.store.record_counts(0, &counts, 1.0);
+        rig.store.transit_release(0, &[7]).unwrap();
+        rig.store.end_step().unwrap();
+        rig.settle();
+        assert!(rig.store.in_ram(0, 7) && !rig.store.in_vram(0, 7));
+        let stats = rig.store.take_stats();
+        assert_eq!(
+            (stats.transit_uploads, stats.transit_from_ram, stats.transit_reads),
+            (1, u64::from(from_ram), u64::from(!from_ram))
+        );
+        assert_eq!((stats.transit_adopted, stats.evictions, stats.demotions), (0, 0, 0));
+    }
+}
+
+#[test]
+fn a_guess_is_read_ahead_and_the_want_that_names_it_takes_it() {
+    let mut rig = transit_rig(2, 4);
+    rig.store.begin_step();
+    // Guesses take at most half of staging: two of the three are read.
+    rig.store.transit_guess(1, &[3, 4, 5]).unwrap();
+    rig.settle();
+    assert_eq!(rig.store.stats().transit_ahead_reads, 2);
+    assert!(rig.take_transit(1).is_empty(), "a guess is not uploaded");
+
+    // The record names one of them and an expert nobody guessed.
+    let named = rig.store.transit_want(1, &[4, 8]).unwrap();
+    assert_eq!((named.guessed, named.unguessed), (1, 1));
+    rig.settle();
+    assert_eq!(rig.take_transit(1), [4, 8]);
+    rig.store.transit_release(1, &[4, 8]).unwrap();
+    // The layer is over: the guesses nobody named are dropped.
+    rig.store.transit_forget(1).unwrap();
+    rig.store.end_step().unwrap();
+    rig.settle();
+    let stats = rig.store.take_stats();
+    assert_eq!((stats.transit_reads, stats.transit_ahead_used), (1, 1));
+    assert_eq!(stats.transit_ahead_unused, stats.transit_ahead_reads - 1);
+    assert_eq!(stats.transit_uploads, 2);
+    for expert in [3, 4, 5, 8] {
+        assert!(!rig.store.in_vram(1, expert) && !rig.store.in_ram(1, expert));
+    }
+
+    // Everything is free again: a full round of wants goes through.
+    rig.store.begin_step();
+    rig.store.transit_want(2, &[1, 2]).unwrap();
+    rig.settle();
+    assert_eq!(rig.take_transit(2), [1, 2]);
+    rig.store.transit_release(2, &[1, 2]).unwrap();
+    rig.store.end_step().unwrap();
+}
+
+/// A store with transit whose four VRAM slots of layer 0 hold experts 1 to 4,
+/// with the heat of 100 rows each but expert 4, which has that of `cold` rows.
+fn full_rig(cold: u32) -> Rig {
+    let mut rig = rig(4, 4, |config| {
+        config.transit_slots = vec![2];
+        config.staging_slots = 2;
+        config.vram_reserve = 0;
+    });
+    rig.step(&[&[1, 2]]);
+    rig.step(&[&[3, 4]]);
+    let mut counts = [0u32; EXPERTS as usize];
+    counts[1..4].fill(100);
+    counts[4] = cold;
+    rig.store.record_counts(0, &counts, 1.0);
+    for expert in 1..=4 {
+        rig.assert_usable(0, expert);
+    }
+    rig.store.take_stats();
+    rig
+}
+
+#[test]
+fn an_expert_the_heat_ranks_high_stays_in_ram_after_its_transit() {
+    // Every member of the VRAM tier is far hotter than what comes through.
+    let mut rig = full_rig(100);
+    rig.store.begin_step();
+    rig.store.transit_want(0, &[7, 9]).unwrap();
+    rig.settle();
+    assert_eq!(rig.take_transit(0), [7, 9]);
+    // The step used expert 7 for five rows; of expert 9 the heat knows nothing.
+    let mut counts = [0u32; EXPERTS as usize];
+    counts[7] = 5;
+    rig.store.record_counts(0, &counts, 1.0);
+    rig.store.transit_release(0, &[7, 9]).unwrap();
+    rig.store.end_step().unwrap();
+    rig.settle();
+    assert!(rig.store.in_ram(0, 7) && !rig.store.in_ram(0, 9));
+    assert!(!rig.store.in_vram(0, 7));
+    let stats = rig.store.take_stats();
+    assert_eq!((stats.transit_admitted, stats.transit_adopted, stats.evictions), (1, 0, 0));
+
+    // From RAM it goes up without a read, and it is the file's bytes.
+    rig.store.begin_step();
+    rig.store.transit_want(0, &[7]).unwrap();
+    rig.settle();
+    assert_eq!(rig.take_transit(0), [7]);
+    rig.store.transit_release(0, &[7]).unwrap();
+    rig.store.end_step().unwrap();
+    let stats = rig.store.take_stats();
+    assert_eq!((stats.transit_from_ram, stats.transit_reads), (1, 0));
+}
+
+#[test]
+fn a_store_without_transit_says_so() {
+    let mut rig = rig(4, 4, |_| {});
+    assert!(rig.store.transit_pool(0).is_none());
+    assert_eq!(rig.store.staging_slots(), 0);
+    assert!(rig.store.transit_want(0, &[1]).is_err());
+    // A guess is only a hint.
+    rig.store.transit_guess(0, &[1]).unwrap();
+}
+
+#[test]
+fn an_expert_let_go_on_its_way_is_brought_when_it_is_named_again() {
+    let mut rig = transit_rig(2, 2);
+    rig.store.begin_step();
+    rig.store.transit_want(0, &[7]).unwrap();
+    // The step ends early (it failed) while the read is on its way, and the
+    // next step names the expert again.
+    rig.store.begin_step();
+    assert_eq!(rig.store.transit_pending(0), 1, "let go, and still there until its read is back");
+    rig.store.transit_want(0, &[7]).unwrap();
+    rig.settle();
+    assert_eq!(rig.take_transit(0), [7]);
+    rig.store.transit_release(0, &[7]).unwrap();
+    rig.store.end_step().unwrap();
+    rig.settle();
+
+    // Nothing was lost on the way: both slots of each kind are free.
+    rig.store.begin_step();
+    rig.store.transit_want(1, &[3, 4]).unwrap();
+    rig.settle();
+    assert_eq!(rig.take_transit(1), [3, 4]);
+    rig.store.transit_release(1, &[3, 4]).unwrap();
+    rig.store.end_step().unwrap();
+}
+
+#[test]
+fn what_waits_for_a_slot_is_not_on_its_way() {
+    let mut rig = transit_rig(2, 2);
+    rig.store.begin_step();
+    rig.store.transit_want(0, &[7, 9, 11]).unwrap();
+    // Two reads are on their way; the third has no staging slot to be read to.
+    assert_eq!((rig.store.transit_pending(0), rig.store.transit_moving(0)), (3, 2));
+    rig.settle();
+    // Two have arrived, and the third waits for what they hold: nothing moves
+    // until a round has read them and they are released.
+    assert_eq!((rig.store.transit_pending(0), rig.store.transit_moving(0)), (1, 0));
+    assert_eq!(rig.take_transit(0), [7, 9]);
+    rig.store.transit_release(0, &[7, 9]).unwrap();
+    assert_eq!(rig.store.transit_moving(0), 1);
+    rig.settle();
+    assert_eq!(rig.take_transit(0), [11]);
+    rig.store.transit_release(0, &[11]).unwrap();
+    rig.store.end_step().unwrap();
+}
+
+#[test]
+fn an_expert_hotter_than_the_coldest_member_takes_its_slot_from_transit() {
+    // Expert 4 holds a slot with the heat of two rows (and one pick).
+    let mut rig = full_rig(2);
+    rig.store.begin_step();
+    rig.store.transit_want(0, &[7, 9]).unwrap();
+    rig.settle();
+    assert_eq!(rig.take_transit(0), [7, 9]);
+    // Fifty rows of the step used expert 7 and three used expert 9.
+    let mut counts = [0u32; EXPERTS as usize];
+    counts[7] = 50;
+    counts[9] = 3;
+    rig.store.record_counts(0, &counts, 1.0);
+    // The round that read them has not ended: nothing moves yet.
+    assert!(!rig.store.in_vram(0, 7) && rig.store.in_vram(0, 4));
+    rig.store.transit_release(0, &[7, 9]).unwrap();
+    // The coldest member is gone at once, and the newcomer shows when the
+    // device has copied it.
+    assert!(!rig.store.in_vram(0, 4) && !rig.store.in_vram(0, 7));
+    rig.settle();
+    rig.assert_usable(0, 7);
+    assert!(rig.store.in_vram(0, 7));
+    assert_eq!(rig.store.device(0).entry(0, 4), -1);
+    // Expert 9 is not hotter than a member by the margin: it does not stay in
+    // VRAM. What left VRAM is in RAM, an upload away.
+    assert!(!rig.store.in_vram(0, 9));
+    assert!(rig.store.in_ram(0, 4));
+    for expert in 1..=3 {
+        rig.assert_usable(0, expert);
+    }
+    rig.store.end_step().unwrap();
+    rig.settle();
+    let stats = rig.store.take_stats();
+    assert_eq!((stats.transit_adopted, stats.evictions, stats.uploads), (1, 1, 0));
+    assert_eq!((stats.transit_uploads, stats.transit_reads), (2, 2));
+
+    // The next step finds it in its slot, and transit is free again.
+    rig.store.begin_step();
+    assert_eq!(rig.store.routed(0, &[7]).unwrap(), 0);
+    rig.store.transit_want(1, &[5, 6]).unwrap();
+    rig.settle();
+    assert_eq!(rig.take_transit(1), [5, 6]);
+    rig.store.transit_release(1, &[5, 6]).unwrap();
+    rig.store.end_step().unwrap();
+}
+
+#[test]
+fn an_expert_with_heat_takes_a_free_slot_from_transit() {
+    // Two of the four slots of every layer are free.
+    let mut rig = transit_rig(2, 2);
+    rig.step(&[&[1, 2]]);
+    rig.store.take_stats();
+    rig.store.begin_step();
+    rig.store.transit_want(0, &[7, 9]).unwrap();
+    rig.settle();
+    assert_eq!(rig.take_transit(0), [7, 9]);
+    let mut counts = [0u32; EXPERTS as usize];
+    counts[7] = 1;
+    rig.store.record_counts(0, &counts, 1.0);
+    rig.store.transit_release(0, &[7, 9]).unwrap();
+    rig.settle();
+    rig.assert_usable(0, 7);
+    rig.assert_usable(0, 1);
+    rig.assert_usable(0, 2);
+    // Of expert 9 the heat knows nothing: it is forgotten.
+    assert!(!rig.store.in_vram(0, 9) && !rig.store.in_ram(0, 9));
+    rig.store.end_step().unwrap();
+    rig.settle();
+    let stats = rig.store.take_stats();
+    assert_eq!((stats.transit_adopted, stats.transit_admitted), (1, 0));
 }

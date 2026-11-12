@@ -47,6 +47,25 @@ pub trait SlotDevice {
         len: usize,
     ) -> Result<(), StoreError>;
 
+    /// Enqueues the move of an expert on the device, in the order of the
+    /// copies out of slots (a `mark(true)` follows it): `parts` (offset in a
+    /// slot, bytes) of slot `from` of pool `from_pool` are copied into slot
+    /// `slot` of pool `pool`, and behind them the table entry of `expert` of
+    /// `layer` is written to name that slot. It runs behind the copy down of
+    /// what the slot held and keeps no upload waiting. Both slots are inside
+    /// their pools.
+    #[allow(clippy::too_many_arguments)]
+    fn adopt(
+        &mut self,
+        from_pool: usize,
+        from: u32,
+        pool: usize,
+        slot: u32,
+        parts: &[(u64, usize)],
+        layer: usize,
+        expert: u32,
+    ) -> Result<(), StoreError>;
+
     /// Enqueues the write of a table entry: `expert` of `layer` is in slot
     /// `slot` of the layer's pool, or (-1) in none.
     fn set_entry(&mut self, layer: usize, expert: u32, slot: i32) -> Result<(), StoreError>;
@@ -242,6 +261,24 @@ impl CudaSlots {
         base.offset(u64::from(slot) * stride + offset)
     }
 
+    /// A cell of the ring of table entries that holds `slot`, for a copy
+    /// enqueued next on either stream.
+    fn entry_cell(&mut self, slot: i32) -> Result<*const u8, StoreError> {
+        if self.next_entry == ENTRY_RING {
+            // Every cell has a copy that may not have run yet.
+            self.stream.synchronize()?;
+            self.down.synchronize()?;
+            self.next_entry = 0;
+        }
+        // SAFETY: the cell is inside the pinned ring, and no enqueued copy
+        // reads it any more (the ring was waited for when it wrapped).
+        let cell = unsafe { self.entries.as_mut_ptr().add(4 * self.next_entry) };
+        self.next_entry += 1;
+        // SAFETY: as above; a pinned allocation is aligned for i32.
+        unsafe { cell.cast::<i32>().write(slot) };
+        Ok(cell.cast_const())
+    }
+
     fn event(&mut self) -> Result<Event, StoreError> {
         match self.spare.pop() {
             Some(event) => Ok(event),
@@ -289,18 +326,40 @@ impl SlotDevice for CudaSlots {
         Ok(())
     }
 
-    fn set_entry(&mut self, layer: usize, expert: u32, slot: i32) -> Result<(), StoreError> {
-        if self.next_entry == ENTRY_RING {
-            // Every cell has a copy that may not have run yet.
-            self.stream.synchronize()?;
-            self.next_entry = 0;
+    fn adopt(
+        &mut self,
+        from_pool: usize,
+        from: u32,
+        pool: usize,
+        slot: u32,
+        parts: &[(u64, usize)],
+        layer: usize,
+        expert: u32,
+    ) -> Result<(), StoreError> {
+        for (offset, len) in parts {
+            let src = self.slot_ptr(from_pool, from, *offset);
+            let dst = self.slot_ptr(pool, slot, *offset);
+            // SAFETY: both slots are inside their pools (the store's plan
+            // sized them), which are different buffers of this device.
+            unsafe { self.down.copy(dst, src, *len)? };
         }
-        // SAFETY: the cell is inside the pinned ring, and no enqueued copy
-        // reads it any more (the ring was waited for when it wrapped).
-        let cell = unsafe { self.entries.as_mut_ptr().add(4 * self.next_entry) };
-        self.next_entry += 1;
-        // SAFETY: as above; a pinned allocation is aligned for i32.
-        unsafe { cell.cast::<i32>().write(slot) };
+        let cell = self.entry_cell(slot as i32)?;
+        let entry = self.table(layer).offset(4 * u64::from(expert));
+        // SAFETY: the entry is inside the tables, the cell stays unchanged
+        // until the ring wraps.
+        unsafe { self.down.copy_from_host(entry, cell, 4)? };
+        // An upload into the slot waits for all of this, as for a copy down.
+        let event = match self.going_down.remove(&(pool, slot)) {
+            Some(event) => event,
+            None => self.event()?,
+        };
+        event.record(&self.down)?;
+        self.going_down.insert((pool, slot), event);
+        Ok(())
+    }
+
+    fn set_entry(&mut self, layer: usize, expert: u32, slot: i32) -> Result<(), StoreError> {
+        let cell = self.entry_cell(slot)?;
         let entry = self.table(layer).offset(4 * u64::from(expert));
         // SAFETY: the entry is inside the tables, the cell stays unchanged
         // until the ring wraps.
@@ -395,6 +454,7 @@ impl SlotDevice for CudaSlots {
 enum HostOp {
     Upload { pool: usize, at: usize, src: *const u8, len: usize },
     Download { pool: usize, at: usize, dst: *mut u8, len: usize },
+    Copy { from_pool: usize, from: usize, pool: usize, at: usize, len: usize },
     Entry { layer: usize, expert: u32, slot: i32 },
     Claim { layer: usize, token: u32, groups: Vec<u32> },
     Deliver { layer: usize, token: u32, sums: Vec<f32> },
@@ -461,6 +521,10 @@ impl HostSlots {
                     let dst = unsafe { std::slice::from_raw_parts_mut(dst, len) };
                     dst.copy_from_slice(&self.pools[pool].0[at..at + len]);
                 }
+                HostOp::Copy { from_pool, from, pool, at, len } => {
+                    let bytes = self.pools[from_pool].0[from..from + len].to_vec();
+                    self.pools[pool].0[at..at + len].copy_from_slice(&bytes);
+                }
                 HostOp::Entry { layer, expert, slot } => self.tables[layer][expert as usize] = slot,
                 HostOp::Claim { layer, token, groups } => {
                     self.shares[layer].claimed = Some((token, groups));
@@ -526,6 +590,25 @@ impl SlotDevice for HostSlots {
     ) -> Result<(), StoreError> {
         let at = (u64::from(slot) * self.pools[pool].1 + offset) as usize;
         self.push(HostOp::Download { pool, at, dst, len });
+        Ok(())
+    }
+
+    fn adopt(
+        &mut self,
+        from_pool: usize,
+        from: u32,
+        pool: usize,
+        slot: u32,
+        parts: &[(u64, usize)],
+        layer: usize,
+        expert: u32,
+    ) -> Result<(), StoreError> {
+        for (offset, len) in parts {
+            let from = (u64::from(from) * self.pools[from_pool].1 + offset) as usize;
+            let at = (u64::from(slot) * self.pools[pool].1 + offset) as usize;
+            self.push(HostOp::Copy { from_pool, from, pool, at, len: *len });
+        }
+        self.push(HostOp::Entry { layer, expert, slot: slot as i32 });
         Ok(())
     }
 

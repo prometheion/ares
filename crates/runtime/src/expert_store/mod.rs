@@ -19,6 +19,12 @@
 //!   an expert that VRAM evicts comes down into it.
 //! - **SSD.** The file itself, read through `ares-io`: demand reads for
 //!   experts a running step waits for, prefetches for guesses.
+//! - **Transit and staging** (`transit.rs`). A step of many rows uses far
+//!   more experts of a layer than the layer has slots, each for all its rows
+//!   at once. What such a step misses is uploaded into a small pool of
+//!   transit slots per device, from its RAM slot or from the file through
+//!   staging slots in host memory, computed from there and released; it takes
+//!   a slot of the tiers afterwards only if its heat says so.
 //!
 //! # A step
 //!
@@ -53,6 +59,7 @@ pub mod cpu;
 mod device;
 mod hybrid;
 mod tier;
+mod transit;
 
 use std::any::Any;
 use std::collections::{HashMap, VecDeque};
@@ -70,6 +77,8 @@ pub use device::{CudaSlots, HostShareState, HostSlots, SlotDevice};
 pub use hybrid::{CostModel, Miss, PromoteRule, Serve};
 pub use tier::Pool;
 use tier::Tier;
+pub use transit::Named;
+use transit::{Transit, TransitPlan};
 
 /// Why the store could not be built or could not go on.
 #[derive(Debug, thiserror::Error)]
@@ -119,6 +128,12 @@ pub struct StoreConfig {
     /// Every this many steps, slots pass between the layers of a pool by
     /// need; 0 never moves any.
     pub rebalance_every: u64,
+    /// Transit slots per device (`transit.rs`), taken from the device's bytes
+    /// for slots; a device that is not named has none.
+    pub transit_slots: Vec<u32>,
+    /// Staging slots in host memory for experts on their way from the file
+    /// into transit, taken from the bytes of the RAM tier.
+    pub staging_slots: u32,
 }
 
 impl StoreConfig {
@@ -135,6 +150,8 @@ impl StoreConfig {
             heat_decay: 0.9,
             decay_every: 32,
             rebalance_every: 256,
+            transit_slots: Vec::new(),
+            staging_slots: 0,
         }
     }
 }
@@ -163,23 +180,41 @@ pub struct StorePlan {
     layers: Vec<Geometry>,
     vram: Tier,
     ram: Tier,
+    transit: TransitPlan,
 }
 
 impl StorePlan {
     /// The pools of `device` as `(slot bytes, slots)`, in the order a
-    /// [`SlotDevice`] numbers them.
+    /// [`SlotDevice`] numbers them: the pools of the tier, then the transit
+    /// pool if the device has one.
     pub fn device_pools(&self, device: usize) -> Vec<(u64, u32)> {
-        self.vram.pools.iter().filter(|p| p.place == device).map(|p| (p.stride, p.slots)).collect()
+        let tier = self.vram.pools.iter().filter(|p| p.place == device);
+        let transit = self.transit.pools.get(device).copied().flatten();
+        tier.map(|p| (p.stride, p.slots))
+            .chain(transit.map(|(_, stride, slots)| (stride, slots)))
+            .collect()
     }
 
-    /// Bytes of expert slots on `device`.
+    /// Bytes of the expert slots of the tier on `device`.
     pub fn vram_bytes(&self, device: usize) -> u64 {
         self.vram.bytes(device)
     }
 
-    /// Bytes of the region the RAM tier needs, aligned to [`StorePlan::block`].
+    /// Bytes of the transit slots on `device`.
+    pub fn transit_bytes(&self, device: usize) -> u64 {
+        self.transit.bytes(device)
+    }
+
+    /// Transit slots on `device` and staging slots in host memory.
+    pub fn transit_slots(&self, device: usize) -> (u32, u32) {
+        let slots = self.transit.pools.get(device).copied().flatten().map_or(0, |pool| pool.2);
+        (slots, self.transit.stage_slots)
+    }
+
+    /// Bytes of the region the RAM tier and staging need, aligned to
+    /// [`StorePlan::block`].
     pub fn ram_bytes(&self) -> usize {
-        self.ram.bytes(0) as usize
+        self.ram.bytes(0) as usize + self.transit.stage_len()
     }
 
     /// The alignment reads need of the region.
@@ -388,11 +423,41 @@ pub struct StoreStats {
     /// layers: from the arrival of a record to the last of its misses being
     /// in a slot or delivered.
     pub wait_ms: f64,
+    /// Experts uploaded into transit slots, how many of them from the RAM
+    /// tier (the others from the file through staging), and their bytes.
+    pub transit_uploads: u64,
+    pub transit_from_ram: u64,
+    pub transit_upload_bytes: u64,
+    /// Reads of experts from the file into staging that a record asked for,
+    /// reads that were started ahead of a record on a guess, and the bytes of
+    /// both (whole blocks).
+    pub transit_reads: u64,
+    pub transit_ahead_reads: u64,
+    pub transit_read_bytes: u64,
+    /// Of the guesses, those a record then named and those that were dropped
+    /// after their read had started.
+    pub transit_ahead_used: u64,
+    pub transit_ahead_unused: u64,
+    /// Milliseconds from asking for an expert to its being usable in
+    /// transit, summed over the experts.
+    pub transit_ms: f64,
+    /// Guessed reads that came back before a record named them, and the
+    /// milliseconds from the guess to the bytes being in staging, summed.
+    pub transit_ahead_done: u64,
+    pub transit_ahead_ms: f64,
+    /// Experts that came from the file through staging and were kept in the
+    /// RAM tier afterwards, by their heat.
+    pub transit_admitted: u64,
+    /// Experts that took a slot of the VRAM tier from their transit slot, by
+    /// their heat.
+    pub transit_adopted: u64,
 }
 
 /// The expert tiers of a model and the work that feeds them.
 pub struct ExpertStore<D: SlotDevice> {
     config: StoreConfig,
+    /// The block of the files' direct reads: read buffers are whole blocks.
+    block: usize,
     map: ExpertMap,
     reader: Reader,
     devices: Vec<D>,
@@ -422,6 +487,7 @@ pub struct ExpertStore<D: SlotDevice> {
     /// Layers of the running step that miss something, and since when.
     waits: Vec<(usize, Instant)>,
     hybrid: Option<hybrid::Hybrid>,
+    transit: Transit,
     stats: StoreStats,
 }
 
@@ -501,16 +567,48 @@ impl StorePlan {
         let floor = (config.max_rows * config.top_k) as usize + config.vram_reserve;
         let vram_layers: Vec<(usize, u64)> =
             layers.iter().map(|s| (s.device, s.slot_bytes)).collect();
-        let vram = Tier::plan(n_experts, &vram_layers, &config.vram_bytes, floor, &heat)
-            .ok_or_else(|| {
+        // Transit and staging come out of the budgets of the tiers.
+        let mut transit =
+            TransitPlan { pools: vec![None; config.vram_bytes.len()], ..TransitPlan::default() };
+        let mut vram_budget = config.vram_bytes.clone();
+        for (device, budget) in vram_budget.iter_mut().enumerate() {
+            let slots = config.transit_slots.get(device).copied().unwrap_or(0);
+            let stride = layers.iter().filter(|s| s.device == device).map(|s| s.slot_bytes).max();
+            if let (true, Some(stride)) = (slots > 0, stride) {
+                *budget = budget.checked_sub(stride * u64::from(slots)).ok_or_else(|| {
+                    plan_error(format!(
+                        "the VRAM budget of device {device} does not hold {slots} transit slots"
+                    ))
+                })?;
+                transit.pools[device] = Some((0, stride, slots));
+            }
+        }
+        transit.stage_slots = config.staging_slots;
+        transit.stage_bytes =
+            ram_layers.iter().map(|(_, bytes)| *bytes as usize).max().unwrap_or(0);
+        let ram_budget =
+            config.ram_bytes.checked_sub(transit.stage_len() as u64).ok_or_else(|| {
+                plan_error(format!(
+                    "the RAM budget does not hold {} staging slots",
+                    config.staging_slots
+                ))
+            })?;
+        let vram =
+            Tier::plan(n_experts, &vram_layers, &vram_budget, floor, &heat).ok_or_else(|| {
                 plan_error(format!(
                     "the VRAM budget does not hold {floor} slots per layer ({} rows of {} experts \
                      and {} free)",
                     config.max_rows, config.top_k, config.vram_reserve
                 ))
             })?;
-        let ram = Tier::plan(n_experts, &ram_layers, &[config.ram_bytes], 2, &heat)
+        let ram = Tier::plan(n_experts, &ram_layers, &[ram_budget], 2, &heat)
             .ok_or_else(|| plan_error("the RAM budget does not hold 2 slots per layer".into()))?;
+        transit.stage_base = ram.bytes(0) as usize;
+        for (device, pool) in transit.pools.iter_mut().enumerate() {
+            if let Some((index, _, _)) = pool {
+                *index = vram.pools.iter().filter(|p| p.place == device).count();
+            }
+        }
 
         for (layer, g) in geometry.iter_mut().enumerate() {
             let pool = vram.pool_of[layer];
@@ -521,7 +619,7 @@ impl StorePlan {
                 .map(|p| (p.stride * u64::from(p.slots)) as usize)
                 .sum();
         }
-        Ok(StorePlan { config, n_experts, block, layers: geometry, vram, ram })
+        Ok(StorePlan { config, n_experts, block, layers: geometry, vram, ram, transit })
     }
 }
 
@@ -539,15 +637,13 @@ impl<D: SlotDevice> ExpertStore<D> {
         region: HostRegion,
         profile: Option<&ExpertHeat>,
     ) -> Result<Self, StoreError> {
-        let StorePlan { config, n_experts, block, layers, vram, ram } = plan;
-        if region.len < ram.bytes(0) as usize
-            || !(region.ptr.as_ptr() as usize).is_multiple_of(block)
-        {
+        let StorePlan { config, n_experts, block, layers, vram, ram, transit } = plan;
+        let needed = ram.bytes(0) as usize + transit.stage_len();
+        if region.len < needed || !(region.ptr.as_ptr() as usize).is_multiple_of(block) {
             return Err(StoreError::Plan(format!(
-                "the RAM region has {} bytes at {:p}; the tier needs {} aligned to {block}",
-                region.len,
-                region.ptr,
-                ram.bytes(0)
+                "the RAM region has {} bytes at {:p}; the tier and staging need {needed} aligned \
+                 to {block}",
+                region.len, region.ptr,
             )));
         }
         if let Some(missing) =
@@ -578,7 +674,9 @@ impl<D: SlotDevice> ExpertStore<D> {
             wants: Vec::new(),
             waits: Vec::new(),
             hybrid: None,
+            transit: Transit::new(transit),
             stats: StoreStats::default(),
+            block,
             config,
             map,
             reader,
@@ -656,6 +754,7 @@ impl<D: SlotDevice> ExpertStore<D> {
             && self.guesses.is_empty()
             && self.device_ops.iter().flatten().all(VecDeque::is_empty)
             && self.cpu_is_settled()
+            && !self.transit.is_busy()
     }
 
     /// A step starts: its routers have not run. Call it before the step is
@@ -666,6 +765,7 @@ impl<D: SlotDevice> ExpertStore<D> {
         self.in_step = true;
         self.phase.fill(Phase::Ahead);
         self.cpu_begin_step();
+        self.transit_begin_step();
     }
 
     /// The route record of `layer` of the running step has arrived: `picks`
@@ -900,7 +1000,10 @@ impl<D: SlotDevice> ExpertStore<D> {
         // Reads that finished.
         self.reader.poll(&mut self.completions);
         for done in std::mem::take(&mut self.completions) {
-            let Some(op) = self.reads.get_mut(&(done.key / 4)) else { continue };
+            let Some(op) = self.reads.get_mut(&(done.key / 4)) else {
+                self.transit_read_done(done.key, done.result.is_err());
+                continue;
+            };
             op.parts_left -= 1;
             op.failed |= done.result.is_err();
             if op.parts_left > 0 {
@@ -1022,6 +1125,7 @@ impl<D: SlotDevice> ExpertStore<D> {
         }
 
         self.poll_cpu()?;
+        self.poll_transit()?;
 
         // Layers that have everything they missed.
         let mut at = 0;
