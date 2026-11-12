@@ -2572,33 +2572,108 @@ grows by the staged rows (0.6 MiB and 1.1 MiB), and every card holds 2 MiB
 more outside its ledger, the larger kernel module. The layer split moved two
 blocks from the second card to the first, which no longer counts the table.
 
-The same day, same cards, against the same commit, each pair run back to back
-at least twice while other builds ran on the machine (load 3 to 20). Staging
-a prompt step of 512 rows was timed by itself: 0.12 ms to 0.31 ms for the host
-to copy the rows and 0.10 ms to 0.19 ms for the upload, of a step of 380 ms.
+The same day, same cards, the speed of three trees: the commit before
+(92aedff), the change as it was first merged (6c27759) and the tree with the
+step scratch put right (below), run in turn two to six times each while
+other builds ran on the machine (load 3 to 25). Staging a prompt step of 512
+rows was timed by itself: 0.12 ms to 0.31 ms for the host to copy the rows
+and 0.10 ms to 0.19 ms for the upload, of a step of 380 ms.
 
-| Run | Before | Now |
-| --- | --- | --- |
-| IQ2_XXS, one card: prompt of 2048 tokens, ms | 1750 to 1753 | 1746 to 1757 |
-| IQ2_XXS, one card: decode step, ms | 20.90, 20.94 | 20.89, 20.89 |
-| UD-Q4_K_S, two cards: prompt of 2048 tokens, ms | 1507 to 1519 | 1522 to 1539 |
-| UD-Q4_K_S, two cards: decode step, ms | 24.72 to 24.82 | 24.71 to 24.84 |
-| UD-Q4_K_S, two cards, drafts with the vocabulary: step with four drafts, ms | 33.30 to 33.49 | 33.57 to 33.68 |
-| the same: a link of the draft chain, ms | 1.43 to 1.46 | 1.49 to 1.51 |
-| the same: tokens per second, mean of seven prompts of 300 tokens | 98.6, 98.5 | 96.8, 98.9 |
+| Run | Before | As first merged | Now |
+| --- | --- | --- | --- |
+| IQ2_XXS, one card: prompt of 2048 tokens, ms | 1749 to 1751 | 1749 to 1757 | 1748 to 1752 |
+| IQ2_XXS, one card: decode step, ms | 20.88, 20.94 | 20.92, 20.93 | 20.89, 20.95 |
+| IQ2_XXS, two cards: prompt of 2048 tokens, ms | 1693 to 1711 | 1717 to 1737 | 1693 to 1727 |
+| UD-Q4_K_S, two cards: prompt of 2048 tokens, ms | 1502 to 1520 | 1520 to 1538 | 1501 to 1529 |
+| UD-Q4_K_S, two cards: decode step, ms | 24.76 to 24.83 | 24.70 to 24.79 | 24.73 to 24.77 |
+| UD-Q4_K_S, two cards, drafts with the vocabulary: tokens per second, mean of seven prompts of 300 tokens | 97.8 to 100.4 | 97.7 to 98.9 | 98.1 to 98.9 |
+| the same: a link of the draft chain, ms | 1.43 to 1.46 | 1.48 to 1.51 | 1.48 to 1.51 |
 
-On one card nothing changed. On the tensor split a prompt takes 0.7 % to
-1.8 % longer and a step with drafts 0.2 ms to 0.3 ms longer (0.05 ms per link
-of the chain). The commit of this change alone measures 1525 ms to 1539 ms
-for the prompt and 33.52 ms to 33.61 ms for the step, so it is this change
-and not what was merged with it. The staging does not account for it, by the
-timing above, and where the time goes is not known: the profile of a prompt
-step shows it in the weight products of the second card, which holds what it
-held, the difference stays when both runs are given the device layout
-for every matrix (1497 ms to 1506 ms against 1512 ms to 1520 ms), and the
-small file on the same split shows it too (1691 ms to 1708 ms against 1710 ms
-to 1726 ms). In steps of 128 rows it is 0.2 % to 0.4 %. The tokens per second
-differ less than two runs of one binary do.
+On one card nothing changed, and a prompt on the tensor split takes what it
+took. A link of the draft chain takes 0.05 ms longer than before, for a
+reason of its own (the last paragraph of this section). Of the tokens per
+second one run of each of the two later columns is left out, 89.7 and 92.9,
+taken while the load rose from 5 to 17. On a layer split of the IQ2_XXS file
+(shares 0.5 and 0.5), where the change moved two blocks to the first card,
+the same prompt takes 2157 ms to 2171 ms before, 2085 ms to 2095 ms as first
+merged and 2064 ms to 2075 ms now (load 3 to 6), a decode step 27.38 ms and
+27.44 ms, 26.93 ms and 26.97 ms, 26.92 ms and 26.95 ms.
+
+**What the tensor split lost at first.** As first merged, the change made a
+prompt on two cards 0.7 % to 1.8 % slower, in steps of 128 rows 0.2 % to
+0.4 %, and the profile of a prompt step showed the time in the weight
+products of the second card, which holds the bytes it held. It was neither
+the table in page-locked memory nor its upload, the exchange between the
+cards or the layouts: it was where the second card's step scratch begins.
+The stage of the staged rows is the first buffer of the scratch, and a part
+that stages nothing still took 64 bytes for it, so on the second card every
+buffer behind it began 64 bytes later than before. Among them are the f16
+activations of the weight products. Their rows lie a whole number of lines of
+128 bytes apart, counted from the start of their buffer, and a step of the
+tile kernels reads 64 values of each row: that is one line when the buffer
+starts on a line and two when it starts between two. On the first card the
+stage is a multiple of 128 bytes in both files, which is why one card showed
+nothing.
+
+Found with a probe build that moves one buffer of the second card's scratch
+at a time (2026-11-12, UD-Q4_K_S on the same split, prompt of 2048 tokens in
+steps of 512 rows, both passes of three runs in turn with the others at load
+8 to 15; the two rows marked * are from a batch of three runs whose first
+ran while the load rose from 5 to 18 and is left out, 1524 ms and 1531 ms,
+1514 ms and 1544 ms):
+
+| The second card's step scratch | Prompt, ms |
+| --- | --- |
+| as before the change: nothing in front of the first buffer | 1501 to 1508 |
+| as first merged: every buffer 64 bytes later | 1514 to 1523 |
+| only the f16 activations 64 bytes later | 1516 to 1531 |
+| only the 8-bit activations 64 bytes later (the f16 ones 128) * | 1497 to 1513 |
+| every buffer but the prepared activations 64 bytes later | 1500 to 1510 |
+| every buffer 128 bytes later * | 1501 to 1510 |
+
+So the step scratch now starts every buffer on a line
+(`Kernels::ACTIVATION_LINE`, which is also the 128 of the pitch of the rows),
+and a part that stages nothing has no stage (`Carve` in `device/part.rs`).
+Before, the activations lay on a line only because every size in front of
+them happened to be a multiple of 128 bytes; now where a buffer starts does
+not depend on the sizes of the others. The VRAM is what the table above
+says: the first card holds 518 MiB less without drafts (10102 MiB to
+9584 MiB taken at a context of 32 768 tokens in the default K/V format) and
+the second what it held (5790 MiB, 5792 MiB).
+
+**The link of the draft chain** takes 1.48 ms to 1.51 ms where it took
+1.43 ms to 1.46 ms (UD-Q4_K_S on the split, drafts with the vocabulary),
+which is 0.2 ms to 0.3 ms of a step with four drafts (its median 33.27 ms to
+33.36 ms before, 33.55 ms to 33.59 ms now) and less in tokens per second
+than two runs of one binary differ by. The chain runs on the first
+card only, and neither the gather nor the staged row of the newest token
+costs it: with the same layout forced for every matrix the link is the same
+before and after the change (1.48 ms to 1.50 ms against 1.48 ms to 1.51 ms in
+the device layout, 1.45 ms to 1.48 ms against 1.45 ms to 1.46 ms in the
+file's). What changed is the choice of the layouts on the first card ("Device
+layouts in the model"): before, the draft head (q6_K, 66 343 rows) and the
+two wide matrices of the draft block's feed-forward part (q6_K, 17 408 rows)
+took the file's layout, now the device layout. The chooser times each layout
+in three rounds on a buffer as large as the device's weights and takes the
+fastest. For these matrices at one row every round of the file's layout
+measures 0.1434 ms to 0.1441 ms and every round of the device layout
+0.1423 ms to 0.1427 ms, except that with a buffer of the old size (9470 MiB)
+one round of the file's layout comes out at 0.1381 ms and 0.1367 ms (the
+result repeats to 0.0005 ms from load to load) and decided for it. With the
+buffer the table no longer takes part of (9088 MiB) there is no such round.
+Giving the probe of the present tree a buffer of the old size, and nothing
+else, brings back the old choice and the old link (1.43 ms to 1.44 ms). The
+old choice was the faster one for the chain, but it was not made on what the
+probe usually measures: the probe has the two layouts within one percent of
+each other for these matrices, and the chain runs 0.05 ms faster per link
+with the file's. A round that is 2 % or more faster than the other two of
+its product occurs in 7 to 9 of the 232 products timed on the first card, in
+other products with another size of the buffer. This is left as it is:
+getting the faster link back for a reason would take a probe that reads the
+draft block's matrices as a chain reads them (several times a step, a few
+hundred megabytes apart) and a choice that does not rest on one round of
+three, and either changes the layouts of other matrices on both cards, which
+has to be measured as a change of its own.
 
 **Device layouts in the model.** At load the model first measures how the
 few-row kernels launch for every shape of a matrix that can have the device
