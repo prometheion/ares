@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use ares_api::{
     ChatFormat, DecisionRequest, DecisionSink, Engine, EngineError, EngineStats, EventSink,
-    GenerateRequest, ModelCard, RequestId,
+    GenerateRequest, ModelCard, Prompt, RequestId,
 };
 use ares_cuda::Device;
 
@@ -288,6 +288,13 @@ impl Engine for Runtime {
 
     fn chat_format(&self, model: &str) -> Option<ChatFormat> {
         (model == self.card.id).then(|| self.model.chat_format()).flatten()
+    }
+
+    fn count_tokens(&self, model: &str, prompt: &Prompt) -> Result<u32, EngineError> {
+        if model != self.card.id {
+            return Err(EngineError::ModelNotFound(model.to_owned()));
+        }
+        Ok(u32::try_from(self.model.encode(prompt)?.len()).unwrap_or(u32::MAX))
     }
 
     fn submit(&self, request: GenerateRequest, events: EventSink) -> Result<(), EngineError> {

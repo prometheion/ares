@@ -3486,10 +3486,10 @@ request's id and the place of the call.
 `max_tokens` if the client leaves it out) and returns `{"input_tokens": N}`,
 the tokens of the prompt the engine would have been given; nothing is
 generated. The count is `Engine::count_tokens` of `ares-api`, which renders and
-tokenizes a prompt. The runtime does not implement it yet (it is
-`self.model.encode(prompt)?.len()` in `impl Engine for Runtime`), so with a
-loaded model the route answers 501 until it does; the host tests count with a
-test engine.
+tokenizes a prompt; the runtime answers it with the model's own encoding of the
+prompt, so the count is the prompt a run of the same request reports (computed
+plus cached), which a host test checks through the real runtime. An engine that
+cannot count answers 501.
 
 Both routes run on the core of the chat route in `routes.rs`: `prepare`
 applies what a parsed chat request says about thinking and tools and returns

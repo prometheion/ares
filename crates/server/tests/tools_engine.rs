@@ -241,3 +241,32 @@ async fn with_auto_the_text_is_free_and_a_call_follows_the_trigger() {
     let none = json!({"tools": tools(), "tool_choice": "none", "max_tokens": 60});
     assert_eq!(whole(&app, none).await, free);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_runtime_counts_the_prompt_a_run_of_the_same_request_reports() {
+    let app = served(Some("@"));
+    let body = json!({
+        "model": "synthetic",
+        "system": "be brief",
+        "messages": [{"role": "user", "content": "turn it down"}],
+        "max_tokens": 20,
+    })
+    .to_string();
+    let (status, counted) = json(post(&app, "/v1/messages/count_tokens", &body).await).await;
+    assert_eq!(status, StatusCode::OK, "{counted}");
+    let counted = counted["input_tokens"].as_u64().unwrap();
+    assert!(counted > 0);
+
+    // The prompt of a run is what was computed plus what the prefix cache gave.
+    let (status, answer) = json(post(&app, "/v1/messages", &body).await).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    let usage = &answer["usage"];
+    let ran = usage["input_tokens"].as_u64().unwrap()
+        + usage["cache_read_input_tokens"].as_u64().unwrap();
+    assert_eq!(counted, ran, "{answer}");
+
+    // A model the runtime does not hold is not counted for.
+    let other = body.replace("synthetic", "another");
+    let (status, _) = json(post(&app, "/v1/messages/count_tokens", &other).await).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
