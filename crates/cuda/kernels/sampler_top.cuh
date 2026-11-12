@@ -18,96 +18,201 @@
 // f32 values per device and row in the exchange of the candidates: logit and
 // token of each, and the status.
 #define ARES_TOP_VALUES(N) (2 * (N) + 2)
-// A thread of a top kernel sees at most this many logits of its chunk (a chunk
-// is 4096 logits, a block 256 threads), so its own list needs no more places.
-#define ARES_TOP_MINE 16
-
-// `N` times: the largest proposal of the block, taken from the thread that
-// made it. `mine` is the thread's own list in descending order with `n_mine`
-// entries. Thread 0 gets the block's list in `out`.
-template <int N>
-static __device__ __forceinline__ void ares_sample_take_best(const unsigned long long* mine,
-                                                             uint32_t n_mine,
-                                                             unsigned long long* partial,
-                                                             unsigned long long* out) {
-    uint32_t next = 0;
-    for (int c = 0; c < N; ++c) {
-        const unsigned long long proposal = next < n_mine ? mine[next] : 0ull;
-        const unsigned long long best = ares_block_max_u64(proposal, partial);
-        if (best != 0ull && proposal == best) {
-            next += 1;
-        }
-        if (threadIdx.x == 0) {
-            out[c] = best;
-        }
-        __syncthreads();
-    }
-}
+// The logits of its chunk a thread of a top kernel reads: a chunk is at most
+// this many logits per thread of the block. They stay in the thread's
+// registers, so nothing is read twice.
+#define ARES_TOP_PER 16
 
 // Which tokens a top kernel looks at.
 #define ARES_TOP_ALL 0
 // The tokens of the set the chain left (the probabilities after the chain).
 #define ARES_TOP_SET 1
 
-// Grid (chunks, rows), ARES_SAMPLE_THREADS threads. Chunk `b` of row `r` is
-// the logits `b * chunk ..` of the row; its best candidates go to
-// `lists[(r * chunks + b) * ARES_TOP_LIST(N) ..]`, packed, best first, then a
-// word that is 1 when the chunk has a logit that is NaN or plus infinity.
+// Grid (chunks, rows), up to ARES_SAMPLE_THREADS threads (a multiple of 32, at
+// least `N`), `chunk` at most ARES_TOP_PER logits per thread. Chunk `b` of row
+// `r` is the logits `b * chunk ..` of the row; its best candidates go to
+// `lists[(r * chunks + b) * ARES_TOP_LIST(N) ..]`, packed, best first, zero
+// where the chunk has fewer, then a word that is 1 when the chunk has a logit
+// that is NaN or plus infinity.
 //
 // `tokens` maps a column of the logits to its token (`tokens[first + i]`);
 // null means the token is `first + i`.
+//
+// Most logits are far below the best, so the kernel first finds a bar that
+// the `N` best of the chunk reach, from one number per thread, and only then
+// orders the few logits that reach it:
+//
+// 1. Every thread finds its own best. A column is the threads with the same
+//    lane; the bar is the `N`th best of the 32 columns' bests. `N` different
+//    logits reach it, so the `N` best of the chunk do.
+// 2. The threads whose best reaches the bar are few. Each counts how many of
+//    them have a better best: fewer than `N` for a thread that holds one of
+//    the `N` best of the chunk, and for at most `N` threads.
+// 3. Those threads put their logits that reach the bar on one list, at most
+//    `N * ARES_TOP_PER` entries, and every entry finds its place by counting
+//    the entries above it.
+//
+// Packed values order by logit and then by token, and no two are equal, so
+// the result does not depend on the order in which threads add to the lists.
 template <int N, int WHICH>
 static __device__ __forceinline__ void ares_sample_top_body(
     const float* logits, uint32_t stride, uint32_t n_local, const uint32_t* tokens, uint32_t first,
     uint32_t chunk, unsigned long long* lists, const AresSampleState* state) {
-    __shared__ unsigned long long partial[ARES_SAMPLE_THREADS / 32];
-    __shared__ unsigned long long merged[N];
+    static_assert(N <= 32, "the bar is one of the 32 columns' bests");
+    // The best of every thread; after the bar is known, the bests that reach it.
+    __shared__ unsigned long long thread_best[ARES_SAMPLE_THREADS];
+    __shared__ unsigned long long column_best[32];
+    __shared__ unsigned long long candidates[N * ARES_TOP_PER];
+    __shared__ uint32_t n_strong;
+    __shared__ uint32_t n_candidates;
     __shared__ uint32_t bad_any;
+    const uint32_t tid = threadIdx.x;
     const uint32_t r = blockIdx.y;
     const uint32_t begin = blockIdx.x * chunk;
     const uint32_t end = min(begin + chunk, n_local);
     const float* row = logits + (size_t)r * stride;
-    if (threadIdx.x == 0) {
+    if (tid == 0) {
+        n_strong = 0;
+        n_candidates = 0;
         bad_any = 0;
     }
-    __syncthreads();
 
-    constexpr int MINE = N < ARES_TOP_MINE ? N : ARES_TOP_MINE;
-    unsigned long long mine[MINE];
-    uint32_t n_mine = 0;
+    // Bit `k` of `valid`: the thread's logit `k` is one the kernel looks at.
+    float v[ARES_TOP_PER];
+    uint32_t valid = 0;
     bool bad = false;
-    for (uint32_t i = begin + threadIdx.x; i < end; i += ARES_SAMPLE_THREADS) {
-        // Adding zero turns a negative zero into a positive one, so that
-        // equal logits have equal bits.
-        const float l = ares_sample_logit(row[i], &bad);
-        if (WHICH == ARES_TOP_SET) {
-            if (!ares_sample_present(l) || !ares_in_set(state[r], ares_sample_key(state[r].l_max, l))) {
-                continue;
-            }
-        }
-        const uint32_t token = tokens ? tokens[first + i] : first + i;
-        unsigned long long v = ares_sample_pack(l, token);
-        // Insert into the descending list; the smallest falls off the end.
-        for (uint32_t j = 0; j < n_mine; ++j) {
-            if (v > mine[j]) {
-                const unsigned long long t = mine[j];
-                mine[j] = v;
-                v = t;
-            }
-        }
-        if (n_mine < MINE) {
-            mine[n_mine++] = v;
+#pragma unroll
+    for (int k = 0; k < ARES_TOP_PER; ++k) {
+        const uint32_t i = begin + k * blockDim.x + tid;
+        v[k] = 0.0f;
+        if (i < end) {
+            // Adding zero turns a negative zero into a positive one, so that
+            // equal logits have equal bits.
+            v[k] = ares_sample_logit(row[i], &bad);
+            valid |= 1u << k;
         }
     }
+    if (WHICH == ARES_TOP_SET) {
+        const float l_max = state[r].l_max;
+        const uint32_t lo = state[r].lo;
+        const uint32_t hi = state[r].hi;
+#pragma unroll
+        for (int k = 0; k < ARES_TOP_PER; ++k) {
+            const uint32_t key = ares_sample_key(l_max, v[k]);
+            if (!ares_sample_present(v[k]) || key < lo || key > hi) {
+                valid &= ~(1u << k);
+            }
+        }
+    }
+
+    // The thread's best: the largest logit, and the lowest token among equal
+    // ones. Columns in the order of the tokens need no token for that.
+    float best_logit = 0.0f;
+    int best_k = -1;
+    bool tie = false;
+#pragma unroll
+    for (int k = 0; k < ARES_TOP_PER; ++k) {
+        if (valid & (1u << k)) {
+            if (best_k < 0 || v[k] > best_logit) {
+                best_logit = v[k];
+                best_k = k;
+                tie = false;
+            } else if (v[k] == best_logit) {
+                tie = true;
+            }
+        }
+    }
+    unsigned long long mine = 0ull;
+    if (best_k >= 0) {
+        const uint32_t i = begin + best_k * blockDim.x + tid;
+        uint32_t token = tokens ? tokens[first + i] : first + i;
+        if (tie && tokens) {
+#pragma unroll
+            for (int k = 0; k < ARES_TOP_PER; ++k) {
+                if ((valid & (1u << k)) && v[k] == best_logit) {
+                    token = min(token, tokens[first + begin + k * blockDim.x + tid]);
+                }
+            }
+        }
+        mine = ares_sample_pack(best_logit, token);
+    }
+    thread_best[tid] = mine;
+    __syncthreads();
     if (bad) {
         bad_any = 1;
     }
-    ares_sample_take_best<N>(mine, n_mine, partial, merged);
-    if (threadIdx.x == 0) {
-        unsigned long long* out = lists + ((size_t)r * gridDim.x + blockIdx.x) * ARES_TOP_LIST(N);
-        for (int c = 0; c < N; ++c) {
-            out[c] = merged[c];
+
+    // The bar: the `N`th best of the columns, zero when fewer columns have a
+    // logit. Columns without one are equal; the lane orders them.
+    const uint32_t lane = tid & 31;
+    const uint32_t n_warps = blockDim.x >> 5;
+    unsigned long long column = 0ull;
+    for (uint32_t w = 0; w < n_warps; ++w) {
+        const unsigned long long other = thread_best[w * 32 + lane];
+        column = other > column ? other : column;
+    }
+    if (tid < 32) {
+        column_best[lane] = column;
+    }
+    __syncthreads();
+    uint32_t columns_above = 0;
+#pragma unroll
+    for (uint32_t j = 0; j < 32; ++j) {
+        const unsigned long long other = column_best[j];
+        columns_above += (other > column || (other == column && j < lane)) ? 1u : 0u;
+    }
+    const unsigned long long bar = ares_warp_max_u64(columns_above == N - 1 ? column : 0ull);
+
+    const bool strong = mine != 0ull && mine >= bar;
+    if (strong) {
+        thread_best[atomicAdd(&n_strong, 1u)] = mine;
+    }
+    __syncthreads();
+    uint32_t threads_above = N;
+    if (strong) {
+        threads_above = 0;
+        const uint32_t n = n_strong;
+        for (uint32_t j = 0; j < n; ++j) {
+            threads_above += thread_best[j] > mine ? 1u : 0u;
         }
+    }
+    if (threads_above < N) {
+#pragma unroll
+        for (int k = 0; k < ARES_TOP_PER; ++k) {
+            if (valid & (1u << k)) {
+                const uint32_t i = begin + k * blockDim.x + tid;
+                const unsigned long long packed =
+                    ares_sample_pack(v[k], tokens ? tokens[first + i] : first + i);
+                if (packed >= bar) {
+                    const uint32_t at = atomicAdd(&n_candidates, 1u);
+                    if (at < N * ARES_TOP_PER) {
+                        candidates[at] = packed;
+                    }
+                }
+            }
+        }
+    }
+    __syncthreads();
+
+    // Every candidate to its place in the chunk's list. Equal entries, which
+    // only a token list that names a token twice gives, keep their order.
+    const uint32_t n = min(n_candidates, (uint32_t)(N * ARES_TOP_PER));
+    unsigned long long* out = lists + ((size_t)r * gridDim.x + blockIdx.x) * ARES_TOP_LIST(N);
+    for (uint32_t c = tid; c < n; c += blockDim.x) {
+        const unsigned long long packed = candidates[c];
+        uint32_t above = 0;
+        for (uint32_t j = 0; j < n; ++j) {
+            const unsigned long long other = candidates[j];
+            above += (other > packed || (other == packed && j < c)) ? 1u : 0u;
+        }
+        if (above < N) {
+            out[above] = packed;
+        }
+    }
+    if (tid >= n && tid < N) {
+        out[tid] = 0ull;
+    }
+    if (tid == 0) {
         out[N] = bad_any;
     }
 }
