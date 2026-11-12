@@ -1,0 +1,19 @@
+// The second prefill module: the tensor-core weight kernels (mm.cuh) of the types that
+// prefill.cu does not have, f16 and f16 with f16 accumulation only (mm_types_more.cuh).
+// Compiled for compute capability 8.0 and newer like prefill.cu; the Rust side
+// (src/kernels.rs) lists the same names.
+
+#include "common.cuh"
+#include "mm_shapes.cuh"
+#include "mm_types_more.cuh"
+
+#define ARES_MM_MORE(NAME, T)                       \
+    ARES_MM_F16_LARGE(ares_mm_f16_##NAME, T)        \
+    ARES_MM_F16_MEDIUM(ares_mm_f16m_##NAME, T)      \
+    ARES_MM_F16_SMALL(ares_mm_f16s_##NAME, T)       \
+    ARES_MM_H_LARGE(ares_mm_h_##NAME, T)            \
+    ARES_MM_H_MEDIUM(ares_mm_hm_##NAME, T)          \
+    ARES_MM_H_SMALL(ares_mm_hs_##NAME, T)
+
+ARES_MM_MORE(iq2_xxs, EngMmIQ2XXS)
+ARES_MM_MORE(iq1_s, EngMmIQ1S)

@@ -25,6 +25,10 @@ static IMAGE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/kernels.fatbin")
 /// capability 8.0 and newer (the tensor-core weight kernels).
 static PREFILL_IMAGE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/prefill.fatbin"));
 
+/// The second prefill module, from `kernels/prefill_more.cu`: the tensor-core weight
+/// kernels of the types the first has none for, in the two f16 variants.
+static PREFILL_MORE_IMAGE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/prefill_more.fatbin"));
+
 /// The most activation rows one launch of a weight kernel handles
 /// (`ARES_MAX_BATCH` in `kernels/common.cuh`).
 pub const MAX_BATCH: u32 = 8;
@@ -103,6 +107,13 @@ const PREFILL_TYPES: [(GgmlType, &str, u64, u32); 11] = [
     (GgmlType::Q8_0, "q8_0", 2, 0),
 ];
 
+/// The weight types of the second prefill module (`kernels/mm_types_more.cuh`), laid out as
+/// [`PREFILL_TYPES`]. They have the f16 and the f16 flush variants and no int8 one
+/// ([`Kernels::prefill_path_for`] takes the first on a card that runs it at full rate and
+/// the second on a capped card).
+const PREFILL_MORE_TYPES: [(GgmlType, &str, u64, u32); 2] =
+    [(GgmlType::IQ2_XXS, "iq2_xxs", 2, 2048 + 4096), (GgmlType::IQ1_S, "iq1_s", 2, 16384)];
+
 /// One shape of the prefill kernels (`kernels/prefill.cu`): the weight rows and
 /// activation rows a thread block computes, and its threads.
 #[derive(Clone, Copy, Debug)]
@@ -160,7 +171,7 @@ const DEFAULT_SHARED: u32 = 48 << 10;
 /// For each weight type, up to how many activation rows the decode kernels (in
 /// launches of [`MAX_BATCH`] rows) are the faster family; above it the tensor-core
 /// kernels are. See [`Kernels::decode_kernel_rows`].
-const DECODE_ROWS: [(GgmlType, u32); 11] = [
+const DECODE_ROWS: [(GgmlType, u32); 13] = [
     (GgmlType::Q4_K, 16),
     (GgmlType::Q5_K, 16),
     (GgmlType::Q6_K, 8),
@@ -172,6 +183,8 @@ const DECODE_ROWS: [(GgmlType, u32); 11] = [
     (GgmlType::IQ2_S, 12),
     (GgmlType::IQ2_XS, 12),
     (GgmlType::Q8_0, 8),
+    (GgmlType::IQ2_XXS, 16),
+    (GgmlType::IQ1_S, 12),
 ];
 
 /// The types for which [`PrefillPath::F16Flush`] is as fast as int8 on a capped card
@@ -253,12 +266,16 @@ pub enum Precision {
     Exact,
 }
 
-/// The kernels of the prefill module on one device.
+/// The kernels of one type: the alignment, the bytes of its table and the kernels indexed
+/// `[path][shape]`; a type has none for a path it has no variant of.
+type PrefillType = (GgmlType, u64, u32, [Option<[Function; 3]>; 3]);
+
+/// The kernels of the prefill modules on one device.
 #[derive(Debug, Clone)]
 struct Prefill {
     /// Per type: the alignment, the bytes of its table and the kernels, indexed
     /// `[path][shape]`.
-    types: Vec<(GgmlType, u64, u32, [[Function; 3]; 3])>,
+    types: Vec<PrefillType>,
     /// The kernels over the device layouts and their tables.
     layouts: layout::Layouts,
     convert_f16: Function,
@@ -286,12 +303,35 @@ pub struct Kernels {
 impl Prefill {
     fn load(device: &Device) -> Result<Self> {
         let module = Module::load(device, PREFILL_IMAGE)?;
+        let more = Module::load(device, PREFILL_MORE_IMAGE)?;
         let limit = device.info().max_shared_per_block_optin;
-        let types = PREFILL_TYPES
-            .iter()
+        let mut types = Self::load_types(&module, &PREFILL_TYPES, true, limit)?;
+        types.extend(Self::load_types(&more, &PREFILL_MORE_TYPES, false, limit)?);
+        Ok(Self {
+            types,
+            layouts: layout::Layouts::load(&module, limit)?,
+            convert_f16: module.function("ares_convert_f16")?,
+            full_rate: probe_full_rate(device, &module)?,
+        })
+    }
+
+    /// The kernels of `list` in `module`, with the int8 variant or without it.
+    fn load_types(
+        module: &Module,
+        list: &[(GgmlType, &str, u64, u32)],
+        int8: bool,
+        limit: u32,
+    ) -> Result<Vec<PrefillType>> {
+        list.iter()
             .map(|(ty, suffix, align, table)| {
                 let mut paths = Vec::new();
-                for (path, (variant, elem)) in [("i8", 1u32), ("f16", 2u32), ("h", 2u32)].into_iter().enumerate() {
+                for (path, (variant, elem)) in
+                    [("i8", 1u32), ("f16", 2u32), ("h", 2u32)].into_iter().enumerate()
+                {
+                    if path == 0 && !int8 {
+                        paths.push(None);
+                        continue;
+                    }
                     let mut shapes = Vec::new();
                     for (shape, part) in SHAPES[path].iter().zip(SHAPE_SUFFIX) {
                         let function =
@@ -310,18 +350,13 @@ impl Prefill {
                         }
                         shapes.push(function);
                     }
-                    paths.push(<[Function; 3]>::try_from(shapes).expect("three shapes"));
+                    paths.push(Some(<[Function; 3]>::try_from(shapes).expect("three shapes")));
                 }
-                let kernels = <[[Function; 3]; 3]>::try_from(paths).expect("three paths");
+                let kernels =
+                    <[Option<[Function; 3]>; 3]>::try_from(paths).expect("three paths");
                 Ok((*ty, *align, *table, kernels))
             })
-            .collect::<Result<Vec<_>>>()?;
-        Ok(Self {
-            types,
-            layouts: layout::Layouts::load(&module, limit)?,
-            convert_f16: module.function("ares_convert_f16")?,
-            full_rate: probe_full_rate(device, &module)?,
-        })
+            .collect()
     }
 }
 
@@ -746,7 +781,10 @@ impl Kernels {
     /// and the row counts 8, 12, ..., 32: following it costs at most 13% against
     /// the faster family at any of them. It was measured with the int8 path, the one
     /// both GPUs take; the f16 path of a device with full-rate tensor cores has its
-    /// own crossover, not measured.
+    /// own crossover, not measured. The types of the second prefill module have no
+    /// int8 path: theirs were measured against the f16 path with f16 accumulation (the
+    /// same rule, rows 8 to 32 on both GPUs; at most 6 % lost in total at the row count
+    /// given: IQ2_XXS 16, IQ1_S 12).
     pub fn decode_kernel_rows(ty: GgmlType) -> Option<u32> {
         DECODE_ROWS.iter().find(|(t, _)| *t == ty).map(|(_, rows)| *rows)
     }
@@ -761,7 +799,21 @@ impl Kernels {
     /// types of [`Kernels::has_fast_matvec`]; the device must also have the
     /// prefill kernels, see [`Kernels::has_prefill_kernels`]).
     pub fn has_prefill_matmul(ty: GgmlType) -> bool {
-        PREFILL_TYPES.iter().any(|(t, ..)| *t == ty)
+        PREFILL_TYPES.iter().chain(&PREFILL_MORE_TYPES).any(|(t, ..)| *t == ty)
+    }
+
+    /// Whether [`Kernels::matmul`] has a kernel of `path` for weights of type `ty` on this
+    /// device: every tile-kernel type has the two f16 variants, those of
+    /// [`Kernels::has_prefill_matmul`] that are not in the first module have no int8 one.
+    pub fn has_prefill_path(&self, ty: GgmlType, path: PrefillPath) -> bool {
+        let index = match path {
+            PrefillPath::Int8 => 0,
+            PrefillPath::F16 => 1,
+            PrefillPath::F16Flush => 2,
+        };
+        self.prefill.as_ref().is_some_and(|p| {
+            p.types.iter().any(|(t, .., paths)| *t == ty && paths[index].is_some())
+        })
     }
 
     /// The path the prefill family takes on this device for the requested
@@ -793,8 +845,14 @@ impl Kernels {
     /// types prepares an input in each format it uses.
     pub fn prefill_path_for(&self, ty: GgmlType, precision: Precision) -> Result<PrefillPath> {
         let path = self.prefill_path(precision)?;
+        let has_int8 = self
+            .prefill_kernels()?
+            .types
+            .iter()
+            .find(|(t, ..)| *t == ty)
+            .is_none_or(|(.., paths)| paths[0].is_some());
         Ok(match (precision, path) {
-            (Precision::Fast, PrefillPath::Int8) if FLUSH_AS_FAST.contains(&ty) => {
+            (Precision::Fast, PrefillPath::Int8) if FLUSH_AS_FAST.contains(&ty) || !has_int8 => {
                 PrefillPath::F16Flush
             }
             _ => path,
@@ -833,7 +891,8 @@ impl Kernels {
         (0..3)
             .map(|shape| {
                 let info = SHAPES[path_index][shape];
-                let function = &kernels[path_index][shape];
+                let function =
+                    &kernels[path_index].as_ref().ok_or_else(|| no_variant(ty, path))?[shape];
                 let shared_bytes = info.shared_bytes(elem, *table);
                 let (registers, _) = function.resources()?;
                 Ok(PrefillShape {
@@ -961,7 +1020,12 @@ impl Kernels {
                 what: "prefill kernel type",
                 detail: format!(
                     "{ty} has no prefill kernel (it has one for {})",
-                    PREFILL_TYPES.map(|(t, ..)| t.name()).join(", ")
+                    PREFILL_TYPES
+                        .iter()
+                        .chain(&PREFILL_MORE_TYPES)
+                        .map(|(t, ..)| t.name())
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 ),
             });
         };
@@ -991,7 +1055,8 @@ impl Kernels {
             PrefillPath::F16Flush => (2, 2, u64::from(n_in) * 2),
         };
         let shape = shape_index(n_rows);
-        let (shape_info, function) = (SHAPES[path_index][shape], &kernels[path_index][shape]);
+        let function = &kernels[path_index].as_ref().ok_or_else(|| no_variant(ty, path))?[shape];
+        let shape_info = SHAPES[path_index][shape];
         let Shape { weight_rows, batch_rows, threads } = shape_info;
         let shared = shape_info.shared_bytes(elem, *table);
         let n_weight_tiles = n_out.div_ceil(weight_rows);
@@ -1018,6 +1083,15 @@ impl Kernels {
         // SAFETY: the argument list matches the ares_mm_* kernels; the ranges are the
         // caller's guarantee.
         unsafe { function.launch(stream, [blocks, 1, 1], [threads, 1, 1], shared, args) }
+    }
+}
+
+/// The error for a path a type has no variant of (the types of the second module have
+/// no int8 one).
+fn no_variant(ty: GgmlType, path: PrefillPath) -> Error {
+    Error::Invalid {
+        what: "prefill kernel path",
+        detail: format!("{ty} has no prefill kernel for the {path:?} path"),
     }
 }
 

@@ -94,6 +94,7 @@ fn main() {
     let modules = [
         ("module.cu", "kernels.fatbin", FLOOR),
         ("prefill.cu", "prefill.fatbin", TENSOR_FLOOR),
+        ("prefill_more.cu", "prefill_more.fatbin", TENSOR_FLOOR),
         ("layers.cu", "layers.fatbin", FLOOR),
         ("attention.cu", "attention.fatbin", TENSOR_FLOOR),
         ("experts.cu", "experts.fatbin", FLOOR),

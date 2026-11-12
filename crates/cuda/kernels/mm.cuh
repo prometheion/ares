@@ -683,24 +683,47 @@ static __device__ __forceinline__ void ares_mm_codes_to_f16(const uint32_t (&cw)
     }
 }
 
+// Whether a type decodes an item straight to f16 (`T::decode_f16(raw, chunk, item, table,
+// out)`, the 32 values as 2 runs of 8 f16 pairs) instead of through the codes and
+// scales of `decode`: the types whose f16 decoders are the ones of the expert kernels
+// (expertrows_types.cuh), which have no 8-bit form.
+template <class T, class = void>
+struct AresMmDirect : std::false_type {};
+template <class T>
+struct AresMmDirect<T, std::void_t<decltype(T::decode_f16)>> : std::true_type {};
+
 // The decoding of one item (32 values): the f16 values of its two runs.
 template <class T>
 static __device__ __forceinline__ void ares_mm_decode_item(
     const typename T::Raw& src, uint32_t chunk, uint32_t item, const uint8_t* table, bool valid, uint32_t (&out)[2][8]) {
-    AresMmDec dec;
-    if (valid) {
-        T::decode(src, chunk, item, table, dec);
-    } else {
+    if constexpr (AresMmDirect<T>::value) {
+        if (valid) {
+            T::decode_f16(src, chunk, item, table, out);
+        } else {
 #pragma unroll
-        for (int i = 0; i < 8; i++) {
-            dec.w[i] = 0;
+            for (int run = 0; run < 2; run++) {
+#pragma unroll
+                for (int i = 0; i < 8; i++) {
+                    out[run][i] = 0;
+                }
+            }
         }
-        dec.sw[0] = dec.sw[1] = dec.mw[0] = dec.mw[1] = 0.0f;
-    }
+    } else {
+        AresMmDec dec;
+        if (valid) {
+            T::decode(src, chunk, item, table, dec);
+        } else {
 #pragma unroll
-    for (int run = 0; run < 2; run++) {
-        const uint32_t cw[4] = {dec.w[4 * run], dec.w[4 * run + 1], dec.w[4 * run + 2], dec.w[4 * run + 3]};
-        ares_mm_codes_to_f16<T::SIGNED_CODES>(cw, dec.sw[run], dec.mw[run], out[run]);
+            for (int i = 0; i < 8; i++) {
+                dec.w[i] = 0;
+            }
+            dec.sw[0] = dec.sw[1] = dec.mw[0] = dec.mw[1] = 0.0f;
+        }
+#pragma unroll
+        for (int run = 0; run < 2; run++) {
+            const uint32_t cw[4] = {dec.w[4 * run], dec.w[4 * run + 1], dec.w[4 * run + 2], dec.w[4 * run + 3]};
+            ares_mm_codes_to_f16<T::SIGNED_CODES>(cw, dec.sw[run], dec.mw[run], out[run]);
+        }
     }
 }
 

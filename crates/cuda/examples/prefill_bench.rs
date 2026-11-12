@@ -37,7 +37,7 @@ const N_OUT: u32 = 17408;
 
 /// The types with a tile kernel over the file's layout, in the order of their bytes
 /// in Qwen3.8-27B, then the others that have a device layout.
-const TYPES: [GgmlType; 16] = [
+const TYPES: [GgmlType; 18] = [
     GgmlType::IQ4_XS,
     GgmlType::Q4_K,
     GgmlType::Q5_K,
@@ -54,6 +54,8 @@ const TYPES: [GgmlType; 16] = [
     GgmlType::Q4_1,
     GgmlType::Q5_0,
     GgmlType::Q5_1,
+    GgmlType::IQ2_XXS,
+    GgmlType::IQ1_S,
 ];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -130,7 +132,7 @@ fn main() -> Result<()> {
             info.name,
             kernels.tensor_cores_full_rate()
         );
-        let tiled = types.iter().copied().find(|t| Kernels::has_prefill_matmul(*t));
+        let tiled = types.iter().copied().find(|t| kernels.has_prefill_path(*t, PrefillPath::Int8));
         for path in [PrefillPath::Int8, PrefillPath::F16, PrefillPath::F16Flush] {
             let Some(tiled) = tiled else { break };
             for shape in kernels.prefill_shapes(tiled, path)? {
@@ -246,6 +248,9 @@ fn time_type(
             if matches!(which, Which::Int8 | Which::F16 | Which::F16Flush)
                 && !Kernels::has_prefill_matmul(ty)
             {
+                continue;
+            }
+            if which == Which::Int8 && !kernels.has_prefill_path(ty, PrefillPath::Int8) {
                 continue;
             }
             let ms = match which {

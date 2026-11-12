@@ -165,6 +165,18 @@ struct ErIQ2XXS {
     }
 };
 
+// The four f16 pairs of a group of 8 values of the IQ1 types: the bytes of a codebook entry
+// (two words, each byte -1, 0 or 1), the scale of the group `sc` (the f16x2 d * (2 s + 1)) and
+// its shift `delta` (+-sc / 8, the sign being that of the group's delta bit): sc * (b + 1/8 or
+// -1/8) with one rounding.
+static __device__ __forceinline__ void ares_er_iq1_values(const uint2& g, uint32_t sc, uint32_t delta, uint32_t (&h)[4]) {
+    const uint32_t x = g.x ^ 0x80808080u, y = g.y ^ 0x80808080u;
+    h[0] = ares_er_h2_fma(ares_er_h2_sub(ares_er_magic(x, 0x5140), 0x64806480u), sc, delta);
+    h[1] = ares_er_h2_fma(ares_er_h2_sub(ares_er_magic(x, 0x5342), 0x64806480u), sc, delta);
+    h[2] = ares_er_h2_fma(ares_er_h2_sub(ares_er_magic(y, 0x5140), 0x64806480u), sc, delta);
+    h[3] = ares_er_h2_fma(ares_er_h2_sub(ares_er_magic(y, 0x5342), 0x64806480u), sc, delta);
+}
+
 // ---------------------------------------------------------------------------
 // IQ1_M: 256 values in 56 bytes, 8-byte aligned: 32 bytes of low index bits, 16 of high
 // index bits and delta signs, four u16 of scales whose top nibbles spread the f16 d. A
@@ -217,10 +229,6 @@ struct ErIQ1M {
         const uint2 g = reinterpret_cast<const uint2*>(tab)[idx];
         const uint32_t sc = s.sc[l >> 1];
         const uint32_t delta = ((part >> (3 + 4 * (l & 1))) & 1u) ? (s.nsc[l >> 1] ^ 0x80008000u) : s.nsc[l >> 1];
-        const uint32_t x = g.x ^ 0x80808080u, y = g.y ^ 0x80808080u;
-        h[0] = ares_er_h2_fma(ares_er_h2_sub(ares_er_magic(x, 0x5140), 0x64806480u), sc, delta);
-        h[1] = ares_er_h2_fma(ares_er_h2_sub(ares_er_magic(x, 0x5342), 0x64806480u), sc, delta);
-        h[2] = ares_er_h2_fma(ares_er_h2_sub(ares_er_magic(y, 0x5140), 0x64806480u), sc, delta);
-        h[3] = ares_er_h2_fma(ares_er_h2_sub(ares_er_magic(y, 0x5342), 0x64806480u), sc, delta);
+        ares_er_iq1_values(g, sc, delta, h);
     }
 };

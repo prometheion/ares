@@ -51,7 +51,20 @@ const TYPES: [(GgmlType, &[usize]); 11] = [
     (GgmlType::Q8_0, &[0]),
 ];
 
+/// The types of the second module (`kernels/prefill_more.cu`): the f16 variants only.
+const MORE_TYPES: [(GgmlType, &[usize]); 2] = [(GgmlType::IQ2_XXS, &[0]), (GgmlType::IQ1_S, &[0])];
+
 const PATHS: [PrefillPath; 3] = [PrefillPath::Int8, PrefillPath::F16, PrefillPath::F16Flush];
+
+/// Every type with a tile kernel.
+fn all_types() -> impl Iterator<Item = (GgmlType, &'static [usize])> {
+    TYPES.into_iter().chain(MORE_TYPES)
+}
+
+/// The paths a type has kernels for.
+fn paths_of(kernels: &Kernels, ty: GgmlType) -> Vec<PrefillPath> {
+    PATHS.into_iter().filter(|p| kernels.has_prefill_path(ty, *p)).collect()
+}
 
 fn gpus() -> Option<&'static [Device]> {
     static DEVICES: OnceLock<Option<Vec<Device>>> = OnceLock::new();
@@ -107,11 +120,11 @@ fn read_f32(buffer: &DeviceBuffer, n: usize) -> Vec<f32> {
 /// `n_blocks` blocks of `ty` of random bytes, with finite f16 scales of both
 /// signs (any other bytes are valid in every one of these types).
 fn random_blocks(rng: &mut Rng, ty: GgmlType, n_blocks: usize) -> Vec<u8> {
-    let (_, scales) = TYPES.iter().find(|(t, _)| *t == ty).unwrap();
+    let (_, scales) = all_types().find(|(t, _)| *t == ty).unwrap();
     let block = ty.block_bytes() as usize;
     let mut bytes: Vec<u8> = (0..n_blocks * block).map(|_| (rng.next() >> 32) as u8).collect();
     for b in 0..n_blocks {
-        for &offset in *scales {
+        for &offset in scales {
             let scale = (0.002 + 0.02 * (rng.unit() * 0.5 + 0.5))
                 * if rng.next().is_multiple_of(4) { -1.0 } else { 1.0 };
             let at = b * block + offset;
@@ -361,7 +374,7 @@ fn prefill_matmul_computes_the_emulated_product_on_every_type() {
         if !kernels.has_prefill_kernels() {
             continue;
         }
-        for (ty, _) in TYPES {
+        for (ty, _) in all_types() {
             let bv = ty.block_values() as usize;
             let mut shapes = vec![
                 (bv, 1, 1),
@@ -379,7 +392,7 @@ fn prefill_matmul_computes_the_emulated_product_on_every_type() {
             for (n_in, n_out, n_rows) in shapes {
                 let w = random_blocks(&mut rng, ty, n_in / bv * n_out);
                 let x: Vec<f32> = (0..n_in * n_rows).map(|_| rng.activation()).collect();
-                for path in PATHS {
+                for path in paths_of(&kernels, ty) {
                     let have = run_matmul(device, &kernels, ty, path, &w, &x, n_in, n_out, n_rows);
                     let dev = deviation(path, ty, &w, &x, &have, n_in, n_out, n_rows);
                     eprintln!(
@@ -413,7 +426,7 @@ fn prefill_matmul_is_right_around_every_shape_boundary() {
         if !kernels.has_prefill_kernels() {
             continue;
         }
-        for (ty, _) in TYPES {
+        for (ty, _) in all_types() {
             let bv = ty.block_values() as usize;
             let n_in = 512usize;
             let mut cases: Vec<(usize, usize)> = [
@@ -433,7 +446,7 @@ fn prefill_matmul_is_right_around_every_shape_boundary() {
             for (n_out, n_rows) in cases {
                 let w = &w[..n_in / bv * n_out * ty.block_bytes() as usize];
                 let x = &x_all[..n_in * n_rows];
-                for path in PATHS {
+                for path in paths_of(&kernels, ty) {
                     let have = run_matmul(device, &kernels, ty, path, w, x, n_in, n_out, n_rows);
                     let dev = deviation(path, ty, w, x, &have, n_in, n_out, n_rows);
                     assert_within(
@@ -464,7 +477,7 @@ fn prefill_matmul_on_real_tensors() {
     let gguf = ares_gguf::Gguf::open(&path).unwrap();
     let mut rng = Rng(0x853c49e6748fea9b);
     let mut checked = Vec::new();
-    for (ty, _) in TYPES {
+    for (ty, _) in all_types() {
         let Some(tensor) = gguf
             .tensors()
             .iter()
@@ -484,7 +497,7 @@ fn prefill_matmul_on_real_tensors() {
                 if !kernels.has_prefill_kernels() {
                     continue;
                 }
-                for path in PATHS {
+                for path in paths_of(&kernels, ty) {
                     let have = run_matmul(device, &kernels, ty, path, w, &x, n_in, rows, n_rows);
                     let dev = deviation(path, ty, w, &x, &have, n_in, rows, n_rows);
                     eprintln!(
@@ -603,12 +616,12 @@ fn a_row_gives_the_same_result_alone_and_in_a_batch() {
         if !kernels.has_prefill_kernels() {
             continue;
         }
-        for (ty, _) in TYPES {
+        for (ty, _) in all_types() {
             let bv = ty.block_values() as usize;
             let (n_in, n_out, n_rows) = (bv * 8, 150usize, 130usize);
             let w = random_blocks(&mut rng, ty, n_in / bv * n_out);
             let x: Vec<f32> = (0..n_in * n_rows).map(|_| rng.activation()).collect();
-            for path in PATHS {
+            for path in paths_of(&kernels, ty) {
                 let batch = run_matmul(device, &kernels, ty, path, &w, &x, n_in, n_out, n_rows);
                 for rows in [40usize, 20] {
                     let part = run_matmul(
@@ -662,8 +675,8 @@ fn the_shapes_fit_the_device() {
         if !kernels.has_prefill_kernels() {
             continue;
         }
-        for (ty, _) in TYPES {
-            for path in PATHS {
+        for (ty, _) in all_types() {
+            for path in paths_of(&kernels, ty) {
                 let shapes = kernels.prefill_shapes(ty, path).unwrap();
                 assert_eq!(shapes.len(), 3);
                 for shape in &shapes {
@@ -723,7 +736,7 @@ fn bad_arguments_are_refused() {
     let null = DevicePtr::NULL;
     let int8 = PrefillPath::Int8;
 
-    for ty in [GgmlType::F16, GgmlType::Q4_0, GgmlType::Q2_K, GgmlType::IQ1_S, GgmlType::MXFP4] {
+    for ty in [GgmlType::F16, GgmlType::Q4_0, GgmlType::Q2_K, GgmlType::MXFP4] {
         assert!(!Kernels::has_prefill_matmul(ty));
         // SAFETY: refused before anything is launched.
         let error = unsafe { kernels.matmul(&stream, ty, int8, p, p, p, 256, 1, 1) }

@@ -1,8 +1,8 @@
 //! The device implementation of `qwen35` on a made-up model whose weights, embedding table
-//! included, are in types that have no tensor-core (prefill) kernel: IQ2_XXS and IQ1_S (the
-//! bulk of the 2-bit file of Qwen3.8-27B) and Q2_K. Their prompts go through the decode
-//! kernels in launches of eight rows, whatever the number of rows, and the embedding is
-//! gathered in the type it is stored in.
+//! included, are in the 2-bit types of the small file of Qwen3.8-27B: IQ2_XXS and IQ1_S
+//! (the bulk of it), whose prompts go through the tile kernels, and Q2_K, which has none yet,
+//! so that its prompts go through the decode kernels in launches of eight rows whatever the
+//! number of rows. The embedding is gathered in the type it is stored in.
 //!
 //! Needs `ARES_TEST_CUDA=1` (and nothing else: the model is made here), and says so when it
 //! skips. `ARES_TEST_DEVICE` picks the GPU (default 0). Lines that start with `ERR` are the
@@ -119,7 +119,7 @@ fn direct(n: usize, pos0: usize) -> [Segment; 1] {
 }
 
 #[test]
-fn a_model_in_types_without_tensor_core_kernels_runs_prompts_of_any_length() {
+fn a_model_in_two_bit_types_runs_prompts_of_any_length() {
     let Some(device) = gpu() else { return };
     for ty in [GgmlType::IQ2_XXS, GgmlType::IQ1_S, GgmlType::Q2_K] {
         let dir = TempDir::new("types");
