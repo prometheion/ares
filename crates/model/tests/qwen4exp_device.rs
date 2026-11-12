@@ -491,20 +491,38 @@ fn the_forward_pass_and_greedy_tokens_match_the_reference() {
 /// The slices of a prompt of 9, 64 and 256 rows run on the many-row kernels, with half of
 /// every layer's experts without a slot, and what follows them (a step of a few rows and
 /// single tokens) continues from the state they left. The dense products take int8
-/// activations (`Precision::Fast` on these cards) or f16 ones (`Precision::Exact`); and
-/// with so few slots that the misses of a layer come in several batches, each giving way
-/// to the one after it.
+/// activations (`Precision::Fast` on these cards) or f16 ones (`Precision::Exact`). The
+/// experts a layer misses pass through transit: with room for all of them at once, with
+/// four transit slots (several rounds a layer, from RAM and from the file, and what the
+/// heat ranks high takes a slot of the tier afterwards), and, with a tier that holds only
+/// what a decode step needs, without transit: then they come into the layer's slots in
+/// batches, each giving way to the one after it.
 #[test]
 fn steps_wider_than_eight_rows_match_the_reference() {
     let Some(devices) = devices() else { return };
-    for (precision, few_slots) in
-        [(Precision::Fast, false), (Precision::Exact, false), (Precision::Exact, true)]
-    {
-        wide_steps(&devices, precision, few_slots);
+    for (precision, slots) in [
+        (Precision::Fast, Slots::Plenty),
+        (Precision::Exact, Slots::Plenty),
+        (Precision::Exact, Slots::Transit),
+        (Precision::Exact, Slots::Few),
+    ] {
+        wide_steps(&devices, precision, slots);
     }
 }
 
-fn wide_steps(devices: &[Device], precision: Precision, few_slots: bool) {
+/// The slots a store of the wide steps' test has.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Slots {
+    /// What the placement gives, and half of the experts in them.
+    Plenty,
+    /// What a decode step needs in every layer and four transit slots.
+    Transit,
+    /// What a decode step needs in every layer and nothing else: no transit.
+    Few,
+}
+
+fn wide_steps(devices: &[Device], precision: Precision, slots: Slots) {
+    let few_slots = slots != Slots::Plenty;
     let synthetic = Synthetic { types: Types::Quantized, ..model(23) };
     let gguf = open("wide", &synthetic.bytes_with_experts(GgmlType::IQ2_S, GgmlType::Q2_0));
     let c = Config::from_gguf(&gguf).unwrap();
@@ -524,7 +542,10 @@ fn wide_steps(devices: &[Device], precision: Precision, few_slots: bool) {
             down_ty: GgmlType::Q2_0,
         };
         let layers = layers_per_device(c.n_layer, devices.len()) as u64;
-        opts.slot_bytes = Some(layers * u64::from(8 * shape.top_k) * shape.slot_bytes().unwrap());
+        let transit = if slots == Slots::Transit { 4 } else { 0 };
+        opts.slot_bytes =
+            Some((layers * u64::from(8 * shape.top_k) + transit) * shape.slot_bytes().unwrap());
+        opts.transit = Some(transit as u32);
     }
     opts.part.cells = 512;
     let mut session =
@@ -545,9 +566,8 @@ fn wide_steps(devices: &[Device], precision: Precision, few_slots: bool) {
         let want = window.logits_of(rows - 1).unwrap();
         let error = rel_rms(session.logits(0).unwrap(), want);
         eprintln!(
-            "  {precision:?}{}, {rows} rows: logits of the last row differ by {error:.2e} (relative \
-             RMS)",
-            if few_slots { ", few slots" } else { "" }
+            "  {precision:?}, {slots:?}, {rows} rows: logits of the last row differ by {error:.2e} \
+             (relative RMS)"
         );
         assert!(is_near_best(picks[0], want, error), "the most likely token after {at} tokens");
         worst = worst.max(error);
@@ -562,6 +582,27 @@ fn wide_steps(devices: &[Device], precision: Precision, few_slots: bool) {
     assert!(wide.missing > 0, "no expert was missing: the test brings none");
     if few_slots {
         assert!(wide.extra_rounds > wide.layers, "the misses came in one batch: {wide:?}");
+    }
+    let stats = session.take_store_stats();
+    eprintln!(
+        "  transit: {} experts ({} from RAM, {} read from the file, {} read ahead), {} took a \
+         slot afterwards, {} stayed in RAM; into slots: {} uploads, {} evictions",
+        stats.transit_uploads,
+        stats.transit_from_ram,
+        stats.transit_reads,
+        stats.transit_ahead_reads,
+        stats.transit_adopted,
+        stats.transit_admitted,
+        stats.uploads,
+        stats.evictions,
+    );
+    match slots {
+        Slots::Few => assert_eq!(stats.transit_uploads, 0, "a tier at its floor has no transit"),
+        Slots::Plenty => assert!(stats.transit_uploads > 0, "{stats:?}"),
+        Slots::Transit => {
+            assert!(stats.transit_from_ram > 0 && stats.transit_reads > 0, "{stats:?}");
+            assert!(stats.transit_adopted > 0 && stats.evictions > 0, "{stats:?}");
+        }
     }
     // The quantized dense matrices cost the 8-bit activations of their products.
     assert!(worst < 0.2, "logits {worst:.2e}");

@@ -107,6 +107,7 @@ dependencies = [
  "ares-state",
  "ares-tokenizer",
  "ares-vulkan",
+ "ares-weights",
  "thiserror",
 ]
 

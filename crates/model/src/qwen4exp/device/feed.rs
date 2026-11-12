@@ -15,7 +15,10 @@ use ares_cuda::{Device, ExpertShape, MAX_BATCH, RouteGroup, RouteRecord};
 use ares_gguf::Gguf;
 use ares_io::{ExpertMap, Reader};
 use ares_runtime::expert_store::cpu::{CpuPool, Placement as CpuPlacement, Topology};
-use ares_runtime::expert_store::{CudaSlots, ExpertStore, HostRegion, LayerSpec, Serve, StorePlan};
+use ares_runtime::expert_store::{
+    CudaSlots, ExpertStore, HostRegion, LayerSpec, Serve, StoreConfig, StorePlan,
+};
+use ares_weights::{Lookahead, LookaheadRule};
 
 use super::Error;
 use super::board::Board;
@@ -124,6 +127,67 @@ impl Layout {
     }
 }
 
+/// Gives `config` the transit slots of every device and the staging slots in host memory
+/// for the experts that wide steps miss (`ares_runtime::expert_store`'s transit), from what
+/// the budgets of the tiers leave outside them. `slots` sets the transit slots of every
+/// device instead (0: none, and the misses go into the tier's slots).
+///
+/// - A device's transit holds half of the experts of a layer that the device computes and
+///   that have no slot in VRAM, so that two rounds bring a layer's misses: one batch is
+///   computed while the next is uploaded. At least two rows' picks, at most an eighth of
+///   the device's bytes for slots.
+/// - Staging holds twice the experts of a layer that are in no tier (the reads of a layer,
+///   and those read ahead for the next), at least twice what the drives take at once, at
+///   most an eighth of the bytes of the RAM tier.
+pub(super) fn plan_transit(
+    config: &mut StoreConfig,
+    layout: &Layout,
+    reader: &Reader,
+    slots: Option<u32>,
+) {
+    let all = layout.expert_bytes.max(1) as f64;
+    let vram: u64 = config.vram_bytes.iter().sum();
+    let outside_vram = (1.0 - vram as f64 / all).clamp(0.0, 1.0);
+    let in_no_tier = (1.0 - (vram as f64 + config.ram_bytes as f64) / all).clamp(0.0, 1.0);
+    let n_experts = f64::from(layout.shapes[0].n_experts);
+    let stride = layout.specs.iter().map(|s| s.slot_bytes).max().unwrap_or(1).max(1);
+    let floor = 2 * config.top_k;
+    // What the tiers must keep: the slots a decode step needs in every layer.
+    let tier_floor = u64::from(config.max_rows * config.top_k) + config.vram_reserve as u64;
+    config.transit_slots = config
+        .vram_bytes
+        .iter()
+        .enumerate()
+        .map(|(device, bytes)| {
+            let kept: u64 = layout
+                .specs
+                .iter()
+                .filter(|spec| spec.device == device)
+                .map(|spec| spec.slot_bytes * tier_floor)
+                .sum();
+            let most = (bytes / 8).min(bytes.saturating_sub(kept)) / stride;
+            let most = most.min(u64::from(u32::MAX)) as u32;
+            let wanted = (n_experts / layout.per_layer as f64 * outside_vram / 2.0).ceil() as u32;
+            let slots = slots.unwrap_or(wanted.max(floor)).min(most);
+            if slots < 2 { 0 } else { slots }
+        })
+        .collect();
+    // A slot of staging is an expert and a few blocks of the file.
+    let stage = stride + (stride >> 4);
+    let kept = 2 * layout.specs.len() as u64 * stage;
+    let most = (config.ram_bytes / 8).min(config.ram_bytes.saturating_sub(kept)) / stage;
+    let most = most.min(u64::from(u32::MAX)) as u32;
+    let at_once =
+        (ares_io::Config::default().queue_depth * reader.drives().len().max(1)).div_ceil(3) as u32;
+    let wanted = (2.0 * n_experts * in_no_tier).ceil() as u32;
+    let staging = wanted.max(2 * at_once).min(most);
+    config.staging_slots = if staging < 2 { 0 } else { staging };
+    if config.staging_slots == 0 || slots == Some(0) {
+        config.transit_slots.clear();
+        config.staging_slots = 0;
+    }
+}
+
 /// The slots of one device: its pools and tables, and the host shares that
 /// let the CPU compute what a layer misses, reserved in the device's ledger
 /// and in `pinned`.
@@ -198,6 +262,16 @@ pub(super) struct Feed {
     groups: Vec<RouteGroup>,
     /// What the wide steps found and waited for, since the counters were read.
     wide: WideStats,
+    /// Per layer of the store: the experts the wide step before found in no slot there,
+    /// which is the guess for the next one, and whether the running step has made it.
+    last_missing: Vec<Vec<u32>>,
+    guessed: Vec<bool>,
+    /// How many layers ahead the guesses are read, from the time a guessed read takes and
+    /// the time of a layer.
+    lookahead: Lookahead,
+    /// The guessed reads the store had counted, and their time, when they were last looked
+    /// at.
+    ahead_seen: (u64, f64),
 }
 
 impl Feed {
@@ -210,6 +284,10 @@ impl Feed {
     ) -> Self {
         Self {
             followed: vec![0; boards.len()],
+            last_missing: vec![Vec::new(); layout.specs.len()],
+            guessed: vec![false; layout.specs.len()],
+            lookahead: Lookahead::default(),
+            ahead_seen: (0, 0.0),
             store,
             boards,
             firsts,
@@ -219,6 +297,66 @@ impl Feed {
             groups: Vec::new(),
             wide: WideStats::default(),
         }
+    }
+
+    /// Whether the misses of layer `at` of the store go through transit.
+    pub(super) fn has_transit(&self, at: usize) -> bool {
+        self.store.transit_pool(at).is_some() && self.store.staging_slots() > 0
+    }
+
+    /// How many experts of layer `at` a round from transit waits for: half of the transit
+    /// slots of the layer's device, so that the other half fills while the round runs.
+    pub(super) fn transit_batch(&self, at: usize) -> usize {
+        self.store.transit_pool(at).map_or(1, |(_, _, slots)| (slots as usize / 2).max(1))
+    }
+
+    /// The address of transit slot `slot` of the device of layer `at`.
+    pub(super) fn transit_address(&self, at: usize, slot: u32) -> u64 {
+        let Some((pool, stride, _)) = self.store.transit_pool(at) else { return 0 };
+        let (device, _) = self.store.place(at);
+        self.store.device(device).pool(pool).0.as_raw() + u64::from(slot) * stride
+    }
+
+    /// The record of layer `at` of the store, in a wide step, named `missing`, which have
+    /// no slot: they are brought into transit, and the reads of the layers ahead start on a
+    /// guess.
+    pub(super) fn named(&mut self, at: usize, missing: &[u32]) -> Result<(), Error> {
+        self.want(at, missing)?;
+        self.last_missing[at] = missing.to_vec();
+        self.guess_ahead(at + self.layout.per_layer)
+    }
+
+    /// Brings `missing` of layer `at` of the store into transit, and notes how many of
+    /// those that have to be read had been guessed and how long the guessed reads took.
+    pub(super) fn want(&mut self, at: usize, missing: &[u32]) -> Result<(), Error> {
+        let named = self.store.transit_want(at, missing)?;
+        // The guess is the same for every distance: what is chosen is how many layers a
+        // guessed read needs to arrive.
+        let rule = LookaheadRule::default();
+        for distance in 1..=rule.max_distance {
+            self.lookahead.observe_recall(distance, named.guessed, named.guessed + named.unguessed);
+        }
+        let stats = self.store.stats();
+        let (done, ms) = (stats.transit_ahead_done, stats.transit_ahead_ms);
+        if done > self.ahead_seen.0 {
+            self.lookahead
+                .observe_read((ms - self.ahead_seen.1) / (done - self.ahead_seen.0) as f64);
+        }
+        self.ahead_seen = (done, ms);
+        Ok(())
+    }
+
+    /// Starts the guessed reads of the layers from `first` of the store on, every
+    /// `per_layer`-th (the layers of one part, or all when the parts hold a range of layers
+    /// each), as far ahead as the lookahead says.
+    fn guess_ahead(&mut self, first: usize) -> Result<(), Error> {
+        let step = self.layout.per_layer;
+        for at in (first..self.guessed.len()).step_by(step).take(self.lookahead.distance()) {
+            if !std::mem::replace(&mut self.guessed[at], true) && self.has_transit(at) {
+                self.store.transit_guess(at, &self.last_missing[at])?;
+            }
+        }
+        Ok(())
     }
 
     /// The board of part `index`.
@@ -287,10 +425,19 @@ impl Feed {
     }
 
     /// A step of `rows` rows begins: its routers have not run.
-    pub(super) fn begin_step(&mut self, rows: u32) {
+    pub(super) fn begin_step(&mut self, rows: u32) -> Result<(), Error> {
         self.rows = rows;
         self.followed.fill(0);
         self.store.begin_step();
+        self.guessed.fill(false);
+        if rows > MAX_BATCH {
+            // The first layers of every part have no layer before them to start their
+            // guesses.
+            for index in 0..self.boards.len() {
+                self.guess_ahead(self.layout.store_layer(index, self.firsts[index]))?;
+            }
+        }
+        Ok(())
     }
 
     /// Hands the route records that have arrived to the store, per part in
@@ -331,9 +478,24 @@ impl Feed {
 
     /// Layers of part `index` up to `followed` have been handled by [`Misses`], which found
     /// `stats`.
-    pub(super) fn layer_done(&mut self, index: usize, followed: usize, stats: &WideStats) {
+    pub(super) fn layer_done(
+        &mut self,
+        index: usize,
+        followed: usize,
+        stats: &WideStats,
+    ) -> Result<(), Error> {
         self.followed[index] = followed;
         self.wide.add(stats);
+        let at = self.layout.store_layer(index, self.firsts[index] + followed - 1);
+        if self.has_transit(at) {
+            // What a layer takes when it waits for no expert is what a guessed read can
+            // hide behind.
+            let own = stats.layer_time.saturating_sub(stats.bring_wait);
+            self.lookahead.observe_layer(own.as_secs_f64() * 1e3);
+            // The guesses for this layer that its record did not name are dropped.
+            self.store.transit_forget(at)?;
+        }
+        Ok(())
     }
 
     /// What wide steps found and waited for since the last call.

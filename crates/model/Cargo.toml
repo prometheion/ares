@@ -19,6 +19,8 @@ ares-runtime = { path = "../runtime" }
 ares-sampler.workspace = true
 ares-state.workspace = true
 ares-tokenizer.workspace = true
+# How far ahead of a layer the experts of a prompt are read.
+ares-weights.workspace = true
 thiserror.workspace = true
 
 [[example]]

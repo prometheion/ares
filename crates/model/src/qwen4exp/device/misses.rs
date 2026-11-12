@@ -7,9 +7,17 @@
 //! 1. The layer is enqueued. The host gives the first round the experts that are in a slot
 //!    now; the device computes them while the host waits for the layer's route record.
 //! 2. The record says which experts the rows picked. Those without a slot are the layer's
-//!    misses. When the first round has ended on the device (nothing reads a slot any more),
-//!    the store brings the misses, as many as the layer has slots at a time, and each batch
-//!    that has arrived is the next round's table; its output is added to the first one's.
+//!    misses. The store brings them into transit slots at once (`ExpertStore::transit_want`:
+//!    from their RAM slot, or from the file through staging), next to the first round: no
+//!    slot is touched, so nothing has to wait for the kernels that read slots. Whenever a
+//!    round has ended and half of the transit slots hold experts that have arrived (or all
+//!    that are left), those are the next round's table; its output is added to the first
+//!    one's, and its slots are free again when it has ended.
+//! 3. When the record of a layer arrives, the reads of the layers ahead are started on a
+//!    guess (`Feed::guess_ahead`): what the wide step before missed there.
+//!
+//! A store without transit brings the misses into the layer's slots instead, as many as
+//! the layer has at a time, once the first round has ended (nothing reads a slot any more).
 //!
 //! [`Misses::advance`] never waits. The caller serves the store and calls it again.
 
@@ -42,6 +50,8 @@ pub struct WideStats {
     pub bring_wait: Duration,
     /// Time from enqueuing a later round to its end.
     pub round_wait: Duration,
+    /// Time of the layers from their enqueuing to the end of their last round.
+    pub layer_time: Duration,
 }
 
 impl WideStats {
@@ -55,6 +65,7 @@ impl WideStats {
         self.compute_wait += other.compute_wait;
         self.bring_wait += other.bring_wait;
         self.round_wait += other.round_wait;
+        self.layer_time += other.layer_time;
     }
 }
 
@@ -68,6 +79,8 @@ enum Stage {
     Arrive,
     /// A later round runs.
     Round,
+    /// The misses come through transit: a round runs, or the next one waits for experts.
+    Transit,
     /// Every expert the layer's rows picked has been computed.
     Done,
 }
@@ -98,6 +111,14 @@ pub(super) struct Misses {
     /// The experts that did not, most picked first, and the batch being brought.
     missing: Vec<u32>,
     batch: std::ops::Range<usize>,
+    /// Through transit: the experts that have arrived and wait for a round (with their
+    /// transit slot), the ones the running round reads, whether a round runs, and how many
+    /// of the misses have been given to a round.
+    arrived: Vec<(u32, u32)>,
+    in_round: Vec<u32>,
+    running: bool,
+    computed: usize,
+    begun: Instant,
     stats: WideStats,
 }
 
@@ -139,6 +160,11 @@ impl Misses {
             resident,
             missing: Vec::new(),
             batch: 0..0,
+            arrived: Vec::new(),
+            in_round: Vec::new(),
+            running: false,
+            computed: 0,
+            begun: Instant::now(),
             stats: WideStats::default(),
         })
     }
@@ -177,10 +203,59 @@ impl Misses {
                         all.filter(picked).filter(|e| self.resident[*e as usize] == 0).collect();
                     self.missing.sort_by_key(|e| std::cmp::Reverse(counts[*e as usize]));
                     self.stats.missing = self.missing.len() as u64;
+                    let transit = feed.has_transit(self.at);
+                    if transit {
+                        feed.named(self.at, &self.missing)?;
+                    }
                     if self.missing.is_empty() {
                         return self.finish(feed);
                     }
-                    self.stage = Stage::Compute;
+                    self.stage = if transit { Stage::Transit } else { Stage::Compute };
+                    self.running = true;
+                    self.since = Instant::now();
+                }
+                Stage::Transit => {
+                    if !part.rounds_done()? {
+                        return Ok(Progress::Waiting);
+                    }
+                    if std::mem::take(&mut self.running) {
+                        // The round that ran has ended: the first one, or one from transit,
+                        // whose slots are free for the next experts.
+                        let waited = self.since.elapsed();
+                        if self.computed == 0 {
+                            self.stats.compute_wait += waited;
+                        } else {
+                            self.stats.round_wait += waited;
+                        }
+                        self.since = Instant::now();
+                        feed.store.transit_release(self.at, &self.in_round)?;
+                        self.in_round.clear();
+                    }
+                    if self.computed == self.missing.len() {
+                        return self.finish(feed);
+                    }
+                    feed.store.transit_take(self.at, &mut self.arrived);
+                    let left = self.missing.len() - self.computed;
+                    let batch = feed.transit_batch(self.at).min(left);
+                    // A round waits for a batch, as long as experts of the layer are on
+                    // their way. When none is (the others wait for the slots this round
+                    // gives back, or for staging that another layer holds), it takes what
+                    // has arrived.
+                    if self.arrived.is_empty()
+                        || (self.arrived.len() < batch && feed.store.transit_moving(self.at) > 0)
+                    {
+                        return Ok(Progress::Waiting);
+                    }
+                    self.stats.bring_wait += self.since.elapsed();
+                    let mut table = vec![0u64; self.resident.len()];
+                    for (expert, slot) in self.arrived.drain(..) {
+                        table[expert as usize] = feed.transit_address(self.at, slot);
+                        self.in_round.push(expert);
+                    }
+                    self.computed += self.in_round.len();
+                    part.experts_round(env, self.layer, &table, None)?;
+                    self.stats.extra_rounds += 1;
+                    self.running = true;
                     self.since = Instant::now();
                 }
                 Stage::Compute => {
@@ -240,7 +315,8 @@ impl Misses {
     }
 
     fn finish(&mut self, feed: &mut Feed) -> Result<Progress, Error> {
-        feed.layer_done(self.part, self.layer + 1, &self.stats);
+        self.stats.layer_time = self.begun.elapsed();
+        feed.layer_done(self.part, self.layer + 1, &self.stats)?;
         self.stage = Stage::Done;
         Ok(Progress::Done)
     }

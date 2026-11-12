@@ -10,7 +10,7 @@
 //!     [--check DIR/NAME,...] [--chat] [--generate 64]
 //!     [--text TOKENS.txt] [--text-file A.md,B.md] [--decode-at 1000,8000]
 //!     [--decode-steps 64]
-//!     [--prefill 2048] [--breakdown] [--serve model|stream|cpu]
+//!     [--prefill 2048] [--breakdown] [--serve model|stream|cpu] [--transit 32]
 //! ```
 //!
 //! - `--spread`: how two devices share the model: a range of layers each
@@ -45,6 +45,9 @@
 //!   kernels' limit; more runs the many-row kernels and reports what the wide steps
 //!   found missing and waited for); `--repeat K` reads it `K` times, the later ones
 //!   with the experts the first one fetched.
+//! - `--transit N`: transit slots per device for the experts a wide step misses, to
+//!   measure what they are worth; 0 brings them into the tier's slots, and without the
+//!   option the plan of the store decides.
 //! - `--serve`: how an expert that is in no slot is served: `model` lets the
 //!   store's measured costs decide between an upload and the CPU (what the
 //!   engine does), `stream` uploads every one, `cpu` computes every one.
@@ -95,6 +98,7 @@ struct Args {
     breakdown: bool,
     serve: Serve,
     stall_s: u64,
+    transit: Option<u32>,
 }
 
 fn parse() -> Result<Args, AnyError> {
@@ -128,6 +132,7 @@ fn parse() -> Result<Args, AnyError> {
         breakdown: false,
         serve: Serve::Measured,
         stall_s: 20,
+        transit: None,
     };
     let mut it = std::env::args().skip(1);
     let list = |s: String| -> Vec<String> { s.split(',').map(str::to_owned).collect() };
@@ -176,6 +181,7 @@ fn parse() -> Result<Args, AnyError> {
             "--repeat" => args.repeat = value()?.parse()?,
             "--breakdown" => args.breakdown = true,
             "--stall-s" => args.stall_s = value()?.parse()?,
+            "--transit" => args.transit = Some(value()?.parse()?),
             "--serve" => {
                 args.serve = match value()?.as_str() {
                     "stream" => Serve::Stream,
@@ -276,6 +282,36 @@ fn store_line(stats: &StoreStats, steps: usize) -> String {
         percentile(&stats.cpu_ms, 0.5),
         percentile(&stats.cpu_ms, 0.99),
         per(stats.promotions),
+    )
+}
+
+/// What the tiers moved: experts uploaded into slots, evicted, copied down to RAM and read
+/// from the file, and what one upload takes on each device by the store's cost model.
+fn churn_line(stats: &StoreStats, session: &Session<'_>) -> String {
+    let gib = |bytes: u64| bytes as f64 / (1u64 << 30) as f64;
+    let link: Vec<String> = (0..session.devices().len())
+        .map(|device| {
+            match session.store().cost_model().and_then(|model| model.upload_time(device)) {
+                Some(seconds) => format!("{:.2}", seconds * 1e3),
+                None => "?".to_owned(),
+            }
+        })
+        .collect();
+    format!(
+        "churn: {} uploads into slots ({:.2} GiB), {} evictions, {} copied down to RAM ({:.2} \
+         GiB), {} reads from the file for a step ({:.2} GiB), {} guessed reads ({:.2} GiB), {} \
+         promotions; an upload takes {} ms per device by the cost model",
+        stats.uploads,
+        gib(stats.upload_bytes),
+        stats.evictions,
+        stats.demotions,
+        gib(stats.demote_bytes),
+        stats.demand_reads,
+        gib(stats.demand_read_bytes),
+        stats.guess_reads,
+        gib(stats.guess_read_bytes),
+        stats.promotions,
+        link.join(" | "),
     )
 }
 
@@ -413,6 +449,7 @@ fn run() -> Result<(), AnyError> {
         bounds: args.bounds.clone(),
         serve: args.serve,
         stall: Duration::from_secs(args.stall_s),
+        transit: args.transit,
         ..SessionOptions::default()
     };
     let devices: Vec<Device> =
@@ -718,6 +755,25 @@ fn run() -> Result<(), AnyError> {
                 load_average(),
             );
             println!("  store: {}", store_line(&stats, args.prefill.div_ceil(args.rows as usize)));
+            println!("  {}", churn_line(&stats, &session));
+            if stats.transit_uploads > 0 {
+                println!(
+                    "  transit: {} experts ({} from RAM, {:.2} GiB up), {:.2} ms each from asked \
+                     to usable; read from the file: {} asked, {} ahead of which {} used and {} \
+                     dropped ({:.2} GiB); afterwards {} took a VRAM slot and {} a RAM slot",
+                    stats.transit_uploads,
+                    stats.transit_from_ram,
+                    stats.transit_upload_bytes as f64 / (1u64 << 30) as f64,
+                    stats.transit_ms / stats.transit_uploads as f64,
+                    stats.transit_reads,
+                    stats.transit_ahead_reads,
+                    stats.transit_ahead_used,
+                    stats.transit_ahead_unused,
+                    stats.transit_read_bytes as f64 / (1u64 << 30) as f64,
+                    stats.transit_adopted,
+                    stats.transit_admitted,
+                );
+            }
             if round + 1 == args.repeat {
                 breakdown(profile.as_deref(), &session);
             }

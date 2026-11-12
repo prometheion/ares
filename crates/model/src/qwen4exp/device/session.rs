@@ -35,7 +35,7 @@ use ares_runtime::expert_store::{
 };
 
 use super::Error;
-use super::feed::{Feed, Layout, build_store, cpu_pool, device_slots, places};
+use super::feed::{Feed, Layout, build_store, cpu_pool, device_slots, places, plan_transit};
 use super::load::Role;
 use super::misses::{Misses, Progress, WideStats};
 use super::ngram::NgramFeed;
@@ -131,6 +131,10 @@ pub struct SessionOptions {
     /// with an error that says what it waited for: a device that waits for
     /// an expert nobody brings would otherwise wait for ever.
     pub stall: Duration,
+    /// Transit slots of every device for the experts a wide step misses, to
+    /// measure what they are worth; `None` lets the plan of the store decide
+    /// (`plan_transit`), 0 brings the misses into the tier's slots.
+    pub transit: Option<u32>,
 }
 
 impl Default for SessionOptions {
@@ -149,6 +153,7 @@ impl Default for SessionOptions {
             cpu_workers: None,
             row_cache: 16 << 20,
             stall: Duration::from_secs(30),
+            transit: None,
         }
     }
 }
@@ -596,6 +601,9 @@ impl<'g> Session<'g> {
         if let Some(reserve) = opts.reserve {
             config.vram_reserve = reserve;
         }
+        if opts.part.max_rows > MAX_BATCH {
+            plan_transit(&mut config, &layout, &reader, opts.transit);
+        }
         let reserve = config.vram_reserve;
         let plan = StorePlan::new(config, &map, &reader, &layout.specs, None)?;
         if let Some((times, mixer)) = speeds {
@@ -976,7 +984,7 @@ impl<'g> Session<'g> {
         self.step += 1;
         self.step_rows = dims.n_rows;
         self.enqueued.fill(0);
-        self.feed.begin_step(dims.n_rows);
+        self.feed.begin_step(dims.n_rows)?;
         // The exchanges between a mixer and its worker are numbered through
         // the steps: eight per layer.
         let per_step = 8 * (self.c.n_layer as u32 + 1);

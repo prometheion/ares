@@ -44,7 +44,9 @@ use ares_state::PageLayout;
 use ares_tokenizer::{ChatOptions, Tokenizer};
 
 use super::board::Board;
-use super::feed::{Feed, Layout, build_store, cpu_pool, device_slots, expert_map, places};
+use super::feed::{
+    Feed, Layout, build_store, cpu_pool, device_slots, expert_map, places, plan_transit,
+};
 use super::misses::{Misses, Progress, WideStats};
 use super::ngram::NgramFeed;
 use super::part::{
@@ -287,7 +289,7 @@ impl Flow {
                 counter.store(0, Ordering::Release);
             }
             self.finished.store(0, Ordering::Release);
-            feed.begin_step(rows);
+            feed.begin_step(rows).map_err(model_error)?;
             self.begun.store(step, Ordering::Release);
         }
         feed.store.device_mut(index).fence(stream).map_err(|e| invalid(e.to_string()))
@@ -326,7 +328,12 @@ impl Flow {
     fn progress(&self) -> u64 {
         if let Ok(feed) = self.feed.try_lock() {
             let stats = feed.store.stats();
-            self.uploads_seen.store(stats.uploads + stats.demand_reads, Ordering::Relaxed);
+            let moved = stats.uploads
+                + stats.demand_reads
+                + stats.transit_uploads
+                + stats.transit_reads
+                + stats.transit_ahead_reads;
+            self.uploads_seen.store(moved, Ordering::Relaxed);
         }
         let layers: usize =
             self.enqueued.iter().chain(&self.followed).map(|n| n.load(Ordering::Acquire)).sum();
@@ -674,8 +681,9 @@ impl Qwen4Exp {
         totals.from_disk += stats.miss_from_disk;
         totals.on_their_way += stats.miss_on_its_way;
         totals.cpu_experts += stats.cpu_experts;
-        totals.uploads += stats.uploads;
-        totals.read_bytes += stats.demand_read_bytes + stats.guess_read_bytes;
+        totals.uploads += stats.uploads + stats.transit_uploads;
+        totals.read_bytes +=
+            stats.demand_read_bytes + stats.guess_read_bytes + stats.transit_read_bytes;
         totals.wait_us += (stats.wait_ms * 1e3) as u64;
         Some(stats)
     }
@@ -800,6 +808,9 @@ impl Qwen4Exp {
                 );
                 if let Some(reserve) = self.opts.reserve {
                     config.vram_reserve = reserve;
+                }
+                if o.max_rows > MAX_BATCH {
+                    plan_transit(&mut config, layout, &reader, self.opts.transit);
                 }
                 let plan = StorePlan::new(config, &map, &reader, &layout.specs, None)
                     .map_err(|e| invalid(e.to_string()))?;
