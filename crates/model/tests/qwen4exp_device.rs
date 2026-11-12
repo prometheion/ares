@@ -114,6 +114,22 @@ fn model(seed: u64) -> Synthetic {
     Synthetic { shape, seed, types: Types::Shipped, lazy_type: Some(GgmlType::IQ4_NL) }
 }
 
+/// [`model`] with experts whose down matrices `down_ty` can hold: an inner width of 64, or
+/// of the type's block where that is larger.
+fn model_of(seed: u64, down_ty: GgmlType) -> Synthetic {
+    let mut synthetic = model(seed);
+    synthetic.shape.expert_ff = (down_ty.block_values() as usize).max(64);
+    synthetic
+}
+
+/// Every weight type once as the type of gate and up and once as the type of down: the
+/// pair `i` has gate and up of type `i` and down of the type seven places on, so that the
+/// pairs mix the families (k-quants with i-quants, floats with quantized types).
+fn type_pairs() -> Vec<(GgmlType, GgmlType)> {
+    let types: Vec<GgmlType> = ExpertShape::types().collect();
+    (0..types.len()).map(|i| (types[i], types[(i + 7) % types.len()])).collect()
+}
+
 fn open(name: &str, bytes: &[u8]) -> Gguf {
     let path = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("q4dev-{name}.gguf"));
     std::fs::write(&path, bytes).expect("the test directory is writable");
@@ -221,6 +237,8 @@ impl Probe for Compare<'_> {
             rel_rms(out.residual, &want.output),
         ];
         for (worst, error) in self.worst[kind].iter_mut().zip(errors) {
+            // A maximum drops what is not a number.
+            assert!(error.is_finite(), "layer {layer}: an output that is not a number");
             *worst = worst.max(error);
         }
         for (got, want) in out.picks.iter().zip(&want.picks) {
@@ -740,7 +758,12 @@ impl Probe for Fed<'_> {
         let rows = |ours: &[f32], theirs: &[f32], width: usize| -> f64 {
             ours.chunks(width)
                 .zip(theirs.chunks(width))
-                .map(|(o, t)| rel_rms(o, t))
+                .map(|(o, t)| {
+                    let error = rel_rms(o, t);
+                    // A maximum drops what is not a number.
+                    assert!(error.is_finite(), "layer {layer}: a row that is not a number");
+                    error
+                })
                 .fold(0.0, f64::max)
         };
         let errors = [
@@ -761,9 +784,20 @@ impl Probe for Fed<'_> {
 /// of a layer between the two: of the experts' output, of the core's output
 /// and of the residual after the layer.
 fn layers_with_misses(devices: &[Device], serve: Serve) -> [f64; 3] {
-    let synthetic = model(31);
-    let name = format!("fed-{serve:?}");
-    let gguf = open(&name, &synthetic.bytes_with_experts(GgmlType::IQ2_S, GgmlType::Q2_0));
+    layers_with_misses_of(devices, serve, GgmlType::IQ2_S, GgmlType::Q2_0)
+}
+
+/// [`layers_with_misses`] for a model whose experts have gate and up of `gate_ty` and down
+/// of `down_ty`.
+fn layers_with_misses_of(
+    devices: &[Device],
+    serve: Serve,
+    gate_ty: GgmlType,
+    down_ty: GgmlType,
+) -> [f64; 3] {
+    let synthetic = model_of(31, down_ty);
+    let name = format!("fed-{serve:?}-{gate_ty}-{down_ty}");
+    let gguf = open(&name, &synthetic.bytes_with_experts(gate_ty, down_ty));
     let c = Config::from_gguf(&gguf).unwrap();
     let w = Weights::load(&gguf, &c).unwrap();
     let text = synthetic.shape.tokens(56, 29);
@@ -775,8 +809,8 @@ fn layers_with_misses(devices: &[Device], serve: Serve) -> [f64; 3] {
         n_ff: c.experts.ff as u32,
         n_experts: c.experts.count as u32,
         top_k: c.experts.used as u32,
-        gate_ty: GgmlType::IQ2_S,
-        down_ty: GgmlType::Q2_0,
+        gate_ty,
+        down_ty,
     };
     let layers_per_device = layers_per_device(c.n_layer, devices.len());
     let opts = SessionOptions {
@@ -809,8 +843,9 @@ fn layers_with_misses(devices: &[Device], serve: Serve) -> [f64; 3] {
     let stats = missing.take_store_stats();
     let misses = stats.picks - stats.hits;
     eprintln!(
-        "  {} device(s), {serve:?}: {misses} of {} picks had no slot, {} of them computed on the \
-         CPU ({} uploads, {} promotions between steps); fed the residuals of a run without \
+        "  {gate_ty} and {down_ty}, {} device(s), {serve:?}: {misses} of {} picks had no slot, {} \
+         of them computed on the CPU ({} uploads, {} promotions between steps); fed the residuals \
+         of a run without \
          misses, a layer's rows differ from that run's by at most {:.2e} (experts), {:.2e} \
          (core), {:.2e} (residual), relative RMS",
         devices.len(),
@@ -859,6 +894,242 @@ fn experts_computed_on_the_cpu_change_nothing() {
         assert!(experts < 1e-2, "{serve:?}: experts {experts:.2e}");
         assert!(residual < 1e-2, "{serve:?}: residual {residual:.2e}");
     }
+}
+
+/// Feeds every layer the reference's input and compares what its experts give row by row.
+///
+/// A row is compared when its experts read what the reference's read and are the
+/// reference's: `worst` is the largest relative RMS of such a row's expert output and
+/// residual. A row is counted and not compared when the discrete choices before its experts
+/// went the other way at a near tie, which the rounding of the products before them can
+/// cause (8-bit activations in steps of up to eight rows, f16 operands of the float
+/// matrices in wider ones): its router picked another expert, or its attention selected
+/// another block, which shows as a core far from the reference's ([`OTHER_BLOCK`]).
+struct ExpertRows<'a> {
+    expected: &'a [Expected],
+    n: usize,
+    /// Expert output and residual of the rows that are compared.
+    worst: [f64; 2],
+    rows: usize,
+    compared: usize,
+}
+
+/// A row's core is this far from the reference's (relative RMS) only when its attention
+/// read other blocks: with the reference's blocks it is within 3e-2
+/// (`every_layer_matches_the_reference`), with another block it is another vector.
+const OTHER_BLOCK: f64 = 0.1;
+
+impl Probe for ExpertRows<'_> {
+    fn before(&mut self, layer: usize) -> Option<Vec<f32>> {
+        Some(self.expected[layer].input.clone())
+    }
+
+    fn after(&mut self, layer: usize, out: LayerOut<'_>) {
+        let want = &self.expected[layer];
+        let n = self.n;
+        let wide = out.residual.len() / out.picks.len();
+        for (row, (got, reference)) in out.picks.iter().zip(&want.picks).enumerate() {
+            self.rows += 1;
+            let (mut got, mut reference) = (got.clone(), reference.clone());
+            got.sort_unstable();
+            reference.sort_unstable();
+            let at = row * n..(row + 1) * n;
+            let streams = row * wide..(row + 1) * wide;
+            let errors = [
+                rel_rms(&out.core[at.clone()], &want.core[at.clone()]),
+                rel_rms(&out.ffn[at.clone()], &want.ffn[at]),
+                rel_rms(&out.residual[streams.clone()], &want.output[streams]),
+            ];
+            // A maximum drops what is not a number.
+            assert!(
+                errors.iter().all(|e| e.is_finite()),
+                "layer {layer}, row {row}: an output that is not a number"
+            );
+            if got == reference && errors[0] < OTHER_BLOCK {
+                self.compared += 1;
+                for (worst, error) in self.worst.iter_mut().zip(&errors[1..]) {
+                    *worst = worst.max(*error);
+                }
+            }
+        }
+    }
+}
+
+/// Models with experts of the pairs `part * 7 ..` of [`type_pairs`], in steps of up to eight
+/// rows (the decode kernels) and of 64 and 20 rows (the many-row kernels), against the CPU
+/// reference of the model.
+///
+/// First every layer by itself, fed the reference's input, row by row ([`ExpertRows`]):
+/// what the experts of a type give is held to the reference there. Then a free run, whose
+/// logits are what those differences grow to through the layers of a made-up model (its
+/// 8-bit activation codes and its discrete choices amplify them, see
+/// `experts_computed_on_the_cpu_change_nothing`): they must be numbers, and the most likely
+/// token must be one the reference's logits put near the top.
+fn expert_types_match_the_reference(part: usize) {
+    let Some(devices) = devices() else { return };
+    for (gate_ty, down_ty) in type_pairs().into_iter().skip(7 * part).take(7) {
+        let synthetic = model_of(41, down_ty);
+        let name = format!("types-{gate_ty}-{down_ty}");
+        let gguf = open(&name, &synthetic.bytes_with_experts(gate_ty, down_ty));
+        let c = Config::from_gguf(&gguf).unwrap();
+        let w = Weights::load(&gguf, &c).unwrap();
+        let reference = Reference::new(&c, &w);
+        let steps = [8usize, 3, 64, 20, 1];
+        let prompt = synthetic.shape.tokens(steps.iter().sum(), 9);
+        let open_session = || {
+            let mut opts = options(devices.len(), c.n_layer, CacheFormat::Q8);
+            opts.part.max_rows = 64;
+            let mut session =
+                Session::open(&gguf, &c, &w, devices.clone(), opts).expect("the model opens");
+            let n_expert = c.experts.count as u32;
+            session.fill(&mut |_| (0..n_expert).collect()).expect("the tiers fill");
+            session
+        };
+
+        // Layer by layer: [up to eight rows, more][expert output, residual] of the rows
+        // that are compared.
+        let mut session = open_session();
+        let mut state = SequenceState::new(&c);
+        let mut worst = [[0.0f64; 2]; 2];
+        let (mut rows, mut compared, mut at) = (0, 0, 0);
+        for count in steps {
+            let tokens = &prompt[at..at + count];
+            at += count;
+            let wide = usize::from(count > 8);
+            let layers = expected(&reference, &c, &w, &state, tokens);
+            let mut probe = ExpertRows {
+                expected: &layers,
+                n: c.n_embd,
+                worst: worst[wide],
+                rows: 0,
+                compared: 0,
+            };
+            session
+                .step_probed(
+                    &[Rows { slot: 0, tokens, direct: true, wanted: Wanted::None }],
+                    &mut probe,
+                )
+                .unwrap();
+            worst[wide] = probe.worst;
+            rows += probe.rows;
+            compared += probe.compared;
+            let window = reference.window(&state, tokens, LogitRows::None).unwrap();
+            reference.commit(&mut state, &window, count).unwrap();
+        }
+        drop(session);
+
+        // A free run.
+        let mut session = open_session();
+        let mut state = SequenceState::new(&c);
+        let (mut at, mut logits) = (0, [0.0f64; 2]);
+        for count in steps {
+            let tokens = &prompt[at..at + count];
+            at += count;
+            let picks = session
+                .step(&[Rows { slot: 0, tokens, direct: true, wanted: Wanted::Last }])
+                .unwrap()
+                .to_vec();
+            let window = reference.window(&state, tokens, LogitRows::All).unwrap();
+            let want = window.logits_of(count - 1).unwrap();
+            let got = session.logits(0).unwrap();
+            let error = rel_rms(got, want);
+            // A maximum drops what is not a number.
+            assert!(
+                error.is_finite() && got.iter().all(|v| v.is_finite()),
+                "{gate_ty} and {down_ty}: the logits after {at} tokens are not numbers"
+            );
+            assert!(
+                is_near_best(picks[0], want, error),
+                "{gate_ty} and {down_ty}: the most likely token after {at} tokens ({error:.2e})"
+            );
+            let wide = usize::from(count > 8);
+            logits[wide] = logits[wide].max(error);
+            reference.commit(&mut state, &window, count).unwrap();
+        }
+        eprintln!(
+            "  ERR {gate_ty} and {down_ty}, {} device(s): the experts of a row differ from the \
+             reference's by at most {:.2e} (up to eight rows) and {:.2e} (64 and 20 rows), the \
+             residual by {:.2e} and {:.2e}, in the {compared} of {rows} rows of layers that made \
+             the reference's choices; the logits of a free run by {:.2e} and {:.2e} (relative \
+             RMS)",
+            devices.len(),
+            worst[0][0],
+            worst[1][0],
+            worst[0][1],
+            worst[1][1],
+            logits[0],
+            logits[1],
+        );
+        for (wide, (experts, residual)) in [EXPERT_ROW_8BIT, EXPERT_ROW_F16].iter().enumerate() {
+            let what = format!("{gate_ty} and {down_ty}, {}", ["up to eight rows", "wide"][wide]);
+            assert!(worst[wide][0] < *experts, "{what}: experts {:.2e}", worst[wide][0]);
+            assert!(worst[wide][1] < *residual, "{what}: residual {:.2e}", worst[wide][1]);
+        }
+        assert!(compared * 100 >= rows * 97, "{compared} of {rows} rows could be compared");
+    }
+}
+
+/// The bounds of one row's expert output and of its residual against the reference's
+/// (relative RMS). In steps of up to eight rows the decode kernels round the activations and
+/// the hidden values to 8 bits: 1.4e-2 to 2.8e-2 and 3.4e-3 to 6.0e-3 over the 28 pairs of
+/// types on both cards (2026-11-12). In wider steps the many-row kernels round both to f16
+/// and the dense products before them read f16 operands: 5.7e-3 to 1.6e-2 and 2.2e-3 to
+/// 3.6e-3.
+const EXPERT_ROW_8BIT: (f64, f64) = (8e-2, 2e-2);
+const EXPERT_ROW_F16: (f64, f64) = (4e-2, 1e-2);
+
+#[test]
+fn experts_of_every_weight_type_match_the_reference_1() {
+    expert_types_match_the_reference(0);
+}
+
+#[test]
+fn experts_of_every_weight_type_match_the_reference_2() {
+    expert_types_match_the_reference(1);
+}
+
+#[test]
+fn experts_of_every_weight_type_match_the_reference_3() {
+    expert_types_match_the_reference(2);
+}
+
+#[test]
+fn experts_of_every_weight_type_match_the_reference_4() {
+    expert_types_match_the_reference(3);
+}
+
+/// An expert of any weight type that is in no slot is computed on the CPU with the result
+/// the device gives, within the bound of the types of the real file
+/// (`experts_computed_on_the_cpu_change_nothing`).
+fn expert_types_on_the_cpu_change_nothing(part: usize) {
+    let Some(devices) = devices() else { return };
+    for (gate_ty, down_ty) in type_pairs().into_iter().skip(7 * part).take(7) {
+        let [experts, core, residual] =
+            layers_with_misses_of(&devices, Serve::Cpu, gate_ty, down_ty);
+        assert_eq!(core, 0.0, "{gate_ty} and {down_ty}");
+        assert!(experts < 1e-2, "{gate_ty} and {down_ty}: experts {experts:.2e}");
+        assert!(residual < 1e-2, "{gate_ty} and {down_ty}: residual {residual:.2e}");
+    }
+}
+
+#[test]
+fn experts_of_every_weight_type_on_the_cpu_change_nothing_1() {
+    expert_types_on_the_cpu_change_nothing(0);
+}
+
+#[test]
+fn experts_of_every_weight_type_on_the_cpu_change_nothing_2() {
+    expert_types_on_the_cpu_change_nothing(1);
+}
+
+#[test]
+fn experts_of_every_weight_type_on_the_cpu_change_nothing_3() {
+    expert_types_on_the_cpu_change_nothing(2);
+}
+
+#[test]
+fn experts_of_every_weight_type_on_the_cpu_change_nothing_4() {
+    expert_types_on_the_cpu_change_nothing(3);
 }
 
 /// The profile adds up the device time of timed steps by kind, and steps

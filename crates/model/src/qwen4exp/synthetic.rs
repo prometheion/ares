@@ -232,17 +232,17 @@ impl Synthetic {
         file.build()
     }
 
-    /// The bytes of the GGUF file with the routed experts in types that
-    /// [`ares_quant::quantize`] cannot write: gate and up as `gate_ty`
-    /// (IQ2_S, IQ2_XXS or IQ1_M), down as `down_ty` (Q2_0), the types the
-    /// expert kernels of the devices compute. Their blocks are valid blocks
-    /// of made-up content, not the encoding of any float matrix: what they
-    /// decode to is the model. Everything else is as in [`Synthetic::bytes`].
+    /// The bytes of the GGUF file with the routed experts in any weight type: gate and up
+    /// as `gate_ty`, down as `down_ty`. A type the writer has an encoder for (the float
+    /// types, IQ4_NL and what [`ares_quant::quantize`] writes: Q4_0, Q4_1, Q5_0, Q5_1, Q8_0)
+    /// holds the encoding of the experts' values. Every other type holds valid blocks of
+    /// made-up content, not the encoding of any float matrix: what they decode to is the
+    /// model. Everything else is as in [`Synthetic::bytes`].
     ///
     /// # Panics
     ///
-    /// Panics when a type cannot hold the rows of this shape or is not one
-    /// of those named above.
+    /// Panics when a type cannot hold the rows of this shape (gate and up have rows of
+    /// `n_embd` values, down of `expert_ff`) or holds no weights.
     pub fn bytes_with_experts(&self, gate_ty: GgmlType, down_ty: GgmlType) -> Vec<u8> {
         let mut file = File::default();
         self.metadata(&mut file);
@@ -369,9 +369,9 @@ impl Synthetic {
             matrix(file, &name("ffn_gate_inp.weight"), &[n, s.n_expert], 6.0, f32t);
             let stack = |file: &mut File, what: &str, dims: &[usize], gain: f32, which: usize| {
                 let name = name(what);
-                match experts {
-                    Some(types) => {
-                        let ty = [types.0, types.1][which];
+                match experts.map(|types| [types.0, types.1][which]) {
+                    Some(ty) if has_encoder(ty) => matrix(file, &name, dims, gain, ty),
+                    Some(ty) => {
                         let rms = gain / (dims[0] as f32).sqrt();
                         let data = self.made_up_blocks(&name, ty, dims, rms);
                         file.raw_tensor(&name, dims, ty, data);
@@ -457,14 +457,10 @@ impl Synthetic {
 
     /// Valid blocks of `ty` for a tensor of `dims` whose rows have `dims[0]`
     /// values: every byte is drawn from the seed and the tensor's name, and
-    /// the block scale is then set so that the decoded values have about the
-    /// RMS `rms`. For the types of the routed experts, in which any bytes
-    /// are a block once the scale is finite.
+    /// the scales of a block are then set so that the decoded values have about the
+    /// RMS `rms` ([`set_scale`]). For the quantized types, in which any bytes are a
+    /// block once the scales are finite.
     fn made_up_blocks(&self, name: &str, ty: GgmlType, dims: &[usize], rms: f32) -> Vec<u8> {
-        assert!(
-            matches!(ty, GgmlType::IQ2_S | GgmlType::IQ2_XXS | GgmlType::IQ1_M | GgmlType::Q2_0),
-            "no made-up blocks of {ty}"
-        );
         let (values, block) = (ty.block_values() as usize, ty.block_bytes() as usize);
         assert!(dims[0].is_multiple_of(values), "{ty} cannot hold rows of {} values", dims[0]);
         let n_blocks = dims.iter().product::<usize>() / values;
@@ -481,25 +477,10 @@ impl Synthetic {
             z ^ (z >> 31)
         };
         let mut data: Vec<u8> = (0..n_blocks * block).map(|_| (next() >> 32) as u8).collect();
-        // The scale of a block is an f16: at its start, or for IQ1_M spread
-        // over the top nibbles of the four 16-bit words at byte 48.
-        let set_scale = |blk: &mut [u8], scale: f32| {
-            let d = ares_quant::f32_to_f16(scale);
-            if ty == GgmlType::IQ1_M {
-                for i in 0..4 {
-                    let at = 48 + 2 * i;
-                    let word = u16::from_le_bytes([blk[at], blk[at + 1]]);
-                    let word = (word & 0x0fff) | (((d >> (4 * i)) & 0xf) << 12);
-                    blk[at..at + 2].copy_from_slice(&word.to_le_bytes());
-                }
-            } else {
-                blk[0..2].copy_from_slice(&d.to_le_bytes());
-            }
-        };
         // What the bytes decode to with a scale of one, over the first blocks.
         let sample = n_blocks.min(64);
         for blk in data.chunks_exact_mut(block).take(sample) {
-            set_scale(blk, 1.0);
+            set_scale(ty, blk, 1.0);
         }
         let mut decoded = vec![0.0f32; sample * values];
         ares_quant::dequantize(ty, &data[..sample * block], &mut decoded)
@@ -510,7 +491,7 @@ impl Synthetic {
         for blk in data.chunks_exact_mut(block) {
             // Between 0.75 and 1.25 times the scale that gives `rms`.
             let jitter = 0.75 + (next() >> 40) as f32 / 16_777_216.0 * 0.5;
-            set_scale(blk, rms / unit * jitter);
+            set_scale(ty, blk, rms / unit * jitter);
         }
         data
     }
@@ -540,6 +521,63 @@ impl Synthetic {
                 mean + sum * 3.0f32.sqrt() * scale
             })
             .collect()
+    }
+}
+
+/// Whether the writer encodes values as `ty` ([`File::tensor`]); of the other weight types
+/// it makes blocks of made-up content.
+fn has_encoder(ty: GgmlType) -> bool {
+    use GgmlType::{BF16, F16, F32, IQ4_NL, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0};
+    matches!(ty, F32 | F16 | BF16 | IQ4_NL | Q4_0 | Q4_1 | Q5_0 | Q5_1 | Q8_0)
+}
+
+/// Sets every scale of a block of `ty` to `scale`, or to the nearest value its encoding
+/// has: the decoded values of a block are proportional to it. Most types keep their scales
+/// as f16 fields (a scale and a minimum for the types that have both); IQ1_M spreads one
+/// over the top nibbles of four 16-bit words, MXFP4 has an exponent byte (a power of two)
+/// and NVFP4 four bytes of four exponent and three mantissa bits.
+///
+/// # Panics
+///
+/// Panics for a type that has no blocks with scales (the float types) or holds no weights.
+fn set_scale(ty: GgmlType, blk: &mut [u8], scale: f32) {
+    use GgmlType::*;
+    let fields: &[usize] = match ty {
+        Q4_K | Q5_K | Q4_1 | Q5_1 => &[0, 2],
+        Q2_K => &[80, 82],
+        Q6_K => &[208],
+        Q3_K => &[108],
+        TQ1_0 => &[52],
+        TQ2_0 => &[64],
+        Q4_0 | Q5_0 | Q8_0 | Q1_0 | Q2_0 => &[0],
+        IQ4_XS | IQ4_NL | IQ3_S | IQ3_XXS | IQ2_S | IQ2_XS | IQ2_XXS | IQ1_S => &[0],
+        IQ1_M | MXFP4 | NVFP4 => &[],
+        other => panic!("no made-up blocks of {other}"),
+    };
+    let d = ares_quant::f32_to_f16(scale);
+    for &at in fields {
+        blk[at..at + 2].copy_from_slice(&d.to_le_bytes());
+    }
+    match ty {
+        IQ1_M => {
+            for i in 0..4 {
+                let at = 48 + 2 * i;
+                let word = u16::from_le_bytes([blk[at], blk[at + 1]]);
+                let word = (word & 0x0fff) | (((d >> (4 * i)) & 0xf) << 12);
+                blk[at..at + 2].copy_from_slice(&word.to_le_bytes());
+            }
+        }
+        // The scale is 2^(e - 128).
+        MXFP4 => blk[0] = (128.0 + scale.log2().round()).clamp(1.0, 254.0) as u8,
+        // The scale is (1 + m / 8) 2^(e - 8), e from 1 to 15 (0 is the subnormals; e 15
+        // with m 7 is the code of a NaN).
+        NVFP4 => {
+            let exp = scale.log2().floor().clamp(-7.0, 7.0);
+            let man = ((scale / exp.exp2() - 1.0) * 8.0).round().clamp(0.0, 7.0) as u8;
+            let code = (((exp + 8.0) as u8) << 3) | man;
+            blk[..4].fill(code.min(0x7e));
+        }
+        _ => {}
     }
 }
 

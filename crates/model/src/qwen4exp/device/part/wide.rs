@@ -115,6 +115,11 @@ impl State {
                 device.info().name
             )));
         }
+        for layer in &w.layers {
+            layer.moe.shape.check_rows().map_err(|e| {
+                invalid(format!("steps of {} rows, layer {}: {e}", opts.max_rows, layer.layer))
+            })?;
+        }
         let types = dense_types(w);
         // One form of activations for every dense matrix, so that each fused kernel writes
         // one: the form the options' precision gives all of them, else the exact one, which

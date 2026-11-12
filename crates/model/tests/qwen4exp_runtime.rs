@@ -81,8 +81,21 @@ fn model(seed: u64) -> Synthetic {
 }
 
 fn gguf_path(seed: u64) -> PathBuf {
-    let path = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("q4rt-{seed}.gguf"));
-    std::fs::write(&path, model(seed).bytes_with_experts(GgmlType::IQ2_S, GgmlType::Q2_0))
+    gguf_path_of(seed, GgmlType::IQ2_S, GgmlType::Q2_0)
+}
+
+/// The file of the made-up model with gate and up of the experts as `gate_ty` and down as
+/// `down_ty` (an inner width of 64, or of the type's block where that is larger).
+fn gguf_path_of(seed: u64, gate_ty: GgmlType, down_ty: GgmlType) -> PathBuf {
+    let mut synthetic = model(seed);
+    synthetic.shape.expert_ff = (down_ty.block_values() as usize).max(64);
+    let name = if (gate_ty, down_ty) == (GgmlType::IQ2_S, GgmlType::Q2_0) {
+        format!("q4rt-{seed}.gguf")
+    } else {
+        format!("q4rt-{seed}-{gate_ty}-{down_ty}.gguf")
+    };
+    let path = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
+    std::fs::write(&path, synthetic.bytes_with_experts(gate_ty, down_ty))
         .expect("the test directory is writable");
     path
 }
@@ -270,8 +283,19 @@ fn start_rows(
     config: RuntimeConfig,
     rows: u32,
 ) -> (Runtime, Arc<Qwen4Exp>) {
+    start_at(&gguf_path(seed), placement, pages, config, rows)
+}
+
+/// [`start_rows`] for the model file at `path`.
+fn start_at(
+    path: &std::path::Path,
+    placement: Placement,
+    pages: u32,
+    config: RuntimeConfig,
+    rows: u32,
+) -> (Runtime, Arc<Qwen4Exp>) {
     let devices = open_devices(placement);
-    let gguf = Gguf::open(gguf_path(seed)).unwrap();
+    let gguf = Gguf::open(path).unwrap();
     let n_layer = Config::from_gguf(&gguf).unwrap().n_layer;
     let opts = options(placement, n_layer, pages, MAX_ROWS, rows);
     let inner =
@@ -447,7 +471,12 @@ fn session_answer(seed: u64, placement: Placement, prompt: &[u32], n: usize) -> 
 
 /// The greedy tokens the CPU reference writes after `prompt`.
 fn reference_answer(seed: u64, prompt: &[u32], n: usize) -> Vec<u32> {
-    let gguf = Gguf::open(gguf_path(seed)).unwrap();
+    reference_answer_at(&gguf_path(seed), prompt, n)
+}
+
+/// [`reference_answer`] for the model file at `path`.
+fn reference_answer_at(path: &std::path::Path, prompt: &[u32], n: usize) -> Vec<u32> {
+    let gguf = Gguf::open(path).unwrap();
     let c = Config::from_gguf(&gguf).unwrap();
     let w = Weights::load(&gguf, &c).unwrap();
     let reference = Reference::new(&c, &w);
@@ -592,6 +621,46 @@ fn a_prompt_read_in_wide_steps_gives_the_reference_answer() {
         assert!(wide.layers > 0, "{placement:?}: the prompt ran in no wide step");
         assert!(wide.missing > 0, "{placement:?}: no expert was fetched");
         assert!(leading(&got, &reference) >= 2, "{placement:?}: {got:?} against {reference:?}");
+    }
+}
+
+/// Models whose experts are stored in other weight types than the real file's, through the
+/// runtime in every placement: a prompt read in wide steps (the many-row kernels of the
+/// types, with experts fetched) and the tokens after it (the decode kernels), against the
+/// CPU reference of the model.
+#[test]
+fn models_of_other_expert_types_answer_as_the_reference_in_every_placement() {
+    if !enabled() {
+        return;
+    }
+    let prompt = prompt(200, 5);
+    for (gate_ty, down_ty) in [
+        (GgmlType::Q4_K, GgmlType::Q8_0),
+        (GgmlType::BF16, GgmlType::Q4_0),
+        (GgmlType::IQ3_S, GgmlType::IQ4_XS),
+        (GgmlType::Q5_1, GgmlType::TQ2_0),
+    ] {
+        let path = gguf_path_of(1, gate_ty, down_ty);
+        let reference = reference_answer_at(&path, &prompt, 16);
+        for placement in placements() {
+            let (runtime, model) =
+                start_at(&path, placement, 16, RuntimeConfig::default(), WIDE_ROWS);
+            let got = ask(&runtime, 1, &prompt, 16);
+            let wide = model.wide_stats().expect("the parts are open");
+            runtime.shutdown();
+            let leading = got.iter().zip(&reference).take_while(|(x, y)| x == y).count();
+            eprintln!(
+                "TYPES {gate_ty} and {down_ty}, {placement:?}: {leading} tokens as the \
+                 reference's before the first difference; {} layers of wide steps picked {} \
+                 experts, {} without a slot",
+                wide.layers, wide.picked, wide.missing
+            );
+            assert!(wide.layers > 0, "{placement:?}: the prompt ran in no wide step");
+            assert!(
+                leading >= 2,
+                "{gate_ty} and {down_ty}, {placement:?}: {got:?} against {reference:?}"
+            );
+        }
     }
 }
 
