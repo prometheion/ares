@@ -655,3 +655,23 @@ fn a_cached_page_is_converted_to_make_room_and_keeps_its_text() {
         assert_eq!(rig.pages.slots().1, 0, "{label}: nothing is left");
     }
 }
+
+#[test]
+fn the_table_of_a_new_group_is_zero_on_the_device_whatever_the_memory_held() {
+    let Some(devices) = gpus() else { return };
+    for device in devices {
+        // Memory that held something when it was freed, of the sizes the
+        // group's table takes.
+        for _ in 0..4 {
+            let dirty = DeviceBuffer::new(device, 96 * 4).unwrap();
+            dirty.write(0, &[0xAB; 96 * 4]).unwrap();
+        }
+        let rig = Rig::new(device, KvFormat::Q4, KvFormat::Q4, 256, 6, 16, 4);
+        let table = download(rig.pages.own_table().expect("a table of its own"));
+        assert!(
+            table.iter().all(|b| *b == 0),
+            "{}: the table starts as its mirror does",
+            device.info().name
+        );
+    }
+}

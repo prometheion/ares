@@ -26,7 +26,9 @@ use ares_api::Engine;
 use ares_core::units::{Bytes, MIB};
 use ares_cuda::{Device, DeviceInfo, Wait};
 use ares_gguf::Gguf;
-use ares_model::qwen35::device::{Options, Placement, Qwen35, Spread, exact_bytes, page_bytes};
+use ares_model::qwen35::device::{
+    Options, Placement, Qwen35, Spread, exact_bytes, page_bytes, step_rows,
+};
 use ares_model::qwen35::weights::{Matrix, Mixer};
 use ares_model::qwen35::{Config, Weights};
 use ares_runtime::{GpuConfig, Model, Runtime, RuntimeConfig, Split, required_ram};
@@ -628,6 +630,9 @@ fn load_qwen35(gguf: Gguf, options: &LoadOptions, begun: Instant) -> Result<Load
     let part_options = Options {
         precision: options.precision,
         kv,
+        // The rows of a step that the file's types pay for: a file whose
+        // matrices have no tensor-core kernel wastes the scratch of wide steps.
+        max_rows: step_rows(&weights, options.precision),
         logit_rows: window_rows.max(parallel),
         window_rows,
         draft_vocabulary: vocabulary.clone(),

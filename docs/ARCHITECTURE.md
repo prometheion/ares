@@ -876,9 +876,16 @@ top-k 20, top-p 0.95), against 40.5 without drafts and 62 to 67 for the fork
 with its production flags on the same questions. A link of the chain costs
 1.46 ms (it reads 335 MiB of the block and 278 MiB of the head), a step 34 ms
 for 2.5 to 2.9 tokens; the first draft is accepted in 74 to 83 % of the
-steps. The block takes 335 MiB of weights and 2.1 MiB of K and V per 1000
-tokens on its device, and nothing for its head, which is rows of the output
-head. With exact products the text with drafts equals the text without, for
+steps. The block takes 335 MiB of weights and, with its K and V in `q4` (the only format
+it has: 11 000 drafts each with the block's K and V in `q8` and in `q4` were
+accepted at the same rate, 67.4 % against 67.1 % for the first draft of a
+window and 64.7 % against 65.8 % for the second, greedy, and 70.3 % against
+70.3 % and 64.5 % against 66.6 % sampled, `z` below 1.3, and 74.5 / 76.1
+against 74.8 / 76.8 tokens per second), 1.1 MiB per 1000 tokens on its device
+where `q8` took 2.1 (the same on the `Q4_K_S` file over both cards, 3000
+drafts each: first draft 69.9 % against 67.8 % greedy and 63.2 % against 64.9 %
+sampled), and nothing for its head, which is rows of the output head. With
+exact products the text with drafts equals the text without, for
 the most probable token and for sampled tokens with the same seed
 (`tests/qwen35_mtp_runtime.rs`, and over HTTP by the hash of the reply's tokens,
 `ares-server`'s `tests/real.rs` on the 27B and both cards). With the fast

@@ -129,7 +129,11 @@ impl Pages {
         let own = if own_table {
             let bytes = (entries as u64 * 4).max(16);
             ledger.reserve(format!("qwen35 {what}: page table"), bytes)?;
-            Some(DeviceBuffer::new(device, bytes)?)
+            let table = DeviceBuffer::new(device, bytes)?;
+            // The mirror of the table starts as zeros, and so must the table: a
+            // step writes only the entries that differ from the mirror.
+            table.write(0, &vec![0u8; bytes as usize])?;
+            Some(table)
         } else {
             None
         };
@@ -173,9 +177,14 @@ impl Pages {
     }
 
     /// The exact pool, for tests that read it.
-    #[cfg(test)]
     pub(super) fn exact_buffer(&self) -> Option<&DeviceBuffer> {
         self.exact.as_ref()
+    }
+
+    /// The group's own page table, for tests that read it.
+    #[cfg(test)]
+    pub(super) fn own_table(&self) -> Option<&DeviceBuffer> {
+        self.own.as_ref()
     }
 
     /// Exact slots in the pool, and in use.

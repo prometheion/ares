@@ -3,16 +3,18 @@
 //!
 //! ```text
 //! qwen35_run <model.gguf> [--split single|tensor|layer] [--shares 0.625,0.375]
-//!     [--devices 0,1] [--precision fast|exact] [--max-rows 512] [--context 4096]
+//!     [--devices 0,1] [--precision fast|exact] [--max-rows N] [--context 4096]
 //!     [--chat] [--generate 48] [--capture DIR]... [--decode-at 1000,32000]
 //!     [--decode-steps 64] [--prefill 2048] [--text FILE] [--state f32|f16]
 //!     [--pipeline-rows 256] [--no-profile] [--balance FILE] [--balance-out FILE]
 //!     [--step-rows N] [--layouts measured|file|device] [--prompt-weight 1]
-//!     [--show-layouts] [--kv q8,q8] [--draft-kv q8,q8]
+//!     [--show-layouts] [--kv q8,q8]
 //! ```
 //!
+//! - `--max-rows N`: the rows of a step (and so the scratch); by default what
+//!   the file's types pay for (`step_rows`).
 //! - `--kv K,V`: the formats of K and of V of the attention blocks (`f16`, `q8`
-//!   to `q4`; the default is `q8,q8`), `--draft-kv` those of the draft block.
+//!   to `q4`; the default is `q8,q8`); the draft block's are always `q4`.
 //!   With `q7` to `q4` a second, small pool of exact entries holds the first
 //!   tile of a sequence and its newest cells.
 //! - `--chat`: a German and an English question through the chat template,
@@ -69,11 +71,11 @@ use std::time::{Duration, Instant};
 
 use ares_cuda::{CacheFormat, Device, Precision, StateFormat, Wait};
 use ares_gguf::Gguf;
-use ares_model::qwen35::Config;
 use ares_model::qwen35::device::placement::{HalfShares, Placement};
 use ares_model::qwen35::device::{
-    Layouts, Options, PHASES, PartReport, Profile, Qwen35, Rows, Session, Spread, Wanted,
+    Layouts, Options, PHASES, PartReport, Profile, Qwen35, Rows, Session, Spread, Wanted, step_rows,
 };
+use ares_model::qwen35::{Config, Weights};
 use ares_runtime::Pick;
 use ares_tokenizer::{ChatOptions, EncodeOptions, Message};
 
@@ -132,8 +134,7 @@ struct Args {
     precision: Precision,
     state: StateFormat,
     kv: (CacheFormat, CacheFormat),
-    draft_kv: (CacheFormat, CacheFormat),
-    max_rows: u32,
+    max_rows: Option<u32>,
     context: u32,
     chat: bool,
     generate: usize,
@@ -159,6 +160,18 @@ struct Args {
     show_layouts: bool,
 }
 
+impl Args {
+    /// The rows of a step: the one asked for, or what the file's types pay for.
+    fn rows(&self) -> u32 {
+        self.max_rows.unwrap_or_else(|| {
+            let gguf = Gguf::open(&self.model).expect("the model file");
+            let config = Config::from_gguf(&gguf).expect("the configuration");
+            let weights = Weights::load(&gguf, &config).expect("the weights");
+            step_rows(&weights, self.precision)
+        })
+    }
+}
+
 fn parse() -> Args {
     let mut args = Args {
         model: PathBuf::new(),
@@ -168,8 +181,7 @@ fn parse() -> Args {
         precision: Precision::Fast,
         state: StateFormat::F32,
         kv: (CacheFormat::Q8, CacheFormat::Q8),
-        draft_kv: Options::default().draft_kv,
-        max_rows: 512,
+        max_rows: None,
         context: 4096,
         chat: false,
         generate: 48,
@@ -219,8 +231,7 @@ fn parse() -> Args {
                 }
             }
             "--kv" => args.kv = formats(&value()),
-            "--draft-kv" => args.draft_kv = formats(&value()),
-            "--max-rows" => args.max_rows = value().parse().expect("rows"),
+            "--max-rows" => args.max_rows = Some(value().parse().expect("rows")),
             "--context" => args.context = value().parse().expect("cells"),
             "--chat" => args.chat = true,
             "--generate" => args.generate = value().parse().expect("tokens"),
@@ -540,8 +551,7 @@ fn main() {
         layouts: args.layouts,
         state: args.state,
         kv: args.kv,
-        draft_kv: args.draft_kv,
-        max_rows: args.max_rows,
+        max_rows: args.rows(),
         logit_rows,
         window_rows: 0,
         pipeline_rows: args.pipeline_rows,
@@ -567,7 +577,7 @@ fn main() {
         model.placement().split,
         devices.len(),
         args.precision,
-        args.max_rows,
+        args.rows(),
         args.context
     );
     for (report, (device, before)) in model.reports().iter().zip(devices.iter().zip(&free_before)) {
@@ -592,7 +602,7 @@ fn main() {
         print_layouts(report, args.show_layouts);
     }
     let tokenizer = model.tokenizer();
-    let chunk = args.step_rows.unwrap_or(args.max_rows as usize).min(args.max_rows as usize);
+    let chunk = args.step_rows.unwrap_or(args.rows() as usize).min(args.rows() as usize);
 
     if args.chat {
         let questions = [
@@ -801,8 +811,7 @@ fn engine(args: &Args, spread: &Spread, window: u32) {
         layouts: args.layouts,
         state: args.state,
         kv: args.kv,
-        draft_kv: args.draft_kv,
-        max_rows: args.max_rows,
+        max_rows: args.rows(),
         logit_rows: (2 * window).max(16),
         window_rows: if window > 1 { 2 * window } else { 0 },
         draft_vocabulary: vocabulary,
@@ -1087,8 +1096,7 @@ fn conversation(args: &Args, spread: &Spread, history: usize) {
         layouts: args.layouts,
         state: args.state,
         kv: args.kv,
-        draft_kv: args.draft_kv,
-        max_rows: args.max_rows,
+        max_rows: args.rows(),
         logit_rows: (2 * args.window).max(16),
         window_rows: if args.window > 1 { 2 * args.window } else { 0 },
         pipeline_rows: args.pipeline_rows,

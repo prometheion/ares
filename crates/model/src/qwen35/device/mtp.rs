@@ -42,7 +42,8 @@ use ares_sampler::{SamplePick, SampleRow};
 use super::super::load::{DeviceWeights, DraftW, MixerW};
 use super::kv;
 use super::{
-    AttentionAt, Options, Part, Phase, Prepared, StepEnv, TAILS_PER_SLOT, geometry, invalid,
+    AttentionAt, DRAFT_KV, Options, Part, Phase, Prepared, StepEnv, TAILS_PER_SLOT, geometry,
+    invalid,
 };
 use crate::qwen35::Config;
 
@@ -146,7 +147,6 @@ pub(super) struct DraftSizes {
 pub(super) fn sizes(
     c: &Config,
     w: &DeviceWeights,
-    opts: &Options,
     max_slots: u32,
     pages: u32,
     target_blocks: u32,
@@ -154,7 +154,7 @@ pub(super) fn sizes(
 ) -> Option<DraftSizes> {
     let draft = w.draft.as_ref()?;
     let MixerW::Attention(a) = &draft.block.mixer else { return None };
-    let geo = geometry(c, opts.draft_kv, a.n_kv);
+    let geo = geometry(c, DRAFT_KV, a.n_kv);
     let rows = max_slots;
     let widest = draft.block.ffn.as_ref().map_or(0, |f| f.gate.n_out).max(a.out.n_in).max(a.q.n_in);
     let slots = 20 * u64::from(target_blocks) / u64::from(a.n_kv) + 64;
@@ -322,14 +322,14 @@ impl Mtp {
         scratch.write(s.sampler, &vec![0u8; SamplerKernels::scratch_bytes(max_slots) as usize])?;
         let sizing =
             kv::Sizing { slots: max_slots, rows: opts.max_rows, tails: max_slots * TAILS_PER_SLOT };
-        let exact_slots = kv::slots_for(opts.draft_kv.0, opts.draft_kv.1, sizing);
+        let exact_slots = kv::slots_for(DRAFT_KV.0, DRAFT_KV.1, sizing);
         let pages_kv = kv::Pages::new(
             device,
             ledger,
             "draft block",
             &[sizes.at.geo],
             exact_slots,
-            kv::newest_cells(opts.draft_kv.0, opts.draft_kv.1),
+            kv::newest_cells(DRAFT_KV.0, DRAFT_KV.1),
             pages,
             max_slots,
             table_stride,
@@ -498,6 +498,12 @@ impl Part {
         (m.drafted > 0).then(|| Drafted { ptr: m.at(m.s.drafts), tokens: m.drafted })
     }
 
+    /// The block's exact K/V entries (its cells are in them while their tile is
+    /// exact: see [`DRAFT_KV`]), for tests that read the cells it wrote.
+    pub fn draft_exact_entries(&self) -> Option<&DeviceBuffer> {
+        self.mtp.as_ref().and_then(|m| m.kv.exact_buffer())
+    }
+
     /// The row of the carry that `slot`'s next chain starts from (the final
     /// hidden state of its last row) and its bytes: what a checkpoint keeps
     /// of the block. `None` on a device without the block.
@@ -639,11 +645,15 @@ impl Part {
     }
 
     /// For tests of the block alone: what [`Part::enqueue`] does for the
-    /// draft block before the model's blocks.
+    /// draft block before the model's blocks, with the preparation of the
+    /// step's K/V entries that comes first there.
     pub fn enqueue_drafts(&mut self, env: &StepEnv<'_>) -> Result<(), ModelError> {
         if self.mtp.is_none() {
             return Err(invalid("no draft block"));
         }
+        // The exact entries and the table of the block's layer are made ready
+        // for the step, as `Part::enqueue` does in its first stage.
+        self.prepare_kv(env)?;
         self.draft_before(env)
     }
 

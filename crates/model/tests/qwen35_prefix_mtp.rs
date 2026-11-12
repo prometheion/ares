@@ -191,9 +191,16 @@ impl Rig {
         bytes
     }
 
+    /// The block's cells: the converted entries of the pages, and the exact
+    /// entries its tiles are in while they are exact.
     fn pool(&self) -> Vec<u8> {
         let mut bytes = vec![0u8; self.pages.len() as usize];
         self.pages.read(0, &mut bytes).unwrap();
+        if let Some(exact) = self.part.draft_exact_entries() {
+            let mut more = vec![0u8; exact.len() as usize];
+            exact.read(0, &mut more).unwrap();
+            bytes.extend(more);
+        }
         bytes
     }
 

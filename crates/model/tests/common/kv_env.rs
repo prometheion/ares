@@ -1,10 +1,10 @@
 //! The K/V formats a GPU test runs with. By default those of
-//! `Options::default()`; `ARES_TEST_KV=k,v` (or one name for both) and
-//! `ARES_TEST_DRAFT_KV` change them, so that the same tests can be run with
-//! the formats that keep exact cells (`q7` to `q4`):
+//! `Options::default()`; `ARES_TEST_KV=k,v` (or one name for both) changes them,
+//! so that the same tests can be run with the formats that keep exact cells
+//! (`q7` to `q4`):
 //!
 //! ```sh
-//! ARES_TEST_KV=q5,q4 ARES_TEST_DRAFT_KV=q4 ARES_TEST_CUDA=1 cargo test --release ...
+//! ARES_TEST_KV=q5,q4 ARES_TEST_CUDA=1 cargo test --release ...
 //! ```
 
 #![allow(dead_code)]
@@ -30,9 +30,5 @@ fn pair(var: &str, default: (CacheFormat, CacheFormat)) -> (CacheFormat, CacheFo
 
 /// `options` with the formats of the environment.
 pub fn with_env(options: Options) -> Options {
-    Options {
-        kv: pair("ARES_TEST_KV", options.kv),
-        draft_kv: pair("ARES_TEST_DRAFT_KV", options.draft_kv),
-        ..options
-    }
+    Options { kv: pair("ARES_TEST_KV", options.kv), ..options }
 }

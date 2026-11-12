@@ -44,6 +44,16 @@ pub use resume::{CopyTimes, checkpoint_bytes, state_slot_bytes};
 /// only pool the formats without a tile mean use).
 pub const PAGE_ENTRY: u32 = 1 << 31;
 
+/// The formats of K and of V of the draft block: 4 bits, whatever the model's.
+/// The block's keys and values are read to propose a token that the model then
+/// verifies, and they cost the same VRAM per cell as any layer's. With them in
+/// `q4` against `q8` the share of drafts the model accepts is the same: the
+/// first draft 67.1 % against 67.4 % and 70.3 % against 70.3 % (greedy and
+/// sampled), the second 65.8 % against 64.7 % and 66.6 % against 64.5 %, over
+/// 11 000 drafts each (Qwen3.8-27B, German, English and code); the differences
+/// are inside the noise (`z` below 1.3).
+pub const DRAFT_KV: (CacheFormat, CacheFormat) = (CacheFormat::Q4, CacheFormat::Q4);
+
 /// The partly used pages (tails) per sequence slot that the prefix cache may
 /// hold. A tail keeps an exact entry for as long as it exists, so the exact
 /// pool is sized for them: one per slot serves a conversation that goes on from
@@ -72,8 +82,6 @@ pub struct Options {
     /// entries and converts tiles as they leave the newest cells
     /// ([`PAGE_ENTRY`] names the converted entry of a page).
     pub kv: (CacheFormat, CacheFormat),
-    /// The formats of K and of V of the draft block.
-    pub draft_kv: (CacheFormat, CacheFormat),
     /// The most rows of a step: decides the scratch.
     pub max_rows: u32,
     /// The most rows of a step whose logits are wanted.
@@ -113,7 +121,6 @@ impl Default for Options {
             layouts: Layouts::default(),
             state: StateFormat::F32,
             kv: (CacheFormat::Q8, CacheFormat::Q8),
-            draft_kv: (CacheFormat::Q8, CacheFormat::Q8),
             max_rows: 512,
             logit_rows: 8,
             window_rows: 0,
@@ -308,6 +315,10 @@ struct Scratch {
     p: u64,
     w1: u64,
     w2: u64,
+    /// The gate and the up projection of the feed-forward part, which lie
+    /// where the mixers' `w1` to `o` do: the two never are in use at once.
+    gate: u64,
+    up: u64,
     alpha: u64,
     beta: u64,
     q: u64,
@@ -505,7 +516,7 @@ pub fn page_bytes(c: &Config, placement: &Placement, index: usize, opts: &Option
         .sum::<u64>()
         // The draft block's keys and values, on the device that holds it.
         + placement.draft.as_ref().filter(|d| d.device == index).map_or(0, |_| {
-            geometry(c, opts.draft_kv, c.attention.n_head_kv as u32).converted_entry_bytes()
+            geometry(c, DRAFT_KV, c.attention.n_head_kv as u32).converted_entry_bytes()
         })
 }
 
@@ -534,11 +545,11 @@ pub fn exact_bytes(
         .draft
         .as_ref()
         .filter(|d| d.device == index)
-        .map(|_| geometry(c, opts.draft_kv, c.attention.n_head_kv as u32))
+        .map(|_| geometry(c, DRAFT_KV, c.attention.n_head_kv as u32))
         .into_iter()
         .collect();
     kv::exact_pool_bytes(&main, kv::slots_for(opts.kv.0, opts.kv.1, sizing))
-        + kv::exact_pool_bytes(&draft, kv::slots_for(opts.draft_kv.0, opts.draft_kv.1, sizing))
+        + kv::exact_pool_bytes(&draft, kv::slots_for(DRAFT_KV.0, DRAFT_KV.1, sizing))
 }
 
 fn geometry(c: &Config, kv: (CacheFormat, CacheFormat), kv_heads: u32) -> CacheGeometry {
@@ -707,8 +718,7 @@ impl Part {
         )?;
         // The draft block: its pool after the blocks', and room in the step's
         // buffers for the rows it computes there (`mtp.rs`).
-        let draft_sizes =
-            mtp::sizes(c, &w, opts, max_slots, pages, plan_config.target_blocks, pool);
+        let draft_sizes = mtp::sizes(c, &w, max_slots, pages, plan_config.target_blocks, pool);
         let without_draft = (hq, hkv, state_slots);
         if let Some(sizes) = &draft_sizes {
             pool += sizes.pool;
@@ -730,18 +740,35 @@ impl Part {
         s.x = take(rows * d * 4);
         s.xn = take(rows * d * 4);
         s.p = take(rows * d * 4);
-        s.w1 = take(rows * cd.max(2 * hq).max(f) * 4);
-        s.w2 = take(rows * vd.max(hkv).max(f) * 4);
+        // The buffers of a mixer (the projections, the queries and keys, the
+        // output) and the two of the feed-forward part (gate and up) are in use
+        // in turn, so they share one region: the larger of the two sets. A head
+        // in parts also computes in it, after the last block.
+        let logit_rows = u64::from(opts.logit_rows);
+        let head_rows = w.head.as_ref().map_or(0, |h| u64::from(h.n_out));
+        let in_parts = w.head.as_ref().is_some_and(|h| h.parts.len() > 1);
+        let widths = [cd.max(2 * hq), vd.max(hkv), kd.max(hq), (kd + vd).max(hq), vd.max(hq)];
+        let place = |width: u64| (rows * width * 4).next_multiple_of(64);
+        let mixer: u64 = widths.iter().map(|w| place(*w)).sum();
+        let region = take(mixer.max(2 * place(f)).max(if in_parts {
+            logit_rows * head_rows * 4
+        } else {
+            0
+        }));
+        s.w1 = region;
+        s.w2 = s.w1 + place(widths[0]);
+        s.q = s.w2 + place(widths[1]);
+        s.kv = s.q + place(widths[2]);
+        s.o = s.kv + place(widths[3]);
+        s.gate = region;
+        s.up = region + place(f);
+        s.logit_parts = region;
         s.alpha = take(rows * nv * 4);
         s.beta = take(rows * nv * 4);
-        s.q = take(rows * kd.max(hq) * 4);
-        s.kv = take(rows * (kd + vd).max(hq) * 4);
-        s.o = take(rows * vd.max(hq) * 4);
         s.k = take(rows * hkv * 4);
         s.v = take(rows * hkv * 4);
         s.rope = take(rows * rope_pairs * 8);
         let widest = d.max(vd).max(hq).max(f);
-        let logit_rows = u64::from(opts.logit_rows);
         // The decode kernels in several launches (`Part::in_batches`) read the rows in batches
         // of `MAX_BATCH`, each batch with its scales behind it: room for the last, partial one
         // as for a whole batch, and for the padding between the batches.
@@ -766,12 +793,7 @@ impl Part {
             .max(draft_sizes.as_ref().map_or(0, |sizes| sizes.act_h)),
         );
         s.picked = take(logit_rows * d * 4);
-        let head_rows = w.head.as_ref().map_or(0, |h| u64::from(h.n_out));
         s.logits = take(logit_rows * head_rows * 4);
-        // A head in parts computes several rows part by part before they are
-        // put in their place.
-        let in_parts = w.head.as_ref().is_some_and(|h| h.parts.len() > 1);
-        s.logit_parts = take(if in_parts { logit_rows * head_rows * 4 } else { 0 });
         s.attn_state = take(state_slots);
         s.attn_state_bytes = state_slots;
         s.status = take(16);
@@ -2200,7 +2222,7 @@ impl Part {
         let (stream, n) = (env.stream, env.dims.n_rows);
         let s = self.s;
         let inner = f.gate.n_out;
-        let (gate, up) = (self.rows(s.w1, inner), self.rows(s.w2, inner));
+        let (gate, up) = (self.rows(s.gate, inner), self.rows(s.up, inner));
         // SAFETY: scratch and weights as in `recurrent`.
         unsafe {
             self.normed_input(env, self.w.at(block.post_norm), &[&f.gate, &f.up])?;
