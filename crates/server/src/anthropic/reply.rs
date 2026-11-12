@@ -328,12 +328,16 @@ enum StartBody<'a> {
 struct Empty {}
 
 #[derive(Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(tag = "type")]
 enum DeltaBody<'a> {
-    ThinkingDelta { thinking: &'a str },
-    TextDelta { text: &'a str },
-    InputJsonDelta { partial_json: &'a str },
-    SignatureDelta { signature: &'a str },
+    #[serde(rename = "thinking_delta")]
+    Thinking { thinking: &'a str },
+    #[serde(rename = "text_delta")]
+    Text { text: &'a str },
+    #[serde(rename = "input_json_delta")]
+    InputJson { partial_json: &'a str },
+    #[serde(rename = "signature_delta")]
+    Signature { signature: &'a str },
 }
 
 #[derive(Serialize)]
@@ -369,14 +373,14 @@ pub(crate) fn block_event(event: &BlockEvent) -> Written {
             start(*index, StartBody::ToolUse { id, name, input: Empty {} })
         }
         BlockEvent::ThinkingDelta { index, text } => {
-            delta(*index, DeltaBody::ThinkingDelta { thinking: text })
+            delta(*index, DeltaBody::Thinking { thinking: text })
         }
-        BlockEvent::TextDelta { index, text } => delta(*index, DeltaBody::TextDelta { text }),
+        BlockEvent::TextDelta { index, text } => delta(*index, DeltaBody::Text { text }),
         BlockEvent::InputDelta { index, json } => {
-            delta(*index, DeltaBody::InputJsonDelta { partial_json: json })
+            delta(*index, DeltaBody::InputJson { partial_json: json })
         }
         BlockEvent::Signature { index } => {
-            delta(*index, DeltaBody::SignatureDelta { signature: SIGNATURE })
+            delta(*index, DeltaBody::Signature { signature: SIGNATURE })
         }
         BlockEvent::Stop { index } => {
             ("content_block_stop", EventBody::ContentBlockStop { index: *index })

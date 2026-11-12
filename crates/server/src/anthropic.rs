@@ -74,6 +74,12 @@
 //! reply that a stop sequence cut says `end_turn` and its `stop_sequence` is
 //! `null`.
 //!
+//! **The billing line of Claude Code.** Claude Code begins its system prompt
+//! with a line of its own bookkeeping whose stamp (`cch=...`) is another one
+//! in every request, which would part every prompt from the cached one at its
+//! first line. The five characters of the stamp are overwritten, as
+//! llama-server does; nothing else of a prompt is changed.
+//!
 //! **Where this is not llama-server.** llama-server concatenates system
 //! blocks without anything between them, moves the text of a user turn before
 //! its tool results, reads `tool_choice` `tool` as `any` and `none` not at
