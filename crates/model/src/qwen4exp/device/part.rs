@@ -328,6 +328,9 @@ pub struct Ports {
     pub partial: DevicePtr,
     /// Where the mixed input of a recurrent half arrives, as activations.
     pub m: DevicePtr,
+    /// Where the mixed input of a half block arrives in a wide step: `rows` rows of
+    /// `n_embd` f32 and a flag per row.
+    pub raw: DevicePtr,
     /// Where the mixed input of each layer's mixture of experts arrives, and
     /// the bytes from one layer to the next.
     pub acts: DevicePtr,
@@ -441,6 +444,9 @@ struct Scratch {
     // and of the outputs that are quantized, the addresses of the experts of the rounds,
     // the plan, the hidden values and the f16 form of the mixed input for the experts.
     mixed_f16: u64,
+    /// The mixed input of a half block as the mixer pushed it, f32, before it is
+    /// prepared (on a worker).
+    m_raw: u64,
     out_f16: u64,
     addresses: u64,
     plan_rows: u64,
@@ -736,6 +742,7 @@ impl Frame {
                 )
             };
             s.mixed_f16 = take(f16(n));
+            s.m_raw = take(rows * n * 4);
             s.out_f16 = take(f16((rec * vd).max(att * hq).max(shared_ff)));
             s.addresses = take(wide::ROUNDS * 8 * c.experts.count as u64);
             s.plan_rows = take(wide::plan_bytes(&expert_shape, opts.max_rows));
@@ -1236,6 +1243,7 @@ impl Part {
             record_flag: exchange.ptr().offset(flags - 4),
             partial: exchange.ptr().offset(flags.next_multiple_of(64)),
             m: self.at(self.f.s.m),
+            raw: self.at(self.f.s.m_raw),
             acts: self.acts.ptr(),
             act_stride: self.f.act_stride,
             records: self.records.ptr(),
@@ -1791,9 +1799,9 @@ impl Part {
         let norm = self.w.at(mixer.norm);
         // The fused read is made for a few rows: each block multiplies its rows by the
         // mixer's matrices out of the cache. A wide step takes the separate kernels instead,
-        // whose products multiply eight rows at a time; they cannot push to a peer.
-        let fused = self.fused && !(Self::is_wide(rows) && self.role == Role::Whole);
-        if fused {
+        // whose products multiply eight rows at a time over several streams.
+        let wide_step = Self::is_wide(rows);
+        if self.fused && !wide_step {
             let matrix = |m: &Mat| MixerMatrix { ptr: self.w.mat(m), ty: m.ty };
             let inject = mixer.inject.as_ref().filter(|_| inj.is_some()).map(matrix);
             // A read that writes goes from one residual buffer to the other:
@@ -1833,14 +1841,37 @@ impl Part {
             self.flipped ^= writes;
             return self.mark(stream, Phase::Mixers);
         }
-        if push.is_some() || write.is_some_and(|w| w.peer.is_some() || w.own.is_none()) {
+        if !wide_step
+            && (push.is_some() || write.is_some_and(|w| w.peer.is_some() || w.own.is_none()))
+        {
             return Err(invalid("an exchange with a peer needs the fused read"));
         }
         let r = self.r();
         let lo = self.act_values(s.lo, rank, rows);
         // SAFETY: scratch of this part sized for the most rows; weights in
-        // the arena.
+        // the arena; a peer's memory as `set_peer` was told.
         unsafe {
+            let write = match write {
+                // The peer's share of the block before is written to the streams in a
+                // launch of its own, which waits for it.
+                Some(w) if w.peer.is_some() => {
+                    self.q4.read_down(
+                        stream,
+                        r,
+                        r,
+                        Some(w),
+                        None,
+                        self.at(s.partials),
+                        rows,
+                        hc,
+                        n,
+                        rank,
+                        self.eps,
+                    )?;
+                    None
+                }
+                other => other,
+            };
             match write.and_then(|w| w.own.map(|out| (out, w.inj))) {
                 Some((out, inj)) => {
                     self.q4.stream_write_norm(stream, r, out, inj, norm, xn, rows, hc, n, self.eps)
@@ -1854,6 +1885,19 @@ impl Part {
                 self.product(stream, inject, self.at(s.xn), inj, rows)?;
             }
             self.q4.mix_quant(stream, xn, self.at(s.gate), m, rows, hc, n)?;
+            if let Some(to) = push {
+                // The peer gets the mixed values and prepares them itself.
+                let values = self.act_values(s.m, n, rows);
+                self.q4.swap(
+                    stream,
+                    Some((Some(values), None, None, to)),
+                    None,
+                    None,
+                    None,
+                    rows,
+                    n,
+                )?;
+            }
         }
         self.mark(stream, Phase::Mixers)
     }
@@ -1904,7 +1948,9 @@ impl Part {
             )),
             _ => None,
         };
-        let wait = wait.map(|no| (own.flags, Q4Kernels::read_flags(rows, self.n), no));
+        // A wide step's input arrives with a flag per row, not per block of the read.
+        let flags = if Self::is_wide(rows) { rows } else { Q4Kernels::read_flags(rows, self.n) };
+        let wait = wait.map(|no| (own.flags, flags, no));
         // SAFETY: scratch of this part; the peer's ports are memory of a
         // device this one has peer access to (`set_peer`).
         unsafe {
@@ -1986,7 +2032,7 @@ impl Part {
         // The recurrent or attention half.
         let write = self.take_write();
         let push = peer.filter(|(_, core)| *core).map(|(ports, _)| Departure {
-            data: ports.m,
+            data: if Self::is_wide(rows) { ports.raw } else { ports.m },
             flags: ports.flags,
             token: self.exchange_no(env, i, X_CORE_INPUT),
         });
@@ -2013,7 +2059,7 @@ impl Part {
             if wide { self.at(s.m) } else { self.acts.ptr().offset(i as u64 * self.f.act_stride) };
         let write = self.take_write();
         let push = peer.map(|(ports, _)| Departure {
-            data: if wide { ports.m } else { ports.acts.offset(i as u64 * ports.act_stride) },
+            data: if wide { ports.raw } else { ports.acts.offset(i as u64 * ports.act_stride) },
             flags: ports.flags,
             token: self.exchange_no(env, i, X_MOE_INPUT),
         });
@@ -2039,6 +2085,7 @@ impl Part {
         match &layer.core {
             CoreW::Recurrent(r) => {
                 self.swap(env, Some(self.exchange_no(env, i, X_CORE_INPUT)), None, None)?;
+                self.prepare_arrival(env.stream, rows)?;
                 self.recurrent(env, i, r)?;
                 self.pending = Some(Pending::Core {
                     own: true,
@@ -2052,16 +2099,17 @@ impl Part {
         // this layer's buffer. The shared expert's scalar gate is computed
         // from it while the kernel that waited is still there, and the
         // experts' output starts from zero.
-        let m = if Self::is_wide(rows) {
-            self.at(s.m)
+        let m_values = if Self::is_wide(rows) {
+            self.at(s.m_raw)
         } else {
-            self.acts.ptr().offset(i as u64 * self.f.act_stride)
+            let m = self.acts.ptr().offset(i as u64 * self.f.act_stride);
+            let values = u64::from(rows) * u64::from(self.n) * 4;
+            m.offset(act_bytes(u64::from(self.n), u64::from(rows)) - values)
         };
-        let values = u64::from(rows) * u64::from(self.n) * 4;
-        let m_values = m.offset(act_bytes(u64::from(self.n), u64::from(rows)) - values);
         let gate = layer.moe.shared.map(|sh| (self.w.mat(&sh.inp), m_values, self.at(s.s)));
         let wait = self.exchange_no(env, i, X_MOE_INPUT);
         self.swap(env, Some(wait), gate, Some(self.at(s.out)))?;
+        self.prepare_arrival(env.stream, rows)?;
         self.moe(env, i, &layer.moe)?;
         self.pending = Some(Pending::Moe {
             exchange: Some(self.exchange_no(env, i, X_MOE_PARTIAL)),

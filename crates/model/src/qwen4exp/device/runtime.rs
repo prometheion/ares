@@ -442,19 +442,22 @@ impl Embedding {
 // --- the model --------------------------------------------------------------
 
 /// The rows of a step to open the model with on `devices`: as many as the scratch of a step
-/// may take of the smaller device's memory (one eighth; the rest is slots for experts and
+/// may take of the smaller device's memory (a thirty-second; the rest is slots for experts and
 /// the pools of K and V), as a power of two between eight (the decode kernels' limit, which
-/// is all that a device without the tile kernels runs) and [`WIDE_ROWS`].
+/// is all that a device without the tile kernels runs) and 4096.
 ///
-/// A step of more rows reads the experts of a layer once for more of them. The scratch
-/// grows with the rows, about half a megabyte a row for Flash-Next; `opts` supplies the
-/// other choices of the part, whose `max_rows` is ignored.
+/// A step of more rows reads the experts of a layer once for more of them, and every byte of
+/// the scratch is a byte less for expert slots, which the generating steps miss: measured on
+/// Flash-Next, 2048 rows (1.4 GiB of scratch on a 12 GiB card) cost a third to a half of the
+/// generation speed through the slots they took. The scratch grows with the rows, about 0.7 MiB
+/// a row for Flash-Next; `opts` supplies the other choices of the part, whose `max_rows` is
+/// ignored.
 pub fn step_rows(gguf: &Gguf, devices: &[Device], opts: &Options) -> Result<u32, OpenError> {
     let config = Config::from_gguf(gguf)?;
     if devices.iter().any(|d| d.info().compute_capability.0 < 8) {
         return Ok(MAX_BATCH);
     }
-    let room = devices.iter().map(|d| d.info().total_memory / 8).min().unwrap_or(0);
+    let room = devices.iter().map(|d| d.info().total_memory / 32).min().unwrap_or(0);
     let mut rows = WIDE_ROWS;
     while rows > MAX_BATCH {
         let opts = Options { max_rows: rows, ..opts.clone() };
@@ -470,7 +473,7 @@ pub fn step_rows(gguf: &Gguf, devices: &[Device], opts: &Options) -> Result<u32,
 }
 
 /// The most rows of a step the model is opened with.
-pub const WIDE_ROWS: u32 = 4096;
+const WIDE_ROWS: u32 = 4096;
 
 /// Where the layers of the model in `gguf` would go on `devices` with `opts`,
 /// and the bytes one page of the pools would take on each device. Nothing is

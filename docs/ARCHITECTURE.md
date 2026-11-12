@@ -2205,9 +2205,13 @@ below), runs every layer at that width (`device/part/wide.rs`, `device/misses.rs
   the int8 rows the fused kernels already leave (`mix_quant`, `gated_norm_quant`,
   `swiglu_quant`), or f16 rows (`prepare_mixed`, `gated_norm_f16`, `swiglu_f16`) when the
   device runs the f16 tensor cores at full rate or `Options::precision` is `Exact`. The
-  float matrices (router, indexer projections, the recurrent gates, the n-gram block's
-  projections) have no tile kernel and are multiplied eight rows at a time by the decode
-  kernel, which reads the f32 section of the activations (`Part::wide_product`).
+  float matrices (the mixers', the router, the indexer projections, the recurrent gates,
+  the n-gram block's projections) have no tile kernel and are multiplied eight rows at a
+  time by the decode kernel, which reads the f32 section of the activations
+  (`Part::wide_product`); the chunks run on four streams, since a launch of eight rows
+  has a few dozen blocks and takes about 90 microseconds whatever it multiplies. The
+  fused read of a stream mixer is made for a few rows, so a wide step reads its mixers
+  with the separate kernels.
 - *The router* is `ExpertKernels::logits_rows` and `pick_rows`: ids and weights of every
   row's picks in the form `ExpertRowKernels::plan_rows` reads, without the groups of the
   decode kernels, which hold eight rows.
@@ -2229,17 +2233,21 @@ below), runs every layer at that width (`device/part/wide.rs`, `device/misses.rs
 - *Both devices on every layer*: the mixer routes. The worker's host thread reads the
   record from the mixer's board (the mixer has enqueued the layer when `Flow::enqueued`
   says so), uploads it, and builds its table from the experts it owns
-  (`Placement::owner`); the mixed input of both halves lands in the worker's `m` scratch,
-  where the core's input was.
+  (`Placement::owner`). The mixer pushes the mixed input of both halves to the worker as
+  f32 rows with a flag per row; the worker quantizes them. The worker's exchange is two
+  launches in a wide step: its kernel has a block per row, and the blocks that wait for
+  the mixer's input must not keep from running the blocks that push the partial output
+  the mixer needs before it sends that input (with more rows than blocks that fit the
+  device at once the single launch stood still).
 - *What stays at eight rows*: the host share and the buffers of the decode kernels, the
   per-layer copies of the layer's input rows that the CPU reads, and the store's reserve
   (`StoreConfig::max_rows`). Only the scratch of a step scales with the rows.
 
 `step_rows` decides the rows a model opens with: the largest power of two up to 4096
-whose scratch (`Frame::step_bytes`) is at most an eighth of the smaller device's memory,
-and 8 on a device below compute capability 8.0. The scratch is about half a megabyte a
-row for Flash-Next, so it is the rows that cost expert slots: the choice is the device's
-memory, not a number measured on these two cards.
+whose scratch (`Frame::step_bytes`) is at most a thirty-second of the smaller device's
+memory, and 8 on a device below compute capability 8.0. The scratch is about 0.7 MiB a
+row for Flash-Next, and every byte of it is a byte less for expert slots, which the
+generating steps miss.
 
 **Measured through the server** (2026-11-11, RTX 4070 and RTX 3060, the
 engine started with `--chat-var enable_thinking=false` and otherwise its

@@ -6,9 +6,13 @@
 //! - **Dense products** go through the tile kernels (`Kernels::product`) in the form of
 //!   activations the device and the matrix type ask for ([`ActivationForm`]): the int8
 //!   rows the fused kernels already write, or f16 rows converted from their f32
-//!   section. The float matrices (router, mixers, the projections of the indexer and of
-//!   the n-gram block, the recurrent gates) have no tile kernel: the decode kernel
-//!   multiplies them eight rows at a time.
+//!   section. The float matrices (the mixers', the router, the projections of the indexer
+//!   and of the n-gram block, the recurrent gates) have no tile kernel: the decode kernel
+//!   multiplies them eight rows at a time, the chunks spread over four streams. For that
+//!   reason a wide step reads its stream mixers with the separate kernels and not with the
+//!   fused read (the fused one is made for a few rows). A mixer that shares the layer
+//!   pushes the mixed input to its worker as f32 rows with a flag per row, and the worker
+//!   prepares it ([`Part::prepare_arrival`]).
 //! - **The router** picks for every row ([`ExpertKernels::logits_rows`],
 //!   [`ExpertKernels::pick_rows`]) and leaves the ids and weights of the picks, not the
 //!   groups of the decode kernels, which hold eight rows.
@@ -227,6 +231,28 @@ impl Part {
                 y,
                 m.n_in,
                 m.n_out,
+                rows,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Prepares the mixed input a mixer pushed (f32 rows) in the int8 layout the products
+    /// and the router read; a worker does it after its wait, which is the launch before.
+    pub(super) fn prepare_arrival(&self, stream: &Stream, rows: u32) -> Result<(), ModelError> {
+        if !Self::is_wide(rows) {
+            return Ok(());
+        }
+        let s = self.f.s;
+        // SAFETY: `m_raw` holds the rows once the wait before has run; `m` is scratch of
+        // this part.
+        unsafe {
+            self.kernels.prepare_prefill_activations(
+                stream,
+                ares_cuda::PrefillPath::Int8,
+                self.at(s.m_raw),
+                self.at(s.m),
+                self.n,
                 rows,
             )?;
         }

@@ -36,7 +36,7 @@ pub use part::{
 pub use placement::{
     DeviceMemory, DevicePlan, PartPlan, Placement, TensorChoice, TensorPlan, ram_tier_bytes,
 };
-pub use runtime::{OpenError, Qwen4Exp, WIDE_ROWS, place, step_rows};
+pub use runtime::{OpenError, Qwen4Exp, place, step_rows};
 pub use session::{
     Fill, LayerOut, PartReport, Probe, Rows, Session, SessionOptions, Spread, StepTime, Wanted,
     read_time,
