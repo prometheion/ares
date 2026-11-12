@@ -24,9 +24,11 @@
 //! the kernels have read an expert that came from the file, its bytes are
 //! still in staging, and if the heat (which has the counts of the step that
 //! used it by then) says it is worth more than what the RAM tier would give
-//! up for it, by the margin of a swap, it is copied into the RAM tier there
-//! and then ([`ExpertStore::transit_release`]). From the RAM tier the hottest
-//! go up into VRAM between steps like any others.
+//! up for it, it is copied into the RAM tier there and then
+//! ([`ExpertStore::transit_release`]). And an expert that is in a transit slot
+//! is in VRAM: one that is hotter than the member of the layer's VRAM slots
+//! that would leave takes that slot by a copy on the device. From the RAM
+//! tier the hottest go up into VRAM between steps like any others.
 //!
 //! # Who asks
 //!
@@ -405,9 +407,10 @@ impl<D: SlotDevice> ExpertStore<D> {
     }
 
     /// Gives `expert` of `layer`, which is in transit slot `slot`, a slot of
-    /// the layer's VRAM tier if the heat says so: a free one, or the coldest
-    /// member's when the expert is hotter by the margin of a swap
-    /// ([`SwapRule`]). Its bytes are copied from the transit slot on the
+    /// the layer's VRAM tier if the heat says so: a free one, or the slot of
+    /// the member that would leave when the expert is hotter (by the margin
+    /// of a swap, [`SwapRule`], when that member has to be copied down to RAM
+    /// to be kept). Its bytes are copied from the transit slot on the
     /// device, its table entry follows them, and the transit slot (and the
     /// staging slot `stage`) are free when that has run. What it evicts goes
     /// the way of every evicted expert. Returns whether it started.
@@ -436,11 +439,18 @@ impl<D: SlotDevice> ExpertStore<D> {
         }
         if vram.n_free() == 0 {
             // The member that would leave: one the step has no use for, and
-            // colder than the newcomer by the margin.
+            // colder than the newcomer. If it has to be copied down to RAM
+            // to be kept, the swap costs a copy over the link and must be
+            // worth it by the margin; if it is worth nothing or RAM holds
+            // its bytes, nothing moves but the newcomer, on the device.
             let rule = SwapRule::default();
-            match vram.victim(self.step, heat) {
-                Some((_, worth, false)) if own > rule.margin * worth + rule.bonus => {}
-                _ => return Ok(false),
+            let Some((member, worth, false)) = vram.victim(self.step, heat) else {
+                return Ok(false);
+            };
+            let stays = worth <= 0.0 || self.ram.sets[layer].contains(member);
+            let needed = if stays { worth } else { rule.margin * worth + rule.bonus };
+            if own <= needed {
+                return Ok(false);
             }
         }
         let started = self.vram.sets[layer].start_read(expert, Want::Demand, self.step, heat);
@@ -470,8 +480,7 @@ impl<D: SlotDevice> ExpertStore<D> {
 
     /// Lets `expert` of `layer`, whose bytes are in staging slot `stage`, take
     /// a slot of the RAM tier if the heat knows it and a slot is free or the
-    /// swap pays ([`SwapRule`]: the same margin that keeps two experts of
-    /// similar heat from trading places in an election).
+    /// member that would leave is worth less.
     fn transit_admit(&mut self, layer: usize, expert: u32, stage: u32) {
         let ram = &self.ram.sets[layer];
         if ram.contains(expert) || ram.is_loading(expert) || self.vram.sets[layer].contains(expert)
@@ -481,16 +490,16 @@ impl<D: SlotDevice> ExpertStore<D> {
         self.refresh_worth(layer);
         let worth = self.ram_worth.layer(layer);
         let ram = &self.ram.sets[layer];
-        let rule = SwapRule::default();
         let heat = self.heat.layer(layer)[expert as usize];
         // Nothing the heat has not seen is kept, and a member gives way only
-        // to an expert that is hotter by the margin.
+        // to an expert that is hotter. No margin: the bytes are in host
+        // memory already, and to drop them is to read them again.
         if heat <= 0.0 {
             return;
         }
         if ram.n_free() == 0 {
             match ram.victim(self.step, worth) {
-                Some((_, cold, false)) if heat > rule.margin * cold + rule.bonus => {}
+                Some((_, cold, false)) if heat > cold => {}
                 _ => return,
             }
         }

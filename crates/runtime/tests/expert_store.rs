@@ -1630,3 +1630,33 @@ fn an_expert_with_heat_takes_a_free_slot_from_transit() {
     let stats = rig.store.take_stats();
     assert_eq!((stats.transit_adopted, stats.transit_admitted), (1, 0));
 }
+
+#[test]
+fn a_swap_that_copies_nothing_down_needs_no_margin() {
+    // Expert 4 holds a VRAM slot with the heat of one pick, and RAM has its
+    // bytes: to let it go costs nothing.
+    let mut rig = full_rig(0);
+    assert!(rig.store.in_ram(0, 4));
+    rig.store.begin_step();
+    rig.store.transit_want(0, &[7, 9]).unwrap();
+    rig.settle();
+    assert_eq!(rig.take_transit(0), [7, 9]);
+    // Two rows used expert 7 and one used expert 9: 7 is hotter than 4, but
+    // not by the margin of a swap; 9 is as hot as 4.
+    let mut counts = [0u32; EXPERTS as usize];
+    counts[7] = 2;
+    counts[9] = 1;
+    rig.store.record_counts(0, &counts, 1.0);
+    rig.store.transit_release(0, &[7, 9]).unwrap();
+    rig.settle();
+    rig.assert_usable(0, 7);
+    assert!(!rig.store.in_vram(0, 4) && rig.store.in_ram(0, 4));
+    // Expert 9 came from the file and is hotter than the copies RAM keeps of
+    // what VRAM holds: it stays in RAM, though one row used it.
+    assert!(!rig.store.in_vram(0, 9) && rig.store.in_ram(0, 9));
+    rig.store.end_step().unwrap();
+    rig.settle();
+    let stats = rig.store.take_stats();
+    assert_eq!((stats.transit_adopted, stats.transit_admitted), (1, 1));
+    assert_eq!((stats.evictions, stats.demotions), (1, 0));
+}
