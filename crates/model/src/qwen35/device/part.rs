@@ -14,13 +14,13 @@
 use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
-use ares_core::{GgmlType, Ledger};
+use ares_core::Ledger;
 use ares_cuda::{
     ActivationForm, AttendBuffers, AttentionKernels, AttentionShape, CacheFormat, CacheGeometry,
     CommitSet, Device, DeviceBuffer, DevicePtr, ENTRY_CELLS, EmbedRows, Event, Kernels,
     LayerKernels, MAX_BATCH, OutputGate, PUSH_MAX_VALUES, PinnedBuffer, PlanBuffers, PlanConfig,
     Planner, Precision, PrefillPath, RopeParams, Segment, StateFormat, StepDims, Stream,
-    WeightLayout,
+    WeightLayout, WeightRange,
 };
 use ares_cuda::{PUSH_MAX_ROWS, PushSlot};
 use ares_runtime::{Logits, ModelError, PinnedRam, Split};
@@ -1122,10 +1122,12 @@ impl Part {
 
     // --- products ----------------------------------------------------------------
 
-    /// Which kernel family multiplies a matrix of `ty` in the file's layout
-    /// with `n` rows: `None` for the decode kernels.
-    fn path(&self, ty: GgmlType, n: u32) -> Result<Option<PrefillPath>, ModelError> {
-        file_path(&self.kernels, self.opts.precision, ty, n)
+    /// Which kernel family multiplies the matrix `m` in the file's layout
+    /// with `n` rows: `None` for the decode kernels. A float matrix takes
+    /// only what the size of its weights leaves of the tile kernels
+    /// (`WeightRange`, found when the model was loaded).
+    fn path(&self, m: &Mat, n: u32) -> Result<Option<PrefillPath>, ModelError> {
+        Ok(m.range.path(file_path(&self.kernels, self.opts.precision, m.ty, n)?))
     }
 
     /// Whether the products of `mats` with `n` rows are taken, for those in
@@ -1139,10 +1141,14 @@ impl Part {
     /// 80 ms from 9 to 24 rows, while the decode kernels take 36 ms for 8. A
     /// matrix in its device layout has no such gap.) The decision is the
     /// group's: the matrices that read the same input are all multiplied in
-    /// launches or none.
+    /// launches or none. A float matrix with a weight beyond the range of
+    /// f16 (`WeightRange::Beyond`) has no other kernel, so its group takes
+    /// the launches for any number of rows above one launch's.
     fn in_batches(&self, mats: &[&Mat], n: u32) -> bool {
-        let mut file = mats.iter().filter(|m| m.layout == WeightLayout::File).peekable();
-        file.peek().is_some() && decode_in_batches(self.opts.precision, file.map(|m| m.ty), n)
+        let file = || mats.iter().filter(|m| m.layout == WeightLayout::File);
+        file().next().is_some()
+            && (decode_in_batches(self.opts.precision, file().map(|m| m.ty), n)
+                || (n > MAX_BATCH && file().any(|m| m.range == WeightRange::Beyond)))
     }
 
     /// The forms of an input of `n` rows that the products with `mats` read.
@@ -1153,7 +1159,7 @@ impl Part {
             match m.layout {
                 WeightLayout::Device => forms.f16 = true,
                 WeightLayout::File if batched => {}
-                WeightLayout::File => match self.path(m.ty, n)? {
+                WeightLayout::File => match self.path(m, n)? {
                     None | Some(PrefillPath::Int8) => forms.int8 = true,
                     Some(PrefillPath::F16 | PrefillPath::F16Flush) => forms.f16 = true,
                 },
@@ -1434,7 +1440,7 @@ impl Part {
         // SAFETY: the matrix is in the arena as the file stores it and the
         // activations were prepared for this path by `prepare`.
         unsafe {
-            match self.path(m.ty, n)? {
+            match self.path(m, n)? {
                 None => self.kernels.matvec(
                     stream,
                     m.ty,

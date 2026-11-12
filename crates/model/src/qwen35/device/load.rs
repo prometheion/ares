@@ -30,7 +30,7 @@ use std::time::{Duration, Instant};
 use ares_core::{GgmlType, Ledger};
 use ares_cuda::{
     Device, DeviceBuffer, DevicePtr, EmbedRows, KeptRows, Kernels, LayerKernels, Precision,
-    RecurrentShape, Stream, WeightLayout,
+    RecurrentShape, Stream, WeightLayout, WeightRange,
 };
 use ares_runtime::ModelError;
 
@@ -53,6 +53,9 @@ pub(crate) struct Mat {
     pub n_out: u32,
     pub at: u64,
     pub layout: WeightLayout,
+    /// What the size of its weights leaves of the tile kernels (a float
+    /// matrix; any other takes them all).
+    pub range: WeightRange,
 }
 
 impl Mat {
@@ -336,6 +339,36 @@ impl Reader {
     }
 }
 
+/// The ranges of the float matrices of a load, by the address of their stored
+/// bytes: a matrix is read once for it, with ordinary reads as the uploads
+/// do, whatever the number of layouts and parts it is placed in. The range is
+/// that of the whole stored matrix, also where a device holds a part of it.
+#[derive(Default)]
+struct Ranges {
+    known: Vec<(usize, WeightRange)>,
+    files: Option<MappedFiles>,
+    staging: Vec<u8>,
+}
+
+impl Ranges {
+    fn of(&mut self, m: &Matrix<'_>) -> WeightRange {
+        if !matches!(m.ty(), GgmlType::F32 | GgmlType::F16 | GgmlType::BF16) {
+            return WeightRange::Any;
+        }
+        let at = m.bytes().as_ptr() as usize;
+        if let Some((_, range)) = self.known.iter().find(|(known, _)| *known == at) {
+            return *range;
+        }
+        let files = self.files.get_or_insert_with(MappedFiles::of_process);
+        let mut range = WeightRange::Any;
+        for piece in m.bytes().chunks(PIECE) {
+            range = range.and(WeightRange::of(m.ty(), files.read(piece, &mut self.staging)));
+        }
+        self.known.push((at, range));
+        range
+    }
+}
+
 /// One tensor of the arena.
 struct Item<'g> {
     at: u64,
@@ -354,6 +387,7 @@ struct Layout<'g, 'c> {
     model: Usage,
     /// How the norm in front of a half block is prepared for its products.
     normed: Prep,
+    ranges: Ranges,
 }
 
 impl<'g> Layout<'g, '_> {
@@ -377,10 +411,11 @@ impl<'g> Layout<'g, '_> {
         n_in: u32,
         source: Source<'g>,
         layout: WeightLayout,
+        range: WeightRange,
     ) -> Mat {
         self.chooser.placed(ty, layout, n_out, n_in);
         let at = self.len.next_multiple_of(ALIGN);
-        let mat = Mat { ty, n_in, n_out, at, layout };
+        let mat = Mat { ty, n_in, n_out, at, layout, range };
         let rearrange = (layout == WeightLayout::Device).then_some((ty, n_out, n_in));
         self.len = at + mat.bytes().max(source.len());
         self.items.push(Item { at, source, rearrange });
@@ -416,7 +451,8 @@ impl<'g> Layout<'g, '_> {
             }
             _ => Source::Rows(*m, rows),
         };
-        self.matrix(ty, n_out, n_in, source, layout)
+        let range = self.ranges.of(m);
+        self.matrix(ty, n_out, n_in, source, layout, range)
     }
 
     /// Columns `columns` of every row of `m` (range after range, whole blocks
@@ -428,7 +464,8 @@ impl<'g> Layout<'g, '_> {
             [one] if one.start == 0 && one.end == m.cols() => Source::Bytes(m.bytes()),
             _ => Source::Columns(*m, columns),
         };
-        self.matrix(m.ty(), m.rows() as u32, n_in, source, layout)
+        let range = self.ranges.of(m);
+        self.matrix(m.ty(), m.rows() as u32, n_in, source, layout, range)
     }
 }
 
@@ -614,11 +651,12 @@ impl DeviceWeights {
         // The tensors are laid out twice: once for the chooser to see every
         // matrix and what the weights take in all, and, when it has probed
         // and decided, once more with the layouts it chose.
-        let mut layout = Layout { items: Vec::new(), len: 0, chooser, model, normed };
+        let ranges = Ranges::default();
+        let mut layout = Layout { items: Vec::new(), len: 0, chooser, model, normed, ranges };
         tables(&mut layout, c, w, plan, draft, index)?;
-        let Layout { len, mut chooser, .. } = layout;
+        let Layout { len, mut chooser, ranges, .. } = layout;
         chooser.decide(len, balance.map(|b| (b, index)))?;
-        let mut layout = Layout { items: Vec::new(), len: 0, chooser, model, normed };
+        let mut layout = Layout { items: Vec::new(), len: 0, chooser, model, normed, ranges };
         let Tables { blocks, embedding, output_norm, head, head_tokens, draft } =
             tables(&mut layout, c, w, plan, draft, index)?;
         let Layout { items, len, chooser, .. } = layout;
