@@ -4,7 +4,7 @@ Made on 2026-11-11. Read-only survey: nothing was built or run, no repository wa
 R03 to R12, R14, R16, R21 and H02, the counts and the lists were brought up to date on 2026-11-12, when the
 sampler's features (penalties, DRY, logit bias, probabilities, `n` and the rest) were built; G01, G03, G06, G07
 and G09 were brought up to date the same day, when structured output was built, T01 to T04 and G05 when
-tool calls were, and A07 and A08 when the Messages API was.
+tool calls were, A07 and A08 when the Messages API was, and T06 when calls inside the thinking were.
 One row is one capability that a user or operator of an inference server can observe or rely on.
 
 ## How to read it
@@ -130,11 +130,11 @@ or no-op options; Ares may do a thing differently as long as the result is not w
 | ID | Feature | Engines | What it is | Ares | Frame | Need |
 | --- | --- | --- | --- | --- | --- | --- |
 | T01 | Tool calls | llama, ik, kobold, ollama, vllm, sglang, tgi, trt, lmdeploy, tabby, mistralrs, mlc, sonar, localai, strata, tfold, lmstudio | `tools` rendered by the template; the reply's calls parsed into `tool_calls` (id, name, JSON arguments), streamed as deltas, `finish_reason: tool_calls`; tool results accepted back | done: `tools` go to the chat template; the calls of a reply come back in `tool_calls` (id, name, arguments as JSON text), streamed as OpenAI's deltas (the name first, then fragments of the arguments, no markup in `content`), with `finish_reason: tool_calls`; assistant turns with `tool_calls` and `role: tool` results are checked and rendered. For templates that write calls in the tagged form of Qwen3.8 (`<function=..>` and `<parameter=..>` between `<tool_call>` tags), read off the template; a request with tools for a template with another form (JSON between tags, among others) is refused | yes | essential |
-| T02 | Forced tool choice | llama, vllm, tfold, tgi?, mistralrs? | `tool_choice` `required` or a named function enforced by a grammar; `none` hides the tools | done: `auto` (free until the model opens a call, then held to the grammar of calls), `required` and a named function (calls from the first token of the answer; the reasoning stays free), `none` (the tools are in the prompt and the reply is text, as with llama-server) | yes | common |
+| T02 | Forced tool choice | llama, vllm, tfold, tgi?, mistralrs? | `tool_choice` `required` or a named function enforced by a grammar; `none` hides the tools | done: `auto` (free until the model opens a call, then held to the grammar of calls), `required` and a named function (calls from the first token of the answer, or from a call opened inside the thinking; the reasoning stays free but cannot end the reply), `none` (the tools are in the prompt and the reply is text, as with llama-server) | yes | common |
 | T03 | Parallel tool calls switch | llama, vllm, tfold | `parallel_tool_calls: false` returns at most one call | done: `parallel_tool_calls: false` allows one call in the grammar; the default is several | yes | common |
 | T04 | Strict argument schemas | vllm, mistralrs | arguments constrained to the tool's JSON schema (`strict`) | partly: the arguments are always held to the tool's schema by the grammar (names, required and optional arguments, every value that is not a string through the JSON schema, the strings of an `enum` or `const`), `strict` or not; a string is written raw in the format, and its `pattern`, `minLength`, `maxLength` and `format` are not enforced | yes | common |
 | T05 | Recovery of imperfect calls | strata, tfold, vllm | read drifted envelopes, close markup that the end token cut, type arguments by the schema, repair JSON slips; anything else stays text | not started | yes | common |
-| T06 | Calls inside thinking | tfold, tabby, strata | a complete call written before the think block closes is returned as the call | not started | yes | niche |
+| T06 | Calls inside thinking | tfold, tabby, strata, fork | a complete call written before the think block closes is returned as the call | done: when the tools may be called (`auto`, `required`, a named function) the marker of a call inside the thinking ends the reasoning there, as in llama-server: the text before it is `reasoning_content`, the call is held to the grammar of calls from the next token and comes back in `tool_calls`, whole and streamed; `required` and a named function cannot end while they think; with `none` or without tools the marker is reasoning. The marker and the tags are read off the template. Host tests; the test with a real model is written and has not been run | yes | niche |
 | T07 | Policy for undeclared tools | strata, tfold | a well-formed call of a tool the request did not offer: text plus a marker, or returned as a call | not started | yes | niche |
 | T08 | Deterministic call ids | tfold | ids keyed from the request, so a replay names its calls the same | not started | yes | niche |
 | T09 | Tools run by the server | llama, kobold, strata, mistralrs, localai, lmstudio, vllm, sglang | the server spawns MCP servers or built-in tools (files, shell, web search) and runs the loop itself | not started | yes | niche |
@@ -344,12 +344,12 @@ Counted from the tables above with a script (see the end of this file for the co
 | --- | --- |
 | Total | 223 |
 | Inside the frame | 200 |
-| - done | 59 |
+| - done | 60 |
 | - partly | 43 |
-| - not started | 98 (essential 5, common 26, niche 67) |
+| - not started | 97 (essential 5, common 26, niche 66) |
 | Outside the frame | 23 (all not started) |
 
-Of the 59 done rows 27 are essential, 26 common and 6 niche; of the 43 partly rows 11 are essential, 18 common
+Of the 60 done rows 27 are essential, 26 common and 7 niche; of the 43 partly rows 11 are essential, 18 common
 and 14 niche. A row is one capability, so the counts weigh a sampler option like a model router; List 1 orders
 them by need instead.
 
@@ -376,7 +376,7 @@ them by need instead.
 - Observability: O01 latency histograms
 - Operations: X04 CORS, X05 Host and Origin checks, X09 container image and service unit
 
-**Niche (67).** A03, A05, A06, A10, A14, A20, A23 to A27; R13, R15, R17, R19, R22, R24, R27, R29; G02, G04, G08; T06 to T10; K04, K07; F03, F05, F08, F10, F12, F13, F15, F19, F20; S14 to S16, S18 to S20, S23; P02, P05, P07,
+**Niche (66).** A03, A05, A06, A10, A14, A20, A23 to A27; R13, R15, R17, R19, R22, R24, R27, R29; G02, G04, G08; T07 to T10; K04, K07; F03, F05, F08, F10, F12, F13, F15, F19, F20; S14 to S16, S18 to S20, S23; P02, P05, P07,
 P08, P12, P23, P32, P34; M07, M09, M12, M13; V07; H11, H12; O05, O07; X02, X03, X06, X11; Q05.
 
 The rows that are `partly` are not in this list; the largest of them are Vulkan (H02: no expert

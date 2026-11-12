@@ -179,7 +179,7 @@ machine (RTX 4070 + RTX 3060, Qwen3.8-27B) or read from the engines listed in
 | `ares-sched` | Step planner (generation, decision rows and prompts in one step), admission (pages claimed per step, a reservation that corrects itself, a queue instead of refusals), the order of a pass for long prompts of a model with experts, step time model with a term for the context, draft length choice, the lookup drafter on a suffix automaton shared by all sequences | Done; unit and model tests; the conductor uses the planner, admission (without spill), the lookup drafter and the step cost |
 | `ares-weights` | Expert heat, tiers that are elected and fed by reads (admission, protection, guesses bound late, slots given back), slots per layer by need, the waves of experts of a pass, a token table for the first layers, the lookahead distance, routing bias for pruning | Done, unit tested; the expert store uses the slot sets, the heat and the split of slots; guesses, the token table and pruning are not used by a running model yet |
 | `ares-api` | Request (with every sampling field), event (text and probabilities), decision and error types; the `Engine` trait between HTTP and the runtime (`submit` for generation, `decide` for decisions, `stats`, `chat_format` for what a model's chat template declares about thinking) | Done, unit tested |
-| `ares-server` | The `ares` binary: loads a model on the devices and serves it over an OpenAI-compatible HTTP API, with the plan of devices, split, shares and context made from what the devices report | Serves `qwen35` and `qwen4exp` models (chat and plain completions, streamed and not, every sampling field and the probabilities of the tokens, `n` completions, timings, metrics, staged shutdown, the reasoning of a reply apart from its content and in the history, with llama-server's controls for thinking, tool calls held to the tools' schemas by a grammar); 192 tests without a GPU, 17 that start the real binary (some need the 27B or the files of Flash-Next) and 25 that run the engine in the test's process (the 7 of tool calls have not been run); for `qwen35` the prefix cache is on, with `--ram` for the engine's RAM, for `qwen4exp` the RAM is mostly the tier of experts; no router mode, no multimodal input, `/v1/systemone` answers 501 |
+| `ares-server` | The `ares` binary: loads a model on the devices and serves it over an OpenAI-compatible HTTP API, with the plan of devices, split, shares and context made from what the devices report | Serves `qwen35` and `qwen4exp` models (chat and plain completions, streamed and not, every sampling field and the probabilities of the tokens, `n` completions, timings, metrics, staged shutdown, the reasoning of a reply apart from its content and in the history, with llama-server's controls for thinking, tool calls held to the tools' schemas by a grammar, also when the model opens the call inside its thinking); 213 tests without a GPU, 17 that start the real binary (some need the 27B or the files of Flash-Next) and 26 that run the engine in the test's process (the 8 of tool calls have not been run); for `qwen35` the prefix cache is on, with `--ram` for the engine's RAM, for `qwen4exp` the RAM is mostly the tier of experts; no router mode, no multimodal input, `/v1/systemone` answers 501 |
 | `ares-runtime` | The conductor thread and one thread per device, the step loop that connects plan, state and kernels, admission, speculation with the lookup drafter and with a model's own drafts, the `Model` trait a model implements, a synthetic model that drives the real kernels, and the expert store (VRAM slots, RAM tier, reads, the CPU computing what is not on a GPU) | Drives `qwen35` on one device, in tensor split and in layer split, with picks made on the device; implements `Engine::submit` (not `decide`); the prefix cache is in the conductor, checked against the host executor as an oracle and carried out by `qwen35` on the devices (checkpoints in page-locked RAM within one RAM limit, `PinnedRam`), and there is no spill of pages to RAM (a request that gives way stays in the pool's cache); the expert store is driven by the device threads of `qwen4exp` (see [Qwen3.8-Flash-Next through the runtime](#qwen38-flash-next-through-the-runtime)) |
 | `ares-model` | Model architectures: configuration and weight table from a GGUF, a CPU reference of the forward pass with explicit state (window and commit) that GPU implementations are compared with block by block, and the implementation on the devices | `qwen35` (Qwen3.5-0.8B, Qwen3.8-27B) runs through the runtime and the server, with the model's draft block. `qwen4exp` (Qwen3.8-Flash-Next) runs through the runtime and the server on one or two cards, without speculation (it has no draft head built, and the lookup in earlier text takes part only next to a model drafter), and through a session of its own that tests and measurements use. See [Several devices](#several-devices) |
 
@@ -1243,6 +1243,24 @@ vocabularies of the supported models. This is what llama.cpp calls a lazy
 grammar and what the calls of tools use; the third kind of rule, a grammar in
 the engine's own Lark syntax (`Shape::Lark`), is the one the server writes for
 them. No field of a request sets a trigger.
+
+*A text that ends the reasoning.* A model that thinks may write what belongs
+after its reasoning without closing the reasoning first: the marker that opens
+the call of a tool. A `Structure` may name an interrupt (`Interrupt`): a text,
+and the rule for what follows it. While a reply thinks the guide looks for the
+closing tag and for that text; at whichever comes first the reasoning ends, and
+after the text the interrupt's rule binds, from the token after the one that
+completes it, as after a trigger. After the closing tag the structure's own
+rule and trigger apply as without an interrupt, and a trigger that begins in
+the token of the closing tag is seen. A structure with an interrupt and without
+a trigger binds every reply, through one rule or the other, so such a reply may
+not end while it thinks: the rows of its reasoning carry a mask of every token
+but the ones that end a reply, and a draft that would end it there is cut. With
+a trigger the reasoning carries no mask, and a reply may end in it. The guide
+compiles the interrupt's rule next to the structure's (one grammar when the two
+are the same), and refuses an interrupt whose text is empty. No field of a
+request sets an interrupt; the server writes one for the tools of a request
+(see [Server](#server), "Tool calls").
 
 *Drafts.* The text with drafts is the text without. Every row of a window gets
 the mask of its own path, so a draft the rule forbids is never the pick of the
@@ -3340,14 +3358,56 @@ whether a tool says `strict` or not. A string is written raw, so the
 
 | `tool_choice` | The reply |
 | --- | --- |
-| `auto` (the default) | free until the model writes `<tool_call>` (the rule's trigger); from there calls, and nothing after them |
-| `required` | calls from the first token of the answer, after the empty line the template writes there: at least one |
+| `auto` (the default) | free until the model writes `<tool_call>` (the rule's trigger), in its answer or inside its thinking; from there calls, and nothing after them |
+| `required` | calls from the first token of the answer, after the empty line the template writes there, or from `<tool_call>` inside the thinking: at least one |
 | a named function | the same, and every call is of that function; the prompt still lists all tools |
 | `none` | text: the tools are in the prompt, no rule binds the reply, and a call the model writes stays in `content`, as with llama-server |
 
 `parallel_tool_calls: false` allows one call. The reasoning of a model that
 thinks is free in every case, and the rule (or the wait for the trigger) starts
-after its closing tag; a call the model writes inside its thinking is reasoning.
+after its closing tag, or at a call the model opens before it.
+
+*A call inside the thinking.* These models sometimes write `<tool_call>` while
+they still think, without `</think>` before it. When the tools of a request may
+be called (`auto`, `required`, a named function), the marker ends the reasoning
+where it stands, as llama-server has it for these templates
+(`thinking_end_tags` and the parser of `common/parsers/qwen3-coder.cpp`). The
+marker is the trigger of the detected `ToolFormat` and the tags are those of
+the detected thinking; nothing is known by the name of a model.
+
+- The engine: the structure of the request names the marker as an interrupt
+  (see [Sampling](#sampling)), with the rule of a call whose marker is written.
+  From the token after the marker the reply is held as a call after `</think>`
+  is: a name among the tools, arguments by the schema, the closing tags, then
+  white space, another call if several are allowed, or the end. With `required`
+  or a named function the end tokens are not allowed while the reply thinks, so
+  it cannot end as reasoning alone: it ends with a call or at the limit of
+  tokens. llama-server reaches the same by a grammar over the whole reply.
+- The reply: the reasoning's splitter ends the reasoning at the marker
+  (`Splitter::ends_at`, set by `Sorter::new` when the request has a splitter of
+  calls) and passes the marker on as the first text of the content, where
+  `CallSplitter` reads the call. `reasoning_content` is the text before the
+  marker without the white space between the two (llama-server leaves it in),
+  `content` is empty, and no part of the marker reaches either, however a
+  stream cuts the text. White space at the end of the reasoning is held back
+  for one piece of a stream, until the next shows whether the marker follows. A
+  raw reply (`reasoning_format: none`) keeps its thinking in `content` and has
+  the call too: `CallSplitter` reads the first marker of a reply wherever it
+  stands.
+- `</think>` after such a call cannot be written: after a call the rule allows
+  white space, another call and the end, and no text. A reply that never writes
+  it lacks nothing. When the turn comes back, the template writes `<think>`, the
+  reasoning, `</think>`, an empty line and the call, the same prompt as for a
+  reply that closed its thinking; checked with the templates and vocabularies of
+  Qwen3.5-0.8B, Qwen3.8-27B and Qwen3.8-Flash-Next (`tools/templates.rs` in
+  `ares-server`). The cached sequence is repeated up to the end of the
+  reasoning and the call is computed again (41 of the 56 generated tokens in
+  the test), where a reply that closed its thinking before the call is repeated
+  whole.
+- With `tool_choice: "none"`, or without tools, nothing binds the reply and
+  nothing reads calls: the marker inside the thinking is reasoning like any
+  other text. llama-server ends the reasoning at the marker there too and
+  returns the rest of the thinking as `content`.
 
 The server reads the calls out of the answer as it comes (`CallSplitter`, on
 what the reasoning's splitter calls content): it holds back what may still be
@@ -3376,7 +3436,8 @@ same call with `tool_calls` as the reason, as llama-server does.
 The text with drafts is the text without, as for every rule (host tests on the
 synthetic model: `crates/runtime/tests/tools.rs` under the rule, and
 `crates/server/tests/tools_engine.rs` from the request to the answer, where the
-reply is also the same whole and streamed). A request with tools that may be
+reply is also the same whole and streamed; both with a call after the thinking
+and with one inside it). A request with tools that may be
 called has a rule, which is free for the thinking and for the text before a
 call: there the request takes the model's own drafts like a request without
 tools, and the conductor stops taking what a window gives at the token that
@@ -3397,12 +3458,15 @@ as `auto` there (it reads `tool_choice` as a string), here it is enforced; a
 `response_format` or `json_schema` next to tools wins over them without a word
 there and is refused here, as `grammar` is by both (with `tool_choice: none`
 the other rule applies and the tools are only in the prompt); llama-server takes
-`<tool_call>` inside the thinking as the end of the thinking and the start of a
-call, here it is reasoning; the strings of an `enum` are enforced here and any
-text is accepted there; the white space between the content and a call is not
-part of `content` here. The legacy `functions` and `function_call` are refused.
+`<tool_call>` inside the thinking as the end of the thinking with and without
+tools, here only when the tools may be called; the strings of an `enum` are
+enforced here and any text is accepted there; the white space between the
+content or the reasoning and a call is part of neither here. The legacy
+`functions` and `function_call` are refused.
 The tests with real models (`crates/server/tests/real_tools.rs`: the 0.8B on
-one card, the 27B on two) are written and have not been run.
+one card, the 27B on two) are written and have not been run; the one of a call
+inside the thinking bans the token of `</think>` with a `logit_bias`, so that a
+model that wants to call has to open the call while it thinks.
 
 **The Messages API.** `POST /v1/messages` is Anthropic's Messages API. A
 request is served as the chat request that asks the same: the `anthropic`
