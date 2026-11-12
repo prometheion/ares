@@ -22,7 +22,7 @@ use ares_cuda::{Device, Precision, Wait};
 use ares_gguf::Gguf;
 use ares_model::qwen35::device::{Options, Qwen35, Spread};
 use ares_runtime::{GpuConfig, Model, Runtime, RuntimeConfig};
-use ares_tokenizer::{ChatOptions, Json};
+use ares_tokenizer::{ChatOptions, EncodeOptions, Json, Tokenizer};
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, header};
@@ -49,6 +49,8 @@ fn model_path() -> Option<PathBuf> {
 /// The server over the engine.
 struct Served {
     app: Router,
+    engine: Arc<dyn Engine>,
+    path: PathBuf,
 }
 
 impl Served {
@@ -83,7 +85,19 @@ impl Served {
         let devices = vec![Device::open(ordinal, Wait::Block).unwrap()];
         let runtime = Arc::new(Runtime::start_gpu(as_model, devices, config, gpu).unwrap());
         let engine: Arc<dyn Engine> = runtime;
-        Self { app: ares_server::router(engine) }
+        Self { app: ares_server::router(engine.clone()), engine, path: path.clone() }
+    }
+
+    /// The token of the tag that closes the thinking, which the chat template
+    /// of the model names.
+    fn thinking_end(&self) -> u32 {
+        let format = self.engine.chat_format("q").expect("a chat format");
+        let close = format.thinking.expect("the model thinks").end_tag().to_owned();
+        let tokenizer = Tokenizer::from_gguf(&Gguf::open(&self.path).unwrap()).unwrap();
+        let tokens =
+            tokenizer.encode(&close, EncodeOptions { add_special: false, parse_special: true });
+        assert_eq!(tokens.len(), 1, "{close} is {tokens:?}");
+        tokens[0]
     }
 
     async fn post(&self, path: &str, body: &Value) -> (u16, Value) {
@@ -265,26 +279,83 @@ async fn with_thinking_on_the_thinking_is_free_and_the_answer_obeys() {
         "required": ["answer", "unit"],
         "additionalProperties": false,
     });
+    let format = json!({"type": "json_schema", "json_schema": {"name": "a", "schema": schema}});
     let question = "Anna has 3 apples and buys 4 more. How many apples does she have?";
-    let choice = served
-        .chat(
-            question,
-            json!({
-                "response_format": {"type": "json_schema", "json_schema": {"name": "a", "schema": schema}},
-                "max_tokens": 3000,
-                "temperature": 0,
-            }),
-        )
-        .await;
+    let reasoning_of = |choice: &Value| {
+        choice["message"]["reasoning_content"].as_str().unwrap_or_default().to_owned()
+    };
+
+    // The thinking is free: under the rule it is the thinking of the same
+    // request without a rule, character for character. The limit cuts both
+    // while the model thinks (a model that is done sooner has the same
+    // thinking all the same, and then an answer that differs).
+    let cut = json!({"max_tokens": 200, "temperature": 0});
+    let free = served.chat(question, cut.clone()).await;
+    let mut ruled = cut;
+    ruled["response_format"] = format.clone();
+    let ruled = served.chat(question, ruled).await;
+    let thinking = reasoning_of(&ruled);
+    eprintln!(
+        "RES thinking, cut at 200 tokens: {} bytes of reasoning with the rule, {} without",
+        thinking.len(),
+        reasoning_of(&free).len()
+    );
+    assert_eq!(thinking, reasoning_of(&free), "the rule changed the thinking");
+    // It is prose, which no JSON value is, and which the schema would have
+    // refused from its first character.
+    assert!(thinking.len() > 40, "the model did not think: {ruled}");
+    assert!(serde_json::from_str::<Value>(thinking.trim()).is_err(), "{thinking:?}");
+
+    // The answer obeys once the thinking is over. When that is, is the
+    // model's business: the 0.8B, taking the most probable token, thinks about
+    // this question in a loop of six lines to any limit, with the rule and
+    // without. So the token of the closing tag gets a bias, the least of a
+    // ladder with which the reply leaves its thinking and ends by itself;
+    // none where the model leaves by itself. A bias brings the tag forward
+    // and changes nothing else: the tag is no part of the answer's JSON.
+    let close = served.thinking_end();
+    let mut left = None;
+    for bias in [0.0, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 16.0, 24.0] {
+        let choice = served
+            .chat(
+                question,
+                json!({
+                    "response_format": format,
+                    "max_tokens": 600,
+                    "temperature": 0,
+                    "logit_bias": [[close, bias]],
+                }),
+            )
+            .await;
+        eprintln!(
+            "RES thinking, a bias of {bias} on the closing tag: {} bytes of reasoning, answer \
+             {:?}, finish {}",
+            reasoning_of(&choice).len(),
+            choice["message"]["content"].as_str().unwrap_or_default(),
+            choice["finish_reason"]
+        );
+        if choice["finish_reason"] == "stop" {
+            left = Some(choice);
+            break;
+        }
+    }
+    let choice = left.expect("no bias of the ladder made the reply leave its thinking");
     let message = &choice["message"];
-    let reasoning = message["reasoning_content"].as_str().unwrap_or_default();
+    let reasoning = reasoning_of(&choice);
     let text = message["content"].as_str().unwrap_or_default();
-    eprintln!("RES thinking: {} bytes of reasoning, answer {text:?}", reasoning.len());
-    assert_eq!(choice["finish_reason"], "stop", "reasoning {reasoning:?}, content {text:?}");
-    // The thinking is free: it is prose, which no JSON value is, and which the
-    // schema would have refused from its first character.
-    assert!(reasoning.len() > 40, "the model did not think: {message}");
-    assert!(serde_json::from_str::<Value>(reasoning.trim()).is_err(), "{reasoning:?}");
+    // The thinking came first and is the start of the free thinking above, or
+    // all of it.
+    assert!(reasoning.len() > 40, "the reply left its thinking at once: {message}");
+    let shared = reasoning.len().min(thinking.len());
+    assert!(
+        reasoning.is_char_boundary(shared) && thinking.is_char_boundary(shared),
+        "{reasoning:?}"
+    );
+    assert_eq!(
+        reasoning[..shared].trim_end(),
+        thinking[..shared].trim_end(),
+        "the same thinking up to the tag"
+    );
     // The answer obeys.
     let answer: Value = serde_json::from_str(text).unwrap_or_else(|e| panic!("{text:?}: {e}"));
     let object = answer.as_object().expect("an object");
@@ -295,7 +366,7 @@ async fn with_thinking_on_the_thinking_is_free_and_the_answer_obeys() {
         .chat(
             question,
             json!({
-                "response_format": {"type": "json_schema", "json_schema": {"name": "a", "schema": schema}},
+                "response_format": format,
                 "chat_template_kwargs": {"enable_thinking": false},
                 "temperature": 0,
             }),
