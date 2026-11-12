@@ -135,9 +135,9 @@ mod tests {
         let bell = Bell::new();
         bell.bind();
         bell.ring();
-        let started = Instant::now();
+        // A wait that does not spin parks unless the ring is there already:
+        // that it ended as a spin says that it did not sleep.
         assert_eq!(bell.wait_past(0, Duration::ZERO), (1, Woke::Spinning));
-        assert!(started.elapsed() < Duration::from_millis(100));
     }
 
     #[test]
@@ -166,7 +166,14 @@ mod tests {
                 bell.wait_past(0, Duration::ZERO)
             })
         };
-        thread::sleep(Duration::from_millis(50));
+        // The ring comes once the waiter has said that it parks, however long
+        // its thread takes to get that far: a ring before that would be seen
+        // without parking.
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !bell.parked.load(Ordering::SeqCst) {
+            assert!(Instant::now() < deadline, "the waiter never parked");
+            thread::sleep(Duration::from_millis(1));
+        }
         bell.ring();
         assert_eq!(waiter.join().unwrap(), (1, Woke::Parked));
     }
