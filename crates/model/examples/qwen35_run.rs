@@ -11,8 +11,8 @@
 //!     [--show-layouts] [--kv q8,q8]
 //! ```
 //!
-//! - `--max-rows N`: the rows of a step (and so the scratch); by default what
-//!   the file's types pay for (`step_rows`).
+//! - `--max-rows N`: the rows of a step (and so the scratch); by default the
+//!   default of the model's options.
 //! - `--kv K,V`: the formats of K and of V of the attention blocks (`f16`, `q8`
 //!   to `q4`; the default is `q8,q8`); the draft block's are always `q4`.
 //!   With `q7` to `q4` a second, small pool of exact entries holds the first
@@ -71,11 +71,11 @@ use std::time::{Duration, Instant};
 
 use ares_cuda::{CacheFormat, Device, Precision, StateFormat, Wait};
 use ares_gguf::Gguf;
+use ares_model::qwen35::Config;
 use ares_model::qwen35::device::placement::{HalfShares, Placement};
 use ares_model::qwen35::device::{
-    Layouts, Options, PHASES, PartReport, Profile, Qwen35, Rows, Session, Spread, Wanted, step_rows,
+    Layouts, Options, PHASES, PartReport, Profile, Qwen35, Rows, Session, Spread, Wanted,
 };
-use ares_model::qwen35::{Config, Weights};
 use ares_runtime::Pick;
 use ares_tokenizer::{ChatOptions, EncodeOptions, Message};
 
@@ -161,14 +161,9 @@ struct Args {
 }
 
 impl Args {
-    /// The rows of a step: the one asked for, or what the file's types pay for.
+    /// The rows of a step: the one asked for, or the default of the options.
     fn rows(&self) -> u32 {
-        self.max_rows.unwrap_or_else(|| {
-            let gguf = Gguf::open(&self.model).expect("the model file");
-            let config = Config::from_gguf(&gguf).expect("the configuration");
-            let weights = Weights::load(&gguf, &config).expect("the weights");
-            step_rows(&weights, self.precision)
-        })
+        self.max_rows.unwrap_or(Options::default().max_rows)
     }
 }
 

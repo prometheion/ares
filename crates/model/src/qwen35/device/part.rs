@@ -84,7 +84,16 @@ pub struct Options {
     /// entries and converts tiles as they leave the newest cells
     /// ([`PAGE_ENTRY`] names the converted entry of a page).
     pub kv: (CacheFormat, CacheFormat),
-    /// The most rows of a step: decides the scratch.
+    /// The most rows of a step: decides the scratch. Every weight type has
+    /// a tile kernel, so a wide step pays for every file. The default is
+    /// where the rate of reading a prompt stopped growing on Qwen3.8-27B
+    /// (2026-11-12, an RTX 4070 and an RTX 3060, prompts of 2048 tokens): the
+    /// `Q4_K_S` file on a tensor split of 0.625 / 0.375 read 870, 952, 1238,
+    /// 1358, 1363 and 1370 tokens per second in steps of 128, 256, 384, 512,
+    /// 768 and 1024 rows (a scratch of 59, 90, 122, 153, 216 and 279 MiB on
+    /// the RTX 4070), the `IQ2_XXS` file on one RTX 4070 1008, 1131, 1172 and
+    /// 1213 in steps of 128, 256, 512 and 1024 rows (76, 119, 205 and 377
+    /// MiB). Files in `f32`, `f16` or `bf16` have not been measured.
     pub max_rows: u32,
     /// The most rows of a step whose logits are wanted.
     pub logit_rows: u32,

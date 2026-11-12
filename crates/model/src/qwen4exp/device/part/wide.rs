@@ -116,9 +116,6 @@ impl State {
             )));
         }
         let types = dense_types(w);
-        if let Some(ty) = types.iter().find(|ty| !Kernels::has_prefill_matmul(**ty)) {
-            return Err(invalid(format!("the weights of type {ty} have no kernel for wide steps")));
-        }
         // One form of activations for every dense matrix, so that each fused kernel writes
         // one: the form the options' precision gives all of them, else the exact one, which
         // is f16 for all.

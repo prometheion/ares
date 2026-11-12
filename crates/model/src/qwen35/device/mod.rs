@@ -23,7 +23,6 @@ mod harness;
 mod load;
 mod part;
 pub mod placement;
-mod rows;
 mod runtime;
 mod session;
 
@@ -36,6 +35,5 @@ pub use part::{
     exact_bytes, page_bytes, state_slot_bytes,
 };
 pub use placement::{BlockSlice, DevicePlan, DraftPlan, Placement, PlacementError};
-pub use rows::{BATCHED_ROWS, step_rows};
 pub use runtime::{OpenError, PartReport, Qwen35, Spread};
 pub use session::{Rows, Session, StepTime, Wanted};
