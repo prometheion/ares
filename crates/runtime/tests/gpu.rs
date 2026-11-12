@@ -501,3 +501,89 @@ fn requests_with_different_settings_in_one_step_do_not_affect_each_other_on_ever
         }
     });
 }
+
+/// Binds the last three tokens of every `period` tokens of a reply to the
+/// letters from x to z and leaves the others free.
+struct Stretches {
+    period: usize,
+}
+
+impl Stretches {
+    fn binds(&self, place: usize) -> bool {
+        place % self.period >= self.period - 3
+    }
+}
+
+impl TokenFilter for Stretches {
+    fn mask(&mut self, reply: &[u32], drafts: &[u32], mask: &mut TokenMask) -> bool {
+        if !self.binds(reply.len() + drafts.len()) {
+            return false;
+        }
+        mask.fill(false);
+        for token in b'x'..=b'z' {
+            mask.set(u32::from(token), true);
+        }
+        true
+    }
+
+    fn free_rows(&mut self, reply: &[u32], tokens: &[u32]) -> usize {
+        (0..=tokens.len()).take_while(|k| !self.binds(reply.len() + k)).count()
+    }
+}
+
+/// A request with a rule that is free for stretches of its reply takes the
+/// model's own drafts in them: the windows carry no mask, and what a window
+/// gives ends at the token before a bound one. The tokens are the same with
+/// drafts and without, on every placement.
+///
+/// The text never repeats, so the lookup in earlier text has nothing to
+/// offer. The synthetic model's draft block drafts what it has seen the model
+/// pick, so the reply is made once without drafts on one runtime, and again
+/// with drafts on a second runtime of the same model: its block knows the
+/// reply, bound tokens included, and its lookup knows nothing.
+#[test]
+fn a_rule_that_is_free_in_stretches_takes_the_models_drafts_on_every_placement() {
+    on_every_placement(|split, devices| {
+        for period in [7usize, 10, 13] {
+            let mut s = setup(split, devices);
+            s.model = s.model.repetitive(1, 1).with_own_drafts(4, &[]);
+            let used = s.model.devices;
+            let model = Arc::new(SyntheticModel::new(s.model).unwrap());
+            let open = || {
+                let gpu = GpuConfig::new(&s.runtime, &*model);
+                let devices = gpus().expect("enabled")[..used].to_vec();
+                Runtime::start_gpu(model.clone(), devices, s.runtime.clone(), gpu)
+                    .expect("the runtime starts")
+            };
+            let prompt = "free and bound in turn";
+            let ask = |rt: &Runtime, draft: bool| {
+                let mut r = request(prompt, Some(150));
+                r.draft = draft;
+                start_filtered(rt, r, Stretches { period }).unwrap().finish()
+            };
+            let first = open();
+            let expected = ask(&first, false);
+            assert_eq!(expected.usage.completion_tokens, 150, "stretches of {period}");
+            let letters = expected.text.chars().filter(|c| ('x'..='z').contains(c)).count();
+            assert!(letters >= 3 * (150 / period), "stretches of {period}: {}", expected.text);
+            first.shutdown();
+            drop(first);
+
+            let second = open();
+            let got = ask(&second, true);
+            assert_eq!(got, expected, "stretches of {period}: drafts changed the reply");
+            let c = snapshot(&second).counters;
+            let (windows, accepted): (u64, u64) =
+                (c.draft_lengths[1].iter().sum(), c.drafts_accepted_at[1].iter().sum());
+            eprintln!(
+                "RES stretches of {period}: {windows} windows took the block's drafts, {accepted} \
+                 of its drafts accepted, {} rows of drafts cut again",
+                c.drafts_rejected
+            );
+            assert!(
+                accepted > 10,
+                "stretches of {period}: {accepted} drafts of the block accepted"
+            );
+        }
+    });
+}
