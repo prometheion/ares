@@ -5,7 +5,8 @@
 //! answers each with [`SyntheticModel::host_pick`], a fixed function of the
 //! row's token and context, so the conductor's planning, page handling,
 //! speculation, stopping and event delivery run exactly as with devices.
-//! It is not an inference path: its picks mean nothing, and it exists so that
+//! It is not an inference path: its picks mean nothing (a row with a mask picks
+//! the first token its mask allows from the pick on), and it exists so that
 //! every decision the conductor makes can be checked by the default
 //! `cargo test`, and so that the benchmark can show what the conductor costs
 //! with devices that take no time.
@@ -139,6 +140,20 @@ impl std::fmt::Debug for HostExecutor {
 }
 
 impl HostExecutor {
+    /// A row that carries a mask picks the first token the mask allows from
+    /// its own pick on (and on around the vocabulary): still a fixed function
+    /// of the row, and a pick the mask forbids is never made.
+    fn apply_masks(view: &RecordView<'_>, picks: &mut [Pick], vocab: u32) {
+        for (index, pick) in picks.iter_mut().enumerate() {
+            let Some(mask) = view.sampler(index as u32).mask() else { continue };
+            let allowed = |t: u32| view.mask_word(mask, t / 32) >> (t % 32) & 1 != 0;
+            if let Some(token) = (0..vocab).map(|k| (pick.token + k) % vocab).find(|&t| allowed(t))
+            {
+                pick.token = token;
+            }
+        }
+    }
+
     /// An executor for `model`, which sizes the record for `max_rows` rows and
     /// `max_slots` sequences.
     pub fn new(model: Arc<SyntheticModel>, max_rows: u32, max_slots: u32) -> Self {
@@ -335,6 +350,7 @@ impl Executor for HostExecutor {
             }
         }
         drop(tables);
+        Self::apply_masks(&view, &mut self.picks, self.model.config().vocab());
         self.dispatched_at = Instant::now();
         Ok(())
     }

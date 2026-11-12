@@ -346,6 +346,7 @@ fn run_once(rt: &Runtime, o: &Options, n: usize, round: usize) -> Run {
             max_tokens: Some(o.tokens),
             stop: Vec::new(),
             draft: true,
+            structure: None,
             id: RequestId((round * 1000 + i) as u64 + 1),
         };
         rt.submit(

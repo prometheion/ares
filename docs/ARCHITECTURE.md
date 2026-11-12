@@ -171,6 +171,7 @@ machine (RTX 4070 + RTX 3060, Qwen3.8-27B) or read from the engines listed in
 | `ares-quant` | CPU reference decoder for every GGUF type; the specification and reference codec of the engine's own KV formats (`f16`, `q8` to `q4`, tiles with a mean, the policy of exact cells) | Done; bit-identical to ggml's C code on fixtures generated from it; the KV formats are pinned by golden files and were measured on the K and V of real models |
 | `ares-sampler` | The definitions of the sampler: the settings of a row, the arithmetic every backend repeats bit for bit, the pick of one row written from its definitions (`sample_reference`), the penalties, DRY and logit bias the host works out, token masks | Done; the reference is checked against llama.cpp's samplers written again in double precision, the penalties against their definition; see [Sampling](#sampling) |
 | `ares-cuda` | Driver API bound at run time, devices, memory, streams, events, modules, decode weight kernels for all 28 weight types, prefill weight kernels for eleven, the layer kernels of `qwen35`, attention over the stored K/V formats, the sampler's kernels, the mesh that sums across devices over peer access or the host | Device layer, decode, layer and attention kernels done; prefill kernels verified, their pass over the weights 1.3 times as fast as the fork's whole prefill; tested on both GPUs, with and without peer access |
+| `ares-grammar` | The grammar engine on the host: GBNF grammars, JSON schemas, Lark and regular expressions turned into the set of tokens that may come next (llguidance behind a vocabulary of bytes per token), the reasoning gate, the cut of forbidden drafts | Done; GPU-free tests of the engine, and through the runtime and the server; see [Sampling](#sampling) |
 | `ares-vulkan` | The same device-level surface on Vulkan; decode and prefill weight kernels for all 28 weight types as compute shaders, the prefill ones on cooperative matrices; the layer kernels; attention over the stored K/V formats; sums between devices | Device layer and weight, layer and attention kernels done (23 device, 9 kernel, 8 layer, 4 layout, 9 mesh and 9 attention tests on both GPUs); no sampler (to be rebuilt against `ares-sampler`), no expert or `qwen4exp` kernels and no model yet |
 | `ares-state` | Page pool, page tables with copy on write, the prefix index (pages published as they fill, tails, announcements, priority classes), the checkpoint policy for recurrent state, page layouts | Done as bookkeeping; randomised model checks; the conductor's prefix cache uses them (see `ares-runtime`) |
 | `ares-store` | State on disk: pages and checkpoints by content hash in segment files, per fingerprint, with a size limit | Done as a store of opaque bytes, tested against restarts, the limit and damaged files; not yet connected to devices |
@@ -1167,14 +1168,83 @@ cached. What is refused, by name: `min_keep` above 1, `repeat_last_n` or
 `dry_penalty_last_n` above 1024 or -1, more than 1024 biased tokens, more than
 20 alternatives, `n` above 16, `adaptive_target`, `adaptive_decay`, the sampler
 names `infill` and `adaptive_p`, a `samplers` list that puts penalties or DRY
-after a sampler that cuts, and what belongs to the grammar and tool-call
-work still to come.
+after a sampler that cuts, and what belongs to the tool-call work still to
+come. Structured output is read from `grammar`, `json_schema` and
+`response_format` (below).
 
-**The hook for grammars.** A request can carry a `TokenFilter`
+**The hook.** A request can carry a `TokenFilter`
 (`Runtime::submit_filtered`): before each step the conductor asks it, for every
 wanted row, which tokens may follow the reply and the drafts before the row, and
-writes the answer as a mask into the record. The mechanism is tested with masks
-made by tests; the grammar engine is the next piece.
+writes the answer as a mask into the record; it may also say how many of the
+drafts it allows, and that it has failed. Grammars are one such filter.
+
+**Structured output.** A request can carry a `Structure` (`ares-api`): a rule
+for the text of the reply, a grammar in GBNF or a JSON schema, and where in the
+reply the rule starts to bind. The engine turns it into the set of tokens that
+may come next at every row, writes that set as a mask into the step record, and
+the sampler applies it before the draw like any other mask (above), so a reply
+follows the rule from the first token to the last or the request ends in an
+error. `Runtime::submit_filtered` still takes any `TokenFilter`; a request with
+a `Structure` gets one made by the runtime.
+
+*The engine.* `ares-grammar` wraps llguidance (MIT, crates.io, version 1.9;
+Cargo.toml names it with the thread pool of its C interface left out; it builds
+offline once fetched): an Earley parser over lexemes that a lexer built on
+derivatives of regular expressions finds, with the token mask computed by
+walking the vocabulary's trie. It is suitable because it takes the vocabulary
+as bytes per token, which is what `Model::piece` gives, and needs nothing but
+that: the tokens a control token stands for are empty and no grammar allows
+them, and the end tokens are allowed exactly where the grammar can end. Reading
+the vocabulary of 248,320 tokens takes about a second; the runtime does it on a
+thread of its own when it starts, and a request with a structure waits for it
+if it comes sooner. Compiling a grammar takes one to two milliseconds.
+
+*Kinds.* `grammar` is GBNF as llama.cpp reads it (`root`, literals and
+classes, groups, `*`, `+`, `?`, `{m,n}`, `.`, `<[id]>` and `!<[id]>` tokens,
+comments, the same rules for where a line ends a rule); it is translated to
+the engine's Lark syntax, with the position of a syntax error (line and column)
+in the message. Left recursion, which llama.cpp refuses, works. `json_schema`
+and the schemas of `response_format` go to the engine's JSON compiler, in
+llama.cpp's way: keywords it does not know are left out (the engine's default
+refuses them), white space between the parts is llama.cpp's own (one space, or
+line breaks and an indent of up to 20, so a model cannot fill its reply with
+blanks), `$ref` is followed inside the schema and a remote one is refused (the
+server fetches nothing). An empty schema is any object, as llama-server reads
+it.
+
+*Where the rule starts.* A model that thinks is free while it thinks. The
+server knows the format from the chat template (`ThinkingFormat`) and sets
+`Start` for the request: from the first token when the template has no
+thinking or the prompt has closed the block (thinking off); after the closing
+tag when the prompt has opened the block (`<think>\n`); and for a template that
+writes nothing into the prompt, either the opening tag followed by reasoning
+or the rule from the first token. llama-server does this for `response_format`
+and `json_schema` (it builds the grammar around the reasoning parser) and binds
+a plain `grammar` to the first token, which keeps a thinking model from
+thinking; this server binds all three after the reasoning, and
+`enable_thinking: false` gives the other behaviour. The answer starts at the
+token after the closing tag: the blank line the template writes there is not
+allowed to the model, and a closing tag that shares a token with the start of
+the answer is not checked against the rule for the rest of that token.
+
+*Drafts.* The text with drafts is the text without. Every row of a window gets
+the mask of its own path, so a draft the rule forbids is never the pick of the
+row before it and is rejected whatever happens. On top of that the conductor
+cuts a forbidden draft, and the ones after it, from the lookup's proposal
+before the window is chosen (`TokenFilter::admitted`), so the rows are not paid
+for: a test with runs of one letter has every draft verified accepted, and 74 of
+119 without the cut. A request with a rule takes no drafts from the model's own
+draft block (their tokens are not known when the record is written, as for
+penalties). Tokens the rule forces (one token allowed) are not offered as
+drafts: the lookup is the drafter that joins next to a draft block, and a
+forced token would be a third source with a chance of one; it is not built.
+
+*Errors.* A grammar or schema the engine refuses is a 400 that names the field
+and the problem; both `grammar` and `json_schema` (or `response_format`) in one
+request is a 400, where llama-server takes one of them silently. If the engine
+fails in the middle of a reply (it ran out of the fuel it gives a grammar, or
+the grammar allows no token and the model has no end token) the request ends
+with an error and the text is not sent.
 
 ## Weights
 
@@ -2710,7 +2780,7 @@ GPU that CUDA 13 does not run on.
 | vLLM, SGLang, TGI, TokenSpeed, LMDeploy, ExLlamaV3 (their schedulers and caches) | Pages claimed per step with a reservation for the output still expected; a request waits when it does not fit; prefix pages published when they fill, with tails; checkpoint intervals and eviction for recurrent state; a context term in the step cost | `ares-sched`, `ares-state` (done as bookkeeping, not wired into the conductor) |
 | TensorRT-LLM, SGLang, vLLM (suffix decoding) | One lookup drafter on a suffix automaton over a corpus shared by all requests | `ares-sched`, used by the conductor |
 | MiniJinja | The interpreter of chat templates | `ares-tokenizer` |
-| llguidance | Grammar-constrained output: the grammar engine on the host gives a mask per row, which the sampler applies on the device (the mask and its hook are built, see [Sampling](#sampling)) | Mask built; the engine is planned |
+| llguidance | Grammar-constrained output: the grammar engine on the host gives a mask per row, which the sampler applies on the device (the mask and its hook are built, see [Sampling](#sampling)) | Done (`ares-grammar`): GBNF and JSON schema on the sampler's mask, after the reasoning of a model that thinks, and a forbidden draft is cut; Lark and regular expressions are in the engine and have no request field |
 | AirLLM | Nothing beyond the expert tiers: reading whole layers per pass is bounded by disk throughput | - |
 | Run My AI, ik_llama.cpp, Fiddler, ktransformers, BELLS, AI-DER, FATE, ProMoE | Direct reads with demand before prefetch; prefill layer by layer in waves of experts; the RAM tier as a cache with admission and protection; the order of work inside a MoE layer; slots per layer by need; fused gate and up of an expert | `ares-io` (reads done); the rest planned, see [Weights](#weights) |
 
@@ -2838,7 +2908,7 @@ order it would be taken up; the source of each idea is in
    starting point), experts, the `qwen4exp` kernels, and the models; attention for
    windows of many rows on the cooperative matrices, and a faster decode of
    the `q8` and `q4` rows; a faster upload.
-7. Grammars (llguidance) on the sampler's mask, tool calls, the
+7. Tool calls (on the grammars of Sampling), the
    router mode with `models.ini`, multimodal input, `Engine::decide` and
    `/v1/systemone` on the real engine.
 8. A path for Turing; a run on any card that is not one of the two here.
@@ -2971,8 +3041,11 @@ dropped, pages copied, pages cached, RAM locked for checkpoints). The sampling
 fields of the OpenAI API and of llama.cpp's server are read under their names
 (see [Sampling](#sampling)), `n` completions of a prompt are `n` requests that
 read the prompt once, and the probabilities of the tokens come back in the
-answer, streamed or not. A field of a request that the server does not hand to
-the engine is refused by name, not ignored: grammars, tools and images among
+answer, streamed or not, and `grammar`, `json_schema` and `response_format` make the
+reply follow a GBNF grammar or a JSON schema (see [Sampling](#sampling), "Structured
+output"; the same fields on chat and on completions, and a model that thinks is free
+while it thinks). A field of a request that the server does not hand to
+the engine is refused by name, not ignored: tools and images among
 them today, and the sampler's few limits (a history of more than 1024 tokens
 for the penalties, more than 20 alternatives, `min_keep` above 1, adaptive-p).
 A client that disconnects frees its sequence. The

@@ -19,6 +19,14 @@ ares-weights = { path = "crates/weights" }
 ares-store = { path = "crates/store" }
 ares-tokenizer = { path = "crates/tokenizer" }
 ares-sampler = { path = "crates/sampler" }
+ares-grammar = { path = "crates/grammar" }
+
+# The grammar engine behind structured output (MIT): an Earley parser with a
+# lexer built on derivatives, which gives the tokens a grammar allows next. The
+# default features also pull in a thread pool that serves its C interface, which
+# this engine does not use.
+llguidance = { version = "1.9", default-features = false, features = ["lark", "referencing", "ahash"] }
+toktrie = "1.9"
 
 thiserror = "2"
 memmap2 = "0.9"

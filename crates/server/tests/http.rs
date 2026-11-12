@@ -610,9 +610,6 @@ async fn bad_requests_are_refused_before_the_engine_sees_them() {
         chat(json!({"stream": "yes"})).into_case(Some("stream"), "stream must be a boolean"),
         chat(json!({"stream_options": 5})).into_case(Some("stream_options"), "must be an object"),
         // What the server does not do is refused by name, never dropped.
-        chat(json!({"grammar": "root ::= \"a\""})).into_case(Some("grammar"), "structured output"),
-        chat(json!({"json_schema": {"type": "object"}})).into_case(Some("json_schema"), "structured output"),
-        chat(json!({"response_format": {"type": "json_object"}})).into_case(Some("response_format"), "structured output"),
         chat(json!({"top_logprobs": 5})).into_case(Some("top_logprobs"), "requires logprobs"),
         chat(json!({"tool_choice": "required"})).into_case(Some("tool_choice"), "tool calls are not built"),
         chat(json!({"functions": []})).into_case(Some("functions"), "tool calls are not built"),

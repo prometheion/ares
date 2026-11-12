@@ -2,7 +2,8 @@
 
 Made on 2026-11-11. Read-only survey: nothing was built or run, no repository was changed. The `Ares` column of
 R03 to R12, R14, R16, R21 and H02, the counts and the lists were brought up to date on 2026-11-12, when the
-sampler's features (penalties, DRY, logit bias, probabilities, `n` and the rest) were built.
+sampler's features (penalties, DRY, logit bias, probabilities, `n` and the rest) were built; G01, G03, G06, G07
+and G09 were brought up to date the same day, when structured output was built.
 One row is one capability that a user or operator of an inference server can observe or rely on.
 
 ## How to read it
@@ -113,15 +114,15 @@ or no-op options; Ares may do a thing differently as long as the result is not w
 
 | ID | Feature | Engines | What it is | Ares | Frame | Need |
 | --- | --- | --- | --- | --- | --- | --- |
-| G01 | JSON object and JSON schema | llama, vllm, sglang, tgi, trt, mlc, ollama, tfold, lmdeploy, lmstudio, mistralrs?; strata by validation | `response_format` `json_object` or `json_schema` enforced while decoding | not started (refused; llguidance on the GPU's candidates is planned) | yes | essential |
+| G01 | JSON object and JSON schema | llama, vllm, sglang, tgi, trt, mlc, ollama, tfold, lmdeploy, lmstudio, mistralrs?; strata by validation | `response_format` `json_object` or `json_schema` enforced while decoding | done: `response_format` (`json_object`, `json_schema` with `strict`), llama.cpp's `json_schema` and `schema` of `json_object`, on chat and on completions; the schema is always enforced by the grammar engine (llguidance) on the sampler's mask | yes | essential |
 | G02 | Regular expression | sglang, tfold, lmdeploy, vllm?, tgi? | the reply matches a regex | not started | yes | niche |
-| G03 | Context-free grammar | llama, kobold, localai (GBNF); sglang, tfold, vllm? (EBNF) | the reply follows a grammar | not started | yes | common |
+| G03 | Context-free grammar | llama, kobold, localai (GBNF); sglang, tfold, vllm? (EBNF) | the reply follows a grammar | done: `grammar` in GBNF as llama.cpp reads it (left recursion works), on chat and on completions; syntax errors are 400s with line and column | yes | common |
 | G04 | Choice | tfold, vllm? | the reply is one of the given strings | not started | yes | niche |
 | G05 | Grammar on a trigger | vllm, sglang | free text until a tag opens, then the grammar of that tag (structural tags); the basis of strict tool calls | not started | yes | common |
-| G06 | Grammar with thinking | tfold, sglang? | the grammar starts after the think block closes | not started | yes | common |
-| G07 | Grammar under drafts | tfold, vllm?, mlc? | drafts are cut at the first token the grammar refuses; tokens the grammar forces are appended as drafts | not started | yes | common |
+| G06 | Grammar with thinking | tfold, sglang? | the grammar starts after the think block closes | done: a grammar, a schema or a `response_format` binds the text after the closing tag of the reasoning (free while it thinks); a template that writes no tag into the prompt lets the reply open the block or answer; thinking off binds the whole reply | yes | common |
+| G07 | Grammar under drafts | tfold, vllm?, mlc? | drafts are cut at the first token the grammar refuses; tokens the grammar forces are appended as drafts | partly: a draft the grammar refuses is cut before it is verified, and every row of a window has the mask of its own path; tokens the grammar forces are not offered as drafts | yes | common |
 | G08 | Completable within the limit | tfold | `grammar_budget`: never draw a token after which the value cannot close within `max_tokens` | not started | yes | niche |
-| G09 | Bounded whitespace in JSON | sglang, tfold | a model cannot fill its reply with blanks inside a value | not started | yes | niche |
+| G09 | Bounded whitespace in JSON | sglang, tfold | a model cannot fill its reply with blanks inside a value | done for schemas and `json_object` (llama.cpp's white space: one space, or line breaks with an indent of up to 20); a GBNF grammar has the white space its author wrote | yes | niche |
 
 ## 4. Request features: tool calling
 
@@ -342,31 +343,30 @@ Counted from the tables above with a script (see the end of this file for the co
 | --- | --- |
 | Total | 223 |
 | Inside the frame | 200 |
-| - done | 52 |
-| - partly | 38 |
-| - not started | 110 (essential 7, common 35, niche 68) |
+| - done | 56 |
+| - partly | 39 |
+| - not started | 105 (essential 6, common 32, niche 67) |
 | Outside the frame | 23 (all not started) |
 
-Of the 52 done rows 25 are essential, 22 common and 5 niche; of the 38 partly rows 11 are essential, 13 common
+Of the 56 done rows 26 are essential, 24 common and 6 niche; of the 39 partly rows 11 are essential, 14 common
 and 14 niche. A row is one capability, so the counts weigh a sampler option like a model router; List 1 orders
 them by need instead.
 
 ## List 1: inside the frame, not started, most depended-on first
 
-**Essential (7).** Without these a current agent client cannot use the server at all.
+**Essential (6).** Without these a current agent client cannot use the server at all.
 
 - T01 tool calls (parse, stream, results back)
 - K01 reasoning separated from the answer
-- G01 JSON object and JSON schema output
 - R23 sampling defaults of the server
 - M02 several models loaded on request, and M03 the preset file
 - X01 API keys
 
-**Common (35).**
+**Common (32).**
 
 - API: A04 Responses, A07 Anthropic Messages, A08 token counting, A09 tokenize, A16 model properties
 - Sampling: R25 server cap for the output length
-- Structured output: G03 grammars, G05 grammar on a trigger, G06 grammar with thinking, G07 grammar under drafts
+- Structured output: G05 grammar on a trigger
 - Tools: T02 forced tool choice, T03 parallel switch, T04 strict schemas, T05 recovery of imperfect calls
 - Reasoning: K03 thinking budget, K05 loop guard, K06 earlier reasoning in the history
 - Prompt: F07 template override, F09 continuing the assistant message, F11 image input, F18 truncation
@@ -377,8 +377,7 @@ them by need instead.
 - Observability: O01 latency histograms
 - Operations: X04 CORS, X05 Host and Origin checks, X09 container image and service unit
 
-**Niche (68).** A03, A05, A06, A10, A14, A20, A23 to A27; R13, R15, R17, R19, R22, R24, R27, R29; G02, G04, G08,
-G09; T06 to T10; K04, K07; F03, F05, F08, F10, F12, F13, F15, F19, F20; S14 to S16, S18 to S20, S23; P02, P05, P07,
+**Niche (67).** A03, A05, A06, A10, A14, A20, A23 to A27; R13, R15, R17, R19, R22, R24, R27, R29; G02, G04, G08; T06 to T10; K04, K07; F03, F05, F08, F10, F12, F13, F15, F19, F20; S14 to S16, S18 to S20, S23; P02, P05, P07,
 P08, P12, P23, P32, P34; M07, M09, M12, M13; V07; H11, H12; O05, O07; X02, X03, X06, X11; Q05.
 
 The rows that are `partly` are not in this list; the largest of them are Vulkan (H02: no sampler, expert
@@ -444,8 +443,11 @@ story saves and multiplayer; tunnels (kobold, tgi) and usage statistics sent hom
    recomputation are exact.
 8. **How JSON output is enforced.** Constrained decoding (llama, vllm, sglang, tgi, trt, mlc, tfold) or a schema
    in the prompt, validation afterwards and 502 on failure (strata). Grammar dialects differ: GBNF (llama,
-   kobold), EBNF through xgrammar (vllm, sglang, tfold), Lark through llguidance (planned for Ares).
-9. **A grammar and thinking.** The grammar starts after the think block closes (tfold), or thinking has to be off.
+   kobold), EBNF through xgrammar (vllm, sglang, tfold), GBNF and JSON schema through llguidance (Ares; Lark and regular expressions are in the engine
+   and have no request field).
+9. **A grammar and thinking.** The grammar starts after the think block closes (tfold; Ares; llama-server for
+   `response_format` and `json_schema`), or thinking has to be off (llama-server for a plain `grammar`, which binds
+   from the first token). Ares binds all three after the reasoning; `enable_thinking: false` binds the whole reply.
 10. **`tool_choice: required`.** Enforced by a grammar (vllm, llama, tfold's native server), by replacing tokens
     (tfold's Python server), or not supported (ollama's OpenAI route lists `tool_choice` as unsupported).
 11. **A call of a tool the request did not declare.** Text plus `strata_rejected_tool_calls` (strata's default),

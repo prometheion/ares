@@ -249,7 +249,7 @@ fn a_filter_makes_a_mask_for_every_wanted_row_and_the_record_carries_it() {
     let run = start_filtered(&rt, r, Counting { calls: calls.clone() }).unwrap().finish();
     assert_eq!(run.usage.completion_tokens, 200);
     let (wanted, held, checked) = *masks.lock().unwrap();
-    assert!(wanted > 200 && held == wanted && checked == wanted, "{wanted} {held} {checked}");
+    assert!(wanted >= 200 && held == wanted && checked == wanted, "{wanted} {held} {checked}");
     // The filter saw the reply grow by one token at a time, and the drafts of
     // a window before each of its rows.
     let calls = calls.lock().unwrap();

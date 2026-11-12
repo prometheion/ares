@@ -1400,6 +1400,14 @@ impl Conductor {
                     // The lookup first: its proposal costs nothing, and it
                     // learns from what is right whether it is taken or not.
                     a.drafter.draft(&self.corpus, cap, &mut a.lookup, &mut a.lookup_chances);
+                    // A draft that a rule of the request forbids cannot be
+                    // picked: it and the ones after it are not offered.
+                    a.sampler.cut_drafts(
+                        &a.tokens,
+                        a.prompt_len as usize,
+                        &mut a.lookup,
+                        &mut a.lookup_chances,
+                    );
                     // The model's own drafts are made on the device while the
                     // step runs, so a row cannot be corrected for the drafts
                     // before it, which it must be for some requests.
@@ -2056,6 +2064,14 @@ impl Conductor {
         for i in 0..self.parts.len() {
             let slot = self.parts[i].slot;
             let a = self.slots[slot as usize].as_mut().expect("running");
+            // A rule that failed in the middle of the reply: the picks of
+            // this step were made without it, and the text is not sent.
+            if let Some(message) = a.sampler.failure() {
+                a.emitted.clear();
+                let _ = a.sink.send(Event::Error(EngineError::Internal(message)));
+                self.retire(slot, FinishReason::Cancelled);
+                continue;
+            }
             let mut listening = true;
             // The probabilities of the tokens whose text goes out now go out
             // first (a token that prints nothing goes out with the text

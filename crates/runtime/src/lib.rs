@@ -65,6 +65,7 @@ mod model;
 mod ram;
 mod record;
 mod sampling;
+mod structured;
 mod sync;
 mod synthetic;
 pub mod testing;

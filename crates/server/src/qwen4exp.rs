@@ -420,6 +420,7 @@ fn warm_up(runtime: &Runtime, model: &str) -> Result<(), LoadError> {
         max_tokens: Some(32),
         stop: Vec::new(),
         draft: true,
+        structure: None,
         id: RequestId(0),
     };
     runtime.submit(request, sink).map_err(|e| LoadError::Start(format!("warm-up: {e}")))?;

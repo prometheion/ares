@@ -43,6 +43,21 @@ pub trait TokenFilter: Send {
     /// and `drafts`. Returns whether the row is restricted at all: a row that
     /// is not takes no mask.
     fn mask(&mut self, reply: &[u32], drafts: &[u32], mask: &mut TokenMask) -> bool;
+
+    /// How many of the leading `drafts` the rule allows after `reply`: the
+    /// drafts before the first token it forbids. A draft it forbids cannot be
+    /// picked, so the rows from there on would be wasted; the conductor cuts
+    /// them from the window. A rule that cannot tell allows all of them.
+    fn admitted(&mut self, _reply: &[u32], drafts: &[u32]) -> usize {
+        drafts.len()
+    }
+
+    /// Why the rule can no longer be followed, if it cannot (the engine behind
+    /// it failed in the middle of the reply). The request ends with an error:
+    /// text that goes on without the rule is not what was asked for.
+    fn failure(&mut self) -> Option<String> {
+        None
+    }
 }
 
 /// What the conductor keeps for all requests: the tokens that end a
@@ -303,6 +318,27 @@ impl RequestSampler {
     /// filter) takes only the drafts the host makes.
     pub fn allows_own_drafts(&self) -> bool {
         self.allows_drafts() && !self.corrections.path_dependent() && self.filter.is_none()
+    }
+
+    /// Cuts from `drafts` (and from `chances`, the chance of each) the first
+    /// draft the request's rule forbids and the ones after it. `tokens` are the
+    /// tokens of the request so far, the prompt first.
+    pub fn cut_drafts(
+        &mut self,
+        tokens: &[u32],
+        prompt_len: usize,
+        drafts: &mut Vec<u32>,
+        chances: &mut Vec<f64>,
+    ) {
+        let Some(filter) = &mut self.filter else { return };
+        let allowed = filter.admitted(&tokens[prompt_len.min(tokens.len())..], drafts);
+        drafts.truncate(allowed);
+        chances.truncate(allowed);
+    }
+
+    /// Why the request's rule failed, if it did.
+    pub fn failure(&mut self) -> Option<String> {
+        self.filter.as_mut().and_then(|filter| filter.failure())
     }
 
     /// The sampler row of the wanted row at `position` of a request whose

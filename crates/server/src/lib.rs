@@ -42,6 +42,7 @@ pub mod plan;
 mod qwen4exp;
 mod reasoning;
 mod routes;
+mod structured;
 mod systemone;
 mod wire;
 

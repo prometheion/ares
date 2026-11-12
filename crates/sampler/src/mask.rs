@@ -66,6 +66,18 @@ impl TokenMask {
         &self.words
     }
 
+    /// Makes the mask the one `words` spell (bit `t % 32` of word `t / 32` is
+    /// token `t`). The bits past the last token are cleared.
+    ///
+    /// # Panics
+    ///
+    /// When `words` is not [`TokenMask::words_for`] the tokens long.
+    pub fn copy_words(&mut self, words: &[u32]) {
+        assert_eq!(words.len(), self.words.len(), "a mask of {} tokens", self.tokens);
+        self.words.copy_from_slice(words);
+        self.trim();
+    }
+
     /// Allows every token and returns the mask for reuse.
     pub fn fill(&mut self, allowed: bool) {
         self.words.fill(if allowed { u32::MAX } else { 0 });
@@ -105,5 +117,8 @@ mod tests {
         let mut m = TokenMask::none(33);
         m.fill(true);
         assert_eq!(m.count(), 33);
+        m.copy_words(&[0b101, u32::MAX]);
+        assert!(m.allowed(0) && !m.allowed(1) && m.allowed(2) && m.allowed(32));
+        assert_eq!(m.count(), 3, "the bits past the last token are cleared");
     }
 }

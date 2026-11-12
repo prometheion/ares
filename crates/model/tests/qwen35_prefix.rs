@@ -318,6 +318,7 @@ impl Rig {
                     max_tokens: Some(max_tokens),
                     stop: Vec::new(),
                     draft: true,
+                    structure: None,
                     id: RequestId(self.next.fetch_add(1, Ordering::Relaxed)),
                 },
                 sink,

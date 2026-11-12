@@ -42,7 +42,7 @@
 //! newline before the closing tag in `reasoning_content`; a template that does
 //! not trim would then write it twice.
 
-use ares_api::{Engine, GenerateRequest, Json, Prompt, ThinkingFormat};
+use ares_api::{Engine, GenerateRequest, Json, Prompt, Start, ThinkingFormat};
 
 use crate::error::ApiError;
 use crate::wire::{Fields, Parsed, wrong_type};
@@ -192,7 +192,7 @@ pub(crate) fn apply(
     engine: &dyn Engine,
     default: ReasoningFormat,
 ) -> Result<Splitter, ApiError> {
-    let GenerateRequest { model, prompt, .. } = &mut parsed.request;
+    let GenerateRequest { model, prompt, structure, .. } = &mut parsed.request;
     let Prompt::Chat { variables, .. } = prompt else {
         return Ok(Splitter::plain());
     };
@@ -201,6 +201,9 @@ pub(crate) fn apply(
     let thinking = format.as_ref().and_then(|format| format.thinking.as_ref());
     let plan = plan(&asked, thinking, default)?;
     *variables = plan.variables;
+    if let Some(structure) = structure {
+        structure.start = plan.start;
+    }
     Ok(plan.splitter)
 }
 
@@ -209,6 +212,8 @@ pub(crate) fn apply(
 struct Plan {
     variables: Vec<(String, Json)>,
     splitter: Splitter,
+    /// Where a grammar of the request starts to bind.
+    start: Start,
 }
 
 fn plan(
@@ -262,19 +267,40 @@ fn plan(
     }
 
     let format = asked.format.unwrap_or(default);
-    let splitter = match thinking {
-        None => Splitter::plain(),
+    let (splitter, start) = match thinking {
+        None => (Splitter::plain(), Start::Reply),
         Some(thinking) => {
             let on = asks_thinking.unwrap_or(thinking.on_by_default);
             let prompt = if on { &thinking.prompt_on } else { &thinking.prompt_off };
-            if format.extracts() {
+            let splitter = if format.extracts() {
                 Splitter::extracting(thinking, prompt)
             } else {
                 Splitter::raw(prompt)
-            }
+            };
+            (splitter, answer_starts(thinking, prompt))
         }
     };
-    Ok(Plan { variables, splitter })
+    Ok(Plan { variables, splitter, start })
+}
+
+/// Where the answer of a reply starts, for a prompt that ends with `prompt`
+/// (from the opening tag on): llama-server binds a grammar to the text after
+/// the reasoning, and so does this server, whatever the format the reasoning
+/// is returned in.
+///
+/// - The prompt has closed the block (thinking is off): the reply is the
+///   answer from its first token.
+/// - The prompt has opened it: the reply is reasoning until the closing tag.
+/// - The prompt wrote no tag: the reply may open the block itself, or answer.
+fn answer_starts(thinking: &ThinkingFormat, prompt: &str) -> Start {
+    let (open, close) = (thinking.start_tag(), thinking.end_tag());
+    if close.is_empty() || (prompt.is_empty() && open.is_empty()) || prompt.contains(close) {
+        return Start::Reply;
+    }
+    Start::AfterReasoning {
+        open: prompt.is_empty().then(|| open.to_owned()),
+        close: close.to_owned(),
+    }
 }
 
 /// Text a splitter has sorted: the reasoning and the content of a piece.

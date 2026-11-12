@@ -11,6 +11,7 @@ repository.workspace = true
 ares-api = { path = "../api" }
 ares-core.workspace = true
 ares-cuda.workspace = true
+ares-grammar.workspace = true
 ares-sampler.workspace = true
 ares-io = { path = "../io" }
 # The exact reference that the tables of the CPU expert kernels are read from.

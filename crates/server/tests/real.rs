@@ -603,14 +603,20 @@ fn what_the_engine_cannot_do_is_refused_by_name() {
     refused(chat_path, chat(json!({"logit_bias": {"99999999": -100}})), 400, &["logit_bias"]);
     refused(chat_path, chat(json!({"samplers": ["top_k", "penalties"]})), 400, &["penalties"]);
     refused(chat_path, chat(json!({"top_logprobs": 2})), 400, &["top_logprobs"]);
-    // Nor has the server what these ask for.
-    refused(chat_path, chat(json!({"grammar": "root ::= \"yes\""})), 400, &["grammar"]);
+    // Nor has the server what this asks for.
     refused(chat_path, chat(json!({"n": 17})), 400, &["n must be between 1 and 16"]);
+    // A grammar is served, and one that is wrong is told by name.
     refused(
         chat_path,
-        chat(json!({"response_format": {"type": "json_object"}})),
+        chat(json!({"grammar": "root ::= nothing"})),
         400,
-        &["response_format", "structured output"],
+        &["grammar", "'nothing'"],
+    );
+    refused(
+        chat_path,
+        chat(json!({"response_format": {"type": "xml"}})),
+        400,
+        &["response_format", "xml"],
     );
     let tool = json!({"type": "function", "function": {"name": "f", "parameters": {}}});
     refused(chat_path, chat(json!({"tools": [tool]})), 501, &["tool"]);

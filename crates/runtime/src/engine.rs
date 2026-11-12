@@ -19,6 +19,7 @@ use crate::exec::{ExecError, Executor};
 use crate::gpu::{GpuConfig, GpuExecutor};
 use crate::model::Model;
 use crate::sampling::TokenFilter;
+use crate::structured::Grammars;
 use crate::timing::Snapshot;
 
 /// How long a question to the conductor (statistics, inspection) may take.
@@ -38,6 +39,8 @@ pub struct Runtime {
     /// The longest prompt a request may have, in tokens, plus one: what the
     /// model's context and the whole page pool hold.
     limit: u32,
+    /// The grammar engine of structured output.
+    grammars: Grammars,
     /// `None` after shutdown. Sending happens under the lock, so a request
     /// is either in the channel before the shutdown command or refused.
     commands: Mutex<Option<Sender<Command>>>,
@@ -97,6 +100,7 @@ impl Runtime {
             )));
         }
         let card = model.card();
+        let grammars = Grammars::start(&*model);
         let (tx, rx) = mpsc::channel();
         let (ready_tx, ready_rx) = mpsc::channel();
         let limit = card.context_length.min(config.pages.saturating_mul(config.cells_per_page));
@@ -138,6 +142,7 @@ impl Runtime {
             model,
             card,
             limit,
+            grammars,
             commands: Mutex::new(Some(tx)),
             conductor_id: thread.thread().id(),
             conductor: Mutex::new(Some(thread)),
@@ -181,6 +186,11 @@ impl Runtime {
         if request.max_tokens == Some(0) {
             return Err(EngineError::InvalidRequest("max_tokens must be at least 1".into()));
         }
+        let filter = match (filter, &request.structure) {
+            (Some(filter), _) => Some(filter),
+            (None, Some(structure)) => Some(self.grammars.filter(structure)?),
+            (None, None) => None,
+        };
         let prompt = self.model.encode(&request.prompt)?;
         if prompt.is_empty() {
             return Err(EngineError::InvalidRequest(

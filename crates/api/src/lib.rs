@@ -33,6 +33,7 @@ mod request;
 mod sampling;
 mod sink;
 mod stats;
+mod structure;
 
 pub use answer::{Answer, DecisionOutcome, DecisionResult, Verdict};
 pub use chat::{ChatFormat, ThinkingFormat};
@@ -52,3 +53,4 @@ pub use sampling::{
 };
 pub use sink::{DecisionSink, EventSink};
 pub use stats::{EngineStats, ExpertStats};
+pub use structure::{Shape, Start, Structure};

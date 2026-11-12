@@ -4,7 +4,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{Json, Message, Sampling};
+use crate::{Json, Message, Sampling, Structure};
 
 /// Identifies a request from [`Engine::submit`](crate::Engine::submit) or
 /// [`Engine::decide`](crate::Engine::decide) until its last event or its
@@ -60,13 +60,16 @@ pub struct GenerateRequest {
     /// Whether the engine may verify drafts for this request. `false` makes
     /// the request a plain one-token-per-step generation, to compare with.
     pub draft: bool,
+    /// A rule the reply must follow (a grammar, a JSON schema), or `None` for
+    /// text that is free.
+    pub structure: Option<Structure>,
     pub id: RequestId,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Role;
+    use crate::{Role, Shape, Start};
 
     #[test]
     fn ids_print_in_fixed_width_hex() {
@@ -90,6 +93,10 @@ mod tests {
             max_tokens: Some(16),
             stop: vec!["\n\n".into()],
             draft: true,
+            structure: Some(Structure {
+                shape: Shape::JsonSchema(r#"{"type":"object"}"#.into()),
+                start: Start::AfterReasoning { open: None, close: "</think>".into() },
+            }),
             id: RequestId(9),
         };
         let text = serde_json::to_string(&request).unwrap();

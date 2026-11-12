@@ -20,6 +20,7 @@ use serde::Serialize;
 use crate::bridge::Timings;
 use crate::error::ApiError;
 use crate::reasoning::{self, Asked, Split};
+use crate::structured;
 
 /// Which of the two endpoints a request came in on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -162,7 +163,7 @@ fn refuse_unserved(endpoint: Endpoint, fields: &Fields<'_>) -> Result<(), ApiErr
                     || reasoning::FIELDS.contains(&name)
             }
             Endpoint::Completions => name == "prompt",
-        };
+        } || structured::FIELDS.contains(&name);
         if value.is_null() || own || SERVED.contains(&name) || BOOKKEEPING.contains(&name) {
             continue;
         }
@@ -182,12 +183,10 @@ fn unserved(name: &str, value: &Json) -> Option<&'static str> {
         Json::Float(f) => *f == off,
         _ => false,
     };
-    let structured = "structured output (grammars, JSON schemas) is not built";
     let tools = "tool calls are not built";
     let off = match name {
         "best_of" => number(1.0),
         "echo" => matches!(value, Json::Bool(false)),
-        "response_format" => value.get("type").and_then(Json::as_str) == Some("text"),
         "tool_choice" => matches!(value.as_str(), Some("none" | "auto")),
         // It says how tools are called, and a request with tools is the
         // engine's to refuse.
@@ -206,7 +205,6 @@ fn unserved(name: &str, value: &Json) -> Option<&'static str> {
              picks, and unlike mirostat it has no draw that the sampler can do without drafts"
         }
         "echo" | "suffix" => "the completion is returned on its own",
-        "response_format" | "grammar" | "json_schema" => structured,
         "tool_choice" | "parallel_tool_calls" | "functions" | "function_call" => tools,
         name if reasoning::FIELDS.contains(&name) => {
             "thinking belongs to chat requests: /v1/completions has no chat template"
@@ -247,6 +245,7 @@ fn from_json(endpoint: Endpoint, json: &Json, id: RequestId) -> Result<Parsed, A
         max_tokens: max_tokens(&fields, endpoint)?,
         stop: stop(&fields)?,
         draft: fields.bool("draft")?.unwrap_or(true),
+        structure: structured::asked(&fields)?,
         id,
     };
     let include_usage = match fields.get("stream_options") {

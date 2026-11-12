@@ -1,0 +1,23 @@
+[package]
+name = "ares-grammar"
+description = "The grammar engine on the host: GBNF grammars, JSON schemas and regular expressions turned into the set of tokens that may come next, one token at a time"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+ares-api = { path = "../api" }
+llguidance.workspace = true
+toktrie.workspace = true
+serde_json = "1"
+thiserror.workspace = true
+
+[dev-dependencies]
+# The cost of a step is measured on the vocabulary of a real model.
+ares-gguf.workspace = true
+ares-tokenizer.workspace = true
+
+[lints]
+workspace = true
