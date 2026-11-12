@@ -472,31 +472,48 @@ fn drafts_do_not_change_the_answer() {
     if !enabled() {
         return;
     }
-    // A text that repeats, so that the lookup has something to propose.
-    let mut prompt = prompt(12, 5);
-    prompt.extend_from_within(..);
-    prompt.extend_from_within(..12);
     for placement in placements() {
-        let mut answers = Vec::new();
-        for speculation in [false, true] {
-            let config = RuntimeConfig { speculation, max_draft: 3, ..RuntimeConfig::default() };
-            let (runtime, model) = start(2, placement, 16, config);
-            warm(&model);
-            let answer = ask(&runtime, 1, &prompt, 160);
-            assert_nothing_missed(&model, "an answer with filled tiers");
-            let counters = runtime.snapshot().map(|s| s.counters);
-            runtime.shutdown();
-            if let (true, Some(c)) = (speculation, counters) {
-                eprintln!(
-                    "RES {placement:?}: drafts accepted {}, rejected {}, window rows {}",
-                    c.drafts_accepted, c.drafts_rejected, c.window_rows
-                );
-                assert!(c.drafts_accepted > 0, "{placement:?}: no draft was accepted");
-                assert!(c.drafts_rejected > 0, "{placement:?}: no draft was rejected");
+        // A made-up model repeats itself by chance only, and the lookup has
+        // something to accept only where it does. The texts are tried one
+        // after the other until drafts have been accepted and rejected both;
+        // with every one the answer must be what it is without drafts.
+        let (mut accepted, mut rejected) = (0, 0);
+        for seed in 5..13 {
+            // A text that repeats, so that the lookup has something to propose.
+            let mut prompt = prompt(12, seed);
+            prompt.extend_from_within(..);
+            prompt.extend_from_within(..12);
+            let mut answers = Vec::new();
+            for speculation in [false, true] {
+                let config =
+                    RuntimeConfig { speculation, max_draft: 3, ..RuntimeConfig::default() };
+                let (runtime, model) = start(2, placement, 16, config);
+                warm(&model);
+                let answer = ask(&runtime, 1, &prompt, 160);
+                assert_nothing_missed(&model, "an answer with filled tiers");
+                let counters = runtime.snapshot().map(|s| s.counters);
+                runtime.shutdown();
+                if let (true, Some(c)) = (speculation, counters) {
+                    eprintln!(
+                        "RES {placement:?} text {seed}: drafts accepted {}, rejected {}, window \
+                         rows {}",
+                        c.drafts_accepted, c.drafts_rejected, c.window_rows
+                    );
+                    accepted += c.drafts_accepted;
+                    rejected += c.drafts_rejected;
+                }
+                answers.push(answer);
             }
-            answers.push(answer);
+            assert_eq!(
+                answers[0], answers[1],
+                "{placement:?} text {seed}: drafts changed the answer"
+            );
+            if accepted > 0 && rejected > 0 {
+                break;
+            }
         }
-        assert_eq!(answers[0], answers[1], "{placement:?}: drafts changed the answer");
+        assert!(accepted > 0, "{placement:?}: no draft was accepted in any text");
+        assert!(rejected > 0, "{placement:?}: no draft was rejected in any text");
     }
 }
 
