@@ -45,8 +45,36 @@ enum Drafts {
 
 const MAX_ROWS: u32 = 32;
 
+/// How far the logits of a prompt may be from the reference's, as the relative L2 distance
+/// over all rows and over the worst row. The gather copies and decodes rows and rounds
+/// nothing, so what remains is the rounding of the products, f16 operands on the tensor
+/// cores against f32 on the host. Measured on an RTX 4070 (2026-11-12): 2.4e-3 to 2.7e-3 over
+/// all rows and 3.9e-3 to 5.1e-3 in the worst row, for both types and the same wherever the
+/// rows came from. One wrong row is 0.26 and 1.4 away (the test measures it), so the bounds
+/// are four times the rounding and at most a twenty-fifth of a wrong row.
+const ROUNDING: f64 = 1e-2;
+const ROUNDING_OF_A_ROW: f64 = 2e-2;
+const N_VOCAB: usize = 256;
+
+/// A model of four blocks in a shape the device kernels run: the delta rule's heads are 128
+/// wide, which is the one width its kernels are built for.
 fn spec(tied: bool, nextn: bool, matrix_type: GgmlType) -> Spec {
-    Spec { nextn, tied, matrix_type, n_vocab: 160, ..Spec::default() }
+    Spec {
+        n_layer: 4,
+        n_embd: 256,
+        n_ff: 256,
+        n_vocab: N_VOCAB,
+        n_head: 2,
+        n_head_kv: 1,
+        head_dim: 256,
+        k_heads: 2,
+        v_heads: 6,
+        state: 128,
+        nextn,
+        tied,
+        matrix_type,
+        ..Spec::default()
+    }
 }
 
 fn placement(c: &Config, drafts: &Drafts) -> Placement {
@@ -131,9 +159,9 @@ fn expected(
 #[test]
 fn the_model_reads_its_prompt_from_host_rows_and_kept_rows_with_a_head_of_its_own_or_a_tied_one() {
     let Some(device) = gpu() else { return };
-    let ids: Vec<u32> = (0..29).map(|i| ((i * 37 + 11) % 160) as u32).collect();
+    let ids: Vec<u32> = (0..29).map(|i| ((i * 37 + 11) % N_VOCAB) as u32).collect();
     // The prompt has tokens of the list and tokens that are not.
-    let list = listed(160);
+    let list = listed(N_VOCAB);
     assert!(ids.iter().any(|t| list.contains(t)) && ids.iter().any(|t| !list.contains(t)));
     for matrix_type in [GgmlType::F32, GgmlType::Q8_0] {
         for tied in [false, true] {
@@ -144,6 +172,21 @@ fn the_model_reads_its_prompt_from_host_rows_and_kept_rows_with_a_head_of_its_ow
             let w = Weights::load(&gguf, &c).unwrap();
             assert_eq!(w.output.is_none(), tied);
             let want = reference_logits(&c, &w, &ids);
+            // What one wrong row does to the logits, where it does least: another last
+            // token, which changes the last row only. The bounds lie far below it.
+            let mut other = ids.clone();
+            *other.last_mut().unwrap() = (ids[ids.len() - 1] + 1) % N_VOCAB as u32;
+            let wrong = reference_logits(&c, &w, &other);
+            let last = (ids.len() - 1) * c.n_vocab..;
+            let apart = rel_l2(&wrong, &want);
+            let apart_row = rel_l2(&wrong[last.clone()], &want[last]);
+            eprintln!(
+                "ERR one wrong row {matrix_type} tied {tied}: {apart:.2e}, its row {apart_row:.2e}"
+            );
+            assert!(
+                apart > 10.0 * ROUNDING && apart_row > 10.0 * ROUNDING_OF_A_ROW,
+                "{matrix_type} tied {tied}: one wrong row is {apart} and {apart_row} away"
+            );
             for drafts in [Drafts::No, Drafts::Listed(list.clone()), Drafts::Any] {
                 let placement = placement(&c, &drafts);
                 let opts = Options {
@@ -184,11 +227,16 @@ fn the_model_reads_its_prompt_from_host_rows_and_kept_rows_with_a_head_of_its_ow
                 }
                 assert_eq!(width, c.n_vocab, "{what}");
                 let error = rel_l2(&ordered, &want);
-                eprintln!("ERR logits {what}: {error:.2e} from the reference");
-                // The gather is exact; what differs from the reference is the products'
-                // rounding (and the 8-bit activations' of Q8_0 weights).
-                let limit = if matrix_type == GgmlType::F32 { 2e-2 } else { 0.25 };
-                assert!(error < limit, "{what}: logits {error}");
+                let worst = (0..n)
+                    .map(|row| {
+                        let at = row * c.n_vocab..(row + 1) * c.n_vocab;
+                        rel_l2(&ordered[at.clone()], &want[at])
+                    })
+                    .fold(0.0, f64::max);
+                eprintln!(
+                    "ERR logits {what}: {error:.2e} from the reference, worst row {worst:.2e}"
+                );
+                assert!(error < ROUNDING && worst < ROUNDING_OF_A_ROW, "{what}: {error} {worst}");
             }
         }
     }
