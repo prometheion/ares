@@ -177,7 +177,7 @@ machine (RTX 4070 + RTX 3060, Qwen3.8-27B) or read from the engines listed in
 | `ares-store` | State on disk: pages and checkpoints by content hash in segment files, per fingerprint, with a size limit | Done as a store of opaque bytes, tested against restarts, the limit and damaged files; not yet connected to devices |
 | `ares-io` | Reads of weights straight from the model file: io_uring with direct I/O, demand before prefetch, cancel and promote, copies of a file on several drives with the reads spread over them, a map from experts to file ranges, row reads behind a cache | Done, tested against real files and on two drives; 1.4 to 1.7 GiB/s of random expert-sized reads per SSD of the development machine and 2.9 to 3.0 GiB/s over both; the expert store and the n-gram rows of `qwen4exp` read through it |
 | `ares-sched` | Step planner (generation, decision rows and prompts in one step), admission (pages claimed per step, a reservation that corrects itself, a queue instead of refusals), the order of a pass for long prompts of a model with experts, step time model with a term for the context, draft length choice, the lookup drafter on a suffix automaton shared by all sequences | Done; unit and model tests; the conductor uses the planner, admission (without spill), the lookup drafter and the step cost |
-| `ares-weights` | Expert heat, tiers that are elected and fed by reads (admission, protection, guesses bound late, slots given back), slots per layer by need, the waves of experts of a pass, a token table for the first layers, the lookahead distance, routing bias for pruning | Done, unit tested; the expert store uses the slot sets, the heat and the split of slots; guesses, the token table and pruning are not used by a running model yet |
+| `ares-weights` | Expert heat, tiers that are elected and fed by reads (admission, protection, guesses bound late, slots given back), slots per layer by need, the waves of experts of a pass, a token table for the first layers, the lookahead distance, routing bias for pruning | Done, unit tested; the expert store uses the slot sets, the heat, the swap rule and the split of slots; the guess queue, the token table, the waves and pruning are not used by a running model yet (the lookahead distance only by a guess of `qwen4exp` that is switched off) |
 | `ares-api` | Request (with every sampling field), event (text and probabilities), decision and error types; the `Engine` trait between HTTP and the runtime (`submit` for generation, `decide` for decisions, `stats`, `chat_format` for what a model's chat template declares about thinking) | Done, unit tested |
 | `ares-server` | The `ares` binary: loads a model on the devices and serves it over an OpenAI-compatible HTTP API, with the plan of devices, split, shares and context made from what the devices report | Serves `qwen35` and `qwen4exp` models (chat and plain completions, streamed and not, every sampling field and the probabilities of the tokens, `n` completions, timings, metrics, staged shutdown, the reasoning of a reply apart from its content and in the history, with llama-server's controls for thinking, tool calls held to the tools' schemas by a grammar, also when the model opens the call inside its thinking); 213 tests without a GPU, 17 that start the real binary (some need the 27B or the files of Flash-Next) and 26 that run the engine in the test's process (the 8 of tool calls have not been run); for `qwen35` the prefix cache is on, with `--ram` for the engine's RAM, for `qwen4exp` the RAM is mostly the tier of experts; no router mode, no multimodal input, `/v1/systemone` answers 501 |
 | `ares-runtime` | The conductor thread and one thread per device, the step loop that connects plan, state and kernels, admission, speculation with the lookup drafter and with a model's own drafts, the `Model` trait a model implements, a synthetic model that drives the real kernels, and the expert store (VRAM slots, RAM tier, reads, the CPU computing what is not on a GPU) | Drives `qwen35` on one device, in tensor split and in layer split, with picks made on the device; implements `Engine::submit` (not `decide`); the prefix cache is in the conductor, checked against the host executor as an oracle and carried out by `qwen35` on the devices (checkpoints in page-locked RAM within one RAM limit, `PinnedRam`), and there is no spill of pages to RAM (a request that gives way stays in the pool's cache); the expert store is driven by the device threads of `qwen4exp` (see [Qwen3.8-Flash-Next through the runtime](#qwen38-flash-next-through-the-runtime)) |
@@ -1412,8 +1412,11 @@ pages) and comes with the runtime.
   are read in place from the GGUF at `offset + e * stride` with direct I/O
   through `io_uring` into buffers the caller provides (pinned staging buffers
   of a GPU backend), demand reads before read-ahead, which is cut into chunks
-  and can be cancelled or promoted. Next-layer router prediction and
-  profile-based read-ahead for prefill, which start reads early, are planned.
+  and can be cancelled or promoted. The wide steps of `qwen4exp` submit all
+  reads of a layer at once, into staging slots next to the RAM tier (see
+  "Wide steps" under "Qwen3.8-Flash-Next through the runtime"). Reading ahead
+  of the router is built in the store and has no guess worth reading yet:
+  next-layer router prediction, which starts reads early, is planned.
 - **Several SSDs.** A model can have copies on more than one drive (a mirror
   directory per extra drive), and the parts of a split model can be on
   different drives. Every drive has its own queue depth, and each chunk of a
@@ -2743,15 +2746,17 @@ running. What was chosen:
   cancellation and new requests are handled between steps as for any model.
   The only protection of other sequences is the planner's: a prompt is read
   in pieces of up to `Model::prompt_rows` rows (for this model its whole step,
-  `step_rows`: 256 rows on this machine), each with the newest token of every
+  `step_rows`: 512 rows on this machine), each with the newest token of every
   generating sequence riding along, and the share owes the generating
-  sequences rounds for the time a piece took. A piece of 256 rows takes 1 to
-  2.5 s (a prompt of 1000 tokens, four pieces, 4.6 to 10.1 s to the first
-  token; in steps of eight rows it was 125 steps of about 70 ms, 8.7 s) against
-  22 ms for a step of one row, because every row routes to experts of its own,
-  so the token that rides along with a piece comes after that time, and the
-  rounds owed between pieces go at a token each; whether generation gets the
-  half of the time that the share promises was not measured for this model.
+  sequences rounds for the time a piece took. A piece of 512 rows of a long
+  prompt takes 2 to 2.5 s (3.5 to 4.5 s before the misses went through transit,
+  see "Transit, measured") against 22 ms for a step of one row, because every
+  row routes to experts of its own; 0.9 s of it is the layers before any
+  expert. So the token that rides along with a piece comes after that time, a
+  request that arrives while a lone prompt is read waits that long for its
+  first step, and the rounds owed between pieces go at a token each; whether
+  generation gets the half of the time that the share promises was not
+  measured for this model.
   Taking the missing experts of a step's rows apart, to let the rows that have
   theirs run first, is not built.
 
@@ -2797,16 +2802,49 @@ width (`device/part/wide.rs`, `device/misses.rs`):
   (`Misses`). When the layer is enqueued it gives the first round a table of the address of
   every expert that has a slot in VRAM (`ExpertStore::vram_slot`), and the device computes
   them while the route record travels to the host. The record gives, per expert, how many
-  pairs picked it. The experts without a slot are the layer's **misses**, most picked
-  first. Once the first round has ended on the device (nothing reads a slot any more), the
-  store is asked for as many misses as the layer has slots (`ExpertStore::routed`, which
-  protects the batch and evicts what is not needed), and the batch that has arrived is the
-  next round's table, whose outputs `red.add` into the same rows. The plan of the layer is
-  made once. The host never waits inside a call: the caller serves the store between the
-  steps of `Misses::advance`. A step that misses nothing has one round and the host only
-  waits for the record, while the first round runs. The experts are not computed on the
-  CPU in wide steps; the heat of the store gets the layer's counts of rows per expert
-  (`record_counts`), so what a prompt used is what the tiers hold when it ends.
+  pairs picked it. The experts without a slot are the layer's **misses**, most picked first.
+  A step that misses nothing has one round and the host only waits for the record, while the
+  first round runs. The plan of the layer is made once, and the host never waits inside a
+  call: the caller serves the store between the steps of `Misses::advance`. The experts are
+  not computed on the CPU in wide steps; the heat of the store gets the layer's counts of
+  rows per expert (`record_counts`).
+- *The misses pass through transit* (`expert_store/transit.rs`). A slice of a prompt uses far
+  more experts of a layer than the layer has slots, each for all its rows at once and then
+  no more, so a missed expert takes no slot: the store uploads it into one of a small pool
+  of transit slots on its device, which belongs to no layer, from its RAM slot (which keeps
+  it) or, when no tier holds it, from the file through staging slots in host memory
+  (`ExpertStore::transit_want`). Nothing is evicted and no table entry is written, so the
+  uploads start with the record, next to the first round, and every read of the layer is
+  submitted at once. Whenever the device has finished a round and half of the transit slots
+  hold experts that have arrived (or all that are left, or nothing of the layer is on its
+  way any more), those are the next round's table, whose outputs `red.add` into the same
+  rows; when it has ended, its transit slots are free for the next ones.
+- *What a prompt used takes slots by its heat, on the device.* When the round that read an
+  expert from transit has ended (`transit_release`), the heat has the counts of the step. An
+  expert that finds a free slot of the layer in VRAM, or that is hotter than the member that
+  would leave (by the margin of a swap, `SwapRule`, when that member has to be copied down to
+  RAM to be kept), takes that slot: its bytes are copied from
+  the transit slot to the slot on the device and the table entry follows them
+  (`SlotDevice::adopt`, in the order of the copies down, so that no upload waits for it), at
+  most half of the transit slots at a time. That is how the warm-up fills empty tiers and how
+  VRAM follows a prompt, without an upload and without evicting what is hotter. An expert
+  that came from the file and that is hotter than what the RAM tier would give up for it is
+  copied there from staging; the others are forgotten. What the adopted experts evict goes down to RAM like every
+  evicted expert.
+- *The sizes* come from the budgets at load (`plan_transit`): a device's transit holds half
+  of the experts of a layer that the device computes and that have no slot in VRAM (56 to 58
+  slots per device on this machine with both cards on every layer, 1.44 MiB each, taken
+  from the bytes for slots: a slot less for every layer), staging twice the experts of a layer that no tier holds (165 to 250
+  slots here, by the RAM the tier got), at most an eighth of each tier. A tier that has only the slots a decode step needs has no
+  transit: its misses come into the layer's slots in batches, each giving way to the next
+  (`ExpertStore::routed`), as all misses did before transit.
+- *No read is started on a guess.* The store reads guesses ahead into half of staging as
+  prefetches and promotes them when a record names them (`transit_guess`), and `Feed` can
+  guess, for the layers ahead (`ares_weights::Lookahead` gives the distance), what the wide
+  step before missed there and no tier holds. That guess is off (`SessionOptions::
+  read_ahead`), because it is mostly wrong and costs more than it gives: see "Transit,
+  measured". A guess worth reading is the next layer's router applied to this layer's
+  input, which is not built.
 - *Both devices on every layer*: the mixer routes. The worker's host thread reads the
   record from the mixer's board (the mixer has enqueued the layer when `Flow::enqueued`
   says so), uploads it, and builds its table from the experts it owns
@@ -3075,16 +3113,88 @@ In steps of eight rows, which the float tile kernels do not touch, it is 158 and
 and 80. The rows that differ are near ties (the two logits 0.01 to 0.15 apart), and which
 rows they are changes from run to run with the misses the CPU serves, as before.
 
+**Transit, measured** (2026-11-12, RTX 4070 and RTX 3060, the engine of before (`b8b0271`:
+every miss of a wide step takes a slot of its layer) and the one with transit started one
+after the other, `--chat-var enable_thinking=false`, otherwise the defaults (steps of 512
+rows, no drafts), greedy, 128 tokens; per round a short German question, German prose of
+1000 tokens, Rust of 1034, the short question, the long prompt of 5033 tokens (prose, code
+and German), the short question; the numbers of the second of two rounds; other agents'
+builds ran on the machine, the load average is given):
+
+| | Both on every layer, before (load 12 to 16) | The same, transit (load 6 to 7) | Layers split, before (load 6 to 7) | Layers split, transit (load 3.5 to 4) |
+| --- | --- | --- | --- | --- |
+| Prompt, German 1000: tokens/s, time to the first token | 185, 5.4 s | 255, 3.9 s | 165, 6.1 s | 231, 4.3 s |
+| Prompt, Rust 1034 | 104, 10.0 s | 174, 6.0 s | 41 (77 in the first round), 25.2 s | 152, 6.8 s |
+| Prompt, 5033 tokens | 141, 35.9 s | 224, 22.5 s | 112, 45.1 s | 198, 25.4 s |
+| Generation after the prompt, German / Rust / long: tokens/s | 24 / 21 / 23 | 32 / 36 / 30 | 26 / 11 / 23 | 36 / 32 / 32 |
+| The short question before and after the long prompt | 24, 32 | 36, 32 | 8, 28 | 34, 33 |
+| Read from the file for the long prompt | 23.1 GiB | 7.7 GiB | 25.1 GiB | 9.0 GiB |
+
+The engine of before ran at a higher load in the first pair and was disturbed in the Rust
+request of the second (and the short question behind it), so its generation numbers there are
+too low: at a load of 5 to 6 it generated at 35, 28 and 23 tokens per second after the three
+prompts and answered the short question at 32 and 30 (prompts then: 188, 98 and 130 tokens per
+second). The transit columns are of two builds of this work (`6213d28`, `e6f12f6`); the last
+rules (`373b0b3`) were measured against the build before them, the tier fixed with `--ram
+10G`, at a load of 3 to 4: the long prompt at 211 and 208 tokens per second the first time a
+server sees it and 248 and 245 the second, German prose as the first request at 123 and 117,
+generation at 34 to 40. What a server reads first after its warm-up is bound by the file and
+gains least: German prose 120 before and 107 with transit in one pair, 62 and 117 in the
+other; the long prompt 123 and 213, 112 and 180. Run again with the final rules and the tier
+fixed, on a machine at a load of 14 to 19, German and Rust were 173 and 85 before and 222 and
+152 with transit, and the long prompt 126 and 118: the load and the drive decide a run, so
+the engines were always measured next to each other.
+
+What moved (the tool, both cards on every layer, the tiers filled from the recorded routing
+of other texts, then 4700 tokens of the long text read three times in steps of 256 rows, the
+tier fixed at 9 GiB, load 17 to 31): before, every reading uploaded 53 000 to 57 000 experts
+into slots, evicted as many, copied 29 000 to 35 000 of them down to RAM and read 19 000 to
+24 000 from the file (26 to 33 GiB), the third reading of the same text like the first; the
+layers waited 32 to 80 ms each (per part) for their misses, 74 to 89 % of a layer's time,
+and it read at 37, 64 and 90 tokens per second. With transit the three readings read 25, 14
+and 14 GiB from the file, 20 000, 600 and 80 experts took a VRAM slot, the layers waited 67,
+15 and 15 ms (86, 60 and 60 %), and it read at 45, 168 and 169 tokens per second. A slice of
+256 rows misses 29 to 35 of the 124 experts it picks per layer and part either way: the slots
+hold what they hold. A miss whose bytes are in RAM costs the link and no more (0.25 to 0.3
+ms an expert over both cards, 0.07 to 0.12 ms on the RTX 4070 and 0.5 to 0.7 on the RTX
+3060, against 0.9 to 2 ms before), so the churn was the cost and not the link; the RTX
+3060's link (8 GT/s, four lanes) is what the misses of its layers wait for now. The first
+reading of a short prompt on tiers of other texts is the case transit does not help and
+sometimes hurts (1000 tokens: 86 before and 35 with transit at that load, 55 and 49, 107 and
+84 on a quieter machine): nearly every miss takes a slot then and most of what they evict is
+copied down; why that costs more than the old path's own copies is not understood.
+Generation right after a reading, in the tool: 41.5 and 15.3 tokens per second before (after
+1000 and after 4700 tokens, the second at a load of 29), 33.9 and 24.1 with transit.
+
+- *The transit slots.* 16, 32, 64 and 128 slots per device read a second reading of 2500
+  tokens at 200, 207, 215 and 223 tokens per second (steps of 512 rows, load 11 to 15; the
+  first reading is bound by the file and shows the load: 86 to 98) with 4.3, 2.5, 1.45 and
+  1.02 rounds after the first per layer. The plan's rule (half of the experts of a layer
+  that have no VRAM slot: 56 to 58 here, 82 MiB per device) is where the rate stops growing
+  for the memory.
+- *Reading ahead on a guess.* With the guess (what the wide step before missed in the layer
+  and no tier holds) a reading of 2500 tokens read 14.0 to 15.0 GiB from the file against
+  12.3 to 12.4 without and a second reading 4.0 to 5.7 against 2.9, and ran at 69 and 96
+  tokens per second against 102 and 107, and 221 and 214 against 259 and 277 (on, off, on,
+  off; load 25, 12, 9, 5). Of the guessed reads 48 % were used in a first reading and 8 to
+  14 % in a second: what a step read and the heat keeps is in RAM afterwards, so what is
+  left to guess is mostly what one row used.
+- *The rows of a step.* 4700 tokens in steps of 256, 512 and 1024 rows (the tool, a second
+  reading, load 4 to 6): 100, 112 and 126 tokens per second, while the layers of a step take
+  0.41, 0.86 and 1.77 s before any expert (2.9 s at 2048 rows). More rows bring each expert
+  for more rows at once, 12 % of rate for twice the rows, and keep every other request
+  waiting twice as long.
+
 What bounds the prompt now:
 
 - *Bringing the missed experts.* A slice of a long prompt picks 40 to 80 % of the experts of
-  every layer, the tiers hold 56 % in VRAM and 30 % in RAM, so every slice misses a fifth to
-  two thirds of what it picks, and the next slice misses them again. The store delivers an expert
-  from the RAM tier in 1 to 2 ms, from the file in 8 to 130 ms, one request after the other:
-  about a gigabyte per second where the link takes ten or more. That is 30 to 60 percent of a
-  slice's time, and what the layer-major pass with waves must fix: fetch each expert of a layer
-  once for the whole prompt, with many requests in flight and the next layer's experts read
-  while this one computes.
+  every layer, the tiers hold 55 % in VRAM and 30 % in RAM, so every slice misses a quarter
+  to a third of what it picks, and the next slice misses most of them again: they are
+  uploaded again at the link's speed (3 GiB/s on the RTX 3060), which is 60 % of a layer's
+  time when their bytes are in RAM. What no tier holds is read from the file when the
+  record names it, all reads of a layer at once, and the layer waits for the last: the
+  file gave 0.7 to 1.0 GiB/s on this machine while others used the drive, and a first
+  reading takes 4 to 13 GiB from it.
 - *The dense part of a layer.* The host waited 18 to 40 ms per layer and slice of 512 rows for the
   router's picks; that is the device's time through the mixers, the projections and the
   recurrent layer. The mixers' matrices are BF16; eight rows at a time over four streams
@@ -3095,13 +3205,34 @@ What bounds the prompt now:
   next layer cannot be enqueued before the host has the misses of this one: a layer without
   misses costs one round trip of the record (about 0.1 ms); the waves would take that out too.
 
-**Where a faster prompt path goes next.** The prompt pass that streams whole layers
-(`ares_sched::Pass` and `ExpertStore::plan_waves` / `wave`, built and unused) goes where
-`Misses` is now: it would hand the store the layer's counts for all rows of the prompt
-instead of a slice's, enqueue the waves, and keep the hidden states of the prompt's rows in a
-buffer of their own on the device; the conductor would run the pass's pieces between ordinary
-steps. `Misses` already has the part that matters for it: a round computes the experts of a
-table of addresses, whatever slot or transit memory they are in.
+**Where a faster prompt path goes next.**
+
+- *A guess worth reading ahead.* The reads of a layer start when its record arrives and the
+  layer waits for the slowest of them; what a first reading takes from the file is what
+  bounds it. The store can read ahead of the router and promote what the record names; what
+  it lacks is a guess that is right. The next layer's router applied to this layer's input
+  (FATE reports close to all experts of a prompt's rows found that way) needs a second
+  product and a second record per layer on the part that routes, and the record's way to the
+  host; with it the reads of layer L+1 run while layer L computes.
+- *The pass.* A step of more rows brings each expert of a layer once for more rows, and a
+  pass (`ares_sched::Pass`: all rows up to a layer's router in chunks that fit the scratch,
+  then the layer's experts for all rows) takes the scratch out of that. A pass inside one
+  step was designed and written but never compiled (the residual, the pending output and
+  the experts' input of every row kept on the device, 56 KiB a row; rounds over the chunks;
+  only for both cards on every layer), and is not in the tree: a step is what a request
+  that arrives waits for, and a step of 512 rows already takes more than a second on this
+  machine (see "Transit, measured"), so a pass of more rows inside one step keeps every
+  other request waiting for seconds. What an interruptible pass needs instead: the
+  conductor runs the pieces of `Pass` between ordinary steps (`pass_rows_between` sizes
+  them), so a pass is a state of the model that outlives a step: the kept rows on every
+  part and what `Misses` knows of the layer (plan made or not, which experts were computed)
+  must survive ordinary steps that run between two pieces, which need the scratch and the
+  transit slots meanwhile; the executor and `DeviceModel` need a piece as a unit of work
+  that ends without its rows having reached the end of the model; a sequence in a pass has
+  rows at a point inside the model, which the page tables, the recurrent state (its windows
+  advance chunk by chunk and layer by layer, not row by row through all layers) and
+  cancellation must know; and a split by layers must hand the kept rows of all chunks over
+  between the devices at the boundary layer, in pieces the link buffers hold.
 
 ### Vulkan
 

@@ -378,7 +378,7 @@ impl<D: SlotDevice> ExpertStore<D> {
     /// the step by now. One that is hotter than the coldest member of the
     /// layer's VRAM slots, by the margin of a swap, takes that member's slot:
     /// it is copied there from its transit slot, on the device, so the tier
-    /// follows a prompt without an upload ([`ExpertStore::transit_adopt`]).
+    /// follows a prompt without an upload (`transit_adopt`).
     /// One that came from the file and that the RAM tier would keep is copied
     /// there from staging. The others are forgotten.
     pub fn transit_release(&mut self, layer: usize, experts: &[u32]) -> Result<(), StoreError> {
