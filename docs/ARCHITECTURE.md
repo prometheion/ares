@@ -2108,11 +2108,12 @@ within 1.0 to 3.4 % of the exact arithmetic on unrounded activations (8-bit acti
 hidden values, as for the four types before). Many-row kernels, the same types and widths,
 every tile and both sums: 0.04 to 0.10 % rms against the exact result. The blocks of real
 tensors as experts (`ARES_TEST_GGUF=<any model file>`, the largest tensor of each type the
-file has, at the real widths): the decode
-kernels within 0.50 steps and 2e-7 and the many-row kernels within 0.06 to 0.13 % on the 12
-types of the Q4_K_S file of Qwen3.8-27B (Q3_K to Q8_0, the i-quants from IQ2_XS to IQ4_NL,
-F32), the decode kernels the same on the 12 of its IQ2_XXS file (IQ1_S, IQ2_XXS and Q2_K among
-them). The CPU against the device, layer by layer in
+file has, at the real widths), on the Q4_K_S and the IQ2_XXS file of Qwen3.8-27B, a
+Q6_K file with BF16 and F16 tensors and Flash-Next's own, 19 types between them (all but
+Q4_0, Q4_1, Q5_0, Q5_1, which the made-up models hold as encoded values, and TQ1_0, TQ2_0,
+MXFP4, NVFP4 and Q1_0, of which there is no file here: those five are tested on generated
+blocks only): the decode kernels within 0.50 steps and 2e-7, the many-row kernels within
+0.06 to 0.13 %. The CPU against the device, layer by layer in
 made-up models of 28 pairs of types with half of the experts missing: 2.2e-7 to 4.6e-7 where
 no hidden code falls on a rounding boundary and up to 2.3e-3 where one does (the decoded
 path sums in another order than the device's integer sums; the test allows 1e-2). Whole
@@ -2169,17 +2170,20 @@ bytes hold five values each in planes 32 values apart, so a lane loads five word
 activations and five scales from different places, which is what bounds the dense decode
 kernel of the type too (`mmvq_more.cuh`). *Q6_K* is 1.3 to 1.8 times as slow as the median
 in the many-row kernels: its item is 18 raw words per row stream, which the adapter holds
-for four streams and for the step ahead. NVFP4 as gate and up was 1.5 times the median in the many-row kernels at 8 and 64 rows
-on the RTX 4070 in this run, and at the median on the RTX 3060 and at 512 rows; that was not
-looked into.
+for four streams and for the step ahead. *NVFP4* as gate and up is 1.35 to 1.45 times as slow as the other 4-bit types in the
+many-row kernels at 8 and 64 rows on the RTX 4070 (820 and 750 microseconds against 565 to
+610 and 550 to 570, the same in two runs) and not on the RTX 3060 or at 512 rows; the cause
+was not found.
 
 *The four types of the real file, before and after* (`examples/expert_rows_bench` and
-`expert_layer_bench` on the real experts and the recorded routes, RTX 4070, the build of
-before and this one started alternately, twice, the better of each; load average 2 to 6): the
-decode kernels within 1 % at every point (they are the same instantiations), gate and up of
-the many-row kernels within 4 %, faster at most points, and down of the many-row kernels the
-same at 1 and 4096 rows and 6 to 18 % faster at 8 to 512 rows (1251 to 1058 microseconds for
-IQ2_S's layer at 512 rows).
+`expert_layer_bench` on the real experts and the recorded routes at 1, 8, 64, 512 and 4096
+rows, the build of before and this one started alternately, twice on each card, the better
+of each; load average 2 to 6): the decode kernels within 1 % at every point on both cards
+(they are the same instantiations). Gate and up of the many-row kernels within 4 % on the RTX
+4070, faster at most points, and within 1 % on the RTX 3060 but for IQ2_XXS, 7 % slower at 8
+rows (453 to 485 microseconds) and 4 % faster at 4096. Down of the many-row kernels the same
+at 1 and 4096 rows and faster between: 6 to 18 % on the RTX 4070 (1251 to 1058 microseconds
+for IQ2_S's layer at 512 rows), 10 to 24 % on the RTX 3060.
 
 *Speed on the CPU by type* (`ares-runtime`'s `examples/expert_cpu_types`, 2026-11-12, nine
 workers as the engine places them on this machine, load average 3 to 5 from other work;
