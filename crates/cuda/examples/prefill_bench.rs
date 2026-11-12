@@ -37,7 +37,7 @@ const N_OUT: u32 = 17408;
 
 /// The types with a tile kernel over the file's layout, in the order of their bytes
 /// in Qwen3.8-27B, then the others that have a device layout.
-const TYPES: [GgmlType; 18] = [
+const TYPES: [GgmlType; 25] = [
     GgmlType::IQ4_XS,
     GgmlType::Q4_K,
     GgmlType::Q5_K,
@@ -56,6 +56,13 @@ const TYPES: [GgmlType; 18] = [
     GgmlType::Q5_1,
     GgmlType::IQ2_XXS,
     GgmlType::IQ1_S,
+    GgmlType::IQ1_M,
+    GgmlType::Q2_0,
+    GgmlType::TQ1_0,
+    GgmlType::TQ2_0,
+    GgmlType::MXFP4,
+    GgmlType::NVFP4,
+    GgmlType::Q1_0,
 ];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -188,6 +195,14 @@ fn time_type(
     for block in host.chunks_exact_mut(ty.block_bytes() as usize) {
         for scale_at in scale_offsets(ty) {
             block[*scale_at..*scale_at + 2].copy_from_slice(&0x2c00u16.to_le_bytes());
+        }
+        if ty == GgmlType::IQ1_M {
+            // The f16 d is spread over the top nibbles of the four u16 of the scales.
+            for i in 0..4 {
+                let word = u16::from_le_bytes([block[48 + 2 * i], block[49 + 2 * i]]);
+                let word = (word & 0x0FFF) | (((0x2c00u16 >> (4 * i)) & 0xF) << 12);
+                block[48 + 2 * i..50 + 2 * i].copy_from_slice(&word.to_le_bytes());
+            }
         }
     }
     let weights = (0..copies)

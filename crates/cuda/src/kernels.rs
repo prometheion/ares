@@ -111,8 +111,22 @@ const PREFILL_TYPES: [(GgmlType, &str, u64, u32); 11] = [
 /// [`PREFILL_TYPES`]. They have the f16 and the f16 flush variants and no int8 one
 /// ([`Kernels::prefill_path_for`] takes the first on a card that runs it at full rate and
 /// the second on a capped card).
-const PREFILL_MORE_TYPES: [(GgmlType, &str, u64, u32); 2] =
-    [(GgmlType::IQ2_XXS, "iq2_xxs", 2, 2048 + 4096), (GgmlType::IQ1_S, "iq1_s", 2, 16384)];
+const PREFILL_MORE_TYPES: [(GgmlType, &str, u64, u32); 14] = [
+    (GgmlType::IQ2_XXS, "iq2_xxs", 2, 2048 + 4096),
+    (GgmlType::IQ1_S, "iq1_s", 2, 16384),
+    (GgmlType::IQ1_M, "iq1_m", 8, 16384),
+    (GgmlType::Q2_0, "q2_0", 2, 0),
+    (GgmlType::Q2_K, "q2_K", 4, 0),
+    (GgmlType::Q4_0, "q4_0", 2, 0),
+    (GgmlType::Q4_1, "q4_1", 4, 0),
+    (GgmlType::Q5_0, "q5_0", 2, 0),
+    (GgmlType::Q5_1, "q5_1", 4, 0),
+    (GgmlType::TQ1_0, "tq1_0", 2, 0),
+    (GgmlType::TQ2_0, "tq2_0", 2, 0),
+    (GgmlType::MXFP4, "mxfp4", 1, 0),
+    (GgmlType::NVFP4, "nvfp4", 4, 0),
+    (GgmlType::Q1_0, "q1_0", 2, 0),
+];
 
 /// One shape of the prefill kernels (`kernels/prefill.cu`): the weight rows and
 /// activation rows a thread block computes, and its threads.
@@ -171,7 +185,7 @@ const DEFAULT_SHARED: u32 = 48 << 10;
 /// For each weight type, up to how many activation rows the decode kernels (in
 /// launches of [`MAX_BATCH`] rows) are the faster family; above it the tensor-core
 /// kernels are. See [`Kernels::decode_kernel_rows`].
-const DECODE_ROWS: [(GgmlType, u32); 13] = [
+const DECODE_ROWS: [(GgmlType, u32); 16] = [
     (GgmlType::Q4_K, 16),
     (GgmlType::Q5_K, 16),
     (GgmlType::Q6_K, 8),
@@ -185,6 +199,9 @@ const DECODE_ROWS: [(GgmlType, u32); 13] = [
     (GgmlType::Q8_0, 8),
     (GgmlType::IQ2_XXS, 16),
     (GgmlType::IQ1_S, 12),
+    (GgmlType::IQ1_M, 12),
+    (GgmlType::Q2_0, 16),
+    (GgmlType::Q4_0, 16),
 ];
 
 /// The types for which [`PrefillPath::F16Flush`] is as fast as int8 on a capped card
@@ -784,7 +801,9 @@ impl Kernels {
     /// own crossover, not measured. The types of the second prefill module have no
     /// int8 path: theirs were measured against the f16 path with f16 accumulation (the
     /// same rule, rows 8 to 32 on both GPUs; at most 6 % lost in total at the row count
-    /// given: IQ2_XXS 16, IQ1_S 12).
+    /// given: IQ2_XXS 16, IQ1_S 12, IQ1_M 12, Q2_0 16, Q4_0 16). Q2_K, whose decode
+    /// kernel loses from 9 rows on, and the types not measured have no entry: above
+    /// eight rows they take the tile kernels.
     pub fn decode_kernel_rows(ty: GgmlType) -> Option<u32> {
         DECODE_ROWS.iter().find(|(t, _)| *t == ty).map(|(_, rows)| *rows)
     }

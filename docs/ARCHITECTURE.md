@@ -63,11 +63,10 @@ Scope decisions:
   i-quants, the ternary and 1-bit types, the 4-bit float types), and each has
   its kernels on both backends. Both backends have a decode kernel for every
   type, and the embedding gather decodes every type on both. The Vulkan
-  kernels for many rows cover every type; the CUDA ones cover thirteen: the
-  eleven types of the Q4_K file of Qwen3.8-27B, the first reference file, and
-  iq2_xxs and iq1_s, which make most of its 2-bit file, and are being
-  extended. Until they are, the dense model multiplies a matrix of any other
-  type with the decode kernels in launches of eight rows.
+  kernels for many rows cover every type; the CUDA ones cover twenty-five of
+  the twenty-eight: all but the three float types, which are the next ones.
+  Until they have them, the dense model multiplies a matrix of a float type
+  with the decode kernels in launches of eight rows.
 
 - **No engine is the model for this one.** llama.cpp, vLLM, SGLang, Strata
   and the others are references, each for what it does best, and a design is
@@ -928,7 +927,7 @@ microsecond and nothing in the path synchronises.
 **Prefill weight kernels.** A quantized matrix times many rows of
 activations, on the tensor cores, for eleven types (`kernels/mm.cuh`,
 `mm_types.cuh`, `mmr.cuh`, `prefill.cu`) and, in a second module with the f16
-paths only (`prefill_more.cu`, `mm_types_more.cuh`; below), iq2_xxs and iq1_s.
+paths only (`prefill_more.cu`, `mm_types_more.cuh`; below), fourteen more.
 Three paths,
 which `Kernels::prefill_path_for(ty, precision)` chooses per type and device:
 
@@ -1011,16 +1010,17 @@ kernels are the faster family (6 to 20, by type); above it `matmul` is used.
 Re-measured with all paths: Q4_K 16, IQ4_XS 12, Q6_K 8 to 12 on the RTX 4070
 (unchanged); the RTX 3060 keeps decode ahead up to about 16 for Q6_K.
 
-**IQ2_XXS and IQ1_S** (`prefill_more.cu`, `mm_types_more.cuh`). The same tile
+**The second module** (`prefill_more.cu`, `mm_types_more.cuh`): iq2_xxs, iq1_s, iq1_m,
+q2_0, q2_K, q4_0, q4_1, q5_0, q5_1, tq1_0, tq2_0, mxfp4, nvfp4 and q1_0. The same tile
 kernels over the file's layout, with the f16 and the f16-accumulation paths and no
 int8 one: for IQ2_S the f16 path with f16 accumulation is as fast as int8 (73.4
 against 65.5 TOPS on the RTX 4070, 31.4 against 29.2 on the RTX 3060) and 20 times
-more exact, so an 8-bit form of the two types was not built. A type of the second
-module hands the tile kernel its decoder as `decode_f16` (`AresMmDirect` in `mm.cuh`):
+more exact, so an 8-bit form of these types was not built. IQ2_XXS, IQ1_S and IQ1_M
+hand the tile kernel their decoder as `decode_f16` (`AresMmDirect` in `mm.cuh`):
 the item's 32 values come out as f16 pairs straight from the codebook entry, the sign
 masks and the scale, with the decoders of the many-row expert kernels
 (`expertrows_types.cuh`; IQ1_S shares the group of IQ1_M, `ares_er_iq1_values`),
-where the other types go through signed codes and `ares_mm_codes_to_f16`. Measured
+where the others go through codes and scales as the first module does (`ares_mm_codes_to_f16`). Measured
 2026-11-12 (`prefill_bench`, 17408 x 5120, 2048 rows, TOPS, RTX 4070 / RTX 3060; load
 from other jobs on the machine does not touch a GPU kernel):
 
@@ -1031,33 +1031,43 @@ from other jobs on the machine does not touch a GPU kernel):
 | (iq2_s)  | 52.0 / 22.5            | 73.4 / 31.4               |                        |
 | (q4_K)   | 55.3 / 23.5            | 77.9 / 33.9               |                        |
 
-So both are in the range of the types that had kernels (5.1 times as fast as the
+The other twelve, f16 with f16 accumulation at 1024 rows (RTX 4070 / RTX 3060):
+iq1_m 84.1 / 35.3, q2_0 81.9 / 34.9, q2_K 76.4 / 32.9, q4_0 73.7 / 32.2, q4_1 73.8 / 32.1,
+q5_0 66.9 / 29.5, q5_1 66.3 / 29.1, tq1_0 65.1 / 27.9, tq2_0 79.1 / 33.7, mxfp4 75.2 / 32.5, nvfp4 74.6 / 32.4, q1_0 81.6 / 34.8.
+
+IQ2_XXS and IQ1_S are in the range of the types that had kernels (5.1 times as fast as the
 decode kernels in launches of eight rows for IQ2_XXS, 6.5 for IQ1_S), and no device
 layout was tried for them: the rearranged form of Q4_K above was not faster than the
 tile kernel at prompt sizes and these kernels are within 8 % of Q4_K's rate, so there is
 no gap for a layout to close, and Vulkan has nothing to mirror (the layouts stay those
-of the file). Their rows of `DECODE_ROWS` (the decode kernels win up to 16 rows for
-IQ2_XXS, 12 for IQ1_S) are from the same bench at 8 to 32 rows.
+of the file). Their rows of `DECODE_ROWS` (the decode kernels win up to 16 rows for IQ2_XXS, Q2_0 and Q4_0,
+up to 12 for IQ1_S and IQ1_M; Q2_K and Q5_1 have none, since theirs win only up to about 10
+rows, nor have the types not measured, so above eight rows those take the tile kernels) are
+from the same bench at 8 to 32 rows.
 
 The 2-bit file of Qwen3.8-27B (`Qwen3.8-27B-UD-IQ2_XXS.gguf`, 2048 tokens, one card,
-`qwen35_run --prefill 2048`): the prompt went from 267 to 1104 tokens per second on the
-RTX 4070 and from 128 to 521 on the RTX 3060 (the llama.cpp fork: 1011 to 1108 and 563);
-the decode step at 1000 tokens of context did not change (21.03 and 20.99 ms, 36.53 and
-36.57 ms), the top-1 agreement with llama.cpp on the German and English prompts is
-96.8 / 98.3 % (RTX 4070) and 96.4 / 98.7 % (RTX 3060) after, 96.0 to 99.1 % before. The
-Q4_K_S file on both cards (0.625 / 0.375): 1253 and 1278 tokens per second, 24.72 and
-24.81 ms per decode step, which is the noise of the layout probes. On the RTX 3060 the
-weights take 3.3 of the 3.9 seconds of the pass, at the 31 to 34 TOPS that every tile
-kernel reaches there (Q4_K 34); the llama.cpp fork's 563 tokens per second would need
-about 9 % more from them.
+`qwen35_run --prefill 2048`): the prompt went from 267 to 1154 tokens per second on the
+RTX 4070 and from 128 to 536 on the RTX 3060 (the llama.cpp fork: 1011 to 1108 and 563);
+the decode step at 1000 tokens of context did not change (21.03 and 21.06 ms, 36.53 and
+36.51 ms), the top-1 agreement with llama.cpp on the German and English prompts is
+96.4 / 97.8 % (RTX 4070) and 96.8 / 98.7 % (RTX 3060) after, 96.0 to 99.1 % before. With
+only IQ2_XXS and IQ1_S the prompt ran at 1104 and 521 tokens per second; the other 4 %
+and 3 % are the three attention blocks with q2_K matrices, which took the whole group of
+matrices that read their input through the decode kernels. The Q4_K_S file on both
+cards (0.625 / 0.375) took 1253 and 1278 tokens per second, 24.72 and 24.81 ms per decode
+step, which is the noise of the layout probes. On the RTX 3060 the weights are 88 % of
+the pass (profile of the first version per step of 512 rows: weights 860 ms, recurrent
+layers 86, attention 34), at the 31 to 34 TOPS that every tile kernel reaches there (Q4_K
+34), IQ2_XXS being about 43 % of that time and IQ1_S 28 % by their rates and numbers of
+values; the llama.cpp fork's 563 tokens per second would need about 5 % less time than
+the 536. On the RTX 4070 the weights take 1.62 of the 1.87 seconds.
 
-The other fifteen weight types have no prefill kernel yet (q2_K, the legacy types
-but q8_0, iq1_m, the ternary, 4-bit float, 1-bit and 2-bit types, and the float
-types). A dense model that has such a matrix takes the rows of a prompt through the
-decode kernels in launches of eight rows (`decode_in_batches` in
+The three float types (f32, f16, bf16) have no prefill kernel yet. A dense model that
+has such a matrix takes the rows of a prompt through the decode kernels in launches
+of eight rows (`decode_in_batches` in
 `qwen35/device/choose.rs`): the weights are read once for every eight rows, and the
 matrices that read the same input are multiplied that way too, whatever their types.
-(In the 2-bit file that is q2_K in three attention blocks.) `Precision::Exact` has
+`Precision::Exact` has
 no such way: it is the tile kernels' f16 path, and refuses a matrix in the file's
 layout of one of these types.
 

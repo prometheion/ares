@@ -52,7 +52,22 @@ const TYPES: [(GgmlType, &[usize]); 11] = [
 ];
 
 /// The types of the second module (`kernels/prefill_more.cu`): the f16 variants only.
-const MORE_TYPES: [(GgmlType, &[usize]); 2] = [(GgmlType::IQ2_XXS, &[0]), (GgmlType::IQ1_S, &[0])];
+const MORE_TYPES: [(GgmlType, &[usize]); 14] = [
+    (GgmlType::IQ2_XXS, &[0]),
+    (GgmlType::IQ1_S, &[0]),
+    (GgmlType::IQ1_M, &[]),
+    (GgmlType::Q2_0, &[0]),
+    (GgmlType::Q2_K, &[80, 82]),
+    (GgmlType::Q4_0, &[0]),
+    (GgmlType::Q4_1, &[0, 2]),
+    (GgmlType::Q5_0, &[0]),
+    (GgmlType::Q5_1, &[0, 2]),
+    (GgmlType::TQ1_0, &[52]),
+    (GgmlType::TQ2_0, &[64]),
+    (GgmlType::MXFP4, &[]),
+    (GgmlType::NVFP4, &[]),
+    (GgmlType::Q1_0, &[0]),
+];
 
 const PATHS: [PrefillPath; 3] = [PrefillPath::Int8, PrefillPath::F16, PrefillPath::F16Flush];
 
@@ -117,8 +132,10 @@ fn read_f32(buffer: &DeviceBuffer, n: usize) -> Vec<f32> {
     bytes.as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)).collect()
 }
 
-/// `n_blocks` blocks of `ty` of random bytes, with finite f16 scales of both
-/// signs (any other bytes are valid in every one of these types).
+/// `n_blocks` blocks of `ty` of random bytes, with finite scales (f16 of both signs; a
+/// small power of two for MXFP4's exponent byte and NVFP4's four UE4M3 bytes), where the
+/// bytes of a scale could otherwise be infinite or NaN. Any other bytes are valid in every
+/// one of these types.
 fn random_blocks(rng: &mut Rng, ty: GgmlType, n_blocks: usize) -> Vec<u8> {
     let (_, scales) = all_types().find(|(t, _)| *t == ty).unwrap();
     let block = ty.block_bytes() as usize;
@@ -129,6 +146,27 @@ fn random_blocks(rng: &mut Rng, ty: GgmlType, n_blocks: usize) -> Vec<u8> {
                 * if rng.next().is_multiple_of(4) { -1.0 } else { 1.0 };
             let at = b * block + offset;
             bytes[at..at + 2].copy_from_slice(&f32_to_f16(scale).to_le_bytes());
+        }
+        match ty {
+            // The E8M0 exponent byte: 2^-7 to 2^3.
+            GgmlType::MXFP4 => bytes[b * block] = 120 + (rng.next() % 11) as u8,
+            // The four UE4M3 scale bytes: 0.125 to 2.
+            GgmlType::NVFP4 => {
+                for i in 0..4 {
+                    bytes[b * block + i] = 0x20 + (rng.next() % 0x21) as u8;
+                }
+            }
+            _ => {}
+        }
+        if ty == GgmlType::IQ1_M {
+            // The f16 d is spread over the top nibbles of the four u16 of the scales.
+            let d = f32_to_f16(0.002 + 0.02 * (rng.unit() * 0.5 + 0.5));
+            for i in 0..4 {
+                let at = b * block + 48 + 2 * i;
+                let word = u16::from_le_bytes([bytes[at], bytes[at + 1]]);
+                let word = (word & 0x0FFF) | (((d >> (4 * i)) & 0xF) << 12);
+                bytes[at..at + 2].copy_from_slice(&word.to_le_bytes());
+            }
         }
     }
     bytes
@@ -736,7 +774,7 @@ fn bad_arguments_are_refused() {
     let null = DevicePtr::NULL;
     let int8 = PrefillPath::Int8;
 
-    for ty in [GgmlType::F16, GgmlType::Q4_0, GgmlType::Q2_K, GgmlType::MXFP4] {
+    for ty in [GgmlType::F16, GgmlType::BF16, GgmlType::F32] {
         assert!(!Kernels::has_prefill_matmul(ty));
         // SAFETY: refused before anything is launched.
         let error = unsafe { kernels.matmul(&stream, ty, int8, p, p, p, 256, 1, 1) }

@@ -1206,22 +1206,26 @@ mod tests {
                 assert_eq!(fast(&[ty], n), expected, "{ty} with {n} rows");
             }
         }
-        // The thirteen types with tile kernels are split only where their decode kernels are
-        // faster; the other fifteen always.
+        // The twenty-five types with tile kernels are split only where their decode kernels are
+        // faster; the three float types always.
         let tile = ares_core::ggml_type::ALL_TYPES
             .into_iter()
             .filter(|t| t.is_weight() && Kernels::has_prefill_matmul(*t))
             .count();
-        assert_eq!(tile, 13);
-        assert!(fast(&[GgmlType::Q2_K], 512) && fast(&[GgmlType::Q4_0], 9));
+        assert_eq!(tile, 25);
+        assert!(fast(&[GgmlType::BF16], 512) && fast(&[GgmlType::F16], 9));
         assert!(!fast(&[GgmlType::IQ2_XXS], 512) && !fast(&[GgmlType::IQ2_XXS], 17));
-        assert!(fast(&[GgmlType::IQ1_S], 12) && !fast(&[GgmlType::IQ1_S], 13));
+        assert!(
+            fast(&[GgmlType::IQ1_S], 12)
+                && !fast(&[GgmlType::IQ1_S], 13)
+                && !fast(&[GgmlType::Q2_K], 9)
+        );
         assert!(!fast(&[GgmlType::Q4_K], 17) && fast(&[GgmlType::Q4_K], 16));
         // Matrices that read one input are multiplied the same way: one without a tile
         // kernel brings the others along, and one that is faster on the tile kernels keeps
         // the others off the decode kernels.
-        assert!(fast(&[GgmlType::Q4_K, GgmlType::Q2_K], 100));
-        assert!(fast(&[GgmlType::Q8_0, GgmlType::Q2_K], 100));
+        assert!(fast(&[GgmlType::Q4_K, GgmlType::F16], 100));
+        assert!(fast(&[GgmlType::Q8_0, GgmlType::F32], 100));
         assert!(fast(&[GgmlType::Q4_K, GgmlType::IQ4_XS], 12));
         assert!(!fast(&[GgmlType::Q4_K, GgmlType::Q8_0], 12));
         // The exact products are the tile kernels' f16 path: no launches of decode kernels.

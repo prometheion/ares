@@ -1,8 +1,8 @@
 //! The device implementation of `qwen35` on a made-up model whose weights, embedding table
-//! included, are in the 2-bit types of the small file of Qwen3.8-27B: IQ2_XXS and IQ1_S
-//! (the bulk of it), whose prompts go through the tile kernels, and Q2_K, which has none yet,
-//! so that its prompts go through the decode kernels in launches of eight rows whatever the
-//! number of rows. The embedding is gathered in the type it is stored in.
+//! included, are in the 2-bit types of the small file of Qwen3.8-27B: IQ2_XXS and IQ1_S (the
+//! bulk of it) and Q2_K. Their prompts go through the decode kernels up to the rows where the
+//! tile kernels are faster and through the tile kernels above, and the embedding is gathered
+//! in the type it is stored in.
 //!
 //! Needs `ARES_TEST_CUDA=1` (and nothing else: the model is made here), and says so when it
 //! skips. `ARES_TEST_DEVICE` picks the GPU (default 0). Lines that start with `ERR` are the
