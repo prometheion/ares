@@ -173,6 +173,7 @@ async fn the_engine_receives_everything_the_client_sent_and_nothing_else() {
             {"role": "developer", "content": "newer name for system"}
         ],
         "tools": [{"type": "function", "function": {"name": "f", "parameters": {"type": "object", "properties": {"z": {"type": "integer"}, "a": {"type": "string"}}}}}],
+        "tool_choice": "none",
         "temperature": 0.5, "top_p": 0.75, "top_k": 40, "min_p": 0.0625,
         "presence_penalty": 0.5, "frequency_penalty": -0.25, "repeat_penalty": 1.5, "seed": 42,
         "max_tokens": 100, "max_completion_tokens": 50,
@@ -611,8 +612,8 @@ async fn bad_requests_are_refused_before_the_engine_sees_them() {
         chat(json!({"stream_options": 5})).into_case(Some("stream_options"), "must be an object"),
         // What the server does not do is refused by name, never dropped.
         chat(json!({"top_logprobs": 5})).into_case(Some("top_logprobs"), "requires logprobs"),
-        chat(json!({"tool_choice": "required"})).into_case(Some("tool_choice"), "tool calls are not built"),
-        chat(json!({"functions": []})).into_case(Some("functions"), "tool calls are not built"),
+        chat(json!({"tool_choice": "required"})).into_case(Some("tool_choice"), "the request has no tools"),
+        chat(json!({"functions": []})).into_case(Some("functions"), "send tools and tool_choice"),
         // The engine of these tests declares no template, so it has no effort to set.
         chat(json!({"reasoning_effort": "high"})).into_case(Some("reasoning_effort"), "does not use it"),
         (COMPLETIONS, completion_body(json!({"chat_template_kwargs": {"enable_thinking": false}})), Some("chat_template_kwargs"), "no chat template"),

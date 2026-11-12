@@ -1,5 +1,6 @@
 //! The HTTP handlers.
 
+use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::sync::LazyLock;
@@ -17,9 +18,11 @@ use futures_util::StreamExt;
 use crate::Config;
 use crate::bridge::{DecisionRun, Flight, Item, Run, Stop, Timings};
 use crate::error::ApiError;
-use crate::reasoning::{self, Split, Splitter};
+use crate::reasoning::{self, Split};
+use crate::reply::{Piece, Sorter};
 use crate::systemone;
-use crate::wire::{self, Choice, Endpoint, Head};
+use crate::tools;
+use crate::wire::{self, Call, Choice, Endpoint, Head};
 
 /// What every handler needs.
 #[derive(Clone)]
@@ -92,7 +95,9 @@ async fn try_completion(
     let body = read_body(request, app.config.max_body_bytes).await?;
     let id = next_request_id();
     let mut parsed = wire::parse(endpoint, &body, id)?;
-    let splitter = reasoning::apply(&mut parsed, &*app.engine, app.config.reasoning_format)?;
+    let thinking = reasoning::apply(&mut parsed, &*app.engine, app.config.reasoning_format)?;
+    let calls = tools::apply(&mut parsed, &*app.engine, &thinking)?;
+    let sorter = Sorter::new(thinking.splitter, calls);
     let mut head = Head::new(endpoint, id, &parsed.request.model);
     head.logprobs = parsed.logprobs;
     tracing::info!(
@@ -116,18 +121,22 @@ async fn try_completion(
             request.sampling.seed =
                 request.sampling.seed.map(|seed| seed.wrapping_add(u64::from(i)));
         }
-        runs.push(Run::start(
-            &app.engine,
-            request,
-            app.config.event_buffer,
-            &app.flight,
-            app.stop.clone(),
-        )?);
+        let sorter = sorter.with_call_ids(tools::call_ids(request.id));
+        runs.push((
+            sorter,
+            Run::start(
+                &app.engine,
+                request,
+                app.config.event_buffer,
+                &app.flight,
+                app.stop.clone(),
+            )?,
+        ));
     }
     if parsed.stream {
-        stream(runs, head, parsed.include_usage, splitter).await
+        stream(runs, head, parsed.include_usage).await
     } else {
-        collect(runs, head, splitter).await
+        collect(runs, head).await
     }
 }
 
@@ -194,28 +203,46 @@ fn next_request_id() -> RequestId {
 /// What one completion of a non-streaming request came to.
 struct Collected {
     text: Split,
+    calls: Vec<Call>,
     probs: Vec<TokenProbs>,
     finish: &'static str,
     usage: Usage,
     timings: Timings,
 }
 
-async fn collect_one(mut run: Run, mut splitter: Splitter) -> Result<Collected, ApiError> {
+/// The reason a reply ended, as the answer says it: a reply that ended by
+/// itself (or at a stop string) with calls in it ended to call them. A reply
+/// the limit of tokens cut says so, whatever it holds.
+fn finish_reason(finish: &'static str, calls: usize) -> &'static str {
+    if finish == "stop" && calls > 0 { "tool_calls" } else { finish }
+}
+
+async fn collect_one(mut run: Run, mut sorter: Sorter) -> Result<Collected, ApiError> {
     let mut text = Split::default();
+    let mut calls: Vec<Call> = Vec::new();
     let mut probs = Vec::new();
+    let mut take = |pieces: Vec<Piece>| {
+        for piece in pieces {
+            match piece {
+                Piece::Text(sorted) => {
+                    text.reasoning.push_str(&sorted.reasoning);
+                    text.content.push_str(&sorted.content);
+                }
+                Piece::Call { id, name, .. } => {
+                    calls.push(Call { id, name, arguments: String::new() });
+                }
+                Piece::Arguments { index, json } => calls[index].arguments.push_str(&json),
+            }
+        }
+    };
     loop {
         match run.next().await? {
-            Item::Text(piece) => {
-                let sorted = splitter.push(&piece);
-                text.reasoning.push_str(&sorted.reasoning);
-                text.content.push_str(&sorted.content);
-            }
+            Item::Text(piece) => take(sorter.push(&piece)),
             Item::Probs(more) => probs.extend(more),
             Item::Done { finish, usage, timings } => {
-                let rest = splitter.finish();
-                text.reasoning.push_str(&rest.reasoning);
-                text.content.push_str(&rest.content);
-                return Ok(Collected { text, probs, finish, usage, timings });
+                take(sorter.finish());
+                let finish = finish_reason(finish, calls.len());
+                return Ok(Collected { text, calls, probs, finish, usage, timings });
             }
         }
     }
@@ -228,15 +255,15 @@ async fn collect_one(mut run: Run, mut splitter: Splitter) -> Result<Collected, 
 /// would have spent on it anyway. The completions of an `n` above 1 are
 /// collected side by side, so that none of them waits in its queue while
 /// another is being read.
-async fn collect(runs: Vec<Run>, head: Head, splitter: Splitter) -> Result<Response, ApiError> {
+async fn collect(runs: Vec<(Sorter, Run)>, head: Head) -> Result<Response, ApiError> {
     let done = futures_util::future::try_join_all(
-        runs.into_iter().map(|run| collect_one(run, splitter.clone())),
+        runs.into_iter().map(|(sorter, run)| collect_one(run, sorter)),
     )
     .await?;
     let choices: Vec<Choice<'_>> = done
         .iter()
         .enumerate()
-        .map(|(i, c)| head.choice(i as u32).complete_choice(&c.text, c.finish, &c.probs))
+        .map(|(i, c)| head.choice(i as u32).complete_choice(&c.text, &c.calls, c.finish, &c.probs))
         .collect();
     // One prompt, however many completions of it.
     let usage = Usage {
@@ -261,28 +288,30 @@ fn json_response(body: String) -> Response {
 /// The completions of an `n` above 1 are streamed side by side, their chunks
 /// told apart by `index`; the usage and the end marker come once, after all.
 async fn stream(
-    runs: Vec<Run>,
+    runs: Vec<(Sorter, Run)>,
     head: Head,
     include_usage: bool,
-    splitter: Splitter,
 ) -> Result<Response, ApiError> {
     let many = runs.len() > 1;
-    let firsts = futures_util::future::try_join_all(runs.into_iter().map(|mut run| async move {
-        let first = run.next().await?;
-        Ok::<_, ApiError>((run, first))
-    }))
-    .await?;
+    let firsts =
+        futures_util::future::try_join_all(runs.into_iter().map(|(sorter, mut run)| async move {
+            let first = run.next().await?;
+            Ok::<_, ApiError>((sorter, run, first))
+        }))
+        .await?;
     let shared = many.then(|| Arc::new(Shared::default()));
     let parts: Vec<_> = firsts
         .into_iter()
         .enumerate()
-        .map(|(i, (run, first))| {
+        .map(|(i, (sorter, run, first))| {
             let state = Chunks {
                 run,
                 head: head.choice(i as u32),
                 include_usage,
-                splitter: splitter.clone(),
+                sorter,
                 phase: Phase::Start(first),
+                queue: VecDeque::new(),
+                calls: 0,
                 sent: 0,
                 shared: shared.clone(),
             };
@@ -371,8 +400,13 @@ struct Chunks {
     run: Run,
     head: Head,
     include_usage: bool,
-    splitter: Splitter,
+    sorter: Sorter,
     phase: Phase,
+    /// Chunks that are ready and have not gone out: a piece of the reply can
+    /// be several (content, the start of a call, its arguments).
+    queue: VecDeque<String>,
+    /// How many calls the reply has begun.
+    calls: usize,
     /// Characters of text sent so far, for the offsets of probabilities.
     sent: usize,
     /// Set when this is one of several completions.
@@ -390,6 +424,9 @@ impl Chunks {
     /// one is not.
     async fn step(&mut self) -> Option<String> {
         loop {
+            if let Some(chunk) = self.queue.pop_front() {
+                return Some(chunk);
+            }
             match std::mem::replace(&mut self.phase, Phase::End) {
                 Phase::End => return None,
                 Phase::Start(first) => {
@@ -400,24 +437,19 @@ impl Chunks {
                 }
                 Phase::Ready(Item::Text(text)) => {
                     self.phase = Phase::Pull;
-                    // A piece that is held back or empty would only add an empty chunk.
-                    let sorted = self.splitter.push(&text);
-                    if !sorted.is_empty() {
-                        self.sent += sorted.content.chars().count();
-                        return Some(self.head.text_chunk(&sorted));
-                    }
+                    // A piece that is held back or empty adds no chunk.
+                    let pieces = self.sorter.push(&text);
+                    self.enqueue(pieces);
                 }
                 Phase::Ready(Item::Probs(probs)) => {
                     self.phase = Phase::Pull;
                     return Some(self.head.probs_chunk(&probs, self.sent));
                 }
                 Phase::Ready(Item::Done { finish, usage, timings }) => {
+                    let rest = self.sorter.finish();
+                    self.enqueue(rest);
+                    let finish = finish_reason(finish, self.calls);
                     self.phase = Phase::Finish { finish, usage, timings };
-                    let rest = self.splitter.finish();
-                    if !rest.is_empty() {
-                        self.sent += rest.content.chars().count();
-                        return Some(self.head.text_chunk(&rest));
-                    }
                 }
                 Phase::Finish { finish, usage, timings } => {
                     self.phase = match &self.shared {
@@ -447,6 +479,26 @@ impl Chunks {
                 }
                 Phase::Marker => return Some("[DONE]".to_owned()),
             }
+        }
+    }
+}
+
+impl Chunks {
+    /// Queues the chunks of what the sorter found in a piece of the reply.
+    fn enqueue(&mut self, pieces: Vec<Piece>) {
+        for piece in pieces {
+            let chunk = match piece {
+                Piece::Text(sorted) => {
+                    self.sent += sorted.content.chars().count();
+                    self.head.text_chunk(&sorted)
+                }
+                Piece::Call { index, id, name } => {
+                    self.calls += 1;
+                    self.head.call_chunk(index, &id, &name)
+                }
+                Piece::Arguments { index, json } => self.head.arguments_chunk(index, &json),
+            };
+            self.queue.push_back(chunk);
         }
     }
 }

@@ -181,8 +181,19 @@ fn refuse_budget(fields: &Fields<'_>) -> Result<(), ApiError> {
     }
 }
 
+/// What a request comes to for its reply.
+#[derive(Debug)]
+pub(crate) struct Applied {
+    /// Sorts the text of the reply into reasoning and content.
+    pub splitter: Splitter,
+    /// Where the answer of the reply starts: where a rule for it binds.
+    pub start: Start,
+    /// Whether the reasoning stays in the content, tags and all.
+    pub raw: bool,
+}
+
 /// Applies what `parsed` asks about thinking to its request and returns the
-/// splitter for the reply.
+/// splitter for the reply and where its answer starts.
 ///
 /// The variables go into the prompt of a chat request, on top of the ones the
 /// engine was started with. `default` is the format the server was started
@@ -191,10 +202,10 @@ pub(crate) fn apply(
     parsed: &mut Parsed,
     engine: &dyn Engine,
     default: ReasoningFormat,
-) -> Result<Splitter, ApiError> {
+) -> Result<Applied, ApiError> {
     let GenerateRequest { model, prompt, structure, .. } = &mut parsed.request;
     let Prompt::Chat { variables, .. } = prompt else {
-        return Ok(Splitter::plain());
+        return Ok(Applied { splitter: Splitter::plain(), start: Start::Reply, raw: false });
     };
     let asked = std::mem::take(&mut parsed.reasoning);
     let format = engine.chat_format(model);
@@ -202,9 +213,10 @@ pub(crate) fn apply(
     let plan = plan(&asked, thinking, default)?;
     *variables = plan.variables;
     if let Some(structure) = structure {
-        structure.start = plan.start;
+        structure.start = plan.start.clone();
     }
-    Ok(plan.splitter)
+    let raw = thinking.is_some() && !asked.format.unwrap_or(default).extracts();
+    Ok(Applied { splitter: plan.splitter, start: plan.start, raw })
 }
 
 /// What a request comes to once the template's thinking is known.

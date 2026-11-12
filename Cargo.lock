@@ -160,6 +160,7 @@ dependencies = [
  "ares-core",
  "ares-cuda",
  "ares-gguf",
+ "ares-grammar",
  "ares-model",
  "ares-runtime",
  "ares-sampler",

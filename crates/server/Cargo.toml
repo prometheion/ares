@@ -20,6 +20,9 @@ ares-core = { path = "../core" }
 # Devices are chosen, opened and described here before the runtime gets them.
 ares-cuda.workspace = true
 ares-gguf = { path = "../gguf" }
+# The grammar of the calls of tools, and the kinds of value a tool's schema
+# allows for an argument.
+ares-grammar.workspace = true
 ares-model = { path = "../model" }
 ares-runtime = { path = "../runtime" }
 # The variables of a chat template that are set at start.

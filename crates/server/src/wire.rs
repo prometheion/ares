@@ -21,6 +21,7 @@ use crate::bridge::Timings;
 use crate::error::ApiError;
 use crate::reasoning::{self, Asked, Split};
 use crate::structured;
+use crate::tools;
 
 /// Which of the two endpoints a request came in on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,6 +65,9 @@ pub(crate) struct Parsed {
     /// What a chat request says about thinking: the variables of the chat
     /// template are not in `request` yet.
     pub reasoning: Asked,
+    /// What a chat request says about tools: the rule for the reply is not
+    /// in `request` yet.
+    pub tools: tools::Asked,
     /// How many completions to make of the prompt.
     pub n: u32,
     pub logprobs: Option<LogprobFormat>,
@@ -94,8 +98,7 @@ pub(crate) fn members(json: &Json) -> Result<&[(String, Json)], ApiError> {
     }
 }
 
-/// The fields of a request that are read and handed to the engine. The
-/// engine refuses what it cannot do among them (penalties, tools).
+/// The fields of a request that are read and handed to the engine.
 const SERVED: &[&str] = &[
     "model",
     "stream",
@@ -159,8 +162,9 @@ fn refuse_unserved(endpoint: Endpoint, fields: &Fields<'_>) -> Result<(), ApiErr
         let name = name.as_str();
         let own = match endpoint {
             Endpoint::Chat => {
-                ["messages", "tools", "max_completion_tokens"].contains(&name)
+                ["messages", "max_completion_tokens"].contains(&name)
                     || reasoning::FIELDS.contains(&name)
+                    || tools::FIELDS.contains(&name)
             }
             Endpoint::Completions => name == "prompt",
         } || structured::FIELDS.contains(&name);
@@ -183,14 +187,9 @@ fn unserved(name: &str, value: &Json) -> Option<&'static str> {
         Json::Float(f) => *f == off,
         _ => false,
     };
-    let tools = "tool calls are not built";
     let off = match name {
         "best_of" => number(1.0),
         "echo" => matches!(value, Json::Bool(false)),
-        "tool_choice" => matches!(value.as_str(), Some("none" | "auto")),
-        // It says how tools are called, and a request with tools is the
-        // engine's to refuse.
-        "parallel_tool_calls" => matches!(value, Json::Bool(_)),
         _ => false,
     };
     if off {
@@ -205,7 +204,12 @@ fn unserved(name: &str, value: &Json) -> Option<&'static str> {
              picks, and unlike mirostat it has no draw that the sampler can do without drafts"
         }
         "echo" | "suffix" => "the completion is returned on its own",
-        "tool_choice" | "parallel_tool_calls" | "functions" | "function_call" => tools,
+        "functions" | "function_call" => {
+            "the functions of the first chat API are not served: send tools and tool_choice"
+        }
+        name if tools::FIELDS.contains(&name) => {
+            "tools belong to chat requests: /v1/completions has no chat template"
+        }
         name if reasoning::FIELDS.contains(&name) => {
             "thinking belongs to chat requests: /v1/completions has no chat template"
         }
@@ -234,9 +238,9 @@ fn from_json(endpoint: Endpoint, json: &Json, id: RequestId) -> Result<Parsed, A
     sampling.validate().map_err(|e| ApiError::invalid_param(e.field, e.to_string()))?;
     refuse_unserved(endpoint, &fields)?;
 
-    let reasoning = match endpoint {
-        Endpoint::Chat => reasoning::asked(&fields)?,
-        Endpoint::Completions => Asked::default(),
+    let (reasoning, tools) = match endpoint {
+        Endpoint::Chat => (reasoning::asked(&fields)?, tools::asked(&fields)?),
+        Endpoint::Completions => (Asked::default(), tools::Asked::default()),
     };
     let request = GenerateRequest {
         model,
@@ -258,6 +262,7 @@ fn from_json(endpoint: Endpoint, json: &Json, id: RequestId) -> Result<Parsed, A
         stream: fields.bool("stream")?.unwrap_or(false),
         include_usage,
         reasoning,
+        tools,
         n,
         logprobs: format,
     })
@@ -786,7 +791,12 @@ fn message(index: usize, value: &Json) -> Result<Message, ApiError> {
     };
     let tool_calls = match fields.get("tool_calls") {
         None => None,
-        Some(Json::Array(calls)) => Some(calls.clone()),
+        Some(Json::Array(calls)) => {
+            for (j, call) in calls.iter().enumerate() {
+                tool_call(&format!("{}[{j}]", at("tool_calls")), call)?;
+            }
+            Some(calls.clone())
+        }
         Some(other) => {
             return Err(ApiError::invalid_param(
                 at("tool_calls"),
@@ -803,6 +813,33 @@ fn message(index: usize, value: &Json) -> Result<Message, ApiError> {
         tool_calls,
         reasoning_content: string_field("reasoning_content")?,
     })
+}
+
+/// Checks a call of an assistant message: `{"id", "type": "function",
+/// "function": {"name", "arguments"}}`, the arguments an object as JSON text
+/// (OpenAI's form) or as it is.
+fn tool_call(at: &str, call: &Json) -> Result<(), ApiError> {
+    let refuse = |message: String| Err(ApiError::invalid_param(at, message));
+    let Some(function @ Json::Object(_)) = call.get("function") else {
+        return refuse(format!("{at}.function must be an object"));
+    };
+    if !matches!(function.get("name"), Some(Json::String(name)) if !name.is_empty()) {
+        return refuse(format!("{at}.function.name must be a string that is not empty"));
+    }
+    let object = match function.get("arguments") {
+        None | Some(Json::Null | Json::Object(_)) => true,
+        Some(Json::String(text)) if text.trim().is_empty() => true,
+        Some(Json::String(text)) => {
+            matches!(serde_json::from_str::<Json>(text), Ok(Json::Object(_)))
+        }
+        Some(_) => false,
+    };
+    if !object {
+        return refuse(format!(
+            "{at}.function.arguments must be a JSON object, as text or as it is"
+        ));
+    }
+    Ok(())
 }
 
 /// Flattens `content` to text. It is a string, a list of typed parts, or
@@ -908,10 +945,20 @@ impl Head {
     pub fn complete_choice<'a>(
         &self,
         text: &'a Split,
+        calls: &'a [Call],
         finish: &'static str,
         probs: &[TokenProbs],
     ) -> Choice<'a> {
         let logprobs = self.logprobs_value(probs, 0);
+        let tool_calls: Vec<CallBody<'a>> = calls
+            .iter()
+            .map(|call| CallBody {
+                index: None,
+                id: Some(&call.id),
+                kind: Some("function"),
+                function: FunctionBody { name: Some(&call.name), arguments: &call.arguments },
+            })
+            .collect();
         match self.endpoint {
             Endpoint::Chat => Choice {
                 index: self.index,
@@ -919,6 +966,7 @@ impl Head {
                     role: "assistant",
                     content: &text.content,
                     reasoning_content: non_empty(&text.reasoning),
+                    tool_calls: (!tool_calls.is_empty()).then_some(tool_calls),
                 }),
                 text: None,
                 delta: None,
@@ -967,7 +1015,7 @@ impl Head {
 
     /// The first chunk of a chat stream: it announces the role.
     pub fn role_chunk(&self) -> String {
-        let delta = Delta { role: Some("assistant"), content: Some(""), reasoning_content: None };
+        let delta = Delta { role: Some("assistant"), content: Some(""), ..Delta::default() };
         self.render(true, vec![self.chunk_choice(Some(delta), None, None)], None, None)
     }
 
@@ -976,9 +1024,9 @@ impl Head {
         let choice = match self.endpoint {
             Endpoint::Chat => self.chunk_choice(
                 Some(Delta {
-                    role: None,
                     content: non_empty(&text.content),
                     reasoning_content: non_empty(&text.reasoning),
+                    ..Delta::default()
                 }),
                 None,
                 None,
@@ -986,6 +1034,32 @@ impl Head {
             Endpoint::Completions => self.chunk_choice(None, Some(&text.content), None),
         };
         self.render(true, vec![choice], None, None)
+    }
+
+    /// The chunk that begins the call `index` of a chat stream: its id and
+    /// the name of the tool, as OpenAI streams them.
+    pub fn call_chunk(&self, index: usize, id: &str, name: &str) -> String {
+        self.call_delta(CallBody {
+            index: Some(index),
+            id: Some(id),
+            kind: Some("function"),
+            function: FunctionBody { name: Some(name), arguments: "" },
+        })
+    }
+
+    /// The next fragment of the arguments of the call `index`.
+    pub fn arguments_chunk(&self, index: usize, json: &str) -> String {
+        self.call_delta(CallBody {
+            index: Some(index),
+            id: None,
+            kind: None,
+            function: FunctionBody { name: None, arguments: json },
+        })
+    }
+
+    fn call_delta(&self, call: CallBody<'_>) -> String {
+        let delta = Delta { tool_calls: Some(vec![call]), ..Delta::default() };
+        self.render(true, vec![self.chunk_choice(Some(delta), None, None)], None, None)
     }
 
     /// The last chunk of the text: carries `finish_reason`, the timings and
@@ -1171,9 +1245,43 @@ pub(crate) struct Choice<'a> {
 #[derive(Serialize)]
 struct FullMessage<'a> {
     role: &'static str,
+    /// The empty text for a reply that is only calls, as llama-server writes
+    /// it (OpenAI writes `null`).
     content: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_content: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_calls: Option<Vec<CallBody<'a>>>,
+}
+
+/// A call of a tool that a reply made.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Call {
+    pub id: String,
+    pub name: String,
+    /// The arguments, a JSON object as text.
+    pub arguments: String,
+}
+
+/// A call in a message, or a part of one in a delta of a stream: the first
+/// delta of a call has its place, its id, its type and the name, the ones
+/// after it the place and a fragment of the arguments.
+#[derive(Serialize)]
+struct CallBody<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    index: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    id: Option<&'a str>,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    kind: Option<&'static str>,
+    function: FunctionBody<'a>,
+}
+
+#[derive(Serialize)]
+struct FunctionBody<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<&'a str>,
+    arguments: &'a str,
 }
 
 #[derive(Serialize, Default)]
@@ -1184,6 +1292,8 @@ struct Delta<'a> {
     content: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_content: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_calls: Option<Vec<CallBody<'a>>>,
 }
 
 /// `text`, or nothing for the empty text: a field that has no text is left out.

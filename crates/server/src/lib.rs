@@ -41,9 +41,11 @@ pub mod load;
 pub mod plan;
 mod qwen4exp;
 mod reasoning;
+mod reply;
 mod routes;
 mod structured;
 mod systemone;
+mod tools;
 mod wire;
 
 use std::future::{Future, IntoFuture};

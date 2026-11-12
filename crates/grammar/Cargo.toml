@@ -11,7 +11,9 @@ repository.workspace = true
 ares-api = { path = "../api" }
 llguidance.workspace = true
 toktrie.workspace = true
-serde_json = "1"
+# The properties of a tool's schema keep their order: it is the order of the
+# arguments of a call when they are too many to be accepted in any order.
+serde_json = { version = "1", features = ["preserve_order"] }
 thiserror.workspace = true
 
 [dev-dependencies]
