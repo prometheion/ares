@@ -9,8 +9,8 @@
 //! For every type, a 17408 x 5120 matrix (the FFN of Qwen3.8-27B) is multiplied
 //! with `rows` activation rows by each path, 10 launches in a row between two
 //! events, over several copies of the matrix that together are larger than any
-//! L2 cache. The decode kernels are timed for comparison at up to 64 rows (in
-//! launches of 8). The fast path of the device is marked.
+//! L2 cache. The decode kernels are timed for comparison at up to `--decode-rows` rows (64
+//! unless said otherwise, in launches of 8). The fast path of the device is marked.
 //!
 //! For a type with a device layout (`Kernels::has_device_layout`), `layout` and
 //! `layout-exact` time `Kernels::product` over the rearranged matrix with the kernel
@@ -23,7 +23,7 @@
 //! ```sh
 //! cargo run --release -p ares-cuda --example prefill_bench -- \
 //!     [--rows 64,256,1024] [--types q4_K,iq4_xs] [--device N] [--shape 17408x5120] \
-//!     [--paths int8,f16,f16flush,decode,layout,layout-exact,r8f,...]
+//!     [--decode-rows 64] [--paths int8,f16,f16flush,decode,layout,layout-exact,r8f,...]
 //! ```
 
 use std::time::Instant;
@@ -46,8 +46,8 @@ fn n_out() -> u32 {
 }
 
 /// The types with a tile kernel over the file's layout, in the order of their bytes
-/// in Qwen3.8-27B, then the others that have a device layout.
-const TYPES: [GgmlType; 25] = [
+/// in Qwen3.8-27B, then the others that have a device layout, then the float types.
+const TYPES: [GgmlType; 28] = [
     GgmlType::IQ4_XS,
     GgmlType::Q4_K,
     GgmlType::Q5_K,
@@ -73,6 +73,9 @@ const TYPES: [GgmlType; 25] = [
     GgmlType::MXFP4,
     GgmlType::NVFP4,
     GgmlType::Q1_0,
+    GgmlType::BF16,
+    GgmlType::F16,
+    GgmlType::F32,
 ];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -95,6 +98,7 @@ fn main() -> Result<()> {
     let mut types: Vec<GgmlType> = TYPES.to_vec();
     let mut paths = vec![Which::Int8, Which::F16, Which::Decode];
     let mut only_device: Option<u32> = None;
+    let mut decode_rows = 64u32;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         let value = args.next().unwrap_or_else(|| panic!("{arg} needs a value"));
@@ -112,6 +116,7 @@ fn main() -> Result<()> {
                     .collect();
             }
             "--device" => only_device = Some(value.parse().expect("--device")),
+            "--decode-rows" => decode_rows = value.parse().expect("--decode-rows"),
             "--shape" => {
                 let (o, i) = value.split_once('x').expect("--shape <rows>x<columns>");
                 let (o, i): (u64, u64) = (o.parse().expect("--shape"), i.parse().expect("--shape"));
@@ -190,7 +195,7 @@ fn main() -> Result<()> {
             }
         }
         for &ty in &types {
-            time_type(&device, &kernels, &stream, ty, &rows, &paths, fast)?;
+            time_type(&device, &kernels, &stream, ty, &rows, &paths, fast, decode_rows)?;
         }
     }
     Ok(())
@@ -199,6 +204,7 @@ fn main() -> Result<()> {
 /// Launches per timed run.
 const RUN: usize = 10;
 
+#[allow(clippy::too_many_arguments)]
 fn time_type(
     device: &Device,
     kernels: &Kernels,
@@ -207,20 +213,34 @@ fn time_type(
     rows: &[u32],
     paths: &[Which],
     fast: PrefillPath,
+    decode_rows: u32,
 ) -> Result<()> {
     let w_bytes = ty.bytes_for(u64::from(n_out()) * u64::from(n_in())).expect("whole blocks");
     let copies = ((320u64 << 20) / w_bytes + 1).max(2) as usize;
     // Random bytes: any block is a valid block of these types, and uniform data
     // would draw less power than weights do. The f16 scales stay finite.
     let mut state = 0x9e3779b97f4a7c15u64;
-    let mut host: Vec<u8> = (0..w_bytes)
-        .map(|_| {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            (state >> 32) as u8
-        })
-        .collect();
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state >> 32
+    };
+    let mut host: Vec<u8> = if matches!(ty, GgmlType::F32 | GgmlType::F16 | GgmlType::BF16) {
+        // Weights of the size of a weight: random bits would be NaNs and infinities.
+        (0..w_bytes / u64::from(ty.block_bytes()))
+            .flat_map(|_| {
+                let v = (next() as f32 / (1u64 << 31) as f32 - 1.0) * 0.1;
+                match ty {
+                    GgmlType::F32 => v.to_le_bytes().to_vec(),
+                    GgmlType::F16 => ares_quant::f32_to_f16(v).to_le_bytes().to_vec(),
+                    _ => ares_quant::f32_to_bf16(v).to_le_bytes().to_vec(),
+                }
+            })
+            .collect()
+    } else {
+        (0..w_bytes).map(|_| next() as u8).collect()
+    };
     for block in host.chunks_exact_mut(ty.block_bytes() as usize) {
         for scale_at in scale_offsets(ty) {
             block[*scale_at..*scale_at + 2].copy_from_slice(&0x2c00u16.to_le_bytes());
@@ -286,16 +306,11 @@ fn time_type(
     for &n in rows {
         let mut line = format!("  {:<8} {n:>5} rows", ty.name());
         for &which in paths {
-            if which == Which::Decode && n > 64 {
+            if which == Which::Decode && n > decode_rows {
                 continue;
             }
             if matches!(which, Which::Layout(_) | Which::Kernel(_) | Which::Few(_))
                 && rearranged.is_empty()
-            {
-                continue;
-            }
-            if matches!(which, Which::Int8 | Which::F16 | Which::F16Flush)
-                && !Kernels::has_prefill_matmul(ty)
             {
                 continue;
             }
@@ -497,6 +512,7 @@ fn time(
 /// The byte offsets of the f16 scales of a block of `ty`.
 fn scale_offsets(ty: GgmlType) -> &'static [usize] {
     match ty {
+        GgmlType::F32 | GgmlType::F16 | GgmlType::BF16 => &[],
         GgmlType::Q4_K | GgmlType::Q5_K | GgmlType::Q4_1 | GgmlType::Q5_1 => &[0, 2],
         GgmlType::Q6_K => &[208],
         GgmlType::Q3_K => &[108],

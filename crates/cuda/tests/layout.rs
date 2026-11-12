@@ -464,10 +464,7 @@ fn the_table_serves_every_number_of_rows() {
                         dev.assert_within(&what, true);
                         // The tile kernel over the file's layout computes the same
                         // product from the same f16 operands.
-                        if pass == 0
-                            && precision == Precision::Exact
-                            && Kernels::has_prefill_matmul(ty)
-                        {
+                        if pass == 0 && precision == Precision::Exact {
                             let file = run(
                                 device,
                                 &kernels,

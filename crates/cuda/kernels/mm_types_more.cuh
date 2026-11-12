@@ -2,10 +2,10 @@
 // does not have, in f16 only: the item decoders of the codebook types are those of the
 // expert kernels (expertrows_types.cuh), which decode a group of eight values straight to
 // f16 pairs with the scale folded in (`decode_f16`, see AresMmDirect in mm.cuh), the
-// simpler types are codes and scales as in mm_types.cuh. The 8-bit forms of
-// mm_types.cuh would need the same decoders to another output; on a capped card the
-// f16 with f16 accumulation of IQ2_S is as fast as its 8-bit form (src/kernels.rs), so
-// the types here have the two f16 variants only.
+// simpler types are codes and scales as in mm_types.cuh, and the float types (F32, F16,
+// BF16) have no codes at all. The 8-bit forms of mm_types.cuh would need the same decoders
+// to another output; on a capped card the f16 with f16 accumulation of IQ2_S is as fast as
+// its 8-bit form (src/kernels.rs), so the types here have the two f16 variants only.
 #pragma once
 
 #include "expertrows_types.cuh"
@@ -551,3 +551,93 @@ struct EngMmTQ10 {
         o.mw[0] = o.mw[1] = d;
     }
 };
+
+// ---------------------------------------------------------------------------
+// The float types F32, F16 and BF16: a block is one value, the item 32 values (64 or 128
+// bytes) read as 16-byte words, so the matrix must be 16-byte aligned (its rows are a
+// multiple of 64 bytes long, since the step is 32 values). The tile holds the weights as
+// f16 operands without a scale, converted by the round to nearest of `cvt`:
+//   F16   copied; exact.
+//   BF16  a bf16 is the top half of an f32, so the conversion is a shift and `cvt`; exact
+//         for the values in the range of f16 normal numbers (the 8 bits of mantissa of a
+//         bf16 fit the 11 of an f16).
+//   F32   rounded to 11 bits of mantissa (relative error 2^-11 at most).
+// A value beyond 65504 becomes infinite (the product is then infinite or NaN, not a wrong
+// finite number), one below 2^-14 loses bits from the bottom (an f16 subnormal, absolute
+// error at most 2^-25), and one below 2^-25 becomes zero. The variant with f16 accumulation
+// adds partial sums of 64 products of a weight and a value of at most 1, which overflow at
+// weights of about 1000 and more (an infinity as well). docs/ARCHITECTURE.md, "Float
+// matrices", has the range of the matrices of the two models.
+template <int ELEM_BYTES, bool BF16>
+struct EngMmFloat {
+    static constexpr int BLOCK_VALUES = 1;
+    static constexpr int BLOCK_BYTES = ELEM_BYTES;
+    static constexpr int SMEM_BYTES = 0;
+    static constexpr bool HAS_MIN = false;
+    static constexpr bool SPLIT16 = false;
+    static constexpr bool SIGNED_CODES = false;
+    static constexpr bool MAGIC = false;
+    static constexpr int ITEM_STRIDE = 32;
+    static constexpr int RUN_STRIDE = 16;
+    // The 16-byte words of an item (a run is half of them).
+    static constexpr int WORDS = 2 * ELEM_BYTES;
+    static __device__ __forceinline__ void init(uint8_t*, uint32_t, uint32_t) {}
+
+    struct Raw {
+        uint4 q[WORDS];
+    };
+
+    // The item holds the values 64 chunk + 32 item of the row. The loads stay in L1: the
+    // other item of a step reads the other half of the same lines.
+    static __device__ __forceinline__ Raw load(const uint8_t* row, uint32_t chunk, uint32_t item) {
+        const uint4* p = reinterpret_cast<const uint4*>(row + static_cast<size_t>(64 * chunk + 32 * item) * ELEM_BYTES);
+        Raw r;
+#pragma unroll
+        for (int i = 0; i < WORDS; i++) {
+            r.q[i] = __ldg(p + i);
+        }
+        return r;
+    }
+
+    // Two values as an f16 pair, the first in the low half.
+    static __device__ __forceinline__ uint32_t pair(float first, float second) {
+        const __half2 h = __floats2half2_rn(first, second);
+        return *reinterpret_cast<const uint32_t*>(&h);
+    }
+
+    // The f16 pair of the two 16-bit values of a word (F16, BF16).
+    static __device__ __forceinline__ uint32_t pair_of_halves(uint32_t two) {
+        if constexpr (BF16) {
+            return pair(__uint_as_float(two << 16), __uint_as_float(two & 0xFFFF0000u));
+        } else {
+            return two;
+        }
+    }
+
+    static __device__ __forceinline__ void decode_f16(const Raw& r, uint32_t, uint32_t, const uint8_t*, uint32_t (&out)[2][8]) {
+#pragma unroll
+        for (int run = 0; run < 2; run++) {
+            if constexpr (ELEM_BYTES == 4) {
+#pragma unroll
+                for (int k = 0; k < 4; k++) {
+                    const uint4 v = r.q[4 * run + k];
+                    out[run][2 * k] = pair(__uint_as_float(v.x), __uint_as_float(v.y));
+                    out[run][2 * k + 1] = pair(__uint_as_float(v.z), __uint_as_float(v.w));
+                }
+            } else {
+#pragma unroll
+                for (int k = 0; k < 2; k++) {
+                    const uint4 v = r.q[2 * run + k];
+                    out[run][4 * k] = pair_of_halves(v.x);
+                    out[run][4 * k + 1] = pair_of_halves(v.y);
+                    out[run][4 * k + 2] = pair_of_halves(v.z);
+                    out[run][4 * k + 3] = pair_of_halves(v.w);
+                }
+            }
+        }
+    }
+};
+
+using EngMmF32 = EngMmFloat<4, false>;
+using EngMmF16 = EngMmFloat<2, false>;
+using EngMmBF16 = EngMmFloat<2, true>;

@@ -171,26 +171,18 @@ pub(crate) fn file_path(
 /// Whether matrices of `types` in the file's layout take `n` rows through
 /// the decode kernels in several launches of up to [`MAX_BATCH`] rows. That
 /// is so for a few more rows than one launch takes, where every type's
-/// decode kernel still beats its tile kernel (`Kernels::decode_kernel_rows`),
-/// and for any number of rows as soon as one of the types has no tile kernel
-/// at all (`Kernels::has_prefill_matmul`): its decode kernel is the only one
-/// that reads the file's layout, and the matrices that read the same input
-/// are multiplied the same way. (`Precision::Exact` multiplies with the tile
-/// kernels' f16 path and has no such way.)
+/// decode kernel still beats its tile kernel (`Kernels::decode_kernel_rows`);
+/// from there on the tile kernels multiply the file's layout, whatever the
+/// type. (`Precision::Exact` multiplies with the tile kernels' f16 path and
+/// has no such window.)
 pub(crate) fn decode_in_batches(
     precision: Precision,
-    types: impl Iterator<Item = GgmlType>,
+    mut types: impl Iterator<Item = GgmlType>,
     n: u32,
 ) -> bool {
-    if !matches!(precision, Precision::Fast) || n <= MAX_BATCH {
-        return false;
-    }
-    let (mut all_within, mut any_decode_only) = (true, false);
-    for ty in types {
-        any_decode_only |= !Kernels::has_prefill_matmul(ty);
-        all_within &= Kernels::decode_kernel_rows(ty).is_some_and(|limit| n <= limit);
-    }
-    any_decode_only || all_within
+    matches!(precision, Precision::Fast)
+        && n > MAX_BATCH
+        && types.all(|ty| Kernels::decode_kernel_rows(ty).is_some_and(|limit| n <= limit))
 }
 
 /// What a matrix is used for, as far as its layout depends on it.
@@ -1025,11 +1017,8 @@ impl<'a> Chooser<'a> {
                     (b * per, per.min(n - b * per), act_q.offset(u64::from(b) * stride))
                 })
             };
-            let file_runs = if batched || path.is_none() {
-                Kernels::has_fast_matvec(ty)
-            } else {
-                Kernels::has_prefill_matmul(ty) && f16_kernels
-            };
+            let file_runs =
+                if batched || path.is_none() { Kernels::has_fast_matvec(ty) } else { f16_kernels };
             // SAFETY: the probe's buffers hold `most_rows` rows of `n_in`
             // values in every form and their products with `n_out` rows.
             unsafe {
@@ -1232,29 +1221,19 @@ mod tests {
     }
 
     #[test]
-    fn matrices_without_a_tile_kernel_take_any_number_of_rows_in_launches_of_the_decode_kernels() {
+    fn matrices_take_the_decode_kernels_in_launches_only_where_those_are_faster() {
         let fast =
             |types: &[GgmlType], n| decode_in_batches(Precision::Fast, types.iter().copied(), n);
         for ty in ares_core::ggml_type::ALL_TYPES.into_iter().filter(|t| t.is_weight()) {
             // One launch takes up to eight rows, so there is nothing to split.
             assert!(!fast(&[ty], 1) && !fast(&[ty], MAX_BATCH), "{ty}");
             for n in [MAX_BATCH + 1, 16, 17, 100, 512] {
-                let expected = match Kernels::decode_kernel_rows(ty) {
-                    _ if !Kernels::has_prefill_matmul(ty) => true,
-                    Some(limit) => n <= limit,
-                    None => false,
-                };
+                let expected = Kernels::decode_kernel_rows(ty).is_some_and(|limit| n <= limit);
                 assert_eq!(fast(&[ty], n), expected, "{ty} with {n} rows");
             }
+            // Every weight type has a tile kernel, so none is split for lack of one.
+            assert!(!fast(&[ty], 512), "{ty}");
         }
-        // The twenty-five types with tile kernels are split only where their decode kernels are
-        // faster; the three float types always.
-        let tile = ares_core::ggml_type::ALL_TYPES
-            .into_iter()
-            .filter(|t| t.is_weight() && Kernels::has_prefill_matmul(*t))
-            .count();
-        assert_eq!(tile, 25);
-        assert!(fast(&[GgmlType::BF16], 512) && fast(&[GgmlType::F16], 9));
         assert!(!fast(&[GgmlType::IQ2_XXS], 512) && !fast(&[GgmlType::IQ2_XXS], 17));
         assert!(
             fast(&[GgmlType::IQ1_S], 12)
@@ -1262,11 +1241,8 @@ mod tests {
                 && !fast(&[GgmlType::Q2_K], 9)
         );
         assert!(!fast(&[GgmlType::Q4_K], 17) && fast(&[GgmlType::Q4_K], 16));
-        // Matrices that read one input are multiplied the same way: one without a tile
-        // kernel brings the others along, and one that is faster on the tile kernels keeps
-        // the others off the decode kernels.
-        assert!(fast(&[GgmlType::Q4_K, GgmlType::F16], 100));
-        assert!(fast(&[GgmlType::Q8_0, GgmlType::F32], 100));
+        // Matrices that read one input are multiplied the same way: one that is faster on the
+        // tile kernels keeps the others off the decode kernels.
         assert!(fast(&[GgmlType::Q4_K, GgmlType::IQ4_XS], 12));
         assert!(!fast(&[GgmlType::Q4_K, GgmlType::Q8_0], 12));
         // The exact products are the tile kernels' f16 path: no launches of decode kernels.

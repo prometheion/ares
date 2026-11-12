@@ -1123,15 +1123,14 @@ impl Part {
     /// the file's layout, by the decode kernels in several launches of up to
     /// [`MAX_BATCH`] rows each: a window of a few more rows than one launch
     /// takes, where every such matrix's decode kernel still beats its
-    /// tensor-core kernel, and any number of rows when one of the matrices
-    /// has no tensor-core kernel. Where that is, is not decided here:
-    /// `Kernels::decode_kernel_rows` and `Kernels::has_prefill_matmul` say
-    /// it per weight type. (The tile kernels of the file's layout decode a
-    /// whole matrix whatever the rows. On Qwen3.8-27B over an RTX 4070 and
-    /// an RTX 3060 that is a step of about 80 ms from 9 to 24 rows, while the
-    /// decode kernels take 36 ms for 8. A matrix in its device layout has no
-    /// such gap.) The decision is the group's: the matrices that read the
-    /// same input are all multiplied in launches or none.
+    /// tensor-core kernel. Where that is, is not decided here:
+    /// `Kernels::decode_kernel_rows` says it per weight type. (The tile
+    /// kernels of the file's layout decode a whole matrix whatever the rows.
+    /// On Qwen3.8-27B over an RTX 4070 and an RTX 3060 that is a step of about
+    /// 80 ms from 9 to 24 rows, while the decode kernels take 36 ms for 8. A
+    /// matrix in its device layout has no such gap.) The decision is the
+    /// group's: the matrices that read the same input are all multiplied in
+    /// launches or none.
     fn in_batches(&self, mats: &[&Mat], n: u32) -> bool {
         let mut file = mats.iter().filter(|m| m.layout == WeightLayout::File).peekable();
         file.peek().is_some() && decode_in_batches(self.opts.precision, file.map(|m| m.ty), n)

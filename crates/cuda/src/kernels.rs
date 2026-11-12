@@ -113,7 +113,7 @@ const PREFILL_TYPES: [(GgmlType, &str, u64, u32); 11] = [
 /// [`PREFILL_TYPES`]. They have the f16 and the f16 flush variants and no int8 one
 /// ([`Kernels::prefill_path_for`] takes the first on a card that runs it at full rate and
 /// the second on a capped card).
-const PREFILL_MORE_TYPES: [(GgmlType, &str, u64, u32); 14] = [
+const PREFILL_MORE_TYPES: [(GgmlType, &str, u64, u32); 17] = [
     (GgmlType::IQ2_XXS, "iq2_xxs", 2, 2048 + 4096),
     (GgmlType::IQ1_S, "iq1_s", 2, 16384),
     (GgmlType::IQ1_M, "iq1_m", 8, 16384),
@@ -128,6 +128,9 @@ const PREFILL_MORE_TYPES: [(GgmlType, &str, u64, u32); 14] = [
     (GgmlType::MXFP4, "mxfp4", 1, 0),
     (GgmlType::NVFP4, "nvfp4", 4, 0),
     (GgmlType::Q1_0, "q1_0", 2, 0),
+    (GgmlType::F32, "f32", 16, 0),
+    (GgmlType::F16, "f16", 16, 0),
+    (GgmlType::BF16, "bf16", 16, 0),
 ];
 
 /// One shape of the prefill kernels (`kernels/prefill.cu`): the weight rows and
@@ -816,16 +819,10 @@ impl Kernels {
         self.prefill.is_some()
     }
 
-    /// Whether [`Kernels::matmul`] has a kernel for weights of type `ty` (the
-    /// types of [`Kernels::has_fast_matvec`]; the device must also have the
-    /// prefill kernels, see [`Kernels::has_prefill_kernels`]).
-    pub fn has_prefill_matmul(ty: GgmlType) -> bool {
-        PREFILL_TYPES.iter().chain(&PREFILL_MORE_TYPES).any(|(t, ..)| *t == ty)
-    }
-
     /// Whether [`Kernels::matmul`] has a kernel of `path` for weights of type `ty` on this
-    /// device: every tile-kernel type has the two f16 variants, those of
-    /// [`Kernels::has_prefill_matmul`] that are not in the first module have no int8 one.
+    /// device: every type of [`Kernels::has_fast_matvec`] has the two f16 variants, those
+    /// that are not in the first module (the float types among them) have no int8 one. `false`
+    /// on a GPU without prefill kernels.
     pub fn has_prefill_path(&self, ty: GgmlType, path: PrefillPath) -> bool {
         let index = match path {
             PrefillPath::Int8 => 0,
@@ -1010,15 +1007,21 @@ impl Kernels {
     /// rounding of what they compute with: int8 with the decode kernels'
     /// quantization of the activations, f16 with the rounding of weights and
     /// activations to f16; [`PrefillPath::F16Flush`] also rounds partial sums of
-    /// 64 products to f16. A type without a prefill kernel is refused with an
-    /// error, as is a device below compute capability 8.0.
+    /// 64 products to f16. The float types (F32, F16, BF16) have the two f16 paths
+    /// only, with their weights as f16 operands without a scale: F16 weights are
+    /// exact, BF16 weights exact within the range of normal f16 numbers, F32 weights
+    /// rounded to 11 bits; a weight beyond 65504 is an infinity in the tile, so the
+    /// outputs that read it are infinite or NaN, and one below 6.1e-5 keeps what an f16
+    /// subnormal holds (error at most 2^-25). A type without a prefill kernel is
+    /// refused with an error, as is a device below compute capability 8.0.
     ///
     /// # Safety
     ///
     /// On the stream's device and alive until the launch has run: `w` must
     /// address the matrix as GGUF stores it (`n_out` rows of `n_in` values in
-    /// whole blocks of `ty`), aligned to 16 bytes for Q4_K and Q5_K, to 8 for
-    /// IQ4_XS and to 2 for the other types (checked); `act` the activations
+    /// whole blocks of `ty`; `n_in` a multiple of 32 as well), aligned to 16 bytes for Q4_K,
+    /// Q5_K and the float types, to 8 for IQ4_XS and to 2 for the other types (checked);
+    /// `act` the activations
     /// prepared for this `path`, `n_in` and `n_rows`, 16-byte aligned
     /// (checked); `y` `n_rows * n_out` f32 values. `y` must not overlap the
     /// inputs.
@@ -1050,7 +1053,8 @@ impl Kernels {
                 ),
             });
         };
-        let block_values = ty.block_values();
+        // The kernels take the weights in items of 32 values; a float type has blocks of one.
+        let block_values = ty.block_values().max(32);
         if n_in == 0 || !n_in.is_multiple_of(block_values) {
             return Err(Error::Invalid {
                 what: "weight matrix",

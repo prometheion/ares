@@ -686,7 +686,7 @@ static __device__ __forceinline__ void ares_mm_codes_to_f16(const uint32_t (&cw)
 // Whether a type decodes an item straight to f16 (`T::decode_f16(raw, chunk, item, table,
 // out)`, the 32 values as 2 runs of 8 f16 pairs) instead of through the codes and
 // scales of `decode`: the types whose f16 decoders are the ones of the expert kernels
-// (expertrows_types.cuh), which have no 8-bit form.
+// (expertrows_types.cuh), which have no 8-bit form, and the float types.
 template <class T, class = void>
 struct AresMmDirect : std::false_type {};
 template <class T>

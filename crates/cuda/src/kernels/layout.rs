@@ -544,14 +544,15 @@ impl Kernels {
         precision: Precision,
         n_rows: u32,
     ) -> Result<Option<PrefillPath>> {
-        let tile = self.prefill.is_some() && Self::has_prefill_matmul(ty);
+        let tile = self.prefill.is_some();
         let decode = Self::has_fast_matvec(ty) && n_rows <= MAX_BATCH;
         let decode_rows = Self::decode_kernel_rows(ty).unwrap_or(MAX_BATCH).min(MAX_BATCH);
         match precision {
             Precision::Exact if tile => Ok(Some(PrefillPath::F16)),
             Precision::Fast if decode && (n_rows <= decode_rows || !tile) => Ok(None),
             Precision::Fast if tile => Ok(Some(self.prefill_path_for(ty, Precision::Fast)?)),
-            // No tile kernel: the decode kernels are all there is.
+            // No tile kernels on this device (before compute capability 8.0): the decode
+            // kernels are all there is.
             _ if decode => Ok(None),
             _ => Err(Error::Invalid {
                 what: "weight kernel",

@@ -62,11 +62,8 @@ Scope decisions:
   that hold weights (the float types, the legacy and K quantizations, the
   i-quants, the ternary and 1-bit types, the 4-bit float types), and each has
   its kernels on both backends. Both backends have a decode kernel for every
-  type, and the embedding gather decodes every type on both. The Vulkan
-  kernels for many rows cover every type; the CUDA ones cover twenty-five of
-  the twenty-eight: all but the three float types, which are the next ones.
-  Until they have them, the dense model multiplies a matrix of a float type
-  with the decode kernels in launches of eight rows.
+  type, and the embedding gather decodes every type on both. The kernels for
+  many rows cover every type on both backends.
 
 - **No engine is the model for this one.** llama.cpp, vLLM, SGLang, Strata
   and the others are references, each for what it does best, and a design is
@@ -1551,14 +1548,84 @@ layers 86, attention 34), at the 31 to 34 TOPS that every tile kernel reaches th
 values; the llama.cpp fork's 563 tokens per second would need about 5 % less time than
 the 536. On the RTX 4070 the weights take 1.62 of the 1.87 seconds.
 
-The three float types (f32, f16, bf16) have no prefill kernel yet. A dense model that
-has such a matrix takes the rows of a prompt through the decode kernels in launches
-of eight rows (`decode_in_batches` in
-`qwen35/device/choose.rs`): the weights are read once for every eight rows, and the
-matrices that read the same input are multiplied that way too, whatever their types.
-`Precision::Exact` has
-no such way: it is the tile kernels' f16 path, and refuses a matrix in the file's
-layout of one of these types.
+**Float matrices** (f32, f16, bf16: `EngMmFloat` in `kernels/mm_types_more.cuh`, the second
+module). They have the two f16 variants and no int8 one, since they have no integer codes,
+and make the last three of the 28 types with a tile kernel. An item of 32 values is read as
+16-byte words (the matrix must be 16-byte aligned, `n_in` a multiple of 32) and converted as
+the tile is made: f16 is copied, bf16 is shifted to the top of an f32 and rounded by `cvt`,
+f32 rounded by `cvt`; there is no scale. Before this, a dense model with such a matrix
+multiplied it, and every matrix that read the same input, with the decode kernels in
+launches of eight rows.
+
+*Range.* An f16 holds 6.1e-5 to 65504 in full precision, down to 6e-8 with fewer bits. The
+2-D float tensors that a product reads, in the models at hand (every value of every tensor
+measured): the Q4_K_S file of Qwen3.8-27B has none, only vectors (norms, `ssm_a`,
+`ssm_dt.bias`) and the convolution taps; its IQ4_XS file has 96 f32 matrices, `ssm_alpha`
+and `ssm_beta` of 5120 x 48, whose values are f16 values (largest 0.06 to 0.33, converting
+them to f16 changes nothing). Qwen3.8-Flash-Next has 436: 388 bf16
+(`hc_{attn,ffn}_{up,down,inject}`, the indexer's `q_proj` and `k_proj`, `ssm_alpha`,
+`ssm_beta`, `ple_key`, `ple_value`, `output_hc_*`) and 48 f32 (`ffn_gate_inp`, the router),
+whose values are bf16 values too (their low 16 bits are zero). The largest value of any of
+them is 8.56 (per matrix 0.16 to 8.56), 7600 times below the overflow. In a matrix 0.06 to
+2.6 % of the values are below 6.1e-5, and 0 to 0.5 % (all but `ssm_alpha` below 0.005 %)
+below 3e-8, which become zero. Converting straight to f16 changes the weights by 1e-9 to
+1.9e-7 of their rms: bf16 values in the normal range are exact in f16 (8 bits of mantissa in
+11), so only those small ones are not. A scale per matrix (a power of two that puts the
+largest value at 0.5 to 1) was measured and lost: these matrices are already that size, and
+it moved the error from 4e-9..1.9e-7 to 4e-9..3.7e-7 (it pushes the matrices whose largest
+value is 4 to 8 below the range of normal numbers by a factor of 4 to 8). A scale per row of
+weights would take the worst to 3e-8 (the rows of `ssm_alpha` differ in size by up to
+3.5e5), at the price of a vector of exponents per matrix and a pass over the matrix to make
+it; it is not worth that for an error this far below the activations' rounding. So the
+kernels take no scale and are never silently wrong by range: a weight beyond 65504 is an
+infinity in the tile, so the outputs that read it are infinite or NaN (tested for bf16 and
+f32), and the variant with f16 accumulation, which adds partial sums of 64 products of a
+weight and a value of at most 1, does the same from weights of about 1000. What a matrix
+loses below 6.1e-5 is absolute: at most 2^-25 per weight, which the test
+`tiny_float_weights_are_off_by_at_most_the_spacing_of_f16_subnormals` bounds on weights from
+1e-7 to 1e-4 (3.1e-6 measured on 512 values against the bound 2.0e-5). On other models a
+float matrix whose values do not fit has to be looked at before the tile kernels are used on
+it; nothing in the engine checks that on load.
+
+*Error against the exact f32 product* (`tests/prefill.rs`, weights of rms 0.05 with
+outliers, activations of rms 1 with outliers, shapes from 1 x 32 to 200 x 1024): the f16
+path 0.02 to 0.03 % rms for f16 and bf16 weights (the rounding of the activations; the
+weights are exact), 0.02 to 0.04 % for f32 weights; the path with f16 accumulation 0.04 to
+0.06 %. Against the same product with the operands rounded to f16 and summed exactly, the
+f16 path is within 3e-6 of the magnitude of the sum and the flush path within 1e-3.
+
+*Speed* (`examples/prefill_bench`, a 17408 x 5120 matrix, ms, RTX 4070 / RTX 3060, machine
+load 29 to 38 from other builds; the last column is the decode kernels in launches of eight
+rows, which is what the model did before):
+
+| rows | f16 path | f16 accumulation | eight-row launches |
+|---:|---|---|---|
+| 16 | 0.40 / 0.63 | 0.40 / 0.63 | 0.78 / 1.41 |
+| 64 | 0.43 / 0.65 | 0.43 / 0.63 | 3.13 / 5.64 |
+| 256 | 0.94 / 2.19 | 0.73 / 1.57 | 12.4 / 22.5 |
+| 1024 | 3.71 / 8.52 | 2.80 / 6.32 | 49.8 / 90.5 |
+| 4096 | 14.7 / 34.2 | 11.0 / 25.3 | 199 / 362 |
+
+(bf16; f16 is within 3 % of it everywhere.) f32: 0.83 / 1.18 at 16 rows, 1.41 / 2.98 at
+256, 5.29 / 11.9 at 1024 and 20.6 / 47.8 at 4096 with the f16 path; 5.73 / 12.4 and 22.3 /
+50.2 with f16 accumulation, which is not faster for f32 (so the tensor cores are not what
+bounds it; the large shape of f32 uses all 128 registers a thread may have, with 64 of them
+holding the raw bytes of the next two items); eight-row launches 1.53 / 2.29 at 16 rows, 24.3 /
+36.6 at 256, 97 / 147 at 1024 and 389 / 589 at 4096. In TOPS at 4096 rows: bf16 and f16 50 / 21
+(f16 path) and 66 / 29 (f16 accumulation), f32 35 / 15 and 33 / 15, of 58.6 / 25.6 that the
+capped tensor cores run. Up to 8 rows the decode kernels are as fast or faster (0.39 / 0.72 ms
+for bf16 at 8 rows against 0.42 / 0.76; 0.056 against 0.107 ms for 320 x 10240) and compute
+the exact product; from 9 rows on the tile
+kernels are faster for all three types (0.40 against 0.77 for two launches), so the float
+types have no row of `DECODE_ROWS`. Flash-Next's mixers (bf16, 512 rows):
+`hc_{attn,ffn}_down` 320 x 10240 3.10 / 4.02 ms in launches of eight rows, 0.31 / 0.44 ms on
+the tile kernels' f16 path and 0.21 / 0.30 with f16 accumulation; `hc_{attn,ffn}_up` 10240 x
+320 1.21 / 2.55 ms, 0.097 / 0.22 and 0.081 / 0.18 ms.
+
+A model calls them through `Kernels::product` (matrix in `WeightLayout::File`, with the
+activations in the form `Kernels::activation_form` names and `prepare_activations` makes for
+the same arguments): up to 8 rows with `Precision::Fast` it is the decode kernel, above that
+the tile kernel of `prefill_path_for`, and with `Precision::Exact` always the f16 path.
 
 A pass over all weight matrices of Qwen3.8-27B (Q4_K_S file, 13.8 GiB) at
 the split 0.625 / 0.375 takes 92 ms with 64 rows, 221 ms with 256, 694 ms

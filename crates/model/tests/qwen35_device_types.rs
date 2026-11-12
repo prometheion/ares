@@ -1,8 +1,9 @@
 //! The device implementation of `qwen35` on a made-up model whose weights, embedding table
-//! included, are in the 2-bit types of the small file of Qwen3.8-27B: IQ2_XXS and IQ1_S (the
-//! bulk of it) and Q2_K. Their prompts go through the decode kernels up to the rows where the
-//! tile kernels are faster and through the tile kernels above, and the embedding is gathered
-//! in the type it is stored in.
+//! included, are in the 2-bit types of the small file of Qwen3.8-27B (IQ2_XXS and IQ1_S, the
+//! bulk of it, and Q2_K) or in one of the float types (F32, F16, BF16). Their prompts go
+//! through the decode kernels up to the rows where the tile kernels are faster (for the float
+//! types, up to one launch of eight rows) and through the tile kernels above, and the
+//! embedding is gathered in the type it is stored in.
 //!
 //! Needs `ARES_TEST_CUDA=1` (and nothing else: the model is made here), and says so when it
 //! skips. `ARES_TEST_DEVICE` picks the GPU (default 0). Lines that start with `ERR` are the
@@ -67,7 +68,7 @@ fn random_blocks(ty: GgmlType, n_blocks: usize, rng: &mut Rng) -> Vec<u8> {
 /// A model of four blocks whose widths, and the widths of the slices of a device, are whole
 /// blocks of the 256-value types, with every matrix but the two small ones of the recurrent
 /// blocks in `ty`; those are Q8_0, as they are in the real file, so that the matrices that
-/// read one input are of two types, one of which has a tensor-core kernel.
+/// read one input are of two types.
 fn model(ty: GgmlType) -> Vec<u8> {
     let spec = Spec {
         n_layer: 4,
@@ -96,6 +97,10 @@ fn model(ty: GgmlType) -> Vec<u8> {
                 vec![0u8; GgmlType::Q8_0.bytes_for(t.values.len() as u64).unwrap() as usize];
             ares_quant::quantize(GgmlType::Q8_0, &t.values, &mut bytes).unwrap();
             builder.tensor(&t.name, &t.dims, GgmlType::Q8_0, bytes)
+        } else if matches!(ty, GgmlType::F32 | GgmlType::F16 | GgmlType::BF16) {
+            let mut bytes = vec![0u8; ty.bytes_for(t.values.len() as u64).unwrap() as usize];
+            ares_quant::quantize(ty, &t.values, &mut bytes).unwrap();
+            builder.tensor(&t.name, &t.dims, ty, bytes)
         } else {
             let n_blocks = t.values.len() / ty.block_values() as usize;
             builder.tensor(&t.name, &t.dims, ty, random_blocks(ty, n_blocks, &mut rng))
@@ -119,9 +124,17 @@ fn direct(n: usize, pos0: usize) -> [Segment; 1] {
 }
 
 #[test]
-fn a_model_in_two_bit_types_runs_prompts_of_any_length() {
+fn a_model_in_two_bit_and_float_types_runs_prompts_of_any_length() {
     let Some(device) = gpu() else { return };
-    for ty in [GgmlType::IQ2_XXS, GgmlType::IQ1_S, GgmlType::Q2_K] {
+    let types = [
+        GgmlType::IQ2_XXS,
+        GgmlType::IQ1_S,
+        GgmlType::Q2_K,
+        GgmlType::F32,
+        GgmlType::F16,
+        GgmlType::BF16,
+    ];
+    for ty in types {
         let dir = TempDir::new("types");
         let gguf = Gguf::open(dir.file("model.gguf", &model(ty))).unwrap();
         let c = Config::from_gguf(&gguf).unwrap();
@@ -150,8 +163,9 @@ fn a_model_in_two_bit_types_runs_prompts_of_any_length() {
                 worst = worst.max(rel_l2(&logits[row * vocab..][..vocab], want));
             }
             eprintln!("ERR logits {ty} n={n}: worst row {worst:.2e} from the reference");
-            // The decode kernels quantize the activations to int8 and the logits of a made-up
-            // model are flat, so a few percent differ; a wrong decoder is of order 1.
+            // The decode kernels of the quantized types quantize the activations to int8 and
+            // the logits of a made-up model are flat, so a few percent differ; a wrong decoder
+            // is of order 1.
             assert!(worst < 0.25, "{ty} n={n}: logits {worst}");
 
             // One more row after them, from the state they left.

@@ -33,7 +33,7 @@ use ares_core::GgmlType;
 use ares_cuda::{
     Device, DeviceBuffer, DevicePtr, Kernels, Precision, PrefillPath, Stream, Wait, device_count,
 };
-use ares_quant::{f16_to_f32, f32_to_f16};
+use ares_quant::{f16_to_f32, f32_to_bf16, f32_to_f16};
 
 /// The types with a prefill kernel, and the byte offsets of the f16 fields of a
 /// block that must be finite for the test data to be meaningful.
@@ -69,11 +69,20 @@ const MORE_TYPES: [(GgmlType, &[usize]); 14] = [
     (GgmlType::Q1_0, &[0]),
 ];
 
+/// The float types, also of the second module: no scales in the data.
+const FLOAT_TYPES: [GgmlType; 3] = [GgmlType::F32, GgmlType::F16, GgmlType::BF16];
+
 const PATHS: [PrefillPath; 3] = [PrefillPath::Int8, PrefillPath::F16, PrefillPath::F16Flush];
 
 /// Every type with a tile kernel.
 fn all_types() -> impl Iterator<Item = (GgmlType, &'static [usize])> {
-    TYPES.into_iter().chain(MORE_TYPES)
+    TYPES.into_iter().chain(MORE_TYPES).chain(FLOAT_TYPES.map(|ty| (ty, &[][..])))
+}
+
+/// The values of a row the kernels take at once: a block, or 32 for the float types, whose
+/// blocks are one value.
+fn unit(ty: GgmlType) -> usize {
+    (ty.block_values() as usize).max(32)
 }
 
 /// The paths a type has kernels for.
@@ -132,11 +141,32 @@ fn read_f32(buffer: &DeviceBuffer, n: usize) -> Vec<f32> {
     bytes.as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)).collect()
 }
 
+/// The values as weights of a float type.
+fn float_bytes(ty: GgmlType, values: &[f32]) -> Vec<u8> {
+    values
+        .iter()
+        .flat_map(|v| match ty {
+            GgmlType::F32 => v.to_le_bytes().to_vec(),
+            GgmlType::F16 => f32_to_f16(*v).to_le_bytes().to_vec(),
+            _ => f32_to_bf16(*v).to_le_bytes().to_vec(),
+        })
+        .collect()
+}
+
+/// `n` weights of a float type: normal numbers of the size of a weight, a few much larger.
+fn random_floats(rng: &mut Rng, ty: GgmlType, n: usize) -> Vec<u8> {
+    let values: Vec<f32> = (0..n).map(|_| rng.activation() * 0.05).collect();
+    float_bytes(ty, &values)
+}
+
 /// `n_blocks` blocks of `ty` of random bytes, with finite scales (f16 of both signs; a
 /// small power of two for MXFP4's exponent byte and NVFP4's four UE4M3 bytes), where the
 /// bytes of a scale could otherwise be infinite or NaN. Any other bytes are valid in every
 /// one of these types.
 fn random_blocks(rng: &mut Rng, ty: GgmlType, n_blocks: usize) -> Vec<u8> {
+    if FLOAT_TYPES.contains(&ty) {
+        return random_floats(rng, ty, n_blocks);
+    }
     let (_, scales) = all_types().find(|(t, _)| *t == ty).unwrap();
     let block = ty.block_bytes() as usize;
     let mut bytes: Vec<u8> = (0..n_blocks * block).map(|_| (rng.next() >> 32) as u8).collect();
@@ -414,15 +444,16 @@ fn prefill_matmul_computes_the_emulated_product_on_every_type() {
         }
         for (ty, _) in all_types() {
             let bv = ty.block_values() as usize;
+            let step = unit(ty);
             let mut shapes = vec![
-                (bv, 1, 1),
-                (bv, 3, 9),
-                (bv * 5, 13, 70),
-                (bv * 20, 129, 65),
-                (bv * 8, 100, 130),
+                (step, 1, 1),
+                (step, 3, 9),
+                (step * 5, 13, 70),
+                (step * 20, 129, 65),
+                (step * 8, 100, 130),
                 (if bv == 256 { 2048 } else { 1024 }, 200, 33),
             ];
-            if bv == 32 {
+            if step == 32 {
                 // Not a whole number of steps of 64 values.
                 shapes.push((96, 40, 17));
                 shapes.push((32 * 25, 77, 66));
@@ -516,47 +547,71 @@ fn prefill_matmul_on_real_tensors() {
     let mut rng = Rng(0x853c49e6748fea9b);
     let mut checked = Vec::new();
     for (ty, _) in all_types() {
-        let Some(tensor) = gguf
-            .tensors()
-            .iter()
-            .filter(|t| t.ty == ty && t.dims.as_slice().len() == 2)
-            .min_by_key(|t| t.size)
-        else {
+        let candidates = gguf.tensors().iter().filter(|t| {
+            t.ty == ty
+                && t.dims.as_slice().len() == 2
+                && (t.dims.get(0) as usize).is_multiple_of(unit(ty))
+        });
+        // The smallest matrix of a type; of a float type (the few that models keep, of many
+        // kinds) the first of each kind: the same name without the layer's number.
+        let mut chosen = Vec::new();
+        if FLOAT_TYPES.contains(&ty) {
+            let mut kinds = Vec::new();
+            for tensor in candidates {
+                let kind: String = tensor.name.chars().filter(|c| !c.is_ascii_digit()).collect();
+                if !kinds.contains(&kind) {
+                    kinds.push(kind);
+                    chosen.push(tensor);
+                }
+            }
+        } else {
+            chosen.extend(candidates.min_by_key(|t| t.size));
+        }
+        if chosen.is_empty() {
             continue;
-        };
-        let (n_in, n_out) = (tensor.dims.get(0) as usize, tensor.dims.get(1) as usize);
-        let rows = n_out.min(200);
-        let row_bytes = ty.bytes_for(n_in as u64).unwrap() as usize;
-        let w = &gguf.data(tensor)[..rows * row_bytes];
-        for n_rows in [8usize, 9, 70] {
-            let x: Vec<f32> = (0..n_in * n_rows).map(|_| rng.activation()).collect();
-            for device in gpus {
-                let kernels = Kernels::load(device).unwrap();
-                if !kernels.has_prefill_kernels() {
-                    continue;
-                }
-                for path in paths_of(&kernels, ty) {
-                    let have = run_matmul(device, &kernels, ty, path, w, &x, n_in, rows, n_rows);
-                    let dev = deviation(path, ty, w, &x, &have, n_in, rows, n_rows);
-                    eprintln!(
-                        "{} ({ty}, {rows} x {n_in}) rows {n_rows} prefill {path:?} on {}: {}",
-                        tensor.name,
-                        device.info().name,
-                        dev.describe()
-                    );
-                    assert_within(path, &tensor.name, &dev, true);
-                }
-                if n_rows <= 8 {
-                    // The decode family computes what the int8 path does.
-                    let have = run_matvec(device, &kernels, ty, w, &x, n_in, rows, n_rows);
-                    let dev = deviation(PrefillPath::Int8, ty, w, &x, &have, n_in, rows, n_rows);
-                    eprintln!(
-                        "{} ({ty}, {rows} x {n_in}) rows {n_rows} decode on {}: {}",
-                        tensor.name,
-                        device.info().name,
-                        dev.describe()
-                    );
-                    assert_within(PrefillPath::Int8, &tensor.name, &dev, true);
+        }
+        for tensor in chosen {
+            let (n_in, n_out) = (tensor.dims.get(0) as usize, tensor.dims.get(1) as usize);
+            let rows = n_out.min(200);
+            let row_bytes = ty.bytes_for(n_in as u64).unwrap() as usize;
+            let w = &gguf.data(tensor)[..rows * row_bytes];
+            for n_rows in [8usize, 9, 70] {
+                let x: Vec<f32> = (0..n_in * n_rows).map(|_| rng.activation()).collect();
+                for device in gpus {
+                    let kernels = Kernels::load(device).unwrap();
+                    if !kernels.has_prefill_kernels() {
+                        continue;
+                    }
+                    for path in paths_of(&kernels, ty) {
+                        let have =
+                            run_matmul(device, &kernels, ty, path, w, &x, n_in, rows, n_rows);
+                        let dev = deviation(path, ty, w, &x, &have, n_in, rows, n_rows);
+                        eprintln!(
+                            "{} ({ty}, {rows} x {n_in}) rows {n_rows} prefill {path:?} on {}: {}",
+                            tensor.name,
+                            device.info().name,
+                            dev.describe()
+                        );
+                        assert_within(path, &tensor.name, &dev, true);
+                    }
+                    if n_rows <= 8 {
+                        let have = run_matvec(device, &kernels, ty, w, &x, n_in, rows, n_rows);
+                        let dev =
+                            deviation(PrefillPath::Int8, ty, w, &x, &have, n_in, rows, n_rows);
+                        eprintln!(
+                            "{} ({ty}, {rows} x {n_in}) rows {n_rows} decode on {}: {}",
+                            tensor.name,
+                            device.info().name,
+                            dev.describe()
+                        );
+                        if FLOAT_TYPES.contains(&ty) {
+                            // The decode kernels of the float types multiply the exact activations.
+                            assert!(dev.loose_scaled < 1e-5, "{}: {}", tensor.name, dev.describe());
+                        } else {
+                            // The decode family computes what the int8 path does.
+                            assert_within(PrefillPath::Int8, &tensor.name, &dev, true);
+                        }
+                    }
                 }
             }
         }
@@ -656,7 +711,7 @@ fn a_row_gives_the_same_result_alone_and_in_a_batch() {
         }
         for (ty, _) in all_types() {
             let bv = ty.block_values() as usize;
-            let (n_in, n_out, n_rows) = (bv * 8, 150usize, 130usize);
+            let (n_in, n_out, n_rows) = (unit(ty) * 8, 150usize, 130usize);
             let w = random_blocks(&mut rng, ty, n_in / bv * n_out);
             let x: Vec<f32> = (0..n_in * n_rows).map(|_| rng.activation()).collect();
             for path in paths_of(&kernels, ty) {
@@ -705,6 +760,126 @@ fn a_row_gives_the_same_result_alone_and_in_a_batch() {
 /// The shapes are described as they sit on the device: every one holds at least a
 /// block of an SM, the shared memory fits the opt-in limit, and the rows they take
 /// grow from the small shape to the large.
+/// A float weight beyond the range of f16 must not turn into a wrong finite number: the
+/// tile holds an infinity, and the outputs that read it are infinite or NaN, on every path.
+/// The other outputs are right.
+#[test]
+fn a_float_weight_beyond_f16_makes_its_outputs_infinite_and_no_others_wrong() {
+    let Some(gpus) = gpus() else { return };
+    let mut rng = Rng(0x9e3779b97f4a7c15);
+    let (n_in, n_out, n_rows, bad_row) = (256usize, 70usize, 40usize, 7usize);
+    for device in gpus {
+        let kernels = Kernels::load(device).unwrap();
+        if !kernels.has_prefill_kernels() {
+            continue;
+        }
+        for ty in [GgmlType::F32, GgmlType::BF16] {
+            let mut values: Vec<f32> = (0..n_in * n_out).map(|_| rng.activation() * 0.05).collect();
+            values[bad_row * n_in + 100] = -7.0e4;
+            values[(bad_row + 1) * n_in + 3] = 1.0e30;
+            let w = float_bytes(ty, &values);
+            let x: Vec<f32> = (0..n_in * n_rows).map(|_| rng.activation() + 2.0).collect();
+            for path in paths_of(&kernels, ty) {
+                let have = run_matmul(device, &kernels, ty, path, &w, &x, n_in, n_out, n_rows);
+                let mut right = vec![true; n_out];
+                right[bad_row] = false;
+                right[bad_row + 1] = false;
+                for b in 0..n_rows {
+                    for r in 0..n_out {
+                        let y = have[b * n_out + r];
+                        if right[r] {
+                            assert!(y.is_finite(), "{ty} {path:?} row {b} output {r}: {y}");
+                        } else {
+                            assert!(!y.is_finite(), "{ty} {path:?} row {b} output {r}: {y}");
+                        }
+                    }
+                }
+                // The finite outputs are those of the matrix without the two weights.
+                let ok_rows: Vec<usize> = (0..n_out).filter(|r| right[*r]).collect();
+                let mut kept = Vec::new();
+                for r in &ok_rows {
+                    kept.extend_from_slice(&values[r * n_in..][..n_in]);
+                }
+                let w_ok = float_bytes(ty, &kept);
+                let reference =
+                    run_matmul(device, &kernels, ty, path, &w_ok, &x, n_in, ok_rows.len(), n_rows);
+                for b in 0..n_rows {
+                    for (i, r) in ok_rows.iter().enumerate() {
+                        assert_eq!(have[b * n_out + r], reference[b * ok_rows.len() + i]);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Weights below the smallest normal f16 (6.1e-5) keep what an f16 subnormal holds: a
+/// multiple of 2^-24, so the error of a weight is at most 2^-25. That bounds the output's
+/// error: the rounding of the weights, 2^-25 times the sum of the activations' magnitudes,
+/// and the rounding of the activations to f16, 2^-11 of each product (and, for the path that
+/// accumulates in f16, 2^-25 for each partial sum of 16 values, as small sums are subnormals
+/// too). The measured error is printed next to the bound.
+#[test]
+fn tiny_float_weights_are_off_by_at_most_the_spacing_of_f16_subnormals() {
+    let Some(gpus) = gpus() else { return };
+    let mut rng = Rng(0x2545f4914f6cdd1d);
+    let (n_in, n_out, n_rows) = (512usize, 130usize, 33usize);
+    for device in gpus {
+        let kernels = Kernels::load(device).unwrap();
+        if !kernels.has_prefill_kernels() {
+            continue;
+        }
+        for ty in [GgmlType::F32, GgmlType::BF16] {
+            // From 1e-7 to 1e-4, the range where f16 stops being exact for a bf16.
+            let values: Vec<f32> = (0..n_in * n_out)
+                .map(|_| {
+                    let magnitude = 10f32.powf(-7.0 + 3.0 * (rng.unit() * 0.5 + 0.5));
+                    magnitude * if rng.next().is_multiple_of(2) { -1.0 } else { 1.0 }
+                })
+                .collect();
+            let w = float_bytes(ty, &values);
+            let mut exact_weights = vec![0f32; n_in * n_out];
+            ares_quant::dequantize(ty, &w, &mut exact_weights).unwrap();
+            let x: Vec<f32> = (0..n_in * n_rows).map(|_| rng.activation()).collect();
+            for path in paths_of(&kernels, ty) {
+                let have = run_matmul(device, &kernels, ty, path, &w, &x, n_in, n_out, n_rows);
+                let (mut worst, mut worst_bound) = (0f64, 0f64);
+                for b in 0..n_rows {
+                    for r in 0..n_out {
+                        let (mut exact, mut abs_x, mut abs_wx) = (0f64, 0f64, 0f64);
+                        for k in 0..n_in {
+                            let (wv, xv) = (
+                                f64::from(exact_weights[r * n_in + k]),
+                                f64::from(x[b * n_in + k]),
+                            );
+                            exact += wv * xv;
+                            abs_x += xv.abs();
+                            abs_wx += (wv * xv).abs();
+                        }
+                        // The flushing path also rounds each partial sum of 16 values to f16, which
+                        // in this range is a subnormal too.
+                        let flush =
+                            if path == PrefillPath::F16Flush { n_in as f64 / 16.0 } else { 0.0 };
+                        let bound = 2f64.powi(-25) * (abs_x + flush) + 2f64.powi(-10) * abs_wx;
+                        let error = (f64::from(have[b * n_out + r]) - exact).abs();
+                        assert!(
+                            error <= bound,
+                            "{ty} {path:?} row {b} output {r}: {error:e} > {bound:e}"
+                        );
+                        if error / bound > worst / worst_bound.max(1e-300) {
+                            (worst, worst_bound) = (error, bound);
+                        }
+                    }
+                }
+                eprintln!(
+                    "{ty} weights from 1e-7 to 1e-4, {path:?} on {}: largest error {worst:.2e} against the bound {worst_bound:.2e}",
+                    device.info().name
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn the_shapes_fit_the_device() {
     let Some(gpus) = gpus() else { return };
@@ -774,23 +949,23 @@ fn bad_arguments_are_refused() {
     let null = DevicePtr::NULL;
     let int8 = PrefillPath::Int8;
 
-    for ty in [GgmlType::F16, GgmlType::BF16, GgmlType::F32] {
-        assert!(!Kernels::has_prefill_matmul(ty));
+    for ty in [GgmlType::Q8_1, GgmlType::Q8_K, GgmlType::F64, GgmlType::I32] {
         // SAFETY: refused before anything is launched.
         let error = unsafe { kernels.matmul(&stream, ty, int8, p, p, p, 256, 1, 1) }
             .unwrap_err()
             .to_string();
         assert!(error.contains(ty.name()) && error.contains("no prefill kernel"), "{error}");
         assert!(error.contains("q4_K") && error.contains("iq4_xs"), "{error}");
+        assert!(error.contains("f32") && error.contains("bf16"), "{error}");
     }
-    for (ty, _) in TYPES {
-        assert!(Kernels::has_prefill_matmul(ty));
-        // Both families exist for the type, and the rule says where one hands over to the other.
-        assert!(Kernels::has_fast_matvec(ty));
-        let rows = Kernels::decode_kernel_rows(ty).unwrap();
-        assert!((1..=32).contains(&rows), "{ty}: {rows}");
+    for ty in ares_core::ggml_type::ALL_TYPES.into_iter().filter(|t| t.is_weight()) {
+        // Every weight type has both families, and the rule says where one hands over to the other.
+        assert!(Kernels::has_fast_matvec(ty), "{ty}");
+        assert!(all_types().any(|(t, _)| t == ty), "{ty} has no tile kernel");
+        if let Some(rows) = Kernels::decode_kernel_rows(ty) {
+            assert!((1..=32).contains(&rows), "{ty}: {rows}");
+        }
     }
-    assert_eq!(Kernels::decode_kernel_rows(GgmlType::F16), None);
 
     // SAFETY: every call below is refused before anything is launched.
     unsafe {
@@ -798,6 +973,15 @@ fn bad_arguments_are_refused() {
         assert!(kernels.matmul(&stream, GgmlType::Q4_K, int8, p, p, p, 300, 1, 1).is_err());
         assert!(kernels.matmul(&stream, GgmlType::Q8_0, int8, p, p, p, 48, 1, 1).is_err());
         assert!(kernels.matmul(&stream, GgmlType::Q4_K, int8, p, p, p, 0, 1, 1).is_err());
+        // The float types have blocks of one value; the kernels still take 32 at a time, and
+        // 16 bytes of alignment, and there is no int8 form of them.
+        for ty in FLOAT_TYPES {
+            let f16 = PrefillPath::F16;
+            assert!(kernels.matmul(&stream, ty, f16, p, p, p, 40, 1, 1).is_err(), "{ty}");
+            assert!(kernels.matmul(&stream, ty, f16, p.offset(8), p, p, 64, 1, 1).is_err(), "{ty}");
+            let error = kernels.matmul(&stream, ty, int8, p, p, p, 64, 1, 1).unwrap_err();
+            assert!(error.to_string().contains("Int8"), "{ty}: {error}");
+        }
         // No rows, or too many to count.
         assert!(kernels.matmul(&stream, GgmlType::Q4_K, int8, p, p, p, 256, 1, 0).is_err());
         assert!(kernels.matmul(&stream, GgmlType::Q4_K, int8, p, p, p, 4096, 1, 1 << 20).is_err());
