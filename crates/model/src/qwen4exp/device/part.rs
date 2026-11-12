@@ -448,6 +448,8 @@ struct Scratch {
     /// prepared (on a worker).
     m_raw: u64,
     out_f16: u64,
+    /// The f16 form of the input of a float product ([`wide::float_f16_bytes`]).
+    float_f16: u64,
     addresses: u64,
     plan_rows: u64,
     hidden_rows: u64,
@@ -744,6 +746,7 @@ impl Frame {
             s.mixed_f16 = take(f16(n));
             s.m_raw = take(rows * n * 4);
             s.out_f16 = take(f16((rec * vd).max(att * hq).max(shared_ff)));
+            s.float_f16 = take(wide::float_f16_bytes(streams, wide, n, opts.max_rows));
             s.addresses = take(wide::ROUNDS * 8 * c.experts.count as u64);
             s.plan_rows = take(wide::plan_bytes(&expert_shape, opts.max_rows));
             s.hidden_rows = take(expert_shape.rows_hidden_bytes(opts.max_rows));

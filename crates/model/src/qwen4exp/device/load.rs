@@ -19,7 +19,7 @@ use std::ops::Range;
 use std::time::{Duration, Instant};
 
 use ares_core::{GgmlType, Ledger};
-use ares_cuda::{Device, DeviceBuffer, DevicePtr, ExpertShape, RecurrentShape};
+use ares_cuda::{Device, DeviceBuffer, DevicePtr, ExpertShape, RecurrentShape, WeightRange};
 use ares_runtime::ModelError;
 
 use crate::qwen4exp::Config;
@@ -72,6 +72,10 @@ pub(crate) struct Mat {
     pub n_in: u32,
     pub n_out: u32,
     pub at: u64,
+    /// What the size of a float matrix's weights leaves of the tile kernels, which hold
+    /// them as f16 (a wide step asks, `part/wide.rs`); [`WeightRange::Any`] for every other
+    /// type, and for every matrix of a layout that only measures sizes.
+    pub range: WeightRange,
 }
 
 /// A stream mixer: the offset of its norm weights (`f32`, a weight per value
@@ -148,6 +152,8 @@ pub(crate) struct MoeW {
     pub shape: ExpertShape,
     /// The router matrix (F32, `n_experts` rows of `n_embd`): not on a worker.
     pub router: Option<u64>,
+    /// The range of the router's weights, as [`Mat::range`].
+    pub router_range: WeightRange,
     pub shared: Option<SharedW>,
 }
 
@@ -265,6 +271,10 @@ pub(crate) fn key_head_unit(c: &Config, r: &RecurrentWeights<'_>) -> usize {
 struct Layout<'g> {
     len: u64,
     parts: Vec<(u64, Source<'g>)>,
+    /// Whether the float matrices are read for the range of their weights: for the layout
+    /// that is uploaded, not for the ones that only measure sizes (a pass over the bytes
+    /// of every float matrix).
+    ranges: bool,
 }
 
 fn invalid(message: impl Into<String>) -> ModelError {
@@ -283,16 +293,22 @@ impl<'g> Layout<'g> {
         self.push(Source::Floats(values.to_vec()))
     }
 
+    /// The range of the weights of `m`: of the whole matrix, also where a part holds some
+    /// of its rows or columns (no part of it is larger than the whole).
+    fn range(&self, m: &Matrix<'_>) -> WeightRange {
+        if self.ranges { WeightRange::of(m.ty(), m.bytes()) } else { WeightRange::Any }
+    }
+
     fn matrix(&mut self, m: &Matrix<'g>) -> Mat {
         let at = self.push(Source::File(m.bytes()));
-        Mat { ty: m.ty(), n_in: m.cols() as u32, n_out: m.rows() as u32, at }
+        Mat { ty: m.ty(), n_in: m.cols() as u32, n_out: m.rows() as u32, at, range: self.range(m) }
     }
 
     /// Rows `rows` of `m`, range after range, as a matrix of their own.
     fn rows(&mut self, m: &Matrix<'g>, rows: Vec<Range<usize>>) -> Mat {
         let n_out = rows.iter().map(Range::len).sum::<usize>() as u32;
         let at = self.push(Source::Rows(*m, rows));
-        Mat { ty: m.ty(), n_in: m.cols() as u32, n_out, at }
+        Mat { ty: m.ty(), n_in: m.cols() as u32, n_out, at, range: self.range(m) }
     }
 
     /// Columns `columns` of every row of `m` as a matrix of their own.
@@ -306,7 +322,7 @@ impl<'g> Layout<'g> {
         }
         let n_in = columns.iter().map(Range::len).sum::<usize>() as u32;
         let at = self.push(Source::Columns(*m, columns));
-        Ok(Mat { ty: m.ty(), n_in, n_out: m.rows() as u32, at })
+        Ok(Mat { ty: m.ty(), n_in, n_out: m.rows() as u32, at, range: self.range(m) })
     }
 
     /// The key heads `heads` of a recurrent layer with their value heads: a
@@ -456,18 +472,24 @@ impl<'g> Layout<'g> {
             )));
         }
         let router = streams.then(|| self.push(Source::File(moe.router.bytes())));
+        let router_range = if streams { self.range(&moe.router) } else { WeightRange::Any };
+        let largest = moe.shared_gate_inp.iter().fold(0.0f32, |m, v| {
+            // A value that is not a number counts as beyond every range.
+            if v.is_nan() { f32::INFINITY } else { m.max(v.abs()) }
+        });
         let shared = share.shared.then(|| SharedW {
             inp: Mat {
                 ty: GgmlType::F32,
                 n_in: c.n_embd as u32,
                 n_out: 1,
                 at: self.floats(&moe.shared_gate_inp),
+                range: WeightRange::of_largest(largest),
             },
             gate: self.matrix(&moe.shared_gate),
             up: self.matrix(&moe.shared_up),
             down: self.matrix(&moe.shared_down),
         });
-        let moe = MoeW { shape, router, shared };
+        let moe = MoeW { shape, router, router_range, shared };
         let ngram = w
             .ngram
             .as_ref()
@@ -558,7 +580,7 @@ impl DeviceWeights {
         shares: &[LayerShare],
         head: bool,
     ) -> Result<Self, ModelError> {
-        let mut layout = Layout::default();
+        let mut layout = Layout { ranges: true, ..Layout::default() };
         let on_device = shares
             .iter()
             .enumerate()

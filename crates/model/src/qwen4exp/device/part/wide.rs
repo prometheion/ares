@@ -7,14 +7,18 @@
 //!   activations the device and the matrix type ask for ([`ActivationForm`]): the int8
 //!   rows the fused kernels already write, or f16 rows converted from their f32
 //!   section. The float matrices (the mixers', the router, the projections of the indexer
-//!   and of the n-gram block, the recurrent gates) have no tile kernel: the decode kernel
-//!   multiplies them eight rows at a time, the chunks spread over four streams. For that
-//!   reason a wide step reads its stream mixers with the separate kernels and not with the
-//!   fused read (the fused one is made for a few rows). A mixer that shares the layer
-//!   pushes the mixed input to its worker as f32 rows with a flag per row, and the worker
-//!   prepares it ([`Part::prepare_arrival`]).
-//! - **The router** picks for every row ([`ExpertKernels::logits_rows`],
-//!   [`ExpertKernels::pick_rows`]) and leaves the ids and weights of the picks, not the
+//!   and of the n-gram block, the recurrent gates) take the float tile kernels: their input
+//!   is converted to f16 for the product (they read the f32 values a fused kernel wrote,
+//!   whatever form the quantized matrices take) and the sums are f32. A matrix with a weight
+//!   that f16 cannot hold ([`Mat::range`], read when the model was loaded), or a width the
+//!   tile kernels do not take, is multiplied by the decode kernel eight rows at a time, the
+//!   chunks spread over four streams. A wide step reads
+//!   its stream mixers with the separate kernels and not with the fused read (the fused one
+//!   is made for a few rows). A mixer that shares the layer pushes the mixed input to its
+//!   worker as f32 rows with a flag per row, and the worker prepares it
+//!   ([`Part::prepare_arrival`]).
+//! - **The router** is such a float product and picks for every row
+//!   ([`ExpertKernels::pick_rows`]): it leaves the ids and weights of the picks, not the
 //!   groups of the decode kernels, which hold eight rows.
 //! - **The routed experts** run on the many-row kernels ([`ExpertRowKernels`]) in rounds.
 //!   Those kernels do not wait on the device for an expert that has no slot, so the host
@@ -24,7 +28,7 @@
 //!   brings the experts that were missing and gives a table of just those for the next
 //!   round, which adds to the same output. The plan is made once per layer.
 
-use ares_cuda::ExpertShape;
+use ares_cuda::{ExpertShape, PrefillPath};
 
 use super::*;
 
@@ -42,6 +46,19 @@ pub(super) fn plan_bytes(shape: &ExpertShape, rows: u32) -> u64 {
     shape.rows_plan_bytes(rows, ares_cuda::ROWS_TILES[0])
 }
 
+/// Bytes of the scratch that holds the f16 form of the input of a float product
+/// ([`Part::wide_product`]) for steps of up to `max_rows` rows: of the widest input a float
+/// matrix reads, which is the normalized streams (`wide` values) on a part that has them and
+/// the mixed input (`n` values) on a worker.
+pub(super) fn float_f16_bytes(streams: bool, wide: u64, n: u64, max_rows: u32) -> u64 {
+    Kernels::prefill_activation_bytes(PrefillPath::F16, float_width(streams, wide, n), max_rows)
+}
+
+/// The widest input the scratch of [`float_f16_bytes`] holds.
+fn float_width(streams: bool, wide: u64, n: u64) -> u32 {
+    (if streams { wide.max(n) } else { n }) as u32
+}
+
 /// A layer of a wide step whose experts the host is bringing.
 #[derive(Clone, Copy, Debug)]
 struct Layer {
@@ -55,6 +72,8 @@ pub(super) struct State {
     kernels: ExpertRowKernels,
     precision: Precision,
     form: ActivationForm,
+    /// The widest input of a float product the scratch for its f16 form holds.
+    float_width: u32,
     /// The address tables of a layer as the host wrote them: per layer
     /// [`ROUNDS`] of them, in page-locked memory the copies read.
     staging: PinnedBuffer,
@@ -137,10 +156,18 @@ impl State {
             None => (opts.precision, ActivationForm::Int8),
         };
         let layers = w.layers.len();
+        // The widths the frame sized the scratch of the float products with
+        // ([`float_f16_bytes`]): the streams' where the part has the mixers.
+        let n = w.layers.first().map_or(0, |l| l.moe.shape.n_embd);
+        let streams =
+            w.layers.iter().filter_map(|l| l.mixers.map(|(attn, _)| attn.down.n_in)).max();
+        let float_width =
+            float_width(streams.is_some(), u64::from(streams.unwrap_or(0)), u64::from(n));
         Ok(Self {
             kernels: rows,
             precision,
             form,
+            float_width,
             staging: PinnedBuffer::new(device, (frame.addr_stage as usize * layers).max(16))?,
             done: Event::new(device)?,
             layer: None,
@@ -180,38 +207,11 @@ impl Part {
         y: DevicePtr,
         rows: u32,
     ) -> Result<(), ModelError> {
-        let w = self.w.mat(m);
         let wide =
             self.wide_state.as_ref().ok_or_else(|| invalid("a wide step without wide state"))?;
         if is_float(m.ty) {
-            // The float kernel reads the f32 section; eight rows at a time, the chunks
-            // spread over the helper streams.
-            let row_bytes = 4 * u64::from(m.n_in);
-            let f32_at =
-                |k: u32| Kernels::quantized_activation_bytes(m.n_in, k) - row_bytes * u64::from(k);
-            wide.fork.record(stream)?;
-            for helper in &wide.helpers {
-                helper.wait_event(&wide.fork)?;
-            }
-            let (mut first, mut next) = (0, 0);
-            while first < rows {
-                let k = (rows - first).min(MAX_BATCH);
-                let chunk = act.offset(f32_at(rows) + row_bytes * u64::from(first) - f32_at(k));
-                let at = y.offset(4 * u64::from(first) * u64::from(m.n_out));
-                // SAFETY: the chunk's rows are inside the caller's buffers, which nothing on
-                // the step's stream touches until the helpers have been waited for.
-                unsafe {
-                    let helper = &wide.helpers[next];
-                    self.kernels.matvec(helper, m.ty, w, chunk, at, m.n_in, m.n_out, k)?;
-                }
-                first += k;
-                next = (next + 1) % wide.helpers.len();
-            }
-            for (helper, join) in wide.helpers.iter().zip(&wide.joins) {
-                join.record(helper)?;
-                stream.wait_event(join)?;
-            }
-            return Ok(());
+            // SAFETY: the caller's guarantee.
+            return unsafe { self.wide_float(stream, m, act, y, rows) };
         }
         let s = self.f.s;
         let input = match wide.form {
@@ -235,6 +235,78 @@ impl Part {
                 m.n_out,
                 rows,
             )?;
+        }
+        Ok(())
+    }
+
+    /// [`Part::wide_product`] for a float matrix (F32, F16, BF16), which reads the f32
+    /// section of the rows: on the float tile kernel, with the rows converted to f16 into a
+    /// scratch of this product's own. The sums are f32 ([`PrefillPath::F16`]) whatever the
+    /// step's precision is: the path with f16 sums loses a row of small weights among larger
+    /// ones (the recurrent gates have such rows), and with it the made-up model's layers
+    /// were up to four times as far from the reference (`tests/qwen4exp_device.rs`,
+    /// `every_layer_of_wide_steps_matches_the_reference`). A matrix with a weight beyond f16
+    /// ([`Mat::range`]), or of a width the tile kernel or the scratch does not take, is
+    /// multiplied by the decode kernel, which computes with the weights as stored: eight rows
+    /// at a time, the chunks spread over the helper streams.
+    ///
+    /// # Safety
+    ///
+    /// As [`Part::product`].
+    unsafe fn wide_float(
+        &self,
+        stream: &Stream,
+        m: &Mat,
+        act: DevicePtr,
+        y: DevicePtr,
+        rows: u32,
+    ) -> Result<(), ModelError> {
+        let w = self.w.mat(m);
+        let wide =
+            self.wide_state.as_ref().ok_or_else(|| invalid("a wide step without wide state"))?;
+        let row_bytes = 4 * u64::from(m.n_in);
+        let f32_at =
+            |k: u32| Kernels::quantized_activation_bytes(m.n_in, k) - row_bytes * u64::from(k);
+        let tile = m.n_in.is_multiple_of(32) && m.n_in <= wide.float_width;
+        if let Some(path) = m.range.path(tile.then_some(PrefillPath::F16)) {
+            let f16 = self.at(self.f.s.float_f16);
+            // SAFETY: the rows are inside the caller's buffer; the scratch holds the f16 form
+            // of `float_width` values a row and only this product reads it; the matrix is
+            // 64-byte aligned in the arena.
+            unsafe {
+                self.kernels.prepare_prefill_activations(
+                    stream,
+                    PrefillPath::F16,
+                    act.offset(f32_at(rows)),
+                    f16,
+                    m.n_in,
+                    rows,
+                )?;
+                self.kernels.matmul(stream, m.ty, path, w, f16, y, m.n_in, m.n_out, rows)?;
+            }
+            return Ok(());
+        }
+        wide.fork.record(stream)?;
+        for helper in &wide.helpers {
+            helper.wait_event(&wide.fork)?;
+        }
+        let (mut first, mut next) = (0, 0);
+        while first < rows {
+            let k = (rows - first).min(MAX_BATCH);
+            let chunk = act.offset(f32_at(rows) + row_bytes * u64::from(first) - f32_at(k));
+            let at = y.offset(4 * u64::from(first) * u64::from(m.n_out));
+            // SAFETY: the chunk's rows are inside the caller's buffers, which nothing on
+            // the step's stream touches until the helpers have been waited for.
+            unsafe {
+                let helper = &wide.helpers[next];
+                self.kernels.matvec(helper, m.ty, w, chunk, at, m.n_in, m.n_out, k)?;
+            }
+            first += k;
+            next = (next + 1) % wide.helpers.len();
+        }
+        for (helper, join) in wide.helpers.iter().zip(&wide.joins) {
+            join.record(helper)?;
+            stream.wait_event(join)?;
         }
         Ok(())
     }
@@ -322,14 +394,16 @@ impl Part {
             let router = w.router.ok_or_else(|| invalid("a layer without its router"))?;
             let record = self.at(s.rec_full);
             let bytes = record_bytes(&w.shape, rows);
-            self.experts.logits_rows(
-                stream,
-                &w.shape,
-                self.w.at(router),
-                m,
-                self.at(s.logits),
-                rows,
-            )?;
+            // The router is a float matrix like the others: `logits[b][e]` is its row `e`
+            // times row `b`.
+            let router = Mat {
+                ty: GgmlType::F32,
+                n_in: w.shape.n_embd,
+                n_out: w.shape.n_experts,
+                at: router,
+                range: w.router_range,
+            };
+            self.wide_float(stream, &router, m, self.at(s.logits), rows)?;
             self.experts.pick_rows(stream, &w.shape, self.at(s.logits), record, rows)?;
             self.routed[i].record(stream)?;
             self.side.wait_event(&self.routed[i])?;

@@ -347,8 +347,19 @@ fn every_layer_matches_the_reference() {
 }
 
 /// Every layer of steps of 9 to 256 rows, each fed the reference's input, against the
-/// reference: with the dense matrices as f32 (exact products) and quantized (the tile
-/// kernels' integer products), with half of the experts without a slot.
+/// reference: with the dense matrices as f32 (the float tile kernels: f16 operands, f32
+/// sums) and quantized (the tile kernels' integer products), with half of the experts
+/// without a slot.
+///
+/// Measured 2026-11-12 on the RTX 4070, before the float matrices of a wide step took the
+/// tile kernels (they were multiplied exactly, eight rows at a time) and after. Float dense
+/// matrices: recurrent core 3.6e-7 and 7.4e-4, experts 1.62e-2 and 1.65e-2, attention core
+/// 7.9e-3 and 7.7e-3, 2814 and 2804 of 2816 rows with the reference's experts. Quantized:
+/// recurrent core 1.57e-2 and 1.59e-2, experts 0.216 and 0.216, attention core 1.65e-2 and
+/// 1.84e-2, 2734 and 2746 rows. With f16 sums instead of f32 sums for the float matrices
+/// (what the step's precision would pick on these cards) the attention core of the
+/// quantized model was 6.2e-2 and the experts of the float one 5.3e-2, which is why the
+/// float matrices sum in f32.
 #[test]
 fn every_layer_of_wide_steps_matches_the_reference() {
     let Some(devices) = devices() else { return };
