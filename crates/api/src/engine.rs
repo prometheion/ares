@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     ChatFormat, DecisionRequest, DecisionSink, EngineError, EngineStats, EventSink,
-    GenerateRequest, RequestId,
+    GenerateRequest, Prompt, RequestId,
 };
 
 /// A model the engine serves.
@@ -45,6 +45,19 @@ pub trait Engine: Send + Sync + 'static {
     /// for every chat request, so it only reads what the engine already has.
     fn chat_format(&self, _model: &str) -> Option<ChatFormat> {
         None
+    }
+
+    /// How many tokens `prompt` comes to for `model`: the prompt as
+    /// [`submit`](Engine::submit) reads it (a conversation goes through the
+    /// chat template with its tools and its variables), counted and not
+    /// computed. Nothing is generated and no device is asked.
+    ///
+    /// Like [`stats`](Engine::stats) this one may take a while, since a
+    /// prompt of any length is rendered and tokenized: async code calls it
+    /// from a thread that may block. The default is an engine that cannot
+    /// count.
+    fn count_tokens(&self, _model: &str, _prompt: &Prompt) -> Result<u32, EngineError> {
+        Err(EngineError::Unsupported("this engine does not count the tokens of a prompt".into()))
     }
 
     /// Starts a request.
