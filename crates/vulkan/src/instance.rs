@@ -57,6 +57,12 @@ pub(crate) struct Physical {
     /// buffer access and clustered subgroup operations; every desktop GPU of the
     /// last few years has them, so this is `None` there.
     pub(crate) quantized_unsupported: Option<String>,
+    /// Why the attention kernels cannot run here, if they cannot: what the quantized
+    /// kernels need, plus shuffles within a subgroup (the codec's butterflies) and
+    /// `max_shared_memory` for the smallest kernel.
+    pub(crate) attention_unsupported: Option<String>,
+    /// Bytes of shared memory a workgroup may use (`maxComputeSharedMemorySize`).
+    pub(crate) max_shared_memory: u32,
     /// Every device extension the driver lists.
     pub(crate) extensions: Vec<String>,
     /// What the device can share with other devices and with host memory.
@@ -353,6 +359,10 @@ fn describe(entry: &Entry, instance: &ash::Instance, raw: vk::PhysicalDevice) ->
         id.driver_uuid,
         has_host_memory.then_some(host_properties.min_imported_host_pointer_alignment),
     );
+    let attention_unsupported = quantized_unsupported.clone().or_else(|| {
+        (!subgroup.supported_operations.contains(vk::SubgroupFeatureFlags::SHUFFLE))
+            .then(|| "the attention kernels need shuffles within a subgroup".to_owned())
+    });
     let device_heap = device_heap.unwrap_or(0);
     let family_index = family.unwrap_or(0);
     let info = DeviceInfo {
@@ -388,6 +398,8 @@ fn describe(entry: &Entry, instance: &ash::Instance, raw: vk::PhysicalDevice) ->
         max_work_group_count: props.limits.max_compute_work_group_count,
         memory_budget,
         unusable,
+        attention_unsupported,
+        max_shared_memory: props.limits.max_compute_shared_memory_size,
         quantized_unsupported,
         extensions: extensions
             .iter()

@@ -162,6 +162,7 @@ name = "ares-vulkan"
 version = "0.0.1"
 dependencies = [
  "ares-core",
+ "ares-cuda",
  "ares-gguf",
  "ares-quant",
  "ash",

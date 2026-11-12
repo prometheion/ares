@@ -104,6 +104,16 @@ const LAYOUT_SHAPES: [(&str, &str, &[&str]); 7] = [
     ("r64h", "mml_wide.glsl", &["-DARES_NBT=4", "-DARES_ACC32=0"]),
 ];
 
+/// The attention kernel over items (`shaders/attn_item.glsl`): a template compiled per head
+/// size and per capacity in vectors (the formats of K and V are specialization constants of
+/// the pipeline). `src/attention.rs` names them the same way.
+const ATTENTION_ITEMS: [(&str, &[&str]); 4] = [
+    ("attn_item_d128_v8", &["-DATTN_D=128", "-DATTN_NV=8"]),
+    ("attn_item_d128_v16", &["-DATTN_D=128", "-DATTN_NV=16"]),
+    ("attn_item_d256_v8", &["-DATTN_D=256", "-DATTN_NV=8"]),
+    ("attn_item_d256_v16", &["-DATTN_D=256", "-DATTN_NV=16"]),
+];
+
 /// The shape of the kernel `name` (`mmvq_q4_K`, ...). `ARES_SWEEP=rows,per_batch,unroll`
 /// (for example `4,1,0`) gives it to every kernel, for measuring the choices.
 fn shape_of(name: &str) -> Shape {
@@ -224,6 +234,17 @@ fn main() {
             });
             listing.push((name.clone(), 0, vec![name]));
         }
+    }
+    for (name, defines) in ATTENTION_ITEMS {
+        jobs.push(Job {
+            source: Path::new("shaders").join("attn_item.glsl"),
+            target: out.join(format!("{name}.spv")),
+            rows: 0,
+            batch: 0,
+            unroll: 0,
+            defines: defines.iter().map(|d| (*d).to_owned()).collect(),
+        });
+        listing.push((name.to_owned(), 0, vec![name.to_owned()]));
     }
     let next = AtomicUsize::new(0);
     let failure: Mutex<Option<String>> = Mutex::new(None);

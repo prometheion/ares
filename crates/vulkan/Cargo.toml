@@ -14,6 +14,9 @@ ares-core = { path = "../core" }
 thiserror.workspace = true
 
 [dev-dependencies]
+# The host side of what a backend is held to: the sampler's reference arithmetic and the CUDA
+# kernels that the benchmarks and the agreement tests run next to these.
+ares-cuda.workspace = true
 ares-gguf = { path = "../gguf" }
 ares-quant = { path = "../quant" }
 

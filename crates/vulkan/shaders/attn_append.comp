@@ -1,0 +1,52 @@
+#version 450
+#include "attn_common.glsl"
+
+// Appends the K and V rows of a step. Grid (n_rows, H), workgroup 64: cluster 0 writes K,
+// cluster 1 V. A row goes to the cell `pos` of its sequence: into an exact entry as f16, or,
+// for a policy without a mean (f16 and q8, no exact windows), straight into the format in a
+// converted entry. Draft rows are ordinary rows here; what is pending is decided by the table
+// the host builds (their entries are exact).
+//
+// k_in, v_in: [row][kv_total][D] f32, the row stride being kv_total * D.
+layout(local_size_x = 64) in;
+
+layout(push_constant, std430) uniform Push {
+    uint64_t rows;
+    uint64_t k_in;
+    uint64_t v_in;
+    uint64_t tables;
+    uint64_t exact_pool;
+    uint64_t conv_pool;
+    uint64_t cfg;
+    uint64_t status;
+} pc;
+
+void main() {
+    const Geo g = attn_geo(pc.cfg);
+    const uint row = gl_WorkGroupID.x, h = gl_WorkGroupID.y;
+    const uint side = gl_LocalInvocationID.x >> 5;
+    const AttnRowRec ri = attn_row(pc.rows, row);
+    const uint ref = ld4(pc.tables + 4ul * (ri.table + ri.pos / TILE_CELLS));
+    const uint cell = ri.pos % TILE_CELLS;
+    const uint64_t src = (side == 0u ? pc.k_in : pc.v_in)
+        + 4ul * ((uint64_t(row) * g.kv_total + g.head0 + h) * g.D);
+    const uint64_t slot = ref & ~CONVERTED_BIT;
+    if ((ref & CONVERTED_BIT) != 0u) {
+        if (fmt_has_mean(g.kf) || fmt_has_mean(g.vf)) {
+            if (gl_LocalInvocationID.x == 0u) {
+                atomicOr(B4(pc.status).v[0], STATUS_DIRECT_MEAN);
+            }
+            return;
+        }
+        const uint64_t head = pc.conv_pool + slot * g.entry_c + uint64_t(h) * g.head_c;
+        const uint fmt = side == 0u ? g.kf : g.vf;
+        const uint rb = side == 0u ? g.rbk : g.rbv;
+        const uint64_t dst =
+            head + (side == 0u ? g.k_rows_off : g.v_rows_off) + uint64_t(cell) * rb;
+        encode_row_f32(fmt, src, dst, g.D, pc.status);
+    } else {
+        const uint64_t dst = pc.exact_pool + slot * g.entry_e + uint64_t(h) * g.head_e
+            + uint64_t(side) * TILE_CELLS * 2ul * g.D + uint64_t(cell) * 2ul * g.D;
+        encode_row_f32(FMT_F16, src, dst, g.D, pc.status);
+    }
+}

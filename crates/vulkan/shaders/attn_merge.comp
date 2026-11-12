@@ -1,0 +1,50 @@
+#version 450
+#include "attn_common.glsl"
+
+// Merges the pieces of a row (the states of its items) into the output, with the sigmoid gate
+// as epilogue: `m` the largest log2 sum of exponentials of the pieces, each piece weighted by
+// exp2(its sum - m). Grid (rows, local query heads), workgroup 256.
+layout(local_size_x = 256) in;
+
+layout(push_constant, std430) uniform Push {
+    uint64_t rows;
+    uint64_t st_acc;
+    uint64_t st_lse;
+    uint64_t gate;
+    uint64_t dst;
+    uint64_t cfg;
+} pc;
+
+void main() {
+    const Geo g = attn_geo(pc.cfg);
+    const uint hq = g.H * g.G;
+    const uint64_t row = gl_WorkGroupID.x;
+    const uint hl = gl_WorkGroupID.y;
+    const AttnRowRec r = attn_row(pc.rows, uint(row));
+    if (r.n_slots == 0u) {
+        return;
+    }
+    float m = uintBitsToFloat(0xff800000u);
+    for (uint i = 0u; i < r.n_slots; ++i) {
+        m = max(m, ldf(pc.st_lse + 4ul * (uint64_t(r.slot_base + i) * hq + hl)));
+    }
+    if (isinf(m)) {
+        m = 0.0;
+    }
+    for (uint d = gl_LocalInvocationID.x; d < g.D; d += 256u) {
+        float acc = 0.0;
+        float den = 0.0;
+        for (uint i = 0u; i < r.n_slots; ++i) {
+            const uint64_t s = uint64_t(r.slot_base + i) * hq + hl;
+            const float w = exp2(ldf(pc.st_lse + 4ul * s) - m);
+            acc = fma(w, ldf(pc.st_acc + 4ul * (s * g.D + d)), acc);
+            den += w;
+        }
+        float x = den > 0.0 ? acc / den : 0.0;
+        const uint64_t at = (row * g.kv_total * g.G + uint64_t(g.head0 * g.G + hl)) * g.D + d;
+        if (pc.gate != 0ul) {
+            x *= 1.0 / (1.0 + exp(-ldf(pc.gate + 4ul * at)));
+        }
+        FloatRef(pc.dst + 4ul * at).v[0] = x;
+    }
+}

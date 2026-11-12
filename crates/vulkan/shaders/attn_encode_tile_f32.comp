@@ -1,0 +1,31 @@
+#version 450
+// The golden inputs have rows of 352 values: 16 KiB of shared memory for the mean, which every
+// Vulkan device has.
+#define ATTN_MAX_D 4096
+#include "attn_convert_common.glsl"
+
+// The codec on f32 input, for tests: encodes `rows` rows of D values as one tile (with the
+// mean of the format) or, with use_mean = 0, each row on its own (`encode_row`). Grid 1,
+// workgroup 256.
+layout(local_size_x = 256) in;
+
+layout(push_constant, std430) uniform Push {
+    uint64_t src;
+    uint64_t mean_out;
+    uint64_t rows_out;
+    uint64_t status;
+    uint rows;
+    uint D;
+    uint fmt;
+    uint use_mean;
+} pc;
+
+float value(uint row, uint col) {
+    return ldf(src_base + 4ul * (uint64_t(row) * src_d + col));
+}
+
+void main() {
+    src_base = pc.src;
+    src_d = pc.D;
+    convert_side(pc.rows, pc.D, pc.fmt, pc.use_mean != 0u, pc.mean_out, pc.rows_out, pc.status);
+}

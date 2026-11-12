@@ -1,0 +1,34 @@
+#version 450
+#include "attn_convert_common.glsl"
+
+// Converts exact entries (128 cells as f16) into converted ones, in the formats of the
+// policy, with the mean of the rotated rows for q7 to q4 (the bytes of `encode_tile`).
+// jobs: pairs (exact slot, converted slot). Grid (n_jobs, H, 2): z = 0 is K, 1 is V.
+// Workgroup 256.
+layout(local_size_x = 256) in;
+
+layout(push_constant, std430) uniform Push {
+    uint64_t jobs;
+    uint64_t exact_pool;
+    uint64_t conv_pool;
+    uint64_t cfg;
+    uint64_t status;
+} pc;
+
+float value(uint row, uint col) {
+    return h2f(ld2(src_base + 2ul * (uint64_t(row) * src_d + col)));
+}
+
+void main() {
+    const Geo g = attn_geo(pc.cfg);
+    const uvec2 job = ld8(pc.jobs + 8ul * gl_WorkGroupID.x);
+    const uint h = gl_WorkGroupID.y, side = gl_WorkGroupID.z;
+    src_d = g.D;
+    src_base = pc.exact_pool + uint64_t(job.x) * g.entry_e + uint64_t(h) * g.head_e
+        + uint64_t(side) * TILE_CELLS * 2ul * g.D;
+    const uint64_t head = pc.conv_pool + uint64_t(job.y) * g.entry_c + uint64_t(h) * g.head_c;
+    const uint fmt = side == 0u ? g.kf : g.vf;
+    convert_side(
+        TILE_CELLS, g.D, fmt, true, head + (side == 0u ? 0ul : uint64_t(g.v_mean_off)),
+        head + (side == 0u ? g.k_rows_off : g.v_rows_off), pc.status);
+}
