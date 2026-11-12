@@ -275,7 +275,9 @@ fn a_guess_arrives_before_its_layer_and_takes_only_free_slots() {
     // While layer 0 runs, layer 1's picks are predicted: three experts, of
     // which two can have the free slots.
     rig.store.predicted(1, &[10, 11, 12], usize::MAX).unwrap();
-    rig.settle_guesses();
+    rig.settle_guesses(|store| {
+        [10, 11, 12].into_iter().filter(|e| store.in_vram(1, *e)).count() >= 2
+    });
     let early: Vec<u32> = [10, 11, 12].into_iter().filter(|e| rig.store.in_vram(1, *e)).collect();
     assert_eq!(early.len(), 2, "two free slots");
     for expert in &early {
@@ -312,7 +314,7 @@ fn an_unsure_guess_is_uploaded_from_ram_but_not_read_from_the_file() {
     rig.store.routed(0, &[1, 2]).unwrap();
     // Nothing of what is named may be read: both are unsure.
     rig.store.predicted(1, &[4, 13], 0).unwrap();
-    rig.settle_guesses();
+    rig.settle_guesses(|store| store.in_vram(1, 4));
     assert!(rig.store.in_vram(1, 4), "what RAM has is uploaded early");
     assert!(!rig.store.in_ram(1, 13) && !rig.store.in_vram(1, 13));
     rig.store.routed(1, &[4, 13]).unwrap();
@@ -379,12 +381,22 @@ fn a_prompt_takes_a_layers_experts_in_waves_and_fetches_each_once() {
 }
 
 impl Rig {
-    /// Lets guesses be read and uploaded as far as they can be.
-    fn settle_guesses(&mut self) {
-        let deadline = Instant::now() + Duration::from_millis(300);
-        while Instant::now() < deadline {
+    /// Lets guesses be read and uploaded until `there` says that what the
+    /// test expects has arrived, however long the reader's thread takes for
+    /// it, and for a few rounds more, in which what should not follow would
+    /// show. (A step whose guesses are not all placed does not settle, so the
+    /// test names what it waits for.)
+    fn settle_guesses(&mut self, there: impl Fn(&ExpertStore<HostSlots>) -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut more = 50;
+        while more > 0 {
             self.store.poll().unwrap();
             self.store.device_mut(0).run(usize::MAX);
+            if there(&self.store) {
+                more -= 1;
+            } else {
+                assert!(Instant::now() < deadline, "the guesses never arrived: {:?}", self.store);
+            }
             std::thread::sleep(Duration::from_micros(200));
         }
     }
