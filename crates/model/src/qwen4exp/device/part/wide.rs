@@ -57,7 +57,17 @@ pub(super) struct State {
     /// Recorded behind the latest round of experts.
     done: Event,
     layer: Option<Layer>,
+    /// Streams that run the chunks of eight rows of a float product side by side: such a
+    /// kernel has a few dozen blocks, so one after the other they leave the device idle.
+    helpers: Vec<Stream>,
+    /// Recorded on the step's stream before the helpers start, and on each helper behind
+    /// its chunks.
+    fork: Event,
+    joins: Vec<Event>,
 }
+
+/// Streams the chunks of a float product are spread over.
+const HELPERS: usize = 4;
 
 /// The ggml types of the dense matrices that have tile kernels and take part in wide steps.
 fn dense_types(w: &DeviceWeights) -> Vec<GgmlType> {
@@ -128,6 +138,9 @@ impl State {
             staging: PinnedBuffer::new(device, (frame.addr_stage as usize * layers).max(16))?,
             done: Event::new(device)?,
             layer: None,
+            helpers: (0..HELPERS).map(|_| Stream::new(device, 0)).collect::<Result<_, _>>()?,
+            fork: Event::new(device)?,
+            joins: (0..HELPERS).map(|_| Event::new(device)).collect::<Result<_, _>>()?,
         })
     }
 }
@@ -162,26 +175,38 @@ impl Part {
         rows: u32,
     ) -> Result<(), ModelError> {
         let w = self.w.mat(m);
+        let wide =
+            self.wide_state.as_ref().ok_or_else(|| invalid("a wide step without wide state"))?;
         if is_float(m.ty) {
-            // The float kernel reads the f32 section; eight rows at a time.
+            // The float kernel reads the f32 section; eight rows at a time, the chunks
+            // spread over the helper streams.
             let row_bytes = 4 * u64::from(m.n_in);
             let f32_at =
                 |k: u32| Kernels::quantized_activation_bytes(m.n_in, k) - row_bytes * u64::from(k);
-            let mut first = 0;
+            wide.fork.record(stream)?;
+            for helper in &wide.helpers {
+                helper.wait_event(&wide.fork)?;
+            }
+            let (mut first, mut next) = (0, 0);
             while first < rows {
                 let k = (rows - first).min(MAX_BATCH);
                 let chunk = act.offset(f32_at(rows) + row_bytes * u64::from(first) - f32_at(k));
                 let at = y.offset(4 * u64::from(first) * u64::from(m.n_out));
-                // SAFETY: the chunk's rows are inside the caller's buffers.
+                // SAFETY: the chunk's rows are inside the caller's buffers, which nothing on
+                // the step's stream touches until the helpers have been waited for.
                 unsafe {
-                    self.kernels.matvec(stream, m.ty, w, chunk, at, m.n_in, m.n_out, k)?;
+                    let helper = &wide.helpers[next];
+                    self.kernels.matvec(helper, m.ty, w, chunk, at, m.n_in, m.n_out, k)?;
                 }
                 first += k;
+                next = (next + 1) % wide.helpers.len();
+            }
+            for (helper, join) in wide.helpers.iter().zip(&wide.joins) {
+                join.record(helper)?;
+                stream.wait_event(join)?;
             }
             return Ok(());
         }
-        let wide =
-            self.wide_state.as_ref().ok_or_else(|| invalid("a wide step without wide state"))?;
         let s = self.f.s;
         let input = match wide.form {
             ActivationForm::Int8 => act,
