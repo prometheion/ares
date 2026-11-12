@@ -167,6 +167,68 @@ pub(crate) fn piece(tokenizer: &Tokenizer, token: u32, text: &mut Vec<u8>) {
 mod tests {
     use super::*;
 
+    /// The tools of a request, the calls of an assistant message and their
+    /// results come out of the chat template of a model file, when one is
+    /// named: `ARES_TEST_GGUF` (Qwen3.5-0.8B), `ARES_TEST_QWEN38_27B` or
+    /// `ARES_TEST_FLASH_NEXT`. Reading the metadata of a file needs no GPU.
+    #[test]
+    fn tools_calls_and_results_reach_the_template_of_a_model_file() {
+        use ares_api::Json as Api;
+        let object = |members: &[(&str, Api)]| {
+            Api::Object(members.iter().map(|(k, v)| ((*k).to_owned(), v.clone())).collect())
+        };
+        let text = |value: &str| Api::String(value.to_owned());
+        let schema = object(&[
+            ("type", text("object")),
+            (
+                "properties",
+                object(&[
+                    ("city", object(&[("type", text("string"))])),
+                    ("days", object(&[("type", text("integer"))])),
+                ]),
+            ),
+        ]);
+        let function = object(&[("name", text("get_weather")), ("parameters", schema)]);
+        let tools = vec![object(&[("type", text("function")), ("function", function)])];
+        // The arguments as JSON text, which is OpenAI's form, and as an object.
+        let call = |arguments: Api| {
+            let function = object(&[("name", text("get_weather")), ("arguments", arguments)]);
+            object(&[("id", text("call_1")), ("type", text("function")), ("function", function)])
+        };
+        let calls = vec![
+            call(text(r#"{"city": "Köln", "days": 3}"#)),
+            call(object(&[("city", text("Bonn"))])),
+        ];
+        let mut assistant = ares_api::Message::new(Role::Assistant, "");
+        assistant.tool_calls = Some(calls);
+        let mut result = ares_api::Message::new(Role::Tool, "12 degrees");
+        result.tool_call_id = Some("call_1".to_owned());
+        let prompt = Prompt::Chat {
+            messages: vec![ares_api::Message::new(Role::User, "The weather?"), assistant, result],
+            tools: Some(tools),
+            variables: Vec::new(),
+        };
+        for variable in ["ARES_TEST_GGUF", "ARES_TEST_QWEN38_27B", "ARES_TEST_FLASH_NEXT"] {
+            let Some(path) = std::env::var_os(variable) else {
+                eprintln!("skipped: set {variable} to a model file");
+                continue;
+            };
+            let tokenizer = Tokenizer::from_gguf(&ares_gguf::Gguf::open(path).unwrap()).unwrap();
+            let chat = ChatOptions::default();
+            let format = chat_format(&tokenizer, &chat).tools.expect("a format for calls");
+            assert_eq!(format.trigger(), "<tool_call>", "{variable}");
+            let tokens = encode(&tokenizer, &chat, &prompt).unwrap();
+            let text = String::from_utf8(tokenizer.decode(&tokens, true).unwrap()).unwrap();
+            assert!(text.contains("<tools>\n{\"type\": \"function\""), "{variable}: {text}");
+            let calls = "<tool_call>\n<function=get_weather>\n<parameter=city>\nKöln\n\
+                         </parameter>\n<parameter=days>\n3\n</parameter>\n</function>\n\
+                         </tool_call>\n<tool_call>\n<function=get_weather>\n<parameter=city>\n\
+                         Bonn\n</parameter>\n</function>\n</tool_call><|im_end|>";
+            assert!(text.contains(calls), "{variable}: {text}");
+            assert!(text.contains("<tool_response>\n12 degrees\n</tool_response>"), "{variable}");
+        }
+    }
+
     #[test]
     fn a_request_variable_wins_over_the_one_the_server_set() {
         let chat = ChatOptions {

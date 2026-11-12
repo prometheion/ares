@@ -6,7 +6,9 @@
 
 use std::time::Instant;
 
+use ares_api::ToolFormat;
 use ares_gguf::Gguf;
+use ares_grammar::calls::{CallRule, Callable};
 use ares_grammar::{Compiler, Source, Vocabulary};
 use ares_tokenizer::Tokenizer;
 
@@ -38,6 +40,35 @@ const SCHEMA: &str = r#"{
 
 const JSON_GBNF: &str = include_str!("../tests/grammars/json.gbnf");
 
+/// The grammar of the calls of two tools in the format of Qwen3.8's template.
+/// `text` is true for a tool whose arguments are strings (a random walk then
+/// stays in the text of one), false for one whose arguments are JSON.
+fn calls(text: bool) -> String {
+    let format = ToolFormat {
+        call_open: "<tool_call>\n<function=".into(),
+        name_close: ">\n".into(),
+        param_open: "<parameter=".into(),
+        key_close: ">\n".into(),
+        param_close: "\n</parameter>\n".into(),
+        call_close: "</function>\n</tool_call>".into(),
+        before_calls: "\n\n".into(),
+        between_calls: "\n".into(),
+    };
+    let write: serde_json::Value = serde_json::from_str(
+        r#"{"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}"#,
+    )
+    .unwrap();
+    let set: serde_json::Value = serde_json::from_str(
+        r#"{"type": "object", "properties": {"level": {"type": "integer"}, "mode": {"enum": ["quiet", "loud"]}, "on": {"type": "boolean"}, "tags": {"type": "array", "items": {"type": "number"}}}, "required": ["level", "mode", "on", "tags"]}"#,
+    )
+    .unwrap();
+    let tools = [Callable {
+        name: if text { "write_file" } else { "set_volume" },
+        parameters: Some(if text { &write } else { &set }),
+    }];
+    CallRule { format: &format, tools: &tools, parallel: true, triggered: false }.lark().unwrap()
+}
+
 fn main() {
     let steps: usize = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(400);
     let path = std::env::var("ARES_TEST_QWEN35_MODEL").expect("ARES_TEST_QWEN35_MODEL");
@@ -52,7 +83,10 @@ fn main() {
     println!("vocabulary of {n} tokens, {} end tokens: {:.1} ms", ends.len(), ms(t));
     println!("{}", peak_memory());
 
+    let (text_calls, json_calls) = (calls(true), calls(false));
     for (name, source) in [
+        ("tool calls, string arguments", Source::Lark(&text_calls)),
+        ("tool calls, JSON arguments", Source::Lark(&json_calls)),
         ("json schema (moderate)", Source::JsonSchema(SCHEMA)),
         ("json_object", Source::JsonSchema(r#"{"type":"object"}"#)),
         ("llama.cpp json.gbnf", Source::Gbnf(JSON_GBNF)),

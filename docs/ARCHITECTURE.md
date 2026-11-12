@@ -3341,6 +3341,13 @@ thinking and the free text before a call included, where no mask binds. To give
 those rows the model's drafts the conductor would have to stop accepting them at
 the token that makes the rule bind; that is not built.
 
+On the vocabulary of the 0.8B (248,320 tokens) the grammar of a tool compiles in
+about a millisecond, and the mask of a step along random walks through it takes a
+median of 2 microseconds inside the text of a string argument (3 at the 90th
+percentile, 1.8 milliseconds at the longest) and 3 inside JSON arguments (5, and
+53 microseconds at the longest); host time on one core, with the machine under
+load (`mask_cost` of `ares-grammar`, which has the two grammars).
+
 Where this is not llama-server: `required` there lets text come before the first
 call, here the answer is a call from its first token; a named function is read
 as `auto` there (it reads `tool_choice` as a string), here it is enforced; a
