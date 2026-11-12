@@ -2118,9 +2118,11 @@ Against the CPU reference the largest logit of a prompt's last token is the
 reference's in every run, 9 or 10 of the 10 largest agree, and the next
 token is the reference's in 159 or 160 of 160 German and 79 of 80 English
 rows; the rows that differ are near ties. The tool steps the model through a
-session of its own, with at most eight rows per step: prompts are read at 54 to
-73 tokens per second *(agent)*, bound by experts that have to be fetched. The
-server runs it through the runtime (see below).
+session of its own, with eight rows per step unless `--rows` says more: prompts
+are read at 54 to 73 tokens per second *(agent)* in steps of eight rows, bound by
+experts that have to be fetched, and at 357 to 388 (1000 tokens) in slices of 512
+rows on the many-row kernels (see "Wide steps" below). The server runs it through
+the runtime (see below).
 
 An expert that is in no slot can be computed on the CPU instead of being
 uploaded, chosen per expert by measured cost. On the recorded routing with
@@ -2173,16 +2175,18 @@ running. What was chosen:
   every device has ended; a step that misses experts is a longer step, and
   cancellation and new requests are handled between steps as for any model.
   The only protection of other sequences is the planner's: a prompt is read
-  in pieces of eight rows (`Model::prompt_rows`, which for this model is its
-  whole step), each with the newest token of every generating sequence riding
-  along, and the share owes the generating sequences rounds for the time a
-  piece took. A step of eight prompt rows takes about 70 ms (a prompt of 1000
-  tokens, 125 steps, 8.7 s) against 22 ms for a step of one row, because every
-  row routes to experts of its own, so the token that rides along with a piece
-  comes after those 70 ms, and the rounds owed between pieces go at a token
-  each; whether generation gets the half of the time that the share promises
-  was not measured for this model. Taking the missing experts of a step's rows
-  apart, to let the rows that have theirs run first, is not built.
+  in pieces of up to `Model::prompt_rows` rows (for this model its whole step,
+  `step_rows`: 256 rows on this machine), each with the newest token of every
+  generating sequence riding along, and the share owes the generating
+  sequences rounds for the time a piece took. A piece of 256 rows takes 1 to
+  2.5 s (a prompt of 1000 tokens, four pieces, 4.6 to 10.1 s to the first
+  token; in steps of eight rows it was 125 steps of about 70 ms, 8.7 s) against
+  22 ms for a step of one row, because every row routes to experts of its own,
+  so the token that rides along with a piece comes after that time, and the
+  rounds owed between pieces go at a token each; whether generation gets the
+  half of the time that the share promises was not measured for this model.
+  Taking the missing experts of a step's rows apart, to let the rows that have
+  theirs run first, is not built.
 
 Both placements work through the same code. By layers, the second device
 receives the residual through the runtime's links; with both cards on every
@@ -2195,9 +2199,11 @@ the card with the attention layers), and the logits of the wanted rows stay on
 the device for the sampler.
 
 **Wide steps: a prompt on the many-row kernels.** A step of up to eight rows is as
-described above, and generating sequences and the windows of their drafts stay there.
-The slice of a prompt that the conductor sends, up to `Model::max_rows` rows (`step_rows`,
-below), runs every layer at that width (`device/part/wide.rs`, `device/misses.rs`):
+described above, and a round of generation stays there: one row for each sequence, since the
+model takes no drafts. The piece of a prompt that the conductor sends between rounds, up to
+`Model::prompt_rows` rows, which for this model is `Model::max_rows` (`step_rows`, below),
+with the newest token of every generating sequence riding along, runs every layer at that
+width (`device/part/wide.rs`, `device/misses.rs`):
 
 - *Mixers, n-gram block, recurrent layers, attention* take the rows as they are: the
   kernels were written for the 27B's prompts. The dense products go through the tile
@@ -2264,7 +2270,7 @@ three prompts, after the warm-up and a round that fills the slots):
 | Time to the first token, short question | 0.30 to 0.43 s | 0.30 to 0.46 s | 0.29 to 0.52 s |
 | Prompt, 1000 tokens | 63 to 128 tokens/s | 77 to 123 | 50 to 106 |
 | Prompt, 2000 tokens | 126 tokens/s | 108 | 72 |
-| The tool, same machine, load 17 to 23 | decode step at 1000 tokens: 23.1 ms median (21.5 to 23.1 at lower loads); prompt of 2000 tokens: 71 tokens/s in steps of eight rows | | |
+| The tool, same machine, load 17 to 23 | decode step at 1000 tokens: 23.1 ms median (21.5 to 23.1 at lower loads); prompt of 2000 tokens: 71 tokens/s in steps of eight rows (before the wide steps below) | | |
 
 Without drafts a token takes 20.7 to 23.9 ms, the tool's step (21.5 to 23.1
 ms), so the server adds nothing to it. The median over the six warm runs with
@@ -2272,9 +2278,9 @@ the lookup drafts was 58 tokens per second, and 48 and 51 over the twelve runs o
 the two servers measured again below, against Strata's 56 with drafts: level
 within the spread of the runs, which is wider than the difference (44 to 110
 in the first series; what the drafts gain depends on the text, as everywhere:
-English prose at 110 accepted 95 of 95). Prompts are read at 63 to 139 tokens per second, in steps
+English prose at 110 accepted 95 of 95). Prompts were read at 63 to 139 tokens per second, in steps
 of eight rows, where the tool's earlier measurements were 54 to 73 and Strata's
-42 to 201.
+42 to 201 (slices of a prompt are wider now, see "Wide steps, measured").
 
 Where the experts were found, per decode step without drafts (480 picks, 10
 experts of 48 layers), second and third round: 6.0 to 15.6 outside a slot for
@@ -2328,8 +2334,8 @@ costs slots, so without `--context` the K and V of the pool take a
 thirty-second of the room for slots (17 408 to 18 432 tokens for two sequences
 on this machine) where the 27B gets what is left. Options that mean nothing for the
 model are errors that name them: `--shares`, `--precision exact`,
-`--draft-vocab`, K/V formats with a tile mean, and rows that do not fit a step
-of eight (`--parallel`), and the options of drafting (`--drafters mtp`,
+`--draft-vocab`, K/V formats with a tile mean, more sequences than the eight rows of a
+generating step (`--parallel`), and the options of drafting (`--drafters mtp`,
 `--window`).
 
 **The RAM.** The tier of experts is a user of the one RAM limit (`--ram`,
@@ -2408,21 +2414,72 @@ the n-gram feed to be told what the cached prefix's last tokens were, because
 it keeps them per sequence for the hash of the rows of the table. The
 conductor's part, and the places for checkpoints in `PinnedRam`, exist.
 
-**Where a faster prompt path plugs in.** A step has at most eight rows
-(`Model::max_rows`, the expert kernels' bound; `Frame` sizes the scratch by
-it), and every row routes to its own experts, so a prompt of N tokens is N / 8
-steps that each miss. The kernels with many rows go in `Part::moe` (the
-`ExpertKernels::experts` call, which takes 1 to 8 rows) and in the scratch
-sizes of `Frame`. The prompt pass that streams whole layers (`ares_sched::Pass`
-and `ExpertStore::plan_waves` / `wave`, built and unused) goes where the
-per-layer follow of the route records is now: `Flow::pump` hands a layer's
-record to the store, and a pass would hand it the layer's counts for all rows
-of the prompt instead and enqueue the waves; `Part::begin`, `enqueue_layer`
-and `end` are already per layer, the hidden states of the prompt's rows would
-need a buffer of their own on the device, and the conductor would run the
-pass's pieces between ordinary steps. Nothing of that is in this change, and
-nothing here makes the prompt path slower than the session's: prompts of 1000 and 2000 tokens read at 63 to 139 and 72 to 126 tokens per second
-through the server against 71 for the tool, in steps of eight rows.
+**Wide steps, measured** (2026-11-12, RTX 4070 and RTX 3060, the engine of before (`0a43601`,
+steps of eight rows) and the one with wide steps started one after the other, both with the
+lookup drafts the server made before the draft policy, greedy, 128 tokens, prompts of about 1000 tokens (German, Rust) and 4700 (the long one: prose,
+code and German), rounds one to three of the same prompts, the numbers of round three; load
+average 2.4 to 9.4 for the layers and 2.6 to 10 for the two on every layer, other agents'
+builds in the background; `--chat-var enable_thinking=false`, otherwise the defaults):
+
+| | Layers split, before | Layers split, wide steps | Both on every layer, before | Both on every layer, wide steps |
+| --- | --- | --- | --- | --- |
+| Prompt, German 1000: tokens/s, time to the first token | 110, 9.1 s | 170, 5.9 s | 141, 7.1 s | 217, 4.6 s |
+| Prompt, Rust 1000 | 83, 12.5 s | 103, 10.1 s | 100, 10.4 s | 123, 8.4 s |
+| Prompt, 4700 tokens | 100, 50.4 s | 132, 38.1 s | 126, 39.8 s | 166, 30.4 s |
+| Generation, German / Rust / long prompt: tokens/s | 42 / 68 / 41 | 53 / 46 / 36 | 70 / 80 / 43 | 58 / 53 / 34 |
+| VRAM in use (RTX 4070, RTX 3060) | 11 703, 11 695 MiB | 11 707, 11 695 | 11 683, 11 665 | 11 697, 11 663 |
+| RAM, anonymous | 11.80 GB | 11.81 GB | 11.71 GB | 11.65 GB |
+
+The step has 256 rows (`step_rows` with a thirty-second of the memory: 221 and 179 MiB of
+step buffers where eight rows took 53 and 45), which costs 0.16 GiB of expert slots on the
+RTX 4070 (9.20 to 9.04 GiB). Wide steps alone make the prompts 1.2 to 1.6 times as fast, not the
+five to ten times that the kernels alone would allow, and they cost the generating steps
+that follow: in this series they miss 1.2 to 1.5 times as many experts (outside a slot, of the picks of
+a decode step: 4.1, 12.7 and 7.3 % before and 6.2, 15.0 and 10.7 % after for the layers split;
+4.3, 12.6 and 7.8 % and 5.7, 15.5 and 10.5 % for the other), and the generation speeds in the table
+lie lower in five of six pairs, within a spread of the runs that is as wide as the difference
+(30 to 90 tokens per second by text and run, as before). A step of 2048 rows (an eighth of the
+memory, 1.4 GiB of step buffers, 1.1 to 1.2 GiB fewer slots; the layers split) read the prompts 1.3 to 1.8 times
+as fast as eight rows, and generated at 47, 33, 34, 29 and 33 tokens per second where eight rows
+gave 77, 41, 68, 37 and 69: the slots are worth more than the rows.
+
+What a wide step misses (the same runs, per layer and step of 256 rows, the layers split
+and the two on every layer alike): 184 to 243 distinct experts picked of 512, of which 34 to
+57 (19 to 29 %) had no slot, against 39 to 45 picked and 2 to 5 of them missed in a step of eight
+rows; the layers waited 31 to 62 ms per layer and step for them (the long prompt: 55 to
+56), where 126 to 631 steps of eight rows waited 0.3 to 0.9 ms per layer each. In the tool, with the
+same 1000 tokens read again (the experts of the text are in the tiers), 512 rows read at 388
+tokens per second on the layers split and 357 on the two on every layer; 4000 tokens in slices
+of 512 rows read at 112 and 145 tokens per second warm and 67 and 63 cold, in slices of 2048 at
+147 and 129 warm (one layer of a slice then waits 160 to 350 ms for 110 to 300 missed experts).
+
+What bounds the prompt now:
+
+- *Bringing the missed experts.* A slice of a long prompt picks 40 to 80 % of the experts of
+  every layer, the tiers hold 56 % in VRAM and 30 % in RAM, so every slice misses a fifth to
+  two thirds of what it picks, and the next slice misses them again. The store delivers an expert
+  from the RAM tier in 1 to 2 ms, from the file in 8 to 130 ms, one request after the other:
+  about a gigabyte per second where the link takes ten or more. That is 30 to 60 percent of a
+  slice's time, and what the layer-major pass with waves must fix: fetch each expert of a layer
+  once for the whole prompt, with many requests in flight and the next layer's experts read
+  while this one computes.
+- *The dense part of a layer.* The host waits 18 to 40 ms per layer and slice of 512 rows for the
+  router's picks; that is the device's time through the mixers, the projections and the
+  recurrent layer. The mixers' matrices are BF16, which has no tile kernel; eight rows at a
+  time over four streams they take 4 ms a read on the RTX 4070 and 7 on the RTX 3060 at 512
+  rows (the fused read took 7.5 and 24). A tile kernel for the float types would be the
+  next step there.
+- *The host in every layer.* The first round runs while the picks travel to the host, but the
+  next layer cannot be enqueued before the host has the misses of this one: a layer without
+  misses costs one round trip of the record (about 0.1 ms); the waves would take that out too.
+
+**Where a faster prompt path goes next.** The prompt pass that streams whole layers
+(`ares_sched::Pass` and `ExpertStore::plan_waves` / `wave`, built and unused) goes where
+`Misses` is now: it would hand the store the layer's counts for all rows of the prompt
+instead of a slice's, enqueue the waves, and keep the hidden states of the prompt's rows in a
+buffer of their own on the device; the conductor would run the pass's pieces between ordinary
+steps. `Misses` already has the part that matters for it: a round computes the experts of a
+table of addresses, whatever slot or transit memory they are in.
 
 ### Vulkan
 
@@ -2617,13 +2674,15 @@ Work is paused here until Qwen4 is released; nothing below is in progress.
   built, and the lookup in earlier text takes part only next to a model
   drafter. 43 to 48 tokens per second at the median of a series of runs at
   about 1000 tokens of context (a decode step takes 22 to 23 ms, 17 ms when it
-  misses no expert), prompts of 1000 tokens at 63 to 139 tokens per second.
-  With the lookup drafts it had before the draft policy, which have not been
-  measured since, it was at 48 to 58 (three series; 20 to 110 by text and
-  run), level with Strata's median of 56 with drafts on this machine within
-  the spread; without them it is behind that until its draft head is built.
-  Prompts are read in steps of eight rows, on the eight-row expert kernels (the many-row
-  ones are built and not wired; see [Qwen3.8-Flash-Next through the
+  misses no expert). With the lookup drafts it had before the draft policy,
+  which have not been measured since, it was at 48 to 58 (three series; 20 to
+  110 by text and run), level with Strata's median of 56 with drafts on this
+  machine within the spread; without them it is behind that until its draft
+  head is built. Prompts are read in pieces of 256 rows on the many-row expert
+  kernels, at 103 to 217 tokens per second for 1000 tokens and 132 to 166 for
+  4700 (before: eight rows, 83 to 141 and 100 to 126; measured before the draft
+  policy, with the slices the engine then sent); bound by the experts the
+  slices miss (see [Qwen3.8-Flash-Next through the
   runtime](#qwen38-flash-next-through-the-runtime)).
 - CUDA has every kernel family the two models need: weights for all 28
   types (twelve with a device layout that serves every row count from one
@@ -2685,9 +2744,10 @@ order it would be taken up; the source of each idea is in
    files need.
 2. The mixture-of-experts case ahead of Strata: drafts from the model's
    draft block (and with it the lookup in earlier text, which the model had
-   before the draft policy and has not while it has no drafter); the prompt path (experts in waves and steps of more than
-   eight rows, on the many-row expert kernels, which are built; where it plugs
-   in is described under "Qwen3.8-Flash-Next through the runtime"); reading the
+   before the draft policy and has not while it has no drafter); the prompt
+   path's waves (steps of more than eight rows run on the many-row expert
+   kernels; what the layer-major pass with waves has left to fix is described
+   under "Qwen3.8-Flash-Next through the runtime"); reading the
    experts the next layers will pick before their routers have run; owners of
    experts that follow the heat; the tier of experts giving memory back.
 3. Attention for models that attend a few thousand cells through lists: the

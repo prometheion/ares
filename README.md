@@ -30,7 +30,10 @@ part only next to a model drafter); it agrees with its CPU reference and
 generates at 43 to 48 tokens per second at the median. With the lookup drafts
 it had before the draft policy it made 48 to 58 (three series), level with
 Strata's 56 with drafts within the spread of the runs. It has no prefix cache,
-and reads prompts in steps of eight rows. The numbers are in
+and reads prompts in pieces of 256 rows on the many-row expert kernels (103 to
+217 tokens per second for a prompt of 1000 tokens, 132 to 166 for 4700, measured
+before the draft policy and the pieces between rounds of generation). The numbers
+are in
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#status).
 
 There is no release yet. The first release is the complete engine: every
