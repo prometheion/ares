@@ -53,4 +53,4 @@ pub use sampling::{
 };
 pub use sink::{DecisionSink, EventSink};
 pub use stats::{EngineStats, ExpertStats};
-pub use structure::{Shape, Start, Structure};
+pub use structure::{Interrupt, Shape, Start, Structure};

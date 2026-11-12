@@ -19,13 +19,42 @@ pub struct Structure {
     /// from the token after the one that completes the trigger: a tokenizer
     /// writes such a tag as a token of its own.
     pub trigger: Option<String>,
+    /// What ends the reasoning of a reply besides its closing tag, and the
+    /// rule for what follows. `None`: the reasoning ends at its closing tag
+    /// and nowhere else.
+    pub interrupt: Option<Interrupt>,
 }
 
 impl Structure {
     /// A rule that binds the reply from its first token.
     pub fn new(shape: Shape) -> Self {
-        Self { shape, start: Start::Reply, trigger: None }
+        Self { shape, start: Start::Reply, trigger: None, interrupt: None }
     }
+}
+
+/// A text that ends the reasoning of a reply where it stands, and the rule
+/// for what follows it.
+///
+/// A model that thinks may write what belongs after its reasoning without
+/// closing the reasoning first: the marker that opens the call of a tool, for
+/// one. With an interrupt such a reply has ended its reasoning at the text,
+/// as if the closing tag stood before it, and `shape` binds what follows the
+/// text, from the token after the one that completes it. The reasoning ends
+/// at whichever comes first, the closing tag or the text; after the closing
+/// tag the structure's own rule (and its trigger) applies as without an
+/// interrupt. A reply that does not think ([`Start::Reply`]) has no
+/// reasoning to end, and the interrupt says nothing about it.
+///
+/// A structure with an interrupt and without a trigger binds every reply: it
+/// either closes its reasoning and follows the structure's rule, or writes
+/// the text and follows this one. Such a reply may not end while it thinks:
+/// the end tokens are not allowed in its reasoning.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Interrupt {
+    /// The text; it is not empty.
+    pub text: String,
+    /// The rule that binds what follows the text.
+    pub shape: Shape,
 }
 
 /// The rule itself.

@@ -246,6 +246,7 @@ async fn a_model_that_thinks_gets_its_grammar_after_the_reasoning() {
                 close: "</think>".into(),
             },
             trigger: None,
+            interrupt: None,
         })
     };
     // The prompt opened the block: the reply is reasoning from its first token.

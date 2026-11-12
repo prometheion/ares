@@ -186,6 +186,7 @@ fn a_reply_is_free_until_the_trigger_and_calls_after_it_with_drafts_and_without(
         shape: calls(&format, true, true),
         start: Start::Reply,
         trigger: Some(format.trigger().to_owned()),
+        interrupt: None,
     };
     let mut texts = Vec::new();
     for speculation in [false, true] {

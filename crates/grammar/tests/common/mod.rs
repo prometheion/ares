@@ -18,10 +18,20 @@ const LONG: &[&str] = &[
 ];
 
 pub fn toy() -> Toy {
+    toy_with(&[])
+}
+
+/// The toy vocabulary with tokens for the texts of `extra` as well.
+pub fn toy_with(extra: &[&str]) -> Toy {
     let mut pieces: Vec<Vec<u8>> = (0..=255u8).map(|b| vec![b]).collect();
     // Bytes of a character that continues another are tokens too; a model's
     // vocabulary has them, and the grammar must put them together.
     pieces.extend(LONG.iter().map(|s| s.as_bytes().to_vec()));
+    for text in extra {
+        if text.len() > 1 && !pieces.iter().any(|piece| piece == text.as_bytes()) {
+            pieces.push(text.as_bytes().to_vec());
+        }
+    }
     let control = pieces.len() as u32;
     pieces.push(Vec::new());
     let eos = pieces.len() as u32;
@@ -39,6 +49,11 @@ impl Toy {
     pub fn text(&self, tokens: &[u32]) -> String {
         let bytes: Vec<u8> = tokens.iter().flat_map(|t| self.vocab.piece(*t).to_vec()).collect();
         String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    /// The token whose text is `text`.
+    pub fn token(&self, text: &str) -> u32 {
+        self.vocab.find(text.as_bytes()).unwrap_or_else(|| panic!("no token for {text:?}"))
     }
 
     pub fn tokens(&self, text: &str) -> Vec<u32> {

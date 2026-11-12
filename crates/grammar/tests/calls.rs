@@ -3,7 +3,7 @@
 
 mod common;
 
-use ares_api::{Shape, Start, Structure, ToolFormat};
+use ares_api::{Interrupt, Shape, Start, Structure, ToolFormat};
 use ares_grammar::Source;
 use ares_grammar::calls::{CallRule, Callable};
 use common::*;
@@ -228,6 +228,7 @@ fn guide(toy: &Toy, triggered: bool, start: Start) -> ares_grammar::Guide {
         shape: Shape::Lark(lark(&Rule { parallel: true, triggered })),
         start,
         trigger: triggered.then(|| "<tool_call>".to_owned()),
+        interrupt: None,
     };
     toy.compiler.guide(&structure).expect("a guide")
 }
@@ -300,4 +301,266 @@ fn a_reply_that_must_call_is_bound_from_the_answer_on() {
             .into_iter()
             .collect::<Vec<_>>()
     );
+}
+
+// A call that the model opens while it still thinks.
+
+const MARKER: &str = "<tool_call>";
+
+fn thinking() -> Start {
+    Start::AfterReasoning { open: None, close: "</think>".into() }
+}
+
+/// The structure the server writes for a request with tools: with `auto` the
+/// reply is free until the marker, with `required` it is calls from its
+/// answer on, and either way the marker inside the reasoning ends it.
+fn calling(toy: &Toy, required: bool, start: Start) -> ares_grammar::Guide {
+    let after_marker = Shape::Lark(lark(&Rule { parallel: true, triggered: true }));
+    let structure = Structure {
+        shape: if required {
+            Shape::Lark(lark(&Rule { parallel: true, triggered: false }))
+        } else {
+            after_marker.clone()
+        },
+        start,
+        trigger: (!required).then(|| MARKER.to_owned()),
+        interrupt: Some(Interrupt { text: MARKER.into(), shape: after_marker }),
+    };
+    toy.compiler.guide(&structure).expect("a guide")
+}
+
+/// What a reply may be bound to after `tokens`.
+#[derive(Debug, PartialEq, Eq)]
+enum Next {
+    /// Nothing binds it.
+    Free,
+    /// Every token but the end.
+    Unending,
+    /// The rest of a call whose marker is written: a line break.
+    InCall,
+    /// A call from its marker on, after white space if any.
+    CallOrSpace,
+}
+
+fn next(toy: &Toy, g: &mut ares_grammar::Guide, tokens: &[u32]) -> Next {
+    let Some(mask) = g.mask(tokens, &[]).unwrap() else { return Next::Free };
+    let allowed = allowed_tokens(&mask);
+    if allowed == [u32::from(b'\n')] {
+        Next::InCall
+    } else if allowed.len() as u32 == toy.vocab.len() - 1 && !allowed.contains(&toy.eos) {
+        Next::Unending
+    } else {
+        // White space, or what the marker starts with.
+        assert!(allowed.contains(&u32::from(b'<')), "{allowed:?}");
+        let starts_a_call = |token: &u32| {
+            let piece = toy.vocab.piece(*token);
+            MARKER.as_bytes().starts_with(piece) || piece.iter().all(|b| b" \n\t".contains(b))
+        };
+        assert!(allowed.iter().all(starts_a_call), "{allowed:?}");
+        Next::CallOrSpace
+    }
+}
+
+#[test]
+fn the_marker_inside_the_reasoning_ends_it_and_the_call_is_bound() {
+    let toy = toy_with(&[MARKER]);
+    let one = call("get", &[]);
+    for required in [false, true] {
+        let free = if required { Next::Unending } else { Next::Free };
+        let mut g = calling(&toy, required, thinking());
+        let mut reply = toy.tokens("I look it up. <tool_cal is not it.\n\n");
+        assert_eq!(next(&toy, &mut g, &[]), free);
+        assert_eq!(next(&toy, &mut g, &reply), free, "thinking");
+        reply.push(toy.token(MARKER));
+        assert_eq!(next(&toy, &mut g, &reply), Next::InCall, "required: {required}");
+        // The name is a tool's, as after the closing tag.
+        let mut wrong = reply.clone();
+        wrong.extend(toy.tokens("\n<function=get_t"));
+        assert!(g.mask(&wrong, &[]).unwrap().is_none(), "no tool of that name");
+        assert_eq!(g.admitted(&reply, &toy.tokens("\n<function=put")).unwrap(), 11);
+        // After the call: white space, another call, the end. Not the tag
+        // that closes the reasoning, and no text.
+        reply.extend(toy.tokens(one.strip_prefix(MARKER).unwrap()));
+        let mask = g.mask(&reply, &[]).unwrap().expect("bound to the end");
+        let after = allowed_tokens(&mask);
+        assert!(after.contains(&toy.eos) && after.contains(&u32::from(b'\n')), "{after:?}");
+        assert!(after.contains(&u32::from(b'<')) && after.contains(&toy.token(MARKER)));
+        assert!(!after.contains(&toy.token("</think>")), "the reasoning is over");
+        assert!(!after.contains(&u32::from(b'D')), "no text after a call");
+        let mut closing = reply.clone();
+        closing.extend(toy.tokens("\n<"));
+        let mask = g.mask(&closing, &[]).unwrap().expect("bound");
+        assert_eq!(allowed_tokens(&mask), vec![u32::from(b't')], "only another call");
+        // A second call follows by the same rule.
+        reply.extend(toy.tokens(&format!("\n{one}")));
+        assert!(allowed(&g.mask(&reply, &[]).unwrap().unwrap(), toy.eos));
+    }
+}
+
+#[test]
+fn the_marker_binds_however_the_tokens_cut_it() {
+    // A token for every start and every end of the marker, alone and with
+    // text around it.
+    let mut pieces = vec![MARKER.to_owned()];
+    for cut in 1..MARKER.len() {
+        let (head, tail) = MARKER.split_at(cut);
+        pieces.extend([
+            head.to_owned(),
+            tail.to_owned(),
+            format!("so {head}"),
+            format!("{tail}\n"),
+        ]);
+    }
+    let pieces: Vec<&str> = pieces.iter().map(String::as_str).collect();
+    let toy = toy_with(&pieces);
+    for required in [false, true] {
+        let free = if required { Next::Unending } else { Next::Free };
+        for cut in 1..MARKER.len() {
+            let (head, tail) = MARKER.split_at(cut);
+            // Two tokens.
+            let mut g = calling(&toy, required, thinking());
+            let mut reply = toy.tokens("Now ");
+            reply.push(toy.token(head));
+            assert_eq!(next(&toy, &mut g, &reply), free, "cut at {cut}");
+            reply.push(toy.token(tail));
+            assert_eq!(next(&toy, &mut g, &reply), Next::InCall, "cut at {cut}");
+            // The first with text before the marker.
+            let mut g = calling(&toy, required, thinking());
+            let reply = [toy.token(&format!("so {head}")), toy.token(tail)];
+            assert_eq!(next(&toy, &mut g, &reply[..1]), free, "cut at {cut}");
+            assert_eq!(next(&toy, &mut g, &reply), Next::InCall, "cut at {cut}");
+            // The second arrives as a draft.
+            let mut g = calling(&toy, required, thinking());
+            let mask = g.mask(&reply[..1], &reply[1..]).unwrap().expect("bound after the draft");
+            assert_eq!(allowed_tokens(&mask), vec![u32::from(b'\n')], "cut at {cut}");
+            // One byte a token.
+            let mut g = calling(&toy, required, thinking());
+            let bytes: Vec<u32> = MARKER.bytes().map(u32::from).collect();
+            assert_eq!(next(&toy, &mut g, &bytes[..bytes.len() - 1]), free);
+            assert_eq!(next(&toy, &mut g, &bytes), Next::InCall);
+            // A token that goes on after the marker: the rule is checked
+            // from the next token on, and that token's rest is not.
+            let mut g = calling(&toy, required, thinking());
+            let reply = [toy.token(head), toy.token(&format!("{tail}\n"))];
+            let mask = g.mask(&reply, &[]).unwrap().expect("bound");
+            assert_eq!(allowed_tokens(&mask), vec![u32::from(b'\n')]);
+        }
+    }
+}
+
+#[test]
+fn the_marker_binds_wherever_it_stands_to_the_end_of_the_reasoning() {
+    // Tokens that hold the closing tag and the start of the marker.
+    let mut pieces = vec![MARKER.to_owned(), format!("</think>{MARKER}")];
+    for cut in 1..MARKER.len() {
+        pieces.extend([format!("</think>{}", &MARKER[..cut]), MARKER[cut..].to_owned()]);
+    }
+    let pieces: Vec<&str> = pieces.iter().map(String::as_str).collect();
+    let toy = toy_with(&pieces);
+    let marker = toy.token(MARKER);
+    let close = toy.token("</think>");
+    let with = |before: &str, tokens: &[u32]| {
+        let mut reply = toy.tokens(before);
+        reply.extend(tokens);
+        reply
+    };
+    for required in [false, true] {
+        let free = if required { Next::Unending } else { Next::Free };
+        let after_close = if required { Next::CallOrSpace } else { Next::Free };
+        // A guide follows one reply: each of these gets its own.
+        let at = |reply: &[u32]| next(&toy, &mut calling(&toy, required, thinking()), reply);
+        // At the very start of the reasoning, in the middle, at its end.
+        assert_eq!(at(&[marker]), Next::InCall);
+        assert_eq!(at(&with("One. ", &[marker])), Next::InCall);
+        assert_eq!(at(&with("One.\n", &[marker])), Next::InCall);
+        // The closing tag after the marker is not the end of any reasoning:
+        // the rule of the call holds, and refuses it.
+        let mut g = calling(&toy, required, thinking());
+        assert_eq!(g.admitted(&with("One. ", &[marker]), &[close]).unwrap(), 0);
+        // What only begins like the marker is reasoning, and the closing
+        // tag after it ends the reasoning as ever.
+        assert_eq!(at(&with("One. <tool_call", &[])), free);
+        assert_eq!(at(&with("One. <tool_call", &[close])), after_close);
+        // Right after the closing tag, after the template's blank line, and
+        // after text of the answer (which a reply that must call cannot write).
+        assert_eq!(at(&with("One.\n", &[close])), after_close);
+        assert_eq!(at(&with("One.\n", &[close, marker])), Next::InCall);
+        let mut blank = with("One.\n", &[close]);
+        blank.extend(toy.tokens("\n\n"));
+        assert_eq!(at(&blank), after_close);
+        blank.push(marker);
+        assert_eq!(at(&blank), Next::InCall);
+        if !required {
+            let mut answer = with("One.\n", &[close]);
+            answer.extend(toy.tokens("\n\nSure. <tool_cal"));
+            assert_eq!(at(&answer), Next::Free);
+            answer.extend(toy.tokens("l>"));
+            assert_eq!(at(&answer), Next::InCall);
+            // One token for the closing tag and all or a part of the marker:
+            // the marker is the answer's, and it binds.
+            assert_eq!(at(&with("One.", &[toy.token(&format!("</think>{MARKER}"))])), Next::InCall);
+            for cut in 1..MARKER.len() {
+                let head = toy.token(&format!("</think>{}", &MARKER[..cut]));
+                assert_eq!(at(&with("One.", &[head])), Next::Free, "cut at {cut}");
+                let tail = toy.token(&MARKER[cut..]);
+                assert_eq!(at(&with("One.", &[head, tail])), Next::InCall, "cut at {cut}");
+            }
+        }
+    }
+}
+
+#[test]
+fn a_reply_that_must_call_cannot_end_while_it_thinks() {
+    let toy = toy_with(&[MARKER]);
+    let mut g = calling(&toy, true, thinking());
+    let mut reply = Vec::new();
+    for piece in ["I ", "think ", "and ", "never ", "close."] {
+        reply.extend(toy.tokens(piece));
+        let mask = g.mask(&reply, &[]).unwrap().expect("a mask while it thinks");
+        assert!(!allowed(&mask, toy.eos), "no end after {piece:?}");
+        assert!(allowed(&mask, u32::from(b'x')) && allowed(&mask, toy.control));
+        assert!(allowed(&mask, toy.token(MARKER)) && allowed(&mask, toy.token("</think>")));
+    }
+    // A draft that ends the reply there is cut, with what follows it.
+    assert_eq!(g.admitted(&reply, &[u32::from(b'a'), toy.eos, u32::from(b'b')]).unwrap(), 1);
+    assert!(g.mask(&reply, &[u32::from(b'a'), toy.eos]).unwrap().is_none());
+    // Drafts through the marker are admitted into the call, up to the first
+    // one the rule refuses.
+    let mut drafts = vec![u32::from(b' '), toy.token(MARKER)];
+    drafts.extend(toy.tokens("\n<function=get>\n</function>\nX"));
+    assert_eq!(g.admitted(&reply, &drafts).unwrap(), drafts.len() - 1);
+    // With `auto` the reply may end in its reasoning, and no row of it
+    // carries a mask.
+    let mut g = calling(&toy, false, thinking());
+    assert!(g.mask(&reply, &[]).unwrap().is_none());
+    assert_eq!(g.admitted(&reply, &[toy.eos]).unwrap(), 1);
+}
+
+#[test]
+fn without_an_interrupt_or_without_reasoning_nothing_changes() {
+    let toy = toy_with(&[MARKER]);
+    // A reply that does not think: the interrupt says nothing about it.
+    let mut g = calling(&toy, true, Start::Reply);
+    assert_eq!(next(&toy, &mut g, &[]), Next::CallOrSpace);
+    let mut g = calling(&toy, false, Start::Reply);
+    assert_eq!(next(&toy, &mut g, &toy.tokens("Sure.")), Next::Free);
+    assert_eq!(next(&toy, &mut g, &toy.tokens("Sure. <tool_call>")), Next::InCall);
+    // A reply that may open its reasoning itself: the marker ends it too.
+    let lead = Start::AfterReasoning { open: Some("<think>".into()), close: "</think>".into() };
+    let at = |required: bool, text: &str| {
+        next(&toy, &mut calling(&toy, required, lead.clone()), &toy.tokens(text))
+    };
+    assert_eq!(at(false, "<think>so <tool_call>"), Next::InCall);
+    assert_eq!(at(false, "<tool_call>"), Next::InCall, "no reasoning");
+    assert_eq!(at(true, "<think>so "), Next::Unending);
+    assert_eq!(at(true, "<think>so <tool_call>"), Next::InCall);
+    // An interrupt whose text is empty is refused.
+    let shape = Shape::Lark(lark(&WHOLE));
+    let empty = Structure {
+        shape: shape.clone(),
+        start: thinking(),
+        trigger: None,
+        interrupt: Some(Interrupt { text: String::new(), shape }),
+    };
+    assert!(toy.compiler.guide(&empty).is_err());
 }

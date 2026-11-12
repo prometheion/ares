@@ -69,7 +69,7 @@ pub struct GenerateRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Role, Shape, Start};
+    use crate::{Interrupt, Role, Shape, Start};
 
     #[test]
     fn ids_print_in_fixed_width_hex() {
@@ -97,6 +97,10 @@ mod tests {
                 shape: Shape::JsonSchema(r#"{"type":"object"}"#.into()),
                 start: Start::AfterReasoning { open: None, close: "</think>".into() },
                 trigger: Some("<tool_call>".into()),
+                interrupt: Some(Interrupt {
+                    text: "<tool_call>".into(),
+                    shape: Shape::Lark("start: \"a\"".into()),
+                }),
             }),
             id: RequestId(9),
         };

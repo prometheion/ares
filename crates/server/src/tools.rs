@@ -235,6 +235,7 @@ pub(crate) fn apply(
         shape: Shape::Lark(lark),
         start: thinking.start.clone(),
         trigger: triggered.then(|| format.trigger().to_owned()),
+        interrupt: None,
     });
     Ok(Some(splitter(format, &asked.tools, thinking, request.id)))
 }

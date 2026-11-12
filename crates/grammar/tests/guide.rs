@@ -5,7 +5,9 @@ use ares_grammar::Guide;
 use common::*;
 
 fn guide(toy: &Toy, shape: Shape, start: Start) -> Guide {
-    toy.compiler.guide(&Structure { shape, start, trigger: None }).expect("a guide")
+    toy.compiler
+        .guide(&Structure { shape, start, trigger: None, interrupt: None })
+        .expect("a guide")
 }
 
 fn bytes(text: &str) -> Vec<u32> {
