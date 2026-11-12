@@ -757,9 +757,6 @@ fn a_row_gives_the_same_result_alone_and_in_a_batch() {
     }
 }
 
-/// The shapes are described as they sit on the device: every one holds at least a
-/// block of an SM, the shared memory fits the opt-in limit, and the rows they take
-/// grow from the small shape to the large.
 /// A float weight beyond the range of f16 must not turn into a wrong finite number: the
 /// tile holds an infinity, and the outputs that read it are infinite or NaN, on every path.
 /// The other outputs are right.
@@ -813,17 +810,64 @@ fn a_float_weight_beyond_f16_makes_its_outputs_infinite_and_no_others_wrong() {
     }
 }
 
-/// Weights below the smallest normal f16 (6.1e-5) keep what an f16 subnormal holds: a
-/// multiple of 2^-24, so the error of a weight is at most 2^-25. That bounds the output's
-/// error: the rounding of the weights, 2^-25 times the sum of the activations' magnitudes,
-/// and the rounding of the activations to f16, 2^-11 of each product (and, for the path that
-/// accumulates in f16, 2^-25 for each partial sum of 16 values, as small sums are subnormals
-/// too). The measured error is printed next to the bound.
+/// The distance between neighbouring f16 values at the magnitude `v`: 2^-24 below 2^-13 (the
+/// subnormals and the first binade of normal numbers), 2^-10 of the binade above.
+fn f16_spacing(v: f64) -> f64 {
+    let exponent = if v > 0.0 { ((v.to_bits() >> 52) & 0x7ff) as i32 - 1023 } else { -14 };
+    2f64.powi(exponent.max(-14) - 10)
+}
+
+/// `v` rounded to the nearest f16, halves to even.
+fn nearest_f16(v: f64) -> f64 {
+    let spacing = f16_spacing(v.abs());
+    (v / spacing).round_ties_even() * spacing
+}
+
+/// The power of two `ares_convert_f16` divides a row of activations by: the one above the
+/// row's largest magnitude, so that the divided values are below 1.
+fn row_factor(x: &[f32]) -> f32 {
+    let largest = x.iter().fold(0f32, |m, v| m.max(v.abs()));
+    assert!(largest.is_normal());
+    2f32.powi(((largest.to_bits() >> 23) & 0xff) as i32 - 126)
+}
+
+/// Weights below 2^-13 (1.2e-4) lie where f16 values are 2^-24 apart (the subnormals and the
+/// first binade of normal numbers), so the tile holds each of them within 2^-25, whatever its
+/// size. This is what that and the other roundings of the kernels do to an output, and the
+/// test holds the kernels to the sum of it.
+///
+/// For a row of activations `x` with the factor `s` (the power of two above its largest
+/// magnitude, by which `ares_convert_f16` divides the row) a kernel computes
+/// `y = s * sum of f16(w[k]) * f16(x[k] / s)`. In the units of `y`:
+///
+/// - *Weights.* `|f16(w) - w| <= 2^-25`: an F32 weight is rounded once, to nearest (`cvt`), a
+///   BF16 weight is first widened to f32, which changes nothing. Times the activations as the
+///   kernel has them: `2^-25 * sum |x^[k]|`, with `x^ = s * f16(x / s)`.
+/// - *Activations.* `|x^ - x| <= max(2^-11 |x|, 2^-25 s)`, the second for the values below
+///   `2^-14 s`, which are subnormal once divided: `sum |w[k]| * |x^[k] - x[k]|` (the test takes
+///   the difference itself).
+/// - *Sums of the f16 path.* The products are exact (22 bits). An `mma` adds 16 of them to an
+///   f32 sum and leaves it within a spacing of f32, `2^-23` of its magnitude, `n_in / 16` times.
+/// - *Sums of the path with f16 accumulation.* The sum of each 64 values is kept as an f16, and
+///   it is rounded after every 8 products: the tensor cores take the 16 products of an `mma` in
+///   two steps (measured on the two cards at hand: rounding the sum to the nearest f16 after
+///   every 8 products on the CPU gives the bits of the kernel for the share of the outputs the
+///   test prints, 99.7 to 99.8 %; after every 16, or truncating, for 15 % at most). A step is
+///   off by at most the spacing of f16 at the partial sum `h`, and the partial sum is in the
+///   units of the divided row: `s * 2^-24` for `|h| < 2^-13`, at most `s * 2^-10 |h|` above
+///   (the bound allows the whole spacing, so it does not depend on the rounding being to
+///   nearest). So with weights this small every step loses up to `2^-24` of the row's factor,
+///   3.8e-6 for a row whose largest activation is 40, where the f16 path loses nothing; over
+///   `n_in / 8` steps that is the larger part of this path's error. Each group's sum is then
+///   added to an f32: `n_in / 64` times a spacing of f32.
+///
+/// The measured error is printed with the bound and the three parts of the bound.
 #[test]
 fn tiny_float_weights_are_off_by_at_most_the_spacing_of_f16_subnormals() {
     let Some(gpus) = gpus() else { return };
     let mut rng = Rng(0x2545f4914f6cdd1d);
     let (n_in, n_out, n_rows) = (512usize, 130usize, 33usize);
+    let (weight_step, f32_step) = (2f64.powi(-25), 2f64.powi(-23));
     for device in gpus {
         let kernels = Kernels::load(device).unwrap();
         if !kernels.has_prefill_kernels() {
@@ -837,49 +881,92 @@ fn tiny_float_weights_are_off_by_at_most_the_spacing_of_f16_subnormals() {
                     magnitude * if rng.next().is_multiple_of(2) { -1.0 } else { 1.0 }
                 })
                 .collect();
+            assert!(values.iter().all(|v| v.abs() < 2f32.powi(-13)));
             let w = float_bytes(ty, &values);
             let mut exact_weights = vec![0f32; n_in * n_out];
             ares_quant::dequantize(ty, &w, &mut exact_weights).unwrap();
             let x: Vec<f32> = (0..n_in * n_rows).map(|_| rng.activation()).collect();
             for path in paths_of(&kernels, ty) {
+                let flush = path == PrefillPath::F16Flush;
                 let have = run_matmul(device, &kernels, ty, path, &w, &x, n_in, n_out, n_rows);
-                let (mut worst, mut worst_bound) = (0f64, 0f64);
+                // The output that comes closest to its bound: error, bound and the bound's parts.
+                let mut worst = (0f64, 1f64, [0f64; 3]);
+                let mut emulated = 0usize;
                 for b in 0..n_rows {
+                    let xb = &x[b * n_in..][..n_in];
+                    let factor = row_factor(xb);
+                    let s = f64::from(factor);
+                    // The activations as the kernel has them, in the units of the divided row.
+                    let divided: Vec<f64> = xb.iter().map(|v| through_f16(*v / factor)).collect();
                     for r in 0..n_out {
-                        let (mut exact, mut abs_x, mut abs_wx) = (0f64, 0f64, 0f64);
-                        for k in 0..n_in {
-                            let (wv, xv) = (
-                                f64::from(exact_weights[r * n_in + k]),
-                                f64::from(x[b * n_in + k]),
-                            );
-                            exact += wv * xv;
-                            abs_x += xv.abs();
-                            abs_wx += (wv * xv).abs();
+                        let row = &exact_weights[r * n_in..][..n_in];
+                        let (mut exact, mut weights, mut activations) = (0f64, 0f64, 0f64);
+                        // In the units of the divided row: the sum of the magnitudes so far, and
+                        // what the f32 sum may be off by.
+                        let (mut magnitude, mut off) = (0f64, 0f64);
+                        // The emulation of the path with f16 accumulation.
+                        let mut sum = 0f32;
+                        for group in 0..n_in / 64 {
+                            // The f16 sum of the group: its magnitude at most, what it may be
+                            // off by, and its emulation.
+                            let (mut partial, mut partial_off, mut h) = (0f64, 0f64, 0f64);
+                            for step in 0..8 {
+                                let mut products = 0f64;
+                                for k in group * 64 + step * 8..group * 64 + step * 8 + 8 {
+                                    let (wv, xv) = (f64::from(row[k]), f64::from(xb[k]));
+                                    let tile = through_f16(row[k]);
+                                    exact += wv * xv;
+                                    weights += weight_step * (divided[k] * s).abs();
+                                    activations += wv.abs() * (divided[k] * s - xv).abs();
+                                    partial += (tile * divided[k]).abs();
+                                    products += tile * divided[k];
+                                }
+                                if flush {
+                                    partial_off += f16_spacing(partial + partial_off);
+                                    h = nearest_f16(h + products);
+                                } else if step % 2 == 1 {
+                                    off += f32_step * (magnitude + partial + off);
+                                }
+                            }
+                            magnitude += partial;
+                            if flush {
+                                off += partial_off;
+                                off += f32_step * (magnitude + off);
+                                sum += h as f32;
+                            }
                         }
-                        // The flushing path also rounds each partial sum of 16 values to f16, which
-                        // in this range is a subnormal too.
-                        let flush =
-                            if path == PrefillPath::F16Flush { n_in as f64 / 16.0 } else { 0.0 };
-                        let bound = 2f64.powi(-25) * (abs_x + flush) + 2f64.powi(-10) * abs_wx;
+                        let parts = [weights, activations, off * s];
+                        let bound: f64 = parts.iter().sum();
                         let error = (f64::from(have[b * n_out + r]) - exact).abs();
                         assert!(
                             error <= bound,
-                            "{ty} {path:?} row {b} output {r}: {error:e} > {bound:e}"
+                            "{ty} {path:?} row {b} output {r}: {error:e} > {bound:e} (weights, activations, sums: {parts:?})"
                         );
-                        if error / bound > worst / worst_bound.max(1e-300) {
-                            (worst, worst_bound) = (error, bound);
+                        if error / bound > worst.0 / worst.1 {
+                            worst = (error, bound, parts);
                         }
+                        emulated += usize::from(have[b * n_out + r] == sum * factor);
                     }
                 }
+                let (error, bound, [weights, activations, sums]) = worst;
                 eprintln!(
-                    "{ty} weights from 1e-7 to 1e-4, {path:?} on {}: largest error {worst:.2e} against the bound {worst_bound:.2e}",
+                    "{ty} weights from 1e-7 to 1e-4, {path:?} on {}: closest to its bound is the error {error:.2e} against {bound:.2e} (weights {weights:.2e}, activations {activations:.2e}, sums {sums:.2e})",
                     device.info().name
                 );
+                if flush {
+                    eprintln!(
+                        "  {emulated} of {} outputs are the bits of f16 sums rounded to nearest after every 8 products",
+                        n_rows * n_out
+                    );
+                }
             }
         }
     }
 }
 
+/// The shapes are described as they sit on the device: every one holds at least a
+/// block of an SM, the shared memory fits the opt-in limit, and the rows they take
+/// grow from the small shape to the large.
 #[test]
 fn the_shapes_fit_the_device() {
     let Some(gpus) = gpus() else { return };
