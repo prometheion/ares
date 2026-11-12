@@ -403,7 +403,12 @@ fn an_id_in_use_is_refused_by_a_terminal_event() {
 fn long_prompts_are_read_in_chunks_next_to_generation_and_say_the_same() {
     let mut rng = Rng(42);
     let long = rng.prompt(300);
-    let model = model(|c| c.max_rows = 64);
+    // A context as large as the pool: a request with no limit generates for
+    // some twenty seconds of steps, far longer than the test goes on.
+    let model = model(|c| {
+        c.max_rows = 64;
+        c.context_length = 65_536;
+    });
 
     // Reference: the long prompt in few big steps, alone.
     let wide = runtime_with(&model, RuntimeConfig { max_rows: 0, ..config(false, 4096) }, |e| e);
@@ -415,7 +420,7 @@ fn long_prompts_are_read_in_chunks_next_to_generation_and_say_the_same() {
     let rt = runtime_with(&model, RuntimeConfig { max_rows: 16, ..config(false, 4096) }, |e| {
         e.with_delay(Duration::from_micros(300))
     });
-    let generating = start(&rt, request("already generating", Some(200))).unwrap();
+    let generating = start(&rt, request("already generating", None)).unwrap();
     generating.wait_for_text(5);
     let before = snapshot(&rt);
     let run = run_one(&rt, request(&long, Some(30)));
@@ -423,7 +428,8 @@ fn long_prompts_are_read_in_chunks_next_to_generation_and_say_the_same() {
     let d = since(&snapshot(&rt), &before);
     assert!(d["mixed"] >= 3, "the prompt shared steps with the generating request: {d:?}");
     assert!(d["steps"] >= 300 / 16, "{d:?}");
-    generating.finish();
+    rt.cancel(generating.id);
+    assert_eq!(generating.finish().finish, FinishReason::Cancelled, "it generated all the while");
 }
 
 #[test]
@@ -615,20 +621,32 @@ fn watch(steps: &Steps) -> impl FnMut(&ares_runtime::RecordView<'_>) + Send + 's
 
 /// A runtime whose steps cost what a device's do, a pass over the weights and
 /// a little for every row, with a sequence that is generating (and drafting).
+/// The executor says what each step cost, so the turns of prompts and rounds
+/// are taken from exactly these prices; it also takes the time, so that the
+/// prompts of a test arrive while the sequence generates. The sequence has no
+/// limit but the pool, which it would take twenty seconds of steps to fill:
+/// it generates for as long as a test goes on, and [`end`] checks that it did.
 fn generating(steps: &Steps) -> (Runtime, Handle) {
     let model = model(|c| {
         repeating(c);
         c.max_rows = 128;
-        c.context_length = 4096;
+        c.context_length = 65_536;
     });
     let observer = watch(steps);
     let rt = runtime_with(&model, config(true, 4096), |e| {
         e.with_row_cost(Duration::from_micros(3000), Duration::from_micros(30))
             .with_observer(observer)
     });
-    let generating = start(&rt, request("a sequence that goes on", Some(2000))).unwrap();
+    let generating = start(&rt, request("a sequence that goes on", None)).unwrap();
     generating.wait_for_text(60);
     (rt, generating)
+}
+
+/// Ends the sequence of [`generating`], which was generating to the last.
+fn end(rt: Runtime, generating: Handle) {
+    rt.cancel(generating.id);
+    assert_eq!(generating.finish().finish, FinishReason::Cancelled, "it generated all the while");
+    rt.shutdown();
 }
 
 #[test]
@@ -652,8 +670,7 @@ fn a_prompt_next_to_a_drafting_sequence_is_read_in_pieces_without_draft_rows() {
     );
     // The sequence went on in rounds of drafts between the pieces.
     assert!(ours.iter().any(|s| s.windows > 0 && s.rows > 1), "{ours:?}");
-    generating.finish();
-    rt.shutdown();
+    end(rt, generating);
 }
 
 #[test]
@@ -663,7 +680,7 @@ fn a_long_prompt_takes_half_of_the_time_next_to_a_sequence_that_generates() {
     let before = steps.lock().unwrap().len();
     start(&rt, request(&Rng(6).prompt(2400), Some(1))).unwrap().finish();
     let after = steps.lock().unwrap().len();
-    // The cost the executor charges.
+    // The cost the executor charges, which is what the conductor books.
     let ms = |s: &Seen| 3.0 + 0.03 * f64::from(s.rows);
     let ours: Vec<Seen> = steps.lock().unwrap()[before..after].to_vec();
     let prompt: f64 = ours.iter().filter(|s| s.prompt_rows > 0).map(ms).sum();
@@ -671,8 +688,7 @@ fn a_long_prompt_takes_half_of_the_time_next_to_a_sequence_that_generates() {
     // The default slowdown is 2: the sequence gets as much time as the prompt.
     let owed = rounds / prompt;
     assert!((0.8..1.25).contains(&owed), "the sequence had {rounds:.0} ms, the prompt {prompt:.0}");
-    generating.finish();
-    rt.shutdown();
+    end(rt, generating);
 }
 
 #[test]
@@ -688,8 +704,7 @@ fn a_short_prompt_next_to_a_drafting_sequence_is_read_whole_in_the_next_step() {
             steps.lock().unwrap()[before..after].iter().filter(|s| s.prompt_rows > 0).count();
         assert_eq!(pieces, 1, "round {round}: a prompt of 60 rows is one piece");
     }
-    generating.finish();
-    rt.shutdown();
+    end(rt, generating);
 }
 
 #[test]
@@ -712,23 +727,40 @@ fn launches(rows: u32) -> Duration {
     Duration::from_micros(3000 + 30 * u64::from(rows) + 3000 * u64::from(rows.div_ceil(8) - 1))
 }
 
+fn launches_ms(rows: u32) -> f64 {
+    launches(rows).as_secs_f64() * 1e3
+}
+
+/// A model whose draft block is right this often and whose text gives the
+/// lookup nothing, so that every draft is the block's.
+fn drafting_model(accuracy: &[f64], max_rows: u32) -> Arc<SyntheticModel> {
+    model(|c| {
+        never_repeating(c);
+        c.own_drafts = 15;
+        c.own_accuracy = accuracy.to_vec();
+        c.max_rows = max_rows;
+        c.context_length = 2048;
+    })
+}
+
+/// A runtime on the device of [`launches`]. The executor tells the conductor
+/// what each step cost and takes no time for it: the prices the policy sees
+/// are exactly these, on a machine however busy, so its choices can be
+/// checked to the row.
 fn drafting_runtime(
     accuracy: &[f64],
     window: u32,
     warm_up: bool,
     steps: Option<&Steps>,
 ) -> (Runtime, Arc<SyntheticModel>) {
-    let model = model(|c| {
-        never_repeating(c);
-        c.own_drafts = 15;
-        c.own_accuracy = accuracy.to_vec();
-        c.max_rows = 64;
-        c.context_length = 2048;
-    });
+    let model = drafting_model(accuracy, 64);
     let observer = steps.map(watch);
     let config = RuntimeConfig { window_rows: window, warm_up, ..config(true, 4096) };
     let rt = runtime_with(&model, config, |e| {
-        let e = e.with_step_cost(launches).with_link_cost(Duration::from_micros(300));
+        let e = e
+            .with_step_cost(launches)
+            .with_link_cost(Duration::from_micros(300))
+            .without_sleeping();
         match observer {
             Some(observer) => e.with_observer(observer),
             None => e,
@@ -772,15 +804,20 @@ fn a_window_of_one_row_is_no_speculation_even_for_a_model_with_a_drafter_and_tex
     assert_eq!((c.draft_rows, c.drafts_accepted), (0, 0), "{c:?}");
     // The same model and text with room for a window do draft: it is the room
     // that was missing, not the text.
-    let rt = runtime(&model, true);
+    let rt = runtime_with(&model, config(true, 4096), |e| {
+        e.with_delay(Duration::from_micros(200)).without_sleeping()
+    });
     alone(&rt, "a text that loops", Some(300));
-    assert!(snapshot_of(&rt).counters.drafts_accepted > 0);
+    assert!(snapshot_of(&rt).counters.drafts_accepted > 100);
 }
 
 #[test]
 fn the_lookup_joins_the_model_drafter_when_there_is_one() {
     let model = model(never_repeating);
-    let rt = runtime_with(&model, RuntimeConfig { window_rows: 8, ..config(true, 4096) }, |e| e);
+    // A step costs the same whatever it carries, and the executor says so.
+    let rt = runtime_with(&model, RuntimeConfig { window_rows: 8, ..config(true, 4096) }, |e| {
+        e.with_delay(Duration::from_micros(200)).without_sleeping()
+    });
     alone(&rt, "written twice", Some(200));
     let before = snapshot_of(&rt).counters;
     alone(&rt, "written twice", Some(200));
@@ -797,32 +834,40 @@ fn drafts_are_as_long_as_they_pay_and_stop_at_the_edge_of_a_launch() {
     // A draft block that is right nearly always: seven links fill the eight
     // rows of a launch, and a second launch costs more than the rows after it
     // are worth.
-    let (rt, _) = drafting_runtime(&[0.97], 16, true, None);
+    let steps: Steps = Arc::default();
+    let (rt, _) = drafting_runtime(&[0.97], 16, true, Some(&steps));
+    let warm_up = steps.lock().unwrap().len();
     alone(&rt, "a long and easy text", Some(400));
+    let windows: Vec<u32> =
+        steps.lock().unwrap()[warm_up..].iter().filter(|s| s.windows > 0).map(|s| s.rows).collect();
+    // The estimate starts from the belief and grows with every draft that is
+    // accepted, and so do the windows, to the eight rows of a launch and
+    // never to a ninth. From there every window is exactly the launch, up to
+    // the last, which the end of the request may cut short.
+    assert!(windows.iter().all(|rows| *rows <= 8), "{windows:?}");
+    let full = windows.iter().position(|rows| *rows == 8).expect("a window of a whole launch");
+    assert!(full <= 12, "the policy took {full} windows to learn: {windows:?}");
+    let settled = &windows[full..windows.len() - 1];
+    assert!(settled.len() >= 40 && settled.iter().all(|rows| *rows == 8), "{windows:?}");
     let l = lengths(&rt)[1];
-    // (Nearly all: the price of a step is measured with sleeps on a machine
-    // that may be busy, and a window in a hundred may be longer or shorter.)
-    let windows: u64 = l.iter().sum();
-    assert!(l[5..8].iter().sum::<u64>() * 10 >= windows * 8, "{l:?}");
-    assert!(l[8..].iter().sum::<u64>() * 20 <= windows, "{l:?}");
+    assert!(l[8..].iter().all(|n| *n == 0), "{l:?}");
 
     // One that is right a third of the time stops sooner, from the first
-    // window on.
+    // window on: no window verifies more than three drafts.
     let (rt, _) = drafting_runtime(&[0.33], 16, true, None);
     alone(&rt, "a hard text", Some(400));
     let l = lengths(&rt)[1];
     let windows: u64 = l.iter().sum();
-    let long: u64 = l[4..].iter().sum();
-    assert!(windows > 0 && long * 10 < windows, "{l:?}");
+    assert!(windows > 100 && l[4..].iter().all(|n| *n == 0), "{l:?}");
 
-    // One that is never right is not asked for long (the back-off is checked
-    // against exact prices in the scheduler's tests: here the price of a step
-    // is measured with sleeps, and the rarer a draft that pays, the more the
-    // noise of that price decides how often one is tried).
+    // One that is never right is tried a few times and then hardly at all, as
+    // in the scheduler's test of the back-off with the same prices.
     let (rt, _) = drafting_runtime(&[0.0], 16, true, None);
     alone(&rt, "an impossible text", Some(400));
     let c = snapshot_of(&rt).counters;
-    assert!(c.draft_rows * 2 < c.tokens, "{c:?}");
+    let tries: u64 = c.draft_lengths[1].iter().sum();
+    assert!((2..=20).contains(&tries), "{tries} windows with drafts: {c:?}");
+    assert_eq!(c.drafts_accepted, 0, "{c:?}");
 }
 
 #[test]
@@ -830,7 +875,11 @@ fn the_window_is_the_room_and_not_the_length() {
     let (rt, _) = drafting_runtime(&[0.97], 4, true, None);
     alone(&rt, "a long and easy text", Some(300));
     let l = lengths(&rt)[1];
-    assert!(l[3] > 20 && l[4..].iter().all(|n| *n == 0), "{l:?}");
+    // Three drafts fit and three is what nearly every window takes; none has
+    // more.
+    let windows: u64 = l.iter().sum();
+    assert!(l[3] > 60 && l[3] + 3 >= windows, "{l:?}");
+    assert!(l[4..].iter().all(|n| *n == 0), "{l:?}");
 }
 
 #[test]
@@ -853,17 +902,60 @@ fn the_warm_up_measures_every_window_size_and_every_link_of_the_chain() {
 fn the_calibration_finds_the_edge_of_a_launch_and_the_cost_of_a_link() {
     let (rt, _) = drafting_runtime(&[0.97], 8, true, None);
     let calibration = snapshot_of(&rt).calibration.expect("the warm-up measured");
+    // The table holds what the device charges for every size, to the edge:
+    // eight rows are one launch and nine are two, 3 ms more.
+    assert!(calibration.step_ms.len() >= 24, "{:?}", calibration.step_ms);
+    for (rows, ms) in &calibration.step_ms {
+        assert!((ms - launches_ms(*rows)).abs() < 1e-9, "{rows} rows: {ms} ms");
+    }
     let step = |rows: u32| calibration.step_ms.iter().find(|(n, _)| *n == rows).unwrap().1;
-    // Eight rows are one launch and nine two: 3 ms more, with the sleeps of a
-    // test executor on top.
-    assert!((step(9) - step(8) - 3.0).abs() < 1.0, "{:?}", calibration.step_ms);
-    assert!((step(8) - step(1)).abs() < 1.0, "{:?}", calibration.step_ms);
+    assert!((step(9) - step(8) - 3.03).abs() < 1e-9, "{:?}", calibration.step_ms);
     // A link of the chain costs 0.3 ms, however long the chain.
     assert_eq!(calibration.chain_ms.len(), 7, "{:?}", calibration.chain_ms);
     assert!(
-        calibration.chain_ms.iter().all(|(links, ms)| (ms / f64::from(*links) - 0.3).abs() < 0.01)
+        calibration.chain_ms.iter().all(|(links, ms)| (ms / f64::from(*links) - 0.3).abs() < 1e-9)
     );
     assert!(calibration.steps > 30 && calibration.seconds > 0.0, "{calibration:?}");
+}
+
+#[test]
+fn the_conductor_measures_the_steps_of_an_executor_that_does_not_say_what_they_took() {
+    // What a device does: the executor takes the time of a step and says
+    // nothing, and the conductor measures the step with its own clock, at the
+    // warm-up and for every step after it. On a busy machine such a
+    // measurement is anything from the time the step took upwards, so this
+    // test asserts what holds at any speed and leaves the choices that follow
+    // from exact prices to the tests above.
+    let model = drafting_model(&[0.97], 16);
+    let start = |measured: bool| {
+        let config = RuntimeConfig { window_rows: 8, warm_up: true, ..config(true, 4096) };
+        runtime_with(&model, config, |e| {
+            let e = e.with_step_cost(launches).with_link_cost(Duration::from_micros(300));
+            if measured { e.timed_by_the_conductor() } else { e.without_sleeping() }
+        })
+    };
+    let measured = start(true);
+    let calibration = snapshot_of(&measured).calibration.expect("the warm-up measured");
+    let sizes: Vec<u32> = calibration.step_ms.iter().map(|(rows, _)| *rows).collect();
+    assert_eq!(sizes, (1..=16).collect::<Vec<_>>());
+    // A step is never measured shorter than the executor took for it.
+    for (rows, ms) in &calibration.step_ms {
+        assert!(*ms >= launches_ms(*rows) - 1e-6, "{rows} rows in {ms} ms");
+    }
+    // The chain's time is the executor's word, here as on a device.
+    assert!(
+        calibration.chain_ms.iter().all(|(links, ms)| (ms / f64::from(*links) - 0.3).abs() < 1e-9),
+        "{:?}",
+        calibration.chain_ms
+    );
+    // Whatever the measured prices make of the windows, the text is the one
+    // that exact prices give, and every token is counted.
+    let run = alone(&measured, "the same words", Some(120));
+    assert_eq!(run, alone(&start(false), "the same words", Some(120)));
+    assert_eq!(run.usage.completion_tokens, 120);
+    let c = snapshot_of(&measured).counters;
+    assert_eq!(c.tokens, 120, "{c:?}");
+    assert!(c.steps <= 121 && c.drafts_accepted <= c.draft_rows, "{c:?}");
 }
 
 #[test]
