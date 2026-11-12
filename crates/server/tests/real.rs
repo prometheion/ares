@@ -930,26 +930,24 @@ fn flash_next_answers_in_both_placements() {
             "{split}: the reference's first sentence: {text:?}"
         );
         // A request that turns thinking on gets the reasoning apart from the
-        // content: the limit cuts the reply inside the thinking.
+        // content, and neither has the tags that divide them.
         let body = client.chat(
             ENGLISH,
             json!({
-                "max_tokens": 40,
+                "max_tokens": 160,
                 "temperature": 0,
                 "chat_template_kwargs": {"enable_thinking": true},
             }),
         );
         let reply = client.post("/v1/chat/completions", &body);
         assert_eq!(reply.status, 200, "{}", reply.body);
-        let choice = &reply.json()["choices"][0];
-        let reasoning = choice["message"]["reasoning_content"].as_str().unwrap_or("");
-        eprintln!("RES {split}: reasoning {reasoning:?}");
-        assert!(reasoning.len() > 40, "{split}: the thinking is the reasoning: {choice}");
-        assert!(
-            choice["message"]["content"].as_str().is_none_or(str::is_empty),
-            "{split}: a reply cut inside the thinking has no content: {choice}"
-        );
-        assert_eq!(choice["finish_reason"], "length", "{split}: {choice}");
+        let message = &reply.json()["choices"][0]["message"];
+        let reasoning = message["reasoning_content"].as_str().unwrap_or("");
+        let content = message["content"].as_str().unwrap_or("");
+        eprintln!("RES {split}: reasoning {reasoning:?}, content {content:?}");
+        assert!(reasoning.len() > 40, "{split}: the thinking is the reasoning: {message}");
+        assert!(content.len() > 40, "{split}: and the answer is the content: {message}");
+        assert!(!reasoning.contains("think>") && !content.contains("think>"), "{split}: {message}");
 
         // Two requests at once share the steps.
         let together: Vec<String> = thread::scope(|scope| {
