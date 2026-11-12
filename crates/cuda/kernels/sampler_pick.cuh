@@ -11,8 +11,9 @@
 // f32 values per device and row in the exchange of the picks.
 #define ARES_SAMPLE_PICK_VALUES 2
 
-// Grid (chunks, rows), ARES_SAMPLE_THREADS threads. Raises `state[r].best`
-// to the best packed score of this chunk.
+// Grid (chunks, rows), ARES_SAMPLE_THREADS threads, `chunk` at most
+// ARES_SAMPLE_PER logits per thread. Raises `state[r].best` to the best
+// packed score of this chunk.
 ARES_KERNEL ares_sample_pick(const float* logits, uint32_t stride, uint32_t n_local,
                              const uint32_t* tokens, uint32_t first, uint32_t chunk,
                              const AresSampleParams* params, AresSampleState* state) {
@@ -25,14 +26,20 @@ ARES_KERNEL ares_sample_pick(const float* logits, uint32_t stride, uint32_t n_lo
     const AresSampleState s = state[r];
     const uint32_t begin = blockIdx.x * chunk;
     const uint32_t end = min(begin + chunk, n_local);
-    const float* row = logits + (size_t)r * stride;
+    float v[ARES_SAMPLE_PER];
+    const uint32_t n = ares_sample_read(logits + (size_t)r * stride, begin, end, v);
     unsigned long long best = 0ull;
-    for (uint32_t i = begin + threadIdx.x; i < end; i += ARES_SAMPLE_THREADS) {
+#pragma unroll
+    for (int k = 0; k < ARES_SAMPLE_PER; ++k) {
+        if ((uint32_t)k >= n) {
+            break;
+        }
         bool bad = false;
-        const float l = ares_sample_logit(row[i], &bad);
+        const float l = ares_sample_logit(v[k], &bad);
         if (!ares_sample_present(l) || !ares_in_set(s, ares_sample_key(s.l_max, l))) {
             continue;
         }
+        const uint32_t i = begin + k * blockDim.x + threadIdx.x;
         const uint32_t token = tokens ? tokens[first + i] : first + i;
         const float g = ares_sample_gumbel(p.seed_lo, p.seed_hi, p.position, token);
         const float score = __fadd_rn(__fmul_rn(l, s.inv_t), g);
