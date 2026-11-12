@@ -1,4 +1,4 @@
-//! Errors in the shape OpenAI clients parse.
+//! Errors in the shape OpenAI clients parse, and in Anthropic's for its routes.
 
 use ares_api::{Engine, EngineError};
 use axum::Json;
@@ -168,6 +168,56 @@ impl ApiError {
             },
         }
     }
+}
+
+impl ApiError {
+    /// The error as Anthropic's API writes one: `{"type": "error", "error":
+    /// {"type", "message"}}`. The status is the same as on the other routes.
+    pub fn anthropic(&self) -> AnthropicEnvelope<'_> {
+        let kind = match (self.status, self.code) {
+            (_, "overloaded") => "overloaded_error",
+            (StatusCode::UNAUTHORIZED, _) => "authentication_error",
+            (StatusCode::FORBIDDEN, _) => "permission_error",
+            (StatusCode::NOT_FOUND, _) => "not_found_error",
+            (StatusCode::PAYLOAD_TOO_LARGE, _) => "request_too_large",
+            (StatusCode::TOO_MANY_REQUESTS, _) => "rate_limit_error",
+            (status, _) if status.is_server_error() => "api_error",
+            _ => "invalid_request_error",
+        };
+        AnthropicEnvelope { kind: "error", error: AnthropicBody { kind, message: &self.message } }
+    }
+}
+
+/// An [`ApiError`] on a route of Anthropic's API.
+#[derive(Debug)]
+pub(crate) struct Anthropic(pub ApiError);
+
+impl IntoResponse for Anthropic {
+    fn into_response(self) -> Response {
+        let error = self.0;
+        if error.status.is_server_error() {
+            tracing::warn!(status = error.status.as_u16(), code = error.code, "{}", error.message);
+        }
+        let mut response = (error.status, Json(error.anthropic())).into_response();
+        if let Some(seconds) = error.retry_after {
+            response.headers_mut().insert(header::RETRY_AFTER, HeaderValue::from(seconds));
+        }
+        response
+    }
+}
+
+#[derive(Serialize)]
+pub(crate) struct AnthropicEnvelope<'a> {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    error: AnthropicBody<'a>,
+}
+
+#[derive(Serialize)]
+struct AnthropicBody<'a> {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    message: &'a str,
 }
 
 #[derive(Serialize)]

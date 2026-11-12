@@ -218,7 +218,11 @@ fn unserved(name: &str, value: &Json) -> Option<&'static str> {
 }
 
 /// [`parse`] after the JSON syntax is dealt with.
-fn from_json(endpoint: Endpoint, json: &Json, id: RequestId) -> Result<Parsed, ApiError> {
+pub(crate) fn from_json(
+    endpoint: Endpoint,
+    json: &Json,
+    id: RequestId,
+) -> Result<Parsed, ApiError> {
     let fields = Fields(members(json)?);
 
     let model = fields
@@ -377,7 +381,7 @@ impl<'a> Fields<'a> {
         self.get(name).map(|v| expect_str(name, v)).transpose()
     }
 
-    fn bool(&self, name: &str) -> Result<Option<bool>, ApiError> {
+    pub(crate) fn bool(&self, name: &str) -> Result<Option<bool>, ApiError> {
         match self.get(name) {
             None => Ok(None),
             Some(Json::Bool(b)) => Ok(Some(*b)),
@@ -396,7 +400,7 @@ impl<'a> Fields<'a> {
     }
 
     /// A whole number. `100.0` is accepted, `100.5` is not.
-    fn int(&self, name: &str) -> Result<Option<i64>, ApiError> {
+    pub(crate) fn int(&self, name: &str) -> Result<Option<i64>, ApiError> {
         match self.get(name) {
             None => Ok(None),
             Some(Json::Int(i)) => Ok(Some(*i)),

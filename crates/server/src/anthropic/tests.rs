@@ -1,0 +1,606 @@
+use ares_api::{Json, Usage};
+use serde_json::{Value, json};
+
+use super::reply::{Block, BlockEvent, Blocks, Content, Head, SIGNATURE, block_event, stop_reason};
+use super::request::{Purpose, to_chat};
+use crate::reasoning::Split;
+use crate::reply::Piece;
+
+fn read(body: Value) -> Json {
+    serde_json::from_value(body).unwrap()
+}
+
+/// The chat body a Messages body comes to.
+fn chat(body: Value) -> Value {
+    let chat = to_chat(&read(body), Purpose::Reply).unwrap_or_else(|e| panic!("{}", e.message));
+    serde_json::to_value(chat).unwrap()
+}
+
+fn with(extra: Value) -> Value {
+    let mut body = json!({
+        "model": "m",
+        "max_tokens": 64,
+        "messages": [{"role": "user", "content": "hi"}],
+    });
+    body.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+    body
+}
+
+/// The message of the refusal of a body, and the field it names.
+fn refused(body: Value) -> (String, String) {
+    let error = to_chat(&read(body.clone()), Purpose::Reply)
+        .err()
+        .unwrap_or_else(|| panic!("not refused: {body}"));
+    assert_eq!(error.status, axum::http::StatusCode::BAD_REQUEST);
+    (error.param.unwrap_or_default(), error.message)
+}
+
+fn weather() -> Value {
+    json!({
+        "name": "get_weather",
+        "description": "The weather of a city.",
+        "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}},
+    })
+}
+
+#[test]
+fn the_plain_fields_go_over_under_the_names_of_the_chat_body() {
+    let body = with(json!({
+        "system": "Be brief.",
+        "temperature": 0.5,
+        "top_p": 0.9,
+        "top_k": 40,
+        "stream": true,
+        "stop_sequences": ["END", "\n\n"],
+        "metadata": {"user_id": "u1"},
+        "service_tier": "auto",
+    }));
+    assert_eq!(
+        chat(body),
+        json!({
+            "model": "m",
+            "temperature": 0.5,
+            "top_p": 0.9,
+            "top_k": 40,
+            "max_tokens": 64,
+            "stream": true,
+            "messages": [
+                {"role": "system", "content": "Be brief."},
+                {"role": "user", "content": "hi"},
+            ],
+            "stop": ["END", "\n\n"],
+        })
+    );
+}
+
+#[test]
+fn system_blocks_are_one_system_message() {
+    let marker = json!({"type": "ephemeral", "ttl": "1h"});
+    let body = with(json!({"system": [
+        {"type": "text", "text": "You are terse."},
+        {"type": "text", "text": "Answer in German.", "cache_control": marker},
+    ]}));
+    assert_eq!(
+        chat(body)["messages"][0],
+        json!({"role": "system", "content": "You are terse.\nAnswer in German."})
+    );
+    // No text, no message.
+    assert_eq!(chat(with(json!({"system": []})))["messages"].as_array().unwrap().len(), 1);
+    assert_eq!(chat(with(json!({"system": ""})))["messages"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn the_stamp_of_the_billing_header_is_the_same_in_every_request() {
+    let header = |stamp: &str| {
+        format!(
+            "x-anthropic-billing-header: cc_version=2.1.101.e51; cc_entrypoint=cli; cch={stamp};"
+        )
+    };
+    let system = |stamp: &str| {
+        let body = with(json!({"system": [
+            {"type": "text", "text": header(stamp)},
+            {"type": "text", "text": "You are Claude Code. cch=12345;"},
+        ]}));
+        chat(body)["messages"][0]["content"].as_str().unwrap().to_owned()
+    };
+    assert_eq!(system("a5145"), system("0beef"));
+    assert_eq!(system("a5145"), format!("{}\nYou are Claude Code. cch=12345;", header("fffff")));
+    // Only that line, and only a stamp of that form.
+    for other in [
+        "cch=a5145; is text",
+        "x-anthropic-billing-header: cch=a51;",
+        "x-anthropic-billing-header: none",
+    ] {
+        assert_eq!(chat(with(json!({"system": other})))["messages"][0]["content"], other);
+    }
+}
+
+#[test]
+fn a_turn_of_the_user_keeps_the_order_of_its_blocks() {
+    let body = with(json!({"messages": [
+        {"role": "user", "content": [
+            {"type": "text", "text": "one"},
+            {"type": "text", "text": "two", "cache_control": {"type": "ephemeral"}},
+        ]},
+        {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "toolu_1", "name": "get_weather", "input": {"city": "Köln"}},
+            {"type": "tool_use", "id": "toolu_2", "name": "now", "input": {}},
+        ]},
+        {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "toolu_1", "content": "12 °C"},
+            {"type": "tool_result", "tool_use_id": "toolu_2", "is_error": true, "content": [
+                {"type": "text", "text": "no clock"},
+                {"type": "text", "text": "try later"},
+            ]},
+            {"type": "text", "text": "and now?"},
+        ]},
+    ]}));
+    assert_eq!(
+        chat(body)["messages"],
+        json!([
+            {"role": "user", "content": "one\ntwo"},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "toolu_1", "type": "function",
+                 "function": {"name": "get_weather", "arguments": {"city": "Köln"}}},
+                {"id": "toolu_2", "type": "function", "function": {"name": "now", "arguments": {}}},
+            ]},
+            {"role": "tool", "tool_call_id": "toolu_1", "content": "12 °C"},
+            {"role": "tool", "tool_call_id": "toolu_2", "content": "Error: no clock\ntry later"},
+            {"role": "user", "content": "and now?"},
+        ])
+    );
+    // A failed call that says nothing still says that it failed.
+    let failed = with(json!({"messages": [{"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": "t", "is_error": true},
+    ]}]}));
+    assert_eq!(chat(failed)["messages"][0]["content"], "Error");
+}
+
+#[test]
+fn the_thinking_of_a_turn_goes_back_as_its_reasoning_whatever_the_signature() {
+    for signature in [json!(SIGNATURE), json!(""), json!("EqQBCkgIARABGAIiQL..."), Value::Null] {
+        let body = with(json!({"messages": [
+            {"role": "user", "content": "2+2?"},
+            {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "2 and 2\nmake 4", "signature": signature},
+                {"type": "redacted_thinking", "data": "b3BhcXVl"},
+                {"type": "text", "text": "4"},
+            ]},
+            {"role": "user", "content": "sure?"},
+        ]}));
+        assert_eq!(
+            chat(body)["messages"][1],
+            json!({"role": "assistant", "content": "4", "reasoning_content": "2 and 2\nmake 4"})
+        );
+    }
+    // Without thinking the message has no reasoning, which a template can tell
+    // from an empty one.
+    let body = with(json!({"messages": [
+        {"role": "user", "content": "a"},
+        {"role": "assistant", "content": "b"},
+        {"role": "user", "content": "c"},
+    ]}));
+    assert_eq!(chat(body)["messages"][1], json!({"role": "assistant", "content": "b"}));
+}
+
+#[test]
+fn tools_and_the_choice_among_them_are_those_of_the_chat_body() {
+    let function = json!({"type": "function", "function": {
+        "name": "get_weather",
+        "description": "The weather of a city.",
+        "parameters": {"type": "object", "properties": {"city": {"type": "string"}}},
+    }});
+    let bare = json!({"name": "now", "input_schema": {"type": "object"}, "type": "custom",
+        "strict": true, "eager_input_streaming": true, "defer_loading": false,
+        "cache_control": {"type": "ephemeral"}});
+    let got = chat(with(json!({"tools": [weather(), bare]})));
+    assert_eq!(got["tools"][0], function);
+    assert_eq!(
+        got["tools"][1],
+        json!({"type": "function", "function": {"name": "now", "parameters": {"type": "object"}}})
+    );
+    assert!(got.get("tool_choice").is_none() && got.get("parallel_tool_calls").is_none());
+
+    let choice = |choice: Value| chat(with(json!({"tools": [weather()], "tool_choice": choice})));
+    assert_eq!(choice(json!({"type": "auto"}))["tool_choice"], "auto");
+    assert_eq!(choice(json!({"type": "any"}))["tool_choice"], "required");
+    assert_eq!(choice(json!({"type": "none"}))["tool_choice"], "none");
+    assert_eq!(
+        choice(json!({"type": "tool", "name": "get_weather"}))["tool_choice"],
+        json!({"type": "function", "function": {"name": "get_weather"}})
+    );
+    let one = choice(json!({"type": "any", "disable_parallel_tool_use": true}));
+    assert_eq!(one["parallel_tool_calls"], false);
+    let many = choice(json!({"type": "auto", "disable_parallel_tool_use": false}));
+    assert_eq!(many["parallel_tool_calls"], true);
+    // No tools, no section for them in the prompt.
+    assert!(chat(with(json!({"tools": []}))).get("tools").is_none());
+}
+
+#[test]
+fn thinking_is_the_switch_of_the_chat_template_and_the_budget_is_not_a_field() {
+    let variables = |thinking: Value| chat(with(json!({"thinking": thinking})));
+    let on = json!({"enable_thinking": true});
+    let enabled = variables(json!({"type": "enabled", "budget_tokens": 31999}));
+    assert_eq!(enabled["chat_template_kwargs"], on);
+    assert!(enabled.get("thinking_budget_tokens").is_none(), "{enabled}");
+    assert_eq!(variables(json!({"type": "enabled"}))["chat_template_kwargs"], on);
+    assert_eq!(variables(json!({"type": "adaptive"}))["chat_template_kwargs"], on);
+    assert_eq!(
+        variables(json!({"type": "disabled"}))["chat_template_kwargs"],
+        json!({"enable_thinking": false})
+    );
+    // A request that does not say leaves it to the server.
+    assert!(chat(with(json!({}))).get("chat_template_kwargs").is_none());
+}
+
+#[test]
+fn output_config_is_the_schema_and_the_effort_of_the_chat_body() {
+    let schema = json!({"type": "object", "properties": {"n": {"type": "integer"}}});
+    let got = chat(with(json!({"output_config": {
+        "format": {"type": "json_schema", "schema": schema},
+        "effort": "low",
+    }})));
+    assert_eq!(
+        got["response_format"],
+        json!({"type": "json_schema", "json_schema": {"schema": schema}})
+    );
+    assert_eq!(got["reasoning_effort"], "low");
+    // With tools that stay in the prompt the schema is the rule.
+    let none = json!({"tools": [weather()], "tool_choice": {"type": "none"},
+        "output_config": {"format": {"type": "json_schema", "schema": schema}}});
+    assert!(chat(with(none)).get("response_format").is_some());
+}
+
+#[test]
+fn a_count_needs_no_limit_and_has_no_stream() {
+    let body =
+        json!({"model": "m", "messages": [{"role": "user", "content": "hi"}], "stream": true});
+    let counted = to_chat(&read(body.clone()), Purpose::Count).unwrap();
+    assert_eq!(
+        serde_json::to_value(counted).unwrap(),
+        json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]})
+    );
+    assert_eq!(refused(body).0, "max_tokens");
+}
+
+#[test]
+fn what_is_not_served_is_refused_by_its_name() {
+    let image = json!({"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AA=="}});
+    let user = |block: Value| with(json!({"messages": [{"role": "user", "content": [block]}]}));
+    let assistant = |block: Value| {
+        with(json!({"messages": [
+            {"role": "user", "content": "a"},
+            {"role": "assistant", "content": [block]},
+            {"role": "user", "content": "b"},
+        ]}))
+    };
+    let tool = |extra: Value| {
+        let mut tool = weather();
+        tool.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        with(json!({"tools": [tool]}))
+    };
+    let cases: Vec<(Value, &str, &str)> = vec![
+        // Input that is not text.
+        (
+            user(image.clone()),
+            "messages[0].content[0]",
+            "'image' is not supported: images and documents",
+        ),
+        (user(json!({"type": "document", "source": {}})), "messages[0].content[0]", "'document'"),
+        (
+            user(json!({"type": "tool_result", "tool_use_id": "t", "content": [image]})),
+            "messages[0].content[0].content[0]",
+            "'image'",
+        ),
+        // Tools the server would have to run, and what they leave behind.
+        (
+            with(json!({"tools": [{"type": "web_search_20250305", "name": "web_search"}]})),
+            "tools",
+            "tools[0]: a tool of the type 'web_search_20250305' is not supported",
+        ),
+        (
+            with(json!({"tools": [{"type": "bash_20250124", "name": "bash"}]})),
+            "tools",
+            "'bash_20250124'",
+        ),
+        (
+            assistant(
+                json!({"type": "server_tool_use", "id": "s", "name": "web_search", "input": {}}),
+            ),
+            "messages[1].content[0]",
+            "'server_tool_use' is not supported: the server runs no tools",
+        ),
+        (
+            with(json!({"mcp_servers": [{"type": "url", "url": "https://x"}]})),
+            "mcp_servers",
+            "runs no tools",
+        ),
+        (tool(json!({"defer_loading": true})), "tools", "tools[0].defer_loading is not supported"),
+        (
+            tool(json!({"input_examples": [{}]})),
+            "tools",
+            "tools[0].input_examples is not supported",
+        ),
+        // A message to continue.
+        (
+            with(json!({"messages": [
+                {"role": "user", "content": "a"},
+                {"role": "assistant", "content": "{"},
+            ]})),
+            "messages[1]",
+            "continuing a message is not built",
+        ),
+        // Members nobody knows, anywhere.
+        (with(json!({"context_management": {"edits": []}})), "context_management", "does not edit"),
+        (with(json!({"top_a": 0.2})), "top_a", "top_a is not supported"),
+        (with(json!({"stop": ["x"]})), "stop", "stop_sequences"),
+        (
+            user(json!({"type": "text", "text": "a", "citations": [{"type": "char_location"}]})),
+            "messages[0].content[0]",
+            "citations is not supported",
+        ),
+        (
+            user(json!({"type": "text", "text": "a", "extra": 1})),
+            "messages[0].content[0]",
+            ".extra is not supported",
+        ),
+        (
+            with(
+                json!({"thinking": {"type": "enabled", "budget_tokens": 1024, "display": "omitted"}}),
+            ),
+            "thinking",
+            "thinking.display is not supported",
+        ),
+        (
+            with(json!({"output_config": {"format": {"type": "json_schema", "schema": {}}},
+                "tools": [weather()]})),
+            "output_config.format",
+            "cannot be combined with tools",
+        ),
+        // Shapes.
+        (with(json!({"max_tokens": 0})), "max_tokens", "at least 1"),
+        (with(json!({"messages": []})), "messages", "must not be empty"),
+        (
+            with(json!({"messages": [{"role": "system", "content": "x"}]})),
+            "messages[0].role",
+            "\"user\" or \"assistant\"",
+        ),
+        (with(json!({"messages": [{"role": "user"}]})), "messages[0].content", "is required"),
+        (
+            with(json!({"messages": [{"role": "user", "content": []}]})),
+            "messages[0].content",
+            "must not be empty",
+        ),
+        (with(json!({"system": [{"type": "image"}]})), "system[0]", "'image'"),
+        (with(json!({"stop_sequences": [""]})), "stop_sequences", "empty string"),
+        (with(json!({"stop_sequences": "END"})), "stop_sequences", "an array of strings"),
+        (
+            with(json!({"thinking": {"type": "on"}})),
+            "thinking",
+            "\"enabled\", \"adaptive\" or \"disabled\"",
+        ),
+        (
+            with(json!({"thinking": {"type": "enabled", "budget_tokens": 0}})),
+            "thinking",
+            "at least 1",
+        ),
+        (with(json!({"tool_choice": {"type": "any"}})), "tool_choice", "has no tools"),
+        (
+            with(json!({"tools": [weather()], "tool_choice": {"type": "tool", "name": "nope"}})),
+            "tool_choice",
+            "'nope', which is not among the tools",
+        ),
+        (
+            with(json!({"tools": [weather()], "tool_choice": "auto"})),
+            "tool_choice",
+            "must be an object",
+        ),
+        (
+            with(json!({"tools": [{"name": "f"}]})),
+            "tools",
+            "tools[0].input_schema must be an object",
+        ),
+        (with(json!({"tools": [{"input_schema": {}}]})), "tools", "tools[0].name"),
+        (
+            assistant(json!({"type": "tool_use", "id": "t", "name": "f", "input": "{}"})),
+            "messages[1].content[0]",
+            "input must be an object",
+        ),
+        (
+            user(json!({"type": "tool_result", "content": "x"})),
+            "messages[0].content[0]",
+            "tool_use_id is required",
+        ),
+        (with(json!({"cache_control": {"type": "forever"}})), "cache_control", "\"ephemeral\""),
+        (with(json!({"metadata": "u1"})), "metadata", "an object"),
+    ];
+    for (body, param, fragment) in cases {
+        let (named, message) = refused(body.clone());
+        assert_eq!(named, param, "{message}: {body}");
+        assert!(message.contains(fragment), "{message:?} lacks {fragment:?}");
+    }
+}
+
+fn text(reasoning: &str, content: &str) -> Piece {
+    Piece::Text(Split { reasoning: reasoning.into(), content: content.into() })
+}
+
+fn call(index: usize, name: &str) -> Piece {
+    Piece::Call { index, id: format!("toolu_x_{index}"), name: name.into() }
+}
+
+fn arguments(index: usize, json: &str) -> Piece {
+    Piece::Arguments { index, json: json.into() }
+}
+
+/// The events of a reply that came in `steps`, and its content.
+fn blocks(steps: Vec<Vec<Piece>>) -> (Vec<BlockEvent>, Content) {
+    let mut blocks = Blocks::default();
+    let mut events = Vec::new();
+    for pieces in steps {
+        events.extend(blocks.push(pieces));
+    }
+    events.extend(blocks.finish());
+    let mut content = Content::default();
+    content.take(events.clone());
+    (events, content)
+}
+
+#[test]
+fn a_reply_is_its_blocks_in_the_order_the_model_wrote_them() {
+    let (events, content) = blocks(vec![
+        vec![text("The user ", "")],
+        vec![text("wants weather.", "I will ")],
+        vec![text("", "look."), call(0, "get_weather"), arguments(0, "{\"city\":")],
+        vec![arguments(0, "\"Köln\"}"), call(1, "now"), arguments(1, "{}")],
+    ]);
+    let weather = Block::ToolUse {
+        id: "toolu_x_0".into(),
+        name: "get_weather".into(),
+        input: "{\"city\":\"Köln\"}".into(),
+    };
+    assert_eq!(
+        content.0,
+        vec![
+            Block::Thinking("The user wants weather.".into()),
+            Block::Text("I will look.".into()),
+            weather,
+            Block::ToolUse { id: "toolu_x_1".into(), name: "now".into(), input: "{}".into() },
+        ]
+    );
+    // Every block opens, gets its deltas and closes before the next opens,
+    // and a thinking block gets its signature before it closes.
+    let names: Vec<String> = events
+        .iter()
+        .map(|event| {
+            let (name, data) = block_event(event);
+            let data: Value = serde_json::from_str(&data).unwrap();
+            assert_eq!(data["type"], name);
+            let detail = match name {
+                "content_block_start" => data["content_block"]["type"].as_str().unwrap().to_owned(),
+                "content_block_delta" => data["delta"]["type"].as_str().unwrap().to_owned(),
+                _ => "stop".to_owned(),
+            };
+            format!("{}:{detail}", data["index"])
+        })
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "0:thinking",
+            "0:thinking_delta",
+            "0:thinking_delta",
+            "0:signature_delta",
+            "0:stop",
+            "1:text",
+            "1:text_delta",
+            "1:text_delta",
+            "1:stop",
+            "2:tool_use",
+            "2:input_json_delta",
+            "2:input_json_delta",
+            "2:stop",
+            "3:tool_use",
+            "3:input_json_delta",
+            "3:stop",
+        ]
+    );
+}
+
+#[test]
+fn a_reply_without_text_has_no_blocks_and_thinking_may_come_again() {
+    assert_eq!(blocks(vec![vec![], vec![text("", "")]]), (Vec::new(), Content::default()));
+    // Reasoning after a call is a block of its own.
+    let (_, content) = blocks(vec![vec![text("a", ""), call(0, "now"), text("b", "c")]]);
+    assert_eq!(
+        content.0,
+        vec![
+            Block::Thinking("a".into()),
+            Block::ToolUse { id: "toolu_x_0".into(), name: "now".into(), input: String::new() },
+            Block::Thinking("b".into()),
+            Block::Text("c".into()),
+        ]
+    );
+}
+
+#[test]
+fn the_message_has_the_blocks_the_reason_and_the_usage() {
+    let (_, content) = blocks(vec![vec![
+        text("hm", "ok"),
+        call(0, "get_weather"),
+        arguments(0, "{\"city\":\"Köln\",\"days\":3.0}"),
+        call(1, "cut"),
+        arguments(1, "{\"city\":\"Kö"),
+    ]]);
+    let head = Head { id: "msg_1".into(), model: "m".into() };
+    let usage = Usage {
+        prompt_tokens: 100,
+        completion_tokens: 7,
+        cached_prompt_tokens: 60,
+        output_hash: 0,
+    };
+    let text = head.message(&content, stop_reason("stop", 2), usage);
+    // The input is the text the model wrote, not a reading of it.
+    assert!(text.contains(r#""input":{"city":"Köln","days":3.0}}"#), "{text}");
+    let message: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(
+        message,
+        json!({
+            "id": "msg_1",
+            "type": "message",
+            "role": "assistant",
+            "model": "m",
+            "content": [
+                {"type": "thinking", "thinking": "hm", "signature": SIGNATURE},
+                {"type": "text", "text": "ok"},
+                {"type": "tool_use", "id": "toolu_x_0", "name": "get_weather",
+                 "input": {"city": "Köln", "days": 3.0}},
+                // A call the limit cut has no whole input.
+                {"type": "tool_use", "id": "toolu_x_1", "name": "cut", "input": {}},
+            ],
+            "stop_reason": "tool_use",
+            "stop_sequence": null,
+            "usage": {
+                "input_tokens": 40,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 60,
+                "output_tokens": 7,
+            },
+        })
+    );
+    assert_eq!(stop_reason("stop", 0), "end_turn");
+    assert_eq!(stop_reason("length", 0), "max_tokens");
+    assert_eq!(stop_reason("length", 1), "max_tokens");
+}
+
+#[test]
+fn a_reply_sent_back_is_the_turn_the_chat_route_would_get_back() {
+    // What the reply's blocks say, a client sends back as they are.
+    let (_, content) = blocks(vec![vec![
+        text("2 and 2\nmake 4", "Let me check."),
+        call(0, "add"),
+        arguments(0, "{\"a\":2,\"b\":2}"),
+    ]]);
+    let head = Head { id: "msg_1".into(), model: "m".into() };
+    let message: Value =
+        serde_json::from_str(&head.message(&content, "tool_use", Usage::default())).unwrap();
+    let body = with(json!({"messages": [
+        {"role": "user", "content": "2+2?"},
+        {"role": "assistant", "content": message["content"]},
+        {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "toolu_x_0", "content": "4"},
+        ]},
+    ]}));
+    assert_eq!(
+        chat(body)["messages"],
+        json!([
+            {"role": "user", "content": "2+2?"},
+            {"role": "assistant", "content": "Let me check.",
+             "reasoning_content": "2 and 2\nmake 4",
+             "tool_calls": [{"id": "toolu_x_0", "type": "function",
+                 "function": {"name": "add", "arguments": {"a": 2, "b": 2}}}]},
+            {"role": "tool", "tool_call_id": "toolu_x_0", "content": "4"},
+        ])
+    );
+}
