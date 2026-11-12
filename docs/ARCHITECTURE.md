@@ -1239,6 +1239,24 @@ penalties). Tokens the rule forces (one token allowed) are not offered as
 drafts: the lookup is the drafter that joins next to a draft block, and a
 forced token would be a third source with a chance of one; it is not built.
 
+*Cost.* Host time, on the vocabulary of the 0.8B (248,320 tokens), one core of
+the machine (`cargo run --release -p ares-grammar --example mask_cost`): reading
+the vocabulary 0.5 s, once per runtime; compiling a JSON schema of moderate size
+(eight properties, a pattern, enums, a nested object, an array) 0.7 ms; the mask
+of a step along random walks through it a median of 1 microsecond, 61 at the 90th
+percentile and 1.9 milliseconds at the longest (a step that opens something the
+engine has not seen); `json_object` a median of 2 microseconds. A GBNF grammar
+is read one character at a time, as in llama.cpp, and costs more: llama.cpp's
+`json.gbnf` takes 6.8 milliseconds a mask (compiling 1.2 ms), a grammar of a few
+literals 3 microseconds. The mask is worked out on the conductor's thread before
+the step is launched, one row after the other, so it adds to the step; working it
+out during the device's step (vLLM) is not built, and would hide the 6.8
+milliseconds of a character grammar behind a step of a large model. Merging the
+rules that are one lexeme (a string in quotes) into regular expressions was
+tried and gave nothing for `json.gbnf`, whose string rule ends in optional white
+space. The device applies the mask in the sampler, which costs what the section
+on masks above says (6 to 16 percent of the draw of the most probable token).
+
 *Errors.* A grammar or schema the engine refuses is a 400 that names the field
 and the problem; both `grammar` and `json_schema` (or `response_format`) in one
 request is a 400, where llama-server takes one of them silently. If the engine
