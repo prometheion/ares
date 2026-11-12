@@ -523,6 +523,46 @@ impl<'a, 'g> Reference<'a, 'g> {
         out
     }
 
+    /// What the mixture of experts of `layer` would read if `r` (`n` rows of
+    /// `D` values) were the residual in front of it: the read of the layer's
+    /// second mixer, `n` rows of `N` values. With the residual of an earlier
+    /// point of the model this is the input of a router applied early, which
+    /// is what the measurements of read-ahead predictors compare.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `layer` is out of range or `r` is not `n` rows.
+    pub fn expert_input(&self, layer: usize, r: &[f32], n: usize) -> Vec<f32> {
+        assert_eq!(r.len(), n * self.config.wide(), "r must be {n} rows of the residual");
+        self.read(&self.weights.layers[layer].ffn_mixer, r, n).0
+    }
+
+    /// The logits of the router of `layer` for the rows `m` (`n` rows of `N`
+    /// values), `n` rows of one logit per expert.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `layer` is out of range or `m` is not `n` rows.
+    pub fn router_logits(&self, layer: usize, m: &[f32], n: usize) -> Vec<f32> {
+        matmul(self.threads, &self.weights.layers[layer].moe.router, m, n)
+    }
+
+    /// The residual behind the first half of `layer`: `r`, the residual that
+    /// enters the layer (behind the n-gram block, in the layer that has one),
+    /// with `core`, the output of the layer's recurrent or attention part
+    /// (`n` rows of `N` values), written back through the layer's first mixer.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `layer` is out of range or the rows are not `n`.
+    pub fn after_core(&self, layer: usize, r: &[f32], core: &[f32], n: usize) -> Vec<f32> {
+        assert_eq!(r.len(), n * self.config.wide(), "r must be {n} rows of the residual");
+        let (_, inj) = self.read(&self.weights.layers[layer].attn_mixer, r, n);
+        let mut out = r.to_vec();
+        self.write(&mut out, core, &inj, n);
+        out
+    }
+
     /// One layer over the rows of `r`, in place (section 1 of the
     /// specification).
     fn run_layer(
