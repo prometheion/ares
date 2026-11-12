@@ -577,6 +577,18 @@ fn run() -> Result<(), AnyError> {
         );
     }
     println!("  RAM tier: {ram_slots} slots");
+    let store = session.store();
+    let transit: Vec<String> = (0..session.devices().len())
+        .map(|device| {
+            let layer = (0..store.n_layers()).find(|layer| store.place(*layer).0 == device);
+            layer.and_then(|layer| store.transit_pool(layer)).map_or(0, |pool| pool.2).to_string()
+        })
+        .collect();
+    println!(
+        "  transit: {} slots per device, staging {} slots",
+        transit.join(" | "),
+        store.staging_slots()
+    );
 
     if !args.profile.is_empty() {
         let mut counts = vec![vec![0u32; c.experts.count]; c.n_layer];

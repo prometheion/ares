@@ -698,6 +698,11 @@ impl<D: SlotDevice> ExpertStore<D> {
         &mut self.devices[device]
     }
 
+    /// The layers of the store.
+    pub fn n_layers(&self) -> usize {
+        self.layers.len()
+    }
+
     /// The device that runs `layer` and the layer's pool among that device's.
     pub fn place(&self, layer: usize) -> (usize, usize) {
         (self.layers[layer].device, self.layers[layer].device_pool)

@@ -435,14 +435,12 @@ impl<D: SlotDevice> ExpertStore<D> {
             return Ok(false);
         }
         if vram.n_free() == 0 {
+            // The member that would leave: one the step has no use for, and
+            // colder than the newcomer by the margin.
             let rule = SwapRule::default();
-            let coldest = (0..heat.len() as u32)
-                .filter(|member| vram.contains(*member))
-                .map(|member| heat[member as usize])
-                .min_by(f32::total_cmp)
-                .unwrap_or(0.0);
-            if own <= rule.margin * coldest + rule.bonus {
-                return Ok(false);
+            match vram.victim(self.step, heat) {
+                Some((_, worth, false)) if own > rule.margin * worth + rule.bonus => {}
+                _ => return Ok(false),
             }
         }
         let started = self.vram.sets[layer].start_read(expert, Want::Demand, self.step, heat);
@@ -484,16 +482,17 @@ impl<D: SlotDevice> ExpertStore<D> {
         let worth = self.ram_worth.layer(layer);
         let ram = &self.ram.sets[layer];
         let rule = SwapRule::default();
-        let coldest = (0..worth.len() as u32)
-            .filter(|member| ram.contains(*member))
-            .map(|member| worth[member as usize])
-            .min_by(f32::total_cmp)
-            .unwrap_or(0.0);
         let heat = self.heat.layer(layer)[expert as usize];
-        // Nothing the heat has not seen is kept, and a member gives way only to an expert
-        // that is hotter by the margin.
-        if heat <= 0.0 || (ram.n_free() == 0 && heat <= rule.margin * coldest + rule.bonus) {
+        // Nothing the heat has not seen is kept, and a member gives way only
+        // to an expert that is hotter by the margin.
+        if heat <= 0.0 {
             return;
+        }
+        if ram.n_free() == 0 {
+            match ram.victim(self.step, worth) {
+                Some((_, cold, false)) if heat > rule.margin * cold + rule.bonus => {}
+                _ => return,
+            }
         }
         let started = self.ram.sets[layer].start_read(expert, Want::Demand, self.step, worth);
         let Start::Slot(swap) = started else { return };

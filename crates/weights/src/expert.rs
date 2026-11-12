@@ -534,6 +534,28 @@ impl SlotSet {
         Start::Slot(Swap { slot: slot as u32, evict: Some(victim), load: expert })
     }
 
+    /// The member a demand read would evict now, with what it is worth
+    /// ([`SlotSet::start_read`]'s order) and whether step `step` still needs
+    /// it. `None` when a slot is empty or no member may go: for a caller that
+    /// brings an expert in only if it is worth more than what leaves.
+    pub fn victim(&self, step: u64, heat: &[f32]) -> Option<(u32, f32, bool)> {
+        assert_eq!(heat.len(), self.slot_of.len(), "one heat value per expert");
+        if self.slots.contains(&Slot::Empty) {
+            return None;
+        }
+        self.slots
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, s)| match s {
+                Slot::Holds(e) if self.held[*e as usize] == 0 => Some((slot, *e)),
+                _ => None,
+            })
+            .min_by(|a, b| self.eviction_order(*a, *b, step, heat))
+            .map(|(slot, expert)| {
+                (expert, self.worth(slot, expert, heat), self.needed(expert, step))
+            })
+    }
+
     /// The first of two members to go: not needed before needed, then the
     /// lower worth, then the higher expert number.
     fn eviction_order(
@@ -655,6 +677,31 @@ impl SlotSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_victim_is_the_member_a_demand_read_would_evict() {
+        let heat = [0.0, 5.0, 2.0, 9.0];
+        let mut set = SlotSet::new(4, 2);
+        assert_eq!(set.victim(1, &heat), None, "a slot is empty");
+        for expert in [1, 2] {
+            let Start::Slot(swap) = set.start_read(expert, Want::Demand, 1, &heat) else {
+                unreachable!("free slots");
+            };
+            set.commit(&swap);
+        }
+        // Step 1 routed both: the colder one is a demand read's last resort.
+        assert_eq!(set.victim(1, &heat), Some((2, 2.0, true)));
+        // A later step needs neither.
+        assert_eq!(set.victim(2, &heat), Some((2, 2.0, false)));
+        // A member whose bytes are being copied out does not go.
+        set.hold(2);
+        assert_eq!(set.victim(2, &heat), Some((1, 5.0, false)));
+        set.release(2);
+        let Start::Slot(swap) = set.start_read(3, Want::Demand, 2, &heat) else {
+            unreachable!("expert 2 can go");
+        };
+        assert_eq!(swap.evict, Some(2));
+    }
 
     #[test]
     fn a_held_member_is_never_evicted() {
