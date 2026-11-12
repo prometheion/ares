@@ -57,6 +57,8 @@ pub(crate) struct CallSplitter {
     gate: Option<String>,
     /// How many calls have begun.
     calls: usize,
+    /// The white space that stood before the trigger of the call being read.
+    layout: String,
     /// The schema of the tool being called.
     schema: Option<Value>,
     /// How many arguments the call has so far.
@@ -120,6 +122,7 @@ impl CallSplitter {
             buffer: String::new(),
             gate: gate.filter(|tag| !tag.is_empty()),
             calls: 0,
+            layout: String::new(),
             schema: None,
             arguments: 0,
             finished: false,
@@ -205,7 +208,9 @@ impl CallSplitter {
         let trigger = self.format.trigger();
         if let Some(at) = self.buffer.find(trigger) {
             // The white space before a call is the template's.
-            Self::content(parts, self.buffer[..at].trim_end_matches(is_space));
+            let text = self.buffer[..at].trim_end_matches(is_space);
+            self.layout = self.buffer[text.len()..at].to_owned();
+            Self::content(parts, text);
             self.buffer.drain(..at + trigger.len());
             self.state = State::Name;
             return true;
@@ -229,8 +234,9 @@ impl CallSplitter {
     }
 
     /// The buffer is not a call after all: `seen`, the markup read so far, is
-    /// content, and so is what follows.
+    /// content with the white space before it, and so is what follows.
     fn not_a_call(&mut self, parts: &mut Vec<Part>, seen: &str) -> bool {
+        Self::content(parts, &std::mem::take(&mut self.layout));
         Self::content(parts, seen);
         self.state = State::Text;
         true

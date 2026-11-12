@@ -72,8 +72,19 @@ impl ValueTypes {
     pub fn of(parameters: Option<&Value>, key: &str) -> Self {
         let Some(root) = parameters else { return Self(Self::ALL) };
         match property(root, key) {
-            Some(schema) => Self(types(schema, root, 0)),
+            Some(schema) => Self::of_schema(schema, root),
             None => Self(Self::ALL),
+        }
+    }
+
+    /// The kinds `schema` allows, inside the tool's schema `root`. A schema
+    /// that contradicts itself allows no kind and no value; it is read as
+    /// one that says nothing, so that the grammar and the reader of the reply
+    /// agree on how its value is written.
+    fn of_schema(schema: &Value, root: &Value) -> Self {
+        match types(schema, root, 0) {
+            0 => Self(Self::ALL),
+            kinds => Self(kinds),
         }
     }
 
@@ -267,8 +278,8 @@ impl CallRule<'_> {
                 )));
             }
             let open = literal(&format!("{}{key}{}", format.param_open, format.key_close));
-            let kinds = ValueTypes(types(schema, root, 0));
-            let value = if !kinds.has_string() && kinds.0 != 0 {
+            let kinds = ValueTypes::of_schema(schema, root);
+            let value = if !kinds.has_string() {
                 rules.push(format!("j{index}_{at}: %json {}", embedded(schema, root)?));
                 format!("j{index}_{at} {}", literal(&format.param_close))
             } else if let Some(strings) = choices(schema, root).filter(|_| kinds.only_string()) {
@@ -371,6 +382,9 @@ mod tests {
         assert_eq!(of("not there"), ValueTypes(ValueTypes::ALL));
         assert!(of("union").allows(&json!(true)) && of("union").allows(&json!([])));
         assert!(!of("both").has_string() && of("both").allows(&json!(2)));
+        // A schema that allows nothing is read as one that says nothing.
+        let never = json!({"properties": {"x": {"type": "string", "enum": [1]}}});
+        assert_eq!(ValueTypes::of(Some(&never), "x"), ValueTypes(ValueTypes::ALL));
         assert_eq!(ValueTypes::of(None, "s"), ValueTypes(ValueTypes::ALL));
     }
 }

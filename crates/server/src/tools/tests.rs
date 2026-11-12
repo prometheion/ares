@@ -218,7 +218,7 @@ fn a_call_the_end_cuts_stays_as_far_as_it_came() {
 fn what_is_not_a_call_in_the_format_is_content() {
     // The trigger and then something else.
     let got = sorted("See <tool_call> for the tag.");
-    assert_eq!((got.content.as_str(), got.calls.len()), ("See<tool_call> for the tag.", 0));
+    assert_eq!((got.content.as_str(), got.calls.len()), ("See <tool_call> for the tag.", 0));
     // A call that goes on with what is neither an argument nor its end.
     let got = sorted("<tool_call>\n<function=now>\nand then text");
     assert_eq!(calls(&got), [call("now", "{}")]);
