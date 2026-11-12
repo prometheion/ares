@@ -48,6 +48,14 @@ fn runtime(model: &Arc<SyntheticModel>, speculation: bool) -> Runtime {
     runtime_with(model, config(speculation, 4096), |e| e)
 }
 
+/// A context as large as the pool. A request with no limit of its own then
+/// generates for seconds of steps and not for a tenth of one, so a test that
+/// cancels it, shuts it down or sends something next to it finds it running
+/// however late the test's thread gets to it.
+fn roomy(c: &mut SyntheticConfig) {
+    c.context_length = 65_536;
+}
+
 /// A model whose text loops and changes its loop every 40 positions, and whose
 /// draft block gets the first links right more often than the last.
 fn repeating(c: &mut SyntheticConfig) {
@@ -158,7 +166,7 @@ fn a_text_another_request_wrote_is_drafted_from_the_corpus_all_requests_share() 
 
 #[test]
 fn cancelling_frees_the_pages_at_once() {
-    let model = model(|_| {});
+    let model = model(roomy);
     let rt = runtime_with(&model, config(true, 4096), |e| e.with_delay(Duration::from_micros(500)));
     cancel_frees_pages_and_spares_the_others(&rt);
 }
@@ -293,7 +301,7 @@ fn shutdown_ends_requests_in_flight_and_joins_the_conductor() {
 
 #[test]
 fn shutting_down_while_a_step_is_held_waits_for_it_and_then_ends_everything() {
-    let model = model(|_| {});
+    let model = model(roomy);
     let gate = Gate::new();
     // A little delay per step, so that the request is still running when
     // the gate closes.
@@ -319,7 +327,7 @@ fn shutting_down_while_a_step_is_held_waits_for_it_and_then_ends_everything() {
 
 #[test]
 fn dropping_the_runtime_ends_requests_too() {
-    let model = model(|_| {});
+    let model = model(roomy);
     let rt = runtime_with(&model, config(true, 4096), |e| e.with_delay(Duration::from_millis(1)));
     let handle = start(&rt, request("dropped", None)).unwrap();
     handle.wait_for_text(1);
@@ -385,7 +393,7 @@ fn a_sink_that_refuses_cancels_the_request_and_frees_its_pages() {
 
 #[test]
 fn an_id_in_use_is_refused_by_a_terminal_event() {
-    let model = model(|_| {});
+    let model = model(roomy);
     let rt = runtime_with(&model, config(true, 4096), |e| e.with_delay(Duration::from_millis(1)));
     let first = request("first", None);
     let id = first.id;
@@ -403,11 +411,10 @@ fn an_id_in_use_is_refused_by_a_terminal_event() {
 fn long_prompts_are_read_in_chunks_next_to_generation_and_say_the_same() {
     let mut rng = Rng(42);
     let long = rng.prompt(300);
-    // A context as large as the pool: a request with no limit generates for
-    // some twenty seconds of steps, far longer than the test goes on.
+    // The request that generates has no limit and outlasts the test.
     let model = model(|c| {
+        roomy(c);
         c.max_rows = 64;
-        c.context_length = 65_536;
     });
 
     // Reference: the long prompt in few big steps, alone.
@@ -629,8 +636,8 @@ fn watch(steps: &Steps) -> impl FnMut(&ares_runtime::RecordView<'_>) + Send + 's
 fn generating(steps: &Steps) -> (Runtime, Handle) {
     let model = model(|c| {
         repeating(c);
+        roomy(c);
         c.max_rows = 128;
-        c.context_length = 65_536;
     });
     let observer = watch(steps);
     let rt = runtime_with(&model, config(true, 4096), |e| {
