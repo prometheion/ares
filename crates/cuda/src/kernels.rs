@@ -1032,6 +1032,16 @@ impl Kernels {
             .collect()
     }
 
+    /// The bytes of a line of the devices' caches, and where a buffer of f16
+    /// activations ([`PrefillPath::F16`], [`PrefillPath::F16Flush`]) should start: at a
+    /// multiple of it. The rows of that form lie a whole number of lines apart, counted
+    /// from the start of the buffer, and a step of the tile kernels reads 64 values of a
+    /// row, which is one line. From a start that is 64 bytes off a line every step reads
+    /// two, and the products are slower (docs/ARCHITECTURE.md, "The token embedding of
+    /// `qwen35`": 1 % of a prompt on an RTX 3060). 16 bytes are all the kernels ask for;
+    /// the 8-bit form, of which a step reads 64 bytes of a row, is as fast from either.
+    pub const ACTIVATION_LINE: u64 = 128;
+
     /// The bytes [`Kernels::prepare_prefill_activations`] writes for `n_rows`
     /// rows of `n_in` activations in the format of `path`.
     pub fn prefill_activation_bytes(path: PrefillPath, n_in: u32, n_rows: u32) -> u64 {
@@ -1041,8 +1051,9 @@ impl Kernels {
                 // The rows lie a whole, odd number of lines of 128 bytes apart
                 // (`ares_act_f16_pitch` in `kernels/mm.cuh`), so that the same place of
                 // many rows does not fall into one set of the caches.
-                let pitch = ((u64::from(n_in) * 2).div_ceil(128) + 1) | 1;
-                let values = pitch * 128 * u64::from(n_rows);
+                let line = Self::ACTIVATION_LINE;
+                let pitch = ((u64::from(n_in) * 2).div_ceil(line) + 1) | 1;
+                let values = pitch * line * u64::from(n_rows);
                 // Then, at the next multiple of 16 bytes, one f32 per row: the power of
                 // two the row was divided by.
                 values.next_multiple_of(16) + 4 * u64::from(n_rows)
@@ -1063,7 +1074,8 @@ impl Kernels {
     /// On the stream's device and alive until the launch has run: `x` must
     /// address `n_rows * n_in` f32 values and `out` the
     /// [`Kernels::prefill_activation_bytes`] of the path, 16-byte aligned
-    /// (checked), not overlapping `x`.
+    /// (checked), not overlapping `x`. The f16 paths are fastest when `out`
+    /// starts on a line ([`Kernels::ACTIVATION_LINE`]).
     pub unsafe fn prepare_prefill_activations(
         &self,
         stream: &Stream,

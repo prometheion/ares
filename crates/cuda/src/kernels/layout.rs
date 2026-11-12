@@ -514,7 +514,8 @@ impl Kernels {
     ///
     /// `x` must address the rows and `out`
     /// [`Kernels::activation_bytes`]`(form, n_in, n_rows)` bytes, 16-byte aligned, on
-    /// the stream's device, valid until the launch has run.
+    /// the stream's device, valid until the launch has run. The products that read the
+    /// f16 form are fastest when `out` starts on a line ([`Kernels::ACTIVATION_LINE`]).
     pub unsafe fn prepare_activations(
         &self,
         stream: &Stream,

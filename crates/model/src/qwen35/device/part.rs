@@ -324,6 +324,28 @@ impl std::fmt::Debug for StepEnv<'_> {
     }
 }
 
+/// Hands out the buffers of a scratch, one behind the other, each from the
+/// start of a line of the devices' caches ([`Kernels::ACTIVATION_LINE`]).
+///
+/// The f16 activations have to start there: a step of the tile kernels reads
+/// one line of each of their rows from a start on a line and two from a start
+/// between two, which made a prompt on the second device of a tensor split
+/// 1 % slower when 64 bytes came to lie in front of its buffers. So where a
+/// buffer starts does not depend on the sizes of the ones in front of it.
+#[derive(Debug, Default)]
+struct Carve {
+    len: u64,
+}
+
+impl Carve {
+    /// The offset of the next buffer, of `bytes` bytes (at least 16).
+    fn take(&mut self, bytes: u64) -> u64 {
+        let at = self.len;
+        self.len = (at + bytes.max(16)).next_multiple_of(Kernels::ACTIVATION_LINE);
+        at
+    }
+}
+
 /// Offsets of the step scratch.
 #[derive(Clone, Copy, Debug, Default)]
 struct Scratch {
@@ -752,21 +774,18 @@ impl Part {
 
         // The scratch of a step.
         let mut s = Scratch::default();
-        let mut len = 0u64;
-        let mut take = |bytes: u64| {
-            let at = len;
-            len = (len + bytes.max(16)).next_multiple_of(64);
-            at
-        };
+        let mut carve = Carve::default();
+        let mut take = |bytes: u64| carve.take(bytes);
         let rope_pairs = (c.attention.rope.dim / 2) as u64;
-        // The rows of the embedding table the host staged (`embed.rs`).
+        // The rows of the embedding table the host staged (`embed.rs`). A part
+        // that stages none has no such buffer: nothing in front of the others.
         let embed = match &w.embedding {
             Some(e) if e.stages() => {
                 Some(HostRows::open(device, &weights.token_embd, opts.max_rows)?)
             }
             _ => None,
         };
-        s.stage = take(embed.as_ref().map_or(0, |host| rows * host.row_bytes() as u64));
+        s.stage = embed.as_ref().map_or(0, |host| take(rows * host.row_bytes() as u64));
         s.x = take(rows * d * 4);
         s.xn = take(rows * d * 4);
         s.p = take(rows * d * 4);
@@ -827,7 +846,7 @@ impl Part {
         s.attn_state = take(state_slots);
         s.attn_state_bytes = state_slots;
         s.status = take(16);
-        s.len = len;
+        s.len = carve.len;
 
         ledger.reserve("qwen35 step scratch", s.len)?;
         let state_bytes = (slot_bytes * u64::from(max_slots)).max(64);
@@ -2382,5 +2401,30 @@ impl Part {
         }
         stream.synchronize()?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every buffer of a scratch starts on a line, whatever the sizes of the
+    /// buffers in front of it, and none reaches into the next.
+    #[test]
+    fn the_buffers_of_a_scratch_start_on_a_line() {
+        let line = Kernels::ACTIVATION_LINE;
+        let sizes = [0, 1, 16, 63, 64, 65, 127, 128, 192, 2200, 17600, 1_126_400, 10_485_760];
+        for first in sizes {
+            let mut carve = Carve::default();
+            let mut end = 0;
+            for bytes in std::iter::once(first).chain(sizes) {
+                let at = carve.take(bytes);
+                assert_eq!(at % line, 0, "{bytes} bytes behind {first} start at {at}");
+                assert!(at >= end, "{bytes} bytes at {at} lie in the buffer that ends at {end}");
+                end = at + bytes.max(16);
+            }
+            assert!(carve.len >= end);
+            assert_eq!(carve.len % line, 0);
+        }
     }
 }
