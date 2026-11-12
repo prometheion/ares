@@ -430,6 +430,61 @@ async fn the_items_of_a_conversation_reach_the_template_as_its_turns() {
 }
 
 #[tokio::test]
+async fn a_request_as_codex_writes_it_is_served() {
+    // The members Codex sends with every request, as its source has them:
+    // no instructions (they stand first in the input), a stream, the
+    // include, its own bookkeeping, and the items of a turn sent back
+    // without their ids.
+    let text = |text: &str| json!([{"type": "input_text", "text": text}]);
+    let body = json!({
+        "model": "mock",
+        "stream": true,
+        "input": [
+            {"type": "message", "role": "developer", "content": text("You are a coding agent.")},
+            {"type": "message", "role": "developer", "content": text("Sandbox: read-only.")},
+            {"type": "message", "role": "user", "content": text("<cwd>/srv</cwd>")},
+            {"type": "message", "role": "user", "content": text("How is the weather in Köln?")},
+            {"type": "reasoning", "summary": [], "encrypted_content": null, "content": [
+                {"type": "reasoning_text", "text": "I look it up."},
+            ]},
+            {"type": "function_call", "name": "get_weather", "call_id": "call_1",
+             "arguments": "{\"city\":\"Köln\"}"},
+            {"type": "function_call_output", "call_id": "call_1", "output": "12 °C"},
+        ],
+        "tools": tools(),
+        "tool_choice": "auto",
+        "parallel_tool_calls": false,
+        "reasoning": {"effort": "medium"},
+        "store": false,
+        "include": ["reasoning.encrypted_content"],
+        "prompt_cache_key": "0199a213-81c0-7800-8aa1-bbab2a035a53",
+        "client_metadata": {"x-codex-installation-id": "7"},
+    });
+    let (engine, app) = serve(says(&format!("{THINKS}Mild."), 4, FinishReason::Stop));
+    let response = post(&app, RESPONSES, &body.to_string()).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = assemble(&events(&body_text(response).await));
+    assert_eq!((&response["status"], &response["store"]), (&json!("completed"), &json!(false)));
+    assert_eq!(response["output"][1]["content"][0]["text"], "Mild.");
+
+    let request = engine.submitted().remove(0);
+    let Prompt::Chat { messages, variables, .. } = &request.prompt else { panic!() };
+    let turns: Vec<_> = messages.iter().map(|m| (m.role, m.content.as_str())).collect();
+    assert_eq!(
+        turns,
+        [
+            (Role::System, "You are a coding agent.\n\nSandbox: read-only."),
+            (Role::User, "<cwd>/srv</cwd>"),
+            (Role::User, "How is the weather in Köln?"),
+            (Role::Assistant, ""),
+            (Role::Tool, "12 °C"),
+        ]
+    );
+    assert_eq!(messages[3].reasoning_content.as_deref(), Some("I look it up."));
+    assert_eq!(variables, &[("reasoning_effort".to_owned(), Json::String("medium".into()))]);
+}
+
+#[tokio::test]
 async fn tools_reach_the_template_and_the_reply_gets_the_rule_of_the_tool_choice() {
     let after_reasoning = Start::AfterReasoning { open: None, close: "</think>".into() };
     let lark = |request: &GenerateRequest| match &request.structure.as_ref().unwrap().shape {
