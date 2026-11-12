@@ -24,7 +24,7 @@ mod common;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use ares_api::{BiasKey, LogitBias, LogprobRequest, SamplerKind, Sampling};
+use ares_api::{BiasKey, FinishReason, LogitBias, LogprobRequest, SamplerKind, Sampling};
 use ares_cuda::{Device, Wait, device_count};
 use ares_runtime::{
     GpuConfig, Runtime, RuntimeConfig, Split, SyntheticConfig, SyntheticModel, TokenFilter,
@@ -448,9 +448,23 @@ fn every_sampler_feature_gives_the_same_tokens_with_and_without_drafts_on_every_
         assert_eq!(start_filtered(&runtime, r, Sliding).unwrap().finish(), expected);
         let d = since(&snapshot(&runtime), &before);
         assert!(d["accepted"] > 10, "drafts are accepted under a filter ({d:?})");
+        runtime.shutdown();
+        drop(runtime);
+
         // A grammar, which refuses drafts as well as picks: the mask of every
         // row of a window is the mask of its own path, and a draft the grammar
         // forbids is cut. The text is the grammar's, with drafts and without.
+        //
+        // The grammar is whole after 140 tokens, and then nothing but the end
+        // of the reply may follow. The model above has no token that ends a
+        // reply, and a request for more than 140 tokens fails on it by name
+        // (`a_reply_the_grammar_cannot_end_ends_in_an_error_and_not_in_free_text`
+        // in `tests/structured.rs`). This one has the token beyond the bytes,
+        // which the last word of a mask holds alone: the mask after the 140
+        // tokens allows that token only, and the reply ends there by itself.
+        let mut ending = drafting(split, devices);
+        ending.model.eos = Some(256);
+        let runtime = start(ending);
         let grammar = ares_api::Structure::new(ares_api::Shape::Gbnf(
             "root ::= (\"ab\" | \"cd\"){20} [a-f]{100}".into(),
         ));
@@ -468,12 +482,23 @@ fn every_sampler_feature_gives_the_same_tokens_with_and_without_drafts_on_every_
             expected.text
         );
         assert!(expected.text.chars().all(|c| ('a'..='f').contains(&c)), "{}", expected.text);
+        assert_eq!(
+            (expected.text.len(), expected.usage.completion_tokens, expected.finish),
+            (140, 141, FinishReason::Stop),
+            "the grammar's 140 tokens and the token that ends the reply: {}",
+            expected.text
+        );
         let before = snapshot(&runtime);
         r.id = fresh_id();
         r.draft = true;
         assert_eq!(run_one(&runtime, r), expected, "the text of a grammar, with drafts");
         let d = since(&snapshot(&runtime), &before);
+        eprintln!(
+            "RES a grammar on {split:?}: {} rows of drafts verified, {} accepted, in {} steps",
+            d["draft_rows"], d["accepted"], d["steps"]
+        );
         assert!(d["draft_rows"] > 0, "windows verified drafts under a grammar ({d:?})");
+        assert!(d["accepted"] > 10, "drafts are accepted under a grammar ({d:?})");
     });
 }
 
