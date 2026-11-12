@@ -54,6 +54,11 @@ const EPS: f32 = 1e-5;
 pub struct SyntheticConfig {
     /// The model's name for `GenerateRequest::model`.
     pub name: String,
+    /// What the model declares about its chat template (it has none: a
+    /// conversation is rendered as lines of `role: text`). A test sets it to
+    /// have the front end read the replies as those of a model that thinks or
+    /// calls tools.
+    pub chat: Option<ares_api::ChatFormat>,
     pub split: Split,
     /// How many devices the model spans; 1 unless split.
     pub devices: usize,
@@ -127,6 +132,7 @@ impl SyntheticConfig {
     pub fn realistic(split: Split, devices: usize) -> Self {
         Self {
             name: "synthetic".to_owned(),
+            chat: None,
             split,
             devices: if split == Split::Single { 1 } else { devices },
             width: 5120,
@@ -469,6 +475,10 @@ impl Model for SyntheticModel {
 
     fn ends(&self, token: u32) -> bool {
         self.config.eos == Some(token)
+    }
+
+    fn chat_format(&self) -> Option<ares_api::ChatFormat> {
+        self.config.chat.clone()
     }
 
     /// One token per byte. A character of the model's own alphabet (what
