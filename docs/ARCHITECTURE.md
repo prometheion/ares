@@ -1085,7 +1085,8 @@ probabilities with drafts as without them (a request that says `"draft": false`
 is the one to compare with), and a request does not change what the requests in
 the same steps get. The synthetic model of `ares-runtime`, whose device part
 drafts what it has seen the model pick, proves it bit for bit on every
-placement, with a rule about the tokens as well
+placement, with a rule about the tokens and with a grammar that ends its reply
+as well
 (`every_sampler_feature_gives_the_same_tokens_with_and_without_drafts_on_every_placement`
 and `requests_with_different_settings_in_one_step_do_not_affect_each_other_on_every_placement`
 in `crates/runtime/tests/gpu.rs`), and `crates/runtime/tests/sampling.rs` checks
@@ -1230,7 +1231,14 @@ thinking; this server binds all three after the reasoning, and
 `enable_thinking: false` gives the other behaviour. The answer starts at the
 token after the closing tag: the blank line the template writes there is not
 allowed to the model, and a closing tag that shares a token with the start of
-the answer is not checked against the rule for the rest of that token.
+the answer is not checked against the rule for the rest of that token. With the
+0.8B (`crates/server/tests/real_structured.rs`) the thinking under a
+`response_format` is the thinking of the same request without one, character
+for character, and the answer after it obeys the schema. When the thinking
+ends is the model's business: taking the most probable token, the 0.8B thinks
+about the question of that test in a loop to any limit, with the rule and
+without, so the test puts a bias on the token of the closing tag, the least
+of a ladder with which the reply ends by itself (1 for the 0.8B).
 
 *A rule on a trigger.* A `Structure` may name a trigger: the answer is then
 free from where the rule would start until its text contains the trigger, and
@@ -1301,8 +1309,24 @@ drafts accepted and took 60 steps, and one of 310 free tokens and a call of 42
 took 89; the same 310 tokens without a rule had 255 accepted in 55 steps, and
 the two replies without drafts took 316 and 352 steps. The same file puts the
 binding token at every pick of a window in turn, for both kinds of rule, and has
-a filter that is free and bound in turn, after which the drafts come back. No
-model was run for this: what it gives on the 27B is not measured.
+a filter that is free and bound in turn, after which the drafts come back.
+
+On the devices the synthetic model shows the same on every placement
+(`a_rule_that_is_free_in_stretches_takes_the_models_drafts_on_every_placement`
+in `crates/runtime/tests/gpu.rs`: a rule that binds the last three of every 7,
+10 or 13 tokens, on a second runtime of a model whose draft block has seen the
+reply): of a reply of 150 tokens, 22 to 30 windows took the block's drafts and
+56 to 92 of its drafts were accepted, and the reply is the one without drafts.
+On the 27B over both cards (`the_27b_calls_the_same_with_drafts_and_without`
+in `crates/server/tests/real_tools.rs`) a request with tools whose reply thinks
+and then calls (100 tokens) had 57 of the block's drafts verified and 40
+accepted, next to 32 and 29 of the lookup's, and was the reply without drafts
+token for token; the server reported 84 tokens a second for it and 31 for the
+same request without drafts. That is one run of each, with a lookup that had
+the text of two calls before it, and no benchmark. A reply that is a call from
+its first token (the same test, thinking off) takes none of the block's
+drafts, as the rule binds all of it: 20 of 27 and 37 of 37 of the lookup's
+were accepted there.
 
 Under a bound rule the model's drafts are not taken. A window verified without
 masks could be kept as far as each pick is a token the mask of its row allows,
@@ -3469,9 +3493,17 @@ enforced here and any text is accepted there; the white space between the
 content or the reasoning and a call is part of neither here. The legacy
 `functions` and `function_call` are refused.
 The tests with real models (`crates/server/tests/real_tools.rs`: the 0.8B on
-one card, the 27B on two) are written and have not been run; the one of a call
-inside the thinking bans the token of `</think>` with a `logit_bias`, so that a
-model that wants to call has to open the call while it thinks.
+one card, the 27B on two) pass. Whether a model opens a call inside its
+thinking is the model's business, so the test of that does not wait for it: it
+bans the token of `</think>` with a `logit_bias` and puts a bias on the token
+of the marker, the least of a ladder with which the reply has a call, and
+offers tools without an argument of free text (a string may hold the marker,
+and the bias would write it there). Under the ban alone the 0.8B thinks on to
+the limit and never writes the marker. With a bias of 6 on the marker (8 for a
+sampled reply) it thinks, opens the call inside its thinking, and the call
+comes back with the reasoning before it, the same raw, streamed and without
+drafts. The last step of the ladder is more than two logits are apart, so a
+model that follows no smaller one has the marker as its first token.
 
 **The Messages API.** `POST /v1/messages` is Anthropic's Messages API. A
 request is served as the chat request that asks the same: the `anthropic`
@@ -3575,8 +3607,7 @@ between them, moves the text of a user turn before its tool results, reads
 it does not know, passes images on, and enforces `budget_tokens` in its
 sampler. Its `stop_reason` is `end_turn` for a stop string as well, but it
 names the string in `stop_sequence`. The tests with a real model
-(`crates/server/tests/real_messages.rs`, the 0.8B on one card) are written and
-have not been run.
+(`crates/server/tests/real_messages.rs`, the 0.8B on one card) pass.
 
 **The Responses API.** `POST /v1/responses` is OpenAI's Responses API,
 without state. A request is served as the chat request that asks the same, as
@@ -3735,7 +3766,7 @@ tools (a tool that takes free text), and a `text.format` next to tools that
 may be called (the reply follows one rule, as on the chat route). What Codex
 sends was read in its source and not tried against a running Codex. The
 tests with a real model (`crates/server/tests/real_responses.rs`, the 0.8B on
-one card) are written and have not been run.
+one card) pass.
 
 For a mixture of experts (`qwen4exp`) the plan is another one: where the
 layers go (`--split tensor`: both devices on every layer, `layer`: a range
