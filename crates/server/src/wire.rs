@@ -902,6 +902,12 @@ fn text_prompt(fields: &Fields<'_>) -> Result<Prompt, ApiError> {
     }
 }
 
+/// The answer of a route that counts the tokens of a prompt, in the shape
+/// OpenAI's `/v1/responses/input_tokens` has.
+pub(crate) fn input_tokens(tokens: u32) -> String {
+    format!(r#"{{"object":"response.input_tokens","input_tokens":{tokens}}}"#)
+}
+
 /// Seconds since the Unix epoch, for `created`.
 pub(crate) fn unix_time() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
@@ -1198,7 +1204,7 @@ struct Completion<'a> {
 /// draft counts are left out for a request that did not run alone, because
 /// the engine counts drafts for all requests together.
 #[derive(Serialize)]
-struct TimingsBody {
+pub(crate) struct TimingsBody {
     prompt_n: u32,
     prompt_ms: f64,
     prompt_per_second: Option<f64>,

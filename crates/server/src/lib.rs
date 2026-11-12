@@ -9,6 +9,8 @@
 //! `/health` and `/metrics`, into a server of Anthropic's Messages API on
 //! `POST /v1/messages` and `/v1/messages/count_tokens` (the `anthropic`
 //! module: a Messages request runs as the chat request that asks the same),
+//! with `/v1/chat/completions/input_tokens`, which counts the tokens of a
+//! chat request and generates nothing,
 //! and into a System One server on
 //! `POST /v1/systemone`. The HTTP side holds no model knowledge. It parses and
 //! checks the request, hands a [`ares_api::GenerateRequest`] to the engine and
@@ -129,6 +131,7 @@ fn routes_over(engine: Arc<dyn Engine>, config: Config, stop: Stop) -> Router {
             "/v1/messages/count_tokens",
             post(anthropic::count_tokens).fallback(anthropic::method_not_allowed),
         )
+        .route("/v1/chat/completions/input_tokens", post(routes::chat_input_tokens))
         .fallback(routes::not_found)
         .method_not_allowed_fallback(routes::method_not_allowed)
         .with_state(routes::App { engine, config, flight, stop })

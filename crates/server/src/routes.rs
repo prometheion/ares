@@ -65,6 +65,24 @@ pub(crate) async fn completions(State(app): State<App>, request: Request) -> Res
     completion(app, request, Endpoint::Completions).await
 }
 
+/// `POST /v1/chat/completions/input_tokens`: the tokens of the prompt a chat
+/// request comes to. The body is read as `/v1/chat/completions` reads it,
+/// and nothing is generated.
+pub(crate) async fn chat_input_tokens(State(app): State<App>, request: Request) -> Response {
+    match try_chat_input_tokens(app, request).await {
+        Ok(response) => response,
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn try_chat_input_tokens(app: App, request: Request) -> Result<Response, ApiError> {
+    let body = read_body(request, app.config.max_body_bytes).await?;
+    let mut parsed = wire::parse(Endpoint::Chat, &body, next_request_id())?;
+    prepare(&app, &mut parsed, app.config.reasoning_format)?;
+    let tokens = count_prompt(&app, parsed.request).await?;
+    Ok(json_response(wire::input_tokens(tokens)))
+}
+
 pub(crate) async fn systemone(State(app): State<App>, request: Request) -> Response {
     match try_systemone(app, request).await {
         Ok(response) => response,
@@ -167,6 +185,19 @@ impl Reply {
             }
         })
     }
+}
+
+/// How many tokens the prompt of `request` comes to: the request as a route
+/// read and prepared it, counted by the engine and not run. An engine that
+/// cannot count answers 501.
+pub(crate) async fn count_prompt(app: &App, request: GenerateRequest) -> Result<u32, ApiError> {
+    let engine = app.engine.clone();
+    // Rendering and tokenizing a long prompt takes its time.
+    let counted =
+        tokio::task::spawn_blocking(move || engine.count_tokens(&request.model, &request.prompt))
+            .await
+            .map_err(|e| ApiError::internal(format!("the count of the prompt was lost: {e}")))?;
+    counted.map_err(|e| ApiError::from_engine(&*app.engine, e))
 }
 
 /// The response of a stream of events. `keep_alive` is what goes out while

@@ -181,14 +181,7 @@ async fn try_messages(app: App, request: Request) -> Result<Response, ApiError> 
 async fn try_count(app: App, request: Request) -> Result<Response, ApiError> {
     let body = read_body(request, app.config.max_body_bytes).await?;
     let (parsed, _) = read(&app, &body, next_request_id(), Purpose::Count)?;
-    let engine = app.engine.clone();
-    let request = parsed.request;
-    // Rendering and tokenizing a long prompt takes its time.
-    let counted =
-        tokio::task::spawn_blocking(move || engine.count_tokens(&request.model, &request.prompt))
-            .await
-            .map_err(|e| ApiError::internal(format!("the count of the prompt was lost: {e}")))?;
-    let tokens = counted.map_err(|e| ApiError::from_engine(&*app.engine, e))?;
+    let tokens = routes::count_prompt(&app, parsed.request).await?;
     Ok(json_response(format!(r#"{{"input_tokens":{tokens}}}"#)))
 }
 
