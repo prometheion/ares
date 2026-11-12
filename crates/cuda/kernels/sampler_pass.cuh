@@ -66,7 +66,8 @@ static __device__ __forceinline__ bool ares_pass_runs(const AresSampleParams& p,
     }
 }
 
-// Grid (chunks, rows), ARES_SAMPLE_THREADS threads. Adds the tokens of the
+// Grid (chunks, rows), ARES_SAMPLE_THREADS threads, `chunk` at most
+// ARES_SAMPLE_PER logits per thread. Adds the tokens of the
 // set in chunk `blockIdx.x` of row `blockIdx.y` to the row's accumulators:
 //
 // - STATS, TAIL, RAW: the five sums of `Sums` (RAW is over all tokens at
@@ -89,12 +90,17 @@ ARES_KERNEL ares_sample_pass(const float* logits, uint32_t stride, uint32_t n_lo
     }
     const uint32_t begin = blockIdx.x * chunk;
     const uint32_t end = min(begin + chunk, n_local);
-    const float* row = logits + (size_t)r * stride;
+    float v[ARES_SAMPLE_PER];
+    const uint32_t n = ares_sample_read(logits + (size_t)r * stride, begin, end, v);
     unsigned long long t[5] = {0, 0, 0, 0, 0};
     unsigned long long min_enc = 0, max_key = 0;
-    for (uint32_t i = begin + threadIdx.x; i < end; i += ARES_SAMPLE_THREADS) {
+#pragma unroll
+    for (int k = 0; k < ARES_SAMPLE_PER; ++k) {
+        if ((uint32_t)k >= n) {
+            break;
+        }
         bool bad = false;
-        const float l = ares_sample_logit(row[i], &bad);
+        const float l = ares_sample_logit(v[k], &bad);
         if (!ares_sample_present(l)) {
             continue;
         }
@@ -159,11 +165,27 @@ ARES_KERNEL ares_sample_pass(const float* logits, uint32_t stride, uint32_t n_lo
         }
         return;
     }
-    for (int k = 0; k < 5; ++k) {
-        const unsigned long long total = ares_block_sum_u64(t[k], partial);
-        __syncthreads();
-        if (threadIdx.x == 0) {
-            atomicAdd(&state[r].acc[k], total);
+    // The five sums of every warp, then of the chunk: thread `k` adds up sum
+    // `k`. A warp, and a chunk, without a token of the set has nothing to add.
+    __shared__ unsigned long long warp_sums[ARES_SAMPLE_THREADS / 32][5];
+    if (__ballot_sync(0xffffffffu, t[0] != 0) != 0) {
+        for (int k = 0; k < 5; ++k) {
+            t[k] = ares_warp_sum_u64(t[k]);
+        }
+    }
+    if ((threadIdx.x & 31) == 0) {
+        for (int k = 0; k < 5; ++k) {
+            warp_sums[threadIdx.x >> 5][k] = t[k];
+        }
+    }
+    __syncthreads();
+    if (threadIdx.x < 5) {
+        unsigned long long total = 0;
+        for (uint32_t w = 0; w < (blockDim.x >> 5); ++w) {
+            total += warp_sums[w][threadIdx.x];
+        }
+        if (total != 0) {
+            atomicAdd(&state[r].acc[threadIdx.x], total);
         }
     }
 }
