@@ -383,11 +383,22 @@ impl RequestSampler {
         });
     }
 
+    /// The reply ended at its token limit or at a token that ends it, not at
+    /// a stop string. The tokens whose text has not gone out whole belong to
+    /// the reply all the same (the limit can cut a character in two, and the
+    /// bytes of half a character never print): the next [`text_sent`]
+    /// returns their probabilities too.
+    ///
+    /// [`text_sent`]: RequestSampler::text_sent
+    pub fn reply_ended(&mut self) {
+        self.text_bytes = usize::MAX;
+    }
+
     /// `n` bytes of text went out. Returns the probabilities of the tokens
     /// whose text has gone out whole. The probabilities of tokens whose text
-    /// never goes out (a stop string held it back) are never reported.
+    /// never goes out because a stop string held it back are never reported.
     pub fn text_sent(&mut self, n: usize) -> Vec<TokenProbs> {
-        self.text_bytes += n;
+        self.text_bytes = self.text_bytes.saturating_add(n);
         let mut out = Vec::new();
         while self.queue.front().is_some_and(|q| q.end <= self.text_bytes) {
             out.push(self.queue.pop_front().expect("checked").probs);
@@ -582,5 +593,31 @@ mod tests {
         s.picked(&[Pick::default()], &[lp]);
         s.token_taken(&m, 0, 67, b"C");
         assert!(s.text_sent(0).is_empty());
+    }
+
+    #[test]
+    fn a_reply_that_ends_reports_the_tokens_whose_text_never_went_out() {
+        let sampling = Sampling {
+            logprobs: Some(LogprobRequest { top: 1, after_chain: false }),
+            ..Sampling::default()
+        };
+        let m = model();
+        let mut s = RequestSampler::new(&sampling, &m, &mut Context::default(), 1, None).unwrap();
+        let mut lp = LogprobOut::NONE;
+        (lp.n, lp.chosen) = (1, -0.5);
+        lp.token[0] = 65;
+        lp.logprob[0] = -0.5;
+        s.picked(&[Pick::default(); 3], &[lp, lp, lp]);
+        // "A", then the first two bytes of a character of three that the
+        // token limit cuts off.
+        s.token_taken(&m, 0, 65, b"A");
+        s.token_taken(&m, 1, 66, &[0xe2, 0x82]);
+        s.token_taken(&m, 2, 67, &[]);
+        assert_eq!(s.text_sent(1).len(), 1);
+        assert!(s.text_sent(0).is_empty());
+        s.reply_ended();
+        let rest = s.text_sent(0);
+        assert_eq!(rest.iter().map(|p| p.token).collect::<Vec<_>>(), [66, 67]);
+        assert!(s.text_sent(5).is_empty(), "each probability goes out once");
     }
 }

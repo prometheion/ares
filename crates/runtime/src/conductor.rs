@@ -336,6 +336,7 @@ impl Active {
             self.completion += 1;
             if model.ends(token) {
                 self.stop.flush(&mut self.emitted);
+                self.sampler.reply_ended();
                 self.finished = Some(FinishReason::Stop);
                 return;
             }
@@ -357,6 +358,7 @@ impl Active {
                 || self.tokens.len() as u32 >= context_length
             {
                 self.stop.flush(&mut self.emitted);
+                self.sampler.reply_ended();
                 self.finished = Some(FinishReason::Length);
                 return;
             }
