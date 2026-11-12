@@ -4,7 +4,8 @@ Made on 2026-11-11. Read-only survey: nothing was built or run, no repository wa
 R03 to R12, R14, R16, R21 and H02, the counts and the lists were brought up to date on 2026-11-12, when the
 sampler's features (penalties, DRY, logit bias, probabilities, `n` and the rest) were built; G01, G03, G06, G07
 and G09 were brought up to date the same day, when structured output was built, T01 to T04 and G05 when
-tool calls were, A07 and A08 when the Messages API was, and T06 when calls inside the thinking were.
+tool calls were, A07 and A08 when the Messages API was, T06 when calls inside the thinking were, and A04, A08
+and decision 20 of List 3 when the Responses API was.
 One row is one capability that a user or operator of an inference server can observe or rely on.
 
 ## How to read it
@@ -50,11 +51,11 @@ or no-op options; Ares may do a thing differently as long as the result is not w
 | A01 | Chat completions (OpenAI), streamed and not | llama, ik, kobold, ollama, vllm, sglang, tgi, trt, lmdeploy, tabby, mistralrs, mlc, sonar, localai, strata, tfold, lmstudio | `POST /v1/chat/completions`; SSE chunks with a role chunk, deltas, `finish_reason`, `[DONE]` | done (qwen35 and qwen4exp models, text parts only) | yes | essential |
 | A02 | Text completions (OpenAI) | llama, kobold, ollama, vllm, sglang, trt, lmdeploy, tabby, tfold, tgi? | `POST /v1/completions` with one string prompt, no chat template | done | yes | common |
 | A03 | Prompt as token ids; several prompts in one request | llama, sglang, tfold (ids), vllm? | `prompt` as a list of ids, or a list of prompts answered as several choices | not started (refused by name) | yes | niche |
-| A04 | Responses API (OpenAI), stateless | llama, ik, vllm, trt, ollama, strata, tfold, mistralrs, lmstudio, swap | `POST /v1/responses` run as the equivalent chat request; typed SSE events, function tools, reasoning items, `text.format` | not started | yes | common |
+| A04 | Responses API (OpenAI), stateless | llama, ik, vllm, trt, ollama, strata, tfold, mistralrs, lmstudio, swap | `POST /v1/responses` run as the equivalent chat request; typed SSE events, function tools, reasoning items, `text.format` | done: `/v1/responses` runs as the chat request that asks the same (`instructions`, `input` as a string or as items: messages, `function_call`, `function_call_output`, `reasoning`; function `tools`, `tool_choice`, `parallel_tool_calls`, `max_output_tokens`, `reasoning.effort`, `text.format`), whole (a response with `reasoning`, `message` and `function_call` items, `status` `completed` or `incomplete`, the usage with `cached_tokens`) and as the typed events with `sequence_number`. Without state: the response says `store: false`, and `store: true`, `previous_response_id`, `conversation`, `background` and the routes of a stored response are refused by name. A reasoning item has the reasoning in `content` (`reasoning_text`) and gives it back to the prompt when it returns; `include: reasoning.encrypted_content` is accepted and adds nothing. Refused by name: images, files and audio, tools that are not functions, `prompt` templates, token probabilities, `truncation: auto`, reasoning summaries of a given kind, the sampler's fields of the chat route. No `output_tokens_details.reasoning_tokens` (K07). Host tests; the test with a real model is written and has not been run | yes | common |
 | A05 | Stored responses, conversations held by the server | tfold, vllm, sglang, lmstudio | `store`, `previous_response_id`, `GET` and `DELETE /v1/responses/{id}` (vllm also cancel); lmstudio "stateful chats". ollama and strata are stateless on purpose | not started | yes | niche |
 | A06 | Responses over WebSocket | tfold | `GET /v1/responses` upgrade, `response.create` events, lanes and a cache per socket | not started | yes | niche |
 | A07 | Anthropic Messages API | llama, vllm, strata, tfold, mistralrs, sonar, lmdeploy, lmstudio, swap | `POST /v1/messages`: `system`, content blocks, `tool_use` and `tool_result`, thinking blocks, Anthropic's SSE events, `x-api-key` | partly: `/v1/messages` runs as the chat request that asks the same (`system`, text, `tool_use`, `tool_result` and thinking blocks, `tools`, `tool_choice`, `thinking`, `stop_sequences`, `output_config`), whole and as Anthropic's events, with the cache counts in the usage and errors in Anthropic's shape; `budget_tokens` is accepted and not enforced, `cache_control` is accepted and changes nothing, `x-api-key` is not looked at. Missing: `stop_reason: stop_sequence` (the engine reports one reason for the end token and a stop string, so such a reply says `end_turn`); images and documents, server tools, a prefill and `defer_loading` are refused by name | yes | common |
-| A08 | Token counting | llama, vllm, tfold, mistralrs, swap | `/v1/messages/count_tokens`, `/v1/responses/input_tokens`, `/v1/chat/completions/input_tokens`: render the request, return the count, generate nothing | partly: `/v1/messages/count_tokens` reads a body as `/v1/messages` does and asks the engine for the count (`Engine::count_tokens`, which the runtime answers with the model's encoding of the prompt). The other two routes are not started | yes | common |
+| A08 | Token counting | llama, vllm, tfold, mistralrs, swap | `/v1/messages/count_tokens`, `/v1/responses/input_tokens`, `/v1/chat/completions/input_tokens`: render the request, return the count, generate nothing | done: `/v1/messages/count_tokens`, `/v1/responses/input_tokens` and `/v1/chat/completions/input_tokens` each read a body as their generating route does and ask the engine for the count (`Engine::count_tokens`, which the runtime answers with the model's encoding of the prompt); the two OpenAI routes answer `{"object": "response.input_tokens", "input_tokens": N}`. Host tests show the count equal to the prompt a run of the same request reports | yes | common |
 | A09 | Tokenize and detokenize | llama, vllm, sglang, tfold, tabby, kobold | text or chat messages to ids (optionally the pieces), ids to text | not started | yes | common |
 | A10 | Render a request without running it | llama, vllm, trt, tabby, tfold | the prompt text or ids a chat body renders to (`/apply-template`, `/v1/chat/completions/render`, `generate:false`) | not started | yes | niche |
 | A11 | Decisions API | llama, ik, vllm, sglang, tfold, lmstudio, localai | typed questions (yes/no, choice, score) answered from the next-token logits of the served model, no text generated: `/v1/systemone`, `/v1/decisions`, `/v1/score` | partly: route, wire format and planner rows exist; `Engine::decide` is not implemented and the route answers 501 | yes | niche |
@@ -344,12 +345,12 @@ Counted from the tables above with a script (see the end of this file for the co
 | --- | --- |
 | Total | 223 |
 | Inside the frame | 200 |
-| - done | 60 |
-| - partly | 43 |
-| - not started | 97 (essential 5, common 26, niche 66) |
+| - done | 62 |
+| - partly | 42 |
+| - not started | 96 (essential 5, common 25, niche 66) |
 | Outside the frame | 23 (all not started) |
 
-Of the 60 done rows 27 are essential, 26 common and 7 niche; of the 43 partly rows 11 are essential, 18 common
+Of the 62 done rows 27 are essential, 28 common and 7 niche; of the 42 partly rows 11 are essential, 17 common
 and 14 niche. A row is one capability, so the counts weigh a sampler option like a model router; List 1 orders
 them by need instead.
 
@@ -362,9 +363,9 @@ them by need instead.
 - M02 several models loaded on request, and M03 the preset file
 - X01 API keys
 
-**Common (26).**
+**Common (25).**
 
-- API: A04 Responses, A09 tokenize, A16 model properties
+- API: A09 tokenize, A16 model properties
 - Sampling: R25 server cap for the output length
 - Tools: T05 recovery of imperfect calls
 - Reasoning: K03 thinking budget, K05 loop guard, K06 earlier reasoning in the history
@@ -472,7 +473,9 @@ story saves and multiplayer; tunnels (kobold, tgi) and usage statistics sent hom
 19. **Idle unload.** A lifetime per request (ollama `keep_alive`), per model (lmstudio and llama-swap TTL), or one
     setting of the server (llama `--sleep-idle-seconds`, tfold `--idle-unload`).
 20. **Responses API state.** `store` defaults to true as at OpenAI (tfold, vllm) or the route is stateless
-    (llama, ollama, strata).
+    (llama, ollama, strata). Ares: stateless. A response says `store: false`, also when the request left `store`
+    out; `store: true`, `previous_response_id`, `conversation` and `background: true` are refused by name, and
+    the routes of a stored response answer 404. Stored responses stay row A05.
 21. **Fetching image URLs.** On by default (llama), off unless a flag allows it (tfold `--vision-urls`, tabby
     `disable_fetch_requests`, sglang's allowed domains).
 22. **What invalidates state on disk.** A fingerprint of checkpoint, kernel build, OS build and chip (tfold), of

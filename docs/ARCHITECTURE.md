@@ -3160,7 +3160,10 @@ checkpoints that let a conversation continue from what was computed (see
 
 It answers `POST /v1/chat/completions` and `/v1/completions`, streamed and
 not, Anthropic's `POST /v1/messages` and `/v1/messages/count_tokens` (see
-"The Messages API" below), `GET /v1/models`, `/health` and `/metrics`, with
+"The Messages API" below), OpenAI's `POST /v1/responses` without state, with
+`/v1/responses/input_tokens` and `/v1/chat/completions/input_tokens`, which
+count a request and generate nothing (see "The Responses API" below),
+`GET /v1/models`, `/health` and `/metrics`, with
 timings in every answer of the OpenAI routes
 (prompt tokens and time, generated tokens and time, drafts proposed and
 accepted, and `token_hash`, a hash of the reply's token ids in the final message
@@ -3574,6 +3577,165 @@ sampler. Its `stop_reason` is `end_turn` for a stop string as well, but it
 names the string in `stop_sequence`. The tests with a real model
 (`crates/server/tests/real_messages.rs`, the 0.8B on one card) are written and
 have not been run.
+
+**The Responses API.** `POST /v1/responses` is OpenAI's Responses API,
+without state. A request is served as the chat request that asks the same, as
+a Messages request is: the `responses` module of `ares-server` writes its body
+over into a chat body, and from there it is the chat route's path (the same
+reader, the same engine request, the same prefix cache, the same rule for
+calls, the same end when the client leaves). The reply comes back as a
+response object with its output items, or as the typed events of the API.
+
+| Field | Here |
+| --- | --- |
+| `model`, `temperature`, `top_p`, `stream` | as on the chat route |
+| `instructions` | a system message |
+| `input` | a string (one message of the user), or items: messages (`user`, `assistant`, `system`, `developer`; a string or `input_text` and `output_text` parts), `function_call`, `function_call_output` (a string or `input_text` parts), `reasoning` |
+| `tools` | functions in the shape of this API: `type: "function"`, `name`, `description`, `parameters`, `strict` (the arguments are held to the schema either way) |
+| `tool_choice` | `auto`, `none`, `required`, `{"type": "function", "name"}` |
+| `parallel_tool_calls` | as on the chat route |
+| `max_output_tokens` | the limit of tokens; a reply it cuts has the status `incomplete` and `incomplete_details.reason: "max_output_tokens"` |
+| `reasoning` | `effort` is the chat route's `reasoning_effort` (`none` switches thinking off, any other value is the template's variable); `summary: "auto"` is accepted and no summary is written |
+| `text.format` | `text`, `json_object`, `json_schema`: the chat route's `response_format` |
+| `include` | `reasoning.encrypted_content` is accepted and adds nothing (below) |
+| `truncation` | `disabled`, which is what the server does |
+| `store`, `background` | `false` (below) |
+| `metadata`, `user`, `safety_identifier`, `service_tier`, `client_metadata` | bookkeeping: accepted, without effect; `metadata` and `user` are said back |
+| `prompt_cache_key`, `prompt_cache_retention`, `prompt_cache_options` | accepted, without effect, as `cache_control` is on `/v1/messages`: the server caches every prefix by itself and drops what it kept by its own budget, so a retention is no promise |
+
+The parts of one message are concatenated, as the chat route does it. The
+items one reply returned for a turn (a reasoning item, a message, calls) are
+one message of the assistant again; an item that does not continue a turn in
+that order begins another message. `instructions` and the messages of the
+roles `system` and `developer` that stand before the conversation are one
+system message, joined by an empty line: Codex puts its instructions at the
+head of `input` and sends no `instructions` (read in its source, not tried),
+and the chat template of Qwen3.5-0.8B refuses a system message that is not
+the first one (`System message must be at the beginning.`, read in the model
+file). Such a message inside a conversation stays where it stands, and the
+template decides about it: that template refuses it.
+
+Everything else is refused with a 400 that names it, in OpenAI's shape of an
+error, as on the chat route: `input_image`, `input_file` and `input_audio`
+parts (input other than text is not built), tools that are not functions
+(`web_search`, `file_search`, `code_interpreter`, `computer_use`, `mcp`,
+`local_shell`, `custom` and the like), the items such tools leave in a
+history and a `tool_choice` that names one or a subset (`allowed_tools`),
+`prompt` templates, `top_logprobs` and `include:
+["message.output_text.logprobs"]` (the pieces of a reply are not told apart
+into the tokens of the answer, of the reasoning and of calls),
+`text.verbosity`, `reasoning.summary` `concise` and `detailed`,
+`truncation: "auto"`, `max_tool_calls`, `stream_options.include_obfuscation:
+true`, and any member the module does not know. Only members of this API are
+read: the sampler's fields of the chat route (`top_k`, `min_p`, `seed`, `stop`
+and the others) are refused here, as on `/v1/messages`.
+
+- **No state** (open decision 20 of the feature checklist). The route keeps
+  no responses, as llama-server, ollama and Strata. A response says
+  `"store": false`, also when the request left `store` out, where OpenAI's
+  default is `true`. A request that sets `store: true` is refused: it asks
+  for something the server does not do, and the clients that work without
+  stored responses say so themselves. Codex sends `store: false` with every
+  request (read in its source, `codex-rs/core/src/client.rs`, on 2026-11-12);
+  the OpenAI SDKs send the member only when their caller sets it.
+  `previous_response_id`, `conversation`, `background: true`, an
+  `item_reference` in `input` and a `prompt` template are refused by name,
+  and `GET` and `DELETE /v1/responses/{id}`, `cancel`, `input_items` and
+  `compact` answer 404 and say that no response is kept. Stored responses are
+  row A05 of the checklist and are not built.
+- **Reasoning items.** The reasoning of a reply is one item of the type
+  `reasoning`, before the message. Its `content` is the reasoning as the
+  model wrote it, in a part of the type `reasoning_text`, which is what the
+  API has for models whose reasoning is not hidden; its `summary` is empty,
+  because the server writes none; and it has no `encrypted_content`, because
+  the server has nothing to hide and no secret to encrypt with. A reasoning
+  item that comes back is the reasoning of its turn: the text of its
+  `content`, whatever its id says. The item of a reply sent back unchanged is
+  therefore the turn the chat route gets back with `reasoning_content`, so the
+  template writes what the model generated, on every turn the same, and the
+  prefix cache continues (see "A conversation that continues from the
+  cache"). A `summary` and an `encrypted_content` of an item are accepted and
+  nothing of them enters the prompt: a summary is not the reasoning, and
+  encrypted content is text only the service that wrote it can read. A client
+  that sends back only those two (and not `content`) gets the same answers and
+  pays what a chat client pays that drops `reasoning_content`: the last turn
+  is computed again.
+- **`include`.** `reasoning.encrypted_content` asks for reasoning items that
+  a client without stored responses can send back, and Codex asks for it with
+  every request. Every reasoning item of this server is such an item, so the
+  value is accepted and adds nothing. The other values are refused by name.
+- **`truncation`.** `disabled` is what the server does: an input that does
+  not fit the context is the error `context_length_exceeded`. `auto` would
+  drop items from the conversation, which the server does not do.
+- **The usage.** `input_tokens` is the whole prompt,
+  `input_tokens_details.cached_tokens` the part of it the prefix cache gave,
+  `output_tokens` what was generated. There are no `output_tokens_details`:
+  the engine does not count the tokens of the reasoning apart
+  (`ares_api::Usage` has one count for the reply), and a number that is not
+  measured is not written. The response has the `timings` of the chat route
+  next to the usage.
+- **`output_text`.** The response has no member of that name. The official
+  SDKs put it together from the items; llama-server does not send it either,
+  and its own test reads it from the Python SDK.
+- **What a response says back.** `instructions`, `max_output_tokens`,
+  `temperature`, `top_p`, `tools`, `tool_choice`, `parallel_tool_calls`,
+  `text`, `reasoning`, `metadata` and `user` as the request gave them (`null`
+  where it gave nothing: the engine's own defaults are not known to the
+  route), and `store: false`, `background: false`, `truncation: "disabled"`,
+  `previous_response_id: null`.
+
+The output is in the order the model wrote it: the reasoning item, the
+message (one `output_text` part), then one `function_call` item for every
+call, with `call_id` (`call_`, the request's id and the place of the call),
+`name` and `arguments` as the JSON text the model wrote. The ids of items are
+`rs_`, `msg_` or `fc_`, the request's id and the place in the output. An item
+the limit of tokens cut has the status `incomplete`, and a call it cut has its
+arguments as far as they came.
+
+A stream is `response.created` and `response.in_progress`, then for every
+item `response.output_item.added`, its events and `response.output_item.done`,
+then `response.completed` or `response.incomplete` with the response as it is
+returned whole; every event has its `sequence_number`, counted from 0. A
+reasoning item and a message have `response.content_part.added`, their deltas
+(`response.reasoning_text.delta`, `response.output_text.delta`), the text once
+more (`response.reasoning_text.done`, `response.output_text.done`) and
+`response.content_part.done`; a call has
+`response.function_call_arguments.delta` and
+`response.function_call_arguments.done`. The stream and the whole response are
+made from the same thing (`Output` in `responses/reply.rs`, which takes the
+pieces of a reply and keeps the items), so the two cannot differ. The usage is
+in the last event only, since the engine counts the prompt when the reply
+ends. A failure after the stream began is an `error` event (`code`, `message`,
+`param`), and the stream ends with it. There is no `[DONE]`.
+
+`POST /v1/responses/input_tokens` reads a body as `/v1/responses` does, and
+`POST /v1/chat/completions/input_tokens` one as `/v1/chat/completions` does;
+both return `{"object": "response.input_tokens", "input_tokens": N}`, the
+shape OpenAI and llama-server have, and generate nothing. The count is
+`Engine::count_tokens`, as for `/v1/messages/count_tokens`, so it is the
+prompt a run of the same request reports (host tests on the scripted engine
+and through the real runtime).
+
+Where this is not llama-server: it drops tools that are not functions,
+`store`, `background`, `truncation`, `include`, `text` and every member it
+does not know without a word, passes the chat route's fields through, and
+reads a `tool_choice` that names a function as `auto`; here each is served or
+refused. It requires a reasoning item to have a `summary` and a `content`
+that is not empty, and writes `encrypted_content: ""`. Its stream has no
+`sequence_number`, no `response.reasoning_text.done`, no
+`response.function_call_arguments.done` and no events for the part of a
+reasoning item, it numbers the items by what kinds it has seen, and it calls
+every response `completed`, also one the limit of tokens cut.
+
+What is not there: the count of reasoning tokens (it needs the engine), a
+switch that turns thinking on for a template whose default is off and that
+does not read `reasoning_effort` (the route has `effort` alone, and
+`--reasoning` decides for the server), the probabilities of tokens, custom
+tools (a tool that takes free text), and a `text.format` next to tools that
+may be called (the reply follows one rule, as on the chat route). What Codex
+sends was read in its source and not tried against a running Codex. The
+tests with a real model (`crates/server/tests/real_responses.rs`, the 0.8B on
+one card) are written and have not been run.
 
 For a mixture of experts (`qwen4exp`) the plan is another one: where the
 layers go (`--split tensor`: both devices on every layer, `layer`: a range
