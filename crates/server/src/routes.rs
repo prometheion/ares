@@ -7,7 +7,7 @@ use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use ares_api::{Engine, RequestId, TokenProbs, Usage};
+use ares_api::{Engine, GenerateRequest, RequestId, TokenProbs, Usage};
 use axum::Json;
 use axum::extract::{Request, State};
 use axum::http::{HeaderName, HeaderValue, header};
@@ -15,14 +15,14 @@ use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use futures_util::StreamExt;
 
-use crate::Config;
 use crate::bridge::{DecisionRun, Flight, Item, Run, Stop, Timings};
 use crate::error::ApiError;
 use crate::reasoning::{self, Split};
 use crate::reply::{Piece, Sorter};
 use crate::systemone;
 use crate::tools;
-use crate::wire::{self, Call, Choice, Endpoint, Head};
+use crate::wire::{self, Call, Choice, Endpoint, Head, Parsed};
+use crate::{Config, ReasoningFormat};
 
 /// What every handler needs.
 #[derive(Clone)]
@@ -80,6 +80,111 @@ pub(crate) async fn method_not_allowed(request: Request) -> ApiError {
     ApiError::method_not_allowed(request.method().as_str(), request.uri().path())
 }
 
+// --- the core of every route that generates ----------------------------------
+//
+// A route of any API runs a conversation in three steps, and none of them
+// knows a wire format:
+//
+// 1. It reads its body into a [`Parsed`] chat request (`wire::from_json` for
+//    a body in the chat format; a route of another API writes its body over
+//    into that format first, as the `anthropic` module does).
+// 2. [`prepare`] applies what the request says about thinking and tools to
+//    it, and returns the [`Sorter`] of its reply.
+// 3. [`Reply::start`] hands the request to the engine, and [`Reply::next`]
+//    gives the reply as it comes: [`Piece`]s (reasoning, content, the start
+//    of a call, fragments of its arguments) and at the end the reason, the
+//    usage and the timings. The route writes them in its own format.
+//
+// A streaming route awaits the first step before it starts its response, so
+// that a request the engine refuses gets an HTTP status; dropping the
+// [`Reply`] (the client went away) cancels the request in the engine.
+
+/// Applies what a chat request says about thinking and about tools to the
+/// request for the engine (the variables of the chat template, the rule of
+/// the reply), and returns what sorts the text of its reply. `format` is how
+/// the reasoning is returned when the request does not say.
+pub(crate) fn prepare(
+    app: &App,
+    parsed: &mut Parsed,
+    format: ReasoningFormat,
+) -> Result<Sorter, ApiError> {
+    let thinking = reasoning::apply(parsed, &*app.engine, format)?;
+    let calls = tools::apply(parsed, &*app.engine, &thinking)?;
+    Ok(Sorter::new(thinking.splitter, calls))
+}
+
+/// A reply the engine is generating: the request in the engine and the
+/// sorter of its text. Dropping it before its end cancels the request.
+#[derive(Debug)]
+pub(crate) struct Reply {
+    run: Run,
+    sorter: Sorter,
+}
+
+/// The next thing of a reply.
+#[derive(Debug)]
+pub(crate) enum Step {
+    /// What the sorter found in the text that came; nothing when all of it
+    /// is held back.
+    Pieces(Vec<Piece>),
+    /// The probabilities of the tokens whose text went out.
+    Probs(Vec<TokenProbs>),
+    End(End),
+}
+
+/// How a reply ended.
+#[derive(Debug)]
+pub(crate) struct End {
+    /// What the sorter still held.
+    pub rest: Vec<Piece>,
+    /// `stop` (the model ended the reply, or a stop string did) or `length`.
+    pub finish: &'static str,
+    pub usage: Usage,
+    pub timings: Timings,
+}
+
+impl Reply {
+    /// Hands `request` to the engine; `sorter` sorts its reply.
+    pub fn start(app: &App, request: GenerateRequest, sorter: Sorter) -> Result<Self, ApiError> {
+        let run = Run::start(
+            &app.engine,
+            request,
+            app.config.event_buffer,
+            &app.flight,
+            app.stop.clone(),
+        )?;
+        Ok(Self { run, sorter })
+    }
+
+    /// The next step of the reply, or the reason there will be none. After
+    /// an `Err` or a [`Step::End`] the reply is over.
+    pub async fn next(&mut self) -> Result<Step, ApiError> {
+        Ok(match self.run.next().await? {
+            Item::Text(text) => Step::Pieces(self.sorter.push(&text)),
+            Item::Probs(probs) => Step::Probs(probs),
+            Item::Done { finish, usage, timings } => {
+                Step::End(End { rest: self.sorter.finish(), finish, usage, timings })
+            }
+        })
+    }
+}
+
+/// The response of a stream of events. `keep_alive` is what goes out while
+/// the engine has nothing to say.
+pub(crate) fn sse_response<S>(events: S, keep_alive: KeepAlive) -> Response
+where
+    S: futures_util::Stream<Item = Result<SseEvent, Infallible>> + Send + 'static,
+{
+    let mut response = Sse::new(events).keep_alive(keep_alive).into_response();
+    // Reverse proxies that buffer would hold the tokens back.
+    response
+        .headers_mut()
+        .insert(HeaderName::from_static("x-accel-buffering"), HeaderValue::from_static("no"));
+    response
+}
+
+// --- the completion routes of the OpenAI API ---------------------------------
+
 async fn completion(app: App, request: Request, endpoint: Endpoint) -> Response {
     match try_completion(app, request, endpoint).await {
         Ok(response) => response,
@@ -95,9 +200,7 @@ async fn try_completion(
     let body = read_body(request, app.config.max_body_bytes).await?;
     let id = next_request_id();
     let mut parsed = wire::parse(endpoint, &body, id)?;
-    let thinking = reasoning::apply(&mut parsed, &*app.engine, app.config.reasoning_format)?;
-    let calls = tools::apply(&mut parsed, &*app.engine, &thinking)?;
-    let sorter = Sorter::new(thinking.splitter, calls);
+    let sorter = prepare(&app, &mut parsed, app.config.reasoning_format)?;
     let mut head = Head::new(endpoint, id, &parsed.request.model);
     head.logprobs = parsed.logprobs;
     tracing::info!(
@@ -122,16 +225,7 @@ async fn try_completion(
                 request.sampling.seed.map(|seed| seed.wrapping_add(u64::from(i)));
         }
         let sorter = sorter.with_call_ids(tools::call_ids(request.id));
-        runs.push((
-            sorter,
-            Run::start(
-                &app.engine,
-                request,
-                app.config.event_buffer,
-                &app.flight,
-                app.stop.clone(),
-            )?,
-        ));
+        runs.push(Reply::start(&app, request, sorter)?);
     }
     if parsed.stream {
         stream(runs, head, parsed.include_usage).await
@@ -167,7 +261,7 @@ async fn try_systemone(app: App, request: Request) -> Result<Response, ApiError>
 /// the refusal comes out in the same error format as every other one, and so
 /// that a prompt with a long context (megabytes of JSON) is allowed on
 /// purpose instead of hitting the framework's small default.
-async fn read_body(request: Request, limit: usize) -> Result<Vec<u8>, ApiError> {
+pub(crate) async fn read_body(request: Request, limit: usize) -> Result<Vec<u8>, ApiError> {
     let declared = request
         .headers()
         .get(header::CONTENT_LENGTH)
@@ -192,7 +286,7 @@ async fn read_body(request: Request, limit: usize) -> Result<Vec<u8>, ApiError> 
 /// Ids are unique within the process and, because the counter starts at the
 /// time of the first request, almost surely across restarts, so that a
 /// `chatcmpl-...` id found in a client's log points at one request.
-fn next_request_id() -> RequestId {
+pub(crate) fn next_request_id() -> RequestId {
     static NEXT: LazyLock<AtomicU64> = LazyLock::new(|| {
         let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_nanos());
         AtomicU64::new(nanos as u64)
@@ -217,7 +311,7 @@ fn finish_reason(finish: &'static str, calls: usize) -> &'static str {
     if finish == "stop" && calls > 0 { "tool_calls" } else { finish }
 }
 
-async fn collect_one(mut run: Run, mut sorter: Sorter) -> Result<Collected, ApiError> {
+async fn collect_one(mut reply: Reply) -> Result<Collected, ApiError> {
     let mut text = Split::default();
     let mut calls: Vec<Call> = Vec::new();
     let mut probs = Vec::new();
@@ -236,11 +330,11 @@ async fn collect_one(mut run: Run, mut sorter: Sorter) -> Result<Collected, ApiE
         }
     };
     loop {
-        match run.next().await? {
-            Item::Text(piece) => take(sorter.push(&piece)),
-            Item::Probs(more) => probs.extend(more),
-            Item::Done { finish, usage, timings } => {
-                take(sorter.finish());
+        match reply.next().await? {
+            Step::Pieces(pieces) => take(pieces),
+            Step::Probs(more) => probs.extend(more),
+            Step::End(End { rest, finish, usage, timings }) => {
+                take(rest);
                 let finish = finish_reason(finish, calls.len());
                 return Ok(Collected { text, calls, probs, finish, usage, timings });
             }
@@ -255,11 +349,8 @@ async fn collect_one(mut run: Run, mut sorter: Sorter) -> Result<Collected, ApiE
 /// would have spent on it anyway. The completions of an `n` above 1 are
 /// collected side by side, so that none of them waits in its queue while
 /// another is being read.
-async fn collect(runs: Vec<(Sorter, Run)>, head: Head) -> Result<Response, ApiError> {
-    let done = futures_util::future::try_join_all(
-        runs.into_iter().map(|(sorter, run)| collect_one(run, sorter)),
-    )
-    .await?;
+async fn collect(runs: Vec<Reply>, head: Head) -> Result<Response, ApiError> {
+    let done = futures_util::future::try_join_all(runs.into_iter().map(collect_one)).await?;
     let choices: Vec<Choice<'_>> = done
         .iter()
         .enumerate()
@@ -273,7 +364,7 @@ async fn collect(runs: Vec<(Sorter, Run)>, head: Head) -> Result<Response, ApiEr
     Ok(json_response(head.complete(choices, usage, done[0].timings)))
 }
 
-fn json_response(body: String) -> Response {
+pub(crate) fn json_response(body: String) -> Response {
     ([(header::CONTENT_TYPE, HeaderValue::from_static("application/json"))], body).into_response()
 }
 
@@ -287,28 +378,22 @@ fn json_response(body: String) -> Response {
 ///
 /// The completions of an `n` above 1 are streamed side by side, their chunks
 /// told apart by `index`; the usage and the end marker come once, after all.
-async fn stream(
-    runs: Vec<(Sorter, Run)>,
-    head: Head,
-    include_usage: bool,
-) -> Result<Response, ApiError> {
+async fn stream(runs: Vec<Reply>, head: Head, include_usage: bool) -> Result<Response, ApiError> {
     let many = runs.len() > 1;
-    let firsts =
-        futures_util::future::try_join_all(runs.into_iter().map(|(sorter, mut run)| async move {
-            let first = run.next().await?;
-            Ok::<_, ApiError>((sorter, run, first))
-        }))
-        .await?;
+    let firsts = futures_util::future::try_join_all(runs.into_iter().map(|mut reply| async move {
+        let first = reply.next().await?;
+        Ok::<_, ApiError>((reply, first))
+    }))
+    .await?;
     let shared = many.then(|| Arc::new(Shared::default()));
     let parts: Vec<_> = firsts
         .into_iter()
         .enumerate()
-        .map(|(i, (sorter, run, first))| {
+        .map(|(i, (reply, first))| {
             let state = Chunks {
-                run,
+                reply,
                 head: head.choice(i as u32),
                 include_usage,
-                sorter,
                 phase: Phase::Start(first),
                 queue: VecDeque::new(),
                 calls: 0,
@@ -333,12 +418,7 @@ async fn stream(
             .boxed(),
         None => merged.boxed(),
     };
-    let mut response = Sse::new(events).keep_alive(KeepAlive::default()).into_response();
-    // Reverse proxies that buffer would hold the tokens back.
-    response
-        .headers_mut()
-        .insert(HeaderName::from_static("x-accel-buffering"), HeaderValue::from_static("no"));
-    Ok(response)
+    Ok(sse_response(events, KeepAlive::default()))
 }
 
 /// What the completions of one request share while they stream.
@@ -377,10 +457,10 @@ impl Shared {
 
 /// Where the SSE state machine is. Every `step` produces one `data:` line.
 enum Phase {
-    /// The first item has arrived but nothing was sent yet.
-    Start(Item),
-    /// An item that is ready to be sent.
-    Ready(Item),
+    /// The first step has arrived but nothing was sent yet.
+    Start(Step),
+    /// A step that is ready to be sent.
+    Ready(Step),
     /// Waiting for the engine.
     Pull,
     /// The text is out; the finish chunk is next.
@@ -397,10 +477,9 @@ enum Phase {
 }
 
 struct Chunks {
-    run: Run,
+    reply: Reply,
     head: Head,
     include_usage: bool,
-    sorter: Sorter,
     phase: Phase,
     /// Chunks that are ready and have not gone out: a piece of the reply can
     /// be several (content, the start of a call, its arguments).
@@ -416,8 +495,8 @@ struct Chunks {
 impl Chunks {
     /// The payload of the next SSE event, or `None` when the stream is over.
     ///
-    /// When a stream is dropped half way (the client disconnected), `run` is
-    /// dropped with it and cancels the request in the engine.
+    /// When a stream is dropped half way (the client disconnected), `reply`
+    /// is dropped with it and cancels the request in the engine.
     ///
     /// A failure is sent as an error object and ends the stream without
     /// `[DONE]`: a stream that ends with `[DONE]` reads as complete, and this
@@ -435,18 +514,16 @@ impl Chunks {
                         return Some(self.head.role_chunk());
                     }
                 }
-                Phase::Ready(Item::Text(text)) => {
+                Phase::Ready(Step::Pieces(pieces)) => {
                     self.phase = Phase::Pull;
                     // A piece that is held back or empty adds no chunk.
-                    let pieces = self.sorter.push(&text);
                     self.enqueue(pieces);
                 }
-                Phase::Ready(Item::Probs(probs)) => {
+                Phase::Ready(Step::Probs(probs)) => {
                     self.phase = Phase::Pull;
                     return Some(self.head.probs_chunk(&probs, self.sent));
                 }
-                Phase::Ready(Item::Done { finish, usage, timings }) => {
-                    let rest = self.sorter.finish();
+                Phase::Ready(Step::End(End { rest, finish, usage, timings })) => {
                     self.enqueue(rest);
                     let finish = finish_reason(finish, self.calls);
                     self.phase = Phase::Finish { finish, usage, timings };
@@ -462,8 +539,8 @@ impl Chunks {
                     };
                     return Some(self.head.finish_chunk(finish, timings));
                 }
-                Phase::Pull => match self.run.next().await {
-                    Ok(item) => self.phase = Phase::Ready(item),
+                Phase::Pull => match self.reply.next().await {
+                    Ok(step) => self.phase = Phase::Ready(step),
                     Err(error) => {
                         if let Some(shared) = &self.shared {
                             shared.failed.store(true, Ordering::Release);
@@ -505,6 +582,6 @@ impl Chunks {
 
 impl std::fmt::Debug for Chunks {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Chunks").field("run", &self.run).finish_non_exhaustive()
+        f.debug_struct("Chunks").field("reply", &self.reply).finish_non_exhaustive()
     }
 }
