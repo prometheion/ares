@@ -435,3 +435,56 @@ async fn the_runtime_counts_the_prompt_a_run_of_the_same_request_reports() {
     let (status, _) = json(post(&app, "/v1/messages/count_tokens", &other).await).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_counts_of_the_openai_routes_are_the_prompts_their_requests_report() {
+    let app = served(Some("@"));
+
+    // A Responses request: the count is the input of its run, what the
+    // prefix cache gave included.
+    let request = json!({
+        "model": "synthetic",
+        "instructions": "be brief",
+        "input": [
+            {"role": "user", "content": [{"type": "input_text", "text": "turn it down"}]},
+            {"role": "assistant", "content": "to what"},
+            {"role": "user", "content": "to nine"},
+        ],
+        "tools": [{
+            "type": "function",
+            "name": "set_volume",
+            "parameters": {"type": "object", "properties": {"level": {"type": "integer"}}},
+        }],
+        "tool_choice": "none",
+        "max_output_tokens": 20,
+    })
+    .to_string();
+    let (status, counted) = json(post(&app, "/v1/responses/input_tokens", &request).await).await;
+    assert_eq!(status, StatusCode::OK, "{counted}");
+    assert_eq!(counted["object"], "response.input_tokens");
+    let counted = counted["input_tokens"].as_u64().unwrap();
+    assert!(counted > 0);
+    for _ in 0..2 {
+        let (status, response) = json(post(&app, "/v1/responses", &request).await).await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        assert_eq!(response["usage"]["input_tokens"], counted, "{response}");
+    }
+
+    // A chat request.
+    let body = body(json!({"tools": tools(), "max_tokens": 20})).to_string();
+    let path = "/v1/chat/completions/input_tokens";
+    let (status, counted) = json(post(&app, path, &body).await).await;
+    assert_eq!(status, StatusCode::OK, "{counted}");
+    assert_eq!(counted["object"], "response.input_tokens");
+    let (status, answer) = json(post(&app, CHAT, &body).await).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert_eq!(counted["input_tokens"], answer["usage"]["prompt_tokens"], "{answer}");
+
+    // A model the runtime does not hold is not counted for.
+    let other = json!({"model": "another", "messages": [{"role": "user", "content": "hi"}]});
+    let (status, _) = json(post(&app, path, &other.to_string()).await).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let other = json!({"model": "another", "input": "hi"}).to_string();
+    let (status, _) = json(post(&app, "/v1/responses/input_tokens", &other).await).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
