@@ -1083,9 +1083,9 @@ fn expert_types_match_the_reference(part: usize) {
 /// The bounds of one row's expert output and of its residual against the reference's
 /// (relative RMS). In steps of up to eight rows the decode kernels round the activations and
 /// the hidden values to 8 bits: 1.4e-2 to 2.8e-2 and 3.4e-3 to 6.0e-3 over the 28 pairs of
-/// types on both cards (2026-11-12). In wider steps the many-row kernels round both to f16
-/// and the dense products before them read f16 operands: 5.7e-3 to 1.6e-2 and 2.2e-3 to
-/// 3.6e-3.
+/// types, on one card and on two (2026-11-12). In wider steps the many-row kernels round
+/// both to f16 and the dense products before them read f16 operands: 5.9e-3 to 1.3e-2 and
+/// 2.3e-3 to 3.6e-3. 764 to 768 of a model's 768 rows of layers were compared.
 const EXPERT_ROW_8BIT: (f64, f64) = (8e-2, 2e-2);
 const EXPERT_ROW_F16: (f64, f64) = (4e-2, 1e-2);
 

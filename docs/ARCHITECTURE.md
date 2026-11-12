@@ -1783,8 +1783,10 @@ for). The test `float_weights_beyond_f16_are_multiplied_by_the_kernels_that_hold
 made-up model with a row of weights of 61440 and two weights of 7e4: its logits are within
 7.1e-3 of the reference, as without such weights (6.0e-3); with the rule taken out the logits
 of a prompt of nine rows are not numbers and the step after it fails.
-The layout probes time such a matrix by its type, on the tile kernels. `qwen4exp` calls the
-kernels through `Kernels::product`, which knows no range: its float matrices are not checked.
+The layout probes time such a matrix by its type, on the tile kernels. `qwen4exp` reads the
+range of its float matrices at load as well (`Mat::range` in its `device/load.rs`) and its
+wide steps ask it before every float product; its quantized matrices go through
+`Kernels::product`, which knows no range and needs none.
 
 *Small weights.* What a matrix loses below 6.1e-5 is absolute, at most 2^-25 per weight. The
 test `tiny_float_weights_are_off_by_at_most_the_spacing_of_f16_subnormals` derives the bound of
@@ -1893,8 +1895,10 @@ the float types and is to leave the buffer the prefill kernels size.
 
 **Many-row expert kernels** (`kernels/expertrows*.cuh`,
 `ares_cuda::ExpertRowKernels`). The experts of a MoE layer for any number of rows,
-on the tensor cores, for the types of Qwen3.8-Flash-Next (gate and up IQ2_S,
-IQ2_XXS, IQ1_M; down Q2_0). The decode kernels above take eight rows; these take
+on the tensor cores, for every weight type (see "Experts in every weight type" below; the
+kernels were written for the types of Qwen3.8-Flash-Next, gate and up IQ2_S, IQ2_XXS and
+IQ1_M and down Q2_0, and what is measured in this section is measured on those). The decode
+kernels above take eight rows; these take
 as many as there is memory for, and are meant for prompts and windows of drafts.
 Four stages, all on the device, none needing the host to read the picks:
 
@@ -1923,7 +1927,7 @@ Four stages, all on the device, none needing the host to read the picks:
   order of K inside an `mma` is free if both operands use the same. The epilogue
   makes `silu(gate) * up` in f32, divides it by a power of two per pair and 64
   values (so nothing overflows an f16) and stores f16.
-- **Down** (`rows_down`). The same with Q2_0: a word of 16 codes gives the pairs
+- **Down** (`rows_down`). The same with the type of down, for Q2_0: a word of 16 codes gives the pairs
   (value j, value j + 8) of the operand with one shift and mask, so the hidden
   values are stored in that order. The product of a block of 64 is multiplied by
   the pair's scale as it is added to the accumulators.
@@ -1952,8 +1956,9 @@ gives each round its address table and brings what a table lacked.
 
 Against the exact result (f64 on the dequantized weights and the f32 activations) the
 output is 0.05 to 0.07 % rms off, and the hidden values the same, on generated blocks of
-all four types and on the real tensors of one layer of each type (the same figures on both
-cards). Rows scaled by 1e-4 to 1e5 within one call stay within 0.2 %. The decode
+the four types the kernels were written for and on the real tensors of one layer of each
+type (the same figures on both cards); over all 28 types, as gate and up and as down, 0.04
+to 0.10 % (the test allows 0.2 %). Rows scaled by 1e-4 to 1e5 within one call stay within 0.2 %. The decode
 kernels, which quantize the activations and the hidden values to int8, are at about 1 % in
 the matrices of their family (their expert test allows 5 %).
 
@@ -2053,6 +2058,176 @@ at 8, 1855 / 4243 at 256, 12998 / 28900 at 4096; IQ1_M (blk.8) 66 / 114, 194 / 4
 - **Memory a call needs**, per row for Qwen3.8-Flash-Next (ten picks): 5.2 KB of f16
   activations, 13.2 KB of hidden values, 102 KB of scratch for the ordered sum (none for the
   atomic one), 0.12 KB of plan and 10 KB of output; the plan is 0.6 MB for 4096 rows.
+
+**Experts in every weight type** (`kernels/experts.cu`, `kernels/expertrows*.cu`,
+`ares_runtime::expert_store::cpu`). The three matrices of an expert may be stored in any of
+the 28 types a model file holds weights in. Gate and up of a layer share one type (one kernel
+computes both rows against the same activations; the loader refuses a layer in which they
+differ), down has its own, and the types may differ from layer to layer. A row must be whole
+blocks of its type and whole groups of 32 values (`ExpertShape::check`), so a type with blocks
+of 256 values cannot hold a down matrix whose rows are the 640 hidden values of Flash-Next;
+the many-row kernels also take the width in steps of 128 and the inner width in steps of 64
+(`ExpertShape::check_rows`, asked when a model opens for wide steps). The router
+(`ffn_gate_inp`) must be F32.
+
+- *Decode kernels.* `ares_expert_gate_up_<type>` and `ares_expert_down_<type>` are the
+  templates of `expert_ffn.cuh` over the decode traits of the weight kernels, instantiated
+  for all 25 quantized types. The float types have a trait of the same interface
+  (`EngExpertFloat`): the weights as stored times the int8 activations, so that an expert of
+  any type computes `W x^` for the rounded activations `x^` and the host can compute the
+  same.
+- *Many-row kernels.* IQ2_S, IQ2_XXS, IQ1_M and IQ1_S as gate and up and Q2_0 as down have a
+  decoder written for these kernels. Every other type and role goes through an adapter
+  (`expertrows_mm.cuh`) that makes a gate and up or a down decoder of the item decoder of the
+  dense tile kernels (32 values of a row as f16 pairs), so the engine has one tensor-core
+  decoder per type. An adapted type decodes an item whole when a step begins and holds its
+  16 words per row stream across the step, where a written decoder makes each group as it is
+  used; the down kernel, whose threads take 16 values each, decodes an item for half of it.
+  The kernels are in five modules (`expertrows.cu`, `expertrows_{k,i,l,f}.cu`) that compile
+  side by side, and whether the sum is atomic or ordered is an argument of the down kernel,
+  not a kernel of its own.
+- *On the CPU* (`cpu/kernels.rs`). IQ2_S, IQ2_XXS and IQ1_M as gate and up and Q2_0 as down
+  have kernels that multiply the file's bytes. Every other type and role is decoded row by
+  row with the reference decoder (`ares_quant::dequantize`) and multiplied in f32 with the
+  same rounded activations, once for all the rows of the step that use the expert. The
+  decoding is what such an expert costs (table below).
+- *The cost model* (`CostModel` in `expert_store/hybrid.rs`) times CPU jobs per pair of
+  types (gate and up, down): each pair a model has is calibrated by itself when the store
+  gets its CPU half, and a job's time is recorded under its layer's pair. Before, every gate
+  type but IQ2_S and IQ2_XXS shared one entry and the type of down was not looked at, which
+  would have timed a decoded type as IQ1_M. A pair whose jobs take longer than an upload is
+  uploaded, by the measured numbers: the split takes whichever of the CPU's job and the last
+  upload ends first.
+
+*Tested* (2026-11-12, both cards). Decode kernels, every type as gate and up and as down, on
+generated blocks at rows of 512 and 128 values and at the real widths (2560 and 640, or 768
+for a down type with blocks of 256): the hidden values are within 0.50 of their own rounding
+step of `silu(gate x^) * (up x^)` on the reference decoder's weights (the test allows 0.51),
+the output within 1.5e-7 of the exact sum over the device's own hidden values, the layer
+within 1.0 to 3.4 % of the exact arithmetic on unrounded activations (8-bit activations and
+hidden values, as for the four types before). Many-row kernels, the same types and widths,
+every tile and both sums: 0.04 to 0.10 % rms against the exact result. The blocks of real
+tensors as experts (`ARES_TEST_GGUF=<any model file>`, the largest tensor of each type the
+file has, at the real widths): the decode
+kernels within 0.50 steps and 2e-7 and the many-row kernels within 0.06 to 0.13 % on the 12
+types of the Q4_K_S file of Qwen3.8-27B (Q3_K to Q8_0, the i-quants from IQ2_XS to IQ4_NL,
+F32), the decode kernels the same on the 12 of its IQ2_XXS file (IQ1_S, IQ2_XXS and Q2_K among
+them). The CPU against the device, layer by layer in
+made-up models of 28 pairs of types with half of the experts missing: 2.2e-7 to 4.6e-7 where
+no hidden code falls on a rounding boundary and up to 2.3e-3 where one does (the decoded
+path sums in another order than the device's integer sums; the test allows 1e-2). Whole
+made-up models of 28 pairs of types against the model's CPU reference, layer by layer and row
+by row: the experts of a row within 1.4e-2 to 2.8e-2 of the reference's in
+steps of up to eight rows and 5.9e-3 to 1.3e-2 in wide steps, in the 764 to 768 of a model's
+768 rows of layers that made the reference's choices (on one card and on two); four pairs through the runtime in every
+placement (`models_of_other_expert_types_answer_as_the_reference_in_every_placement`).
+
+*Speed of the kernels by type* (`examples/expert_types_bench`, 2026-11-12, load average 6 to
+9 from other work; microseconds, RTX 4070 / RTX 3060; an expert of 2560 x 640, or 768 hidden
+values for a down type with blocks of 256, 64 experts of random bytes, eight picks a row and
+no two rows of a step of eight the same ones; the type is that of gate and up with Q2_0 as
+down, or that of down with IQ2_S as gate and up; the decode kernels at 1 and 8 rows, the
+many-row kernels with their plan and the atomic sum at 8, 64 and 512 rows):
+
+| type | bits | gate and up: decode kernels, 1 row | 8 rows | many-row kernels, 8 rows | 64 | 512 | down: decode kernels, 1 row | 8 rows | many-row kernels, 8 rows | 64 | 512 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| q4_K | 4.50 | 56 / 113 | 443 / 811 | 575 / 761 | 530 / 656 | 1021 / 2447 | 44 / 88 | 339 / 650 | 663 / 1140 | 650 / 1194 | 1218 / 2817 |
+| q5_K | 5.50 | 47 / 116 | 497 / 846 | 591 / 780 | 635 / 783 | 1115 / 2462 | 46 / 94 | 371 / 701 | 691 / 1220 | 673 / 1296 | 1284 / 2936 |
+| q6_K | 6.56 | 58 / 126 | 559 / 929 | 916 / 972 | 936 / 1139 | 1400 / 3433 | 56 / 107 | 416 / 814 | 784 / 1509 | 776 / 1550 | 1477 / 3414 |
+| q3_K | 3.44 | 51 / 113 | 410 / 806 | 469 / 787 | 455 / 830 | 1151 / 3386 | 52 / 110 | 376 / 806 | 724 / 1480 | 735 / 1524 | 1440 / 3248 |
+| q2_K | 2.62 | 49 / 109 | 382 / 796 | 377 / 558 | 331 / 594 | 1013 / 2377 | 54 / 118 | 398 / 865 | 593 / 1169 | 594 / 1184 | 1279 / 2864 |
+| iq4_xs | 4.25 | 45 / 109 | 431 / 785 | 540 / 751 | 520 / 686 | 1013 / 2386 | 44 / 91 | 336 / 666 | 584 / 1233 | 590 / 1249 | 1265 / 2911 |
+| iq4_nl | 4.50 | 46 / 106 | 444 / 764 | 565 / 705 | 562 / 659 | 1027 / 2348 | 42 / 91 | 327 / 667 | 584 / 1060 | 618 / 1071 | 1164 / 2647 |
+| iq3_s | 3.44 | 50 / 114 | 405 / 838 | 439 / 1013 | 370 / 768 | 1096 / 2623 | 46 / 98 | 327 / 705 | 607 / 1349 | 653 / 1593 | 1408 / 3206 |
+| iq3_xxs | 3.06 | 48 / 106 | 376 / 754 | 395 / 725 | 371 / 732 | 1027 / 2477 | 47 / 97 | 324 / 697 | 576 / 1329 | 612 / 1461 | 1385 / 3218 |
+| iq2_s | 2.56 | 47 / 103 | 344 / 739 | 401 / 911 | 399 / 882 | 1011 / 2422 | 46 / 96 | 320 / 689 | 571 / 1364 | 582 / 1378 | 1304 / 3151 |
+| iq2_xs | 2.31 | 46 / 103 | 340 / 749 | 421 / 954 | 394 / 845 | 1045 / 2505 | 46 / 96 | 323 / 694 | 570 / 1270 | 590 / 1364 | 1346 / 3145 |
+| iq2_xxs | 2.06 | 49 / 110 | 367 / 794 | 373 / 710 | 365 / 707 | 995 / 2364 | 46 / 96 | 316 / 687 | 531 / 1216 | 544 / 1251 | 1322 / 3047 |
+| iq1_s | 1.56 | 43 / 97 | 336 / 710 | 290 / 579 | 298 / 622 | 1146 / 2744 | 49 / 97 | 354 / 695 | 531 / 1222 | 575 / 1328 | 1263 / 3141 |
+| iq1_m | 1.75 | 45 / 108 | 379 / 790 | 267 / 579 | 303 / 652 | 1132 / 2731 | 51 / 105 | 400 / 772 | 527 / 1193 | 557 / 1277 | 1204 / 2869 |
+| q8_0 | 8.50 | 89 / 141 | 662 / 1071 | 872 / 1066 | 748 / 971 | 1135 / 2473 | 42 / 99 | 406 / 750 | 692 / 1098 | 702 / 1154 | 1156 / 2670 |
+| q4_0 | 4.50 | 42 / 105 | 445 / 770 | 608 / 755 | 566 / 703 | 1007 / 2298 | 41 / 88 | 319 / 645 | 607 / 987 | 598 / 1019 | 1100 / 2536 |
+| q4_1 | 5.00 | 38 / 110 | 470 / 807 | 635 / 770 | 588 / 726 | 1020 / 2317 | 40 / 86 | 323 / 637 | 578 / 954 | 560 / 986 | 1029 / 2361 |
+| q5_0 | 5.50 | 41 / 115 | 497 / 841 | 654 / 789 | 671 / 767 | 1063 / 2376 | 41 / 91 | 341 / 668 | 614 / 1041 | 612 / 1069 | 1155 / 2618 |
+| q5_1 | 6.00 | 43 / 119 | 523 / 880 | 635 / 764 | 606 / 719 | 1049 / 2368 | 44 / 92 | 357 / 698 | 582 / 960 | 583 / 1022 | 1047 / 2412 |
+| tq1_0 | 1.69 | 77 / 200 | 738 / 1519 | 548 / 1260 | 589 / 1361 | 1212 / 2891 | 87 / 204 | 838 / 1532 | 674 / 1462 | 668 / 1489 | 1437 / 3609 |
+| tq2_0 | 2.06 | 39 / 88 | 319 / 635 | 415 / 591 | 329 / 591 | 963 / 2295 | 50 / 105 | 372 / 769 | 579 / 1168 | 578 / 1217 | 1301 / 3040 |
+| mxfp4 | 4.25 | 44 / 104 | 424 / 775 | 658 / 916 | 486 / 700 | 1041 / 2399 | 47 / 107 | 350 / 776 | 472 / 1043 | 505 / 1076 | 1142 / 2664 |
+| nvfp4 | 4.50 | 49 / 108 | 424 / 823 | 820 / 796 | 762 / 668 | 1107 / 2431 | 45 / 96 | 349 / 715 | 597 / 1084 | 601 / 1093 | 1074 / 2448 |
+| q1_0 | 1.12 | 38 / 85 | 284 / 604 | 262 / 484 | 272 / 551 | 931 / 2218 | 37 / 77 | 256 / 530 | 407 / 967 | 414 / 977 | 1033 / 2471 |
+| q2_0 | 2.25 | 42 / 95 | 329 / 672 | 417 / 532 | 392 / 647 | 973 / 2312 | 46 / 103 | 344 / 740 | 403 / 911 | 398 / 882 | 1010 / 2420 |
+| f32 | 32.00 | 274 / 377 | 1946 / 2875 | 2963 / 4127 | 3103 / 5090 | 3424 / 9744 | 142 / 222 | 1062 / 1701 | 1286 / 1951 | 1287 / 2029 | 1573 / 3340 |
+| f16 | 16.00 | 144 / 214 | 1072 / 1647 | 1043 / 1481 | 1030 / 1465 | 1424 / 2639 | 84 / 134 | 599 / 1045 | 815 / 1329 | 819 / 1399 | 1162 / 2774 |
+| bf16 | 16.00 | 145 / 214 | 1072 / 1647 | 1043 / 1484 | 1027 / 1464 | 1475 / 2778 | 84 / 134 | 600 / 1046 | 815 / 1327 | 819 / 1397 | 1117 / 2722 |
+
+The types of 2 to 6.6 bits lie within 1.3 times of the median of their column, with these
+exceptions. *The float types and Q8_0* are bound by their bytes: a step of one row reads eight
+experts once, 104 MiB for F32 as gate and up, 54 for F16 and BF16 and 30 for Q8_0, at 350 to
+430 GB/s on the RTX 4070 of the 473 the card reads in a loop of loads. *TQ1_0* is 1.6 to 2.4
+times as slow as its neighbours in the decode kernels (120 to 150 GB/s at one row): its
+bytes hold five values each in planes 32 values apart, so a lane loads five words of
+activations and five scales from different places, which is what bounds the dense decode
+kernel of the type too (`mmvq_more.cuh`). *Q6_K* is 1.3 to 1.8 times as slow as the median
+in the many-row kernels: its item is 18 raw words per row stream, which the adapter holds
+for four streams and for the step ahead. NVFP4 as gate and up was 1.5 times the median in the many-row kernels at 8 and 64 rows
+on the RTX 4070 in this run, and at the median on the RTX 3060 and at 512 rows; that was not
+looked into.
+
+*The four types of the real file, before and after* (`examples/expert_rows_bench` and
+`expert_layer_bench` on the real experts and the recorded routes, RTX 4070, the build of
+before and this one started alternately, twice, the better of each; load average 2 to 6): the
+decode kernels within 1 % at every point (they are the same instantiations), gate and up of
+the many-row kernels within 4 %, faster at most points, and down of the many-row kernels the
+same at 1 and 4096 rows and 6 to 18 % faster at 8 to 512 rows (1251 to 1058 microseconds for
+IQ2_S's layer at 512 rows).
+
+*Speed on the CPU by type* (`ares-runtime`'s `examples/expert_cpu_types`, 2026-11-12, nine
+workers as the engine places them on this machine, load average 3 to 5 from other work;
+the median time of a job of one expert that 1 or 8 rows use, in microseconds, from the
+creation of the job to its last task, which is what the cost model times; the same shapes as
+above):
+
+| type | gate and up: 1 row | 8 rows | down: 1 row | 8 rows |
+| --- | ---: | ---: | ---: | ---: |
+| q4_K | 147 | 399 | 105 | 325 |
+| q5_K | 214 | 468 | 143 | 368 |
+| q6_K | 267 | 520 | 162 | 385 |
+| q3_K | 507 | 757 | 267 | 471 |
+| q2_K | 473 | 728 | 254 | 467 |
+| iq4_xs | 271 | 517 | 165 | 404 |
+| iq4_nl | 265 | 517 | 139 | 326 |
+| iq3_s | 273 | 521 | 167 | 395 |
+| iq3_xxs | 277 | 533 | 171 | 396 |
+| iq2_s | 48 | 195 | 222 | 446 |
+| iq2_xs | 379 | 647 | 226 | 462 |
+| iq2_xxs | 55 | 210 | 229 | 451 |
+| iq1_s | 282 | 547 | 178 | 419 |
+| iq1_m | 71 | 262 | 188 | 449 |
+| q8_0 | 131 | 390 | 91 | 279 |
+| q4_0 | 208 | 472 | 122 | 304 |
+| q4_1 | 231 | 478 | 131 | 312 |
+| q5_0 | 298 | 562 | 157 | 336 |
+| q5_1 | 310 | 572 | 163 | 339 |
+| tq1_0 | 226 | 485 | 144 | 383 |
+| tq2_0 | 141 | 395 | 110 | 347 |
+| mxfp4 | 256 | 508 | 134 | 319 |
+| nvfp4 | 296 | 551 | 149 | 336 |
+| q1_0 | 513 | 770 | 247 | 415 |
+| q2_0 | 514 | 774 | 48 | 194 |
+| f32 | 338 | 474 | 177 | 359 |
+| f16 | 471 | 700 | 213 | 383 |
+| bf16 | 163 | 401 | 96 | 276 |
+
+An expert of the types with a written kernel takes 48 to 71 microseconds when one row uses
+it and 195 to 262 when eight do; a decoded type takes
+131 to 514 as gate and up (2.7 to 11
+times the 48 of IQ2_S) and 390 to 774 for eight rows, 91 to 267 and 276 to 471 as down (Q2_0:
+48 and 194). An upload of one expert takes 0.1 ms at the median on the RTX 4070 and 0.4 ms
+over the link of the RTX 3060 (measured with the real file, see "Qwen3.8-Flash-Next through
+the runtime"). So the CPU is sooner for a single miss of the written types on both cards; a
+decoded type is sooner only against the slower link, and not when several rows use the
+expert. The store decides that per layer and step from the times it measured for the layer's
+pair of types and for the device's uploads; nothing in it names a type as slow.
 
 **Layer kernels** (`kernels/layers.cu`, `ares_cuda::LayerKernels`).
 Everything a block of `qwen35` does between its matrix products: the
@@ -2600,15 +2775,19 @@ width (`device/part/wide.rs`, `device/misses.rs`):
   `swiglu_quant`), or f16 rows (`prepare_mixed`, `gated_norm_f16`, `swiglu_f16`) when the
   device runs the f16 tensor cores at full rate or `Options::precision` is `Exact`. The
   float matrices (the mixers', the router, the indexer projections, the recurrent gates,
-  the n-gram block's projections) have no tile kernel and are multiplied eight rows at a
-  time by the decode kernel, which reads the f32 section of the activations
-  (`Part::wide_product`); the chunks run on four streams, since a launch of eight rows
-  has a few dozen blocks and takes about 90 microseconds whatever it multiplies. The
-  fused read of a stream mixer is made for a few rows, so a wide step reads its mixers
-  with the separate kernels.
-- *The router* is `ExpertKernels::logits_rows` and `pick_rows`: ids and weights of every
-  row's picks in the form `ExpertRowKernels::plan_rows` reads, without the groups of the
-  decode kernels, which hold eight rows.
+  the n-gram block's projections) go through the float tile kernels (`Part::wide_float`):
+  the f32 section of the activations is converted to f16 rows in a scratch of its own,
+  whatever form the quantized matrices of the step read, and the sums are f32 whatever the
+  step's precision is (see "Float matrices of a wide step" below for why). The range of a
+  float matrix's weights is read when the model is loaded (`Mat::range`); a matrix with a
+  weight beyond f16, or of a width the tile kernels do not take, is multiplied eight rows
+  at a time by the decode kernel on four streams, as all of them were before (a launch of
+  eight rows has a few dozen blocks and takes about 90 microseconds whatever it
+  multiplies). The fused read of a stream mixer is made for a few rows, so a wide step
+  reads its mixers with the separate kernels.
+- *The router* is such a float product (`ffn_gate_inp` is F32) and `pick_rows`: ids and
+  weights of every row's picks in the form `ExpertRowKernels::plan_rows` reads, without the
+  groups of the decode kernels, which hold eight rows.
 - *The routed experts* run in **rounds**. The many-row kernels do not wait on the device
   for an expert that has no slot, so in a wide step the host takes part in every layer
   (`Misses`). When the layer is enqueued it gives the first round a table of the address of
@@ -2841,6 +3020,57 @@ tokens per second on the layers split and 357 on the two on every layer; 4000 to
 of 512 rows read at 112 and 145 tokens per second warm and 67 and 63 cold, in slices of 2048 at
 147 and 129 warm (one layer of a slice then waits 160 to 350 ms for 110 to 300 missed experts).
 
+**Float matrices of a wide step, measured** (2026-11-12, RTX 4070 and RTX 3060; the engine
+of before (`b8b0271`, the float matrices in launches of eight rows) and the one with the
+float tile kernels started one after the other, two or three times; the tool, `qwen4exp_run --prefill 1000
+--rows 512 --repeat 4 --breakdown` on the first 1000 tokens of this document, of which the
+first reading fills the tiers and is left out; load average 3 to 22 from other work):
+
+| | before | after |
+| --- | --- | --- |
+| Prompt, layers split: tokens per second (three pairs of runs) | 258, 276, 296; 256, 274, 273; 266, 274, 276 | 335, 428, 434; 415, 459, 462; 402, 450, 457 |
+| Prompt, both cards on every layer | 288, 314, 314; 292, 312, 315 | 384, 422, 421; 374, 413, 416 |
+| Device time of the mixers per step, layers split (25 layers on the RTX 4070, 23 on the RTX 3060) | 207.5 / 344 ms | 52.9 / 78.7 ms |
+| The other dense products of the same step | 66.2 / 118 ms | 45.0 / 84.8 ms |
+| The host's wait for a layer's picks, layers split | 17.1 to 17.8 ms | 6.5 to 7.0 ms |
+| The same, both cards on every layer | 17.7 to 18.4 ms | 9.5 to 9.8 ms |
+
+A layer's two mixers took 8.3 ms on the RTX 4070 and 15 ms on the RTX 3060 and take 2.1 and
+3.4 ms; as kernels alone the four products of a layer's mixers are 8.6 / 13.1 ms in launches
+of eight rows and 0.8 / 1.3 ms on the tile kernels (the numbers under "Float matrices"
+above), so what a mixer costs now is mostly its other kernels. The router alone is worth 5
+to 8 % of the prompt: with the router left on its launches of eight rows the same runs read
+351 to 425 tokens per second on the layers split and the host waited 7.8 to 8.4 ms for a
+layer's picks.
+
+*What it costs in precision.* The float products of a wide step were exact f32 and now read
+f16 operands (0.02 to 0.04 % rms a product, see "Float matrices"). The sums are f32 whatever
+the step's precision asks for the quantized matrices: with f16 sums, which is what
+`Precision::Fast` picks for a float type on these cards, the layers of the made-up model
+were up to four times as far from the CPU reference (`every_layer_of_wide_steps_matches_the_reference`:
+attention core 6.2e-2 against 1.8e-2 with quantized dense matrices, experts 5.3e-2 against
+1.65e-2 with float ones; f16 sums lose a row of small weights among larger ones, and the
+recurrent gates have such rows). With f32 sums and float dense matrices the recurrent core
+is 7.4e-4 from the reference where it was 3.6e-7, and everything else is where it was
+(experts 1.65e-2 after 1.62e-2, attention core 7.7e-3 after 7.9e-3; with quantized dense
+matrices 1.59e-2, 0.216 and 1.84e-2 after 1.57e-2, 0.216 and 1.65e-2). What moves are the
+discrete choices at near ties: the router of the made-up model with float dense matrices
+picked the reference's experts in 2804 of 2816 rows of layers where it had in 2814 (2810
+with the router left exact; with quantized dense matrices, whose 8-bit activations move the
+router's input a hundred times as far, 2746 after 2734), and in 2 of 28 made-up models one
+row of a wide step selected another block in an attention layer, which none did with exact
+float products. The tests of the expert types compare the rows that made the reference's
+choices and count the others (`ExpertRows` in `tests/qwen4exp_device.rs`). 
+
+*The real file* against its recorded CPU reference (`qwen4exp_run --check` on the German and
+the English trace, both cards on every layer, one run each before and after). With the given
+tokens read in one wide step, the logits of the last one are 0.023 and 0.032 from the
+reference's (relative RMS; 0.126 and 0.061 before) and, fed the reference's tokens, the next
+token is the reference's in 160 of 160 German and 79 of 80 English rows (158 and 78 before).
+In steps of eight rows, which the float tile kernels do not touch, it is 158 and 80 after 160
+and 80. The rows that differ are near ties (the two logits 0.01 to 0.15 apart), and which
+rows they are changes from run to run with the misses the CPU serves, as before.
+
 What bounds the prompt now:
 
 - *Bringing the missed experts.* A slice of a long prompt picks 40 to 80 % of the experts of
@@ -2851,12 +3081,12 @@ What bounds the prompt now:
   slice's time, and what the layer-major pass with waves must fix: fetch each expert of a layer
   once for the whole prompt, with many requests in flight and the next layer's experts read
   while this one computes.
-- *The dense part of a layer.* The host waits 18 to 40 ms per layer and slice of 512 rows for the
+- *The dense part of a layer.* The host waited 18 to 40 ms per layer and slice of 512 rows for the
   router's picks; that is the device's time through the mixers, the projections and the
-  recurrent layer. The mixers' matrices are BF16, which has no tile kernel; eight rows at a
-  time over four streams they take 4 ms a read on the RTX 4070 and 7 on the RTX 3060 at 512
-  rows (the fused read took 7.5 and 24). A tile kernel for the float types would be the
-  next step there.
+  recurrent layer. The mixers' matrices are BF16; eight rows at a time over four streams
+  they took 4 ms a read on the RTX 4070 and 7 on the RTX 3060 at 512 rows (the fused read
+  took 7.5 and 24). On the float tile kernels a read takes 1.1 and 1.7 ms and the host waits
+  7 to 10 ms for the picks (see "Float matrices of a wide step, measured" above).
 - *The host in every layer.* The first round runs while the picks travel to the host, but the
   next layer cannot be enqueued before the host has the misses of this one: a layer without
   misses costs one round trip of the record (about 0.1 ms); the waves would take that out too.
