@@ -1605,6 +1605,24 @@ s for a prompt of 1000 tokens (13 tokens/s), with it 13 to 23 s in four
 sessions and 53 s in one at a load of 15 to 18; a text the warm-up did not
 resemble keeps being slow until its experts have slots.
 
+Measured again on 2026-11-12, after the work was put on the main line (the
+embedding gather, the prefix cache, reasoning in the server, the many-row expert
+kernels, none of which the model's path uses): the server of before and the one
+of after, started alternately twice, three rounds of the same three prompts at
+128 tokens, rounds two and three, load average 10 to 15. Generation was 30 to 89
+(median over the twelve runs 47.7) tokens per second before and 31 to 84
+(median 50.8) after: German 30 to 89 and 31 to 84, English 20 to 55 and 43 to
+53, code 32 to 81 and 48 to 71. Prompts of 1000 tokens were read at 37 to 138
+and 65 to 138 tokens per second, the time to the first token was 7.8 to 27.8 s
+and 7.8 to 15.9 s. The two servers do not differ beyond the spread between runs
+of one of them, which comes from what the text accepts of its drafts and from
+the load. The cards held 11 679 and 11 661 MiB, the process 9.4 to 11.4 GB of RAM
+(once 14.7 GB right after the start). A first run of the server after the work
+at a load of 23 to 25, with other agents' builds and benchmarks on the same
+drive and cores, gave 21 to 43 tokens per second and prompts at 35 to 52: the
+machine's load decides what a step that waits for the drive costs, so a
+comparison needs the two servers measured next to each other.
+
 Against the tool's chat on its two questions the server writes the same
 English text (64 tokens, the second time; the first time it parted after 30
 tokens at a near tie) and, in German, a text of the same kind that starts with
