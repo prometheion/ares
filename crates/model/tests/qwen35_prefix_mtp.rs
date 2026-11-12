@@ -1,6 +1,6 @@
 //! What the prefix cache needs of the model's own draft block, on the real
-//! Qwen3.8-27B's block: only the block, the embedding table and the output
-//! head go to the device (two gigabytes), and the hidden states the model
+//! Qwen3.8-27B's block: only the block, the embedding rows it keeps and the
+//! output head go to the device (two gigabytes), and the hidden states the model
 //! would compute are made up by the test.
 //!
 //! The block keeps state per sequence: its keys and values in the same pages
@@ -128,6 +128,7 @@ impl Rig {
             stream: &self.stream,
             step: self.record.ptr(),
             dims: record.dims(),
+            tokens,
             segments: &segments,
             tables: self.tables.ptr(),
             pages: self.pages.ptr(),
@@ -151,6 +152,7 @@ impl Rig {
             stream: &self.stream,
             step: self.record.ptr(),
             dims: record.dims(),
+            tokens: &tokens,
             segments: &segments,
             tables: self.tables.ptr(),
             pages: self.pages.ptr(),
@@ -269,7 +271,7 @@ fn setup() -> Option<Setup> {
     Some(Setup { device: Device::open(ordinal, Wait::Block).unwrap(), config, gguf })
 }
 
-/// Only the draft block, the embedding table and the head on the device.
+/// Only the draft block, the embedding rows it keeps and the head on the device.
 fn placement(c: &Config) -> Placement {
     let mut placement = Placement::single(c);
     placement.devices[0].blocks = vec![None; c.n_layer];

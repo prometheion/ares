@@ -27,7 +27,7 @@ use ares_core::units::{Bytes, MIB};
 use ares_cuda::{Device, DeviceInfo, Wait};
 use ares_gguf::Gguf;
 use ares_model::qwen35::device::{
-    Options, Placement, Qwen35, Spread, exact_bytes, page_bytes, step_rows,
+    EmbeddingReport, Options, Placement, Qwen35, Spread, exact_bytes, page_bytes, step_rows,
 };
 use ares_model::qwen35::weights::{Matrix, Mixer};
 use ares_model::qwen35::{Config, Weights};
@@ -222,7 +222,8 @@ fn block_bytes(w: &Weights<'_>, layer: usize) -> (u64, u64) {
 /// What `placement` puts on each device, estimated without a device.
 ///
 /// The weights follow the loader (`qwen35::device::load`): a device's slice of
-/// every block, the embedding table, its rows of the head, the draft block.
+/// every block, the embedding rows the draft chain picks, its rows of the head,
+/// the draft block.
 /// The scratch of a step follows `Part::open` with the widths of the whole
 /// model, which a slice does not exceed. Both are estimates: the loader
 /// aligns and rearranges, and the part has more small buffers than are
@@ -280,14 +281,17 @@ fn footprint(
                     per_sequence += (conv + delta) * options.state.bytes();
                 }
             }
-            if plan.embedding {
-                weights += matrix_bytes(&w.token_embd);
+            // The embedding table lies in host memory. The device that embeds
+            // keeps the rows of the tokens the draft chain picks, as a matrix
+            // of their own unless the head is the table, whose rows they
+            // are then.
+            if let Some(draft) =
+                placement.draft.as_ref().filter(|draft| draft.device == index && w.output.is_some())
+            {
+                weights +=
+                    part_of(matrix_bytes(&w.token_embd), draft.head_rows as usize, c.n_vocab);
             }
-            // A head that is the embedding table is stored once where both are.
-            let shared = plan.embedding && w.output.is_none() && placement.draft.is_none();
-            if !shared {
-                weights += part_of(matrix_bytes(w.head()), plan.head.len(), c.n_vocab);
-            }
+            weights += part_of(matrix_bytes(w.head()), plan.head.len(), c.n_vocab);
             if let (Some(_), Some(nextn)) =
                 (placement.draft.as_ref().filter(|draft| draft.device == index), &w.nextn)
             {
@@ -313,6 +317,28 @@ fn footprint(
             }
         })
         .collect()
+}
+
+/// Where the token embedding of a device lies, for the report at start.
+fn embedding_note(e: &EmbeddingReport) -> String {
+    if !e.embeds {
+        return String::new();
+    }
+    let on_device = match (e.kept_rows, e.shared_with_head) {
+        (0, _) => "no rows on the device".to_owned(),
+        (rows, true) => format!("{rows} rows on the device, the first rows of the head"),
+        (rows, false) => format!("{rows} rows on the device ({})", Bytes(e.kept_bytes)),
+    };
+    match e.host_bytes {
+        0 => format!(", token embedding {} on the device ({on_device})", Bytes(e.table_bytes)),
+        host => format!(
+            ", token embedding {} in page-locked RAM ({} locked, with the rows of a step; \
+             {on_device}; {} of the step scratch for the rows the host stages)",
+            Bytes(e.table_bytes),
+            Bytes(host),
+            Bytes(e.staged_bytes)
+        ),
+    }
 }
 
 /// The link of a device to its slot, as Linux reports it.
@@ -589,7 +615,7 @@ fn load_qwen35(gguf: Gguf, options: &LoadOptions, begun: Instant) -> Result<Load
         "this model file has no draft block (multi-token prediction)",
     )?;
     // The model's draft block is not built for a layer split (the block, the
-    // embedding table and the first rows of the head must be on one device).
+    // device that embeds and the first rows of the head must be one device).
     let layer = options.split == Some(SplitKind::Layer);
     if mtp && layer && options.drafters.is_some() {
         return Err(refuse(
@@ -920,9 +946,13 @@ fn load_qwen35(gguf: Gguf, options: &LoadOptions, begun: Instant) -> Result<Load
         ..GpuConfig::new(&runtime_config, &*model)
     };
     tracing::info!(
-        "plan: RAM, at most {} for the engine ({why_ram}): {} for its step buffers, the rest for          checkpoints of recurrent state, {} each over all devices, {}; the memory is page-locked          as checkpoints are taken",
+        "plan: RAM, at most {} for the engine ({why_ram}): {} for its step buffers{}, the rest for          checkpoints of recurrent state, {} each over all devices, {}; the memory is page-locked          as checkpoints are taken",
         Bytes(ram),
         Bytes(required),
+        match model.pinned_ram() {
+            0 => String::new(),
+            bytes => format!(" and the token embedding table ({} of them)", Bytes(bytes)),
+        },
         Bytes(checkpoint),
         match checkpoint {
             0 => "none for this model".to_owned(),
@@ -984,7 +1014,7 @@ fn load_qwen35(gguf: Gguf, options: &LoadOptions, begun: Instant) -> Result<Load
         let free = h.device.mem_info()?.free;
         let taken = h.free.saturating_sub(free);
         tracing::info!(
-            "device {} ({}): weights {} in {:.1} s{}, recurrent state {} ({} per sequence), K \
+            "device {} ({}): weights {} in {:.1} s{}{}, recurrent state {} ({} per sequence), K \
              and V {} ({} per 1000 tokens), exact K/V entries {}, step scratch {}, inputs kept \
              for draft windows {}, draft block buffers {}, everything else {}; taken {}, free {}",
             h.device.ordinal(),
@@ -996,6 +1026,7 @@ fn load_qwen35(gguf: Gguf, options: &LoadOptions, begun: Instant) -> Result<Load
                 .as_ref()
                 .map(|d| format!(" (of which the draft block {})", Bytes(d.weights)))
                 .unwrap_or_default(),
+            embedding_note(&report.embedding),
             Bytes(state),
             Bytes(report.state_bytes_per_slot),
             Bytes(kv_bytes),

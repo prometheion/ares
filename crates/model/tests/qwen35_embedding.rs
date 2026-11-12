@@ -1,0 +1,195 @@
+//! Where the token embedding of `qwen35` lies, on made-up models: in host memory, with the
+//! device keeping only the rows its draft chain can pick, and a tied head (a file without
+//! `output.weight`, whose head is the table) keeping its own.
+//!
+//! The placement tests need nothing; the device tests need `ARES_TEST_CUDA=1` (the models
+//! are made here), `ARES_TEST_DEVICE` picks the GPU (default 0). Lines that start with `ERR`
+//! are the measurements.
+
+mod common;
+
+use std::sync::OnceLock;
+
+use ares_core::GgmlType;
+use ares_cuda::{Device, Precision, Segment, Wait};
+use ares_gguf::Gguf;
+use ares_model::qwen35::device::{EmbeddingReport, Harness, Options, Placement};
+use ares_model::qwen35::{Config, LogitRows, Reference, SequenceState, Weights};
+use common::{Spec, Synth, TempDir};
+
+fn gpu() -> Option<&'static Device> {
+    static DEVICE: OnceLock<Option<Device>> = OnceLock::new();
+    DEVICE
+        .get_or_init(|| {
+            if std::env::var_os("ARES_TEST_CUDA").is_none() {
+                eprintln!("skipped: set ARES_TEST_CUDA=1 to run the tests that open GPUs");
+                return None;
+            }
+            let ordinal =
+                std::env::var("ARES_TEST_DEVICE").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+            Some(Device::open(ordinal, Wait::Block).expect("open device"))
+        })
+        .as_ref()
+}
+
+/// What the draft block may propose in a case.
+#[derive(Clone, Debug)]
+enum Drafts {
+    /// The model has no draft block placed.
+    No,
+    /// It proposes the tokens of a list.
+    Listed(Vec<u32>),
+    /// It proposes every token of the device's head.
+    Any,
+}
+
+const MAX_ROWS: u32 = 32;
+
+fn spec(tied: bool, nextn: bool, matrix_type: GgmlType) -> Spec {
+    Spec { nextn, tied, matrix_type, n_vocab: 160, ..Spec::default() }
+}
+
+fn placement(c: &Config, drafts: &Drafts) -> Placement {
+    let single = Placement::single(c);
+    match drafts {
+        Drafts::No => single,
+        Drafts::Listed(tokens) => single.with_draft(c, Some(tokens)).unwrap(),
+        Drafts::Any => single.with_draft(c, None).unwrap(),
+    }
+}
+
+/// Every third token, in a different order than the table's.
+fn listed(n_vocab: usize) -> Vec<u32> {
+    let mut tokens: Vec<u32> = (0..n_vocab as u32).filter(|t| t % 3 == 1).collect();
+    tokens.reverse();
+    tokens
+}
+
+#[test]
+fn the_rows_a_draft_chain_picks_are_the_draft_heads_and_the_host_stages_the_rest() {
+    let dir = TempDir::new("embedding-placement");
+    let synth = Synth::new(spec(false, true, GgmlType::F32));
+    let gguf = Gguf::open(dir.file("model.gguf", &synth.builder().build())).unwrap();
+    let c = Config::from_gguf(&gguf).unwrap();
+    // No draft block: nothing is kept, every row of every step comes from the host.
+    let none = placement(&c, &Drafts::No);
+    assert_eq!((none.kept_rows(), none.stages_rows(&c)), (0, true));
+    // A draft vocabulary: the rows of its tokens, no matter in which order they were listed.
+    let list = listed(c.n_vocab);
+    let some = placement(&c, &Drafts::Listed(list.clone()));
+    assert_eq!((some.kept_rows(), some.stages_rows(&c)), (list.len() as u32, true));
+    // Without one the chain can pick every token of the head on the device: the whole table
+    // is kept, and the host stages nothing.
+    let any = placement(&c, &Drafts::Any);
+    assert_eq!((any.kept_rows(), any.stages_rows(&c)), (c.n_vocab as u32, false));
+}
+
+/// The logits of the reference for `ids`, one row of the vocabulary each.
+fn reference_logits(c: &Config, w: &Weights<'_>, ids: &[u32]) -> Vec<f32> {
+    let mut state = SequenceState::new(c);
+    let window = Reference::new(c, w).forward(&mut state, ids, LogitRows::All).unwrap();
+    (0..ids.len()).flat_map(|row| window.logits_of(row).unwrap().to_vec()).collect()
+}
+
+fn rel_l2(got: &[f32], want: &[f32]) -> f64 {
+    assert_eq!(got.len(), want.len());
+    let (mut d, mut n) = (0.0f64, 0.0f64);
+    for (g, w) in got.iter().zip(want) {
+        d += (f64::from(*g) - f64::from(*w)).powi(2);
+        n += f64::from(*w).powi(2);
+    }
+    (d / n.max(1e-300)).sqrt()
+}
+
+/// What the embedding of a part should be in a case.
+fn expected(
+    tied: bool,
+    drafts: &Drafts,
+    n_vocab: usize,
+    table_bytes: u64,
+    stage_bytes: u64,
+) -> EmbeddingReport {
+    let row = table_bytes / n_vocab as u64;
+    let kept_rows = match drafts {
+        Drafts::No => 0,
+        Drafts::Listed(tokens) => tokens.len(),
+        Drafts::Any => n_vocab,
+    };
+    let stages = kept_rows < n_vocab;
+    EmbeddingReport {
+        embeds: true,
+        table_bytes,
+        host_bytes: if stages { table_bytes + stage_bytes } else { 0 },
+        kept_rows: kept_rows as u32,
+        // A tied head holds the rows anyway: they are its first rows.
+        kept_bytes: if tied { 0 } else { kept_rows as u64 * row },
+        shared_with_head: tied && kept_rows > 0,
+        staged_bytes: if stages { stage_bytes } else { 0 },
+    }
+}
+
+#[test]
+fn the_model_reads_its_prompt_from_host_rows_and_kept_rows_with_a_head_of_its_own_or_a_tied_one() {
+    let Some(device) = gpu() else { return };
+    let ids: Vec<u32> = (0..29).map(|i| ((i * 37 + 11) % 160) as u32).collect();
+    // The prompt has tokens of the list and tokens that are not.
+    let list = listed(160);
+    assert!(ids.iter().any(|t| list.contains(t)) && ids.iter().any(|t| !list.contains(t)));
+    for matrix_type in [GgmlType::F32, GgmlType::Q8_0] {
+        for tied in [false, true] {
+            let synth = Synth::new(spec(tied, true, matrix_type));
+            let dir = TempDir::new("embedding");
+            let gguf = Gguf::open(dir.file("model.gguf", &synth.builder().build())).unwrap();
+            let c = Config::from_gguf(&gguf).unwrap();
+            let w = Weights::load(&gguf, &c).unwrap();
+            assert_eq!(w.output.is_none(), tied);
+            let want = reference_logits(&c, &w, &ids);
+            for drafts in [Drafts::No, Drafts::Listed(list.clone()), Drafts::Any] {
+                let placement = placement(&c, &drafts);
+                let opts = Options {
+                    precision: Precision::Exact,
+                    max_rows: MAX_ROWS,
+                    logit_rows: 32,
+                    window_rows: if matches!(drafts, Drafts::No) { 0 } else { 8 },
+                    ..Options::default()
+                };
+                let mut harness =
+                    Harness::open_placed(device, &c, &w, &placement, &opts, 1, 512).unwrap();
+                let what = format!("{matrix_type} tied {tied} {drafts:?}");
+
+                let table_bytes = w.token_embd.bytes().len() as u64;
+                let row_bytes = table_bytes / c.n_vocab as u64;
+                let report = harness.part().embedding_report();
+                let stage_bytes = u64::from(MAX_ROWS) * row_bytes;
+                assert_eq!(
+                    report,
+                    expected(tied, &drafts, c.n_vocab, table_bytes, stage_bytes),
+                    "{what}"
+                );
+
+                let n = ids.len();
+                let out: Vec<u32> = (0..n as u32).collect();
+                let segments =
+                    [Segment { row0: 0, n_rows: n as u32, slot: 0, pos0: 0, direct: true }];
+                let got = harness.step(&segments, &ids, &out).unwrap();
+                let width = got.len() / n;
+                // The columns of the logits are the head's rows: in the order of the draft
+                // vocabulary when there is one.
+                let mut ordered = vec![0.0f32; got.len()];
+                for row in 0..n {
+                    for column in 0..width {
+                        let token = placement.head_token(column as u32) as usize;
+                        ordered[row * c.n_vocab + token] = got[row * width + column];
+                    }
+                }
+                assert_eq!(width, c.n_vocab, "{what}");
+                let error = rel_l2(&ordered, &want);
+                eprintln!("ERR logits {what}: {error:.2e} from the reference");
+                // The gather is exact; what differs from the reference is the products'
+                // rounding (and the 8-bit activations' of Q8_0 weights).
+                let limit = if matrix_type == GgmlType::F32 { 2e-2 } else { 0.25 };
+                assert!(error < limit, "{what}: logits {error}");
+            }
+        }
+    }
+}

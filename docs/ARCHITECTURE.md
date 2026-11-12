@@ -856,7 +856,8 @@ are committed, not at once.
 
 **The model's own drafts** (`qwen35`, the next-token-prediction block of the
 27B). A step with them is still enqueued whole: the block's chain runs first,
-on the device that holds the embedding table, each link's pick made by the
+on the device that embeds (which keeps the rows of the tokens the chain can
+pick, see "The token embedding of `qwen35`"), each link's pick made by the
 sampler with the settings and the noise of the row that will verify it and
 written straight into the token array of the step record on the device; then
 the verify window, whose embedding reads those tokens; then, for every row of
@@ -1993,6 +1994,41 @@ itself agrees with the reference in 704 of 725 rows.
 The weights are loaded in about 4 s from a cached file. The recurrent state
 takes 150 MiB per sequence over both cards, K and V 33 MiB per 1000 tokens.
 
+**The token embedding of `qwen35`.** The embedding table (`token_embd`,
+248 320 rows of 5120 values in the file's types: 313 MiB in the small test
+file, 680 MiB at Q4_K_S) does not lie on the device. A step needs the rows of
+its own tokens, a few kilobytes each in the file's form, and the gather kernel
+decodes them wherever they lie (`kernels/layer_embed.cuh`: all 28 weight
+types). Where they come from (`device/embed.rs`):
+
+- **The host.** The table lies in page-locked host memory of the device that
+  embeds (the first one), booked as required memory of the engine's one RAM
+  limit (`Model::pinned_ram`). A step copies the rows of its tokens into a
+  page-locked staging buffer, one row per row of the step, and uploads them
+  on the step's stream in one copy right after the record; no event, no wait.
+  A prompt step of 512 rows uploads 1.4 MiB at Q4_K.
+- **The device itself, for the draft chain.** The model's own draft block
+  picks tokens inside the step, on the device, and embeds them (the chain's
+  next link, the verify window, the block following the model) before the
+  host knows them. So the device that holds the draft block keeps the rows of
+  every token the chain can pick, which are the rows of the draft head: with
+  a draft vocabulary those tokens in ascending order (the same list that
+  orders the head, so the gather finds a row by binary search and nothing
+  extra is stored), without one the first rows of the head on the device (the
+  whole table when the device holds the whole head, and then the host stages
+  nothing). A device without a draft block keeps no row. The newest token of
+  a chain, which the host knows, is staged with the draft block's records.
+  The gather takes a row from the kept rows when they hold its token and
+  from the staged row of its position otherwise.
+- **A tied head** (a file without `output.weight`, whose head is the table)
+  is a head like any other: its rows are laid out as the head's rows, in the
+  layout that measures faster, and the embedding adds nothing. With a draft
+  block on its device the head is one matrix in the file's layout instead,
+  and the rows of the draft head, which are its first rows, are the rows the
+  gather keeps: still nothing twice on the device.
+
+A layer split no longer counts the table in the first device's share.
+
 **Device layouts in the model.** At load the model first measures how the
 few-row kernels launch for every shape of a matrix that can have the device
 layout (`Kernels::tune_layout`, four launches timed over the probe buffer: a
@@ -2649,7 +2685,10 @@ shared by the executor and the device threads. It has three users so far:
 
 - the step record and the read-back buffers of the devices, with the
   page-locked buffers a model's parts hold (required, booked at start:
-  `required_ram`, `Model::pinned_ram`);
+  `required_ram`, `Model::pinned_ram`); for `qwen35` that includes the token
+  embedding table (313 MiB in the small test file, 680 MiB in the 27B at
+  Q4_K_S) and the staging buffer of the rows a step uploads from it, unless
+  the device keeps the whole table (see "The token embedding of `qwen35`");
 - the tier of experts of a mixture-of-experts model (elastic, priority 100,
   floor 0), which the model locks once at load: as much as the limit leaves
   and the experts that have no VRAM slot can use. It does not give anything

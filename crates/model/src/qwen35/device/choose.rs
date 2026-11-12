@@ -250,9 +250,9 @@ pub struct LayoutReport {
     /// activations and for f16.
     pub preparations: Vec<(u32, u32, [f32; 2])>,
     /// The matrices in each layout and their bytes on the device:
-    /// `[file, device]`. The embedding table counts as the file's; a head
-    /// that is the same bytes is not counted, and a head in two parts is
-    /// two matrices.
+    /// `[file, device]`. The rows of the embedding table that the draft chain
+    /// keeps count as the file's (a tied head's rows, which they are, count as
+    /// the head), and a head in two parts is two matrices.
     pub matrices: [u32; 2],
     pub bytes: [u64; 2],
     /// The bytes the device layout added: rows rounded up to 16.

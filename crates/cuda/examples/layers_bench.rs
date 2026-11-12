@@ -22,9 +22,9 @@
 
 use ares_core::GgmlType;
 use ares_cuda::{
-    AttentionShape, CommitSet, Device, DeviceBuffer, Event, LayerKernels, NormKind, OutputGate,
-    RecurrentShape, Result, RopeParams, Segment, StateFormat, StepDims, StepRecord, Stream, Wait,
-    devices, quantized_activation_bytes,
+    AttentionShape, CommitSet, Device, DeviceBuffer, DevicePtr, EmbedRows, Event, KeptRows,
+    LayerKernels, NormKind, OutputGate, RecurrentShape, Result, RopeParams, Segment, StateFormat,
+    StepDims, StepRecord, Stream, Wait, devices, quantized_activation_bytes,
 };
 
 const D: u32 = 5120;
@@ -223,10 +223,17 @@ fn run(rig: &Rig, configs: &[Config], title: &str, with_state_rotation: bool, on
                     &rig.stream,
                     step.ptr(),
                     dims,
-                    table.ptr(),
-                    GgmlType::Q3_K,
-                    table_rows as u32,
-                    D,
+                    &EmbedRows {
+                        ty: GgmlType::Q3_K,
+                        n_vocab: table_rows as u32,
+                        n_embd: D,
+                        kept: KeptRows {
+                            rows: table.ptr(),
+                            tokens: DevicePtr::NULL,
+                            count: table_rows as u32,
+                        },
+                        staged: DevicePtr::NULL,
+                    },
                     emb_out.ptr(),
                 )
                 .unwrap()

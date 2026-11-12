@@ -17,6 +17,7 @@ use ares_state::PageLayout;
 use ares_tokenizer::{ChatOptions, Tokenizer};
 
 use super::choose::{Balance, LayoutReport};
+use super::embed::{EmbeddingReport, HostRows, TableShape};
 use super::part::{
     DraftBytes, DraftChain, DraftStep, Exchange, Options, PAGE_ENTRY, Part, PartSetup, StepEnv,
     TAILS_PER_SLOT, checkpoint_bytes, page_bytes,
@@ -66,6 +67,8 @@ pub struct PartReport {
     pub exact_bytes: u64,
     /// What the model's draft block takes, on the device that holds it.
     pub draft: Option<DraftBytes>,
+    /// Where the token embedding lies and what it takes.
+    pub embedding: EmbeddingReport,
     /// Which weight matrices got which layout, and what the choice took.
     pub layouts: LayoutReport,
     /// Every reservation in the device's ledger once the part was built: the
@@ -103,6 +106,9 @@ pub struct Qwen35 {
     /// Where the parts of a tensor split, which the runtime opens at the
     /// same time, tell each other what the weight products cost them.
     balance: Option<Balance>,
+    /// The page-locked host memory the device that embeds holds for the token
+    /// embedding: none when it keeps the whole table.
+    pinned: u64,
 }
 
 impl std::fmt::Debug for Qwen35 {
@@ -128,20 +134,22 @@ impl Qwen35 {
         context: u32,
     ) -> Result<Self, OpenError> {
         let config = Config::from_gguf(&gguf)?;
-        let placement = {
+        let (placement, table) = {
             let weights = Weights::load(&gguf, &config)?;
-            match spread {
+            let table = TableShape::of(&weights.token_embd);
+            let placement = match spread {
                 Spread::Single => Placement::single(&config),
                 Spread::Tensor(shares) => Placement::tensor(&config, shares)?,
                 Spread::TensorByHalf(shares, halves) => {
                     Placement::tensor_by_half(&config, shares, halves)?
                 }
                 Spread::Layer(shares) => Placement::layer(&config, &weights, shares)?,
-            }
+            };
+            (placement, table)
         };
         // A model with a next-token-prediction block drafts with it wherever
-        // it can: when windows may carry drafts, and the embedding table and
-        // the first rows of the head are on one device (not a layer split).
+        // it can: when windows may carry drafts, and the device that embeds
+        // has the first rows of the head (not a layer split).
         let placement =
             if config.n_nextn == 1 && options.window_rows > 1 && placement.split != Split::Layer {
                 placement.with_draft(&config, options.draft_vocabulary.as_deref())?
@@ -153,6 +161,11 @@ impl Qwen35 {
         let context = context.clamp(1, config.n_ctx as u32);
         let balance = (placement.split == Split::Tensor && placement.n_devices() > 1)
             .then(|| Balance::new(placement.n_devices()));
+        let pinned = if placement.stages_rows(&config) {
+            HostRows::locked_bytes(&table, options.max_rows)
+        } else {
+            0
+        };
         let format = chat::chat_format(&tokenizer, &ChatOptions::default());
         Ok(Self {
             gguf,
@@ -169,6 +182,7 @@ impl Qwen35 {
             chat: ChatOptions::default(),
             reports: Mutex::new(Vec::new()),
             balance,
+            pinned,
         })
     }
 
@@ -280,6 +294,10 @@ impl Model for Qwen35 {
         }
     }
 
+    fn pinned_ram(&self) -> u64 {
+        self.pinned
+    }
+
     fn max_rows(&self) -> u32 {
         self.options.max_rows
     }
@@ -385,11 +403,13 @@ impl Model for Qwen35 {
             page_bytes: part.page_bytes(),
             exact_bytes: part.exact_bytes(),
             draft: part.draft_bytes(),
+            embedding: part.embedding_report(),
             layouts: part.layouts().clone(),
             ledger: cx.ledger.entries().map(|(name, bytes)| (name.to_owned(), bytes)).collect(),
         });
         Ok(Box::new(Qwen35Device {
             part,
+            tokens: Vec::new(),
             segments: Vec::new(),
             replay: Vec::new(),
             chains: Vec::new(),
@@ -401,6 +421,8 @@ impl Model for Qwen35 {
 #[derive(Debug)]
 struct Qwen35Device {
     part: Part,
+    /// The tokens of the step's rows, read from the record.
+    tokens: Vec<u32>,
     /// The segments of the step, read from the record once.
     segments: Vec<Segment>,
     /// The rows of the step that are replays.
@@ -491,6 +513,8 @@ impl DeviceModel for Qwen35Device {
             self.part.enqueue_commit(step.stream, step.record_on_device.offset(offset), dims)?;
         }
         self.part.enqueue_copies(step.stream, step.pages, record)?;
+        self.tokens.clear();
+        self.tokens.extend((0..record.rows()).map(|i| record.row(i).token));
         self.segments.clear();
         self.segments.extend((0..record.segments()).map(|i| record.segment(i)));
         self.replay.clear();
@@ -531,6 +555,7 @@ impl DeviceModel for Qwen35Device {
             stream: step.stream,
             step: step.record_on_device,
             dims: record.dims(),
+            tokens: &self.tokens,
             segments: &self.segments,
             tables: step.tables,
             pages: step.pages,

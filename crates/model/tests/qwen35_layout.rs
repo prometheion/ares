@@ -542,9 +542,9 @@ fn the_0_8b_in_either_layout_matches_the_reference() {
         );
         match layouts {
             Layouts::File => assert_eq!(report.matrices[1], 0),
-            // The embedding table, which is the head too, is all that the
-            // gather keeps in the file's layout.
-            Layouts::Device => assert_eq!(report.matrices[0], 1),
+            // The embedding table lies in host memory, and the 0.8B's head, which
+            // is the same tensor, is a head like any other.
+            Layouts::Device => assert_eq!(report.matrices[0], 0),
             Layouts::Measured { .. } => {}
         }
         for n in [1usize, 4, 21] {

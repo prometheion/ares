@@ -52,8 +52,9 @@ pub use kernels::{
     Precision, PrefillPath, PrefillShape, WeightLayout,
 };
 pub use layers::{
-    AttentionShape, CommitSet, LayerKernels, NormKind, OutputGate, RecurrentShape, RopeParams,
-    Segment, StateFormat, StepDims, StepRecord, quantized_activation_bytes,
+    AttentionShape, CommitSet, EmbedRows, KeptRows, LayerKernels, NormKind, OutputGate,
+    RecurrentShape, RopeParams, Segment, StateFormat, StepDims, StepRecord,
+    quantized_activation_bytes,
 };
 pub use layers::{MERGE_MAX_WIDTH, MergeNorm, Wire, partial_wire_bytes};
 pub use memory::{DeviceBuffer, DevicePtr, HostRegistration, PinnedBuffer};

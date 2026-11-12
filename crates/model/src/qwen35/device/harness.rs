@@ -53,13 +53,29 @@ impl Harness {
         slots: u32,
         cells: u32,
     ) -> Result<Self, ModelError> {
-        let placement = Placement::single(c);
+        Self::open_placed(device, c, w, &Placement::single(c), opts, slots, cells)
+    }
+
+    /// [`Harness::open`] for a placement on one device: [`Placement::single`],
+    /// possibly with the draft block ([`Placement::with_draft`]).
+    pub fn open_placed(
+        device: &Device,
+        c: &Config,
+        w: &Weights<'_>,
+        placement: &Placement,
+        opts: &Options,
+        slots: u32,
+        cells: u32,
+    ) -> Result<Self, ModelError> {
+        if placement.n_devices() != 1 {
+            return Err(ModelError::Invalid("a harness drives one device".into()));
+        }
         let kernels = Kernels::load(device)?;
         let stream = Stream::new(device, 0)?;
         let table_stride = cells.div_ceil(ENTRY_CELLS).max(1);
         let pages = slots * table_stride;
         let mut ledger = Ledger::new(format!("CUDA{}", device.ordinal()), device.mem_info()?.free);
-        let page_bytes = super::part::page_bytes(c, &placement, 0, opts);
+        let page_bytes = super::part::page_bytes(c, placement, 0, opts);
         let pool_bytes = (u64::from(pages) * page_bytes).max(64);
         let record_bytes =
             (128 + 32 * u64::from(slots) + 24 * u64::from(opts.max_rows)).next_multiple_of(64);
@@ -71,7 +87,7 @@ impl Harness {
         let part = Part::open(
             c,
             w,
-            &placement,
+            placement,
             opts,
             PartSetup {
                 index: 0,
@@ -159,6 +175,7 @@ impl Harness {
             stream: &self.stream,
             step: self.record.ptr(),
             dims,
+            tokens,
             segments,
             tables: self.tables.ptr(),
             pages: self.pages.ptr(),
@@ -201,13 +218,15 @@ impl Harness {
         x: &[f32],
     ) -> Result<Vec<f32>, ModelError> {
         let n = x.len() / self.d;
-        let record = StepRecord::new(segments, &vec![0; n], None, &[])?;
+        let tokens = vec![0; n];
+        let record = StepRecord::new(segments, &tokens, None, &[])?;
         let dims = self.upload(&record)?;
         self.part.scratch().write(self.part.x_offset(), &bytes_of(x))?;
         let env = StepEnv {
             stream: &self.stream,
             step: self.record.ptr(),
             dims,
+            tokens: &tokens,
             segments,
             tables: self.tables.ptr(),
             pages: self.pages.ptr(),

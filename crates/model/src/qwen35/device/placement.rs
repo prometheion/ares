@@ -25,7 +25,7 @@
 //!   ([`HalfShares`], from measured times) and cuts each half at the unit
 //!   nearest to it.
 //! - **Layer split**: each device holds a range of whole blocks, the first one
-//!   the embedding table and the last one the output head.
+//!   embeds the tokens and the last one holds the output head.
 
 use std::ops::Range;
 use std::sync::Arc;
@@ -56,7 +56,9 @@ pub struct DevicePlan {
     /// Per block of the model its slice here, or `None` when the block is on
     /// another device.
     pub blocks: Vec<Option<BlockSlice>>,
-    /// Whether the device holds the token embedding table.
+    /// Whether the device embeds the step's tokens. The table itself lies in
+    /// host memory; the device keeps the rows the draft chain can pick
+    /// ([`Placement::kept_rows`]).
     pub embedding: bool,
     /// The rows of the output head this device computes logits for. Row `r`
     /// is token `r` unless a draft vocabulary reorders the head
@@ -93,9 +95,10 @@ pub struct Placement {
 /// The place of the next-token-prediction block, with which the model drafts
 /// its own next tokens.
 ///
-/// The whole block is on one device, the one with the embedding table: a
-/// draft chain reads the embedding of each token it picks and must not cross
-/// to another device between its links. Its head is the first rows of the
+/// The whole block is on one device, the one that embeds: a draft chain reads
+/// the embedding of each token it picks, a row of the table that must be on
+/// that device, and the chain must not cross to another device between its
+/// links. Its head is the first rows of the
 /// output head on that device. A draft vocabulary puts the rows of its tokens
 /// first, so the draft head reads those rows only and takes no memory of its
 /// own.
@@ -194,8 +197,8 @@ impl Placement {
     }
 
     /// A tensor split: device `i` holds about `shares[i]` of every matrix
-    /// (the shares are normalised to add up to 1). The embedding table is on
-    /// the first device; the head is cut by tokens.
+    /// (the shares are normalised to add up to 1). The first device embeds;
+    /// the head is cut by tokens.
     pub fn tensor(c: &Config, shares: &[f64]) -> Result<Self, PlacementError> {
         Self::tensor_cut(c, shares, None)
     }
@@ -295,19 +298,17 @@ impl Placement {
     }
 
     /// A layer split: device `i` holds a range of whole blocks with about
-    /// `shares[i]` of the weights' bytes, the embedding table counted for
-    /// the first device and the head for the last.
+    /// `shares[i]` of the weights' bytes, the head counted for the last
+    /// device (the embedding table lies in host memory).
     pub fn layer(c: &Config, w: &Weights<'_>, shares: &[f64]) -> Result<Self, PlacementError> {
         let cumulative = check_shares(shares)?;
         let n = shares.len();
         if n == 1 {
             return Ok(Self::single(c));
         }
-        let embedding = matrix_bytes(&w.token_embd);
-        // A tied head is uploaded again on the last device.
         let head = matrix_bytes(w.head());
         let blocks: Vec<u64> = (0..c.n_layer).map(|l| block_bytes(w, l)).collect();
-        let total = (embedding + head + blocks.iter().sum::<u64>()) as f64;
+        let total = (head + blocks.iter().sum::<u64>()) as f64;
         let single = Self::single(c);
         let full = &single.devices[0].blocks;
         let mut devices: Vec<DevicePlan> = (0..n)
@@ -318,7 +319,7 @@ impl Placement {
             })
             .collect();
         let mut device = 0;
-        let mut used = embedding as f64;
+        let mut used = 0.0;
         for (layer, bytes) in blocks.iter().enumerate() {
             // A block goes to the next device when more than half of it lies
             // past this device's share.
@@ -353,7 +354,7 @@ impl Placement {
         let on_device = self.devices[device].head.clone();
         if on_device.start != 0 || on_device.is_empty() {
             return Err(PlacementError(
-                "the draft block needs the embedding table and the first rows of the output \
+                "the draft block needs the device that embeds and the first rows of the output \
                  head on one device, which a layer split does not give"
                     .into(),
             ));
@@ -402,9 +403,22 @@ impl Placement {
         self.devices.len()
     }
 
-    /// The device that holds the embedding table.
+    /// The device that embeds the step's tokens.
     pub fn embedding_device(&self) -> usize {
         self.devices.iter().position(|d| d.embedding).unwrap_or(0)
+    }
+
+    /// The rows of the token embedding table that lie on the device that
+    /// embeds: those of the tokens the draft block can pick, none without a
+    /// draft block. The device gets the other rows from the host.
+    pub fn kept_rows(&self) -> u32 {
+        self.draft.as_ref().map_or(0, |d| d.head_rows)
+    }
+
+    /// Whether the host stages rows of the table for the steps: the device
+    /// that embeds keeps the rows of fewer than all tokens.
+    pub fn stages_rows(&self, c: &Config) -> bool {
+        self.kept_rows() < c.n_vocab as u32
     }
 
     /// The range of blocks device `index` holds under a layer split, or all

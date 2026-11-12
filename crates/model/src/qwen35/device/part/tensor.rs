@@ -81,6 +81,7 @@ impl Part {
                 stream: env.stream,
                 step: env.step,
                 dims: env.dims,
+                tokens: env.tokens,
                 segments: env.segments,
                 tables: env.tables,
                 pages: env.pages,
@@ -93,6 +94,7 @@ impl Part {
             stream: env.stream,
             step: self.group_records.ptr().offset(group.record),
             dims: group.dims,
+            tokens: &env.tokens[group.first_row as usize..][..group.dims.n_rows as usize],
             segments: &group.segments,
             tables: env.tables,
             pages: env.pages,
@@ -106,22 +108,16 @@ impl Part {
         let bytes = dims.n_rows as usize * self.d as usize * 4;
         let (x, p) = (self.at(self.s.x), self.at(self.s.p));
         // The residual stream starts as the sum of the embedding, which one
-        // device holds, and nothing from the others.
-        // SAFETY: `x` and `p` hold the step's rows; the table is in the arena.
+        // device makes, and nothing from the others.
+        // SAFETY: `x` and `p` hold the step's rows; the kept rows are in the arena and
+        // the staged rows in the scratch.
         unsafe {
             stream.fill(x, 0, bytes)?;
-            match &self.w.embedding {
-                Some(table) => self.layers.embed_gather(
-                    stream,
-                    env.step,
-                    dims,
-                    self.w.mat(table),
-                    table.ty,
-                    table.n_out,
-                    table.n_in,
-                    p,
-                )?,
-                None => stream.fill(p, 0, bytes)?,
+            if self.w.embedding.is_some() {
+                let source = self.embed_rows()?;
+                self.layers.embed_gather(stream, env.step, dims, &source, p)?;
+            } else {
+                stream.fill(p, 0, bytes)?;
             }
         }
         self.mark(stream, Phase::Layers)?;

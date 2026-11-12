@@ -22,8 +22,9 @@ use std::sync::OnceLock;
 
 use ares_core::GgmlType;
 use ares_cuda::{
-    AttentionShape, Device, DeviceBuffer, Kernels, LayerKernels, NormKind, OutputGate, RopeParams,
-    Segment, StepRecord, Stream, Wait, device_count, quantized_activation_bytes,
+    AttentionShape, Device, DeviceBuffer, DevicePtr, EmbedRows, KeptRows, Kernels, LayerKernels,
+    NormKind, OutputGate, RopeParams, Segment, StepRecord, Stream, Wait, device_count,
+    quantized_activation_bytes,
 };
 
 fn gpus() -> Option<&'static [Device]> {
@@ -215,10 +216,17 @@ fn the_embedding_gather_decodes_every_weight_type() {
                         &gpu.stream,
                         step.ptr(),
                         record.dims(),
-                        table_buf.ptr(),
-                        ty,
-                        n_vocab as u32,
-                        n_embd as u32,
+                        &EmbedRows {
+                            ty,
+                            n_vocab: n_vocab as u32,
+                            n_embd: n_embd as u32,
+                            kept: KeptRows {
+                                rows: table_buf.ptr(),
+                                tokens: DevicePtr::NULL,
+                                count: n_vocab as u32,
+                            },
+                            staged: DevicePtr::NULL,
+                        },
                         out.ptr(),
                     )
                     .unwrap();
@@ -257,14 +265,126 @@ fn the_embedding_gather_decodes_every_weight_type() {
                     &gpu.stream,
                     buf.ptr(),
                     record.dims(),
-                    buf.ptr(),
-                    ty,
-                    1,
-                    256,
+                    &EmbedRows {
+                        ty,
+                        n_vocab: 1,
+                        n_embd: 256,
+                        kept: KeptRows::NONE,
+                        staged: buf.ptr(),
+                    },
                     buf.ptr(),
                 )
             };
             assert!(err.unwrap_err().to_string().contains(ty.name()), "{ty}");
+        }
+    }
+}
+
+/// A table of `n` rows of three Q8_0 blocks with scales of one, so that no value is a NaN.
+fn q8_table(rng: &mut Rng, n: usize) -> Vec<u8> {
+    let mut table: Vec<u8> = (0..n * 102).map(|_| (rng.unit() * 120.0) as i8 as u8).collect();
+    assert_eq!(GgmlType::Q8_0.block_bytes(), 34);
+    for block in table.as_chunks_mut::<34>().0 {
+        block[..2].copy_from_slice(&0x3C00u16.to_le_bytes());
+    }
+    table
+}
+
+#[test]
+fn the_embedding_gather_takes_a_row_from_the_rows_the_device_keeps_or_the_staged_one() {
+    let Some(gpus) = gpus() else { return };
+    let ty = GgmlType::Q8_0;
+    let (n_vocab, n_embd) = (40usize, 96usize);
+    let row_bytes = ty.bytes_for(n_embd as u64).unwrap() as usize;
+    assert_eq!(row_bytes, 102);
+    let mut rng = Rng(11);
+    // The table, and the rows the host stages, which differ from it so that the source of
+    // a row shows in its values.
+    let table = q8_table(&mut rng, n_vocab);
+    let other = q8_table(&mut rng, n_vocab);
+    let decode = |rows: &[u8], row: usize| {
+        let mut values = vec![0.0f32; n_embd];
+        ares_quant::dequantize(ty, &rows[row * row_bytes..][..row_bytes], &mut values).unwrap();
+        values
+    };
+    let zeros = vec![0.0f32; n_embd];
+    // The device keeps the rows of the tokens 3, 4, 17, 18 and 30 (as a list), or of the
+    // tokens 0 to 4 (as a prefix).
+    let listed: Vec<u32> = vec![3, 4, 17, 18, 30];
+    let listed_rows: Vec<u8> = listed
+        .iter()
+        .flat_map(|&t| table[t as usize * row_bytes..][..row_bytes].to_vec())
+        .collect();
+    let prefix = 5;
+    // Tokens kept by both, by one, by neither, and past the table.
+    let tokens: Vec<u32> = vec![17, 5, 30, 3, 39, 0, 4, 40, 41, u32::MAX, 18, 2];
+    let n = tokens.len();
+    for device in gpus {
+        let gpu = Gpu::new(device);
+        let segments = [Segment { row0: 0, n_rows: n as u32, slot: 0, pos0: 0, direct: false }];
+        let record = StepRecord::new(&segments, &tokens, None, &[]).unwrap();
+        let step = gpu.step(&record);
+        // Row `r` of the step is staged from `other` for the token it has; a kept token's
+        // staged row is the wrong one, which must not be read.
+        let staged: Vec<u8> = tokens
+            .iter()
+            .flat_map(|&t| {
+                let row = (t as usize + 1) % n_vocab;
+                other[row * row_bytes..][..row_bytes].to_vec()
+            })
+            .collect();
+        let (listed_buf, tokens_buf) = (
+            gpu.bytes(&listed_rows),
+            gpu.bytes(&listed.iter().flat_map(|t| t.to_le_bytes()).collect::<Vec<u8>>()),
+        );
+        let prefix_buf = gpu.bytes(&table[..prefix * row_bytes]);
+        let staged_buf = gpu.bytes(&staged);
+        let run = |kept: KeptRows, staged: DevicePtr| {
+            let out = gpu.empty((n * n_embd * 4) as u64);
+            let source =
+                EmbedRows { ty, n_vocab: n_vocab as u32, n_embd: n_embd as u32, kept, staged };
+            unsafe {
+                gpu.layers
+                    .embed_gather(&gpu.stream, step.ptr(), record.dims(), &source, out.ptr())
+                    .unwrap();
+            }
+            gpu.read(&out, n * n_embd)
+        };
+        let list = KeptRows { rows: listed_buf.ptr(), tokens: tokens_buf.ptr(), count: 5 };
+        let first = KeptRows { rows: prefix_buf.ptr(), tokens: DevicePtr::NULL, count: 5 };
+        let cases: [(&str, KeptRows, DevicePtr); 4] = [
+            ("a list and staged rows", list, staged_buf.ptr()),
+            ("a prefix and staged rows", first, staged_buf.ptr()),
+            ("staged rows only", KeptRows::NONE, staged_buf.ptr()),
+            ("a list only", list, DevicePtr::NULL),
+        ];
+        for (what, kept, staged_ptr) in cases {
+            let got = run(kept, staged_ptr);
+            for (r, &t) in tokens.iter().enumerate() {
+                let in_list = listed.iter().position(|&l| l == t);
+                let kept_row = match what {
+                    "a prefix and staged rows" => (t as usize) < prefix,
+                    "staged rows only" => false,
+                    _ => in_list.is_some(),
+                };
+                let want = if t as usize >= n_vocab {
+                    zeros.clone()
+                } else if kept_row {
+                    match what {
+                        "a prefix and staged rows" => decode(&table, t as usize),
+                        _ => decode(&listed_rows, in_list.unwrap()),
+                    }
+                } else if staged_ptr != DevicePtr::NULL {
+                    decode(&staged, r)
+                } else {
+                    zeros.clone()
+                };
+                assert_eq!(
+                    &got[r * n_embd..][..n_embd],
+                    want.as_slice(),
+                    "{what}: row {r} (token {t})"
+                );
+            }
         }
     }
 }

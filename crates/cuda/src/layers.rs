@@ -88,6 +88,44 @@ pub struct StepDims {
     pub n_out: u32,
 }
 
+/// Where the embedding gather finds the rows of a token embedding table: a table of
+/// `n_vocab` rows of `n_embd` values of type `ty`, of which the device keeps some rows and
+/// the host stages others for the step.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EmbedRows {
+    pub ty: GgmlType,
+    pub n_vocab: u32,
+    pub n_embd: u32,
+    /// The rows the device keeps.
+    pub kept: KeptRows,
+    /// The rows staged for the step, in the table's form: row `r` of the step is the `r`-th
+    /// row here. Null: the host staged none.
+    pub staged: DevicePtr,
+}
+
+impl EmbedRows {
+    /// The bytes of one row of the table.
+    pub fn row_bytes(&self) -> u64 {
+        self.ty.bytes_for(u64::from(self.n_embd)).expect("whole blocks")
+    }
+}
+
+/// The rows of a table that lie on the device.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KeptRows {
+    /// The rows, `count` of them, in the table's form.
+    pub rows: DevicePtr,
+    /// The tokens of the rows (u32 each, ascending), or null when the rows are those of the
+    /// first `count` tokens.
+    pub tokens: DevicePtr,
+    pub count: u32,
+}
+
+impl KeptRows {
+    /// No row at all.
+    pub const NONE: Self = Self { rows: DevicePtr::NULL, tokens: DevicePtr::NULL, count: 0 };
+}
+
 /// The step record: header, segments, tokens, positions and output rows in the
 /// layout `kernels/layer_step.cuh` documents. Upload [`StepRecord::as_bytes`]
 /// to a device buffer (16-byte aligned) and pass its address to the kernels.
@@ -471,28 +509,27 @@ impl LayerKernels {
         Ok(())
     }
 
-    /// Embedding gather: `out[r] = table[token_r]` decoded to f32 for the
-    /// `dims.n_rows` rows of the step. `table` is the tensor as GGUF stores it
-    /// (`n_vocab` rows of `n_embd` values of type `ty`, any of the 28 weight types),
-    /// aligned to 4 bytes. A token past `n_vocab` gives a row of zeros.
+    /// Embedding gather: `out[r]` is the row of the table for the token of row `r` of the
+    /// step, decoded to f32, for the `dims.n_rows` rows of the step. The rows are stored as
+    /// GGUF stores the table (any of the 28 weight types, `source.row_bytes()` each, aligned
+    /// to 4 bytes) and come from where [`EmbedRows`] says. A token past `n_vocab`, and one
+    /// that neither the rows kept on the device nor the staged rows hold, gives a row of
+    /// zeros.
     ///
     /// # Safety
     ///
-    /// `step` must address the uploaded record, `table` the whole table and
-    /// `out` `n_rows * n_embd` f32 values, on the stream's device, alive until
-    /// the launch has run.
-    #[allow(clippy::too_many_arguments)]
+    /// `step` must address the uploaded record, `source` rows that are alive until the
+    /// launch has run (the kept rows and their tokens, a staged row for every row of the
+    /// step) and `out` `n_rows * n_embd` f32 values, all on the stream's device.
     pub unsafe fn embed_gather(
         &self,
         stream: &Stream,
         step: DevicePtr,
         dims: StepDims,
-        table: DevicePtr,
-        ty: GgmlType,
-        n_vocab: u32,
-        n_embd: u32,
+        source: &EmbedRows,
         out: DevicePtr,
     ) -> Result<()> {
+        let EmbedRows { ty, n_vocab, n_embd, kept, staged } = *source;
         if !ty.is_weight() {
             return Err(invalid("embedding gather", format!("{ty} is not a weight type")));
         }
@@ -502,14 +539,31 @@ impl LayerKernels {
                 format!("{n_embd} values are not whole {ty} blocks of {}", ty.block_values()),
             ));
         }
-        check_align("embedding table", table, 4)?;
+        if kept.count > n_vocab {
+            return Err(invalid(
+                "embedding gather",
+                format!("{} kept rows for a table of {n_vocab}", kept.count),
+            ));
+        }
+        if kept.count > 0 {
+            check_align("kept embedding rows", kept.rows, 4)?;
+            if kept.tokens != DevicePtr::NULL {
+                check_align("tokens of the kept embedding rows", kept.tokens, 4)?;
+            }
+        }
+        if staged != DevicePtr::NULL {
+            check_align("staged embedding rows", staged, 4)?;
+        }
         if dims.n_rows == 0 {
             return Ok(());
         }
-        let row_bytes = ty.bytes_for(u64::from(n_embd)).expect("whole blocks");
+        let row_bytes = source.row_bytes();
         let args = Args::new()
             .ptr(step)
-            .ptr(table)
+            .ptr(kept.rows)
+            .ptr(kept.tokens)
+            .u32(kept.count)
+            .ptr(staged)
             .u32(ty.id())
             .u64(row_bytes)
             .u32(n_vocab)

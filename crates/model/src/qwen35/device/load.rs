@@ -11,8 +11,9 @@
 //! file stores it, or in its device layout, the same bytes rearranged for the
 //! tensor cores with the rows rounded up to 16. Which one is chosen per matrix
 //! by timing both on the device (`choose.rs`). A matrix that something else
-//! than a product reads keeps the file's layout: the embedding table (the
-//! gather decodes its rows) and a head that is the same bytes. A slice is cut
+//! than a product reads keeps the file's layout: the rows of the embedding
+//! table that the draft chain's gather decodes (see `embed.rs`: the rest of
+//! the table lies in host memory) and a head whose rows they are. A slice is cut
 //! in the file's layout and then rearranged, because the device layout mixes
 //! 16 rows; for the same reason a head whose first rows the draft block reads
 //! as a matrix of their own is laid out in two parts when a part takes the
@@ -28,12 +29,13 @@ use std::time::{Duration, Instant};
 
 use ares_core::{GgmlType, Ledger};
 use ares_cuda::{
-    Device, DeviceBuffer, DevicePtr, Kernels, LayerKernels, Precision, RecurrentShape, Stream,
-    WeightLayout,
+    Device, DeviceBuffer, DevicePtr, EmbedRows, KeptRows, Kernels, LayerKernels, Precision,
+    RecurrentShape, Stream, WeightLayout,
 };
 use ares_runtime::ModelError;
 
 use super::choose::{Balance, Chooser, LayoutReport, Layouts, Prep, Shape, Usage};
+use super::embed::TableShape;
 use super::placement::{BlockSlice, DevicePlan, DraftPlan};
 use crate::qwen35::Config;
 use crate::qwen35::weights::{Matrix, Mixer, Weights};
@@ -304,6 +306,16 @@ impl MappedFiles {
     }
 }
 
+/// Reads the stored bytes of `m` into `into`, which has their length: with
+/// ordinary reads, a piece at a time, as the uploads do.
+pub(super) fn read_matrix(m: &Matrix<'_>, into: &mut [u8]) {
+    let mut files = MappedFiles::of_process();
+    let mut staging = Vec::new();
+    for (piece, to) in m.bytes().chunks(PIECE).zip(into.chunks_mut(PIECE)) {
+        to.copy_from_slice(files.read(piece, &mut staging));
+    }
+}
+
 /// What the uploads of a load share: the files behind the model's bytes and
 /// the memory they are read and gathered into.
 #[derive(Default)]
@@ -486,10 +498,41 @@ pub(crate) struct LoadOptions {
     pub merged: bool,
 }
 
+/// The token embedding on the device that embeds the step's tokens: the
+/// table's shape, and the rows of it that lie on the device.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct EmbedW {
+    pub table: TableShape,
+    /// The rows the draft chain can pick; none without a draft block here.
+    pub kept: Option<KeptW>,
+}
+
+/// The rows of the embedding table that lie on a device: the rows of the
+/// draft head, for the tokens the chain picks.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct KeptW {
+    /// The rows, in the file's layout: the draft head's, in its order.
+    pub rows: Mat,
+    /// The tokens of the rows (u32 each, ascending): the offset of the list
+    /// in the arena. `None`: the rows are those of the first tokens.
+    pub tokens: Option<u64>,
+    /// Whether the rows are the first rows of the head, which a tied model
+    /// holds anyway.
+    pub shared_with_head: bool,
+}
+
+impl EmbedW {
+    /// Whether the host stages rows for the gather: the device keeps rows
+    /// for fewer than all tokens.
+    pub fn stages(&self) -> bool {
+        self.kept.is_none_or(|k| k.rows.n_out < self.table.n_vocab)
+    }
+}
+
 /// The tables of a device's tensors: where each is in the arena.
 struct Tables {
     blocks: Vec<BlockW>,
-    embedding: Option<Mat>,
+    embedding: Option<EmbedW>,
     output_norm: u64,
     head: Option<HeadW>,
     head_tokens: Option<u64>,
@@ -501,8 +544,8 @@ struct Tables {
 pub(crate) struct DeviceWeights {
     arena: DeviceBuffer,
     pub blocks: Vec<BlockW>,
-    /// The token embedding table, on the device that has it.
-    pub embedding: Option<Mat>,
+    /// The token embedding, on the device that embeds the step's tokens.
+    pub embedding: Option<EmbedW>,
     pub output_norm: u64,
     /// The rows of the output head on this device.
     pub head: Option<HeadW>,
@@ -532,6 +575,19 @@ impl DeviceWeights {
     /// The bytes of the arena.
     pub fn bytes(&self) -> u64 {
         self.arena.len()
+    }
+
+    /// Where the embedding gather finds its rows: the rows this device keeps
+    /// and the rows staged at `staged` (null for none). `None` on a device
+    /// that does not embed.
+    pub fn embed_rows(&self, staged: DevicePtr) -> Option<EmbedRows> {
+        let EmbedW { table, kept } = self.embedding?;
+        let kept = kept.map_or(KeptRows::NONE, |k| KeptRows {
+            rows: self.mat(&k.rows),
+            tokens: k.tokens.map_or(DevicePtr::NULL, |at| self.at(at)),
+            count: k.rows.n_out,
+        });
+        Some(EmbedRows { ty: table.ty, n_vocab: table.n_vocab, n_embd: table.n_embd, kept, staged })
     }
 
     /// Lays out and uploads what `plan` gives device `index`; `draft` is the
@@ -636,9 +692,22 @@ impl DeviceWeights {
     }
 }
 
-/// Lays out what `plan` gives device `index`: the head and the embedding
-/// table first (the largest matrices find room behind them in the arena to
-/// be rearranged from), then the blocks, then the draft block.
+/// The rows of the tokens `tokens` as runs of consecutive tokens.
+fn runs_of(tokens: &[u32]) -> Vec<Range<usize>> {
+    let mut runs: Vec<Range<usize>> = Vec::new();
+    for &token in tokens {
+        match runs.last_mut() {
+            Some(run) if run.end == token as usize => run.end += 1,
+            _ => runs.push(token as usize..token as usize + 1),
+        }
+    }
+    runs
+}
+
+/// Lays out what `plan` gives device `index`: the rows of the embedding table
+/// the draft chain picks and the head first (the largest matrices find room
+/// behind them in the arena to be rearranged from), then the blocks, then
+/// the draft block.
 fn tables<'g>(
     layout: &mut Layout<'g, '_>,
     c: &Config,
@@ -649,20 +718,34 @@ fn tables<'g>(
 ) -> Result<Tables, ModelError> {
     let model = layout.model;
     let own_draft = draft.filter(|d| d.device == index);
-    // The head and the embedding table come first: the largest matrices
-    // find room behind them in the arena to be rearranged from.
-    let embedding = plan.embedding.then(|| {
-        let m = &w.token_embd;
-        // The gather decodes rows of the file's layout.
-        layout.kept(m, one(0..m.rows()))
+    let order = draft.and_then(|d| d.head_order.as_deref());
+    // The embedding table stays on the host (`embed.rs`); the device that
+    // embeds keeps the rows of the draft head, the tokens its chain picks.
+    // A model with an head of its own has them as a matrix of their own,
+    // laid out first like the head. A tied model has them in its head
+    // (below).
+    let tied = w.output.is_none();
+    if own_draft.is_some() && !plan.embedding {
+        return Err(ModelError::Invalid("the draft block's device does not embed".into()));
+    }
+    let chain_tokens = own_draft.map(|d| match order {
+        Some(order) => runs_of(&order[..d.head_rows as usize]),
+        None => one(0..d.head_rows as usize),
     });
+    let own_rows = match (&chain_tokens, tied) {
+        (Some(rows), false) => Some(layout.kept(&w.token_embd, rows.clone())),
+        _ => None,
+    };
     // The head's logits are wanted for the rows of a decode step and for
     // one row of a prompt. The draft block reads the head's first rows as
     // a matrix of their own (the draft vocabulary): where those are not
     // all rows of the head here, they are laid out apart from the rest.
     let head_usage = Usage { decode_rows: model.decode_rows, prompt: false };
     let draft_rows = own_draft.map(|d| d.head_rows as usize);
-    let order = draft.and_then(|d| d.head_order.as_deref());
+    // A tied head with a draft block here is one matrix in the file's
+    // layout, so that its first rows are the rows of the draft head and of
+    // the embedding the chain reads.
+    let in_file = tied && own_draft.is_some();
     let mut head_tokens = None;
     let head = if plan.head.is_empty() {
         None
@@ -670,16 +753,6 @@ fn tables<'g>(
         // The rows of this device's tokens in the head's order, as runs of
         // consecutive tokens.
         let tokens = &order[plan.head.start as usize..plan.head.end as usize];
-        let runs_of = |tokens: &[u32]| {
-            let mut runs: Vec<Range<usize>> = Vec::new();
-            for &token in tokens {
-                match runs.last_mut() {
-                    Some(run) if run.end == token as usize => run.end += 1,
-                    _ => runs.push(token as usize..token as usize + 1),
-                }
-            }
-            runs
-        };
         head_tokens = Some(layout.push(Source::Words(tokens.to_vec())));
         let parts = match draft_rows {
             Some(first) if first > 0 && first < tokens.len() => {
@@ -687,36 +760,34 @@ fn tables<'g>(
             }
             _ => vec![runs_of(tokens)],
         };
-        Some(head_parts(layout, w.head(), parts, head_usage, plan.head.start)?)
+        Some(head_rows(layout, w.head(), parts, head_usage, plan.head.start, in_file)?)
     } else {
-        let m = w.head();
         let rows = plan.head.start as usize..plan.head.end as usize;
-        let offset = (rows.start * row_bytes(m)) as u64;
-        // A head that is the embedding table reads the same bytes when the
-        // table is here and the slice starts at an aligned row.
-        match (&embedding, w.output.is_none()) {
-            (Some(table), true) if offset.is_multiple_of(ALIGN) => Some(HeadW {
-                parts: vec![Mat {
-                    ty: table.ty,
-                    n_in: table.n_in,
-                    n_out: rows.len() as u32,
-                    at: table.at + offset,
-                    layout: table.layout,
-                }],
-                n_out: rows.len() as u32,
-                first_token: plan.head.start,
-            }),
-            _ => {
-                let parts = match draft_rows {
-                    Some(first) if first > 0 && first < rows.len() => {
-                        vec![one(rows.start..rows.start + first), one(rows.start + first..rows.end)]
-                    }
-                    _ => vec![one(rows)],
-                };
-                Some(head_parts(layout, m, parts, head_usage, plan.head.start)?)
+        let parts = match draft_rows {
+            Some(first) if first > 0 && first < rows.len() => {
+                vec![one(rows.start..rows.start + first), one(rows.start + first..rows.end)]
             }
-        }
+            _ => vec![one(rows)],
+        };
+        Some(head_rows(layout, w.head(), parts, head_usage, plan.head.start, in_file)?)
     };
+    let kept = match (own_draft, &head) {
+        (Some(d), Some(head)) => Some(match own_rows {
+            Some(rows) => KeptW { rows, tokens: head_tokens, shared_with_head: false },
+            None => KeptW {
+                rows: Mat { n_out: d.head_rows, ..head.parts[0] },
+                tokens: head_tokens,
+                shared_with_head: true,
+            },
+        }),
+        (Some(_), None) => {
+            return Err(ModelError::Invalid(
+                "the draft block's device holds no row of the output head".into(),
+            ));
+        }
+        (None, _) => None,
+    };
+    let embedding = plan.embedding.then(|| EmbedW { table: TableShape::of(&w.token_embd), kept });
     let mut blocks = Vec::new();
     for (layer, slice) in plan.blocks.iter().enumerate() {
         let Some(slice) = slice else { continue };
@@ -725,14 +796,27 @@ fn tables<'g>(
     let output_norm = layout.floats(&w.output_norm);
     let draft = match (own_draft, &head) {
         (Some(plan), Some(head)) => Some(draft_block(layout, c, w, plan, head)?),
-        (Some(_), None) => {
-            return Err(ModelError::Invalid(
-                "the draft block's device holds no row of the output head".into(),
-            ));
-        }
-        (None, _) => None,
+        _ => None,
     };
     Ok(Tables { blocks, embedding, output_norm, head, head_tokens, draft })
+}
+
+/// Lays out the rows of the output head `m` that a device holds ([`head_parts`]),
+/// or, with `in_file`, as one matrix in the file's layout whatever is faster.
+fn head_rows<'g>(
+    layout: &mut Layout<'g, '_>,
+    m: &Matrix<'g>,
+    parts: Vec<Vec<Range<usize>>>,
+    usage: Usage,
+    first_token: u32,
+    in_file: bool,
+) -> Result<HeadW, ModelError> {
+    if !in_file {
+        return head_parts(layout, m, parts, usage, first_token);
+    }
+    let n_out = parts.iter().flatten().map(|r| r.len()).sum::<usize>() as u32;
+    let part = layout.rows(m, parts.into_iter().flatten().collect(), WeightLayout::File);
+    Ok(HeadW { parts: vec![part], n_out, first_token })
 }
 
 /// Lays out the rows of the output head `m` that a device holds, given as the

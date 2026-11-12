@@ -17,14 +17,16 @@ use std::sync::{Arc, Mutex};
 use ares_core::{GgmlType, Ledger};
 use ares_cuda::{
     ActivationForm, AttendBuffers, AttentionKernels, AttentionShape, CacheFormat, CacheGeometry,
-    CommitSet, Device, DeviceBuffer, DevicePtr, ENTRY_CELLS, Event, Kernels, LayerKernels,
-    MAX_BATCH, OutputGate, PUSH_MAX_VALUES, PinnedBuffer, PlanBuffers, PlanConfig, Planner,
-    Precision, PrefillPath, RopeParams, Segment, StateFormat, StepDims, Stream, WeightLayout,
+    CommitSet, Device, DeviceBuffer, DevicePtr, ENTRY_CELLS, EmbedRows, Event, Kernels,
+    LayerKernels, MAX_BATCH, OutputGate, PUSH_MAX_VALUES, PinnedBuffer, PlanBuffers, PlanConfig,
+    Planner, Precision, PrefillPath, RopeParams, Segment, StateFormat, StepDims, Stream,
+    WeightLayout,
 };
 use ares_cuda::{PUSH_MAX_ROWS, PushSlot};
 use ares_runtime::{Logits, ModelError, PinnedRam, Split};
 
 use super::choose::{Balance, LayoutReport, Layouts, decode_in_batches, file_path};
+use super::embed::{EmbeddingReport, HostRows};
 use super::load::{AttentionW, BlockW, DeviceWeights, FfnW, LoadOptions, Mat, MixerW, RecurrentW};
 use super::placement::Placement;
 use crate::qwen35::Config;
@@ -289,6 +291,12 @@ pub struct StepEnv<'a> {
     /// The step record on the device, in the layout of the layer kernels.
     pub step: DevicePtr,
     pub dims: StepDims,
+    /// The token of each row of the step, as the host knows it: the device
+    /// that embeds gets the rows of these tokens from the host. A row whose
+    /// token the model's own draft chain picks on the device holds any token
+    /// here (the record's placeholder); the chain's pick is what the gather
+    /// reads.
+    pub tokens: &'a [u32],
     /// The segments of the record.
     pub segments: &'a [Segment],
     /// The page tables on the device (`table_stride` entries per slot) and the
@@ -310,6 +318,8 @@ impl std::fmt::Debug for StepEnv<'_> {
 /// Offsets of the step scratch.
 #[derive(Clone, Copy, Debug, Default)]
 struct Scratch {
+    /// The rows of the embedding table that the host staged for the step.
+    stage: u64,
     x: u64,
     xn: u64,
     p: u64,
@@ -424,6 +434,9 @@ pub struct Part {
     layers: LayerKernels,
     attention: Option<AttentionKernels>,
     w: DeviceWeights,
+    /// The embedding table in host memory, when this part embeds and the
+    /// host stages rows (`embed.rs`).
+    embed: Option<HostRows>,
     // Model sizes.
     d: u32,
     eps: f32,
@@ -737,6 +750,16 @@ impl Part {
             at
         };
         let rope_pairs = (c.attention.rope.dim / 2) as u64;
+        // The rows of the embedding table the host staged (`embed.rs`).
+        let embed = match &w.embedding {
+            Some(e) if e.stages() => {
+                Some(HostRows::open(device, &weights.token_embd, opts.max_rows)?)
+            }
+            _ => None,
+        };
+        s.stage = take(
+            embed.as_ref().map_or(0, |_| rows * w.embedding.map_or(0, |e| e.table.row_bytes())),
+        );
         s.x = take(rows * d * 4);
         s.xn = take(rows * d * 4);
         s.p = take(rows * d * 4);
@@ -875,6 +898,7 @@ impl Part {
             layers,
             attention,
             w,
+            embed,
             d: d as u32,
             eps: c.rms_eps,
             rope: RopeParams {
@@ -1469,6 +1493,13 @@ impl Part {
                 dims.n_rows, dims.n_out, self.opts.max_rows, self.opts.logit_rows
             )));
         }
+        if env.tokens.len() != dims.n_rows as usize {
+            return Err(invalid(format!(
+                "{} tokens for the {} rows of the step",
+                env.tokens.len(),
+                dims.n_rows
+            )));
+        }
         for s in env.segments {
             let end = u64::from(s.pos0.max(0) as u32) + u64::from(s.n_rows);
             if s.slot >= self.max_slots
@@ -1756,6 +1787,7 @@ impl Part {
     pub fn enqueue(&mut self, env: &StepEnv<'_>) -> Result<Option<Logits>, ModelError> {
         self.begin(env)?;
         self.start_sequences(env)?;
+        self.stage_embedding(env)?;
         // The draft block's chains come first: the rows that verify their
         // drafts read them from the step record.
         self.draft_before(env)?;
@@ -1783,6 +1815,7 @@ impl Part {
                     stream: env.stream,
                     step: self.group_records.ptr().offset(group.record),
                     dims: group.dims,
+                    tokens: &env.tokens[group.first_row as usize..][..group.dims.n_rows as usize],
                     segments: &group.segments,
                     tables: env.tables,
                     pages: env.pages,
@@ -1918,23 +1951,57 @@ impl Part {
         self.mark(env.stream, Phase::Other)
     }
 
+    /// Copies the rows of the embedding table that the step's tokens need to
+    /// the stage and enqueues their upload, beside the step record. The
+    /// copy of the step before has run: a step ends before the next one is
+    /// enqueued. A part that does not embed, or keeps the whole table, has
+    /// nothing to stage.
+    pub(super) fn stage_embedding(&mut self, env: &StepEnv<'_>) -> Result<(), ModelError> {
+        let Some(host) = &mut self.embed else { return Ok(()) };
+        if env.tokens.is_empty() {
+            return Ok(());
+        }
+        let (from, bytes) = host.stage(env.tokens)?;
+        // SAFETY: the stage of the scratch holds a row of the table's form for
+        // every row of the largest step; `from` is the pinned stage, which is
+        // not written again before the next step.
+        unsafe { env.stream.copy_from_host(self.scratch.ptr().offset(self.s.stage), from, bytes) }?;
+        Ok(())
+    }
+
+    /// Where the gather finds the rows of the embedding: the rows this part
+    /// keeps, and the staged rows of the step when the host stages any.
+    fn embed_rows(&self) -> Result<EmbedRows, ModelError> {
+        let staged = self.embed.as_ref().map_or(DevicePtr::NULL, |_| self.at(self.s.stage));
+        self.w.embed_rows(staged).ok_or_else(|| invalid("this part does not embed the tokens"))
+    }
+
+    /// What the embedding takes on this part and where it lies.
+    pub fn embedding_report(&self) -> EmbeddingReport {
+        let Some(e) = &self.w.embedding else { return EmbeddingReport::default() };
+        let kept = e.kept;
+        EmbeddingReport {
+            embeds: true,
+            table_bytes: e.table.bytes(),
+            host_bytes: self.embed.as_ref().map_or(0, HostRows::locked),
+            kept_rows: kept.map_or(0, |k| k.rows.n_out),
+            kept_bytes: kept.filter(|k| !k.shared_with_head).map_or(0, |k| k.rows.bytes()),
+            shared_with_head: kept.is_some_and(|k| k.shared_with_head),
+            staged_bytes: self
+                .embed
+                .as_ref()
+                .map_or(0, |_| u64::from(self.opts.max_rows) * e.table.row_bytes()),
+        }
+    }
+
     fn enqueue_input(&mut self, env: &StepEnv<'_>) -> Result<(), ModelError> {
         let (stream, dims) = (env.stream, env.dims);
         let x = self.at(self.s.x);
-        if let Some(table) = &self.w.embedding {
-            // SAFETY: the table is in the arena, `x` holds the step's rows.
-            unsafe {
-                self.layers.embed_gather(
-                    stream,
-                    env.step,
-                    dims,
-                    self.w.mat(table),
-                    table.ty,
-                    table.n_out,
-                    table.n_in,
-                    x,
-                )?;
-            }
+        if self.w.embedding.is_some() {
+            let source = self.embed_rows()?;
+            // SAFETY: the kept rows are in the arena, the staged rows in the
+            // scratch, `x` holds the step's rows.
+            unsafe { self.layers.embed_gather(stream, env.step, dims, &source, x)? };
             self.mark(stream, Phase::Layers)?;
         }
         if self.split == Split::Layer && self.index > 0 {

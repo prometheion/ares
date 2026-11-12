@@ -18,6 +18,7 @@
 //! is measured against (`tests/qwen35_device.rs`).
 
 mod choose;
+mod embed;
 mod harness;
 mod load;
 mod part;
@@ -27,6 +28,7 @@ mod runtime;
 mod session;
 
 pub use choose::{Balance, LayoutProbe, LayoutReport, Layouts};
+pub use embed::EmbeddingReport;
 pub use harness::Harness;
 pub use part::{
     CopyTimes, DRAFT_KV, DraftBytes, DraftChain, DraftStep, DraftTimes, Drafted, Exchange, Options,

@@ -24,9 +24,13 @@
 //!   step overwrites them. This is also what replaces the provisional keys
 //!   and values a chain wrote from its own outputs.
 //!
-//! The whole block is on one device, the one with the embedding table, and
-//! its head is the first rows of the output head there (the draft vocabulary
-//! when the placement has one), so it takes no weights twice. The chain works
+//! The whole block is on one device, the one that embeds, and its head is the
+//! first rows of the output head there (the draft vocabulary when the
+//! placement has one), so it takes no weights twice. That device keeps the
+//! rows of the embedding table for the tokens the chain can pick (`embed.rs`):
+//! a link embeds its pick from them, and the embedding of the verify window
+//! reads them for the same tokens. The newest token of a chain is known to
+//! the host, which stages its row with the step's records. The chain works
 //! in a scratch of its own, sized for the sequences that can draft at once;
 //! following the model reuses the step's scratch, which is free by then.
 
@@ -239,6 +243,9 @@ pub(super) struct Mtp {
     pending: Option<DraftStep>,
     /// Where the rows of the step are in `records`, for following.
     follow_rows: u64,
+    /// Where the rows of the chains' newest tokens that the host staged are
+    /// in `records` (link 0 embeds them); null when it staged none.
+    newest: DevicePtr,
     drafted: u32,
     clock: Clock,
     times: DraftTimes,
@@ -265,9 +272,15 @@ impl Mtp {
             return Err(invalid("the draft block is an attention block"));
         };
         let ffn = draft.block.ffn.as_ref().ok_or_else(|| invalid("the draft block has no ffn"))?;
-        if w.embedding.is_none() {
-            return Err(invalid("the draft block's device holds no embedding table"));
+        let Some(embedding) = &w.embedding else {
+            return Err(invalid("the draft block's device does not embed"));
+        };
+        if embedding.kept.is_none() {
+            return Err(invalid("the draft block's device keeps no rows of the embedding table"));
         }
+        // The newest tokens' rows go with the records when the host stages rows.
+        let staged_rows =
+            if embedding.stages() { u64::from(max_slots) * embedding.table.row_bytes() } else { 0 };
         let d = c.n_embd as u64;
         let rows = u64::from(max_slots);
         let links = u64::from(opts.window_rows.saturating_sub(1).max(1));
@@ -311,8 +324,9 @@ impl Mtp {
         // sequence; then the carry index of link 0 and the rows of the step.
         let per_link =
             64 + rows * (32 + 4 + 16 + 16) + rows * (32 + 8 + 8) + 64 + rows * PLAN_BYTES;
-        let record_bytes = (links * per_link + rows * 4 + u64::from(opts.max_rows) * 16 + 256)
-            .next_multiple_of(64);
+        let record_bytes =
+            (links * per_link + rows * 4 + u64::from(opts.max_rows) * 16 + 256 + staged_rows)
+                .next_multiple_of(64);
         ledger.reserve("qwen35 draft block: hidden states kept", carry_bytes)?;
         ledger.reserve("qwen35 draft block: chain scratch", s.len)?;
         ledger.reserve("qwen35 draft block: step records", record_bytes)?;
@@ -362,6 +376,7 @@ impl Mtp {
             head_tokens: w.head_tokens.map_or(DevicePtr::NULL, |at| w.at(at)),
             pending: None,
             follow_rows: 0,
+            newest: DevicePtr::NULL,
             drafted: 0,
             clock,
             times: DraftTimes::default(),
@@ -638,6 +653,7 @@ impl Part {
             let bytes: Vec<u8> = hidden.iter().flat_map(|v| v.to_le_bytes()).collect();
             env.stream.synchronize()?;
             self.scratch.write(self.s.xn, &bytes)?;
+            self.stage_embedding(env)?;
             self.draft_follow(env, &m)
         })();
         self.mtp = Some(m);
@@ -799,6 +815,27 @@ impl Part {
         buf[follow_rows as usize..follow_rows as usize + row_bytes.len()]
             .copy_from_slice(&row_bytes);
         end = follow_rows + row_bytes.len() as u64;
+        // The rows of the newest tokens, for link 0, in the order of its rows;
+        // the host stages them when the device does not keep every row.
+        let newest_at = end.next_multiple_of(16);
+        m.newest = match &self.embed {
+            Some(host) => {
+                let size = host.row_bytes();
+                let rows = order.iter().map(|&c| step.chains[c].token);
+                if newest_at + order.len() as u64 * size as u64 > capacity {
+                    return Err(full());
+                }
+                for (i, token) in rows.enumerate() {
+                    if let Some(row) = host.row(token) {
+                        let at = newest_at as usize + i * size;
+                        buf[at..at + size].copy_from_slice(row);
+                    }
+                }
+                end = newest_at + order.len() as u64 * size as u64;
+                m.records.ptr().offset(newest_at)
+            }
+            None => DevicePtr::NULL,
+        };
         m.follow_rows = follow_rows;
         m.drafted = total;
         // SAFETY: the pinned buffer is not written again before the next
@@ -848,7 +885,12 @@ impl Part {
         let w = &m.w;
         let MixerW::Attention(a) = &w.block.mixer else { return Err(invalid("draft attention")) };
         let ffn = w.block.ffn.as_ref().ok_or_else(|| invalid("draft ffn"))?;
-        let table = self.w.embedding.ok_or_else(|| invalid("no embedding table"))?;
+        // Link 0 embeds the newest tokens, whose rows the host staged; the
+        // others embed the picks of the link before, which the device keeps.
+        let source = self
+            .w
+            .embed_rows(if j == 0 { m.newest } else { DevicePtr::NULL })
+            .ok_or_else(|| invalid("the draft block's device does not embed"))?;
         let attention = self.attention.clone().ok_or_else(|| invalid("attention kernels"))?;
         let geo = m.at.geo;
         let s = m.s;
@@ -871,16 +913,7 @@ impl Part {
         // for this link; weights, tables and pool as in `Part::attend`.
         unsafe {
             let plan = link.plan.on_device(rec.offset(link.plan_at));
-            self.layers.embed_gather(
-                stream,
-                step,
-                link.dims,
-                self.w.mat(&table),
-                table.ty,
-                table.n_out,
-                table.n_in,
-                e,
-            )?;
+            self.layers.embed_gather(stream, step, link.dims, &source, e)?;
             // x = proj_e e' + proj_h h'
             self.kernels.rms_norm_f32(stream, e, self.w.at(w.enorm), xn, d, n, eps)?;
             self.prepare(stream, xn, d, n, &[&w.proj_e], Prepared::default())?;
@@ -999,7 +1032,7 @@ impl Part {
         let (stream, dims, n, d, eps) = (env.stream, env.dims, env.dims.n_rows, self.d, self.eps);
         let w = &m.w;
         let MixerW::Attention(a) = &w.block.mixer else { return Err(invalid("draft attention")) };
-        let table = self.w.embedding.ok_or_else(|| invalid("no embedding table"))?;
+        let source = self.embed_rows()?;
         let attention = self.attention.clone().ok_or_else(|| invalid("attention kernels"))?;
         let geo = m.at.geo;
         let s = self.s;
@@ -1037,16 +1070,7 @@ impl Part {
                 m.carry_rows,
                 d,
             )?;
-            self.layers.embed_gather(
-                stream,
-                env.step,
-                dims,
-                self.w.mat(&table),
-                table.ty,
-                table.n_out,
-                table.n_in,
-                p,
-            )?;
+            self.layers.embed_gather(stream, env.step, dims, &source, p)?;
             self.kernels.rms_norm_f32(stream, p, self.w.at(w.enorm), xn, d, n, eps)?;
             self.prepare(stream, xn, d, n, &[&w.proj_e], Prepared::default())?;
             self.product(stream, &w.proj_e, n, p)?;

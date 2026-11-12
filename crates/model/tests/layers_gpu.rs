@@ -32,9 +32,9 @@ use std::sync::OnceLock;
 
 use ares_core::GgmlType;
 use ares_cuda::{
-    CommitSet, Device, DeviceBuffer, DevicePtr, Kernels, LayerKernels, OutputGate, Precision,
-    PrefillPath, RecurrentShape, Segment, StateFormat, StepRecord, Stream, Wait, device_count,
-    quantized_activation_bytes,
+    CommitSet, Device, DeviceBuffer, DevicePtr, EmbedRows, KeptRows, Kernels, LayerKernels,
+    OutputGate, Precision, PrefillPath, RecurrentShape, Segment, StateFormat, StepRecord, Stream,
+    Wait, device_count, quantized_activation_bytes,
 };
 use ares_gguf::Gguf;
 use ares_model::qwen35::reference::pieces::{conv_silu, delta_step, l2_norm, sigmoid, softplus};
@@ -729,10 +729,17 @@ fn embedding_gather_decodes_rows_of_the_real_table() {
                     &gpu.stream,
                     step.ptr(),
                     record.dims(),
-                    table_b.ptr(),
-                    ty,
-                    picks.len() as u32,
-                    c.n_embd as u32,
+                    &EmbedRows {
+                        ty,
+                        n_vocab: picks.len() as u32,
+                        n_embd: c.n_embd as u32,
+                        kept: KeptRows {
+                            rows: table_b.ptr(),
+                            tokens: DevicePtr::NULL,
+                            count: picks.len() as u32,
+                        },
+                        staged: DevicePtr::NULL,
+                    },
                     out.ptr(),
                 )
                 .unwrap();

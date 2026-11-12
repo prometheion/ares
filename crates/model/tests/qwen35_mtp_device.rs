@@ -4,8 +4,8 @@
 //! capture of it made by `tools/capture` (`ARES_TEST_QWEN35_CAPTURE27`, with
 //! `german/base` and `english/base`): the tokens of a prompt and of what
 //! follows it, and the model's final hidden state of every position. Only the
-//! draft block, the embedding table and the output head go to the device (two
-//! gigabytes); the hidden states the model would compute are put there by the
+//! draft block, the embedding rows it keeps and the output head go to the device
+//! (two gigabytes); the hidden states the model would compute are put there by the
 //! test, so the block is compared on its own:
 //!
 //! - it follows the prompt (its keys and values of every position);
@@ -164,6 +164,7 @@ impl Rig {
             stream: &self.stream,
             step: self.record.ptr(),
             dims: record.dims(),
+            tokens,
             segments: &segments,
             tables: self.tables.ptr(),
             pages: self.pages.ptr(),
@@ -190,6 +191,7 @@ impl Rig {
             stream: &self.stream,
             step: self.record.ptr(),
             dims: record.dims(),
+            tokens: &tokens,
             segments: &segments,
             tables: self.tables.ptr(),
             pages: self.pages.ptr(),
@@ -265,7 +267,7 @@ fn the_draft_block_on_the_device_drafts_what_the_reference_drafts() {
     let reference = Reference::new(&config, &weights);
     let d = config.n_embd;
 
-    // Only the draft block, the embedding table and the head on the device.
+    // Only the draft block, the embedding rows it keeps and the head on the device.
     let mut placement = Placement::single(&config);
     placement.devices[0].blocks = vec![None; config.n_layer];
     let placement = placement.with_draft(&config, vocabulary.as_deref()).unwrap();
@@ -328,7 +330,7 @@ fn the_draft_block_on_the_device_drafts_what_the_reference_drafts() {
         let mut rig = Rig::open(&device, &config, &weights, &placement, &opts);
         let bytes = rig.part.draft_bytes().unwrap();
         println!(
-            "{precision:?}: the part holds {:.1} MiB of weights (embedding, head, draft block); the \
+            "{precision:?}: the part holds {:.1} MiB of weights (kept embedding rows, head, draft block); the \
              draft block: weights {:.1} MiB, K/V {:.3} MiB per 1000 tokens, kept hidden states \
              {:.2} MiB, chain scratch {:.2} MiB, step records {:.2} MiB, step scratch grown by {:.2} MiB",
             rig.part.weight_bytes() as f64 / 1048576.0,

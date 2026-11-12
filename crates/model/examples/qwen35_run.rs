@@ -365,6 +365,57 @@ fn generate(
     (tokens, times)
 }
 
+/// Prints where a device's token embedding lies and what it takes.
+fn print_embedding(report: &PartReport) {
+    let e = &report.embedding;
+    if !e.embeds {
+        return;
+    }
+    let kept = match (e.kept_rows, e.shared_with_head) {
+        (0, _) => "no rows on the device".to_owned(),
+        (rows, true) => format!("{rows} rows on the device, the first rows of the head"),
+        (rows, false) => {
+            format!(
+                "{rows} rows ({:.1} MiB) on the device for the draft chain",
+                e.kept_bytes as f64 / MIB
+            )
+        }
+    };
+    println!(
+        "RES embedding device {}: table {:.1} MiB, {:.1} MiB page-locked RAM (the table and the rows of a step), {kept}, {:.1} MiB of the step scratch for staged rows",
+        report.index,
+        e.table_bytes as f64 / MIB,
+        e.host_bytes as f64 / MIB,
+        e.staged_bytes as f64 / MIB,
+    );
+}
+
+/// Prints the page-locked RAM the model holds for the token embedding and
+/// what the kernel says this process has pinned.
+fn print_locked(model: &Qwen35) {
+    use ares_runtime::Model;
+    let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    let kib = |field: &str| {
+        status
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix(field)?
+                    .strip_prefix(':')?
+                    .split_whitespace()
+                    .next()?
+                    .parse::<f64>()
+                    .ok()
+            })
+            .unwrap_or(0.0)
+    };
+    println!(
+        "RES RAM locked: {:.1} MiB for the token embedding (booked as required); the kernel counts {:.1} MiB pinned and {:.1} MiB locked in this process",
+        model.pinned_ram() as f64 / MIB,
+        kib("VmPin") / 1024.0,
+        kib("VmLck") / 1024.0,
+    );
+}
+
 /// Prints every reservation of a device's ledger, and what the ledger does not
 /// know of the memory the device holds.
 fn print_ledger(report: &PartReport, held: u64, taken: u64) {
@@ -598,9 +649,11 @@ fn main() {
             (memory.total - free) as f64 / MIB,
             free as f64 / MIB,
         );
+        print_embedding(report);
         print_ledger(report, memory.total - free, *before - free);
         print_layouts(report, args.show_layouts);
     }
+    print_locked(&model);
     let tokenizer = model.tokenizer();
     let chunk = args.step_rows.unwrap_or(args.rows() as usize).min(args.rows() as usize);
 

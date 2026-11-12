@@ -136,6 +136,7 @@ impl Rig {
             stream: &self.stream,
             step: self.record.ptr(),
             dims: record.dims(),
+            tokens,
             segments: &segments,
             tables: self.tables.ptr(),
             pages: self.pages.ptr(),
