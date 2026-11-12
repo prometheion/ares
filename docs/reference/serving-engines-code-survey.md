@@ -368,9 +368,11 @@ across all requests are verified, up to a budget from a cost profile.
   `acceptance_estimator.py`.
 - Numbers: none.
 - VRAM: one float per request and position.
-- Ares: **take** into `ares_sched::plan`. Today `best_draft_len` decides per
-  sequence and drafts are handed out "while rows are left"; the measurement
-  that a ninth row costs a second launch at eight requests is this trade.
+- Ares: **taken** in `ares_sched::choose`: the rows of all windows are ranked
+  by their chance and the step takes the number of them that gives the best
+  tokens per millisecond by the price of a step measured at load; the
+  measurement that a ninth row costs a second launch at eight requests is this
+  trade.
 
 ### Structured output
 

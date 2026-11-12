@@ -168,11 +168,16 @@ fn parse(raw: &[u8]) -> Reply {
 
 impl Server {
     /// Starts `ares` with the model on one device and `flags`, and waits
-    /// until it listens.
+    /// until it listens. The test device (`ARES_TEST_DEVICE`) serves it unless
+    /// `flags` name `--devices`.
     fn start(model: &PathBuf, port: u16, flags: &[&str]) -> Self {
         let device = std::env::var("ARES_TEST_DEVICE").unwrap_or_else(|_| "0".to_owned());
-        // Exact products and a context of 8192 unless the test says otherwise.
-        let mut base = vec!["--devices", device.as_str()];
+        // The test device, exact products and a context of 8192 unless the test
+        // says otherwise.
+        let mut base: Vec<&str> = Vec::new();
+        if !flags.contains(&"--devices") {
+            base.extend(["--devices", device.as_str()]);
+        }
         if !flags.contains(&"--precision") {
             base.extend(["--precision", "exact"]);
         }
@@ -875,7 +880,9 @@ fn the_choice_of_drafters_is_refused_by_name_before_a_device_is_touched() {
 //
 // These need a model with a draft block: `ARES_TEST_DRAFT_MODEL`, a
 // quantization of the 27B that fits one card, such as
-// `Qwen3.8-27B-UD-IQ2_XXS-with-draft-block.gguf`.
+// `Qwen3.8-27B-UD-IQ2_XXS-with-draft-block.gguf` (served with the fast
+// kernels: it has no exact prefill kernels), and for the test of exact
+// products `ARES_TEST_QWEN35_27B`, the Q4_K_S file, on two cards.
 
 fn draft_model() -> Option<PathBuf> {
     std::env::var_os("ARES_TEST_CUDA")?;
@@ -883,6 +890,20 @@ fn draft_model() -> Option<PathBuf> {
         Some(path) => Some(path.into()),
         None => {
             eprintln!("skipped: set ARES_TEST_DRAFT_MODEL to a model file with a draft block");
+            None
+        }
+    }
+}
+
+/// The 27B with its draft block for the tests that need exact products and so
+/// a type of weights with a prefill kernel for them: `ARES_TEST_QWEN35_27B`
+/// (Qwen3.8-27B-UD-Q4_K_S.gguf), served on both cards.
+fn two_card_model() -> Option<PathBuf> {
+    std::env::var_os("ARES_TEST_CUDA")?;
+    match std::env::var_os("ARES_TEST_QWEN35_27B") {
+        Some(path) => Some(path.into()),
+        None => {
+            eprintln!("skipped: set ARES_TEST_QWEN35_27B to the 27B Q4_K_S file (two GPUs)");
             None
         }
     }
@@ -900,7 +921,11 @@ fn reply_tokens(server: &Client, question: &str, drafts: bool) -> (String, Strin
     assert_eq!(plain.status, 200, "{}", plain.body);
     let body = plain.json();
     let hash = body["timings"]["token_hash"].as_str().expect("a token hash").to_owned();
-    let text = body["choices"][0]["message"]["content"].as_str().unwrap().to_owned();
+    let message = &body["choices"][0]["message"];
+    let text = [message["reasoning_content"].as_str(), message["content"].as_str()]
+        .into_iter()
+        .flatten()
+        .collect::<String>();
     // The stream carries the same hash in its last event with timings.
     extra["stream"] = json!(true);
     let streamed = server.post("/v1/chat/completions", &server.chat(question, extra));
@@ -915,7 +940,7 @@ fn reply_tokens(server: &Client, question: &str, drafts: bool) -> (String, Strin
 #[test]
 fn a_request_can_switch_drafts_off_and_the_reply_has_a_hash_of_its_tokens() {
     let Some(model) = draft_model() else { return };
-    let server = Server::start(&model, port(9), &["--parallel", "1"]);
+    let server = Server::start(&model, port(9), &["--parallel", "1", "--precision", "fast"]);
     let (_, _, drafted) = reply_tokens(&server, ENGLISH, true);
     assert!(drafted.unwrap_or(0) > 0, "the draft block and the lookup draft: {drafted:?}");
     let (_, _, none) = reply_tokens(&server, ENGLISH, false);
@@ -929,42 +954,129 @@ fn a_request_can_switch_drafts_off_and_the_reply_has_a_hash_of_its_tokens() {
     server.stop();
 }
 
+/// What the tests of drafts ask.
+const QUESTIONS: [&str; 3] =
+    [GERMAN, ENGLISH, "Write a Rust function that reverses a string, with a test."];
+
+/// Asks every question with drafts and without, and says for each whether the
+/// replies are the same tokens: `None`, or where they part (the characters
+/// they share).
+fn replies_with_and_without_drafts(server: &Client) -> Vec<(&'static str, Option<usize>)> {
+    QUESTIONS
+        .into_iter()
+        .map(|question| {
+            let (with, with_text, drafted) = reply_tokens(server, question, true);
+            let (without, without_text, _) = reply_tokens(server, question, false);
+            assert!(drafted.unwrap_or(0) > 0, "{question}: drafts were verified");
+            let shared = with_text.chars().zip(without_text.chars()).take_while(|(a, b)| a == b);
+            let parted = (with != without).then(|| shared.count());
+            assert_eq!(parted.is_none(), with_text == without_text, "{question}: hash and text");
+            (question, parted)
+        })
+        .collect()
+}
+
 /// With exact products a window of several rows and single rows round alike,
 /// so the tokens with drafts are the tokens without them, and the hash of the
 /// reply says so over HTTP.
 #[test]
 fn with_exact_products_the_reply_with_drafts_is_the_reply_without() {
-    let Some(model) = draft_model() else { return };
-    let server = Server::start(&model, port(9), &["--parallel", "1", "--precision", "exact"]);
-    for question in [GERMAN, ENGLISH, "Write a Rust function that reverses a string, with a test."]
-    {
-        let (with, with_text, drafted) = reply_tokens(&server, question, true);
-        let (without, without_text, _) = reply_tokens(&server, question, false);
-        assert!(drafted.unwrap_or(0) > 0, "{question}: drafts were verified");
-        assert_eq!(with_text, without_text, "{question}");
-        assert_eq!(with, without, "{question}: the hashes of the tokens");
+    // Exact products need a prefill kernel for every type of the weights, which
+    // the one-card file (IQ2_XXS) has none for: the 27B in Q4_K_S, on both cards.
+    let Some(model) = two_card_model() else { return };
+    let flags =
+        ["--devices", "0,1", "--split", "tensor", "--parallel", "1", "--precision", "exact"];
+    let server = Server::start(&model, port(9), &flags);
+    for (question, parted) in replies_with_and_without_drafts(&server) {
+        assert_eq!(parted, None, "{question}: the replies part after this many characters");
     }
     server.stop();
 }
 
 /// With the fast kernels (8-bit activations for a few rows) a window of
-/// several rows rounds differently from single rows, and the tokens with
-/// drafts are not always the tokens without them: a known defect that another
-/// piece of work (the kernels) is to remove. This states what is true today
-/// and is switched on to see whether it still is; when the kernels agree, it
-/// becomes the check of the exact-products test above, for the default
-/// products.
+/// several rows rounds differently from single rows, and a reply with drafts
+/// can part from the reply without them at a token whose two best candidates
+/// are nearly equal. That is a defect of the kernels, which another piece of
+/// work is to remove. Until then this says how often it happens (the test's
+/// output has it) and holds on to what is true: the replies share their start,
+/// and the drafts that were verified were verified. When the kernels agree the
+/// replies are equal, exactly as in the test above: `differing` is then
+/// always empty, the assertion on it becomes `assert!(differing.is_empty())`
+/// and the two tests become one over both precisions.
 #[test]
-#[ignore = "known defect: the tokens with drafts differ from the tokens without them with the fast kernels"]
-fn with_the_fast_kernels_the_reply_with_drafts_is_the_reply_without() {
+fn with_the_fast_kernels_a_reply_with_drafts_can_part_from_the_reply_without() {
     let Some(model) = draft_model() else { return };
     let server = Server::start(&model, port(9), &["--parallel", "1", "--precision", "fast"]);
-    for question in [GERMAN, ENGLISH, "Write a Rust function that reverses a string, with a test."]
-    {
-        let (with, ..) = reply_tokens(&server, question, true);
-        let (without, ..) = reply_tokens(&server, question, false);
-        assert_eq!(with, without, "{question}");
+    let differing: Vec<_> = replies_with_and_without_drafts(&server)
+        .into_iter()
+        .filter_map(|(question, parted)| Some((question, parted?)))
+        .collect();
+    eprintln!(
+        "fast kernels: {} of {} replies with drafts part from the reply without: {differing:?}",
+        differing.len(),
+        QUESTIONS.len()
+    );
+    for (question, shared) in &differing {
+        assert!(*shared >= SHARED_START, "{question}: the replies part after {shared} characters");
     }
+    server.stop();
+}
+
+/// How much of its start (in characters) a reply with drafts shares with the
+/// reply without them at the least, with the fast kernels. The replies part
+/// at a token where two candidates are nearly equal, which was after 300 to
+/// 430 characters where this was measured (the notes in ARCHITECTURE.md have
+/// 150 to 650); a reply that parts within its first words is more likely a
+/// window that was read wrong than rounding.
+const SHARED_START: usize = 16;
+
+/// A server started with no drafters does not speculate, whatever the text
+/// repeats: the lookup in earlier text is no drafter on its own.
+#[test]
+fn a_server_with_no_drafters_never_drafts_and_one_with_the_draft_block_does() {
+    let Some(model) = draft_model() else { return };
+    let repeat = "Write the sentence 'The quick brown fox jumps over the lazy dog.' ten times.";
+    let flags = ["--parallel", "1", "--precision", "fast"];
+    let mut none = Vec::from(flags);
+    none.extend(["--drafters", "none"]);
+    let mut server = Server::start(&model, port(9), &none);
+    assert!(
+        server.logged().iter().any(|l| l.contains("no drafters") && l.contains("no speculation")),
+        "{:#?}",
+        server.logged()
+    );
+    for drafts in [true, false] {
+        let (_, text, drafted) = reply_tokens(&server, repeat, drafts);
+        assert!(text.contains("quick brown fox"), "{text}");
+        assert_eq!(drafted, Some(0), "no draft rows with --drafters none (draft: {drafts})");
+    }
+    assert_eq!(server.metric("drafts_proposed_total"), 0, "the counters say the same");
+    server.stop();
+    let server = Server::start(&model, port(9), &flags);
+    let (_, _, drafted) = reply_tokens(&server, repeat, true);
+    assert!(drafted.unwrap_or(0) > 0, "the same request drafts with the model's draft block");
+    server.stop();
+}
+
+/// A model with no draft block has no drafter, and the lookup does not run
+/// without one.
+#[test]
+fn a_model_with_no_draft_block_is_served_with_no_speculation_at_all() {
+    let Some(model) = model() else { return };
+    let repeat = "Write the sentence 'The quick brown fox jumps over the lazy dog.' ten times.";
+    let mut server = Server::start(&model, port(9), &["--parallel", "1"]);
+    assert!(
+        server
+            .logged()
+            .iter()
+            .any(|l| l.contains("no model drafter") && l.contains("no speculation")),
+        "{:#?}",
+        server.logged()
+    );
+    let (_, text, drafted) = reply_tokens(&server, repeat, true);
+    assert!(text.contains("quick brown fox"), "{text}");
+    assert_eq!(drafted, Some(0));
+    assert_eq!(server.metric("drafts_proposed_total"), 0);
     server.stop();
 }
 

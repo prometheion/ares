@@ -763,6 +763,21 @@ fn a_model_with_no_drafter_does_not_speculate_and_the_lookup_does_not_run_alone(
 }
 
 #[test]
+fn a_window_of_one_row_is_no_speculation_even_for_a_model_with_a_drafter_and_text_that_repeats() {
+    // What `--drafters none` makes of a model whose file has a draft block.
+    let model = model(repeating);
+    let rt = runtime(&model, false);
+    alone(&rt, "a text that loops", Some(300));
+    let c = snapshot_of(&rt).counters;
+    assert_eq!((c.draft_rows, c.drafts_accepted), (0, 0), "{c:?}");
+    // The same model and text with room for a window do draft: it is the room
+    // that was missing, not the text.
+    let rt = runtime(&model, true);
+    alone(&rt, "a text that loops", Some(300));
+    assert!(snapshot_of(&rt).counters.drafts_accepted > 0);
+}
+
+#[test]
 fn the_lookup_joins_the_model_drafter_when_there_is_one() {
     let model = model(never_repeating);
     let rt = runtime_with(&model, RuntimeConfig { window_rows: 8, ..config(true, 4096) }, |e| e);

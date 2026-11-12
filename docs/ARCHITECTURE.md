@@ -825,8 +825,8 @@ the step, the block's own keys and values from the hidden states the model
 just computed. The host learns the drafts with the picks, counts the accepted
 ones and puts the commit into the next record. The conductor chooses per
 sequence and step between a lookup draft and the model's own by expected
-tokens per millisecond (`best_draft_len`), with the cost of a link measured on
-the device.
+tokens per millisecond (`ares_sched::choose`), with the cost of a link measured
+on the device.
 
 Measured 2026-11-10 on Qwen3.8-27B (tensor split 0.625 / 0.375, RTX 4070 and
 RTX 3060, at most three drafts, the fork's draft vocabulary of 66 343 tokens,
@@ -841,9 +841,12 @@ steps. The block takes 335 MiB of weights and 2.1 MiB of K and V per 1000
 tokens on its device, and nothing for its head, which is rows of the output
 head. With exact products the text with drafts equals the text without, for
 the most probable token and for sampled tokens with the same seed
-(`tests/qwen35_mtp_runtime.rs`); with the fast kernels a window of several
-rows rounds differently from single rows and the texts part after 150 to 650
-characters (the margins of the picks where they part were not measured).
+(`tests/qwen35_mtp_runtime.rs`, and over HTTP by the hash of the reply's tokens,
+`ares-server`'s `tests/real.rs` on the 27B and both cards); with the fast
+kernels a window of several rows rounds differently from single rows and the
+texts part after 150 to 650 characters (the margins of the picks where they
+part were not measured; `tests/real.rs` has two of three questions parting
+after 300 and 430 characters on one card).
 
 Measured 2026-11-11 with the policy on Qwen3.8-27B (tensor split 0.625 / 0.375,
 `qwen35_run --engine`, 400 tokens per request through the chat template with
