@@ -2316,8 +2316,9 @@ The weights are loaded in about 4 s from a cached file. The recurrent state
 takes 150 MiB per sequence over both cards, K and V 33 MiB per 1000 tokens.
 
 **The token embedding of `qwen35`.** The embedding table (`token_embd`,
-248 320 rows of 5120 values in the file's types: 313 MiB in the small test
-file, 680 MiB at Q4_K_S) does not lie on the device. A step needs the rows of
+248 320 rows of 5120 values in the file's types: 313 MiB in the IQ2_XXS test
+file of the 27B, 521 MiB in its UD-Q4_K_S file, whose table is Q3_K) does not
+lie on the device. A step needs the rows of
 its own tokens, a few kilobytes each in the file's form, and the gather kernel
 decodes them wherever they lie (`kernels/layer_embed.cuh`: all 28 weight
 types). Where they come from (`device/embed.rs`):
@@ -2327,7 +2328,7 @@ types). Where they come from (`device/embed.rs`):
   limit (`Model::pinned_ram`). A step copies the rows of its tokens into a
   page-locked staging buffer, one row per row of the step, and uploads them
   on the step's stream in one copy right after the record; no event, no wait.
-  A prompt step of 512 rows uploads 1.4 MiB at Q4_K.
+  A prompt step of 512 rows uploads 1.1 MiB of the UD-Q4_K_S file's table.
 - **The device itself, for the draft chain.** The model's own draft block
   picks tokens inside the step, on the device, and embeds them (the chain's
   next link, the verify window, the block following the model) before the
@@ -2349,6 +2350,73 @@ types). Where they come from (`device/embed.rs`):
   gather keeps: still nothing twice on the device.
 
 A layer split no longer counts the table in the first device's share.
+
+The table is required memory of the RAM limit, as the step buffers are. The
+default limit always holds it. A `--ram` below the sum is refused, and the
+refusal names every share and the sum in bytes, which `--ram` takes as it
+stands (`plan::too_little_ram`; the 0.8B test file: "--ram 4.0 MiB is less
+than the 199.5 MiB the engine needs to run (209235952 bytes): 212.0 KiB for
+its step buffers, 199.3 MiB for the token embedding table and the rows of a
+step, which lie in page-locked RAM and not on a device"). The table does not
+go back to a device when the limit is small. VRAM is what bounds the context,
+and `--ram` is set low for other reasons, to switch the checkpoints off for
+one: a limit that also moved the table would take context away without being
+asked to, and what the devices hold would depend on it. The price is paid by
+an operator with little RAM and much VRAM, who must give the table its RAM
+(0.2 GiB to 0.5 GiB for the files above) and cannot choose the device
+instead. That choice is not built; the gather reads a whole table on the
+device already (the draft block without a vocabulary), so it would be a
+decision of the placement.
+
+Measured on 2026-11-12 with `qwen35_run` on an RTX 4070 and an RTX 3060, a
+context of 32 768 tokens, K and V in `q5`, against the commit before
+(92aedff, the table on the first device). The columns are the VRAM the
+process took on each card, in MiB, the page-locked RAM the model books and
+what the kernel counted more for the process (`RssShmem`, where it counts
+what the driver locks; `VmLck` and `VmPin` stay at zero):
+
+| File and placement | VRAM before | VRAM now | RAM booked | Kernel |
+| --- | --- | --- | --- | --- |
+| IQ2_XXS, one card, no drafts | 8026 | 7716 | 313 | +315 |
+| IQ2_XXS, one card, drafts with a vocabulary of 66 343 tokens | 9422 | 9194 | 313 | +313 |
+| IQ2_XXS, one card, drafts without a vocabulary | 9424 | 9424 | 0 | 0 |
+| UD-Q4_K_S, tensor split 0.625 / 0.375, drafts with the vocabulary | 10948, 6046 | 10568, 6048 | 522 | +523 |
+| UD-Q4_K_S, tensor split 0.625 / 0.375, no drafts | 9918, 5680 | 9400, 5682 | 522 | +521 |
+| IQ2_XXS, layer split 0.5 / 0.5 | 4168, 4098 | 4050, 3906 | 313 | +312 |
+
+The weights of the first card shrink by the table less the rows it keeps for
+the draft chain (84 MiB and 139 MiB for the vocabulary), its step scratch
+grows by the staged rows (0.6 MiB and 1.1 MiB), and every card holds 2 MiB
+more outside its ledger, the larger kernel module. The layer split moved two
+blocks from the second card to the first, which no longer counts the table.
+
+The same day, same cards, against the same commit, each pair run back to back
+at least twice while other builds ran on the machine (load 3 to 20). Staging
+a prompt step of 512 rows was timed by itself: 0.12 ms to 0.31 ms for the host
+to copy the rows and 0.10 ms to 0.19 ms for the upload, of a step of 380 ms.
+
+| Run | Before | Now |
+| --- | --- | --- |
+| IQ2_XXS, one card: prompt of 2048 tokens, ms | 1750 to 1753 | 1746 to 1757 |
+| IQ2_XXS, one card: decode step, ms | 20.90, 20.94 | 20.89, 20.89 |
+| UD-Q4_K_S, two cards: prompt of 2048 tokens, ms | 1507 to 1519 | 1522 to 1539 |
+| UD-Q4_K_S, two cards: decode step, ms | 24.72 to 24.82 | 24.71 to 24.84 |
+| UD-Q4_K_S, two cards, drafts with the vocabulary: step with four drafts, ms | 33.30 to 33.49 | 33.57 to 33.68 |
+| the same: a link of the draft chain, ms | 1.43 to 1.46 | 1.49 to 1.51 |
+| the same: tokens per second, mean of seven prompts of 300 tokens | 98.6, 98.5 | 96.8, 98.9 |
+
+On one card nothing changed. On the tensor split a prompt takes 0.7 % to
+1.8 % longer and a step with drafts 0.2 ms to 0.3 ms longer (0.05 ms per link
+of the chain). The commit of this change alone measures 1525 ms to 1539 ms
+for the prompt and 33.52 ms to 33.61 ms for the step, so it is this change
+and not what was merged with it. The staging does not account for it, by the
+timing above, and where the time goes is not known: the profile of a prompt
+step shows it in the weight products of the second card, which holds what it
+held, the difference stays when both runs are given the device layout
+for every matrix (1497 ms to 1506 ms against 1512 ms to 1520 ms), and the
+small file on the same split shows it too (1691 ms to 1708 ms against 1710 ms
+to 1726 ms). In steps of 128 rows it is 0.2 % to 0.4 %. The tokens per second
+differ less than two runs of one binary do.
 
 **Device layouts in the model.** At load the model first measures how the
 few-row kernels launch for every shape of a matrix that can have the device
@@ -3168,9 +3236,11 @@ shared by the executor and the device threads. It has three users so far:
 - the step record and the read-back buffers of the devices, with the
   page-locked buffers a model's parts hold (required, booked at start:
   `required_ram`, `Model::pinned_ram`); for `qwen35` that includes the token
-  embedding table (313 MiB in the small test file, 680 MiB in the 27B at
-  Q4_K_S) and the staging buffer of the rows a step uploads from it, unless
-  the device keeps the whole table (see "The token embedding of `qwen35`");
+  embedding table (313 MiB and 521 MiB in the two files of the 27B that were
+  measured) and the staging buffer of the rows a step uploads from it, unless
+  the device keeps the whole table (see "The token embedding of `qwen35`",
+  also for what a limit below it does: the server refuses it and names the
+  shares);
 - the tier of experts of a mixture-of-experts model (elastic, priority 100,
   floor 0), which the model locks once at load: as much as the limit leaves
   and the experts that have no VRAM slot can use. It does not give anything
