@@ -9,8 +9,10 @@
 //! `/health` and `/metrics`, into a server of Anthropic's Messages API on
 //! `POST /v1/messages` and `/v1/messages/count_tokens` (the `anthropic`
 //! module: a Messages request runs as the chat request that asks the same),
-//! with `/v1/chat/completions/input_tokens`, which counts the tokens of a
-//! chat request and generates nothing,
+//! into a server of OpenAI's Responses API without state on
+//! `POST /v1/responses` (the `responses` module, on the same footing), with
+//! the routes that count the tokens of a request and generate nothing
+//! (`/v1/responses/input_tokens`, `/v1/chat/completions/input_tokens`),
 //! and into a System One server on
 //! `POST /v1/systemone`. The HTTP side holds no model knowledge. It parses and
 //! checks the request, hands a [`ares_api::GenerateRequest`] to the engine and
@@ -48,6 +50,7 @@ pub mod plan;
 mod qwen4exp;
 mod reasoning;
 mod reply;
+mod responses;
 mod routes;
 mod structured;
 mod systemone;
@@ -61,7 +64,7 @@ use std::time::Duration;
 
 use ares_api::Engine;
 use axum::Router;
-use axum::routing::{get, post};
+use axum::routing::{any, get, post};
 use tokio::net::TcpListener;
 use tokio::sync::{Notify, watch};
 
@@ -132,6 +135,10 @@ fn routes_over(engine: Arc<dyn Engine>, config: Config, stop: Stop) -> Router {
             post(anthropic::count_tokens).fallback(anthropic::method_not_allowed),
         )
         .route("/v1/chat/completions/input_tokens", post(routes::chat_input_tokens))
+        .route("/v1/responses", post(responses::create))
+        .route("/v1/responses/input_tokens", post(responses::input_tokens))
+        .route("/v1/responses/{id}", any(responses::stored))
+        .route("/v1/responses/{id}/{what}", any(responses::stored))
         .fallback(routes::not_found)
         .method_not_allowed_fallback(routes::method_not_allowed)
         .with_state(routes::App { engine, config, flight, stop })
