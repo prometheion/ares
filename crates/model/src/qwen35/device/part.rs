@@ -757,9 +757,7 @@ impl Part {
             }
             _ => None,
         };
-        s.stage = take(
-            embed.as_ref().map_or(0, |_| rows * w.embedding.map_or(0, |e| e.table.row_bytes())),
-        );
+        s.stage = take(embed.as_ref().map_or(0, |host| rows * host.row_bytes() as u64));
         s.x = take(rows * d * 4);
         s.xn = take(rows * d * 4);
         s.p = take(rows * d * 4);
@@ -1990,7 +1988,7 @@ impl Part {
             staged_bytes: self
                 .embed
                 .as_ref()
-                .map_or(0, |_| u64::from(self.opts.max_rows) * e.table.row_bytes()),
+                .map_or(0, |host| u64::from(self.opts.max_rows) * host.row_bytes() as u64),
         }
     }
 
