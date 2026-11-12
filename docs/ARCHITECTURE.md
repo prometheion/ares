@@ -1351,6 +1351,10 @@ rules that are one lexeme (a string in quotes) into regular expressions was
 tried and gave nothing for `json.gbnf`, whose string rule ends in optional white
 space. The device applies the mask in the sampler, which costs what the section
 on masks above says (6 to 16 percent of the draw of the most probable token).
+Through the server, the 0.8B on the RTX 4070 wrote 400 tokens under a JSON
+schema (an array of integers) at 412 tokens a second and 400 tokens of free
+text at 415 (`the_grammar_costs_what_the_mask_costs_per_step` in
+`crates/server/tests/real_structured.rs`, the best of three runs each).
 
 *Errors.* A grammar or schema the engine refuses is a 400 that names the field
 and the problem; both `grammar` and `json_schema` (or `response_format`) in one
