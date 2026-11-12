@@ -2,8 +2,9 @@
 //! with the 27B on two: the template's tools reach the model, a required call
 //! and a named function come back as valid calls, `auto` calls when the
 //! question needs the tool and the reply is the same streamed, a history with
-//! calls and results is answered, and the reply with drafts is the reply
-//! without. Lines that start with `RES` say what the models did.
+//! calls and results is answered, a call the model opens inside its thinking
+//! is a call, and the reply with drafts is the reply without. Lines that start
+//! with `RES` say what the models did.
 //!
 //! The server runs in this process over the real engine (requests go through
 //! the router without a socket). Needs `ARES_TEST_CUDA=1` and
@@ -389,6 +390,91 @@ async fn a_call_the_limit_cuts_ends_with_length_and_no_markup() {
         }
         assert_eq!(served.stream(&body).await, reply, "cut at {limit}");
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_call_the_model_opens_inside_its_thinking_is_a_call() {
+    let Some(path) = small() else { return };
+    let served = Served::start(&path);
+    // The model thinks, and the tag that closes its thinking is banned: a
+    // call it wants to make it has to open inside the thinking. The tag and
+    // the marker are the template's.
+    let format = served.engine.chat_format("q").expect("a chat format");
+    let close = format.thinking.expect("the model thinks").end_tag().to_owned();
+    let marker = format.tools.expect("a format for calls").trigger().to_owned();
+    let tokenizer = ares_tokenizer::Tokenizer::from_gguf(&Gguf::open(&path).unwrap()).unwrap();
+    let options = ares_tokenizer::EncodeOptions { add_special: false, parse_special: true };
+    let closing = tokenizer.encode(&close, options);
+    assert_eq!(closing.len(), 1, "{close} is {closing:?}");
+    let pinned = |extra: Value| {
+        let mut body = request(WEATHER, extra);
+        body["chat_template_kwargs"] = json!({"enable_thinking": true});
+        body["logit_bias"] = json!([[closing[0], false]]);
+        body["max_tokens"] = json!(1500);
+        body
+    };
+
+    let named = json!({"type": "function", "function": {"name": "get_weather"}});
+    for (what, extra) in [
+        ("required", json!({"tool_choice": "required"})),
+        ("named", json!({"tool_choice": named, "parallel_tool_calls": false})),
+        ("required, sampled", json!({"tool_choice": "required", "temperature": 0.8, "seed": 3})),
+        ("auto", json!({})),
+    ] {
+        let body = pinned(extra);
+        let reply = served.ask(&body).await;
+        println!("RES in the thinking, {what}: {reply:?}");
+        check(&reply);
+        // The same reply raw shows that the model never left its thinking:
+        // the content is the thinking from the tag the prompt ended with on,
+        // and has no closing tag (which the model could still spell out
+        // with other tokens; then nothing was tested here).
+        let mut raw = body.clone();
+        raw["reasoning_format"] = json!("none");
+        let raw = served.ask(&raw).await;
+        assert_eq!(raw.hash, reply.hash, "{what}: the same tokens");
+        assert!(raw.content.starts_with("<think>"), "{what}: {raw:?}");
+        assert!(
+            !raw.content.contains(&close),
+            "{what}: the model spelled the banned tag out, so no call was inside the thinking"
+        );
+        assert_eq!(raw.calls, reply.calls, "{what}: the raw reply has the same calls");
+        // Nothing of the marker in the text, and no answer.
+        assert!(!reply.reasoning.contains(&marker), "{what}: the marker in the reasoning");
+        assert!(!raw.content.contains(&marker), "{what}: the marker in the content");
+        assert_eq!(reply.content, "", "{what}");
+        if what == "auto" {
+            // Left to itself the model calls, or ends its reply thinking.
+            let expected = if reply.calls.is_empty() { "stop" } else { "tool_calls" };
+            assert!(reply.finish == expected || reply.finish == "length", "{reply:?}");
+        } else {
+            // A reply that must call cannot end while it thinks: the call
+            // inside the thinking is the only way on.
+            assert_eq!(reply.finish, "tool_calls", "{what}: {reply:?}");
+            assert!(!reply.calls.is_empty(), "{what}");
+            assert!(!reply.reasoning.is_empty(), "{what}: the reasoning comes back");
+        }
+        if what == "named" {
+            assert_eq!(reply.calls, [reply.calls[0].clone()], "one call");
+            assert_eq!(reply.calls[0].0, "get_weather");
+        }
+        assert_eq!(served.stream(&body).await, reply, "{what}: the stream is the whole reply");
+        let mut plain = body.clone();
+        plain["draft"] = json!(false);
+        let without = served.ask(&plain).await;
+        assert_eq!(without.hash, reply.hash, "{what}: the tokens with drafts are those without");
+        assert_eq!(without, reply, "{what}");
+    }
+
+    // With none the same model under the same ban only thinks: whatever it
+    // writes is reasoning, and there is no call.
+    let mut body = pinned(json!({"tool_choice": "none"}));
+    body["max_tokens"] = json!(300);
+    let reply = served.ask(&body).await;
+    println!("RES in the thinking, none: {reply:?}");
+    assert!(reply.calls.is_empty() && reply.finish != "tool_calls", "{reply:?}");
+    assert_eq!(reply.content, "", "the thinking was never closed");
+    assert_eq!(served.stream(&body).await, reply, "none: the stream is the whole reply");
 }
 
 #[tokio::test(flavor = "multi_thread")]
