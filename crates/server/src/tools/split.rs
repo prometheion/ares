@@ -13,6 +13,13 @@
 //! the content and a call, and at the end of a reply that has calls, is the
 //! template's layout and belongs to neither.
 //!
+//! The first marker of a call in the text starts the calls, wherever it
+//! stands: that is where the rule of the request binds the reply, in the
+//! answer and inside the reasoning alike. The reasoning's splitter ends the
+//! reasoning there and passes the marker on (see `Splitter::ends_at`); a
+//! reply that is returned raw has its reasoning in the content, and its
+//! calls are read the same way.
+//!
 //! A reply that is held to the grammar of calls has no other shape than the
 //! one read here. Text that does not continue a call the way the format says
 //! (from an engine that did not hold it) ends the call and is content.
@@ -52,9 +59,6 @@ pub(crate) struct CallSplitter {
     state: State,
     /// Text that has come and has not been sorted.
     buffer: String,
-    /// Text that comes before the answer and is passed on as content (the
-    /// reasoning of a reply that is returned raw), up to this tag.
-    gate: Option<String>,
     /// How many calls have begun.
     calls: usize,
     /// The white space that stood before the trigger of the call being read.
@@ -106,21 +110,14 @@ fn escaped(text: &str) -> String {
 impl CallSplitter {
     /// A splitter for replies that may call `tools` (the name and the schema
     /// of the arguments of each). `id` is what the ids of the calls start
-    /// with. `gate` is a tag the answer starts after: the text up to it is
-    /// passed on as content.
-    pub fn new(
-        format: ToolFormat,
-        tools: HashMap<String, Option<Value>>,
-        id: String,
-        gate: Option<String>,
-    ) -> Self {
+    /// with.
+    pub fn new(format: ToolFormat, tools: HashMap<String, Option<Value>>, id: String) -> Self {
         Self {
             format,
             tools,
             id,
             state: State::Text,
             buffer: String::new(),
-            gate: gate.filter(|tag| !tag.is_empty()),
             calls: 0,
             layout: String::new(),
             schema: None,
@@ -133,6 +130,11 @@ impl CallSplitter {
     /// with `id`.
     pub fn with_id(&self, id: String) -> Self {
         Self { id, ..self.clone() }
+    }
+
+    /// The marker that opens a call.
+    pub fn trigger(&self) -> &str {
+        self.format.trigger()
     }
 
     /// Takes the next piece of the answer.
@@ -191,20 +193,6 @@ impl CallSplitter {
     }
 
     fn text(&mut self, parts: &mut Vec<Part>) -> bool {
-        if let Some(gate) = &self.gate {
-            // Before the answer: everything up to the tag is content.
-            let Some(at) = self.buffer.find(gate.as_str()) else {
-                let held = if self.finished { 0 } else { partial_suffix(&self.buffer, gate) };
-                let ready = self.buffer.len() - held;
-                Self::content(parts, &self.buffer[..ready]);
-                self.buffer.drain(..ready);
-                return false;
-            };
-            let end = at + gate.len();
-            Self::content(parts, &self.buffer[..end]);
-            self.buffer.drain(..end);
-            self.gate = None;
-        }
         let trigger = self.format.trigger();
         if let Some(at) = self.buffer.find(trigger) {
             // The white space before a call is the template's.

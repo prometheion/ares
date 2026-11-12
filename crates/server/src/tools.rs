@@ -21,16 +21,37 @@
 //! `parallel_tool_calls: false` allows one call. The reasoning of a model
 //! that thinks is free in every case and the rule binds the answer after it.
 //!
+//! # A call inside the thinking
+//!
+//! A model that thinks sometimes opens a call without closing its reasoning
+//! first. When calls are allowed, the marker that opens a call
+//! ([`ToolFormat::trigger`]) ends the reasoning where it stands, as
+//! llama-server has it for these templates: the text before it is the
+//! reasoning, and what follows is a call under the same rule as a call after
+//! the closing tag ([`Interrupt`] in the engine, the reasoning's splitter and
+//! [`CallSplitter`] in the reply). The white space between the reasoning and
+//! the marker is layout and belongs to neither. After such a call the rule
+//! allows what it allows after any call (white space, another call, the end),
+//! so the reply cannot write the closing tag any more, and nothing is missing
+//! without it: the template writes the tag itself when the turn comes back.
+//! With `required` or a named function the reply cannot end while it thinks
+//! (its end tokens are not allowed there), so it ends with a call or at the
+//! limit of tokens. With `none`, or without tools, the marker inside the
+//! thinking is reasoning like any other text.
+//!
 //! Where this is not llama-server: `required` there lets text come before the
 //! first call; a named function is read as `auto` there (its `tool_choice` is
 //! a string); a `response_format` or `json_schema` next to tools wins over
-//! them silently there and is refused here, as `grammar` is by both.
+//! them silently there and is refused here, as `grammar` is by both; the
+//! marker ends the reasoning there without tools and with `none` too (the
+//! rest of the thinking is then content), and the white space before it
+//! stays in `reasoning_content`.
 
 mod split;
 
 use std::collections::HashMap;
 
-use ares_api::{Engine, Json, Shape, Start, Structure, ToolFormat};
+use ares_api::{Engine, Interrupt, Json, Shape, Start, Structure, ToolFormat};
 use ares_grammar::calls::{CallRule, Callable};
 use serde_json::Value;
 
@@ -229,32 +250,36 @@ pub(crate) fn apply(
         .map(|tool| Callable { name: &tool.name, parameters: tool.parameters.as_ref() })
         .collect();
     let triggered = asked.choice == Choice::Auto;
-    let rule = CallRule { format: &format, tools: &callable, parallel: asked.parallel, triggered };
-    let lark = rule.lark().map_err(|e| ApiError::invalid_param("tools", format!("tools: {e}")))?;
+    let rule = |triggered: bool| {
+        CallRule { format: &format, tools: &callable, parallel: asked.parallel, triggered }
+            .lark()
+            .map(Shape::Lark)
+            .map_err(|e| ApiError::invalid_param("tools", format!("tools: {e}")))
+    };
+    let shape = rule(triggered)?;
+    // A reply that thinks may open a call before it closes its reasoning:
+    // the marker ends the reasoning, and the rule of a call that has been
+    // opened binds what follows.
+    let interrupt = match &thinking.start {
+        Start::Reply => None,
+        Start::AfterReasoning { .. } => Some(Interrupt {
+            text: format.trigger().to_owned(),
+            shape: if triggered { shape.clone() } else { rule(true)? },
+        }),
+    };
     request.structure = Some(Structure {
-        shape: Shape::Lark(lark),
+        shape,
         start: thinking.start.clone(),
         trigger: triggered.then(|| format.trigger().to_owned()),
-        interrupt: None,
+        interrupt,
     });
-    Ok(Some(splitter(format, &asked.tools, thinking, request.id)))
+    Ok(Some(splitter(format, &asked.tools, request.id)))
 }
 
-fn splitter(
-    format: ToolFormat,
-    tools: &[Tool],
-    thinking: &Applied,
-    id: ares_api::RequestId,
-) -> CallSplitter {
+fn splitter(format: ToolFormat, tools: &[Tool], id: ares_api::RequestId) -> CallSplitter {
     let schemas: HashMap<String, Option<Value>> =
         tools.iter().map(|tool| (tool.name.clone(), tool.parameters.clone())).collect();
-    // A reply that is returned raw has its reasoning in the content: calls
-    // are looked for after it, where the rule binds.
-    let gate = match &thinking.start {
-        Start::AfterReasoning { open: None, close } if thinking.raw => Some(close.clone()),
-        _ => None,
-    };
-    CallSplitter::new(format, schemas, call_ids(id), gate)
+    CallSplitter::new(format, schemas, call_ids(id))
 }
 
 /// What the ids of the calls of the request `id` start with.

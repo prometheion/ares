@@ -19,7 +19,7 @@ fn format() -> ToolFormat {
     }
 }
 
-fn splitter(gate: Option<&str>) -> CallSplitter {
+fn splitter() -> CallSplitter {
     let weather = json!({
         "type": "object",
         "properties": {
@@ -31,7 +31,7 @@ fn splitter(gate: Option<&str>) -> CallSplitter {
     });
     let tools: HashMap<String, Option<Value>> =
         [("get_weather".to_owned(), Some(weather)), ("now".to_owned(), None)].into();
-    CallSplitter::new(format(), tools, "call_".into(), gate.map(str::to_owned))
+    CallSplitter::new(format(), tools, "call_".into())
 }
 
 /// What a reply comes to: its content, and each call as its id, its name and
@@ -65,8 +65,8 @@ impl Sorted {
 }
 
 /// The reply sorted when it arrives in the pieces `cuts` make of it.
-fn sorted_in(text: &str, cuts: &[usize], gate: Option<&str>) -> Sorted {
-    let mut splitter = splitter(gate);
+fn sorted_in(text: &str, cuts: &[usize]) -> Sorted {
+    let mut splitter = splitter();
     let mut sorted = Sorted::default();
     let mut from = 0;
     for &cut in cuts.iter().chain([&text.len()]) {
@@ -78,7 +78,7 @@ fn sorted_in(text: &str, cuts: &[usize], gate: Option<&str>) -> Sorted {
 }
 
 fn sorted(text: &str) -> Sorted {
-    sorted_in(text, &[], None)
+    sorted_in(text, &[])
 }
 
 fn call(name: &str, arguments: &str) -> (String, String, String) {
@@ -121,20 +121,20 @@ fn the_pieces_of_a_stream_give_the_same_however_the_text_is_cut() {
     let boundaries: Vec<usize> = (1..TWO.len()).filter(|at| TWO.is_char_boundary(*at)).collect();
     // Two pieces, cut at every position: every marker is split everywhere.
     for &cut in &boundaries {
-        assert_eq!(sorted_in(TWO, &[cut], None), whole, "cut at {cut}");
+        assert_eq!(sorted_in(TWO, &[cut]), whole, "cut at {cut}");
     }
     // One character at a time, and in pieces of three and of seven.
-    assert_eq!(sorted_in(TWO, &boundaries, None), whole);
+    assert_eq!(sorted_in(TWO, &boundaries), whole);
     for step in [3, 7] {
         let cuts: Vec<usize> = boundaries.iter().copied().step_by(step).collect();
-        assert_eq!(sorted_in(TWO, &cuts, None), whole, "pieces of {step}");
+        assert_eq!(sorted_in(TWO, &cuts), whole, "pieces of {step}");
     }
 }
 
 #[test]
 fn no_markup_reaches_the_content_of_a_stream() {
     let boundaries: Vec<usize> = (1..TWO.len()).filter(|at| TWO.is_char_boundary(*at)).collect();
-    let mut splitter = splitter(None);
+    let mut splitter = splitter();
     let mut from = 0;
     for &cut in boundaries.iter().chain([&TWO.len()]) {
         for part in splitter.push(&TWO[from..cut]) {
@@ -152,7 +152,7 @@ fn text_without_a_call_is_content_as_it_is() {
         let got = sorted(text);
         assert_eq!((got.content.as_str(), got.calls.len()), (text, 0));
         let cuts: Vec<usize> = (1..text.len()).collect();
-        assert_eq!(sorted_in(text, &cuts, None), got, "{text:?}");
+        assert_eq!(sorted_in(text, &cuts), got, "{text:?}");
     }
 }
 
@@ -211,7 +211,7 @@ fn a_call_the_end_cuts_stays_as_far_as_it_came() {
     // A cut reply gives the same in a stream.
     let text = &TWO[..TWO.find("Rhein").unwrap()];
     let cuts: Vec<usize> = (1..text.len()).filter(|at| text.is_char_boundary(*at)).collect();
-    assert_eq!(sorted_in(text, &cuts, None), sorted(text));
+    assert_eq!(sorted_in(text, &cuts), sorted(text));
 }
 
 #[test]
@@ -230,11 +230,24 @@ fn what_is_not_a_call_in_the_format_is_content() {
 }
 
 #[test]
-fn a_raw_reply_has_its_calls_after_the_reasoning() {
-    let text = "<think>\nI could write <tool_call> here.\n</think>\n\nSure.\n\n<tool_call>\n<function=now>\n</function>\n</tool_call>";
-    let got = sorted_in(text, &[], Some("</think>"));
-    assert_eq!(got.content, "<think>\nI could write <tool_call> here.\n</think>\n\nSure.");
-    assert_eq!(calls(&got), [call("now", "{}")]);
-    let cuts: Vec<usize> = (1..text.len()).collect();
-    assert_eq!(sorted_in(text, &cuts, Some("</think>")), got);
+fn a_raw_reply_has_its_calls_at_the_first_marker_after_the_reasoning_or_inside_it() {
+    // The reasoning of a raw reply is content, tags and all. The calls
+    // start where the rule binds: at the first marker.
+    let now = "<tool_call>\n<function=now>\n</function>\n</tool_call>";
+    for (text, content) in [
+        (
+            format!("<think>\nI look.\n</think>\n\nSure.\n\n{now}"),
+            "<think>\nI look.\n</think>\n\nSure.",
+        ),
+        (format!("<think>\nI look.\n</think>\n\n{now}"), "<think>\nI look.\n</think>"),
+        // The model did not close its thinking: nothing closes it here.
+        (format!("<think>\nI look.\n\n{now}\n"), "<think>\nI look."),
+        (format!("<think>\n{now}"), "<think>"),
+    ] {
+        let got = sorted(&text);
+        assert_eq!(got.content, content);
+        assert_eq!(calls(&got), [call("now", "{}")]);
+        let cuts: Vec<usize> = (1..text.len()).collect();
+        assert_eq!(sorted_in(&text, &cuts), got);
+    }
 }

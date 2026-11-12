@@ -17,6 +17,10 @@ pub(crate) enum Piece {
 
 /// Sorts the text of a reply: the reasoning's splitter first, and the
 /// splitter of the calls on what that one calls content.
+///
+/// A reply that may call tools ends its reasoning at the marker of a call
+/// too, so the two splitters agree with the engine's rule on where the calls
+/// start: at the first marker, inside the thinking or after it.
 #[derive(Debug, Clone)]
 pub(crate) struct Sorter {
     thinking: Splitter,
@@ -25,6 +29,10 @@ pub(crate) struct Sorter {
 
 impl Sorter {
     pub fn new(thinking: Splitter, calls: Option<CallSplitter>) -> Self {
+        let thinking = match &calls {
+            Some(calls) => thinking.ends_at(calls.trigger()),
+            None => thinking,
+        };
         Self { thinking, calls }
     }
 
@@ -78,3 +86,6 @@ impl Sorter {
         pieces
     }
 }
+
+#[cfg(test)]
+mod tests;

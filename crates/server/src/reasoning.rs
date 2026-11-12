@@ -41,6 +41,12 @@
 //! the content, so that is what is taken off again. llama-server leaves the
 //! newline before the closing tag in `reasoning_content`; a template that does
 //! not trim would then write it twice.
+//!
+//! A reply that may call tools can end its reasoning in a second way: with
+//! the marker that opens a call, written before the closing tag
+//! ([`Splitter::ends_at`]). The reasoning is the text before the marker
+//! without the white space that stands between the two, and the marker is
+//! the first text of the content, where the splitter of the calls reads it.
 
 use ares_api::{Engine, GenerateRequest, Json, Prompt, Start, ThinkingFormat};
 
@@ -188,8 +194,6 @@ pub(crate) struct Applied {
     pub splitter: Splitter,
     /// Where the answer of the reply starts: where a rule for it binds.
     pub start: Start,
-    /// Whether the reasoning stays in the content, tags and all.
-    pub raw: bool,
 }
 
 /// Applies what `parsed` asks about thinking to its request and returns the
@@ -205,7 +209,7 @@ pub(crate) fn apply(
 ) -> Result<Applied, ApiError> {
     let GenerateRequest { model, prompt, structure, .. } = &mut parsed.request;
     let Prompt::Chat { variables, .. } = prompt else {
-        return Ok(Applied { splitter: Splitter::plain(), start: Start::Reply, raw: false });
+        return Ok(Applied { splitter: Splitter::plain(), start: Start::Reply });
     };
     let asked = std::mem::take(&mut parsed.reasoning);
     let format = engine.chat_format(model);
@@ -215,8 +219,7 @@ pub(crate) fn apply(
     if let Some(structure) = structure {
         structure.start = plan.start.clone();
     }
-    let raw = thinking.is_some() && !asked.format.unwrap_or(default).extracts();
-    Ok(Applied { splitter: plan.splitter, start: plan.start, raw })
+    Ok(Applied { splitter: plan.splitter, start: plan.start })
 }
 
 /// What a request comes to once the template's thinking is known.
@@ -340,6 +343,9 @@ pub(crate) struct Splitter {
     /// Text that has come and has not been sorted.
     buffer: String,
     layout: Layout,
+    /// A text that ends the reasoning where it stands and is the first of
+    /// the content: the marker that opens a call of a tool.
+    marker: Option<String>,
     /// Whether the reasoning so far has been more than white space.
     started: bool,
     finished: bool,
@@ -384,13 +390,13 @@ impl Splitter {
 
     /// The raw text, preceded by the end of the prompt from the tag on, which
     /// is what llama-server returns when it is not asked to extract.
-    fn raw(prompt: &str) -> Self {
+    pub(crate) fn raw(prompt: &str) -> Self {
         Self::new(State::Raw, Layout { seed: prompt.to_owned(), ..Layout::default() })
     }
 
     /// Sorts a reply to a prompt that ends with `prompt` (from the opening tag
     /// on) into reasoning and content.
-    fn extracting(format: &ThinkingFormat, prompt: &str) -> Self {
+    pub(crate) fn extracting(format: &ThinkingFormat, prompt: &str) -> Self {
         let start = format.start.trim_start_matches(is_space);
         let end = format.end.as_str();
         let layout = Layout {
@@ -406,7 +412,16 @@ impl Splitter {
     }
 
     fn new(state: State, layout: Layout) -> Self {
-        Self { state, buffer: String::new(), layout, started: false, finished: false }
+        Self { state, buffer: String::new(), layout, marker: None, started: false, finished: false }
+    }
+
+    /// The same splitter for a reply whose reasoning ends at `marker` too,
+    /// when the marker comes before the closing tag: the text before it is
+    /// the reasoning, less the white space between the two, and the content
+    /// starts with the marker. An empty marker ends nothing.
+    pub fn ends_at(mut self, marker: &str) -> Self {
+        self.marker = (!marker.is_empty()).then(|| marker.to_owned());
+        self
     }
 
     /// Takes the next piece of the reply.
@@ -476,10 +491,22 @@ impl Splitter {
         }
     }
 
-    /// The reasoning: up to the closing tag. False when more text is needed.
+    /// The reasoning: up to the closing tag, or up to the marker if that
+    /// comes first. False when more text is needed.
     fn reasoning(&mut self, split: &mut Split) -> bool {
         let (end_tag, before_end) = (&self.layout.end_tag, &self.layout.before_end);
-        if let Some(at) = self.buffer.find(end_tag.as_str()) {
+        let closed = self.buffer.find(end_tag.as_str());
+        let marked = self.marker.as_deref().and_then(|marker| self.buffer.find(marker));
+        if let Some(at) = marked.filter(|at| closed.is_none_or(|closed| *at < closed)) {
+            // The white space before the marker is layout, as it is between
+            // the content and a call.
+            let reasoning = self.buffer[..at].trim_end_matches(is_space).len();
+            self.emit(split, reasoning, true);
+            self.buffer.drain(..at - reasoning);
+            self.state = State::Content;
+            return true;
+        }
+        if let Some(at) = closed {
             // The white space the template writes before the tag is not the
             // reasoning's.
             let before = &self.buffer[..at];
@@ -490,12 +517,20 @@ impl Splitter {
             self.state = State::AfterEnd;
             return true;
         }
-        // The end of the text may be the start of what ends the reasoning.
+        // The end of the text may be the start of what ends the reasoning:
+        // of the tag with the white space the template writes before it, or
+        // of the marker with any white space before it.
         let held = if self.finished {
             0
         } else {
             let with_space = format!("{before_end}{end_tag}");
-            partial_suffix(&self.buffer, end_tag).max(partial_suffix(&self.buffer, &with_space))
+            let tag = partial_suffix(&self.buffer, end_tag)
+                .max(partial_suffix(&self.buffer, &with_space));
+            let marker = self.marker.as_deref().map_or(0, |marker| {
+                let before = self.buffer.len() - partial_suffix(&self.buffer, marker);
+                self.buffer.len() - self.buffer[..before].trim_end_matches(is_space).len()
+            });
+            tag.max(marker)
         };
         let ready = self.buffer.len() - held;
         self.emit(split, ready, self.finished);

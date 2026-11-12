@@ -230,6 +230,165 @@ fn a_plain_splitter_passes_everything_as_content() {
 
 // What a request asks.
 
+// A reply that may call tools: the marker of a call ends the reasoning too.
+
+const MARKER: &str = "<tool_call>";
+
+/// A reply to a prompt that opened the block, for a request whose tools may
+/// be called.
+fn calling() -> Splitter {
+    thinking().ends_at(MARKER)
+}
+
+#[test]
+fn the_marker_of_a_call_ends_the_reasoning_and_is_the_first_of_the_content() {
+    let call = "<tool_call>\n<function=now>\n</function>\n</tool_call>";
+    // The white space between the reasoning and the marker is neither's.
+    for space in ["", " ", "\n", "\n\n", " \n\t\n "] {
+        assert_eq!(
+            whole(calling(), &format!("I look it up.{space}{call}")),
+            pair("I look it up.", call),
+            "{space:?}"
+        );
+    }
+    // A reply that opens the call at once has no reasoning.
+    assert_eq!(whole(calling(), call), pair("", call));
+    assert_eq!(whole(calling(), &format!("\n \n{call}")), pair("", call));
+    // What follows the marker is content, the closing tag too: the
+    // reasoning is over.
+    assert_eq!(
+        whole(calling(), "one<tool_call> two\n</think>\n\nthree"),
+        pair("one", "<tool_call> two\n</think>\n\nthree")
+    );
+    assert_eq!(
+        whole(calling(), "one<tool_call><tool_call>"),
+        pair("one", "<tool_call><tool_call>")
+    );
+}
+
+#[test]
+fn a_marker_after_the_closing_tag_is_content_as_before() {
+    for text in [
+        "I look.\n</think>\n\n<tool_call>\nx",
+        "I look.\n</think><tool_call>\nx",
+        "I look.\n</think>\n\nSure.\n\n<tool_call>\nx",
+        "I look. <tool_cal\n</think>\n\nSure. <tool_call>",
+        "no marker at all\n</think>\n\nanswer",
+        "cut inside the thinking \n",
+        "",
+    ] {
+        assert_eq!(whole(calling(), text), whole(thinking(), text), "{text:?}");
+    }
+    // What only begins like the marker is reasoning.
+    assert_eq!(
+        whole(calling(), "a <tool_cal b <tool_call\n</think>\n\nc"),
+        pair("a <tool_cal b <tool_call", "c")
+    );
+    // At the end of a reply too, with the white space before it.
+    assert_eq!(whole(calling(), "cut \n<tool_ca"), pair("cut \n<tool_ca", ""));
+    assert_eq!(whole(calling(), "cut \n\n"), pair("cut \n\n", ""));
+}
+
+#[test]
+fn the_marker_ends_the_reasoning_however_the_text_is_cut() {
+    let texts = [
+        "I look it up.\n\n<tool_call>\n<function=now>\n</function>\n</tool_call>",
+        "I look.<tool_call>\nrest\n</think>\n\nmore",
+        "<tool_call>\nx",
+        " \n <tool_call>x",
+        "Zwei \u{e4}pfel \u{1f600} \n<tool_call>\n\u{fc}",
+        "I look.\n</think>\n\n<tool_call>\nx",
+        "I look.\n</think><tool_call>x",
+        "I look.\n</think>\n\nSure.\n\n<tool_call>x",
+        "I look. <tool_cal\n</think>\n\nSure.<tool_call>y",
+        "a < b <t <tool <tool_call\n<tool_call>z",
+        "ends in white space \n\n",
+        "ends in <tool_c",
+    ];
+    for text in texts {
+        let expected = whole(calling(), text);
+        let boundaries: Vec<usize> =
+            text.char_indices().map(|(at, _)| at).chain([text.len()]).collect();
+        let check = |parts: &[&str]| {
+            let (given, last) = pieces(calling(), parts);
+            let mut marked = false;
+            let (mut reasoning, mut content) = (String::new(), String::new());
+            for split in given.iter().chain([&last]) {
+                // Once content has come, no more reasoning does.
+                assert!(content.is_empty() || split.reasoning.is_empty(), "{text:?} {parts:?}");
+                reasoning.push_str(&split.reasoning);
+                content.push_str(&split.content);
+                marked |= split.reasoning.contains(MARKER);
+            }
+            assert!(!marked, "the marker in the reasoning of {text:?} as {parts:?}");
+            assert_eq!((reasoning, content), expected, "{text:?} as {parts:?}");
+        };
+        // Three pieces, cut at every pair of positions: the marker is split
+        // at every byte, and so is the white space before it.
+        for &first in &boundaries {
+            for &second in boundaries.iter().filter(|second| **second >= first) {
+                check(&[&text[..first], &text[first..second], &text[second..]]);
+            }
+        }
+        // One character at a time.
+        let characters: Vec<&str> =
+            boundaries.windows(2).map(|pair| &text[pair[0]..pair[1]]).collect();
+        check(&characters);
+    }
+}
+
+#[test]
+fn the_reasoning_before_a_marker_streams_but_for_the_white_space_at_its_end() {
+    let (given, last) = pieces(calling(), &["First ", "second.\n", "\n", "<tool", "_call>", "\nx"]);
+    let reasoning: Vec<&str> = given.iter().map(|s| s.reasoning.as_str()).collect();
+    assert_eq!(reasoning, ["First", " second.", "", "", "", ""]);
+    let content: Vec<&str> = given.iter().map(|s| s.content.as_str()).collect();
+    assert_eq!(content, ["", "", "", "", "<tool_call>", "\nx"]);
+    assert!(last.is_empty());
+    // White space that no marker follows is the reasoning's, a piece later.
+    let (given, _) = pieces(calling(), &["One. \n", "Two.<to", "ol ", "x"]);
+    let reasoning: Vec<&str> = given.iter().map(|s| s.reasoning.as_str()).collect();
+    assert_eq!(reasoning, ["One.", " \nTwo.", "<tool", " x"]);
+}
+
+#[test]
+fn without_a_marker_the_text_of_one_is_reasoning() {
+    // A request without tools, or with `tool_choice: none`.
+    let text = "I could write\n\n<tool_call>\n<function=now>\n</function>\n</tool_call> here.\n</think>\n\nSure.";
+    assert_eq!(
+        whole(thinking(), text),
+        pair(
+            "I could write\n\n<tool_call>\n<function=now>\n</function>\n</tool_call> here.",
+            "Sure."
+        )
+    );
+    // And white space streams as it comes.
+    let (given, _) = pieces(thinking(), &["One. ", "Two.\n\n", "x"]);
+    let reasoning: Vec<&str> = given.iter().map(|s| s.reasoning.as_str()).collect();
+    assert_eq!(reasoning, ["One. ", "Two.\n", "\nx"]);
+    // An empty marker ends nothing.
+    assert_eq!(whole(thinking().ends_at(""), text), whole(thinking(), text));
+}
+
+#[test]
+fn the_marker_ends_the_reasoning_a_reply_opened_itself_and_changes_no_other_reply() {
+    let lead = ThinkingFormat { prompt_on: String::new(), ..qwen() };
+    let opened = || Splitter::extracting(&lead, "").ends_at(MARKER);
+    assert_eq!(whole(opened(), "<think>\nso\n<tool_call>x"), pair("so", "<tool_call>x"));
+    assert_eq!(whole(opened(), "<tool_call>x"), pair("", "<tool_call>x"));
+    assert_eq!(whole(opened(), "Sure. <tool_call>x"), pair("", "Sure. <tool_call>x"));
+    // Thinking off, a raw reply, a model that does not think: all content.
+    let format = qwen();
+    let off = Splitter::extracting(&format, &format.prompt_off).ends_at(MARKER);
+    assert_eq!(whole(off, "Sure. \n<tool_call>x"), pair("", "Sure. \n<tool_call>x"));
+    let raw = Splitter::raw("<think>\n").ends_at(MARKER);
+    assert_eq!(whole(raw, "so \n<tool_call>x"), pair("", "<think>\nso \n<tool_call>x"));
+    assert_eq!(
+        whole(Splitter::plain().ends_at(MARKER), "a \n<tool_call>"),
+        pair("", "a \n<tool_call>")
+    );
+}
+
 fn object(members: &[(&str, Json)]) -> Vec<(String, Json)> {
     members.iter().map(|(name, value)| ((*name).to_owned(), value.clone())).collect()
 }

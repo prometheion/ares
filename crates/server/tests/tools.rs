@@ -168,6 +168,7 @@ async fn streamed(steps: Vec<Step>, extra: Value) -> Reply {
     for chunk in &stream.chunks {
         let choice = &chunk["choices"][0];
         let delta = &choice["delta"];
+        let answering = !reply.content.is_empty() || !reply.calls.is_empty();
         if let Some(content) = delta["content"].as_str() {
             assert!(
                 !content.contains("tool_call") && !content.contains("function"),
@@ -176,6 +177,11 @@ async fn streamed(steps: Vec<Step>, extra: Value) -> Reply {
             reply.content.push_str(content);
         }
         if let Some(reasoning) = delta["reasoning_content"].as_str() {
+            assert!(
+                !reasoning.contains("tool_call") && !reasoning.contains("function"),
+                "markup in a reasoning delta: {reasoning:?}"
+            );
+            assert!(!answering, "reasoning after the answer began: {chunk}");
             reply.reasoning.push_str(reasoning);
         }
         for call in delta["tool_calls"].as_array().into_iter().flatten() {
@@ -243,6 +249,9 @@ async fn tools_reach_the_template_and_the_reply_gets_the_rule_of_the_tool_choice
         let structure = request.structure.as_ref().unwrap();
         assert_eq!(structure.trigger.as_deref(), Some("<tool_call>"));
         assert_eq!(structure.start, after_reasoning, "the reasoning is free");
+        // The marker inside the reasoning ends it, and the same rule binds.
+        let interrupt = structure.interrupt.as_ref().expect("an interrupt");
+        assert_eq!((interrupt.text.as_str(), &interrupt.shape), ("<tool_call>", &structure.shape));
         let grammar = lark(&request);
         assert!(grammar.starts_with("start: first more\n"), "{grammar}");
         assert!(grammar.contains(r#""\n<function=get_weather>\n""#), "{grammar}");
@@ -257,6 +266,18 @@ async fn tools_reach_the_template_and_the_reply_gets_the_rule_of_the_tool_choice
     assert_eq!((structure.trigger.as_deref(), &structure.start), (None, &after_reasoning));
     assert!(lark(&request).starts_with("start: WS? next more\n"));
     assert!(lark(&request).contains("<function=now>"));
+    // A call opened inside the reasoning goes on by the rule of a call
+    // whose marker is written.
+    let opened = |request: &GenerateRequest| {
+        let interrupt =
+            request.structure.as_ref().unwrap().interrupt.clone().expect("an interrupt");
+        assert_eq!(interrupt.text, "<tool_call>");
+        let Shape::Lark(grammar) = interrupt.shape else { panic!("not a grammar of calls") };
+        assert!(grammar.starts_with("start: first more\n"), "{grammar}");
+        grammar
+    };
+    let grammar = opened(&request);
+    assert!(grammar.contains(r#""\n<function=get_weather>\n""#) && grammar.contains("=now>"));
 
     // A named function: the same, with that function alone.
     let choice = json!({"type": "function", "function": {"name": "now"}});
@@ -265,12 +286,16 @@ async fn tools_reach_the_template_and_the_reply_gets_the_rule_of_the_tool_choice
     let grammar = lark(&request);
     assert!(grammar.starts_with("start: WS? next more\n") && grammar.contains("<function=now>"));
     assert!(!grammar.contains("get_weather"), "{grammar}");
+    let inside = opened(&request);
+    assert!(inside.contains("<function=now>") && !inside.contains("get_weather"), "{inside}");
     let Prompt::Chat { tools: sent, .. } = &request.prompt else { panic!() };
     assert_eq!(sent.as_ref().map(Vec::len), Some(2), "the prompt has all the tools");
 
-    // One call at most.
+    // One call at most, inside the reasoning too.
     let request = submitted(json!({"parallel_tool_calls": false}), qwen()).await;
     assert!(lark(&request).contains("more: WS?\n"), "{}", lark(&request));
+    let one = json!({"parallel_tool_calls": false, "tool_choice": "required"});
+    assert!(opened(&submitted(one, qwen()).await).contains("more: WS?\n"));
 
     // none: the tools are in the prompt and the reply is free, as with
     // llama-server.
@@ -282,7 +307,8 @@ async fn tools_reach_the_template_and_the_reply_gets_the_rule_of_the_tool_choice
     // Thinking off: the rule binds from the first token of the reply.
     let off = json!({"chat_template_kwargs": {"enable_thinking": false}});
     let request = submitted(off, qwen()).await;
-    assert_eq!(request.structure.as_ref().unwrap().start, Start::Reply);
+    let structure = request.structure.as_ref().unwrap();
+    assert_eq!((&structure.start, &structure.interrupt), (&Start::Reply, &None));
 }
 
 #[tokio::test]
@@ -365,6 +391,134 @@ async fn with_tool_choice_none_a_call_the_model_writes_stays_text() {
             if stream { streamed_raw(steps, extra).await } else { whole(steps, extra).await };
         assert_eq!(reply.content, CALL);
         assert_eq!((reply.calls.len(), reply.finish.as_str()), (0, "stop"));
+    }
+}
+
+/// The model opens the call while it still thinks: no closing tag.
+const THINKS_ON: &str = "The user asks for the weather.";
+
+#[tokio::test]
+async fn a_call_inside_the_thinking_comes_back_as_a_call_and_ends_the_reasoning() {
+    let named = json!({"type": "function", "function": {"name": "get_weather"}});
+    let choices = [
+        json!({}),
+        json!({"tool_choice": "auto"}),
+        json!({"tool_choice": "required"}),
+        json!({"tool_choice": named}),
+    ];
+    let expected = Reply {
+        content: String::new(),
+        reasoning: THINKS_ON.into(),
+        calls: vec![("get_weather".into(), r#"{"city":"Köln","days":3}"#.into())],
+        finish: "tool_calls".into(),
+    };
+    for extra in choices {
+        // The white space before the marker is neither the reasoning's nor
+        // the call's, whatever the model writes there.
+        for space in ["\n\n", "\n", "", " "] {
+            let said = format!("{THINKS_ON}{space}{CALL}");
+            // However the engine cuts the text: the marker is split somewhere.
+            for size in [1, 2, 3, 5, 11, 1000] {
+                let reply = whole(says(&said, size, FinishReason::Stop), extra.clone()).await;
+                assert_eq!(reply, expected, "{extra} {space:?} in pieces of {size}");
+                let reply = streamed(says(&said, size, FinishReason::Stop), extra.clone()).await;
+                assert_eq!(reply, expected, "{extra} {space:?} streamed in pieces of {size}");
+            }
+        }
+    }
+
+    // Several calls, the first of them inside the thinking; and a reply
+    // that opens a call at once has no reasoning.
+    let said = format!("{THINKS_ON}\n\n{CALL}\n{NOW}\n");
+    let reply = streamed(says(&said, 4, FinishReason::Stop), json!({})).await;
+    assert_eq!(reply.reasoning, THINKS_ON);
+    assert_eq!(reply.calls.len(), 2, "{reply:?}");
+    assert_eq!((reply.content.as_str(), reply.finish.as_str()), ("", "tool_calls"));
+    assert_eq!(reply, whole(says(&said, 4, FinishReason::Stop), json!({})).await);
+    let (_, app) = serve(says(NOW, 3, FinishReason::Stop), qwen());
+    let (_, body) = json(post(&app, CHAT, &chat(json!({}))).await).await;
+    let message = &body["choices"][0]["message"];
+    assert!(message.get("reasoning_content").is_none_or(|r| r == ""), "{body}");
+    assert_eq!(message["tool_calls"][0]["function"]["name"], "now");
+    assert_eq!(message["content"], "");
+}
+
+#[tokio::test]
+async fn a_call_inside_the_thinking_that_the_limit_cuts_is_returned_as_far_as_it_came() {
+    let cut = CALL.find("</parameter>").unwrap() - 2;
+    let said = format!("{THINKS_ON}\n\n{}", &CALL[..cut]);
+    let expected = Reply {
+        content: String::new(),
+        reasoning: THINKS_ON.into(),
+        calls: vec![("get_weather".into(), r#"{"city":"Köl"#.into())],
+        finish: "length".into(),
+    };
+    for size in [1, 4, 1000] {
+        assert_eq!(whole(says(&said, size, FinishReason::Length), json!({})).await, expected);
+        assert_eq!(streamed(says(&said, size, FinishReason::Length), json!({})).await, expected);
+    }
+    // Cut right after the marker, or inside it: no call. The whole marker
+    // has ended the reasoning; a part of one is text of it.
+    for (end, reasoning) in
+        [("\n<tool_call>", THINKS_ON.to_owned()), ("\n<tool", format!("{THINKS_ON}\n<tool"))]
+    {
+        let said = format!("{THINKS_ON}{end}");
+        let reply = whole(says(&said, 2, FinishReason::Length), json!({})).await;
+        assert_eq!(reply, Reply { reasoning, finish: "length".into(), ..Reply::default() });
+    }
+}
+
+#[tokio::test]
+async fn with_tool_choice_none_or_without_tools_a_call_inside_the_thinking_is_reasoning() {
+    let said = format!("I could call.\n\n{CALL}\nBut I answer.\n</think>\n\nIt is sunny.");
+    let expected = Reply {
+        content: "It is sunny.".into(),
+        reasoning: format!("I could call.\n\n{CALL}\nBut I answer."),
+        calls: Vec::new(),
+        finish: "stop".into(),
+    };
+    for extra in [json!({"tool_choice": "none"}), json!({"tools": null}), json!({"tools": []})] {
+        for size in [1, 6, 1000] {
+            let steps = says(&said, size, FinishReason::Stop);
+            assert_eq!(whole(steps, extra.clone()).await, expected, "{extra}");
+            // The stream, with its reasoning as it is.
+            let (_, app) = serve(says(&said, size, FinishReason::Stop), qwen());
+            let mut body = extra.clone();
+            body["stream"] = json!(true);
+            let stream = parse_sse(&body_text(post(&app, CHAT, &chat(body)).await).await);
+            let mut reply = Reply { finish: "stop".into(), ..Reply::default() };
+            for chunk in &stream.chunks {
+                let delta = &chunk["choices"][0]["delta"];
+                assert!(delta.get("tool_calls").is_none(), "{chunk}");
+                reply.content.push_str(delta["content"].as_str().unwrap_or_default());
+                reply.reasoning.push_str(delta["reasoning_content"].as_str().unwrap_or_default());
+            }
+            assert_eq!(reply, expected, "{extra} streamed in pieces of {size}");
+        }
+    }
+    // A reply that never closes its thinking is reasoning to its end.
+    let said = format!("I could call.\n\n{CALL}");
+    let reply = whole(says(&said, 5, FinishReason::Stop), json!({"tool_choice": "none"})).await;
+    assert_eq!(reply, Reply { reasoning: said, finish: "stop".into(), ..Reply::default() });
+}
+
+#[tokio::test]
+async fn a_raw_reply_has_the_call_it_opened_inside_the_thinking() {
+    // `reasoning_format: none`: the thinking stays in the content, from the
+    // tag the prompt ended with on, and the call is a call.
+    let said = format!("{THINKS_ON}\n\n{CALL}");
+    let extra = json!({"reasoning_format": "none"});
+    let expected = Reply {
+        content: format!("<think>\n{THINKS_ON}"),
+        reasoning: String::new(),
+        calls: vec![("get_weather".into(), r#"{"city":"Köln","days":3}"#.into())],
+        finish: "tool_calls".into(),
+    };
+    for size in [1, 7, 1000] {
+        let reply = whole(says(&said, size, FinishReason::Stop), extra.clone()).await;
+        assert_eq!(reply, expected, "pieces of {size}");
+        let reply = streamed(says(&said, size, FinishReason::Stop), extra.clone()).await;
+        assert_eq!(reply, expected, "streamed in pieces of {size}");
     }
 }
 
