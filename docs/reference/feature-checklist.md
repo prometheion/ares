@@ -1,6 +1,8 @@
 # Feature parity checklist: what the other inference engines have, and where Ares stands
 
-Made on 2026-11-11. Read-only survey: nothing was built or run, no repository was changed.
+Made on 2026-11-11. Read-only survey: nothing was built or run, no repository was changed. The `Ares` column of
+R03 to R12, R14, R16, R21 and H02, the counts and the lists were brought up to date on 2026-11-12, when the
+sampler's features (penalties, DRY, logit bias, probabilities, `n` and the rest) were built.
 One row is one capability that a user or operator of an inference server can observe or rely on.
 
 ## How to read it
@@ -79,25 +81,25 @@ or no-op options; Ares may do a thing differently as long as the result is not w
 | --- | --- | --- | --- | --- | --- | --- |
 | R01 | Temperature, top-k, top-p, min-p | all | per request; temperature 0 is greedy; `top_k` 0 or -1 is off | done (on the device) | yes | essential |
 | R02 | Seed | llama, ollama, vllm, trt, mlc, lmdeploy, strata, tfold, sglang?, tgi? | an explicit seed repeats a draw; none means a fresh one; in trt, tfold and Ares the draw of a position does not depend on batch mates | done (generator keyed by seed and position); the seed drawn for a request is not reported (tfold logs it) | yes | common |
-| R03 | Presence and frequency penalty | llama, fork, ollama, vllm, sglang, tgi, trt, mlc, strata, tfold, tabby | OpenAI's rule over the tokens of the reply; under drafts every verified row is penalised for its own path (strata, tfold) | not started (parsed; the engine refuses non-zero values) | yes | essential |
-| R04 | Repetition penalty with a window | llama, fork, ollama, kobold, vllm, sglang, tgi, trt, lmdeploy, strata, tabby | multiplicative penalty on seen tokens; window `repeat_last_n` or `penalty_range` (tabby adds a decay) | not started (parsed; refused) | yes | common |
-| R05 | DRY | llama, kobold, tabby, sonar | penalty that grows with the length of a repeated sequence; breakers, allowed length, range | not started | yes | niche |
-| R06 | XTC | llama, ik, kobold, tabby, sonar | removes the most likely tokens with a given probability | not started | yes | niche |
-| R07 | Further truncation samplers | llama (typical, top-n-sigma), ik (top-n-sigma), kobold (top-a, TFS, typical), tabby (top_a, tfs, typical, skew, smoothing), trt (top-p decay, no-repeat n-gram) | more ways to cut the candidate set | not started | yes | niche |
-| R08 | Mirostat | llama, kobold, tabby, sonar | perplexity-targeting sampler | not started | yes | niche |
-| R09 | Dynamic temperature, adaptive-p | llama, ik (adaptive-p), kobold (dynatemp), tabby (both) | temperature or target probability that moves with the distribution | not started | yes | niche |
-| R10 | Sampler order | llama, kobold, tabby | the request or the server names the order of the filters | not started (fixed order) | yes | niche |
-| R11 | Logit bias | llama, strata, sglang, mlc, kobold, tabby, ik, vllm? | additive bias per token id (OpenAI's map); llama also bans with `false` and accepts strings; ik has a bias that expires | not started (refused) | yes | common |
-| R12 | Allowed and banned token ids, bad words | vllm, tabby, lmdeploy | restrict the draw to ids, or never draw ids or words | not started | yes | niche |
+| R03 | Presence and frequency penalty | llama, fork, ollama, vllm, sglang, tgi, trt, mlc, strata, tfold, tabby | OpenAI's rule over the tokens of the reply; under drafts every verified row is penalised for its own path (strata, tfold) | done (llama.cpp's rule: over the last `repeat_last_n` tokens of the prompt and the reply, 64 unless set, at most 1024, not over the reply alone; every verified row is penalised for its own path, and a request with penalties takes lookup drafts and none from the model's draft block) | yes | essential |
+| R04 | Repetition penalty with a window | llama, fork, ollama, kobold, vllm, sglang, tgi, trt, lmdeploy, strata, tabby | multiplicative penalty on seen tokens; window `repeat_last_n` or `penalty_range` (tabby adds a decay) | done (`repeat_penalty` / `repetition_penalty` with the window `repeat_last_n`; no decay) | yes | common |
+| R05 | DRY | llama, kobold, tabby, sonar | penalty that grows with the length of a repeated sequence; breakers, allowed length, range | done (`dry_multiplier`, `dry_base`, `dry_allowed_length`, `dry_penalty_last_n`, `dry_sequence_breakers`: llama.cpp's algorithm and defaults) | yes | niche |
+| R06 | XTC | llama, ik, kobold, tabby, sonar | removes the most likely tokens with a given probability | done (`xtc_probability`, `xtc_threshold`) | yes | niche |
+| R07 | Further truncation samplers | llama (typical, top-n-sigma), ik (top-n-sigma), kobold (top-a, TFS, typical), tabby (top_a, tfs, typical, skew, smoothing), trt (top-p decay, no-repeat n-gram) | more ways to cut the candidate set | partly: typical (`typical_p`) and top-n-sigma are done; top-a, TFS, skew, smoothing, top-p decay and no-repeat n-gram are not started; `min_keep` above 1 is refused | yes | niche |
+| R08 | Mirostat | llama, kobold, tabby, sonar | perplexity-targeting sampler | done (mirostat 1 and 2 with `mirostat_tau`, `mirostat_eta`; its windows have one row, since `mu` moves with every pick) | yes | niche |
+| R09 | Dynamic temperature, adaptive-p | llama, ik (adaptive-p), kobold (dynatemp), tabby (both) | temperature or target probability that moves with the distribution | partly: dynamic temperature is done (`dynatemp_range`, `dynatemp_exponent`); adaptive-p is refused (`adaptive_target`, `adaptive_decay`) | yes | niche |
+| R10 | Sampler order | llama, kobold, tabby | the request or the server names the order of the filters | done (`samplers` as names or letters, llama.cpp's order when absent; penalties and DRY after a sampler that cuts, `infill` and `adaptive_p` are refused) | yes | niche |
+| R11 | Logit bias | llama, strata, sglang, mlc, kobold, tabby, ik, vllm? | additive bias per token id (OpenAI's map); llama also bans with `false` and accepts strings; ik has a bias that expires | done (OpenAI's map and llama.cpp's list; a token id or a text, whose every token gets the bias; `false` bans a token; no bias that expires) | yes | common |
+| R12 | Allowed and banned token ids, bad words | vllm, tabby, lmdeploy | restrict the draw to ids, or never draw ids or words | partly: token ids can be banned through `logit_bias` with `false`; no list of allowed ids and no bad words; the sampler takes a mask per row, which only the grammar hook (`TokenFilter`) fills | yes | niche |
 | R13 | Banned strings with rewind | kobold, tabby, ik | when a banned string appears, go back and draw again without it | not started | yes | niche |
-| R14 | Log probabilities | llama, vllm, sglang, tgi, trt, mlc, lmdeploy, strata, tfold, kobold | per token `logprob`, `bytes`, up to 20 alternatives; streamed too; equal with drafts on or off (tfold) | not started (refused) | yes | common |
+| R14 | Log probabilities | llama, vllm, sglang, tgi, trt, mlc, lmdeploy, strata, tfold, kobold | per token `logprob`, `bytes`, up to 20 alternatives; streamed too; equal with drafts on or off (tfold) | done (`logprobs` and `top_logprobs` on chat, `logprobs` on completions, `n_probs` with `post_sampling_probs`; per token `logprob`, `bytes` and up to 20 alternatives, streamed in chunks of their own; the model's own softmax or the distribution after the chain; the same with drafts on or off) | yes | common |
 | R15 | Log probabilities of the prompt | vllm, tfold, tgi, sglang | `prompt_logprobs`, `echo`, `logprob_start_len`; gives perplexity over HTTP | not started | yes | niche |
-| R16 | Several choices | llama, sglang, mlc, tgi, trt, vllm? | `n` above 1, `best_of` | not started (`n` must be 1) | yes | niche |
+| R16 | Several choices | llama, sglang, mlc, tgi, trt, vllm? | `n` above 1, `best_of` | partly: `n` (`n_cmpl`) up to 16, streamed too, as n requests with the seeds `seed`, `seed + 1`, ... that read the prompt once; no `best_of` (refused) | yes | niche |
 | R17 | Beam search | vllm, trt | beams with length penalty | not started | yes | niche |
 | R18 | Stop strings | all | the reply is cut before the match, also across chunk borders | done | yes | essential |
 | R19 | Stop token ids, stop regex, keeping the stop text | vllm, sglang, lmdeploy | `stop_token_ids`, `stop_regex`, `include_stop_str_in_output` | not started | yes | niche |
 | R20 | Output limit | all | `max_tokens`, `max_completion_tokens`; -1 or absent means the room left | done | yes | essential |
-| R21 | Minimum length, ignoring the end token | llama, vllm, sglang, tfold, lmdeploy, tabby, kobold | `min_tokens`; `ignore_eos` for benchmarks | not started | yes | niche |
+| R21 | Minimum length, ignoring the end token | llama, vllm, sglang, tfold, lmdeploy, tabby, kobold | `min_tokens`; `ignore_eos` for benchmarks | partly: `ignore_eos` is done; `min_tokens` is not started | yes | niche |
 | R22 | Time limit for a request | llama | `t_max_predict_ms` | not started | yes | niche |
 | R23 | Sampling defaults of the server | llama, fork, vllm, sglang, trt, strata, tfold, tabby, kobold, ollama | values for fields a request leaves out: flags or preset keys, `generation_config`, model-card sets (strata and tfold keep one set for thinking and one without) | not started (no option) | yes | essential |
 | R24 | Forced overrides | tabby, kobold | the server's value wins over the request's | not started | yes | niche |
@@ -278,7 +280,7 @@ or no-op options; Ares may do a thing differently as long as the result is not w
 | ID | Feature | Engines | What it is | Ares | Frame | Need |
 | --- | --- | --- | --- | --- | --- | --- |
 | H01 | CUDA | llama, fork, ik, kobold, ollama, vllm, sglang, tgi, trt, lmdeploy, tabby, mistralrs, mlc, sonar, strata, avalon, tfold | every card CUDA 13 supports | partly: Ampere and Ada measured; other classes compiled and untested; Turing has no prompt and no attention path | yes | essential |
-| H02 | Vulkan | kobold, mlc, llama? | the same features on any GPU with Vulkan | partly: weight and layer kernels at CUDA's speed; no attention, sampler, expert or qwen4exp kernels, no model | yes | essential |
+| H02 | Vulkan | kobold, mlc, llama? | the same features on any GPU with Vulkan | partly: weight and layer kernels at CUDA's speed, attention kernels slower than CUDA's; no sampler (to be rebuilt against `ares-sampler`), expert or qwen4exp kernels, no model | yes | essential |
 | H03 | Several GPUs on Vulkan | llama? | a model split over Vulkan devices | partly: sums go through host pages; no direct route works on the test driver | yes | common |
 | H04 | Pure CPU inference, dense layers on the CPU | llama, ik, kobold, ollama, mistralrs, localai | a model or part of a dense model runs on the CPU (`-ngl`) | not started | no: no CPU inference | - |
 | H05 | Windows and macOS | llama, kobold, ollama, strata, tfold, mistralrs, mlc, lmstudio | native builds | not started | no: Linux only | - |
@@ -340,31 +342,30 @@ Counted from the tables above with a script (see the end of this file for the co
 | --- | --- |
 | Total | 223 |
 | Inside the frame | 200 |
-| - done | 41 |
-| - partly | 36 |
-| - not started | 123 (essential 8, common 38, niche 77) |
+| - done | 52 |
+| - partly | 38 |
+| - not started | 110 (essential 7, common 35, niche 68) |
 | Outside the frame | 23 (all not started) |
 
-Of the 41 done rows 23 are essential, 17 common and 1 niche; of the 36 partly rows 12 are essential, 15 common
-and 9 niche. A row is one capability, so the counts weigh a sampler option like a model router; List 1 orders
+Of the 52 done rows 25 are essential, 22 common and 5 niche; of the 38 partly rows 11 are essential, 13 common
+and 14 niche. A row is one capability, so the counts weigh a sampler option like a model router; List 1 orders
 them by need instead.
 
 ## List 1: inside the frame, not started, most depended-on first
 
-**Essential (8).** Without these a current agent client cannot use the server at all.
+**Essential (7).** Without these a current agent client cannot use the server at all.
 
 - T01 tool calls (parse, stream, results back)
 - K01 reasoning separated from the answer
 - G01 JSON object and JSON schema output
-- R03 presence and frequency penalty
 - R23 sampling defaults of the server
 - M02 several models loaded on request, and M03 the preset file
 - X01 API keys
 
-**Common (38).**
+**Common (35).**
 
 - API: A04 Responses, A07 Anthropic Messages, A08 token counting, A09 tokenize, A16 model properties
-- Sampling: R04 repetition penalty, R11 logit bias, R14 log probabilities, R25 server cap for the output length
+- Sampling: R25 server cap for the output length
 - Structured output: G03 grammars, G05 grammar on a trigger, G06 grammar with thinking, G07 grammar under drafts
 - Tools: T02 forced tool choice, T03 parallel switch, T04 strict schemas, T05 recovery of imperfect calls
 - Reasoning: K03 thinking budget, K05 loop guard, K06 earlier reasoning in the history
@@ -376,13 +377,12 @@ them by need instead.
 - Observability: O01 latency histograms
 - Operations: X04 CORS, X05 Host and Origin checks, X09 container image and service unit
 
-**Niche (77).** A03, A05, A06, A10, A14, A20, A23 to A27; R05 to R10, R12, R13, R15 to R17, R19, R21, R22,
-R24, R27, R29; G02, G04, G08, G09; T06 to T10; K04, K07; F03, F05, F08, F10, F12, F13, F15, F19, F20; S14 to
-S16, S18 to S20, S23; P02, P05, P07, P08, P12, P23, P32, P34; M07, M09, M12, M13; V07; H11, H12; O05, O07; X02,
-X03, X06, X11; Q05.
+**Niche (68).** A03, A05, A06, A10, A14, A20, A23 to A27; R13, R15, R17, R19, R22, R24, R27, R29; G02, G04, G08,
+G09; T06 to T10; K04, K07; F03, F05, F08, F10, F12, F13, F15, F19, F20; S14 to S16, S18 to S20, S23; P02, P05, P07,
+P08, P12, P23, P32, P34; M07, M09, M12, M13; V07; H11, H12; O05, O07; X02, X03, X06, X11; Q05.
 
-The rows that are `partly` are not in this list; the largest of them are Vulkan (H02: no attention, sampler,
-expert kernels and no model, against the frame's "full parity"), the mixture-of-experts model without a prefix cache
+The rows that are `partly` are not in this list; the largest of them are Vulkan (H02: no sampler, expert
+kernels and no model, against the frame's "full parity"), the mixture-of-experts model without a prefix cache
 (S10) and the open parts of its tiers (P19 to P21), the low-bit K/V formats (P14), the RAM and disk tiers of the
 cache (S12, S13), the per-request thinking switch (K02) and the prompt next to generation (S05).
 
@@ -426,14 +426,16 @@ story saves and multiplayer; tunnels (kobold, tgi) and usage statistics sent hom
    (llama `--alias`, tfold, strata `aliases`).
 3. **Order of the filters.** `min_p` after top-k and top-p (sglang, tfold) or before them (vllm, trt). llama's
    default chain is penalties, DRY, top-n-sigma, top-k, typical, top-p, min-p, XTC, temperature, and it is
-   configurable; tabby has `temperature_last` as an option.
+   configurable; tabby has `temperature_last` as an option. Ares: llama's default order, configurable through
+   `samplers`.
 4. **What a penalty counts.** The tokens of the reply only (tfold; strata since its change), or the last N tokens
    of prompt and reply (llama's `repeat_last_n`; strata's old behaviour behind `STRATA_PENALTY_PROMPT=1`); trt has
    `prompt_ignore_length`. Under drafts: each verified row for its own path (strata, tfold), or penalties refused
-   with trees (trt).
+   with trees (trt). Ares: the last N tokens of prompt and reply, each verified row for its own path.
 5. **What a log probability is.** The model's distribution at temperature 1 before any filter (tfold; llama's
    default) or after the sampler chain (llama `post_sampling_probs`). With thinking: the answer's tokens only
-   (tfold) or the thinking's tokens under `reasoning_content` as well (strata).
+   (tfold) or the thinking's tokens under `reasoning_content` as well (strata). Ares: the model's own distribution
+   unless `post_sampling_probs` asks for the one after the chain.
 6. **A `max_tokens` past the window.** Shortened to the room left (strata's default; Ares today) or refused with
    400 when the client gave it explicitly (tfold; strata with `fit_max_tokens: false`).
 7. **A prompt longer than the context.** Refused (strata, tfold, Ares), cut to N tokens from the left or the

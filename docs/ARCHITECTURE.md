@@ -132,11 +132,16 @@ machine (RTX 4070 + RTX 3060, Qwen3.8-27B) or read from the engines listed in
    position-addressable state and leaves recurrent state untouched; the
    accepted prefix is then committed. Rejected rows are cut from the page
    table. There is no snapshot and restore of recurrent state per step.
-6. **Sample on the device.** Logits stay on the GPU; penalties, top-k, top-p,
-   min-p and the pick run there. The random number for a position comes from a
-   counter-based generator keyed by (seed, position), so the randomness of a
-   pick does not depend on what else is in the step, and verifying a draft
-   compares it with the pick the model makes for that position.
+6. **Sample on the device.** Logits stay on the GPU; the corrections of a
+   request (penalties, DRY, logit bias, a mask), the samplers it chooses
+   (top-n-sigma, top-k, typical, top-p, min-p, XTC, temperature and a dynamic
+   one, mirostat), the pick, and the probabilities it asks for all run there.
+   The random number for a position comes from a counter-based generator keyed
+   by (seed, position, token), so the randomness of a pick does not depend on
+   what else is in the step, and verifying a draft compares it with the pick the
+   model makes for that position. What a pick depends on that only the host
+   knows, the tokens before the row, goes to the device per row, so every row
+   of a window is picked as if the drafts before it were the text.
 7. **One thread decides.** All bookkeeping (pages, plans, expert tiers) is
    plain data owned by the step loop, with no locks. Other threads do work
    that waits: one per device to enqueue, a pool for file I/O, the HTTP
@@ -167,18 +172,18 @@ machine (RTX 4070 + RTX 3060, Qwen3.8-27B) or read from the engines listed in
 | `ares-core` | Tensor element types and block geometry, byte units, memory ledgers | Done, unit tested |
 | `ares-gguf` | Zero-copy GGUF reader (version 3, split files, validation at open), a small writer for tests | Done; tested against synthetic, truncated and corrupted files and real models |
 | `ares-quant` | CPU reference decoder for every GGUF type; the specification and reference codec of the engine's own KV formats (`f16`, `q8` to `q4`, tiles with a mean, the policy of exact cells) | Done; bit-identical to ggml's C code on fixtures generated from it; the KV formats are pinned by golden files and were measured on the K and V of real models |
-| `ares-cuda` | Driver API bound at run time, devices, memory, streams, events, modules, decode weight kernels for all 28 weight types, prefill weight kernels for eleven, the layer kernels of `qwen35`, attention over the stored K/V formats, the mesh that sums across devices over peer access or the host | Device layer, decode, layer and attention kernels done; prefill kernels verified, their pass over the weights 1.3 times as fast as the fork's whole prefill; tested on both GPUs, with and without peer access |
+| `ares-sampler` | The definitions of the sampler: the settings of a row, the arithmetic every backend repeats bit for bit, the pick of one row written from its definitions (`sample_reference`), the penalties, DRY and logit bias the host works out, token masks | Done; the reference is checked against llama.cpp's samplers written again in double precision, the penalties against their definition; see [Sampling](#sampling) |
+| `ares-cuda` | Driver API bound at run time, devices, memory, streams, events, modules, decode weight kernels for all 28 weight types, prefill weight kernels for eleven, the layer kernels of `qwen35`, attention over the stored K/V formats, the sampler's kernels, the mesh that sums across devices over peer access or the host | Device layer, decode, layer and attention kernels done; prefill kernels verified, their pass over the weights 1.3 times as fast as the fork's whole prefill; tested on both GPUs, with and without peer access |
 | `ares-vulkan` | The same device-level surface on Vulkan; decode and prefill weight kernels for all 28 weight types as compute shaders, the prefill ones on cooperative matrices; the layer kernels; attention over the stored K/V formats; sums between devices | Device layer and weight, layer and attention kernels done (23 device, 9 kernel, 8 layer, 4 layout, 9 mesh and 9 attention tests on both GPUs); no sampler (to be rebuilt against `ares-sampler`), no expert or `qwen4exp` kernels and no model yet |
 | `ares-state` | Page pool, page tables with copy on write, the prefix index (pages published as they fill, tails, announcements, priority classes), the checkpoint policy for recurrent state, page layouts | Done as bookkeeping; randomised model checks; the conductor's prefix cache uses them (see `ares-runtime`) |
 | `ares-store` | State on disk: pages and checkpoints by content hash in segment files, per fingerprint, with a size limit | Done as a store of opaque bytes, tested against restarts, the limit and damaged files; not yet connected to devices |
 | `ares-io` | Reads of weights straight from the model file: io_uring with direct I/O, demand before prefetch, cancel and promote, copies of a file on several drives with the reads spread over them, a map from experts to file ranges, row reads behind a cache | Done, tested against real files and on two drives; 1.4 to 1.7 GiB/s of random expert-sized reads per SSD of the development machine and 2.9 to 3.0 GiB/s over both; the expert store and the n-gram rows of `qwen4exp` read through it |
 | `ares-sched` | Step planner (generation, decision rows and prompts in one step), admission (pages claimed per step, a reservation that corrects itself, a queue instead of refusals), the order of a pass for long prompts of a model with experts, step time model with a term for the context, draft length choice, the lookup drafter on a suffix automaton shared by all sequences | Done; unit and model tests; the conductor uses the planner, admission (without spill), the lookup drafter and the step cost |
 | `ares-weights` | Expert heat, tiers that are elected and fed by reads (admission, protection, guesses bound late, slots given back), slots per layer by need, the waves of experts of a pass, a token table for the first layers, the lookahead distance, routing bias for pruning | Done, unit tested; the expert store uses the slot sets, the heat and the split of slots; guesses, the token table and pruning are not used by a running model yet |
-| `ares-api` | Request, event, decision and error types; the `Engine` trait between HTTP and the runtime (`submit` for generation, `decide` for decisions, `stats`, `chat_format` for what a model's chat template declares about thinking) | Done, unit tested |
-| `ares-server` | The `ares` binary: loads a model on the devices and serves it over an OpenAI-compatible HTTP API, with the plan of devices, split, shares and context made from what the devices report | Serves `qwen35` and `qwen4exp` models (chat and plain completions, streamed and not, timings, metrics, staged shutdown, the reasoning of a reply apart from its content and in the history, with llama-server's controls for thinking); 154 tests without a GPU, 10 that start the real binary and 3 that run the engine in the test's process; for `qwen35` the prefix cache is on, with `--ram` for the engine's RAM, for `qwen4exp` the RAM is mostly the tier of experts; no router mode, no multimodal input, no tool calls, `/v1/systemone` answers 501 |
+| `ares-api` | Request (with every sampling field), event (text and probabilities), decision and error types; the `Engine` trait between HTTP and the runtime (`submit` for generation, `decide` for decisions, `stats`, `chat_format` for what a model's chat template declares about thinking) | Done, unit tested |
+| `ares-server` | The `ares` binary: loads a model on the devices and serves it over an OpenAI-compatible HTTP API, with the plan of devices, split, shares and context made from what the devices report | Serves `qwen35` and `qwen4exp` models (chat and plain completions, streamed and not, every sampling field and the probabilities of the tokens, `n` completions, timings, metrics, staged shutdown, the reasoning of a reply apart from its content and in the history, with llama-server's controls for thinking); 164 tests without a GPU, 17 that start the real binary (some need the 27B or the files of Flash-Next) and 12 that run the engine in the test's process; for `qwen35` the prefix cache is on, with `--ram` for the engine's RAM, for `qwen4exp` the RAM is mostly the tier of experts; no router mode, no multimodal input, no tool calls, `/v1/systemone` answers 501 |
 | `ares-runtime` | The conductor thread and one thread per device, the step loop that connects plan, state and kernels, admission, speculation with the lookup drafter and with a model's own drafts, the `Model` trait a model implements, a synthetic model that drives the real kernels, and the expert store (VRAM slots, RAM tier, reads, the CPU computing what is not on a GPU) | Drives `qwen35` on one device, in tensor split and in layer split, with picks made on the device; implements `Engine::submit` (not `decide`); the prefix cache is in the conductor, checked against the host executor as an oracle and carried out by `qwen35` on the devices (checkpoints in page-locked RAM within one RAM limit, `PinnedRam`), and there is no spill of pages to RAM (a request that gives way stays in the pool's cache); the expert store is driven by the device threads of `qwen4exp` (see [Qwen3.8-Flash-Next through the runtime](#qwen38-flash-next-through-the-runtime)) |
 | `ares-model` | Model architectures: configuration and weight table from a GGUF, a CPU reference of the forward pass with explicit state (window and commit) that GPU implementations are compared with block by block, and the implementation on the devices | `qwen35` (Qwen3.5-0.8B, Qwen3.8-27B) runs through the runtime and the server, with the model's draft block. `qwen4exp` (Qwen3.8-Flash-Next) runs through the runtime and the server on one or two cards, without speculation (it has no draft head built, and the lookup in earlier text takes part only next to a model drafter), and through a session of its own that tests and measurements use. See [Several devices](#several-devices) |
-
 
 Both test architectures are specified under [reference/](reference/):
 [qwen35](reference/qwen35-architecture.md) and
@@ -227,15 +232,18 @@ requests ──► plan ──► upload step record ──► window ──► 
    Position-addressable state is appended; recurrent layers read their base
    state and keep their inputs.
 4. **Sample.** The sampler's kernels pick the token of every wanted row on
-   the device (`ares_cuda::SamplerKernels`): the most probable token, or
-   temperature, top-k, top-p and min-p as exact thresholds on `p / p_max`
-   (a radix descent over integer histograms) and a pick by Gumbel noise of
+   the device (`ares_cuda::SamplerKernels`): the logits are corrected first
+   (the row's entries and mask, written in the step record), then the most
+   probable token is taken, or the stages of the row's program cut the tokens
+   and scale the temperature as exact thresholds (radix descents over integer
+   histograms, sums of integers) and the pick is made by Gumbel noise of
    (seed, position, token) from a counter-based generator. Its arithmetic is
-   repeated bit for bit on the host (`sample_reference`), which is what its
-   tests compare with. Under a tensor split every device holds the logits of
-   a slice of the vocabulary and the devices add up small partial results
-   between the sampler's steps. Only the picks and the eight best candidates
-   of each row (80 bytes per row) go to the host.
+   repeated bit for bit on the host (`ares_sampler::sample_reference`), which
+   is what its tests compare with; see [Sampling](#sampling). Under a tensor
+   split every device holds the logits of a slice of the vocabulary and the
+   devices add up small partial results between the sampler's steps. Only the
+   picks and the eight best candidates of each row (80 bytes per row), and the
+   probabilities a row asks for (168 bytes), go to the host.
 5. **Commit.** For each sequence the accepted prefix is replayed into its
    recurrent state and the page table is cut after the last accepted row
    (`Sequence::truncate`). Drafters and their acceptance statistics are
@@ -921,6 +929,216 @@ rollback rows forced a replay. Measured on this engine, the gain over three
 links is where text is copied (the rewrite) and for English prose, and zero
 or inside the spread for German and code; nothing is lost where it does not
 pay, because the policy drafts what the price and the acceptance say pay.
+
+## Sampling
+
+A request can set what the model's logits go through before a token is drawn
+from them, and ask for the probabilities of what was drawn. All of it runs on
+the device, in the kernels of `ares-cuda` (`kernels/sampler_*.cuh`), and is
+defined by `ares-sampler`, a crate with no device in it: the settings of a
+row (`SampleParams`, `SampleRow`), the arithmetic every backend repeats
+operation by operation (`arith`), the pick of one row written from its
+definitions (`sample_reference`) and the corrections the host works out
+(`penalties`). Every test of the kernels compares the records they write with
+the reference's bit for bit; a second backend is held to the same.
+
+**What a row carries.** Each wanted row of a step has a sampler row in the step
+record (128 bytes: position, seed, the stages of its program and their
+settings, where its corrections and its mask are, what it reports), and may
+have corrections (16 bytes each, at most 4096 a row) and a mask (a bit per
+token). The logits are corrected in place before anything reads them. A model
+that drafts for itself on the device picks its drafts from the logits as they
+are (`SampleRow::for_draft`): a draft is a guess that the verifying row
+confirms.
+
+**Corrections.** An entry changes one token: `l = l + bias`, then
+`l = l <= 0 ? l * rep : l / rep` (llama.cpp's repetition penalty, which
+lowers a logit on either side of zero), then `l = l - sub`; a token the mask
+does not allow becomes minus infinity. The host emits them from the row's own
+path, the prompt and the reply up to the row's input token and, for a row of a
+window that verifies drafts, the drafts before it. That is what makes a window
+pick what the sequence picks one token at a time. They are:
+
+- the repetition, presence and frequency penalties of llama.cpp over the last
+  `repeat_last_n` tokens of the prompt and the reply (64 unless set, at most
+  1024, 0 off). OpenAI counts presence and frequency over the generated tokens
+  only; this server counts the window, as llama-server does.
+- DRY, ported from llama.cpp's algorithm (the Z algorithm on the reversed window
+  and the sequence breakers, which are found once per list of strings by a
+  pass over the vocabulary's text) with the same defaults (multiplier 0, base
+  1.75, allowed length 2, window 64, breakers `\n : " *`). The penalty is
+  added to `sub`, so it is subtracted after the repetition penalty has
+  scaled the logit where llama.cpp subtracts twice; the difference is one
+  rounding.
+- a logit bias: a token and a number, `false` for a token that must never be
+  picked, or a text, of which every token gets the bias; `ignore_eos` is a ban
+  on the tokens that end a generation.
+
+A request with corrections that depend on the path (penalties, DRY) or a mask
+takes no drafts from the model's own draft block: those are made on the device
+while the step runs, and the host cannot correct a row for drafts it does not
+have yet. It takes the lookup drafts, which the host has, wherever the model has
+a draft block (the lookup joins next to a model drafter and never runs alone).
+
+**The chain.** A sampled row starts with the set of every token that has a
+finite logit, ordered by the distance below the best logit (a token's *key* is
+the bits of that distance, which order like it). The row's program is a list
+of at most 16 stages; each cuts the set to the tokens with keys from `lo` to
+`hi`, or scales the temperature `T` the logits are read at. `x` below is the
+distance below the best token of the set divided by `T`; a token's probability
+within the set is `exp(-x)` over the sum of that.
+
+| Stage | Keeps | Found on the device by |
+| --- | --- | --- |
+| top-n-sigma `n` | `d <= n * sigma`, sigma the standard deviation of the distances `d` of the set | sums of `d` and `d^2` as integers |
+| top-k `k` | the `k` most probable and every token tied with the last | radix descent over the keys, by count |
+| typical `p` | the tokens within the smallest radius of `x` around the mean of `x` (weighted by probability) that holds more than `p` | sums, then a descent over the radii by weight, then the least and greatest key inside |
+| top-p `p` | the most probable that hold at least `p` of the set | radix descent by weight |
+| min-p `p` | at least `p` times as probable as the best of the set | one threshold, no pass |
+| XTC `prob`, `thr` | with probability `prob`: removes the tokens more probable than the least probable that has `thr` or more, if there are two | a draw, sums, a scan |
+| temperature `t` | sets `T = t * T`; a `t` below 1e-6 keeps the tokens tied for the best | arithmetic; a dynamic temperature (range `r`, exponent `e`) first sums the entropy `H` of the set and takes `t` between `max(0, t-r)` and `t+r` by `(H / ln n)^e` |
+| mirostat 2 | the tokens whose surprise `-log2 p` is at most `mu`, or the best | sums, then a search of the key |
+| mirostat 1 | the top-`k` of the `k` that the hundred most probable tokens and `mu` imply | descent for the hundredth key, a gather of the keys below it, arithmetic, descent for `k` |
+
+The order of the program is the request's `samplers` (llama.cpp's default
+order: penalties, DRY, top-n-sigma, top-k, typical, top-p, min-p, XTC,
+temperature); a stage that is not listed is not applied, one that is listed
+twice is applied twice. Penalties and DRY correct the logits and so come
+first or not at all. A stage whose setting switches it off is left out of the
+program. Mirostat replaces the chain, as it does in llama.cpp, which then
+applies neither penalties nor DRY; the logit bias applies to every chain.
+
+The pick is the token of the final set with the largest `logit / T + noise`,
+the noise being Gumbel of (seed, position, token). A row with temperature 0
+(and no dynamic temperature or mirostat) takes the most probable token of the
+corrected logits, the lower token on a tie, whatever the stages are.
+
+Where this differs from llama.cpp: tokens tied at a cut are all kept (llama.cpp
+keeps the first by its sort order); the random numbers are not its generator's,
+so a seed does not give the text llama.cpp gives, only the same text every time
+here; a temperature of 0 takes the best token even where a stage before the
+temperature would have removed it; the probabilities are fixed-point sums, so
+a cut can fall one token away from where llama.cpp's float sums put it when a
+token sits within 1e-6 of it; `min_keep` above 1 is refused (a cut would need
+the count of the tokens it left); adaptive-p is refused (see below); a window
+longer than 1024 is refused.
+
+**Accuracy.** Everything that is summed over tokens is an integer (a count, the
+weights as fixed-point numbers with 40 fractional bits, the entropy term, the
+sums for the deviation), so the order in which threads, blocks and devices add
+does not matter; the exponential and the logarithm are polynomials of IEEE
+operations, in single precision per token and in double precision per row. The
+cross-device sums are numbers split into limbs of 16 or 20 bits that add
+exactly as `f32`. That is why the device's records equal the host's bit for
+bit.
+
+**Mirostat and drafts.** Mirostat's `mu` moves with every token by the
+probability of the token picked, which a row of a window cannot know before the
+row before it is picked. A request with mirostat therefore has windows of one
+row; its `mu` is the host's and the device reports the surprise of each pick.
+Adaptive-p has the same dependence and is not built.
+
+**Drafts and the text.** Every feature gives the same tokens, text and
+probabilities with drafts as without them (a request that says `"draft": false`
+is the one to compare with), and a request does not change what the requests in
+the same steps get. The synthetic model of `ares-runtime`, whose device part
+drafts what it has seen the model pick, proves it bit for bit on every
+placement, with a rule about the tokens as well
+(`every_sampler_feature_gives_the_same_tokens_with_and_without_drafts_on_every_placement`
+and `requests_with_different_settings_in_one_step_do_not_affect_each_other_on_every_placement`
+in `crates/runtime/tests/gpu.rs`), and `crates/runtime/tests/sampling.rs` checks
+the records of the windows against the definitions. The lookup in earlier text
+drafts only next to a model drafter, so the tests on a real model use the 27B and
+its draft block, on both cards with exact products. There the texts were equal
+with drafts and without in all 14 settings through the server
+(`crates/server/tests/real_sampling.rs`: 437 draft rows verified, 425 of them
+right), equal under two rules about the tokens, and equal for requests that run
+next to each other. A model is not exact in general: the logits of a row depend
+on the size of the step that computed it by up to 2e-3 ("Rounding" under
+"Sequence state"), so on a model or a placement where that shows, a sampled
+text can part where two tokens are that close; the tests assert that the
+texts agree for a long stretch and that the probabilities agree on it within
+the model's error.
+
+**Probabilities.** A request asks for the probability of each generated token
+and of the `top` most probable alternatives (at most 20). Two distributions:
+
+- *the model's own*: the softmax of the logits as the model gave them, before
+  the corrections and the chain (OpenAI's `logprobs`, llama.cpp's `n_probs`;
+  vLLM's default). The device takes the best twenty and the sum of the
+  weights from the uncorrected logits before it corrects them, and the pick's
+  uncorrected logit from the entry that corrected it.
+- *after the chain*: the probability within the tokens the chain left, at the
+  temperature it ended with (llama.cpp's `post_sampling_probs`). A row that
+  takes the most probable token has the tokens tied for it.
+
+OpenAI says nothing of a distribution; vLLM and llama.cpp take the model's own
+by default, and so does this server. A probability whose logarithm is below
+-100 is not reported. The probabilities of a token go out with the text of
+the token, once the characters are whole and no stop string holds them back; a
+reply that ends at its token limit inside a character reports the tokens of the
+half character with the last delivery, so that it reports as many tokens as it
+has (one that a stop string cuts does not report the tokens of the string).
+
+**Cost.** The time of the sampler's kernels for one step with 248 320 logits, from
+the launch to the end of the stream, in microseconds (medians of 40 runs, the
+first number for 1 row, then 4 and 16; `the_time_of_a_pick` in
+`crates/cuda/tests/sampler.rs` prints them). The first three lines were also
+measured on the sampler before this piece, in the same minutes and with the
+same load; the others have no earlier figure. Corrections are 64 entries a
+row, a mask allows a third of the tokens, probabilities are the five best.
+
+| Row asks for | RTX 4070 before | RTX 4070 now | RTX 3060 before | RTX 3060 now |
+| --- | --- | --- | --- | --- |
+| most probable token | 38 / 81 / 241 | 40 / 82 / 245 | 56 / 138 / 386 | 58 / 140 / 391 |
+| top-k 20, top-p 0.95 | 124 / 211 / 556 | 125 / 201 / 546 | 156 / 384 / 1138 | 155 / 380 / 1133 |
+| top-p 0.95 | 88 / 158 / 442 | 90 / 156 / 448 | 130 / 276 / 832 | 130 / 294 / 876 |
+| most probable token, penalties | | 40 / 84 / 240 | | 58 / 142 / 390 |
+| most probable token, a mask | | 42 / 86 / 260 | | 64 / 160 / 452 |
+| top-k, top-p, penalties and a mask | | 124 / 202 / 541 | | 163 / 406 / 1190 |
+| most probable token, probabilities | | 94 / 209 / 624 | | 146 / 417 / 1232 |
+| top-k, top-p, probabilities after the chain | | 142 / 233 / 610 | | 211 / 481 / 1405 |
+| top-n-sigma, typical, top-k, top-p | | 172 / 275 / 700 | | 244 / 581 / 1732 |
+
+A request that asks for nothing of the new features costs what it did: the
+most probable token is 1 to 5 percent slower than before (2 microseconds for
+one row, the size of the noise of the measurement), top-k with top-p is the
+same or faster, and top-p alone is 5 to 7 percent slower on the RTX 3060 for 4
+and 16 rows (not isolated; the histogram kernel does more for each token than
+the old one, a test of the set it works on and the scaling by the temperature
+that a chain with a temperature before the cut needs). Penalties are free. A mask costs 6 percent on the RTX 4070 and up to 16 percent on the
+RTX 3060 for the most probable token. Probabilities of the model's own
+distribution add a pass over the logits: 54 microseconds for one row and 380
+for 16 on the RTX 4070 (88 and 840 on the RTX 3060). Top-n-sigma and typical
+together add 47 microseconds for one row and 154 for 16 on the RTX 4070.
+
+**Requests.** The server reads the fields under the names of the OpenAI API and
+of llama.cpp's server: `temperature`, `top_k`, `top_p`, `min_p`, `typical_p`
+(`typical`), `top_n_sigma`, `xtc_probability`, `xtc_threshold`,
+`dynatemp_range`, `dynatemp_exponent`, `mirostat`, `mirostat_tau`,
+`mirostat_eta`, `repeat_penalty` (`repetition_penalty`), `repeat_last_n`,
+`presence_penalty`, `frequency_penalty`, `dry_multiplier`, `dry_base`,
+`dry_allowed_length`, `dry_penalty_last_n`, `dry_sequence_breakers`,
+`logit_bias` (both forms), `ignore_eos`, `samplers` (names or letters), `seed`,
+`stop`, `n` (`n_cmpl`) and `max_tokens` (`max_completion_tokens`, `n_predict`);
+for probabilities `logprobs` and `top_logprobs` (chat), `logprobs` (completions,
+OpenAI's older form of `tokens` and `top_logprobs`), and `n_probs` with
+`post_sampling_probs`. Unset means the model's default for the numbers the
+model owns (temperature, top-k, top-p, min-p), and llama.cpp's for the rest.
+`n` completions are `n` requests with the seeds `seed`, `seed + 1`, ...; the
+engine reads the prompt once and the other requests start from what it
+cached. What is refused, by name: `min_keep` above 1, `repeat_last_n` or
+`dry_penalty_last_n` above 1024 or -1, more than 1024 biased tokens, more than
+20 alternatives, `n` above 16, `adaptive_target`, `adaptive_decay`, the sampler
+names `infill` and `adaptive_p`, a `samplers` list that puts penalties or DRY
+after a sampler that cuts, and what belongs to the grammar and tool-call
+work still to come.
+
+**The hook for grammars.** A request can carry a `TokenFilter`
+(`Runtime::submit_filtered`): before each step the conductor asks it, for every
+wanted row, which tokens may follow the reply and the drafts before the row, and
+writes the answer as a mask into the record. The mechanism is tested with masks
+made by tests; the grammar engine is the next piece.
 
 ## Weights
 
@@ -2238,7 +2456,7 @@ GPU that CUDA 13 does not run on.
 | vLLM, SGLang, TGI, TokenSpeed, LMDeploy, ExLlamaV3 (their schedulers and caches) | Pages claimed per step with a reservation for the output still expected; a request waits when it does not fit; prefix pages published when they fill, with tails; checkpoint intervals and eviction for recurrent state; a context term in the step cost | `ares-sched`, `ares-state` (done as bookkeeping, not wired into the conductor) |
 | TensorRT-LLM, SGLang, vLLM (suffix decoding) | One lookup drafter on a suffix automaton over a corpus shared by all requests | `ares-sched`, used by the conductor |
 | MiniJinja | The interpreter of chat templates | `ares-tokenizer` |
-| llguidance | Grammar-constrained output by validating the GPU's top candidates on the CPU | Planned |
+| llguidance | Grammar-constrained output: the grammar engine on the host gives a mask per row, which the sampler applies on the device (the mask and its hook are built, see [Sampling](#sampling)) | Mask built; the engine is planned |
 | AirLLM | Nothing beyond the expert tiers: reading whole layers per pass is bounded by disk throughput | - |
 | Run My AI, ik_llama.cpp, Fiddler, ktransformers, BELLS, AI-DER, FATE, ProMoE | Direct reads with demand before prefetch; prefill layer by layer in waves of experts; the RAM tier as a cache with admission and protection; the order of work inside a MoE layer; slots per layer by need; fused gate and up of an expert | `ares-io` (reads done); the rest planned, see [Weights](#weights) |
 
@@ -2282,6 +2500,15 @@ Work is paused here until Qwen4 is released; nothing below is in progress.
   copy), layers, attention over the stored K/V formats, sampler, sums
   between devices, router and experts, the kernels of `qwen4exp`. The CUDA
   tests pass on both cards, the kernel ones also on real tensors.
+- The sampler serves everything a request can set on the device, in the
+  names of the OpenAI API and of llama.cpp's server: penalties, DRY, logit
+  bias, a mask per row (the hook the grammars will use), the probabilities of
+  the tokens, the samplers of llama.cpp's chain in any order, mirostat, `n`
+  completions and a seed. Its kernels equal the reference of `ares-sampler`
+  bit for bit on both cards, the reference equals llama.cpp's definitions, and
+  with drafts the tokens are the tokens without them (bit for bit on the
+  synthetic model, and equal in all 14 settings on the 27B). A request that asks
+  for none of it costs what the old sampler did. See [Sampling](#sampling).
 - Vulkan has the weight kernels (the same device layouts, byte for byte) and
   the layer kernels, at CUDA's speed on these cards, and the attention kernels
   over all stored K/V formats. Attention is within 20 % of
@@ -2353,7 +2580,7 @@ order it would be taken up; the source of each idea is in
    starting point), experts, the `qwen4exp` kernels, and the models; attention for
    windows of many rows on the cooperative matrices, and a faster decode of
    the `q8` and `q4` rows; a faster upload.
-7. The sampler's penalties and grammars (llguidance), tool calls, the
+7. Grammars (llguidance) on the sampler's mask, tool calls, the
    router mode with `models.ini`, multimodal input, `Engine::decide` and
    `/v1/systemone` on the real engine.
 8. A path for Turing; a run on any card that is not one of the two here.
@@ -2479,10 +2706,15 @@ and the checkpoint instead of computing it, the answer's `usage` says how much
 (`prompt_tokens_details.cached_tokens`, as OpenAI does), `timings.prompt_n` counts
 the tokens that were computed, and `/metrics` has the counters (starts from the
 cache, cells taken from it, rows replayed, checkpoints saved, restored and
-dropped, pages copied, pages cached, RAM locked for checkpoints). A field of a
-request that the server does not hand to the engine
-is refused by name, not ignored: grammars, logit bias, penalties, tools and
-images among them today. A client that disconnects frees its sequence. The
+dropped, pages copied, pages cached, RAM locked for checkpoints). The sampling
+fields of the OpenAI API and of llama.cpp's server are read under their names
+(see [Sampling](#sampling)), `n` completions of a prompt are `n` requests that
+read the prompt once, and the probabilities of the tokens come back in the
+answer, streamed or not. A field of a request that the server does not hand to
+the engine is refused by name, not ignored: grammars, tools and images among
+them today, and the sampler's few limits (a history of more than 1024 tokens
+for the penalties, more than 20 alternatives, `min_keep` above 1, adaptive-p).
+A client that disconnects frees its sequence. The
 first signal lets running requests finish, the second ends them, and the
 devices are released before the process exits.
 
