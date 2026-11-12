@@ -245,9 +245,102 @@ pub enum PrefillPath {
     /// the rate GeForce cards give f16 accumulation (twice that of f32
     /// accumulation). 0.04 % rms from the exact product on the test data, against
     /// 1.1 % for [`PrefillPath::Int8`]. Partial sums are at most 64 products of a
-    /// weight and a value of magnitude below 1 (the activations are scaled per
-    /// row, see [`Kernels::prepare_prefill_activations`]), so they cannot overflow.
+    /// weight and a value of magnitude below 1 (the activations are divided per
+    /// row by a power of two, see [`Kernels::prepare_prefill_activations`]), so
+    /// they cannot overflow for weights up to [`WeightRange::F16_SUMS_MAX`], and
+    /// they are rounded to f16 after every 8 products: a partial sum below
+    /// 1.2e-4 of the row's factor to a multiple of 2^-24 of it, which an output
+    /// of very small weights feels (`docs/ARCHITECTURE.md`, "Float matrices").
     F16Flush,
+}
+
+/// What the size of a float matrix's weights (F32, F16, BF16) leaves of the tile kernels
+/// ([`Kernels::matmul`]), which hold these weights as f16 without a scale. The decode kernels
+/// ([`Kernels::matvec`]) multiply the weights as stored, in f32, whatever their size.
+///
+/// A loader asks once per matrix ([`WeightRange::of`], a pass over its bytes) and takes the
+/// path [`WeightRange::path`] leaves, so that a product is never infinite where the exact one
+/// is finite. A matrix of another type is always [`WeightRange::Any`]: its scales are f16
+/// in the file.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WeightRange {
+    /// Every path: no weight is larger than [`WeightRange::F16_SUMS_MAX`].
+    #[default]
+    Any,
+    /// Not [`PrefillPath::F16Flush`]: a weight is larger than [`WeightRange::F16_SUMS_MAX`],
+    /// so an f16 sum of 64 products could overflow. [`PrefillPath::F16`] sums in f32.
+    F32Sums,
+    /// No tile kernel: a weight is larger than the largest f16 (65504), infinite or not a
+    /// number, and would be an infinity in the tile.
+    Beyond,
+}
+
+impl WeightRange {
+    /// The largest weight the path with f16 accumulation takes: 2^9. Its partial sums are 64
+    /// products of a weight and an activation of at most 1 (the rows are divided by a power
+    /// of two above their largest value), so they stay below 2^15, half the range of f16,
+    /// and the roundings on the way (at most a spacing of f16 each) cannot reach the rest.
+    pub const F16_SUMS_MAX: f32 = 512.0;
+
+    /// The range of a matrix of `ty` stored in `bytes`: the largest magnitude decides.
+    /// Bytes beyond the last whole value are ignored.
+    pub fn of(ty: GgmlType, bytes: &[u8]) -> Self {
+        // The bits of a float without its sign order as its magnitude does, and those of an
+        // infinity or a NaN are above every finite number's.
+        let largest = match ty {
+            GgmlType::F32 => {
+                let bits = bytes.as_chunks::<4>().0.iter().map(|b| u32::from_le_bytes(*b));
+                f32::from_bits(bits.fold(0, |m, b| m.max(b & 0x7FFF_FFFF)))
+            }
+            GgmlType::F16 => {
+                let bits = bytes.as_chunks::<2>().0.iter().map(|b| u16::from_le_bytes(*b));
+                match bits.fold(0, |m, b| m.max(b & 0x7FFF)) {
+                    0x7C00.. => f32::INFINITY,
+                    // A subnormal: far below any limit.
+                    bits @ ..0x0400 => f32::from(bits) * 2f32.powi(-24),
+                    bits => {
+                        f32::from(0x0400 | (bits & 0x03FF)) * 2f32.powi(i32::from(bits >> 10) - 25)
+                    }
+                }
+            }
+            GgmlType::BF16 => {
+                let bits = bytes.as_chunks::<2>().0.iter().map(|b| u16::from_le_bytes(*b));
+                f32::from_bits(u32::from(bits.fold(0, |m, b| m.max(b & 0x7FFF))) << 16)
+            }
+            _ => return Self::Any,
+        };
+        Self::of_largest(largest)
+    }
+
+    /// The range of a float matrix whose largest magnitude is `largest`.
+    pub fn of_largest(largest: f32) -> Self {
+        if largest <= Self::F16_SUMS_MAX {
+            Self::Any
+        } else if largest <= 65504.0 {
+            Self::F32Sums
+        } else {
+            Self::Beyond
+        }
+    }
+
+    /// The more restrictive of two ranges: that of a matrix made of both.
+    pub fn and(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Beyond, _) | (_, Self::Beyond) => Self::Beyond,
+            (Self::F32Sums, _) | (_, Self::F32Sums) => Self::F32Sums,
+            _ => Self::Any,
+        }
+    }
+
+    /// The path a matrix of this range takes where one of [`WeightRange::Any`] takes `path`:
+    /// `None` is the decode kernels.
+    pub fn path(self, path: Option<PrefillPath>) -> Option<PrefillPath> {
+        match (self, path) {
+            (Self::Beyond, _) => None,
+            (Self::F32Sums, Some(PrefillPath::F16Flush)) => Some(PrefillPath::F16),
+            _ => path,
+        }
+    }
 }
 
 /// How one shape of the prefill kernels runs on a device
@@ -1012,7 +1105,8 @@ impl Kernels {
     /// exact, BF16 weights exact within the range of normal f16 numbers, F32 weights
     /// rounded to 11 bits; a weight beyond 65504 is an infinity in the tile, so the
     /// outputs that read it are infinite or NaN, and one below 6.1e-5 keeps what an f16
-    /// subnormal holds (error at most 2^-25). A type without a prefill kernel is
+    /// subnormal holds (error at most 2^-25); [`WeightRange`] tells a loader which
+    /// path holds the weights of a matrix. A type without a prefill kernel is
     /// refused with an error, as is a device below compute capability 8.0.
     ///
     /// # Safety
@@ -1149,4 +1243,68 @@ fn check_alignment(what: &'static str, ptr: DevicePtr, align: u64) -> Result<()>
         });
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use ares_core::GgmlType;
+    use ares_quant::{f32_to_bf16, f32_to_f16};
+
+    use super::{PrefillPath, WeightRange};
+
+    fn bytes(ty: GgmlType, values: &[f32]) -> Vec<u8> {
+        values
+            .iter()
+            .flat_map(|v| match ty {
+                GgmlType::F32 => v.to_le_bytes().to_vec(),
+                GgmlType::F16 => f32_to_f16(*v).to_le_bytes().to_vec(),
+                _ => f32_to_bf16(*v).to_le_bytes().to_vec(),
+            })
+            .collect()
+    }
+
+    /// The largest magnitude decides, of either sign and wherever it is; the limits belong
+    /// to the range below them. The values are ones every float type holds.
+    #[test]
+    fn the_range_of_a_float_matrix_is_that_of_its_largest_weight() {
+        for ty in [GgmlType::F32, GgmlType::F16, GgmlType::BF16] {
+            let range = |values: &[f32]| WeightRange::of(ty, &bytes(ty, values));
+            assert_eq!(range(&[]), WeightRange::Any, "{ty}");
+            assert_eq!(range(&[0.0, -0.0, 3.0e-7, 0.25, -8.5]), WeightRange::Any, "{ty}");
+            assert_eq!(range(&[0.25, -512.0, 3.0]), WeightRange::Any, "{ty}");
+            assert_eq!(range(&[0.25, 3.0, -520.0]), WeightRange::F32Sums, "{ty}");
+            assert_eq!(range(&[65280.0, 0.25]), WeightRange::F32Sums, "{ty}");
+            assert_eq!(range(&[0.25, f32::INFINITY, 1.0]), WeightRange::Beyond, "{ty}");
+            assert_eq!(range(&[f32::NEG_INFINITY]), WeightRange::Beyond, "{ty}");
+            assert_eq!(range(&[1.0, f32::NAN]), WeightRange::Beyond, "{ty}");
+        }
+        // The largest f16 is within f16; the next bf16 and f32 are not.
+        assert_eq!(WeightRange::of(GgmlType::F16, &0x7BFFu16.to_le_bytes()), WeightRange::F32Sums);
+        assert_eq!(WeightRange::of(GgmlType::F32, &65504f32.to_le_bytes()), WeightRange::F32Sums);
+        assert_eq!(WeightRange::of(GgmlType::F32, &65505f32.to_le_bytes()), WeightRange::Beyond);
+        for ty in [GgmlType::F32, GgmlType::BF16] {
+            assert_eq!(WeightRange::of(ty, &bytes(ty, &[1.0, -7.0e4])), WeightRange::Beyond);
+            assert_eq!(WeightRange::of(ty, &bytes(ty, &[1.0e30, 2.0])), WeightRange::Beyond);
+        }
+        // The scales of the other types are f16 in the file: any bytes are in range.
+        assert_eq!(WeightRange::of(GgmlType::Q4_K, &[0xFF; 144]), WeightRange::Any);
+    }
+
+    #[test]
+    fn a_range_leaves_the_paths_that_hold_its_weights() {
+        use PrefillPath::{F16, F16Flush, Int8};
+        for path in [None, Some(Int8), Some(F16), Some(F16Flush)] {
+            assert_eq!(WeightRange::Any.path(path), path);
+            assert_eq!(WeightRange::Beyond.path(path), None);
+        }
+        assert_eq!(WeightRange::F32Sums.path(Some(F16Flush)), Some(F16));
+        assert_eq!(WeightRange::F32Sums.path(Some(F16)), Some(F16));
+        assert_eq!(WeightRange::F32Sums.path(None), None);
+        let all = [WeightRange::Any, WeightRange::F32Sums, WeightRange::Beyond];
+        for (i, a) in all.into_iter().enumerate() {
+            for (j, b) in all.into_iter().enumerate() {
+                assert_eq!(a.and(b), all[i.max(j)]);
+            }
+        }
+    }
 }

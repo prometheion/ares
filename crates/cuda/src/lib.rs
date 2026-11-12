@@ -49,7 +49,7 @@ pub use experts::{
 };
 pub use kernels::{
     ActivationForm, FEW_ROWS, FewPlan, Kernels, LayoutKernel, LayoutRows, LayoutTable, MAX_BATCH,
-    Precision, PrefillPath, PrefillShape, WeightLayout,
+    Precision, PrefillPath, PrefillShape, WeightLayout, WeightRange,
 };
 pub use layers::{
     AttentionShape, CommitSet, EmbedRows, KeptRows, LayerKernels, NormKind, OutputGate,

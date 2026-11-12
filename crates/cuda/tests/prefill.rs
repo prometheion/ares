@@ -31,7 +31,8 @@ use std::sync::OnceLock;
 
 use ares_core::GgmlType;
 use ares_cuda::{
-    Device, DeviceBuffer, DevicePtr, Kernels, Precision, PrefillPath, Stream, Wait, device_count,
+    Device, DeviceBuffer, DevicePtr, Kernels, Precision, PrefillPath, Stream, Wait, WeightRange,
+    device_count,
 };
 use ares_quant::{f16_to_f32, f32_to_bf16, f32_to_f16};
 
@@ -225,7 +226,12 @@ fn through_f16(v: f32) -> f64 {
 /// How far a kernel result is from the two references.
 #[derive(Debug)]
 struct Deviation {
-    /// Largest `|have - emulation| / sum of |w x|` over the outputs.
+    /// Largest `|have - emulation| / sum of |w x|` over the outputs. For the path with f16
+    /// accumulation, what the rounding of small partial sums may cost is taken off the
+    /// difference first: the f16 sum is rounded after every 8 products, and where it is below
+    /// 2^-13 of the row's factor a rounding is absolute, at most 2^-24 of the factor (derived
+    /// at `tiny_float_weights_are_off_by_at_most_the_spacing_of_f16_subnormals`). An output of
+    /// a row of small weights among larger ones is off by that, whatever its own size.
     tight: f64,
     /// `rms(have - exact) / rms(exact)` and `max|have - exact| / max|exact|`,
     /// with `exact` the product of the weights with the unrounded activations.
@@ -370,6 +376,11 @@ fn deviation(
     let (mut err2, mut ref2, mut err_max, mut ref_max, mut scale2) = (0f64, 0f64, 0f64, 0f64, 0f64);
     for b in 0..n_rows {
         let xb = &x[b * n_in..][..n_in];
+        let small_sums = if path == PrefillPath::F16Flush && xb.iter().any(|v| *v != 0.0) {
+            n_in.div_ceil(8) as f64 * 2f64.powi(-24) * f64::from(row_factor(xb))
+        } else {
+            0.0
+        };
         let xs: Vec<f64> = match path {
             PrefillPath::Int8 => quantized_like_the_gpu(xb),
             PrefillPath::F16 | PrefillPath::F16Flush => {
@@ -389,7 +400,8 @@ fn deviation(
                 squares += e * e;
             }
             let h = f64::from(have[b * n_out + r]);
-            worst_tight = worst_tight.max((h - emulated).abs() / magnitude.max(1e-30));
+            let difference = ((h - emulated).abs() - small_sums).max(0.0);
+            worst_tight = worst_tight.max(difference / magnitude.max(1e-30));
             err2 += (h - exact).powi(2);
             ref2 += exact.powi(2);
             scale2 += squares;
@@ -775,6 +787,8 @@ fn a_float_weight_beyond_f16_makes_its_outputs_infinite_and_no_others_wrong() {
             values[bad_row * n_in + 100] = -7.0e4;
             values[(bad_row + 1) * n_in + 3] = 1.0e30;
             let w = float_bytes(ty, &values);
+            // Which is why a loader asks for the range of a matrix and takes the decode kernels.
+            assert_eq!(WeightRange::of(ty, &w), WeightRange::Beyond);
             let x: Vec<f32> = (0..n_in * n_rows).map(|_| rng.activation() + 2.0).collect();
             for path in paths_of(&kernels, ty) {
                 let have = run_matmul(device, &kernels, ty, path, &w, &x, n_in, n_out, n_rows);
@@ -803,6 +817,64 @@ fn a_float_weight_beyond_f16_makes_its_outputs_infinite_and_no_others_wrong() {
                 for b in 0..n_rows {
                     for (i, r) in ok_rows.iter().enumerate() {
                         assert_eq!(have[b * n_out + r], reference[b * ok_rows.len() + i]);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Weights that f16 holds but whose sums it does not. Above `WeightRange::F16_SUMS_MAX` the
+/// path with f16 accumulation can overflow: a run of 64 weights of 8000 against activations of
+/// one sign gives an infinite output there, and the product on the f16 path, whose sums are
+/// f32. At the limit itself it cannot: 64 weights of 512 against the largest activations a
+/// divided row holds give the product.
+#[test]
+fn the_f16_sums_take_weights_up_to_their_limit_and_overflow_above() {
+    let Some(gpus) = gpus() else { return };
+    let mut rng = Rng(0x94d049bb133111eb);
+    let (n_in, n_out, n_rows, large_row) = (256usize, 70usize, 40usize, 7usize);
+    for device in gpus {
+        let kernels = Kernels::load(device).unwrap();
+        if !kernels.has_prefill_kernels() {
+            continue;
+        }
+        for ty in [GgmlType::F32, GgmlType::BF16] {
+            for (weight, range) in [(8000.0, WeightRange::F32Sums), (512.0, WeightRange::Any)] {
+                let mut values: Vec<f32> =
+                    (0..n_in * n_out).map(|_| rng.activation() * 0.05).collect();
+                values[large_row * n_in + 64..large_row * n_in + 128].fill(weight);
+                let w = float_bytes(ty, &values);
+                assert_eq!(WeightRange::of(ty, &w), range, "{ty} {weight}");
+                let mut exact_weights = vec![0f32; n_in * n_out];
+                ares_quant::dequantize(ty, &w, &mut exact_weights).unwrap();
+                // Just below a power of two, so that the divided values are just below 1.
+                let x: Vec<f32> = (0..n_in * n_rows).map(|_| 0.96 + 0.03 * rng.unit()).collect();
+                for path in paths_of(&kernels, ty) {
+                    let have = run_matmul(device, &kernels, ty, path, &w, &x, n_in, n_out, n_rows);
+                    let held = range.path(Some(path)) == Some(path);
+                    for b in 0..n_rows {
+                        for r in 0..n_out {
+                            let y = f64::from(have[b * n_out + r]);
+                            if r == large_row && !held {
+                                assert!(y.is_infinite(), "{ty} {path:?} row {b}: {y}");
+                                continue;
+                            }
+                            let (mut exact, mut magnitude) = (0f64, 0f64);
+                            for k in 0..n_in {
+                                let p = f64::from(exact_weights[r * n_in + k])
+                                    * f64::from(x[b * n_in + k]);
+                                exact += p;
+                                magnitude += p.abs();
+                            }
+                            // The activations are rounded by 2^-11 of each product, and the
+                            // f16 sum of a group by at most 2^-10 of each of its 8 partial
+                            // sums, the last of which is the group: 4.9e-3 in all.
+                            assert!(
+                                (y - exact).abs() <= 5e-3 * magnitude,
+                                "{ty} {weight} {path:?} row {b} output {r}: {y} for {exact}"
+                            );
+                        }
                     }
                 }
             }
