@@ -448,6 +448,32 @@ fn every_sampler_feature_gives_the_same_tokens_with_and_without_drafts_on_every_
         assert_eq!(start_filtered(&runtime, r, Sliding).unwrap().finish(), expected);
         let d = since(&snapshot(&runtime), &before);
         assert!(d["accepted"] > 10, "drafts are accepted under a filter ({d:?})");
+        // A grammar, which refuses drafts as well as picks: the mask of every
+        // row of a window is the mask of its own path, and a draft the grammar
+        // forbids is cut. The text is the grammar's, with drafts and without.
+        let grammar = ares_api::Structure::new(ares_api::Shape::Gbnf(
+            "root ::= (\"ab\" | \"cd\"){20} [a-f]{100}".into(),
+        ));
+        let mut r = feature_request(
+            prompt,
+            Sampling { temperature: Some(0.9), seed: Some(5), ..Sampling::default() },
+        );
+        r.structure = Some(grammar);
+        r.draft = false;
+        r.id = fresh_id();
+        let expected = run_one(&runtime, r.clone());
+        assert!(
+            expected.text.chars().take(40).all(|c| ('a'..='d').contains(&c)),
+            "{}",
+            expected.text
+        );
+        assert!(expected.text.chars().all(|c| ('a'..='f').contains(&c)), "{}", expected.text);
+        let before = snapshot(&runtime);
+        r.id = fresh_id();
+        r.draft = true;
+        assert_eq!(run_one(&runtime, r), expected, "the text of a grammar, with drafts");
+        let d = since(&snapshot(&runtime), &before);
+        assert!(d["draft_rows"] > 0, "windows verified drafts under a grammar ({d:?})");
     });
 }
 

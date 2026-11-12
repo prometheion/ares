@@ -50,6 +50,7 @@ fn main() {
     let vocab = Vocabulary::new(&pieces, &ends).unwrap();
     let compiler = Compiler::new(vocab).unwrap();
     println!("vocabulary of {n} tokens, {} end tokens: {:.1} ms", ends.len(), ms(t));
+    println!("{}", peak_memory());
 
     for (name, source) in [
         ("json schema (moderate)", Source::JsonSchema(SCHEMA)),
@@ -93,6 +94,14 @@ fn main() {
             at(1.0)
         );
     }
+}
+
+/// The most memory the process has held, from the kernel.
+fn peak_memory() -> String {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| s.lines().find(|l| l.starts_with("VmHWM")).map(str::to_owned))
+        .unwrap_or_default()
 }
 
 fn ms(t: Instant) -> f64 {

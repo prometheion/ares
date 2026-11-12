@@ -168,3 +168,28 @@ fn a_grammar_that_is_wrong_is_refused_with_the_place() {
         assert!(message.contains(wants), "{text:?}: {message:?} lacks {wants:?}");
     }
 }
+
+#[test]
+fn a_string_rule_written_character_by_character_reads_quotes_and_escapes() {
+    let toy = toy();
+    let mut g = toy.grammar(Source::Gbnf(
+        "root ::= string (\",\" string)*\nstring ::= \"\\\"\" ([^\"\\\\] | \"\\\\\" .)* \"\\\"\"",
+    ));
+    assert!(accepts(&toy, &mut g, r#""abc""#));
+    assert!(accepts(&toy, &mut g, r#""a\"b","\\","""#));
+    assert!(!accepts(&toy, &mut g, r#""abc"#), "not closed");
+    assert!(!viable(&toy, &mut g, r#""a"b"#), "a quote ends the string");
+    assert!(viable(&toy, &mut g, r#""a\"#), "an escape takes the next character");
+}
+
+#[test]
+fn repetitions_leave_what_the_rest_of_the_rule_needs() {
+    let toy = toy();
+    // `d+` must give back the last digit: the grammar reads one character at a time.
+    let mut g = toy.grammar(Source::Gbnf("root ::= d+ [0-9]\nd ::= [0-9]"));
+    assert!(accepts(&toy, &mut g, "12"));
+    assert!(accepts(&toy, &mut g, "9876"));
+    assert!(!accepts(&toy, &mut g, "1"));
+    let mut g = toy.grammar(Source::Gbnf("root ::= num \"x\"\nnum ::= [0-9]+"));
+    assert!(accepts(&toy, &mut g, "123x") && !accepts(&toy, &mut g, "x"));
+}
