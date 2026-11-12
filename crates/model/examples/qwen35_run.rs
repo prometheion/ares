@@ -386,28 +386,23 @@ fn print_embedding(report: &PartReport) {
 }
 
 /// Prints the page-locked RAM the model holds for the token embedding and
-/// what the kernel says this process has pinned.
+/// what the kernel counts for this process. Memory the driver page-locks is
+/// shared memory of the process to the kernel (`RssShmem`), with every other
+/// buffer the driver locked for it: the step record, the read-back, the
+/// staging of the uploads. `VmLck` and `VmPin` do not count it.
 fn print_locked(model: &Qwen35) {
     use ares_runtime::Model;
     let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
-    let kib = |field: &str| {
-        status
-            .lines()
-            .find_map(|line| {
-                line.strip_prefix(field)?
-                    .strip_prefix(':')?
-                    .split_whitespace()
-                    .next()?
-                    .parse::<f64>()
-                    .ok()
-            })
-            .unwrap_or(0.0)
-    };
+    let shared = status
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("RssShmem:")?.split_whitespace().next()?.parse::<f64>().ok()
+        })
+        .unwrap_or(0.0);
     println!(
-        "RES RAM locked: {:.1} MiB for the token embedding (booked as required); the kernel counts {:.1} MiB pinned and {:.1} MiB locked in this process",
+        "RES RAM locked: {:.1} MiB for the token embedding (booked as required); the kernel counts {:.1} MiB of shared memory in this process, which is all the driver locked for it",
         model.pinned_ram() as f64 / MIB,
-        kib("VmPin") / 1024.0,
-        kib("VmLck") / 1024.0,
+        shared / 1024.0,
     );
 }
 
@@ -912,6 +907,7 @@ fn engine(args: &Args, spread: &Spread, window: u32) {
             taken as f64 / MIB,
             (memory.total - memory.free) as f64 / MIB,
         );
+        print_embedding(report);
         print_ledger(report, memory.total - memory.free, taken);
         print_layouts(report, args.show_layouts);
         if let Some(d) = &report.draft {
@@ -930,6 +926,7 @@ fn engine(args: &Args, spread: &Spread, window: u32) {
             );
         }
     }
+    print_locked(&model);
 
     // A file to write again with two names changed: text to copy.
     let rewrite = format!(
