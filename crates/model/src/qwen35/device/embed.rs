@@ -2,7 +2,8 @@
 //!
 //! The token embedding table (`token_embd`: a row of `n_embd` values in the
 //! file's quantized form for every token of the vocabulary) is large, 313 MiB
-//! to 680 MiB for the 27B, and a step needs the rows of its own tokens only.
+//! and 521 MiB in two files of the 27B, and a step needs the rows of its own
+//! tokens only.
 //! So the table does not lie on the device. The device that embeds the step's
 //! tokens gets their rows from two places:
 //!
