@@ -7,8 +7,9 @@
 //!
 //! - the kernels (`kernels.rs`): gate and up of an expert on the same
 //!   input, `silu(gate) * up`, down, for the rows of a step that picked the
-//!   expert, straight on the file's quantized bytes (IQ2_S, IQ2_XXS and IQ1_M
-//!   for gate and up, Q2_0 for down). The arithmetic is the device's: the
+//!   expert, straight on the file's quantized bytes (kernels written for
+//!   IQ2_S, IQ2_XXS and IQ1_M gate and up and for Q2_0 down, and every other
+//!   weight type through the reference decoder). The arithmetic is the device's: the
 //!   same int8 activations, exact integer sums per 32 values, the hidden
 //!   values quantized the same way. A row therefore loses nothing when the
 //!   CPU computes one of its experts.
@@ -33,7 +34,7 @@ use std::time::{Duration, Instant};
 use ares_core::GgmlType;
 use ares_cuda::ExpertShape;
 
-use kernels::{DownExpert, GateKind, Hidden, RowIn};
+use kernels::{DownExpert, DownKind, GateKind, Hidden, RowIn};
 pub use pool::{CpuPool, Placement, Topology};
 use tables::Lanes16;
 
@@ -264,6 +265,7 @@ struct JobExpert {
 /// does not depend on who ran it.
 pub struct LayerJob {
     kind: GateKind,
+    down: DownKind,
     features: Features,
     n_in: usize,
     n_ff: usize,
@@ -330,21 +332,13 @@ impl LayerJob {
         act: &[u8],
         experts: &[CpuExpert],
     ) -> Result<Self, CpuError> {
-        let kind = match shape.gate_ty {
-            GgmlType::IQ2_S => GateKind::Iq2S,
-            GgmlType::IQ2_XXS => GateKind::Iq2Xxs,
-            GgmlType::IQ1_M => GateKind::Iq1M,
-            ty => return Err(CpuError::Type { what: "gate and up", ty }),
-        };
-        if shape.down_ty != GgmlType::Q2_0 {
-            return Err(CpuError::Type { what: "down", ty: shape.down_ty });
-        }
+        let kind = GateKind::of(shape.gate_ty)
+            .ok_or(CpuError::Type { what: "gate and up", ty: shape.gate_ty })?;
+        let down = DownKind::of(shape.down_ty)
+            .ok_or(CpuError::Type { what: "down", ty: shape.down_ty })?;
+        // Whole blocks of both types and whole groups of 32 values.
+        shape.check().map_err(|e| CpuError::Job(e.to_string()))?;
         let (n_in, n_ff) = (shape.n_embd as usize, shape.n_ff as usize);
-        if n_in == 0 || !n_in.is_multiple_of(256) || n_ff == 0 || !n_ff.is_multiple_of(64) {
-            return Err(CpuError::Job(format!(
-                "width {n_in} must be whole blocks of 256 and inner width {n_ff} of 64"
-            )));
-        }
         if n_rows == 0 || n_rows > MAX_ROWS {
             return Err(CpuError::Job(format!("{n_rows} rows; a job takes 1 to {MAX_ROWS}")));
         }
@@ -389,6 +383,7 @@ impl LayerJob {
         let tasks = gate_up_tasks + if list.is_empty() { 0 } else { n_in.div_ceil(DOWN_ROWS) };
         let job = Self {
             kind,
+            down,
             features,
             n_in,
             n_ff,
@@ -444,11 +439,7 @@ impl LayerJob {
 
     /// The index of the job's gate type in a [`ThreadSpeed`].
     fn kind_index(&self) -> usize {
-        match self.kind {
-            GateKind::Iq2S => 0,
-            GateKind::Iq2Xxs => 1,
-            GateKind::Iq1M => 2,
-        }
+        self.kind.index()
     }
 
     /// Runs task `index`, which the caller has claimed. A down task must
@@ -520,6 +511,7 @@ impl LayerJob {
             unsafe {
                 kernels::down_rows(
                     self.features.vnni,
+                    self.down,
                     &experts,
                     self.n_ff,
                     self.n_out,
