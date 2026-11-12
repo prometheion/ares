@@ -242,8 +242,9 @@ fn a_filter_makes_a_mask_for_every_wanted_row_and_the_record_carries_it() {
     });
     let calls = Arc::new(Mutex::new(Vec::new()));
     // The filter lets one token through at each place, so that the reply
-    // repeats at once and the lookup in earlier text has drafts to offer (a
-    // request with a filter takes no drafts from the model's own block).
+    // repeats at once and the lookup in earlier text has drafts to offer (the
+    // filter binds every row, so the request takes no drafts from the model's
+    // own block).
     let mut r = request("filtered", Some(200));
     r.sampling.temperature = Some(0.8);
     let run = start_filtered(&rt, r, Counting { calls: calls.clone() }).unwrap().finish();

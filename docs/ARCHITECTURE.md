@@ -1013,11 +1013,14 @@ pick what the sequence picks one token at a time. They are:
   picked, or a text, of which every token gets the bias; `ignore_eos` is a ban
   on the tokens that end a generation.
 
-A request with corrections that depend on the path (penalties, DRY) or a mask
-takes no drafts from the model's own draft block: those are made on the device
-while the step runs, and the host cannot correct a row for drafts it does not
-have yet. It takes the lookup drafts, which the host has, wherever the model has
-a draft block (the lookup joins next to a model drafter and never runs alone).
+A request with corrections that depend on the path (penalties, DRY) takes no
+drafts from the model's own draft block: those are made on the device while the
+step runs, and the host cannot correct a row for drafts it does not have yet. It
+takes the lookup drafts, which the host has, wherever the model has a draft block
+(the lookup joins next to a model drafter and never runs alone). A request with
+a mask is in the same position only while its rule binds: where the rule leaves
+the reply free it takes the model's drafts like any other request (see "Drafts"
+under "Structured output" below).
 
 **The chain.** A sampled row starts with the set of every token that has a
 finite logit, ordered by the distance below the best logit (a token's *key* is
@@ -1247,11 +1250,47 @@ row before it and is rejected whatever happens. On top of that the conductor
 cuts a forbidden draft, and the ones after it, from the lookup's proposal
 before the window is chosen (`TokenFilter::admitted`), so the rows are not paid
 for: a test with runs of one letter has every draft verified accepted, and 74 of
-119 without the cut. A request with a rule takes no drafts from the model's own
-draft block (their tokens are not known when the record is written, as for
-penalties). Tokens the rule forces (one token allowed) are not offered as
-drafts: the lookup is the drafter that joins next to a draft block, and a
+119 without the cut. Tokens the rule forces (one token allowed) are not offered
+as drafts: the lookup is the drafter that joins next to a draft block, and a
 forced token would be a third source with a chance of one; it is not built.
+
+*The model's own drafts.* The tokens of the draft block's drafts are not known
+when the record is written, so the rows of a window that takes them carry no
+mask. For the rows a rule leaves free that is exact: no mask applies there with
+drafts or without. Most rules are free for most of a reply (the reasoning before
+a `response_format`, a schema or a grammar; with tools that may be called, the
+reasoning and the text before the trigger), so a request with a rule takes the
+model's drafts whenever the next token is free, as a request without a rule
+does, and takes the lookup's alone while the rule is bound. Where the rule
+starts to bind inside such a window is found when the picks are back
+(`TokenFilter::free_rows`, which a `Structure` answers from the phase of the
+reply, `Guide::free_rows`): the token that makes it bind (the last token of the
+closing tag, of the trigger) was picked by a free row and is taken; the rows
+after it needed a mask, so their picks are not the request's and their cells are
+cut, as those of rejected drafts are. That token is then the newest token of the
+next window, whose first row has its mask; its row is computed a second time,
+which is the cost of a binding token inside a window, once per phase. The
+devices are not involved: they get the count of accepted rows from the host as
+for every window, and a window of this kind looks like any window of the model's
+drafts. A filter that does not say which rows it leaves free is taken to bind
+every row.
+
+On the host (`crates/runtime/tests/free_drafts.rs`, the synthetic model with
+text that never repeats and a draft block that is right nine times in ten, a
+window of 8 rows, a step priced at 3 ms and 0.03 ms a row and 0.3 ms a link of
+the chain): a reply of 310 free tokens and 6 bound ones had 255 of the block's
+drafts accepted and took 60 steps, and one of 310 free tokens and a call of 42
+took 89; the same 310 tokens without a rule had 255 accepted in 55 steps, and
+the two replies without drafts took 316 and 352 steps. The same file puts the
+binding token at every pick of a window in turn, for both kinds of rule, and has
+a filter that is free and bound in turn, after which the drafts come back. No
+model was run for this: what it gives on the 27B is not measured.
+
+Under a bound rule the model's drafts are not taken. A window verified without
+masks could be kept as far as each pick is a token the mask of its row allows,
+which the host can work out afterwards; that is exact for a row that takes the
+most probable token and not for a sampled one, whose cuts (top-k, top-p and the
+others) are made within the tokens the mask leaves. It is not built.
 
 *Cost.* Host time, on the vocabulary of the 0.8B (248,320 tokens), one core of
 the machine (`cargo run --release -p ares-grammar --example mask_cost`): reading
@@ -2986,8 +3025,9 @@ order it would be taken up; the source of each idea is in
    the `q8` and `q4` rows; a faster upload.
 7. The router mode with `models.ini`, multimodal input, `Engine::decide` and
    `/v1/systemone` on the real engine. For tool calls: the tests on the real
-   models, the model's own drafts for the free part of a reply with tools, and
-   a format for templates that write calls otherwise.
+   models (the model's own drafts in the free part of a reply with tools
+   among them, which only the host has run), and a format for templates that
+   write calls otherwise.
 8. A path for Turing; a run on any card that is not one of the two here.
 
 ## Host memory
@@ -3335,11 +3375,12 @@ The text with drafts is the text without, as for every rule (host tests on the
 synthetic model: `crates/runtime/tests/tools.rs` under the rule, and
 `crates/server/tests/tools_engine.rs` from the request to the answer, where the
 reply is also the same whole and streamed). A request with tools that may be
-called has a rule, and a request with a rule takes no drafts from the model's own
-draft block (see [Sampling](#sampling)): that holds for its whole reply, the
-thinking and the free text before a call included, where no mask binds. To give
-those rows the model's drafts the conductor would have to stop accepting them at
-the token that makes the rule bind; that is not built.
+called has a rule, which is free for the thinking and for the text before a
+call: there the request takes the model's own drafts like a request without
+tools, and the conductor stops taking what a window gives at the token that
+makes the rule bind (the trigger, or the closing tag of the reasoning when a
+call is required; see "Drafts" under [Sampling](#sampling)). Inside a call it
+takes the lookup's drafts alone.
 
 On the vocabulary of the 0.8B (248,320 tokens) the grammar of a tool compiles in
 about a millisecond, and the mask of a step along random walks through it takes a
