@@ -1244,7 +1244,8 @@ fn first_choice(reply: &Reply) -> (String, Vec<Value>) {
 #[test]
 fn the_sampler_serves_what_a_request_sets_and_reports_the_probabilities() {
     let Some(model) = model() else { return };
-    let server = Server::start(&model, port(9), &[]);
+    // The 0.8B thinks first unless told not to: the answers are the reply.
+    let server = Server::start(&model, port(9), &["--chat-var", "enable_thinking=false"]);
     let chat_path = "/v1/chat/completions";
     let question = "Name three colours.";
     let greedy = |extra: Value| {
