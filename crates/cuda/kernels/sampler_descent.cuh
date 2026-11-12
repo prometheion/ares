@@ -54,32 +54,24 @@ static __device__ __forceinline__ uint32_t ares_sample_level_bins(uint32_t level
     return level == 1 ? 2048u : 1024u;
 }
 
-// Grid (chunks, rows), ARES_SAMPLE_THREADS threads. Adds the tokens of the set
-// in chunk `blockIdx.x` of row `blockIdx.y` to the row's histogram
-// `hist[(r * ARES_SAMPLE_BINS + bin) * ARES_SAMPLE_BIN_WORDS ..]`, which must be zero
-// before the first chunk adds to it.
-ARES_KERNEL ares_sample_hist(const float* logits, uint32_t stride, uint32_t n_local, uint32_t chunk,
-                             const AresSampleParams* params, const AresSampleState* state,
-                             uint32_t* hist, uint32_t desc, uint32_t level, uint32_t position) {
-    __shared__ uint32_t local[ARES_SAMPLE_BINS * ARES_SAMPLE_BIN_WORDS];
-    const uint32_t r = blockIdx.y;
-    if (!ares_desc_runs(params[r], state[r], desc, position)) {
-        return;
-    }
-    const uint32_t bins = ares_sample_level_bins(level);
-    for (uint32_t i = threadIdx.x; i < bins * ARES_SAMPLE_BIN_WORDS; i += ARES_SAMPLE_THREADS) {
-        local[i] = 0;
-    }
-    __syncthreads();
+// A row with at most this many tokens for a histogram (as far as the kernels
+// before know, see `AresSampleState::set_tokens`) adds them to it one by one.
+#define ARES_HIST_FEW 256
 
-    const AresSampleState s = state[r];
+// Adds the tokens of the set among this thread's `n` logits `v` to the
+// histogram at `bins`: the count of each token, and its weight unless the
+// descent goes by count.
+static __device__ __forceinline__ void ares_hist_chunk(const float* v, uint32_t n,
+                                                       const AresSampleState& s, uint32_t desc,
+                                                       uint32_t level, bool by_count, uint32_t* bins) {
     const uint32_t prefix = s.prefix;
-    const uint32_t begin = blockIdx.x * chunk;
-    const uint32_t end = min(begin + chunk, n_local);
-    const float* row = logits + (size_t)r * stride;
-    for (uint32_t i = begin + threadIdx.x; i < end; i += ARES_SAMPLE_THREADS) {
+#pragma unroll
+    for (int k = 0; k < ARES_SAMPLE_PER; ++k) {
+        if ((uint32_t)k >= n) {
+            break;
+        }
         bool bad = false;
-        const float l = ares_sample_logit(row[i], &bad);
+        const float l = ares_sample_logit(v[k], &bad);
         if (!ares_sample_present(l)) {
             continue;
         }
@@ -106,18 +98,61 @@ ARES_KERNEL ares_sample_hist(const float* logits, uint32_t stride, uint32_t n_lo
             }
             bin = key & 0x3ffu;
         }
-        const uint64_t w = ares_sample_weight(__float_as_uint(x));
-        uint32_t* at = local + bin * ARES_SAMPLE_BIN_WORDS;
+        uint32_t* at = bins + bin * ARES_SAMPLE_BIN_WORDS;
         atomicAdd(at, 1u);
+        if (by_count) {
+            continue;
+        }
+        const uint64_t w = ares_sample_weight(__float_as_uint(x));
         if (w != 0) {
             atomicAdd(at + 1, (uint32_t)(w & 0x3fffu));
             atomicAdd(at + 2, (uint32_t)((w >> 14) & 0x3fffu));
             atomicAdd(at + 3, (uint32_t)(w >> 28));
         }
     }
-    __syncthreads();
+}
+
+// Grid (chunks, rows), ARES_SAMPLE_THREADS threads, `chunk` at most
+// ARES_SAMPLE_PER logits per thread. Adds the tokens of the set
+// in chunk `blockIdx.x` of row `blockIdx.y` to the row's histogram
+// `hist[(r * ARES_SAMPLE_BINS + bin) * ARES_SAMPLE_BIN_WORDS ..]`, which must be zero
+// before the first chunk adds to it. A descent by count (top-k, the
+// hundredth token) reads no weights, so its histograms hold none.
+//
+// A chunk builds its histogram in shared memory, where the same few bins take
+// most of the tokens, and adds the bins it used to the row's. After a cut,
+// and below the first level, a row has few tokens that count; the kernel that
+// decided the level before says how many, and then the chunks skip their own
+// histograms and add the tokens to the row's directly.
+ARES_KERNEL ares_sample_hist(const float* logits, uint32_t stride, uint32_t n_local, uint32_t chunk,
+                             const AresSampleParams* params, const AresSampleState* state,
+                             uint32_t* hist, uint32_t desc, uint32_t level, uint32_t position) {
+    __shared__ uint32_t local[ARES_SAMPLE_BINS * ARES_SAMPLE_BIN_WORDS];
+    const uint32_t r = blockIdx.y;
+    if (!ares_desc_runs(params[r], state[r], desc, position)) {
+        return;
+    }
+    const AresSampleState s = state[r];
+    const bool by_count = desc == ARES_DESC_TOPK || desc == ARES_DESC_K100;
+    const uint32_t begin = blockIdx.x * chunk;
+    const uint32_t end = min(begin + chunk, n_local);
+    float v[ARES_SAMPLE_PER];
+    const uint32_t n = ares_sample_read(logits + (size_t)r * stride, begin, end, v);
     uint32_t* global = hist + (size_t)r * ARES_SAMPLE_BINS * ARES_SAMPLE_BIN_WORDS;
-    for (uint32_t i = threadIdx.x; i < bins * ARES_SAMPLE_BIN_WORDS; i += ARES_SAMPLE_THREADS) {
+    if ((level == 0 ? s.set_tokens : s.level_tokens) <= ARES_HIST_FEW) {
+        ares_hist_chunk(v, n, s, desc, level, by_count, global);
+        return;
+    }
+    // The words of a bin that this descent uses: the count alone, or all.
+    const uint32_t words = ares_sample_level_bins(level) * ARES_SAMPLE_BIN_WORDS;
+    const uint32_t step = by_count ? ARES_SAMPLE_BIN_WORDS : 1u;
+    for (uint32_t i = threadIdx.x * step; i < words; i += ARES_SAMPLE_THREADS * step) {
+        local[i] = 0;
+    }
+    __syncthreads();
+    ares_hist_chunk(v, n, s, desc, level, by_count, local);
+    __syncthreads();
+    for (uint32_t i = threadIdx.x * step; i < words; i += ARES_SAMPLE_THREADS * step) {
         const uint32_t v = local[i];
         if (v != 0) {
             atomicAdd(global + i, v);
@@ -176,10 +211,17 @@ ARES_KERNEL ares_sample_decide(const float* exchange, const AresSampleParams* pa
     const float* row = exchange + (size_t)r * ARES_SAMPLE_BINS * ARES_SAMPLE_BIN_WORDS;
     const float* mine = row + (size_t)threadIdx.x * per_thread * ARES_SAMPLE_BIN_WORDS;
 
+    // The thread's bins, all read before one is used.
+    float own[ARES_SAMPLE_BINS / ARES_SAMPLE_THREADS * ARES_SAMPLE_BIN_WORDS];
+#pragma unroll
+    for (uint32_t j = 0; j < ARES_SAMPLE_BINS / ARES_SAMPLE_THREADS * ARES_SAMPLE_BIN_WORDS; ++j) {
+        own[j] = j < per_thread * ARES_SAMPLE_BIN_WORDS ? mine[j] : 0.0f;
+    }
     uint64_t c = 0, w = 0;
-    for (uint32_t j = 0; j < per_thread; ++j) {
-        c += ares_sample_bin_count(mine + j * ARES_SAMPLE_BIN_WORDS);
-        w += ares_sample_bin_weight(mine + j * ARES_SAMPLE_BIN_WORDS);
+#pragma unroll
+    for (uint32_t j = 0; j < ARES_SAMPLE_BINS / ARES_SAMPLE_THREADS; ++j) {
+        c += ares_sample_bin_count(own + j * ARES_SAMPLE_BIN_WORDS);
+        w += ares_sample_bin_weight(own + j * ARES_SAMPLE_BIN_WORDS);
     }
     counts[threadIdx.x] = c;
     weights[threadIdx.x] = w;
@@ -224,20 +266,28 @@ ARES_KERNEL ares_sample_decide(const float* exchange, const AresSampleParams* pa
         // keeps the deeper levels empty.
         s->prefix = 0xffffffffu;
         s->rem = 0;
+        s->level_tokens = 0;
     } else if (before < target && target <= totals[threadIdx.x]) {
         uint64_t run = before;
         uint32_t bin = 0;
+        // The tokens in the bins before the one the target falls in, and in it.
+        uint64_t tokens_below = threadIdx.x ? counts[threadIdx.x - 1] : 0;
+        uint64_t tokens_in = 0;
         for (uint32_t j = 0; j < per_thread; ++j) {
             const float* b = mine + j * ARES_SAMPLE_BIN_WORDS;
-            const uint64_t v = by_count ? ares_sample_bin_count(b) : ares_sample_bin_weight(b);
+            tokens_in = ares_sample_bin_count(b);
+            const uint64_t v = by_count ? tokens_in : ares_sample_bin_weight(b);
             bin = threadIdx.x * per_thread + j;
             if (run + v >= target) {
                 break;
             }
             run += v;
+            tokens_below += tokens_in;
         }
         s->prefix = level == 0 ? bin : (s->prefix << shift) | bin;
         s->rem = target - run;
+        s->below_tokens = (level == 0 ? 0u : s->below_tokens) + (uint32_t)tokens_below;
+        s->level_tokens = (uint32_t)tokens_in;
     }
     __syncthreads();
     if (threadIdx.x != 0 || level != 2) {
@@ -249,6 +299,8 @@ ARES_KERNEL ares_sample_decide(const float* exchange, const AresSampleParams* pa
         case ARES_DESC_TOPP:
             if (cut != 0xffffffffu) {
                 s->hi = min(s->hi, cut);
+                // The tokens of the set up to the cut are what is left of it.
+                s->set_tokens = min(s->set_tokens, s->below_tokens + s->level_tokens);
             }
             ares_stage_done(p, s, position);
             break;

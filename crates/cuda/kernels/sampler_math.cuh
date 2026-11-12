@@ -141,7 +141,16 @@ struct AresSampleState {
     // The logarithm of the weight of all tokens, for the model's own
     // probabilities.
     double raw_lnz;
-    uint32_t reserved[20];
+    // How many tokens the row's next histogram will see, as far as the
+    // kernels before it know. `set_tokens`: at most this many tokens are in
+    // the set (0xffffffff: never counted). `level_tokens`: the tokens in the
+    // bin the last level of a descent chose, which are those of its next
+    // level; `below_tokens`: the tokens of the set in the bins before it.
+    // They only choose how a histogram is built, never what it holds.
+    uint32_t set_tokens;
+    uint32_t level_tokens;
+    uint32_t below_tokens;
+    uint32_t reserved[17];
 };
 static_assert(sizeof(AresSampleState) == 256, "the host sizes the scratch by 256 bytes a row");
 
@@ -416,6 +425,27 @@ static __device__ __forceinline__ void ares_sample_terms(float d, float x, unsig
     t[2] = (unsigned long long)__fmul_rn(__ull2float_rn(w), x);
     t[3] = (unsigned long long)__fmul_rn(dc, 16777216.0f);
     t[4] = (unsigned long long)__fmul_rn(__fmul_rn(dc, dc), 65536.0f);
+}
+
+// --- a thread's logits of a chunk ---------------------------------------------------
+
+// The logits of its chunk a thread of a kernel that passes over the row reads:
+// a chunk is at most this many logits per thread of the block.
+#define ARES_SAMPLE_PER 16
+
+// Reads the logits of chunk `begin .. end` of `row` that belong to this thread
+// (`begin + k * blockDim.x + threadIdx.x`) into `v` and returns how many there
+// are. All of them are read before one is used, so the thread waits for the
+// memory once and not once per logit.
+static __device__ __forceinline__ uint32_t ares_sample_read(const float* row, uint32_t begin,
+                                                            uint32_t end, float* v) {
+    const uint32_t mine = begin + threadIdx.x;
+#pragma unroll
+    for (int k = 0; k < ARES_SAMPLE_PER; ++k) {
+        const uint32_t i = mine + k * blockDim.x;
+        v[k] = i < end ? row[i] : 0.0f;
+    }
+    return mine < end ? min((end - mine - 1) / blockDim.x + 1, (uint32_t)ARES_SAMPLE_PER) : 0u;
 }
 
 // --- reductions --------------------------------------------------------------------

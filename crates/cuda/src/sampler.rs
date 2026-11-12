@@ -42,10 +42,10 @@ const THREADS: u32 = 256;
 const BINS: u32 = 2048;
 const BIN_WORDS: u32 = 4;
 const CHUNK: u32 = 4096;
-/// A thread of a top kernel holds at most this many logits of its chunk
-/// (`ARES_TOP_PER` in the kernels).
-const TOP_PER: u32 = 16;
-const _: () = assert!(CHUNK <= TOP_PER * THREADS);
+/// A thread of a kernel that passes over a row reads at most this many logits
+/// of its chunk (`ARES_SAMPLE_PER` in the kernels).
+const PER_THREAD: u32 = 16;
+const _: () = assert!(CHUNK <= PER_THREAD * THREADS);
 const MAX_CHUNKS: u32 = SAMPLE_MAX_VOCAB / CHUNK;
 /// Entries per chunk in the list of a top kernel with the most candidates.
 const LIST: u32 = LOGPROBS_MAX as u32 + 1;
