@@ -11,6 +11,7 @@
 //!     [--text TOKENS.txt] [--text-file A.md,B.md] [--decode-at 1000,8000]
 //!     [--decode-steps 64]
 //!     [--prefill 2048] [--breakdown] [--serve model|stream|cpu] [--transit 32]
+//!     [--read-ahead on|off]
 //! ```
 //!
 //! - `--spread`: how two devices share the model: a range of layers each
@@ -47,7 +48,9 @@
 //!   with the experts the first one fetched.
 //! - `--transit N`: transit slots per device for the experts a wide step misses, to
 //!   measure what they are worth; 0 brings them into the tier's slots, and without the
-//!   option the plan of the store decides.
+//!   option the plan of the store decides. `--read-ahead on` starts the reads of the
+//!   layers ahead on a guess (what the wide step before missed there), to measure what the
+//!   guesses are worth.
 //! - `--serve`: how an expert that is in no slot is served: `model` lets the
 //!   store's measured costs decide between an upload and the CPU (what the
 //!   engine does), `stream` uploads every one, `cpu` computes every one.
@@ -99,6 +102,7 @@ struct Args {
     serve: Serve,
     stall_s: u64,
     transit: Option<u32>,
+    read_ahead: bool,
 }
 
 fn parse() -> Result<Args, AnyError> {
@@ -133,6 +137,7 @@ fn parse() -> Result<Args, AnyError> {
         serve: Serve::Measured,
         stall_s: 20,
         transit: None,
+        read_ahead: false,
     };
     let mut it = std::env::args().skip(1);
     let list = |s: String| -> Vec<String> { s.split(',').map(str::to_owned).collect() };
@@ -182,6 +187,13 @@ fn parse() -> Result<Args, AnyError> {
             "--breakdown" => args.breakdown = true,
             "--stall-s" => args.stall_s = value()?.parse()?,
             "--transit" => args.transit = Some(value()?.parse()?),
+            "--read-ahead" => {
+                args.read_ahead = match value()?.as_str() {
+                    "on" => true,
+                    "off" => false,
+                    other => return Err(format!("--read-ahead {other}: on or off").into()),
+                }
+            }
             "--serve" => {
                 args.serve = match value()?.as_str() {
                     "stream" => Serve::Stream,
@@ -450,6 +462,7 @@ fn run() -> Result<(), AnyError> {
         serve: args.serve,
         stall: Duration::from_secs(args.stall_s),
         transit: args.transit,
+        read_ahead: args.read_ahead,
         ..SessionOptions::default()
     };
     let devices: Vec<Device> =

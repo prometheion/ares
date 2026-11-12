@@ -135,6 +135,12 @@ pub struct SessionOptions {
     /// measure what they are worth; `None` lets the plan of the store decide
     /// (`plan_transit`), 0 brings the misses into the tier's slots.
     pub transit: Option<u32>,
+    /// Whether wide steps start the reads of the layers ahead on a guess: what the wide step
+    /// before missed there and no tier holds. Off unless a measurement asks for it: that
+    /// guess is mostly wrong (what a step read and the heat keeps is in RAM afterwards, so
+    /// what is left to guess is what one row used), and with it a prompt read 1.6 to 2.8 GiB
+    /// more from the file and 5 to 30 % slower (measured 2026-11-12, see ARCHITECTURE.md).
+    pub read_ahead: bool,
 }
 
 impl Default for SessionOptions {
@@ -154,6 +160,7 @@ impl Default for SessionOptions {
             row_cache: 16 << 20,
             stall: Duration::from_secs(30),
             transit: None,
+            read_ahead: false,
         }
     }
 }
@@ -669,7 +676,8 @@ impl<'g> Session<'g> {
         }
         let boards = parts.iter().map(Part::board).collect();
         let firsts = parts.iter().map(|part| part.layer_range().start).collect();
-        let feed = Feed::new(store, boards, firsts, layout, c.experts.used as u32);
+        let mut feed = Feed::new(store, boards, firsts, layout, c.experts.used as u32);
+        feed.set_read_ahead(opts.read_ahead);
 
         let ngram = NgramFeed::open(gguf, c, opts.row_cache, opts.part.max_slots)?;
 

@@ -875,7 +875,9 @@ impl Qwen4Exp {
                     .iter()
                     .map(|b| b.clone().ok_or_else(|| invalid("a part has no route records")))
                     .collect::<Result<Vec<_>, _>>()?;
-                let feed = Feed::new(store, boards, firsts, layout.clone(), c.experts.used as u32);
+                let mut feed =
+                    Feed::new(store, boards, firsts, layout.clone(), c.experts.used as u32);
+                feed.set_read_ahead(self.opts.read_ahead);
                 let ngram = NgramFeed::open(&self.gguf, c, self.opts.row_cache, o.max_slots)
                     .map_err(model_error)?;
                 let flow = Arc::new(Flow {

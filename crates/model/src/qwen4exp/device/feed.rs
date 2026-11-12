@@ -272,6 +272,8 @@ pub(super) struct Feed {
     /// The guessed reads the store had counted, and their time, when they were last looked
     /// at.
     ahead_seen: (u64, f64),
+    /// Whether the reads of the layers ahead are started on a guess.
+    read_ahead: bool,
 }
 
 impl Feed {
@@ -288,6 +290,7 @@ impl Feed {
             guessed: vec![false; layout.specs.len()],
             lookahead: Lookahead::default(),
             ahead_seen: (0, 0.0),
+            read_ahead: false,
             store,
             boards,
             firsts,
@@ -297,6 +300,11 @@ impl Feed {
             groups: Vec::new(),
             wide: WideStats::default(),
         }
+    }
+
+    /// Sets whether wide steps read ahead on a guess (they do not unless told to).
+    pub(super) fn set_read_ahead(&mut self, read_ahead: bool) {
+        self.read_ahead = read_ahead;
     }
 
     /// Whether the misses of layer `at` of the store go through transit.
@@ -350,6 +358,9 @@ impl Feed {
     /// `per_layer`-th (the layers of one part, or all when the parts hold a range of layers
     /// each), as far ahead as the lookahead says.
     fn guess_ahead(&mut self, first: usize) -> Result<(), Error> {
+        if !self.read_ahead {
+            return Ok(());
+        }
         let step = self.layout.per_layer;
         for at in (first..self.guessed.len()).step_by(step).take(self.lookahead.distance()) {
             if !std::mem::replace(&mut self.guessed[at], true) && self.has_transit(at) {
