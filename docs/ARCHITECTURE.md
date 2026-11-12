@@ -168,7 +168,7 @@ machine (RTX 4070 + RTX 3060, Qwen3.8-27B) or read from the engines listed in
 | `ares-gguf` | Zero-copy GGUF reader (version 3, split files, validation at open), a small writer for tests | Done; tested against synthetic, truncated and corrupted files and real models |
 | `ares-quant` | CPU reference decoder for every GGUF type; the specification and reference codec of the engine's own KV formats (`f16`, `q8` to `q4`, tiles with a mean, the policy of exact cells) | Done; bit-identical to ggml's C code on fixtures generated from it; the KV formats are pinned by golden files and were measured on the K and V of real models |
 | `ares-cuda` | Driver API bound at run time, devices, memory, streams, events, modules, decode weight kernels for all 28 weight types, prefill weight kernels for eleven, the layer kernels of `qwen35`, attention over the stored K/V formats, the mesh that sums across devices over peer access or the host | Device layer, decode, layer and attention kernels done; prefill kernels verified, their pass over the weights 1.3 times as fast as the fork's whole prefill; tested on both GPUs, with and without peer access |
-| `ares-vulkan` | The same device-level surface on Vulkan; decode and prefill weight kernels for all 28 weight types as compute shaders, the prefill ones on cooperative matrices; sums between devices | Device layer and weight kernels done (23 device, 11 kernel and 9 mesh tests on both GPUs); no layer or attention kernels and no model yet |
+| `ares-vulkan` | The same device-level surface on Vulkan; decode and prefill weight kernels for all 28 weight types as compute shaders, the prefill ones on cooperative matrices; the layer kernels; attention over the stored K/V formats; the sampler; sums between devices | Device layer and weight, layer, attention and sampler kernels done (23 device, 9 kernel, 8 layer, 4 layout, 9 mesh, 9 attention and 6 sampler tests on both GPUs); no expert or `qwen4exp` kernels and no model yet |
 | `ares-state` | Page pool, page tables with copy on write, the prefix index (pages published as they fill, tails, announcements, priority classes), the checkpoint policy for recurrent state, page layouts | Done as bookkeeping; randomised model checks; the conductor's prefix cache uses them (see `ares-runtime`) |
 | `ares-store` | State on disk: pages and checkpoints by content hash in segment files, per fingerprint, with a size limit | Done as a store of opaque bytes, tested against restarts, the limit and damaged files; not yet connected to devices |
 | `ares-io` | Reads of weights straight from the model file: io_uring with direct I/O, demand before prefetch, cancel and promote, copies of a file on several drives with the reads spread over them, a map from experts to file ranges, row reads behind a cache | Done, tested against real files and on two drives; 1.4 to 1.7 GiB/s of random expert-sized reads per SSD of the development machine and 2.9 to 3.0 GiB/s over both; the expert store and the n-gram rows of `qwen4exp` read through it |
@@ -2013,8 +2013,101 @@ GPU that CUDA 13 does not run on.
   and Q6_K at 75.5 / 34.3 *(measured by the agent that built the kernels;
   CUDA: 88.8 / 39.3 and 74.5)*.
 - The layer kernels exist with CUDA's semantics and are held to the same
-  references. Attention, the expert and sampler kernels, the kernels of
-  `qwen4exp` and a model on Vulkan do not exist yet.
+  references.
+- Attention exists for every stored K/V format (`f16`, `q8` and the formats
+  with a tile mean down to `q4`, separately for K and V), over dense ranges,
+  lists of ranges and prefixes that several sequences share, with the kernels
+  that append new cells and convert exact tiles. The bytes it writes are the
+  CPU reference's (`ares_quant::kv`, which CUDA's are held to as well),
+  checked byte for byte; its
+  output equals `KvHead::attend` within 1.1e-5 of the largest output element
+  on random rows, on the captured rows of Qwen3.8-27B and for every pair of
+  formats and both head sizes, on both cards (the reference's tolerance for
+  an `f32` kernel is 2e-5; CUDA's tensor-core kernels are held to 8e-3).
+  There is no tensor-core instruction in it. An item (some rows of one KV head
+  over a list of ranges, as the CUDA plan cuts them) is one workgroup that
+  takes a cell per invocation for the scores and a slice of the columns per
+  invocation for V, in `f32`, with the rows decoded in registers; it holds up
+  to 16 vectors (the query heads of its rows; 8 on a device with less than
+  28 KiB of shared memory) where CUDA's hold 64. The planner aims for three
+  workgroups for each multiprocessor, as CUDA's does; Vulkan does not report
+  their count, so it is measured at load, by how many workgroups of 1024
+  invocations the device runs at once (46 and 27 on these cards, the same in
+  every load). The device needs what the quantized weight kernels need and
+  shuffles in a subgroup.
+  Measured 2026-11-12 on the shape of Qwen3.8-27B (head size 256, 4 KV heads
+  of 6 query heads), one attention layer, the best of two runs, Vulkan next
+  to CUDA on the same card, `ARES_LIBCUDA` from the p2p bench:
+
+  | case (per layer) | RTX 4070 Vulkan us | RTX 4070 CUDA us | ratio | RTX 3060 Vulkan us | RTX 3060 CUDA us | ratio |
+  | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+  | f16/f16 1 rows over 1024 | 27 | 20 | 1.36 | 41 | 47 | 0.87 |
+  | f16/f16 8 rows over 1024 | 62 | 34 | 1.84 | 121 | 109 | 1.11 |
+  | f16/f16 64 rows over 1024 | 229 | 174 | 1.32 | 611 | 335 | 1.82 |
+  | f16/f16 1 rows over 32768 | 358 | 307 | 1.16 | 494 | 526 | 0.94 |
+  | f16/f16 8 rows over 32768 | 943 | 415 | 2.27 | 2,336 | 818 | 2.86 |
+  | f16/f16 64 rows over 32768 | 7,023 | 3,229 | 2.17 | 16,779 | 6,101 | 2.75 |
+  | f16/f16 1 rows over 262144 | 2,568 | 2,267 | 1.13 | 3,504 | 3,957 | 0.89 |
+  | f16/f16 8 rows over 262144 | 7,928 | 2,728 | 2.91 | 18,885 | 5,822 | 3.24 |
+  | f16/f16 64 rows over 262144 | 58,219 | 24,983 | 2.33 | 137,887 | 47,610 | 2.90 |
+  | f16/f16 list of 2051 over 32768 | 38 | 32 | 1.19 | 76 | 92 | 0.83 |
+  | q8/q8 1 rows over 1024 | 55 | 28 | 2.01 | 83 | 49 | 1.68 |
+  | q8/q8 8 rows over 1024 | 108 | 40 | 2.74 | 226 | 115 | 1.97 |
+  | q8/q8 64 rows over 1024 | 361 | 206 | 1.75 | 1,048 | 382 | 2.75 |
+  | q8/q8 1 rows over 32768 | 493 | 217 | 2.27 | 888 | 480 | 1.85 |
+  | q8/q8 8 rows over 32768 | 1,776 | 382 | 4.65 | 4,175 | 782 | 5.34 |
+  | q8/q8 64 rows over 32768 | 45,696 | 3,378 | 13.53 | 32,521 | 6,335 | 5.13 |
+  | q8/q8 1 rows over 262144 | 3,463 | 1,376 | 2.52 | 6,688 | 3,552 | 1.88 |
+  | q8/q8 8 rows over 262144 | 15,954 | 2,447 | 6.52 | 32,716 | 5,396 | 6.06 |
+  | q8/q8 64 rows over 262144 | 103,061 | 25,989 | 3.97 | 260,029 | 49,401 | 5.26 |
+  | q8/q8 list of 2051 over 32768 | 71 | 39 | 1.81 | 147 | 72 | 2.06 |
+  | q4/q4 1 rows over 1024 | 60 | 46 | 1.29 | 78 | 74 | 1.05 |
+  | q4/q4 8 rows over 1024 | 106 | 41 | 2.55 | 200 | 105 | 1.90 |
+  | q4/q4 64 rows over 1024 | 375 | 210 | 1.79 | 860 | 391 | 2.20 |
+  | q4/q4 1 rows over 32768 | 426 | 196 | 2.17 | 818 | 445 | 1.84 |
+  | q4/q4 8 rows over 32768 | 1,655 | 411 | 4.03 | 4,146 | 934 | 4.44 |
+  | q4/q4 64 rows over 32768 | 12,787 | 4,208 | 3.04 | 31,231 | 7,988 | 3.91 |
+  | q4/q4 1 rows over 262144 | 3,056 | 930 | 3.29 | 6,193 | 2,587 | 2.39 |
+  | q4/q4 8 rows over 262144 | 12,978 | 2,701 | 4.80 | 33,379 | 6,082 | 5.49 |
+  | q4/q4 64 rows over 262144 | 102,631 | 33,304 | 3.08 | 251,630 | 63,071 | 3.99 |
+  | q4/q4 list of 2051 over 32768 | 80 | 61 | 1.30 | 137 | 117 | 1.17 |
+
+  Where Vulkan is behind and what bounds it. With one row of `f16` over
+  32768 or more cells it is within 16 % of CUDA on the RTX 4070 (418 GB/s of
+  the card's 504 over 262144 cells) and 6 to 11 % faster on the RTX 3060:
+  memory bound. With one row of `q8` or `q4` it takes 1.05 to 3.3 times as
+  long on both cards: each invocation walks the row of its own cell through
+  2-byte loads (the groups of the formats are 2-byte aligned) and unpacks the
+  bit planes into `f32` before the products, so the kernel is bound by
+  instructions and not by memory (165 and 99 GB/s on the RTX 4070 against
+  CUDA's 413 and 321 for one row over 262144 cells). Windows of 8 and 64
+  rows take 1.1 to 6.5 times as long, mostly 2 to 5: an item holds 16
+  vectors, two rows of six heads, so a window of 8 rows is four items per KV
+  head that each read every cell (CUDA: one item of 48 vectors on tensor
+  cores), and 64 rows read them 32 times. A kernel for wide windows on the
+  cooperative matrices that the weight kernels already use is not built.
+  A list of 2051 cells takes 0.83 to 2.1 times as long as CUDA's.
+  One entry stands out: `q8`, 64 rows over 32768 cells, on the RTX 4070 takes
+  45.7 ms in both runs of the final build, 13.5 times CUDA's and 3.6 times the
+  12.6 ms the same kernel took in four runs before the device size was measured
+  the way it is now (the plan is the same, 128 items); its cause is not
+  found.
+- The sampler exists with the same arithmetic as CUDA's, operation for
+  operation (no fused multiply-add, correctly rounded division, the
+  exponential and logarithm as polynomials, the radix descent for top-k and
+  top-p, the Philox draw), so that a request gets the same tokens on either
+  backend: every record equals the host reference's bit for bit
+  (`ares_cuda::sample_reference`) for vocabularies from one token to Qwen's,
+  four shapes of rows, every combination of the cuts, with a token map, in
+  slices as several devices hold them, and in batches of different sizes
+  sharing one scratch. The pick of Qwen's vocabulary (248320 logits) takes
+  15 / 26 / 71 us for 1 / 4 / 16 greedy rows on the RTX 4070 against CUDA's
+  25 / 65 / 225, and 107 / 168 / 420 us with top-k 20 and top-p 0.95 against
+  107 / 194 / 539 (RTX 3060: 23 / 49 / 154 against 34 / 112 / 360, and
+  150 / 339 / 951 against 148 / 380 / 1118; best of two runs). It has no 64-bit atomic (an
+  optional feature on Vulkan): every chunk writes its best score and one
+  more kernel takes the maximum. Its histograms need 32 KiB of shared memory.
+- The expert and `qwen4exp` kernels and a model on Vulkan do not exist yet.
 - No direct route between the two cards works on this driver: an exported
   allocation is imported by the other card without an error and carries no
   data. Sums go through host pages that both cards import, at the speed of
@@ -2089,8 +2182,12 @@ Work is paused here until Qwen4 is released; nothing below is in progress.
   between devices, router and experts, the kernels of `qwen4exp`. The CUDA
   tests pass on both cards, the kernel ones also on real tensors.
 - Vulkan has the weight kernels (the same device layouts, byte for byte) and
-  the layer kernels, at CUDA's speed on these cards. It has no attention, no
-  expert, sampler or `qwen4exp` kernels and no model.
+  the layer kernels, at CUDA's speed on these cards, the attention kernels
+  over all stored K/V formats and the sampler. Attention is within 20 % of
+  CUDA's for one row of `f16`, 1.3 to 3.3 times as slow for one row of `q8`
+  or `q4` and 2 to 6.5 times for windows of 8 and 64 rows (no tensor cores,
+  items of 16 vectors); the sampler is as fast as CUDA's or faster. It has no
+  expert or `qwen4exp` kernels and no model.
 - The KV formats are specified, pinned by golden files and measured on the K
   and V of real models; the CUDA kernels write them bit-exactly and read
   them within 1e-3 of the CPU reference. The dense model uses `q8` for K
@@ -2112,7 +2209,12 @@ Work is paused here until Qwen4 is released; nothing below is in progress.
   that shares only the start of the chat template with an earlier request
   (three tokens) now runs a step of its own to replay them before its rows
   (one more step in the counts of `--engine`, not timed); a model that only
-  runs on Turing has no prefill and no attention path.
+  runs on Turing has no prefill and no attention path; CUDA's sampler
+  keeps a state of 72 bytes (`AresSampleState`) in 64 bytes per row of its
+  scratch, so for a batch of four or more rows the state of the last rows
+  overlaps the candidate lists of row 0 (a race that shows rarely; found
+  while mirroring the sampler on Vulkan, whose state is 64 bytes, and not
+  reproduced on a device).
 - Real model files are test data and stay outside the repository.
 
 ## Next steps
@@ -2145,8 +2247,9 @@ order it would be taken up; the source of each idea is in
    than the integer kernels, so the dense model can hold every matrix in it;
    shares of a tensor split from a measurement at load; device layouts for
    the remaining types.
-6. Vulkan: attention, experts, sampler, the `qwen4exp` kernels, and the
-   models; a faster upload.
+6. Vulkan: experts, the `qwen4exp` kernels, and the models; attention for
+   windows of many rows on the cooperative matrices, and a faster decode of
+   the `q8` and `q4` rows; a faster upload.
 7. The sampler's penalties and grammars (llguidance), tool calls, the
    router mode with `models.ini`, multimodal input, `Engine::decide` and
    `/v1/systemone` on the real engine.
