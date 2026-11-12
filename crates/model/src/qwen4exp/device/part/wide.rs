@@ -1,0 +1,432 @@
+//! Steps wider than the decode kernels take: slices of a prompt.
+//!
+//! A step of up to [`MAX_BATCH`] rows runs as the module above describes. A wider
+//! one runs the same layers with the kernels that take any number of rows:
+//!
+//! - **Dense products** go through the tile kernels (`Kernels::product`) in the form of
+//!   activations the device and the matrix type ask for ([`ActivationForm`]): the int8
+//!   rows the fused kernels already write, or f16 rows converted from their f32
+//!   section. The float matrices (router, mixers, the projections of the indexer and of
+//!   the n-gram block, the recurrent gates) have no tile kernel: the decode kernel
+//!   multiplies them eight rows at a time.
+//! - **The router** picks for every row ([`ExpertKernels::logits_rows`],
+//!   [`ExpertKernels::pick_rows`]) and leaves the ids and weights of the picks, not the
+//!   groups of the decode kernels, which hold eight rows.
+//! - **The routed experts** run on the many-row kernels ([`ExpertRowKernels`]) in rounds.
+//!   Those kernels do not wait on the device for an expert that has no slot, so the host
+//!   takes part in every layer: the first round computes the experts that are in a slot
+//!   when the layer is enqueued (the host gives their addresses, [`Part::experts_round`]);
+//!   the host reads the picks (they reach it as the record of the decode kernels does),
+//!   brings the experts that were missing and gives a table of just those for the next
+//!   round, which adds to the same output. The plan is made once per layer.
+
+use ares_cuda::ExpertShape;
+
+use super::*;
+
+/// Address tables alive at once: the round being computed and the one prepared next.
+pub(super) const ROUNDS: u64 = 2;
+
+/// Bytes of the record of a wide step: a header, then the ids and the weights of the picks.
+/// It is what the router leaves on the device and what reaches the host.
+pub(super) fn record_bytes(shape: &ExpertShape, rows: u32) -> u64 {
+    16 + 8 * u64::from(shape.top_k) * u64::from(rows)
+}
+
+/// Bytes of the plan of the widest step: the smallest tile has the most items.
+pub(super) fn plan_bytes(shape: &ExpertShape, rows: u32) -> u64 {
+    shape.rows_plan_bytes(rows, ares_cuda::ROWS_TILES[0])
+}
+
+/// A layer of a wide step whose experts the host is bringing.
+#[derive(Clone, Copy, Debug)]
+struct Layer {
+    index: usize,
+    tile: u32,
+    rounds: u32,
+}
+
+/// What a part needs for wide steps.
+pub(super) struct State {
+    kernels: ExpertRowKernels,
+    precision: Precision,
+    form: ActivationForm,
+    /// The address tables of a layer as the host wrote them: per layer
+    /// [`ROUNDS`] of them, in page-locked memory the copies read.
+    staging: PinnedBuffer,
+    /// Recorded behind the latest round of experts.
+    done: Event,
+    layer: Option<Layer>,
+}
+
+/// The ggml types of the dense matrices that have tile kernels and take part in wide steps.
+fn dense_types(w: &DeviceWeights) -> Vec<GgmlType> {
+    let mut types = Vec::new();
+    for layer in &w.layers {
+        match &layer.core {
+            CoreW::Recurrent(r) => types.extend([r.qkv.ty, r.z.ty, r.out.ty]),
+            CoreW::Attention(a) => types.extend([a.q.ty, a.k.ty, a.v.ty, a.out.ty]),
+            CoreW::None => {}
+        }
+        if let Some(shared) = &layer.moe.shared {
+            types.extend([shared.gate.ty, shared.up.ty, shared.down.ty]);
+        }
+    }
+    types.retain(|ty| !is_float(*ty));
+    types.sort_by_key(|ty| ty.name());
+    types.dedup();
+    types
+}
+
+fn is_float(ty: GgmlType) -> bool {
+    matches!(ty, GgmlType::F32 | GgmlType::F16 | GgmlType::BF16)
+}
+
+impl State {
+    /// The state for wide steps of a part, or an error naming what the device lacks.
+    pub(super) fn open(
+        device: &Device,
+        kernels: &Kernels,
+        w: &DeviceWeights,
+        opts: &Options,
+        frame: &Frame,
+    ) -> Result<Self, ModelError> {
+        let rows = ExpertRowKernels::load(device).map_err(|e| {
+            invalid(format!("steps of {} rows need the many-row kernels: {e}", opts.max_rows))
+        })?;
+        if !kernels.has_prefill_kernels() {
+            return Err(invalid(format!(
+                "steps of {} rows need the tile kernels, which {} lacks",
+                opts.max_rows,
+                device.info().name
+            )));
+        }
+        let types = dense_types(w);
+        if let Some(ty) = types.iter().find(|ty| !Kernels::has_prefill_matmul(**ty)) {
+            return Err(invalid(format!("the weights of type {ty} have no kernel for wide steps")));
+        }
+        // One form of activations for every dense matrix, so that each fused kernel writes
+        // one: the form the options' precision gives all of them, else the exact one, which
+        // is f16 for all.
+        let form_of = |precision: Precision, ty: GgmlType| {
+            kernels
+                .activation_form(ty, WeightLayout::File, precision, opts.max_rows)
+                .map_err(|e| invalid(e.to_string()))
+        };
+        let forms =
+            types.iter().map(|ty| form_of(opts.precision, *ty)).collect::<Result<Vec<_>, _>>()?;
+        let (precision, form) = match forms.first() {
+            Some(first) if forms.iter().all(|f| f == first) => (opts.precision, *first),
+            Some(_) => (Precision::Exact, ActivationForm::F16),
+            None => (opts.precision, ActivationForm::Int8),
+        };
+        let layers = w.layers.len();
+        Ok(Self {
+            kernels: rows,
+            precision,
+            form,
+            staging: PinnedBuffer::new(device, (frame.addr_stage as usize * layers).max(16))?,
+            done: Event::new(device)?,
+            layer: None,
+        })
+    }
+}
+
+impl Part {
+    /// Whether the dense products of a step of `rows` rows run on the tile kernels.
+    pub(super) fn is_wide(rows: u32) -> bool {
+        rows > MAX_BATCH
+    }
+
+    /// Whether the outputs of the recurrent and attention blocks and of the shared expert
+    /// are quantized for their products in f16 instead of int8 (in wide steps).
+    pub(super) fn wide_f16(&self, rows: u32) -> bool {
+        Self::is_wide(rows)
+            && self.wide_state.as_ref().is_some_and(|w| w.form == ActivationForm::F16)
+    }
+
+    /// `y = m x` for the `rows` rows of a wide step. `act` is the rows in the int8 layout
+    /// (the layout of `Kernels::quantize_activations`, with the f32 values as its last
+    /// section) that a fused kernel wrote: the buffer of the mixed input or the one of the
+    /// quantized outputs.
+    ///
+    /// # Safety
+    ///
+    /// As [`Part::product`].
+    pub(super) unsafe fn wide_product(
+        &self,
+        stream: &Stream,
+        m: &Mat,
+        act: DevicePtr,
+        y: DevicePtr,
+        rows: u32,
+    ) -> Result<(), ModelError> {
+        let w = self.w.mat(m);
+        if is_float(m.ty) {
+            // The float kernel reads the f32 section; eight rows at a time.
+            let row_bytes = 4 * u64::from(m.n_in);
+            let f32_at =
+                |k: u32| Kernels::quantized_activation_bytes(m.n_in, k) - row_bytes * u64::from(k);
+            let mut first = 0;
+            while first < rows {
+                let k = (rows - first).min(MAX_BATCH);
+                let chunk = act.offset(f32_at(rows) + row_bytes * u64::from(first) - f32_at(k));
+                let at = y.offset(4 * u64::from(first) * u64::from(m.n_out));
+                // SAFETY: the chunk's rows are inside the caller's buffers.
+                unsafe {
+                    self.kernels.matvec(stream, m.ty, w, chunk, at, m.n_in, m.n_out, k)?;
+                }
+                first += k;
+            }
+            return Ok(());
+        }
+        let wide =
+            self.wide_state.as_ref().ok_or_else(|| invalid("a wide step without wide state"))?;
+        let s = self.f.s;
+        let input = match wide.form {
+            ActivationForm::Int8 => act,
+            ActivationForm::F16 if act == self.at(s.m) => self.at(s.mixed_f16),
+            ActivationForm::F16 if act == self.at(s.act) => self.at(s.out_f16),
+            ActivationForm::F16 => return Err(invalid("a wide product of an unprepared input")),
+        };
+        // SAFETY: the matrix is in the arena as the file stores it; the rows were prepared
+        // in the form the product reads.
+        unsafe {
+            self.kernels.product(
+                stream,
+                m.ty,
+                WeightLayout::File,
+                wide.precision,
+                self.w.mat(m),
+                input,
+                y,
+                m.n_in,
+                m.n_out,
+                rows,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Converts the mixed input of a half block to f16 where the products read that.
+    ///
+    /// # Safety
+    ///
+    /// The mixed input must be at `m` in scratch.
+    pub(super) unsafe fn prepare_mixed(
+        &self,
+        stream: &Stream,
+        rows: u32,
+    ) -> Result<(), ModelError> {
+        if !self.wide_f16(rows) {
+            return Ok(());
+        }
+        let s = self.f.s;
+        // SAFETY: the rows were written by the fused read before.
+        unsafe {
+            self.kernels.prepare_activations(
+                stream,
+                ActivationForm::F16,
+                self.act_values(s.m, self.n, rows),
+                self.at(s.mixed_f16),
+                self.n,
+                rows,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// The first stage of the routed experts of a wide step in layer `i`. A part that routes
+    /// runs the router and leaves the picks with the host (the board); every part with the
+    /// shared expert computes it. The experts themselves run in [`Part::experts_round`].
+    pub(super) fn moe_wide(
+        &mut self,
+        env: &StepEnv<'_>,
+        i: usize,
+        w: &MoeW,
+    ) -> Result<(), ModelError> {
+        let stream = env.stream;
+        let rows = env.record.dims().n_rows;
+        let s = self.f.s;
+        let m = self.at(s.m);
+        let tile = ExpertRowKernels::tile_for(&w.shape, rows);
+        let wide =
+            self.wide_state.as_mut().ok_or_else(|| invalid("a wide step without wide state"))?;
+        wide.layer = Some(Layer { index: i, tile, rounds: 0 });
+        // SAFETY: scratch and weights of this part, sized for the most rows; the mixed
+        // input is the fused read's.
+        unsafe {
+            self.prepare_mixed(stream, rows)?;
+            if self.role == Role::Worker {
+                // The mixer routes. The worker's output starts from zeros (its exchange
+                // cleared it) and the shared expert's is sent on its own, with the gate.
+                if let Some(shared) = &w.shared {
+                    self.shared(stream, shared, m, rows)?;
+                    self.mark(stream, Phase::Dense)?;
+                }
+                return self.mark(stream, Phase::Experts);
+            }
+            let router = w.router.ok_or_else(|| invalid("a layer without its router"))?;
+            let record = self.at(s.rec_full);
+            let bytes = record_bytes(&w.shape, rows);
+            self.experts.logits_rows(
+                stream,
+                &w.shape,
+                self.w.at(router),
+                m,
+                self.at(s.logits),
+                rows,
+            )?;
+            self.experts.pick_rows(stream, &w.shape, self.at(s.logits), record, rows)?;
+            self.routed[i].record(stream)?;
+            self.side.wait_event(&self.routed[i])?;
+            self.side.copy_to_host(self.board.record_dst(i), record, bytes as usize)?;
+            self.board.copies_enqueued(i, &self.side)?;
+            self.mark(stream, Phase::Experts)?;
+            if let Some(shared) = &w.shared {
+                self.product(stream, &shared.inp, m, self.at(s.s), rows)?;
+                self.shared(stream, shared, m, rows)?;
+                self.q4.gate_scale(
+                    stream,
+                    self.at(s.ysh),
+                    self.at(s.s),
+                    self.at(s.out),
+                    rows,
+                    self.n,
+                )?;
+            } else {
+                stream.fill(
+                    self.at(s.out),
+                    0,
+                    (u64::from(rows) * u64::from(self.n) * 4) as usize,
+                )?;
+            }
+        }
+        self.mark(stream, Phase::Dense)
+    }
+
+    /// The address of slot `slot` of the pool of layer `i`'s experts.
+    pub fn slot_address(&self, i: usize, slot: u32) -> u64 {
+        let bytes = self.w.layers[i].moe.shape.slot_bytes().unwrap_or(0);
+        self.expert_at[i].pool.as_raw() + u64::from(slot) * bytes
+    }
+
+    /// Computes, for the rows of the wide step, the experts of layer `i` that have an
+    /// address in `addresses` (one per expert, 0 for none), adding their outputs to the
+    /// layer's. The shared expert was enqueued by [`Part::enqueue_layer`]; the first round
+    /// makes the layer's plan from the picks (`record`, the router's record as the host has
+    /// it, when this part did not route itself). Every expert is computed in one round only:
+    /// the host gives each round the experts the earlier rounds did not have.
+    pub fn experts_round(
+        &mut self,
+        env: &StepEnv<'_>,
+        i: usize,
+        addresses: &[u64],
+        record: Option<&[u8]>,
+    ) -> Result<(), ModelError> {
+        let stream = env.stream;
+        let rows = env.record.dims().n_rows;
+        let s = self.f.s;
+        let shape = self.w.layers[i].moe.shape;
+        let bytes = 8 * shape.n_experts as usize;
+        if addresses.len() != shape.n_experts as usize {
+            return Err(invalid(format!(
+                "{} addresses for {} experts",
+                addresses.len(),
+                bytes / 8
+            )));
+        }
+        let tables = self.at(s.addresses);
+        let stride = self.f.addr_stage as usize;
+        let (staging, device_table, tile, first) = {
+            let wide = self.wide_state.as_mut().ok_or_else(|| invalid("no wide state"))?;
+            let layer =
+                wide.layer.as_mut().filter(|l| l.index == i).ok_or_else(|| {
+                    invalid(format!("layer {i} has no experts waiting for a round"))
+                })?;
+            let table = layer.rounds as usize % ROUNDS as usize;
+            let first = layer.rounds == 0;
+            layer.rounds += 1;
+            // SAFETY: the staging holds `ROUNDS` tables per layer; the copy of a table that
+            // was staged before has run (the host waits for each round before the next but
+            // one).
+            let staging = unsafe { wide.staging.as_mut_ptr().add(i * stride + table * bytes) };
+            (staging, tables.offset((table * bytes) as u64), layer.tile, first)
+        };
+        // SAFETY: the staging and the device table hold `bytes`; scratch is this part's.
+        unsafe {
+            std::ptr::copy_nonoverlapping(addresses.as_ptr().cast::<u8>(), staging, bytes);
+            stream.copy_from_host(device_table, staging, bytes)?;
+            let wide = self.wide_state.as_ref().ok_or_else(|| invalid("no wide state"))?;
+            if first {
+                let record_at = self.at(s.rec_full);
+                if let Some(record) = record {
+                    let bytes = record_bytes(&shape, rows) as usize;
+                    let record = record.get(..bytes).ok_or_else(|| invalid("a short record"))?;
+                    stream.copy_from_host(record_at, record.as_ptr(), bytes)?;
+                }
+                self.kernels.prepare_prefill_activations(
+                    stream,
+                    ares_cuda::PrefillPath::F16,
+                    self.act_values(s.m, self.n, rows),
+                    self.at(s.experts_f16),
+                    self.n,
+                    rows,
+                )?;
+                wide.kernels.plan_rows(
+                    stream,
+                    &shape,
+                    rows,
+                    tile,
+                    record_at,
+                    self.at(s.plan_rows),
+                    env.token,
+                )?;
+            }
+            wide.kernels.rows_gate_up(
+                stream,
+                &shape,
+                rows,
+                tile,
+                device_table,
+                self.at(s.plan_rows),
+                self.at(s.experts_f16),
+                self.at(s.hidden_rows),
+            )?;
+            wide.kernels.rows_down(
+                stream,
+                &shape,
+                rows,
+                tile,
+                Accumulate::Atomic,
+                device_table,
+                self.at(s.plan_rows),
+                self.at(s.hidden_rows),
+                self.at(s.out),
+                DevicePtr::NULL,
+            )?;
+            wide.done.record(stream)?;
+        }
+        self.mark(stream, Phase::Experts)
+    }
+
+    /// Whether the rounds of experts enqueued so far have run on the device.
+    pub fn rounds_done(&self) -> Result<bool, ModelError> {
+        let wide = self.wide_state.as_ref().ok_or_else(|| invalid("no wide state"))?;
+        Ok(wide.done.is_done()?)
+    }
+
+    /// How many pairs of the wide step picked each expert of layer `i`, from the layer's
+    /// record as the router's board has it (the ids follow the 16 bytes of the header).
+    pub fn picked_counts(&self, i: usize, rows: u32, record: &[u8]) -> Vec<u32> {
+        let shape = self.w.layers[i].moe.shape;
+        let picks = shape.top_k as usize * rows as usize;
+        let mut counts = vec![0u32; shape.n_experts as usize];
+        for id in record[16..16 + 4 * picks].as_chunks::<4>().0 {
+            if let Some(count) = counts.get_mut(u32::from_le_bytes(*id) as usize) {
+                *count += 1;
+            }
+        }
+        counts
+    }
+}

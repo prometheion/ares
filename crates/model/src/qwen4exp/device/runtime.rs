@@ -32,7 +32,7 @@ use std::time::{Duration, Instant};
 
 use ares_api::{ChatFormat, EngineError, ExpertStats, ModelCard, Prompt};
 use ares_core::Ledger;
-use ares_cuda::{Device, ENTRY_CELLS, Event, Segment, StepRecord, Stream};
+use ares_cuda::{Device, ENTRY_CELLS, Event, MAX_BATCH, Segment, StepRecord, Stream};
 use ares_gguf::Gguf;
 use ares_io::Reader;
 use ares_runtime::expert_store::{CudaSlots, Serve, StoreConfig, StorePlan, StoreStats};
@@ -45,8 +45,11 @@ use ares_tokenizer::{ChatOptions, Tokenizer};
 
 use super::board::Board;
 use super::feed::{Feed, Layout, build_store, cpu_pool, device_slots, expert_map, places};
+use super::misses::{Misses, Progress, WideStats};
 use super::ngram::NgramFeed;
-use super::part::{ExpertAt, Frame, PAGE_ENTRY, Part, PartSetup, PartShape, Ports, StepEnv};
+use super::part::{
+    ExpertAt, Frame, Options, PAGE_ENTRY, Part, PartSetup, PartShape, Ports, StepEnv,
+};
 use super::placement::{MARGIN, PartPlan, Placement, ram_tier_bytes};
 use super::session::{Chosen, Fill, PartReport, SessionOptions, choose};
 use crate::chat;
@@ -230,16 +233,35 @@ struct Flow {
     finished: AtomicUsize,
     /// Set by a part whose step failed, so that the others give up.
     failed: AtomicBool,
+    /// Uploads and reads the store had finished the last time anyone looked.
+    uploads_seen: AtomicU64,
     stall: Duration,
     /// The bytes of the tier of experts in RAM.
     ram_bytes: u64,
     /// What the store counted, summed over the times it was read.
     totals: Mutex<ExpertStats>,
+    /// What the wide steps found and waited for, since the engine started.
+    wide: Mutex<WideStats>,
 }
 
 impl Flow {
     fn parts(&self) -> usize {
         self.enqueued.len()
+    }
+
+    /// Adds what the wide steps found since the last call to the totals. The experts of a
+    /// layer that a wide step found in a slot are hits and the others are picks the store
+    /// counts when it brings them (as misses, never as hits).
+    fn fold_wide(&self) {
+        let wide = self.lock_feed().take_wide();
+        let found = wide.picked - wide.missing;
+        let mut totals = self.totals.lock().unwrap_or_else(|e| e.into_inner());
+        totals.picks += found;
+        totals.hits += found;
+        totals.wait_us +=
+            (wide.compute_wait + wide.bring_wait + wide.round_wait).as_micros() as u64;
+        drop(totals);
+        self.wide.lock().unwrap_or_else(|e| e.into_inner()).add(&wide);
     }
 
     fn fail(&self) {
@@ -296,6 +318,19 @@ impl Flow {
             ngram.poll();
         }
         Ok(())
+    }
+
+    /// A number that changes whenever a layer is enqueued or followed or the store finishes
+    /// an upload or a read. A wide step that waits for the other part's layers makes no
+    /// progress of its own, and has stood still only when this does not change either.
+    fn progress(&self) -> u64 {
+        if let Ok(feed) = self.feed.try_lock() {
+            let stats = feed.store.stats();
+            self.uploads_seen.store(stats.uploads + stats.demand_reads, Ordering::Relaxed);
+        }
+        let layers: usize =
+            self.enqueued.iter().chain(&self.followed).map(|n| n.load(Ordering::Acquire)).sum();
+        layers as u64 + self.uploads_seen.load(Ordering::Relaxed)
     }
 
     /// An error when another part failed, or when the step has stood still
@@ -405,6 +440,37 @@ impl Embedding {
 }
 
 // --- the model --------------------------------------------------------------
+
+/// The rows of a step to open the model with on `devices`: as many as the scratch of a step
+/// may take of the smaller device's memory (one eighth; the rest is slots for experts and
+/// the pools of K and V), as a power of two between eight (the decode kernels' limit, which
+/// is all that a device without the tile kernels runs) and [`WIDE_ROWS`].
+///
+/// A step of more rows reads the experts of a layer once for more of them. The scratch
+/// grows with the rows, about half a megabyte a row for Flash-Next; `opts` supplies the
+/// other choices of the part, whose `max_rows` is ignored.
+pub fn step_rows(gguf: &Gguf, devices: &[Device], opts: &Options) -> Result<u32, OpenError> {
+    let config = Config::from_gguf(gguf)?;
+    if devices.iter().any(|d| d.info().compute_capability.0 < 8) {
+        return Ok(MAX_BATCH);
+    }
+    let room = devices.iter().map(|d| d.info().total_memory / 8).min().unwrap_or(0);
+    let mut rows = WIDE_ROWS;
+    while rows > MAX_BATCH {
+        let opts = Options { max_rows: rows, ..opts.clone() };
+        // The scratch of the part with everything: the widest a part is.
+        let shape = PartShape::whole(&config, 0..config.n_layer, true);
+        let frame = Frame::new(&config, &opts, &shape, 1)?;
+        if frame.step_bytes(&opts) <= room {
+            break;
+        }
+        rows /= 2;
+    }
+    Ok(rows)
+}
+
+/// The most rows of a step the model is opened with.
+pub const WIDE_ROWS: u32 = 4096;
 
 /// Where the layers of the model in `gguf` would go on `devices` with `opts`,
 /// and the bytes one page of the pools would take on each device. Nothing is
@@ -523,7 +589,7 @@ impl Qwen4Exp {
                 0
             } else {
                 (layers * layout.per_layer) as u64
-                    * layout.shapes[0].host_share_bytes(opts.part.max_rows)
+                    * layout.shapes[0].host_share_bytes(opts.part.max_rows.min(MAX_BATCH))
             };
             // The entries the store copies through are a ring of 256 KiB.
             pinned += frame.pinned_bytes(&opts.part, layers) + shares + (256 << 10);
@@ -584,10 +650,19 @@ impl Qwen4Exp {
         reports
     }
 
+    /// What the wide steps found missing and waited for since the engine started; `None`
+    /// before the parts are open.
+    pub fn wide_stats(&self) -> Option<WideStats> {
+        let flow = self.flow.get()?;
+        flow.fold_wide();
+        Some(*flow.wide.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+
     /// What the expert store counted since the last call; `None` before the
     /// parts are open.
     pub fn take_store_stats(&self) -> Option<StoreStats> {
         let flow = self.flow.get()?;
+        flow.fold_wide();
         let stats = flow.lock_feed().store.take_stats();
         let mut totals = flow.totals.lock().unwrap_or_else(|e| e.into_inner());
         totals.picks += stats.picks;
@@ -677,7 +752,7 @@ impl Qwen4Exp {
             0
         } else {
             (c.n_layer * layout.per_layer) as u64
-                * layout.shapes[0].host_share_bytes(o.max_rows).next_multiple_of(16)
+                * layout.shapes[0].host_share_bytes(o.max_rows.min(MAX_BATCH)).next_multiple_of(16)
         };
         let room = cx.ledger.free().saturating_sub(MARGIN + tables + host_shares);
         let (ram, device) = (cx.ram, cx.device);
@@ -714,8 +789,12 @@ impl Qwen4Exp {
                     Some(ram.obtainable_experts()),
                     layout.ram_wanted(vram.iter().sum()),
                 );
-                let mut config =
-                    StoreConfig::new(o.max_rows, c.experts.used as u32, vram, ram_bytes);
+                let mut config = StoreConfig::new(
+                    o.max_rows.min(MAX_BATCH),
+                    c.experts.used as u32,
+                    vram,
+                    ram_bytes,
+                );
                 if let Some(reserve) = self.opts.reserve {
                     config.vram_reserve = reserve;
                 }
@@ -733,8 +812,16 @@ impl Qwen4Exp {
             planned.plan.device_pools(index)
         };
         let mut pinned = Ledger::new("pinned RAM (booked by the engine)", u64::MAX / 2);
-        let slots = device_slots(device, cx.ledger, &mut pinned, &pools, layout, serve, o.max_rows)
-            .map_err(model_error)?;
+        let slots = device_slots(
+            device,
+            cx.ledger,
+            &mut pinned,
+            &pools,
+            layout,
+            serve,
+            o.max_rows.min(MAX_BATCH),
+        )
+        .map_err(model_error)?;
         self.meeting.meet(
             n,
             |build| {
@@ -785,8 +872,10 @@ impl Qwen4Exp {
                     begun: AtomicU64::new(0),
                     finished: AtomicUsize::new(0),
                     failed: AtomicBool::new(false),
+                    uploads_seen: AtomicU64::new(0),
                     stall: self.opts.stall,
                     ram_bytes,
+                    wide: Mutex::new(WideStats::default()),
                     totals: Mutex::new(ExpertStats {
                         ram_tier_bytes: ram_bytes,
                         ..Default::default()
@@ -854,6 +943,18 @@ impl Qwen4Exp {
             per_step: 8 * (c.n_layer as u32 + 1),
             embedding: first.then(|| Embedding::new(&self.gguf, &weights)).transpose()?,
             drives_ngram: part.ngram_layer().is_some(),
+            routing: Routing {
+                mixer: self.placement.tensor.as_ref().map(|t| t.mixer).filter(|m| *m != index),
+                owned: self.placement.tensor.as_ref().map(|_| {
+                    (0..c.n_layer)
+                        .map(|layer| {
+                            (0..c.experts.count as u32)
+                                .map(|e| self.placement.owner(layer, e) == index)
+                                .collect()
+                        })
+                        .collect()
+                }),
+            },
             part,
             flow,
             segments: Vec::new(),
@@ -984,6 +1085,7 @@ struct Qwen4ExpDevice {
     embedding: Option<Embedding>,
     /// Whether this part keeps the sequences the n-gram table is read for.
     drives_ngram: bool,
+    routing: Routing,
     part: Part,
     flow: Arc<Flow>,
     // The step being enqueued, kept to reuse the memory.
@@ -1004,6 +1106,53 @@ impl std::fmt::Debug for Qwen4ExpDevice {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Qwen4ExpDevice").field("index", &self.index).finish_non_exhaustive()
     }
+}
+
+/// The experts of layer `layer` of `part` (the `index`-th) in a step of more than eight
+/// rows: the first round is enqueued with the experts that have a slot, then the store is
+/// served until the misses are brought and computed (`Misses`).
+fn wide_layer(
+    part: &mut Part,
+    flow: &Flow,
+    index: usize,
+    env: &StepEnv<'_>,
+    layer: usize,
+    routing: &Routing,
+) -> Result<(), ModelError> {
+    let owned = |expert: u32| routing.owned.as_ref().is_none_or(|o| o[layer][expert as usize]);
+    let (mut started, mut seen) = (Instant::now(), flow.progress());
+    let source = routing.mixer.map(|mixer| flow.lock_feed().board(mixer));
+    let mut misses = {
+        let feed = flow.lock_feed();
+        Misses::begin(part, env, &feed, index, layer, source, &owned).map_err(model_error)?
+    };
+    loop {
+        let routed =
+            routing.mixer.is_none_or(|mixer| flow.enqueued[mixer].load(Ordering::Acquire) > layer);
+        let progress = {
+            let mut feed = flow.lock_feed();
+            misses.advance(part, env, &mut feed, routed, &owned).map_err(model_error)?
+        };
+        if progress == Progress::Done {
+            return Ok(());
+        }
+        let progress = flow.progress();
+        if progress != seen {
+            (started, seen) = (Instant::now(), progress);
+        }
+        flow.check(started, "the experts of a wide step were brought")?;
+        flow.pump()?;
+        std::hint::spin_loop();
+    }
+}
+
+/// Who routes for a part and which experts it computes, when both devices work on every
+/// layer.
+struct Routing {
+    /// The device that routes, for a part that does not.
+    mixer: Option<usize>,
+    /// Per layer and expert, whether this part computes the expert; `None` for all.
+    owned: Option<Vec<Vec<bool>>>,
 }
 
 impl Qwen4ExpDevice {
@@ -1148,7 +1297,12 @@ impl Qwen4ExpDevice {
             }
             self.flow.throttle(self.index)?;
             self.part.enqueue_layer(&env!(fetched.as_deref(), None), i)?;
+            // The other part of a shared layer may read this one's record from now on.
             self.flow.enqueued[self.index].store(i + 1, Ordering::Release);
+            if rows > MAX_BATCH {
+                let env = env!(fetched.as_deref(), None);
+                wide_layer(&mut self.part, &self.flow, self.index, &env, i, &self.routing)?;
+            }
             self.flow.pump()?;
         }
         let n_out = self.part.end(&env!(fetched.as_deref(), None))?;

@@ -616,6 +616,12 @@ impl<D: SlotDevice> ExpertStore<D> {
         self.vram.sets[layer].contains(expert)
     }
 
+    /// The slot of the layer's pool (the number the slot table holds, counted
+    /// from the first slot of the pool) that `expert` of `layer` is usable in.
+    pub fn vram_slot(&self, layer: usize, expert: u32) -> Option<u32> {
+        self.vram.sets[layer].slot(expert).map(|local| self.vram.slot(layer, local))
+    }
+
     /// Whether `expert` of `layer` is in the RAM tier.
     pub fn in_ram(&self, layer: usize, expert: u32) -> bool {
         self.ram.sets[layer].contains(expert)
@@ -675,6 +681,17 @@ impl<D: SlotDevice> ExpertStore<D> {
         self.guesses.forget_layer(layer);
         self.wants.retain(|w| w.layer != layer || w.demand);
         self.demand(layer, picks)
+    }
+
+    /// The kernels that compute `experts` of `layer` in the running step have ended: the
+    /// step needs them no more, so they give way before the experts of later requests of
+    /// the same layer (a wide step asks for a layer's misses in batches). Without this a
+    /// batch could only take the room the step has not claimed yet, and would evict its own
+    /// members when the claimed experts make up the rest.
+    pub fn finished(&mut self, layer: usize, experts: &[u32]) {
+        for expert in experts {
+            self.vram.sets[layer].unprotect(*expert);
+        }
     }
 
     /// The experts of `layer` that the kernels enqueued next need, with

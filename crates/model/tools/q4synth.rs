@@ -3,7 +3,7 @@
 //! (`tools/q4capture/README.md`).
 //!
 //! ```sh
-//! cargo run --release -p ares-model --example q4synth -- OUT_DIR [f32|shipped] [SEED] [TOKENS]
+//! cargo run --release -p ares-model --example q4synth -- OUT_DIR [f32|shipped|quantized] [SEED] [TOKENS]
 //! ```
 //!
 //! writes `OUT_DIR/synthetic-<types>.gguf` and `OUT_DIR/prompt.tokens` (ids
@@ -16,12 +16,13 @@ use ares_model::qwen4exp::synthetic::{Synthetic, Types};
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let Some(out) = args.first().map(PathBuf::from) else {
-        return Err("usage: q4synth OUT_DIR [f32|shipped] [SEED] [TOKENS]".into());
+        return Err("usage: q4synth OUT_DIR [f32|shipped|quantized] [SEED] [TOKENS]".into());
     };
     let kind = args.get(1).map_or("f32", String::as_str);
     let types = match kind {
         "f32" => Types::F32,
         "shipped" => Types::Shipped,
+        "quantized" => Types::Quantized,
         other => return Err(format!("unknown tensor types '{other}'").into()),
     };
     let seed: u64 = args.get(2).map_or(Ok(1), |s| s.parse())?;

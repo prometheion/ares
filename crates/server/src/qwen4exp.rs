@@ -17,7 +17,7 @@ use ares_api::{Engine, Event, EventSink, GenerateRequest, Prompt, RequestId, Sam
 use ares_core::units::Bytes;
 use ares_gguf::Gguf;
 use ares_model::qwen4exp::Config;
-use ares_model::qwen4exp::device::{Options, Qwen4Exp, SessionOptions, Spread, place};
+use ares_model::qwen4exp::device::{Options, Qwen4Exp, SessionOptions, Spread, place, step_rows};
 use ares_runtime::{GpuConfig, Runtime, RuntimeConfig, required_ram};
 use ares_tokenizer::{ChatOptions, Tokenizer};
 
@@ -27,7 +27,8 @@ use crate::load::{
 };
 use crate::plan::{self, CELLS_PER_PAGE, DEFAULT_PARALLEL, LoadOptions, SplitKind};
 
-/// The most rows of a step: what the expert kernels take.
+/// The most rows of a step that generates (one for each sequence, as the model takes no drafts
+/// yet): what the decode kernels of the experts take. Only the slices of a prompt are wider.
 const MAX_ROWS: u32 = ares_cuda::MAX_BATCH;
 
 /// A text of German, English and code, about 700 tokens, that the model reads
@@ -157,10 +158,24 @@ pub(crate) fn load(gguf: Gguf, options: &LoadOptions, begun: Instant) -> Result<
 
     // The model's settings that do not depend on the context.
     let model_context = config.n_ctx as u32;
+    // The rows of a step: the devices decide, by the memory a step's scratch may take.
+    let max_rows = step_rows(
+        &Gguf::open(&options.model)?,
+        &devices,
+        &Options {
+            kv,
+            logit_rows: parallel,
+            window_rows: 0,
+            max_slots: parallel,
+            ..Options::default()
+        },
+    )
+    .map_err(|e| LoadError::Model(e.to_string()))?;
+    tracing::info!("steps of up to {max_rows} rows");
     let session = |context: u32, pages: u32| SessionOptions {
         part: Options {
             kv,
-            max_rows: MAX_ROWS,
+            max_rows,
             logit_rows: parallel,
             window_rows: 0,
             max_slots: parallel,

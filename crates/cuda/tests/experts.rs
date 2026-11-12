@@ -31,7 +31,7 @@ use std::sync::OnceLock;
 use ares_core::GgmlType;
 use ares_cuda::{
     Device, DeviceBuffer, ExpertKernels, ExpertShape, HostShare, Kernels, PinnedBuffer,
-    RouteRecord, Stream, Wait, device_count,
+    PrefillPath, RouteRecord, Stream, Wait, device_count,
 };
 
 fn gpus() -> Option<&'static [Device]> {
@@ -585,6 +585,75 @@ fn router_orders_equal_values_by_index() {
             let weights: Vec<f32> = record.weights(row).collect();
             assert_eq!(weights[0], weights[1]);
             assert_eq!(weights[2], weights[3]);
+        }
+    }
+}
+
+#[test]
+fn the_router_routes_more_rows_than_a_decode_step_takes() {
+    let Some(gpus) = gpus() else { return };
+    let layer = synthetic_layer(GgmlType::IQ2_S, 21);
+    let shape = &layer.shape;
+    let (n, k) = (shape.n_embd as usize, shape.top_k as usize);
+    let mut rng = Rng(9);
+    for n_rows in [9u32, 17, 70] {
+        let x: Vec<f32> = (0..n_rows as usize * n).map(|_| rng.activation()).collect();
+        for device in gpus {
+            let rig = Rig::new(device, &layer, n_rows, 1);
+            rig.x.write(0, &f32_bytes(&x)).unwrap();
+            // SAFETY: the buffers were sized for this shape and number of rows.
+            unsafe {
+                let quantize = rig.kernels.quantize_activations(
+                    &rig.stream,
+                    rig.x.ptr(),
+                    rig.act.ptr(),
+                    shape.n_embd,
+                    n_rows,
+                );
+                assert!(quantize.is_err(), "the decode quantization takes eight rows");
+                rig.kernels
+                    .prepare_prefill_activations(
+                        &rig.stream,
+                        PrefillPath::Int8,
+                        rig.x.ptr(),
+                        rig.act.ptr(),
+                        shape.n_embd,
+                        n_rows,
+                    )
+                    .unwrap();
+                rig.experts
+                    .logits_rows(
+                        &rig.stream,
+                        shape,
+                        rig.router.ptr(),
+                        rig.act.ptr(),
+                        rig.logits.ptr(),
+                        n_rows,
+                    )
+                    .unwrap();
+                rig.experts
+                    .pick_rows(&rig.stream, shape, rig.logits.ptr(), rig.record.ptr(), n_rows)
+                    .unwrap();
+            }
+            rig.stream.synchronize().unwrap();
+            let mut record = vec![0u8; shape.record_bytes(n_rows) as usize];
+            rig.record.read(0, &mut record).unwrap();
+            let cap = n_rows as usize * k;
+            let ids = &record[16..16 + 4 * cap];
+            let weights = bytes_f32(&record[16 + 4 * cap..16 + 8 * cap]);
+            for row in 0..n_rows as usize {
+                let (_, expected) = reference_route(&layer, &x[row * n..(row + 1) * n]);
+                for (j, (expert, weight)) in expected.iter().enumerate() {
+                    let at = row * k + j;
+                    let id = u32::from_le_bytes(ids[4 * at..4 * at + 4].try_into().unwrap());
+                    assert_eq!(id, *expert, "row {row} of {n_rows}, pick {j}");
+                    assert!(
+                        (weights[at] - weight).abs() <= 1e-4 * weight.max(1e-3),
+                        "row {row} of {n_rows}, pick {j}: weight {} against {weight}",
+                        weights[at]
+                    );
+                }
+            }
         }
     }
 }

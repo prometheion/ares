@@ -1625,9 +1625,10 @@ Turing card has no tile kernels for experts either).
 These kernels do not wait for an expert on the device and have no host share: they skip
 an expert without an address and report it. The decode kernels therefore stay for the
 steps of a generating sequence, which depend on both, and for the windows below the
-break-even. What becomes dead once a prompt pass uses the new ones is the prompt's path
-through `ExpertKernels::experts` in steps of eight rows (and the `check_rows` limit that
-keeps a prompt to them).
+break-even (which is at most eight rows, the decode kernels' own limit, so every step of
+more than eight rows is above it). The slices of a prompt of Qwen3.8-Flash-Next run on the
+new kernels (see "Wide steps" under "Qwen3.8-Flash-Next through the runtime"); the host
+gives each round its address table and brings what a table lacked.
 
 Against the exact result (f64 on the dequantized weights and the f32 activations) the
 output is 0.05 to 0.07 % rms off, and the hidden values the same, on generated blocks of
@@ -2192,6 +2193,53 @@ copies the ranges that changed), K and V and the keys of the indexer live in
 the pages the runtime allocates (`Frame`'s layout, 13.9 MiB per 1000 cells on
 the card with the attention layers), and the logits of the wanted rows stay on
 the device for the sampler.
+
+**Wide steps: a prompt on the many-row kernels.** A step of up to eight rows is as
+described above, and generating sequences and the windows of their drafts stay there.
+The slice of a prompt that the conductor sends, up to `Model::max_rows` rows (`step_rows`,
+below), runs every layer at that width (`device/part/wide.rs`, `device/misses.rs`):
+
+- *Mixers, n-gram block, recurrent layers, attention* take the rows as they are: the
+  kernels were written for the 27B's prompts. The dense products go through the tile
+  kernels (`Kernels::product`) in the activation form the device and the type ask for:
+  the int8 rows the fused kernels already leave (`mix_quant`, `gated_norm_quant`,
+  `swiglu_quant`), or f16 rows (`prepare_mixed`, `gated_norm_f16`, `swiglu_f16`) when the
+  device runs the f16 tensor cores at full rate or `Options::precision` is `Exact`. The
+  float matrices (router, indexer projections, the recurrent gates, the n-gram block's
+  projections) have no tile kernel and are multiplied eight rows at a time by the decode
+  kernel, which reads the f32 section of the activations (`Part::wide_product`).
+- *The router* is `ExpertKernels::logits_rows` and `pick_rows`: ids and weights of every
+  row's picks in the form `ExpertRowKernels::plan_rows` reads, without the groups of the
+  decode kernels, which hold eight rows.
+- *The routed experts* run in **rounds**. The many-row kernels do not wait on the device
+  for an expert that has no slot, so in a wide step the host takes part in every layer
+  (`Misses`). When the layer is enqueued it gives the first round a table of the address of
+  every expert that has a slot in VRAM (`ExpertStore::vram_slot`), and the device computes
+  them while the route record travels to the host. The record gives, per expert, how many
+  pairs picked it. The experts without a slot are the layer's **misses**, most picked
+  first. Once the first round has ended on the device (nothing reads a slot any more), the
+  store is asked for as many misses as the layer has slots (`ExpertStore::routed`, which
+  protects the batch and evicts what is not needed), and the batch that has arrived is the
+  next round's table, whose outputs `red.add` into the same rows. The plan of the layer is
+  made once. The host never waits inside a call: the caller serves the store between the
+  steps of `Misses::advance`. A step that misses nothing has one round and the host only
+  waits for the record, while the first round runs. The experts are not computed on the
+  CPU in wide steps; the heat of the store gets the layer's counts of rows per expert
+  (`record_counts`), so what a prompt used is what the tiers hold when it ends.
+- *Both devices on every layer*: the mixer routes. The worker's host thread reads the
+  record from the mixer's board (the mixer has enqueued the layer when `Flow::enqueued`
+  says so), uploads it, and builds its table from the experts it owns
+  (`Placement::owner`); the mixed input of both halves lands in the worker's `m` scratch,
+  where the core's input was.
+- *What stays at eight rows*: the host share and the buffers of the decode kernels, the
+  per-layer copies of the layer's input rows that the CPU reads, and the store's reserve
+  (`StoreConfig::max_rows`). Only the scratch of a step scales with the rows.
+
+`step_rows` decides the rows a model opens with: the largest power of two up to 4096
+whose scratch (`Frame::step_bytes`) is at most an eighth of the smaller device's memory,
+and 8 on a device below compute capability 8.0. The scratch is about half a megabyte a
+row for Flash-Next, so it is the rows that cost expert slots: the choice is the device's
+memory, not a number measured on these two cards.
 
 **Measured through the server** (2026-11-11, RTX 4070 and RTX 3060, the
 engine started with `--chat-var enable_thinking=false` and otherwise its

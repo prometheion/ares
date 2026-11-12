@@ -23,7 +23,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
 use ares_core::GgmlType;
-use ares_cuda::{CacheFormat, Device, ExpertShape, Wait, device_count};
+use ares_cuda::{CacheFormat, Device, ExpertShape, Precision, Wait, device_count};
 use ares_gguf::Gguf;
 use ares_model::qwen4exp::device::{
     LayerOut, Options, PHASES, Phase, Probe, Profile, Rows, Session, SessionOptions, Spread, Wanted,
@@ -165,6 +165,16 @@ fn rel_rms(got: &[f32], want: &[f32]) -> f64 {
         size += f64::from(*w).powi(2);
     }
     (diff / size.max(1e-30)).sqrt()
+}
+
+/// Whether `pick` is the most likely token of `want` up to what the measured `error` of the
+/// logits (relative RMS) can move: a token within three times that of the largest logit,
+/// and within a hundredth of the logits' RMS (the error is a mean over the row; the logits
+/// of a made-up model's top tokens lie close together).
+fn is_near_best(pick: u32, want: &[f32], error: f64) -> bool {
+    let best = want.iter().copied().fold(f32::MIN, f32::max);
+    let rms = (want.iter().map(|v| f64::from(*v).powi(2)).sum::<f64>() / want.len() as f64).sqrt();
+    f64::from(best - want[pick as usize]) <= (3.0 * error + 1e-2) * rms
 }
 
 fn arg_max(row: &[f32]) -> u32 {
@@ -318,6 +328,82 @@ fn every_layer_matches_the_reference() {
     }
 }
 
+/// Every layer of steps of 9 to 256 rows, each fed the reference's input, against the
+/// reference: with the dense matrices as f32 (exact products) and quantized (the tile
+/// kernels' integer products), with half of the experts without a slot.
+#[test]
+fn every_layer_of_wide_steps_matches_the_reference() {
+    let Some(devices) = devices() else { return };
+    for (types, core_bound) in [(Types::Shipped, 2e-3), (Types::Quantized, 4e-2)] {
+        let synthetic = Synthetic { types, ..model(11) };
+        let gguf = open(
+            &format!("wide-layers-{types:?}"),
+            &synthetic.bytes_with_experts(GgmlType::IQ2_S, GgmlType::Q2_0),
+        );
+        let c = Config::from_gguf(&gguf).unwrap();
+        let w = Weights::load(&gguf, &c).unwrap();
+        let reference = Reference::new(&c, &w);
+        let mut opts = options(devices.len(), c.n_layer, CacheFormat::Q8);
+        opts.part.max_rows = 256;
+        let mut session =
+            Session::open(&gguf, &c, &w, devices.clone(), opts).expect("the model opens");
+        let present = c.experts.count as u32 / 2;
+        session.fill(&mut |_| (0..present).collect()).expect("the tiers fill");
+        let steps = [9usize, 64, 5, 256, 1, 17];
+        let all = synthetic.shape.tokens(steps.iter().sum(), 3);
+        let mut state = SequenceState::new(&c);
+        let mut worst = [[0.0f64; 3]; 2];
+        let (mut rows, mut same_picks, mut at) = (0, 0, 0);
+        for &count in &steps {
+            let tokens = &all[at..at + count];
+            let layers = expected(&reference, &c, &w, &state, tokens);
+            let mut probe = Compare {
+                expected: &layers,
+                attention: &c.attention_layers,
+                worst,
+                rows: 0,
+                same_picks: 0,
+            };
+            session
+                .step_probed(
+                    &[Rows { slot: 0, tokens, direct: true, wanted: Wanted::None }],
+                    &mut probe,
+                )
+                .unwrap();
+            worst = probe.worst;
+            rows += probe.rows;
+            same_picks += probe.same_picks;
+            let window = reference.window(&state, tokens, LogitRows::None).unwrap();
+            reference.commit(&mut state, &window, count).unwrap();
+            at += count;
+        }
+        eprintln!(
+            "  {types:?}, {} device(s): recurrent layers: core {:.2e}, experts {:.2e}, residual \
+             {:.2e}; attention layers: core {:.2e}, experts {:.2e}, residual {:.2e}; \
+             {same_picks} of {rows} rows of layers with the reference's experts",
+            devices.len(),
+            worst[0][0],
+            worst[0][1],
+            worst[0][2],
+            worst[1][0],
+            worst[1][1],
+            worst[1][2],
+        );
+        assert!(worst[0][0] < core_bound, "recurrent core {:.2e}", worst[0][0]);
+        assert!(worst[1][0] < core_bound.max(3e-2), "attention core {:.2e}", worst[1][0]);
+        // With quantized dense matrices the 8-bit activations of the products move the
+        // router's input a little, and a row whose picks flip at a near tie gets other
+        // experts: the error of the experts' output is that of those rows.
+        let (experts, residual, picks) =
+            if types == Types::Quantized { (0.3, 6e-2, 94) } else { (8e-2, 4e-2, 97) };
+        for kind in &worst {
+            assert!(kind[1] < experts, "experts {:.2e}", kind[1]);
+            assert!(kind[2] < residual, "residual {:.2e}", kind[2]);
+        }
+        assert!(same_picks * 100 >= rows * picks, "{same_picks} of {rows} routings");
+    }
+}
+
 /// The whole pass: the most likely token of every prompt row, the logits of
 /// the last one, and greedy tokens after it.
 #[test]
@@ -371,6 +457,98 @@ fn the_forward_pass_and_greedy_tokens_match_the_reference() {
     );
     assert!(worst < 0.15, "logits {worst:.2e}");
     assert!(same * 10 >= prompt.len() * 9, "{same} of {} rows", prompt.len());
+}
+
+/// The slices of a prompt of 9, 64 and 256 rows run on the many-row kernels, with half of
+/// every layer's experts without a slot, and what follows them (a step of a few rows and
+/// single tokens) continues from the state they left. The dense products take int8
+/// activations (`Precision::Fast` on these cards) or f16 ones (`Precision::Exact`); and
+/// with so few slots that the misses of a layer come in several batches, each giving way
+/// to the one after it.
+#[test]
+fn steps_wider_than_eight_rows_match_the_reference() {
+    let Some(devices) = devices() else { return };
+    for (precision, few_slots) in
+        [(Precision::Fast, false), (Precision::Exact, false), (Precision::Exact, true)]
+    {
+        wide_steps(&devices, precision, few_slots);
+    }
+}
+
+fn wide_steps(devices: &[Device], precision: Precision, few_slots: bool) {
+    let synthetic = Synthetic { types: Types::Quantized, ..model(23) };
+    let gguf = open("wide", &synthetic.bytes_with_experts(GgmlType::IQ2_S, GgmlType::Q2_0));
+    let c = Config::from_gguf(&gguf).unwrap();
+    let w = Weights::load(&gguf, &c).unwrap();
+    let reference = Reference::new(&c, &w);
+    let mut opts = options(devices.len(), c.n_layer, CacheFormat::Q8);
+    opts.part.max_rows = 256;
+    opts.part.precision = precision;
+    if few_slots {
+        // The least the store gives a layer: the experts of a step of eight rows.
+        let shape = ExpertShape {
+            n_embd: c.n_embd as u32,
+            n_ff: c.experts.ff as u32,
+            n_experts: c.experts.count as u32,
+            top_k: c.experts.used as u32,
+            gate_ty: GgmlType::IQ2_S,
+            down_ty: GgmlType::Q2_0,
+        };
+        let layers = layers_per_device(c.n_layer, devices.len()) as u64;
+        opts.slot_bytes = Some(layers * u64::from(8 * shape.top_k) * shape.slot_bytes().unwrap());
+    }
+    opts.part.cells = 512;
+    let mut session =
+        Session::open(&gguf, &c, &w, devices.to_vec(), opts).expect("the model opens");
+    let present = if few_slots { 6 } else { c.experts.count as u32 / 2 };
+    session.fill(&mut |_| (0..present).collect()).expect("the tiers fill");
+    let mut state = SequenceState::new(&c);
+    let prompt = synthetic.shape.tokens(9 + 64 + 256 + 3, 9);
+    let (mut at, mut worst, mut token) = (0, 0.0f64, 0u32);
+    for rows in [9, 64, 256, 3] {
+        let tokens = &prompt[at..at + rows];
+        at += rows;
+        let picks = session
+            .step(&[Rows { slot: 0, tokens, direct: true, wanted: Wanted::Last }])
+            .unwrap()
+            .to_vec();
+        let window = reference.window(&state, tokens, LogitRows::All).unwrap();
+        let want = window.logits_of(rows - 1).unwrap();
+        let error = rel_rms(session.logits(0).unwrap(), want);
+        eprintln!(
+            "  {precision:?}{}, {rows} rows: logits of the last row differ by {error:.2e} (relative \
+             RMS)",
+            if few_slots { ", few slots" } else { "" }
+        );
+        assert!(is_near_best(picks[0], want, error), "the most likely token after {at} tokens");
+        worst = worst.max(error);
+        token = picks[0];
+        reference.commit(&mut state, &window, rows).unwrap();
+    }
+    let wide = session.take_wide_stats();
+    eprintln!(
+        "  {} layers of wide steps: {} experts picked, {} of them without a slot, {} more rounds",
+        wide.layers, wide.picked, wide.missing, wide.extra_rounds
+    );
+    assert!(wide.missing > 0, "no expert was missing: the test brings none");
+    if few_slots {
+        assert!(wide.extra_rounds > wide.layers, "the misses came in one batch: {wide:?}");
+    }
+    // The quantized dense matrices cost the 8-bit activations of their products.
+    assert!(worst < 0.2, "logits {worst:.2e}");
+    // Single tokens go on from the state the wide steps left.
+    for _ in 0..8 {
+        let picks = session
+            .step(&[Rows { slot: 0, tokens: &[token], direct: true, wanted: Wanted::Last }])
+            .unwrap()
+            .to_vec();
+        let window = reference.window(&state, &[token], LogitRows::Last).unwrap();
+        let want = window.logits_of(0).unwrap();
+        let error = rel_rms(session.logits(0).unwrap(), want);
+        assert!(is_near_best(picks[0], want, error), "a single token after the wide steps");
+        reference.commit(&mut state, &window, 1).unwrap();
+        token = arg_max(want);
+    }
 }
 
 /// A draft window leaves the state untouched and its commit advances it by

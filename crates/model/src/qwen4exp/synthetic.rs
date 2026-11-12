@@ -184,6 +184,11 @@ pub enum Types {
     /// `ple_value`, F16 for `ple_conv1d`, `f32` for everything else (which is
     /// quantized in the real file).
     Shipped,
+    /// The types of [`Types::Shipped`], and the matrices of the recurrent and attention
+    /// layers and of the shared experts quantized as the real file has them (IQ4_NL, a
+    /// type whose block divides the row widths), so that the products with them take the
+    /// weight kernels' integer and tile paths.
+    Quantized,
 }
 
 /// A made-up model.
@@ -324,7 +329,8 @@ impl Synthetic {
     fn tensors(&self, file: &mut File, experts: Option<(GgmlType, GgmlType)>) {
         let s = &self.shape;
         let (n, wide, lr) = (s.n_embd, s.wide(), s.mixer_rank);
-        let shipped = self.types == Types::Shipped;
+        let shipped = self.types != Types::F32;
+        let dense = if self.types == Types::Quantized { GgmlType::IQ4_NL } else { GgmlType::F32 };
         let bf16 = if shipped { GgmlType::BF16 } else { GgmlType::F32 };
         let lazy = self.lazy_type.unwrap_or(GgmlType::F32);
         let f32t = GgmlType::F32;
@@ -377,15 +383,15 @@ impl Synthetic {
             stack(file, "ffn_up_exps.weight", &[n, s.expert_ff, s.n_expert], 1.5, 0);
             stack(file, "ffn_down_exps.weight", &[s.expert_ff, n, s.n_expert], 1.0, 1);
             matrix(file, &name("ffn_gate_inp_shexp.weight"), &[n], 2.0, f32t);
-            matrix(file, &name("ffn_gate_shexp.weight"), &[n, s.shared_ff], 1.5, f32t);
-            matrix(file, &name("ffn_up_shexp.weight"), &[n, s.shared_ff], 1.5, f32t);
-            matrix(file, &name("ffn_down_shexp.weight"), &[s.shared_ff, n], 1.0, f32t);
+            matrix(file, &name("ffn_gate_shexp.weight"), &[n, s.shared_ff], 1.5, dense);
+            matrix(file, &name("ffn_up_shexp.weight"), &[n, s.shared_ff], 1.5, dense);
+            matrix(file, &name("ffn_down_shexp.weight"), &[s.shared_ff, n], 1.0, dense);
             if s.is_attention(layer) {
                 let (q_dim, kv_dim) = (s.n_head * s.head_dim, s.n_head_kv * s.head_dim);
-                matrix(file, &name("attn_q.weight"), &[n, q_dim * 2], 1.5, f32t);
-                matrix(file, &name("attn_k.weight"), &[n, kv_dim], 1.5, f32t);
-                matrix(file, &name("attn_v.weight"), &[n, kv_dim], 1.5, f32t);
-                matrix(file, &name("attn_output.weight"), &[q_dim, n], 1.5, f32t);
+                matrix(file, &name("attn_q.weight"), &[n, q_dim * 2], 1.5, dense);
+                matrix(file, &name("attn_k.weight"), &[n, kv_dim], 1.5, dense);
+                matrix(file, &name("attn_v.weight"), &[n, kv_dim], 1.5, dense);
+                matrix(file, &name("attn_output.weight"), &[q_dim, n], 1.5, dense);
                 let idx = s.indexer_dim;
                 matrix(
                     file,
@@ -397,11 +403,11 @@ impl Synthetic {
                 matrix(file, &name("indexer.k_proj.weight"), &[n, idx], 1.5, bf16);
             } else {
                 let (kd, vd) = (s.n_k_heads * s.state_size, s.n_v_heads * s.state_size);
-                matrix(file, &name("attn_qkv.weight"), &[n, 2 * kd + vd], 1.5, f32t);
-                matrix(file, &name("attn_gate.weight"), &[n, vd], 1.5, f32t);
+                matrix(file, &name("attn_qkv.weight"), &[n, 2 * kd + vd], 1.5, dense);
+                matrix(file, &name("attn_gate.weight"), &[n, vd], 1.5, dense);
                 matrix(file, &name("ssm_alpha.weight"), &[n, s.n_v_heads], 2.0, bf16);
                 matrix(file, &name("ssm_beta.weight"), &[n, s.n_v_heads], 2.0, bf16);
-                matrix(file, &name("ssm_out.weight"), &[vd, n], 1.5, f32t);
+                matrix(file, &name("ssm_out.weight"), &[vd, n], 1.5, dense);
             }
             if s.ngram.as_ref().is_some_and(|g| g.layer == layer) {
                 matrix(file, &name("ple_key.weight"), &[n, wide], 1.5, bf16);

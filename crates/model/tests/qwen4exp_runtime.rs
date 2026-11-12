@@ -23,7 +23,7 @@ use ares_model::qwen4exp::device::{
     Options, Qwen4Exp, Rows, Session, SessionOptions, Spread, Wanted,
 };
 use ares_model::qwen4exp::synthetic::{NgramShape, Shape, Synthetic, Types};
-use ares_model::qwen4exp::{Config, Weights};
+use ares_model::qwen4exp::{Config, LogitRows, Reference, SequenceState, Weights};
 use ares_runtime::{
     ContextSpec, DeviceContext, DeviceModel, GpuConfig, LinkSpec, Model, ModelError, PrefixCache,
     Runtime, RuntimeConfig, Split,
@@ -32,6 +32,8 @@ use ares_state::PageLayout;
 use ares_tokenizer::{ChatOptions, Json, Tokenizer};
 
 const MAX_ROWS: u32 = 8;
+/// The rows of a step that reads a slice of a prompt on the many-row kernels.
+const WIDE_ROWS: u32 = 64;
 const CELLS: u32 = 512;
 const SLOTS: u32 = 2;
 
@@ -109,11 +111,17 @@ fn open_devices(placement: Placement) -> Vec<Device> {
     (0..count).map(|d| Device::open(d, Wait::Spin).expect("open device")).collect()
 }
 
-fn options(placement: Placement, n_layer: usize, pages: u32, window_rows: u32) -> SessionOptions {
+fn options(
+    placement: Placement,
+    n_layer: usize,
+    pages: u32,
+    window_rows: u32,
+    rows: u32,
+) -> SessionOptions {
     SessionOptions {
         part: Options {
             kv: (CacheFormat::Q8, CacheFormat::Q8),
-            max_rows: MAX_ROWS,
+            max_rows: rows,
             logit_rows: MAX_ROWS,
             window_rows,
             max_slots: SLOTS,
@@ -251,10 +259,21 @@ fn start(
     pages: u32,
     config: RuntimeConfig,
 ) -> (Runtime, Arc<Qwen4Exp>) {
+    start_rows(seed, placement, pages, config, MAX_ROWS)
+}
+
+/// [`start`] with steps of up to `rows` rows.
+fn start_rows(
+    seed: u64,
+    placement: Placement,
+    pages: u32,
+    config: RuntimeConfig,
+    rows: u32,
+) -> (Runtime, Arc<Qwen4Exp>) {
     let devices = open_devices(placement);
     let gguf = Gguf::open(gguf_path(seed)).unwrap();
     let n_layer = Config::from_gguf(&gguf).unwrap().n_layer;
-    let opts = options(placement, n_layer, pages, MAX_ROWS);
+    let opts = options(placement, n_layer, pages, MAX_ROWS, rows);
     let inner =
         Arc::new(Qwen4Exp::new(gguf, byte_tokenizer(None), "made", &devices, opts, CELLS).unwrap());
     let config = RuntimeConfig { pages, cells_per_page: 128, max_slots: SLOTS, ..config };
@@ -399,7 +418,7 @@ fn session_answer(seed: u64, placement: Placement, prompt: &[u32], n: usize) -> 
     let gguf = Gguf::open(gguf_path(seed)).unwrap();
     let c = Config::from_gguf(&gguf).unwrap();
     let w = Weights::load(&gguf, &c).unwrap();
-    let mut opts = options(placement, c.n_layer, 0, MAX_ROWS);
+    let mut opts = options(placement, c.n_layer, 0, MAX_ROWS, MAX_ROWS);
     opts.part.pool_pages = 0;
     opts.ram_tier = Some(64 << 20);
     let mut session = Session::open(&gguf, &c, &w, devices, opts).expect("the session opens");
@@ -420,6 +439,28 @@ fn session_answer(seed: u64, placement: Placement, prompt: &[u32], n: usize) -> 
             .step(&[Rows { slot: 0, tokens: &token, direct: true, wanted: Wanted::Last }])
             .expect("a step");
         answer.push(picks[0]);
+    }
+    answer
+}
+
+/// The greedy tokens the CPU reference writes after `prompt`.
+fn reference_answer(seed: u64, prompt: &[u32], n: usize) -> Vec<u32> {
+    let gguf = Gguf::open(gguf_path(seed)).unwrap();
+    let c = Config::from_gguf(&gguf).unwrap();
+    let w = Weights::load(&gguf, &c).unwrap();
+    let reference = Reference::new(&c, &w);
+    let mut state = SequenceState::new(&c);
+    let arg_max = |row: &[f32]| {
+        row.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map_or(0, |(i, _)| i as u32)
+    };
+    let mut window = reference.window(&state, prompt, LogitRows::All).unwrap();
+    reference.commit(&mut state, &window, prompt.len()).unwrap();
+    let mut answer = vec![arg_max(window.logits_of(prompt.len() - 1).unwrap())];
+    while answer.len() < n {
+        let token = [answer[answer.len() - 1]];
+        window = reference.window(&state, &token, LogitRows::Last).unwrap();
+        reference.commit(&mut state, &window, 1).unwrap();
+        answer.push(arg_max(window.logits_of(0).unwrap()));
     }
     answer
 }
@@ -457,7 +498,7 @@ fn declared(template: Option<&str>, chat: ChatOptions) -> Option<ChatFormat> {
     let devices = open_devices(Placement::One);
     let gguf = Gguf::open(gguf_path(1)).unwrap();
     let n_layer = Config::from_gguf(&gguf).unwrap().n_layer;
-    let opts = options(Placement::One, n_layer, 16, MAX_ROWS);
+    let opts = options(Placement::One, n_layer, 16, MAX_ROWS, MAX_ROWS);
     Qwen4Exp::new(gguf, byte_tokenizer(template), "made", &devices, opts, CELLS)
         .unwrap()
         .with_chat_options(chat)
@@ -514,6 +555,41 @@ fn the_runtime_answers_as_the_session_does_in_every_placement() {
         );
         assert_eq!(got, want, "{placement:?}: the runtime says something else than the session");
         assert_eq!(first[..5], want[..5], "{placement:?}: the answer with fetched experts");
+    }
+}
+
+/// A prompt read in slices of up to 64 rows, on the many-row kernels, with every expert
+/// fetched (none has a slot when the model starts), in every placement: the answer starts as
+/// the CPU reference's does. (Later tokens of a made-up model's answer follow near ties, which
+/// every difference of arithmetic flips; the numbers printed say how far each agrees.)
+#[test]
+fn a_prompt_read_in_wide_steps_gives_the_reference_answer() {
+    if !enabled() {
+        return;
+    }
+    let prompt = prompt(200, 5);
+    let reference = reference_answer(1, &prompt, 16);
+    for placement in placements() {
+        let eight = session_answer(1, placement, &prompt, 16);
+        let (runtime, model) = start_rows(1, placement, 16, RuntimeConfig::default(), WIDE_ROWS);
+        let got = ask(&runtime, 1, &prompt, 16);
+        let wide = model.wide_stats().expect("the parts are open");
+        runtime.shutdown();
+        let leading = |a: &[u32], b: &[u32]| a.iter().zip(b).take_while(|(x, y)| x == y).count();
+        eprintln!(
+            "WIDE {placement:?}: {} tokens as the reference's before the first difference \
+             (steps of eight rows: {}); {} layers of wide steps picked {} experts, {} without a \
+             slot, in {} more rounds",
+            leading(&got, &reference),
+            leading(&eight, &reference),
+            wide.layers,
+            wide.picked,
+            wide.missing,
+            wide.extra_rounds
+        );
+        assert!(wide.layers > 0, "{placement:?}: the prompt ran in no wide step");
+        assert!(wide.missing > 0, "{placement:?}: no expert was fetched");
+        assert!(leading(&got, &reference) >= 2, "{placement:?}: {got:?} against {reference:?}");
     }
 }
 

@@ -25,8 +25,8 @@ use std::time::{Duration, Instant};
 
 use ares_core::{GgmlType, Ledger};
 use ares_cuda::{
-    Device, DeviceBuffer, DevicePtr, Event, Kernels, Lane, Mesh, MixerMatrix, Parcel, Q4Kernels,
-    RouteRecord, Segment, StepRecord, Stream, peer_access,
+    Device, DeviceBuffer, DevicePtr, Event, Kernels, Lane, MAX_BATCH, Mesh, MixerMatrix, Parcel,
+    Q4Kernels, RouteRecord, Segment, StepRecord, Stream, peer_access,
 };
 use ares_gguf::Gguf;
 use ares_io::Reader;
@@ -37,6 +37,7 @@ use ares_runtime::expert_store::{
 use super::Error;
 use super::feed::{Feed, Layout, build_store, cpu_pool, device_slots, places};
 use super::load::Role;
+use super::misses::{Misses, Progress, WideStats};
 use super::ngram::NgramFeed;
 use super::part::{Options, Part, PartSetup, StepEnv};
 use super::placement::{DeviceMemory, PartPlan, Placement, TensorChoice, ram_tier_bytes};
@@ -281,6 +282,25 @@ macro_rules! step_env {
             pools: $self.pools[$device].ptr(),
         }
     };
+}
+
+/// The experts each of `rows` rows picked, from a route record: that of the decode kernels
+/// for up to [`MAX_BATCH`] rows, else the ids behind the header.
+fn picks_of(record: &[u8], used: usize, rows: u32) -> Result<Vec<Vec<u32>>, Error> {
+    if rows > MAX_BATCH {
+        let ids = record
+            .get(16..16 + 4 * used * rows as usize)
+            .ok_or_else(|| invalid("a route record that is none"))?;
+        return Ok(ids
+            .as_chunks::<4>()
+            .0
+            .chunks(used)
+            .map(|row| row.iter().map(|id| u32::from_le_bytes(*id)).collect())
+            .collect());
+    }
+    let route = RouteRecord::parse(record, used as u32, rows)
+        .ok_or_else(|| invalid("a route record that is none"))?;
+    Ok((0..rows as usize).map(|row| route.ids(row).collect()).collect())
 }
 
 /// How long a read of a stream mixer of the model's sizes takes on `device`:
@@ -567,8 +587,12 @@ impl<'g> Session<'g> {
             .map(|d| d.slots.min(opts.slot_bytes.unwrap_or(u64::MAX)))
             .collect();
         let ram_bytes = ram_tier_bytes(opts.ram_tier, layout.ram_wanted(vram.iter().sum()));
-        let mut config =
-            StoreConfig::new(opts.part.max_rows, c.experts.used as u32, vram, ram_bytes);
+        let mut config = StoreConfig::new(
+            opts.part.max_rows.min(MAX_BATCH),
+            c.experts.used as u32,
+            vram,
+            ram_bytes,
+        );
         if let Some(reserve) = opts.reserve {
             config.vram_reserve = reserve;
         }
@@ -621,7 +645,7 @@ impl<'g> Session<'g> {
                 &plan.device_pools(index),
                 &layout,
                 opts.serve,
-                opts.part.max_rows,
+                opts.part.max_rows.min(MAX_BATCH),
             )?);
         }
         debug_assert_eq!(plan.n_layers(), store_layers);
@@ -694,6 +718,11 @@ impl<'g> Session<'g> {
     /// The expert store.
     pub fn store(&self) -> &ExpertStore<CudaSlots> {
         &self.feed.store
+    }
+
+    /// What wide steps found missing and waited for since the last call.
+    pub fn take_wide_stats(&mut self) -> WideStats {
+        self.feed.take_wide()
     }
 
     /// What the store counted since the last call.
@@ -791,6 +820,57 @@ impl<'g> Session<'g> {
             }
             self.pump()?;
             self.watch(started, "a device ran the step")?;
+            std::hint::spin_loop();
+        }
+    }
+
+    /// The experts of layer `layer` of `devices` in a wide step: enqueues the first rounds,
+    /// then serves the store until the misses are brought and computed.
+    fn wide_layer(
+        &mut self,
+        step: &Step<'_>,
+        layer: usize,
+        fetched: &Option<Vec<u8>>,
+        devices: &[usize],
+    ) -> Result<(), Error> {
+        let mixer = self.placement.tensor.as_ref().map(|t| t.mixer);
+        let owners: Vec<usize> =
+            (0..self.c.experts.count as u32).map(|e| self.placement.owner(layer, e)).collect();
+        let owned =
+            |device: usize, expert: u32| mixer.is_none() || owners[expert as usize] == device;
+        let started = Instant::now();
+        let mut misses = Vec::with_capacity(devices.len());
+        for &device in devices {
+            let env = step_env!(self, step, device, fetched, None);
+            let source = mixer.filter(|m| *m != device).map(|m| self.parts[m].board());
+            misses.push(Misses::begin(
+                &mut self.parts[device],
+                &env,
+                &self.feed,
+                device,
+                layer,
+                source,
+                &|expert| owned(device, expert),
+            )?);
+        }
+        loop {
+            let mut done = true;
+            for (misses, &device) in misses.iter_mut().zip(devices) {
+                let env = step_env!(self, step, device, fetched, None);
+                let progress = misses.advance(
+                    &mut self.parts[device],
+                    &env,
+                    &mut self.feed,
+                    true,
+                    &|expert| owned(device, expert),
+                )?;
+                done &= progress == Progress::Done;
+            }
+            if done {
+                return Ok(());
+            }
+            self.pump()?;
+            self.watch(started, "the experts of a wide step were brought")?;
             std::hint::spin_loop();
         }
     }
@@ -1018,6 +1098,9 @@ impl<'g> Session<'g> {
                 }
                 self.parts[device]
                     .enqueue_layer(&step_env!(self, step, device, fetched, inbound), i)?;
+                if dims.n_rows > MAX_BATCH {
+                    self.wide_layer(step, i, &fetched, &[device])?;
+                }
                 self.enqueued[device] += 1;
                 self.pump()?;
                 if let Some(probe) = probe.as_deref_mut() {
@@ -1027,17 +1110,11 @@ impl<'g> Session<'g> {
                     self.follow()?;
                     let part = &self.parts[device];
                     let rows = dims.n_rows as usize;
-                    let route = RouteRecord::parse(
-                        part.route_record(i),
-                        self.c.experts.used as u32,
-                        dims.n_rows,
-                    )
-                    .ok_or_else(|| invalid("a route record that is none"))?;
                     let out = LayerOut {
                         residual: &part.read_residual(rows)?,
                         core: &part.read_core_out(rows)?,
                         ffn: &part.read_ffn_out(rows)?,
-                        picks: (0..rows).map(|row| route.ids(row).collect()).collect(),
+                        picks: picks_of(part.route_record(i), self.c.experts.used, dims.n_rows)?,
                     };
                     probe.after(first_layer + i, out);
                 }
@@ -1114,6 +1191,9 @@ impl<'g> Session<'g> {
                     .enqueue_layer(&step_env!(self, step, device, fetched, None), i)?;
                 self.enqueued[device] += 1;
             }
+            if dims.n_rows > MAX_BATCH {
+                self.wide_layer(step, i, &fetched, &[mixer, worker])?;
+            }
             self.pump()?;
             if let Some(probe) = probe.as_deref_mut() {
                 settle!();
@@ -1132,14 +1212,11 @@ impl<'g> Session<'g> {
                 );
                 let ffn = sum(m.read_ffn_out(rows)?, m.read_peer_partial(rows)?);
                 // Both records keep every row's picks.
-                let route =
-                    RouteRecord::parse(m.route_record(i), self.c.experts.used as u32, dims.n_rows)
-                        .ok_or_else(|| invalid("a route record that is none"))?;
                 let out = LayerOut {
                     residual: &m.read_residual(rows)?,
                     core: &core,
                     ffn: &ffn,
-                    picks: (0..rows).map(|row| route.ids(row).collect()).collect(),
+                    picks: picks_of(m.route_record(i), self.c.experts.used, dims.n_rows)?,
                 };
                 probe.after(i, out);
             }

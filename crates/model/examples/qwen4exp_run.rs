@@ -41,7 +41,10 @@
 //!   timed events cost a part of a step themselves, so steps are measured
 //!   both ways).
 //! - `--prefill N`: reads `N` tokens of `--text` from an empty sequence and
-//!   reports tokens per second.
+//!   reports tokens per second, in steps of `--rows` rows (default 8, the decode
+//!   kernels' limit; more runs the many-row kernels and reports what the wide steps
+//!   found missing and waited for); `--repeat K` reads it `K` times, the later ones
+//!   with the experts the first one fetched.
 //! - `--serve`: how an expert that is in no slot is served: `model` lets the
 //!   store's measured costs decide between an upload and the CPU (what the
 //!   engine does), `stream` uploads every one, `cpu` computes every one.
@@ -87,6 +90,8 @@ struct Args {
     decode_at: Vec<usize>,
     decode_steps: usize,
     prefill: usize,
+    repeat: usize,
+    rows: u32,
     breakdown: bool,
     serve: Serve,
     stall_s: u64,
@@ -118,6 +123,8 @@ fn parse() -> Result<Args, AnyError> {
         decode_at: Vec::new(),
         decode_steps: 64,
         prefill: 0,
+        repeat: 1,
+        rows: 8,
         breakdown: false,
         serve: Serve::Measured,
         stall_s: 20,
@@ -165,6 +172,8 @@ fn parse() -> Result<Args, AnyError> {
             }
             "--decode-steps" => args.decode_steps = value()?.parse()?,
             "--prefill" => args.prefill = value()?.parse()?,
+            "--rows" => args.rows = value()?.parse()?,
+            "--repeat" => args.repeat = value()?.parse()?,
             "--breakdown" => args.breakdown = true,
             "--stall-s" => args.stall_s = value()?.parse()?,
             "--serve" => {
@@ -385,6 +394,7 @@ fn run() -> Result<(), AnyError> {
         part: Options {
             cells: args.cells,
             keys: args.keys,
+            max_rows: args.rows,
             profile: profile.clone(),
             ..Options::default()
         },
@@ -687,24 +697,48 @@ fn run() -> Result<(), AnyError> {
         if text.len() < args.prefill {
             return Err(format!("--text has {} tokens", text.len()).into());
         }
-        session.restart(0)?;
-        session.take_store_stats();
-        if let Some(profile) = &profile {
-            profile.pause(true);
-        }
-        let started = Instant::now();
-        after_prefill = read(&mut session, &text[..args.prefill], true)?;
-        let seconds = started.elapsed().as_secs_f64();
-        let stats = session.take_store_stats();
-        println!(
-            "prefill: {} tokens in {seconds:.2} s = {:.1} tokens/s in steps of {} rows (load \
+        for round in 0..args.repeat {
+            session.restart(0)?;
+            session.take_store_stats();
+            if let Some(profile) = &profile {
+                // `--breakdown` times the last reading.
+                profile.reset();
+                profile.pause(round + 1 < args.repeat);
+            }
+            let started = Instant::now();
+            after_prefill = read(&mut session, &text[..args.prefill], true)?;
+            let seconds = started.elapsed().as_secs_f64();
+            let stats = session.take_store_stats();
+            println!(
+                "prefill: {} tokens in {seconds:.2} s = {:.1} tokens/s in steps of {} rows (load \
              average {})",
-            args.prefill,
-            args.prefill as f64 / seconds,
-            session.options().part.max_rows,
-            load_average(),
-        );
-        println!("  store: {}", store_line(&stats, args.prefill.div_ceil(8)));
+                args.prefill,
+                args.prefill as f64 / seconds,
+                session.options().part.max_rows,
+                load_average(),
+            );
+            println!("  store: {}", store_line(&stats, args.prefill.div_ceil(args.rows as usize)));
+            if round + 1 == args.repeat {
+                breakdown(profile.as_deref(), &session);
+            }
+            let wide = session.take_wide_stats();
+            if wide.layers > 0 {
+                let layers = wide.layers as f64;
+                println!(
+                    "  wide steps: {:.1} experts picked per layer, {:.1} of them without a slot, {:.2} \
+                 more rounds; per layer the host waited {:.2} ms for the picks, {:.2} ms for \
+                 the first round to end, {:.2} ms for the misses to arrive, {:.2} ms for later \
+                 rounds",
+                    wide.picked as f64 / layers,
+                    wide.missing as f64 / layers,
+                    wide.extra_rounds as f64 / layers,
+                    wide.record_wait.as_secs_f64() * 1e3 / layers,
+                    wide.compute_wait.as_secs_f64() * 1e3 / layers,
+                    wide.bring_wait.as_secs_f64() * 1e3 / layers,
+                    wide.round_wait.as_secs_f64() * 1e3 / layers,
+                );
+            }
+        }
     }
     let mut at = if args.prefill > 0 { args.prefill } else { 0 };
     for &context in &args.decode_at {

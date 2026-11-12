@@ -20,6 +20,7 @@
 mod board;
 mod feed;
 mod load;
+mod misses;
 mod ngram;
 mod part;
 pub mod placement;
@@ -28,13 +29,14 @@ mod session;
 
 pub use board::Board;
 pub use load::{LayerShare, Role};
+pub use misses::WideStats;
 pub use part::{
     ExpertAt, Options, PAGE_ENTRY, PHASES, Part, PartSetup, Phase, Ports, Profile, StepEnv,
 };
 pub use placement::{
     DeviceMemory, DevicePlan, PartPlan, Placement, TensorChoice, TensorPlan, ram_tier_bytes,
 };
-pub use runtime::{OpenError, Qwen4Exp, place};
+pub use runtime::{OpenError, Qwen4Exp, WIDE_ROWS, place, step_rows};
 pub use session::{
     Fill, LayerOut, PartReport, Probe, Rows, Session, SessionOptions, Spread, StepTime, Wanted,
     read_time,

@@ -48,14 +48,17 @@ use std::sync::{Arc, Mutex};
 
 use ares_core::{GgmlType, Ledger};
 use ares_cuda::{
-    Arrival, AttendBuffers, AttentionKernels, AttentionShape, AttnItem, AttnRow, AttnShape,
-    CacheFormat, CacheGeometry, CommitSet, Departure, Device, DeviceBuffer, DevicePtr, ENTRY_CELLS,
-    Event, ExpertKernels, IndexerShape, Kernels, KeyFormat, LayerKernels, ListHandOver, MAX_BATCH,
-    MixerMatrix, NgramShape, OutputGate, PinnedBuffer, Plan, PlanConfig, Planner, Q4Kernels,
-    ReadWrite, RopeParams, Segment, SelectionRule, StateFormat, StepRecord, Stream,
+    Accumulate, ActivationForm, Arrival, AttendBuffers, AttentionKernels, AttentionShape, AttnItem,
+    AttnRow, AttnShape, CacheFormat, CacheGeometry, CommitSet, Departure, Device, DeviceBuffer,
+    DevicePtr, ENTRY_CELLS, Event, ExpertKernels, ExpertRowKernels, IndexerShape, Kernels,
+    KeyFormat, LayerKernels, ListHandOver, MAX_BATCH, MixerMatrix, NgramShape, OutputGate,
+    PinnedBuffer, Plan, PlanConfig, Planner, Precision, Q4Kernels, ReadWrite, RopeParams, Segment,
+    SelectionRule, StateFormat, StepRecord, Stream, WeightLayout,
 };
 use ares_runtime::ModelError;
 use ares_runtime::expert_store::cpu::act_bytes as cpu_act_bytes;
+
+mod wide;
 
 use super::board::Board;
 use super::load::{
@@ -84,8 +87,9 @@ pub struct Options {
     pub state: StateFormat,
     /// How a row past the dense limit picks its cells.
     pub rule: SelectionRule,
-    /// The most rows of a step, at most [`MAX_BATCH`]: the expert kernels
-    /// take no more.
+    /// The most rows of a step. A step of up to [`MAX_BATCH`] rows runs the
+    /// decode kernels; a wider one (a slice of a prompt) runs the many-row kernels
+    /// (see the module `wide`) and needs a device with compute capability 8.0.
     pub max_rows: u32,
     /// The most rows of a step whose logits are wanted.
     pub logit_rows: u32,
@@ -100,6 +104,8 @@ pub struct Options {
     /// out (`StepEnv::pools`); 0 for as many as the page tables have entries,
     /// so that every sequence slot can own pages of its own.
     pub pool_pages: u32,
+    /// The precision of the products with the dense weights in wide steps.
+    pub precision: Precision,
     /// Whether the logits of the wanted rows are copied to the host
     /// ([`Part::logits`]). A driver whose sampler reads them on the device
     /// ([`Part::head_logits`]) leaves it off: a row is a megabyte.
@@ -121,6 +127,7 @@ impl Default for Options {
             max_slots: 1,
             cells: 4096,
             pool_pages: 0,
+            precision: Precision::Fast,
             host_logits: true,
             profile: None,
         }
@@ -430,6 +437,15 @@ struct Scratch {
     picked: u64,
     act_p: u64,
     head: u64,
+    // Steps wider than the decode kernels take ([`wide`]): the f16 form of the mixed input
+    // and of the outputs that are quantized, the addresses of the experts of the rounds,
+    // the plan, the hidden values and the f16 form of the mixed input for the experts.
+    mixed_f16: u64,
+    out_f16: u64,
+    addresses: u64,
+    plan_rows: u64,
+    hidden_rows: u64,
+    experts_f16: u64,
     len: u64,
 }
 
@@ -476,6 +492,9 @@ pub(crate) struct Frame {
     x_bytes: u64,
     /// Bytes of the table that says which experts the peer owns.
     owner_bytes: u64,
+    /// Bytes of page-locked memory per layer for the address tables of the rounds of a
+    /// wide step; 0 when steps have at most [`MAX_BATCH`] rows.
+    addr_stage: u64,
 }
 
 fn invalid(message: impl Into<String>) -> ModelError {
@@ -539,11 +558,8 @@ impl Frame {
                  which this implementation does not manage yet: use f16 or q8",
             ));
         }
-        if opts.max_rows == 0 || opts.max_rows > MAX_BATCH {
-            return Err(invalid(format!(
-                "steps of up to {} rows: the expert kernels take 1 to {MAX_BATCH}",
-                opts.max_rows
-            )));
+        if opts.max_rows == 0 || u64::from(opts.max_rows) * c.wide() as u64 >= 1 << 32 {
+            return Err(invalid(format!("steps of up to {} rows", opts.max_rows)));
         }
         if opts.logit_rows == 0 || opts.logit_rows > opts.max_rows || opts.max_slots == 0 {
             return Err(invalid(
@@ -666,10 +682,15 @@ impl Frame {
         let shared_ff = c.experts.shared_ff as u64;
         s.act = take(act_bytes((rec * vd).max(att * hq).max(shared_ff), rows));
         // The most partial states a plan makes: the planner's own bound for
-        // dense rows (`Planner::finish`) and the pieces of device-made lists.
-        let state_slots = (20 * u64::from(plan_config.target_blocks) / u64::from(geo.kv_heads)
-            + 64)
-            .max(rows * u64::from(MAX_PIECES));
+        // dense rows (`Planner::finish`) and the pieces of device-made lists
+        // (a row has one piece when there are as many rows as the plan has
+        // blocks, so this is at most one state per row then).
+        let state_slots =
+            (20 * u64::from(plan_config.target_blocks) / u64::from(geo.kv_heads) + 64).max(
+                (rows * u64::from(MAX_PIECES)).min(
+                    (u64::from(plan_config.target_blocks) / u64::from(geo.kv_heads)).max(rows),
+                ),
+            );
         // A state is, per query head, the weighted V and the log of the sum.
         let state = c.attention.n_head as u64 * (u64::from(geo.head_dim) + 1) * 4;
         s.attn_state = take(att * state_slots * state);
@@ -682,9 +703,15 @@ impl Frame {
             gate_ty: GgmlType::IQ2_S,
             down_ty: GgmlType::Q2_0,
         };
-        s.rec_full = take(expert_shape.record_bytes(opts.max_rows));
+        // The records of the decode kernels have 8 rows; a wide step's record is the ids and
+        // the weights of the router's picks.
+        let decode_rows = opts.max_rows.min(MAX_BATCH);
+        let record_bytes = expert_shape
+            .record_bytes(decode_rows)
+            .max(wide::record_bytes(&expert_shape, opts.max_rows));
+        s.rec_full = take(record_bytes);
         s.logits = take(expert_shape.logits_bytes(opts.max_rows));
-        s.hidden = take(expert_shape.hidden_bytes(opts.max_rows));
+        s.hidden = take(expert_shape.hidden_bytes(decode_rows));
         s.sg = take(rows * shared_ff * 4);
         s.su = take(rows * shared_ff * 4);
         s.ysh = take(rows * n * 4);
@@ -700,6 +727,21 @@ impl Frame {
         s.picked = take(heads * logit_rows * n * 4);
         s.act_p = take(heads * act_bytes(n, logit_rows));
         s.head = take(heads * logit_rows * c.n_vocab as u64 * 4);
+        if opts.max_rows > MAX_BATCH {
+            let f16 = |width: u64| {
+                Kernels::prefill_activation_bytes(
+                    ares_cuda::PrefillPath::F16,
+                    width as u32,
+                    opts.max_rows,
+                )
+            };
+            s.mixed_f16 = take(f16(n));
+            s.out_f16 = take(f16((rec * vd).max(att * hq).max(shared_ff)));
+            s.addresses = take(wide::ROUNDS * 8 * c.experts.count as u64);
+            s.plan_rows = take(wide::plan_bytes(&expert_shape, opts.max_rows));
+            s.hidden_rows = take(expert_shape.rows_hidden_bytes(opts.max_rows));
+            s.experts_f16 = take(expert_shape.rows_activation_bytes(opts.max_rows));
+        }
         s.len = len;
 
         // A flag per block of a read, and one for a route record.
@@ -741,9 +783,10 @@ impl Frame {
             kept_bytes,
             s,
             inbox,
-            record_stride: expert_shape.record_bytes(opts.max_rows).next_multiple_of(64),
-            act_stride: act_bytes(n, rows).next_multiple_of(64),
-            act_host_stride: (cpu_act_bytes(n as usize, rows as usize) as u64).next_multiple_of(64),
+            record_stride: record_bytes.next_multiple_of(64),
+            act_stride: act_bytes(n, u64::from(decode_rows)).next_multiple_of(64),
+            act_host_stride: (cpu_act_bytes(n as usize, decode_rows as usize) as u64)
+                .next_multiple_of(64),
             geo,
             ix,
             ng,
@@ -756,6 +799,11 @@ impl Frame {
             },
             owner_bytes: if shape.role == Role::Mixer {
                 (shape.shares.len() as u64 * c.experts.count as u64).next_multiple_of(64)
+            } else {
+                0
+            },
+            addr_stage: if opts.max_rows > MAX_BATCH {
+                wide::ROUNDS * 8 * c.experts.count as u64
             } else {
                 0
             },
@@ -788,7 +836,7 @@ impl Frame {
     /// and rows of `layers` layers, the step's inputs, the mirror of the
     /// tables and the status word.
     pub(crate) fn pinned_bytes(&self, opts: &Options, layers: usize) -> u64 {
-        (self.record_stride + self.act_host_stride) * layers as u64
+        (self.record_stride + self.act_host_stride + self.addr_stage) * layers as u64
             + self.inbox.len
             + self.tables_bytes(opts)
             + 16
@@ -875,6 +923,9 @@ pub struct Part {
     status_host: PinnedBuffer,
     status_pending: bool,
     marks: Option<Marks>,
+    /// What steps wider than the decode kernels take need; `None` when no step has more
+    /// than [`MAX_BATCH`] rows.
+    wide_state: Option<wide::State>,
 }
 
 impl std::fmt::Debug for Part {
@@ -1008,6 +1059,10 @@ impl Part {
             events: Vec::new(),
             phases: Vec::new(),
         });
+        let kernels = Kernels::load(device)?;
+        let wide_state = (opts.max_rows > MAX_BATCH)
+            .then(|| wide::State::open(device, &kernels, &w, opts, &f))
+            .transpose()?;
         let a = &c.attention;
         Ok(Self {
             index,
@@ -1017,7 +1072,7 @@ impl Part {
             flipped: false,
             opts: opts.clone(),
             device: device.clone(),
-            kernels: Kernels::load(device)?,
+            kernels,
             layers: LayerKernels::load(device)?,
             q4: Q4Kernels::load(device)?,
             attention,
@@ -1075,6 +1130,7 @@ impl Part {
             status_host: PinnedBuffer::new(device, 16)?,
             status_pending: false,
             marks,
+            wide_state,
             w,
             f,
         })
@@ -1707,6 +1763,9 @@ impl Part {
         // SAFETY: the matrix is in the arena as the file stores it; the rest
         // is the caller's guarantee.
         unsafe {
+            if Self::is_wide(rows) {
+                return self.wide_product(stream, m, act, y, rows);
+            }
             self.kernels.matvec(stream, m.ty, self.w.mat(m), act, y, m.n_in, m.n_out, rows)?;
         }
         Ok(())
@@ -1730,7 +1789,11 @@ impl Part {
         let (hc, n, wide, rank) = (self.hc, self.n, self.wide, self.rank);
         let xn = self.act_values(s.xn, wide, rows);
         let norm = self.w.at(mixer.norm);
-        if self.fused {
+        // The fused read is made for a few rows: each block multiplies its rows by the
+        // mixer's matrices out of the cache. A wide step takes the separate kernels instead,
+        // whose products multiply eight rows at a time; they cannot push to a peer.
+        let fused = self.fused && !(Self::is_wide(rows) && self.role == Role::Whole);
+        if fused {
             let matrix = |m: &Mat| MixerMatrix { ptr: self.w.mat(m), ty: m.ty };
             let inject = mixer.inject.as_ref().filter(|_| inj.is_some()).map(matrix);
             // A read that writes goes from one residual buffer to the other:
@@ -1844,7 +1907,18 @@ impl Part {
         let wait = wait.map(|no| (own.flags, Q4Kernels::read_flags(rows, self.n), no));
         // SAFETY: scratch of this part; the peer's ports are memory of a
         // device this one has peer access to (`set_peer`).
-        unsafe { self.q4.swap(env.stream, push, wait, gate, zero, rows, self.n)? };
+        unsafe {
+            if Self::is_wide(rows) && push.is_some() && wait.is_some() {
+                // A block of the kernel per row, and the blocks that wait must not keep
+                // the ones that push from running: the mixer needs every row pushed before
+                // it sends what the waits are for, and a wide step has more rows than
+                // blocks that fit the device at once. So the push is a launch of its own.
+                self.q4.swap(env.stream, push, None, None, None, rows, self.n)?;
+                self.q4.swap(env.stream, None, wait, gate, zero, rows, self.n)?;
+            } else {
+                self.q4.swap(env.stream, push, wait, gate, zero, rows, self.n)?;
+            }
+        }
         self.mark(env.stream, Phase::Exchange)
     }
 
@@ -1934,10 +2008,12 @@ impl Part {
         });
         // The mixture of experts. Its input stays where the host can copy it
         // from until the next step: a miss is computed from it.
-        let m = self.acts.ptr().offset(i as u64 * self.f.act_stride);
+        let wide = Self::is_wide(rows);
+        let m =
+            if wide { self.at(s.m) } else { self.acts.ptr().offset(i as u64 * self.f.act_stride) };
         let write = self.take_write();
         let push = peer.map(|(ports, _)| Departure {
-            data: ports.acts.offset(i as u64 * ports.act_stride),
+            data: if wide { ports.m } else { ports.acts.offset(i as u64 * ports.act_stride) },
             flags: ports.flags,
             token: self.exchange_no(env, i, X_MOE_INPUT),
         });
@@ -1976,7 +2052,11 @@ impl Part {
         // this layer's buffer. The shared expert's scalar gate is computed
         // from it while the kernel that waited is still there, and the
         // experts' output starts from zero.
-        let m = self.acts.ptr().offset(i as u64 * self.f.act_stride);
+        let m = if Self::is_wide(rows) {
+            self.at(s.m)
+        } else {
+            self.acts.ptr().offset(i as u64 * self.f.act_stride)
+        };
         let values = u64::from(rows) * u64::from(self.n) * 4;
         let m_values = m.offset(act_bytes(u64::from(self.n), u64::from(rows)) - values);
         let gate = layer.moe.shared.map(|sh| (self.w.mat(&sh.inp), m_values, self.at(s.s)));
@@ -2102,6 +2182,7 @@ impl Part {
         // sequence (segments checked in `check`); the kept buffers hold
         // `window_rows` rows, which bounds a deferred step.
         unsafe {
+            self.prepare_mixed(stream, rows)?;
             self.product(stream, &r.qkv, m, qkv, rows)?;
             self.product(stream, &r.z, m, z, rows)?;
             self.product(stream, &r.beta, m, beta, rows)?;
@@ -2146,17 +2227,32 @@ impl Part {
                 conv_state,
                 conv_stride,
             )?;
-            self.layers.gated_norm_quant(
-                stream,
-                OutputGate::Sigmoid,
-                o,
-                z,
-                self.w.at(r.ssm_norm),
-                self.at(s.act),
-                rows * shape.n_v_heads,
-                shape.head_dim,
-                self.eps,
-            )?;
+            if self.wide_f16(rows) {
+                self.layers.gated_norm_f16(
+                    stream,
+                    OutputGate::Sigmoid,
+                    o,
+                    z,
+                    self.w.at(r.ssm_norm),
+                    self.at(s.out_f16),
+                    rows,
+                    shape.n_v_heads,
+                    shape.head_dim,
+                    self.eps,
+                )?;
+            } else {
+                self.layers.gated_norm_quant(
+                    stream,
+                    OutputGate::Sigmoid,
+                    o,
+                    z,
+                    self.w.at(r.ssm_norm),
+                    self.at(s.act),
+                    rows * shape.n_v_heads,
+                    shape.head_dim,
+                    self.eps,
+                )?;
+            }
             self.mark(stream, Phase::Recurrent)?;
             self.product(stream, &r.out, self.at(s.act), self.at(s.p), rows)?;
         }
@@ -2199,6 +2295,7 @@ impl Part {
         // bytes are in the inbox for the whole step.
         unsafe {
             let buffers = step_plan.plan.on_device(base);
+            self.prepare_mixed(stream, rows)?;
             self.product(stream, &a.q, m, qg, rows)?;
             self.product(stream, &a.k, m, k_raw, rows)?;
             self.product(stream, &a.v, m, v, rows)?;
@@ -2313,7 +2410,15 @@ impl Part {
                 1.0 / (geo.head_dim as f32).sqrt(),
             )?;
             self.mark(stream, Phase::Attention)?;
-            self.kernels.quantize_activations(stream, o, self.at(s.act), hq, rows)?;
+            if Self::is_wide(rows) {
+                let (form, to) = match self.wide_f16(rows) {
+                    true => (ActivationForm::F16, s.out_f16),
+                    false => (ActivationForm::Int8, s.act),
+                };
+                self.kernels.prepare_activations(stream, form, o, self.at(to), hq, rows)?;
+            } else {
+                self.kernels.quantize_activations(stream, o, self.at(s.act), hq, rows)?;
+            }
             self.product(stream, &a.out, self.at(s.act), self.at(s.p), rows)?;
         }
         self.plan = Some(step_plan);
@@ -2323,6 +2428,9 @@ impl Part {
     fn moe(&mut self, env: &StepEnv<'_>, i: usize, w: &MoeW) -> Result<(), ModelError> {
         let stream = env.stream;
         let rows = env.record.dims().n_rows;
+        if Self::is_wide(rows) {
+            return self.moe_wide(env, i, w);
+        }
         let s = self.f.s;
         let at = self.expert_at[i];
         let m = self.acts.ptr().offset(i as u64 * self.f.act_stride);
@@ -2447,13 +2555,24 @@ impl Part {
         unsafe {
             self.product(stream, &shared.gate, m, self.at(s.sg), rows)?;
             self.product(stream, &shared.up, m, self.at(s.su), rows)?;
-            self.layers.swiglu_quant(
-                stream,
-                self.at(s.sg),
-                self.at(s.su),
-                self.at(s.act),
-                rows * shared.gate.n_out,
-            )?;
+            if self.wide_f16(rows) {
+                self.layers.swiglu_f16(
+                    stream,
+                    self.at(s.sg),
+                    self.at(s.su),
+                    self.at(s.out_f16),
+                    rows,
+                    shared.gate.n_out,
+                )?;
+            } else {
+                self.layers.swiglu_quant(
+                    stream,
+                    self.at(s.sg),
+                    self.at(s.su),
+                    self.at(s.act),
+                    rows * shared.gate.n_out,
+                )?;
+            }
             self.product(stream, &shared.down, self.at(s.act), self.at(s.ysh), rows)?;
         }
         Ok(())

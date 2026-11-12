@@ -543,6 +543,85 @@ impl ExpertKernels {
         unsafe { self.group.launch(stream, [1, 1, 1], [threads, 1, 1], 0, args) }
     }
 
+    /// The router's logits for any number of rows, from activations in the layout of
+    /// [`Kernels::quantize_activations`](crate::Kernels::quantize_activations) for `n_rows`
+    /// rows (what the fused kernels that quantize write). The float router multiplies the f32
+    /// section of the buffer, in launches of [`MAX_BATCH`] rows that each read the router
+    /// matrix once. `logits[b][e]` is as [`ExpertKernels::logits`] gives it.
+    ///
+    /// # Safety
+    ///
+    /// Those of [`ExpertKernels::logits`], with `act` the layout of `n_rows` rows and `logits`
+    /// [`ExpertShape::logits_bytes`] of `n_rows`.
+    pub unsafe fn logits_rows(
+        &self,
+        stream: &Stream,
+        shape: &ExpertShape,
+        router: DevicePtr,
+        act: DevicePtr,
+        logits: DevicePtr,
+        n_rows: u32,
+    ) -> Result<()> {
+        shape.check()?;
+        let row_bytes = 4 * u64::from(shape.n_embd);
+        if n_rows == 0 || u64::from(n_rows) * u64::from(shape.n_embd) >= 1 << 32 {
+            return Err(invalid(
+                "expert kernels",
+                format!("{n_rows} rows of {} values", shape.n_embd),
+            ));
+        }
+        let f32_at = |rows: u32| {
+            crate::Kernels::quantized_activation_bytes(shape.n_embd, rows)
+                - row_bytes * u64::from(rows)
+        };
+        let mut first = 0;
+        while first < n_rows {
+            let rows = (n_rows - first).min(MAX_BATCH);
+            // A launch of `rows` rows finds its f32 values `f32_at(rows)` bytes behind its
+            // pointer. Those are the chunk's own rows, which lie in the caller's buffer, so
+            // the pointer is inside it too.
+            let chunk = act.offset(f32_at(n_rows) + row_bytes * u64::from(first) - f32_at(rows));
+            let out = logits.offset(4 * u64::from(first) * u64::from(shape.n_experts));
+            // SAFETY: the chunk's rows are inside the caller's buffers.
+            unsafe { self.logits(stream, shape, router, chunk, out, rows)? };
+            first += rows;
+        }
+        Ok(())
+    }
+
+    /// Picks the experts of any number of rows from their logits: each row's `top_k` experts
+    /// with the largest probability (equal values: the lower index first) and their
+    /// renormalised weights go into `record`, in the form the many-row kernels read
+    /// ([`ExpertRowKernels::plan_rows`]): a header of 16 bytes, `n_rows * top_k` ids
+    /// (`u32`), then as many weights (`f32`). The header and the groups of the decode kernels
+    /// are not written. `logits` is overwritten.
+    ///
+    /// # Safety
+    ///
+    /// `logits` must address `n_rows` rows of `n_experts` f32 and `record`
+    /// `16 + 8 * n_rows * top_k` bytes, 4-byte aligned, on the stream's device, overlapping
+    /// neither, alive until the launch has run.
+    pub unsafe fn pick_rows(
+        &self,
+        stream: &Stream,
+        shape: &ExpertShape,
+        logits: DevicePtr,
+        record: DevicePtr,
+        n_rows: u32,
+    ) -> Result<()> {
+        shape.check()?;
+        if n_rows == 0 {
+            return Err(invalid("expert kernels", "a pick of no rows".into()));
+        }
+        check_align("router logits", logits, 4)?;
+        check_align("route record", record, 4)?;
+        let args =
+            Args::new().ptr(logits).ptr(record).u32(shape.n_experts).u32(shape.top_k).u32(n_rows);
+        let threads = shape.n_experts.next_multiple_of(32);
+        // SAFETY: the argument list matches ares_expert_pick.
+        unsafe { self.pick.launch(stream, [n_rows, 1, 1], [threads, 1, 1], 0, args) }
+    }
+
     /// Computes the experts a route record names for the rows it was routed
     /// from and adds, for every row, the sum of its experts' outputs times
     /// their weights to the row's `n_embd` values at `out`.

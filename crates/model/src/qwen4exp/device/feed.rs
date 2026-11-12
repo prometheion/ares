@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ares_core::Ledger;
-use ares_cuda::{Device, ExpertShape, RouteGroup, RouteRecord};
+use ares_cuda::{Device, ExpertShape, MAX_BATCH, RouteGroup, RouteRecord};
 use ares_gguf::Gguf;
 use ares_io::{ExpertMap, Reader};
 use ares_runtime::expert_store::cpu::{CpuPool, Placement as CpuPlacement, Topology};
@@ -19,6 +19,7 @@ use ares_runtime::expert_store::{CudaSlots, ExpertStore, HostRegion, LayerSpec, 
 
 use super::Error;
 use super::board::Board;
+use super::misses::WideStats;
 use super::part::ExpertAt;
 use super::placement::Placement;
 use super::session::Fill;
@@ -195,6 +196,8 @@ pub(super) struct Feed {
     /// handed to the store.
     followed: Vec<usize>,
     groups: Vec<RouteGroup>,
+    /// What the wide steps found and waited for, since the counters were read.
+    wide: WideStats,
 }
 
 impl Feed {
@@ -214,7 +217,13 @@ impl Feed {
             used,
             rows: 0,
             groups: Vec::new(),
+            wide: WideStats::default(),
         }
+    }
+
+    /// The board of part `index`.
+    pub(super) fn board(&self, index: usize) -> Arc<Board> {
+        self.boards[index].clone()
     }
 
     pub(super) fn layout(&self) -> &Layout {
@@ -288,6 +297,11 @@ impl Feed {
     /// the order of its layers, of the first `enqueued[part]` layers, and lets
     /// the store work. Never waits.
     pub(super) fn pump(&mut self, enqueued: &[usize]) -> Result<(), Error> {
+        if self.rows > MAX_BATCH {
+            // The layers of a wide step are followed by `Misses`.
+            self.store.poll()?;
+            return Ok(());
+        }
         for (index, board) in self.boards.iter().enumerate() {
             while self.followed[index] < enqueued[index] {
                 let i = self.followed[index];
@@ -313,6 +327,18 @@ impl Feed {
         }
         self.store.poll()?;
         Ok(())
+    }
+
+    /// Layers of part `index` up to `followed` have been handled by [`Misses`], which found
+    /// `stats`.
+    pub(super) fn layer_done(&mut self, index: usize, followed: usize, stats: &WideStats) {
+        self.followed[index] = followed;
+        self.wide.add(stats);
+    }
+
+    /// What wide steps found and waited for since the last call.
+    pub(super) fn take_wide(&mut self) -> WideStats {
+        std::mem::take(&mut self.wide)
     }
 
     /// Whether every route record of the `enqueued` layers is with the store.
