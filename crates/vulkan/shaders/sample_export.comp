@@ -1,0 +1,36 @@
+#version 450
+#include "sample_common.glsl"
+
+// Grid (bins / 256, rows), 256 invocations. Moves the histogram of a level into `exchange` as
+// four f32 values per bin (the count and the weight in limbs of 20 bits: sums of up to 16
+// devices stay exact) and clears the histogram for the next level.
+layout(local_size_x = 256) in;
+
+layout(push_constant, std430) uniform Push {
+    uint64_t hist;
+    uint64_t exchange;
+    uint64_t params;
+    uint descent;
+} pc;
+
+void main() {
+    const uint r = gl_WorkGroupID.y;
+    const uint need = F_SAMPLE | (pc.descent == DESCENT_TOP_K ? F_TOP_K : F_TOP_P);
+    if ((params_of(pc.params, r).flags & need) != need) {
+        return;
+    }
+    const uint64_t at = (uint64_t(r) * BINS + gl_WorkGroupID.x * THREADS + gl_LocalInvocationID.x) * BIN_WORDS;
+    const uint64_t h = pc.hist + 4ul * at;
+    const uint c = LWord(h).v[0];
+    const uint64_t w = uint64_t(LWord(h + 4ul).v[0]) + (uint64_t(LWord(h + 8ul).v[0]) << 14)
+        + (uint64_t(LWord(h + 12ul).v[0]) << 28);
+    const uint64_t e = pc.exchange + 4ul * at;
+    FloatRef(e).v[0] = float(c);
+    FloatRef(e + 4ul).v[0] = float(uint(w & 0xffffful));
+    FloatRef(e + 8ul).v[0] = float(uint((w >> 20) & 0xffffful));
+    FloatRef(e + 12ul).v[0] = float(uint(w >> 40));
+    LWord(h).v[0] = 0u;
+    LWord(h + 4ul).v[0] = 0u;
+    LWord(h + 8ul).v[0] = 0u;
+    LWord(h + 12ul).v[0] = 0u;
+}

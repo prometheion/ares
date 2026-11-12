@@ -1,0 +1,48 @@
+#version 450
+#include "sample_common.glsl"
+
+// Grid (rows), 32 invocations: merges the lists of all devices after the sum.
+layout(local_size_x = 32) in;
+
+layout(push_constant, std430) uniform Push {
+    uint64_t exchange;
+    uint64_t params;
+    uint64_t state;
+    uint64_t out_;
+    uint devices;
+} pc;
+
+shared uint64_t merged[CANDIDATES];
+#include "sample_take_best.glsl"
+
+void main() {
+    if (gl_LocalInvocationID.x != 0u) {
+        return;
+    }
+    const uint r = gl_WorkGroupID.x;
+    const uint64_t slots = pc.exchange + 4ul * uint64_t(r) * pc.devices * TOP_VALUES;
+    uint64_t best[CANDIDATES];
+    [[unroll]] for (uint c = 0u; c < CANDIDATES; ++c) {
+        best[c] = 0ul;
+    }
+    uint bad = 0u;
+    for (uint d = 0u; d < pc.devices; ++d) {
+        const uint64_t slot = slots + 4ul * d * TOP_VALUES;
+        bad |= ldf(slot + 8ul * CANDIDATES) != 0.0 ? 1u : 0u;
+        for (uint c = 0u; c < CANDIDATES; ++c) {
+            const float token = ldf(slot + 8ul * c + 4ul);
+            if (!(token >= 0.0)) {
+                continue;
+            }
+            uint64_t v = pack_pick(ldf(slot + 8ul * c), uint(token));
+            [[unroll]] for (uint j = 0u; j < CANDIDATES; ++j) {
+                if (v > best[j]) {
+                    const uint64_t t = best[j];
+                    best[j] = v;
+                    v = t;
+                }
+            }
+        }
+    }
+    join_row(best, bad, params_of(pc.params, r), state_of(pc.state, r), out_of(pc.out_, r));
+}

@@ -1,0 +1,73 @@
+#version 450
+#include "sample_common.glsl"
+
+// Grid (rows), 256 invocations, `chunks` at most that many. With one device the row is finished
+// here; with several, this device's list goes into its slot of `exchange` (TOP_VALUES values
+// per device and row) and zeros into the other slots, for the sum across devices.
+layout(local_size_x = 256) in;
+
+layout(push_constant, std430) uniform Push {
+    uint64_t lists;
+    uint64_t exchange;
+    uint64_t params;
+    uint64_t state;
+    uint64_t out_;
+    uint chunks;
+    uint devices;
+    uint rank;
+} pc;
+
+shared uint64_t merged[CANDIDATES];
+shared uint bad_any;
+
+#include "sample_take_best.glsl"
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint r = gl_WorkGroupID.x;
+    if (tid == 0u) {
+        bad_any = 0u;
+    }
+    barrier();
+    uint64_t mine[CANDIDATES];
+    [[unroll]] for (uint j = 0u; j < CANDIDATES; ++j) {
+        mine[j] = 0ul;
+    }
+    uint n_mine = 0u;
+    if (tid < pc.chunks) {
+        const uint64_t list = pc.lists + 8ul * (uint64_t(r) * pc.chunks + tid) * LIST;
+        [[unroll]] for (uint c = 0u; c < CANDIDATES; ++c) {
+            mine[c] = U64Ref(list + 8ul * c).v[0];
+            n_mine += mine[c] != 0ul ? 1u : 0u;
+        }
+        if (U64Ref(list + 8ul * CANDIDATES).v[0] != 0ul) {
+            bad_any = 1u;
+        }
+    }
+    take_best(mine, n_mine);
+    if (tid != 0u) {
+        return;
+    }
+    if (pc.devices == 1u) {
+        uint64_t best[CANDIDATES];
+        [[unroll]] for (uint c = 0u; c < CANDIDATES; ++c) {
+            best[c] = merged[c];
+        }
+        join_row(best, bad_any, params_of(pc.params, r), state_of(pc.state, r), out_of(pc.out_, r));
+        return;
+    }
+    const uint64_t slots = pc.exchange + 4ul * uint64_t(r) * pc.devices * TOP_VALUES;
+    for (uint d = 0u; d < pc.devices; ++d) {
+        const uint64_t slot = slots + 4ul * d * TOP_VALUES;
+        for (uint c = 0u; c < CANDIDATES; ++c) {
+            const bool have = d == pc.rank && merged[c] != 0ul;
+            // A token as a float is exact below 2^24; -1 marks "none". The other devices'
+            // slots hold zeros, so the sum leaves this one.
+            FloatRef(slot + 8ul * c).v[0] = have ? unsortable(uint(merged[c] >> 32)) : 0.0;
+            FloatRef(slot + 8ul * c + 4ul).v[0] =
+                d != pc.rank ? 0.0 : (have ? float(0xffffffffu - uint(merged[c])) : -1.0);
+        }
+        FloatRef(slot + 8ul * CANDIDATES).v[0] = d == pc.rank ? float(bad_any) : 0.0;
+        FloatRef(slot + 8ul * CANDIDATES + 4ul).v[0] = 0.0;
+    }
+}

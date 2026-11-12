@@ -91,6 +91,7 @@ mod memory;
 mod mesh;
 mod module;
 mod prefill;
+mod sampler;
 mod stream;
 mod timeline;
 mod transfer;
@@ -118,5 +119,9 @@ pub use memory::{DeviceBuffer, DevicePtr, HostPages, ShareKind, SharedMemory, St
 pub use mesh::{Lane, MAX_DEVICES, Mesh, PUSH_MAX_VALUES, Parcel, Route, device_groups};
 pub use module::{Args, Function, MAX_ARGS, Module};
 pub use prefill::{Precision, PrefillPath};
+pub use sampler::{
+    SAMPLE_CANDIDATES, SAMPLE_MAX_VOCAB, SAMPLE_STATUS_EMPTY, SAMPLE_STATUS_NONFINITE, SampleBatch,
+    SampleCut, SampleParams, SamplePick, SamplePlan, SampleRow, SampleStep, SamplerKernels,
+};
 pub use stream::{DEFAULT_BATCH, Event, MAX_IN_FLIGHT, Stream};
 pub use timeline::SharedTimeline;

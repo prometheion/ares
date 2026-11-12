@@ -1,0 +1,25 @@
+#version 450
+#include "sample_common.glsl"
+
+// Grid (n_segs) of a commit record: the hidden state of the last accepted row of each window
+// becomes row 0 of its sequence's carry.
+layout(local_size_x = 256) in;
+
+layout(push_constant, std430) uniform Push {
+    uint64_t commit;
+    uint64_t carry;
+    uint carry_rows;
+    uint d;
+} pc;
+
+void main() {
+    const Seg seg = step_seg(pc.commit, gl_WorkGroupID.x);
+    if ((seg.flags & SEG_DIRECT) != 0u || seg.accepted < 2u || seg.accepted > pc.carry_rows) {
+        return;
+    }
+    const uint64_t base = pc.carry + 4ul * uint64_t(seg.slot) * pc.carry_rows * pc.d;
+    const uint64_t from = base + 4ul * uint64_t(seg.accepted - 1u) * pc.d;
+    for (uint j = gl_LocalInvocationID.x; j < pc.d; j += 256u) {
+        FloatRef(base + 4ul * j).v[0] = ldf(from + 4ul * j);
+    }
+}
