@@ -1123,37 +1123,172 @@ reply that ends at its token limit inside a character reports the tokens of the
 half character with the last delivery, so that it reports as many tokens as it
 has (one that a stop string cuts does not report the tokens of the string).
 
-**Cost.** The time of the sampler's kernels for one step with 248 320 logits, from
-the launch to the end of the stream, in microseconds (medians of 40 runs, the
-first number for 1 row, then 4 and 16; `the_time_of_a_pick` in
-`crates/cuda/tests/sampler.rs` prints them). The first three lines were also
-measured on the sampler before this piece, in the same minutes and with the
-same load; the others have no earlier figure. Corrections are 64 entries a
-row, a mask allows a third of the tokens, probabilities are the five best.
+**Cost.** The time of the sampler's kernels for one step with 248 320 logits a
+row, from the launch to the end of the stream, in microseconds: the median of
+40 picks, for 1 / 4 / 16 rows. `vk_sampler_bench` (an example of `ares-vulkan`)
+runs both backends on the same card with the same rows and the same method;
+`the_time_of_a_pick` in `crates/cuda/tests/sampler.rs` prints CUDA's alone.
+Corrections are 64 entries a row, a mask allows a third of the tokens,
+probabilities are the five best. Measured on 2026-11-12, each backend alone on
+one card: three runs of the benchmark with CUDA's kernels as they were
+(commit 6c27759) and three with the kernels described below, in pairs back to
+back, while other work compiled and other processes used the cards between
+the runs (load average 4 to 10). A figure is the median of its runs (six
+for Vulkan, whose sampler is the same in all); the run furthest from it was
+35 percent away for Vulkan, 31 for CUDA before and 30 for CUDA now.
 
-| Row asks for | RTX 4070 before | RTX 4070 now | RTX 3060 before | RTX 3060 now |
+RTX 4070:
+
+| Row asks for | Vulkan | CUDA before | CUDA now | now / Vulkan |
 | --- | --- | --- | --- | --- |
-| most probable token | 38 / 81 / 241 | 40 / 82 / 245 | 56 / 138 / 386 | 58 / 140 / 391 |
-| top-k 20, top-p 0.95 | 124 / 211 / 556 | 125 / 201 / 546 | 156 / 384 / 1138 | 155 / 380 / 1133 |
-| top-p 0.95 | 88 / 158 / 442 | 90 / 156 / 448 | 130 / 276 / 832 | 130 / 294 / 876 |
-| most probable token, penalties | | 40 / 84 / 240 | | 58 / 142 / 390 |
-| most probable token, a mask | | 42 / 86 / 260 | | 64 / 160 / 452 |
-| top-k, top-p, penalties and a mask | | 124 / 202 / 541 | | 163 / 406 / 1190 |
-| most probable token, probabilities | | 94 / 209 / 624 | | 146 / 417 / 1232 |
-| top-k, top-p, probabilities after the chain | | 142 / 233 / 610 | | 211 / 481 / 1405 |
-| top-n-sigma, typical, top-k, top-p | | 172 / 275 / 700 | | 244 / 581 / 1732 |
+| most probable token | 32 / 49 / 128 | 36 / 76 / 244 | 23 / 29 / 57 | 0.71 / 0.59 / 0.45 |
+| top-k 20, top-p 0.95 | 139 / 196 / 535 | 123 / 203 / 545 | 98 / 127 / 228 | 0.71 / 0.65 / 0.43 |
+| top-p 0.95 | 93 / 138 / 394 | 84 / 148 / 431 | 72 / 107 / 251 | 0.77 / 0.77 / 0.64 |
+| most probable token, penalties | 36 / 50 / 111 | 41 / 82 / 245 | 27 / 32 / 57 | 0.76 / 0.65 / 0.51 |
+| most probable token, a mask | 37 / 56 / 150 | 44 / 91 / 266 | 30 / 39 / 75 | 0.81 / 0.70 / 0.50 |
+| top-k, top-p, penalties and a mask | 145 / 200 / 498 | 129 / 207 / 553 | 105 / 137 / 258 | 0.72 / 0.68 / 0.52 |
+| most probable token, probabilities | 95 / 171 / 520 | 103 / 225 / 682 | 60 / 92 / 209 | 0.63 / 0.54 / 0.40 |
+| top-k, top-p, probabilities after the chain | 180 / 262 / 692 | 163 / 260 / 691 | 123 / 160 / 292 | 0.68 / 0.61 / 0.42 |
+| top-n-sigma, typical, top-k, top-p | 228 / 342 / 865 | 192 / 304 / 799 | 175 / 239 / 484 | 0.77 / 0.70 / 0.56 |
 
-A request that asks for nothing of the new features costs what it did: the
-most probable token is 1 to 5 percent slower than before (2 microseconds for
-one row, the size of the noise of the measurement), top-k with top-p is the
-same or faster, and top-p alone is 5 to 7 percent slower on the RTX 3060 for 4
-and 16 rows (not isolated; the histogram kernel does more for each token than
-the old one, a test of the set it works on and the scaling by the temperature
-that a chain with a temperature before the cut needs). Penalties are free. A mask costs 6 percent on the RTX 4070 and up to 16 percent on the
-RTX 3060 for the most probable token. Probabilities of the model's own
-distribution add a pass over the logits: 54 microseconds for one row and 380
-for 16 on the RTX 4070 (88 and 840 on the RTX 3060). Top-n-sigma and typical
-together add 47 microseconds for one row and 154 for 16 on the RTX 4070.
+RTX 3060:
+
+| Row asks for | Vulkan | CUDA before | CUDA now | now / Vulkan |
+| --- | --- | --- | --- | --- |
+| most probable token | 80 / 110 / 240 | 70 / 151 / 411 | 42 / 77 / 119 | 0.52 / 0.70 / 0.50 |
+| top-k 20, top-p 0.95 | 240 / 459 / 1154 | 170 / 407 / 1169 | 137 / 243 / 602 | 0.57 / 0.53 / 0.52 |
+| top-p 0.95 | 184 / 316 / 842 | 132 / 290 / 897 | 107 / 201 / 543 | 0.58 / 0.64 / 0.64 |
+| most probable token, penalties | 70 / 108 / 223 | 64 / 145 / 409 | 37 / 63 / 110 | 0.53 / 0.59 / 0.49 |
+| most probable token, a mask | 87 / 127 / 318 | 76 / 170 / 483 | 48 / 90 / 186 | 0.55 / 0.71 / 0.59 |
+| top-k, top-p, penalties and a mask | 209 / 420 / 1165 | 167 / 422 / 1217 | 141 / 269 / 676 | 0.67 / 0.64 / 0.58 |
+| most probable token, probabilities | 178 / 366 / 978 | 156 / 448 / 1267 | 97 / 183 / 451 | 0.54 / 0.50 / 0.46 |
+| top-k, top-p, probabilities after the chain | 286 / 554 / 1505 | 215 / 508 / 1437 | 160 / 320 / 745 | 0.56 / 0.58 / 0.50 |
+| top-n-sigma, typical, top-k, top-p | 346 / 692 / 1894 | 252 / 613 / 1772 | 227 / 478 / 1178 | 0.66 / 0.69 / 0.62 |
+
+*Why CUDA's kernels were the slower ones.* The two backends ran the same
+algorithm, statement for statement, and Vulkan's was up to 2.2 times faster
+where a step picks for several rows (the table: 111 against 245 microseconds
+for the most probable token of 16 rows with penalties on the RTX 4070). The
+device time of each part of a pick (`sampler_steps`, an example of
+`ares-cuda`, records an event on the stream after every part) showed where it
+went: of the 244 microseconds of the most probable token of 16 rows on the RTX
+4070, 225 were the kernel that finds the best eight logits of each chunk of
+4096, sixteen times what reading the rows takes (a kernel that only reads the
+16 rows and takes one maximum per chunk needs 14 microseconds, 51 on the RTX
+3060). It was instructions and barriers, not memory: every thread kept a
+sorted list of its best eight among 16 logits, which the CUDA compiler puts
+into the thread's local memory, and the block took its best eight in eight
+rounds of a reduction over all threads, 17 barriers and 160 shuffles a thread.
+The kernel with twenty candidates (the probabilities) took 281 microseconds
+the same way. The levels of a radix descent came next: each built a histogram
+of 1024 or 2048 bins in shared memory in every chunk, cleared before and added
+to the row's after, 38 microseconds a level for 16 rows however few tokens the
+level had. What the Vulkan compiler makes of the same statements is faster;
+where exactly was not looked for, because both did work that is not needed.
+
+*What CUDA's kernels do now*, for the same records bit for bit:
+
+- **The best of a chunk.** A thread reads its 16 logits into registers and
+  finds its own best. The threads with the same lane are a column; the eighth
+  best of the 32 columns' bests (the twentieth, for the probabilities) is a
+  bar that at least eight logits reach, so the best eight of the chunk do.
+  Few threads have a best that reaches the bar; each counts how many of them
+  have a better one, and the at most eight with fewer than eight above them
+  put their logits that reach the bar on one list, where every entry finds
+  its place by counting the entries above it. Four barriers, no list per
+  thread. The kernel alone, 16 rows: 225 to 39 microseconds on the RTX 4070
+  and 354 to 86 on the RTX 3060; with twenty candidates 281 to 40 and 591 to
+  97. Rows made to be hard for it (every logit equal, descending, the best
+  tokens all in the columns of one thread) take 36 to 53 microseconds on the
+  RTX 4070, less than before in every case, and are in the tests
+  (`rows_whose_best_tokens_crowd_together_equal_the_host`).
+- **A thread's logits at once.** A kernel that passes over a row read a
+  logit, used it and read the next, so a thread waited for the memory sixteen
+  times. The top, histogram, pass and draw kernels read the thread's 16
+  logits before they use one. (The mask kernel got slower that way, 21 to 31
+  microseconds for 16 rows on the RTX 4070, and is as it was.)
+- **Histograms of few tokens.** The kernel that decides a level leaves in the
+  row's state how many tokens the bin it chose holds, which are the tokens of
+  the next level, and after the last level how many the set still has. A row
+  with at most 256 tokens for a histogram adds them to the row's histogram
+  directly, with no histogram per chunk; after top-k 20 that is every level
+  that follows. The numbers choose how a histogram is built and nothing
+  else. A descent by count (top-k, the hundredth token of mirostat 1) holds
+  no weights. The six levels of top-k 20 with top-p 0.95 for 16 rows: 254 to
+  176 microseconds with the direct histograms and 175 to 115 with the reads
+  on the RTX 4070 (two pairs of runs, each back to back), 673 to 540 and 539
+  to 390 on the RTX 3060.
+- **The sums of a pass** meet at one barrier, not ten: 28 to 17 microseconds
+  for the pass of the probabilities after the chain, 16 rows, RTX 4070.
+
+Two things that were tried made nothing faster and are not in: the running
+totals of the kernel that decides a level by shuffles in place of its 16
+barriers (35 microseconds for six of them either way), and a count of the
+level's tokens per chunk in front of every histogram (the dense histograms
+got 5 to 10 percent slower).
+
+*Where the time of a pick is now.* Device time of the parts, 16 rows, RTX 4070
+/ RTX 3060, in microseconds (`sampler_steps`, one run):
+| Part | RTX 4070 before | RTX 4070 now | RTX 3060 before | RTX 3060 now |
+| --- | --- | --- | --- | --- |
+| the best eight logits | 206 to 230 | 35 to 41 | 358 to 369 | 78 to 81 |
+| the best twenty of the model's own logits | 289 | 44 | 637 | 101 |
+| the best twenty of the set after the chain | 81 | 34 | 194 | 74 |
+| the six levels of top-k 20 with top-p 0.95 | 230 | 130 | 669 | 388 |
+| the three levels of top-p 0.95 alone | 143 | 124 | 389 | 306 |
+| deciding six levels | 35 | 42 | 55 | 72 |
+| the draw after the cuts | 17 | 16 | 61 | 55 |
+| the pass of the probabilities after the chain | 28 | 17 | 80 | 59 |
+| the pass that weighs every token | 90 | 90 | 209 | 212 |
+| a mask | 22 | 22 | 75 | 74 |
+
+A level with few tokens takes 19 to 25 microseconds on the RTX 4070 and 63 to
+71 on the RTX 3060; the first level of top-p alone, where every token has a
+weight, 69 and 140. Deciding a level is the one part that got slower: 6 to 8
+microseconds now on the RTX 4070 and 9 to 24 on the RTX 3060, where the second
+level of a descent by weight takes 24. The kernel got the count of the chosen
+bin to write and reads its bins at once; which of the two costs the time was
+not found.
+
+A kernel that passes over the rows is now within 1.3 to 3 times of reading
+them, and a pick with cuts is the number of its passes: eight for top-k with
+top-p. After the first cut the set is a few dozen tokens, and the later
+levels, passes and the draw still read every logit to find them; a list of
+the set's tokens, written when the first cut is made, would make them
+independent of the vocabulary. That is not built. For one row a pick is its
+launches: 3 microseconds each on the RTX 4070 and 5 on the RTX 3060, 22 of
+them for top-k with top-p.
+
+*In a decode step.* The 27B with its draft block and the vocabulary list on
+both cards (`qwen35_run --engine 8 --generate 300 --sample`, seven prompts,
+windows of up to 16 rows, the logits of a row split between the cards; the
+kernels before and after in runs back to back, two pairs, load average 4 to 21):
+the sampler's part of a step that picks the most probable tokens went from
+0.077 to 0.036 ms on the RTX 4070 and from 0.51 to 0.47 ms on the RTX 3060
+(the median over the prompts of the median of their steps), and a link of
+the draft chain, which ends in a pick over the vocabulary list, from 1.49 to
+1.48 ms. A step takes 31 to 41 ms by the number of links it drafts, and the
+median of a prompt's steps moves between those values from run to run; for
+the five times a prompt's steps drafted the same number of links in both
+runs of a pair it was 0.16 to 0.25 ms lower in four (40.63 to 40.38, 31.44
+to 31.28, 35.88 to 35.68, 33.77 to 33.54 ms) and 2 ms lower in the fifth, a
+jump between two of those values.
+That is 0.5 to 0.7 percent of a step, of which the sampler was 1.5 percent;
+tokens per second did not change measurably (97.8 and 98.2 on average). With
+top-k 20 and top-p 0.95 the sampler's part depends on the rows of the
+window: for the three prompts with the same links in both runs it went from
+0.61, 0.63 and 0.94 ms to 0.53, 0.53 and 0.82 ms on the RTX 4070 and from
+1.03, 1.05 and 1.37 to 0.95, 0.96 and 1.25 ms on the RTX 3060. Most of that
+part is not the kernels, which take 0.23 ms for 16 rows of the whole
+vocabulary on one card: between the parts of a pick the two cards add up
+their partial results, 8192 values a row for every level of a descent. What
+that exchange costs was not taken apart here.
+
+A request that sets nothing pays for the best eight logits of its row and
+nothing else. Penalties cost a launch. A mask is a pass that writes (22
+microseconds for 16 rows on the RTX 4070, 74 on the RTX 3060). The model's own
+probabilities add the best twenty and a pass that weighs every token (44 and
+90 microseconds for 16 rows on the RTX 4070, 101 and 212 on the RTX 3060).
 
 **Requests.** The server reads the fields under the names of the OpenAI API and
 of llama.cpp's server: `temperature`, `top_k`, `top_p`, `min_p`, `typical_p`
