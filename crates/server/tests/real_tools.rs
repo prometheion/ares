@@ -3,8 +3,9 @@
 //! and a named function come back as valid calls, `auto` calls when the
 //! question needs the tool and the reply is the same streamed, a history with
 //! calls and results is answered, a call the model opens inside its thinking
-//! is a call, and the reply with drafts is the reply without. Lines that start
-//! with `RES` say what the models did.
+//! is a call, and the reply with drafts is the reply without, also where the
+//! 27B thinks before it calls and takes the drafts of its draft block. Lines
+//! that start with `RES` say what the models did.
 //!
 //! The server runs in this process over the real engine (requests go through
 //! the router without a socket). Needs `ARES_TEST_CUDA=1` and
@@ -58,6 +59,7 @@ fn large() -> Option<PathBuf> {
 struct Served {
     app: Router,
     engine: Arc<dyn Engine>,
+    runtime: Arc<Runtime>,
 }
 
 impl Served {
@@ -87,7 +89,7 @@ impl Served {
     /// The 27B over both cards with its draft block and the lookup in earlier
     /// text, with exact products so that a row computes the same in a window
     /// as alone. The context is 1024 tokens, as in `real_sampling.rs`: the
-    /// prompt with the tools and a reply that does not think fit.
+    /// prompt with the tools and the replies of the test fit.
     fn start_drafting(path: &PathBuf) -> Self {
         let options = Options {
             precision: Precision::Exact,
@@ -114,8 +116,8 @@ impl Served {
         let as_model: Arc<dyn Model> = Arc::new(model);
         let gpu = GpuConfig::new(&config, &*as_model);
         let runtime = Arc::new(Runtime::start_gpu(as_model, devices, config, gpu).unwrap());
-        let engine: Arc<dyn Engine> = runtime;
-        Self { app: ares_server::router(engine.clone()), engine }
+        let engine: Arc<dyn Engine> = runtime.clone();
+        Self { app: ares_server::router(engine.clone()), engine, runtime }
     }
 
     async fn post(&self, body: &Value) -> (u16, String) {
@@ -131,13 +133,33 @@ impl Served {
 
     /// The reply to a request that is to succeed.
     async fn ask(&self, body: &Value) -> Reply {
+        self.ask_timed(body).await.0
+    }
+
+    /// The drafts of the model's own draft block that the engine has verified
+    /// and accepted so far, and those of the lookup in earlier text.
+    fn drafts(&self) -> [(u64, u64); 2] {
+        let counters = self.runtime.snapshot().expect("the conductor answers").counters;
+        [1, 0].map(|source| {
+            let verified: u64 = counters.draft_lengths[source]
+                .iter()
+                .enumerate()
+                .map(|(drafts, windows)| drafts as u64 * windows)
+                .sum();
+            (verified, counters.drafts_accepted_at[source].iter().sum())
+        })
+    }
+
+    /// The reply to a request that is to succeed, and the timings the server
+    /// reports with it.
+    async fn ask_timed(&self, body: &Value) -> (Reply, Value) {
         let (status, text) = self.post(body).await;
         assert_eq!(status, 200, "{text}");
         let answer: Value = serde_json::from_str(&text).unwrap();
         let choice = &answer["choices"][0];
         let message = &choice["message"];
         let calls = message["tool_calls"].as_array().cloned().unwrap_or_default();
-        Reply {
+        let reply = Reply {
             content: message["content"].as_str().unwrap().to_owned(),
             reasoning: message["reasoning_content"].as_str().unwrap_or_default().to_owned(),
             calls: calls
@@ -152,7 +174,8 @@ impl Served {
                 .collect(),
             finish: choice["finish_reason"].as_str().unwrap().to_owned(),
             hash: answer["timings"]["token_hash"].as_str().unwrap_or_default().to_owned(),
-        }
+        };
+        (reply, answer["timings"].clone())
     }
 
     /// The same request streamed, with the deltas put together.
@@ -392,13 +415,48 @@ async fn a_call_the_limit_cuts_ends_with_length_and_no_markup() {
     }
 }
 
+/// The tools of the test of a call inside the thinking: no argument of them
+/// is free text. The text of a string may be anything up to its closing tag,
+/// the marker of a call included, and the bias that test puts on the marker
+/// would write the marker there.
+fn tools_without_text() -> Value {
+    json!([
+        {"type": "function", "function": {
+            "name": "get_weather",
+            "description": "Get the weather forecast for a city.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "city": {"type": "string", "enum": ["Paris", "Rome", "Berlin"]},
+                    "days": {"type": "integer", "minimum": 1, "maximum": 7},
+                },
+                "required": ["city", "days"],
+            },
+        }},
+        {"type": "function", "function": {
+            "name": "get_time",
+            "description": "Get the current time.",
+            "parameters": {"type": "object", "properties": {}},
+        }},
+    ])
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_call_the_model_opens_inside_its_thinking_is_a_call() {
     let Some(path) = small() else { return };
     let served = Served::start(&path);
     // The model thinks, and the tag that closes its thinking is banned: a
-    // call it wants to make it has to open inside the thinking. The tag and
-    // the marker are the template's.
+    // call it makes it has to open inside the thinking. The tag and the
+    // marker are the template's.
+    //
+    // Whether a model does that is the model's business: the 0.8B under the
+    // ban alone thinks on to any limit and never writes the marker. So the
+    // marker's token gets a bias, the least of a ladder with which the reply
+    // has a call. With the first steps the model thinks before it calls; the
+    // last is more than any logit is apart from another, and the marker is
+    // the first token of such a reply whatever the model would have written.
+    // One call is allowed, because the bias would open another after every
+    // call.
     let format = served.engine.chat_format("q").expect("a chat format");
     let close = format.thinking.expect("the model thinks").end_tag().to_owned();
     let marker = format.tools.expect("a format for calls").trigger().to_owned();
@@ -406,25 +464,50 @@ async fn a_call_the_model_opens_inside_its_thinking_is_a_call() {
     let options = ares_tokenizer::EncodeOptions { add_special: false, parse_special: true };
     let closing = tokenizer.encode(&close, options);
     assert_eq!(closing.len(), 1, "{close} is {closing:?}");
-    let pinned = |extra: Value| {
+    let opening = tokenizer.encode(&marker, options);
+    assert_eq!(opening.len(), 1, "{marker} is {opening:?}");
+    let pinned = |extra: Value, bias: Option<f64>| {
         let mut body = request(WEATHER, extra);
+        body["tools"] = tools_without_text();
+        body["parallel_tool_calls"] = json!(false);
         body["chat_template_kwargs"] = json!({"enable_thinking": true});
-        body["logit_bias"] = json!([[closing[0], false]]);
-        body["max_tokens"] = json!(1500);
+        body["logit_bias"] = match bias {
+            Some(bias) => json!([[closing[0], false], [opening[0], bias]]),
+            None => json!([[closing[0], false]]),
+        };
+        body["max_tokens"] = json!(300);
         body
     };
+    const LADDER: [f64; 10] = [2.0, 4.0, 6.0, 8.0, 10.0, 12.0, 16.0, 20.0, 28.0, 1000.0];
 
     let named = json!({"type": "function", "function": {"name": "get_weather"}});
+    let mut thought = 0;
     for (what, extra) in [
         ("required", json!({"tool_choice": "required"})),
-        ("named", json!({"tool_choice": named, "parallel_tool_calls": false})),
+        ("named", json!({"tool_choice": named})),
         ("required, sampled", json!({"tool_choice": "required", "temperature": 0.8, "seed": 3})),
         ("auto", json!({})),
     ] {
-        let body = pinned(extra);
-        let reply = served.ask(&body).await;
-        println!("RES in the thinking, {what}: {reply:?}");
-        check(&reply);
+        let mut found = None;
+        for bias in LADDER {
+            let body = pinned(extra.clone(), Some(bias));
+            let reply = served.ask(&body).await;
+            println!("RES in the thinking, {what}, a bias of {bias} on the marker: {reply:?}");
+            assert_eq!(reply.content, "", "{what}: {reply:?}");
+            assert!(!reply.reasoning.contains(&marker), "{what}: the marker in the reasoning");
+            if reply.finish != "tool_calls" {
+                // The model thought to the limit (or into a call that the
+                // limit cut), or, with auto, which may, ended its reply
+                // thinking.
+                let ended = what == "auto" && reply.finish == "stop" && reply.calls.is_empty();
+                assert!(reply.finish == "length" || ended, "{what}: {reply:?}");
+                continue;
+            }
+            check(&reply);
+            found = Some((body, reply));
+            break;
+        }
+        let (body, reply) = found.expect("the marker comes with the last bias of the ladder");
         // The same reply raw shows that the model never left its thinking:
         // the content is the thinking from the tag the prompt ended with on,
         // and has no closing tag (which the model could still spell out
@@ -439,25 +522,16 @@ async fn a_call_the_model_opens_inside_its_thinking_is_a_call() {
             "{what}: the model spelled the banned tag out, so no call was inside the thinking"
         );
         assert_eq!(raw.calls, reply.calls, "{what}: the raw reply has the same calls");
-        // Nothing of the marker in the text, and no answer.
-        assert!(!reply.reasoning.contains(&marker), "{what}: the marker in the reasoning");
+        // Nothing of the marker in the text, and no answer: the reasoning up
+        // to the marker and the call after it are the whole reply.
         assert!(!raw.content.contains(&marker), "{what}: the marker in the content");
-        assert_eq!(reply.content, "", "{what}");
-        if what == "auto" {
-            // Left to itself the model calls, or ends its reply thinking.
-            let expected = if reply.calls.is_empty() { "stop" } else { "tool_calls" };
-            assert!(reply.finish == expected || reply.finish == "length", "{reply:?}");
-        } else {
-            // A reply that must call cannot end while it thinks: the call
-            // inside the thinking is the only way on.
-            assert_eq!(reply.finish, "tool_calls", "{what}: {reply:?}");
-            assert!(!reply.calls.is_empty(), "{what}");
-            assert!(!reply.reasoning.is_empty(), "{what}: the reasoning comes back");
-        }
+        assert_eq!(raw.content.trim_end(), format!("<think>\n{}", reply.reasoning).trim_end());
+        assert_eq!(reply.finish, "tool_calls", "{what}: {reply:?}");
+        assert_eq!(reply.calls, [reply.calls[0].clone()], "{what}: one call");
         if what == "named" {
-            assert_eq!(reply.calls, [reply.calls[0].clone()], "one call");
             assert_eq!(reply.calls[0].0, "get_weather");
         }
+        thought += usize::from(!reply.reasoning.is_empty());
         assert_eq!(served.stream(&body).await, reply, "{what}: the stream is the whole reply");
         let mut plain = body.clone();
         plain["draft"] = json!(false);
@@ -465,11 +539,22 @@ async fn a_call_the_model_opens_inside_its_thinking_is_a_call() {
         assert_eq!(without.hash, reply.hash, "{what}: the tokens with drafts are those without");
         assert_eq!(without, reply, "{what}");
     }
+    println!("RES in the thinking: {thought} of 4 replies thought before the call");
+    assert!(thought > 0, "no reply thought before its call: the reasoning before one is not shown");
+
+    // A reply that must call cannot end while it thinks, and one that never
+    // writes the marker thinks to the limit: under the ban alone the reply is
+    // reasoning, cut, with no call and no answer.
+    let reply = served.ask(&pinned(json!({"tool_choice": "required"}), None)).await;
+    println!("RES in the thinking, required, the ban alone: {reply:?}");
+    if reply.calls.is_empty() {
+        assert_eq!(reply.finish, "length", "{reply:?}");
+        assert!(reply.content.is_empty() && !reply.reasoning.is_empty(), "{reply:?}");
+    }
 
     // With none the same model under the same ban only thinks: whatever it
     // writes is reasoning, and there is no call.
-    let mut body = pinned(json!({"tool_choice": "none"}));
-    body["max_tokens"] = json!(300);
+    let body = pinned(json!({"tool_choice": "none"}), None);
     let reply = served.ask(&body).await;
     println!("RES in the thinking, none: {reply:?}");
     assert!(reply.calls.is_empty() && reply.finish != "tool_calls", "{reply:?}");
@@ -481,16 +566,47 @@ async fn a_call_the_model_opens_inside_its_thinking_is_a_call() {
 async fn the_27b_calls_the_same_with_drafts_and_without() {
     let Some(path) = large() else { return };
     let served = Served::start_drafting(&path);
-    for (what, extra) in [("auto", json!({})), ("required", json!({"tool_choice": "required"}))] {
+    // The replies of the first two are a call from their first token: the
+    // rule binds all of them, and the drafts are the lookup's. The third
+    // thinks first, which the rule leaves free: there the request takes the
+    // drafts of the model's draft block, up to the token that makes the rule
+    // bind.
+    let thinking = json!({"chat_template_kwargs": {"enable_thinking": true}, "max_tokens": 600});
+    for (what, extra) in [
+        ("auto", json!({})),
+        ("required", json!({"tool_choice": "required"})),
+        ("auto, thinking", thinking),
+    ] {
         let body = request(WEATHER, extra);
-        let reply = served.ask(&body).await;
+        let before = served.drafts();
+        let (reply, timings) = served.ask_timed(&body).await;
+        let after = served.drafts();
         println!("RES 27B {what}: {reply:?}");
         check(&reply);
         assert!(!reply.calls.is_empty(), "{what}: the 27B does not call the tool: {reply:?}");
         assert_eq!(reply.finish, "tool_calls", "{what}");
         let mut plain = body.clone();
         plain["draft"] = json!(false);
-        let without = served.ask(&plain).await;
+        let (without, plain_timings) = served.ask_timed(&plain).await;
+        // What the engine counted for the request with drafts, and the speed
+        // the server reports for the two: one run each, and the lookup has
+        // the text of the replies before this one, so these are no benchmark.
+        let [own, lookup] = [0, 1].map(|i| (after[i].0 - before[i].0, after[i].1 - before[i].1));
+        println!(
+            "RES 27B {what}: {} tokens; of the draft block's drafts {} verified and {} accepted, \
+             of the lookup's {} and {}; {} tokens/s with drafts, {} without",
+            timings["predicted_n"],
+            own.0,
+            own.1,
+            lookup.0,
+            lookup.1,
+            timings["predicted_per_second"],
+            plain_timings["predicted_per_second"]
+        );
+        if what.contains("thinking") {
+            assert!(!reply.reasoning.is_empty(), "{what}: the 27B did not think: {reply:?}");
+            assert!(own.1 > 0, "{what}: no draft of the draft block was accepted in the thinking");
+        }
         assert_eq!(without.hash, reply.hash, "{what}: the tokens with drafts are those without");
         assert_eq!(without, reply, "{what}");
         assert_eq!(served.stream(&body).await, reply, "{what}: the stream is the whole reply");
