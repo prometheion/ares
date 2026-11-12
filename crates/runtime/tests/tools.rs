@@ -1,6 +1,7 @@
 //! Replies that call tools, through the step loop on the synthetic model with
 //! a host executor: the grammar of the calls behind the sampler's mask, from
-//! the first token or from a trigger on, with drafts and without.
+//! the first token or from a trigger on, and from a marker inside the
+//! reasoning on, with drafts and without.
 //!
 //! The synthetic model has one token for each byte, and `~` ends a reply. It
 //! has no line break among its printable bytes, so the format of the calls
@@ -11,7 +12,7 @@ mod common;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use ares_api::{Engine, FinishReason, Shape, Start, Structure, ToolFormat};
+use ares_api::{Engine, FinishReason, Interrupt, Shape, Start, Structure, ToolFormat};
 use ares_grammar::calls::{CallRule, Callable};
 use ares_runtime::testing::HostExecutor;
 use ares_runtime::{RecordView, Runtime, RuntimeConfig, Split, SyntheticConfig, SyntheticModel};
@@ -211,4 +212,55 @@ fn a_reply_is_free_until_the_trigger_and_calls_after_it_with_drafts_and_without(
         texts.push(run.text);
     }
     assert_eq!(texts[0], texts[1], "the text with drafts is the text without");
+}
+
+#[test]
+fn a_call_opened_inside_the_reasoning_is_bound_with_drafts_and_without() {
+    let model = model();
+    // The model writes an '8' at its third token: that is the marker of a
+    // call here. It thinks, and never writes the tag that closes its thinking.
+    let format = format("8");
+    for must_call in [false, true] {
+        let structure = Structure {
+            shape: calls(&format, true, !must_call),
+            start: Start::AfterReasoning { open: None, close: "</think>".into() },
+            trigger: (!must_call).then(|| format.trigger().to_owned()),
+            interrupt: Some(Interrupt {
+                text: format.trigger().to_owned(),
+                shape: calls(&format, true, true),
+            }),
+        };
+        let mut texts = Vec::new();
+        for speculation in [false, true] {
+            let rows = Arc::new(Mutex::new(Rows::default()));
+            let rt = runtime(&model, speculation, watch(&rows));
+            let mut request = request("a prompt", Some(900));
+            request.structure = Some(structure.clone());
+            let run = run_one(&rt, request);
+            assert_eq!(run.finish, FinishReason::Stop, "{run:?}");
+            let at = run.text.find('8').expect("the model wrote the marker");
+            assert!(at > 0, "reasoning comes first: {}", run.text);
+            let calls = parse(&run.text[at..], "8");
+            check(&calls);
+            assert!(!calls.is_empty(), "{}", run.text);
+            let rows = rows.lock().unwrap();
+            if must_call {
+                // The reasoning may not end the reply: its rows carry a mask.
+                assert_eq!(rows.unmasked, 0, "every wanted row carries a mask");
+            } else {
+                assert!(
+                    rows.unmasked >= at && rows.unmasked < rows.wanted,
+                    "the marker is at {at}: {} rows, {} without a mask",
+                    rows.wanted,
+                    rows.unmasked
+                );
+            }
+            if speculation {
+                let stats = rt.stats().expect("stats");
+                assert!(stats.drafts_proposed > 0, "no drafts were verified: nothing was tested");
+            }
+            texts.push(run.text);
+        }
+        assert_eq!(texts[0], texts[1], "the text with drafts is the text without");
+    }
 }

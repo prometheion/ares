@@ -288,4 +288,6 @@ pub(crate) fn call_ids(id: ares_api::RequestId) -> String {
 }
 
 #[cfg(test)]
+mod templates;
+#[cfg(test)]
 mod tests;
