@@ -126,6 +126,16 @@ impl TokenFilter for GrammarFilter {
         }
     }
 
+    fn free_rows(&mut self, reply: &[u32], tokens: &[u32]) -> usize {
+        match self.guide.free_rows(reply, tokens) {
+            Ok(rows) => rows,
+            Err(e) => {
+                self.failed(e.to_string());
+                0
+            }
+        }
+    }
+
     fn failure(&mut self) -> Option<String> {
         self.failure.clone()
     }

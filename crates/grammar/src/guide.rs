@@ -324,6 +324,40 @@ impl Guide {
         let leading = from.saturating_sub(reply.len());
         Ok((leading + taken.saturating_sub(before)).min(drafts.len()))
     }
+
+    /// How many rows of a window the structure leaves free, counted from the
+    /// first: row `k` of the window follows `reply` and the first `k` of
+    /// `tokens`, and it is free when [`mask`](Guide::mask) has no mask for it
+    /// because the grammar does not bind there (the reply is thinking, or
+    /// waits for its trigger). The count stops at the first row that is not
+    /// free, so it is at most one more than `tokens` has.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Compile`] when the engine fails to follow the grammar.
+    pub fn free_rows(&mut self, reply: &[u32], tokens: &[u32]) -> Result<usize, Error> {
+        self.see(reply)?;
+        let mut phase = self.phase.clone();
+        let mut rows = 0;
+        while self.free(&phase) {
+            let Some(&token) = tokens.get(rows) else { return Ok(rows + 1) };
+            phase = self.fold(phase, reply.len() + rows, token)?;
+            rows += 1;
+        }
+        Ok(rows)
+    }
+
+    /// Whether a reply in `phase` may go on with any token.
+    fn free(&self, phase: &Phase) -> bool {
+        match phase {
+            Phase::Reasoning(_) | Phase::Waiting(_) => true,
+            // A reply that may still open its reasoning is held to the tag or
+            // to the grammar's first tokens, unless the grammar waits for a
+            // trigger: then the answer it may turn out to be is free as well.
+            Phase::Lead(_) => !self.trigger.is_empty(),
+            Phase::Bound(_) => false,
+        }
+    }
 }
 
 /// The position of `needle` in `haystack`.

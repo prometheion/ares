@@ -52,6 +52,25 @@ pub trait TokenFilter: Send {
         drafts.len()
     }
 
+    /// How many rows of a window the rule leaves free, counted from the first
+    /// row: row `k` follows `reply` and the first `k` of `tokens`, and it is
+    /// free when the rule restricts nothing there and [`mask`] would say so.
+    /// The count stops at the first row the rule binds, so it is 0 when the
+    /// rule binds the token after `reply` and at most one more than `tokens`
+    /// has.
+    ///
+    /// This is what lets a request with a rule take the drafts the model makes
+    /// on the device, which the host does not know when it writes the masks:
+    /// such a window is verified only while its first row is free, none of
+    /// its rows carries a mask, and of what it picked the request keeps the
+    /// tokens of its free rows (see [`RequestSampler::free_rows`]). A rule
+    /// that cannot tell binds every row.
+    ///
+    /// [`mask`]: TokenFilter::mask
+    fn free_rows(&mut self, _reply: &[u32], _tokens: &[u32]) -> usize {
+        0
+    }
+
     /// Why the rule can no longer be followed, if it cannot (the engine behind
     /// it failed in the middle of the reply). The request ends with an error:
     /// text that goes on without the rule is not what was asked for.
@@ -312,12 +331,32 @@ impl RequestSampler {
         !self.params.stateful()
     }
 
-    /// Whether the drafts a window verifies may be made by the model on the
-    /// device. Those are not known when the step's record is written, so a
-    /// request whose rows depend on the drafts before them (penalties, DRY, a
-    /// filter) takes only the drafts the host makes.
-    pub fn allows_own_drafts(&self) -> bool {
-        self.allows_drafts() && !self.corrections.path_dependent() && self.filter.is_none()
+    /// Whether the drafts of the coming window may be made by the model on
+    /// the device. Those are not known when the step's record is written, so a
+    /// request whose rows are corrected for the drafts before them (penalties,
+    /// DRY) takes only the drafts the host makes. A request with a rule takes
+    /// the model's drafts while the rule is not bound: after `tokens`, the
+    /// tokens of the request so far (the prompt first), the next token is
+    /// free. Where the rule starts to bind inside such a window is found when
+    /// the picks are back ([`RequestSampler::free_rows`]).
+    pub fn allows_own_drafts(&mut self, tokens: &[u32], prompt_len: usize) -> bool {
+        self.allows_drafts()
+            && !self.corrections.path_dependent()
+            && self.free_rows(tokens, prompt_len, &[]) > 0
+    }
+
+    /// How many rows of a window that verified the model's own drafts were
+    /// rows the request's rule leaves free: row `k` follows `tokens` (the
+    /// request so far, the prompt first) and the first `k` of `accepted`, the
+    /// drafts the window's picks confirmed. Such a window has no masks, so
+    /// the pick of a row is the request's token only if the row is free; the
+    /// first row that is not ends what the window gives. Without a rule every
+    /// row is free.
+    pub fn free_rows(&mut self, tokens: &[u32], prompt_len: usize, accepted: &[u32]) -> usize {
+        match &mut self.filter {
+            Some(filter) => filter.free_rows(&tokens[prompt_len.min(tokens.len())..], accepted),
+            None => accepted.len() + 1,
+        }
     }
 
     /// Cuts from `drafts` (and from `chances`, the chance of each) the first

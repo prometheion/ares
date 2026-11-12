@@ -1412,9 +1412,11 @@ impl Conductor {
                         &mut a.lookup_chances,
                     );
                     // The model's own drafts are made on the device while the
-                    // step runs, so a row cannot be corrected for the drafts
-                    // before it, which it must be for some requests.
-                    let own = if a.sampler.allows_own_drafts() {
+                    // step runs, so a row can be neither corrected nor masked
+                    // for the drafts before it: a request with penalties takes
+                    // none, and one with a rule takes them while the rule
+                    // leaves its next token free.
+                    let own = if a.sampler.allows_own_drafts(&a.tokens, a.prompt_len as usize) {
                         cap.min(self.model.own_drafts() as usize)
                     } else {
                         0
@@ -1818,13 +1820,20 @@ impl Conductor {
                         // model's draft block writes them on the device.
                         writer.own_drafts().map_err(full)?;
                     }
+                    // The model's own drafts are not known yet. A request
+                    // takes them only while no row depends on the drafts
+                    // before it as far as the host can tell (no penalties,
+                    // and a rule that leaves the first row free), so every
+                    // row is made as the first: without a mask. The commit
+                    // stops at the row a rule would have bound.
+                    let known: &[u32] = if a.own { &[] } else { &a.draft };
                     for k in 0..part.rows as usize {
                         let row = a.sampler.row(
                             first_cell + k as u32,
                             &a.tokens,
                             a.prompt_len as usize,
-                            &a.draft,
-                            k,
+                            known,
+                            k.min(known.len()),
                             &mut self.step_rows,
                         );
                         self.samplers.push(row);
@@ -1966,13 +1975,32 @@ impl Conductor {
                         a.draft.resize(drafts, u32::MAX);
                         draft_cursor = end;
                     }
-                    let accepted =
-                        (0..drafts).take_while(|&i| picks[i].token == a.draft[i]).count();
+                    let right = (0..drafts).take_while(|&i| picks[i].token == a.draft[i]).count();
+                    // The rows of a window that took the model's own drafts
+                    // carry no mask, because the host did not know the drafts.
+                    // That is exact for the rows the request's rule leaves
+                    // free, and a request takes such a window only while its
+                    // first row is. When a token of the window makes the rule
+                    // bind (the tag that closes the reasoning, a trigger), the
+                    // rows after it needed a mask and their picks are not the
+                    // request's: the window gives its tokens up to and
+                    // including that one, whose row runs again with its mask.
+                    let free = match a.own {
+                        true => {
+                            a.sampler.free_rows(&a.tokens, a.prompt_len as usize, &a.draft[..right])
+                        }
+                        false => right + 1,
+                    };
+                    let accepted = right.min(free.saturating_sub(1));
                     if drafts > 0 {
                         let source = usize::from(a.own);
                         if a.own {
-                            a.own_acceptance.observe(drafts, accepted);
-                            self.own_engine.observe(drafts, accepted);
+                            // What the rule cut off was not tested; the draft
+                            // of the token that made it bind was, and was
+                            // right.
+                            let tested = drafts.min(free);
+                            a.own_acceptance.observe(tested, right.min(tested));
+                            self.own_engine.observe(tested, right.min(tested));
                         } else {
                             // The corpus learns what matches like this one
                             // are worth.
@@ -1982,8 +2010,11 @@ impl Conductor {
                         counters.draft_lengths[source][drafts.min(DRAFT_POSITIONS)] += 1;
                         counters.drafts_accepted += accepted as u64;
                         counters.drafts_rejected += (drafts - accepted) as u64;
-                        // Positions up to the first rejected one were tested.
-                        for i in 0..drafts.min(accepted + 1) {
+                        // Positions up to the first rejected one were tested;
+                        // a draft the rule cut off was not rejected.
+                        let tested =
+                            if accepted < right { accepted } else { drafts.min(accepted + 1) };
+                        for i in 0..tested {
                             let at = i.min(counters.drafts_tested_at[source].len() - 1);
                             counters.drafts_tested_at[source][at] += 1;
                             counters.drafts_accepted_at[source][at] += u64::from(i < accepted);
