@@ -3141,7 +3141,9 @@ checkpoints that let a conversation continue from what was computed (see
 "Host memory").
 
 It answers `POST /v1/chat/completions` and `/v1/completions`, streamed and
-not, `GET /v1/models`, `/health` and `/metrics`, with timings in every answer
+not, Anthropic's `POST /v1/messages` and `/v1/messages/count_tokens` (see
+"The Messages API" below), `GET /v1/models`, `/health` and `/metrics`, with
+timings in every answer of the OpenAI routes
 (prompt tokens and time, generated tokens and time, drafts proposed and
 accepted, and `token_hash`, a hash of the reply's token ids in the final message
 and in the last event of a stream). A request can switch drafting off for itself
@@ -3401,6 +3403,111 @@ text is accepted there; the white space between the content and a call is not
 part of `content` here. The legacy `functions` and `function_call` are refused.
 The tests with real models (`crates/server/tests/real_tools.rs`: the 0.8B on
 one card, the 27B on two) are written and have not been run.
+
+**The Messages API.** `POST /v1/messages` is Anthropic's Messages API. A
+request is served as the chat request that asks the same: the `anthropic`
+module of `ares-server` writes its body over into a chat body, and from there
+it is the chat route's path (the same reader, the same engine request, the same
+prefix cache, the same rule for calls, the same end when the client leaves).
+The reply comes back as a message with content blocks, or as Anthropic's
+events.
+
+| Field | Here |
+| --- | --- |
+| `model`, `max_tokens` (required), `temperature`, `top_p`, `top_k`, `stream` | as on the chat route |
+| `system` | a string or text blocks: one system message |
+| `messages` | turns of `user` and `assistant`, a string or blocks. User: `text`, and `tool_result` (a string or text blocks), which becomes a message of the role `tool` where it stands. Assistant: `text`, `thinking`, `redacted_thinking`, `tool_use` |
+| `tools` | `name`, `description`, `input_schema` (and `type: custom`, `strict`, `eager_input_streaming`, which ask for what is always done) |
+| `tool_choice` | `auto`, `any` (the chat route's `required`), `tool` with a name, `none`; `disable_parallel_tool_use` allows one call |
+| `thinking` | `enabled` and `adaptive` switch thinking on, `disabled` off; a request without it leaves it to `--reasoning` |
+| `stop_sequences` | the stop strings |
+| `output_config` | `format` with a JSON schema is the chat route's `response_format`; `effort` is its `reasoning_effort` |
+| `metadata`, `service_tier` | bookkeeping: accepted, without effect |
+| `cache_control` | accepted on the body, on blocks and on tools; without effect (below) |
+
+The text blocks of one message are joined with a line break. A result that says
+`is_error` has `Error: ` before its text, because the chat template has no
+other place for it. Everything else is refused with a 400 that names it, in
+Anthropic's shape of an error (`{"type": "error", "error": {"type",
+"message"}}`, with the status the chat route gives): `image` and `document`
+blocks (input other than text is not built), tools of a `type` that Anthropic's
+service defines or runs (`web_search_...`, `bash_...`) and the blocks they
+leave in a history, `defer_loading`, `mcp_servers`, `container`,
+`context_management`, citations, a last message of the assistant (a prefill:
+continuing a message is not built), and any member the module does not know.
+`x-api-key`, `anthropic-version` and `anthropic-beta` are not looked at: the
+server has no keys yet and one version of the API, and a field of a beta is
+served or refused by its name in the body.
+
+- **A budget for thinking** (`thinking.budget_tokens`) is checked and not
+  enforced. The engine has none, and Claude Code sends one with every request
+  that thinks, so a refusal would refuse the client. Thinking is on and as
+  long as the model makes it; `max_tokens` bounds thinking and answer
+  together, as at Anthropic, where the budget is a target too.
+- **Signatures.** A thinking block of a reply carries the fixed signature
+  `unsigned`: the server has no secret to sign with, and an empty signature
+  may make a client drop the block. A thinking block that comes back is the
+  reasoning of its message whatever its signature says. A reply's blocks sent
+  back unchanged are the turn the chat route gets back with
+  `reasoning_content`, so the template writes what the model generated and the
+  prefix cache continues (see "A conversation that continues from the cache").
+  `redacted_thinking` is accepted and nothing of it enters the prompt: only
+  Anthropic's service can read it.
+- **Cache markers.** The server caches every prefix by itself, so a
+  `cache_control` marker changes nothing and its `ttl` is no promise. The
+  usage has `cache_read_input_tokens` (the part of the prompt the cache gave),
+  `input_tokens` (the rest: the two add up to the prompt, as at Anthropic) and
+  `cache_creation_input_tokens`, which is 0.
+- **Why a reply ended.** `end_turn`, `max_tokens` or `tool_use`. The engine
+  reports one reason for the end token and for a stop string, so a reply that
+  a stop sequence ended says `end_turn` with `stop_sequence: null`. Telling
+  them apart needs the conductor to say which stop string matched.
+- **The billing line of Claude Code.** Claude Code begins its system prompt
+  with `x-anthropic-billing-header: ...; cch=a5145;`, whose `cch` is another
+  one in every request. Left alone it would part every prompt from the cached
+  one at its first line, so its five characters are overwritten, as
+  llama-server does. Nothing else of a prompt is changed.
+
+A stream is `message_start`, then for every block `content_block_start`, its
+deltas (`thinking_delta`, `text_delta`, `input_json_delta`; a thinking block
+gets a `signature_delta` before it closes) and `content_block_stop`, then
+`message_delta` with the reason and the usage, and `message_stop`. The blocks
+are in the order the model wrote them and numbered from 0; a whole message is
+the same events put together, so the two cannot differ. The engine counts the
+prompt when the reply ends, so the usage of `message_start` is zeros and
+`message_delta` has all of it. While the engine has nothing to say the stream
+sends `ping`. A failure after the stream began is an `error` event, and the
+stream ends without `message_stop`. The input of a `tool_use` block is the
+JSON text the model wrote, byte for byte; a call that `max_tokens` cut has the
+fragments in a stream and `{}` in a whole message. Call ids are `toolu_`, the
+request's id and the place of the call.
+
+`POST /v1/messages/count_tokens` reads a body as `/v1/messages` does (without
+`max_tokens` if the client leaves it out) and returns `{"input_tokens": N}`,
+the tokens of the prompt the engine would have been given; nothing is
+generated. The count is `Engine::count_tokens` of `ares-api`, which renders and
+tokenizes a prompt. The runtime does not implement it yet (it is
+`self.model.encode(prompt)?.len()` in `impl Engine for Runtime`), so with a
+loaded model the route answers 501 until it does; the host tests count with a
+test engine.
+
+Both routes run on the core of the chat route in `routes.rs`: `prepare`
+applies what a parsed chat request says about thinking and tools and returns
+the sorter of its reply, `Reply::start` hands the request to the engine, and
+`Reply::next` gives the reply as pieces (reasoning, content, the start of a
+call, fragments of its arguments) and its end (reason, usage, timings). A
+route of another API writes its body over into the chat body, calls these, and
+writes the pieces in its own format.
+
+Where this is not llama-server: it concatenates system blocks with nothing
+between them, moves the text of a user turn before its tool results, reads
+`tool_choice` `tool` as `any` and does not read `none`, drops
+`thinking: disabled`, `is_error`, `disable_parallel_tool_use` and every member
+it does not know, passes images on, and enforces `budget_tokens` in its
+sampler. Its `stop_reason` is `end_turn` for a stop string as well, but it
+names the string in `stop_sequence`. The tests with a real model
+(`crates/server/tests/real_messages.rs`, the 0.8B on one card) are written and
+have not been run.
 
 For a mixture of experts (`qwen4exp`) the plan is another one: where the
 layers go (`--split tensor`: both devices on every layer, `layer`: a range

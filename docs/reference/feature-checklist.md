@@ -3,8 +3,8 @@
 Made on 2026-11-11. Read-only survey: nothing was built or run, no repository was changed. The `Ares` column of
 R03 to R12, R14, R16, R21 and H02, the counts and the lists were brought up to date on 2026-11-12, when the
 sampler's features (penalties, DRY, logit bias, probabilities, `n` and the rest) were built; G01, G03, G06, G07
-and G09 were brought up to date the same day, when structured output was built, and T01 to T04 and G05 when
-tool calls were.
+and G09 were brought up to date the same day, when structured output was built, T01 to T04 and G05 when
+tool calls were, and A07 and A08 when the Messages API was.
 One row is one capability that a user or operator of an inference server can observe or rely on.
 
 ## How to read it
@@ -53,8 +53,8 @@ or no-op options; Ares may do a thing differently as long as the result is not w
 | A04 | Responses API (OpenAI), stateless | llama, ik, vllm, trt, ollama, strata, tfold, mistralrs, lmstudio, swap | `POST /v1/responses` run as the equivalent chat request; typed SSE events, function tools, reasoning items, `text.format` | not started | yes | common |
 | A05 | Stored responses, conversations held by the server | tfold, vllm, sglang, lmstudio | `store`, `previous_response_id`, `GET` and `DELETE /v1/responses/{id}` (vllm also cancel); lmstudio "stateful chats". ollama and strata are stateless on purpose | not started | yes | niche |
 | A06 | Responses over WebSocket | tfold | `GET /v1/responses` upgrade, `response.create` events, lanes and a cache per socket | not started | yes | niche |
-| A07 | Anthropic Messages API | llama, vllm, strata, tfold, mistralrs, sonar, lmdeploy, lmstudio, swap | `POST /v1/messages`: `system`, content blocks, `tool_use` and `tool_result`, thinking blocks, Anthropic's SSE events, `x-api-key` | not started | yes | common |
-| A08 | Token counting | llama, vllm, tfold, mistralrs, swap | `/v1/messages/count_tokens`, `/v1/responses/input_tokens`, `/v1/chat/completions/input_tokens`: render the request, return the count, generate nothing | not started | yes | common |
+| A07 | Anthropic Messages API | llama, vllm, strata, tfold, mistralrs, sonar, lmdeploy, lmstudio, swap | `POST /v1/messages`: `system`, content blocks, `tool_use` and `tool_result`, thinking blocks, Anthropic's SSE events, `x-api-key` | partly: `/v1/messages` runs as the chat request that asks the same (`system`, text, `tool_use`, `tool_result` and thinking blocks, `tools`, `tool_choice`, `thinking`, `stop_sequences`, `output_config`), whole and as Anthropic's events, with the cache counts in the usage and errors in Anthropic's shape; `budget_tokens` is accepted and not enforced, `cache_control` is accepted and changes nothing, `x-api-key` is not looked at. Missing: `stop_reason: stop_sequence` (the engine reports one reason for the end token and a stop string, so such a reply says `end_turn`); images and documents, server tools, a prefill and `defer_loading` are refused by name | yes | common |
+| A08 | Token counting | llama, vllm, tfold, mistralrs, swap | `/v1/messages/count_tokens`, `/v1/responses/input_tokens`, `/v1/chat/completions/input_tokens`: render the request, return the count, generate nothing | partly: `/v1/messages/count_tokens` reads a body as `/v1/messages` does and asks the engine for the count (`Engine::count_tokens`); the runtime does not implement the count yet, so with a loaded model the route answers 501. The other two routes are not started | yes | common |
 | A09 | Tokenize and detokenize | llama, vllm, sglang, tfold, tabby, kobold | text or chat messages to ids (optionally the pieces), ids to text | not started | yes | common |
 | A10 | Render a request without running it | llama, vllm, trt, tabby, tfold | the prompt text or ids a chat body renders to (`/apply-template`, `/v1/chat/completions/render`, `generate:false`) | not started | yes | niche |
 | A11 | Decisions API | llama, ik, vllm, sglang, tfold, lmstudio, localai | typed questions (yes/no, choice, score) answered from the next-token logits of the served model, no text generated: `/v1/systemone`, `/v1/decisions`, `/v1/score` | partly: route, wire format and planner rows exist; `Engine::decide` is not implemented and the route answers 501 | yes | niche |
@@ -345,11 +345,11 @@ Counted from the tables above with a script (see the end of this file for the co
 | Total | 223 |
 | Inside the frame | 200 |
 | - done | 59 |
-| - partly | 41 |
-| - not started | 100 (essential 5, common 28, niche 67) |
+| - partly | 43 |
+| - not started | 98 (essential 5, common 26, niche 67) |
 | Outside the frame | 23 (all not started) |
 
-Of the 59 done rows 27 are essential, 26 common and 6 niche; of the 41 partly rows 11 are essential, 16 common
+Of the 59 done rows 27 are essential, 26 common and 6 niche; of the 43 partly rows 11 are essential, 18 common
 and 14 niche. A row is one capability, so the counts weigh a sampler option like a model router; List 1 orders
 them by need instead.
 
@@ -362,9 +362,9 @@ them by need instead.
 - M02 several models loaded on request, and M03 the preset file
 - X01 API keys
 
-**Common (28).**
+**Common (26).**
 
-- API: A04 Responses, A07 Anthropic Messages, A08 token counting, A09 tokenize, A16 model properties
+- API: A04 Responses, A09 tokenize, A16 model properties
 - Sampling: R25 server cap for the output length
 - Tools: T05 recovery of imperfect calls
 - Reasoning: K03 thinking budget, K05 loop guard, K06 earlier reasoning in the history
