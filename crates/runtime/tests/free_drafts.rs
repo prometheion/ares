@@ -183,6 +183,7 @@ fn rule(kind: Kind, tag: &str) -> Structure {
             shape: Shape::Gbnf("root ::= [x-z]{5}".into()),
             start: Start::AfterReasoning { open: None, close: tag.to_owned() },
             trigger: None,
+            interrupt: None,
         },
         Kind::Trigger => {
             let format = format(tag);
@@ -201,6 +202,7 @@ fn rule(kind: Kind, tag: &str) -> Structure {
                 shape: Shape::Lark(rule.lark().unwrap()),
                 start: Start::Reply,
                 trigger: Some(format.trigger().to_owned()),
+                interrupt: None,
             }
         }
     }

@@ -4,7 +4,7 @@
 
 mod common;
 
-use ares_api::{Shape, Start, Structure};
+use ares_api::{Interrupt, Shape, Start, Structure};
 use common::*;
 
 const YES_NO: &str = r#"root ::= "yes" | "no""#;
@@ -15,6 +15,17 @@ fn bytes(text: &str) -> Vec<u32> {
 }
 
 fn structure(open: Option<&str>, close: Option<&str>, trigger: Option<&str>) -> Structure {
+    interrupted(open, close, trigger, None)
+}
+
+/// A structure whose reasoning also ends at `interrupt`, which the same
+/// grammar follows.
+fn interrupted(
+    open: Option<&str>,
+    close: Option<&str>,
+    trigger: Option<&str>,
+    interrupt: Option<&str>,
+) -> Structure {
     Structure {
         shape: Shape::Gbnf(YES_NO.into()),
         start: match close {
@@ -24,6 +35,8 @@ fn structure(open: Option<&str>, close: Option<&str>, trigger: Option<&str>) -> 
             None => Start::Reply,
         },
         trigger: trigger.map(str::to_owned),
+        interrupt: interrupt
+            .map(|text| Interrupt { text: text.to_owned(), shape: Shape::Gbnf(YES_NO.into()) }),
     }
 }
 
@@ -117,4 +130,32 @@ fn a_structure_that_binds_from_the_first_token_has_no_free_row() {
     let s = structure(None, None, None);
     assert_eq!(check(&toy, &s, "yes", 0), 0);
     assert_eq!(check(&toy, &s, "no", 1), 0);
+}
+
+#[test]
+fn an_interrupt_ends_the_free_rows_of_the_reasoning_where_it_stands() {
+    let toy = toy();
+    // With a trigger the reasoning is free, and the interrupt inside it binds
+    // what follows like the closing tag and the trigger after it would.
+    let s = interrupted(None, Some("</think>"), Some("<call>"), Some("<call>"));
+    let text = "think <ca no <call>yes";
+    let marker_ends = text.find("<call>").unwrap() + "<call>".len();
+    assert_eq!(check(&toy, &s, text, 0), marker_ends);
+    assert_eq!(check(&toy, &s, text, marker_ends - 2), 2);
+    assert_eq!(check(&toy, &s, text, marker_ends), 0);
+    let text = "think </think>then <call>no";
+    assert_eq!(check(&toy, &s, text, 0), text.len() - "no".len());
+}
+
+#[test]
+fn a_reply_that_has_to_reach_a_rule_has_no_free_row_while_it_thinks() {
+    let toy = toy();
+    // Without a trigger the reply may not end in its thinking: every row of
+    // it carries the mask that keeps the end tokens out, so none is free.
+    let s = interrupted(None, Some("</think>"), None, Some("<call>"));
+    for text in ["hm, 1? </think>yes", "hm <call>no"] {
+        for reply in 0..text.len() {
+            assert_eq!(check(&toy, &s, text, reply), 0, "{text:?} after {reply}");
+        }
+    }
 }

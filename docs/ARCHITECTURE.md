@@ -3438,12 +3438,14 @@ synthetic model: `crates/runtime/tests/tools.rs` under the rule, and
 `crates/server/tests/tools_engine.rs` from the request to the answer, where the
 reply is also the same whole and streamed; both with a call after the thinking
 and with one inside it). A request with tools that may be
-called has a rule, which is free for the thinking and for the text before a
-call: there the request takes the model's own drafts like a request without
-tools, and the conductor stops taking what a window gives at the token that
-makes the rule bind (the trigger, or the closing tag of the reasoning when a
-call is required; see "Drafts" under [Sampling](#sampling)). Inside a call it
-takes the lookup's drafts alone.
+called has a rule. With `auto` the rule is free for the thinking and for the
+text before a call: there the request takes the model's own drafts like a
+request without tools, and the conductor stops taking what a window gives at
+the token that makes the rule bind (the trigger, also when it stands inside the
+thinking; see "Drafts" under [Sampling](#sampling)). Inside a call it takes the
+lookup's drafts alone. A request that has to call (`required`, a named
+function) may not end while it thinks, so its thinking rows carry a mask and
+are not free: it takes the lookup's drafts alone for its whole reply.
 
 On the vocabulary of the 0.8B (248,320 tokens) the grammar of a tool compiles in
 about a millisecond, and the mask of a step along random walks through it takes a

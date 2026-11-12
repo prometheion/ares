@@ -445,12 +445,15 @@ impl Guide {
     /// Whether a reply in `phase` may go on with any token.
     fn free(&self, phase: &Phase) -> bool {
         match phase {
-            Phase::Reasoning(_) | Phase::Waiting(_) => true,
+            // A reply that has to reach a rule may not end while it thinks:
+            // its thinking rows carry a mask and are not free.
+            Phase::Reasoning(_) => self.may_end_thinking,
+            Phase::Waiting(_) => true,
             // A reply that may still open its reasoning is held to the tag or
             // to the grammar's first tokens, unless the grammar waits for a
             // trigger: then the answer it may turn out to be is free as well.
             Phase::Lead(_) => !self.trigger.is_empty(),
-            Phase::Bound(_) => false,
+            Phase::Bound(..) => false,
         }
     }
 }
