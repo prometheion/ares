@@ -1764,15 +1764,45 @@ value is 4 to 8 below the range of normal numbers by a factor of 4 to 8). A scal
 weights would take the worst to 3e-8 (the rows of `ssm_alpha` differ in size by up to
 3.5e5), at the price of a vector of exponents per matrix and a pass over the matrix to make
 it; it is not worth that for an error this far below the activations' rounding. So the
-kernels take no scale and are never silently wrong by range: a weight beyond 65504 is an
-infinity in the tile, so the outputs that read it are infinite or NaN (tested for bf16 and
-f32), and the variant with f16 accumulation, which adds partial sums of 64 products of a
-weight and a value of at most 1, does the same from weights of about 1000. What a matrix
-loses below 6.1e-5 is absolute: at most 2^-25 per weight, which the test
-`tiny_float_weights_are_off_by_at_most_the_spacing_of_f16_subnormals` bounds on weights from
-1e-7 to 1e-4 (3.1e-6 measured on 512 values against the bound 2.0e-5). On other models a
-float matrix whose values do not fit has to be looked at before the tile kernels are used on
-it; nothing in the engine checks that on load.
+kernels take no scale.
+
+*Weights beyond the range.* A weight beyond 65504 is an infinity in the tile, so the outputs
+that read it are infinite or NaN (tested for bf16 and f32), and the variant with f16
+accumulation, which adds partial sums of 64 products of a weight and a value of at most 1,
+gives an infinity from weights of about 1000 (tested with a run of 64 weights of 8000). A
+`qwen35` model does not get there. `WeightRange::of` reads the largest magnitude of a float
+matrix, and the loader asks it once for every float matrix a product reads (one more read of
+its bytes; the result is `Mat::range`). A matrix whose largest weight is at most 512 takes any
+path: 64 products of at most 512 stay below 2^15, half the range of f16 (tested at 512 with
+activations just below 1). Above that it takes the f16 path, whose sums are f32, where another
+float matrix takes f16 accumulation. Above 65504, or with an infinity or a NaN in the file, it
+takes no tile kernel: the matrices that read the same input are multiplied by the decode
+kernels in launches of eight rows, which compute with the weights as stored (and, for a
+quantized matrix among them, with int8 activations, also where `Precision::Exact` was asked
+for). The test `float_weights_beyond_f16_are_multiplied_by_the_kernels_that_hold_them` runs a
+made-up model with a row of weights of 61440 and two weights of 7e4: its logits are within
+7.1e-3 of the reference, as without such weights (6.0e-3); with the rule taken out the logits
+of a prompt of nine rows are not numbers and the step after it fails.
+The layout probes time such a matrix by its type, on the tile kernels. `qwen4exp` calls the
+kernels through `Kernels::product`, which knows no range: its float matrices are not checked.
+
+*Small weights.* What a matrix loses below 6.1e-5 is absolute, at most 2^-25 per weight. The
+test `tiny_float_weights_are_off_by_at_most_the_spacing_of_f16_subnormals` derives the bound of
+an output from the roundings of each step and holds both paths to it on weights from 1e-7 to
+1e-4 (512 values, 2026-11-12, both cards): the f16 path is off by at most 3.4e-6 to 5.0e-6
+against a bound of 1.7e-5. The path with f16 accumulation loses more there, and not through
+the weights. The tensor cores round its f16 sum after every 8 products (measured: doing
+exactly that on the CPU gives the kernel's bits for 99.7 to 99.8 % of the outputs on both
+cards, rounding after every 16 for 14 %), and the sum is in the units of the activation row
+divided by its factor, the power of two above the row's largest magnitude. A partial sum
+below 1.2e-4 is therefore rounded to a multiple of 2^-24 of that factor, so an output is off
+by up to `n_in / 8` times that whatever its own size: 3.3e-5 to 3.5e-5 in the test (bound
+2.6e-4), ten times the f16 path. That is felt by an output whose row of weights is small next
+to the activations: on Flash-Next's `ssm_alpha` (bf16, 48 x 2560, whose rows differ in size by
+up to 3.5e5) the worst output with f16 accumulation was 3.3 % of the sum of the magnitudes of
+its products away from the product of the rounded operands (8 rows, RTX 4070; 2e-6 on the f16
+path), while the error over all outputs was 0.045 % rms. The tests take that absolute term off
+before they compare the path with its emulation.
 
 *Error against the exact f32 product* (`tests/prefill.rs`, weights of rms 0.05 with
 outliers, activations of rms 1 with outliers, shapes from 1 x 32 to 200 x 1024): the f16
@@ -1780,6 +1810,13 @@ path 0.02 to 0.03 % rms for f16 and bf16 weights (the rounding of the activation
 weights are exact), 0.02 to 0.04 % for f32 weights; the path with f16 accumulation 0.04 to
 0.06 %. Against the same product with the operands rounded to f16 and summed exactly, the
 f16 path is within 3e-6 of the magnitude of the sum and the flush path within 1e-3.
+On the real float tensors (`prefill_matmul_on_real_tensors`, 2026-11-12, both cards, 8, 9 and
+70 activation rows of a normal distribution with outliers, the first 200 rows of the first
+matrix of each kind): the 14 kinds of bf16 matrix of Flash-Next 0.014 to 0.024 % rms on the
+f16 path and 0.042 to 0.061 % with f16 accumulation, its f32 `ffn_gate_inp` 0.020 to 0.022 %
+and 0.041 to 0.053 %, and the f32 `ssm_alpha` and `ssm_beta` of the IQ4_XS file of
+Qwen3.8-27B 0.017 to 0.023 % and 0.046 to 0.054 %. The decode kernels, which take eight rows
+of them, show no error in the four digits printed. Both cards give the same numbers.
 
 *Speed* (`examples/prefill_bench`, a 17408 x 5120 matrix, ms, RTX 4070 / RTX 3060, machine
 load 29 to 38 from other builds; the last column is the decode kernels in launches of eight
@@ -1808,6 +1845,35 @@ types have no row of `DECODE_ROWS`. Flash-Next's mixers (bf16, 512 rows):
 `hc_{attn,ffn}_down` 320 x 10240 3.10 / 4.02 ms in launches of eight rows, 0.31 / 0.44 ms on
 the tile kernels' f16 path and 0.21 / 0.30 with f16 accumulation; `hc_{attn,ffn}_up` 10240 x
 320 1.21 / 2.55 ms, 0.097 / 0.22 and 0.081 / 0.18 ms.
+
+*In a model* (`qwen35_run`, Qwen3.8-27B on both cards at 0.625 / 0.375, a prompt of 2048
+tokens in steps of 512 rows, two passes, then 96 decode steps at 1000 tokens of context;
+2026-11-12; before is the commit before these kernels, after is with them and with the ten
+other pieces integrated at the same time; each pair back to back, two rounds, with the
+machine's load average in brackets):
+
+| file | | prompt, tokens per second | decode step, ms (median) |
+|---|---|---|---|
+| Q4_K_S, no float matrix | before | 1366, 1363 [2.7]; 1354, 1354 [13] | 24.76; 24.80 |
+| | after | 1347, 1345 [2.7]; 1342, 1352 [12] | 24.75; 24.76 |
+| IQ4_XS, 96 f32 matrices | before | 871, 866 [2.6 to 7.6]; 874, 878 [21 to 16] | 28.89; 25.47 |
+| | after | 1283, 1295 [7.6 to 15]; 1306, 1310 [16 to 12] | 26.59; 25.50 |
+
+The Q4_K_S file is unchanged within the 1.4 % its runs differ by. The IQ4_XS file reads a
+prompt 1.5 times as fast: its `ssm_alpha` and `ssm_beta` (f32, 5120 x 48) had taken the
+matrices that read the same input with them through launches of eight rows in every recurrent
+block. Its decode step is the same (the fastest step of the first round was 25.43 before and
+25.31 after; the medians of that round were taken while the load rose).
+
+*The rows of a step.* A file of float matrices reads a prompt in the steps of 512 rows that
+every file takes; wide steps are what the tile kernels are for. Measured on one card (RTX
+4070, 2026-11-12, a prompt of 2048 tokens, two passes, each run twice, steps of 128 against
+512 rows by `--max-rows`): a copy of Qwen3.5-0.8B with all 187 matrices in bf16 (1434 MiB, in
+the file's layout) reads 12342, 13079, 13677 and 13688 tokens per second in steps of 128 rows
+and 27625, 27548, 27597 and 27536 in steps of 512 (load 8). The first eight blocks of
+Qwen3.8-27B with their 62 matrices in bf16 (made from the Q4_K_S file; 5806 MiB in the file's
+layout, 17408 x 5120 the largest) read 5596, 5699, 5700 and 5695 tokens per second in steps
+of 128 rows and 7810, 8068, 8082 and 8062 in steps of 512 (load 10).
 
 A model calls them through `Kernels::product` (matrix in `WeightLayout::File`, with the
 activations in the form `Kernels::activation_form` names and `prepare_activations` makes for
