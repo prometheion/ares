@@ -12,8 +12,13 @@ use crate::Error;
 /// llama.cpp does. The white space between the parts of the JSON is the one
 /// llama.cpp's grammars allow: one space, or a line break with some indent.
 pub(crate) fn prepare(text: &str) -> Result<Value, Error> {
-    let mut schema: Value = serde_json::from_str(text)
+    let schema: Value = serde_json::from_str(text)
         .map_err(|e| Error::Schema(format!("the JSON schema is not valid JSON: {e}")))?;
+    with_options(schema)
+}
+
+/// `schema` with the options every schema of a request is compiled with.
+pub(crate) fn with_options(mut schema: Value) -> Result<Value, Error> {
     match &mut schema {
         Value::Object(members) => {
             let options = json!({

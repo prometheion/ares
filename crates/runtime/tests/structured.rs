@@ -163,6 +163,7 @@ fn the_reasoning_is_free_and_the_answer_after_its_closing_tag_is_bound() {
     let structure = Structure {
         shape: Shape::Gbnf("root ::= [x-z]{5}".into()),
         start: Start::AfterReasoning { open: None, close: "8".into() },
+        trigger: None,
     };
     let mut texts = Vec::new();
     for speculation in [false, true] {

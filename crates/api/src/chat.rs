@@ -11,6 +11,64 @@ use serde::{Deserialize, Serialize};
 pub struct ChatFormat {
     /// How the model thinks, or `None` if its template has no thinking.
     pub thinking: Option<ThinkingFormat>,
+    /// How the model writes a call of a tool, or `None` if its template
+    /// writes calls in no way the engine knows (or has no tools at all).
+    pub tools: Option<ToolFormat>,
+}
+
+/// How a model writes the calls of tools into its reply: every call between
+/// tags, the name of the tool in a tag of its own, and each argument between
+/// a tag that names it and a tag that closes it. The template of Qwen3.8
+/// writes
+///
+/// ```text
+/// <tool_call>
+/// <function=NAME>
+/// <parameter=KEY>
+/// VALUE
+/// </parameter>
+/// </function>
+/// </tool_call>
+/// ```
+///
+/// A value that is a string stands as it is, without quotes; every other
+/// value is JSON. The pieces are what the template writes around the name,
+/// the keys and the values, white space included.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolFormat {
+    /// From the start of a call to the name of the tool
+    /// (`"<tool_call>\n<function="`).
+    pub call_open: String,
+    /// After the name (`">\n"`).
+    pub name_close: String,
+    /// Before the key of an argument (`"<parameter="`).
+    pub param_open: String,
+    /// Between the key and the value (`">\n"`).
+    pub key_close: String,
+    /// After the value (`"\n</parameter>\n"`).
+    pub param_close: String,
+    /// After the last argument, to the end of the call
+    /// (`"</function>\n</tool_call>"`).
+    pub call_close: String,
+    /// What the template writes between the text of a message and its first
+    /// call (`"\n\n"`).
+    pub before_calls: String,
+    /// What it writes between two calls (`"\n"`).
+    pub between_calls: String,
+}
+
+impl ToolFormat {
+    /// The text that tells a call has begun: the start of `call_open` up to
+    /// its first white space (`"<tool_call>"`).
+    pub fn trigger(&self) -> &str {
+        let end = self.call_open.find(|c: char| c.is_ascii_whitespace());
+        &self.call_open[..end.unwrap_or(self.call_open.len())]
+    }
+
+    /// What follows the trigger in `call_open` (`"\n<function="`).
+    pub fn after_trigger(&self) -> &str {
+        &self.call_open[self.trigger().len()..]
+    }
 }
 
 /// How a model thinks before it answers: reasoning between two tags, whose

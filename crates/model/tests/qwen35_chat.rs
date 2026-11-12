@@ -99,7 +99,7 @@ fn the_variables_of_a_request_win_over_the_ones_the_server_started_with() {
 fn the_model_declares_what_its_template_says_about_thinking() {
     let Some(path) = path() else { return };
     let thinking = |chat: ChatOptions| {
-        let ChatFormat { thinking } =
+        let ChatFormat { thinking, .. } =
             model(&path, chat).chat_format().expect("a model with a template");
         thinking.expect("the template thinks")
     };

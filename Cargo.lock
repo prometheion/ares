@@ -135,6 +135,7 @@ dependencies = [
  "ares-state",
  "ares-weights",
  "libc",
+ "serde_json",
  "thiserror",
  "tokio",
 ]

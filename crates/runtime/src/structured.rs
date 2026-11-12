@@ -82,6 +82,7 @@ fn describe(structure: &Structure, message: &str) -> String {
     match structure.shape {
         ares_api::Shape::Gbnf(_) => format!("grammar: {message}"),
         ares_api::Shape::JsonSchema(_) => format!("json_schema: {message}"),
+        ares_api::Shape::Lark(_) => format!("tools: {message}"),
     }
 }
 

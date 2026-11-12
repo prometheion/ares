@@ -96,6 +96,7 @@ mod tests {
             structure: Some(Structure {
                 shape: Shape::JsonSchema(r#"{"type":"object"}"#.into()),
                 start: Start::AfterReasoning { open: None, close: "</think>".into() },
+                trigger: Some("<tool_call>".into()),
             }),
             id: RequestId(9),
         };

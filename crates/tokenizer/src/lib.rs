@@ -86,6 +86,7 @@ mod json;
 mod pretok;
 mod reasoning;
 mod tokenizer;
+mod tools;
 mod unicode;
 #[rustfmt::skip]
 mod unicode_table;
@@ -97,4 +98,5 @@ pub use error::{Error, Result};
 pub use json::{Json, JsonError};
 pub use reasoning::ReasoningFormat;
 pub use tokenizer::{EncodeOptions, TokenKind, Tokenizer};
+pub use tools::ToolFormat;
 pub use vocab::SpecialTokens;

@@ -339,7 +339,7 @@ impl Server {
                     template,
                     inner: qwen,
                     chat,
-                    format: ChatFormat { thinking },
+                    format: ChatFormat { thinking, tools: None },
                 })
             }
         };

@@ -11,6 +11,7 @@ use crate::chat::{ChatError, ChatOptions, ChatTemplate, Message, Tool};
 use crate::error::{Error, Result};
 use crate::pretok;
 use crate::reasoning::ReasoningFormat;
+use crate::tools::ToolFormat;
 use crate::unicode::{classes, cpt_at, sanitize};
 use crate::unicode_table::SPACE;
 use crate::vocab::{Pre, SpecialTokens, Vocab, attr};
@@ -534,6 +535,15 @@ impl Tokenizer {
     pub fn reasoning_format(&self) -> Option<ReasoningFormat> {
         let template = self.chat.as_ref().or(self.chat_tool_use.as_ref())?.as_ref().ok()?;
         ReasoningFormat::detect(template)
+    }
+
+    /// How the model's chat template writes the calls of tools, or `None` if
+    /// it writes them in a form that is not understood (or has no template for
+    /// them). The template asked is the one a conversation with tools is
+    /// rendered by.
+    pub fn tool_format(&self) -> Option<ToolFormat> {
+        let template = self.chat_tool_use.as_ref().or(self.chat.as_ref())?.as_ref().ok()?;
+        ToolFormat::detect(template)
     }
 
     /// The prompt for a conversation, made by the model's chat template.

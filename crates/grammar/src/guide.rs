@@ -16,11 +16,18 @@ enum Phase {
     /// In the reasoning; these are the last bytes of it, as many as can still
     /// become the closing tag.
     Reasoning(Vec<u8>),
+    /// Past the reasoning and free, until the text has the trigger; these are
+    /// the last bytes of it, as many as can still become the trigger.
+    Waiting(Vec<u8>),
     /// The grammar's first token is the token at this index of the reply.
     Bound(usize),
 }
 
 /// A structure being followed by one reply.
+///
+/// A structure with a trigger leaves the answer free until its text has the
+/// trigger, and binds what follows it; a reply that may open its reasoning
+/// itself is then free from its first token.
 ///
 /// [`mask`](Guide::mask) and [`admitted`](Guide::admitted) each take the tokens of the reply so far and the
 /// drafts that follow them, and answer for the position after the last draft.
@@ -32,6 +39,8 @@ pub struct Guide {
     vocab: Vocabulary,
     open: Option<Vec<u8>>,
     close: Vec<u8>,
+    /// The text the grammar waits for; empty when it waits for none.
+    trigger: Vec<u8>,
     /// What the guide knows of the reply it has been given: the phase after
     /// `seen` tokens.
     seen: usize,
@@ -64,32 +73,42 @@ impl Compiler {
         let source = match &structure.shape {
             ares_api::Shape::Gbnf(text) => Source::Gbnf(text),
             ares_api::Shape::JsonSchema(text) => Source::JsonSchema(text),
+            ares_api::Shape::Lark(text) => Source::Lark(text),
         };
         let mut grammar = self.compile(source)?;
-        let (open, close, phase) = match &structure.start {
-            Start::Reply => (None, Vec::new(), Phase::Bound(0)),
-            Start::AfterReasoning { open: None, close } => {
-                (None, close.as_bytes().to_vec(), Phase::Reasoning(Vec::new()))
-            }
-            Start::AfterReasoning { open: Some(open), close } => {
-                (Some(open.as_bytes().to_vec()), close.as_bytes().to_vec(), Phase::Lead(0))
+        let (open, close) = match &structure.start {
+            Start::Reply => (None, Vec::new()),
+            Start::AfterReasoning { open, close } => {
+                if close.is_empty() {
+                    return Err(Error::Compile(
+                        "the tag that closes the reasoning is empty".into(),
+                    ));
+                }
+                (open.as_ref().map(|open| open.as_bytes().to_vec()), close.as_bytes().to_vec())
             }
         };
-        if matches!(phase, Phase::Reasoning(_) | Phase::Lead(_)) && close.is_empty() {
-            return Err(Error::Compile("the tag that closes the reasoning is empty".into()));
-        }
-        Ok(Guide {
+        let trigger = match &structure.trigger {
+            Some(trigger) if trigger.is_empty() => {
+                return Err(Error::Compile("the trigger of the grammar is empty".into()));
+            }
+            Some(trigger) => trigger.as_bytes().to_vec(),
+            None => Vec::new(),
+        };
+        let mut guide = Guide {
             cursor: grammar.start(),
             vocab: self.vocabulary().clone(),
             open,
             close,
+            trigger,
             seen: 0,
-            phase,
+            phase: Phase::Bound(0),
             lead: HashMap::new(),
             start: None,
             path: Vec::new(),
             last: None,
-        })
+        };
+        guide.phase = guide.initial();
+        Ok(guide)
     }
 }
 
@@ -105,15 +124,17 @@ impl Guide {
                     // Text after the tag in the same token is not checked
                     // against the grammar: tokenizers write the tag as a token
                     // of its own.
-                    Phase::Bound(index + 1)
+                    self.answer(index + 1)
                 } else {
                     let keep = self.close.len() - 1;
                     bytes.drain(..bytes.len().saturating_sub(keep));
                     Phase::Reasoning(bytes)
                 }
             }
+            Phase::Waiting(tail) => self.wait(tail, index, token),
             Phase::Lead(matched) => {
-                if matched == 0 && self.starts_grammar(token)? {
+                let waits = !self.trigger.is_empty();
+                if !waits && matched == 0 && self.starts_grammar(token)? {
                     return Ok(Phase::Bound(index));
                 }
                 let open = self.open.as_deref().expect("a lead has a tag");
@@ -125,12 +146,39 @@ impl Guide {
                     } else {
                         Phase::Lead(matched)
                     }
+                } else if waits {
+                    // Not the tag after all: the answer, which began with what
+                    // looked like the tag.
+                    let tail = open[..matched].to_vec();
+                    self.wait(tail, index, token)
                 } else {
                     // Neither the tag nor the grammar: the grammar will refuse it.
                     Phase::Bound(index)
                 }
             }
         })
+    }
+
+    /// The phase of the answer whose first token is the one at `index`: bound,
+    /// or free until the trigger.
+    fn answer(&self, index: usize) -> Phase {
+        if self.trigger.is_empty() { Phase::Bound(index) } else { Phase::Waiting(Vec::new()) }
+    }
+
+    /// The phase after `token` at `index` of an answer that waits for the
+    /// trigger and ends with `tail`.
+    fn wait(&self, tail: Vec<u8>, index: usize, token: u32) -> Phase {
+        let mut bytes = tail;
+        bytes.extend_from_slice(self.vocab.piece(token));
+        if find(&bytes, &self.trigger).is_some() {
+            // As for the tag that closes the reasoning: the grammar is
+            // checked from the next token on.
+            Phase::Bound(index + 1)
+        } else {
+            let keep = self.trigger.len() - 1;
+            bytes.drain(..bytes.len().saturating_sub(keep));
+            Phase::Waiting(bytes)
+        }
     }
 
     /// Whether the grammar allows `token` as its first.
@@ -184,7 +232,7 @@ impl Guide {
 
     fn initial(&self) -> Phase {
         match (&self.open, self.close.is_empty()) {
-            (_, true) => Phase::Bound(0),
+            (_, true) => self.answer(0),
             (Some(_), false) => Phase::Lead(0),
             (None, false) => Phase::Reasoning(Vec::new()),
         }
@@ -197,7 +245,9 @@ impl Guide {
         let mut phase = self.phase.clone();
         let mut free = drafts.len();
         for (i, &token) in drafts.iter().enumerate() {
-            if let Phase::Lead(matched) = phase {
+            if let Phase::Lead(matched) = phase
+                && self.trigger.is_empty()
+            {
                 let words = self.lead_words(matched)?;
                 if !crate::mask_allows(&words, token) && free == drafts.len() {
                     free = i;
@@ -227,8 +277,10 @@ impl Guide {
         }
         let (phase, free) = self.walk(reply, drafts)?;
         let mask = match phase {
-            Phase::Reasoning(_) => None,
-            Phase::Lead(matched) if free == drafts.len() => Some(self.lead_words(matched)?),
+            Phase::Reasoning(_) | Phase::Waiting(_) => None,
+            Phase::Lead(matched) if free == drafts.len() && self.trigger.is_empty() => {
+                Some(self.lead_words(matched)?)
+            }
             Phase::Lead(_) => None,
             Phase::Bound(from) => {
                 let path = std::mem::take(&mut self.path);

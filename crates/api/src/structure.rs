@@ -12,12 +12,19 @@ use serde::{Deserialize, Serialize};
 pub struct Structure {
     pub shape: Shape,
     pub start: Start,
+    /// A text that the rule waits for. `None`: the rule binds from `start`.
+    /// With a trigger the reply is free from `start` on, until its text
+    /// contains the trigger; the rule then binds what follows the trigger, and
+    /// a reply that never writes it stays free to its end. The rule is checked
+    /// from the token after the one that completes the trigger: a tokenizer
+    /// writes such a tag as a token of its own.
+    pub trigger: Option<String>,
 }
 
 impl Structure {
     /// A rule that binds the reply from its first token.
     pub fn new(shape: Shape) -> Self {
-        Self { shape, start: Start::Reply }
+        Self { shape, start: Start::Reply, trigger: None }
     }
 }
 
@@ -30,6 +37,10 @@ pub enum Shape {
     /// A JSON schema, as JSON text: the reply is a JSON value that the schema
     /// accepts.
     JsonSchema(String),
+    /// A grammar in the Lark syntax of the grammar engine (llguidance); it
+    /// starts at the rule `start`. The front end writes these for the calls
+    /// of tools (`ares_grammar::calls`).
+    Lark(String),
 }
 
 /// Where the rule starts to bind.

@@ -3,19 +3,32 @@
 //! model's tokens, for the architectures that share the Qwen chat template and
 //! tokenizer.
 
-use ares_api::{ChatFormat, EngineError, Prompt, Role, ThinkingFormat};
-use ares_tokenizer::{ChatOptions, EncodeOptions, Json, Message, ReasoningFormat, Tokenizer};
+use ares_api::{ChatFormat, EngineError, Prompt, Role, ThinkingFormat, ToolFormat};
+use ares_tokenizer::{
+    ChatOptions, EncodeOptions, Json, Message, ReasoningFormat, Tokenizer, Tool, ToolCall,
+};
 
 /// What the chat template of `tokenizer` declares when it is rendered with
 /// `chat`, the options the server started the model with.
 ///
 /// The template is read, not the name of the model: the tags that mark the
-/// thinking, how the end of the prompt opens or closes the block, and whether
-/// the template reads `reasoning_effort`. Whether the model thinks when a
-/// request does not say is the template's default with `chat` applied.
+/// thinking, how the end of the prompt opens or closes the block, whether
+/// the template reads `reasoning_effort`, and the tags it writes the calls of
+/// tools with. Whether the model thinks when a request does not say is the
+/// template's default with `chat` applied.
 pub fn chat_format(tokenizer: &Tokenizer, chat: &ChatOptions) -> ChatFormat {
     ChatFormat {
         thinking: tokenizer.reasoning_format().map(|format| thinking_format(format, chat)),
+        tools: tokenizer.tool_format().map(|format| ToolFormat {
+            call_open: format.call_open,
+            name_close: format.name_close,
+            param_open: format.param_open,
+            key_close: format.key_close,
+            param_close: format.param_close,
+            call_close: format.call_close,
+            before_calls: format.before_calls,
+            between_calls: format.between_calls,
+        }),
     }
 }
 
@@ -78,14 +91,9 @@ pub(crate) fn encode(
             Ok(tokenizer.encode(text, EncodeOptions { add_special: true, parse_special: false }))
         }
         Prompt::Chat { messages, tools, variables } => {
-            if tools.as_ref().is_some_and(|t| !t.is_empty())
-                || messages.iter().any(|m| m.tool_calls.as_ref().is_some_and(|c| !c.is_empty()))
-            {
-                return Err(EngineError::Unsupported(
-                    "tool definitions and tool calls are not passed to the chat template yet"
-                        .into(),
-                ));
-            }
+            let invalid = |what: String| EngineError::InvalidRequest(what);
+            let tools: Vec<Tool> =
+                tools.iter().flatten().map(tool).collect::<Result<_, _>>().map_err(invalid)?;
             let messages: Vec<Message> = messages
                 .iter()
                 .map(|m| {
@@ -99,15 +107,53 @@ pub(crate) fn encode(
                     message.name = m.name.clone().unwrap_or_default();
                     message.tool_call_id = m.tool_call_id.clone().unwrap_or_default();
                     message.reasoning_content = m.reasoning_content.clone().unwrap_or_default();
-                    message
+                    message.tool_calls =
+                        m.tool_calls.iter().flatten().map(tool_call).collect::<Result<_, _>>()?;
+                    Ok(message)
                 })
-                .collect();
+                .collect::<Result<_, String>>()
+                .map_err(invalid)?;
             let text = tokenizer
-                .render_chat(&messages, &[], &with_variables(chat, variables))
+                .render_chat(&messages, &tools, &with_variables(chat, variables))
                 .map_err(|e| EngineError::InvalidRequest(format!("chat template: {e}")))?;
             Ok(tokenizer.encode(&text, EncodeOptions { add_special: true, parse_special: true }))
         }
     }
+}
+
+/// A tool of a request, in the OpenAI form (`{"type": "function", "function":
+/// {"name", "description", "parameters"}}`), as the template is given it.
+fn tool(value: &ares_api::Json) -> Result<Tool, String> {
+    let function = value.get("function").unwrap_or(value);
+    let name = function.get("name").and_then(ares_api::Json::as_str);
+    Ok(Tool {
+        name: name.ok_or("a tool has no name")?.to_owned(),
+        description: function
+            .get("description")
+            .and_then(ares_api::Json::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        parameters: function.get("parameters").map_or(Json::Object(Vec::new()), template_value),
+    })
+}
+
+/// A call of an assistant message, in the OpenAI form (`{"id", "type":
+/// "function", "function": {"name", "arguments"}}`). The arguments are JSON
+/// text there; an object is taken as well.
+fn tool_call(value: &ares_api::Json) -> Result<ToolCall, String> {
+    let function = value.get("function").unwrap_or(value);
+    let name = function.get("name").and_then(ares_api::Json::as_str);
+    let arguments = match function.get("arguments") {
+        None | Some(ares_api::Json::Null) => "{}".to_owned(),
+        Some(ares_api::Json::String(text)) if text.trim().is_empty() => "{}".to_owned(),
+        Some(ares_api::Json::String(text)) => text.clone(),
+        Some(other) => template_value(other).dump(),
+    };
+    Ok(ToolCall {
+        id: value.get("id").and_then(ares_api::Json::as_str).map(str::to_owned),
+        name: name.ok_or("a tool call has no name")?.to_owned(),
+        arguments,
+    })
 }
 
 /// Appends the bytes of the text of `token` to `text`.

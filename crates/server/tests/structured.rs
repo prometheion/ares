@@ -89,7 +89,7 @@ async fn structure_of(
     thinking: Option<ThinkingFormat>,
 ) -> Option<Structure> {
     let inner = instant();
-    let engine = Declaring { inner: inner.clone(), format: ChatFormat { thinking } };
+    let engine = Declaring { inner: inner.clone(), format: ChatFormat { thinking, tools: None } };
     let app = ares_server::router_with(Arc::new(engine), ares_server::Config::default());
     let (status, value) = json(post(&app, path, body).await).await;
     assert_eq!(status, StatusCode::OK, "{value}");
@@ -245,6 +245,7 @@ async fn a_model_that_thinks_gets_its_grammar_after_the_reasoning() {
                 open: open.map(str::to_owned),
                 close: "</think>".into(),
             },
+            trigger: None,
         })
     };
     // The prompt opened the block: the reply is reasoning from its first token.

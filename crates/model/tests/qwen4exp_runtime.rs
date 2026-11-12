@@ -512,7 +512,7 @@ fn the_model_declares_what_its_template_says_about_thinking() {
     if !enabled() {
         return;
     }
-    let ChatFormat { thinking } = declared(Some(THINKING_TEMPLATE), ChatOptions::default())
+    let ChatFormat { thinking, .. } = declared(Some(THINKING_TEMPLATE), ChatOptions::default())
         .expect("a model with a template declares its format");
     let format = thinking.expect("the template thinks");
     assert_eq!(format.start, "<think>\n");

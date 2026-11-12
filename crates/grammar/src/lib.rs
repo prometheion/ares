@@ -1,5 +1,6 @@
 //! The grammar engine on the host.
 
+pub mod calls;
 mod compile;
 mod cursor;
 mod error;

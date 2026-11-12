@@ -65,7 +65,7 @@ fn serve(
     config: Config,
 ) -> (Arc<MockEngine>, axum::Router) {
     let inner = MockEngine::script(steps);
-    let engine = Declaring { inner: inner.clone(), format: ChatFormat { thinking } };
+    let engine = Declaring { inner: inner.clone(), format: ChatFormat { thinking, tools: None } };
     (inner, ares_server::router_with(Arc::new(engine), config))
 }
 

@@ -29,6 +29,8 @@ ares-gguf.workspace = true
 # The HTTP example serves the synthetic engine through the real front end and
 # drives it with raw sockets.
 ares-server = { path = "../server" }
+# The schemas of the tools in tests/tools.rs.
+serde_json = "1"
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 
 [lints]

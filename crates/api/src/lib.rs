@@ -36,7 +36,7 @@ mod stats;
 mod structure;
 
 pub use answer::{Answer, DecisionOutcome, DecisionResult, Verdict};
-pub use chat::{ChatFormat, ThinkingFormat};
+pub use chat::{ChatFormat, ThinkingFormat, ToolFormat};
 pub use decision::{
     ChoiceOption, DecisionError, DecisionRequest, MAX_SCORE_LEVELS, MIN_SCORE_LEVELS, Question,
     QuestionKind,
