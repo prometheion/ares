@@ -572,6 +572,88 @@ fn a_token_map_and_slices_give_the_same_picks() {
     }
 }
 
+/// Rows that are hard for the kernels that find the best tokens and build
+/// the histograms: every logit equal, the best tokens next to each other or
+/// all in the columns one thread of a block reads, and fewer tokens than
+/// candidates.
+#[test]
+fn rows_whose_best_tokens_crowd_together_equal_the_host() {
+    let Some(devices) = gpus() else { return };
+    let mut rng = Rng(0x5eed_1234_abcd_0005);
+    let lp = |top, after_chain| Logprobs { top, chosen: true, after_chain };
+    for device in devices {
+        let kernels = SamplerKernels::load(device).unwrap();
+        for n in [5000usize, 248_320] {
+            let sampled = SampleParams {
+                temperature: 1.0,
+                seed: 0x0123_4567_89ab_cdef,
+                vocab: n as u32,
+                ..SampleParams::GREEDY
+            };
+            let own = SampleParams { logprobs: lp(20, false), ..SampleParams::GREEDY };
+            let settings = [
+                SampleParams::GREEDY,
+                own,
+                SampleParams { top_k: 40, top_p: 0.9, logprobs: lp(20, true), ..sampled },
+                SampleParams { top_k: 1000, ..sampled },
+                SampleParams { top_p: 0.95, ..sampled },
+                SampleParams { typical_p: 0.8, ..sampled },
+                SampleParams { min_p: 0.05, logprobs: lp(20, true), ..sampled },
+            ];
+            let shapes: Vec<(&str, Vec<f32>)> = vec![
+                ("equal", vec![1.5; n]),
+                ("descending", (0..n).map(|i| -(i as f32) * 1e-3).collect()),
+                ("ascending", (0..n).map(|i| i as f32 * 1e-3).collect()),
+                // The columns one thread of a block of 256 reads.
+                (
+                    "one thread",
+                    (0..n)
+                        .map(|i| if i % 256 == 7 { 30.0 + (i % 1000) as f32 } else { rng.normal() })
+                        .collect(),
+                ),
+                // Forty neighbours, most of them equal.
+                (
+                    "neighbours",
+                    (0..n)
+                        .map(
+                            |i| {
+                                if (4100..4140).contains(&i) { 20.0 + (i % 7) as f32 } else { -3.0 }
+                            },
+                        )
+                        .collect(),
+                ),
+                (
+                    "three tokens",
+                    (0..n)
+                        .map(|i| if i % (n / 3) == 11 { 2.0 } else { f32::NEG_INFINITY })
+                        .collect(),
+                ),
+                ("no token", vec![f32::NEG_INFINITY; n]),
+            ];
+            // A permutation: column i is token map[i].
+            let mut map: Vec<u32> = (0..n as u32).collect();
+            for i in (1..n).rev() {
+                map.swap(i, rng.below(i + 1));
+            }
+            for (what, logits) in &shapes {
+                // A row without a token that reports the model's own
+                // probabilities is left out: the kernels report -0.0 for its
+                // pick where the reference has minus infinity.
+                let params: Vec<SampleRow> = settings
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, p)| !(*what == "no token" && **p == own))
+                    .map(|(i, p)| p.row(i as u32))
+                    .collect();
+                let rows = vec![logits.clone(); params.len()];
+                let extras = Extras::none(rows.len());
+                check(device, &kernels, &rows, &params, &extras, &[], None, what);
+                check(device, &kernels, &rows, &params, &extras, &[n * 5 / 8], Some(&map), what);
+            }
+        }
+    }
+}
+
 /// Corrections of random tokens and random masks for `rows` rows of a
 /// vocabulary of `vocab` tokens.
 fn random_extras(rng: &mut Rng, vocab: usize, rows: usize) -> Extras {
