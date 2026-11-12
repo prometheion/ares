@@ -1,0 +1,40 @@
+#version 450
+#include "sample_common.glsl"
+
+// Makes the logits of the tokens a row's mask does not allow minus infinity. The mask is
+// `mask_words` words per row, a bit per token, set where the token is allowed.
+//
+// Grid (chunks, rows), THREADS invocations.
+layout(local_size_x = 256) in;
+
+layout(push_constant, std430) uniform Push {
+    uint64_t logits;
+    uint64_t tokens;
+    uint64_t params;
+    uint64_t masks;
+    uint stride;
+    uint n_local;
+    uint first;
+    uint chunk;
+    uint mask_words;
+} pc;
+
+void main() {
+    const uint r = gl_WorkGroupID.y;
+    Params p = params_of(pc.params, r);
+    if ((p.flags & F_MASK) == 0u) {
+        return;
+    }
+    const uint64_t mask = pc.masks + 4ul * uint64_t(p.mask_slot) * pc.mask_words;
+    const uint begin = gl_WorkGroupID.x * pc.chunk;
+    const uint end = min(begin + pc.chunk, pc.n_local);
+    const uint64_t row = pc.logits + 4ul * uint64_t(r) * pc.stride;
+    for (uint i = begin + gl_LocalInvocationID.x; i < end; i += THREADS) {
+        const uint token = token_of(pc.tokens, pc.first, i);
+        const bool allowed =
+            (token >> 5) < pc.mask_words && ((ldu(mask + 4ul * (token >> 5)) >> (token & 31u)) & 1u) != 0u;
+        if (!allowed) {
+            FloatRef(row + 4ul * i).v[0] = NEG_INF;
+        }
+    }
+}

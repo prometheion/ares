@@ -1,0 +1,116 @@
+#version 450
+#include "sample_pass.glsl"
+
+// Adds the tokens of the set in chunk `gl_WorkGroupID.x` of row `gl_WorkGroupID.y` up and writes
+// the chunk's partial results:
+//
+// - STATS, TAIL, RAW: the five sums of `Sums` (RAW is over all tokens at temperature 1, from the
+//   model's best logit);
+// - XTC: number 0 counts the tokens whose weight reaches the target, number 1 is the largest key
+//   among them plus one;
+// - TYPICAL: number 0 is the smallest key among the tokens within the radius (as 2^32 minus the
+//   key, for a maximum), number 1 the largest plus one;
+// - GATHER: the keys below the hundredth go to the row's list in `gather` (the `lists` scratch
+//   as 32-bit words, `gather_stride` of them a row).
+//
+// Grid (chunks, rows), THREADS invocations.
+layout(local_size_x = 256) in;
+
+layout(push_constant, std430) uniform Push {
+    uint64_t logits;
+    uint64_t params;
+    uint64_t state;
+    uint64_t lists;
+    uint stride;
+    uint n_local;
+    uint chunk;
+    uint gather_stride;
+    uint mode;
+    uint position;
+} pc;
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint r = gl_WorkGroupID.y;
+    Params p = params_of(pc.params, r);
+    State s = state_of(pc.state, r);
+    if (!pass_runs(p, s, pc.mode, pc.position)) {
+        return;
+    }
+    const uint begin = gl_WorkGroupID.x * pc.chunk;
+    const uint end = min(begin + pc.chunk, pc.n_local);
+    const uint64_t row = pc.logits + 4ul * uint64_t(r) * pc.stride;
+    uint64_t t[5] = uint64_t[5](0ul, 0ul, 0ul, 0ul, 0ul);
+    uint64_t min_enc = 0ul, max_key = 0ul;
+    for (uint i = begin + tid; i < end; i += THREADS) {
+        bool bad;
+        const float l = sample_logit(ldf(row + 4ul * i), bad);
+        if (!present(l)) {
+            continue;
+        }
+        float d, x;
+        uint key;
+        if (pc.mode == PASS_RAW) {
+            d = fsub(s.raw_lmax, l);
+            x = d;
+            key = 0u;
+        } else {
+            key = sample_key(s.l_max, l);
+            if (!in_set(s, key)) {
+                continue;
+            }
+            sample_x(s, key, d, x);
+        }
+        switch (pc.mode) {
+        case PASS_XTC:
+            if (sample_weight(floatBitsToUint(x)) >= s.target) {
+                t[0] += 1ul;
+                max_key = max(max_key, uint64_t(key) + 1ul);
+            }
+            break;
+        case PASS_TYPICAL:
+            if ((floatBitsToUint(fsub(x, s.mean_x)) & 0x7fffffffu) <= s.cut) {
+                min_enc = max(min_enc, uint64_t(0xffffffffu - key) + 1ul);
+                max_key = max(max_key, uint64_t(key) + 1ul);
+            }
+            break;
+        case PASS_GATHER:
+            if (key < s.cut100) {
+                const uint at = atomicAdd(s.n_gather, 1u);
+                if (at < SAMPLE_M) {
+                    UintRef(pc.lists + 4ul * (uint64_t(r) * pc.gather_stride + at)).v[0] = key;
+                }
+            }
+            break;
+        default: {
+            uint64_t terms[5];
+            sample_terms(d, x, terms);
+            [[unroll]] for (uint k = 0u; k < 5u; ++k) {
+                t[k] += terms[k];
+            }
+        }
+        }
+    }
+    if (pc.mode == PASS_GATHER) {
+        return;
+    }
+    const uint64_t out_at =
+        pc.lists + 8ul * (uint64_t(r) * gl_NumWorkGroups.x + gl_WorkGroupID.x) * PARTIALS;
+    if (pc.mode == PASS_XTC || pc.mode == PASS_TYPICAL) {
+        const uint64_t a = pc.mode == PASS_XTC ? block_sum_u64(t[0]) : block_max_u64(min_enc);
+        barrier();
+        const uint64_t b = block_max_u64(max_key);
+        if (tid == 0u) {
+            U64Ref(out_at).v[0] = a;
+            U64Ref(out_at + 8ul).v[0] = b;
+        }
+        return;
+    }
+    for (uint k = 0u; k < 5u; ++k) {
+        const uint64_t total = block_sum_u64(t[k]);
+        barrier();
+        if (tid == 0u) {
+            U64Ref(out_at + 8ul * k).v[0] = total;
+        }
+    }
+}

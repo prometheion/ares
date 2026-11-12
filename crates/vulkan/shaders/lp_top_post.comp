@@ -1,0 +1,6 @@
+#version 450
+// The best 20 tokens of the set the chain left, for the rows that report the probabilities
+// after the chain (see sample_top.glsl).
+#define TOP_N 20u
+#define TOP_ROWS 2
+#include "sample_top.glsl"

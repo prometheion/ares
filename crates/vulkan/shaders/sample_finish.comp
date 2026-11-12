@@ -1,0 +1,52 @@
+#version 450
+#include "sample_pick.glsl"
+
+// The pick of a sampled row into its record: the best score of the chunks (one device) or of
+// the devices' slots after the sum (several).
+//
+// Grid (rows), THREADS invocations.
+layout(local_size_x = 256) in;
+
+layout(push_constant, std430) uniform Push {
+    uint64_t lists;
+    uint64_t state;
+    uint64_t exchange;
+    uint64_t params;
+    uint64_t out_;
+    uint chunks;
+    uint devices;
+} pc;
+
+void main() {
+    const uint r = gl_WorkGroupID.x;
+    if ((params_of(pc.params, r).flags & F_SAMPLE) == 0u) {
+        return;
+    }
+    State s = state_of(pc.state, r);
+    uint64_t best = 0ul;
+    if (pc.devices == 1u) {
+        best = pick_best(pc.lists, r, pc.chunks, s);
+    }
+    if (gl_LocalInvocationID.x != 0u) {
+        return;
+    }
+    if (pc.devices > 1u) {
+        const uint64_t slots = pc.exchange + 4ul * uint64_t(r) * pc.devices * PICK_VALUES;
+        for (uint d = 0u; d < pc.devices; ++d) {
+            const float token = ldf(slots + 4ul * (d * PICK_VALUES + 1u));
+            if (token >= 0.0) {
+                const uint64_t v = pack_pick(ldf(slots + 4ul * d * PICK_VALUES), uint(token));
+                best = v > best ? v : best;
+            }
+        }
+    }
+    Out o = out_of(pc.out_, r);
+    if (best == 0ul) {
+        o.token = 0xffffffffu;
+        o.status = s.status | S_EMPTY;
+        return;
+    }
+    o.token = 0xffffffffu - uint(best);
+    o.value = unsortable(uint(best >> 32));
+    o.status = s.status;
+}

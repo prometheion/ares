@@ -1,0 +1,68 @@
+#version 450
+#include "sample_pass.glsl"
+
+// The logit of a row's pick on the device that holds its column, into this device's slot of
+// `exchange` (PASS_VALUES values per device and row: whether it is here, the logit after the
+// corrections, the logit before them) and zeros elsewhere.
+//
+// Grid (rows), 32 invocations of which the first works.
+layout(local_size_x = 32) in;
+
+layout(push_constant, std430) uniform Push {
+    uint64_t logits;
+    uint64_t inverse;
+    uint64_t params;
+    uint64_t entries;
+    uint64_t out_;
+    uint64_t exchange;
+    uint stride;
+    uint n_local;
+    uint first;
+    uint vocab;
+    uint devices;
+    uint rank;
+} pc;
+
+void main() {
+    if (gl_LocalInvocationID.x != 0u) {
+        return;
+    }
+    const uint r = gl_WorkGroupID.x;
+    Params p = params_of(pc.params, r);
+    if ((p.flags & (F_LP_RAW | F_LP_POST | F_MIROSTAT)) == 0u) {
+        return;
+    }
+    const uint token = out_of(pc.out_, r).token;
+    const uint64_t slots = pc.exchange + 4ul * uint64_t(r) * pc.devices * PASS_VALUES;
+    for (uint d = 0u; d < pc.devices; ++d) {
+        for (uint k = 0u; k < 3u; ++k) {
+            FloatRef(slots + 4ul * (d * PASS_VALUES + k)).v[0] = 0.0;
+        }
+    }
+    if (token == 0xffffffffu) {
+        return;
+    }
+    uint col;
+    if (pc.inverse != 0ul) {
+        col = token < pc.vocab ? ldu(pc.inverse + 4ul * token) : 0xffffffffu;
+    } else {
+        col = token - pc.first;
+    }
+    if (col >= pc.n_local) {
+        return;
+    }
+    bool bad;
+    const float corrected = sample_logit(ldf(pc.logits + 4ul * (uint64_t(r) * pc.stride + col)), bad);
+    float raw = corrected;
+    for (uint i = 0u; i < p.entries_count; ++i) {
+        Entry e = Entry(pc.entries + ENTRY_BYTES * (p.entries_first + i));
+        if (e.token == token) {
+            raw = sample_logit(e.bias, bad);
+            break;
+        }
+    }
+    const uint64_t slot = slots + 4ul * pc.rank * PASS_VALUES;
+    FloatRef(slot).v[0] = 1.0;
+    FloatRef(slot + 4ul).v[0] = corrected;
+    FloatRef(slot + 8ul).v[0] = raw;
+}

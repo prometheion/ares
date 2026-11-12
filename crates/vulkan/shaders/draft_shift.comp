@@ -1,0 +1,34 @@
+#version 450
+#include "layer_common.glsl"
+
+// Grid (max_seg_rows, n_segs): for every row of the step the final hidden state of the position
+// before it: of the row before in its segment, or the sequence's carry for a segment's first
+// row (zeros at position 0). `hidden` has the final hidden state of every row of the step.
+layout(local_size_x = 256) in;
+
+layout(push_constant, std430) uniform Push {
+    uint64_t step;
+    uint64_t hidden;
+    uint64_t carry;
+    uint64_t dst;
+    uint carry_rows;
+    uint d;
+} pc;
+
+void main() {
+    const Seg seg = step_seg(pc.step, gl_WorkGroupID.y);
+    const uint pos0 = ldu(pc.step + ldu(pc.step + 16) + 32ul * gl_WorkGroupID.y + 16ul);
+    const uint i = gl_WorkGroupID.x;
+    if (i >= seg.n_rows) {
+        return;
+    }
+    const uint r = seg.row0 + i;
+    const uint64_t from = i == 0u
+        ? pc.carry + 4ul * uint64_t(seg.slot) * pc.carry_rows * pc.d
+        : pc.hidden + 4ul * uint64_t(r - 1u) * pc.d;
+    const bool none = i == 0u && pos0 == 0u;
+    const uint64_t to = pc.dst + 4ul * uint64_t(r) * pc.d;
+    for (uint j = gl_LocalInvocationID.x; j < pc.d; j += 256u) {
+        FloatRef(to + 4ul * j).v[0] = none ? 0.0 : ldf(from + 4ul * j);
+    }
+}

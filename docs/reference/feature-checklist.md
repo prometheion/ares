@@ -281,7 +281,7 @@ or no-op options; Ares may do a thing differently as long as the result is not w
 | ID | Feature | Engines | What it is | Ares | Frame | Need |
 | --- | --- | --- | --- | --- | --- | --- |
 | H01 | CUDA | llama, fork, ik, kobold, ollama, vllm, sglang, tgi, trt, lmdeploy, tabby, mistralrs, mlc, sonar, strata, avalon, tfold | every card CUDA 13 supports | partly: Ampere and Ada measured; other classes compiled and untested; Turing has no prompt and no attention path | yes | essential |
-| H02 | Vulkan | kobold, mlc, llama? | the same features on any GPU with Vulkan | partly: weight and layer kernels at CUDA's speed, attention kernels slower than CUDA's; no sampler (to be rebuilt against `ares-sampler`), expert or qwen4exp kernels, no model | yes | essential |
+| H02 | Vulkan | kobold, mlc, llama? | the same features on any GPU with Vulkan | partly: weight and layer kernels at CUDA's speed, attention kernels slower than CUDA's, the sampler's kernels equal to CUDA's bit for bit (they need `shaderFloat64`); no expert or qwen4exp kernels, no model | yes | essential |
 | H03 | Several GPUs on Vulkan | llama? | a model split over Vulkan devices | partly: sums go through host pages; no direct route works on the test driver | yes | common |
 | H04 | Pure CPU inference, dense layers on the CPU | llama, ik, kobold, ollama, mistralrs, localai | a model or part of a dense model runs on the CPU (`-ngl`) | not started | no: no CPU inference | - |
 | H05 | Windows and macOS | llama, kobold, ollama, strata, tfold, mistralrs, mlc, lmstudio | native builds | not started | no: Linux only | - |
@@ -380,7 +380,7 @@ them by need instead.
 **Niche (67).** A03, A05, A06, A10, A14, A20, A23 to A27; R13, R15, R17, R19, R22, R24, R27, R29; G02, G04, G08; T06 to T10; K04, K07; F03, F05, F08, F10, F12, F13, F15, F19, F20; S14 to S16, S18 to S20, S23; P02, P05, P07,
 P08, P12, P23, P32, P34; M07, M09, M12, M13; V07; H11, H12; O05, O07; X02, X03, X06, X11; Q05.
 
-The rows that are `partly` are not in this list; the largest of them are Vulkan (H02: no sampler, expert
+The rows that are `partly` are not in this list; the largest of them are Vulkan (H02: no expert
 kernels and no model, against the frame's "full parity"), the mixture-of-experts model without a prefix cache
 (S10) and the open parts of its tiers (P19 to P21), the low-bit K/V formats (P14), the RAM and disk tiers of the
 cache (S12, S13), the per-request thinking switch (K02) and the prompt next to generation (S05).

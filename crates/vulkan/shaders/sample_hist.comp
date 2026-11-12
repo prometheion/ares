@@ -1,0 +1,90 @@
+#version 450
+#include "sample_descent.glsl"
+
+// Adds the tokens of the set in chunk `gl_WorkGroupID.x` of row `gl_WorkGroupID.y` to the row's
+// histogram `hist[(r * BINS + bin) * BIN_WORDS ..]`, which must be zero before the first chunk
+// adds to it. Needs BINS * BIN_WORDS * 4 = 32 KiB of shared memory.
+//
+// Grid (chunks, rows), THREADS invocations.
+layout(local_size_x = 256) in;
+
+layout(push_constant, std430) uniform Push {
+    uint64_t logits;
+    uint64_t params;
+    uint64_t state;
+    uint64_t hist;
+    uint stride;
+    uint n_local;
+    uint chunk;
+    uint desc;
+    uint level;
+    uint position;
+} pc;
+
+shared uint local_hist[BINS * BIN_WORDS];
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint r = gl_WorkGroupID.y;
+    State s = state_of(pc.state, r);
+    if (!desc_runs(params_of(pc.params, r), s, pc.desc, pc.position)) {
+        return;
+    }
+    const uint bins = level_bins(pc.level);
+    for (uint i = tid; i < bins * BIN_WORDS; i += THREADS) {
+        local_hist[i] = 0u;
+    }
+    barrier();
+
+    const uint prefix = s.prefix;
+    const uint begin = gl_WorkGroupID.x * pc.chunk;
+    const uint end = min(begin + pc.chunk, pc.n_local);
+    const uint64_t row = pc.logits + 4ul * uint64_t(r) * pc.stride;
+    for (uint i = begin + tid; i < end; i += THREADS) {
+        bool bad;
+        const float l = sample_logit(ldf(row + 4ul * i), bad);
+        if (!present(l)) {
+            continue;
+        }
+        const uint token_key = sample_key(s.l_max, l);
+        if (!in_set(s, token_key)) {
+            continue;
+        }
+        float d, x;
+        sample_x(s, token_key, d, x);
+        // The key the descent orders by.
+        const uint key = pc.desc == DESC_TYPICAL
+            ? (floatBitsToUint(fsub(x, s.mean_x)) & 0x7fffffffu)
+            : token_key;
+        uint bin;
+        if (pc.level == 0u) {
+            bin = key >> 21;
+        } else if (pc.level == 1u) {
+            if ((key >> 21) != prefix) {
+                continue;
+            }
+            bin = (key >> 10) & 0x7ffu;
+        } else {
+            if ((key >> 10) != prefix) {
+                continue;
+            }
+            bin = key & 0x3ffu;
+        }
+        const uint64_t w = sample_weight(floatBitsToUint(x));
+        const uint at = bin * BIN_WORDS;
+        atomicAdd(local_hist[at], 1u);
+        if (w != 0ul) {
+            atomicAdd(local_hist[at + 1u], uint(w & 0x3fffUL));
+            atomicAdd(local_hist[at + 2u], uint((w >> 14) & 0x3fffUL));
+            atomicAdd(local_hist[at + 3u], uint(w >> 28));
+        }
+    }
+    barrier();
+    const uint64_t global = pc.hist + 4ul * uint64_t(r) * BINS * BIN_WORDS;
+    for (uint i = tid; i < bins * BIN_WORDS; i += THREADS) {
+        const uint v = local_hist[i];
+        if (v != 0u) {
+            atomicAdd(UintRef(global + 4ul * i).v[0], v);
+        }
+    }
+}

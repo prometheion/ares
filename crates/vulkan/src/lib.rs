@@ -63,8 +63,11 @@
 //!   file's layout and [`Kernels::matmul_decode`] runs them in batches.
 //! - Pipelines of the weight and layer kernels are made on first use;
 //!   [`Kernels::prepare`] and [`LayerKernels::prepare`] make them ahead of a step.
-//! - There are no expert, sampler or `qwen4exp` kernels yet; the sampler is to be rebuilt against
-//!   `ares-sampler`.
+//! - [`SamplerKernels`] is the sampler of `ares-cuda`'s `SamplerKernels` with the same steps,
+//!   records and exchange between devices, held to `ares-sampler`'s reference bit for bit
+//!   (see the `sampler` module). It needs `shaderFloat64`, 32 KiB of shared memory and
+//!   workgroups of 256 invocations, and a device without them is refused at load.
+//! - There are no expert or `qwen4exp` kernels yet.
 //! - Dropping a [`DeviceBuffer`], [`StagingBuffer`] or [`Function`] waits for
 //!   the whole device (the way `cuMemFree` does), after flushing every stream.
 //!
@@ -92,6 +95,7 @@ mod memory;
 mod mesh;
 mod module;
 mod prefill;
+mod sampler;
 mod stream;
 mod timeline;
 mod transfer;
@@ -119,5 +123,8 @@ pub use memory::{DeviceBuffer, DevicePtr, HostPages, ShareKind, SharedMemory, St
 pub use mesh::{Lane, MAX_DEVICES, Mesh, PUSH_MAX_VALUES, Parcel, Route, device_groups};
 pub use module::{Args, Function, MAX_ARGS, Module};
 pub use prefill::{Precision, PrefillPath};
+pub use sampler::{
+    Descent, PassMode, Phase, SAMPLE_MAX_VOCAB, SampleBatch, SamplePlan, SampleStep, SamplerKernels,
+};
 pub use stream::{DEFAULT_BATCH, Event, MAX_IN_FLIGHT, Stream};
 pub use timeline::SharedTimeline;

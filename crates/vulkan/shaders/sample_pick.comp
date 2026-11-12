@@ -1,0 +1,56 @@
+#version 450
+#include "sample_common.glsl"
+
+// The pick of a sampled row: among the tokens the stages left, the one with the largest
+// `logit / temperature + noise`, where the noise is the Gumbel number of (seed, position,
+// token). That is a draw from the distribution of those tokens at that temperature, and because
+// a token's noise depends on nothing else, the same row gives the same pick alone or in any
+// batch, on one device or on several.
+//
+// Grid (chunks, rows), THREADS invocations. Writes the best packed score of its chunk to
+// `lists[r * chunks + chunk]` (CUDA raises a 64-bit maximum in the row's state with an atomic;
+// 64-bit atomics are an optional feature here, and `sample_pick_export` and `sample_finish` take
+// the maximum of the chunks). A row that is not picked here writes nothing.
+layout(local_size_x = 256) in;
+
+layout(push_constant, std430) uniform Push {
+    uint64_t logits;
+    uint64_t tokens;
+    uint64_t params;
+    uint64_t state;
+    uint64_t lists;
+    uint stride;
+    uint n_local;
+    uint first;
+    uint chunk;
+} pc;
+
+void main() {
+    const uint r = gl_WorkGroupID.y;
+    Params p = params_of(pc.params, r);
+    State s = state_of(pc.state, r);
+    if ((p.flags & F_SAMPLE) == 0u || (s.status & S_EMPTY) != 0u) {
+        return;
+    }
+    const uint begin = gl_WorkGroupID.x * pc.chunk;
+    const uint end = min(begin + pc.chunk, pc.n_local);
+    const uint64_t row = pc.logits + 4ul * uint64_t(r) * pc.stride;
+    const float l_max = s.l_max;
+    const float inv_t = s.inv_t;
+    uint64_t best = 0ul;
+    for (uint i = begin + gl_LocalInvocationID.x; i < end; i += THREADS) {
+        bool bad;
+        const float l = sample_logit(ldf(row + 4ul * i), bad);
+        if (!present(l) || !in_set(s, sample_key(l_max, l))) {
+            continue;
+        }
+        const uint token = token_of(pc.tokens, pc.first, i);
+        const float g = sample_gumbel(p.seed_lo, p.seed_hi, p.position, token);
+        const uint64_t v = pack_pick(fadd(fmul(l, inv_t), g), token);
+        best = v > best ? v : best;
+    }
+    best = block_max_u64(best);
+    if (gl_LocalInvocationID.x == 0u) {
+        U64Ref(pc.lists + 8ul * (uint64_t(r) * gl_NumWorkGroups.x + gl_WorkGroupID.x)).v[0] = best;
+    }
+}

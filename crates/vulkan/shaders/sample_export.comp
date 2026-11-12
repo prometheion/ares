@@ -1,0 +1,38 @@
+#version 450
+#include "sample_descent.glsl"
+
+// Moves the histogram of a level into `exchange` as four f32 values per bin (the count and the
+// weight in limbs of 20 bits: sums of up to 16 devices stay exact) and clears the histogram for
+// the next level.
+//
+// Grid (bins / THREADS, rows), THREADS invocations.
+layout(local_size_x = 256) in;
+
+layout(push_constant, std430) uniform Push {
+    uint64_t hist;
+    uint64_t exchange;
+    uint64_t params;
+    uint64_t state;
+    uint desc;
+    uint position;
+} pc;
+
+void main() {
+    const uint r = gl_WorkGroupID.y;
+    if (!desc_runs(params_of(pc.params, r), state_of(pc.state, r), pc.desc, pc.position)) {
+        return;
+    }
+    const uint64_t at =
+        (uint64_t(r) * BINS + gl_WorkGroupID.x * THREADS + gl_LocalInvocationID.x) * BIN_WORDS;
+    UintRef h = UintRef(pc.hist + 4ul * at);
+    FloatRef e = FloatRef(pc.exchange + 4ul * at);
+    const uint64_t w = uint64_t(h.v[1]) + (uint64_t(h.v[2]) << 14) + (uint64_t(h.v[3]) << 28);
+    e.v[0] = float(h.v[0]);
+    e.v[1] = float(uint(w & 0xfffffUL));
+    e.v[2] = float(uint((w >> 20) & 0xfffffUL));
+    e.v[3] = float(uint(w >> 40));
+    h.v[0] = 0u;
+    h.v[1] = 0u;
+    h.v[2] = 0u;
+    h.v[3] = 0u;
+}

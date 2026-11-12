@@ -1,0 +1,65 @@
+#version 450
+#include "sample_common.glsl"
+
+// The arithmetic of the sampler one function at a time, so that a test can hold each to the
+// host's (`ares_sampler::arith`) over many inputs: item `i` has the inputs `a[i]` and `b[i]` (64
+// bits each) and the shader writes five 64-bit results to `o[5 * i ..]`, of which `mode` says
+// what they are.
+//
+//  0 weight(a)            1 ln_f32(a)          2 gumbel(seed a, position b, token b >> 32)
+//  3 exp_d(a)             4 ln_d(a)            5 pow_d(a, b)
+//  6 ln_fixed(a)          7 a / b (f64)        8 sqrt(a) (f64)
+//  9 f32(a: u64)         10 f64(a: u64)       11 f32(a: f64)
+// 12 a / b (f32)         13 xtc_draw(seed a, position b)
+// 14 the terms of a token (d = a, x = b; f32) 15 share(a, b)
+layout(local_size_x = 64) in;
+
+layout(push_constant, std430) uniform Push {
+    uint64_t a;
+    uint64_t b;
+    uint64_t o;
+    uint n;
+    uint mode;
+} pc;
+
+void main() {
+    const uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.n) {
+        return;
+    }
+    const uint64_t a = U64Ref(pc.a + 8ul * i).v[0];
+    const uint64_t b = U64Ref(pc.b + 8ul * i).v[0];
+    U64Ref o = U64Ref(pc.o + 40ul * i);
+    uint64_t r = 0ul;
+    switch (pc.mode) {
+    case 0u: r = sample_weight(uint(a)); break;
+    case 1u: r = uint64_t(floatBitsToUint(sample_ln(uintBitsToFloat(uint(a))))); break;
+    case 2u:
+        r = uint64_t(floatBitsToUint(
+            sample_gumbel(uint(a), uint(a >> 32), uint(b), uint(b >> 32))));
+        break;
+    case 3u: r = bits_of(sample_exp_d(double_of(a))); break;
+    case 4u: r = bits_of(sample_ln_d(double_of(a))); break;
+    case 5u: r = bits_of(sample_pow_d(double_of(a), double_of(b))); break;
+    case 6u: r = bits_of(sample_ln_fixed(a)); break;
+    case 7u: r = bits_of(ddiv(double_of(a), double_of(b))); break;
+    case 8u: r = bits_of(sqrt(double_of(a))); break;
+    case 9u: r = uint64_t(floatBitsToUint(float(a))); break;
+    case 10u: r = bits_of(double(a)); break;
+    case 11u: r = uint64_t(floatBitsToUint(float(double_of(a)))); break;
+    case 12u:
+        r = uint64_t(floatBitsToUint(fdiv(uintBitsToFloat(uint(a)), uintBitsToFloat(uint(b)))));
+        break;
+    case 13u: r = uint64_t(floatBitsToUint(sample_xtc_draw(uint(a), uint(a >> 32), uint(b)))); break;
+    case 14u: {
+        uint64_t t[5];
+        sample_terms(uintBitsToFloat(uint(a)), uintBitsToFloat(uint(b)), t);
+        for (uint k = 0u; k < 5u; ++k) {
+            U64Ref(pc.o + 40ul * i + 8ul * k).v[0] = t[k];
+        }
+        return;
+    }
+    default: r = sample_share(a, uint(b)); break;
+    }
+    o.v[0] = r;
+}

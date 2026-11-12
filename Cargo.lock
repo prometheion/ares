@@ -207,6 +207,7 @@ dependencies = [
  "ares-cuda",
  "ares-gguf",
  "ares-quant",
+ "ares-sampler",
  "ash",
  "thiserror",
 ]

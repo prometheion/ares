@@ -299,7 +299,10 @@ impl Device {
             .shader_integer_dot_product(true);
         let mut features = vk::PhysicalDeviceFeatures2::default()
             .features(
-                vk::PhysicalDeviceFeatures::default().shader_int64(true).shader_int16(quantized),
+                vk::PhysicalDeviceFeatures::default()
+                    .shader_int64(true)
+                    .shader_int16(quantized)
+                    .shader_float64(physical.shader_float64),
             )
             .push_next(&mut v11)
             .push_next(&mut v12);

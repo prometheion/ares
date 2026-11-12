@@ -1,0 +1,88 @@
+#version 450
+#include "sample_pass.glsl"
+
+// What a row reports after its pick: the pick's logit from all devices, then the probabilities
+// of the pick and of the best alternatives, and for mirostat the surprise of the pick.
+//
+// The probability of a token is `exp(-x) / sum`, with `x` the token's scaled distance below the
+// best token of the set and `sum` the weights of the set, so its logarithm is `-x - ln(sum)`,
+// worked out in double precision from the integer sum (`sample_ln_fixed`). For the model's own
+// probabilities the set is every token, at temperature 1, from the best logit the model gave.
+//
+// Grid (rows), 32 invocations of which the first works.
+layout(local_size_x = 32) in;
+
+layout(push_constant, std430) uniform Push {
+    uint64_t exchange;
+    uint64_t params;
+    uint64_t state;
+    uint64_t out_;
+    uint64_t logprobs;
+    uint devices;
+} pc;
+
+// The logarithm of the probability of a token at distance `x`.
+float log_probability(float x, double ln_sum) {
+    return float(dsub(-double(x), ln_sum));
+}
+
+void main() {
+    if (gl_LocalInvocationID.x != 0u) {
+        return;
+    }
+    const uint r = gl_WorkGroupID.x;
+    Params p = params_of(pc.params, r);
+    State s = state_of(pc.state, r);
+    if ((p.flags & (F_LP_RAW | F_LP_POST | F_MIROSTAT)) == 0u) {
+        return;
+    }
+    Out o = out_of(pc.out_, r);
+    Logprobs lp = logprobs_of(pc.logprobs, r);
+    const bool raw_mode = (p.flags & F_LP_RAW) != 0u;
+    const bool post_mode = (p.flags & F_LP_POST) != 0u;
+    const bool has_token = o.token != 0xffffffffu;
+    float corrected = 0.0, raw = 0.0;
+    bool found = false;
+    const uint64_t slots = pc.exchange + 4ul * uint64_t(r) * pc.devices * PASS_VALUES;
+    for (uint d = 0u; d < pc.devices && has_token; ++d) {
+        const uint64_t slot = slots + 4ul * d * PASS_VALUES;
+        if (ldf(slot) != 0.0) {
+            found = true;
+            corrected = ldf(slot + 4ul);
+            raw = ldf(slot + 8ul);
+        }
+    }
+    const double lnz_set =
+        ((s.status & S_EMPTY) == 0u && (post_mode || (p.flags & F_MIROSTAT) != 0u))
+        ? sample_ln_fixed(s.sums[1]) : 0.0LF;
+    if ((p.flags & F_MIROSTAT) != 0u && found) {
+        float d, x;
+        sample_x(s, sample_key(s.l_max, corrected), d, x);
+        o.aux = float(ddiv(dadd(lnz_set, double(x)), LN2));
+    }
+    if (!raw_mode && !post_mode) {
+        return;
+    }
+    lp.chosen = NEG_INF;
+    if (post_mode) {
+        for (uint c = 0u; c < lp.n; ++c) {
+            float d, x;
+            sample_x(s, sample_key(s.l_max, lp.logprob[c]), d, x);
+            lp.logprob[c] = log_probability(x, lnz_set);
+        }
+        if (found) {
+            float d, x;
+            sample_x(s, sample_key(s.l_max, corrected), d, x);
+            lp.chosen = log_probability(x, lnz_set);
+        }
+    } else {
+        for (uint c = 0u; c < lp.n; ++c) {
+            const float d = fsub(s.raw_lmax, lp.logprob[c]);
+            lp.logprob[c] = log_probability(d > 0.0 ? d : 0.0, s.raw_lnz);
+        }
+        if (found) {
+            const float d = fsub(s.raw_lmax, raw);
+            lp.chosen = log_probability(d > 0.0 ? d : 0.0, s.raw_lnz);
+        }
+    }
+}

@@ -1,0 +1,41 @@
+#version 450
+#define TOP_N 8u
+#include "sample_join.glsl"
+
+// The best of a device's chunks. Grid (rows), THREADS invocations, `chunks` at most that many.
+// With one device the row is finished here; with several, this device's list goes into its slot
+// of `exchange` (TOP_VALUES values per device and row) and zeros into the other slots, for the
+// sum across devices (`sample_top_join` finishes the row after it).
+layout(local_size_x = 256) in;
+
+layout(push_constant, std430) uniform Push {
+    uint64_t lists;
+    uint64_t exchange;
+    uint64_t params;
+    uint64_t state;
+    uint64_t out_;
+    uint chunks;
+    uint devices;
+    uint rank;
+} pc;
+
+void main() {
+    const uint r = gl_WorkGroupID.x;
+    if (gl_LocalInvocationID.x == 0u) {
+        bad_any = 0u;
+    }
+    barrier();
+    merge_chunks(pc.lists, r, pc.chunks);
+    if (gl_LocalInvocationID.x != 0u) {
+        return;
+    }
+    if (pc.devices == 1u) {
+        uint64_t best[CANDIDATES];
+        [[unroll]] for (uint c = 0u; c < CANDIDATES; ++c) {
+            best[c] = merged[c];
+        }
+        join_row(best, bad_any, params_of(pc.params, r), state_of(pc.state, r), out_of(pc.out_, r));
+        return;
+    }
+    export_list(pc.exchange, r, pc.devices, pc.rank, bad_any);
+}

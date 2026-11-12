@@ -1,0 +1,25 @@
+#version 450
+#include "sample_common.glsl"
+
+// `inverse[tokens[c]] = c` for the columns `c` of a device that holds a token list; the host
+// filled the table with 0xffffffff first.
+//
+// Grid (ceil(n_local / THREADS)), THREADS invocations.
+layout(local_size_x = 256) in;
+
+layout(push_constant, std430) uniform Push {
+    uint64_t tokens;
+    uint64_t inverse;
+    uint n_local;
+    uint vocab;
+} pc;
+
+void main() {
+    const uint c = gl_GlobalInvocationID.x;
+    if (c < pc.n_local) {
+        const uint token = ldu(pc.tokens + 4ul * c);
+        if (token < pc.vocab) {
+            UintRef(pc.inverse + 4ul * token).v[0] = c;
+        }
+    }
+}

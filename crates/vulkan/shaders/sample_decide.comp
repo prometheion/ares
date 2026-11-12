@@ -1,0 +1,126 @@
+#version 450
+#include "sample_descent.glsl"
+
+// Reads the histogram of a level (summed over all devices) and takes the row one level down.
+// After the last level the cut is known: top-k and top-p cap the set and are done, typical
+// sampling and mirostat 1 keep the key for the stage's next shader.
+//
+// Grid (rows), THREADS invocations.
+layout(local_size_x = 256) in;
+
+layout(push_constant, std430) uniform Push {
+    uint64_t exchange;
+    uint64_t params;
+    uint64_t state;
+    uint desc;
+    uint level;
+    uint position;
+} pc;
+
+shared uint64_t counts[THREADS];
+shared uint64_t weights[THREADS];
+shared uint64_t shared_target;
+
+uint64_t bin_count(uint64_t bin) { return uint64_t(ldf(bin)); }
+
+uint64_t bin_weight(uint64_t bin) {
+    return uint64_t(ldf(bin + 4ul)) + (uint64_t(ldf(bin + 8ul)) << 20)
+        + (uint64_t(ldf(bin + 12ul)) << 40);
+}
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint r = gl_WorkGroupID.x;
+    Params p = params_of(pc.params, r);
+    State s = state_of(pc.state, r);
+    if (!desc_runs(p, s, pc.desc, pc.position)) {
+        return;
+    }
+    const uint bins = level_bins(pc.level);
+    const uint per_thread = bins / THREADS;
+    const uint64_t mine =
+        pc.exchange + 4ul * (uint64_t(r) * BINS + uint64_t(tid) * per_thread) * BIN_WORDS;
+
+    uint64_t c = 0ul, w = 0ul;
+    for (uint j = 0u; j < per_thread; ++j) {
+        c += bin_count(mine + 16ul * j);
+        w += bin_weight(mine + 16ul * j);
+    }
+    counts[tid] = c;
+    weights[tid] = w;
+    // Running totals over the invocations, the invocation's own bins included.
+    for (uint offset = 1u; offset < THREADS; offset <<= 1) {
+        barrier();
+        const uint64_t pc_ = tid >= offset ? counts[tid - offset] : 0ul;
+        const uint64_t pw = tid >= offset ? weights[tid - offset] : 0ul;
+        barrier();
+        counts[tid] += pc_;
+        weights[tid] += pw;
+    }
+    barrier();
+
+    const bool by_count = pc.desc == DESC_TOPK || pc.desc == DESC_K100;
+    if (tid == 0u) {
+        uint64_t target;
+        if (pc.level > 0u) {
+            target = s.rem;
+        } else if (by_count) {
+            target = pc.desc == DESC_K100 ? uint64_t(SAMPLE_M) : uint64_t(s.k);
+        } else {
+            // The share of the weight of the set.
+            const uint64_t z = weights[THREADS - 1u];
+            if (pc.desc == DESC_TOPP) {
+                target = sample_share(z, p.top_p_q32);
+                target = target == 0ul ? 1ul : target;
+            } else {
+                target = sample_share(z, p.typical_q32) + 1ul;
+            }
+        }
+        shared_target = target;
+    }
+    barrier();
+    const uint64_t target = shared_target;
+    const uint64_t total = by_count ? counts[tid] : weights[tid];
+    const uint64_t before = tid != 0u ? (by_count ? counts[tid - 1u] : weights[tid - 1u]) : 0ul;
+    const uint shift = pc.level == 0u ? 0u : (pc.level == 1u ? 11u : 10u);
+    if (tid == THREADS - 1u && total < target) {
+        // Fewer tokens than the target asks for: no cut. A prefix no key has keeps the deeper
+        // levels empty.
+        s.prefix = 0xffffffffu;
+        s.rem = 0ul;
+    } else if (before < target && target <= total) {
+        uint64_t run = before;
+        uint bin = 0u;
+        for (uint j = 0u; j < per_thread; ++j) {
+            const uint64_t b = mine + 16ul * j;
+            const uint64_t v = by_count ? bin_count(b) : bin_weight(b);
+            bin = tid * per_thread + j;
+            if (run + v >= target) {
+                break;
+            }
+            run += v;
+        }
+        s.prefix = pc.level == 0u ? bin : (s.prefix << shift) | bin;
+        s.rem = target - run;
+    }
+    barrier();
+    if (tid != 0u || pc.level != 2u) {
+        return;
+    }
+    const uint cut = s.prefix;
+    switch (pc.desc) {
+    case DESC_TOPK:
+    case DESC_TOPP:
+        if (cut != 0xffffffffu) {
+            s.hi = min(s.hi, cut);
+        }
+        sample_stage_done(p, s, pc.position);
+        break;
+    case DESC_TYPICAL:
+        s.cut = cut;
+        break;
+    default:
+        s.cut100 = cut;
+        break;
+    }
+}

@@ -11,6 +11,7 @@ build = "build.rs"
 [dependencies]
 ash = "0.38"
 ares-core = { path = "../core" }
+ares-sampler.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]

@@ -25,6 +25,41 @@ pub(crate) const PUSH_CONSTANT_BYTES: u32 = 128;
 /// then has at most 32 subgroups, which is what their reductions are sized for.
 pub(crate) const MIN_SUBGROUP_SIZE: u32 = 8;
 
+/// The shared memory the sampler's histograms need in a workgroup: 2048 bins of four 32-bit
+/// words, and a small area for the reductions.
+pub(crate) const SAMPLER_SHARED_BYTES: u32 = 2048 * 4 * 4 + 256;
+
+/// The workgroup the sampler's kernels are written for.
+pub(crate) const SAMPLER_WORKGROUP: u32 = 256;
+
+/// Why the sampler cannot run on a device that reports these, if it cannot: `shader_float64`
+/// (`shaderFloat64`), the bytes of shared memory of a workgroup and the invocations of the
+/// largest workgroup.
+pub(crate) fn sampler_requirements(
+    shader_float64: bool,
+    shared_memory: u32,
+    workgroup: u32,
+) -> Option<String> {
+    if !shader_float64 {
+        Some(
+            "it lacks shaderFloat64: the sampler's entropy, deviation, dynamic temperature and \
+             mirostat are IEEE double-precision arithmetic that the host repeats bit for bit"
+                .to_owned(),
+        )
+    } else if shared_memory < SAMPLER_SHARED_BYTES {
+        Some(format!(
+            "its workgroups have {shared_memory} bytes of shared memory, the histograms need \
+             {SAMPLER_SHARED_BYTES}"
+        ))
+    } else if workgroup < SAMPLER_WORKGROUP {
+        Some(format!(
+            "its workgroups have {workgroup} invocations, at least {SAMPLER_WORKGROUP} are needed"
+        ))
+    } else {
+        None
+    }
+}
+
 pub(crate) struct Instance {
     /// Keeps the loader library mapped for as long as the instance lives.
     _entry: Entry,
@@ -61,6 +96,13 @@ pub(crate) struct Physical {
     /// kernels need, plus shuffles within a subgroup (the codec's butterflies) and
     /// `max_shared_memory` for the smallest kernel.
     pub(crate) attention_unsupported: Option<String>,
+    /// Why the sampler cannot run here, if it cannot: it does double-precision arithmetic
+    /// (`shaderFloat64`) in the kernels that finish a stage, builds histograms of the tokens in
+    /// [`SAMPLER_SHARED_BYTES`] of shared memory and reduces in workgroups of 256 invocations.
+    pub(crate) sampler_unsupported: Option<String>,
+    /// Whether the device runs double-precision arithmetic in shaders (`shaderFloat64`); it is
+    /// switched on when the device is opened.
+    pub(crate) shader_float64: bool,
     /// Bytes of shared memory a workgroup may use (`maxComputeSharedMemorySize`).
     pub(crate) max_shared_memory: u32,
     /// Invocations in the largest workgroup of one dimension the device runs
@@ -248,6 +290,7 @@ fn describe(entry: &Entry, instance: &ash::Instance, raw: vk::PhysicalDevice) ->
         unusable.get_or_insert(reason);
     };
     let mut coop_supported = false;
+    let mut shader_float64 = false;
     let mut quantized_unsupported = None;
     let mut no_quantized = |reason: String| {
         quantized_unsupported.get_or_insert(reason);
@@ -272,6 +315,7 @@ fn describe(entry: &Entry, instance: &ash::Instance, raw: vk::PhysicalDevice) ->
         // (the dot product one only when its extension is listed).
         unsafe { instance.get_physical_device_features2(raw, &mut features) };
         let int64 = features.features.shader_int64 == vk::TRUE;
+        shader_float64 = features.features.shader_float64 == vk::TRUE;
         let int16 = features.features.shader_int16 == vk::TRUE;
         coop_supported = has_coop && coop_features.cooperative_matrix == vk::TRUE;
         if !has_dot_product || dot_features.shader_integer_dot_product != vk::TRUE {
@@ -366,6 +410,14 @@ fn describe(entry: &Entry, instance: &ash::Instance, raw: vk::PhysicalDevice) ->
         (!subgroup.supported_operations.contains(vk::SubgroupFeatureFlags::SHUFFLE))
             .then(|| "the attention kernels need shuffles within a subgroup".to_owned())
     });
+    let sampler_unsupported = sampler_requirements(
+        shader_float64,
+        props.limits.max_compute_shared_memory_size,
+        props
+            .limits
+            .max_compute_work_group_invocations
+            .min(props.limits.max_compute_work_group_size[0]),
+    );
     let device_heap = device_heap.unwrap_or(0);
     let family_index = family.unwrap_or(0);
     let info = DeviceInfo {
@@ -402,6 +454,8 @@ fn describe(entry: &Entry, instance: &ash::Instance, raw: vk::PhysicalDevice) ->
         memory_budget,
         unusable,
         attention_unsupported,
+        sampler_unsupported,
+        shader_float64,
         max_shared_memory: props.limits.max_compute_shared_memory_size,
         max_workgroup_size: props
             .limits
@@ -469,5 +523,30 @@ fn describe_sharing(
                     | vk::ExternalSemaphoreFeatureFlags::IMPORTABLE,
             ),
         driver_uuid,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_device_without_double_precision_is_refused_with_the_reason() {
+        let reason = sampler_requirements(false, 49152, 1024).expect("refused");
+        assert!(reason.contains("shaderFloat64"), "{reason}");
+    }
+
+    #[test]
+    fn a_device_with_too_little_shared_memory_or_too_small_workgroups_is_refused() {
+        let reason = sampler_requirements(true, 16384, 1024).expect("refused");
+        assert!(reason.contains("16384") && reason.contains("shared memory"), "{reason}");
+        let reason = sampler_requirements(true, 49152, 128).expect("refused");
+        assert!(reason.contains("128 invocations"), "{reason}");
+    }
+
+    #[test]
+    fn a_device_that_has_what_the_sampler_needs_is_accepted() {
+        assert_eq!(sampler_requirements(true, SAMPLER_SHARED_BYTES, SAMPLER_WORKGROUP), None);
+        assert_eq!(sampler_requirements(true, 65536, 1024), None);
     }
 }

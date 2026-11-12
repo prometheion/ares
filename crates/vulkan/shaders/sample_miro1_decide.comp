@@ -1,0 +1,82 @@
+#version 450
+#include "sample_pass.glsl"
+
+// Mirostat 1: the `k` that the hundred most probable tokens imply. The keys below the hundredth
+// come from all devices; the rest of the hundred are the hundredth key itself.
+//
+// Grid (rows), 32 invocations of which the first works.
+layout(local_size_x = 32) in;
+
+layout(push_constant, std430) uniform Push {
+    uint64_t exchange;
+    uint64_t params;
+    uint64_t state;
+    uint devices;
+    uint position;
+} pc;
+
+bool finite_d(double x) { return ((bits_of(x) >> 52) & 0x7ffUL) != 0x7ffUL; }
+
+void main() {
+    if (gl_LocalInvocationID.x != 0u) {
+        return;
+    }
+    const uint r = gl_WorkGroupID.x;
+    Params p = params_of(pc.params, r);
+    State s = state_of(pc.state, r);
+    if (!stage_runs(p, s, pc.position, STAGE_MIRO1)) {
+        return;
+    }
+    const uint64_t slots = pc.exchange + 4ul * uint64_t(r) * pc.devices * GATHER_VALUES;
+    // The keys below the hundredth, in ascending order.
+    uint keys[SAMPLE_M];
+    uint n = 0u;
+    for (uint d = 0u; d < pc.devices; ++d) {
+        const uint64_t slot = slots + 4ul * d * GATHER_VALUES;
+        const uint count = uint(ldf(slot));
+        for (uint i = 0u; i < count && n < SAMPLE_M; ++i) {
+            const uint key = (uint(ldf(slot + 4ul * (1u + 2u * i))) << 16)
+                | uint(ldf(slot + 4ul * (2u + 2u * i)));
+            uint at = n++;
+            while (at > 0u && keys[at - 1u] > key) {
+                keys[at] = keys[at - 1u];
+                --at;
+            }
+            keys[at] = key;
+        }
+    }
+    // With fewer than a hundred tokens in the set all of them are listed.
+    const uint m = s.cut100 == 0xffffffffu ? n : SAMPLE_M;
+    uint k = 1u;
+    if (m >= 2u) {
+        double x[SAMPLE_M];
+        for (uint i = 0u; i < m; ++i) {
+            const uint key = i < n ? keys[i] : s.cut100;
+            float d, xf;
+            sample_x(s, key, d, xf);
+            x[i] = double(xf);
+        }
+        double sum_tb = 0.0LF, sum_tt = 0.0LF;
+        for (uint i = 0u; i + 1u < m; ++i) {
+            const double t = sample_ln_d(ddiv(double(i + 2u), double(i + 1u)));
+            sum_tb = dadd(sum_tb, dmul(t, dsub(x[i + 1u], x[i])));
+            sum_tt = dadd(sum_tt, dmul(t, t));
+        }
+        const double s_hat = ddiv(sum_tb, sum_tt);
+        if (finite_d(s_hat) && s_hat > 0.0LF) {
+            const double eps = dsub(s_hat, 1.0LF);
+            const double n_vocab = double(p.vocab);
+            const double two_mu = sample_exp_d(dmul(double(p.mu), LN2));
+            const double base = ddiv(
+                dmul(eps, two_mu),
+                dsub(1.0LF, sample_exp_d(dmul(-eps, sample_ln_d(n_vocab)))));
+            if (finite_d(base) && base > 0.0LF) {
+                const double value = sample_pow_d(base, ddiv(1.0LF, s_hat));
+                if (finite_d(value) && value >= 1.0LF) {
+                    k = value < 4294967295.0LF ? uint(value) : 0xffffffffu;
+                }
+            }
+        }
+    }
+    s.k = k;
+}

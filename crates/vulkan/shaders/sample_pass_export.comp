@@ -1,0 +1,54 @@
+#version 450
+#include "sample_pass.glsl"
+
+// Adds up the partial results of the chunks of a pass and puts the totals into this device's
+// slot of `exchange` (PASS_VALUES values per device and row, four limbs per number) and zeros
+// into the other slots.
+//
+// Grid (rows), THREADS invocations, `chunks` at most that many.
+layout(local_size_x = 256) in;
+
+layout(push_constant, std430) uniform Push {
+    uint64_t lists;
+    uint64_t params;
+    uint64_t state;
+    uint64_t exchange;
+    uint chunks;
+    uint devices;
+    uint rank;
+    uint mode;
+    uint position;
+} pc;
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint r = gl_WorkGroupID.x;
+    if (!pass_runs(params_of(pc.params, r), state_of(pc.state, r), pc.mode, pc.position)) {
+        return;
+    }
+    const bool range = pc.mode == PASS_XTC || pc.mode == PASS_TYPICAL;
+    const uint n = range ? 2u : 5u;
+    const uint64_t mine = pc.lists + 8ul * (uint64_t(r) * pc.chunks + tid) * PARTIALS;
+    uint64_t totals[5];
+    for (uint k = 0u; k < n; ++k) {
+        const uint64_t v = tid < pc.chunks ? U64Ref(mine + 8ul * k).v[0] : 0ul;
+        // XTC counts tokens (number 0); everything else that is a range is a maximum.
+        const bool maximum = range && !(pc.mode == PASS_XTC && k == 0u);
+        totals[k] = maximum ? block_max_u64(v) : block_sum_u64(v);
+        barrier();
+    }
+    if (tid != 0u) {
+        return;
+    }
+    const uint64_t slots = pc.exchange + 4ul * uint64_t(r) * pc.devices * PASS_VALUES;
+    for (uint d = 0u; d < pc.devices; ++d) {
+        const uint64_t slot = slots + 4ul * d * PASS_VALUES;
+        for (uint k = 0u; k < n; ++k) {
+            const uint64_t v = d == pc.rank ? totals[k] : 0ul;
+            for (uint limb = 0u; limb < 4u; ++limb) {
+                FloatRef(slot + 4ul * (k * 4u + limb)).v[0] =
+                    float(uint((v >> (16u * limb)) & 0xffffUL));
+            }
+        }
+    }
+}

@@ -1,0 +1,44 @@
+#version 450
+#include "sample_pass.glsl"
+
+// Moves the keys the row's chunks gathered into this device's slot of `exchange`
+// (GATHER_VALUES values per device and row: the count, then each key as two halves of 16 bits)
+// and zeros into the other slots, and empties the list.
+//
+// Grid (rows), 32 invocations of which the first works.
+layout(local_size_x = 32) in;
+
+layout(push_constant, std430) uniform Push {
+    uint64_t state;
+    uint64_t params;
+    uint64_t gather;
+    uint64_t exchange;
+    uint gather_stride;
+    uint devices;
+    uint rank;
+    uint position;
+} pc;
+
+void main() {
+    if (gl_LocalInvocationID.x != 0u) {
+        return;
+    }
+    const uint r = gl_WorkGroupID.x;
+    State s = state_of(pc.state, r);
+    if (!pass_runs(params_of(pc.params, r), s, PASS_GATHER, pc.position)) {
+        return;
+    }
+    const uint n = min(s.n_gather, SAMPLE_M);
+    const uint64_t slots = pc.exchange + 4ul * uint64_t(r) * pc.devices * GATHER_VALUES;
+    for (uint d = 0u; d < pc.devices; ++d) {
+        const uint64_t slot = slots + 4ul * d * GATHER_VALUES;
+        FloatRef(slot).v[0] = d == pc.rank ? float(n) : 0.0;
+        for (uint i = 0u; i < SAMPLE_M; ++i) {
+            const uint key = (d == pc.rank && i < n)
+                ? ldu(pc.gather + 4ul * (uint64_t(r) * pc.gather_stride + i)) : 0u;
+            FloatRef(slot + 4ul * (1u + 2u * i)).v[0] = float(key >> 16);
+            FloatRef(slot + 4ul * (2u + 2u * i)).v[0] = float(key & 0xffffu);
+        }
+    }
+    s.n_gather = 0u;
+}

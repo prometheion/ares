@@ -169,10 +169,10 @@ machine (RTX 4070 + RTX 3060, Qwen3.8-27B) or read from the engines listed in
 | `ares-core` | Tensor element types and block geometry, byte units, memory ledgers | Done, unit tested |
 | `ares-gguf` | Zero-copy GGUF reader (version 3, split files, validation at open), a small writer for tests | Done; tested against synthetic, truncated and corrupted files and real models |
 | `ares-quant` | CPU reference decoder for every GGUF type; the specification and reference codec of the engine's own KV formats (`f16`, `q8` to `q4`, tiles with a mean, the policy of exact cells) | Done; bit-identical to ggml's C code on fixtures generated from it; the KV formats are pinned by golden files and were measured on the K and V of real models |
-| `ares-sampler` | The definitions of the sampler: the settings of a row, the arithmetic every backend repeats bit for bit, the pick of one row written from its definitions (`sample_reference`), the penalties, DRY and logit bias the host works out, token masks | Done; the reference is checked against llama.cpp's samplers written again in double precision, the penalties against their definition; see [Sampling](#sampling) |
+| `ares-sampler` | The definitions of the sampler: the settings of a row, the arithmetic every backend repeats bit for bit, the pick of one row written from its definitions (`sample_reference`), the penalties, DRY and logit bias the host works out, token masks | Done; the reference is checked against llama.cpp's samplers written again in double precision, the penalties against their definition; both backends' kernels are held to it bit for bit; see [Sampling](#sampling) |
 | `ares-cuda` | Driver API bound at run time, devices, memory, streams, events, modules, decode weight kernels for all 28 weight types, prefill weight kernels for eleven, the layer kernels of `qwen35`, attention over the stored K/V formats, the sampler's kernels, the mesh that sums across devices over peer access or the host | Device layer, decode, layer and attention kernels done; prefill kernels verified, their pass over the weights 1.3 times as fast as the fork's whole prefill; tested on both GPUs, with and without peer access |
 | `ares-grammar` | The grammar engine on the host: GBNF grammars, JSON schemas, Lark and regular expressions turned into the set of tokens that may come next (llguidance behind a vocabulary of bytes per token), the reasoning gate, the cut of forbidden drafts | Done; GPU-free tests of the engine, and through the runtime and the server; see [Sampling](#sampling) |
-| `ares-vulkan` | The same device-level surface on Vulkan; decode and prefill weight kernels for all 28 weight types as compute shaders, the prefill ones on cooperative matrices; the layer kernels; attention over the stored K/V formats; sums between devices | Device layer and weight, layer and attention kernels done (23 device, 9 kernel, 8 layer, 4 layout, 9 mesh and 9 attention tests on both GPUs); no sampler (to be rebuilt against `ares-sampler`), no expert or `qwen4exp` kernels and no model yet |
+| `ares-vulkan` | The same device-level surface on Vulkan; decode and prefill weight kernels for all 28 weight types as compute shaders, the prefill ones on cooperative matrices; the layer kernels; attention over the stored K/V formats; the sampler's kernels; sums between devices | Device layer and weight, layer, attention and sampler kernels done (23 device, 9 kernel, 8 layer, 4 layout, 9 mesh, 9 attention and 8 sampler tests on both GPUs; the sampler's records equal `ares-sampler`'s reference bit for bit); no expert or `qwen4exp` kernels and no model yet |
 | `ares-state` | Page pool, page tables with copy on write, the prefix index (pages published as they fill, tails, announcements, priority classes), the checkpoint policy for recurrent state, page layouts | Done as bookkeeping; randomised model checks; the conductor's prefix cache uses them (see `ares-runtime`) |
 | `ares-store` | State on disk: pages and checkpoints by content hash in segment files, per fingerprint, with a size limit | Done as a store of opaque bytes, tested against restarts, the limit and damaged files; not yet connected to devices |
 | `ares-io` | Reads of weights straight from the model file: io_uring with direct I/O, demand before prefetch, cancel and promote, copies of a file on several drives with the reads spread over them, a map from experts to file ranges, row reads behind a cache | Done, tested against real files and on two drives; 1.4 to 1.7 GiB/s of random expert-sized reads per SSD of the development machine and 2.9 to 3.0 GiB/s over both; the expert store and the n-gram rows of `qwen4exp` read through it |
@@ -230,7 +230,8 @@ requests ──► plan ──► upload step record ──► window ──► 
    Position-addressable state is appended; recurrent layers read their base
    state and keep their inputs.
 4. **Sample.** The sampler's kernels pick the token of every wanted row on
-   the device (`ares_cuda::SamplerKernels`): the logits are corrected first
+   the device (`ares_cuda::SamplerKernels`, or `ares_vulkan::SamplerKernels` with the
+   same steps): the logits are corrected first
    (the row's entries and mask, written in the step record), then the most
    probable token is taken, or the stages of the row's program cut the tokens
    and scale the temperature as exact thresholds (radix descents over integer
@@ -971,13 +972,14 @@ pay, because the policy drafts what the price and the acceptance say pay.
 
 A request can set what the model's logits go through before a token is drawn
 from them, and ask for the probabilities of what was drawn. All of it runs on
-the device, in the kernels of `ares-cuda` (`kernels/sampler_*.cuh`), and is
+the device, in the kernels of `ares-cuda` (`kernels/sampler_*.cuh`) or of
+`ares-vulkan` (`shaders/sample_*.comp`, see [Vulkan](#vulkan)), and is
 defined by `ares-sampler`, a crate with no device in it: the settings of a
 row (`SampleParams`, `SampleRow`), the arithmetic every backend repeats
 operation by operation (`arith`), the pick of one row written from its
 definitions (`sample_reference`) and the corrections the host works out
 (`penalties`). Every test of the kernels compares the records they write with
-the reference's bit for bit; a second backend is held to the same.
+the reference's bit for bit; Vulkan's are held to the same.
 
 **What a row carries.** Each wanted row of a step has a sampler row in the step
 record (128 bytes: position, seed, the stages of its program and their
@@ -2757,17 +2759,57 @@ GPU that CUDA 13 does not run on.
   or 138 workgroups, as it did in four earlier runs of the whole table, so it
   is not the plan; it depends on what ran before or where the pools lie, and
   the cause is not found.
-- The sampler does not exist on Vulkan yet. A mirror of CUDA's first sampler
-  was built (commit `f857acb`: kernels in `shaders/sample_*.comp`, a host
-  side in `crates/vulkan/src/sampler.rs`, an agreement test against the host
-  reference and a benchmark next to CUDA's; it was as fast as CUDA's or
-  faster, and had no 64-bit atomic, which is optional on Vulkan, so every
-  chunk wrote its best score and one more kernel took the maximum). It
-  implemented the definitions that `ares_cuda` held then (`SampleParams`,
-  `sample_reference`), which moved into `ares-sampler` and were rewritten
-  with penalties, DRY, masks, logprobs and more samplers, so the mirror was
-  removed. Vulkan's sampler is to be rebuilt against `ares-sampler`, with
-  that commit as a starting point.
+- The sampler (`SamplerKernels`, `shaders/sample_*.comp`, `lp_*.comp`,
+  `draft_*.comp`) has every step, record and entry point of CUDA's:
+  corrections and masks, the token map and slices of the vocabulary as
+  several devices hold them, the radix descents of top-k, top-p and typical
+  sampling, top-n-sigma, min-p, XTC, temperature and its dynamic form,
+  mirostat 1 and 2, the draw, the probabilities before and after the chain,
+  and the draft kernels (picks into the next records, hidden-state gather,
+  shift, keep and commit of the carry). `tests/sampler.rs` is the twin of
+  CUDA's: 1312 rows of 41 settings, four shapes of rows and vocabularies
+  from one token to Qwen's equal the records of `sample_reference` bit for
+  bit on both cards, and so do rows with corrections and masks, with a token
+  map, with the vocabulary cut into two or three slices whose exchange is
+  added on the host, and in batches of different sizes that share one
+  scratch area. A second test holds each function of the arithmetic (the
+  weight, both logarithms, the exponential, the power, the Gumbel noise, the
+  terms of a token, the division and the square root in double precision, the
+  conversions of 64-bit integers) to `ares_sampler::arith` over 20 000
+  random inputs from every range the sampler reaches, bit for bit on both
+  cards. The code is CUDA's operation for operation, with these differences:
+  - No 64-bit atomic (an optional feature on Vulkan, which the first
+    mirror already avoided): every chunk of the vocabulary writes its best
+    score, or its sums, into the scratch area, and the kernel that follows
+    takes the maximum or adds them. The row's state is 128 bytes.
+  - Subgroup operations of whatever width the device reports (at least 8)
+    and shared memory for one value per subgroup; a maximum or a sum of
+    64-bit numbers goes through 32-bit halves or 16-bit limbs, so that the
+    64-bit subgroup types are not needed.
+  - Division in single and double precision is corrected by fused
+    multiply-adds to the correctly rounded quotient (the division of a
+    shader is only within a few ulp), and every operation is `precise`, so
+    that nothing is fused into a multiply-add.
+  - **Double precision.** The reference uses IEEE doubles where a row needs a
+    handful of numbers: the entropy and the deviation of a set, the dynamic
+    temperature, the limit of mirostat 2, the exponent that mirostat 1
+    estimates, the logarithm of the sum that a probability is divided by.
+    The kernels repeat them with `double`, which needs the device feature
+    `shaderFloat64`; both cards have it, and their addition, subtraction,
+    multiplication, division (the corrected form),
+    square root, and conversions between 64-bit integers, `f32` and `f64`
+    equal Rust's in every bit tested. A device without `shaderFloat64` is
+    refused at `SamplerKernels::load` with that reason; no other precision is
+    substituted, since a sampler that diverged from the reference in the
+    last bit would no longer give a seed the same text on both backends.
+    (A soft-float library in 64-bit integers would give the bits on every
+    device; it is not built.) Denormal results, and the order of NaNs and
+    infinities in arithmetic, are left to the device: the shaders test the
+    special logits on their bits, and a logit in the denormal range is not
+    in the tests.
+  - A device is also refused for less than 32 KiB of shared memory (the
+    histograms of the descent) or workgroups of fewer than 256 invocations,
+    with the numbers it reports. Nothing asks for a device's name.
 - The expert and `qwen4exp` kernels and a model on Vulkan do not exist yet.
 - No direct route between the two cards works on this driver: an exported
   allocation is imported by the other card without an error and carries no
@@ -2853,14 +2895,16 @@ Work is paused here until Qwen4 is released; nothing below is in progress.
   with drafts the tokens are the tokens without them (bit for bit on the
   synthetic model, and equal in all 14 settings on the 27B). A request that asks
   for none of it costs what the old sampler did. See [Sampling](#sampling).
+  Vulkan's kernels (same steps and records, no 64-bit atomics, `shaderFloat64`
+  required) equal the same reference bit for bit on both cards; no model runs
+  them yet.
 - Vulkan has the weight kernels (the same device layouts, byte for byte) and
   the layer kernels, at CUDA's speed on these cards, and the attention kernels
   over all stored K/V formats. Attention is within 20 % of
   CUDA's for one row of `f16`, 1.3 to 3.3 times as slow for one row of `q8`
   or `q4` and 2 to 6.5 times for windows of 8 and 64 rows (no tensor cores,
-  items of 16 vectors). It has no sampler (to be rebuilt against
-  `ares-sampler`; commit `f857acb` holds the mirror of CUDA's first one), no
-  expert or `qwen4exp` kernels and no model.
+  items of 16 vectors). It has the sampler and no expert or `qwen4exp`
+  kernels and no model.
 - The KV formats are specified, pinned by golden files and measured on the K
   and V of real models; the CUDA kernels write them bit-exactly and read
   them within 1e-3 of the CPU reference. The dense model serves all of
@@ -2922,8 +2966,10 @@ order it would be taken up; the source of each idea is in
    does not change with the draft block or from one load to the next; a row
    of a draft window computed with the bits it has alone, in the recurrent
    and attention layers too, so that drafts cannot change the text.
-6. Vulkan: the sampler against `ares-sampler` (commit `f857acb` is the
-   starting point), experts, the `qwen4exp` kernels, and the models; attention for
+6. Vulkan: experts, the `qwen4exp` kernels, and the models (the sampler's
+   kernels wait for a model that calls them); a sampler on devices without
+   `shaderFloat64`, with the double-precision functions written in 64-bit
+   integers; attention for
    windows of many rows on the cooperative matrices, and a faster decode of
    the `q8` and `q4` rows; a faster upload.
 7. Tool calls (on the grammars of Sampling), the

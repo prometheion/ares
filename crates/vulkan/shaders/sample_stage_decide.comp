@@ -1,0 +1,203 @@
+#version 450
+#include "sample_pass.glsl"
+
+// Reads the totals of the pass before it and takes the row's stage one step on (see PHASE_*).
+//
+// Grid (rows), 32 invocations of which the first works.
+layout(local_size_x = 32) in;
+
+layout(push_constant, std430) uniform Push {
+    uint64_t exchange;
+    uint64_t params;
+    uint64_t state;
+    uint devices;
+    uint phase;
+    uint position;
+} pc;
+
+// The five sums, added up over the devices.
+void slot_sums(uint64_t slots, uint devices, out uint64_t sums[5]) {
+    [[unroll]] for (uint k = 0u; k < 5u; ++k) {
+        sums[k] = 0ul;
+    }
+    for (uint d = 0u; d < devices; ++d) {
+        for (uint k = 0u; k < 5u; ++k) {
+            sums[k] += slot_number(slots + 4ul * d * PASS_VALUES, k);
+        }
+    }
+}
+
+// The standard deviation of the distances of a set, as a float.
+float sigma_of(uint64_t sums[5]) {
+    if (sums[0] == 0ul) {
+        return 0.0;
+    }
+    const double n = double(sums[0]);
+    const double mean = ddiv(ddiv(double(sums[3]), 16777216.0LF), n);
+    const double var = dsub(ddiv(ddiv(double(sums[4]), 65536.0LF), n), dmul(mean, mean));
+    return float(var > 0.0LF ? sqrt(var) : 0.0LF);
+}
+
+// The entropy of the distribution of a set, in nats.
+double entropy_of(uint64_t sums[5]) {
+    if (sums[1] == 0ul) {
+        return 0.0LF;
+    }
+    return dadd(sample_ln_fixed(sums[1]), ddiv(double(sums[2]), double(sums[1])));
+}
+
+// Whether the token with key `key` is kept by mirostat 2 at surprise limit `limit` (in nats of
+// the scaled distance).
+bool miro2_keeps(State s, uint key, double limit) {
+    float d, x;
+    sample_x(s, key, d, x);
+    return double(x) <= limit;
+}
+
+void main() {
+    if (gl_LocalInvocationID.x != 0u) {
+        return;
+    }
+    const uint r = gl_WorkGroupID.x;
+    Params p = params_of(pc.params, r);
+    State s = state_of(pc.state, r);
+    const uint64_t slots = pc.exchange + 4ul * uint64_t(r) * pc.devices * PASS_VALUES;
+    const uint position = pc.position;
+    uint64_t sums[5];
+    switch (pc.phase) {
+    case PHASE_NSIGMA: {
+        if (!stage_runs(p, s, position, STAGE_NSIGMA)) {
+            return;
+        }
+        slot_sums(slots, pc.devices, sums);
+        if (sums[0] > 1ul) {
+            const float lim = fadd(uintBitsToFloat(s.lo), fmul(p.n_sigma, sigma_of(sums)));
+            s.hi = min(s.hi, min(floatBitsToUint(lim), KEY_MAX));
+        }
+        sample_stage_done(p, s, position);
+        return;
+    }
+    case PHASE_TYPICAL_MEAN: {
+        if (!stage_runs(p, s, position, STAGE_TYPICAL)) {
+            return;
+        }
+        slot_sums(slots, pc.devices, sums);
+        s.mean_x = sums[1] == 0ul ? 0.0 : float(ddiv(double(sums[2]), double(sums[1])));
+        return;
+    }
+    case PHASE_TYPICAL_SET: {
+        if (!stage_runs(p, s, position, STAGE_TYPICAL)) {
+            return;
+        }
+        uint64_t min_enc = 0ul, max_key = 0ul;
+        for (uint d = 0u; d < pc.devices; ++d) {
+            const uint64_t slot = slots + 4ul * d * PASS_VALUES;
+            min_enc = max(min_enc, slot_number(slot, 0u));
+            max_key = max(max_key, slot_number(slot, 1u));
+        }
+        if (max_key != 0ul) {
+            s.lo = uint(0x100000000UL - min_enc);
+            s.hi = uint(max_key - 1ul);
+        }
+        sample_stage_done(p, s, position);
+        return;
+    }
+    case PHASE_XTC_TARGET: {
+        if (!stage_runs(p, s, position, STAGE_XTC) || !xtc_applies(p)) {
+            return;
+        }
+        slot_sums(slots, pc.devices, sums);
+        // ceil(z * thr / 2^32), at least 1.
+        const uint64_t lo = (sums[1] & 0xffffffffUL) * uint64_t(p.xtc_thr_q32);
+        const uint64_t hi = (sums[1] >> 32) * uint64_t(p.xtc_thr_q32);
+        const uint64_t target = hi + (lo >> 32) + ((lo & 0xffffffffUL) != 0ul ? 1ul : 0ul);
+        s.target = target == 0ul ? 1ul : target;
+        return;
+    }
+    case PHASE_XTC_CUT: {
+        if (!stage_runs(p, s, position, STAGE_XTC)) {
+            return;
+        }
+        if (xtc_applies(p) && s.target != 0ul) {
+            uint64_t count = 0ul, max_key = 0ul;
+            for (uint d = 0u; d < pc.devices; ++d) {
+                const uint64_t slot = slots + 4ul * d * PASS_VALUES;
+                count += slot_number(slot, 0u);
+                max_key = max(max_key, slot_number(slot, 1u));
+            }
+            if (count >= 2ul) {
+                s.lo = uint(max_key - 1ul);
+            }
+            s.target = 0ul;
+        }
+        sample_stage_done(p, s, position);
+        return;
+    }
+    case PHASE_TEMP: {
+        if (!stage_runs(p, s, position, STAGE_TEMP) || !(p.dyn_delta > 0.0)) {
+            return;
+        }
+        slot_sums(slots, pc.devices, sums);
+        if (sums[0] > 1ul) {
+            const double t0 = double(p.temp);
+            const double delta = double(p.dyn_delta);
+            const double low = dsub(t0, delta);
+            const double min_t = low > 0.0LF ? low : 0.0LF;
+            const double max_t = dadd(t0, delta);
+            double normalized = ddiv(entropy_of(sums), sample_ln_d(double(sums[0])));
+            normalized = normalized < 0.0LF ? 0.0LF : (normalized > 1.0LF ? 1.0LF : normalized);
+            const double dynamic = dadd(
+                min_t, dmul(dsub(max_t, min_t), sample_pow_d(normalized, double(p.dyn_exp))));
+            const float t = float(dynamic);
+            if (t < TEMPERATURE_MIN) {
+                s.hi = s.lo;
+            } else {
+                s.inv_t = fmul(s.inv_t, fdiv(1.0, t));
+            }
+        }
+        sample_stage_done(p, s, position);
+        return;
+    }
+    case PHASE_MIRO2: {
+        if (!stage_runs(p, s, position, STAGE_MIRO2)) {
+            return;
+        }
+        slot_sums(slots, pc.devices, sums);
+        const double limit = dsub(dmul(double(p.mu), LN2), sample_ln_fixed(sums[1]));
+        // The largest key whose token is kept, found from where the threshold falls and
+        // corrected for the rounding of the multiplications: the surprise grows with the key.
+        uint hi = s.lo;
+        if (miro2_keeps(s, s.lo, limit)) {
+            const float lo_f = uintBitsToFloat(s.lo);
+            const float guess = fadd(lo_f, float(ddiv(limit, double(s.inv_t))));
+            hi = max(s.lo, min(floatBitsToUint(guess), KEY_MAX));
+            for (int i = 0; i < 4096 && hi < KEY_MAX && miro2_keeps(s, hi + 1u, limit); ++i) {
+                hi += 1u;
+            }
+            for (int i = 0; i < 4096 && hi > s.lo && !miro2_keeps(s, hi, limit); ++i) {
+                hi -= 1u;
+            }
+        }
+        s.hi = min(s.hi, hi);
+        sample_stage_done(p, s, position);
+        return;
+    }
+    case PHASE_TAIL:
+    case PHASE_RAW: {
+        if (!pass_runs(p, s, pc.phase == PHASE_TAIL ? PASS_TAIL : PASS_RAW, position)) {
+            return;
+        }
+        slot_sums(slots, pc.devices, sums);
+        if (pc.phase == PHASE_TAIL) {
+            for (uint k = 0u; k < 5u; ++k) {
+                s.sums[k] = sums[k];
+            }
+        } else {
+            s.raw_lnz = sample_ln_fixed(sums[1]);
+        }
+        return;
+    }
+    default:
+        return;
+    }
+}

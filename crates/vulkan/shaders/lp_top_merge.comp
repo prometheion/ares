@@ -1,0 +1,48 @@
+#version 450
+#define TOP_N 20u
+#include "lp_take.glsl"
+
+// Like `sample_top_merge` for the 20 candidates of a row that reports probabilities. `raw`
+// picks the kind of row (the model's own probabilities, or those after the chain).
+//
+// Grid (rows), THREADS invocations, `chunks` at most that many.
+layout(local_size_x = 256) in;
+
+layout(push_constant, std430) uniform Push {
+    uint64_t lists;
+    uint64_t exchange;
+    uint64_t params;
+    uint64_t state;
+    uint64_t logprobs;
+    uint chunks;
+    uint devices;
+    uint rank;
+    uint raw;
+} pc;
+
+void main() {
+    const uint r = gl_WorkGroupID.x;
+    Params p = params_of(pc.params, r);
+    State s = state_of(pc.state, r);
+    if (!lp_row(p, s, pc.raw != 0u)) {
+        return;
+    }
+    if (gl_LocalInvocationID.x == 0u) {
+        bad_any = 0u;
+    }
+    barrier();
+    merge_chunks(pc.lists, r, pc.chunks);
+    if (gl_LocalInvocationID.x != 0u) {
+        return;
+    }
+    if (pc.devices == 1u) {
+        uint64_t best[LOGPROBS_MAX];
+        [[unroll]] for (uint c = 0u; c < LOGPROBS_MAX; ++c) {
+            best[c] = merged[c];
+        }
+        lp_take(best, p, s, logprobs_of(pc.logprobs, r), pc.raw != 0u);
+        return;
+    }
+    // The status word of this list is not used: the row's status comes from the other list.
+    export_list(pc.exchange, r, pc.devices, pc.rank, 0u);
+}

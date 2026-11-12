@@ -1,0 +1,5 @@
+#version 450
+// The best 20 tokens of the rows that report the model's own probabilities (see sample_top.glsl).
+#define TOP_N 20u
+#define TOP_ROWS 1
+#include "sample_top.glsl"

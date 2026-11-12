@@ -1,0 +1,48 @@
+#version 450
+#include "sample_common.glsl"
+
+// Applies the entries of each row: `l = l + bias`, then `l = l <= 0 ? l * rep : l / rep`, then
+// `l = l - sub` (`Entry::apply` in crates/sampler/src/row.rs). The column of a token is
+// `token - first`, or `inverse[token]` when the columns are not in the order of the tokens. An
+// entry for a token this device does not hold is left alone. The logit the shader finds is
+// written into the entry's `bias`, so that it is known later.
+//
+// Grid (ceil(entries / THREADS), rows), THREADS invocations.
+layout(local_size_x = 256) in;
+
+layout(push_constant, std430) uniform Push {
+    uint64_t logits;
+    uint64_t inverse;
+    uint64_t params;
+    uint64_t entries;
+    uint stride;
+    uint n_local;
+    uint first;
+    uint vocab;
+} pc;
+
+void main() {
+    const uint r = gl_WorkGroupID.y;
+    Params p = params_of(pc.params, r);
+    const uint i = gl_WorkGroupID.x * THREADS + gl_LocalInvocationID.x;
+    if (i >= p.entries_count) {
+        return;
+    }
+    Entry e = Entry(pc.entries + ENTRY_BYTES * (p.entries_first + i));
+    const uint token = e.token;
+    uint col;
+    if (pc.inverse != 0ul) {
+        col = token < pc.vocab ? ldu(pc.inverse + 4ul * token) : 0xffffffffu;
+    } else {
+        col = token - pc.first;
+    }
+    if (col >= pc.n_local) {
+        return;
+    }
+    FloatRef at = FloatRef(pc.logits + 4ul * (uint64_t(r) * pc.stride + col));
+    const float found = at.v[0];
+    float l = fadd(found, e.bias);
+    l = l <= 0.0 ? fmul(l, e.rep) : fdiv(l, e.rep);
+    at.v[0] = fsub(l, e.sub);
+    e.bias = found;
+}
