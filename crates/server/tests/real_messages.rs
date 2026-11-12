@@ -1,0 +1,359 @@
+//! The Anthropic Messages API through the server, with the real Qwen3.5-0.8B
+//! on a GPU: a message comes back as blocks, a stream put together is the
+//! message that is returned whole, a required call of a tool has an input of
+//! its schema and its result is answered, a conversation that is sent back
+//! (thinking blocks included) is counted and run, and the count of a request
+//! is the input it reports when it runs. Lines that start with `RES` say what
+//! the model did.
+//!
+//! The server runs in this process over the real engine (requests go through
+//! the router without a socket). Needs `ARES_TEST_CUDA=1` and
+//! `ARES_TEST_QWEN35_MODEL` (the 0.8B); `ARES_TEST_DEVICE` names the device
+//! (default 0).
+//!
+//! ```sh
+//! ARES_TEST_CUDA=1 ARES_TEST_QWEN35_MODEL=Qwen3.5-0.8B-Q4_K_M.gguf \
+//!     cargo test --release -p ares-server --test real_messages -- --test-threads=1 --nocapture
+//! ```
+
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use ares_api::{
+    ChatFormat, DecisionRequest, DecisionSink, Engine, EngineError, EngineStats, EventSink,
+    GenerateRequest, ModelCard, Prompt, RequestId,
+};
+use ares_cuda::{Device, Precision, Wait};
+use ares_gguf::Gguf;
+use ares_model::qwen35::device::{Options, Qwen35, Spread};
+use ares_runtime::{GpuConfig, Model, Runtime, RuntimeConfig};
+use axum::Router;
+use axum::body::Body;
+use axum::http::{Request, header};
+use serde_json::{Value, json};
+use tower::ServiceExt;
+
+const MESSAGES: &str = "/v1/messages";
+const COUNT: &str = "/v1/messages/count_tokens";
+
+fn small() -> Option<PathBuf> {
+    if std::env::var_os("ARES_TEST_CUDA").is_none() {
+        eprintln!("skipped: set ARES_TEST_CUDA=1 to run the tests that open GPUs");
+        return None;
+    }
+    let path = std::env::var_os("ARES_TEST_QWEN35_MODEL").map(PathBuf::from);
+    if path.is_none() {
+        eprintln!("skipped: set ARES_TEST_QWEN35_MODEL to the Qwen3.5-0.8B model file");
+    }
+    path
+}
+
+/// The runtime, with the count of a prompt taken from the model's own
+/// tokenizer: what `Engine::count_tokens` of the runtime is to do.
+struct Counting {
+    runtime: Arc<Runtime>,
+    model: Arc<dyn Model>,
+}
+
+impl Engine for Counting {
+    fn models(&self) -> Vec<ModelCard> {
+        self.runtime.models()
+    }
+
+    fn chat_format(&self, model: &str) -> Option<ChatFormat> {
+        self.runtime.chat_format(model)
+    }
+
+    fn count_tokens(&self, model: &str, prompt: &Prompt) -> Result<u32, EngineError> {
+        if model != self.model.card().id {
+            return Err(EngineError::ModelNotFound(model.to_owned()));
+        }
+        Ok(self.model.encode(prompt)?.len() as u32)
+    }
+
+    fn submit(&self, request: GenerateRequest, events: EventSink) -> Result<(), EngineError> {
+        self.runtime.submit(request, events)
+    }
+
+    fn decide(&self, request: DecisionRequest, outcome: DecisionSink) -> Result<(), EngineError> {
+        self.runtime.decide(request, outcome)
+    }
+
+    fn cancel(&self, id: RequestId) {
+        self.runtime.cancel(id);
+    }
+
+    fn stats(&self) -> Option<EngineStats> {
+        self.runtime.stats()
+    }
+}
+
+/// The server over the 0.8B on one device.
+fn served(path: &PathBuf) -> Router {
+    let options = Options {
+        precision: Precision::Exact,
+        max_rows: 128,
+        logit_rows: 16,
+        window_rows: 8,
+        pipeline_rows: 32,
+        ..Options::default()
+    };
+    let model =
+        Qwen35::new(Gguf::open(path).unwrap(), "q", &Spread::Single, options, 4096).unwrap();
+    let config =
+        RuntimeConfig { pages: 96, cells_per_page: 128, max_slots: 4, ..RuntimeConfig::default() };
+    let ordinal = std::env::var("ARES_TEST_DEVICE").ok().and_then(|d| d.parse().ok()).unwrap_or(0);
+    let devices = vec![Device::open(ordinal, Wait::Block).unwrap()];
+    let model: Arc<dyn Model> = Arc::new(model);
+    let gpu = GpuConfig::new(&config, &*model);
+    let runtime = Arc::new(Runtime::start_gpu(model.clone(), devices, config, gpu).unwrap());
+    ares_server::router(Arc::new(Counting { runtime, model }))
+}
+
+async fn post(app: &Router, path: &str, body: &Value) -> (u16, String) {
+    let request = Request::post(path)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header("x-api-key", "none")
+        .header("anthropic-version", "2023-06-01")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    let status = response.status().as_u16();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    (status, String::from_utf8(bytes.to_vec()).unwrap())
+}
+
+fn request(extra: Value) -> Value {
+    let mut body = json!({
+        "model": "q",
+        "max_tokens": 200,
+        "temperature": 0,
+        "messages": [{"role": "user", "content": "What is the capital of France? One word."}],
+    });
+    body.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+    body
+}
+
+/// The message a request is answered with.
+async fn message(app: &Router, body: &Value) -> Value {
+    let (status, text) = post(app, MESSAGES, body).await;
+    assert_eq!(status, 200, "{text}");
+    let message: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!((&message["type"], &message["role"]), (&json!("message"), &json!("assistant")));
+    message
+}
+
+/// The same request streamed, with its events put together into a message.
+async fn streamed(app: &Router, body: &Value) -> Value {
+    let mut body = body.clone();
+    body["stream"] = json!(true);
+    let (status, text) = post(app, MESSAGES, &body).await;
+    assert_eq!(status, 200, "{text}");
+    let mut message = Value::Null;
+    let mut content: Vec<Value> = Vec::new();
+    let mut inputs: Vec<String> = Vec::new();
+    for event in text.split("\n\n").filter(|event| !event.trim().is_empty()) {
+        let name = event.lines().find_map(|l| l.strip_prefix("event: ")).expect("a name");
+        let data = event.lines().find_map(|l| l.strip_prefix("data: ")).expect("data");
+        let data: Value = serde_json::from_str(data).unwrap();
+        assert_eq!(data["type"], name);
+        let index = data["index"].as_u64().unwrap_or(0) as usize;
+        match name {
+            "message_start" => message = data["message"].clone(),
+            "content_block_start" => {
+                assert_eq!(index, content.len(), "blocks in order");
+                content.push(data["content_block"].clone());
+                inputs.push(String::new());
+            }
+            "content_block_delta" => {
+                let delta = &data["delta"];
+                let member = match delta["type"].as_str().unwrap() {
+                    "thinking_delta" => "thinking",
+                    "signature_delta" => "signature",
+                    "text_delta" => "text",
+                    "input_json_delta" => {
+                        inputs[index].push_str(delta["partial_json"].as_str().unwrap());
+                        continue;
+                    }
+                    other => panic!("a delta of the type {other}"),
+                };
+                let so_far = content[index][member].as_str().unwrap().to_owned();
+                content[index][member] = json!(so_far + delta[member].as_str().unwrap());
+            }
+            "content_block_stop" => {
+                if content[index]["type"] == "tool_use" {
+                    content[index]["input"] =
+                        serde_json::from_str(&inputs[index]).unwrap_or_else(|_| json!({}));
+                }
+            }
+            "message_delta" => {
+                message["stop_reason"] = data["delta"]["stop_reason"].clone();
+                message["stop_sequence"] = data["delta"]["stop_sequence"].clone();
+                message["usage"] = data["usage"].clone();
+            }
+            "message_stop" | "ping" => {}
+            other => panic!("an event named {other}: {data}"),
+        }
+    }
+    message["content"] = Value::Array(content);
+    message
+}
+
+/// A message without what differs between two requests.
+fn anonymous(mut message: Value) -> Value {
+    message["id"] = Value::Null;
+    // The second of two equal requests reads its prompt from the cache.
+    message["usage"]["cache_read_input_tokens"] = Value::Null;
+    message["usage"]["input_tokens"] = Value::Null;
+    for (place, block) in message["content"].as_array_mut().unwrap().iter_mut().enumerate() {
+        if block["type"] == "tool_use" {
+            block["id"] = json!(place);
+        }
+    }
+    message
+}
+
+fn prompt_tokens(message: &Value) -> u64 {
+    let usage = &message["usage"];
+    usage["input_tokens"].as_u64().unwrap() + usage["cache_read_input_tokens"].as_u64().unwrap()
+}
+
+fn weather() -> Value {
+    json!([{
+        "name": "get_weather",
+        "description": "Get the current weather of a city.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "city": {"type": "string"},
+                "unit": {"enum": ["celsius", "fahrenheit"]},
+            },
+            "required": ["city", "unit"],
+        },
+    }])
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_message_is_blocks_and_its_stream_is_the_same_message() {
+    let Some(path) = small() else { return };
+    let app = served(&path);
+
+    // Thinking off: one text block.
+    let body = request(json!({"thinking": {"type": "disabled"}}));
+    let plain = message(&app, &body).await;
+    println!("RES plain: {plain}");
+    let content = plain["content"].as_array().unwrap();
+    assert_eq!(content.len(), 1, "{plain}");
+    assert_eq!(content[0]["type"], "text");
+    assert!(content[0]["text"].as_str().unwrap().contains("Paris"), "{plain}");
+    assert_eq!(plain["stop_reason"], "end_turn");
+    assert!(plain["usage"]["output_tokens"].as_u64().unwrap() > 0);
+    assert_eq!(anonymous(streamed(&app, &body).await), anonymous(plain));
+
+    // Thinking on: a thinking block first, signed with the fixed text.
+    let body =
+        request(json!({"thinking": {"type": "enabled", "budget_tokens": 1024}, "max_tokens": 600}));
+    let thought = message(&app, &body).await;
+    println!("RES thinking: {thought}");
+    let content = thought["content"].as_array().unwrap();
+    assert_eq!(content[0]["type"], "thinking", "{thought}");
+    assert!(!content[0]["thinking"].as_str().unwrap().is_empty());
+    assert_eq!(content[0]["signature"], "unsigned");
+    assert_eq!(anonymous(streamed(&app, &body).await), anonymous(thought.clone()));
+
+    // The reply sent back with the next question: counted, and run with the
+    // count as its prompt. How much of it the cache gave is printed.
+    let mut next = body.clone();
+    next["messages"] = json!([
+        body["messages"][0],
+        {"role": "assistant", "content": thought["content"]},
+        {"role": "user", "content": "And of Italy?"},
+    ]);
+    let (status, counted) = post(&app, COUNT, &next).await;
+    assert_eq!(status, 200, "{counted}");
+    let counted: Value = serde_json::from_str(&counted).unwrap();
+    let second = message(&app, &next).await;
+    println!("RES second turn: {second}");
+    assert_eq!(counted["input_tokens"], prompt_tokens(&second), "{counted} {second}");
+    println!(
+        "RES second turn: {} of {} prompt tokens from the cache (first turn: {} prompt, {} generated)",
+        second["usage"]["cache_read_input_tokens"],
+        prompt_tokens(&second),
+        prompt_tokens(&thought),
+        thought["usage"]["output_tokens"]
+    );
+
+    // The limit: the reason says so.
+    let cut = message(&app, &request(json!({"max_tokens": 3}))).await;
+    assert_eq!(cut["stop_reason"], "max_tokens", "{cut}");
+    assert_eq!(cut["usage"]["output_tokens"], 3);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_required_call_is_a_tool_use_block_and_its_result_is_answered() {
+    let Some(path) = small() else { return };
+    let app = served(&path);
+    let question = json!({"role": "user", "content": "How is the weather in Paris, in celsius?"});
+    for choice in [json!({"type": "any"}), json!({"type": "tool", "name": "get_weather"})] {
+        let body = request(json!({
+            "messages": [question],
+            "tools": weather(),
+            "tool_choice": choice,
+            "thinking": {"type": "disabled"},
+        }));
+        let called = message(&app, &body).await;
+        println!("RES call ({}): {called}", choice["type"]);
+        assert_eq!(called["stop_reason"], "tool_use", "{called}");
+        let content = called["content"].as_array().unwrap();
+        let call = content.last().unwrap();
+        assert_eq!((&call["type"], &call["name"]), (&json!("tool_use"), &json!("get_weather")));
+        assert!(call["id"].as_str().unwrap().starts_with("toolu_"));
+        assert!(call["input"]["city"].is_string(), "{call}");
+        assert!(["celsius", "fahrenheit"].contains(&call["input"]["unit"].as_str().unwrap()));
+        assert_eq!(anonymous(streamed(&app, &body).await), anonymous(called.clone()));
+
+        // The result goes back, and the model answers in text.
+        let mut next = body.clone();
+        next["tool_choice"] = json!({"type": "auto"});
+        next["messages"] = json!([
+            question,
+            {"role": "assistant", "content": called["content"]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": call["id"], "content": "Sunny, 21 degrees."},
+            ]},
+        ]);
+        let (status, counted) = post(&app, COUNT, &next).await;
+        assert_eq!(status, 200, "{counted}");
+        let counted: Value = serde_json::from_str(&counted).unwrap();
+        let answer = message(&app, &next).await;
+        println!("RES answer: {answer}");
+        assert_eq!(counted["input_tokens"], prompt_tokens(&answer));
+        assert!(answer["content"].as_array().unwrap().iter().any(|block| block["type"] == "text"));
+    }
+
+    // auto with a question that needs no tool, and none: text either way.
+    for choice in ["auto", "none"] {
+        let body = request(json!({
+            "tools": weather(),
+            "tool_choice": {"type": choice},
+            "thinking": {"type": "disabled"},
+        }));
+        let reply = message(&app, &body).await;
+        println!("RES {choice}: {reply}");
+        if choice == "none" {
+            assert_ne!(reply["stop_reason"], "tool_use", "{reply}");
+        }
+    }
+
+    // What is not served is refused in Anthropic's shape.
+    let image = json!({"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AA=="}});
+    let (status, text) =
+        post(&app, MESSAGES, &request(json!({"messages": [{"role": "user", "content": [image]}]})))
+            .await;
+    assert_eq!(status, 400, "{text}");
+    let error: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(
+        (&error["type"], &error["error"]["type"]),
+        (&json!("error"), &json!("invalid_request_error"))
+    );
+}
