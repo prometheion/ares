@@ -77,14 +77,12 @@ fn size_class(pairs: usize) -> usize {
     (pairs.max(1).next_power_of_two().trailing_zeros() as usize).min(SIZES - 1)
 }
 
-/// The index of a gate type among the three the CPU computes.
-fn kind_of(ty: GgmlType) -> usize {
-    match ty {
-        GgmlType::IQ2_S => 0,
-        GgmlType::IQ2_XXS => 1,
-        _ => 2,
-    }
-}
+/// The types of a layer's experts, of gate and up and of down: what a CPU job of the layer
+/// is timed by. Each pair of types a model has is timed by itself, because the time of a job
+/// depends on both and differs widely between them: the types with a kernel written for them
+/// (IQ2_S, IQ2_XXS and IQ1_M for gate and up, Q2_0 for down) multiply the file's bytes, every
+/// other type is decoded row by row first (`cpu/kernels.rs`).
+pub type ExpertTypes = (GgmlType, GgmlType);
 
 /// One expert a layer misses, as the split sees it.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -102,23 +100,30 @@ pub struct Miss {
 /// What the split between CPU and link is decided from: measured times only.
 #[derive(Clone, Debug)]
 pub struct CostModel {
-    /// Seconds per (expert, row) pair of a CPU job, by gate type and size
-    /// class, from the creation of the job to its last task.
-    cpu: [[Mean; SIZES]; 3],
+    /// Seconds per (expert, row) pair of a CPU job, by the types of the
+    /// layer's experts and by size class, from the creation of the job to its
+    /// last task. An entry per pair of types that was timed.
+    cpu: Vec<(ExpertTypes, [Mean; SIZES])>,
     /// Seconds one expert takes on a device's upload stream.
     upload: Vec<Mean>,
 }
 
 impl CostModel {
     pub(super) fn new(devices: usize) -> Self {
-        Self { cpu: [[Mean::default(); SIZES]; 3], upload: vec![Mean::default(); devices] }
+        Self { cpu: Vec::new(), upload: vec![Mean::default(); devices] }
     }
 
-    /// A CPU job of `pairs` pairs of a layer with gate type `ty` took `time`.
-    pub fn record_job(&mut self, ty: GgmlType, pairs: usize, time: Duration) {
-        if pairs > 0 {
-            self.cpu[kind_of(ty)][size_class(pairs)].add(time.as_secs_f64() / pairs as f64);
+    /// A CPU job of `pairs` pairs of a layer whose experts have the types
+    /// `types` took `time`.
+    pub fn record_job(&mut self, types: ExpertTypes, pairs: usize, time: Duration) {
+        if pairs == 0 {
+            return;
         }
+        let at = self.cpu.iter().position(|(t, _)| *t == types).unwrap_or_else(|| {
+            self.cpu.push((types, [Mean::default(); SIZES]));
+            self.cpu.len() - 1
+        });
+        self.cpu[at].1[size_class(pairs)].add(time.as_secs_f64() / pairs as f64);
     }
 
     /// One expert took `time` on the upload stream of `device`.
@@ -127,13 +132,13 @@ impl CostModel {
     }
 
     /// The expected time of a CPU job of `pairs` pairs; `None` before any
-    /// job of that gate type was timed. A size that was never seen takes
-    /// the time per pair of the nearest size that was.
-    pub fn job_time(&self, ty: GgmlType, pairs: usize) -> Option<f64> {
+    /// job of a layer of those types was timed. A size that was never seen
+    /// takes the time per pair of the nearest size that was.
+    pub fn job_time(&self, types: ExpertTypes, pairs: usize) -> Option<f64> {
         if pairs == 0 {
             return Some(0.0);
         }
-        let classes = &self.cpu[kind_of(ty)];
+        let (_, classes) = self.cpu.iter().find(|(t, _)| *t == types)?;
         let class = size_class(pairs);
         let per_pair = (0..SIZES)
             .filter(|c| classes[*c].samples > 0)
@@ -156,7 +161,13 @@ impl CostModel {
     /// then to the hottest. With equal ends the CPU takes more: its work
     /// leaves the tiers and the link as they are. A side that was never
     /// timed is tried, one expert at a time, so that it gets timed.
-    pub fn split(&self, ty: GgmlType, device: usize, misses: &[Miss], queued: usize) -> Vec<bool> {
+    pub fn split(
+        &self,
+        types: ExpertTypes,
+        device: usize,
+        misses: &[Miss],
+        queued: usize,
+    ) -> Vec<bool> {
         let mut on_cpu = vec![true; misses.len()];
         let mut order: Vec<usize> = (0..misses.len()).filter(|i| !misses[*i].cpu_only).collect();
         order.sort_by(|a, b| {
@@ -173,8 +184,8 @@ impl CostModel {
             }
             return on_cpu;
         };
-        if self.job_time(ty, 1).is_none() {
-            // The CPU was never timed for this type: it gets one expert, the
+        if self.job_time(types, 1).is_none() {
+            // The CPU was never timed for these types: it gets one expert, the
             // one that costs it least, and the link the rest.
             let cheapest = order.last().copied();
             for i in &order {
@@ -183,7 +194,7 @@ impl CostModel {
             return on_cpu;
         }
         let end = |on_cpu: &[bool], uploads: usize| -> f64 {
-            let cpu = self.job_time(ty, pairs(on_cpu)).unwrap_or(0.0);
+            let cpu = self.job_time(types, pairs(on_cpu)).unwrap_or(0.0);
             let link = if uploads == 0 { 0.0 } else { (queued + uploads) as f64 * upload };
             cpu.max(link)
         };
@@ -437,7 +448,8 @@ impl<D: SlotDevice> ExpertStore<D> {
         let misses: Vec<Miss> = candidates.iter().map(|c| c.1).collect();
         let on_cpu = match hybrid.serve {
             Serve::Measured => {
-                hybrid.model.split(shape.gate_ty, device, &misses, hybrid.queued_uploads[device])
+                let types = (shape.gate_ty, shape.down_ty);
+                hybrid.model.split(types, device, &misses, hybrid.queued_uploads[device])
             }
             _ => vec![true; misses.len()],
         };
@@ -594,7 +606,7 @@ impl<D: SlotDevice> ExpertStore<D> {
                     sums.iter_mut().zip(part).for_each(|(s, p)| *s += p);
                 }
                 if let Some(time) = job.elapsed() {
-                    hybrid.model.record_job(shape.gate_ty, job.pairs(), time);
+                    hybrid.model.record_job((shape.gate_ty, shape.down_ty), job.pairs(), time);
                 }
                 self.stats.cpu_jobs += 1;
                 self.stats.cpu_busy_ms += job.busy().as_secs_f64() * 1e3;
@@ -900,33 +912,60 @@ fn start_job(
     Ok(job)
 }
 
-/// Times jobs of every gate type the model has, of 1, 2, 4 and 8 pairs, on
-/// the pool: the cost model's first numbers. The bytes are arbitrary (the
-/// time of a kernel does not depend on them) with finite scales.
+/// Bytes of a matrix of `ty` for a job that is only timed: they vary, so that
+/// the codebook lookups do, and every byte is below 0x40, which keeps every
+/// scale (an f16 wherever it lies) small and finite. The bytes that hold the
+/// exponent of a float, or of a block of MXFP4, are set so that no weight is
+/// subnormal or near it: the products with such weights are subnormal, which
+/// a CPU computes many times slower, and no real weight is.
+pub(super) fn timing_bytes(ty: GgmlType, len: usize, seed: usize) -> Vec<u8> {
+    let mut bytes: Vec<u8> =
+        (0..len).map(|i| ((i * 31 + seed * 17) ^ (i >> 7)) as u8 & 0x3f).collect();
+    // The width of a value or block, and where in it the exponent is: 0x38 to
+    // 0x3f there is 2^-15 to 2^0 for the float types, 0x78 to 0x7b a block
+    // scale of 2^-7 to 2^-4 for MXFP4.
+    let (width, at, exponent, mask) = match ty {
+        GgmlType::F32 => (4, 3, 0x38, 0x07),
+        GgmlType::F16 | GgmlType::BF16 => (2, 1, 0x38, 0x07),
+        GgmlType::MXFP4 => (ty.block_bytes() as usize, 0, 0x78, 0x03),
+        _ => return bytes,
+    };
+    for value in bytes.chunks_exact_mut(width) {
+        value[at] = exponent | (value[at] & mask);
+    }
+    bytes
+}
+
+/// Times jobs of every pair of types the model's experts have, of 1, 2, 4
+/// and 8 pairs, on the pool: the cost model's first numbers. The bytes are
+/// arbitrary (the time of a kernel does not depend on them) with finite
+/// scales.
 fn calibrate(
     pool: &CpuPool,
     shapes: &[ExpertShape],
     model: &mut CostModel,
 ) -> Result<(), StoreError> {
-    let mut seen: Vec<GgmlType> = Vec::new();
+    let mut seen: Vec<ExpertTypes> = Vec::new();
     for shape in shapes {
-        if seen.contains(&shape.gate_ty) {
+        let types = (shape.gate_ty, shape.down_ty);
+        if seen.contains(&types) {
             continue;
         }
-        seen.push(shape.gate_ty);
+        seen.push(types);
         let plan = |what: &str| StoreError::Plan(format!("calibration: {what}"));
         let gate_bytes = shape.gate_bytes().ok_or_else(|| plan("gate size"))? as usize;
         let down_bytes = shape.down_bytes().ok_or_else(|| plan("down size"))? as usize;
-        // Bytes that vary, so that the codebook lookups do; every byte is
-        // below 0x40, which keeps every scale (an f16 wherever it lies)
-        // small and finite.
-        let fill = |len: usize, seed: usize| -> Vec<u8> {
-            (0..len).map(|i| ((i * 31 + seed * 17) ^ (i >> 7)) as u8 & 0x3f).collect()
-        };
         // Several experts, so that a job reads memory the last one did not
-        // leave in the cache: 8 experts are 9 to 12 MB.
+        // leave in the cache: 8 experts are 9 to 12 MB in the types of the
+        // model the kernels were written for.
         let experts: Vec<[Vec<u8>; 3]> = (0..8)
-            .map(|e| [fill(gate_bytes, e), fill(gate_bytes, e + 8), fill(down_bytes, e + 16)])
+            .map(|e| {
+                [
+                    timing_bytes(shape.gate_ty, gate_bytes, e),
+                    timing_bytes(shape.gate_ty, gate_bytes, e + 8),
+                    timing_bytes(shape.down_ty, down_bytes, e + 16),
+                ]
+            })
             .collect();
         let n_in = shape.n_embd as usize;
         for rows in [1usize, 2, 4, 8] {
@@ -957,7 +996,7 @@ fn calibrate(
                 }
                 // The first rounds wake the workers and warm the tables.
                 if let (true, Some(time)) = (round >= 2, job.elapsed()) {
-                    model.record_job(shape.gate_ty, rows, time);
+                    model.record_job(types, rows, time);
                 }
             }
         }
@@ -969,14 +1008,13 @@ fn calibrate(
 mod tests {
     use super::*;
 
+    /// The types of a layer whose jobs the test models are timed for.
+    const FAST: ExpertTypes = (GgmlType::IQ2_S, GgmlType::Q2_0);
+
     fn model(cpu_per_pair: f64, upload: f64) -> CostModel {
         let mut model = CostModel::new(1);
         for pairs in [1, 2, 4, 8, 16, 32] {
-            model.record_job(
-                GgmlType::IQ2_S,
-                pairs,
-                Duration::from_secs_f64(cpu_per_pair * pairs as f64),
-            );
+            model.record_job(FAST, pairs, Duration::from_secs_f64(cpu_per_pair * pairs as f64));
         }
         model.record_upload(0, Duration::from_secs_f64(upload));
         model
@@ -991,22 +1029,19 @@ mod tests {
         // 100 us per pair on the CPU, 150 us per upload.
         let m = model(100e-6, 150e-6);
         // One expert, one row: the CPU is sooner.
-        assert_eq!(m.split(GgmlType::IQ2_S, 0, &[miss(1, 1.0)], 0), vec![true]);
+        assert_eq!(m.split(FAST, 0, &[miss(1, 1.0)], 0), vec![true]);
         // One expert that eight rows use: one upload beats 800 us of CPU.
-        assert_eq!(m.split(GgmlType::IQ2_S, 0, &[miss(8, 1.0)], 0), vec![false]);
+        assert_eq!(m.split(FAST, 0, &[miss(8, 1.0)], 0), vec![false]);
         // Six experts of one row: all on the CPU end at 600 us; with the
         // two hottest uploaded the link ends at 300 and the CPU at 400; a
         // third upload would end at 450.
         let six: Vec<Miss> = (0..6).map(|i| miss(1, i as f32)).collect();
-        assert_eq!(
-            m.split(GgmlType::IQ2_S, 0, &six, 0),
-            vec![true, true, true, true, false, false]
-        );
+        assert_eq!(m.split(FAST, 0, &six, 0), vec![true, true, true, true, false, false]);
         // With four uploads queued on the link, the CPU takes them all.
-        assert_eq!(m.split(GgmlType::IQ2_S, 0, &six, 4), vec![true; 6]);
+        assert_eq!(m.split(FAST, 0, &six, 4), vec![true; 6]);
         // The expert with the most rows goes up first.
         let mixed = [miss(1, 9.0), miss(4, 1.0), miss(1, 1.0)];
-        assert_eq!(m.split(GgmlType::IQ2_S, 0, &mixed, 0), vec![true, false, true]);
+        assert_eq!(m.split(FAST, 0, &mixed, 0), vec![true, false, true]);
     }
 
     #[test]
@@ -1014,37 +1049,65 @@ mod tests {
         let m = model(100e-6, 10e-6);
         let mut misses = vec![miss(4, 1.0), miss(4, 1.0)];
         misses[0].cpu_only = true;
-        assert_eq!(m.split(GgmlType::IQ2_S, 0, &misses, 0), vec![true, false]);
+        assert_eq!(m.split(FAST, 0, &misses, 0), vec![true, false]);
     }
 
     #[test]
     fn a_side_that_was_never_timed_is_tried() {
         let mut m = CostModel::new(1);
-        m.record_job(GgmlType::IQ2_S, 1, Duration::from_micros(100));
+        m.record_job(FAST, 1, Duration::from_micros(100));
         // No upload was timed: one expert goes up.
-        assert_eq!(
-            m.split(GgmlType::IQ2_S, 0, &[miss(1, 1.0), miss(1, 2.0)], 0),
-            vec![true, false]
-        );
+        assert_eq!(m.split(FAST, 0, &[miss(1, 1.0), miss(1, 2.0)], 0), vec![true, false]);
         // No job of this type was timed: the CPU gets one expert.
         m.record_upload(0, Duration::from_micros(200));
         assert_eq!(
-            m.split(GgmlType::IQ1_M, 0, &[miss(2, 1.0), miss(1, 1.0)], 0),
+            m.split((GgmlType::IQ1_M, GgmlType::Q2_0), 0, &[miss(2, 1.0), miss(1, 1.0)], 0),
             vec![false, true]
         );
     }
 
     #[test]
+    fn every_pair_of_types_is_timed_by_itself() {
+        // A layer whose jobs take 100 us a pair, and layers that differ from it in the
+        // type of gate and up or in the type of down, whose jobs take 50 times that.
+        let mut m = model(100e-6, 150e-6);
+        let slow_gate = (GgmlType::Q4_K, GgmlType::Q2_0);
+        let slow_down = (GgmlType::IQ2_S, GgmlType::Q6_K);
+        for types in [slow_gate, slow_down] {
+            // Never timed: the CPU gets one expert, which times it.
+            assert_eq!(m.job_time(types, 1), None);
+            assert_eq!(m.split(types, 0, &[miss(1, 1.0), miss(1, 2.0)], 0), vec![true, false]);
+            for pairs in [1, 2, 4, 8] {
+                m.record_job(types, pairs, Duration::from_secs_f64(5e-3 * pairs as f64));
+            }
+        }
+        // What the first layer's jobs take is what it was.
+        assert_eq!(m.split(FAST, 0, &[miss(1, 1.0)], 0), vec![true]);
+        let near = |t: Option<f64>, want: f64| t.is_some_and(|t| (t - want).abs() < 1e-9);
+        assert!(near(m.job_time(FAST, 1), 100e-6));
+        for types in [slow_gate, slow_down] {
+            assert!(near(m.job_time(types, 2), 10e-3));
+            // An upload of 150 us is sooner than 5 ms of CPU, for one expert and for
+            // six, also behind 20 uploads that are queued.
+            assert_eq!(m.split(types, 0, &[miss(1, 1.0)], 0), vec![false]);
+            assert_eq!(m.split(types, 0, &[miss(1, 1.0); 6], 20), vec![false; 6]);
+        }
+        // An expert that cannot be uploaded now is the CPU's whatever it costs.
+        let held = Miss { pairs: 1, heat: 1.0, cpu_only: true };
+        assert_eq!(m.split(slow_gate, 0, &[held, miss(1, 1.0)], 0), vec![true, false]);
+    }
+
+    #[test]
     fn job_times_come_from_the_nearest_size() {
         let mut m = CostModel::new(1);
-        assert_eq!(m.job_time(GgmlType::IQ2_S, 3), None);
-        m.record_job(GgmlType::IQ2_S, 1, Duration::from_micros(200));
-        m.record_job(GgmlType::IQ2_S, 8, Duration::from_micros(800));
+        assert_eq!(m.job_time(FAST, 3), None);
+        m.record_job(FAST, 1, Duration::from_micros(200));
+        m.record_job(FAST, 8, Duration::from_micros(800));
         let near = |a: Option<f64>, b: f64| a.is_some_and(|a| (a - b).abs() < 1e-9);
-        assert!(near(m.job_time(GgmlType::IQ2_S, 1), 200e-6));
-        assert!(near(m.job_time(GgmlType::IQ2_S, 2), 400e-6));
-        assert!(near(m.job_time(GgmlType::IQ2_S, 6), 600e-6));
-        assert!(near(m.job_time(GgmlType::IQ2_S, 40), 4000e-6));
-        assert_eq!(m.job_time(GgmlType::IQ2_S, 0), Some(0.0));
+        assert!(near(m.job_time(FAST, 1), 200e-6));
+        assert!(near(m.job_time(FAST, 2), 400e-6));
+        assert!(near(m.job_time(FAST, 6), 600e-6));
+        assert!(near(m.job_time(FAST, 40), 4000e-6));
+        assert_eq!(m.job_time(FAST, 0), Some(0.0));
     }
 }

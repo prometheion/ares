@@ -667,7 +667,7 @@ fn prompt_pass_hybrid(
             let on_cpu = match options.serve {
                 Serve::Cpu => vec![true; misses.len()],
                 _ => store.cost_model().ok_or("no cost model")?.split(
-                    shape.gate_ty,
+                    (shape.gate_ty, shape.down_ty),
                     index,
                     &misses,
                     0,
@@ -1357,8 +1357,10 @@ fn main() -> Result<(), AnyError> {
         let calibrating = Instant::now();
         store.enable_cpu(pool, shapes.clone(), options.serve)?;
         let model = store.cost_model().ok_or("no cost model")?;
-        let us =
-            |ty: GgmlType, pairs: usize| model.job_time(ty, pairs).map_or(f64::NAN, |t| t * 1e6);
+        // The bench's file has down as Q2_0 in every layer.
+        let us = |ty: GgmlType, pairs: usize| {
+            model.job_time((ty, GgmlType::Q2_0), pairs).map_or(f64::NAN, |t| t * 1e6)
+        };
         println!(
             "cpu: {workers} workers on {cpus:?}; calibrated in {:.0} ms: a job of 1 / 2 / 4 / 8 pairs takes {:.0} / {:.0} / {:.0} / {:.0} us (iq2_s), {:.0} / {:.0} / {:.0} / {:.0} (iq2_xxs), {:.0} / {:.0} / {:.0} / {:.0} (iq1_m), load {}",
             calibrating.elapsed().as_secs_f64() * 1e3,
@@ -1771,9 +1773,9 @@ fn main() -> Result<(), AnyError> {
             let us = |t: Option<f64>| t.map_or(f64::NAN, |t| t * 1e6);
             println!(
                 "          cost model now: a job of 1 / 2 / 4 pairs {:.0} / {:.0} / {:.0} us (iq2_s); an upload {} us; load {}",
-                us(model.job_time(GgmlType::IQ2_S, 1)),
-                us(model.job_time(GgmlType::IQ2_S, 2)),
-                us(model.job_time(GgmlType::IQ2_S, 4)),
+                us(model.job_time((GgmlType::IQ2_S, GgmlType::Q2_0), 1)),
+                us(model.job_time((GgmlType::IQ2_S, GgmlType::Q2_0), 2)),
+                us(model.job_time((GgmlType::IQ2_S, GgmlType::Q2_0), 4)),
                 (0..n_devices)
                     .map(|d| format!("{:.0}", us(model.upload_time(d))))
                     .collect::<Vec<_>>()
