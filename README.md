@@ -23,8 +23,9 @@ that lets a conversation continue from what was computed; on two GPUs it is
 ahead of the llama.cpp fork it is measured against in prompt processing and
 in generation. Flash-Next is served by the same binary on two GPUs, with
 drafts from earlier text; it agrees with its CPU reference and generates at
-about 58 tokens per second at the median with drafts, against Strata's 56. It
-has no prefix cache, and reads prompts in steps of eight rows. The numbers are in
+48 to 58 tokens per second at the median with drafts (three series), level with
+Strata's 56 within the spread of the runs. It has no prefix cache, and reads
+prompts in steps of eight rows. The numbers are in
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#status).
 
 There is no release yet. The first release is the complete engine: every

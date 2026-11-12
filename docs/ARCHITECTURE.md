@@ -1581,9 +1581,11 @@ three prompts, after the warm-up and a round that fills the slots):
 
 Without drafts a token takes 20.7 to 23.9 ms, the tool's step (21.5 to 23.1
 ms), so the server adds nothing to it. The median over the six warm runs with
-drafts is 58 tokens per second against Strata's 56 with drafts (44 to 110; what
-the drafts gain depends on the text, as everywhere: English prose at 110
-accepted 95 of 95). Prompts are read at 63 to 139 tokens per second, in steps
+drafts is 58 tokens per second, and 48 and 51 over the twelve runs of each of
+the two servers measured again below, against Strata's 56 with drafts: level
+within the spread of the runs, which is wider than the difference (44 to 110
+in the first series; what the drafts gain depends on the text, as everywhere:
+English prose at 110 accepted 95 of 95). Prompts are read at 63 to 139 tokens per second, in steps
 of eight rows, where the tool's earlier measurements were 54 to 73 and Strata's
 42 to 201.
 
@@ -1826,12 +1828,12 @@ Work is paused here until Qwen4 is released; nothing below is in progress.
   See [Several devices](#several-devices).
 - **Qwen3.8-Flash-Next** runs on both cards, agrees with the CPU reference
   and answers in German and English, and is served by the `ares` binary like
-  the 27B, in both placements, with drafts from earlier text: 58 tokens per
-  second at the median of six runs at about 1000 tokens of context (44 to 110
-  by text), 43 to 48 without drafts (a decode step takes 22 to 23 ms, 17 ms
+  the 27B, in both placements, with drafts from earlier text: 48 to 58 tokens
+  per second at the median of a series of runs at about 1000 tokens of context
+  (three series; 20 to 110 by text and run), 43 to 48 without drafts (a decode step takes 22 to 23 ms, 17 ms
   when it misses no expert), prompts of 1000 tokens at 63 to 139 tokens per
   second. Strata generates at a median of 56 tokens per second with drafts on
-  this machine. The model's own draft block is not used yet, and prompts are
+  this machine, so the two are level within the spread. The model's own draft block is not used yet, and prompts are
   read in steps of eight rows, on the eight-row expert kernels (the many-row
   ones are built and not wired; see [Qwen3.8-Flash-Next through the
   runtime](#qwen38-flash-next-through-the-runtime)).
