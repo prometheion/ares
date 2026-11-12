@@ -63,8 +63,9 @@ pub trait TokenFilter: Send {
     /// on the device, which the host does not know when it writes the masks:
     /// such a window is verified only while its first row is free, none of
     /// its rows carries a mask, and of what it picked the request keeps the
-    /// tokens of its free rows (see [`RequestSampler::free_rows`]). A rule
-    /// that cannot tell binds every row.
+    /// tokens of its free rows: the conductor asks again when the picks are
+    /// back, with the drafts they confirmed as `tokens`. A rule that cannot
+    /// tell binds every row.
     ///
     /// [`mask`]: TokenFilter::mask
     fn free_rows(&mut self, _reply: &[u32], _tokens: &[u32]) -> usize {
