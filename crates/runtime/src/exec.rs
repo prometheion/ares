@@ -71,6 +71,13 @@ pub struct StepOutput {
     pub draft_ms: f64,
     /// What each device measured.
     pub devices: Vec<DeviceTimes>,
+    /// The milliseconds the step took, the drafter's included, from an executor
+    /// that knows them without a clock: the conductor takes them for the time
+    /// of the step in place of what it measured. Devices leave it `None`; the
+    /// test executor says what a test told it a step costs, so that what the
+    /// conductor decides from the prices does not depend on how busy the
+    /// machine is.
+    pub step_ms: Option<f64>,
 }
 
 /// Why a step could not be run.

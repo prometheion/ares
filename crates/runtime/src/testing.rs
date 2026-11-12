@@ -44,6 +44,22 @@
 //! many rows, a write into a page that others read, a tail that does not hold
 //! what it says, a slot that was taken before its state was saved: each of
 //! them changes the generated tokens.
+//!
+//! # What a step costs
+//!
+//! The conductor decides the drafts of a step and the turns of prompts and
+//! generation from what steps cost, which on devices it measures with its
+//! clock. A test gives the executor that cost ([`HostExecutor::with_delay`],
+//! [`HostExecutor::with_step_cost`], [`HostExecutor::with_link_cost`]) and the
+//! executor tells the conductor exactly that ([`StepOutput::step_ms`]), so the
+//! prices the policy sees are the ones the test wrote down, however busy the
+//! machine is and however late a sleeping thread is woken. The executor also
+//! takes the time, so that requests arrive and are cancelled while steps run;
+//! a test that needs no time to pass asks for
+//! [`HostExecutor::without_sleeping`], and one that wants the conductor's own
+//! measuring asks for [`HostExecutor::timed_by_the_conductor`]. An executor
+//! that was given no cost says nothing, and the conductor measures what the
+//! host needs for a step.
 
 mod faulty;
 
@@ -117,6 +133,10 @@ pub struct HostExecutor {
     step_cost: Option<Box<dyn Fn(u32) -> Duration + Send>>,
     /// How long the step that was dispatched takes.
     step_delay: Duration,
+    /// Whether a step takes the time it costs, and whether the executor tells
+    /// the conductor what it cost.
+    sleeps: bool,
+    states: bool,
     /// What a link of the model's draft chain takes on the device, and what
     /// the chain of the step that was dispatched drafted and took.
     link: Duration,
@@ -167,6 +187,8 @@ impl HostExecutor {
             delay: Duration::ZERO,
             step_cost: None,
             step_delay: Duration::ZERO,
+            sleeps: true,
+            states: true,
             link: Duration::ZERO,
             drafts: Vec::new(),
             draft_ms: 0.0,
@@ -203,7 +225,8 @@ impl HostExecutor {
         self
     }
 
-    /// Makes every step take at least `delay`, as a device would.
+    /// Makes every step cost `delay` whatever it carries, and take at least
+    /// that long, as a device would.
     pub fn with_delay(mut self, delay: Duration) -> Self {
         self.delay = delay;
         self
@@ -229,6 +252,25 @@ impl HostExecutor {
     /// longest window's.
     pub fn with_link_cost(mut self, link: Duration) -> Self {
         self.link = link;
+        self
+    }
+
+    /// Makes the steps cost what they cost without taking the time: the
+    /// executor tells the conductor what a step took and does not sleep for
+    /// it. For tests of what the conductor decides from the prices, in which
+    /// nothing has to happen while a step runs.
+    pub fn without_sleeping(mut self) -> Self {
+        self.sleeps = false;
+        self
+    }
+
+    /// Leaves the time of a step to the conductor's clock, as devices do: the
+    /// executor takes the time a step costs and says nothing about it. What
+    /// the conductor measures then is never less than the cost and otherwise
+    /// depends on how busy the machine is, so a test with such an executor
+    /// asserts only what holds at any speed.
+    pub fn timed_by_the_conductor(mut self) -> Self {
+        self.states = false;
         self
     }
 
@@ -364,7 +406,9 @@ impl Executor for HostExecutor {
                 message: "the test never opened the gate".into(),
             });
         }
-        if let Some(left) = self.step_delay.checked_sub(self.dispatched_at.elapsed()) {
+        if self.sleeps
+            && let Some(left) = self.step_delay.checked_sub(self.dispatched_at.elapsed())
+        {
             std::thread::sleep(left);
         }
         if self.failing {
@@ -375,6 +419,10 @@ impl Executor for HostExecutor {
         out.drafts.clear();
         out.drafts.extend_from_slice(&self.drafts);
         out.draft_ms = self.draft_ms;
+        // A step that was given a cost took exactly that, whatever the clock
+        // says; one that was given none is the conductor's to measure.
+        let priced = self.step_cost.is_some() || !self.delay.is_zero();
+        out.step_ms = (self.states && priced).then_some(self.step_delay.as_secs_f64() * 1e3);
         out.devices.clear();
         let finished_at_ns = self.clock.now_ns();
         out.devices.resize(self.devices, DeviceTimes { finished_at_ns, ..DeviceTimes::default() });

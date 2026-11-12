@@ -604,6 +604,7 @@ impl Conductor {
                 drafts: Vec::with_capacity(max_rows as usize),
                 draft_ms: 0.0,
                 devices: Vec::with_capacity(exec.devices()),
+                step_ms: None,
             },
             samplers: Vec::with_capacity(max_rows as usize),
             step_rows: StepRows::default(),
@@ -763,6 +764,8 @@ impl Conductor {
         })?;
         self.exec.collect(self.config.conductor_spin, &mut self.output)?;
         let ms = begun.elapsed().as_secs_f64() * 1e3;
+        // An executor that knows the time of its steps without a clock says so.
+        let ms = self.output.step_ms.take().unwrap_or(ms);
         Ok((ms - self.output.draft_ms, self.output.draft_ms))
     }
 
@@ -1715,6 +1718,8 @@ impl Conductor {
             self.chain.observe(own_links, draft_ms);
         }
         let step_ms = (t_back - t_dispatch).as_secs_f64() * 1e3;
+        // An executor that knows the time of its steps without a clock says so.
+        let step_ms = self.output.step_ms.take().unwrap_or(step_ms);
         self.prices.observe(load, step_ms - draft_ms);
         self.share.spent(turn, step_ms, generating, self.prompt_rows.iter().any(|rows| *rows > 0));
         let last_done = self.output.devices.iter().map(|d| d.finished_at_ns).max().unwrap_or(0);
