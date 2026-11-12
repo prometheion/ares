@@ -8,7 +8,8 @@
 // all of them, from the address the table gives for the expert (the matrices of an
 // expert are `up_offset` apart, see ExpertShape).
 //
-// - A operand (weights): decoded in registers from the file's bytes (expertrows_types.cuh).
+// - A operand (weights): decoded in registers from the file's bytes (expertrows_types.cuh,
+//   and expertrows_mm.cuh for the types that come through the tile kernels' decoders).
 //   Four row streams per thread (gate g, gate g + 8, up g, up g + 8) with their raw
 //   words loaded one chunk of 128 values ahead.
 // - B operand (activations): the rows of the item gathered by cp.async (`pair_row`)
@@ -52,7 +53,7 @@
 //   them contiguous, is what would take the kernels from 230 GB/s towards the limit.
 #pragma once
 
-#include "expertrows_plan.cuh"
+#include "expertrows_layout.cuh"
 #include "expertrows_types.cuh"
 #include "layer_math.cuh"
 
@@ -124,7 +125,7 @@ static __device__ __forceinline__ void ares_er_gate_up(
 
     const uint8_t* gate = reinterpret_cast<const uint8_t*>(addr);
     const uint8_t* up = gate + up_offset;
-    const size_t row_bytes = static_cast<size_t>(n_embd >> 8) * (T::BLOCK_BYTES);
+    const size_t row_bytes = static_cast<size_t>(n_embd / T::BLOCK_VALUES) * (T::BLOCK_BYTES);
     const uint32_t row0 = tile * 64 + warp * 16;
     const uint8_t* wrow[4] = {
         gate + (row0 + g) * row_bytes,
@@ -135,7 +136,7 @@ static __device__ __forceinline__ void ares_er_gate_up(
     uint32_t b_ofs[4];
 #pragma unroll
     for (uint32_t l = 0; l < 4; l++) {
-        b_ofs[l] = g * 256 + 16 * ares_er_phys(t, l, g & 1);
+        b_ofs[l] = g * 256 + 16 * ares_er_phys_of(T::piece(t, l), g & 1);
     }
 
     float acc_g[NB][4], acc_u[NB][4];
@@ -176,10 +177,10 @@ static __device__ __forceinline__ void ares_er_gate_up(
                 next[s] = T::load(wrow[s], 4 * (c + 1) + t);
             }
         }
-        AresErScales sc[4];
+        typename T::Scales sc[4];
 #pragma unroll
         for (int s = 0; s < 4; s++) {
-            sc[s] = T::scales(raw[s]);
+            sc[s] = T::scales(raw[s], tab);
         }
         const uint8_t* stage = stages + (c % STAGES) * STAGE_BYTES;
 #pragma unroll
@@ -269,3 +270,15 @@ static __device__ __forceinline__ void ares_er_gate_up(
         ares_er_gate_up<T, NB, STAGES>(expert_addr, up_offset, plan, xh, xscale, hidden, hscale, n_embd, n_ff, \
                                        n_experts, n_pairs);                                                \
     }
+
+// The gate and up kernels of a type by tile (8 NB pairs): the stages of activations in
+// shared memory. Three, and two for the largest tile, which would otherwise leave room for
+// one block on a multiprocessor (src/experts.rs lists the same numbers). Deeper pipelines of
+// the small tiles (more stages, weights loaded several chunks ahead) were measured slower on
+// the real weights: more registers and shared memory per block, fewer blocks on a
+// multiprocessor.
+#define ARES_ER_GATE_UP_SIZES(PREFIX, T)                          \
+    ARES_ER_GATE_UP_KERNEL(PREFIX##_n1, T, 1, 3)                  \
+    ARES_ER_GATE_UP_KERNEL(PREFIX##_n2, T, 2, 3)                  \
+    ARES_ER_GATE_UP_KERNEL(PREFIX##_n4, T, 4, 3)                  \
+    ARES_ER_GATE_UP_KERNEL(PREFIX##_n8, T, 8, 2)

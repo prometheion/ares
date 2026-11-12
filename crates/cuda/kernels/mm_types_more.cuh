@@ -16,7 +16,7 @@
 // The f16 pairs of the four groups of an item (sub-block of 32 values), two groups to a run.
 template <class E>
 static __device__ __forceinline__ void ares_mm_er_item(const typename E::Raw& raw, const uint8_t* tab, uint32_t (&out)[2][8]) {
-    const AresErScales scales = E::scales(raw);
+    const AresErScales scales = E::scales(raw, tab);
 #pragma unroll
     for (int l = 0; l < 4; l++) {
         uint32_t h[4];
@@ -60,8 +60,13 @@ using EngMmIQ1M = EngMmErItem<ErIQ1M>;
 // | (3 bits of qh[ib]) << 8 for the four groups l of 8 values, value = d (2 s + 1) (grid + delta)
 // with the delta +-1/8 of the sub-block (bit 15 of qh). The group is IQ1_M's.
 struct ErIQ1S {
+    static constexpr uint32_t BLOCK_VALUES = 256;
     static constexpr uint32_t BLOCK_BYTES = 50;
     static constexpr uint32_t TABLE_BYTES = ErIQ1M::TABLE_BYTES;
+    using Scales = AresErScales;
+    static __device__ __forceinline__ uint32_t piece(uint32_t t, uint32_t l) {
+        return 4 * t + l;
+    }
 
     struct Raw {
         uint32_t qs, qh, d;
@@ -82,7 +87,7 @@ struct ErIQ1S {
     }
 
     // `sc` is d (2 s + 1) for all four groups, `nsc` the shift: the sign of the delta bit applied.
-    static __device__ __forceinline__ AresErScales scales(const Raw& r) {
+    static __device__ __forceinline__ AresErScales scales(const Raw& r, const uint8_t*) {
         AresErScales s;
         const uint32_t sc = ares_er_h2_of(static_cast<float>(2 * ((r.qh >> 12) & 7) + 1) * ares_er_f16_at(r.d));
         const uint32_t eighth = ares_er_h2_mul(sc, 0x30003000u);  // 1/8

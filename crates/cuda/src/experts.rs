@@ -15,6 +15,13 @@
 //!   weights read once for all its rows, and adds the weighted sum to the
 //!   rows' outputs.
 //!
+//! An expert's matrices are stored in any weight type a model file has
+//! ([`ExpertShape::types`]): gate and up of a layer share one type, down has
+//! its own, and both families of kernels have one per type and role. What a
+//! shape must have is rows of whole blocks of its types
+//! ([`ExpertShape::check`], and [`ExpertShape::check_rows`] for the many-row
+//! kernels).
+//!
 //! An expert that was picked and has no slot when its kernels run is waited
 //! for **on the device**: the thread blocks of that expert poll its table
 //! entry until the host has uploaded the expert and written the entry, while
@@ -55,16 +62,52 @@ pub const EXPERT_MAX_EXPERTS: u32 = 1024;
 /// The most experts the router picks per row (`ARES_EXPERT_MAX_K`).
 pub const EXPERT_MAX_K: u32 = 16;
 
-/// The types gate and up may have, with their kernels' names and the
-/// alignment the decoders need of a matrix.
-const GATE_UP_TYPES: [(GgmlType, &str, u64); 3] = [
-    (GgmlType::IQ2_S, "ares_expert_gate_up_iq2_s", 2),
-    (GgmlType::IQ2_XXS, "ares_expert_gate_up_iq2_xxs", 2),
-    (GgmlType::IQ1_M, "ares_expert_gate_up_iq1_m", 8),
+/// The weight types an expert's matrices may be stored in: every one a model file can hold
+/// a weight in, with the suffix of its kernels' names (`ares_expert_gate_up_<suffix>`,
+/// `ares_expert_down_<suffix>`, `ares_er_gate_up_<suffix>_n1` ...; `kernels/experts.cu` and
+/// `kernels/expertrows*.cu` list the same). Gate and up of a layer share one type, down has
+/// its own. The decoders load nothing wider than 16 bytes and every matrix of a slot starts
+/// on a multiple of 16, so no type asks more of a slot's address than that.
+const EXPERT_TYPES: [(GgmlType, &str); 28] = [
+    (GgmlType::Q4_K, "q4_K"),
+    (GgmlType::Q5_K, "q5_K"),
+    (GgmlType::Q6_K, "q6_K"),
+    (GgmlType::Q3_K, "q3_K"),
+    (GgmlType::Q2_K, "q2_K"),
+    (GgmlType::IQ4_XS, "iq4_xs"),
+    (GgmlType::IQ4_NL, "iq4_nl"),
+    (GgmlType::IQ3_S, "iq3_s"),
+    (GgmlType::IQ3_XXS, "iq3_xxs"),
+    (GgmlType::IQ2_S, "iq2_s"),
+    (GgmlType::IQ2_XS, "iq2_xs"),
+    (GgmlType::IQ2_XXS, "iq2_xxs"),
+    (GgmlType::IQ1_S, "iq1_s"),
+    (GgmlType::IQ1_M, "iq1_m"),
+    (GgmlType::Q8_0, "q8_0"),
+    (GgmlType::Q4_0, "q4_0"),
+    (GgmlType::Q4_1, "q4_1"),
+    (GgmlType::Q5_0, "q5_0"),
+    (GgmlType::Q5_1, "q5_1"),
+    (GgmlType::TQ1_0, "tq1_0"),
+    (GgmlType::TQ2_0, "tq2_0"),
+    (GgmlType::MXFP4, "mxfp4"),
+    (GgmlType::NVFP4, "nvfp4"),
+    (GgmlType::Q1_0, "q1_0"),
+    (GgmlType::Q2_0, "q2_0"),
+    (GgmlType::F32, "f32"),
+    (GgmlType::F16, "f16"),
+    (GgmlType::BF16, "bf16"),
 ];
 
-/// The types down may have.
-const DOWN_TYPES: [(GgmlType, &str, u64); 1] = [(GgmlType::Q2_0, "ares_expert_down_q2_0", 2)];
+/// The index of `ty` in [`EXPERT_TYPES`]: `None` for a type no weight is stored in (the
+/// integer types, F64 and the two that ggml keeps for itself).
+fn expert_type(ty: GgmlType) -> Option<usize> {
+    EXPERT_TYPES.iter().position(|(t, _)| *t == ty)
+}
+
+/// The values of a row that an activation scale covers: a row of an expert's matrix is
+/// whole groups of them, whatever the type's own block.
+const ACT_GROUP: u32 = 32;
 
 /// The host share of a layer (`AresHostShare` in
 /// `kernels/expert_layout.cuh`): where the host writes which groups of a
@@ -224,33 +267,36 @@ impl ExpertShape {
         (self.pairs(n_rows) * u64::from(self.n_ff)).next_multiple_of(16)
     }
 
-    /// Whether the kernels can compute a layer of this shape, and if not, why.
+    /// The weight types the kernels compute an expert in: every type a model file stores
+    /// weights in.
+    pub fn types() -> impl Iterator<Item = GgmlType> {
+        EXPERT_TYPES.iter().map(|(ty, _)| *ty)
+    }
+
+    /// Whether the kernels can compute a layer of this shape, and if not, why. Every
+    /// weight type is taken, for gate and up and for down; what is refused is a width
+    /// that is not whole blocks of the type or whole groups of 32 values (the activations
+    /// and the hidden values are scaled per 32).
     pub fn check(&self) -> Result<()> {
         let what = "expert shape";
-        if !GATE_UP_TYPES.iter().any(|(ty, _, _)| *ty == self.gate_ty) {
+        for (matrix, ty) in [("gate and up", self.gate_ty), ("down", self.down_ty)] {
+            if expert_type(ty).is_none() {
+                return Err(invalid(
+                    what,
+                    format!("{matrix} of type {ty}, which holds no weights"),
+                ));
+            }
+        }
+        if self.n_embd == 0
+            || !self.n_embd.is_multiple_of(self.gate_ty.block_values())
+            || !self.n_embd.is_multiple_of(ACT_GROUP)
+        {
             return Err(invalid(
                 what,
                 format!(
-                    "gate and up of type {} have no expert kernel (there is one for {})",
-                    self.gate_ty,
-                    GATE_UP_TYPES.map(|(t, _, _)| t.name()).join(", ")
+                    "width {} is not whole blocks of {} and groups of {ACT_GROUP}",
+                    self.n_embd, self.gate_ty
                 ),
-            ));
-        }
-        if !DOWN_TYPES.iter().any(|(ty, _, _)| *ty == self.down_ty) {
-            return Err(invalid(
-                what,
-                format!(
-                    "down of type {} has no expert kernel (there is one for {})",
-                    self.down_ty,
-                    DOWN_TYPES.map(|(t, _, _)| t.name()).join(", ")
-                ),
-            ));
-        }
-        if self.n_embd == 0 || !self.n_embd.is_multiple_of(self.gate_ty.block_values()) {
-            return Err(invalid(
-                what,
-                format!("width {} is not whole blocks of {}", self.n_embd, self.gate_ty),
             ));
         }
         if self.n_ff == 0
@@ -385,28 +431,30 @@ pub struct ExpertKernels {
     select: Function,
     pick: Function,
     group: Function,
-    gate_up: Vec<(GgmlType, u64, Function)>,
-    down: Vec<(GgmlType, u64, Function)>,
+    /// Per type of [`EXPERT_TYPES`]: the gate and up kernel and the down kernel.
+    typed: Vec<(Function, Function)>,
 }
 
 impl ExpertKernels {
     /// Loads the kernels on `device`.
     pub fn load(device: &Device) -> Result<Self> {
         let module = Module::load(device, IMAGE)?;
-        let typed = |types: &[(GgmlType, &str, u64)]| {
-            types
-                .iter()
-                .map(|(ty, name, align)| Ok((*ty, *align, module.function(name)?)))
-                .collect::<Result<Vec<_>>>()
-        };
+        let typed = EXPERT_TYPES
+            .iter()
+            .map(|(_, suffix)| {
+                Ok((
+                    module.function(&format!("ares_expert_gate_up_{suffix}"))?,
+                    module.function(&format!("ares_expert_down_{suffix}"))?,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             device: device.clone(),
             logits: module.function("ares_expert_logits")?,
             select: module.function("ares_expert_select")?,
             pick: module.function("ares_expert_pick")?,
             group: module.function("ares_expert_group")?,
-            gate_up: typed(&GATE_UP_TYPES)?,
-            down: typed(&DOWN_TYPES)?,
+            typed,
         })
     }
 
@@ -675,15 +723,13 @@ impl ExpertKernels {
             u32::try_from(shape.up_offset().ok_or_else(geometry)?).map_err(|_| geometry())?;
         let down_offset =
             u32::try_from(shape.down_offset().ok_or_else(geometry)?).map_err(|_| geometry())?;
-        let find = |kernels: &[(GgmlType, u64, Function)], ty: GgmlType| {
-            kernels.iter().find(|(t, _, _)| *t == ty).map(|(_, align, f)| (*align, f.clone()))
+        let kernel = |ty: GgmlType| {
+            expert_type(ty)
+                .map(|i| &self.typed[i])
+                .ok_or_else(|| invalid("expert shape", "no kernel for the types".into()))
         };
-        let (Some((gate_align, gate_up)), Some((down_align, down))) =
-            (find(&self.gate_up, shape.gate_ty), find(&self.down, shape.down_ty))
-        else {
-            return Err(invalid("expert shape", "no kernel for the types".into()));
-        };
-        check_align("expert pool", pool, 16.max(gate_align).max(down_align))?;
+        let (gate_up, down) = (&kernel(shape.gate_ty)?.0, &kernel(shape.down_ty)?.1);
+        check_align("expert pool", pool, 16)?;
         check_align("slot table", slot_table, 4)?;
         check_align("route record", record, 4)?;
         check_align("activations", act, 16)?;
@@ -738,9 +784,39 @@ impl ExpertKernels {
 // ---------------------------------------------------------------------------
 // Many rows: a plan on the device and tile kernels on the tensor cores.
 
-/// The tensor-core kernels of the experts for any number of rows
-/// (`kernels/expertrows.cu`) as a fat binary (`build.rs`).
-static ROWS_IMAGE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/expertrows.fatbin"));
+/// The tensor-core kernels of the experts for any number of rows as fat binaries
+/// (`build.rs`), each with the suffixes of the types whose gate and up kernels and whose
+/// down kernels it holds. `kernels/expertrows.cu` has the plan, the ordered sum and the
+/// types with a decoder written for these kernels; the other four have every other type,
+/// through the decoders of the dense tile kernels (`kernels/expertrows_mm.cuh`).
+type RowsModule = (&'static [u8], &'static [&'static str], &'static [&'static str]);
+static ROWS_MODULES: [RowsModule; 5] = [
+    (
+        include_bytes!(concat!(env!("OUT_DIR"), "/expertrows.fatbin")),
+        &["iq2_s", "iq2_xxs", "iq1_m", "iq1_s"],
+        &["q2_0"],
+    ),
+    (
+        include_bytes!(concat!(env!("OUT_DIR"), "/expertrows_k.fatbin")),
+        &["q4_K", "q5_K", "q6_K", "q3_K", "q2_K", "q8_0", "iq4_xs", "iq4_nl"],
+        &["q4_K", "q5_K", "q6_K", "q3_K", "q2_K", "q8_0", "iq4_xs", "iq4_nl"],
+    ),
+    (
+        include_bytes!(concat!(env!("OUT_DIR"), "/expertrows_i.fatbin")),
+        &["iq3_s", "iq3_xxs", "iq2_xs", "q2_0"],
+        &["iq3_s", "iq3_xxs", "iq2_xs", "iq2_s", "iq2_xxs", "iq1_s", "iq1_m"],
+    ),
+    (
+        include_bytes!(concat!(env!("OUT_DIR"), "/expertrows_l.fatbin")),
+        &["q4_0", "q4_1", "q5_0", "q5_1", "tq1_0", "tq2_0"],
+        &["q4_0", "q4_1", "q5_0", "q5_1", "tq1_0", "tq2_0"],
+    ),
+    (
+        include_bytes!(concat!(env!("OUT_DIR"), "/expertrows_f.fatbin")),
+        &["mxfp4", "nvfp4", "q1_0", "f32", "f16", "bf16"],
+        &["mxfp4", "nvfp4", "q1_0", "f32", "f16", "bf16"],
+    ),
+];
 
 /// The sizes of an item that the many-row kernels exist for: the plan cuts an
 /// expert's run of pairs into items of at most this many, and a kernel built for a
@@ -764,16 +840,30 @@ const ROWS_WEIGHT_ROWS: u32 = 64;
 const ROWS_GATE_UP_STAGES: [u64; 4] = [3, 3, 3, 2];
 const ROWS_DOWN_STAGES: u64 = 4;
 
-/// The types gate and up may have for the many-row kernels: the kernel's name up to the
-/// suffix with the tile, and the bytes of the type's tables in shared memory.
-const ROWS_GATE_UP_TYPES: [(GgmlType, &str, u64); 3] = [
-    (GgmlType::IQ2_S, "ares_er_gate_up_iq2_s", 8192 + 4096),
-    (GgmlType::IQ2_XXS, "ares_er_gate_up_iq2_xxs", 2048 + 4096),
-    (GgmlType::IQ1_M, "ares_er_gate_up_iq1_m", 16384),
+/// The values of a row the many-row gate and up kernel takes per step, and the values of
+/// a row of down per stage (`kernels/expertrows_gate_up.cuh`, `expertrows_down.cuh`).
+const ROWS_GATE_CHUNK: u32 = 128;
+const ROWS_DOWN_BLOCK: u32 = 64;
+
+/// The gate and up decoders written for the many-row kernels (`kernels/expertrows_types.cuh`,
+/// and IQ1_S's in `mm_types_more.cuh`) and the bytes of their tables in shared memory. Every
+/// other decoder is the item decoder of the dense tile kernels, whose table is
+/// [`Kernels::tile_table_bytes`](crate::Kernels::tile_table_bytes).
+const ROWS_OWN_GATE_UP: [(GgmlType, u64); 4] = [
+    (GgmlType::IQ2_S, 8192 + 4096),
+    (GgmlType::IQ2_XXS, 2048 + 4096),
+    (GgmlType::IQ1_M, 16384),
+    (GgmlType::IQ1_S, 16384),
 ];
 
-/// The type down has for the many-row kernels, and its kernel's name.
-const ROWS_DOWN_TYPE: (GgmlType, &str) = (GgmlType::Q2_0, "ares_er_down_q2_0");
+/// The bytes of shared memory the decoder of `ty` keeps its tables in: in the gate and up
+/// kernel, and in the down kernel (Q2_0, whose down decoder is written for it, has none
+/// either way).
+fn rows_table_bytes(ty: GgmlType) -> (u64, u64) {
+    let tile = u64::from(crate::Kernels::tile_table_bytes(ty).unwrap_or(0));
+    let gate_up = ROWS_OWN_GATE_UP.iter().find(|(t, _)| *t == ty).map_or(tile, |(_, bytes)| *bytes);
+    (gate_up, tile)
+}
 
 /// How the many-row down kernel adds an expert's output to a row.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -957,6 +1047,26 @@ impl<'a> RowsPlan<'a> {
 }
 
 impl ExpertShape {
+    /// Whether the many-row kernels ([`ExpertRowKernels`]) can compute a layer of this shape:
+    /// what [`ExpertShape::check`] asks, and widths in whole steps of those kernels (128
+    /// values of the model's width, 64 of the inner one).
+    pub fn check_rows(&self) -> Result<()> {
+        self.check()?;
+        if !self.n_embd.is_multiple_of(ROWS_GATE_CHUNK)
+            || !self.n_ff.is_multiple_of(ROWS_DOWN_BLOCK)
+        {
+            return Err(invalid(
+                "expert shape",
+                format!(
+                    "the many-row kernels take widths in steps of {ROWS_GATE_CHUNK} and inner \
+                     widths in steps of {ROWS_DOWN_BLOCK}, not {} and {}",
+                    self.n_embd, self.n_ff
+                ),
+            ));
+        }
+        Ok(())
+    }
+
     /// Bytes of the plan of `n_rows` rows with items of `tile` pairs.
     pub fn rows_plan_bytes(&self, n_rows: u32, tile: u32) -> u64 {
         RowsPlanLayout::new(self.n_experts, n_rows.saturating_mul(self.top_k), tile).bytes
@@ -1001,10 +1111,10 @@ fn rows_gate_up_shared(table: u64, tile: u32) -> u64 {
     table + u64::from(tile) * (stages * 256 + 4 + 16)
 }
 
-/// Dynamic shared memory of the down kernel for items of `tile` pairs: the stages of
-/// hidden values (128 bytes a row each), and the rows and weights of the item.
-fn rows_down_shared(tile: u32) -> u64 {
-    u64::from(tile) * (ROWS_DOWN_STAGES * 128 + 8)
+/// Dynamic shared memory of the down kernel for items of `tile` pairs: the type's tables,
+/// the stages of hidden values (128 bytes a row each), and the rows and weights of the item.
+fn rows_down_shared(table: u64, tile: u32) -> u64 {
+    table + u64::from(tile) * (ROWS_DOWN_STAGES * 128 + 8)
 }
 
 /// The index of `tile` in [`ROWS_TILES`].
@@ -1057,6 +1167,12 @@ fn tile_index(tile: u32) -> Result<usize> {
 /// scale per pair and 64 values. The value of a pair is the same bits whatever other
 /// rows the call has.
 ///
+/// **Types.** Every weight type has its kernels for gate and up and for down. IQ2_S,
+/// IQ2_XXS, IQ1_M and IQ1_S as gate and up and Q2_0 as down have a decoder written for
+/// these kernels (`kernels/expertrows_types.cuh`); every other type and role decodes with
+/// the item decoder of the dense tile kernels (`kernels/expertrows_mm.cuh`), which holds
+/// more in registers per step. `docs/ARCHITECTURE.md` has the measured times of each.
+///
 /// Needs compute capability 8.0 or newer (the `mma` shape and `cp.async` of Ampere).
 #[derive(Debug, Clone)]
 pub struct ExpertRowKernels {
@@ -1066,10 +1182,10 @@ pub struct ExpertRowKernels {
     plan_offsets: Function,
     plan_scatter: Function,
     combine: Function,
-    /// Per type: the type, its tables' bytes of shared memory and the kernels by tile.
-    gate_up: Vec<(GgmlType, u64, [Function; 4])>,
-    /// `[Ordered, Atomic][tile]`.
-    down: [[Function; 4]; 2],
+    /// Per type of [`EXPERT_TYPES`]: the bytes of shared memory of its tables and the
+    /// kernels by tile, for gate and up and for down.
+    gate_up: Vec<(u64, [Function; 4])>,
+    down: Vec<(u64, [Function; 4])>,
 }
 
 impl ExpertRowKernels {
@@ -1085,43 +1201,60 @@ impl ExpertRowKernels {
                 ),
             ));
         }
-        let module = Module::load(device, ROWS_IMAGE)?;
         let limit = u64::from(device.info().max_shared_per_block_optin);
-        let tiled = |name: &str| -> Result<[Function; 4]> {
-            Ok([
-                module.function(&format!("{name}_n1"))?,
-                module.function(&format!("{name}_n2"))?,
-                module.function(&format!("{name}_n4"))?,
-                module.function(&format!("{name}_n8"))?,
-            ])
-        };
-        let mut gate_up = Vec::new();
-        for (ty, name, table) in ROWS_GATE_UP_TYPES {
-            let functions = tiled(name)?;
-            for (function, tile) in functions.iter().zip(ROWS_TILES) {
-                let bytes = rows_gate_up_shared(table, tile);
+        // The kernels of one type by tile, each allowed the shared memory `shared` gives.
+        let tiled = |module: &Module, name: &str, shared: &dyn Fn(u32) -> u64| {
+            let mut functions = Vec::with_capacity(ROWS_TILES.len());
+            for (tile, suffix) in ROWS_TILES.into_iter().zip(["n1", "n2", "n4", "n8"]) {
+                let function = module.function(&format!("{name}_{suffix}"))?;
+                let bytes = shared(tile);
                 if bytes > limit {
                     return Err(invalid(
                         "many-row experts",
                         format!(
-                            "{name} for {tile} pairs needs {bytes} bytes of shared memory; \
-                             the device allows {limit}"
+                            "{name} for {tile} pairs needs {bytes} bytes of shared memory; the \
+                             device allows {limit}"
                         ),
                     ));
                 }
                 function.allow_dynamic_shared(bytes as u32)?;
+                functions.push(function);
             }
-            gate_up.push((ty, table, functions));
-        }
-        let down = [
-            tiled(&format!("{}_ordered", ROWS_DOWN_TYPE.1))?,
-            tiled(&format!("{}_atomic", ROWS_DOWN_TYPE.1))?,
-        ];
-        for way in &down {
-            for (function, tile) in way.iter().zip(ROWS_TILES) {
-                function.allow_dynamic_shared(rows_down_shared(tile) as u32)?;
+            <[Function; 4]>::try_from(functions)
+                .map_err(|_| invalid("many-row experts", "a kernel per tile".into()))
+        };
+        let mut gate_up: Vec<Option<(u64, [Function; 4])>> = vec![None; EXPERT_TYPES.len()];
+        let mut down = gate_up.clone();
+        let mut base = None;
+        for (image, gate_up_types, down_types) in &ROWS_MODULES {
+            let module = Module::load(device, image)?;
+            for (types, kernels, is_down) in
+                [(gate_up_types, &mut gate_up, false), (down_types, &mut down, true)]
+            {
+                for suffix in types.iter() {
+                    let index = EXPERT_TYPES
+                        .iter()
+                        .position(|(_, s)| s == suffix)
+                        .ok_or_else(|| invalid("many-row experts", format!("no type {suffix}")))?;
+                    let tables = rows_table_bytes(EXPERT_TYPES[index].0);
+                    kernels[index] = Some(if is_down {
+                        let name = format!("ares_er_down_{suffix}");
+                        (tables.1, tiled(&module, &name, &|tile| rows_down_shared(tables.1, tile))?)
+                    } else {
+                        let name = format!("ares_er_gate_up_{suffix}");
+                        let shared = |tile| rows_gate_up_shared(tables.0, tile);
+                        (tables.0, tiled(&module, &name, &shared)?)
+                    });
+                }
             }
+            base.get_or_insert(module);
         }
+        let module = base.ok_or_else(|| invalid("many-row experts", "no module".into()))?;
+        let all = |kernels: Vec<Option<(u64, [Function; 4])>>| {
+            kernels.into_iter().collect::<Option<Vec<_>>>().ok_or_else(|| {
+                invalid("many-row experts", "a weight type without its kernels".into())
+            })
+        };
         Ok(Self {
             device: device.clone(),
             plan_small: module.function("ares_er_plan_small")?,
@@ -1129,8 +1262,8 @@ impl ExpertRowKernels {
             plan_offsets: module.function("ares_er_plan_offsets")?,
             plan_scatter: module.function("ares_er_plan_scatter")?,
             combine: module.function("ares_er_combine")?,
-            gate_up,
-            down,
+            gate_up: all(gate_up)?,
+            down: all(down)?,
         })
     }
 
@@ -1141,7 +1274,7 @@ impl ExpertRowKernels {
     /// Checks what every call has to: the shape, the rows and the tile. Returns the
     /// number of pairs and the index of the tile.
     fn check_call(shape: &ExpertShape, n_rows: u32, tile: u32) -> Result<(u32, usize)> {
-        shape.check()?;
+        shape.check_rows()?;
         let index = tile_index(tile)?;
         let pairs = n_rows.checked_mul(shape.top_k).filter(|p| n_rows > 0 && *p < 1 << 28);
         let Some(pairs) = pairs else {
@@ -1259,8 +1392,7 @@ impl ExpertRowKernels {
         check_align("plan", plan, 16)?;
         check_align("activations", act, 16)?;
         check_align("hidden values", hidden, 16)?;
-        let Some((_, table, kernels)) = self.gate_up.iter().find(|(ty, _, _)| *ty == shape.gate_ty)
-        else {
+        let Some((table, kernels)) = expert_type(shape.gate_ty).map(|i| &self.gate_up[i]) else {
             return Err(invalid("expert shape", "no many-row kernel for the types".into()));
         };
         let geometry = || invalid("expert shape", "sizes overflow".into());
@@ -1338,13 +1470,15 @@ impl ExpertRowKernels {
             .u32(shape.n_ff)
             .u32(shape.n_embd)
             .u32(shape.n_experts)
-            .u32(pairs);
+            .u32(pairs)
+            .u32(u32::from(way == Accumulate::Atomic));
         let grid = [layout.max_items(), shape.n_embd / ROWS_WEIGHT_ROWS, 1];
-        let kernel = &self.down[usize::from(way == Accumulate::Atomic)][index];
+        let Some((table, kernels)) = expert_type(shape.down_ty).map(|i| &self.down[i]) else {
+            return Err(invalid("expert shape", "no many-row kernel for the types".into()));
+        };
+        let shared = rows_down_shared(*table, tile) as u32;
         // SAFETY: the argument list matches the ares_er_down_* kernels.
-        unsafe {
-            kernel.launch(stream, grid, [ROWS_THREADS, 1, 1], rows_down_shared(tile) as u32, args)
-        }
+        unsafe { kernels[index].launch(stream, grid, [ROWS_THREADS, 1, 1], shared, args) }
     }
 
     /// Adds the experts' outputs that [`Accumulate::Ordered`] left in `scratch` to the
@@ -1418,9 +1552,17 @@ impl ExpertRowKernels {
     }
 }
 
-/// The route record of the decode kernels for up to [`MAX_BATCH`] rows, written on the host:
-/// the header, ids and weights, and the groups (each picked expert once, ascending, with the
-/// rows that picked it and the slot `slot_of` gives it).
+impl ExpertShape {
+    /// The route record of the decode kernels for up to [`MAX_BATCH`] rows, written on the
+    /// host instead of by the router: the header, the ids and weights (every pick of a row
+    /// with the same weight), and the groups (each picked expert once, ascending, with the
+    /// rows that picked it and the slot `slot_of` gives it). `picks` has `top_k` experts for
+    /// each row. For measurements, which need picks and no router.
+    pub fn host_record(&self, picks: &[Vec<u32>], slot_of: &[i32]) -> Vec<u8> {
+        decode_record(self, picks, slot_of)
+    }
+}
+
 fn decode_record(shape: &ExpertShape, picks: &[Vec<u32>], slot_of: &[i32]) -> Vec<u8> {
     let k = shape.top_k as usize;
     let cap = picks.len() * k;
@@ -1649,14 +1791,53 @@ mod tests {
     }
 
     #[test]
-    fn refuses_shapes_without_a_kernel() {
-        assert!(flash_next(GgmlType::Q4_K).check().is_err());
+    fn every_weight_type_is_taken_and_a_row_must_be_whole_blocks() {
+        assert_eq!(ExpertShape::types().count(), 28);
+        for ty in ExpertShape::types() {
+            // Gate and up: rows of 2560 values are whole blocks of every type.
+            assert!(flash_next(ty).check().is_ok(), "gate and up of {ty}");
+            assert!(flash_next(ty).check_rows().is_ok(), "gate and up of {ty}, many rows");
+            // Down: rows of 640 values are whole blocks of the types of up to 128 values.
+            let mut shape = flash_next(GgmlType::IQ2_S);
+            shape.down_ty = ty;
+            assert_eq!(shape.check().is_ok(), 640 % ty.block_values() == 0, "down of {ty}");
+            shape.n_ff = 768;
+            assert!(shape.check_rows().is_ok(), "down of {ty} with rows of 768 values");
+            let (gate_up, down) = rows_table_bytes(ty);
+            assert!(gate_up.is_multiple_of(16) && down.is_multiple_of(16), "{ty}");
+        }
+        // Mixed: any pair of types whose blocks divide the widths.
+        let mut shape = flash_next(GgmlType::Q4_K);
+        shape.down_ty = GgmlType::BF16;
+        assert!(shape.check().is_ok());
+        // What holds no weights.
+        for ty in [GgmlType::I8, GgmlType::I32, GgmlType::F64, GgmlType::Q8_K, GgmlType::Q8_1] {
+            assert!(flash_next(ty).check().is_err(), "{ty}");
+        }
         let mut shape = flash_next(GgmlType::IQ2_S);
         shape.top_k = 17;
         assert!(shape.check().is_err());
         shape.top_k = 10;
         shape.n_ff = 600;
         assert!(shape.check().is_err());
+        // Widths the decode kernels take and the many-row kernels do not.
+        let narrow = ExpertShape { n_embd: 96, n_ff: 32, ..flash_next(GgmlType::Q4_0) };
+        let narrow = ExpertShape { down_ty: GgmlType::Q4_0, ..narrow };
+        assert!(narrow.check().is_ok() && narrow.check_rows().is_err());
+    }
+
+    #[test]
+    fn every_type_has_its_many_row_kernels_in_one_module() {
+        for (ty, suffix) in EXPERT_TYPES {
+            for down in [false, true] {
+                let holders = ROWS_MODULES
+                    .iter()
+                    .map(|(_, gate_up, downs)| if down { downs } else { gate_up })
+                    .filter(|types| types.contains(&suffix))
+                    .count();
+                assert_eq!(holders, 1, "{ty} ({})", if down { "down" } else { "gate and up" });
+            }
+        }
     }
 
     #[test]

@@ -7,7 +7,8 @@
 // rows picked it. The weights are the file's quantized bytes in the expert's
 // slot; the products are the integer dot products of the decode family
 // (mmvq.cuh) with the decoders of the weight types (`T::load_w`, `T::load_a`,
-// `T::dot_acc`), so a type that has a decode kernel can be an expert's type.
+// `T::dot_acc`), so a type that has a decode kernel can be an expert's type, and
+// every one is (experts.cu); the float types through EngExpertFloat below.
 //
 // 1. ares_expert_gate_up_<type>: a thread block per picked expert and 32
 //    values of its inner width. A warp reads row j of the gate and row j of
@@ -36,6 +37,61 @@
 #include "expert_layout.cuh"
 #include "layer_math.cuh"
 #include "mmvq.cuh"
+#include "mmvq_float.cuh"
+
+// The float types (F32, F16, BF16) as a type of the decode family, for the experts: a
+// "block" is the 32 values that share an activation scale, a lane takes 8 of them with the
+// loads of the float weight kernel (`F::load8`, mmvq_float.cuh), and the product is the
+// weights as stored times the int8 activations, the sum of a lane's eight scaled once.
+// The dense float kernel (ares_mmvf) multiplies the unquantized f32 copy of the activations
+// instead; the experts do not, so that gate, up and down of every type compute the same
+// thing, W x^ for the rounded activations x^ (the hidden values exist as int8 only), and
+// the host can compute an expert of any type with the same result.
+//
+// The rows of a matrix must be 16-byte aligned: its start is (a slot), and a row of whole
+// groups of 32 values is 64 or 128 bytes a group.
+template <class F>
+struct EngExpertFloat {
+    static constexpr int BLOCK_VALUES = 32;
+    static constexpr int BLOCK_BYTES = 32 * F::ELEM_BYTES;
+    static constexpr int LANES = 4;
+    static constexpr int SMEM_BYTES = 0;
+    static __device__ __forceinline__ void init(uint8_t*, uint32_t, uint32_t) {}
+
+    struct W {
+        float v[8];
+    };
+    struct A {
+        uint2 q;
+        float d;
+    };
+
+    static __device__ __forceinline__ W load_w(const uint8_t* blk, uint32_t slot, const uint8_t*) {
+        W w;
+        F::load8(blk + static_cast<size_t>(8 * slot) * F::ELEM_BYTES, w.v);
+        return w;
+    }
+
+    static __device__ __forceinline__ A load_a(const int8_t* q, const float2* ds, uint32_t slot) {
+        A a;
+        a.q = *reinterpret_cast<const uint2*>(q + 8 * slot);
+        a.d = ds->x;
+        return a;
+    }
+
+    static __device__ __forceinline__ void dot_acc(float& acc, const W& w, const A& a) {
+        float t = 0.0f;
+#pragma unroll
+        for (int k = 0; k < 4; k++) {
+            t = fmaf(w.v[k], static_cast<float>(static_cast<int8_t>(a.q.x >> (8 * k))), t);
+        }
+#pragma unroll
+        for (int k = 0; k < 4; k++) {
+            t = fmaf(w.v[4 + k], static_cast<float>(static_cast<int8_t>(a.q.y >> (8 * k))), t);
+        }
+        acc = fmaf(t, a.d, acc);
+    }
+};
 
 // The dot products of `ROWS` weight rows with the activation rows named in
 // `mask`, added to `acc`: the inner loop of ares_mmvq, with the activation

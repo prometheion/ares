@@ -906,6 +906,18 @@ impl Kernels {
         DECODE_ROWS.iter().find(|(t, _)| *t == ty).map(|(_, rows)| *rows)
     }
 
+    /// The bytes of shared memory the tile kernels' decoder of `ty` keeps its tables in
+    /// (`SMEM_BYTES` of the type in `kernels/mm_types*.cuh`); `None` for a type without a
+    /// tile kernel. The many-row expert kernels, which decode with the same decoders, lay
+    /// out their shared memory with it.
+    pub fn tile_table_bytes(ty: GgmlType) -> Option<u32> {
+        PREFILL_TYPES
+            .iter()
+            .chain(PREFILL_MORE_TYPES.iter())
+            .find(|(t, _, _, _)| *t == ty)
+            .map(|(_, _, _, table)| *table)
+    }
+
     /// Whether this device has the prefill kernels at all: they need compute
     /// capability 8.0 (Ampere) or newer.
     pub fn has_prefill_kernels(&self) -> bool {

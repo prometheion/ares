@@ -22,7 +22,9 @@
 //! lowest such target the toolkit lists, 8.0 with CUDA 13.4). A GPU below that
 //! loads the first module and not the second; there are no prefill kernels
 //! for it and nothing stands in for them. The many-row expert kernels
-//! (`kernels/expertrows.cu`) are built the same way and for the same reason.
+//! (`kernels/expertrows.cu` and `expertrows_{k,i,l,f}.cu`, which hold the kernels of the
+//! other weight types and are modules of their own so that they compile side by side) are
+//! built the same way and for the same reason.
 //!
 //! Environment:
 //! - `NVCC`: path of the compiler (default: `$CUDA_PATH/bin/nvcc`,
@@ -99,6 +101,10 @@ fn main() {
         ("attention.cu", "attention.fatbin", TENSOR_FLOOR),
         ("experts.cu", "experts.fatbin", FLOOR),
         ("expertrows.cu", "expertrows.fatbin", TENSOR_FLOOR),
+        ("expertrows_k.cu", "expertrows_k.fatbin", TENSOR_FLOOR),
+        ("expertrows_i.cu", "expertrows_i.fatbin", TENSOR_FLOOR),
+        ("expertrows_l.cu", "expertrows_l.fatbin", TENSOR_FLOOR),
+        ("expertrows_f.cu", "expertrows_f.fatbin", TENSOR_FLOOR),
         ("q4.cu", "q4.fatbin", FLOOR),
         ("sampler.cu", "sampler.fatbin", FLOOR),
     ];

@@ -19,6 +19,21 @@
 //   j + 8) with one shift and mask, so the hidden values are stored in that order
 //   (the gate and up kernel writes them so).
 //
+// A type `T` of the gate and up kernel provides:
+//   BLOCK_VALUES, BLOCK_BYTES   the geometry of a block of the file
+//   TABLE_BYTES, init(tab)      its tables in shared memory (a multiple of 16 bytes)
+//   Raw load(row, sb)           the global loads of sub-block `sb` of a row (32 values;
+//                               thread t of a quad takes sb = 4 c + t in chunk c)
+//   Scales scales(raw, tab)     what the four groups of the sub-block share
+//   group(raw, scales, l, tab, h)   the eight values of step l as four f16 pairs
+//   piece(t, l)                 which 8 values of a chunk of 128 those are, as a number
+//                               0..15 (values 8 p to 8 p + 7): the activations are read
+//                               from the same place. 4 t + l for a type whose sub-block
+//                               is 32 consecutive values.
+// The types below are written for these kernels; expertrows_mm.cuh makes one of any item
+// decoder of the dense tile kernels (mm_types.cuh, mm_types_more.cuh), which is how every
+// other weight type gets here.
+//
 // A decoded value is the f16 `scale * magnitude`, rounded once: the codebook
 // magnitudes are small integers, so they come out of the bytes exactly as f16 `1024 +
 // m` (0x64 in the high byte, the trick of Marlin) and one fused multiply-add with `-1024
@@ -68,9 +83,15 @@ static __device__ __forceinline__ float ares_er_f16_at(uint32_t bits) {
 // each. value = d * (2 s + 1) / 8 * magnitude * sign, s the nibble of the scale byte
 // for the half (l / 2).
 struct ErIQ2S {
+    static constexpr uint32_t BLOCK_VALUES = 256;
     static constexpr uint32_t BLOCK_BYTES = 82;
     static constexpr uint32_t GRID_BYTES = 1024 * 8;
     static constexpr uint32_t TABLE_BYTES = GRID_BYTES + 256 * 16;
+
+    using Scales = AresErScales;
+    static __device__ __forceinline__ uint32_t piece(uint32_t t, uint32_t l) {
+        return 4 * t + l;
+    }
 
     struct Raw {
         uint32_t qs, signs, qh, sc, d;
@@ -94,7 +115,7 @@ struct ErIQ2S {
         return r;
     }
 
-    static __device__ __forceinline__ AresErScales scales(const Raw& r) {
+    static __device__ __forceinline__ AresErScales scales(const Raw& r, const uint8_t*) {
         const float d8 = ares_er_f16_at(r.d) * 0.125f;
         AresErScales s;
         s.sc[0] = ares_er_h2_of(static_cast<float>(2 * (r.sc & 0xF) + 1) * d8);
@@ -121,9 +142,15 @@ struct ErIQ2S {
 // codebook indices and a u32 with four 7-bit sign indices and a 4-bit scale on top.
 // value = d * (2 s + 1) / 8 * magnitude * sign.
 struct ErIQ2XXS {
+    static constexpr uint32_t BLOCK_VALUES = 256;
     static constexpr uint32_t BLOCK_BYTES = 66;
     static constexpr uint32_t GRID_BYTES = 256 * 8;
     static constexpr uint32_t TABLE_BYTES = GRID_BYTES + 256 * 16;
+
+    using Scales = AresErScales;
+    static __device__ __forceinline__ uint32_t piece(uint32_t t, uint32_t l) {
+        return 4 * t + l;
+    }
 
     struct Raw {
         uint32_t idx, aux, d;
@@ -144,7 +171,7 @@ struct ErIQ2XXS {
         return r;
     }
 
-    static __device__ __forceinline__ AresErScales scales(const Raw& r) {
+    static __device__ __forceinline__ AresErScales scales(const Raw& r, const uint8_t*) {
         const float s = static_cast<float>(2 * (r.aux >> 28) + 1) * ares_er_f16_at(r.d) * 0.125f;
         AresErScales out;
         out.sc[0] = out.sc[1] = ares_er_h2_of(s);
@@ -184,9 +211,15 @@ static __device__ __forceinline__ void ares_er_iq1_values(const uint2& g, uint32
 // each half of 16 values. A group of 8 values is the codebook's bytes in {-1, 0, 1}
 // plus a delta of +-1/8 (the sign bit of the group), times d * (2 s + 1).
 struct ErIQ1M {
+    static constexpr uint32_t BLOCK_VALUES = 256;
     static constexpr uint32_t BLOCK_BYTES = 56;
     static constexpr uint32_t GRID_BYTES = 2048 * 8;
     static constexpr uint32_t TABLE_BYTES = GRID_BYTES;
+
+    using Scales = AresErScales;
+    static __device__ __forceinline__ uint32_t piece(uint32_t t, uint32_t l) {
+        return 4 * t + l;
+    }
 
     struct Raw {
         uint32_t qs, qh, ib;
@@ -208,7 +241,7 @@ struct ErIQ1M {
     }
 
     // `sc` is d * (2 s + 1) of each half; `nsc` is that divided by 8, the delta.
-    static __device__ __forceinline__ AresErScales scales(const Raw& r) {
+    static __device__ __forceinline__ AresErScales scales(const Raw& r, const uint8_t*) {
         const uint32_t sc0 = r.sc.x & 0xFFFF, sc1 = r.sc.x >> 16, sc2 = r.sc.y & 0xFFFF, sc3 = r.sc.y >> 16;
         const uint32_t d16 = (sc0 >> 12) | ((sc1 >> 8) & 0x00F0) | ((sc2 >> 4) & 0x0F00) | (sc3 & 0xF000);
         const float d = ares_er_f16_at(d16);
