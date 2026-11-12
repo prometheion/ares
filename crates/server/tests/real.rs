@@ -1359,6 +1359,68 @@ fn flash_next_answers_in_both_placements() {
     }
 }
 
+/// Flash-Next through the binary on one device, where nearly half of the
+/// experts are in no tier and come from the file while it answers: the
+/// answers are the ones of two devices, the reference's first sentence
+/// included, and the counters say that experts were read from the file.
+#[test]
+fn flash_next_answers_on_one_card() {
+    let Some(model) = flash_model() else { return };
+    let devices = std::env::var("ARES_TEST_DEVICES").unwrap_or_else(|_| "0".to_owned());
+    let device = devices.split(',').next().unwrap_or("0").to_owned();
+    let mut server = Server::start_with(
+        &model,
+        port(2),
+        &["--devices", &device, "--chat-var", "enable_thinking=false"],
+        &[],
+        SLOW,
+    );
+    let log = server.logged().join("\n");
+    assert!(log.contains("plan: RAM"), "the plan says where the RAM goes: {log}");
+    let client: &Client = &server;
+    assert_eq!(client.get("/health").body, r#"{"status":"ok"}"#);
+    let ask = |question: &str| {
+        let body = client.chat(question, json!({"max_tokens": 80, "temperature": 0}));
+        client.post("/v1/chat/completions", &body)
+    };
+    let german = ask(GERMAN);
+    let text = answer(&german);
+    eprintln!("RES one card: German answer {text:?}; timings {}", german.json()["timings"]);
+    assert!(mentions(&text, GERMAN_WORDS), "a German answer about light: {text:?}");
+    let text = answer(&ask(ENGLISH));
+    eprintln!("RES one card: English answer {text:?}");
+    assert!(mentions(&text, ENGLISH_WORDS), "an English answer about light: {text:?}");
+    let text = answer(&ask(HASH_TABLE));
+    assert!(
+        text.starts_with(
+            "A hash table stores data by mapping keys to specific indices in an array using a \
+             hash function."
+        ),
+        "the reference's first sentence: {text:?}"
+    );
+    // The same question again finds its experts in the tiers.
+    let disk_before = client.metric("expert_misses_disk_total");
+    let text = answer(&ask(HASH_TABLE));
+    assert!(text.starts_with("A hash table stores data"), "the second time: {text:?}");
+    let disk_again = client.metric("expert_misses_disk_total") - disk_before;
+
+    let (picks, hits) = (client.metric("expert_picks_total"), client.metric("expert_hits_total"));
+    let (ram, disk, coming) = (
+        client.metric("expert_misses_ram_total"),
+        client.metric("expert_misses_disk_total"),
+        client.metric("expert_misses_on_their_way_total"),
+    );
+    eprintln!(
+        "RES one card: {picks} picks, {hits} in a slot, {ram} from RAM, {disk} from the file \
+         ({disk_again} of them when the last question was asked again), {coming} on their way"
+    );
+    assert!(picks > 1000 && hits > 0 && hits <= picks, "{picks} picks, {hits} hits");
+    assert_eq!(picks, hits + ram + disk + coming, "every pick was a hit or a miss");
+    assert!(disk > 0, "one card does not hold the model: experts came from the file");
+    assert!(client.metric("steps_total") > 100);
+    server.stop();
+}
+
 /// The text of the first choice of an answer, and the ids of its tokens with
 /// the probabilities (`logprob`) the answer reports.
 fn first_choice(reply: &Reply) -> (String, Vec<Value>) {
