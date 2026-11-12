@@ -528,13 +528,25 @@ pub(crate) fn hold_devices(options: &LoadOptions) -> Result<(Vec<u32>, Vec<Held>
 
 /// The most host RAM the engine may use: what the operator named, or half of
 /// what the machine has available now. `required` is what the engine needs to
-/// run at all; `nothing` says what is not spared when the machine reports no
-/// available memory.
+/// run at all, its step buffers; `nothing` says what is not spared when the
+/// machine reports no available memory.
 pub(crate) fn ram_limit(
     options: &LoadOptions,
     required: u64,
     nothing: &str,
 ) -> Result<(u64, String), LoadError> {
+    ram_limit_of(options, &[("its step buffers", required)], nothing)
+}
+
+/// [`ram_limit`] for an engine that must page-lock more than its step
+/// buffers to run: `needs` is all of it, by what it is for. A limit below
+/// their sum is refused, and the refusal names every share.
+fn ram_limit_of(
+    options: &LoadOptions,
+    needs: &[(&str, u64)],
+    nothing: &str,
+) -> Result<(u64, String), LoadError> {
+    let required: u64 = needs.iter().map(|(_, bytes)| bytes).sum();
     let available = std::fs::read_to_string("/proc/meminfo")
         .ok()
         .and_then(|text| plan::parse_available_ram(&text));
@@ -555,11 +567,7 @@ pub(crate) fn ram_limit(
         },
     };
     if ram < required {
-        return Err(refuse(format!(
-            "--ram {} is less than the {} the engine needs for its step buffers",
-            Bytes(ram),
-            Bytes(required)
-        )));
+        return Err(refuse(plan::too_little_ram(ram, needs)));
     }
     Ok((ram, why_ram))
 }
@@ -924,10 +932,23 @@ fn load_qwen35(gguf: Gguf, options: &LoadOptions, begun: Instant) -> Result<Load
         );
     }
     // Host RAM: one limit for the engine. What it needs to run is taken from
-    // it first; the rest is the budget of the checkpoints of recurrent state
-    // (the only other user today), which are locked as they come into use.
+    // it first: its step buffers and, where the token embedding table lies in
+    // host memory, the table and the rows of a step. A limit below that is
+    // refused: the table does not go back to a device, whose memory is what
+    // bounds the context. The rest is the budget of the checkpoints of
+    // recurrent state (the only other user today), which are locked as they
+    // come into use.
     let required = required_ram(&*model, parallel);
-    let (ram, why_ram) = ram_limit(options, required, "none is spared for checkpoints")?;
+    let table = model.pinned_ram();
+    let mut needs = vec![("its step buffers", required - table)];
+    if table > 0 {
+        needs.push((
+            "the token embedding table and the rows of a step, which lie in page-locked RAM \
+             and not on a device",
+            table,
+        ));
+    }
+    let (ram, why_ram) = ram_limit_of(options, &needs, "none is spared for checkpoints")?;
     let checkpoint = model.prefix_cache().map_or(0, |cache| cache.bytes());
     let runtime_config = RuntimeConfig {
         pages,
@@ -943,12 +964,17 @@ fn load_qwen35(gguf: Gguf, options: &LoadOptions, begun: Instant) -> Result<Load
         ..GpuConfig::new(&runtime_config, &*model)
     };
     tracing::info!(
-        "plan: RAM, at most {} for the engine ({why_ram}): {} for its step buffers{}, the rest for          checkpoints of recurrent state, {} each over all devices, {}; the memory is page-locked          as checkpoints are taken",
+        "plan: RAM, at most {} for the engine ({why_ram}): {} for its step buffers{}, the rest \
+         for checkpoints of recurrent state, {} each over all devices, {}; the memory is \
+         page-locked as checkpoints are taken",
         Bytes(ram),
-        Bytes(required),
-        match model.pinned_ram() {
+        Bytes(required - table),
+        match table {
             0 => String::new(),
-            bytes => format!(" and the token embedding table ({} of them)", Bytes(bytes)),
+            bytes => format!(
+                ", {} for the token embedding table and the rows of a step (locked at load)",
+                Bytes(bytes)
+            ),
         },
         Bytes(checkpoint),
         match checkpoint {

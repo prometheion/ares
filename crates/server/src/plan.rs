@@ -7,6 +7,7 @@
 
 use std::path::PathBuf;
 
+use ares_core::units::Bytes;
 use ares_cuda::{CacheFormat, Precision};
 use ares_tokenizer::Json;
 
@@ -263,6 +264,22 @@ pub fn default_ram(available: Option<u64>) -> u64 {
     available.unwrap_or(0) / 2
 }
 
+/// What the server says when the RAM limit `ram` is less than what the engine
+/// must page-lock to run at all. `needs` is that memory by what it is for:
+/// the message names every share and the whole in bytes, the number that
+/// `--ram` takes as it stands.
+pub fn too_little_ram(ram: u64, needs: &[(&str, u64)]) -> String {
+    let required: u64 = needs.iter().map(|(_, bytes)| bytes).sum();
+    let shares: Vec<String> =
+        needs.iter().map(|(what, bytes)| format!("{} for {what}", Bytes(*bytes))).collect();
+    format!(
+        "--ram {} is less than the {} the engine needs to run ({required} bytes): {}",
+        Bytes(ram),
+        Bytes(required),
+        shares.join(", ")
+    )
+}
+
 /// The bytes of memory available for new programs in the text of
 /// `/proc/meminfo` (`MemAvailable`), or `None` when it is not there.
 pub fn parse_available_ram(meminfo: &str) -> Option<u64> {
@@ -344,6 +361,28 @@ mod tests {
         assert_eq!(parse_available_ram("MemTotal: 1 kB\n"), None);
         assert_eq!(parse_available_ram("MemAvailable: lots\n"), None);
         assert_eq!(default_ram(None), 0);
+    }
+
+    #[test]
+    fn a_ram_limit_that_is_too_small_is_answered_with_every_share_and_the_whole_in_bytes() {
+        let needs = [
+            ("its step buffers", 3 << 20),
+            ("the token embedding table and the rows of a step", 200 << 20),
+        ];
+        let said = too_little_ram(4 << 20, &needs);
+        assert_eq!(
+            said,
+            "--ram 4.0 MiB is less than the 203.0 MiB the engine needs to run (212860928 bytes): \
+             3.0 MiB for its step buffers, 200.0 MiB for the token embedding table and the rows \
+             of a step"
+        );
+        // The number of bytes it names is a limit the option takes.
+        assert_eq!(parse_size("212860928"), Some(203 << 20));
+        assert_eq!(
+            too_little_ram(0, &[("its step buffers", 1024)]),
+            "--ram 0 B is less than the 1.0 KiB the engine needs to run (1024 bytes): 1.0 KiB \
+             for its step buffers"
+        );
     }
 
     #[test]

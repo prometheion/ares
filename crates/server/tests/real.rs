@@ -873,6 +873,44 @@ fn a_second_turn_starts_from_what_the_first_turn_computed_and_says_so() {
     server.stop();
 }
 
+/// The server started as [`Server::start`] starts it, with `ram` as its RAM
+/// limit, which it refuses: its exit status and what it said. The port is
+/// named so that a server that starts after all takes no other, and such a
+/// server is killed.
+fn refused_ram(model: &PathBuf, port: u16, flags: &[&str], ram: &str) -> (ExitStatus, String) {
+    let device = std::env::var("ARES_TEST_DEVICE").unwrap_or_else(|_| "0".to_owned());
+    let mut child = Command::new(BIN)
+        .arg("--model")
+        .arg(model)
+        .args(["--port", &port.to_string(), "--devices", &device])
+        .args(["--precision", "exact", "--context", "8192", "--ram", ram])
+        .args(flags)
+        .env_remove("RUST_LOG")
+        .stdin(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stderr = child.stderr.take().unwrap();
+    let said = thread::spawn(move || {
+        let mut said = String::new();
+        stderr.read_to_string(&mut said).unwrap();
+        said
+    });
+    let deadline = Instant::now() + LIMIT;
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() > deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("--ram {ram} was not refused: {}", said.join().unwrap());
+        }
+        thread::sleep(Duration::from_millis(20));
+    };
+    (status, said.join().unwrap())
+}
+
 #[test]
 fn a_server_with_no_ram_to_spare_keeps_no_checkpoints_and_answers_as_one_with() {
     let Some(model) = model() else { return };
@@ -881,13 +919,39 @@ fn a_server_with_no_ram_to_spare_keeps_no_checkpoints_and_answers_as_one_with() 
     let [_, with_second] = two_turns(&with);
     with.stop();
 
-    // The 0.8B's checkpoint is 20 MB: 4 MB of RAM holds none, so a start from
+    // To run at all the engine page-locks its step buffers and the token
+    // embedding table, which lies in host memory. A limit below that is
+    // refused, and the refusal names both shares and their sum in bytes.
+    let (status, said) = refused_ram(&model, port(8), &flags, "4M");
+    let refusal = said.lines().find(|l| l.contains("--ram 4.0 MiB is less than")).unwrap_or(&said);
+    assert!(
+        !status.success()
+            && refusal.contains("for its step buffers")
+            && refusal.contains("for the token embedding table"),
+        "{said}"
+    );
+    let required: u64 = refusal
+        .split_once(" bytes)")
+        .and_then(|(before, _)| before.rsplit_once('('))
+        .and_then(|(_, bytes)| bytes.parse().ok())
+        .unwrap_or_else(|| panic!("the refusal names what is needed in bytes: {refusal}"));
+    assert!(required > 4 << 20, "{refusal}");
+    // One byte less than that is refused as well.
+    let (status, said) = refused_ram(&model, port(8), &flags, &(required - 1).to_string());
+    assert!(!status.success() && said.contains("is less than"), "{said}");
+
+    // Exactly that much is a server with no RAM to spare: nothing of the
+    // limit is left for a checkpoint (the 0.8B's is 20 MB), so a start from
     // cached pages replays every cached row.
+    let required = required.to_string();
     let mut few = Vec::from(flags);
-    few.extend(["--ram", "4M"]);
+    few.extend(["--ram", &required]);
     let mut without = Server::start(&model, port(8), &few);
     assert!(
-        without.logged().iter().any(|l| l.contains("plan: RAM") && l.contains("as asked")),
+        without.logged().iter().any(|l| l.contains("plan: RAM")
+            && l.contains("as asked")
+            && l.contains("for the token embedding table")
+            && l.contains("room for 0")),
         "{:#?}",
         without.logged()
     );
