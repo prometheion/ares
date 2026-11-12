@@ -3,7 +3,8 @@
 Made on 2026-11-11. Read-only survey: nothing was built or run, no repository was changed. The `Ares` column of
 R03 to R12, R14, R16, R21 and H02, the counts and the lists were brought up to date on 2026-11-12, when the
 sampler's features (penalties, DRY, logit bias, probabilities, `n` and the rest) were built; G01, G03, G06, G07
-and G09 were brought up to date the same day, when structured output was built.
+and G09 were brought up to date the same day, when structured output was built, and T01 to T04 and G05 when
+tool calls were.
 One row is one capability that a user or operator of an inference server can observe or rely on.
 
 ## How to read it
@@ -118,7 +119,7 @@ or no-op options; Ares may do a thing differently as long as the result is not w
 | G02 | Regular expression | sglang, tfold, lmdeploy, vllm?, tgi? | the reply matches a regex | not started | yes | niche |
 | G03 | Context-free grammar | llama, kobold, localai (GBNF); sglang, tfold, vllm? (EBNF) | the reply follows a grammar | done: `grammar` in GBNF as llama.cpp reads it (left recursion works), on chat and on completions; syntax errors are 400s with line and column | yes | common |
 | G04 | Choice | tfold, vllm? | the reply is one of the given strings | not started | yes | niche |
-| G05 | Grammar on a trigger | vllm, sglang | free text until a tag opens, then the grammar of that tag (structural tags); the basis of strict tool calls | not started | yes | common |
+| G05 | Grammar on a trigger | vllm, sglang | free text until a tag opens, then the grammar of that tag (structural tags); the basis of strict tool calls | partly: a rule can wait for a trigger (`Structure::trigger`: the answer is free until its text has the trigger, the rule binds what follows), and tool calls use it; no field of a request gives a client a trigger of its own (structural tags, llama.cpp's `grammar_lazy`) | yes | common |
 | G06 | Grammar with thinking | tfold, sglang? | the grammar starts after the think block closes | done: a grammar, a schema or a `response_format` binds the text after the closing tag of the reasoning (free while it thinks); a template that writes no tag into the prompt lets the reply open the block or answer; thinking off binds the whole reply | yes | common |
 | G07 | Grammar under drafts | tfold, vllm?, mlc? | drafts are cut at the first token the grammar refuses; tokens the grammar forces are appended as drafts | partly: a draft the grammar refuses is cut before it is verified, and every row of a window has the mask of its own path; tokens the grammar forces are not offered as drafts | yes | common |
 | G08 | Completable within the limit | tfold | `grammar_budget`: never draw a token after which the value cannot close within `max_tokens` | not started | yes | niche |
@@ -128,10 +129,10 @@ or no-op options; Ares may do a thing differently as long as the result is not w
 
 | ID | Feature | Engines | What it is | Ares | Frame | Need |
 | --- | --- | --- | --- | --- | --- | --- |
-| T01 | Tool calls | llama, ik, kobold, ollama, vllm, sglang, tgi, trt, lmdeploy, tabby, mistralrs, mlc, sonar, localai, strata, tfold, lmstudio | `tools` rendered by the template; the reply's calls parsed into `tool_calls` (id, name, JSON arguments), streamed as deltas, `finish_reason: tool_calls`; tool results accepted back | not started (the template renders tools and tool results; the engine refuses a request with tools) | yes | essential |
-| T02 | Forced tool choice | llama, vllm, tfold, tgi?, mistralrs? | `tool_choice` `required` or a named function enforced by a grammar; `none` hides the tools | not started | yes | common |
-| T03 | Parallel tool calls switch | llama, vllm, tfold | `parallel_tool_calls: false` returns at most one call | not started | yes | common |
-| T04 | Strict argument schemas | vllm, mistralrs | arguments constrained to the tool's JSON schema (`strict`) | not started | yes | common |
+| T01 | Tool calls | llama, ik, kobold, ollama, vllm, sglang, tgi, trt, lmdeploy, tabby, mistralrs, mlc, sonar, localai, strata, tfold, lmstudio | `tools` rendered by the template; the reply's calls parsed into `tool_calls` (id, name, JSON arguments), streamed as deltas, `finish_reason: tool_calls`; tool results accepted back | done: `tools` go to the chat template; the calls of a reply come back in `tool_calls` (id, name, arguments as JSON text), streamed as OpenAI's deltas (the name first, then fragments of the arguments, no markup in `content`), with `finish_reason: tool_calls`; assistant turns with `tool_calls` and `role: tool` results are checked and rendered. For templates that write calls in the tagged form of Qwen3.8 (`<function=..>` and `<parameter=..>` between `<tool_call>` tags), read off the template; a request with tools for a template with another form (JSON between tags, among others) is refused | yes | essential |
+| T02 | Forced tool choice | llama, vllm, tfold, tgi?, mistralrs? | `tool_choice` `required` or a named function enforced by a grammar; `none` hides the tools | done: `auto` (free until the model opens a call, then held to the grammar of calls), `required` and a named function (calls from the first token of the answer; the reasoning stays free), `none` (the tools are in the prompt and the reply is text, as with llama-server) | yes | common |
+| T03 | Parallel tool calls switch | llama, vllm, tfold | `parallel_tool_calls: false` returns at most one call | done: `parallel_tool_calls: false` allows one call in the grammar; the default is several | yes | common |
+| T04 | Strict argument schemas | vllm, mistralrs | arguments constrained to the tool's JSON schema (`strict`) | partly: the arguments are always held to the tool's schema by the grammar (names, required and optional arguments, every value that is not a string through the JSON schema, the strings of an `enum` or `const`), `strict` or not; a string is written raw in the format, and its `pattern`, `minLength`, `maxLength` and `format` are not enforced | yes | common |
 | T05 | Recovery of imperfect calls | strata, tfold, vllm | read drifted envelopes, close markup that the end token cut, type arguments by the schema, repair JSON slips; anything else stays text | not started | yes | common |
 | T06 | Calls inside thinking | tfold, tabby, strata | a complete call written before the think block closes is returned as the call | not started | yes | niche |
 | T07 | Policy for undeclared tools | strata, tfold | a well-formed call of a tool the request did not offer: text plus a marker, or returned as a call | not started | yes | niche |
@@ -343,31 +344,29 @@ Counted from the tables above with a script (see the end of this file for the co
 | --- | --- |
 | Total | 223 |
 | Inside the frame | 200 |
-| - done | 56 |
-| - partly | 39 |
-| - not started | 105 (essential 6, common 32, niche 67) |
+| - done | 59 |
+| - partly | 41 |
+| - not started | 100 (essential 5, common 28, niche 67) |
 | Outside the frame | 23 (all not started) |
 
-Of the 56 done rows 26 are essential, 24 common and 6 niche; of the 39 partly rows 11 are essential, 14 common
+Of the 59 done rows 27 are essential, 26 common and 6 niche; of the 41 partly rows 11 are essential, 16 common
 and 14 niche. A row is one capability, so the counts weigh a sampler option like a model router; List 1 orders
 them by need instead.
 
 ## List 1: inside the frame, not started, most depended-on first
 
-**Essential (6).** Without these a current agent client cannot use the server at all.
+**Essential (5).** Without these a current agent client cannot use the server at all.
 
-- T01 tool calls (parse, stream, results back)
 - K01 reasoning separated from the answer
 - R23 sampling defaults of the server
 - M02 several models loaded on request, and M03 the preset file
 - X01 API keys
 
-**Common (32).**
+**Common (28).**
 
 - API: A04 Responses, A07 Anthropic Messages, A08 token counting, A09 tokenize, A16 model properties
 - Sampling: R25 server cap for the output length
-- Structured output: G05 grammar on a trigger
-- Tools: T02 forced tool choice, T03 parallel switch, T04 strict schemas, T05 recovery of imperfect calls
+- Tools: T05 recovery of imperfect calls
 - Reasoning: K03 thinking budget, K05 loop guard, K06 earlier reasoning in the history
 - Prompt: F07 template override, F09 continuing the assistant message, F11 image input, F18 truncation
 - Scheduling: S04 bounded queue with a retry answer, S06 priorities, S24 idle unload
