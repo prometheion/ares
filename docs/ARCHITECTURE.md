@@ -2088,10 +2088,11 @@ GPU that CUDA 13 does not run on.
   cooperative matrices that the weight kernels already use is not built.
   A list of 2051 cells takes 0.83 to 2.1 times as long as CUDA's.
   One entry stands out: `q8`, 64 rows over 32768 cells, on the RTX 4070 takes
-  45.7 ms in both runs of the final build, 13.5 times CUDA's and 3.6 times the
-  12.6 ms the same kernel took in four runs before the device size was measured
-  the way it is now (the plan is the same, 128 items); its cause is not
-  found.
+  45.7 ms in both runs of the whole table, 13.5 times CUDA's. Alone in a
+  process it takes 12.6 ms (3.7 times CUDA's) with a planner target of 78, 121
+  or 138 workgroups, as it did in four earlier runs of the whole table, so it
+  is not the plan; it depends on what ran before or where the pools lie, and
+  the cause is not found.
 - The sampler exists with the same arithmetic as CUDA's, operation for
   operation (no fused multiply-add, correctly rounded division, the
   exponential and logarithm as polynomials, the radix descent for top-k and
