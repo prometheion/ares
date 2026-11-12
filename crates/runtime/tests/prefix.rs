@@ -12,7 +12,7 @@ mod common;
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ares_api::Engine;
 use ares_runtime::testing::{Gate, HostExecutor, Problems};
@@ -91,6 +91,17 @@ fn engine_with(
 
 fn engine(model: &Arc<SyntheticModel>, config: RuntimeConfig) -> Rig {
     engine_with(model, config, |host| host)
+}
+
+/// Waits until the conductor has dispatched `n` steps, which an observer
+/// counts in `steps`. It is inside the last of them, or about to be: what is
+/// submitted from here on it takes in after that step.
+fn dispatched(steps: &AtomicU32, n: u32) {
+    let deadline = Instant::now() + LIMIT;
+    while steps.load(Ordering::SeqCst) < n {
+        assert!(Instant::now() < deadline, "the conductor never dispatched step {n}");
+        std::thread::sleep(Duration::from_micros(200));
+    }
 }
 
 /// What the oracle found wrong, which is nothing when the conductor did right.
@@ -335,14 +346,20 @@ fn two_equal_prompts_submitted_together_share_from_the_first_full_page_and_one_i
     let prompt = text_of(&mut rng, 100);
     let model = model(Some(CHECKPOINT), |_| {});
     let gate = Gate::new();
-    let e = engine_with(&model, config(256, 16), |host| host.with_gate(gate.clone()));
+    let steps = Arc::new(AtomicU32::new(0));
+    let e = engine_with(&model, config(256, 16), |host| {
+        let steps = steps.clone();
+        host.with_gate(gate.clone()).with_observer(move |_| {
+            steps.fetch_add(1, Ordering::SeqCst);
+        })
+    });
     let expected = fresh(|_| {}, &prompt, 30);
 
     // Keep the conductor inside a step while both are submitted, so that it
     // takes them in one turn and starts them in one pass.
     gate.close();
     let busy = start(&e.rt, request("busy", Some(1))).unwrap();
-    std::thread::sleep(Duration::from_millis(100));
+    dispatched(&steps, 1);
     let (a, b) = (request(&prompt, Some(30)), request(&prompt, Some(30)));
     let (a_id, b_id) = (a.id, b.id);
     let (a, b) = (start(&e.rt, a).unwrap(), start(&e.rt, b).unwrap());
@@ -404,27 +421,33 @@ fn a_request_held_for_a_page_that_is_given_up_computes_it_itself() {
     let model = model(Some(CHECKPOINT), |_| {});
     let gate = Gate::new();
     // The conductor stops in the second step, which is the first of the
-    // request that computes the prompt.
+    // request that computes the prompt. The gate is closed before the step is
+    // counted, so whoever sees the count finds it closed.
     let (steps, stop) = (Arc::new(AtomicU32::new(0)), gate.clone());
     let e = engine_with(&model, config(256, 32), |host| {
+        let steps = steps.clone();
         host.with_gate(gate.clone()).with_observer(move |_| {
-            if steps.fetch_add(1, Ordering::SeqCst) == 1 {
+            if steps.load(Ordering::SeqCst) == 1 {
                 stop.close();
             }
+            steps.fetch_add(1, Ordering::SeqCst);
         })
     });
     let expected = fresh(|_| {}, &prompt, 20);
     gate.close();
     let busy = start(&e.rt, request("busy", Some(1))).unwrap();
-    std::thread::sleep(Duration::from_millis(100));
+    // The conductor is inside the step of "busy": the two prompts arrive
+    // together, after it.
+    dispatched(&steps, 1);
     let (owner, held) = (request(&prompt, Some(20)), request(&prompt, Some(20)));
     let (owner_id, held_id) = (owner.id, held.id);
     let (owner, held) = (start(&e.rt, owner).unwrap(), start(&e.rt, held).unwrap());
     gate.open();
     busy.finish();
-    std::thread::sleep(Duration::from_millis(100));
-    // The first request has read one page and is cancelled; the other has been
+    // The conductor is inside the second step, held at the gate: the first
+    // request has read one page when it is cancelled, and the other has been
     // waiting for the second.
+    dispatched(&steps, 2);
     e.rt.cancel(owner_id);
     gate.open();
     assert_eq!(owner.finish().finish, ares_api::FinishReason::Cancelled);
@@ -830,15 +853,24 @@ fn many_requests_with_shared_prefixes_edits_and_tight_memory_all_say_what_they_s
                 ..config(pages, checkpoints)
             };
             let gate = Gate::new();
+            let steps = Arc::new(AtomicU32::new(0));
             let e = engine_with(&model, cfg, |host| {
-                host.with_delay(Duration::from_micros(80)).with_gate(gate.clone())
+                let steps = steps.clone();
+                host.with_delay(Duration::from_micros(80)).with_gate(gate.clone()).with_observer(
+                    move |_| {
+                        steps.fetch_add(1, Ordering::SeqCst);
+                    },
+                )
             });
             for round in 0..2 {
                 let mut arrival = Rng(77 + round);
                 let busy = burst.then(|| {
+                    // Nothing runs, so the next step is the one of "busy", and
+                    // the conductor is inside it when the requests are sent.
+                    let idle = steps.load(Ordering::SeqCst);
                     gate.close();
                     let busy = start(&e.rt, request("busy", Some(1))).unwrap();
-                    std::thread::sleep(Duration::from_millis(50));
+                    dispatched(&steps, idle + 1);
                     busy
                 });
                 let handles: Vec<Handle> = jobs
