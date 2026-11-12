@@ -618,8 +618,66 @@ fn what_the_engine_cannot_do_is_refused_by_name() {
         400,
         &["response_format", "xml"],
     );
+    // Tools are served, as functions the client runs. What a request asks
+    // about them beyond that is told by name: a tool of another kind, two
+    // tools of one name, a choice the tools do not cover, a second rule for
+    // the reply next to them, the functions of the first chat API, and tools
+    // where there is no chat template.
     let tool = json!({"type": "function", "function": {"name": "f", "parameters": {}}});
-    refused(chat_path, chat(json!({"tools": [tool]})), 501, &["tool"]);
+    let tools = |extra: Value| {
+        let mut body = chat(extra);
+        body["tools"] = json!([tool]);
+        body
+    };
+    refused(
+        chat_path,
+        chat(json!({"tools": [{"type": "web_search"}]})),
+        400,
+        &["tools[0].type", "\"web_search\"", "other kinds of tools are not served"],
+    );
+    refused(chat_path, chat(json!({"tools": [tool, tool]})), 400, &["two tools named 'f'"]);
+    refused(
+        chat_path,
+        chat(json!({"tool_choice": "required"})),
+        400,
+        &["tool_choice", "the request has no tools"],
+    );
+    let named = json!({"type": "function", "function": {"name": "g"}});
+    refused(
+        chat_path,
+        tools(json!({"tool_choice": named})),
+        400,
+        &["tool_choice", "'g'", "not among the tools"],
+    );
+    for (rule, value) in [
+        ("grammar", json!("root ::= \"a\"")),
+        ("json_schema", json!({"type": "object"})),
+        ("response_format", json!({"type": "json_object"})),
+    ] {
+        let mut body = tools(json!({}));
+        body[rule] = value;
+        let error = refused(chat_path, body, 400, &["tools cannot be combined with", rule]);
+        assert_eq!(error["param"], "tools");
+    }
+    refused(
+        chat_path,
+        chat(json!({"functions": [tool["function"]]})),
+        400,
+        &["functions", "tools"],
+    );
+    refused(
+        "/v1/completions",
+        json!({"model": server.model, "prompt": "Hi", "tools": [tool]}),
+        400,
+        &["tools is not supported", "/v1/completions has no chat template"],
+    );
+    // A budget for the thinking is not built.
+    refused(
+        chat_path,
+        chat(json!({"thinking_budget_tokens": 100})),
+        400,
+        &["thinking_budget_tokens", "a budget for thinking is not built"],
+    );
     let image = json!({
         "model": server.model,
         "messages": [{"role": "user", "content": [
