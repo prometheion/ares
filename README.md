@@ -24,12 +24,16 @@ the acceptance, measured while running), prompts that are read in pieces
 between rounds of generation, sampling on the device and a prefix cache
 that lets a conversation continue from what was computed; on two GPUs it is
 ahead of the llama.cpp fork it is measured against in prompt processing and
-in generation. Flash-Next is served by the same binary on two GPUs, without
-speculation (its draft head is not built, and the lookup in earlier text takes
-part only next to a model drafter); it agrees with its CPU reference and
-generates at 43 to 48 tokens per second at the median. With the lookup drafts
-it had before the draft policy it made 48 to 58 (three series), level with
-Strata's 56 with drafts within the spread of the runs. It has no prefix cache,
+in generation. Flash-Next is served by the same binary on two GPUs; it agrees
+with its CPU reference and generates at 43 to 48 tokens per second at the
+median, without drafts. Its draft block is built (a file of its own, `--drafters
+FILE`): it runs in every placement, drafts what the CPU reference drafts and
+changes no token, and its links are accepted two times of three; the engine
+does not get faster by it yet, because the price of a window is measured before
+the tiers hold a text's experts and every row that verifies a draft brings
+experts of its own. With the lookup drafts it had before the draft policy it
+made 48 to 58 (three series), level with Strata's 56 with drafts within the
+spread of the runs. It has no prefix cache,
 and reads prompts in pieces of 256 rows on the many-row expert kernels (103 to
 217 tokens per second for a prompt of 1000 tokens, 132 to 166 for 4700, measured
 before the draft policy and the pieces between rounds of generation). The numbers

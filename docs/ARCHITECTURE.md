@@ -3879,9 +3879,10 @@ Work is paused here until Qwen4 is released; nothing below is in progress.
   cards need alone (see "A step"). See [Several devices](#several-devices).
 - **Qwen3.8-Flash-Next** runs on both cards, agrees with the CPU reference
   and answers in German and English, and is served by the `ares` binary like
-  the 27B, in both placements, without speculation: it has no draft head
-  built, and the lookup in earlier text takes part only next to a model
-  drafter. 43 to 48 tokens per second at the median of a series of runs at
+  the 27B, in both placements. Its draft block (`--drafters FILE`) runs in
+  every placement and changes no token, but no window is chosen for it on
+  this machine yet (see "It drafts with its draft block"), so it generates
+  without speculation: 43 to 48 tokens per second at the median of a series of runs at
   about 1000 tokens of context (a decode step takes 22 to 23 ms, 17 ms when it
   misses no expert). With the lookup drafts it had before the draft policy,
   which have not been measured since, it was at 48 to 58 (three series; 20 to
