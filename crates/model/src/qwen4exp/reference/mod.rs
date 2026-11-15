@@ -29,12 +29,15 @@
 //! fixed order.
 //!
 //! Only text is implemented: the rotary position of a cell is its index, and
-//! every cell hashes its own token. The MTP draft block (section 4) is not
-//! implemented; it would reuse the mixer, attention and expert functions of
-//! this module with its own weights, and reads [`Window::trunk_out`].
+//! every cell hashes its own token. The MTP draft block (section 4) is in
+//! `draft.rs`: the mixer, attention and expert functions of this module with
+//! the block's own weights, on what [`Window::trunk_out`] holds.
 
 mod blocks;
+mod draft;
 mod ops;
+
+pub use draft::{DraftState, DraftWindow};
 
 /// The operations of the reference that GPU kernels are held to one by one.
 /// Each is a pure function over slices with one documented order of
@@ -624,27 +627,12 @@ impl<'a, 'g> Reference<'a, 'g> {
         }
         let c = self.config;
         let r = &c.recurrent;
-        let (kv_dim, kk) = (c.attention_dims().1, r.conv_kernel - 1);
-        let (block, id) = (c.indexer.block, c.indexer.key_dim);
+        let kk = r.conv_kernel - 1;
         let (start, end) = (state.position, state.position + accepted);
         for (layer_state, rows) in state.layers.iter_mut().zip(&window.layers) {
             match (layer_state, rows) {
-                (
-                    LayerState::Attention { k, v, pooled, raw_tail },
-                    LayerRows::Attention { k: wk, v: wv, raw, pooled: w_pooled },
-                ) => {
-                    k.extend_from_slice(&wk[..accepted * kv_dim]);
-                    v.extend_from_slice(&wv[..accepted * kv_dim]);
-                    // The pooled keys of the blocks the accepted rows complete.
-                    let new_blocks = end / block - start / block;
-                    pooled.extend_from_slice(&w_pooled[..new_blocks * id]);
-                    // The raw keys of the cells of the block that is now incomplete.
-                    let first = end / block * block;
-                    let mut tail = Vec::with_capacity((end - first) * id);
-                    for cell in first..end {
-                        tail.extend_from_slice(raw_key(raw_tail, raw, start, block, id, cell));
-                    }
-                    *raw_tail = tail;
+                (state @ LayerState::Attention { .. }, rows @ LayerRows::Attention { .. }) => {
+                    commit_attention(c, state, rows, start, accepted);
                 }
                 (
                     LayerState::Recurrent { conv, delta },
@@ -1139,6 +1127,39 @@ impl<'a, 'g> Reference<'a, 'g> {
         }
         (out, routing)
     }
+}
+
+/// Applies the first `accepted` rows of an attention layer's window, which
+/// started after `start` cells, to the layer's state.
+fn commit_attention(
+    c: &Config,
+    state: &mut LayerState,
+    rows: &LayerRows,
+    start: usize,
+    accepted: usize,
+) {
+    let (
+        LayerState::Attention { k, v, pooled, raw_tail },
+        LayerRows::Attention { k: wk, v: wv, raw, pooled: w_pooled },
+    ) = (state, rows)
+    else {
+        unreachable!("called for an attention layer and its window");
+    };
+    let kv_dim = c.attention_dims().1;
+    let (block, id) = (c.indexer.block, c.indexer.key_dim);
+    let end = start + accepted;
+    k.extend_from_slice(&wk[..accepted * kv_dim]);
+    v.extend_from_slice(&wv[..accepted * kv_dim]);
+    // The pooled keys of the blocks the accepted rows complete.
+    let new_blocks = end / block - start / block;
+    pooled.extend_from_slice(&w_pooled[..new_blocks * id]);
+    // The raw keys of the cells of the block that is now incomplete.
+    let first = end / block * block;
+    let mut tail = Vec::with_capacity((end - first) * id);
+    for cell in first..end {
+        tail.extend_from_slice(raw_key(raw_tail, raw, start, block, id, cell));
+    }
+    *raw_tail = tail;
 }
 
 /// What `run_layer` hands back besides the residual.

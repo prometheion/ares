@@ -23,7 +23,9 @@ use ares_cuda::{Device, DeviceBuffer, DevicePtr, ExpertShape, RecurrentShape, We
 use ares_runtime::ModelError;
 
 use crate::qwen4exp::Config;
-use crate::qwen4exp::weights::{Layer, Matrix, Mixer, RecurrentWeights, StreamMixer, Weights};
+use crate::qwen4exp::weights::{
+    DraftWeights, Layer, Matrix, Mixer, RecurrentWeights, StreamMixer, Weights,
+};
 
 /// What a part is to the residual streams of the model.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -183,6 +185,21 @@ pub(crate) struct HeadW {
     pub mixer: MixerW,
     pub output: Mat,
 }
+
+/// What makes the input of the model's draft block: the norm weights (`f32`
+/// offsets) and the projections of the paired token's embedding and of the
+/// residual streams.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DraftInW {
+    pub norm_embedding: u64,
+    pub norm_hidden: u64,
+    pub fc_embedding: Mat,
+    pub fc_hidden: Mat,
+}
+
+/// The offset that marks the one matrix a part reads in another part's arena
+/// (the output head, which a draft block shares with the model).
+const BORROWED: u64 = u64::MAX;
 
 /// What goes to one place of the arena.
 enum Source<'g> {
@@ -514,6 +531,15 @@ impl<'g> Layout<'g> {
             output: self.matrix(&w.output),
         })
     }
+
+    fn draft_in(&mut self, w: &DraftWeights<'g>) -> DraftInW {
+        DraftInW {
+            norm_embedding: self.floats(&w.norm_embedding),
+            norm_hidden: self.floats(&w.norm_hidden),
+            fc_embedding: self.matrix(&w.fc_embedding),
+            fc_hidden: self.matrix(&w.fc_hidden),
+        }
+    }
 }
 
 /// Bytes of what a part of `role` holds of layer `layer` in an arena.
@@ -542,6 +568,11 @@ pub(crate) struct DeviceWeights {
     arena: DeviceBuffer,
     pub layers: Vec<LayerW>,
     pub head: Option<HeadW>,
+    /// The input projections of a draft block; `None` for a part of the model.
+    pub draft_in: Option<DraftInW>,
+    /// Where the matrix at [`BORROWED`] is: in the arena of another part on
+    /// the same device, which outlives this one.
+    borrowed: DevicePtr,
     upload: Duration,
 }
 
@@ -553,7 +584,13 @@ impl DeviceWeights {
 
     /// The address of a matrix.
     pub fn mat(&self, m: &Mat) -> DevicePtr {
-        self.at(m.at)
+        if m.at == BORROWED { self.borrowed } else { self.at(m.at) }
+    }
+
+    /// The output head and where it is on the device, for a draft block on
+    /// the same device to read it. `None` for a part without the head.
+    pub fn output(&self) -> Option<(Mat, DevicePtr)> {
+        self.head.map(|head| (head.output, self.mat(&head.output)))
     }
 
     /// Bytes of the arena.
@@ -595,6 +632,55 @@ impl DeviceWeights {
         for (at, source) in &layout.parts {
             arena.write(*at, source.bytes(&mut staging))?;
         }
-        Ok(Self { arena, layers: on_device, head, upload: started.elapsed() })
+        Ok(Self {
+            arena,
+            layers: on_device,
+            head,
+            draft_in: None,
+            borrowed: DevicePtr::NULL,
+            upload: started.elapsed(),
+        })
     }
+
+    /// Lays out and uploads the dense weights of a draft block: its one layer
+    /// (`c` and `w` describe it as a model of one layer), its input projections
+    /// and its own final mixer. Its output head is `output`, the model's, which
+    /// is on `device` already.
+    pub fn load_block(
+        device: &Device,
+        ledger: &mut Ledger,
+        c: &Config,
+        w: &DraftWeights<'_>,
+        output: (Mat, DevicePtr),
+    ) -> Result<Self, ModelError> {
+        let mut layout = Layout { ranges: true, ..Layout::default() };
+        let layer = layout.layer(c, 0, &w.layer, Role::Whole, &LayerShare::whole(c, 0))?;
+        let mixer = layout.mixer("output_hc", &w.output_mixer)?;
+        let draft_in = layout.draft_in(w);
+        let len = layout.len.max(ALIGN);
+        ledger.reserve("qwen4exp draft block weights", len)?;
+        let arena = DeviceBuffer::new(device, len)?;
+        let started = Instant::now();
+        let mut staging = Vec::new();
+        for (at, source) in &layout.parts {
+            arena.write(*at, source.bytes(&mut staging))?;
+        }
+        Ok(Self {
+            arena,
+            layers: vec![layer],
+            head: Some(HeadW { mixer, output: Mat { at: BORROWED, ..output.0 } }),
+            draft_in: Some(draft_in),
+            borrowed: output.1,
+            upload: started.elapsed(),
+        })
+    }
+}
+
+/// Bytes of the dense weights of a draft block in an arena.
+pub(crate) fn block_bytes(c: &Config, w: &DraftWeights<'_>) -> Result<u64, ModelError> {
+    let mut layout = Layout::default();
+    layout.layer(c, 0, &w.layer, Role::Whole, &LayerShare::whole(c, 0))?;
+    layout.mixer("output_hc", &w.output_mixer)?;
+    layout.draft_in(w);
+    Ok(layout.len)
 }

@@ -58,6 +58,7 @@ use ares_cuda::{
 use ares_runtime::ModelError;
 use ares_runtime::expert_store::cpu::act_bytes as cpu_act_bytes;
 
+mod block;
 mod wide;
 
 use super::board::Board;
@@ -936,6 +937,8 @@ pub struct Part {
     /// What steps wider than the decode kernels take need; `None` when no step has more
     /// than [`MAX_BATCH`] rows.
     wide_state: Option<wide::State>,
+    /// What a part that runs the model's draft block needs besides a layer.
+    block: Option<block::State>,
 }
 
 impl std::fmt::Debug for Part {
@@ -985,6 +988,26 @@ impl Part {
         let shape = PartShape { role, first, shares, head };
         let f = Frame::new(c, opts, &shape, device.info().multiprocessors)?;
         let w = DeviceWeights::load(device, ledger, c, weights, role, first, &shape.shares, head)?;
+        let starts = first == 0 && role != Role::Worker;
+        Self::assemble(c, opts, index, role, head, f, w, device, ledger, starts)
+    }
+
+    /// The part around its weights `w` and its frame `f`: reserves and
+    /// allocates state, pools' tables and scratch. `starts` says whether the
+    /// part starts the residual from the embeddings.
+    #[allow(clippy::too_many_arguments)]
+    fn assemble(
+        c: &Config,
+        opts: &Options,
+        index: usize,
+        role: Role,
+        head: bool,
+        f: Frame,
+        w: DeviceWeights,
+        device: &Device,
+        ledger: &mut Ledger,
+        starts: bool,
+    ) -> Result<Self, ModelError> {
         let mut mixer_types = Vec::new();
         let mixers = w.layers.iter().filter_map(|l| l.mixers).flat_map(|(a, b)| [a, b]);
         for mixer in mixers.chain(w.head.map(|h| h.mixer)) {
@@ -1077,7 +1100,7 @@ impl Part {
         Ok(Self {
             index,
             role,
-            first: first == 0 && role != Role::Worker,
+            first: starts,
             fused,
             flipped: false,
             opts: opts.clone(),
@@ -1141,6 +1164,7 @@ impl Part {
             status_pending: false,
             marks,
             wide_state,
+            block: None,
             w,
             f,
         })
@@ -2311,6 +2335,19 @@ impl Part {
     }
 
     fn attend(&mut self, env: &StepEnv<'_>, i: usize, a: &AttentionW) -> Result<(), ModelError> {
+        self.attend_rows(env, i, a, false)
+    }
+
+    /// The attention half of layer `i`. With `keys_only` the rows write their
+    /// keys and values and the indexer's keys and read nothing: what a draft
+    /// block does to follow the model (`part/block.rs`).
+    fn attend_rows(
+        &mut self,
+        env: &StepEnv<'_>,
+        i: usize,
+        a: &AttentionW,
+        keys_only: bool,
+    ) -> Result<(), ModelError> {
         let (stream, dims) = (env.stream, env.record.dims());
         let rows = dims.n_rows;
         let s = self.f.s;
@@ -2347,10 +2384,14 @@ impl Part {
         unsafe {
             let buffers = step_plan.plan.on_device(base);
             self.prepare_mixed(stream, rows)?;
-            self.product(stream, &a.q, m, qg, rows)?;
+            // Rows that only write keys read nothing: their queries are whatever
+            // the buffers hold, and nothing below looks at what comes of them.
+            if !keys_only {
+                self.product(stream, &a.q, m, qg, rows)?;
+                self.product(stream, &a.indexer_q, m, iq, rows)?;
+            }
             self.product(stream, &a.k, m, k_raw, rows)?;
             self.product(stream, &a.v, m, v, rows)?;
-            self.product(stream, &a.indexer_q, m, iq, rows)?;
             self.product(stream, &a.indexer_k, m, raw, rows)?;
             self.mark(stream, Phase::Dense)?;
             self.layers.attn_prep(
@@ -2412,6 +2453,10 @@ impl Part {
                 carry,
                 carry_stride,
             )?;
+            if keys_only {
+                self.plan = Some(step_plan);
+                return self.mark(stream, Phase::Attention);
+            }
             if step_plan.listed.is_some() {
                 let (ranges, items) = (base.offset(layout.ranges), base.offset(layout.items));
                 let (scores, counts) = (self.at(s.scores), self.at(s.counts));

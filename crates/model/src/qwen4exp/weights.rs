@@ -38,6 +38,17 @@ pub struct Matrix<'g> {
 }
 
 impl<'g> Matrix<'g> {
+    /// The rows `rows` of the matrix as a matrix of their own.
+    fn slice(&self, rows: std::ops::Range<usize>) -> Self {
+        let size = self.data.len() / self.rows;
+        Self {
+            ty: self.ty,
+            rows: rows.len(),
+            cols: self.cols,
+            data: &self.data[rows.start * size..rows.end * size],
+        }
+    }
+
     /// The element type the rows are stored in.
     pub fn ty(&self) -> GgmlType {
         self.ty
@@ -81,6 +92,10 @@ impl<'g> Matrix<'g> {
 /// The matrices of all routed experts of one kind in a layer, as stored:
 /// expert `e` is the `e`-th contiguous slab of `rows` rows. Nothing is read
 /// until an expert is asked for.
+///
+/// A file that stores two kinds in one tensor (the draft block's gate and up)
+/// gives two stacks over the same bytes: the slabs of a stack are then `stride`
+/// bytes apart and start `skip` bytes into the tensor.
 #[derive(Clone, Copy, Debug)]
 pub struct ExpertStack<'g> {
     ty: GgmlType,
@@ -88,6 +103,11 @@ pub struct ExpertStack<'g> {
     rows: usize,
     cols: usize,
     data: &'g [u8],
+    /// Bytes from one expert's slab to the next, and where the first starts.
+    stride: usize,
+    skip: usize,
+    /// Bytes of one expert's matrix.
+    size: usize,
 }
 
 impl<'g> ExpertStack<'g> {
@@ -103,7 +123,14 @@ impl<'g> ExpertStack<'g> {
 
     /// The stored bytes of one expert's matrix.
     pub fn expert_bytes(&self) -> usize {
-        self.data.len() / self.n_expert
+        self.size
+    }
+
+    /// Where the matrix of expert 0 starts in the tensor that holds the stack,
+    /// and the bytes from one expert's matrix to the next: what a reader of the
+    /// file needs to fetch one expert.
+    pub fn span(&self) -> (usize, usize) {
+        (self.skip, self.stride)
     }
 
     /// The matrix of expert `expert`: a view of its bytes in the mapped file.
@@ -113,12 +140,12 @@ impl<'g> ExpertStack<'g> {
     /// Panics when `expert` is out of range.
     pub fn expert(&self, expert: usize) -> Matrix<'g> {
         assert!(expert < self.n_expert, "the layer has {} experts", self.n_expert);
-        let size = self.expert_bytes();
+        let at = self.skip + expert * self.stride;
         Matrix {
             ty: self.ty,
             rows: self.rows,
             cols: self.cols,
-            data: &self.data[expert * size..(expert + 1) * size],
+            data: &self.data[at..at + self.size],
         }
     }
 }
@@ -370,6 +397,127 @@ impl<'g> Weights<'g> {
     }
 }
 
+/// The weights of the model's draft block (section 4 of the specification):
+/// one layer of the attention kind with its own mixture of experts, the two
+/// projections that make its input, and its own final mixer. Its output head
+/// is the model's.
+#[derive(Clone, Debug)]
+pub struct DraftWeights<'g> {
+    /// Norm weight over the embedding of the paired token, `N` values
+    /// (`pre_fc_norm_embedding`).
+    pub norm_embedding: Vec<f32>,
+    /// Norm weight over the trunk's residual as one vector, `D` values
+    /// (`pre_fc_norm_hidden`).
+    pub norm_hidden: Vec<f32>,
+    /// The projection of the normed embedding, `N` to `N` (`fc_embedding`).
+    pub fc_embedding: Matrix<'g>,
+    /// The projection of each normed stream, `N` to `N` (`fc_hidden`).
+    pub fc_hidden: Matrix<'g>,
+    /// The block: an attention layer without the n-gram embedding.
+    pub layer: Layer<'g>,
+    /// The block's own final mixer in front of the model's head, without
+    /// inject (`hyper_connection_mixer`).
+    pub output_mixer: StreamMixer<'g>,
+}
+
+/// The value of `general.architecture` in a file that holds a draft block as
+/// Strata packs it: the checkpoint's tensor names under `mtp.`, norm weights
+/// as the checkpoint has them, gate and up of the routed experts in one tensor
+/// and the indexer's two projections in one.
+pub const DRAFT_ARCHITECTURE: &str = "qwen4exp-mtp";
+
+impl<'g> DraftWeights<'g> {
+    /// Builds the table from the tensors of `gguf`, a file of the architecture
+    /// [`DRAFT_ARCHITECTURE`], for the model `config` describes: every shape
+    /// must be that of the model's own attention layers.
+    pub fn load(gguf: &'g Gguf, config: &Config) -> Result<Self> {
+        let found = gguf.architecture().unwrap_or_default();
+        if found != DRAFT_ARCHITECTURE {
+            return Err(Error::Architecture { found: found.to_owned() });
+        }
+        let mut loader = Loader { gguf, used: HashSet::new() };
+        let c = config;
+        let (n, wide, e, ix) = (c.n_embd, c.wide(), &c.experts, &c.indexer);
+        let (q_dim, kv_dim) = c.attention_dims();
+        let layer = |what: &str| format!("mtp.layers.0.{what}");
+        let mixer = |loader: &mut Loader<'g>, prefix: &str, inject: bool| {
+            let name = |what: &str| format!("{prefix}.{what}");
+            Ok::<_, Error>(StreamMixer {
+                norm: loader.norm_plus_one(&name("hc_norm.weight"), wide)?,
+                down: loader.matrix(&name("input_mix_weight_down.weight"), wide, c.mixer_rank)?,
+                up: loader.matrix(&name("input_mix_weight_up.weight"), c.mixer_rank, wide)?,
+                inject: if inject {
+                    Some(loader.matrix(&name("block_inject_weight.weight"), wide, c.n_stream)?)
+                } else {
+                    None
+                },
+            })
+        };
+        let attn_mixer = mixer(&mut loader, &layer("attn_hyper_connection"), true)?;
+        let ffn_mixer = mixer(&mut loader, &layer("mlp_hyper_connection"), true)?;
+        let output_mixer = mixer(&mut loader, "mtp.hyper_connection_mixer", false)?;
+        // Query rows first, then the rows of the raw key.
+        let (iq, ik) = (ix.n_head * ix.key_dim, ix.key_dim);
+        let indexer =
+            loader.matrix(&layer("self_attn.indexer.index_qk_proj.weight"), n, iq + ik)?;
+        let attention = AttentionWeights {
+            q: loader.matrix(&layer("self_attn.q_proj.weight"), n, q_dim * 2)?,
+            k: loader.matrix(&layer("self_attn.k_proj.weight"), n, kv_dim)?,
+            v: loader.matrix(&layer("self_attn.v_proj.weight"), n, kv_dim)?,
+            out: loader.matrix(&layer("self_attn.o_proj.weight"), q_dim, n)?,
+            q_norm: loader
+                .norm_plus_one(&layer("self_attn.q_norm.weight"), c.attention.head_dim)?,
+            k_norm: loader
+                .norm_plus_one(&layer("self_attn.k_norm.weight"), c.attention.head_dim)?,
+            indexer_q: indexer.slice(0..iq),
+            indexer_k: indexer.slice(iq..iq + ik),
+            indexer_q_norm: loader
+                .norm_plus_one(&layer("self_attn.indexer.q_layernorm.weight"), ix.key_dim)?,
+            indexer_k_norm: loader
+                .norm_plus_one(&layer("self_attn.indexer.k_layernorm.weight"), ix.key_dim)?,
+        };
+        let [gate, up] =
+            loader.fused_experts(&layer("mlp.experts.gate_up_proj"), n, e.ff, e.count)?;
+        let moe = Moe {
+            router: loader.matrix(&layer("mlp.gate.weight"), n, e.count)?,
+            gate,
+            up,
+            down: loader.experts(&layer("mlp.experts.down_proj"), e.ff, n, e.count)?,
+            shared_gate_inp: loader
+                .vector_of(&layer("mlp.shared_expert_gate.weight"), &[n as u64, 1])?,
+            shared_gate: loader.matrix(
+                &layer("mlp.shared_expert.gate_proj.weight"),
+                n,
+                e.shared_ff,
+            )?,
+            shared_up: loader.matrix(&layer("mlp.shared_expert.up_proj.weight"), n, e.shared_ff)?,
+            shared_down: loader.matrix(
+                &layer("mlp.shared_expert.down_proj.weight"),
+                e.shared_ff,
+                n,
+            )?,
+        };
+        let weights = Self {
+            norm_embedding: loader.norm_plus_one("mtp.pre_fc_norm_embedding.weight", n)?,
+            norm_hidden: loader.norm_plus_one("mtp.pre_fc_norm_hidden.weight", wide)?,
+            fc_embedding: loader.matrix("mtp.fc_embedding.weight", n, n)?,
+            fc_hidden: loader.matrix("mtp.fc_hidden.weight", n, n)?,
+            layer: Layer {
+                attn_mixer,
+                ffn_mixer,
+                mixer: Mixer::Attention(attention),
+                moe,
+                ngram: None,
+            },
+            output_mixer,
+        };
+        if let Some(extra) = gguf.tensors().iter().find(|t| !loader.used.contains(&t.name)) {
+            return Err(Error::UnexpectedTensor { name: extra.name.clone() });
+        }
+        Ok(weights)
+    }
+}
+
 struct Loader<'g> {
     gguf: &'g Gguf,
     used: HashSet<String>,
@@ -421,7 +569,43 @@ impl<'g> Loader<'g> {
     ) -> Result<ExpertStack<'g>> {
         let info = self.info(name, &[cols as u64, rows as u64, n_expert as u64])?;
         let data = self.rows_of(info, cols, (rows * n_expert) as u64)?;
-        Ok(ExpertStack { ty: info.ty, n_expert, rows, cols, data })
+        let size = data.len() / n_expert;
+        Ok(ExpertStack { ty: info.ty, n_expert, rows, cols, data, stride: size, skip: 0, size })
+    }
+
+    /// Two stacks stored as one tensor, each expert's `rows` rows of the first
+    /// followed by its `rows` rows of the second.
+    fn fused_experts(
+        &mut self,
+        name: &str,
+        cols: usize,
+        rows: usize,
+        n_expert: usize,
+    ) -> Result<[ExpertStack<'g>; 2]> {
+        let info = self.info(name, &[cols as u64, 2 * rows as u64, n_expert as u64])?;
+        let data = self.rows_of(info, cols, (2 * rows * n_expert) as u64)?;
+        let stride = data.len() / n_expert;
+        let size = stride / 2;
+        Ok([0, size].map(|skip| ExpertStack {
+            ty: info.ty,
+            n_expert,
+            rows,
+            cols,
+            data,
+            stride,
+            skip,
+            size,
+        }))
+    }
+
+    /// A vector whose stored values are `w` of a norm that multiplies by
+    /// `1 + w` (the draft block's file keeps the checkpoint's values).
+    fn norm_plus_one(&mut self, name: &str, len: usize) -> Result<Vec<f32>> {
+        let mut w = self.vector(name, len)?;
+        for v in &mut w {
+            *v += 1.0;
+        }
+        Ok(w)
     }
 
     fn table(&mut self, row_dim: usize, rows: u64) -> Result<NgramTable<'g>> {

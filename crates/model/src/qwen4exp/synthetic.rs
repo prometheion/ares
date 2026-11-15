@@ -255,6 +255,115 @@ impl Synthetic {
         std::fs::write(path, self.bytes())
     }
 
+    /// The bytes of a file that holds a draft block for this model, laid out
+    /// as Strata packs the real one (section 2.5 of the specification): the
+    /// architecture `qwen4exp-mtp`, the checkpoint's tensor names under `mtp.`,
+    /// norm weights as the `w` of `1 + w`, gate and up of the routed experts in
+    /// one tensor and the indexer's two projections in one. The types follow
+    /// [`Synthetic::types`]; `experts` gives the routed experts another type
+    /// (gate and up, down), as [`Synthetic::bytes_with_experts`] does.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a type cannot hold the rows of this shape.
+    pub fn draft_bytes(&self, experts: Option<(GgmlType, GgmlType)>) -> Vec<u8> {
+        let mut file = File::default();
+        file.string("general.architecture", "qwen4exp-mtp");
+        file.string("general.name", "ares synthetic qwen4exp draft block");
+        let s = &self.shape;
+        let (n, wide, lr) = (s.n_embd, s.wide(), s.mixer_rank);
+        let shipped = self.types != Types::F32;
+        let dense = if self.types == Types::Quantized { GgmlType::IQ4_NL } else { GgmlType::F32 };
+        let bf16 = if shipped { GgmlType::BF16 } else { GgmlType::F32 };
+        let lazy = self.lazy_type.unwrap_or(GgmlType::F32);
+        let f32t = GgmlType::F32;
+        let matrix = |file: &mut File, name: &str, dims: &[usize], gain: f32, ty: GgmlType| {
+            let scale = gain / (dims[0] as f32).sqrt();
+            let values = self.normal(name, dims.iter().product(), scale, 0.0);
+            file.tensor(name, dims, ty, &values);
+        };
+        let vector = |file: &mut File, name: &str, dims: &[usize], scale: f32, mean: f32| {
+            let values = self.normal(name, dims.iter().product(), scale, mean);
+            file.tensor(name, dims, f32t, &values);
+        };
+        // The two projections keep the scale of what they read: the residual
+        // of a made-up trunk and its embeddings have an RMS of about one.
+        matrix(&mut file, "mtp.fc_embedding.weight", &[n, n], 0.7, dense);
+        matrix(&mut file, "mtp.fc_hidden.weight", &[n, n], 0.7, dense);
+        vector(&mut file, "mtp.pre_fc_norm_embedding.weight", &[n], 0.1, 0.0);
+        vector(&mut file, "mtp.pre_fc_norm_hidden.weight", &[wide], 0.1, 0.0);
+        let mixers = [
+            ("mtp.layers.0.attn_hyper_connection", true),
+            ("mtp.layers.0.mlp_hyper_connection", true),
+            ("mtp.hyper_connection_mixer", false),
+        ];
+        for (prefix, inject) in mixers {
+            let name = |what: &str| format!("{prefix}.{what}");
+            vector(&mut file, &name("hc_norm.weight"), &[wide], 0.1, 0.0);
+            matrix(&mut file, &name("input_mix_weight_down.weight"), &[wide, lr], 2.0, bf16);
+            matrix(&mut file, &name("input_mix_weight_up.weight"), &[lr, wide], 2.0, bf16);
+            if inject {
+                matrix(
+                    &mut file,
+                    &name("block_inject_weight.weight"),
+                    &[wide, s.n_stream],
+                    2.0,
+                    bf16,
+                );
+            }
+        }
+        let name = |what: &str| format!("mtp.layers.0.{what}");
+        let (q_dim, kv_dim) = (s.n_head * s.head_dim, s.n_head_kv * s.head_dim);
+        matrix(&mut file, &name("self_attn.q_proj.weight"), &[n, q_dim * 2], 1.5, dense);
+        matrix(&mut file, &name("self_attn.k_proj.weight"), &[n, kv_dim], 1.5, dense);
+        matrix(&mut file, &name("self_attn.v_proj.weight"), &[n, kv_dim], 1.5, dense);
+        matrix(&mut file, &name("self_attn.o_proj.weight"), &[q_dim, n], 1.5, dense);
+        vector(&mut file, &name("self_attn.q_norm.weight"), &[s.head_dim], 0.2, 0.5);
+        vector(&mut file, &name("self_attn.k_norm.weight"), &[s.head_dim], 0.2, 0.5);
+        let idx = s.indexer_dim;
+        matrix(
+            &mut file,
+            &name("self_attn.indexer.index_qk_proj.weight"),
+            &[n, (s.indexer_heads + 1) * idx],
+            1.5,
+            bf16,
+        );
+        vector(&mut file, &name("self_attn.indexer.q_layernorm.weight"), &[idx], 0.1, 0.0);
+        vector(&mut file, &name("self_attn.indexer.k_layernorm.weight"), &[idx], 0.1, 0.0);
+        matrix(&mut file, &name("mlp.gate.weight"), &[n, s.n_expert], 6.0, f32t);
+        let stack = |file: &mut File, what: &str, dims: &[usize], gain: f32, which: usize| {
+            let name = name(what);
+            match experts.map(|types| [types.0, types.1][which]) {
+                Some(ty) if has_encoder(ty) => matrix(file, &name, dims, gain, ty),
+                Some(ty) => {
+                    let rms = gain / (dims[0] as f32).sqrt();
+                    let data = self.made_up_blocks(&name, ty, dims, rms);
+                    file.raw_tensor(&name, dims, ty, data);
+                }
+                None => matrix(file, &name, dims, gain, lazy),
+            }
+        };
+        stack(&mut file, "mlp.experts.gate_up_proj", &[n, 2 * s.expert_ff, s.n_expert], 1.5, 0);
+        stack(&mut file, "mlp.experts.down_proj", &[s.expert_ff, n, s.n_expert], 1.0, 1);
+        matrix(&mut file, &name("mlp.shared_expert_gate.weight"), &[n, 1], 2.0, bf16);
+        matrix(
+            &mut file,
+            &name("mlp.shared_expert.gate_proj.weight"),
+            &[n, s.shared_ff],
+            1.5,
+            dense,
+        );
+        matrix(&mut file, &name("mlp.shared_expert.up_proj.weight"), &[n, s.shared_ff], 1.5, dense);
+        matrix(
+            &mut file,
+            &name("mlp.shared_expert.down_proj.weight"),
+            &[s.shared_ff, n],
+            1.0,
+            dense,
+        );
+        file.build()
+    }
+
     fn metadata(&self, file: &mut File) {
         let s = &self.shape;
         file.string("general.architecture", "qwen4exp");
