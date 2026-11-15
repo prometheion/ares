@@ -174,7 +174,7 @@ machine (RTX 4070 + RTX 3060, Qwen3.8-27B) or read from the engines listed in
 | `ares-grammar` | The grammar engine on the host: GBNF grammars, JSON schemas, Lark and regular expressions turned into the set of tokens that may come next (llguidance behind a vocabulary of bytes per token), the reasoning gate, the cut of forbidden drafts | Done; GPU-free tests of the engine, and through the runtime and the server; see [Sampling](#sampling) |
 | `ares-vulkan` | The same device-level surface on Vulkan; decode and prefill weight kernels for all 28 weight types as compute shaders, the prefill ones on cooperative matrices; the layer kernels; attention over the stored K/V formats; the sampler's kernels; sums between devices | Device layer and weight, layer, attention and sampler kernels done (23 device, 9 kernel, 8 layer, 4 layout, 9 mesh, 9 attention and 8 sampler tests on both GPUs; the sampler's records equal `ares-sampler`'s reference bit for bit); no expert or `qwen4exp` kernels and no model yet |
 | `ares-state` | Page pool, page tables with copy on write, the prefix index (pages published as they fill, tails, announcements, priority classes), the checkpoint policy for recurrent state, page layouts | Done as bookkeeping; randomised model checks; the conductor's prefix cache uses them (see `ares-runtime`) |
-| `ares-store` | State on disk: pages and checkpoints by content hash in segment files, per fingerprint, with a size limit | Done as a store of opaque bytes, tested against restarts, the limit and damaged files; not yet connected to devices |
+| `ares-store` | State on disk: pages and checkpoints by content hash in segment files, per fingerprint, with a size limit, read and written with direct I/O outside of its index | Done as a store of opaque bytes, tested against restarts, the limit and damaged files; the prefix cache of `qwen35` keeps its level on SSD in it (`--cache`) |
 | `ares-io` | Reads of weights straight from the model file: io_uring with direct I/O, demand before prefetch, cancel and promote, copies of a file on several drives with the reads spread over them, a map from experts to file ranges, row reads behind a cache | Done, tested against real files and on two drives; 1.4 to 1.7 GiB/s of random expert-sized reads per SSD of the development machine and 2.9 to 3.0 GiB/s over both; the expert store and the n-gram rows of `qwen4exp` read through it |
 | `ares-sched` | Step planner (generation, decision rows and prompts in one step), admission (pages claimed per step, a reservation that corrects itself, a queue instead of refusals), the order of a pass for long prompts of a model with experts, step time model with a term for the context, draft length choice, the lookup drafter on a suffix automaton shared by all sequences | Done; unit and model tests; the conductor uses the planner, admission (without spill), the lookup drafter and the step cost |
 | `ares-weights` | Expert heat, tiers that are elected and fed by reads (admission, protection, guesses bound late, slots given back), slots per layer by need, the waves of experts of a pass, a token table for the first layers, the lookahead distance, routing bias for pruning | Done, unit tested; the expert store uses the slot sets, the heat, the swap rule and the split of slots; the guess queue, the token table, the waves and pruning are not used by a running model yet (the lookahead distance only by a guess of `qwen4exp` that is switched off) |
@@ -689,16 +689,161 @@ crossing, and lets a prefix shared by many rows of a step be attended to
 once. A plain f32 implementation agrees with the reference to 2e-6; the
 tolerance for kernels is ten times that.
 
-**On disk.** `ares-store` keeps full pages, and the checkpoint that belongs
-to a page's end, under the same chain hash in a directory per fingerprint
-(model, quantization, state formats, page size; nothing that leaves the state
-unchanged, such as drafters or the split over devices). A page is written
-once, when it is full, so nothing is written at unload, a shared prefix is
-stored once, and a restart finds everything by reading record headers. Space
-is reclaimed a segment at a time, least recently used first, after the stores
-of other fingerprints. It is a cache: it does not sync, and a torn or damaged
-record costs only itself. Moving page bytes between the devices and the store
-comes with the runtime.
+**On SSD.** The prefix cache has a level on SSD (`ares --cache <dir>`;
+`crates/runtime/src/cache/ssd.rs` over `ares-store`). What a sequence
+computes is written to a store as it is computed, and a prompt whose start is
+in the store and not in the devices has it brought back before it starts. A
+conversation therefore resumes after its pages left the devices, after its
+model was unloaded (router mode), and after a restart of the server. A model
+takes part when its device side moves state to the host and back
+(`Model::durable`, `DeviceModel::transfer`); `qwen35` does, `qwen4exp` has no
+prefix cache yet.
+
+- **The store** (`ares-store`) keeps two kinds of records under the chain
+  hash of a page, the page and the checkpoint of recurrent state at its end,
+  in a directory per fingerprint. A record is a header block and one part per
+  device, each padded to 4096 bytes, so parts are written from and read into
+  aligned buffers with direct I/O (through the page cache on a filesystem
+  without it). Pages and checkpoints lie in segment files of their own (256
+  MiB): a conversation's pages sit together, and its checkpoints, which later
+  turns leave behind, age and go without taking pages along. The index is
+  rebuilt from the record headers when the store is opened. One process uses
+  a store at a time (a lock file); a second server on the same directory and
+  fingerprint runs without the level and says so.
+- **Bytes move outside of steps.** The conductor calls
+  `Executor::transfer` between steps (`Cache::pump`, at the top of its loop):
+  the device threads copy pages and checkpoint places to or from buffers in
+  host memory and wait for their streams. One writer thread writes the
+  buffers to the store and syncs the drive a second after its last record
+  (and every ten seconds while records keep coming); four reader threads
+  read and check what comes back. The step loop does not wait for the drive:
+  pages that the drive takes slower than they are computed stay queued (they
+  are in the pool), and a page the pool gives up before its turn is not
+  written. The one exception is a checkpoint that must leave its place when
+  three are with the writer already: the loop waits up to 250 ms for a
+  buffer, and gives that checkpoint up after that. The store's index is locked to reserve or
+  find a record, never while bytes move. The buffers (16 pages and up to 3
+  checkpoints, made when first used) are ordinary memory aligned for direct
+  I/O, not page-locked, so a copy to or from them blocks its device thread,
+  which is what a transfer does anyway.
+- **What is written when.** A full page is queued at the commit after which
+  it has the form it keeps: at once with `f16` and `q8` and no draft block,
+  and else when the sequence's last step began past it by the newest cells
+  the device keeps exact (`Durable::settle_cells`; a device converts the
+  tiles behind them at the start of a step). The rest is queued when the
+  sequence ends, gives way or is cancelled. A
+  checkpoint at a page boundary (the anchor of a prompt, the intervals in a
+  prompt and while generating) is copied out of its place in the pump that
+  follows the step whose record carried its save, while the place still holds
+  it. A record the store has is not written again. Nothing is written when a
+  model is unloaded or the server stops beyond what was already queued.
+  The partly used last page of a sequence and the state at its end are not
+  written: after a restart the next turn restores the checkpoint before them
+  (the anchor of the last prompt, or a later one from the reply) and computes
+  from there, which costs the rows of the last reply once.
+- **The rule against wear.** Nothing of a text is written before its
+  sequence holds 2048 settled cells; then its pages are written from the
+  first on, and its checkpoints from that depth on. Below that a text is
+  computed again in about a second and a half on the 27B, and what would be
+  written is mostly its checkpoint, which is as large as the pages of several
+  thousand cells. Pages of a short prompt that a long one later starts with
+  are written then, by the long one.
+- **A hit.** `Cache::probe` asks the store for the pages after the ones the
+  index has. For a model with recurrent state the run ends at its deepest
+  checkpoint in the store (the pages behind it would be replayed row by row,
+  which takes as long as computing them), and without a checkpoint nothing is
+  brought back. The run is announced in the index under an owner of its own,
+  so the prompt, and any other prompt that shares it, is held as for a page
+  that another sequence computes. The readers bring the pages and the
+  checkpoint into host memory, the conductor gives each page a page of the
+  pool (cached pages nobody holds make room), the devices take the bytes, and
+  the pages enter the index in order, the last one with the checkpoint, which
+  went into a checkpoint place. The prompt then starts as from any cached
+  prefix. A record that cannot be read or fails its checksum ends its run and
+  is forgotten; the prompt computes from there.
+- **Forms.** With `q7` to `q4`, and for the draft block always, a page is an
+  exact entry while it is the first tile or among the newest cells and a
+  converted one later. A page goes to the store in the form it has, with a
+  tag; the delay above lets most pages be written converted. A page that
+  comes back exact takes an exact slot when it is the first tile or lies at
+  the end of the run, and is converted on the way in otherwise, as the window
+  of a sequence that went on would have converted it.
+- **The fingerprint** covers everything besides the tokens that changes the
+  stored bytes: the model's files (their size, their first 64 KiB and 16
+  samples of 4 KiB spread over each), the formats of K and of V, the draft
+  block and its formats when the model drafts, the format of the recurrent
+  state, how the products round (`--precision`), the page size, and which
+  heads of every block each device holds (the bytes are stored per device, so
+  another split or other shares are another store). The names of the pages
+  start from the fingerprint, not from the model's id, so a model keeps its
+  store under another name. State of another fingerprint is never read; it
+  counts against the size limit and is the first to go.
+- **The size limit** (`--cache-size`, 32 GiB by default) is for everything in
+  the directory. When it is passed, stores of other fingerprints that no
+  process has open go first, then segments none of whose records a prompt can
+  still reach (a page is reachable while every page before it in its chain is
+  stored, a checkpoint while its page is), then the segment used least
+  recently; the order of use survives a restart in the files' modification
+  times. Several models that are loaded at once keep within the limit each.
+- **Failure.** The level is a cache and never reaches a request: a record
+  that cannot be written is dropped and counted, a full drive gives up old
+  segments and the write is tried once more, a directory that vanished is made
+  again (what was written between its loss and the next sync is lost), and a
+  damaged or missing file costs the runs that needed it.
+- **RAM.** A checkpoint goes to the drive and comes back through a
+  checkpoint place, so one place is what the level needs of the RAM limit
+  (the server counts it as required when `--cache` is given); with more room
+  the places keep the hot checkpoints as before.
+- **Measured** 2026-11-15 with the server and `--cache`: Qwen3.8-27B Q4_K_S
+  on the RTX 4070 and the RTX 3060, tensor split 0.625 / 0.375, two sequence
+  slots, the model's draft block on. A conversation whose first prompt has
+  29 322 tokens (a list of 1900 lines and a question) and whose second turn
+  adds the reply and another question (29 354 tokens); requests on
+  `/v1/completions`, most probable token, time to the first token of the
+  stream. The store lies on the btrfs volume (an NVMe drive, compressed with
+  zstd) that the model files are read from, and other work used the machine
+  and that drive throughout: the load average is given with every time, and
+  `dd` with direct I/O and blocks of 4 MiB wrote 1.0 to 1.2 GB/s and read 1.9
+  GB/s when the drive was free, and read 160 to 730 MB/s when it was not.
+
+  | First token after | K and V in `q8` | K and V in `q5` |
+  | --- | --- | --- |
+  | Computed (nothing cached) | 30.39 s (load 11); without `--cache` 30.73 s (load 17) | 34.77 s (load 19) |
+  | Second turn, from the devices | 0.150 s (load 11); without `--cache` 0.144 s | 0.191 s (load 19) |
+  | Second turn after the pool gave up 92 of its 229 pages and their checkpoint | 0.59 s (load 23) | not measured: the pool of `q5` held the conversation |
+  | Second turn in a new process, all 229 pages and the checkpoint from SSD | 1.15 s (load 17); 2.1 to 3.0 s in four more runs (load 12 to 40, the drive busy) | 2.90 s (load 18, the drive busy) |
+
+  The replies were the same in every row. What the store took: with `q8` a
+  page of 128 cells is 4.62 MB (36.1 MB per 1000 tokens), with `q5` 3.17 MB
+  on average (24.8 MB per 1000 tokens; the pages a request leaves behind its
+  end are written as exact entries, and the first page always), and a
+  checkpoint is 157 MB, one for every turn whose prompt ends on a new page.
+  The first turn with `q8` wrote 229 pages and a checkpoint, 1.21 GB, in 1.28
+  s of the writer's time (0.95 GB/s); over a whole run the writer needed 44 s
+  for 3.9 GB, since a sync took seconds whenever other work wrote to the
+  volume. The step loop does not wait for the writer: reading the prompt
+  took as long with the store as without it, and of that time the loop spent
+  0.30 s in transfers (1.0 %). A request with a prompt of 2970 tokens that
+  then writes 600 tokens (27 pages and a checkpoint to the store) took 5.27 s
+  with the store and 5.01 s without it, eight runs each at loads of 14 to
+  21; the transfers were 0.06 to 0.32 s of it, and its tokens came at 218
+  per second against 233. A page costs a transfer of 3 to 5 ms and a
+  checkpoint one of 30 to 60 ms, each once, so a long generation pays about
+  one percent. In the run of 1.15 s the four readers read the 1.21 GB in
+  0.89 s each (1.36 GB/s together, against the 1.9 GB/s of `dd`), the
+  devices took the bytes in 0.25 s, and the rest is the 42 rows after the
+  checkpoint; with the drive busy a reader needed 1.0 to 2.5 s. The buffers
+  in transit are ordinary memory: with the machine at a load of 33 to 40 the
+  copies to the devices took 0.9 to 1.5 s instead of 0.25 s, which
+  page-locked buffers would not.
+- **Across loads.** The state that comes back is bit for bit the state that
+  was written, so a resume from SSD in the same load equals a resume from the
+  devices where the same checkpoint is used. A later load may choose other
+  kernel layouts for its products (they are measured at load), whose rounding
+  differs from the load that wrote the state: the reply after a restart is
+  the reply a server gives that continues that state, which is not bit for
+  bit what the new load would have computed for the prefix itself. The texts
+  of the tests, which copy from their prompts, are the same.
 
 A randomised test drives sequences through appends, rollbacks, forks, cache
 hits and evictions against a simulated device and checks after every
@@ -3762,8 +3907,10 @@ order it would be taken up; the source of each idea is in
 4. The prefix cache beyond the first pass: checkpoints at the message
    boundaries the server names (the anchor is a page boundary before the end
    of the prompt now), a warm pass in the background, spill of a sequence to
-   RAM, pages and checkpoints that move between VRAM, RAM and `ares-store`
-   (and so survive a restart), locking the RAM of the next chunk of places
+   RAM, the partly used last page and the state at a request's end on SSD
+   (pages and checkpoints at page boundaries are, see "On SSD"), a layout of
+   stored state that does not depend on the split, locking the RAM of the
+   next chunk of places
    ahead of its first use, and `qwen4exp` with a cache (what that needs is
    under "Qwen3.8-Flash-Next through the runtime").
 5. Shares of a tensor split from a measurement at load; device layouts for
@@ -3796,7 +3943,7 @@ share.
 | K/V pages of running sequences that do not fit in VRAM (KV offload) | Required | Never gives way; everything below shrinks for it |
 | RAM tier of MoE experts | Elastic, high | Shrinks to the working set the running requests need (it does not shrink yet: nobody competes with it) |
 | Row caches and staging | Elastic, middle | Shrink to a small floor |
-| Prompt cache in RAM (pages of finished conversations) | Elastic, low | Goes first; its pages are on SSD as well |
+| Prompt cache in RAM (pages of finished conversations) | Elastic, low | Goes first; its pages are on SSD as well (with `--cache`; the checkpoints are its RAM today, and one place is required for the way to the drive) |
 
 A broker in `ares-core` keeps the books: a user asks to grow, and when the
 memory is not free the broker names who must give back how much, lowest
@@ -3851,7 +3998,8 @@ Nothing that costs speed happens silently:
   generation gets slower: experts that were in RAM now come from the SSD.
 - **When the prompt cache in RAM shrinks**, that is routine and only counted;
   its pages are on SSD. (Pages are not in RAM yet; the checkpoints are the
-  prompt cache's only RAM today.)
+  prompt cache's only RAM today, and with `--cache` the ones at page
+  boundaries are on SSD as well.)
 
 The same facts are available as counters to whoever monitors the server.
 
@@ -3882,9 +4030,11 @@ engine. What that needs:
   in the background and only as far as offload needs it. (Today the only such
   memory is the checkpoints' places, which a device thread locks in chunks
   when one is first used, not in the background; see "Host memory".)
-- **Unloading frees and returns.** Nothing is written at unload: state on
-  disk is written as it is produced. (No state is on disk yet, so the prefix
-  cache of a model goes with it; see "Several models" under Server.) The
+- **Unloading frees and returns.** Nothing is written at unload beyond what
+  was already queued for the drive: state on SSD is written as it is
+  produced (see "On SSD" under "Sequence state"). With `--cache` a model that
+  is loaded again finds its conversations in its store; without it the
+  prefix cache of a model goes with it. The
   unload ends the engine's requests, joins its threads, drops the engine and
   compares what every device reports as free before and after with what the
   model took at its load; the log has both and the time.
@@ -3908,7 +4058,11 @@ drafters that take part (`--drafters`) and the room for their windows
 of what the machine reports as available when the server starts; the
 engine's step buffers are taken from it, and the rest is the budget of the
 checkpoints that let a conversation continue from what was computed (see
-"Host memory").
+"Host memory"). `--cache <dir>` gives the prompt cache its level on SSD and
+`--cache-size` the most the directory may take (32G when it is not given);
+without a directory nothing is written to any drive (see "On SSD" under
+"Sequence state"). In a preset file the keys are `cache` and `cache-size`,
+for all models in `[*]` or for one.
 
 It answers `POST /v1/chat/completions` and `/v1/completions`, streamed and
 not, Anthropic's `POST /v1/messages` and `/v1/messages/count_tokens` (see
