@@ -1039,7 +1039,16 @@ fn two_card_model() -> Option<PathBuf> {
 /// the hash of its token ids as the last chunk of the stream and the final
 /// message of a plain request give it, and the drafts verified for it.
 fn reply_tokens(server: &Client, question: &str, drafts: bool) -> (String, String, Option<u64>) {
-    let mut extra = json!({"max_tokens": 160, "temperature": 0});
+    reply_tokens_as(server, question, drafts, json!({"max_tokens": 160, "temperature": 0}))
+}
+
+/// [`reply_tokens`] with the settings of `extra` (the tokens, the sampler).
+fn reply_tokens_as(
+    server: &Client,
+    question: &str,
+    drafts: bool,
+    mut extra: Value,
+) -> (String, String, Option<u64>) {
     if !drafts {
         extra["draft"] = json!(false);
     }
@@ -1088,11 +1097,20 @@ const QUESTIONS: [&str; 3] =
 /// replies are the same tokens: `None`, or where they part (the characters
 /// they share).
 fn replies_with_and_without_drafts(server: &Client) -> Vec<(&'static str, Option<usize>)> {
+    replies_with_and_without_drafts_as(server, &json!({"max_tokens": 160, "temperature": 0}))
+}
+
+/// [`replies_with_and_without_drafts`] with the settings of `extra`.
+fn replies_with_and_without_drafts_as(
+    server: &Client,
+    extra: &Value,
+) -> Vec<(&'static str, Option<usize>)> {
     QUESTIONS
         .into_iter()
         .map(|question| {
-            let (with, with_text, drafted) = reply_tokens(server, question, true);
-            let (without, without_text, _) = reply_tokens(server, question, false);
+            let (with, with_text, drafted) = reply_tokens_as(server, question, true, extra.clone());
+            let (without, without_text, _) =
+                reply_tokens_as(server, question, false, extra.clone());
             assert!(drafted.unwrap_or(0) > 0, "{question}: drafts were verified");
             let shared = with_text.chars().zip(without_text.chars()).take_while(|(a, b)| a == b);
             let parted = (with != without).then(|| shared.count());
@@ -1102,9 +1120,8 @@ fn replies_with_and_without_drafts(server: &Client) -> Vec<(&'static str, Option
         .collect()
 }
 
-/// With exact products a window of several rows and single rows round alike,
-/// so the tokens with drafts are the tokens without them, and the hash of the
-/// reply says so over HTTP.
+/// With exact products, too, the tokens with drafts are the tokens without
+/// them, and the hash of the reply says so over HTTP.
 #[test]
 fn with_exact_products_the_reply_with_drafts_is_the_reply_without() {
     // Exact products need a prefill kernel for every type of the weights, which
@@ -1119,42 +1136,40 @@ fn with_exact_products_the_reply_with_drafts_is_the_reply_without() {
     server.stop();
 }
 
-/// With the fast kernels (8-bit activations for a few rows) a window of
-/// several rows rounds differently from single rows, and a reply with drafts
-/// can part from the reply without them at a token whose two best candidates
-/// are nearly equal. That is a defect of the kernels, which another piece of
-/// work is to remove. Until then this says how often it happens (the test's
-/// output has it) and holds on to what is true: the replies share their start,
-/// and the drafts that were verified were verified. When the kernels agree the
-/// replies are equal, exactly as in the test above: `differing` is then
-/// always empty, the assertion on it becomes `assert!(differing.is_empty())`
-/// and the two tests become one over both precisions.
+/// With the fast kernels, which is how a model is served, the reply with
+/// drafts is the reply without them, token for token: a row of a draft window
+/// computes with the bits it has alone (the weight kernels, the recurrent
+/// blocks and attention all do; `crates/model/tests/qwen35_windows.rs` holds
+/// every block to it). Over replies of 300 tokens, so that a rare difference
+/// would show, with the most probable token and sampled with a seed, on the
+/// one-card file; and on both cards in a tensor split when the larger file is
+/// there.
 #[test]
-fn with_the_fast_kernels_a_reply_with_drafts_can_part_from_the_reply_without() {
+fn with_the_fast_kernels_the_reply_with_drafts_is_the_reply_without() {
     let Some(model) = draft_model() else { return };
+    let greedy = json!({"max_tokens": 300, "temperature": 0});
+    let sampled =
+        json!({"max_tokens": 300, "temperature": 0.8, "top_k": 20, "top_p": 0.95, "seed": 4711});
     let server = Server::start(&model, port(9), &["--parallel", "1", "--precision", "fast"]);
-    let differing: Vec<_> = replies_with_and_without_drafts(&server)
-        .into_iter()
-        .filter_map(|(question, parted)| Some((question, parted?)))
-        .collect();
-    eprintln!(
-        "fast kernels: {} of {} replies with drafts part from the reply without: {differing:?}",
-        differing.len(),
-        QUESTIONS.len()
-    );
-    for (question, shared) in &differing {
-        assert!(*shared >= SHARED_START, "{question}: the replies part after {shared} characters");
+    for (how, extra) in [("the most probable token", &greedy), ("sampled", &sampled)] {
+        for (question, parted) in replies_with_and_without_drafts_as(&server, extra) {
+            assert_eq!(
+                parted, None,
+                "{how}, {question}: the replies part after this many characters"
+            );
+        }
+    }
+    server.stop();
+    let Some(model) = two_card_model() else { return };
+    let flags = ["--devices", "0,1", "--split", "tensor", "--parallel", "1", "--precision", "fast"];
+    let server = Server::start(&model, port(9), &flags);
+    for (how, extra) in [("the most probable token", &greedy), ("sampled", &sampled)] {
+        for (question, parted) in replies_with_and_without_drafts_as(&server, extra) {
+            assert_eq!(parted, None, "both cards, {how}, {question}: the replies part");
+        }
     }
     server.stop();
 }
-
-/// How much of its start (in characters) a reply with drafts shares with the
-/// reply without them at the least, with the fast kernels. The replies part
-/// at a token where two candidates are nearly equal, which was after 300 to
-/// 430 characters where this was measured (the notes in ARCHITECTURE.md have
-/// 150 to 650); a reply that parts within its first words is more likely a
-/// window that was read wrong than rounding.
-const SHARED_START: usize = 16;
 
 /// A server started with no drafters does not speculate, whatever the text
 /// repeats: the lookup in earlier text is no drafter on its own.
