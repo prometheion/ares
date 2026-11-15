@@ -435,6 +435,11 @@ fn apply(preset: &mut Preset, scope: Scope, key: &Key) -> Result<Applied, String
         _ => {}
     }
     let Some((flag, kind)) = options::lookup(&format!("--{name}")) else {
+        // The field of a request, written as the request writes it.
+        let dashed = name.replace('_', "-");
+        if dashed != name && options::lookup(&format!("--{dashed}")).is_some() {
+            return Err(format!("Ares has no option '{name}': the key is '{dashed}', with dashes"));
+        }
         return Err(match other_name(name) {
             Some(hint) => format!("Ares has no option '{name}': {hint}"),
             None => format!(
@@ -864,6 +869,11 @@ idle-unload = never
             assert!(said.starts_with("m.ini:3: Ares has no option '"), "{said}");
             assert!(said.contains(name) && said.contains(says), "{said}");
         }
+        // The field of a request is a key under its name with dashes.
+        let said = refused("[m]\nmodel = /m.gguf\ntop_p = 0.95\n");
+        assert!(said.ends_with("Ares has no option 'top_p': the key is 'top-p', with dashes"));
+        let said = refused("[m]\nmodel = /m.gguf\nmax_tokens = 100\n");
+        assert!(said.contains("the key is 'max-tokens'"), "{said}");
         // One that Ares has nothing for is named and not taken.
         let said = refused("[m]\nmodel = /m.gguf\nmmproj = /p.gguf\n");
         assert!(said.contains("Ares has no option 'mmproj'") && said.contains("ares --help"));
