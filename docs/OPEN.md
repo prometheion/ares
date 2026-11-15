@@ -86,9 +86,8 @@ Everything `FEATURES.md` lists for the 27B and not for Flash-Next is owed:
 - [ ] K and V in `q7` to `q4`, separately for K and V (see above); the draft block's K and V in `q4`.
 - [ ] The prefix cache with its RAM and SSD levels (see above).
 - [ ] The draft block read from the model file (`--drafters mtp`) and a draft vocabulary.
-- [ ] Replies that are the same from run to run: today they differ slightly when the CPU
-      computes missed experts, so "text with drafts is the text without" is shown only on
-      made-up models and on the real file with the CPU path off.
+- Not owed (the owner, 2026-11-16): replies that are bit for bit the same from run to run.
+  They differ slightly when the CPU computes missed experts, and that is accepted.
 - [ ] Structured output, tool calls and the Messages and Responses routes have never run on
       the real Flash-Next file (the runtime and server code is shared; a smoke script for
       tools exists and was not run).
