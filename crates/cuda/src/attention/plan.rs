@@ -19,6 +19,17 @@
 //! piece can be read by several rows at once: the rows of one window do, and so do
 //! the rows of several sequences over a prefix of entries they have in common
 //! ([`PlanConfig::min_shared_cells`]), where that is cheaper than each on its own.
+//!
+//! **Rows that must not depend on the step** ([`Planner::window`]). A row of a
+//! draft window has to give the bits it gives as the only row of a step, or a
+//! reply would depend on what was drafted. Three things decide the bits of a
+//! row, and such a window fixes all three by the row alone: the pieces (the
+//! cut of the row's cells: the pieces merge as rounded sums), which are those
+//! of a step that holds nothing but the row; the kernel, which is the
+//! tensor-core kernel in its decode shapes for one row and for several (a
+//! vector has the same arithmetic in each of them, whatever shares the item);
+//! and the entries, which the caller names per window. Rows whose pieces are
+//! the same share their items, so the cells are still read once per window.
 
 use std::ops::Range;
 
@@ -27,6 +38,8 @@ use super::{AttnRow, CacheGeometry, ENTRY_CELLS};
 pub const ITEM_CONVERTED: u32 = 1;
 pub const ITEM_CAUSAL: u32 = 2;
 pub const ITEM_FINAL: u32 = 4;
+/// The item runs on the tensor-core kernels whatever its vectors and formats.
+pub const ITEM_TENSOR: u32 = 8;
 const CONVERTED_BIT: u32 = 0x8000_0000;
 
 /// One block of work, as the kernels read it (48 bytes).
@@ -48,10 +61,20 @@ pub struct AttnItem {
     pub flags: u32,
     /// Which piece of its rows the item is.
     pub slot: u32,
-    pub pad: [u32; 3],
+    /// One more than the tile whose entry the item takes from `swap_entry`
+    /// instead of the table; 0 for none.
+    pub swap_tile: u32,
+    pub swap_entry: u32,
+    pub pad: u32,
 }
 
 impl AttnItem {
+    /// Whether the item may run on the direct kernel, as far as the item
+    /// says: it reads converted entries and is not bound to the tensor cores.
+    pub fn direct(&self) -> bool {
+        self.flags & ITEM_CONVERTED != 0 && self.flags & ITEM_TENSOR == 0
+    }
+
     pub fn to_bytes(items: &[AttnItem]) -> Vec<u8> {
         items
             .iter()
@@ -66,8 +89,8 @@ impl AttnItem {
                     i.total,
                     i.flags,
                     i.slot,
-                    0,
-                    0,
+                    i.swap_tile,
+                    i.swap_entry,
                     0,
                 ]
             })
@@ -202,6 +225,10 @@ struct Dense {
     first_row: u32,
     n_rows: u32,
     pos0: u32,
+    /// Planned row by row as each row alone would be ([`Planner::window`]).
+    alone: bool,
+    /// The tile whose entry the rows take from here, not from the table.
+    swap: Option<(u32, u32)>,
 }
 
 /// One row that sees a list of ranges of cells.
@@ -293,6 +320,50 @@ impl Planner {
             first_row,
             n_rows,
             pos0,
+            alone: false,
+            swap: None,
+        });
+    }
+
+    /// As [`Planner::dense`], for rows whose results must not depend on what
+    /// else the step holds (the rows of a draft window, a row that is
+    /// generated without drafts): every row gets the pieces and the kernel it
+    /// has as the only row of a step, and so the same bits. The window reads
+    /// nothing together with other sequences.
+    ///
+    /// `swap` names one tile and the entry these rows read it from instead of
+    /// the table's: a tile that the rows before this window still read in
+    /// another form (a tile that is converted for the rows from some position
+    /// on, while the table has it as the rows before that position read it).
+    pub fn window(
+        &mut self,
+        table: u32,
+        entries: &[u32],
+        first_row: u32,
+        n_rows: u32,
+        pos0: u32,
+        swap: Option<(u32, u32)>,
+    ) {
+        let need = (pos0 + n_rows).div_ceil(ENTRY_CELLS) as usize;
+        assert!(
+            entries.len() >= need,
+            "the table has {} entries, {need} are needed",
+            entries.len()
+        );
+        let mut entries = entries[..need].to_vec();
+        if let Some((tile, entry)) = swap {
+            assert!((tile as usize) < need, "tile {tile} is past the window's cells");
+            entries[tile as usize] = entry;
+        }
+        self.dense.push(Dense {
+            table,
+            kinds: Self::kinds(&entries),
+            entries,
+            first_row,
+            n_rows,
+            pos0,
+            alone: true,
+            swap,
         });
     }
 
@@ -402,6 +473,10 @@ impl Planner {
         let min_entries = self.cfg.min_shared_cells.div_ceil(ENTRY_CELLS).max(1);
         let mut groups: Vec<(Vec<usize>, u32)> = Vec::new();
         for (i, d) in self.dense.iter().enumerate() {
+            // A window whose rows are planned as alone shares nothing.
+            if d.alone {
+                continue;
+            }
             // Only entries that end before the window's first row can be shared: every row
             // of the item sees all of its cells.
             let own = d.pos0 / ENTRY_CELLS;
@@ -481,7 +556,7 @@ impl Planner {
                 share.rows.len().div_ceil(rows_per_tile(share.rows.len() as u32, g) as usize);
             work += u64::from(share.cells) * chunks as u64;
         }
-        for (i, d) in self.dense.iter().enumerate() {
+        for (i, d) in self.dense.iter().enumerate().filter(|(_, d)| !d.alone) {
             let from = shares.iter().find(|s| s.members.contains(&i)).map_or(0, |s| s.cells);
             let per = rows_per_tile(d.n_rows, g);
             let mut r = 0;
@@ -525,10 +600,27 @@ impl Planner {
                     b.plan.row_ids.extend_from_slice(chunk);
                     at
                 };
-                b.items(first.table, row0, chunk.len() as u32, &pieces, 0, true, false);
+                b.items(first.table, row0, chunk.len() as u32, &pieces, 0, true, false, None);
             }
         }
-        for (i, d) in self.dense.iter().enumerate() {
+        // The pieces of a row that is alone in its step: all of the budget.
+        let alone_pieces = (budget as u32).clamp(1, max_pieces);
+        for d in self.dense.iter().filter(|d| d.alone) {
+            // Rows share a tile while they have the same pieces, which are a
+            // function of the entries a row reads, and while their vectors fit
+            // the decode shapes of the kernel.
+            let per = (AttnShape::Decode48.max_vecs() / g).max(1);
+            let mut r = 0;
+            while r < d.n_rows {
+                let pos = d.pos0 + r;
+                let entry_end = (pos / ENTRY_CELLS + 1) * ENTRY_CELLS;
+                let n = per.min(d.n_rows - r).min(entry_end - pos);
+                let pieces = Self::pieces_of_entries(&d.kinds, 0..pos + n, alone_pieces);
+                b.tile(d.table, d.first_row + r, n, pos, pieces, true, 0, Some(d.swap));
+                r += n;
+            }
+        }
+        for (i, d) in self.dense.iter().enumerate().filter(|(_, d)| !d.alone) {
             let from = shares.iter().find(|s| s.members.contains(&i)).map_or(0, |s| s.cells);
             let per = rows_per_tile(d.n_rows, g);
             let mut r = 0;
@@ -548,6 +640,7 @@ impl Planner {
                     pieces,
                     true,
                     shared_pieces[i] as u32,
+                    None,
                 );
                 r += n;
             }
@@ -560,7 +653,7 @@ impl Planner {
                 pieces_for(cells),
                 self.cfg.min_piece_cells,
             );
-            b.tile(s.table, s.row, 1, s.pos, pieces, false, 0);
+            b.tile(s.table, s.row, 1, s.pos, pieces, false, 0, None);
         }
         let Builder { mut plan, groups, next_slot, .. } = b;
         for (shape, mut items) in AttnShape::ALL.into_iter().zip(groups) {
@@ -571,15 +664,11 @@ impl Planner {
             // kernels (up to 8 vectors over quantized K and V: converted entries on the
             // direct kernel, exact ones on the tensor cores) each kind is a launch of its
             // own, the converted items first; otherwise one launch takes both.
+            // Items that must run on the tensor cores go with the exact ones.
             let split = shape == AttnShape::Decode8 && geo.k.id() != 0 && geo.v.id() != 0;
-            items.sort_by_key(|i| {
-                (split && i.flags & ITEM_CONVERTED == 0, std::cmp::Reverse(i.total))
-            });
-            let first = if split {
-                items.iter().filter(|i| i.flags & ITEM_CONVERTED != 0).count()
-            } else {
-                items.len()
-            };
+            items.sort_by_key(|i| (split && !i.direct(), std::cmp::Reverse(i.total)));
+            let first =
+                if split { items.iter().filter(|i| i.direct()).count() } else { items.len() };
             let start = plan.items.len();
             plan.items.extend(items);
             let end = plan.items.len();
@@ -618,6 +707,7 @@ impl Builder {
         pieces: Vec<Piece>,
         causal: bool,
         before: u32,
+        alone: Option<Option<(u32, u32)>>,
     ) {
         let n_pieces = before + pieces.len() as u32;
         let single = n_pieces == 1;
@@ -633,11 +723,13 @@ impl Builder {
         if !single {
             self.next_slot += n_rows * n_pieces;
         }
-        self.items(table, first_row, n_rows, &pieces, before, causal, single);
+        self.items(table, first_row, n_rows, &pieces, before, causal, single, alone);
     }
 
     /// Emits one item per piece and KV head for the `n_rows` rows listed in `row_ids`
-    /// from `row0` on. The pieces are the rows' pieces `slot0` and following.
+    /// from `row0` on. The pieces are the rows' pieces `slot0` and following. `alone`
+    /// is given for rows planned as alone ([`Planner::window`]), with their swapped
+    /// tile: their items are bound to the tensor-core kernels.
     #[allow(clippy::too_many_arguments)]
     fn items(
         &mut self,
@@ -648,7 +740,10 @@ impl Builder {
         slot0: u32,
         causal: bool,
         single: bool,
+        alone: Option<Option<(u32, u32)>>,
     ) {
+        let (swap_tile, swap_entry) =
+            alone.flatten().map_or((0, 0), |(tile, entry)| (tile + 1, entry));
         let vecs = n_rows * self.g;
         let shape = AttnShape::ALL
             .iter()
@@ -672,9 +767,12 @@ impl Builder {
                     total: before,
                     flags: (if piece.converted { ITEM_CONVERTED } else { 0 })
                         | (if causal { ITEM_CAUSAL } else { 0 })
-                        | (if single { ITEM_FINAL } else { 0 }),
+                        | (if single { ITEM_FINAL } else { 0 })
+                        | (if alone.is_some() { ITEM_TENSOR } else { 0 }),
                     slot: slot0 + slot as u32,
-                    pad: [0; 3],
+                    swap_tile,
+                    swap_entry,
+                    pad: 0,
                 });
             }
         }
@@ -772,9 +870,10 @@ mod tests {
         for (shape, range) in &plan.groups {
             let items = &plan.items[range.clone()];
             assert!(items.iter().all(|i| i.n_rows * geo.q_per_kv <= shape.max_vecs()));
+            // A launch is of one kernel: the direct one, or the tensor cores.
             if *shape == AttnShape::Decode8 && geo.k.id() != 0 && geo.v.id() != 0 {
-                let kind = items[0].flags & ITEM_CONVERTED;
-                assert!(items.iter().all(|i| i.flags & ITEM_CONVERTED == kind));
+                let direct = items[0].direct();
+                assert!(items.iter().all(|i| i.direct() == direct));
             }
         }
     }
@@ -811,6 +910,98 @@ mod tests {
         // No more blocks than the device holds at once, apart from the small tails.
         let large = plan.items.iter().filter(|i| i.total > 1024).count() as u32;
         assert!(large <= cfg.target_blocks, "{large} blocks");
+    }
+
+    /// What a plan has row `row` (the cell `pos`) read: per item of the row its KV head,
+    /// its piece, its flags, and its ranges cut at the row's own cell.
+    fn seen(plan: &Plan, row: u32, pos: u32) -> Vec<(u32, u32, u32, Vec<Range<u32>>)> {
+        let mut items: Vec<_> = plan
+            .items
+            .iter()
+            .filter(|i| plan.row_ids[i.row0 as usize..(i.row0 + i.n_rows) as usize].contains(&row))
+            .map(|i| {
+                let ranges = &plan.ranges[i.ranges_off as usize..][..3 * i.n_ranges as usize];
+                let cut = ranges.chunks(3).map(|r| r[0]..r[1].min(pos + 1)).collect();
+                (i.kv_head, i.slot, i.flags, cut)
+            })
+            .collect();
+        items.sort_by_key(|i| (i.0, i.1));
+        items
+    }
+
+    #[test]
+    fn a_window_cuts_every_row_as_the_row_alone_whatever_else_the_step_holds() {
+        let geo = geometry();
+        // 21 pieces for a row; the sequence has 80 entries, exact at both ends.
+        let cfg = PlanConfig::for_multiprocessors(28);
+        let entries: Vec<u32> = (0..80u32)
+            .map(|e| if e == 0 || e >= 77 { 500 + e } else { e | CONVERTED_BIT })
+            .collect();
+        // 11 rows across the entry that begins at 9984, where the pieces of a row
+        // change, and more vectors than one tile holds; next to them the rows of a
+        // prompt and a row of a third sequence.
+        let (pos0, n) = (9980u32, 11u32);
+        let other: Vec<u32> = (0..40u32).map(|e| (2000 + e) | CONVERTED_BIT).collect();
+        let mut planner = Planner::new(geo, cfg, n + 31);
+        planner.dense(80, &other, 0, 30, 4000);
+        planner.window(0, &entries, 30, n, pos0, None);
+        planner.window(120, &other[..20], 30 + n, 1, 2500, None);
+        let together = planner.finish();
+        let mut tables = entries.clone();
+        tables.extend(&other);
+        tables.extend(&other[..20]);
+        let mut want: Vec<Want> = (0..30).map(|i| window(80, 4000 + i)).collect();
+        want.extend((0..n).map(|i| window(0, pos0 + i)));
+        want.push(window(120, 2500));
+        check(&together, &geo, &tables, &want);
+        for r in 0..n {
+            let mut planner = Planner::new(geo, cfg, 1);
+            planner.window(0, &entries, 0, 1, pos0 + r, None);
+            let alone = planner.finish();
+            check(&alone, &geo, &entries, &[window(0, pos0 + r)]);
+            assert_eq!(seen(&together, 30 + r, pos0 + r), seen(&alone, 0, pos0 + r), "row {r}");
+            assert_eq!(together.rows[(30 + r) as usize].n_slots, alone.rows[0].n_slots);
+        }
+        // Rows share items where their pieces are the same: the four rows before the
+        // new entry, and the seven after it (42 vectors, one tile).
+        let rows_of = |row: u32| {
+            let item = together.items.iter().find(|i| {
+                together.row_ids[i.row0 as usize..(i.row0 + i.n_rows) as usize].contains(&row)
+            });
+            item.map(|i| i.n_rows)
+        };
+        assert_eq!((rows_of(30), rows_of(34), rows_of(40)), (Some(4), Some(7), Some(7)));
+        // None of the window's items may run on the direct kernel, one row or many.
+        let windows = together.items.iter().filter(|i| i.table != 80);
+        assert!(windows.clone().count() > 0 && windows.clone().all(|i| !i.direct()));
+    }
+
+    #[test]
+    fn a_window_names_the_tile_it_reads_from_another_entry() {
+        let geo = CacheGeometry { k: CacheFormat::Q4, v: CacheFormat::Q4, ..geometry() };
+        let cfg = PlanConfig::for_multiprocessors(46);
+        // Five entries, all exact; the rows read tile 1 from the converted entry 9.
+        let entries: Vec<u32> = (0..5u32).map(|e| 100 + e).collect();
+        let mut planner = Planner::new(geo, cfg, 4);
+        planner.window(0, &entries, 0, 2, 510, None);
+        planner.window(0, &entries, 2, 2, 512, Some((1, 9 | CONVERTED_BIT)));
+        let plan = planner.finish();
+        let swapped: Vec<&AttnItem> = plan.items.iter().filter(|i| i.swap_tile != 0).collect();
+        assert!(swapped.iter().all(|i| (i.swap_tile, i.swap_entry) == (2, 9 | CONVERTED_BIT)));
+        // A piece per entry (few entries): the rows from the position on read tile 1
+        // converted, the rows before it read exact entries only.
+        let kinds = |row: u32| -> Vec<bool> {
+            let mut items: Vec<&AttnItem> = plan
+                .items
+                .iter()
+                .filter(|i| i.kv_head == 0 && (i.row0..i.row0 + i.n_rows).contains(&row))
+                .collect();
+            items.sort_by_key(|i| i.slot);
+            items.iter().map(|i| i.flags & ITEM_CONVERTED != 0).collect()
+        };
+        assert_eq!(kinds(0), [false; 4]);
+        assert_eq!(kinds(2), [false, true, false, false, false]);
+        assert!(plan.items.iter().filter(|i| i.row0 == 0).all(|i| i.swap_tile == 0));
     }
 
     #[test]

@@ -390,7 +390,7 @@ static __device__ void attn_direct_body(
 #ifdef ATTN_SAME_ROWS
             n_cell = rg[0] + (lane & (ATTN_SAME_ROWS - 1));  // timing only: every unit reads the same rows
 #endif
-            n_ent = tables[it.table + n_cell / ATTN_TILE_CELLS] & ~ATTN_CONVERTED_BIT;
+            n_ent = attn_entry(it, tables, n_cell) & ~ATTN_CONVERTED_BIT;
             const uint8_t* head = conv_pool + (size_t)n_ent * g.entry_c + head_c;
             const uint32_t r = n_cell % ATTN_TILE_CELLS;
             n_kp = head + g.k_rows_off + (size_t)r * g.rbk;

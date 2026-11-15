@@ -39,8 +39,18 @@ struct AttnItem {
     uint32_t total;       // cells in the ranges
     uint32_t flags;       // ITEM_*
     uint32_t slot;        // piece number among the row's pieces
-    uint32_t pad[3];
+    uint32_t swap_tile;   // one more than the tile whose entry is swap_entry, not the table's; 0: none
+    uint32_t swap_entry;
+    uint32_t pad;
 };
+
+// The entry of the tile of `cell` for the item: the table's, or the one the item brings for
+// one tile (a tile that the rows of this item read converted while the table still names its
+// exact entry for the rows before them).
+static __device__ __forceinline__ uint32_t attn_entry(const AttnItem& it, const uint32_t* tables, uint32_t cell) {
+    const uint32_t tile = cell / ATTN_TILE_CELLS;
+    return tile + 1 == it.swap_tile ? it.swap_entry : tables[it.table + tile];
+}
 
 // Distinct entries a chunk may touch (each needs its own mean term), by the number of
 // vectors of the launch: one row against many entries (block-sparse) has few vectors.
@@ -146,7 +156,7 @@ static __device__ void attn_body(
         const uint32_t j = (uint32_t)c * nc + lane;
         if (c < n_chunks && lane < nc && j < it.total) {
             pend_cell = map_cell(j);
-            pend_ent = tables[it.table + pend_cell / ATTN_TILE_CELLS];
+            pend_ent = attn_entry(it, tables, pend_cell);
         }
     };
     auto meta_store = [&](int c) {  // warp 0 only

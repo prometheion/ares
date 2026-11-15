@@ -308,7 +308,8 @@ pub struct PlanBuffers {
     /// The buffer [`Plan::upload`] allocated; `None` when the caller owns the memory.
     _owned: Option<DeviceBuffer>,
     /// Per launch: the shape, the first item, the number of items, the most rows of an
-    /// item, and whether the items read converted entries.
+    /// item, and whether the items may run on the direct kernel (converted entries, and
+    /// none bound to the tensor cores).
     groups: Vec<(AttnShape, usize, usize, u32, bool)>,
     n_rows: u32,
     state_slots: u64,
@@ -372,9 +373,9 @@ impl Plan {
                 item.total,
                 item.flags,
                 item.slot,
-                item.pad[0],
-                item.pad[1],
-                item.pad[2],
+                item.swap_tile,
+                item.swap_entry,
+                item.pad,
             ];
             for w in words {
                 dst[at..at + 4].copy_from_slice(&w.to_le_bytes());
@@ -419,8 +420,8 @@ impl Plan {
                 .map(|(s, r)| {
                     let items = &self.items[r.clone()];
                     let rows = items.iter().map(|i| i.n_rows).max().unwrap_or(0);
-                    let converted = items.iter().all(|i| i.flags & plan::ITEM_CONVERTED != 0);
-                    (*s, r.start, r.end - r.start, rows, converted)
+                    let direct = items.iter().all(AttnItem::direct);
+                    (*s, r.start, r.end - r.start, rows, direct)
                 })
                 .collect(),
             n_rows: self.rows.len() as u32,
@@ -506,7 +507,9 @@ impl AttentionKernels {
     /// Attention of the rows of a plan: one launch per kernel shape and kind of entry the
     /// plan uses, then the merge of partial states if any row has more than one piece.
     /// Items of up to 8 vectors in converted entries with K and V both quantized run on
-    /// the direct kernel, everything else on the tensor-core kernels. `scale` is the
+    /// the direct kernel, everything else on the tensor-core kernels, and so do the
+    /// items of a [`Planner::window`], whose rows must compute the same alone and
+    /// together. `scale` is the
     /// factor on the scores (`1 / sqrt(head_dim)`).
     ///
     /// # Safety
@@ -528,9 +531,9 @@ impl AttentionKernels {
         let st_acc = buffers.scratch;
         let st_lse = buffers.scratch.offset(acc_bytes);
         let gate = buffers.gate.unwrap_or(DevicePtr::NULL);
-        for (shape, first, count, max_rows, converted) in &plan.groups {
+        for (shape, first, count, max_rows, direct) in &plan.groups {
             let vecs = max_rows * geo.q_per_kv;
-            let quantized = *converted && geo.k != CacheFormat::F16 && geo.v != CacheFormat::F16;
+            let quantized = *direct && geo.k != CacheFormat::F16 && geo.v != CacheFormat::F16;
             if quantized && vecs <= DIRECT_MAX_VECS {
                 let nv = DIRECT_VECS.into_iter().find(|nv| vecs <= *nv).unwrap_or(DIRECT_MAX_VECS);
                 let function = self

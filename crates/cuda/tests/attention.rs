@@ -1164,6 +1164,235 @@ fn batches_of_sequences_ranges_and_wide_windows_equal_the_reference() {
     }
 }
 
+/// The outputs of the rows of one step that `plan` describes (`n` rows of one
+/// sequence, whose table is `table`), for the queries and gates given:
+/// `[row][q_heads][D]`.
+#[allow(clippy::too_many_arguments)]
+fn attend_planned(
+    kernels: &AttentionKernels,
+    stream: &Stream,
+    geo: &CacheGeometry,
+    pools: &Pools,
+    table: &[u32],
+    cfg: PlanConfig,
+    n: usize,
+    q: &[f32],
+    gate: &[f32],
+    plan: impl FnOnce(&mut Planner),
+) -> Vec<f32> {
+    let device = kernels.device();
+    let values = n * (geo.kv_total * geo.q_per_kv * geo.head_dim) as usize;
+    assert_eq!((q.len(), gate.len()), (values, values));
+    let (q_dev, gate_dev) = (upload(device, &f32_bytes(q)), upload(device, &f32_bytes(gate)));
+    let out_dev = zeroed(device, values as u64 * 4);
+    let table_dev = upload(device, &u32_bytes(table));
+    let mut planner = Planner::new(*geo, cfg, n as u32);
+    plan(&mut planner);
+    let plan = planner.finish();
+    let scratch = zeroed(device, plan.state_bytes(geo).max(16));
+    let buffers = plan.upload(device).unwrap();
+    let args = AttendBuffers {
+        tables: table_dev.ptr(),
+        exact_pool: pools.exact.ptr(),
+        converted_pool: pools.converted.ptr(),
+        q: q_dev.ptr(),
+        gate: Some(gate_dev.ptr()),
+        out: out_dev.ptr(),
+        scratch: scratch.ptr(),
+    };
+    let scale = 1.0 / (geo.head_dim as f32).sqrt();
+    // SAFETY: the buffers have the sizes the plan and the geometry give.
+    unsafe { kernels.attend(stream, geo, &buffers, &args, scale).unwrap() };
+    stream.synchronize().unwrap();
+    download(&out_dev, values * 4)
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| f32::from_le_bytes(*b))
+        .collect()
+}
+
+/// The rows of the model's heads on this device, of `[row][q_heads][D]`: the
+/// kernels write no other.
+fn own_heads(geo: &CacheGeometry, rows: &[f32], n: usize) -> Vec<u32> {
+    let (g, d) = (geo.q_per_kv as usize, geo.head_dim as usize);
+    let per_row = geo.kv_total as usize * g * d;
+    let first = geo.first_kv_head as usize * g * d;
+    let len = geo.kv_heads as usize * g * d;
+    (0..n)
+        .flat_map(|r| rows[r * per_row + first..r * per_row + first + len].iter())
+        .map(|x| x.to_bits())
+        .collect()
+}
+
+/// A row of a window planned with [`Planner::window`] has, bit for bit, the
+/// output it has as the only row of a step: for every pair of formats, for
+/// windows of one tile of vectors and of several, for a window that begins a
+/// new entry (where the pieces of a row change), and with as few pieces as
+/// make a piece span several entries. Drafts rely on this: what a window
+/// holds besides a row must not change the row.
+#[test]
+fn a_row_of_a_window_has_the_bits_it_has_alone() {
+    let Some(devices) = gpus() else { return };
+    let mut rng = Rng(0xA104E);
+    for device in devices {
+        let kernels = AttentionKernels::load(device).unwrap();
+        let stream = Stream::new(device, 0).unwrap();
+        let sm = device.info().multiprocessors;
+        let mut compared = 0usize;
+        for k in KvFormat::ALL {
+            for v in KvFormat::ALL {
+                // A head of 256 with 6 query heads per KV head (one row is 6
+                // vectors, 8 rows fill the widest decode shape), and one of 128
+                // with 4 for a few pairs.
+                let small = (k == v) || (k == KvFormat::Q8 && v == KvFormat::F16);
+                for d in [256usize, 128] {
+                    if d == 128 && !small {
+                        continue;
+                    }
+                    let mut geo = test_geometry(k, v, d);
+                    if d == 128 {
+                        geo.q_per_kv = 4;
+                    }
+                    // 1500 cells and then the window: with a tile mean the
+                    // first tile and the newest are exact, the others converted.
+                    let hist = 1500usize;
+                    let case = Case { k, v, d, hist, rows: 40 };
+                    let (pools, seq) = build(&kernels, &stream, &case, &geo, &mut rng);
+                    let per_row = (geo.kv_total * geo.q_per_kv) as usize * d;
+                    // (first position, rows): inside an entry, across the entry
+                    // that begins at 1536, more rows than one tile of vectors.
+                    for (pos0, rows) in [(1501usize, 2usize), (1505, 8), (1530, 8), (1520, 19)] {
+                        for cfg in [
+                            PlanConfig::for_multiprocessors(sm),
+                            PlanConfig { target_blocks: 8, ..PlanConfig::for_multiprocessors(sm) },
+                        ] {
+                            let q: Vec<f32> =
+                                (0..rows * per_row).map(|_| rng.kv_value(0.0)).collect();
+                            let gate: Vec<f32> =
+                                (0..rows * per_row).map(|_| 2.0 * rng.gaussian()).collect();
+                            let together = attend_planned(
+                                &kernels,
+                                &stream,
+                                &geo,
+                                &pools,
+                                &seq.table,
+                                cfg,
+                                rows,
+                                &q,
+                                &gate,
+                                |p| p.window(0, &seq.table, 0, rows as u32, pos0 as u32, None),
+                            );
+                            for r in 0..rows {
+                                let range = r * per_row..(r + 1) * per_row;
+                                let alone = attend_planned(
+                                    &kernels,
+                                    &stream,
+                                    &geo,
+                                    &pools,
+                                    &seq.table,
+                                    cfg,
+                                    1,
+                                    &q[range.clone()],
+                                    &gate[range.clone()],
+                                    |p| p.window(0, &seq.table, 0, 1, (pos0 + r) as u32, None),
+                                );
+                                assert!(
+                                    own_heads(&geo, &alone, 1).iter().any(|x| *x != 0),
+                                    "the row was computed"
+                                );
+                                assert_eq!(
+                                    own_heads(&geo, &together[range], 1),
+                                    own_heads(&geo, &alone, 1),
+                                    "{} {k}/{v} d {d}: row {r} of the {rows} rows at {pos0}, \
+                                     {} blocks",
+                                    device.info().name,
+                                    cfg.target_blocks
+                                );
+                                compared += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        println!("{}: {compared} rows of windows equal the rows alone", device.info().name);
+    }
+}
+
+/// A window can read one tile from an entry it names instead of the table's:
+/// the rows that read a tile converted while the table still has its exact
+/// entry for the rows before them. Such rows have the bits they have once the
+/// table names the converted entry.
+#[test]
+fn a_window_reads_a_swapped_tile_as_if_the_table_named_it() {
+    let Some(devices) = gpus() else { return };
+    let mut rng = Rng(0x5A9);
+    for device in devices {
+        let kernels = AttentionKernels::load(device).unwrap();
+        let stream = Stream::new(device, 0).unwrap();
+        let cfg = PlanConfig::for_multiprocessors(device.info().multiprocessors);
+        for format in [KvFormat::Q7, KvFormat::Q4] {
+            let (d, rows) = (256usize, 6usize);
+            let geo = test_geometry(format, format, d);
+            // 400 cells: every tile is still exact with q4 (256 newest cells),
+            // and tile 2 is the last full one, exact with q7 too (32 newest).
+            let case = Case { k: format, v: format, d, hist: 400 - rows, rows };
+            let (mut pools, seq) = build(&kernels, &stream, &case, &geo, &mut rng);
+            let tile = 2usize;
+            let exact = seq.table[tile];
+            assert_eq!(exact & CONVERTED, 0, "{format}: tile {tile} is an exact entry");
+            // Convert the tile into a free converted slot; the table keeps the
+            // exact entry.
+            let converted = pools.free_converted.pop().unwrap();
+            let jobs = upload(device, &u32_bytes(&[exact, converted]));
+            let status = zeroed(device, 4);
+            // SAFETY: both slots are in the pools.
+            unsafe {
+                kernels
+                    .convert(
+                        &stream,
+                        &geo,
+                        jobs.ptr(),
+                        1,
+                        pools.exact.ptr(),
+                        pools.converted.ptr(),
+                        status.ptr(),
+                    )
+                    .unwrap();
+            }
+            stream.synchronize().unwrap();
+            assert_eq!(status_of(&status), 0);
+            let per_row = (geo.kv_total * geo.q_per_kv) as usize * d;
+            let q: Vec<f32> = (0..rows * per_row).map(|_| rng.kv_value(0.0)).collect();
+            let gate: Vec<f32> = (0..rows * per_row).map(|_| 2.0 * rng.gaussian()).collect();
+            let pos0 = (400 - rows) as u32;
+            let swap = Some((tile as u32, converted | CONVERTED));
+            let run = |table: &[u32], swap: Option<(u32, u32)>| {
+                attend_planned(&kernels, &stream, &geo, &pools, table, cfg, rows, &q, &gate, |p| {
+                    p.window(0, table, 0, rows as u32, pos0, swap)
+                })
+            };
+            let swapped = run(&seq.table, swap);
+            let mut named = seq.table.clone();
+            named[tile] = converted | CONVERTED;
+            let by_table = run(&named, None);
+            let unswapped = run(&seq.table, None);
+            assert_eq!(
+                own_heads(&geo, &swapped, rows),
+                own_heads(&geo, &by_table, rows),
+                "{} {format}",
+                device.info().name
+            );
+            assert_ne!(
+                own_heads(&geo, &swapped, rows),
+                own_heads(&geo, &unswapped, rows),
+                "{format}: the converted tile is not the exact one"
+            );
+        }
+    }
+}
+
 fn read_f32_file(path: &std::path::Path) -> Vec<f32> {
     std::fs::read(path)
         .unwrap_or_else(|e| panic!("{}: {e}", path.display()))
