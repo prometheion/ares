@@ -116,8 +116,8 @@ pub struct SyntheticConfig {
     /// `None`: it does not (the default). Only the host executor carries the
     /// transfers out. Needs `prefix_cache`.
     pub durable: Option<u64>,
-    /// The cells at the end of a sequence whose pages the model says have not
-    /// reached the form they keep ([`crate::Durable::settle_cells`]).
+    /// The cells before the start of a step whose pages the model says have
+    /// not reached the form they keep ([`crate::Durable::settle_cells`]).
     pub settle_cells: u32,
     /// The links of a chain of drafts the model makes itself, like the draft
     /// block of a real one: 0 for none. The context must read one token

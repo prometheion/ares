@@ -1212,11 +1212,14 @@ fn load_qwen35(
         let held = snapshot.counters.ssd;
         match &snapshot.ssd_problem {
             Some(why) => tracing::warn!(
-                "the prompt cache on SSD in {} is not in use, the cache lives in the devices and                  in RAM alone: {why}",
+                "the prompt cache on SSD in {} is not in use, the cache lives in the devices and \
+                 in RAM alone: {why}",
                 ssd.dir.display()
             ),
             None => tracing::info!(
-                "prompt cache on SSD: {}, at most {} for everything in it; this model's store                  holds {} pages and {} checkpoints in {}; texts of {} tokens and more are                  written as they are computed",
+                "prompt cache on SSD: {}, at most {} for everything in it; this model's store \
+                 holds {} pages and {} checkpoints in {}; texts of {} tokens and more are \
+                 written as they are computed",
                 ssd.dir.display(),
                 Bytes(ssd.max_bytes),
                 held.store_pages,

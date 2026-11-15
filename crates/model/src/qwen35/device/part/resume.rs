@@ -123,16 +123,13 @@ pub fn transit_page_bytes(c: &Config, placement: &Placement, index: usize, opts:
             .map_or(0, |_| entry(DRAFT_KV, c.attention.n_head_kv as u32))
 }
 
-/// The cells at the end of a sequence whose pages may still be exact entries
+/// The cells before the start of a step that may still be exact entries
 /// under `placement`: the newest cells that the formats of the attention
-/// blocks and of the draft block keep exact, and the page a step converts
-/// behind them. 0 when no group has exact entries.
+/// blocks and of the draft block keep exact. A step converts the tiles that
+/// lie before them at its start. 0 when no group has exact entries.
 pub fn settle_cells(placement: &Placement, opts: &Options) -> u32 {
     let draft = placement.draft.as_ref().map_or(0, |_| kv::newest_cells(DRAFT_KV.0, DRAFT_KV.1));
-    match kv::newest_cells(opts.kv.0, opts.kv.1).max(draft) {
-        0 => 0,
-        newest => newest + ares_cuda::ENTRY_CELLS,
-    }
+    kv::newest_cells(opts.kv.0, opts.kv.1).max(draft)
 }
 
 /// The tag of a page in transit: which groups' entries are exact ones.

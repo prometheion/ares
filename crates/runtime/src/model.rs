@@ -180,9 +180,11 @@ pub struct Durable {
     pub page_bytes: Vec<u64>,
     /// Per device, the bytes of its share of a checkpoint.
     pub state_bytes: Vec<u64>,
-    /// The cells at the end of a sequence whose pages have not reached the
-    /// form they keep: a page is written when its sequence is this far past
-    /// it, or ends. 0 for a model that stores a page in one form.
+    /// The cells before the start of a step that the device keeps in another
+    /// form than the one a page ends in (a device brings pages into that form
+    /// at the start of a step, by where the sequence stands then): a page is
+    /// written when its sequence's last step began this far past it, or when
+    /// the sequence ends. 0 for a model that stores a page in one form.
     pub settle_cells: u32,
 }
 

@@ -13,10 +13,11 @@
 //!
 //! # What is written, and when
 //!
-//! - **A page** when it is full and its sequence is
-//!   [`Durable::settle_cells`] past it, or ends (ends, gives way, is
-//!   cancelled), in the form the device holds it in then. A page that the
-//!   store has is not written again: its name says what it holds.
+//! - **A page** when it is full and its sequence's last step began
+//!   [`Durable::settle_cells`] past it, or when the sequence ends (ends,
+//!   gives way, is cancelled), in the form the device holds it in then. A
+//!   page that the store has is not written again: its name says what it
+//!   holds.
 //! - **A checkpoint** at a page boundary, after the step whose record carried
 //!   its save. The partly used last page of a sequence and the state at its
 //!   end are not written: a prompt that resumes from the drive restores the
@@ -393,8 +394,9 @@ pub(crate) struct Ssd {
     made_pages: usize,
     free_states: Vec<Vec<TransitPart>>,
     made_states: usize,
-    /// Per running sequence, the pages of it that were looked at.
-    cursors: HashMap<Owner, usize>,
+    /// Per running sequence, the pages of it that were looked at, and the
+    /// cells it held when it was last noted: where its last step began.
+    cursors: HashMap<Owner, (usize, u64)>,
     page_out: VecDeque<PageOut>,
     state_out: VecDeque<StateOut>,
     /// What is queued here or with the writer.
@@ -580,14 +582,17 @@ impl Ssd {
             return;
         }
         let full = (settled / per_page) as usize;
+        let (from, began) = self.cursors.get(&owner).copied().unwrap_or((0, 0));
+        // A device brings a page into the form it keeps at the start of a
+        // step, by where the sequence stands then: what the step that has
+        // just run left behind its start is final now.
         let due = match last {
             true => full,
             false => {
-                (settled.saturating_sub(u64::from(self.durable.settle_cells)) / per_page) as usize
+                (began.saturating_sub(u64::from(self.durable.settle_cells)) / per_page) as usize
             }
         };
         let due = due.min(full).min(chain.hashes().len());
-        let from = self.cursors.get(&owner).copied().unwrap_or(0);
         if from < due {
             let store = self.shared.store();
             for i in from..due {
@@ -608,7 +613,7 @@ impl Ssd {
         if last {
             self.cursors.remove(&owner);
         } else {
-            self.cursors.insert(owner, from.max(due));
+            self.cursors.insert(owner, (from.max(due), settled));
         }
     }
 

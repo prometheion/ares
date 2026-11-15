@@ -582,7 +582,10 @@ impl fmt::Display for Snapshot {
             let s = &c.ssd;
             writeln!(
                 f,
-                "prefix cache on SSD: {} pages and {} checkpoints written ({} bytes, {} failed,                  {} checkpoints skipped, {} waiting), {} pages and {} checkpoints read ({}                  bytes) in {} runs ({} cut); the store holds {} pages and {} checkpoints in {}                  bytes; {} transfers took {:.1} ms",
+                "prefix cache on SSD: {} pages and {} checkpoints written ({} bytes, {} failed, \
+                 {} checkpoints skipped, {} waiting), {} pages and {} checkpoints read ({} \
+                 bytes) in {} runs ({} cut); the store holds {} pages and {} checkpoints in {} \
+                 bytes; {} transfers took {:.1} ms",
                 s.pages_written,
                 s.states_written,
                 s.bytes_written,
