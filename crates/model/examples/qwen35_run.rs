@@ -49,7 +49,10 @@
 //!   step whose drafts and how many from the price of a step (measured at
 //!   load) and the acceptance (measured while running); `--draft-vocab FILE`
 //!   restricts the block's drafts to the tokens of a list (an id per line).
-//!   `--out DIR` keeps the answers, to compare runs. `--chat-var name=value`
+//!   `--out DIR` keeps the answers, to compare runs. `--undrafted` asks every
+//!   request again without drafts (`"draft": false`) and a third time with
+//!   them, and says where the texts part; `--requests N` asks the first `N`
+//!   of the seven. `--chat-var name=value`
 //!   sets a variable of the chat template (`reasoning_effort=medium`). Reports
 //!   tokens per second, acceptance by draft position, the lengths of the
 //!   drafts and the time of a step by kind.
@@ -153,6 +156,8 @@ struct Args {
     checkpoints: Option<u64>,
     window: u32,
     sample: bool,
+    undrafted: bool,
+    requests: usize,
     draft_vocab: Option<PathBuf>,
     out: Option<PathBuf>,
     chat_vars: Vec<(String, String)>,
@@ -195,6 +200,8 @@ fn parse() -> Args {
         checkpoints: None,
         window: 8,
         sample: false,
+        undrafted: false,
+        requests: usize::MAX,
         draft_vocab: None,
         out: None,
         chat_vars: Vec::new(),
@@ -247,6 +254,8 @@ fn parse() -> Args {
             "--checkpoints" => args.checkpoints = Some(value().parse().expect("checkpoints")),
             "--window" => args.window = value().parse().expect("rows of a window"),
             "--sample" => args.sample = true,
+            "--undrafted" => args.undrafted = true,
+            "--requests" => args.requests = value().parse().expect("requests"),
             "--draft-vocab" => args.draft_vocab = Some(value().into()),
             "--out" => args.out = Some(value().into()),
             "--layouts" => {
@@ -780,14 +789,16 @@ fn main() {
     }
 }
 
-/// One request through the engine. Returns the answer, the seconds from its
-/// first piece of text to its end and the completion tokens.
+/// One request through the engine, with drafts or without (`"draft": false`).
+/// Returns the answer, the seconds from its first piece of text to its end and
+/// the completion tokens.
 fn ask(
     runtime: &ares_runtime::Runtime,
     id: u64,
     question: &str,
     sampling: ares_api::Sampling,
     max_tokens: u32,
+    draft: bool,
 ) -> (String, f64, u32) {
     use ares_api::{Engine, Event, EventSink, GenerateRequest, Prompt, RequestId, Role};
     use std::sync::{Mutex, mpsc};
@@ -825,7 +836,7 @@ fn ask(
                 sampling,
                 max_tokens: Some(max_tokens),
                 stop: Vec::new(),
-                draft: true,
+                draft,
                 structure: None,
                 id: RequestId(id),
             },
@@ -977,15 +988,16 @@ fn engine(args: &Args, spread: &Spread, window: u32) {
     }
     // The first request also pays for whatever the first steps of a process
     // pay; it is not measured.
-    let _ = ask(&runtime, 1, "Say hello.", settings[0].1.clone(), 8);
+    let _ = ask(&runtime, 1, "Say hello.", settings[0].1.clone(), 8, true);
     let mut id = 1;
+    let (mut compared, mut parted) = (0u32, 0u32);
     for (how, sampling) in &settings {
-        for (name, question) in questions {
+        for (name, question) in questions.into_iter().take(args.requests) {
             id += 1;
             let _ = runtime.take_snapshot();
             profile.reset();
             let (text, seconds, tokens) =
-                ask(&runtime, id, question, sampling.clone(), args.generate as u32);
+                ask(&runtime, id, question, sampling.clone(), args.generate as u32, true);
             let Some(snapshot) = runtime.snapshot() else { panic!("the engine is gone") };
             let c = snapshot.counters;
             if let Some(dir) = &args.out {
@@ -1072,7 +1084,50 @@ fn engine(args: &Args, spread: &Spread, window: u32) {
             }
             let shown: String = text.chars().take(160).collect();
             println!("RES {name} {how} text: {}", shown.replace('\n', " "));
+            if args.undrafted {
+                // The same request without drafts, and with them once more: the
+                // second and third start from what the first left in the cache.
+                let _ = runtime.take_snapshot();
+                id += 1;
+                let (plain, _, plain_tokens) =
+                    ask(&runtime, id, question, sampling.clone(), args.generate as u32, false);
+                let plain_steps = runtime.snapshot().map_or(0, |s| s.counters.steps);
+                id += 1;
+                let (again, ..) =
+                    ask(&runtime, id, question, sampling.clone(), args.generate as u32, true);
+                let shared =
+                    |a: &str, b: &str| a.chars().zip(b.chars()).take_while(|(x, y)| x == y).count();
+                let against = |other: &str| {
+                    if other == text {
+                        "the same text".to_owned()
+                    } else {
+                        format!(
+                            "parts after {} of {} characters",
+                            shared(&text, other),
+                            text.chars().count()
+                        )
+                    }
+                };
+                compared += 1;
+                parted += u32::from(plain != text);
+                println!(
+                    "RES {name} {how}: without drafts ({plain_tokens} tokens in {plain_steps} \
+                     steps): {}; with drafts again: {}",
+                    against(&plain),
+                    against(&again),
+                );
+                if let Some(dir) = &args.out {
+                    std::fs::write(dir.join(format!("{name}.{how}.undrafted.txt")), &plain)
+                        .expect("write");
+                }
+            }
         }
+    }
+    if args.undrafted {
+        println!(
+            "RES drafts and the text: {parted} of {compared} replies with drafts are not the reply \
+             without"
+        );
     }
     runtime.shutdown();
 }
