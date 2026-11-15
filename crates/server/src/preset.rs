@@ -464,6 +464,11 @@ fn other_name(name: &str) -> Option<&'static str> {
              draft is, is chosen for every step"
         }
         "cache-ram" => "the RAM the engine may use, its caches included, is 'ram'",
+        "cache-disk" => "the directory of the prompt cache on SSD is 'cache'",
+        "cache-disk-size" => "the most the prompt cache takes on SSD is 'cache-size'",
+        "ctx-checkpoints" | "checkpoint-root" | "checkpoint-spread" | "cache-save-min" => {
+            "the engine places its checkpoints and decides what of them is kept and written"
+        }
         "sleep-idle-seconds" => "the time a model may stay idle is 'idle-unload'",
         "a" | "alias" => "more ids of a model are 'aliases'",
         "models-max" => {
@@ -689,6 +694,21 @@ idle-unload = never
     }
 
     #[test]
+    fn the_prompt_cache_on_ssd_is_set_for_all_models_or_for_one() {
+        let text = "[*]\ncache = /var/cache/ares\ncache-size = 64G\n\n\
+                    [a]\nmodel = /a.gguf\n\n[b]\nmodel = /b.gguf\ncache-size = 8G\n";
+        let presets = parse(text, &[]).unwrap();
+        let [a, b] = presets.models.as_slice() else { panic!("{presets:?}") };
+        assert_eq!(a.options.load.cache, Some(PathBuf::from("/var/cache/ares")));
+        assert_eq!(a.options.load.cache_size, Some(64 << 30));
+        assert_eq!(b.options.load.cache, Some(PathBuf::from("/var/cache/ares")));
+        assert_eq!(b.options.load.cache_size, Some(8 << 30));
+        // Without the key nothing is written anywhere.
+        let presets = parse("[a]\nmodel = /a.gguf\n", &[]).unwrap();
+        assert_eq!(presets.models[0].options.load.cache, None);
+    }
+
+    #[test]
     fn an_option_of_llama_server_is_answered_with_the_one_of_ares() {
         for (key, says) in [
             ("ctx-size = 262144", "the context is 'context'"),
@@ -701,6 +721,10 @@ idle-unload = never
             ("spec-type = ngram-simple,draft-mtp", "'drafters'"),
             ("spec-draft-vocab = /v.txt", "'draft-vocab'"),
             ("cache-ram = 12288", "'ram'"),
+            ("cache-disk = /var/cache/llama", "'cache'"),
+            ("cache-disk-size = 65536", "'cache-size'"),
+            ("ctx-checkpoints = 32", "the engine places its checkpoints"),
+            ("cache-save-min = 1024", "the engine places its checkpoints"),
             ("sleep-idle-seconds = 600", "'idle-unload'"),
             ("alias = x", "'aliases'"),
             ("stop-timeout = 180", "an unload writes nothing"),

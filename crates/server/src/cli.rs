@@ -66,6 +66,20 @@ OPTIONS:
                                what the machine has available when the server
                                starts]
 
+    Prompt cache on SSD.
+        --cache <DIR>          A directory in which the engine keeps the state of
+                               what it has computed (K and V, and checkpoints of
+                               recurrent state), so that a prompt that starts with
+                               it resumes from there after the state has left the
+                               devices, after the model was unloaded and after a
+                               restart. Texts of 2048 tokens and more are written,
+                               as they are computed; a store fits one model file
+                               with its formats and split, and the directory may
+                               be shared by all models [default: none, and nothing
+                               is written]
+        --cache-size <SIZE>    The most that directory may take, such as 64G; what
+                               was used least recently goes first [default: 32G]
+
     Speed against exactness.
         --precision <KIND>     fast:  8-bit activations where they are faster
                                exact: f16 products everywhere, same text whatever
@@ -365,6 +379,12 @@ mod tests {
         assert_eq!(load.kv, Some((CacheFormat::Q8, CacheFormat::F16)));
         assert_eq!(load.draft_vocabulary, Some(PathBuf::from("v.txt")));
         assert_eq!(run(&["--model=m", "--split=layer"]).load.split, Some(SplitKind::Layer));
+        // The prompt cache on SSD: off without a directory, and a size of its own.
+        let load = run(&["--model=m"]).load;
+        assert_eq!((load.cache, load.cache_size), (None, None));
+        let load = run(&["--model=m", "--cache", "/var/cache/ares", "--cache-size=64G"]).load;
+        assert_eq!(load.cache, Some(PathBuf::from("/var/cache/ares")));
+        assert_eq!(load.cache_size, Some(64 << 30));
         // The formats that keep exact cells are accepted, for K and V apart.
         let load = run(&["--model=m", "--kv", "q5,q4"]).load;
         assert_eq!(load.kv, Some((CacheFormat::Q5, CacheFormat::Q4)));
@@ -499,6 +519,9 @@ mod tests {
             (&["--kv", "q8,q8,q8"], "--kv"),
             (&["--ram", "lots"], "--ram"),
             (&["--ram", "-1"], "--ram"),
+            (&["--cache", ""], "--cache"),
+            (&["--cache-size", "plenty"], "--cache-size"),
+            (&["--cache-size", "100M"], "--cache-size"),
             (&["--precision", "sloppy"], "--precision"),
             (&["--drafters", "none,mtp"], "--drafters"),
             (&["--chat-var", "novalue"], "--chat-var"),

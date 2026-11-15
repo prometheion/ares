@@ -31,7 +31,7 @@ use ares_model::qwen35::device::{
 };
 use ares_model::qwen35::weights::{Matrix, Mixer};
 use ares_model::qwen35::{Config, Weights};
-use ares_runtime::{GpuConfig, Model, Runtime, RuntimeConfig, Split, required_ram};
+use ares_runtime::{GpuConfig, Model, Runtime, RuntimeConfig, Split, SsdConfig, required_ram};
 use ares_tokenizer::ChatOptions;
 
 use crate::models::{LoadFailure, Loader, Site, Unit};
@@ -1137,14 +1137,27 @@ fn load_qwen35(
             table,
         ));
     }
-    let (ram, why_ram) = ram_limit_of(options, site, &needs, "none is spared for checkpoints")?;
     let checkpoint = model.prefix_cache().map_or(0, |cache| cache.bytes());
+    // The prompt cache on SSD moves a checkpoint through a place in RAM, on
+    // its way to the drive and back: with a directory for it, one place is
+    // what the engine needs, whatever else the limit leaves for checkpoints.
+    let ssd = options.cache.as_ref().map(|dir| {
+        SsdConfig::new(dir, options.cache_size.unwrap_or(crate::plan::DEFAULT_CACHE_SIZE))
+    });
+    if ssd.is_some() && checkpoint > 0 {
+        needs.push((
+            "one checkpoint of recurrent state on its way to the prompt cache on SSD or back",
+            checkpoint,
+        ));
+    }
+    let (ram, why_ram) = ram_limit_of(options, site, &needs, "none is spared for checkpoints")?;
     let runtime_config = RuntimeConfig {
         pages,
         cells_per_page: CELLS_PER_PAGE,
         max_slots: parallel,
         window_rows: if mtp { window } else { 1 },
         checkpoint_budget: ram - required,
+        ssd: ssd.clone(),
         ..RuntimeConfig::default()
     };
     let gpu = GpuConfig {
@@ -1195,6 +1208,24 @@ fn load_qwen35(
         loading.elapsed().as_secs_f64(),
         begun.elapsed().as_secs_f64()
     );
+    if let (Some(ssd), Some(snapshot)) = (&ssd, runtime.snapshot()) {
+        let held = snapshot.counters.ssd;
+        match &snapshot.ssd_problem {
+            Some(why) => tracing::warn!(
+                "the prompt cache on SSD in {} is not in use, the cache lives in the devices and                  in RAM alone: {why}",
+                ssd.dir.display()
+            ),
+            None => tracing::info!(
+                "prompt cache on SSD: {}, at most {} for everything in it; this model's store                  holds {} pages and {} checkpoints in {}; texts of {} tokens and more are                  written as they are computed",
+                ssd.dir.display(),
+                Bytes(ssd.max_bytes),
+                held.store_pages,
+                held.store_states,
+                Bytes(held.store_bytes),
+                ssd.min_cells
+            ),
+        }
+    }
     if let Some(calibration) = runtime.snapshot().and_then(|snapshot| snapshot.calibration) {
         let table = |points: &[(u32, f64)]| {
             points.iter().map(|(n, ms)| format!("{n}: {ms:.1}")).collect::<Vec<_>>().join(", ")

@@ -1368,7 +1368,63 @@ pub(crate) fn model_list(models: &[crate::models::Listed]) -> serde_json::Value 
 
 /// The body of `GET /metrics`.
 pub(crate) fn metrics(stats: &ares_api::EngineStats) -> String {
-    let rows: [(&str, &str, &str, u64); 29] = [
+    let ssd = &stats.ssd;
+    let rows: [(&str, &str, &str, u64); 39] = [
+        (
+            "cache_ssd_pages_written_total",
+            "counter",
+            "Pages of sequence state the prompt cache wrote to SSD",
+            ssd.pages_written,
+        ),
+        (
+            "cache_ssd_checkpoints_written_total",
+            "counter",
+            "Checkpoints of recurrent state the prompt cache wrote to SSD",
+            ssd.checkpoints_written,
+        ),
+        (
+            "cache_ssd_written_bytes_total",
+            "counter",
+            "Bytes the prompt cache wrote to SSD",
+            ssd.bytes_written,
+        ),
+        (
+            "cache_ssd_write_nanoseconds_total",
+            "counter",
+            "Time the prompt cache's writer spent writing and syncing",
+            ssd.write_ns,
+        ),
+        (
+            "cache_ssd_pages_read_total",
+            "counter",
+            "Pages of sequence state the prompt cache read back from SSD",
+            ssd.pages_read,
+        ),
+        (
+            "cache_ssd_checkpoints_read_total",
+            "counter",
+            "Checkpoints of recurrent state the prompt cache read back from SSD",
+            ssd.checkpoints_read,
+        ),
+        (
+            "cache_ssd_read_bytes_total",
+            "counter",
+            "Bytes the prompt cache read back from SSD",
+            ssd.bytes_read,
+        ),
+        (
+            "cache_ssd_read_nanoseconds_total",
+            "counter",
+            "Time the prompt cache's readers spent reading and checking, summed",
+            ssd.read_ns,
+        ),
+        (
+            "cache_ssd_transfer_nanoseconds_total",
+            "counter",
+            "Time the step loop waited while cached state moved between devices and host",
+            ssd.transfer_ns,
+        ),
+        ("cache_ssd_bytes", "gauge", "Bytes the model's store takes on SSD", ssd.store_bytes),
         (
             "requests_finished_total",
             "counter",

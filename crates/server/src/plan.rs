@@ -68,6 +68,12 @@ pub enum Drafter {
     Block(PathBuf),
 }
 
+/// The most bytes the prompt cache takes on SSD when `--cache-size` does not
+/// say: room for the state of about a million tokens of the largest model the
+/// engine runs today, and little enough to be no surprise on a drive whose
+/// size the operator did not state.
+pub const DEFAULT_CACHE_SIZE: u64 = 32 << 30;
+
 /// What the operator asked for. `None` means "decide from the devices and
 /// the model".
 #[derive(Debug, Clone, PartialEq)]
@@ -90,6 +96,12 @@ pub struct LoadOptions {
     pub kv: Option<(CacheFormat, CacheFormat)>,
     /// The most host RAM the engine may use, in bytes.
     pub ram: Option<u64>,
+    /// The directory in which the prompt cache keeps state on SSD. `None`:
+    /// the cache lives in the devices and in RAM alone.
+    pub cache: Option<PathBuf>,
+    /// The most bytes everything in that directory may take
+    /// ([`DEFAULT_CACHE_SIZE`]).
+    pub cache_size: Option<u64>,
     /// How the matrix products round.
     pub precision: Precision,
     /// The model drafters that take part. `None`: every one that is
@@ -118,6 +130,8 @@ impl LoadOptions {
             parallel: None,
             kv: None,
             ram: None,
+            cache: None,
+            cache_size: None,
             precision: Precision::Fast,
             drafters: None,
             window: None,

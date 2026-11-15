@@ -67,6 +67,8 @@ pub fn lookup(name: &str) -> Option<(&'static str, Kind)> {
         "--parallel" => ("--parallel", Kind::Value),
         "--kv" => ("--kv", Kind::Value),
         "--ram" => ("--ram", Kind::Value),
+        "--cache" => ("--cache", Kind::Value),
+        "--cache-size" => ("--cache-size", Kind::Value),
         "--precision" => ("--precision", Kind::Value),
         "--drafters" => ("--drafters", Kind::Value),
         "--window" => ("--window", Kind::Value),
@@ -208,6 +210,17 @@ pub fn set(options: &mut ModelOptions, flag: &'static str, value: &str) -> Resul
             let expected = "a size such as 16G or 512M";
             load.ram =
                 Some(plan::parse_size(value).ok_or_else(|| invalid("--ram", value, expected))?);
+        }
+        "--cache" => {
+            if value.trim().is_empty() {
+                return Err(invalid("--cache", value, "a directory"));
+            }
+            load.cache = Some(PathBuf::from(value));
+        }
+        "--cache-size" => {
+            let expected = "a size such as 64G, at least 1G";
+            let size = plan::parse_size(value).filter(|size| *size >= 1 << 30);
+            load.cache_size = Some(size.ok_or_else(|| invalid("--cache-size", value, expected))?);
         }
         "--precision" => {
             load.precision = match value {
