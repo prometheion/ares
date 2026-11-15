@@ -890,7 +890,7 @@ fn window_rows(steps: &Steps, from: usize) -> Vec<u32> {
 }
 
 #[test]
-fn late_steps_do_not_price_a_window_out() {
+fn a_late_step_does_not_price_a_window_out() {
     // The device of `launches`, on a machine that now and then does something
     // else: the next `late` steps take a hundred times what they cost.
     let late = Arc::new(std::sync::atomic::AtomicU32::new(0));
@@ -912,10 +912,10 @@ fn late_steps_do_not_price_a_window_out() {
     alone(&rt, "a long and easy text", Some(200));
     let settled = steps.lock().unwrap().len();
     assert_eq!(window_rows(&steps, settled - 10)[..8], [8; 8]);
-    // Three steps of eight rows in a row take 300 ms where they cost 3: the
-    // price of eight rows is the second smallest of its last five steps, so
-    // it has not moved, and every window after them is eight rows as before.
-    late.store(3, Ordering::Relaxed);
+    // A step of eight rows takes 300 ms where it costs 3: the price of eight
+    // rows is the mean of its last eight steps without the largest, so it
+    // has not moved, and every window after it is eight rows as before.
+    late.store(1, Ordering::Relaxed);
     alone(&rt, "another long and easy text", Some(200));
     assert_eq!(late.load(Ordering::Relaxed), 0);
     let after = window_rows(&steps, settled);

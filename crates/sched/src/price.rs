@@ -12,11 +12,15 @@
 //! The table is kept true by the steps that run, and it is built so that no
 //! size can be priced out for good ([`Curve`]):
 //!
-//! - **A size's price is the second smallest of its last five measurements**
-//!   (the smallest of up to three). Other work on the machine only ever adds
-//!   to a step, so one late step, or three in five, moves nothing; a size
-//!   that really got slower is followed after four steps, one that got faster
-//!   after two.
+//! - **A size's price is the mean of its last eight measurements without the
+//!   largest** (the smallest of up to three). Other work on the machine only
+//!   ever adds to a step, so one late step in eight moves nothing. It is a
+//!   mean and not a median because some of what a step takes belongs to it
+//!   and comes unevenly: a model that fetches experts has steps that miss
+//!   some and take several times as long, more often the more rows they
+//!   carry, and the tokens per millisecond of a size are its tokens over its
+//!   mean time. A size that changed is followed as its measurements are
+//!   replaced, wholly after eight.
 //! - **A size that has not run for [`OLD`] measurements of the table is old.**
 //!   What it cost then says little about now (tiers that warmed up, a machine
 //!   that was busy), so its price is held between the prices of the nearest
@@ -29,11 +33,11 @@
 //!   the price. It is tried once more, so that one late step among the two
 //!   does not waste the turn.
 //!
-//! Together: a price that is too high because of late steps needs four of
-//! them in five; a price that is too high for any reason (a first measurement
-//! on cold tiers, a busy stretch) is tried again after [`OLD`] measurements
-//! and corrected by one step; and trying costs at most two steps per size and
-//! [`OLD`] steps, which also bring the tokens their rows verify.
+//! Together: one late step does nothing; a price that is too high for any
+//! reason (two late steps close together, a first measurement on cold tiers,
+//! a busy stretch) is tried again after [`OLD`] measurements and corrected by
+//! one step; and trying costs at most two steps per size and [`OLD`] steps,
+//! which also bring the tokens their rows verify.
 //!
 //! Between two measured row counts the price is interpolated, below the
 //! smallest it is the smallest, above the largest it goes on with the slope of
@@ -48,7 +52,7 @@ use std::collections::BTreeMap;
 use crate::timing::{Load, StepTimeModel};
 
 /// How many measurements of a count are kept.
-const KEPT: usize = 5;
+const KEPT: usize = 8;
 
 /// After this many measurements of a curve without one of its own, a count's
 /// price is old: held between its neighbours', and tried again by whoever
@@ -88,13 +92,18 @@ impl Point {
         self.len += 1;
     }
 
-    /// The second smallest of the measurements kept, the smallest of up to
-    /// three.
+    /// The mean of the measurements kept without the largest, the smallest
+    /// of up to three.
     fn price(&self) -> f64 {
-        let mut sorted = self.samples;
-        let sorted = &mut sorted[..self.len];
-        sorted.sort_by(f64::total_cmp);
-        sorted[usize::from(self.len > 3)]
+        let samples = &self.samples[..self.len];
+        let (smallest, largest) = samples
+            .iter()
+            .fold((f64::INFINITY, 0.0f64), |(low, high), ms| (low.min(*ms), high.max(*ms)));
+        if self.len > 3 {
+            (samples.iter().sum::<f64>() - largest) / (self.len - 1) as f64
+        } else {
+            smallest
+        }
     }
 }
 
@@ -390,35 +399,38 @@ mod tests {
     }
 
     #[test]
-    fn late_steps_do_not_move_a_price_and_a_real_change_is_followed() {
+    fn a_late_step_does_not_move_a_price_and_a_real_change_is_followed() {
         let mut curve = Curve::new();
         curve.set(4, 25.0);
         for _ in 0..8 {
             curve.observe(4, 25.0);
         }
         // One step in which the machine did something else, a hundred times
-        // too long: nothing moves. Nor with a second and a third in five.
+        // too long: nothing moves, for as long as it is among the last eight.
         curve.observe(4, 2500.0);
-        assert_eq!(curve.ms(4), Some(25.0));
-        curve.observe(4, 25.0);
-        curve.observe(4, 900.0);
-        curve.observe(4, 700.0);
-        assert_eq!(curve.ms(4), Some(25.0));
-        for _ in 0..5 {
+        for _ in 0..7 {
+            assert_eq!(curve.ms(4), Some(25.0));
             curve.observe(4, 25.0);
         }
-        // Steps that take 30 ms from now on are the price after four of them.
-        for _ in 0..3 {
-            curve.observe(4, 30.0);
+        // Two of them close together do move it, by the smaller one's share
+        // of seven steps, until they are eight steps back.
+        curve.observe(4, 900.0);
+        curve.observe(4, 725.0);
+        assert_eq!(curve.ms(4), Some(125.0));
+        for _ in 0..7 {
+            curve.observe(4, 25.0);
         }
-        assert_eq!(curve.ms(4), Some(25.0), "three do not say yet");
-        curve.observe(4, 30.0);
-        assert_eq!(curve.ms(4), Some(30.0));
-        // And steps that got faster after two.
-        curve.observe(4, 20.0);
-        assert_eq!(curve.ms(4), Some(30.0));
-        curve.observe(4, 20.0);
-        assert_eq!(curve.ms(4), Some(20.0));
+        assert_eq!(curve.ms(4), Some(25.0));
+        // Steps that take 32 ms from now on move the price with each of them
+        // and are the price after eight.
+        curve.observe(4, 32.0);
+        assert_eq!(curve.ms(4), Some(25.0));
+        curve.observe(4, 32.0);
+        assert_eq!(curve.ms(4), Some(26.0));
+        for _ in 0..6 {
+            curve.observe(4, 32.0);
+        }
+        assert_eq!(curve.ms(4), Some(32.0));
     }
 
     #[test]
@@ -488,7 +500,7 @@ mod tests {
         for _ in 0..4 {
             curve.observe(4, 2900.0);
         }
-        assert_eq!(curve.ms(4), Some(2900.0));
+        assert!(curve.ms(4).unwrap() > 2000.0);
         // Whoever chooses takes four rows when they cost less than 40 ms, and
         // one row otherwise. The steps cost what they really cost.
         let mut chosen_at = None;
@@ -512,14 +524,14 @@ mod tests {
             table.measured(rows, 30.0 + f64::from(rows));
         }
         let truth = |load: Load| 30.0 + load.rows as f64 + 4e-6 * load.cells as f64;
-        // Steps at several depths, and every seventh is late by 250 ms.
+        // Steps at several depths, and every eleventh is late by 250 ms.
         let mut step = 0;
         for _ in 0..12 {
             for context in [0u64, 10_000, 50_000, 120_000, 200_000] {
                 for rows in [1u32, 8] {
                     let load = Load::chunk(context, rows);
                     step += 1;
-                    table.observe(load, truth(load) + if step % 7 == 0 { 250.0 } else { 0.0 });
+                    table.observe(load, truth(load) + if step % 11 == 0 { 250.0 } else { 0.0 });
                 }
             }
         }
