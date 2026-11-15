@@ -3136,6 +3136,23 @@ lookup in earlier text takes part as soon as a model drafter does and never alon
   this model routes to experts of its own, so a rejected draft costs what a token
   costs.
 
+*Drafts change no token.* On made-up models, in every placement, a sequence
+writes with the block what it writes without, token for token: greedy, with
+drafts of the lookup that are accepted, with `"draft": false`, and sampled with
+a seed (`tests/qwen4exp_runtime.rs`); the block's chains are the CPU reference's
+from the same cells (first links 33 of 33, 18 of 18 and 32 of 34 in one run of
+the three placements). Two sequences that share their steps part from what each
+writes alone at a near tie, with the block and without it (the reference has the
+two tokens 0.003 apart at a spread of 1.5): what a row's sums are depends on the
+shape of its step, drafts or not. On the real file the comparison is made with
+every miss uploaded and none computed by the CPU, whose arithmetic is not the
+device's: 64 greedy tokens and 48 sampled with a seed were the same with and
+without the block on both cards (2026-11-15; 110 drafts verified, 73 accepted,
+the links 29 of 32, 18 of 29 and 12 of 18). With the CPU serving misses, as the
+server runs, two runs of the same request differ at near ties without any draft,
+so nothing can be said there beyond the first sentence of an answer, which the
+server's test pins.
+
 *Measured* (2026-11-15, RTX 4070 and RTX 3060, `--ram 10G`, `--chat-var
 enable_thinking=false`, greedy, 128 tokens after prompts of about 1000 tokens of
 German prose, English prose and Rust; the machine was shared with three other
@@ -3150,12 +3167,16 @@ measurement of two engines):
 | Both cards on every layer, the block, prices learned from the steps that run, windows of 8 rows (load 11 to 18) | 10.7 / 24.4 / 17.2 | 63.7 / 28.9 / 50.7 |
 | A range of layers each, the block, prices measured at the start, windows of 4 rows (load 6 to 8) | 23.7 / 30.8 / 27.8 | 39.9 / 37.6 / 47.6 |
 | A range of layers each, no drafter (load 28 to 33) | 15.4 / 22.6 / 8.8 | 19.9 / 25.7 / 10.4 |
+| One card (RTX 4070), the block, prices measured at the start, windows of 4 rows (load 16 to 22) | 11.4 / 13.5 / 5.9 | 4.1 / 15.8 / 9.6 |
 
 In the fourth row the conductor did choose windows (its measured prices came out
 lower on a quieter machine): 255 links in 87 steps, the links accepted 59 times of
 87, 36 of 59 and 21 of 36, 5.4 ms a link on the RTX 3060 (15.7 ms for the chain of
 a step that drafts), 535 to 1080 picks a step where a step of one row has 480, and
-21 to 166 of them outside a slot. The second time a text is asked the lookup has
+21 to 166 of them outside a slot. On one card, which holds a third of the experts
+in VRAM and reads the rest from RAM and the file, windows were chosen as well: 326
+links in 182 steps, accepted 117 times of 181, 50 of 82 and 3 of 5, 6.1 to 6.9 ms
+a link. The second time a text is asked the lookup has
 it, which is where the 63.7 and the 47.6 come from (37 and 15 steps for 128
 tokens). The block takes 175 MiB of dense weights, 21 to 49 MiB of keys and values
 and 35 to 48 MiB of buffers on its card. No pair of runs with and
