@@ -89,13 +89,19 @@ with it; the runs are too noisy to tell the two apart.
       F32 matrices of an IQ4_XS file were exact before: decide with a KL measurement.
 - [ ] VRAM and quality against the fork at equal settings: never measured.
 - [ ] Prompt on the RTX 3060 alone is 3 % behind the fork.
-- [ ] DFlash2 with draft trees (study in `/var/tmp/ares-dflash-study/REPORT.md`).
 - [ ] The model's own drafts for the thinking rows of a request that has to call a tool;
       drafts while a rule is bound.
 - [ ] Sampler: a row with no finite logit reports `-0.0` where the reference says minus
       infinity; deciding a level got slower (35 to 42 us); a list of the set's tokens after
       the first cut; on two cards most of the sampler's time on the RTX 3060 is the exchange.
 - [ ] F32 tile kernel is 2.5 times slower than BF16 (untuned).
+
+## Drafters (every model)
+- [ ] DFlash2 with draft trees, as a kind of drafter the runtime knows, for every model that
+      has a DFlash2 drafter file (dense and MoE alike), not as a feature of one model: the
+      drafter model on the device, a tree instead of a chain (fill, node allocation), tree
+      verification in the windows, the policy choosing among lookup, MTP and DFlash2 or all
+      of them. Study: `/var/tmp/ares-dflash-study/REPORT.md`.
 
 ## Prompt cache (every model; RAM first, then SSD, as in the owner's fork)
 - [ ] RAM level for the K/V state that leaves VRAM; write to SSD when the RAM level evicts
