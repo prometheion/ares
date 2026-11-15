@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use ares_core::Ledger;
 use ares_cuda::{Device, ExpertShape, MAX_BATCH, RouteGroup, RouteRecord};
 use ares_gguf::Gguf;
-use ares_io::{ExpertMap, Reader};
+use ares_io::{ExpertMap, ExpertSpan, FileId, Reader};
 use ares_runtime::expert_store::cpu::{CpuPool, Placement as CpuPlacement, Topology};
 use ares_runtime::expert_store::{
     CudaSlots, ExpertStore, HostRegion, LayerSpec, Serve, StoreConfig, StorePlan,
@@ -27,17 +27,24 @@ use super::part::ExpertAt;
 use super::placement::Placement;
 use super::session::Fill;
 use crate::qwen4exp::Config;
-use crate::qwen4exp::weights::Weights;
+use crate::qwen4exp::weights::{DraftWeights, Moe, Weights};
 
 fn invalid(message: impl Into<String>) -> Error {
     Error::Invalid(message.into())
 }
 
 /// Where the experts' tensors are in the file, for a store with `per_layer`
-/// entries for each layer of the model.
-pub(super) fn expert_map(gguf: &Gguf, c: &Config, per_layer: usize) -> Result<ExpertMap, Error> {
+/// entries for each layer of the model. With `draft`, the experts of the
+/// model's draft block are the store's layer 0, in a file of their own that
+/// the reader opens behind the model's parts ([`reader`]).
+pub(super) fn expert_map(
+    gguf: &Gguf,
+    c: &Config,
+    per_layer: usize,
+    draft: Option<&DraftLayer<'_>>,
+) -> Result<ExpertMap, Error> {
     let patterns = ["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"];
-    Ok(if per_layer > 1 {
+    let mut map = if per_layer > 1 {
         let names: Vec<Vec<String>> = (0..c.n_layer * per_layer)
             .map(|at| {
                 patterns.iter().map(|p| format!("blk.{}.{p}.weight", at / per_layer)).collect()
@@ -46,7 +53,44 @@ pub(super) fn expert_map(gguf: &Gguf, c: &Config, per_layer: usize) -> Result<Ex
         ExpertMap::new(gguf, &names)?
     } else {
         ExpertMap::discover(gguf, &patterns)?
-    })
+    };
+    if let Some(draft) = draft {
+        let places = draft
+            .weights
+            .expert_places(draft.gguf)
+            .ok_or_else(|| invalid("the draft block's experts are not in its file"))?;
+        let spans = places.map(|p| ExpertSpan {
+            file: FileId(gguf.n_parts() as u16 + p.part),
+            base: p.base,
+            stride: p.stride,
+            len: p.len,
+        });
+        map.insert_first(c.experts.count, &spans);
+    }
+    Ok(map)
+}
+
+/// The reader of the model's parts and, behind them, of the parts of the
+/// file of its draft block.
+pub(super) fn reader(gguf: &Gguf, draft: Option<&Gguf>) -> Result<Reader, Error> {
+    let config = ares_io::Config::default();
+    let Some(draft) = draft else {
+        return Ok(Reader::open_gguf(gguf, config)?);
+    };
+    let paths: Vec<&std::path::Path> = (0..gguf.n_parts())
+        .map(|part| gguf.path(part as u16))
+        .chain((0..draft.n_parts()).map(|part| draft.path(part as u16)))
+        .collect();
+    Ok(Reader::open(&paths, config)?)
+}
+
+/// The draft block of a model as the store sees it.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct DraftLayer<'a> {
+    pub gguf: &'a Gguf,
+    pub weights: &'a DraftWeights<'a>,
+    /// The device that runs the block: the one with the output head.
+    pub device: usize,
 }
 
 /// How the experts of a model are laid out for the store: where each layer's
@@ -63,6 +107,12 @@ pub(super) struct Layout {
     /// The bytes of the experts a device would hold if it held its share of
     /// them all.
     pub expert_bytes: u64,
+    /// The store's layers in front of the model's: 1 with a draft block, whose
+    /// experts are layer 0 (a step routes it before any layer of the model),
+    /// 0 without.
+    pub base: usize,
+    /// The device of the draft block and the bytes of all its experts.
+    pub draft: Option<(usize, u64)>,
 }
 
 impl Layout {
@@ -73,57 +123,83 @@ impl Layout {
         c: &Config,
         w: &Weights<'_>,
         placement: &Placement,
+        draft: Option<&DraftLayer<'_>>,
     ) -> Result<(Self, ExpertMap), Error> {
         let per_layer = if placement.tensor.is_some() { placement.devices.len() } else { 1 };
         let store_layers = c.n_layer * per_layer;
-        let map = expert_map(gguf, c, per_layer)?;
-        let mut specs = Vec::with_capacity(store_layers);
-        let mut shapes = Vec::with_capacity(store_layers);
+        let map = expert_map(gguf, c, per_layer, draft)?;
+        let base = usize::from(draft.is_some());
+        let mut specs = Vec::with_capacity(base + store_layers);
+        let mut shapes = Vec::with_capacity(base + store_layers);
         let mut expert_bytes = 0u64;
-        for at in 0..store_layers {
-            let layer = at / per_layer;
-            let moe = &w.layers[layer].moe;
-            let shape = ExpertShape {
-                n_embd: c.n_embd as u32,
-                n_ff: c.experts.ff as u32,
-                n_experts: c.experts.count as u32,
-                top_k: c.experts.used as u32,
-                gate_ty: moe.gate.ty(),
-                down_ty: moe.down.ty(),
-            };
-            let geometry = || invalid(format!("layer {layer}: the experts do not fit a slot"));
-            let slot_bytes = shape.slot_bytes().ok_or_else(geometry)?;
-            specs.push(LayerSpec {
-                device: if per_layer > 1 {
-                    at % per_layer
-                } else {
-                    placement
-                        .device_of(layer)
-                        .ok_or_else(|| invalid(format!("layer {layer} is on no device")))?
-                },
+        let shape_of = |moe: &Moe<'_>| ExpertShape {
+            n_embd: c.n_embd as u32,
+            n_ff: c.experts.ff as u32,
+            n_experts: c.experts.count as u32,
+            top_k: c.experts.used as u32,
+            gate_ty: moe.gate.ty(),
+            down_ty: moe.down.ty(),
+        };
+        let spec_of = |shape: &ExpertShape, device: usize, what: &str| {
+            let geometry = || invalid(format!("{what}: the experts do not fit a slot"));
+            Ok::<_, Error>(LayerSpec {
+                device,
                 offsets: [
                     0,
                     shape.up_offset().ok_or_else(geometry)?,
                     shape.down_offset().ok_or_else(geometry)?,
                 ],
-                slot_bytes,
-            });
-            expert_bytes += slot_bytes * c.experts.count as u64 / per_layer as u64;
+                slot_bytes: shape.slot_bytes().ok_or_else(geometry)?,
+            })
+        };
+        let mut draft_bytes = None;
+        if let Some(draft) = draft {
+            let shape = shape_of(&draft.weights.layer.moe);
+            let spec = spec_of(&shape, draft.device, "the draft block")?;
+            draft_bytes = Some((draft.device, spec.slot_bytes * c.experts.count as u64));
+            specs.push(spec);
             shapes.push(shape);
         }
-        Ok((Self { specs, shapes, per_layer, expert_bytes }, map))
+        for at in 0..store_layers {
+            let layer = at / per_layer;
+            let shape = shape_of(&w.layers[layer].moe);
+            let device = if per_layer > 1 {
+                at % per_layer
+            } else {
+                placement
+                    .device_of(layer)
+                    .ok_or_else(|| invalid(format!("layer {layer} is on no device")))?
+            };
+            let spec = spec_of(&shape, device, &format!("layer {layer}"))?;
+            expert_bytes += spec.slot_bytes * c.experts.count as u64 / per_layer as u64;
+            specs.push(spec);
+            shapes.push(shape);
+        }
+        Ok((Self { specs, shapes, per_layer, expert_bytes, base, draft: draft_bytes }, map))
+    }
+
+    /// The bytes of the draft block's experts on `device`: all of them on the
+    /// device that runs the block, none elsewhere.
+    pub(super) fn draft_bytes(&self, device: usize) -> u64 {
+        self.draft.filter(|(on, _)| *on == device).map_or(0, |(_, bytes)| bytes)
     }
 
     /// The most bytes a tier in host memory can use: one slot per expert that
     /// has none in VRAM is all it ever holds, and a slot is the expert and a
     /// few blocks of the file.
     pub(super) fn ram_wanted(&self, vram_bytes: u64) -> u64 {
-        (self.expert_bytes + (self.expert_bytes >> 4)).saturating_sub(vram_bytes).max(64 << 20)
+        let all = self.expert_bytes + self.draft.map_or(0, |(_, bytes)| bytes);
+        (all + (all >> 4)).saturating_sub(vram_bytes).max(64 << 20)
     }
 
     /// The store layer of layer `layer` on device `part`.
     pub(super) fn store_layer(&self, part: usize, layer: usize) -> usize {
-        if self.per_layer > 1 { layer * self.per_layer + part } else { layer }
+        self.base + if self.per_layer > 1 { layer * self.per_layer + part } else { layer }
+    }
+
+    /// The store's layers of the model, without the draft block's.
+    pub(super) fn model_layers(&self) -> std::ops::Range<usize> {
+        self.base..self.specs.len()
     }
 }
 
@@ -274,6 +350,18 @@ pub(super) struct Feed {
     ahead_seen: (u64, f64),
     /// Whether the reads of the layers ahead are started on a guess.
     read_ahead: bool,
+    /// The route records of the model's draft block, whose experts are layer
+    /// 0 of the store.
+    draft: Option<DraftRecords>,
+}
+
+/// The route records of a draft block. Its steps run one after the other
+/// inside a step of the model, each with a record of its own in the same
+/// place of the block's board.
+struct DraftRecords {
+    board: Arc<Board>,
+    /// The rows of the block's step whose record the store has not seen yet.
+    waiting: Option<u32>,
 }
 
 impl Feed {
@@ -299,7 +387,27 @@ impl Feed {
             rows: 0,
             groups: Vec::new(),
             wide: WideStats::default(),
+            draft: None,
         }
+    }
+
+    /// The board of the model's draft block: its records are those of layer 0
+    /// of the store.
+    pub(super) fn set_draft(&mut self, board: Arc<Board>) {
+        self.draft = Some(DraftRecords { board, waiting: None });
+    }
+
+    /// A step of the draft block with `rows` rows was enqueued: its route
+    /// record is on its way to the block's board.
+    pub(super) fn draft_routed(&mut self, rows: u32) {
+        if let Some(draft) = &mut self.draft {
+            draft.waiting = Some(rows);
+        }
+    }
+
+    /// Whether the store has the route record of the draft block's last step.
+    pub(super) fn draft_followed(&self) -> bool {
+        self.draft.as_ref().is_none_or(|draft| draft.waiting.is_none())
     }
 
     /// Sets whether wide steps read ahead on a guess (they do not unless told to).
@@ -400,6 +508,13 @@ impl Feed {
         self.store.take_stats();
         let before = self.store.reader().stats();
         let shared = self.layout.per_layer > 1;
+        if self.draft.is_some() {
+            // The draft block is asked as the layer behind the model's last.
+            let mut order = experts_of(n_layer);
+            let (vram, ram) = self.store.slots(0);
+            order.truncate((vram + ram).min(n_experts));
+            self.store.fill(0, &order)?;
+        }
         for layer in 0..n_layer {
             let wanted = experts_of(layer);
             for part in 0..self.layout.per_layer {
@@ -455,6 +570,23 @@ impl Feed {
     /// the order of its layers, of the first `enqueued[part]` layers, and lets
     /// the store work. Never waits.
     pub(super) fn pump(&mut self, enqueued: &[usize]) -> Result<(), Error> {
+        if let Some(draft) = &mut self.draft
+            && let Some(rows) = draft.waiting
+            && draft.board.arrived(0)?
+        {
+            let record = RouteRecord::parse(draft.board.record(0), self.used, rows)
+                .ok_or_else(|| invalid("a route record of the draft block that is none"))?;
+            self.groups.clear();
+            self.groups.extend(record.groups());
+            self.store.routed_rows(
+                0,
+                record.token(),
+                rows as usize,
+                &self.groups,
+                draft.board.rows(0, rows as usize),
+            )?;
+            draft.waiting = None;
+        }
         if self.rows > MAX_BATCH {
             // The layers of a wide step are followed by `Misses`.
             self.store.poll()?;

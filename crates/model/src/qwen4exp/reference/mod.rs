@@ -37,6 +37,7 @@ mod blocks;
 mod draft;
 mod ops;
 
+pub(crate) use draft::block_config;
 pub use draft::{DraftState, DraftWindow};
 
 /// The operations of the reference that GPU kernels are held to one by one.

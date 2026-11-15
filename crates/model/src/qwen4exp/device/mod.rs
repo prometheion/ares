@@ -9,6 +9,8 @@
 //!   recurrent state of every sequence slot, the K/V and key pools of its
 //!   attention layers, the scratch of a step, and [`Part::enqueue`], which
 //!   queues the kernels of a step and does not wait.
+//! - `draft.rs` runs the model's draft block next to the part that holds the
+//!   output head, for a model the runtime drives ([`Qwen4Exp::with_draft`]).
 //! - [`Session`] drives a whole model, on one device or several, from one
 //!   host thread: it fetches the n-gram rows, hands the residual from device
 //!   to device, follows the route records and lets the expert store bring
@@ -18,6 +20,7 @@
 //! here is measured against (`tests/qwen4exp_device.rs`).
 
 mod board;
+mod draft;
 mod feed;
 mod load;
 mod misses;
@@ -28,6 +31,7 @@ mod runtime;
 mod session;
 
 pub use board::Board;
+pub use draft::{DraftReport, DraftTimes, Drafted};
 pub use load::{LayerShare, Role};
 pub use misses::WideStats;
 pub use part::{

@@ -42,6 +42,14 @@ pub enum Error {
         /// Which relation between the values does not hold.
         what: String,
     },
+    /// A file that was named as the model's draft block is something else.
+    #[error("general.architecture is {found}; the file of this model's draft block has {expected}")]
+    NotADraftBlock {
+        /// The architecture the file names.
+        found: String,
+        /// The architecture of a draft block's file.
+        expected: &'static str,
+    },
     /// A tensor the configuration needs is not in the file.
     #[error("tensor '{name}' is missing")]
     MissingTensor {

@@ -675,12 +675,3 @@ impl DeviceWeights {
         })
     }
 }
-
-/// Bytes of the dense weights of a draft block in an arena.
-pub(crate) fn block_bytes(c: &Config, w: &DraftWeights<'_>) -> Result<u64, ModelError> {
-    let mut layout = Layout::default();
-    layout.layer(c, 0, &w.layer, Role::Whole, &LayerShare::whole(c, 0))?;
-    layout.mixer("output_hc", &w.output_mixer)?;
-    layout.draft_in(w);
-    Ok(layout.len)
-}

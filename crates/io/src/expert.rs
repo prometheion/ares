@@ -27,8 +27,24 @@ struct Stacked {
     file: FileId,
     /// File offset of expert 0.
     base: u64,
-    /// Bytes of one expert in this tensor.
+    /// Bytes from one expert to the next in this tensor.
     stride: usize,
+    /// Bytes of one expert's range: the stride, unless the tensor holds
+    /// something else of every expert as well ([`ExpertSpan`]).
+    len: usize,
+}
+
+/// A matrix of every expert of a layer, given by where it is in a file rather
+/// than by a tensor of the model: expert `e` has `len` bytes at
+/// `base + e * stride`. For a file that keeps two matrices of an expert in one
+/// tensor, and for experts in a file of their own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExpertSpan {
+    /// The file, as the reader that serves the map numbers it.
+    pub file: FileId,
+    pub base: u64,
+    pub stride: usize,
+    pub len: usize,
 }
 
 #[derive(Debug)]
@@ -135,6 +151,17 @@ impl ExpertMap {
         Ok(Self { layers })
     }
 
+    /// Puts a layer in front of the others: it becomes layer 0 and every other
+    /// layer's number grows by one. The layer has `n_experts` experts whose
+    /// matrices are `spans`, in the order [`ExpertMap::ranges`] yields them.
+    pub fn insert_first(&mut self, n_experts: usize, spans: &[ExpertSpan]) {
+        let tensors = spans
+            .iter()
+            .map(|s| Stacked { file: s.file, base: s.base, stride: s.stride, len: s.len })
+            .collect();
+        self.layers.insert(0, Some(LayerExperts { n_experts, tensors }));
+    }
+
     /// One more than the number of the last layer with experts.
     pub fn n_layers(&self) -> usize {
         self.layers.len()
@@ -154,7 +181,7 @@ impl ExpertMap {
     /// every expert of the layer.
     pub fn expert_bytes(&self, layer: usize) -> Option<u64> {
         let layer = self.layers.get(layer)?.as_ref()?;
-        Some(layer.tensors.iter().map(|t| t.stride as u64).sum())
+        Some(layer.tensors.iter().map(|t| t.len as u64).sum())
     }
 
     /// The ranges to read for expert `expert` of `layer`, one per tensor, in
@@ -172,7 +199,7 @@ impl ExpertMap {
         Some(layer.tensors.iter().map(move |t| ExpertRange {
             file: t.file,
             offset: t.base + (expert * t.stride) as u64,
-            len: t.stride,
+            len: t.len,
         }))
     }
 }
@@ -212,7 +239,7 @@ fn layer_of(layer: usize, infos: &[&TensorInfo]) -> Result<LayerExperts, LayoutE
                 return Err(indivisible());
             }
             let stride = usize::try_from(info.size / experts).map_err(|_| indivisible())?;
-            Ok(Stacked { file: FileId(info.part), base: info.offset, stride })
+            Ok(Stacked { file: FileId(info.part), base: info.offset, stride, len: stride })
         })
         .collect::<Result<Vec<_>, _>>()?;
     Ok(LayerExperts { n_experts: n_experts as usize, tensors })
@@ -221,6 +248,32 @@ fn layer_of(layer: usize, infos: &[&TensorInfo]) -> Result<LayerExperts, LayoutE
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_layer_put_in_front_is_layer_0_and_reads_the_ranges_it_was_given() {
+        let mut map = ExpertMap { layers: vec![None] };
+        // Two matrices in one tensor of 100 bytes an expert, and one of 40.
+        map.insert_first(
+            3,
+            &[
+                ExpertSpan { file: FileId(2), base: 1000, stride: 100, len: 60 },
+                ExpertSpan { file: FileId(2), base: 1060, stride: 100, len: 40 },
+                ExpertSpan { file: FileId(2), base: 5000, stride: 40, len: 40 },
+            ],
+        );
+        assert_eq!((map.n_layers(), map.n_experts(0), map.n_experts(1)), (2, Some(3), None));
+        assert_eq!(map.expert_bytes(0), Some(140));
+        let ranges: Vec<ExpertRange> = map.ranges(0, 2).expect("an expert").collect();
+        assert_eq!(
+            ranges,
+            [
+                ExpertRange { file: FileId(2), offset: 1200, len: 60 },
+                ExpertRange { file: FileId(2), offset: 1260, len: 40 },
+                ExpertRange { file: FileId(2), offset: 5080, len: 40 },
+            ]
+        );
+        assert!(map.ranges(0, 3).is_none());
+    }
 
     #[test]
     fn block_numbers_come_from_the_name() {

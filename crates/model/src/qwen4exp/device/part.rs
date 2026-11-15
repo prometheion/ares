@@ -989,12 +989,13 @@ impl Part {
         let f = Frame::new(c, opts, &shape, device.info().multiprocessors)?;
         let w = DeviceWeights::load(device, ledger, c, weights, role, first, &shape.shares, head)?;
         let starts = first == 0 && role != Role::Worker;
-        Self::assemble(c, opts, index, role, head, f, w, device, ledger, starts)
+        Self::assemble(c, opts, index, role, head, f, w, device, ledger, starts, "qwen4exp")
     }
 
-    /// The part around its weights `w` and its frame `f`: reserves and
-    /// allocates state, pools' tables and scratch. `starts` says whether the
-    /// part starts the residual from the embeddings.
+    /// The part around its weights `w` and its frame `f`: reserves (under
+    /// names that start with `label`) and allocates state, pools' tables and
+    /// scratch. `starts` says whether the part starts the residual from the
+    /// embeddings.
     #[allow(clippy::too_many_arguments)]
     fn assemble(
         c: &Config,
@@ -1007,6 +1008,7 @@ impl Part {
         device: &Device,
         ledger: &mut Ledger,
         starts: bool,
+        label: &str,
     ) -> Result<Self, ModelError> {
         let mut mixer_types = Vec::new();
         let mixers = w.layers.iter().filter_map(|l| l.mixers).flat_map(|(a, b)| [a, b]);
@@ -1027,17 +1029,17 @@ impl Part {
             ));
         }
         let state_bytes = f.slot_bytes * u64::from(opts.max_slots);
-        ledger.reserve("qwen4exp recurrent state", state_bytes)?;
-        ledger.reserve("qwen4exp step scratch", f.s.len)?;
+        ledger.reserve(format!("{label} recurrent state"), state_bytes)?;
+        ledger.reserve(format!("{label} step scratch"), f.s.len)?;
         let records_bytes = (f.record_stride * w.layers.len() as u64).max(64);
-        ledger.reserve("qwen4exp route records", records_bytes)?;
+        ledger.reserve(format!("{label} route records"), records_bytes)?;
         let acts_bytes = (f.act_stride * w.layers.len() as u64).max(64);
-        ledger.reserve("qwen4exp expert inputs", acts_bytes)?;
-        ledger.reserve("qwen4exp step inputs", f.inbox.len)?;
+        ledger.reserve(format!("{label} expert inputs"), acts_bytes)?;
+        ledger.reserve(format!("{label} step inputs"), f.inbox.len)?;
         let tables_bytes = f.tables_bytes(opts);
-        ledger.reserve("qwen4exp page tables", tables_bytes)?;
+        ledger.reserve(format!("{label} page tables"), tables_bytes)?;
         let exchange = if f.x_bytes > 0 {
-            ledger.reserve("qwen4exp exchange", f.x_bytes)?;
+            ledger.reserve(format!("{label} exchange"), f.x_bytes)?;
             let buffer = DeviceBuffer::new(device, f.x_bytes)?;
             buffer.write(0, &vec![0u8; f.x_bytes as usize])?;
             Some(buffer)
@@ -1045,7 +1047,7 @@ impl Part {
             None
         };
         let owner = if f.owner_bytes > 0 {
-            ledger.reserve("qwen4exp expert owners", f.owner_bytes)?;
+            ledger.reserve(format!("{label} expert owners"), f.owner_bytes)?;
             let buffer = DeviceBuffer::new(device, f.owner_bytes)?;
             buffer.write(0, &vec![0u8; f.owner_bytes as usize])?;
             Some(buffer)
@@ -1053,7 +1055,7 @@ impl Part {
             None
         };
         if f.kept_bytes > 0 {
-            ledger.reserve("qwen4exp draft window inputs", f.kept_bytes)?;
+            ledger.reserve(format!("{label} draft window inputs"), f.kept_bytes)?;
         }
         let scratch = DeviceBuffer::new(device, f.s.len)?;
         let state = DeviceBuffer::new(device, state_bytes)?;

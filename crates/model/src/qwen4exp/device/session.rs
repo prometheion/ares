@@ -590,7 +590,7 @@ impl<'g> Session<'g> {
         // page-locked RAM, reads from the file.
         // When the devices share the layers, the store sees every layer once
         // per device: the experts of the layer that the device owns.
-        let (layout, map) = Layout::new(gguf, c, w, &placement)?;
+        let (layout, map) = Layout::new(gguf, c, w, &placement, None)?;
         let store_layers = c.n_layer * layout.per_layer;
         let reader = Reader::open_gguf(gguf, ares_io::Config::default())?;
         let vram: Vec<u64> = placement

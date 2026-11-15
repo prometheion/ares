@@ -32,20 +32,22 @@ use std::time::{Duration, Instant};
 
 use ares_api::{ChatFormat, EngineError, ExpertStats, ModelCard, Prompt};
 use ares_core::Ledger;
-use ares_cuda::{Device, ENTRY_CELLS, Event, MAX_BATCH, Segment, StepRecord, Stream};
+use ares_cuda::{Device, DevicePtr, ENTRY_CELLS, Event, MAX_BATCH, Segment, StepRecord, Stream};
 use ares_gguf::Gguf;
 use ares_io::Reader;
 use ares_runtime::expert_store::{CudaSlots, Serve, StoreConfig, StorePlan, StoreStats};
 use ares_runtime::{
-    ContextSpec, DeviceContext, DeviceModel, LinkSpec, Logits, Model, ModelError, Pick, Split,
-    StepContext,
+    ContextSpec, DeviceContext, DeviceModel, LinkSpec, Logits, Model, ModelError, OwnDrafts, Pick,
+    Split, StepContext,
 };
 use ares_state::PageLayout;
 use ares_tokenizer::{ChatOptions, Tokenizer};
 
 use super::board::Board;
+use super::draft::{Chain, DraftBlock, DraftReport, DraftTimes, Drafted, Watch};
 use super::feed::{
-    Feed, Layout, build_store, cpu_pool, device_slots, expert_map, places, plan_transit,
+    DraftLayer, Feed, Layout, build_store, cpu_pool, device_slots, expert_map, places,
+    plan_transit, reader,
 };
 use super::misses::{Misses, Progress, WideStats};
 use super::ngram::NgramFeed;
@@ -55,7 +57,7 @@ use super::part::{
 use super::placement::{MARGIN, PartPlan, Placement, ram_tier_bytes};
 use super::session::{Chosen, Fill, PartReport, SessionOptions, choose};
 use crate::chat;
-use crate::qwen4exp::weights::Weights;
+use crate::qwen4exp::weights::{DraftWeights, Weights};
 use crate::qwen4exp::{Config, Error as FileError};
 
 /// How many layers a device thread enqueues ahead of the last layer of its
@@ -210,6 +212,9 @@ struct Build {
     n_slots: Vec<usize>,
     slot_bytes: Vec<u64>,
     flow: Option<Arc<Flow>>,
+    /// The route records of the draft block, and where its experts are.
+    draft_board: Option<Arc<Board>>,
+    draft_place: Option<ExpertAt>,
 }
 
 /// The plan of the expert store and what it was made from.
@@ -223,9 +228,14 @@ struct PlanBox {
 
 /// The expert store, the rows of the n-gram table, and the counters that tell
 /// the threads how far each part's step has got.
-struct Flow {
+pub(super) struct Flow {
     feed: Mutex<Feed>,
     ngram: Mutex<NgramFeed>,
+    /// The tokens the draft block picked for the rows of a step, as (row,
+    /// token), and the step they are for: the device thread that holds the
+    /// block tells the others, which need them for the embeddings and the
+    /// rows of the n-gram table.
+    drafts: Mutex<(u64, Vec<(u32, u32)>)>,
     /// Per part: the layers of the running step that it has enqueued, and the
     /// layers whose route records the store has handled.
     enqueued: Vec<AtomicUsize>,
@@ -270,7 +280,7 @@ impl Flow {
         self.failed.store(true, Ordering::SeqCst);
     }
 
-    fn lock_feed(&self) -> MutexGuard<'_, Feed> {
+    pub(super) fn lock_feed(&self) -> MutexGuard<'_, Feed> {
         self.feed.lock().unwrap_or_else(|e| e.into_inner())
     }
 
@@ -302,7 +312,7 @@ impl Flow {
     /// Hands the route records that have arrived to the store and lets it and
     /// the reads of table rows work, if no other thread is doing that now.
     /// Never waits.
-    fn pump(&self) -> Result<(), ModelError> {
+    pub(super) fn pump(&self) -> Result<(), ModelError> {
         match self.feed.try_lock() {
             Ok(mut feed) => {
                 let enqueued = self.enqueued_layers();
@@ -342,7 +352,7 @@ impl Flow {
 
     /// An error when another part failed, or when the step has stood still
     /// since `started` for longer than a step may.
-    fn check(&self, started: Instant, what: &str) -> Result<(), ModelError> {
+    pub(super) fn check(&self, started: Instant, what: &str) -> Result<(), ModelError> {
         if self.failed.load(Ordering::Acquire) {
             return Err(ModelError::Aborted);
         }
@@ -402,6 +412,27 @@ impl Flow {
         }
     }
 
+    /// The draft block has made the drafts of step `step`.
+    fn publish(&self, step: u64, drafts: Vec<(u32, u32)>) {
+        *self.drafts.lock().unwrap_or_else(|e| e.into_inner()) = (step, drafts);
+    }
+
+    /// Waits for the drafts of step `step`, serving the store meanwhile.
+    fn await_drafts(&self, step: u64) -> Result<Vec<(u32, u32)>, ModelError> {
+        let started = Instant::now();
+        loop {
+            {
+                let drafts = self.drafts.lock().unwrap_or_else(|e| e.into_inner());
+                if drafts.0 == step {
+                    return Ok(drafts.1.clone());
+                }
+            }
+            self.check(started, "the draft block drafted on another device")?;
+            self.pump()?;
+            std::hint::spin_loop();
+        }
+    }
+
     /// A part has ended its step on the device: the last of them ends it for
     /// the store.
     fn finish(&self) -> Result<(), ModelError> {
@@ -416,7 +447,8 @@ impl Flow {
 
 /// The token embeddings, decoded on the host: the first part of the model
 /// starts the residual streams from them.
-struct Embedding {
+#[derive(Clone)]
+pub(super) struct Embedding {
     gguf: Arc<Gguf>,
     tensor: usize,
     ty: ares_core::GgmlType,
@@ -424,7 +456,7 @@ struct Embedding {
 }
 
 impl Embedding {
-    fn new(gguf: &Arc<Gguf>, w: &Weights<'_>) -> Result<Self, ModelError> {
+    pub(super) fn new(gguf: &Arc<Gguf>, w: &Weights<'_>) -> Result<Self, ModelError> {
         let name = "token_embd.weight";
         let tensor = gguf
             .tensors()
@@ -435,7 +467,7 @@ impl Embedding {
     }
 
     /// Decodes the embedding of `token` into `out`.
-    fn decode(&self, token: u32, out: &mut [f32]) -> Result<(), ModelError> {
+    pub(super) fn decode(&self, token: u32, out: &mut [f32]) -> Result<(), ModelError> {
         let data = self.gguf.data(&self.gguf.tensors()[self.tensor]);
         let size = data.len() / self.rows;
         let row = data
@@ -543,6 +575,10 @@ pub struct Qwen4Exp {
     pinned: u64,
     /// The bytes one page of the pools takes on each device.
     page_bytes: Vec<u64>,
+    /// The file of the model's draft block, when it drafts.
+    draft: Option<Arc<Gguf>>,
+    draft_report: Mutex<Option<DraftReport>>,
+    draft_watch: Arc<Mutex<Watch>>,
 }
 
 impl std::fmt::Debug for Qwen4Exp {
@@ -588,7 +624,7 @@ impl Qwen4Exp {
         opts.part.host_logits = false;
         let weights = Weights::load(&gguf, &config)?;
         let (placement, page_bytes) = place_in(&config, &weights, devices, &opts)?;
-        let (layout, _map) = Layout::new(&gguf, &config, &weights, &placement)?;
+        let (layout, _map) = Layout::new(&gguf, &config, &weights, &placement, None)?;
         let mut pinned = 0;
         for (index, device) in devices.iter().enumerate() {
             let PartPlan { role, first, shares, head } = placement.part(&config, index);
@@ -632,12 +668,77 @@ impl Qwen4Exp {
                 n_slots: vec![0; n],
                 slot_bytes: vec![0; n],
                 flow: None,
+                draft_board: None,
+                draft_place: None,
             }),
             flow: OnceLock::new(),
             reports: Mutex::new(Vec::new()),
             pinned,
             page_bytes,
+            draft: None,
+            draft_report: Mutex::new(None),
+            draft_watch: Arc::default(),
         })
+    }
+
+    /// Gives the model its draft block from `draft`, a file of the block as
+    /// Strata packs it ([`DraftWeights`]): windows then take the block's
+    /// drafts, as many rows as `opts.part.window_rows` allows. The block runs
+    /// on the device that holds the output head, in every placement, and its
+    /// routed experts go through the expert store with the model's. Before the
+    /// runtime opens the parts.
+    pub fn with_draft(mut self, draft: Gguf) -> Result<Self, OpenError> {
+        let choice = |why: &str| Err(OpenError::Choice(why.to_owned()));
+        if self.opts.part.window_rows < 2 {
+            return choice("a draft block needs windows of at least two rows");
+        }
+        if self.opts.part.window_rows > MAX_BATCH {
+            return choice(
+                "a step that verifies drafts runs the decode kernels, which take eight rows",
+            );
+        }
+        let (c, n) = (&self.config, self.placement.n_devices());
+        let head = DraftWeights::load(&draft, c)?;
+        let weights = Weights::load(&self.gguf, c)?;
+        let device = self.head_device();
+        let layer = DraftLayer { gguf: &draft, weights: &head, device };
+        let (layout, _map) = Layout::new(&self.gguf, c, &weights, &self.placement, Some(&layer))?;
+        // The block's host share and its staged rows and picks.
+        if self.opts.serve != Serve::Stream {
+            self.pinned += layout.shapes[0].host_share_bytes(MAX_BATCH);
+        }
+        self.pinned += u64::from(MAX_BATCH) * c.wide() as u64 * 4 + (64 << 10);
+        self.layout = layout;
+        debug_assert!(device < n);
+        drop((head, weights));
+        self.draft = Some(Arc::new(draft));
+        Ok(self)
+    }
+
+    /// The device part that holds the final mixer and the output head.
+    fn head_device(&self) -> usize {
+        (0..self.placement.n_devices())
+            .find(|d| self.placement.part(&self.config, *d).head)
+            .unwrap_or(0)
+    }
+
+    /// What the draft block took on its device, once the runtime has opened
+    /// the parts; `None` for a model without one.
+    pub fn draft_report(&self) -> Option<DraftReport> {
+        *self.draft_report.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// What the draft block's steps took and how its drafts fared since the
+    /// engine started.
+    pub fn draft_times(&self) -> DraftTimes {
+        self.draft_watch.lock().unwrap_or_else(|e| e.into_inner()).times
+    }
+
+    /// The newest chains the draft block made, oldest first (the last 1024),
+    /// and forgets them: for tests and measurements that compare its drafts
+    /// with the reference's.
+    pub fn take_drafted(&self) -> Vec<Drafted> {
+        self.draft_watch.lock().unwrap_or_else(|e| e.into_inner()).recent.drain(..).collect()
     }
 
     /// Renders chat prompts with `options`: whether the model thinks, and the
@@ -693,17 +794,24 @@ impl Qwen4Exp {
     pub fn expert_slots(&self) -> Option<(usize, usize, u64)> {
         let flow = self.flow.get()?;
         let feed = flow.lock_feed();
-        let layers = self.config.n_layer * self.layout.per_layer;
-        let (vram, ram) = (0..layers).fold((0, 0), |(v, r), at| {
+        let (vram, ram) = self.layout.model_layers().fold((0, 0), |(v, r), at| {
             let (vram, ram) = feed.store.slots(at);
             (v + vram, r + ram)
         });
         Some((vram, ram, flow.ram_bytes))
     }
 
+    /// The slots of the draft block's experts in VRAM and in the RAM tier;
+    /// `None` without a draft block or before the parts are open.
+    pub fn draft_slots(&self) -> Option<(usize, usize)> {
+        self.draft.as_ref()?;
+        Some(self.flow.get()?.lock_feed().store.slots(0))
+    }
+
     /// Brings the experts `experts_of(layer)` names for every layer into the
     /// tiers before anything is served, most wanted first, as far as the slots
-    /// go (a recorded routing, or every expert for a model that fits). Call it
+    /// go (a recorded routing, or every expert for a model that fits); the
+    /// draft block is asked for as the layer behind the model's last. Call it
     /// while no request runs; `None` before the parts are open.
     pub fn fill(
         &self,
@@ -758,11 +866,33 @@ impl Qwen4Exp {
         )?;
         let serve = self.opts.serve;
         let layout = &self.layout;
-        let tables = 4 * (c.n_layer * layout.per_layer) as u64 * c.experts.count as u64;
+        // The draft block, next to the part that holds the head: before the
+        // room for slots is counted.
+        let embedding = Embedding::new(&self.gguf, &weights)?;
+        let mut block = match (&self.draft, part.output()) {
+            (Some(draft), Some(output)) if index == self.head_device() => {
+                let head = DraftWeights::load(draft, c).map_err(|e| invalid(e.to_string()))?;
+                let block = DraftBlock::open(
+                    c,
+                    &head,
+                    o,
+                    index,
+                    output,
+                    embedding.clone(),
+                    self.draft_watch.clone(),
+                    cx.device,
+                    cx.ledger,
+                )?;
+                *self.draft_report.lock().unwrap_or_else(|e| e.into_inner()) = Some(block.report());
+                Some(block)
+            }
+            _ => None,
+        };
+        let tables = 4 * layout.specs.len() as u64 * c.experts.count as u64;
         let host_shares = if serve == Serve::Stream {
             0
         } else {
-            (c.n_layer * layout.per_layer) as u64
+            layout.specs.len() as u64
                 * layout.shapes[0].host_share_bytes(o.max_rows.min(MAX_BATCH)).next_multiple_of(16)
         };
         let room = cx.ledger.free().saturating_sub(MARGIN + tables + host_shares);
@@ -771,6 +901,7 @@ impl Qwen4Exp {
         // The room each device has left decides the slots of the store.
         let (ports, board) = (part.ports(), part.board());
         let cores: Vec<bool> = (0..layer_count).map(|i| part.has_core(i)).collect();
+        let draft_board = block.as_ref().map(DraftBlock::board);
         self.meeting.meet(
             n,
             |build| {
@@ -778,24 +909,37 @@ impl Qwen4Exp {
                 build.ports[index] = ports;
                 build.cores[index] = cores;
                 build.boards[index] = Some(board);
+                if draft_board.is_some() {
+                    build.draft_board = draft_board;
+                }
                 Ok(())
             },
             |build| {
                 let vram: Vec<u64> = (0..n)
                     .map(|d| {
-                        let own = if self.placement.tensor.is_some() {
-                            layout.expert_bytes
-                        } else {
-                            self.placement.devices[d].experts
-                        };
+                        let own = layout.draft_bytes(d)
+                            + if self.placement.tensor.is_some() {
+                                layout.expert_bytes
+                            } else {
+                                self.placement.devices[d].experts
+                            };
                         build.room[d]
                             .min(own + (own >> 6))
                             .min(self.opts.slot_bytes.unwrap_or(u64::MAX))
                     })
                     .collect();
-                let reader = Reader::open_gguf(&self.gguf, ares_io::Config::default())
+                let reader = reader(&self.gguf, self.draft.as_deref()).map_err(model_error)?;
+                let head = self
+                    .draft
+                    .as_ref()
+                    .map(|draft| DraftWeights::load(draft, c))
+                    .transpose()
                     .map_err(|e| invalid(e.to_string()))?;
-                let map = expert_map(&self.gguf, c, layout.per_layer).map_err(model_error)?;
+                let draft_layer = self.draft.as_ref().zip(head.as_ref()).map(|(gguf, weights)| {
+                    DraftLayer { gguf, weights, device: self.head_device() }
+                });
+                let map = expert_map(&self.gguf, c, layout.per_layer, draft_layer.as_ref())
+                    .map_err(model_error)?;
                 let ram_bytes = ram_tier_bytes(
                     Some(ram.obtainable_experts()),
                     layout.ram_wanted(vram.iter().sum()),
@@ -875,14 +1019,27 @@ impl Qwen4Exp {
                     .iter()
                     .map(|b| b.clone().ok_or_else(|| invalid("a part has no route records")))
                     .collect::<Result<Vec<_>, _>>()?;
+                if self.draft.is_some() {
+                    let (device, pool) = store.place(0);
+                    let slots = store.device(device);
+                    build.draft_place = Some(ExpertAt {
+                        table: slots.table(0),
+                        pool: slots.pool(pool).0,
+                        host: slots.host_share(0),
+                    });
+                }
                 let mut feed =
                     Feed::new(store, boards, firsts, layout.clone(), c.experts.used as u32);
                 feed.set_read_ahead(self.opts.read_ahead);
+                if let Some(board) = build.draft_board.clone() {
+                    feed.set_draft(board);
+                }
                 let ngram = NgramFeed::open(&self.gguf, c, self.opts.row_cache, o.max_slots)
                     .map_err(model_error)?;
                 let flow = Arc::new(Flow {
                     feed: Mutex::new(feed),
                     ngram: Mutex::new(ngram),
+                    drafts: Mutex::new((0, Vec::new())),
                     enqueued: (0..n).map(|_| AtomicUsize::new(0)).collect(),
                     followed: (0..n).map(|_| AtomicUsize::new(0)).collect(),
                     begun: AtomicU64::new(0),
@@ -907,6 +1064,11 @@ impl Qwen4Exp {
         let (places, flow, peer, n_slots, slot_bytes) = {
             let build = self.meeting.lock();
             let build = &build.value;
+            if let Some(block) = &mut block {
+                let at =
+                    build.draft_place.ok_or_else(|| invalid("the draft block has no slots"))?;
+                block.set_experts(at)?;
+            }
             let peer = self.placement.tensor.as_ref().map(|tensor| {
                 let other = 1 - index;
                 (build.ports[other], build.cores[other].clone(), tensor.mixer)
@@ -957,7 +1119,11 @@ impl Qwen4Exp {
             n_vocab: c.n_vocab as u32,
             wide: c.wide() as u32,
             per_step: 8 * (c.n_layer as u32 + 1),
-            embedding: first.then(|| Embedding::new(&self.gguf, &weights)).transpose()?,
+            embedding: first.then_some(embedding),
+            draft: block,
+            drafts: self.draft.is_some(),
+            residual: None,
+            chains: Vec::new(),
             drives_ngram: part.ngram_layer().is_some(),
             routing: Routing {
                 mixer: self.placement.tensor.as_ref().map(|t| t.mixer).filter(|m| *m != index),
@@ -1061,6 +1227,13 @@ impl Model for Qwen4Exp {
         self.opts.part.window_rows
     }
 
+    fn own_drafts(&self) -> u32 {
+        match self.draft {
+            Some(_) => self.opts.part.window_rows.saturating_sub(1),
+            None => 0,
+        }
+    }
+
     fn attention_span(&self) -> u32 {
         self.config.indexer.dense_limit() as u32
     }
@@ -1116,6 +1289,13 @@ struct Qwen4ExpDevice {
     /// The step that ended last: its segments as (slot, direct, rows, first
     /// row), and its wanted rows.
     shape: Vec<(u32, bool, u32, u32)>,
+    /// The model's draft block, on the part that holds the output head.
+    draft: Option<DraftBlock>,
+    /// Whether the model drafts (on this part or another).
+    drafts: bool,
+    /// Where the part left the residual of the rows of its last step.
+    residual: Option<DevicePtr>,
+    chains: Vec<Chain>,
 }
 
 impl std::fmt::Debug for Qwen4ExpDevice {
@@ -1186,18 +1366,42 @@ impl Qwen4ExpDevice {
             return Err(invalid("a step without rows"));
         }
         self.segments.clear();
+        self.chains.clear();
         for i in 0..record.segments() {
-            if record.own_drafts(i) {
-                return Err(invalid("the model drafts nothing itself"));
-            }
             if record.replay(i) {
                 return Err(invalid("the model has no prefix cache to replay from"));
             }
-            self.segments.push(record.segment(i));
+            let segment = record.segment(i);
+            if record.own_drafts(i) {
+                if !self.drafts {
+                    return Err(invalid("the model drafts nothing itself"));
+                }
+                if segment.n_rows >= 2 {
+                    // All rows of a window are wanted, so its sampler rows are
+                    // consecutive; `wanted` counts the wanted rows before it.
+                    let wanted: u32 = (0..record.runs())
+                        .map(|r| record.run(r))
+                        .map(|(first, count)| segment.row0.clamp(first, first + count) - first)
+                        .sum();
+                    self.chains.push(Chain {
+                        segment: i as usize,
+                        rows: (0..segment.n_rows - 1)
+                            .map(|j| record.sampler(wanted + j).for_draft())
+                            .collect(),
+                    });
+                }
+            }
+            self.segments.push(segment);
+        }
+        // The rows that take the block's drafts have no token yet.
+        let mut drafted = vec![false; rows as usize];
+        for chain in &self.chains {
+            let s = &self.segments[chain.segment];
+            drafted[(s.row0 + 1) as usize..(s.row0 + s.n_rows) as usize].fill(true);
         }
         self.tokens.clear();
         for row in 0..rows {
-            let token = record.row(row).token;
+            let token = if drafted[row as usize] { 0 } else { record.row(row).token };
             if token >= self.n_vocab {
                 return Err(invalid(format!("token {token} of a vocabulary of {}", self.n_vocab)));
             }
@@ -1208,6 +1412,13 @@ impl Qwen4ExpDevice {
             let (first, count) = record.run(run);
             self.out_rows.extend(first..first + count);
         }
+        // The step begins for the store: the draft block routes in it before
+        // any layer of the model. The number of the step marks its route
+        // records and its exchanges: a kernel waits for a flag that is behind
+        // the number, and the flags start at 0, so no step may be numbered 0
+        // (the conductor's first warm-up record is).
+        let number = u64::from(record.step()) + 1;
+        self.flow.begin(number, rows, self.index, stream)?;
 
         // The draft windows of the step before: how many rows count.
         if self.part.has_deferred() {
@@ -1225,6 +1436,18 @@ impl Qwen4ExpDevice {
             }
         }
 
+        // The draft block follows the rows of the last step that count, in
+        // the tables of that step.
+        if let (Some(block), Some(residual)) = (&mut self.draft, self.residual.take()) {
+            let outcome = |slot: u32, row0: u32| {
+                (0..record.commits())
+                    .map(|i| record.commit(i))
+                    .find(|c| c.slot == slot && c.row0 == row0)
+                    .map(|c| c.accepted)
+            };
+            block.follow(stream, &self.flow, &outcome, residual)?;
+        }
+
         // The page tables as the conductor made them.
         let mut taken = 0;
         for i in 0..record.updates() {
@@ -1233,7 +1456,30 @@ impl Qwen4ExpDevice {
                 let entries = (taken..taken + update.count).map(|k| record.entry(k));
                 self.part.update_table(stream, update.slot, update.first, entries)?;
             }
+            if let Some(block) = &mut self.draft {
+                let entries = (taken..taken + update.count).map(|k| record.entry(k));
+                block.update_table(stream, update.slot, update.first, entries)?;
+            }
             taken += update.count;
+        }
+
+        // The newest cell of every sequence in the draft block and the chains
+        // of the windows that take its drafts; the other device threads wait
+        // for the drafts, which are rows of this step.
+        if let Some(block) = &mut self.draft {
+            block.draft(stream, &self.flow, &self.segments, &mut self.tokens, &self.chains)?;
+            let drafts: Vec<(u32, u32)> = drafted
+                .iter()
+                .enumerate()
+                .filter(|(_, drafted)| **drafted)
+                .map(|(row, _)| (row as u32, self.tokens[row]))
+                .collect();
+            self.flow.publish(number, drafts);
+            block.keep(&self.segments, &self.tokens, &self.chains);
+        } else if !self.chains.is_empty() {
+            for (row, token) in self.flow.await_drafts(number)? {
+                self.tokens[row as usize] = token;
+            }
         }
 
         // The rows of the n-gram table, and where the sequences are now.
@@ -1273,14 +1519,8 @@ impl Qwen4ExpDevice {
         let (segments, x) = (&self.segments, &self.x);
 
         // The step: every layer, with the host serving the store behind it.
-        // The number of the step marks its route records and its exchanges: a
-        // kernel waits for a flag that is behind the number, and the flags
-        // start at 0, so no step may be numbered 0 (the conductor's first
-        // warm-up record is).
-        let number = u64::from(record.step()) + 1;
         let (token, xbase) =
             (number as u32, (number as u32).wrapping_mul(self.per_step).wrapping_add(1));
-        self.flow.begin(number, rows, self.index, stream)?;
         let inbound = if self.by_layers && self.index > 0 {
             Some(step.links.receive(self.index - 1, stream)?)
         } else {
@@ -1322,6 +1562,9 @@ impl Qwen4ExpDevice {
             self.flow.pump()?;
         }
         let n_out = self.part.end(&env!(fetched.as_deref(), None))?;
+        if self.draft.is_some() {
+            self.residual = Some(self.part.residual());
+        }
         if self.by_layers && self.index + 1 < self.devices {
             step.links.send(self.index, stream, self.part.residual(), rows * self.wide)?;
         }
@@ -1395,6 +1638,15 @@ impl DeviceModel for Qwen4ExpDevice {
             next.iter().map(|(slot, token)| (*slot, token.as_slice())).collect();
         // A failed read ahead costs nothing but the read of the step.
         let _ = self.flow.lock_ngram().expect(&next);
+    }
+
+    fn own_drafts(&self) -> Option<OwnDrafts> {
+        let (ptr, tokens) = self.draft.as_ref()?.drafted()?;
+        Some(OwnDrafts { ptr, tokens })
+    }
+
+    fn own_draft_ms(&mut self) -> f64 {
+        self.draft.as_ref().map_or(0.0, DraftBlock::chain_ms)
     }
 }
 

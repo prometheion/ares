@@ -13,11 +13,14 @@
 //! prefix of them is committed with [`Reference::draft_commit`].
 //!
 //! Where Strata and the fork differ (differences 8 to 10 of the
-//! specification): the residual is normed as one vector of `D` values and a
-//! cell is rotated to its own index, as Strata does; the cells a row reads are
-//! selected by the block's own indexer, as the fork does and as the trunk's
-//! attention layers do. Up to the dense limit that is every cell, which is
-//! what Strata reads at any length.
+//! specification): every stream of the residual is normed by itself, as the
+//! fork does and as the mixers norm the streams (Strata norms the `D` values
+//! as one vector unless told otherwise; on the real model the block guessed
+//! 63 of 80 tokens with a norm per stream and 58 with one norm, see
+//! `tests/qwen4exp_real.rs`); a cell is rotated to its own index, as Strata
+//! does; the cells a row reads are selected by the block's own indexer, as
+//! the fork does and as the trunk's attention layers do. Up to the dense
+//! limit that is every cell, which is what Strata reads at any length.
 
 use crate::qwen4exp::config::Config;
 use crate::qwen4exp::error::{Error, Result};
@@ -135,9 +138,9 @@ impl Reference<'_, '_> {
     /// the block's own of the link before) and `tokens` the paired tokens.
     ///
     /// ```text
-    /// e    = fc_embedding (rms(token_embd[token]) * norm_embedding)
-    /// hn   = rms(rt as one vector) * norm_hidden
-    /// R[c] = fc_hidden hn[c] + e
+    /// e     = fc_embedding (rms(token_embd[token]) * norm_embedding)
+    /// hn[c] = rms(rt[c]) * norm_hidden[c]
+    /// R[c]  = fc_hidden hn[c] + e
     /// ```
     ///
     /// # Panics
@@ -157,7 +160,7 @@ impl Reference<'_, '_> {
         let e = matmul(self.threads, &head.fc_embedding, &en, n);
         let mut hn = vec![0.0f32; n * wide];
         for (src, dst) in rt.chunks_exact(wide).zip(hn.chunks_exact_mut(wide)) {
-            pieces::rms_norm(src, &head.norm_hidden, c.rms_eps, dst);
+            pieces::stream_norm(src, &head.norm_hidden, n_embd, c.rms_eps, dst);
         }
         // Every stream is a row of the projection.
         let mut r = matmul(self.threads, &head.fc_hidden, &hn, n * c.n_stream);

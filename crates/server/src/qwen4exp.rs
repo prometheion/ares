@@ -16,20 +16,22 @@ use std::time::{Duration, Instant};
 use ares_api::{Engine, Event, EventSink, GenerateRequest, Prompt, RequestId, Sampling};
 use ares_core::units::Bytes;
 use ares_gguf::Gguf;
-use ares_model::qwen4exp::Config;
 use ares_model::qwen4exp::device::{Options, Qwen4Exp, SessionOptions, Spread, place, step_rows};
+use ares_model::qwen4exp::{Config, DraftWeights};
 use ares_runtime::{GpuConfig, Runtime, RuntimeConfig, required_ram};
 use ares_tokenizer::{ChatOptions, Tokenizer};
 
 use crate::load::{
-    LoadError, Loaded, VRAM_HEADROOM, describe_links, draft_block_takes_part, hold_devices, join,
-    ram_limit, refuse, short,
+    LoadError, Loaded, VRAM_HEADROOM, describe_links, hold_devices, join, ram_limit, refuse, short,
 };
 use crate::models::Site;
-use crate::plan::{self, CELLS_PER_PAGE, DEFAULT_PARALLEL, LoadOptions, SplitKind};
+use crate::plan::{
+    self, CELLS_PER_PAGE, DEFAULT_PARALLEL, DEFAULT_WINDOW, Drafter, LoadOptions, SplitKind,
+};
 
-/// The most rows of a step that generates (one for each sequence, as the model takes no drafts
-/// yet): what the decode kernels of the experts take. Only the slices of a prompt are wider.
+/// The most rows of a step that generates (the newest token of every sequence and the drafts
+/// they verify): what the decode kernels of the experts take. Only the slices of a prompt are
+/// wider.
 const MAX_ROWS: u32 = ares_cuda::MAX_BATCH;
 
 /// A text of German, English and code, about 700 tokens, that the model reads
@@ -88,23 +90,49 @@ pub(crate) fn load(
              arithmetic",
         ));
     }
-    // The model has no draft head built yet, and the lookup in earlier text
-    // takes part only next to a model drafter: nothing speculates, so no
-    // window is reserved, and the options of drafting mean nothing.
-    draft_block_takes_part(
-        options,
-        false,
-        "the draft head of this model is not built yet, so no model drafter takes part",
-    )?;
-    if options.window.is_some() {
-        return Err(refuse(
-            "--window does nothing for this model: it has no drafter of its own yet, so no \
-             window is reserved",
-        ));
+    // The model's draft block is a file of its own, which --drafters names:
+    // the model file carries none. Without it nothing speculates (the lookup
+    // in earlier text takes part only next to a model drafter), no window is
+    // reserved, and the options of drafting mean nothing.
+    let drafter = match options.drafters.as_deref() {
+        None | Some([]) => None,
+        Some([Drafter::Block(path)]) => Some(path.clone()),
+        Some([Drafter::Mtp]) => {
+            return Err(refuse(
+                "--drafters mtp: this model file carries no draft block; the block is a file of \
+                 its own, which --drafters names by its path",
+            ));
+        }
+        Some(_) => {
+            return Err(refuse(
+                "--drafters: this model drafts with one draft block; name its file alone",
+            ));
+        }
+    };
+    // The file is read before a device is touched: one that is no draft block
+    // of this model is refused by name.
+    let drafter = drafter
+        .map(|path| {
+            let named = |e: String| refuse(format!("--drafters {}: {e}", path.display()));
+            let file = Gguf::open(&path).map_err(|e| named(e.to_string()))?;
+            DraftWeights::load(&file, &config).map_err(|e| named(e.to_string()))?;
+            Ok::<_, LoadError>((path, file))
+        })
+        .transpose()?;
+    let window = options.window.unwrap_or(DEFAULT_WINDOW);
+    if options.window.is_some() && drafter.is_none() {
+        return Err(refuse("--window without a model drafter does nothing"));
+    }
+    if drafter.is_some() && !(2..=MAX_ROWS).contains(&window) {
+        return Err(refuse(format!(
+            "--window {window}: a window is the newest token and its drafts, 2 to {MAX_ROWS} \
+             rows (a step that verifies drafts has {MAX_ROWS} rows for all sequences together)"
+        )));
     }
     if options.draft_vocabulary.is_some() {
         return Err(refuse(
-            "--draft-vocab is for a model's own draft block, which this model does not use yet",
+            "--draft-vocab does nothing for this model: its draft block picks from the whole \
+             output head",
         ));
     }
     let parallel = options.parallel.unwrap_or(DEFAULT_PARALLEL);
@@ -113,6 +141,10 @@ pub(crate) fn load(
             "--parallel {parallel}: a step has {MAX_ROWS} rows at most, one for each sequence"
         )));
     }
+    // Rows of a step that verifies drafts, for all sequences together, and
+    // the rows whose logits a step can want.
+    let window_rows = if drafter.is_some() { MAX_ROWS } else { 0 };
+    let logit_rows = window_rows.max(parallel);
     if options.context == Some(0) {
         return Err(refuse("--context must be at least 1"));
     }
@@ -168,13 +200,7 @@ pub(crate) fn load(
     let max_rows = step_rows(
         &Gguf::open(&options.model)?,
         &devices,
-        &Options {
-            kv,
-            logit_rows: parallel,
-            window_rows: 0,
-            max_slots: parallel,
-            ..Options::default()
-        },
+        &Options { kv, logit_rows, window_rows, max_slots: parallel, ..Options::default() },
     )
     .map_err(|e| LoadError::Model(e.to_string()))?;
     tracing::info!("steps of up to {max_rows} rows");
@@ -182,8 +208,8 @@ pub(crate) fn load(
         part: Options {
             kv,
             max_rows,
-            logit_rows: parallel,
-            window_rows: 0,
+            logit_rows,
+            window_rows,
             max_slots: parallel,
             cells: context.min(model_context),
             pool_pages: pages,
@@ -268,10 +294,20 @@ pub(crate) fn load(
         if options.parallel.is_some() { "as asked" } else { "the default" },
     );
     tracing::info!(
-        "plan: K in {}, V in {}; no speculation: the model's draft head is not built yet, and \
-         earlier text alone is not a drafter",
+        "plan: K in {}, V in {}; {}",
         plan::format_name(kv.0),
         plan::format_name(kv.1),
+        match &drafter {
+            Some((path, _)) => format!(
+                "the model's draft block ({}) drafts, on the device that holds the output \
+                 head: windows of up to {window} rows a sequence, {MAX_ROWS} rows a step, as \
+                 long as they pay; the lookup in earlier text joins",
+                path.display()
+            ),
+            None => "no speculation: the model drafts with a draft block from a file of its \
+                     own (--drafters <file>), and earlier text alone is not a drafter"
+                .to_owned(),
+        },
     );
     for ((plan, h), per_page) in placement.devices.iter().zip(&held).zip(&page_bytes) {
         tracing::info!(
@@ -299,11 +335,16 @@ pub(crate) fn load(
              /v1/completions works"
         );
     }
-    let model = std::sync::Arc::new(
-        Qwen4Exp::new(gguf, tokenizer, name.clone(), &devices, opts, longest)
-            .map_err(|e| LoadError::Model(e.to_string()))?
-            .with_chat_options(chat),
-    );
+    let mut model = Qwen4Exp::new(gguf, tokenizer, name.clone(), &devices, opts, longest)
+        .map_err(|e| LoadError::Model(e.to_string()))?
+        .with_chat_options(chat);
+    let drafting = drafter.is_some();
+    if let Some((path, file)) = drafter {
+        model = model
+            .with_draft(file)
+            .map_err(|e| LoadError::Model(format!("--drafters {}: {e}", path.display())))?;
+    }
+    let model = std::sync::Arc::new(model);
 
     // Host RAM: one limit for the engine. What it needs to run is taken from
     // it first (the step buffers of the devices and the parts'); the tier of
@@ -320,7 +361,7 @@ pub(crate) fn load(
         pages,
         cells_per_page: CELLS_PER_PAGE,
         max_slots: parallel,
-        window_rows: 1,
+        window_rows: if drafting { window } else { 1 },
         checkpoint_budget: 0,
         ..RuntimeConfig::default()
     };
@@ -394,6 +435,18 @@ pub(crate) fn load(
             100.0 * vram as f64 / all as f64,
             Bytes(ram_bytes),
             100.0 * ram_slots as f64 / all as f64,
+        );
+    }
+    if let Some(report) = model.draft_report() {
+        let (vram, ram_slots) = model.draft_slots().unwrap_or((0, 0));
+        tracing::info!(
+            "draft block, on device {}: dense weights {}, K, V and keys {}, buffers {}; its {} \
+             experts share the tiers: {vram} slots in VRAM, {ram_slots} in RAM",
+            held[report.index].device.ordinal(),
+            Bytes(report.weights),
+            Bytes(report.pools),
+            Bytes(report.buffers),
+            config.experts.count,
         );
     }
     tracing::info!(

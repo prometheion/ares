@@ -12,9 +12,9 @@
 //!   token it is paired with ([`Part::block_input`]):
 //!
 //!   ```text
-//!   e    = fc_embedding (rms(embedding) * norm_embedding)
-//!   hn   = rms(residual as one vector) * norm_hidden
-//!   R[c] = fc_hidden hn[c] + e
+//!   e     = fc_embedding (rms(embedding) * norm_embedding)
+//!   hn[c] = rms(residual[c]) * norm_hidden[c]
+//!   R[c]  = fc_hidden hn[c] + e
 //!   ```
 //!
 //!   The host decodes the embedding, as it does for the model's first layer,
@@ -84,8 +84,19 @@ impl Part {
         let shape = PartShape::whole(c, 0..1, true);
         let f = Frame::new(c, opts, &shape, device.info().multiprocessors)?;
         let weights = DeviceWeights::load_block(device, ledger, c, w, output)?;
-        let mut part =
-            Self::assemble(c, opts, index, Role::Whole, true, f, weights, device, ledger, false)?;
+        let mut part = Self::assemble(
+            c,
+            opts,
+            index,
+            Role::Whole,
+            true,
+            f,
+            weights,
+            device,
+            ledger,
+            false,
+            "qwen4exp draft block",
+        )?;
         let rows = u64::from(MAX_BATCH);
         let row = c.wide() as u64 * 4;
         let (emb, normed, e, input) = (0, rows * row, 2 * rows * row, 3 * rows * row);
@@ -112,16 +123,6 @@ impl Part {
         if self.role == Role::Worker { None } else { self.w.output() }
     }
 
-    /// Page-locked bytes a draft block holds for its input.
-    pub fn block_pinned_bytes(&self) -> u64 {
-        self.block.as_ref().map_or(0, |b| b.emb_host.len() as u64)
-    }
-
-    /// Bytes of the device buffers a draft block has besides those of a part.
-    pub fn block_bytes(&self) -> u64 {
-        self.block.as_ref().map_or(0, |b| b.scratch.len() + b.saved.len())
-    }
-
     /// Enqueues the input of a draft block for `rows` rows and returns where
     /// it is (`rows * D` f32, valid until the next call): what
     /// [`StepEnv::inbound`] of the block's step names. `residual` addresses
@@ -130,8 +131,10 @@ impl Part {
     ///
     /// # Safety
     ///
-    /// `residual` must address `rows * D` f32 values on this part's device
-    /// that stay as they are until the launches have run.
+    /// `residual` must address `rows * D` f32 values on this part's device,
+    /// 16-byte aligned, that stay as they are until the launches have run.
+    /// The device must have run the block's last step: its host buffers are
+    /// written again here.
     pub unsafe fn block_input(
         &mut self,
         stream: &Stream,
@@ -152,7 +155,7 @@ impl Part {
         let values = (rows * wide) as usize;
         // SAFETY: the pinned buffer and every section of the scratch hold
         // `MAX_BATCH` rows of `D` values; the copies of the step before have
-        // run (the host waited for its picks).
+        // run (the caller's guarantee).
         unsafe {
             let staged = block.emb_host.as_mut_ptr().cast::<f32>();
             for (row, x) in embeddings.chunks_exact(n as usize).enumerate() {
@@ -193,15 +196,16 @@ impl Part {
                 Ok(())
             };
             project(&input.fc_embedding, block.normed, block.e)?;
-            // The residual, normed as one vector of every row, then each
-            // stream through its projection.
-            self.kernels.rms_norm_f32(
+            // The residual, every stream normed by itself, then each stream
+            // through its projection.
+            self.q4.stream_norm(
                 stream,
                 residual,
                 self.w.at(input.norm_hidden),
                 at(block.normed),
-                wide,
                 rows,
+                hc,
+                n,
                 eps,
             )?;
             project(&input.fc_hidden, block.normed, block.input)?;
@@ -231,16 +235,13 @@ impl Part {
     }
 
     /// Ends a step whose rows only wrote keys ([`Part::enqueue_keys`]): no
-    /// residual is written back and no head runs.
+    /// residual is written back and no head runs. What writing the keys
+    /// reported is read with the next step that runs the whole layer
+    /// ([`Part::end`]): the host does not wait between steps of this kind.
     pub fn end_keys(&mut self, env: &StepEnv<'_>) -> Result<(), ModelError> {
         if env.segments.iter().any(|s| !s.direct) {
             return Err(invalid("rows that only write keys are certain"));
         }
-        // SAFETY: the status word of the scratch and its pinned copy.
-        unsafe {
-            env.stream.copy_to_host(self.status_host.as_mut_ptr(), self.at(self.f.s.status), 4)?;
-        }
-        self.status_pending = true;
         self.pending = None;
         Ok(())
     }

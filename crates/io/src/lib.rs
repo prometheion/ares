@@ -94,7 +94,7 @@ mod worker;
 
 pub use buffer::Buffer;
 pub use error::{Error, LayoutError, Result};
-pub use expert::{ExpertMap, ExpertRange};
+pub use expert::{ExpertMap, ExpertRange, ExpertSpan};
 pub use file::{
     AlignSource, BufferedReason, CopyInfo, DirectAlign, DriveId, DriveInfo, FileId, FileInfo,
     IoMode, Span,

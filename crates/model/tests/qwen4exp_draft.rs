@@ -77,7 +77,7 @@ fn a_model_file_is_not_a_draft_block_and_a_block_of_another_shape_is_refused() {
     let gguf = open("refused-model", &model.bytes());
     let config = Config::from_gguf(&gguf).expect("config");
     let error = DraftWeights::load(&gguf, &config).expect_err("a model is no block");
-    assert!(matches!(error, Error::Architecture { .. }), "{error}");
+    assert!(matches!(error, Error::NotADraftBlock { .. }), "{error}");
 
     let mut other = model.clone();
     other.shape.expert_ff *= 2;
@@ -127,9 +127,9 @@ fn the_input_is_the_projected_streams_plus_the_projected_embedding() {
             .collect();
         let e = product(&head.fc_embedding, &en);
         let row = &rt[t * wide..(t + 1) * wide];
-        // One RMS over all streams of the row.
-        let scale = rms(row);
         for c in 0..config.n_stream {
+            // Every stream is normed by itself.
+            let scale = rms(&row[c * n..(c + 1) * n]);
             let hn: Vec<f64> = (0..n)
                 .map(|i| f64::from(row[c * n + i]) / scale * f64::from(head.norm_hidden[c * n + i]))
                 .collect();

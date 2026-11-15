@@ -86,12 +86,13 @@ fn options_that_mean_nothing_for_a_mixture_of_experts_are_refused_by_name() {
     assert!(stderr.contains("--split"), "it says what to use instead: {stderr}");
     refuses(&["--precision", "exact"], "--precision");
     refuses(&["--draft-vocab", "tokens.txt"], "--draft-vocab");
-    // The model has no draft head built yet: no model drafter takes part, so
-    // nothing speculates and a window would be room for nothing.
+    // The model file carries no draft block: the block is a file of its own.
+    // Without it no model drafter takes part, nothing speculates and a window
+    // would be room for nothing.
     let stderr = refuses(&["--drafters", "mtp"], "--drafters");
-    assert!(stderr.contains("not built yet"), "{stderr}");
+    assert!(stderr.contains("a file of its own"), "{stderr}");
     let stderr = refuses(&["--drafters", "mtp,/models/dflash2.gguf"], "--drafters");
-    assert!(stderr.contains("not built yet"), "{stderr}");
+    assert!(stderr.contains("one draft block"), "{stderr}");
     refuses(&["--window", "8"], "--window");
     let stderr = refuses(&["--kv", "q4"], "q4");
     assert!(stderr.contains("f16 or q8"), "{stderr}");
@@ -101,4 +102,43 @@ fn options_that_mean_nothing_for_a_mixture_of_experts_are_refused_by_name() {
 fn rows_that_do_not_fit_a_step_are_refused_with_the_option_that_makes_them() {
     let stderr = refuses(&["--parallel", "9"], "--parallel");
     assert!(stderr.contains("8 rows"), "{stderr}");
+}
+
+/// The file of a made-up draft block for the made-up model.
+fn draft_block() -> &'static PathBuf {
+    static PATH: LazyLock<PathBuf> = LazyLock::new(|| {
+        let path = model().with_file_name("made-draft.gguf");
+        std::fs::write(&path, made_up().draft_bytes(Some((GgmlType::IQ2_S, GgmlType::Q2_0))))
+            .unwrap();
+        path
+    });
+    &PATH
+}
+
+#[test]
+fn a_drafter_that_is_no_draft_block_of_the_model_is_refused_by_name() {
+    // A model is no draft block.
+    let itself = model().to_str().unwrap();
+    let stderr = refuses(&["--drafters", itself], "--drafters");
+    assert!(stderr.contains("qwen4exp-mtp"), "it says what a block's file is: {stderr}");
+    refuses(&["--drafters", "/nowhere/block.gguf"], "/nowhere/block.gguf");
+    // A block of another shape is no block of this model.
+    let mut other = made_up();
+    other.shape.shared_ff = 32;
+    let path = model().with_file_name("other-draft.gguf");
+    std::fs::write(&path, other.draft_bytes(Some((GgmlType::IQ2_S, GgmlType::Q2_0)))).unwrap();
+    let stderr = refuses(&["--drafters", path.to_str().unwrap()], "--drafters");
+    assert!(stderr.contains("shared_expert"), "it names the tensor: {stderr}");
+}
+
+#[test]
+fn the_window_of_a_drafting_model_fits_the_step_that_verifies() {
+    let block = draft_block().to_str().unwrap();
+    // A window is the newest token and at least one draft, and a step that
+    // verifies drafts has the eight rows of the decode kernels.
+    let stderr = refuses(&["--drafters", block, "--window", "9"], "--window");
+    assert!(stderr.contains("2 to 8"), "{stderr}");
+    refuses(&["--drafters", block, "--window", "1"], "--window");
+    // The block picks from the whole head.
+    refuses(&["--drafters", block, "--draft-vocab", "tokens.txt"], "--draft-vocab");
 }

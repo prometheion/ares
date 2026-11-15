@@ -406,8 +406,8 @@ pub struct DraftWeights<'g> {
     /// Norm weight over the embedding of the paired token, `N` values
     /// (`pre_fc_norm_embedding`).
     pub norm_embedding: Vec<f32>,
-    /// Norm weight over the trunk's residual as one vector, `D` values
-    /// (`pre_fc_norm_hidden`).
+    /// Norm weights over the trunk's residual, stream `c` at
+    /// `[c * N, (c + 1) * N)` (`pre_fc_norm_hidden`).
     pub norm_hidden: Vec<f32>,
     /// The projection of the normed embedding, `N` to `N` (`fc_embedding`).
     pub fc_embedding: Matrix<'g>,
@@ -433,7 +433,10 @@ impl<'g> DraftWeights<'g> {
     pub fn load(gguf: &'g Gguf, config: &Config) -> Result<Self> {
         let found = gguf.architecture().unwrap_or_default();
         if found != DRAFT_ARCHITECTURE {
-            return Err(Error::Architecture { found: found.to_owned() });
+            return Err(Error::NotADraftBlock {
+                found: found.to_owned(),
+                expected: DRAFT_ARCHITECTURE,
+            });
         }
         let mut loader = Loader { gguf, used: HashSet::new() };
         let c = config;
@@ -515,6 +518,46 @@ impl<'g> DraftWeights<'g> {
             return Err(Error::UnexpectedTensor { name: extra.name.clone() });
         }
         Ok(weights)
+    }
+}
+
+/// Where one matrix of every routed expert of a draft block is in the block's
+/// file: the part of the file, the offset of expert 0's matrix, the bytes
+/// from one expert's matrix to the next, and the bytes of a matrix.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExpertPlace {
+    /// The part of the file the tensor is in.
+    pub part: u16,
+    /// The file offset of the matrix of expert 0.
+    pub base: u64,
+    /// Bytes from one expert's matrix to the next.
+    pub stride: usize,
+    /// Bytes of one matrix.
+    pub len: usize,
+}
+
+impl DraftWeights<'_> {
+    /// Where gate, up and down of the routed experts are in `gguf`, the file
+    /// the table was built from: what a reader of the file needs to fetch an
+    /// expert. `None` when `gguf` is another file.
+    pub fn expert_places(&self, gguf: &Gguf) -> Option<[ExpertPlace; 3]> {
+        let place = |name: &str, stack: &ExpertStack<'_>| {
+            let info = gguf.tensor(name)?;
+            let (skip, stride) = stack.span();
+            (stack.data.len() as u64 == info.size).then_some(ExpertPlace {
+                part: info.part,
+                base: info.offset + skip as u64,
+                stride,
+                len: stack.expert_bytes(),
+            })
+        };
+        let moe = &self.layer.moe;
+        let fused = "mtp.layers.0.mlp.experts.gate_up_proj";
+        Some([
+            place(fused, &moe.gate)?,
+            place(fused, &moe.up)?,
+            place("mtp.layers.0.mlp.experts.down_proj", &moe.down)?,
+        ])
     }
 }
 

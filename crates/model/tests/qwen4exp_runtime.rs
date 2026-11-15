@@ -23,7 +23,9 @@ use ares_model::qwen4exp::device::{
     Options, Qwen4Exp, Rows, Session, SessionOptions, Spread, Wanted,
 };
 use ares_model::qwen4exp::synthetic::{NgramShape, Shape, Synthetic, Types};
-use ares_model::qwen4exp::{Config, LogitRows, Reference, SequenceState, Weights};
+use ares_model::qwen4exp::{
+    Config, DraftState, DraftWeights, LogitRows, Reference, SequenceState, Weights,
+};
 use ares_runtime::{
     ContextSpec, DeviceContext, DeviceModel, GpuConfig, LinkSpec, Model, ModelError, PrefixCache,
     Runtime, RuntimeConfig, Split,
@@ -247,6 +249,10 @@ impl Model for Made {
     fn draft_rows(&self) -> u32 {
         self.0.draft_rows()
     }
+
+    fn own_drafts(&self) -> u32 {
+        self.0.own_drafts()
+    }
     fn attention_span(&self) -> u32 {
         self.0.attention_span()
     }
@@ -294,12 +300,44 @@ fn start_at(
     config: RuntimeConfig,
     rows: u32,
 ) -> (Runtime, Arc<Qwen4Exp>) {
+    start_with(path, None, placement, pages, config, rows)
+}
+
+/// The file of a made-up draft block for the made-up model of `seed`, its
+/// experts in the types of the model's.
+fn draft_path(seed: u64) -> PathBuf {
+    let path = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("q4rt-{seed}-draft.gguf"));
+    std::fs::write(&path, model(seed).draft_bytes(Some((GgmlType::IQ2_S, GgmlType::Q2_0))))
+        .expect("the test directory is writable");
+    path
+}
+
+/// [`start`] for a model that drafts with its draft block: windows of up to
+/// eight rows.
+fn start_drafting(seed: u64, placement: Placement, pages: u32) -> (Runtime, Arc<Qwen4Exp>) {
+    let config = RuntimeConfig { window_rows: 8, ..RuntimeConfig::default() };
+    start_with(&gguf_path(seed), Some(&draft_path(seed)), placement, pages, config, MAX_ROWS)
+}
+
+/// [`start_at`], with the draft block of the file `draft` when there is one.
+fn start_with(
+    path: &std::path::Path,
+    draft: Option<&std::path::Path>,
+    placement: Placement,
+    pages: u32,
+    config: RuntimeConfig,
+    rows: u32,
+) -> (Runtime, Arc<Qwen4Exp>) {
     let devices = open_devices(placement);
     let gguf = Gguf::open(path).unwrap();
     let n_layer = Config::from_gguf(&gguf).unwrap().n_layer;
     let opts = options(placement, n_layer, pages, MAX_ROWS, rows);
-    let inner =
-        Arc::new(Qwen4Exp::new(gguf, byte_tokenizer(None), "made", &devices, opts, CELLS).unwrap());
+    let mut inner =
+        Qwen4Exp::new(gguf, byte_tokenizer(None), "made", &devices, opts, CELLS).unwrap();
+    if let Some(draft) = draft {
+        inner = inner.with_draft(Gguf::open(draft).unwrap()).expect("the draft block fits");
+    }
+    let inner = Arc::new(inner);
     let config = RuntimeConfig { pages, cells_per_page: 128, max_slots: SLOTS, ..config };
     let model: Arc<dyn Model> = Arc::new(Made(inner.clone()));
     let mut gpu = GpuConfig::new(&config, &*model);
@@ -386,6 +424,9 @@ fn warm(model: &Qwen4Exp) {
         vram_slots >= model.config().n_layer * model.config().experts.count,
         "every expert has a slot"
     );
+    if let Some((vram_slots, _)) = model.draft_slots() {
+        assert!(vram_slots >= model.config().experts.count, "every expert of the draft block");
+    }
     model.take_store_stats();
 }
 
@@ -847,4 +888,244 @@ fn a_cancelled_request_frees_its_place_for_the_next() {
         assert_eq!(ask(&runtime, 3, &b, 20), want, "{placement:?}");
         runtime.shutdown();
     }
+}
+
+/// The tokens `prompt` and what a request wrote after it, as the CPU
+/// reference of the model and of its draft block see them: the residual
+/// after the last layer of every cell, and the block's cells that follow.
+struct Followed {
+    tokens: Vec<u32>,
+    trunk: Vec<f32>,
+    wide: usize,
+}
+
+/// The chains the draft block of the made-up model `seed` made for a request
+/// that read `prompt` and wrote `answer`, against the CPU reference's chains
+/// from the same cells: per link, how many were compared (a link is compared
+/// when the links before it agreed) and how many agreed.
+fn chains_against_the_reference(
+    seed: u64,
+    chains: &[ares_model::qwen4exp::device::Drafted],
+    prompt: &[u32],
+    answer: &[u32],
+) -> ([usize; 8], [usize; 8]) {
+    let gguf = Gguf::open(gguf_path(seed)).unwrap();
+    let file = Gguf::open(draft_path(seed)).unwrap();
+    let c = Config::from_gguf(&gguf).unwrap();
+    let w = Weights::load(&gguf, &c).unwrap();
+    let head = DraftWeights::load(&file, &c).unwrap();
+    let reference = Reference::new(&c, &w);
+    let tokens: Vec<u32> = prompt.iter().chain(answer).copied().collect();
+    let trunk = reference.window(&SequenceState::new(&c), &tokens, LogitRows::All).unwrap();
+    // How far the model's own picks on the device are the reference's from
+    // the same tokens: what near ties do to a made-up model.
+    let arg_max = |row: &[f32]| {
+        row.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map_or(0, |(i, _)| i as u32)
+    };
+    let own = (prompt.len() - 1..tokens.len() - 1)
+        .filter(|&i| arg_max(trunk.logits_of(i).unwrap()) == tokens[i + 1])
+        .count();
+    eprintln!("RES the model's own picks are the reference's in {own} of {}", answer.len());
+    let f = Followed { tokens, trunk: trunk.trunk_out, wide: c.wide() };
+    let cells = f.tokens.len() - 1;
+    let follow = reference
+        .draft_window(
+            &head,
+            &DraftState::new(),
+            &f.trunk[..cells * f.wide],
+            &f.tokens[1..],
+            LogitRows::None,
+        )
+        .unwrap();
+    let (mut compared, mut agreed) = ([0usize; 8], [0usize; 8]);
+    for chain in chains {
+        // The window started at the newest token's cell; the chain's first
+        // link is the cell before it.
+        let newest = chain.position as usize - 1;
+        if newest == 0 || newest >= f.tokens.len() || f.tokens[newest] != chain.token {
+            continue;
+        }
+        let mut state = DraftState::new();
+        reference.draft_commit(&mut state, &follow, newest - 1).unwrap();
+        let row = &f.trunk[(newest - 1) * f.wide..newest * f.wide];
+        let want =
+            reference.draft_chain(&head, &state, row, chain.token, chain.drafts.len()).unwrap();
+        for (link, (got, want)) in chain.drafts.iter().zip(&want).enumerate() {
+            compared[link] += 1;
+            if got != want {
+                eprintln!(
+                    "RES a chain from cell {} parts from the reference's at link {link} of {}",
+                    newest - 1,
+                    chain.drafts.len()
+                );
+                break;
+            }
+            agreed[link] += 1;
+        }
+    }
+    (compared, agreed)
+}
+
+/// The model drafts with its own draft block in every placement, and the
+/// block on the device drafts what the CPU reference's chain drafts from the
+/// same cells: its input from the model's residual and the paired token, its
+/// keys and values of the cells the model has passed, its experts through
+/// the store, its own final mixer and the model's head, link after link.
+#[test]
+fn the_draft_block_drafts_what_the_reference_drafts_in_every_placement() {
+    if !enabled() {
+        return;
+    }
+    let prompt = prompt(21, 3);
+    for placement in placements() {
+        let (runtime, model) = start_drafting(1, placement, 16);
+        warm(&model);
+        model.take_drafted();
+        let answer = ask(&runtime, 1, &prompt, 40);
+        assert_nothing_missed(&model, "an answer with drafts and filled tiers");
+        let chains = model.take_drafted();
+        let counters = runtime.snapshot().expect("the runtime is running").counters;
+        let report = model.draft_report().expect("the model has a draft block");
+        let times = model.draft_times();
+        runtime.shutdown();
+        let (compared, agreed) = chains_against_the_reference(1, &chains, &prompt, &answer);
+        eprintln!(
+            "RES {placement:?}: {} chains of {} links in all; against the reference per link \
+             {agreed:?} of {compared:?}; draft rows {}, accepted {}, rejected {}; the block on \
+             part {}: weights {} B, pools {} B, buffers {} B; {:.2} ms a link",
+            chains.len(),
+            counters.own_draft_links,
+            counters.draft_rows,
+            counters.drafts_accepted,
+            counters.drafts_rejected,
+            report.index,
+            report.weights,
+            report.pools,
+            report.buffers,
+            times.chain_ms / times.links.max(1) as f64,
+        );
+        assert!(counters.own_draft_links > 0, "{placement:?}: the block drafted nothing");
+        // How many chains the policy asks for depends on what a link costs
+        // that day; a made-up block is never right, so they stop soon.
+        assert!(compared[0] >= 2, "{placement:?}: {} chains to compare", compared[0]);
+        // A made-up model has near ties that the device's arithmetic flips;
+        // a block that is wired wrongly agrees by chance, once in a hundred.
+        assert!(
+            agreed[0] * 10 >= compared[0] * 8,
+            "{placement:?}: first links agree in {} of {}",
+            agreed[0],
+            compared[0]
+        );
+        assert!(
+            compared[1] == 0 || agreed[1] * 10 >= compared[1] * 6,
+            "{placement:?}: second links agree in {} of {}",
+            agreed[1],
+            compared[1]
+        );
+    }
+}
+
+/// Drafts change no token: with the draft block a reply is what it is
+/// without, greedy and sampled with a seed, alone and next to another
+/// sequence, in every placement. The made-up block guesses badly, so most of
+/// its drafts are rejected and rolled back; the text repeats and the request
+/// is asked again, so that the lookup in earlier text joins and has drafts
+/// that are accepted, which the block then has to follow.
+#[test]
+fn drafts_change_no_token_in_any_placement() {
+    if !enabled() {
+        return;
+    }
+    let mut repeats = prompt(12, 5);
+    repeats.extend_from_within(..);
+    repeats.extend_from_within(..12);
+    let other = prompt(23, 8);
+    let greedy = Sampling { temperature: Some(0.0), ..Sampling::default() };
+    let seeded = Sampling { temperature: Some(0.9), seed: Some(11), ..Sampling::default() };
+    let mut failures = Vec::new();
+    for placement in placements() {
+        // Without the block.
+        let (runtime, model) = start(2, placement, 16, RuntimeConfig::default());
+        warm(&model);
+        let plain = ask(&runtime, 1, &repeats, 120);
+        let plain_other = ask(&runtime, 2, &other, 60);
+        let (plain_seeded, _) = ask_sampled(&runtime, 3, &repeats, 60, seeded.clone(), true);
+        assert_nothing_missed(&model, "the answers without drafts");
+        runtime.shutdown();
+        drop(model);
+
+        let (runtime, model) = start_drafting(2, placement, 16);
+        warm(&model);
+        let first = ask(&runtime, 1, &repeats, 120);
+        // The same again: the lookup has the whole answer to offer.
+        let again = ask(&runtime, 2, &repeats, 120);
+        let (sampled, _) = ask_sampled(&runtime, 3, &repeats, 60, seeded.clone(), true);
+        let (undrafted, _) = ask_sampled(&runtime, 4, &repeats, 120, greedy.clone(), false);
+        let (rx_a, rx_b) = (submit(&runtime, 5, &repeats, 120), submit(&runtime, 6, &other, 60));
+        let together = (
+            rx_a.recv_timeout(Duration::from_secs(300)).unwrap().unwrap(),
+            rx_b.recv_timeout(Duration::from_secs(300)).unwrap().unwrap(),
+        );
+        assert_nothing_missed(&model, "the answers with drafts and filled tiers");
+        let counters = runtime.snapshot().expect("the runtime is running").counters;
+        let times = model.draft_times();
+        runtime.shutdown();
+        eprintln!(
+            "RES {placement:?}: {} tokens; draft rows {}, accepted {}, rejected {}; the block \
+             made {} links in {} steps, verified per link {:?}, accepted {:?}; {} rows only \
+             wrote keys",
+            plain.len(),
+            counters.draft_rows,
+            counters.drafts_accepted,
+            counters.drafts_rejected,
+            counters.own_draft_links,
+            counters.own_draft_steps,
+            times.offered,
+            times.accepted,
+            times.key_rows,
+        );
+        assert!(plain.len() > 12, "{placement:?}: the answer is {} tokens", plain.len());
+        assert!(counters.own_draft_links > 0, "{placement:?}: the block drafted nothing");
+        assert!(counters.drafts_accepted > 0, "{placement:?}: no draft was accepted");
+        assert!(counters.drafts_rejected > 0, "{placement:?}: no draft was rejected");
+        for (what, prompt, got, want) in [
+            ("drafts changed a greedy reply", &repeats, &first, &plain),
+            ("accepted drafts changed a greedy reply", &repeats, &again, &plain),
+            ("a request without drafts", &repeats, &undrafted, &plain),
+            ("next to another sequence", &repeats, &together.0, &plain),
+            ("the other sequence", &other, &together.1, &plain_other),
+        ] {
+            if got != want {
+                let at = got.iter().zip(want).position(|(a, b)| a != b).unwrap_or(0);
+                let gap = reference_gap(2, prompt, &want[..at], got[at], want[at]);
+                failures.push(format!(
+                    "{placement:?}: {what}: token {at} is {} and not {}; the reference has \
+                     them {gap:?} apart (logits of the two, the largest, the spread)",
+                    got[at], want[at]
+                ));
+            }
+        }
+        if sampled != plain_seeded {
+            failures.push(format!("{placement:?}: drafts changed a sampled reply"));
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// What the CPU reference says of the row behind `prompt` and `written`: the
+/// logits of the tokens `a` and `b`, the largest logit and the standard
+/// deviation of all of them.
+fn reference_gap(seed: u64, prompt: &[u32], written: &[u32], a: u32, b: u32) -> [f32; 4] {
+    let gguf = Gguf::open(gguf_path(seed)).unwrap();
+    let c = Config::from_gguf(&gguf).unwrap();
+    let w = Weights::load(&gguf, &c).unwrap();
+    let reference = Reference::new(&c, &w);
+    let tokens: Vec<u32> = prompt.iter().chain(written).copied().collect();
+    let window = reference.window(&SequenceState::new(&c), &tokens, LogitRows::Last).unwrap();
+    let logits = window.logits_of(tokens.len() - 1).unwrap();
+    let mean = logits.iter().sum::<f32>() / logits.len() as f32;
+    let spread =
+        (logits.iter().map(|l| (l - mean).powi(2)).sum::<f32>() / logits.len() as f32).sqrt();
+    let largest = logits.iter().copied().fold(f32::MIN, f32::max);
+    [logits[a as usize], logits[b as usize], largest, spread]
 }
