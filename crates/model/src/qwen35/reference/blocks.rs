@@ -176,6 +176,8 @@ impl Reference<'_, '_> {
                         beta[t * nv + h],
                         Some(&mut o),
                     );
+                    // The next row goes on from the matrix as the state holds it.
+                    self.storage.round(&mut s, dv, dk);
                     out.extend_from_slice(&o);
                 }
             }

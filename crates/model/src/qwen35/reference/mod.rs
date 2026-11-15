@@ -187,8 +187,10 @@ impl Window {
 }
 
 /// How the delta-rule matrices are held between steps. The arithmetic of a step
-/// is the same in every case; the format only rounds the matrices once a commit
-/// has advanced them, which is what storing the state in a smaller type costs.
+/// is the same in every case; the format only rounds the matrices after every
+/// row that advances them (in a window and in a commit alike, so that a row
+/// does not depend on the step that computes it), which is what storing the
+/// state in a smaller type costs.
 /// Used to measure that cost against `F32`, the exact state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StateStorage {
@@ -424,8 +426,6 @@ impl<'a, 'g> Reference<'a, 'g> {
                     }
                     for t in 0..accepted {
                         blocks::advance_delta(r, delta, q, k, v, g, beta, t);
-                    }
-                    if accepted > 0 {
                         self.storage.round(delta, r.head_v_dim, r.head_k_dim);
                     }
                 }

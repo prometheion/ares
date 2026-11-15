@@ -190,6 +190,7 @@ fn ref_window(
     alpha: &[f32],
     beta_in: &[f32],
     n: usize,
+    storage: ares_model::qwen35::StateStorage,
 ) -> RefWindow {
     let sh = &p.shape;
     let (dk, nv, nk) = (sh.head_dim as usize, sh.n_v_heads as usize, sh.n_k_heads as usize);
@@ -239,6 +240,8 @@ fn ref_window(
                 beta[t * nv + h],
                 Some(&mut o),
             );
+            // The matrix as the state holds it between two rows.
+            storage.round(s, dk, dk);
             out[t * vd + h * dk..][..dk].copy_from_slice(&o);
         }
     }
@@ -284,10 +287,8 @@ fn ref_commit(
                 w.beta[t * nv + h],
                 None,
             );
+            storage.round(s, dk, dk);
         }
-    }
-    if accepted > 0 {
-        storage.round(&mut seq.s, dk, dk);
     }
 }
 
@@ -423,6 +424,7 @@ fn recurrent_protocol(format: StateFormat, variant: &str, gpu: &Gpu) -> (f64, f6
                     &alpha[r0 * nv..(r0 + s.rows) * nv],
                     &beta_in[r0 * nv..(r0 + s.rows) * nv],
                     s.rows,
+                    storage,
                 )
             })
             .collect();
@@ -494,7 +496,12 @@ fn recurrent_protocol(format: StateFormat, variant: &str, gpu: &Gpu) -> (f64, f6
                 e_q < 2e-6 && e_kv < 2e-6,
                 "step {step_no} seq {i}: conv outputs q {e_q}, kv {e_kv}"
             );
-            assert!(e_out < 5e-5, "step {step_no} seq {i}: delta output {e_out}");
+            // An f16 state is rounded after every row, in the kernel and in the
+            // reference: a value they compute a few f32 steps apart can round to
+            // different neighbours in f16, and the rows after it go on from there
+            // (5.2e-5 measured; a neighbour is 1e-3 of one of 128 values).
+            let limit = if format == StateFormat::F32 { 5e-5 } else { 5e-4 };
+            assert!(e_out < limit, "step {step_no} seq {i}: delta output {e_out}");
             worst_out = worst_out.max(e_out);
             worst_conv = worst_conv.max(e_q.max(e_kv));
         }
