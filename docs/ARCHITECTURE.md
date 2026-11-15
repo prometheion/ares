@@ -1101,7 +1101,7 @@ it is how the engine drafts.
 | MTP | The model's own draft head or block | Done for `qwen35` on one device and under a tensor split: the block runs on the device with the embedding table, its chain and its picks stay on the device (`device/mtp.rs`); not under a layer split. Chains of up to the window's rows less one (7 by default). Done for `qwen4exp` in every placement, from a file of the block (`--drafters FILE`): the block runs on the device with the output head and the host reads every pick (see "Qwen3.8-Flash-Next through the runtime") |
 | DFlash, DSpark, DFlash2 | A small draft model that reads the target's hidden states at a few layers and proposes a block of tokens at once | Not built: it needs taps on the target's layers and a second model on the same devices. `--drafters FILE` is refused with "not built yet" for a `qwen35` model (the file is not opened; for a `qwen4exp` model the file is the model's own draft block); the choice of a window takes any number of drafters |
 | Drafter selection | Per step and for all sequences together, whose drafts go into each window, by expected tokens per millisecond of the whole step, from the price of a step and the acceptance measured per drafter, position and sequence; a proposal that was not taken learns from what turned out right | Done: `ares_sched::choose` |
-| Adaptive draft length | The length that maximises the same number | Done, in the same call |
+| Adaptive draft length | The length that maximises the same number | Done, in the same call; and a chain ends as it is made where one more link does not raise that number, by the probability the drafter gave its drafts (see "The chain is cut by the drafter's own probability") |
 | Draft trees | Several branches verified in one window | Not built; the choice is made over rows ranked by their chance, which is a tree's ranking (see `crates/sched/src/window.rs`) |
 | Verification | Windows of any length for any number of sequences in one step, then commit | Done |
 
@@ -1133,10 +1133,9 @@ a flag or a constant of this machine:
   inputs, prompt rows that are certain), then the doublings up to a piece of
   prompt, the fastest of two (one above 24 rows), and windows whose draft
   rows the block fills, from 2 rows to the longest window, for the time of its
-  chain by length. Every step that runs corrects the entry for its rows by a
-  fifth of the difference, so a device that slows down or a context that gets
-  deep is followed; a context term (per cell a row reads) is fitted
-  separately (`ares_sched::PriceTable`).
+  chain by length. The steps that run keep the table true (see "Prices that
+  stay true"); a context term (per cell a row reads) is fitted separately
+  (`ares_sched::PriceTable`).
 - *Acceptance is measured per drafter, per position and per sequence*
   (`ares_sched::Acceptance`): position `i` is accepted *given* that the ones
   before it were, so a draft that failed at position 2 says nothing about
@@ -1157,6 +1156,164 @@ a flag or a constant of this machine:
   shorter and one longer. In 300 random cases of two sequences, two drafters
   and chains of up to five rows it is the best of all choices in 293 and
   never below 97.9 % of it.
+
+**Prices that stay true.** A price measured once goes stale, and a price that
+is too high keeps its own size from running, so nothing corrects it: the
+first table of Flash-Next is measured before its tiers hold any expert and
+kept every window from being chosen, and on the 27B one late step under CPU
+load moved the price of its row count a fifth of the way to a value ten to a
+hundred times too high. The table (`ares_sched::Curve`, for the rows of a step
+and for the links of a chain) is therefore built on two rules.
+
+- *The price of a size is the mean of its last eight measurements without the
+  largest* (the smallest of up to three). Other work on the machine only adds
+  to a step, so one late step in eight moves nothing. It is a mean and not a
+  median because part of what a step takes is its own and comes unevenly: a
+  step of Flash-Next that misses experts takes several times as long as one
+  that does not, the more often the more rows it has, and a size gives its
+  tokens over its mean time (a first version priced a size at the second
+  smallest of five, and the server then chose windows whose usual step was
+  cheap and whose mean was not). A size that changed is followed as its
+  measurements are replaced, wholly after eight; the fit of the context term
+  takes no step that took more than twice its price.
+- *A size that has not run for 256 measurements of the table is old.* Its
+  price is held between the prices of the nearest sizes on either side that
+  are current (fewer rows do not cost more, more rows do not cost less), and
+  the choice of a window is made at the price to *try* it at
+  (`Curve::trial_ms`): that of the nearest smaller size that is current, as if
+  its extra rows were free. It is then taken whenever its rows could pay at
+  all, the step measures it, and the measurement stands beside the old price,
+  the smaller of the two being the price; it is tried a second time, so that
+  one late step among the two does not waste the turn.
+
+No size can be locked out by this. One late step moves nothing. A price that
+is too high for any other reason (two late steps close together, a cold
+start, a busy stretch, a text that missed its experts) is old after 256 steps
+in which the size did not run, whatever it is, and one step at the trial
+price replaces it. A size that is
+not taken even at the trial price cannot pay at any price, so its price does
+not matter. Trying costs at most two steps per size in 256, and they are
+not lost: their rows verify drafts. The share of prompt and generation
+(`Share`) reads the plain prices, so a trial price never shortens a prompt's
+turn.
+
+The measurement at load stays. It gives every size a price before the first
+request, taken together under the same conditions, which is the shape of the
+table (where a launch ends), and it pays the first use of every kernel. Its
+level is not trusted: on cold tiers it is too high for every size, the one row
+that runs comes down with its first steps, and the windows are tried again
+after 256 steps (`windows_priced_out_on_a_cold_start_are_tried_again_and_chosen_when_they_pay`
+in `crates/runtime/tests/conductor.rs` states exactly that device).
+
+**The chain is cut by the drafter's own probability.** The acceptance per
+position is an average: it says that the third draft is right six times in
+ten, not whether this one is. The drafter knows more. The probability it gave
+a draft (`SamplePick::confidence`: the share of the pick among the row's eight
+best logits, which the sampler reports for every row) is counted against what
+verification found (`ares_sched::Confidence`, sixteen ranges of probability,
+starting from the probability itself and moving to what was observed), and
+that gives the chance of a draft the drafter has just made.
+
+A chain is made link by link, so the rule is applied where the chain is made.
+One more link is worth the chance that its draft counts and costs its time,
+and it is made when that raises the rate of the step, the number the windows
+are chosen by: `reach * mean >= rate * ms`, where the reach is the product
+of the chances of the drafts made so far, `mean` the chance of a draft whose
+probability is not known yet (the average over the drafts verified), `rate`
+the tokens per millisecond the step was chosen for and `ms` what the curve
+says the link takes. The conductor writes the table of chances and, for every
+draft row, the reach its link needs (`ares_sched::need`) into the step record
+("draft bars"); the drafter multiplies the chances of its picks and ends the
+chain at the first link whose bar the reach misses. There is no threshold of
+its own in this: a link that costs nothing is always made, and one that costs
+more than a token never.
+
+A link that is not made comes back as no draft (`u32::MAX`), and its row of
+the window, which the record fixed before the chain ran, carries the last
+draft again and is not counted. So the cut saves links and not rows. The
+choice of the window knows it: a chain is priced by the links expected to be
+made (the share of drafts that leave a chain above each bar), and a draft row
+counts only as often as its link is made behind a draft that was right, so
+windows are asked longer than the average draft would carry and the chain
+decides per token how far it goes.
+
+What each drafter does with the bars:
+
+- *The 27B's block* still enqueues its chain on the device, and now copies
+  every link's picks to the host. Where a bar can end the chain (the least
+  chance in the table would not carry the reach over it) the device thread
+  waits for those picks before it enqueues the next link; where no pick could
+  end it, nothing is waited for.
+- *The draft block of Flash-Next* reads every pick on the host as before; a
+  chain that ends there saves its links, which are the dear part of a window
+  while the block's experts are not resident.
+- *Removing the rows* of the links that were not made needs a step whose
+  shape follows the chain (the chain as a step of its own before the window,
+  or a window the device shortens); neither is built. It is what a window of
+  Flash-Next costs most, see `docs/OPEN.md`.
+
+Measured 2026-11-15, the build before this work against the build with it,
+back to back, on a machine that other work kept at the load averages given;
+every number is an indication.
+
+*Qwen3.8-27B* (tensor split 0.625 / 0.375, `qwen35_run --engine 8 --generate
+300`, the fork's draft vocabulary, most probable token; tokens per second for
+German prose, English prose, new code, the rewrite of a file, and a second
+question of each of the first three):
+
+| Run (load average) | before | with |
+| --- | --- | --- |
+| 1 (17 to 29) | 87.4, 93.8, 88.1, 139.6, 91.4, 89.7, 96.5 | 88.1, 94.6, 85.1, 139.2, 92.5, 94.5, 101.0 |
+| 2 (13 to 45) | 71.4, 75.7, 74.9, 131.1, 77.2, 76.4, 84.9 | 67.6, 72.4, 72.6, 108.3, 73.6, 80.8, 91.3 |
+| 3 (10 to 18) | 86.4, 92.3, 87.0, 143.9, 91.5, 91.7, 96.8 | 86.3, 94.4, 87.5, 150.0, 91.5, 91.2, 98.9 |
+
+(Runs 1 and 2 priced a size at the second smallest of its last five steps,
+run 3 is the rule above.) The two builds are not told apart. What changed is
+inside: the windows verify 1 to 7 drafts where they verified 3 to 5 (German,
+run 1: 4, 14, 16, 12, 26, 22 and 1 windows of 1 to 7 drafts, before 72 of 4
+and 21 of 5), a step gives 3 % more tokens (3.06, 3.23 and 2.86 against 2.97,
+3.16 and 2.75) and takes 1 to 7 % longer, because the device thread waits for
+the picks of a link before it enqueues the next. Of 400 to 500 links asked
+for in a request 13 to 26 % were not made. The block's probability says what
+the average cannot: of the drafts it gave 0.94 and more, 140 of 146 were
+accepted (German) and 148 of 154 (code), of those between 0.25 and 0.56 25 of
+67 and 20 of 49. The gain is not there until a link can end without a wait
+of the host.
+
+With the tool's process stopped for 250 ms once a second while it generates
+(32 to 39 stops a run, one step in thirty late by ten times its length), the
+build before this work verifies windows of 1 to 3 drafts where it verified 4
+and 5 (German: 27, 43, 38, 8 and 6 windows of 1 to 5 drafts) and gives 59.6,
+68.6, 64.0, 104.3, 71.0, 61.5 and 76.6 tokens per second (load 8); the build
+with it keeps its windows (German: 8, 10, 23, 38, 5, 5 and 9 of 1 to 7) and
+its table (28.4 to 35.9 ms for 1 to 8 rows after the run, 24.6 to 30.3
+undisturbed) and gives 58.2, 49.2, 55.6, 83.0, 58.6, 58.9 and 63.0 at a load
+that rose to 22 during the run: its steps were 10 ms longer, which the load
+or the waits for the links under it account for, not the table. An earlier
+pair at loads of 17 to 45 gave 64.6, 53.2, 62.7, 103.3, 64.5, 69.2, 73.1
+before and 67.5, 65.7, 58.0, 96.3, 69.1, 67.0, 74.2 with.
+
+*Qwen3.8-Flash-Next* through the server (both cards on every layer, `--ram
+8G`, `--drafters` the block's file, three questions of 300 tokens asked three
+times over, thinking off): the server chooses windows in every request, from
+the first on, of 1.7 to 3.7 tokens a step, and 68 to 98 % of their drafts are
+accepted. It is slower for them:
+
+| Tokens per second, German, English, code | round 1 | round 2 | round 3 |
+| --- | --- | --- | --- |
+| with the draft block (load 15 to 19) | 17.9, 18.5, 15.9 | 24.0, 23.8, 21.9 | 55.1, 27.0, 23.1 |
+| without (load 9) | 34.8, 29.0, 19.9 | 38.5, 35.1, 23.3 | 39.7, 39.3, 26.0 |
+
+A step with a window reads 18 to 56 experts from the file where a step of one
+row reads 3.5 to 16, and a window step of 1.7 tokens takes 96 ms where a row
+takes 29. Two things the price of a window does not say here: the dearest of
+its last eight steps is left out, and on this model that step is not late,
+it is the one that fetched; and the experts a window brings into the tiers
+push out what the next steps need, which no step is charged for. The build
+before this work chose windows in seven of nine requests of the same run and
+was no faster (28.9, 14.1, 8.6; 11.8, 12.6, 10.6; 12.9, 18.6, 14.6 at loads
+of 20 to 42). Until a window's rows find their experts, `--drafters` costs
+this model speed.
 
 **What limited the chain.** In order: the default of three drafts
 (`--drafts`), which was a cap on every sequence's window whatever the text;
@@ -1220,7 +1377,8 @@ lookup's cost; a long prompt is therefore read into the corpus as its rows
 are committed, not at once.
 
 **The model's own drafts** (`qwen35`, the next-token-prediction block of the
-27B). A step with them is still enqueued whole: the block's chain runs first,
+27B). A step with them is enqueued whole unless a draft bar can end the chain
+(see above): the block's chain runs first,
 on the device that embeds (which keeps the rows of the tokens the chain can
 pick, see "The token embedding of `qwen35`"), each link's pick made by the
 sampler with the settings and the noise of the row that will verify it and
@@ -3432,16 +3590,19 @@ lookup in earlier text takes part as soon as a model drafter does and never alon
   each card), 260 and 146 with a range of layers each. A division by the experts
   a layer has on the device was tried through the plan's profile and changed
   nothing; the store moves slots between layers by need as it runs.
-- *The policy is the conductor's, unchanged, and on this machine it chooses no
-  window yet.* The price of a step by its rows and of a chain by its links is
+- *The policy is the conductor's.* The price of a step by its rows and of a
+  chain by its links is
   measured when the engine starts, and those steps find no expert in a slot: with
   the block loaded they gave 35.5, 49.4, 93.0, 77.0, 97.5, 133.5, 111.3 and
   122.5 ms for one to eight rows and 15.6, 3.3, 4.7, 6.3, 7.7, 9.0 and 10.1 ms
   for one to seven links (2026-11-15, both cards on every layer, load average 20;
-  a step of one row takes 22 ms once the tiers hold a text's experts). A price
-  is corrected only by a step of its size that runs, so the one-row price comes
-  down to what it is and the others stay where they were measured, and a window
-  of two rows at 49 ms and a link never pays against a row at 22 ms. Started
+  a step of one row takes 22 ms once the tiers hold a text's experts). Until
+  2026-11-15 a price was corrected only by a step of its size that ran, so the
+  one-row price came down to what it is and the others stayed where they were
+  measured, and a window of two rows at 49 ms and a link never paid against a
+  row at 22 ms; since then a size that has not run for 256 steps is tried
+  again at the price of the row that runs (see "Prices that stay true").
+  Started
   without that measurement (so that the table fills from the steps that run) the
   server did draft: the block's links were accepted 115 times of 176, 51 of 73
   and 21 of 29 for the first three on German and English prose and Rust (the
@@ -3451,9 +3612,8 @@ lookup in earlier text takes part as soon as a model drafter does and never alon
   step of one row misses 6 to 37). It was not faster for it, the measured steps
   no longer filled the tiers with what a first text finds there, and a first
   chain that ran while experts were missing left a price that kept every later
-  one from being chosen. So the server measures at the start as for any model.
-  What this model needs of the conductor, and does not have: prices of its
-  windows taken when the tiers are filled, or tried again after they were.
+  one from being chosen. So the server measures at the start as for any model,
+  and the windows' prices are taken again when the tiers are filled.
 - *The window* is four rows unless `--window` says otherwise (2 to 8): a row of
   this model routes to experts of its own, so a rejected draft costs what a token
   costs.

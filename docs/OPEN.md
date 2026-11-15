@@ -44,15 +44,31 @@ between cards stay with the model. Today the two models share almost nothing ins
 ## Qwen3.8 Flash-Next (`qwen4exp`)
 
 ### Speculation that pays (output unchanged)
-The draft block is in `main` (`--drafters <file>`): exact, and no faster yet. Measured
-2026-11-15 on two cards with `--ram 8G` under load: 13 to 41 tokens/s without it and 10 to 41
-with it; the runs are too noisy to tell the two apart.
-- [ ] Window prices that follow the tiers: measured warm, re-measured, stale sizes tried
-      again. Today they are measured once at load on cold tiers, so no window is chosen on
-      two cards. The same defect lets a late step poison the 27B's price table under CPU load.
+The draft block is in `main` (`--drafters <file>`): exact, and slower with it. Measured
+2026-11-15 on two cards with `--ram 8G`, back to back: 16 to 27 tokens/s with it (55 once,
+on a text it could copy) and 20 to 40 without. The server now chooses windows in every
+request (1.7 to 3.7 tokens a step, 68 to 98 % of the drafts accepted), and a window step
+reads 18 to 56 experts from the file where a row reads 3.5 to 16.
+- [x] Window prices that follow the tiers: a size's price is the mean of its last eight
+      steps without the largest, and a size that has not run for 256 steps is tried again
+      at the price of the nearest smaller size that runs (`ares_sched::Curve`). The server
+      chooses windows on two cards (2026-11-15, see the Speculation section).
 - [ ] All 512 experts of the draft block resident in VRAM (about 700 MiB): a link costs
       5 to 9 ms today, 1.5 ms when its experts are there.
-- [ ] Chain cut per token by the draft's own probability.
+- [x] Chain cut per token by the draft's own probability: the links. The block reports the
+      probability of each draft, the conductor counts acceptance by probability and sets
+      a bar per link from the step's rate and the link's price, and the chain ends at it.
+- [ ] The rows of the links a chain did not make leave the step. Today the window's rows
+      are fixed before the chain runs, so a cut saves links and not rows, and a row is what
+      a window of this model costs most (its experts). Needs the chain as a step of its
+      own before the window (the host then cuts the window, and can mask its rows), or a
+      window the device threads shorten together.
+- [ ] The price of a window by what it misses. The price of a size leaves out the dearest
+      of its last eight steps (so that a late step does not count), and on this model that
+      step is the one that fetched experts; and what a window brings into the tiers pushes
+      out what the next steps need, which no step is charged for. First to try: the plain
+      mean for a model whose steps wait for experts; then a price per row by where its
+      experts are. Until then `--drafters` costs this model speed.
 - [ ] Speculation never waits for a file read: a window row whose expert is not cached is
       not accepted; the rows before it stay exact.
 - [ ] Draft vocabulary (German, English, code) for the draft block.
@@ -136,6 +152,10 @@ Everything `FEATURES.md` lists for the 27B and not for Flash-Next is owed:
 ## Qwen3.8 27B (`qwen35`)
 - [ ] Drafts under a layer split (Flash-Next drafts in every placement; the 27B not under
       `--split layer`): parity owed to the 27B, step 6 of the shared layer.
+- [ ] The draft chain's cut costs a wait of the host per link (the device thread reads the
+      link's picks before it enqueues the next); on 2026-11-15 the tokens per step rose and
+      the step got longer by about as much. A cut on the device (the links of a chain as
+      kernels that end early) would keep the gain.
 - [ ] A generating step of more than 16 rows still changes kernel family (three sequences
       drafting at once): the last gap in "text with drafts is the text without" (which holds
       since 2026-11-16 for single sequences in every placement and K/V format). Texts under
