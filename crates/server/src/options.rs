@@ -9,6 +9,7 @@ use ares_cuda::Precision;
 use ares_tokenizer::Json;
 
 use crate::ReasoningFormat;
+use crate::defaults::{self, Conflict, Defaults};
 use crate::plan::{self, Drafter, LoadOptions, SplitKind};
 
 /// What is set for one model.
@@ -17,6 +18,9 @@ pub struct ModelOptions {
     pub load: LoadOptions,
     /// How the reasoning of a reply is returned when a request does not say.
     pub reasoning_format: ReasoningFormat,
+    /// What a request gets for the fields it leaves out, and the most tokens
+    /// of a reply.
+    pub defaults: Defaults,
 }
 
 impl Default for ModelOptions {
@@ -25,7 +29,15 @@ impl Default for ModelOptions {
     fn default() -> Self {
         let mut load = LoadOptions::new("");
         set_chat_variable(&mut load, "preserve_reasoning", Json::Bool(true));
-        Self { load, reasoning_format: ReasoningFormat::default() }
+        Self { load, reasoning_format: ReasoningFormat::default(), defaults: Defaults::default() }
+    }
+}
+
+impl ModelOptions {
+    /// Whether the options hold together, each being a value its option
+    /// takes: [`set`] checks one value, this the combinations.
+    pub fn check(&self) -> Result<(), Conflict> {
+        self.defaults.check()
     }
 }
 
@@ -79,7 +91,8 @@ pub fn lookup(name: &str) -> Option<(&'static str, Kind)> {
         "--reasoning-effort" => ("--reasoning-effort", Kind::Value),
         "--reasoning-preserve" => ("--reasoning-preserve", Kind::Switch(true)),
         "--no-reasoning-preserve" => ("--reasoning-preserve", Kind::Switch(false)),
-        _ => return None,
+        // The defaults of a request's fields, under the names of the fields.
+        other => (defaults::lookup(other)?, Kind::Value),
     })
 }
 
@@ -272,7 +285,7 @@ pub fn set(options: &mut ModelOptions, flag: &'static str, value: &str) -> Resul
             };
             set_chat_variable(load, "preserve_reasoning", Json::Bool(on));
         }
-        other => unreachable!("'{other}' is not a name lookup gives"),
+        other => defaults::set(&mut options.defaults, other, value)?,
     }
     Ok(())
 }

@@ -71,6 +71,13 @@ pub(crate) struct Parsed {
     /// How many completions to make of the prompt.
     pub n: u32,
     pub logprobs: Option<LogprobFormat>,
+    /// The request asks for a seed of its own draw (llama.cpp's `seed: -1`),
+    /// which is not the same as saying nothing where the model has a seed.
+    pub fresh_seed: bool,
+    /// The limit of tokens the reply got in place of the larger one the
+    /// request asked for (the model's `--max-tokens-limit`); set where the
+    /// model's defaults are applied.
+    pub lowered: Option<u32>,
 }
 
 /// The most completions one request may ask for.
@@ -241,6 +248,8 @@ pub(crate) fn from_json(
     let sampling = Sampling { logprobs, ..sampling(&fields)? };
     sampling.validate().map_err(|e| ApiError::invalid_param(e.field, e.to_string()))?;
     refuse_unserved(endpoint, &fields)?;
+    // A seed that is there and is none is llama.cpp's -1.
+    let fresh_seed = sampling.seed.is_none() && fields.get("seed").is_some();
 
     let (reasoning, tools) = match endpoint {
         Endpoint::Chat => (reasoning::asked(&fields)?, tools::asked(&fields)?),
@@ -269,6 +278,8 @@ pub(crate) fn from_json(
         tools,
         n,
         logprobs: format,
+        fresh_seed,
+        lowered: None,
     })
 }
 

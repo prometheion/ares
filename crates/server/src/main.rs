@@ -39,7 +39,7 @@ async fn main() -> ExitCode {
     // One model on the command line is the one preset of a server without a
     // preset file. A file that cannot be served is refused here, with its
     // line, before anything is started.
-    let cli::Options { host, port, presets, load, reasoning_format, given } = options;
+    let cli::Options { host, port, presets, load, reasoning_format, defaults, given } = options;
     let (presets, single) = match &presets {
         Some(file) => match Presets::read(file, &given) {
             Ok(presets) => (presets, None),
@@ -49,7 +49,7 @@ async fn main() -> ExitCode {
             }
         },
         None => {
-            let presets = Presets::single(ModelOptions { load, reasoning_format });
+            let presets = Presets::single(ModelOptions { load, reasoning_format, defaults });
             let id = presets.models[0].id.clone();
             (presets, Some(id))
         }
@@ -97,6 +97,10 @@ async fn run(
         .ok()
         .and_then(|text| plan::parse_available_ram(&text));
     let offered = presets.models.len();
+    // What a request to each model gets for the fields it leaves out, once.
+    for preset in &presets.models {
+        tracing::info!(model = preset.id.as_str(), "{}", preset.options.defaults);
+    }
     let models = Arc::new(Models::start(
         presets,
         Arc::new(DeviceLoader),

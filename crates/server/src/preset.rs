@@ -20,16 +20,21 @@
 //! devices = 0
 //! context = 16384
 //! ram = 2G
+//! temperature = 0.7
+//! top-p = 0.8
+//! max-tokens = 4096
 //! ```
 //!
 //! A key is an option of the command line under its name without the dashes
 //! (`context`, `kv`, `chat-var`, which may stand several times), with the
 //! value the option takes; a switch (`reasoning-preserve`) takes `true` or
-//! `false`. Three keys exist only here: `aliases` (more ids the model answers
-//! to, separated by commas), `load-on-startup` (`true`: loaded when the server
-//! starts, not at its first request) and `idle-unload` (how long the model may
-//! stay loaded without a request: seconds, or a number with `s`, `m` or `h`;
-//! `never`, the default).
+//! `false`. Among them are the defaults of a model's requests (`temperature`,
+//! `top-p`, `max-tokens` and the others of [`crate::defaults`]): what a
+//! request gets for a field it leaves out. Three keys exist only here:
+//! `aliases` (more ids the model answers to, separated by commas),
+//! `load-on-startup` (`true`: loaded when the server starts, not at its first
+//! request) and `idle-unload` (how long the model may stay loaded without a
+//! request: seconds, or a number with `s`, `m` or `h`; `never`, the default).
 //!
 //! What holds for a model is, from the strongest: the command line, the
 //! model's section, the section `[*]`, the built-in defaults. `ram` is the
@@ -38,8 +43,10 @@
 //! together; in a model's section it is that model's part of it.
 //!
 //! Nothing is ignored: a key the server does not know, a value an option does
-//! not take, a section without a model file or with a file that is not there,
-//! and an id that two sections answer to are errors with the file and the line.
+//! not take, two keys that cannot hold together (`max-tokens` above
+//! `max-tokens-limit`), a section without a model file or with a file that is
+//! not there, and an id that two sections answer to are errors with the file
+//! and the line.
 //! An option of llama-server that Ares has under another name is answered with
 //! that name.
 
@@ -229,6 +236,23 @@ impl Presets {
                 options::set(&mut preset.options, flag, value).map_err(|e| at(0, e.to_string()))?;
             }
             preset.options.load.ram = own_ram;
+            // Each value is one its option takes; together they may not hold.
+            // The line is that of a key of the two that is in effect: one of
+            // the model's own section if there is one, else one of [*], and
+            // none if the command line gave both.
+            if let Err(conflict) = preset.options.check() {
+                let given = |flag: &str| on_command_line.iter().any(|(known, _)| *known == flag);
+                let line_in = |keys: &[Key]| {
+                    let flags = conflict.flags.iter().filter(|flag| !given(flag));
+                    let lines = flags.filter_map(|flag| {
+                        let name = flag.trim_start_matches('-');
+                        keys.iter().find(|key| key.name == name).map(|key| key.line)
+                    });
+                    lines.max()
+                };
+                let line = line_in(&section.keys).or_else(|| line_in(&global.keys)).unwrap_or(0);
+                return Err(at(line, format!("[{}]: {}", preset.id, conflict.reason)));
+            }
             preset.options.load.name = Some(preset.id.clone());
 
             let ids = std::iter::once((preset.id.clone(), section.line)).chain(
@@ -477,6 +501,33 @@ fn other_name(name: &str) -> Option<&'static str> {
         "stop-timeout" => "an unload writes nothing and waits for nothing but running requests",
         "ngl" | "gpu-layers" | "n-gpu-layers" => "all of a model is on the devices",
         "fa" | "flash-attn" | "jinja" => "that is always on",
+        // The defaults of the sampler: a key is the field of a request, with
+        // dashes.
+        "temp" => "the temperature of a request that names none is 'temperature'",
+        "top-nsigma" => "that default is 'top-n-sigma' (0 is off)",
+        "typical" => "that default is 'typical-p'",
+        "dynatemp-exp" => "that default is 'dynatemp-exponent'",
+        "mirostat-lr" => "mirostat's rate is 'mirostat-eta'",
+        "mirostat-ent" => "mirostat's target is 'mirostat-tau'",
+        "dry-sequence-breaker" => {
+            "DRY's breakers are 'dry-sequence-breakers', all of them in one JSON array \
+             ([\"\\n\", \":\"])"
+        }
+        "sampler-seq" | "sampling-seq" => {
+            "the order of the samplers is 'samplers', by their names \
+             (penalties,dry,top_k,top_p,min_p,temperature)"
+        }
+        "s" => "the seed of a request that names none is 'seed'",
+        "n" | "predict" | "n-predict" => {
+            "the limit of tokens for a request that names none is 'max-tokens'; \
+             'max-tokens-limit' is the most any request gets"
+        }
+        "ignore-eos" => {
+            "a reply that does not end is what a request asks for (ignore_eos), not a default \
+             of a model"
+        }
+        "l" | "logit-bias" => "a logit bias is a request's (logit_bias); a model has no default",
+        "adaptive-target" | "adaptive-decay" => "adaptive-p is not built",
         _ => return None,
     })
 }
@@ -677,6 +728,66 @@ idle-unload = never
                 5,
                 "is more than the 4294967296 bytes the server may use",
             ),
+            // The defaults of a model's requests: the range of each value.
+            (
+                "[m]\nmodel = /m.gguf\ntop-p = 1.5\n",
+                3,
+                "top-p = '1.5' is not a number above 0 and at most 1",
+            ),
+            (
+                "[*]\ntemperature = -1\n[m]\nmodel = /m.gguf\n",
+                2,
+                "temperature = '-1' is not a number from 0 on",
+            ),
+            ("[m]\nmodel = /m.gguf\nmirostat = 3\n", 3, "mirostat = '3' is not 0 (off), 1 or 2"),
+            (
+                "[m]\nmodel = /m.gguf\nrepeat-last-n = 4096\n",
+                3,
+                "repeat-last-n = '4096' is not a number of tokens from 0 to 1024",
+            ),
+            (
+                "[m]\nmodel = /m.gguf\nsamplers = top_k;temperature\n",
+                3,
+                "is not names of samplers separated by commas",
+            ),
+            (
+                "[m]\nmodel = /m.gguf\ndry-sequence-breakers = \\n\n",
+                3,
+                "is not a JSON array of strings",
+            ),
+            ("[m]\nmodel = /m.gguf\nseed = -1\n", 3, "seed = '-1' is not a whole number from 0"),
+            (
+                "[m]\nmodel = /m.gguf\nmax-tokens = 0\n",
+                3,
+                "max-tokens = '0' is not a number of tokens, at least 1",
+            ),
+            (
+                "[*]\nmax-tokens-limit = lots\n[m]\nmodel = /m.gguf\n",
+                2,
+                "max-tokens-limit = 'lots' is not a number of tokens, at least 1",
+            ),
+            (
+                "[m]\nmodel = /m.gguf\ntemperature = 0.5\ntemperature = 0.7\n",
+                4,
+                "'temperature' stands twice in [m] (first at line 3)",
+            ),
+            // And the two that cannot hold together, wherever each stands.
+            (
+                "[m]\nmodel = /m.gguf\nmax-tokens = 8192\nmax-tokens-limit = 4096\n",
+                4,
+                "[m]: max-tokens = 8192 is more than max-tokens-limit = 4096",
+            ),
+            (
+                "[*]\nmax-tokens = 8192\n[m]\nmodel = /m.gguf\n[n]\nmodel = /n.gguf\n\
+                 max-tokens-limit = 4096\n",
+                7,
+                "[n]: max-tokens = 8192 is more than max-tokens-limit = 4096",
+            ),
+            (
+                "[*]\nmax-tokens-limit = 10\nmax-tokens = 20\n[m]\nmodel = /m.gguf\n",
+                3,
+                "[m]: max-tokens = 20 is more than max-tokens-limit = 10",
+            ),
         ] {
             let error = parse(text, &[]).expect_err(text);
             assert_eq!(error.file, Path::new("m.ini"), "{text}");
@@ -730,6 +841,23 @@ idle-unload = never
             ("stop-timeout = 180", "an unload writes nothing"),
             ("ngl = 99", "all of a model is on the devices"),
             ("jinja = true", "that is always on"),
+            // The sampler's defaults and the length of a reply.
+            ("temp = 0.7", "'temperature'"),
+            ("top-nsigma = 2", "'top-n-sigma'"),
+            ("typical = 0.9", "'typical-p'"),
+            ("dynatemp-exp = 1.5", "'dynatemp-exponent'"),
+            ("mirostat-lr = 0.1", "'mirostat-eta'"),
+            ("mirostat-ent = 5", "'mirostat-tau'"),
+            ("dry-sequence-breaker = none", "'dry-sequence-breakers'"),
+            ("sampler-seq = edskypmxt", "'samplers'"),
+            ("sampling-seq = edskypmxt", "'samplers'"),
+            ("s = 42", "'seed'"),
+            ("n-predict = 96000", "'max-tokens'"),
+            ("predict = 96000", "'max-tokens-limit' is the most any request gets"),
+            ("n = 96000", "'max-tokens'"),
+            ("ignore-eos = true", "ignore_eos"),
+            ("logit-bias = 15043+1", "logit_bias"),
+            ("adaptive-target = 0.5", "adaptive-p is not built"),
         ] {
             let said = refused(&format!("[m]\nmodel = /m.gguf\n{key}\n"));
             let name = key.split(' ').next().unwrap();
@@ -739,6 +867,86 @@ idle-unload = never
         // One that Ares has nothing for is named and not taken.
         let said = refused("[m]\nmodel = /m.gguf\nmmproj = /p.gguf\n");
         assert!(said.contains("Ares has no option 'mmproj'") && said.contains("ares --help"));
+    }
+
+    #[test]
+    fn the_defaults_of_requests_are_keys_of_a_model_or_of_all_models() {
+        // The sampling lines of the production preset of llama-server stand as
+        // they are; `n-predict` is `max-tokens`.
+        let text = "\
+[*]
+max-tokens = 96000
+reasoning = on
+
+[Qwen3.8-27b]
+model = /models/Qwen3.8-27B-UD-Q4_K_S.gguf
+temperature = 1.0
+top-p = 0.95
+top-k = 20
+min-p = 0.0
+presence-penalty = 0.0
+repeat-penalty = 1.0
+
+[small]
+model = /models/small.gguf
+temperature = 0.7
+max-tokens = 4096
+max-tokens-limit = 8192
+seed = 7
+samplers = penalties, dry, top_k, top_p, min_p, temperature
+dry-sequence-breakers = [\"\\n\", \"a = b\"]
+";
+        let presets = parse(text, &[]).unwrap();
+        let [big, small] = presets.models.as_slice() else { panic!("{presets:?}") };
+        let defaults = &big.options.defaults;
+        let sampling = ares_api::Sampling {
+            temperature: Some(1.0),
+            top_p: Some(0.95),
+            top_k: Some(20),
+            min_p: Some(0.0),
+            presence_penalty: Some(0.0),
+            repeat_penalty: Some(1.0),
+            ..ares_api::Sampling::default()
+        };
+        assert_eq!(defaults.sampling, sampling);
+        assert_eq!((defaults.max_tokens, defaults.max_tokens_limit), (Some(96000), None));
+
+        let defaults = &small.options.defaults;
+        assert_eq!(defaults.sampling.temperature, Some(0.7));
+        assert_eq!(defaults.sampling.top_p, None, "another model's key is not this one's");
+        assert_eq!((defaults.max_tokens, defaults.max_tokens_limit), (Some(4096), Some(8192)));
+        assert_eq!(defaults.sampling.seed, Some(7));
+        assert_eq!(defaults.sampling.samplers.as_ref().map(Vec::len), Some(6));
+        // A value may hold an equals sign and a backslash.
+        let breakers = vec!["\n".to_owned(), "a = b".to_owned()];
+        assert_eq!(defaults.sampling.dry_sequence_breakers, Some(breakers));
+    }
+
+    #[test]
+    fn the_command_line_takes_part_in_what_has_to_hold_together() {
+        let text = "[*]\nmax-tokens = 8192\n[m]\nmodel = /m.gguf\n[n]\nmodel = /n.gguf\n\
+                    max-tokens = 2048\n";
+        // A limit on the command line holds for every model: the default of
+        // [*], which [m] takes, is above it, and the line is that key's.
+        let error = parse(text, &[("--max-tokens-limit", "4096")]).unwrap_err();
+        assert_eq!(error.line, 2, "{error}");
+        assert!(
+            error.reason.contains("[m]: max-tokens = 8192 is more than max-tokens-limit = 4096"),
+            "{error}"
+        );
+        // The command line's value takes the place of the file's, and then
+        // they hold together.
+        let given = [("--max-tokens-limit", "4096"), ("--max-tokens", "100")];
+        let presets = parse(text, &given).unwrap();
+        for model in &presets.models {
+            let defaults = &model.options.defaults;
+            assert_eq!((defaults.max_tokens, defaults.max_tokens_limit), (Some(100), Some(4096)));
+        }
+        // Two options of the command line that do not: no line of the file.
+        let given = [("--max-tokens-limit", "10"), ("--max-tokens", "100")];
+        let error = parse(text, &given).unwrap_err();
+        assert_eq!(error.line, 0, "{error}");
+        assert!(error.to_string().starts_with("m.ini: [m]: max-tokens = 100 is more"), "{error}");
     }
 
     #[test]

@@ -47,6 +47,7 @@ use tokio::sync::{Notify, broadcast, watch};
 
 use crate::ReasoningFormat;
 use crate::bridge::Flight;
+use crate::defaults::Defaults;
 use crate::preset::{Preset, Presets};
 
 /// What a load finds next to it.
@@ -131,7 +132,7 @@ pub struct ModelEvent {
 }
 
 /// A model as `GET /v1/models` lists it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Listed {
     pub id: String,
     pub aliases: Vec<String>,
@@ -140,6 +141,8 @@ pub struct Listed {
     /// `None` for the model of a server that was given an engine and no
     /// presets ([`Models::fixed`]).
     pub status: Option<ModelEvent>,
+    /// What a request to the model gets for the fields it leaves out.
+    pub defaults: Arc<Defaults>,
 }
 
 /// Why a request does not get its model.
@@ -172,6 +175,8 @@ struct Loaded {
 
 struct Entry {
     preset: Arc<Preset>,
+    /// The preset's, for the requests to take with their hold.
+    defaults: Arc<Defaults>,
     phase: Phase,
     loaded: Option<Loaded>,
     card: Option<ModelCard>,
@@ -584,6 +589,7 @@ struct Held {
     /// may have used.
     id: Option<String>,
     reasoning_format: ReasoningFormat,
+    defaults: Arc<Defaults>,
     home: Option<(Arc<Shared>, usize)>,
 }
 
@@ -637,11 +643,25 @@ impl Lease {
     pub fn reasoning_format(&self) -> ReasoningFormat {
         self.0.reasoning_format
     }
+
+    /// What a request gets for the fields it leaves out, and the most tokens
+    /// of its reply.
+    pub fn defaults(&self) -> &Defaults {
+        &self.0.defaults
+    }
 }
 
 enum Kind {
-    Fixed { engine: Arc<dyn Engine>, flight: Arc<Flight>, reasoning_format: ReasoningFormat },
-    Presets { shared: Arc<Shared>, manager: Mutex<Option<tokio::task::JoinHandle<()>>> },
+    Fixed {
+        engine: Arc<dyn Engine>,
+        flight: Arc<Flight>,
+        reasoning_format: ReasoningFormat,
+        defaults: Arc<Defaults>,
+    },
+    Presets {
+        shared: Arc<Shared>,
+        manager: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    },
 }
 
 /// The models of a server. See the [module documentation](self).
@@ -656,9 +676,14 @@ impl std::fmt::Debug for Models {
 impl Models {
     /// One engine that is there from the start to the end, and decides for
     /// itself which names it answers to: nothing is loaded or unloaded.
-    pub fn fixed(engine: Arc<dyn Engine>, reasoning_format: ReasoningFormat) -> Self {
+    /// `reasoning_format` and `defaults` hold for every model it serves.
+    pub fn fixed(
+        engine: Arc<dyn Engine>,
+        reasoning_format: ReasoningFormat,
+        defaults: Defaults,
+    ) -> Self {
         let flight = Arc::new(Flight::new(&*engine));
-        Self(Kind::Fixed { engine, flight, reasoning_format })
+        Self(Kind::Fixed { engine, flight, reasoning_format, defaults: Arc::new(defaults) })
     }
 
     /// The models of `presets`, none loaded yet; those that are to be loaded
@@ -678,6 +703,7 @@ impl Models {
             .map(|(preset, ticket)| Entry {
                 wanted: preset.load_on_startup.then_some(ticket),
                 asked: preset.load_on_startup,
+                defaults: Arc::new(preset.options.defaults.clone()),
                 preset: Arc::new(preset),
                 phase: Phase::Unloaded,
                 loaded: None,
@@ -724,12 +750,13 @@ impl Models {
 
     async fn take(&self, name: &str, load: bool) -> Result<Lease, AcquireError> {
         let shared = match &self.0 {
-            Kind::Fixed { engine, flight, reasoning_format } => {
+            Kind::Fixed { engine, flight, reasoning_format, defaults } => {
                 return Ok(Lease(Arc::new(Held {
                     engine: Some(engine.clone()),
                     flight: flight.clone(),
                     id: None,
                     reasoning_format: *reasoning_format,
+                    defaults: defaults.clone(),
                     home: None,
                 })));
             }
@@ -766,6 +793,7 @@ impl Models {
                         flight: loaded.flight.clone(),
                         id: Some(entry.preset.id.clone()),
                         reasoning_format: entry.preset.options.reasoning_format,
+                        defaults: entry.defaults.clone(),
                         home: Some((shared.clone(), index)),
                     })));
                 }
@@ -860,7 +888,7 @@ impl Models {
     /// Every model with its state, in the order of the preset file.
     pub fn list(&self) -> Vec<Listed> {
         match &self.0 {
-            Kind::Fixed { engine, .. } => engine
+            Kind::Fixed { engine, defaults, .. } => engine
                 .models()
                 .into_iter()
                 .map(|card| Listed {
@@ -868,6 +896,7 @@ impl Models {
                     aliases: Vec::new(),
                     card: Some(card),
                     status: None,
+                    defaults: defaults.clone(),
                 })
                 .collect(),
             Kind::Presets { shared, .. } => shared
@@ -882,6 +911,7 @@ impl Models {
                         aliases: entry.preset.aliases.clone(),
                         card: entry.card.clone(),
                         status: Some(ModelEvent { model, status, reason }),
+                        defaults: entry.defaults.clone(),
                     }
                 })
                 .collect(),

@@ -44,6 +44,7 @@
 
 mod anthropic;
 mod bridge;
+pub mod defaults;
 mod error;
 pub mod load;
 pub mod models;
@@ -72,6 +73,7 @@ use tokio::net::TcpListener;
 use tokio::sync::{Notify, watch};
 
 use crate::bridge::Stop;
+use crate::defaults::Defaults;
 use crate::models::Models;
 pub use crate::reasoning::ReasoningFormat;
 
@@ -91,6 +93,9 @@ pub struct Config {
     /// How the reasoning of a reply is returned when a request does not say
     /// (`--reasoning-format`).
     pub reasoning_format: ReasoningFormat,
+    /// What a request gets for the fields it leaves out, and the most tokens
+    /// of a reply (`--temperature` and the others of the `defaults` module).
+    pub defaults: Defaults,
 }
 
 impl Default for Config {
@@ -100,6 +105,7 @@ impl Default for Config {
             max_body_bytes: 64 << 20,
             shutdown_grace: Duration::from_secs(30),
             reasoning_format: ReasoningFormat::default(),
+            defaults: Defaults::default(),
         }
     }
 }
@@ -118,12 +124,13 @@ pub fn router(engine: Arc<dyn Engine>) -> Router {
 /// Reads the engine's statistics once ([`Engine::stats`]), which may wait
 /// for the engine's step.
 pub fn router_with(engine: Arc<dyn Engine>, config: Config) -> Router {
-    router_over(Arc::new(Models::fixed(engine, config.reasoning_format)), config)
+    let models = Models::fixed(engine, config.reasoning_format, config.defaults.clone());
+    router_over(Arc::new(models), config)
 }
 
 /// The server's routes over `models`: a request's `model` names one of them,
-/// which is loaded if it is not. `config.reasoning_format` is not read: each
-/// model has its own.
+/// which is loaded if it is not. `config.reasoning_format` and
+/// `config.defaults` are not read: each model has its own.
 pub fn router_over(models: Arc<Models>, config: Config) -> Router {
     // Nobody raises this signal: a router that is served by someone else is
     // stopped by them.
@@ -181,8 +188,8 @@ pub async fn serve_until(
     shutdown: impl Future<Output = ()> + Send + 'static,
     now: impl Future<Output = ()> + Send,
 ) -> io::Result<()> {
-    let models = Arc::new(Models::fixed(engine, config.reasoning_format));
-    serve_models(listener, models, config, shutdown, now).await
+    let models = Models::fixed(engine, config.reasoning_format, config.defaults.clone());
+    serve_models(listener, Arc::new(models), config, shutdown, now).await
 }
 
 /// Serves `models` on `listener` until `shutdown` completes, as [`serve`]

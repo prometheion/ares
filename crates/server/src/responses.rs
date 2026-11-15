@@ -131,6 +131,7 @@ use crate::models::Lease;
 use crate::reply::Sorter;
 use crate::routes::{
     self, App, End, Reply, Step, json_response, next_request_id, read_body, sse_response,
+    with_limit,
 };
 use crate::wire::{self, Endpoint, Parsed};
 
@@ -181,11 +182,12 @@ async fn read(
     id: RequestId,
     purpose: Purpose,
 ) -> Result<(Parsed, Sorter, Echo, Lease), ApiError> {
-    let (chat, echo) = request::to_chat(&wire::read_json(body)?, purpose)?;
+    let (chat, mut echo) = request::to_chat(&wire::read_json(body)?, purpose)?;
     let mut parsed = wire::from_json(Endpoint::Chat, &chat, id).map_err(request::renamed)?;
     let (sorter, lease) = routes::prepare(app, &mut parsed, Some(ReasoningFormat::Auto))
         .await
         .map_err(request::renamed)?;
+    echo.applied(&parsed.request);
     Ok((parsed, sorter, echo, lease))
 }
 
@@ -209,7 +211,12 @@ async fn try_create(app: App, request: Request) -> Result<Response, ApiError> {
     );
     let reply = Reply::start(&app, &lease, parsed.request, sorter)?;
     let output = Output::new(id.to_string());
-    if parsed.stream { stream(reply, head, output).await } else { whole(reply, head, output).await }
+    let response = if parsed.stream {
+        stream(reply, head, output).await
+    } else {
+        whole(reply, head, output).await
+    };
+    Ok(with_limit(response?, parsed.lowered))
 }
 
 /// Counts the prompt of a request and generates nothing: the body is read

@@ -16,6 +16,7 @@ use axum::response::{IntoResponse, Response};
 use futures_util::StreamExt;
 
 use crate::bridge::{DecisionRun, Item, Run, Stop, Timings};
+use crate::defaults::LIMIT_HEADER;
 use crate::error::ApiError;
 use crate::models::{Lease, Listed, ModelEvent, Models};
 use crate::reasoning::{self, Split};
@@ -37,8 +38,20 @@ pub(crate) async fn health() -> Json<serde_json::Value> {
     Json(serde_json::json!({ "status": "ok" }))
 }
 
+/// `GET /v1/models`: every model, and with each what a field means that a
+/// request to it leaves out (`defaults`, under the names of the fields) and
+/// the most tokens of a reply, if the model has such a limit.
 pub(crate) async fn models(State(app): State<App>) -> Json<serde_json::Value> {
-    Json(wire::model_list(&app.models.list()))
+    let listed = app.models.list();
+    let mut list = wire::model_list(&listed);
+    let models = list["data"].as_array_mut().into_iter().flatten();
+    for (model, listed) in models.zip(&listed) {
+        model["defaults"] = listed.defaults.fields();
+        if let Some(limit) = listed.defaults.max_tokens_limit {
+            model["max_tokens_limit"] = limit.into();
+        }
+    }
+    Json(list)
 }
 
 /// The model a request names, loaded if it was not, which the request waits
@@ -257,17 +270,21 @@ pub(crate) async fn method_not_allowed(request: Request) -> ApiError {
 // [`Reply`] (the client went away) cancels the request in the engine.
 
 /// Takes the model a chat request names ([`model_of`]: the request waits
-/// for its load), applies what the request says about thinking and about
-/// tools to the request for the engine (the variables of the chat template,
-/// the rule of the reply), and returns what sorts the text of its reply with
-/// the hold on the model. `format` is how the reasoning is returned when the
-/// request does not say; `None`: as the model's own options say.
+/// for its load), gives the request the model's defaults for what it leaves
+/// out and holds the length of its reply to the model's limit (the
+/// `defaults` module), applies what the request says about thinking and
+/// about tools to the request for the engine (the variables of the chat
+/// template, the rule of the reply), and returns what sorts the text of its
+/// reply with the hold on the model. `format` is how the reasoning is
+/// returned when the request does not say; `None`: as the model's own
+/// options say.
 pub(crate) async fn prepare(
     app: &App,
     parsed: &mut Parsed,
     format: Option<ReasoningFormat>,
 ) -> Result<(Sorter, Lease), ApiError> {
     let lease = model_of(app, &mut parsed.request.model).await?;
+    lease.defaults().apply(parsed);
     let format = format.unwrap_or(lease.reasoning_format());
     let thinking = reasoning::apply(parsed, &**lease.engine(), format)?;
     let calls = tools::apply(parsed, &**lease.engine(), &thinking)?;
@@ -351,6 +368,16 @@ pub(crate) async fn count_prompt(lease: &Lease, request: GenerateRequest) -> Res
     counted.map_err(|e| ApiError::from_engine(&**lease.engine(), e))
 }
 
+/// Says in a header of `response` that the reply got `lowered` tokens at
+/// most in place of the larger limit its request asked for
+/// ([`LIMIT_HEADER`]); nothing for a request the model's limit left alone.
+pub(crate) fn with_limit(mut response: Response, lowered: Option<u32>) -> Response {
+    if let Some(limit) = lowered {
+        response.headers_mut().insert(HeaderName::from_static(LIMIT_HEADER), limit.into());
+    }
+    response
+}
+
 /// The response of a stream of events. `keep_alive` is what goes out while
 /// the engine has nothing to say.
 pub(crate) fn sse_response<S>(events: S, keep_alive: KeepAlive) -> Response
@@ -409,11 +436,12 @@ async fn try_completion(
         let sorter = sorter.with_call_ids(tools::call_ids(request.id));
         runs.push(Reply::start(&app, &lease, request, sorter)?);
     }
-    if parsed.stream {
+    let response = if parsed.stream {
         stream(runs, head, parsed.include_usage).await
     } else {
         collect(runs, head).await
-    }
+    };
+    Ok(with_limit(response?, parsed.lowered))
 }
 
 /// `POST /v1/systemone`: one JSON answer, no streaming (the API has none).

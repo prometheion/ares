@@ -7,8 +7,9 @@
 //! `top_p` go by the same name in both APIs, are handed over as they are and
 //! checked there.
 
-use ares_api::Json;
+use ares_api::{GenerateRequest, Json};
 
+use crate::defaults::decimal;
 use crate::error::ApiError;
 use crate::wire::{Fields, members, wrong_type};
 
@@ -84,6 +85,25 @@ pub(crate) struct Echo {
     pub tools: Json,
     pub top_p: Json,
     pub user: Json,
+}
+
+impl Echo {
+    /// Makes the response say what was applied to `request`, the request as
+    /// the engine gets it: the model's default where the body left
+    /// `temperature` or `top_p` out (`null` where the model has none and the
+    /// engine's own value holds), and the limit of tokens the reply has, which
+    /// is the model's when the body named none or more than the model allows.
+    pub fn applied(&mut self, request: &GenerateRequest) {
+        let number = |value: Option<f32>| value.map_or(Json::Null, |v| Json::Float(decimal(v)));
+        if self.temperature.is_null() {
+            self.temperature = number(request.sampling.temperature);
+        }
+        if self.top_p.is_null() {
+            self.top_p = number(request.sampling.top_p);
+        }
+        self.max_output_tokens =
+            request.max_tokens.map_or(Json::Null, |limit| Json::Int(i64::from(limit)));
+    }
 }
 
 fn refuse(param: impl Into<String>, message: impl Into<String>) -> ApiError {

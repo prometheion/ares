@@ -60,7 +60,7 @@ async fn models_come_from_the_engine_in_the_openai_list_format() {
     assert_eq!(body["data"].as_array().unwrap().len(), 2);
     assert_eq!(
         body["data"][0],
-        json!({"id": "mock", "object": "model", "created": 1_700_000_000u64, "owned_by": "ares", "context_length": 4096})
+        json!({"id": "mock", "object": "model", "created": 1_700_000_000u64, "owned_by": "ares", "context_length": 4096, "defaults": {}})
     );
     assert_eq!(body["data"][1]["id"], "mock-2");
 }

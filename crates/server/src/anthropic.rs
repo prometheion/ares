@@ -115,6 +115,7 @@ use crate::models::Lease;
 use crate::reply::Sorter;
 use crate::routes::{
     self, App, End, Reply, Step, json_response, next_request_id, read_body, sse_response,
+    with_limit,
 };
 use crate::wire::{self, Endpoint, Parsed};
 
@@ -174,7 +175,8 @@ async fn try_messages(app: App, request: Request) -> Result<Response, ApiError> 
         "request"
     );
     let reply = Reply::start(&app, &lease, parsed.request, sorter)?;
-    if parsed.stream { stream(reply, head).await } else { whole(reply, head).await }
+    let response = if parsed.stream { stream(reply, head).await } else { whole(reply, head).await };
+    Ok(with_limit(response?, parsed.lowered))
 }
 
 /// Counts the prompt of a request and generates nothing: the body is read

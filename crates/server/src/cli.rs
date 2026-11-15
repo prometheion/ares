@@ -4,6 +4,7 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 
 use ares_server::ReasoningFormat;
+use ares_server::defaults::Defaults;
 use ares_server::options::{self, Kind, ModelOptions};
 use ares_server::plan::LoadOptions;
 
@@ -132,6 +133,67 @@ OPTIONS:
     A budget for the thinking tokens is not built: the engine cannot put the
     tokens that end the thinking into a sequence.
 
+    What a request gets for a field it leaves out. An option has the name of
+    the field with dashes (--top-p for top_p), and a request's own value always
+    holds. The defaults named here are the engine's own.
+        --temperature <T>      0 picks the most probable token [default: 0]
+        --top-k <N>            Keep the N most probable tokens, 0 for all
+                               [default: 0]
+        --top-p <P>            Keep the most probable tokens that hold P of the
+                               probability, 1 for all [default: 1]
+        --min-p <P>            Drop tokens less than P times as probable as the
+                               best, 0 for none [default: 0]
+        --typical-p <P>        Locally typical sampling, 1 is off [default: 1]
+        --top-n-sigma <N>      Keep the tokens within N standard deviations of
+                               the best logit, 0 is off [default: 0]
+        --xtc-probability <P>, --xtc-threshold <P>
+                               XTC: the chance that the most probable tokens are
+                               removed, and the probability from which a token is
+                               one of them [default: 0 (off), 0.1]
+        --dynatemp-range <R>, --dynatemp-exponent <E>
+                               A temperature that moves by R around
+                               --temperature with the entropy [default: 0 (off),
+                               1]
+        --repeat-penalty <N>   Lowers the logits of the tokens that stand in the
+                               last --repeat-last-n tokens by this factor, 1 is
+                               off [default: 1]
+        --presence-penalty <N>, --frequency-penalty <N>
+                               Subtracted from the logits of those tokens, once
+                               and for every time they stand there [default: 0]
+        --repeat-last-n <N>    The tokens the three penalties look at, at most
+                               1024, 0 switches them off [default: 64]
+        --dry-multiplier <N>, --dry-base <N>, --dry-allowed-length <N>,
+        --dry-penalty-last-n <N>
+                               DRY, the penalty for a token that would repeat a
+                               sequence [default: 0 (off), 1.75, 2, 64]
+        --dry-sequence-breakers <JSON>
+                               The strings a repeated sequence does not reach
+                               across, as a JSON array
+                               [default: [\"\\n\", \":\", \"\\\"\", \"*\"]]
+        --mirostat <0|1|2>, --mirostat-tau <N>, --mirostat-eta <N>
+                               Mirostat in place of the other samplers, its
+                               target surprise and its rate [default: 0 (off),
+                               5, 0.1]
+        --samplers <LIST>      The samplers that apply and their order, by name
+                               [default: penalties,dry,top_n_sigma,top_k,typ_p,
+                               top_p,min_p,xtc,temperature]
+        --seed <N>             The seed of a request that names none, which then
+                               draws the same for the same prompt; a request
+                               asks for a draw of its own with seed -1
+                               [default: a new one for every request]
+
+    The length of a reply.
+        --max-tokens <N>       The limit of tokens for a request that names
+                               none (max_tokens, max_completion_tokens,
+                               max_output_tokens, n_predict) [default: none, a
+                               reply ends when the model ends it or the context
+                               is full]
+        --max-tokens-limit <N> The most tokens of any reply: a request that asks
+                               for more gets this many, and its response says so
+                               in the header x-ares-max-tokens-limit; a request
+                               that names no limit gets --max-tokens or, without
+                               it, this [default: none]
+
     -h, --help                 Print this help
 
 The log level is set with the RUST_LOG environment variable (default: info).
@@ -147,6 +209,7 @@ pub struct Options {
     pub presets: Option<PathBuf>,
     pub load: LoadOptions,
     pub reasoning_format: ReasoningFormat,
+    pub defaults: Defaults,
     /// The options of a model as they were given, by their names and in
     /// their order: with a preset file they are set again over every section.
     pub given: Vec<(&'static str, String)>,
@@ -174,6 +237,8 @@ pub enum CliError {
     InvalidValue { flag: &'static str, value: String, expected: &'static str },
     #[error("option '{0}' is given twice")]
     Repeated(&'static str),
+    #[error("options '{}' and '{}': {reason}", flags[0], flags[1])]
+    Conflict { flags: [&'static str; 2], reason: String },
     #[error(
         "there is nothing to serve: name a model file with --model, or a preset file of several \
          models with --models-preset"
@@ -189,6 +254,12 @@ pub enum CliError {
 impl From<options::Invalid> for CliError {
     fn from(e: options::Invalid) -> Self {
         CliError::InvalidValue { flag: e.flag, value: e.value, expected: e.expected }
+    }
+}
+
+impl From<ares_server::defaults::Conflict> for CliError {
+    fn from(e: ares_server::defaults::Conflict) -> Self {
+        CliError::Conflict { flags: e.flags, reason: e.reason }
     }
 }
 
@@ -271,8 +342,12 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, CliErr
         (true, Some(_)) => return Err(CliError::ModelAndPresets),
         _ => {}
     }
-    let ModelOptions { load, reasoning_format } = model;
-    Ok(Command::Run(Box::new(Options { host, port, presets, load, reasoning_format, given })))
+    // What stands on the command line holds together; with a preset file the
+    // sections are checked with it when the file is read.
+    model.check()?;
+    let ModelOptions { load, reasoning_format, defaults } = model;
+    let options = Options { host, port, presets, load, reasoning_format, defaults, given };
+    Ok(Command::Run(Box::new(options)))
 }
 
 #[cfg(test)]
@@ -304,6 +379,8 @@ mod tests {
         expected.chat_variables = vec![("preserve_reasoning".to_owned(), Json::Bool(true))];
         assert_eq!(options.load, expected);
         assert_eq!(options.reasoning_format, ReasoningFormat::Auto);
+        // A field a request leaves out is the engine's own, and no reply has a limit.
+        assert_eq!(options.defaults, Defaults::default());
     }
 
     #[test]
@@ -392,6 +469,91 @@ mod tests {
             run(&["--model=m", "--kv=q7"]).load.kv,
             Some((CacheFormat::Q7, CacheFormat::Q7))
         );
+    }
+
+    #[test]
+    fn the_defaults_of_requests_are_options_under_the_names_of_the_fields() {
+        let options = run(&[
+            "--model=m",
+            "--temperature",
+            "0.7",
+            "--top-p=0.8",
+            "--top-k",
+            "20",
+            "--min-p=0",
+            "--presence-penalty",
+            "1.5",
+            "--repeat-penalty=1.05",
+            "--repeat-last-n",
+            "256",
+            "--dry-sequence-breakers",
+            r#"["\n", ":"]"#,
+            "--samplers=top_k,top_p,temperature",
+            "--mirostat=0",
+            "--seed",
+            "42",
+            "--max-tokens",
+            "4096",
+            "--max-tokens-limit=8192",
+        ]);
+        let defaults = options.defaults;
+        let sampling = &defaults.sampling;
+        assert_eq!((sampling.temperature, sampling.top_p), (Some(0.7), Some(0.8)));
+        assert_eq!((sampling.top_k, sampling.min_p), (Some(20), Some(0.0)));
+        assert_eq!((sampling.presence_penalty, sampling.repeat_penalty), (Some(1.5), Some(1.05)));
+        assert_eq!((sampling.repeat_last_n, sampling.mirostat), (Some(256), Some(0)));
+        assert_eq!(sampling.dry_sequence_breakers, Some(vec!["\n".to_owned(), ":".to_owned()]));
+        assert_eq!(sampling.samplers.as_ref().map(Vec::len), Some(3));
+        assert_eq!(sampling.seed, Some(42));
+        assert_eq!((defaults.max_tokens, defaults.max_tokens_limit), (Some(4096), Some(8192)));
+        // What nobody named stays open.
+        assert_eq!((sampling.frequency_penalty, sampling.typical_p), (None, None));
+
+        // With a preset file they are kept, to hold over every section.
+        let options = run(&["--models-preset=m.ini", "--temperature=0.2", "--max-tokens", "64"]);
+        assert_eq!(
+            options.given,
+            vec![("--temperature", "0.2".to_owned()), ("--max-tokens", "64".to_owned())]
+        );
+
+        // A value outside its range, and two options that cannot hold together.
+        for (args, flag) in [
+            (&["--temperature", "-1"][..], "--temperature"),
+            (&["--top-p", "0"], "--top-p"),
+            (&["--mirostat", "3"], "--mirostat"),
+            (&["--repeat-last-n", "2000"], "--repeat-last-n"),
+            (&["--samplers", "top_k,penalties"], "--samplers"),
+            (&["--dry-sequence-breakers", "none"], "--dry-sequence-breakers"),
+            (&["--seed", "-1"], "--seed"),
+            (&["--max-tokens", "0"], "--max-tokens"),
+            (&["--max-tokens-limit", "-1"], "--max-tokens-limit"),
+        ] {
+            match parse_strs(args) {
+                Err(CliError::InvalidValue { flag: named, .. }) => assert_eq!(named, flag),
+                other => panic!("{args:?}: {other:?}"),
+            }
+        }
+        for first in [&["--model=m"][..], &["--models-preset=m.ini"]] {
+            let args = [first, &["--max-tokens-limit", "100", "--max-tokens=200"]].concat();
+            let error = parse_strs(&args).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "options '--max-tokens' and '--max-tokens-limit': max-tokens = 200 is more than \
+                 max-tokens-limit = 100: the length of a reply whose request names none cannot \
+                 be above the most a request gets"
+            );
+        }
+        assert_eq!(
+            parse_strs(&["--model=m", "--top-k=1", "--top-k", "2"]),
+            Err(CliError::Repeated("--top-k"))
+        );
+        // The names of llama-server are not options of Ares.
+        for name in ["--temp", "--n-predict", "-n", "--typical", "-s"] {
+            assert_eq!(
+                parse_strs(&["--model=m", name, "1"]),
+                Err(CliError::UnknownOption(name.to_owned()))
+            );
+        }
     }
 
     #[test]
