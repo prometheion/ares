@@ -47,8 +47,8 @@ between cards stay with the model. Today the two models share almost nothing ins
 The draft block is in `main` (`--drafters <file>`): exact, and slower with it. Measured
 2026-11-15 on two cards with `--ram 8G`, back to back: 16 to 27 tokens/s with it (55 once,
 on a text it could copy) and 20 to 40 without. The server now chooses windows in every
-request (1.7 to 3.7 tokens a step, 68 to 98 % of the drafts accepted), and a window step
-reads 18 to 56 experts from the file where a row reads 3.5 to 16.
+request (1.7 to 3.7 tokens a step, 47 to 98 % of the drafts accepted), and a window step
+reads 9 to 56 experts from the file where a row reads 3.5 to 16.
 - [x] Window prices that follow the tiers: a size's price is the mean of its last eight
       steps without the largest, and a size that has not run for 256 steps is tried again
       at the price of the nearest smaller size that runs (`ares_sched::Curve`). The server

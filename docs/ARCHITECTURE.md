@@ -1273,11 +1273,11 @@ inside: the windows verify 1 to 7 drafts where they verified 3 to 5 (German,
 run 1: 4, 14, 16, 12, 26, 22 and 1 windows of 1 to 7 drafts, before 72 of 4
 and 21 of 5), a step gives 3 % more tokens (3.06, 3.23 and 2.86 against 2.97,
 3.16 and 2.75) and takes 1 to 7 % longer, because the device thread waits for
-the picks of a link before it enqueues the next. Of 400 to 500 links asked
-for in a request 13 to 26 % were not made. The block's probability says what
+the picks of a link before it enqueues the next. Of the 290 to 490 links
+asked for in a request 11 to 26 % were not made. The block's probability says what
 the average cannot: of the drafts it gave 0.94 and more, 140 of 146 were
-accepted (German) and 148 of 154 (code), of those between 0.25 and 0.56 25 of
-67 and 20 of 49. The gain is not there until a link can end without a wait
+accepted (German) and 148 of 154 (the second code question), of those
+between 0.25 and 0.56 25 of 67 and 20 of 49. The gain is not there until a link can end without a wait
 of the host.
 
 With the tool's process stopped for 250 ms once a second while it generates
@@ -1296,7 +1296,7 @@ before and 67.5, 65.7, 58.0, 96.3, 69.1, 67.0, 74.2 with.
 *Qwen3.8-Flash-Next* through the server (both cards on every layer, `--ram
 8G`, `--drafters` the block's file, three questions of 300 tokens asked three
 times over, thinking off): the server chooses windows in every request, from
-the first on, of 1.7 to 3.7 tokens a step, and 68 to 98 % of their drafts are
+the first on, of 1.7 to 3.7 tokens a step, and 47 to 98 % of their drafts are
 accepted. It is slower for them:
 
 | Tokens per second, German, English, code | round 1 | round 2 | round 3 |
@@ -1304,7 +1304,7 @@ accepted. It is slower for them:
 | with the draft block (load 15 to 19) | 17.9, 18.5, 15.9 | 24.0, 23.8, 21.9 | 55.1, 27.0, 23.1 |
 | without (load 9) | 34.8, 29.0, 19.9 | 38.5, 35.1, 23.3 | 39.7, 39.3, 26.0 |
 
-A step with a window reads 18 to 56 experts from the file where a step of one
+A step with a window reads 9 to 56 experts from the file where a step of one
 row reads 3.5 to 16, and a window step of 1.7 tokens takes 96 ms where a row
 takes 29. Two things the price of a window does not say here: the dearest of
 its last eight steps is left out, and on this model that step is not late,
