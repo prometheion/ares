@@ -1244,6 +1244,7 @@ fn flash_next_writes_with_drafts_what_it_writes_without() {
     let (plain_seeded, _) = ask_sampled(&runtime, 2, &FLASH_PROMPT, 48, seeded.clone(), true);
     let stats = model.take_store_stats().expect("the parts are open");
     runtime.shutdown();
+    drop(runtime);
     drop(model);
     assert_eq!(stats.cpu_experts, 0, "the CPU computed experts: {stats:?}");
     assert_eq!(plain[..4], FLASH_CONTINUATION, "the reference's first tokens");

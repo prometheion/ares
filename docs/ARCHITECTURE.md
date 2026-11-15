@@ -3133,6 +3133,35 @@ lookup in earlier text takes part as soon as a model drafter does and never alon
   this model routes to experts of its own, so a rejected draft costs what a token
   costs.
 
+*Measured* (2026-11-15, RTX 4070 and RTX 3060, `--ram 10G`, `--chat-var
+enable_thinking=false`, greedy, 128 tokens after prompts of about 1000 tokens of
+German prose, English prose and Rust; the machine was shared with three other
+jobs the whole day, the load average is given, and a step that waits for the
+drive or the CPU takes what the load leaves it, so the columns are not one
+measurement of two engines):
+
+| | Generation, first request: German / English / Rust | The same requests again |
+| --- | --- | --- |
+| Both cards on every layer, no drafter (load 9 to 11) | 30.9 / 19.4 / 19.4 tokens/s | 33.3 / 44.2 / 33.2 |
+| The same (load 12 to 22, a build running) | 19.3 / 24.3 / 16.9 | 27.9 / 24.6 / 13.3 |
+| Both cards on every layer, the block, prices learned from the steps that run, windows of 8 rows (load 11 to 18) | 10.7 / 24.4 / 17.2 | 63.7 / 28.9 / 50.7 |
+| A range of layers each, the block, prices measured at the start, windows of 4 rows (load 6 to 8) | 23.7 / 30.8 / 27.8 | 39.9 / 37.6 / 47.6 |
+| A range of layers each, no drafter (load 28 to 33) | 15.4 / 22.6 / 8.8 | 19.9 / 25.7 / 10.4 |
+
+In the fourth row the conductor did choose windows (its measured prices came out
+lower on a quieter machine): 255 links in 87 steps, the links accepted 59 times of
+87, 36 of 59 and 21 of 36, 5.4 ms a link on the RTX 3060 (15.7 ms for the chain of
+a step that drafts), 535 to 1080 picks a step where a step of one row has 480, and
+21 to 166 of them outside a slot. The second time a text is asked the lookup has
+it, which is where the 63.7 and the 47.6 come from (37 and 15 steps for 128
+tokens). The block takes 175 MiB of dense weights, 21 to 49 MiB of keys and values
+and 35 to 48 MiB of buffers on its card, and its experts had 111 slots in VRAM and
+73 in RAM when both cards share the layers (before the slots were divided by owned
+experts; 260 and 146 for a range of layers each, after). No pair of runs with and
+without the block at the same load exists, so whether the block makes this model
+faster is not shown; the first requests of the third row say that windows of eight
+rows on tiers that do not hold the text make it slower.
+
 **A step that has to wait for experts.** The experts a layer needs are known
 when its router has run, so a step cannot be enqueued whole and left alone:
 an expert that is in no slot is brought (uploaded, or computed by the CPU)
