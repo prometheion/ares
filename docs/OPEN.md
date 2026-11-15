@@ -81,6 +81,18 @@ with it; the runs are too noisy to tell the two apart.
 - [ ] NVFP4 many-row gate and up 1.4 times its neighbours on the RTX 4070; IQ2_XXS many-row
       at 8 rows 7 % slower on the RTX 3060 since the kernels for all types.
 
+### Parity with the 27B (the owner's rule: what one model can, the other must)
+Everything `FEATURES.md` lists for the 27B and not for Flash-Next is owed:
+- [ ] K and V in `q7` to `q4`, separately for K and V (see above); the draft block's K and V in `q4`.
+- [ ] The prefix cache with its RAM and SSD levels (see above).
+- [ ] The draft block read from the model file (`--drafters mtp`) and a draft vocabulary.
+- [ ] Replies that are the same from run to run: today they differ slightly when the CPU
+      computes missed experts, so "text with drafts is the text without" is shown only on
+      made-up models and on the real file with the CPU path off.
+- [ ] Structured output, tool calls and the Messages and Responses routes have never run on
+      the real Flash-Next file (the runtime and server code is shared; a smoke script for
+      tools exists and was not run).
+
 ## Qwen3.8 27B (`qwen35`)
 - [ ] A generating step of more than 16 rows still changes kernel family (three sequences
       drafting at once): the last gap in "text with drafts is the text without" (which holds
