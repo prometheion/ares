@@ -46,7 +46,10 @@ mod anthropic;
 mod bridge;
 mod error;
 pub mod load;
+pub mod models;
+pub mod options;
 pub mod plan;
+pub mod preset;
 mod qwen4exp;
 mod reasoning;
 mod reply;
@@ -68,7 +71,8 @@ use axum::routing::{any, get, post};
 use tokio::net::TcpListener;
 use tokio::sync::{Notify, watch};
 
-use crate::bridge::{Flight, Stop};
+use crate::bridge::Stop;
+use crate::models::Models;
 pub use crate::reasoning::ReasoningFormat;
 
 /// Limits of the server. [`Config::default`] suits production; tests shrink
@@ -114,18 +118,27 @@ pub fn router(engine: Arc<dyn Engine>) -> Router {
 /// Reads the engine's statistics once ([`Engine::stats`]), which may wait
 /// for the engine's step.
 pub fn router_with(engine: Arc<dyn Engine>, config: Config) -> Router {
+    router_over(Arc::new(Models::fixed(engine, config.reasoning_format)), config)
+}
+
+/// The server's routes over `models`: a request's `model` names one of them,
+/// which is loaded if it is not. `config.reasoning_format` is not read: each
+/// model has its own.
+pub fn router_over(models: Arc<Models>, config: Config) -> Router {
     // Nobody raises this signal: a router that is served by someone else is
     // stopped by them.
     let (_, stop) = Stop::new();
-    routes_over(engine, config, stop)
+    routes_over(models, config, stop)
 }
 
-fn routes_over(engine: Arc<dyn Engine>, config: Config, stop: Stop) -> Router {
-    let flight = Arc::new(Flight::new(&*engine));
+fn routes_over(models: Arc<Models>, config: Config, stop: Stop) -> Router {
     Router::new()
         .route("/health", get(routes::health))
         .route("/metrics", get(routes::metrics))
         .route("/v1/models", get(routes::models))
+        .route("/models/load", post(routes::load_model))
+        .route("/models/unload", post(routes::unload_model))
+        .route("/models/sse", get(routes::model_events))
         .route("/v1/chat/completions", post(routes::chat_completions))
         .route("/v1/completions", post(routes::completions))
         .route("/v1/systemone", post(routes::systemone))
@@ -141,7 +154,7 @@ fn routes_over(engine: Arc<dyn Engine>, config: Config, stop: Stop) -> Router {
         .route("/v1/responses/{id}/{what}", any(responses::stored))
         .fallback(routes::not_found)
         .method_not_allowed_fallback(routes::method_not_allowed)
-        .with_state(routes::App { engine, config, flight, stop })
+        .with_state(routes::App { models, config, stop })
 }
 
 /// Serves `engine` on `listener` until `shutdown` completes.
@@ -161,13 +174,27 @@ pub async fn serve(
 
 /// Like [`serve`], with a second signal: when `now` completes during the
 /// grace period, the wait for running requests ends at once.
-///
-/// However it stops, no request is left in the engine when this returns,
-/// unless a client did not take its last words within two seconds. The caller
-/// can then shut the engine down and find it idle.
 pub async fn serve_until(
     listener: TcpListener,
     engine: Arc<dyn Engine>,
+    config: Config,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+    now: impl Future<Output = ()> + Send,
+) -> io::Result<()> {
+    let models = Arc::new(Models::fixed(engine, config.reasoning_format));
+    serve_models(listener, models, config, shutdown, now).await
+}
+
+/// Serves `models` on `listener` until `shutdown` completes, as [`serve`]
+/// does for one engine; when `now` completes during the grace period, the
+/// wait for running requests ends at once.
+///
+/// However it stops, no request is left in an engine when this returns,
+/// unless a client did not take its last words within two seconds. The caller
+/// can then shut the models down ([`Models::shutdown`]) and find them idle.
+pub async fn serve_models(
+    listener: TcpListener,
+    models: Arc<Models>,
     config: Config,
     shutdown: impl Future<Output = ()> + Send + 'static,
     now: impl Future<Output = ()> + Send,
@@ -176,7 +203,7 @@ pub async fn serve_until(
     let draining = Arc::new(Notify::new());
     let begin_drain = draining.clone();
     let (stop_requests, stop) = Stop::new();
-    let serving = axum::serve(listener, routes_over(engine, config, stop))
+    let serving = axum::serve(listener, routes_over(models, config, stop))
         .with_graceful_shutdown(async move {
             shutdown.await;
             tracing::info!("shutting down: no new connections, waiting for running requests");

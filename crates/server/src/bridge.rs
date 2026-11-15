@@ -242,7 +242,7 @@ impl Stop {
     }
 
     /// Completes when the signal is raised.
-    async fn raised(&mut self) {
+    pub async fn raised(&mut self) {
         if self.0.wait_for(|stop| *stop).await.is_err() {
             std::future::pending::<()>().await;
         }

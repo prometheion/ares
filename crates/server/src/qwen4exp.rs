@@ -23,8 +23,9 @@ use ares_tokenizer::{ChatOptions, Tokenizer};
 
 use crate::load::{
     LoadError, Loaded, VRAM_HEADROOM, describe_links, draft_block_takes_part, hold_devices, join,
-    ram_limit, refuse,
+    ram_limit, refuse, short,
 };
+use crate::models::Site;
 use crate::plan::{self, CELLS_PER_PAGE, DEFAULT_PARALLEL, LoadOptions, SplitKind};
 
 /// The most rows of a step that generates (one for each sequence, as the model takes no drafts
@@ -45,7 +46,12 @@ const TRIAL_CONTEXT: u32 = 8192;
 
 /// Loads the model of `options`, whose file `gguf` is open, and starts the
 /// runtime over it.
-pub(crate) fn load(gguf: Gguf, options: &LoadOptions, begun: Instant) -> Result<Loaded, LoadError> {
+pub(crate) fn load(
+    gguf: Gguf,
+    options: &LoadOptions,
+    site: &Site,
+    begun: Instant,
+) -> Result<Loaded, LoadError> {
     let config = Config::from_gguf(&gguf).map_err(|e| LoadError::Model(e.to_string()))?;
     tracing::info!(
         "model: {} layers of width {} in {} streams, {} experts per layer of which {} are used, \
@@ -188,10 +194,13 @@ pub(crate) fn load(gguf: Gguf, options: &LoadOptions, begun: Instant) -> Result<
         ..SessionOptions::default()
     };
     let named_split = |e: String| {
-        LoadError::Model(match options.split {
+        // A placement that does not fit is, next to other models, no room.
+        let fits = !e.contains("does not fit");
+        let error = LoadError::Model(match options.split {
             Some(kind) => format!("--split {}: {e}", kind.name()),
             None => e,
-        })
+        });
+        if fits { error } else { short(site, error) }
     };
 
     // Context: tokens of state for all sequences together. Without a number
@@ -210,10 +219,11 @@ pub(crate) fn load(gguf: Gguf, options: &LoadOptions, begun: Instant) -> Result<
             let fit = plan::pages_beside_experts(&slots, &page_bytes);
             let context = plan::default_context(fit, parallel, model_context);
             if context == 0 {
-                return Err(refuse(
+                let error = refuse(
                     "the devices have no room for context next to the experts' slots; name one \
                      with --context to try it anyway",
-                ));
+                );
+                return Err(short(site, error));
             }
             (
                 context,
@@ -280,12 +290,7 @@ pub(crate) fn load(gguf: Gguf, options: &LoadOptions, begun: Instant) -> Result<
     }
 
     // Load.
-    let name = options
-        .model
-        .file_stem()
-        .map(|stem| stem.to_string_lossy().into_owned())
-        .filter(|stem| !stem.is_empty())
-        .unwrap_or_else(|| "model".to_owned());
+    let name = options.name.clone().unwrap_or_else(|| crate::preset::id_of_file(&options.model));
     let chat = ChatOptions { variables: options.chat_variables.clone(), ..ChatOptions::default() };
     let tokenizer = Tokenizer::from_gguf(&gguf).map_err(|e| LoadError::Model(e.to_string()))?;
     if !tokenizer.has_chat_template() {
@@ -305,8 +310,12 @@ pub(crate) fn load(gguf: Gguf, options: &LoadOptions, begun: Instant) -> Result<
     // experts takes the rest, as far as the experts that VRAM has no slot for
     // can use it.
     let required = required_ram(&*model, parallel);
-    let (ram, why_ram) =
-        ram_limit(options, required, "the tier of experts gets nothing beyond the step buffers")?;
+    let (ram, why_ram) = ram_limit(
+        options,
+        site,
+        required,
+        "the tier of experts gets nothing beyond the step buffers",
+    )?;
     let runtime_config = RuntimeConfig {
         pages,
         cells_per_page: CELLS_PER_PAGE,
@@ -332,7 +341,7 @@ pub(crate) fn load(gguf: Gguf, options: &LoadOptions, begun: Instant) -> Result<
     let runtime = Runtime::start_gpu(model.clone(), devices, runtime_config, gpu).map_err(|e| {
         let error = e.to_string();
         let short_of_memory = error.to_lowercase().contains("memory");
-        LoadError::Start(if error.contains("RAM budget") {
+        let error = LoadError::Start(if error.contains("RAM budget") {
             format!(
                 "{error}. The tier of experts is what --ram leaves after the {} the engine \
                  needs for its buffers: name a larger --ram",
@@ -345,7 +354,8 @@ pub(crate) fn load(gguf: Gguf, options: &LoadOptions, begun: Instant) -> Result<
             )
         } else {
             error
-        })
+        });
+        if short_of_memory { short(site, error) } else { error }
     })?;
     tracing::info!(
         "loaded in {:.1} s ({:.1} s since the start)",
@@ -390,7 +400,7 @@ pub(crate) fn load(gguf: Gguf, options: &LoadOptions, begun: Instant) -> Result<
         "context: {context} tokens of sequence state, all of it in VRAM (state is not moved to \
          RAM yet, so a context that does not fit is refused at load)"
     );
-    Ok(Loaded::new(runtime, name, held))
+    Ok(Loaded::new(runtime, name, held, ram))
 }
 
 /// Reads [`WARM_UP`] and writes a few tokens after it, so that the tiers of

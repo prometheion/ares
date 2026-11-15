@@ -74,6 +74,9 @@ pub enum Drafter {
 pub struct LoadOptions {
     /// The GGUF file (any part of a split model).
     pub model: PathBuf,
+    /// The id the model is served under: the name of its section in a preset
+    /// file. `None`: the file's name without its extension.
+    pub name: Option<String>,
     /// The devices to use, by the driver's index.
     pub devices: Option<Vec<u32>>,
     pub split: Option<SplitKind>,
@@ -107,6 +110,7 @@ impl LoadOptions {
     pub fn new(model: impl Into<PathBuf>) -> Self {
         Self {
             model: model.into(),
+            name: None,
             devices: None,
             split: None,
             shares: None,

@@ -34,6 +34,7 @@ use ares_model::qwen35::{Config, Weights};
 use ares_runtime::{GpuConfig, Model, Runtime, RuntimeConfig, Split, required_ram};
 use ares_tokenizer::ChatOptions;
 
+use crate::models::{LoadFailure, Loader, Site, Unit};
 use crate::plan::{
     self, CELLS_PER_PAGE, DEFAULT_PARALLEL, DEFAULT_WINDOW, Drafter, LoadOptions, Room,
     SINGLE_DEVICE_MIN_CONTEXT, SplitKind,
@@ -74,6 +75,21 @@ pub enum LoadError {
     Model(String),
     #[error("the model could not be loaded onto the devices: {0}")]
     Start(String),
+    /// The devices or the RAM limit cannot hold the model next to the other
+    /// models of this server, which could be unloaded for it.
+    #[error("{0}")]
+    NoRoom(String),
+}
+
+/// `error`, a lack of memory, as a load next to other models sees it: room
+/// that unloading one of them can make.
+pub(crate) fn short(site: &Site, error: LoadError) -> LoadError {
+    if site.beside { LoadError::NoRoom(error.to_string()) } else { error }
+}
+
+/// The site of a model that is loaded alone, with the RAM its options name.
+fn alone(options: &LoadOptions) -> Site {
+    Site { beside: false, ram: options.ram, ram_is_rest: false }
 }
 
 pub(crate) fn refuse(message: impl Into<String>) -> LoadError {
@@ -119,6 +135,38 @@ pub struct Loaded {
     runtime: Arc<Runtime>,
     name: String,
     held: Vec<Held>,
+    /// The most RAM the engine may use.
+    ram: u64,
+    /// What every device had free when the model was on it, after the load.
+    free_loaded: Vec<u64>,
+}
+
+/// What an unload gave back.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Released {
+    /// For every device the model was on: its number, what the model had
+    /// taken of it by the device's own report (free before the load less
+    /// free after it), and what the device reported as free before and
+    /// after the unload.
+    pub devices: Vec<DeviceRelease>,
+    /// The memory of the process that is in RAM (`VmRSS`), before and after.
+    pub rss: Option<(u64, u64)>,
+    pub seconds: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeviceRelease {
+    pub ordinal: u32,
+    pub taken: u64,
+    pub free_before: u64,
+    pub free_after: u64,
+}
+
+/// The bytes of the process that are in RAM, as Linux reports them.
+fn resident() -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let line = status.lines().find_map(|line| line.strip_prefix("VmRSS:"))?;
+    line.trim().strip_suffix("kB")?.trim().parse::<u64>().ok()?.checked_mul(1024)
 }
 
 impl std::fmt::Debug for Loaded {
@@ -128,8 +176,10 @@ impl std::fmt::Debug for Loaded {
 }
 
 impl Loaded {
-    pub(crate) fn new(runtime: Runtime, name: String, held: Vec<Held>) -> Self {
-        Self { runtime: Arc::new(runtime), name, held }
+    pub(crate) fn new(runtime: Runtime, name: String, held: Vec<Held>, ram: u64) -> Self {
+        let free_loaded =
+            held.iter().map(|h| h.device.mem_info().map_or(h.free, |memory| memory.free)).collect();
+        Self { runtime: Arc::new(runtime), name, held, ram, free_loaded }
     }
 
     /// The engine to serve.
@@ -143,37 +193,126 @@ impl Loaded {
     }
 
     /// Ends every request that still runs, joins the conductor and the device
-    /// threads, and gives the devices back. Returns when all of that is done.
-    pub fn unload(self) {
+    /// threads, and gives the devices back. Returns when all of that is done,
+    /// with what the devices report: the log says for every device what came
+    /// back, and warns when it is less than the model took.
+    pub fn unload(self) -> Released {
         let begun = Instant::now();
+        let rss_before = resident();
+        let free_before: Vec<_> = self.held.iter().map(|h| h.device.mem_info().ok()).collect();
         self.runtime.shutdown();
         let running = self.runtime.is_running();
         // The device threads have ended and dropped what they held. A model
         // that holds device memory of its own (the slots of experts) frees it
-        // with the runtime, whose last handle this is.
-        let Self { runtime, held, .. } = self;
+        // with the runtime, whose last handle this is once the requests that
+        // ended have let go of theirs.
+        let Self { mut runtime, held, name, free_loaded, .. } = self;
+        let patience = Instant::now();
+        let runtime = loop {
+            match Arc::try_unwrap(runtime) {
+                Ok(runtime) => break Some(runtime),
+                Err(shared) if patience.elapsed() > std::time::Duration::from_secs(5) => {
+                    tracing::warn!(
+                        model = %name,
+                        handles = Arc::strong_count(&shared),
+                        "requests still hold the engine: what the model itself holds is freed \
+                         when they let go"
+                    );
+                    drop(shared);
+                    break None;
+                }
+                Err(shared) => {
+                    runtime = shared;
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+            }
+        };
         drop(runtime);
-        // These are the last handles of the devices, and with them the driver
-        // contexts go.
-        for held in &held {
+        let mut devices = Vec::new();
+        for ((held, before), loaded) in held.iter().zip(free_before).zip(free_loaded) {
             let info = held.device.info();
-            match held.device.mem_info() {
-                Ok(memory) => tracing::info!(
-                    "device {} ({}): released, {} free ({} when the server started)",
-                    info.ordinal,
-                    info.name,
-                    Bytes(memory.free),
-                    Bytes(held.free),
-                ),
-                Err(error) => tracing::warn!("device {}: {error}", info.ordinal),
+            match (before, held.device.mem_info()) {
+                (Some(before), Ok(after)) => {
+                    let release = DeviceRelease {
+                        ordinal: info.ordinal,
+                        taken: held.free.saturating_sub(loaded),
+                        free_before: before.free,
+                        free_after: after.free,
+                    };
+                    let back = release.free_after.saturating_sub(release.free_before);
+                    tracing::info!(
+                        "device {} ({}): {} released of the {} the model took, {} free",
+                        info.ordinal,
+                        info.name,
+                        Bytes(back),
+                        Bytes(release.taken),
+                        Bytes(after.free),
+                    );
+                    // Allocation granularity aside, all of it comes back.
+                    if back + 16 * MIB < release.taken {
+                        tracing::warn!(
+                            "device {}: {} of what the model took did not come back",
+                            info.ordinal,
+                            Bytes(release.taken - back)
+                        );
+                    }
+                    devices.push(release);
+                }
+                (_, Err(error)) => tracing::warn!("device {}: {error}", info.ordinal),
+                (None, _) => {}
             }
         }
+        // These handles go last; a device no other model is on closes with
+        // its driver context.
         drop(held);
+        let rss = rss_before.zip(resident());
+        let seconds = begun.elapsed().as_secs_f64();
         tracing::info!(
+            model = %name,
             running,
-            "the engine has stopped in {:.0} ms: threads joined, devices released",
-            begun.elapsed().as_secs_f64() * 1e3
+            "the engine has stopped in {:.0} ms: threads joined, devices released{}",
+            seconds * 1e3,
+            match rss {
+                Some((before, after)) =>
+                    format!(", {} of the process in RAM ({} before)", Bytes(after), Bytes(before)),
+                None => String::new(),
+            }
         );
+        Released { devices, rss, seconds }
+    }
+}
+
+impl Unit for Loaded {
+    fn engine(&self) -> Arc<dyn Engine> {
+        self.runtime.clone()
+    }
+
+    fn ram(&self) -> u64 {
+        self.ram
+    }
+
+    fn unload(self: Box<Self>) {
+        Loaded::unload(*self);
+    }
+}
+
+/// Loads models onto the devices: the server's [`Loader`].
+#[derive(Debug, Default, Clone, Copy)]
+pub struct DeviceLoader;
+
+impl Loader for DeviceLoader {
+    fn load(
+        &self,
+        preset: &crate::preset::Preset,
+        site: &Site,
+    ) -> Result<Box<dyn Unit>, LoadFailure> {
+        let mut options = preset.options.load.clone();
+        options.ram = site.ram;
+        match load_at(&options, site) {
+            Ok(loaded) => Ok(Box::new(loaded)),
+            Err(LoadError::NoRoom(why)) => Err(LoadFailure::NoRoom(why)),
+            Err(error) => Err(LoadFailure::Failed(error.to_string())),
+        }
     }
 }
 
@@ -532,10 +671,11 @@ pub(crate) fn hold_devices(options: &LoadOptions) -> Result<(Vec<u32>, Vec<Held>
 /// machine reports no available memory.
 pub(crate) fn ram_limit(
     options: &LoadOptions,
+    site: &Site,
     required: u64,
     nothing: &str,
 ) -> Result<(u64, String), LoadError> {
-    ram_limit_of(options, &[("its step buffers", required)], nothing)
+    ram_limit_of(options, site, &[("its step buffers", required)], nothing)
 }
 
 /// [`ram_limit`] for an engine that must page-lock more than its step
@@ -543,6 +683,7 @@ pub(crate) fn ram_limit(
 /// their sum is refused, and the refusal names every share.
 fn ram_limit_of(
     options: &LoadOptions,
+    site: &Site,
     needs: &[(&str, u64)],
     nothing: &str,
 ) -> Result<(u64, String), LoadError> {
@@ -551,6 +692,9 @@ fn ram_limit_of(
         .ok()
         .and_then(|text| plan::parse_available_ram(&text));
     let (ram, why_ram) = match options.ram {
+        Some(ram) if site.ram_is_rest => {
+            (ram, "what the server's limit has left next to the loaded models".to_owned())
+        }
         Some(ram) => (ram, "as asked".to_owned()),
         None => match available {
             Some(available) => (
@@ -567,7 +711,10 @@ fn ram_limit_of(
         },
     };
     if ram < required {
-        return Err(refuse(plan::too_little_ram(ram, needs)));
+        let error = refuse(plan::too_little_ram(ram, needs));
+        // What is left of the server's limit grows when a model is unloaded;
+        // a number the operator named for this model does not.
+        return Err(if site.ram_is_rest { short(site, error) } else { error });
     }
     Ok((ram, why_ram))
 }
@@ -576,6 +723,14 @@ fn ram_limit_of(
 /// long as the weights take to reach the devices; call it from a thread that
 /// may block.
 pub fn load(options: &LoadOptions) -> Result<Loaded, LoadError> {
+    load_at(options, &alone(options))
+}
+
+/// [`load`] at `site`: next to other models of this server, a model that
+/// finds too little room is not loaded with what there is but refused with
+/// [`LoadError::NoRoom`], before its weights are read, so that one of the
+/// others can be unloaded for it.
+pub fn load_at(options: &LoadOptions, site: &Site) -> Result<Loaded, LoadError> {
     let begun = Instant::now();
     let gguf = Gguf::open(&options.model)?;
     let architecture = gguf.architecture().map(str::to_owned);
@@ -589,14 +744,21 @@ pub fn load(options: &LoadOptions) -> Result<Loaded, LoadError> {
     );
     let architecture = architecture.ok_or(LoadError::NoArchitecture)?;
     match architecture.as_str() {
-        ares_model::qwen35::config::ARCHITECTURE => load_qwen35(gguf, options, begun),
-        ares_model::qwen4exp::config::ARCHITECTURE => crate::qwen4exp::load(gguf, options, begun),
+        ares_model::qwen35::config::ARCHITECTURE => load_qwen35(gguf, options, site, begun),
+        ares_model::qwen4exp::config::ARCHITECTURE => {
+            crate::qwen4exp::load(gguf, options, site, begun)
+        }
         _ => Err(LoadError::Architecture(architecture)),
     }
 }
 
 /// Loads a `qwen35` model: dense, all of it on the devices.
-fn load_qwen35(gguf: Gguf, options: &LoadOptions, begun: Instant) -> Result<Loaded, LoadError> {
+fn load_qwen35(
+    gguf: Gguf,
+    options: &LoadOptions,
+    site: &Site,
+    begun: Instant,
+) -> Result<Loaded, LoadError> {
     let config = Config::from_gguf(&gguf).map_err(|e| LoadError::Model(e.to_string()))?;
     let weights = Weights::load(&gguf, &config).map_err(|e| LoadError::Model(e.to_string()))?;
     tracing::info!(
@@ -776,12 +938,13 @@ fn load_qwen35(gguf: Gguf, options: &LoadOptions, begun: Instant) -> Result<Load
                              device's memory is too small for its share",
                         ),
                         None => {
-                            return Err(refuse(format!(
+                            let error = refuse(format!(
                                 "the model does not fit on the devices: it needs about {} with \
                                  a context of {smallest} tokens, and they have {} free",
                                 Bytes(whole.shared + whole.per_device * held.len() as u64),
                                 Bytes(held.iter().map(|h| h.free.saturating_sub(headroom)).sum()),
-                            )));
+                            ));
+                            return Err(short(site, error));
                         }
                     }
                 }
@@ -805,10 +968,41 @@ fn load_qwen35(gguf: Gguf, options: &LoadOptions, begun: Instant) -> Result<Load
 
     // Context: tokens of state for all sequences together.
     let model_context = config.n_ctx as u32;
+    let taken_text = || {
+        join(
+            held.iter().zip(&footprint).map(|(h, f)| {
+                format!(
+                    "device {} has {} free and the model takes {} without K and V",
+                    h.device.ordinal(),
+                    Bytes(h.free),
+                    Bytes(f.weights + f.step + f.exact + f.per_sequence * u64::from(parallel))
+                )
+            }),
+            ", ",
+        )
+    };
     let (context, why_context) = match options.context {
+        // Next to other models the estimate decides before the weights are
+        // read; alone the devices' ledgers do at load, as ever.
+        Some(context) if site.beside && fit < plan::pool_pages(context, parallel) => {
+            return Err(LoadError::NoRoom(format!(
+                "the devices cannot hold the model with its context of {context} tokens next to \
+                 what is loaded (by estimate: {})",
+                taken_text()
+            )));
+        }
         Some(context) => (context, "as asked"),
         None => {
             let context = plan::default_context(fit, parallel, model_context);
+            // Next to other models a context below the least a device is
+            // chosen for is no room: one of them makes way.
+            if site.beside && context < smallest {
+                return Err(LoadError::NoRoom(format!(
+                    "the devices have room for a context of {context} tokens next to what is \
+                     loaded, less than the {smallest} a model is loaded for (by estimate: {})",
+                    taken_text()
+                )));
+            }
             if context == 0 {
                 return Err(refuse(format!(
                     "the devices have no room for sequence state next to the model (by \
@@ -912,12 +1106,7 @@ fn load_qwen35(gguf: Gguf, options: &LoadOptions, begun: Instant) -> Result<Load
     }
 
     // Load.
-    let name = options
-        .model
-        .file_stem()
-        .map(|stem| stem.to_string_lossy().into_owned())
-        .filter(|stem| !stem.is_empty())
-        .unwrap_or_else(|| "model".to_owned());
+    let name = options.name.clone().unwrap_or_else(|| crate::preset::id_of_file(&options.model));
     let chat = ChatOptions { variables: options.chat_variables.clone(), ..ChatOptions::default() };
     drop(weights);
     let model = Arc::new(
@@ -948,7 +1137,7 @@ fn load_qwen35(gguf: Gguf, options: &LoadOptions, begun: Instant) -> Result<Load
             table,
         ));
     }
-    let (ram, why_ram) = ram_limit_of(options, &needs, "none is spared for checkpoints")?;
+    let (ram, why_ram) = ram_limit_of(options, site, &needs, "none is spared for checkpoints")?;
     let checkpoint = model.prefix_cache().map_or(0, |cache| cache.bytes());
     let runtime_config = RuntimeConfig {
         pages,
@@ -990,14 +1179,16 @@ fn load_qwen35(gguf: Gguf, options: &LoadOptions, begun: Instant) -> Result<Load
         // A context that was estimated to fit and did not is the server's
         // mistake, and the operator should know the way around it.
         let short_of_memory = error.to_lowercase().contains("memory");
-        LoadError::Start(if options.context.is_none() && short_of_memory {
+        let error = LoadError::Start(if options.context.is_none() && short_of_memory {
             format!(
                 "{error}. The context of {context} tokens was chosen from an estimate of \
                      what the model takes; name a smaller one with --context"
             )
         } else {
             error
-        })
+        });
+        // The estimate was too low: next to other models that is no room.
+        if short_of_memory { short(site, error) } else { error }
     })?;
     tracing::info!(
         "loaded in {:.1} s ({:.1} s since the start)",
@@ -1092,7 +1283,7 @@ fn load_qwen35(gguf: Gguf, options: &LoadOptions, begun: Instant) -> Result<Load
         "context: {context} tokens of sequence state, all of it in VRAM (state is not moved to \
          RAM yet, so a context that does not fit is refused at load)"
     );
-    Ok(Loaded { runtime: Arc::new(runtime), name, held })
+    Ok(Loaded::new(runtime, name, held, ram))
 }
 
 /// What the whole model takes when it is shared out: the part that is

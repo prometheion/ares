@@ -3,19 +3,28 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
 
-use ares_cuda::Precision;
 use ares_server::ReasoningFormat;
-use ares_server::plan::{self, Drafter, LoadOptions, SplitKind};
-use ares_tokenizer::Json;
+use ares_server::options::{self, Kind, ModelOptions};
+use ares_server::plan::LoadOptions;
 
 pub const USAGE: &str = "\
 ares: inference server with an OpenAI-compatible API
 
 USAGE:
     ares --model <PATH> [OPTIONS]
+    ares --models-preset <FILE> [OPTIONS]
 
 OPTIONS:
         --model <PATH>         GGUF model file to load and serve (any part of a split model)
+        --models-preset <FILE> Serve several models from a preset file: an INI file
+                               with one section for each model, named by the id
+                               requests use, and a section [*] for all of them. A
+                               section holds the options below under their names
+                               (context = 32768), and aliases, load-on-startup and
+                               idle-unload. A model is loaded when a request names
+                               it and unloaded when another needs its room or when
+                               it was idle for its idle-unload. An option given
+                               here on the command line holds for every model
         --host <ADDR>          Address to listen on [default: 127.0.0.1]
         --port <PORT>          Port to listen on, 0 picks a free one [default: 8000]
 
@@ -47,7 +56,10 @@ OPTIONS:
 
     Host memory.
         --ram <SIZE>           The most RAM the whole engine may use, such as 16G or
-                               512M. What the engine needs to run is taken from it
+                               512M, for all loaded models together; ram in a
+                               model's section of a preset file is that model's
+                               part of it, and a model without one takes what is
+                               left. What the engine needs to run is taken from it
                                first; the rest is for the checkpoints of recurrent
                                state that let a conversation continue from what was
                                computed, locked as they are taken [default: half of
@@ -116,8 +128,14 @@ ARES_LIBCUDA names the driver library to load instead of the system's libcuda.so
 pub struct Options {
     pub host: String,
     pub port: u16,
+    /// The preset file of `--models-preset`; without one `load.model` is the
+    /// one model to serve.
+    pub presets: Option<PathBuf>,
     pub load: LoadOptions,
     pub reasoning_format: ReasoningFormat,
+    /// The options of a model as they were given, by their names and in
+    /// their order: with a preset file they are set again over every section.
+    pub given: Vec<(&'static str, String)>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -143,10 +161,21 @@ pub enum CliError {
     #[error("option '{0}' is given twice")]
     Repeated(&'static str),
     #[error(
-        "there is nothing to serve: name a model file with --model (loading models on request \
-         from a preset file is not built yet)"
+        "there is nothing to serve: name a model file with --model, or a preset file of several \
+         models with --models-preset"
     )]
     NoModel,
+    #[error(
+        "--model and --models-preset are both given: a preset file names its models in its \
+         sections"
+    )]
+    ModelAndPresets,
+}
+
+impl From<options::Invalid> for CliError {
+    fn from(e: options::Invalid) -> Self {
+        CliError::InvalidValue { flag: e.flag, value: e.value, expected: e.expected }
+    }
 }
 
 /// The text of a value.
@@ -154,77 +183,13 @@ fn text(value: OsString) -> Result<String, CliError> {
     value.into_string().map_err(|v| CliError::NotUnicode(v.to_string_lossy().into_owned()))
 }
 
-fn invalid(flag: &'static str, value: &str, expected: &'static str) -> CliError {
-    CliError::InvalidValue { flag, value: value.to_owned(), expected }
-}
-
-fn number<T: std::str::FromStr>(
-    flag: &'static str,
-    value: &str,
-    expected: &'static str,
-) -> Result<T, CliError> {
-    value.trim().parse().map_err(|_| invalid(flag, value, expected))
-}
-
-fn list<T: std::str::FromStr>(
-    flag: &'static str,
-    value: &str,
-    expected: &'static str,
-) -> Result<Vec<T>, CliError> {
-    value.split(',').map(|item| number(flag, item, expected)).collect()
-}
-
-/// The model drafters of `--drafters`: names separated by commas. `mtp` is
-/// the model's own draft block, `none` (alone) is no drafter, anything else is
-/// the file of a block drafter.
-fn drafters(value: &str) -> Result<Vec<Drafter>, CliError> {
-    let expected = "mtp, none, or a drafter file; several separated by commas";
-    if value.trim() == "none" {
-        return Ok(Vec::new());
-    }
-    let mut list = Vec::new();
-    for name in value.split(',').map(str::trim) {
-        let drafter = match name {
-            "" | "none" => return Err(invalid("--drafters", value, expected)),
-            "mtp" => Drafter::Mtp,
-            file => Drafter::Block(PathBuf::from(file)),
-        };
-        if list.contains(&drafter) {
-            return Err(invalid("--drafters", value, expected));
-        }
-        list.push(drafter);
-    }
-    Ok(list)
-}
-
-/// A variable of the chat template: a JSON value where the text is one
-/// (`false`, `3`, `"x"`), the text itself otherwise (`medium`).
-fn chat_variable(value: &str) -> Result<(String, Json), CliError> {
-    let expected = "NAME=VALUE";
-    let (name, value) =
-        value.split_once('=').ok_or_else(|| invalid("--chat-var", value, expected))?;
-    if name.is_empty() {
-        return Err(invalid("--chat-var", value, expected));
-    }
-    let value = Json::parse(value).unwrap_or_else(|_| Json::String(value.to_owned()));
-    Ok((name.to_owned(), value))
-}
-
-/// Sets a variable of the chat template; the later setting of a name wins, as
-/// on any command line.
-fn set_chat_variable(load: &mut LoadOptions, name: &str, value: Json) {
-    load.chat_variables.retain(|(known, _)| known != name);
-    load.chat_variables.push((name.to_owned(), value));
-}
-
 /// Parses the arguments after the program name. `--name value` and
 /// `--name=value` are both accepted.
 pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, CliError> {
     let (mut host, mut port) = ("127.0.0.1".to_owned(), 8000);
-    let mut load = LoadOptions::new("");
-    let mut reasoning_format = ReasoningFormat::default();
-    // The thinking of earlier turns stays in the prompt unless asked otherwise.
-    set_chat_variable(&mut load, "preserve_reasoning", Json::Bool(true));
+    let mut presets = None;
+    let mut model = ModelOptions::default();
+    let mut given = Vec::new();
     let mut seen: Vec<&'static str> = Vec::new();
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
@@ -254,166 +219,53 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, CliErr
                 port = value.parse().map_err(|_| CliError::InvalidPort(value.into_owned()))?;
                 "--port"
             }
-            "--model" => {
-                load.model = PathBuf::from(value("--model")?);
-                "--model"
+            "--models-preset" => {
+                presets = Some(PathBuf::from(value("--models-preset")?));
+                "--models-preset"
             }
-            "--devices" => {
-                let value = text(value("--devices")?)?;
-                load.devices = Some(list("--devices", &value, "a list of device numbers (0,1)")?);
-                "--devices"
-            }
-            "--split" => {
-                let value = text(value("--split")?)?;
-                load.split = Some(match value.as_str() {
-                    "single" => SplitKind::Single,
-                    "tensor" => SplitKind::Tensor,
-                    "layer" => SplitKind::Layer,
-                    _ => return Err(invalid("--split", &value, "single, tensor or layer")),
-                });
-                "--split"
-            }
-            "--shares" => {
-                let value = text(value("--shares")?)?;
-                let expected = "a list of positive numbers (0.625,0.375)";
-                let shares: Vec<f64> = list("--shares", &value, expected)?;
-                if shares.iter().any(|share| !share.is_finite() || *share <= 0.0) {
-                    return Err(invalid("--shares", &value, expected));
+            _ => match options::lookup(name) {
+                Some((flag, Kind::Value)) => {
+                    let value = text(value(flag)?)?;
+                    options::set(&mut model, flag, &value)?;
+                    given.push((flag, value));
+                    flag
                 }
-                load.shares = Some(shares);
-                "--shares"
-            }
-            "--context" => {
-                let value = text(value("--context")?)?;
-                let expected = "a number of tokens, at least 1";
-                let context: u32 = number("--context", &value, expected)?;
-                if context == 0 {
-                    return Err(invalid("--context", &value, expected));
+                Some((flag, Kind::Switch(on))) => {
+                    if inline.is_some() {
+                        return Err(CliError::UnexpectedValue(flag));
+                    }
+                    let value = if on { "true" } else { "false" };
+                    options::set(&mut model, flag, value)?;
+                    given.push((flag, value.to_owned()));
+                    flag
                 }
-                load.context = Some(context);
-                "--context"
-            }
-            "--parallel" => {
-                let value = text(value("--parallel")?)?;
-                let expected = "a number of sequences, at least 1";
-                let parallel: u32 = number("--parallel", &value, expected)?;
-                if parallel == 0 {
-                    return Err(invalid("--parallel", &value, expected));
-                }
-                load.parallel = Some(parallel);
-                "--parallel"
-            }
-            "--kv" => {
-                let value = text(value("--kv")?)?;
-                let expected = "a format (f16, q8, q7, q6, q5, q4) or two, for K and V (q8,f16)";
-                let formats = value
-                    .split(',')
-                    .map(|name| plan::cache_format(name.trim()))
-                    .collect::<Option<Vec<_>>>()
-                    .ok_or_else(|| invalid("--kv", &value, expected))?;
-                load.kv = Some(match formats.as_slice() {
-                    [both] => (*both, *both),
-                    [k, v] => (*k, *v),
-                    _ => return Err(invalid("--kv", &value, expected)),
-                });
-                "--kv"
-            }
-            "--ram" => {
-                let value = text(value("--ram")?)?;
-                let expected = "a size such as 16G or 512M";
-                load.ram = Some(
-                    plan::parse_size(&value).ok_or_else(|| invalid("--ram", &value, expected))?,
-                );
-                "--ram"
-            }
-            "--precision" => {
-                let value = text(value("--precision")?)?;
-                load.precision = match value.as_str() {
-                    "fast" => Precision::Fast,
-                    "exact" => Precision::Exact,
-                    _ => return Err(invalid("--precision", &value, "fast or exact")),
-                };
-                "--precision"
-            }
-            "--drafters" => {
-                let value = text(value("--drafters")?)?;
-                load.drafters = Some(drafters(&value)?);
-                "--drafters"
-            }
-            "--window" => {
-                let value = text(value("--window")?)?;
-                let expected = "a number of rows, at least 2";
-                let rows: u32 = number("--window", &value, expected)?;
-                if rows < 2 {
-                    return Err(invalid("--window", &value, expected));
-                }
-                load.window = Some(rows);
-                "--window"
-            }
-            "--draft-vocab" => {
-                load.draft_vocabulary = Some(PathBuf::from(value("--draft-vocab")?));
-                "--draft-vocab"
-            }
-            "--chat-var" => {
-                let value = text(value("--chat-var")?)?;
-                let (name, value) = chat_variable(&value)?;
-                set_chat_variable(&mut load, &name, value);
-                continue;
-            }
-            "-rea" | "--reasoning" => {
-                let value = text(value("--reasoning")?)?;
-                match value.as_str() {
-                    "on" => set_chat_variable(&mut load, "enable_thinking", Json::Bool(true)),
-                    "off" => set_chat_variable(&mut load, "enable_thinking", Json::Bool(false)),
-                    "auto" => load.chat_variables.retain(|(name, _)| name != "enable_thinking"),
-                    _ => return Err(invalid("--reasoning", &value, "on, off or auto")),
-                }
-                "--reasoning"
-            }
-            "--reasoning-format" => {
-                let value = text(value("--reasoning-format")?)?;
-                reasoning_format = ReasoningFormat::from_name(&value).ok_or_else(|| {
-                    invalid("--reasoning-format", &value, "none, auto, deepseek or deepseek-legacy")
-                })?;
-                "--reasoning-format"
-            }
-            "--reasoning-effort" => {
-                let value = text(value("--reasoning-effort")?)?;
-                if value.is_empty() {
-                    return Err(invalid("--reasoning-effort", &value, "a level, or default"));
-                }
-                if value == "default" {
-                    load.chat_variables.retain(|(name, _)| name != "reasoning_effort");
-                } else {
-                    set_chat_variable(&mut load, "reasoning_effort", Json::String(value));
-                }
-                "--reasoning-effort"
-            }
-            "--reasoning-preserve" | "--no-reasoning-preserve" => {
-                if inline.is_some() {
-                    return Err(CliError::UnexpectedValue("--reasoning-preserve"));
-                }
-                let on = name == "--reasoning-preserve";
-                set_chat_variable(&mut load, "preserve_reasoning", Json::Bool(on));
-                "--reasoning-preserve"
-            }
-            _ => return Err(CliError::UnknownOption(whole.to_owned())),
+                None => return Err(CliError::UnknownOption(whole.to_owned())),
+            },
         };
+        if options::repeats(flag) {
+            continue;
+        }
         // A flag that is given twice is a mistake more often than a choice.
         if seen.contains(&flag) {
             return Err(CliError::Repeated(flag));
         }
         seen.push(flag);
     }
-    if load.model.as_os_str().is_empty() {
-        return Err(CliError::NoModel);
+    let named = !model.load.model.as_os_str().is_empty();
+    match (named, &presets) {
+        (false, None) => return Err(CliError::NoModel),
+        (true, Some(_)) => return Err(CliError::ModelAndPresets),
+        _ => {}
     }
-    Ok(Command::Run(Box::new(Options { host, port, load, reasoning_format })))
+    let ModelOptions { load, reasoning_format } = model;
+    Ok(Command::Run(Box::new(Options { host, port, presets, load, reasoning_format, given })))
 }
 
 #[cfg(test)]
 mod tests {
-    use ares_cuda::CacheFormat;
+    use ares_cuda::{CacheFormat, Precision};
+    use ares_server::plan::{Drafter, SplitKind};
+    use ares_tokenizer::Json;
 
     use super::*;
 
@@ -665,5 +517,23 @@ mod tests {
     fn a_value_may_look_like_a_flag() {
         // `--model --odd.gguf` is a path, not a missing value: the flag asked for one.
         assert_eq!(run(&["--model", "--odd.gguf"]).load.model, PathBuf::from("--odd.gguf"));
+    }
+
+    #[test]
+    fn a_preset_file_takes_the_place_of_a_model_and_keeps_what_was_given() {
+        let options = run(&["--models-preset", "models.ini", "--context", "4096", "-rea", "off"]);
+        assert_eq!(options.presets, Some(PathBuf::from("models.ini")));
+        assert_eq!(
+            options.given,
+            vec![("--context", "4096".to_owned()), ("--reasoning", "off".to_owned())]
+        );
+        assert_eq!(
+            parse_strs(&["--models-preset", "m.ini", "--model", "m.gguf"]),
+            Err(CliError::ModelAndPresets)
+        );
+        assert_eq!(
+            run(&["--model=m", "--no-reasoning-preserve"]).given,
+            vec![("--model", "m".to_owned()), ("--reasoning-preserve", "false".to_owned())]
+        );
     }
 }

@@ -34,8 +34,8 @@
 //! model as its compact JSON, which is what the API says.
 
 use ares_api::{
-    ChoiceOption, DecisionRequest, DecisionResult, Json, ModelCard, Prompt, Question, QuestionKind,
-    RequestId, Verdict,
+    ChoiceOption, DecisionRequest, DecisionResult, Json, Prompt, Question, QuestionKind, RequestId,
+    Verdict,
 };
 
 use crate::error::ApiError;
@@ -51,8 +51,8 @@ pub(crate) struct Parsed {
 
 /// Parses and checks the body of a System One request.
 ///
-/// `models` is what the engine serves, to default `model`.
-pub(crate) fn parse(body: &[u8], id: RequestId, models: &[ModelCard]) -> Result<Parsed, ApiError> {
+/// `models` are the ids that are served, to default `model`.
+pub(crate) fn parse(body: &[u8], id: RequestId, models: &[String]) -> Result<Parsed, ApiError> {
     let json = wire::read_json(body)?;
     let fields = Fields(wire::members(&json)?);
 
@@ -84,28 +84,25 @@ pub(crate) fn parse(body: &[u8], id: RequestId, models: &[ModelCard]) -> Result<
 }
 
 /// The model to ask. Named, or the only one that is served.
-fn model_to_ask(fields: &Fields<'_>, models: &[ModelCard]) -> Result<String, ApiError> {
+fn model_to_ask(fields: &Fields<'_>, models: &[String]) -> Result<String, ApiError> {
     if let Some(name) = fields.string("model")?.filter(|m| !m.is_empty()) {
         return Ok(name.to_owned());
     }
     match models {
-        [only] => Ok(only.id.clone()),
+        [only] => Ok(only.clone()),
         // Nothing is served. The engine is asked all the same: it knows why,
         // and says so (this build cannot run any model, say), where a
         // complaint about a field the client could not have filled in
         // would hide it.
         [] => Ok(String::new()),
-        several => {
-            let names: Vec<_> = several.iter().map(|m| m.id.as_str()).collect();
-            Err(ApiError::invalid_param(
-                "model",
-                format!(
-                    "model is required: this server serves {} models ({}), name one",
-                    several.len(),
-                    names.join(", ")
-                ),
-            ))
-        }
+        several => Err(ApiError::invalid_param(
+            "model",
+            format!(
+                "model is required: this server serves {} models ({}), name one",
+                several.len(),
+                several.join(", ")
+            ),
+        )),
     }
 }
 

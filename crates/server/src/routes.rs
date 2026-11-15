@@ -7,7 +7,7 @@ use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use ares_api::{Engine, GenerateRequest, RequestId, TokenProbs, Usage};
+use ares_api::{GenerateRequest, RequestId, TokenProbs, Usage};
 use axum::Json;
 use axum::extract::{Request, State};
 use axum::http::{HeaderName, HeaderValue, header};
@@ -15,8 +15,9 @@ use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use futures_util::StreamExt;
 
-use crate::bridge::{DecisionRun, Flight, Item, Run, Stop, Timings};
+use crate::bridge::{DecisionRun, Item, Run, Stop, Timings};
 use crate::error::ApiError;
+use crate::models::{Lease, Listed, ModelEvent, Models};
 use crate::reasoning::{self, Split};
 use crate::reply::{Piece, Sorter};
 use crate::systemone;
@@ -27,9 +28,8 @@ use crate::{Config, ReasoningFormat};
 /// What every handler needs.
 #[derive(Clone)]
 pub(crate) struct App {
-    pub engine: Arc<dyn Engine>,
+    pub models: Arc<Models>,
     pub config: Config,
-    pub flight: Arc<Flight>,
     pub stop: Stop,
 }
 
@@ -38,15 +38,154 @@ pub(crate) async fn health() -> Json<serde_json::Value> {
 }
 
 pub(crate) async fn models(State(app): State<App>) -> Json<serde_json::Value> {
-    Json(wire::model_list(&app.engine.models()))
+    Json(wire::model_list(&app.models.list()))
 }
 
-/// `GET /metrics`: what the engine has done and holds, in the text format
-/// monitoring systems scrape.
-pub(crate) async fn metrics(State(app): State<App>) -> Response {
+/// The model a request names, loaded if it was not, which the request waits
+/// for: behind a load that runs, and behind the requests of a model that has
+/// to make room. `model` becomes the id the engine knows the model by, which
+/// is what the answer says, whatever alias the request used. A client that
+/// goes away gives the wait up, and so does the end of the server.
+pub(crate) async fn model_of(app: &App, model: &mut String) -> Result<Lease, ApiError> {
+    let mut stop = app.stop.clone();
+    let lease = tokio::select! {
+        lease = app.models.acquire(model) => lease?,
+        () = stop.raised() => return Err(ApiError::cancelled()),
+    };
+    if let Some(id) = lease.id() {
+        id.clone_into(model);
+    }
+    Ok(lease)
+}
+
+/// The body of `POST /models/load` and `/models/unload`.
+fn named_model(body: &[u8]) -> Result<String, ApiError> {
+    let json = wire::read_json(body)?;
+    let mut name = None;
+    for (key, value) in wire::members(&json)? {
+        match (key.as_str(), value) {
+            ("model", ares_api::Json::String(model)) => name = Some(model.clone()),
+            ("model", _) => return Err(ApiError::invalid_param("model", "model is a string")),
+            (other, _) => {
+                return Err(ApiError::invalid_param(
+                    other,
+                    format!("'{other}' is not a member of this request: it has 'model'"),
+                ));
+            }
+        }
+    }
+    name.ok_or_else(|| ApiError::invalid_param("model", "model is required"))
+}
+
+/// `POST /models/load`: puts a model in the line of loads and answers at
+/// once; the load shows in `GET /v1/models` and in `GET /models/sse`.
+pub(crate) async fn load_model(State(app): State<App>, request: Request) -> Response {
+    let asked = async {
+        let name = named_model(&read_body(request, app.config.max_body_bytes).await?)?;
+        app.models.ask_load(&name)?;
+        Ok::<_, ApiError>(json_response(r#"{"success":true}"#.to_owned()))
+    };
+    asked.await.unwrap_or_else(IntoResponse::into_response)
+}
+
+/// `POST /models/unload`: the model gets no new requests and is unloaded
+/// when those that run have ended. Answers at once.
+pub(crate) async fn unload_model(State(app): State<App>, request: Request) -> Response {
+    let asked = async {
+        let name = named_model(&read_body(request, app.config.max_body_bytes).await?)?;
+        app.models.ask_unload(&name)?;
+        Ok::<_, ApiError>(json_response(r#"{"success":true}"#.to_owned()))
+    };
+    asked.await.unwrap_or_else(IntoResponse::into_response)
+}
+
+fn status_event(model: &str, status: &str, reason: Option<&str>) -> Result<SseEvent, Infallible> {
+    let mut data = serde_json::json!({ "status": status });
+    if let Some(reason) = reason {
+        data["reason"] = reason.into();
+    }
+    let event = serde_json::json!({ "model": model, "event": "model_status", "data": data });
+    Ok(SseEvent::default().data(event.to_string()))
+}
+
+/// `GET /models/sse`: the state of every model as it is, then every change.
+pub(crate) async fn model_events(State(app): State<App>) -> Response {
+    let Some((now, changes)) = app.models.watch() else {
+        return ApiError::unsupported(
+            "this server was given one engine and no presets: its model does not change state",
+        )
+        .into_response();
+    };
+    let first = now.into_iter().filter_map(|Listed { status, .. }| status).map(|s| {
+        let ModelEvent { model, status, reason } = s;
+        status_event(&model, status, reason.as_deref())
+    });
+    let later = futures_util::stream::unfold(changes, |mut changes| async move {
+        loop {
+            match changes.recv().await {
+                Ok(ModelEvent { model, status, reason }) => {
+                    return Some((status_event(&model, status, reason.as_deref()), changes));
+                }
+                // A reader too slow for the changes misses some; the next
+                // ones are still true.
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+            }
+        }
+    });
+    sse_response(futures_util::stream::iter(first).chain(later), KeepAlive::default())
+}
+
+/// The value of `model` in the query of a URL (`?model=<id>`), with its
+/// percent escapes read.
+fn model_in_query(query: Option<&str>) -> Option<String> {
+    let value = query?.split('&').find_map(|pair| pair.strip_prefix("model="))?;
+    let mut bytes = Vec::with_capacity(value.len());
+    let mut rest = value.as_bytes();
+    while let [first, tail @ ..] = rest {
+        let escaped = match (first, tail) {
+            (b'%', [high, low, ..]) => std::str::from_utf8(&[*high, *low])
+                .ok()
+                .and_then(|hex| u8::from_str_radix(hex, 16).ok()),
+            _ => None,
+        };
+        match escaped {
+            Some(byte) => {
+                bytes.push(byte);
+                rest = &tail[2..];
+            }
+            None => {
+                bytes.push(if *first == b'+' { b' ' } else { *first });
+                rest = tail;
+            }
+        }
+    }
+    String::from_utf8(bytes).ok()
+}
+
+/// `GET /metrics`: what an engine has done and holds, in the text format
+/// monitoring systems scrape. The engine is the one of `?model=<id>`, or of
+/// the only model there is; a model that is not loaded has none.
+pub(crate) async fn metrics(State(app): State<App>, request: Request) -> Response {
+    let name = match (model_in_query(request.uri().query()), app.models.offered().as_deref()) {
+        (Some(name), _) => name,
+        (None, Some([only])) => only.clone(),
+        // One engine and no presets: there is nothing to choose.
+        (None, None) => String::new(),
+        (None, Some(_)) => {
+            return ApiError::invalid_param(
+                "model",
+                "several models are served: name one, /metrics?model=<id>",
+            )
+            .into_response();
+        }
+    };
+    let lease = match app.models.loaded(&name).await {
+        Ok(lease) => lease,
+        Err(error) => return ApiError::from(error).into_response(),
+    };
     // The engine may wait for the end of its step before it answers.
-    let engine = app.engine.clone();
-    let stats = tokio::task::spawn_blocking(move || engine.stats()).await.ok().flatten();
+    let stats = tokio::task::spawn_blocking(move || lease.engine().stats()).await.ok().flatten();
     match stats {
         Some(stats) => (
             [(header::CONTENT_TYPE, HeaderValue::from_static("text/plain; version=0.0.4"))],
@@ -78,8 +217,8 @@ pub(crate) async fn chat_input_tokens(State(app): State<App>, request: Request) 
 async fn try_chat_input_tokens(app: App, request: Request) -> Result<Response, ApiError> {
     let body = read_body(request, app.config.max_body_bytes).await?;
     let mut parsed = wire::parse(Endpoint::Chat, &body, next_request_id())?;
-    prepare(&app, &mut parsed, app.config.reasoning_format)?;
-    let tokens = count_prompt(&app, parsed.request).await?;
+    let (_, lease) = prepare(&app, &mut parsed, None).await?;
+    let tokens = count_prompt(&lease, parsed.request).await?;
     Ok(json_response(wire::input_tokens(tokens)))
 }
 
@@ -117,18 +256,22 @@ pub(crate) async fn method_not_allowed(request: Request) -> ApiError {
 // that a request the engine refuses gets an HTTP status; dropping the
 // [`Reply`] (the client went away) cancels the request in the engine.
 
-/// Applies what a chat request says about thinking and about tools to the
-/// request for the engine (the variables of the chat template, the rule of
-/// the reply), and returns what sorts the text of its reply. `format` is how
-/// the reasoning is returned when the request does not say.
-pub(crate) fn prepare(
+/// Takes the model a chat request names ([`model_of`]: the request waits
+/// for its load), applies what the request says about thinking and about
+/// tools to the request for the engine (the variables of the chat template,
+/// the rule of the reply), and returns what sorts the text of its reply with
+/// the hold on the model. `format` is how the reasoning is returned when the
+/// request does not say; `None`: as the model's own options say.
+pub(crate) async fn prepare(
     app: &App,
     parsed: &mut Parsed,
-    format: ReasoningFormat,
-) -> Result<Sorter, ApiError> {
-    let thinking = reasoning::apply(parsed, &*app.engine, format)?;
-    let calls = tools::apply(parsed, &*app.engine, &thinking)?;
-    Ok(Sorter::new(thinking.splitter, calls))
+    format: Option<ReasoningFormat>,
+) -> Result<(Sorter, Lease), ApiError> {
+    let lease = model_of(app, &mut parsed.request.model).await?;
+    let format = format.unwrap_or(lease.reasoning_format());
+    let thinking = reasoning::apply(parsed, &**lease.engine(), format)?;
+    let calls = tools::apply(parsed, &**lease.engine(), &thinking)?;
+    Ok((Sorter::new(thinking.splitter, calls), lease))
 }
 
 /// A reply the engine is generating: the request in the engine and the
@@ -137,6 +280,9 @@ pub(crate) fn prepare(
 pub(crate) struct Reply {
     run: Run,
     sorter: Sorter,
+    /// Dropped after the run: the model may be unloaded when its requests
+    /// have let go of the engine.
+    _lease: Lease,
 }
 
 /// The next thing of a reply.
@@ -162,16 +308,21 @@ pub(crate) struct End {
 }
 
 impl Reply {
-    /// Hands `request` to the engine; `sorter` sorts its reply.
-    pub fn start(app: &App, request: GenerateRequest, sorter: Sorter) -> Result<Self, ApiError> {
+    /// Hands `request` to the engine of `lease`; `sorter` sorts its reply.
+    pub fn start(
+        app: &App,
+        lease: &Lease,
+        request: GenerateRequest,
+        sorter: Sorter,
+    ) -> Result<Self, ApiError> {
         let run = Run::start(
-            &app.engine,
+            lease.engine(),
             request,
             app.config.event_buffer,
-            &app.flight,
+            lease.flight(),
             app.stop.clone(),
         )?;
-        Ok(Self { run, sorter })
+        Ok(Self { run, sorter, _lease: lease.clone() })
     }
 
     /// The next step of the reply, or the reason there will be none. After
@@ -190,14 +341,14 @@ impl Reply {
 /// How many tokens the prompt of `request` comes to: the request as a route
 /// read and prepared it, counted by the engine and not run. An engine that
 /// cannot count answers 501.
-pub(crate) async fn count_prompt(app: &App, request: GenerateRequest) -> Result<u32, ApiError> {
-    let engine = app.engine.clone();
+pub(crate) async fn count_prompt(lease: &Lease, request: GenerateRequest) -> Result<u32, ApiError> {
+    let engine = lease.engine().clone();
     // Rendering and tokenizing a long prompt takes its time.
     let counted =
         tokio::task::spawn_blocking(move || engine.count_tokens(&request.model, &request.prompt))
             .await
             .map_err(|e| ApiError::internal(format!("the count of the prompt was lost: {e}")))?;
-    counted.map_err(|e| ApiError::from_engine(&*app.engine, e))
+    counted.map_err(|e| ApiError::from_engine(&**lease.engine(), e))
 }
 
 /// The response of a stream of events. `keep_alive` is what goes out while
@@ -231,7 +382,7 @@ async fn try_completion(
     let body = read_body(request, app.config.max_body_bytes).await?;
     let id = next_request_id();
     let mut parsed = wire::parse(endpoint, &body, id)?;
-    let sorter = prepare(&app, &mut parsed, app.config.reasoning_format)?;
+    let (sorter, lease) = prepare(&app, &mut parsed, None).await?;
     let mut head = Head::new(endpoint, id, &parsed.request.model);
     head.logprobs = parsed.logprobs;
     tracing::info!(
@@ -256,7 +407,7 @@ async fn try_completion(
                 request.sampling.seed.map(|seed| seed.wrapping_add(u64::from(i)));
         }
         let sorter = sorter.with_call_ids(tools::call_ids(request.id));
-        runs.push(Reply::start(&app, request, sorter)?);
+        runs.push(Reply::start(&app, &lease, request, sorter)?);
     }
     if parsed.stream {
         stream(runs, head, parsed.include_usage).await
@@ -273,7 +424,9 @@ async fn try_completion(
 async fn try_systemone(app: App, request: Request) -> Result<Response, ApiError> {
     let body = read_body(request, app.config.max_body_bytes).await?;
     let id = next_request_id();
-    let parsed = systemone::parse(&body, id, &app.engine.models())?;
+    let served: Vec<_> = app.models.list().into_iter().map(|listed| listed.id).collect();
+    let mut parsed = systemone::parse(&body, id, &served)?;
+    let lease = model_of(&app, &mut parsed.request.model).await?;
     tracing::info!(
         %id,
         model = %parsed.request.model,
@@ -282,7 +435,7 @@ async fn try_systemone(app: App, request: Request) -> Result<Response, ApiError>
     );
 
     let result =
-        DecisionRun::start(&app.engine, parsed.request, app.stop.clone())?.finish().await?;
+        DecisionRun::start(lease.engine(), parsed.request, app.stop.clone())?.finish().await?;
     Ok(json_response(parsed.reply.render(&result)?))
 }
 

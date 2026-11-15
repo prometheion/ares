@@ -120,6 +120,23 @@ impl ApiError {
         Self::internal("the engine stopped working on the request without finishing it")
     }
 
+    /// A request named a model that is not served; `available` are the ids
+    /// that are.
+    pub fn unknown_model(model: &str, available: &[String]) -> Self {
+        let hint = if available.is_empty() {
+            "no model is served".to_owned()
+        } else {
+            format!("available models: {}", available.join(", "))
+        };
+        Self {
+            status: StatusCode::NOT_FOUND,
+            message: format!("The model '{model}' does not exist ({hint})"),
+            code: "model_not_found",
+            param: Some("model".into()),
+            ..Self::invalid("")
+        }
+    }
+
     /// Maps what the engine reported to what a client should see.
     ///
     /// `engine` is only asked for its model list, to make "unknown model"
@@ -129,18 +146,7 @@ impl ApiError {
         match error {
             EngineError::ModelNotFound(model) => {
                 let available: Vec<_> = engine.models().into_iter().map(|m| m.id).collect();
-                let hint = if available.is_empty() {
-                    "no model is served".to_owned()
-                } else {
-                    format!("available models: {}", available.join(", "))
-                };
-                Self {
-                    status: StatusCode::NOT_FOUND,
-                    message: format!("The model '{model}' does not exist ({hint})"),
-                    code: "model_not_found",
-                    param: Some("model".into()),
-                    ..Self::invalid("")
-                }
+                Self::unknown_model(&model, &available)
             }
             EngineError::InvalidRequest(_) => Self::invalid(message),
             // OpenAI answers 400 here, and its SDKs key on the code.
@@ -166,6 +172,31 @@ impl ApiError {
                 param: self.param.as_deref(),
                 code: self.code,
             },
+        }
+    }
+}
+
+impl From<crate::models::AcquireError> for ApiError {
+    /// Why a request did not get its model.
+    fn from(error: crate::models::AcquireError) -> Self {
+        use crate::models::AcquireError;
+        match error {
+            AcquireError::NotFound { model, available } => Self::unknown_model(&model, &available),
+            // The request is fine and the server cannot serve it now: the
+            // reason says whether trying again can help.
+            AcquireError::Failed { model, reason } => Self {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                code: "model_load_failed",
+                param: Some("model".into()),
+                ..Self::internal(format!("the model '{model}' could not be loaded: {reason}"))
+            },
+            AcquireError::NotLoaded { model } => Self {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                code: "model_not_loaded",
+                param: Some("model".into()),
+                ..Self::internal(format!("the model '{model}' is not loaded"))
+            },
+            AcquireError::Stopping => Self::cancelled(),
         }
     }
 }

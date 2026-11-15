@@ -1336,17 +1336,31 @@ impl From<Usage> for UsageBody {
 }
 
 /// The model list for `GET /v1/models`.
-pub(crate) fn model_list(models: &[ares_api::ModelCard]) -> serde_json::Value {
+pub(crate) fn model_list(models: &[crate::models::Listed]) -> serde_json::Value {
     let data: Vec<_> = models
         .iter()
         .map(|m| {
-            serde_json::json!({
+            let mut model = serde_json::json!({
                 "id": m.id,
                 "object": "model",
-                "created": m.created,
                 "owned_by": "ares",
-                "context_length": m.context_length,
-            })
+            });
+            // What only a loaded model knows; kept from its last load.
+            if let Some(card) = &m.card {
+                model["created"] = card.created.into();
+                model["context_length"] = card.context_length.into();
+            }
+            // A server with presets says where each model stands, in the
+            // shape llama-server's router has; a failure is a state here,
+            // with its reason.
+            if let Some(status) = &m.status {
+                model["aliases"] = m.aliases.clone().into();
+                model["status"] = serde_json::json!({ "value": status.status });
+                if let Some(reason) = &status.reason {
+                    model["status"]["reason"] = reason.as_str().into();
+                }
+            }
+            model
         })
         .collect();
     serde_json::json!({ "object": "list", "data": data })

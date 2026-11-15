@@ -111,6 +111,7 @@ use self::reply::{Blocks, Content, Head, Written, block_event, message_end, stop
 use self::request::Purpose;
 use crate::ReasoningFormat;
 use crate::error::{Anthropic, ApiError};
+use crate::models::Lease;
 use crate::reply::Sorter;
 use crate::routes::{
     self, App, End, Reply, Step, json_response, next_request_id, read_body, sse_response,
@@ -145,23 +146,24 @@ pub(crate) async fn method_not_allowed(request: Request) -> Response {
 /// The reasoning is always taken out of the text: a thinking block is where
 /// this API has it, whatever `--reasoning-format` says about
 /// `reasoning_content`.
-fn read(
+async fn read(
     app: &App,
     body: &[u8],
     id: RequestId,
     purpose: Purpose,
-) -> Result<(Parsed, Sorter), ApiError> {
+) -> Result<(Parsed, Sorter, Lease), ApiError> {
     let chat = request::to_chat(&wire::read_json(body)?, purpose)?;
     let mut parsed = wire::from_json(Endpoint::Chat, &chat, id).map_err(request::renamed)?;
-    let sorter =
-        routes::prepare(app, &mut parsed, ReasoningFormat::Auto).map_err(request::renamed)?;
-    Ok((parsed, sorter.with_call_ids(format!("toolu_{id}_"))))
+    let (sorter, lease) = routes::prepare(app, &mut parsed, Some(ReasoningFormat::Auto))
+        .await
+        .map_err(request::renamed)?;
+    Ok((parsed, sorter.with_call_ids(format!("toolu_{id}_")), lease))
 }
 
 async fn try_messages(app: App, request: Request) -> Result<Response, ApiError> {
     let body = read_body(request, app.config.max_body_bytes).await?;
     let id = next_request_id();
-    let (parsed, sorter) = read(&app, &body, id, Purpose::Reply)?;
+    let (parsed, sorter, lease) = read(&app, &body, id, Purpose::Reply).await?;
     let head = Head { id: format!("msg_{id}"), model: parsed.request.model.clone() };
     tracing::info!(
         %id,
@@ -171,7 +173,7 @@ async fn try_messages(app: App, request: Request) -> Result<Response, ApiError> 
         max_tokens = ?parsed.request.max_tokens,
         "request"
     );
-    let reply = Reply::start(&app, parsed.request, sorter)?;
+    let reply = Reply::start(&app, &lease, parsed.request, sorter)?;
     if parsed.stream { stream(reply, head).await } else { whole(reply, head).await }
 }
 
@@ -180,8 +182,8 @@ async fn try_messages(app: App, request: Request) -> Result<Response, ApiError> 
 /// it would have been given.
 async fn try_count(app: App, request: Request) -> Result<Response, ApiError> {
     let body = read_body(request, app.config.max_body_bytes).await?;
-    let (parsed, _) = read(&app, &body, next_request_id(), Purpose::Count)?;
-    let tokens = routes::count_prompt(&app, parsed.request).await?;
+    let (parsed, _, lease) = read(&app, &body, next_request_id(), Purpose::Count).await?;
+    let tokens = routes::count_prompt(&lease, parsed.request).await?;
     Ok(json_response(format!(r#"{{"input_tokens":{tokens}}}"#)))
 }
 

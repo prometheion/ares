@@ -4,15 +4,21 @@
 //! devices (see `ares_server::load`), serves it, and on SIGINT or SIGTERM
 //! stops in order: no new connections, running requests finish or are ended,
 //! the engine's threads are joined, the devices released, and only then does
-//! the process exit.
+//! the process exit. `ares --models-preset <file.ini>` serves the models of a
+//! preset file the same way, each loaded when a request names it (see
+//! `ares_server::models`).
 
 mod cli;
 
 use std::io::IsTerminal;
 use std::process::ExitCode;
+use std::sync::Arc;
 
-use ares_server::load::{self, Loaded};
-use ares_server::{Config, serve_until};
+use ares_server::load::DeviceLoader;
+use ares_server::models::{AcquireError, Models, SystemClock};
+use ares_server::options::ModelOptions;
+use ares_server::preset::Presets;
+use ares_server::{Config, plan, serve_models};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tracing_subscriber::EnvFilter;
@@ -30,6 +36,24 @@ async fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    // One model on the command line is the one preset of a server without a
+    // preset file. A file that cannot be served is refused here, with its
+    // line, before anything is started.
+    let cli::Options { host, port, presets, load, reasoning_format, given } = options;
+    let (presets, single) = match &presets {
+        Some(file) => match Presets::read(file, &given) {
+            Ok(presets) => (presets, None),
+            Err(error) => {
+                eprintln!("error: {error}\nrun 'ares --help' for the options");
+                return ExitCode::from(2);
+            }
+        },
+        None => {
+            let presets = Presets::single(ModelOptions { load, reasoning_format });
+            let id = presets.models[0].id.clone();
+            (presets, Some(id))
+        }
+    };
 
     // Logs go to stderr: stdout is for output a user asks for, like --help.
     // Colors only on a terminal, so that a log file or journal stays plain text.
@@ -41,7 +65,7 @@ async fn main() -> ExitCode {
         .with_ansi(std::io::stderr().is_terminal())
         .init();
 
-    match run(options).await {
+    match run(&host, port, presets, single).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(message) => {
             tracing::error!("{message}");
@@ -50,47 +74,76 @@ async fn main() -> ExitCode {
     }
 }
 
-async fn run(options: cli::Options) -> Result<(), String> {
+async fn run(
+    host: &str,
+    port: u16,
+    presets: Presets,
+    single: Option<String>,
+) -> Result<(), String> {
     let mut signals = Signals::install();
 
     // The port first: a port that is taken is known at once, before seconds
     // are spent on the weights. Connections wait in the backlog until the
     // model is loaded.
-    let listener = TcpListener::bind((options.host.as_str(), options.port))
+    let listener = TcpListener::bind((host, port))
         .await
-        .map_err(|e| format!("cannot listen on {}:{}: {e}", options.host, options.port))?;
+        .map_err(|e| format!("cannot listen on {host}:{port}: {e}"))?;
     let address =
         listener.local_addr().map_err(|e| format!("cannot read the listen address: {e}"))?;
 
-    let config = Config { reasoning_format: options.reasoning_format, ..Config::default() };
-    let load_options = options.load;
-    let mut loading = tokio::task::spawn_blocking(move || load::load(&load_options));
-    let mut stop_after_load = false;
-    let loaded = loop {
-        tokio::select! {
-            result = &mut loading => {
-                break result
-                    .map_err(|e| format!("loading the model failed: {e}"))?
-                    .map_err(|e| e.to_string())?;
-            }
-            () = signals.next() => {
-                if stop_after_load {
-                    tracing::warn!("second signal: exiting without cleaning up");
-                    std::process::exit(1);
+    // The most RAM of all loaded models together, when nobody names it: half
+    // of what the machine has available now.
+    let available = std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|text| plan::parse_available_ram(&text));
+    let offered = presets.models.len();
+    let models = Arc::new(Models::start(
+        presets,
+        Arc::new(DeviceLoader),
+        Arc::new(SystemClock::default()),
+        plan::default_ram(available),
+    ));
+
+    match &single {
+        // One model on the command line is loaded before the server listens,
+        // and a server that cannot load it does not start.
+        Some(id) => {
+            let mut stop_after_load = false;
+            let loading = models.wait_loaded(id);
+            tokio::pin!(loading);
+            loop {
+                tokio::select! {
+                    result = &mut loading => {
+                        match result {
+                            Ok(()) => break,
+                            Err(AcquireError::Failed { reason, .. }) => return Err(reason),
+                            Err(other) => return Err(format!("loading the model failed: {other:?}")),
+                        }
+                    }
+                    () = signals.next() => {
+                        if stop_after_load {
+                            tracing::warn!("second signal: exiting without cleaning up");
+                            std::process::exit(1);
+                        }
+                        tracing::warn!(
+                            "stopping as soon as the model is loaded: the upload of the weights \
+                             cannot be interrupted. A second signal exits at once"
+                        );
+                        stop_after_load = true;
+                    }
                 }
-                tracing::warn!(
-                    "stopping as soon as the model is loaded: the upload of the weights cannot \
-                     be interrupted. A second signal exits at once"
-                );
-                stop_after_load = true;
             }
+            if stop_after_load {
+                models.shutdown().await;
+                return Ok(());
+            }
+            tracing::info!(%address, model = id.as_str(), "listening");
         }
-    };
-    if stop_after_load {
-        return unload(loaded).await;
+        // The models of a preset file are loaded when a request names them,
+        // or from now on in the background if their sections say so.
+        None => tracing::info!(%address, models = offered, "listening"),
     }
 
-    tracing::info!(%address, model = loaded.name(), "listening");
     let (drain, drained) = oneshot::channel::<()>();
     let (hurry, hurried) = oneshot::channel::<()>();
     tokio::spawn(async move {
@@ -102,10 +155,10 @@ async fn run(options: cli::Options) -> Result<(), String> {
         tracing::warn!("third signal: exiting without cleaning up");
         std::process::exit(1);
     });
-    let served = serve_until(
+    let served = serve_models(
         listener,
-        loaded.engine(),
-        config,
+        models.clone(),
+        Config::default(),
         async {
             let _ = drained.await;
         },
@@ -117,19 +170,12 @@ async fn run(options: cli::Options) -> Result<(), String> {
         },
     )
     .await;
-    // The engine is stopped whatever became of the HTTP side.
-    unload(loaded).await?;
+    // Every model is unloaded and the devices are released, whatever became
+    // of the HTTP side.
+    models.shutdown().await;
     served.map_err(|e| format!("the server failed: {e}"))?;
     tracing::info!("stopped");
     Ok(())
-}
-
-/// Stops the engine and releases the devices, on a thread that may wait for
-/// the engine's threads to end.
-async fn unload(loaded: Loaded) -> Result<(), String> {
-    tokio::task::spawn_blocking(move || loaded.unload())
-        .await
-        .map_err(|e| format!("stopping the engine failed: {e}"))
 }
 
 /// SIGINT and SIGTERM, one after the other: the first asks for an orderly
