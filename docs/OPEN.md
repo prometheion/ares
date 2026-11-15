@@ -17,7 +17,6 @@ Order of work the owner has set: CUDA complete for both models first, Vulkan par
 | Elastic host memory (`moe/elastic-ram`) | built; being put on top of the SSD cache (conflicts in six files); then my verification |
 | Exact draft windows of the 27B (`dense/exact-windows`) | built, rebased; my verification is running |
 | Server defaults for sampling and reply length (R23, R25) | agent working |
-| Image input | design study running (read only) |
 | Test file `Qwen3.8-Flash-Next-UD-Q4_K_XL` (104 GiB) | downloading to `/mnt/data/ares-models`, 19 GiB so far, slow |
 
 ## Qwen3.8 Flash-Next (`qwen4exp`)
@@ -131,8 +130,24 @@ with it; the runs are too noisy to tell the two apart.
       container image and service unit (X09).
 
 ## Whole features not started
-- [ ] Image input (F11; the owner's preset sets `mmproj`). Audio, video and Gemma 4 are on
-      the waiting list.
+- [ ] Image input (F11; the owner's preset sets `mmproj`). Design: `/var/tmp/ares-survey/image-input-design.md`
+      (2026-11-15). Both projector files are the same tower (`qwen3vl_merger`: patches of
+      16 x 16, 27 blocks of width 1152, a 2 x 2 merger to the language model's width; 888
+      and 866 MiB), with different weights. An image becomes (W/32) x (H/32) rows: 256 for
+      512 x 512, 1024 for 1024 x 1024. Pieces, none started:
+  - [ ] 0. Reference numbers from the fork's `llama-mtmd-debug` on the CPU (needs the owner's go: it runs the fork).
+  - [ ] 1. CPU reference of the tower: config, size rule, resize, patch rows, the pass.
+  - [ ] 2. The tower on the device: dense attention for heads of 72, layer norm with bias,
+        bias and GELU, the tower's rotary rotation, the position table's resize; `ffn_down`
+        padded from 4304 to 4320 inputs.
+  - [ ] 3. Weights not resident (uploaded block by block), the tower as a job the conductor plans.
+  - [ ] 4. Cells and positions in the runtime: image spans next to tokens, positions (t, h, w)
+        per row, staging and a store of image rows.
+  - [ ] 5. The splice in `qwen35` (a row source in the embedding gather; positions in the draft chain's links).
+  - [ ] 6. The splice in `qwen4exp` (host rows; the n-gram feed's image token).
+  - [ ] 7. Routes (`image_url`, Anthropic `image`, Responses `input_image`), limits, errors, `--mmproj`.
+  - [ ] 8. Caching: cells named by a digest of the resized pixels, 64-bit names through the index and the SSD level.
+- [ ] Audio, video and Gemma 4 are on the waiting list.
 - [ ] Jev mode: `/v1/systemone` exists and answers 501; `Engine::decide` on the real runtime.
 - [ ] Turing.
 - [ ] K/V of a running sequence beyond VRAM (P16; an exception, low priority).
@@ -152,3 +167,6 @@ with it; the runs are too noisy to tell the two apart.
 - How long may a request wait behind a long prompt on Flash-Next?
 - Should the SSD cache be on by default with a default directory? (Today: only with `--cache`.)
 - Do audio, video and Gemma 4 block the first release?
+- Images: may the fork's `llama-mtmd-debug` be run on the CPU once for reference numbers?
+  Remote image URLs: never, or behind an option (the server has no HTTP client today)?
+  The most rows per image by default: 4096 as the fork or 1024 as Strata?
