@@ -29,9 +29,9 @@
 //!   written is mostly the checkpoint, which is as large as the pages of
 //!   thousands of cells.
 //!
-//! The writer syncs the drive whenever it has nothing left to write, so what
-//! was written is durable shortly after, whatever happens to the copies on
-//! the devices.
+//! The writer syncs the drive a second after it has nothing left to write,
+//! and every ten seconds while records keep coming, so what was written is
+//! durable shortly after, whatever happens to the copies on the devices.
 //!
 //! # A hit
 //!
@@ -71,6 +71,9 @@ use crate::model::Durable;
 const PAGE_BUFFERS: usize = 16;
 /// Checkpoints in transit at once.
 const STATE_BUFFERS: usize = 3;
+/// How long the step loop waits for a buffer for a checkpoint that must
+/// leave its place now, before it gives that checkpoint up.
+const STATE_PATIENCE: Duration = Duration::from_millis(250);
 /// Threads that read from the drive.
 const READERS: usize = 4;
 
@@ -244,19 +247,24 @@ struct WriteDone {
     ns: u64,
 }
 
-/// The longest that written records wait for the sync that makes them
-/// durable while more keep coming.
-const SYNC_EVERY: Duration = Duration::from_millis(500);
+/// How long the writer waits for the next record before it syncs what it
+/// wrote, and the longest that a written record waits for a sync while more
+/// keep coming. A sync of a segment took 0.1 to 1 s on the drive this was
+/// measured on (btrfs, busy), in which the writer writes nothing; a sync
+/// after every record or every half second kept it from the drive's rate.
+const SYNC_IDLE: Duration = Duration::from_secs(1);
+const SYNC_EVERY: Duration = Duration::from_secs(10);
 
 fn writer(shared: Arc<Shared>, jobs: Receiver<WriteJob>, done: Sender<WriteDone>) {
     // When the oldest record that no sync has covered was written.
     let mut unsynced: Option<Instant> = None;
     loop {
         // What was written goes through to the drive when nothing else comes
-        // for a moment, and twice a second while records keep coming.
+        // for a moment, and every few seconds while records keep coming.
         let job = match unsynced {
             None => jobs.recv().map_err(|_| RecvTimeoutError::Disconnected),
-            Some(since) => jobs.recv_timeout(SYNC_EVERY.saturating_sub(since.elapsed())),
+            Some(since) if since.elapsed() >= SYNC_EVERY => Err(RecvTimeoutError::Timeout),
+            Some(_) => jobs.recv_timeout(SYNC_IDLE),
         };
         let job = match job {
             Ok(job) => job,
@@ -675,13 +683,13 @@ impl Ssd {
         Some((names[0], owner))
     }
 
-    /// Waits for the writer to finish a record, which gives its buffer back.
-    /// `false` when it holds none or does not finish one in time.
+    /// Waits a moment for the writer to finish a record, which gives its
+    /// buffer back. `false` when it holds none or does not finish one in time.
     fn wait_for_writer(&mut self) -> bool {
         if self.writing == 0 {
             return false;
         }
-        match self.from_writer.recv_timeout(Duration::from_secs(2)) {
+        match self.from_writer.recv_timeout(STATE_PATIENCE) {
             Ok(done) => {
                 self.written(done);
                 true
@@ -908,16 +916,10 @@ impl Cache {
             ssd.state_out.push_back(StateOut { place, hash, parent, depth });
         }
 
-        // Rounds of transfers: one as a rule. More when pages wait for the
-        // drive faster than it takes them: then the step loop waits for the
-        // writer here, so that the pool does not give up pages that are not
-        // written yet.
-        loop {
-            self.round(ssd, pool, exec);
-            if ssd.page_out.len() <= PAGE_BUFFERS || !ssd.wait_for_writer() {
-                break;
-            }
-        }
+        // The step loop does not wait for the drive: pages that it takes
+        // slower than they are computed stay queued, in the pool, and a page
+        // the pool gives up before its turn is not written.
+        self.round(ssd, pool, exec);
     }
 
     /// One round of [`Cache::pump`]: what the readers need next, one batch of
@@ -936,8 +938,14 @@ impl Cache {
         // checkpoint that comes back in the same batch may take one of their
         // places.
         while let Some(out) = ssd.state_out.pop_front() {
+            // A checkpoint cannot wait for a later pump: its place may be
+            // taken by then. With all buffers at the writer the loop waits
+            // for one, briefly: this is the one place where the step loop
+            // waits for the drive, and it takes three checkpoints that the
+            // writer has not written yet.
+            let begun = Instant::now();
             let mut buffer = ssd.state_buffer();
-            while buffer.is_none() && ssd.wait_for_writer() {
+            while buffer.is_none() && begun.elapsed() < STATE_PATIENCE && ssd.wait_for_writer() {
                 buffer = ssd.state_buffer();
             }
             match buffer {

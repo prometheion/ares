@@ -201,6 +201,7 @@ fn what_the_devices_gave_up_comes_back_from_ssd() {
     let e = engine(&model, config(32, 4, Some(store(&dir.0))));
     let (one, two) = (text_of(3, 300), text_of(4, 300));
     let a = e.ask(&one, 10);
+    e.written(19);
     let b = e.ask(&two, 10);
     assert_eq!((a.report.cached_tokens, b.report.cached_tokens), (0, 0));
     let s = e.written(2 * 19);
@@ -284,7 +285,14 @@ fn the_size_limit_gives_up_the_texts_used_least_recently() {
     let at = SsdConfig { max_bytes: 700 << 10, segment_bytes: 160 << 10, ..store(&dir.0) };
     let texts: Vec<String> = (0..8).map(|i| text_of(20 + i, 300)).collect();
     let e = engine(&model, config(64, 4, Some(at.clone())));
-    let answers: Vec<String> = texts.iter().map(|text| e.ask(text, 8).text).collect();
+    // Each text is written before the next one takes its pages of the pool:
+    // the engine does not wait for the drive, and a page the pool gives up
+    // before it was written is not written.
+    let mut answers = Vec::new();
+    for (i, text) in texts.iter().enumerate() {
+        answers.push(e.ask(text, 8).text);
+        e.written((i as u64 + 1) * 19);
+    }
     let s = e.written(8 * 19);
     assert!(s.counters.ssd.store_bytes <= at.max_bytes, "{s}");
     assert!(s.counters.ssd.store_pages < 8 * 19, "{s}");
@@ -309,7 +317,9 @@ fn damaged_and_missing_files_cost_only_time() {
     let model = model(1, |_| {});
     let (one, two) = (text_of(40, 500), text_of(41, 500));
     let e = engine(&model, config(256, 8, Some(store(&dir.0))));
-    let (a, b) = (e.ask(&one, 10), e.ask(&two, 10));
+    let a = e.ask(&one, 10);
+    e.written(31);
+    let b = e.ask(&two, 10);
     e.written(2 * 31);
     drop(e);
 
