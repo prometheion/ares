@@ -106,6 +106,15 @@ pub trait Engine: Send + Sync + 'static {
     /// not block.
     fn cancel(&self, id: RequestId);
 
+    /// Why the engine can serve no request any more, once that is so: a device
+    /// it runs on has failed, and every request from then on is refused with
+    /// this reason. `None` while it works. Whoever holds several engines asks
+    /// this to take a broken one down and leave the others serving. Must not
+    /// block.
+    fn failure(&self) -> Option<String> {
+        None
+    }
+
     /// What the engine has done since it started and what it holds now, or
     /// `None` for an engine that keeps no such books (or has shut down).
     ///

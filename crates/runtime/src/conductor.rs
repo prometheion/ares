@@ -534,6 +534,8 @@ pub(crate) struct Conductor {
     /// When the last device finished the previous step, on the executor's clock.
     last_done_ns: Option<u64>,
     failed: Option<String>,
+    /// `failed`, for whoever asks from another thread ([`Conductor::failure`]).
+    failure: std::sync::Arc<std::sync::OnceLock<String>>,
     shutting_down: bool,
     /// Requests wait and the last pass could start none of them.
     stalled: bool,
@@ -635,6 +637,7 @@ impl Conductor {
             after_idle: true,
             last_done_ns: None,
             failed: None,
+            failure: std::sync::Arc::default(),
             shutting_down: false,
             stalled: false,
         }
@@ -1245,7 +1248,14 @@ impl Conductor {
             let _ = a.sink.send(Event::Error(error.clone()));
             self.dismiss(self.waiting.len() - 1, FinishReason::Cancelled);
         }
+        let _ = self.failure.set(message.clone());
         self.failed = Some(message);
+    }
+
+    /// Where the conductor writes why it accepts no more requests, once its
+    /// devices have failed.
+    pub(crate) fn failure(&self) -> std::sync::Arc<std::sync::OnceLock<String>> {
+        self.failure.clone()
     }
 
     /// One pass of the admission accounting: the pages the parts in

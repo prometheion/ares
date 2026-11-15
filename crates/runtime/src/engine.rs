@@ -2,7 +2,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle, ThreadId};
 use std::time::Duration;
 
@@ -49,6 +49,8 @@ pub struct Runtime {
     /// Cleared when the conductor thread has ended, and with it the device
     /// threads the conductor's executor owns.
     running: Arc<AtomicBool>,
+    /// Why the engine accepts no more requests, once its devices have failed.
+    failure: Arc<OnceLock<String>>,
 }
 
 /// Clears the flag when the conductor thread is done, however it ends.
@@ -106,6 +108,7 @@ impl Runtime {
         let limit = card.context_length.min(config.pages.saturating_mul(config.cells_per_page));
         let warm_up = config.warm_up;
         let mut conductor = Conductor::new(model.clone(), config, executor, rx);
+        let failure = conductor.failure();
         let running = Arc::new(AtomicBool::new(true));
         let alive = running.clone();
         let thread = thread::Builder::new()
@@ -147,6 +150,7 @@ impl Runtime {
             conductor_id: thread.thread().id(),
             conductor: Mutex::new(Some(thread)),
             running,
+            failure,
         })
     }
 
@@ -313,6 +317,10 @@ impl Engine for Runtime {
         if let Some(sender) = self.commands.lock().expect("commands").as_ref() {
             let _ = sender.send(Command::Cancel(id));
         }
+    }
+
+    fn failure(&self) -> Option<String> {
+        self.failure.get().cloned()
     }
 
     fn stats(&self) -> Option<EngineStats> {
