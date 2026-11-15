@@ -62,7 +62,7 @@ or no-op options; Ares may do a thing differently as long as the result is not w
 | A12 | Embeddings | llama, kobold, ollama, vllm, sglang, trt, tabby, localai, tfold, sonar, swap | `/v1/embeddings` (float or base64, `dimensions`) from an embedding model | not started | no: newest model architectures only (needs embedding models) | - |
 | A13 | Rerank, score, classify, pooling | llama, vllm, sglang, tfold, sonar, localai, swap | `/v1/rerank` and relatives with reranker or classifier models | not started | no: newest model architectures only (other model kinds) | - |
 | A14 | Batch requests | vllm, trt, sglang? | many requests in one call or file (`/v1/chat/completions/batch`, OpenAI files and batches) | not started | yes | niche |
-| A15 | Model list | all | `GET /v1/models` with id and context length | done (one model) | yes | essential |
+| A15 | Model list | all | `GET /v1/models` with id and context length | done: every preset with its state (`loaded`, `loading`, `unloading`, `unloaded`, `failed` with the reason) and its aliases | yes | essential |
 | A16 | Model properties and capability discovery | llama, strata, tfold, tabby, ollama, sglang, vllm, localai | chat template, defaults, modalities, tool and reasoning support, thinking switch: `/props`, a `capabilities` object, `/api/show`, `/get_model_info` | not started | yes | common |
 | A17 | Health | all | `GET /health`; 503 while a model loads; some add ready or generate probes (sglang `/ready`, `/health_generate`) | done (liveness only) | yes | essential |
 | A18 | Prometheus metrics endpoint | llama, vllm, sglang, tgi, trt, tabby, mistralrs, strata, tfold, sonar, swap | `GET /metrics` in the text format | done (20 counters and gauges) | yes | common |
@@ -205,7 +205,7 @@ or no-op options; Ares may do a thing differently as long as the result is not w
 | S21 | Cached tokens reported | llama, vllm, sglang, strata, tfold, ollama | `usage.prompt_tokens_details.cached_tokens` | done | yes | common |
 | S22 | A disconnect cancels | strata, tfold, llama?, vllm?, sglang?, tabby? | a closed connection frees the sequence at the next step | done | yes | essential |
 | S23 | Timeouts | llama, strata, sglang | read and write timeout; a watchdog for a silent engine | not started | yes | niche |
-| S24 | Idle unload | llama, ollama, kobold, sglang, vllm, strata, tfold, lmstudio, swap | VRAM is freed after N idle seconds and the model reloads on the next request (`--sleep-idle-seconds`, `keep_alive`, `--idle-unload`, TTL) | not started | yes | common |
+| S24 | Idle unload | llama, ollama, kobold, sglang, vllm, strata, tfold, lmstudio, swap | VRAM is freed after N idle seconds and the model reloads on the next request (`--sleep-idle-seconds`, `keep_alive`, `--idle-unload`, TTL) | done: `idle-unload` of a preset; the unload checks what the devices report against what the model took | yes | common |
 
 ## 8. Speed features
 
@@ -251,11 +251,11 @@ or no-op options; Ares may do a thing differently as long as the result is not w
 | ID | Feature | Engines | What it is | Ares | Frame | Need |
 | --- | --- | --- | --- | --- | --- | --- |
 | M01 | One GGUF loaded at start, split files included | llama, fork, ik, kobold, strata, avalon | `--model` names any part of a split file | done | yes | essential |
-| M02 | Several models, loaded on request | llama, fork, ollama, kobold, tabby, localai, lmstudio, mistralrs, triton, swap | the `model` of a request selects a preset; the model is loaded if needed | not started (planned as a router mode) | yes | essential |
-| M03 | Preset file | llama, fork, kobold, tabby, strata, swap | one section per model, a global section, precedence rules, keys that exist only in presets (`load-on-startup`, `stop-timeout`) | not started | yes | essential |
-| M04 | Load and unload endpoints, load events | llama, strata, tabby, kobold, ollama, lmstudio, swap, mistralrs? | `POST /models/load` and `/unload`; an SSE stream of load state | not started | yes | common |
-| M05 | Limit of loaded models and eviction | llama, ollama, lmstudio, swap | the least recently used idle model is unloaded to make room (`--models-max`, memory margin, auto-evict, swap matrix) | not started | yes | common |
-| M06 | Model aliases | llama, sglang, trt, strata, tfold, tabby, localai, swap, vllm? | several ids for one model; tfold gives an id a default priority | not started | yes | common |
+| M02 | Several models, loaded on request | llama, fork, ollama, kobold, tabby, localai, lmstudio, mistralrs, triton, swap | the `model` of a request selects a preset; the model is loaded if needed | done: `--models-preset`; a request waits for its model's load | yes | essential |
+| M03 | Preset file | llama, fork, kobold, tabby, strata, swap | one section per model, a global section, precedence rules, keys that exist only in presets (`load-on-startup`, `stop-timeout`) | done: the options of the command line under their names, `aliases`, `load-on-startup`, `idle-unload`; everything else is refused with file and line | yes | essential |
+| M04 | Load and unload endpoints, load events | llama, strata, tabby, kobold, ollama, lmstudio, swap, mistralrs? | `POST /models/load` and `/unload`; an SSE stream of load state | done: `/models/load`, `/models/unload`, `/models/sse`; no load progress | yes | common |
+| M05 | Limit of loaded models and eviction | llama, ollama, lmstudio, swap | the least recently used idle model is unloaded to make room (`--models-max`, memory margin, auto-evict, swap matrix) | done: by what the plan of a load needs and the devices report as free, not by a count; a busy model drains first | yes | common |
+| M06 | Model aliases | llama, sglang, trt, strata, tfold, tabby, localai, swap, vllm? | several ids for one model; tfold gives an id a default priority | done: `aliases` of a preset | yes | common |
 | M07 | Model download and cache management | llama, ollama, tabby, lmstudio, localai, mistralrs, strata | pull from a hub by name, list, delete | not started | yes | niche |
 | M08 | Configuration file and environment variables | llama, vllm, sglang, trt, tabby, strata, kobold, tfold | every option also as a file key or a variable | not started (flags only, and two variables) | yes | common |
 | M09 | Settings changed without a restart | localai, kobold, llama, tfold, swap | runtime settings, config reload, key file reload | not started | yes | niche |
@@ -345,34 +345,33 @@ Counted from the tables above with a script (see the end of this file for the co
 | --- | --- |
 | Total | 223 |
 | Inside the frame | 200 |
-| - done | 62 |
+| - done | 68 |
 | - partly | 42 |
-| - not started | 96 (essential 5, common 25, niche 66) |
+| - not started | 90 (essential 3, common 21, niche 66) |
 | Outside the frame | 23 (all not started) |
 
-Of the 62 done rows 27 are essential, 28 common and 7 niche; of the 42 partly rows 11 are essential, 17 common
+Of the 68 done rows 29 are essential, 32 common and 7 niche; of the 42 partly rows 11 are essential, 17 common
 and 14 niche. A row is one capability, so the counts weigh a sampler option like a model router; List 1 orders
 them by need instead.
 
 ## List 1: inside the frame, not started, most depended-on first
 
-**Essential (5).** Without these a current agent client cannot use the server at all.
+**Essential (3).** Without these a current agent client cannot use the server at all.
 
 - K01 reasoning separated from the answer
 - R23 sampling defaults of the server
-- M02 several models loaded on request, and M03 the preset file
 - X01 API keys
 
-**Common (25).**
+**Common (21).**
 
 - API: A09 tokenize, A16 model properties
 - Sampling: R25 server cap for the output length
 - Tools: T05 recovery of imperfect calls
 - Reasoning: K03 thinking budget, K05 loop guard, K06 earlier reasoning in the history
 - Prompt: F07 template override, F09 continuing the assistant message, F11 image input, F18 truncation
-- Scheduling: S04 bounded queue with a retry answer, S06 priorities, S24 idle unload
+- Scheduling: S04 bounded queue with a retry answer, S06 priorities
 - Speed: P06 block drafters (DFlash, DSpark), P16 K/V of a running sequence beyond VRAM
-- Models: M04 load and unload endpoints, M05 limit and eviction, M06 aliases, M08 configuration file
+- Models: M08 configuration file
 - Memory: V04 VRAM reserve
 - Observability: O01 latency histograms
 - Operations: X04 CORS, X05 Host and Origin checks, X09 container image and service unit
@@ -422,7 +421,8 @@ story saves and multiplayer; tunnels (kobold, tgi) and usage statistics sent hom
    (llama and most OpenAI-compatible servers; tfold accepts and ignores a named list on Responses `include`).
 2. **The `model` of a request.** Must name a served id (Ares answers 404 `model_not_found`; routers route by it),
    is ignored (strata: one server, one model, because clients send names of their own), or matches an alias
-   (llama `--alias`, tfold, strata `aliases`).
+   (llama `--alias`, tfold, strata `aliases`). Ares: the id of a preset or one of its `aliases`; anything else
+   is the 404, and the answer names the model by its id.
 3. **Order of the filters.** `min_p` after top-k and top-p (sglang, tfold) or before them (vllm, trt). llama's
    default chain is penalties, DRY, top-n-sigma, top-k, typical, top-p, min-p, XTC, temperature, and it is
    configurable; tabby has `temperature_last` as an option. Ares: llama's default order, configurable through
@@ -465,13 +465,16 @@ story saves and multiplayer; tunnels (kobold, tgi) and usage statistics sent hom
     GLM-5.3) or cleared as the template does by default; it decides whether a new user message invalidates the
     cached prefix.
 16. **A full queue.** Wait without a bound (llama, Ares) or answer 503 or 429 with `Retry-After` (ollama, tgi,
-    tfold).
+    tfold). A request whose model has to be loaded waits as well, also when a busy model has to end its requests
+    and make room first: that model takes no new requests meanwhile, so the wait is bounded by the requests that
+    run.
 17. **Priority.** A number, lower first (vllm; sglang can flip it), or two classes, foreground and background
     (tfold).
 18. **Drafts under sampling.** The same tokens as without drafts (tfold; Ares with exact products), the same
     distribution only (vllm's rejection sampler), or acceptance that is deliberately loose (vllm FLy, trt).
 19. **Idle unload.** A lifetime per request (ollama `keep_alive`), per model (lmstudio and llama-swap TTL), or one
-    setting of the server (llama `--sleep-idle-seconds`, tfold `--idle-unload`).
+    setting of the server (llama `--sleep-idle-seconds`, tfold `--idle-unload`). Ares: per model, `idle-unload`
+    of its preset, with the section `[*]` as the setting for all.
 20. **Responses API state.** `store` defaults to true as at OpenAI (tfold, vllm) or the route is stateless
     (llama, ollama, strata). Ares: stateless. A response says `store: false`, also when the request left `store`
     out; `store: true`, `previous_response_id`, `conversation` and `background: true` are refused by name, and

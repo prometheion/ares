@@ -179,7 +179,7 @@ machine (RTX 4070 + RTX 3060, Qwen3.8-27B) or read from the engines listed in
 | `ares-sched` | Step planner (generation, decision rows and prompts in one step), admission (pages claimed per step, a reservation that corrects itself, a queue instead of refusals), the order of a pass for long prompts of a model with experts, step time model with a term for the context, draft length choice, the lookup drafter on a suffix automaton shared by all sequences | Done; unit and model tests; the conductor uses the planner, admission (without spill), the lookup drafter and the step cost |
 | `ares-weights` | Expert heat, tiers that are elected and fed by reads (admission, protection, guesses bound late, slots given back), slots per layer by need, the waves of experts of a pass, a token table for the first layers, the lookahead distance, routing bias for pruning | Done, unit tested; the expert store uses the slot sets, the heat, the swap rule and the split of slots; the guess queue, the token table, the waves and pruning are not used by a running model yet (the lookahead distance only by a guess of `qwen4exp` that is switched off) |
 | `ares-api` | Request (with every sampling field), event (text and probabilities), decision and error types; the `Engine` trait between HTTP and the runtime (`submit` for generation, `decide` for decisions, `stats`, `chat_format` for what a model's chat template declares about thinking) | Done, unit tested |
-| `ares-server` | The `ares` binary: loads a model on the devices and serves it over an OpenAI-compatible HTTP API, with the plan of devices, split, shares and context made from what the devices report | Serves `qwen35` and `qwen4exp` models (chat and plain completions, streamed and not, every sampling field and the probabilities of the tokens, `n` completions, timings, metrics, staged shutdown, the reasoning of a reply apart from its content and in the history, with llama-server's controls for thinking, tool calls held to the tools' schemas by a grammar, also when the model opens the call inside its thinking); 213 tests without a GPU, 17 that start the real binary (some need the 27B or the files of Flash-Next) and 26 that run the engine in the test's process (the 8 of tool calls have not been run); for `qwen35` the prefix cache is on, with `--ram` for the engine's RAM, for `qwen4exp` the RAM is mostly the tier of experts; no router mode, no multimodal input, `/v1/systemone` answers 501 |
+| `ares-server` | The `ares` binary: loads a model on the devices and serves it over an OpenAI-compatible HTTP API, with the plan of devices, split, shares and context made from what the devices report | Serves `qwen35` and `qwen4exp` models (chat and plain completions, streamed and not, every sampling field and the probabilities of the tokens, `n` completions, timings, metrics, staged shutdown, the reasoning of a reply apart from its content and in the history, with llama-server's controls for thinking, tool calls held to the tools' schemas by a grammar, also when the model opens the call inside its thinking); 213 tests without a GPU, 17 that start the real binary (some need the 27B or the files of Flash-Next) and 26 that run the engine in the test's process (the 8 of tool calls have not been run); for `qwen35` the prefix cache is on, with `--ram` for the engine's RAM, for `qwen4exp` the RAM is mostly the tier of experts; a router mode that serves several models from a preset file, loads them on request and unloads them for room or when idle (host tests of the preset reader and of the state machine on a scripted loader; its 2 tests on real devices have not been run); no multimodal input, `/v1/systemone` answers 501 |
 | `ares-runtime` | The conductor thread and one thread per device, the step loop that connects plan, state and kernels, admission, speculation with the lookup drafter and with a model's own drafts, the `Model` trait a model implements, a synthetic model that drives the real kernels, and the expert store (VRAM slots, RAM tier, reads, the CPU computing what is not on a GPU) | Drives `qwen35` on one device, in tensor split and in layer split, with picks made on the device; implements `Engine::submit` (not `decide`); the prefix cache is in the conductor, checked against the host executor as an oracle and carried out by `qwen35` on the devices (checkpoints in page-locked RAM within one RAM limit, `PinnedRam`), and there is no spill of pages to RAM (a request that gives way stays in the pool's cache); the expert store is driven by the device threads of `qwen4exp` (see [Qwen3.8-Flash-Next through the runtime](#qwen38-flash-next-through-the-runtime)) |
 | `ares-model` | Model architectures: configuration and weight table from a GGUF, a CPU reference of the forward pass with explicit state (window and commit) that GPU implementations are compared with block by block, and the implementation on the devices | `qwen35` (Qwen3.5-0.8B, Qwen3.8-27B) runs through the runtime and the server, with the model's draft block. `qwen4exp` (Qwen3.8-Flash-Next) runs through the runtime and the server on one or two cards, without speculation (it has no draft head built, and the lookup in earlier text takes part only next to a model drafter), and through a session of its own that tests and measurements use. See [Several devices](#several-devices) |
 
@@ -3778,7 +3778,7 @@ order it would be taken up; the source of each idea is in
    integers; attention for
    windows of many rows on the cooperative matrices, and a faster decode of
    the `q8` and `q4` rows; a faster upload.
-7. The router mode with `models.ini`, multimodal input, `Engine::decide` and
+7. Multimodal input, `Engine::decide` and
    `/v1/systemone` on the real engine. For tool calls: the tests on the real
    models (the model's own drafts in the free part of a reply with tools
    among them, which only the host has run), and a format for templates that
@@ -3863,7 +3863,13 @@ engine. What that needs:
 - **Nothing to start.** The server process, the device contexts and the
   kernels stay loaded while models come and go. The CUDA kernels are
   precompiled machine code; the Vulkan pipelines want a pipeline cache on
-  disk.
+  disk. (Today the server process stays, and a device's driver context
+  stays while a model is on the device: it is opened with the first model
+  there and closed with the last, so that a server with nothing loaded holds
+  no device memory and a model whose device failed is loaded again on a
+  fresh context. A model that takes the place of the only other one on its
+  devices therefore opens them again; what that costs is part of its load
+  time and is not measured apart.)
 - **Weights at the speed of the slowest link.** Tensors are read with direct
   I/O (or taken from the page cache when the file is already there) into
   page-locked staging and copied to all devices at once, each device on its
@@ -3877,14 +3883,21 @@ engine. What that needs:
   memory is the checkpoints' places, which a device thread locks in chunks
   when one is first used, not in the background; see "Host memory".)
 - **Unloading frees and returns.** Nothing is written at unload: state on
-  disk is written as it is produced.
+  disk is written as it is produced. (No state is on disk yet, so the prefix
+  cache of a model goes with it; see "Several models" under Server.) The
+  unload ends the engine's requests, joins its threads, drops the engine and
+  compares what every device reports as free before and after with what the
+  model took at its load; the log has both and the time.
 
-Load and unload times are measured with the first model; there are no numbers
-yet.
+Models are loaded and unloaded while the server runs by its router mode (see
+"Several models" under Server). Load and unload times of the real files
+through it are not measured yet.
 
 ## Server
 
-`ares --model <file.gguf>` loads a model on the devices and serves it.
+`ares --model <file.gguf>` loads a model on the devices and serves it;
+`ares --models-preset <file.ini>` serves several, each loaded when a request
+names it (see "Several models" below).
 Without options it plans for itself: the first device that holds the weights
 and a context, or else a tensor split over all devices with shares from the
 memory bandwidth each device reports, and a context from the VRAM that is
@@ -4498,9 +4511,176 @@ the reasoning of a reply comes apart from the content, in streams too, and
 `--reasoning` and the controls of a request work the same way; a reply that
 `max_tokens` cuts inside the thinking has reasoning and no content.
 
-A router mode driven by a preset file (`models.ini`, one section per model)
-that loads and unloads models on request, and multimodal input, are not
-built.
+Multimodal input is not built.
+
+**Several models (router mode).** `ares --models-preset <file.ini>` serves the
+models of a preset file. A model is loaded when a request names it, stays
+loaded while the devices and the RAM hold it next to the others, and is
+unloaded when another model needs its room or when it was idle for its time.
+`ares --model <file.gguf>` is the same server with one preset that is loaded
+before the server listens and never unloaded; a load that fails there ends
+the start, as before.
+
+*The preset file* is an INI file (`crates/server/src/preset.rs`). The section
+`[*]` holds what is the same for every model; every other section is one
+model, and its name is the id requests use and `/v1/models` lists.
+
+```ini
+[*]
+ram = 24G
+idle-unload = 30m
+
+[qwen-27b]
+model = /models/Qwen3.8-27B-UD-Q4_K_S.gguf
+aliases = default, gpt-4o
+reasoning-effort = medium
+load-on-startup = true
+
+[small]
+model = /models/Qwen3.5-0.8B-Q4_K_M.gguf
+devices = 0
+context = 16384
+ram = 2G
+```
+
+A key is an option of the command line for one model under its name without
+the dashes, with the value the option takes (`context`, `kv`, `devices`,
+`chat-var`, which may stand several times; a switch such as
+`reasoning-preserve` takes `true` or `false`). The command line and the file
+are read by the same code (`options.rs`), so there is one vocabulary and one
+check of a value. Three keys exist only in the file:
+
+| Key | Meaning | Default |
+| --- | --- | --- |
+| `aliases` | more ids the model answers to, separated by commas | none |
+| `load-on-startup` | `true`: loaded when the server starts, in the background, not at its first request | `false` |
+| `idle-unload` | how long the model stays loaded without a request: seconds, or a number with `s`, `m` or `h`; `never` | `never` |
+
+What holds for a model is, from the strongest: the command line (an option of
+a model given next to `--models-preset` holds for every model), the model's
+section, the section `[*]`, the built-in defaults. `ram` is the one key that
+means something else by where it stands: on the command line and in `[*]` it
+is the most RAM of the server, for all loaded models together (default: half
+of what the machine has available when the server starts); in a model's
+section it is that model's part of it, and a model without one takes what the
+limit has left when it is loaded. `host` and `port` are the server's and stand
+on the command line only; `--model` and `--models-preset` exclude each other.
+
+Nothing in the file is ignored. The server does not start, and says the file,
+the line and the reason, for: a key it does not know, a value an option does
+not take, a key before the first section, a key or a section that stands
+twice, a section without `model`, a model file that does not exist, an id or
+alias that two sections answer to, `model` or `aliases` in `[*]`, and a
+model's `ram` above the server's. An option of llama-server is not accepted
+under its name: the error names the option of Ares that does the job where
+there is one (`ctx-size`: `context`; `tensor-split`: `shares`; `ctk` and
+`ctv`: `kv`; `chat-template-kwargs`: `chat-var`; `sleep-idle-seconds`:
+`idle-unload`; `alias`: `aliases`, and the others of `other_name` in
+`preset.rs`). What only the devices or the model file can say (a split the
+devices cannot do, a context that fits nowhere) is found when the model is
+loaded, and is then the reason of a failed load.
+
+*A request and its model* (`crates/server/src/models.rs`). The `model` of a
+request is an id or an alias; anything else is a 404 `model_not_found` that
+lists the ids. The request takes a hold on the model for as long as it runs.
+If the model is not loaded the request waits until it is, behind a load that
+already runs, and the answer names the model by its id whatever alias the
+request used. A client that goes away while it waits gives its place up: a
+load nobody waits for is not started, and one that has begun is finished (the
+way of the weights to the devices is not interrupted) and leaves the model
+loaded and idle. One task does every load and every unload, one at a time, so
+that what the devices report as free is what the next load is planned
+against.
+
+*Making room.* Nothing counts models. The loader plans a model as on the
+command line, against what the devices report as free and what the server's
+RAM limit has left, and says "no room" before it reads the weights when the
+plan does not fit: the estimate of the model with the context its preset
+names is more than a device has free; or, for a preset that names no context,
+less than the least context a device is chosen for (8192 tokens, or the
+model's own) fits; or the RAM left is less than what the engine needs to run.
+Then the model that has been idle the longest is unloaded and the load is
+planned again, until it fits or no model is left, in which case the load
+fails with the plan's words. A preset that names no context gets what the
+devices have free when it is loaded, as on the command line, which next to
+other models is less than alone: presets that are to share a device name
+their `context`, and their `ram`.
+
+A model that is serving requests is never unloaded under them. When a load
+finds no room and only such models are loaded, the one used least recently
+gives way: it gets no new requests (they wait in line, behind the load, and
+load it again afterwards), and it is unloaded when its running requests have
+ended. The wait of the new request is therefore bounded by the requests that
+run when it arrives, so it waits, and no request is answered 503 because
+another model is busy (open decision 16 of the feature checklist: Ares waits
+here as it does for a full queue). `/v1/models` shows such a model as
+`loading` with the reason `waiting for room: ...`. What this costs: with
+requests for two models that cannot be loaded together arriving all the
+time, the server changes between them at the pace of its loads.
+
+*Idle unload.* A model whose preset has an `idle-unload` is unloaded when no
+request has held it for that long; the time counts from the end of its last
+request. The next request loads it again. The time is one setting of a
+preset, with `[*]` as the default for all (open decision 19).
+
+*What an unload releases.* The engine of the model is shut down (its
+requests ended, its threads joined) and dropped, with the pages of sequence
+state, the weights and the page-locked RAM it holds; a device that no other
+model is on is closed with its driver context, so that a server with nothing
+loaded holds no device memory. The unload compares what every device reports
+as free before and after with what the model had taken at its load, logs
+both, and warns when less came back than was taken.
+
+The prefix cache does not outlive its model. Its cells are pages of K and V
+in VRAM and its checkpoints are page-locked RAM, both the engine's, and a
+checkpoint without the pages it belongs to resumes nothing; keeping either
+across an unload would keep the memory the unload is for. A model that is
+loaded again starts with an empty cache, and the first request of a
+conversation computes its prompt again. Keeping a conversation across an
+unload needs the pages on the SSD, written as they are produced (see
+"Loading and unloading"), which is not built.
+
+*Endpoints.*
+
+| Endpoint | What it does |
+| --- | --- |
+| `GET /v1/models` | every preset in the order of the file: `id`, `aliases`, `status` (`{"value": "unloaded" \| "loading" \| "loaded" \| "unloading" \| "failed", "reason"}`), and `created` and `context_length` once the model was loaded |
+| `POST /models/load` `{"model": id}` | puts the model in the line of loads and answers `{"success": true}` at once |
+| `POST /models/unload` `{"model": id}` | the model gets no new requests and is unloaded when those that run have ended; answers `{"success": true}` at once |
+| `GET /models/sse` | Server-Sent Events: the state of every model as it is, then every change, as `{"model", "event": "model_status", "data": {"status", "reason"}}` |
+| `GET /metrics?model=id` | the statistics of one loaded model; without `model` when the server has one |
+
+The bodies and the answers of the two `POST` routes and the events are
+llama-server's. Where they differ: a failure is a state of its own with its
+reason (llama-server writes `unloaded` with `failed: true` and an exit code,
+since its models are processes); a member of a body other than `model` is
+refused; the event stream begins with the state of every model, so that a
+client that connects late knows where it is; and there are no `args`,
+`progress` or download events. A load asked through the endpoint is not
+waited for by the answer, as in llama-server: whether it succeeded is in the
+list and in the events. An unload does not end running requests; a way to
+end them by force is not built.
+
+*Failures and the end.* A load that fails leaves its model `failed` with the
+reason, which every request that waited for it gets as a 503
+`model_load_failed`; the other models are not touched, and the next request
+for the model tries the load again. An engine whose device fails says so
+(`Engine::failure`; the runtime's conductor sets it when a step fails on a
+device): its model gets no new requests, is unloaded when the requests the
+failure ended have let go, and is listed as `failed` with the engine's reason
+until a request loads it again; models on other devices serve on. On the
+first signal the server stops as before, and then unloads every model before
+the process exits; a load that runs then is finished first.
+
+*What is not there.* The plan of a load cannot be asked without the load
+(the mixture-of-experts model's placement reads the devices itself), so the
+router finds the models that have to go by trying: a model that fits
+nowhere has unloaded the idle models, and waited for the busy ones, before
+it fails. A model is planned against free memory only, so a preset without a
+`context` that is loaded next to others gets less than alone. The RAM limits
+of loaded models are parts of the server's limit that are booked at load;
+the models do not give RAM to each other while they run. A model option
+given on the command line needs text that is UTF-8, paths included.
 
 The set of flags is the engine's own and starts from nothing. A flag exists
 only for something that is worth setting: a real choice (KV formats, context
