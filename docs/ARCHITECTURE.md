@@ -185,7 +185,8 @@ machine (RTX 4070 + RTX 3060, Qwen3.8-27B) or read from the engines listed in
 
 Both test architectures are specified under [reference/](reference/):
 [qwen35](reference/qwen35-architecture.md) and
-[qwen4exp](reference/qwen4exp-architecture.md).
+[qwen4exp](reference/qwen4exp-architecture.md). The projector for images is
+described under [The image tower](#the-image-tower).
 
 ## A step
 
@@ -4039,6 +4040,75 @@ GPU that CUDA 13 does not run on.
   shader compiler thread was still working after hundreds of pipelines had
   been created. The tests leave without destroying their devices; the
   engine needs the same care at shutdown.
+
+## The image tower
+
+`ares-model::qwen3vl` holds the projector that both language models read images
+through (`clip.projector_type = qwen3vl_merger`; one file per model, the same
+shape with other weights and another output width): its configuration and
+weight table, the pixel work in front of it, and a CPU reference of the pass.
+The reference is a test oracle, as the references of the language models are.
+Nothing serves with it and nothing of the tower runs on a device yet. It sits
+in `ares-model` beside `qwen35` and `qwen4exp`, with the same parts (`config`,
+`weights`, `reference`), because the device implementation will be written
+there and held to it there.
+
+- **Configuration and weights** are read strictly: a `clip.*` key the
+  implementation does not know, another projector type, deepstack layers, an
+  activation other than GELU, a merge other than 2 x 2, and a tensor that is
+  missing, misshapen or not part of the projector are refused by name.
+- **Pixels** (`image`): the size rule (both sides to the nearest multiple of
+  32 pixels with ties to the even multiple, then scaled into the limits of 8
+  and 4096 rows by default), the bicubic resize in the 22-bit fixed point of
+  Pillow's resampling, and `(value / 255 - mean) / std`, each operation for
+  operation as llama.cpp's `mtmd` does it. The reference takes pixels; reading
+  image files belongs to the server.
+- **The pass** (`reference`): patch rows of 768 values in the merger's order
+  through the sum of the two patch kernels, the 48 x 48 position table resized
+  bilinearly with aligned corners, 27 blocks (layer norm, one matrix for query,
+  key and value, the rotation of query and key in two halves of a head by the
+  patch's row and column, full softmax attention, the MLP with the tanh GELU),
+  the last norm, and the merger over four patches side by side. Sums are
+  accumulated in `f64` and rounded to `f32` once, in an order fixed by the
+  length of the data, so the rows have the same bits on any number of threads.
+  Every stage can be tapped.
+
+**Checked against llama.cpp.** Rows of both projectors were taken from the
+fork's `llama-mtmd-debug` on the CPU for eleven square patterns of 4 to 1024
+rows, with the sum of every node of its graph. That program computes a noisy
+version of the pass: it rounds pixels and patch kernels to f16, the input of
+every BF16 matrix to bf16 and the GELU to f16 on both sides, and with flash
+attention queries, keys and values to f16. The reference has a second
+arithmetic with the first three of these roundings. Up to the end of the first
+block its stage sums and llama.cpp's agree to 5e-6 of the summed magnitudes.
+After that they drift apart, because a value that differs in its last bit can
+round to the other bf16 neighbour: with the precision of the sums as the only
+change (`f32` in place of `f64`), the reference with the roundings moved by
+0.2 to 0.9 % on the four images tried. How much the roundings matter depends on
+the image, so the test measures it per image, as the distance between the
+reference with and without them (0.2 to 7 %, largest for an image of one
+colour), and allows three times that plus 0.1 %. Measured on the images of up
+to 256 rows of both projectors, and of 576 and 1024 rows of the 27B's: the
+reference with the roundings is 0.2 to 2.2 % from llama.cpp's rows (relative
+root of the squared differences), the exact one 0.2 to 6.3 %; llama.cpp with
+flash attention is 0.6 to 1.2 % from llama.cpp without. The exact arithmetic
+is what a device is to be compared with.
+
+The resize could not be put through llama.cpp (its debug program reads no
+image file). It equals Pillow 13 byte for byte on ten images when Pillow
+filters the columns first, as llama.cpp does; one call of Pillow filters the
+rows first when that leaves the smaller picture between the passes, and its
+result then differs from llama.cpp's (two of the ten images, by up to 16 of
+255 on a checkerboard).
+
+The residual of the tower holds values in the thousands beside values near
+one: in the 27B's projector it stays below 21 for nine blocks, is about 430
+to 520 from block 9 on and about 6000 after the last block, where one MLP
+writes a value that large; 8384 is the largest seen (Flash-Next's projector).
+Sums of such values need `f32`.
+
+On the 16 threads of the development machine, under other load, the pass takes
+32 to 37 s for 256 rows and 115 to 127 s for 1024.
 
 ## What is taken from where
 

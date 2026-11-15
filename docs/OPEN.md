@@ -156,9 +156,13 @@ Everything `FEATURES.md` lists for the 27B and not for Flash-Next is owed:
       (2026-11-15). Both projector files are the same tower (`qwen3vl_merger`: patches of
       16 x 16, 27 blocks of width 1152, a 2 x 2 merger to the language model's width; 888
       and 866 MiB), with different weights. An image becomes (W/32) x (H/32) rows: 256 for
-      512 x 512, 1024 for 1024 x 1024. Pieces, none started:
-  - [ ] 0. Reference numbers from the fork's `llama-mtmd-debug` on the CPU (the owner agreed 2026-11-16).
-  - [ ] 1. CPU reference of the tower: config, size rule, resize, patch rows, the pass.
+      512 x 512, 1024 for 1024 x 1024. Pieces, 0 and 1 done:
+  - [x] 0. Reference numbers from the fork's `llama-mtmd-debug` on the CPU: rows of both
+        projectors for eleven square patterns of 4 to 1024 rows, with the sum of every node of
+        the graph. The program reads no image file, so no own image, no wide or tall grid and
+        no resize went through the fork; the resize is checked against Pillow instead.
+  - [x] 1. CPU reference of the tower (`ares-model::qwen3vl`): config, size rule, resize, patch
+        rows, the pass. See "The image tower" in `ARCHITECTURE.md`.
   - [ ] 2. The tower on the device: dense attention for heads of 72, layer norm with bias,
         bias and GELU, the tower's rotary rotation, the position table's resize; `ffn_down`
         padded from 4304 to 4320 inputs.
