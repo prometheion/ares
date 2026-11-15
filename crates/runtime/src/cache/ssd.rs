@@ -1066,7 +1066,7 @@ impl Cache {
                         }
                     }
                 }
-                Note::PageOut(out) => self.to_writer(ssd, Kind::Page, &out, parts, ok),
+                Note::PageOut(out) => self.hand_over(ssd, Kind::Page, &out, parts, ok),
                 Note::StateOut(out) => {
                     let page = PageOut {
                         page: PageId(0),
@@ -1074,7 +1074,7 @@ impl Cache {
                         parent: out.parent,
                         depth: out.depth,
                     };
-                    self.to_writer(ssd, Kind::State, &page, parts, ok);
+                    self.hand_over(ssd, Kind::State, &page, parts, ok);
                 }
             }
         }
@@ -1097,7 +1097,7 @@ impl Cache {
         }
     }
 
-    fn to_writer(
+    fn hand_over(
         &mut self,
         ssd: &mut Ssd,
         kind: Kind,
