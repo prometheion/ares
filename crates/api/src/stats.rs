@@ -49,6 +49,9 @@ pub struct SsdStats {
     pub transfer_ns: u64,
     /// Bytes the model's store takes on the drive now.
     pub store_bytes: u64,
+    /// Pages and checkpoints that wait to be written or are being written
+    /// now.
+    pub pending: u64,
 }
 
 /// Totals of an engine since it started, and what it holds right now.

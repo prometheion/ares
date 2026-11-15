@@ -212,18 +212,17 @@ impl Server {
     }
 
     /// Waits until the store has taken everything that was queued for it:
-    /// the count of written pages has stopped growing and is not zero.
+    /// pages were written and nothing waits for the writer. Returns the pages
+    /// written.
     fn settled(&self) -> u64 {
         let deadline = Instant::now() + LIMIT;
-        let mut last = u64::MAX;
         loop {
-            let now = self.metric("cache_ssd_pages_written_total");
-            if now == last && now > 0 {
-                return now;
+            let written = self.metric("cache_ssd_pages_written_total");
+            if written > 0 && self.metric("cache_ssd_pending") == 0 {
+                return written;
             }
-            last = now;
             assert!(Instant::now() < deadline, "the store never came to rest");
-            thread::sleep(Duration::from_millis(300));
+            thread::sleep(Duration::from_millis(100));
         }
     }
 

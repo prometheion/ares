@@ -360,6 +360,7 @@ impl Engine for Runtime {
                 read_ns: c.ssd.read_ns,
                 transfer_ns: c.ssd.transfer_ns,
                 store_bytes: c.ssd.store_bytes,
+                pending: c.ssd.pending,
             },
         })
     }

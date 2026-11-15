@@ -1369,7 +1369,7 @@ pub(crate) fn model_list(models: &[crate::models::Listed]) -> serde_json::Value 
 /// The body of `GET /metrics`.
 pub(crate) fn metrics(stats: &ares_api::EngineStats) -> String {
     let ssd = &stats.ssd;
-    let rows: [(&str, &str, &str, u64); 39] = [
+    let rows: [(&str, &str, &str, u64); 40] = [
         (
             "cache_ssd_pages_written_total",
             "counter",
@@ -1425,6 +1425,12 @@ pub(crate) fn metrics(stats: &ares_api::EngineStats) -> String {
             ssd.transfer_ns,
         ),
         ("cache_ssd_bytes", "gauge", "Bytes the model's store takes on SSD", ssd.store_bytes),
+        (
+            "cache_ssd_pending",
+            "gauge",
+            "Pages and checkpoints that wait to be written to SSD",
+            ssd.pending,
+        ),
         (
             "requests_finished_total",
             "counter",
