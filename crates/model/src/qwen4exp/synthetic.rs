@@ -330,7 +330,8 @@ impl Synthetic {
         );
         vector(&mut file, &name("self_attn.indexer.q_layernorm.weight"), &[idx], 0.1, 0.0);
         vector(&mut file, &name("self_attn.indexer.k_layernorm.weight"), &[idx], 0.1, 0.0);
-        matrix(&mut file, &name("mlp.gate.weight"), &[n, s.n_expert], 6.0, f32t);
+        // The real block's router is BF16 where the model's own are F32.
+        matrix(&mut file, &name("mlp.gate.weight"), &[n, s.n_expert], 6.0, bf16);
         let stack = |file: &mut File, what: &str, dims: &[usize], gain: f32, which: usize| {
             let name = name(what);
             match experts.map(|types| [types.0, types.1][which]) {

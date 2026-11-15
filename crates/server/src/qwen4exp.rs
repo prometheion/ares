@@ -438,6 +438,7 @@ pub(crate) fn load(
         );
     }
     if let Some(report) = model.draft_report() {
+        watch_drafts(std::sync::Arc::downgrade(&model));
         let (vram, ram_slots) = model.draft_slots().unwrap_or((0, 0));
         tracing::info!(
             "draft block, on device {}: dense weights {}, K, V and keys {}, buffers {}; its {} \
@@ -495,6 +496,48 @@ fn warm_up(runtime: &Runtime, model: &str) -> Result<(), LoadError> {
         begun.elapsed().as_secs_f64()
     );
     Ok(())
+}
+
+/// How often the log says what the draft block did, while it does something.
+const DRAFT_WATCH: Duration = Duration::from_secs(20);
+
+/// Logs what the model's draft block did since the engine started, whenever
+/// that has changed: the links it made and what one cost, and how the drafts
+/// of each link fared with the rows that verified them. Ends with the model.
+fn watch_drafts(model: std::sync::Weak<Qwen4Exp>) {
+    let watch = move || {
+        let mut links = 0;
+        loop {
+            std::thread::sleep(DRAFT_WATCH);
+            let Some(model) = model.upgrade() else { return };
+            let times = model.draft_times();
+            if times.links == links {
+                continue;
+            }
+            links = times.links;
+            let longest = times.offered.iter().rposition(|n| *n > 0).map_or(0, |i| i + 1);
+            let rates = join(
+                times.offered[..longest]
+                    .iter()
+                    .zip(&times.accepted)
+                    .map(|(offered, accepted)| format!("{accepted} of {offered}")),
+                ", ",
+            );
+            tracing::info!(
+                "draft block: {} links in {} steps, {:.2} ms a link ({:.2} ms a step that \
+                 drafts); accepted per link, of the drafts that were verified: {rates}; {} rows \
+                 only wrote keys, {:.3} ms of the host each",
+                times.links,
+                times.chain_steps,
+                times.chain_ms / times.links.max(1) as f64,
+                times.chain_ms / times.chain_steps.max(1) as f64,
+                times.key_rows,
+                times.key_ms / times.key_rows.max(1) as f64,
+            );
+        }
+    };
+    // Without the thread the engine runs all the same.
+    let _ = std::thread::Builder::new().name("ares-draft-watch".into()).spawn(watch);
 }
 
 fn ordinals_of(held: &[crate::load::Held]) -> String {

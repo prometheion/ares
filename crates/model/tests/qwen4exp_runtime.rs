@@ -1026,11 +1026,12 @@ fn the_draft_block_drafts_what_the_reference_drafts_in_every_placement() {
 }
 
 /// Drafts change no token: with the draft block a reply is what it is
-/// without, greedy and sampled with a seed, alone and next to another
-/// sequence, in every placement. The made-up block guesses badly, so most of
-/// its drafts are rejected and rolled back; the text repeats and the request
-/// is asked again, so that the lookup in earlier text joins and has drafts
-/// that are accepted, which the block then has to follow.
+/// without, greedy and sampled with a seed, in every placement. The made-up
+/// block guesses badly, so most of its drafts are rejected and rolled back;
+/// the text repeats and the request is asked again, so that the lookup in
+/// earlier text joins and has drafts that are accepted, which the block then
+/// has to follow. Two sequences that share their steps write what each
+/// writes alone up to a near tie, with drafts and without.
 #[test]
 fn drafts_change_no_token_in_any_placement() {
     if !enabled() {
@@ -1050,6 +1051,15 @@ fn drafts_change_no_token_in_any_placement() {
         let plain = ask(&runtime, 1, &repeats, 120);
         let plain_other = ask(&runtime, 2, &other, 60);
         let (plain_seeded, _) = ask_sampled(&runtime, 3, &repeats, 60, seeded.clone(), true);
+        // Two sequences that share their steps, still without drafts: what a
+        // sequence says next to another one is its own text up to near ties
+        // (a row's sums are not the same bits in every shape of step, and a
+        // made-up model amplifies the difference).
+        let (rx_a, rx_b) = (submit(&runtime, 4, &repeats, 120), submit(&runtime, 5, &other, 60));
+        let plain_together = (
+            rx_a.recv_timeout(Duration::from_secs(300)).unwrap().unwrap(),
+            rx_b.recv_timeout(Duration::from_secs(300)).unwrap().unwrap(),
+        );
         assert_nothing_missed(&model, "the answers without drafts");
         runtime.shutdown();
         drop(model);
@@ -1088,25 +1098,40 @@ fn drafts_change_no_token_in_any_placement() {
         assert!(counters.own_draft_links > 0, "{placement:?}: the block drafted nothing");
         assert!(counters.drafts_accepted > 0, "{placement:?}: no draft was accepted");
         assert!(counters.drafts_rejected > 0, "{placement:?}: no draft was rejected");
+        // Alone, a sequence writes with drafts what it writes without, token
+        // for token.
+        for (what, got, want) in [
+            ("drafts changed a greedy reply", &first, &plain),
+            ("accepted drafts changed a greedy reply", &again, &plain),
+            ("a request without drafts", &undrafted, &plain),
+            ("drafts changed a sampled reply", &sampled, &plain_seeded),
+        ] {
+            if got != want {
+                failures.push(format!("{placement:?}: {what}: {got:?} and not {want:?}"));
+            }
+        }
+        // Next to another sequence it does up to a near tie, with drafts as
+        // without: where two replies part, the reference has the two tokens
+        // within a hundredth of the spread of its logits.
         for (what, prompt, got, want) in [
-            ("drafts changed a greedy reply", &repeats, &first, &plain),
-            ("accepted drafts changed a greedy reply", &repeats, &again, &plain),
-            ("a request without drafts", &repeats, &undrafted, &plain),
+            ("two sequences without drafts", &repeats, &plain_together.0, &plain),
+            ("the other of two without drafts", &other, &plain_together.1, &plain_other),
             ("next to another sequence", &repeats, &together.0, &plain),
             ("the other sequence", &other, &together.1, &plain_other),
         ] {
-            if got != want {
-                let at = got.iter().zip(want).position(|(a, b)| a != b).unwrap_or(0);
-                let gap = reference_gap(2, prompt, &want[..at], got[at], want[at]);
-                failures.push(format!(
-                    "{placement:?}: {what}: token {at} is {} and not {}; the reference has \
-                     them {gap:?} apart (logits of the two, the largest, the spread)",
-                    got[at], want[at]
-                ));
+            let Some(at) = got.iter().zip(want).position(|(a, b)| a != b) else {
+                assert_eq!(got.len(), want.len(), "{placement:?}: {what}");
+                continue;
+            };
+            let [a, b, largest, spread] = reference_gap(2, prompt, &want[..at], got[at], want[at]);
+            eprintln!(
+                "RES {placement:?}: {what}: token {at} is {} and not {}: the reference has \
+                 their logits at {a} and {b}, the largest at {largest}, a spread of {spread}",
+                got[at], want[at]
+            );
+            if (a - b).abs() > 0.01 * spread {
+                failures.push(format!("{placement:?}: {what}: token {at} is no near tie"));
             }
-        }
-        if sampled != plain_seeded {
-            failures.push(format!("{placement:?}: drafts changed a sampled reply"));
         }
     }
     assert!(failures.is_empty(), "{failures:#?}");

@@ -481,14 +481,26 @@ impl<'g> Layout<'g> {
             down_ty: moe.down.ty(),
         };
         shape.check()?;
-        if moe.router.ty() != GgmlType::F32 {
-            return Err(invalid(format!(
-                "{} is {}: the router kernel takes F32",
-                name("ffn_gate_inp"),
-                moe.router.ty()
-            )));
-        }
-        let router = streams.then(|| self.push(Source::File(moe.router.bytes())));
+        let router = match moe.router.ty() {
+            _ if !streams => None,
+            GgmlType::F32 => Some(self.push(Source::File(moe.router.bytes()))),
+            // The router kernel multiplies f32 rows: a router in another float
+            // type (the draft block's file has BF16) is widened once, here.
+            GgmlType::F16 | GgmlType::BF16 => {
+                let (rows, cols) = (moe.router.rows(), moe.router.cols());
+                let mut values = vec![0.0f32; rows * cols];
+                for (row, out) in values.chunks_exact_mut(cols).enumerate() {
+                    moe.router.decode_row(row, out);
+                }
+                Some(self.floats(&values))
+            }
+            other => {
+                return Err(invalid(format!(
+                    "{} is {other}: the router kernel takes a float type",
+                    name("ffn_gate_inp"),
+                )));
+            }
+        };
         let router_range = if streams { self.range(&moe.router) } else { WeightRange::Any };
         let largest = moe.shared_gate_inp.iter().fold(0.0f32, |m, v| {
             // A value that is not a number counts as beyond every range.
