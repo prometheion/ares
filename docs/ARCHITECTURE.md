@@ -4087,12 +4087,12 @@ change (`f32` in place of `f64`), the reference with the roundings moved by
 0.2 to 0.9 % on the four images tried. How much the roundings matter depends on
 the image, so the test measures it per image, as the distance between the
 reference with and without them (0.2 to 7 %, largest for an image of one
-colour), and allows three times that plus 0.1 %. Measured on the images of up
-to 256 rows of both projectors, and of 576 and 1024 rows of the 27B's: the
-reference with the roundings is 0.2 to 2.2 % from llama.cpp's rows (relative
-root of the squared differences), the exact one 0.2 to 6.3 %; llama.cpp with
-flash attention is 0.6 to 1.2 % from llama.cpp without. The exact arithmetic
-is what a device is to be compared with.
+colour), and allows three times that plus 0.1 %. Measured on the eleven
+images of both projectors: the reference with the roundings is 0.2 to 2.2 %
+from llama.cpp's rows (relative root of the squared differences), the exact
+one 0.2 to 6.3 %; llama.cpp with flash attention is 0.6 to 1.2 % from
+llama.cpp without. The exact arithmetic is what a device is to be compared
+with.
 
 The resize could not be put through llama.cpp (its debug program reads no
 image file). It equals Pillow 13 byte for byte on ten images when Pillow
