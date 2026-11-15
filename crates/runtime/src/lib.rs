@@ -72,16 +72,19 @@ pub mod testing;
 mod text;
 mod timing;
 
+pub use cache::{SsdConfig, SsdCounters};
 pub use conductor::{SequenceInfo, token_hash};
 pub use config::RuntimeConfig;
 pub use engine::Runtime;
 pub use error::RuntimeError;
-pub use exec::{Clock, ExecError, Executor, Pick, StepMeta, StepOutput};
+pub use exec::{
+    Clock, ExecError, Executor, Pick, StepMeta, StepOutput, Transfer, TransferKind, TransitPart,
+};
 pub use gpu::{GpuConfig, GpuExecutor, required_ram};
 pub use links::{Links, MAX_DEVICES};
 pub use model::{
-    ContextSpec, DeviceContext, DeviceModel, LinkSpec, Logits, Model, ModelError, OwnDrafts,
-    PrefixCache, Split, StepContext,
+    ContextSpec, DeviceContext, DeviceModel, DeviceTransfer, Durable, LinkSpec, Logits, Model,
+    ModelError, OwnDrafts, PrefixCache, Split, StepContext, TransferContext,
 };
 pub use ram::{LockedChunk, PinnedRam};
 pub use record::{

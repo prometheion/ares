@@ -306,6 +306,9 @@ pub struct Counters {
     /// Requests that were held back, once or more, because another sequence
     /// was computing the first page of their prompt that was not cached.
     pub requests_held: u64,
+    /// What the level of the prefix cache on SSD has done since the engine
+    /// started (a reset leaves it), and what it holds.
+    pub ssd: crate::SsdCounters,
     /// How the conductor's waits for the devices ended.
     pub conductor_wakes: crate::sync::WakeCounts,
     /// How the device threads' waits for work ended.
@@ -431,6 +434,10 @@ pub struct Snapshot {
     pub requests: Vec<RequestReport>,
     /// What the warm-up measured; `None` for a runtime that ran none.
     pub calibration: Option<Calibration>,
+    /// Why the level of the prefix cache on SSD is not in use although the
+    /// engine was given a directory for it; `None` when it is in use or was
+    /// not asked for.
+    pub ssd_problem: Option<String>,
 }
 
 impl Snapshot {
@@ -461,6 +468,7 @@ impl Snapshot {
             waiting,
             requests: stats.requests.iter().copied().collect(),
             calibration: None,
+            ssd_problem: None,
         }
     }
 
@@ -567,6 +575,32 @@ impl fmt::Display for Snapshot {
             c.checkpoints_restored,
             c.checkpoints_dropped
         )?;
+        if let Some(why) = &self.ssd_problem {
+            writeln!(f, "prefix cache on SSD: not in use ({why})")?;
+        }
+        if c.ssd.enabled {
+            let s = &c.ssd;
+            writeln!(
+                f,
+                "prefix cache on SSD: {} pages and {} checkpoints written ({} bytes, {} failed,                  {} checkpoints skipped, {} waiting), {} pages and {} checkpoints read ({}                  bytes) in {} runs ({} cut); the store holds {} pages and {} checkpoints in {}                  bytes; {} transfers took {:.1} ms",
+                s.pages_written,
+                s.states_written,
+                s.bytes_written,
+                s.write_errors,
+                s.states_skipped,
+                s.pending,
+                s.pages_read,
+                s.states_read,
+                s.bytes_read,
+                s.imports,
+                s.imports_cut,
+                s.store_pages,
+                s.store_states,
+                s.store_bytes,
+                s.transfers,
+                s.transfer_ns as f64 / 1e6
+            )?;
+        }
         writeln!(
             f,
             "{:<28} {:>9} {:>9} {:>9} {:>9} {:>9}",

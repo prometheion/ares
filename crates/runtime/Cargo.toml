@@ -18,6 +18,7 @@ ares-io = { path = "../io" }
 ares-quant = { path = "../quant" }
 ares-sched.workspace = true
 ares-state.workspace = true
+ares-store.workspace = true
 ares-weights.workspace = true
 # Worker threads of the CPU expert kernels are bound to cores.
 libc.workspace = true

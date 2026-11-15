@@ -80,6 +80,48 @@ pub struct StepOutput {
     pub step_ms: Option<f64>,
 }
 
+/// What a transfer moves, and which way.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TransferKind {
+    /// The state per position of a pool page, from the devices to the host.
+    PageOut,
+    /// The same, into a pool page that no sequence reads yet.
+    PageIn,
+    /// A checkpoint of recurrent state, from its place to the host.
+    StateOut,
+    /// The same, into a place.
+    StateIn,
+}
+
+/// The share of one device in a transfer: where its bytes are on the host.
+#[derive(Debug)]
+pub struct TransitPart {
+    /// Memory aligned for direct I/O, with room for the device's share in
+    /// any form.
+    pub mem: ares_store::Aligned,
+    /// The bytes of it that are in use, and the tag that says what form they
+    /// have, which the device sets on the way out and reads on the way in.
+    pub len: usize,
+    pub tag: u32,
+}
+
+/// One movement of state between the devices and host memory, for the level
+/// of the prefix cache that is on SSD ([`Executor::transfer`]).
+#[derive(Debug)]
+pub struct Transfer {
+    pub kind: TransferKind,
+    /// The pool page, or the checkpoint place.
+    pub object: u32,
+    /// For a page on the way in: it keeps the form it was stored in. A device
+    /// that stores a page in more than one form (exact while it is new,
+    /// converted later) may otherwise bring it in in the later one.
+    pub keep_form: bool,
+    /// A part per device.
+    pub parts: Vec<TransitPart>,
+    /// Set by the executor: every device carried it out.
+    pub ok: bool,
+}
+
 /// Why a step could not be run.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum ExecError {
@@ -117,6 +159,19 @@ pub trait Executor: Send {
     /// state now. An executor that keeps no checkpoints holds none.
     fn checkpoint_ram(&self) -> u64 {
         0
+    }
+
+    /// Carries out `batch` on every device, in order, and returns when the
+    /// bytes are where they go. Called between steps: after
+    /// [`Executor::collect`] and before the next [`Executor::dispatch`]. A
+    /// transfer a device could not carry out comes back with `ok` unset, which
+    /// costs the cache that state and nothing else. The default is an
+    /// executor whose devices move nothing: every transfer fails.
+    fn transfer(&mut self, batch: &mut [Transfer]) -> Result<(), ExecError> {
+        for transfer in batch {
+            transfer.ok = false;
+        }
+        Ok(())
     }
 
     /// Stops the devices and joins their threads. Idempotent.

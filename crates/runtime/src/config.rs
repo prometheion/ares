@@ -38,6 +38,10 @@ pub struct RuntimeConfig {
     /// while generating (`ares_state::CheckpointPolicy`).
     pub checkpoint_prompt_interval: u32,
     pub checkpoint_generation_interval: u32,
+    /// The level of the prefix cache that is on SSD: where it lies and how
+    /// large it may get. `None` keeps the cache in the devices and in RAM
+    /// alone. Only a model that says it is [`crate::Model::durable`] uses it.
+    pub ssd: Option<crate::SsdConfig>,
     /// The most rows of a step; 0 for the model's own maximum.
     pub max_rows: u32,
     /// The most rows of one sequence's window in a step: its newest token and
@@ -93,6 +97,7 @@ impl Default for RuntimeConfig {
             checkpoint_budget: 0,
             checkpoint_prompt_interval: 32_768,
             checkpoint_generation_interval: 2048,
+            ssd: None,
             max_rows: 0,
             window_rows: 8,
             lookup: LookupConfig::default(),

@@ -21,8 +21,12 @@ use ares_state::{
 };
 
 use crate::config::RuntimeConfig;
-use crate::model::PrefixCache;
+use crate::model::{Durable, PrefixCache};
 use crate::record::{PageCopy, RecordFull, RecordWriter, StateCopy, StateCopyKind};
+
+mod ssd;
+
+pub use ssd::{SsdConfig, SsdCounters};
 
 /// What a look into the index found for a text.
 pub(crate) struct Probe {
@@ -71,6 +75,15 @@ pub(crate) struct Cache {
     /// Counts what was given up, so that waiting requests can tell their
     /// numbers are out of date.
     pub evictions: u64,
+    /// The level on SSD, when the engine has one and the model can use it,
+    /// and why not when it was asked for and is not in use.
+    ssd: Option<ssd::Ssd>,
+    pub ssd_problem: Option<String>,
+    /// The saves of checkpoints, each with its place and what it hangs on,
+    /// in their order: queued for the next record, and carried by the record
+    /// that was written last.
+    saved: Vec<(u32, ChainHash)>,
+    flying: Vec<(u32, ChainHash)>,
 }
 
 impl Cache {
@@ -82,12 +95,35 @@ impl Cache {
         u32::try_from(policy.capacity()).unwrap_or(u32::MAX)
     }
 
+    /// `durable` is what the model offers the level on SSD; the level is in
+    /// use when the model offers it and `config` names a directory.
     pub(crate) fn new(
         model_name: &str,
         spec: &PrefixCache,
+        durable: Option<&Durable>,
         config: &RuntimeConfig,
         cells_per_page: u32,
     ) -> Self {
+        let recurrent = spec.bytes() > 0;
+        let (ssd, ssd_problem) = match (&config.ssd, durable) {
+            (Some(at), Some(durable)) => {
+                match ssd::Ssd::open(at, durable, cells_per_page, recurrent) {
+                    Ok(ssd) => (Some(ssd), None),
+                    Err(why) => (None, Some(why)),
+                }
+            }
+            (Some(_), None) => (None, Some("this model keeps no state on SSD".to_owned())),
+            (None, _) => (None, None),
+        };
+        // What is on SSD is found by the names of its pages, so they start
+        // from what the store's fingerprint covers and not from a name that
+        // the operator may change.
+        let root = match (&ssd, durable) {
+            (Some(_), Some(durable)) => {
+                ChainHash::root(&ssd::Ssd::fingerprint(durable, cells_per_page).bytes())
+            }
+            _ => ChainHash::root(model_name.as_bytes()),
+        };
         let policy = CheckpointPolicy {
             prompt_interval: config.checkpoint_prompt_interval,
             generation_interval: config.checkpoint_generation_interval,
@@ -101,9 +137,13 @@ impl Cache {
         };
         Self {
             index,
-            root: ChainHash::root(model_name.as_bytes()),
+            root,
             cells_per_page,
-            recurrent: spec.bytes() > 0,
+            recurrent,
+            ssd,
+            ssd_problem,
+            saved: Vec::new(),
+            flying: Vec::new(),
             capacity: Self::places(spec, config),
             policy,
             next_place: 0,
@@ -135,7 +175,13 @@ impl Cache {
     /// What the cache has for a prompt of `tokens` (named in `chain`), whose
     /// last token is always computed. The matched pages count as used.
     pub(crate) fn probe(&mut self, pool: &PagePool, chain: &Chain, tokens: &[u32]) -> Probe {
-        let found = self.index.lookup_chain(chain, &tokens[..tokens.len() - 1]);
+        let mut found = self.index.lookup_chain(chain, &tokens[..tokens.len() - 1]);
+        // What the index does not have may be on SSD: a run of pages that is
+        // brought back holds the prompt as a page that is being computed does.
+        if let (Some(ssd), None) = (&mut self.ssd, found.computing) {
+            let total = (tokens.len() - 1) / self.cells_per_page as usize;
+            found.computing = ssd.want(&mut self.index, chain, found.pages.len(), total);
+        }
         let cached = found.cells(self.cells_per_page).min(tokens.len() as u64);
         let resume = if self.recurrent {
             self.policy.resume(&found, tokens.len() as u64)
@@ -205,6 +251,9 @@ impl Cache {
             Ok(before) => {
                 debug_assert!(before.is_none(), "the entry had no checkpoint");
                 self.saves.push(StateCopy { kind: StateCopyKind::Save, slot, place });
+                if self.ssd.is_some() {
+                    self.saved.push((place, hash));
+                }
                 Saved { taken: true, dropped }
             }
             Err(id) => {
@@ -275,6 +324,7 @@ impl Cache {
         self.scratch.extend_from_slice(&self.restores);
         writer.copies(&self.scratch, &self.page_copies)?;
         self.saves.clear();
+        self.flying.append(&mut self.saved);
         self.restores.clear();
         self.page_copies.clear();
         self.free_places.append(&mut self.deferred);
@@ -297,6 +347,7 @@ mod tests {
         Cache::new(
             "m",
             &PrefixCache { checkpoint_bytes: vec![100], tails_per_slot: None },
+            None,
             &config,
             PER_PAGE,
         )
@@ -372,7 +423,7 @@ mod tests {
     fn a_model_that_keeps_state_per_tail_limits_the_tails_per_slot() {
         let config = RuntimeConfig { max_slots: 2, ..RuntimeConfig::default() };
         let spec = PrefixCache { checkpoint_bytes: vec![100], tails_per_slot: Some(1) };
-        let mut cache = Cache::new("m", &spec, &config, PER_PAGE);
+        let mut cache = Cache::new("m", &spec, None, &config, PER_PAGE);
         let mut pool = PagePool::new(16, PER_PAGE);
         let root = ChainHash::root(b"m");
         let mut dropped = Vec::new();
@@ -394,7 +445,7 @@ mod tests {
 
         // No limit without the model asking for one.
         let spec = PrefixCache { checkpoint_bytes: vec![100], tails_per_slot: None };
-        let mut cache = Cache::new("m", &spec, &config, PER_PAGE);
+        let mut cache = Cache::new("m", &spec, None, &config, PER_PAGE);
         for i in 0..3u32 {
             let mut seq = Sequence::new();
             seq.append(&mut pool, 2).unwrap();

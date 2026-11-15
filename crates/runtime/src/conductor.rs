@@ -145,6 +145,7 @@ pub(crate) struct StatsCopy {
     checkpoint_ram: u64,
     active: u32,
     waiting: u32,
+    ssd_problem: Option<String>,
 }
 
 impl StatsCopy {
@@ -159,6 +160,7 @@ impl StatsCopy {
             self.waiting,
         );
         snapshot.calibration = self.calibration;
+        snapshot.ssd_problem = self.ssd_problem;
         snapshot
     }
 }
@@ -589,9 +591,16 @@ impl Conductor {
             context_length: model.card().context_length,
             span: model.attention_span(),
             pool: PagePool::new(config.pages, config.cells_per_page),
-            cache: model
-                .prefix_cache()
-                .map(|spec| Cache::new(&model.card().id, &spec, &config, config.cells_per_page)),
+            cache: model.prefix_cache().map(|spec| {
+                let durable = model.durable(config.cells_per_page);
+                Cache::new(
+                    &model.card().id,
+                    &spec,
+                    durable.as_ref(),
+                    &config,
+                    config.cells_per_page,
+                )
+            }),
             admission: Admission::new(admission),
             slots: (0..slots).map(|_| None).collect(),
             free_slots: (0..config.max_slots).rev().collect(),
@@ -775,12 +784,20 @@ impl Conductor {
     /// The loop. Returns after a shutdown, when every request has ended.
     pub(crate) fn run(mut self) {
         loop {
+            // The level of the cache on SSD moves what is due, between steps.
+            let moving = match &mut self.cache {
+                Some(cache) => {
+                    cache.pump(&mut self.pool, &mut *self.exec);
+                    cache.ssd_busy()
+                }
+                None => false,
+            };
             if self.active == 0 && !self.shutting_down {
                 // Nothing runs. With nobody in line either, sleep until
                 // somebody asks for something.
-                let command = if self.waiting.is_empty() {
+                let command = if self.waiting.is_empty() && !moving {
                     self.rx.recv().map(Some).map_err(|_| RecvTimeoutError::Disconnected)
-                } else if self.stalled {
+                } else if self.stalled || self.waiting.is_empty() {
                     self.rx.recv_timeout(STALLED).map(Some)
                 } else {
                     // The last running request has just ended: the next in
@@ -817,6 +834,10 @@ impl Conductor {
             self.handle(command);
         }
         self.finish_everything(FinishReason::Cancelled);
+        // What waits to be written to SSD is written before the devices go.
+        if let (Some(cache), None) = (&mut self.cache, &self.failed) {
+            cache.drain(&mut self.pool, &mut *self.exec);
+        }
         self.exec.shutdown();
     }
 
@@ -834,6 +855,9 @@ impl Conductor {
             },
             Command::Stats { reset, reply } => {
                 self.stats.counters.device_wakes = self.exec.device_wakes();
+                if let Some(cache) = &mut self.cache {
+                    self.stats.counters.ssd = cache.ssd_counters();
+                }
                 let copy = StatsCopy {
                     stats: self.stats.clone(),
                     calibration: self.calibration.clone(),
@@ -843,6 +867,7 @@ impl Conductor {
                     checkpoint_ram: self.exec.checkpoint_ram(),
                     active: self.active as u32,
                     waiting: self.waiting.len() as u32,
+                    ssd_problem: self.cache.as_ref().and_then(|cache| cache.ssd_problem.clone()),
                 };
                 if reset {
                     self.stats.reset();
@@ -1097,6 +1122,7 @@ impl Conductor {
             cells,
             Priority::NORMAL,
         );
+        cache.note(a.owner, &a.chain, cells, true);
         let full = (cells / per_page) as usize;
         let rest = &a.tokens[full * per_page as usize..cells as usize];
         let target = if rest.is_empty() {
@@ -2090,6 +2116,7 @@ impl Conductor {
                     settled,
                     Priority::NORMAL,
                 );
+                cache.note(a.owner, &a.chain, settled, false);
                 if let Some(at) =
                     cache.capture(u64::from(a.prompt_len), a.checkpoint_at, part.from, reached)
                     && at == reached

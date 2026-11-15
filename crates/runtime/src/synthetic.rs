@@ -110,6 +110,15 @@ pub struct SyntheticConfig {
     /// copies, to check what the conductor does with them; the model's device
     /// part has none and refuses to open with this set.
     pub prefix_cache: Option<u64>,
+    /// Whether the model says its device side moves pages and checkpoints to
+    /// the host and back, which lets the prefix cache keep them on SSD, and
+    /// the number that stands for its weights in the store's fingerprint.
+    /// `None`: it does not (the default). Only the host executor carries the
+    /// transfers out. Needs `prefix_cache`.
+    pub durable: Option<u64>,
+    /// The cells at the end of a sequence whose pages the model says have not
+    /// reached the form they keep ([`crate::Durable::settle_cells`]).
+    pub settle_cells: u32,
     /// The links of a chain of drafts the model makes itself, like the draft
     /// block of a real one: 0 for none. The context must read one token
     /// (`context.window == 1`) so that a draft's context follows from the
@@ -150,6 +159,8 @@ impl SyntheticConfig {
             tensor_shares: Vec::new(),
             state_bytes_per_cell: 0,
             prefix_cache: None,
+            durable: None,
+            settle_cells: 0,
             own_drafts: 0,
             own_accuracy: Vec::new(),
             seed: 0x5eed,
@@ -555,6 +566,21 @@ impl Model for SyntheticModel {
         self.config.prefix_cache.map(|bytes| PrefixCache {
             checkpoint_bytes: vec![bytes; self.config.devices],
             tails_per_slot: None,
+        })
+    }
+
+    fn durable(&self, cells_per_page: u32) -> Option<crate::Durable> {
+        let weights = self.config.durable?;
+        let devices = self.config.devices;
+        // What the host executor writes for a page and for a checkpoint, all
+        // of it as the first device's share.
+        let first = |bytes: u64| (0..devices).map(|d| if d == 0 { bytes } else { 8 }).collect();
+        let window = u64::from(self.config.context.window.max(1));
+        Some(crate::Durable {
+            fingerprint: [&b"synthetic"[..], &weights.to_le_bytes()].concat(),
+            page_bytes: first(u64::from(cells_per_page) * crate::testing::CELL_BYTES as u64),
+            state_bytes: first(crate::testing::STATE_BYTES as u64 + 4 * window),
+            settle_cells: self.config.settle_cells,
         })
     }
 

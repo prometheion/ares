@@ -814,6 +814,13 @@ impl PrefixIndex {
         Ok(before)
     }
 
+    /// The cached page named `hash`: the page, the hash it follows and its
+    /// number in its chain (1 for a first page). `None` for a tail and for a
+    /// page the index does not hold.
+    pub fn page(&self, hash: ChainHash) -> Option<(PageId, ChainHash, u32)> {
+        self.entries.get(&hash).map(|entry| (entry.page, entry.parent, entry.depth))
+    }
+
     /// The checkpoint attached to the entry or tail `hash`.
     pub fn checkpoint(&self, hash: ChainHash) -> Option<CheckpointId> {
         if let Some(entry) = self.entries.get(&hash) {

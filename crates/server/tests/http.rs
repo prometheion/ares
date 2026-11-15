@@ -895,6 +895,12 @@ async fn metrics_are_the_engines_statistics_as_text() {
             wait_us: 12_000,
             ..ExpertStats::default()
         },
+        ssd: ares_api::SsdStats {
+            pages_written: 7,
+            bytes_written: 4096,
+            pages_read: 3,
+            ..ares_api::SsdStats::default()
+        },
     });
     let response = get(&app(&engine), "/metrics").await;
     assert_eq!(response.status(), StatusCode::OK);
@@ -902,6 +908,10 @@ async fn metrics_are_the_engines_statistics_as_text() {
     let text = body_text(response).await;
     for line in [
         "ares_requests_finished_total 2",
+        "ares_cache_ssd_pages_written_total 7",
+        "ares_cache_ssd_written_bytes_total 4096",
+        "ares_cache_ssd_pages_read_total 3",
+        "ares_cache_ssd_bytes 0",
         "ares_requests_cancelled_total 1",
         "ares_requests_refused_total 0",
         "ares_steps_total 5",

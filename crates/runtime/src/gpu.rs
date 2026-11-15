@@ -36,9 +36,13 @@ use ares_sampler::{LogprobOut, SamplePick, SampleRow};
 use crate::cache::Cache;
 use crate::config::RuntimeConfig;
 use crate::error::RuntimeError;
+use crate::exec::Transfer;
 use crate::exec::{Clock, ExecError, Executor, Pick, StepMeta, StepOutput};
 use crate::links::Links;
-use crate::model::{DeviceContext, DeviceModel, Model, ModelError, Split, StepContext};
+use crate::model::{
+    DeviceContext, DeviceModel, DeviceTransfer, Model, ModelError, Split, StepContext,
+    TransferContext,
+};
 use crate::ram::PinnedRam;
 use crate::record::{self, RecordView};
 use crate::sync::{Bell, WakeCounts, Woke};
@@ -133,7 +137,13 @@ impl PinnedRecord {
 }
 
 enum Job {
-    Step { meta: StepMeta, dispatched_ns: u64 },
+    Step {
+        meta: StepMeta,
+        dispatched_ns: u64,
+    },
+    /// This device's shares of the transfers of a batch
+    /// ([`Executor::transfer`]).
+    Transfer(Vec<DeviceTransfer>),
     Quit,
 }
 
@@ -151,6 +161,10 @@ struct DeviceResult {
     has_picks: bool,
     drafts: Vec<u32>,
     draft_ms: f64,
+    /// What this device made of the transfers of a batch, in their order: the
+    /// bytes and the tag of its share, or `None` for one it could not carry
+    /// out.
+    transfers: Vec<Option<(usize, u32)>>,
 }
 
 /// The hand-over between the conductor and one device thread.
@@ -402,6 +416,49 @@ impl Executor for GpuExecutor {
         self.ram.checkpoints()
     }
 
+    fn transfer(&mut self, batch: &mut [Transfer]) -> Result<(), ExecError> {
+        assert!(!self.in_flight, "transfers run between steps");
+        if batch.is_empty() {
+            return Ok(());
+        }
+        self.shared.remaining.store(self.handles.len(), Ordering::SeqCst);
+        for (device, handle) in self.handles.iter().enumerate() {
+            let shares = batch.iter_mut().map(|transfer| {
+                let part = &mut transfer.parts[device];
+                DeviceTransfer {
+                    kind: transfer.kind,
+                    object: transfer.object,
+                    keep_form: transfer.keep_form,
+                    ptr: part.mem.as_mut_ptr(),
+                    room: part.mem.len(),
+                    len: part.len,
+                    tag: part.tag,
+                }
+            });
+            *handle.mailbox.job.lock().expect("job slot") = Some(Job::Transfer(shares.collect()));
+            handle.mailbox.bell.ring();
+        }
+        // The parts are the devices' until every one of them has rung.
+        self.shared.done.bind();
+        let (count, _) = self.shared.done.wait_past(self.seen, Duration::from_millis(1));
+        self.seen = count;
+        for transfer in batch.iter_mut() {
+            transfer.ok = true;
+        }
+        for (device, handle) in self.handles.iter().enumerate() {
+            let result = handle.mailbox.result.lock().expect("result slot");
+            for (i, transfer) in batch.iter_mut().enumerate() {
+                match result.transfers.get(i).copied().flatten() {
+                    Some((len, tag)) => {
+                        (transfer.parts[device].len, transfer.parts[device].tag) = (len, tag);
+                    }
+                    None => transfer.ok = false,
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn device_wakes(&self) -> WakeCounts {
         self.handles.iter().fold(WakeCounts::default(), |sum, h| WakeCounts {
             spun: sum.spun + h.mailbox.spun.load(Ordering::Relaxed),
@@ -612,6 +669,28 @@ fn worker_main(init: Init, ready: mpsc::Sender<Result<(), RuntimeError>>) {
                         }
                     }
                 }
+                worker.finish();
+            }
+            Some(Job::Transfer(mut shares)) => {
+                // A share that fails costs the cache that state; the stream
+                // has passed every copy before the conductor reads a byte.
+                let done = panic::catch_unwind(AssertUnwindSafe(|| {
+                    let cx = TransferContext {
+                        stream: &worker.stream,
+                        pages: worker.pages.as_ref().map_or(DevicePtr::NULL, DeviceBuffer::ptr),
+                    };
+                    let mut done = Vec::with_capacity(shares.len());
+                    for share in &mut shares {
+                        let ok = worker.model.transfer(&cx, share).is_ok();
+                        done.push(ok.then_some((share.len, share.tag)));
+                    }
+                    if worker.stream.synchronize().is_err() {
+                        done.iter_mut().for_each(|share| *share = None);
+                    }
+                    done
+                }));
+                mailbox.result.lock().expect("result slot").transfers =
+                    done.unwrap_or_else(|_| vec![None; shares.len()]);
                 worker.finish();
             }
             Some(Job::Quit) => break,

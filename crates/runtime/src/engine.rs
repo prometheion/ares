@@ -349,6 +349,18 @@ impl Engine for Runtime {
             cached_pages: snapshot.cached_pages,
             checkpoint_ram: snapshot.checkpoint_ram,
             experts: self.model.expert_stats().unwrap_or_default(),
+            ssd: ares_api::SsdStats {
+                pages_written: c.ssd.pages_written,
+                checkpoints_written: c.ssd.states_written,
+                bytes_written: c.ssd.bytes_written,
+                write_ns: c.ssd.write_ns,
+                pages_read: c.ssd.pages_read,
+                checkpoints_read: c.ssd.states_read,
+                bytes_read: c.ssd.bytes_read,
+                read_ns: c.ssd.read_ns,
+                transfer_ns: c.ssd.transfer_ns,
+                store_bytes: c.ssd.store_bytes,
+            },
         })
     }
 }

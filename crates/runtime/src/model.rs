@@ -165,6 +165,54 @@ impl PrefixCache {
     }
 }
 
+/// What a model offers the level of the prefix cache that is on SSD: its
+/// device side moves pages and checkpoints between the devices and host
+/// memory ([`DeviceModel::transfer`]), in a form that another load of the same
+/// model can take back.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Durable {
+    /// Everything besides the tokens that changes the bytes of a page or of a
+    /// checkpoint in transit: the weights, the formats and the precision of
+    /// the state, and how the bytes are laid out over the devices. State
+    /// written under another fingerprint is never read.
+    pub fingerprint: Vec<u8>,
+    /// Per device, the most bytes its share of a page takes in transit.
+    pub page_bytes: Vec<u64>,
+    /// Per device, the bytes of its share of a checkpoint.
+    pub state_bytes: Vec<u64>,
+    /// The cells at the end of a sequence whose pages have not reached the
+    /// form they keep: a page is written when its sequence is this far past
+    /// it, or ends. 0 for a model that stores a page in one form.
+    pub settle_cells: u32,
+}
+
+/// What a device part is given to carry out a transfer.
+#[derive(Debug)]
+pub struct TransferContext<'a> {
+    pub stream: &'a Stream,
+    /// The memory of the state pages on this device, as in [`StepContext`].
+    pub pages: DevicePtr,
+}
+
+/// One device's share of a [`Transfer`](crate::Transfer).
+#[derive(Debug)]
+pub struct DeviceTransfer {
+    pub kind: crate::TransferKind,
+    /// The pool page, or the checkpoint place.
+    pub object: u32,
+    pub keep_form: bool,
+    /// Host memory with `room` bytes, aligned to 4096.
+    pub ptr: *mut u8,
+    pub room: usize,
+    /// The bytes in use and their tag: read on the way in, set on the way out.
+    pub len: usize,
+    pub tag: u32,
+}
+
+// SAFETY: the pointer names memory of a transfer the conductor handed over
+// and does not touch until every device has finished with it.
+unsafe impl Send for DeviceTransfer {}
+
 /// What a device part is built from.
 #[derive(Debug)]
 pub struct DeviceContext<'a> {
@@ -294,6 +342,18 @@ pub trait DeviceModel: Send {
         None
     }
 
+    /// Carries out this device's share of a transfer of the prefix cache's
+    /// level on SSD, between steps. The part may enqueue copies on the stream;
+    /// the runtime waits for the stream afterwards. Only a part of a model
+    /// that says it is [`Model::durable`] is asked.
+    fn transfer(
+        &mut self,
+        _cx: &TransferContext<'_>,
+        _item: &mut DeviceTransfer,
+    ) -> Result<(), ModelError> {
+        Err(ModelError::Invalid("this model moves no state to the host".into()))
+    }
+
     /// Device milliseconds the part's own drafter took in the step that ran
     /// last. Asked after that step has ended.
     fn own_draft_ms(&mut self) -> f64 {
@@ -412,6 +472,15 @@ pub trait Model: Send + Sync + 'static {
     /// with recurrent state must not answer `Some` before its device side
     /// restores, saves and replays: it would resume from state that is not there.
     fn prefix_cache(&self) -> Option<PrefixCache> {
+        None
+    }
+
+    /// `Some` when the model's device side also moves pages and checkpoints
+    /// to host memory and back ([`DeviceModel::transfer`]), which lets the
+    /// prefix cache keep them on SSD. Only asked of a model with a prefix
+    /// cache, for pages of `cells_per_page` cells.
+    fn durable(&self, cells_per_page: u32) -> Option<Durable> {
+        let _ = cells_per_page;
         None
     }
 

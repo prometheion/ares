@@ -134,6 +134,7 @@ dependencies = [
  "ares-sched",
  "ares-server",
  "ares-state",
+ "ares-store",
  "ares-weights",
  "libc",
  "serde_json",

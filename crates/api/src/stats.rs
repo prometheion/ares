@@ -28,6 +28,29 @@ pub struct ExpertStats {
     pub ram_tier_bytes: u64,
 }
 
+/// What the level of the prompt cache on SSD has done since the engine
+/// started, and what it holds; all zero for an engine without one.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SsdStats {
+    /// Pages and checkpoints written, the bytes they take on the drive, and
+    /// the nanoseconds the writer spent writing and syncing them.
+    pub pages_written: u64,
+    pub checkpoints_written: u64,
+    pub bytes_written: u64,
+    pub write_ns: u64,
+    /// Pages and checkpoints read back, their bytes, and the nanoseconds the
+    /// readers spent on them, summed over the readers.
+    pub pages_read: u64,
+    pub checkpoints_read: u64,
+    pub bytes_read: u64,
+    pub read_ns: u64,
+    /// Nanoseconds the engine's step loop waited while state moved between
+    /// the devices and host memory.
+    pub transfer_ns: u64,
+    /// Bytes the model's store takes on the drive now.
+    pub store_bytes: u64,
+}
+
 /// Totals of an engine since it started, and what it holds right now.
 ///
 /// The counts only grow, so the difference of two copies says what happened
@@ -77,6 +100,9 @@ pub struct EngineStats {
     pub checkpoint_ram: u64,
     /// How the experts were found, for a model that streams them.
     pub experts: ExpertStats,
+    /// What the prompt cache did on SSD.
+    #[serde(default)]
+    pub ssd: SsdStats,
 }
 
 impl EngineStats {

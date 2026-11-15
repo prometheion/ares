@@ -429,6 +429,16 @@ impl Executor for HostExecutor {
         Ok(Woke::Spinning)
     }
 
+    fn transfer(&mut self, batch: &mut [crate::Transfer]) -> Result<(), ExecError> {
+        for transfer in batch {
+            transfer.ok = match &mut self.oracle {
+                Some(oracle) if self.model.config().durable.is_some() => oracle.transfer(transfer),
+                _ => false,
+            };
+        }
+        Ok(())
+    }
+
     fn device_wakes(&self) -> WakeCounts {
         WakeCounts::default()
     }
@@ -491,6 +501,19 @@ impl State {
     }
 }
 
+/// The bytes of a cell and of a state without its recent tokens, as the
+/// oracle writes them for the level of the prefix cache on SSD.
+pub(crate) const CELL_BYTES: usize = 32;
+pub(crate) const STATE_BYTES: usize = 32;
+
+fn word(bytes: &[u8], at: usize) -> u32 {
+    u32::from_le_bytes(bytes[at..at + 4].try_into().expect("4 bytes"))
+}
+
+fn long(bytes: &[u8], at: usize) -> u64 {
+    u64::from_le_bytes(bytes[at..at + 8].try_into().expect("8 bytes"))
+}
+
 /// What one position of a sequence stores: the key and value of a real model.
 #[derive(Clone, Copy, Debug, Default)]
 struct Cell {
@@ -536,6 +559,75 @@ impl Oracle {
             slots: (0..slots).map(|_| Slot::default()).collect(),
             places: HashMap::new(),
             vocab: config.vocab(),
+        }
+    }
+
+    /// Carries out a transfer of the cache's level on SSD: a page's cells or
+    /// a place's state as bytes in the first part, and back.
+    fn transfer(&mut self, transfer: &mut crate::Transfer) -> bool {
+        use crate::TransferKind::{PageIn, PageOut, StateIn, StateOut};
+        let per_page = self.cells_per_page as usize;
+        let Some(part) = transfer.parts.first_mut() else { return false };
+        let cells = transfer.object as usize * per_page..(transfer.object as usize + 1) * per_page;
+        match transfer.kind {
+            PageOut | PageIn if cells.end > self.cells.len() => false,
+            PageOut => {
+                for (cell, out) in self.cells[cells].iter().zip(part.mem.chunks_mut(CELL_BYTES)) {
+                    out[0] = u8::from(cell.written) | u8::from(cell.poisoned) << 1;
+                    out[4..8].copy_from_slice(&cell.token.to_le_bytes());
+                    out[8..12].copy_from_slice(&cell.ctx.to_le_bytes());
+                    out[16..24].copy_from_slice(&cell.prev.to_le_bytes());
+                    out[24..32].copy_from_slice(&cell.chain.to_le_bytes());
+                }
+                (part.len, part.tag) = (per_page * CELL_BYTES, 1);
+                true
+            }
+            PageIn if part.len != per_page * CELL_BYTES || part.tag != 1 => false,
+            PageIn => {
+                for (cell, bytes) in self.cells[cells].iter_mut().zip(part.mem.chunks(CELL_BYTES)) {
+                    *cell = Cell {
+                        written: bytes[0] & 1 != 0,
+                        poisoned: bytes[0] & 2 != 0,
+                        token: word(bytes, 4),
+                        ctx: word(bytes, 8),
+                        prev: long(bytes, 16),
+                        chain: long(bytes, 24),
+                    };
+                }
+                true
+            }
+            StateOut => {
+                let Some(state) = self.places.get(&transfer.object) else { return false };
+                let out = &mut part.mem;
+                out[0..4].copy_from_slice(&state.pos.to_le_bytes());
+                out[4..8].copy_from_slice(&state.ctx.to_le_bytes());
+                out[8..16].copy_from_slice(&state.chain.to_le_bytes());
+                out[16] = u8::from(state.poisoned);
+                out[20..24].copy_from_slice(&(state.recent.len() as u32).to_le_bytes());
+                for (i, token) in state.recent.iter().enumerate() {
+                    let at = STATE_BYTES + 4 * i;
+                    out[at..at + 4].copy_from_slice(&token.to_le_bytes());
+                }
+                (part.len, part.tag) = (STATE_BYTES + 4 * state.recent.len(), 2);
+                true
+            }
+            StateIn if part.len < STATE_BYTES || part.tag != 2 => false,
+            StateIn => {
+                let bytes = &part.mem[..part.len];
+                let recent = word(bytes, 20) as usize;
+                if part.len != STATE_BYTES + 4 * recent {
+                    return false;
+                }
+                let state = State {
+                    pos: word(bytes, 0),
+                    ctx: word(bytes, 4),
+                    chain: long(bytes, 8),
+                    poisoned: bytes[16] != 0,
+                    recent: (0..recent).map(|i| word(bytes, STATE_BYTES + 4 * i)).collect(),
+                };
+                self.places.insert(transfer.object, state);
+                true
+            }
         }
     }
 
