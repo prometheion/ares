@@ -4,8 +4,9 @@ Made on 2026-11-11. Read-only survey: nothing was built or run, no repository wa
 R03 to R12, R14, R16, R21 and H02, the counts and the lists were brought up to date on 2026-11-12, when the
 sampler's features (penalties, DRY, logit bias, probabilities, `n` and the rest) were built; G01, G03, G06, G07
 and G09 were brought up to date the same day, when structured output was built, T01 to T04 and G05 when
-tool calls were, A07 and A08 when the Messages API was, T06 when calls inside the thinking were, and A04, A08
-and decision 20 of List 3 when the Responses API was.
+tool calls were, A07 and A08 when the Messages API was, T06 when calls inside the thinking were, A04, A08
+and decision 20 of List 3 when the Responses API was, and R23 and R25 with the counts and List 1 when the
+server's defaults for sampling and for the length of a reply were.
 One row is one capability that a user or operator of an inference server can observe or rely on.
 
 ## How to read it
@@ -104,9 +105,9 @@ or no-op options; Ares may do a thing differently as long as the result is not w
 | R20 | Output limit | all | `max_tokens`, `max_completion_tokens`; -1 or absent means the room left | done | yes | essential |
 | R21 | Minimum length, ignoring the end token | llama, vllm, sglang, tfold, lmdeploy, tabby, kobold | `min_tokens`; `ignore_eos` for benchmarks | partly: `ignore_eos` is done; `min_tokens` is not started | yes | niche |
 | R22 | Time limit for a request | llama | `t_max_predict_ms` | not started | yes | niche |
-| R23 | Sampling defaults of the server | llama, fork, vllm, sglang, trt, strata, tfold, tabby, kobold, ollama | values for fields a request leaves out: flags or preset keys, `generation_config`, model-card sets (strata and tfold keep one set for thinking and one without) | not started (no option) | yes | essential |
+| R23 | Sampling defaults of the server | llama, fork, vllm, sglang, trt, strata, tfold, tabby, kobold, ollama | values for fields a request leaves out: flags or preset keys, `generation_config`, model-card sets (strata and tfold keep one set for thinking and one without) | done (an option for every sampling field of a request, under the field's name with dashes: `--temperature`, `--top-k`, `--top-p`, `--min-p`, the penalties and their window, DRY, typical, top-n-sigma, XTC, dynamic temperature, mirostat, `--samplers`, `--seed`; on the command line and as keys of a preset file, for all models or for one; a request's own value holds; `/v1/models` lists them; one set for a model, none of its own for replies that think; sampling metadata of the model file is not read) | yes | essential |
 | R24 | Forced overrides | tabby, kobold | the server's value wins over the request's | not started | yes | niche |
-| R25 | Server default and cap for the output length | llama, fork, kobold, tgi | `n-predict`, `--genlimit`, `--max-total-tokens` | not started | yes | common |
+| R25 | Server default and cap for the output length | llama, fork, kobold, tgi | `n-predict`, `--genlimit`, `--max-total-tokens` | done (`--max-tokens` is the limit of a request that names none, as `n-predict` is; `--max-tokens-limit` is the most any request gets: a request above it gets the limit, the header `x-ares-max-tokens-limit` says so, and a reply it cuts ends with `length`; for all models or for one; a default above the limit is refused at start) | yes | common |
 | R26 | Output independent of batch composition | sglang, tfold, strata | the same text alone, next to others, with or without drafts (sglang `--enable-deterministic-inference`; tfold always; strata by switches) | partly: with `--precision exact` and steps of the same size; the fast kernels round differently | yes | common |
 | R27 | Guidance (CFG), watermark | kobold (CFG), tgi, vllm, sglang (watermark) | negative prompt; statistical watermark | not started | yes | niche |
 | R28 | Logits processors supplied by the user | vllm, sglang, trt, lmdeploy | Python code run on the logits | not started | no: one binary (no plugin code) | - |
@@ -345,27 +346,25 @@ Counted from the tables above with a script (see the end of this file for the co
 | --- | --- |
 | Total | 223 |
 | Inside the frame | 200 |
-| - done | 68 |
+| - done | 70 |
 | - partly | 42 |
-| - not started | 90 (essential 3, common 21, niche 66) |
+| - not started | 88 (essential 2, common 20, niche 66) |
 | Outside the frame | 23 (all not started) |
 
-Of the 68 done rows 29 are essential, 32 common and 7 niche; of the 42 partly rows 11 are essential, 17 common
+Of the 70 done rows 30 are essential, 33 common and 7 niche; of the 42 partly rows 11 are essential, 17 common
 and 14 niche. A row is one capability, so the counts weigh a sampler option like a model router; List 1 orders
 them by need instead.
 
 ## List 1: inside the frame, not started, most depended-on first
 
-**Essential (3).** Without these a current agent client cannot use the server at all.
+**Essential (2).** Without these a current agent client cannot use the server at all.
 
 - K01 reasoning separated from the answer
-- R23 sampling defaults of the server
 - X01 API keys
 
-**Common (21).**
+**Common (20).**
 
 - API: A09 tokenize, A16 model properties
-- Sampling: R25 server cap for the output length
 - Tools: T05 recovery of imperfect calls
 - Reasoning: K03 thinking budget, K05 loop guard, K06 earlier reasoning in the history
 - Prompt: F07 template override, F09 continuing the assistant message, F11 image input, F18 truncation

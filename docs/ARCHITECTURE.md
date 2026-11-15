@@ -1239,6 +1239,20 @@ token sits within 1e-6 of it; `min_keep` above 1 is refused (a cut would need
 the count of the tokens it left); adaptive-p is refused (see below); a window
 longer than 1024 is refused.
 
+**What a field is when a request leaves it out.** The model's default, if
+the server was given one for that field (`--temperature`, `--top-p` and the
+others: "The defaults of a model's requests" under [Server](#server)), and
+the engine's own value otherwise: temperature 0, which takes the most probable
+token; no top-k, top-p 1, min-p 0, typical 1 and top-n-sigma 0, which cut
+nothing; XTC and the dynamic temperature off (threshold 0.1, exponent 1); the
+three penalties off (1, 0, 0) over a window of 64; DRY off (multiplier 0, base
+1.75, allowed length 2, window 64); no mirostat (tau 5, eta 0.1 when a request
+switches it on); llama.cpp's order; a seed of its own for every request. The
+engine reads a request in which a field is either a value or open
+(`ares_api::Sampling`), and the server fills the open fields from the model's
+defaults before it hands the request over, so the engine does not know where a
+value came from.
+
 **Accuracy.** Everything that is summed over tokens is an integer (a count, the
 weights as fixed-point numbers with 40 fractional bits, the entropy term, the
 sums for the deviation), so the order in which threads, blocks and devices add
@@ -4272,7 +4286,10 @@ checkpoints that let a conversation continue from what was computed (see
 `--cache-size` the most the directory may take (32G when it is not given);
 without a directory nothing is written to any drive (see "On SSD" under
 "Sequence state"). In a preset file the keys are `cache` and `cache-size`,
-for all models in `[*]` or for one.
+for all models in `[*]` or for one. What a request gets for a sampling field
+it leaves out, and how long a reply may be, are options of the model too
+(`--temperature`, `--top-p`, `--max-tokens` and the others: see "The defaults
+of a model's requests" below).
 
 It answers `POST /v1/chat/completions` and `/v1/completions`, streamed and
 not, Anthropic's `POST /v1/messages` and `/v1/messages/count_tokens` (see
@@ -4307,6 +4324,94 @@ for the penalties, more than 20 alternatives, `min_keep` above 1, adaptive-p).
 A client that disconnects frees its sequence. The
 first signal lets running requests finish, the second ends them, and the
 devices are released before the process exits.
+
+**The defaults of a model's requests.** A model has its own value for every
+sampling field a request can leave out, and its own limits for the length of
+a reply (`crates/server/src/defaults.rs`). They are options of the model, on
+the command line and as keys of a preset file, for all models in `[*]` or for
+one, with the precedence of every option (the command line, the model's
+section, `[*]`, the engine's own value).
+
+An option that gives a field of a request its default has the name of the
+field, with dashes, and takes what the field takes, in the range a request is
+held to:
+
+| Options | Field of a request |
+| --- | --- |
+| `--temperature`, `--top-k`, `--top-p`, `--min-p`, `--typical-p`, `--top-n-sigma` | `temperature`, `top_k`, `top_p`, `min_p`, `typical_p`, `top_n_sigma` |
+| `--xtc-probability`, `--xtc-threshold`, `--dynatemp-range`, `--dynatemp-exponent` | the same with underscores |
+| `--repeat-penalty`, `--presence-penalty`, `--frequency-penalty`, `--repeat-last-n` | the three penalties and their window (at most 1024) |
+| `--dry-multiplier`, `--dry-base`, `--dry-allowed-length`, `--dry-penalty-last-n`, `--dry-sequence-breakers` | DRY; the breakers are a JSON array of strings, as in a request |
+| `--mirostat`, `--mirostat-tau`, `--mirostat-eta` | mirostat 0, 1 or 2, its target and its rate |
+| `--samplers` | the samplers that apply and their order, as names separated by commas; penalties and dry stand first |
+| `--seed` | the seed of a request that names none |
+| `--max-tokens` | the limit of tokens: `max_tokens`, `max_completion_tokens`, `max_output_tokens`, `n_predict` |
+
+A request's own value always holds, also one that switches a sampler off
+(`top_k: 0`). A field it leaves out or writes as `null` takes the model's
+default, and without one the engine's own value (see [Sampling](#sampling)).
+The defaults are filled in where every generating route takes its model
+(`routes::prepare`), so they are the same on `/v1/chat/completions`,
+`/v1/completions`, `/v1/messages` and `/v1/responses`, also for a field the API
+of a route has no member for: a Messages request has no `min_p`, and gets the
+model's. A logit bias, `ignore_eos`, the probabilities to report, `n` and the
+stop strings are what a request asks for and have no default.
+
+`--seed` makes a request that names no seed draw the same for the same prompt,
+which is the one way to a reproducible reply on the two routes whose API has
+no seed. The `n` completions of one prompt draw from the seed and the ones
+after it. A request asks for a draw of its own in llama.cpp's words, `seed:
+-1`.
+
+*One set.* Strata and TensorFold keep two sets of defaults for a model, one for
+replies that think and one for those that do not, after the two sets Qwen's
+model cards give. Ares keeps one. The production setup it replaces has one
+(llama-server's preset has no second), and the one value Qwen's card gives
+differently for the two, a presence penalty of 1.5 without thinking, was taken
+back there on 2026-11-03: scripts without reasoning broke twice as often with
+it. A second set would be more keys of the same kind, filled in at the same
+place, where the server also reads what a request says about thinking;
+nothing in the first set changes when it comes.
+
+*The length of a reply.* Two options, because they answer two questions.
+`--max-tokens` is the limit of a reply whose request names none (no
+`max_tokens`, `max_completion_tokens`, `max_output_tokens` or `n_predict`, or
+llama.cpp's `-1`): what llama-server's `--n-predict` is, which bounds no
+request that names its own limit. `--max-tokens-limit` is the most tokens of
+any reply, the kind of limit KoboldCpp's `--genlimit` is: a request that asks
+for more gets this many, and a request that names no limit gets `--max-tokens`
+or, without it, this. A default above the limit is refused at start.
+
+A request above the limit is served with the limit and not refused. A limit
+of tokens is an upper bound, not an order for that many, so the shorter reply
+is one the request allows, as a reply that the end of the context cut is; and
+a refusal would lock out every client that sends the same large number with
+each request, which the Messages API makes all of its clients do. What
+happened can be seen in the response: it has the header
+`x-ares-max-tokens-limit` with the limit that took the place of the request's,
+streamed or not; a reply the limit cut ends with `length` (`max_tokens` on
+`/v1/messages`, `incomplete` with `max_output_tokens` on `/v1/responses`) and
+its usage has the count; and the response object of `/v1/responses`, which
+says back what was applied, has the limit in effect in `max_output_tokens`
+and the model's defaults in `temperature` and `top_p` where the request left
+them out.
+
+*Where they show.* `GET /v1/models` has for every model `defaults`, an object
+under the names of the request's fields with the values as a request writes
+them (`{"temperature": 1.0, "top_p": 0.95, "max_tokens": 96000}`; `max_tokens`
+is what a request without a limit gets, the default or else the limit), and
+`max_tokens_limit` if the model has one. A field that is not listed is the
+engine's own. The log of a start names them once for every model. The
+start refuses, with the file and the line in a preset: a value outside the
+range of its field, and a default length above the limit, wherever the two
+stand (a limit on the command line against a default in a section is the
+section's line).
+
+llama-server's names for these that Ares writes differently are answered in a
+preset with the name of Ares, like its other options: `temp`, `typical`,
+`top-nsigma`, `dynatemp-exp`, `mirostat-lr`, `mirostat-ent`,
+`dry-sequence-breaker`, `sampler-seq`, `s`, and `n-predict`, which is
+`max-tokens`. Sampling settings in the metadata of a model file are not read.
 
 **Thinking.** Qwen3.8 thinks before it answers: the template ends the prompt
 with `<think>\n`, and the model writes its reasoning, `\n</think>\n\n` and the
@@ -4905,12 +5010,17 @@ model = /models/Qwen3.5-0.8B-Q4_K_M.gguf
 devices = 0
 context = 16384
 ram = 2G
+temperature = 0.7
+top-p = 0.8
+max-tokens = 4096
 ```
 
 A key is an option of the command line for one model under its name without
 the dashes, with the value the option takes (`context`, `kv`, `devices`,
 `chat-var`, which may stand several times; a switch such as
-`reasoning-preserve` takes `true` or `false`). The command line and the file
+`reasoning-preserve` takes `true` or `false`; `temperature`, `top-p`,
+`max-tokens` and the other defaults of a model's requests). The command line
+and the file
 are read by the same code (`options.rs`), so there is one vocabulary and one
 check of a value. Three keys exist only in the file:
 
@@ -4934,8 +5044,9 @@ Nothing in the file is ignored. The server does not start, and says the file,
 the line and the reason, for: a key it does not know, a value an option does
 not take, a key before the first section, a key or a section that stands
 twice, a section without `model`, a model file that does not exist, an id or
-alias that two sections answer to, `model` or `aliases` in `[*]`, and a
-model's `ram` above the server's. An option of llama-server is not accepted
+alias that two sections answer to, `model` or `aliases` in `[*]`, a
+model's `ram` above the server's, and a `max-tokens` above the
+`max-tokens-limit` that holds for the same model. An option of llama-server is not accepted
 under its name: the error names the option of Ares that does the job where
 there is one (`ctx-size`: `context`; `tensor-split`: `shares`; `ctk` and
 `ctv`: `kv`; `chat-template-kwargs`: `chat-var`; `sleep-idle-seconds`:
@@ -5008,7 +5119,7 @@ unload needs the pages on the SSD, written as they are produced (see
 
 | Endpoint | What it does |
 | --- | --- |
-| `GET /v1/models` | every preset in the order of the file: `id`, `aliases`, `status` (`{"value": "unloaded" \| "loading" \| "loaded" \| "unloading" \| "failed", "reason"}`), and `created` and `context_length` once the model was loaded |
+| `GET /v1/models` | every preset in the order of the file: `id`, `aliases`, `status` (`{"value": "unloaded" \| "loading" \| "loaded" \| "unloading" \| "failed", "reason"}`), `defaults` (what a field means that a request to the model leaves out) and `max_tokens_limit` if it has one, and `created` and `context_length` once the model was loaded |
 | `POST /models/load` `{"model": id}` | puts the model in the line of loads and answers `{"success": true}` at once |
 | `POST /models/unload` `{"model": id}` | the model gets no new requests and is unloaded when those that run have ended; answers `{"success": true}` at once |
 | `GET /models/sse` | Server-Sent Events: the state of every model as it is, then every change, as `{"model", "event": "model_status", "data": {"status", "reason"}}` |

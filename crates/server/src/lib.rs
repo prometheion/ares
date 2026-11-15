@@ -22,7 +22,9 @@
 //!
 //! A request is served in full or refused: a field that asks for something
 //! the server or the engine does not do is an error that names the field,
-//! never dropped (the `wire` module).
+//! never dropped (the `wire` module). A sampling field it leaves out takes
+//! the default its model was given, and its reply is held to the length the
+//! model allows (the [`defaults`] module).
 //!
 //! A model that thinks has its reasoning returned apart from its answer, in
 //! `reasoning_content`, and an assistant message of a request may carry it

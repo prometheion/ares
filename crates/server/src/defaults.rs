@@ -5,8 +5,8 @@
 //! as a key of a preset file. An option that gives a field of a request its
 //! default has the name of the field, with dashes: `--top-p` for `top_p`,
 //! `--repeat-last-n` for `repeat_last_n`, `--max-tokens` for `max_tokens`
-//! ([`SETTINGS`] is the list). One option is not a default but a bound:
-//! `--max-tokens-limit`, the most tokens of any reply.
+//! (`SETTINGS` in this module is the list). One option is not a default but a
+//! bound: `--max-tokens-limit`, the most tokens of any reply.
 //!
 //! # What a request gets
 //!
@@ -17,13 +17,17 @@
 //! (`routes::prepare`), so they hold on `/v1/chat/completions`,
 //! `/v1/completions`, `/v1/messages` and `/v1/responses` alike, also for the
 //! fields the API of a route has no member for (`min_p` on `/v1/messages`).
+//! `seed: -1`, llama.cpp's word for a seed of the request's own draw, is a
+//! value and not a field left out: such a request does not get the model's
+//! seed.
 //!
 //! There is one set of defaults for a model, not one for replies that think
-//! and one for those that do not, as Strata and TypeFold keep them: the
+//! and one for those that do not, as Strata and TensorFold keep them: the
 //! production setup this server replaces has one, and the one value Qwen's
 //! card gives differently for the two (the presence penalty) is 0 there for
 //! both. A second set would be more keys of the same kind, applied in the
-//! same place, which knows whether the request thinks.
+//! same place, where the server also reads what a request says about
+//! thinking.
 //!
 //! # The length of a reply
 //!
@@ -61,7 +65,8 @@ pub const STAGES_MAX: usize = 16;
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Defaults {
     /// The sampler: a field that is set is the default of the request's field
-    /// of that name. Only the fields of [`SETTINGS`] are read.
+    /// of that name. Only the fields that an option of a model sets are read;
+    /// a bias, `ignore_eos` and the probabilities to report have no default.
     pub sampling: Sampling,
     /// The limit of a reply whose request names none (`--max-tokens`).
     pub max_tokens: Option<u32>,
