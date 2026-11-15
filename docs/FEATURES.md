@@ -38,6 +38,12 @@ the kernels exist; no model runs there yet.
 - Temperature and dynamic temperature, top-k, top-p, min-p, typical, top-n-sigma, XTC,
   repetition, presence and frequency penalties, DRY, logit bias, mirostat, seed, `n`,
   logprobs. The sampler runs on the device and equals a CPU reference bit for bit.
+- Defaults per model for every sampling field a request leaves out (`--temperature`,
+  `--top-k`, `--top-p`, `--min-p`, the penalties, DRY, mirostat, `--samplers`, `--seed`):
+  options and preset keys named like the request's fields. Without one the engine samples
+  greedily.
+- Reply length: `--max-tokens` for requests that give no limit, `--max-tokens-limit` as a
+  cap (a request above it is cut and the reply says so). `/v1/models` shows what is in effect.
 
 ## Output control
 - Reasoning: `reasoning_content` in and out, `--reasoning`, `--reasoning-effort`,

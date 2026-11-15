@@ -1,11 +1,11 @@
 # What is still open
 
-Updated 2026-11-16, `main` at the exact draft windows of the 27B (230 commits ahead of
-`origin/main`, nothing pushed). What is there is listed in [`FEATURES.md`](FEATURES.md).
+Updated 2026-11-16, `main` at the server's defaults for sampling and reply length (nothing
+pushed). What is there is listed in [`FEATURES.md`](FEATURES.md).
 This file is brought up to date at every merge into `main`. It lists work, defects and
 measurements that are owed; what a feature must do in detail is in
-[`reference/feature-checklist.md`](reference/feature-checklist.md) (223 rows: 68 done,
-42 partly, 90 not started, 23 outside the frame; its rows K01, K02, K06 and P14 are out
+[`reference/feature-checklist.md`](reference/feature-checklist.md) (223 rows: 70 done,
+42 partly, 88 not started, 23 outside the frame; its rows K01, K02, K06 and P14 are out
 of date: reasoning is built, and `q7` to `q4` run in the 27B).
 
 Order of work the owner has set: CUDA complete for both models first, Vulkan parity last.
@@ -15,7 +15,6 @@ Order of work the owner has set: CUDA complete for both models first, Vulkan par
 | Piece | State |
 | --- | --- |
 | Elastic host memory | built and put on top of the SSD cache and the draft block (one squashed commit); my verification is queued |
-| Server defaults for sampling and reply length (R23, R25) | built; my verification is running |
 | Window prices that follow the tiers, chain cut by confidence | agent working |
 | Test file `Qwen3.8-Flash-Next-UD-Q4_K_XL` (104 GiB) | downloading to `/mnt/data/ares-models`, slow |
 
