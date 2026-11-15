@@ -476,6 +476,7 @@ fn the_page_tables_the_devices_hold_match_the_conductors() {
 fn a_failing_device_ends_every_request_with_an_error_and_stops_taking_new_ones() {
     let model = model(|_| {});
     let rt = runtime_with(&model, config(true, 4096), |e| e.failing_at(5));
+    assert_eq!(rt.failure(), None, "an engine that works has no failure to tell");
     let handles: Vec<Handle> =
         (0..4).map(|i| start(&rt, request(&format!("doomed {i}"), None)).unwrap()).collect();
     for handle in handles {
@@ -484,6 +485,9 @@ fn a_failing_device_ends_every_request_with_an_error_and_stops_taking_new_ones()
     }
     let later = start(&rt, request("after", Some(1))).unwrap().failure();
     assert!(matches!(later, EngineError::Internal(_)), "{later}");
+    // Whoever holds the engine can ask, without a request, why it serves none.
+    let said = rt.failure().expect("the engine says that it failed");
+    assert!(said.contains("injected"), "{said}");
 }
 
 #[test]

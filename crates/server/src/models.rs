@@ -302,12 +302,17 @@ impl Shared {
                 entry.broken = Some(why);
             }
         }
-        // Nobody gives way to a load that is not wanted any more.
+        // Nobody gives way to a load that is not wanted any more, and the
+        // loads that waited behind that one plan again: another model may
+        // have to give way for them.
         for index in 0..state.entries.len() {
             if let Some(taker) = state.entries[index].gives_way_to
                 && state.entries[taker].wanted.is_none()
             {
                 state.entries[index].gives_way_to = None;
+                for entry in &mut state.entries {
+                    entry.blocked = None;
+                }
                 changed = true;
             }
         }
@@ -477,7 +482,9 @@ impl Shared {
                     state.entries[idle].gives_way_to = Some(index);
                     None
                 } else if let Some(busy) = others(true) {
-                    if !state.entries.iter().any(|e| e.gives_way_to == Some(index)) {
+                    // One busy model gives way at a time; when it is gone,
+                    // whoever still finds no room plans again.
+                    if !state.entries.iter().any(|e| e.gives_way_to.is_some()) {
                         state.entries[busy].gives_way_to = Some(index);
                     }
                     let entry = &mut state.entries[index];

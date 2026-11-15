@@ -462,6 +462,24 @@ async fn a_busy_model_keeps_serving_when_the_request_that_wanted_its_room_goes_a
 }
 
 #[tokio::test]
+async fn two_loads_that_wait_for_one_busy_model_are_both_served_when_one_of_them_goes_away() {
+    let ini = "[a]\nmodel = /a.gguf\ncontext = 8\n[b]\nmodel = /b.gguf\ncontext = 8\n\
+               [c]\nmodel = /c.gguf\ncontext = 8\n";
+    let w = world(ini, &[10]);
+    let running = w.models.acquire("a").await.unwrap();
+    let for_b = w.request("b");
+    eventually("b to wait for room", || w.status("b").1.is_some()).await;
+    let for_c = w.request("c");
+    eventually("c to wait for room", || w.status("c").1.is_some()).await;
+    // The request a gave way to goes away: the other still gets its room.
+    for_b.abort();
+    let _ = for_b.await;
+    drop(running);
+    assert_eq!(for_c.await.unwrap().unwrap().id(), Some("c"));
+    assert_eq!(w.machine.log(), ["load a", "unload a", "load c"]);
+}
+
+#[tokio::test]
 async fn the_ram_limit_makes_room_like_a_device_does() {
     let ini = "\
 [*]
