@@ -877,8 +877,8 @@ it is how the engine drafts.
 | Part | What it is | State |
 | --- | --- | --- |
 | Lookup drafter | Continues the longest earlier occurrence of the current text, in this request or another: one suffix automaton over a corpus that all sequences share (`LookupCorpus`, `LookupDrafter`; after TensorRT-LLM, SGLang and vLLM's suffix decoding), with a confidence per proposed token and a bound on memory. It replaces the n-gram lookup per sequence; llama.cpp's map and cache variants are not built | Done and measured on text; the conductor uses it, next to a model drafter and never alone |
-| MTP | The model's own draft head or block | Done for `qwen35` on one device and under a tensor split: the block runs on the device with the embedding table, its chain and its picks stay on the device (`device/mtp.rs`); not under a layer split. Chains of up to the window's rows less one (7 by default) |
-| DFlash, DSpark, DFlash2 | A small draft model that reads the target's hidden states at a few layers and proposes a block of tokens at once | Not built: it needs taps on the target's layers and a second model on the same devices. `--drafters FILE` is refused with "not built yet" (the file is not opened); the choice of a window takes any number of drafters |
+| MTP | The model's own draft head or block | Done for `qwen35` on one device and under a tensor split: the block runs on the device with the embedding table, its chain and its picks stay on the device (`device/mtp.rs`); not under a layer split. Chains of up to the window's rows less one (7 by default). Done for `qwen4exp` in every placement, from a file of the block (`--drafters FILE`): the block runs on the device with the output head and the host reads every pick (see "Qwen3.8-Flash-Next through the runtime") |
+| DFlash, DSpark, DFlash2 | A small draft model that reads the target's hidden states at a few layers and proposes a block of tokens at once | Not built: it needs taps on the target's layers and a second model on the same devices. `--drafters FILE` is refused with "not built yet" for a `qwen35` model (the file is not opened; for a `qwen4exp` model the file is the model's own draft block); the choice of a window takes any number of drafters |
 | Drafter selection | Per step and for all sequences together, whose drafts go into each window, by expected tokens per millisecond of the whole step, from the price of a step and the acceptance measured per drafter, position and sequence; a proposal that was not taken learns from what turned out right | Done: `ares_sched::choose` |
 | Adaptive draft length | The length that maximises the same number | Done, in the same call |
 | Draft trees | Several branches verified in one window | Not built; the choice is made over rows ranked by their chance, which is a tree's ranking (see `crates/sched/src/window.rs`) |
@@ -3063,15 +3063,63 @@ gives way and comes back, several sequences in a step. The model is
 stays as the tool's and the tests' way to step it by hand (and for the probes
 that compare layer by layer).
 
-**It does not speculate.** The draft policy gives a model drafts only when it
-has a drafter of its own (`Model::own_drafts`): the lookup in earlier text
-takes part as soon as one does and never alone (see [Speculation](#speculation)).
-Flash-Next has no draft head built, so its windows are one row, its parts
-reserve no room for windows, and the server refuses `--drafters mtp` (and a
-drafter from a file), `--window` and `--draft-vocab` by name; `--drafters
-none` is what it does anyway. The measurements below that speak of drafts were
-taken before the policy, when the lookup ran by itself on this model, and
-were not repeated: the column without drafts is what the server does now.
+**It drafts with its draft block, from a file of the block.** The model's draft
+head is a block of its own (section 4 of the
+[specification](reference/qwen4exp-architecture.md)): one layer of the attention
+kind with its own mixture of 512 experts, two projections that make its input
+from the trunk's residual after the last layer and the embedding of the token
+behind it, and its own final mixer in front of the model's output head. The model
+file carries none; `--drafters FILE` names the file Strata packs it in (889 MB for
+Flash-Next: 175 MiB of dense weights, the experts in Q2_0), and the server refuses
+a file that is no block of this model before a device is touched. `--drafters mtp`
+is refused (a block inside the model file, as the llama.cpp fork lays it out, is
+not read: there is no such file here), and so is `--draft-vocab`: the block picks
+from the whole output head. Without a block the model does not speculate: the
+lookup in earlier text takes part as soon as a model drafter does and never alone
+(see [Speculation](#speculation)).
+
+- *Where it runs.* On the device that holds the output head, in every placement
+  (one card; the last card of a split by layers; the card that mixes when both
+  work on every layer), as a second part of one layer (`device/draft.rs`,
+  `device/part/block.rs`) that reads the model's output head where it is. Its keys,
+  values and indexer keys are pages of its own, addressed through the model's
+  page tables.
+- *What it does in a step.* The block is one token behind the model: its cell `i`
+  pairs the trunk's residual of cell `i` with the token of cell `i + 1`. In front
+  of every step of the model it (1) follows the rows of the step before that
+  count, which the record of this step tells (rows that only write keys and
+  values, eight to a launch), and keeps the residual of the last of them; (2)
+  runs the newest cell of every sequence, whose token is the first row of the
+  step; (3) for the windows that take its drafts goes on from its own residual
+  and its own pick, link after link. The keys of the indexer a sequence carries
+  are saved behind the first link and put back behind the last, and the keys and
+  values of a chain's cells are overwritten when the model has passed them.
+- *The host reads every pick.* The embedding of a row and the rows of the n-gram
+  table are host work in this model, so a link ends with a read of its pick
+  (where the 27B's chain stays on the device), and the device threads that do not
+  hold the block wait for the drafts before they enqueue the step that verifies
+  them. The verify window is the model's ordinary step of up to eight rows; the
+  rows that are rejected leave no trace in the recurrent layers, the n-gram
+  history and the indexer's keys (`Part::enqueue_commit`, which existed), and
+  their keys and values are overwritten.
+- *Its experts go through the expert store*, as layer 0 in front of the model's
+  layers (a step routes the block before any layer of the model), read from the
+  block's file. With a block the slots of a pool are divided by the experts a
+  layer has on the device, so that the block, which has all 512 on one card, gets
+  more than a layer that two cards share.
+- *The price of its windows is learned, not measured at load.* The steps the
+  conductor measures at the start find no expert in a slot: on this machine they
+  gave 35.5, 49.4, 93.0, 77.0, 97.5, 133.5, 111.3 and 122.5 ms for one to eight
+  rows (2026-11-15) where a step of one row takes 22 ms once the tiers are
+  filled, and with that table no window is ever chosen, because a price is only
+  corrected by a step of its size that runs. So a server whose model drafts
+  starts the runtime without that measurement, and the table fills from the steps
+  of the warm-up text and of the requests. What stays open: a window that ran
+  while its experts were missing leaves a price that keeps it from being chosen
+  again; the conductor has no way to try a size again.
+- *The window* is four rows unless `--window` says otherwise (2 to 8): a row of
+  this model routes to experts of its own, so a rejected draft costs what a token
+  costs.
 
 **A step that has to wait for experts.** The experts a layer needs are known
 when its router has run, so a step cannot be enqueued whole and left alone:
@@ -3126,8 +3174,8 @@ the card with the attention layers), and the logits of the wanted rows stay on
 the device for the sampler.
 
 **Wide steps: a prompt on the many-row kernels.** A step of up to eight rows is as
-described above, and a round of generation stays there: one row for each sequence, since the
-model takes no drafts. The piece of a prompt that the conductor sends between rounds, up to
+described above, and a round of generation stays there: one row for each sequence, and with
+a draft block the drafts they verify, eight rows for all of them together. The piece of a prompt that the conductor sends between rounds, up to
 `Model::prompt_rows` rows, which for this model is `Model::max_rows` (`step_rows`, below),
 with the newest token of every generating sequence riding along, runs every layer at that
 width (`device/part/wide.rs`, `device/misses.rs`):
@@ -3299,8 +3347,9 @@ thirty-second of the room for slots (17 408 to 18 432 tokens for two sequences
 on this machine) where the 27B gets what is left. Options that mean nothing for the
 model are errors that name them: `--shares`, `--precision exact`,
 `--draft-vocab`, K/V formats with a tile mean, more sequences than the eight rows of a
-generating step (`--parallel`), and the options of drafting (`--drafters mtp`,
-`--window`).
+generating step (`--parallel`), `--drafters mtp` (the model file carries no draft block;
+`--drafters FILE` names the block's file), and `--window` without a drafter or beyond
+the eight rows of a step that verifies.
 
 **The RAM.** The tier of experts is a user of the one RAM limit (`--ram`,
 `PinnedRam`): elastic, with a priority above the checkpoints, so the limit

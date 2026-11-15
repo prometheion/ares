@@ -25,14 +25,20 @@ use crate::load::{
     LoadError, Loaded, VRAM_HEADROOM, describe_links, hold_devices, join, ram_limit, refuse, short,
 };
 use crate::models::Site;
-use crate::plan::{
-    self, CELLS_PER_PAGE, DEFAULT_PARALLEL, DEFAULT_WINDOW, Drafter, LoadOptions, SplitKind,
-};
+use crate::plan::{self, CELLS_PER_PAGE, DEFAULT_PARALLEL, Drafter, LoadOptions, SplitKind};
 
 /// The most rows of a step that generates (the newest token of every sequence and the drafts
 /// they verify): what the decode kernels of the experts take. Only the slices of a prompt are
 /// wider.
 const MAX_ROWS: u32 = ares_cuda::MAX_BATCH;
+
+/// The rows of a sequence's window unless `--window` says otherwise: the
+/// newest token and three drafts. A row of this model routes to experts of
+/// its own, so a draft that is rejected has cost what a token costs; on
+/// German and English prose and code the block's fourth link was accepted 7
+/// times of 18 where the first three were accepted two times of three
+/// (2026-11-15, both cards on every layer).
+const DRAFT_WINDOW: u32 = 4;
 
 /// A text of German, English and code, about 700 tokens, that the model reads
 /// once at the start (see [`warm_up`]).
@@ -119,7 +125,7 @@ pub(crate) fn load(
             Ok::<_, LoadError>((path, file))
         })
         .transpose()?;
-    let window = options.window.unwrap_or(DEFAULT_WINDOW);
+    let window = options.window.unwrap_or(DRAFT_WINDOW);
     if options.window.is_some() && drafter.is_none() {
         return Err(refuse("--window without a model drafter does nothing"));
     }
@@ -362,6 +368,12 @@ pub(crate) fn load(
         cells_per_page: CELLS_PER_PAGE,
         max_slots: parallel,
         window_rows: if drafting { window } else { 1 },
+        // A model that drafts learns the price of its steps from the steps
+        // that run, the warm-up text first: the steps the conductor would
+        // measure at the start find no expert in a slot, and what a window
+        // costs then (three to four times its price once the tiers hold the
+        // text's experts) would keep every window from being tried.
+        warm_up: !drafting,
         checkpoint_budget: 0,
         ..RuntimeConfig::default()
     };
@@ -403,6 +415,22 @@ pub(crate) fn load(
         loading.elapsed().as_secs_f64(),
         begun.elapsed().as_secs_f64()
     );
+    if let Some(calibration) = runtime.snapshot().and_then(|snapshot| snapshot.calibration) {
+        let table = |points: &[(u32, f64)]| {
+            join(points.iter().map(|(n, ms)| format!("{n}: {ms:.1}")), ", ")
+        };
+        tracing::info!(
+            "the price of a step was measured in {:.1} s ({} steps), in ms by rows: {}{}",
+            calibration.seconds,
+            calibration.steps,
+            table(&calibration.step_ms),
+            if calibration.chain_ms.is_empty() {
+                String::new()
+            } else {
+                format!("; the draft block's chain, by links: {}", table(&calibration.chain_ms))
+            }
+        );
+    }
     warm_up(&runtime, &name)?;
 
     // What it took.

@@ -1359,6 +1359,67 @@ fn flash_next_answers_in_both_placements() {
     }
 }
 
+/// Flash-Next with its draft block (`ARES_TEST_QWEN4EXP_DRAFT` names the
+/// block's file; without it the test is skipped): the plan says that the
+/// block drafts and what it took, the answer to the question the reference
+/// answered starts as the reference's does, drafts are verified and some are
+/// accepted, and a request that says no drafts gets none.
+#[test]
+fn flash_next_drafts_with_its_draft_block() {
+    let Some(model) = flash_model() else { return };
+    let Some(block) = std::env::var_os("ARES_TEST_QWEN4EXP_DRAFT") else {
+        eprintln!("skipped: set ARES_TEST_QWEN4EXP_DRAFT to the file of Flash-Next's draft block");
+        return;
+    };
+    let block = block.to_str().expect("a path in UTF-8").to_owned();
+    let devices = std::env::var("ARES_TEST_DEVICES").unwrap_or_else(|_| "0,1".to_owned());
+    let mut server = Server::start_with(
+        &model,
+        port(3),
+        &["--devices", &devices, "--chat-var", "enable_thinking=false", "--drafters", &block],
+        &[],
+        SLOW,
+    );
+    let log = server.logged().join("\n");
+    assert!(log.contains("draft block") && log.contains("drafts"), "the plan names it: {log}");
+    assert!(log.contains("experts share the tiers"), "and what it took: {log}");
+    let client: &Client = &server;
+    let ask = |question: &str, draft: bool| {
+        let body =
+            client.chat(question, json!({"max_tokens": 80, "temperature": 0, "draft": draft}));
+        client.post("/v1/chat/completions", &body)
+    };
+    let first = answer(&ask(HASH_TABLE, true));
+    eprintln!("RES drafts: {first:?}");
+    assert!(
+        first.starts_with(
+            "A hash table stores data by mapping keys to specific indices in an array using a \
+             hash function."
+        ),
+        "the reference's first sentence: {first:?}"
+    );
+    let text = answer(&ask(GERMAN, true));
+    assert!(mentions(&text, GERMAN_WORDS), "a German answer about light: {text:?}");
+    // The same question again: the lookup in earlier text has the answer.
+    let again = answer(&ask(HASH_TABLE, true));
+    assert!(again.starts_with("A hash table stores data"), "the second time: {again:?}");
+    let (proposed, accepted) =
+        (client.metric("drafts_proposed_total"), client.metric("drafts_accepted_total"));
+    eprintln!("RES drafts: {proposed} verified, {accepted} accepted");
+    assert!(proposed > 0 && accepted > 0, "{proposed} drafts verified, {accepted} accepted");
+    assert!(accepted <= proposed);
+    // A request that says no gets none, and the same kind of answer.
+    let plain = answer(&ask(HASH_TABLE, false));
+    assert_eq!(client.metric("drafts_proposed_total"), proposed, "a request without drafts");
+    assert!(plain.starts_with("A hash table stores data"), "without drafts: {plain:?}");
+    let (picks, hits) = (client.metric("expert_picks_total"), client.metric("expert_hits_total"));
+    let misses = client.metric("expert_misses_ram_total")
+        + client.metric("expert_misses_disk_total")
+        + client.metric("expert_misses_on_their_way_total");
+    assert_eq!(picks, hits + misses, "every pick, the block's included, was a hit or a miss");
+    server.stop();
+}
+
 /// Flash-Next through the binary on one device, where nearly half of the
 /// experts are in no tier and come from the file while it answers: the
 /// answers are the ones of two devices, the reference's first sentence

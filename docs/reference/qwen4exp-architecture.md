@@ -665,13 +665,13 @@ token at cell `i + 1`, `tok`; its output is a guess for the token at cell
 
 ```
 e     = fc_embedding @ (rms(token_embd[tok]) * (1 + pre_fc_norm_embedding))           (N)
-hn    = rms(Rt as one vector of D) * (1 + pre_fc_norm_hidden)                         (D)
+hn[c] = rms(Rt[c]) * (1 + pre_fc_norm_hidden[c])       every stream by itself         (hc x N)
 h[c]  = fc_hidden @ hn[c]                                                             (hc x N)
 R[c]  = h[c] + e
 m, inj = read(R, attn_hyper_connection)
 k, v  = k_proj @ m, v_proj @ m;  k[b] = rope(rms(k[b]) * (1 + k_norm), i);  store at cell i of the block's own K/V
 q, gate from q_proj @ m as in 3.6;  q[a] = rope(rms(q[a]) * (1 + q_norm), i)
-att   = attention of 3.6 over the block's own cells max(0, i + 1 - 32768) .. i
+att   = attention of 3.6 over the block's own cells 0 .. i, with the block's own indexer
 R     = write(R, o_proj @ (att * sigmoid(gate)), inj)
 m, inj = read(R, mlp_hyper_connection)
 R     = write(R, moe(m), inj)                         3.7 with the block's router, experts and shared expert
@@ -712,13 +712,26 @@ the list can never be drafted. The trunk's head is never restricted.
 | 5 | How attention is restricted | a list of cell ids read through the page table | a mask of minus infinity over all cells, then dense attention (F: `build_qsa_sel`, `build_attn_qsa`) | the list; same values |
 | 6 | K/V storage | f16, int8 with an f16 scale per 64 values, 4-bit after a 256-point Hadamard rotation, or K 8-bit and V 4-bit (S: `include/strata/core/layer.hpp` `QsaState`) | the KV cache's type, optionally rotated (F: `build_attn_qsa`, `self_k_rot`) | the engine's own formats |
 | 7 | Undoing rejected drafts | nothing recurrent is written before acceptance; a commit replays the accepted rows (S: `include/strata/kernels/verify_kernels.hpp`) | snapshots of the recurrent state for the last `n_rs_seq` tokens (F: `delta-net-base.cpp` `build_recurrent_attn`, `qwen4exp.cpp` `build_conv_state_at`) | Strata's, which is also what Ares plans |
-| 8 | MTP: norm of the trunk residual | one `rms` over all `D` values (default; `--mtp-hnorm stream` gives the other) (S: `mtp.cpp` `record_front`) | `rms` per stream (F: `graph_mtp`, `mtp_hnorm`) | Strata's default, switchable. Open point 2 |
-| 9 | MTP: what its attention reads | all of its last 32768 cells, no indexer; the block's indexer tensors are unused (S: `mtp.hpp`, `record_rest`) | the block's own indexer and selection when the context has an indexer memory (F: `graph_mtp`, `src/llama-model.cpp` `filter_idx` for the MTP context) | Strata's. Same result up to 2051 cells. Open point 3 |
+| 8 | MTP: norm of the trunk residual | one `rms` over all `D` values (default; `--mtp-hnorm stream` gives the other) (S: `mtp.cpp` `record_front`) | `rms` per stream (F: `graph_mtp`, `mtp_hnorm`) | the fork's, `rms` per stream, as the mixers norm the streams. Measured: see below |
+| 9 | MTP: what its attention reads | all of its last 32768 cells, no indexer; the block's indexer tensors are unused (S: `mtp.hpp`, `record_rest`) | the block's own indexer and selection when the context has an indexer memory (F: `graph_mtp`, `src/llama-model.cpp` `filter_idx` for the MTP context) | the fork's: the block is an attention layer like the trunk's, with its own indexer. Same result as Strata's up to 2051 cells |
 | 10 | MTP: rotary position of cell `i` | `i` (S: `mtp.hpp`) | `i + 1`, the position of the paired token (F: `speculative.cpp` `process`) | Strata's. A shift of all cells by one leaves `q . k` unchanged up to rounding |
 | 11 | MTP file | separate file, checkpoint names, raw norm weights, fused tensors | `blk.48.*` in the model file, converted | this machine has Strata's file only |
 | 12 | Which layers are recurrent | from `full_attention_interval`, checked against `compress_ratios` | from `attention.recurrent_layers`, else the interval | either; they agree for this file |
 | 13 | Shapes | compiled in, a file of another shape is refused | read from the metadata | from the metadata |
 | 14 | Draft token list | always the subset when the file exists | a subset that falls back to the whole vocabulary for a sequence whose recent text is often outside it (F: `speculative.cpp`, `vocab_in`, `seq_miss`) | not part of the architecture |
+
+**On difference 8.** The block's file has no outputs to compare with, so
+the two norms were measured by what the block is for (2026-11-15, the CPU
+reference, `tests/qwen4exp_real.rs`; the 99 tokens of the English trace of
+section 8, of which the model wrote 80): fed the trunk's residual of a cell
+and the token behind it, the block's largest logit was the token the trunk
+wrote one further in 63 of 80 cells with a norm per stream and in 58 of 80
+with one norm over all streams; chains of three links from ten cells were
+accepted 9, 6 and 3 times of 10, 9 and 6 (per stream) and 9, 7 and 4 times
+of 10, 9 and 7 (one norm). Strata's notes give 0.60 and 0.63 for its two
+settings on its own measure (S: `docs/DGX_SPARK_LINUX.md`), and the header
+of its drafter 0.89, 0.86 and 0.85 for the three links of its probe (S:
+`mtp.hpp`), which was not available here.
 
 **On difference 1.** It is the only difference that changes the trunk's
 numbers, by at most 3 cells of the 513th-ranked block and only past 2051
@@ -1069,16 +1082,18 @@ architecture needs:
    implementation was not read.
 2. **The MTP block's norm of the trunk residual** (difference 8): one RMS
    over 10240 values (Strata's default) or one per stream (the fork).
-   Strata's header says its form was validated by draft acceptance in a
-   tool, `tools/mtp_probe.py`, that is not in the repository. Not decided
-   here.
+   Decided by measurement on 2026-11-15 for one per stream ("On difference
+   8" in section 5): 63 against 58 of 80 guesses on one text. One text of
+   80 tokens is a small sample.
 3. **The MTP block's attention past 2051 cells** (difference 9): the
    checkpoint ships an indexer for the block and the converter gives the
    block a compress ratio (F: `conversion/qwen4exp.py`
-   `set_gguf_parameters`); Strata ignores it on purpose. Only draft quality
-   depends on it.
+   `set_gguf_parameters`); Strata ignores it on purpose. The reference and
+   the engine use the block's indexer; nothing was measured past 2051
+   cells. Only draft quality depends on it.
 4. **The `1 +` on the MTP file's norm weights** rests on `tools/mtp_rt.py`
-   and on value ranges, not on a run.
+   and on value ranges, and since 2026-11-15 on a run: with it the block
+   guesses 63 of 80 of the trunk's tokens (section 5).
 5. **Whether the fork runs this file on this machine, and how fast**
    (8.2): not tried.
 6. **Strata's tap output on one GPU** (8.1): read from source and from the
