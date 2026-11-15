@@ -146,7 +146,10 @@ with it; the runs are too noisy to tell the two apart.
   - [ ] 2. The tower on the device: dense attention for heads of 72, layer norm with bias,
         bias and GELU, the tower's rotary rotation, the position table's resize; `ffn_down`
         padded from 4304 to 4320 inputs.
-  - [ ] 3. Weights not resident (uploaded block by block), the tower as a job the conductor plans.
+  - [ ] 3. Both homes for the tower's weights, as the owner requires (llama's `mmproj` with and
+        without `no-mmproj-offload`): resident in VRAM, or held in RAM and uploaded block
+        by block for each image so that no VRAM is taken for good; a key chooses. The tower
+        as a job the conductor plans. (Computed on the GPU in both cases.)
   - [ ] 4. Cells and positions in the runtime: image spans next to tokens, positions (t, h, w)
         per row, staging and a store of image rows.
   - [ ] 5. The splice in `qwen35` (a row source in the embedding gather; positions in the draft chain's links).
