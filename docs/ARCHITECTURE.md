@@ -647,6 +647,18 @@ same way on every device, from the segments of the record:
   cache keeps at most one tail per slot (`PrefixCache::tails_per_slot`).
 - Page copies copy the exact entry; a page that is copied is always partly
   used, hence exact.
+- A row reads a tile converted from the position at which the tile has left
+  the newest cells (`newest + 128 * (tile + 1)`), whatever step computes the
+  row. A draft window that reaches across such a position has the tile both
+  ways: it is converted at the start of the step and keeps its exact entry;
+  the rows from the position on read the converted entry (the plan of their
+  attention names it for that one tile, the table does not), the rows before
+  it the exact one, and a step that starts past the position gives the exact
+  entry up. So a row of a window reads the bytes it would read in a step of
+  its own. The tile must have been full before the window and only one tile
+  may leave inside it, so with these formats a draft window has at most
+  `min(newest, 128)` rows (32 with `q7`, 64 with `q6`, 128 with `q5` and
+  `q4`); a longer one is refused by the device part.
 
 The formats were chosen on synthetic rows and then measured on the K and V of
 two real models (Qwen3.5-0.8B and Qwen3.8-27B, one text of 3.7k tokens; the
@@ -1029,46 +1041,63 @@ window and 64.7 % against 65.8 % for the second, greedy, and 70.3 % against
 against 74.8 / 76.8 tokens per second), 1.1 MiB per 1000 tokens on its device
 where `q8` took 2.1 (the same on the `Q4_K_S` file over both cards, 3000
 drafts each: first draft 69.9 % against 67.8 % greedy and 63.2 % against 64.9 %
-sampled), and nothing for its head, which is rows of the output head. With
-exact products the text with drafts equals the text without, for
-the most probable token and for sampled tokens with the same seed
-(`tests/qwen35_mtp_runtime.rs`, and over HTTP by the hash of the reply's tokens,
-`ares-server`'s `tests/real.rs` on the 27B and both cards). With the fast
-kernels the texts are not guaranteed to agree: a window of several rows rounds
-differently from single rows. Before the few-row kernels the texts parted after
-150 to 650 characters (the margins of the picks where they part were not
-measured; `tests/real.rs` had two of three questions parting after 300 and 430
-characters on one card). Measured 2026-11-12 on the same questions (three
-drafts, 300 tokens, the most probable token and sampled with seed 20261110):
-with every matrix in the device layout all six texts are the same token for token
-(23 and 22 matrices, the i-quants of 2 and 3 bits among them, have no device
-layout and run through the integer decode kernels), with every matrix in the
-file's layout two of six are, and with the measured choice two of six in one
-load and four of six in another, which are not the same model: the choice of
-layouts differs from load to load, and more matrices stay in the file's layout
-when the model has its draft block (96 and 100 on the RTX 4070 against 37 and
-40; the cause was not found).
+sampled), and nothing for its head, which is rows of the output head.
 
-The cause is not a matrix kernel. A row of a matrix has the same bits alone
-and in a step of up to eight rows (sixteen in the device layout), in a launch
-of any shape, and so have the norms, merges and activations: rows of different
-sequences in one step give the top logit of the rows alone bit for bit, in
-either layout, on one card and on two, and launching every product of the
-file's layout one row at a time changes no bit. The rows of *one* sequence in
-a step do change each other's result: the top logit of a row in a window of
-four differs from the row alone by 1.7e-4 of the logit on average in the
-device layout, 1.1e-3 in the file's layout and 8.8e-5 with exact products
-(Qwen3.8-27B, 16 rows each; 6.3e-4, 2.6e-3 and 2.2e-4 on the 0.8B). It does
-not grow with the context (at 8, 100 and 700 tokens: 2.5e-4, 1.7e-4 and 1.8e-4
-in the device layout, 3.0e-3, 1.1e-3 and 1.3e-3 in the file's), so it is how
-the recurrent or the attention layers take several rows of one sequence (not
-isolated further), not the reading of a long cache. The activations are
-rounded to f16 or to 8 bits before the next product, which turns a difference
-in the last bits of a float into a step of that rounding now and then; the
-8-bit step is larger, so the file's layout carries the difference four to
-seven times further than the device layout and picks another token more often.
-In the device layout the six texts are the same because the difference is
-below the margin of their picks, not because it is zero.
+**The text with drafts is the text without**, token for token, with the fast
+kernels as with exact products, for the most probable token and for sampled
+tokens with the same seed. A step verifies a window of rows of a sequence, and
+row `k` of it gives the logits that a step of that row alone gives after the
+`k` rows before it were committed, bit for bit: the weight kernels give a row
+the same product in any launch of a decode step, the recurrent blocks carry
+their state from row to row as single steps store it, and attention plans
+every generated row as if it were the only row of its step (see "Attention
+kernels" under [Devices](#devices)). The tests: every kind of block, every
+format of K and V, windows with rejected drafts, on made-up models
+(`crates/model/tests/qwen35_windows.rs`: every logit, the recurrent state and
+the stored K and V); the 0.8B on one card, in a tensor split and in a layer
+split with every format (`a_row_of_a_draft_window_picks_what_it_picks_alone_on_every_placement`
+in `tests/qwen35_device_runtime.rs`); the kernels and the plan in `ares-cuda`
+(`a_row_of_a_window_has_the_bits_it_has_alone`); and the 27B over HTTP by the
+hash of a reply's tokens (`ares-server`'s `tests/real.rs`).
+
+It was not so before 2026-11-15, with the fast kernels. Measured then with
+`qwen35_run --engine 8 --undrafted` (German prose, English prose and code, 300
+tokens each, the most probable token and sampled with seed 20261110; every
+request with drafts, with `"draft": false` and with drafts again in one
+runtime): with K and V in `q8`, the default, 6 of 6 replies of the `IQ2_XXS`
+file on the RTX 4070 parted from the reply without drafts, after 213 to 845 of
+1100 to 1500 characters, and 4 of 6 of the `Q4_K_S` file over both cards, after
+285 to 867; with K and V in `f16` none of 6 parted on either. The second reply
+with drafts was the first in all 24. After the change, the same day, with
+`q8`: none of 6 parts on the RTX 4070 and none of 6 over both cards.
+
+The cause was attention and nothing else. A probe ran the blocks of a step
+one by one (`Harness::blocks`) and fed every block of a window the rows that
+the single rows had fed it (Qwen3.5-0.8B, windows of 4 and 8 rows after 200 to
+700 tokens): every recurrent block, with its feed-forward half, its norms and
+its products, gave a row of a window the bits of the row alone (all 216 and
+432 rows) and left the same state after the commit; every attention block
+gave other bits (none of 72 and 144 rows, off by up to 7e-3 of the block's
+largest output) while the stored K and V were the same bytes. With K or V in
+`f16` every row was equal, and with `q4` as long as every tile was still an
+exact entry. What depended on the step was the read:
+
+- *The kernel.* One row over quantized K and V in converted entries ran on
+  the direct kernel (queries of 15 bits, integer products), a window on the
+  tensor cores (f16 operands). The two differ by about 1e-3.
+- *The pieces.* A row's cells are cut into pieces whose states are merged in
+  rounded sums; the cut followed the last row of the window and every other
+  row of the step, so a window that began a new table entry cut its earlier
+  rows otherwise than a step of their own would (once a sequence has more
+  entries than a row has pieces).
+- *With `q7` to `q4`, when a tile is converted.* A step converted the tiles
+  that had left the newest cells as of its first row; a later row of the
+  window read a tile exact that it reads converted in a step of its own.
+
+The earlier measurements fit this: rows of different sequences in one step
+were equal to the rows alone (each is an item of its own, on the direct
+kernel), rows of one sequence were not, and the difference did not grow with
+the context.
 
 Measured 2026-11-11 with the policy on Qwen3.8-27B (tensor split 0.625 / 0.375,
 `qwen35_run --engine`, 400 tokens per request through the chat template with
@@ -1241,12 +1270,15 @@ its draft block, on both cards with exact products. There the texts were equal
 with drafts and without in all 14 settings through the server
 (`crates/server/tests/real_sampling.rs`: 437 draft rows verified, 425 of them
 right), equal under two rules about the tokens, and equal for requests that run
-next to each other. A model is not exact in general: the logits of a row depend
-on the size of the step that computed it by up to 2e-3 ("Rounding" under
-"Sequence state"), so on a model or a placement where that shows, a sampled
-text can part where two tokens are that close; the tests assert that the
-texts agree for a long stretch and that the probabilities agree on it within
-the model's error.
+next to each other. Since 2026-11-15 a row of a draft window has the logits of
+the row alone bit for bit with the fast kernels too (see "The text with drafts
+is the text without" under [Speculation](#speculation)), so the same holds as
+a model is served. What a row still depends on is the steps that computed its
+prompt and, past 16 generated rows in a step, the size of the step ("Rounding"
+under "Sequence state"): where that shows, a sampled text can part where two
+tokens are that close, and the tests of requests next to each other assert
+that the texts agree for a long stretch and that the probabilities agree on it
+within the model's error.
 
 **Probabilities.** A request asks for the probability of each generated token
 and of the `top` most probable alternatives (at most 20). Two distributions:
@@ -2545,9 +2577,20 @@ block (2.44 ms on the RTX 3060), which is 2.3 times as fast as the thread
 mapping of the llama.cpp fork's kernel in the same harness. The rule is
 sequential in the rows; a chunked form on the tensor cores is not built.
 
+A row of a draft window has the bits of the row alone in these kernels: the
+convolution takes its window from the raw inputs of the rows before it, the
+delta rule carries the matrix from row to row in the registers exactly as a
+step of one row stores and reloads it, and the commit replays the accepted
+rows with the same operations (`crates/model/tests/qwen35_windows.rs` holds
+the outputs, the state and the logits to that, bit for bit).
+
 The state of the delta rule can be held in `f16` (`StateFormat::F16`), which
 halves the 150 MiB per sequence of the 27B and takes the delta rule of four
-sequences from 55 to 32 µs. Measured on the CPU reference with the 0.8B over
+sequences from 55 to 32 µs (measured before the rounding per row that
+follows). The matrix is then rounded to `f16` after every
+row, in the registers of a window, a prompt and a commit as well, because a
+step of one row stores the rounded matrix: a row must not depend on the step
+that computed it. Measured on the CPU reference with the 0.8B over
 1000 tokens of real text, rounding the state to `f16` after every step moves
 the logits by a KL divergence of 1e-6 to 3e-6 and never changes the most
 likely token, but the error grows with the length (the hidden state is off
@@ -2578,6 +2621,60 @@ of the largest output element of `KvHead::attend` on the same stored bytes
 (6e-3 at worst), which is the `f16` operands of the tensor cores; it does
 not depend on the format, and `q4` / `q4` on captured rows of Qwen3.8-27B
 is as close as `f16` / `f16`.
+
+*Generated rows* (`Planner::window`). The row of a decode step and the rows of
+a draft window must give the same bits alone and together, or a reply would
+depend on what was drafted for it. Three things decide the bits of a row, and
+for these rows each is fixed by the row alone:
+
+- The pieces are those of a step that holds nothing but the row: the whole
+  budget of blocks (three per multiprocessor, by the KV heads of the device,
+  at most 64 pieces), cut over the entries the row reads. Rows of a window
+  that read the same entries have the same pieces and share their items, so
+  the cells are read once for all of them; a window that begins a new entry
+  is two tiles of rows in that step. Other sequences change nothing, and
+  such rows read no prefix together with other sequences.
+- The kernel is the tensor-core kernel in its decode shapes (8, 16 and 48
+  vectors), for one row as for eight: a vector has the same arithmetic in
+  each of them, whatever shares the item, and the cells past a row's own are
+  masked to exact zeros. The direct kernel, which is faster for one row over
+  quantized K and V, is not taken for these rows: a window of rows has no
+  kernel with its arithmetic that reads the cells once (its work is per
+  vector, eight rows would cost it eight times one). It still serves the rows
+  that see a list of ranges (`qwen4exp`) and the links of the draft block's
+  chain, whose results are proposals.
+- The entries are the caller's: with `q7` to `q4` the rows of a window past
+  the position at which a tile leaves the newest cells read it converted (see
+  "Where the tile formats keep their exact cells").
+
+The rows of a prompt are planned as before (tiles of up to 64 vectors, pieces
+by the step), and are not the rows a single step computes.
+
+It costs nothing that was measured. 2026-11-15, the build before against the
+build after, back to back, without the profile, K and V in `q8`, the machine
+at a load of 15 to 27 from other work. A decode step without drafts, which is
+the step that changed kernels: on the RTX 4070 with the `IQ2_XXS` file 20.94
+ms before and 20.78 ms after at 1000 tokens of context, 21.95 and 21.90 ms at
+8000, 24.03 and 24.02 ms at 32000 (attention over the 16 layers took 0.66 ms
+of a step on the direct kernel and 0.52 ms on the tensor cores at 1000 tokens,
+1.52 and 1.50 ms at 8000); over both cards with the `Q4_K_S` file 24.83 and
+24.54 ms at 1000 tokens. A prompt of 2048 tokens: 1167 and 1171 tokens per
+second before, 1170 and 1170 after on the one card; 1350 and 1355 before, 1358
+and 1363 after on both. With drafts (`qwen35_run --engine 8 --generate 300`,
+the draft vocabulary, the most probable token, two runs of seven requests
+with each build) a window's step is the step it was, as far as a loaded
+machine shows: over both cards the step median of a request was 31.41 to 31.47
+ms before in the quietest stretch (three requests; 34 to 39 ms in the others,
+as the load rose) and 31.42 to 31.77 ms after (the seven requests of the
+quieter run; 32.7 to 37.2 ms in the other), and the tokens per second follow
+the load and the text (59 to 82 before and 64 to 80 after for prose and code,
+109 and 127 before and 120 and 138 after for the rewrite). On the one card a
+run where the policy chose one link both times had 130 steps of 23.92 ms
+before and 130 of 24.00 ms after for the same 300 tokens (91.6 and 91.0 tokens
+per second); where it chose two links in one run and one in the other the
+steps cannot be compared. The
+scratch of a step grew by 1.6 MiB on the one card and by 1.2 and 1.0 MiB on
+the two (the states of the pieces of rows planned alone).
 
 Measured 2026-11-10 per attention layer (Qwen3.8-27B has 16), one sequence,
 RTX 4070 / RTX 3060:
@@ -3983,14 +4080,13 @@ Work is paused here until Qwen4 is released; nothing below is in progress.
   RAM is one setting (`--ram`).
 - Known defects: a long prompt next to a generating Flash-Next sequence slows
   it by the misses of the prompt's rows (nothing separates the two inside a
-  step); with the fast kernels the text with drafts is not always
-  the text without (the rows of one sequence in a step change each other's
-  logits by 2e-4 to 1e-3 of the logit, more in the file's layout than in the
-  device layout: see "Speculation"; with exact products it is the same, for
-  steps of the same size: see "Rounding" under "Sequence state"; the hash of a
-  reply's tokens, which the server returns, and `"draft": false` check it over
-  HTTP, and the test of that for the fast kernels is switched off until they
-  agree); a prompt
+  step); a row of a draft window has the bits of the row alone only while
+  the step has no more rows than the few-row kernels of the device layout take
+  (16: three sequences that draft at once with windows of 8, or a window above
+  16 rows, go past it, and their rows then round as the rows of a prompt do);
+  a row still depends on the steps that computed its prompt (see "Rounding"
+  under "Sequence state"), so a reply from the prefix cache is not always the
+  reply computed from nothing; a prompt
   that shares only the start of the chat template with an earlier request
   (three tokens) now runs a step of its own to replay them before its rows
   (one more step in the counts of `--engine`, not timed); a model that only
@@ -4029,9 +4125,10 @@ order it would be taken up; the source of each idea is in
 5. Shares of a tensor split from a measurement at load; device layouts for
    the remaining types (the i-quants of 2 and 3 bits stay in the file's layout,
    and with them the integer kernels for few rows); a choice of layouts that
-   does not change with the draft block or from one load to the next; a row
-   of a draft window computed with the bits it has alone, in the recurrent
-   and attention layers too, so that drafts cannot change the text.
+   does not change with the draft block or from one load to the next; the
+   few-row kernels of the device layout in launches, so that a step of more
+   than 16 generated rows keeps every row's bits; rows of a prompt that
+   compute as single rows do, so that the prefix cache cannot change a text.
 6. Vulkan: experts, the `qwen4exp` kernels, and the models (the sampler's
    kernels wait for a model that calls them); a sampler on devices without
    `shaderFloat64`, with the double-precision functions written in 64-bit
@@ -4188,8 +4285,8 @@ timings in every answer of the OpenAI routes
 accepted, and `token_hash`, a hash of the reply's token ids in the final message
 and in the last event of a stream). A request can switch drafting off for itself
 with `"draft": false`; the two replies of one request, with and without drafts,
-are then compared by their hashes over HTTP (they are equal with
-`--precision exact`; with the fast kernels they are not always, see Status).
+are then compared by their hashes over HTTP (they are equal, with the fast kernels and with `--precision exact`: see
+"The text with drafts is the text without" under [Speculation](#speculation)).
 The prefix cache is on for `qwen35` without a flag: a prompt that
 starts with text the engine has computed reads the cached part from the pages
 and the checkpoint instead of computing it, the answer's `usage` says how much

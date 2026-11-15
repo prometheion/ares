@@ -3,8 +3,10 @@
 //! Needs two GPUs (`ARES_TEST_CUDA=1`) and the model
 //! (`ARES_TEST_QWEN35_27B`); `ARES_TEST_DRAFT_VOCAB` names a draft vocabulary
 //! (a token id per line). The model is split by tensor over both devices
-//! with exact products, so that a row computes the same in a window of
-//! several rows as alone and the texts can be compared:
+//! with exact products (the fast kernels are held to the same in
+//! `qwen35_windows.rs`, `qwen35_device_runtime.rs` and the server's
+//! `tests/real.rs`): a row computes the same in a window of several rows as
+//! alone, and the texts can be compared:
 //!
 //! - the text with the model's own drafts is the text without them, for
 //!   the most probable token and for sampled tokens (same seed);

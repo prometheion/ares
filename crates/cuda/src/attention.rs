@@ -87,6 +87,9 @@
 //!   a scale per group once per block; the sum of a group is scaled once. For the output
 //!   every lane holds 8 values of every vector and adds weight times code times scale in
 //!   f32, one cell after the other. Three blocks of four warps per multiprocessor.
+//!   The rows of a [`Planner::window`] never run on it: a row of a draft window must
+//!   compute as the row alone does, and a window of rows has no kernel with this
+//!   arithmetic that reads the cells once.
 //! - **Tensor cores** (`kernels/attn_kernel.cuh`), for everything else: exact entries, an
 //!   `f16` format, more than 8 vectors. K and V of a chunk of 32 cells (16 for the wide
 //!   kernel) are copied raw from global memory by `cp.async`, decoded to f16 tiles in
