@@ -5,8 +5,8 @@ Updated 2026-11-16, `main` at the exact draft windows of the 27B (230 commits ah
 This file is brought up to date at every merge into `main`. It lists work, defects and
 measurements that are owed; what a feature must do in detail is in
 [`reference/feature-checklist.md`](reference/feature-checklist.md) (223 rows: 68 done,
-42 partly, 90 not started, 23 outside the frame; its rows K01, K02 and K06 still say
-"not started" although reasoning is built).
+42 partly, 90 not started, 23 outside the frame; its rows K01, K02, K06 and P14 are out
+of date: reasoning is built, and `q7` to `q4` run in the 27B).
 
 Order of work the owner has set: CUDA complete for both models first, Vulkan parity last.
 
@@ -67,6 +67,9 @@ with it; the runs are too noisy to tell the two apart.
 - [ ] A log line when the tier shrinks.
 
 ### Cache, tests, kernels
+- [ ] K and V in `q7` to `q4` for this model (it takes `f16` and `q8`; the smaller formats
+      need the pool of exact entries and the tile conversion the 27B has). At 13.9 MiB per
+      1000 tokens in `q8`, a context of 131072 holds 1.8 GiB that could be expert slots.
 - [ ] Prefix cache for this model (it has none), with the RAM and SSD levels.
 - [ ] Device tests that do not depend on machine load
       (`steps_wider_than_eight_rows_match_the_reference`,
