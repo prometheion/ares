@@ -529,6 +529,20 @@ impl Feed {
                 self.store.fill(at, &order)?;
             }
         }
+        self.settle()?;
+        let after = self.store.reader().stats();
+        let stats = self.store.take_stats();
+        Ok(Fill {
+            uploads: stats.uploads,
+            read_bytes: after.prefetch.device_bytes + after.demand.device_bytes
+                - before.prefetch.device_bytes
+                - before.demand.device_bytes,
+            time: started.elapsed(),
+        })
+    }
+
+    /// Lets the store work until nothing moves any more.
+    fn settle(&mut self) -> Result<(), Error> {
         let progress =
             |store: &ExpertStore<CudaSlots>| (store.stats().uploads, store.stats().demand_reads);
         let mut last = (progress(&self.store), Instant::now());
@@ -539,15 +553,23 @@ impl Feed {
                 last = (now, Instant::now());
             }
         }
-        let after = self.store.reader().stats();
-        let stats = self.store.take_stats();
-        Ok(Fill {
-            uploads: stats.uploads,
-            read_bytes: after.prefetch.device_bytes + after.demand.device_bytes
-                - before.prefetch.device_bytes
-                - before.demand.device_bytes,
-            time: started.elapsed(),
-        })
+        Ok(())
+    }
+
+    /// Brings the experts of the draft block into the tiers as far as its
+    /// slots go, before the first step: the block's router runs for every
+    /// link of a chain, and the first chains of a server decide what the
+    /// conductor takes a link to cost. No step may run meanwhile.
+    pub(super) fn fill_draft(&mut self, n_experts: usize) -> Result<(), Error> {
+        if self.draft.is_none() {
+            return Ok(());
+        }
+        let (vram, ram) = self.store.slots(0);
+        let order: Vec<u32> = (0..(vram + ram).min(n_experts) as u32).collect();
+        self.store.fill(0, &order)?;
+        self.settle()?;
+        self.store.take_stats();
+        Ok(())
     }
 
     /// A step of `rows` rows begins: its routers have not run.

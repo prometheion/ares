@@ -1060,6 +1060,7 @@ impl Qwen4Exp {
                 feed.set_read_ahead(self.opts.read_ahead);
                 if let Some(board) = build.draft_board.clone() {
                     feed.set_draft(board);
+                    feed.fill_draft(c.experts.count).map_err(model_error)?;
                 }
                 let ngram = NgramFeed::open(&self.gguf, c, self.opts.row_cache, o.max_slots)
                     .map_err(model_error)?;

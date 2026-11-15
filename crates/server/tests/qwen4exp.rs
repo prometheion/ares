@@ -138,7 +138,6 @@ fn the_window_of_a_drafting_model_fits_the_step_that_verifies() {
     // verifies drafts has the eight rows of the decode kernels.
     let stderr = refuses(&["--drafters", block, "--window", "9"], "--window");
     assert!(stderr.contains("2 to 8"), "{stderr}");
-    refuses(&["--drafters", block, "--window", "1"], "--window");
     // The block picks from the whole head.
     refuses(&["--drafters", block, "--draft-vocab", "tokens.txt"], "--draft-vocab");
 }

@@ -26,6 +26,7 @@ use ares_model::qwen4exp::synthetic::{NgramShape, Shape, Synthetic, Types};
 use ares_model::qwen4exp::{
     Config, DraftState, DraftWeights, LogitRows, Reference, SequenceState, Weights,
 };
+use ares_runtime::expert_store::Serve;
 use ares_runtime::{
     ContextSpec, DeviceContext, DeviceModel, GpuConfig, LinkSpec, Model, ModelError, PrefixCache,
     Runtime, RuntimeConfig, Split,
@@ -1153,4 +1154,115 @@ fn reference_gap(seed: u64, prompt: &[u32], written: &[u32], a: u32, b: u32) -> 
         (logits.iter().map(|l| (l - mean).powi(2)).sum::<f32>() / logits.len() as f32).sqrt();
     let largest = logits.iter().copied().fold(f32::MIN, f32::max);
     [logits[a as usize], logits[b as usize], largest, spread]
+}
+
+/// `<|im_start|>user\nErkläre in drei Sätzen, warum der Himmel blau
+/// ist.<|im_end|>\n<|im_start|>assistant\n`, as tokens of Flash-Next, and the
+/// four tokens the CPU reference and Strata continue with
+/// (`tests/qwen4exp_real.rs`).
+const FLASH_PROMPT: [u32; 22] = [
+    248045, 846, 198, 18871, 10248, 45125, 303, 55593, 326, 179212, 11, 183857, 2607, 199908,
+    242880, 5810, 13, 248046, 198, 248045, 74455, 198,
+];
+const FLASH_CONTINUATION: [u32; 4] = [248068, 198, 760, 1156];
+
+/// The runtime over the real model on both cards (or the one there is), with
+/// every miss uploaded and none computed by the CPU, whose arithmetic is not
+/// the device's: what a row computes then does not depend on where its
+/// experts were found. With `draft` the model drafts with that block, in
+/// windows of four rows whose price is learned from the steps that run.
+fn start_flash(
+    path: &std::path::Path,
+    draft: Option<&std::path::Path>,
+) -> (Runtime, Arc<Qwen4Exp>) {
+    let placement = if device_count().expect("the CUDA driver") >= 2 {
+        Placement::Shared
+    } else {
+        Placement::One
+    };
+    let devices = open_devices(placement);
+    let gguf = Gguf::open(path).unwrap();
+    let n_layer = Config::from_gguf(&gguf).unwrap().n_layer;
+    let mut opts = options(placement, n_layer, 16, MAX_ROWS, MAX_ROWS);
+    opts.serve = Serve::Stream;
+    opts.reserve = None;
+    opts.spread = if placement == Placement::Shared { Spread::Auto } else { Spread::Layers };
+    let mut inner =
+        Qwen4Exp::new(gguf, byte_tokenizer(None), "made", &devices, opts, CELLS).unwrap();
+    if let Some(draft) = draft {
+        inner = inner.with_draft(Gguf::open(draft).unwrap()).expect("the draft block fits");
+    }
+    let inner = Arc::new(inner);
+    let config = RuntimeConfig {
+        pages: 16,
+        cells_per_page: 128,
+        max_slots: SLOTS,
+        window_rows: if draft.is_some() { 4 } else { 1 },
+        warm_up: false,
+        ..RuntimeConfig::default()
+    };
+    let model: Arc<dyn Model> = Arc::new(Made(inner.clone()));
+    let mut gpu = GpuConfig::new(&config, &*model);
+    // A small tier in RAM: what has no slot in VRAM is read from the file.
+    gpu.ram_limit += 1 << 30;
+    gpu.vram_headroom = 512 << 20;
+    (Runtime::start_gpu(model, devices, config, gpu).expect("the runtime starts"), inner)
+}
+
+/// On the real model drafts change no token: Flash-Next writes with its draft
+/// block, token for token, what it writes without, greedy and sampled with a
+/// seed, and the block's drafts are accepted. The CPU serves no miss in either
+/// run (see [`start_flash`]), so the comparison is not one of two arithmetics.
+/// Needs `ARES_TEST_QWEN4EXP_MODEL` and `ARES_TEST_QWEN4EXP_DRAFT`.
+#[test]
+fn flash_next_writes_with_drafts_what_it_writes_without() {
+    if !enabled() {
+        return;
+    }
+    let (Some(path), Some(draft)) = (
+        std::env::var_os("ARES_TEST_QWEN4EXP_MODEL").map(PathBuf::from),
+        std::env::var_os("ARES_TEST_QWEN4EXP_DRAFT").map(PathBuf::from),
+    ) else {
+        eprintln!(
+            "skipped: set ARES_TEST_QWEN4EXP_MODEL to the first part of Flash-Next and \
+             ARES_TEST_QWEN4EXP_DRAFT to the file of its draft block"
+        );
+        return;
+    };
+    let seeded = Sampling { temperature: Some(0.8), seed: Some(5), ..Sampling::default() };
+    let (runtime, model) = start_flash(&path, None);
+    let plain = ask(&runtime, 1, &FLASH_PROMPT, 64);
+    let (plain_seeded, _) = ask_sampled(&runtime, 2, &FLASH_PROMPT, 48, seeded.clone(), true);
+    let stats = model.take_store_stats().expect("the parts are open");
+    runtime.shutdown();
+    drop(model);
+    assert_eq!(stats.cpu_experts, 0, "the CPU computed experts: {stats:?}");
+    assert_eq!(plain[..4], FLASH_CONTINUATION, "the reference's first tokens");
+
+    let (runtime, model) = start_flash(&path, Some(&draft));
+    let drafted = ask(&runtime, 1, &FLASH_PROMPT, 64);
+    let (sampled, _) = ask_sampled(&runtime, 2, &FLASH_PROMPT, 48, seeded, true);
+    let stats = model.take_store_stats().expect("the parts are open");
+    let counters = runtime.snapshot().expect("the runtime is running").counters;
+    let times = model.draft_times();
+    runtime.shutdown();
+    eprintln!(
+        "RES Flash-Next: {} and {} tokens; draft rows {}, accepted {}, rejected {}; the block \
+         made {} links in {} steps, {:.2} ms a link; verified per link {:?}, accepted {:?}",
+        plain.len(),
+        plain_seeded.len(),
+        counters.draft_rows,
+        counters.drafts_accepted,
+        counters.drafts_rejected,
+        times.links,
+        times.chain_steps,
+        times.chain_ms / times.links.max(1) as f64,
+        times.offered,
+        times.accepted,
+    );
+    assert_eq!(stats.cpu_experts, 0, "the CPU computed experts: {stats:?}");
+    assert!(times.accepted[0] > 0, "none of the block's drafts was accepted: {times:?}");
+    assert!(counters.drafts_rejected > 0, "no draft was rejected");
+    assert_eq!(drafted, plain, "drafts changed a greedy reply of Flash-Next");
+    assert_eq!(sampled, plain_seeded, "drafts changed a sampled reply of Flash-Next");
 }
