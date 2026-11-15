@@ -1126,6 +1126,33 @@ fn engine(args: &Args, spread: &Spread, window: u32) {
                     c.own_draft_us as f64 / 1e3 / c.own_draft_links.max(1) as f64,
                 );
             }
+            if c.own_links_asked > 0 {
+                let by_p: Vec<String> = c
+                    .own_tested_by_p
+                    .iter()
+                    .zip(&c.own_accepted_by_p)
+                    .enumerate()
+                    .filter(|(_, (tested, _))| **tested > 0)
+                    .map(|(bin, (t, a))| format!("{:.2}: {a}/{t}", bin as f64 / 16.0))
+                    .collect();
+                println!(
+                    "RES {name} {how}: own links asked {}, not made {}; accepted of verified by \
+                     the drafter's probability (ranges of 1/16, from): {}",
+                    c.own_links_asked,
+                    c.own_links_cut,
+                    by_p.join(", ")
+                );
+            }
+            let prices = |table: &[(u32, f64)]| {
+                let shown: Vec<String> =
+                    table.iter().take(8).map(|(n, ms)| format!("{n}: {ms:.2}")).collect();
+                shown.join(", ")
+            };
+            println!(
+                "RES {name} {how}: prices now, ms by rows: {}; chain by links: {}",
+                prices(&snapshot.step_ms),
+                prices(&snapshot.chain_ms)
+            );
             let devices: Vec<String> = (0..snapshot.devices.len())
                 .map(|d| {
                     format!(

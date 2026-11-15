@@ -954,8 +954,8 @@ impl Part {
             }
             m.picked.record(stream)?;
             m.picked.synchronize()?;
-            for k in read..=j {
-                for (row, reach) in reach.iter_mut().enumerate().take(links[k].n as usize) {
+            for (k, link) in links.iter().enumerate().take(j + 1).skip(read) {
+                for (row, reach) in reach.iter_mut().enumerate().take(link.n as usize) {
                     *reach *= f64::from(draft_chance(chances, m.confidence(k as u32, row as u32)));
                 }
             }
