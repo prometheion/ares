@@ -55,6 +55,10 @@ const KEPT: usize = 5;
 /// chooses.
 pub const OLD: u64 = 256;
 
+/// A step that took more than this many times its price is late: other work
+/// on the machine, not the step. It says nothing about what a cell costs.
+const LATE: f64 = 2.0;
+
 /// What was measured of one count.
 #[derive(Clone, Debug)]
 struct Point {
@@ -265,14 +269,20 @@ impl PriceTable {
         if !ms.is_finite() || ms < 0.0 || load.rows == 0 {
             return;
         }
+        let expected = self.ms(load);
         // The rows' own price is what is left when the context is taken out.
         let own = ms - self.per_cell_ms() * load.cells as f64;
         self.rows.observe(load.rows, own.max(0.0));
         // The context term is fitted to the steps as they were: the fit has
         // rows and cells as separate terms, and tells them apart wherever
         // steps differ in both (a prompt's piece against a window deep in its
-        // context).
-        self.context.observe_load(load, ms);
+        // context). A late step is not one of them: the fit is of least
+        // squares, and a step ten times too long would be read as ten times
+        // the cost of its cells. The rows' own price forgets a late step by
+        // its rule; the fit never sees one.
+        if expected.is_none_or(|expected| ms <= LATE * expected) {
+            self.context.observe_load(load, ms);
+        }
     }
 
     /// The price of a step that carries `load`, or `None` before anything was
@@ -493,6 +503,31 @@ mod tests {
         // It is tried once it is old, and from then on it is chosen at its price.
         assert_eq!(chosen_at, Some(OLD));
         assert_eq!((curve.ms(4), curve.trial_ms(4)), (Some(29.0), Some(29.0)));
+    }
+
+    #[test]
+    fn late_steps_do_not_reach_the_context_term() {
+        let mut table = PriceTable::new();
+        for rows in [1, 8] {
+            table.measured(rows, 30.0 + f64::from(rows));
+        }
+        let truth = |load: Load| 30.0 + load.rows as f64 + 4e-6 * load.cells as f64;
+        // Steps at several depths, and every seventh is late by 250 ms.
+        let mut step = 0;
+        for _ in 0..12 {
+            for context in [0u64, 10_000, 50_000, 120_000, 200_000] {
+                for rows in [1u32, 8] {
+                    let load = Load::chunk(context, rows);
+                    step += 1;
+                    table.observe(load, truth(load) + if step % 7 == 0 { 250.0 } else { 0.0 });
+                }
+            }
+        }
+        assert!((table.per_cell_ms() - 4e-6).abs() < 4e-7, "{}", table.per_cell_ms());
+        for rows in [1, 8] {
+            let price = table.rows_ms(rows).unwrap();
+            assert!((price - (30.0 + f64::from(rows))).abs() < 0.5, "{rows} rows: {price}");
+        }
     }
 
     #[test]
