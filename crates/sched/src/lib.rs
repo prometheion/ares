@@ -21,12 +21,16 @@
 //!   for all rows, then on, so that a prompt fetches each expert once.
 //! - [`PriceTable`] is what a step costs by its rows, as a table (the weight
 //!   kernels take their rows in launches, so the price has edges), measured on
-//!   the devices at load and corrected by every step that runs, with a term
-//!   for the cells the rows read ([`StepTimeModel`] fits that term).
+//!   the devices at load and kept true by the steps that run (a late step
+//!   moves nothing, and a size that has not run for long is tried again), with
+//!   a term for the cells the rows read ([`StepTimeModel`] fits that term).
 //! - [`Acceptance`] is how often a drafter's drafts are accepted, per
 //!   position, for a sequence, starting from what the engine has seen.
 //!   [`choose`] picks, for the whole step, whose drafts go into each
 //!   sequence's window and how many, by the expected tokens per millisecond.
+//!   [`Confidence`] is how often a draft is accepted by the probability its
+//!   drafter gave it, and [`need`] the bar a chain is cut by as it is made:
+//!   the same rule, with the chances of the drafts it has.
 //! - [`LookupCorpus`] and [`LookupDrafter`] propose drafts by continuing the
 //!   longest earlier occurrence of the current text, in any sequence: one
 //!   suffix automaton over everything the engine has read and written, with
@@ -39,6 +43,7 @@
 //!   a copy of the counters.
 
 mod admission;
+mod confidence;
 mod draft;
 mod lookup;
 mod pass;
@@ -49,11 +54,12 @@ mod timing;
 mod window;
 
 pub use admission::{Admission, AdmissionConfig, Arrival, Claims, ExceedsPool, Outcome, PoolView};
+pub use confidence::{BINS as CONFIDENCE_BINS, Confidence, links_made, need};
 pub use draft::{Acceptance, BELIEF};
 pub use lookup::{LookupConfig, LookupCorpus, LookupDrafter, LookupMatch};
 pub use pass::{Pass, PassStep, Point, pass_rows_between, runs_as_pass};
 pub use plan::{Limits, Part, PartKind, Plan, Request, SeqId, Want, plan};
-pub use price::{Curve, PriceTable};
+pub use price::{Curve, OLD as PRICE_OLD, PriceTable};
 pub use share::{Pending, Share, Turn};
 pub use timing::{Load, StepCost, StepTimeModel};
-pub use window::{Choice, Offer, Prices, Wish, choose};
+pub use window::{Choice, Offer, Prices, Wish, choose, rate};

@@ -131,6 +131,16 @@ pub fn choose(wishes: &[Wish<'_>], prices: &Prices<'_>) -> Vec<Choice> {
         .collect()
 }
 
+/// The rate a choice is expected to have, in tokens per millisecond of the
+/// whole step: what [`choose`] maximised. For whoever decides something else
+/// by the same rule (a drafter that ends its chain where one more link would
+/// lower this, see [`need`](crate::need)).
+pub fn rate(wishes: &[Wish<'_>], prices: &Prices<'_>, choices: &[Choice]) -> f64 {
+    let assigned: Vec<Option<usize>> = choices.iter().map(|c| c.drafter).collect();
+    let drafts: Vec<u32> = choices.iter().map(|c| c.drafts).collect();
+    score(wishes, prices, &assigned, &drafts)
+}
+
 /// The rate of the step if each sequence `i` verifies `drafts[i]` drafts of
 /// the drafter `assigned[i]`: the tokens it is expected to give over the time
 /// of the step and of the chains.
@@ -443,6 +453,20 @@ mod tests {
         assert_eq!(choose(&wishes, &prices), [Choice { drafter: Some(LOOKUP), drafts: 3 }]);
         let prices = Prices { spare_rows: 1, ..prices };
         assert_eq!(choose(&wishes, &prices)[0].drafts, 1);
+    }
+
+    #[test]
+    fn the_rate_of_a_choice_is_its_tokens_over_its_time() {
+        let price = step(25.0, 0.5, 0.0);
+        let chain = |_: usize, links: u32| 1.5 * f64::from(links);
+        let chances = [0.8, 0.5];
+        let offers = [Offer { drafter: CHAIN, chances: &chances }];
+        let wishes = [Wish { reads: 0, offers: &offers }];
+        let prices = Prices { step: &price, chain: &chain, spare_rows: 7 };
+        // Two drafts: 1 + 0.8 + 0.4 tokens in 26.5 ms of step and 3 of chain.
+        let two = [Choice { drafter: Some(CHAIN), drafts: 2 }];
+        assert!((rate(&wishes, &prices, &two) - 2.2 / 29.5).abs() < 1e-12);
+        assert!((rate(&wishes, &prices, &[NONE]) - 1.0 / 25.5).abs() < 1e-12);
     }
 
     #[test]
