@@ -190,6 +190,7 @@ name = "ares-store"
 version = "0.0.1"
 dependencies = [
  "ares-state",
+ "libc",
  "thiserror",
 ]
 

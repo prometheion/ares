@@ -9,6 +9,8 @@ repository.workspace = true
 
 [dependencies]
 ares-state.workspace = true
+# O_DIRECT.
+libc.workspace = true
 thiserror.workspace = true
 
 [lints]
