@@ -25,6 +25,10 @@
 //! | `metadata`, `service_tier` | bookkeeping: accepted, without effect |
 //! | `cache_control`, on the body and on blocks and tools | accepted, without effect: see below |
 //!
+//! A sampling field the request leaves out takes the default of its model,
+//! also the fields this API has no member for, and `max_tokens` is held to
+//! the most the model allows, as on the chat route (the `defaults` module).
+//!
 //! Blocks of a user turn: `text`, and `tool_result` (with a string or text
 //! blocks), which becomes a message of the role `tool` where it stands. Blocks
 //! of an assistant turn: `text`, `thinking`, `redacted_thinking` and

@@ -86,6 +86,14 @@
 //! server does not have (probabilities of tokens, results of tools it does
 //! not run, images) and are refused by name.
 //!
+//! **What was applied.** A response says back `temperature`, `top_p` and
+//! `max_output_tokens`. Here they are what the request ran with: its own
+//! value, or the model's default where it left the member out (`null` where
+//! the model has none and the engine's own value held), and for
+//! `max_output_tokens` the limit the reply has, which is the model's when
+//! the request named none or more than the model allows (the `defaults`
+//! module).
+//!
 //! **`truncation`.** `disabled` is what the server does: an input that does
 //! not fit the context is an error (`context_length_exceeded`). `auto` would
 //! drop items from a conversation, which the server does not do.
