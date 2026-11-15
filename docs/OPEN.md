@@ -1,6 +1,7 @@
 # What is still open
 
-Updated 2026-11-15, `main` at 35f152c (207 commits ahead of `origin/main`, nothing pushed).
+Updated 2026-11-15, `main` at the draft block of Flash-Next (218 commits ahead of `origin/main`,
+nothing pushed).
 This file is brought up to date at every merge into `main`. It lists work, defects and
 measurements that are owed; what a feature must do in detail is in
 [`reference/feature-checklist.md`](reference/feature-checklist.md) (223 rows: 68 done,
@@ -14,8 +15,7 @@ Order of work the owner has set: CUDA complete for both models first, Vulkan par
 | Piece | State |
 | --- | --- |
 | Elastic host memory (`moe/elastic-ram`) | built; being put on top of the SSD cache (conflicts in six files); then my verification |
-| Draft block of Flash-Next (`moe/draft-head`) | built and exact, gives no speed yet; my verification is running; merge only if the default without a drafter is unchanged |
-| Exact draft windows of the 27B (`dense/exact-windows`) | built, rebased; my verification is queued |
+| Exact draft windows of the 27B (`dense/exact-windows`) | built, rebased; my verification is running |
 | Server defaults for sampling and reply length (R23, R25) | agent working |
 | Image input | design study running (read only) |
 | Test file `Qwen3.8-Flash-Next-UD-Q4_K_XL` (104 GiB) | downloading to `/mnt/data/ares-models`, 19 GiB so far, slow |
@@ -23,6 +23,9 @@ Order of work the owner has set: CUDA complete for both models first, Vulkan par
 ## Qwen3.8 Flash-Next (`qwen4exp`)
 
 ### Speculation that pays (output unchanged)
+The draft block is in `main` (`--drafters <file>`): exact, and no faster yet. Measured
+2026-11-15 on two cards with `--ram 8G` under load: 13 to 41 tokens/s without it and 10 to 41
+with it; the runs are too noisy to tell the two apart.
 - [ ] Window prices that follow the tiers: measured warm, re-measured, stale sizes tried
       again. Today they are measured once at load on cold tiers, so no window is chosen on
       two cards. The same defect lets a late step poison the 27B's price table under CPU load.
