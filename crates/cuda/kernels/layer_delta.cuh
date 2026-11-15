@@ -24,6 +24,10 @@
 // outputs, for the segments that are not direct.
 //
 // The state is f32 or f16 in memory (ST); the arithmetic is f32 either way.
+// With f16 in memory the matrix is rounded to f16 after every row, in the
+// registers too: a step of one row stores the rounded matrix and the next
+// step loads it, and the rows of a window, a prompt or a commit must go on
+// from the same values, or a row would depend on the step it was computed in.
 #pragma once
 
 #include "common.cuh"
@@ -49,6 +53,17 @@ static __device__ __forceinline__ void ares_delta_store4(__half* p, float4 v) {
     raw.x = *reinterpret_cast<const uint32_t*>(&a);
     raw.y = *reinterpret_cast<const uint32_t*>(&b);
     *reinterpret_cast<uint2*>(p) = raw;
+}
+
+// The values as the state holds them between two rows: themselves for f32,
+// rounded to f16 for f16 (what a store and a load would give).
+static __device__ __forceinline__ float4 ares_delta_held(const float*, float4 v) {
+    return v;
+}
+static __device__ __forceinline__ float4 ares_delta_held(const __half*, float4 v) {
+    const float2 a = __half22float2(__floats2half2_rn(v.x, v.y));
+    const float2 b = __half22float2(__floats2half2_rn(v.z, v.w));
+    return make_float4(a.x, a.y, b.x, b.y);
 }
 
 // DK: head width d (k and v heads have the same width), LPR: lanes per row of S,
@@ -187,6 +202,10 @@ static __device__ __forceinline__ void ares_delta_body(const AresStep* step, con
                     s[j].z = fmaf(decay, s[j].z, k4.z * d);
                     s[j].w = fmaf(decay, s[j].w, k4.w * d);
                 }
+            }
+#pragma unroll
+            for (int j = 0; j < PER_LANE; j++) {
+                s[j] = ares_delta_held(row_state, s[j]);
             }
         }
         if (WINDOW) {
