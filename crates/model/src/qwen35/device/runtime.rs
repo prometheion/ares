@@ -586,10 +586,19 @@ impl DeviceModel for Qwen35Device {
             // rows of a window are wanted, so the sampler rows of a window
             // are consecutive; `wanted` counts the wanted rows before it.
             self.chains.clear();
+            let mut bar = 0;
             for (i, segment) in self.segments.iter().enumerate() {
                 if !record.own_drafts(i as u32) || segment.n_rows < 2 {
                     continue;
                 }
+                // The bars of the window's links, when the record has them.
+                let links = segment.n_rows - 1;
+                let needs = if record.draft_bars() >= bar + links {
+                    (bar..bar + links).map(|k| record.draft_need(k)).collect()
+                } else {
+                    Vec::new()
+                };
+                bar += links;
                 let wanted: u32 = (0..record.runs())
                     .map(|r| record.run(r))
                     .map(|(first, count)| segment.row0.clamp(first, first + count) - first)
@@ -600,11 +609,13 @@ impl DeviceModel for Qwen35Device {
                     rows: (0..segment.n_rows - 1)
                         .map(|j| record.sampler(wanted + j).for_draft())
                         .collect(),
+                    needs,
                 });
             }
             self.part.draft_step(DraftStep {
                 tokens: step.record_on_device.offset(record.tokens_offset()),
                 chains: std::mem::take(&mut self.chains),
+                chances: record.draft_chances(),
             })?;
         }
         let exchange = LinkExchange { links: step.links, index: step.index, stream: step.stream };
@@ -635,6 +646,10 @@ impl DeviceModel for Qwen35Device {
 
     fn own_drafts(&self) -> Option<OwnDrafts> {
         self.part.drafted().map(|d| OwnDrafts { ptr: d.ptr, tokens: d.tokens })
+    }
+
+    fn own_draft_probs(&mut self, out: &mut Vec<f32>) {
+        self.part.draft_probs(out);
     }
 
     fn own_draft_ms(&mut self) -> f64 {

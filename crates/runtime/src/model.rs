@@ -361,6 +361,14 @@ pub trait DeviceModel: Send {
     fn own_draft_ms(&mut self) -> f64 {
         0.0
     }
+
+    /// The probability the part's drafter gave each draft of the step that ran
+    /// last, in the order of [`DeviceModel::own_drafts`], appended to `out`:
+    /// as many as there are drafts, or none from a drafter that does not
+    /// report them. A link that was not made (the chain ended before it) is
+    /// NaN, and its draft is not a draft whatever the device holds there.
+    /// Asked after the step has ended.
+    fn own_draft_probs(&mut self, _out: &mut Vec<f32>) {}
 }
 
 /// An architecture.

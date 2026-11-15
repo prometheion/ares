@@ -13,7 +13,11 @@
 //!   settings and the noise of the row that will verify it, and is written
 //!   straight into the token array of the step record, where the embedding of
 //!   the verify window reads it, and into a list the host reads at the end of
-//!   the step together with the picks.
+//!   the step together with the picks. The host reads every link's picks as
+//!   well, for the probability the block gave each draft; where the step's
+//!   draft bars may end a chain it waits for them before it enqueues the next
+//!   link, and a link that is not made costs nothing (its rows of the verify
+//!   window get the last draft again, and the host is told they are none).
 //! - **Following the model**, after its blocks. The block's keys and values
 //!   at a position depend on that position's token and the model's hidden
 //!   state of the position before only, so for every row of the step they are
@@ -40,7 +44,7 @@ use ares_cuda::{
     PinnedBuffer, Planner, PrefillPath, SampleBatch, SamplePlan, SamplerKernels, Segment, StepDims,
     StepRecord,
 };
-use ares_runtime::ModelError;
+use ares_runtime::{DraftChances, ModelError, draft_chance};
 use ares_sampler::{SamplePick, SampleRow};
 
 use super::super::load::{DeviceWeights, DraftW, MixerW};
@@ -65,6 +69,9 @@ pub struct DraftChain {
     /// How the rows that verify the drafts are sampled, one per draft: link
     /// `j` of the chain and row `j` of the window pick the same position.
     pub rows: Vec<SampleRow>,
+    /// The reach the chain needs for each link to be made (the step record's
+    /// draft bars); empty for a chain that makes every link.
+    pub needs: Vec<f32>,
 }
 
 /// What the block drafts in the coming step.
@@ -74,6 +81,9 @@ pub struct DraftStep {
     /// the drafts into it.
     pub tokens: DevicePtr,
     pub chains: Vec<DraftChain>,
+    /// The chance of a draft by its probability, which the reach of a chain
+    /// is made of; `None` when the chains make every link.
+    pub chances: Option<DraftChances>,
 }
 
 /// Where a step left the tokens it drafted: `tokens` u32 on the device, the
@@ -247,6 +257,14 @@ pub(super) struct Mtp {
     /// in `records` (link 0 embeds them); null when it staged none.
     newest: DevicePtr,
     drafted: u32,
+    /// The picks of every link of the step, as the device copies them out,
+    /// and the event behind the newest copy.
+    picks_host: PinnedBuffer,
+    picked: Event,
+    /// The links the chains of the step made, and where the host's list has
+    /// the draft of each row of each link: `(link, row, place)`.
+    made: u32,
+    layout: Vec<(u32, u32, u32)>,
     clock: Clock,
     times: DraftTimes,
     step_scratch: u64,
@@ -378,6 +396,10 @@ impl Mtp {
             follow_rows: 0,
             newest: DevicePtr::NULL,
             drafted: 0,
+            picks_host: PinnedBuffer::new(device, (links * rows) as usize * SamplePick::BYTES)?,
+            picked: Event::new(device)?,
+            made: 0,
+            layout: Vec::new(),
             clock,
             times: DraftTimes::default(),
             step_scratch,
@@ -386,6 +408,18 @@ impl Mtp {
 
     fn at(&self, offset: u64) -> DevicePtr {
         self.scratch.ptr().offset(offset)
+    }
+
+    /// How sure link `link` was of the pick of its row `row`. The copy of the
+    /// link's picks has run.
+    fn confidence(&self, link: u32, row: u32) -> f32 {
+        let at = (link as usize * self.max_chains as usize + row as usize) * SamplePick::BYTES;
+        // SAFETY: the buffer holds a record for every row of every link, and
+        // the device is not writing this one any more.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(self.picks_host.as_ptr().add(at), SamplePick::BYTES)
+        };
+        SamplePick::from_bytes(bytes).confidence()
     }
 
     /// Adds the events of the last step to the times. The step has run.
@@ -511,6 +545,18 @@ impl Part {
     pub fn drafted(&self) -> Option<Drafted> {
         let m = self.mtp.as_ref()?;
         (m.drafted > 0).then(|| Drafted { ptr: m.at(m.s.drafts), tokens: m.drafted })
+    }
+
+    /// The probability the block gave each draft of the step that ran last,
+    /// in the order of [`Part::drafted`], appended to `out`; NaN for a link
+    /// that was not made. The step has ended.
+    pub fn draft_probs(&self, out: &mut Vec<f32>) {
+        let Some(m) = self.mtp.as_ref().filter(|m| m.drafted > 0) else { return };
+        let from = out.len();
+        out.resize(from + m.drafted as usize, f32::NAN);
+        for &(link, row, place) in m.layout.iter().filter(|(link, ..)| *link < m.made) {
+            out[from + place as usize] = m.confidence(link, row);
+        }
     }
 
     /// The block's exact K/V entries (its cells are in them while their tile is
@@ -678,8 +724,11 @@ impl Part {
     fn draft_chains(&mut self, env: &StepEnv<'_>, m: &mut Mtp) -> Result<(), ModelError> {
         m.flush_clock()?;
         m.clock.last_chain_ms = 0.0;
-        let step =
-            m.pending.take().unwrap_or(DraftStep { tokens: DevicePtr::NULL, chains: Vec::new() });
+        let step = m.pending.take().unwrap_or(DraftStep {
+            tokens: DevicePtr::NULL,
+            chains: Vec::new(),
+            chances: None,
+        });
         let stream = env.stream;
         let geo = m.at.geo;
 
@@ -838,6 +887,8 @@ impl Part {
         };
         m.follow_rows = follow_rows;
         m.drafted = total;
+        m.made = links.len() as u32;
+        m.layout.clear();
         // SAFETY: the pinned buffer is not written again before the next
         // step's records, which are written after this step has run; the
         // device buffer has its size.
@@ -862,10 +913,80 @@ impl Part {
                 self.d,
             )?;
         }
+        // The reach of each chain, in the order of the links' rows: the
+        // product of the chances of its drafts, as far as the host has read
+        // their picks.
+        let mut reach = vec![1.0f64; order.len()];
+        let lowest = step.chances.map(|c| f64::from(c.iter().copied().fold(1.0, f32::min)));
+        let pick_bytes = SamplePick::BYTES;
+        let mut read = 0;
         for (j, link) in links.iter().enumerate() {
             let next_tokens = links.get(j + 1).map_or(DevicePtr::NULL, |next| rec(next.tokens));
             self.draft_link(env, m, j as u32, link, step.tokens, next_tokens)?;
+            let at = j * m.max_chains as usize * pick_bytes;
+            // SAFETY: the host's buffer holds a record for every row of every
+            // link, like the device's, and is read when the copy has run.
+            unsafe {
+                stream.copy_to_host(
+                    m.picks_host.as_mut_ptr().add(at),
+                    m.at(m.s.picks + at as u64),
+                    link.n as usize * pick_bytes,
+                )?;
+            }
+            m.layout.extend(
+                (0..link.n).map(|row| (j as u32, row, first[order[row as usize]] + j as u32)),
+            );
+            let (Some(next), Some(chances), Some(lowest)) =
+                (links.get(j + 1), &step.chances, lowest)
+            else {
+                continue;
+            };
+            // The next link is made while a chain that has it reaches its
+            // bar. Whether one can miss it is known without the picks when
+            // even the least chance for every link not read yet leaves the
+            // reach above the bar: then nothing is waited for.
+            let need = |row: usize| {
+                f64::from(step.chains[order[row]].needs.get(j + 1).copied().unwrap_or(0.0))
+            };
+            let least = lowest.powi((j + 1 - read) as i32);
+            if (0..next.n as usize).any(|row| reach[row] * least >= need(row)) {
+                continue;
+            }
+            m.picked.record(stream)?;
+            m.picked.synchronize()?;
+            for k in read..=j {
+                for (row, reach) in reach.iter_mut().enumerate().take(links[k].n as usize) {
+                    *reach *= f64::from(draft_chance(chances, m.confidence(k as u32, row as u32)));
+                }
+            }
+            read = j + 1;
+            if (0..next.n as usize).all(|row| reach[row] < need(row)) {
+                m.made = j as u32 + 1;
+                break;
+            }
         }
+        // The rows of the links that were not made take the last draft of
+        // their chain again: a token the device has the embedding of. The
+        // host is told that they are no drafts.
+        let last = m.made as usize - 1;
+        for dead in &links[m.made as usize..] {
+            // SAFETY: as in `draft_link`; the picks of link `last` hold a
+            // record for each of the chains that are longer.
+            unsafe {
+                m.sampler.draft_put(
+                    stream,
+                    m.at(m.s.picks + (last * m.max_chains as usize * pick_bytes) as u64),
+                    dead.n,
+                    DevicePtr::NULL,
+                    0,
+                    step.tokens,
+                    rec(dead.record_rows),
+                    m.at(m.s.drafts),
+                    rec(dead.draft_at),
+                )?;
+            }
+        }
+        m.clock.links = u64::from(m.made);
         m.clock.chain[1].record(stream)?;
         self.mark(stream, Phase::Other)
     }

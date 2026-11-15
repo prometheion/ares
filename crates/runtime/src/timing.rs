@@ -266,6 +266,15 @@ pub struct Counters {
     pub own_draft_steps: u64,
     pub own_draft_links: u64,
     pub own_draft_us: u64,
+    /// Links the windows asked the model's own draft block for, and the links
+    /// it did not make of them because it ended a chain at its bar.
+    pub own_links_asked: u64,
+    pub own_links_cut: u64,
+    /// The model's own drafts that were verified, by the probability the
+    /// drafter gave them (the ranges of [`ares_sched::Confidence`]), and how
+    /// many of them were accepted.
+    pub own_tested_by_p: [u64; ares_sched::CONFIDENCE_BINS],
+    pub own_accepted_by_p: [u64; ares_sched::CONFIDENCE_BINS],
     /// Steps that carried prompt rows and generating rows together.
     pub mixed_steps: u64,
     /// Tokens delivered to requests (accepted picks).
@@ -435,6 +444,11 @@ pub struct Snapshot {
     pub requests: Vec<RequestReport>,
     /// What the warm-up measured; `None` for a runtime that ran none.
     pub calibration: Option<Calibration>,
+    /// What a step costs by its rows and the model's own draft chain by its
+    /// links now, `(count, milliseconds)`: the warm-up's tables as the steps
+    /// that ran have corrected them.
+    pub step_ms: Vec<(u32, f64)>,
+    pub chain_ms: Vec<(u32, f64)>,
     /// Why the level of the prefix cache on SSD is not in use although the
     /// engine was given a directory for it; `None` when it is in use or was
     /// not asked for.
@@ -469,6 +483,8 @@ impl Snapshot {
             waiting,
             requests: stats.requests.iter().copied().collect(),
             calibration: None,
+            step_ms: Vec::new(),
+            chain_ms: Vec::new(),
             ssd_problem: None,
         }
     }

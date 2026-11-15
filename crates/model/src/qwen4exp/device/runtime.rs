@@ -1478,6 +1478,7 @@ impl Qwen4ExpDevice {
         }
         self.segments.clear();
         self.chains.clear();
+        let mut bar = 0;
         for i in 0..record.segments() {
             if record.replay(i) {
                 return Err(invalid("the model has no prefix cache to replay from"));
@@ -1494,11 +1495,18 @@ impl Qwen4ExpDevice {
                         .map(|r| record.run(r))
                         .map(|(first, count)| segment.row0.clamp(first, first + count) - first)
                         .sum();
+                    // The bars of the window's links, when the record has them.
+                    let links = segment.n_rows - 1;
+                    let needs = if record.draft_bars() >= bar + links {
+                        (bar..bar + links).map(|k| record.draft_need(k)).collect()
+                    } else {
+                        Vec::new()
+                    };
+                    bar += links;
                     self.chains.push(Chain {
                         segment: i as usize,
-                        rows: (0..segment.n_rows - 1)
-                            .map(|j| record.sampler(wanted + j).for_draft())
-                            .collect(),
+                        rows: (0..links).map(|j| record.sampler(wanted + j).for_draft()).collect(),
+                        needs,
                     });
                 }
             }
@@ -1585,7 +1593,15 @@ impl Qwen4ExpDevice {
         // of the windows that take its drafts; the other device threads wait
         // for the drafts, which are rows of this step.
         if let Some(block) = &mut self.draft {
-            block.draft(stream, &self.flow, &self.segments, &mut self.tokens, &self.chains)?;
+            let chances = record.draft_chances();
+            block.draft(
+                stream,
+                &self.flow,
+                &self.segments,
+                &mut self.tokens,
+                &self.chains,
+                chances.as_ref(),
+            )?;
             let drafts: Vec<(u32, u32)> = drafted
                 .iter()
                 .enumerate()
@@ -1593,7 +1609,7 @@ impl Qwen4ExpDevice {
                 .map(|(row, _)| (row as u32, self.tokens[row]))
                 .collect();
             self.flow.publish(number, drafts);
-            block.keep(&self.segments, &self.tokens, &self.chains);
+            block.keep(&self.segments, &self.tokens);
         } else if !self.chains.is_empty() {
             for (row, token) in self.flow.await_drafts(number)? {
                 self.tokens[row as usize] = token;
@@ -1765,6 +1781,12 @@ impl DeviceModel for Qwen4ExpDevice {
 
     fn own_draft_ms(&mut self) -> f64 {
         self.draft.as_ref().map_or(0.0, DraftBlock::chain_ms)
+    }
+
+    fn own_draft_probs(&mut self, out: &mut Vec<f32>) {
+        if let Some(block) = self.draft.as_ref().filter(|block| block.drafted().is_some()) {
+            out.extend_from_slice(block.probs());
+        }
     }
 }
 

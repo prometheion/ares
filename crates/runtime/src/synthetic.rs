@@ -131,6 +131,10 @@ pub struct SyntheticConfig {
     /// draft the model itself would pick, given that the links before it did;
     /// the last number serves the links after it. Empty: every link is right.
     pub own_accuracy: Vec<f64>,
+    /// For the host executor: the probability its drafter reports for a draft
+    /// that is right and for one that is wrong. `None`: it reports none, and
+    /// makes every link it is asked for.
+    pub own_probability: Option<(f32, f32)>,
     pub seed: u64,
 }
 
@@ -163,6 +167,7 @@ impl SyntheticConfig {
             settle_cells: 0,
             own_drafts: 0,
             own_accuracy: Vec::new(),
+            own_probability: None,
             seed: 0x5eed,
         }
     }
@@ -434,6 +439,22 @@ impl SyntheticModel {
     /// hash of where it is falls under the link's accuracy, and another token
     /// when it does not. For the executors that stand in for a device.
     pub fn host_drafts(&self, token: u32, context: u32, position: u32, links: u32) -> Vec<u32> {
+        self.host_chain(token, context, position, links)
+            .into_iter()
+            .map(|(draft, _)| draft)
+            .collect()
+    }
+
+    /// [`SyntheticModel::host_drafts`] with the probability the drafter gives
+    /// each draft ([`SyntheticConfig::own_probability`]; NaN when it reports
+    /// none).
+    pub fn host_chain(
+        &self,
+        token: u32,
+        context: u32,
+        position: u32,
+        links: u32,
+    ) -> Vec<(u32, f32)> {
         let c = &self.config;
         let accuracy = |j: u32| {
             c.own_accuracy.get(j as usize).or(c.own_accuracy.last()).copied().unwrap_or(1.0)
@@ -447,7 +468,14 @@ impl SyntheticModel {
             h = (h ^ (h >> 33)).wrapping_mul(0xff51_afd7_ed55_8ccd) ^ c.seed;
             h = (h ^ (h >> 33)).wrapping_mul(0xc4ce_b9fe_1a85_ec53);
             let unit = (h >> 11) as f64 / (1u64 << 53) as f64;
-            drafts.push(if unit < accuracy(j) { truth } else { (truth + 1) % c.vocab() });
+            let right = unit < accuracy(j);
+            let p = c.own_probability.map_or(
+                f32::NAN,
+                |(sure, unsure)| {
+                    if right { sure } else { unsure }
+                },
+            );
+            drafts.push((if right { truth } else { (truth + 1) % c.vocab() }, p));
             (token, context) = (truth, self.context_of(truth, at));
         }
         drafts

@@ -67,6 +67,12 @@ pub struct StepOutput {
     /// The tokens the model drafted itself for the windows that asked for
     /// them, in the order of the record's segments, window after window.
     pub drafts: Vec<u32>,
+    /// The probability the drafter gave each of `drafts`, in the same order,
+    /// from a drafter that reports it; empty otherwise. A link that the
+    /// drafter did not make (it ended its chain there, see
+    /// [`RecordView::draft_need`](crate::record::RecordView::draft_need)) has
+    /// `u32::MAX` for its draft and no probability (NaN).
+    pub draft_probs: Vec<f32>,
     /// Device milliseconds the model's own drafter took.
     pub draft_ms: f64,
     /// What each device measured.

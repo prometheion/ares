@@ -869,7 +869,10 @@ fn drafts_are_as_long_as_they_pay_and_stop_at_the_edge_of_a_launch() {
     alone(&rt, "a hard text", Some(400));
     let l = lengths(&rt)[1];
     let windows: u64 = l.iter().sum();
-    assert!(windows > 100 && l[4..].iter().all(|n| *n == 0), "{l:?}");
+    // (A size that has not run for long is tried again, twice at most: the
+    // longer windows are those trials and no more.)
+    assert!(windows > 100 && l[4..].iter().all(|n| *n <= 2), "{l:?}");
+    assert!(l[4..].iter().sum::<u64>() * 20 < windows, "{l:?}");
 
     // One that is never right is tried a few times and then hardly at all, as
     // in the scheduler's test of the back-off with the same prices.
@@ -879,6 +882,162 @@ fn drafts_are_as_long_as_they_pay_and_stop_at_the_edge_of_a_launch() {
     let tries: u64 = c.draft_lengths[1].iter().sum();
     assert!((2..=20).contains(&tries), "{tries} windows with drafts: {c:?}");
     assert_eq!(c.drafts_accepted, 0, "{c:?}");
+}
+
+/// The rows of the windows the steps after the first `from` made.
+fn window_rows(steps: &Steps, from: usize) -> Vec<u32> {
+    steps.lock().unwrap()[from..].iter().filter(|s| s.windows > 0).map(|s| s.rows).collect()
+}
+
+#[test]
+fn late_steps_do_not_price_a_window_out() {
+    // The device of `launches`, on a machine that now and then does something
+    // else: the next `late` steps take a hundred times what they cost.
+    let late = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let steps: Steps = Arc::default();
+    let model = drafting_model(&[0.97], 64);
+    let config = RuntimeConfig { window_rows: 16, warm_up: true, ..config(true, 4096) };
+    let rt = runtime_with(&model, config, |e| {
+        let late = late.clone();
+        e.with_step_cost(move |rows| {
+            let hit =
+                late.try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1)).is_ok();
+            launches(rows) * if hit { 100 } else { 1 }
+        })
+        .with_link_cost(Duration::from_micros(300))
+        .without_sleeping()
+        .with_observer(watch(&steps))
+    });
+    // The policy settles on windows of the eight rows of a launch.
+    alone(&rt, "a long and easy text", Some(200));
+    let settled = steps.lock().unwrap().len();
+    assert_eq!(window_rows(&steps, settled - 10)[..8], [8; 8]);
+    // Three steps of eight rows in a row take 300 ms where they cost 3: the
+    // price of eight rows is the second smallest of its last five steps, so
+    // it has not moved, and every window after them is eight rows as before.
+    late.store(3, Ordering::Relaxed);
+    alone(&rt, "another long and easy text", Some(200));
+    assert_eq!(late.load(Ordering::Relaxed), 0);
+    let after = window_rows(&steps, settled);
+    assert!(
+        after.len() > 20 && after[..after.len() - 1].iter().all(|rows| *rows == 8),
+        "{after:?}"
+    );
+    let now = snapshot_of(&rt).step_ms;
+    let eight = now.iter().find(|(rows, _)| *rows == 8).map(|(_, ms)| *ms).expect("measured");
+    assert!((eight - launches_ms(8)).abs() < 1e-9, "{now:?}");
+}
+
+#[test]
+fn windows_priced_out_on_a_cold_start_are_tried_again_and_chosen_when_they_pay() {
+    // A device whose rows are dear while it is cold (9 ms a row on top of
+    // 3 ms: no draft pays for its row) and cost what `launches` says once it
+    // is warm. The warm-up measures it cold.
+    let warm = Arc::new(AtomicBool::new(false));
+    let steps: Steps = Arc::default();
+    let model = drafting_model(&[0.97], 64);
+    let config = RuntimeConfig { window_rows: 8, warm_up: true, ..config(true, 4096) };
+    let rt = runtime_with(&model, config, |e| {
+        let warm = warm.clone();
+        e.with_step_cost(move |rows| {
+            if warm.load(Ordering::Relaxed) {
+                launches(rows)
+            } else {
+                Duration::from_millis(3 + 9 * u64::from(rows))
+            }
+        })
+        .with_link_cost(Duration::from_micros(300))
+        .without_sleeping()
+        .with_observer(watch(&steps))
+    });
+    let cold = snapshot_of(&rt).calibration.expect("a warm-up").step_ms;
+    assert_eq!(cold[..3], [(1, 12.0), (2, 21.0), (3, 30.0)]);
+    let warm_up = steps.lock().unwrap().len();
+    warm.store(true, Ordering::Relaxed);
+    alone(&rt, "a long and easy text", Some(700));
+    // For as long as the windows' prices are current nothing is drafted: a
+    // row that costs 9 ms is not worth a draft. After 256 steps they are old
+    // and tried at the price of the one row that runs, and from the first
+    // trial on the windows are measured warm and chosen: the whole launch,
+    // once the drafts have shown how good they are.
+    let seen: Vec<Seen> = steps.lock().unwrap()[warm_up..].to_vec();
+    let first = seen.iter().position(|s| s.windows > 0).expect("a window");
+    assert_eq!(first, ares_sched::PRICE_OLD as usize + 1, "the first window");
+    let rows: Vec<u32> = seen[first..].iter().map(|s| s.rows).collect();
+    let full = rows.iter().position(|rows| *rows == 8).expect("a window of a whole launch");
+    assert!(full <= 12, "{rows:?}");
+    assert!(rows[full..rows.len() - 1].iter().all(|rows| *rows == 8), "{rows:?}");
+    // And the table says what the device costs now.
+    let now = snapshot_of(&rt).step_ms;
+    for rows in [1, 4, 8] {
+        let price = now.iter().find(|(n, _)| *n == rows).map(|(_, ms)| *ms).expect("measured");
+        assert!((price - launches_ms(rows)).abs() < 1e-9, "{rows} rows: {now:?}");
+    }
+}
+
+/// A model whose draft block is right six times in ten at every link and
+/// says so: 0.95 for a draft that is right and 0.15 for one that is wrong
+/// (`sure`), or nothing.
+fn unsure_drafts(sure: bool) -> (Run, ares_runtime::Snapshot) {
+    let model = model(|c| {
+        never_repeating(c);
+        c.own_drafts = 7;
+        c.own_accuracy = vec![0.6];
+        c.own_probability = sure.then_some((0.95, 0.15));
+        c.context_length = 2048;
+    });
+    // A step of 3 ms and 0.03 ms a row, a link of 0.3 ms: the chain is what
+    // a window costs.
+    let config = RuntimeConfig { window_rows: 8, warm_up: true, ..config(true, 4096) };
+    let rt = runtime_with(&model, config, |e| {
+        e.with_step_cost(launches).with_link_cost(Duration::from_micros(300)).without_sleeping()
+    });
+    let run = alone(&rt, "a text that is hard in places", Some(600));
+    (run, snapshot_of(&rt))
+}
+
+#[test]
+fn a_chain_ends_at_the_first_draft_its_drafter_is_unsure_of() {
+    let (plain, without) = unsure_drafts(false);
+    let (cut, with) = unsure_drafts(true);
+    assert_eq!(cut.text, plain.text, "the windows decide speed, not the text");
+    let (c, p) = (with.counters, without.counters);
+    // The model's own drafts that were made, and those of them that were
+    // accepted.
+    let made = |c: &ares_runtime::Counters| {
+        c.draft_lengths[1].iter().enumerate().map(|(len, n)| len as u64 * n).sum::<u64>()
+    };
+    let accepted = |c: &ares_runtime::Counters| c.drafts_accepted_at[1].iter().sum::<u64>();
+    // A draft given 0.15 starts in the range whose chance is 2.5 in 16, and
+    // a link pays when the chain reaches it with more than that (0.55 tokens
+    // per millisecond, 0.3 ms, drafts right 0.6 of the time: 0.28): the chain
+    // ends behind its first wrong draft, from the first window on. So a
+    // window has one draft that is not accepted at most, every draft given
+    // 0.95 was accepted and none given 0.15.
+    let windows: u64 = c.draft_lengths[1].iter().sum();
+    let wasted = made(&c) - accepted(&c);
+    assert!(windows > 100 && wasted <= windows, "{c:?}");
+    let (sure, unsure) = (15, 2);
+    assert_eq!(c.own_tested_by_p[sure], c.own_accepted_by_p[sure]);
+    assert_eq!((c.own_tested_by_p[unsure], c.own_accepted_by_p[unsure]), (wasted, 0));
+    assert_eq!(accepted(&c), c.own_accepted_by_p[sure]);
+    assert!(c.own_links_cut > 0, "{c:?}");
+    // The drafter that says nothing makes every link it is asked for, so a
+    // link is asked for only where the average draft pays for it; the one
+    // that ends its chains itself is asked for more, makes them where its
+    // drafts are sure, and gets more tokens out of a step.
+    assert_eq!((p.own_links_cut, p.own_tested_by_p), (0, [0; 16]));
+    let per_step = |c: &ares_runtime::Counters| c.tokens as f64 / c.steps as f64;
+    eprintln!("RES tokens per step {:.3} with the cut, {:.3} without", per_step(&c), per_step(&p));
+    assert!(per_step(&c) > 1.1 * per_step(&p), "{} {}", per_step(&c), per_step(&p));
+    // What a step costs is known exactly here (3 ms, 0.03 ms a row, and the
+    // chain): the same tokens take less time.
+    let ms = |c: &ares_runtime::Counters| {
+        c.steps as f64 * 3.0 + c.rows as f64 * 0.03 + c.own_draft_us as f64 / 1e3
+    };
+    assert_eq!(c.tokens, p.tokens);
+    eprintln!("RES {:.1} ms with the cut, {:.1} ms without", ms(&c), ms(&p));
+    assert!(ms(&c) < 0.95 * ms(&p), "{} ms with the cut, {} without", ms(&c), ms(&p));
 }
 
 #[test]

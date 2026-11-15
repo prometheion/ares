@@ -163,7 +163,8 @@ impl Rig {
         self.part
             .draft_step(DraftStep {
                 tokens: self.record.ptr().offset(off_tokens),
-                chains: vec![DraftChain { segment: 0, token, rows }],
+                chains: vec![DraftChain { segment: 0, token, rows, needs: Vec::new() }],
+                chances: None,
             })
             .unwrap();
         self.part.enqueue_drafts(&env).unwrap();

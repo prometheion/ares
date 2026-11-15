@@ -164,6 +164,7 @@ struct DeviceResult {
     logprobs: Vec<LogprobOut>,
     has_picks: bool,
     drafts: Vec<u32>,
+    draft_probs: Vec<f32>,
     draft_ms: f64,
     /// What this device made of the transfers of a batch, in their order: the
     /// bytes and the tag of its share, or `None` for one it could not carry
@@ -400,6 +401,7 @@ impl Executor for GpuExecutor {
         out.picks.clear();
         out.logprobs.clear();
         out.drafts.clear();
+        out.draft_probs.clear();
         out.draft_ms = 0.0;
         out.devices.clear();
         let mut have_picks = false;
@@ -429,6 +431,7 @@ impl Executor for GpuExecutor {
                 have_picks = true;
             }
             if !result.drafts.is_empty() {
+                out.draft_probs.extend_from_slice(&result.draft_probs);
                 out.drafts.extend_from_slice(&result.drafts);
             }
             out.draft_ms += result.draft_ms;
@@ -596,6 +599,7 @@ struct Worker {
     picks: Vec<Pick>,
     logprobs: Vec<LogprobOut>,
     drafts: Vec<u32>,
+    draft_probs: Vec<f32>,
     draft_ms: f64,
 }
 
@@ -683,6 +687,7 @@ fn worker_main(init: Init, ready: mpsc::Sender<Result<(), RuntimeError>>) {
                             std::mem::swap(&mut result.picks, &mut worker.picks);
                             std::mem::swap(&mut result.logprobs, &mut worker.logprobs);
                             std::mem::swap(&mut result.drafts, &mut worker.drafts);
+                            std::mem::swap(&mut result.draft_probs, &mut worker.draft_probs);
                             result.draft_ms = worker.draft_ms;
                         }
                         Err((cause, secondary)) => {
@@ -849,6 +854,7 @@ impl Worker {
             picks: Vec::with_capacity(max_rows as usize),
             logprobs: Vec::with_capacity(logit_rows as usize),
             drafts: Vec::with_capacity(max_rows as usize),
+            draft_probs: Vec::with_capacity(max_rows as usize),
             draft_ms: 0.0,
             device,
             stream,
@@ -1081,6 +1087,19 @@ impl Worker {
             let at = self.logit_rows as usize * SamplePick::BYTES;
             let bytes = &self.back[at..at + own.tokens as usize * 4];
             self.drafts.extend(bytes.as_chunks::<4>().0.iter().map(|b| u32::from_le_bytes(*b)));
+        }
+        // What the drafter says of its drafts: a link it did not make is no
+        // draft, whatever the device holds in its place.
+        self.draft_probs.clear();
+        self.model.own_draft_probs(&mut self.draft_probs);
+        if self.draft_probs.len() == self.drafts.len() {
+            for (draft, p) in self.drafts.iter_mut().zip(&self.draft_probs) {
+                if p.is_nan() {
+                    *draft = u32::MAX;
+                }
+            }
+        } else {
+            self.draft_probs.clear();
         }
         if produced {
             self.model.picked(&self.picks);

@@ -29,7 +29,11 @@
 //! embeddings and the rows of the n-gram table of the rows that verify the
 //! drafts. While it waits the thread serves the expert store, which brings the
 //! experts the block's router picked like those of any layer (the block is
-//! layer 0 of the store).
+//! layer 0 of the store). With the pick the host has the probability the
+//! block gave it, and a chain ends where the step's draft bars say one more
+//! link is not expected to pay: the links after it are not made, their rows
+//! of the window take the last draft again, and the runtime is told that they
+//! are no drafts.
 //!
 //! The block's pages are its own memory, addressed through the page tables
 //! the conductor gives the model: page `p` of a sequence holds the same cells
@@ -43,7 +47,7 @@ use ares_cuda::{
     Device, DeviceBuffer, DevicePtr, Event, MAX_BATCH, PinnedBuffer, SampleBatch, SamplePlan,
     SamplerKernels, Segment, StepRecord, Stream,
 };
-use ares_runtime::ModelError;
+use ares_runtime::{DraftChances, ModelError, draft_chance};
 use ares_sampler::{SamplePick, SampleRow};
 
 use super::board::Board;
@@ -79,6 +83,9 @@ pub(super) struct Chain {
     /// How the rows that verify the drafts are sampled, one per draft: link
     /// `j` and row `j` of the window pick the same position.
     pub rows: Vec<SampleRow>,
+    /// The reach the chain needs for each link to be made (the step record's
+    /// draft bars); empty for a chain that makes every link.
+    pub needs: Vec<f32>,
 }
 
 /// Where a row of a block step takes its residual from.
@@ -184,6 +191,11 @@ pub(super) struct DraftBlock {
     /// The drafts of the step, for the runtime to read with the picks.
     drafts: DeviceBuffer,
     n_drafts: u32,
+    /// The probability the block gave each draft of the step, in the order of
+    /// the drafts; NaN for a link that was not made. And the links each
+    /// window's chain made, by its segment.
+    probs: Vec<f32>,
+    made: Vec<(usize, u32)>,
     picked: Event,
     /// Recorded behind a step whose rows only wrote keys, and whether the
     /// device may still be running such a step: the host writes the block's
@@ -282,6 +294,8 @@ impl DraftBlock {
             drafts_host,
             drafts: DeviceBuffer::new(device, drafts_bytes)?,
             n_drafts: 0,
+            probs: Vec::new(),
+            made: Vec::new(),
             picked: Event::new(device)?,
             wrote: Event::new(device)?,
             writing: false,
@@ -407,9 +421,12 @@ impl DraftBlock {
         segments: &[Segment],
         tokens: &mut [u32],
         chains: &[Chain],
+        chances: Option<&DraftChances>,
     ) -> Result<(), ModelError> {
         self.n_drafts = 0;
         self.last_chain_ms = 0.0;
+        self.probs.clear();
+        self.made.clear();
         let drafting = |i: usize| chains.iter().any(|c| c.segment == i);
         // The newest cells of the sequences that do not draft.
         let begun = Instant::now();
@@ -442,7 +459,13 @@ impl DraftBlock {
         let mut order: Vec<usize> = (0..chains.len()).collect();
         order.sort_by_key(|&c| std::cmp::Reverse(chains[c].rows.len()));
         let n_links = chains[order[0]].rows.len();
-        let mut newest: Vec<u32> = Vec::with_capacity(order.len());
+        let mut newest: Vec<u32> = vec![0; chains.len()];
+        // Per chain: the product of the chances of its drafts, their
+        // probabilities, and its row in the link before.
+        let mut reach = vec![1.0f64; chains.len()];
+        let mut probs: Vec<Vec<f32>> = vec![Vec::new(); chains.len()];
+        let mut at = vec![0u32; chains.len()];
+        let mut links_run = 0u64;
         for &c in &order {
             let segment = segments
                 .get(chains[c].segment)
@@ -453,23 +476,32 @@ impl DraftBlock {
                     chains[c].rows.len()
                 )));
             }
-            newest.push(tokens[segment.row0 as usize]);
+            newest[c] = tokens[segment.row0 as usize];
         }
         for j in 0..n_links {
+            // A chain goes on while it has made every link so far and its
+            // reach is at the bar of the next.
+            let goes_on = |c: usize| {
+                let need = chains[c].needs.get(j).copied().unwrap_or(0.0);
+                probs[c].len() == j && (j == 0 || chances.is_none() || reach[c] >= f64::from(need))
+            };
             let live: Vec<usize> =
-                order.iter().copied().filter(|&c| chains[c].rows.len() > j).collect();
+                order.iter().copied().filter(|&c| chains[c].rows.len() > j && goes_on(c)).collect();
+            if live.is_empty() {
+                break;
+            }
+            links_run += 1;
             let rows: Vec<Row> = live
                 .iter()
-                .enumerate()
-                .map(|(row, &c)| {
+                .map(|&c| {
                     let s = &segments[chains[c].segment];
                     Row {
                         slot: s.slot,
                         // A window at the start of a sequence has no cell in
                         // front of it (the conductor's probes are such).
                         cell: (s.pos0 as u32).saturating_sub(1) + j as u32,
-                        token: newest[row],
-                        source: if j == 0 { Source::Carry } else { Source::Link(row as u32) },
+                        token: newest[c],
+                        source: if j == 0 { Source::Carry } else { Source::Link(at[c]) },
                     }
                 })
                 .collect();
@@ -485,8 +517,22 @@ impl DraftBlock {
             }
             for (row, &c) in live.iter().enumerate() {
                 let s = &segments[chains[c].segment];
-                tokens[(s.row0 + 1) as usize + j] = picks[row];
-                newest[row] = picks[row];
+                let (token, p) = picks[row];
+                tokens[(s.row0 + 1) as usize + j] = token;
+                newest[c] = token;
+                at[c] = row as u32;
+                probs[c].push(p);
+                if let Some(chances) = chances {
+                    reach[c] *= f64::from(draft_chance(chances, p));
+                }
+            }
+        }
+        // The rows of the links that were not made take the last draft of
+        // their chain again: any token serves, and nothing counts them.
+        for (c, chain) in chains.iter().enumerate() {
+            let s = &segments[chain.segment];
+            for j in probs[c].len()..chain.rows.len() {
+                tokens[(s.row0 + 1) as usize + j] = newest[c];
             }
         }
         for &c in &order {
@@ -494,13 +540,16 @@ impl DraftBlock {
         }
 
         // The drafts in the order of the step's segments, for the runtime.
-        let mut by_segment: Vec<&Chain> = chains.iter().collect();
-        by_segment.sort_by_key(|c| c.segment);
+        let mut by_segment: Vec<usize> = (0..chains.len()).collect();
+        by_segment.sort_by_key(|&c| chains[c].segment);
         let mut n = 0usize;
         let mut watch = self.watch.lock().unwrap_or_else(|e| e.into_inner());
-        for chain in by_segment {
+        for c in by_segment {
+            let chain = &chains[c];
+            let made = probs[c].len();
+            self.made.push((chain.segment, made as u32));
             let s = &segments[chain.segment];
-            let rows = (s.row0 + 1) as usize..(s.row0 + s.n_rows) as usize;
+            let rows = (s.row0 + 1) as usize..(s.row0 + 1) as usize + made;
             if watch.recent.len() == Watch::KEPT {
                 watch.recent.pop_front();
             }
@@ -514,7 +563,8 @@ impl DraftBlock {
                 if n >= MAX_BATCH as usize {
                     return Err(invalid("more drafts than a step of the block has rows"));
                 }
-                let token = tokens[(s.row0 + 1) as usize + j];
+                let token = if j < made { tokens[(s.row0 + 1) as usize + j] } else { u32::MAX };
+                self.probs.push(probs[c].get(j).copied().unwrap_or(f32::NAN));
                 // SAFETY: the drafts' section of the pinned buffer holds
                 // `MAX_BATCH` words.
                 unsafe {
@@ -536,7 +586,7 @@ impl DraftBlock {
         self.n_drafts = n as u32;
         self.last_chain_ms = begun.elapsed().as_secs_f64() * 1e3;
         self.times.chain_steps += 1;
-        self.times.links += n_links as u64;
+        self.times.links += links_run;
         self.times.chain_ms += self.last_chain_ms;
         watch.times = self.times;
         Ok(())
@@ -544,7 +594,7 @@ impl DraftBlock {
 
     /// Remembers the rows of the model's step that is enqueued now: the next
     /// step follows them.
-    pub(super) fn keep(&mut self, segments: &[Segment], tokens: &[u32], chains: &[Chain]) {
+    pub(super) fn keep(&mut self, segments: &[Segment], tokens: &[u32]) {
         self.tails.clear();
         self.tails.extend(segments.iter().enumerate().map(|(i, s)| Tail {
             slot: s.slot,
@@ -552,8 +602,14 @@ impl DraftBlock {
             row0: s.row0,
             tokens: tokens[s.row0 as usize..(s.row0 + s.n_rows) as usize].to_vec(),
             direct: s.direct,
-            links: chains.iter().find(|c| c.segment == i).map_or(0, |c| c.rows.len() as u32),
+            links: self.made.iter().find(|(segment, _)| *segment == i).map_or(0, |(_, made)| *made),
         }));
+    }
+
+    /// The probability the block gave each draft of the step, in the order
+    /// of the drafts; NaN for a link that was not made.
+    pub(super) fn probs(&self) -> &[f32] {
+        &self.probs
     }
 
     /// Where the step left the drafts and how many.
@@ -578,7 +634,7 @@ impl DraftBlock {
         rows: &[Row],
         model: DevicePtr,
         sample: Option<&[SampleRow]>,
-    ) -> Result<Option<Vec<u32>>, ModelError> {
+    ) -> Result<Option<Vec<(u32, f32)>>, ModelError> {
         let n = rows.len() as u32;
         if n == 0 || n > MAX_BATCH {
             return Err(invalid(format!("a step of the draft block of {n} rows")));
@@ -760,7 +816,7 @@ impl DraftBlock {
                     pick.status, pick.token
                 )));
             }
-            picks.push(pick.token);
+            picks.push((pick.token, pick.confidence()));
         }
         Ok(Some(picks))
     }

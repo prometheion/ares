@@ -33,6 +33,7 @@
 //! | state copies | 3 each | 0 save or 1 restore, sequence slot, checkpoint place |
 //! | page copies | 3 each | page to copy from, page to copy to, cells to copy |
 //! | freed pages | 1 each | pages the pool freed since the last record |
+//! | draft bars | 16 + 1 each | for the windows whose drafts the model makes: the chance of a draft by its probability (16 ranges, `f32`), then for every draft row of those windows, in the order of the segments, the reach its chain needs for that link to be made (`f32`) |
 //!
 //! A segment is **direct** when all of its rows are certain to be accepted (a
 //! slice of a prompt, a generation row without drafts): the recurrent kernels
@@ -85,6 +86,16 @@
 //! named, at most [`FREED_PER_RECORD`] of them (the rest follow in the next
 //! records), and a page that has an owner again is not named.
 //!
+//! **Draft bars** let a drafter that makes its links one after the other end a
+//! chain where one more link is not expected to pay (`ares_sched::need`): the
+//! reach of a chain is the product of the chances of the drafts it has made,
+//! each read from the table by the probability the drafter gave it, and link
+//! `j` is made while the reach is at least the bar of its row. Link 0 has no
+//! bar. A link that is not made comes back as `u32::MAX`
+//! ([`StepOutput::drafts`](crate::StepOutput)); its row stays in the step. A
+//! record without the section, and a drafter that cannot stop, make every
+//! link.
+//!
 //! The *context* is a number the host derives from the sequence's tokens up to
 //! and including the row's token. A real model has no use for it (attention
 //! reads the sequence's pages); the synthetic model has no attention kernel,
@@ -133,6 +144,10 @@ const H_OFF_MASKS: usize = 29;
 const H_MASK_WORDS: usize = 30;
 const H_FREED: usize = 31;
 const H_OFF_FREED: usize = 32;
+const H_BARS: usize = 33;
+const H_OFF_BARS: usize = 34;
+/// The ranges of the table of chances at the head of the draft bars.
+const BAR_CHANCES: usize = ares_sched::CONFIDENCE_BINS;
 
 /// The most freed pages one record names.
 pub const FREED_PER_RECORD: usize = 1024;
@@ -224,8 +239,18 @@ pub fn max_bytes(max_rows: u32, max_slots: u32, wanted: u32, vocab: u32) -> usiz
         + slots * 3 * 12
         + segments * 12
         + 16 * 8
-        + FREED_PER_RECORD * 4;
+        + FREED_PER_RECORD * 4
+        + (BAR_CHANCES + rows) * 4;
     bytes.next_multiple_of(256)
+}
+
+/// The chance that a draft is accepted, by the range of the probability its
+/// drafter gave it (the ranges of [`ares_sched::Confidence`]).
+pub type DraftChances = [f32; BAR_CHANCES];
+
+/// The chance of a draft of probability `p` by `chances`.
+pub fn draft_chance(chances: &DraftChances, p: f32) -> f32 {
+    chances[ares_sched::Confidence::bin(p)]
 }
 
 /// The record does not fit its buffer.
@@ -284,6 +309,7 @@ impl<'a> RecordWriter<'a> {
             H_OFF_CORRECTIONS,
             H_OFF_MASKS,
             H_OFF_FREED,
+            H_OFF_BARS,
         ] {
             header[h] = end as u32;
         }
@@ -559,6 +585,23 @@ impl<'a> RecordWriter<'a> {
         Ok(())
     }
 
+    /// The draft bars: the chance of a draft by its probability, and for
+    /// every draft row of the windows whose drafts the model makes, in the
+    /// order of the segments, the reach its chain needs for that link.
+    pub fn draft_bars(
+        &mut self,
+        chances: &[f32; BAR_CHANCES],
+        needs: &[f32],
+    ) -> Result<(), RecordFull> {
+        let off = self.end;
+        let words: Vec<u32> = chances.iter().chain(needs).map(|value| value.to_bits()).collect();
+        self.put(off, &words)?;
+        self.header[H_BARS] = needs.len() as u32;
+        self.header[H_OFF_BARS] = off as u32;
+        self.end = align(off + words.len() * 4);
+        Ok(())
+    }
+
     /// Writes the headers and returns the bytes used, a multiple of 16 so the
     /// copy is a whole number of the device's transfer units.
     pub fn finish(mut self) -> Result<usize, RecordFull> {
@@ -626,6 +669,8 @@ impl<'a> RecordView<'a> {
             header[H_OFF_MASKS] as usize
                 + header[H_MASKS] as usize * header[H_MASK_WORDS] as usize * 4,
             header[H_OFF_FREED] as usize + header[H_FREED] as usize * 4,
+            header[H_OFF_BARS] as usize
+                + if header[H_BARS] > 0 { (BAR_CHANCES + header[H_BARS] as usize) * 4 } else { 0 },
         ];
         if ends.iter().any(|end| *end > bytes.len()) {
             return Err(RecordError::Truncated);
@@ -855,6 +900,39 @@ impl<'a> RecordView<'a> {
         assert!(i < self.page_copies(), "page copy {i} of {}", self.page_copies());
         let at = self.header[H_OFF_PAGE_COPIES] as usize + i as usize * 12;
         PageCopy { from: self.word(at), to: self.word(at + 4), cells: self.word(at + 8) }
+    }
+
+    /// The number of draft bars: one per draft row of the windows whose
+    /// drafts the model makes, or none.
+    pub fn draft_bars(&self) -> u32 {
+        self.header[H_BARS]
+    }
+
+    /// The reach the chain of draft row `i` (counted over the windows whose
+    /// drafts the model makes, in the order of the segments) needs for that
+    /// link to be made.
+    pub fn draft_need(&self, i: u32) -> f32 {
+        assert!(i < self.draft_bars(), "draft bar {i} of {}", self.draft_bars());
+        let at = self.header[H_OFF_BARS] as usize + (BAR_CHANCES + i as usize) * 4;
+        f32::from_bits(self.word(at))
+    }
+
+    /// The chance that a draft is accepted whose drafter gave it the
+    /// probability `p`, from the table of the draft bars.
+    pub fn draft_chance(&self, p: f32) -> f32 {
+        assert!(self.draft_bars() > 0, "the record has no draft bars");
+        let at = self.header[H_OFF_BARS] as usize + ares_sched::Confidence::bin(p) * 4;
+        f32::from_bits(self.word(at))
+    }
+
+    /// The table of the draft bars: the chance of a draft by the range of its
+    /// probability ([`draft_chance`] reads it). `None` for a record without
+    /// draft bars.
+    pub fn draft_chances(&self) -> Option<DraftChances> {
+        (self.draft_bars() > 0).then(|| {
+            let at = self.header[H_OFF_BARS] as usize;
+            std::array::from_fn(|bin| f32::from_bits(self.word(at + bin * 4)))
+        })
     }
 
     /// The number of pages the pool freed since the record before.

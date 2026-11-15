@@ -150,6 +150,7 @@ pub struct HostExecutor {
     /// the chain of the step that was dispatched drafted and took.
     link: Duration,
     drafts: Vec<u32>,
+    draft_probs: Vec<f32>,
     draft_ms: f64,
     gate: Option<Gate>,
     observer: Option<Observer>,
@@ -202,6 +203,7 @@ impl HostExecutor {
             states: true,
             link: Duration::ZERO,
             drafts: Vec::new(),
+            draft_probs: Vec::new(),
             draft_ms: 0.0,
             gate: None,
             observer: None,
@@ -272,8 +274,10 @@ impl HostExecutor {
     }
 
     /// Makes each link of the model's own draft chain take `link` on the
-    /// device, in addition to the step: the chain of a step is as long as its
-    /// longest window's.
+    /// device, in addition to the step: the chain of a step is as long as the
+    /// longest chain its drafter made (a drafter that reports probabilities,
+    /// [`crate::SyntheticConfig::own_probability`], ends a chain at the
+    /// record's draft bars).
     pub fn with_link_cost(mut self, link: Duration) -> Self {
         self.link = link;
         self
@@ -342,26 +346,49 @@ impl Executor for HostExecutor {
         // windows that take them before the blocks read them, and hands the
         // drafts back with the picks.
         self.drafts.clear();
+        self.draft_probs.clear();
         let mut longest = 0;
         let mut patches = Vec::new();
         {
             let view = RecordView::new(&self.record[..meta.record_bytes]).map_err(broken)?;
+            let reports = self.model.config().own_probability.is_some();
+            let mut bar = 0;
             for i in (0..view.segments()).filter(|i| view.own_drafts(*i)) {
                 let segment = view.segment(i);
                 let newest = view.row(segment.row0);
                 let links = segment.n_rows - 1;
-                longest = longest.max(links);
-                let drafts =
-                    self.model.host_drafts(newest.token, newest.context, newest.position, links);
-                for (j, draft) in drafts.iter().enumerate() {
+                let chain =
+                    self.model.host_chain(newest.token, newest.context, newest.position, links);
+                // A drafter that knows its probabilities ends the chain where
+                // the record's bars say one more link does not pay; the rows
+                // of the links it did not make keep what the record had.
+                let made = if reports && view.draft_bars() >= bar + links {
+                    let needs: Vec<f32> = (bar..bar + links).map(|k| view.draft_need(k)).collect();
+                    let chances = chain.iter().map(|(_, p)| f64::from(view.draft_chance(*p)));
+                    ares_sched::links_made(chances, &needs) as u32
+                } else {
+                    links
+                };
+                bar += links;
+                longest = longest.max(made);
+                for (j, (draft, p)) in chain.iter().enumerate() {
+                    if j as u32 >= made {
+                        self.drafts.push(u32::MAX);
+                        self.draft_probs.push(f32::NAN);
+                        continue;
+                    }
                     let position = newest.position + 1 + j as u32;
                     patches.push((
                         segment.row0 + 1 + j as u32,
                         *draft,
                         self.model.context_of(*draft, position),
                     ));
+                    self.drafts.push(*draft);
+                    self.draft_probs.push(*p);
                 }
-                self.drafts.extend(drafts);
+            }
+            if !reports {
+                self.draft_probs.clear();
             }
         }
         for (row, token, context) in patches {
@@ -450,6 +477,8 @@ impl Executor for HostExecutor {
         out.picks.extend_from_slice(&self.picks);
         out.drafts.clear();
         out.drafts.extend_from_slice(&self.drafts);
+        out.draft_probs.clear();
+        out.draft_probs.extend_from_slice(&self.draft_probs);
         out.draft_ms = self.draft_ms;
         // A step that was given a cost took exactly that, whatever the clock
         // says; one that was given none is the conductor's to measure.

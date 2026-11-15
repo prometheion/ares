@@ -534,6 +534,28 @@ impl SamplePick {
     /// The bytes of a record on the device.
     pub const BYTES: usize = 16 + 8 * SAMPLE_CANDIDATES;
 
+    /// The probability of the picked token among the row's candidates, by
+    /// their logits as they are: how sure the row was of its pick. The tokens
+    /// past the candidates are left out, so this is at least the token's
+    /// probability over the whole row; a pick that is not among the candidates
+    /// has 0.
+    pub fn confidence(&self) -> f32 {
+        let best = self.cand_logit[0];
+        let (mut all, mut own) = (0.0f32, 0.0f32);
+        for (token, logit) in self.cand_token.iter().zip(&self.cand_logit) {
+            if *token == u32::MAX {
+                break;
+            }
+            let weight = (logit - best).exp();
+            all += weight;
+            if *token == self.token {
+                own = weight;
+            }
+        }
+        let share = own / all;
+        if share.is_finite() { share } else { 0.0 }
+    }
+
     /// Reads a record as the device wrote it.
     pub fn from_bytes(bytes: &[u8]) -> Self {
         let word =
