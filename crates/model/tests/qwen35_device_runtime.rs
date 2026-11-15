@@ -532,3 +532,141 @@ fn every_kind_of_sampler_setting_answers_on_the_real_model() {
     check_probabilities("a filter", &probs, None);
     runtime.shutdown();
 }
+
+/// What the rows of a text pick, generated a row at a time and in draft
+/// windows, on one placement: both sequences read the same prompt, then the
+/// single rows of slot 0 generate `tokens` tokens (each row's pick is the next
+/// row's token), and slot 1 verifies windows that draft that text, some with a
+/// wrong draft. Returns the rows compared and the windows with a rejected
+/// draft; panics where a row of a window does not pick the token of the row
+/// alone with the same logit, bit for bit.
+fn windows_against_single_rows(
+    session: &mut Session,
+    what: &str,
+    prompt: &[u32],
+    tokens: usize,
+    longest: usize,
+) -> (usize, usize) {
+    for slot in 0..2 {
+        for (i, chunk) in prompt.chunks(64).enumerate() {
+            let part = Rows {
+                slot,
+                position: (i * 64) as u32,
+                tokens: chunk,
+                direct: true,
+                wanted: Wanted::None,
+            };
+            session.step(&[part]).unwrap();
+        }
+    }
+    // The text and the pick of every row: row `i` reads `text[i]`.
+    let start = prompt.len() as u32;
+    let mut text = vec![prompt[prompt.len() - 1]];
+    let mut alone = Vec::new();
+    for i in 0..tokens {
+        let part = Rows {
+            slot: 0,
+            position: start + i as u32,
+            tokens: &text[i..i + 1],
+            direct: true,
+            wanted: Wanted::Last,
+        };
+        let pick = session.step(&[part]).unwrap()[0];
+        alone.push((pick.token, pick.logit.to_bits()));
+        text.push(pick.token);
+    }
+    let mut seed = 0x9E37_79B9_7F4A_7C15u64 ^ tokens as u64;
+    let mut below = |n: usize| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        ((seed >> 20) % n as u64) as usize
+    };
+    let (mut at, mut rejected) = (0usize, 0usize);
+    while at < tokens {
+        let rows = (2 + below(longest - 1)).min(tokens - at);
+        let mut window = text[at..at + rows].to_vec();
+        // A wrong draft: the rows from it on do not count.
+        let accepted = if rows > 1 && below(3) == 0 {
+            let wrong = 1 + below(rows - 1);
+            window[wrong] = if window[wrong] == 100 { 101 } else { 100 };
+            rejected += 1;
+            wrong
+        } else {
+            rows
+        };
+        let direct = rows == 1;
+        let part = Rows {
+            slot: 1,
+            position: start + at as u32,
+            tokens: &window,
+            direct,
+            wanted: Wanted::All,
+        };
+        let picks: Vec<(u32, u32)> =
+            session.step(&[part]).unwrap().iter().map(|p| (p.token, p.logit.to_bits())).collect();
+        if !direct {
+            session.accept(&[accepted as u32]).unwrap();
+        }
+        for r in 0..accepted {
+            assert_eq!(
+                picks[r],
+                alone[at + r],
+                "{what}: row {r} of a window of {rows} rows, {} tokens after the prompt",
+                at + r
+            );
+        }
+        at += accepted;
+    }
+    (tokens, rejected)
+}
+
+/// On the real model, in every placement and with every format of K and V, a
+/// row of a draft window picks the token of the row alone with the same logit
+/// bit for bit, over a few hundred generated tokens: the text does not depend
+/// on what was drafted. With the fast kernels, which is how the model is
+/// served. The layer split has no draft block of its own (its drafts would
+/// come from a lookup), which changes nothing for a window: the rows are
+/// verified the same way.
+#[test]
+fn a_row_of_a_draft_window_picks_what_it_picks_alone_on_every_placement() {
+    use ares_cuda::CacheFormat;
+    let (true, Some(path), Some(capture)) =
+        (enabled(), env_path("ARES_TEST_QWEN35_MODEL"), env_path("ARES_TEST_QWEN35_CAPTURE"))
+    else {
+        return;
+    };
+    let mut placements = vec![("one device", Spread::Single, vec![0u32])];
+    if device_count().unwrap() >= 2 {
+        placements.push(("tensor split", Spread::Tensor(vec![0.625, 0.375]), vec![0, 1]));
+        placements.push(("layer split", Spread::Layer(vec![0.5, 0.5]), vec![0, 1]));
+    } else {
+        eprintln!("one device: the splits are skipped");
+    }
+    for (name, spread, ordinals) in placements {
+        for format in CacheFormat::ALL {
+            // The default format at length, the others over fewer tokens; with
+            // `q4` far enough for a tile to be converted (after 512 cells).
+            let (language, tokens) = match format {
+                CacheFormat::Q8 => ("german", 400),
+                CacheFormat::Q4 => ("english", 340),
+                _ => ("english", 200),
+            };
+            let prompt = read_ids(&capture.join(language).join("base/prompt.tokens"));
+            let opts = Options { kv: (format, format), logit_rows: 16, ..options(Precision::Fast) };
+            let model = Arc::new(
+                Qwen35::new(Gguf::open(&path).unwrap(), "q", &spread, opts, 1024).unwrap(),
+            );
+            let devices: Vec<Device> =
+                ordinals.iter().map(|d| Device::open(*d, Wait::Block).unwrap()).collect();
+            let mut session = Session::start(model, devices, 2, 1024, 64 << 20).unwrap();
+            let what = format!("{name}, K and V as {format:?}");
+            let (rows, rejected) =
+                windows_against_single_rows(&mut session, &what, &prompt, tokens, 8);
+            eprintln!(
+                "RES {what}: {rows} rows of draft windows ({rejected} windows with a rejected \
+                 draft) pick what the rows alone pick, bit for bit"
+            );
+        }
+    }
+}
