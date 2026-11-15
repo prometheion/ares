@@ -102,16 +102,24 @@ fn cases(dir: &Path) -> Vec<(String, usize)> {
     found
 }
 
-/// How far the reference with llama.cpp's roundings may be from llama.cpp's
-/// rows without flash attention, as the relative root of the squared
-/// difference; see `docs/ARCHITECTURE.md` for where the number comes from.
-const FORK_ARITHMETIC: f64 = 2e-2;
-/// The same for the exact reference: llama.cpp's CPU path rounds every input
-/// of a BF16 matrix to bf16, which the exact reference does not.
-const EXACT: f64 = 3e-2;
-/// How far the sum of a stage may be from the sum llama.cpp printed, as a
-/// part of the sum of the magnitudes.
+/// How far a stage's sum may be from the sum llama.cpp printed, as a part of
+/// the sum of the magnitudes, up to the end of the first block: there the two
+/// have done the same operations on the same inputs and differ by the
+/// rounding of `f32` sums. Measured: 5e-6 at most.
+const EARLY_SUM: f64 = 5e-5;
+/// The same for every later stage, where the differences have grown.
 const STAGE_SUM: f64 = 1e-2;
+/// llama.cpp's CPU path rounds the input of every BF16 matrix to bf16 and the
+/// GELU to f16. A value that differs in its last bit can round the other
+/// way, which moves it by a bf16 step, and 27 blocks later two computations
+/// that are not the same bit for bit are apart by about what the roundings
+/// themselves change. That amount depends on the image and is measured per
+/// image: the distance between the reference with those roundings and the
+/// reference without. Either may be this many times that far from
+/// llama.cpp's rows.
+const ROUNDING_NOISE: f64 = 3.0;
+/// And this much besides, for images on which the roundings change little.
+const FLOOR: f64 = 1e-3;
 
 fn against_llama_cpp(model: &str, tag: &str, n_out: usize) {
     let (Some(path), Some(reference_dir)) = (env_path(model), env_path("ARES_TEST_QWEN3VL_REF"))
@@ -140,6 +148,7 @@ fn against_llama_cpp(model: &str, tag: &str, n_out: usize) {
         // With llama.cpp's roundings: every stage's sum, then the rows.
         let reference = Reference::new(&config, &weights).with_arithmetic(Arithmetic::ForkCpu);
         let mut worst_sum = (0.0f64, String::new());
+        let mut worst_early = 0.0f64;
         let mut compared = 0;
         let started = Instant::now();
         let ours = reference
@@ -153,6 +162,17 @@ fn against_llama_cpp(model: &str, tag: &str, n_out: usize) {
                 let off = (f64::from(sum) - theirs).abs() / size.max(1e-30);
                 if std::env::var_os("ARES_TEST_QWEN3VL_STAGES").is_some() {
                     eprintln!("  {name}: sum {sum} llama.cpp {theirs} off {off:.1e}");
+                }
+                let early = match stage {
+                    Stage::Patches | Stage::Positions => true,
+                    Stage::Ln1(l) | Stage::QueryRotated(l) | Stage::KeyRotated(l) => l == 0,
+                    Stage::Attention(l) | Stage::AttentionOut(l) | Stage::Residual(l) => l == 0,
+                    Stage::Ln2(l) | Stage::Hidden(l) | Stage::Gelu(l) => l == 0,
+                    Stage::Mlp(l) | Stage::Block(l) => l == 0,
+                    _ => false,
+                };
+                if early {
+                    worst_early = worst_early.max(off);
                 }
                 if off > worst_sum.0 {
                     worst_sum = (off, name);
@@ -193,7 +213,8 @@ fn against_llama_cpp(model: &str, tag: &str, n_out: usize) {
 
         eprintln!(
             "{case}: {rows} rows, largest |value| {largest:.2}; with llama.cpp's roundings \
-             rel {fork_rel:.2e} max {fork_max:.2e} (worst stage sum {:.1e} at {}), {fork_seconds:.1} s; \
+             rel {fork_rel:.2e} max {fork_max:.2e} (stage sums: {worst_early:.1e} in the first \
+             block, {:.1e} at {}), {fork_seconds:.1} s; \
              exact rel {exact_rel:.2e} max {exact_max:.2e}, {exact_seconds:.1} s; the two \
              against each other rel {between:.2e}",
             worst_sum.0, worst_sum.1
@@ -237,8 +258,16 @@ fn against_llama_cpp(model: &str, tag: &str, n_out: usize) {
             worst_sum.1,
             worst_sum.0
         );
-        assert!(fork_rel < FORK_ARITHMETIC, "{case}: with llama.cpp's roundings {fork_rel:.2e}");
-        assert!(exact_rel < EXACT, "{case}: exact {exact_rel:.2e}");
+        assert!(
+            worst_early < EARLY_SUM,
+            "{case}: a sum of the first block is off by {worst_early:.2e}"
+        );
+        let allowed = ROUNDING_NOISE * between + FLOOR;
+        assert!(
+            fork_rel < allowed,
+            "{case}: with llama.cpp's roundings {fork_rel:.2e} of {allowed:.2e}"
+        );
+        assert!(exact_rel < allowed, "{case}: exact {exact_rel:.2e} of {allowed:.2e}");
     }
 }
 

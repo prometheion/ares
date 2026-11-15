@@ -163,10 +163,10 @@ pub fn resize_bicubic(
         let filter = Filter::new(width, out_width);
         wide = vec![0u8; out_width * height * 3];
         for (src, dst) in rgb.chunks_exact(width * 3).zip(wide.chunks_exact_mut(out_width * 3)) {
-            for (xx, pixel) in dst.chunks_exact_mut(3).enumerate() {
+            for (xx, pixel) in dst.as_chunks_mut::<3>().0.iter_mut().enumerate() {
                 let (first, taps) = filter.taps(xx);
                 let mut sums = [half; 3];
-                for (p, k) in src[first * 3..].chunks_exact(3).zip(taps) {
+                for (p, k) in src[first * 3..].as_chunks::<3>().0.iter().zip(taps) {
                     for c in 0..3 {
                         sums[c] += i32::from(p[c]) * k;
                     }
@@ -203,9 +203,9 @@ pub fn resize_bicubic(
 /// channel, in `f32` and in this order of operations.
 pub fn normalize(config: &Config, rgb: &[u8]) -> Vec<f32> {
     let mut out = Vec::with_capacity(rgb.len());
-    for pixel in rgb.chunks_exact(3) {
-        for c in 0..3 {
-            out.push((f32::from(pixel[c]) / 255.0 - config.mean[c]) / config.std[c]);
+    for pixel in rgb.as_chunks::<3>().0 {
+        for ((value, mean), std) in pixel.iter().zip(&config.mean).zip(&config.std) {
+            out.push((f32::from(*value) / 255.0 - mean) / std);
         }
     }
     out
