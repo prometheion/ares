@@ -142,6 +142,17 @@ impl Default for Options {
     }
 }
 
+/// Where an attention block keeps a tile of a sequence, for tests that read
+/// the stored keys and values ([`Part::kv_place`]).
+#[derive(Clone, Copy, Debug)]
+pub struct KvPlace {
+    pub geo: CacheGeometry,
+    /// A converted entry, at `offset` in the engine's pool of pages; otherwise
+    /// an exact entry, at `offset` in [`Part::exact_kv`].
+    pub converted: bool,
+    pub offset: u64,
+}
+
 /// What a stretch of a step's kernels is, for [`Profile`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Phase {
@@ -487,6 +498,9 @@ pub struct Part {
     kept: Option<DeviceBuffer>,
     /// The step whose deferred segments wait for their commit.
     has_deferred: bool,
+    /// Whether every row of the step being enqueued is generated: a single
+    /// row or a row of a draft window, none of a prompt.
+    generating: bool,
     table_stride: u32,
     max_slots: u32,
     /// The page tables as the conductor wrote them: the entries of the pool's
@@ -733,7 +747,17 @@ impl Part {
                     pool += u64::from(pages) * geo.converted_entry_bytes();
                     exact_at += u64::from(exact_slots) * geo.exact_entry_bytes();
                     // The most partial states a plan makes: see `Planner::finish`.
-                    let slots = 20 * u64::from(plan_config.target_blocks) / u64::from(a.n_kv) + 64;
+                    // A generated row has the pieces of a row that is alone in
+                    // its step (`Planner::window`), each with a state: a step
+                    // that verifies drafts has at most `window_rows` such rows
+                    // and nothing else, any other step one per sequence next
+                    // to the rows of prompts.
+                    let alone = u64::from(
+                        (plan_config.target_blocks / a.n_kv).clamp(1, plan_config.max_pieces),
+                    );
+                    let prompts =
+                        20 * u64::from(plan_config.target_blocks) / u64::from(a.n_kv) + 64;
+                    let slots = (window * alone).max(prompts + u64::from(max_slots) * alone);
                     state_slots = state_slots
                         .max(slots * u64::from(a.n_head) * (u64::from(geo.head_dim) + 1) * 4);
                 }
@@ -943,6 +967,7 @@ impl Part {
             n_pages: pages,
             kept,
             has_deferred: false,
+            generating: false,
             table_stride,
             max_slots,
             page_tab: vec![0; max_slots as usize * table_stride as usize],
@@ -1163,10 +1188,17 @@ impl Part {
     /// launches or none. A float matrix with a weight beyond the range of
     /// f16 (`WeightRange::Beyond`) has no other kernel, so its group takes
     /// the launches for any number of rows above one launch's.
+    ///
+    /// A step whose rows are all generated (single rows and draft windows,
+    /// `Part::generating`) takes the launches too, whatever the types, with
+    /// the fast kernels: a row of a window must be multiplied by the kernel
+    /// that multiplies it alone, and that is the decode kernel.
     fn in_batches(&self, mats: &[&Mat], n: u32) -> bool {
         let file = || mats.iter().filter(|m| m.layout == WeightLayout::File);
+        let fast = matches!(self.opts.precision, Precision::Fast);
         file().next().is_some()
             && (decode_in_batches(self.opts.precision, file().map(|m| m.ty), n)
+                || (n > MAX_BATCH && fast && self.generating)
                 || (n > MAX_BATCH && file().any(|m| m.range == WeightRange::Beyond)))
     }
 
@@ -1544,6 +1576,15 @@ impl Part {
                 )));
             }
         }
+        if let Some(limit) = kv::Pages::window_limit(self.opts.kv.0, self.opts.kv.1)
+            && let Some(s) = env.segments.iter().find(|s| !s.direct && s.n_rows > limit)
+        {
+            return Err(invalid(format!(
+                "a draft window of {} rows; with K/V as {:?} and {:?} a window has at most {limit} \
+                 rows (a tile that leaves the exact cells inside it must have been full before it)",
+                s.n_rows, self.opts.kv.0, self.opts.kv.1
+            )));
+        }
         let deferred = env.segments.iter().any(|s| !s.direct);
         if deferred && dims.n_rows > self.opts.window_rows {
             return Err(invalid(format!(
@@ -1578,6 +1619,7 @@ impl Part {
             }
         }
         self.flush_profile()?;
+        self.generating = env.segments.iter().all(|s| !s.direct || s.n_rows == 1);
         self.prepare_kv(env)?;
         self.plan_groups(env)?;
         self.plans.clear();
@@ -1596,7 +1638,34 @@ impl Part {
                     let need = (s.pos0 as u32 + s.n_rows).div_ceil(ENTRY_CELLS) as usize;
                     let entries =
                         &self.kv.entries(&self.page_tab)[table as usize..table as usize + need];
-                    planner.dense(table, entries, s.row0, s.n_rows, s.pos0 as u32);
+                    let pos0 = s.pos0 as u32;
+                    if s.direct && s.n_rows > 1 {
+                        // The rows of a prompt.
+                        planner.dense(table, entries, s.row0, s.n_rows, pos0);
+                        continue;
+                    }
+                    // A row that is generated, alone or in a window with
+                    // drafts, attends as the only row of a step would: what
+                    // was drafted must not change a bit of it. Where a tile
+                    // leaves the newest cells inside the window, the rows from
+                    // there on read it converted.
+                    let end = pos0 + s.n_rows;
+                    match self.kv.ahead(s.slot).filter(|a| pos0 < a.from && a.from < end) {
+                        None => planner.window(table, entries, s.row0, s.n_rows, pos0, None),
+                        Some(a) => {
+                            let before = a.from - pos0;
+                            let swap = Some((a.tile, a.page | PAGE_ENTRY));
+                            planner.window(table, entries, s.row0, before, pos0, None);
+                            planner.window(
+                                table,
+                                entries,
+                                s.row0 + before,
+                                s.n_rows - before,
+                                a.from,
+                                swap,
+                            );
+                        }
+                    }
                 }
                 let plan = planner.finish();
                 let state = plan.state_bytes(&at.geo);
@@ -1657,10 +1726,11 @@ impl Part {
                 settles: s.direct,
             })
             .collect();
-        let jobs = self.kv.prepare(env.stream, &reaches, &self.page_tab, env.tables)?;
+        let jobs = self.kv.prepare(env.stream, &reaches, &self.page_tab, env.tables, true)?;
         self.convert(env.stream, env.pages, Which::Attention, &jobs, 1)?;
         if let Some(m) = &mut self.mtp {
-            let jobs = m.kv.prepare(env.stream, &reaches, &self.page_tab, env.tables)?;
+            // The draft block attends a link at a time: no window reads its tiles.
+            let jobs = m.kv.prepare(env.stream, &reaches, &self.page_tab, env.tables, false)?;
             self.convert(env.stream, env.pages, Which::Draft, &jobs, 1)?;
         }
         Ok(())
@@ -1919,11 +1989,14 @@ impl Part {
             return Err(invalid("there is no draft window to commit"));
         }
         self.draft_commit(stream, step, dims)?;
-        let kept = self.kept.as_ref().ok_or_else(|| invalid("no draft windows were reserved"))?;
         let (conv_stride, delta_stride) =
             (self.slot_bytes / 4, self.slot_bytes / self.opts.state.bytes());
         for (block, at) in self.w.blocks.iter().zip(&self.recurrent_at) {
             let (MixerW::Recurrent(r), Some(at)) = (&block.mixer, at) else { continue };
+            // (A part without recurrent blocks keeps no inputs and has
+            // nothing to commit here.)
+            let kept =
+                self.kept.as_ref().ok_or_else(|| invalid("no draft windows were reserved"))?;
             let k = |i: usize| kept.ptr().offset(at.kept[i]);
             // SAFETY: the kept buffers hold the inputs of the last step's
             // rows (it had at most `window_rows` rows), the state arena every
@@ -2354,6 +2427,27 @@ impl Part {
     /// The arena of recurrent state.
     pub fn state(&self) -> &DeviceBuffer {
         &self.state
+    }
+
+    /// Where attention block `i` keeps tile `tile` of the sequence in `slot`,
+    /// by the table of the last step; `None` for a block that is not
+    /// attention here.
+    pub fn kv_place(&self, i: usize, slot: u32, tile: u32) -> Option<KvPlace> {
+        let at = self.attention_at.get(i).copied().flatten()?;
+        let entry = self.kv.entries(&self.page_tab)[(slot * self.table_stride + tile) as usize];
+        let (converted, index) = (entry & PAGE_ENTRY != 0, u64::from(entry & !PAGE_ENTRY));
+        let offset = if converted {
+            at.pool + index * at.geo.converted_entry_bytes()
+        } else {
+            at.exact + index * at.geo.exact_entry_bytes()
+        };
+        Some(KvPlace { geo: at.geo, converted, offset })
+    }
+
+    /// The pool of exact K/V entries of the attention blocks, when their
+    /// formats have a tile mean.
+    pub fn exact_kv(&self) -> Option<&DeviceBuffer> {
+        self.kv.exact_buffer()
     }
 
     /// Writes K and V rows of `n` consecutive cells from cell `pos0` of the

@@ -272,8 +272,10 @@ impl<'a> Rig<'a> {
             plan.push((first as usize, tokens.len()));
         }
         self.frees();
-        let jobs =
-            self.pages.prepare(&self.stream, &reaches, &self.page_tab, DevicePtr::NULL).unwrap();
+        let jobs = self
+            .pages
+            .prepare(&self.stream, &reaches, &self.page_tab, DevicePtr::NULL, false)
+            .unwrap();
         let layer = [self.layer()];
         self.pages
             .convert(
@@ -333,7 +335,8 @@ impl<'a> Rig<'a> {
             writes: false,
             settles: false,
         };
-        let jobs = self.pages.prepare(&self.stream, &[r], &self.page_tab, DevicePtr::NULL).unwrap();
+        let jobs =
+            self.pages.prepare(&self.stream, &[r], &self.page_tab, DevicePtr::NULL, false).unwrap();
         let layer = [self.layer()];
         self.pages
             .convert(

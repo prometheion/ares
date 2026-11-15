@@ -18,7 +18,7 @@ use ares_cuda::{
 };
 use ares_runtime::ModelError;
 
-use super::forms::{Convert, Exhausted, Forms, Reach, exact_slots};
+use super::forms::{Ahead, Convert, Exhausted, Forms, Reach, exact_slots, window_limit};
 use super::{PAGE_ENTRY, invalid};
 
 /// The exact cells at the end of a sequence that a policy with these formats
@@ -261,22 +261,40 @@ impl Pages {
         }
     }
 
+    /// The tile that the rows of the draft window of `slot` read converted
+    /// from a position inside the window on, in the step last prepared, while
+    /// the group's table names its exact entry.
+    pub(super) fn ahead(&self, slot: u32) -> Option<Ahead> {
+        self.forms.as_ref().and_then(|forms| forms.ahead(slot))
+    }
+
+    /// The most rows of a draft window of the group, when its formats bound
+    /// them (`forms::window_limit`).
+    pub(super) fn window_limit(k: CacheFormat, v: CacheFormat) -> Option<u32> {
+        has_exact(k, v).then(|| window_limit(newest_cells(k, v)))
+    }
+
     /// Prepares a step: converts what left its window, gives the pages the rows
     /// write exact slots, and writes the group's table where it differs from
-    /// the entries those imply. Returns the conversions to run.
+    /// the entries those imply. Returns the conversions to run. `windows`:
+    /// the rows of a draft window attend together and must read every tile as
+    /// they would alone ([`Pages::ahead`]).
     pub(super) fn prepare(
         &mut self,
         stream: &Stream,
         reaches: &[Reach],
         conductor: &[u32],
         step_table: DevicePtr,
+        windows: bool,
     ) -> Result<Vec<Convert>, ModelError> {
         let stride = self.stride as usize;
         if let Some(forms) = &mut self.forms {
             forms
-                .prepare(reaches, |slot, tile| {
-                    conductor[slot as usize * stride + tile as usize] & !PAGE_ENTRY
-                })
+                .prepare(
+                    reaches,
+                    |slot, tile| conductor[slot as usize * stride + tile as usize] & !PAGE_ENTRY,
+                    windows,
+                )
                 .map_err(exhausted)?;
         }
         if self.mirror.is_empty() {

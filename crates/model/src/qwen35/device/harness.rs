@@ -245,6 +245,115 @@ impl Harness {
         Ok(floats(&bytes))
     }
 
+    /// Runs every block of the part in turn on the rows of `segments`, as one
+    /// step, and returns the residual stream after each block. `input(i)`
+    /// gives the rows block `i` reads (`d` values each), or `None` for what
+    /// the block before it left; block 0 must be given its rows. The blocks
+    /// read and advance the state on the device as in a step, and a draft
+    /// window is committed with [`Harness::commit`] as after a step.
+    pub fn blocks(
+        &mut self,
+        segments: &[Segment],
+        mut input: impl FnMut(usize) -> Option<Vec<f32>>,
+    ) -> Result<Vec<Vec<f32>>, ModelError> {
+        let n: usize = segments.iter().map(|s| s.n_rows as usize).sum();
+        let tokens = vec![0; n];
+        let record = StepRecord::new(segments, &tokens, None, &[])?;
+        let dims = self.upload(&record)?;
+        let env = StepEnv {
+            stream: &self.stream,
+            step: self.record.ptr(),
+            dims,
+            tokens: &tokens,
+            segments,
+            tables: self.tables.ptr(),
+            pages: self.pages.ptr(),
+            exchange: None,
+            replay: &[],
+        };
+        self.part.enqueue_begin(&env)?;
+        self.part.enqueue_rope(&env)?;
+        let mut after = Vec::with_capacity(self.part.n_blocks());
+        for i in 0..self.part.n_blocks() {
+            match input(i) {
+                Some(x) if x.len() == n * self.d => {
+                    // The write does not go through the stream: the block
+                    // before must have ended.
+                    self.stream.synchronize()?;
+                    self.part.scratch().write(self.part.x_offset(), &bytes_of(&x))?;
+                }
+                Some(x) => {
+                    return Err(ModelError::Invalid(format!(
+                        "{} values for {n} rows of {}",
+                        x.len(),
+                        self.d
+                    )));
+                }
+                None if i == 0 => {
+                    return Err(ModelError::Invalid("the first block needs its rows".into()));
+                }
+                None => {}
+            }
+            self.part.enqueue_block(&env, i)?;
+            self.stream.synchronize()?;
+            let mut bytes = vec![0u8; n * self.d * 4];
+            self.part.scratch().read(self.part.x_offset(), &mut bytes)?;
+            after.push(floats(&bytes));
+        }
+        self.part.enqueue_finish(&env)?;
+        self.stream.synchronize()?;
+        self.last = Some(record);
+        Ok(after)
+    }
+
+    /// The stored keys and values of the first `cells` cells of the sequence
+    /// in `slot`, in attention block `i`, as the bytes on the device: for
+    /// every tile a byte that says whether it is a converted entry, then per
+    /// KV head the tile means of a converted entry and the rows of K and of V
+    /// that hold cells.
+    pub fn read_kv(&self, i: usize, slot: u32, cells: u32) -> Result<Vec<u8>, ModelError> {
+        self.stream.synchronize()?;
+        let mut out = Vec::new();
+        for tile in 0..cells.div_ceil(ENTRY_CELLS) {
+            let place = self
+                .part
+                .kv_place(i, slot, tile)
+                .ok_or_else(|| ModelError::Invalid(format!("block {i} is not attention")))?;
+            let rows = (cells - tile * ENTRY_CELLS).min(ENTRY_CELLS) as u64;
+            let geo = place.geo;
+            let d = u64::from(geo.head_dim);
+            out.push(u8::from(place.converted));
+            let mut take = |buffer: &DeviceBuffer, at: u64, len: u64| {
+                let mut bytes = vec![0u8; len as usize];
+                buffer.read(at, &mut bytes).map(|()| out.extend(bytes))
+            };
+            for head in 0..u64::from(geo.kv_heads) {
+                if place.converted {
+                    let base = place.offset + head * geo.converted_head_bytes();
+                    let (k_mean, v_mean) = (
+                        u64::from(geo.k.mean_bytes(geo.head_dim)),
+                        u64::from(geo.v.mean_bytes(geo.head_dim)),
+                    );
+                    let (k_row, v_row) = (
+                        u64::from(geo.k.row_bytes(geo.head_dim)),
+                        u64::from(geo.v.row_bytes(geo.head_dim)),
+                    );
+                    let v_at = base + k_mean + u64::from(ENTRY_CELLS) * k_row;
+                    take(&self.pages, base, k_mean + rows * k_row)?;
+                    take(&self.pages, v_at, v_mean + rows * v_row)?;
+                } else {
+                    let exact = self.part.exact_kv().ok_or_else(|| {
+                        ModelError::Invalid("an exact entry without an exact pool".into())
+                    })?;
+                    let base = place.offset + head * u64::from(ENTRY_CELLS) * 4 * d;
+                    take(exact, base, rows * 2 * d)?;
+                    take(exact, base + u64::from(ENTRY_CELLS) * 2 * d, rows * 2 * d)?;
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// Puts the recurrent state of block `i` and `slot` on the device: the
     /// convolution windows and the delta-rule matrices in the reference's
     /// layout.

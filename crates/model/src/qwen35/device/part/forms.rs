@@ -15,6 +15,13 @@
 //! - At the start of every step, for every sequence in it, the tiles that left
 //!   the sequence's window are converted. A shared page is converted for every
 //!   holder, and every holder's table follows the next time its sequence runs.
+//! - A row reads a tile converted from the position at which the tile has
+//!   left the newest cells, whatever step computes the row. A draft window
+//!   that reaches across such a position has the tile both ways: converted
+//!   at the start of the step for its rows from that position on
+//!   ([`Ahead`]), and still an exact entry, which its rows before the
+//!   position read and which a step that starts past the position gives up.
+//!   So a row of a window reads what it would read in a step of its own.
 //! - A page that the cache holds and no sequence needs stays exact until the
 //!   pool is short of slots; then the page used least recently among the full
 //!   ones is converted. A partly used page (a tail of the prefix cache) never
@@ -50,6 +57,25 @@ pub(super) struct Reach {
     pub writes: bool,
     /// Whether all rows are certain to be accepted.
     pub settles: bool,
+}
+
+/// A tile that the later rows of a draft window read converted while the
+/// table still names its exact entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Ahead {
+    pub slot: u32,
+    /// The first position whose row reads the tile converted.
+    pub from: u32,
+    pub tile: u32,
+    pub page: u32,
+}
+
+/// The most rows of a draft window for a group that keeps its `newest` cells
+/// exact: the tile that leaves the newest cells inside the window must have
+/// been full before the window (so no more rows than `newest`), and only one
+/// tile may leave (so no more rows than a tile).
+pub(super) fn window_limit(newest: u32) -> u32 {
+    newest.min(TILE)
 }
 
 impl Reach {
@@ -106,6 +132,8 @@ pub(super) struct Forms {
     free: Vec<u32>,
     clock: u64,
     jobs: Vec<Convert>,
+    /// The tiles the draft windows of the step read both ways.
+    ahead: Vec<Ahead>,
 }
 
 impl Forms {
@@ -121,6 +149,7 @@ impl Forms {
             free: (0..capacity).rev().collect(),
             clock: 0,
             jobs: Vec::new(),
+            ahead: Vec::new(),
         }
     }
 
@@ -219,13 +248,18 @@ impl Forms {
     /// Prepares a step: the tiles that left their sequence's window are
     /// converted, and every page the rows write has an exact slot.
     /// `page(slot, tile)` names the pages of a sequence's table. The
-    /// conversions wait in [`Forms::take_jobs`].
+    /// conversions wait in [`Forms::take_jobs`]. With `windows`, the tiles
+    /// that leave the newest cells inside a draft window are converted too
+    /// and keep their exact entries ([`Forms::ahead`]); a group whose rows
+    /// attend one at a time has no use for that.
     pub(super) fn prepare(
         &mut self,
         reaches: &[Reach],
         page: impl Fn(u32, u32) -> u32,
+        windows: bool,
     ) -> Result<(), Exhausted> {
         self.clock += 1;
+        self.ahead.clear();
         // The pages of the step are not given up for room.
         for r in reaches {
             for tile in r.tiles() {
@@ -238,6 +272,22 @@ impl Forms {
                 let p = page(r.slot, tile);
                 if self.exact_of[p as usize] != NONE {
                     self.convert(p);
+                }
+            }
+        }
+        for r in reaches.iter().filter(|r| windows && !r.settles && r.rows > 1) {
+            let last = r.pos0 + r.rows - 1;
+            let leaving = self.converted_tiles(r.pos0).end.max(1)..self.converted_tiles(last).end;
+            // Only a tile that was full before the window: its cells are
+            // settled, so what is converted now is what a later step would
+            // convert ([`window_limit`] keeps a window from reaching further).
+            for tile in leaving.filter(|tile| (tile + 1) * TILE <= r.pos0) {
+                let p = page(r.slot, tile);
+                let slot = self.exact_of[p as usize];
+                if slot != NONE {
+                    self.jobs.push(Convert { exact: slot, page: p });
+                    let from = self.newest + (tile + 1) * TILE;
+                    self.ahead.push(Ahead { slot: r.slot, from, tile, page: p });
                 }
             }
         }
@@ -266,6 +316,12 @@ impl Forms {
         if self.exact_of[page as usize] != NONE {
             self.convert(page);
         }
+    }
+
+    /// The tile that the rows of the draft window of `slot` read converted
+    /// from a position inside the window on, in the step last prepared.
+    pub(super) fn ahead(&self, slot: u32) -> Option<Ahead> {
+        self.ahead.iter().copied().find(|a| a.slot == slot)
     }
 
     /// The conversions that wait, in the order they must run.
@@ -315,7 +371,7 @@ mod tests {
         // A prompt of 768 cells in steps of 128.
         let mut forms = Forms::new(8, 32, 256);
         for step in 0..6 {
-            forms.prepare(&[reach(step * 128, 128)], page).unwrap();
+            forms.prepare(&[reach(step * 128, 128)], page, true).unwrap();
         }
         let jobs = forms.take_jobs();
         assert_eq!(
@@ -348,7 +404,7 @@ mod tests {
                     Reach { slot, pos0: pos[slot as usize], rows, writes: true, settles: true }
                 })
                 .collect();
-            forms.prepare(&reaches, page).unwrap();
+            forms.prepare(&reaches, page, true).unwrap();
             for r in &reaches {
                 pos[r.slot as usize] += r.rows;
             }
@@ -361,12 +417,12 @@ mod tests {
     #[test]
     fn a_full_page_that_nobody_reads_is_converted_when_the_pool_is_short() {
         let mut forms = Forms::new(2, 16, 256);
-        forms.prepare(&[reach(0, 256)], page).unwrap();
+        forms.prepare(&[reach(0, 256)], page, true).unwrap();
         assert_eq!(forms.in_use(), 2);
         let (slot_of_0, slot_of_1) = (forms.slot_of(0).unwrap(), forms.slot_of(1).unwrap());
         // Another sequence writes a page of its own: the page used longest ago
         // makes room.
-        forms.prepare(&[second(0, 1)], other).unwrap();
+        forms.prepare(&[second(0, 1)], other, true).unwrap();
         assert_eq!(forms.take_jobs(), [Convert { exact: slot_of_0, page: 0 }]);
         assert_eq!(forms.slot_of(0), None);
         assert_eq!(forms.slot_of(1), Some(slot_of_1));
@@ -376,8 +432,8 @@ mod tests {
     #[test]
     fn a_partly_used_page_is_never_converted_for_room() {
         let mut forms = Forms::new(1, 16, 256);
-        forms.prepare(&[reach(0, 5)], page).unwrap();
-        let error = forms.prepare(&[second(0, 1)], other).unwrap_err();
+        forms.prepare(&[reach(0, 5)], page, true).unwrap();
+        let error = forms.prepare(&[second(0, 1)], other, true).unwrap_err();
         assert_eq!(error, Exhausted { capacity: 1, partial: 1, in_step: 0 });
         assert!(forms.take_jobs().is_empty());
     }
@@ -385,24 +441,24 @@ mod tests {
     #[test]
     fn the_pages_of_the_step_are_not_given_up() {
         let mut forms = Forms::new(2, 16, 256);
-        forms.prepare(&[reach(0, 256)], page).unwrap();
+        forms.prepare(&[reach(0, 256)], page, true).unwrap();
         // The same sequence goes on and needs a third page: its own pages are
         // read in this step, so none is converted for it.
-        let error = forms.prepare(&[reach(256, 1)], page).unwrap_err();
+        let error = forms.prepare(&[reach(256, 1)], page, true).unwrap_err();
         assert_eq!(error, Exhausted { capacity: 2, partial: 0, in_step: 2 });
     }
 
     #[test]
     fn a_freed_page_gives_its_slot_back() {
         let mut forms = Forms::new(1, 16, 256);
-        forms.prepare(&[reach(0, 5)], page).unwrap();
+        forms.prepare(&[reach(0, 5)], page, true).unwrap();
         assert_eq!(forms.in_use(), 1);
         forms.release(0);
         assert_eq!(forms.in_use(), 0);
         assert_eq!(forms.slot_of(0), None);
         forms.release(0);
         assert_eq!(forms.in_use(), 0, "releasing twice changes nothing");
-        forms.prepare(&[reach(0, 5)], page).unwrap();
+        forms.prepare(&[reach(0, 5)], page, true).unwrap();
         assert_eq!(forms.slot_of(0), Some(0));
     }
 
@@ -411,16 +467,16 @@ mod tests {
         let mut forms = Forms::new(8, 32, 128);
         // Slot 0 wrote six pages; with 128 newest cells it keeps tiles 0, 4 and 5.
         for step in 0..6 {
-            forms.prepare(&[reach(step * 128, 128)], page).unwrap();
+            forms.prepare(&[reach(step * 128, 128)], page, true).unwrap();
         }
-        forms.prepare(&[reach(768, 1)], page).unwrap();
+        forms.prepare(&[reach(768, 1)], page, true).unwrap();
         forms.take_jobs();
         assert!((1..5).all(|p| forms.slot_of(p).is_none()));
         // Slot 1 reads the same pages from a shorter sequence, whose window
         // would hold pages 2 and 3 exact: it finds them converted.
         let shared = |_slot: u32, tile: u32| tile;
         let reader = Reach { slot: 1, pos0: 384, rows: 1, writes: false, settles: false };
-        forms.prepare(&[reader], shared).unwrap();
+        forms.prepare(&[reader], shared, true).unwrap();
         assert!(forms.take_jobs().is_empty());
         assert_eq!(forms.entry(2, FLAG), 2 | FLAG);
         assert_eq!(forms.entry(3, FLAG), 3 | FLAG);
@@ -429,22 +485,61 @@ mod tests {
     #[test]
     fn a_page_handed_out_again_is_not_full_until_its_new_tile_is() {
         let mut forms = Forms::new(2, 16, 256);
-        forms.prepare(&[reach(0, 128)], page).unwrap();
+        forms.prepare(&[reach(0, 128)], page, true).unwrap();
         assert!(forms.slot_of(0).is_some());
         // The pool freed page 0 and gave it to another sequence between two
         // records without the device being told: it starts a tile in this step.
-        forms.prepare(&[second(0, 5)], |_slot, _tile| 0).unwrap();
+        forms.prepare(&[second(0, 5)], |_slot, _tile| 0, true).unwrap();
         // Another sequence needs the second slot and finds none to give up: the
         // page holds 5 cells of its new tile.
-        forms.prepare(&[Reach { slot: 2, ..reach(0, 1) }], |_slot, tile| 5 + tile).unwrap();
-        let error = forms.prepare(&[Reach { slot: 3, ..reach(0, 1) }], |_s, tile| 9 + tile);
+        forms.prepare(&[Reach { slot: 2, ..reach(0, 1) }], |_slot, tile| 5 + tile, true).unwrap();
+        let error = forms.prepare(&[Reach { slot: 3, ..reach(0, 1) }], |_s, tile| 9 + tile, true);
         assert_eq!(error.unwrap_err().partial, 2, "neither page is full");
+    }
+
+    #[test]
+    fn a_draft_window_across_a_conversion_has_the_tile_both_ways() {
+        // 128 newest cells: tile 1 is converted for rows from position 384 on.
+        let mut forms = Forms::new(8, 32, 128);
+        forms.prepare(&[reach(0, 380)], page, true).unwrap();
+        assert!(forms.take_jobs().is_empty());
+        let slot_of_1 = forms.slot_of(1).unwrap();
+        // A window of 8 rows from 380: rows 380 to 383 read tile 1 exact, rows
+        // 384 to 387 converted. The tile is converted now and keeps its slot.
+        let window = Reach { settles: false, ..reach(380, 8) };
+        forms.prepare(&[window], page, true).unwrap();
+        assert_eq!(forms.take_jobs(), [Convert { exact: slot_of_1, page: 1 }]);
+        assert_eq!(forms.ahead(0), Some(Ahead { slot: 0, from: 384, tile: 1, page: 1 }));
+        assert_eq!(forms.slot_of(1), Some(slot_of_1), "the rows before 384 read the exact entry");
+        // Two rows are accepted: the next window starts at 382 and has the
+        // tile both ways again; a step that starts at 384 gives the slot up.
+        forms.prepare(&[Reach { settles: false, ..reach(382, 8) }], page, true).unwrap();
+        assert_eq!(forms.ahead(0).map(|a| a.from), Some(384));
+        assert_eq!(forms.take_jobs().len(), 1);
+        forms.prepare(&[reach(384, 1)], page, true).unwrap();
+        assert_eq!(forms.ahead(0), None);
+        assert_eq!(forms.take_jobs(), [Convert { exact: slot_of_1, page: 1 }]);
+        assert_eq!(forms.slot_of(1), None);
+        // A window inside one stretch between two conversions, a row alone and
+        // the rows of a prompt have no such tile, and neither has a group that
+        // does not ask for it.
+        let mut forms = Forms::new(8, 32, 128);
+        forms.prepare(&[reach(0, 380)], page, true).unwrap();
+        forms.prepare(&[Reach { settles: false, ..reach(380, 4) }], page, true).unwrap();
+        assert_eq!(forms.ahead(0), None);
+        forms.prepare(&[Reach { settles: false, ..reach(380, 8) }], page, false).unwrap();
+        assert_eq!(forms.ahead(0), None);
+        forms.prepare(&[reach(380, 8)], page, true).unwrap();
+        assert_eq!(forms.ahead(0), None);
+        assert!(forms.take_jobs().is_empty());
+        assert_eq!(window_limit(32), 32);
+        assert_eq!(window_limit(256), 128);
     }
 
     #[test]
     fn a_replay_writes_nothing() {
         let mut forms = Forms::new(4, 16, 256);
-        forms.prepare(&[Reach { writes: false, ..reach(0, 300) }], page).unwrap();
+        forms.prepare(&[Reach { writes: false, ..reach(0, 300) }], page, true).unwrap();
         assert_eq!(forms.in_use(), 0);
     }
 
@@ -453,17 +548,17 @@ mod tests {
         let mut forms = Forms::new(1, 16, 256);
         // A window with drafts is not certain: its page is not given up until a
         // step starts past it.
-        forms.prepare(&[Reach { settles: false, ..reach(0, 128) }], page).unwrap();
-        assert_eq!(forms.prepare(&[second(0, 1)], other).unwrap_err().partial, 1);
+        forms.prepare(&[Reach { settles: false, ..reach(0, 128) }], page, true).unwrap();
+        assert_eq!(forms.prepare(&[second(0, 1)], other, true).unwrap_err().partial, 1);
         let commit = Reach { slot: 0, pos0: 128, rows: 0, writes: false, settles: false };
-        forms.prepare(&[commit], page).unwrap();
-        forms.prepare(&[second(0, 1)], other).unwrap();
+        forms.prepare(&[commit], page, true).unwrap();
+        forms.prepare(&[second(0, 1)], other, true).unwrap();
         assert_eq!(forms.take_jobs().len(), 1);
 
         // The rows of a prompt are certain: the page they fill can go at once.
         let mut forms = Forms::new(1, 16, 256);
-        forms.prepare(&[reach(0, 128)], page).unwrap();
-        forms.prepare(&[second(0, 1)], other).unwrap();
+        forms.prepare(&[reach(0, 128)], page, true).unwrap();
+        forms.prepare(&[second(0, 1)], other, true).unwrap();
         assert_eq!(forms.take_jobs().len(), 1);
     }
 }

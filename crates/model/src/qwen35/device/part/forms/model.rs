@@ -180,7 +180,7 @@ fn run(seed: u64, newest: u32) -> Stats {
             forms.release(*page);
         }
         forms
-            .prepare(&reaches, |slot, tile| page_tab[(slot * stride + tile) as usize])
+            .prepare(&reaches, |slot, tile| page_tab[(slot * stride + tile) as usize], false)
             .unwrap_or_else(|e| panic!("seed {seed}: {e}"));
         stats.converted += forms.take_jobs().len() as u32;
         forms.assert_consistent();
