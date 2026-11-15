@@ -260,6 +260,14 @@ impl Forms {
         Ok(())
     }
 
+    /// Converts `page` now when it is exact, as when the window of a sequence
+    /// has left it: the job waits in [`Forms::take_jobs`].
+    pub(super) fn convert_page(&mut self, page: u32) {
+        if self.exact_of[page as usize] != NONE {
+            self.convert(page);
+        }
+    }
+
     /// The conversions that wait, in the order they must run.
     pub(super) fn take_jobs(&mut self) -> Vec<Convert> {
         std::mem::take(&mut self.jobs)

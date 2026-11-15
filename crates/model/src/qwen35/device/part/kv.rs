@@ -215,6 +215,34 @@ impl Pages {
         }
     }
 
+    /// The exact slot of `page`, when the group holds it as an exact entry.
+    pub(super) fn exact_slot(&self, page: u32) -> Option<u32> {
+        self.forms.as_ref()?.slot_of(page)
+    }
+
+    /// Makes `page` an exact entry that holds all its cells, whatever the
+    /// group kept for it before: a page that comes back from the prefix
+    /// cache's level on SSD in that form. Returns its slot and the conversions
+    /// that made room, which must run before the slot is written.
+    pub(super) fn adopt_exact(&mut self, page: u32) -> Result<(u32, Vec<Convert>), ModelError> {
+        let forms = self.forms.as_mut().ok_or_else(|| invalid("the group has no exact entries"))?;
+        forms.release(page);
+        let slot = forms.ensure(page, None).map_err(exhausted)?;
+        forms.settle_page(page);
+        Ok((slot, forms.take_jobs()))
+    }
+
+    /// The conversion of `page` into its converted entry, when it is exact.
+    pub(super) fn convert_page(&mut self, page: u32) -> Vec<Convert> {
+        match &mut self.forms {
+            Some(forms) => {
+                forms.convert_page(page);
+                forms.take_jobs()
+            }
+            None => Vec::new(),
+        }
+    }
+
     /// The pool freed these pages.
     pub(super) fn release(&mut self, pages: impl IntoIterator<Item = u32>) {
         if let Some(forms) = &mut self.forms {

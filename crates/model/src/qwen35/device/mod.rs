@@ -32,7 +32,7 @@ pub use harness::Harness;
 pub use part::{
     CopyTimes, DRAFT_KV, DraftBytes, DraftChain, DraftStep, DraftTimes, Drafted, Exchange, Options,
     PAGE_ENTRY, PHASES, Part, PartSetup, Phase, Profile, StepEnv, TAILS_PER_SLOT, checkpoint_bytes,
-    exact_bytes, page_bytes, state_slot_bytes,
+    exact_bytes, page_bytes, settle_cells, state_slot_bytes, transit_page_bytes,
 };
 pub use placement::{BlockSlice, DevicePlan, DraftPlan, Placement, PlacementError};
 pub use runtime::{OpenError, PartReport, Qwen35, Spread};

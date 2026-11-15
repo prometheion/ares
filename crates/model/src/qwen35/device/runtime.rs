@@ -10,8 +10,8 @@ use ares_api::{ChatFormat, EngineError, ModelCard, Prompt};
 use ares_cuda::{DevicePtr, ENTRY_CELLS, PushSlot, Segment, Stream};
 use ares_gguf::Gguf;
 use ares_runtime::{
-    ContextSpec, DeviceContext, DeviceModel, LinkSpec, Links, Logits, Model, ModelError, OwnDrafts,
-    PrefixCache, Split, StepContext,
+    ContextSpec, DeviceContext, DeviceModel, DeviceTransfer, Durable, LinkSpec, Links, Logits,
+    Model, ModelError, OwnDrafts, PrefixCache, Split, StepContext, TransferContext,
 };
 use ares_state::PageLayout;
 use ares_tokenizer::{ChatOptions, Tokenizer};
@@ -19,8 +19,8 @@ use ares_tokenizer::{ChatOptions, Tokenizer};
 use super::choose::{Balance, LayoutReport};
 use super::embed::{EmbeddingReport, HostRows, TableShape};
 use super::part::{
-    DraftBytes, DraftChain, DraftStep, Exchange, Options, PAGE_ENTRY, Part, PartSetup, StepEnv,
-    TAILS_PER_SLOT, checkpoint_bytes, page_bytes,
+    DRAFT_KV, DraftBytes, DraftChain, DraftStep, Exchange, Options, PAGE_ENTRY, Part, PartSetup,
+    StepEnv, TAILS_PER_SLOT, checkpoint_bytes, page_bytes, settle_cells, transit_page_bytes,
 };
 use super::placement::{HalfShares, Placement, PlacementError};
 use crate::chat;
@@ -223,6 +223,67 @@ impl Qwen35 {
     }
 }
 
+/// What of a model file goes into the fingerprint of stored state: its size,
+/// its first bytes (the header, with the model's settings) and samples spread
+/// over the rest (the weights). A file that was copied or moved is the same
+/// file; reading all of it at every load would take as long as loading it.
+fn file_identity(path: &std::path::Path, out: &mut Vec<u8>) {
+    use std::os::unix::fs::FileExt;
+    const HEAD: usize = 64 << 10;
+    const SAMPLE: usize = 4096;
+    const SAMPLES: u64 = 16;
+    let Ok(file) = std::fs::File::open(path) else { return };
+    let len = file.metadata().map_or(0, |meta| meta.len());
+    out.extend_from_slice(&len.to_le_bytes());
+    let mut buf = vec![0u8; HEAD];
+    let got = file.read_at(&mut buf, 0).unwrap_or(0);
+    out.extend_from_slice(&buf[..got]);
+    for i in 1..=SAMPLES {
+        let at = len / (SAMPLES + 1) * i;
+        let got = file.read_at(&mut buf[..SAMPLE], at).unwrap_or(0);
+        out.extend_from_slice(&buf[..got]);
+    }
+}
+
+impl Qwen35 {
+    /// Everything besides the tokens that changes the bytes of a page or of a
+    /// checkpoint as the device parts hand them out
+    /// ([`ares_runtime::Durable::fingerprint`]):
+    ///
+    /// - the model's files (size, header and samples of the weights);
+    /// - the formats of K and of V of the attention blocks, and the draft
+    ///   block's when the model drafts (its keys, values and carry are part
+    ///   of the state);
+    /// - the format of the recurrent state, and how the products round;
+    /// - which heads of every block each device holds, since the bytes are
+    ///   laid out per device.
+    fn state_fingerprint(&self) -> Vec<u8> {
+        let mut out = b"qwen35 state 1\0".to_vec();
+        for part in 0..self.gguf.n_parts() {
+            file_identity(self.gguf.path(part as u16), &mut out);
+        }
+        let draft = self.placement.draft.as_ref().map(|draft| (draft.device, DRAFT_KV));
+        let settings = format!(
+            "kv {:?} draft {:?} state {:?} precision {:?} split {:?}",
+            self.options.kv,
+            draft,
+            self.options.state,
+            self.options.precision,
+            self.placement.split
+        );
+        out.extend_from_slice(settings.as_bytes());
+        for device in &self.placement.devices {
+            out.push(0xff);
+            for block in &device.blocks {
+                let heads = block.as_ref().map_or(0..0, |slice| slice.heads.clone());
+                out.extend_from_slice(&heads.start.to_le_bytes());
+                out.extend_from_slice(&heads.end.to_le_bytes());
+            }
+        }
+        out
+    }
+}
+
 impl Model for Qwen35 {
     fn card(&self) -> ModelCard {
         ModelCard { id: self.name.clone(), context_length: self.context, created: self.created }
@@ -334,6 +395,24 @@ impl Model for Qwen35 {
                 })
                 .collect(),
             tails_per_slot: Some(TAILS_PER_SLOT),
+        })
+    }
+
+    fn durable(&self, cells_per_page: u32) -> Option<Durable> {
+        if cells_per_page != ENTRY_CELLS {
+            return None;
+        }
+        let devices = 0..self.placement.n_devices();
+        Some(Durable {
+            fingerprint: self.state_fingerprint(),
+            page_bytes: devices
+                .clone()
+                .map(|d| transit_page_bytes(&self.config, &self.placement, d, &self.options))
+                .collect(),
+            state_bytes: devices
+                .map(|d| checkpoint_bytes(&self.config, &self.placement, d, self.options.state))
+                .collect(),
+            settle_cells: settle_cells(&self.placement, &self.options),
         })
     }
 
@@ -562,6 +641,14 @@ impl DeviceModel for Qwen35Device {
             exchange: (step.devices > 1).then_some(&exchange as &dyn Exchange),
             replay: &self.replay,
         })
+    }
+
+    fn transfer(
+        &mut self,
+        cx: &TransferContext<'_>,
+        item: &mut DeviceTransfer,
+    ) -> Result<(), ModelError> {
+        self.part.transfer(cx.stream, cx.pages, item)
     }
 
     fn logit_tokens(&self) -> DevicePtr {

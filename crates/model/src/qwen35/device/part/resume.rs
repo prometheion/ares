@@ -25,9 +25,11 @@ use std::ops::Range;
 use ares_cuda::{
     AttentionKernels, AttnRow, CacheGeometry, Device, DevicePtr, Event, StateFormat, Stream,
 };
-use ares_runtime::{LockedChunk, ModelError, PinnedRam, RecordView, StateCopyKind};
+use ares_runtime::{
+    DeviceTransfer, LockedChunk, ModelError, PinnedRam, RecordView, StateCopyKind, TransferKind,
+};
 
-use super::{Part, Profile};
+use super::{DRAFT_KV, Options, Part, Profile, Which, geometry, kv};
 use crate::qwen35::Config;
 use crate::qwen35::device::placement::Placement;
 
@@ -91,6 +93,51 @@ pub fn checkpoint_bytes(
         .map_or(0, |_| c.n_embd as u64 * 4);
     state_slot_bytes(c, placement, index, state) + carry
 }
+
+/// The most bytes one page takes on device `index` on its way to the host and
+/// back, for the prefix cache's level on SSD: every K/V entry the device holds
+/// of the page, each in the larger of its two forms where its formats have two
+/// (the converted entry, and the exact one a page has while it is new).
+pub fn transit_page_bytes(c: &Config, placement: &Placement, index: usize, opts: &Options) -> u64 {
+    let entry = |kv: (ares_cuda::CacheFormat, ares_cuda::CacheFormat), heads: u32| {
+        let geo = geometry(c, kv, heads);
+        match kv::has_exact(kv.0, kv.1) {
+            true => geo.converted_entry_bytes().max(geo.exact_entry_bytes()),
+            false => geo.converted_entry_bytes(),
+        }
+    };
+    placement.devices[index]
+        .blocks
+        .iter()
+        .enumerate()
+        .filter_map(|(layer, slice)| {
+            let slice = slice.as_ref()?;
+            (c.is_attention(layer) && !slice.heads.is_empty())
+                .then(|| entry(opts.kv, slice.heads.len() as u32))
+        })
+        .sum::<u64>()
+        + placement
+            .draft
+            .as_ref()
+            .filter(|d| d.device == index)
+            .map_or(0, |_| entry(DRAFT_KV, c.attention.n_head_kv as u32))
+}
+
+/// The cells at the end of a sequence whose pages may still be exact entries
+/// under `placement`: the newest cells that the formats of the attention
+/// blocks and of the draft block keep exact, and the page a step converts
+/// behind them. 0 when no group has exact entries.
+pub fn settle_cells(placement: &Placement, opts: &Options) -> u32 {
+    let draft = placement.draft.as_ref().map_or(0, |_| kv::newest_cells(DRAFT_KV.0, DRAFT_KV.1));
+    match kv::newest_cells(opts.kv.0, opts.kv.1).max(draft) {
+        0 => 0,
+        newest => newest + ares_cuda::ENTRY_CELLS,
+    }
+}
+
+/// The tag of a page in transit: which groups' entries are exact ones.
+const EXACT_ATTENTION: u32 = 1;
+const EXACT_DRAFT: u32 = 2;
 
 /// The rows of `first..first + n` of a step that write cells, as ranges of
 /// rows counted from `first`: every row but those of the `replay` ranges
@@ -334,6 +381,210 @@ impl Part {
             }
         }
         Ok(())
+    }
+
+    fn group(&mut self, which: Which) -> Option<&mut kv::Pages> {
+        match which {
+            Which::Attention => Some(&mut self.kv),
+            Which::Draft => self.mtp.as_mut().map(|m| &mut m.kv),
+        }
+    }
+
+    /// Runs conversions that a page on its way in made necessary, and waits
+    /// for them: the group's list of jobs on the device is written once per
+    /// step otherwise, and a transfer is no step.
+    fn convert_now(
+        &mut self,
+        stream: &Stream,
+        pages: DevicePtr,
+        which: Which,
+        jobs: &[super::forms::Convert],
+    ) -> Result<(), ModelError> {
+        if jobs.is_empty() {
+            return Ok(());
+        }
+        self.convert(stream, pages, which, jobs, 0)?;
+        Ok(stream.synchronize()?)
+    }
+
+    /// Copies the entries of `page` in the layers of one group to `dst`, in
+    /// the form the group holds them in. Returns the bytes and whether they
+    /// are exact entries.
+    fn group_out(
+        &mut self,
+        stream: &Stream,
+        pages: DevicePtr,
+        which: Which,
+        page: u32,
+        dst: *mut u8,
+        room: usize,
+    ) -> Result<(usize, bool), ModelError> {
+        let layers = self.layers_of(which);
+        let Some(group) = self.group(which) else { return Ok((0, false)) };
+        let (slot, exact_pool) = (group.exact_slot(page), group.exact());
+        let mut at = 0usize;
+        for layer in &layers {
+            let (src, bytes) = match slot {
+                Some(slot) => {
+                    let entry = layer.geo.exact_entry_bytes();
+                    (exact_pool.offset(layer.exact + u64::from(slot) * entry), entry as usize)
+                }
+                None => {
+                    let entry = layer.geo.converted_entry_bytes();
+                    (pages.offset(layer.pool + u64::from(page) * entry), entry as usize)
+                }
+            };
+            if at + bytes > room {
+                return Err(super::invalid("a page in transit has less room than its entries"));
+            }
+            // SAFETY: the entry is in the layer's pool (the page and the slot
+            // are below the pools' sizes) and `dst` has room for it (checked
+            // above); the caller waits for the stream before it reads.
+            unsafe { stream.copy_to_host(dst.add(at), src, bytes)? };
+            at += bytes;
+        }
+        Ok((at, slot.is_some()))
+    }
+
+    /// Copies the entries of `page` in the layers of one group from `src`,
+    /// which holds them as exact entries (`exact`) or as converted ones. An
+    /// exact page that is not to `keep` its form is converted at once. Returns
+    /// the bytes read.
+    #[allow(clippy::too_many_arguments)]
+    fn group_in(
+        &mut self,
+        stream: &Stream,
+        pages: DevicePtr,
+        which: Which,
+        page: u32,
+        src: *const u8,
+        len: usize,
+        exact: bool,
+        keep: bool,
+    ) -> Result<usize, ModelError> {
+        let layers = self.layers_of(which);
+        let Some(group) = self.group(which) else { return Ok(0) };
+        let slot = if exact {
+            let (slot, jobs) = group.adopt_exact(page)?;
+            self.convert_now(stream, pages, which, &jobs)?;
+            Some(slot)
+        } else {
+            // Whatever the group kept for the page's number belongs to a page
+            // that is gone.
+            group.release([page]);
+            None
+        };
+        let exact_pool = self.group(which).map_or(DevicePtr::NULL, |group| group.exact());
+        let mut at = 0usize;
+        for layer in &layers {
+            let (dst, bytes) = match slot {
+                Some(slot) => {
+                    let entry = layer.geo.exact_entry_bytes();
+                    (exact_pool.offset(layer.exact + u64::from(slot) * entry), entry as usize)
+                }
+                None => {
+                    let entry = layer.geo.converted_entry_bytes();
+                    (pages.offset(layer.pool + u64::from(page) * entry), entry as usize)
+                }
+            };
+            if at + bytes > len {
+                return Err(super::invalid("a page in transit is shorter than its entries"));
+            }
+            // SAFETY: as in `group_out`, the other way; `src` holds `len`
+            // bytes and stays as it is until the caller has waited for the
+            // stream.
+            unsafe { stream.copy_from_host(dst, src.add(at), bytes)? };
+            at += bytes;
+        }
+        if exact && !keep {
+            let jobs = self.group(which).map(|group| group.convert_page(page)).unwrap_or_default();
+            self.convert_now(stream, pages, which, &jobs)?;
+        }
+        Ok(at)
+    }
+
+    /// Carries out this part's share of a transfer of the prefix cache's level
+    /// on SSD (`ares_runtime::DeviceModel::transfer`): a page's K/V entries of
+    /// every attention block and of the draft block, in the form they have,
+    /// or a checkpoint place. Runs between steps; the caller waits for the
+    /// stream.
+    pub fn transfer(
+        &mut self,
+        stream: &Stream,
+        pages: DevicePtr,
+        item: &mut DeviceTransfer,
+    ) -> Result<(), ModelError> {
+        let groups = [(Which::Attention, EXACT_ATTENTION), (Which::Draft, EXACT_DRAFT)];
+        match item.kind {
+            TransferKind::PageOut | TransferKind::PageIn if item.object >= self.n_pages => Err(
+                super::invalid(format!("page {} of {} in a transfer", item.object, self.n_pages)),
+            ),
+            TransferKind::PageOut => {
+                (item.len, item.tag) = (0, 0);
+                for (which, bit) in groups {
+                    // SAFETY: the transfer's memory holds `room` bytes.
+                    let dst = unsafe { item.ptr.add(item.len) };
+                    let room = item.room - item.len;
+                    let (bytes, exact) =
+                        self.group_out(stream, pages, which, item.object, dst, room)?;
+                    item.len += bytes;
+                    item.tag |= if exact { bit } else { 0 };
+                }
+                Ok(())
+            }
+            TransferKind::PageIn => {
+                if item.len > item.room {
+                    return Err(super::invalid("a page in transit is longer than its room"));
+                }
+                let mut at = 0usize;
+                for (which, bit) in groups {
+                    // SAFETY: `at` is within the `len` bytes of the transfer.
+                    let src = unsafe { item.ptr.add(at) };
+                    let exact = item.tag & bit != 0;
+                    at += self.group_in(
+                        stream,
+                        pages,
+                        which,
+                        item.object,
+                        src,
+                        item.len - at,
+                        exact,
+                        item.keep_form,
+                    )?;
+                }
+                if at != item.len {
+                    return Err(super::invalid(format!(
+                        "a page in transit holds {} bytes; its entries here take {at}",
+                        item.len
+                    )));
+                }
+                Ok(())
+            }
+            TransferKind::StateOut | TransferKind::StateIn => {
+                let bytes = self.places.bytes;
+                let out = item.kind == TransferKind::StateOut;
+                if bytes > item.room || (!out && item.len != bytes) {
+                    return Err(super::invalid(format!(
+                        "a checkpoint of {bytes} bytes and one of {} in transit",
+                        if out { item.room } else { item.len }
+                    )));
+                }
+                if bytes > 0 {
+                    let place = self.places.pointer(item.object)?;
+                    // SAFETY: the place and the transfer's memory hold `bytes`
+                    // bytes each and are different allocations; no copy of a
+                    // step reads or writes the place now, between steps.
+                    unsafe {
+                        match out {
+                            true => std::ptr::copy_nonoverlapping(place, item.ptr, bytes),
+                            false => std::ptr::copy_nonoverlapping(item.ptr, place, bytes),
+                        }
+                    }
+                }
+                (item.len, item.tag) = (bytes, 0);
+                Ok(())
+            }
+        }
     }
 
     fn check_slot(&self, slot: u32) -> Result<(), ModelError> {

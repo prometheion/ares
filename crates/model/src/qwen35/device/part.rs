@@ -40,7 +40,7 @@ mod resume;
 mod tensor;
 
 pub use mtp::{DraftBytes, DraftChain, DraftStep, DraftTimes, Drafted};
-pub use resume::{CopyTimes, checkpoint_bytes, state_slot_bytes};
+pub use resume::{CopyTimes, checkpoint_bytes, settle_cells, state_slot_bytes, transit_page_bytes};
 
 /// Bit 31 of a table entry: the page is in the pool of stored formats (the
 /// only pool the formats without a tile mean use).
