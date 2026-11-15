@@ -42,7 +42,6 @@ use ares_runtime::{
 };
 use ares_state::PageLayout;
 use ares_tokenizer::{ChatOptions, Tokenizer};
-use ares_weights::ExpertHeat;
 
 use super::board::Board;
 use super::draft::{Chain, DraftBlock, DraftReport, DraftTimes, Drafted, Watch};
@@ -957,33 +956,7 @@ impl Qwen4Exp {
                 if o.max_rows > MAX_BATCH {
                     plan_transit(&mut config, layout, &reader, self.opts.transit);
                 }
-                // With a draft block the slots of a pool are divided by the
-                // experts each layer has on the device: the block has all of
-                // its experts on one device, a layer that two devices share
-                // has a part of them on each, and slots divided evenly would
-                // leave the block, whose router runs for every link of every
-                // chain, the smallest share of its experts in a slot.
-                let owned = self.draft.as_ref().map(|_| {
-                    let mut owned = ExpertHeat::new(layout.specs.len(), c.experts.count, 1.0);
-                    let all = vec![1u32; c.experts.count];
-                    owned.seed(0, &all, c.experts.count as f32);
-                    for layer in 0..c.n_layer {
-                        for device in 0..layout.per_layer {
-                            let counts: Vec<u32> = (0..c.experts.count as u32)
-                                .map(|e| {
-                                    u32::from(
-                                        layout.per_layer == 1
-                                            || self.placement.owner(layer, e) == device,
-                                    )
-                                })
-                                .collect();
-                            let total = counts.iter().sum::<u32>() as f32;
-                            owned.seed(layout.store_layer(device, layer), &counts, total);
-                        }
-                    }
-                    owned
-                });
-                let plan = StorePlan::new(config, &map, &reader, &layout.specs, owned.as_ref())
+                let plan = StorePlan::new(config, &map, &reader, &layout.specs, None)
                     .map_err(|e| invalid(e.to_string()))?;
                 build.plan = Some(PlanBox { plan, map, reader });
                 Ok(())

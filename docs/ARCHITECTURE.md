@@ -3104,9 +3104,12 @@ lookup in earlier text takes part as soon as a model drafter does and never alon
   their keys and values are overwritten.
 - *Its experts go through the expert store*, as layer 0 in front of the model's
   layers (a step routes the block before any layer of the model), read from the
-  block's file. With a block the slots of a pool are divided by the experts a
-  layer has on the device, so that the block, which has all 512 on one card, gets
-  more than a layer that two cards share.
+  block's file, and brought into its slots when the store is built. The block
+  gets the slots of a layer: 111 in VRAM and 73 in RAM of its 512 experts when
+  both cards share the layers (where a layer has about half of its experts on
+  each card), 260 and 146 with a range of layers each. A division by the experts
+  a layer has on the device was tried through the plan's profile and changed
+  nothing; the store moves slots between layers by need as it runs.
 - *The policy is the conductor's, unchanged, and on this machine it chooses no
   window yet.* The price of a step by its rows and of a chain by its links is
   measured when the engine starts, and those steps find no expert in a slot: with
@@ -3155,9 +3158,7 @@ a step that drafts), 535 to 1080 picks a step where a step of one row has 480, a
 21 to 166 of them outside a slot. The second time a text is asked the lookup has
 it, which is where the 63.7 and the 47.6 come from (37 and 15 steps for 128
 tokens). The block takes 175 MiB of dense weights, 21 to 49 MiB of keys and values
-and 35 to 48 MiB of buffers on its card, and its experts had 111 slots in VRAM and
-73 in RAM when both cards share the layers (before the slots were divided by owned
-experts; 260 and 146 for a range of layers each, after). No pair of runs with and
+and 35 to 48 MiB of buffers on its card. No pair of runs with and
 without the block at the same load exists, so whether the block makes this model
 faster is not shown; the first requests of the third row say that windows of eight
 rows on tiers that do not hold the text make it slower.
