@@ -368,12 +368,6 @@ pub(crate) fn load(
         cells_per_page: CELLS_PER_PAGE,
         max_slots: parallel,
         window_rows: if drafting { window } else { 1 },
-        // A model that drafts learns the price of its steps from the steps
-        // that run, the warm-up text first: the steps the conductor would
-        // measure at the start find no expert in a slot, and what a window
-        // costs then (three to four times its price once the tiers hold the
-        // text's experts) would keep every window from being tried.
-        warm_up: !drafting,
         checkpoint_budget: 0,
         ..RuntimeConfig::default()
     };

@@ -3107,16 +3107,28 @@ lookup in earlier text takes part as soon as a model drafter does and never alon
   block's file. With a block the slots of a pool are divided by the experts a
   layer has on the device, so that the block, which has all 512 on one card, gets
   more than a layer that two cards share.
-- *The price of its windows is learned, not measured at load.* The steps the
-  conductor measures at the start find no expert in a slot: on this machine they
-  gave 35.5, 49.4, 93.0, 77.0, 97.5, 133.5, 111.3 and 122.5 ms for one to eight
-  rows (2026-11-15) where a step of one row takes 22 ms once the tiers are
-  filled, and with that table no window is ever chosen, because a price is only
-  corrected by a step of its size that runs. So a server whose model drafts
-  starts the runtime without that measurement, and the table fills from the steps
-  of the warm-up text and of the requests. What stays open: a window that ran
-  while its experts were missing leaves a price that keeps it from being chosen
-  again; the conductor has no way to try a size again.
+- *The policy is the conductor's, unchanged, and on this machine it chooses no
+  window yet.* The price of a step by its rows and of a chain by its links is
+  measured when the engine starts, and those steps find no expert in a slot: with
+  the block loaded they gave 35.5, 49.4, 93.0, 77.0, 97.5, 133.5, 111.3 and
+  122.5 ms for one to eight rows and 15.6, 3.3, 4.7, 6.3, 7.7, 9.0 and 10.1 ms
+  for one to seven links (2026-11-15, both cards on every layer, load average 20;
+  a step of one row takes 22 ms once the tiers hold a text's experts). A price
+  is corrected only by a step of its size that runs, so the one-row price comes
+  down to what it is and the others stay where they were measured, and a window
+  of two rows at 49 ms and a link never pays against a row at 22 ms. Started
+  without that measurement (so that the table fills from the steps that run) the
+  server did draft: the block's links were accepted 115 times of 176, 51 of 73
+  and 21 of 29 for the first three on German and English prose and Rust (the
+  fourth: 7 of 18), a link took 7.5 to 8.1 ms while most of the block's experts
+  were in no slot, and the rows that verify waited for experts of their own (135
+  outside a slot and 167 ms waited a step with windows of eight rows, where a
+  step of one row misses 6 to 37). It was not faster for it, the measured steps
+  no longer filled the tiers with what a first text finds there, and a first
+  chain that ran while experts were missing left a price that kept every later
+  one from being chosen. So the server measures at the start as for any model.
+  What this model needs of the conductor, and does not have: prices of its
+  windows taken when the tiers are filled, or tried again after they were.
 - *The window* is four rows unless `--window` says otherwise (2 to 8): a row of
   this model routes to experts of its own, so a rejected draft costs what a token
   costs.

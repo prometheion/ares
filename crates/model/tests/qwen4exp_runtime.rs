@@ -320,6 +320,19 @@ fn start_drafting(seed: u64, placement: Placement, pages: u32) -> (Runtime, Arc<
     start_with(&gguf_path(seed), Some(&draft_path(seed)), placement, pages, config, MAX_ROWS)
 }
 
+/// [`start_drafting`] without the prices the conductor measures at the
+/// start: windows are then chosen by what they are expected to bring alone,
+/// so that a block whose drafts are never right goes on drafting whatever a
+/// link costs on the day.
+fn start_drafting_unpriced(
+    seed: u64,
+    placement: Placement,
+    pages: u32,
+) -> (Runtime, Arc<Qwen4Exp>) {
+    let config = RuntimeConfig { window_rows: 8, warm_up: false, ..RuntimeConfig::default() };
+    start_with(&gguf_path(seed), Some(&draft_path(seed)), placement, pages, config, MAX_ROWS)
+}
+
 /// [`start_at`], with the draft block of the file `draft` when there is one.
 fn start_with(
     path: &std::path::Path,
@@ -979,7 +992,7 @@ fn the_draft_block_drafts_what_the_reference_drafts_in_every_placement() {
     }
     let prompt = prompt(21, 3);
     for placement in placements() {
-        let (runtime, model) = start_drafting(1, placement, 16);
+        let (runtime, model) = start_drafting_unpriced(1, placement, 16);
         warm(&model);
         model.take_drafted();
         let answer = ask(&runtime, 1, &prompt, 40);
@@ -1006,8 +1019,6 @@ fn the_draft_block_drafts_what_the_reference_drafts_in_every_placement() {
             times.chain_ms / times.links.max(1) as f64,
         );
         assert!(counters.own_draft_links > 0, "{placement:?}: the block drafted nothing");
-        // How many chains the policy asks for depends on what a link costs
-        // that day; a made-up block is never right, so they stop soon.
         assert!(compared[0] >= 2, "{placement:?}: {} chains to compare", compared[0]);
         // A made-up model has near ties that the device's arithmetic flips;
         // a block that is wired wrongly agrees by chance, once in a hundred.
@@ -1238,6 +1249,15 @@ fn flash_next_writes_with_drafts_what_it_writes_without() {
     drop(model);
     assert_eq!(stats.cpu_experts, 0, "the CPU computed experts: {stats:?}");
     assert_eq!(plain[..4], FLASH_CONTINUATION, "the reference's first tokens");
+    // The cards give the first engine's memory back before the second plans
+    // with what is free.
+    let free = |device: u32| {
+        Device::open(device, Wait::Spin).and_then(|d| d.mem_info()).map_or(0, |m| m.free)
+    };
+    let begun = std::time::Instant::now();
+    while free(0) < 10 << 30 && begun.elapsed() < Duration::from_secs(120) {
+        std::thread::sleep(Duration::from_millis(500));
+    }
 
     let (runtime, model) = start_flash(&path, Some(&draft));
     let drafted = ask(&runtime, 1, &FLASH_PROMPT, 64);
