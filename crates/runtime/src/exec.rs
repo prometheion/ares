@@ -174,6 +174,13 @@ pub trait Executor: Send {
         Ok(())
     }
 
+    /// The books of the page-locked RAM the checkpoints lie in, which say
+    /// how much of it they may hold. An executor without such memory has
+    /// none.
+    fn ram(&self) -> Option<crate::ram::PinnedRam> {
+        None
+    }
+
     /// Stops the devices and joins their threads. Idempotent.
     fn shutdown(&mut self);
 }

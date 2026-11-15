@@ -11,7 +11,8 @@
 //! a restore a copy to it, both queued on the step's stream, so the stream
 //! orders them against the kernels around them. The places are locked in
 //! chunks when they are first used, within the engine's RAM limit
-//! ([`PinnedRam`]).
+//! ([`PinnedRam`]), and a chunk in which the conductor has no checkpoint is
+//! given back when the checkpoints must make room.
 //!
 //! **A page** is copied whole, for every attention block and for the draft
 //! block's own array, because the cells of an entry lie in planes per head;
@@ -21,12 +22,13 @@
 //! already and only advance the recurrent state.
 
 use std::ops::Range;
+use std::sync::Arc;
 
 use ares_cuda::{
     AttentionKernels, AttnRow, CacheGeometry, Device, DevicePtr, Event, StateFormat, Stream,
 };
 use ares_runtime::{
-    DeviceTransfer, LockedChunk, ModelError, PinnedRam, RecordView, StateCopyKind, TransferKind,
+    DeviceTransfer, ModelError, PinnedRam, PlaceChunks, RecordView, StateCopyKind, TransferKind,
 };
 
 use super::{DRAFT_KV, Options, Part, Profile, Which, geometry, kv};
@@ -235,16 +237,15 @@ struct CopyClock {
     pending: Option<CopyCounts>,
 }
 
-/// The places for checkpoints on the host, locked as they come into use.
+/// The places for checkpoints on the host, locked as they come into use and
+/// given back when the checkpoints must make room ([`PlaceChunks`]).
 #[derive(Debug)]
 pub(super) struct Places {
-    device: Device,
-    ram: PinnedRam,
     /// The bytes of one place.
     bytes: usize,
-    capacity: u32,
-    per_chunk: u32,
-    chunks: Vec<LockedChunk>,
+    chunks: Arc<PlaceChunks>,
+    /// Chunks that had to be locked for a place, since the part was opened.
+    fresh: u32,
     clock: Option<CopyClock>,
 }
 
@@ -256,8 +257,6 @@ impl Places {
         capacity: u32,
         timed: bool,
     ) -> Result<Self, ModelError> {
-        let bytes = bytes as usize;
-        let per_chunk = CHUNK_BYTES.checked_div(bytes).unwrap_or(1).max(1) as u32;
         let clock = timed
             .then(|| -> Result<CopyClock, ares_cuda::Error> {
                 Ok(CopyClock {
@@ -272,41 +271,30 @@ impl Places {
             })
             .transpose()?;
         Ok(Self {
-            device: device.clone(),
-            ram: ram.clone(),
-            bytes,
-            capacity,
-            per_chunk,
-            chunks: Vec::new(),
+            bytes: bytes as usize,
+            chunks: ram.place_chunks(device, bytes, capacity, CHUNK_BYTES),
+            fresh: 0,
             clock,
         })
     }
 
-    /// Where place `place` is, locking the chunk it lies in the first time.
+    /// Where place `place` is, locking the chunk it lies in when it is not
+    /// locked: the first time, and after the chunk was given back.
     fn pointer(&mut self, place: u32) -> Result<*mut u8, ModelError> {
-        if place >= self.capacity {
-            return Err(super::invalid(format!(
-                "checkpoint place {place} of {}: the conductor names a place this part does not \
-                 have",
-                self.capacity
-            )));
-        }
-        let chunk = (place / self.per_chunk) as usize;
-        while self.chunks.len() <= chunk {
-            let first = self.chunks.len() as u32 * self.per_chunk;
-            let places = self.per_chunk.min(self.capacity - first);
-            let locked = self.ram.lock_checkpoints(&self.device, places as usize * self.bytes)?;
-            self.chunks.push(locked);
-        }
-        let within = (place % self.per_chunk) as usize * self.bytes;
-        // SAFETY: the place is inside its chunk, which holds `per_chunk`
-        // places (the last one the rest).
-        Ok(unsafe { self.chunks[chunk].as_mut_ptr().add(within) })
+        let (pointer, fresh) = self.chunks.pointer(place)?;
+        self.fresh += u32::from(fresh);
+        Ok(pointer)
     }
 
-    /// Bytes of host memory locked for the places so far.
+    /// Where place `place` is when it holds memory: `None` after its chunk
+    /// was given back, and before it was ever locked.
+    fn held(&self, place: u32) -> Option<*mut u8> {
+        self.chunks.held(place)
+    }
+
+    /// Bytes of host memory locked for the places now.
     pub(super) fn locked(&self) -> u64 {
-        self.chunks.iter().map(|chunk| chunk.len() as u64).sum()
+        self.chunks.locked()
     }
 }
 
@@ -567,7 +555,18 @@ impl Part {
                     )));
                 }
                 if bytes > 0 {
-                    let place = self.places.pointer(item.object)?;
+                    // A checkpoint leaves from memory that holds it. A place
+                    // whose chunk was given back holds nothing: the transfer
+                    // fails, and no new memory is locked to read from.
+                    let place = match out {
+                        true => self.places.held(item.object).ok_or_else(|| {
+                            super::invalid(format!(
+                                "checkpoint place {} holds nothing: its memory was given back",
+                                item.object
+                            ))
+                        })?,
+                        false => self.places.pointer(item.object)?,
+                    };
                     // SAFETY: the place and the transfer's memory hold `bytes`
                     // bytes each and are different allocations; no copy of a
                     // step reads or writes the place now, between steps.
@@ -644,11 +643,11 @@ impl Part {
         // The chunks of the places the copies name are locked first, so that
         // the host's wait for the lock is not in the time of the copies.
         let locking = std::time::Instant::now();
-        let before = self.places.chunks.len();
+        let before = self.places.fresh;
         for i in 0..states {
             self.places.pointer(record.state_copy(i).place)?;
         }
-        counts.locks = (self.places.chunks.len() - before) as u32;
+        counts.locks = self.places.fresh - before;
         counts.lock_ms = locking.elapsed().as_secs_f64() * 1e3;
         self.copy_mark(stream, 0)?;
         for i in 0..states {

@@ -141,6 +141,10 @@ pub struct SessionOptions {
     /// what is left to guess is what one row used), and with it a prompt read 1.6 to 2.8 GiB
     /// more from the file and 5 to 30 % slower (measured 2026-11-12, see ARCHITECTURE.md).
     pub read_ahead: bool,
+    /// The bytes of a piece of the RAM tier under the runtime: what the tier
+    /// locks or gives back at a time. `None` for the store's own size; tests
+    /// of a small model name a smaller one.
+    pub ram_piece: Option<usize>,
 }
 
 impl Default for SessionOptions {
@@ -161,6 +165,7 @@ impl Default for SessionOptions {
             stall: Duration::from_secs(30),
             transit: None,
             read_ahead: false,
+            ram_piece: None,
         }
     }
 }

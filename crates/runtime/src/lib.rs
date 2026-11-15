@@ -86,7 +86,10 @@ pub use model::{
     ContextSpec, DeviceContext, DeviceModel, DeviceTransfer, Durable, LinkSpec, Logits, Model,
     ModelError, OwnDrafts, PrefixCache, Split, StepContext, TransferContext,
 };
-pub use ram::{LockedChunk, PinnedRam};
+pub use ram::{
+    Follow, LockedChunk, Look, Machine, Meminfo, MemorySource, PinnedRam, PlaceChunks, Rule,
+    Verdict, high_watermarks,
+};
 pub use record::{
     Commit, FREED_PER_RECORD, PageCopy, RecordFull, RecordView, RecordWriter, Row, StateCopy,
     StateCopyKind, TableUpdate,

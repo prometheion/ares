@@ -52,6 +52,11 @@ pub struct SsdStats {
     /// Pages and checkpoints that wait to be written or are being written
     /// now.
     pub pending: u64,
+    /// Checkpoints that were due on the drive and were not written: the
+    /// writer held every buffer when one had to leave its place, or the
+    /// checkpoint was given up (host memory ran short) before the step that
+    /// saves it had run.
+    pub checkpoints_skipped: u64,
 }
 
 /// Totals of an engine since it started, and what it holds right now.

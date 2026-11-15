@@ -414,15 +414,17 @@ impl Shared {
         let beside = others().next().is_some();
         let left = self.ram.saturating_sub(booked);
         match state.entries[index].preset.options.load.ram {
-            Some(own) if own > left && (self.ram_named || beside) => Err(format!(
+            // Without a limit of the server there is nothing to fit into:
+            // every engine follows the memory the machine has, and they
+            // share it through the one watch over it.
+            Some(own) if !self.ram_named => Ok(Site { beside, ram: Some(own), ram_is_rest: false }),
+            None if !self.ram_named => Ok(Site { beside, ram: None, ram_is_rest: false }),
+            Some(own) if own > left => Err(format!(
                 "its {own} bytes of RAM do not fit in the {left} bytes that the server's limit \
                  of {} bytes has left",
                 self.ram
             )),
             Some(own) => Ok(Site { beside, ram: Some(own), ram_is_rest: false }),
-            None if !beside && !self.ram_named => {
-                Ok(Site { beside, ram: None, ram_is_rest: false })
-            }
             // Alone, the whole of a limit the operator named is as asked.
             None => Ok(Site { beside, ram: Some(left), ram_is_rest: beside }),
         }
@@ -688,7 +690,9 @@ impl Models {
 
     /// The models of `presets`, none loaded yet; those that are to be loaded
     /// at start are put in line. `default_ram` is the most RAM of all loaded
-    /// models together when the presets name none. Must be called inside a
+    /// models together when the presets name none: all the machine has, and
+    /// the engines then share what is available instead of parts of a limit.
+    /// Must be called inside a
     /// Tokio runtime: the manager's task starts here.
     pub fn start(
         presets: Presets,

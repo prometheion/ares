@@ -146,6 +146,24 @@ pub fn start(rt: &Runtime, request: GenerateRequest) -> Result<Handle, EngineErr
     Ok(Handle { id, rx })
 }
 
+/// Starts a request whose events `seen` looks at before the test gets them,
+/// on the thread that sends them: the conductor's, after the step whose text
+/// they carry and before the next.
+pub fn start_seen(
+    rt: &Runtime,
+    request: GenerateRequest,
+    seen: impl Fn(&Event) + Send + Sync + 'static,
+) -> Result<Handle, EngineError> {
+    let id = request.id;
+    let (tx, rx) = mpsc::channel();
+    let sink = EventSink::new(move |event| {
+        seen(&event);
+        tx.send(event).is_ok()
+    });
+    rt.submit(request, sink)?;
+    Ok(Handle { id, rx })
+}
+
 /// Starts a request whose picks `filter` restricts.
 pub fn start_filtered(
     rt: &Runtime,

@@ -10,13 +10,15 @@
 //!   divided by [`ares_weights::split_slots`]). The device computes an
 //!   expert from its slot, which the kernels find through the layer's slot
 //!   table on the device (`ares_cuda::ExpertKernels`).
-//! - **RAM.** One page-locked region, cut into slots the same way. Reads from
-//!   the file land here, in place and in the file's bytes (a read covers
-//!   whole blocks, so a slot is the expert plus at most two blocks per
-//!   matrix), uploads go from here, and the CPU computes from here
-//!   ([`cpu`]). The tier holds what VRAM does not:
-//!   an expert that VRAM holds is worth nothing here and gives way first, and
-//!   an expert that VRAM evicts comes down into it.
+//! - **RAM.** One region of addresses, cut into slots the same way and
+//!   page-locked in pieces. Reads from the file land here, in place and in
+//!   the file's bytes (a read covers whole blocks, so a slot is the expert
+//!   plus at most two blocks per matrix), uploads go from here, and the CPU
+//!   computes from here ([`cpu`]). The tier holds what VRAM does not: an
+//!   expert that VRAM holds is worth nothing here and gives way first, and an
+//!   expert that VRAM evicts comes down into it. The tier follows the memory
+//!   the machine has: it gives pieces back to the system, the coldest experts
+//!   of every layer with them, and takes them again (`elastic.rs`).
 //! - **SSD.** The file itself, read through `ares-io`: demand reads for
 //!   experts a running step waits for, prefetches for guesses.
 //! - **Transit and staging** (`transit.rs`). A step of many rows uses far
@@ -57,16 +59,16 @@
 
 pub mod cpu;
 mod device;
+mod elastic;
 mod hybrid;
+mod region;
 mod tier;
 mod transit;
 
-use std::any::Any;
 use std::collections::{HashMap, VecDeque};
-use std::ptr::NonNull;
 use std::time::Instant;
 
-use ares_core::{Ledger, LedgerError};
+use ares_core::LedgerError;
 use ares_io::{Buffer, Class, Completion, ExpertMap, Read, Reader};
 use ares_weights::{
     ExpertHeat, ExpertWaves, GuessQueue, LayerNeed, Place, SplitRule, Start, Swap, Want,
@@ -74,7 +76,9 @@ use ares_weights::{
 };
 
 pub use device::{CudaSlots, HostShareState, HostSlots, SlotDevice};
+use elastic::{Layout, Pieces};
 pub use hybrid::{CostModel, Miss, PromoteRule, Serve};
+pub use region::{HostRegion, Locker, PIECE, Released};
 pub use tier::Pool;
 use tier::Tier;
 pub use transit::Named;
@@ -134,6 +138,10 @@ pub struct StoreConfig {
     /// Staging slots in host memory for experts on their way from the file
     /// into transit, taken from the bytes of the RAM tier.
     pub staging_slots: u32,
+    /// The bytes of a piece of the RAM tier, about: what the tier locks or
+    /// gives back to the system at a time. A piece is whole slots of one
+    /// pool.
+    pub ram_piece: u64,
 }
 
 impl StoreConfig {
@@ -152,6 +160,7 @@ impl StoreConfig {
             rebalance_every: 256,
             transit_slots: Vec::new(),
             staging_slots: 0,
+            ram_piece: PIECE as u64,
         }
     }
 }
@@ -166,8 +175,6 @@ struct Geometry {
     lens: [usize; 3],
     /// Where each matrix's read buffer starts in a RAM slot.
     ram_bases: [usize; 3],
-    /// Where the layer's RAM pool starts in the region.
-    ram_pool_base: usize,
 }
 
 /// The slots a store will have: what [`StorePlan::new`] works out, for
@@ -181,6 +188,8 @@ pub struct StorePlan {
     vram: Tier,
     ram: Tier,
     transit: TransitPlan,
+    /// Where the RAM tier's slots and staging lie in the region.
+    layout: Layout,
 }
 
 impl StorePlan {
@@ -212,9 +221,15 @@ impl StorePlan {
     }
 
     /// Bytes of the region the RAM tier and staging need, aligned to
-    /// [`StorePlan::block`].
+    /// [`StorePlan::block`]: their slots, in pieces that start on pages.
     pub fn ram_bytes(&self) -> usize {
-        self.ram.bytes(0) as usize + self.transit.stage_len()
+        self.layout.len
+    }
+
+    /// Bytes from one slot of `layer` to the next in the RAM tier: the expert
+    /// and the blocks its reads cover.
+    pub fn ram_slot_bytes(&self, layer: usize) -> u64 {
+        self.ram.pools[self.ram.pool_of[layer]].stride
     }
 
     /// The alignment reads need of the region.
@@ -233,81 +248,6 @@ impl StorePlan {
 
     pub fn n_experts(&self) -> usize {
         self.n_experts
-    }
-}
-
-/// The memory of the RAM tier.
-pub struct HostRegion {
-    ptr: NonNull<u8>,
-    len: usize,
-    _owner: Box<dyn Any + Send>,
-}
-
-// SAFETY: the region is memory that only the store uses, and the store is used
-// by one thread at a time.
-unsafe impl Send for HostRegion {}
-
-impl std::fmt::Debug for HostRegion {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "HostRegion({} bytes)", self.len)
-    }
-}
-
-impl HostRegion {
-    /// `len` page-locked bytes, reserved in the ledger of pinned RAM.
-    ///
-    /// The memory is the process's own, locked in place for the device
-    /// (`cuMemHostRegister`), not memory the driver allocates
-    /// (`cuMemHostAlloc`): direct I/O cannot read into the driver's mapping,
-    /// and the reads of the tier would fall back to the page cache.
-    pub fn pinned(
-        device: &ares_cuda::Device,
-        ledger: &mut Ledger,
-        len: usize,
-    ) -> Result<Self, StoreError> {
-        let len = len.max(1).next_multiple_of(4096);
-        ledger.reserve("expert RAM tier", len as u64)?;
-        Self::locked(device, len, ())
-    }
-
-    /// `len` page-locked bytes (a multiple of 4096) that `booking` accounts
-    /// for and that give the booking back when the region is dropped.
-    pub(crate) fn locked(
-        device: &ares_cuda::Device,
-        len: usize,
-        booking: impl Any + Send,
-    ) -> Result<Self, StoreError> {
-        /// Dropped in this order: unlocked, freed, unbooked.
-        struct Locked {
-            _registration: ares_cuda::HostRegistration,
-            _buffer: Buffer,
-            _booking: Box<dyn Any + Send>,
-        }
-        let mut buffer = Buffer::aligned(len, 2 << 20);
-        let ptr = NonNull::new(buffer.as_mut_ptr())
-            .ok_or_else(|| StoreError::Plan("an allocation without an address".into()))?;
-        // SAFETY: the range is the buffer's own memory, page-aligned and a
-        // whole number of pages, and it stays allocated until the
-        // registration has been dropped (the field order of `Locked`).
-        let registration =
-            unsafe { ares_cuda::HostRegistration::new(device, ptr.as_ptr(), len, false)? };
-        Ok(Self {
-            ptr,
-            len,
-            _owner: Box::new(Locked {
-                _registration: registration,
-                _buffer: buffer,
-                _booking: Box::new(booking),
-            }),
-        })
-    }
-
-    /// `len` bytes of ordinary memory aligned to `align`: for tests and for
-    /// a store whose device is not a GPU.
-    pub fn unpinned(len: usize, align: usize) -> Self {
-        let mut buffer = Buffer::aligned(len, align);
-        let ptr = NonNull::new(buffer.as_mut_ptr()).unwrap_or(NonNull::dangling());
-        Self { ptr, len, _owner: Box::new(buffer) }
     }
 }
 
@@ -451,6 +391,11 @@ pub struct StoreStats {
     /// Experts that took a slot of the VRAM tier from their transit slot, by
     /// their heat.
     pub transit_adopted: u64,
+    /// Pieces of the RAM tier given back to the system and taken again, and
+    /// the experts that left the tier with the pieces given back.
+    pub pieces_released: u64,
+    pub pieces_locked: u64,
+    pub piece_evictions: u64,
 }
 
 /// The expert tiers of a model and the work that feeds them.
@@ -488,6 +433,7 @@ pub struct ExpertStore<D: SlotDevice> {
     waits: Vec<(usize, Instant)>,
     hybrid: Option<hybrid::Hybrid>,
     transit: Transit,
+    pieces: Pieces,
     stats: StoreStats,
 }
 
@@ -557,7 +503,6 @@ impl StorePlan {
                 offsets: spec.offsets,
                 lens,
                 ram_bases,
-                ram_pool_base: 0,
             });
             ram_layers.push((0usize, at as u64));
         }
@@ -603,7 +548,8 @@ impl StorePlan {
             })?;
         let ram = Tier::plan(n_experts, &ram_layers, &[ram_budget], 2, &heat)
             .ok_or_else(|| plan_error("the RAM budget does not hold 2 slots per layer".into()))?;
-        transit.stage_base = ram.bytes(0) as usize;
+        let layout = Layout::new(&ram.pools, config.ram_piece, transit.stage_len());
+        transit.stage_base = layout.stage_base;
         for (device, pool) in transit.pools.iter_mut().enumerate() {
             if let Some((index, _, _)) = pool {
                 *index = vram.pools.iter().filter(|p| p.place == device).count();
@@ -614,12 +560,8 @@ impl StorePlan {
             let pool = vram.pool_of[layer];
             g.device_pool =
                 vram.pools[..pool].iter().filter(|p| p.place == vram.pools[pool].place).count();
-            g.ram_pool_base = ram.pools[..ram.pool_of[layer]]
-                .iter()
-                .map(|p| (p.stride * u64::from(p.slots)) as usize)
-                .sum();
         }
-        Ok(StorePlan { config, n_experts, block, layers: geometry, vram, ram, transit })
+        Ok(StorePlan { config, n_experts, block, layers: geometry, vram, ram, transit, layout })
     }
 }
 
@@ -637,13 +579,15 @@ impl<D: SlotDevice> ExpertStore<D> {
         region: HostRegion,
         profile: Option<&ExpertHeat>,
     ) -> Result<Self, StoreError> {
-        let StorePlan { config, n_experts, block, layers, vram, ram, transit } = plan;
-        let needed = ram.bytes(0) as usize + transit.stage_len();
-        if region.len < needed || !(region.ptr.as_ptr() as usize).is_multiple_of(block) {
+        let StorePlan { config, n_experts, block, layers, vram, ram, transit, layout } = plan;
+        let mut region = region;
+        let needed = layout.len;
+        if region.len() < needed || !(region.ptr().as_ptr() as usize).is_multiple_of(block) {
             return Err(StoreError::Plan(format!(
                 "the RAM region has {} bytes at {:p}; the tier and staging need {needed} aligned \
                  to {block}",
-                region.len, region.ptr,
+                region.len(),
+                region.ptr(),
             )));
         }
         if let Some(missing) =
@@ -658,7 +602,9 @@ impl<D: SlotDevice> ExpertStore<D> {
             }
         }
         let ram_skip = ram.pools.iter().map(|p| vec![[0; 3]; p.slots as usize]).collect();
-        Ok(Self {
+        region.cut(&layout.spans);
+        let pieces = Pieces::new(layout, &ram);
+        let mut store = Self {
             ram_worth: ExpertHeat::new(layers.len(), n_experts, 1.0),
             worth_stale: vec![true; layers.len()],
             guesses: GuessQueue::new(),
@@ -675,6 +621,7 @@ impl<D: SlotDevice> ExpertStore<D> {
             waits: Vec::new(),
             hybrid: None,
             transit: Transit::new(transit),
+            pieces,
             stats: StoreStats::default(),
             block,
             config,
@@ -686,7 +633,9 @@ impl<D: SlotDevice> ExpertStore<D> {
             vram,
             ram,
             heat,
-        })
+        };
+        store.settle_pieces()?;
+        Ok(store)
     }
 
     /// The device side of device `device`.
@@ -972,6 +921,11 @@ impl<D: SlotDevice> ExpertStore<D> {
         self.step += 1;
         self.stats.steps += 1;
         self.wants.retain(|w| w.demand);
+        // Memory the machine wants back goes before anything new is started,
+        // and memory the tier may take again comes a piece a step: a lock
+        // takes tens of milliseconds, and the next step waits for it.
+        self.shrink_ram(elastic::STEP_WAIT)?;
+        self.grow_ram(1)?;
         if self.config.decay_every > 0 && self.step.is_multiple_of(self.config.decay_every) {
             self.heat.decay();
             self.worth_stale.fill(true);
@@ -1118,7 +1072,7 @@ impl<D: SlotDevice> ExpertStore<D> {
 
         // Guesses, while lanes are free. A fill has the drive to itself.
         let lanes = if self.filling { 4 * self.config.read_lanes } else { self.config.read_lanes };
-        while self.reads.len() < lanes && !self.guesses.is_empty() {
+        while self.reads.len() < lanes && !self.guesses.is_empty() && !self.pieces.shrinking {
             for layer in 0..self.layers.len() {
                 self.refresh_worth(layer);
             }
@@ -1173,14 +1127,12 @@ impl<D: SlotDevice> ExpertStore<D> {
     /// `layer`: the start of its read buffer.
     fn ram_part(&self, layer: usize, local: u32, part: usize) -> *mut u8 {
         let g = &self.layers[layer];
-        let pool = &self.ram.pools[self.ram.pool_of[layer]];
-        let at = g.ram_pool_base
-            + self.ram.slot(layer, local) as usize * pool.stride as usize
-            + g.ram_bases[part];
-        debug_assert!(at < self.region.len);
+        let pool = self.ram.pool_of[layer];
+        let at = self.pieces.layout.slot_at(pool, self.ram.slot(layer, local)) + g.ram_bases[part];
+        debug_assert!(at < self.region.len());
         // SAFETY: the offset is inside the region: the plan sized the pools
         // and `new` checked the region against it.
-        unsafe { self.region.ptr.as_ptr().add(at) }
+        unsafe { self.region.ptr().as_ptr().add(at) }
     }
 
     /// Starts the read of an expert from the file into its RAM slot.

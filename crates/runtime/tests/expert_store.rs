@@ -96,6 +96,17 @@ struct Rig {
 
 /// A store with `vram_slots` slots per layer in VRAM and `ram_slots` in RAM.
 fn rig(vram_slots: u64, ram_slots: u64, tune: impl FnOnce(&mut StoreConfig)) -> Rig {
+    rig_in_pieces(vram_slots, ram_slots, None, tune)
+}
+
+/// [`rig`] with a RAM tier that lies in pieces of `pieces.0` slots, of which
+/// `pieces.1` pieces are locked at the start.
+fn rig_in_pieces(
+    vram_slots: u64,
+    ram_slots: u64,
+    pieces: Option<(usize, usize)>,
+    tune: impl FnOnce(&mut StoreConfig),
+) -> Rig {
     let dir = Scratch::new();
     let gguf = model(&dir);
     let map =
@@ -121,13 +132,20 @@ fn rig(vram_slots: u64, ram_slots: u64, tune: impl FnOnce(&mut StoreConfig)) -> 
         None,
     )
     .unwrap();
-    let ram_slot = probe.ram_bytes() / (probe.slots(0).1 * LAYERS);
+    let ram_slot = probe.ram_slot_bytes(0) as usize;
     config.ram_bytes = (ram_slots * LAYERS as u64 + u64::from(staging)) * ram_slot as u64;
+    if let Some((per_piece, _)) = pieces {
+        config.ram_piece = (per_piece * ram_slot) as u64;
+    }
     let plan = StorePlan::new(config, &map, &reader, &layers, None).unwrap();
     assert_eq!(plan.slots(0), (vram_slots as usize, ram_slots as usize));
     assert_eq!(plan.transit_slots(0), (transit, staging));
     let device = HostSlots::new(&plan.device_pools(0), LAYERS, EXPERTS);
-    let region = HostRegion::unpinned(plan.ram_bytes(), plan.block());
+    let mut region = HostRegion::unpinned(plan.ram_bytes(), plan.block());
+    if let Some((per_piece, start)) = pieces {
+        // A piece is whole pages.
+        region = region.starting_with(start * (per_piece * ram_slot).next_multiple_of(4096));
+    }
     Rig {
         store: ExpertStore::new(plan, map, reader, vec![device], region, None).unwrap(),
         _dir: dir,
@@ -487,7 +505,7 @@ mod hybrid {
         config.vram_reserve = 0;
         config.rebalance_every = 0;
         let probe = StorePlan::new(config.clone(), &map, &reader, &layers, None).unwrap();
-        let ram_slot = probe.ram_bytes() / (probe.slots(0).1 * LAYERS);
+        let ram_slot = probe.ram_slot_bytes(0) as usize;
         config.ram_bytes = ram_slots * (ram_slot * LAYERS) as u64;
         let plan = StorePlan::new(config, &map, &reader, &layers, None).unwrap();
         assert_eq!(plan.slots(0), (vram_slots as usize, ram_slots as usize));
@@ -995,7 +1013,7 @@ mod device {
         config.vram_reserve = 0;
         config.rebalance_every = 0;
         let probe = StorePlan::new(config.clone(), &map, &reader, &layers, None).unwrap();
-        let ram_slot = probe.ram_bytes() / (probe.slots(0).1 * LAYERS);
+        let ram_slot = probe.ram_slot_bytes(0) as usize;
         config.ram_bytes = ram_slots * (ram_slot * LAYERS) as u64;
         let plan = StorePlan::new(config, &map, &reader, &layers, None).unwrap();
         assert_eq!(plan.slots(0), (vram_slots as usize, ram_slots as usize));
@@ -1659,4 +1677,130 @@ fn a_swap_that_copies_nothing_down_needs_no_margin() {
     let stats = rig.store.take_stats();
     assert_eq!((stats.transit_adopted, stats.transit_admitted), (1, 1));
     assert_eq!((stats.evictions, stats.demotions), (1, 0));
+}
+
+// --- a RAM tier that follows the memory it is allowed ------------------------
+
+/// The slots every layer has in the RAM tier.
+fn ram_slots(rig: &Rig) -> Vec<usize> {
+    (0..LAYERS).map(|layer| rig.store.slots(layer).1).collect()
+}
+
+/// The experts of `layer` that are in the RAM tier.
+fn in_ram(rig: &Rig, layer: usize) -> Vec<u32> {
+    (0..EXPERTS).filter(|expert| rig.store.in_ram(layer, *expert)).collect()
+}
+
+#[test]
+fn a_tier_that_starts_small_has_slots_for_what_is_locked_and_every_layer_its_share() {
+    // 8 slots per layer are planned in pieces of 3, and half of the 8 pieces is locked.
+    let rig = rig_in_pieces(3, 8, Some((3, 4)), recent_first);
+    let (locked, whole) = rig.store.ram_bytes();
+    assert!(locked > 0 && locked <= whole / 2 + whole / 8, "{locked} of {whole}");
+    let slots = ram_slots(&rig);
+    let total: usize = slots.iter().sum();
+    assert_eq!(total, rig.store.ram_slots());
+    assert!((6..=14).contains(&total), "{slots:?}");
+    let (least, most) = (slots.iter().min().unwrap(), slots.iter().max().unwrap());
+    assert!(most - least <= 1 && *least >= 2, "the layers share what is there: {slots:?}");
+    assert_eq!(rig.store.ram_target(), locked);
+}
+
+#[test]
+fn the_tier_gives_pieces_back_keeps_what_is_hot_and_takes_the_pieces_again() {
+    let mut rig = rig_in_pieces(3, 8, Some((3, 8)), recent_first);
+    assert_eq!(ram_slots(&rig), [8; LAYERS]);
+    let whole = rig.store.ram_bytes().0;
+    // Eight experts per layer pass through RAM; 6 and 7 are used most, and 0
+    // and 1 are in VRAM at the end, so their copies in RAM are worth least.
+    for pair in [[0, 1], [2, 3], [4, 5], [6, 7], [6, 7], [6, 7], [0, 1]] {
+        rig.step(&[&pair[..], &pair[..], &pair[..]]);
+    }
+    for layer in 0..LAYERS {
+        assert_eq!(in_ram(&rig, layer), [0, 1, 2, 3, 4, 5, 6, 7]);
+    }
+    rig.store.take_stats();
+
+    // Half of it must go.
+    rig.store.set_ram_target(whole / 2);
+    let given = rig.store.shrink_ram(Duration::ZERO).unwrap();
+    assert!(given > 0);
+    let (locked, _) = rig.store.ram_bytes();
+    assert!(locked <= whole / 2, "{locked} of {whole}");
+    let released = rig.store.take_released();
+    assert_eq!(released.len(), given);
+    assert_eq!(released.iter().map(|piece| piece.len() as u64).sum::<u64>(), whole - locked);
+    drop(released);
+    let slots = ram_slots(&rig);
+    assert!(slots.iter().all(|n| (3..=4).contains(n)), "every layer gave its share: {slots:?}");
+    for (layer, n) in slots.iter().enumerate() {
+        let kept = in_ram(&rig, layer);
+        assert_eq!(kept.len(), *n, "what stays fills the slots: {kept:?}");
+        assert!(kept.contains(&6) && kept.contains(&7), "the hottest stay: {kept:?}");
+        assert!(!kept.contains(&0) && !kept.contains(&1), "copies of what VRAM holds go first");
+    }
+    let stats = rig.store.take_stats();
+    assert_eq!(stats.pieces_released, given as u64);
+    assert!(stats.piece_evictions >= 12, "{stats:?}");
+
+    // What stayed is where the store looks for it: it comes up from RAM
+    // with its own bytes (the step checks them), wherever it was copied to.
+    rig.step(&[&[6, 7][..], &[6, 7][..], &[6, 7][..]]);
+    rig.step(&[&[2, 3][..], &[2, 3][..], &[2, 3][..]]);
+    let stats = rig.store.take_stats();
+    assert!(stats.miss_from_ram >= 6, "{stats:?}");
+
+    // The memory is free again: the pieces come back with empty slots, and
+    // what is read next lands in them.
+    rig.store.set_ram_target(u64::MAX);
+    assert_eq!(rig.store.grow_ram(1).unwrap(), 1, "a piece at a time when it is asked so");
+    assert_eq!(rig.store.grow_ram(usize::MAX).unwrap(), given - 1);
+    assert_eq!(rig.store.ram_bytes().0, whole);
+    assert_eq!(ram_slots(&rig), [8; LAYERS]);
+    for pair in [[8, 9], [10, 11], [12, 13], [2, 3], [6, 7], [8, 9], [12, 13]] {
+        rig.step(&[&pair[..], &pair[..], &pair[..]]);
+    }
+    assert_eq!(rig.store.take_stats().pieces_locked, given as u64);
+}
+
+#[test]
+fn nothing_is_given_up_while_a_step_runs_and_the_end_of_the_step_gives_it() {
+    let mut rig = rig_in_pieces(3, 8, Some((3, 8)), recent_first);
+    for pair in [[0, 1], [2, 3], [4, 5]] {
+        rig.step(&[&pair[..], &pair[..], &pair[..]]);
+    }
+    let whole = rig.store.ram_bytes().0;
+    rig.store.begin_step();
+    rig.store.routed(0, &[4, 5]).unwrap();
+    rig.settle();
+    rig.store.set_ram_target(whole / 2);
+    assert_eq!(rig.store.shrink_ram(Duration::ZERO).unwrap(), 0);
+    assert_eq!(rig.store.ram_bytes().0, whole);
+    for layer in 1..LAYERS {
+        rig.store.routed(layer, &[4, 5]).unwrap();
+        rig.settle();
+    }
+    rig.store.end_step().unwrap();
+    assert!(rig.store.ram_bytes().0 <= whole / 2);
+    assert!(!rig.store.take_released().is_empty());
+    rig.settle();
+    rig.step(&[&[0, 1][..], &[2, 3][..], &[4, 5][..]]);
+}
+
+#[test]
+fn a_tier_keeps_two_slots_for_every_layer_whatever_it_is_told() {
+    let mut rig = rig_in_pieces(3, 8, Some((3, 8)), recent_first);
+    rig.step(&[&[0, 1][..], &[0, 1][..], &[0, 1][..]]);
+    rig.store.set_ram_target(0);
+    assert!(rig.store.shrink_ram(Duration::ZERO).unwrap() > 0);
+    assert!(rig.store.ram_at_floor());
+    let slots = ram_slots(&rig);
+    assert!(slots.iter().all(|n| *n >= 2), "{slots:?}");
+    assert!(slots.iter().sum::<usize>() <= 2 * LAYERS + 4, "{slots:?}");
+    assert!(rig.store.ram_bytes().0 > 0);
+    // It asks no more until it is told something new, and it still serves.
+    assert_eq!(rig.store.shrink_ram(Duration::ZERO).unwrap(), 0);
+    for pair in [[2, 3], [4, 5], [0, 1]] {
+        rig.step(&[&pair[..], &pair[..], &pair[..]]);
+    }
 }

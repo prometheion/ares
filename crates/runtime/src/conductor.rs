@@ -128,8 +128,16 @@ const STALLED: Duration = Duration::from_millis(1);
 pub(crate) enum Command {
     Submit(Box<Submission>),
     Cancel(RequestId),
-    Stats { reset: bool, reply: SyncSender<StatsCopy> },
-    Inspect { reply: SyncSender<Vec<SequenceInfo>> },
+    Stats {
+        reset: bool,
+        reply: SyncSender<StatsCopy>,
+    },
+    Inspect {
+        reply: SyncSender<Vec<SequenceInfo>>,
+    },
+    /// The checkpoints may hold less page-locked memory than they do: the
+    /// conductor gives the coldest up, also while nothing runs.
+    Trim,
     Shutdown,
 }
 
@@ -600,6 +608,7 @@ impl Conductor {
                     &config,
                     config.cells_per_page,
                 )
+                .with_ram(exec.ram())
             }),
             admission: Admission::new(admission),
             slots: (0..slots).map(|_| None).collect(),
@@ -784,10 +793,18 @@ impl Conductor {
     /// The loop. Returns after a shutdown, when every request has ended.
     pub(crate) fn run(mut self) {
         loop {
-            // The level of the cache on SSD moves what is due, between steps.
+            // Between steps, in this order. First the level of the cache on
+            // SSD moves what is due: a checkpoint whose save has run leaves
+            // its place for the drive, and one that comes back takes a place.
+            // Then the checkpoints that the page-locked memory has no room
+            // for any more go, the coldest first, and only now are their
+            // places called unused, so that no transfer reads or writes
+            // memory that is given back. Every transfer of the pump has
+            // returned by then, and no step runs.
             let moving = match &mut self.cache {
                 Some(cache) => {
                     cache.pump(&mut self.pool, &mut *self.exec);
+                    self.stats.counters.checkpoints_dropped += u64::from(cache.trim());
                     cache.ssd_busy()
                 }
                 None => false,
@@ -877,6 +894,8 @@ impl Conductor {
             Command::Inspect { reply } => {
                 let _ = reply.send(self.inspect());
             }
+            // The loop trims between steps, at its top; this woke it.
+            Command::Trim => {}
             Command::Shutdown => self.shutting_down = true,
         }
     }

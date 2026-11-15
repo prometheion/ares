@@ -913,6 +913,7 @@ async fn metrics_are_the_engines_statistics_as_text() {
         "ares_cache_ssd_pages_read_total 3",
         "ares_cache_ssd_bytes 0",
         "ares_cache_ssd_pending 0",
+        "ares_cache_ssd_checkpoints_skipped_total 0",
         "ares_requests_cancelled_total 1",
         "ares_requests_refused_total 0",
         "ares_steps_total 5",

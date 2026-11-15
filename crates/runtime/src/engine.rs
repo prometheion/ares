@@ -107,6 +107,14 @@ impl Runtime {
         let (ready_tx, ready_rx) = mpsc::channel();
         let limit = card.context_length.min(config.pages.saturating_mul(config.cells_per_page));
         let warm_up = config.warm_up;
+        // When the checkpoints must give page-locked memory back, the
+        // conductor is woken to give the coldest up, also while nothing runs.
+        if let Some(ram) = executor.ram() {
+            let wake = Mutex::new(tx.clone());
+            ram.on_checkpoints(move |_, _| {
+                let _ = wake.lock().unwrap_or_else(|e| e.into_inner()).send(Command::Trim);
+            });
+        }
         let mut conductor = Conductor::new(model.clone(), config, executor, rx);
         let failure = conductor.failure();
         let running = Arc::new(AtomicBool::new(true));
@@ -154,14 +162,27 @@ impl Runtime {
         })
     }
 
-    /// Starts a runtime with a thread per device over `devices`.
+    /// Starts a runtime with a thread per device over `devices`. The engine
+    /// holds whatever the RAM limit of `gpu` allows.
     pub fn start_gpu(
         model: Arc<dyn Model>,
         devices: Vec<Device>,
         config: RuntimeConfig,
         gpu: GpuConfig,
     ) -> Result<Self, RuntimeError> {
-        let executor = GpuExecutor::start(model.clone(), devices, gpu)?;
+        Self::start_gpu_following(model, devices, config, gpu, None)
+    }
+
+    /// [`Runtime::start_gpu`] for an engine that follows the memory of
+    /// `machine` below the RAM limit of `gpu` (see [`crate::Machine`]).
+    pub fn start_gpu_following(
+        model: Arc<dyn Model>,
+        devices: Vec<Device>,
+        config: RuntimeConfig,
+        gpu: GpuConfig,
+        machine: Option<Arc<crate::Machine>>,
+    ) -> Result<Self, RuntimeError> {
+        let executor = GpuExecutor::start_following(model.clone(), devices, gpu, machine)?;
         Self::start(model, Box::new(executor), config)
     }
 
@@ -361,6 +382,7 @@ impl Engine for Runtime {
                 transfer_ns: c.ssd.transfer_ns,
                 store_bytes: c.ssd.store_bytes,
                 pending: c.ssd.pending,
+                checkpoints_skipped: c.ssd.states_skipped,
             },
         })
     }

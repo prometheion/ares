@@ -1380,7 +1380,7 @@ pub(crate) fn model_list(models: &[crate::models::Listed]) -> serde_json::Value 
 /// The body of `GET /metrics`.
 pub(crate) fn metrics(stats: &ares_api::EngineStats) -> String {
     let ssd = &stats.ssd;
-    let rows: [(&str, &str, &str, u64); 40] = [
+    let rows: [(&str, &str, &str, u64); 42] = [
         (
             "cache_ssd_pages_written_total",
             "counter",
@@ -1441,6 +1441,12 @@ pub(crate) fn metrics(stats: &ares_api::EngineStats) -> String {
             "gauge",
             "Pages and checkpoints that wait to be written to SSD",
             ssd.pending,
+        ),
+        (
+            "cache_ssd_checkpoints_skipped_total",
+            "counter",
+            "Checkpoints of recurrent state that were due on SSD and were given up unwritten",
+            ssd.checkpoints_skipped,
         ),
         (
             "requests_finished_total",
@@ -1570,6 +1576,12 @@ pub(crate) fn metrics(stats: &ares_api::EngineStats) -> String {
             "counter",
             "Time layers waited for the experts they missed, summed over layers",
             stats.experts.wait_us,
+        ),
+        (
+            "expert_ram_tier_bytes",
+            "gauge",
+            "Page-locked RAM the tier of experts holds now",
+            stats.experts.ram_tier_bytes,
         ),
     ];
     let mut text = String::new();

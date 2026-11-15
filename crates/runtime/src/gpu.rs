@@ -43,7 +43,7 @@ use crate::model::{
     DeviceContext, DeviceModel, DeviceTransfer, Model, ModelError, Split, StepContext,
     TransferContext,
 };
-use crate::ram::PinnedRam;
+use crate::ram::{Machine, PinnedRam};
 use crate::record::{self, RecordView};
 use crate::sync::{Bell, WakeCounts, Woke};
 use crate::timing::DeviceTimes;
@@ -61,8 +61,12 @@ pub struct GpuConfig {
     pub vram_headroom: u64,
     /// The engine's RAM limit: the most page-locked RAM the executor and the
     /// models' device parts lock together. What the executor needs to run
-    /// ([`required_ram`]) is booked first; the rest is for the checkpoints of
-    /// recurrent state, which are locked as they come into use.
+    /// ([`required_ram`]) is booked first; the rest is for the tier of
+    /// experts of a model that has one and for the checkpoints of recurrent
+    /// state, which are locked as they come into use. The buffers of the
+    /// prefix cache's level on SSD are ordinary memory and not in this
+    /// limit ([`crate::SsdConfig::transit_ram`]): who names a limit for all
+    /// the engine's host memory takes them off it first.
     pub ram_limit: u64,
     /// The pool's pages, and the bytes of state they take on each device
     /// (the pages times the model's bytes per page there): reserved in the
@@ -226,10 +230,24 @@ struct Init {
 impl GpuExecutor {
     /// Opens the model on `devices` (one part per device) and starts a thread
     /// for each. Returns when every part is built, or with the first error.
+    /// The engine holds whatever its RAM limit allows.
     pub fn start(
         model: Arc<dyn Model>,
         devices: Vec<Device>,
         config: GpuConfig,
+    ) -> Result<Self, RuntimeError> {
+        Self::start_following(model, devices, config, None)
+    }
+
+    /// [`GpuExecutor::start`] for an engine that follows the memory of
+    /// `machine` below its RAM limit: the tier of experts and the
+    /// checkpoints hold what the machine has and give it back when it gets
+    /// short.
+    pub fn start_following(
+        model: Arc<dyn Model>,
+        devices: Vec<Device>,
+        config: GpuConfig,
+        machine: Option<Arc<Machine>>,
     ) -> Result<Self, RuntimeError> {
         if devices.len() != model.devices() {
             return Err(RuntimeError::Config(format!(
@@ -252,7 +270,10 @@ impl GpuExecutor {
 
         // Page-locked memory is the host's scarcest kind; it is reserved
         // before it is taken.
-        let ram = PinnedRam::new(config.ram_limit);
+        let ram = match &machine {
+            Some(machine) => PinnedRam::following(config.ram_limit, machine),
+            None => PinnedRam::new(config.ram_limit),
+        };
         ram.require(required_ram(&*model, config.max_slots))?;
 
         let streams = devices
@@ -457,6 +478,10 @@ impl Executor for GpuExecutor {
             }
         }
         Ok(())
+    }
+
+    fn ram(&self) -> Option<PinnedRam> {
+        Some(self.ram.clone())
     }
 
     fn device_wakes(&self) -> WakeCounts {

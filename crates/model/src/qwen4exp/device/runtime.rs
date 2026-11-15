@@ -35,10 +35,12 @@ use ares_core::Ledger;
 use ares_cuda::{Device, DevicePtr, ENTRY_CELLS, Event, MAX_BATCH, Segment, StepRecord, Stream};
 use ares_gguf::Gguf;
 use ares_io::Reader;
-use ares_runtime::expert_store::{CudaSlots, Serve, StoreConfig, StorePlan, StoreStats};
+use ares_runtime::expert_store::{
+    CudaSlots, HostRegion, PIECE, Serve, StoreConfig, StorePlan, StoreStats,
+};
 use ares_runtime::{
     ContextSpec, DeviceContext, DeviceModel, LinkSpec, Logits, Model, ModelError, OwnDrafts, Pick,
-    Split, StepContext,
+    PinnedRam, Split, StepContext,
 };
 use ares_state::PageLayout;
 use ares_tokenizer::{ChatOptions, Tokenizer};
@@ -54,7 +56,7 @@ use super::ngram::NgramFeed;
 use super::part::{
     ExpertAt, Frame, Options, PAGE_ENTRY, Part, PartSetup, PartShape, Ports, StepEnv,
 };
-use super::placement::{MARGIN, PartPlan, Placement, ram_tier_bytes};
+use super::placement::{MARGIN, PartPlan, Placement};
 use super::session::{Chosen, Fill, PartReport, SessionOptions, choose};
 use crate::chat;
 use crate::qwen4exp::weights::{DraftWeights, Weights};
@@ -222,7 +224,14 @@ struct PlanBox {
     plan: StorePlan,
     map: ares_io::ExpertMap,
     reader: Reader,
+    /// The bytes of the RAM tier that are locked at the start.
+    ram_start: u64,
 }
+
+/// How long the tier of experts locks pieces at a time when it may hold
+/// more and no step runs: the thread that watches the machine's memory does
+/// it, it must look again soon, and a step that begins waits for it.
+const GROW_SLICE: Duration = Duration::from_millis(40);
 
 // --- what the device threads share in a step --------------------------------
 
@@ -248,8 +257,6 @@ pub(super) struct Flow {
     /// Uploads and reads the store had finished the last time anyone looked.
     uploads_seen: AtomicU64,
     stall: Duration,
-    /// The bytes of the tier of experts in RAM.
-    ram_bytes: u64,
     /// What the store counted, summed over the times it was read.
     totals: Mutex<ExpertStats>,
     /// What the wide steps found and waited for, since the engine started.
@@ -282,6 +289,33 @@ impl Flow {
 
     pub(super) fn lock_feed(&self) -> MutexGuard<'_, Feed> {
         self.feed.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The tier of experts in RAM follows `allowance`, the bytes it may hold.
+    /// Called by the thread that watches the machine's memory. A running
+    /// step gives pieces up, and takes one, when it ends
+    /// ([`Flow::finish`]); when no step runs, this gives them up and locks
+    /// pieces for a while, and no step begins meanwhile: the driver's unlock
+    /// waits for the device, and a step's kernels can wait for the store.
+    fn follow_ram(&self, ram: &PinnedRam, allowance: u64) {
+        let mut feed = self.lock_feed();
+        feed.store.set_ram_target(allowance);
+        if feed.store.waiting() > 0 {
+            return;
+        }
+        if feed.store.shrink_ram(Duration::ZERO).is_err() {
+            self.fail();
+        }
+        drop(feed.store.take_released());
+        if feed.store.ram_at_floor() {
+            ram.experts_floor(feed.store.ram_bytes().0);
+        }
+        let begun = Instant::now();
+        while begun.elapsed() < GROW_SLICE && !feed.store.in_step() {
+            if !matches!(feed.store.grow_ram(1), Ok(1)) {
+                break;
+            }
+        }
     }
 
     fn lock_ngram(&self) -> MutexGuard<'_, NgramFeed> {
@@ -437,7 +471,12 @@ impl Flow {
     /// the store.
     fn finish(&self) -> Result<(), ModelError> {
         if self.finished.fetch_add(1, Ordering::AcqRel) + 1 == self.parts() {
-            self.lock_feed().end_step().map_err(model_error)?;
+            let mut feed = self.lock_feed();
+            feed.end_step().map_err(model_error)?;
+            // What the tier gave up at the end of this step is unlocked
+            // here, where every device has ended the step and none has
+            // begun the next.
+            drop(feed.store.take_released());
         }
         Ok(())
     }
@@ -774,8 +813,12 @@ impl Qwen4Exp {
     pub fn take_store_stats(&self) -> Option<StoreStats> {
         let flow = self.flow.get()?;
         flow.fold_wide();
-        let stats = flow.lock_feed().store.take_stats();
+        let (stats, ram_bytes) = {
+            let mut feed = flow.lock_feed();
+            (feed.store.take_stats(), feed.store.ram_bytes().0)
+        };
         let mut totals = flow.totals.lock().unwrap_or_else(|e| e.into_inner());
+        totals.ram_tier_bytes = ram_bytes;
         totals.picks += stats.picks;
         totals.hits += stats.hits;
         totals.from_ram += stats.miss_from_ram;
@@ -790,7 +833,8 @@ impl Qwen4Exp {
     }
 
     /// The slots of the experts in VRAM and in the RAM tier, over all layers,
-    /// and the bytes of the RAM tier; `None` before the parts are open.
+    /// and the bytes of the RAM tier, as they are now (the RAM tier follows
+    /// the memory the machine has); `None` before the parts are open.
     pub fn expert_slots(&self) -> Option<(usize, usize, u64)> {
         let flow = self.flow.get()?;
         let feed = flow.lock_feed();
@@ -798,7 +842,8 @@ impl Qwen4Exp {
             let (vram, ram) = feed.store.slots(at);
             (v + vram, r + ram)
         });
-        Some((vram, ram, flow.ram_bytes))
+        let ram_bytes = feed.store.ram_bytes().0;
+        Some((vram, ram, ram_bytes))
     }
 
     /// The slots of the draft block's experts in VRAM and in the RAM tier;
@@ -940,15 +985,18 @@ impl Qwen4Exp {
                 });
                 let map = expert_map(&self.gguf, c, layout.per_layer, draft_layer.as_ref())
                     .map_err(model_error)?;
-                let ram_bytes = ram_tier_bytes(
-                    Some(ram.obtainable_experts()),
-                    layout.ram_wanted(vram.iter().sum()),
-                );
+                // The tier is planned for all it can ever hold, what the limit
+                // leaves and the experts without a slot in VRAM can use, and
+                // starts with what it may hold now. Staging is sized for the
+                // tier as it starts.
+                let reach = ram.obtainable_experts().min(layout.ram_wanted(vram.iter().sum()));
+                ram.want_experts(reach, 0);
+                let ram_start = ram.experts_allowance().min(reach);
                 let mut config = StoreConfig::new(
                     o.max_rows.min(MAX_BATCH),
                     c.experts.used as u32,
                     vram,
-                    ram_bytes,
+                    ram_start,
                 );
                 if let Some(reserve) = self.opts.reserve {
                     config.vram_reserve = reserve;
@@ -956,9 +1004,11 @@ impl Qwen4Exp {
                 if o.max_rows > MAX_BATCH {
                     plan_transit(&mut config, layout, &reader, self.opts.transit);
                 }
+                config.ram_bytes = reach;
+                config.ram_piece = self.opts.ram_piece.unwrap_or(PIECE) as u64;
                 let plan = StorePlan::new(config, &map, &reader, &layout.specs, None)
                     .map_err(|e| invalid(e.to_string()))?;
-                build.plan = Some(PlanBox { plan, map, reader });
+                build.plan = Some(PlanBox { plan, map, reader, ram_start });
                 Ok(())
             },
         )?;
@@ -987,15 +1037,20 @@ impl Qwen4Exp {
                 Ok(())
             },
             |build| {
-                let PlanBox { plan, map, reader } =
+                let PlanBox { plan, map, reader, ram_start } =
                     build.plan.take().ok_or_else(|| invalid("no plan was made"))?;
                 let slots: Vec<CudaSlots> =
                     build.slots.iter_mut().filter_map(Option::take).collect();
                 for d in 0..n {
                     build.slot_bytes[d] = plan.vram_bytes(d);
                 }
-                let tier = ram.lock_experts(device, plan.ram_bytes() as u64)?;
-                let ram_bytes = plan.ram_bytes() as u64;
+                let reach = plan.ram_bytes() as u64;
+                let tier = HostRegion::elastic(
+                    plan.ram_bytes(),
+                    ram_start as usize,
+                    ram.expert_pieces(device),
+                )
+                .map_err(|e| invalid(e.to_string()))?;
                 // Cores for the threads that drive the step: the conductor and
                 // one for each device.
                 let cpu = (serve != Serve::Stream)
@@ -1004,6 +1059,8 @@ impl Qwen4Exp {
                     .map_err(model_error)?;
                 let store = build_store(plan, layout, map, reader, slots, tier, cpu)
                     .map_err(model_error)?;
+                let ram_bytes = store.ram_bytes().0;
+                let ram_fixed = store.ram_fixed_bytes();
                 let mut firsts = Vec::with_capacity(n);
                 for d in 0..n {
                     let part = self.placement.part(c, d);
@@ -1048,7 +1105,6 @@ impl Qwen4Exp {
                     failed: AtomicBool::new(false),
                     uploads_seen: AtomicU64::new(0),
                     stall: self.opts.stall,
-                    ram_bytes,
                     wide: Mutex::new(WideStats::default()),
                     totals: Mutex::new(ExpertStats {
                         ram_tier_bytes: ram_bytes,
@@ -1056,6 +1112,15 @@ impl Qwen4Exp {
                     }),
                 });
                 let _ = self.flow.set(flow.clone());
+                // From here on the tier follows what it is allowed: its
+                // staging slots are the part it never gives up.
+                ram.want_experts(reach, ram_fixed);
+                let follower = Arc::downgrade(&flow);
+                ram.on_experts(move |ram, allowance| {
+                    if let Some(flow) = follower.upgrade() {
+                        flow.follow_ram(ram, allowance);
+                    }
+                });
                 build.flow = Some(flow);
                 Ok(())
             },

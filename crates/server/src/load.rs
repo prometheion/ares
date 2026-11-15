@@ -19,7 +19,7 @@
 //! each part really took next to what was estimated.
 
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 use ares_api::Engine;
@@ -31,7 +31,9 @@ use ares_model::qwen35::device::{
 };
 use ares_model::qwen35::weights::{Matrix, Mixer};
 use ares_model::qwen35::{Config, Weights};
-use ares_runtime::{GpuConfig, Model, Runtime, RuntimeConfig, Split, SsdConfig, required_ram};
+use ares_runtime::{
+    GpuConfig, Machine, Meminfo, Model, Runtime, RuntimeConfig, Split, SsdConfig, required_ram,
+};
 use ares_tokenizer::ChatOptions;
 
 use crate::models::{LoadFailure, Loader, Site, Unit};
@@ -665,10 +667,28 @@ pub(crate) fn hold_devices(options: &LoadOptions) -> Result<(Vec<u32>, Vec<Held>
     Ok((ordinals, held))
 }
 
-/// The most host RAM the engine may use: what the operator named, or half of
-/// what the machine has available now. `required` is what the engine needs to
-/// run at all, its step buffers; `nothing` says what is not spared when the
-/// machine reports no available memory.
+static WATCH: OnceLock<Arc<Machine>> = OnceLock::new();
+
+/// The watch over the machine's memory that the engines of this process
+/// follow: the machine itself ([`Machine::system`]), unless [`follow`] named
+/// another before the first model was loaded.
+pub fn watch() -> Arc<Machine> {
+    WATCH.get_or_init(Machine::system).clone()
+}
+
+/// Makes the engines of this process follow `machine`. For a test or a tool
+/// that gives the engine a memory of its own to follow (a machine with less
+/// than this one has, say); the server never calls it. Returns false, and
+/// changes nothing, once a watch is in use.
+pub fn follow(machine: Arc<Machine>) -> bool {
+    WATCH.set(machine).is_ok()
+}
+
+/// The most host RAM the engine may use: what the operator named, or all the
+/// machine has. Below that limit the engine follows the machine
+/// ([`Machine`]): its elastic memory is what is available less a headroom.
+/// `required` is what the engine needs to run at all, its step buffers;
+/// `nothing` says what is not spared when the machine reports no memory.
 pub(crate) fn ram_limit(
     options: &LoadOptions,
     site: &Site,
@@ -688,25 +708,32 @@ fn ram_limit_of(
     nothing: &str,
 ) -> Result<(u64, String), LoadError> {
     let required: u64 = needs.iter().map(|(_, bytes)| bytes).sum();
-    let available = std::fs::read_to_string("/proc/meminfo")
-        .ok()
-        .and_then(|text| plan::parse_available_ram(&text));
+    let machine = watch();
+    // What the engine really holds below its limit, as it stands now.
+    let follows = match machine.available() {
+        Some(available) => format!(
+            "below it the engine holds what the machine has available, {} now, less a headroom \
+             of {}, and gives memory back when other programs need it",
+            Bytes(available),
+            Bytes(machine.headroom())
+        ),
+        None => "the machine does not report what it has available, so the engine holds no \
+                 more than it needs to run"
+            .to_owned(),
+    };
     let (ram, why_ram) = match options.ram {
         Some(ram) if site.ram_is_rest => {
-            (ram, "what the server's limit has left next to the loaded models".to_owned())
+            (ram, format!("what the server's limit has left next to the loaded models; {follows}"))
         }
-        Some(ram) => (ram, "as asked".to_owned()),
-        None => match available {
-            Some(available) => (
-                plan::default_ram(Some(available)).max(required),
-                format!(
-                    "half of the {} the machine has available now; --ram changes it",
-                    Bytes(available)
-                ),
+        Some(ram) => (ram, format!("as asked; {follows}")),
+        None => match Meminfo::total() {
+            Some(total) => (
+                plan::default_ram(Some(total)).max(required),
+                format!("all the machine has; {follows}; --ram sets a lower limit"),
             ),
             None => (
                 required,
-                format!("the machine reports no available memory, so {nothing}; --ram sets it"),
+                format!("the machine reports no memory, so {nothing}; --ram sets the limit"),
             ),
         },
     };
@@ -1125,8 +1152,10 @@ fn load_qwen35(
     // host memory, the table and the rows of a step. A limit below that is
     // refused: the table does not go back to a device, whose memory is what
     // bounds the context. The rest is the budget of the checkpoints of
-    // recurrent state (the only other user today), which are locked as they
-    // come into use.
+    // recurrent state (the only other user in a model without experts),
+    // which are locked as they come into use, as far as the machine has the
+    // memory, and given back when it gets short. The prompt cache on SSD
+    // adds two needs of its own, below.
     let required = required_ram(&*model, parallel);
     let table = model.pinned_ram();
     let mut needs = vec![("its step buffers", required - table)];
@@ -1140,35 +1169,52 @@ fn load_qwen35(
     let checkpoint = model.prefix_cache().map_or(0, |cache| cache.bytes());
     // The prompt cache on SSD moves a checkpoint through a place in RAM, on
     // its way to the drive and back: with a directory for it, one place is
-    // what the engine needs, whatever else the limit leaves for checkpoints.
+    // what the engine needs, whatever else the limit leaves for checkpoints
+    // and whatever the machine has (the cache's floor in the engine's books).
+    // And it moves pages and checkpoints through buffers of ordinary memory,
+    // which the engine holds once they are in use: they are not page-locked,
+    // so they are not in those books, and they count against the limit here.
     let ssd = options.cache.as_ref().map(|dir| {
         SsdConfig::new(dir, options.cache_size.unwrap_or(crate::plan::DEFAULT_CACHE_SIZE))
     });
-    if ssd.is_some() && checkpoint > 0 {
+    let durable = ssd.as_ref().and_then(|_| model.durable(CELLS_PER_PAGE));
+    let transit = durable.as_ref().map_or(0, SsdConfig::transit_ram);
+    let through = durable.is_some() && checkpoint > 0;
+    if through {
         needs.push((
             "one checkpoint of recurrent state on its way to the prompt cache on SSD or back",
             checkpoint,
         ));
     }
+    if transit > 0 {
+        needs.push((
+            "the pages and checkpoints in transit to the prompt cache on SSD and back, at \
+             their most (ordinary memory, taken as it is first used)",
+            transit,
+        ));
+    }
     let (ram, why_ram) = ram_limit_of(options, site, &needs, "none is spared for checkpoints")?;
+    // What the engine may page-lock: the limit less the buffers in transit.
+    let lockable = ram - transit;
     let runtime_config = RuntimeConfig {
         pages,
         cells_per_page: CELLS_PER_PAGE,
         max_slots: parallel,
         window_rows: if mtp { window } else { 1 },
-        checkpoint_budget: ram - required,
+        checkpoint_budget: lockable - required,
         ssd: ssd.clone(),
         ..RuntimeConfig::default()
     };
     let gpu = GpuConfig {
         vram_headroom: headroom,
-        ram_limit: ram,
+        ram_limit: lockable,
         ..GpuConfig::new(&runtime_config, &*model)
     };
     tracing::info!(
-        "plan: RAM, at most {} for the engine ({why_ram}): {} for its step buffers{}, the rest \
-         for checkpoints of recurrent state, {} each over all devices, {}; the memory is \
-         page-locked as checkpoints are taken",
+        "plan: RAM, at most {} for the engine ({why_ram}): {} for its step buffers{}{}, the \
+         rest for checkpoints of recurrent state, {} each over all devices, {}; the memory is \
+         page-locked as checkpoints are taken, and the coldest checkpoints are given up when \
+         the machine needs it{}",
         Bytes(ram),
         Bytes(required - table),
         match table {
@@ -1178,16 +1224,33 @@ fn load_qwen35(
                 Bytes(bytes)
             ),
         },
+        match transit {
+            0 => String::new(),
+            bytes => format!(
+                ", at most {} for pages and checkpoints in transit between the devices and \
+                 the prompt cache's store on SSD (ordinary memory, taken as it is first used)",
+                Bytes(bytes)
+            ),
+        },
         Bytes(checkpoint),
         match checkpoint {
             0 => "none for this model".to_owned(),
-            bytes => format!("room for {}", (ram - required) / bytes),
+            bytes => format!("room for {}", (lockable - required) / bytes),
+        },
+        match through {
+            true =>
+                ", down to the one that checkpoints pass through on their way to the prompt \
+                 cache's store on SSD and back: that place is kept whatever the machine has",
+            false => "",
         }
     );
     tracing::info!("loading the weights");
     let loading = Instant::now();
     let devices: Vec<Device> = held.iter().map(|h| h.device.clone()).collect();
-    let runtime = Runtime::start_gpu(model.clone(), devices, runtime_config, gpu).map_err(|e| {
+    let machine = Some(watch());
+    let started =
+        Runtime::start_gpu_following(model.clone(), devices, runtime_config, gpu, machine);
+    let runtime = started.map_err(|e| {
         let error = e.to_string();
         // A context that was estimated to fit and did not is the server's
         // mistake, and the operator should know the way around it.

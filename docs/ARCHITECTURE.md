@@ -723,9 +723,10 @@ prefix cache yet.
   a store at a time (a lock file); a second server on the same directory and
   fingerprint runs without the level and says so.
 - **Bytes move outside of steps.** The conductor calls
-  `Executor::transfer` between steps (`Cache::pump`, at the top of its loop):
-  the device threads copy pages and checkpoint places to or from buffers in
-  host memory and wait for their streams. One writer thread writes the
+  `Executor::transfer` between steps (`Cache::pump`, at the top of its loop,
+  before it gives up the checkpoints that host memory has no room for; see
+  "RAM" below): the device threads copy pages and checkpoint places to or
+  from buffers in host memory and wait for their streams. One writer thread writes the
   buffers to the store and syncs the drive a second after its last record
   (and every ten seconds while records keep coming); four reader threads
   read and check what comes back. The step loop does not wait for the drive:
@@ -803,9 +804,50 @@ prefix cache yet.
   again (what was written between its loss and the next sync is lost), and a
   damaged or missing file costs the runs that needed it.
 - **RAM.** A checkpoint goes to the drive and comes back through a
-  checkpoint place, so one place is what the level needs of the RAM limit
-  (the server counts it as required when `--cache` is given); with more room
-  the places keep the hot checkpoints as before.
+  checkpoint place, so one place is what the level needs of the RAM limit;
+  with more room the places keep the hot checkpoints as before. The places
+  are the lowest user of the engine's page-locked memory, which follows what
+  the machine has ("Host memory"), and this is how the two meet:
+  - *One place is kept whatever the machine has.* It is the floor of the
+    checkpoints in the engine's books (`PinnedRam::want_checkpoints`), as
+    the staging of the experts is the floor of their tier: the machine is
+    not given it, and a tier of experts could not take it. On a machine with
+    no room for checkpoints a prompt still resumes from SSD (its checkpoint
+    lands in that place and is restored from it), and the checkpoints of
+    what is computed still reach the drive, one after the other through
+    places: the one a restore reads and the one of the next save, never
+    more. Without `--cache` there is no floor, and the same machine leaves
+    the cache no checkpoint at all.
+  - *One order between steps.* The conductor pumps the level on SSD first
+    and gives checkpoints up after, in the same turn of its loop. A
+    checkpoint whose save has run has therefore left its place for a buffer
+    in transit before the place is called unused and its memory can go back
+    to the system; what is in a buffer or with the writer is written
+    whatever happens to the place. When the writer holds every buffer, that
+    checkpoint is given up after the 250 ms above, as without a machine to
+    follow. A place that the level on SSD has yet to read is not called
+    unused whichever of the two comes first, and a device part that is asked
+    to read a checkpoint out of a place whose memory went back fails that
+    transfer instead of locking new memory to read from
+    (`PlaceChunks::held`).
+  - *A save that has not run has nothing to write.* A checkpoint that is
+    given up before the record with its save was written (memory ran short
+    between two steps, or a checkpoint from the drive needed the place)
+    loses that save, and the level on SSD forgets it with it: nothing is
+    copied out of a place that never held it. The pages of that text are
+    written all the same; the next checkpoint of the sequence, or of the
+    next turn, is the one a later prompt resumes from.
+  - *Nothing of this is silent.* The checkpoints that went from RAM are
+    counted (`ares_checkpoints_dropped_total`), and so are the ones that
+    were due on the drive and were not written, for either reason
+    (`ares_cache_ssd_checkpoints_skipped_total`).
+  - *The buffers in transit* (16 pages and 3 checkpoints at their most, 545
+    MB with the 27B in `q8`: 16 x 4.62 MB and 3 x 157 MB) are ordinary
+    memory outside the books of page-locked memory. The server counts their
+    most against `--ram` next to those books: a limit below what the engine
+    needs to run with them is refused, and the plan line of the log names
+    them and the place that is kept. The watch over the machine sees them as
+    memory of its own process, not as another program that grows.
 - **Measured** 2026-11-15 with the server and `--cache`: Qwen3.8-27B Q4_K_S
   on the RTX 4070 and the RTX 3060, tensor split 0.625 / 0.375, two sequence
   slots, the model's draft block on. A conversation whose first prompt has
@@ -3584,8 +3626,10 @@ RAM, 7.5 GiB, outside the books of the limit; that is 37 % more slots and about
 half the reads from the file. With a limit that lets the tier hold every
 expert the VRAM has no slot for (about 16 GiB on this machine), reads from the
 file stop after the first use of an expert. Raising `--ram` is the lever, and
-how much RAM is free is the user's to say; the limit is not raised by itself.
-The tier does not shrink if another user of the machine needs the memory.
+how much RAM is free is the user's to say. (Since 2026-11-15 the default limit
+is all the machine has and the tier follows what is available, giving memory
+back when another user of the machine needs it; see "Host memory" and the
+measurement there.)
 
 **Taking part in the prefix cache** (`prefix_cache()` is `None`: every prompt
 is computed from its first token, a request that gives way comes back as a
@@ -4158,26 +4202,76 @@ order it would be taken up; the source of each idea is in
 
 ## Host memory
 
-There is one setting for RAM: the most the whole engine may use. Inside that
-limit the users of memory make room for each other; nobody is given a fixed
-share.
+There is one setting for RAM: the most the whole engine may use (`--ram`;
+without it, all the machine has). Inside that limit the users of memory make
+room for each other; nobody is given a fixed share. The limit only caps what
+the engine holds. What it really holds follows the machine: page-locked
+memory is the one kind the kernel cannot take back (it is neither swapped nor
+reclaimed), so an engine that locks what is free must watch the machine
+itself, and it gives memory back in time when another program grows, with or
+without a limit that was named.
 
 | User | Kind | When memory is short |
 | --- | --- | --- |
-| K/V pages of running sequences that do not fit in VRAM (KV offload) | Required | Never gives way; everything below shrinks for it |
-| RAM tier of MoE experts | Elastic, high | Shrinks to the working set the running requests need (it does not shrink yet: nobody competes with it) |
-| Row caches and staging | Elastic, middle | Shrink to a small floor |
-| Prompt cache in RAM (pages of finished conversations) | Elastic, low | Goes first; its pages are on SSD as well (with `--cache`; the checkpoints are its RAM today, and one place is required for the way to the drive) |
+| What the engine needs to run: step buffers, read-back buffers, the token embedding table where it lies on the host; with `--cache` also one checkpoint place and the buffers that state passes through on its way to the drive and back (ordinary memory) | Required | Never gives way. A limit below it is refused at load |
+| RAM tier of MoE experts | Elastic, the highest | Gets all that is not required, as far as it can use it, and is the last to shrink: it gives pieces back only when the prompt cache has nothing left in RAM |
+| Staging of the experts on their way from the file into transit | Part of the tier | The pieces that hold it are never given up |
+| Prompt cache in RAM (checkpoints of recurrent state; pages of finished conversations when they are built) | Elastic, the lowest | Goes first: down to nothing without `--cache`, and a checkpoint that goes is gone; down to the one place above with `--cache`, where the checkpoints at page boundaries are on SSD as well and a prompt that needs one brings it back |
 
-A broker in `ares-core` keeps the books: a user asks to grow, and when the
-memory is not free the broker names who must give back how much, lowest
-priority first and never below a floor. KV offload of a running request can
-therefore only fail when the limit is too small for the requests themselves,
-not because a cache holds the memory. VRAM is handled the same way in spirit
-but is planned ahead (ledgers), because moving things there is costly.
+Nothing is reserved for K/V pages that leave VRAM (KV offload, not built):
+that is an exceptional case, and when it happens it takes from the users
+above like any other need.
 
-**What is built.** The broker is `PinnedRam` (`crates/runtime/src/ram.rs`),
-shared by the executor and the device threads. It has three users so far:
+A broker in `ares-core` keeps the books of the limit: a user asks to grow, a
+grant beyond the limit is refused, and the refusal names who holds what. Below
+the limit every elastic user keeps to an **allowance**, the bytes it may hold
+now, and that is what moves. VRAM is handled the same way in spirit but is
+planned ahead (ledgers), because moving things there is costly.
+
+**The rule** (`crates/runtime/src/ram/machine.rs`: `Rule`, `Follow`,
+`Machine`). One watch per process reads `MemAvailable` every 50 ms, and every
+5 ms while a release is under way.
+
+- *The headroom* is what the engine leaves available. It is not a round
+  number but the sum of two things that can be stated. First, what the kernel
+  keeps free for itself before it stops reclaiming: the high watermarks of
+  its zones (`/proc/zoneinfo`; 33 150 pages, 129.5 MiB, on the machine of
+  the measurements below). Second, what other programs can take while the
+  engine is still giving: the fastest growth of the others that was seen
+  (bytes per second over the last four looks, what the process itself holds
+  taken out) times the time the engine needs to react (the period of the looks
+  plus the slowest release that was seen, from the look that asked to the
+  look that found the memory gone). Until something faster or slower was
+  seen the rule assumes 2 GiB per second (one thread that writes to new
+  pages: the helper of the measurement below wrote 1.4 to 1.9 GiB per
+  second) and 100 ms; what was seen above the assumptions is forgotten by
+  half every ten minutes. On that machine the headroom is 129.5 MiB + 2
+  GiB/s x 150 ms = 437 MiB until something else was seen. It has a most, a
+  sixteenth of the machine's RAM (1.95 GiB there), so that one jump of the
+  machine's numbers does not cost the engine its memory for the hour it
+  takes to forget it.
+- *Giving back.* When less than the headroom is available, the elastic users
+  together may hold that much less than they hold, at once: the checkpoints
+  first, the tier of experts when they have nothing left, the engines of a
+  process alike. What is required is not in that sum and is never asked for.
+- *Taking.* When more than the headroom and a band (two pieces, or a quarter
+  of the headroom when that is more) has been available for a while, the
+  users may hold the surplus down to the middle of the band. The wait is 3 s
+  at first and doubles, up to 5 minutes, when memory had to be given back
+  within a minute of taking it (once for every take); a give long after the
+  last take starts it at 3 s again. A program that allocates and frees is so followed down at
+  once and up more and more slowly. Memory that is free when a model is
+  loaded is taken at the load without the wait.
+- *Dividing.* What the elastic users may hold is divided by rank: the tiers
+  of experts of all loaded models first, each the same as far as it can use
+  it, then the checkpoints with what is left.
+
+**What is built.** The books are `PinnedRam` (`crates/runtime/src/ram.rs`),
+shared by the executor and the device threads. An engine with a fixed limit
+(`PinnedRam::new`: the tests and tools that set the limit to what they
+measure) holds whatever the limit allows; an engine that follows a `Machine`
+(`PinnedRam::following`: every engine of the server) has its allowances set
+look by look. The users:
 
 - the step record and the read-back buffers of the devices, with the
   page-locked buffers a model's parts hold (required, booked at start:
@@ -4187,43 +4281,198 @@ shared by the executor and the device threads. It has three users so far:
   the device keeps the whole table (see "The token embedding of `qwen35`",
   also for what a limit below it does: the server refuses it and names the
   shares);
-- the tier of experts of a mixture-of-experts model (elastic, priority 100,
-  floor 0), which the model locks once at load: as much as the limit leaves
-  and the experts that have no VRAM slot can use. It does not give anything
-  back yet, since nothing ranks above it that could ask;
-- the checkpoints of recurrent state of the prefix cache (elastic, the lowest
-  priority, floor 0), which a device part locks in chunks of at least 32 MiB
-  when a place is first used and keeps locked while the engine runs. They
-  give way to the tier when both are asked for.
+- the tier of experts of a mixture-of-experts model. Its memory is one range
+  of addresses planned for all the tier can ever hold (what the limit leaves
+  and the experts without a VRAM slot can use), page-locked in **pieces of 64
+  MiB** (`expert_store/region.rs`): a piece takes memory when it is locked
+  and gives it back to the system when it is released (unlocked, then
+  `MADV_DONTNEED`). A piece is whole slots
+  of one pool and starts on a page, because a device copies from one locked
+  range and not across two. The size comes from what a lock and a release
+  cost (RTX 4070, 2026-11-15, load average 22, two rounds each): locking a
+  GiB for a device (`cuMemHostRegister`, which also brings the pages in) took
+  380 to 680 ms whatever the size of the pieces, 32 to 43 ms for a piece of
+  64 MiB; releasing a GiB took 105 to 111 ms in pieces of 64 MiB (7 ms a
+  piece, the slowest 10 to 13 ms), 142 to 166 ms in pieces of 16 MiB and 76
+  to 102 ms in pieces of 256 MiB (21 to 43 ms a piece). With 64 MiB a release
+  takes effect within about 10 ms and a GiB is back in a ninth of a second.
+  The kernel's count of the process's resident memory went from 192 to 1216
+  MiB and back to 192 in every round. The tier starts with the pieces its allowance
+  holds. When the allowance falls, pieces are given up between steps, once no
+  read, copy or CPU job touches the tier's memory (the end of a step waits up
+  to 20 ms for what is on its way and tries again after the next step
+  otherwise; an idle engine gives them up on the watch's thread). A piece is
+  a range of addresses whose slots belong to a few layers and hold whatever
+  was read into them, so it is not given up as it lies: every layer of the
+  pool gives slots in proportion to what it has above the two a layer keeps,
+  each layer gives its coldest (the copies of experts that VRAM holds first),
+  and the experts that lie in the piece and stay are copied into the slots
+  that were given (`expert_store/elastic.rs`). The driver's unlock waits for
+  the device to finish what it has, and a step's kernels can wait on the
+  device for an expert the store brings, so a piece is never unlocked while
+  a step runs: the thread that ends the step unlocks what the step's end gave
+  up, where every device has ended the step, and the watch's thread does it
+  for an engine that runs nothing, with the store held so that no step
+  begins meanwhile. When the allowance rises, a piece is locked at the end
+  of every step (that step ends 30 to 70 ms later), or by the watch for 40
+  ms at a time while nothing runs, and its slots come back empty; they fill
+  from what the routers pick. The piece that holds staging is never given
+  up, and the tier says so when it can give no more;
+- the checkpoints of recurrent state of the prefix cache, which a device
+  part locks in chunks of at least 32 MiB when a place is first used
+  (`PlaceChunks`). The conductor keeps no more checkpoints than their
+  allowance holds: it takes none when the allowance has no room, gives the
+  coldest up when it falls (between steps; an idle conductor is woken for
+  it), and tells the books which places are in use. A chunk in which no place
+  is in use is unlocked and freed (`PinnedRam::sweep_checkpoints`), and
+  locked again when a place in it is used again. In a model whose checkpoint
+  is larger than a chunk (the 27B), a chunk is a place; in a small model a
+  chunk goes only when all its places are free, and checkpoints are not moved
+  to make one free. With the prompt cache on SSD the allowance has a floor
+  of one place, and the conductor gives checkpoints up only after the level
+  on SSD has taken what is due out of their places (see "RAM" under "On
+  SSD"). The cache counts the floor as one place; the books forgive the
+  chunk that place lies in on every device, since in a small model a chunk
+  holds several places and goes only as a whole;
+- the buffers of the prompt cache on SSD (`--cache`): ordinary memory,
+  aligned for direct I/O, allocated when first used and kept. They are not
+  in the books; the server takes their most (`SsdConfig::transit_ram`) off
+  the limit before it hands the rest to the books.
+
+Inside one engine there is nobody else today: a mixture of experts has no
+prefix cache and a dense model has no experts, so the two elastic users never
+meet in one set of books, and a prompt's working memory, staging and
+checkpoints do not borrow from each other at run time (staging is a fixed
+part of the tier, sized at load for the tier as it starts). The ranks decide
+between the engines of a server (see "Several models"). What does meet inside
+a dense model's engine is the checkpoints and the level of the prompt cache
+on SSD, which reads checkpoints out of the places and writes them back in;
+the rules for that are under "On SSD".
 
 The limit is `GpuConfig::ram_limit`, which the server sets from `--ram`
-(default: half of what the machine reports as available when it starts; the
-log states it and the reason). For a model with a prefix cache, what the limit
-leaves after the required memory is the checkpoint budget of the conductor
-(`RuntimeConfig::checkpoint_budget`), so the places the conductor hands out
-never lock more than the limit; for a mixture of experts it is the tier. Nobody
-asks the checkpoints to give memory back yet, as nothing competes with them; a
-lock that does not fit fails the step with the books in the message. The first
-use of a place waits for the lock on the device's thread (21 to 22.5 ms for
-93.5 MiB, 11.8 ms for 56.1 MiB, measured with the 27B); locking ahead in the
-background is not built. `GET /metrics` reports the bytes locked
-(`ares_checkpoint_ram_bytes`) and the counters of the expert store
-(`ares_expert_*`).
+(default: all the machine has; the log states it, what the machine has
+available and the headroom at that moment), less the most the buffers of the
+prompt cache on SSD take when `--cache` is given, since those are host memory
+of the engine that the books do not hold. For a model with a prefix cache,
+what the limit leaves after the required memory is the checkpoint budget of
+the conductor (`RuntimeConfig::checkpoint_budget`), so the places the
+conductor hands out never lock more than the limit; for a mixture of experts
+it is what the tier is planned for. A dense model's server therefore lets the
+checkpoints use what the machine has, less the headroom, and gives the
+coldest up when the machine needs the memory. A lock that does not fit the
+limit fails the step with the books in the message. The first use of a place
+waits for the lock on the device's thread (21 to 22.5 ms for 93.5 MiB, 11.8
+ms for 56.1 MiB, measured with the 27B); locking ahead in the background is
+not built. `GET /metrics` reports the bytes locked
+(`ares_checkpoint_ram_bytes`, `ares_expert_ram_tier_bytes`) and the counters
+of the expert store (`ares_expert_*`).
+
+**Measured** (2026-11-15; RTX 4070 and RTX 3060, 31.2 GiB of RAM, a machine
+that other work shared: its available memory moved by several GiB between
+runs and the load average was between 4 and 56, which is next to every
+number).
+
+*What the tier is worth* (Flash-Next, three texts of German, English and
+code, 96 tokens each, each asked twice; tokens per second of generation and
+experts read from the file per step, first ask / second ask). The server
+before this change with its default, half of what was available, against the
+server after it with `--ram` set to what was available less 6.5 GiB (the
+measurements had to leave the machine 3 GiB; without a limit the tier takes
+what is available less the headroom, about 6 GiB more than here):
+
+| Both cards | Tier | Experts with a slot | German | English | Code | Reads per step |
+| --- | --- | --- | --- | --- | --- | --- |
+| before, 13.8 GiB available | 6.8 GiB, 4 704 slots | 73.4 % | 14.8 / 26.5 | 11.6 / 9.7 | 5.9 / 19.3 | 17.0 / 6.1, 8.2 / 7.7, 19.9 / 7.2 |
+| after, `--ram 12.26G` | 12.2 GiB, 8 832 slots | 90.2 % | 20.6 / 31.0 | 27.8 / 32.1 | 18.5 / 32.3 | 9.8 / 1.9, 3.3 / 2.1, 7.6 / 1.3 |
+| before, 20.0 GiB available | 9.9 GiB, 7 104 slots | 83.2 % | 19.2 / 33.4 | 35.9 / 35.8 | 22.6 / 27.0 | 10.8 / 3.7, 4.0 / 3.1, 9.7 / 1.2 |
+| after, `--ram 14.80G` | 14.7 GiB, 10 752 slots | 98.1 % | 33.4 / 39.0 | 36.2 / 49.3 | 29.1 / 47.5 | 9.3 / 2.7, 4.4 / 0.7, 6.9 / 0.3 |
+
+On one card the two servers were only measured with tiers of nearly the same
+size (9.1 against 9.6 GiB on the RTX 4070, 25 to 27 % of the experts in RAM
+next to 20.5 % in VRAM): 1.4 to 9.1 tokens per second and 39 to 93 reads per
+step in both, at a load average of 22 to 28, with no difference that the
+spread of the runs would show.
+
+*Giving back and taking again* (`crates/server/tests/real_elastic.rs`: the
+engine in the test's process follows this machine's memory less 4.5 GiB that
+the test hides, so that it gives memory back while the machine itself keeps
+its safe margin; no `--ram`; a helper takes 4 GiB in steps of 64 MiB every 50
+ms, writing 2.2 to 2.5 GiB per second, holds them 20 s and frees them; a
+generation of 1500 tokens runs meanwhile):
+
+| | Both cards | RTX 4070 alone |
+| --- | --- | --- |
+| Available before the load; the tier after it | 21.1 GiB; 13.9 GiB | 20.3 GiB; 12.7 GiB |
+| Headroom after the load | 1 995 MiB, its most: the load's long steps made a release take 24.5 s | 1 995 MiB (17.5 s) |
+| Overall tokens per second, German / English / code, first and second ask | 23.1 and 46.2 / 33.5 and 48.3 / 24.3 and 40.8 | 3.0 and 11.2 / 5.3 and 7.8 / 2.2 and 3.7, while the tier gave 4 GiB to other work on the machine (load average 36 to 47) |
+| Reads from the file per step | 10.4 and 0.10 / 4.1 and 0.18 / 8.3 and 1.07 | 45 and 25 / 29 and 18 / 76 and 52 |
+| The tier while the helper grew | 13.8 to 10.0 GiB; the first piece gone 11 ms after the helper started, whole GiB after 1.3, 2.5 and 3.8 s | 9.0 to 6.3 GiB; first piece after 3.1 s (a step on one card took seconds under that load), whole GiB after 5.8 and 8.3 s |
+| Least memory available to the engine's eyes (headroom 1 995 MiB) | 1.88 GiB | 1.60 GiB |
+| Resident memory of the process | 15.4 to 11.1 GiB | 9.2 to 6.4 GiB |
+| Generation, pieces per second before / while the helper ran | 42.3 / 43.8 | 4.0 / 2.1 |
+| The tier back within 256 MiB after the helper freed its memory | 7.2 s (the wait was 6 s); generation 15 pieces per second meanwhile, a piece is locked at every step's end | 18.2 s (wait 12 s) |
+
+*The dense 27B* on both cards, the server before and after with their
+defaults (a limit of 9.7 GiB before, of all the machine has after, 31.2 GiB,
+of which the checkpoints lock what they use), the three texts with 160
+tokens each, two rounds each: 57 to 59 tokens per second of generation for
+the first German ask in all four runs, 66 to 80 for the English one, 95 to
+132 for code, and 203 to 257 when a text is asked again, with no difference
+between the two servers that the rounds would show. Both took a checkpoint
+for every new text and held 150 and then 299 MiB of locked memory for them.
+
+The same two tests on small models check what the kernel counts
+(`qwen4exp_runtime`: a made-up model's tier from 14.2 to 1.0 MiB and back,
+the process's resident memory 13.0 MiB less; `qwen35_prefix`: the 0.8B's
+checkpoints from 303 MiB to none while the engine is idle, resident memory
+301 MiB less, the next answers equal to those without a cache, none taken
+while memory is short, kept again afterwards).
+
+What these runs also showed, and what follows from it:
+
+- The driver's unlock of page-locked memory waits for the device. The first
+  version unlocked on the watch's thread while a step ran, and a load under
+  memory pressure stood still for ten minutes, every thread waiting; pieces
+  are since unlocked and locked between steps only. A release therefore
+  takes as long as the step that runs: 11 ms on two cards that decode, three
+  seconds on one card under load, 17 to 25 s during the long steps of a load.
+- That time is in the headroom by the rule, so after a load the headroom is
+  at its most (a sixteenth of the machine's RAM) and falls back as the slow
+  release is forgotten, by half every ten minutes. A release that does not
+  wait for a step would keep it at a few hundred MiB; it would need memory
+  that the device does not read during a step, and is not built.
+- Not built, and not tried: a mixture of experts and a dense model loaded on
+  the same device, with memory short. The chunks of the dense model's
+  checkpoints are freed on the watch's thread whatever the devices do; that
+  is safe for a dense model alone, whose kernels never wait for the host,
+  and it is the same wait as above when a step of a mixture of experts runs
+  on that device. Freeing them between the steps of every engine on the
+  device needs a rule that the engines of a device share.
+- With `--ram 28G` on this machine the engine holds what is available less
+  the headroom when it loads, not 28 GiB: 20 to 21 GiB with the 21 to 22 GiB
+  that were available in the calm runs here, of which Flash-Next on both
+  cards can use about 16 GiB (its experts without a slot in VRAM) and on one card
+  all of it.
+
 
 Nothing that costs speed happens silently:
 
 - **At load**, the engine states what the configured context means: how many
   tokens of state fit in VRAM, and, if the context is larger than that, that
   K/V will spill to RAM, from which point, and how much RAM that can take at
-  most. A context that fits entirely in VRAM never offloads.
-- **When K/V first spills** for a running request, that is reported, with the
-  amount.
-- **When the expert tier in RAM has to shrink**, that is a warning, because
-  generation gets slower: experts that were in RAM now come from the SSD.
-- **When the prompt cache in RAM shrinks**, that is routine and only counted;
-  its pages are on SSD. (Pages are not in RAM yet; the checkpoints are the
-  prompt cache's only RAM today, and with `--cache` the ones at page
-  boundaries are on SSD as well.)
+  most. A context that fits entirely in VRAM never offloads. It also states
+  the RAM limit, what the machine has available and the headroom.
+- **When the expert tier in RAM shrinks**, generation gets slower: experts
+  that were in RAM now come from the SSD. The tier's bytes are a gauge, and
+  the pieces given up and taken are counted (`StoreStats::pieces_released`,
+  `pieces_locked`, `piece_evictions`); a line in the log for it is not
+  written yet.
+- **When the prompt cache in RAM shrinks**, that is routine and only counted
+  (`ares_checkpoints_dropped_total`). (Pages are not in RAM yet; the
+  checkpoints are the prompt cache's only RAM today, and with `--cache` the
+  ones at page boundaries are on SSD as well. One that was due there and was
+  given up unwritten is counted apart,
+  `ares_cache_ssd_checkpoints_skipped_total`.)
 
 The same facts are available as counters to whoever monitors the server.
 
@@ -4278,8 +4527,9 @@ memory bandwidth each device reports, and a context from the VRAM that is
 left; the start-up report says what was chosen, why, and where the VRAM
 went. Devices, split, shares, context, K/V format, precision, the model
 drafters that take part (`--drafters`) and the room for their windows
-(`--window`), and the RAM the engine may use (`--ram`) can be given instead. The RAM defaults to half
-of what the machine reports as available when the server starts; the
+(`--window`), and the RAM the engine may use (`--ram`) can be given instead. The RAM limit defaults
+to all the machine has, and below any limit the engine holds what the machine
+has available less a headroom (see "Host memory"); the
 engine's step buffers are taken from it, and the rest is the budget of the
 checkpoints that let a conversation continue from what was computed (see
 "Host memory"). `--cache <dir>` gives the prompt cache its level on SSD and
@@ -5034,10 +5284,15 @@ What holds for a model is, from the strongest: the command line (an option of
 a model given next to `--models-preset` holds for every model), the model's
 section, the section `[*]`, the built-in defaults. `ram` is the one key that
 means something else by where it stands: on the command line and in `[*]` it
-is the most RAM of the server, for all loaded models together (default: half
-of what the machine has available when the server starts); in a model's
+is the most RAM of the server, for all loaded models together; in a model's
 section it is that model's part of it, and a model without one takes what the
-limit has left when it is loaded. `host` and `port` are the server's and stand
+limit has left when it is loaded. Without a limit of the server there are no
+parts to fit: every model may hold up to its own `ram`, or all the machine
+has, and the loaded models share what the machine has available through the
+one watch over it (see "Host memory": the tiers of experts first and evenly,
+the checkpoints with the rest, and all of them give memory back when the
+machine needs it). With a limit, the parts cap the models as before and each
+follows the machine below its part. `host` and `port` are the server's and stand
 on the command line only; `--model` and `--models-preset` exclude each other.
 
 Nothing in the file is ignored. The server does not start, and says the file,
@@ -5073,7 +5328,8 @@ RAM limit has left, and says "no room" before it reads the weights when the
 plan does not fit: the estimate of the model with the context its preset
 names is more than a device has free; or, for a preset that names no context,
 less than the least context a device is chosen for (8192 tokens, or the
-model's own) fits; or the RAM left is less than what the engine needs to run.
+model's own) fits; or, when the server has a RAM limit, the RAM left is less
+than what the engine needs to run.
 Then the model that has been idle the longest is unloaded and the load is
 planned again, until it fits or no model is left, in which case the load
 fails with the plan's words. A preset that names no context gets what the
@@ -5152,9 +5408,17 @@ the process exits; a load that runs then is finished first.
 router finds the models that have to go by trying: a model that fits
 nowhere has unloaded the idle models, and waited for the busy ones, before
 it fails. A model is planned against free memory only, so a preset without a
-`context` that is loaded next to others gets less than alone. The RAM limits
-of loaded models are parts of the server's limit that are booked at load;
-the models do not give RAM to each other while they run. A model option
+`context` that is loaded next to others gets less than alone. With a RAM
+limit of the server, the limits of loaded models are parts of it that are
+booked at load. What the models really hold they share through the one watch
+over the machine's memory (see "Host memory"): the tiers of experts of all
+loaded models get the same as far as each can use it, the checkpoints what is
+left, and all give memory back when the machine needs it. So a model that is
+loaded next to a tier that had taken what was free gets its share at the next
+look, out of that tier; that is the only way RAM passes from one loaded model
+to another, and nothing moves it by which model is in use. Without a limit of
+the server no model is unloaded for another's RAM: what a second model needs
+to run comes out of the elastic memory of the first. A model option
 given on the command line needs text that is UTF-8, paths included.
 
 The set of flags is the engine's own and starts from nothing. A flag exists

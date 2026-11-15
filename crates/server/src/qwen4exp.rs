@@ -378,14 +378,18 @@ pub(crate) fn load(
     };
     tracing::info!(
         "plan: RAM, at most {} for the engine ({why_ram}): {} for its step buffers, the rest for \
-         the tier of experts, which holds the experts that have no slot in VRAM as far as it \
-         goes and shrinks for nothing",
+         the tier of experts, which holds the experts that have no slot in VRAM as far as the \
+         memory goes, gives pieces back when the machine needs them, the coldest experts of \
+         every layer with them, and takes them again when the memory is free",
         Bytes(ram),
         Bytes(required),
     );
     tracing::info!("loading the weights");
     let loading = Instant::now();
-    let runtime = Runtime::start_gpu(model.clone(), devices, runtime_config, gpu).map_err(|e| {
+    let machine = Some(crate::load::watch());
+    let started =
+        Runtime::start_gpu_following(model.clone(), devices, runtime_config, gpu, machine);
+    let runtime = started.map_err(|e| {
         let error = e.to_string();
         let short_of_memory = error.to_lowercase().contains("memory");
         let error = LoadError::Start(if error.contains("RAM budget") {
@@ -453,7 +457,7 @@ pub(crate) fn load(
         let all = config.n_layer * config.experts.count;
         tracing::info!(
             "experts: {all} in the file; {vram} slots in VRAM ({:.1} %), {ram_slots} in the RAM \
-             tier of {} ({:.1} %); the slots fill from what the routers pick",
+             tier of {} now ({:.1} %); the slots fill from what the routers pick",
             100.0 * vram as f64 / all as f64,
             Bytes(ram_bytes),
             100.0 * ram_slots as f64 / all as f64,

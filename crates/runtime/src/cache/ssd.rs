@@ -93,6 +93,19 @@ pub struct SsdConfig {
 }
 
 impl SsdConfig {
+    /// The most host memory the level on SSD takes for pages and checkpoints
+    /// in transit, for a model that is `durable`: ordinary memory, not
+    /// page-locked, allocated as the buffers first come into use and kept.
+    /// It is not in the books of the page-locked RAM
+    /// ([`crate::PinnedRam`]); who sets the engine's RAM limit counts it
+    /// next to them.
+    pub fn transit_ram(durable: &Durable) -> u64 {
+        let room =
+            |bytes: &[u64]| bytes.iter().map(|b| ares_store::padded(*b as usize) as u64).sum();
+        let (page, state): (u64, u64) = (room(&durable.page_bytes), room(&durable.state_bytes));
+        PAGE_BUFFERS as u64 * page + STATE_BUFFERS as u64 * state
+    }
+
     /// The engine's own numbers for a store in `dir` of at most `max_bytes`.
     pub fn new(dir: impl Into<PathBuf>, max_bytes: u64) -> Self {
         Self {
@@ -131,7 +144,10 @@ pub struct SsdCounters {
     /// nanoseconds the conductor waited for them.
     pub transfers: u64,
     pub transfer_ns: u64,
-    /// Checkpoints that were not written because none could be in transit.
+    /// Checkpoints that were due and were not written: none could be in
+    /// transit (the writer held every buffer), or the checkpoint was given
+    /// up before the record with its save had run, so that its place never
+    /// held it.
     pub states_skipped: u64,
     /// What the store holds now.
     pub store_pages: u64,
@@ -828,6 +844,27 @@ impl Drop for Ssd {
 }
 
 impl Cache {
+    /// The save into `place` that waits for the next record will not run
+    /// (its checkpoint was given up): the level on SSD forgets it, and counts
+    /// it when the checkpoint would have been written.
+    pub(super) fn unsave(&mut self, place: u32) {
+        let Some(ssd) = &mut self.ssd else { return };
+        let per_page = u64::from(ssd.cells_per_page);
+        let index = &self.index;
+        self.saved.retain(|(of, hash)| {
+            if *of != place {
+                return true;
+            }
+            let due = index.page(*hash).is_some_and(|(_, _, depth)| {
+                u64::from(depth) * per_page >= ssd.min_cells
+                    && !ssd.queued.contains(&(Kind::State, *hash))
+                    && !ssd.shared.store().contains(Kind::State, *hash)
+            });
+            ssd.counters.states_skipped += u64::from(due);
+            false
+        });
+    }
+
     /// Tells the level on SSD that the sequence of `owner` holds `settled`
     /// cells whose full pages are published under the names of `chain`, and
     /// with `last` that it ends here: the pages that are due are queued.
@@ -995,7 +1032,10 @@ impl Cache {
                             // A save that waits for the next record and names
                             // this place is of a checkpoint that was dropped
                             // before it ran: it must not run over what the
-                            // place holds from now on.
+                            // place holds from now on. (`Cache::release`
+                            // drops such a save with its checkpoint, so
+                            // there is none here; the rule stays where the
+                            // place is taken.)
                             self.saves.retain(|copy| copy.place != place);
                             self.saved.retain(|(of, _)| *of != place);
                             batch.push(transfer(TransferKind::StateIn, place, false, parts));
@@ -1075,7 +1115,7 @@ impl Cache {
                                     self.release(before);
                                 }
                             }
-                            Some(Err(_)) | None => self.free_places.push(place),
+                            Some(Err(_)) | None => self.free(place),
                         }
                     }
                 }

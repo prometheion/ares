@@ -210,6 +210,12 @@ impl Executor for Recording {
     fn checkpoint_ram(&self) -> u64 {
         self.inner.checkpoint_ram()
     }
+    fn ram(&self) -> Option<ares_runtime::PinnedRam> {
+        self.inner.ram()
+    }
+    fn transfer(&mut self, batch: &mut [ares_runtime::Transfer]) -> Result<(), ExecError> {
+        self.inner.transfer(batch)
+    }
     fn shutdown(&mut self) {
         self.inner.shutdown();
     }
@@ -221,11 +227,24 @@ struct Rig {
     next: AtomicU64,
     /// The bytes of one checkpoint on all devices.
     checkpoint: u64,
+    /// The bytes of a checkpoint on each device.
+    parts: Vec<u64>,
     /// The picks of every step since the engine was ready.
     picks: Arc<Mutex<Vec<Pick>>>,
 }
 
 fn rig(path: &PathBuf, layout: Layout, cached: bool, tweak: Tweak<'_>) -> Rig {
+    rig_following(path, layout, cached, tweak, None)
+}
+
+/// [`rig`] for an engine whose checkpoints follow the memory of `machine`.
+fn rig_following(
+    path: &PathBuf,
+    layout: Layout,
+    cached: bool,
+    tweak: Tweak<'_>,
+    machine: Option<Arc<ares_runtime::Machine>>,
+) -> Rig {
     let options = kv_env::with_env(Options {
         precision: Precision::Exact,
         max_rows: 128,
@@ -268,7 +287,7 @@ fn rig(path: &PathBuf, layout: Layout, cached: bool, tweak: Tweak<'_>) -> Rig {
         .collect();
     let picks = Arc::new(Mutex::new(Vec::new()));
     let executor = Recording {
-        inner: GpuExecutor::start(model.clone(), devices, gpu).unwrap(),
+        inner: GpuExecutor::start_following(model.clone(), devices, gpu, machine).unwrap(),
         picks: picks.clone(),
     };
     let runtime = Runtime::start(model, Box::new(executor), config).unwrap();
@@ -278,7 +297,7 @@ fn rig(path: &PathBuf, layout: Layout, cached: bool, tweak: Tweak<'_>) -> Rig {
     assert_eq!(parts, spec.checkpoint_bytes, "{layout:?}");
     // The steps of the warm-up are not the tests'.
     picks.lock().unwrap().clear();
-    Rig { runtime, next: AtomicU64::new(1), checkpoint, picks }
+    Rig { runtime, next: AtomicU64::new(1), checkpoint, parts, picks }
 }
 
 /// What a request came to.
@@ -738,5 +757,234 @@ fn a_row_computed_in_a_step_of_another_size_differs_by_rounding_only() {
         if chunk % 32 == 0 {
             assert_eq!(different_logits, 0, "steps of whole tiles of 32 rows give the same rows");
         }
+    }
+}
+
+/// The checkpoints on a machine whose memory the test sets: when it runs
+/// short the conductor gives them up, also while nothing runs, the parts'
+/// chunks are unlocked and freed, and no new checkpoint is taken while there
+/// is no room; the answers stay what they are without a cache. When memory
+/// has been free for a while, checkpoints are kept again.
+#[test]
+fn the_checkpoints_give_their_memory_back_when_the_machine_runs_short() {
+    use ares_runtime::{Machine, Rule};
+    let Some(path) = model_path() else { return };
+    let resident = || {
+        let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+        let line = status.lines().find_map(|line| line.strip_prefix("VmRSS:")).unwrap_or("0 kB");
+        line.trim().trim_end_matches("kB").trim().parse::<u64>().unwrap_or(0) * 1024
+    };
+    let prompt = vec![user(copy(passage(1, 60)))];
+    let layout = layouts()[0];
+    let cold = rig(&path, layout, false, &|_, _| {}).ask(&prompt, 40);
+
+    let available = Arc::new(AtomicU64::new(64 << 30));
+    let ms = Arc::new(AtomicU64::new(0));
+    let rule = Rule {
+        reserve: 64 << 20,
+        speed: 0,
+        latency: Duration::ZERO,
+        calm: Duration::from_secs(1),
+        most: 64 << 20,
+        ..Rule::default()
+    };
+    let machine = {
+        let (available, ms) = (available.clone(), ms.clone());
+        Machine::new(
+            rule,
+            move || Some(available.load(Ordering::SeqCst)),
+            move || Duration::from_millis(ms.load(Ordering::SeqCst)),
+        )
+    };
+    let look = || {
+        ms.fetch_add(50, Ordering::SeqCst);
+        machine.look().expect("the machine says what it has")
+    };
+    let cached = rig_following(&path, layout, true, &|_, _| {}, Some(machine.clone()));
+    let first = cached.ask(&prompt, 40);
+    cached.ask(&[user(copy(passage(2, 60)))], 40);
+    assert_same("the first answer", &cold, &first);
+    let held = cached.snapshot().checkpoint_ram;
+    assert!(held > 0, "checkpoints are kept while the machine has memory");
+    let before = resident();
+
+    // The machine runs short while the engine is idle: the conductor is
+    // woken, gives the checkpoints up, and their chunks are freed.
+    available.store(0, Ordering::SeqCst);
+    for _ in 0..400 {
+        look();
+        if cached.snapshot().checkpoint_ram == 0 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let after = resident();
+    let dropped = cached.snapshot().counters.checkpoints_dropped;
+    eprintln!(
+        "RES {layout:?}: the checkpoints held {held} bytes of locked memory and hold {} now; \
+         {dropped} were given up; resident memory of the process {before} -> {after}",
+        cached.snapshot().checkpoint_ram
+    );
+    assert_eq!(cached.snapshot().checkpoint_ram, 0, "the chunks were given back");
+    assert!(dropped >= 1);
+
+    // The same prompt again is answered alike, and no checkpoint is taken
+    // while there is no room for one.
+    let again = cached.ask(&prompt, 40);
+    assert_same("the answer after the checkpoints went", &cold, &again);
+    assert_eq!(cached.snapshot().checkpoint_ram, 0, "none is taken while memory is short");
+
+    // Memory is free again, and after a while checkpoints are kept again.
+    available.store(64 << 30, Ordering::SeqCst);
+    for _ in 0..30 {
+        look();
+    }
+    let later = cached.ask(&[user(copy(passage(3, 60)))], 40);
+    assert!(later.usage.completion_tokens > 0);
+    assert!(cached.snapshot().checkpoint_ram > 0, "checkpoints are kept again");
+    let once_more = cached.ask(&prompt, 40);
+    assert_same("the answer with checkpoints again", &cold, &once_more);
+}
+
+/// The prompt cache on SSD on a machine that has no room for checkpoints:
+/// the one place the cache keeps for the way to the drive is enough. A prompt
+/// whose state another engine wrote resumes from the drive (its checkpoint
+/// lands in that place and is restored from it), the checkpoints of what it
+/// computes go through places to the drive, and the page-locked memory comes
+/// down to the one place when the machine is looked at again (to the chunk
+/// that place lies in on every device, where a chunk holds several). The
+/// answers are those of an engine without a cache. On one card and, with two,
+/// on a tensor split.
+#[test]
+fn a_prompt_resumes_from_ssd_on_a_machine_without_room_for_checkpoints() {
+    use ares_runtime::{Machine, Rule, SsdConfig};
+    let Some(path) = model_path() else { return };
+    let written = |rig: &Rig, states: u64| {
+        for _ in 0..2000 {
+            let ssd = rig.snapshot().counters.ssd;
+            if ssd.states_written >= states && ssd.pending == 0 {
+                return ssd;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        panic!("the level on SSD did not write: {:?}", rig.snapshot().counters.ssd);
+    };
+    let machine_with = |available: u64| {
+        let ms = Arc::new(AtomicU64::new(0));
+        let rule = Rule {
+            reserve: 64 << 20,
+            speed: 0,
+            latency: Duration::ZERO,
+            most: 64 << 20,
+            ..Rule::default()
+        };
+        let clock = ms.clone();
+        let machine = Machine::new(
+            rule,
+            move || Some(available),
+            move || Duration::from_millis(clock.load(Ordering::SeqCst)),
+        );
+        (machine, ms)
+    };
+    let tested = layouts().into_iter().filter(|l| matches!(l, Layout::Card(0) | Layout::Tensor));
+    for layout in tested {
+        let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("qwen35-prefix-ssd-no-room-{layout:?}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = dir.clone();
+        let on_ssd = move |config: &mut RuntimeConfig, _: u64| {
+            config.ssd = Some(SsdConfig { min_cells: PAGE, ..SsdConfig::new(&store, 4 << 30) });
+        };
+
+        let first = vec![user(copy(passage(11, 60)))];
+        let cold = rig(&path, layout, false, &|_, _| {}).ask(&first, 40);
+
+        // An engine with memory to spare computes the prompt and writes it.
+        let (machine, _) = machine_with(64 << 30);
+        let writer = rig_following(&path, layout, true, &on_ssd, Some(machine));
+        assert!(writer.snapshot().ssd_problem.is_none(), "{:?}", writer.snapshot().ssd_problem);
+        let wrote = writer.ask(&first, 40);
+        assert_same("the answer of the engine that writes", &cold, &wrote);
+        // Two checkpoints: at most one lies in the reply, so one lies in the
+        // prompt, where the next engine resumes.
+        let ssd = written(&writer, 2);
+        assert!(ssd.pages_written >= 1, "{ssd:?}");
+        drop(writer);
+
+        // Another engine, on a machine that has nothing to spare from the
+        // start: the checkpoints may hold the one place of the cache's floor.
+        let (machine, ms) = machine_with(0);
+        let short = rig_following(&path, layout, true, &on_ssd, Some(machine.clone()));
+        assert_eq!(short.snapshot().checkpoint_ram, 0);
+        // What one place locks: the chunk it lies in on every device (chunks
+        // of 32 MiB, or one place where a place is larger).
+        let chunk: u64 =
+            short.parts.iter().map(|bytes| ((32 << 20) / bytes).clamp(1, 16) * bytes).sum();
+        let again = short.ask(&first, 40);
+        assert_same("the answer from SSD without room for checkpoints", &cold, &again);
+        let s = short.snapshot();
+        assert!(again.usage.cached_prompt_tokens >= PAGE, "{:?}", again.usage);
+        assert_eq!(s.counters.ssd.states_read, 1, "{:?}", s.counters.ssd);
+        assert!(s.counters.checkpoints_restored >= 1);
+        assert!(s.counters.ssd.pages_read >= 1, "{:?}", s.counters.ssd);
+        // A longer text: its checkpoints pass through places to the drive,
+        // never more than two at once (the place a restore reads and the next
+        // save's).
+        let before = written(&short, 0).states_written;
+        let second = vec![user(copy(passage(12, 60)))];
+        let longer = short.ask(&second, 40);
+        assert!(longer.usage.completion_tokens > 0);
+        // How many of them the drive took in time is the drive's matter (the
+        // writer holds three at once, and one that cannot leave its place
+        // within 250 ms is given up and counted); at least one is written.
+        let ssd = written(&short, before + 1);
+        assert!(short.snapshot().checkpoint_ram <= 2 * chunk);
+        // The machine is looked at again: what is not the one place goes
+        // back, and the machine waits for nothing more.
+        let mut owed = u64::MAX;
+        for _ in 0..40 {
+            ms.fetch_add(50, Ordering::SeqCst);
+            owed = machine.look().expect("the machine says what it has").owed;
+            if short.snapshot().checkpoint_ram <= chunk && owed == 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let held = short.snapshot().checkpoint_ram;
+        eprintln!(
+            "SSD {layout:?}: one checkpoint takes {} bytes and its place locks {chunk}; with no \
+             room on the machine the places hold {held} bytes; {} checkpoints read from SSD, {} \
+             written and {} given up unwritten, {} pages read",
+            short.checkpoint,
+            s.counters.ssd.states_read,
+            ssd.states_written,
+            ssd.states_skipped,
+            s.counters.ssd.pages_read
+        );
+        assert!(held <= chunk, "{layout:?}: {held} bytes are more than the one place");
+        assert_eq!(owed, 0, "{layout:?}: the floor is not memory the machine waits for");
+        drop(short);
+
+        // What that engine wrote is right: a third one resumes the second
+        // text.
+        let cold = rig(&path, layout, false, &|_, _| {}).ask(&second, 40);
+        let (machine, _) = machine_with(0);
+        let third = rig_following(&path, layout, true, &on_ssd, Some(machine));
+        let resumed = third.ask(&second, 40);
+        assert_same("the answer from what was written without room", &cold, &resumed);
+        eprintln!(
+            "SSD {layout:?}: the second text resumed with {} of {} prompt tokens from SSD",
+            resumed.usage.cached_prompt_tokens, resumed.usage.prompt_tokens
+        );
+        // Every checkpoint of that text that was due is on the drive unless
+        // one was given up: then the prompt may have none to resume from.
+        assert!(
+            resumed.usage.cached_prompt_tokens >= PAGE || ssd.states_skipped > 0,
+            "{:?} {ssd:?}",
+            resumed.usage
+        );
+        drop(third);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

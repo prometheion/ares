@@ -274,16 +274,18 @@ pub fn default_context(pages_fit: u32, parallel: u32, model_context: u32) -> u32
     if context >= 2048 { context / 1024 * 1024 } else { context }
 }
 
-/// The host RAM the engine may use when the operator names no limit: half of
-/// what the machine reports as available when the server starts, so that the
-/// engine never takes what the rest of the system is using. Nothing when the
-/// machine reports nothing (the engine then keeps to what it needs to run).
-pub fn default_ram(available: Option<u64>) -> u64 {
-    available.unwrap_or(0) / 2
+/// The most host RAM the engine may ever use when the operator names no
+/// limit: all the machine has (`total`, its `MemTotal`). Below it, as below a
+/// limit that was named, the engine holds what the machine has available less
+/// a headroom and gives memory back when other programs need it
+/// (`ares_runtime::Machine`). Nothing when the machine reports nothing (the
+/// engine then keeps to what it needs to run).
+pub fn default_ram(total: Option<u64>) -> u64 {
+    total.unwrap_or(0)
 }
 
 /// What the server says when the RAM limit `ram` is less than what the engine
-/// must page-lock to run at all. `needs` is that memory by what it is for:
+/// must hold to run at all. `needs` is that memory by what it is for:
 /// the message names every share and the whole in bytes, the number that
 /// `--ram` takes as it stands.
 pub fn too_little_ram(ram: u64, needs: &[(&str, u64)]) -> String {
@@ -374,7 +376,7 @@ mod tests {
         let meminfo = "MemTotal:       32768000 kB\nMemFree:         1000000 kB\n\
                        MemAvailable:   20000000 kB\nBuffers:           10000 kB\n";
         assert_eq!(parse_available_ram(meminfo), Some(20_000_000 * 1024));
-        assert_eq!(default_ram(parse_available_ram(meminfo)), 10_000_000 * 1024);
+        assert_eq!(default_ram(Some(32_768_000 * 1024)), 32_768_000 * 1024);
         // A machine that says nothing: no spare RAM.
         assert_eq!(parse_available_ram("MemTotal: 1 kB\n"), None);
         assert_eq!(parse_available_ram("MemAvailable: lots\n"), None);

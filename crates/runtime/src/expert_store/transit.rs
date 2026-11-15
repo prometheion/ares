@@ -605,10 +605,10 @@ impl<D: SlotDevice> ExpertStore<D> {
         let at = plan.stage_base
             + stage as usize * plan.stage_bytes
             + self.layers[layer].ram_bases[part];
-        debug_assert!(at < self.region.len);
+        debug_assert!(at < self.region.len());
         // SAFETY: the offset is inside the region: the plan put staging behind
         // the RAM tier and `new` checked the region against both.
-        unsafe { self.region.ptr.as_ptr().add(at) }
+        unsafe { self.region.ptr().as_ptr().add(at) }
     }
 
     /// Starts the read of an expert from the file into a staging slot, if one

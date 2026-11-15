@@ -45,6 +45,14 @@
 //! what it says, a slot that was taken before its state was saved: each of
 //! them changes the generated tokens.
 //!
+//! Given the books of page-locked RAM as well ([`HostExecutor::with_ram`]),
+//! the oracle plays the strictest device those books allow: a checkpoint
+//! place holds memory from the first copy into it, booked as a device part
+//! books its chunks, and loses it, with what it held, as soon as the
+//! conductor has called the place unused. A save into a place that is not in
+//! use, and a checkpoint that leaves such a place for the drive, are problems;
+//! a restore from one finds nothing.
+//!
 //! # What a step costs
 //!
 //! The conductor decides the drafts of a step and the turns of prompts and
@@ -69,6 +77,7 @@ use std::time::{Duration, Instant};
 
 use crate::exec::{Clock, ExecError, Executor, Pick, StepMeta, StepOutput};
 use crate::model::{ContextSpec, Model};
+use crate::ram::PinnedRam;
 use crate::record::{RecordView, StateCopyKind};
 use crate::sync::{WakeCounts, Woke};
 use crate::synthetic::SyntheticModel;
@@ -151,6 +160,8 @@ pub struct HostExecutor {
     failing: bool,
     oracle: Option<Oracle>,
     problems: Problems,
+    /// The books of the page-locked RAM the checkpoint places lie in.
+    ram: Option<PinnedRam>,
 }
 
 impl std::fmt::Debug for HostExecutor {
@@ -201,6 +212,7 @@ impl HostExecutor {
             failing: false,
             oracle: None,
             problems: Arc::default(),
+            ram: None,
         }
     }
 
@@ -210,6 +222,15 @@ impl HostExecutor {
     pub fn with_pool(mut self, pages: u32, cells_per_page: u32) -> Self {
         let slots = self.tables.lock().expect("tables").len();
         self.oracle = Some(Oracle::new(&self.model, pages, cells_per_page, slots));
+        self
+    }
+
+    /// Makes the checkpoint places lie in the page-locked memory of `ram`,
+    /// as a device's do: the conductor keeps to the allowance of these books,
+    /// and the oracle holds the memory of a place only while the conductor
+    /// has the place in use (see the module documentation).
+    pub fn with_ram(mut self, ram: PinnedRam) -> Self {
+        self.ram = Some(ram);
         self
     }
 
@@ -370,7 +391,15 @@ impl Executor for HostExecutor {
         }
         match &mut self.oracle {
             Some(oracle) => {
-                oracle.step(&self.model, &view, &tables, &mut self.picks, &self.problems)
+                oracle.give_back(self.ram.as_ref());
+                oracle.step(
+                    &self.model,
+                    &view,
+                    &tables,
+                    &mut self.picks,
+                    self.ram.as_ref(),
+                    &self.problems,
+                )
             }
             None => {
                 if self.model.config().prefix_cache.is_some() {
@@ -430,13 +459,26 @@ impl Executor for HostExecutor {
     }
 
     fn transfer(&mut self, batch: &mut [crate::Transfer]) -> Result<(), ExecError> {
+        if let Some(oracle) = &mut self.oracle {
+            oracle.give_back(self.ram.as_ref());
+        }
         for transfer in batch {
             transfer.ok = match &mut self.oracle {
-                Some(oracle) if self.model.config().durable.is_some() => oracle.transfer(transfer),
+                Some(oracle) if self.model.config().durable.is_some() => {
+                    oracle.transfer(transfer, self.ram.as_ref(), &self.problems)
+                }
                 _ => false,
             };
         }
         Ok(())
+    }
+
+    fn checkpoint_ram(&self) -> u64 {
+        self.ram.as_ref().map_or(0, PinnedRam::checkpoints)
+    }
+
+    fn ram(&self) -> Option<PinnedRam> {
+        self.ram.clone()
     }
 
     fn device_wakes(&self) -> WakeCounts {
@@ -545,7 +587,18 @@ struct Oracle {
     cells: Vec<Cell>,
     slots: Vec<Slot>,
     places: HashMap<u32, State>,
+    /// The bytes of a checkpoint place, and the places that hold memory in
+    /// the books the executor was given.
+    place_bytes: u64,
+    held: Vec<u32>,
     vocab: u32,
+}
+
+fn note(problems: &Problems, what: String) {
+    let mut log = problems.lock().expect("problems");
+    if log.len() < MAX_PROBLEMS {
+        log.push(what);
+    }
 }
 
 impl Oracle {
@@ -558,14 +611,69 @@ impl Oracle {
             cells: vec![Cell::default(); pages as usize * cells_per_page as usize],
             slots: (0..slots).map(|_| Slot::default()).collect(),
             places: HashMap::new(),
+            place_bytes: config.prefix_cache.unwrap_or(0),
+            held: Vec::new(),
             vocab: config.vocab(),
+        }
+    }
+
+    /// The places the conductor has called unused lose their memory, and
+    /// what they held with it. Between steps, as a device part gives chunks
+    /// back; a device may keep them longer, never shorter.
+    fn give_back(&mut self, ram: Option<&PinnedRam>) {
+        let Some(ram) = ram else { return };
+        let (places, bytes) = (&mut self.places, self.place_bytes);
+        self.held.retain(|place| {
+            let live = ram.place_is_live(*place);
+            if !live {
+                places.remove(place);
+                ram.release_checkpoints(bytes);
+            }
+            live
+        });
+    }
+
+    /// A copy writes place `place`: it takes memory in the books when it
+    /// holds none, and it must be a place the conductor has in use.
+    fn take(&mut self, place: u32, what: &str, ram: Option<&PinnedRam>, problems: &Problems) {
+        let Some(ram) = ram else { return };
+        if !ram.place_is_live(place) {
+            note(problems, format!("{what} place {place}, which the conductor called unused"));
+        }
+        if !self.held.contains(&place) {
+            if let Err(error) = ram.book_checkpoints(self.place_bytes) {
+                note(problems, format!("{what} place {place}: {error}"));
+            }
+            self.held.push(place);
         }
     }
 
     /// Carries out a transfer of the cache's level on SSD: a page's cells or
     /// a place's state as bytes in the first part, and back.
-    fn transfer(&mut self, transfer: &mut crate::Transfer) -> bool {
+    fn transfer(
+        &mut self,
+        transfer: &mut crate::Transfer,
+        ram: Option<&PinnedRam>,
+        problems: &Problems,
+    ) -> bool {
         use crate::TransferKind::{PageIn, PageOut, StateIn, StateOut};
+        match transfer.kind {
+            StateOut if ram.is_some_and(|ram| !ram.place_is_live(transfer.object)) => {
+                note(
+                    problems,
+                    format!(
+                        "a checkpoint leaves place {} for the drive, and the conductor called \
+                         that place unused",
+                        transfer.object
+                    ),
+                );
+                return false;
+            }
+            StateIn => {
+                self.take(transfer.object, "a checkpoint from the drive lands in", ram, problems)
+            }
+            _ => {}
+        }
         let per_page = self.cells_per_page as usize;
         let Some(part) = transfer.parts.first_mut() else { return false };
         let cells = transfer.object as usize * per_page..(transfer.object as usize + 1) * per_page;
@@ -694,14 +802,10 @@ impl Oracle {
         view: &RecordView<'_>,
         tables: &[Vec<u32>],
         picks: &mut Vec<Pick>,
+        ram: Option<&PinnedRam>,
         problems: &Problems,
     ) {
-        let complain = |what: String| {
-            let mut log = problems.lock().expect("problems");
-            if log.len() < MAX_PROBLEMS {
-                log.push(what);
-            }
-        };
+        let complain = |what: String| note(problems, what);
 
         // The commit of the step before.
         for i in 0..view.commits() {
@@ -723,6 +827,7 @@ impl Oracle {
         for i in 0..view.state_copies() {
             let copy = view.state_copy(i);
             if copy.kind == StateCopyKind::Save {
+                self.take(copy.place, "a save writes", ram, problems);
                 let state = self.slots.get(copy.slot as usize).and_then(|slot| slot.state.clone());
                 self.places.insert(
                     copy.place,

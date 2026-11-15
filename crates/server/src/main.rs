@@ -91,11 +91,9 @@ async fn run(
     let address =
         listener.local_addr().map_err(|e| format!("cannot read the listen address: {e}"))?;
 
-    // The most RAM of all loaded models together, when nobody names it: half
-    // of what the machine has available now.
-    let available = std::fs::read_to_string("/proc/meminfo")
-        .ok()
-        .and_then(|text| plan::parse_available_ram(&text));
+    // The most RAM of all loaded models together, when nobody names it: all
+    // the machine has. The engines hold what is available below it.
+    let total = ares_runtime::Meminfo::total();
     let offered = presets.models.len();
     // What a request to each model gets for the fields it leaves out, once.
     for preset in &presets.models {
@@ -105,7 +103,7 @@ async fn run(
         presets,
         Arc::new(DeviceLoader),
         Arc::new(SystemClock::default()),
-        plan::default_ram(available),
+        plan::default_ram(total),
     ));
 
     match &single {

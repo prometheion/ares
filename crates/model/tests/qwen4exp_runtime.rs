@@ -28,8 +28,8 @@ use ares_model::qwen4exp::{
 };
 use ares_runtime::expert_store::Serve;
 use ares_runtime::{
-    ContextSpec, DeviceContext, DeviceModel, GpuConfig, LinkSpec, Model, ModelError, PrefixCache,
-    Runtime, RuntimeConfig, Split,
+    ContextSpec, DeviceContext, DeviceModel, GpuConfig, LinkSpec, Machine, Model, ModelError,
+    PrefixCache, Rule, Runtime, RuntimeConfig, Split,
 };
 use ares_state::PageLayout;
 use ares_tokenizer::{ChatOptions, Json, Tokenizer};
@@ -291,6 +291,40 @@ fn start_rows(
     rows: u32,
 ) -> (Runtime, Arc<Qwen4Exp>) {
     start_at(&gguf_path(seed), placement, pages, config, rows)
+}
+
+/// [`start`] for an engine whose tier of experts in RAM follows `machine`, in
+/// pieces of `piece` bytes.
+fn start_following(
+    seed: u64,
+    placement: Placement,
+    pages: u32,
+    machine: &Arc<Machine>,
+    piece: usize,
+) -> (Runtime, Arc<Qwen4Exp>) {
+    let devices = open_devices(placement);
+    let gguf = Gguf::open(gguf_path(seed)).unwrap();
+    let n_layer = Config::from_gguf(&gguf).unwrap().n_layer;
+    let mut opts = options(placement, n_layer, pages, MAX_ROWS, MAX_ROWS);
+    opts.ram_piece = Some(piece);
+    let inner =
+        Arc::new(Qwen4Exp::new(gguf, byte_tokenizer(None), "made", &devices, opts, CELLS).unwrap());
+    let config =
+        RuntimeConfig { pages, cells_per_page: 128, max_slots: SLOTS, ..RuntimeConfig::default() };
+    let model: Arc<dyn Model> = Arc::new(Made(inner.clone()));
+    let mut gpu = GpuConfig::new(&config, &*model);
+    gpu.ram_limit += 256 << 20;
+    gpu.vram_headroom = 512 << 20;
+    let runtime = Runtime::start_gpu_following(model, devices, config, gpu, Some(machine.clone()))
+        .expect("the runtime starts");
+    (runtime, inner)
+}
+
+/// The resident bytes of this process, as the kernel counts them.
+fn resident() -> u64 {
+    let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    let line = status.lines().find_map(|line| line.strip_prefix("VmRSS:")).unwrap_or("0 kB");
+    line.trim().trim_end_matches("kB").trim().parse::<u64>().unwrap_or(0) * 1024
 }
 
 /// [`start_rows`] for the model file at `path`.
@@ -1284,4 +1318,86 @@ fn flash_next_writes_with_drafts_what_it_writes_without() {
     assert!(counters.drafts_rejected > 0, "no draft was rejected");
     assert_eq!(drafted, plain, "drafts changed a greedy reply of Flash-Next");
     assert_eq!(sampled, plain_seeded, "drafts changed a sampled reply of Flash-Next");
+}
+
+/// The tier of experts in RAM under the runtime, on a machine whose memory the test sets:
+/// when the machine runs short the tier gives its pieces back, the process's resident memory
+/// falls by what was given (the kernel's count: page-locked memory really went back), the
+/// engine answers as before, and when memory has been free for a while the tier takes its
+/// pieces again.
+#[test]
+fn the_ram_tier_gives_its_memory_back_to_the_system_and_takes_it_again() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    if !enabled() {
+        return;
+    }
+    const PIECE: usize = 1 << 20;
+    let available = Arc::new(AtomicU64::new(64 << 30));
+    let ms = Arc::new(AtomicU64::new(0));
+    let rule = Rule {
+        reserve: 64 << 20,
+        speed: 0,
+        latency: Duration::ZERO,
+        piece: PIECE as u64,
+        calm: Duration::from_secs(1),
+        most: 64 << 20,
+        ..Rule::default()
+    };
+    let machine = {
+        let (available, ms) = (available.clone(), ms.clone());
+        Machine::new(
+            rule,
+            move || Some(available.load(Ordering::SeqCst)),
+            move || Duration::from_millis(ms.load(Ordering::SeqCst)),
+        )
+    };
+    let look = || {
+        ms.fetch_add(50, Ordering::SeqCst);
+        machine.look().expect("the machine says what it has")
+    };
+    let prompt = prompt(21, 3);
+    let (runtime, model) = start_following(1, Placement::One, 16, &machine, PIECE);
+    ask(&runtime, 1, &prompt, 24);
+    warm(&model);
+    let want = ask(&runtime, 2, &prompt, 24);
+    let (_, slots, whole) = model.expert_slots().expect("the parts are open");
+    assert!(whole >= 8 * PIECE as u64, "a tier of several pieces: {whole}");
+    let before = resident();
+
+    // The machine runs short of memory.
+    available.store(0, Ordering::SeqCst);
+    for _ in 0..100 {
+        if look().owed == 0 {
+            break;
+        }
+    }
+    let (_, slots_low, low) = model.expert_slots().expect("the parts are open");
+    let after = resident();
+    eprintln!(
+        "RES the RAM tier went from {whole} bytes ({slots} slots) to {low} ({slots_low}); the \
+         process's resident memory from {before} to {after}"
+    );
+    assert!(low <= whole / 2 && slots_low < slots, "{whole} -> {low}, {slots} -> {slots_low}");
+    assert!(
+        before.saturating_sub(after) + (2 << 20) >= whole - low,
+        "what the tier gave went back to the system: {before} -> {after} for {}",
+        whole - low
+    );
+    assert_eq!(ask(&runtime, 3, &prompt, 24), want, "the answer with a small tier");
+
+    // Memory is free again: nothing is taken at once, all of it after a while.
+    available.store(64 << 30, Ordering::SeqCst);
+    look();
+    assert_eq!(model.expert_slots().expect("open").2, low, "not before it has been free a while");
+    for _ in 0..200 {
+        look();
+        if model.expert_slots().expect("open").2 == whole {
+            break;
+        }
+    }
+    let (_, slots_again, again) = model.expert_slots().expect("the parts are open");
+    assert_eq!((slots_again, again), (slots, whole), "the tier has its pieces again");
+    assert!(resident() + (2 << 20) >= after + (whole - low), "and they are locked again");
+    assert_eq!(ask(&runtime, 4, &prompt, 24), want, "the answer with the tier it had");
+    runtime.shutdown();
 }

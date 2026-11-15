@@ -508,6 +508,34 @@ context = 1
     assert!(w.is("b", "loaded") && w.is("c", "loaded"));
 }
 
+/// Without a limit of the server there are no parts of a limit to fit into:
+/// every model is loaded with its own limit or none, whatever is loaded
+/// beside it, and none is unloaded for another's RAM. What they hold they
+/// share by following the machine's memory (`ares_runtime::Machine`).
+#[tokio::test]
+async fn without_a_limit_of_the_server_no_model_makes_room_for_anothers_ram() {
+    let ini = "\
+[a]
+model = /a.gguf
+context = 1
+[b]
+model = /b.gguf
+context = 1
+ram = 6
+[c]
+model = /c.gguf
+context = 1
+";
+    let w = world(ini, &[10]);
+    for model in ["a", "b", "c"] {
+        drop(w.models.acquire(model).await.unwrap());
+    }
+    assert_eq!(w.machine.site("a"), Site { beside: false, ram: None, ram_is_rest: false });
+    assert_eq!(w.machine.site("b"), Site { beside: true, ram: Some(6), ram_is_rest: false });
+    assert_eq!(w.machine.site("c"), Site { beside: true, ram: None, ram_is_rest: false });
+    assert_eq!(w.machine.log(), ["load a", "load b", "load c"]);
+}
+
 // --- idle unload ----------------------------------------------------------------
 
 #[tokio::test]

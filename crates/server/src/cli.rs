@@ -61,11 +61,16 @@ OPTIONS:
                                model's section of a preset file is that model's
                                part of it, and a model without one takes what is
                                left. What the engine needs to run is taken from it
-                               first; the rest is for the checkpoints of recurrent
-                               state that let a conversation continue from what was
-                               computed, locked as they are taken [default: half of
-                               what the machine has available when the server
-                               starts]
+                               first (with --cache that includes one checkpoint and
+                               the buffers state passes through on its way to the
+                               drive and back); the rest is for the experts of a
+                               mixture of experts that have no slot in VRAM, and
+                               for the checkpoints of recurrent state that let a
+                               conversation continue from what was computed. Below
+                               the limit the engine holds what the machine has
+                               available less a small headroom, and gives memory
+                               back when other programs need it [default: all the
+                               machine has]
 
     Prompt cache on SSD.
         --cache <DIR>          A directory in which the engine keeps the state of

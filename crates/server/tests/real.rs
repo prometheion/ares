@@ -1244,14 +1244,24 @@ fn flash_model() -> Option<PathBuf> {
     }
 }
 
+/// The RAM limit of the servers of Flash-Next (`ARES_TEST_FLASH_RAM`, default
+/// `8G`). Without a limit the tier of experts takes what the machine has
+/// available less a small headroom, which is the server's default and not
+/// what a test that shares the machine with other work should do.
+fn flash_ram() -> String {
+    std::env::var("ARES_TEST_FLASH_RAM").unwrap_or_else(|_| "8G".to_owned())
+}
+
 /// A server on two devices (`ARES_TEST_DEVICES`, default `0,1`) that spread
 /// the model as `split` says.
 fn flash_server(model: &PathBuf, port: u16, split: &str) -> Server {
     let devices = std::env::var("ARES_TEST_DEVICES").unwrap_or_else(|_| "0,1".to_owned());
+    let ram = flash_ram();
+    let chat = "enable_thinking=false";
     Server::start_with(
         model,
         port,
-        &["--devices", &devices, "--split", split, "--chat-var", "enable_thinking=false"],
+        &["--devices", &devices, "--split", split, "--ram", &ram, "--chat-var", chat],
         &[],
         SLOW,
     )
@@ -1444,10 +1454,11 @@ fn flash_next_answers_on_one_card() {
     let Some(model) = flash_model() else { return };
     let devices = std::env::var("ARES_TEST_DEVICES").unwrap_or_else(|_| "0".to_owned());
     let device = devices.split(',').next().unwrap_or("0").to_owned();
+    let ram = flash_ram();
     let mut server = Server::start_with(
         &model,
         port(2),
-        &["--devices", &device, "--chat-var", "enable_thinking=false"],
+        &["--devices", &device, "--ram", &ram, "--chat-var", "enable_thinking=false"],
         &[],
         SLOW,
     );

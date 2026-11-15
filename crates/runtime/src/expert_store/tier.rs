@@ -90,6 +90,18 @@ impl Tier {
         self.slot[layer][local as usize]
     }
 
+    /// The slots of the layer's pool behind each of the layer's slot numbers.
+    pub fn locals(&self, layer: usize) -> &[u32] {
+        &self.slot[layer]
+    }
+
+    /// Puts slot `slot` of the layer's pool behind the layer's slot number
+    /// `local`. The caller keeps every slot of the pool behind exactly one
+    /// number of one layer.
+    pub fn remap(&mut self, layer: usize, local: u32, slot: u32) {
+        self.slot[layer][local as usize] = slot;
+    }
+
     /// The bytes of all pools at `place`.
     pub fn bytes(&self, place: usize) -> u64 {
         self.pools.iter().filter(|p| p.place == place).map(|p| p.stride * u64::from(p.slots)).sum()
