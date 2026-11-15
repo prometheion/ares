@@ -1,0 +1,151 @@
+# What is still open
+
+Updated 2026-11-15, `main` at 35f152c (207 commits ahead of `origin/main`, nothing pushed).
+This file is brought up to date at every merge into `main`. It lists work, defects and
+measurements that are owed; what a feature must do in detail is in
+[`reference/feature-checklist.md`](reference/feature-checklist.md) (223 rows: 68 done,
+42 partly, 90 not started, 23 outside the frame; its rows K01, K02 and K06 still say
+"not started" although reasoning is built).
+
+Order of work the owner has set: CUDA complete for both models first, Vulkan parity last.
+
+## In work now
+
+| Piece | State |
+| --- | --- |
+| Elastic host memory (`moe/elastic-ram`) | built; being put on top of the SSD cache (conflicts in six files); then my verification |
+| Draft block of Flash-Next (`moe/draft-head`) | built and exact, gives no speed yet; my verification is running; merge only if the default without a drafter is unchanged |
+| Exact draft windows of the 27B (`dense/exact-windows`) | built, rebased; my verification is queued |
+| Server defaults for sampling and reply length (R23, R25) | agent working |
+| Image input | design study running (read only) |
+| Test file `Qwen3.8-Flash-Next-UD-Q4_K_XL` (104 GiB) | downloading to `/mnt/data/ares-models`, 19 GiB so far, slow |
+
+## Qwen3.8 Flash-Next (`qwen4exp`)
+
+### Speculation that pays (output unchanged)
+- [ ] Window prices that follow the tiers: measured warm, re-measured, stale sizes tried
+      again. Today they are measured once at load on cold tiers, so no window is chosen on
+      two cards. The same defect lets a late step poison the 27B's price table under CPU load.
+- [ ] All 512 experts of the draft block resident in VRAM (about 700 MiB): a link costs
+      5 to 9 ms today, 1.5 ms when its experts are there.
+- [ ] Chain cut per token by the draft's own probability.
+- [ ] Speculation never waits for a file read: a window row whose expert is not cached is
+      not accepted; the rows before it stay exact.
+- [ ] Draft vocabulary (German, English, code) for the draft block.
+- [ ] `--drafters mtp` for a model file that carries its block; drafts in the measuring tool.
+
+### Experts from the SSD
+- [ ] Usage profile: the server keeps its expert heat in a file, loads it at start in place
+      of the canned warm-up text (41 to 44 s at every start), keeps it current, and fills
+      empty slots from it when idle.
+- [ ] Prediction on the device: the routers of the next two layers applied to the current
+      state in the router's own launch; read-ahead in chunks of 512 KiB, at most two while
+      a demand read runs. (A first attempt with the prediction on the host was rejected:
+      it changed the text and halved generation on two cards; branch `moe/read-ahead`
+      is kept as a record.)
+- [ ] Long prompts layer by layer over the whole prompt, interruptible, with read-ahead of
+      the most used experts of the next two layers.
+- [ ] A missed expert waits 2.3 to 3.2 ms for the file where the drive needs 1.4 ms: find
+      the rest.
+- [ ] Pruning as a fourth level next to VRAM, RAM and SSD: a picked expert that is only on
+      the SSD is fetched only when the pick is strong; else it is skipped (tail skip) or
+      replaced by the most similar cached expert (the owner's idea; no engine has it). A
+      threshold as the quality dial, off by default; measured per rule and threshold on
+      the IQ2_XS file and on the Q4_K_XL file (KL, agreement, reads per token, speed).
+- [ ] The first reading of a short prompt after other texts is slower with transit
+      (35 against 86 tokens/s in one run); not understood.
+- [ ] A request that arrives behind a lone long prompt waits for one piece of 512 rows,
+      2 to 2.5 s. Needs a bound in time. **Question to the owner: how long may it wait?**
+
+### Host memory
+- [ ] A release that does not wait for the running step, so the headroom stays at a few
+      hundred MiB (it sits at its cap of 1.95 GiB after every load).
+- [ ] A MoE model and a dense model on one device under memory pressure: the dense
+      checkpoints are still freed on the watch's thread, the path that deadlocked.
+- [ ] A log line when the tier shrinks.
+
+### Cache, tests, kernels
+- [ ] Prefix cache for this model (it has none), with the RAM and SSD levels.
+- [ ] Device tests that do not depend on machine load
+      (`steps_wider_than_eight_rows_match_the_reference`,
+      `every_layer_of_wide_steps_matches_the_reference`,
+      `experts_of_every_weight_type_on_the_cpu_change_nothing_*` fail now and then under load).
+- [ ] The step scratch starts its buffers on a 128-byte line (as fixed for the 27B).
+- [ ] Float experts beyond the f16 range are not caught in the many-row kernels.
+- [ ] CPU path for the 24 types without a hand-written kernel is 3 to 11 times slower.
+- [ ] NVFP4 many-row gate and up 1.4 times its neighbours on the RTX 4070; IQ2_XXS many-row
+      at 8 rows 7 % slower on the RTX 3060 since the kernels for all types.
+
+## Qwen3.8 27B (`qwen35`)
+- [ ] A generating step of more than 16 rows still changes kernel family (three sequences
+      drafting at once): the last gap in "text with drafts is the text without".
+- [ ] Layout choice that is stable: it rests on the fastest of three probe rounds; a link of
+      the draft chain costs 1.49 ms where 1.44 ms is possible; the choice changes between
+      loads and with the draft block; the 0.8B decodes 5 % slower than it could.
+- [ ] `qwen35_run` aborts a direct prompt run with `--kv q5,q5` (reserve for partial states).
+- [ ] Float matrices under the fast precision use f16 sums (0.04 to 0.06 % rms) where the
+      F32 matrices of an IQ4_XS file were exact before: decide with a KL measurement.
+- [ ] VRAM and quality against the fork at equal settings: never measured.
+- [ ] Prompt on the RTX 3060 alone is 3 % behind the fork.
+- [ ] DFlash2 with draft trees (study in `/var/tmp/ares-dflash-study/REPORT.md`).
+- [ ] The model's own drafts for the thinking rows of a request that has to call a tool;
+      drafts while a rule is bound.
+- [ ] Sampler: a row with no finite logit reports `-0.0` where the reference says minus
+      infinity; deciding a level got slower (35 to 42 us); a list of the set's tokens after
+      the first cut; on two cards most of the sampler's time on the RTX 3060 is the exchange.
+- [ ] F32 tile kernel is 2.5 times slower than BF16 (untuned).
+
+## Prompt cache (every model; RAM first, then SSD, as in the owner's fork)
+- [ ] RAM level for the K/V state that leaves VRAM; write to SSD when the RAM level evicts
+      (full or shrinking), at unload and at a clean stop. Today pages are written through
+      as they are computed and only checkpoints lie in RAM.
+- [ ] The same for Flash-Next.
+- [ ] One size limit for all models on a directory; the transit buffers inside `--ram`;
+      a test of the full drive; a layout that does not depend on the split.
+- [ ] Cache policy: resume point at the prompt's end, memory of reply tokens, marks, warm pass.
+- [ ] On `/v1/responses` a second turn took 1 of 35 prompt tokens from the cache where
+      `/v1/messages` took 18: the history is rendered differently somewhere.
+
+## Server and API
+- [ ] API keys (X01); configuration file and environment variables (M08); CORS (X04);
+      Host and Origin checks (X05).
+- [ ] Tokenize and detokenize (A09); model properties (A16); template override (F07);
+      continuing the last assistant message (F09); truncation and context shift (F18).
+- [ ] Thinking budget (K03; Anthropic's `budget_tokens` is accepted and not enforced);
+      loop guard (K05); reasoning tokens in the usage (K07).
+- [ ] `stop_reason: stop_sequence` (the engine does not tell a stop string from the end token).
+- [ ] Tool calls: a generic format for other templates; recovery of imperfect calls (T05);
+      string constraints `pattern`, `minLength`, `maxLength`, `format`; forced tokens as
+      drafts; a guard for `ignore_eos` with a complete grammar; the end-token rule for a
+      schema with thinking; llama.cpp's `json.gbnf` costs 6.8 ms per mask.
+- [ ] Responses: stored responses (A05), WebSocket (A06); the chat route's sampler fields
+      are refused there. Messages: never run against Claude Code; no prefill.
+- [ ] Router: load and unload times in the docs; "no room" for Flash-Next is recognised by
+      message text; a plan cannot be asked without loading; two elastic models on real devices.
+- [ ] A request with tools or an effort for an unknown model gets a 400 where a 404 belongs.
+- [ ] Latency histograms (O01), logs (O03, O04), a bounded queue that says when to retry
+      (S04), priorities (S06), timeouts (S23), a VRAM reserve for other programs (V04),
+      container image and service unit (X09).
+
+## Whole features not started
+- [ ] Image input (F11; the owner's preset sets `mmproj`). Audio, video and Gemma 4 are on
+      the waiting list.
+- [ ] Jev mode: `/v1/systemone` exists and answers 501; `Engine::decide` on the real runtime.
+- [ ] Turing.
+- [ ] K/V of a running sequence beyond VRAM (P16; an exception, low priority).
+
+## Vulkan (last)
+- [ ] A backend-free crate and the `ares-gpu` facade; expert and Flash-Next kernels; both
+      models on Vulkan in every placement; attention for wide windows (2 to 6.5 times slower
+      than CUDA today); the delta rule's f16 state rounded per row; the sampler's `-0.0`.
+
+## Measurements owed on a quiet machine
+- [ ] Flash-Next with the owner's real limit (a RAM tier of 24 to 26 GiB), one card and two.
+- [ ] The SSD cache's times to the first token (taken under load so far).
+- [ ] Flash-Next with its draft block once speculation pays; target above 56 tokens/s.
+- [ ] Before a release: both models against the fork and against Strata, speed, VRAM, quality.
+
+## Questions to the owner
+- How long may a request wait behind a long prompt on Flash-Next?
+- Should the SSD cache be on by default with a default directory? (Today: only with `--cache`.)
+- Do audio, video and Gemma 4 block the first release?
