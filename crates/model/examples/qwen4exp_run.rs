@@ -900,7 +900,10 @@ fn run() -> Result<(), AnyError> {
                 format!("--text has {} tokens, the fingerprint reads 600", text.len()).into()
             );
         }
+        session.take_store_stats();
         fingerprint(&mut session, &text[..600], out)?;
+        let stats = session.take_store_stats();
+        println!("  store: {}", store_line(&stats, stats.steps as usize));
     }
     // The pick after the last token that was read, for a decode run that
     // starts right there.
