@@ -2222,7 +2222,8 @@ impl Conductor {
                     // What each draft row is worth: the chance that the
                     // drafts up to its own are right, times what a token
                     // costs.
-                    if !drafts_only && part.rows > 1 {
+                    // Before the step has a price nothing is known of it.
+                    if !drafts_only && part.rows > 1 && self.token_ms > 0.0 {
                         let chances = if a.own { &a.own_chances } else { &a.lookup_chances };
                         self.worth.resize(row_index as usize + 1, 0.0);
                         let mut reach = 1.0;
