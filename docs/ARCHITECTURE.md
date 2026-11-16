@@ -1,7 +1,8 @@
 # Architecture of Ares
 
-This document describes how the engine is built, why, and how far each part
-is. It is the place to start before changing anything.
+This document describes how the engine is built and why. It is the place to
+start before changing anything. What runs today is in [`FEATURES.md`](FEATURES.md),
+what is open in [`OPEN.md`](OPEN.md).
 
 The goal ([issue 1](https://github.com/prometheion/ares/issues/1)) is one
 inference server that takes the best technique of every existing engine and
@@ -4137,138 +4138,12 @@ other engines' code, with a ranked list of what to take and a list of where
 Ares still copies llama.cpp without a reason, is
 [reference/serving-engines-code-survey.md](reference/serving-engines-code-survey.md).
 
-## Status
+## Status and what is open
 
-State on 2026-11-11, on an RTX 4070 and an RTX 3060 with driver 615.78.08.
-Work is paused here until Qwen4 is released; nothing below is in progress.
-
-- **Qwen3.8-27B** runs on both cards through the runtime and the server and
-  is ahead of the llama.cpp fork in tensor split: a prompt of 2048 tokens at
-  1285 to 1291 tokens per second against about 1180, a decode step without
-  drafts in 24.8 ms against 28, and 82 to 86 tokens per second with the
-  model's own drafts against 62 to 67. Through HTTP it is as fast as without.
-  Drafts are chosen for every step from a price of a step measured at load
-  and acceptance measured while running (see [Speculation](#speculation)):
-  chains of 7 links where text is copied (142 to 163 tokens per second for a
-  rewrite of a file), of 3 to 6 on prose and code. A prompt that arrives next
-  to generating sequences gets its first token about 25 ms after what the
-  cards need alone (see "A step"). See [Several devices](#several-devices).
-- **Qwen3.8-Flash-Next** runs on both cards, agrees with the CPU reference
-  and answers in German and English, and is served by the `ares` binary like
-  the 27B, in both placements. Its draft block (`--drafters FILE`) runs in
-  every placement and changes no token, but no window is chosen for it on
-  this machine yet (see "It drafts with its draft block"), so it generates
-  without speculation: 43 to 48 tokens per second at the median of a series of runs at
-  about 1000 tokens of context (a decode step takes 22 to 23 ms, 17 ms when it
-  misses no expert). With the lookup drafts it had before the draft policy,
-  which have not been measured since, it was at 48 to 58 (three series; 20 to
-  110 by text and run), level with Strata's median of 56 with drafts on this
-  machine within the spread; without them it is behind that until its draft
-  head is built. Prompts are read in pieces of 256 rows on the many-row expert
-  kernels, at 103 to 217 tokens per second for 1000 tokens and 132 to 166 for
-  4700 (before: eight rows, 83 to 141 and 100 to 126; measured before the draft
-  policy, with the slices the engine then sent); bound by the experts the
-  slices miss (see [Qwen3.8-Flash-Next through the
-  runtime](#qwen38-flash-next-through-the-runtime)).
-- CUDA has every kernel family the two models need: weights for all 28
-  types (twelve with a device layout that serves every row count from one
-  copy), layers, attention over the stored K/V formats, sampler, sums
-  between devices, router and experts, the kernels of `qwen4exp`. The CUDA
-  tests pass on both cards, the kernel ones also on real tensors.
-- The sampler serves everything a request can set on the device, in the
-  names of the OpenAI API and of llama.cpp's server: penalties, DRY, logit
-  bias, a mask per row (the hook the grammars will use), the probabilities of
-  the tokens, the samplers of llama.cpp's chain in any order, mirostat, `n`
-  completions and a seed. Its kernels equal the reference of `ares-sampler`
-  bit for bit on both cards, the reference equals llama.cpp's definitions, and
-  with drafts the tokens are the tokens without them (bit for bit on the
-  synthetic model, and equal in all 14 settings on the 27B). A request that asks
-  for none of it costs what the old sampler did. See [Sampling](#sampling).
-  Vulkan's kernels (same steps and records, no 64-bit atomics, `shaderFloat64`
-  required) equal the same reference bit for bit on both cards; no model runs
-  them yet.
-- Vulkan has the weight kernels (the same device layouts, byte for byte) and
-  the layer kernels, at CUDA's speed on these cards, and the attention kernels
-  over all stored K/V formats. Attention is within 20 % of
-  CUDA's for one row of `f16`, 1.3 to 3.3 times as slow for one row of `q8`
-  or `q4` and 2 to 6.5 times for windows of 8 and 64 rows (no tensor cores,
-  items of 16 vectors). It has the sampler and no expert or `qwen4exp`
-  kernels and no model.
-- The KV formats are specified, pinned by golden files and measured on the K
-  and V of real models; the CUDA kernels write them bit-exactly and read
-  them within 1e-3 of the CPU reference. The dense model serves all of
-  them for K and V apart, in every placement and with the prefix cache
-  (`q8` is the default); the formats with a tile mean (`q7` to `q4`) keep a
-  second, small pool of exact entries (see "Sequence state").
-- The prefix cache runs on the devices for `qwen35`, in every placement: a
-  conversation's next turn starts from the pages and the checkpoint of the
-  last one (on Qwen3.8-27B a second turn after a history of 24k tokens gives
-  its first token after about 0.14 s instead of 25 s; see "Sequence state"),
-  the usage of an answer says how much came from the cache, and the engine's
-  RAM is one setting (`--ram`).
-- Known defects: a long prompt next to a generating Flash-Next sequence slows
-  it by the misses of the prompt's rows (nothing separates the two inside a
-  step); a row of a draft window has the bits of the row alone only while
-  the step has no more rows than the few-row kernels of the device layout take
-  (16: three sequences that draft at once with windows of 8, or a window above
-  16 rows, go past it, and their rows then round as the rows of a prompt do);
-  a row still depends on the steps that computed its prompt (see "Rounding"
-  under "Sequence state"), so a reply from the prefix cache is not always the
-  reply computed from nothing; a prompt
-  that shares only the start of the chat template with an earlier request
-  (three tokens) now runs a step of its own to replay them before its rows
-  (one more step in the counts of `--engine`, not timed); a model that only
-  runs on Turing has no prefill and no attention path.
-- Real model files are test data and stay outside the repository.
-
-## Next steps
-
-Nothing is being worked on until Qwen4 is released. What is open, in the
-order it would be taken up; the source of each idea is in
-[reference/serving-engines-code-survey.md](reference/serving-engines-code-survey.md).
-
-1. Qwen4 itself: its architecture next to `qwen4exp`, and whatever its
-   files need.
-2. The mixture-of-experts case ahead of Strata: drafts from the model's
-   draft block (and with it the lookup in earlier text, which the model had
-   before the draft policy and has not while it has no drafter); the prompt
-   path's waves (steps of more than eight rows run on the many-row expert
-   kernels; what the layer-major pass with waves has left to fix is described
-   under "Qwen3.8-Flash-Next through the runtime"); reading the
-   experts the next layers will pick before their routers have run; owners of
-   experts that follow the heat; the tier of experts giving memory back.
-3. Attention for models that attend a few thousand cells through lists: the
-   kernel chosen by a measurement on the device, staged loads where they
-   pay, one launch per row, items of twelve query heads, rows of a prompt
-   that share cells; and the K/V formats with a tile mean in `qwen4exp`.
-4. The prefix cache beyond the first pass: checkpoints at the message
-   boundaries the server names (the anchor is a page boundary before the end
-   of the prompt now), a warm pass in the background, spill of a sequence to
-   RAM, the partly used last page and the state at a request's end on SSD
-   (pages and checkpoints at page boundaries are, see "On SSD"), a layout of
-   stored state that does not depend on the split, locking the RAM of the
-   next chunk of places
-   ahead of its first use, and `qwen4exp` with a cache (what that needs is
-   under "Qwen3.8-Flash-Next through the runtime").
-5. Shares of a tensor split from a measurement at load; device layouts for
-   the remaining types (the i-quants of 2 and 3 bits stay in the file's layout,
-   and with them the integer kernels for few rows); a choice of layouts that
-   does not change with the draft block or from one load to the next; the
-   few-row kernels of the device layout in launches, so that a step of more
-   than 16 generated rows keeps every row's bits; rows of a prompt that
-   compute as single rows do, so that the prefix cache cannot change a text.
-6. Vulkan: experts, the `qwen4exp` kernels, and the models (the sampler's
-   kernels wait for a model that calls them); a sampler on devices without
-   `shaderFloat64`, with the double-precision functions written in 64-bit
-   integers; attention for
-   windows of many rows on the cooperative matrices, and a faster decode of
-   the `q8` and `q4` rows; a faster upload.
-7. Multimodal input, `Engine::decide` and
-   `/v1/systemone` on the real engine. For tool calls: the tests on the real
-   models (the model's own drafts in the free part of a reply with tools
-   among them, which only the host has run), and a format for templates that
-   write calls otherwise.
-8. A path for Turing; a run on any card that is not one of the two here.
+What the engine can do today is listed in [`FEATURES.md`](FEATURES.md), what is still
+open in [`OPEN.md`](OPEN.md); both are brought up to date at every merge into `main`.
+This document describes how the parts work and why. Numbers in it carry the date they
+were measured; the current ones are in `FEATURES.md`.
 
 ## Host memory
 

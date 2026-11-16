@@ -32,7 +32,9 @@ the kernels exist; no model runs there yet.
 - Prompt cache on SSD: `--cache <DIR>`, `--cache-size` (default 32G). A conversation resumes
   after its state left the cards, after an unload and after a restart.
 - `--ram`: one limit for all page-locked host memory; too small a limit is refused with every
-  share named.
+  share named. Below it the engine follows the machine: when other programs need memory it
+  gives page-locked memory back between steps (checkpoints first, the expert tier last) and
+  takes it again when the memory is free; the reserve it keeps is derived, not fixed.
 
 ## Sampling
 - Temperature and dynamic temperature, top-k, top-p, min-p, typical, top-n-sigma, XTC,

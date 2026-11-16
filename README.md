@@ -11,34 +11,16 @@ of each existing engine and leaves out everything kept for compatibility.
 - One binary, a server; no command line tools, no GUI
 
 The goals are in [issue 1](https://github.com/prometheion/ares/issues/1).
-How the engine is built and how far each part is: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+How the engine is built: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## State
 
 Ares supports two models until Qwen4 replaces them: Qwen3.8-27B, dense, and
-Qwen3.8-Flash-Next, a mixture of experts streamed from SSD. The 27B is
-served by the `ares` binary on one or two GPUs through CUDA, with drafts
-from the model's own draft block and from earlier text (whose drafts and how
-long are chosen for every step from the price of a step, measured at load, and
-the acceptance, measured while running), prompts that are read in pieces
-between rounds of generation, sampling on the device and a prefix cache
-that lets a conversation continue from what was computed; on two GPUs it is
-ahead of the llama.cpp fork it is measured against in prompt processing and
-in generation. Flash-Next is served by the same binary on two GPUs; it agrees
-with its CPU reference and generates at 43 to 48 tokens per second at the
-median, without drafts. Its draft block is built (a file of its own, `--drafters
-FILE`): it runs in every placement, drafts what the CPU reference drafts and
-changes no token, and its links are accepted two times of three; the engine
-does not get faster by it yet, because the price of a window is measured before
-the tiers hold a text's experts and every row that verifies a draft brings
-experts of its own. With the lookup drafts it had before the draft policy it
-made 48 to 58 (three series), level with Strata's 56 with drafts within the
-spread of the runs. It has no prefix cache,
-and reads prompts in pieces of 256 rows on the many-row expert kernels (103 to
-217 tokens per second for a prompt of 1000 tokens, 132 to 166 for 4700, measured
-before the draft policy and the pieces between rounds of generation). The numbers
-are in
-[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#status).
+Qwen3.8-Flash-Next, a mixture of experts whose experts live in VRAM, RAM and on
+the SSD. Both are served by the `ares` binary through CUDA on one or two GPUs;
+Vulkan follows when CUDA is complete. What runs today and how fast:
+[docs/FEATURES.md](docs/FEATURES.md). What is still open:
+[docs/OPEN.md](docs/OPEN.md).
 
 There is no release yet. The first release is the complete engine: every
 row of [docs/reference/feature-checklist.md](docs/reference/feature-checklist.md)

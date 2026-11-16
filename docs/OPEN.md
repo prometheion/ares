@@ -1,7 +1,7 @@
 # What is still open
 
-Updated 2026-11-16, `main` at the server's defaults for sampling and reply length (nothing
-pushed). What is there is listed in [`FEATURES.md`](FEATURES.md).
+Updated 2026-11-16, `main` at elastic host memory and the image tower's CPU reference
+(nothing pushed). What is there is listed in [`FEATURES.md`](FEATURES.md).
 This file is brought up to date at every merge into `main`. It lists work, defects and
 measurements that are owed; what a feature must do in detail is in
 [`reference/feature-checklist.md`](reference/feature-checklist.md) (223 rows: 70 done,
@@ -14,9 +14,33 @@ Order of work the owner has set: CUDA complete for both models first, Vulkan par
 
 | Piece | State |
 | --- | --- |
-| Elastic host memory | built and put on top of the SSD cache and the draft block (one squashed commit); my verification is queued |
-| Window prices that follow the tiers, chain cut by confidence | agent working |
-| Test file `Qwen3.8-Flash-Next-UD-Q4_K_XL` (104 GiB) | downloading to `/mnt/data/ares-models`, slow |
+| Speculation that pays on Flash-Next: prices that follow the tiers (built), rows of unmade links leave the step, the draft block's experts resident, no window row waits for a file read; built in the conductor and the expert store, not in one model | agent working (branch `sched/live-prices`) |
+| Expert usage profile in place of the warm-up text, idle fill of the tiers | agent working (`moe/expert-profile`) |
+| RAM level of the prompt cache, written to the SSD only when evicted, at unload and at a stop | agent working (`cache/ram-level`) |
+| Shared model layer, steps 0 to 3 (see below); step 3 brings Flash-Next K and V in `q7` to `q4` | agent working (`model/shared-blocks`) |
+| Test files: `Qwen3.8-Flash-Next-UD-Q4_K_XL` (104 GiB), then Flash-Next's DFlash2 drafter (3.1 GiB) | downloading to `/mnt/data/ares-models`, 6 MB/s |
+
+## Shared model layer (the owner's rule, 2026-11-16)
+Generic for Ares, not like llama.cpp: a few models, shared code where it can be, each model
+still at its maximum through its own launch plan. A part becomes a shared block when it owns
+state the runtime touches (pages, slot state, checkpoints, windows, commits, replays, trees)
+or when it drafts; products, norms, kernel choice per row count, fused launches and exchanges
+between cards stay with the model. Today the two models share almost nothing inside
+`crates/model`, which is why every parity item below is owed twice. Design study:
+`/var/tmp/ares-survey/shared-model-layer.md`. Each step lands green on its own.
+- [ ] 0. A `blocks` module; the 27B's K/V code moved into it as it is.
+- [ ] 1. The K/V group as a block, the 27B onto it (bit for bit, same launches).
+- [ ] 2. The recurrent (delta-rule) block, both models onto it (bit for bit).
+- [ ] 3. Flash-Next onto the K/V group: K and V in `q7` to `q4`, windows as if alone.
+- [ ] 4. Slot state and checkpoints as one contract: Flash-Next's prefix cache with RAM and SSD.
+- [ ] 5. Token rows (embedding on the host, in the mapped file or on the card; the image rows).
+- [ ] 6. One driver for the draft block: Flash-Next's draft vocabulary and picks on the card,
+      `--drafters mtp`; the 27B's drafts under a layer split. After the speculation piece.
+- [ ] 7. Drafters as kinds of the runtime (lookup, draft block, DFlash). After the speculation piece.
+- [ ] 8. DFlash on both models: each model gives only its tap (the 27B a copy of the residual,
+      Flash-Next the mean of its four streams); the loader reads the drafter's shape from the file.
+- [ ] 9. Trees in the blocks, verified once for every drafter and both models.
+- [ ] 10. Tree fill from the DFlash lattice, MTP links mixed into a tree.
 
 ## Qwen3.8 Flash-Next (`qwen4exp`)
 
@@ -92,6 +116,8 @@ Everything `FEATURES.md` lists for the 27B and not for Flash-Next is owed:
       tools exists and was not run).
 
 ## Qwen3.8 27B (`qwen35`)
+- [ ] Drafts under a layer split (Flash-Next drafts in every placement; the 27B not under
+      `--split layer`): parity owed to the 27B, step 6 of the shared layer.
 - [ ] A generating step of more than 16 rows still changes kernel family (three sequences
       drafting at once): the last gap in "text with drafts is the text without" (which holds
       since 2026-11-16 for single sequences in every placement and K/V format). Texts under
@@ -117,7 +143,12 @@ Everything `FEATURES.md` lists for the 27B and not for Flash-Next is owed:
       has a DFlash2 drafter file (dense and MoE alike), not as a feature of one model: the
       drafter model on the device, a tree instead of a chain (fill, node allocation), tree
       verification in the windows, the policy choosing among lookup, MTP and DFlash2 or all
-      of them. Study: `/var/tmp/ares-dflash-study/REPORT.md`.
+      of them. Built on the shared layer (steps 7 to 10 above), for both models at once.
+      Study: `/var/tmp/ares-dflash-study/REPORT.md`. Drafter files: the 27B's
+      (`~/Services/models/dflash-test/Qwen3.8-27B-DFlash2-Q4_K_M.gguf`; the 27B's DSpark file
+      has the same architecture name with another shape: block of 7, other taps, no selector);
+      Flash-Next's from `incoai/Qwen3.8-Flash-Next-DFlash2-GGUF` (downloading; trained on the
+      mean of the model's four hyper-connection streams, which llama.cpp cannot drive yet).
 
 ## Prompt cache (every model; RAM first, then SSD, as in the owner's fork)
 - [ ] RAM level for the K/V state that leaves VRAM; write to SSD when the RAM level evicts
@@ -165,7 +196,10 @@ Everything `FEATURES.md` lists for the 27B and not for Flash-Next is owed:
         rows, the pass. See "The image tower" in `ARCHITECTURE.md`.
   - [ ] 2. The tower on the device: dense attention for heads of 72, layer norm with bias,
         bias and GELU, the tower's rotary rotation, the position table's resize; `ffn_down`
-        padded from 4304 to 4320 inputs.
+        padded from 4304 to 4320 inputs. The residual reaches 5400 to 8400, so `ffn_down`,
+        the residual add and the norms' statistics stay in `f32`; the device is held to the
+        exact reference (`Arithmetic::Exact`). Reference dumps of the fork:
+        `/var/tmp/ares-qwen3vl-ref` (with the notes of pieces 0 and 1).
   - [ ] 3. Both homes for the tower's weights, as the owner requires (llama's `mmproj` with and
         without `no-mmproj-offload`): resident in VRAM, or held in RAM and uploaded block
         by block for each image so that no VRAM is taken for good; a key chooses. The tower
