@@ -1,7 +1,8 @@
 # What is still open
 
-Updated 2026-11-16, `main` at elastic host memory and the image tower's CPU reference
-(nothing pushed). What is there is listed in [`FEATURES.md`](FEATURES.md).
+Updated 2026-11-16, `main` at the shared layer's step 3, the speculation, the server basics
+and the image tower on the device (nothing pushed). What is there is listed in
+[`FEATURES.md`](FEATURES.md).
 This file is brought up to date at every merge into `main`. It lists work, defects and
 measurements that are owed; what a feature must do in detail is in
 [`reference/feature-checklist.md`](reference/feature-checklist.md) (223 rows: 70 done,
@@ -14,10 +15,10 @@ Order of work the owner has set: CUDA complete for both models first, Vulkan par
 
 | Piece | State |
 | --- | --- |
-| Speculation that pays on Flash-Next: prices that follow the tiers (built), rows of unmade links leave the step, the draft block's experts resident, no window row waits for a file read; built in the conductor and the expert store, not in one model | built, measured; rebased onto `model/shared-blocks` (steps 0 to 3 of the shared model layer, server basics, image tower) and proven there: fingerprints without drafts unchanged, GPU tests green (branch `sched/live-prices`) |
-| Shared model layer, steps 0 to 3 (see below); step 3 brings Flash-Next K and V in `q7` to `q4` | agent working (`model/shared-blocks`) |
-| Image tower on the device, weights resident in VRAM or in RAM and uploaded per image (pieces 2 and 3) | agent working (`vision/tower-device`) |
-| Test files: `Qwen3.8-Flash-Next-UD-Q4_K_XL` (104 GiB), then Flash-Next's DFlash2 drafter (3.1 GiB) | downloading to `/mnt/data/ares-models`, 6 MB/s |
+| Shared model layer step 4: slot state and checkpoints as one contract, Flash-Next's prefix cache with RAM and SSD | agent working (`model/prefix-flash`) |
+| Shared model layer steps 7 and 8: drafters as kinds of the runtime, DFlash2 on both models (chains; trees are 9 and 10) | agent working (`spec/dflash`) |
+| Flash-Next: the next layers' routers predict picks on the device, capped read-ahead from the SSD | agent working (`moe/predict`) |
+| Flash-Next: pruning as a fourth level, three rules compared (skip, router's next best, most similar), `--expert-prune RULE:THRESHOLD`, off by default | agent working (`moe/pruning`) |
 
 ## Shared model layer (the owner's rule, 2026-11-16)
 Generic for Ares, not like llama.cpp: a few models, shared code where it can be, each model
@@ -27,10 +28,10 @@ or when it drafts; products, norms, kernel choice per row count, fused launches 
 between cards stay with the model. Today the two models share almost nothing inside
 `crates/model`, which is why every parity item below is owed twice. Design study:
 `/var/tmp/ares-survey/shared-model-layer.md`. Each step lands green on its own.
-- [ ] 0. A `blocks` module; the 27B's K/V code moved into it as it is.
-- [ ] 1. The K/V group as a block, the 27B onto it (bit for bit, same launches).
-- [ ] 2. The recurrent (delta-rule) block, both models onto it (bit for bit).
-- [ ] 3. Flash-Next onto the K/V group: K and V in `q7` to `q4`, windows as if alone.
+- [x] 0. A `blocks` module; the 27B's K/V code moved into it as it is.
+- [x] 1. The K/V group as a block, the 27B onto it (bit for bit, same launches).
+- [x] 2. The recurrent (delta-rule) block, both models onto it (bit for bit).
+- [x] 3. Flash-Next onto the K/V group: K and V in `q7` to `q4`, windows as if alone.
 - [ ] 4. Slot state and checkpoints as one contract: Flash-Next's prefix cache with RAM and SSD.
 - [ ] 5. Token rows (embedding on the host, in the mapped file or on the card; the image rows).
 - [ ] 6. One driver for the draft block: Flash-Next's draft vocabulary and picks on the card,
