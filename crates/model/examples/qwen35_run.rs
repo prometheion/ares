@@ -56,6 +56,8 @@
 //!   sets a variable of the chat template (`reasoning_effort=medium`). Reports
 //!   tokens per second, acceptance by draft position, the lengths of the
 //!   drafts and the time of a step by kind.
+//!   `--dflash FILE` drafts with a DFlash2 drafter as well, `--no-draft-block`
+//!   without the model's draft block.
 //! - `--conversation TOKENS`: the prefix cache on the devices. A conversation
 //!   whose history is about `TOKENS` tokens (a slice of `--text`) has a second
 //!   turn, and a conversation of the same size that the engine has never seen
@@ -165,6 +167,9 @@ struct Args {
     undrafted: bool,
     requests: usize,
     draft_vocab: Option<PathBuf>,
+    /// A DFlash drafter file, and whether the model's draft block drafts.
+    dflash: Option<PathBuf>,
+    draft_block: bool,
     out: Option<PathBuf>,
     chat_vars: Vec<(String, String)>,
     layouts: Layouts,
@@ -210,6 +215,8 @@ fn parse() -> Args {
         undrafted: false,
         requests: usize::MAX,
         draft_vocab: None,
+        dflash: None,
+        draft_block: true,
         out: None,
         chat_vars: Vec::new(),
         layouts: Layouts::default(),
@@ -265,6 +272,8 @@ fn parse() -> Args {
             "--undrafted" => args.undrafted = true,
             "--requests" => args.requests = value().parse().expect("requests"),
             "--draft-vocab" => args.draft_vocab = Some(value().into()),
+            "--dflash" => args.dflash = Some(value().into()),
+            "--no-draft-block" => args.draft_block = false,
             "--out" => args.out = Some(value().into()),
             "--layouts" => {
                 args.layouts = match value().as_str() {
@@ -940,10 +949,12 @@ fn engine(args: &Args, spread: &Spread, window: u32) {
         logit_rows: (2 * window).max(16),
         window_rows: if window > 1 { 2 * window } else { 0 },
         draft_vocabulary: vocabulary,
+        draft_block: args.draft_block,
+        dflash: args.dflash.as_ref().map(|path| {
+            Arc::new(ares_model::dflash::File::open(path).expect("the DFlash drafter"))
+        }),
         pipeline_rows: args.pipeline_rows,
         profile: args.profile.then(|| profile.clone()),
-        draft_block: true,
-        dflash: None,
     };
     let devices: Vec<Device> =
         args.devices.iter().map(|d| Device::open(*d, Wait::Block).expect("open device")).collect();
