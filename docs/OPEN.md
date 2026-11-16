@@ -173,8 +173,12 @@ Everything `FEATURES.md` lists for the 27B and not for Flash-Next is owed:
       `durable` and `transfer`, nothing of the levels is 27B-only).
 - [ ] Locking a page's buffers costs about 0.5 ms per MB when RAM grows (a page of the 27B is
       4.6 MB): lock ahead in the background while a step runs.
-- [ ] A checkpoint that later requests left behind is not written when it leaves the index;
-      one that leaves with its page, after the deeper ones of its text left, is.
+- [ ] A checkpoint that later requests left behind at deeper page boundaries is not written
+      when it leaves the index; one that leaves with its page, after the deeper ones of its
+      text left, is.
+- [ ] An unload or a stop waits for the drive to take what only RAM and the devices hold (on
+      the btrfs volume here, compressed and busy: 20 to 100 s for 1.5 GB). What only RAM holds
+      could be written after the devices are released, by a writer that outlives the engine.
 - [ ] One size limit for all models on a directory; a test of the full drive; a layout that
       does not depend on the split.
 - [ ] Cache policy: resume point at the prompt's end, memory of reply tokens, marks, warm pass.

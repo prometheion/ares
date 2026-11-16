@@ -478,16 +478,53 @@ impl Cache {
         if capacity == 0 {
             return (None, dropped);
         }
-        let place = self.free_places.pop().or_else(|| {
-            (self.next_place < self.capacity).then(|| {
-                self.next_place += 1;
-                self.next_place - 1
-            })
-        });
+        let place = self.free_place(&mut dropped);
         if let Some(place) = place {
             self.mark(place, true);
         }
         (place, dropped)
+    }
+
+    /// A place for a checkpoint whose memory the limit of the books holds: a
+    /// free place whose memory is locked already if there is one, else one
+    /// whose first use the limit has room for, made by giving up what goes
+    /// for nothing. The devices lock a place when a copy of a step first uses
+    /// it, and a lock beyond the limit would fail that step: pages in RAM
+    /// share the limit with the places, so this is not given by the number
+    /// of places alone. `None` when there is no such place. `dropped` counts
+    /// the checkpoints that went to make room.
+    fn free_place(&mut self, dropped: &mut u32) -> Option<u32> {
+        let Some(books) = self.books.clone() else {
+            return self.free_places.pop().or_else(|| self.unused_place());
+        };
+        loop {
+            let locked = self.free_places.iter().rposition(|place| books.place_lock(*place) == 0);
+            if let Some(at) = locked {
+                return Some(self.free_places.remove(at));
+            }
+            let place = self
+                .free_places
+                .last()
+                .copied()
+                .or_else(|| (self.next_place < self.capacity).then_some(self.next_place))?;
+            if books.unbooked() >= books.place_lock(place) {
+                return match self.free_places.last() == Some(&place) {
+                    true => self.free_places.pop(),
+                    false => self.unused_place(),
+                };
+            }
+            if !self.give_up_free(dropped) {
+                return None;
+            }
+        }
+    }
+
+    /// A place never used so far, if there is one.
+    fn unused_place(&mut self) -> Option<u32> {
+        (self.next_place < self.capacity).then(|| {
+            self.next_place += 1;
+            self.next_place - 1
+        })
     }
 
     /// Gives one thing up that is worth little: a buffer that holds nothing,
@@ -947,14 +984,16 @@ impl Cache {
     }
 
     /// Gives what only RAM holds to the writer, the coldest first, until it
-    /// is no more than the allowance less room for [`RESERVE`] pages: what
-    /// comes next then finds room without waiting for the drive.
+    /// is no more than the allowance less room for [`RESERVE`] pages and one
+    /// checkpoint: what comes next then finds room without waiting for the
+    /// drive.
     fn clean_ahead(&mut self) {
         if self.ssd.is_none() {
             return;
         }
         let Some(ram) = &self.in_ram else { return };
-        let room = self.allowance().saturating_sub(RESERVE * ram.page_bytes());
+        let reserve = RESERVE * ram.page_bytes() + self.bytes;
+        let room = self.allowance().saturating_sub(reserve);
         // Every turn takes one thing out of the dirty part of the order.
         for _ in 0..=ram.len() * 2 {
             let Some(ram) = &self.in_ram else { return };

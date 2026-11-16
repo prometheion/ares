@@ -426,3 +426,37 @@ fn an_engine_that_ends_writes_all_its_pages_through_the_floor_of_ram() {
     }
     e.consistent();
 }
+
+#[test]
+fn pages_in_ram_never_leave_a_checkpoint_without_memory_the_limit_can_lock() {
+    let dir = TempDir::new("place");
+    // Checkpoints of 32 pages each: more than the room RAM keeps for pages
+    // that come. The books' limit holds the floor, four checkpoints and 48
+    // pages; the budget is larger, so pages take what the limit leaves.
+    let mut config = SyntheticConfig::small(Split::Single, 1);
+    config.context_length = 2048;
+    config.prefix_cache = Some(32 * PAGE_BYTES);
+    config.durable = Some(1);
+    let model = Arc::new(SyntheticModel::new(config).unwrap());
+    let memory = Memory::new(PLENTY);
+    let budget = RuntimeConfig {
+        cache_ram: 64 * 32 * PAGE_BYTES + 256 * PAGE_BYTES,
+        ..self::config(32, 0, Some(store(&dir.0)))
+    };
+    let limit = 32 * PAGE_BYTES + FLOOR + 4 * 32 * PAGE_BYTES + 48 * PAGE_BYTES;
+    let (e, ram) = following(&model, budget, &memory.machine, limit);
+    // Texts pass through a pool that holds one and a half of them: RAM fills
+    // with what only it holds, while every text takes checkpoints. A place
+    // whose memory the limit could not lock would be a problem the oracle
+    // writes down.
+    for i in 0..6 {
+        let text = text_of(110 + i, 300);
+        let answer = e.ask(&text, 10);
+        assert_eq!(answer.text, fresh(&text, 10));
+        e.consistent();
+        assert!(ram.used() <= limit, "{} of {limit}", ram.used());
+    }
+    let s = e.written();
+    assert!(s.counters.checkpoints_saved > 0, "{s}");
+    assert_eq!(s.counters.ram.pages_dropped, 0, "{s}");
+}

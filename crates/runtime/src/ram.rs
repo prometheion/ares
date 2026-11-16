@@ -142,6 +142,10 @@ pub(crate) struct Shared {
     /// per device part; none for an executor without devices, whose pages
     /// are ordinary memory, booked all the same.
     devices: Mutex<Vec<Device>>,
+    /// For an executor without devices that books its places itself (the
+    /// host executor): the bytes of a place, and the places that hold
+    /// memory now.
+    host_places: Mutex<Option<(u64, Vec<bool>)>>,
 }
 
 impl Shared {
@@ -308,6 +312,7 @@ impl PinnedRam {
                 live: Mutex::new(Vec::new()),
                 chunks: Mutex::new(Vec::new()),
                 devices: Mutex::new(Vec::new()),
+                host_places: Mutex::new(None),
             }),
         }
     }
@@ -614,6 +619,62 @@ impl PinnedRam {
     pub(crate) fn place_is_live(&self, place: u32) -> bool {
         let places = self.shared.live.lock().unwrap_or_else(|e| e.into_inner());
         places.get(place as usize).copied().unwrap_or(false)
+    }
+
+    /// An executor without devices books places of `bytes` itself, and says
+    /// which hold memory ([`PinnedRam::host_place_held`]).
+    pub fn host_places(&self, bytes: u64) {
+        *self.shared.host_places.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some((bytes, Vec::new()));
+    }
+
+    /// Place `place` of an executor without devices holds memory, or not.
+    pub fn host_place_held(&self, place: u32, held: bool) {
+        let mut host = self.shared.host_places.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((_, places)) = host.as_mut() {
+            if places.len() <= place as usize {
+                places.resize(place as usize + 1, false);
+            }
+            places[place as usize] = held;
+        }
+    }
+
+    /// The bytes the devices would lock when checkpoint place `place` is
+    /// used next: the chunks it lies in that are not locked now, on every
+    /// device part. 0 for a place whose memory is there, and for books
+    /// whose places nobody books when they are first used.
+    pub(crate) fn place_lock(&self, place: u32) -> u64 {
+        if let Some((bytes, places)) =
+            &*self.shared.host_places.lock().unwrap_or_else(|e| e.into_inner())
+        {
+            return if places.get(place as usize).copied().unwrap_or(false) { 0 } else { *bytes };
+        }
+        let tables: Vec<Arc<PlaceChunks>> = {
+            let all = self.shared.chunks.lock().unwrap_or_else(|e| e.into_inner());
+            all.iter().filter_map(Weak::upgrade).collect()
+        };
+        tables
+            .iter()
+            .filter(|table| place < table.capacity)
+            .map(|table| {
+                let index = (place / table.per_chunk) as usize;
+                let chunks = table.chunks.lock().unwrap_or_else(|e| e.into_inner());
+                match chunks.get(index) {
+                    Some(Some(_)) => 0,
+                    _ => {
+                        let first = index as u32 * table.per_chunk;
+                        let places = table.per_chunk.min(table.capacity - first);
+                        u64::from(places) * table.bytes as u64
+                    }
+                }
+            })
+            .sum()
+    }
+
+    /// The bytes the limit leaves unbooked now.
+    pub(crate) fn unbooked(&self) -> u64 {
+        let books = self.books();
+        books.broker.capacity().saturating_sub(books.broker.used())
     }
 
     /// Releases chunks of checkpoint places in which the conductor has no

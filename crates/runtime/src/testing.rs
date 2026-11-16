@@ -230,6 +230,9 @@ impl HostExecutor {
     /// and the oracle holds the memory of a place only while the conductor
     /// has the place in use (see the module documentation).
     pub fn with_ram(mut self, ram: PinnedRam) -> Self {
+        // The places are booked here as they are first used, as a device
+        // part locks them: the books learn which hold memory.
+        ram.host_places(self.model.config().prefix_cache.unwrap_or(0));
         self.ram = Some(ram);
         self
     }
@@ -628,6 +631,7 @@ impl Oracle {
             if !live {
                 places.remove(place);
                 ram.release_checkpoints(bytes);
+                ram.host_place_held(*place, false);
             }
             live
         });
@@ -641,6 +645,7 @@ impl Oracle {
             note(problems, format!("{what} place {place}, which the conductor called unused"));
         }
         if !self.held.contains(&place) {
+            ram.host_place_held(place, true);
             if let Err(error) = ram.book_checkpoints(self.place_bytes) {
                 note(problems, format!("{what} place {place}: {error}"));
             }

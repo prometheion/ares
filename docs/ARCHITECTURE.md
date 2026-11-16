@@ -740,8 +740,8 @@ on the cards. What RAM holds and what goes first is
   pages that the devices hold; what the drive holds and what is not worth
   writing (a text shorter than the level on SSD's least, a tail, a
   checkpoint that later requests have left behind at deeper page
-  boundaries), and everything when
-  there is no level on SSD; then the rest, which is written first. A page is
+  boundaries), and everything when there is no level on SSD; then the rest,
+  which is written first. A page is
   the most recently used of what left the devices when it arrives, and the
   devices give a text up from its end, so a text goes from its end here too.
   A checkpoint goes on its own or with its page.
