@@ -71,6 +71,7 @@ mod device;
 mod elastic;
 mod fill;
 mod hybrid;
+mod near;
 mod profile;
 mod region;
 mod tier;
@@ -91,6 +92,7 @@ pub use device::{CudaSlots, HostShareState, HostSlots, SlotDevice};
 use elastic::{Layout, Pieces};
 pub use fill::{FillOrder, FillPace, FillStats, FillTier, TierFill};
 pub use hybrid::{CostModel, Miss, PromoteRule, Serve};
+pub use near::{ExpertNeighbours, NEAR_FORMAT, Near};
 pub use profile::{ExpertProfile, Ignored, PROFILE_FORMAT, ProfileKey};
 pub use region::{HostRegion, Locker, PIECE, Released};
 pub use tier::Pool;
@@ -750,6 +752,15 @@ impl<D: SlotDevice> ExpertStore<D> {
     /// Whether `expert` of `layer` is in the RAM tier.
     pub fn in_ram(&self, layer: usize, expert: u32) -> bool {
         self.ram.sets[layer].contains(expert)
+    }
+
+    /// Sets `out[e]` to 1 for every expert of `layer` that VRAM or the RAM
+    /// tier holds or has on its way, and leaves the others as they are: a pick
+    /// of such an expert needs no read from the file. The router's pruning
+    /// reads this.
+    pub fn mark_present(&self, layer: usize, out: &mut [u8]) {
+        self.vram.sets[layer].mark_present(out);
+        self.ram.sets[layer].mark_present(out);
     }
 
     pub fn heat(&self) -> &ExpertHeat {

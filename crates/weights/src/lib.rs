@@ -29,11 +29,11 @@
 //! - [`ExpertWaves`] divides the experts a layer needs for a whole prompt into
 //!   waves that fit the space for them, so that a prompt fetches each expert
 //!   once.
-//! - [`SlotSet::write_route_bias`] turns a tier into a routing constraint:
-//!   the router may be told to prefer or to use only the experts that are
-//!   already there. Re-deciding that set every few tokens is dynamic expert
-//!   pruning: a run keeps the experts it actually uses and drops the rest,
-//!   trading a bounded loss of quality for not having to fetch them.
+//! - [`SlotSet::mark_present`] says which experts a tier holds or has on
+//!   their way, which the router's pruning reads (dynamic expert pruning,
+//!   `ares_cuda::Prune`): a pick that only the file holds may be left out or
+//!   stood in for by an expert that is there, trading a bounded loss of
+//!   quality for not waiting for the file.
 //!
 //! Reading the experts (direct I/O from the GGUF, staging, uploads) and the
 //! kernels that compute with slots belong to the layers that own devices and

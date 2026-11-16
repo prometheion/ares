@@ -332,17 +332,15 @@ impl SlotSet {
         }
     }
 
-    /// Writes a bias for the router's scores: 0 for experts in this tier and
-    /// `-penalty` for the others.
-    ///
-    /// Added before the top-k, a large penalty restricts routing to the tier
-    /// (hard pruning); the router kernel can exempt its strongest raw picks
-    /// from the bias, which keeps most of the quality (protected pruning). A
-    /// small penalty only breaks near-ties in favour of experts that are
-    /// already there.
-    pub fn write_route_bias(&self, out: &mut [f32], penalty: f32) {
-        for (out, slot) in out.iter_mut().zip(&self.slot_of) {
-            *out = if *slot == NO_SLOT { -penalty } else { 0.0 };
+    /// Sets `out[e]` to 1 for every expert whose data is in place or on its
+    /// way into a slot, and leaves the others as they are: a pick of such an
+    /// expert needs no read from the file. The router's pruning reads this, a
+    /// byte per expert over every tier (`ares_cuda::PruneLayer::cached`).
+    pub fn mark_present(&self, out: &mut [u8]) {
+        for ((out, slot), loading) in out.iter_mut().zip(&self.slot_of).zip(&self.loading_in) {
+            if *slot != NO_SLOT || *loading != NO_SLOT {
+                *out = 1;
+            }
         }
     }
 
@@ -826,15 +824,16 @@ mod tests {
     }
 
     #[test]
-    fn maps_and_route_bias_follow_membership() {
+    fn maps_and_presence_follow_membership() {
         let mut set = SlotSet::new(4, 2);
         elect_and_commit(&mut set, &[0.0, 5.0, 0.0, 7.0], &SwapRule::default());
         let mut map = [0i32; 4];
         set.write_slot_map(&mut map);
         assert_eq!(map, [-1, 1, -1, 0]);
-        let mut bias = [9.0f32; 4];
-        set.write_route_bias(&mut bias, 1e30);
-        assert_eq!(bias, [-1e30, 0.0, -1e30, 0.0]);
+        // Presence adds to what another tier marked (expert 2 here).
+        let mut present = [0u8, 0, 1, 0];
+        set.mark_present(&mut present);
+        assert_eq!(present, [0, 1, 1, 1]);
     }
 
     /// The premise of the dynamic cache, on a synthetic workload: routing
