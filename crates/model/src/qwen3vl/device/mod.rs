@@ -122,7 +122,7 @@ struct Pass<'a> {
     rows: u32,
     patches: u32,
     out: DevicePtr,
-    /// Stop after this many units (all of them when `None`).
+    /// How many units of the plan run, from the first.
     units: usize,
 }
 
@@ -134,7 +134,9 @@ pub struct DeviceTower {
     tower: TowerKernels,
     plan: Plan,
     placed: Placed,
+    /// The factor between the angles of neighbouring pairs of the rotation.
     step: f32,
+    /// What the attention's scores are multiplied by.
     scale: f32,
 }
 

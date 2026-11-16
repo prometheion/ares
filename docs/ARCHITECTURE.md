@@ -4413,8 +4413,10 @@ model's width out, in a buffer on the device that the language model can read
 - **Groups.** A block's work before and after its attention is row by row, so
   it runs for 2048 patches at a time; what grows with the image is the
   residual, query, key and value and the attention's output (16.5 KiB a
-  patch). The scratch of an image of 4096 rows is about 330 MiB, of 1024 rows
-  about 130 MiB.
+  patch). The scratch of an image of 4096 rows is 328.6 MiB, of 1024 rows
+  131 MiB. Groups of 4096 patches were 1.6 to 3.8 % faster on both cards (68
+  MiB more scratch from 1024 rows on); the VRAM is worth more to the language
+  model.
 
 **Two homes for the weights** (`qwen3vl::Home`, a load option; llama.cpp's
 `mmproj` with and without `no-mmproj-offload`). The weights are one image of
