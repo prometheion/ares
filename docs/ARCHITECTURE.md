@@ -4256,9 +4256,12 @@ runs), so their reads can start a layer or two before their records
   another step is ignored), with both cards on every layer each expert to its owner's half
   of the store layer. `ExpertStore::ahead` takes them for a layer the step has not routed:
   what a tier holds or what is on its way is left alone; the others are read into the RAM
-  tier as guesses, the likeliest first and behind every demand read. A guess takes a slot
-  of the tier only when its read starts and never one of an expert the step needs, and
-  one that nobody used is worth nothing there, the first to give way.
+  tier as guesses, the likeliest first and behind every demand read. A read ahead takes a
+  slot only when its read starts, and only room that nobody uses (`Want::Spare`): a free
+  slot, a guess nobody used, a copy of an expert that VRAM holds. It never takes the place
+  of a member a later step may need: when it did (as any guess does, the coldest member),
+  the generating steps after a prompt read with reads ahead read 14 experts a step from the
+  file where the build of before read 6 to 8 (one card, and two cards with `--ram 4G`).
 - *Only what is picked more often than not.* When the tiers hold what a text uses, an
   expert that no tier holds is one the text has not used, and a prediction that names it is
   mostly wrong: on two cards with `--ram 8G` a read ahead of every such expert was picked 3 %
@@ -4297,7 +4300,8 @@ runs), so their reads can start a layer or two before their records
   both cards with the split pinned, `--core-share 0.76 --shared worker`, every miss
   uploaded, `--serve stream`) is the same with the predictions and the reads ahead as
   without them, with `--ram-gib 8` and with `--ram-gib 4` (2026-11-16: `ffbe225f5e70e94b`
-  for all four). With the prompt in wide steps (`--rows 512`) no comparison holds bit for
+  for all four; the runs with the predictions read 4.2 and 4.6 experts ahead per step, of
+  which 1.1 and 1.2 were picked, in the prompt's steps of eight rows and the windows). With the prompt in wide steps (`--rows 512`) no comparison holds bit for
   bit: two runs of the build of before differ themselves (the many-row kernels add a row's
   experts with `red.add`, `Accumulate::Atomic`, in the order of the schedule), and the
   picks of a run with the predictions were those of one of them.

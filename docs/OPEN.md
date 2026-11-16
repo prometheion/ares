@@ -127,7 +127,16 @@ other differed more by the load than by the drafts.
       the most used experts of the next two layers. (Wide steps read the next layer's
       predicted picks ahead now, within a step.)
 - [ ] A missed expert waits 2.3 to 3.2 ms for the file where the drive needs 1.4 ms: find
-      the rest.
+      the rest. Measured 2026-11-16 (`qwen4exp_run --decode-at`, its `drive:` line; two cards
+      `--ram-gib 8`, load 7 to 12, the drive shared with other agents' builds and models):
+      a demand read of one matrix took 2.0 to 2.1 ms at the median from its submission to the
+      reader to its completion (8.9 to 9.4 at the 99th percentile), an expert's three reads
+      2.8 to 3.6 ms on the mean, the miss from the record to its slot 2.3 to 3.2 ms, and one
+      from RAM 0.1 ms (the upload). So the rest is in the reads themselves, not in the
+      store: the three matrices of an expert are three requests (their tensors lie apart in
+      the file), several misses of a step share the drive, and so do other users of it. On
+      one card (8.6 reads a step) a matrix took 2.7 ms at the median and 28.6 ms at the 99th
+      percentile. Not resolved further on the shared drive.
 - [x] Pruning as a fourth level next to VRAM, RAM and SSD (branch `moe/pruning`):
       `--expert-prune skip|router|similar:RANK`, off by default, on the device right after
       the router's top-k; the tool `qwen4exp_prune` measures it. Skip is the rule to use
