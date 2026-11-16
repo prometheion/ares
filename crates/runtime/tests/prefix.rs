@@ -499,7 +499,7 @@ fn rejected_drafts_inside_a_tail_are_cut_and_the_next_turn_takes_exactly_what_wa
         let mut stopped = request(&first, Some(80));
         stopped.stop = vec![stop.clone()];
         let said = run_one(&e.rt, stopped);
-        assert_eq!(said.finish, ares_api::FinishReason::Stop, "{at}");
+        assert_eq!(said.finish, ares_api::FinishReason::StopString(0), "{at}");
         let produced = u64::from(said.usage.completion_tokens);
         // The tokens of the stop string were generated and are cells too, but
         // the last token of the request has none.

@@ -511,7 +511,7 @@ pub fn requests_end_for_the_right_reason(rt: &Runtime, context_length: u32) {
     let mut stopped = request("stop here", Some(60));
     stopped.stop = vec![stop.clone()];
     let run = run_one(rt, stopped);
-    assert_eq!(run.finish, FinishReason::Stop);
+    assert_eq!(run.finish, FinishReason::StopString(0), "the first of the request's stop strings");
     assert_eq!(run.text, full.text[..at], "the text ends before the stop string");
     let before = full.text[..at].chars().count() as u32;
     assert_eq!(

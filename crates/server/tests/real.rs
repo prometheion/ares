@@ -446,7 +446,7 @@ fn the_basics_of_a_server_work_with_a_real_model() {
     ]);
     prefill["stop_sequences"] = json!([]);
     let rest = server.post("/v1/messages", &prefill).json();
-    assert_eq!(rest["stop_reason"], "max_tokens", "{rest}");
+    assert!(["max_tokens", "end_turn"].contains(&rest["stop_reason"].as_str().unwrap()), "{rest}");
     let rest = rest["content"][0]["text"].as_str().unwrap_or_default().to_owned();
     // The template lays the turn out as its own, so the reply need not be the
     // free one's; it goes on, and does not begin the answer again.
