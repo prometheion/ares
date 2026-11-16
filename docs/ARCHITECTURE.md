@@ -1016,8 +1016,10 @@ and after a restart of the server. Nothing is written as it is computed.
     prompt still resumes from SSD (its checkpoint lands in that place and is
     restored from it, its pages pass through the floor), and what leaves the
     devices still reaches the drive, through the floor and at the drive's
-    pace. Without `--cache` there is no floor, and the same machine leaves the
-    cache nothing in RAM.
+    pace. Without `--cache` the floor is the one checkpoint place (for a model
+    with recurrent state; the owner's decision of 2026-11-16): the same machine
+    leaves the cache that place in RAM and no page, so a conversation still
+    resumes from its last checkpoint instead of replaying every row it found.
   - *A checkpoint leaves its place before the place is called unused*: the
     trim copies what it gives up out of the places first, and a place whose
     copy has not run keeps its memory. A device part that is asked to read a
@@ -4874,10 +4876,13 @@ RAM and on SSD; what differs is what a checkpoint and a page hold:
   are the prompt cache's, the lowest user of the engine's page-locked RAM:
   the tier of experts has the allowance first, and the cache in RAM holds what
   the tier leaves. With a full tier the cache has nothing beyond its floor:
-  with `--cache` one place and 16 pages that state passes through on its way
-  to the drive and back, which hold the last checkpoint of a conversation and
-  pages that leave the cards on their way to the drive; without `--cache`, no
-  checkpoint is taken and a hit replays every cached row.
+  one checkpoint place, booked before the tier (the server's plan counts it
+  among what the engine needs, and refuses a limit too small for it), which
+  holds the last checkpoint of a conversation, so the next turn resumes from it
+  and replays only the rows after it; with `--cache` also 16 pages that state
+  passes through on its way to the drive and back. (Before the owner's
+  decision of 2026-11-16 the floor was there only with `--cache`, and without
+  it a hit replayed every cached row.)
 - **Measured** 2026-11-16 with the server (`real_cache.rs`): Swift IQ2_XS on the
   RTX 4070 and the RTX 3060, both on every layer, `--ram 8G --context 20480
   --parallel 2 --cache <dir>`, a conversation of 660 facts and two questions
@@ -5540,10 +5545,10 @@ without a limit that was named.
 
 | User | Kind | When memory is short |
 | --- | --- | --- |
-| What the engine needs to run: step buffers, read-back buffers, the token embedding table where it lies on the host; with `--cache` also the floor of the prompt cache (one checkpoint place and 16 pages) and the buffers that checkpoints pass through on their way to the drive and back (ordinary memory) | Required | Never gives way. A limit below it is refused at load |
+| What the engine needs to run: step buffers, read-back buffers, the token embedding table where it lies on the host; the floor of the prompt cache for a model with recurrent state (one checkpoint place, and with `--cache` 16 pages); with `--cache` the buffers that checkpoints pass through on their way to the drive and back (ordinary memory) | Required | Never gives way. A limit below it is refused at load |
 | RAM tier of MoE experts | Elastic, the highest | Gets all that is not required, as far as it can use it, and is the last to shrink: it gives pieces back only when the prompt cache has nothing left in RAM |
 | Staging of the experts on their way from the file into transit | Part of the tier | The pieces that hold it are never given up |
-| Prompt cache in RAM (checkpoints of recurrent state, and the pages that left the devices) | Elastic, the lowest | Goes first: what the devices or the drive also hold goes at once; what only RAM holds is written to the drive first with `--cache` and goes when it is written, down to the floor above; without `--cache` it goes at once, down to nothing |
+| Prompt cache in RAM (checkpoints of recurrent state, and the pages that left the devices) | Elastic, the lowest | Goes first: what the devices or the drive also hold goes at once; what only RAM holds is written to the drive first with `--cache` and goes when it is written, down to the floor above; without `--cache` it goes at once, down to its one checkpoint place |
 
 Nothing is reserved for K/V pages that leave VRAM (KV offload, not built):
 that is an exceptional case, and when it happens it takes from the users
@@ -5670,12 +5675,13 @@ look by look. The users:
   locked again when a place in it is used again. In a model whose checkpoint
   is larger than a chunk (the 27B), a chunk is a place; in a small model a
   chunk goes only when all its places are free, and checkpoints are not moved
-  to make one free. With the prompt cache on SSD the allowance has a floor
-  of one place and 16 pages, and the conductor gives checkpoints up only
-  after they left their places for the drive (see "RAM" under "On SSD").
-  The cache counts the floor as one place and the pages; the books forgive
-  the chunk that place lies in on every device, since in a small model a
-  chunk holds several places and goes only as a whole;
+  to make one free. The allowance has a floor of one place (for a model with
+  recurrent state), with the prompt cache on SSD one place and 16 pages, and
+  there the conductor gives checkpoints up only after they left their places
+  for the drive (see "RAM" under "On SSD").
+  The cache counts the floor as one place and the pages; the first chunk of
+  every device part holds place 0 alone, so the floor is as large as what its
+  place locks even where a chunk holds several places (a small model);
 - the buffers that checkpoints pass through on their way to the drive and
   back (`--cache`): ordinary memory, aligned for direct I/O, allocated when
   first used and kept. They are not in the books; the server takes their

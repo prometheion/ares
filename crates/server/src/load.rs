@@ -1252,27 +1252,34 @@ fn load_qwen35(
         ));
     }
     let checkpoint = model.prefix_cache().map_or(0, |cache| cache.bytes());
-    // The prompt cache on SSD moves state through RAM on its way to the
-    // drive and back: with a directory for it, one checkpoint place and a
-    // few pages are what the engine needs, whatever else the limit leaves
-    // for the prompt cache and whatever the machine has (the cache's floor
-    // in the engine's books). And it copies checkpoints out of their places
-    // into buffers of ordinary memory, which the engine holds once they are
-    // in use: they are not page-locked, so they are not in those books, and
-    // they count against the limit here.
+    // One checkpoint place is what the prompt cache keeps whatever the
+    // machine has (the cache's floor in the engine's books): without a
+    // checkpoint a hit replays every row it found. The prompt cache on SSD
+    // moves state through RAM on its way to the drive and back: with a
+    // directory for it, a few pages join that place in the floor. And it
+    // copies checkpoints out of their places into buffers of ordinary memory,
+    // which the engine holds once they are in use: they are not page-locked,
+    // so they are not in those books, and they count against the limit here.
     let ssd = options.cache.as_ref().map(|dir| {
         SsdConfig::new(dir, options.cache_size.unwrap_or(crate::plan::DEFAULT_CACHE_SIZE))
     });
     let durable = ssd.as_ref().and_then(|_| model.durable(CELLS_PER_PAGE));
     let transit = durable.as_ref().map_or(0, SsdConfig::transit_ram);
-    let floor = durable.as_ref().map_or(0, |durable| SsdConfig::floor_ram(durable, checkpoint));
-    let through = floor > 0;
-    if through {
-        needs.push((
+    let floor =
+        durable.as_ref().map_or(checkpoint, |durable| SsdConfig::floor_ram(durable, checkpoint));
+    let through = durable.is_some() && floor > 0;
+    match (floor, through) {
+        (0, _) => {}
+        (_, true) => needs.push((
             "one checkpoint of recurrent state and the pages on their way to the prompt cache \
              on SSD or back (page-locked)",
             floor,
-        ));
+        )),
+        (_, false) => needs.push((
+            "one checkpoint of recurrent state, which the prompt cache in RAM keeps whatever \
+             the machine has (page-locked)",
+            floor,
+        )),
     }
     if transit > 0 {
         needs.push((
@@ -1328,15 +1335,19 @@ fn load_qwen35(
             0 => "none for this model".to_owned(),
             bytes => format!("room for {}", (lockable - required) / bytes),
         },
-        match through {
-            true => format!(
+        match (floor, through) {
+            (0, _) => String::new(),
+            (_, true) => format!(
                 ", down to {} that state passes through on its way to the prompt cache's store \
                  on SSD and back, a checkpoint place and pages, which are kept whatever the \
                  machine has; only what leaves RAM is written there, and what is worth keeping \
                  when the model is unloaded",
                 Bytes(floor)
             ),
-            false => String::new(),
+            (_, false) => format!(
+                ", down to {}, one checkpoint place, which is kept whatever the machine has",
+                Bytes(floor)
+            ),
         }
     );
     tracing::info!("loading the weights");

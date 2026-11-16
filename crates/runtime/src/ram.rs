@@ -80,8 +80,9 @@ struct Books {
     experts_want: u64,
     experts_floor: u64,
     /// The most the prompt cache can use: the conductor's budget. And the
-    /// part of it the cache cannot work without, when its level on SSD moves
-    /// state through RAM: one checkpoint place and a few pages.
+    /// part of it the cache keeps whatever the machine has: one checkpoint
+    /// place for a model with recurrent state, and a few pages when its level
+    /// on SSD moves state through RAM.
     cache_want: u64,
     place_floor: u64,
     pages_floor: u64,
@@ -153,26 +154,12 @@ impl Shared {
         self.books.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// What the prompt cache's floor holds locked: its pages, and the one
-    /// place or, where the places are locked in chunks, the chunk it lies in
-    /// on every device part (in a small model a chunk holds several places).
-    /// Nothing without a floor.
+    /// What the prompt cache's floor holds locked: its pages and its one
+    /// place, which lies alone in the first chunk of every device part (see
+    /// [`PlaceChunks`]). Nothing without a floor.
     fn floor_held(&self) -> u64 {
-        let (place, pages) = {
-            let books = self.books();
-            let floor = books.cache_floor();
-            (books.place_floor.min(floor), floor.saturating_sub(books.place_floor))
-        };
-        if place == 0 {
-            return pages;
-        }
-        let tables = self.chunks.lock().unwrap_or_else(|e| e.into_inner());
-        let chunks: u64 = tables
-            .iter()
-            .filter_map(Weak::upgrade)
-            .map(|table| u64::from(table.per_chunk.min(table.capacity)) * table.bytes as u64)
-            .sum();
-        place.max(chunks) + pages
+        let books = self.books();
+        books.cache_floor()
     }
 
     pub(crate) fn wants(&self) -> Wants {
@@ -425,11 +412,11 @@ impl PinnedRam {
     }
 
     /// Says what the prompt cache can use at most, the conductor's budget,
-    /// and what it cannot work without, all in bytes: one checkpoint `place`
-    /// and some `pages` for a cache whose level on SSD moves state through
-    /// them on its way to the drive and back, and nothing otherwise. The
-    /// floor is the cache's whatever the machine has, as the tier's floor is
-    /// the tier's.
+    /// and what it keeps whatever the machine has, all in bytes: one
+    /// checkpoint `place` (for a model with recurrent state) and some `pages`
+    /// for a cache whose level on SSD moves state through them on its way to
+    /// the drive and back. The floor is the cache's whatever the machine has,
+    /// as the tier's floor is the tier's.
     pub fn want_cache(&self, want: u64, place: u64, pages: u64) {
         {
             let mut books = self.books();
@@ -657,15 +644,11 @@ impl PinnedRam {
             .iter()
             .filter(|table| place < table.capacity)
             .map(|table| {
-                let index = (place / table.per_chunk) as usize;
+                let index = table.chunk_of(place);
                 let chunks = table.chunks.lock().unwrap_or_else(|e| e.into_inner());
                 match chunks.get(index) {
                     Some(Some(_)) => 0,
-                    _ => {
-                        let first = index as u32 * table.per_chunk;
-                        let places = table.per_chunk.min(table.capacity - first);
-                        u64::from(places) * table.bytes as u64
-                    }
+                    _ => u64::from(table.chunk_places(index).1) * table.bytes as u64,
                 }
             })
             .sum()
@@ -695,9 +678,9 @@ impl PinnedRam {
                 if held <= allowance {
                     break;
                 }
-                let first = index * table.per_chunk as usize;
+                let (first, places) = table.chunk_places(index);
                 let in_use =
-                    live.iter().skip(first).take(table.per_chunk as usize).any(|used| *used);
+                    live.iter().skip(first as usize).take(places as usize).any(|used| *used);
                 if in_use {
                     continue;
                 }
@@ -820,7 +803,10 @@ impl Drop for CacheBuffer {
 }
 
 /// The places of one device part's checkpoints on the host. See
-/// [`PinnedRam::place_chunks`].
+/// [`PinnedRam::place_chunks`]. The first chunk holds place 0 alone: the one
+/// place the prompt cache keeps whatever the machine has is then as large as
+/// its lock, however small a place is next to a chunk. The other chunks hold
+/// `per_chunk` places each.
 #[derive(Debug)]
 pub struct PlaceChunks {
     ram: PinnedRam,
@@ -842,6 +828,26 @@ impl PlaceChunks {
         self.capacity
     }
 
+    /// The chunk place `place` lies in.
+    fn chunk_of(&self, place: u32) -> usize {
+        match (place, self.per_chunk) {
+            (_, 1) => place as usize,
+            (0, _) => 0,
+            (place, per_chunk) => (1 + (place - 1) / per_chunk) as usize,
+        }
+    }
+
+    /// The first place of chunk `index` and how many places it holds.
+    fn chunk_places(&self, index: usize) -> (u32, u32) {
+        let first = match (index, self.per_chunk) {
+            (_, 1) => index as u32,
+            (0, _) => 0,
+            (index, per_chunk) => 1 + (index as u32 - 1) * per_chunk,
+        };
+        let places = if index == 0 { 1 } else { self.per_chunk };
+        (first, places.min(self.capacity.saturating_sub(first)))
+    }
+
     /// Where place `place` is, and whether its chunk had to be locked for
     /// this call. The memory stays where it is while the conductor has the
     /// place in use ([`PinnedRam::place_live`]).
@@ -853,22 +859,22 @@ impl PlaceChunks {
                 self.capacity
             )));
         }
-        let index = (place / self.per_chunk) as usize;
+        let index = self.chunk_of(place);
+        let (first, places) = self.chunk_places(index);
         let mut chunks = self.chunks.lock().unwrap_or_else(|e| e.into_inner());
         if chunks.len() <= index {
             chunks.resize_with(index + 1, || None);
         }
         let fresh = chunks[index].is_none();
         if fresh {
-            let first = index as u32 * self.per_chunk;
-            let places = self.per_chunk.min(self.capacity - first);
             chunks[index] =
                 Some(self.ram.lock_checkpoints(&self.device, places as usize * self.bytes)?);
         }
         let chunk = chunks[index].as_mut().expect("locked above");
-        let within = (place % self.per_chunk) as usize * self.bytes;
-        // SAFETY: the place is inside its chunk, which holds `per_chunk`
-        // places (the last one the rest).
+        let within = (place - first) as usize * self.bytes;
+        // SAFETY: the place is inside its chunk, which holds the places from
+        // `first` on (the first chunk one, the others `per_chunk`, the last
+        // the rest).
         Ok((unsafe { chunk.as_mut_ptr().add(within) }, fresh))
     }
 
@@ -880,9 +886,11 @@ impl PlaceChunks {
         if place >= self.capacity {
             return None;
         }
+        let index = self.chunk_of(place);
+        let first = self.chunk_places(index).0;
         let mut chunks = self.chunks.lock().unwrap_or_else(|e| e.into_inner());
-        let chunk = chunks.get_mut((place / self.per_chunk) as usize)?.as_mut()?;
-        let within = (place % self.per_chunk) as usize * self.bytes;
+        let chunk = chunks.get_mut(index)?.as_mut()?;
+        let within = (place - first) as usize * self.bytes;
         // SAFETY: as in `pointer`.
         Some(unsafe { chunk.as_mut_ptr().add(within) })
     }

@@ -335,13 +335,15 @@ fn a_prompt_resumes_from_ssd_while_the_machine_has_no_room_for_checkpoints() {
     e.consistent();
     drop(e);
 
-    // Without a level on SSD the same machine leaves the cache no place at
-    // all: no checkpoint is taken.
+    // Without a level on SSD the same machine leaves the cache its one
+    // checkpoint place and no pages: checkpoints are still taken, one at a
+    // time in that place.
     let e = engine(&model, config(None), &memory, None);
-    assert_eq!(e.ram.cache_allowance(), 0);
+    assert_eq!(e.ram.cache_allowance(), CHECKPOINT);
     assert_eq!(e.ask(&first, 20).text, a.text);
     let s = e.snapshot();
-    assert_eq!((s.counters.checkpoints_saved, e.peak.load(Ordering::SeqCst)), (0, 0), "{s}");
+    assert!(s.counters.checkpoints_saved > 0, "{s}");
+    assert!(e.peak.load(Ordering::SeqCst) <= CHECKPOINT, "{}", e.peak.load(Ordering::SeqCst));
     e.consistent();
 }
 

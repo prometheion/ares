@@ -318,16 +318,18 @@ impl Cache {
     /// The places and the pages in RAM lie in the page-locked memory of
     /// `books`: the cache keeps to its allowance and tells them which places
     /// are in use. Without books of the executor's, pages in RAM are booked
-    /// in books of their own, as large as the budget. With the level on SSD
-    /// in use, one place (for a model with recurrent state) and [`RESERVE`]
-    /// pages are what the cache cannot work without: state passes through
-    /// them to the drive and back.
+    /// in books of their own, as large as the budget. One place, for a model
+    /// with recurrent state, is what the cache keeps whatever the machine and
+    /// the tier of experts leave it: without a checkpoint every hit replays
+    /// all the rows it found, so a conversation resumes from its last
+    /// checkpoint at least. With the level on SSD in use, [`RESERVE`] pages
+    /// are kept as well: state passes through them to the drive and back.
     pub(crate) fn with_ram(mut self, books: Option<PinnedRam>) -> Self {
         let page = self.durable.as_ref().map_or(0, |durable| {
             durable.page_bytes.iter().map(|b| ares_store::padded(*b as usize) as u64).sum()
         });
         let through = self.ssd.is_some();
-        let place = if through && self.recurrent && self.capacity > 0 { self.bytes } else { 0 };
+        let place = if self.recurrent && self.capacity > 0 { self.bytes } else { 0 };
         let pages = if through { RESERVE * page } else { 0 };
         let want = self.policy.budget_bytes.max(place + pages);
         let books = match (books, &self.durable) {
@@ -1779,15 +1781,18 @@ mod tests {
         // The first never ran its save: it had nothing to write.
         assert_eq!(f.cache.ssd_counters().states_skipped, 1);
 
-        // Without a level on SSD nothing is kept: the same books allow no
-        // checkpoint at all.
+        // Without a level on SSD the floor is the one place, without pages:
+        // the same books still let a checkpoint be taken, and the next one
+        // takes the place over.
         let config = RuntimeConfig { cache_ram: 400, ..RuntimeConfig::default() };
         let spec = PrefixCache { checkpoint_bytes: vec![100], tails_per_slot: None };
         let mut plain =
             Cache::new("m", &spec, None, &config, PER_PAGE).with_ram(Some(f.ram.clone()));
-        assert_eq!(f.ram.cache_allowance(), 0);
+        assert_eq!(f.ram.cache_allowance(), 100, "one place");
         let hashes = three_pages(&mut plain, &mut f.pool);
-        assert!(!plain.save(0, hashes[0], Owner(1)).taken);
+        assert!(plain.save(0, hashes[0], Owner(1)).taken);
+        let second = plain.save(1, hashes[1], Owner(1));
+        assert_eq!((second.taken, second.dropped), (true, 1));
     }
 
     #[test]
@@ -1910,7 +1915,8 @@ mod tests {
             assert_eq!(f.written().pages_written, 0, "nothing while RAM holds them");
             // The machine has no room: RAM keeps its floor of pages with a
             // level on SSD, and what goes is written before its memory goes;
-            // without one it is dropped at once.
+            // without one it is dropped at once, down to what the one
+            // checkpoint place holds while no checkpoint uses it.
             f.machine_has(0);
             f.trimmed(&mut devices);
             match ssd {
@@ -1925,8 +1931,8 @@ mod tests {
                     assert_eq!(f.cache.ram_counters().pages_dropped, 0);
                 }
                 false => {
-                    assert_eq!(f.cache.ram_counters().pages, 0);
-                    assert_eq!(f.ram.cache_pages(), 0);
+                    assert!(f.ram.cache_pages() <= STATE, "{}", f.ram.cache_pages());
+                    assert_eq!(f.cache.ram_counters().pages, f.ram.cache_pages() / PAGE);
                 }
             }
         }

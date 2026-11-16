@@ -249,8 +249,17 @@ Everything `FEATURES.md` lists for the 27B and not for Flash-Next is owed:
       cell of a page waits for the next token (the block is one token behind), so a page that is
       cached at a sequence's end has it unwritten and a sequence that resumes there writes it
       into the shared page while its tile is exact; only drafts can differ. With `--ram` small
-      enough that the tier of experts takes it all, the cache in RAM has its floor alone (one
-      checkpoint place and 16 pages with `--cache`, nothing without).
+      enough that the tier of experts takes it all, the cache in RAM has its floor alone: one
+      checkpoint place, booked before the tier, also without `--cache` (the owner, 2026-11-16:
+      a conversation resumes from its last checkpoint), and with `--cache` 16 pages besides.
+      Open: the one place holds the newest checkpoint, the end of a turn; a template that writes
+      the reply into the next prompt otherwise than it was generated (the 0.8B's) parts before
+      that end, and the next turn replays every cached row. With one place the cache could keep
+      the last checkpoint at a page boundary instead of a tail (Flash-Next's template continues
+      exactly: 1416 of 1436 tokens cached, nothing replayed, at `--ram 8G` without `--cache`).
+      On the made-up Flash-Next under a limit the tier takes whole the place kept its first
+      checkpoint over three turns (1 saved, 2 restored, 242 of 498 found rows replayed): a later
+      checkpoint did not take the place over there; not looked into.
 - [ ] The draft block read from the model file (`--drafters mtp`) and a draft vocabulary.
 - Not owed (the owner, 2026-11-16): replies that are bit for bit the same from run to run.
   They differ slightly when the CPU computes missed experts, and that is accepted.

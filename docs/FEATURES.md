@@ -39,7 +39,8 @@ the kernels exist; no model runs there yet.
   sequence (recurrent state, Flash-Next's indexer keys, n-gram history and feed, draft block).
 - Prompt cache in RAM: what leaves the cards is kept in page-locked RAM inside `--ram`,
   the lowest user of it (below Flash-Next's tier of experts), and comes back from there;
-  elastic, without a flag.
+  elastic, without a flag; one checkpoint place is always kept, so a conversation resumes
+  from its last checkpoint even when the tier takes the rest.
 - Prompt cache on SSD: `--cache <DIR>`, `--cache-size` (default 32G), below RAM. Only what
   leaves RAM is written, and what is worth keeping at an unload or a stop; a conversation
   resumes after an unload and after a restart.

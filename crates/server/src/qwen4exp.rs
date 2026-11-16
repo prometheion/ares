@@ -422,10 +422,13 @@ pub(crate) fn load(
     // experts takes the rest, as far as the experts that VRAM has no slot for
     // can use it, and the prompt cache in RAM (checkpoints of the recurrent
     // state and pages that left the devices) what the tier leaves: the tier
-    // ranks first. The prompt cache on SSD adds two needs of its own, as for a
-    // dense model: a checkpoint place and a few pages that state passes
-    // through on its way to the drive and back, whatever the tier holds, and
-    // buffers of ordinary memory for checkpoints in transit.
+    // ranks first. One checkpoint place the prompt cache keeps whatever the
+    // tier holds, booked before the tier: without a checkpoint a hit replays
+    // every row it found, and a conversation resumes from its last checkpoint
+    // at least. The prompt cache on SSD adds two needs of its own, as for a
+    // dense model: a few pages that state passes through on its way to the
+    // drive and back, next to that place, and buffers of ordinary memory for
+    // checkpoints in transit.
     let required = required_ram(&*model, parallel);
     let checkpoint = model.prefix_cache().map_or(0, |cache| cache.bytes());
     let ssd = options.cache.as_ref().map(|dir| {
@@ -433,14 +436,21 @@ pub(crate) fn load(
     });
     let durable = ssd.as_ref().and_then(|_| model.durable(CELLS_PER_PAGE));
     let transit = durable.as_ref().map_or(0, SsdConfig::transit_ram);
-    let floor = durable.as_ref().map_or(0, |durable| SsdConfig::floor_ram(durable, checkpoint));
+    let floor =
+        durable.as_ref().map_or(checkpoint, |durable| SsdConfig::floor_ram(durable, checkpoint));
     let mut needs = vec![("its step buffers", required)];
-    if floor > 0 {
-        needs.push((
+    match (floor, &durable) {
+        (0, _) => {}
+        (_, Some(_)) => needs.push((
             "one checkpoint of recurrent state and the pages on their way to the prompt cache \
              on SSD or back (page-locked)",
             floor,
-        ));
+        )),
+        (_, None) => needs.push((
+            "one checkpoint of recurrent state, which the prompt cache in RAM keeps whatever \
+             the tier of experts holds (page-locked)",
+            floor,
+        )),
     }
     if transit > 0 {
         needs.push((
@@ -490,12 +500,16 @@ pub(crate) fn load(
             ),
         },
         Bytes(checkpoint),
-        match floor {
-            0 => String::new(),
-            bytes => format!(
+        match (floor, &durable) {
+            (0, _) => String::new(),
+            (bytes, Some(_)) => format!(
                 ", and {} that state passes through on its way to the prompt cache's store on SSD \
                  and back, a checkpoint place and pages, which the cache keeps whatever the tier \
                  holds",
+                Bytes(bytes)
+            ),
+            (bytes, None) => format!(
+                ", and {} for one checkpoint place, which the cache keeps whatever the tier holds",
                 Bytes(bytes)
             ),
         },

@@ -295,6 +295,10 @@ struct Setup {
     ssd: Option<SsdConfig>,
     /// Pages of the pool.
     pages: u32,
+    /// A RAM limit that leaves the tier of experts less than it wants, so
+    /// that it takes everything the prompt cache does not keep whatever the
+    /// tier holds.
+    tier_takes_all: bool,
 }
 
 impl Setup {
@@ -308,6 +312,7 @@ impl Setup {
             checkpoints: 16,
             ssd: None,
             pages: PAGES,
+            tier_takes_all: false,
         }
     }
 }
@@ -348,8 +353,14 @@ fn rig(setup: &Setup) -> Rig {
     };
     let model: Arc<dyn Model> = Arc::new(Made { inner: inner.clone(), cached: setup.cached });
     let mut gpu = GpuConfig::new(&config, &*model);
-    // Room for the tier of experts next to what the executor needs.
-    gpu.ram_limit += 256 << 20;
+    if setup.tier_takes_all {
+        // Less than the tier wants (at least 64 MiB) next to what the
+        // executor needs, and nothing named for the prompt cache.
+        gpu.ram_limit = gpu.ram_limit - config.cache_ram + (32 << 20);
+    } else {
+        // Room for the tier of experts next to what the executor needs.
+        gpu.ram_limit += 256 << 20;
+    }
     gpu.vram_headroom = 512 << 20;
     let runtime = Runtime::start_gpu(model, devices, config, gpu).expect("the runtime starts");
     warm(&inner);
@@ -553,6 +564,38 @@ fn a_conversation_continued_over_several_turns_is_answered_as_without_a_cache() 
                 said.usage
             );
         }
+    }
+}
+
+/// A RAM limit that the tier of experts takes whole, with no level on SSD:
+/// the prompt cache still keeps one checkpoint place, booked before the tier,
+/// so each turn of a conversation resumes from a checkpoint of the turn before
+/// and replays only the rows after it, where without the place every hit
+/// replayed every row it found.
+#[test]
+fn a_conversation_resumes_from_a_checkpoint_when_the_tier_takes_all_the_ram() {
+    if !enabled() {
+        return;
+    }
+    for placement in placements() {
+        let cold = conversation(&rig(&Setup::new(2, placement, false)), 3, 20);
+        let cached = rig(&Setup { tier_takes_all: true, ..Setup::new(2, placement, true) });
+        let warm = conversation(&cached, 3, 20);
+        for (turn, (cold, warm)) in cold.iter().zip(&warm).enumerate() {
+            report(&format!("tier takes all, turn {turn}"), placement, warm);
+            assert_same(&format!("turn {turn}"), cold, warm);
+        }
+        report_counters(placement, &cached);
+        let c = cached.snapshot().counters;
+        let found: u64 = warm[1..].iter().map(|a| u64::from(a.usage.cached_prompt_tokens)).sum();
+        assert!(found > 0, "{placement:?}: the later turns found the earlier ones");
+        assert!(c.checkpoints_restored >= 2, "{placement:?}: {} restored", c.checkpoints_restored);
+        // Not a full replay: without the place every row found was replayed.
+        assert!(
+            c.replay_rows < found,
+            "{placement:?}: {} rows replayed of {found} found",
+            c.replay_rows
+        );
     }
 }
 

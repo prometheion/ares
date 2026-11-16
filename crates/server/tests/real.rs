@@ -1002,8 +1002,17 @@ fn refused_ram(model: &PathBuf, port: u16, flags: &[&str], ram: &str) -> (ExitSt
     (status, said.join().unwrap())
 }
 
+/// A server whose `--ram` is exactly what the engine needs: the step buffers,
+/// the token embedding table and the one checkpoint place the prompt cache
+/// keeps whatever else the limit and the machine leave. A limit below that is
+/// refused with the shares named; at that limit checkpoints are taken in that
+/// place, and a second turn answers as a server with room does. (The place
+/// holds the newest checkpoint, the end of the first turn; this model's
+/// template writes the reply into the second prompt otherwise than it was
+/// generated, so the second turn parts from the first before that end and
+/// replays the cached rows.)
 #[test]
-fn a_server_with_no_ram_to_spare_keeps_no_checkpoints_and_answers_as_one_with() {
+fn a_server_with_no_ram_to_spare_keeps_one_checkpoint_and_answers_as_one_with() {
     let Some(model) = model() else { return };
     let flags = ["--chat-var", "enable_thinking=false"];
     let with = Server::start(&model, port(7), &flags);
@@ -1011,14 +1020,16 @@ fn a_server_with_no_ram_to_spare_keeps_no_checkpoints_and_answers_as_one_with() 
     with.stop();
 
     // To run at all the engine page-locks its step buffers and the token
-    // embedding table, which lies in host memory. A limit below that is
-    // refused, and the refusal names both shares and their sum in bytes.
+    // embedding table, which lies in host memory, and the prompt cache keeps
+    // one checkpoint place. A limit below that is refused, and the refusal
+    // names the shares and their sum in bytes.
     let (status, said) = refused_ram(&model, port(8), &flags, "4M");
     let refusal = said.lines().find(|l| l.contains("--ram 4.0 MiB is less than")).unwrap_or(&said);
     assert!(
         !status.success()
             && refusal.contains("for its step buffers")
-            && refusal.contains("for the token embedding table"),
+            && refusal.contains("for the token embedding table")
+            && refusal.contains("one checkpoint of recurrent state"),
         "{said}"
     );
     let required: u64 = refusal
@@ -1031,9 +1042,9 @@ fn a_server_with_no_ram_to_spare_keeps_no_checkpoints_and_answers_as_one_with() 
     let (status, said) = refused_ram(&model, port(8), &flags, &(required - 1).to_string());
     assert!(!status.success() && said.contains("is less than"), "{said}");
 
-    // Exactly that much is a server with no RAM to spare: nothing of the
-    // limit is left for a checkpoint (the 0.8B's is 20 MB), so a start from
-    // cached pages replays every cached row.
+    // Exactly that much is a server with no RAM to spare: the limit leaves
+    // the prompt cache its one checkpoint place (the 0.8B's is 20 MB) and
+    // nothing more.
     let required = required.to_string();
     let mut few = Vec::from(flags);
     few.extend(["--ram", &required]);
@@ -1042,20 +1053,24 @@ fn a_server_with_no_ram_to_spare_keeps_no_checkpoints_and_answers_as_one_with() 
         without.logged().iter().any(|l| l.contains("plan: RAM")
             && l.contains("as asked")
             && l.contains("for the token embedding table")
-            && l.contains("room for 0")),
+            && l.contains("room for 1")
+            && l.contains("one checkpoint place")),
         "{:#?}",
         without.logged()
     );
     let [_, without_second] = two_turns(&without);
     let cached = without_second.0["prompt_tokens_details"]["cached_tokens"].as_u64().unwrap();
     assert!(cached >= 5 * 128, "the pages are cached all the same: {}", without_second.0);
-    assert_eq!(without.metric("checkpoints_saved_total"), 0);
-    assert_eq!(without.metric("checkpoints_restored_total"), 0);
-    assert_eq!(without.metric("checkpoint_ram_bytes"), 0);
-    assert!(
-        without.metric("replayed_rows_total") >= cached - 1,
-        "all {cached} cached rows were replayed"
+    eprintln!(
+        "RES no RAM to spare: {} checkpoints saved, {} restored, {} bytes locked for them; {} of \
+         {cached} cached rows replayed",
+        without.metric("checkpoints_saved_total"),
+        without.metric("checkpoints_restored_total"),
+        without.metric("checkpoint_ram_bytes"),
+        without.metric("replayed_rows_total"),
     );
+    assert!(without.metric("checkpoints_saved_total") >= 1, "checkpoints are taken in the place");
+    assert!(without.metric("checkpoint_ram_bytes") > 0, "the place holds one");
     assert_eq!(without_second.2, with_second.2, "the second answer, with and without checkpoints");
     without.stop();
 }

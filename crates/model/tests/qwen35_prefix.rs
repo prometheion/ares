@@ -762,10 +762,11 @@ fn a_row_computed_in_a_step_of_another_size_differs_by_rounding_only() {
 }
 
 /// The checkpoints on a machine whose memory the test sets: when it runs
-/// short the conductor gives them up, also while nothing runs, the parts'
-/// chunks are unlocked and freed, and no new checkpoint is taken while there
-/// is no room; the answers stay what they are without a cache. When memory
-/// has been free for a while, checkpoints are kept again.
+/// short the conductor gives them up, also while nothing runs, down to the one
+/// place the cache keeps whatever the machine has; the parts' other chunks are
+/// unlocked and freed, and while there is no room checkpoints take that place
+/// alone; the answers stay what they are without a cache. When memory has
+/// been free for a while, checkpoints are kept again.
 #[test]
 fn the_checkpoints_give_their_memory_back_when_the_machine_runs_short() {
     use ares_runtime::{Machine, Rule};
@@ -802,6 +803,10 @@ fn the_checkpoints_give_their_memory_back_when_the_machine_runs_short() {
         machine.look().expect("the machine says what it has")
     };
     let cached = rig_following(&path, layout, true, &|_, _| {}, Some(machine.clone()));
+    // What one place locks: the chunk it lies in on every device (chunks of
+    // 32 MiB, or one place where a place is larger).
+    let place: u64 =
+        cached.parts.iter().map(|bytes| ((32 << 20) / bytes).clamp(1, 16) * bytes).sum();
     let first = cached.ask(&prompt, 40);
     cached.ask(&[user(copy(passage(2, 60)))], 40);
     assert_same("the first answer", &cold, &first);
@@ -810,11 +815,12 @@ fn the_checkpoints_give_their_memory_back_when_the_machine_runs_short() {
     let before = resident();
 
     // The machine runs short while the engine is idle: the conductor is
-    // woken, gives the checkpoints up, and their chunks are freed.
+    // woken, gives the checkpoints up but the one place, and their chunks are
+    // freed.
     available.store(0, Ordering::SeqCst);
     for _ in 0..400 {
         look();
-        if cached.snapshot().checkpoint_ram == 0 {
+        if cached.snapshot().checkpoint_ram <= place {
             break;
         }
         std::thread::sleep(Duration::from_millis(5));
@@ -826,14 +832,14 @@ fn the_checkpoints_give_their_memory_back_when_the_machine_runs_short() {
          {dropped} were given up; resident memory of the process {before} -> {after}",
         cached.snapshot().checkpoint_ram
     );
-    assert_eq!(cached.snapshot().checkpoint_ram, 0, "the chunks were given back");
+    assert!(cached.snapshot().checkpoint_ram <= place, "the chunks but the place's went back");
     assert!(dropped >= 1);
 
-    // The same prompt again is answered alike, and no checkpoint is taken
-    // while there is no room for one.
+    // The same prompt again is answered alike, and checkpoints take the one
+    // place alone while there is no room for more.
     let again = cached.ask(&prompt, 40);
     assert_same("the answer after the checkpoints went", &cold, &again);
-    assert_eq!(cached.snapshot().checkpoint_ram, 0, "none is taken while memory is short");
+    assert!(cached.snapshot().checkpoint_ram <= place, "the place alone while memory is short");
 
     // Memory is free again, and after a while checkpoints are kept again.
     available.store(64 << 30, Ordering::SeqCst);
