@@ -1201,7 +1201,7 @@ fn load_qwen35(
         cells_per_page: CELLS_PER_PAGE,
         max_slots: parallel,
         window_rows: if mtp { window } else { 1 },
-        checkpoint_budget: lockable - required,
+        cache_ram: lockable - required,
         ssd: ssd.clone(),
         ..RuntimeConfig::default()
     };

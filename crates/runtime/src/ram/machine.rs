@@ -6,8 +6,8 @@
 //! [`Machine`] does that for every engine of a process: it reads what the
 //! machine has available ([`MemorySource`]), decides by a [`Rule`] how much
 //! the elastic users of page-locked memory may hold together, and divides that
-//! among them by rank: the tiers of experts first, the checkpoints of the
-//! prompt caches with what is left.
+//! among them by rank: the tiers of experts first, the prompt caches with what
+//! is left.
 //!
 //! The rule is described with its numbers ([`Rule`]).
 //!
@@ -479,7 +479,7 @@ impl Machine {
             state.members.retain(|member| member.strong_count() > 0);
             let wants: Vec<super::Wants> = members.iter().map(|m| m.wants()).collect();
             let locked: u64 = wants.iter().map(|w| w.locked).sum();
-            let held: u64 = wants.iter().map(|w| w.experts_held + w.checkpoints_held).sum();
+            let held: u64 = wants.iter().map(|w| w.experts_held + w.cache_held).sum();
             let own = self.source.own().unwrap_or(locked);
             let verdict = state.follow.look(now, available, own);
             let headroom = state.follow.headroom();
@@ -493,22 +493,21 @@ impl Machine {
                 Verdict::Stay if claim => held + spare.saturating_sub(band / 2),
                 Verdict::Stay => state.target.min(held + spare),
             };
-            // The tiers of experts first, the checkpoints with the rest.
+            // The tiers of experts first, the prompt caches with the rest.
             let experts =
                 share(state.target, &wants.iter().map(|w| w.experts_want).collect::<Vec<_>>());
             let rest = state.target - experts.iter().sum::<u64>();
-            let checkpoints =
-                share(rest, &wants.iter().map(|w| w.checkpoints_want).collect::<Vec<_>>());
+            let caches = share(rest, &wants.iter().map(|w| w.cache_want).collect::<Vec<_>>());
             // How long a release takes is what the headroom is sized by:
             // every engine times its own, from the look that asked for it to
             // the look that finds it holding that much less.
             let mut owed = 0;
             for (i, member) in members.iter().enumerate() {
                 let over = wants[i].experts_held.saturating_sub(experts[i])
-                    + wants[i].checkpoints_held.saturating_sub(checkpoints[i]);
+                    + wants[i].cache_held.saturating_sub(caches[i]);
                 owed += over;
-                let holds = wants[i].experts_held + wants[i].checkpoints_held;
-                if let Some(took) = member.allow(experts[i], checkpoints[i], now, holds, over) {
+                let holds = wants[i].experts_held + wants[i].cache_held;
+                if let Some(took) = member.allow(experts[i], caches[i], now, holds, over) {
                     state.follow.released(took);
                 }
             }

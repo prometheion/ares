@@ -897,8 +897,7 @@ fn engine(args: &Args, spread: &Spread, window: u32) {
         cells_per_page: 128,
         max_slots: 2,
         window_rows: window.max(1),
-        checkpoint_budget: args.checkpoints.unwrap_or(0)
-            * model.prefix_cache().map_or(0, |c| c.bytes()),
+        cache_ram: args.checkpoints.unwrap_or(0) * model.prefix_cache().map_or(0, |c| c.bytes()),
         ..RuntimeConfig::default()
     };
     let gpu = GpuConfig::new(&config, &*model);
@@ -1238,7 +1237,7 @@ fn conversation(args: &Args, spread: &Spread, history: usize) {
         cells_per_page: per_page as u32,
         max_slots: 2,
         window_rows: args.window.max(1),
-        checkpoint_budget: checkpoints * model.prefix_cache().map_or(0, |c| c.bytes()),
+        cache_ram: checkpoints * model.prefix_cache().map_or(0, |c| c.bytes()),
         ..RuntimeConfig::default()
     };
     let gpu = GpuConfig::new(&config, &*model);

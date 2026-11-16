@@ -93,20 +93,51 @@ pub enum TransferKind {
     StateIn,
 }
 
+/// Host memory that one device's share of a transfer lies in, aligned for
+/// direct I/O: a buffer on its way to the drive or back, or a page of the
+/// prompt cache in RAM.
+#[derive(Debug)]
+pub enum HostBytes {
+    /// Ordinary memory, outside the engine's books of page-locked RAM.
+    Transit(ares_store::Aligned),
+    /// A share of a page that the prompt cache keeps in RAM: in the books,
+    /// and page-locked on an engine with devices.
+    Cache(crate::ram::CacheBuffer),
+}
+
+impl std::ops::Deref for HostBytes {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        match self {
+            HostBytes::Transit(buffer) => buffer,
+            HostBytes::Cache(buffer) => buffer,
+        }
+    }
+}
+
+impl std::ops::DerefMut for HostBytes {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        match self {
+            HostBytes::Transit(buffer) => buffer,
+            HostBytes::Cache(buffer) => buffer,
+        }
+    }
+}
+
 /// The share of one device in a transfer: where its bytes are on the host.
 #[derive(Debug)]
 pub struct TransitPart {
     /// Memory aligned for direct I/O, with room for the device's share in
     /// any form.
-    pub mem: ares_store::Aligned,
+    pub mem: HostBytes,
     /// The bytes of it that are in use, and the tag that says what form they
     /// have, which the device sets on the way out and reads on the way in.
     pub len: usize,
     pub tag: u32,
 }
 
-/// One movement of state between the devices and host memory, for the level
-/// of the prefix cache that is on SSD ([`Executor::transfer`]).
+/// One movement of state between the devices and host memory, for the levels
+/// of the prefix cache in RAM and on SSD ([`Executor::transfer`]).
 #[derive(Debug)]
 pub struct Transfer {
     pub kind: TransferKind,

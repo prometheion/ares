@@ -323,7 +323,7 @@ impl Server {
             window_rows: 4,
             checkpoint_prompt_interval: PAGE,
             checkpoint_generation_interval: PAGE,
-            checkpoint_budget: 16 * checkpoint,
+            cache_ram: 16 * checkpoint,
             ..RuntimeConfig::default()
         };
         let trace = Arc::new(Trace::default());

@@ -306,8 +306,9 @@ pub struct Counters {
     /// Requests that were held back, once or more, because another sequence
     /// was computing the first page of their prompt that was not cached.
     pub requests_held: u64,
-    /// What the level of the prefix cache on SSD has done since the engine
-    /// started (a reset leaves it), and what it holds.
+    /// What the levels of the prefix cache in RAM and on SSD have done since
+    /// the engine started (a reset leaves them), and what they hold.
+    pub ram: crate::RamCounters,
     pub ssd: crate::SsdCounters,
     /// How the conductor's waits for the devices ended.
     pub conductor_wakes: crate::sync::WakeCounts,
@@ -575,6 +576,23 @@ impl fmt::Display for Snapshot {
             c.checkpoints_restored,
             c.checkpoints_dropped
         )?;
+        if c.ram.enabled {
+            let r = &c.ram;
+            writeln!(
+                f,
+                "prefix cache in RAM: {} pages and {} checkpoints in {} bytes; {} pages came \
+                 from the devices, {} went back, {} were dropped unwritten; {} transfers took \
+                 {:.1} ms",
+                r.pages,
+                r.checkpoints,
+                r.bytes,
+                r.pages_in,
+                r.pages_read,
+                r.pages_dropped,
+                r.transfers,
+                r.transfer_ns as f64 / 1e6
+            )?;
+        }
         if let Some(why) = &self.ssd_problem {
             writeln!(f, "prefix cache on SSD: not in use ({why})")?;
         }

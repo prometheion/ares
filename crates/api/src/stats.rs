@@ -63,6 +63,26 @@ pub struct SsdStats {
     pub checkpoints_skipped: u64,
 }
 
+/// What the level of the prompt cache in RAM has done since the engine
+/// started, and what it holds; all zero for an engine without one.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RamCacheStats {
+    /// Pages it holds now, and the bytes of their page-locked buffers (those
+    /// that hold nothing at the moment included).
+    pub pages: u64,
+    pub bytes: u64,
+    /// Pages that left the devices and were copied into it.
+    pub pages_in: u64,
+    /// Pages a prompt took back to the devices from it.
+    pub pages_read: u64,
+    /// Pages given up without being written although they were worth
+    /// keeping: no room in RAM, or no level on SSD below it.
+    pub pages_dropped: u64,
+    /// Nanoseconds the engine's step loop waited while pages moved between
+    /// the devices and RAM.
+    pub transfer_ns: u64,
+}
+
 /// Totals of an engine since it started, and what it holds right now.
 ///
 /// The counts only grow, so the difference of two copies says what happened
@@ -108,10 +128,14 @@ pub struct EngineStats {
     pub pages: u32,
     /// Pages and tails the prefix cache holds.
     pub cached_pages: u32,
-    /// Bytes of page-locked RAM held for checkpoints of recurrent state.
+    /// Bytes of page-locked RAM held for checkpoints of recurrent state (the
+    /// pages of the prompt cache in RAM are in `ram`).
     pub checkpoint_ram: u64,
     /// How the experts were found, for a model that streams them.
     pub experts: ExpertStats,
+    /// What the prompt cache did in RAM.
+    #[serde(default)]
+    pub ram: RamCacheStats,
     /// What the prompt cache did on SSD.
     #[serde(default)]
     pub ssd: SsdStats,

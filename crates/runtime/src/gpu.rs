@@ -92,18 +92,18 @@ pub fn required_ram(model: &dyn Model, max_slots: u32) -> u64 {
 impl GpuConfig {
     /// The defaults for a runtime of `config` over `model`: page tables for
     /// every slot, long enough for the model's whole context, and a RAM limit
-    /// that holds what the executor needs and every checkpoint the budget of
-    /// `config` allows.
+    /// that holds what the executor needs and the prefix cache's RAM of
+    /// `config` (for a model with a prefix cache).
     pub fn new(config: &RuntimeConfig, model: &dyn Model) -> Self {
         let cache = model.prefix_cache();
         let checkpoints = cache.as_ref().map_or(0, |spec| Cache::places(spec, config));
-        let checkpoint_ram = cache.as_ref().map_or(0, |spec| spec.bytes()) * u64::from(checkpoints);
+        let cache_ram = if cache.is_some() { config.cache_ram } else { 0 };
         Self {
             max_slots: config.max_slots,
             table_stride: model.card().context_length.div_ceil(config.cells_per_page),
             spin: Duration::from_millis(2),
             vram_headroom: 256 * MIB,
-            ram_limit: required_ram(model, config.max_slots) + checkpoint_ram,
+            ram_limit: required_ram(model, config.max_slots) + cache_ram,
             checkpoints,
             pages: config.pages,
             page_bytes: {
@@ -275,6 +275,9 @@ impl GpuExecutor {
             None => PinnedRam::new(config.ram_limit),
         };
         ram.require(required_ram(&*model, config.max_slots))?;
+        // The pages of the prompt cache in RAM are locked for the device that
+        // copies each share of them.
+        ram.lock_for(devices.clone());
 
         let streams = devices
             .iter()
@@ -1103,7 +1106,7 @@ mod tests {
 
     #[test]
     fn the_devices_get_as_many_places_as_the_conductor_counts_and_room_in_the_ram_limit() {
-        let config = RuntimeConfig { checkpoint_budget: 10_250, ..RuntimeConfig::default() };
+        let config = RuntimeConfig { cache_ram: 10_250, ..RuntimeConfig::default() };
         let cached = model(Some(1000));
         let gpu = GpuConfig::new(&config, &cached);
         // Ten whole checkpoints fit the budget; the conductor counts the same.
@@ -1111,11 +1114,11 @@ mod tests {
         assert_eq!(gpu.checkpoints, Cache::places(&cached.prefix_cache().unwrap(), &config));
         let needed = required_ram(&cached, config.max_slots);
         assert!(needed > 0);
-        assert_eq!(gpu.ram_limit, needed + 10_000, "what the executor needs and the places");
+        assert_eq!(gpu.ram_limit, needed + 10_250, "what the executor needs and the cache's");
 
         // A model without a cache, or a budget of none, has no places.
         assert_eq!(GpuConfig::new(&config, &model(None)).checkpoints, 0);
-        let none = RuntimeConfig { checkpoint_budget: 0, ..config };
+        let none = RuntimeConfig { cache_ram: 0, ..config };
         let gpu = GpuConfig::new(&none, &cached);
         assert_eq!((gpu.checkpoints, gpu.ram_limit), (0, needed));
     }

@@ -76,7 +76,7 @@ fn config(ssd: Option<SsdConfig>) -> RuntimeConfig {
         max_slots: 8,
         window_rows: 1,
         warm_up: false,
-        checkpoint_budget: 8 * CHECKPOINT,
+        cache_ram: 8 * CHECKPOINT,
         checkpoint_prompt_interval: 2 * PAGE,
         checkpoint_generation_interval: 2 * PAGE,
         ssd,
@@ -199,7 +199,7 @@ fn fresh(prompt: &str, max_tokens: u32) -> String {
     let rt = Runtime::start(
         model.clone(),
         Box::new(HostExecutor::new(model.clone(), model.config().max_rows, 8)),
-        RuntimeConfig { pages: 4096, checkpoint_budget: 0, ..self::config(None) },
+        RuntimeConfig { pages: 4096, cache_ram: 0, ..self::config(None) },
     )
     .unwrap();
     alone(&rt, prompt, Some(max_tokens)).text
@@ -245,11 +245,11 @@ fn a_checkpoint_leaves_for_the_drive_before_the_machine_gets_its_place_back() {
             }
         })),
     );
-    assert_eq!(e.ram.checkpoints_allowance(), 8 * CHECKPOINT);
+    assert_eq!(e.ram.cache_allowance(), 8 * CHECKPOINT);
     let b = e.ask(&first, 20);
     assert_eq!(b.text, a.text);
     assert_eq!(b.text, fresh(&first, 20));
-    assert_eq!(e.ram.checkpoints_allowance(), CHECKPOINT, "the floor: one place");
+    assert_eq!(e.ram.cache_allowance(), CHECKPOINT, "the floor: one place");
     let s = e.written(13);
     // The checkpoints that were in RAM went, the coldest first, and their
     // places with them; every checkpoint that was due on the drive got
@@ -287,7 +287,7 @@ fn a_prompt_resumes_from_ssd_while_the_machine_has_no_room_for_checkpoints() {
     // Another engine on a machine that has nothing to spare from the start.
     let memory = Memory::new(0);
     let e = engine(&model, config(Some(store(&dir.0))), &memory, None);
-    assert_eq!(e.ram.checkpoints_allowance(), CHECKPOINT, "nothing but the floor");
+    assert_eq!(e.ram.cache_allowance(), CHECKPOINT, "nothing but the floor");
     let second = format!("{first}{}{}", a.text, text_of(12, 40));
     let b = e.ask(&second, 20);
     assert_eq!(b.text, fresh(&second, 20));
@@ -322,7 +322,7 @@ fn a_prompt_resumes_from_ssd_while_the_machine_has_no_room_for_checkpoints() {
     // Without a level on SSD the same machine leaves the cache no place at
     // all: no checkpoint is taken.
     let e = engine(&model, config(None), &memory, None);
-    assert_eq!(e.ram.checkpoints_allowance(), 0);
+    assert_eq!(e.ram.cache_allowance(), 0);
     assert_eq!(e.ask(&first, 20).text, a.text);
     let s = e.snapshot();
     assert_eq!((s.counters.checkpoints_saved, e.peak.load(Ordering::SeqCst)), (0, 0), "{s}");
@@ -349,7 +349,7 @@ fn memory_that_comes_back_is_taken_again_and_the_level_on_ssd_never_notices() {
         assert!(std::time::Instant::now() < deadline, "nothing was given up");
         std::thread::sleep(Duration::from_millis(1));
     }
-    assert_eq!(e.ram.checkpoints_allowance(), CHECKPOINT);
+    assert_eq!(e.ram.cache_allowance(), CHECKPOINT);
 
     // The second turn finds its pages in the devices and its checkpoints
     // gone from RAM but for one; it says the same as an engine that kept
@@ -360,7 +360,7 @@ fn memory_that_comes_back_is_taken_again_and_the_level_on_ssd_never_notices() {
     for _ in 0..100 {
         memory.has(PLENTY);
     }
-    assert_eq!(e.ram.checkpoints_allowance(), 8 * CHECKPOINT, "all of the budget again");
+    assert_eq!(e.ram.cache_allowance(), 8 * CHECKPOINT, "all of the budget again");
     let third = format!("{second}{}{}", b.text, text_of(23, 40));
     let c = e.ask(&third, 20);
     assert_eq!(c.text, fresh(&third, 20));

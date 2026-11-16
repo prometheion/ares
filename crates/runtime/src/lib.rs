@@ -72,13 +72,14 @@ pub mod testing;
 mod text;
 mod timing;
 
-pub use cache::{SsdConfig, SsdCounters};
+pub use cache::{RamCounters, SsdConfig, SsdCounters};
 pub use conductor::{SequenceInfo, token_hash};
 pub use config::RuntimeConfig;
 pub use engine::Runtime;
 pub use error::RuntimeError;
 pub use exec::{
-    Clock, ExecError, Executor, Pick, StepMeta, StepOutput, Transfer, TransferKind, TransitPart,
+    Clock, ExecError, Executor, HostBytes, Pick, StepMeta, StepOutput, Transfer, TransferKind,
+    TransitPart,
 };
 pub use gpu::{GpuConfig, GpuExecutor, required_ram};
 pub use links::{Links, MAX_DEVICES};
@@ -87,8 +88,8 @@ pub use model::{
     ModelError, OwnDrafts, PrefixCache, Split, StepContext, TransferContext,
 };
 pub use ram::{
-    Follow, LockedChunk, Look, Machine, Meminfo, MemorySource, PinnedRam, PlaceChunks, Rule,
-    Verdict, high_watermarks,
+    CacheBuffer, Follow, LockedChunk, Look, Machine, Meminfo, MemorySource, PinnedRam, PlaceChunks,
+    Rule, Verdict, high_watermarks,
 };
 pub use record::{
     Commit, FREED_PER_RECORD, PageCopy, RecordFull, RecordView, RecordWriter, Row, StateCopy,

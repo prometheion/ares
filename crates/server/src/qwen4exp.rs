@@ -375,7 +375,7 @@ pub(crate) fn load(
         cells_per_page: CELLS_PER_PAGE,
         max_slots: parallel,
         window_rows: if drafting { window } else { 1 },
-        checkpoint_budget: 0,
+        cache_ram: 0,
         ..RuntimeConfig::default()
     };
     let gpu = GpuConfig {

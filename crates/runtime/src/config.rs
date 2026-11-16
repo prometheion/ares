@@ -25,15 +25,19 @@ pub struct RuntimeConfig {
     /// before any request has finished. The accounting corrects it from
     /// what finished requests really used.
     pub output_ratio: f64,
-    /// The most bytes all checkpoints of recurrent state may take together, on
-    /// all devices. A checkpoint is where a prompt that starts from the prefix
+    /// The most bytes the prefix cache keeps in RAM: the checkpoints of
+    /// recurrent state, on all devices together, and the pages that left the
+    /// devices. A checkpoint is where a prompt that starts from the prefix
     /// cache restores the state of the model's recurrent layers; without one
-    /// it replays every cached row. 0 keeps none. Only a model whose
-    /// [`crate::Model::prefix_cache`] says it has recurrent state uses it. On
-    /// devices the places this holds are locked in RAM as they are used, within
-    /// [`crate::GpuConfig::ram_limit`], which [`crate::GpuConfig::new`] sets to
-    /// what the executor needs and this budget together.
-    pub checkpoint_budget: u64,
+    /// it replays every cached row. Only a model whose
+    /// [`crate::Model::prefix_cache`] says it has recurrent state takes
+    /// checkpoints, and only a model that is [`crate::Model::durable`] keeps
+    /// pages here. 0 keeps none. On devices this memory is locked as it is
+    /// used, within [`crate::GpuConfig::ram_limit`], which
+    /// [`crate::GpuConfig::new`] sets to what the executor needs and this
+    /// together; the checkpoints and the pages share it, and it follows the
+    /// machine (see "Host memory" in `docs/ARCHITECTURE.md`).
+    pub cache_ram: u64,
     /// The least distance in cells between checkpoints inside a prompt, and
     /// while generating (`ares_state::CheckpointPolicy`).
     pub checkpoint_prompt_interval: u32,
@@ -94,7 +98,7 @@ impl Default for RuntimeConfig {
             max_slots: 256,
             output_clip: 4096,
             output_ratio: 0.7,
-            checkpoint_budget: 0,
+            cache_ram: 0,
             checkpoint_prompt_interval: 32_768,
             checkpoint_generation_interval: 2048,
             ssd: None,

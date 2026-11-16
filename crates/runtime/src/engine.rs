@@ -107,11 +107,12 @@ impl Runtime {
         let (ready_tx, ready_rx) = mpsc::channel();
         let limit = card.context_length.min(config.pages.saturating_mul(config.cells_per_page));
         let warm_up = config.warm_up;
-        // When the checkpoints must give page-locked memory back, the
-        // conductor is woken to give the coldest up, also while nothing runs.
+        // When the prompt cache must give page-locked memory back, the
+        // conductor is woken to give the coldest checkpoints and pages up,
+        // also while nothing runs.
         if let Some(ram) = executor.ram() {
             let wake = Mutex::new(tx.clone());
-            ram.on_checkpoints(move |_, _| {
+            ram.on_cache(move |_, _| {
                 let _ = wake.lock().unwrap_or_else(|e| e.into_inner()).send(Command::Trim);
             });
         }
@@ -370,6 +371,14 @@ impl Engine for Runtime {
             cached_pages: snapshot.cached_pages,
             checkpoint_ram: snapshot.checkpoint_ram,
             experts: self.model.expert_stats().unwrap_or_default(),
+            ram: ares_api::RamCacheStats {
+                pages: c.ram.pages,
+                bytes: c.ram.bytes,
+                pages_in: c.ram.pages_in,
+                pages_read: c.ram.pages_read,
+                pages_dropped: c.ram.pages_dropped,
+                transfer_ns: c.ram.transfer_ns,
+            },
             ssd: ares_api::SsdStats {
                 pages_written: c.ssd.pages_written,
                 checkpoints_written: c.ssd.states_written,

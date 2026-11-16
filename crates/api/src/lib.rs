@@ -52,5 +52,5 @@ pub use sampling::{
     SamplingError, TOP_LOGPROBS_MAX,
 };
 pub use sink::{DecisionSink, EventSink};
-pub use stats::{EngineStats, ExpertStats, SsdStats};
+pub use stats::{EngineStats, ExpertStats, RamCacheStats, SsdStats};
 pub use structure::{Interrupt, Shape, Start, Structure};

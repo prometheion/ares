@@ -242,8 +242,8 @@ impl PrefixMatch {
     }
 }
 
-/// What the index gave up.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// What the index gave up, with its name, so that a slower level can keep it.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Evicted {
     /// The page, which is free again unless a sequence still holds it.
     pub page: PageId,
@@ -251,6 +251,28 @@ pub struct Evicted {
     pub checkpoint: Option<CheckpointId>,
     /// The class the page had.
     pub class: Priority,
+    /// The name of what went: a page's hash, or a tail's.
+    pub hash: ChainHash,
+    /// What it follows: the hash of the page before it (or the root). For a
+    /// tail, the page it hangs under.
+    pub parent: ChainHash,
+    /// A page's number in its chain (1 for a first page). For a tail, the
+    /// number of the page it hangs under (0 under the root).
+    pub depth: u32,
+    /// A tail's tokens; `None` for a full page.
+    pub tail: Option<Vec<u32>>,
+}
+
+/// A cached page as [`PrefixIndex::cached_pages`] lists it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CachedPage {
+    pub hash: ChainHash,
+    pub page: PageId,
+    /// The hash of the page before it, or the root.
+    pub parent: ChainHash,
+    /// Its number in its chain (1 for a first page).
+    pub depth: u32,
+    pub checkpoint: Option<CheckpointId>,
 }
 
 /// The names of a sequence's full pages, kept next to the sequence so that
@@ -368,6 +390,31 @@ impl PrefixIndex {
     /// The number of pages the index holds: cached pages and tails.
     pub fn len(&self) -> usize {
         self.entries.len() + self.tail_prior.len()
+    }
+
+    /// Every cached page (the tails not), the least recently used first.
+    pub fn cached_pages(&self) -> Vec<CachedPage> {
+        let mut pages: Vec<(u64, CachedPage)> = self
+            .entries
+            .iter()
+            .map(|(hash, entry)| {
+                let page = CachedPage {
+                    hash: *hash,
+                    page: entry.page,
+                    parent: entry.parent,
+                    depth: entry.depth,
+                    checkpoint: entry.checkpoint,
+                };
+                (entry.last_used, page)
+            })
+            .collect();
+        pages.sort_unstable_by_key(|(used, page)| (*used, page.hash));
+        pages.into_iter().map(|(_, page)| page).collect()
+    }
+
+    /// Whether the index holds a page or a tail of this name.
+    pub fn holds(&self, hash: ChainHash) -> bool {
+        self.entries.contains_key(&hash) || self.tail_prior.contains_key(&hash)
     }
 
     /// Whether the index holds no page at all.
@@ -755,7 +802,15 @@ impl PrefixIndex {
         pool.release(tail.page);
         self.detach(prior);
         self.checkpoints -= usize::from(tail.checkpoint.is_some());
-        Evicted { page: tail.page, checkpoint: tail.checkpoint, class: tail.class }
+        Evicted {
+            page: tail.page,
+            checkpoint: tail.checkpoint,
+            class: tail.class,
+            hash,
+            parent: prior,
+            depth: self.entries.get(&prior).map_or(0, |entry| entry.depth),
+            tail: Some(tail.tokens),
+        }
     }
 
     /// Sets the class of the cached page or tail named `hash`. Returns
@@ -853,7 +908,15 @@ impl PrefixIndex {
         }
         self.detach(entry.parent);
         self.checkpoints -= usize::from(entry.checkpoint.is_some());
-        Some(Evicted { page: entry.page, checkpoint: entry.checkpoint, class: entry.class })
+        Some(Evicted {
+            page: entry.page,
+            checkpoint: entry.checkpoint,
+            class: entry.class,
+            hash,
+            parent: entry.parent,
+            depth: entry.depth,
+            tail: None,
+        })
     }
 
     fn tail_page(&self, hash: ChainHash) -> Option<PageId> {
@@ -1319,7 +1382,11 @@ mod tests {
             Some(Evicted {
                 page: pages[0],
                 checkpoint: Some(CheckpointId(3)),
-                class: Priority::NORMAL
+                class: Priority::NORMAL,
+                hash: first,
+                parent: root,
+                depth: 0,
+                tail: Some(vec![1, 100]),
             })
         );
         seq.release(&mut pool);

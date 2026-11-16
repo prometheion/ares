@@ -72,7 +72,7 @@ fn config(pages: u32, places: u64, ssd: Option<SsdConfig>) -> RuntimeConfig {
         max_slots: 8,
         window_rows: 1,
         warm_up: false,
-        checkpoint_budget: places * CHECKPOINT,
+        cache_ram: places * CHECKPOINT,
         checkpoint_prompt_interval: 2 * PAGE,
         checkpoint_generation_interval: 2 * PAGE,
         ssd,

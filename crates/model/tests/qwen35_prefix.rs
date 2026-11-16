@@ -274,7 +274,7 @@ fn rig_following(
         // page, so that a short test crosses several of them.
         checkpoint_prompt_interval: PAGE,
         checkpoint_generation_interval: PAGE,
-        checkpoint_budget: 16 * checkpoint,
+        cache_ram: 16 * checkpoint,
         ..RuntimeConfig::default()
     };
     tweak(&mut config, checkpoint);
@@ -610,13 +610,13 @@ fn requests_that_give_way_under_a_small_page_pool_come_back_from_the_cache() {
 }
 
 #[test]
-fn a_small_checkpoint_budget_gives_up_checkpoints_and_the_answers_stay_the_same() {
+fn a_small_cache_ram_gives_up_checkpoints_and_the_answers_stay_the_same() {
     let Some(path) = model_path() else { return };
     for layout in layouts() {
         let cold = rig(&path, layout, false, &|_, _| {});
         // Room for two checkpoints, while a turn leaves several.
         let small = |config: &mut RuntimeConfig, checkpoint: u64| {
-            config.checkpoint_budget = 2 * checkpoint;
+            config.cache_ram = 2 * checkpoint;
         };
         let cached = rig(&path, layout, true, &small);
         let mut history = vec![user(copy(passage(7, 30)))];

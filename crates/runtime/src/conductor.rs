@@ -76,7 +76,7 @@
 //! - **Evict.** When a step's claims need room, cached pages nobody holds go
 //!   from the ends of chains, after the requests that start took the pages they
 //!   share. Checkpoints go when their budget is full
-//!   ([`RuntimeConfig::checkpoint_budget`]) or with the page they hang on.
+//!   ([`RuntimeConfig::cache_ram`]) or with the page they hang on.
 
 use std::collections::HashMap;
 use std::ops::Range;
@@ -793,19 +793,21 @@ impl Conductor {
     /// The loop. Returns after a shutdown, when every request has ended.
     pub(crate) fn run(mut self) {
         loop {
-            // Between steps, in this order. First the level of the cache on
-            // SSD moves what is due: a checkpoint whose save has run leaves
-            // its place for the drive, and one that comes back takes a place.
-            // Then the checkpoints that the page-locked memory has no room
-            // for any more go, the coldest first, and only now are their
-            // places called unused, so that no transfer reads or writes
-            // memory that is given back. Every transfer of the pump has
-            // returned by then, and no step runs.
+            // Between steps, in this order. First the levels of the cache
+            // below the devices move what is due: what left the devices goes
+            // into RAM, what leaves RAM goes to the drive (a checkpoint out of
+            // its place first), and what comes back from the drive takes
+            // pages of the pool and a place. Then what the page-locked memory
+            // has no room for any more goes, and only now are the places of
+            // checkpoints that went called unused, so that no transfer reads
+            // or writes memory that is given back. Every transfer of the pump
+            // has returned by then, and no step runs.
             let moving = match &mut self.cache {
                 Some(cache) => {
                     cache.pump(&mut self.pool, &mut *self.exec);
-                    self.stats.counters.checkpoints_dropped += u64::from(cache.trim());
-                    cache.ssd_busy()
+                    let dropped = cache.trim(&mut self.pool, &mut *self.exec);
+                    self.stats.counters.checkpoints_dropped += u64::from(dropped);
+                    cache.busy()
                 }
                 None => false,
             };
@@ -851,7 +853,8 @@ impl Conductor {
             self.handle(command);
         }
         self.finish_everything(FinishReason::Cancelled);
-        // What waits to be written to SSD is written before the devices go.
+        // What is worth keeping on SSD is written before the devices go: what
+        // only RAM holds, and the pages and checkpoints of the devices.
         if let (Some(cache), None) = (&mut self.cache, &self.failed) {
             cache.drain(&mut self.pool, &mut *self.exec);
         }
@@ -874,6 +877,7 @@ impl Conductor {
                 self.stats.counters.device_wakes = self.exec.device_wakes();
                 if let Some(cache) = &mut self.cache {
                     self.stats.counters.ssd = cache.ssd_counters();
+                    self.stats.counters.ram = cache.ram_counters();
                 }
                 let copy = StatsCopy {
                     stats: self.stats.clone(),
@@ -962,7 +966,9 @@ impl Conductor {
         let (chain, cached, idle, waits_for) = match &mut self.cache {
             Some(cache) => {
                 let chain = cache.chain(&prompt);
-                let probe = cache.probe(&self.pool, &chain, &prompt);
+                // What RAM has of it comes back now, before the step is
+                // planned, so that the accounting sees the pages it took.
+                let probe = cache.probe(&mut self.pool, Some(&mut *self.exec), &chain, &prompt);
                 let waits = probe.found.computing.map(|(hash, _)| hash);
                 (chain, probe.resume.cached_cells as u32, probe.idle, waits)
             }
@@ -1046,7 +1052,7 @@ impl Conductor {
         let probe = match &mut self.cache {
             Some(cache) => {
                 let a = &self.waiting[i];
-                Some(cache.probe(&self.pool, &a.chain, &a.tokens[..a.known as usize]))
+                Some(cache.probe(&mut self.pool, None, &a.chain, &a.tokens[..a.known as usize]))
             }
             None => None,
         };
@@ -1190,7 +1196,8 @@ impl Conductor {
         let (rows, idle) = match &mut self.cache {
             Some(cache) => {
                 a.looked_at = cache.evictions;
-                let probe = cache.probe(&self.pool, &a.chain, &a.tokens[..a.known as usize]);
+                let tokens = &a.tokens[..a.known as usize];
+                let probe = cache.probe(&mut self.pool, None, &a.chain, tokens);
                 (
                     probe.resume.compute.end.saturating_sub(probe.resume.compute.start) as u32,
                     probe.idle,
@@ -1348,7 +1355,9 @@ impl Conductor {
                 continue;
             }
             a.looked_at = cache.evictions;
-            let probe = cache.probe(&self.pool, &a.chain, &a.tokens[..a.known as usize]);
+            // Before the step is planned: what RAM has comes back now.
+            let tokens = &a.tokens[..a.known as usize];
+            let probe = cache.probe(&mut self.pool, Some(&mut *self.exec), &a.chain, tokens);
             if a.ran {
                 // It gave way and comes back: the rows the cache does not hold.
                 let rows = probe.resume.compute.end.saturating_sub(probe.resume.compute.start);
@@ -1727,6 +1736,11 @@ impl Conductor {
             return;
         }
 
+        // What left the devices while the step was planned is copied into
+        // RAM before the step writes its pages again.
+        if let Some(cache) = &mut self.cache {
+            cache.settle_leaving(&mut self.pool, &mut *self.exec);
+        }
         let used = match self.write_record() {
             Ok(used) => used,
             Err(message) => return self.fail(message),

@@ -13,14 +13,16 @@
 //!   what keeps a mixture-of-experts model from reading its experts from
 //!   disk, and it gives way to nothing but what is required). It is locked in
 //!   pieces ([`PinnedRam::expert_pieces`]), as many as its allowance holds;
-//! - the checkpoints of recurrent state that the prefix cache keeps (elastic,
-//!   the lowest rank: a cache gives way to whatever needs the memory). A
-//!   device part locks them in chunks, when a place is first used, so the
-//!   memory the cache holds is the memory it has used and not the whole
-//!   budget ([`PlaceChunks`]). A cache whose level on SSD moves checkpoints
-//!   through a place keeps that one place whatever the machine has: it is
-//!   the cache's floor ([`PinnedRam::want_checkpoints`]), and neither the
-//!   tier of experts nor the machine is given it.
+//! - the prompt cache in RAM (elastic, the lowest rank: a cache gives way to
+//!   whatever needs the memory): the checkpoints of recurrent state, which a
+//!   device part locks in chunks when a place is first used, so the memory
+//!   the cache holds is the memory it has used and not the whole budget
+//!   ([`PlaceChunks`]), and the pages that left the devices, a buffer per
+//!   device share of a page ([`PinnedRam::cache_buffer`]). A cache with a
+//!   level on SSD keeps one place and a few pages whatever the machine has:
+//!   state passes through them on its way to the drive and back. That is the
+//!   cache's floor ([`PinnedRam::want_cache`]), and neither the tier of
+//!   experts nor the machine is given it.
 //!
 //! # The limit and the allowances
 //!
@@ -28,13 +30,13 @@
 //! refused. Below it the elastic users keep to an **allowance**, which says
 //! how much each may hold now. With a fixed limit ([`PinnedRam::new`]) the
 //! allowances are what the limit leaves: all of it to the tier of experts as
-//! far as the tier can use it, the rest to the checkpoints. An engine that
+//! far as the tier can use it, the rest to the prompt cache. An engine that
 //! follows the machine ([`PinnedRam::following`]) has its allowances set by
 //! the [`Machine`], look by look, from the memory the machine really has; the
-//! tier and the checkpoints then give memory back to the system when their
+//! tier and the prompt cache then give memory back to the system when their
 //! allowance falls and take it again when it rises (the tier through the hook
-//! of [`PinnedRam::on_experts`], the checkpoints through
-//! [`PinnedRam::on_checkpoints`] and [`PinnedRam::sweep_checkpoints`]).
+//! of [`PinnedRam::on_experts`], the prompt cache through
+//! [`PinnedRam::on_cache`] and [`PinnedRam::sweep_checkpoints`]).
 //!
 //! The books are shared by the executor and the device threads, so they sit
 //! behind a lock; a grant is recorded in the same call that makes it, and a
@@ -47,6 +49,7 @@ use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 use ares_core::{Broker, Class, Consumer, Growth};
 use ares_cuda::{Device, HostRegistration, PinnedBuffer};
+use ares_store::Aligned;
 
 pub use machine::{Follow, Look, Machine, Meminfo, MemorySource, Rule, Verdict, high_watermarks};
 
@@ -54,9 +57,9 @@ use crate::error::RuntimeError;
 use crate::expert_store::{Locker, StoreError};
 use crate::model::ModelError;
 
-/// Checkpoints are a cache of the lowest kind: a prompt that finds none
-/// replays more rows, and nothing else suffers.
-const CHECKPOINT_PRIORITY: u32 = 1;
+/// The prompt cache is a cache of the lowest kind: a prompt that finds less
+/// of itself there computes more rows, and nothing else suffers.
+const CACHE_PRIORITY: u32 = 1;
 
 /// The tier of experts ranks above every cache: a step that misses an expert
 /// waits for the drive, which is the one thing that makes such a model slow.
@@ -66,23 +69,26 @@ struct Books {
     broker: Broker,
     /// The step record and the read-back buffers.
     required: Consumer,
-    /// The checkpoints of recurrent state.
-    checkpoints: Consumer,
+    /// The prompt cache in RAM: checkpoints of recurrent state and pages.
+    cache: Consumer,
+    /// The bytes of `cache` that are pages; the rest are checkpoints.
+    pages: u64,
     /// The tier of experts.
     experts: Consumer,
     /// The most the tier of experts can use, and the part of it the tier
     /// cannot work without (its staging slots and a few slots per layer).
     experts_want: u64,
     experts_floor: u64,
-    /// The most the checkpoints can use: the conductor's budget. And the
-    /// part of it the cache cannot work without: one place, when its level
-    /// on SSD moves checkpoints through it.
-    checkpoints_want: u64,
-    checkpoints_floor: u64,
-    /// What the machine lets the tier and the checkpoints hold above their
+    /// The most the prompt cache can use: the conductor's budget. And the
+    /// part of it the cache cannot work without, when its level on SSD moves
+    /// state through RAM: one checkpoint place and a few pages.
+    cache_want: u64,
+    place_floor: u64,
+    pages_floor: u64,
+    /// What the machine lets the tier and the prompt cache hold above their
     /// floors; not used with a fixed limit.
     experts_allow: u64,
-    checkpoints_allow: u64,
+    cache_allow: u64,
     /// A release that is being timed: when the machine asked for it, and
     /// what the elastic users hold once it is done.
     asked: Option<(std::time::Duration, u64)>,
@@ -97,6 +103,11 @@ impl Books {
     fn elastic_room(&self) -> u64 {
         self.broker.capacity().saturating_sub(self.usage(&self.required))
     }
+
+    /// The prompt cache's floor, never more than it can use.
+    fn cache_floor(&self) -> u64 {
+        (self.place_floor + self.pages_floor).min(self.cache_want)
+    }
 }
 
 type Hook = Arc<dyn Fn(&PinnedRam, u64) + Send + Sync>;
@@ -104,7 +115,7 @@ type Hook = Arc<dyn Fn(&PinnedRam, u64) + Send + Sync>;
 #[derive(Default)]
 struct Hooks {
     experts: Option<Hook>,
-    checkpoints: Option<Hook>,
+    cache: Option<Hook>,
 }
 
 /// What an engine's elastic users hold and can use, for the machine.
@@ -114,9 +125,9 @@ pub(crate) struct Wants {
     /// The tier of experts, above its floor.
     pub experts_held: u64,
     pub experts_want: u64,
-    /// The checkpoints, above their floor.
-    pub checkpoints_held: u64,
-    pub checkpoints_want: u64,
+    /// The prompt cache, above its floor.
+    pub cache_held: u64,
+    pub cache_want: u64,
 }
 
 pub(crate) struct Shared {
@@ -127,6 +138,10 @@ pub(crate) struct Shared {
     live: Mutex<Vec<bool>>,
     /// The places of every device part.
     chunks: Mutex<Vec<Weak<PlaceChunks>>>,
+    /// The devices that the pages of the prompt cache are locked for, one
+    /// per device part; none for an executor without devices, whose pages
+    /// are ordinary memory, booked all the same.
+    devices: Mutex<Vec<Device>>,
 }
 
 impl Shared {
@@ -134,14 +149,18 @@ impl Shared {
         self.books.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// What the one place of the checkpoints' floor holds locked: the place,
-    /// or, where the places are locked in chunks, the chunk it lies in on
-    /// every device part (in a small model a chunk holds several places).
+    /// What the prompt cache's floor holds locked: its pages, and the one
+    /// place or, where the places are locked in chunks, the chunk it lies in
+    /// on every device part (in a small model a chunk holds several places).
     /// Nothing without a floor.
     fn floor_held(&self) -> u64 {
-        let floor = self.books().checkpoints_floor;
-        if floor == 0 {
-            return 0;
+        let (place, pages) = {
+            let books = self.books();
+            let floor = books.cache_floor();
+            (books.place_floor.min(floor), floor.saturating_sub(books.place_floor))
+        };
+        if place == 0 {
+            return pages;
         }
         let tables = self.chunks.lock().unwrap_or_else(|e| e.into_inner());
         let chunks: u64 = tables
@@ -149,40 +168,40 @@ impl Shared {
             .filter_map(Weak::upgrade)
             .map(|table| u64::from(table.per_chunk.min(table.capacity)) * table.bytes as u64)
             .sum();
-        floor.max(chunks)
+        place.max(chunks) + pages
     }
 
     pub(crate) fn wants(&self) -> Wants {
         let floor_held = self.floor_held();
         let books = self.books();
-        let floors = books.experts_floor + books.checkpoints_floor;
+        let floors = books.experts_floor + books.cache_floor();
         let room = books.elastic_room().saturating_sub(floors);
         let experts_want = books.experts_want.saturating_sub(books.experts_floor).min(room);
-        let checkpoints_want = books.checkpoints_want.saturating_sub(books.checkpoints_floor);
+        let cache_want = books.cache_want.saturating_sub(books.cache_floor());
         Wants {
             locked: books.broker.used(),
             experts_held: books.usage(&books.experts).saturating_sub(books.experts_floor),
             experts_want,
-            checkpoints_held: books.usage(&books.checkpoints).saturating_sub(floor_held),
-            checkpoints_want: checkpoints_want.min(room - experts_want),
+            cache_held: books.usage(&books.cache).saturating_sub(floor_held),
+            cache_want: cache_want.min(room - experts_want),
         }
     }
 
-    /// Sets what the tier of experts and the checkpoints may hold above
+    /// Sets what the tier of experts and the prompt cache may hold above
     /// their floors. `holds` is what the two hold at `now` and
     /// `over` how much of it is more than they may: when a release that was
     /// asked for at an earlier look is done, the time it took comes back.
     pub(crate) fn allow(
         &self,
         experts: u64,
-        checkpoints: u64,
+        cache: u64,
         now: std::time::Duration,
         holds: u64,
         over: u64,
     ) -> Option<std::time::Duration> {
         let mut books = self.books();
         books.experts_allow = experts;
-        books.checkpoints_allow = checkpoints;
+        books.cache_allow = cache;
         let mut took = None;
         if let Some((asked, level)) = books.asked
             && holds <= level
@@ -200,17 +219,17 @@ impl Shared {
     /// the machine, from its thread, with none of its locks held.
     pub(crate) fn follow(self: &Arc<Self>) {
         let ram = PinnedRam { shared: self.clone() };
-        let (experts, checkpoints) = {
+        let (experts, cache) = {
             let hooks = self.hooks.lock().unwrap_or_else(|e| e.into_inner());
-            (hooks.experts.clone(), hooks.checkpoints.clone())
+            (hooks.experts.clone(), hooks.cache.clone())
         };
         if let Some(hook) = experts {
             hook(&ram, ram.experts_allowance());
         }
         // The chunk that the floor's place lies in is not more than allowed.
-        let allowance = ram.checkpoints_allowance().max(self.floor_held());
-        if ram.checkpoints() > allowance {
-            if let Some(hook) = checkpoints {
+        let allowance = ram.cache_allowance().max(self.floor_held());
+        if ram.prompt_cache() > allowance {
+            if let Some(hook) = cache {
                 hook(&ram, allowance);
             }
             ram.sweep_checkpoints();
@@ -257,10 +276,10 @@ impl PinnedRam {
         let required = broker
             .register("step record and read-back", Class::Required)
             .expect("a fresh broker takes a consumer");
-        let checkpoints = broker
+        let cache = broker
             .register(
-                "prompt cache: checkpoints of recurrent state",
-                Class::Elastic { priority: CHECKPOINT_PRIORITY, floor: 0 },
+                "prompt cache in RAM: checkpoints of recurrent state and pages",
+                Class::Elastic { priority: CACHE_PRIORITY, floor: 0 },
             )
             .expect("a fresh broker takes a consumer");
         let experts = broker
@@ -269,14 +288,16 @@ impl PinnedRam {
         let books = Books {
             broker,
             required,
-            checkpoints,
+            cache,
+            pages: 0,
             experts,
             experts_want: 0,
             experts_floor: 0,
-            checkpoints_want: 0,
-            checkpoints_floor: 0,
+            cache_want: 0,
+            place_floor: 0,
+            pages_floor: 0,
             experts_allow: 0,
-            checkpoints_allow: 0,
+            cache_allow: 0,
             asked: None,
         };
         Self {
@@ -286,8 +307,15 @@ impl PinnedRam {
                 hooks: Mutex::new(Hooks::default()),
                 live: Mutex::new(Vec::new()),
                 chunks: Mutex::new(Vec::new()),
+                devices: Mutex::new(Vec::new()),
             }),
         }
+    }
+
+    /// The pages of the prompt cache are locked for `devices`, one per
+    /// device part, from now on.
+    pub fn lock_for(&self, devices: Vec<Device>) {
+        *self.shared.devices.lock().unwrap_or_else(|e| e.into_inner()) = devices;
     }
 
     fn books(&self) -> MutexGuard<'_, Books> {
@@ -309,10 +337,22 @@ impl PinnedRam {
         self.books().broker.used()
     }
 
+    /// Bytes the prompt cache holds in RAM now: its checkpoints and its
+    /// pages.
+    pub fn prompt_cache(&self) -> u64 {
+        let books = self.books();
+        books.usage(&books.cache)
+    }
+
     /// Bytes the prompt cache's checkpoints hold now.
     pub fn checkpoints(&self) -> u64 {
         let books = self.books();
-        books.broker.info(books.checkpoints.id()).map_or(0, |info| info.usage)
+        books.usage(&books.cache).saturating_sub(books.pages)
+    }
+
+    /// Bytes the prompt cache's pages hold now.
+    pub fn cache_pages(&self) -> u64 {
+        self.books().pages
     }
 
     /// Bytes the tier of experts holds now.
@@ -322,7 +362,7 @@ impl PinnedRam {
     }
 
     /// The most the tier of experts could lock now: what the limit leaves
-    /// after the required users, counting what the checkpoints could give
+    /// after the required users, counting what the prompt cache could give
     /// back.
     pub fn obtainable_experts(&self) -> u64 {
         let books = self.books();
@@ -331,29 +371,30 @@ impl PinnedRam {
 
     /// What the tier of experts may hold now: with a fixed limit all that
     /// the limit leaves after the required memory and the floor of the
-    /// checkpoints, otherwise what the machine lets it have, and always the
+    /// prompt cache, otherwise what the machine lets it have, and always the
     /// part it cannot work without.
     pub fn experts_allowance(&self) -> u64 {
         let books = self.books();
-        let room = books.elastic_room().saturating_sub(books.checkpoints_floor);
+        let room = books.elastic_room().saturating_sub(books.cache_floor());
         match self.shared.machine {
             None => room,
             Some(_) => (books.experts_floor + books.experts_allow).min(room),
         }
     }
 
-    /// What the checkpoints may hold now: with a fixed limit what the limit
-    /// leaves after the required memory and all the tier of experts can use,
-    /// otherwise what the machine lets them have, and always their floor
-    /// ([`PinnedRam::want_checkpoints`]).
-    pub fn checkpoints_allowance(&self) -> u64 {
+    /// What the prompt cache may hold in RAM now, its checkpoints and its
+    /// pages together: with a fixed limit what the limit leaves after the
+    /// required memory and all the tier of experts can use, otherwise what
+    /// the machine lets it have, and always its floor
+    /// ([`PinnedRam::want_cache`]).
+    pub fn cache_allowance(&self) -> u64 {
         let books = self.books();
         match self.shared.machine {
             None => {
                 let experts = books.experts_want.max(books.usage(&books.experts));
-                books.elastic_room().saturating_sub(experts).max(books.checkpoints_floor)
+                books.elastic_room().saturating_sub(experts).max(books.cache_floor())
             }
-            Some(_) => books.checkpoints_floor + books.checkpoints_allow,
+            Some(_) => books.cache_floor() + books.cache_allow,
         }
     }
 
@@ -378,16 +419,18 @@ impl PinnedRam {
         books.experts_floor = floor.min(books.experts_want);
     }
 
-    /// Says what the checkpoints can use at most, the conductor's budget,
-    /// and what the cache cannot work without, both in bytes. The floor is
-    /// one place for a cache whose level on SSD moves checkpoints through it
-    /// on their way to the drive and back, and nothing otherwise; it is the
-    /// cache's whatever the machine has, as the tier's floor is the tier's.
-    pub fn want_checkpoints(&self, want: u64, floor: u64) {
+    /// Says what the prompt cache can use at most, the conductor's budget,
+    /// and what it cannot work without, all in bytes: one checkpoint `place`
+    /// and some `pages` for a cache whose level on SSD moves state through
+    /// them on its way to the drive and back, and nothing otherwise. The
+    /// floor is the cache's whatever the machine has, as the tier's floor is
+    /// the tier's.
+    pub fn want_cache(&self, want: u64, place: u64, pages: u64) {
         {
             let mut books = self.books();
-            books.checkpoints_want = want;
-            books.checkpoints_floor = floor.min(want);
+            books.cache_want = want;
+            books.place_floor = place;
+            books.pages_floor = pages;
         }
         if let Some(machine) = &self.shared.machine {
             machine.claim();
@@ -402,13 +445,12 @@ impl PinnedRam {
         self.shared.hooks.lock().unwrap_or_else(|e| e.into_inner()).experts = Some(Arc::new(hook));
     }
 
-    /// `hook` is called with these books and the checkpoints' allowance
-    /// when they hold more than it, from the machine's thread: the conductor
-    /// gives checkpoints up, and their chunks are released after it
-    /// ([`PinnedRam::sweep_checkpoints`]).
-    pub fn on_checkpoints(&self, hook: impl Fn(&PinnedRam, u64) + Send + Sync + 'static) {
-        self.shared.hooks.lock().unwrap_or_else(|e| e.into_inner()).checkpoints =
-            Some(Arc::new(hook));
+    /// `hook` is called with these books and the prompt cache's allowance
+    /// when it holds more than that, from the machine's thread: the conductor
+    /// gives checkpoints and pages up, and the chunks of the places are
+    /// released after it ([`PinnedRam::sweep_checkpoints`]).
+    pub fn on_cache(&self, hook: impl Fn(&PinnedRam, u64) + Send + Sync + 'static) {
+        self.shared.hooks.lock().unwrap_or_else(|e| e.into_inner()).cache = Some(Arc::new(hook));
     }
 
     /// What locks the pieces of the tier of experts: each piece is booked
@@ -450,21 +492,27 @@ impl PinnedRam {
         }
     }
 
-    pub(crate) fn book_checkpoints(&self, bytes: u64) -> Result<(), ModelError> {
+    /// Books `bytes` for the prompt cache, or says why the limit has no
+    /// room for them.
+    fn book_cache(&self, bytes: u64, what: &str) -> Result<(), String> {
         let mut books = self.books();
-        let Books { broker, checkpoints, .. } = &mut *books;
-        match broker.grow(checkpoints, bytes) {
+        let Books { broker, cache, .. } = &mut *books;
+        match broker.grow(cache, bytes) {
             Ok(Growth::Granted) => Ok(()),
-            // Nothing ranks below the checkpoints, so there is nobody to
+            // Nothing ranks below the prompt cache, so there is nobody to
             // take from; a plan would be a refusal.
-            Ok(Growth::Reclaim(plan)) => Err(ModelError::Invalid(format!(
-                "the RAM limit of {} bytes has no room for {bytes} more bytes of checkpoints, and \
-                 {} would have to come from others",
+            Ok(Growth::Reclaim(plan)) => Err(format!(
+                "the RAM limit of {} bytes has no room for {bytes} more bytes of {what}, and {} \
+                 would have to come from others",
                 broker.capacity(),
                 plan.total()
-            ))),
-            Err(error) => Err(ModelError::Invalid(error.to_string())),
+            )),
+            Err(error) => Err(error.to_string()),
         }
+    }
+
+    pub(crate) fn book_checkpoints(&self, bytes: u64) -> Result<(), ModelError> {
+        self.book_cache(bytes, "checkpoints").map_err(ModelError::Invalid)
     }
 
     /// Locks `bytes` of RAM on behalf of the checkpoint cache, or says who
@@ -487,9 +535,40 @@ impl PinnedRam {
 
     pub(crate) fn release_checkpoints(&self, bytes: u64) {
         let mut books = self.books();
-        let Books { broker, checkpoints, .. } = &mut *books;
+        let Books { broker, cache, .. } = &mut *books;
         // The bytes were granted by `book_checkpoints`, so the books hold them.
-        let _ = broker.shrink(checkpoints, bytes);
+        let _ = broker.shrink(cache, bytes);
+    }
+
+    /// One device share of a page of the prompt cache in RAM: `bytes` (at
+    /// least; padded to a block of direct I/O) for device part `part`,
+    /// booked, and page-locked when the books know the devices. `Err` when
+    /// the limit has no room or the memory cannot be locked.
+    pub(crate) fn cache_buffer(&self, part: usize, bytes: usize) -> Result<CacheBuffer, String> {
+        let len = ares_store::padded(bytes.max(1));
+        self.book_cache(len as u64, "pages")?;
+        self.books().pages += len as u64;
+        let device = {
+            let devices = self.shared.devices.lock().unwrap_or_else(|e| e.into_inner());
+            devices.get(part).or(devices.first()).cloned()
+        };
+        // Booked from here on: a buffer that cannot be locked gives the
+        // booking back as it is dropped.
+        let mut buffer = CacheBuffer { memory: CacheMemory::Plain(None), ram: self.clone(), len };
+        buffer.memory = match device {
+            Some(device) => {
+                CacheMemory::Locked(PinnedBuffer::new(&device, len).map_err(|e| e.to_string())?)
+            }
+            None => CacheMemory::Plain(Some(Aligned::new(len))),
+        };
+        Ok(buffer)
+    }
+
+    fn release_cache_pages(&self, bytes: u64) {
+        let mut books = self.books();
+        books.pages = books.pages.saturating_sub(bytes);
+        let Books { broker, cache, .. } = &mut *books;
+        let _ = broker.shrink(cache, bytes);
     }
 
     /// The places of a device part's checkpoints: `capacity` places of
@@ -538,11 +617,11 @@ impl PinnedRam {
     }
 
     /// Releases chunks of checkpoint places in which the conductor has no
-    /// checkpoint, until the checkpoints hold no more than their allowance.
+    /// checkpoint, until the prompt cache holds no more than its allowance.
     /// Returns the bytes released.
     pub fn sweep_checkpoints(&self) -> u64 {
-        let allowance = self.checkpoints_allowance().max(self.shared.floor_held());
-        let mut held = self.checkpoints();
+        let allowance = self.cache_allowance().max(self.shared.floor_held());
+        let mut held = self.prompt_cache();
         let tables: Vec<Arc<PlaceChunks>> = {
             let all = self.shared.chunks.lock().unwrap_or_else(|e| e.into_inner());
             all.iter().filter_map(Weak::upgrade).collect()
@@ -627,6 +706,55 @@ impl LockedChunk {
 impl Drop for LockedChunk {
     fn drop(&mut self) {
         self.ram.release_checkpoints(self.buffer.len() as u64);
+    }
+}
+
+/// One device share of a page of the prompt cache in RAM. See
+/// [`PinnedRam::cache_buffer`]. Its bytes go back to the books when it is
+/// dropped.
+pub struct CacheBuffer {
+    memory: CacheMemory,
+    ram: PinnedRam,
+    len: usize,
+}
+
+enum CacheMemory {
+    Locked(PinnedBuffer),
+    /// Ordinary memory; `None` only while the buffer is being made.
+    Plain(Option<Aligned>),
+}
+
+impl std::fmt::Debug for CacheBuffer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let locked = matches!(self.memory, CacheMemory::Locked(_));
+        f.debug_struct("CacheBuffer").field("len", &self.len).field("locked", &locked).finish()
+    }
+}
+
+impl std::ops::Deref for CacheBuffer {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        match &self.memory {
+            CacheMemory::Locked(buffer) => buffer,
+            CacheMemory::Plain(Some(buffer)) => buffer,
+            CacheMemory::Plain(None) => &[],
+        }
+    }
+}
+
+impl std::ops::DerefMut for CacheBuffer {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        match &mut self.memory {
+            CacheMemory::Locked(buffer) => buffer,
+            CacheMemory::Plain(Some(buffer)) => buffer,
+            CacheMemory::Plain(None) => &mut [],
+        }
+    }
+}
+
+impl Drop for CacheBuffer {
+    fn drop(&mut self) {
+        self.ram.release_cache_pages(self.len as u64);
     }
 }
 
@@ -720,7 +848,7 @@ mod tests {
         ram.require(10 * MIB).unwrap();
         assert_eq!((ram.obtainable_experts(), ram.experts()), (90 * MIB, 0));
         // A model without experts leaves all of it to the checkpoints.
-        assert_eq!((ram.experts_allowance(), ram.checkpoints_allowance()), (90 * MIB, 90 * MIB));
+        assert_eq!((ram.experts_allowance(), ram.cache_allowance()), (90 * MIB, 90 * MIB));
         // The checkpoints hold 40 MiB; the tier of experts, which ranks above
         // them, could still have all 90.
         ram.book_checkpoints(40 * MIB).unwrap();
@@ -738,9 +866,9 @@ mod tests {
         // A tier that can use 70 MiB leaves the checkpoints 20, and one that
         // can use everything leaves them nothing.
         ram.want_experts(70 * MIB, 0);
-        assert_eq!((ram.experts_allowance(), ram.checkpoints_allowance()), (90 * MIB, 20 * MIB));
+        assert_eq!((ram.experts_allowance(), ram.cache_allowance()), (90 * MIB, 20 * MIB));
         ram.want_experts(GIB, 0);
-        assert_eq!(ram.checkpoints_allowance(), 0);
+        assert_eq!(ram.cache_allowance(), 0);
         // And the checkpoints cannot take memory back from the tier.
         ram.release_checkpoints(40 * MIB);
         ram.book_experts(90 * MIB).unwrap();
@@ -833,17 +961,17 @@ mod tests {
     /// A prompt cache with a budget of `want` bytes that keeps as many
     /// checkpoints of 64 MiB as it is allowed.
     fn cache(ram: &PinnedRam, want: u64) {
-        ram.on_checkpoints(|ram, allowance| {
+        ram.on_cache(|ram, allowance| {
             while ram.checkpoints() > allowance {
                 ram.release_checkpoints(PIECE.min(ram.checkpoints()));
             }
         });
-        ram.want_checkpoints(want, 0);
+        ram.want_cache(want, 0, 0);
     }
 
     /// The cache takes checkpoints as far as it may.
     fn fill(ram: &PinnedRam) {
-        while ram.checkpoints() + PIECE <= ram.checkpoints_allowance() {
+        while ram.checkpoints() + PIECE <= ram.cache_allowance() {
             ram.book_checkpoints(PIECE).unwrap();
         }
     }
@@ -949,7 +1077,7 @@ mod tests {
         }
         sim.run(&machine, 500);
         assert_eq!(ram.checkpoints(), 0);
-        assert_eq!(ram.checkpoints_allowance(), 0, "and it may take no new checkpoint");
+        assert_eq!(ram.cache_allowance(), 0, "and it may take no new checkpoint");
         assert!(ram.experts() < 6 * GIB && ram.experts() > 3 * GIB, "{}", ram.experts());
         assert!(sim.available() >= machine.headroom());
         assert_eq!(required(&ram), GIB);
@@ -968,12 +1096,12 @@ mod tests {
         // but the one place the cache cannot work without.
         let ram = PinnedRam::new(100 * MIB);
         ram.require(10 * MIB).unwrap();
-        ram.want_checkpoints(40 * MIB, 8 * MIB);
+        ram.want_cache(40 * MIB, 8 * MIB, 0);
         ram.want_experts(GIB, 0);
-        assert_eq!((ram.experts_allowance(), ram.checkpoints_allowance()), (82 * MIB, 8 * MIB));
+        assert_eq!((ram.experts_allowance(), ram.cache_allowance()), (82 * MIB, 8 * MIB));
         // A floor is never more than what the cache can use at all.
-        ram.want_checkpoints(4 * MIB, 8 * MIB);
-        assert_eq!(ram.checkpoints_allowance(), 4 * MIB);
+        ram.want_cache(4 * MIB, 8 * MIB, 0);
+        assert_eq!(ram.cache_allowance(), 4 * MIB);
 
         // A machine to follow, on which other programs leave nothing: the
         // checkpoints go down to their floor and no further, and the machine
@@ -982,7 +1110,7 @@ mod tests {
         let ram = sim.engine(&machine, 64 * GIB, GIB);
         tier(&ram, 8 * GIB);
         cache(&ram, 32 * GIB);
-        ram.want_checkpoints(32 * GIB, PIECE);
+        ram.want_cache(32 * GIB, PIECE, 0);
         fill(&ram);
         sim.run(&machine, 5_000);
         fill(&ram);
@@ -992,7 +1120,7 @@ mod tests {
             sim.run(&machine, 50);
         }
         sim.run(&machine, 500);
-        assert_eq!((ram.checkpoints_allowance(), ram.checkpoints()), (PIECE, PIECE));
+        assert_eq!((ram.cache_allowance(), ram.checkpoints()), (PIECE, PIECE));
         assert!(ram.experts() < 6 * GIB && ram.experts() > 3 * GIB, "{}", ram.experts());
         let look = machine.look().unwrap();
         assert_eq!(look.owed, 0, "the floor is not memory the machine waits for: {look:?}");
