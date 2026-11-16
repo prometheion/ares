@@ -13,10 +13,10 @@
 //! What the router needs to know is which experts a tier holds. Its slot table
 //! does not say (it knows its own device's VRAM, not the other device's or
 //! RAM), so the host writes a byte per expert of every layer of the model at
-//! the start of every step from the store ([`PruneMask::build`]): 1 for an
+//! the start of every step from the store (`PruneMask::build`): 1 for an
 //! expert in a VRAM slot of any device, in the RAM tier, or on its way to one.
 //! Each part that routes copies its layers' bytes onto its device on its
-//! stream before its first layer ([`PartPrune::begin`]). An expert that
+//! stream before its first layer (`PartPrune::begin`). An expert that
 //! arrives during the step counts from the next one.
 //!
 //! Only steps of up to eight rows (generation, windows of drafts) are pruned;
@@ -65,7 +65,8 @@ impl std::fmt::Debug for PruneMask {
 
 impl PruneMask {
     /// A mask of `n_layers` layers of `n_experts` experts, every expert held
-    /// until the first [`PruneMask::build`]: nothing is pruned before.
+    /// until the store first writes it at the start of a step: nothing is
+    /// pruned before.
     pub fn new(device: &Device, n_layers: usize, n_experts: usize) -> Result<Self, ModelError> {
         let len = (n_layers * n_experts).max(1);
         let mut buffers = [PinnedBuffer::new(device, len)?, PinnedBuffer::new(device, len)?];
