@@ -1,6 +1,6 @@
 //! DFlash2, a block drafter from a file of its own that reads taps of the
 //! model it drafts for: its shape and tensors ([`config`]), the CPU reference
-//! ([`reference`]) and the drafter on a device ([`device`]).
+//! ([`reference`](mod@reference)) and the drafter on a device ([`device`]).
 //!
 //! The drafter is a kind the runtime knows ([`ares_runtime::DrafterKind`]):
 //! every model with a DFlash2 file gets it, and gives only what is its own

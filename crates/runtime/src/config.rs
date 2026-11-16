@@ -58,7 +58,7 @@ pub struct RuntimeConfig {
     /// measured so far; this is the room, which the model reserves memory
     /// for (a row of a window keeps its inputs, its logits and a link of the
     /// draft block's chain). A model with no drafter of its own
-    /// ([`crate::Model::own_drafts`]) does not draft at all, whatever this is.
+    /// ([`crate::Model::drafters`]) does not draft at all, whatever this is.
     pub window_rows: u32,
     /// The corpus that drafts are looked up in: its memory and the shortest
     /// match it drafts from.
