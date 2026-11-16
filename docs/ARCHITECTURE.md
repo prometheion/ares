@@ -275,7 +275,10 @@ The blocks so far:
   model's. Both models run on it: the 27B's checkpoint is its slot and its
   draft block's carry row, Flash-Next's is described in "Qwen3.8-Flash-Next
   through the runtime". Moved from the 27B as it was (its five fingerprint
-  cases bit for bit, the same copies and kernels in the same order).
+  cases bit for bit, the same copies and kernels in the same order; measured
+  2026-11-16 in alternation, three runs each at loads of 6 to 28: a decode
+  step at 1000 tokens of the tensor split 25.73 ms before and after, a prompt
+  of 2048 tokens 1309 and 1313 tokens/s).
 
 ## A step
 
