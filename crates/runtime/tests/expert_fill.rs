@@ -96,7 +96,9 @@ fn rig(vram_slots: u64, ram_slots: u64, pieces: Option<(usize, usize)>) -> Rig {
     let map =
         ExpertMap::discover(&gguf, &["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"]).unwrap();
     let reader = Reader::open_gguf(&gguf, Config::default()).unwrap();
-    let layers = [LayerSpec { device: 0, offsets: OFFSETS, slot_bytes: SLOT_BYTES }; LAYERS];
+    let layers =
+        [LayerSpec { device: 0, offsets: OFFSETS, slot_bytes: SLOT_BYTES, resident: false };
+            LAYERS];
     let mut config =
         StoreConfig::new(1, 2, vec![vram_slots * SLOT_BYTES * LAYERS as u64], u64::MAX / 4);
     config.vram_reserve = 1;

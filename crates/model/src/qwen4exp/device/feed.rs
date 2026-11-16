@@ -111,7 +111,8 @@ pub(super) struct Layout {
     /// experts are layer 0 (a step routes it before any layer of the model),
     /// 0 without.
     pub base: usize,
-    /// The device of the draft block and the bytes of all its experts.
+    /// The device of the draft block and the bytes of all its experts, which
+    /// stay resident there.
     pub draft: Option<(usize, u64)>,
 }
 
@@ -140,7 +141,7 @@ impl Layout {
             gate_ty: moe.gate.ty(),
             down_ty: moe.down.ty(),
         };
-        let spec_of = |shape: &ExpertShape, device: usize, what: &str| {
+        let spec_of = |shape: &ExpertShape, device: usize, what: &str, resident: bool| {
             let geometry = || invalid(format!("{what}: the experts do not fit a slot"));
             Ok::<_, Error>(LayerSpec {
                 device,
@@ -150,12 +151,16 @@ impl Layout {
                     shape.down_offset().ok_or_else(geometry)?,
                 ],
                 slot_bytes: shape.slot_bytes().ok_or_else(geometry)?,
+                resident,
             })
         };
         let mut draft_bytes = None;
         if let Some(draft) = draft {
+            // The draft block's experts stay in VRAM, all of them: a chain
+            // routes them in every link, and a link that waits for an expert
+            // costs what a token costs.
             let shape = shape_of(&draft.weights.layer.moe);
-            let spec = spec_of(&shape, draft.device, "the draft block")?;
+            let spec = spec_of(&shape, draft.device, "the draft block", true)?;
             draft_bytes = Some((draft.device, spec.slot_bytes * c.experts.count as u64));
             specs.push(spec);
             shapes.push(shape);
@@ -170,7 +175,7 @@ impl Layout {
                     .device_of(layer)
                     .ok_or_else(|| invalid(format!("layer {layer} is on no device")))?
             };
-            let spec = spec_of(&shape, device, &format!("layer {layer}"))?;
+            let spec = spec_of(&shape, device, &format!("layer {layer}"), false)?;
             expert_bytes += spec.slot_bytes * c.experts.count as u64 / per_layer as u64;
             specs.push(spec);
             shapes.push(shape);

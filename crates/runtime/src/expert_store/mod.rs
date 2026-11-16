@@ -121,6 +121,11 @@ pub struct LayerSpec {
     pub offsets: [u64; 3],
     /// Bytes from one slot to the next.
     pub slot_bytes: u64,
+    /// Every expert of the layer has a slot in VRAM for as long as the store
+    /// lives, outside the tiers: the experts of a drafter, which make every
+    /// link of a chain and must never be waited for. Their bytes come out of
+    /// the device's budget before the tiers get theirs.
+    pub resident: bool,
 }
 
 /// The budgets and rules of a store.
@@ -188,6 +193,8 @@ struct Geometry {
     lens: [usize; 3],
     /// Where each matrix's read buffer starts in a RAM slot.
     ram_bases: [usize; 3],
+    /// Every expert has a VRAM slot for good ([`LayerSpec::resident`]).
+    resident: bool,
 }
 
 /// The slots a store will have: what [`StorePlan::new`] works out, for
@@ -263,6 +270,10 @@ impl StorePlan {
         self.n_experts
     }
 }
+
+/// The RAM slots of a resident layer: what its experts pass through from the
+/// file into VRAM when the store is filled.
+const RESIDENT_PASSAGE: usize = 8;
 
 /// Where a missing expert was when its layer's record arrived.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -516,6 +527,7 @@ impl StorePlan {
                 offsets: spec.offsets,
                 lens,
                 ram_bases,
+                resident: spec.resident,
             });
             ram_layers.push((0usize, at as u64));
         }
@@ -523,6 +535,28 @@ impl StorePlan {
         let heat: Vec<&[f32]> =
             (0..layers.len()).map(|l| profile.map_or(flat.as_slice(), |p| p.layer(l))).collect();
         let floor = (config.max_rows * config.top_k) as usize + config.vram_reserve;
+        // A resident layer holds all its experts in VRAM, and in RAM the slots
+        // its experts pass through on their way from the file when the store
+        // is filled.
+        let vram_fixed: Vec<Option<usize>> =
+            layers.iter().map(|s| s.resident.then_some(n_experts)).collect();
+        let ram_fixed: Vec<Option<usize>> =
+            layers.iter().map(|s| s.resident.then_some(RESIDENT_PASSAGE)).collect();
+        for (device, budget) in config.vram_bytes.iter().enumerate() {
+            let resident: u64 = layers
+                .iter()
+                .filter(|s| s.resident && s.device == device)
+                .map(|s| s.slot_bytes * n_experts as u64)
+                .sum();
+            if resident > *budget {
+                return Err(plan_error(format!(
+                    "the VRAM budget of device {device} ({} MiB) does not hold the experts that \
+                     stay resident there ({} MiB)",
+                    budget >> 20,
+                    resident >> 20
+                )));
+            }
+        }
         let vram_layers: Vec<(usize, u64)> =
             layers.iter().map(|s| (s.device, s.slot_bytes)).collect();
         // Transit and staging come out of the budgets of the tiers.
@@ -551,15 +585,15 @@ impl StorePlan {
                     config.staging_slots
                 ))
             })?;
-        let vram =
-            Tier::plan(n_experts, &vram_layers, &vram_budget, floor, &heat).ok_or_else(|| {
+        let vram = Tier::plan(n_experts, &vram_layers, &vram_budget, floor, &heat, &vram_fixed)
+            .ok_or_else(|| {
                 plan_error(format!(
                     "the VRAM budget does not hold {floor} slots per layer ({} rows of {} experts \
-                     and {} free)",
+                     and {} free) beside the experts that stay resident",
                     config.max_rows, config.top_k, config.vram_reserve
                 ))
             })?;
-        let ram = Tier::plan(n_experts, &ram_layers, &[ram_budget], 2, &heat)
+        let ram = Tier::plan(n_experts, &ram_layers, &[ram_budget], 2, &heat, &ram_fixed)
             .ok_or_else(|| plan_error("the RAM budget does not hold 2 slots per layer".into()))?;
         let layout = Layout::new(&ram.pools, config.ram_piece, transit.stage_len());
         transit.stage_base = layout.stage_base;
@@ -673,6 +707,11 @@ impl<D: SlotDevice> ExpertStore<D> {
     /// The slots `layer` has in VRAM and in RAM.
     pub fn slots(&self, layer: usize) -> (usize, usize) {
         (self.vram.slots(layer), self.ram.slots(layer))
+    }
+
+    /// Whether every expert of `layer` has a VRAM slot for good.
+    pub fn is_resident(&self, layer: usize) -> bool {
+        self.layers[layer].resident
     }
 
     /// Whether `expert` of `layer` is usable in a VRAM slot, as far as the
@@ -1286,7 +1325,7 @@ impl<D: SlotDevice> ExpertStore<D> {
         evicted: &mut Vec<(usize, u32, u32)>,
     ) -> Result<(), StoreError> {
         let reserve = self.config.vram_reserve;
-        if self.vram.sets[layer].n_free() >= reserve {
+        if self.vram.sets[layer].n_free() >= reserve || self.layers[layer].resident {
             return Ok(());
         }
         let given = self.vram.sets[layer].give_back(reserve, self.step, self.heat.layer(layer));

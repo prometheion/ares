@@ -1259,6 +1259,7 @@ fn main() -> Result<(), AnyError> {
                     shape.down_offset().ok_or_else(|| geometry("down"))?,
                 ],
                 slot_bytes: shape.slot_bytes().ok_or_else(|| geometry("slot"))?,
+                resident: false,
             })
         })
         .collect::<Result<_, String>>()?;

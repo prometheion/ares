@@ -112,7 +112,9 @@ fn rig_in_pieces(
     let map =
         ExpertMap::discover(&gguf, &["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"]).unwrap();
     let reader = Reader::open_gguf(&gguf, Config::default()).unwrap();
-    let layers = [LayerSpec { device: 0, offsets: OFFSETS, slot_bytes: SLOT_BYTES }; LAYERS];
+    let layers =
+        [LayerSpec { device: 0, offsets: OFFSETS, slot_bytes: SLOT_BYTES, resident: false };
+            LAYERS];
     // What a RAM slot takes is the plan's business; ask it with a large
     // budget first.
     let mut config =
@@ -220,6 +222,71 @@ fn a_missing_pick_comes_from_the_file_into_a_slot() {
     rig.store.end_step().unwrap();
     let stats = rig.store.take_stats();
     assert_eq!((stats.picks, stats.hits, stats.demand_reads), (2, 2, 0));
+}
+
+#[test]
+fn a_resident_layer_holds_all_its_experts_outside_the_tiers_and_never_misses() {
+    let dir = Scratch::new();
+    let gguf = model(&dir);
+    let map =
+        ExpertMap::discover(&gguf, &["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"]).unwrap();
+    let reader = Reader::open_gguf(&gguf, Config::default()).unwrap();
+    // Layer 0 is a drafter's: all 16 experts stay in VRAM. The other two
+    // share what is left, 4 slots each.
+    let mut layers =
+        [LayerSpec { device: 0, offsets: OFFSETS, slot_bytes: SLOT_BYTES, resident: false };
+            LAYERS];
+    layers[0].resident = true;
+    let vram = (16 + 2 * 4) * SLOT_BYTES;
+    let mut config = StoreConfig::new(1, 2, vec![vram], u64::MAX / 4);
+    config.vram_reserve = 1;
+    config.rebalance_every = 1;
+    recent_first(&mut config);
+    let probe = StorePlan::new(config.clone(), &map, &reader, &layers, None).unwrap();
+    config.ram_bytes = 64 * probe.ram_slot_bytes(1);
+    let plan = StorePlan::new(config.clone(), &map, &reader, &layers, None).unwrap();
+    assert_eq!(plan.slots(0).0, 16, "every expert of the resident layer");
+    assert_eq!((plan.slots(1).0, plan.slots(2).0), (4, 4));
+    assert_eq!(plan.vram_bytes(0), vram);
+    // A budget that does not hold the resident experts and the others' floor
+    // is refused, and says why.
+    let small = StoreConfig { vram_bytes: vec![15 * SLOT_BYTES], ..config.clone() };
+    let refused = StorePlan::new(small, &map, &reader, &layers, None).unwrap_err().to_string();
+    assert!(refused.contains("resident"), "{refused}");
+    let short = StoreConfig { vram_bytes: vec![17 * SLOT_BYTES], ..config.clone() };
+    assert!(StorePlan::new(short, &map, &reader, &layers, None).is_err());
+
+    let device = HostSlots::new(&plan.device_pools(0), LAYERS, EXPERTS);
+    let region = HostRegion::unpinned(plan.ram_bytes(), plan.block());
+    let mut rig = Rig {
+        store: ExpertStore::new(plan, map, reader, vec![device], region, None).unwrap(),
+        _dir: dir,
+    };
+    assert!(rig.store.is_resident(0) && !rig.store.is_resident(1));
+    // Filled once, through the few RAM slots the layer passes its experts
+    // through.
+    rig.store.fill(0, &(0..EXPERTS).collect::<Vec<_>>()).unwrap();
+    rig.settle();
+    for expert in 0..EXPERTS {
+        rig.assert_usable(0, expert);
+    }
+    rig.store.take_stats();
+    // Steps that use every expert of the other layers in turn, with heat that
+    // forgets fast and slots that move between layers at every step: the
+    // resident layer gives up nothing and finds every pick.
+    for round in 0..8u32 {
+        let others = [round * 2 % EXPERTS, (round * 2 + 1) % EXPERTS];
+        rig.step(&[&[round % EXPERTS, (round + 5) % EXPERTS][..], &others[..], &others[..]]);
+    }
+    let stats = rig.store.take_stats();
+    assert!(stats.evictions > 0, "the other layers churn: {stats:?}");
+    for expert in 0..EXPERTS {
+        rig.assert_usable(0, expert);
+    }
+    assert_eq!(rig.store.slots(0).0, 16);
+    rig.store.begin_step();
+    assert_eq!(rig.store.routed(0, &[1, 7, 15]).unwrap(), 0);
+    rig.store.end_step().unwrap();
 }
 
 #[test]
@@ -498,6 +565,7 @@ mod hybrid {
             device: 0,
             offsets: [0, SHAPE.up_offset().unwrap(), SHAPE.down_offset().unwrap()],
             slot_bytes,
+            resident: false,
         };
         let layers = [spec; LAYERS];
         let mut config =
@@ -999,7 +1067,12 @@ mod device {
         let reader = Reader::open_gguf(&gguf, Config::default()).unwrap();
         let slot_bytes = SHAPE.slot_bytes().unwrap();
         let (up_offset, down_offset) = (SHAPE.up_offset().unwrap(), SHAPE.down_offset().unwrap());
-        let spec = LayerSpec { device: 0, offsets: [0, up_offset, down_offset], slot_bytes };
+        let spec = LayerSpec {
+            device: 0,
+            offsets: [0, up_offset, down_offset],
+            slot_bytes,
+            resident: false,
+        };
         let layers = [spec; LAYERS];
         // Slots for what one step of eight rows can pick, which is half of
         // a layer's experts.
