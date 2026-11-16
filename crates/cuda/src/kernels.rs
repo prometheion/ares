@@ -23,6 +23,10 @@ pub use layout::{
 /// the toolkit builds for can load it.
 static IMAGE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/kernels.fatbin"));
 
+/// The module of the weight kernels that multiply unquantized activations with a quantized
+/// matrix, compiled from `kernels/mmv_exact.cu`.
+static EXACT_IMAGE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mmv_exact.fatbin"));
+
 /// The prefill module, compiled from `kernels/prefill.cu` for compute
 /// capability 8.0 and newer (the tensor-core weight kernels).
 static PREFILL_IMAGE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/prefill.fatbin"));
@@ -80,6 +84,37 @@ const FAST_TYPES: [(GgmlType, &str, u64); 28] = [
     (GgmlType::NVFP4, "ares_mmvq_nvfp4", 4),
     (GgmlType::Q1_0, "ares_mmvq_q1_0", 2),
     (GgmlType::Q2_0, "ares_mmvq_q2_0", 2),
+];
+
+/// The quantized weight types and their kernel of [`Kernels::matvec_exact`]
+/// (`kernels/mmv_exact.cu`), with the alignment in bytes it needs of the matrix (its
+/// decoders read bytes and the f16 scales of the blocks).
+const EXACT_TYPES: [(GgmlType, &str, u64); 25] = [
+    (GgmlType::Q4_0, "ares_mmv_exact_q4_0", 2),
+    (GgmlType::Q4_1, "ares_mmv_exact_q4_1", 2),
+    (GgmlType::Q5_0, "ares_mmv_exact_q5_0", 2),
+    (GgmlType::Q5_1, "ares_mmv_exact_q5_1", 2),
+    (GgmlType::Q8_0, "ares_mmv_exact_q8_0", 2),
+    (GgmlType::Q2_K, "ares_mmv_exact_q2_K", 2),
+    (GgmlType::Q3_K, "ares_mmv_exact_q3_K", 2),
+    (GgmlType::Q4_K, "ares_mmv_exact_q4_K", 2),
+    (GgmlType::Q5_K, "ares_mmv_exact_q5_K", 2),
+    (GgmlType::Q6_K, "ares_mmv_exact_q6_K", 2),
+    (GgmlType::IQ2_XXS, "ares_mmv_exact_iq2_xxs", 2),
+    (GgmlType::IQ2_XS, "ares_mmv_exact_iq2_xs", 2),
+    (GgmlType::IQ3_XXS, "ares_mmv_exact_iq3_xxs", 2),
+    (GgmlType::IQ1_S, "ares_mmv_exact_iq1_s", 2),
+    (GgmlType::IQ4_NL, "ares_mmv_exact_iq4_nl", 2),
+    (GgmlType::IQ3_S, "ares_mmv_exact_iq3_s", 2),
+    (GgmlType::IQ2_S, "ares_mmv_exact_iq2_s", 2),
+    (GgmlType::IQ4_XS, "ares_mmv_exact_iq4_xs", 2),
+    (GgmlType::IQ1_M, "ares_mmv_exact_iq1_m", 2),
+    (GgmlType::TQ1_0, "ares_mmv_exact_tq1_0", 2),
+    (GgmlType::TQ2_0, "ares_mmv_exact_tq2_0", 2),
+    (GgmlType::MXFP4, "ares_mmv_exact_mxfp4", 1),
+    (GgmlType::NVFP4, "ares_mmv_exact_nvfp4", 2),
+    (GgmlType::Q1_0, "ares_mmv_exact_q1_0", 2),
+    (GgmlType::Q2_0, "ares_mmv_exact_q2_0", 2),
 ];
 
 /// The decode types whose codebook is large (16 KiB: IQ1_S and IQ1_M). A thread
@@ -411,6 +446,8 @@ pub struct Kernels {
     matvec_q4_k: Function,
     quantize_act: Function,
     fast: Vec<(GgmlType, u64, Function)>,
+    /// The kernels of [`Kernels::matvec_exact`] for the quantized types.
+    exact: Vec<(GgmlType, u64, Function)>,
     /// `None` on a GPU below compute capability 8.0.
     prefill: Option<Prefill>,
 }
@@ -534,6 +571,11 @@ impl Kernels {
             .iter()
             .map(|(ty, name, align)| Ok((*ty, *align, module.function(name)?)))
             .collect::<Result<Vec<_>>>()?;
+        let exact_module = Module::load(device, EXACT_IMAGE)?;
+        let exact = EXACT_TYPES
+            .iter()
+            .map(|(ty, name, align)| Ok((*ty, *align, exact_module.function(name)?)))
+            .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             device: device.clone(),
             add_f32: module.function("ares_add_f32")?,
@@ -544,6 +586,7 @@ impl Kernels {
             matvec_q4_k: module.function("ares_matvec_q4_K")?,
             quantize_act: module.function("ares_quantize_act")?,
             fast,
+            exact,
             prefill,
         })
     }
@@ -861,6 +904,60 @@ impl Kernels {
         };
         let args = Args::new().ptr(w).ptr(q).ptr(y).u32(n_in).u32(n_out).u32(n_batch);
         // SAFETY: the argument list matches the ares_mmvq_* kernels; the ranges are the
+        // caller's guarantee.
+        unsafe { function.launch(stream, [blocks, 1, 1], [MMVQ_THREADS, 1, 1], 0, args) }
+    }
+
+    /// `y[b] = W x[b]` as [`Kernels::matvec`], with the activations as they are: the f32
+    /// section of the prepared rows at `q` (the layout of
+    /// [`Kernels::quantize_activations`]; its int8 codes are not read and need not be
+    /// written). The float types take their kernel of [`Kernels::matvec`], which reads the
+    /// same section; a quantized type takes a kernel that decodes each weight as ggml does
+    /// and sums in f32 in the order of the float kernel, so its product is that of its
+    /// decoded copy in F32 up to the last bit of a weight (a decoder may fuse a multiply and
+    /// an add where the CPU rounds twice). It is for the matrices the engine multiplies
+    /// exactly, whatever type the file stores them in: the stream mixers and the n-gram
+    /// block of qwen4exp. Every weight type has such a kernel.
+    ///
+    /// # Safety
+    ///
+    /// As [`Kernels::matvec`], except that only the f32 section of `q` is read (16-byte
+    /// aligned, at the offset the layout of `n_in` and `n_batch` gives it).
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn matvec_exact(
+        &self,
+        stream: &Stream,
+        ty: GgmlType,
+        w: DevicePtr,
+        q: DevicePtr,
+        y: DevicePtr,
+        n_in: u32,
+        n_out: u32,
+        n_batch: u32,
+    ) -> Result<()> {
+        let Some((_, align, function)) = self.exact.iter().find(|(t, _, _)| *t == ty) else {
+            // SAFETY: the caller's guarantee covers the float kernels, which read the f32
+            // section only.
+            return unsafe { self.matvec(stream, ty, w, q, y, n_in, n_out, n_batch) };
+        };
+        let block_values = ty.block_values();
+        if n_in == 0 || !n_in.is_multiple_of(block_values) {
+            return Err(Error::Invalid {
+                what: "weight matrix",
+                detail: format!(
+                    "{n_in} columns are not a whole number of {ty} blocks of {block_values} values"
+                ),
+            });
+        }
+        check_batch(n_batch)?;
+        if n_out == 0 {
+            return Ok(());
+        }
+        check_alignment("weight matrix", w, *align)?;
+        check_alignment("activations", q, 16)?;
+        let blocks = n_out.div_ceil(MMVQ_ROWS_PER_BLOCK);
+        let args = Args::new().ptr(w).ptr(q).ptr(y).u32(n_in).u32(n_out).u32(n_batch);
+        // SAFETY: the argument list matches the ares_mmv_exact_* kernels; the ranges are the
         // caller's guarantee.
         unsafe { function.launch(stream, [blocks, 1, 1], [MMVQ_THREADS, 1, 1], 0, args) }
     }

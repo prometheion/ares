@@ -107,6 +107,8 @@ fn main() {
         ("expertrows_l.cu", "expertrows_l.fatbin", TENSOR_FLOOR),
         ("expertrows_f.cu", "expertrows_f.fatbin", TENSOR_FLOOR),
         ("q4.cu", "q4.fatbin", FLOOR),
+        ("q4_reads.cu", "q4_reads.fatbin", FLOOR),
+        ("mmv_exact.cu", "mmv_exact.fatbin", FLOOR),
         ("tower.cu", "tower.fatbin", TENSOR_FLOOR),
         ("sampler.cu", "sampler.fatbin", FLOOR),
         ("dflash.cu", "dflash.fatbin", FLOOR),

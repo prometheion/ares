@@ -10,8 +10,13 @@
 //   ares_q4_read_up     lo = silu(down / hc), gate = up @ lo, the gated mean
 //                       and its quantization
 //
-// The three matrices of a mixer multiply unquantized values and are F32, F16
-// or BF16.
+// The three matrices of a mixer multiply unquantized values. They may be of
+// any weight type: each thread decodes the values it multiplies (weight_value.cuh)
+// and the sums are those of the same matrix in F32. The two launches come in one
+// kernel per reader of `down` and `up`: `ares_q4_read_down` and `ares_q4_read_up`
+// for the float types, `_<type>` for the common quantized types (q4_reads.cu) and
+// `_any` for every type by its id at run time; `inject`, a few rows, decodes by
+// its type at run time.
 //
 // **Two devices.** One device, the mixer, holds the residual streams and runs
 // every read. The other, the worker, gets the mixed input of each half block
@@ -40,11 +45,12 @@
 #include "expert_layout.cuh"
 #include "layer_math.cuh"
 #include "quantize_act.cuh"
+#include "weight_value.cuh"
 
-// The types of a mixer's matrices (the `ty` arguments).
+// The float types of a mixer's matrices (the `ty` arguments are ggml type ids).
 #define ARES_Q4_F32 0u
 #define ARES_Q4_F16 1u
-#define ARES_Q4_BF16 2u
+#define ARES_Q4_BF16 30u
 
 // The most rows of `down` one block of ares_q4_read_down computes.
 #define ARES_Q4_TILE 32
@@ -84,6 +90,47 @@ static __device__ __forceinline__ float4 ares_q4_load4(const uint8_t* p, uint32_
                        __half2float(__ushort_as_half(static_cast<unsigned short>(b >> 48))));
 }
 
+// How the read kernels find the values of a matrix of rows of `row_values` values: the row
+// `r` starts at `row(m, r, row_values, ty)` and `load4(row, at, ty)` is its values `at` to
+// `at + 3` (`at` a multiple of 4).
+//
+// The float types, by their type at run time, as the read was written first.
+struct AresQ4Float {
+    static __device__ __forceinline__ const uint8_t* row(const uint8_t* m, size_t r, size_t row_values,
+                                                         uint32_t ty) {
+        return m + r * row_values * ares_q4_value_bytes(ty);
+    }
+    static __device__ __forceinline__ float4 load4(const uint8_t* row, size_t at, uint32_t ty) {
+        return ares_q4_load4(row + at * ares_q4_value_bytes(ty), ty);
+    }
+};
+
+// A type of blocks known at compile time (ggml type id `TY`).
+template <uint32_t TY>
+struct AresQ4Blocks {
+    static __device__ __forceinline__ const uint8_t* row(const uint8_t* m, size_t r, size_t row_values,
+                                                         uint32_t) {
+        return m + r * (row_values / AresWeight<TY>::VALUES) * AresWeight<TY>::BYTES;
+    }
+    static __device__ __forceinline__ float4 load4(const uint8_t* row, size_t at, uint32_t) {
+        return ares_weight4<TY>(row, static_cast<uint32_t>(at));
+    }
+};
+
+// Any weight type, known at run time: the inject rows, which are few.
+struct AresQ4Any {
+    static __device__ __forceinline__ bool is_float(uint32_t ty) {
+        return ty == ARES_Q4_F32 || ty == ARES_Q4_F16 || ty == ARES_Q4_BF16;
+    }
+    static __device__ __forceinline__ const uint8_t* row(const uint8_t* m, size_t r, size_t row_values,
+                                                         uint32_t ty) {
+        return is_float(ty) ? AresQ4Float::row(m, r, row_values, ty) : m + r * ares_weight_row_bytes(ty, row_values);
+    }
+    static __device__ __forceinline__ float4 load4(const uint8_t* row, size_t at, uint32_t ty) {
+        return is_float(ty) ? AresQ4Float::load4(row, at, ty) : ares_weight4_any(row, ty, static_cast<uint32_t>(at));
+    }
+};
+
 static __device__ __forceinline__ float ares_q4_dot4(float4 a, float4 b) {
     return (a.x * b.x + a.y * b.y) + (a.z * b.z + a.w * b.w);
 }
@@ -119,12 +166,16 @@ static __device__ __forceinline__ bool ares_q4_wait(const uint32_t* flag, uint32
 //   ares_q4_read_up adds them.
 //
 // `downp` is followed by `injp` (at rows * hc * rank values). `shape` holds
-// the type of `down` in its lowest byte, the type of `inject` in the next,
-// then hc, then tiles; the grid's height is the number of rows.
-ARES_KERNEL ares_q4_read_down(const float* r_src, float* r_dst, const float* block_out, const float* peer_out,
-                              const uint32_t* peer_flags, uint32_t token, const float* inj, const float* norm,
-                              float* xn, const uint8_t* down, const uint8_t* inject, float* downp,
-                              uint32_t shape, uint32_t n, uint32_t rank, float eps) {
+// the type of `down` in its lowest byte, the type of `inject` in the next (ggml
+// type ids), then hc, then tiles; the grid's height is the number of rows. `W`
+// reads `down`.
+template <class W>
+static __device__ __forceinline__ void ares_q4_read_down_t(const float* r_src, float* r_dst, const float* block_out,
+                                                           const float* peer_out, const uint32_t* peer_flags,
+                                                           uint32_t token, const float* inj, const float* norm,
+                                                           float* xn, const uint8_t* down, const uint8_t* inject,
+                                                           float* downp, uint32_t shape, uint32_t n, uint32_t rank,
+                                                           float eps) {
     const uint32_t rows = gridDim.y;
     const uint32_t hc = (shape >> 16) & 0xffu;
     const uint32_t tiles = shape >> 24;
@@ -219,41 +270,35 @@ ARES_KERNEL ares_q4_read_down(const float* r_src, float* r_dst, const float* blo
     const size_t row_values = static_cast<size_t>(hc) * n;
     const size_t first = static_cast<size_t>(c) * n;
     float acc[ARES_Q4_TILE + ARES_Q4_MAX_STREAMS];
-    {
-        const uint32_t bytes = ares_q4_value_bytes(down_ty);
 #pragma unroll
-        for (int j = 0; j < ARES_Q4_TILE; j++) {
-            float a = 0.0f;
-            if (static_cast<uint32_t>(j) < nj) {
-                const uint8_t* w = down + ((j0 + j) * row_values + first) * bytes;
+    for (int j = 0; j < ARES_Q4_TILE; j++) {
+        float a = 0.0f;
+        if (static_cast<uint32_t>(j) < nj) {
+            const uint8_t* w = W::row(down, j0 + j, row_values, down_ty);
 #pragma unroll
-                for (int k = 0; k < ARES_Q4_RESIDENT; k++) {
-                    const uint32_t i = threadIdx.x + k * blockDim.x;
-                    if (i < chunks) {
-                        a += ares_q4_dot4(ares_q4_load4(w + static_cast<size_t>(i) * 4 * bytes, down_ty), v[k]);
-                    }
+            for (int k = 0; k < ARES_Q4_RESIDENT; k++) {
+                const uint32_t i = threadIdx.x + k * blockDim.x;
+                if (i < chunks) {
+                    a += ares_q4_dot4(W::load4(w, first + static_cast<size_t>(i) * 4, down_ty), v[k]);
                 }
             }
-            acc[j] = a;
         }
+        acc[j] = a;
     }
-    {
-        const uint32_t bytes = ares_q4_value_bytes(inject_ty);
 #pragma unroll
-        for (int j = 0; j < ARES_Q4_MAX_STREAMS; j++) {
-            float a = 0.0f;
-            if (static_cast<uint32_t>(j) < nk) {
-                const uint8_t* w = inject + (j * row_values + first) * bytes;
+    for (int j = 0; j < ARES_Q4_MAX_STREAMS; j++) {
+        float a = 0.0f;
+        if (static_cast<uint32_t>(j) < nk) {
+            const uint8_t* w = AresQ4Any::row(inject, j, row_values, inject_ty);
 #pragma unroll
-                for (int k = 0; k < ARES_Q4_RESIDENT; k++) {
-                    const uint32_t i = threadIdx.x + k * blockDim.x;
-                    if (i < chunks) {
-                        a += ares_q4_dot4(ares_q4_load4(w + static_cast<size_t>(i) * 4 * bytes, inject_ty), v[k]);
-                    }
+            for (int k = 0; k < ARES_Q4_RESIDENT; k++) {
+                const uint32_t i = threadIdx.x + k * blockDim.x;
+                if (i < chunks) {
+                    a += ares_q4_dot4(AresQ4Any::load4(w, first + static_cast<size_t>(i) * 4, inject_ty), v[k]);
                 }
             }
-            acc[ARES_Q4_TILE + j] = a;
         }
+        acc[ARES_Q4_TILE + j] = a;
     }
     const uint32_t lane = threadIdx.x & 31;
     const uint32_t warp = threadIdx.x >> 5;
@@ -297,9 +342,12 @@ ARES_KERNEL ares_q4_read_down(const float* r_src, float* r_dst, const float* blo
 //   peer_act   the same activations once more, in the peer's memory, with
 //              flag `row * (n / 32) + g` of `peer_flags` set to `token` behind
 //              them; null for none
-ARES_KERNEL ares_q4_read_up(const float* xn, const float* downp, const uint8_t* up, int8_t* act, float* inj,
-                            int8_t* peer_act, uint32_t* peer_flags, uint32_t token, uint32_t up_ty, uint32_t hc,
-                            uint32_t n, uint32_t rank, uint32_t tpr) {
+// `W` reads `up`, of type `up_ty`.
+template <class W>
+static __device__ __forceinline__ void ares_q4_read_up_t(const float* xn, const float* downp, const uint8_t* up,
+                                                         int8_t* act, float* inj, int8_t* peer_act,
+                                                         uint32_t* peer_flags, uint32_t token, uint32_t up_ty,
+                                                         uint32_t hc, uint32_t n, uint32_t rank, uint32_t tpr) {
     const uint32_t rows = gridDim.y;
     const float* injp = downp + static_cast<size_t>(rows) * hc * rank;
     __shared__ float lo[ARES_Q4_MAX_RANK];
@@ -329,13 +377,12 @@ ARES_KERNEL ares_q4_read_up(const float* xn, const float* downp, const uint8_t* 
     const uint32_t i = u & 31;
     const uint32_t c = u >> 5;
     const uint32_t value = group * 32 + i;
-    const uint32_t bytes = ares_q4_value_bytes(up_ty);
     const uint32_t span = rank / tpr;
-    const uint8_t* w = up + ((static_cast<size_t>(c) * n + value) * rank + part * span) * bytes;
+    const uint8_t* w = W::row(up, static_cast<size_t>(c) * n + value, rank, up_ty);
     const float* l = lo + part * span;
     float g = 0.0f;
     for (uint32_t k = 0; k < span; k += 4) {
-        const float4 d = ares_q4_load4(w + k * bytes, up_ty);
+        const float4 d = W::load4(w, part * span + k, up_ty);
         g += (d.x * l[k] + d.y * l[k + 1]) + (d.z * l[k + 2] + d.w * l[k + 3]);
     }
     for (uint32_t offset = tpr >> 1; offset > 0; offset >>= 1) {
@@ -393,6 +440,24 @@ ARES_KERNEL ares_q4_read_up(const float* xn, const float* downp, const uint8_t* 
         }
     }
 }
+
+// The two launches of a read for one reader of `down` and `up`: `SUFFIX` names them
+// (`ares_q4_read_down##SUFFIX`, `ares_q4_read_up##SUFFIX`).
+#define ARES_Q4_READS(SUFFIX, W)                                                                              \
+    ARES_KERNEL ares_q4_read_down##SUFFIX(                                                                    \
+        const float* r_src, float* r_dst, const float* block_out, const float* peer_out,                     \
+        const uint32_t* peer_flags, uint32_t token, const float* inj, const float* norm, float* xn,           \
+        const uint8_t* down, const uint8_t* inject, float* downp, uint32_t shape, uint32_t n, uint32_t rank,  \
+        float eps) {                                                                                          \
+        ares_q4_read_down_t<W>(r_src, r_dst, block_out, peer_out, peer_flags, token, inj, norm, xn, down,     \
+                               inject, downp, shape, n, rank, eps);                                           \
+    }                                                                                                         \
+    ARES_KERNEL ares_q4_read_up##SUFFIX(const float* xn, const float* downp, const uint8_t* up, int8_t* act,  \
+                                        float* inj, int8_t* peer_act, uint32_t* peer_flags, uint32_t token,   \
+                                        uint32_t up_ty, uint32_t hc, uint32_t n, uint32_t rank,               \
+                                        uint32_t tpr) {                                                       \
+        ares_q4_read_up_t<W>(xn, downp, up, act, inj, peer_act, peer_flags, token, up_ty, hc, n, rank, tpr);  \
+    }
 
 // The worker's side of an exchange, either half or both. One block per row,
 // `n / 4 <= ARES_Q4_RESIDENT * blockDim.x`.

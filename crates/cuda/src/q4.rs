@@ -19,7 +19,7 @@
 //! ```text
 //! stream_norm        R -> xn                    (or stream_write_norm: the write of the block
 //!                                                before and this norm in one pass)
-//! product down       xn -> down                 BF16: the weight kernels read f32 activations
+//! product down       xn -> down                 Kernels::matvec_exact: f32 activations
 //! squash             down -> lo
 //! product up         lo -> gate
 //! product inject     xn -> inj
@@ -28,13 +28,15 @@
 //! stream_write       R += out * 2 sigmoid(inj / hc)
 //! ```
 //!
-//! The three projections of a mixer are float matrices in the file, and the
-//! float weight kernels read only the f32 section of an activation buffer, so
-//! `stream_norm` and `squash` write plain f32: point them at that section
-//! ([`quantized_activation_bytes`](crate::quantized_activation_bytes) minus four
-//! bytes per value from the start) and no quantization runs in front of those
-//! products. For more rows than the decode kernels take, the prefill
-//! activations are prepared from the same f32 values.
+//! The three projections of a mixer multiply unquantized values, whatever type the
+//! file stores them in (float matrices in most files, Q8_0 in some):
+//! [`Kernels::matvec_exact`](crate::Kernels::matvec_exact) reads only the f32 section
+//! of an activation buffer, so `stream_norm` and `squash` write plain f32: point them
+//! at that section ([`quantized_activation_bytes`](crate::quantized_activation_bytes)
+//! minus four bytes per value from the start) and no quantization runs in front of
+//! those products. For more rows than the decode kernels take, the prefill
+//! activations are prepared from the same f32 values. The fused read
+//! ([`Q4Kernels::read_down`], [`Q4Kernels::read_up`]) takes every weight type too.
 //!
 //! # The hashed n-gram embedding: what the host supplies
 //!
@@ -79,6 +81,7 @@
 //! addresses it is given.
 
 use ares_core::GgmlType;
+use ares_core::ggml_type::ALL_TYPES;
 
 use crate::attention::{AttnItem, AttnRow, ENTRY_CELLS};
 use crate::device::Device;
@@ -89,6 +92,9 @@ use crate::module::{Args, Function, Module};
 use crate::stream::Stream;
 
 static IMAGE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/q4.fatbin"));
+
+/// The fused read of the stream mixer for the quantized types (`kernels/q4_reads.cu`).
+static READS_IMAGE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/q4_reads.fatbin"));
 
 // The kernels read these two types of the attention module by offset.
 const _: () = {
@@ -353,8 +359,9 @@ pub struct Q4Kernels {
     ngram_gate: Function,
     ngram_window: Function,
     ngram_commit: Function,
-    read_down: Function,
-    read_up: Function,
+    /// The two launches of the fused read per type of the matrix they read: the float
+    /// types share one pair, which takes the type as an argument.
+    reads: Vec<(GgmlType, Function, Function)>,
     swap: Function,
     route_split: Function,
     route_recv: Function,
@@ -386,8 +393,7 @@ impl Q4Kernels {
             ngram_gate: module.function("ares_q4_ngram_gate")?,
             ngram_window: module.function("ares_q4_ngram_window")?,
             ngram_commit: module.function("ares_q4_ngram_commit")?,
-            read_down: module.function("ares_q4_read_down")?,
-            read_up: module.function("ares_q4_read_up")?,
+            reads: Self::load_reads(&module, &Module::load(device, READS_IMAGE)?)?,
             swap: module.function("ares_q4_swap")?,
             route_split: module.function("ares_q4_route_split")?,
             route_recv: module.function("ares_q4_route_recv")?,
@@ -397,6 +403,41 @@ impl Q4Kernels {
     /// The device the kernels are loaded on.
     pub fn device(&self) -> &Device {
         &self.device
+    }
+
+    /// The pairs of the fused read for every weight type: those of the float types and the
+    /// one that decodes by the type at run time from `module`, those of [`INLINED_READS`]
+    /// from `typed`, by the names `kernels/q4_reads.cu` gives them.
+    fn load_reads(module: &Module, typed: &Module) -> Result<Vec<(GgmlType, Function, Function)>> {
+        let pair = |m: &Module, suffix: &str| -> Result<(Function, Function)> {
+            Ok((
+                m.function(&format!("ares_q4_read_down{suffix}"))?,
+                m.function(&format!("ares_q4_read_up{suffix}"))?,
+            ))
+        };
+        let float = pair(module, "")?;
+        let any = pair(module, "_any")?;
+        ALL_TYPES
+            .into_iter()
+            .filter(|ty| ty.is_weight())
+            .map(|ty| {
+                let (down, up) = if is_float(ty) {
+                    float.clone()
+                } else if INLINED_READS.contains(&ty) {
+                    pair(typed, &format!("_{}", ty.name()))?
+                } else {
+                    any.clone()
+                };
+                Ok((ty, down, up))
+            })
+            .collect()
+    }
+
+    /// The pair of the fused read for a matrix of `ty`.
+    fn reads_of(&self, ty: GgmlType) -> Result<&(GgmlType, Function, Function)> {
+        self.reads.iter().find(|(t, ..)| *t == ty).ok_or_else(|| {
+            invalid("read", format!("a mixer matrix of {ty}, which holds no weights"))
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1087,26 +1128,32 @@ impl Q4Kernels {
     }
 }
 
-/// A matrix of a stream mixer on the device: `F32`, `F16` or `BF16`, the
-/// types that multiply unquantized values.
+/// A matrix of a stream mixer on the device, of any weight type: the kernels multiply
+/// unquantized values with its weights as ggml decodes them.
 #[derive(Clone, Copy, Debug)]
 pub struct MixerMatrix {
-    /// Where the matrix is, rows contiguous.
+    /// Where the matrix is, rows contiguous, as the file stores them.
     pub ptr: DevicePtr,
     /// Its type.
     pub ty: GgmlType,
 }
 
+fn is_float(ty: GgmlType) -> bool {
+    matches!(ty, GgmlType::F32 | GgmlType::F16 | GgmlType::BF16)
+}
+
 impl MixerMatrix {
-    /// The number the fused kernels know the type by (`ARES_Q4_F32` and so
-    /// on), or `None` for a type they do not read.
-    fn code(&self) -> Option<u32> {
-        match self.ty {
-            GgmlType::F32 => Some(0),
-            GgmlType::F16 => Some(1),
-            GgmlType::BF16 => Some(2),
-            _ => None,
+    /// Checks that the matrix's type holds weights and that rows of `values` values are
+    /// whole blocks of it, and gives the type's ggml id, which the kernels know it by.
+    fn code(&self, values: u32) -> Result<u32> {
+        let ty = self.ty;
+        if !ty.is_weight() || !values.is_multiple_of(ty.block_values()) {
+            return Err(invalid(
+                "read",
+                format!("a mixer matrix of {ty} in rows of {values} values (whole blocks)"),
+            ));
         }
+        Ok(ty.id())
     }
 }
 
@@ -1148,6 +1195,21 @@ pub struct Departure {
     pub token: u32,
 }
 
+/// The quantized types whose fused read has its decoder inlined (`kernels/q4_reads.cu`):
+/// those files use for the stream mixers. Every other type is read by the kernels that
+/// decode by the type at run time.
+const INLINED_READS: [GgmlType; 9] = [
+    GgmlType::Q8_0,
+    GgmlType::Q4_0,
+    GgmlType::Q4_1,
+    GgmlType::Q5_0,
+    GgmlType::Q5_1,
+    GgmlType::IQ4_NL,
+    GgmlType::Q4_K,
+    GgmlType::Q5_K,
+    GgmlType::Q6_K,
+];
+
 /// The most rows of `down` one block of the read's first launch computes
 /// (`ARES_Q4_TILE`).
 const READ_TILE: u32 = 32;
@@ -1172,14 +1234,15 @@ impl Q4Kernels {
     /// Whether [`Q4Kernels::read_down`] and [`Q4Kernels::read_up`] can run a
     /// mixer of these sizes and types; otherwise a read takes the separate
     /// kernels.
+    /// Every weight type is read: `down` and `inject` in rows of `hc * n` values, `up`
+    /// in rows of `rank`, as the file stores them.
     pub fn reads_fused(hc: u32, n: u32, rank: u32, matrices: &[GgmlType]) -> bool {
-        let float = |ty: &GgmlType| matches!(ty, GgmlType::F32 | GgmlType::F16 | GgmlType::BF16);
         (1..=READ_MAX_STREAMS).contains(&hc)
             && row_block("mixer", n).is_ok()
             && rank > 0
             && rank <= READ_MAX_RANK
             && rank.is_multiple_of(4)
-            && matrices.iter().all(float)
+            && matrices.iter().all(|ty| ty.is_weight())
     }
 
     /// The f32 values of the scratch between the two launches of a fused
@@ -1239,11 +1302,12 @@ impl Q4Kernels {
         };
         let (peer_out, peer_flags, token) =
             peer.map_or((null, null, 0), |p| (p.data, p.flags, p.token));
+        let mut function = &self.reads_of(GgmlType::F32)?.1;
         let (weights, xn, down, inject, types, tiles) = match norm {
             Some((weights, xn, down, inject)) => {
-                let bad = || invalid("read", "a mixer matrix that is not F32, F16 or BF16".into());
-                let down_ty = down.code().ok_or_else(bad)?;
-                let inject_ty = inject.map(|m| m.code().ok_or_else(bad)).transpose()?;
+                let down_ty = down.code(hc * n)?;
+                let inject_ty = inject.map(|m| m.code(hc * n)).transpose()?;
+                function = &self.reads_of(down.ty)?.1;
                 if rank == 0 || rank > READ_MAX_RANK {
                     return Err(invalid("read", format!("a mixer of rank {rank}")));
                 }
@@ -1282,8 +1346,9 @@ impl Q4Kernels {
             .u32(n)
             .u32(rank)
             .f32(eps);
-        // SAFETY: the argument list matches ares_q4_read_down; the ranges are the caller's guarantee.
-        unsafe { self.read_down.launch(stream, [hc * tiles, rows, 1], [threads, 1, 1], 0, args) }
+        // SAFETY: the argument list matches the ares_q4_read_down kernels (one per type of
+        // `down`); the ranges are the caller's guarantee.
+        unsafe { function.launch(stream, [hc * tiles, rows, 1], [threads, 1, 1], 0, args) }
     }
 
     /// The second launch of a fused read: `lo = silu(down / hc)`, `gate = up
@@ -1316,9 +1381,7 @@ impl Q4Kernels {
         n: u32,
         rank: u32,
     ) -> Result<()> {
-        let up_ty = up
-            .code()
-            .ok_or_else(|| invalid("read", "a mixer matrix that is not F32, F16 or BF16".into()))?;
+        let up_ty = up.code(rank)?;
         if !Self::reads_fused(hc, n, rank, &[]) || rows == 0 {
             return Err(invalid("read", format!("{rows} rows, {hc} streams of {n}, rank {rank}")));
         }
@@ -1348,8 +1411,10 @@ impl Q4Kernels {
             .u32(n)
             .u32(rank)
             .u32(tpr);
-        // SAFETY: the argument list matches ares_q4_read_up.
-        unsafe { self.read_up.launch(stream, [n / 32, rows, 1], [32 * hc * tpr, 1, 1], 0, args) }
+        let function = &self.reads_of(up.ty)?.2;
+        // SAFETY: the argument list matches the ares_q4_read_up kernels (one per type of
+        // `up`).
+        unsafe { function.launch(stream, [n / 32, rows, 1], [32 * hc * tpr, 1, 1], 0, args) }
     }
 
     /// The worker's side of an exchange between two devices, either half or

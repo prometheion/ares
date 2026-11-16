@@ -18,9 +18,11 @@ use ares_core::GgmlType;
 use ares_cuda::{
     AttendBuffers, AttentionKernels, AttnItem, AttnRow, AttnShape, CacheFormat, CacheGeometry,
     CommitSet, Device, DeviceBuffer, IndexerShape, Kernels, KeyFormat, LayerKernels, ListHandOver,
-    NgramShape, Plan, Q4Kernels, RopeParams, Segment, SelectionRule, StepRecord, Stream, Wait,
-    device_count, quantized_activation_bytes,
+    MixerMatrix, NgramShape, Plan, Q4Kernels, RopeParams, Segment, SelectionRule, StepRecord,
+    Stream, Wait, device_count, quantized_activation_bytes,
 };
+
+mod blocks;
 
 fn gpus() -> Option<&'static [Device]> {
     static DEVICES: OnceLock<Option<Vec<Device>>> = OnceLock::new();
@@ -326,6 +328,160 @@ fn the_stream_mixer_matches_its_formulas() {
         for (name, value) in ["norm", "write", "write+norm", "squash", "mix"].iter().zip(worst) {
             report(&format!("stream mixer {name} rel_max"), value);
             assert!(value < 2e-6, "{name}: {value}");
+        }
+    }
+}
+
+/// The f64 reference of a fused read of `rows` rows (no write in front): the mixed input
+/// `m` (`rows * n`) and the inject values (`rows * hc`), from the residual `r`, the norm
+/// weights and the decoded matrices (`down`: `rank` rows of `hc * n`, `inject`: `hc` rows of
+/// `hc * n`, `up`: `hc * n` rows of `rank`).
+#[allow(clippy::too_many_arguments)]
+fn read_reference(
+    r: &[f32],
+    norm: &[f32],
+    down: &[f32],
+    inject: &[f32],
+    up: &[f32],
+    (rows, hc, n, rank): (usize, usize, usize, usize),
+) -> (Vec<f64>, Vec<f64>) {
+    let d = hc * n;
+    let (mut m, mut inj) = (Vec::with_capacity(rows * n), Vec::with_capacity(rows * hc));
+    for t in 0..rows {
+        let xn: Vec<f64> = (0..hc)
+            .flat_map(|c| rms_norm(&r[t * d + c * n..][..n], &norm[c * n..][..n], EPS))
+            .collect();
+        let dot =
+            |row: &[f32]| -> f64 { row.iter().zip(&xn).map(|(w, x)| f64::from(*w) * x).sum() };
+        let lo: Vec<f64> = (0..rank).map(|j| silu(dot(&down[j * d..][..d]) / hc as f64)).collect();
+        inj.extend((0..hc).map(|k| dot(&inject[k * d..][..d])));
+        for i in 0..n {
+            let mut sum = 0.0;
+            for c in 0..hc {
+                let row = &up[(c * n + i) * rank..][..rank];
+                let gate: f64 = row.iter().zip(&lo).map(|(w, l)| f64::from(*w) * l).sum();
+                sum += xn[c * n + i] * sigmoid(gate);
+            }
+            m.push(sum / hc as f64);
+        }
+    }
+    (m, inj)
+}
+
+/// The fused read of the stream mixer (`read_down`, `read_up`) with its three matrices in
+/// every weight type: the mixed input and the inject values are those of the f64 formulas
+/// over the decoded weights, and a quantized type gives the bits of its decoded copy in F32,
+/// except for the last bit of a weight of a type with an offset (`d * q + m`, which the device
+/// may fuse). The shapes are the model's (four streams of 2560, rank 320) where a row of `up`
+/// is whole blocks of the type, else rank 256 over streams of 512; one row and five.
+#[test]
+fn the_fused_read_takes_every_weight_type() {
+    let Some(gpus) = gpus() else { return };
+    let offset_types =
+        [GgmlType::Q4_1, GgmlType::Q5_1, GgmlType::Q2_K, GgmlType::Q4_K, GgmlType::Q5_K];
+    for device in gpus {
+        let gpu = Gpu::new(device);
+        let mut rng = Rng(0x3a91_c4f7_0b2e_6d15);
+        eprintln!("  {}", gpu.name());
+        for (ty, _) in blocks::TYPES {
+            let bv = ty.block_values() as usize;
+            let (hc, n, rank) = if 320 % bv == 0 { (4, 2560, 320) } else { (4, 512, 256) };
+            let d = hc * n;
+            let (mut worst, mut differ) = (0f64, 0usize);
+            for rows in [1usize, 5] {
+                let mut next = || rng.next();
+                let down = blocks::random_blocks(&mut next, ty, rank * d / bv);
+                let inject = blocks::random_blocks(&mut next, ty, hc * d / bv);
+                let up = blocks::random_blocks(&mut next, ty, d * rank / bv);
+                let decode = |bytes: &[u8], values: usize| -> Vec<f32> {
+                    let mut out = vec![0f32; values];
+                    ares_quant::dequantize(ty, bytes, &mut out).unwrap();
+                    out
+                };
+                let (down_w, inject_w, up_w) =
+                    (decode(&down, rank * d), decode(&inject, hc * d), decode(&up, d * rank));
+                let r = rng.floats(rows * d, 3.0);
+                let norm = rng.floats(d, 1.5);
+                let (r_b, norm_b) = (gpu.floats(&r), gpu.floats(&norm));
+                let act_bytes = quantized_activation_bytes((rows * n) as u64);
+                let run = |ty: GgmlType, down: &[u8], inject: &[u8], up: &[u8]| {
+                    let (down_b, inject_b, up_b) =
+                        (gpu.bytes(down), gpu.bytes(inject), gpu.bytes(up));
+                    let xn = gpu.empty((rows * d * 4) as u64);
+                    let partials = gpu
+                        .empty(Q4Kernels::read_partials(rows as u32, hc as u32, rank as u32) * 4);
+                    let act = gpu.empty(act_bytes);
+                    let inj = gpu.empty((rows * hc * 4) as u64);
+                    let matrix = |b: &DeviceBuffer| MixerMatrix { ptr: b.ptr(), ty };
+                    unsafe {
+                        gpu.q4
+                            .read_down(
+                                &gpu.stream,
+                                r_b.ptr(),
+                                r_b.ptr(),
+                                None,
+                                Some((
+                                    norm_b.ptr(),
+                                    xn.ptr(),
+                                    matrix(&down_b),
+                                    Some(matrix(&inject_b)),
+                                )),
+                                partials.ptr(),
+                                rows as u32,
+                                hc as u32,
+                                n as u32,
+                                rank as u32,
+                                EPS,
+                            )
+                            .unwrap();
+                        gpu.q4
+                            .read_up(
+                                &gpu.stream,
+                                xn.ptr(),
+                                partials.ptr(),
+                                matrix(&up_b),
+                                act.ptr(),
+                                Some(inj.ptr()),
+                                None,
+                                rows as u32,
+                                hc as u32,
+                                n as u32,
+                                rank as u32,
+                            )
+                            .unwrap();
+                    }
+                    let m = gpu.read_at(&act, act_bytes - (rows * n * 4) as u64, rows * n);
+                    (m, gpu.read(&inj, rows * hc))
+                };
+                let (m, inj) = run(ty, &down, &inject, &up);
+                let (want_m, want_inj) =
+                    read_reference(&r, &norm, &down_w, &inject_w, &up_w, (rows, hc, n, rank));
+                worst = worst.max(rel_max(&m, &want_m)).max(rel_max(&inj, &want_inj));
+                if ty != GgmlType::F32 {
+                    let f32_bytes =
+                        |w: &[f32]| -> Vec<u8> { w.iter().flat_map(|v| v.to_le_bytes()).collect() };
+                    let (cm, cinj) = run(
+                        GgmlType::F32,
+                        &f32_bytes(&down_w),
+                        &f32_bytes(&inject_w),
+                        &f32_bytes(&up_w),
+                    );
+                    differ += m
+                        .iter()
+                        .chain(&inj)
+                        .zip(cm.iter().chain(&cinj))
+                        .filter(|(a, b)| a.to_bits() != b.to_bits())
+                        .count();
+                }
+            }
+            report(&format!("fused read {ty} rel_max ({differ} values differ from F32)"), worst);
+            assert!(worst < 1e-5, "{ty}: {worst}");
+            if !offset_types.contains(&ty) {
+                assert_eq!(
+                    differ, 0,
+                    "{ty}: the read differs from that of the decoded copy in F32"
+                );
+            }
         }
     }
 }
