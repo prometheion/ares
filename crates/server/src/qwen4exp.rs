@@ -10,13 +10,16 @@
 //! layers go (a range per device, or both devices on every layer), how much
 //! context costs slots, and how much of the RAM limit the tier takes.
 
+use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use ares_api::{Engine, Event, EventSink, GenerateRequest, Prompt, RequestId, Sampling};
 use ares_core::units::Bytes;
 use ares_gguf::Gguf;
-use ares_model::qwen4exp::device::{Options, Qwen4Exp, SessionOptions, Spread, place, step_rows};
+use ares_model::qwen4exp::device::{
+    Options, ProfileFound, ProfileReport, Qwen4Exp, SessionOptions, Spread, place, step_rows,
+};
 use ares_model::qwen4exp::{Config, DraftWeights};
 use ares_runtime::{GpuConfig, Runtime, RuntimeConfig, required_ram};
 use ares_tokenizer::{ChatOptions, Tokenizer};
@@ -344,6 +347,10 @@ pub(crate) fn load(
     let mut model = Qwen4Exp::new(gguf, tokenizer, name.clone(), &devices, opts, longest)
         .map_err(|e| LoadError::Model(e.to_string()))?
         .with_chat_options(chat);
+    if let Some(dir) = profile_dir(options) {
+        model =
+            model.with_usage_profile(&dir, std::sync::Arc::new(|line| tracing::warn!("{line}")));
+    }
     let drafting = drafter.is_some();
     if let Some((path, file)) = drafter {
         model = model
@@ -429,7 +436,7 @@ pub(crate) fn load(
             }
         );
     }
-    warm_up(&runtime, &name)?;
+    fill_tiers(&runtime, &model, &name)?;
 
     // What it took.
     for (h, report) in held.iter().zip(model.reports()) {
@@ -483,12 +490,77 @@ pub(crate) fn load(
     Ok(Loaded::new(runtime, name, held, ram))
 }
 
+/// Where the usage profiles of the experts are kept: in the directory of the
+/// prompt cache when `--cache` names one (a file of its own next to the
+/// stores, which take only directories), otherwise in the user's cache
+/// directory (`$XDG_CACHE_HOME/ares`, `~/.cache/ares`). `None` when the user
+/// has neither.
+fn profile_dir(options: &LoadOptions) -> Option<PathBuf> {
+    if let Some(dir) = &options.cache {
+        return Some(dir.clone());
+    }
+    let xdg = std::env::var_os("XDG_CACHE_HOME").map(PathBuf::from).filter(|p| p.is_absolute());
+    let base = xdg.or_else(|| {
+        std::env::var_os("HOME")
+            .filter(|home| !home.is_empty())
+            .map(|home| PathBuf::from(home).join(".cache"))
+    })?;
+    Some(base.join("ares"))
+}
+
+/// Fills the tiers of experts before the first request: from the usage profile
+/// when there is one for this model file ([`Qwen4Exp::serving`]); otherwise
+/// the model reads [`WARM_UP`], and the profile is written at once from what
+/// that used. One line in the log says which.
+fn fill_tiers(runtime: &Runtime, model: &Qwen4Exp, name: &str) -> Result<(), LoadError> {
+    let Some(ProfileReport { path, found, filled }) = model.serving() else {
+        let took = warm_up(runtime, name)?;
+        tracing::info!(
+            "warm-up: read a text of German, English and code to fill the tiers of experts, \
+             {took:.1} s (no directory for a usage profile of the experts)"
+        );
+        return Ok(());
+    };
+    let path = path.display();
+    if let (ProfileFound::Found { known }, Some((stats, time))) = (&found, filled)
+        && stats.vram + stats.ram > 0
+    {
+        tracing::info!(
+            "expert profile {path}: found ({known} experts with heat); the tiers were filled \
+             from it in {:.1} s, {} experts into VRAM and {} into the RAM tier, {} read; no \
+             warm-up",
+            time.as_secs_f64(),
+            stats.vram,
+            stats.ram,
+            Bytes(stats.read_bytes),
+        );
+        return Ok(());
+    }
+    let why = match &found {
+        ProfileFound::None => "none for this model file".to_owned(),
+        ProfileFound::Ignored(why) => format!("ignored: {why}"),
+        ProfileFound::Found { .. } => "found, and it brought nothing into the tiers".to_owned(),
+    };
+    let took = warm_up(runtime, name)?;
+    let written = match model.save_profile() {
+        Some(Ok(_)) => "written now".to_owned(),
+        Some(Err(error)) => format!("not written: {error}"),
+        None => "not written: the warm-up ran no step".to_owned(),
+    };
+    tracing::info!(
+        "expert profile {path}: {why}; the warm-up read a text of German, English and code to \
+         fill the tiers, {took:.1} s; the profile is {written}"
+    );
+    Ok(())
+}
+
 /// Reads [`WARM_UP`] and writes a few tokens after it, so that the tiers of
 /// experts hold what a text of German, English and code needs before the first
 /// request comes: the slots start empty, and the first text a model reads
 /// otherwise waits for the drive at nearly every layer (a minute for a prompt
 /// of a thousand tokens, against ten seconds once the slots are filled).
-fn warm_up(runtime: &Runtime, model: &str) -> Result<(), LoadError> {
+/// Returns the seconds it took.
+fn warm_up(runtime: &Runtime, model: &str) -> Result<f64, LoadError> {
     let begun = Instant::now();
     let (done, wait) = mpsc::channel();
     let sink = EventSink::new(move |event| {
@@ -517,11 +589,7 @@ fn warm_up(runtime: &Runtime, model: &str) -> Result<(), LoadError> {
     wait.recv_timeout(WARM_UP_LIMIT)
         .map_err(|_| LoadError::Start("the warm-up did not end in time".into()))?
         .map_err(|e| LoadError::Start(format!("warm-up: {e}")))?;
-    tracing::info!(
-        "warm-up: read a text of German, English and code to fill the tiers of experts, {:.1} s",
-        begun.elapsed().as_secs_f64()
-    );
-    Ok(())
+    Ok(begun.elapsed().as_secs_f64())
 }
 
 /// How often the log says what the draft block did, while it does something.

@@ -130,6 +130,9 @@ fn the_tier_of_flash_next_follows_the_memory_of_a_smaller_machine() {
         options.devices = Some(devices.split(',').map(|d| d.parse().expect("a device")).collect());
     }
     options.ram = env_u64("ARES_TEST_RAM");
+    // The usage profile of the experts stays with the tests (for this model
+    // the directory of the prompt cache holds nothing else).
+    options.cache = Some(PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("elastic-profile"));
     let before_load = (real(), resident());
     let loaded = load::load(&options).expect("the model loads");
     let engine = loaded.engine();

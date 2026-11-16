@@ -81,8 +81,11 @@ OPTIONS:
                                restart. Texts of 2048 tokens and more are written,
                                as they are computed; a store fits one model file
                                with its formats and split, and the directory may
-                               be shared by all models [default: none, and nothing
-                               is written]
+                               be shared by all models. A mixture of experts keeps
+                               the usage profile of its experts there, which fills
+                               its tiers at the next start [default: none, and
+                               nothing is written; the profiles are then kept in
+                               ~/.cache/ares]
         --cache-size <SIZE>    The most that directory may take, such as 64G; what
                                was used least recently goes first [default: 32G]
 

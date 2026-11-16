@@ -52,6 +52,12 @@ fn port(offset: u16) -> u16 {
     base + offset
 }
 
+/// The user's cache directory as the servers of the tests see it: one of the
+/// build's, shared by the tests of one build directory.
+fn test_cache_home() -> PathBuf {
+    PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("cache-home")
+}
+
 /// A running server process. Killed when dropped, so that a failing test
 /// leaves nothing on the device.
 struct Server {
@@ -203,6 +209,9 @@ impl Server {
             .args(base)
             .args(flags)
             .env_remove("RUST_LOG")
+            // What the servers keep in the user's cache directory (the usage
+            // profiles of the experts) stays with the tests.
+            .env("XDG_CACHE_HOME", test_cache_home())
             .stdin(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()
@@ -1506,6 +1515,95 @@ fn flash_next_answers_on_one_card() {
     assert!(disk > 0, "one card does not hold the model: experts came from the file");
     assert!(client.metric("steps_total") > 100);
     server.stop();
+}
+
+/// Flash-Next keeps a usage profile of its experts in the `--cache` directory:
+/// the first start has none, reads the warm-up text and writes the profile;
+/// the next start fills the tiers from it instead of the warm-up and answers
+/// as the reference does; a damaged profile is ignored and written anew.
+#[test]
+fn flash_next_starts_from_the_usage_profile_of_its_experts() {
+    let Some(model) = flash_model() else { return };
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("flash-profile");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let devices = std::env::var("ARES_TEST_DEVICES").unwrap_or_else(|_| "0,1".to_owned());
+    let ram = flash_ram();
+    let start = || {
+        let flags = [
+            "--devices",
+            devices.as_str(),
+            "--ram",
+            ram.as_str(),
+            "--chat-var",
+            "enable_thinking=false",
+            "--cache",
+            dir.to_str().expect("a path in UTF-8"),
+        ];
+        let begun = Instant::now();
+        let mut server = Server::start_with(&model, port(4), &flags, &[], SLOW);
+        let line = server
+            .logged()
+            .iter()
+            .find(|line| line.contains("expert profile"))
+            .cloned()
+            .unwrap_or_else(|| panic!("a line about the profile: {:#?}", server.logged()));
+        eprintln!("RES profile: listening after {:.1} s; {line}", begun.elapsed().as_secs_f64());
+        (server, line)
+    };
+    let profile = || -> Vec<PathBuf> {
+        std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|e| e == "experts"))
+            .collect()
+    };
+    let hash_table = |server: &Server| {
+        let body = server.chat(HASH_TABLE, json!({"max_tokens": 80, "temperature": 0}));
+        let reply = server.post("/v1/chat/completions", &body);
+        let text = answer(&reply);
+        eprintln!("RES profile: {text:?}; timings {}", reply.json()["timings"]);
+        assert!(
+            text.starts_with(
+                "A hash table stores data by mapping keys to specific indices in an array using \
+                 a hash function."
+            ),
+            "the reference's first sentence: {text:?}"
+        );
+    };
+
+    // No profile: the warm-up fills the tiers, and the profile is written.
+    let (server, line) = start();
+    assert!(line.contains("none for this model file") && line.contains("written now"), "{line}");
+    let written = profile();
+    assert_eq!(written.len(), 1, "one profile, in the directory of --cache");
+    let first = std::fs::read(&written[0]).unwrap();
+    hash_table(&server);
+    // A clean stop writes what the requests used.
+    server.stop();
+    let stopped = std::fs::read(&written[0]).unwrap();
+    assert_eq!(stopped.len(), first.len());
+    assert_ne!(stopped, first, "the profile has the heat of the request now");
+
+    // The profile fills the tiers, and nothing is warmed up.
+    let (server, line) = start();
+    assert!(line.contains("found") && line.contains("no warm-up"), "{line}");
+    hash_table(&server);
+    let (picks, hits) = (server.metric("expert_picks_total"), server.metric("expert_hits_total"));
+    eprintln!("RES profile: {picks} picks, {hits} in a slot");
+    server.stop();
+
+    // A damaged profile is ignored with a line that says so, and written anew.
+    let mut damaged = std::fs::read(&written[0]).unwrap();
+    let middle = damaged.len() / 2;
+    damaged[middle] ^= 0x5a;
+    std::fs::write(&written[0], &damaged).unwrap();
+    let (server, line) = start();
+    assert!(line.contains("ignored: it is damaged") && line.contains("written now"), "{line}");
+    hash_table(&server);
+    server.stop();
+    assert_ne!(std::fs::read(&written[0]).unwrap(), damaged);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// The text of the first choice of an answer, and the ids of its tokens with
