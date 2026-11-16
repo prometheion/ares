@@ -739,7 +739,12 @@ fn flash_next_rows_read_what_kvhead_reads_for_every_pair_of_formats() {
                     rig.step(&mut [(&mut seq, t, false)]);
                 }
                 rig.flush(&seq);
-                rig.check(&seq, true, &label);
+                // The stored bytes where the formats have two forms (`f16` and
+                // `q8` write every row into its page; their attention is checked
+                // below as every other pair's).
+                if policy.has_mean() {
+                    rig.check(&seq, true, &label);
+                }
                 let len = seq.cells.len() as u32;
                 let alone = rig.attention_error_of(
                     &seq,
