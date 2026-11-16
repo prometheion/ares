@@ -93,6 +93,10 @@ pub struct TensorPlan {
     /// assigned from a recorded routing ([`Placement::assign`]); otherwise
     /// an expert's owner follows from `expert_share` alone.
     pub owners: Option<Vec<Vec<u8>>>,
+    /// The choices the placement was made from (measured at load unless they
+    /// were given): another placement of the same choices on the same devices
+    /// lays the state out the same way.
+    pub choice: TensorChoice,
 }
 
 /// The choices of a placement in which two devices work on every layer.
@@ -359,7 +363,13 @@ impl Placement {
         }
         Ok(Self {
             devices: plans,
-            tensor: Some(TensorPlan { mixer: choice.mixer, shares, expert_share, owners: None }),
+            tensor: Some(TensorPlan {
+                mixer: choice.mixer,
+                shares,
+                expert_share,
+                owners: None,
+                choice: *choice,
+            }),
         })
     }
 

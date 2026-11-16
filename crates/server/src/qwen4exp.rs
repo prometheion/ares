@@ -18,8 +18,8 @@ use ares_api::{Engine, Event, EventSink, GenerateRequest, Prompt, RequestId, Sam
 use ares_core::units::Bytes;
 use ares_gguf::Gguf;
 use ares_model::qwen4exp::device::{
-    Options, ProfileFound, ProfileReport, PruneSetup, Qwen4Exp, SessionOptions, Spread, place,
-    profile_key, step_rows,
+    Options, ProfileFound, ProfileReport, PruneSetup, Qwen4Exp, SessionOptions, Spread,
+    TensorChoice, place, profile_key, step_rows,
 };
 use ares_model::qwen4exp::{Config, DraftWeights};
 use ares_runtime::expert_store::ExpertNeighbours;
@@ -219,6 +219,24 @@ pub(crate) fn load(
     };
     describe_links(&held)?;
     let devices: Vec<_> = held.iter().map(|h| h.device.clone()).collect();
+    // How two devices share every layer is measured at load, and the state of
+    // a sequence is laid out by it: the prompt cache on SSD keeps state that
+    // another load reads only with the same split. With `--cache` the split
+    // measured once for this model on these devices is kept next to the
+    // stores and taken again; every placement of one load takes one split.
+    let remembered = options.cache.as_ref().and_then(|dir| {
+        let remembered = Split::read(dir, &options.model, &devices)?;
+        tracing::info!(
+            "plan: the split of the two devices is the one measured before for the prompt \
+             cache's state on SSD ({})",
+            remembered.file.display()
+        );
+        Some(remembered)
+    });
+    let mut spread = match (spread, &remembered) {
+        (Spread::Auto | Spread::Tensor { .. }, Some(split)) => split.spread(),
+        (spread, _) => spread,
+    };
 
     // The model's settings that do not depend on the context.
     let model_context = config.n_ctx as u32;
@@ -230,7 +248,7 @@ pub(crate) fn load(
     )
     .map_err(|e| LoadError::Model(e.to_string()))?;
     tracing::info!("steps of up to {max_rows} rows");
-    let session = |context: u32, pages: u32| SessionOptions {
+    let session = |context: u32, pages: u32, spread: Spread| SessionOptions {
         part: Options {
             kv,
             max_rows,
@@ -265,9 +283,10 @@ pub(crate) fn load(
             let (placement, page_bytes) = place(
                 &Gguf::open(&options.model)?,
                 &devices,
-                &session(trial, plan::pool_pages(trial, parallel)),
+                &session(trial, plan::pool_pages(trial, parallel), spread),
             )
             .map_err(|e| named_split(e.to_string()))?;
+            spread = pinned(spread, &placement);
             let slots: Vec<u64> = placement.devices.iter().map(|d| d.slots).collect();
             let fit = plan::pages_beside_experts(&slots, &page_bytes);
             let context = plan::default_context(fit, parallel, model_context);
@@ -287,9 +306,14 @@ pub(crate) fn load(
         }
     };
     let longest = context.min(model_context);
-    let opts = session(longest, pages);
-    let (placement, page_bytes) = place(&Gguf::open(&options.model)?, &devices, &opts)
-        .map_err(|e| named_split(e.to_string()))?;
+    let (placement, page_bytes) =
+        place(&Gguf::open(&options.model)?, &devices, &session(longest, pages, spread))
+            .map_err(|e| named_split(e.to_string()))?;
+    let spread = pinned(spread, &placement);
+    let opts = session(longest, pages, spread);
+    if let (Some(dir), None, Some(tensor)) = (&options.cache, &remembered, &placement.tensor) {
+        Split::write(dir, &options.model, &devices, &tensor.choice);
+    }
 
     tracing::info!(
         "plan: {} ({why_split})",
@@ -641,6 +665,96 @@ fn expert_prune(
         asked.from_rank
     );
     Ok(Some(PruneSetup { prune, near }))
+}
+
+/// The spread that places the model again as `placement` does: its split of
+/// two devices that share every layer, measured or given.
+fn pinned(spread: Spread, placement: &ares_model::qwen4exp::device::Placement) -> Spread {
+    match &placement.tensor {
+        Some(tensor) => Spread::Tensor {
+            mixer: Some(tensor.choice.mixer),
+            core_share: Some(tensor.choice.core_share),
+            shared_on_mixer: Some(tensor.choice.shared_on_mixer),
+        },
+        None => spread,
+    }
+}
+
+/// The split of two devices that share every layer as a load measured it,
+/// kept in a file next to the prompt cache's stores, by model file and for
+/// the devices it was measured on.
+struct Split {
+    choice: TensorChoice,
+    file: PathBuf,
+}
+
+impl Split {
+    fn file(dir: &std::path::Path, model: &std::path::Path) -> PathBuf {
+        let stem = model.file_stem().map_or_else(|| "model".into(), |s| s.to_string_lossy());
+        dir.join(format!("{stem}.split"))
+    }
+
+    fn devices(devices: &[ares_cuda::Device]) -> String {
+        join(devices.iter().map(|d| d.info().name.clone()), ", ")
+    }
+
+    /// The split kept for `model` on `devices`, if there is one for them.
+    fn read(
+        dir: &std::path::Path,
+        model: &std::path::Path,
+        devices: &[ares_cuda::Device],
+    ) -> Option<Self> {
+        let file = Self::file(dir, model);
+        let text = std::fs::read_to_string(&file).ok()?;
+        let value = |key: &str| {
+            text.lines().find_map(|line| line.strip_prefix(key)?.strip_prefix(' ').map(str::trim))
+        };
+        if devices.len() != 2 || value("devices")? != Self::devices(devices) {
+            return None;
+        }
+        let choice = TensorChoice {
+            mixer: value("mixer")?.parse().ok()?,
+            core_share: value("core_share")?.parse().ok()?,
+            shared_on_mixer: value("shared_on_mixer")?.parse().ok()?,
+        };
+        (choice.mixer < 2 && (0.0..=1.0).contains(&choice.core_share))
+            .then_some(Self { choice, file })
+    }
+
+    /// Keeps `choice` for `model` on `devices`; a file that cannot be written
+    /// costs the next load the measurement, which the log says.
+    fn write(
+        dir: &std::path::Path,
+        model: &std::path::Path,
+        devices: &[ares_cuda::Device],
+        choice: &TensorChoice,
+    ) {
+        let file = Self::file(dir, model);
+        let text = format!(
+            "devices {}\nmixer {}\ncore_share {}\nshared_on_mixer {}\n",
+            Self::devices(devices),
+            choice.mixer,
+            choice.core_share,
+            choice.shared_on_mixer
+        );
+        if let Err(error) = std::fs::create_dir_all(dir).and_then(|()| std::fs::write(&file, text))
+        {
+            tracing::warn!(
+                "the split of the two devices could not be kept in {} ({error}): the next load \
+                 measures its own, and the prompt cache's state on SSD of this one is not read \
+                 there unless the measurement is the same",
+                file.display()
+            );
+        }
+    }
+
+    fn spread(&self) -> Spread {
+        Spread::Tensor {
+            mixer: Some(self.choice.mixer),
+            core_share: Some(self.choice.core_share),
+            shared_on_mixer: Some(self.choice.shared_on_mixer),
+        }
+    }
 }
 
 /// Where the usage profiles of the experts are kept: in the directory of the
