@@ -1489,10 +1489,12 @@ fn flash_next_drafts_with_its_draft_block() {
     };
     let block = block.to_str().expect("a path in UTF-8").to_owned();
     let devices = std::env::var("ARES_TEST_DEVICES").unwrap_or_else(|_| "0,1".to_owned());
+    let ram = flash_ram();
+    let chat = "enable_thinking=false";
     let mut server = Server::start_with(
         &model,
         port(3),
-        &["--devices", &devices, "--chat-var", "enable_thinking=false", "--drafters", &block],
+        &["--devices", &devices, "--ram", &ram, "--chat-var", chat, "--drafters", &block],
         &[],
         SLOW,
     );

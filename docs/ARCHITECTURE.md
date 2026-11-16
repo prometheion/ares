@@ -5031,7 +5031,14 @@ look by look. The users:
   a step runs: the thread that ends the step unlocks what the step's end gave
   up, where every device has ended the step, and the watch's thread does it
   for an engine that runs nothing, with the store held so that no step
-  begins meanwhile. When the allowance rises, a piece is locked at the end
+  begins meanwhile. A piece that was given up keeps its lock until then and
+  is not locked again before (`HostRegion::is_releasing`): the driver
+  refuses a lock of a range that a lock still covers
+  (`CUDA_ERROR_HOST_MEMORY_ALREADY_REGISTERED`). The end of a step that gave
+  up a small piece and then a larger one of another pool did that once,
+  when the small one fit in what the larger one left below the allowance
+  (Flash-Next's pools have slots of three sizes, and the last piece of a
+  pool is smaller). When the allowance rises, a piece is locked at the end
   of every step (that step ends 30 to 70 ms later), or by the watch for 40
   ms at a time while nothing runs, and its slots come back empty; they fill
   from what the routers pick, and from the heat while nothing runs (see "The

@@ -413,3 +413,70 @@ fn a_model_that_needs_both_cards_takes_the_place_of_an_idle_one() {
         assert!(after.abs_diff(before) < SLACK, "everything is back: {after} against {before}");
     }
 }
+
+/// Flash-Next in router mode: loaded, unloaded and loaded again in one
+/// process, then made to give way to the 27B (both need both cards) and
+/// loaded once more. Every load locks the tier of experts in a new range of
+/// addresses, often where the last one was: a lock that outlived its model
+/// would make the next load fail (`cuMemHostRegister`). Needs
+/// `ARES_TEST_QWEN4EXP_MODEL` (the first part of Flash-Next),
+/// `ARES_TEST_QWEN35_27B` and two devices; `ARES_TEST_FLASH_RAM` is the limit
+/// of Flash-Next's RAM (default `8G`).
+#[test]
+fn flash_next_is_loaded_again_after_an_unload_and_after_the_27b() {
+    let Some(flash) = file("ARES_TEST_QWEN4EXP_MODEL", "the first part of Flash-Next") else {
+        return;
+    };
+    let Some(large) = file("ARES_TEST_QWEN35_27B", "a qwen35 file that needs two devices") else {
+        return;
+    };
+    if ares_cuda::devices().map_or(0, |devices| devices.len()) < 2 {
+        eprintln!("skipped: needs two devices");
+        return;
+    }
+    let ram = std::env::var("ARES_TEST_FLASH_RAM").unwrap_or_else(|_| "8G".to_owned());
+    let ini = scratch("router-flash").join("models.ini");
+    let text = format!(
+        "[*]\ndevices = 0,1\ncontext = 8192\n\n[flash]\nmodel = {}\nram = {ram}\n\n\
+         [both-cards]\nmodel = {}\n",
+        flash.display(),
+        large.display()
+    );
+    std::fs::write(&ini, text).unwrap();
+    let mut server = Server::start(&ini, port(2));
+    let resident_before = server.resident();
+    let answer = |server: &Server, model: &str| {
+        let reply = server.complete(model);
+        assert_eq!(reply.status, 200, "{model}: {}", reply.body);
+        assert_eq!(server.state(model), "loaded");
+    };
+
+    answer(&server, "flash");
+    let resident_loaded = server.resident();
+    let reply = server.request("POST", "/models/unload", r#"{"model": "flash"}"#);
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    server.until("flash", "unloaded");
+    let resident_unloaded = server.resident();
+    eprintln!(
+        "RES resident: {} MiB before, {} with Flash-Next, {} after its unload",
+        resident_before >> 20,
+        resident_loaded >> 20,
+        resident_unloaded >> 20
+    );
+    assert!(resident_unloaded < resident_loaded, "the unload gave the tier back");
+    answer(&server, "flash");
+
+    // The 27B does not fit next to it: Flash-Next makes way, and comes back.
+    answer(&server, "both-cards");
+    assert_eq!(server.state("flash"), "unloaded");
+    answer(&server, "flash");
+    assert_eq!(server.state("both-cards"), "unloaded");
+
+    let log = server.stop();
+    print_times("router Flash-Next", &log);
+    let text = log.join("\n");
+    assert!(!text.contains("cuMemHostRegister"), "no lock of the tier failed: {text}");
+    assert!(!text.contains("did not come back"), "{text}");
+    let loads = log.iter().filter(|line| line.contains("threads joined, devices released"));
+    assert!(loads.count() >= 4, "every load was unloaded: {log:#?}");
+}
