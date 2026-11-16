@@ -234,15 +234,14 @@ Everything `FEATURES.md` lists for the 27B and not for Flash-Next is owed:
         `f32`. Held to the exact reference per image (see "The image tower" in
         `ARCHITECTURE.md`). Open: the row kernels between the products take about a third of
         the time outside the attention (fusing the residual with the norm after it, a bias in
-        the products' epilogue); the tower on Vulkan. **Question to the owner:** f16 sums
-        flushed every 64 values in the products other than `ffn_down` make an image 5 to 9 %
-        faster on both cards and up to twice as far from the exact rows (still within the
-        tolerance): take it?
+        the products' epilogue); the tower on Vulkan. Not taken: f16 sums flushed every 64
+        values in the products other than `ffn_down` (5 to 9 % faster, up to twice as far
+        from the exact rows; output must not get worse).
   - [x] 3. Both homes for the tower's weights (`qwen3vl::Home`, a load option): resident in
         VRAM, or in page-locked RAM and uploaded unit by unit into two slots of VRAM while the
         unit before computes (no VRAM held between images beyond the two slots, 58 MiB); the
-        same rows bit for bit. Open: the server's key (with piece 7; proposed name
-        `--mmproj-weights ram|vram`, `ram` by default) and adding `DeviceTower::pinned_bytes`
+        same rows bit for bit. Open: the server's key (with piece 7; the owner chose
+        `--mmproj-weights ram|vram`, `ram` by default, 2026-11-16) and adding `DeviceTower::pinned_bytes`
         to the `pinned_ram` of the model that carries the tower (with pieces 5 and 6).
   - [ ] 4. The tower as a job the conductor plans (between steps, on the device whose link and
         tensor cores are faster; its scratch reserved in the ledger at load). Cells and positions
@@ -250,11 +249,13 @@ Everything `FEATURES.md` lists for the 27B and not for Flash-Next is owed:
         store of image rows.
   - [ ] 5. The splice in `qwen35` (a row source in the embedding gather; positions in the draft chain's links).
   - [ ] 6. The splice in `qwen4exp` (host rows; the n-gram feed's image token).
-  - [ ] 7. Routes (`image_url`, Anthropic `image`, Responses `input_image`), limits, errors, `--mmproj`.
+  - [ ] 7. Routes (`image_url`, Anthropic `image`, Responses `input_image`), limits, errors, `--mmproj`,
+        `--mmproj-weights ram|vram` (`ram` by default; the owner, 2026-11-16).
         Embedded images only; fetching remote URLs is backlog. At most 4096 rows per image by
         default (as the fork), with a key to lower it.
   - [ ] 8. Caching: cells named by a digest of the resized pixels, 64-bit names through the index and the SSD level.
-- [ ] Audio, video and Gemma 4 are on the waiting list.
+- [ ] Audio, video and Gemma 4 are backlog: none of them blocks the first release (the owner,
+      2026-11-16).
 - [ ] Jev mode: `/v1/systemone` exists and answers 501; `Engine::decide` on the real runtime.
 - [ ] Turing.
 - [ ] K/V of a running sequence beyond VRAM (P16; an exception, low priority).
@@ -272,9 +273,3 @@ Everything `FEATURES.md` lists for the 27B and not for Flash-Next is owed:
 
 ## Questions to the owner
 - How long may a request wait behind a long prompt on Flash-Next?
-- Should the SSD cache be on by default with a default directory? (Today: only with `--cache`.)
-- Do audio, video and Gemma 4 block the first release?
-- The image tower with f16 sums in its products: 5 to 9 % faster, up to twice the error (see
-  piece 2 of image input)?
-- The image tower's server key: `--mmproj-weights ram|vram` (`ram` by default, as the preset's
-  `no-mmproj-offload`)?
