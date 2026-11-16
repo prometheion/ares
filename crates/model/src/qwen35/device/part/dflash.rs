@@ -129,10 +129,10 @@ impl Part {
             let embed = self.embed.as_ref().ok_or_else(|| {
                 invalid("the DFlash drafter needs the embedding table in host memory")
             })?;
-            let shape = embed.shape();
+            let shape = embed.table().shape();
             let decode = |token: u32| -> Vec<f32> {
                 let mut out = vec![0f32; shape.n_embd as usize];
-                if let Some(row) = embed.row(token) {
+                if let Some(row) = embed.table().row(token) {
                     // A row of whole blocks decodes; a token past the table is
                     // zeros, as the gather gives it.
                     let _ = ares_quant::dequantize(shape.ty, row, &mut out);

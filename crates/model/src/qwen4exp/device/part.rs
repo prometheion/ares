@@ -50,10 +50,10 @@ use ares_core::{GgmlType, Ledger};
 use ares_cuda::{
     Accumulate, ActivationForm, Arrival, AttentionKernels, AttentionShape, AttnItem, AttnRow,
     AttnShape, CacheFormat, CacheGeometry, CommitSet, Departure, Device, DeviceBuffer, DevicePtr,
-    ENTRY_CELLS, Event, ExpertKernels, ExpertRowKernels, IndexerShape, Kernels, KeyFormat,
-    LayerKernels, ListHandOver, MAX_BATCH, MixerMatrix, NgramShape, OutputGate, PinnedBuffer, Plan,
-    PlanConfig, Planner, Precision, Q4Kernels, ReadWrite, RecurrentShape, RopeParams, Segment,
-    SelectionRule, StateFormat, StepRecord, Stream, WeightLayout,
+    ENTRY_CELLS, Event, ExpertKernels, ExpertRowKernels, IndexerShape, KeptRows, Kernels,
+    KeyFormat, LayerKernels, ListHandOver, MAX_BATCH, MixerMatrix, NgramShape, OutputGate,
+    PinnedBuffer, Plan, PlanConfig, Planner, Precision, Q4Kernels, ReadWrite, RecurrentShape,
+    RopeParams, Segment, SelectionRule, StateFormat, StepRecord, Stream, WeightLayout,
 };
 use ares_runtime::ModelError;
 use ares_runtime::expert_store::cpu::act_bytes as cpu_act_bytes;
@@ -72,6 +72,7 @@ use super::load::{
 use super::prune::{PartPrune, PruneMask, PruneSetup};
 use crate::blocks::kv;
 use crate::blocks::recurrent::{self, Inputs, Recurrent};
+use crate::blocks::rows::{self, HostTable};
 use crate::blocks::slots::{Arena, SlotLayout, TAILS_PER_SLOT};
 use crate::qwen4exp::Config;
 use crate::qwen4exp::weights::Weights;
@@ -279,9 +280,9 @@ pub struct StepEnv<'a> {
     pub segments: &'a [Segment],
     /// A number that differs from step to step: it marks the route records.
     pub token: u32,
-    /// The token embeddings of the rows, `rows * n_embd` values: for the
-    /// part that holds the first layer.
-    pub x: &'a [f32],
+    /// The tokens of the rows: the part that holds the first layer stages
+    /// their rows of the embedding table.
+    pub tokens: &'a [u32],
     /// The stored bytes of the n-gram table rows of every row, in head
     /// order: for the layer with the n-gram block, when it is enqueued.
     pub ngram: Option<&'a [u8]>,
@@ -487,6 +488,10 @@ struct Scratch {
 struct Inbox {
     record: u64,
     record_cap: u64,
+    /// The rows of the step's tokens in the table's form, as the host staged
+    /// them (`blocks/rows.rs`), and the gather's output: their values, on the
+    /// device only.
+    rows: u64,
     x: u64,
     plan: u64,
     plan_cap: u64,
@@ -494,6 +499,8 @@ struct Inbox {
     ngram: u64,
     /// The record of the step before, with its accepted counts.
     commit: u64,
+    /// The bytes the host writes (everything but `x`), and all.
+    host_len: u64,
     len: u64,
 }
 
@@ -830,7 +837,6 @@ impl Frame {
         // per row, the output rows.
         inbox.record_cap = (64 + 32 * u64::from(opts.max_slots) + 28 * rows).next_multiple_of(64);
         inbox.record = take(inbox.record_cap);
-        inbox.x = take(rows * n * 4);
         // A plan: the planner's dense plans are a few dozen bytes per row and
         // item; a plan of device-made lists has `MAX_PIECES` items per row
         // and KV head and three words per range.
@@ -843,6 +849,11 @@ impl Frame {
         inbox.hands = take(att * rows * ListHandOver::BYTES as u64);
         inbox.ngram = take(gram * rows * ng.as_ref().map_or(0, NgramShape::fetched_row_bytes));
         inbox.commit = take(inbox.record_cap);
+        // The staged rows of a table of any type, at most four bytes a value,
+        // and the rows they decode to, which only the device writes.
+        inbox.rows = take(rows * n * 4);
+        inbox.x = take(rows * n * 4);
+        inbox.host_len = inbox.x;
         inbox.len = len;
 
         let geos = vec![geo; attention.iter().flatten().count()];
@@ -953,7 +964,7 @@ impl Frame {
         (self.record_stride + self.act_host_stride + self.addr_stage) * layers as u64
             + (u64::from(self.ahead_layers) * self.ahead_list_bytes + self.wide_ids_bytes)
                 * layers as u64
-            + self.inbox.len
+            + self.inbox.host_len
             + self.tables_bytes(opts)
             + self.exact_host
             + 16
@@ -1060,6 +1071,10 @@ pub struct Part {
     predict: Option<predict::State>,
     /// A DFlash drafter, on the part that holds the streams and the head.
     dflash: Option<crate::dflash::Drafter>,
+    /// The token embedding table on the host, for the part that embeds.
+    token_rows: Option<Arc<HostTable>>,
+    /// Rows of the next step that another source computed (`blocks/rows.rs`).
+    spliced: Vec<(u32, DevicePtr)>,
 }
 
 impl std::fmt::Debug for Part {
@@ -1309,7 +1324,7 @@ impl Part {
                 (f.ahead_layers as usize, f.ahead_list_bytes as usize, f.wide_ids_bytes as usize),
             )?),
             routed: stream_events(w.layers.len())?,
-            inbox_host: PinnedBuffer::new(device, f.inbox.len as usize)?,
+            inbox_host: PinnedBuffer::new(device, f.inbox.host_len as usize)?,
             inbox: DeviceBuffer::new(device, f.inbox.len)?,
             logits_host: PinnedBuffer::new(
                 device,
@@ -1334,6 +1349,8 @@ impl Part {
             prune: None,
             predict,
             dflash: None,
+            token_rows: None,
+            spliced: Vec::new(),
             w,
             f,
         })
@@ -1422,6 +1439,21 @@ impl Part {
         }
         self.expert_at = at;
         Ok(())
+    }
+
+    /// Gives the part that embeds the step's tokens the embedding table on
+    /// the host: it stages the rows of a step's tokens and gathers them on
+    /// the device (`blocks/rows.rs`).
+    pub(crate) fn set_token_rows(&mut self, table: Arc<HostTable>) {
+        self.token_rows = Some(table);
+    }
+
+    /// Rows of the next step whose values another source computed: row `r`
+    /// of the step takes the `n_embd` f32 at the address over its gathered
+    /// row (the image tower's rows at an image's positions). The addresses
+    /// stay valid until the step has run.
+    pub fn splice_rows(&mut self, rows: Vec<(u32, DevicePtr)>) {
+        self.spliced = rows;
     }
 
     /// Gives the routers of the part the mask of what the tiers hold, which
@@ -1940,18 +1972,29 @@ impl Part {
                 host.add(ib.record as usize),
                 record.len(),
             );
-            if self.first {
-                if env.x.len() != (n * self.n) as usize {
-                    return Err(invalid(format!("{} embedding values for {n} rows", env.x.len())));
-                }
-                std::ptr::copy_nonoverlapping(
-                    env.x.as_ptr().cast::<u8>(),
-                    host.add(ib.x as usize),
-                    env.x.len() * 4,
-                );
-            }
         }
-        let mut sent = if self.first { ib.x + u64::from(n * self.n) * 4 } else { ib.record_cap };
+        // The part that embeds stages the rows of the step's tokens from the
+        // table on the host (`blocks/rows.rs`) and gathers them on the device
+        // below.
+        let staged = match (&self.token_rows, self.first) {
+            (Some(table), true) => {
+                if env.tokens.len() != n as usize {
+                    return Err(invalid(format!("{} tokens for {n} rows", env.tokens.len())));
+                }
+                // SAFETY: the rows section of the pinned buffer ends where the
+                // device's own section begins; no copy reads it now.
+                let section = unsafe {
+                    std::slice::from_raw_parts_mut(
+                        host.add(ib.rows as usize),
+                        (ib.host_len - ib.rows) as usize,
+                    )
+                };
+                Some(table.stage(env.tokens, section)?)
+            }
+            (None, true) => return Err(invalid("the part that embeds has no token rows")),
+            _ => None,
+        };
+        let mut sent = ib.record_cap;
         if let Some(step_plan) = &plan {
             let layout = step_plan.plan.layout();
             if layout.bytes > ib.plan_cap {
@@ -1985,6 +2028,16 @@ impl Part {
         // most rows; the inbound residual is the caller's guarantee.
         unsafe {
             stream.copy_from_host(self.inbox.ptr(), self.inbox_host.as_ptr(), sent as usize)?;
+            if let (Some(bytes), Some(table)) = (staged, &self.token_rows) {
+                // The rows of the step, and their values where the write
+                // reads them; rows another source computed go over theirs.
+                let (at, x) = (self.inbox_at(ib.rows), self.inbox_at(ib.x));
+                let from = self.inbox_host.as_ptr().add(ib.rows as usize);
+                stream.copy_from_host(at, from, bytes)?;
+                let source = rows::source(&table.shape(), KeptRows::NONE, at);
+                self.layers.embed_gather(stream, self.inbox_at(ib.record), dims, &source, x)?;
+                rows::splice(stream, x, self.n, &std::mem::take(&mut self.spliced))?;
+            }
             if self.first {
                 // 3.1: the embedding in every stream. The write kernel adds
                 // `x * 2 sigmoid(0)`, which is `x`, to the zeroed streams.

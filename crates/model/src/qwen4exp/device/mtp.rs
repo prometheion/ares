@@ -66,7 +66,8 @@ use ares_sampler::{SamplePick, SampleRow};
 
 use super::board::Board;
 use super::part::{ExpertAt, Options, Part, StepEnv};
-use super::runtime::{Embedding, Flow};
+use super::runtime::Flow;
+use crate::blocks::rows::HostTable;
 use crate::blocks::slots::{Extent, PageArray, PageGroup};
 use crate::qwen4exp::Config;
 use crate::qwen4exp::device::load::Mat;
@@ -188,7 +189,7 @@ impl Watch {
 
 pub(super) struct MtpBlock {
     part: Part,
-    embedding: Embedding,
+    embedding: Arc<HostTable>,
     sampler: SamplerKernels,
     /// Keys, values and indexer keys of the block's cells, for every page.
     pools: DeviceBuffer,
@@ -255,7 +256,7 @@ impl MtpBlock {
         opts: &Options,
         index: usize,
         output: (Mat, DevicePtr),
-        embedding: Embedding,
+        embedding: Arc<HostTable>,
         watch: Arc<std::sync::Mutex<Watch>>,
         device: &Device,
         ledger: &mut Ledger,
@@ -816,7 +817,7 @@ impl MtpBlock {
             record: &record,
             segments: &segments,
             token: self.serial,
-            x: &[],
+            tokens: &[],
             ngram: None,
             inbound: Some(input),
             xbase: 0,

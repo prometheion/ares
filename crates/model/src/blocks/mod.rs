@@ -25,6 +25,7 @@
 pub(crate) mod forms;
 pub(crate) mod kv;
 pub(crate) mod recurrent;
+pub(crate) mod rows;
 pub(crate) mod slots;
 
 use ares_runtime::ModelError;

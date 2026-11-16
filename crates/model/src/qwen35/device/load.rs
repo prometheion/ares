@@ -35,8 +35,8 @@ use ares_cuda::{
 use ares_runtime::ModelError;
 
 use super::choose::{Balance, Chooser, LayoutReport, Layouts, Prep, Shape, Usage};
-use super::embed::TableShape;
 use super::placement::{BlockSlice, DevicePlan, DraftPlan};
+use crate::blocks::rows::TableShape;
 use crate::qwen35::Config;
 use crate::qwen35::weights::{Matrix, Mixer, Weights};
 
@@ -469,6 +469,11 @@ impl<'g> Layout<'g, '_> {
     }
 }
 
+/// The shape of the token embedding table `m`.
+pub(super) fn table_shape(m: &Matrix<'_>) -> TableShape {
+    TableShape { ty: m.ty(), n_vocab: m.rows() as u32, n_embd: m.cols() as u32 }
+}
+
 /// One range as a list of ranges.
 fn one(range: Range<usize>) -> Vec<Range<usize>> {
     std::iter::once(range).collect()
@@ -833,7 +838,7 @@ fn tables<'g>(
         }
         (None, _) => None,
     };
-    let embedding = plan.embedding.then(|| EmbedW { table: TableShape::of(&w.token_embd), kept });
+    let embedding = plan.embedding.then(|| EmbedW { table: table_shape(&w.token_embd), kept });
     let mut blocks = Vec::new();
     for (layer, slice) in plan.blocks.iter().enumerate() {
         let Some(slice) = slice else { continue };

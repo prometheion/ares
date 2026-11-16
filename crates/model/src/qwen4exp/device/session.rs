@@ -45,6 +45,7 @@ use super::part::{Options, Part, PartSetup, StepEnv};
 use super::placement::{DeviceMemory, PartPlan, Placement, TensorChoice, ram_tier_bytes};
 use super::prune::{self, PruneMask, PruneStats};
 use super::usage;
+use crate::blocks::rows::{HostTable, TOKEN_EMBD};
 use crate::qwen4exp::Config;
 use crate::qwen4exp::weights::Weights;
 
@@ -282,7 +283,7 @@ pub struct PartReport {
 struct Step<'a> {
     record: &'a StepRecord,
     segments: &'a [Segment],
-    x: &'a [f32],
+    tokens: &'a [u32],
     token: u32,
     xbase: u32,
 }
@@ -296,7 +297,7 @@ macro_rules! step_env {
             record: $step.record,
             segments: $step.segments,
             token: $step.token,
-            x: $step.x,
+            tokens: $step.tokens,
             ngram: $fetched.as_deref(),
             inbound: $inbound,
             xbase: $step.xbase,
@@ -502,7 +503,8 @@ pub(super) fn choose(
 /// A model on its devices, stepped by hand.
 pub struct Session<'g> {
     c: Config,
-    w: &'g Weights<'g>,
+    /// The weights the session was opened from, which it does not outlive.
+    _weights: &'g Weights<'g>,
     opts: SessionOptions,
     placement: Placement,
     devices: Vec<Device>,
@@ -565,15 +567,21 @@ impl<'g> Session<'g> {
             .zip(&memory)
             .map(|(device, m)| Ledger::new(format!("CUDA{}", device.ordinal()), m.budget))
             .collect();
+        // The embedding table where the file is mapped: the part that embeds
+        // stages a step's rows from it.
+        let mapped = Gguf::open(gguf.path(0)).map_err(|e| invalid(e.to_string()))?;
+        let table = Arc::new(HostTable::mapped(Arc::new(mapped), TOKEN_EMBD)?);
         let mut parts = Vec::with_capacity(devices.len());
         for (index, device) in devices.iter().enumerate() {
             let PartPlan { role, first, shares, head } = placement.part(c, index);
-            parts.push(Part::open(
+            let mut part = Part::open(
                 c,
                 w,
                 &opts.part,
                 PartSetup { index, role, first, shares, head, device, ledger: &mut ledgers[index] },
-            )?);
+            )?;
+            part.set_token_rows(table.clone());
+            parts.push(part);
         }
         if let Some(tensor) = &placement.tensor {
             // Each part learns where the other receives, the mixer which
@@ -722,7 +730,7 @@ impl<'g> Session<'g> {
         let n_parts = parts.len();
         Ok(Self {
             c: c.clone(),
-            w,
+            _weights: w,
             streams: devices.iter().map(|d| Stream::new(d, 0)).collect::<Result<_, _>>()?,
             done: events()?,
             probe_done: events()?,
@@ -993,8 +1001,8 @@ impl<'g> Session<'g> {
             return Err(invalid("the draft windows of the last step were not settled"));
         }
         let started = Instant::now();
-        let n = self.c.n_embd;
-        // The record, the embeddings, the rows of the n-gram table.
+        // The record and the rows of the n-gram table; the part that embeds
+        // stages the rows of the embedding table itself.
         let mut segments = Vec::with_capacity(rows.len());
         let mut tokens = Vec::new();
         let mut out_rows = Vec::new();
@@ -1029,10 +1037,6 @@ impl<'g> Session<'g> {
         }
         let record = StepRecord::new(&segments, &tokens, None, &out_rows)?;
         let dims = record.dims();
-        let mut x = vec![0.0f32; tokens.len() * n];
-        for (row, &token) in tokens.iter().enumerate() {
-            self.w.token_embd.decode_row(token as usize, &mut x[row * n..(row + 1) * n]);
-        }
         // The rows of the table: those asked for when the tokens were first
         // known, when these are the tokens; otherwise they are read now.
         let asked: Vec<(u32, &[u32])> = rows.iter().map(|p| (p.slot, p.tokens)).collect();
@@ -1050,7 +1054,7 @@ impl<'g> Session<'g> {
         let step = Step {
             record: &record,
             segments: &segments,
-            x: &x,
+            tokens: &tokens,
             token: self.step,
             xbase: self.step.wrapping_mul(per_step).wrapping_add(1),
         };

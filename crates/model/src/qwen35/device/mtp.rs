@@ -900,7 +900,7 @@ impl Part {
                     return Err(full());
                 }
                 for (i, token) in rows.enumerate() {
-                    if let Some(row) = host.row(token) {
+                    if let Some(row) = host.table().row(token) {
                         let at = newest_at as usize + i * size;
                         buf[at..at + size].copy_from_slice(row);
                     }

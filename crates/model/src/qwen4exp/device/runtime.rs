@@ -63,6 +63,7 @@ use super::prune::{self, PruneMask};
 use super::resume::Resume;
 use super::session::{Chosen, Fill, PartReport, SessionOptions, choose};
 use super::usage::{Log, ProfileReport, Usage, UsageStats};
+use crate::blocks::rows::{HostTable, TOKEN_EMBD};
 use crate::blocks::slots::{self, Declared, TAILS_PER_SLOT};
 use crate::chat;
 use crate::qwen4exp::reference::mtp_config;
@@ -513,41 +514,6 @@ impl Flow {
 /// every row of the step is worth in milliseconds (the record's row worth).
 type StepWindows<'a> = (&'a [(u32, u32)], Option<&'a [f32]>);
 
-// --- the embedding table on the host ----------------------------------------
-
-/// The token embeddings, decoded on the host: the first part of the model
-/// starts the residual streams from them.
-#[derive(Clone)]
-pub(super) struct Embedding {
-    gguf: Arc<Gguf>,
-    tensor: usize,
-    ty: ares_core::GgmlType,
-    rows: usize,
-}
-
-impl Embedding {
-    pub(super) fn new(gguf: &Arc<Gguf>, w: &Weights<'_>) -> Result<Self, ModelError> {
-        let name = "token_embd.weight";
-        let tensor = gguf
-            .tensors()
-            .iter()
-            .position(|t| t.name == name)
-            .ok_or_else(|| invalid(format!("the model has no tensor {name}")))?;
-        Ok(Self { gguf: gguf.clone(), tensor, ty: w.token_embd.ty(), rows: w.token_embd.rows() })
-    }
-
-    /// Decodes the embedding of `token` into `out`.
-    pub(super) fn decode(&self, token: u32, out: &mut [f32]) -> Result<(), ModelError> {
-        let data = self.gguf.data(&self.gguf.tensors()[self.tensor]);
-        let size = data.len() / self.rows;
-        let row = data
-            .get(token as usize * size..(token as usize + 1) * size)
-            .ok_or_else(|| invalid(format!("token {token} of {} embeddings", self.rows)))?;
-        ares_quant::dequantize(self.ty, row, out)
-            .map_err(|e| invalid(format!("the embedding of token {token}: {e}")))
-    }
-}
-
 // --- the model --------------------------------------------------------------
 
 /// The rows of a step to open the model with on `devices`: as many as the scratch of a step
@@ -656,6 +622,8 @@ pub struct Qwen4Exp {
     mtp_watch: Arc<Mutex<Watch>>,
     /// The usage profile of the experts, for a model that keeps one.
     usage: Usage,
+    /// The token embedding table where the file is mapped (`blocks/rows.rs`).
+    rows: Arc<HostTable>,
 }
 
 impl std::fmt::Debug for Qwen4Exp {
@@ -738,8 +706,10 @@ impl Qwen4Exp {
             .map_or(0, |since| since.as_secs());
         let n = placement.n_devices();
         let format = chat::chat_format(&tokenizer, &ChatOptions::default());
+        let gguf = Arc::new(gguf);
+        let rows = Arc::new(HostTable::mapped(gguf.clone(), TOKEN_EMBD)?);
         Ok(Self {
-            gguf: Arc::new(gguf),
+            gguf,
             config,
             opts,
             placement,
@@ -775,6 +745,7 @@ impl Qwen4Exp {
             mtp_report: Mutex::new(None),
             mtp_watch: Arc::default(),
             usage: Usage::default(),
+            rows,
         })
     }
 
@@ -1066,7 +1037,7 @@ impl Qwen4Exp {
         let layout = &self.layout;
         // The MTP block, next to the part that holds the head: before the
         // room for slots is counted.
-        let embedding = Embedding::new(&self.gguf, &weights)?;
+        part.set_token_rows(self.rows.clone());
         let mut block = match (&self.mtp, part.output()) {
             (Some(draft), Some(output)) if index == self.head_device() => {
                 let head = MtpWeights::load(draft, c).map_err(|e| invalid(e.to_string()))?;
@@ -1076,7 +1047,7 @@ impl Qwen4Exp {
                     o,
                     index,
                     output,
-                    embedding.clone(),
+                    self.rows.clone(),
                     self.mtp_watch.clone(),
                     cx.device,
                     cx.ledger,
@@ -1091,7 +1062,7 @@ impl Qwen4Exp {
         let dflash_embedding = match &self.dflash {
             Some(file) if index == self.head_device() => {
                 let mut mask = vec![0f32; c.n_embd];
-                embedding.decode(file.config.mask_token, &mut mask)?;
+                self.rows.decode(file.config.mask_token, &mut mask)?;
                 part.open_dflash(
                     file,
                     cx.device,
@@ -1101,7 +1072,7 @@ impl Qwen4Exp {
                     c.n_vocab,
                     mask,
                 )?;
-                Some(embedding.clone())
+                Some(self.rows.clone())
             }
             _ => None,
         };
@@ -1379,7 +1350,6 @@ impl Qwen4Exp {
             reserved: cx.ledger.reserved(),
             upload: part.upload_time(),
         });
-        let first = part.layer_range().start == 0 && part.role() != super::Role::Worker;
         // The checkpoints of this device: what the model said it keeps of a
         // sequence here is what it copies.
         let feeds = part.ngram_layer().map_or(0, |_| ngram::saved_bytes(c.ngram.as_ref()));
@@ -1398,7 +1368,6 @@ impl Qwen4Exp {
             n_vocab: c.n_vocab as u32,
             wide: c.wide() as u32,
             per_step: 8 * (c.n_layer as u32 + 1),
-            embedding: first.then_some(embedding),
             mtp: block,
             drafts: self.mtp.is_some() || self.dflash.is_some(),
             mtp_id: self.mtp.as_ref().map(|_| 1),
@@ -1427,7 +1396,6 @@ impl Qwen4Exp {
             segments: Vec::new(),
             tokens: Vec::new(),
             out_rows: Vec::new(),
-            x: Vec::new(),
             accepted: Vec::new(),
             windows: Vec::new(),
             shape: Vec::new(),
@@ -1630,8 +1598,6 @@ struct Qwen4ExpDevice {
     wide: u32,
     /// Exchanges between a mixer and its worker per step.
     per_step: u32,
-    /// The embeddings, for the part that starts the residual streams.
-    embedding: Option<Embedding>,
     /// Whether this part keeps the sequences the n-gram table is read for.
     drives_ngram: bool,
     routing: Routing,
@@ -1641,7 +1607,6 @@ struct Qwen4ExpDevice {
     segments: Vec<Segment>,
     tokens: Vec<u32>,
     out_rows: Vec<u32>,
-    x: Vec<f32>,
     accepted: Vec<u32>,
     /// The draft windows of the step before, as (slot, first row), which the
     /// record of this step says the outcome of.
@@ -1658,7 +1623,7 @@ struct Qwen4ExpDevice {
     dflash_id: Option<u32>,
     /// The embedding rows, for the DFlash drafter's newest tokens, on the part
     /// that holds it.
-    dflash_embedding: Option<Embedding>,
+    dflash_embedding: Option<Arc<HostTable>>,
     /// The windows of the step whose drafts the DFlash drafter makes, and
     /// where the MTP block's chains have their drafts in the step's list.
     passes: Vec<crate::dflash::PassSeq>,
@@ -2010,22 +1975,15 @@ impl Qwen4ExpDevice {
         self.shape.clear();
         self.shape.extend(self.segments.iter().map(|s| (s.slot, s.direct, s.n_rows, s.row0)));
 
-        // The residual streams start from the embeddings.
-        let n = self.part.n_embd() as usize;
-        self.x.clear();
-        if let Some(embedding) = &self.embedding {
-            self.x.resize(rows as usize * n, 0.0);
-            for (token, out) in self.tokens.iter().zip(self.x.chunks_exact_mut(n)) {
-                embedding.decode(*token, out)?;
-            }
-        }
+        // The residual streams start from the embeddings, which the part that
+        // embeds stages and gathers itself (`blocks/rows.rs`).
         let mut host = StepRecord::new(&self.segments, &self.tokens, None, &self.out_rows)?;
         for (i, s) in self.segments.iter().enumerate() {
             if self.replay.iter().any(|r| r.contains(&s.row0)) {
                 host.mark_replay(i)?;
             }
         }
-        let (segments, x, replay) = (&self.segments, &self.x, &self.replay);
+        let (segments, tokens, replay) = (&self.segments, &self.tokens, &self.replay);
 
         // The step: every layer, with the host serving the store behind it.
         let (token, xbase) =
@@ -2042,7 +2000,7 @@ impl Qwen4ExpDevice {
                     record: &host,
                     segments,
                     token,
-                    x,
+                    tokens,
                     ngram: $fetched,
                     inbound: $inbound,
                     xbase,

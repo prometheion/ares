@@ -25,9 +25,11 @@ use ares_cuda::{PUSH_MAX_ROWS, PushSlot};
 use ares_runtime::{Logits, ModelError, PinnedRam, Split};
 
 use super::choose::{Balance, LayoutReport, Layouts, decode_in_batches, file_path};
-use super::embed::{EmbeddingReport, HostRows};
-use super::load::{AttentionW, BlockW, DeviceWeights, FfnW, LoadOptions, Mat, MixerW, RecurrentW};
+use super::load::{
+    AttentionW, BlockW, DeviceWeights, FfnW, LoadOptions, Mat, MixerW, RecurrentW, read_matrix,
+};
 use super::placement::Placement;
+use crate::blocks::rows::{self, EmbeddingReport, HostTable, Stage};
 use crate::qwen35::Config;
 use crate::qwen35::weights::Weights;
 
@@ -467,8 +469,10 @@ pub struct Part {
     attention: Option<AttentionKernels>,
     w: DeviceWeights,
     /// The embedding table in host memory, when this part embeds and the
-    /// host stages rows (`embed.rs`).
-    embed: Option<HostRows>,
+    /// host stages rows (`blocks/rows.rs`).
+    embed: Option<Stage>,
+    /// Rows of the next step that another source computed (`blocks/rows.rs`).
+    spliced: Vec<(u32, DevicePtr)>,
     // Model sizes.
     d: u32,
     eps: f32,
@@ -782,11 +786,14 @@ impl Part {
         let mut carve = Carve::default();
         let mut take = |bytes: u64| carve.take(bytes);
         let rope_pairs = (c.attention.rope.dim / 2) as u64;
-        // The rows of the embedding table the host staged (`embed.rs`). A part
-        // that stages none has no such buffer: nothing in front of the others.
+        // The rows of the embedding table the host staged (`blocks/rows.rs`).
+        // A part that stages none has no such buffer: nothing in front of the
+        // others.
         let embed = match &w.embedding {
             Some(e) if e.stages() => {
-                Some(HostRows::open(device, &weights.token_embd, opts.max_rows)?)
+                let m = &weights.token_embd;
+                let table = HostTable::pinned(device, e.table, |bytes| read_matrix(m, bytes))?;
+                Some(Stage::new(device, std::sync::Arc::new(table), opts.max_rows)?)
             }
             _ => None,
         };
@@ -928,6 +935,7 @@ impl Part {
             attention,
             w,
             embed,
+            spliced: Vec::new(),
             d: d as u32,
             eps: c.rms_eps,
             rope: RopeParams {
@@ -1956,12 +1964,9 @@ impl Part {
         if env.tokens.is_empty() {
             return Ok(());
         }
-        let (from, bytes) = host.stage(env.tokens)?;
         // SAFETY: the stage of the scratch holds a row of the table's form for
-        // every row of the largest step; `from` is the pinned stage, which is
-        // not written again before the next step.
-        unsafe { env.stream.copy_from_host(self.scratch.ptr().offset(self.s.stage), from, bytes) }?;
-        Ok(())
+        // every row of the largest step.
+        unsafe { host.upload(env.stream, self.scratch.ptr().offset(self.s.stage), env.tokens) }
     }
 
     /// Where the gather finds the rows of the embedding: the rows this part
@@ -1971,6 +1976,14 @@ impl Part {
         self.w.embed_rows(staged).ok_or_else(|| invalid("this part does not embed the tokens"))
     }
 
+    /// Rows of the next step whose values another source computed: row `r`
+    /// of the step takes the `d` f32 at the address over its gathered row
+    /// (the image tower's rows at an image's positions). The addresses stay
+    /// valid until the step has run.
+    pub fn splice_rows(&mut self, rows: Vec<(u32, DevicePtr)>) {
+        self.spliced = rows;
+    }
+
     /// What the embedding takes on this part and where it lies.
     pub fn embedding_report(&self) -> EmbeddingReport {
         let Some(e) = &self.w.embedding else { return EmbeddingReport::default() };
@@ -1978,7 +1991,7 @@ impl Part {
         EmbeddingReport {
             embeds: true,
             table_bytes: e.table.bytes(),
-            host_bytes: self.embed.as_ref().map_or(0, HostRows::locked),
+            host_bytes: self.embed.as_ref().map_or(0, |s| s.locked() + s.table().locked()),
             kept_rows: kept.map_or(0, |k| k.rows.n_out),
             kept_bytes: kept.filter(|k| !k.shared_with_head).map_or(0, |k| k.rows.bytes()),
             shared_with_head: kept.is_some_and(|k| k.shared_with_head),
@@ -1995,8 +2008,12 @@ impl Part {
         if self.w.embedding.is_some() {
             let source = self.embed_rows()?;
             // SAFETY: the kept rows are in the arena, the staged rows in the
-            // scratch, `x` holds the step's rows.
-            unsafe { self.layers.embed_gather(stream, env.step, dims, &source, x)? };
+            // scratch, `x` holds the step's rows; the spliced rows are the
+            // caller's.
+            unsafe {
+                self.layers.embed_gather(stream, env.step, dims, &source, x)?;
+                rows::splice(stream, x, self.d, &std::mem::take(&mut self.spliced))?;
+            }
             self.mark(stream, Phase::Layers)?;
         }
         if self.split == Split::Layer && self.index > 0 {

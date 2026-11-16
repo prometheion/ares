@@ -18,12 +18,13 @@ use ares_state::PageLayout;
 use ares_tokenizer::{ChatOptions, Tokenizer};
 
 use super::choose::{Balance, LayoutReport};
-use super::embed::{EmbeddingReport, HostRows, TableShape};
+use super::load::table_shape;
 use super::part::{
     Exchange, MTP_KV, MtpBytes, MtpChain, MtpStep, Options, PAGE_ENTRY, Part, PartSetup, StepEnv,
     TAILS_PER_SLOT, declared, page_bytes,
 };
 use super::placement::{HalfShares, Placement, PlacementError};
+use crate::blocks::rows::{EmbeddingReport, Stage};
 use crate::blocks::slots::{self, Declared};
 use crate::chat;
 use crate::dflash::PassSeq;
@@ -139,7 +140,7 @@ impl Qwen35 {
         let config = Config::from_gguf(&gguf)?;
         let (placement, table) = {
             let weights = Weights::load(&gguf, &config)?;
-            let table = TableShape::of(&weights.token_embd);
+            let table = table_shape(&weights.token_embd);
             let placement = match spread {
                 Spread::Single => Placement::single(&config),
                 Spread::Tensor(shares) => Placement::tensor(&config, shares)?,
@@ -175,7 +176,7 @@ impl Qwen35 {
         let balance = (placement.split == Split::Tensor && placement.n_devices() > 1)
             .then(|| Balance::new(placement.n_devices()));
         let pinned = if placement.stages_rows(&config) {
-            HostRows::locked_bytes(&table, options.max_rows)
+            table.bytes() + Stage::locked_bytes(&table, options.max_rows)
         } else {
             0
         };
