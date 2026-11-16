@@ -102,10 +102,27 @@ impl GuessQueue {
     /// guess that no slot can be taken for (every slot of its layer is
     /// loading or needed by the step) stays and is tried again.
     pub fn start(&mut self, sets: &mut [SlotSet], heat: &ExpertHeat, step: u64) -> Option<Started> {
+        self.start_where(sets, heat, step, &mut |_, _| true)
+    }
+
+    /// [`GuessQueue::start`] for the guesses `allowed(layer, expert)` lets start now; the
+    /// others wait as they are (a reader that keeps one kind of guess within a bound of its
+    /// own).
+    pub fn start_where(
+        &mut self,
+        sets: &mut [SlotSet],
+        heat: &ExpertHeat,
+        step: u64,
+        allowed: &mut dyn FnMut(usize, u32) -> bool,
+    ) -> Option<Started> {
         self.waiting.retain(|w| w.step >= step);
         let mut at = 0;
         while at < self.waiting.len() {
             let w = self.waiting[at];
+            if !allowed(w.layer, w.expert) {
+                at += 1;
+                continue;
+            }
             match sets[w.layer].start_read(w.expert, Want::Guess, step, heat.layer(w.layer)) {
                 Start::Slot(swap) => {
                     self.waiting.remove(at);
@@ -177,6 +194,22 @@ mod tests {
             order.push((started.layer, started.swap.load));
         }
         assert_eq!(order, [(0, 6), (0, 7), (1, 5), (1, 4)]);
+    }
+
+    #[test]
+    fn a_guess_that_is_not_allowed_now_waits_and_lets_the_next_start() {
+        let (mut sets, heat) = tiers(2);
+        let mut queue = GuessQueue::new();
+        queue.guess(&mut sets, 0, &[5, 6], 1);
+        queue.guess(&mut sets, 1, &[7], 1);
+        let started = queue.start_where(&mut sets, &heat, 1, &mut |layer, _| layer == 1).unwrap();
+        assert_eq!((started.layer, started.swap.load), (1, 7));
+        sets[1].commit(&started.swap);
+        assert!(queue.start_where(&mut sets, &heat, 1, &mut |layer, _| layer == 1).is_none());
+        assert_eq!(queue.len(), 2, "the guesses of layer 0 wait");
+        assert!(sets[0].contains(0) && sets[0].contains(1), "and have taken nothing");
+        let started = queue.start(&mut sets, &heat, 1).unwrap();
+        assert_eq!((started.layer, started.swap.load), (0, 5));
     }
 
     #[test]
