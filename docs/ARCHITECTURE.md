@@ -753,10 +753,17 @@ on the cards. What RAM holds and what goes first is
   coldest checkpoints of the index. Checkpoints come before pages: a new
   checkpoint makes RAM give up what goes for nothing, then the checkpoints
   that hang on pages in RAM, then the index's by its ranking; pages above
-  their floor make room for checkpoints, not the other way round.
+  their floor make room for checkpoints, not the other way round. The
+  devices lock a place's memory when a step first uses it, and a lock beyond
+  `--ram` would fail the step, so a checkpoint takes a free place whose
+  memory is still locked when there is one, else a place whose lock the
+  limit has room for (`PinnedRam::place_lock`), after giving up what goes for
+  nothing; with neither it is not taken. (Measured: without this a 29k
+  conversation's pages in RAM left the next turn's checkpoint no room under
+  `--ram 3G`, and the step failed.)
 - **Room for what comes.** When RAM is full, the coldest of what only it
-  holds is written ahead, so that there is room for 16 pages without waiting
-  for the drive (`Cache::clean_ahead`). With a level on SSD the cache keeps
+  holds is written ahead, so that there is room for 16 pages and a
+  checkpoint without waiting for the drive (`Cache::clean_ahead`). With a level on SSD the cache keeps
   one checkpoint place and 16 pages whatever the machine has, its floor in
   the books: state passes through them to the drive and back, so a prompt
   resumes from SSD while the machine has no room for the cache, and a page

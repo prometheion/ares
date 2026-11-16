@@ -507,7 +507,7 @@ impl Cache {
                 .last()
                 .copied()
                 .or_else(|| (self.next_place < self.capacity).then_some(self.next_place))?;
-            if books.unbooked() >= books.place_lock(place) {
+            if books.unbooked() >= books.place_lock(place) + self.pending_locks() {
                 return match self.free_places.last() == Some(&place) {
                     true => self.free_places.pop(),
                     false => self.unused_place(),
@@ -517,6 +517,14 @@ impl Cache {
                 return None;
             }
         }
+    }
+
+    /// The bytes the devices will lock for the saves of the next record: the
+    /// places they use whose memory is not locked yet. Nothing else may book
+    /// that room of the limit before the record has run.
+    fn pending_locks(&self) -> u64 {
+        let Some(books) = &self.books else { return 0 };
+        self.saves.iter().map(|copy| books.place_lock(copy.place)).sum()
     }
 
     /// A place never used so far, if there is one.
@@ -940,9 +948,13 @@ impl Cache {
                 return Some(parts);
             }
             // The floor of pages is the level's whatever else the allowance
-            // holds.
+            // holds; and the room in the limit that saves of the next record
+            // will lock is theirs.
             let (bytes, page) = (ram.bytes(), ram.page_bytes());
-            if (self.held() + page <= self.allowance() || bytes + page <= self.page_floor)
+            let room = self.held() + page <= self.allowance() || bytes + page <= self.page_floor;
+            let unbooked = self.books.as_ref().map_or(u64::MAX, PinnedRam::unbooked);
+            if room
+                && unbooked >= page + self.pending_locks()
                 && let Ok(parts) = self.in_ram.as_mut()?.make()
             {
                 return Some(parts);
