@@ -310,8 +310,9 @@ fn store_line(stats: &StoreStats, steps: usize) -> String {
          file ({:.1} MB read), {:.1} on their way; waiting per step {:.2} ms summed over layers; \
          a miss served from RAM {:.2} ms (median) / {:.2} (99 %), from the file {:.2} / {:.2} ms, a \
          layer's CPU share {:.2} / {:.2} ms; between steps {:.1} experts promoted to VRAM per step; \
-         predicted per step {:.1} experts ({:.1} % of them picked), read ahead {:.2} ({:.1} MB, \
-         {:.2} used, {:.2} wasted, {:.2} not read for want of room), a pick read ahead waited \
+         predicted per step {:.1} experts ({:.1} % of them picked; {:.2} in no tier, {:.1} % of \
+         those picked), read ahead {:.2} ({:.1} MB, {:.2} used, {:.2} wasted, {:.2} not read), a \
+         pick read ahead waited \
          {:.2} ms (median) when its read was still on its way ({} times); misses waited for the \
          file {:.2} ms per step, summed over them",
         100.0 * stats.hits as f64 / stats.picks.max(1) as f64,
@@ -332,6 +333,8 @@ fn store_line(stats: &StoreStats, steps: usize) -> String {
         per(stats.promotions),
         per(stats.predicted),
         100.0 * stats.predicted_picked as f64 / stats.predicted.max(1) as f64,
+        per(stats.predicted_in_file),
+        100.0 * stats.predicted_in_file_picked as f64 / stats.predicted_in_file.max(1) as f64,
         per(stats.ahead_reads),
         per(stats.ahead_read_bytes) / 1e6,
         per(stats.ahead_used),

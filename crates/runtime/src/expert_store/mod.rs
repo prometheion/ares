@@ -453,9 +453,14 @@ pub struct StoreStats {
     pub ahead_read_bytes: u64,
     pub ahead_used: u64,
     pub ahead_wasted: u64,
-    /// Predicted experts in no tier that were not read: the bounds of the read-ahead left
-    /// no room before the layer's router ran.
+    /// Predicted experts in no tier that were not read: their place in the predictions is
+    /// picked less often than not, or the bounds of the read-ahead left no room before the
+    /// layer's router ran.
     pub ahead_left: u64,
+    /// Predicted experts that no tier held when they were named, read ahead or not, and of
+    /// them those the router then picked: what a read ahead of every one would have got.
+    pub predicted_in_file: u64,
+    pub predicted_in_file_picked: u64,
     /// For every pick whose read had started ahead and was still on its way when its
     /// record arrived: milliseconds from the record to its bytes being in RAM.
     pub ahead_miss_ms: Vec<f32>,
@@ -1219,12 +1224,11 @@ impl<D: SlotDevice> ExpertStore<D> {
                 self.refresh_worth(layer);
             }
             let ahead = &self.ahead;
-            let room = ahead.has_room();
             let Some(started) = self.guesses.start_where(
                 &mut self.ram.sets,
                 &self.ram_worth,
                 self.step,
-                &mut |layer, expert| room || !ahead.is_queued(layer, expert),
+                &mut |layer, expert| ahead.may_start(layer, expert).unwrap_or(true),
             ) else {
                 break;
             };

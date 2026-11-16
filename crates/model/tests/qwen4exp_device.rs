@@ -788,9 +788,11 @@ fn experts_uploaded_for_a_step_change_nothing() {
 }
 
 /// The routers of the next layers predict the picks of a step of eight rows and the store
-/// reads ahead what no tier holds: the logits are, to the bit, those of a run with every
-/// expert in its slot, with the predictions and without them, and with a RAM tier of a few
-/// slots per layer the reads ahead are many.
+/// reads ahead what no tier holds where such reads are picked more often than not: the
+/// logits are, to the bit, those of a run with every expert in its slot, with the
+/// predictions and without them. (The made-up routers rarely pick what is in no tier, so
+/// little is read here; the store's own tests read ahead, and the real file's fingerprint
+/// compares with reads ahead.)
 #[test]
 fn experts_read_ahead_of_their_router_change_nothing() {
     let Some(devices) = devices() else { return };
@@ -819,8 +821,7 @@ fn experts_read_ahead_of_their_router_change_nothing() {
         if predict == 0 {
             assert_eq!(stats.predicted, 0);
         } else {
-            assert!(stats.predicted > 0 && stats.ahead_reads > 0, "{stats:?}");
-            assert!(stats.ahead_used > 0, "some reads ahead are picked: {stats:?}");
+            assert!(stats.predicted > 0 && stats.predicted_picked > 0, "{stats:?}");
         }
     }
 }

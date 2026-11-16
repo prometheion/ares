@@ -852,13 +852,14 @@ impl Feed {
                                 })
                                 .collect();
                             if !experts.is_empty() {
-                                self.store.ahead(self.layout.store_layer(part, layer), &experts);
+                                let at = self.layout.store_layer(part, layer);
+                                self.store.ahead(at, &experts, d + 1);
                             }
                         }
                     }
                     _ => {
                         let experts: Vec<u32> = list.experts().collect();
-                        self.store.ahead(self.layout.store_layer(index, layer), &experts);
+                        self.store.ahead(self.layout.store_layer(index, layer), &experts, d + 1);
                     }
                 }
             }

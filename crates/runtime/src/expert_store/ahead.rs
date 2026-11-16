@@ -9,6 +9,15 @@
 //! read-ahead keeps within bounds that come from the drive and the step, never from numbers
 //! of a machine:
 //!
+//! - **Only what is picked more often than not.** When the tiers hold what a text uses, an
+//!   expert that no tier holds is one the text has not used, and a prediction that names it
+//!   is mostly wrong. So the store counts, per distance of the prediction (one layer or two)
+//!   and place in its list (the best rank among the rows' picks), how often an expert named
+//!   there that no tier held was then picked, read or not, and reads ahead only at the places
+//!   where that has been at least half the time: a read for nothing then costs the drive no
+//!   more than the reads that are used save the steps. Where the tiers hold little (one card,
+//!   a small RAM tier, a large file) most places qualify; where they hold nearly everything
+//!   few do, and nothing is read.
 //! - **In flight**: at most as many experts as the drives take of prefetches at once
 //!   ([`ares_io::Reader::prefetch_room`]). The reader keeps every prefetch behind every
 //!   demand read and halves the prefetch chunks at a drive while a demand chunk is there, so
@@ -31,6 +40,44 @@ use ares_io::Reader;
 
 use super::{ExpertStore, Geometry, Phase, SlotDevice};
 
+/// The places of a list that are counted apart: the ranks of a step of one row; later places
+/// (a step of several rows names more) count with the last.
+const PLACES: usize = 16;
+
+/// The samples a place needs before its count decides, and the most it keeps: the counts are
+/// halved beyond that, so that they follow the text and the tiers.
+const MIN_SAMPLES: f32 = 16.0;
+const MAX_SAMPLES: f32 = 512.0;
+
+/// How often an expert that no tier held and that a prediction named was then picked, per
+/// distance of the prediction (one layer, two layers) and place in its list.
+#[derive(Clone, Debug, Default)]
+struct Odds {
+    named: [[f32; PLACES]; 2],
+    picked: [[f32; PLACES]; 2],
+}
+
+impl Odds {
+    fn class(distance: usize, place: usize) -> (usize, usize) {
+        (distance.clamp(1, 2) - 1, place.min(PLACES - 1))
+    }
+
+    /// Whether a read ahead at this place is used at least as often as not.
+    fn worth(&self, (d, p): (usize, usize)) -> bool {
+        let named = self.named[d][p];
+        named >= MIN_SAMPLES && 2.0 * self.picked[d][p] >= named
+    }
+
+    fn record(&mut self, (d, p): (usize, usize), picked: bool) {
+        self.named[d][p] += 1.0;
+        self.picked[d][p] += f32::from(u8::from(picked));
+        if self.named[d][p] > MAX_SAMPLES {
+            self.named[d][p] /= 2.0;
+            self.picked[d][p] /= 2.0;
+        }
+    }
+}
+
 /// What a prediction has done for an expert of a layer that the running step has not
 /// routed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -48,7 +95,9 @@ enum State {
 /// The read-ahead of the running step and its bounds.
 #[derive(Debug)]
 pub(super) struct Ahead {
-    named: HashMap<(usize, u32), State>,
+    /// What was named for the layers ahead, with the class (distance, place) of its naming.
+    named: HashMap<(usize, u32), (State, (usize, usize))>,
+    odds: Odds,
     /// Reads ahead that have started and not come back, and the most there may be.
     in_flight: usize,
     lanes: usize,
@@ -78,6 +127,7 @@ impl Ahead {
         let lanes = (reader.prefetch_room() as u64).div_ceil(expert_bytes).max(1) as usize;
         Self {
             named: HashMap::new(),
+            odds: Odds::default(),
             in_flight: 0,
             lanes,
             bytes: 0,
@@ -97,23 +147,30 @@ impl Ahead {
         self.in_flight < self.lanes && self.bytes < self.budget
     }
 
-    /// Whether a guess is a read ahead that waits for room.
-    pub(super) fn is_queued(&self, layer: usize, expert: u32) -> bool {
-        self.named.get(&(layer, expert)) == Some(&State::Queued)
+    /// For a guess that is a read ahead waiting to start: whether it may start now (room,
+    /// and a place whose reads are used at least as often as not). `None` for any other
+    /// guess.
+    pub(super) fn may_start(&self, layer: usize, expert: u32) -> Option<bool> {
+        match self.named.get(&(layer, expert)) {
+            Some((State::Queued, class)) => Some(self.has_room() && self.odds.worth(*class)),
+            _ => None,
+        }
     }
 }
 
 impl<D: SlotDevice> ExpertStore<D> {
-    /// A prediction says that the router of `layer`, which the running step has not reached,
-    /// will pick `experts`, the likeliest first. Those that no tier holds and that are not on
-    /// their way are read from the file into the RAM tier, the likeliest first and behind
-    /// every read a step waits for, as far as the bounds of the read-ahead let them (see the
-    /// module); [`ExpertStore::poll`] starts them. The layer's record then finds them in RAM
-    /// or on their way, and drops what it did not pick.
+    /// A prediction made `distance` layers ahead (1 or 2) says that the router of `layer`,
+    /// which the running step has not reached, will pick `experts`, the likeliest first. Those
+    /// that no tier holds and that are not on their way are read from the file into the RAM
+    /// tier, the likeliest first and behind every read a step waits for, as far as the
+    /// bounds of the read-ahead let them and only at the places of a list whose reads have
+    /// been used at least as often as not (see the module); [`ExpertStore::poll`] starts
+    /// them. The layer's record then finds them in RAM or on their way, and drops what it did
+    /// not pick.
     ///
     /// Nothing happens between steps, for a layer whose record has arrived, or for a layer
     /// whose experts are all resident.
-    pub fn ahead(&mut self, layer: usize, experts: &[u32]) {
+    pub fn ahead(&mut self, layer: usize, experts: &[u32], distance: usize) {
         if !self.in_step
             || self.phase.get(layer) != Some(&Phase::Ahead)
             || self.layers[layer].resident
@@ -123,9 +180,17 @@ impl<D: SlotDevice> ExpertStore<D> {
         self.ahead.predicted = true;
         let n_experts = self.heat.n_experts();
         let mut read = Vec::new();
-        for &expert in experts.iter().filter(|e| (**e as usize) < n_experts) {
+        for (place, &expert) in experts.iter().enumerate() {
+            if expert as usize >= n_experts {
+                continue;
+            }
             let key = (layer, expert);
-            if self.ahead.named.contains_key(&key) {
+            let class = Odds::class(distance, place);
+            if let Some((state, named)) = self.ahead.named.get_mut(&key) {
+                // A nearer prediction counts for the expert from now on.
+                if *state == State::Queued && class.0 < named.0 {
+                    *named = class;
+                }
                 continue;
             }
             self.stats.predicted += 1;
@@ -140,7 +205,7 @@ impl<D: SlotDevice> ExpertStore<D> {
                 read.push(expert);
                 State::Queued
             };
-            self.ahead.named.insert(key, state);
+            self.ahead.named.insert(key, (state, class));
         }
         if !read.is_empty() {
             self.guesses.guess(&mut self.ram.sets, layer, &read, self.step);
@@ -156,7 +221,7 @@ impl<D: SlotDevice> ExpertStore<D> {
         read: u64,
         bytes: u64,
     ) -> bool {
-        let Some(state) = self.ahead.named.get_mut(&(layer, expert)) else { return false };
+        let Some((state, _)) = self.ahead.named.get_mut(&(layer, expert)) else { return false };
         if *state != State::Queued {
             return false;
         }
@@ -176,13 +241,11 @@ impl<D: SlotDevice> ExpertStore<D> {
         {
             self.stats.ahead_miss_ms.push(record.elapsed().as_secs_f32() * 1e3);
         }
-        let key = (layer, expert);
-        if self.ahead.named.get(&key) == Some(&State::Reading(read)) {
-            if failed {
-                self.ahead.named.remove(&key);
-            } else {
-                self.ahead.named.insert(key, State::Arrived);
-            }
+        if let Some((state, _)) = self.ahead.named.get_mut(&(layer, expert))
+            && *state == State::Reading(read)
+        {
+            // A read that failed is counted as never read.
+            *state = if failed { State::Queued } else { State::Arrived };
         }
     }
 
@@ -196,9 +259,15 @@ impl<D: SlotDevice> ExpertStore<D> {
             self.ahead.named.keys().filter(|key| key.0 == layer).copied().collect();
         let now = Instant::now();
         for key in keys {
-            let Some(state) = self.ahead.named.remove(&key) else { continue };
+            let Some((state, class)) = self.ahead.named.remove(&key) else { continue };
             let picked = picks.contains(&key.1);
             self.stats.predicted_picked += u64::from(picked);
+            if state != State::Held {
+                // An expert no tier held when it was named: what its place is worth.
+                self.ahead.odds.record(class, picked);
+                self.stats.predicted_in_file += 1;
+                self.stats.predicted_in_file_picked += u64::from(picked);
+            }
             match state {
                 State::Held => {}
                 State::Queued => self.stats.ahead_left += 1,
@@ -232,7 +301,7 @@ impl<D: SlotDevice> ExpertStore<D> {
     /// read on its way comes back as an unused guess), and the bounds of the next step
     /// follow what this one took.
     pub(super) fn ahead_end_step(&mut self) {
-        for (_, state) in std::mem::take(&mut self.ahead.named) {
+        for (_, (state, _)) in std::mem::take(&mut self.ahead.named) {
             match state {
                 State::Held => {}
                 State::Queued => self.stats.ahead_left += 1,
