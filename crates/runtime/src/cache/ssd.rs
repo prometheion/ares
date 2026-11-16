@@ -77,6 +77,10 @@ const STATE_BUFFERS: usize = 3;
 const PATIENCE: Duration = Duration::from_millis(250);
 /// Threads that read from the drive.
 const READERS: usize = 4;
+/// Pages read from the drive that wait for their way to the devices, at
+/// most: half the floor of pages in RAM, so that the other half is there for
+/// pages that leave the devices to make room for them.
+const READ_AHEAD: usize = RESERVE as usize / 2;
 /// How long an engine that ends waits for the writer at most.
 const DRAIN_LIMIT: Duration = Duration::from_secs(120);
 
@@ -844,10 +848,14 @@ impl Cache {
         }
     }
 
-    /// Hands the readers what the runs need next, as far as buffers go.
+    /// Hands the readers what the runs need next, as far as buffers go and
+    /// up to [`READ_AHEAD`] pages in all.
     fn ask(&mut self) {
         let Some(readers) = self.ssd.as_ref().and_then(|ssd| ssd.to_readers.clone()) else {
             return;
+        };
+        let reading = |ssd: &Ssd| -> usize {
+            ssd.jobs.iter().map(|job| job.outstanding + job.ready.len()).sum()
         };
         let jobs = self.ssd.as_ref().map_or(0, |ssd| ssd.jobs.len());
         for at in 0..jobs {
@@ -881,6 +889,9 @@ impl Cache {
                 let job = &ssd.jobs[at];
                 if job.asked >= job.pages.len() || job.failed {
                     break;
+                }
+                if reading(ssd) >= READ_AHEAD {
+                    return;
                 }
                 let (index, hash) = (job.asked, job.pages[job.asked].0);
                 let Some(parts) = self.ram_buffer() else { return };
