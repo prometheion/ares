@@ -52,10 +52,12 @@ impl Part {
 
     /// What a page holds of the part in the pools at `pools`: the K/V group
     /// of its attention layers, and per attention layer the array of its
-    /// pooled keys.
+    /// pooled keys. `lags`: the part writes a cell after the model's cells of
+    /// it (the draft block).
     pub(crate) fn page_parts(
         &mut self,
         pools: DevicePtr,
+        lags: bool,
     ) -> Result<(Option<PageGroup<'_>>, Vec<PageArray>), ModelError> {
         let bytes = self.f.ix.key_slot_bytes(self.opts.keys);
         let arrays = self
@@ -68,7 +70,7 @@ impl Part {
         let status = self.scratch.ptr().offset(self.f.s.status);
         let group = match (&mut self.kv, &self.attention) {
             (Some(group), Some(kernels)) => {
-                Some(PageGroup { group, pages: pools, kernels, status })
+                Some(PageGroup { group, pages: pools, kernels, status, lags })
             }
             (Some(_), None) => return Err(invalid("a K/V group without attention kernels")),
             (None, _) => None,

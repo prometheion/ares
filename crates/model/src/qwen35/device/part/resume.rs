@@ -135,9 +135,10 @@ impl Part {
     fn pages(&mut self, pages: DevicePtr) -> Result<Pages<'_>, ModelError> {
         let kernels = self.attention.as_ref().ok_or_else(|| invalid("attention kernels"))?;
         let status = self.scratch.ptr().offset(self.s.status);
-        let mut groups = vec![PageGroup { group: &mut self.kv, pages, kernels, status }];
+        let mut groups =
+            vec![PageGroup { group: &mut self.kv, pages, kernels, status, lags: false }];
         if let Some(m) = &mut self.mtp {
-            groups.push(PageGroup { group: &mut m.kv, pages, kernels, status });
+            groups.push(PageGroup { group: &mut m.kv, pages, kernels, status, lags: false });
         }
         Ok(Pages { groups, arrays: Vec::new(), count: self.n_pages })
     }

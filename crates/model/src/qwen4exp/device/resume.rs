@@ -115,7 +115,7 @@ fn pages<'a>(
     pools: DevicePtr,
 ) -> Result<Pages<'a>, ModelError> {
     let count = part.pages();
-    let (group, mut arrays) = part.page_parts(pools)?;
+    let (group, mut arrays) = part.page_parts(pools, false)?;
     let mut groups: Vec<_> = group.into_iter().collect();
     if let Some(block) = block {
         let (group, keys) = block.page_parts()?;

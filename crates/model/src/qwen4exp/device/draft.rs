@@ -52,6 +52,7 @@
 //! (a cached page that another sequence went past) reads the cell and writes
 //! nothing, as a replay. Either way only the drafts can differ.
 
+use std::ops::Range;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -62,8 +63,6 @@ use ares_cuda::{
 };
 use ares_runtime::{DraftChances, ModelError, draft_chance};
 use ares_sampler::{SamplePick, SampleRow};
-
-use std::ops::Range;
 
 use super::board::Board;
 use super::part::{ExpertAt, Options, Part, StepEnv};
@@ -372,11 +371,12 @@ impl DraftBlock {
     }
 
     /// What a page holds of the block: its K/V group and its indexer's pooled
-    /// keys, in the block's own pools.
+    /// keys, in the block's own pools. A tail whose one cell is its sequence's
+    /// last has none of the block's cells yet.
     pub(super) fn page_parts(
         &mut self,
     ) -> Result<(Option<PageGroup<'_>>, Vec<PageArray>), ModelError> {
-        self.part.page_parts(self.pools.ptr())
+        self.part.page_parts(self.pools.ptr(), true)
     }
 
     /// The pool freed these pages: the block gives back what it kept for them.

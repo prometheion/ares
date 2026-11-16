@@ -555,6 +555,11 @@ pub(crate) struct PageGroup<'a> {
     pub pages: DevicePtr,
     pub kernels: &'a AttentionKernels,
     pub status: DevicePtr,
+    /// The group writes a cell after the model's cells of it (a draft block
+    /// one token behind): a partly used page may have none of the group's
+    /// cells yet, and then it has no exact entry in a group that keeps them,
+    /// and a copy of it copies nothing of the group.
+    pub lags: bool,
 }
 
 /// Bytes kept per page besides the K/V groups (an indexer's pooled keys of a
@@ -586,6 +591,9 @@ impl Pages<'_> {
             )));
         }
         for g in &mut self.groups {
+            if g.lags && g.group.has_exact() && g.group.exact_slot(from).is_none() {
+                continue;
+            }
             g.group.copy_page(g.kernels, stream, g.pages, g.status, from, to)?;
         }
         for a in &self.arrays {
