@@ -29,6 +29,7 @@ mod part;
 pub mod placement;
 mod runtime;
 mod session;
+mod usage;
 
 pub use board::Board;
 pub use draft::{DraftReport, DraftTimes, Drafted};
@@ -45,6 +46,7 @@ pub use session::{
     Fill, LayerOut, PartReport, Probe, Rows, Session, SessionOptions, Spread, StepTime, Wanted,
     read_time,
 };
+pub use usage::{IDLE_AFTER, Log, ProfileFound, ProfileReport, UsageStats};
 
 /// Why a model could not be opened on its devices or a step could not run.
 #[derive(Debug, thiserror::Error)]

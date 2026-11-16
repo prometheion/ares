@@ -6,6 +6,7 @@
 //! `qwen3vl`, the image tower and merger that both read images through.
 
 pub mod chat;
+mod files;
 pub mod qwen35;
 pub mod qwen3vl;
 pub mod qwen4exp;

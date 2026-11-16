@@ -1401,3 +1401,86 @@ fn the_ram_tier_gives_its_memory_back_to_the_system_and_takes_it_again() {
     assert_eq!(ask(&runtime, 4, &prompt, 24), want, "the answer with the tier it had");
     runtime.shutdown();
 }
+
+/// [`start`] for a model that keeps the usage profile of its experts in
+/// `dir`, whose misses are all uploaded (the CPU's arithmetic is not the
+/// device's, and a run that misses less would compute other experts there).
+fn start_profiled(placement: Placement, dir: &std::path::Path) -> (Runtime, Arc<Qwen4Exp>) {
+    let devices = open_devices(placement);
+    let gguf = Gguf::open(gguf_path(1)).unwrap();
+    let n_layer = Config::from_gguf(&gguf).unwrap().n_layer;
+    let mut opts = options(placement, n_layer, 16, MAX_ROWS, MAX_ROWS);
+    opts.serve = Serve::Stream;
+    let inner = Qwen4Exp::new(gguf, byte_tokenizer(None), "made", &devices, opts, CELLS)
+        .unwrap()
+        .with_usage_profile(dir, Arc::new(|line| eprintln!("LOG {line}")));
+    let inner = Arc::new(inner);
+    let config = RuntimeConfig {
+        pages: 16,
+        cells_per_page: 128,
+        max_slots: SLOTS,
+        ..RuntimeConfig::default()
+    };
+    let model: Arc<dyn Model> = Arc::new(Made(inner.clone()));
+    let mut gpu = GpuConfig::new(&config, &*model);
+    gpu.ram_limit += 256 << 20;
+    gpu.vram_headroom = 512 << 20;
+    (Runtime::start_gpu(model, devices, config, gpu).expect("the runtime starts"), inner)
+}
+
+/// The usage profile of the experts outlives the engine: the first engine has
+/// none and writes it when it goes, the next one fills its tiers from it before
+/// the first step (in every placement, both devices on every layer
+/// included, where an expert's heat is its owner's) and answers as the first
+/// did. What the store keeps of an idle engine changes no answer.
+#[test]
+fn the_usage_profile_outlives_the_engine_and_fills_the_tiers() {
+    use ares_model::qwen4exp::device::{IDLE_AFTER, ProfileFound};
+    if !enabled() {
+        return;
+    }
+    let prompt = prompt(40, 5);
+    for placement in placements() {
+        let dir =
+            PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("q4rt-usage-{placement:?}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        let profiles = || std::fs::read_dir(&dir).map_or(0, |entries| entries.count());
+
+        let (runtime, model) = start_profiled(placement, &dir);
+        let report = model.serving().expect("the model keeps a profile");
+        assert_eq!(report.found, ProfileFound::None, "{placement:?}");
+        assert!(report.filled.is_none());
+        assert_eq!(profiles(), 0, "nothing is written before a step ran");
+        let first = ask(&runtime, 1, &prompt, 16);
+        // Nothing runs for a while: the keeper fills what is empty.
+        std::thread::sleep(IDLE_AFTER + Duration::from_millis(500));
+        let usage = model.usage_stats().expect("the model keeps a profile");
+        eprintln!("RES {placement:?}: after the first answer and a second of nothing: {usage:?}");
+        assert_eq!(ask(&runtime, 3, &prompt, 16), first, "{placement:?}: after the idle time");
+        runtime.shutdown();
+        drop(runtime);
+        drop(model);
+        assert_eq!(profiles(), 1, "{placement:?}: the engine wrote its profile when it went");
+
+        let (runtime, model) = start_profiled(placement, &dir);
+        let report = model.serving().expect("the model keeps a profile");
+        let ProfileFound::Found { known } = report.found else {
+            panic!("{placement:?}: {report:?}");
+        };
+        let (filled, took) = report.filled.expect("the tiers were filled");
+        eprintln!("RES {placement:?}: {known} experts known, filled {filled:?} in {took:?}");
+        assert!(known > 0 && filled.vram > 0, "{placement:?}: {filled:?}");
+        assert_eq!(filled.dropped, 0);
+        let usage = model.usage_stats().unwrap();
+        assert!(usage.vram.0 as u64 >= filled.vram, "{placement:?}: {usage:?}");
+        model.take_store_stats();
+        let again = ask(&runtime, 2, &prompt, 16);
+        assert_eq!(again, first, "{placement:?}: the same answer from tiers that were filled");
+        let stats = model.take_store_stats().unwrap();
+        assert_eq!(stats.miss_from_disk, 0, "{placement:?}: the profile had what it used");
+        runtime.shutdown();
+        drop(runtime);
+        drop(model);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

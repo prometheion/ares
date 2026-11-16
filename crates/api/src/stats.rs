@@ -26,6 +26,10 @@ pub struct ExpertStats {
     pub wait_us: u64,
     /// Bytes of page-locked RAM the tier of experts holds.
     pub ram_tier_bytes: u64,
+    /// Experts in VRAM slots now, and in the RAM tier (copies of experts that
+    /// VRAM holds among them), over the model's layers.
+    pub vram_experts: u64,
+    pub ram_experts: u64,
 }
 
 /// What the level of the prompt cache on SSD has done since the engine

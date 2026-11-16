@@ -58,6 +58,7 @@ use super::part::{
 };
 use super::placement::{MARGIN, PartPlan, Placement};
 use super::session::{Chosen, Fill, PartReport, SessionOptions, choose};
+use super::usage::{Log, ProfileReport, Usage, UsageStats};
 use crate::chat;
 use crate::qwen4exp::weights::{DraftWeights, Weights};
 use crate::qwen4exp::{Config, Error as FileError};
@@ -618,6 +619,8 @@ pub struct Qwen4Exp {
     draft: Option<Arc<Gguf>>,
     draft_report: Mutex<Option<DraftReport>>,
     draft_watch: Arc<Mutex<Watch>>,
+    /// The usage profile of the experts, for a model that keeps one.
+    usage: Usage,
 }
 
 impl std::fmt::Debug for Qwen4Exp {
@@ -717,7 +720,43 @@ impl Qwen4Exp {
             draft: None,
             draft_report: Mutex::new(None),
             draft_watch: Arc::default(),
+            usage: Usage::default(),
         })
+    }
+
+    /// Keeps the usage profile of the model's experts in `dir` (see
+    /// `usage.rs`): a profile that is there for this model file fills the
+    /// tiers when the engine begins to serve ([`Qwen4Exp::serving`]), and the
+    /// profile is written while the engine serves and when the model is
+    /// dropped. `log` gets what the owner should hear of (a profile that
+    /// cannot be written). Before the runtime opens the parts.
+    pub fn with_usage_profile(mut self, dir: &std::path::Path, log: Log) -> Self {
+        self.usage = Usage::open(dir, &self.gguf, &self.config, log);
+        self
+    }
+
+    /// The engine serves from now on: the heat of the experts becomes the
+    /// usage profile's (the steps that measured the price of a step are no
+    /// text), the tiers are filled from it, and the profile is kept, the
+    /// empty slots filled whenever nothing runs. Call it once the runtime
+    /// runs and before the first request; it returns when the tiers are
+    /// filled, with what was found and filled; `None` without a profile, or
+    /// before the runtime has opened the parts.
+    pub fn serving(&self) -> Option<ProfileReport> {
+        self.usage.serving()
+    }
+
+    /// Writes the usage profile now if steps ran since it was last written:
+    /// its path, or why it could not be written; `None` when there was
+    /// nothing to write.
+    pub fn save_profile(&self) -> Option<Result<std::path::PathBuf, String>> {
+        self.usage.save()
+    }
+
+    /// What the fill of the empty slots did while nothing ran, and what the
+    /// tiers of the model's layers hold; `None` without a usage profile.
+    pub fn usage_stats(&self) -> Option<UsageStats> {
+        self.usage.stats()
     }
 
     /// Gives the model its draft block from `draft`, a file of the block as
@@ -813,12 +852,17 @@ impl Qwen4Exp {
     pub fn take_store_stats(&self) -> Option<StoreStats> {
         let flow = self.flow.get()?;
         flow.fold_wide();
-        let (stats, ram_bytes) = {
+        let (stats, ram_bytes, held) = {
             let mut feed = flow.lock_feed();
-            (feed.store.take_stats(), feed.store.ram_bytes().0)
+            let held = self.layout.model_layers().fold((0, 0), |(vram, ram), at| {
+                let (in_vram, in_ram) = feed.store.held(at);
+                (vram + in_vram as u64, ram + in_ram as u64)
+            });
+            (feed.store.take_stats(), feed.store.ram_bytes().0, held)
         };
         let mut totals = flow.totals.lock().unwrap_or_else(|e| e.into_inner());
         totals.ram_tier_bytes = ram_bytes;
+        (totals.vram_experts, totals.ram_experts) = held;
         totals.picks += stats.picks;
         totals.hits += stats.hits;
         totals.from_ram += stats.miss_from_ram;
@@ -1112,6 +1156,7 @@ impl Qwen4Exp {
                     }),
                 });
                 let _ = self.flow.set(flow.clone());
+                self.usage.attach(&flow, layout, &self.placement);
                 // From here on the tier follows what it is allowed: its
                 // staging slots are the part it never gives up.
                 ram.want_experts(reach, ram_fixed);
