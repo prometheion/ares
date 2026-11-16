@@ -1559,6 +1559,13 @@ impl Qwen4ExpDevice {
             block.follow(stream, &self.flow, &outcome, residual)?;
         }
 
+        // The pages the pool freed give back what the K/V groups keep for them.
+        let freed: Vec<u32> = (0..record.freed()).map(|i| record.freed_page(i)).collect();
+        self.part.release_pages(freed.iter().copied());
+        if let Some(block) = &mut self.draft {
+            block.release_pages(&freed);
+        }
+
         // The page tables as the conductor made them.
         let mut taken = 0;
         for i in 0..record.updates() {

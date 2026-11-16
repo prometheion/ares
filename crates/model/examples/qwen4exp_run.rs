@@ -11,7 +11,7 @@
 //!     [--text TOKENS.txt] [--text-file A.md,B.md] [--decode-at 1000,8000]
 //!     [--decode-steps 64]
 //!     [--prefill 2048] [--breakdown] [--serve model|stream|cpu] [--transit 32]
-//!     [--read-ahead on|off] [--fingerprint FILE]
+//!     [--read-ahead on|off] [--fingerprint FILE] [--kv q8,q8]
 //! ```
 //!
 //! - `--spread`: how two devices share the model: a range of layers each
@@ -51,6 +51,10 @@
 //!   option the plan of the store decides. `--read-ahead on` starts the reads of the
 //!   layers ahead on a guess (what the wide step before missed there), to measure what the
 //!   guesses are worth.
+//! - `--kv K,V`: the formats of K and of V (`f16`, `q8` to `q4`; the default
+//!   is `q8,q8`). With `q7` to `q4` a second, small pool of exact entries
+//!   holds the first tile of a sequence and its newest cells. The draft
+//!   block's are `q4` whatever this says.
 //! - `--fingerprint FILE`: the logits of fixed steps over the first 600
 //!   tokens of the text (a prompt, generated tokens, windows of drafts), a line
 //!   per row with the pick, its logit's bits and a hash of the row, to compare
@@ -63,7 +67,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use ares_cuda::{Device, KeyFormat, Wait};
+use ares_cuda::{CacheFormat, Device, KeyFormat, Wait};
 use ares_gguf::Gguf;
 use ares_model::qwen4exp::device::{
     DeviceMemory, Options, PHASES, Placement, Profile, Rows, Session, SessionOptions, Spread,
@@ -109,6 +113,7 @@ struct Args {
     transit: Option<u32>,
     read_ahead: bool,
     fingerprint: Option<String>,
+    kv: (CacheFormat, CacheFormat),
 }
 
 fn parse() -> Result<Args, AnyError> {
@@ -145,6 +150,7 @@ fn parse() -> Result<Args, AnyError> {
         transit: None,
         read_ahead: false,
         fingerprint: None,
+        kv: (CacheFormat::Q8, CacheFormat::Q8),
     };
     let mut it = std::env::args().skip(1);
     let list = |s: String| -> Vec<String> { s.split(',').map(str::to_owned).collect() };
@@ -192,6 +198,19 @@ fn parse() -> Result<Args, AnyError> {
             "--rows" => args.rows = value()?.parse()?,
             "--repeat" => args.repeat = value()?.parse()?,
             "--fingerprint" => args.fingerprint = Some(value()?),
+            "--kv" => {
+                let text = value()?;
+                let name = |name: &str| {
+                    CacheFormat::ALL
+                        .into_iter()
+                        .find(|f| format!("{f:?}").eq_ignore_ascii_case(name))
+                        .ok_or_else(|| format!("--kv {text}: f16, q8 to q4"))
+                };
+                args.kv = match text.split_once(',') {
+                    Some((k, v)) => (name(k)?, name(v)?),
+                    None => (name(&text)?, name(&text)?),
+                };
+            }
             "--breakdown" => args.breakdown = true,
             "--stall-s" => args.stall_s = value()?.parse()?,
             "--transit" => args.transit = Some(value()?.parse()?),
@@ -515,6 +534,7 @@ fn run() -> Result<(), AnyError> {
             cells: args.cells,
             keys: args.keys,
             max_rows: args.rows,
+            kv: args.kv,
             profile: profile.clone(),
             // The fingerprint verifies windows of four rows of drafts.
             logit_rows: if args.fingerprint.is_some() { 4 } else { 1 },

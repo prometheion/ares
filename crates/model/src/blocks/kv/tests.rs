@@ -146,6 +146,21 @@ impl<'a> Rig<'a> {
         pages: u32,
         slots: u32,
     ) -> Self {
+        Self::with_queries(device, k, v, d, 4, exact, pages, slots)
+    }
+
+    /// A rig whose KV heads have `q_per_kv` query heads each.
+    #[allow(clippy::too_many_arguments)]
+    fn with_queries(
+        device: &'a Device,
+        k: KvFormat,
+        v: KvFormat,
+        d: u32,
+        q_per_kv: u32,
+        exact: u32,
+        pages: u32,
+        slots: u32,
+    ) -> Self {
         let geo = CacheGeometry {
             k: cache_format(k),
             v: cache_format(v),
@@ -153,7 +168,7 @@ impl<'a> Rig<'a> {
             kv_heads: 2,
             kv_total: 2,
             first_kv_head: 0,
-            q_per_kv: 4,
+            q_per_kv,
         };
         let policy = KvPolicy::new(k, v);
         let stride = 24;
@@ -438,6 +453,21 @@ impl<'a> Rig<'a> {
     /// Attention of the last row of `seq` against the reference, relative to the
     /// largest output element.
     fn attention_error(&mut self, seq: &Seq) -> f64 {
+        let len = seq.cells.len() as u32;
+        self.attention_error_of(seq, std::slice::from_ref(&(0..len)), |planner, table, entries| {
+            planner.dense(table, entries, 0, 1, len - 1)
+        })
+    }
+
+    /// Attention of the last row of `seq` over the cells of `ranges`, in a plan
+    /// that `plan` makes for the row of the sequence's table, against the
+    /// reference, relative to the largest output element.
+    fn attention_error_of(
+        &mut self,
+        seq: &Seq,
+        ranges: &[std::ops::Range<u32>],
+        plan: impl FnOnce(&mut Planner, u32, &[u32]),
+    ) -> f64 {
         let geo = self.geo;
         let (d, g) = (geo.head_dim as usize, geo.q_per_kv as usize);
         let q_total = geo.kv_total as usize * g;
@@ -453,7 +483,7 @@ impl<'a> Rig<'a> {
             PlanConfig::for_multiprocessors(self.device.info().multiprocessors),
             1,
         );
-        planner.dense(table, entries, 0, 1, (len - 1) as u32);
+        plan(&mut planner, table, entries);
         let plan = planner.finish();
         let scratch = zeroed(self.device, plan.state_bytes(&geo));
         let buffers = plan.upload(self.device).unwrap();
@@ -476,10 +506,10 @@ impl<'a> Rig<'a> {
         for h in 0..geo.kv_heads as usize {
             for gi in 0..g {
                 let hg = h * g + gi;
-                let want = seq.heads[h]
-                    .attend(&q[hg * d..(hg + 1) * d], scale, std::slice::from_ref(&(0..len)))
-                    .unwrap()
-                    .output;
+                let cells: Vec<std::ops::Range<usize>> =
+                    ranges.iter().map(|r| r.start as usize..r.end as usize).collect();
+                let want =
+                    seq.heads[h].attend(&q[hg * d..(hg + 1) * d], scale, &cells).unwrap().output;
                 let big = want.iter().fold(0.0f32, |m, x| m.max(x.abs())).max(1e-30) as f64;
                 for (w, k) in want.iter().zip(&got[hg * d..(hg + 1) * d]) {
                     worst = worst.max((f64::from(*w) - f64::from(*k)).abs() / big);
@@ -671,6 +701,63 @@ fn the_table_of_a_new_group_is_zero_on_the_device_whatever_the_memory_held() {
             "{}: the table starts as its mirror does",
             device.info().name
         );
+    }
+}
+
+/// Flash-Next's attention (`qwen4exp`: two KV heads of 256 values, 12 query
+/// heads to a KV head) over a K/V group, for every pair of formats: a
+/// generated row, planned as the only row of a step, and a row whose cells a
+/// selection lists, as a plan past the dense limit has it (lists of ranges cut
+/// by the kind of entry), read what `KvHead` reads; and the group stores every
+/// cell as `KvHead` stores it.
+#[test]
+fn flash_next_rows_read_what_kvhead_reads_for_every_pair_of_formats() {
+    let Some(devices) = gpus() else { return };
+    for device in devices {
+        for k in KvFormat::ALL {
+            for v in KvFormat::ALL {
+                let label = format!("{k}/{v} on {}", device.info().name);
+                let policy = KvPolicy::new(k, v);
+                let newest = policy.exact_newest_cells as u32;
+                // Formats without a tile mean keep no exact entries.
+                let exact = match policy.has_mean() {
+                    true => super::super::forms::exact_slots(newest, 1, 300, 0),
+                    false => 0,
+                };
+                let mut rig = Rig::with_queries(device, k, v, 256, 12, exact, 16, 1);
+                let mut seq = rig.seq(0);
+                let mut rng = Rng(31);
+                for n in [300usize, 1, 280, 150, 1] {
+                    let t = tokens(&mut rng, n);
+                    rig.step(&mut [(&mut seq, t, false)]);
+                }
+                let t = tokens(&mut rng, 4);
+                rig.step(&mut [(&mut seq, t, true)]);
+                rig.accept(&mut seq, 4, 2);
+                for _ in 0..40 {
+                    let t = tokens(&mut rng, 1);
+                    rig.step(&mut [(&mut seq, t, false)]);
+                }
+                rig.flush(&seq);
+                rig.check(&seq, true, &label);
+                let len = seq.cells.len() as u32;
+                let alone = rig.attention_error_of(
+                    &seq,
+                    std::slice::from_ref(&(0..len)),
+                    |planner, table, entries| planner.window(table, entries, 0, 1, len - 1, None),
+                );
+                assert!(alone < 6e-3, "{label}: a generated row is off by {alone}");
+                // Blocks the indexer might pick: in the first tile, in converted
+                // tiles, across a tile's end, and the newest cells.
+                let picked = [0..40, 200..330, 400..420, len - 260..len];
+                let listed = rig.attention_error_of(&seq, &picked, |planner, table, entries| {
+                    planner.sparse(table, entries, 0, len - 1, &picked)
+                });
+                assert!(listed < 6e-3, "{label}: a row of listed cells is off by {listed}");
+                rig.end(seq);
+                assert_eq!(rig.pages.slots().1, 0, "{label}: nothing is left");
+            }
+        }
     }
 }
 

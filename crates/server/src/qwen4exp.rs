@@ -78,14 +78,6 @@ pub(crate) fn load(
 
     // What can be refused before a device is touched.
     let kv = options.kv.unwrap_or((ares_cuda::CacheFormat::Q8, ares_cuda::CacheFormat::Q8));
-    if kv.0.has_mean() || kv.1.has_mean() {
-        return Err(refuse(format!(
-            "K/V in {}, {}: the formats q7 to q4 need the pool of exact cells and its \
-             conversion, which this model does not have; use f16 or q8",
-            plan::format_name(kv.0),
-            plan::format_name(kv.1)
-        )));
-    }
     if options.shares.is_some() {
         return Err(refuse(
             "--shares does nothing for this model: two devices that share every layer split its \

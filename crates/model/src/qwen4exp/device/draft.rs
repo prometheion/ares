@@ -326,6 +326,11 @@ impl DraftBlock {
         self.part.update_table(stream, slot, first, entries)
     }
 
+    /// The pool freed these pages: the block gives back what it kept for them.
+    pub(super) fn release_pages(&mut self, pages: &[u32]) {
+        self.part.release_pages(pages.iter().copied());
+    }
+
     /// Step 1: the cells the model's last step has passed. `accepted` says how
     /// many rows of the window of a slot that started at a row count (`None`
     /// when the record names no outcome for it), and `residual` is where the

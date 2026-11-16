@@ -105,9 +105,8 @@ with it; the runs are too noisy to tell the two apart.
 - [ ] A log line when the tier shrinks.
 
 ### Cache, tests, kernels
-- [ ] K and V in `q7` to `q4` for this model (it takes `f16` and `q8`; the smaller formats
-      need the pool of exact entries and the tile conversion the 27B has). At 13.9 MiB per
-      1000 tokens in `q8`, a context of 131072 holds 1.8 GiB that could be expert slots.
+- [x] K and V in `q7` to `q4` for this model (2026-11-16: the shared K/V group, see
+      "Parity with the 27B" below).
 - [ ] Prefix cache for this model (it has none), with the RAM and SSD levels.
 - [ ] Device tests that do not depend on machine load
       (`steps_wider_than_eight_rows_match_the_reference`,
@@ -121,7 +120,11 @@ with it; the runs are too noisy to tell the two apart.
 
 ### Parity with the 27B (the owner's rule: what one model can, the other must)
 Everything `FEATURES.md` lists for the 27B and not for Flash-Next is owed:
-- [ ] K and V in `q7` to `q4`, separately for K and V (see above); the draft block's K and V in `q4`.
+- [x] K and V in `q7` to `q4`, separately for K and V; the draft block's K and V in `q4`
+      (2026-11-16, the shared K/V group). Open: a row of a draft window past the dense limit
+      that reaches across the point where a tile leaves the newest cells reads that tile exact,
+      not converted as the row alone would (rows within the limit read it as alone); the
+      share of drafts accepted with the block's `q4` was not measured on this model.
 - [ ] The prefix cache with its RAM and SSD levels (see above).
 - [ ] The draft block read from the model file (`--drafters mtp`) and a draft vocabulary.
 - Not owed (the owner, 2026-11-16): replies that are bit for bit the same from run to run.
@@ -152,6 +155,24 @@ Everything `FEATURES.md` lists for the 27B and not for Flash-Next is owed:
       infinity; deciding a level got slower (35 to 42 us); a list of the set's tokens after
       the first cut; on two cards most of the sampler's time on the RTX 3060 is the exchange.
 - [ ] F32 tile kernel is 2.5 times slower than BF16 (untuned).
+
+## Shared model layer (every model; the study `shared-model-layer.md`, steps 0 to 3 done)
+The K/V group and the recurrent block are shared (`crates/model/src/blocks`); the rule for what
+becomes a block is in `ARCHITECTURE.md` ("The shared model layer"). Left, in the study's order:
+- [ ] Slot arena and checkpoints as a block (extents from the blocks, save, restore, transfer,
+      page copy over all groups); then the prefix cache of Flash-Next on it.
+- [ ] Token rows (table at home on the host, in the mapped file or on the device; kept rows of
+      a head view; a second row source for images); Flash-Next's embedding from staged rows.
+- [ ] One draft-block driver for both models (chain on the device, picks by the sampler); the
+      27B's drafts under a layer split; Flash-Next's draft vocabulary and `--drafters mtp`.
+- [ ] Drafter kinds in the runtime, taps and DFlash, trees in the blocks, tree fill.
+- [ ] Flash-Next past the dense limit: a draft window's row that reaches across the point where
+      a tile leaves the newest cells reads that tile exact, the row alone reads it converted
+      (`Group::ahead` is planned for rows within the limit only; the lists are made on the
+      device from the table, which still names the exact entry). A shadow row of the table for
+      such rows would close it.
+- [ ] Flash-Next with several sequences: a generated row is planned alone now (no prefix read
+      together with other sequences); its cost with three sequences was not measured.
 
 ## Drafters (every model)
 - [ ] DFlash2 with draft trees, as a kind of drafter the runtime knows, for every model that

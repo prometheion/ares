@@ -739,7 +739,7 @@ impl Part {
         let kv = kv::Group::new(
             device,
             ledger,
-            "attention blocks",
+            "qwen35 attention blocks",
             attention_at.iter().flatten().copied().collect(),
             opts.kv,
             exact_slots,

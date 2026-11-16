@@ -340,7 +340,7 @@ impl Mtp {
         let pages_kv = kv::Group::new(
             device,
             ledger,
-            "draft block",
+            "qwen35 draft block",
             vec![sizes.at],
             DRAFT_KV,
             exact_slots,

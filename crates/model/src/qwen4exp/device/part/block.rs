@@ -32,7 +32,7 @@ use ares_core::Ledger;
 use ares_cuda::{Device, DeviceBuffer, DevicePtr, Kernels, MAX_BATCH, PinnedBuffer, Stream};
 use ares_runtime::ModelError;
 
-use super::{Frame, Options, Part, PartShape, Role, StepEnv, invalid};
+use super::{DRAFT_KV, Frame, Options, Part, PartShape, Role, StepEnv, invalid};
 use crate::qwen4exp::Config;
 use crate::qwen4exp::device::load::{CoreW, DeviceWeights, Mat};
 use crate::qwen4exp::weights::DraftWeights;
@@ -81,6 +81,8 @@ impl Part {
                 opts.max_rows
             )));
         }
+        // The block's K and V are in 4 bits, whatever the model's.
+        let opts = &Options { kv: DRAFT_KV, ..opts.clone() };
         let shape = PartShape::whole(c, 0..1, true);
         let f = Frame::new(c, opts, &shape, device.info().multiprocessors)?;
         let weights = DeviceWeights::load_block(device, ledger, c, w, output)?;

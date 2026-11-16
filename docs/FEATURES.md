@@ -11,7 +11,7 @@ the kernels exist; no model runs there yet.
 | --- | --- | --- |
 | Placements | one card, tensor split, layer split | one card, by layers, both cards on every layer |
 | Weight types | all 28 GGUF types | all 28, experts included |
-| K and V | `f16`, `q8` to `q4`, chosen separately (`--kv`) | `f16` or `q8` (default `q8`); `q7` to `q4` are refused |
+| K and V | `f16`, `q8` to `q4`, chosen separately (`--kv`) | `f16`, `q8` to `q4`, chosen separately (`--kv`); the draft block's in `q4` |
 | Larger than VRAM | no | experts in VRAM slots, a RAM tier and on the SSD; the CPU computes missed ones |
 | Own drafts (MTP) | draft block in the file, with a draft vocabulary | draft block from a file (`--drafters <file>`); exact, no gain yet |
 | Prefix cache | yes, with the RAM and SSD levels | no |

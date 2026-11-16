@@ -291,7 +291,10 @@ fn every_layer_matches_the_reference() {
     // of 11 cells from the second step on.
     let steps = [8usize, 5, 1, 6, 8, 3, 2, 7, 8, 4, 4];
     let all = synthetic.shape.tokens(steps.iter().sum(), 3);
-    for kv in [CacheFormat::F16, CacheFormat::Q8] {
+    // With `q5` and `q4` the 56 cells are all in exact entries (the first tile
+    // and the newest cells stay f16): the exact pool, its table and the exact
+    // lists of the rows past the dense limit.
+    for kv in [CacheFormat::F16, CacheFormat::Q8, CacheFormat::Q5, CacheFormat::Q4] {
         let mut session = session(&gguf, &c, &w, devices.clone(), kv);
         let mut state = SequenceState::new(&c);
         let mut worst = [[0.0f64; 3]; 2];
@@ -334,8 +337,9 @@ fn every_layer_matches_the_reference() {
         );
         // Dense products are exact; the recurrent part differs by rounding.
         assert!(worst[0][0] < 2e-3, "recurrent core {:.2e}", worst[0][0]);
-        // Attention reads K and V as stored (f16 or q8) on f16 tensor cores.
-        let bound = if kv == CacheFormat::F16 { 1e-2 } else { 3e-2 };
+        // Attention reads K and V as stored (f16 or q8; the exact cells of the
+        // tile formats are f16) on f16 tensor cores.
+        let bound = if kv == CacheFormat::Q8 { 3e-2 } else { 1e-2 };
         assert!(worst[1][0] < bound, "attention core {:.2e}", worst[1][0]);
         // The routed experts round their activations to 8 bits twice.
         for kind in &worst {

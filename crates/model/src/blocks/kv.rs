@@ -64,6 +64,18 @@ pub(crate) fn exact_pool_bytes(geos: &[CacheGeometry], slots: u32) -> u64 {
     geos.iter().map(|geo| geo.exact_entry_bytes()).sum::<u64>() * u64::from(slots)
 }
 
+/// What a group of layers with these `geos` and `slots` exact slots takes
+/// besides the pages when its table is the step's (`entries` entries): bytes
+/// on the device (the exact pool, the conversion jobs) and in page-locked host
+/// memory (the stage of the table, the jobs). Nothing without exact slots.
+pub(crate) fn group_bytes(geos: &[CacheGeometry], slots: u32, entries: u64) -> (u64, u64) {
+    if slots == 0 {
+        return (0, 0);
+    }
+    let jobs = 2 * (2 * u64::from(slots) + 8) * 8;
+    (exact_pool_bytes(geos, slots) + jobs, (entries * 4).max(16) + jobs)
+}
+
 /// What a device needs to size the exact pool of a group.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Sizing {
@@ -196,11 +208,11 @@ impl Group {
         let entries = max_slots as usize * stride as usize;
         let exact_bytes = exact_pool_bytes(&geos, slots);
         if slots > 0 {
-            ledger.reserve(format!("qwen35 {what}: exact K/V entries"), exact_bytes)?;
+            ledger.reserve(format!("{what}: exact K/V entries"), exact_bytes)?;
         }
         let own = if own_table {
             let bytes = (entries as u64 * 4).max(16);
-            ledger.reserve(format!("qwen35 {what}: page table"), bytes)?;
+            ledger.reserve(format!("{what}: page table"), bytes)?;
             let table = DeviceBuffer::new(device, bytes)?;
             // The mirror of the table starts as zeros, and so must the table: a
             // step writes only the entries that differ from the mirror.
@@ -217,7 +229,7 @@ impl Group {
         let jobs = if slots > 0 {
             let room = 2 * slots as usize + 8;
             let bytes = 2 * room * 8;
-            ledger.reserve(format!("qwen35 {what}: conversion jobs"), bytes as u64)?;
+            ledger.reserve(format!("{what}: conversion jobs"), bytes as u64)?;
             Some(Jobs {
                 host: PinnedBuffer::new(device, bytes)?,
                 device: DeviceBuffer::new(device, bytes as u64)?,

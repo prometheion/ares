@@ -48,12 +48,12 @@ use std::sync::{Arc, Mutex};
 
 use ares_core::{GgmlType, Ledger};
 use ares_cuda::{
-    Accumulate, ActivationForm, Arrival, AttendBuffers, AttentionKernels, AttentionShape, AttnItem,
-    AttnRow, AttnShape, CacheFormat, CacheGeometry, CommitSet, Departure, Device, DeviceBuffer,
-    DevicePtr, ENTRY_CELLS, Event, ExpertKernels, ExpertRowKernels, IndexerShape, Kernels,
-    KeyFormat, LayerKernels, ListHandOver, MAX_BATCH, MixerMatrix, NgramShape, OutputGate,
-    PinnedBuffer, Plan, PlanConfig, Planner, Precision, Q4Kernels, ReadWrite, RecurrentShape,
-    RopeParams, Segment, SelectionRule, StateFormat, StepRecord, Stream, WeightLayout,
+    Accumulate, ActivationForm, Arrival, AttentionKernels, AttentionShape, AttnItem, AttnRow,
+    AttnShape, CacheFormat, CacheGeometry, CommitSet, Departure, Device, DeviceBuffer, DevicePtr,
+    ENTRY_CELLS, Event, ExpertKernels, ExpertRowKernels, IndexerShape, Kernels, KeyFormat,
+    LayerKernels, ListHandOver, MAX_BATCH, MixerMatrix, NgramShape, OutputGate, PinnedBuffer, Plan,
+    PlanConfig, Planner, Precision, Q4Kernels, ReadWrite, RecurrentShape, RopeParams, Segment,
+    SelectionRule, StateFormat, StepRecord, Stream, WeightLayout,
 };
 use ares_runtime::ModelError;
 use ares_runtime::expert_store::cpu::act_bytes as cpu_act_bytes;
@@ -66,13 +66,18 @@ use super::load::{
     AttentionW, CoreW, DeviceWeights, LayerShare, LayerW, Mat, MixerW, MoeW, NgramW, RecurrentW,
     Role, SharedW,
 };
+use crate::blocks::kv;
 use crate::blocks::recurrent::{self, Inputs, Recurrent};
 use crate::qwen4exp::Config;
 use crate::qwen4exp::weights::Weights;
 
-/// Bit 31 of a table entry: the page is in the pool of stored formats (the
-/// only pool the formats without a tile mean use).
-pub const PAGE_ENTRY: u32 = 1 << 31;
+pub use crate::blocks::PAGE_ENTRY;
+
+/// The formats of K and of V of the draft block: 4 bits, whatever the model's,
+/// as on the 27B (`qwen35::device::DRAFT_KV`, measured there: the share of
+/// drafts the model accepts is the same as with `q8`). Not measured on this
+/// model.
+pub const DRAFT_KV: (CacheFormat, CacheFormat) = (CacheFormat::Q4, CacheFormat::Q4);
 
 /// The most pieces a row's device-made list is cut into.
 const MAX_PIECES: u32 = 16;
@@ -80,8 +85,10 @@ const MAX_PIECES: u32 = 16;
 /// The choices of a device implementation.
 #[derive(Clone, Debug)]
 pub struct Options {
-    /// The formats of K and of V. Only the formats without a tile mean (`f16`,
-    /// `q8`) are supported: the others need the exact pool and its conversion.
+    /// The formats of K and of V of the attention layers, chosen separately.
+    /// With a tile mean (`q7` to `q4`) the K/V group keeps a second, small
+    /// pool of exact entries and converts tiles as they leave the newest cells
+    /// ([`PAGE_ENTRY`] names the converted entry of a page).
     pub kv: (CacheFormat, CacheFormat),
     /// How the pooled keys of the indexer are stored.
     pub keys: KeyFormat,
@@ -309,6 +316,8 @@ struct AttentionAt {
     carry: u64,
     /// Offset in the indexer's kept inputs: the raw keys of a window.
     kept_raw: u64,
+    /// Offset in the exact pool of the K/V group (0 without one).
+    exact: u64,
 }
 
 /// What the peer of a part needs to know of it: where the kernels of the peer
@@ -473,6 +482,13 @@ struct Inbox {
 #[derive(Clone, Debug)]
 pub(crate) struct Frame {
     slot_bytes: u64,
+    /// The exact slots of the K/V group, and the bytes it takes besides the
+    /// pages on the device and in page-locked host memory.
+    exact_slots: u32,
+    exact_device: u64,
+    exact_host: u64,
+    /// Bytes of partial attention states the scratch holds for a plan.
+    attn_state_bytes: u64,
     recurrent: Vec<Option<RecurrentAt>>,
     attention: Vec<Option<AttentionAt>>,
     ngram_history: Option<u64>,
@@ -527,6 +543,11 @@ pub(crate) fn geometry(c: &Config, kv: (CacheFormat, CacheFormat)) -> CacheGeome
     }
 }
 
+/// The layer of the K/V group that the attention layer at `at` is.
+fn kv_layer(f: &Frame, at: &AttentionAt) -> kv::Layer {
+    kv::Layer { geo: f.geo, pool: at.kv_pool, exact: at.exact }
+}
+
 fn indexer_shape(c: &Config) -> IndexerShape {
     IndexerShape {
         n_head: c.indexer.n_head as u32,
@@ -559,12 +580,6 @@ impl Frame {
     ) -> Result<Self, ModelError> {
         let head = shape.head;
         let streams = shape.role != Role::Worker;
-        if opts.kv.0.has_mean() || opts.kv.1.has_mean() {
-            return Err(invalid(
-                "K/V formats with a tile mean (q7 to q4) need the exact pool and its conversion, \
-                 which this implementation does not manage yet: use f16 or q8",
-            ));
-        }
         if opts.max_rows == 0 || u64::from(opts.max_rows) * c.wide() as u64 >= 1 << 32 {
             return Err(invalid(format!("steps of up to {} rows", opts.max_rows)));
         }
@@ -584,6 +599,11 @@ impl Frame {
         let ng = ngram_shape(c);
         let plan_config = PlanConfig::for_multiprocessors(multiprocessors);
         let pages = u64::from(opts.pages());
+        // The exact slots of the K/V group, when its formats have a tile mean:
+        // no prefix cache holds tails here.
+        let sizing = kv::Sizing { slots: opts.max_slots, rows: opts.max_rows, tails: 0 };
+        let exact_slots = kv::slots_for(opts.kv.0, opts.kv.1, sizing);
+        let mut exact_at = 0u64;
 
         let r = &c.recurrent;
         let (cd, kd, vd, nv) =
@@ -617,7 +637,10 @@ impl Frame {
                 pool_bytes = (key_pool + pages * ix.key_slot_bytes(opts.keys)).next_multiple_of(64);
                 let carry = slot_bytes;
                 slot_bytes = (carry + ix.carry_len() * 4).next_multiple_of(64);
-                a_at = Some(AttentionAt { kv_pool, key_pool, carry, kept_raw: keep(id * 4) });
+                let exact = exact_at;
+                exact_at += u64::from(exact_slots) * geo.exact_entry_bytes();
+                let kept_raw = keep(id * 4);
+                a_at = Some(AttentionAt { kv_pool, key_pool, carry, kept_raw, exact });
             } else {
                 any_recurrent = true;
                 // The part's key heads with their value heads: a narrower
@@ -696,7 +719,8 @@ impl Frame {
             );
         // A state is, per query head, the weighted V and the log of the sum.
         let state = c.attention.n_head as u64 * (u64::from(geo.head_dim) + 1) * 4;
-        s.attn_state = take(att * state_slots * state);
+        let attn_state_bytes = att * state_slots * state;
+        s.attn_state = take(attn_state_bytes);
         s.status = take(16);
         let expert_shape = ares_cuda::ExpertShape {
             n_embd: n as u32,
@@ -779,8 +803,15 @@ impl Frame {
         inbox.commit = take(inbox.record_cap);
         inbox.len = len;
 
+        let geos = vec![geo; attention.iter().flatten().count()];
+        let (exact_device, exact_host) =
+            kv::group_bytes(&geos, exact_slots, u64::from(opts.table_entries()));
         Ok(Self {
             slot_bytes: slot_bytes.max(64),
+            exact_slots,
+            exact_device,
+            exact_host,
+            attn_state_bytes,
             recurrent,
             attention,
             ngram_history,
@@ -837,6 +868,7 @@ impl Frame {
             + self.tables_bytes(opts)
             + self.x_bytes
             + self.owner_bytes
+            + self.exact_device
     }
 
     /// Bytes of page-locked host memory the part holds: the route records
@@ -846,6 +878,7 @@ impl Frame {
         (self.record_stride + self.act_host_stride + self.addr_stage) * layers as u64
             + self.inbox.len
             + self.tables_bytes(opts)
+            + self.exact_host
             + 16
     }
 
@@ -857,9 +890,9 @@ impl Frame {
 /// The attention plan of a step on the device.
 struct StepPlan {
     plan: Plan,
-    /// The row capacity of a list in ranges, when the lists are made on the
-    /// device; `None` for a plan the planner made for dense rows.
-    listed: Option<u32>,
+    /// What the hand-over of each row's lists reads, when the lists are made
+    /// on the device; `None` for a plan the planner made for dense rows.
+    hands: Option<Vec<ListHandOver>>,
     /// The blocks the longest row sees.
     max_blocks: u32,
 }
@@ -901,6 +934,9 @@ pub struct Part {
     /// for the planner.
     tables_host: PinnedBuffer,
     entries: Vec<u32>,
+    /// The K/V group of the part's attention layers: their exact pool, the
+    /// entries of the table that name it, and the rules of their rows.
+    kv: Option<kv::Group>,
     /// The recurrent layers: their state's format and a draft window's kept
     /// inputs.
     rec: Recurrent,
@@ -929,8 +965,8 @@ pub struct Part {
     /// the recurrent or attention half.
     peer: Option<(Ports, Vec<bool>)>,
     /// The record of a step whose deferred segments wait for their commit,
-    /// and which of its segments were direct.
-    deferred: Option<(StepRecord, Vec<bool>)>,
+    /// and the slot of each of its segments and whether it was direct.
+    deferred: Option<(StepRecord, Vec<(u32, bool)>)>,
     status_host: PinnedBuffer,
     status_pending: bool,
     marks: Option<Marks>,
@@ -1089,6 +1125,29 @@ impl Part {
         };
         let has_attention = f.attention.iter().any(Option::is_some);
         let attention = has_attention.then(|| AttentionKernels::load(device)).transpose()?;
+        // The K/V group writes the entries of its exact tiles into the
+        // attention half of the tables, which hold the conductor's entries.
+        let kv = has_attention
+            .then(|| {
+                let layers = f.attention.iter().flatten().map(|at| kv_layer(&f, at)).collect();
+                kv::Group::new(
+                    device,
+                    ledger,
+                    &format!("{label} attention layers"),
+                    layers,
+                    opts.kv,
+                    f.exact_slots,
+                    opts.pages(),
+                    opts.max_slots,
+                    opts.table_stride(),
+                    false,
+                )
+            })
+            .transpose()?
+            .map(|mut group| {
+                group.written(0, &entries);
+                group
+            });
         let marks = opts.profile.as_ref().map(|profile| Marks {
             profile: profile.clone(),
             on: false,
@@ -1135,6 +1194,7 @@ impl Part {
             tables,
             tables_host,
             entries,
+            kv,
             rec,
             kept_raw,
             records: DeviceBuffer::new(device, records_bytes)?,
@@ -1449,6 +1509,9 @@ impl Part {
             words[total + i] = entry & !PAGE_ENTRY;
             count += 1;
         }
+        if let Some(kv) = &mut self.kv {
+            kv.written(at, &self.entries[at..at + count]);
+        }
         if count > 0 {
             // SAFETY: both ranges are inside the tables and the mirror.
             unsafe {
@@ -1479,6 +1542,9 @@ impl Part {
         for i in 0..total as u32 {
             self.entries[i as usize] = PAGE_ENTRY | i;
             bytes.extend((PAGE_ENTRY | i).to_le_bytes());
+        }
+        if let Some(kv) = &mut self.kv {
+            kv.written(0, &self.entries);
         }
         bytes.extend((0..total as u32).flat_map(u32::to_le_bytes));
         // SAFETY: the mirror is `bytes.len()` long, up to its padding.
@@ -1581,6 +1647,15 @@ impl Part {
                 )));
             }
         }
+        if let Some(limit) = kv::Group::window_limit(self.opts.kv.0, self.opts.kv.1)
+            && let Some(s) = env.segments.iter().find(|s| !s.direct && s.n_rows > limit)
+        {
+            return Err(invalid(format!(
+                "a draft window of {} rows; with K/V as {:?} and {:?} a window has at most {limit} \
+                 rows (a tile that leaves the exact cells inside it must have been full before it)",
+                s.n_rows, self.opts.kv.0, self.opts.kv.1
+            )));
+        }
         if self.expert_at.len() != self.w.layers.len() {
             return Err(invalid("the part was not told where its experts are"));
         }
@@ -1591,64 +1666,109 @@ impl Part {
     }
 
     /// The attention plan of the step. While every row is within the dense
-    /// limit the planner cuts dense causal attention; a step with a row past
-    /// it gets a plan whose lists the selection kernel fills on the device
-    /// (rows within the limit get all their cells from it).
-    fn build_plan(&self, env: &StepEnv<'_>) -> StepPlan {
+    /// limit the planner cuts dense causal attention: the K/V group plans the
+    /// rows of a prompt together and a generated row as the only row of a step
+    /// (`kv::Group::plan_rows`). A step with a row past the limit gets a plan
+    /// whose lists the selection kernel fills on the device (rows within the
+    /// limit get all their cells from it): a list of the cells in converted
+    /// entries and one of those in exact entries, each with its pieces. A
+    /// generated row has the pieces it has alone in a step; the rows of a
+    /// prompt share the step's.
+    fn build_plan(&self, env: &StepEnv<'_>) -> Result<StepPlan, ModelError> {
         let (geo, ix) = (self.f.geo, self.f.ix);
+        let kv = self.kv.as_ref().ok_or_else(|| invalid("no K/V group"))?;
         let n_rows = env.record.dims().n_rows;
         let stride = self.opts.table_stride();
         let last = env.segments.iter().map(|s| s.pos0 as u32 + s.n_rows).max().unwrap_or(0);
         let max_blocks = (last / ix.block).max(1);
+        let config = self.f.plan_config;
         if last <= ix.dense_limit() {
-            let mut planner = Planner::new(geo, self.f.plan_config, n_rows);
-            for s in env.segments {
-                let table = s.slot * stride;
-                let entries = &self.entries[table as usize..(table + stride) as usize];
-                planner.dense(table, entries, s.row0, s.n_rows, s.pos0 as u32);
-            }
-            return StepPlan { plan: planner.finish(), listed: None, max_blocks };
+            let mut planner = Planner::new(geo, config, n_rows);
+            kv.plan_rows(&mut planner, env.segments, &self.entries, stride);
+            let plan = planner.finish();
+            self.check_states(&plan)?;
+            return Ok(StepPlan { plan, hands: None, max_blocks });
         }
-        let per_row = n_rows * geo.kv_heads;
-        let pieces = (self.f.plan_config.target_blocks / per_row).clamp(1, MAX_PIECES);
+        let entries = kv.entries(&self.entries);
+        let step_pieces = (config.target_blocks / (n_rows * geo.kv_heads)).clamp(1, MAX_PIECES);
+        let alone_pieces = (config.target_blocks / geo.kv_heads).clamp(1, MAX_PIECES);
         let cap = ix.max_ranges(0);
         let mut plan = Plan {
             rows: vec![AttnRow::default(); n_rows as usize],
             row_ids: (0..n_rows).collect(),
             ranges: vec![0; (n_rows * cap * 3) as usize],
-            state_slots: n_rows * pieces,
             needs_merge: true,
             ..Plan::default()
         };
+        // Per row: its pieces of the converted list and of the exact list.
+        let mut lists = Vec::with_capacity(n_rows as usize);
+        let mut slots = 0;
         for s in env.segments {
+            let pieces = if s.direct && s.n_rows > 1 { step_pieces } else { alone_pieces };
+            let table = s.slot * stride;
             for t in 0..s.n_rows {
-                let row = s.row0 + t;
-                plan.rows[row as usize] = AttnRow {
-                    table: s.slot * stride,
-                    pos: s.pos0 as u32 + t,
-                    slot_base: row * pieces,
-                    n_slots: pieces,
-                };
+                let (row, pos) = (s.row0 + t, s.pos0 as u32 + t);
+                let tiles = &entries[table as usize..][..(pos / ENTRY_CELLS + 1) as usize];
+                let converted = if tiles.iter().any(|e| e & PAGE_ENTRY != 0) { pieces } else { 0 };
+                let exact = u32::from(tiles.iter().any(|e| e & PAGE_ENTRY == 0));
+                plan.rows[row as usize] =
+                    AttnRow { table, pos, slot_base: slots, n_slots: converted + exact };
+                slots += converted + exact;
+                lists.push((row, converted, exact));
             }
         }
-        for row in 0..n_rows {
-            for piece in 0..pieces {
-                for kv_head in 0..geo.kv_heads {
-                    // Flag 1: the item reads converted entries.
-                    plan.items.push(AttnItem {
-                        table: plan.rows[row as usize].table,
-                        row0: row,
-                        n_rows: 1,
-                        kv_head,
-                        flags: 1,
-                        slot: piece,
-                        ..AttnItem::default()
-                    });
+        // The items of the converted lists, then those of the exact lists: the
+        // two kinds run on different kernels, a launch each.
+        let mut hands = vec![ListHandOver::default(); n_rows as usize];
+        for exact_list in [false, true] {
+            let start = plan.items.len();
+            for &(row, converted, exact) in &lists {
+                let hand = &mut hands[row as usize];
+                let (pieces, first) = if exact_list {
+                    (hand.item_exact, hand.pieces_exact) = (plan.items.len() as u32, exact);
+                    (exact, converted)
+                } else {
+                    (hand.item_conv, hand.pieces_conv) = (plan.items.len() as u32, converted);
+                    (converted, 0)
+                };
+                for piece in 0..pieces {
+                    for kv_head in 0..geo.kv_heads {
+                        // Flag 1: the item reads converted entries.
+                        plan.items.push(AttnItem {
+                            table: plan.rows[row as usize].table,
+                            row0: row,
+                            n_rows: 1,
+                            kv_head,
+                            flags: u32::from(!exact_list),
+                            slot: first + piece,
+                            ..AttnItem::default()
+                        });
+                    }
                 }
             }
+            if plan.items.len() > start {
+                let shape = AttnShape::for_vecs(geo.q_per_kv);
+                plan.groups.push((shape, start..plan.items.len()));
+            }
         }
-        plan.groups.push((AttnShape::for_vecs(geo.q_per_kv), 0..plan.items.len()));
-        StepPlan { plan, listed: Some(pieces), max_blocks }
+        for (row, hand) in hands.iter_mut().enumerate() {
+            (hand.ranges_off, hand.kv_heads) = (row as u32 * cap * 3, geo.kv_heads);
+        }
+        plan.state_slots = slots;
+        self.check_states(&plan)?;
+        Ok(StepPlan { plan, hands: Some(hands), max_blocks })
+    }
+
+    /// Whether the partial states of `plan` fit the scratch.
+    fn check_states(&self, plan: &Plan) -> Result<(), ModelError> {
+        let state = plan.state_bytes(&self.f.geo);
+        if state > self.f.attn_state_bytes {
+            return Err(invalid(format!(
+                "the attention plan needs {state} bytes of partial states, {} are reserved",
+                self.f.attn_state_bytes
+            )));
+        }
+        Ok(())
     }
 
     /// Starts a step: sends the record, the embeddings and the attention
@@ -1680,7 +1800,17 @@ impl Part {
             return Err(invalid(format!("a step record of {} bytes", record.len())));
         }
         let has_attention = self.attention.is_some();
-        let plan = has_attention.then(|| self.build_plan(env));
+        // The exact K/V entries of the step: tiles that left their sequence's
+        // newest cells are converted, the pages the rows write get exact slots,
+        // and the table names them; the conversions run in front of the step.
+        if let Some(kv) = &mut self.kv {
+            let reaches = kv::reaches(env.segments, &[]);
+            let status = self.scratch.ptr().offset(self.f.s.status);
+            let (tables, pools) = (self.tables.ptr(), env.pools);
+            let kernels = self.attention.as_ref();
+            kv.prepare(kernels, stream, &reaches, &self.entries, tables, pools, status, true)?;
+        }
+        let plan = has_attention.then(|| self.build_plan(env)).transpose()?;
         let ib = self.f.inbox;
         let host = self.inbox_host.as_mut_ptr();
         // SAFETY: the pinned buffer has the sections of `Inbox`; the copies
@@ -1715,18 +1845,8 @@ impl Part {
             };
             step_plan.plan.write(bytes);
             sent = ib.plan + layout.bytes;
-            if let Some(pieces) = step_plan.listed {
-                let cap = self.f.ix.max_ranges(0);
-                let hands: Vec<ListHandOver> = (0..n)
-                    .map(|row| ListHandOver {
-                        ranges_off: row * cap * 3,
-                        item_conv: row * pieces * self.f.geo.kv_heads,
-                        pieces_conv: pieces,
-                        kv_heads: self.f.geo.kv_heads,
-                        ..ListHandOver::default()
-                    })
-                    .collect();
-                let bytes = ListHandOver::to_bytes(&hands);
+            if let Some(hands) = &step_plan.hands {
+                let bytes = ListHandOver::to_bytes(hands);
                 // SAFETY: as above.
                 unsafe {
                     std::ptr::copy_nonoverlapping(
@@ -2344,7 +2464,6 @@ impl Part {
         let step = self.inbox_at(ib.record);
         let tables = self.tables.ptr();
         let key_table = self.tables.ptr().offset(4 * u64::from(self.opts.table_entries()));
-        let kv_pool = env.pools.offset(at.kv_pool);
         let key_pool = env.pools.offset(at.key_pool);
         let carry = self.state.ptr().offset(at.carry);
         let carry_stride = self.f.slot_bytes / 4;
@@ -2386,17 +2505,20 @@ impl Part {
                 Some(gate),
                 k,
             )?;
-            kernels.append(
+            let layer = kv_layer(&self.f, &at);
+            self.group()?.append(
+                &kernels,
                 stream,
-                &geo,
+                &layer,
                 plan_rows,
-                rows,
                 k,
                 v,
                 tables,
-                DevicePtr::NULL,
-                kv_pool,
+                env.pools,
                 self.at(s.status),
+                &[],
+                0,
+                rows,
             )?;
             self.q4.indexer_window(
                 stream,
@@ -2433,7 +2555,7 @@ impl Part {
                 self.plan = Some(step_plan);
                 return self.mark(stream, Phase::Attention);
             }
-            if step_plan.listed.is_some() {
+            if step_plan.hands.is_some() {
                 let (ranges, items) = (base.offset(layout.ranges), base.offset(layout.items));
                 let (scores, counts) = (self.at(s.scores), self.at(s.counts));
                 self.q4.block_scores(
@@ -2449,14 +2571,16 @@ impl Part {
                     rows,
                     step_plan.max_blocks,
                 )?;
-                // Every entry is in the pool of stored formats: one list.
+                // Without exact entries every entry is in the pool of stored
+                // formats: one list.
+                let kinds = self.group()?.has_exact().then_some(tables);
                 self.q4.select(
                     stream,
                     ix,
                     self.opts.rule,
                     plan_rows,
                     scores,
-                    None,
+                    kinds,
                     ranges,
                     counts,
                     0,
@@ -2466,19 +2590,17 @@ impl Part {
                 )?;
                 self.q4.hand_over(stream, self.inbox_at(ib.hands), counts, ranges, items, rows)?;
             }
-            kernels.attend(
+            self.group()?.attend(
+                &kernels,
                 stream,
-                &geo,
+                &layer,
                 &buffers,
-                &AttendBuffers {
-                    tables,
-                    exact_pool: DevicePtr::NULL,
-                    converted_pool: kv_pool,
-                    q,
-                    gate: Some(gate),
-                    out: o,
-                    scratch: self.at(s.attn_state),
-                },
+                tables,
+                env.pools,
+                q,
+                Some(gate),
+                o,
+                self.at(s.attn_state),
                 1.0 / (geo.head_dim as f32).sqrt(),
             )?;
             self.mark(stream, Phase::Attention)?;
@@ -2667,8 +2789,8 @@ impl Part {
             self.status_pending = true;
         }
         if env.segments.iter().any(|s| !s.direct) {
-            self.deferred =
-                Some((env.record.clone(), env.segments.iter().map(|s| s.direct).collect()));
+            let segments = env.segments.iter().map(|s| (s.slot, s.direct)).collect();
+            self.deferred = Some((env.record.clone(), segments));
         }
         let Some(head) = self.w.head.filter(|_| self.role != Role::Worker) else {
             self.flush(env)?;
@@ -2724,6 +2846,25 @@ impl Part {
         self.end(env)
     }
 
+    /// The K/V group of the part's attention layers.
+    fn group(&self) -> Result<&kv::Group, ModelError> {
+        self.kv.as_ref().ok_or_else(|| invalid("no K/V group"))
+    }
+
+    /// Tells the part that the pool freed these pages, so that the K/V group
+    /// gives back what it kept for them.
+    pub fn release_pages(&mut self, pages: impl IntoIterator<Item = u32>) {
+        if let Some(kv) = &mut self.kv {
+            kv.release(pages);
+        }
+    }
+
+    /// The exact slots of the K/V group: how many there are and how many hold
+    /// a page now.
+    pub fn exact_slots(&self) -> (u32, u32) {
+        self.kv.as_ref().map_or((0, 0), kv::Group::slots)
+    }
+
     /// Whether the part keeps what draft windows need for their commit.
     fn keeps_windows(&self) -> bool {
         self.rec.kept_bytes() > 0 || self.kept_raw.is_some()
@@ -2745,15 +2886,21 @@ impl Part {
         };
         let dims = record.dims();
         let mut given = accepted.iter();
-        for (j, direct) in segments.iter().enumerate() {
+        let mut windows = Vec::new();
+        for (j, (slot, direct)) in segments.iter().enumerate() {
             if !direct {
                 let count =
                     given.next().ok_or_else(|| invalid("an outcome per draft window is needed"))?;
                 record.set_accepted(j, *count)?;
+                windows.push((*slot, *count));
             }
         }
         if given.next().is_some() {
             return Err(invalid("more outcomes than draft windows"));
+        }
+        // The cells the windows accepted are settled in the K/V group.
+        if let Some(kv) = &mut self.kv {
+            kv.commit_windows(&windows, &self.entries);
         }
         let ib = self.f.inbox;
         let bytes = record.as_bytes();

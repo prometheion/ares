@@ -222,6 +222,21 @@ The blocks so far:
   step (conversions, exact slots, the table), settles a draft window at its
   commit, and copies, sends to the host and takes back a page in the form it
   has. The 27B has two groups: its attention blocks, and its draft block.
+  Flash-Next's attention layers are a group too, and so is its draft block
+  (a part of one layer), whose K and V are `q4` whatever the model's. Its
+  table is the attention half of the part's tables, which hold the
+  conductor's entries; the group writes the entries of exact tiles over them
+  at the start of a step. Where every row is within the indexer's dense
+  limit the group plans the rows as for the 27B (a generated row as the only
+  row of a step: a row is twelve vectors there, so it reads the tensor-core
+  kernels either way, and a window's rows share their tiles). Past the limit
+  the indexer's selection kernel fills each row's lists on the device, cut by
+  the kind of entry the table names (`Q4Kernels::select` with the tables): a
+  list of cells in converted entries, read on the direct kernel, and one of
+  cells in exact entries, read on the tensor cores, each with its pieces. A
+  generated row has the pieces it has as the only row of a step, the rows of
+  a prompt share the step's. The selection is Flash-Next's; the group owns
+  which entries the lists name.
 - **The recurrent block** (`blocks/recurrent.rs`): the layers of the gated
   delta rule with their extents in a sequence's slot (a convolution window
   and the delta-rule matrices per layer) and the inputs a draft window keeps.
@@ -3711,7 +3726,7 @@ costs slots, so without `--context` the K and V of the pool take a
 thirty-second of the room for slots (17 408 to 18 432 tokens for two sequences
 on this machine) where the 27B gets what is left. Options that mean nothing for the
 model are errors that name them: `--shares`, `--precision exact`,
-`--draft-vocab`, K/V formats with a tile mean, more sequences than the eight rows of a
+`--draft-vocab`, more sequences than the eight rows of a
 generating step (`--parallel`), `--drafters mtp` (the model file carries no draft block;
 `--drafters FILE` names the block's file), and `--window` without a drafter or beyond
 the eight rows of a step that verifies.
