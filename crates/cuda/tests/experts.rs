@@ -31,8 +31,9 @@ use std::sync::OnceLock;
 
 use ares_core::GgmlType;
 use ares_cuda::{
-    Device, DeviceBuffer, ExpertKernels, ExpertShape, HostShare, Kernels, PinnedBuffer,
-    PrefillPath, RouteRecord, Stream, Wait, device_count,
+    Device, DeviceBuffer, ExpertKernels, ExpertShape, HostShare, Kernels, NearEntry, PinnedBuffer,
+    PrefillPath, Prune, PruneLayer, PruneRule, PruneWeights, RouteRecord, Stream, Wait,
+    device_count,
 };
 
 fn gpus() -> Option<&'static [Device]> {
@@ -743,6 +744,226 @@ fn the_router_routes_more_rows_than_a_decode_step_takes() {
                     );
                 }
             }
+        }
+    }
+}
+
+/// What a pruned row computes by the rules of `kernels/expert_router.cuh`, from the
+/// router's picks and weights (`ids`, `weights`, as the record has them), every expert's
+/// probability, which experts are in a tier, and each expert's list of most similar ones:
+/// (expert, weight) in rank order.
+fn reference_prune(
+    prune: &Prune,
+    ids: &[u32],
+    weights: &[f32],
+    prob: &[f32],
+    cached: &[bool],
+    near: &[Vec<NearEntry>],
+) -> Vec<(u32, f32)> {
+    let k = ids.len();
+    let mut touched: Vec<bool> = (0..k)
+        .map(|j| {
+            !cached[ids[j] as usize]
+                && j as u32 >= prune.from_rank
+                && weights[j] < prune.below_weight
+        })
+        .collect();
+    let mut stand: Vec<Option<(u32, f32)>> = vec![None; k];
+    match prune.rule {
+        PruneRule::Skip => {}
+        PruneRule::Router => {
+            let mut candidates: Vec<u32> = (0..prob.len() as u32)
+                .filter(|e| cached[*e as usize] && !ids.contains(e))
+                .collect();
+            candidates
+                .sort_by(|a, b| prob[*b as usize].total_cmp(&prob[*a as usize]).then(a.cmp(b)));
+            let mut next = candidates.into_iter();
+            for j in 0..k {
+                if touched[j] {
+                    stand[j] = next.next().map(|e| (e, 1.0));
+                }
+            }
+        }
+        PruneRule::Similar => {
+            for j in 0..k {
+                if !touched[j] {
+                    continue;
+                }
+                let found = near[ids[j] as usize]
+                    .iter()
+                    .take_while(|n| {
+                        (n.closeness.clamp(0.0, 1.0) * 65535.0).round()
+                            >= (prune.min_closeness.clamp(0.0, 1.0) * 65535.0).round()
+                    })
+                    .find(|n| {
+                        let y = u32::from(n.expert);
+                        cached[y as usize]
+                            && !ids.contains(&y)
+                            && !stand.iter().flatten().any(|(s, _)| *s == y)
+                    });
+                stand[j] = found.map(|n| (u32::from(n.expert), n.scale));
+                touched[j] = found.is_some();
+            }
+        }
+    }
+    let mut computed: Vec<(u32, f32, f32)> = Vec::new();
+    for j in 0..k {
+        if !touched[j] {
+            computed.push((ids[j], prob[ids[j] as usize], weights[j]));
+        } else if let Some((y, scale)) = stand[j] {
+            let kept =
+                if prune.weights == PruneWeights::Scaled { weights[j] * scale } else { weights[j] };
+            computed.push((y, prob[y as usize], kept));
+        }
+    }
+    let sum: f32 = computed.iter().map(|c| c.1).sum();
+    computed
+        .into_iter()
+        .map(|(e, p, kept)| {
+            (
+                e,
+                if prune.weights == PruneWeights::Renormalise {
+                    p / sum.max(1.0 / 16384.0)
+                } else {
+                    kept
+                },
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn a_pruned_router_computes_what_its_rule_says() {
+    let Some(gpus) = gpus() else { return };
+    let layer = synthetic_layer(GgmlType::IQ2_S, 31);
+    let shape = &layer.shape;
+    let (n, k, e) = (shape.n_embd as usize, shape.top_k as usize, shape.n_experts as usize);
+    let mut rng = Rng(77);
+    // Every other expert or so is in a tier; each expert's list of similar
+    // ones is six others with falling closeness.
+    let cached: Vec<bool> = (0..e).map(|_| rng.next() % 5 < 2).collect();
+    let near_count = 6usize;
+    let near: Vec<Vec<NearEntry>> = (0..e)
+        .map(|x| {
+            let mut closeness = 0.95;
+            (0..near_count)
+                .map(|i| {
+                    closeness -= 0.1 + 0.05 * (rng.unit() + 1.0);
+                    let y = (x + 1 + (rng.next() as usize + i * 7) % (e - 1)) % e;
+                    NearEntry { expert: y as u16, closeness, scale: 0.5 + (rng.unit() + 1.0) }
+                })
+                .collect()
+        })
+        .collect();
+    let cached_bytes: Vec<u8> = cached.iter().map(|c| u8::from(*c)).collect();
+    let near_bytes: Vec<u8> = near.iter().flatten().flat_map(|n| n.to_bytes()).collect();
+    let mut dials = Vec::new();
+    for rule in [PruneRule::Skip, PruneRule::Router, PruneRule::Similar] {
+        for weights in [PruneWeights::Keep, PruneWeights::Renormalise, PruneWeights::Scaled] {
+            dials.push(Prune { weights, ..Prune::new(rule, 1) });
+        }
+    }
+    dials.push(Prune { below_weight: 0.3, ..Prune::new(PruneRule::Skip, 0) });
+    dials.push(Prune { min_closeness: 0.6, ..Prune::new(PruneRule::Similar, 0) });
+    // Every expert in a tier: nothing is touched.
+    let all = vec![1u8; e];
+    for n_rows in [1u32, 3, 8] {
+        let x: Vec<f32> = (0..n_rows as usize * n).map(|_| rng.activation()).collect();
+        for device in gpus {
+            let rig = Rig::new(device, &layer, n_rows, 1);
+            let plain = rig.route(shape, &x, n_rows, 5);
+            let tables = DeviceBuffer::new(device, (2 * e + near_bytes.len()) as u64).unwrap();
+            tables.write(0, &cached_bytes).unwrap();
+            tables.write(e as u64, &all).unwrap();
+            tables.write(2 * e as u64, &near_bytes).unwrap();
+            let route = |prune: &Prune, cached_at: u64| {
+                let layer = PruneLayer {
+                    cached: tables.ptr().offset(cached_at),
+                    near: tables.ptr().offset(2 * e as u64),
+                    near_count: near_count as u32,
+                };
+                // SAFETY: the buffers were sized for this shape and number of rows.
+                unsafe {
+                    rig.kernels
+                        .quantize_activations(
+                            &rig.stream,
+                            rig.x.ptr(),
+                            rig.act.ptr(),
+                            shape.n_embd,
+                            n_rows,
+                        )
+                        .unwrap();
+                    rig.experts
+                        .route_pruned(
+                            &rig.stream,
+                            shape,
+                            rig.router.ptr(),
+                            rig.act.ptr(),
+                            rig.logits.ptr(),
+                            rig.table.ptr(),
+                            rig.record.ptr(),
+                            n_rows,
+                            5,
+                            prune,
+                            &layer,
+                        )
+                        .unwrap();
+                }
+                rig.stream.synchronize().unwrap();
+                let mut record = vec![0u8; shape.record_bytes(n_rows) as usize];
+                rig.record.read(0, &mut record).unwrap();
+                record
+            };
+            // Nothing in the file only: the record of the plain router, bit for bit.
+            for prune in &dials {
+                assert_eq!(
+                    route(prune, e as u64),
+                    plain,
+                    "{prune:?}, {n_rows} rows, all in a tier"
+                );
+            }
+            let mut touched_rows = 0;
+            for prune in &dials {
+                let record = route(prune, 0);
+                let parsed = RouteRecord::parse(&record, shape.top_k, n_rows).unwrap();
+                let plain = RouteRecord::parse(&plain, shape.top_k, n_rows).unwrap();
+                let groups: Vec<_> = parsed.groups().collect();
+                assert!(groups.windows(2).all(|w| w[0].expert < w[1].expert));
+                for row in 0..n_rows as usize {
+                    // The record keeps the router's picks.
+                    let ids: Vec<u32> = parsed.ids(row).collect();
+                    let weights: Vec<f32> = parsed.weights(row).collect();
+                    assert_eq!(ids, plain.ids(row).collect::<Vec<_>>());
+                    assert_eq!(weights, plain.weights(row).collect::<Vec<_>>());
+                    let (prob, _) = reference_route(&layer, &x[row * n..(row + 1) * n]);
+                    let mut want = reference_prune(prune, &ids, &weights, &prob, &cached, &near);
+                    want.sort_by_key(|w| w.0);
+                    let got: Vec<(u32, f32)> = groups
+                        .iter()
+                        .filter(|g| g.rows >> row & 1 == 1)
+                        .map(|g| (g.expert, g.weight[row]))
+                        .collect();
+                    if want.len() != k || want.iter().any(|w| !ids.contains(&w.0)) {
+                        touched_rows += 1;
+                    }
+                    assert_eq!(
+                        got.iter().map(|g| g.0).collect::<Vec<_>>(),
+                        want.iter().map(|w| w.0).collect::<Vec<_>>(),
+                        "{prune:?}, row {row} of {n_rows}: picks {ids:?}"
+                    );
+                    for ((_, got), (expert, want)) in got.iter().zip(&want) {
+                        assert!(
+                            (got - want).abs() <= 1e-4 * want.abs().max(1e-3),
+                            "{prune:?}, row {row} of {n_rows}, expert {expert}: {got} against {want}"
+                        );
+                    }
+                }
+                let pairs: u32 = groups.iter().map(|g| g.rows.count_ones()).sum();
+                let missing = groups.iter().filter(|g| g.slot.is_none()).count();
+                assert_eq!(parsed.n_missing(), missing);
+                assert!(pairs <= n_rows * shape.top_k);
+            }
+            assert!(touched_rows > 0, "the rules touched nothing in {n_rows} rows");
         }
     }
 }

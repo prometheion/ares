@@ -47,7 +47,8 @@ pub use driver::{LIBRARY_ENV, driver_version};
 pub use error::{Error, Result};
 pub use experts::{
     Accumulate, EXPERT_MAX_EXPERTS, EXPERT_MAX_K, ExpertKernels, ExpertRowKernels, ExpertShape,
-    HostShare, ROWS_TILES, RouteGroup, RouteRecord, RowsItem, RowsPlan, RowsPlanLayout,
+    HostShare, NearEntry, Prune, PruneLayer, PruneRule, PruneWeights, ROWS_TILES, RouteGroup,
+    RouteRecord, RowsItem, RowsPlan, RowsPlanLayout,
 };
 pub use kernels::{
     ActivationForm, FEW_ROWS, FewPlan, Kernels, LayoutKernel, LayoutRows, LayoutTable, MAX_BATCH,

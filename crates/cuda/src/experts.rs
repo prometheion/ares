@@ -376,6 +376,11 @@ impl<'a> RouteRecord<'a> {
         self.top_k * self.n_rows
     }
 
+    /// The rows of the step the record was written for.
+    pub fn rows(&self) -> usize {
+        self.n_rows
+    }
+
     /// The number the record was written with.
     pub fn token(&self) -> u32 {
         self.word(0)
@@ -423,6 +428,103 @@ impl<'a> RouteRecord<'a> {
     }
 }
 
+/// What the router does with a pick whose expert only the file holds
+/// ([`ExpertKernels::route_pruned`], `kernels/expert_router.cuh`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PruneRule {
+    /// The pick is left out and contributes nothing.
+    Skip,
+    /// The router's best expert that is in a tier and that the row did not
+    /// pick stands in for it.
+    Router,
+    /// The first of the pick's most similar experts ([`NearEntry`]) that is
+    /// in a tier and that the row did not pick stands in for it; a pick
+    /// without one stays.
+    Similar,
+}
+
+/// The weights of what a pruned row computes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PruneWeights {
+    /// Every untouched pick keeps the router's weight; a stand-in takes the
+    /// weight of the pick it stands in for.
+    Keep,
+    /// Every computed expert gets its probability over the sum of the
+    /// probabilities of the computed experts.
+    Renormalise,
+    /// As [`PruneWeights::Keep`], a stand-in's weight times the scale of its
+    /// entry in the table of similar experts.
+    Scaled,
+}
+
+/// The dial of the pruning: which picks a rule may touch. A pick is touched
+/// when its expert is in no tier, its rank (0 the strongest) is `from_rank`
+/// or more, its weight is below `below_weight`, and, for
+/// [`PruneRule::Similar`], a stand-in has a closeness of `min_closeness` or
+/// more.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Prune {
+    pub rule: PruneRule,
+    pub weights: PruneWeights,
+    pub from_rank: u32,
+    pub below_weight: f32,
+    pub min_closeness: f32,
+}
+
+impl Prune {
+    /// `rule` for the picks from rank `from_rank` on (0 the strongest), with
+    /// the weights the rule is measured best with: the router's kept for
+    /// skip and similar, renormalised for the router's own stand-ins.
+    pub fn new(rule: PruneRule, from_rank: u32) -> Self {
+        let weights = match rule {
+            PruneRule::Router => PruneWeights::Renormalise,
+            PruneRule::Skip | PruneRule::Similar => PruneWeights::Keep,
+        };
+        Self { rule, weights, from_rank, below_weight: f32::INFINITY, min_closeness: 0.0 }
+    }
+}
+
+/// One entry of an expert's list of most similar experts, as the router's
+/// pruning reads it (`AresNear`): 8 bytes.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct NearEntry {
+    pub expert: u16,
+    /// How alike the two experts' outputs are, 0 to 1.
+    pub closeness: f32,
+    /// The factor that brings the stand-in's output nearest to the pick's.
+    pub scale: f32,
+}
+
+impl NearEntry {
+    /// Bytes of an entry.
+    pub const BYTES: usize = 8;
+
+    /// The entry as the kernels read it.
+    pub fn to_bytes(&self) -> [u8; 8] {
+        let mut out = [0u8; 8];
+        out[0..2].copy_from_slice(&self.expert.to_le_bytes());
+        out[2..4].copy_from_slice(&closeness_code(self.closeness).to_le_bytes());
+        out[4..8].copy_from_slice(&self.scale.to_le_bytes());
+        out
+    }
+}
+
+/// A closeness of 0 to 1 as the kernels compare it: 0 to 65535.
+fn closeness_code(closeness: f32) -> u16 {
+    (closeness.clamp(0.0, 1.0) * 65535.0).round() as u16
+}
+
+/// Where the pruning of one layer reads on the device.
+#[derive(Clone, Copy, Debug)]
+pub struct PruneLayer {
+    /// `n_experts` bytes: 0 for an expert only the file holds.
+    pub cached: DevicePtr,
+    /// `n_experts * near_count` [`NearEntry`]s, each expert's most similar
+    /// first; null when there is no table.
+    pub near: DevicePtr,
+    pub near_count: u32,
+}
+
 /// The kernels of the mixture of experts on one device.
 #[derive(Debug, Clone)]
 pub struct ExpertKernels {
@@ -431,6 +533,8 @@ pub struct ExpertKernels {
     select: Function,
     pick: Function,
     group: Function,
+    select_pruned: Function,
+    pick_pruned: Function,
     /// Per type of [`EXPERT_TYPES`]: the gate and up kernel and the down kernel.
     typed: Vec<(Function, Function)>,
 }
@@ -454,6 +558,8 @@ impl ExpertKernels {
             select: module.function("ares_expert_select")?,
             pick: module.function("ares_expert_pick")?,
             group: module.function("ares_expert_group")?,
+            select_pruned: module.function("ares_expert_select_pruned")?,
+            pick_pruned: module.function("ares_expert_pick_pruned")?,
             typed,
         })
     }
@@ -493,6 +599,103 @@ impl ExpertKernels {
             self.logits(stream, shape, router, act, logits, n_rows)?;
             self.select(stream, shape, logits, slot_table, record, n_rows, token)
         }
+    }
+
+    /// [`ExpertKernels::route`] with pruning: the same picks and weights go
+    /// into the record (the router's), and the groups, which are what the
+    /// expert kernels compute, follow `prune` for the picks whose expert
+    /// `layer.cached` says only the file holds. A row with no such pick
+    /// computes what [`ExpertKernels::route`] gives it.
+    ///
+    /// # Safety
+    ///
+    /// Those of [`ExpertKernels::route`], and `layer.cached` must address
+    /// `n_experts` bytes and `layer.near`, for [`PruneRule::Similar`],
+    /// `n_experts * near_count` entries, on the stream's device and alive
+    /// until the launches have run.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn route_pruned(
+        &self,
+        stream: &Stream,
+        shape: &ExpertShape,
+        router: DevicePtr,
+        act: DevicePtr,
+        logits: DevicePtr,
+        slot_table: DevicePtr,
+        record: DevicePtr,
+        n_rows: u32,
+        token: u32,
+        prune: &Prune,
+        layer: &PruneLayer,
+    ) -> Result<()> {
+        shape.check()?;
+        check_rows(n_rows)?;
+        check_align("router logits", logits, 4)?;
+        check_align("slot table", slot_table, 4)?;
+        check_align("route record", record, 4)?;
+        check_align("pruning table", layer.near, 4)?;
+        if prune.rule == PruneRule::Similar
+            && (layer.near == DevicePtr::NULL || layer.near_count == 0)
+        {
+            return Err(invalid(
+                "expert pruning",
+                "the rule of similar experts without a table".into(),
+            ));
+        }
+        let rule = match prune.rule {
+            PruneRule::Skip => 1,
+            PruneRule::Router => 2,
+            PruneRule::Similar => 3,
+        };
+        let mode = match prune.weights {
+            PruneWeights::Keep => 0,
+            PruneWeights::Renormalise => 1,
+            PruneWeights::Scaled => 2,
+        };
+        let below = if prune.below_weight.is_finite() { prune.below_weight } else { f32::MAX };
+        let tail = |args: Args| {
+            args.ptr(layer.cached)
+                .ptr(layer.near)
+                .u32(rule)
+                .u32(mode)
+                .u32(prune.from_rank)
+                .f32(below)
+                .u32(u32::from(closeness_code(prune.min_closeness)))
+                .u32(layer.near_count)
+        };
+        // SAFETY: the caller's guarantees.
+        unsafe { self.logits(stream, shape, router, act, logits, n_rows)? };
+        let threads = shape.n_experts.next_multiple_of(32);
+        if n_rows == 1 {
+            let args = tail(
+                Args::new()
+                    .ptr(logits)
+                    .ptr(slot_table)
+                    .ptr(record)
+                    .u32(shape.n_experts)
+                    .u32(shape.top_k)
+                    .u32(token),
+            );
+            // SAFETY: the argument list matches ares_expert_select_pruned.
+            return unsafe {
+                self.select_pruned.launch(stream, [1, 1, 1], [threads, 1, 1], 0, args)
+            };
+        }
+        let args = tail(
+            Args::new().ptr(logits).ptr(record).u32(shape.n_experts).u32(shape.top_k).u32(n_rows),
+        );
+        // SAFETY: the argument list matches ares_expert_pick_pruned.
+        unsafe { self.pick_pruned.launch(stream, [n_rows, 1, 1], [threads, 1, 1], 0, args)? };
+        let args = Args::new()
+            .ptr(logits)
+            .ptr(slot_table)
+            .ptr(record)
+            .u32(shape.n_experts)
+            .u32(shape.top_k)
+            .u32(n_rows)
+            .u32(token);
+        // SAFETY: the argument list matches ares_expert_group.
+        unsafe { self.group.launch(stream, [1, 1, 1], [threads, 1, 1], 0, args) }
     }
 
     /// The router's logits: `logits[b][e]` is row `e` of the router matrix
