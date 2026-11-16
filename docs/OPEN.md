@@ -220,25 +220,30 @@ Everything `FEATURES.md` lists for the 27B and not for Flash-Next is owed:
       (2026-11-15). Both projector files are the same tower (`qwen3vl_merger`: patches of
       16 x 16, 27 blocks of width 1152, a 2 x 2 merger to the language model's width; 888
       and 866 MiB), with different weights. An image becomes (W/32) x (H/32) rows: 256 for
-      512 x 512, 1024 for 1024 x 1024. Pieces, 0 and 1 done:
+      512 x 512, 1024 for 1024 x 1024. Pieces 0 to 3 done:
   - [x] 0. Reference numbers from the fork's `llama-mtmd-debug` on the CPU: rows of both
         projectors for eleven square patterns of 4 to 1024 rows, with the sum of every node of
         the graph. The program reads no image file, so no own image, no wide or tall grid and
         no resize went through the fork; the resize is checked against Pillow instead.
   - [x] 1. CPU reference of the tower (`ares-model::qwen3vl`): config, size rule, resize, patch
         rows, the pass. See "The image tower" in `ARCHITECTURE.md`.
-  - [ ] 2. The tower on the device: dense attention for heads of 72, layer norm with bias,
-        bias and GELU, the tower's rotary rotation, the position table's resize; `ffn_down`
-        padded from 4304 to 4320 inputs. The residual reaches 5400 to 8400, so `ffn_down`,
-        the residual add and the norms' statistics stay in `f32`; the device is held to the
-        exact reference (`Arithmetic::Exact`). Reference dumps of the fork:
-        `/var/tmp/ares-qwen3vl-ref` (with the notes of pieces 0 and 1).
-  - [ ] 3. Both homes for the tower's weights, as the owner requires (llama's `mmproj` with and
-        without `no-mmproj-offload`): resident in VRAM, or held in RAM and uploaded block
-        by block for each image so that no VRAM is taken for good; a key chooses. The tower
-        as a job the conductor plans. (Computed on the GPU in both cases.)
-  - [ ] 4. Cells and positions in the runtime: image spans next to tokens, positions (t, h, w)
-        per row, staging and a store of image rows.
+  - [x] 2. The tower on the device (`qwen3vl::DeviceTower`, `ares_cuda::TowerKernels`): the
+        products on the f16 tile kernels with f32 sums (`ffn_down` padded to 4320 inputs),
+        dense attention for heads of 72, norms with bias, bias and GELU, the 2-D rotation and
+        the position table's resize as kernels of their own; residual and norm statistics in
+        `f32`. Held to the exact reference per image (see "The image tower" in
+        `ARCHITECTURE.md`). Open: the faster f16 sums of the capped cards for the products and
+        the attention's second product, measured against that tolerance; the tower on Vulkan.
+  - [x] 3. Both homes for the tower's weights (`qwen3vl::Home`, a load option): resident in
+        VRAM, or in page-locked RAM and uploaded unit by unit into two slots of VRAM while the
+        unit before computes (no VRAM held between images beyond the two slots, 58 MiB); the
+        same rows bit for bit. Open: the server's key (with piece 7; proposed name
+        `--mmproj-weights ram|vram`, `ram` by default) and adding `DeviceTower::pinned_bytes`
+        to the `pinned_ram` of the model that carries the tower (with pieces 5 and 6).
+  - [ ] 4. The tower as a job the conductor plans (between steps, on the device whose link and
+        tensor cores are faster; its scratch reserved in the ledger at load). Cells and positions
+        in the runtime: image spans next to tokens, positions (t, h, w) per row, staging and a
+        store of image rows.
   - [ ] 5. The splice in `qwen35` (a row source in the embedding gather; positions in the draft chain's links).
   - [ ] 6. The splice in `qwen4exp` (host rows; the n-gram feed's image token).
   - [ ] 7. Routes (`image_url`, Anthropic `image`, Responses `input_image`), limits, errors, `--mmproj`.

@@ -171,7 +171,7 @@ machine (RTX 4070 + RTX 3060, Qwen3.8-27B) or read from the engines listed in
 | `ares-gguf` | Zero-copy GGUF reader (version 3, split files, validation at open), a small writer for tests | Done; tested against synthetic, truncated and corrupted files and real models |
 | `ares-quant` | CPU reference decoder for every GGUF type; the specification and reference codec of the engine's own KV formats (`f16`, `q8` to `q4`, tiles with a mean, the policy of exact cells) | Done; bit-identical to ggml's C code on fixtures generated from it; the KV formats are pinned by golden files and were measured on the K and V of real models |
 | `ares-sampler` | The definitions of the sampler: the settings of a row, the arithmetic every backend repeats bit for bit, the pick of one row written from its definitions (`sample_reference`), the penalties, DRY and logit bias the host works out, token masks | Done; the reference is checked against llama.cpp's samplers written again in double precision, the penalties against their definition; both backends' kernels are held to it bit for bit; see [Sampling](#sampling) |
-| `ares-cuda` | Driver API bound at run time, devices, memory, streams, events, modules, decode weight kernels for all 28 weight types, prefill weight kernels for eleven, the layer kernels of `qwen35`, attention over the stored K/V formats, the sampler's kernels, the mesh that sums across devices over peer access or the host | Device layer, decode, layer and attention kernels done; prefill kernels verified, their pass over the weights 1.3 times as fast as the fork's whole prefill; tested on both GPUs, with and without peer access |
+| `ares-cuda` | Driver API bound at run time, devices, memory, streams, events, modules, decode weight kernels for all 28 weight types, prefill weight kernels for eleven, the layer kernels of `qwen35`, attention over the stored K/V formats, the sampler's kernels, the image tower's kernels besides its products, the mesh that sums across devices over peer access or the host | Device layer, decode, layer and attention kernels done; prefill kernels verified, their pass over the weights 1.3 times as fast as the fork's whole prefill; tested on both GPUs, with and without peer access |
 | `ares-grammar` | The grammar engine on the host: GBNF grammars, JSON schemas, Lark and regular expressions turned into the set of tokens that may come next (llguidance behind a vocabulary of bytes per token), the reasoning gate, the cut of forbidden drafts | Done; GPU-free tests of the engine, and through the runtime and the server; see [Sampling](#sampling) |
 | `ares-vulkan` | The same device-level surface on Vulkan; decode and prefill weight kernels for all 28 weight types as compute shaders, the prefill ones on cooperative matrices; the layer kernels; attention over the stored K/V formats; the sampler's kernels; sums between devices | Device layer and weight, layer, attention and sampler kernels done (23 device, 9 kernel, 8 layer, 4 layout, 9 mesh, 9 attention and 8 sampler tests on both GPUs; the sampler's records equal `ares-sampler`'s reference bit for bit); no expert or `qwen4exp` kernels and no model yet |
 | `ares-state` | Page pool, page tables with copy on write, the prefix index (pages published as they fill, tails, announcements, priority classes), the checkpoint policy for recurrent state, page layouts | Done as bookkeeping; randomised model checks; the conductor's prefix cache uses them (see `ares-runtime`) |
@@ -182,7 +182,7 @@ machine (RTX 4070 + RTX 3060, Qwen3.8-27B) or read from the engines listed in
 | `ares-api` | Request (with every sampling field), event (text and probabilities), decision and error types; the `Engine` trait between HTTP and the runtime (`submit` for generation, `decide` for decisions, `stats`, `chat_format` for what a model's chat template declares about thinking) | Done, unit tested |
 | `ares-server` | The `ares` binary: loads a model on the devices and serves it over an OpenAI-compatible HTTP API, with the plan of devices, split, shares and context made from what the devices report | Serves `qwen35` and `qwen4exp` models (chat and plain completions, streamed and not, every sampling field and the probabilities of the tokens, `n` completions, timings, metrics, staged shutdown, the reasoning of a reply apart from its content and in the history, with llama-server's controls for thinking, tool calls held to the tools' schemas by a grammar, also when the model opens the call inside its thinking); 213 tests without a GPU, 17 that start the real binary (some need the 27B or the files of Flash-Next) and 26 that run the engine in the test's process (the 8 of tool calls have not been run); for `qwen35` the prefix cache is on, with `--ram` for the engine's RAM, for `qwen4exp` the RAM is mostly the tier of experts; a router mode that serves several models from a preset file, loads them on request and unloads them for room or when idle (host tests of the preset reader and of the state machine on a scripted loader; its 2 tests on real devices have not been run); no multimodal input, `/v1/systemone` answers 501 |
 | `ares-runtime` | The conductor thread and one thread per device, the step loop that connects plan, state and kernels, admission, speculation with the lookup drafter and with a model's own drafts, the `Model` trait a model implements, a synthetic model that drives the real kernels, and the expert store (VRAM slots, RAM tier, reads, the CPU computing what is not on a GPU) | Drives `qwen35` on one device, in tensor split and in layer split, with picks made on the device; implements `Engine::submit` (not `decide`); the prefix cache is in the conductor, checked against the host executor as an oracle and carried out by `qwen35` on the devices (checkpoints in page-locked RAM within one RAM limit, `PinnedRam`), and there is no spill of pages to RAM (a request that gives way stays in the pool's cache); the expert store is driven by the device threads of `qwen4exp` (see [Qwen3.8-Flash-Next through the runtime](#qwen38-flash-next-through-the-runtime)) |
-| `ares-model` | Model architectures: configuration and weight table from a GGUF, a CPU reference of the forward pass with explicit state (window and commit) that GPU implementations are compared with block by block, and the implementation on the devices | `qwen35` (Qwen3.5-0.8B, Qwen3.8-27B) runs through the runtime and the server, with the model's draft block. `qwen4exp` (Qwen3.8-Flash-Next) runs through the runtime and the server on one or two cards, without speculation (it has no draft head built, and the lookup in earlier text takes part only next to a model drafter), and through a session of its own that tests and measurements use. See [Several devices](#several-devices) |
+| `ares-model` | Model architectures: configuration and weight table from a GGUF, a CPU reference of the forward pass with explicit state (window and commit) that GPU implementations are compared with block by block, and the implementation on the devices | `qwen35` (Qwen3.5-0.8B, Qwen3.8-27B) runs through the runtime and the server, with the model's draft block. `qwen4exp` (Qwen3.8-Flash-Next) runs through the runtime and the server on one or two cards, without speculation (it has no draft head built, and the lookup in earlier text takes part only next to a model drafter), and through a session of its own that tests and measurements use. See [Several devices](#several-devices). The image tower `qwen3vl` (a CPU reference and the pass on one device, its weights in VRAM or in page-locked RAM) is not spliced into either model yet |
 
 Both test architectures are specified under [reference/](reference/):
 [qwen35](reference/qwen35-architecture.md) and
@@ -4312,12 +4312,12 @@ GPU that CUDA 13 does not run on.
 `ares-model::qwen3vl` holds the projector that both language models read images
 through (`clip.projector_type = qwen3vl_merger`; one file per model, the same
 shape with other weights and another output width): its configuration and
-weight table, the pixel work in front of it, and a CPU reference of the pass.
-The reference is a test oracle, as the references of the language models are.
-Nothing serves with it and nothing of the tower runs on a device yet. It sits
-in `ares-model` beside `qwen35` and `qwen4exp`, with the same parts (`config`,
-`weights`, `reference`), because the device implementation will be written
-there and held to it there.
+weight table, the pixel work in front of it, a CPU reference of the pass, and
+the pass on a device (see [On the device](#on-the-device) below). The reference
+is a test oracle, as the references of the language models are. Nothing serves
+with the tower yet: no route takes an image, and neither language model reads
+its rows. It sits in `ares-model` beside `qwen35` and `qwen4exp`, with the same
+parts (`config`, `weights`, `reference`, `device`).
 
 - **Configuration and weights** are read strictly: a `clip.*` key the
   implementation does not know, another projector type, deepstack layers, an
@@ -4326,8 +4326,9 @@ there and held to it there.
 - **Pixels** (`image`): the size rule (both sides to the nearest multiple of
   32 pixels with ties to the even multiple, then scaled into the limits of 8
   and 4096 rows by default), the bicubic resize in the 22-bit fixed point of
-  Pillow's resampling, and `(value / 255 - mean) / std`, each operation for
-  operation as llama.cpp's `mtmd` does it. The reference takes pixels; reading
+  Pillow's resampling, `(value / 255 - mean) / std`, each operation for
+  operation as llama.cpp's `mtmd` does it, and the patch rows in the merger's
+  order (`patch_rows`), which the reference and the device both read. Reading
   image files belongs to the server.
 - **The pass** (`reference`): patch rows of 768 values in the merger's order
   through the sum of the two patch kernels, the 48 x 48 position table resized
@@ -4375,6 +4376,124 @@ Sums of such values need `f32`.
 
 On the 16 threads of the development machine, under other load, the pass takes
 32 to 37 s for 256 rows and 115 to 127 s for 1024.
+
+### On the device
+
+`qwen3vl::DeviceTower` runs the pass on one device: an image's patch rows in
+(`image::patch_rows`, in the merger's order), the merged rows of the language
+model's width out, in a buffer on the device that the language model can read
+(the splice is not built). It needs compute capability 8.0.
+
+- **Products** are the tile kernels of the language models (`Kernels::matmul`)
+  on their f16 path: f16 operands, f32 sums. The activations are prepared in
+  that path's form (each row divided by the power of two above its largest
+  value, so a row of thousands keeps its precision). `ffn_down` has 4304
+  inputs, which is not a multiple of 32: its rows get 16 zero columns at load
+  and the GELU in front of it writes 16 zeros. The patch matrix is the sum of
+  the file's two kernels, formed once in `f32` (a matrix of 768 inputs; no
+  convolution).
+- **Everything else** is a module of its own (`kernels/tower.cu`,
+  `ares_cuda::TowerKernels`): the layer norm with its bias and the bias with
+  the tanh GELU, each writing the next product's f16 input in the launch that
+  computes it; the residual add in `f32` with the product's bias (the residual
+  reaches 5400 to 8400, see above); the patches' bias and the position table
+  resized to the grid, every operation the reference's in its order without
+  contraction, so these are its bits; query, key and value with their bias,
+  query and key rotated by the patch's row and column (the angles built by
+  multiplying on in `f32` as the reference does), as f16 rows per head; and the
+  attention.
+- **Attention** of every patch over every patch (up to 16384 patches for 4096
+  rows) has no mask and no pages, so it is a kernel of its own in the shape of
+  FlashAttention 2: a block holds 128 queries of one head (8 warps of 16) in
+  registers and walks the keys in chunks of 64, the next chunk copied into
+  shared memory while this one is computed; the head of 72 values is padded to
+  80 for the products, sums are f32, the softmax is online in f32, the
+  probabilities are rounded to f16 for the second product and summed as
+  rounded.
+- **Groups.** A block's work before and after its attention is row by row, so
+  it runs for 2048 patches at a time; what grows with the image is the
+  residual, query, key and value and the attention's output (16.5 KiB a
+  patch). The scratch of an image of 4096 rows is about 330 MiB, of 1024 rows
+  about 130 MiB.
+
+**Two homes for the weights** (`qwen3vl::Home`, a load option; llama.cpp's
+`mmproj` with and without `no-mmproj-offload`). The weights are one image of
+bytes in the device's layout, cut into units: the stem (patch matrix, bias,
+position table), each of the 27 blocks (29.1 MiB), and the merger's two
+matrices in parts of whole tiles of output rows no larger than a block (2 and
+2 parts for the 27B's projector, 2 and 1 for Flash-Next's).
+
+- *VRAM*: the image is uploaded at load and every unit is read where it lies.
+- *RAM* (the default): the image lies in page-locked RAM, which the model that
+  carries the tower books as required memory inside `--ram`
+  (`DeviceTower::pinned_bytes`, added to `Model::pinned_ram`). Every image
+  uploads it unit by unit into two slots of VRAM on a copy stream of the
+  tower's own: unit `u + 2` goes into the slot of unit `u` once the pass has
+  recorded that it is done with it, and the pass waits for a unit's upload
+  before its first launch, so the upload of the next unit runs while the
+  current one computes. Between images it holds the two slots and nothing
+  else.
+
+Both homes launch the same kernels on the same units, so their rows are the
+same bit for bit (the tests compare them).
+
+**Checked** against the exact reference (`tests/qwen3vl_device.rs`), with a
+tolerance measured per image as the reference's own tests measure theirs: the
+reference has a third arithmetic, `HalfOperands`, with the device's roundings
+(the inputs of every product in the f16 form above, the weights to f16,
+queries, keys, values and probabilities to f16); its distance from the exact
+rows says how far such roundings carry the image, and the device may be three
+times that far plus 0.1 %. The cases are the eleven square patterns of the
+reference dumps and the ten own images of the Pillow check (wide, tall, below
+the minimum, and one shrunk to 4060 rows), resized here; the reference's rows
+are kept in a directory, since an image of 4060 rows takes it over an hour on
+the CPU. Measured on both cards (2026-11-16, both projectors, every case up to
+1024 rows): the device is 3.0e-4 to 6.7e-3 from the exact rows, 0.62 to 1.8
+times as far as the reference with the device's roundings is, so no case used
+more than 37 % of its tolerance; the two homes gave the same rows bit for bit,
+and so did the two cards. TODO-4060
+
+The residual after the stem and after the first two blocks is checked value by
+value as well: 0.9e-4 to 1.7e-4 of the exact reference after the stem (the f16
+operands of the patch product), 2.1e-4 to 3.2e-4 after block 0 and 3.6e-4 to
+7.5e-4 after block 1, the same on both cards and in both homes. The kernels
+have tests of their own (`crates/cuda/tests/tower.rs`): the f16 rows the norm
+and the GELU write are the tile kernels' form byte for byte, the residual, the
+placing of parts and the positions are the host's `f32` bit for bit, the
+rotation is within an f16 step and the attention within 2e-3 of the host's in
+`f64`.
+
+**Measured** (2026-11-16, the 27B's projector, `examples/qwen3vl_tower.rs`:
+medians of three passes timed by events on the device, the homes taking turns;
+images of 256, 1024 and 4096 rows; load average 26 to 36):
+
+| | 256 rows | 1024 rows | 4096 rows |
+| --- | --- | --- | --- |
+| RTX 4070, weights in VRAM | 27.1 ms | 141.7 ms | 1017 ms |
+| RTX 4070, weights in RAM | 38.2 ms | 144.7 ms | 1019 ms |
+| RTX 3060, weights in VRAM | 63.1 ms | 310.6 ms | 2306 ms |
+| RTX 3060, weights in RAM | 279.8 ms | 342.9 ms | 2330 ms |
+| the attention's share (both cards) | 11 % | 29 to 30 % | 60 to 62 % |
+
+- *VRAM held between images*: 885.6 MiB in VRAM, 58.3 MiB (the two slots) in
+  RAM, which holds 885.6 MiB of page-locked RAM instead. The scratch of an
+  image is 328.6 MiB for 4096 rows (as the driver reports, 330 MiB).
+- *The uploads* of the RAM home take 37.2 to 37.8 ms on the RTX 4070 (25 GB/s)
+  and 279 ms on the RTX 3060 (3.3 GB/s, its link of four lanes) when they run
+  alone. A pass hides 70 % of them at 256 rows on the RTX 4070 and 92 to 94 %
+  from 1024 rows on; on the RTX 3060 an image of 256 rows waits for its weights
+  (22 % hidden: the pass computes in 63 ms what takes 279 ms to arrive), from
+  1024 rows on 88 to 91 % are hidden. What is not hidden there is the first two
+  units, which no computation precedes.
+- *The attention* reaches 45 to 55 TFLOPS on the RTX 4070 and 19 to 23 on the
+  RTX 3060 (counting `4 * patches^2 * 1152` operations a block, the padding of
+  the heads not counted). The rest of a pass runs at about 33 TFLOPS on the
+  RTX 4070 where the tile kernels alone reach 50 at these sizes: the row kernels
+  in between (norms, rotation, GELU, residual, the conversion of the
+  attention's output) move about 560 MB a block at 1024 rows, about a third of
+  the time outside the attention. Bias, GELU and residual in the epilogues of
+  the products would take most of that away; not built.
+- Loading the tower takes 0.6 to 2.2 s with the file in the page cache.
 
 ## What is taken from where
 
