@@ -8,7 +8,7 @@
 //!     [--prompt 256] [--tokens 2000] [--rule off|skip|router|similar] [--from-rank 8]
 //!     [--below-weight 0.05] [--weights keep|renorm|scaled] [--min-closeness 0.2]
 //!     [--near DIR] [--label NAME] [--out results.tsv] [--serve model|stream]
-//!     [--mixer 0 --core-share 0.76 --shared worker]
+//!     [--mixer 0 --core-share 0.76 --shared worker | --spread layers]
 //! qwen4exp_prune calibrate --model FIRST_PART.gguf --texts a.txt,b.txt --tokens 1024
 //!     --out FILE [--devices 0,1] [--ram-gib 8]
 //! qwen4exp_prune near --model FIRST_PART.gguf --calibration FILE --out DIR [--count 16]
@@ -83,6 +83,7 @@ struct Args {
     mixer: Option<usize>,
     core_share: Option<f64>,
     shared: Option<String>,
+    layers_split: bool,
     calibration: Option<PathBuf>,
     count: usize,
     candidates: usize,
@@ -118,6 +119,7 @@ fn parse() -> Result<Args, AnyError> {
         mixer: None,
         core_share: None,
         shared: None,
+        layers_split: false,
         calibration: None,
         count: 16,
         candidates: 48,
@@ -159,6 +161,13 @@ fn parse() -> Result<Args, AnyError> {
             "--mixer" => args.mixer = Some(value()?.parse()?),
             "--core-share" => args.core_share = Some(value()?.parse()?),
             "--shared" => args.shared = Some(value()?),
+            "--spread" => {
+                args.layers_split = match value()?.as_str() {
+                    "layers" => true,
+                    "auto" => false,
+                    other => return Err(format!("--spread {other}: auto or layers").into()),
+                }
+            }
             "--calibration" => args.calibration = Some(value()?.into()),
             "--count" => args.count = value()?.parse()?,
             "--candidates" => args.candidates = value()?.parse()?,
@@ -236,7 +245,9 @@ fn prune_of(args: &Args) -> Result<Option<Prune>, AnyError> {
 }
 
 fn session_options(args: &Args, c: &Config, rows: u32) -> SessionOptions {
-    let spread = if args.mixer.is_some() || args.core_share.is_some() || args.shared.is_some() {
+    let spread = if args.layers_split {
+        Spread::Layers
+    } else if args.mixer.is_some() || args.core_share.is_some() || args.shared.is_some() {
         Spread::Tensor {
             mixer: args.mixer,
             core_share: args.core_share,
