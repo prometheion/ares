@@ -32,7 +32,8 @@ between cards stay with the model. Today the two models share almost nothing ins
 - [x] 1. The K/V group as a block, the 27B onto it (bit for bit, same launches).
 - [x] 2. The recurrent (delta-rule) block, both models onto it (bit for bit).
 - [x] 3. Flash-Next onto the K/V group: K and V in `q7` to `q4`, windows as if alone.
-- [ ] 4. Slot state and checkpoints as one contract: Flash-Next's prefix cache with RAM and SSD.
+- [x] 4. Slot state and checkpoints as one contract: Flash-Next's prefix cache with RAM and SSD
+      (2026-11-16, `blocks/slots.rs`; the 27B moved onto it bit for bit).
 - [ ] 5. Token rows (embedding on the host, in the mapped file or on the card; the image rows).
 - [ ] 6. One driver for the draft block: Flash-Next's draft vocabulary and picks on the card,
       `--drafters mtp`; the 27B's drafts under a layer split. After the speculation piece.
@@ -225,7 +226,8 @@ other differed more by the load than by the drafts.
 ### Cache, tests, kernels
 - [x] K and V in `q7` to `q4` for this model (2026-11-16: the shared K/V group, see
       "Parity with the 27B" below).
-- [ ] Prefix cache for this model (it has none), with the RAM and SSD levels.
+- [x] Prefix cache for this model, with the RAM and SSD levels (2026-11-16, on the shared slot
+      block; see "Parity with the 27B").
 - [ ] Device tests that do not depend on machine load
       (`steps_wider_than_eight_rows_match_the_reference`,
       `every_layer_of_wide_steps_matches_the_reference`,
@@ -243,7 +245,12 @@ Everything `FEATURES.md` lists for the 27B and not for Flash-Next is owed:
       that reaches across the point where a tile leaves the newest cells reads that tile exact,
       not converted as the row alone would (rows within the limit read it as alone); the
       share of drafts accepted with the block's `q4` was not measured on this model.
-- [ ] The prefix cache with its RAM and SSD levels (see above).
+- [x] The prefix cache with its RAM and SSD levels (2026-11-16). Open: the draft block's last
+      cell of a page waits for the next token (the block is one token behind), so a page that is
+      cached at a sequence's end has it unwritten and a sequence that resumes there writes it
+      into the shared page while its tile is exact; only drafts can differ. With `--ram` small
+      enough that the tier of experts takes it all, the cache in RAM has its floor alone (one
+      checkpoint place and 16 pages with `--cache`, nothing without).
 - [ ] The draft block read from the model file (`--drafters mtp`) and a draft vocabulary.
 - Not owed (the owner, 2026-11-16): replies that are bit for bit the same from run to run.
   They differ slightly when the CPU computes missed experts, and that is accepted.
@@ -279,11 +286,12 @@ Everything `FEATURES.md` lists for the 27B and not for Flash-Next is owed:
       the first cut; on two cards most of the sampler's time on the RTX 3060 is the exchange.
 - [ ] F32 tile kernel is 2.5 times slower than BF16 (untuned).
 
-## Shared model layer (every model; the study `shared-model-layer.md`, steps 0 to 3 done)
-The K/V group and the recurrent block are shared (`crates/model/src/blocks`); the rule for what
+## Shared model layer (every model; the study `shared-model-layer.md`, steps 0 to 4 done)
+The K/V group, the recurrent block and the slot arena with its checkpoints are shared
+(`crates/model/src/blocks`); the rule for what
 becomes a block is in `ARCHITECTURE.md` ("The shared model layer"). Left, in the study's order:
-- [ ] Slot arena and checkpoints as a block (extents from the blocks, save, restore, transfer,
-      page copy over all groups); then the prefix cache of Flash-Next on it.
+- [x] Slot arena and checkpoints as a block (extents from the blocks, save, restore, transfer,
+      page copy over all groups); then the prefix cache of Flash-Next on it (2026-11-16).
 - [ ] Token rows (table at home on the host, in the mapped file or on the device; kept rows of
       a head view; a second row source for images); Flash-Next's embedding from staged rows.
 - [ ] One draft-block driver for both models (chain on the device, picks by the sampler); the
@@ -317,8 +325,8 @@ becomes a block is in `ARCHITECTURE.md` ("The shared model layer"). Left, in the
 ## Prompt cache (every model; RAM first, then SSD, as in the owner's fork)
 - [x] RAM level for the K/V state that leaves VRAM; write to SSD when the RAM level evicts
       (full or shrinking), at unload and at a clean stop (branch `cache/ram-level`).
-- [ ] The same for Flash-Next (its prefix cache first; the interfaces are the model's
-      `durable` and `transfer`, nothing of the levels is 27B-only).
+- [x] The same for Flash-Next (2026-11-16: its prefix cache on the shared slot block; no
+      runtime change was needed, also with both cards on every layer).
 - [ ] Locking a page's buffers costs about 0.5 ms per MB when RAM grows (a page of the 27B is
       4.6 MB): lock ahead in the background while a step runs.
 - [ ] A checkpoint that later requests left behind at deeper page boundaries is not written

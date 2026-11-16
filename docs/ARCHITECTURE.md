@@ -252,8 +252,30 @@ The blocks so far:
   window's accepted rows. Both models' recurrent layers run on it; what feeds
   it (the 27B's norm and products, Flash-Next's stream mixer) and what follows
   it (the gated norm in each model's form, the output product) stay theirs.
-  The slot arena that holds its extents beside other state (Flash-Next's
-  indexer carry and n-gram history) is still the model's.
+- **The slot arena and its checkpoints** (`blocks/slots.rs`): the state a
+  device part keeps per sequence, and what the prefix cache does with it and
+  with the pages. The arena holds a slot per sequence slot; the blocks that
+  keep state per sequence declare their extents in it one after the other
+  (`SlotLayout`: the recurrent block its windows and matrices, Flash-Next's
+  indexers their carried keys and its n-gram block its history), and a
+  sequence that starts in a slot starts from zeros. A **checkpoint** is the
+  extents a model declares (the slot, and state outside it: a draft block's
+  carry, the slot of a draft block that is a part of its own) and bytes the
+  host keeps of the sequence itself (Flash-Next's n-gram feed: its position
+  and last tokens), in a place in page-locked RAM (`Places`, locked in chunks
+  as they come into use). A **page** is every K/V group of the device (tag bit
+  `1 << i` in transit for the `i`-th, which says whether its entries are exact)
+  and every array kept per page besides them (an indexer's pooled keys): a
+  page copy copies all of it, a page goes to the host and back with all of it.
+  The copies of a record run in its order (`enqueue_copies`: saves, page
+  copies, restores), and what the prefix cache is told (`PrefixCache`,
+  `Durable`) is computed in one place from what each device declares before
+  it opens (`Declared`: the bytes of a checkpoint, the groups with their
+  formats and geometries, the bytes of the arrays); the fingerprint stays the
+  model's. Both models run on it: the 27B's checkpoint is its slot and its
+  draft block's carry row, Flash-Next's is described in "Qwen3.8-Flash-Next
+  through the runtime". Moved from the 27B as it was (its five fingerprint
+  cases bit for bit, the same copies and kernels in the same order).
 
 ## A step
 
@@ -557,9 +579,12 @@ one array per part, indexed by page number.
   - The host executor plays a device as an oracle: it keeps the cells of every
     page and the state of every slot as hashes of all tokens in order, and a
     row that reads a wrong one picks another token.
-- On the devices (`qwen35`, `crates/model/src/qwen35/device/part/resume.rs`),
-  in the order the record's documentation gives (the commit of the step
-  before, the saves, the page copies, the restores, the rows):
+- On the devices (the shared slot block `crates/model/src/blocks/slots.rs`;
+  `qwen35` in `crates/model/src/qwen35/device/part/resume.rs`, `qwen4exp` in
+  `crates/model/src/qwen4exp/device/resume.rs`, see "Qwen3.8-Flash-Next
+  through the runtime"), in the order the record's documentation gives (the
+  commit of the step before, the saves, the page copies, the restores, the
+  rows):
   - **A checkpoint** of a device part is its slot of the recurrent state (the
     convolution windows and delta-rule matrices of its blocks) and, on the
     device that holds the draft block, one row of the block's carry. It lies
@@ -773,7 +798,7 @@ tolerance for kernels is ten times that.
 **In RAM.** The prefix cache has a level in host memory below the devices,
 with or without a level on SSD under it, for every model whose device side
 moves its state to the host and back (`Model::durable`,
-`DeviceModel::transfer`; `qwen35` does, `qwen4exp` has no prefix cache yet).
+`DeviceModel::transfer`; both models do, on the shared slot block).
 The levels are the devices, RAM and the drive, as in the owner's llama.cpp
 fork; there is no level of the prompt cache in VRAM besides the working state
 on the cards. What RAM holds and what goes first is
@@ -4777,19 +4802,58 @@ from the SSD matters more (KL 0.011 on the 2-bit file for 1.45 times the speed w
 0.077 on Q4 for 2.5 times). `router` and `similar` stay as rules for measurement: they cost
 more at every rank that leaves most picks alone.
 
-**Taking part in the prefix cache** (`prefix_cache()` is `None`: every prompt
-is computed from its first token, a request that gives way comes back as a
-prompt of all its tokens) needs the device side to carry out what the step
-record asks: the saves and restores of the recurrent state of a slot (the
-convolution windows and delta matrices of 36 layers, the n-gram history and the
-carried indexer state of the attention layers: 112 MiB over both cards per
-slot, which would be a checkpoint), the copies of a page's entry (K, V and the
-keys of every attention layer), and replay segments, rows that rebuild
-recurrent state from cached cells and append nothing (the K/V append, the
-indexer's window and the n-gram commit would skip them). The host side needs
-the n-gram feed to be told what the cached prefix's last tokens were, because
-it keeps them per sequence for the hash of the rows of the table. The
-conductor's part, and the places for checkpoints in `PinnedRam`, exist.
+**The prefix cache** (`crates/model/src/qwen4exp/device/resume.rs`, on the
+shared slot block). Flash-Next takes part as the 27B does, with the levels in
+RAM and on SSD; what differs is what a checkpoint and a page hold:
+
+- **A checkpoint** of a device is the slot of its part (the convolution
+  windows and delta-rule matrices of its recurrent layers, the carried keys of
+  its indexers, the n-gram history); on the device of the draft block, the
+  block's slot (its indexer's carried keys) and its carry (the residual of the
+  sequence's last row that counts, which the block's next cell is paired
+  with); and on the device that holds the n-gram layer, what the n-gram feed
+  knows of the sequence: its position and its last two tokens, from which the
+  rows of the table that its next tokens need are found. That part is the
+  host's: it is written into the place when the save is queued and read from
+  it when the restore is, so it travels with the place to RAM and to the drive.
+- **A page** is the K/V entries and the pooled keys of the part's attention
+  layers and of the draft block (whose pools are its own buffer, with the
+  same page numbers): a page copy copies all of it, a page goes to the host
+  and back with all of it, each group's entries in the form they have.
+- **A replay** writes neither K and V nor pooled keys: the K/V append skips its
+  rows, and the indexer kernel leaves out the blocks of a segment with the
+  record's replay flag (bit 4, the runtime record's; `StepRecord::mark_replay`
+  for the records the part builds itself). Its rows advance the recurrent
+  state, the indexers' carried keys, the n-gram history and the feed as a
+  prompt's do. The draft block's cells of the replayed rows are cached too (the
+  sequence that computed them had the same tokens up to the end of the
+  replay), so the block follows a replay with its carry alone.
+- **The draft block one token behind.** The block's cell `i` pairs the
+  residual of cell `i` with the token of cell `i + 1`, so the last cell of a
+  page is written one step after the page is full, and only when the sequence
+  goes on. A sequence that stops at the end of a page leaves the block's last
+  cell of it unwritten, and the block settles that page all the same (else it
+  would keep an exact slot of `q4` for as long as the page is cached); a
+  sequence that resumes at a page boundary writes that cell into the cached
+  page while its tile is exact, and reads it without writing once the tile is
+  converted (a block row whose tile is converted reads and writes nothing).
+  Only drafts can differ by it; the model's own cells are never written behind
+  its sequence's end.
+- **The order** in a record: the commit of the step before (with the n-gram
+  feed's settling of the windows), the draft block's following of that step,
+  the freed pages and the tables, then the saves, the page copies and the
+  restores, then the chains and the rows; a record that only drafts does its
+  copies too.
+- **Memory.** A checkpoint of the IQ2_XS file is about 112 MiB over the two
+  cards in `f32` (36 recurrent layers of 48 value heads of 128 x 128; the
+  draft block adds its carry of 40 KiB and its indexer's 1.8 KiB). The places
+  are the prompt cache's, the lowest user of the engine's page-locked RAM:
+  the tier of experts has the allowance first, and the cache in RAM holds what
+  the tier leaves. With a full tier the cache has nothing beyond its floor:
+  with `--cache` one place and 16 pages that state passes through on its way
+  to the drive and back, which hold the last checkpoint of a conversation and
+  pages that leave the cards on their way to the drive; without `--cache`, no
+  checkpoint is taken and a hit replays every cached row.
 
 **Wide steps, measured** (2026-11-12, RTX 4070 and RTX 3060, the engine of before (`0a43601`,
 steps of eight rows) and the one with wide steps started one after the other, both with the

@@ -15,7 +15,7 @@ the kernels exist; no model runs there yet.
 | Larger than VRAM | no | experts in VRAM slots, a RAM tier and on the SSD; the CPU computes missed ones |
 | Own drafts (MTP) | draft block in the file, with a draft vocabulary | draft block from a file (`--drafters <file>`), its experts resident in VRAM; exact |
 | DFlash2 drafter (`--drafters <file>`) | chains, one card or tensor split, with the draft vocabulary; exact | chains, one card or both cards on every layer; the mean of the four streams |
-| Prefix cache | yes, with the RAM and SSD levels | no |
+| Prefix cache | yes, with the RAM and SSD levels | yes, with the RAM and SSD levels; its RAM is what the tier of experts leaves |
 
 ## Speed
 - Speculative decoding: the model's own drafts and a lookup in earlier text; the chain runs
@@ -35,9 +35,11 @@ the kernels exist; no model runs there yet.
   without drafts.
 
 ## Caches and memory
-- Prefix cache (27B): automatic, shared by all requests; checkpoints of the recurrent state.
-- Prompt cache in RAM (27B): what leaves the cards is kept in page-locked RAM inside `--ram`,
-  the lowest user of it, and comes back from there; elastic, without a flag.
+- Prefix cache (both models): automatic, shared by all requests; checkpoints of the state per
+  sequence (recurrent state, Flash-Next's indexer keys, n-gram history and feed, draft block).
+- Prompt cache in RAM: what leaves the cards is kept in page-locked RAM inside `--ram`,
+  the lowest user of it (below Flash-Next's tier of experts), and comes back from there;
+  elastic, without a flag.
 - Prompt cache on SSD: `--cache <DIR>`, `--cache-size` (default 32G), below RAM. Only what
   leaves RAM is written, and what is worth keeping at an unload or a stop; a conversation
   resumes after an unload and after a restart.
