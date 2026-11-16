@@ -112,11 +112,20 @@ other differed more by the load than by the drafts.
       still counts it for a model without a profile.
 - [x] Prediction on the device (branch `moe/predict`): right after a layer's router, on a
       stream of its own, the routers of the next two layers on the rows it read; the store
-      reads ahead what no tier holds, at most what the drives take of prefetches at once and
-      per step what the drive could read beside the step's demand reads; a drive takes two
-      prefetch chunks of 512 KiB beside a demand chunk (four alone). Wide steps predict the
-      next layer where the step before read from the file, read ahead through transit's
-      guesses. Fingerprint unchanged; measured in "Reading experts ahead of their router".
+      reads ahead what no tier holds where such reads have been picked at least half the
+      time (per kind of step, distance and place), into RAM nobody uses, at most what the
+      drives take of prefetches at once and per step what the drive could read beside the
+      step's demand reads; a drive takes two prefetch chunks of 512 KiB beside a demand chunk
+      (four alone). Wide steps predict the next layer where the step before read from the
+      file, read ahead through transit's guesses. Fingerprint unchanged. Measured: on the
+      IQ2_XS file with `--ram 8G` or `4G`, one card or two, a generated row's predicted
+      experts in no tier are picked 3 to 8 % of the time, so nothing is read ahead in
+      generation; rows of prompts in steps of eight read some (a quarter used). No speed
+      difference could be shown beside the spread of runs on the shared machine.
+- [ ] The prediction made only where it can pay: in steps of one row on these tiers no place
+      qualifies, and the card still applies two routers per layer (not seen in the step
+      times). A step could predict only now and then while no place qualifies, to keep the
+      counts, through the board as wide steps are asked.
       (A first attempt with the prediction on the host was rejected: it changed the text and
       halved generation on two cards; branch `moe/read-ahead` is kept as a record.)
 - [ ] The shared expert's output in the prediction's input (Run My AI: 11 % fewer misses on

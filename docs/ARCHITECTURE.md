@@ -4310,6 +4310,45 @@ runs), so their reads can start a layer or two before their records
   their bytes, those the record picked and those it did not (`ares_expert_ahead_*`, the
   wide steps' guesses included).
 
+*Measured* (2026-11-16, the IQ2_XS file, `qwen4exp_run --decode-at 1000 --decode-steps 128`
+on the first 1000 tokens of this document, read in steps of eight rows, then 128 generated;
+the engine's serving (`--serve model`); the build of before and the one with the predictions
+run one after the other in one turn of the shared GPU, the load given; the machine and the
+drive were shared with three other agents the whole time, and the same build gave 15 to 41
+tokens per second from run to run):
+
+| Run | Cards, `--ram-gib` | Build | Decode: median, mean | Reads from the file per step | Experts predicted in no tier per step, of them picked | Read ahead per step | Load |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | two, 8 | before | 26.86 ms, 33.5 tokens/s | 4.0 | | | 9 |
+| 1 | two, 8 | every prediction read (first form) | 23.57 ms, 40.2 | 2.9 | 35, 3 % of the reads used | 3.7 (0.11 used) | 7 |
+| 2 | two, 8 | the odds, one table | 26.19 ms, 30.9 | 5.5 | 53, 4.6 % | 1.1 (0.04 used) | 12 |
+| 2 | one, 8 | the odds, one table | 46.46 ms, 18.8 | 8.6 | 53, 7.8 % | 3.3 (0.47 used) | 13 |
+| 2 | one, 8 | before | 37.35 ms, 24.2 | 8.8 | | | 14 |
+| 3 | two, 8 | odds per kind of step | 26.30 ms, 29.6 | 7.3 | 61, 5.3 % | 0 | 7 |
+| 3 | two, 8 | before | 49.05 ms, 15.0 | 8.4 | | | 11 |
+| 3 | one, 8 | before | 30.19 ms, 30.3 | 8.0 | | | 9 |
+| 3 | one, 8 | odds per kind of step | 39.71 ms, 19.7 | 14.2 | 82, 8.0 % | 0 | 10 |
+| 3 | two, 4 | odds per kind of step | 38.12 ms, 22.2 | 14.0 | 84, 7.6 % | 0 | 11 |
+| 3 | two, 4 | before | 29.63 ms, 30.6 | 6.3 | | | 12 |
+| 4 | two, 8 | room nobody uses (`Want::Spare`) | 25.46 ms, 31.6 | 5.6 | 56, 4.6 % | 0 | 10 |
+| 4 | two, 8 | before | 22.68 ms, 40.9 | 2.8 | | | 12 |
+
+- *A generated row's picks that no tier holds are what a prediction gets wrong.* The routers
+  of the next two layers name about 650 experts a step of one row, half of which the routers
+  then pick; but of the 35 to 84 among them that no tier holds only 3 to 8 % are picked, and
+  no place of the lists reaches a half. So the store reads nothing ahead in steps of one row
+  on these tiers, and the fastest steps (17.8 to 18.5 ms) are the same with the predictions
+  as without: what they cost the card is not seen beside the spread of the runs.
+- *Rows of a prompt in steps of eight rows* name experts in no tier that are picked a fifth
+  of the time (20 % in the fingerprint's runs), and some places of their lists more often:
+  the store reads 3.5 to 4.6 experts ahead a step there, of which a quarter are used.
+- *What reading ahead cost.* Reads for nothing take the drive from the reads the steps wait
+  for (run 2 on one card: a miss from the file waited 3.7 ms at the median and 39.7 at the
+  99th percentile, against 2.6 and 8.0 before), and as long as they took the slot of the
+  coldest member of the RAM tier (run 3), the steps after the prompt read 14 experts a step
+  from the file where the build of before read 6 to 8. Hence the odds per kind of step and
+  the room nobody uses.
+
 **What the gap between 17 and 22 ms is made of, and what the size of the tier
 did.** The tool counts, for every decode step at 1000 tokens, the experts the
 routers picked that were in no slot, and splits the steps by what they missed
