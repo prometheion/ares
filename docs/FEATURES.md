@@ -13,12 +13,15 @@ the kernels exist; no model runs there yet.
 | Weight types | all 28 GGUF types | all 28, experts included |
 | K and V | `f16`, `q8` to `q4`, chosen separately (`--kv`) | `f16`, `q8` to `q4`, chosen separately (`--kv`); the draft block's in `q4` |
 | Larger than VRAM | no | experts in VRAM slots, a RAM tier and on the SSD; the CPU computes missed ones |
-| Own drafts (MTP) | draft block in the file, with a draft vocabulary | draft block from a file (`--drafters <file>`); exact, no gain yet |
+| Own drafts (MTP) | draft block in the file, with a draft vocabulary | draft block from a file (`--drafters <file>`), its experts resident in VRAM; exact |
 | Prefix cache | yes, with the RAM and SSD levels | no |
 
 ## Speed
-- Speculative decoding: the model's own drafts and a lookup in earlier text; window length
-  from measured prices. On the 27B the text with drafts is token for token the text without.
+- Speculative decoding: the model's own drafts and a lookup in earlier text; the chain runs
+  in a step of its own and the round verifies as many of its drafts as pay, by the
+  probability the drafter gave each and the measured price of a step. On the 27B the text
+  with drafts is token for token the text without. On Flash-Next a draft row waits for an
+  expert from the SSD only while it is worth the wait.
 - Prompts are read in steps of 512 rows, in pieces between rounds of generation, so running
   requests go on.
 - 27B: the token embedding lies in host RAM (380 to 518 MiB of VRAM saved on the first card).

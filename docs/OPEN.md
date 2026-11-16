@@ -14,7 +14,7 @@ Order of work the owner has set: CUDA complete for both models first, Vulkan par
 
 | Piece | State |
 | --- | --- |
-| Speculation that pays on Flash-Next: prices that follow the tiers (built), rows of unmade links leave the step, the draft block's experts resident, no window row waits for a file read; built in the conductor and the expert store, not in one model | agent working (branch `sched/live-prices`) |
+| Speculation that pays on Flash-Next: prices that follow the tiers (built), rows of unmade links leave the step, the draft block's experts resident, no window row waits for a file read; built in the conductor and the expert store, not in one model | built, measured; rebased onto steps 0 to 2 of the shared model layer (branch `sched/live-prices`) |
 | Shared model layer, steps 0 to 3 (see below); step 3 brings Flash-Next K and V in `q7` to `q4` | agent working (`model/shared-blocks`) |
 | Image tower on the device, weights resident in VRAM or in RAM and uploaded per image (pieces 2 and 3) | agent working (`vision/tower-device`) |
 | Test files: `Qwen3.8-Flash-Next-UD-Q4_K_XL` (104 GiB), then Flash-Next's DFlash2 drafter (3.1 GiB) | downloading to `/mnt/data/ares-models`, 6 MB/s |
@@ -44,34 +44,45 @@ between cards stay with the model. Today the two models share almost nothing ins
 ## Qwen3.8 Flash-Next (`qwen4exp`)
 
 ### Speculation that pays (output unchanged)
-The draft block is in `main` (`--drafters <file>`): exact, and slower with it. Measured
-2026-11-15 on two cards with `--ram 8G`, back to back: 16 to 27 tokens/s with it (55 once,
-on a text it could copy) and 20 to 40 without. The server now chooses windows in every
-request (1.7 to 3.7 tokens a step, 47 to 98 % of the drafts accepted), and a window step
-reads 9 to 56 experts from the file where a row reads 3.5 to 16.
+The draft block is in `main` (`--drafters <file>`): exact. Measured 2026-11-16 on two cards
+with `--ram 8G` (the runs are in "What made the draft block of Flash-Next pay" in
+`ARCHITECTURE.md`): with the block 21 to 35 tokens per second on new text and 27 to 64 the
+second time, against 13 to 22 and 17 to 29 without it at about the same load; one server
+asked with and without drafts in turn gave 12 to 35 % more with them on the mean. On one
+card (the RTX 4070, a third of the experts in VRAM) the block makes it 7 to 34 % slower.
+What is left is the file: at `--ram 8G` a quarter of the experts are only on the SSD, and a
+row of new text reads up to sixteen of them a token (Strata's 56 tokens per second run with
+the file in the page cache).
 - [x] Window prices that follow the tiers: a size's price is the mean of its last eight
       steps without the largest, and a size that has not run for 256 steps is tried again
-      at the price of the nearest smaller size that runs (`ares_sched::Curve`). The server
-      chooses windows on two cards (2026-11-15, see the Speculation section).
-- [ ] All 512 experts of the draft block resident in VRAM (about 700 MiB): a link costs
-      5 to 9 ms today, 1.5 ms when its experts are there.
+      at the price of the nearest smaller size that runs (`ares_sched::Curve`).
+- [x] All 512 experts of the draft block resident in VRAM (675 MiB, a pool of their own
+      outside the tiers, `LayerSpec::resident`): a link costs 1.4 to 1.6 ms where it took
+      5 to 9.
 - [x] Chain cut per token by the draft's own probability: the links. The block reports the
       probability of each draft, the conductor counts acceptance by probability and sets
       a bar per link from the step's rate and the link's price, and the chain ends at it.
-- [ ] The rows of the links a chain did not make leave the step. Today the window's rows
-      are fixed before the chain runs, so a cut saves links and not rows, and a row is what
-      a window of this model costs most (its experts). Needs the chain as a step of its
-      own before the window (the host then cuts the window, and can mask its rows), or a
-      window the device threads shorten together.
-- [ ] The price of a window by what it misses. The price of a size leaves out the dearest
-      of its last eight steps (so that a late step does not count), and on this model that
-      step is the one that fetched experts; and what a window brings into the tiers pushes
-      out what the next steps need, which no step is charged for. First to try: the plain
-      mean for a model whose steps wait for experts; then a price per row by where its
-      experts are. Until then `--drafters` costs this model speed.
-- [ ] Speculation never waits for a file read: a window row whose expert is not cached is
-      not accepted; the rows before it stay exact.
-- [ ] Draft vocabulary (German, English, code) for the draft block.
+- [x] The rows of the drafts that do not pay leave the step: the chain runs in a step that
+      only drafts, and the conductor chooses what the round verifies of it by the
+      probability of every draft (both models, `Conductor::chains_first`).
+- [x] The price of a window by what it misses: the plain mean for a model whose steps wait
+      for what they fetch (`Model::steps_wait_for_fetches`).
+- [x] A draft row waits for the file only while it is worth it (the record's row worth; the
+      store leaves a row whose reads cost more than it is worth, and the conductor accepts
+      nothing from it on). "Never wait" as first built left nearly every draft row at
+      `--ram 8G` and took the gain away.
+- [x] What a row was left without is read ahead for the next round (`StoreConfig::read_left`):
+      without it leaving only moved the read to the next round's first row.
+- [ ] Draft vocabulary (German, English, code) for the draft block: the block's head is the
+      model's whole output head (248 320 rows) on the device with the head; a subset of its
+      rows gathered next to it, and the block's sampler mapping back to token ids, as the
+      27B does it (`--draft-vocab`). Not started.
+- [ ] A window's price by what its rows read: on one card a round with drafts reads 100 to
+      260 experts from the file against 45 to 100 for a row, and what those reads push out of
+      the tiers and hold up for the next steps is charged to no step, so the conductor keeps
+      choosing windows that cost more than they bring. A price per row by the tier its
+      experts come from (the study's `dense(rows) + chain(links) + misses x cost per tier`),
+      or the block not resident where VRAM holds a third of the experts, are the leads.
 - [ ] `--drafters mtp` for a model file that carries its block; drafts in the measuring tool.
 
 ### Experts from the SSD
@@ -152,10 +163,11 @@ Everything `FEATURES.md` lists for the 27B and not for Flash-Next is owed:
 ## Qwen3.8 27B (`qwen35`)
 - [ ] Drafts under a layer split (Flash-Next drafts in every placement; the 27B not under
       `--split layer`): parity owed to the 27B, step 6 of the shared layer.
-- [ ] The draft chain's cut costs a wait of the host per link (the device thread reads the
-      link's picks before it enqueues the next); on 2026-11-15 the tokens per step rose and
-      the step got longer by about as much. A cut on the device (the links of a chain as
-      kernels that end early) would keep the gain.
+- [ ] The draft chain's cut costs a wait of the host per link where a bar can end it (the
+      device thread reads the link's picks before it enqueues the next); since 2026-11-16 the
+      chain is a step of its own and the round verifies only what pays of it, so the cut
+      saves links only. A cut on the device (the links of a chain as kernels that end
+      early) would keep the saving without the waits.
 - [ ] A generating step of more than 16 rows still changes kernel family (three sequences
       drafting at once): the last gap in "text with drafts is the text without" (which holds
       since 2026-11-16 for single sequences in every placement and K/V format). Texts under

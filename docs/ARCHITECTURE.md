@@ -1098,7 +1098,7 @@ it is how the engine drafts.
 | Part | What it is | State |
 | --- | --- | --- |
 | Lookup drafter | Continues the longest earlier occurrence of the current text, in this request or another: one suffix automaton over a corpus that all sequences share (`LookupCorpus`, `LookupDrafter`; after TensorRT-LLM, SGLang and vLLM's suffix decoding), with a confidence per proposed token and a bound on memory. It replaces the n-gram lookup per sequence; llama.cpp's map and cache variants are not built | Done and measured on text; the conductor uses it, next to a model drafter and never alone |
-| MTP | The model's own draft head or block | Done for `qwen35` on one device and under a tensor split: the block runs on the device with the embedding table, its chain and its picks stay on the device (`device/mtp.rs`); not under a layer split. Chains of up to the window's rows less one (7 by default). Done for `qwen4exp` in every placement, from a file of the block (`--drafters FILE`): the block runs on the device with the output head and the host reads every pick (see "Qwen3.8-Flash-Next through the runtime") |
+| MTP | The model's own draft head or block | Done for `qwen35` on one device and under a tensor split: the block runs on the device with the embedding table, its chain and its picks stay on the device (`device/mtp.rs`); not under a layer split. Done for `qwen4exp` in every placement, from a file of the block (`--drafters FILE`): the block runs on the device with the output head, its experts resident in VRAM, and the host reads every pick (see "Qwen3.8-Flash-Next through the runtime"). Both make their chains, of up to the window's rows less one (7 by default), in a step that only drafts, and the round verifies what pays of them |
 | DFlash, DSpark, DFlash2 | A small draft model that reads the target's hidden states at a few layers and proposes a block of tokens at once | Not built: it needs taps on the target's layers and a second model on the same devices. `--drafters FILE` is refused with "not built yet" for a `qwen35` model (the file is not opened; for a `qwen4exp` model the file is the model's own draft block); the choice of a window takes any number of drafters |
 | Drafter selection | Per step and for all sequences together, whose drafts go into each window, by expected tokens per millisecond of the whole step, from the price of a step and the acceptance measured per drafter, position and sequence; a proposal that was not taken learns from what turned out right | Done: `ares_sched::choose` |
 | Adaptive draft length | The length that maximises the same number | Done, in the same call; and a chain ends as it is made where one more link does not raise that number, by the probability the drafter gave its drafts (see "The chain is cut by the drafter's own probability") |
@@ -1175,7 +1175,12 @@ and for the links of a chain) is therefore built on two rules.
   smallest of five, and the server then chose windows whose usual step was
   cheap and whose mean was not). A size that changed is followed as its
   measurements are replaced, wholly after eight; the fit of the context term
-  takes no step that took more than twice its price.
+  takes no step that took more than twice its price. A model whose steps
+  wait for what they fetch (`Model::steps_wait_for_fetches`: Flash-Next,
+  whose experts in no VRAM tier are brought while the step waits) is priced
+  by the plain mean of the eight (`ares_sched::Estimate::Mean`): there the
+  dearest step is not late, it is the one that fetched, and what a size
+  fetches is what it costs.
 - *A size that has not run for 256 measurements of the table is old.* Its
   price is held between the prices of the nearest sizes on either side that
   are current (fewer rows do not cost more, more rows do not cost less), and
@@ -1228,29 +1233,60 @@ chain at the first link whose bar the reach misses. There is no threshold of
 its own in this: a link that costs nothing is always made, and one that costs
 more than a token never.
 
-A link that is not made comes back as no draft (`u32::MAX`), and its row of
-the window, which the record fixed before the chain ran, carries the last
-draft again and is not counted. So the cut saves links and not rows. The
-choice of the window knows it: a chain is priced by the links expected to be
+A link that is not made comes back as no draft (`u32::MAX`). The choice of
+the chain's length knows it: a chain is priced by the links expected to be
 made (the share of drafts that leave a chain above each bar), and a draft row
 counts only as often as its link is made behind a draft that was right, so
-windows are asked longer than the average draft would carry and the chain
+chains are asked longer than the average draft would carry and the chain
 decides per token how far it goes.
 
-What each drafter does with the bars:
+**The chain runs in a step of its own, and the round verifies what pays of
+it.** A round in which sequences take the model's own drafts is two records
+(`Conductor::chains_first`). The first only drafts (a flag of the record): its
+segments are the windows whose drafts the model makes, as long as their
+chains are asked, with the sampler rows their links pick with and the draft
+bars; the model makes the chains and nothing else, no row of the model runs
+and nothing is left to commit. What the record carries besides (the commit of
+the step before, the copies, the page tables, the freed pages) is carried out
+as in any record. The drafts come back with what the drafter said of each.
+Then the conductor knows every draft, and chooses how many of each chain the
+round verifies by the same rate it chooses windows by (`ares_sched::choose`,
+the chain paid for): a draft is worth the chance of its probability
+(`ares_sched::Confidence`) times the chances of the drafts before it, and a
+draft the request's rule forbids is cut with the drafts after it, as a
+lookup's is. The rows of the drafts it does not take are not in the step,
+and their cells leave the table. The round verifies the rest as tokens, with
+the masks the drafts before a row give it, like the lookup's drafts: so a
+request with a rule takes the model's drafts through the token that makes
+the rule bind and is masked from there on (`tests/free_drafts.rs`), and a
+request with penalties takes them too, each row with the corrections of its
+path (until 2026-11-16 such a request took only the lookup's drafts). The
+round's record also says what each draft row is worth (the record's row
+worth: the chance that the drafts up to its own are right times what a token
+costs at the rate the round was chosen for), which a model whose rows may
+have to wait for the file uses to decide whether a row is worth the wait (see
+"A row that verifies a draft waits for the file only while it is worth it"
+under [Weights](#weights)). A row the model leaves (`StepOutput::inexact`)
+gives no draft from it on: the conductor accepts at most the drafts the rows
+before it tested.
 
-- *The 27B's block* still enqueues its chain on the device, and now copies
-  every link's picks to the host. Where a bar can end the chain (the least
-  chance in the table would not carry the reach over it) the device thread
-  waits for those picks before it enqueues the next link; where no pick could
-  end it, nothing is waited for.
-- *The draft block of Flash-Next* reads every pick on the host as before; a
-  chain that ends there saves its links, which are the dear part of a window
-  while the block's experts are not resident.
-- *Removing the rows* of the links that were not made needs a step whose
-  shape follows the chain (the chain as a step of its own before the window,
-  or a window the device shortens); neither is built. It is what a window of
-  Flash-Next costs most, see `docs/OPEN.md`.
+The decision of a window's shape is in one place for every model, the
+conductor; a model only makes chains (the 27B on the device, link after link
+with the picks kept there; Flash-Next with every pick read on the host) and
+runs the step it is given. A tree of drafts extends the same choice: its
+rows are ranked by the chances along their path (see `crates/sched/src/window.rs`).
+The price of a chain is what the step that only drafts took, so the round
+trip of the extra step is in it; the price of the round's rows is the round's.
+
+What each drafter does with the bars in the step that only drafts:
+
+- *The 27B's block* enqueues its chain on the device and copies every link's
+  picks to the host. Where a bar can end the chain (the least chance in the
+  table would not carry the reach over it) the device thread waits for those
+  picks before it enqueues the next link; where no pick could end it,
+  nothing is waited for.
+- *The draft block of Flash-Next* reads every pick on the host as before, so a
+  chain that ends there costs no wait of its own.
 
 Measured 2026-11-15, the build before this work against the build with it,
 back to back, on a machine that other work kept at the load averages given;
@@ -1293,11 +1329,33 @@ or the waits for the links under it account for, not the table. An earlier
 pair at loads of 17 to 45 gave 64.6, 53.2, 62.7, 103.3, 64.5, 69.2, 73.1
 before and 67.5, 65.7, 58.0, 96.3, 69.1, 67.0, 74.2 with.
 
-*Qwen3.8-Flash-Next* through the server (both cards on every layer, `--ram
-8G`, `--drafters` the block's file, three questions of 300 tokens asked three
-times over, thinking off): the server chooses windows in every request, from
-the first on, of 1.7 to 3.7 tokens a step, and 47 to 98 % of their drafts are
-accepted. It is slower for them:
+Measured 2026-11-16 with the chain in a step of its own (and the round cut
+by the drafter's probabilities), against `main` before it (`bc26683`), the
+same tool and settings, three pairs back to back at loads of 1 to 14; tokens
+per second for the same seven requests:
+
+| Run | `main` | with the step that only drafts |
+| --- | --- | --- |
+| 1 | 86.4, 94.4, 86.8, 143.8, 92.2, 90.5, 96.8 | 88.3, 92.9, 88.0, 138.6, 91.4, 96.9, 100.6 |
+| 2 | 85.6, 81.8, 87.0, 133.9, 91.8, 89.8, 94.6 | 89.0, 94.7, 87.2, 149.8, 96.7, 97.2, 102.0 |
+| 3 | 87.3, 91.8, 87.2, 139.4, 91.9, 90.9, 97.5 | 89.8, 93.1, 88.4, 139.4, 92.0, 95.3, 103.9 |
+
+The means are 1 to 7 % higher (German 89.0 against 86.4, English 93.6 against
+89.3, the rewrite 142.6 against 139.0, the second code question 102.2 against
+96.3), within the spread of single runs for most requests and above it for
+none on the side of `main`. The tokens per step are those of `main` (2.7 to
+3.7, 4.8 to 5.7 for the rewrite) with shorter steps: the drafter made 3 to 6
+links a round where `main` made 4 to 6, 4 to 26 % of the links asked were not
+made, and the round verified all but 1 to 5 % of the drafts made. A chain is
+priced at 2.0 ms for one link and 10.3 for seven, the step that only drafts
+included.
+
+*Qwen3.8-Flash-Next* through the server, on 2026-11-15, before the chain was a
+step of its own and the block's experts resident (both cards on every layer,
+`--ram 8G`, `--drafters` the block's file, three questions of 300 tokens asked
+three times over, thinking off): the server chose windows in every request,
+from the first on, of 1.7 to 3.7 tokens a step, and 47 to 98 % of their drafts
+were accepted. It was slower for them:
 
 | Tokens per second, German, English, code | round 1 | round 2 | round 3 |
 | --- | --- | --- | --- |
@@ -1312,8 +1370,100 @@ it is the one that fetched; and the experts a window brings into the tiers
 push out what the next steps need, which no step is charged for. The build
 before this work chose windows in seven of nine requests of the same run and
 was no faster (28.9, 14.1, 8.6; 11.8, 12.6, 10.6; 12.9, 18.6, 14.6 at loads
-of 20 to 42). Until a window's rows find their experts, `--drafters` costs
-this model speed.
+of 20 to 42). What came of it on 2026-11-16 follows.
+
+**What made the draft block of Flash-Next pay** (2026-11-16, RTX 4070 and RTX
+3060, both on every layer, `--ram 8G`, thinking off, greedy, 200 tokens of
+German prose, English prose and code, each prompt twice; the machine was
+shared with other agents' builds and servers all night, at load averages of
+5 to 45 that changed within a run, so only what ran side by side is
+compared; the runs are in `/var/tmp/ares-prices/out2` of the work's notes):
+
+- *The block's experts resident.* A link of the chain takes 1.4 to 1.8 ms (the
+  prices at load: 1.4, 2.7 and 4.1 ms for one to three links), where it took
+  5.4 to 8.1 with the block's experts in the tiers. They take 675 MiB of the
+  RTX 4070: 13 344 slots of the model's experts without the block, 12 816
+  with it.
+- *A draft row that never waits for the file*, as first built, left nearly
+  every draft row: at `--ram 8G` a quarter of the experts are only in the
+  file, a row reads one to three of them a token on known text and up to
+  sixteen on new text, and a row that is left takes no draft. The block's
+  first drafts were accepted 2 times of 106 (they are right about nine times
+  in ten), and the server gave 3.3 to 11.7 tokens per second.
+- *Never leaving a row* brought the acceptance back (284 of 329 first drafts,
+  1.3 to 3.4 tokens a round), and was slower than no drafts (7.9, 8.0 and
+  5.5 tokens per second on new text at a load of 27 against 15.1, 13.4 and
+  8.9 at 36) until the step that only drafts stopped doing the store's work
+  between steps (the heat's decay, the RAM tier that grows a piece, the
+  promotions) a second time per round, and read the rows of the n-gram
+  table the round needs while the conductor decides: then 27, 30 and 18
+  tokens per second on new text and 35, 43 and 27
+  the second time, at a load of 15, where the server without the block gave
+  23, 21 and 16, and 29, 28 and 23 at a load of 17.
+- *Leaving a row without reading ahead* what it was left without only moved
+  the read to the next round, whose first row is most often the left row's
+  token and then waits for the same experts alone in its layer: rounds of
+  1.6 to 2.6 tokens took 100 to 150 ms. With the read started as a guess the
+  rounds are as fast as without drafts while rows are left.
+- *The rule as it stands* (a row waits while it is worth it, what it is left
+  without is read ahead): one server with the block, every prompt asked with
+  drafts and with `"draft": false` one after the other, the order turned every
+  round (so that the load is the same and each comes first as often), load 5
+  to 9: with drafts 32.1, 35.6, 26.0 / 46.1, 66.6, 52.3 / 43.3, 45.8, 33.5 /
+  52.2, 52.0, 62.7 tokens per second, without 39.9, 41.7, 37.6 / 32.2, 30.6,
+  24.5 / 43.8, 45.0, 41.3 / 38.3, 39.0, 25.9 (German, English, code; rounds
+  1 and 3 asked with drafts first). The mean over the rounds is 43.4, 50.0 and
+  43.6 with drafts and 38.6, 39.1 and 32.3 without: 12 to 35 % more. Whichever
+  request comes second finds the tiers filled by the first, and from the
+  second round on the lookup in earlier text has the whole reply, which only
+  the request with drafts uses; the first round is the plainest case, and
+  there the request with drafts, coming first, was the slower.
+
+Two servers of the final build started one after the other, with the block and
+without it (200 tokens, the three prompts twice; the load is the run's; the
+first pair's server without the block ran while another agent's build took
+the machine to a load of 30 and is shown for what it is):
+
+| Tokens per second, German, English, code | first time | second time |
+| --- | --- | --- |
+| without the block, pair 1 (load 30 to 33) | 8.9, 9.5, 7.7 | 19.7, 15.4, 13.9 |
+| with the block, pair 1 (load 12) | 30.4, 35.2, 25.0 | 63.8, 29.6, 29.7 |
+| without the block, pair 2 (load 12 to 15) | 21.9, 20.3, 13.1 | 29.3, 23.4, 16.9 |
+| with the block, pair 2 (load 16 to 17) | 21.2, 30.9, 16.4 | 30.0, 27.4, 27.9 |
+| without the block, earlier build, same rule (load 12) | 32.8, 27.3, 16.7 | 30.2, 33.6, 22.4 |
+
+With the block a round gives 1.3 to 1.9 tokens on a text the first time and
+1.8 to 3.6 the second, when the lookup has the earlier reply; 36 to 90 % of
+the drafts verified are accepted, fewer than the block is right (about 85 %
+of its first drafts), because a row the store leaves is not accepted. The
+second pair, the only one at about the same load, gives with the block 3 %
+less to 52 % more the first time (German, English, code: -3, +52, +25 %) and
+2 to 65 % more the second, and the first pair's server with the block is the
+fastest run of all.
+
+*One card* (the RTX 4070 alone, the same build and settings, one pair at a
+load of 7 to 10): without the block 9.6, 8.9 and 6.2 tokens per second the
+first time and 11.4, 11.0 and 7.2 the second, with it 7.5, 7.8 and 5.2 and
+10.6, 7.3 and 5.7: 7 to 34 % slower. A third of the experts have a VRAM slot
+there, a step of one row reads 45 to 100 experts from the file, a round with
+drafts 100 to 260, and the block's experts take 675 MiB of the 11 GiB. What
+the conductor's prices do not see is what a window's reads cost the steps
+after it (the experts it brings push out others, and its reads ahead queue
+before theirs); see `docs/OPEN.md`.
+
+*How far from Strata.* Strata's log on this machine has 12 to 76 tokens per
+second with drafts, median 55, for 128 tokens (`/var/tmp/ares-survey/strata-speculation.md`).
+The runs above with the block lie between 16 and 64, the second request of a
+text at 28 to 64. What separates the two is the file: Strata runs with no
+RAM copy but 23.6 GiB of page cache for a file set of 28.5 GiB, so nearly
+every expert that is in no VRAM slot is in RAM, while `--ram 8G` leaves a
+quarter of the experts only on the SSD, where a read takes 2.5 to 10 ms on a
+busy machine; a row of new text reads one to sixteen of them a token. Strata
+also skips the weakest missed experts (tail skip, on by default, which
+changes the text) and computes misses on the CPU from the page cache
+without a copy. With a tier that holds every expert that has no VRAM slot
+(about 16 GiB, see "What the gap between 17 and 22 ms is made of") the file
+is read only for an expert's first use, and a draft row then never waits.
 
 **What limited the chain.** In order: the default of three drafts
 (`--drafts`), which was a cap on every sequence's window whatever the text;
@@ -1377,19 +1527,20 @@ lookup's cost; a long prompt is therefore read into the corpus as its rows
 are committed, not at once.
 
 **The model's own drafts** (`qwen35`, the next-token-prediction block of the
-27B). A step with them is enqueued whole unless a draft bar can end the chain
-(see above): the block's chain runs first,
-on the device that embeds (which keeps the rows of the tokens the chain can
-pick, see "The token embedding of `qwen35`"), each link's pick made by the
-sampler with the settings and the noise of the row that will verify it and
-written straight into the token array of the step record on the device; then
-the verify window, whose embedding reads those tokens; then, for every row of
+27B). The block's chain runs in the step that only drafts (see above), on the
+device that embeds (which keeps the rows of the tokens the chain can pick, see
+"The token embedding of `qwen35`"), each link's pick made by the sampler with
+the settings and the noise of the row that will verify it and written into
+the token array of that step's record on the device, where the next link
+reads it (`Part::enqueue_chains`: the block's K and V entries made ready for
+its cells, then the links). The host learns the drafts at the end of that
+step. The round that verifies them is an ordinary step whose windows carry
+the drafts as tokens; after the model's blocks it computes, for every row of
 the step, the block's own keys and values from the hidden states the model
-just computed. The host learns the drafts with the picks, counts the accepted
-ones and puts the commit into the next record. The conductor chooses per
-sequence and step between a lookup draft and the model's own by expected
-tokens per millisecond (`ares_sched::choose`), with the cost of a link measured
-on the device.
+just computed, which replaces what the chain wrote in those cells. The
+conductor chooses per sequence and step between a lookup draft and the
+model's own by expected tokens per millisecond (`ares_sched::choose`), with
+the price of a chain taken from the steps that only draft.
 
 Measured 2026-11-10 on Qwen3.8-27B (tensor split 0.625 / 0.375, RTX 4070 and
 RTX 3060, at most three drafts, the fork's draft vocabulary of 66 343 tokens,
@@ -2096,6 +2247,45 @@ pages) and comes with the runtime.
   and shows the new one when its data has arrived. On a synthetic workload whose topic changes every 500
   tokens, re-election serves 79 % of the picks from a tier of a quarter of the
   experts where a tier filled once serves 29 %.
+- **The experts of a drafter stay resident.** A layer of the expert store can
+  be resident (`LayerSpec::resident`): every one of its experts has a VRAM
+  slot in a pool of its own for as long as the store lives, outside the
+  tiers. Its bytes come out of the device's budget before the tiers get
+  theirs (a budget that does not hold them is refused with what they need),
+  a few RAM slots pass its experts through from the file when the store is
+  filled, and nothing evicts them or moves its slots. A model's draft block
+  is such a layer: its router runs in every link of every chain, and a link
+  that waits for an expert costs what a token costs. Flash-Next's block has
+  512 experts in Q2_0, 675 MiB on the device with the output head.
+- **A row that verifies a draft waits for the file only while it is worth
+  it.** The model tells the store the windows of a step that verify drafts
+  and what each row of the step is worth (`ExpertStore::set_windows`, from
+  the record's row worth: for row `k` of a window, the chance that the
+  drafts up to its own are right times what a token costs at the rate the
+  round was chosen for). A window's first row is its sequence's newest token
+  and gets every expert it picks, wherever it is; a row after it verifies a
+  draft that the next step can verify again. An expert that no tier but the
+  file holds (or whose read is on its way) and that only such rows picked
+  costs its layer a read, unless the layer waits for the file anyway; it is
+  read while the rows a missing expert would leave behind (in each window
+  the lowest row that picked it and the rows after it) are worth more than
+  the read, which is then charged to them, so a row that would wait for many
+  reads is left after a few. An expert that is not read is claimed by the
+  CPU, which adds nothing to the rows' sums. Those rows and every row of
+  their window after them are *left*: their results are not what the rows
+  would give alone, the model says so (`DeviceModel::rows_not_exact`), and
+  the conductor accepts no draft from the first left row of a window on.
+  The rows before it stay exact, because a row depends only on the rows
+  before it, and the text is the text without drafts. An expert whose rows
+  are all left needs no work at all, wherever it is. The rule is in the
+  store's miss path for every model with experts in tiers
+  (`expert_store/windows.rs`); a store without a CPU half leaves nothing,
+  and neither does a step whose record says nothing of its rows' worth.
+  What a row was left without is read into RAM as a guess for the steps
+  after (`StoreConfig::read_left`): the token of a left row is most often
+  the next round's first, which routes to the same experts and would
+  otherwise wait for them there, alone in its layer. See "Speculation" for
+  what was measured.
 - **Dynamic expert pruning.** `SlotSet::write_route_bias` turns a tier into a
   routing constraint. With a large penalty the router only uses experts that
   are present, except for its strongest raw picks, which the router kernel
@@ -3576,20 +3766,26 @@ lookup in earlier text takes part as soon as a model drafter does and never alon
   values of a chain's cells are overwritten when the model has passed them.
 - *The host reads every pick.* The embedding of a row and the rows of the n-gram
   table are host work in this model, so a link ends with a read of its pick
-  (where the 27B's chain stays on the device), and the device threads that do not
-  hold the block wait for the drafts before they enqueue the step that verifies
-  them. The verify window is the model's ordinary step of up to eight rows; the
-  rows that are rejected leave no trace in the recurrent layers, the n-gram
+  (where the 27B's chain stays on the device). The chains run in the step that
+  only drafts (steps 2 and 3 above, for the sequences that draft; the other
+  device threads have nothing to do in it), and the round that verifies them
+  is the model's ordinary step of up to eight rows with the drafts as tokens;
+  the block does not write again the newest cells its chains wrote. The step
+  that only drafts is no step of the expert store (its routing is the block's,
+  whose experts are resident, and the work between two steps of the store is
+  counted in the model's steps), and it asks for the rows of the n-gram table
+  that the round's rows will need (the newest token and the drafts made), so
+  that they are read while the conductor decides. The rows
+  that are rejected leave no trace in the recurrent layers, the n-gram
   history and the indexer's keys (`Part::enqueue_commit`, which existed), and
   their keys and values are overwritten.
-- *Its experts go through the expert store*, as layer 0 in front of the model's
-  layers (a step routes the block before any layer of the model), read from the
-  block's file, and brought into its slots when the store is built. The block
-  gets the slots of a layer: 111 in VRAM and 73 in RAM of its 512 experts when
-  both cards share the layers (where a layer has about half of its experts on
-  each card), 260 and 146 with a range of layers each. A division by the experts
-  a layer has on the device was tried through the plan's profile and changed
-  nothing; the store moves slots between layers by need as it runs.
+- *Its experts are resident in VRAM*, as layer 0 of the expert store in front of
+  the model's layers, read from the block's file when the store is built: all
+  512 of them, in a pool of their own outside the tiers (`LayerSpec::resident`),
+  675 MiB on the card with the head that the tiers do not get. Until 2026-11-16
+  the block had the slots of a layer (111 in VRAM and 73 in RAM of its 512
+  experts with both cards on every layer, 260 and 146 with a range of layers
+  each), and a link took 5.4 to 8.1 ms while most of them were in no slot.
 - *The policy is the conductor's.* The price of a step by its rows and of a
   chain by its links is
   measured when the engine starts, and those steps find no expert in a slot: with
