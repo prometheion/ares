@@ -58,6 +58,18 @@ pub fn product(m: &Matrix<'_>, x: &[f32]) -> Vec<f32> {
     y
 }
 
+/// `x` as the device's weight kernels read it: each 32 values as integers of
+/// at most 127 times the largest magnitude among them over 127.
+pub fn round_activations(x: &[f32]) -> Vec<f32> {
+    let mut out = Vec::with_capacity(x.len());
+    for block in x.chunks(32) {
+        let amax = block.iter().fold(0f32, |m, v| m.max(v.abs()));
+        let d = amax / 127.0;
+        out.extend(block.iter().map(|v| if amax == 0.0 { 0.0 } else { (v / d).round() * d }));
+    }
+    out
+}
+
 /// Row `token` of a table of rows (the selector's), decoded.
 pub fn table_row(m: &Matrix<'_>, token: u32) -> Vec<f32> {
     let row_bytes = m.data.len() / m.n_out;
@@ -186,11 +198,25 @@ pub fn argmax(row: &[f32]) -> usize {
 pub struct Reference<'g> {
     pub c: Config,
     pub w: Weights<'g>,
+    /// Whether the products round their activations as the device's weight
+    /// kernels do ([`round_activations`]); exact f32 otherwise.
+    pub rounds: bool,
 }
 
 impl<'g> Reference<'g> {
     pub fn new(c: Config, w: Weights<'g>) -> Self {
-        Self { c, w }
+        Self { c, w, rounds: false }
+    }
+
+    /// The reference with the device's rounding of activations: what the
+    /// drafter on the device computes up to the order of its sums.
+    pub fn rounding(mut self) -> Self {
+        self.rounds = true;
+        self
+    }
+
+    fn mul(&self, m: &Matrix<'_>, x: &[f32]) -> Vec<f32> {
+        if self.rounds { product(m, &round_activations(x)) } else { product(m, x) }
     }
 
     /// Stores the cells of rows whose taps are `taps` (rows of
@@ -198,11 +224,11 @@ impl<'g> Reference<'g> {
     pub fn inject(&self, cells: &mut Cells, taps: &[f32], positions: &[u32]) {
         let c = &self.c;
         cells.layers.resize_with(c.n_layer, HashMap::new);
-        let mut g = product(&self.w.fc, taps);
+        let mut g = self.mul(&self.w.fc, taps);
         rms_norm(&mut g, &self.w.fc_out_norm.values(), c.eps);
         for (l, lw) in self.w.layers.iter().enumerate() {
-            let mut k = product(&lw.k, &g);
-            let v = product(&lw.v, &g);
+            let mut k = self.mul(&lw.k, &g);
+            let v = self.mul(&lw.v, &g);
             let kv = c.n_head_kv * c.head_dim;
             rms_norm(&mut k, &lw.k_norm.values(), c.eps);
             for (r, &p) in positions.iter().enumerate() {
@@ -246,7 +272,7 @@ impl<'g> Reference<'g> {
         let drafted = &h[d..];
         let logits = head(drafted);
         let n_head = logits.len() / (b - 1);
-        let gate = product(&self.w.selector_hidden, drafted);
+        let gate = self.mul(&self.w.selector_hidden, drafted);
         let rank = c.selector_rank;
         let mut lattice = Lattice {
             tokens: Vec::new(),
@@ -296,12 +322,12 @@ impl<'g> Reference<'g> {
         let (b, hd) = (c.block, c.head_dim);
         let mut xn = x.to_vec();
         rms_norm(&mut xn, &lw.attn_norm.values(), c.eps);
-        let dynamic = product(&lw.attn_conv_proj, &xn);
+        let dynamic = self.mul(&lw.attn_conv_proj, &xn);
         let base = lw.attn_conv_base.values();
         let xc = conv(c, &xn, &dynamic, &base, 0);
-        let mut q = product(&lw.q, &xc);
-        let mut k = product(&lw.k, &xc);
-        let v = product(&lw.v, &xc);
+        let mut q = self.mul(&lw.q, &xc);
+        let mut k = self.mul(&lw.k, &xc);
+        let v = self.mul(&lw.v, &xc);
         rms_norm(&mut q, &lw.q_norm.values(), c.eps);
         rms_norm(&mut k, &lw.k_norm.values(), c.eps);
         let (qd, kv) = (c.n_head * hd, c.n_head_kv * hd);
@@ -348,18 +374,18 @@ impl<'g> Reference<'g> {
                 }
             }
         }
-        let attn = product(&lw.out, &o);
+        let attn = self.mul(&lw.out, &o);
         let attn = conv(c, &attn, &dynamic, &base, 1);
         let ffn_in: Vec<f32> = attn.iter().zip(x).map(|(a, x)| a + x).collect();
         let mut fx = ffn_in.clone();
         rms_norm(&mut fx, &lw.ffn_norm.values(), c.eps);
-        let fdynamic = product(&lw.ffn_conv_proj, &fx);
+        let fdynamic = self.mul(&lw.ffn_conv_proj, &fx);
         let fbase = lw.ffn_conv_base.values();
         let fx = conv(c, &fx, &fdynamic, &fbase, 0);
-        let gate = product(&lw.gate, &fx);
-        let up = product(&lw.up, &fx);
+        let gate = self.mul(&lw.gate, &fx);
+        let up = self.mul(&lw.up, &fx);
         let inner: Vec<f32> = gate.iter().zip(&up).map(|(g, u)| silu(*g) * u).collect();
-        let down = product(&lw.down, &inner);
+        let down = self.mul(&lw.down, &inner);
         let down = conv(c, &down, &fdynamic, &fbase, 1);
         down.iter().zip(&ffn_in).map(|(a, b)| a + b).collect()
     }

@@ -6,7 +6,9 @@
 //! drafter, which the DFlash kind refuses). A test skips the files that are not
 //! named. The device test needs `ARES_TEST_CUDA=1` (`ARES_TEST_DEVICE` names the
 //! device, default 0); its taps, embedding rows and head are random, so it
-//! compares the drafter with the reference and nothing else.
+//! compares the drafter with the reference and nothing else: the reference
+//! rounds its activations as the device's weight kernels do, and the rest is
+//! the order of sums and the ring's f16.
 
 use std::path::PathBuf;
 
@@ -135,8 +137,10 @@ fn device_against_reference(path: &PathBuf, device: &Device) {
     let newest = 1234u32;
     let position = (PROMPT + KEPT) as u32;
 
-    // The reference: the kept rows only.
-    let reference = Reference::new(c.clone(), w.clone());
+    // The reference: the kept rows only, its activations rounded as the
+    // device's weight kernels round them (the exact one differs from both by
+    // that rounding, which grows over the five layers).
+    let reference = Reference::new(c.clone(), w.clone()).rounding();
     let mut cells = Cells::default();
     let kept: Vec<f32> = tap_rows[..PROMPT + KEPT].concat();
     let positions: Vec<u32> = (0..(PROMPT + KEPT) as u32).collect();
@@ -171,6 +175,29 @@ fn device_against_reference(path: &PathBuf, device: &Device) {
         stream.synchronize().unwrap();
         drop(held);
     }
+    // The ring against the reference's cells: the keys and values of the
+    // first layer at a few positions (the inject alone: the fusion, its norm,
+    // a product, the per-head norm and the rotary turn).
+    {
+        let (ring, at, bytes) = drafter.ring_of(0, 0);
+        let kv = c.n_head_kv * c.head_dim;
+        let mut raw = vec![0u8; bytes as usize * 2];
+        ring.read(at, &mut raw).unwrap();
+        let half =
+            |i: usize| ares_quant::f16_to_f32(u16::from_le_bytes([raw[2 * i], raw[2 * i + 1]]));
+        let ring_cells = drafter.ring_cells() as usize;
+        let (mut err, mut norm) = (0f32, 0f32);
+        for p in [0usize, 17, 49, 52] {
+            let (k, v) = &cells.layers[0][&(p as u32)];
+            for i in 0..kv {
+                let (dk, dv) = (half(p * kv + i), half(ring_cells * kv + p * kv + i));
+                err += (dk - k[i]).powi(2) + (dv - v[i]).powi(2);
+                norm += k[i].powi(2) + v[i].powi(2);
+            }
+        }
+        println!("{}: ring off by {:.4} (rms, relative)", path.display(), (err / norm).sqrt());
+        assert!((err / norm).sqrt() < 0.01, "the ring's cells are off by {}", (err / norm).sqrt());
+    }
     let seqs = [PassSeq { slot: 0, position, newest, record_row: u32::MAX, wanted: 7, place: 0 }];
     let embed = |token: u32| {
         assert_eq!(token, newest);
@@ -188,7 +215,7 @@ fn device_against_reference(path: &PathBuf, device: &Device) {
     let err: f32 = h.iter().zip(want).map(|(a, b)| (a - b) * (a - b)).sum::<f32>().sqrt();
     let norm: f32 = want.iter().map(|v| v * v).sum::<f32>().sqrt();
     println!("{}: hidden states off by {:.4} (rms, relative)", path.display(), err / norm);
-    assert!(err / norm < 0.03, "the hidden states are off by {}", err / norm);
+    assert!(err / norm < 0.02, "the hidden states are off by {}", err / norm);
 
     // The candidates and the walk from the device's own hidden states.
     let logits = head_of(&h);
