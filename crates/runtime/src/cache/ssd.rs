@@ -23,8 +23,8 @@
 //!   again: its name says what it holds.
 //! - **A checkpoint** at a page boundary, at least that deep, when it leaves
 //!   RAM: copied out of its place into a buffer of its own first. One that
-//!   later requests have left behind is not written: a deeper one on its
-//!   branch is where a prompt resumes.
+//!   later requests have left behind at deeper page boundaries is not
+//!   written: a deeper one on its branch is where a prompt resumes.
 //! - **Never** a tail (the partly used last page of a sequence) and the state
 //!   at its end: a prompt that resumes from the drive restores the checkpoint
 //!   before them and replays the rows between.

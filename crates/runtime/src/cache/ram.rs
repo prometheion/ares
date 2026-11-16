@@ -18,7 +18,8 @@
 //! 1. pages that the devices hold as well: they go for nothing;
 //! 2. what the drive holds already, and what is not worth writing (a text
 //!    shorter than the level on SSD's least, a tail, a checkpoint that later
-//!    requests have left behind), or anything when there is no level on SSD:
+//!    requests have left behind at deeper page boundaries), or anything when
+//!    there is no level on SSD:
 //!    it goes for nothing;
 //! 3. the rest, which is written to the drive before it goes.
 //!

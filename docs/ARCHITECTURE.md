@@ -739,7 +739,8 @@ on the cards. What RAM holds and what goes first is
 - **What goes first.** By class, then the least recently used: copies of
   pages that the devices hold; what the drive holds and what is not worth
   writing (a text shorter than the level on SSD's least, a tail, a
-  checkpoint that later requests have left behind), and everything when
+  checkpoint that later requests have left behind at deeper page
+  boundaries), and everything when
   there is no level on SSD; then the rest, which is written first. A page is
   the most recently used of what left the devices when it arrives, and the
   devices give a text up from its end, so a text goes from its end here too.
@@ -812,8 +813,11 @@ and after a restart of the server. Nothing is written as it is computed.
   cells). Then all its pages are worth writing, from the first on, and a page
   that is written makes the one before it worth writing, so that a text on
   the drive is found from its start. A checkpoint at a page boundary at least
-  that deep when it leaves RAM, unless later requests have left it behind (a
-  deeper checkpoint on its branch is where a prompt resumes). When an engine
+  that deep when it leaves RAM, unless later requests have left it behind at
+  deeper page boundaries (`PrefixIndex::left_behind_on_pages`: a deeper
+  checkpoint at a page boundary on its one branch is where a prompt resumes
+  from the drive; the state at the end of a tail is no such checkpoint,
+  since the drive keeps no tails). When an engine
   ends (a clean stop, an unload in router mode) everything worth writing that
   the drive does not have is written, the checkpoints first, then what only
   RAM holds, the coldest first, then the pages of the devices; the engine

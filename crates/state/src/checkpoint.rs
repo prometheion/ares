@@ -271,9 +271,14 @@ impl PrefixIndex {
     /// The entry or tail with a checkpoint that lies above `child`, a page
     /// under `prior`: a tail of `prior` that `child` continues, or the
     /// nearest entry up the chain.
-    fn checkpoint_above(&self, mut child: ChainHash, mut prior: ChainHash) -> Option<ChainHash> {
+    fn checkpoint_above(
+        &self,
+        mut child: ChainHash,
+        mut prior: ChainHash,
+        tails: bool,
+    ) -> Option<ChainHash> {
         loop {
-            let tail = self.tails.get(&prior).and_then(|tails| {
+            let tail = self.tails.get(&prior).filter(|_| tails).and_then(|tails| {
                 tails
                     .iter()
                     .filter(|tail| tail.checkpoint.is_some() && tail.extended_by.contains(&child))
@@ -290,7 +295,9 @@ impl PrefixIndex {
         }
     }
 
-    fn checkpoint_nodes(&self, cells_per_page: u32) -> Vec<Node> {
+    /// The tree of checkpoints by their text: of entries and tails, or of
+    /// entries only without `tails`.
+    fn checkpoint_nodes(&self, cells_per_page: u32, tails: bool) -> Vec<Node> {
         let per_page = u64::from(cells_per_page);
         let mut nodes: Vec<Node> = Vec::with_capacity(self.checkpoints);
         let mut above: Vec<Option<ChainHash>> = Vec::with_capacity(self.checkpoints);
@@ -312,9 +319,9 @@ impl PrefixIndex {
             let Some(checkpoint) = entry.checkpoint else { continue };
             let position = u64::from(entry.depth) * per_page;
             nodes.push(node(*hash, checkpoint, position, entry.last_used, entry.checkpoint_by));
-            above.push(self.checkpoint_above(*hash, entry.parent));
+            above.push(self.checkpoint_above(*hash, entry.parent, tails));
         }
-        for (prior, tails) in &self.tails {
+        for (prior, tails) in self.tails.iter().filter(|_| tails) {
             let depth = self.entries.get(prior).map_or(0, |entry| entry.depth);
             for tail in tails {
                 let Some(checkpoint) = tail.checkpoint else { continue };
@@ -338,7 +345,7 @@ impl PrefixIndex {
                     .map(|other| other.hash);
                 above.push(shorter.or_else(|| match self.entries.get(prior) {
                     Some(entry) if entry.checkpoint.is_some() => Some(*prior),
-                    Some(entry) => self.checkpoint_above(*prior, entry.parent),
+                    Some(entry) => self.checkpoint_above(*prior, entry.parent, true),
                     None => None,
                 }));
             }
@@ -376,7 +383,7 @@ impl PrefixIndex {
     /// dropped first at the front.
     pub fn checkpoint_ranks(&self, policy: &CheckpointPolicy) -> Vec<CheckpointRank> {
         let mut ranks: Vec<CheckpointRank> = self
-            .checkpoint_nodes(policy.cells_per_page)
+            .checkpoint_nodes(policy.cells_per_page, true)
             .into_iter()
             .map(|node| CheckpointRank {
                 aged: node.children == 1 && node.requests_below > policy.fresh_requests,
@@ -385,6 +392,22 @@ impl PrefixIndex {
             .collect();
         ranks.sort_by_key(|rank| (!rank.aged, rank.rows_saved, rank.last_used, rank.hash));
         ranks
+    }
+
+    /// The checkpoints at the ends of pages that later requests have left
+    /// behind, counting only checkpoints at the ends of pages: on their one
+    /// branch, more than [`CheckpointPolicy::fresh_requests`] later requests
+    /// have checkpoints at deeper page boundaries. For a level that keeps no
+    /// tails (and no state at their ends), where a prompt resumes from the
+    /// deepest checkpoint at a page boundary: a checkpoint that later turns
+    /// left behind only with the state at the end of their tails is not left
+    /// behind there.
+    pub fn left_behind_on_pages(&self, policy: &CheckpointPolicy) -> Vec<ChainHash> {
+        self.checkpoint_nodes(policy.cells_per_page, false)
+            .into_iter()
+            .filter(|node| node.children == 1 && node.requests_below > policy.fresh_requests)
+            .map(|node| node.rank.hash)
+            .collect()
     }
 
     /// Detaches checkpoints until `incoming` more fit in the policy's budget,
@@ -706,6 +729,43 @@ mod tests {
         assert_eq!(index.checkpoints(), 0);
         index.clear(&mut pool);
         assert_eq!(pool.free_pages(), 64);
+    }
+
+    #[test]
+    fn a_page_checkpoint_is_left_behind_on_pages_only_by_a_deeper_page_checkpoint() {
+        let p = small();
+        let mut pool = PagePool::new(64, PER_PAGE);
+        let mut index = PrefixIndex::new();
+        let root = ChainHash::root(b"m");
+        let mut id = 0;
+        // Request 1 leaves an anchor at 20; requests 2 and 3 go on in the
+        // same page and leave only the state at the ends of their tails.
+        let text = conversation(&mut pool, &mut index, root, &[(1, 0..22, &[20])], &mut id);
+        let found = index.lookup(root, &text, PER_PAGE);
+        let prior = *found.hashes.last().unwrap();
+        for (request, len) in [(2u64, 22u32), (3, 23)] {
+            let mut seq = Sequence::from_shared(&mut pool, &found.pages, 20);
+            seq.append(&mut pool, u64::from(len - 20)).unwrap();
+            let tokens: Vec<u32> = (20..len).collect();
+            index.insert_tail(&mut pool, prior, &tokens, seq.pages()[5], Priority::NORMAL);
+            let tail = PrefixIndex::tail_hash(prior, &tokens);
+            index.attach_checkpoint(tail, CheckpointId(60 + request), Owner(request)).unwrap();
+            seq.release(&mut pool);
+        }
+        // Among all checkpoints the anchor is aged; among those at page
+        // boundaries, which a level without tails keeps, it is the deepest.
+        let anchor = index.checkpoint_ranks(&p).into_iter().find(|r| r.position == 20).unwrap();
+        assert!(anchor.aged);
+        assert!(index.left_behind_on_pages(&p).is_empty());
+        // A later request's checkpoint at a deeper page boundary leaves it
+        // behind there too.
+        let mut longer = text.clone();
+        longer.extend(300..310);
+        let (seq, chain) = run(&mut pool, &mut index, root, &longer);
+        index.attach_checkpoint(chain.hashes()[6], CheckpointId(70), Owner(4)).unwrap();
+        seq.release(&mut pool);
+        assert_eq!(index.left_behind_on_pages(&p), [chain.hashes()[4]]);
+        index.clear(&mut pool);
     }
 
     #[test]

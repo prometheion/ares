@@ -375,3 +375,30 @@ fn a_shrink_writes_what_only_ram_holds_and_gives_the_memory_back() {
     assert_eq!(s.counters.ram.pages_dropped, 0, "{s}");
     e.consistent();
 }
+
+#[test]
+fn the_anchor_that_later_turns_share_inside_its_page_reaches_the_drive() {
+    let dir = TempDir::new("anchor");
+    let model = model();
+    // Turns that add a few tokens each, so that their prompts end in the page
+    // after the first prompt's anchor: they leave no checkpoint at a page
+    // boundary of their own, only the state at the ends of their tails, which
+    // the drive does not keep. The anchor is where the next engine resumes.
+    let e = engine(&model, config(256, 64, Some(store(&dir.0))));
+    let mut text = text_of(80, 200);
+    for turn in 0..3 {
+        let answer = e.ask(&text, 2);
+        assert_eq!(answer.text, fresh(&text, 2), "turn {turn}");
+        text.push_str(&answer.text);
+        text.push_str(&text_of(81 + turn, 2));
+    }
+    e.consistent();
+    drop(e);
+    assert!(stored(&model, &dir.0).store_states >= 1);
+
+    let e = engine(&model, config(256, 64, Some(store(&dir.0))));
+    let answer = e.ask(&text, 10);
+    assert_eq!(answer.text, fresh(&text, 10));
+    assert!(answer.report.cached_tokens >= 192, "{:?}", answer.report);
+    e.consistent();
+}

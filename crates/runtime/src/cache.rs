@@ -490,11 +490,12 @@ impl Cache {
         (place, dropped)
     }
 
-    /// Gives one thing up that goes without a write: a buffer that holds
-    /// nothing, a page or checkpoint in RAM that the devices or the drive
-    /// hold too or that is not worth writing, or a checkpoint of the index
-    /// that later requests have left behind. `false` when there is nothing
-    /// of the kind. `dropped` counts the checkpoints.
+    /// Gives one thing up that is worth little: a buffer that holds nothing,
+    /// a page or checkpoint in RAM that the devices or the drive hold too or
+    /// that is not worth writing, or a checkpoint of the index that later
+    /// requests have left behind (written all the same when the drive keeps
+    /// nothing deeper of its text). `false` when there is nothing of the
+    /// kind. `dropped` counts the checkpoints.
     fn give_up_free(&mut self, dropped: &mut u32) -> bool {
         if let Some(ram) = &mut self.in_ram {
             if ram.free_bytes() > 0 {
@@ -554,8 +555,9 @@ impl Cache {
     }
 
     /// Gives up the checkpoint of the index that its ranking drops first, or,
-    /// with `left_behind`, only one that later requests have left behind
-    /// (it is not written). `false` when there is none.
+    /// with `left_behind`, only one that later requests have left behind. It
+    /// goes to the drive unless later requests left it behind at deeper page
+    /// boundaries ([`Cache::left_behind`]). `false` when there is none.
     fn give_up_index_checkpoint(&mut self, left_behind: bool) -> bool {
         if self.index.checkpoints() == 0 {
             return false;
@@ -566,9 +568,10 @@ impl Cache {
         if left_behind && !first.aged {
             return false;
         }
+        let behind = self.left_behind().contains(&first.hash);
         let Ok(Some(id)) = self.index.set_checkpoint(first.hash, None) else { return false };
         let out = match self.index.page(first.hash) {
-            Some((_, parent, depth)) if !first.aged => {
+            Some((_, parent, depth)) if !behind => {
                 self.state_out(id.0 as u32, first.hash, parent, depth)
             }
             _ => None,
@@ -577,14 +580,15 @@ impl Cache {
         true
     }
 
-    /// The checkpoints of the index that later requests have left behind.
-    /// Only a level on SSD asks: such a checkpoint is not written.
+    /// The checkpoints of the index at page boundaries that later requests
+    /// have left behind at deeper page boundaries. Only a level on SSD asks:
+    /// such a checkpoint is not written, since the drive keeps no tails and a
+    /// prompt resumes there from the deepest checkpoint at a page boundary.
     fn left_behind(&self) -> HashSet<ChainHash> {
         if self.ssd.is_none() || self.index.checkpoints() == 0 {
             return HashSet::new();
         }
-        let ranks = self.index.checkpoint_ranks(&self.policy);
-        ranks.into_iter().filter(|rank| rank.aged).map(|rank| rank.hash).collect()
+        self.index.left_behind_on_pages(&self.policy).into_iter().collect()
     }
 
     /// A page at `depth` lies deep enough for its text to be written.
