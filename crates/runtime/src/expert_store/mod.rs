@@ -1228,7 +1228,7 @@ impl<D: SlotDevice> ExpertStore<D> {
                 &mut self.ram.sets,
                 &self.ram_worth,
                 self.step,
-                &mut |layer, expert| ahead.may_start(layer, expert).unwrap_or(true),
+                &mut |layer, expert| ahead.may_start(layer, expert),
             ) else {
                 break;
             };

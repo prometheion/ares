@@ -121,7 +121,16 @@ pub enum Want {
     /// A prediction or the token table says the expert will be needed. It may
     /// turn out wrong.
     Guess,
+    /// A guess that is read ahead only into room nobody uses: a free slot, or
+    /// one whose member is worth nothing (`heat` gives it no more than
+    /// [`SPARE_WORTH`]: an expert never used, a guess nobody used, a copy the
+    /// tier above holds as well). It never takes the place of a member that a
+    /// later step may need.
+    Spare,
 }
+
+/// The most a member may be worth for a [`Want::Spare`] read to take its slot.
+pub const SPARE_WORTH: f32 = 1e-6;
 
 /// What [`SlotSet::start_read`] decided.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -485,7 +494,8 @@ impl SlotSet {
     ///   [`SlotSet::predicted`]). A member that came as a guess and was
     ///   never used counts as worth nothing, however hot the expert is.
     ///   Equal heat gives way in favour of the lower expert number.
-    /// - A guess never evicts an expert this step needs: [`Start::NoRoom`].
+    /// - A guess never evicts an expert this step needs: [`Start::NoRoom`]. A
+    ///   [`Want::Spare`] guess evicts only a member worth nothing.
     /// - A demand read evicts one only when every other member is needed
     ///   too, and then the coldest of them: the expert it waits for is more
     ///   urgent than a prediction.
@@ -510,8 +520,9 @@ impl SlotSet {
             return Start::Loading;
         }
 
+        let guess = want != Want::Demand;
         if let Some(slot) = self.slots.iter().position(|s| *s == Slot::Empty) {
-            self.begin(slot, expert, want == Want::Guess);
+            self.begin(slot, expert, guess);
             return Start::Slot(Swap { slot: slot as u32, evict: None, load: expert });
         }
         let victim = self
@@ -524,11 +535,14 @@ impl SlotSet {
             })
             .min_by(|a, b| self.eviction_order(*a, *b, step, heat));
         let Some((slot, victim)) = victim else { return Start::NoRoom };
-        if want == Want::Guess && self.needed(victim, step) {
+        if guess && self.needed(victim, step) {
+            return Start::NoRoom;
+        }
+        if want == Want::Spare && self.worth(slot, victim, heat) > SPARE_WORTH {
             return Start::NoRoom;
         }
         self.slot_of[victim as usize] = NO_SLOT;
-        self.begin(slot, expert, want == Want::Guess);
+        self.begin(slot, expert, guess);
         Start::Slot(Swap { slot: slot as u32, evict: Some(victim), load: expert })
     }
 
@@ -675,6 +689,31 @@ impl SlotSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_spare_read_takes_only_room_nobody_uses() {
+        let mut heat = ExpertHeat::new(1, 8, 0.9);
+        let mut set = SlotSet::new(8, 2);
+        heat.record(0, &[0, 0]);
+        for expert in [0, 1] {
+            let Start::Slot(swap) = set.start_read(expert, Want::Demand, 1, heat.layer(0)) else {
+                panic!("two free slots")
+            };
+            set.commit(&swap);
+        }
+        // Expert 0 is worth something, expert 1 nothing (never counted in the heat).
+        let Start::Slot(swap) = set.start_read(5, Want::Spare, 3, heat.layer(0)) else {
+            panic!("expert 1 is worth nothing")
+        };
+        assert_eq!(swap.evict, Some(1));
+        set.commit(&swap);
+        // A guess nobody used is worth nothing too; once a step has used it, both members
+        // are worth something and a spare read finds no room where a guess does.
+        heat.record(0, &[5]);
+        set.routed(&[5], 3);
+        assert_eq!(set.start_read(6, Want::Spare, 4, heat.layer(0)), Start::NoRoom);
+        assert!(matches!(set.start_read(6, Want::Guess, 4, heat.layer(0)), Start::Slot(_)));
+    }
 
     #[test]
     fn the_victim_is_the_member_a_demand_read_would_evict() {

@@ -31,13 +31,15 @@
 //!   for nothing stays in the RAM tier as an unused guess, worth nothing there, the first to
 //!   give way.
 //!
-//! The reads take a slot of the RAM tier as any guess does ([`ares_weights::Want::Guess`]):
-//! never one of an expert the step needs.
+//! A read ahead takes only room of the RAM tier that nobody uses ([`Want::Spare`]): a free
+//! slot, a guess nobody used, a copy of an expert that VRAM holds. It never takes the place
+//! of a member a later step may need, so a read for nothing costs the drive and no more.
 
 use std::collections::HashMap;
 use std::time::Instant;
 
 use ares_io::Reader;
+use ares_weights::Want;
 
 use super::{ExpertStore, Geometry, Phase, SlotDevice};
 
@@ -152,13 +154,15 @@ impl Ahead {
         self.in_flight < self.lanes && self.bytes < self.budget
     }
 
-    /// For a guess that is a read ahead waiting to start: whether it may start now (room,
-    /// and a place whose reads are used at least as often as not). `None` for any other
-    /// guess.
-    pub(super) fn may_start(&self, layer: usize, expert: u32) -> Option<bool> {
+    /// How a guess may start now: a read ahead that waits only when there is room and its
+    /// place is worth it, and then only into room of the RAM tier that nobody uses
+    /// ([`Want::Spare`]); any other guess as a guess.
+    pub(super) fn may_start(&self, layer: usize, expert: u32) -> Option<Want> {
         match self.named.get(&(layer, expert)) {
-            Some((State::Queued, class)) => Some(self.has_room() && self.odds.worth(*class)),
-            _ => None,
+            Some((State::Queued, class)) => {
+                (self.has_room() && self.odds.worth(*class)).then_some(Want::Spare)
+            }
+            _ => Some(Want::Guess),
         }
     }
 }

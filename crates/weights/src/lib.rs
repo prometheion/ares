@@ -127,7 +127,7 @@ mod split;
 mod table;
 mod waves;
 
-pub use expert::{ExpertHeat, Given, SlotSet, Start, Swap, SwapRule, Want};
+pub use expert::{ExpertHeat, Given, SPARE_WORTH, SlotSet, Start, Swap, SwapRule, Want};
 pub use guess::{GuessQueue, Started};
 pub use lookahead::{Lookahead, LookaheadRule};
 pub use split::{LayerNeed, SplitRule, split_slots};
