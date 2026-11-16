@@ -230,14 +230,14 @@ fn what_the_devices_gave_up_comes_back_from_ssd() {
     assert!(s.counters.ssd.pages_written < 19, "{s}");
 
     // The first text again: its pages are gone from the pool and come back,
-    // from RAM and from the drive.
+    // from the drive (and from RAM, as far as its floor still holds them:
+    // that depends on how fast the writer was).
     let again = e.ask(&one, 10);
     assert_eq!(again.text, a.text);
     assert_eq!(again.text, fresh(&one, 10));
     let s = e.snapshot();
     assert!(again.report.cached_tokens >= 256, "{:?}", again.report);
     assert!(s.counters.ssd.pages_read > 0, "{s}");
-    assert!(s.counters.ram.pages_read > 0, "{s}");
     assert!(s.counters.ssd.pages_read < 18, "what the pool still held was not read: {s}");
     e.consistent();
     // Nothing is written twice.

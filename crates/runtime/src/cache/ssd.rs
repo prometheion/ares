@@ -741,13 +741,16 @@ impl Cache {
     }
 
     /// Waits a moment for the writer to finish a record, which gives its
-    /// buffer back. `false` when it holds none or does not finish one in time.
+    /// buffer back: [`PATIENCE`] while the engine runs, as long as the drive
+    /// takes when it ends. `false` when it holds none or does not finish one
+    /// in time.
     pub(super) fn wait_for_writer(&mut self) -> bool {
+        let patience = if self.draining { DRAIN_LIMIT } else { PATIENCE };
         let Some(ssd) = &mut self.ssd else { return false };
         if ssd.writing == 0 {
             return false;
         }
-        match ssd.from_writer.recv_timeout(PATIENCE) {
+        match ssd.from_writer.recv_timeout(patience) {
             Ok(done) => {
                 self.written(done);
                 true

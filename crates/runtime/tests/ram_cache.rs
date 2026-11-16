@@ -402,3 +402,27 @@ fn the_anchor_that_later_turns_share_inside_its_page_reaches_the_drive() {
     assert!(answer.report.cached_tokens >= 192, "{:?}", answer.report);
     e.consistent();
 }
+
+#[test]
+fn an_engine_that_ends_writes_all_its_pages_through_the_floor_of_ram() {
+    let dir = TempDir::new("floor");
+    let model = model();
+    // RAM holds its floor of sixteen pages and nothing more; the devices hold
+    // three texts of 300 cells, 57 full pages, when the engine ends. They
+    // reach the drive through the floor, sixteen at a time.
+    let e = engine(&model, config(256, 0, Some(store(&dir.0))));
+    let texts: Vec<String> = (0..3).map(|i| text_of(90 + i, 300)).collect();
+    let answers: Vec<String> = texts.iter().map(|text| e.ask(text, 10).text).collect();
+    assert_eq!(e.written().counters.ssd.pages_written, 0);
+    drop(e);
+    let stored = stored(&model, &dir.0);
+    assert_eq!(stored.store_pages, 3 * 19, "{stored:?}");
+    let e = engine(&model, config(256, 0, Some(store(&dir.0))));
+    for (text, said) in texts.iter().zip(&answers) {
+        let next = format!("{text}{said}{}", text_of(95, 20));
+        let answer = e.ask(&next, 10);
+        assert_eq!(answer.text, fresh(&next, 10));
+        assert!(answer.report.cached_tokens >= 288, "{:?}", answer.report);
+    }
+    e.consistent();
+}
