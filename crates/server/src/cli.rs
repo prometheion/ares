@@ -151,6 +151,16 @@ OPTIONS:
                                propose: a shorter list makes a draft cheaper
                                [default: every token whose head row is on the
                                block's device]
+        --expert-prune <RULE:RANK>
+                               For a mixture of experts: what a step does with a
+                               pick whose expert only the SSD holds, from the RANK-th
+                               pick of a row on (1 the strongest), instead of
+                               waiting for the drive. skip leaves it out, router
+                               takes the router's next best expert that VRAM or RAM
+                               holds, similar the one most like it there (from a
+                               table of the model file kept beside the usage
+                               profile). Changes the output; similar:8 touches the
+                               8th to 10th of ten picks [default: off]
 
     Prompts.
         --chat-var <NAME=VALUE>  A variable of the model's chat template, such as
@@ -742,8 +752,8 @@ fn read_config(path: &std::path::Path) -> Result<Vec<Given>, CliError> {
 
 #[cfg(test)]
 mod tests {
-    use ares_cuda::{CacheFormat, Precision};
-    use ares_server::plan::{Drafter, SplitKind};
+    use ares_cuda::{CacheFormat, Precision, PruneRule};
+    use ares_server::plan::{Drafter, ExpertPrune, SplitKind};
     use ares_tokenizer::Json;
 
     use super::*;
@@ -846,6 +856,17 @@ mod tests {
         assert_eq!(load.kv, Some((CacheFormat::Q8, CacheFormat::F16)));
         assert_eq!(load.draft_vocabulary, Some(PathBuf::from("v.txt")));
         assert_eq!(run(&["--model=m", "--split=layer"]).load.split, Some(SplitKind::Layer));
+        // Pruning of experts only the SSD holds: off unless asked for.
+        assert_eq!(run(&["--model=m"]).load.expert_prune, None);
+        assert_eq!(run(&["--model=m", "--expert-prune", "off"]).load.expert_prune, None);
+        assert_eq!(
+            run(&["--model=m", "--expert-prune", "similar:8"]).load.expert_prune,
+            Some(ExpertPrune { rule: PruneRule::Similar, from_rank: 8 })
+        );
+        assert_eq!(
+            run(&["--model=m", "--expert-prune=skip:1"]).load.expert_prune,
+            Some(ExpertPrune { rule: PruneRule::Skip, from_rank: 1 })
+        );
         // The prompt cache on SSD: off without a directory, and a size of its own.
         let load = run(&["--model=m"]).load;
         assert_eq!((load.cache, load.cache_size), (None, None));
@@ -1078,6 +1099,9 @@ mod tests {
             (&["--drafters", "none,mtp"], "--drafters"),
             (&["--chat-var", "novalue"], "--chat-var"),
             (&["--chat-var", "=x"], "--chat-var"),
+            (&["--expert-prune", "similar"], "--expert-prune"),
+            (&["--expert-prune", "skip:0"], "--expert-prune"),
+            (&["--expert-prune", "drop:8"], "--expert-prune"),
         ] {
             match parse_strs(args) {
                 Err(CliError::InvalidValue { flag: named, .. }) => assert_eq!(named, flag),

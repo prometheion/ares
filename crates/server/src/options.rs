@@ -10,7 +10,7 @@ use ares_tokenizer::Json;
 
 use crate::ReasoningFormat;
 use crate::defaults::{self, Conflict, Defaults};
-use crate::plan::{self, Drafter, LoadOptions, SplitKind};
+use crate::plan::{self, Drafter, ExpertPrune, LoadOptions, SplitKind};
 
 /// What is set for one model.
 #[derive(Debug, Clone, PartialEq)]
@@ -107,6 +107,7 @@ pub fn lookup(name: &str) -> Option<(&'static str, Kind)> {
         "--chat-var" => ("--chat-var", Kind::Value),
         "--chat-template-file" => ("--chat-template-file", Kind::Value),
         "--queue" => ("--queue", Kind::Value),
+        "--expert-prune" => ("--expert-prune", Kind::Value),
         "-rea" | "--reasoning" => ("--reasoning", Kind::Value),
         "--reasoning-format" => ("--reasoning-format", Kind::Value),
         "--reasoning-effort" => ("--reasoning-effort", Kind::Value),
@@ -137,6 +138,7 @@ pub fn names() -> impl Iterator<Item = &'static str> {
         "--chat-var",
         "--chat-template-file",
         "--queue",
+        "--expert-prune",
         "--reasoning",
         "--reasoning-format",
         "--reasoning-effort",
@@ -192,6 +194,29 @@ fn drafters(value: &str) -> Result<Vec<Drafter>, Invalid> {
         list.push(drafter);
     }
     Ok(list)
+}
+
+/// `--expert-prune`: `off`, or a rule and the rank from which it may touch a
+/// pick (`skip:8`, `router:8`, `similar:1`).
+fn expert_prune(value: &str) -> Result<Option<ExpertPrune>, Invalid> {
+    let expected = "off, or skip, router or similar with the rank from which a pick may be \
+                    touched (similar:8)";
+    if value.trim() == "off" {
+        return Ok(None);
+    }
+    let (rule, rank) =
+        value.split_once(':').ok_or_else(|| invalid("--expert-prune", value, expected))?;
+    let rule = match rule.trim() {
+        "skip" => ares_cuda::PruneRule::Skip,
+        "router" => ares_cuda::PruneRule::Router,
+        "similar" => ares_cuda::PruneRule::Similar,
+        _ => return Err(invalid("--expert-prune", value, expected)),
+    };
+    let from_rank: u32 = number("--expert-prune", rank, expected)?;
+    if from_rank == 0 {
+        return Err(invalid("--expert-prune", value, expected));
+    }
+    Ok(Some(ExpertPrune { rule, from_rank }))
 }
 
 /// A variable of the chat template: a JSON value where the text is one
@@ -311,6 +336,7 @@ pub fn set(options: &mut ModelOptions, flag: &'static str, value: &str) -> Resul
         "--queue" => {
             load.queue = Some(number("--queue", value, "a number of requests, 0 or more")?);
         }
+        "--expert-prune" => load.expert_prune = expert_prune(value)?,
         "--chat-var" => {
             let (name, value) = chat_variable(value)?;
             set_chat_variable(load, &name, value);

@@ -821,6 +821,11 @@ fn load_qwen35(
     );
 
     // What can be refused before a device is touched.
+    if options.expert_prune.is_some() {
+        return Err(refuse(
+            "--expert-prune does nothing for this model: it has no mixture of experts",
+        ));
+    }
     let kv = options.kv.unwrap_or(Options::default().kv);
     let parallel = options.parallel.unwrap_or(DEFAULT_PARALLEL);
     if parallel == 0 {

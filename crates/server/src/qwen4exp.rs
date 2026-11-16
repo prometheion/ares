@@ -18,9 +18,11 @@ use ares_api::{Engine, Event, EventSink, GenerateRequest, Prompt, RequestId, Sam
 use ares_core::units::Bytes;
 use ares_gguf::Gguf;
 use ares_model::qwen4exp::device::{
-    Options, ProfileFound, ProfileReport, Qwen4Exp, SessionOptions, Spread, place, step_rows,
+    Options, ProfileFound, ProfileReport, PruneSetup, Qwen4Exp, SessionOptions, Spread, place,
+    profile_key, step_rows,
 };
 use ares_model::qwen4exp::{Config, DraftWeights};
+use ares_runtime::expert_store::ExpertNeighbours;
 use ares_runtime::{GpuConfig, Runtime, RuntimeConfig, required_ram};
 use ares_tokenizer::Tokenizer;
 
@@ -149,6 +151,7 @@ pub(crate) fn load(
     if options.context == Some(0) {
         return Err(refuse("--context must be at least 1"));
     }
+    let prune = expert_prune(options, &gguf, &config)?;
 
     // The devices.
     let (_, mut held) = hold_devices(options)?;
@@ -214,6 +217,7 @@ pub(crate) fn load(
             max_slots: parallel,
             cells: context.min(model_context),
             pool_pages: pages,
+            prune: prune.clone(),
             ..Options::default()
         },
         headroom: VRAM_HEADROOM,
@@ -482,6 +486,49 @@ pub(crate) fn load(
          RAM yet, so a context that does not fit is refused at load)"
     );
     Ok(Loaded::new(runtime, name, held, ram))
+}
+
+/// What `--expert-prune` asks of the routers, with the table of similar
+/// experts for the rule `similar`, which is kept beside the usage profile.
+fn expert_prune(
+    options: &LoadOptions,
+    gguf: &Gguf,
+    config: &Config,
+) -> Result<Option<PruneSetup>, LoadError> {
+    let Some(asked) = options.expert_prune else { return Ok(None) };
+    if asked.from_rank > config.experts.used as u32 {
+        return Err(refuse(format!(
+            "--expert-prune: rank {} of the {} picks of a row",
+            asked.from_rank, config.experts.used
+        )));
+    }
+    let prune = ares_cuda::Prune::new(asked.rule, asked.from_rank - 1);
+    let near = if asked.rule == ares_cuda::PruneRule::Similar {
+        let dir = profile_dir(options).ok_or_else(|| {
+            refuse("--expert-prune similar: no directory for the table of similar experts")
+        })?;
+        let key = profile_key(gguf, config);
+        let path = ExpertNeighbours::path(&key, &dir);
+        let table = ExpertNeighbours::read(&dir, &key)
+            .map_err(|e| refuse(format!("--expert-prune similar: {}: {e}", path.display())))?
+            .ok_or_else(|| {
+                refuse(format!(
+                    "--expert-prune similar: there is no table of similar experts for this \
+                     model file ({})",
+                    path.display()
+                ))
+            })?;
+        Some(std::sync::Arc::new(table))
+    } else {
+        None
+    };
+    tracing::info!(
+        "expert pruning: {:?} from the {}. pick of a row on, for experts only the SSD holds; \
+         this changes the output",
+        asked.rule,
+        asked.from_rank
+    );
+    Ok(Some(PruneSetup { prune, near }))
 }
 
 /// Where the usage profiles of the experts are kept: in the directory of the

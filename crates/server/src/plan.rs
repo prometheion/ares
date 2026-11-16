@@ -8,7 +8,7 @@
 use std::path::PathBuf;
 
 use ares_core::units::Bytes;
-use ares_cuda::{CacheFormat, Precision};
+use ares_cuda::{CacheFormat, Precision, PruneRule};
 use ares_tokenizer::Json;
 
 /// The cells of a page of sequence state: what the attention kernels store
@@ -68,6 +68,15 @@ pub enum Drafter {
     Block(PathBuf),
 }
 
+/// What a mixture of experts does with a pick whose expert only the SSD holds
+/// (`--expert-prune RULE:THRESHOLD`): `rule` for the picks from the
+/// `from_rank`-th of a row on (1 the strongest).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExpertPrune {
+    pub rule: PruneRule,
+    pub from_rank: u32,
+}
+
 /// The most bytes the prompt cache takes on SSD when `--cache-size` does not
 /// say: room for the state of about a million tokens of the largest model the
 /// engine runs today, and little enough to be no surprise on a drive whose
@@ -120,6 +129,9 @@ pub struct LoadOptions {
     /// The most requests that may wait for a sequence while every sequence
     /// runs. `None`: a request waits until it runs.
     pub queue: Option<u32>,
+    /// Pruning of the picks of a mixture of experts that only the SSD holds.
+    /// `None`: none, the output as the model gives it.
+    pub expert_prune: Option<ExpertPrune>,
 }
 
 impl LoadOptions {
@@ -144,6 +156,7 @@ impl LoadOptions {
             chat_variables: Vec::new(),
             chat_template: None,
             queue: None,
+            expert_prune: None,
         }
     }
 }
