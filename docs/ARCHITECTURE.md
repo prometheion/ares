@@ -4449,11 +4449,12 @@ times that far plus 0.1 %. The cases are the eleven square patterns of the
 reference dumps and the ten own images of the Pillow check (wide, tall, below
 the minimum, and one shrunk to 4060 rows), resized here; the reference's rows
 are kept in a directory, since an image of 4060 rows takes it half an hour on
-12 threads of the CPU. Measured on both cards (2026-11-16, both projectors, every case up to
-1024 rows): the device is 3.0e-4 to 6.7e-3 from the exact rows, 0.62 to 1.8
+12 threads of the CPU. Measured on both cards (2026-11-16, both projectors, all 21 cases up
+to 4060 rows): the device is 3.0e-4 to 6.7e-3 from the exact rows, 0.62 to 1.8
 times as far as the reference with the device's roundings is, so no case used
-more than 37 % of its tolerance; the two homes gave the same rows bit for bit,
-and so did the two cards. TODO-4060
+more than 37 % of its tolerance (the image of 4060 rows: 1.05e-3 for the 27B's
+projector and 1.39e-3 for Flash-Next's, against 1.08e-3 and 1.33e-3); the two
+homes gave the same rows bit for bit, and so did the two cards.
 
 The residual after the stem and after the first two blocks is checked value by
 value as well: 0.9e-4 to 1.7e-4 of the exact reference after the stem (the f16
