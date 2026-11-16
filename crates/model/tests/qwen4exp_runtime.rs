@@ -199,7 +199,14 @@ fn byte_tokenizer(template: Option<&str>) -> Tokenizer {
 
 /// The model of the runtime with the vocabulary of the made-up file: a
 /// prompt is `t5 t9 ...`, a token prints as `t5 `.
-struct Made(Arc<Qwen4Exp>);
+struct Made(Arc<Qwen4Exp>, Cache);
+
+/// Whether the engine over [`Made`] has the model's prefix cache.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Cache {
+    On,
+    Off,
+}
 
 impl Model for Made {
     fn card(&self) -> ModelCard {
@@ -258,7 +265,7 @@ impl Model for Made {
         self.0.attention_span()
     }
     fn prefix_cache(&self) -> Option<PrefixCache> {
-        self.0.prefix_cache()
+        self.0.prefix_cache().filter(|_| self.1 == Cache::On)
     }
     fn page_entry(&self, page: u32) -> u32 {
         self.0.page_entry(page)
@@ -311,7 +318,7 @@ fn start_following(
         Arc::new(Qwen4Exp::new(gguf, byte_tokenizer(None), "made", &devices, opts, CELLS).unwrap());
     let config =
         RuntimeConfig { pages, cells_per_page: 128, max_slots: SLOTS, ..RuntimeConfig::default() };
-    let model: Arc<dyn Model> = Arc::new(Made(inner.clone()));
+    let model: Arc<dyn Model> = Arc::new(Made(inner.clone(), Cache::On));
     let mut gpu = GpuConfig::new(&config, &*model);
     gpu.ram_limit += 256 << 20;
     gpu.vram_headroom = 512 << 20;
@@ -335,7 +342,7 @@ fn start_at(
     config: RuntimeConfig,
     rows: u32,
 ) -> (Runtime, Arc<Qwen4Exp>) {
-    start_with(path, None, placement, pages, config, rows)
+    start_with(path, None, placement, pages, config, rows, Cache::On)
 }
 
 /// The file of a made-up draft block for the made-up model of `seed`, its
@@ -351,7 +358,15 @@ fn draft_path(seed: u64) -> PathBuf {
 /// eight rows.
 fn start_drafting(seed: u64, placement: Placement, pages: u32) -> (Runtime, Arc<Qwen4Exp>) {
     let config = RuntimeConfig { window_rows: 8, ..RuntimeConfig::default() };
-    start_with(&gguf_path(seed), Some(&draft_path(seed)), placement, pages, config, MAX_ROWS)
+    start_with(
+        &gguf_path(seed),
+        Some(&draft_path(seed)),
+        placement,
+        pages,
+        config,
+        MAX_ROWS,
+        Cache::On,
+    )
 }
 
 /// [`start_drafting`] without the prices the conductor measures at the
@@ -364,7 +379,15 @@ fn start_drafting_unpriced(
     pages: u32,
 ) -> (Runtime, Arc<Qwen4Exp>) {
     let config = RuntimeConfig { window_rows: 8, warm_up: false, ..RuntimeConfig::default() };
-    start_with(&gguf_path(seed), Some(&draft_path(seed)), placement, pages, config, MAX_ROWS)
+    start_with(
+        &gguf_path(seed),
+        Some(&draft_path(seed)),
+        placement,
+        pages,
+        config,
+        MAX_ROWS,
+        Cache::On,
+    )
 }
 
 /// [`start_at`], with the draft block of the file `draft` when there is one.
@@ -375,6 +398,7 @@ fn start_with(
     pages: u32,
     config: RuntimeConfig,
     rows: u32,
+    cache: Cache,
 ) -> (Runtime, Arc<Qwen4Exp>) {
     let devices = open_devices(placement);
     let gguf = Gguf::open(path).unwrap();
@@ -387,7 +411,7 @@ fn start_with(
     }
     let inner = Arc::new(inner);
     let config = RuntimeConfig { pages, cells_per_page: 128, max_slots: SLOTS, ..config };
-    let model: Arc<dyn Model> = Arc::new(Made(inner.clone()));
+    let model: Arc<dyn Model> = Arc::new(Made(inner.clone(), cache));
     let mut gpu = GpuConfig::new(&config, &*model);
     // Room for the tier of experts next to what the executor needs.
     gpu.ram_limit += 256 << 20;
@@ -660,7 +684,12 @@ fn the_runtime_answers_as_the_session_does_in_every_placement() {
     let prompt = prompt(21, 3);
     for placement in placements() {
         let want = session_answer(1, placement, &prompt, 24);
-        let (runtime, model) = start(1, placement, 16, RuntimeConfig::default());
+        // Without the prefix cache: with it, the second answer would read the
+        // cells the first one computed with experts that were fetched, the
+        // CPU's arithmetic for the missed ones among them.
+        let path = gguf_path(1);
+        let config = RuntimeConfig::default();
+        let (runtime, model) = start_with(&path, None, placement, 16, config, MAX_ROWS, Cache::Off);
         // The first answer comes from experts that are fetched: the same
         // text up to a near tie. The settled one is the session's.
         let first = ask(&runtime, 1, &prompt, 24);
@@ -1261,7 +1290,7 @@ fn start_flash_with(
         warm_up: false,
         ..RuntimeConfig::default()
     };
-    let model: Arc<dyn Model> = Arc::new(Made(inner.clone()));
+    let model: Arc<dyn Model> = Arc::new(Made(inner.clone(), Cache::On));
     let mut gpu = GpuConfig::new(&config, &*model);
     // A small tier in RAM: what has no slot in VRAM is read from the file.
     gpu.ram_limit += 1 << 30;
@@ -1477,7 +1506,7 @@ fn start_profiled(placement: Placement, dir: &std::path::Path) -> (Runtime, Arc<
         max_slots: SLOTS,
         ..RuntimeConfig::default()
     };
-    let model: Arc<dyn Model> = Arc::new(Made(inner.clone()));
+    let model: Arc<dyn Model> = Arc::new(Made(inner.clone(), Cache::On));
     let mut gpu = GpuConfig::new(&config, &*model);
     gpu.ram_limit += 256 << 20;
     gpu.vram_headroom = 512 << 20;
