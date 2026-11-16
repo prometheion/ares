@@ -12,7 +12,9 @@
 //! stores are made in (default: the tests' directory under the build's). The
 //! test over two devices needs `ARES_TEST_QWEN35_27B_SMALL` (Qwen3.8-27B
 //! IQ2_XXS), which it splits over devices 0 and 1 with K and V in `q5`, the
-//! formats that keep new pages in another form than old ones.
+//! formats that keep new pages in another form than old ones. The test of
+//! Qwen3.8-Flash-Next needs `ARES_TEST_QWEN4EXP_MODEL` (the first of its two
+//! files) and both devices.
 //!
 //! ```sh
 //! ARES_TEST_CUDA=1 ARES_TEST_QWEN35_MODEL=Qwen3.5-0.8B-Q4_K_M.gguf \
@@ -102,12 +104,14 @@ fn dechunk(mut raw: &[u8]) -> Vec<u8> {
     out
 }
 
-/// What a completion said, and how much of its prompt came from the cache.
-#[derive(Debug, PartialEq)]
+/// What a completion said, how much of its prompt came from the cache, and
+/// the milliseconds from the request's arrival to its first token.
+#[derive(Debug)]
 struct Said {
     text: String,
     prompt_tokens: u64,
     cached_tokens: u64,
+    first_ms: f64,
 }
 
 impl Server {
@@ -196,6 +200,7 @@ impl Server {
             text: reply["choices"][0]["text"].as_str().expect("a text").to_owned(),
             prompt_tokens: usage["prompt_tokens"].as_u64().expect("prompt tokens"),
             cached_tokens: usage["prompt_tokens_details"]["cached_tokens"].as_u64().unwrap_or(0),
+            first_ms: reply["timings"]["prompt_ms"].as_f64().unwrap_or(f64::NAN),
         }
     }
 
@@ -419,4 +424,88 @@ fn a_model_that_was_unloaded_resumes_from_ssd_when_it_is_loaded_again() {
     let log = server.stop();
     let stores = log.iter().filter(|line| line.contains("prompt cache on SSD")).count();
     assert_eq!(stores, 2, "the store was opened by both loads: {log:#?}");
+}
+
+/// Qwen3.8-Flash-Next on two devices with a RAM limit of 8 GiB, most of which
+/// the tier of experts takes: a conversation of about 8k tokens is computed
+/// from nothing, goes on from the cards, comes back after other conversations
+/// took the pool (from RAM where the tier leaves the prompt cache room, from
+/// the drive otherwise), and after a restart from the drive. Every reply of
+/// the second turn is the one a server that never saw the conversation gives
+/// (a list of facts: the tokens follow with a wide margin). The time to the
+/// first token of each is reported.
+#[test]
+fn flash_next_resumes_a_conversation_from_the_cards_from_ram_and_from_ssd() {
+    let Some(model) = file("ARES_TEST_QWEN4EXP_MODEL", "the first file of Qwen3.8-Flash-Next")
+    else {
+        return;
+    };
+    let dir = scratch("cache-flash");
+    let cache = dir.display().to_string();
+    let name = name_of(&model);
+    // About 8k tokens of facts; a context that holds two such conversations.
+    let lines = 660;
+    let flags = ["--devices", "0,1", "--ram", "8G", "--context", "20480", "--parallel", "2"];
+    let with_cache: Vec<&str> = flags.iter().copied().chain(["--cache", &cache]).collect();
+    let first = format!("{}{}", facts(1, lines), question(7));
+    let report = |what: &str, said: &Said| {
+        eprintln!(
+            "RES flash {what}: {} of {} prompt tokens from the cache, first token after {:.0} ms",
+            said.cached_tokens, said.prompt_tokens, said.first_ms
+        );
+    };
+
+    // A server that never saw the conversation: the second turn computed
+    // from nothing is the reference.
+    let plain = Server::start(&args(&model, &flags), port(3));
+    let one = plain.complete(&name, &first, 12);
+    assert!(one.text.contains(&code_of(1, 7).to_string()), "{one:?}");
+    plain.stop();
+    let second = format!("{first}{}\n{}", one.text, question(lines - 3));
+    let plain = Server::start(&args(&model, &flags), port(3));
+    let cold = plain.complete(&name, &second, 12);
+    assert!(cold.text.contains(&code_of(1, lines - 3).to_string()), "{cold:?}");
+    assert_eq!(cold.cached_tokens, 0);
+    report("cold", &cold);
+    plain.stop();
+
+    let mut server = Server::start(&args(&model, &with_cache), port(3));
+    let plan = server.logged().iter().find(|line| line.contains("plan: RAM")).cloned();
+    eprintln!("{plan:?}");
+    let again = server.complete(&name, &first, 12);
+    assert_eq!(again.text, one.text, "the first turn");
+    let cards = server.complete(&name, &second, 12);
+    report("from the cards", &cards);
+    assert_eq!(cards.text, cold.text, "the second turn from the cards");
+    assert!(cards.cached_tokens > 4096, "{cards:?}");
+
+    // Two other conversations take the pool.
+    for seed in 2..4 {
+        let other = format!("{}{}", facts(seed, lines), question(5));
+        let said = server.complete(&name, &other, 12);
+        assert!(said.text.contains(&code_of(seed, 5).to_string()), "{said:?}");
+    }
+    let (ram_before, ssd_before) =
+        (server.metric("cache_ram_pages_read_total"), server.metric("cache_ssd_pages_read_total"));
+    let back = server.complete(&name, &second, 12);
+    let from_ram = server.metric("cache_ram_pages_read_total") - ram_before;
+    let from_ssd = server.metric("cache_ssd_pages_read_total") - ssd_before;
+    report(&format!("after eviction ({from_ram} pages from RAM, {from_ssd} from SSD)"), &back);
+    eprintln!(
+        "RES flash: checkpoints in RAM {} bytes, pages in RAM {} bytes",
+        server.metric("checkpoint_ram_bytes"),
+        server.metric("cache_ram_bytes")
+    );
+    assert_eq!(back.text, cold.text, "the second turn after the pool was taken");
+    assert!(back.cached_tokens > 4096, "{back:?}");
+    server.stop();
+
+    // A new process: the drive has what the last one wrote when it stopped.
+    let server = Server::start(&args(&model, &with_cache), port(3));
+    let restart = server.complete(&name, &second, 12);
+    report("after a restart", &restart);
+    assert_eq!(restart.text, cold.text, "the second turn after a restart");
+    assert!(restart.cached_tokens > 4096, "{restart:?}");
+    assert!(server.metric("cache_ssd_checkpoints_read_total") >= 1);
+    server.stop();
 }

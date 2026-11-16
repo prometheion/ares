@@ -23,11 +23,12 @@ use ares_model::qwen4exp::device::{
 };
 use ares_model::qwen4exp::{Config, DraftWeights};
 use ares_runtime::expert_store::ExpertNeighbours;
-use ares_runtime::{GpuConfig, Model, Runtime, RuntimeConfig, required_ram};
+use ares_runtime::{GpuConfig, Model, Runtime, RuntimeConfig, SsdConfig, required_ram};
 use ares_tokenizer::Tokenizer;
 
 use crate::load::{
-    LoadError, Loaded, VRAM_HEADROOM, describe_links, hold_devices, join, ram_limit, refuse, short,
+    LoadError, Loaded, VRAM_HEADROOM, describe_links, hold_devices, join, ram_limit_of, refuse,
+    short,
 };
 use crate::models::Site;
 use crate::plan::{self, CELLS_PER_PAGE, DEFAULT_PARALLEL, Drafter, LoadOptions, SplitKind};
@@ -395,35 +396,85 @@ pub(crate) fn load(
     // Host RAM: one limit for the engine. What it needs to run is taken from
     // it first (the step buffers of the devices and the parts'); the tier of
     // experts takes the rest, as far as the experts that VRAM has no slot for
-    // can use it.
+    // can use it, and the prompt cache in RAM (checkpoints of the recurrent
+    // state and pages that left the devices) what the tier leaves: the tier
+    // ranks first. The prompt cache on SSD adds two needs of its own, as for a
+    // dense model: a checkpoint place and a few pages that state passes
+    // through on its way to the drive and back, whatever the tier holds, and
+    // buffers of ordinary memory for checkpoints in transit.
     let required = required_ram(&*model, parallel);
-    let (ram, why_ram) = ram_limit(
+    let checkpoint = model.prefix_cache().map_or(0, |cache| cache.bytes());
+    let ssd = options.cache.as_ref().map(|dir| {
+        SsdConfig::new(dir, options.cache_size.unwrap_or(crate::plan::DEFAULT_CACHE_SIZE))
+    });
+    let durable = ssd.as_ref().and_then(|_| model.durable(CELLS_PER_PAGE));
+    let transit = durable.as_ref().map_or(0, SsdConfig::transit_ram);
+    let floor = durable.as_ref().map_or(0, |durable| SsdConfig::floor_ram(durable, checkpoint));
+    let mut needs = vec![("its step buffers", required)];
+    if floor > 0 {
+        needs.push((
+            "one checkpoint of recurrent state and the pages on their way to the prompt cache \
+             on SSD or back (page-locked)",
+            floor,
+        ));
+    }
+    if transit > 0 {
+        needs.push((
+            "the checkpoints in transit to the prompt cache on SSD and back, at their most \
+             (ordinary memory, taken as it is first used)",
+            transit,
+        ));
+    }
+    let (ram, why_ram) = ram_limit_of(
         options,
         site,
-        required,
+        &needs,
         "the tier of experts gets nothing beyond the step buffers",
     )?;
+    // What the engine may page-lock: the limit less the buffers in transit.
+    let lockable = ram - transit;
     let runtime_config = RuntimeConfig {
         pages,
         cells_per_page: CELLS_PER_PAGE,
         max_slots: parallel,
         queue: options.queue,
         window_rows: if drafting { window } else { 1 },
-        cache_ram: 0,
+        cache_ram: lockable - required,
+        ssd: ssd.clone(),
         ..RuntimeConfig::default()
     };
     let gpu = GpuConfig {
         vram_headroom: VRAM_HEADROOM,
-        ram_limit: ram,
+        ram_limit: lockable,
         ..GpuConfig::new(&runtime_config, &*model)
     };
     tracing::info!(
-        "plan: RAM, at most {} for the engine ({why_ram}): {} for its step buffers, the rest for \
-         the tier of experts, which holds the experts that have no slot in VRAM as far as the \
-         memory goes, gives pieces back when the machine needs them, the coldest experts of \
-         every layer with them, and takes them again when the memory is free",
+        "plan: RAM, at most {} for the engine ({why_ram}): {} for its step buffers{}, the rest \
+         for the tier of experts first, which holds the experts that have no slot in VRAM as \
+         far as the memory goes, gives pieces back when the machine needs them, the coldest \
+         experts of every layer with them, and takes them again when the memory is free; the \
+         prompt cache in RAM has what the tier leaves, for pages that left the devices and \
+         checkpoints of recurrent state of {} each over all devices{}",
         Bytes(ram),
         Bytes(required),
+        match transit {
+            0 => String::new(),
+            bytes => format!(
+                ", at most {} for checkpoints in transit between RAM and the prompt cache's \
+                 store on SSD (ordinary memory, taken as it is first used)",
+                Bytes(bytes)
+            ),
+        },
+        Bytes(checkpoint),
+        match floor {
+            0 => String::new(),
+            bytes => format!(
+                ", and {} that state passes through on its way to the prompt cache's store on SSD \
+                 and back, a checkpoint place and pages, which the cache keeps whatever the tier \
+                 holds",
+                Bytes(bytes)
+            ),
+        },
     );
     tracing::info!("loading the weights");
     let loading = Instant::now();
@@ -455,6 +506,27 @@ pub(crate) fn load(
         loading.elapsed().as_secs_f64(),
         begun.elapsed().as_secs_f64()
     );
+    if let (Some(ssd), Some(snapshot)) = (&ssd, runtime.snapshot()) {
+        let held = snapshot.counters.ssd;
+        match &snapshot.ssd_problem {
+            Some(why) => tracing::warn!(
+                "the prompt cache on SSD in {} is not in use, the cache lives in the devices and \
+                 in RAM alone: {why}",
+                ssd.dir.display()
+            ),
+            None => tracing::info!(
+                "prompt cache on SSD: {}, at most {} for everything in it; this model's store \
+                 holds {} pages and {} checkpoints in {}; texts of {} tokens and more are \
+                 written when they leave RAM, and when the model is unloaded",
+                ssd.dir.display(),
+                Bytes(ssd.max_bytes),
+                held.store_pages,
+                held.store_states,
+                Bytes(held.store_bytes),
+                ssd.min_cells
+            ),
+        }
+    }
     if let Some(calibration) = runtime.snapshot().and_then(|snapshot| snapshot.calibration) {
         let table = |points: &[(u32, f64)]| {
             join(points.iter().map(|(n, ms)| format!("{n}: {ms:.1}")), ", ")

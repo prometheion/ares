@@ -725,21 +725,12 @@ pub fn follow(machine: Arc<Machine>) -> bool {
 /// The most host RAM the engine may use: what the operator named, or all the
 /// machine has. Below that limit the engine follows the machine
 /// ([`Machine`]): its elastic memory is what is available less a headroom.
-/// `required` is what the engine needs to run at all, its step buffers;
-/// `nothing` says what is not spared when the machine reports no memory.
-pub(crate) fn ram_limit(
-    options: &LoadOptions,
-    site: &Site,
-    required: u64,
-    nothing: &str,
-) -> Result<(u64, String), LoadError> {
-    ram_limit_of(options, site, &[("its step buffers", required)], nothing)
-}
-
-/// [`ram_limit`] for an engine that must page-lock more than its step
-/// buffers to run: `needs` is all of it, by what it is for. A limit below
-/// their sum is refused, and the refusal names every share.
-fn ram_limit_of(
+/// `needs` is what the engine must page-lock to run at all (its step buffers,
+/// and what else a model or the prompt cache cannot do without), by what it
+/// is for: a limit below their sum is refused, and the refusal names every
+/// share. `nothing` says what is not spared when the machine reports no
+/// memory.
+pub(crate) fn ram_limit_of(
     options: &LoadOptions,
     site: &Site,
     needs: &[(&str, u64)],
