@@ -119,11 +119,23 @@ other differed more by the load than by the drafts.
       the most used experts of the next two layers.
 - [ ] A missed expert waits 2.3 to 3.2 ms for the file where the drive needs 1.4 ms: find
       the rest.
-- [ ] Pruning as a fourth level next to VRAM, RAM and SSD: a picked expert that is only on
-      the SSD is fetched only when the pick is strong; else it is skipped (tail skip) or
-      replaced by the most similar cached expert (the owner's idea; no engine has it). A
-      threshold as the quality dial, off by default; measured per rule and threshold on
-      the IQ2_XS file and on the Q4_K_XL file (KL, agreement, reads per token, speed).
+- [x] Pruning as a fourth level next to VRAM, RAM and SSD (branch `moe/pruning`):
+      `--expert-prune skip|router|similar:RANK`, off by default, on the device right after
+      the router's top-k; the tool `qwen4exp_prune` measures it. Skip is the rule to use
+      (least KL for the reads it saves at every rank on both files); a stand-in by
+      similarity does not pay because the experts' outputs are nearly orthogonal (the most
+      similar one carries well under 1 % of a missed expert's output). IQ2_XS, 8 GiB:
+      `skip:4` 0.7 reads per token instead of 4.5, 45 tokens/s instead of 31, KL 0.011;
+      Q4_K_XL from the SSD: `skip:8` 5.0 tokens/s instead of 3.5 at KL 0.026, `skip:1` 17.5
+      at KL 0.50. Tables in ARCHITECTURE.md ("Pruning as a fourth level").
+- [ ] Pruning, what is left: (1) the table for `similar` is made by the tool
+      (`qwen4exp_prune calibrate` and `near`, minutes of GPU and CPU); the server only reads
+      it, and refuses `similar` without it; (2) slices of a prompt (wide steps) are not
+      pruned; (3) a decision per expert over a window (Strata's) instead of per row was not
+      measured; (4) where a third of all picks are touched (Q4, `skip:1`), stand-ins with the
+      table's scale (KL 0.42) and the router's renormalised (0.46) beat skip (0.50): skip
+      renormalised at that rank was not measured; (5) the speeds were measured with every
+      miss uploaded (`--serve stream`, for runs that repeat), not with the CPU serving them.
 - [ ] Defect: Flash-Next's float-path tensors (stream mixers `hc_attn`/`hc_ffn` down and up,
       `output_hc` down and up, `ple_key`/`ple_value`) are refused in a quantized type
       (`device/load.rs` `float_matrix`; UD-Q4_K_XL has them in Q8_0, the IQ2_XS file in BF16).

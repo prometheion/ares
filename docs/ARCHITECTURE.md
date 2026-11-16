@@ -4342,6 +4342,121 @@ gives. Its least-squares scale is kept with it. The candidates are the 48 neares
 outputs on 16 rows that all experts share and the 16 nearest by the router's rows; every
 expert keeps its 16 nearest.
 
+*How alike the experts are, measured* (IQ2_XS, 3296 calibration rows; UD-Q4_K_XL, 640;
+2026-11-16). Hardly at all. The nearest expert of a layer gives a median closeness of 0.001
+to 0.017 in layers 1 to 46 (90 % of the experts below 0.003 to 0.074), 0.070 in layer 0
+and 0.013 in layer 47; the Q4 file gives the same picture (median over the layers 0.003).
+The outputs of two experts on the rows that pick one of them are nearly orthogonal: the
+best stand-in carries well under 1 % of a missed expert's output in most layers, so a
+stand-in that takes the missed pick's weight adds an error about as large as the one it
+takes away. Which measure finds the nearest (64 experts per layer measured against all
+511 others on their own rows, layers 0, 12, 24, 36 and 47 of IQ2_XS): the router's rows
+find a stand-in with 42 to 70 % of the best closeness, the outputs on 16 shared rows 21
+to 74 %, the experts' weights (a sketch of all three matrices) 2 to 7 %. Weights say
+nothing (the inner units of two experts are in no common order); the router's rows and
+outputs on any rows say something, outputs on the expert's own rows say it best, and that
+is what the table keeps.
+
+*The rules, measured* (2026-11-16, RTX 4070 and RTX 3060, `qwen4exp_prune measure`; per
+text a process of its own that opens the model as the server does, fills the tiers from the
+usage profile its warm-up wrote, reads 256 tokens of the text as a prompt in steps of eight
+rows without pruning and then 1000 tokens of it one a step, as generation does, with the
+text's tokens as the tokens generated; KL is the divergence of each step's distribution from
+the same run without pruning over its 256 most likely tokens and the rest as one, top-1 how
+often the most likely token is the same; every miss uploaded (`--serve stream`), because with
+the CPU computing misses two runs without pruning already differ by KL 0.006; texts German
+prose, English prose and Rust; load average 3 to 15). IQ2_XS, both cards on every layer,
+the split pinned:
+
+| `--ram` | Rule | From rank | KL (German / English / code) | Top-1 | Reads from the SSD per token | Tokens/s |
+| --- | --- | --- | --- | --- | --- | --- |
+| 8G | none | - | 0.0008 (0.0001 / 0.0000 / 0.0025): two runs without pruning | 99.6 % | 4.52 | 31.2 |
+| 8G | skip | 8 | 0.0081 (0.0073 / 0.0105 / 0.0066) | 96.3 % | 2.33 | 37.9 |
+| 8G | router | 8 | 0.0085 (0.0085 / 0.0101 / 0.0070) | 96.2 % | 2.33 | 37.7 |
+| 8G | similar | 8 | 0.0095 (0.0088 / 0.0116 / 0.0081) | 95.8 % | 2.34 | 36.7 |
+| 8G | skip | 6 | 0.0094 (0.0107 / 0.0106 / 0.0067) | 95.9 % | 1.37 | 41.6 |
+| 8G | skip | 4 | 0.0111 (0.0108 / 0.0134 / 0.0091) | 95.5 % | 0.71 | 45.2 |
+| 8G | router | 4 | 0.0141 (0.0120 / 0.0143 / 0.0160) | 95.4 % | 0.72 | 42.0 |
+| 8G | similar | 4 | 0.0141 (0.0127 / 0.0166 / 0.0128) | 95.2 % | 0.72 | 38.6 |
+| 8G | similar, scaled | 4 | 0.0108 (0.0111 / 0.0126 / 0.0086) | 95.7 % | 0.71 | 40.7 |
+| 8G | similar, renormalised | 4 | 0.0128 (0.0132 / 0.0146 / 0.0105) | 95.6 % | 0.71 | 43.8 |
+| 8G | skip, renormalised | 4 | 0.0123 (0.0127 / 0.0135 / 0.0106) | 95.7 % | 0.72 | 41.3 |
+| 8G | router, weight kept | 4 | 0.0142 (0.0154 / 0.0149 / 0.0122) | 94.8 % | 0.72 | 33.0 |
+| 8G | skip | 1 | 0.0276 (0.0245 / 0.0255 / 0.0328) | 93.5 % | 0.00 | 46.1 |
+| 8G | router | 1 | 0.0313 (0.0277 / 0.0275 / 0.0387) | 93.2 % | 0.00 | 45.3 |
+| 8G | similar | 1 | 0.0380 (0.0315 / 0.0338 / 0.0486) | 92.9 % | 0.00 | 44.1 |
+| 8G | skip, weight below 0.05 | 1 | 0.0065 (0.0062 / 0.0086 / 0.0048) | 96.4 % | 3.91 | 23.0 (a busy minute) |
+| 8G | skip, weight below 0.1 | 1 | 0.0111 (0.0115 / 0.0123 / 0.0094) | 95.6 % | 0.80 | 42.5 |
+| 4G | none | - | - | - | 10.13 | 15.0 |
+| 4G | skip | 8 | 0.0098 (0.0088 / 0.0118 / 0.0089) | 95.5 % | 5.14 | 23.3 |
+| 4G | router | 8 | 0.0105 (0.0098 / 0.0122 / 0.0094) | 95.6 % | 5.15 | 26.1 |
+| 4G | similar | 8 | 0.0115 (0.0105 / 0.0135 / 0.0106) | 94.8 % | 5.19 | 23.5 |
+| 4G | skip | 1 | 0.0516 (0.0495 / 0.0490 / 0.0564) | 91.9 % | 0.00 | 49.0 |
+| 4G | skip, weight below 0.05 | 1 | 0.0073 (0.0076 / 0.0094 / 0.0050) | 96.2 % | 8.75 | 17.1 |
+
+The UD-Q4_K_XL file (as a copy with its float path in F32, see OPEN.md; a range of layers
+per card, 4 344 experts in VRAM and 2 400 in a RAM tier of 8 GiB, 27 % of all, 23 % with 4 GiB;
+a prompt of 32 tokens and 200 tokens one a step per text):
+
+| `--ram` | Rule | From rank | KL (German / English / code) | Top-1 | Reads from the SSD per token | Tokens/s |
+| --- | --- | --- | --- | --- | --- | --- |
+| 8G | none | - | - | - | 81.0 | 3.5 |
+| 8G | skip | 8 | 0.0258 (0.0383 / 0.0261 / 0.0129) | 93.2 % | 47.1 | 5.0 |
+| 8G | router | 8 | 0.0301 (0.0381 / 0.0318 / 0.0206) | 90.0 % | 46.9 | 4.8 |
+| 8G | similar | 8 | 0.0345 (0.0465 / 0.0393 / 0.0177) | 89.7 % | 48.0 | 4.7 |
+| 8G | skip | 4 | 0.0773 (0.1110 / 0.0858 / 0.0350) | 86.3 % | 16.7 | 8.7 |
+| 8G | skip | 1 | 0.5005 (0.7379 / 0.6505 / 0.1129) | 69.3 % | 0.0 | 17.5 |
+| 8G | router | 1 | 0.4632 (0.6963 / 0.5884 / 0.1049) | 71.7 % | 0.0 | 13.5 |
+| 8G | skip, weight below 0.05 | 1 | 0.0104 (0.0097 / 0.0139 / 0.0076) | 93.8 % | 72.5 | 3.8 |
+| 8G | similar, scaled | 1 | 0.4240 (0.6139 / 0.5830 / 0.0752) | 73.3 % | 1.7 | 11.8 |
+| 4G | none | - | - | - | 98.5 | 3.0 |
+| 4G | skip | 8 | 0.0283 (0.0415 / 0.0296 / 0.0138) | 92.2 % | 58.5 | 4.5 |
+| 4G | skip | 1 | 0.6015 (0.8440 / 0.7742 / 0.1865) | 68.8 % | 0.0 | 20.8 |
+
+What this says:
+
+- *Skip is the rule.* At every rank and on both files it costs the least for the same reads
+  saved, with one exception where a third of all picks are touched (Q4, every pick from rank
+  1): there the stand-ins by similarity with the table's scale (0.42) and the router's,
+  renormalised (0.46), beat skip (0.50), all three far beyond use. A stand-in by similarity with
+  the missed pick's weight is the worst of the three (it adds an output that has almost
+  nothing in common with the missed one); with the table's scale it is as good as skip
+  (0.0108 against 0.0111) and costs more time, because its stand-ins are computed. The
+  router's next best expert is in between: its probability is small, and renormalising
+  shifts weight onto the picks that stay. The owner's idea does not pay on this model,
+  because its experts do not resemble each other.
+- *The rank is the dial, not the weight.* A bound on the pick's weight does as well as a
+  rank, not better: below 0.1 it touches about what the 4th rank on does (0.80 reads per
+  token against 0.71, KL 0.0111 against 0.0111), below 0.05 it saves little (3.91 reads
+  against 4.52) for KL 0.0065. The rank needs no number the operator has to guess.
+- *What it gives.* On IQ2_XS with 8 GiB of RAM, where 71 % of the experts have a slot
+  (12 768 in VRAM, 4 602 in RAM; 62 % with 4 GiB),
+  skipping from the 4th pick on takes the reads from the SSD from 4.5 to 0.7 per token and
+  generation from 31 to 45 tokens per second for KL 0.011 (95.5 % of the tokens the same);
+  from the 8th on (Strata's tail) 2.3 reads, 38 tokens per second, KL 0.008. With 4 GiB
+  (10.1 reads per token, 15 tokens per second) the gain is larger: from the 8th, 23 tokens per
+  second at KL 0.010; every pick, 49 tokens per second at KL 0.052. KL here is against the same
+  file without pruning; Strata measured 0.003 to 0.006 for its tail skip on 2 to 3 bit files,
+  with a decision per expert over a window where Ares decides per row.
+- *The Q4 file from the SSD.* It reads 81 experts per token from the SSD without pruning
+  (3.5 tokens per second). Pruning makes it faster in proportion to what it leaves out, and
+  its quality falls faster than on the 2-bit file: from the 8th pick on 5.0 tokens per
+  second at KL 0.026, from the 4th 8.7 at 0.077, every pick 17.5 at 0.50 (69 % of the tokens
+  the same: another text). For scale, the IQ2_XS file without pruning is KL 0.29 from the Q4
+  file on the same 600 positions (0.37 / 0.37 / 0.11, top-1 75 %; Strata's IQ2_XS pack, a
+  different quantization, so a measure of distance, not of which is right). So a Q4 file
+  read from the SSD with `skip:4` (8.7 tokens per second) stays far nearer to itself than the
+  2-bit file is, at a quarter of the 2-bit file's speed with most of its experts in slots;
+  with `skip:1` it is farther than the 2-bit file. Pruning makes the Q4 file usable from the
+  SSD at 5 to 9 tokens per second, not fast.
+
+*Recommendation.* Offer `skip` and leave it off by default (it changes the output, and
+the operator chooses that). As the value to suggest: `skip:8` (Strata's tail) where the
+model's quality matters most (KL 0.008 on the 2-bit file, 0.026 on Q4), `skip:4` where speed
+from the SSD matters more (KL 0.011 on the 2-bit file for 1.45 times the speed with 8 GiB,
+0.077 on Q4 for 2.5 times). `router` and `similar` stay as rules for measurement: they cost
+more at every rank that leaves most picks alone.
+
 **Taking part in the prefix cache** (`prefix_cache()` is `None`: every prompt
 is computed from its first token, a request that gives way comes back as a
 prompt of all its tokens) needs the device side to carry out what the step
