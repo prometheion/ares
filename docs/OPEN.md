@@ -15,7 +15,6 @@ Order of work the owner has set: CUDA complete for both models first, Vulkan par
 | Piece | State |
 | --- | --- |
 | Speculation that pays on Flash-Next: prices that follow the tiers (built), rows of unmade links leave the step, the draft block's experts resident, no window row waits for a file read; built in the conductor and the expert store, not in one model | agent working (branch `sched/live-prices`) |
-| RAM level of the prompt cache, written to the SSD only when evicted, at unload and at a stop | agent working (`cache/ram-level`) |
 | Shared model layer, steps 0 to 3 (see below); step 3 brings Flash-Next K and V in `q7` to `q4` | agent working (`model/shared-blocks`) |
 | Image tower on the device, weights resident in VRAM or in RAM and uploaded per image (pieces 2 and 3) | agent working (`vision/tower-device`) |
 | Test files: `Qwen3.8-Flash-Next-UD-Q4_K_XL` (104 GiB), then Flash-Next's DFlash2 drafter (3.1 GiB) | downloading to `/mnt/data/ares-models`, 6 MB/s |
@@ -179,6 +178,9 @@ Everything `FEATURES.md` lists for the 27B and not for Flash-Next is owed:
 - [ ] An unload or a stop waits for the drive to take what only RAM and the devices hold (on
       the btrfs volume here, compressed and busy: 20 to 100 s for 1.5 GB). What only RAM holds
       could be written after the devices are released, by a writer that outlives the engine.
+- [ ] A host test of a place whose memory a device keeps locked after it was given up: the host
+      executor frees it at once, so the fault where pages in RAM left no room in `--ram` for a
+      checkpoint's lock was found on the devices only.
 - [ ] One size limit for all models on a directory; a test of the full drive; a layout that
       does not depend on the split.
 - [ ] Cache policy: resume point at the prompt's end, memory of reply tokens, marks, warm pass.

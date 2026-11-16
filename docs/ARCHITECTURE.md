@@ -758,9 +758,10 @@ on the cards. What RAM holds and what goes first is
   `--ram` would fail the step, so a checkpoint takes a free place whose
   memory is still locked when there is one, else a place whose lock the
   limit has room for (`PinnedRam::place_lock`), after giving up what goes for
-  nothing; with neither it is not taken. (Measured: without this a 29k
-  conversation's pages in RAM left the next turn's checkpoint no room under
-  `--ram 3G`, and the step failed.)
+  nothing; with neither it is not taken. Until the step with its save has
+  run, that room is the place's: a new buffer of pages leaves it free.
+  (Measured: without this a 29k conversation's pages in RAM left the next
+  turn's checkpoint no room under `--ram 3G`, and the step failed.)
 - **Room for what comes.** When RAM is full, the coldest of what only it
   holds is written ahead, so that there is room for 16 pages and a
   checkpoint without waiting for the drive (`Cache::clean_ahead`). With a level on SSD the cache keeps
@@ -776,6 +777,40 @@ on the cards. What RAM holds and what goes first is
   `ares_cache_ram_pages_dropped_total` (pages worth keeping that went
   unwritten: no room, or no level on SSD) and
   `ares_cache_ram_transfer_nanoseconds_total`.
+- **Measured** 2026-11-16 with the server: Qwen3.8-27B Q4_K_S on the RTX 4070
+  and the RTX 3060, tensor split 0.625 / 0.375, two sequence slots, the
+  model's draft block on, `--ram 3G`, `--context 32768` (so that another
+  conversation of 29 322 tokens pushes the first one out of the cards), and
+  `--cache` on the btrfs volume (compressed, shared with other work). A
+  conversation A of about 8k or 30k tokens (a list of facts and a
+  question): turn 1 cold, turn 2 from the cards, then a conversation B of
+  29 322 tokens, turn 3 of A, then the server stops and starts again, and
+  turn 4 of A. Time to the first token of a stream on `/v1/completions`,
+  most probable token; the load average next to each run. Before is the
+  build without the level in RAM (pages written as they were computed), in
+  whose turn 3 A comes back from the drive.
+
+  | First token after | 8k, after | 8k, before | 30k, after | 30k, before |
+  | --- | --- | --- | --- | --- |
+  | Computed (turn 1) | 6.33 s (load 25) | 6.23 s (load 5) | 30.15 s (load 4); 30.14 s (load 8) | 30.31 s (load 3) |
+  | From the cards (turn 2) | 0.125 s | 0.131 s | 0.136 s; 0.133 s | 0.142 s |
+  | After B pushed A out (turn 3) | 0.262 s from RAM (33 pages) | 0.302 s from SSD (32 pages); 1.815 s with the drive busy (load 12) | 0.461 s from RAM (202 pages, load 3); 1.327 s (load 21) | 0.532 s from SSD (201 pages) |
+  | After a restart, from SSD (turn 4) | 0.943 s (60 pages, load 17) | 0.596 s (load 4); 1.152 s (load 12) | 0.839 s (229 pages, load 2); 2.62 s (load 15) | 0.673 s (load 2) |
+
+  Nothing was replayed in any turn that resumed. Turn 3 from RAM has to
+  move B out of the cards first (into RAM, a copy of its 203 pages and new
+  buffers for them), where before B's pages were on the drive already and
+  went for nothing; with the drive busy, the read from SSD before took
+  seconds. Of the 1.327 s at load 21 the copies took 0.236 s both ways; the
+  rest is mostly locking new buffers for B's pages (RAM grew by 0.9 GB), a
+  cost of the first time RAM grows that far, which locking ahead would
+  hide. B's pages moving into RAM while B was read cost 0.27 s of its 33 s. What was written: before, every turn wrote what it computed
+  (8k: 430 MB in turn 1, 5 MB in turn 2, 1214 MB with B; 30k: 1214 MB in
+  turn 1 and 1214 MB with B); after, nothing was written while the server
+  ran, and the stop wrote what was worth keeping: 1.65 GB in 17.9 s (8k
+  case, load 19) and 2.43 GB in 8.8 s and 28.4 s (30k case, loads 3 and
+  21), the pages of A and B and their checkpoints at page boundaries. A stop before writes only
+  what was still queued (0.4 s).
 
 **On SSD.** The prefix cache has a level on SSD below RAM (`ares --cache
 <dir>`; `crates/runtime/src/cache/ssd.rs` over `ares-store`). What leaves RAM
