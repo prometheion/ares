@@ -1786,7 +1786,7 @@ impl Qwen4ExpDevice {
             // The DFlash drafter's passes. With windows of the draft block in
             // the same step, its drafts (which the host has) go into the
             // drafter's list at their places, so the step has one list.
-            if !self.passes.is_empty() {
+            if !self.passes.is_empty() && self.part.dflash().is_some() {
                 let embedding = self
                     .dflash_embedding
                     .as_ref()

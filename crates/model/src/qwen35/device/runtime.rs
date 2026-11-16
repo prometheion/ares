@@ -694,7 +694,8 @@ impl DeviceModel for Qwen35Device {
                     replay: &self.replay,
                 })?;
             }
-            if !self.passes.is_empty() {
+            // The drafter is on one device; the others have nothing to do.
+            if !self.passes.is_empty() && self.part.has_dflash() {
                 let list = self.part.draft_list();
                 let tokens = step.record_on_device.offset(record.tokens_offset());
                 self.part.dflash_pass(step.stream, tokens, &self.passes, list)?;
