@@ -273,3 +273,7 @@ Everything `FEATURES.md` lists for the 27B and not for Flash-Next is owed:
 - How long may a request wait behind a long prompt on Flash-Next?
 - Should the SSD cache be on by default with a default directory? (Today: only with `--cache`.)
 - Do audio, video and Gemma 4 block the first release?
+- The image tower with f16 sums in its products: 5 to 9 % faster, up to twice the error (see
+  piece 2 of image input)?
+- The image tower's server key: `--mmproj-weights ram|vram` (`ram` by default, as the preset's
+  `no-mmproj-offload`)?
