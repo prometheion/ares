@@ -124,6 +124,25 @@ other differed more by the load than by the drafts.
       replaced by the most similar cached expert (the owner's idea; no engine has it). A
       threshold as the quality dial, off by default; measured per rule and threshold on
       the IQ2_XS file and on the Q4_K_XL file (KL, agreement, reads per token, speed).
+- [ ] Defect: Flash-Next's float-path tensors (stream mixers `hc_attn`/`hc_ffn` down and up,
+      `output_hc` down and up, `ple_key`/`ple_value`) are refused in a quantized type
+      (`device/load.rs` `float_matrix`; UD-Q4_K_XL has them in Q8_0, the IQ2_XS file in BF16).
+      Owed: take them in every type without a VRAM cost beyond the file's (a quantized kernel
+      with float activations, or a measured choice), exact where the type allows. Sizes: the
+      194 mixer matrices of 10240 x 320 are 644 MiB as Q8_0 and 2425 MiB as F32 (1212 as BF16),
+      `ple_key` (2560 x 10240) 26.6 against 100 MiB, `ple_value` (2560 x 2560) 6.6 against 25
+      MiB; all of them dense weights in VRAM (the mixers on the card that holds the streams,
+      the n-gram block's on the card of layer 1), so every MiB more is expert slots less. The
+      pruning measurement used a copy with them dequantized to F32 (exact for Q8_0), 1.9 GiB of
+      slots less than the file would need.
+- [ ] Defect: the UD-Q4_K_XL file (as an F32 copy of the float path, see above) does not load
+      with both cards on every layer, the default: the card that holds the streams has room
+      for 4.94 GiB of slots, and the store asks for 88 slots of about 3.6 MiB per layer of the
+      experts it owns (eight rows of ten picks and eight free), 15 GiB; the error then says to
+      name a larger `--ram`, which is not the cause. `--split layer` loads (7.61 and 7.22 GiB
+      of slots, 21 and 20 % of the experts each card runs). Owed: a floor of slots per layer
+      and device that follows what a step can pick there (with the experts split between two
+      cards, a device's share of a step's picks), and the right error.
 - [ ] The first reading of a short prompt after other texts is slower with transit
       (35 against 86 tokens/s in one run); not understood.
 - [ ] A request that arrives behind a lone long prompt waits for one piece of 512 rows,
