@@ -299,7 +299,7 @@ impl Client {
         let mut stream = self.connect().expect("the server accepts connections");
         write!(
             stream,
-            "{method} {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\
+            "{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\
              Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
             body.len()
         )

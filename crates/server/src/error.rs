@@ -51,6 +51,19 @@ impl ApiError {
         }
     }
 
+    /// The body of the request did not arrive in time.
+    pub fn too_slow(timeout: std::time::Duration) -> Self {
+        Self {
+            status: StatusCode::REQUEST_TIMEOUT,
+            message: format!(
+                "the request body did not arrive within {} s (the server's --timeout)",
+                timeout.as_secs()
+            ),
+            code: "request_timeout",
+            ..Self::invalid("")
+        }
+    }
+
     pub fn not_found(what: &str) -> Self {
         Self {
             status: StatusCode::NOT_FOUND,
@@ -65,6 +78,45 @@ impl ApiError {
             status: StatusCode::METHOD_NOT_ALLOWED,
             message: format!("{method} is not allowed on '{path}'"),
             code: "method_not_allowed",
+            ..Self::invalid("")
+        }
+    }
+
+    /// The request carries none of the server's keys.
+    pub fn unauthorized() -> Self {
+        Self {
+            status: StatusCode::UNAUTHORIZED,
+            message: "this server wants an API key: send one of its keys as 'Authorization: \
+                      Bearer <key>' or as 'x-api-key: <key>'"
+                .into(),
+            code: "invalid_api_key",
+            ..Self::invalid("")
+        }
+    }
+
+    /// The request was sent to a name the server does not answer to.
+    pub fn forbidden_host(host: &str) -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
+            message: format!(
+                "this server does not answer to the name '{host}': it listens on a local address \
+                 and answers to its local names (localhost, addresses); the operator can add \
+                 names with --allowed-hosts"
+            ),
+            code: "forbidden_host",
+            ..Self::invalid("")
+        }
+    }
+
+    /// A browser sent the request from a page of another site.
+    pub fn forbidden_origin(origin: &str) -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
+            message: format!(
+                "pages of '{origin}' may not call this server from a browser; the operator can \
+                 allow the origin with --cors-origins"
+            ),
+            code: "forbidden_origin",
             ..Self::invalid("")
         }
     }
@@ -273,6 +325,11 @@ impl IntoResponse for ApiError {
         let mut response = (self.status, Json(self.body())).into_response();
         if let Some(seconds) = self.retry_after {
             response.headers_mut().insert(header::RETRY_AFTER, HeaderValue::from(seconds));
+        }
+        if self.status == StatusCode::UNAUTHORIZED {
+            response
+                .headers_mut()
+                .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
         }
         response
     }

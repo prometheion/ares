@@ -307,14 +307,21 @@ impl Ending {
 
 /// The token counts of a response. `input_tokens` are all tokens of the
 /// prompt and `cached_tokens` the ones of them the prefix cache gave, as at
-/// OpenAI. The engine does not count the tokens of the reasoning apart, so
-/// there are no `output_tokens_details`.
+/// OpenAI. `output_tokens_details.reasoning_tokens` are the tokens of the
+/// thinking, for a model that thinks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 struct UsageBody {
     input_tokens: u32,
     input_tokens_details: InputDetails,
     output_tokens: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_tokens_details: Option<OutputDetails>,
     total_tokens: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+struct OutputDetails {
+    reasoning_tokens: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -328,6 +335,9 @@ impl From<Usage> for UsageBody {
             input_tokens: usage.prompt_tokens,
             input_tokens_details: InputDetails { cached_tokens: usage.cached_prompt_tokens },
             output_tokens: usage.completion_tokens,
+            output_tokens_details: usage
+                .reasoning_tokens
+                .map(|reasoning_tokens| OutputDetails { reasoning_tokens }),
             total_tokens: u64::from(usage.prompt_tokens) + u64::from(usage.completion_tokens),
         }
     }

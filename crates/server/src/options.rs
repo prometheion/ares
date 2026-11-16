@@ -41,6 +41,25 @@ impl ModelOptions {
     }
 }
 
+/// The options of the server itself, which no model has: they stand on the
+/// command line (and in its other forms) and not in a section of a preset
+/// file. Their names without the dashes.
+pub const SERVER: &[&str] = &[
+    "host",
+    "port",
+    "models-preset",
+    "config",
+    "help",
+    "api-key",
+    "api-key-file",
+    "allowed-hosts",
+    "cors-origins",
+    "timeout",
+    "log-format",
+    "log-file",
+    "log-text",
+];
+
 /// How an option is written.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
@@ -86,6 +105,8 @@ pub fn lookup(name: &str) -> Option<(&'static str, Kind)> {
         "--window" => ("--window", Kind::Value),
         "--draft-vocab" => ("--draft-vocab", Kind::Value),
         "--chat-var" => ("--chat-var", Kind::Value),
+        "--chat-template-file" => ("--chat-template-file", Kind::Value),
+        "--queue" => ("--queue", Kind::Value),
         "-rea" | "--reasoning" => ("--reasoning", Kind::Value),
         "--reasoning-format" => ("--reasoning-format", Kind::Value),
         "--reasoning-effort" => ("--reasoning-effort", Kind::Value),
@@ -94,6 +115,35 @@ pub fn lookup(name: &str) -> Option<(&'static str, Kind)> {
         // The defaults of a request's fields, under the names of the fields.
         other => (defaults::lookup(other)?, Kind::Value),
     })
+}
+
+/// The options of a model under their one names, as [`lookup`] gives them.
+pub fn names() -> impl Iterator<Item = &'static str> {
+    [
+        "--model",
+        "--devices",
+        "--split",
+        "--shares",
+        "--context",
+        "--parallel",
+        "--kv",
+        "--ram",
+        "--cache",
+        "--cache-size",
+        "--precision",
+        "--drafters",
+        "--window",
+        "--draft-vocab",
+        "--chat-var",
+        "--chat-template-file",
+        "--queue",
+        "--reasoning",
+        "--reasoning-format",
+        "--reasoning-effort",
+        "--reasoning-preserve",
+    ]
+    .into_iter()
+    .chain(defaults::flags())
 }
 
 /// Whether the option may be given several times, each adding to the others.
@@ -252,6 +302,15 @@ pub fn set(options: &mut ModelOptions, flag: &'static str, value: &str) -> Resul
             load.window = Some(rows);
         }
         "--draft-vocab" => load.draft_vocabulary = Some(PathBuf::from(value)),
+        "--chat-template-file" => {
+            if value.trim().is_empty() {
+                return Err(invalid("--chat-template-file", value, "a file"));
+            }
+            load.chat_template = Some(PathBuf::from(value));
+        }
+        "--queue" => {
+            load.queue = Some(number("--queue", value, "a number of requests, 0 or more")?);
+        }
         "--chat-var" => {
             let (name, value) = chat_variable(value)?;
             set_chat_variable(load, &name, value);

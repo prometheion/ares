@@ -63,6 +63,7 @@ fn ask(runtime: &Runtime, id: u64, question: &str, sampling: Sampling, max_token
                     messages: vec![Message::new(Role::User, question)],
                     tools: None,
                     variables: Vec::new(),
+                    continue_final: false,
                 },
                 sampling,
                 max_tokens: Some(max_tokens),

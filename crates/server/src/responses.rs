@@ -200,7 +200,7 @@ async fn read(
 }
 
 async fn try_create(app: App, request: Request) -> Result<Response, ApiError> {
-    let body = read_body(request, app.config.max_body_bytes).await?;
+    let body = read_body(request, &app.config).await?;
     let id = next_request_id();
     let (parsed, sorter, echo, lease) = read(&app, &body, id, Purpose::Reply).await?;
     let head = Head {
@@ -230,7 +230,7 @@ async fn try_create(app: App, request: Request) -> Result<Response, ApiError> {
 /// Counts the prompt of a request and generates nothing: the body is read
 /// as `/v1/responses` reads it.
 async fn try_count(app: App, request: Request) -> Result<Response, ApiError> {
-    let body = read_body(request, app.config.max_body_bytes).await?;
+    let body = read_body(request, &app.config).await?;
     let (parsed, _, _, lease) = read(&app, &body, next_request_id(), Purpose::Count).await?;
     let tokens = routes::count_prompt(&lease, parsed.request).await?;
     Ok(json_response(wire::input_tokens(tokens)))
@@ -245,7 +245,7 @@ async fn whole(mut reply: Reply, head: Head, mut output: Output) -> Result<Respo
             }
             // The probabilities of tokens are not served on this route.
             Step::Probs(_) => {}
-            Step::End(End { rest, finish, usage, timings }) => {
+            Step::End(End { rest, finish, usage, timings, .. }) => {
                 let ending = Ending { finish, usage, timings };
                 output.push(rest);
                 output.finish(ending.cut());
@@ -311,7 +311,7 @@ impl Events {
                     self.write(&changes);
                 }
                 Ok(Step::Probs(_)) => {}
-                Ok(Step::End(End { rest, finish, usage, timings })) => {
+                Ok(Step::End(End { rest, finish, usage, timings, .. })) => {
                     let ending = Ending { finish, usage, timings };
                     let mut changes = self.output.push(rest);
                     changes.extend(self.output.finish(ending.cut()));

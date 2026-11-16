@@ -117,8 +117,12 @@ pub(crate) fn to_chat(body: &Json, purpose: Purpose) -> Result<Json, ApiError> {
             messages.push(object(vec![("role", string("system")), ("content", string(text))]));
         }
     }
-    conversation(&fields, &mut messages)?;
+    // A last message of the assistant is a prefill: the reply continues it.
+    let prefill = conversation(&fields, &mut messages)?;
     chat.push(("messages", Json::Array(messages)));
+    if prefill {
+        chat.push(("continue_final_message", Json::Bool(true)));
+    }
 
     let names = tools(&fields, &mut chat)?;
     let callable = tool_choice(&fields, &names, &mut chat)?;
@@ -294,8 +298,9 @@ fn steady_billing_header(text: &str) -> String {
 }
 
 /// `messages`: the turns of the user and of the assistant, appended to
-/// `chat` as chat messages.
-fn conversation(fields: &Fields<'_>, chat: &mut Vec<Json>) -> Result<(), ApiError> {
+/// `chat` as chat messages. Whether the last turn is the assistant's, which
+/// the reply then continues.
+fn conversation(fields: &Fields<'_>, chat: &mut Vec<Json>) -> Result<bool, ApiError> {
     let turns = match fields.get("messages") {
         Some(Json::Array(turns)) if !turns.is_empty() => turns,
         Some(Json::Array(_)) => return Err(refuse("messages", "messages must not be empty")),
@@ -311,15 +316,6 @@ fn conversation(fields: &Fields<'_>, chat: &mut Vec<Json>) -> Result<(), ApiErro
         match turn.get("role") {
             Some(Json::String(role)) if role == "user" => user(&at, content, chat)?,
             Some(Json::String(role)) if role == "assistant" => {
-                if i + 1 == turns.len() {
-                    return Err(refuse(
-                        at.clone(),
-                        format!(
-                            "{at}: the last message is the assistant's, which asks the model to \
-                             continue it; continuing a message is not built"
-                        ),
-                    ));
-                }
                 chat.push(assistant(&at, content)?);
             }
             _ => {
@@ -330,7 +326,8 @@ fn conversation(fields: &Fields<'_>, chat: &mut Vec<Json>) -> Result<(), ApiErro
             }
         }
     }
-    Ok(())
+    let last = turns.last().and_then(|turn| turn.get("role"));
+    Ok(matches!(last, Some(Json::String(role)) if role == "assistant"))
 }
 
 fn content_type(at: &str, other: &Json) -> ApiError {

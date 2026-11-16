@@ -320,7 +320,7 @@ async fn a_plain_request_is_the_chat_request_and_its_reply_one_text_block() {
     assert_eq!(request.sampling.temperature, Some(0.2));
     assert_eq!((request.sampling.top_p, request.sampling.top_k), (Some(0.9), Some(40)));
     assert!(request.draft && request.structure.is_none() && request.stop.is_empty());
-    let Prompt::Chat { messages, tools, variables } = &request.prompt else { panic!() };
+    let Prompt::Chat { messages, tools, variables, .. } = &request.prompt else { panic!() };
     assert_eq!(messages.len(), 1);
     assert_eq!(
         (messages[0].role, messages[0].content.as_str()),

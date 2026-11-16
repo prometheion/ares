@@ -36,10 +36,13 @@ pub fn unprintable(ch: char) -> Option<u8> {
 /// stop string; the rest waits for the next token.
 #[derive(Debug, Default)]
 pub struct StopMatcher {
-    stops: Vec<String>,
+    /// The stop strings with their places in the list the matcher was given.
+    stops: Vec<(usize, String)>,
     /// Text that has been generated and not released: it is a prefix of at
     /// least one stop string (or empty).
     held: String,
+    /// The place of the stop string that matched.
+    matched: Option<usize>,
 }
 
 impl StopMatcher {
@@ -47,9 +50,16 @@ impl StopMatcher {
     /// before any text.
     pub fn new(stops: &[String]) -> Self {
         Self {
-            stops: stops.iter().filter(|s| !s.is_empty()).cloned().collect(),
+            stops: stops.iter().cloned().enumerate().filter(|(_, s)| !s.is_empty()).collect(),
             held: String::new(),
+            matched: None,
         }
+    }
+
+    /// The place in the list it was given of the stop string that matched,
+    /// once one has.
+    pub fn matched(&self) -> Option<usize> {
+        self.matched
     }
 
     /// Whether there are stop strings at all.
@@ -71,10 +81,15 @@ impl StopMatcher {
         // of some stop string, so a completed one can only be at its end,
         // but another stop string may be a suffix of a longer prefix; check
         // all by position, earliest first.
-        let earliest = self.stops.iter().filter_map(|stop| self.held.find(stop.as_str())).min();
-        if let Some(at) = earliest {
+        let earliest = self
+            .stops
+            .iter()
+            .filter_map(|(index, stop)| self.held.find(stop.as_str()).map(|at| (at, *index)))
+            .min();
+        if let Some((at, index)) = earliest {
             out.push_str(&self.held[..at]);
             self.held.clear();
+            self.matched = Some(index);
             return true;
         }
         // Release everything before the longest suffix that is a prefix of
@@ -83,7 +98,7 @@ impl StopMatcher {
             .held
             .char_indices()
             .map(|(i, _)| i)
-            .find(|&i| self.stops.iter().any(|stop| stop.starts_with(&self.held[i..])))
+            .find(|&i| self.stops.iter().any(|(_, stop)| stop.starts_with(&self.held[i..])))
             .unwrap_or(self.held.len());
         out.push_str(&self.held[..keep_from]);
         self.held.drain(..keep_from);

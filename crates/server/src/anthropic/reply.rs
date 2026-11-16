@@ -203,14 +203,14 @@ impl Content {
 }
 
 /// Why a reply ended, in the words of this API. `finish` is the engine's
-/// word and `calls` the number of calls the reply has.
-///
-/// The engine has one word for a reply the model ended and for one a stop
-/// string ended, so `stop_sequence` is never the reason here.
-pub(crate) fn stop_reason(finish: &str, calls: usize) -> &'static str {
+/// word, `calls` the number of calls the reply has and `stop` the stop
+/// string that ended it, if one did. A reply with calls ended to call them,
+/// also when a stop string cut it.
+pub(crate) fn stop_reason(finish: &str, calls: usize, stop: Option<&str>) -> &'static str {
     match finish {
         "length" => "max_tokens",
         _ if calls > 0 => "tool_use",
+        _ if stop.is_some() => "stop_sequence",
         _ => "end_turn",
     }
 }
@@ -248,6 +248,14 @@ impl From<Usage> for UsageBody {
     }
 }
 
+/// `stop_sequence` of a message: the stop string, when it is the reason.
+fn stop_sequence(stop_reason: &str, stop: Option<&str>) -> String {
+    match stop.filter(|_| stop_reason == "stop_sequence") {
+        Some(stop) => quoted(stop),
+        None => "null".to_owned(),
+    }
+}
+
 fn quoted(text: &str) -> String {
     serde_json::to_string(text).expect("a string serializes")
 }
@@ -269,7 +277,13 @@ fn input_object(text: &str) -> &str {
 
 impl Head {
     /// The message of a reply that is returned whole.
-    pub fn message(&self, content: &Content, stop_reason: &str, usage: Usage) -> String {
+    pub fn message(
+        &self,
+        content: &Content,
+        stop_reason: &str,
+        stop: Option<&str>,
+        usage: Usage,
+    ) -> String {
         let blocks: Vec<String> = content
             .0
             .iter()
@@ -289,11 +303,12 @@ impl Head {
             })
             .collect();
         format!(
-            r#"{{"id":{},"type":"message","role":"assistant","model":{},"content":[{}],"stop_reason":{},"stop_sequence":null,"usage":{}}}"#,
+            r#"{{"id":{},"type":"message","role":"assistant","model":{},"content":[{}],"stop_reason":{},"stop_sequence":{},"usage":{}}}"#,
             quoted(&self.id),
             quoted(&self.model),
             blocks.join(","),
             quoted(stop_reason),
+            stop_sequence(stop_reason, stop),
             to_json(&UsageBody::from(usage))
         )
     }
@@ -391,9 +406,10 @@ pub(crate) fn block_event(event: &BlockEvent) -> Written {
 
 /// The two events that end a stream: why the reply ended and what it cost,
 /// and the end of the message.
-pub(crate) fn message_end(stop_reason: &str, usage: Usage) -> [Written; 2] {
+pub(crate) fn message_end(stop_reason: &str, stop: Option<&str>, usage: Usage) -> [Written; 2] {
+    let stop_sequence = stop.filter(|_| stop_reason == "stop_sequence");
     let delta = EventBody::MessageDelta {
-        delta: Ending { stop_reason, stop_sequence: None },
+        delta: Ending { stop_reason, stop_sequence },
         usage: usage.into(),
     };
     [("message_delta", to_json(&delta)), ("message_stop", to_json(&EventBody::MessageStop {}))]

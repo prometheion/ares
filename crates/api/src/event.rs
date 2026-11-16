@@ -61,8 +61,11 @@ pub struct Alternative {
 /// Why a generation ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum FinishReason {
-    /// The model emitted an end-of-generation token or a stop string matched.
+    /// The model emitted an end-of-generation token.
     Stop,
+    /// A stop string of the request matched: its place in
+    /// [`GenerateRequest::stop`](crate::GenerateRequest::stop).
+    StopString(u32),
     /// `max_tokens` or the end of the context was reached.
     Length,
     /// [`Engine::cancel`](crate::Engine::cancel) took effect, or the engine
@@ -72,8 +75,12 @@ pub enum FinishReason {
     Cancelled,
 }
 
-/// Token counts of a finished request.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// What a finished request took: its tokens, and how long it waited.
+///
+/// Two usages are equal when their counts are: the wait in line is a
+/// measurement of the moment, which two runs of the same request never
+/// share, and is left out of the comparison.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct Usage {
     /// All tokens of the prompt, including the cached ones.
     pub prompt_tokens: u32,
@@ -86,7 +93,30 @@ pub struct Usage {
     /// keeping their tokens: the text with drafts is the text without, or it
     /// is not.
     pub output_hash: u64,
+    /// The tokens of the reply the model generated while it thought: from
+    /// the start of its thinking to the tag that closes it, the tag included
+    /// (a call of a tool that ends the thinking is not part of it). `None`
+    /// from an engine that does not count them, or for a model that does not
+    /// think.
+    #[serde(default)]
+    pub reasoning_tokens: Option<u32>,
+    /// How long the request waited in the engine's line before it first
+    /// started; `None` from an engine that does not say, or for a request
+    /// that ended before it started.
+    #[serde(default)]
+    pub queued: Option<std::time::Duration>,
 }
+
+impl PartialEq for Usage {
+    fn eq(&self, other: &Self) -> bool {
+        let counts = |u: &Usage| {
+            (u.prompt_tokens, u.completion_tokens, u.cached_prompt_tokens, u.output_hash)
+        };
+        counts(self) == counts(other) && self.reasoning_tokens == other.reasoning_tokens
+    }
+}
+
+impl Eq for Usage {}
 
 #[cfg(test)]
 mod tests {

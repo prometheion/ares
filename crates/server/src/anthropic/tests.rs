@@ -322,15 +322,6 @@ fn what_is_not_served_is_refused_by_its_name() {
             "tools",
             "tools[0].input_examples is not supported",
         ),
-        // A message to continue.
-        (
-            with(json!({"messages": [
-                {"role": "user", "content": "a"},
-                {"role": "assistant", "content": "{"},
-            ]})),
-            "messages[1]",
-            "continuing a message is not built",
-        ),
         // Members nobody knows, anywhere.
         (with(json!({"context_management": {"edits": []}})), "context_management", "does not edit"),
         (with(json!({"top_a": 0.2})), "top_a", "top_a is not supported"),
@@ -539,8 +530,9 @@ fn the_message_has_the_blocks_the_reason_and_the_usage() {
         completion_tokens: 7,
         cached_prompt_tokens: 60,
         output_hash: 0,
+        ..Usage::default()
     };
-    let text = head.message(&content, stop_reason("stop", 2), usage);
+    let text = head.message(&content, stop_reason("stop", 2, None), None, usage);
     // The input is the text the model wrote, not a reading of it.
     assert!(text.contains(r#""input":{"city":"Köln","days":3.0}}"#), "{text}");
     let message: Value = serde_json::from_str(&text).unwrap();
@@ -569,9 +561,11 @@ fn the_message_has_the_blocks_the_reason_and_the_usage() {
             },
         })
     );
-    assert_eq!(stop_reason("stop", 0), "end_turn");
-    assert_eq!(stop_reason("length", 0), "max_tokens");
-    assert_eq!(stop_reason("length", 1), "max_tokens");
+    assert_eq!(stop_reason("stop", 0, None), "end_turn");
+    assert_eq!(stop_reason("stop", 0, Some("\n\n")), "stop_sequence");
+    assert_eq!(stop_reason("stop", 1, Some("\n\n")), "tool_use");
+    assert_eq!(stop_reason("length", 0, None), "max_tokens");
+    assert_eq!(stop_reason("length", 1, None), "max_tokens");
 }
 
 #[test]
@@ -584,7 +578,7 @@ fn a_reply_sent_back_is_the_turn_the_chat_route_would_get_back() {
     ]]);
     let head = Head { id: "msg_1".into(), model: "m".into() };
     let message: Value =
-        serde_json::from_str(&head.message(&content, "tool_use", Usage::default())).unwrap();
+        serde_json::from_str(&head.message(&content, "tool_use", None, Usage::default())).unwrap();
     let body = with(json!({"messages": [
         {"role": "user", "content": "2+2?"},
         {"role": "assistant", "content": message["content"]},

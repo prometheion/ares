@@ -44,15 +44,19 @@
 //! when a client reads slower than the engine writes, how a client that
 //! goes away cancels its request, and where a request's timings are taken.
 
+mod access;
 mod anthropic;
 mod bridge;
 pub mod defaults;
 mod error;
+mod latency;
+mod listen;
 pub mod load;
 pub mod models;
 pub mod options;
 pub mod plan;
 pub mod preset;
+mod props;
 mod qwen4exp;
 mod reasoning;
 mod reply;
@@ -63,7 +67,7 @@ mod systemone;
 mod tools;
 mod wire;
 
-use std::future::{Future, IntoFuture};
+use std::future::Future;
 use std::io;
 use std::sync::Arc;
 use std::time::Duration;
@@ -74,6 +78,7 @@ use axum::routing::{any, get, post};
 use tokio::net::TcpListener;
 use tokio::sync::{Notify, watch};
 
+pub use crate::access::Access;
 use crate::bridge::Stop;
 use crate::defaults::Defaults;
 use crate::models::Models;
@@ -98,6 +103,15 @@ pub struct Config {
     /// What a request gets for the fields it leaves out, and the most tokens
     /// of a reply (`--temperature` and the others of the `defaults` module).
     pub defaults: Defaults,
+    /// Who may use the server: keys, names, origins (the `access` module).
+    pub access: Access,
+    /// How long a client may take to send a request (its head and its
+    /// body), and how long one write of an answer may wait for it to take
+    /// what was sent (`--timeout`; the `listen` module).
+    pub timeout: Duration,
+    /// Whether the log has the prompt and the reply of every request
+    /// (`--log-text`).
+    pub log_text: bool,
 }
 
 impl Default for Config {
@@ -108,6 +122,9 @@ impl Default for Config {
             shutdown_grace: Duration::from_secs(30),
             reasoning_format: ReasoningFormat::default(),
             defaults: Defaults::default(),
+            access: Access::default(),
+            timeout: Duration::from_secs(600),
+            log_text: false,
         }
     }
 }
@@ -141,10 +158,14 @@ pub fn router_over(models: Arc<Models>, config: Config) -> Router {
 }
 
 fn routes_over(models: Arc<Models>, config: Config, stop: Stop) -> Router {
+    let access = Arc::new(config.access.clone());
     Router::new()
         .route("/health", get(routes::health))
         .route("/metrics", get(routes::metrics))
         .route("/v1/models", get(routes::models))
+        .route("/props", get(props::props))
+        .route("/tokenize", post(props::tokenize))
+        .route("/detokenize", post(props::detokenize))
         .route("/models/load", post(routes::load_model))
         .route("/models/unload", post(routes::unload_model))
         .route("/models/sse", get(routes::model_events))
@@ -164,6 +185,7 @@ fn routes_over(models: Arc<Models>, config: Config, stop: Stop) -> Router {
         .fallback(routes::not_found)
         .method_not_allowed_fallback(routes::method_not_allowed)
         .with_state(routes::App { models, config, stop })
+        .layer(axum::middleware::from_fn_with_state(access, access::guard))
 }
 
 /// Serves `engine` on `listener` until `shutdown` completes.
@@ -209,16 +231,16 @@ pub async fn serve_models(
     now: impl Future<Output = ()> + Send,
 ) -> io::Result<()> {
     let grace = config.shutdown_grace;
+    let timeout = config.timeout;
     let draining = Arc::new(Notify::new());
     let begin_drain = draining.clone();
     let (stop_requests, stop) = Stop::new();
-    let serving = axum::serve(listener, routes_over(models, config, stop))
-        .with_graceful_shutdown(async move {
+    let serving =
+        listen::listen(listener, routes_over(models, config, stop), timeout, async move {
             shutdown.await;
             tracing::info!("shutting down: no new connections, waiting for running requests");
             begin_drain.notify_one();
-        })
-        .into_future();
+        });
     tokio::pin!(serving);
     let patience = async move {
         draining.notified().await;

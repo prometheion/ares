@@ -60,6 +60,32 @@ pub trait Engine: Send + Sync + 'static {
         Err(EngineError::Unsupported("this engine does not count the tokens of a prompt".into()))
     }
 
+    /// The tokens `prompt` comes to for `model`: what
+    /// [`count_tokens`](Engine::count_tokens) counts, the ids themselves. A
+    /// text is read as a prompt to continue is read, a conversation goes
+    /// through the chat template. Like `count_tokens` it may take a while and
+    /// is called from a thread that may block. The default is an engine that
+    /// cannot tokenize.
+    fn tokenize(&self, _model: &str, _prompt: &Prompt) -> Result<Vec<u32>, EngineError> {
+        Err(EngineError::Unsupported("this engine does not tokenize".into()))
+    }
+
+    /// The bytes each of `tokens` stands for in a reply of `model`, in order:
+    /// part of a character where a character spans tokens, and nothing for a
+    /// token the engine does not write as text (a control token). An id that
+    /// is not one of the model's is an [`EngineError::InvalidRequest`] that
+    /// names it. The default is an engine that cannot say.
+    fn pieces(&self, _model: &str, _tokens: &[u32]) -> Result<Vec<Vec<u8>>, EngineError> {
+        Err(EngineError::Unsupported("this engine does not detokenize".into()))
+    }
+
+    /// The text of the chat template `model` renders conversations with: the
+    /// model file's, or the one it was started with in its place. `None` for
+    /// a model without one, or an engine that does not say. Must not block.
+    fn chat_template(&self, _model: &str) -> Option<String> {
+        None
+    }
+
     /// Starts a request.
     ///
     /// Must return without waiting for the work. On `Ok` the engine owns the

@@ -115,6 +115,11 @@ pub struct LoadOptions {
     pub draft_vocabulary: Option<PathBuf>,
     /// Variables of the chat template.
     pub chat_variables: Vec<(String, Json)>,
+    /// A file with a chat template that takes the place of the model file's.
+    pub chat_template: Option<PathBuf>,
+    /// The most requests that may wait for a sequence while every sequence
+    /// runs. `None`: a request waits until it runs.
+    pub queue: Option<u32>,
 }
 
 impl LoadOptions {
@@ -137,6 +142,8 @@ impl LoadOptions {
             window: None,
             draft_vocabulary: None,
             chat_variables: Vec::new(),
+            chat_template: None,
+            queue: None,
         }
     }
 }

@@ -64,6 +64,7 @@ use ares_api::{
 use tokio::sync::{Notify, mpsc, oneshot, watch};
 
 use crate::error::ApiError;
+use crate::latency::{Latency, Took};
 
 /// What a request produces, minus the failures.
 #[derive(Debug)]
@@ -73,6 +74,9 @@ pub(crate) enum Item {
     Probs(Vec<TokenProbs>),
     Done {
         finish: &'static str,
+        /// The place in the request's list of the stop string that ended
+        /// the reply.
+        stopped_by: Option<usize>,
         usage: Usage,
         timings: Timings,
     },
@@ -151,6 +155,8 @@ pub(crate) struct Flight {
     started: AtomicU64,
     /// The engine's totals after request number `.0` ended, having run alone.
     last: Mutex<Option<(u64, EngineStats)>>,
+    /// How long the requests of the engine took.
+    pub latency: Latency,
 }
 
 impl Flight {
@@ -160,6 +166,7 @@ impl Flight {
             running: AtomicUsize::new(0),
             started: AtomicU64::new(0),
             last: Mutex::new(engine.stats().map(|stats| (0, stats))),
+            latency: Latency::default(),
         }
     }
 
@@ -300,6 +307,10 @@ pub(crate) struct Run {
     seat: Seat,
     stop: Stop,
     model: String,
+    /// The seed the request asked for, for the log.
+    seed: Option<u64>,
+    /// The reply's text, kept for the log when it is to have it.
+    text: Option<String>,
 }
 
 impl std::fmt::Debug for Run {
@@ -310,16 +321,19 @@ impl std::fmt::Debug for Run {
 
 impl Run {
     /// Hands `request` to the engine. `buffer` is the number of events that
-    /// may wait for the handler (at least 1).
+    /// may wait for the handler (at least 1); with `log_text` the reply's text
+    /// goes into the log at its end.
     pub fn start(
         engine: &Arc<dyn Engine>,
         request: GenerateRequest,
         buffer: usize,
         flight: &Arc<Flight>,
         stop: Stop,
+        log_text: bool,
     ) -> Result<Self, ApiError> {
         let id = request.id;
         let model = request.model.clone();
+        let seed = request.sampling.seed;
         // One extra slot for the terminal event, see the module documentation.
         let (tx, rx) = mpsc::channel(buffer.max(1) + 1);
         let overflow = Arc::new(Overflow::default());
@@ -355,6 +369,8 @@ impl Run {
             seat,
             stop,
             model,
+            seed,
+            text: log_text.then(String::new),
         })
     }
 
@@ -388,31 +404,60 @@ impl Run {
             });
         };
         match event {
-            Event::Text(text) => Ok(Item::Text(text)),
+            Event::Text(text) => {
+                if let Some(kept) = &mut self.text {
+                    kept.push_str(&text);
+                }
+                Ok(Item::Text(text))
+            }
             Event::Logprobs(probs) => Ok(Item::Probs(probs)),
             Event::Done { finish, usage } => {
                 self.guard.disarm();
                 let timings = self.timings(usage).await;
                 let rate = |rate: Option<f64>| rate.map_or("-".to_owned(), |r| format!("{r:.1}"));
                 let count = |n: Option<u64>| n.map_or("-".to_owned(), |n| n.to_string());
+                let queued = usage.queued.map(|queued| queued.as_secs_f64() * 1e3);
+                if !matches!(finish, FinishReason::Cancelled) {
+                    let ms = |ms: f64| std::time::Duration::from_secs_f64(ms / 1e3);
+                    self.seat.flight.latency.observe(Took {
+                        queued: usage.queued,
+                        first: ms(timings.prompt_ms),
+                        whole: ms(timings.prompt_ms + timings.generated_ms),
+                        tokens: usage.completion_tokens,
+                    });
+                }
                 tracing::info!(
                     id = %self.guard.id,
                     model = %self.model,
                     ?finish,
                     prompt_tokens = usage.prompt_tokens,
                     cached_prompt_tokens = usage.cached_prompt_tokens,
+                    queued_ms = %queued.map_or("-".to_owned(), |ms| format!("{ms:.1}")),
                     prompt_ms = format_args!("{:.1}", timings.prompt_ms),
                     prompt_tokens_per_s = %rate(timings.prompt_per_second()),
                     completion_tokens = usage.completion_tokens,
+                    reasoning_tokens = %count(usage.reasoning_tokens.map(u64::from)),
                     generation_ms = format_args!("{:.1}", timings.generated_ms),
                     tokens_per_s = %rate(timings.generated_per_second()),
                     drafts = %count(timings.drafts.map(|d| d.0)),
                     drafts_accepted = %count(timings.drafts.map(|d| d.1)),
+                    seed = %count(self.seed),
                     "request finished"
                 );
+                if let Some(text) = self.text.take() {
+                    tracing::info!(id = %self.guard.id, reply = %text, "the reply");
+                }
+                let stopped_by = match finish {
+                    FinishReason::StopString(index) => Some(index as usize),
+                    _ => None,
+                };
                 match finish {
-                    FinishReason::Stop => Ok(Item::Done { finish: "stop", usage, timings }),
-                    FinishReason::Length => Ok(Item::Done { finish: "length", usage, timings }),
+                    FinishReason::Stop | FinishReason::StopString(_) => {
+                        Ok(Item::Done { finish: "stop", stopped_by, usage, timings })
+                    }
+                    FinishReason::Length => {
+                        Ok(Item::Done { finish: "length", stopped_by, usage, timings })
+                    }
                     FinishReason::Cancelled => Err(ApiError::cancelled()),
                 }
             }

@@ -332,6 +332,7 @@ impl Rig {
                         messages: messages.to_vec(),
                         tools: None,
                         variables: Vec::new(),
+                        continue_final: false,
                     },
                     sampling: Sampling { temperature: Some(0.0), ..Sampling::default() },
                     max_tokens: Some(max_tokens),

@@ -4767,7 +4767,8 @@ not, Anthropic's `POST /v1/messages` and `/v1/messages/count_tokens` (see
 "The Messages API" below), OpenAI's `POST /v1/responses` without state, with
 `/v1/responses/input_tokens` and `/v1/chat/completions/input_tokens`, which
 count a request and generate nothing (see "The Responses API" below),
-`GET /v1/models`, `/health` and `/metrics`, with
+`GET /v1/models`, `/health` and `/metrics`, `GET /props`, `POST /tokenize` and
+`/detokenize` (see "Tokens and properties" below), with
 timings in every answer of the OpenAI routes
 (prompt tokens and time, generated tokens and time, drafts proposed and
 accepted, and `token_hash`, a hash of the reply's token ids in the final message
@@ -5202,11 +5203,12 @@ Anthropic's shape of an error (`{"type": "error", "error": {"type",
 blocks (input other than text is not built), tools of a `type` that Anthropic's
 service defines or runs (`web_search_...`, `bash_...`) and the blocks they
 leave in a history, `defer_loading`, `mcp_servers`, `container`,
-`context_management`, citations, a last message of the assistant (a prefill:
-continuing a message is not built), and any member the module does not know.
-`x-api-key`, `anthropic-version` and `anthropic-beta` are not looked at: the
-server has no keys yet and one version of the API, and a field of a beta is
-served or refused by its name in the body.
+`context_management`, citations, and any member the module does not know. A
+last message of the assistant is a prefill, which the reply continues (see
+"Continuing a message" below). `x-api-key` is one of the two headers a key
+may come in (see "Who may use the server"); `anthropic-version` and
+`anthropic-beta` are not looked at: the server has one version of the API, and
+a field of a beta is served or refused by its name in the body.
 
 - **A budget for thinking** (`thinking.budget_tokens`) is checked and not
   enforced. The engine has none, and Claude Code sends one with every request
@@ -5227,10 +5229,12 @@ served or refused by its name in the body.
   usage has `cache_read_input_tokens` (the part of the prompt the cache gave),
   `input_tokens` (the rest: the two add up to the prompt, as at Anthropic) and
   `cache_creation_input_tokens`, which is 0.
-- **Why a reply ended.** `end_turn`, `max_tokens` or `tool_use`. The engine
-  reports one reason for the end token and for a stop string, so a reply that
-  a stop sequence ended says `end_turn` with `stop_sequence: null`. Telling
-  them apart needs the conductor to say which stop string matched.
+- **Why a reply ended.** `end_turn`, `max_tokens`, `tool_use`, or
+  `stop_sequence` with the string in `stop_sequence` (in the message and in the
+  `message_delta` of a stream). The engine names the stop string that matched
+  (`FinishReason::StopString` with its place in the request's list; see "The
+  stop string and the thinking of a reply" below). A reply with calls ended to
+  call them, also when a stop string cut it.
 - **The billing line of Claude Code.** Claude Code begins its system prompt
   with `x-anthropic-billing-header: ...; cch=a5145;`, whose `cch` is another
   one in every request. Left alone it would part every prompt from the cached
@@ -5273,8 +5277,8 @@ between them, moves the text of a user turn before its tool results, reads
 `tool_choice` `tool` as `any` and does not read `none`, drops
 `thinking: disabled`, `is_error`, `disable_parallel_tool_use` and every member
 it does not know, passes images on, and enforces `budget_tokens` in its
-sampler. Its `stop_reason` is `end_turn` for a stop string as well, but it
-names the string in `stop_sequence`. The tests with a real model
+sampler. Its `stop_reason` is `end_turn` for a stop string as well (it names the
+string in `stop_sequence`); here it is `stop_sequence`, as at Anthropic. The tests with a real model
 (`crates/server/tests/real_messages.rs`, the 0.8B on one card) pass.
 
 **The Responses API.** `POST /v1/responses` is OpenAI's Responses API,
@@ -5368,11 +5372,10 @@ and the others) are refused here, as on `/v1/messages`.
   drop items from the conversation, which the server does not do.
 - **The usage.** `input_tokens` is the whole prompt,
   `input_tokens_details.cached_tokens` the part of it the prefix cache gave,
-  `output_tokens` what was generated. There are no `output_tokens_details`:
-  the engine does not count the tokens of the reasoning apart
-  (`ares_api::Usage` has one count for the reply), and a number that is not
-  measured is not written. The response has the `timings` of the chat route
-  next to the usage.
+  `output_tokens` what was generated, and for a model that thinks
+  `output_tokens_details.reasoning_tokens` the tokens of its thinking, which
+  the engine counts. The response has the `timings` of the chat route next to
+  the usage.
 - **`output_text`.** The response has no member of that name. The official
   SDKs put it together from the items; llama-server does not send it either,
   and its own test reads it from the Python SDK.
@@ -5426,7 +5429,7 @@ that is not empty, and writes `encrypted_content: ""`. Its stream has no
 reasoning item, it numbers the items by what kinds it has seen, and it calls
 every response `completed`, also one the limit of tokens cut.
 
-What is not there: the count of reasoning tokens (it needs the engine), a
+What is not there: a
 switch that turns thinking on for a template whose default is off and that
 does not read `reasoning_effort` (the route has `effort` alone, and
 `--reasoning` decides for the server), the probabilities of tokens, custom
@@ -5452,6 +5455,160 @@ the reasoning of a reply comes apart from the content, in streams too, and
 `max_tokens` cuts inside the thinking has reasoning and no content.
 
 Multimodal input is not built.
+
+**Who may use the server** (`crates/server/src/access.rs`). One layer over every
+route looks at a request in this order:
+
+1. The name it was sent to (`Host`). A server on a local address without keys
+   answers only to its local names: `localhost` and the names under it, and
+   addresses written as numbers. A web page that rebinds a name of its own to
+   127.0.0.1 sends that name and gets 403 (`forbidden_host`).
+   `--allowed-hosts` adds names (`*` lifts the check); names given that way hold
+   for every address and with keys too. A request without `Host` (HTTP/1.0)
+   passes: no browser sends one.
+2. A browser's preflight (`OPTIONS` with `Access-Control-Request-Method`) from
+   an origin of `--cors-origins` is answered at once, without a key, which a
+   browser does not send with it: `GET, POST` and the headers it asks for.
+3. The page a request comes from (`Origin`). Without keys, a request a browser
+   sent from a page of another site gets 403 (`forbidden_origin`): local pages,
+   pages of the server's own name, of an allowed host and of `--cors-origins`
+   pass. Programs send no `Origin`.
+4. The key. With keys (`--api-key`, several separated by commas, and
+   `--api-key-file`, one on each line), every route but `/health` wants one,
+   as `Authorization: Bearer <key>` or `x-api-key: <key>` (Anthropic's header,
+   which its SDKs send). The key of a request is compared with every key in
+   full, so the time says nothing about any of them but its length. Without
+   one: 401 with `WWW-Authenticate: Bearer`, in Anthropic's shape on
+   `/v1/messages`.
+
+With keys the key decides, as at strata: a rebound name or a foreign page has
+no key, so the name and the page are not checked unless `--allowed-hosts` says
+so. An answer to an origin of `--cors-origins`, errors included, carries
+`Access-Control-Allow-Origin` (and exposes `Retry-After` and the header of the
+limit of tokens). The methods and headers of CORS are not options: the routes
+take `GET` and `POST`, and a header a preflight asks for is allowed. A server
+that listens beyond this machine without keys says so in the log at start.
+
+**Where options come from** (`crates/server/src/cli.rs`). Every option, of the
+server and of a model, is also a variable of the environment, `ARES_` and its
+name in capitals with underscores (`ARES_TOP_P` for `--top-p`), and a line of
+the file `--config` (or `ARES_CONFIG`) names: `name = value` with the name
+without the dashes, as a key of a preset file is written (a switch takes
+`true` or `false`, `#` and `;` begin a comment, a name stands once unless its
+option may repeat); the file has no sections, the models of several stand in a
+preset file (`models-preset = <file>`). The command line holds over the
+environment and the environment over the file; with a preset file the three
+hold over its sections as the command line alone did. Only the variables of
+Ares' options are read (`ARES_LIBCUDA` and the variables of tests are other
+things), never a name without the prefix. An error names the variable or the
+file and its line.
+
+**Tokens and properties** (`crates/server/src/props.rs`). `POST /tokenize` takes
+`content`, a text, and gives the tokens the engine reads it as when it is the
+prompt of `/v1/completions`; or a chat request (`messages` and the fields of
+`/v1/chat/completions`), and gives the tokens of the prompt it comes to through
+the chat template, with the model's settings and the request's thinking and
+tools, as `/v1/chat/completions/input_tokens` counts them. `with_pieces` adds
+the text of every token, a string where its bytes are whole characters, else
+the bytes (llama.cpp's shape). `POST /detokenize` takes `tokens` and gives the
+text they write in a reply. A control token (`<|im_end|>`) writes nothing in
+both, as in a reply; llama-server writes its text. llama-server reads a text
+with switches of its own (`add_special`, `parse_special`); here a text is read
+the one way a prompt is, and the switches are refused by name. The engine
+answers through `Engine::tokenize` and `Engine::pieces` (`Model::encode` and
+`Model::piece` in the runtime). `model` may be left out when the server has one
+model.
+
+`GET /props` (`?model=<id>` with several models; the model must be loaded, as
+for `/metrics`) says what a model is, in llama.cpp's shape where it fits:
+`context_length` (and `default_generation_settings.n_ctx`), what a request
+gets for the fields it leaves out (`default_generation_settings.params`, the
+`defaults` of `/v1/models`, with `max_tokens_limit`), `chat_template` (the
+text of the template in effect, from `Engine::chat_template`),
+`chat_template_caps` (tools and calls, thinking, whether `reasoning_effort` and
+`enable_thinking` change the prompt, whether it thinks by default),
+`reasoning` (its tags) and `modalities` (text alone: images are not built).
+
+**The stop string and the thinking of a reply** (`crates/runtime/src/watch.rs`).
+The conductor matches stop strings where it turns tokens into text. It carries
+a `Watch` for every request, built where the request is taken
+(`Runtime::start_request`), and tells it every token it accepts and every
+character of their text; the watch is the stop strings' matcher and says which
+of them matched (`FinishReason::StopString`, its place in the request's list),
+counts the tokens of the thinking, and notes when the request left the line.
+The server names the string: `stop_reason` and `stop_sequence` on
+`/v1/messages`, and `stop_reason` next to `finish_reason: "stop"` on the OpenAI
+routes, as vLLM writes it (only when a stop string ended the reply).
+
+Where the thinking is, the engine reads off the prompt: it reads the prompt's
+tokens backwards to the last tag of the thinking the template declares. When
+that is the opening tag (the template opened the thinking, or a continued
+message stands inside it), the reply begins inside it; otherwise the reply may
+open it with its first text, and an answer that begins with anything else has
+none. The thinking ends at the closing tag, whose tokens are the thinking's,
+or at the marker of a call that the model opens inside its thinking (the
+request's rule says it), whose tokens are not. Tokens are counted as the
+conductor accepts them, drafts or not, so the count is exact: every character
+carries the number of the token it came with. The usage has it as
+`completion_tokens_details.reasoning_tokens` (and `output_tokens_details` on
+`/v1/responses`) for a model that thinks; Anthropic's usage has no such field.
+
+**Continuing a message.** A chat request whose last message is the
+assistant's continues it, as llama-server prefills it, unless it says
+`continue_final_message: false` (vLLM's field; `add_generation_prompt: false`,
+which vLLM asks to go with a continuation, says the same). A last message that
+calls tools begins a turn of its own unless the request asks to continue it,
+which is refused: what follows calls are their results. On `/v1/messages` a
+last message of the assistant is Anthropic's prefill and is continued. The
+prompt (`Prompt::Chat::continue_final`, `chat::continued` in `ares-model`) is
+the conversation as the template writes it, up to the end of the last
+message's text: a mark of private use characters is put at the end of that
+text, the conversation rendered, and the rendering cut at the mark, so that the
+template lays the turn out as it does every turn (an empty block of thinking
+before an answer without reasoning, in Qwen3.8's template) and nothing of the
+end of the turn follows. The text is the content, or the reasoning when the
+content is empty and the reasoning is not: the reply then goes on thinking,
+and the server sorts it as reasoning until the closing tag. A template that
+does not write the text as it is given is refused. The reply is what comes
+after the given text; the given text is not repeated.
+
+**The template of a file.** `--chat-template-file <FILE>` (a key of a preset,
+too) gives a chat template in Jinja that takes the place of the model file's
+for every conversation, with tools or without. It is compiled with the model's
+tokenizer at load (a template that does not compile ends the load with the
+file's name and the reason), and what the server reads off a template (the
+tags of the thinking, the form of the calls) is read off it. It travels in
+`ChatOptions::template` of `ares-tokenizer`, so the models' own code is not
+changed for it.
+
+**The line and the timeouts.** A request waits for a sequence as long as it
+takes (decision 16 of the feature checklist). `--queue <N>` bounds the line of
+a model: the engine counts the requests it holds (one for every event sink it
+has not let go of) and refuses one more than `--parallel` and N with
+`EngineError::Overloaded`, which is 503 `overloaded` with `Retry-After: 1`.
+`--timeout <SECONDS>` (600, llama-server's name) bounds what a client may take:
+the head of a request (hyper's timer, which also closes a connection that waits
+longer for its next request), its body (408 `request_timeout`), and one write of
+an answer (`listen::Timed`: a write that waits longer for the client to take
+what was sent fails, the connection closes and the request is cancelled). A
+connection that waits for the engine writes nothing and is never cut. The
+server accepts its connections itself (`listen.rs`, hyper's HTTP/1.1 with the
+graceful shutdown of hyper-util) where it used `axum::serve`, which has no
+timeouts.
+
+**What the server logs and measures.** Every generating request has a line
+with its parameters when it is taken (the model, the limit of tokens, the
+sampling fields in effect, the stop strings and tools it has, whether it
+continues a message) and one when it ends (the reason, prompt and cached
+tokens, generated and reasoning tokens, the wait in the line, the times, the
+drafts, the seed it asked for). `--log-text` adds the prompt and the reply,
+which a log otherwise never holds. `--log-format json` writes every line as a
+JSON object for collectors, `--log-file <FILE>` appends to a file instead of
+standard error; the level is `RUST_LOG`. `/metrics` has, for every model, the
+histograms of the requests that ended with a reply (`crates/server/src/latency.rs`):
+the wait in the engine's line (`ares_request_queue_seconds`, from the watch),
+the prompt after it, the time to the first token, the time per token after the
+first, and the whole request, all from the hand-over to the engine.
 
 **Several models (router mode).** `ares --models-preset <file.ini>` serves the
 models of a preset file. A model is loaded when a request names it, stays

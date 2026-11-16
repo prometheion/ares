@@ -5,7 +5,7 @@
 
 use ares_api::{ChatFormat, EngineError, Prompt, Role, ThinkingFormat, ToolFormat};
 use ares_tokenizer::{
-    ChatOptions, EncodeOptions, Json, Message, ReasoningFormat, Tokenizer, Tool, ToolCall,
+    ChatOptions, Content, EncodeOptions, Json, Message, ReasoningFormat, Tokenizer, Tool, ToolCall,
 };
 
 /// What the chat template of `tokenizer` declares when it is rendered with
@@ -17,9 +17,16 @@ use ares_tokenizer::{
 /// tools with. Whether the model thinks when a request does not say is the
 /// template's default with `chat` applied.
 pub fn chat_format(tokenizer: &Tokenizer, chat: &ChatOptions) -> ChatFormat {
+    // A template the server was started with takes the place of the file's.
+    let (reasoning, tools) = match &chat.template {
+        Some(template) => {
+            (ReasoningFormat::detect(template), ares_tokenizer::ToolFormat::detect(template))
+        }
+        None => (tokenizer.reasoning_format(), tokenizer.tool_format()),
+    };
     ChatFormat {
-        thinking: tokenizer.reasoning_format().map(|format| thinking_format(format, chat)),
-        tools: tokenizer.tool_format().map(|format| ToolFormat {
+        thinking: reasoning.map(|format| thinking_format(format, chat)),
+        tools: tools.map(|format| ToolFormat {
             call_open: format.call_open,
             name_close: format.name_close,
             param_open: format.param_open,
@@ -90,7 +97,7 @@ pub(crate) fn encode(
         Prompt::Text(text) => {
             Ok(tokenizer.encode(text, EncodeOptions { add_special: true, parse_special: false }))
         }
-        Prompt::Chat { messages, tools, variables } => {
+        Prompt::Chat { messages, tools, variables, continue_final } => {
             let invalid = |what: String| EngineError::InvalidRequest(what);
             let tools: Vec<Tool> =
                 tools.iter().flatten().map(tool).collect::<Result<_, _>>().map_err(invalid)?;
@@ -113,11 +120,81 @@ pub(crate) fn encode(
                 })
                 .collect::<Result<_, String>>()
                 .map_err(invalid)?;
-            let text = tokenizer
-                .render_chat(&messages, &tools, &with_variables(chat, variables))
-                .map_err(|e| EngineError::InvalidRequest(format!("chat template: {e}")))?;
+            let options = with_variables(chat, variables);
+            let text = if *continue_final {
+                continued(tokenizer, messages, &tools, options)?
+            } else {
+                tokenizer
+                    .render_chat(&messages, &tools, &options)
+                    .map_err(|e| EngineError::InvalidRequest(format!("chat template: {e}")))?
+            };
             Ok(tokenizer.encode(&text, EncodeOptions { add_special: true, parse_special: true }))
         }
+    }
+}
+
+/// What marks the place where the reply goes on, in a conversation that is
+/// rendered to be continued: characters of the private use area, which no
+/// text of a request has (one that does is refused).
+const MARK: &str = "\u{f8ff}ares-continues-here\u{f8ff}";
+
+/// The prompt of a conversation whose last message, the assistant's, the
+/// reply continues: the conversation as the template writes it, up to the
+/// end of that message's text. That is its content, or its reasoning when
+/// the content is empty and the reasoning is not; the reply then goes on
+/// thinking. The template writes the turn as it writes every turn (an empty
+/// block of thinking before a content without reasoning, in Qwen3.8's
+/// template), and the prompt ends where the message's text does: a mark is
+/// put at its end and the rendering cut there, so that what the template
+/// writes after the text (the end of the turn) is left out.
+fn continued(
+    tokenizer: &Tokenizer,
+    mut messages: Vec<Message>,
+    tools: &[Tool],
+    mut options: ChatOptions,
+) -> Result<String, EngineError> {
+    let invalid = |what: &str| EngineError::InvalidRequest(what.to_owned());
+    if !messages.last().is_some_and(|m| m.role == "assistant") {
+        return Err(invalid(
+            "the last message is not the assistant's: there is no message to continue",
+        ));
+    }
+    let text = |content: &Content| match content {
+        Content::Text(text) => text.clone(),
+        Content::Parts(parts) => parts.concat(),
+    };
+    let mentioned =
+        |m: &Message| text(&m.content).contains(MARK) || m.reasoning_content.contains(MARK);
+    if messages.iter().any(mentioned) {
+        return Err(invalid("a message holds characters this server marks a prompt with"));
+    }
+    let last = messages.last_mut().expect("there is a last message");
+    let thinking = text(&last.content).is_empty() && !last.reasoning_content.is_empty();
+    if thinking {
+        last.reasoning_content.push_str(MARK);
+    } else {
+        match &mut last.content {
+            Content::Text(text) => text.push_str(MARK),
+            Content::Parts(parts) => match parts.last_mut() {
+                Some(part) => part.push_str(MARK),
+                None => parts.push(MARK.to_owned()),
+            },
+        }
+    }
+    options.add_generation_prompt = false;
+    let text = tokenizer
+        .render_chat(&messages, tools, &options)
+        .map_err(|e| EngineError::InvalidRequest(format!("chat template: {e}")))?;
+    let mut marks = text.match_indices(MARK);
+    match (marks.next(), marks.next()) {
+        (Some((at, _)), None) => Ok(text[..at].to_owned()),
+        _ => Err(invalid(if thinking {
+            "the chat template does not write the reasoning of the last message as it is given, \
+             so the reply cannot continue it"
+        } else {
+            "the chat template does not write the last message as it is given, so the reply \
+             cannot continue it"
+        })),
     }
 }
 
@@ -207,6 +284,7 @@ mod tests {
             messages: vec![ares_api::Message::new(Role::User, "The weather?"), assistant, result],
             tools: Some(tools),
             variables: Vec::new(),
+            continue_final: false,
         };
         for variable in ["ARES_TEST_GGUF", "ARES_TEST_QWEN38_27B", "ARES_TEST_FLASH_NEXT"] {
             let Some(path) = std::env::var_os(variable) else {

@@ -17,6 +17,10 @@ pub struct RuntimeConfig {
     /// state, a page table and a row of logits for each. Requests beyond
     /// that wait in line; the line has no limit.
     pub max_slots: u32,
+    /// The most requests that may wait in line while every slot is taken:
+    /// one more is refused as [`ares_api::EngineError::Overloaded`]. `None`:
+    /// the line has no limit, and a request waits until it runs.
+    pub queue: Option<u32>,
     /// The most output tokens a request is counted with when it is decided
     /// whether another fits next to it. A request that names no limit may
     /// write until the context is full, and hardly any does.
@@ -96,6 +100,7 @@ impl Default for RuntimeConfig {
             pages: 4096,
             cells_per_page: 16,
             max_slots: 256,
+            queue: None,
             output_clip: 4096,
             output_ratio: 0.7,
             cache_ram: 0,

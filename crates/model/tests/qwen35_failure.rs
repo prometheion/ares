@@ -101,6 +101,7 @@ fn say(runtime: &Runtime, text: &str) -> Result<String, EngineError> {
                 messages: vec![Message::new(Role::User, text)],
                 tools: None,
                 variables: Vec::new(),
+                continue_final: false,
             },
             sampling: Sampling::default(),
             max_tokens: Some(20),

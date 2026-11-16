@@ -71,6 +71,7 @@ mod synthetic;
 pub mod testing;
 mod text;
 mod timing;
+mod watch;
 
 pub use cache::{RamCounters, SsdConfig, SsdCounters};
 pub use conductor::{SequenceInfo, token_hash};
@@ -103,3 +104,4 @@ pub use timing::{
     Calibration, Counters, DEFAULT_WINDOW, DRAFT_POSITIONS, DevicePhase, DeviceTimes, Phase,
     REPORTED_REQUESTS, RequestReport, Series, Snapshot, Stats, Summary,
 };
+pub use watch::{Thinking, Watch};

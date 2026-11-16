@@ -208,13 +208,30 @@ pub(crate) fn apply(
     default: ReasoningFormat,
 ) -> Result<Applied, ApiError> {
     let GenerateRequest { model, prompt, structure, .. } = &mut parsed.request;
-    let Prompt::Chat { variables, .. } = prompt else {
+    let Prompt::Chat { variables, messages, continue_final, .. } = prompt else {
         return Ok(Applied { splitter: Splitter::plain(), start: Start::Reply });
     };
     let asked = std::mem::take(&mut parsed.reasoning);
     let format = engine.chat_format(model);
     let thinking = format.as_ref().and_then(|format| format.thinking.as_ref());
-    let plan = plan(&asked, thinking, default)?;
+    let mut plan = plan(&asked, thinking, default)?;
+    // A reply that continues the last message goes on where it stands: in its
+    // reasoning, when the message is reasoning and no content, else in its
+    // content, after the thinking the template closed.
+    if *continue_final && let Some(thinking) = thinking {
+        let last = messages.last();
+        let reasoning = last.and_then(|m| m.reasoning_content.as_deref()).unwrap_or_default();
+        let inside = last.is_some_and(|m| m.content.is_empty()) && !reasoning.is_empty();
+        let format = asked.format.unwrap_or(default);
+        (plan.splitter, plan.start) = if inside {
+            let close = thinking.end_tag().to_owned();
+            let splitter =
+                if format.extracts() { Splitter::continuing(thinking) } else { Splitter::plain() };
+            (splitter, Start::AfterReasoning { open: None, close })
+        } else {
+            (Splitter::plain(), Start::Reply)
+        };
+    }
     *variables = plan.variables;
     if let Some(structure) = structure {
         structure.start = plan.start.clone();
@@ -409,6 +426,16 @@ impl Splitter {
         };
         let open = !prompt.is_empty() && !prompt.contains(&layout.end_tag);
         Self::new(if open { State::Reasoning } else { State::Lead }, layout)
+    }
+
+    /// Sorts a reply that continues reasoning the prompt ends inside: what
+    /// comes is reasoning, white space at its start included, until the
+    /// closing tag.
+    pub(crate) fn continuing(format: &ThinkingFormat) -> Self {
+        let mut splitter = Self::extracting(format, "");
+        splitter.state = State::Reasoning;
+        splitter.started = true;
+        splitter
     }
 
     fn new(state: State, layout: Layout) -> Self {

@@ -188,25 +188,32 @@ Everything `FEATURES.md` lists for the 27B and not for Flash-Next is owed:
       `/v1/messages` took 18: the history is rendered differently somewhere.
 
 ## Server and API
-- [ ] API keys (X01); configuration file and environment variables (M08); CORS (X04);
+- [x] API keys (X01); configuration file and environment variables (M08); CORS (X04);
       Host and Origin checks (X05).
-- [ ] Tokenize and detokenize (A09); model properties (A16); template override (F07);
-      continuing the last assistant message (F09); truncation and context shift (F18).
+- [x] Tokenize and detokenize (A09); model properties (A16); template override (F07);
+      continuing the last assistant message (F09).
+- [ ] Truncation and context shift (F18).
+- [ ] `/v1/completions` reads the text of special tokens (`<|im_start|>`) as text, where
+      llama-server parses them; `/tokenize` reads a text the same way.
 - [ ] Thinking budget (K03; Anthropic's `budget_tokens` is accepted and not enforced);
-      loop guard (K05); reasoning tokens in the usage (K07).
-- [ ] `stop_reason: stop_sequence` (the engine does not tell a stop string from the end token).
+      loop guard (K05).
+- [x] Reasoning tokens in the usage (K07); `stop_reason: stop_sequence` and the stop string
+      that ended a reply.
 - [ ] Tool calls: a generic format for other templates; recovery of imperfect calls (T05);
       string constraints `pattern`, `minLength`, `maxLength`, `format`; forced tokens as
       drafts; a guard for `ignore_eos` with a complete grammar; the end-token rule for a
       schema with thinking; llama.cpp's `json.gbnf` costs 6.8 ms per mask.
 - [ ] Responses: stored responses (A05), WebSocket (A06); the chat route's sampler fields
-      are refused there. Messages: never run against Claude Code; no prefill.
+      are refused there. Messages: never run against Claude Code.
 - [ ] Router: load and unload times in the docs; "no room" for Flash-Next is recognised by
       message text; a plan cannot be asked without loading; two elastic models on real devices.
 - [ ] A request with tools or an effort for an unknown model gets a 400 where a 404 belongs.
-- [ ] Latency histograms (O01), logs (O03, O04), a bounded queue that says when to retry
-      (S04), priorities (S06), timeouts (S23), a VRAM reserve for other programs (V04),
-      container image and service unit (X09).
+- [x] Latency histograms (O01), logs (O03, O04), a bounded queue that says when to retry
+      (S04), timeouts (S23).
+- [ ] Priorities (S06), a watchdog for a silent engine (S23), a VRAM reserve for other
+      programs (V04), container image and service unit (X09), key roles and a reload of the
+      key file (X02), TLS (X03).
+- [ ] `/props` of a model that is not loaded (today: 503 `model_not_loaded`, as `/metrics`).
 
 ## Whole features not started
 - [ ] Image input (F11; the owner's preset sets `mmproj`). Design: `/var/tmp/ares-survey/image-input-design.md`

@@ -166,7 +166,7 @@ async fn read(
 }
 
 async fn try_messages(app: App, request: Request) -> Result<Response, ApiError> {
-    let body = read_body(request, app.config.max_body_bytes).await?;
+    let body = read_body(request, &app.config).await?;
     let id = next_request_id();
     let (parsed, sorter, lease) = read(&app, &body, id, Purpose::Reply).await?;
     let head = Head { id: format!("msg_{id}"), model: parsed.request.model.clone() };
@@ -187,7 +187,7 @@ async fn try_messages(app: App, request: Request) -> Result<Response, ApiError> 
 /// as `/v1/messages` reads it, and the engine counts the tokens of the prompt
 /// it would have been given.
 async fn try_count(app: App, request: Request) -> Result<Response, ApiError> {
-    let body = read_body(request, app.config.max_body_bytes).await?;
+    let body = read_body(request, &app.config).await?;
     let (parsed, _, lease) = read(&app, &body, next_request_id(), Purpose::Count).await?;
     let tokens = routes::count_prompt(&lease, parsed.request).await?;
     Ok(json_response(format!(r#"{{"input_tokens":{tokens}}}"#)))
@@ -202,11 +202,11 @@ async fn whole(mut reply: Reply, head: Head) -> Result<Response, ApiError> {
             Step::Pieces(pieces) => content.take(blocks.push(pieces)),
             // This API has no field that asks for them.
             Step::Probs(_) => {}
-            Step::End(End { rest, finish, usage, .. }) => {
+            Step::End(End { rest, finish, stop, usage, .. }) => {
                 content.take(blocks.push(rest));
                 content.take(blocks.finish());
-                let reason = stop_reason(finish, blocks.calls());
-                return Ok(json_response(head.message(&content, reason, usage)));
+                let reason = stop_reason(finish, blocks.calls(), stop.as_deref());
+                return Ok(json_response(head.message(&content, reason, stop.as_deref(), usage)));
             }
         }
     }
@@ -270,11 +270,12 @@ impl Events {
                     self.queue.extend(events.iter().map(block_event));
                 }
                 Ok(Step::Probs(_)) => {}
-                Ok(Step::End(End { rest, finish, usage, .. })) => {
+                Ok(Step::End(End { rest, finish, stop, usage, .. })) => {
                     let mut events = self.blocks.push(rest);
                     events.extend(self.blocks.finish());
                     self.queue.extend(events.iter().map(block_event));
-                    self.queue.extend(message_end(stop_reason(finish, self.blocks.calls()), usage));
+                    let reason = stop_reason(finish, self.blocks.calls(), stop.as_deref());
+                    self.queue.extend(message_end(reason, stop.as_deref(), usage));
                     self.over = true;
                 }
                 Err(error) => {

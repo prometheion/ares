@@ -22,7 +22,7 @@ use ares_model::qwen4exp::device::{
 };
 use ares_model::qwen4exp::{Config, DraftWeights};
 use ares_runtime::{GpuConfig, Runtime, RuntimeConfig, required_ram};
-use ares_tokenizer::{ChatOptions, Tokenizer};
+use ares_tokenizer::Tokenizer;
 
 use crate::load::{
     LoadError, Loaded, VRAM_HEADROOM, describe_links, hold_devices, join, ram_limit, refuse, short,
@@ -336,9 +336,9 @@ pub(crate) fn load(
 
     // Load.
     let name = options.name.clone().unwrap_or_else(|| crate::preset::id_of_file(&options.model));
-    let chat = ChatOptions { variables: options.chat_variables.clone(), ..ChatOptions::default() };
     let tokenizer = Tokenizer::from_gguf(&gguf).map_err(|e| LoadError::Model(e.to_string()))?;
-    if !tokenizer.has_chat_template() {
+    let (chat, template) = crate::load::chat_options(options, &tokenizer)?;
+    if template.is_none() {
         tracing::warn!(
             "the model file has no chat template: /v1/chat/completions will refuse requests, \
              /v1/completions works"
@@ -374,6 +374,7 @@ pub(crate) fn load(
         pages,
         cells_per_page: CELLS_PER_PAGE,
         max_slots: parallel,
+        queue: options.queue,
         window_rows: if drafting { window } else { 1 },
         cache_ram: 0,
         ..RuntimeConfig::default()
@@ -415,6 +416,7 @@ pub(crate) fn load(
         });
         if short_of_memory { short(site, error) } else { error }
     })?;
+    let runtime = runtime.with_chat_template(template);
     tracing::info!(
         "loaded in {:.1} s ({:.1} s since the start)",
         loading.elapsed().as_secs_f64(),

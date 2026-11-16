@@ -39,7 +39,7 @@ fn conversation(reasoning: Option<&str>) -> Vec<Message> {
 }
 
 fn prompt(messages: Vec<Message>, variables: Vec<(String, Request)>) -> Prompt {
-    Prompt::Chat { messages, tools: None, variables }
+    Prompt::Chat { messages, tools: None, variables, continue_final: false }
 }
 
 /// The tokens of the same text with `text`'s own tokenizer.

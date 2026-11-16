@@ -380,7 +380,7 @@ async fn a_plain_request_is_the_chat_request_and_its_reply_one_message() {
     assert_eq!((request.model.as_str(), request.max_tokens), ("mock", Some(256)));
     assert_eq!((request.sampling.temperature, request.sampling.top_p), (Some(0.2), Some(0.9)));
     assert!(request.draft && request.structure.is_none() && request.stop.is_empty());
-    let Prompt::Chat { messages, tools, variables } = &request.prompt else { panic!() };
+    let Prompt::Chat { messages, tools, variables, .. } = &request.prompt else { panic!() };
     let said: Vec<_> = messages.iter().map(|m| (m.role, m.content.as_str())).collect();
     assert_eq!(said, [(Role::System, "Be brief."), (Role::User, "How is the weather in Köln?")]);
     // Thinking is left to the server when the request does not say.

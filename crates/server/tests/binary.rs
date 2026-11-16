@@ -245,7 +245,7 @@ fn a_preset_file_is_served_with_its_defaults_in_the_log_and_in_the_model_list() 
         let address = line.split("address=").nth(1)?.split_whitespace().next()?;
         let mut stream = TcpStream::connect(address).ok()?;
         stream
-            .write_all(b"GET /v1/models HTTP/1.1\r\nHost: ares\r\nConnection: close\r\n\r\n")
+            .write_all(b"GET /v1/models HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
             .ok()?;
         let mut answer = String::new();
         stream.read_to_string(&mut answer).ok()?;

@@ -426,7 +426,7 @@ fn apply(preset: &mut Preset, scope: Scope, key: &Key) -> Result<Applied, String
             preset.idle_unload = idle(key)?;
             return Ok(Applied::Option);
         }
-        "host" | "port" | "models-preset" | "help" => {
+        _ if options::SERVER.contains(&name) => {
             return Err(format!(
                 "'{name}' is an option of the server, not of a model: give it on the command \
                  line (--{name})"

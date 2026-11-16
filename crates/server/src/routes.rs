@@ -94,7 +94,7 @@ fn named_model(body: &[u8]) -> Result<String, ApiError> {
 /// once; the load shows in `GET /v1/models` and in `GET /models/sse`.
 pub(crate) async fn load_model(State(app): State<App>, request: Request) -> Response {
     let asked = async {
-        let name = named_model(&read_body(request, app.config.max_body_bytes).await?)?;
+        let name = named_model(&read_body(request, &app.config).await?)?;
         app.models.ask_load(&name)?;
         Ok::<_, ApiError>(json_response(r#"{"success":true}"#.to_owned()))
     };
@@ -105,7 +105,7 @@ pub(crate) async fn load_model(State(app): State<App>, request: Request) -> Resp
 /// when those that run have ended. Answers at once.
 pub(crate) async fn unload_model(State(app): State<App>, request: Request) -> Response {
     let asked = async {
-        let name = named_model(&read_body(request, app.config.max_body_bytes).await?)?;
+        let name = named_model(&read_body(request, &app.config).await?)?;
         app.models.ask_unload(&name)?;
         Ok::<_, ApiError>(json_response(r#"{"success":true}"#.to_owned()))
     };
@@ -151,7 +151,7 @@ pub(crate) async fn model_events(State(app): State<App>) -> Response {
 
 /// The value of `model` in the query of a URL (`?model=<id>`), with its
 /// percent escapes read.
-fn model_in_query(query: Option<&str>) -> Option<String> {
+pub(crate) fn model_in_query(query: Option<&str>) -> Option<String> {
     let value = query?.split('&').find_map(|pair| pair.strip_prefix("model="))?;
     let mut bytes = Vec::with_capacity(value.len());
     let mut rest = value.as_bytes();
@@ -198,11 +198,13 @@ pub(crate) async fn metrics(State(app): State<App>, request: Request) -> Respons
         Err(error) => return ApiError::from(error).into_response(),
     };
     // The engine may wait for the end of its step before it answers.
+    let latency = lease.flight().clone();
     let stats = tokio::task::spawn_blocking(move || lease.engine().stats()).await.ok().flatten();
+    let latency = &latency.latency;
     match stats {
         Some(stats) => (
             [(header::CONTENT_TYPE, HeaderValue::from_static("text/plain; version=0.0.4"))],
-            wire::metrics(&stats),
+            wire::metrics(&stats) + &latency.render(),
         )
             .into_response(),
         None => ApiError::unsupported("the engine keeps no statistics").into_response(),
@@ -228,7 +230,7 @@ pub(crate) async fn chat_input_tokens(State(app): State<App>, request: Request) 
 }
 
 async fn try_chat_input_tokens(app: App, request: Request) -> Result<Response, ApiError> {
-    let body = read_body(request, app.config.max_body_bytes).await?;
+    let body = read_body(request, &app.config).await?;
     let mut parsed = wire::parse(Endpoint::Chat, &body, next_request_id())?;
     let (_, lease) = prepare(&app, &mut parsed, None).await?;
     let tokens = count_prompt(&lease, parsed.request).await?;
@@ -288,7 +290,43 @@ pub(crate) async fn prepare(
     let format = format.unwrap_or(lease.reasoning_format());
     let thinking = reasoning::apply(parsed, &**lease.engine(), format)?;
     let calls = tools::apply(parsed, &**lease.engine(), &thinking)?;
+    log_request(app, parsed);
     Ok((Sorter::new(thinking.splitter, calls), lease))
+}
+
+/// The line of the log for a request that is taken: its parameters as the
+/// engine gets them, and its prompt with `--log-text`.
+fn log_request(app: &App, parsed: &Parsed) {
+    let request = &parsed.request;
+    let sampling = &request.sampling;
+    let (tools, continues) = match &request.prompt {
+        ares_api::Prompt::Chat { tools, continue_final, .. } => {
+            (tools.as_ref().map_or(0, Vec::len), *continue_final)
+        }
+        ares_api::Prompt::Text(_) => (0, false),
+    };
+    tracing::info!(
+        id = %request.id,
+        model = %request.model,
+        stream = parsed.stream,
+        n = parsed.n,
+        max_tokens = ?request.max_tokens,
+        temperature = ?sampling.temperature,
+        top_k = ?sampling.top_k,
+        top_p = ?sampling.top_p,
+        min_p = ?sampling.min_p,
+        seed = ?sampling.seed,
+        stops = request.stop.len(),
+        tools,
+        structure = request.structure.is_some(),
+        draft = request.draft,
+        continues,
+        "request"
+    );
+    if app.config.log_text {
+        let prompt = serde_json::to_string(&request.prompt).unwrap_or_default();
+        tracing::info!(id = %request.id, %prompt, "the prompt");
+    }
 }
 
 /// A reply the engine is generating: the request in the engine and the
@@ -297,6 +335,8 @@ pub(crate) async fn prepare(
 pub(crate) struct Reply {
     run: Run,
     sorter: Sorter,
+    /// The request's stop strings, to name the one that ended the reply.
+    stops: Vec<String>,
     /// Dropped after the run: the model may be unloaded when its requests
     /// have let go of the engine.
     _lease: Lease,
@@ -320,6 +360,8 @@ pub(crate) struct End {
     pub rest: Vec<Piece>,
     /// `stop` (the model ended the reply, or a stop string did) or `length`.
     pub finish: &'static str,
+    /// The stop string that ended the reply, if one did.
+    pub stop: Option<String>,
     pub usage: Usage,
     pub timings: Timings,
 }
@@ -332,14 +374,16 @@ impl Reply {
         request: GenerateRequest,
         sorter: Sorter,
     ) -> Result<Self, ApiError> {
+        let stops = request.stop.clone();
         let run = Run::start(
             lease.engine(),
             request,
             app.config.event_buffer,
             lease.flight(),
             app.stop.clone(),
+            app.config.log_text,
         )?;
-        Ok(Self { run, sorter, _lease: lease.clone() })
+        Ok(Self { run, sorter, stops, _lease: lease.clone() })
     }
 
     /// The next step of the reply, or the reason there will be none. After
@@ -348,8 +392,9 @@ impl Reply {
         Ok(match self.run.next().await? {
             Item::Text(text) => Step::Pieces(self.sorter.push(&text)),
             Item::Probs(probs) => Step::Probs(probs),
-            Item::Done { finish, usage, timings } => {
-                Step::End(End { rest: self.sorter.finish(), finish, usage, timings })
+            Item::Done { finish, stopped_by, usage, timings } => {
+                let stop = stopped_by.and_then(|index| self.stops.get(index).cloned());
+                Step::End(End { rest: self.sorter.finish(), finish, stop, usage, timings })
             }
         })
     }
@@ -406,21 +451,12 @@ async fn try_completion(
     request: Request,
     endpoint: Endpoint,
 ) -> Result<Response, ApiError> {
-    let body = read_body(request, app.config.max_body_bytes).await?;
+    let body = read_body(request, &app.config).await?;
     let id = next_request_id();
     let mut parsed = wire::parse(endpoint, &body, id)?;
     let (sorter, lease) = prepare(&app, &mut parsed, None).await?;
     let mut head = Head::new(endpoint, id, &parsed.request.model);
     head.logprobs = parsed.logprobs;
-    tracing::info!(
-        %id,
-        model = %parsed.request.model,
-        ?endpoint,
-        stream = parsed.stream,
-        n = parsed.n,
-        max_tokens = ?parsed.request.max_tokens,
-        "request"
-    );
 
     // The completions of a prompt are requests of their own, with their own
     // seeds: the engine computes the prompt once and the other requests start
@@ -450,7 +486,7 @@ async fn try_completion(
 /// handler hands the request to the engine and awaits its own outcome, and
 /// the engine runs decision rows in the same steps as everything else.
 async fn try_systemone(app: App, request: Request) -> Result<Response, ApiError> {
-    let body = read_body(request, app.config.max_body_bytes).await?;
+    let body = read_body(request, &app.config).await?;
     let id = next_request_id();
     let served: Vec<_> = app.models.list().into_iter().map(|listed| listed.id).collect();
     let mut parsed = systemone::parse(&body, id, &served)?;
@@ -467,13 +503,21 @@ async fn try_systemone(app: App, request: Request) -> Result<Response, ApiError>
     Ok(json_response(parsed.reply.render(&result)?))
 }
 
-/// Reads the whole body, refusing more than `limit` bytes.
+/// Reads the whole body, refusing more than the configuration's limit of
+/// bytes, and a body that does not arrive within its timeout.
 ///
 /// The limit is enforced here and not by the framework's extractors so that
 /// the refusal comes out in the same error format as every other one, and so
 /// that a prompt with a long context (megabytes of JSON) is allowed on
 /// purpose instead of hitting the framework's small default.
-pub(crate) async fn read_body(request: Request, limit: usize) -> Result<Vec<u8>, ApiError> {
+pub(crate) async fn read_body(request: Request, config: &Config) -> Result<Vec<u8>, ApiError> {
+    let timeout = config.timeout;
+    tokio::time::timeout(timeout, read_whole(request, config.max_body_bytes))
+        .await
+        .unwrap_or_else(|_| Err(ApiError::too_slow(timeout)))
+}
+
+async fn read_whole(request: Request, limit: usize) -> Result<Vec<u8>, ApiError> {
     let declared = request
         .headers()
         .get(header::CONTENT_LENGTH)
@@ -512,6 +556,7 @@ struct Collected {
     calls: Vec<Call>,
     probs: Vec<TokenProbs>,
     finish: &'static str,
+    stop: Option<String>,
     usage: Usage,
     timings: Timings,
 }
@@ -545,10 +590,10 @@ async fn collect_one(mut reply: Reply) -> Result<Collected, ApiError> {
         match reply.next().await? {
             Step::Pieces(pieces) => take(pieces),
             Step::Probs(more) => probs.extend(more),
-            Step::End(End { rest, finish, usage, timings }) => {
+            Step::End(End { rest, finish, stop, usage, timings }) => {
                 take(rest);
                 let finish = finish_reason(finish, calls.len());
-                return Ok(Collected { text, calls, probs, finish, usage, timings });
+                return Ok(Collected { text, calls, probs, finish, stop, usage, timings });
             }
         }
     }
@@ -566,13 +611,13 @@ async fn collect(runs: Vec<Reply>, head: Head) -> Result<Response, ApiError> {
     let choices: Vec<Choice<'_>> = done
         .iter()
         .enumerate()
-        .map(|(i, c)| head.choice(i as u32).complete_choice(&c.text, &c.calls, c.finish, &c.probs))
+        .map(|(i, c)| {
+            let choice = head.choice(i as u32);
+            choice.complete_choice(&c.text, &c.calls, c.finish, c.stop.as_deref(), &c.probs)
+        })
         .collect();
     // One prompt, however many completions of it.
-    let usage = Usage {
-        completion_tokens: done.iter().map(|c| c.usage.completion_tokens).sum(),
-        ..done[0].usage
-    };
+    let usage = done.iter().skip(1).fold(done[0].usage, |sum, c| add_completion(sum, c.usage));
     Ok(json_response(head.complete(choices, usage, done[0].timings)))
 }
 
@@ -645,9 +690,7 @@ impl Shared {
         let mut total = self.usage.lock().unwrap_or_else(|p| p.into_inner());
         *total = Some(match *total {
             None => usage,
-            Some(sum) => {
-                Usage { completion_tokens: sum.completion_tokens + usage.completion_tokens, ..sum }
-            }
+            Some(sum) => add_completion(sum, usage),
         });
     }
 
@@ -667,6 +710,20 @@ impl Shared {
     }
 }
 
+/// The usage of the completions of one prompt: the prompt once, the tokens
+/// of every completion.
+fn add_completion(sum: Usage, more: Usage) -> Usage {
+    let reasoning = match (sum.reasoning_tokens, more.reasoning_tokens) {
+        (Some(a), Some(b)) => Some(a + b),
+        (a, b) => a.or(b),
+    };
+    Usage {
+        completion_tokens: sum.completion_tokens + more.completion_tokens,
+        reasoning_tokens: reasoning,
+        ..sum
+    }
+}
+
 /// Where the SSE state machine is. Every `step` produces one `data:` line.
 enum Phase {
     /// The first step has arrived but nothing was sent yet.
@@ -678,6 +735,7 @@ enum Phase {
     /// The text is out; the finish chunk is next.
     Finish {
         finish: &'static str,
+        stop: Option<String>,
         usage: Usage,
         timings: Timings,
     },
@@ -735,12 +793,12 @@ impl Chunks {
                     self.phase = Phase::Pull;
                     return Some(self.head.probs_chunk(&probs, self.sent));
                 }
-                Phase::Ready(Step::End(End { rest, finish, usage, timings })) => {
+                Phase::Ready(Step::End(End { rest, finish, stop, usage, timings })) => {
                     self.enqueue(rest);
                     let finish = finish_reason(finish, self.calls);
-                    self.phase = Phase::Finish { finish, usage, timings };
+                    self.phase = Phase::Finish { finish, stop, usage, timings };
                 }
-                Phase::Finish { finish, usage, timings } => {
+                Phase::Finish { finish, stop, usage, timings } => {
                     self.phase = match &self.shared {
                         Some(shared) => {
                             shared.add(usage);
@@ -749,7 +807,7 @@ impl Chunks {
                         None if self.include_usage => Phase::Usage(usage),
                         None => Phase::Marker,
                     };
-                    return Some(self.head.finish_chunk(finish, timings));
+                    return Some(self.head.finish_chunk(finish, stop.as_deref(), timings));
                 }
                 Phase::Pull => match self.reply.next().await {
                     Ok(step) => self.phase = Phase::Ready(step),

@@ -1,6 +1,6 @@
 //! The front of the runtime: an [`Engine`] over a conductor thread.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle, ThreadId};
@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use ares_api::{
     ChatFormat, DecisionRequest, DecisionSink, Engine, EngineError, EngineStats, EventSink,
-    GenerateRequest, ModelCard, Prompt, RequestId,
+    GenerateRequest, ModelCard, Prompt, RequestId, ThinkingFormat,
 };
 use ares_cuda::Device;
 
@@ -21,6 +21,7 @@ use crate::model::Model;
 use crate::sampling::TokenFilter;
 use crate::structured::Grammars;
 use crate::timing::Snapshot;
+use crate::watch::{Thinking, Watch};
 
 /// How long a question to the conductor (statistics, inspection) may take.
 const ASK_TIMEOUT: Duration = Duration::from_secs(30);
@@ -51,6 +52,25 @@ pub struct Runtime {
     running: Arc<AtomicBool>,
     /// Why the engine accepts no more requests, once its devices have failed.
     failure: Arc<OnceLock<String>>,
+    /// The requests the engine holds, running and in line: one for every
+    /// sink it has not let go of.
+    held: Arc<AtomicU32>,
+    /// The most requests that may wait in line while the slots are taken;
+    /// `None`: the line has no limit.
+    queue: Option<u32>,
+    slots: u32,
+    /// The text of the chat template conversations are rendered with.
+    template: Option<String>,
+}
+
+/// One request the engine holds; gives its place up when the sink that
+/// carries it is dropped, however the request ends.
+struct Held(Arc<AtomicU32>);
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 /// Clears the flag when the conductor thread is done, however it ends.
@@ -107,6 +127,7 @@ impl Runtime {
         let (ready_tx, ready_rx) = mpsc::channel();
         let limit = card.context_length.min(config.pages.saturating_mul(config.cells_per_page));
         let warm_up = config.warm_up;
+        let (queue, slots) = (config.queue, config.max_slots);
         // When the prompt cache must give page-locked memory back, the
         // conductor is woken to give the coldest checkpoints and pages up,
         // also while nothing runs.
@@ -160,7 +181,19 @@ impl Runtime {
             conductor: Mutex::new(Some(thread)),
             running,
             failure,
+            held: Arc::new(AtomicU32::new(0)),
+            queue,
+            slots,
+            template: None,
         })
+    }
+
+    /// The runtime, which says that conversations are rendered with the
+    /// chat template `source` ([`Engine::chat_template`]). The template
+    /// itself is the model's business: this is what the engine tells.
+    pub fn with_chat_template(mut self, source: Option<String>) -> Self {
+        self.template = source;
+        self
     }
 
     /// Starts a runtime with a thread per device over `devices`. The engine
@@ -232,11 +265,28 @@ impl Runtime {
                 limit: self.limit,
             });
         }
+        // A full line refuses: the slots are taken and as many wait as may.
+        let held = self.held.fetch_add(1, Ordering::AcqRel) + 1;
+        let place = Held(self.held.clone());
+        if let Some(queue) = self.queue
+            && held > self.slots.saturating_add(queue)
+        {
+            return Err(EngineError::Overloaded);
+        }
+        let events = EventSink::new(move |event| {
+            let _place = &place;
+            events.send(event)
+        });
+        let thinking = self
+            .model
+            .chat_format()
+            .and_then(|format| format.thinking)
+            .map(|format| thinking(&*self.model, &prompt, &format, request.structure.as_ref()));
         let submission = Box::new(Submission {
             id: request.id,
             prompt,
             max_tokens: request.max_tokens,
-            stop: request.stop,
+            stop: Watch::new(&request.stop, thinking),
             sampling: request.sampling,
             draft: request.draft,
             filter,
@@ -317,10 +367,38 @@ impl Engine for Runtime {
     }
 
     fn count_tokens(&self, model: &str, prompt: &Prompt) -> Result<u32, EngineError> {
+        Ok(u32::try_from(self.tokenize(model, prompt)?.len()).unwrap_or(u32::MAX))
+    }
+
+    fn tokenize(&self, model: &str, prompt: &Prompt) -> Result<Vec<u32>, EngineError> {
         if model != self.card.id {
             return Err(EngineError::ModelNotFound(model.to_owned()));
         }
-        Ok(u32::try_from(self.model.encode(prompt)?.len()).unwrap_or(u32::MAX))
+        self.model.encode(prompt)
+    }
+
+    fn pieces(&self, model: &str, tokens: &[u32]) -> Result<Vec<Vec<u8>>, EngineError> {
+        if model != self.card.id {
+            return Err(EngineError::ModelNotFound(model.to_owned()));
+        }
+        let vocab = self.model.vocab();
+        tokens
+            .iter()
+            .map(|&token| {
+                if token >= vocab {
+                    return Err(EngineError::InvalidRequest(format!(
+                        "token {token} is not one of the {vocab} tokens of the model"
+                    )));
+                }
+                let mut bytes = Vec::new();
+                self.model.piece(token, &mut bytes);
+                Ok(bytes)
+            })
+            .collect()
+    }
+
+    fn chat_template(&self, model: &str) -> Option<String> {
+        (model == self.card.id).then(|| self.template.clone()).flatten()
     }
 
     fn submit(&self, request: GenerateRequest, events: EventSink) -> Result<(), EngineError> {
@@ -395,4 +473,50 @@ impl Engine for Runtime {
             },
         })
     }
+}
+
+/// Where the thinking of a reply to `prompt` is: inside, when the last tag of
+/// the thinking the prompt holds is the opening one (the template opened the
+/// thinking for the model); else the reply may open it with its first text.
+/// The prompt is read backwards, its last tokens first, until a tag is found.
+/// A call of a tool may end the thinking when the request's rule says so.
+fn thinking(
+    model: &dyn crate::model::Model,
+    prompt: &[u32],
+    format: &ThinkingFormat,
+    structure: Option<&ares_api::Structure>,
+) -> Thinking {
+    let (open, close) = (format.start_tag().to_owned(), format.end_tag().to_owned());
+    let reversed = |tag: &str| tag.bytes().rev().collect::<Vec<u8>>();
+    let (open_back, close_back) = (reversed(&open), reversed(&close));
+    // The bytes of the prompt from its end, reversed.
+    let mut back: Vec<u8> = Vec::new();
+    let mut inside = false;
+    let mut piece = Vec::new();
+    for &token in prompt.iter().rev() {
+        piece.clear();
+        model.piece(token, &mut piece);
+        let searched = back.len().saturating_sub(open_back.len().max(close_back.len()));
+        back.extend(piece.iter().rev());
+        let found = |tag: &[u8]| {
+            (!tag.is_empty())
+                .then(|| back[searched..].windows(tag.len()).position(|w| w == tag))
+                .flatten()
+                .map(|at| at + searched)
+        };
+        match (found(&open_back), found(&close_back)) {
+            (Some(o), Some(c)) => {
+                inside = o < c;
+                break;
+            }
+            (Some(_), None) => {
+                inside = true;
+                break;
+            }
+            (None, Some(_)) => break,
+            (None, None) => {}
+        }
+    }
+    let interrupt = structure.and_then(|s| s.interrupt.as_ref()).map(|i| i.text.clone());
+    Thinking { inside, open, close, interrupt }
 }

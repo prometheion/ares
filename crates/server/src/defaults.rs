@@ -275,13 +275,15 @@ pub(crate) const SETTINGS: &[Setting] = &[
 const MAX_TOKENS: &str = "--max-tokens";
 const MAX_TOKENS_LIMIT: &str = "--max-tokens-limit";
 
+/// The options of this module under their one names.
+pub(crate) fn flags() -> impl Iterator<Item = &'static str> {
+    [MAX_TOKENS, MAX_TOKENS_LIMIT].into_iter().chain(SETTINGS.iter().map(|setting| setting.flag))
+}
+
 /// The option that is written `name` on the command line, if it is one of
 /// this module: its one name, under which [`set`] takes it.
 pub(crate) fn lookup(name: &str) -> Option<&'static str> {
-    [MAX_TOKENS, MAX_TOKENS_LIMIT]
-        .into_iter()
-        .chain(SETTINGS.iter().map(|setting| setting.flag))
-        .find(|flag| *flag == name)
+    flags().find(|flag| *flag == name)
 }
 
 /// Sets the option `flag` (a name [`lookup`] gave) to `value`.

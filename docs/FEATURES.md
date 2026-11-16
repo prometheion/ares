@@ -64,7 +64,25 @@ the kernels exist; no model runs there yet.
 ## Server
 - Routes: `/v1/chat/completions`, `/v1/completions`, `/v1/messages` and
   `/v1/messages/count_tokens`, `/v1/responses` (stateless) and `/v1/responses/input_tokens`,
-  `/v1/chat/completions/input_tokens`, `/v1/models`, `/health`, `/metrics`.
+  `/v1/chat/completions/input_tokens`, `/v1/models`, `/health`, `/metrics`, `/props`,
+  `/tokenize`, `/detokenize`.
+- API keys: `--api-key`, `--api-key-file` (or `ARES_API_KEY`), as `Authorization: Bearer` or
+  `x-api-key`, compared in constant time; `/health` stays open.
+- CORS for the origins of `--cors-origins`; a server on a local address without keys answers
+  only to local names and pages (against DNS rebinding), `--allowed-hosts` adds names.
+- Every option is also `ARES_<NAME>` and a line of `--config <FILE>` (command line, then
+  environment, then file).
+- `/tokenize` (a text or a chat request, with pieces) and `/detokenize`, in llama.cpp's shapes.
+- `/props` (`?model=`): context, chat template, request defaults, what the template can do.
+- Usage counts the tokens of the thinking (`completion_tokens_details.reasoning_tokens`,
+  `output_tokens_details` on `/v1/responses`).
+- A stop string that ends a reply is named: `stop_reason: stop_sequence` and `stop_sequence` on
+  `/v1/messages`, `stop_reason` (vLLM's field) on the OpenAI routes.
+- `--chat-template-file` replaces the model file's chat template.
+- A last assistant message is continued (llama.cpp's prefill, `continue_final_message`,
+  Anthropic's prefill), in its answer or in its reasoning.
+- `--queue <N>`: a full line answers 503 with `Retry-After`; `--timeout` for reading a request
+  and writing an answer.
 - Router mode: `--models-preset <file.ini>` with one section per model and `[*]` for all;
   a model is loaded when a request names it, the least recently used one makes room, idle
   models unload (`idle-unload`), aliases, `POST /models/load` and `/models/unload`,

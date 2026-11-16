@@ -389,6 +389,7 @@ fn lets_the_caller_set_variables_but_not_the_tokens_of_the_model() {
             add_generation_prompt: false,
             enable_thinking: thinking,
             variables: variables.into_iter().map(|(k, v)| (k.to_owned(), v)).collect(),
+            template: None,
         };
         render(template, &[user("x")], &options)
             .unwrap()

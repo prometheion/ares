@@ -14,8 +14,19 @@ ares: inference server with an OpenAI-compatible API
 USAGE:
     ares --model <PATH> [OPTIONS]
     ares --models-preset <FILE> [OPTIONS]
+    ares --config <FILE> [OPTIONS]
+
+Every option is also a variable of the environment, ARES_ and its name in
+capitals with underscores (ARES_TOP_P=0.9 for --top-p), and a line of the file
+of --config, its name without the dashes (top-p = 0.9; a switch takes true or
+false, as in a preset file). The command line holds over the environment, and
+the environment over the file; with a preset file all three hold over its
+sections. Variables without the prefix are never read.
 
 OPTIONS:
+        --config <FILE>        A file of options, one on each line: name = value;
+                               lines that begin with # or ; are comments
+                               [default: ARES_CONFIG, else none]
         --model <PATH>         GGUF model file to load and serve (any part of a split model)
         --models-preset <FILE> Serve several models from a preset file: an INI file
                                with one section for each model, named by the id
@@ -28,6 +39,30 @@ OPTIONS:
                                here on the command line holds for every model
         --host <ADDR>          Address to listen on [default: 127.0.0.1]
         --port <PORT>          Port to listen on, 0 picks a free one [default: 8000]
+        --timeout <SECONDS>    How long a client may take to send a request, and to
+                               take what one write of an answer sent; then the
+                               connection is closed and its request ended. A reply
+                               the engine takes long for is never cut [default: 600]
+
+    Who may use the server.
+        --api-key <KEYS>       Keys a request must carry one of, separated by commas,
+                               as 'Authorization: Bearer <key>' or 'x-api-key: <key>';
+                               /health stays open [default: none, no key is asked for]
+        --api-key-file <FILE>  A file of more keys, one on each line; lines that
+                               begin with # are comments
+        --allowed-hosts <LIST> Names in a request's Host that the server answers to
+                               besides its local ones (localhost, addresses), separated
+                               by commas, or * for any. A server on a local address
+                               without keys answers only to its local names, against
+                               web pages that rebind a name of theirs to it; with these
+                               names the check holds for every address and with keys
+                               too [default: the local names on a local address without
+                               keys, else any]
+        --cors-origins <LIST>  Origins whose web pages may call the server from a browser
+                               and read its answers (CORS), such as https://chat.example.org,
+                               separated by commas, or * for any. Without keys a request
+                               from a page of any other site is refused, unless the
+                               page is local (localhost, an address) [default: none]
 
     Where the model goes. What is left out is decided from the devices and the
     model, and the log says how.
@@ -120,6 +155,16 @@ OPTIONS:
     Prompts.
         --chat-var <NAME=VALUE>  A variable of the model's chat template, such as
                                add_vision_id=true; may be given several times
+        --chat-template-file <FILE>
+                               A chat template (Jinja) that takes the place of the
+                               model file's, for every conversation
+                               [default: the model file's]
+
+    The line of requests.
+        --queue <N>            The most requests that may wait for a sequence while
+                               --parallel run; one more is refused with 503 and
+                               Retry-After [default: no limit, a request waits
+                               until it runs]
 
     Thinking, under the names llama-server gives these. A request can change
     each of them for itself: enable_thinking and the other variables in
@@ -207,6 +252,14 @@ OPTIONS:
 
     -h, --help                 Print this help
 
+    The log.
+        --log-format <text|json>
+                               text: a line for people; json: one JSON object for
+                               every line, for collectors [default: text]
+        --log-file <FILE>      Append the log to this file [default: standard error]
+        --log-text             The prompt and the reply of every request go into the
+                               log as well; without it the log holds neither
+
 The log level is set with the RUST_LOG environment variable (default: info).
 ARES_LIBCUDA names the driver library to load instead of the system's libcuda.so.1.
 ";
@@ -215,6 +268,14 @@ ARES_LIBCUDA names the driver library to load instead of the system's libcuda.so
 pub struct Options {
     pub host: String,
     pub port: u16,
+    /// `--timeout`: how long a client may take to send a request, and to
+    /// take what one write of an answer sent.
+    pub timeout: std::time::Duration,
+    /// Where the log goes and what it holds.
+    pub log: LogOptions,
+    /// Who may use the server, as given: the keys come with those of the
+    /// file, read when the server starts.
+    pub access: AccessOptions,
     /// The preset file of `--models-preset`; without one `load.model` is the
     /// one model to serve.
     pub presets: Option<PathBuf>,
@@ -224,6 +285,80 @@ pub struct Options {
     /// The options of a model as they were given, by their names and in
     /// their order: with a preset file they are set again over every section.
     pub given: Vec<(&'static str, String)>,
+}
+
+/// The options of `--log-format`, `--log-file` and `--log-text`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LogOptions {
+    /// Every line a JSON object.
+    pub json: bool,
+    /// Appended to this file instead of standard error.
+    pub file: Option<PathBuf>,
+    /// The prompt and the reply of every request too.
+    pub text: bool,
+}
+
+/// The options of `--api-key`, `--api-key-file`, `--allowed-hosts` and
+/// `--cors-origins`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AccessOptions {
+    pub keys: Vec<String>,
+    pub key_file: Option<PathBuf>,
+    /// `None`: not given; `Some(None)`: `*`, any name.
+    pub hosts: Option<Option<Vec<String>>>,
+    pub origins: Vec<String>,
+}
+
+impl AccessOptions {
+    /// What the server lets in when it listens on an address that is
+    /// `local` or not: the keys of the option and of the file, and the names
+    /// it answers to.
+    pub fn access(&self, local: bool) -> Result<ares_server::Access, String> {
+        let mut keys = self.keys.clone();
+        if let Some(file) = &self.key_file {
+            let text = std::fs::read_to_string(file).map_err(|e| {
+                format!("cannot read the keys of --api-key-file '{}': {e}", file.display())
+            })?;
+            for (number, line) in text.lines().enumerate() {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+                if line.contains(char::is_whitespace) {
+                    return Err(format!(
+                        "{}:{}: a key has no spaces: write one key on each line",
+                        file.display(),
+                        number + 1
+                    ));
+                }
+                keys.push(line.to_owned());
+            }
+            if keys.is_empty() {
+                return Err(format!(
+                    "--api-key-file '{}' holds no key: a server that is to want keys needs one",
+                    file.display()
+                ));
+            }
+        }
+        // Without names of its own, a server on a local address answers to
+        // its local names, unless keys decide who comes in.
+        let hosts = match &self.hosts {
+            Some(given) => given.clone(),
+            None if local && keys.is_empty() => Some(Vec::new()),
+            None => None,
+        };
+        Ok(ares_server::Access { keys, hosts, origins: self.origins.clone() })
+    }
+}
+
+/// A list of words separated by commas, none of them empty or holding a
+/// space.
+fn words(flag: &'static str, value: &str, expected: &'static str) -> Result<Vec<String>, CliError> {
+    let words: Vec<String> = value.split(',').map(|word| word.trim().to_owned()).collect();
+    if words.iter().any(|word| word.is_empty() || word.contains(char::is_whitespace)) {
+        return Err(CliError::InvalidValue { flag, value: value.to_owned(), expected });
+    }
+    Ok(words)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -244,6 +379,8 @@ pub enum CliError {
     UnexpectedValue(&'static str),
     #[error("'{0}' is not valid UTF-8; options must be text")]
     NotUnicode(String),
+    #[error("{place}: {message}")]
+    Placed { place: String, message: String },
     #[error("option '{flag}': '{value}' is not {expected}")]
     InvalidValue { flag: &'static str, value: String, expected: &'static str },
     #[error("option '{0}' is given twice")]
@@ -279,13 +416,148 @@ fn text(value: OsString) -> Result<String, CliError> {
     value.into_string().map_err(|v| CliError::NotUnicode(v.to_string_lossy().into_owned()))
 }
 
-/// Parses the arguments after the program name. `--name value` and
-/// `--name=value` are both accepted.
+/// The options of the server itself, as [`options::lookup`] has those of a
+/// model: their one name and how they are written. `--config` is not among
+/// them: it names where the others come from.
+fn server_option(name: &str) -> Option<(&'static str, Kind)> {
+    let flag = match name {
+        "--host" => "--host",
+        "--port" => "--port",
+        "--models-preset" => "--models-preset",
+        "--api-key" => "--api-key",
+        "--api-key-file" => "--api-key-file",
+        "--allowed-hosts" => "--allowed-hosts",
+        "--cors-origins" => "--cors-origins",
+        "--timeout" => "--timeout",
+        "--log-format" => "--log-format",
+        "--log-file" => "--log-file",
+        "--log-text" => return Some(("--log-text", Kind::Switch(true))),
+        _ => return None,
+    };
+    Some((flag, Kind::Value))
+}
+
+/// Every option under its one name, server's and model's: what the
+/// environment is asked for.
+fn every_option() -> impl Iterator<Item = &'static str> {
+    options::SERVER
+        .iter()
+        .filter_map(|name| server_option(&format!("--{name}")).map(|(flag, _)| flag))
+        .chain(options::names())
+}
+
+/// The variable of the environment that gives `flag`: `ARES_` and its name in
+/// capitals, with underscores (`--top-p`: `ARES_TOP_P`).
+pub fn variable_of(flag: &str) -> String {
+    format!("ARES_{}", flag.trim_start_matches('-').replace('-', "_").to_ascii_uppercase())
+}
+
+/// What is being read while options are put together.
+struct Reading {
+    host: String,
+    port: u16,
+    timeout: u64,
+    log: LogOptions,
+    access: AccessOptions,
+    presets: Option<PathBuf>,
+    model: ModelOptions,
+    given: Vec<(&'static str, String)>,
+}
+
+impl Reading {
+    /// Sets `flag` (a name of [`server_option`] or [`options::lookup`]) to
+    /// `value`; a switch takes `true` or `false`. A later setting replaces an
+    /// earlier one.
+    fn set(&mut self, flag: &'static str, value: String) -> Result<(), CliError> {
+        let invalid = |expected| CliError::InvalidValue { flag, value: value.clone(), expected };
+        match flag {
+            "--host" => self.host = value,
+            "--port" => {
+                self.port = value.trim().parse().map_err(|_| CliError::InvalidPort(value))?;
+            }
+            "--models-preset" => self.presets = Some(PathBuf::from(value)),
+            "--log-format" => {
+                self.log.json = match value.as_str() {
+                    "text" => false,
+                    "json" => true,
+                    _ => return Err(invalid("text or json")),
+                };
+            }
+            "--log-file" => {
+                if value.trim().is_empty() {
+                    return Err(invalid("a file"));
+                }
+                self.log.file = Some(PathBuf::from(value));
+            }
+            "--log-text" => {
+                self.log.text = match value.as_str() {
+                    "true" => true,
+                    "false" => false,
+                    _ => return Err(invalid("true or false")),
+                };
+            }
+            "--timeout" => {
+                self.timeout = value
+                    .trim()
+                    .parse()
+                    .ok()
+                    .filter(|seconds| *seconds >= 1)
+                    .ok_or_else(|| invalid("a number of seconds, at least 1"))?;
+            }
+            "--api-key" => self.access.keys = words(flag, &value, "keys separated by commas")?,
+            "--api-key-file" => {
+                if value.trim().is_empty() {
+                    return Err(invalid("a file"));
+                }
+                self.access.key_file = Some(PathBuf::from(value));
+            }
+            "--allowed-hosts" => {
+                let names = words(flag, &value, "host names separated by commas, or *")?;
+                self.access.hosts = Some((!names.iter().any(|name| name == "*")).then_some(names));
+            }
+            "--cors-origins" => {
+                let expected = "origins such as https://chat.example.org separated by commas, or *";
+                let origins = words(flag, &value, expected)?;
+                if origins.iter().any(|o| o != "*" && o != "null" && !o.contains("://")) {
+                    return Err(invalid(expected));
+                }
+                self.access.origins =
+                    origins.into_iter().map(|o| o.trim_end_matches('/').to_owned()).collect();
+            }
+            model => {
+                options::set(&mut self.model, model, &value)?;
+                self.given.push((model, value));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// One option as one of the three places gives it.
+struct Given {
+    flag: &'static str,
+    value: String,
+    /// Where it stands, for an error: `None` on the command line.
+    place: Option<String>,
+}
+
+/// Parses the arguments after the program name, with nothing from the
+/// environment. `--name value` and `--name=value` are both accepted.
+#[cfg(test)]
 pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, CliError> {
-    let (mut host, mut port) = ("127.0.0.1".to_owned(), 8000);
-    let mut presets = None;
-    let mut model = ModelOptions::default();
-    let mut given = Vec::new();
+    parse_with(args, &|_| None)
+}
+
+/// Parses the arguments after the program name, the variables of
+/// `environment` (asked by name) and the configuration file that one of the
+/// two names. The command line holds over the environment, and the
+/// environment over the file.
+pub fn parse_with(
+    args: impl IntoIterator<Item = OsString>,
+    environment: &dyn Fn(&str) -> Option<OsString>,
+) -> Result<Command, CliError> {
+    let mut line = Vec::new();
+    let mut config: Option<(PathBuf, Option<String>)> = None;
     let mut seen: Vec<&'static str> = Vec::new();
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
@@ -298,67 +570,174 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, CliErr
         let mut value = |flag: &'static str| {
             inline.clone().or_else(|| args.next()).ok_or(CliError::MissingValue(flag))
         };
-        let flag: &'static str = match name {
+        let (flag, value) = match name {
             "-h" | "--help" => {
                 if inline.is_some() {
                     return Err(CliError::UnexpectedValue("--help"));
                 }
                 return Ok(Command::Help);
             }
-            "--host" => {
-                host = text(value("--host")?)?;
-                "--host"
-            }
-            "--port" => {
-                let value = value("--port")?;
-                let value = value.to_string_lossy();
-                port = value.parse().map_err(|_| CliError::InvalidPort(value.into_owned()))?;
-                "--port"
-            }
-            "--models-preset" => {
-                presets = Some(PathBuf::from(value("--models-preset")?));
-                "--models-preset"
-            }
-            _ => match options::lookup(name) {
-                Some((flag, Kind::Value)) => {
-                    let value = text(value(flag)?)?;
-                    options::set(&mut model, flag, &value)?;
-                    given.push((flag, value));
-                    flag
+            "--config" => {
+                if config.is_some() {
+                    return Err(CliError::Repeated("--config"));
                 }
+                config = Some((PathBuf::from(value("--config")?), None));
+                continue;
+            }
+            _ => match server_option(name).or(options::lookup(name)) {
+                Some((flag, Kind::Value)) => (flag, text(value(flag)?)?),
                 Some((flag, Kind::Switch(on))) => {
                     if inline.is_some() {
                         return Err(CliError::UnexpectedValue(flag));
                     }
-                    let value = if on { "true" } else { "false" };
-                    options::set(&mut model, flag, value)?;
-                    given.push((flag, value.to_owned()));
-                    flag
+                    (flag, on.to_string())
                 }
                 None => return Err(CliError::UnknownOption(whole.to_owned())),
             },
         };
-        if options::repeats(flag) {
-            continue;
-        }
         // A flag that is given twice is a mistake more often than a choice.
-        if seen.contains(&flag) {
-            return Err(CliError::Repeated(flag));
+        if !options::repeats(flag) {
+            if seen.contains(&flag) {
+                return Err(CliError::Repeated(flag));
+            }
+            seen.push(flag);
         }
-        seen.push(flag);
+        line.push(Given { flag, value, place: None });
     }
+
+    // The environment: a variable for every option, and one for the file.
+    let mut environ = Vec::new();
+    for flag in every_option() {
+        let name = variable_of(flag);
+        if let Some(value) = environment(&name) {
+            let value = text(value)?;
+            environ.push(Given { flag, value, place: Some(name) });
+        }
+    }
+    if config.is_none()
+        && let Some(file) = environment("ARES_CONFIG")
+    {
+        config = Some((PathBuf::from(file), Some("ARES_CONFIG".to_owned())));
+    }
+    let file = match &config {
+        Some((path, _)) => read_config(path)?,
+        None => Vec::new(),
+    };
+
+    let mut reading = Reading {
+        host: "127.0.0.1".to_owned(),
+        port: 8000,
+        timeout: 600,
+        log: LogOptions::default(),
+        access: AccessOptions::default(),
+        presets: None,
+        model: ModelOptions::default(),
+        given: Vec::new(),
+    };
+    for Given { flag, value, place } in file.into_iter().chain(environ).chain(line) {
+        reading.set(flag, value).map_err(|error| match place {
+            Some(place) => CliError::Placed { place, message: error.to_string() },
+            None => error,
+        })?;
+    }
+    let Reading { host, port, timeout, log, access, presets, model, given } = reading;
     let named = !model.load.model.as_os_str().is_empty();
     match (named, &presets) {
         (false, None) => return Err(CliError::NoModel),
         (true, Some(_)) => return Err(CliError::ModelAndPresets),
         _ => {}
     }
-    // What stands on the command line holds together; with a preset file the
-    // sections are checked with it when the file is read.
+    // What is given holds together; with a preset file the sections are
+    // checked with it when the file is read.
     model.check()?;
     let ModelOptions { load, reasoning_format, defaults } = model;
-    let options = Options { host, port, presets, load, reasoning_format, defaults, given };
+    let options = Options {
+        host,
+        port,
+        timeout: std::time::Duration::from_secs(timeout),
+        log,
+        access,
+        presets,
+        load,
+        reasoning_format,
+        defaults,
+        given,
+    };
     Ok(Command::Run(Box::new(options)))
+}
+
+/// The options of a configuration file: lines `name = value` with the names
+/// of the command line's options without the dashes, as the keys of a preset
+/// file are written (a switch takes `true` or `false`; `#` and `;` begin a
+/// comment line). A name stands once, unless its option may be given
+/// several times.
+fn read_config(path: &std::path::Path) -> Result<Vec<Given>, CliError> {
+    let place = |line: usize| match line {
+        0 => path.display().to_string(),
+        line => format!("{}:{line}", path.display()),
+    };
+    let fail = |line: usize, message: String| CliError::Placed { place: place(line), message };
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| fail(0, format!("cannot read the configuration file: {e}")))?;
+    let mut given: Vec<Given> = Vec::new();
+    let mut lines: Vec<(&'static str, usize)> = Vec::new();
+    for (index, raw) in text.lines().enumerate() {
+        let (number, line) = (index + 1, raw.trim());
+        if line.is_empty() || line.starts_with(';') || line.starts_with('#') {
+            continue;
+        }
+        if line.starts_with('[') {
+            return Err(fail(
+                number,
+                "a configuration file has no sections: the models of several go in a preset \
+                 file (models-preset = <file.ini>)"
+                    .into(),
+            ));
+        }
+        let Some((name, value)) = line.split_once('=') else {
+            return Err(fail(number, format!("'{line}' is not an option: write name = value")));
+        };
+        let (name, value) = (name.trim(), value.trim());
+        let dashed = format!("--{name}");
+        let (flag, value) = match server_option(&dashed).or(options::lookup(&dashed)) {
+            Some((flag, Kind::Value)) => (flag, value.to_owned()),
+            Some((flag, Kind::Switch(true))) => match value {
+                "true" | "false" => (flag, value.to_owned()),
+                other => {
+                    return Err(fail(number, format!("{name} = '{other}': write true or false")));
+                }
+            },
+            Some((flag, Kind::Switch(false))) => {
+                return Err(fail(
+                    number,
+                    format!(
+                        "'{name}' is the command line's way to switch {0} off: write {0} = false",
+                        flag.trim_start_matches('-')
+                    ),
+                ));
+            }
+            None if name == "config" => {
+                return Err(fail(number, "a configuration file does not name another".into()));
+            }
+            None if name == "help" => {
+                return Err(fail(number, "'help' is not an option to keep in a file".into()));
+            }
+            None => {
+                return Err(fail(
+                    number,
+                    format!("Ares has no option '{name}' ('ares --help' lists the options)"),
+                ));
+            }
+        };
+        if !options::repeats(flag)
+            && let Some((_, first)) = lines.iter().find(|(known, _)| *known == flag)
+        {
+            return Err(fail(number, format!("'{name}' stands twice (first at line {first})")));
+        }
+        lines.push((flag, number));
+        given.push(Given { flag, value, place: Some(place(number)) });
+    }
+    Ok(given)
 }
 
 #[cfg(test)]
@@ -713,6 +1092,228 @@ mod tests {
     fn a_value_may_look_like_a_flag() {
         // `--model --odd.gguf` is a path, not a missing value: the flag asked for one.
         assert_eq!(run(&["--model", "--odd.gguf"]).load.model, PathBuf::from("--odd.gguf"));
+    }
+
+    /// A file of `text` in the temporary directory, named for the test.
+    fn file(name: &str, text: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!("ares-cli-{}-{name}", std::process::id()));
+        std::fs::write(&path, text).unwrap();
+        path
+    }
+
+    fn with(args: &[&str], variables: &[(&str, &str)]) -> Result<Command, CliError> {
+        let variables: Vec<(String, String)> =
+            variables.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect();
+        let environment = move |name: &str| {
+            variables.iter().find(|(known, _)| known == name).map(|(_, v)| OsString::from(v))
+        };
+        parse_with(args.iter().map(OsString::from), &environment)
+    }
+
+    fn run_with(args: &[&str], variables: &[(&str, &str)]) -> Options {
+        match with(args, variables) {
+            Ok(Command::Run(options)) => *options,
+            other => panic!("{args:?} {variables:?}: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn every_option_is_also_a_variable_of_the_environment() {
+        assert_eq!(variable_of("--top-p"), "ARES_TOP_P");
+        assert_eq!(variable_of("--models-preset"), "ARES_MODELS_PRESET");
+        let options = run_with(
+            &[],
+            &[
+                ("ARES_MODEL", "/models/m.gguf"),
+                ("ARES_CONTEXT", "4096"),
+                ("ARES_TOP_P", "0.9"),
+                ("ARES_REASONING_PRESERVE", "false"),
+                ("ARES_CHAT_VAR", "depth=3"),
+                ("ARES_PORT", "9000"),
+                ("ARES_HOST", "0.0.0.0"),
+                ("ARES_API_KEY", "k1,k2"),
+                ("ARES_CORS_ORIGINS", "https://chat.example.org"),
+            ],
+        );
+        assert_eq!(options.load.model, PathBuf::from("/models/m.gguf"));
+        assert_eq!(options.load.context, Some(4096));
+        assert_eq!(options.defaults.sampling.top_p, Some(0.9));
+        assert_eq!(variable(&options.load, "preserve_reasoning"), Some(Json::Bool(false)));
+        assert_eq!(variable(&options.load, "depth"), Some(Json::Int(3)));
+        assert_eq!((options.host.as_str(), options.port), ("0.0.0.0", 9000));
+        assert_eq!(options.access.keys, ["k1", "k2"]);
+        assert_eq!(options.access.origins, ["https://chat.example.org"]);
+        // A name without the prefix is never read: the shell here has CTX.
+        let options = run_with(&["--model=m"], &[("CTX", "4096"), ("CONTEXT", "4096")]);
+        assert_eq!(options.load.context, None);
+        // A value a variable gives is checked like one of the command line.
+        let error = with(&["--model=m"], &[("ARES_CONTEXT", "0")]).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "ARES_CONTEXT: option '--context': '0' is not a number of tokens, at least 1"
+        );
+    }
+
+    #[test]
+    fn the_command_line_holds_over_the_environment_and_that_over_the_file() {
+        let config = file("order.ini", "model = /m.gguf\ncontext = 1000\ntemperature = 0.5\n");
+        let path = config.to_str().unwrap();
+        let only_file = run_with(&["--config", path], &[]);
+        assert_eq!(only_file.load.context, Some(1000));
+        assert_eq!(only_file.defaults.sampling.temperature, Some(0.5));
+        let environment = [("ARES_CONTEXT", "2000")];
+        assert_eq!(run_with(&["--config", path], &environment).load.context, Some(2000));
+        let options = run_with(&["--config", path, "--context", "3000"], &environment);
+        assert_eq!(options.load.context, Some(3000));
+        assert_eq!(options.defaults.sampling.temperature, Some(0.5), "what only the file says");
+        // The file may also be named by the environment.
+        let options = run_with(&[], &[("ARES_CONFIG", path)]);
+        assert_eq!(options.load.context, Some(1000));
+        // With a preset file the options of a model are kept in that order,
+        // to hold over its sections.
+        let config = file("given.ini", "models-preset = /p.ini\ncontext = 1000\n");
+        let options = run_with(
+            &["--config", config.to_str().unwrap(), "--context=3000"],
+            &[("ARES_CONTEXT", "2000")],
+        );
+        assert_eq!(options.presets, Some(PathBuf::from("/p.ini")));
+        let given = [("--context", "1000"), ("--context", "2000"), ("--context", "3000")];
+        let given: Vec<_> = given.iter().map(|(f, v)| (*f, (*v).to_owned())).collect();
+        assert_eq!(options.given, given);
+    }
+
+    #[test]
+    fn a_configuration_file_has_the_keys_of_a_preset_file() {
+        let config = file(
+            "keys.ini",
+            "; a comment\n# another\nmodel = /m.gguf\nhost = 0.0.0.0\nport = 8080\n\
+             api-key-file = /etc/ares/keys\nchat-var = a=1\nchat-var = b=2\n\
+             reasoning-preserve = false\nmax-tokens = 4096\n",
+        );
+        let options = run_with(&["--config", config.to_str().unwrap()], &[]);
+        assert_eq!((options.host.as_str(), options.port), ("0.0.0.0", 8080));
+        assert_eq!(options.access.key_file, Some(PathBuf::from("/etc/ares/keys")));
+        assert_eq!(variable(&options.load, "a"), Some(Json::Int(1)));
+        assert_eq!(variable(&options.load, "b"), Some(Json::Int(2)));
+        assert_eq!(variable(&options.load, "preserve_reasoning"), Some(Json::Bool(false)));
+        assert_eq!(options.defaults.max_tokens, Some(4096));
+
+        for (text, says) in [
+            ("model = /m.gguf\ncontxt = 1\n", ":2: Ares has no option 'contxt'"),
+            (
+                "model = /m.gguf\ncontext = 1\ncontext = 2\n",
+                ":3: 'context' stands twice (first at line 2)",
+            ),
+            ("[m]\nmodel = /m.gguf\n", ":1: a configuration file has no sections"),
+            ("model /m.gguf\n", ":1: 'model /m.gguf' is not an option"),
+            (
+                "model = /m.gguf\nno-reasoning-preserve = true\n",
+                ":2: 'no-reasoning-preserve' is the command line's way",
+            ),
+            (
+                "model = /m.gguf\nreasoning-preserve = yes\n",
+                ":2: reasoning-preserve = 'yes': write true or false",
+            ),
+            ("config = /other.ini\n", ":1: a configuration file does not name another"),
+            (
+                "model = /m.gguf\ncontext = 0\n",
+                ":2: option '--context': '0' is not a number of tokens",
+            ),
+            ("model = /m.gguf\nport = http\n", ":2: 'http' is not a valid port"),
+        ] {
+            let config = file("bad.ini", text);
+            let said = with(&["--config", config.to_str().unwrap()], &[]).unwrap_err().to_string();
+            assert!(said.starts_with(config.to_str().unwrap()), "{said}");
+            assert!(said.contains(says), "{text}: {said}");
+        }
+        let said = with(&["--config", "/nowhere/ares.ini"], &[]).unwrap_err().to_string();
+        assert!(
+            said.starts_with("/nowhere/ares.ini: cannot read the configuration file"),
+            "{said}"
+        );
+        assert_eq!(with(&["--config=a", "--config=b"], &[]), Err(CliError::Repeated("--config")));
+    }
+
+    #[test]
+    fn the_server_s_options_of_access() {
+        let options = run(&[
+            "--model=m",
+            "--api-key",
+            "one, two",
+            "--allowed-hosts=gpu.lan,ares.example",
+            "--cors-origins",
+            "https://chat.example.org/,https://chat.example",
+        ]);
+        let access = &options.access;
+        assert_eq!(access.keys, ["one", "two"]);
+        assert_eq!(access.hosts, Some(Some(vec!["gpu.lan".to_owned(), "ares.example".to_owned()])));
+        assert_eq!(access.origins, ["https://chat.example.org", "https://chat.example"]);
+        assert_eq!(run(&["--model=m", "--allowed-hosts", "*"]).access.hosts, Some(None));
+        for (args, flag) in [
+            (&["--api-key", "a,,b"][..], "--api-key"),
+            (&["--api-key", "a b"], "--api-key"),
+            (&["--allowed-hosts", ""], "--allowed-hosts"),
+            (&["--cors-origins", "chat.example.org"], "--cors-origins"),
+            (&["--api-key-file", " "], "--api-key-file"),
+        ] {
+            match parse_strs(args) {
+                Err(CliError::InvalidValue { flag: named, .. }) => assert_eq!(named, flag),
+                other => panic!("{args:?}: {other:?}"),
+            }
+        }
+
+        // What the server lets in: a local address without keys answers to
+        // its local names only; keys decide on their own; names that are
+        // given hold everywhere.
+        let open = AccessOptions::default();
+        assert_eq!(open.access(true).unwrap().hosts, Some(Vec::new()));
+        assert_eq!(open.access(false).unwrap().hosts, None);
+        let keyed = AccessOptions { keys: vec!["k".into()], ..AccessOptions::default() };
+        assert_eq!(keyed.access(true).unwrap().hosts, None);
+        let named = AccessOptions { hosts: Some(Some(vec!["gpu.lan".into()])), ..keyed.clone() };
+        assert_eq!(named.access(false).unwrap().hosts, Some(vec!["gpu.lan".to_owned()]));
+        let keys = file("keys.txt", "# the keys\nfrom-file\n\n  second  \n");
+        let both = AccessOptions { key_file: Some(keys), ..keyed };
+        assert_eq!(both.access(true).unwrap().keys, ["k", "from-file", "second"]);
+        let empty = file("empty-keys.txt", "# none\n");
+        let error = AccessOptions { key_file: Some(empty), ..AccessOptions::default() }
+            .access(true)
+            .unwrap_err();
+        assert!(error.contains("holds no key"), "{error}");
+    }
+
+    #[test]
+    fn the_log_and_the_timeout_are_options_of_the_server() {
+        let options = run(&["--model=m"]);
+        assert_eq!(options.log, LogOptions::default());
+        assert_eq!(options.timeout, std::time::Duration::from_secs(600));
+        let options = run(&[
+            "--model=m",
+            "--log-format",
+            "json",
+            "--log-file=/var/log/ares.log",
+            "--log-text",
+            "--timeout",
+            "30",
+        ]);
+        let log = LogOptions { json: true, file: Some("/var/log/ares.log".into()), text: true };
+        assert_eq!(options.log, log);
+        assert_eq!(options.timeout, std::time::Duration::from_secs(30));
+        for (args, flag) in [
+            (&["--log-format", "yaml"][..], "--log-format"),
+            (&["--log-file", ""], "--log-file"),
+            (&["--timeout", "0"], "--timeout"),
+            (&["--timeout", "soon"], "--timeout"),
+        ] {
+            match parse_strs(args) {
+                Err(CliError::InvalidValue { flag: named, .. }) => assert_eq!(named, flag),
+                other => panic!("{args:?}: {other:?}"),
+            }
+        }
+        assert_eq!(parse_strs(&["--log-text=yes"]), Err(CliError::UnexpectedValue("--log-text")));
+        // A switch in the environment says true or false.
+        let options = run_with(&["--model=m"], &[("ARES_LOG_TEXT", "true")]);
+        assert!(options.log.text);
     }
 
     #[test]

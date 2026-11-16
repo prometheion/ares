@@ -456,15 +456,23 @@ impl SyntheticModel {
     fn render(prompt: &Prompt) -> String {
         match prompt {
             Prompt::Text(text) => text.clone(),
-            Prompt::Chat { messages, .. } => {
+            Prompt::Chat { messages, continue_final, .. } => {
+                // A message to continue is the start of the reply.
+                let (before, last) = match messages.split_last() {
+                    Some((last, before)) if *continue_final => (before, Some(last)),
+                    _ => (&messages[..], None),
+                };
                 let mut text = String::new();
-                for message in messages {
+                for message in before {
                     text.push_str(message.role.as_str());
                     text.push_str(": ");
                     text.push_str(&message.content);
                     text.push('\n');
                 }
                 text.push_str("assistant: ");
+                if let Some(last) = last {
+                    text.push_str(&last.content);
+                }
                 text
             }
         }
@@ -1304,6 +1312,7 @@ mod tests {
             messages: vec![Message::new(Role::User, "hi")],
             tools: None,
             variables: Vec::new(),
+            continue_final: false,
         };
         let tokens = model.encode(&prompt).unwrap();
         let text: String = tokens.iter().map(|t| char::from(*t as u8)).collect();

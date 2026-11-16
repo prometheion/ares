@@ -37,6 +37,13 @@ pub enum Prompt {
         /// (`chat_template_kwargs`): they come on top of the ones the engine
         /// was started with and win over them.
         variables: Vec<(String, Json)>,
+        /// The last message is the assistant's, and the reply continues it:
+        /// the prompt ends with the text of that message as the template
+        /// writes it, and not with the end of its turn and the start of a new
+        /// one. With an empty content and some reasoning, the prompt ends
+        /// inside the reasoning, which the reply continues.
+        #[serde(default)]
+        continue_final: bool,
     },
     /// Text to continue as it is: no template, no added roles. Special tokens
     /// the model needs (a beginning-of-text token, say) are still the
@@ -88,6 +95,7 @@ mod tests {
                     Json::String("function".into()),
                 )])]),
                 variables: vec![("enable_thinking".into(), Json::Bool(false))],
+                continue_final: true,
             },
             sampling: Sampling { seed: Some(7), ..Sampling::default() },
             max_tokens: Some(16),

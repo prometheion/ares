@@ -123,11 +123,22 @@ pub struct ChatOptions {
     /// of the same name that this module sets, except `bos_token` and
     /// `eos_token`.
     pub variables: Vec<(String, Json)>,
+    /// A template that takes the place of the model file's, for every
+    /// conversation, with tools or without ([`Tokenizer::compile_template`]
+    /// makes one). `None`: the file's.
+    ///
+    /// [`Tokenizer::compile_template`]: crate::Tokenizer::compile_template
+    pub template: Option<std::sync::Arc<ChatTemplate>>,
 }
 
 impl Default for ChatOptions {
     fn default() -> Self {
-        Self { add_generation_prompt: true, enable_thinking: true, variables: Vec::new() }
+        Self {
+            add_generation_prompt: true,
+            enable_thinking: true,
+            variables: Vec::new(),
+            template: None,
+        }
     }
 }
 
@@ -165,6 +176,15 @@ pub struct ChatTemplate {
     source: String,
     bos_token: String,
     eos_token: String,
+}
+
+impl PartialEq for ChatTemplate {
+    /// Two templates are the same when they are the same text with the same
+    /// special tokens.
+    fn eq(&self, other: &Self) -> bool {
+        (&self.source, &self.bos_token, &self.eos_token)
+            == (&other.source, &other.bos_token, &other.eos_token)
+    }
 }
 
 impl std::fmt::Debug for ChatTemplate {

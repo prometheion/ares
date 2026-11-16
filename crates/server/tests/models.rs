@@ -952,7 +952,7 @@ fn the_binary_serves_a_preset_file_lists_a_failed_load_and_stops_in_order() {
         stream.set_read_timeout(Some(Duration::from_secs(60))).unwrap();
         write!(
             stream,
-            "{method} {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\
+            "{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\
              Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
             body.len()
         )

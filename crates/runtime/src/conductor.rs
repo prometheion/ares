@@ -101,8 +101,8 @@ use crate::exec::{Clock, ExecError, Executor, StepMeta, StepOutput};
 use crate::model::{ContextSpec, Model};
 use crate::record::{self, Commit, RecordWriter, Row, TableUpdate};
 use crate::sampling::{Context, RequestSampler, StepRows, TokenFilter};
-use crate::text::StopMatcher;
 use crate::timing::{Calibration, DRAFT_POSITIONS, Phase, RequestReport, Snapshot, Stats};
+use crate::watch::Watch;
 
 /// The drafters, as the choice of a window numbers them: the lookup in earlier
 /// text, which costs nothing to ask, and the model's own draft block, whose
@@ -178,7 +178,8 @@ pub(crate) struct Submission {
     pub id: RequestId,
     pub prompt: Vec<u32>,
     pub max_tokens: Option<u32>,
-    pub stop: Vec<String>,
+    /// The stop strings, and what else is watched in the reply's text.
+    pub stop: Watch,
     /// How the request's tokens are picked.
     pub sampling: Sampling,
     /// Whether drafts may be verified for the request.
@@ -275,7 +276,7 @@ struct Active {
     /// How the sequence's tokens are picked, and what that keeps from step
     /// to step.
     sampler: RequestSampler,
-    stop: StopMatcher,
+    stop: Watch,
     max_tokens: Option<u32>,
     completion: u32,
     waited_steps: u32,
@@ -311,6 +312,8 @@ impl Active {
             completion_tokens: self.completion,
             cached_prompt_tokens: self.cached_prompt,
             output_hash: token_hash(&self.tokens[self.prompt_len as usize..]),
+            reasoning_tokens: self.stop.reasoning_tokens(),
+            queued: self.stop.queued(),
         }
     }
 
@@ -348,6 +351,7 @@ impl Active {
     ) {
         for (i, &token) in picked.iter().enumerate() {
             self.completion += 1;
+            self.stop.token();
             if model.ends(token) {
                 self.stop.flush(&mut self.emitted);
                 self.sampler.reply_ended();
@@ -365,7 +369,7 @@ impl Active {
             }
             let (stop, emitted) = (&mut self.stop, &mut self.emitted);
             if take_characters(&mut self.pending, |ch| stop.push(ch, emitted)) {
-                self.finished = Some(FinishReason::Stop);
+                self.finished = Some(self.stop.finish());
                 return;
             }
             if self.max_tokens.is_some_and(|max| self.completion >= max)
@@ -1033,7 +1037,7 @@ impl Conductor {
             own_acceptance: Acceptance::new(self.config.window_rows as usize, 0.95),
             draft_allowed: draft,
             sampler,
-            stop: StopMatcher::new(&stop),
+            stop,
             max_tokens,
             completion: 0,
             waited_steps: 0,
@@ -1102,6 +1106,7 @@ impl Conductor {
             return;
         };
         let mut a = self.waiting.swap_remove(i);
+        a.stop.started();
         if let (Some(cache), Some(probe)) = (&mut self.cache, probe) {
             let counters = &mut self.stats.counters;
             let Resume { cached_cells: cached, restore, replay, .. } = probe.resume;

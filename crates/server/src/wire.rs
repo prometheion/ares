@@ -169,7 +169,13 @@ fn refuse_unserved(endpoint: Endpoint, fields: &Fields<'_>) -> Result<(), ApiErr
         let name = name.as_str();
         let own = match endpoint {
             Endpoint::Chat => {
-                ["messages", "max_completion_tokens"].contains(&name)
+                [
+                    "messages",
+                    "max_completion_tokens",
+                    "continue_final_message",
+                    "add_generation_prompt",
+                ]
+                .contains(&name)
                     || reasoning::FIELDS.contains(&name)
                     || tools::FIELDS.contains(&name)
             }
@@ -762,7 +768,61 @@ fn chat_prompt(fields: &Fields<'_>) -> Result<Prompt, ApiError> {
         Some(Json::Array(tools)) => Some(tools.clone()),
         Some(other) => return Err(wrong_type("tools", "an array", other)),
     };
-    Ok(Prompt::Chat { messages, tools, variables: Vec::new() })
+    let continue_final = continues(fields, &messages)?;
+    Ok(Prompt::Chat { messages, tools, variables: Vec::new(), continue_final })
+}
+
+/// Whether the reply continues the last message of the conversation: when it
+/// is the assistant's, as llama-server prefills it, and as a request says
+/// with vLLM's `continue_final_message` (or `add_generation_prompt: false`,
+/// which vLLM asks to go with it). A last message that calls tools begins a
+/// turn of its own unless the request asks to continue it, which is refused:
+/// what follows calls are their results.
+fn continues(fields: &Fields<'_>, messages: &[Message]) -> Result<bool, ApiError> {
+    let last = messages.last().filter(|message| message.role == Role::Assistant);
+    let calls = last.is_some_and(|message| message.tool_calls.is_some());
+    let continues = match (
+        fields.bool("continue_final_message")?,
+        fields.bool("add_generation_prompt")?,
+    ) {
+        (Some(true), Some(true)) => {
+            return Err(ApiError::invalid_param(
+                "continue_final_message",
+                "continue_final_message and add_generation_prompt cannot both be true: a reply \
+                 continues the last message or begins a turn of its own",
+            ));
+        }
+        (Some(false), Some(false)) => {
+            return Err(ApiError::invalid_param(
+                "add_generation_prompt",
+                "add_generation_prompt false asks for a prompt that ends with a closed turn and \
+                 no start of the reply, which is not served: a reply continues the last message \
+                 (continue_final_message) or begins a turn of its own",
+            ));
+        }
+        (Some(asked), _) => asked,
+        (None, Some(generation)) => !generation,
+        (None, None) => last.is_some() && !calls,
+    };
+    let name = if fields.get("continue_final_message").is_some() {
+        "continue_final_message"
+    } else {
+        "add_generation_prompt"
+    };
+    if continues && last.is_none() {
+        return Err(ApiError::invalid_param(
+            name,
+            "the last message is not the assistant's: there is no message to continue",
+        ));
+    }
+    if continues && calls {
+        return Err(ApiError::invalid_param(
+            name,
+            "the last message calls tools, which a reply cannot continue: send the results of \
+             the calls as messages of the role tool",
+        ));
+    }
+    Ok(continues)
 }
 
 fn message(index: usize, value: &Json) -> Result<Message, ApiError> {
@@ -968,6 +1028,7 @@ impl Head {
         text: &'a Split,
         calls: &'a [Call],
         finish: &'static str,
+        stop: Option<&'a str>,
         probs: &[TokenProbs],
     ) -> Choice<'a> {
         let logprobs = self.logprobs_value(probs, 0);
@@ -993,6 +1054,7 @@ impl Head {
                 delta: None,
                 logprobs,
                 finish_reason: Some(finish),
+                stop_reason: stop,
             },
             Endpoint::Completions => Choice {
                 index: self.index,
@@ -1001,6 +1063,7 @@ impl Head {
                 delta: None,
                 logprobs,
                 finish_reason: Some(finish),
+                stop_reason: stop,
             },
         }
     }
@@ -1031,7 +1094,15 @@ impl Head {
         text: Option<&'a str>,
         finish_reason: Option<&'static str>,
     ) -> Choice<'a> {
-        Choice { index: self.index, message: None, text, delta, logprobs: None, finish_reason }
+        Choice {
+            index: self.index,
+            message: None,
+            text,
+            delta,
+            logprobs: None,
+            finish_reason,
+            stop_reason: None,
+        }
     }
 
     /// The first chunk of a chat stream: it announces the role.
@@ -1083,13 +1154,19 @@ impl Head {
         self.render(true, vec![self.chunk_choice(Some(delta), None, None)], None, None)
     }
 
-    /// The last chunk of the text: carries `finish_reason`, the timings and
-    /// no content.
-    pub fn finish_chunk(&self, finish: &'static str, timings: Timings) -> String {
-        let choice = match self.endpoint {
+    /// The last chunk of the text: carries `finish_reason` (and the stop
+    /// string that ended the reply, if one did), the timings and no content.
+    pub fn finish_chunk(
+        &self,
+        finish: &'static str,
+        stop: Option<&str>,
+        timings: Timings,
+    ) -> String {
+        let mut choice = match self.endpoint {
             Endpoint::Chat => self.chunk_choice(Some(Delta::default()), None, Some(finish)),
             Endpoint::Completions => self.chunk_choice(None, Some(""), Some(finish)),
         };
+        choice.stop_reason = stop;
         self.render(true, vec![choice], None, Some(timings))
     }
 
@@ -1261,6 +1338,10 @@ pub(crate) struct Choice<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     logprobs: Option<serde_json::Value>,
     finish_reason: Option<&'static str>,
+    /// The stop string that ended the reply, under vLLM's name; only when
+    /// one did.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stop_reason: Option<&'a str>,
 }
 
 #[derive(Serialize)]
@@ -1328,11 +1409,19 @@ struct UsageBody {
     completion_tokens: u32,
     total_tokens: u64,
     prompt_tokens_details: PromptDetails,
+    /// The tokens of the thinking, for a model that thinks.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    completion_tokens_details: Option<CompletionDetails>,
 }
 
 #[derive(Serialize)]
 struct PromptDetails {
     cached_tokens: u32,
+}
+
+#[derive(Serialize)]
+struct CompletionDetails {
+    reasoning_tokens: u32,
 }
 
 impl From<Usage> for UsageBody {
@@ -1342,6 +1431,9 @@ impl From<Usage> for UsageBody {
             completion_tokens: usage.completion_tokens,
             total_tokens: u64::from(usage.prompt_tokens) + u64::from(usage.completion_tokens),
             prompt_tokens_details: PromptDetails { cached_tokens: usage.cached_prompt_tokens },
+            completion_tokens_details: usage
+                .reasoning_tokens
+                .map(|reasoning_tokens| CompletionDetails { reasoning_tokens }),
         }
     }
 }

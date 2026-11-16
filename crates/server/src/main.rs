@@ -25,7 +25,10 @@ use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    let options = match cli::parse(std::env::args_os().skip(1)) {
+    // Only the variables of Ares' own options are read (`ARES_CONTEXT`), never
+    // a name without the prefix.
+    let environment = |name: &str| std::env::var_os(name);
+    let options = match cli::parse_with(std::env::args_os().skip(1), &environment) {
         Ok(cli::Command::Run(options)) => *options,
         Ok(cli::Command::Help) => {
             print!("{}", cli::USAGE);
@@ -39,7 +42,18 @@ async fn main() -> ExitCode {
     // One model on the command line is the one preset of a server without a
     // preset file. A file that cannot be served is refused here, with its
     // line, before anything is started.
-    let cli::Options { host, port, presets, load, reasoning_format, defaults, given } = options;
+    let cli::Options {
+        host,
+        port,
+        timeout,
+        log,
+        access,
+        presets,
+        load,
+        reasoning_format,
+        defaults,
+        given,
+    } = options;
     let (presets, single) = match &presets {
         Some(file) => match Presets::read(file, &given) {
             Ok(presets) => (presets, None),
@@ -55,17 +69,12 @@ async fn main() -> ExitCode {
         }
     };
 
-    // Logs go to stderr: stdout is for output a user asks for, like --help.
-    // Colors only on a terminal, so that a log file or journal stays plain text.
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .with_writer(std::io::stderr)
-        .with_ansi(std::io::stderr().is_terminal())
-        .init();
+    if let Err(error) = start_log(&log) {
+        eprintln!("error: {error}");
+        return ExitCode::from(2);
+    }
 
-    match run(&host, port, presets, single).await {
+    match run(&host, port, timeout, log.text, &access, presets, single).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(message) => {
             tracing::error!("{message}");
@@ -74,9 +83,41 @@ async fn main() -> ExitCode {
     }
 }
 
+/// Where the log goes: standard error (stdout is for output a user asks for,
+/// like --help), or the file of `--log-file`; as text, with colors only on a
+/// terminal so that a log file or journal stays plain, or as JSON.
+fn start_log(log: &cli::LogOptions) -> Result<(), String> {
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let builder = tracing_subscriber::fmt().with_env_filter(filter);
+    let file = match &log.file {
+        Some(path) => Some(
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .map_err(|e| format!("cannot open the log file '{}': {e}", path.display()))?,
+        ),
+        None => None,
+    };
+    match (file, log.json) {
+        (Some(file), true) => builder.json().with_writer(std::sync::Mutex::new(file)).init(),
+        (Some(file), false) => {
+            builder.with_ansi(false).with_writer(std::sync::Mutex::new(file)).init();
+        }
+        (None, true) => builder.json().with_writer(std::io::stderr).init(),
+        (None, false) => {
+            builder.with_writer(std::io::stderr).with_ansi(std::io::stderr().is_terminal()).init()
+        }
+    }
+    Ok(())
+}
+
 async fn run(
     host: &str,
     port: u16,
+    timeout: std::time::Duration,
+    log_text: bool,
+    access: &cli::AccessOptions,
     presets: Presets,
     single: Option<String>,
 ) -> Result<(), String> {
@@ -90,6 +131,15 @@ async fn run(
         .map_err(|e| format!("cannot listen on {host}:{port}: {e}"))?;
     let address =
         listener.local_addr().map_err(|e| format!("cannot read the listen address: {e}"))?;
+    let access = access.access(address.ip().is_loopback())?;
+    if access.keys.is_empty() && !address.ip().is_loopback() {
+        tracing::warn!(
+            %address,
+            "the server listens beyond this machine and wants no key: anyone who reaches the \
+             port can use it (--api-key, --api-key-file)"
+        );
+    }
+    let config = Config { access, timeout, log_text, ..Config::default() };
 
     // The most RAM of all loaded models together, when nobody names it: all
     // the machine has. The engines hold what is available below it.
@@ -160,7 +210,7 @@ async fn run(
     let served = serve_models(
         listener,
         models.clone(),
-        Config::default(),
+        config,
         async {
             let _ = drained.await;
         },

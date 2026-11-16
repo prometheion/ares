@@ -753,6 +753,29 @@ pub fn load(options: &LoadOptions) -> Result<Loaded, LoadError> {
     load_at(options, &alone(options))
 }
 
+/// The settings a model renders conversations with: the variables of the
+/// chat template, and the template of `--chat-template-file` in place of the
+/// file's, compiled with the model's tokenizer. Also the text of the template
+/// that is in effect, if there is one.
+pub(crate) fn chat_options(
+    options: &LoadOptions,
+    tokenizer: &ares_tokenizer::Tokenizer,
+) -> Result<(ChatOptions, Option<String>), LoadError> {
+    let mut chat =
+        ChatOptions { variables: options.chat_variables.clone(), ..ChatOptions::default() };
+    let Some(path) = &options.chat_template else {
+        return Ok((chat, tokenizer.chat_template_source().map(str::to_owned)));
+    };
+    let failed = |what: String| {
+        LoadError::Options(format!("--chat-template-file '{}': {what}", path.display()))
+    };
+    let source = std::fs::read_to_string(path).map_err(|e| failed(e.to_string()))?;
+    let template = tokenizer.compile_template(&source).map_err(|e| failed(e.to_string()))?;
+    tracing::info!(file = %path.display(), "the chat template of the file takes the place of the model's");
+    chat.template = Some(Arc::new(template));
+    Ok((chat, Some(source)))
+}
+
 /// [`load`] at `site`: next to other models of this server, a model that
 /// finds too little room is not loaded with what there is but refused with
 /// [`LoadError::NoRoom`], before its weights are read, so that one of the
@@ -1134,14 +1157,12 @@ fn load_qwen35(
 
     // Load.
     let name = options.name.clone().unwrap_or_else(|| crate::preset::id_of_file(&options.model));
-    let chat = ChatOptions { variables: options.chat_variables.clone(), ..ChatOptions::default() };
     drop(weights);
-    let model = Arc::new(
-        Qwen35::new(gguf, name.clone(), &spread, part_options, longest)
-            .map_err(|e| LoadError::Model(e.to_string()))?
-            .with_chat_options(chat),
-    );
-    if !model.tokenizer().has_chat_template() {
+    let model = Qwen35::new(gguf, name.clone(), &spread, part_options, longest)
+        .map_err(|e| LoadError::Model(e.to_string()))?;
+    let (chat, template) = chat_options(options, model.tokenizer())?;
+    let model = Arc::new(model.with_chat_options(chat));
+    if template.is_none() {
         tracing::warn!(
             "the model file has no chat template: /v1/chat/completions will refuse requests, \
              /v1/completions works"
@@ -1204,6 +1225,7 @@ fn load_qwen35(
         pages,
         cells_per_page: CELLS_PER_PAGE,
         max_slots: parallel,
+        queue: options.queue,
         window_rows: if mtp { window } else { 1 },
         cache_ram: lockable - required,
         ssd: ssd.clone(),
@@ -1275,6 +1297,7 @@ fn load_qwen35(
         // The estimate was too low: next to other models that is no room.
         if short_of_memory { short(site, error) } else { error }
     })?;
+    let runtime = runtime.with_chat_template(template);
     tracing::info!(
         "loaded in {:.1} s ({:.1} s since the start)",
         loading.elapsed().as_secs_f64(),

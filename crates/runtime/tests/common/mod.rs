@@ -491,7 +491,8 @@ pub fn requests_end_for_the_right_reason(rt: &Runtime, context_length: u32) {
                 prompt_tokens: 8,
                 completion_tokens: 25,
                 cached_prompt_tokens: 0,
-                output_hash: ares_runtime::token_hash(&tokens)
+                output_hash: ares_runtime::token_hash(&tokens),
+                ..Usage::default()
             }
         )
     );
@@ -561,6 +562,7 @@ pub fn the_end_token_ends_a_request_where_it_first_comes_up(make: &dyn Fn(Option
                     .map(|c| u32::from(ares_runtime::unprintable(*c).expect("a token")))
                     .collect::<Vec<_>>(),
             ),
+            ..Usage::default()
         },
         probs: Vec::new(),
     };

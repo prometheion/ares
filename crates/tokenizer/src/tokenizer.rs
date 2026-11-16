@@ -530,6 +530,30 @@ impl Tokenizer {
         self.chat.is_some() || self.chat_tool_use.is_some()
     }
 
+    /// The text of the model file's chat template: the default one, else the
+    /// one for conversations with tools.
+    pub fn chat_template_source(&self) -> Option<&str> {
+        let template = self.chat.as_ref().or(self.chat_tool_use.as_ref())?.as_ref().ok()?;
+        Some(template.source())
+    }
+
+    /// Compiles `source` as a chat template of this model, with the texts of
+    /// its beginning and end tokens: a template that takes the place of the
+    /// file's ([`ChatOptions::template`]).
+    ///
+    /// # Errors
+    ///
+    /// Those of [`ChatTemplate::new`].
+    pub fn compile_template(&self, source: &str) -> std::result::Result<ChatTemplate, ChatError> {
+        let text_of = |id: Option<u32>| {
+            id.and_then(|id| self.piece(id, true).ok())
+                .map(|piece| String::from_utf8_lossy(piece).into_owned())
+                .unwrap_or_default()
+        };
+        let special = &self.vocab.special;
+        ChatTemplate::new(source, &text_of(special.bos), &text_of(special.eos))
+    }
+
     /// How the model's chat template handles thinking, or `None` if it has
     /// none (or no chat template, or one that cannot be used).
     pub fn reasoning_format(&self) -> Option<ReasoningFormat> {
@@ -568,13 +592,15 @@ impl Tokenizer {
         tools: &[Tool],
         options: &ChatOptions,
     ) -> std::result::Result<String, ChatError> {
-        let template = match (&self.chat_tool_use, &self.chat) {
-            (Some(tool_use), _) if !tools.is_empty() => tool_use,
-            (_, Some(default)) => default,
-            (Some(tool_use), None) => tool_use,
-            (None, None) => return Err(ChatError::NoTemplate),
+        let template = match (&options.template, &self.chat_tool_use, &self.chat) {
+            (Some(given), _, _) => given.as_ref(),
+            (None, Some(tool_use), _) if !tools.is_empty() => {
+                tool_use.as_ref().map_err(Clone::clone)?
+            }
+            (None, _, Some(default)) => default.as_ref().map_err(Clone::clone)?,
+            (None, Some(tool_use), None) => tool_use.as_ref().map_err(Clone::clone)?,
+            (None, None, None) => return Err(ChatError::NoTemplate),
         };
-        let template = template.as_ref().map_err(Clone::clone)?;
         let mut prompt = template.render(messages, tools, options)?;
         let special = &self.vocab.special;
         let text_of = |id: Option<u32>| {
