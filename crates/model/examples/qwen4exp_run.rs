@@ -11,7 +11,7 @@
 //!     [--text TOKENS.txt] [--text-file A.md,B.md] [--decode-at 1000,8000]
 //!     [--decode-steps 64]
 //!     [--prefill 2048] [--breakdown] [--serve model|stream|cpu] [--transit 32]
-//!     [--read-ahead on|off]
+//!     [--read-ahead on|off] [--fingerprint FILE]
 //! ```
 //!
 //! - `--spread`: how two devices share the model: a range of layers each
@@ -51,6 +51,11 @@
 //!   option the plan of the store decides. `--read-ahead on` starts the reads of the
 //!   layers ahead on a guess (what the wide step before missed there), to measure what the
 //!   guesses are worth.
+//! - `--fingerprint FILE`: the logits of fixed steps over the first 600
+//!   tokens of the text (a prompt, generated tokens, windows of drafts), a line
+//!   per row with the pick, its logit's bits and a hash of the row, to compare
+//!   two builds bit for bit (with `--serve stream`: the CPU's sums of missed
+//!   experts differ from run to run).
 //! - `--serve`: how an expert that is in no slot is served: `model` lets the
 //!   store's measured costs decide between an upload and the CPU (what the
 //!   engine does), `stream` uploads every one, `cpu` computes every one.
@@ -103,6 +108,7 @@ struct Args {
     stall_s: u64,
     transit: Option<u32>,
     read_ahead: bool,
+    fingerprint: Option<String>,
 }
 
 fn parse() -> Result<Args, AnyError> {
@@ -138,6 +144,7 @@ fn parse() -> Result<Args, AnyError> {
         stall_s: 20,
         transit: None,
         read_ahead: false,
+        fingerprint: None,
     };
     let mut it = std::env::args().skip(1);
     let list = |s: String| -> Vec<String> { s.split(',').map(str::to_owned).collect() };
@@ -184,6 +191,7 @@ fn parse() -> Result<Args, AnyError> {
             "--prefill" => args.prefill = value()?.parse()?,
             "--rows" => args.rows = value()?.parse()?,
             "--repeat" => args.repeat = value()?.parse()?,
+            "--fingerprint" => args.fingerprint = Some(value()?),
             "--breakdown" => args.breakdown = true,
             "--stall-s" => args.stall_s = value()?.parse()?,
             "--transit" => args.transit = Some(value()?.parse()?),
@@ -411,6 +419,70 @@ fn generate(
     Ok((tokens, ms))
 }
 
+/// The logits of fixed steps, written to `out` as the pick, the bits of its
+/// logit and a hash of all the row's logits per wanted row, for comparing two
+/// builds bit for bit: `prompt` read and 24 tokens generated from it; the
+/// same again verified in windows of four rows whose drafts are the generated
+/// tokens, every third window with a wrong second draft.
+fn fingerprint(session: &mut Session<'_>, prompt: &[u32], out: &str) -> Result<(), AnyError> {
+    let mut lines = Vec::new();
+    let note = |session: &Session<'_>, lines: &mut Vec<String>, i: usize| -> Result<(), AnyError> {
+        let logits = session.logits(i).ok_or("no logits")?;
+        let (mut best, mut hash) = (0usize, 0xcbf2_9ce4_8422_2325u64);
+        for (j, value) in logits.iter().enumerate() {
+            if *value > logits[best] {
+                best = j;
+            }
+            hash = (hash ^ u64::from(value.to_bits())).wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        lines.push(format!("{best} {:08x} {hash:016x}", logits[best].to_bits()));
+        Ok(())
+    };
+    session.restart(0)?;
+    let first = read(session, prompt, true)?.ok_or("no pick")?;
+    note(session, &mut lines, 0)?;
+    let mut generated = vec![first];
+    while generated.len() < 24 {
+        let token = [generated[generated.len() - 1]];
+        let rows = Rows { slot: 0, tokens: &token, direct: true, wanted: Wanted::Last };
+        let pick = session.step(&[rows])?[0];
+        note(session, &mut lines, 0)?;
+        generated.push(pick);
+    }
+    session.restart(0)?;
+    let mut last = read(session, prompt, true)?.ok_or("no pick")?;
+    note(session, &mut lines, 0)?;
+    let (mut done, mut window) = (1usize, 0usize);
+    while done + 4 < generated.len() {
+        let mut tokens = vec![last];
+        tokens.extend_from_slice(&generated[done..done + 3]);
+        if window % 3 == 2 {
+            tokens[2] = 13;
+        }
+        session.expect(&[(0, &tokens)])?;
+        let rows = Rows { slot: 0, tokens: &tokens, direct: false, wanted: Wanted::All };
+        let picks = session.step(&[rows])?.to_vec();
+        for i in 0..picks.len() {
+            note(session, &mut lines, i)?;
+        }
+        let mut accepted = 1;
+        while accepted < 4 && picks[accepted - 1] == tokens[accepted] {
+            accepted += 1;
+        }
+        session.accept(&[accepted as u32])?;
+        last = picks[accepted - 1];
+        done += accepted;
+        window += 1;
+    }
+    let text = lines.join("\n") + "\n";
+    std::fs::write(out, &text)?;
+    let hash = text.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
+    });
+    println!("RES fingerprint: {} rows, hash {hash:016x}, in {out}", lines.len());
+    Ok(())
+}
+
 fn main() {
     if let Err(error) = run() {
         eprintln!("qwen4exp_run: {error}");
@@ -444,6 +516,9 @@ fn run() -> Result<(), AnyError> {
             keys: args.keys,
             max_rows: args.rows,
             profile: profile.clone(),
+            // The fingerprint verifies windows of four rows of drafts.
+            logit_rows: if args.fingerprint.is_some() { 4 } else { 1 },
+            window_rows: if args.fingerprint.is_some() { 8 } else { 0 },
             ..Options::default()
         },
         headroom: args.headroom_mib << 20,
@@ -751,6 +826,14 @@ fn run() -> Result<(), AnyError> {
         let plain = std::fs::read_to_string(path)?;
         let options = EncodeOptions { add_special: false, parse_special: false };
         text.extend(tokenizer.encode(&plain, options));
+    }
+    if let Some(out) = &args.fingerprint {
+        if text.len() < 600 {
+            return Err(
+                format!("--text has {} tokens, the fingerprint reads 600", text.len()).into()
+            );
+        }
+        fingerprint(&mut session, &text[..600], out)?;
     }
     // The pick after the last token that was read, for a decode run that
     // starts right there.

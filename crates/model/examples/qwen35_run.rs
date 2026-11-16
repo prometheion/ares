@@ -8,7 +8,7 @@
 //!     [--decode-steps 64] [--prefill 2048] [--text FILE] [--state f32|f16]
 //!     [--pipeline-rows 256] [--no-profile] [--balance FILE] [--balance-out FILE]
 //!     [--step-rows N] [--layouts measured|file|device] [--prompt-weight 1]
-//!     [--show-layouts] [--kv q8,q8]
+//!     [--show-layouts] [--kv q8,q8] [--fingerprint FILE]
 //! ```
 //!
 //! - `--max-rows N`: the rows of a step (and so the scratch); by default the
@@ -65,6 +65,12 @@
 //!   and the RAM locked are reported. `--checkpoints N` is the number of
 //!   checkpoints the engine keeps (16 for `--conversation`, none otherwise);
 //!   `--window W` the rows of a sequence's window (8).
+//!
+//! - `--fingerprint FILE`: the picks of fixed steps over `--text` (a prompt,
+//!   generated tokens, windows of drafts, every row of a short prompt), a line
+//!   per pick with its token and its logit's bits, to compare two builds bit
+//!   for bit (with `--layouts file` or `device`: the measured layouts change
+//!   between loads).
 //!
 //! Lines that start with `RES` are results.
 
@@ -163,6 +169,7 @@ struct Args {
     chat_vars: Vec<(String, String)>,
     layouts: Layouts,
     show_layouts: bool,
+    fingerprint: Option<PathBuf>,
 }
 
 impl Args {
@@ -207,6 +214,7 @@ fn parse() -> Args {
         chat_vars: Vec::new(),
         layouts: Layouts::default(),
         show_layouts: false,
+        fingerprint: None,
     };
     let mut it = std::env::args().skip(1);
     let list = |v: String| v.split(',').map(str::to_owned).collect::<Vec<_>>();
@@ -271,6 +279,7 @@ fn parse() -> Args {
                 args.layouts = Layouts::Measured { prompt_weight: weight };
             }
             "--show-layouts" => args.show_layouts = true,
+            "--fingerprint" => args.fingerprint = Some(value().into()),
             "--chat-var" => {
                 let pair = value();
                 let (name, text) = pair.split_once('=').expect("--chat-var name=value");
@@ -367,6 +376,61 @@ fn generate(
         tokens.push(pick.token);
     }
     (tokens, times)
+}
+
+/// The picks of fixed steps, written to `out` as the token and the bits of
+/// its logit per wanted row, for comparing two builds bit for bit: `prompt`
+/// read in steps of `chunk` rows and 40 tokens generated from it; the same
+/// again verified in windows of four rows whose drafts are the generated
+/// tokens, every third window with a wrong second draft; then `rows` read in
+/// steps of 16 with every row's pick.
+fn fingerprint(session: &mut Session, prompt: &[u32], rows: &[u32], chunk: usize, out: &Path) {
+    let mut lines = Vec::new();
+    let mut note = |pick: &Pick| lines.push(format!("{} {:08x}", pick.token, pick.logit.to_bits()));
+    let (picks, _) = feed(session, prompt, 0, chunk, Wanted::Last);
+    note(&picks[0]);
+    let mut generated = vec![picks[0].token];
+    while generated.len() < 40 {
+        let token = *generated.last().expect("a token");
+        let position = (prompt.len() + generated.len() - 1) as u32;
+        let rows = Rows { slot: 0, position, tokens: &[token], direct: true, wanted: Wanted::Last };
+        let pick = session.step(&[rows]).expect("a step")[0];
+        note(&pick);
+        generated.push(pick.token);
+    }
+    // Windows: the drafts are the generated tokens, so most are accepted.
+    let (picks, _) = feed(session, prompt, 0, chunk, Wanted::Last);
+    note(&picks[0]);
+    let (mut done, mut window) = (1usize, 0usize);
+    let mut last = picks[0].token;
+    while done + 4 < generated.len() {
+        let mut tokens = vec![last];
+        tokens.extend_from_slice(&generated[done..done + 3]);
+        if window % 3 == 2 {
+            tokens[2] = 13;
+        }
+        let position = (prompt.len() + done - 1) as u32;
+        let rows = Rows { slot: 0, position, tokens: &tokens, direct: false, wanted: Wanted::All };
+        let picks = session.step(&[rows]).expect("a window").to_vec();
+        picks.iter().for_each(&mut note);
+        let mut accepted = 1;
+        while accepted < 4 && picks[accepted - 1].token == tokens[accepted] {
+            accepted += 1;
+        }
+        session.accept(&[accepted as u32]).expect("the outcome of a window");
+        last = picks[accepted - 1].token;
+        done += accepted;
+        window += 1;
+    }
+    // Every row's pick, in steps of 16 rows.
+    let (picks, _) = feed(session, rows, 0, 16, Wanted::All);
+    picks.iter().for_each(&mut note);
+    let text = lines.join("\n") + "\n";
+    std::fs::write(out, &text).expect("the fingerprint file");
+    let hash = text.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
+    });
+    println!("RES fingerprint: {} picks, hash {hash:016x}, in {}", lines.len(), out.display());
 }
 
 /// Prints where a device's token embedding lies and what it takes.
@@ -603,7 +667,8 @@ fn main() {
         kv: args.kv,
         max_rows: args.rows(),
         logit_rows,
-        window_rows: 0,
+        // The fingerprint verifies windows of drafts.
+        window_rows: if args.fingerprint.is_some() { 8 } else { 0 },
         pipeline_rows: args.pipeline_rows,
         profile: args.profile.then(|| profile.clone()),
         ..Options::default()
@@ -736,6 +801,10 @@ fn main() {
         assert!(!corpus.is_empty(), "--text FILE is needed for the speed measurements");
         corpus.iter().copied().cycle().take(n).collect()
     };
+
+    if let Some(out) = &args.fingerprint {
+        fingerprint(&mut session, &long(1100), &corpus[..200.min(corpus.len())], chunk, out);
+    }
 
     if let Some(n) = args.prefill {
         let tokens = long(n);
