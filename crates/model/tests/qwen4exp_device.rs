@@ -1353,7 +1353,7 @@ fn pruning_touches_only_what_the_file_alone_holds() {
     assert_eq!(got, want, "pruning touched a pick whose expert has a slot");
     let stats = pruned.take_prune_stats();
     assert!(stats.picks > 0);
-    assert_eq!(stats.skipped + stats.stood_in, 0);
+    assert_eq!(stats.touched + stats.stood_in, 0);
     drop(pruned);
 
     // A slot per pick a step can need in VRAM, as few in RAM: most experts
@@ -1393,14 +1393,14 @@ fn pruning_touches_only_what_the_file_alone_holds() {
             "  {} device(s), {rule:?} with {weights:?} weights: {} picks, {} left out, {} stood in              for; {} in a slot, {} from RAM, {} from the file",
             devices.len(),
             pruned.picks,
-            pruned.skipped,
+            pruned.left_out(),
             pruned.stood_in,
             store.hits,
             store.miss_from_ram,
             store.miss_from_disk,
         );
         assert!(got.iter().flatten().all(|v| v.is_finite()), "{rule:?}: a logit that is no number");
-        assert!(pruned.skipped + pruned.stood_in > 0, "{rule:?} touched nothing");
+        assert!(pruned.touched > 0, "{rule:?} touched nothing");
         match rule {
             // Every pick only the file holds is left out or stood in for.
             PruneRule::Skip | PruneRule::Router => assert_eq!(store.miss_from_disk, 0),
@@ -1408,7 +1408,7 @@ fn pruning_touches_only_what_the_file_alone_holds() {
             PruneRule::Similar => assert!(pruned.stood_in > 0),
         }
         if rule != PruneRule::Skip {
-            assert_eq!(pruned.skipped, 0, "{rule:?} left a pick out");
+            assert_eq!(pruned.left_out(), 0, "{rule:?} left a pick out");
         }
     }
 }

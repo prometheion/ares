@@ -238,9 +238,19 @@ impl PartPrune {
 pub struct PruneStats {
     /// Picks of the routers in steps that prune.
     pub picks: u64,
-    /// Picks that were left out, and picks that an expert stood in for.
-    pub skipped: u64,
+    /// Picks that were not computed: left out, or stood in for.
+    pub touched: u64,
+    /// Experts that were computed in place of a pick. With both devices on
+    /// every layer a pick and its stand-in may belong to different devices,
+    /// so only the totals say how many picks were left out.
     pub stood_in: u64,
+}
+
+impl PruneStats {
+    /// Picks that were left out: touched and not stood in for.
+    pub fn left_out(&self) -> u64 {
+        self.touched.saturating_sub(self.stood_in)
+    }
 }
 
 /// With two devices on every layer: the mixer's index and, per layer and

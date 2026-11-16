@@ -503,7 +503,7 @@ fn measure(args: &Args) -> Result<(), AnyError> {
         t.guess_reads = stats.guess_reads;
         t.wait_ms = stats.wait_ms;
         t.picks = stats.picks;
-        t.skipped = pruned.skipped;
+        t.skipped = pruned.left_out();
         t.stood_in = pruned.stood_in;
         if args.write_ref {
             write_reference(&ref_path, &written)?;

@@ -826,7 +826,7 @@ impl FeedPrune {
                     as u64;
         }
         self.stats.stood_in += stood_in;
-        self.stats.skipped += pruned.saturating_sub(stood_in);
+        self.stats.touched += pruned;
         if any {
             store.record_counts(at, &self.counts, 1.0);
             self.counts.fill(0);
