@@ -161,11 +161,13 @@ other differed more by the load than by the drafts.
       text differ by KL 0.0063, top-1 96.8 %, as large as Strata's tail skip; (2) with every
       miss uploaded (`--serve stream`) a prompt read in a wide step still differs (KL 0.0065):
       the rounds of a wide step `red.add` into the rows in the order their experts arrive;
-      (3) with the prompt in steps of eight rows the first text of a process is bit for bit
-      the same, but the next texts in the same slot after `Session::restart` are not (KL
-      0.0097 English, 0.042 code, read after German). Owed: find what (3) reads that depends
-      on the run (tier state, a slot's leftovers), and say in ARCHITECTURE.md which paths are
-      reproducible; (1) and (2) are choices for speed that a test of quality must know.
+      (3) with the prompt in steps of eight rows the next texts in the same slot after
+      `Session::restart` differ (KL 0.0097 English, 0.042 code, read after German), and even
+      the first text of a process differs a little where many misses are waited for (KL
+      0.0001 German, 0 English, 0.0025 code, top-1 99.0 %). Owed: find what (3) reads that
+      depends on the run (tier state, a slot's leftovers, the order in which waited experts
+      land), and say in ARCHITECTURE.md which paths are reproducible; (1) and (2) are choices
+      for speed that a test of quality must know.
 - [ ] The first reading of a short prompt after other texts is slower with transit
       (35 against 86 tokens/s in one run); not understood.
 - [ ] A request that arrives behind a lone long prompt waits for one piece of 512 rows,
