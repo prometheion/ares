@@ -1340,7 +1340,8 @@ fn flash_next_writes_with_drafts_what_it_writes_without() {
     runtime.shutdown();
     eprintln!(
         "RES Flash-Next: {} and {} tokens; draft rows {}, accepted {}, rejected {}; the block \
-         made {} links in {} steps, {:.2} ms a link; verified per link {:?}, accepted {:?}",
+         made {} links in {} steps, {:.2} ms a link; verified per link {:?}, accepted {:?}; \
+         prefix cache: {} hits, {} rows replayed",
         plain.len(),
         plain_seeded.len(),
         counters.draft_rows,
@@ -1351,6 +1352,8 @@ fn flash_next_writes_with_drafts_what_it_writes_without() {
         times.chain_ms / times.links.max(1) as f64,
         times.offered,
         times.accepted,
+        counters.prefix_hits,
+        counters.replay_rows,
     );
     assert_eq!(stats.cpu_experts, 0, "the CPU computed experts: {stats:?}");
     assert_eq!(plain[..4], FLASH_CONTINUATION, "the reference's first tokens");
@@ -1392,11 +1395,16 @@ fn flash_next_writes_with_dflash_drafts_what_it_writes_without() {
     let stats = model.take_store_stats().expect("the parts are open");
     runtime.shutdown();
     eprintln!(
-        "RES Flash-Next with DFlash: {} tokens in {} steps; tested by position {:?}, accepted {:?}",
+        "RES Flash-Next with DFlash: {} tokens in {} steps; tested by position {:?}, accepted \
+         {:?}; prefix cache: {} hits, {} cells cached, {} rows replayed, {} checkpoints restored",
         counters.tokens,
         counters.steps,
         &counters.drafts_tested_at[2][..7],
         &counters.drafts_accepted_at[2][..7],
+        counters.prefix_hits,
+        counters.cached_cells,
+        counters.replay_rows,
+        counters.checkpoints_restored,
     );
     assert_eq!(stats.cpu_experts, 0, "the CPU computed experts: {stats:?}");
     assert_eq!(plain[..4], FLASH_CONTINUATION, "the reference's first tokens");

@@ -4842,6 +4842,19 @@ RAM and on SSD; what differs is what a checkpoint and a page hold:
   converted (a block row whose tile is converted reads and writes nothing).
   Only drafts can differ by it; the model's own cells are never written behind
   its sequence's end.
+- **A DFlash drafter after a replay.** The drafter keeps nothing in a
+  checkpoint or a page: its ring (the keys and values of the fused taps of a
+  slot's last positions) is its own and is not saved. A replay runs the
+  model's layers, so its rows have their taps (the mean of the four streams
+  before each target layer), and the drafter injects every row of a step into
+  the slot's ring, replay rows included; it reads no segment flag. A segment
+  that does not continue the cells the ring holds (a new sequence, a sequence
+  resumed from the cache) starts the ring again at its first row
+  (`Drafter::begin_step`). So after a hit the drafter drafts from the replayed
+  rows and those after them, which are right; the cached rows before the
+  checkpoint, which nothing replays, are not in its context until the ring has
+  filled again (keeping the ring in the checkpoints is open). Only drafts
+  depend on it.
 - **The order** in a record: the commit of the step before (with the n-gram
   feed's settling of the windows), the draft block's following of that step,
   the freed pages and the tables, then the saves, the page copies and the
