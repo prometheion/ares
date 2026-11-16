@@ -37,19 +37,6 @@ use crate::qwen35::device::placement::Placement;
 /// each.
 const CHUNK_BYTES: usize = 32 << 20;
 
-/// Where a recurrent block's state starts in a slot whose earlier blocks end
-/// at `at`, and where the slot goes on: the convolution windows, the delta-rule
-/// matrices, and the next offset. Every part is aligned to 64 bytes.
-pub(super) fn state_extent(
-    shape: &ares_cuda::RecurrentShape,
-    state: StateFormat,
-    at: u64,
-) -> (u64, u64, u64) {
-    let delta = (at + shape.conv_state_len() * 4).next_multiple_of(64);
-    let end = (delta + shape.delta_state_len() * state.bytes()).next_multiple_of(64);
-    (at, delta, end)
-}
-
 /// The bytes of one sequence's recurrent state on device `index` of
 /// `placement`.
 pub fn state_slot_bytes(
@@ -73,7 +60,7 @@ pub fn state_slot_bytes(
                 head_dim: r.head_k_dim as u32,
                 conv_kernel: r.conv_kernel as u32,
             };
-            state_extent(&shape, state, at).2
+            crate::blocks::recurrent::extent(&shape, state, at).2
         })
 }
 

@@ -16,9 +16,12 @@
 //! - [`kv`]: the K/V group, attention layers that share a pair of K/V formats,
 //!   with their pages and the pool of exact entries of the formats with a tile
 //!   mean ([`forms`]).
+//! - [`recurrent`]: the layers of the gated delta rule, their state in a
+//!   sequence's slot and the inputs a draft window keeps.
 
 pub(crate) mod forms;
 pub(crate) mod kv;
+pub(crate) mod recurrent;
 
 use ares_runtime::ModelError;
 

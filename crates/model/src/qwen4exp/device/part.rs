@@ -52,8 +52,8 @@ use ares_cuda::{
     AttnRow, AttnShape, CacheFormat, CacheGeometry, CommitSet, Departure, Device, DeviceBuffer,
     DevicePtr, ENTRY_CELLS, Event, ExpertKernels, ExpertRowKernels, IndexerShape, Kernels,
     KeyFormat, LayerKernels, ListHandOver, MAX_BATCH, MixerMatrix, NgramShape, OutputGate,
-    PinnedBuffer, Plan, PlanConfig, Planner, Precision, Q4Kernels, ReadWrite, RopeParams, Segment,
-    SelectionRule, StateFormat, StepRecord, Stream, WeightLayout,
+    PinnedBuffer, Plan, PlanConfig, Planner, Precision, Q4Kernels, ReadWrite, RecurrentShape,
+    RopeParams, Segment, SelectionRule, StateFormat, StepRecord, Stream, WeightLayout,
 };
 use ares_runtime::ModelError;
 use ares_runtime::expert_store::cpu::act_bytes as cpu_act_bytes;
@@ -66,6 +66,7 @@ use super::load::{
     AttentionW, CoreW, DeviceWeights, LayerShare, LayerW, Mat, MixerW, MoeW, NgramW, RecurrentW,
     Role, SharedW,
 };
+use crate::blocks::recurrent::{self, Inputs, Recurrent};
 use crate::qwen4exp::Config;
 use crate::qwen4exp::weights::Weights;
 
@@ -294,15 +295,9 @@ pub struct ExpertAt {
     pub host: Option<DevicePtr>,
 }
 
-/// Where a recurrent layer keeps its state and what a draft window keeps.
-#[derive(Clone, Copy, Debug)]
-struct RecurrentAt {
-    /// Offsets in a slot of the state arena.
-    conv: u64,
-    delta: u64,
-    /// Offsets in the arena of kept inputs: qkv, kv, alpha, beta.
-    kept: [u64; 4],
-}
+/// Where a recurrent layer keeps its state and what a draft window keeps: a
+/// layer of the recurrent block.
+type RecurrentAt = recurrent::Layer;
 
 /// Where an attention layer has its pools and state.
 #[derive(Clone, Copy, Debug)]
@@ -312,7 +307,7 @@ struct AttentionAt {
     key_pool: u64,
     /// Offset of the carried indexer state in a slot of the state arena.
     carry: u64,
-    /// Offset in the arena of kept inputs: the raw indexer keys of a window.
+    /// Offset in the indexer's kept inputs: the raw keys of a window.
     kept_raw: u64,
 }
 
@@ -482,7 +477,10 @@ pub(crate) struct Frame {
     attention: Vec<Option<AttentionAt>>,
     ngram_history: Option<u64>,
     pool_bytes: u64,
-    kept_bytes: u64,
+    /// The recurrent layers' extents and kept inputs.
+    rec: recurrent::Layout,
+    /// Bytes of the indexer's kept inputs of a window.
+    raw_bytes: u64,
     s: Scratch,
     inbox: Inbox,
     record_stride: u64,
@@ -595,14 +593,15 @@ impl Frame {
         let iq = (c.indexer.n_head * c.indexer.key_dim) as u64;
         let id = c.indexer.key_dim as u64;
 
-        let (mut slot_bytes, mut pool_bytes, mut kept_bytes) = (0u64, 0u64, 0u64);
+        let (mut slot_bytes, mut pool_bytes, mut raw_bytes) = (0u64, 0u64, 0u64);
+        let mut rec_layout = recurrent::Layout::new(opts.state, opts.window_rows);
         let mut recurrent = Vec::new();
         let mut attention = Vec::new();
         let mut ngram_history = None;
         let (mut any_recurrent, mut any_attention, mut any_ngram) = (false, false, false);
         let mut keep = |bytes: u64| {
-            let at = kept_bytes;
-            kept_bytes = (kept_bytes + window * bytes).next_multiple_of(64);
+            let at = raw_bytes;
+            raw_bytes = (raw_bytes + window * bytes).next_multiple_of(64);
             at
         };
         for (i, share) in shape.shares.iter().enumerate() {
@@ -623,19 +622,14 @@ impl Frame {
                 any_recurrent = true;
                 // The part's key heads with their value heads: a narrower
                 // layer.
-                let s = r.head_dim as u64;
-                let values = heads * (r.n_v_heads / r.n_k_heads) as u64;
-                let channels = (2 * heads + values) * s;
-                let conv = slot_bytes;
-                let delta = (conv + channels * (r.conv_kernel as u64 - 1) * 4).next_multiple_of(64);
-                slot_bytes = (delta + values * s.pow(2) * opts.state.bytes()).next_multiple_of(64);
-                let kept = [
-                    keep(channels * 4),
-                    keep((heads + values) * s * 4),
-                    keep(values * 4),
-                    keep(values * 4),
-                ];
-                r_at = Some(RecurrentAt { conv, delta, kept });
+                let n_k = heads as u32;
+                let shape = RecurrentShape {
+                    n_k_heads: n_k,
+                    n_v_heads: n_k * (r.n_v_heads / r.n_k_heads) as u32,
+                    head_dim: r.head_dim as u32,
+                    conv_kernel: r.conv_kernel as u32,
+                };
+                r_at = Some(rec_layout.layer(shape, &mut slot_bytes));
             }
             if streams && c.ngram.as_ref().is_some_and(|g| g.layer == layer) {
                 any_ngram = true;
@@ -791,7 +785,8 @@ impl Frame {
             attention,
             ngram_history,
             pool_bytes: pool_bytes.max(64),
-            kept_bytes,
+            rec: rec_layout,
+            raw_bytes,
             s,
             inbox,
             record_stride: record_bytes.next_multiple_of(64),
@@ -835,7 +830,8 @@ impl Frame {
     /// scratch, kept window inputs, route records, the step's inputs, tables.
     pub(crate) fn step_bytes(&self, opts: &Options) -> u64 {
         self.s.len
-            + self.kept_bytes
+            + self.rec.kept_bytes()
+            + self.raw_bytes
             + (self.record_stride + self.act_stride) * self.recurrent.len() as u64
             + self.inbox.len
             + self.tables_bytes(opts)
@@ -905,7 +901,11 @@ pub struct Part {
     /// for the planner.
     tables_host: PinnedBuffer,
     entries: Vec<u32>,
-    kept: Option<DeviceBuffer>,
+    /// The recurrent layers: their state's format and a draft window's kept
+    /// inputs.
+    rec: Recurrent,
+    /// The raw keys of the indexer that a draft window keeps.
+    kept_raw: Option<DeviceBuffer>,
     records: DeviceBuffer,
     /// Per layer the input rows of its mixture of experts as activations.
     acts: DeviceBuffer,
@@ -1054,14 +1054,15 @@ impl Part {
         } else {
             None
         };
-        if f.kept_bytes > 0 {
-            ledger.reserve(format!("{label} draft window inputs"), f.kept_bytes)?;
+        if f.raw_bytes > 0 {
+            ledger.reserve(format!("{label} draft window keys of the indexer"), f.raw_bytes)?;
         }
         let scratch = DeviceBuffer::new(device, f.s.len)?;
         let state = DeviceBuffer::new(device, state_bytes)?;
         let tables = DeviceBuffer::new(device, tables_bytes)?;
-        let kept =
-            (f.kept_bytes > 0).then(|| DeviceBuffer::new(device, f.kept_bytes)).transpose()?;
+        let rec = Recurrent::new(device, ledger, label, &f.rec)?;
+        let kept_raw =
+            (f.raw_bytes > 0).then(|| DeviceBuffer::new(device, f.raw_bytes)).transpose()?;
         // A defined start: the state of a slot is cleared again when a
         // sequence starts in it, the zeros stay zeros.
         state.write(0, &vec![0u8; state_bytes as usize])?;
@@ -1134,7 +1135,8 @@ impl Part {
             tables,
             tables_host,
             entries,
-            kept,
+            rec,
+            kept_raw,
             records: DeviceBuffer::new(device, records_bytes)?,
             acts: DeviceBuffer::new(device, acts_bytes)?,
             board: Arc::new(Board::new(
@@ -1572,7 +1574,7 @@ impl Part {
                     stride * ENTRY_CELLS
                 )));
             }
-            if !s.direct && (self.kept.is_none() || s.n_rows > self.opts.window_rows) {
+            if !s.direct && (!self.keeps_windows() || s.n_rows > self.opts.window_rows) {
                 return Err(invalid(format!(
                     "a draft window of {} rows; {} were reserved",
                     s.n_rows, self.opts.window_rows
@@ -2239,70 +2241,42 @@ impl Part {
         let deferred = env.segments.iter().any(|s| !s.direct);
         // A step that verifies drafts keeps the inputs of this layer until
         // its commit; any other step uses the scratch every layer shares.
-        let (qkv, kv, alpha, beta) = match (&self.kept, deferred) {
-            (Some(kept), true) => {
-                let k = |j: usize| kept.ptr().offset(at.kept[j]);
-                (k(0), k(1), k(2), k(3))
-            }
-            (None, true) => return Err(invalid("no draft windows were reserved")),
-            _ => (self.at(s.w1), self.at(s.kv), self.at(s.alpha), self.at(s.beta)),
+        let scratch = Inputs {
+            qkv: self.at(s.w1),
+            kv: self.at(s.kv),
+            alpha: self.at(s.alpha),
+            beta: self.at(s.beta),
         };
+        let io = self.rec.inputs(&at, deferred, scratch)?;
         let (z, o, q) = (self.at(s.w2), self.at(s.o), self.at(s.q));
         let m = self.at(s.m);
         let step = self.inbox_at(self.f.inbox.record);
-        let conv_state = self.state.ptr().offset(at.conv);
-        let delta_state = self.state.ptr().offset(at.delta);
-        let (conv_stride, delta_stride) =
-            (self.f.slot_bytes / 4, self.f.slot_bytes / self.opts.state.bytes());
         // SAFETY: every buffer is scratch of this part sized for the most
         // rows, weights in the arena, or the state arena with a slot per
         // sequence (segments checked in `check`); the kept buffers hold
         // `window_rows` rows, which bounds a deferred step.
         unsafe {
             self.prepare_mixed(stream, rows)?;
-            self.product(stream, &r.qkv, m, qkv, rows)?;
+            self.product(stream, &r.qkv, m, io.qkv, rows)?;
             self.product(stream, &r.z, m, z, rows)?;
-            self.product(stream, &r.beta, m, beta, rows)?;
-            self.product(stream, &r.alpha, m, alpha, rows)?;
+            self.product(stream, &r.beta, m, io.beta, rows)?;
+            self.product(stream, &r.alpha, m, io.alpha, rows)?;
             self.mark(stream, Phase::Dense)?;
-            self.layers.conv_window(
+            self.rec.window(
+                &self.layers,
                 stream,
                 step,
                 dims,
-                shape,
-                Some(self.eps),
-                qkv,
+                &at,
+                self.eps,
+                &io,
+                q,
+                o,
                 self.w.at(r.taps),
-                conv_state,
-                conv_stride,
-                q,
-                kv,
-            )?;
-            self.layers.delta_window(
-                stream,
-                step,
-                dims,
-                shape,
-                self.opts.state,
-                q,
-                kv,
-                alpha,
-                beta,
                 self.w.at(r.dt_bias),
                 self.w.at(r.ssm_a),
-                delta_state,
-                delta_stride,
-                o,
-            )?;
-            self.layers.conv_commit(
-                stream,
-                step,
-                dims,
-                shape,
-                CommitSet::Direct,
-                qkv,
-                conv_state,
-                conv_stride,
+                self.state.ptr(),
+                self.f.slot_bytes,
             )?;
             if self.wide_f16(rows) {
                 self.layers.gated_norm_f16(
@@ -2358,7 +2332,7 @@ impl Part {
         let kernels = self.attention.clone().ok_or_else(|| invalid("no attention kernels"))?;
         let hq = self.attn_shape.n_head * self.attn_shape.head_dim;
         let deferred = env.segments.iter().any(|s| !s.direct);
-        let raw = match (&self.kept, deferred) {
+        let raw = match (&self.kept_raw, deferred) {
             (Some(kept), true) => kept.ptr().offset(at.kept_raw),
             (None, true) => return Err(invalid("no draft windows were reserved")),
             _ => self.at(s.raw),
@@ -2750,6 +2724,11 @@ impl Part {
         self.end(env)
     }
 
+    /// Whether the part keeps what draft windows need for their commit.
+    fn keeps_windows(&self) -> bool {
+        self.rec.kept_bytes() > 0 || self.kept_raw.is_some()
+    }
+
     /// Whether the last step left draft windows that wait for their commit.
     pub fn has_deferred(&self) -> bool {
         self.deferred.is_some()
@@ -2778,7 +2757,9 @@ impl Part {
         }
         let ib = self.f.inbox;
         let bytes = record.as_bytes();
-        let kept = self.kept.as_ref().ok_or_else(|| invalid("no draft windows were reserved"))?;
+        if !self.keeps_windows() {
+            return Err(invalid("no draft windows were reserved"));
+        }
         let step = self.inbox_at(ib.commit);
         let s = self.f.s;
         // SAFETY: the commit section of the inbox holds a record; the kept
@@ -2812,28 +2793,25 @@ impl Part {
                 }
                 match (&layer.core, self.f.recurrent[i], self.f.attention[i]) {
                     (CoreW::Recurrent(r), Some(at), _) => {
-                        let k = |j: usize| kept.ptr().offset(at.kept[j]);
-                        self.layers.commit(
+                        self.rec.commit(
+                            &self.layers,
                             stream,
                             step,
                             dims,
-                            r.shape,
-                            self.opts.state,
-                            k(0),
-                            k(1),
-                            k(2),
-                            k(3),
+                            &at,
                             self.w.at(r.dt_bias),
                             self.w.at(r.ssm_a),
-                            self.state.ptr().offset(at.conv),
-                            self.f.slot_bytes / 4,
-                            self.state.ptr().offset(at.delta),
-                            self.f.slot_bytes / self.opts.state.bytes(),
+                            self.state.ptr(),
+                            self.f.slot_bytes,
                         )?;
                     }
                     (CoreW::Attention(_), _, Some(at)) => {
                         let plan =
                             self.plan.as_ref().ok_or_else(|| invalid("the step had no plan"))?;
+                        let kept = self
+                            .kept_raw
+                            .as_ref()
+                            .ok_or_else(|| invalid("no draft windows were reserved"))?;
                         let plan_rows = self.inbox_at(ib.plan).offset(plan.plan.layout().rows);
                         self.q4.indexer_commit(
                             stream,

@@ -222,6 +222,17 @@ The blocks so far:
   step (conversions, exact slots, the table), settles a draft window at its
   commit, and copies, sends to the host and takes back a page in the form it
   has. The 27B has two groups: its attention blocks, and its draft block.
+- **The recurrent block** (`blocks/recurrent.rs`): the layers of the gated
+  delta rule with their extents in a sequence's slot (a convolution window
+  and the delta-rule matrices per layer) and the inputs a draft window keeps.
+  It decides where a step's inputs go (kept for a window, the shared scratch
+  otherwise), runs the window (convolution, delta rule, and the commit of the
+  convolution windows of the direct rows) and the deferred commit of a
+  window's accepted rows. Both models' recurrent layers run on it; what feeds
+  it (the 27B's norm and products, Flash-Next's stream mixer) and what follows
+  it (the gated norm in each model's form, the output product) stay theirs.
+  The slot arena that holds its extents beside other state (Flash-Next's
+  indexer carry and n-gram history) is still the model's.
 
 ## A step
 

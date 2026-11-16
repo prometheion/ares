@@ -16,11 +16,10 @@ use std::sync::{Arc, Mutex};
 
 use ares_core::Ledger;
 use ares_cuda::{
-    ActivationForm, AttentionKernels, AttentionShape, CacheFormat, CacheGeometry, CommitSet,
-    Device, DeviceBuffer, DevicePtr, ENTRY_CELLS, EmbedRows, Event, Kernels, LayerKernels,
-    MAX_BATCH, OutputGate, PUSH_MAX_VALUES, PinnedBuffer, PlanBuffers, PlanConfig, Planner,
-    Precision, PrefillPath, RopeParams, Segment, StateFormat, StepDims, Stream, WeightLayout,
-    WeightRange,
+    ActivationForm, AttentionKernels, AttentionShape, CacheFormat, CacheGeometry, Device,
+    DeviceBuffer, DevicePtr, ENTRY_CELLS, EmbedRows, Event, Kernels, LayerKernels, MAX_BATCH,
+    OutputGate, PUSH_MAX_VALUES, PinnedBuffer, PlanBuffers, PlanConfig, Planner, Precision,
+    PrefillPath, RopeParams, Segment, StateFormat, StepDims, Stream, WeightLayout, WeightRange,
 };
 use ares_cuda::{PUSH_MAX_ROWS, PushSlot};
 use ares_runtime::{Logits, ModelError, PinnedRam, Split};
@@ -38,6 +37,7 @@ mod resume;
 mod tensor;
 
 use crate::blocks::kv;
+use crate::blocks::recurrent::{self, Inputs, Recurrent};
 
 pub use mtp::{DraftBytes, DraftChain, DraftStep, DraftTimes, Drafted};
 pub use resume::{CopyTimes, checkpoint_bytes, settle_cells, state_slot_bytes, transit_page_bytes};
@@ -388,15 +388,9 @@ struct Scratch {
     len: u64,
 }
 
-/// Where a recurrent block keeps its state and what a draft window keeps.
-#[derive(Clone, Copy, Debug)]
-struct RecurrentAt {
-    /// Offsets in a slot of the state arena.
-    conv: u64,
-    delta: u64,
-    /// Offsets in the arena of kept inputs: qkv, kv, alpha, beta.
-    kept: [u64; 4],
-}
+/// Where a recurrent block keeps its state and what a draft window keeps: a
+/// layer of the recurrent block.
+type RecurrentAt = recurrent::Layer;
 
 /// Where an attention block has its pool, and its geometry: a layer of its
 /// K/V group.
@@ -478,7 +472,9 @@ pub struct Part {
     places: resume::Places,
     /// Pages of the pool.
     n_pages: u32,
-    kept: Option<DeviceBuffer>,
+    /// The recurrent blocks: their state's format and a draft window's kept
+    /// inputs.
+    rec: Recurrent,
     /// The step whose deferred segments wait for their commit.
     has_deferred: bool,
     /// Whether every row of the step being enqueued is generated: a single
@@ -688,7 +684,8 @@ impl Part {
         let (mut cd, mut vd, mut kd, mut nv, mut hq, mut hkv, mut f) = (0u64, 0, 0, 0, 0, 0, 0);
         let mut recurrent_at = Vec::new();
         let mut attention_at = Vec::new();
-        let (mut slot_bytes, mut kept_bytes, mut pool) = (0u64, 0u64, 0u64);
+        let (mut slot_bytes, mut pool) = (0u64, 0u64);
+        let mut rec_layout = recurrent::Layout::new(opts.state, opts.window_rows);
         let sizing =
             kv::Sizing { slots: max_slots, rows: opts.max_rows, tails: max_slots * TAILS_PER_SLOT };
         let exact_slots = kv::slots_for(opts.kv.0, opts.kv.1, sizing);
@@ -705,20 +702,7 @@ impl Part {
                     vd = vd.max(u64::from(s.value_dim()));
                     kd = kd.max(u64::from(s.key_dim()));
                     nv = nv.max(u64::from(s.n_v_heads));
-                    let (conv, delta, end) = resume::state_extent(&s, opts.state, slot_bytes);
-                    slot_bytes = end;
-                    let mut kept = [0u64; 4];
-                    let sizes = [
-                        u64::from(s.conv_dim()),
-                        u64::from(s.key_dim() + s.value_dim()),
-                        u64::from(s.n_v_heads),
-                        u64::from(s.n_v_heads),
-                    ];
-                    for (at, size) in kept.iter_mut().zip(sizes) {
-                        *at = kept_bytes;
-                        kept_bytes = (kept_bytes + window * size * 4).next_multiple_of(64);
-                    }
-                    r_at = Some(RecurrentAt { conv, delta, kept });
+                    r_at = Some(rec_layout.layer(s, &mut slot_bytes));
                 }
                 MixerW::Attention(a) => {
                     let geo = geometry(c, opts.kv, a.n_kv);
@@ -855,12 +839,9 @@ impl Part {
         ledger.reserve("qwen35 step scratch", s.len)?;
         let state_bytes = (slot_bytes * u64::from(max_slots)).max(64);
         ledger.reserve("qwen35 recurrent state", state_bytes)?;
-        if kept_bytes > 0 {
-            ledger.reserve("qwen35 draft window inputs", kept_bytes)?;
-        }
         let scratch = DeviceBuffer::new(device, s.len)?;
         let state = DeviceBuffer::new(device, state_bytes)?;
-        let kept = (kept_bytes > 0).then(|| DeviceBuffer::new(device, kept_bytes)).transpose()?;
+        let rec = Recurrent::new(device, ledger, "qwen35", &rec_layout)?;
         // A defined start: a slot is cleared again when a sequence starts in it.
         state.write(0, &vec![0u8; state_bytes as usize])?;
         scratch.write(s.status, &[0u8; 16])?;
@@ -945,7 +926,7 @@ impl Part {
             slot_bytes,
             places,
             n_pages: pages,
-            kept,
+            rec,
             has_deferred: false,
             generating: false,
             table_stride,
@@ -1003,7 +984,7 @@ impl Part {
 
     /// Bytes a draft window's kept inputs take.
     pub fn kept_bytes(&self) -> u64 {
-        self.kept.as_ref().map_or(0, DeviceBuffer::len)
+        self.rec.kept_bytes()
     }
 
     /// Bytes of K and V per page (128 cells) on this device.
@@ -1876,35 +1857,24 @@ impl Part {
             return Err(invalid("there is no draft window to commit"));
         }
         self.draft_commit(stream, step, dims)?;
-        let (conv_stride, delta_stride) =
-            (self.slot_bytes / 4, self.slot_bytes / self.opts.state.bytes());
         for (block, at) in self.w.blocks.iter().zip(&self.recurrent_at) {
             let (MixerW::Recurrent(r), Some(at)) = (&block.mixer, at) else { continue };
             // (A part without recurrent blocks keeps no inputs and has
             // nothing to commit here.)
-            let kept =
-                self.kept.as_ref().ok_or_else(|| invalid("no draft windows were reserved"))?;
-            let k = |i: usize| kept.ptr().offset(at.kept[i]);
             // SAFETY: the kept buffers hold the inputs of the last step's
             // rows (it had at most `window_rows` rows), the state arena every
             // slot the record names; all on this device.
             unsafe {
-                self.layers.commit(
+                self.rec.commit(
+                    &self.layers,
                     stream,
                     step,
                     dims,
-                    r.shape,
-                    self.opts.state,
-                    k(0),
-                    k(1),
-                    k(2),
-                    k(3),
+                    at,
                     self.w.at(r.dt_bias),
                     self.w.at(r.ssm_a),
-                    self.state.ptr().offset(at.conv),
-                    conv_stride,
-                    self.state.ptr().offset(at.delta),
-                    delta_stride,
+                    self.state.ptr(),
+                    self.slot_bytes,
                 )?;
             }
         }
@@ -2108,74 +2078,41 @@ impl Part {
         let deferred = env.segments.iter().any(|s| !s.direct);
         // A step that verifies drafts keeps the inputs of this block until its
         // commit; any other step uses the scratch every block shares.
-        let (qkv, kv, alpha, beta) = match (&self.kept, deferred) {
-            (Some(kept), true) => {
-                let k = |i: usize| kept.ptr().offset(at.kept[i]);
-                (k(0), k(1), k(2), k(3))
-            }
-            (None, true) => return Err(invalid("no draft windows were reserved")),
-            _ => (
-                self.rows(s.w1, shape.conv_dim()),
-                self.rows(s.kv, shape.key_dim() + shape.value_dim()),
-                self.rows(s.alpha, shape.n_v_heads),
-                self.rows(s.beta, shape.n_v_heads),
-            ),
+        let scratch = Inputs {
+            qkv: self.rows(s.w1, shape.conv_dim()),
+            kv: self.rows(s.kv, shape.key_dim() + shape.value_dim()),
+            alpha: self.rows(s.alpha, shape.n_v_heads),
+            beta: self.rows(s.beta, shape.n_v_heads),
         };
+        let io = self.rec.inputs(&at, deferred, scratch)?;
         let (z, o) = (self.rows(s.w2, shape.value_dim()), self.rows(s.o, shape.value_dim()));
         let q = self.rows(s.q, shape.key_dim());
-        let conv_state = self.state.ptr().offset(at.conv);
-        let delta_state = self.state.ptr().offset(at.delta);
-        let (conv_stride, delta_stride) =
-            (self.slot_bytes / 4, self.slot_bytes / self.opts.state.bytes());
         // SAFETY: every buffer is scratch of this part sized for the most
         // rows and the widest block, weights in the arena, or the state
         // arena with a slot per sequence (segments checked in `check`); the
         // kept buffers hold `window_rows` rows, which bounds a deferred step.
         unsafe {
             self.normed_input(env, self.w.at(block.attn_norm), &[&r.qkv, &r.z, &r.beta, &r.alpha])?;
-            self.product(stream, &r.qkv, n, qkv)?;
+            self.product(stream, &r.qkv, n, io.qkv)?;
             self.product(stream, &r.z, n, z)?;
-            self.product(stream, &r.beta, n, beta)?;
-            self.product(stream, &r.alpha, n, alpha)?;
+            self.product(stream, &r.beta, n, io.beta)?;
+            self.product(stream, &r.alpha, n, io.alpha)?;
             self.mark(stream, Phase::Weights)?;
-            self.layers.conv_window(
+            self.rec.window(
+                &self.layers,
                 stream,
                 env.step,
                 dims,
-                shape,
-                Some(self.eps),
-                qkv,
+                &at,
+                self.eps,
+                &io,
+                q,
+                o,
                 self.w.at(r.taps),
-                conv_state,
-                conv_stride,
-                q,
-                kv,
-            )?;
-            self.layers.delta_window(
-                stream,
-                env.step,
-                dims,
-                shape,
-                self.opts.state,
-                q,
-                kv,
-                alpha,
-                beta,
                 self.w.at(r.dt_bias),
                 self.w.at(r.ssm_a),
-                delta_state,
-                delta_stride,
-                o,
-            )?;
-            self.layers.conv_commit(
-                stream,
-                env.step,
-                dims,
-                shape,
-                CommitSet::Direct,
-                qkv,
-                conv_state,
-                conv_stride,
+                self.state.ptr(),
+                self.slot_bytes,
             )?;
             self.gated_norm(stream, r, o, z, n)?;
             self.mark(stream, Phase::Layers)?;
