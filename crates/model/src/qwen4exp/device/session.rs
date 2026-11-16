@@ -770,6 +770,13 @@ impl<'g> Session<'g> {
         self.feed.take_prune()
     }
 
+    /// Whether the steps from the next on prune, for a session opened with
+    /// pruning (they do until told not to): a measurement reads the prompt the
+    /// same way for every rule.
+    pub fn set_pruning(&mut self, on: bool) {
+        self.feed.set_pruning(on);
+    }
+
     /// The memory of every part.
     pub fn report(&self) -> Vec<PartReport> {
         self.parts

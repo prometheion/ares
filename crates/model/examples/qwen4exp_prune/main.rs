@@ -453,7 +453,6 @@ fn measure(args: &Args) -> Result<(), AnyError> {
     std::fs::create_dir_all(&reference)?;
     let texts = tokens_of_texts(&tokenizer, &args.texts)?;
     let mut session = open(args, &gguf, &c, &w, setup, None)?;
-    let step_rows = 512.min(args.prompt.max(1));
     let mut all = Totals::default();
     let mut lines = Vec::new();
     for (path, tokens) in args.texts.iter().zip(&texts) {
@@ -463,7 +462,12 @@ fn measure(args: &Args) -> Result<(), AnyError> {
             return Err(format!("{path} has {} tokens, {need} are needed", tokens.len()).into());
         }
         session.restart(0)?;
-        prompt(&mut session, &tokens[..args.prompt], step_rows)?;
+        // The prompt the same way for every rule: unpruned, in steps of
+        // eight rows, whose sums do not depend on when an expert arrives (a
+        // wide step adds the rounds of experts that came in the order they came).
+        session.set_pruning(false);
+        prompt(&mut session, &tokens[..args.prompt], 8)?;
+        session.set_pruning(true);
         session.take_store_stats();
         session.take_prune_stats();
         let ref_path = reference.join(format!("{name}.ref"));

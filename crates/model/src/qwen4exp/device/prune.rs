@@ -89,7 +89,8 @@ impl PruneMask {
     /// Writes what the tiers of `store` hold into the buffer that is not
     /// current and makes it current. Call it when a step begins, before any
     /// part enqueues the step.
-    pub(super) fn build(&self, store: &ExpertStore<CudaSlots>, layout: &Layout) {
+    /// With `paused`, every expert counts as held and the step prunes nothing.
+    pub(super) fn build(&self, store: &ExpertStore<CudaSlots>, layout: &Layout, paused: bool) {
         let mut inner = self.lock();
         let next = 1 - inner.current;
         let n = self.n_experts;
@@ -98,10 +99,12 @@ impl PruneMask {
         // last, which read it, are done (see the type).
         let bytes =
             unsafe { std::slice::from_raw_parts_mut(inner.buffers[next].as_mut_ptr(), len) };
-        bytes.fill(0);
-        for (layer, out) in bytes.chunks_exact_mut(n).enumerate() {
-            for part in 0..layout.per_layer {
-                store.mark_present(layout.store_layer(part, layer), out);
+        bytes.fill(u8::from(paused));
+        if !paused {
+            for (layer, out) in bytes.chunks_exact_mut(n).enumerate() {
+                for part in 0..layout.per_layer {
+                    store.mark_present(layout.store_layer(part, layer), out);
+                }
             }
         }
         inner.current = next;

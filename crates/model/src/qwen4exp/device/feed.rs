@@ -371,6 +371,9 @@ struct FeedPrune {
     /// expert, 1 where the other device owns the expert.
     owner: Option<(usize, Vec<u8>)>,
     n_experts: usize,
+    /// Whether the steps prune nothing for now (a measurement that reads a
+    /// prompt the same way for every rule).
+    paused: bool,
     stats: PruneStats,
     /// Per expert of a layer: picks that were pruned, as heat.
     counts: Vec<u32>,
@@ -427,9 +430,17 @@ impl Feed {
             mask,
             owner,
             n_experts,
+            paused: false,
             stats: PruneStats::default(),
             counts: vec![0; n_experts],
         });
+    }
+
+    /// Whether the steps from the next on prune (they do unless told not to).
+    pub(super) fn set_pruning(&mut self, on: bool) {
+        if let Some(prune) = &mut self.prune {
+            prune.paused = !on;
+        }
     }
 
     /// What pruning did since the last call.
@@ -624,7 +635,7 @@ impl Feed {
         self.followed.fill(0);
         self.store.begin_step();
         if let Some(prune) = self.prune.as_ref().filter(|_| rows <= MAX_BATCH) {
-            prune.mask.build(&self.store, &self.layout);
+            prune.mask.build(&self.store, &self.layout, prune.paused);
         }
         self.guessed.fill(false);
         if rows > MAX_BATCH {
