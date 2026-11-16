@@ -152,8 +152,8 @@ impl Model for Uncached {
     fn attention_span(&self) -> u32 {
         self.0.attention_span()
     }
-    fn own_drafts(&self) -> u32 {
-        self.0.own_drafts()
+    fn drafters(&self) -> Vec<ares_runtime::Drafter> {
+        self.0.drafters()
     }
     fn prefix_cache(&self) -> Option<PrefixCache> {
         None

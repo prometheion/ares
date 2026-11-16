@@ -125,6 +125,48 @@ impl ContextSpec {
     }
 }
 
+/// The kinds of drafter the runtime knows besides its own lookup in earlier
+/// text. A model lists the drafters it runs ([`Model::drafters`]); what the
+/// conductor needs of one is its kind and the most drafts it makes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum DrafterKind {
+    /// One more layer of the model's own kind (multi-token prediction), from
+    /// the model file or a file of its own: a chain of links, each of which
+    /// costs device time, and which can end early by its probabilities.
+    Block,
+    /// A block drafter from a file of its own that reads taps of the model
+    /// (DFlash2): one pass makes every draft of a window, so a draft more
+    /// costs no device time once the pass runs.
+    Dflash,
+}
+
+impl DrafterKind {
+    /// The name the statistics and the logs use.
+    pub fn name(self) -> &'static str {
+        match self {
+            DrafterKind::Block => "draft block",
+            DrafterKind::Dflash => "dflash",
+        }
+    }
+
+    /// Where the statistics count the drafts of this kind
+    /// ([`Counters::drafts_tested_at`](crate::Counters)): the lookup is 0.
+    pub fn source(self) -> usize {
+        match self {
+            DrafterKind::Block => 1,
+            DrafterKind::Dflash => 2,
+        }
+    }
+}
+
+/// A drafter a model runs on its devices.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Drafter {
+    pub kind: DrafterKind,
+    /// The most drafts it makes per sequence and step.
+    pub drafts: u32,
+}
+
 /// Why a model's part of a step could not be built or enqueued.
 #[derive(Debug, thiserror::Error)]
 pub enum ModelError {
@@ -292,7 +334,8 @@ pub struct Logits {
 /// Where a device part left the tokens it drafted itself for the windows of a
 /// step: `tokens` u32 on the device, the drafts of each window with the
 /// record's own-drafts flag in the order of the record's segments, window
-/// after window. `u32::MAX` is a draft the part could not make.
+/// after window, whichever of the model's drafters made them. `u32::MAX` is a
+/// draft the part could not make.
 #[derive(Clone, Copy, Debug)]
 pub struct OwnDrafts {
     pub ptr: DevicePtr,
@@ -483,12 +526,13 @@ pub trait Model: Send + Sync + 'static {
         u32::MAX
     }
 
-    /// The most tokens the model drafts itself per sequence and step, with a
-    /// draft block of its own that runs on the devices; 0 for a model
-    /// without one. A window that takes them has the record's own-drafts
-    /// flag and no tokens for its draft rows.
-    fn own_drafts(&self) -> u32 {
-        0
+    /// The drafters the model runs on its devices, none by default. The
+    /// record names a drafter by its place in this list plus one (0 is the
+    /// runtime's lookup, whose drafts are tokens of the record): a window
+    /// whose drafts drafter `i` makes has the record's own-drafts flag, the
+    /// drafter's id, and no tokens for its draft rows.
+    fn drafters(&self) -> Vec<Drafter> {
+        Vec::new()
     }
 
     /// `Some` when the model's device side carries out the state copies, the

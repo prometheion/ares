@@ -236,6 +236,10 @@ pub struct DeviceTimes {
 /// the last.
 pub const DRAFT_POSITIONS: usize = 16;
 
+/// Where drafts come from, for the statistics: the lookup, a draft block, a
+/// DFlash drafter.
+pub const DRAFT_SOURCES: usize = 3;
+
 /// Counts that go with the times.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Counters {
@@ -253,13 +257,14 @@ pub struct Counters {
     /// Drafts by where they came from and their position in the draft,
     /// `[source][position]`: how many were tested (every draft before them
     /// was accepted) and how many of those were accepted. Source 0 is the
-    /// lookup of earlier text, 1 the model's own draft block; the last
+    /// lookup of earlier text, 1 a draft block of the model, 2 a DFlash
+    /// drafter ([`DrafterKind::source`](crate::DrafterKind::source)); the last
     /// position counts the ones past it too.
-    pub drafts_tested_at: [[u64; DRAFT_POSITIONS]; 2],
-    pub drafts_accepted_at: [[u64; DRAFT_POSITIONS]; 2],
+    pub drafts_tested_at: [[u64; DRAFT_POSITIONS]; DRAFT_SOURCES],
+    pub drafts_accepted_at: [[u64; DRAFT_POSITIONS]; DRAFT_SOURCES],
     /// Windows by where their drafts came from and how many drafts they
     /// verified, `[source][drafts]`: the chain lengths the policy chose.
-    pub draft_lengths: [[u64; DRAFT_POSITIONS + 1]; 2],
+    pub draft_lengths: [[u64; DRAFT_POSITIONS + 1]; DRAFT_SOURCES],
     /// Steps in which the model's own draft block drafted, the links of its
     /// chains (the longest chain of each step) and their device time in
     /// microseconds.
@@ -421,9 +426,10 @@ pub struct Calibration {
     pub seconds: f64,
     /// `(rows, milliseconds)` of the steps measured.
     pub step_ms: Vec<(u32, f64)>,
-    /// `(links, milliseconds)` of the chains measured: empty for a model
-    /// that does not draft with a block of its own.
-    pub chain_ms: Vec<(u32, f64)>,
+    /// Per drafter of the model ([`Model::drafters`](crate::Model::drafters)),
+    /// `(drafts, milliseconds)` of the steps that only draft measured: empty
+    /// for a model without drafters.
+    pub chain_ms: Vec<Vec<(u32, f64)>>,
 }
 
 /// A copy of the measurements with percentiles computed, printable as a
@@ -451,11 +457,11 @@ pub struct Snapshot {
     pub requests: Vec<RequestReport>,
     /// What the warm-up measured; `None` for a runtime that ran none.
     pub calibration: Option<Calibration>,
-    /// What a step costs by its rows and the model's own draft chain by its
-    /// links now, `(count, milliseconds)`: the warm-up's tables as the steps
+    /// What a step costs by its rows and each of the model's drafters by its
+    /// drafts now, `(count, milliseconds)`: the warm-up's tables as the steps
     /// that ran have corrected them.
     pub step_ms: Vec<(u32, f64)>,
-    pub chain_ms: Vec<(u32, f64)>,
+    pub chain_ms: Vec<Vec<(u32, f64)>>,
     /// Why the level of the prefix cache on SSD is not in use although the
     /// engine was given a directory for it; `None` when it is in use or was
     /// not asked for.

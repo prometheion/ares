@@ -10,8 +10,9 @@ use ares_api::{ChatFormat, EngineError, ModelCard, Prompt};
 use ares_cuda::{DevicePtr, ENTRY_CELLS, PushSlot, Segment, Stream};
 use ares_gguf::Gguf;
 use ares_runtime::{
-    ContextSpec, DeviceContext, DeviceModel, DeviceTransfer, Durable, LinkSpec, Links, Logits,
-    Model, ModelError, OwnDrafts, PrefixCache, Split, StepContext, TransferContext,
+    ContextSpec, DeviceContext, DeviceModel, DeviceTransfer, Drafter, DrafterKind, Durable,
+    LinkSpec, Links, Logits, Model, ModelError, OwnDrafts, PrefixCache, Split, StepContext,
+    TransferContext,
 };
 use ares_state::PageLayout;
 use ares_tokenizer::{ChatOptions, Tokenizer};
@@ -358,10 +359,13 @@ impl Model for Qwen35 {
         self.options.window_rows
     }
 
-    fn own_drafts(&self) -> u32 {
+    fn drafters(&self) -> Vec<Drafter> {
         match self.placement.draft {
-            Some(_) => self.options.window_rows.saturating_sub(1),
-            None => 0,
+            Some(_) => vec![Drafter {
+                kind: DrafterKind::Block,
+                drafts: self.options.window_rows.saturating_sub(1),
+            }],
+            None => Vec::new(),
         }
     }
 

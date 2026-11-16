@@ -41,8 +41,8 @@ use ares_state::PageLayout;
 
 use crate::exec::Pick;
 use crate::model::{
-    ContextSpec, DeviceContext, DeviceModel, LinkSpec, Logits, Model, ModelError, OwnDrafts,
-    PrefixCache, Split, StepContext,
+    ContextSpec, DeviceContext, DeviceModel, DrafterKind, LinkSpec, Logits, Model, ModelError,
+    OwnDrafts, PrefixCache, Split, StepContext,
 };
 use crate::text::{printable, unprintable};
 
@@ -594,8 +594,11 @@ impl Model for SyntheticModel {
         self.config.max_rows
     }
 
-    fn own_drafts(&self) -> u32 {
-        self.config.own_drafts
+    fn drafters(&self) -> Vec<crate::Drafter> {
+        match self.config.own_drafts {
+            0 => Vec::new(),
+            drafts => vec![crate::Drafter { kind: DrafterKind::Block, drafts }],
+        }
     }
 
     fn prefix_cache(&self) -> Option<PrefixCache> {

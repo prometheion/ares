@@ -241,8 +241,8 @@ impl Model for Templated {
     fn attention_span(&self) -> u32 {
         self.inner.attention_span()
     }
-    fn own_drafts(&self) -> u32 {
-        self.inner.own_drafts()
+    fn drafters(&self) -> Vec<ares_runtime::Drafter> {
+        self.inner.drafters()
     }
     fn prefix_cache(&self) -> Option<PrefixCache> {
         self.inner.prefix_cache()

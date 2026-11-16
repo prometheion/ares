@@ -1085,7 +1085,7 @@ fn engine(args: &Args, spread: &Spread, window: u32) {
                 step.p50_us / 1e3,
                 step.mean_us / 1e3,
             );
-            for (source, label) in [(0, "lookup"), (1, "own")] {
+            for (source, label) in [(0, "lookup"), (1, "block"), (2, "dflash")] {
                 let tested = c.drafts_tested_at[source];
                 if tested[0] == 0 {
                     continue;
@@ -1101,7 +1101,7 @@ fn engine(args: &Args, spread: &Spread, window: u32) {
                     rates.join(", ")
                 );
             }
-            for (source, label) in [(0, "lookup"), (1, "own")] {
+            for (source, label) in [(0, "lookup"), (1, "block"), (2, "dflash")] {
                 let lengths = c.draft_lengths[source];
                 if lengths.iter().all(|n| *n == 0) {
                     continue;
@@ -1149,10 +1149,11 @@ fn engine(args: &Args, spread: &Spread, window: u32) {
                     table.iter().take(8).map(|(n, ms)| format!("{n}: {ms:.2}")).collect();
                 shown.join(", ")
             };
+            let chains: Vec<String> = snapshot.chain_ms.iter().map(|c| prices(c)).collect();
             println!(
-                "RES {name} {how}: prices now, ms by rows: {}; chain by links: {}",
+                "RES {name} {how}: prices now, ms by rows: {}; drafters by drafts: {}",
                 prices(&snapshot.step_ms),
-                prices(&snapshot.chain_ms)
+                chains.join(" | ")
             );
             let devices: Vec<String> = (0..snapshot.devices.len())
                 .map(|d| {

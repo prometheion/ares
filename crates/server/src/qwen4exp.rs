@@ -23,7 +23,7 @@ use ares_model::qwen4exp::device::{
 };
 use ares_model::qwen4exp::{Config, DraftWeights};
 use ares_runtime::expert_store::ExpertNeighbours;
-use ares_runtime::{GpuConfig, Runtime, RuntimeConfig, required_ram};
+use ares_runtime::{GpuConfig, Model, Runtime, RuntimeConfig, required_ram};
 use ares_tokenizer::Tokenizer;
 
 use crate::load::{
@@ -427,11 +427,14 @@ pub(crate) fn load(
             calibration.seconds,
             calibration.steps,
             table(&calibration.step_ms),
-            if calibration.chain_ms.is_empty() {
-                String::new()
-            } else {
-                format!("; the draft block's chain, by links: {}", table(&calibration.chain_ms))
-            }
+            calibration
+                .chain_ms
+                .iter()
+                .zip(model.drafters())
+                .map(|(chain, drafter)| {
+                    format!("; {} by drafts: {}", drafter.kind.name(), table(chain))
+                })
+                .collect::<String>()
         );
     }
     fill_tiers(&runtime, &model, &name)?;

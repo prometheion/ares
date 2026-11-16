@@ -108,8 +108,8 @@ impl<M: Model> Model for Faulty<M> {
         self.inner.attention_span()
     }
 
-    fn own_drafts(&self) -> u32 {
-        self.inner.own_drafts()
+    fn drafters(&self) -> Vec<crate::Drafter> {
+        self.inner.drafters()
     }
 
     fn prefix_cache(&self) -> Option<PrefixCache> {

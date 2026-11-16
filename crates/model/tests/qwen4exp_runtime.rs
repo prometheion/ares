@@ -251,8 +251,8 @@ impl Model for Made {
         self.0.draft_rows()
     }
 
-    fn own_drafts(&self) -> u32 {
-        self.0.own_drafts()
+    fn drafters(&self) -> Vec<ares_runtime::Drafter> {
+        self.0.drafters()
     }
     fn attention_span(&self) -> u32 {
         self.0.attention_span()

@@ -18,7 +18,7 @@
 //! | --- | --- | --- |
 //! | kernel header | 8 | rows, segments, wanted rows, 0, byte offsets of segments, tokens, positions, wanted rows |
 //! | runtime header | 32 | magic, step number, counts of runs, updates, entries, commits, copies, corrections, masks and freed pages, byte offsets of the sections below, the longest segment, the longest commit, the words of a mask, the record's flags (1: drafts only), the rows of the row worth and its offset, 2 unused |
-//! | segments | 8 each | first row, rows, sequence slot, accepted rows, first position, flags (1: direct), 0, 0 |
+//! | segments | 8 each | first row, rows, sequence slot, accepted rows, first position, flags (1: direct), the drafter of a window whose drafts the model makes, 0 |
 //! | tokens | 1 per row | |
 //! | positions | 4 per row | time, height, width, extra: `(p, p, p, 0)` for text |
 //! | row extras | 2 per row | sequence slot, context |
@@ -45,8 +45,10 @@
 //! kernels.
 //!
 //! A window whose drafts the model makes itself (flag 2 of its segment) has
-//! no tokens for its draft rows when the record is written: the model's draft
-//! block makes them, link after link, and the host reads them back.
+//! no tokens for its draft rows when the record is written: one of the model's
+//! drafters makes them (word 6 of the segment names which, as its place in
+//! [`Model::drafters`](crate::Model::drafters) plus one), and the host reads
+//! them back.
 //!
 //! # A step that only drafts
 //!
@@ -386,15 +388,18 @@ impl<'a> RecordWriter<'a> {
     }
 
     /// Marks the segment written last as a window whose draft rows take the
-    /// tokens the model drafts itself: their tokens in this record are
-    /// placeholders.
-    pub fn own_drafts(&mut self) -> Result<(), RecordFull> {
+    /// tokens the model's drafter `drafter` makes (its id: its place in
+    /// [`Model::drafters`](crate::Model::drafters) plus one): their tokens in
+    /// this record are placeholders.
+    pub fn own_drafts(&mut self, drafter: u32) -> Result<(), RecordFull> {
         assert!(self.segs_written > 0, "a segment was written");
+        assert!(drafter > 0, "drafter 0 is the lookup, whose drafts are tokens");
         let at = HEADERS + (self.segs_written as usize - 1) * SEG_BYTES + 20;
         let capacity = self.buf.len();
-        let word = self.buf.get_mut(at..at + 4).ok_or(RecordFull { capacity })?;
-        let flags = u32::from_le_bytes([word[0], word[1], word[2], word[3]]) | FLAG_OWN_DRAFTS;
-        word.copy_from_slice(&flags.to_le_bytes());
+        let words = self.buf.get_mut(at..at + 8).ok_or(RecordFull { capacity })?;
+        let flags = u32::from_le_bytes([words[0], words[1], words[2], words[3]]) | FLAG_OWN_DRAFTS;
+        words[..4].copy_from_slice(&flags.to_le_bytes());
+        words[4..].copy_from_slice(&drafter.to_le_bytes());
         Ok(())
     }
 
@@ -805,8 +810,16 @@ impl<'a> RecordView<'a> {
     /// Whether segment `i` is a window whose draft rows take the tokens the
     /// model drafts itself.
     pub fn own_drafts(&self, i: u32) -> bool {
+        self.drafter(i).is_some()
+    }
+
+    /// The model's drafter that makes the drafts of segment `i` (its id: its
+    /// place in [`Model::drafters`](crate::Model::drafters) plus one), or
+    /// `None` for a segment whose draft rows carry their tokens.
+    pub fn drafter(&self, i: u32) -> Option<u32> {
         assert!(i < self.segments(), "segment {i} of {}", self.segments());
-        self.word(self.header[4] as usize + i as usize * SEG_BYTES + 20) & FLAG_OWN_DRAFTS != 0
+        let at = self.header[4] as usize + i as usize * SEG_BYTES;
+        (self.word(at + 20) & FLAG_OWN_DRAFTS != 0).then(|| self.word(at + 24))
     }
 
     /// Whether the step only drafts: it makes the chains of its windows whose
@@ -1093,7 +1106,7 @@ mod tests {
         let mut buf = vec![0x55u8; 1024];
         let mut w = RecordWriter::new(&mut buf, 1, 2, 4).unwrap();
         w.segment(0, 40, 3, false).unwrap();
-        w.own_drafts().unwrap();
+        w.own_drafts(2).unwrap();
         w.row(Row { slot: 0, position: 40, token: 9, context: 0 }).unwrap();
         w.row(Row { slot: 0, position: 41, token: 0, context: 0 }).unwrap();
         w.row(Row { slot: 0, position: 42, token: 0, context: 0 }).unwrap();
@@ -1104,6 +1117,7 @@ mod tests {
         let used = w.finish().unwrap();
         let record = RecordView::new(&buf[..used]).unwrap();
         assert!(record.own_drafts(0) && !record.own_drafts(1));
+        assert_eq!((record.drafter(0), record.drafter(1)), (Some(2), None), "the drafter's id");
         // The flag is not the kernels' "direct" flag.
         assert!(!record.segment(0).direct && record.segment(1).direct);
         assert_eq!(record.sampler(1), params.row(41));

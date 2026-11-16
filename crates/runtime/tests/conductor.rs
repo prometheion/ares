@@ -851,7 +851,7 @@ fn drafting_runtime(
 }
 
 /// The windows the policy made, by the number of drafts they verified: `[source][drafts]`.
-fn lengths(rt: &Runtime) -> [[u64; 17]; 2] {
+fn lengths(rt: &Runtime) -> [[u64; 17]; ares_runtime::DRAFT_SOURCES] {
     snapshot_of(rt).counters.draft_lengths
 }
 
@@ -1151,10 +1151,9 @@ fn the_calibration_finds_the_edge_of_a_launch_and_the_cost_of_a_link() {
     let step = |rows: u32| calibration.step_ms.iter().find(|(n, _)| *n == rows).unwrap().1;
     assert!((step(9) - step(8) - 3.03).abs() < 1e-9, "{:?}", calibration.step_ms);
     // A link of the chain costs 0.3 ms, however long the chain.
-    assert_eq!(calibration.chain_ms.len(), 7, "{:?}", calibration.chain_ms);
-    assert!(
-        calibration.chain_ms.iter().all(|(links, ms)| (ms / f64::from(*links) - 0.3).abs() < 1e-9)
-    );
+    let chain = &calibration.chain_ms[0];
+    assert_eq!(chain.len(), 7, "{chain:?}");
+    assert!(chain.iter().all(|(links, ms)| (ms / f64::from(*links) - 0.3).abs() < 1e-9));
     assert!(calibration.steps > 30 && calibration.seconds > 0.0, "{calibration:?}");
 }
 
@@ -1185,7 +1184,7 @@ fn the_conductor_measures_the_steps_of_an_executor_that_does_not_say_what_they_t
     // A chain is a step that only drafts, and is measured like any step:
     // never shorter than the executor took for its links.
     assert!(
-        calibration.chain_ms.iter().all(|(links, ms)| *ms >= 0.3 * f64::from(*links) - 1e-6),
+        calibration.chain_ms[0].iter().all(|(links, ms)| *ms >= 0.3 * f64::from(*links) - 1e-6),
         "{:?}",
         calibration.chain_ms
     );

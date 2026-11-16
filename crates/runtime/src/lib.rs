@@ -85,8 +85,9 @@ pub use exec::{
 pub use gpu::{GpuConfig, GpuExecutor, required_ram};
 pub use links::{Links, MAX_DEVICES};
 pub use model::{
-    ContextSpec, DeviceContext, DeviceModel, DeviceTransfer, Durable, LinkSpec, Logits, Model,
-    ModelError, OwnDrafts, PrefixCache, Split, StepContext, TransferContext,
+    ContextSpec, DeviceContext, DeviceModel, DeviceTransfer, Drafter, DrafterKind, Durable,
+    LinkSpec, Logits, Model, ModelError, OwnDrafts, PrefixCache, Split, StepContext,
+    TransferContext,
 };
 pub use ram::{
     CacheBuffer, Follow, LockedChunk, Look, Machine, Meminfo, MemorySource, PinnedRam, PlaceChunks,
@@ -101,7 +102,7 @@ pub use sync::{WakeCounts, Woke};
 pub use synthetic::{SyntheticConfig, SyntheticModel};
 pub use text::{StopMatcher, printable, unprintable};
 pub use timing::{
-    Calibration, Counters, DEFAULT_WINDOW, DRAFT_POSITIONS, DevicePhase, DeviceTimes, Phase,
-    REPORTED_REQUESTS, RequestReport, Series, Snapshot, Stats, Summary,
+    Calibration, Counters, DEFAULT_WINDOW, DRAFT_POSITIONS, DRAFT_SOURCES, DevicePhase,
+    DeviceTimes, Phase, REPORTED_REQUESTS, RequestReport, Series, Snapshot, Stats, Summary,
 };
 pub use watch::{Thinking, Watch};

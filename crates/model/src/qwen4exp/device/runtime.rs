@@ -39,8 +39,8 @@ use ares_runtime::expert_store::{
     CudaSlots, HostRegion, PIECE, Serve, StoreConfig, StorePlan, StoreStats,
 };
 use ares_runtime::{
-    ContextSpec, DeviceContext, DeviceModel, LinkSpec, Logits, Model, ModelError, OwnDrafts, Pick,
-    PinnedRam, Split, StepContext,
+    ContextSpec, DeviceContext, DeviceModel, Drafter, DrafterKind, LinkSpec, Logits, Model,
+    ModelError, OwnDrafts, Pick, PinnedRam, Split, StepContext,
 };
 use ares_state::PageLayout;
 use ares_tokenizer::{ChatOptions, Tokenizer};
@@ -1395,10 +1395,13 @@ impl Model for Qwen4Exp {
         self.opts.part.window_rows
     }
 
-    fn own_drafts(&self) -> u32 {
+    fn drafters(&self) -> Vec<Drafter> {
         match self.draft {
-            Some(_) => self.opts.part.window_rows.saturating_sub(1),
-            None => 0,
+            Some(_) => vec![Drafter {
+                kind: DrafterKind::Block,
+                drafts: self.opts.part.window_rows.saturating_sub(1),
+            }],
+            None => Vec::new(),
         }
     }
 

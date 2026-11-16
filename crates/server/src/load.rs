@@ -1338,11 +1338,14 @@ fn load_qwen35(
             calibration.seconds,
             calibration.steps,
             table(&calibration.step_ms),
-            if calibration.chain_ms.is_empty() {
-                String::new()
-            } else {
-                format!("; the draft block's chain, by links: {}", table(&calibration.chain_ms))
-            }
+            calibration
+                .chain_ms
+                .iter()
+                .zip(model.drafters())
+                .map(|(chain, drafter)| {
+                    format!("; {} by drafts: {}", drafter.kind.name(), table(chain))
+                })
+                .collect::<String>()
         );
     }
 
