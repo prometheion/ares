@@ -5470,9 +5470,9 @@ route looks at a request in this order:
    an origin of `--cors-origins` is answered at once, without a key, which a
    browser does not send with it: `GET, POST` and the headers it asks for.
 3. The page a request comes from (`Origin`). Without keys, a request a browser
-   sent from a page of another site gets 403 (`forbidden_origin`): local pages,
-   pages of the server's own name, of an allowed host and of `--cors-origins`
-   pass. Programs send no `Origin`.
+   sent from a page of another site gets 403 (`forbidden_origin`): pages of
+   this machine (`localhost`, a loopback address), of the server's own name, of
+   an allowed host and of `--cors-origins` pass. Programs send no `Origin`.
 4. The key. With keys (`--api-key`, several separated by commas, and
    `--api-key-file`, one on each line), every route but `/health` wants one,
    as `Authorization: Bearer <key>` or `x-api-key: <key>` (Anthropic's header,

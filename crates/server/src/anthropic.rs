@@ -38,9 +38,10 @@
 //! blocks (input other than text is not built), tools of a `type` that
 //! Anthropic's service defines or runs (`web_search_...`, `bash_...` and the
 //! like) and the blocks they leave in a history, `defer_loading`,
-//! `mcp_servers`, `container`, `context_management`, citations, a last
-//! message of the assistant (a prefill, which asks to continue a message),
-//! and every member this module does not know.
+//! `mcp_servers`, `container`, `context_management`, citations, and every
+//! member this module does not know. A last message of the assistant is a
+//! prefill, and the reply continues it (`continue_final_message` of the chat
+//! body).
 //!
 //! # Decisions
 //!
@@ -73,10 +74,10 @@
 //! `input_tokens` is the rest, so the two add up to the prompt;
 //! `cache_creation_input_tokens` is 0.
 //!
-//! **Why a reply ended.** `end_turn`, `max_tokens` or `tool_use`. The engine
-//! has one word for a reply the model ended and one a stop string ended, so a
-//! reply that a stop sequence cut says `end_turn` and its `stop_sequence` is
-//! `null`.
+//! **Why a reply ended.** `end_turn`, `max_tokens`, `tool_use`, or
+//! `stop_sequence` with the string in `stop_sequence`: the engine names the
+//! stop string that matched. A reply with calls ended to call them, also when
+//! a stop string cut it.
 //!
 //! **The billing line of Claude Code.** Claude Code begins its system prompt
 //! with a line of its own bookkeeping whose stamp (`cch=...`) is another one
@@ -94,9 +95,10 @@
 //!
 //! # Headers
 //!
-//! `x-api-key`, `anthropic-version` and `anthropic-beta` are not looked at:
-//! the server has no keys, one version of the API, and serves a field of a
-//! beta or refuses it by its name in the body.
+//! `x-api-key` carries a key of the server (the `access` module looks at it,
+//! as at `Authorization: Bearer`). `anthropic-version` and `anthropic-beta`
+//! are not looked at: the server has one version of the API, and serves a
+//! field of a beta or refuses it by its name in the body.
 
 mod reply;
 mod request;

@@ -153,6 +153,10 @@ async fn without_keys_a_page_of_another_site_is_refused() {
     assert_eq!(parsed(&text)["error"]["code"], "forbidden_origin");
     let (status, _, _) = send(&app, "POST", "/v1/messages", &foreign, Some(MESSAGES_BODY)).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
+    // A page of another machine of the network is no local page.
+    let lan = [("host", "127.0.0.1:8000"), ("origin", "http://192.168.1.50:3000")];
+    let (status, _, _) = send(&app, "GET", "/v1/models", &lan, None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
     let null = [("host", "127.0.0.1:8000"), ("origin", "null")];
     let (status, _, _) = send(&app, "GET", "/v1/models", &null, None).await;
     assert_eq!(status, StatusCode::FORBIDDEN);

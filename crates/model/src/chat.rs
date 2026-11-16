@@ -307,6 +307,108 @@ mod tests {
         }
     }
 
+    /// The tokenizers of the model files the tests name, with the name of
+    /// the variable: `ARES_TEST_GGUF` (Qwen3.5-0.8B), `ARES_TEST_QWEN38_27B`,
+    /// `ARES_TEST_FLASH_NEXT`. Reading the metadata of a file needs no GPU.
+    fn model_tokenizers() -> Vec<(&'static str, Tokenizer)> {
+        let mut found = Vec::new();
+        for variable in ["ARES_TEST_GGUF", "ARES_TEST_QWEN38_27B", "ARES_TEST_FLASH_NEXT"] {
+            match std::env::var_os(variable) {
+                Some(path) => found.push((
+                    variable,
+                    Tokenizer::from_gguf(&ares_gguf::Gguf::open(path).unwrap()).unwrap(),
+                )),
+                None => eprintln!("skipped: set {variable} to a model file"),
+            }
+        }
+        found
+    }
+
+    fn rendered(tokenizer: &Tokenizer, chat: &ChatOptions, prompt: &Prompt) -> String {
+        let tokens = encode(tokenizer, chat, prompt).unwrap();
+        String::from_utf8(tokenizer.decode(&tokens, true).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn a_continued_message_ends_the_prompt_where_its_text_does() {
+        let user = ares_api::Message::new(Role::User, "Write a haiku.");
+        let conversation = |content: &str, reasoning: Option<&str>, continue_final: bool| {
+            let mut assistant = ares_api::Message::new(Role::Assistant, content);
+            assistant.reasoning_content = reasoning.map(str::to_owned);
+            Prompt::Chat {
+                messages: vec![user.clone(), assistant],
+                tools: None,
+                variables: Vec::new(),
+                continue_final,
+            }
+        };
+        for (variable, tokenizer) in model_tokenizers() {
+            let chat = ChatOptions::default();
+            // The answer goes on after its text, as a whole turn has it.
+            let whole = rendered(&tokenizer, &chat, &conversation("Autumn ", None, false));
+            let continued = rendered(&tokenizer, &chat, &conversation("Autumn ", None, true));
+            let turn =
+                |text: &str| text[text.rfind("<|im_start|>assistant\n").unwrap()..].to_owned();
+            assert!(continued.ends_with("Autumn "), "{variable}: {continued:?}");
+            assert!(!turn(&continued).contains("<|im_end|>"), "{variable}: {continued:?}");
+            assert!(whole.starts_with(continued.trim_end()), "{variable}: {whole:?}");
+            // Reasoning without an answer goes on thinking.
+            let thinking = conversation("", Some("The user wants"), true);
+            let continued = rendered(&tokenizer, &chat, &thinking);
+            assert!(continued.ends_with("The user wants"), "{variable}: {continued:?}");
+            assert!(turn(&continued).contains("<think>"), "{variable}: {continued:?}");
+            assert!(!turn(&continued).contains("</think>"), "{variable}: {continued:?}");
+            // The tags of the thinking print, so the engine finds them in a prompt.
+            for tag in ["<think>", "</think>"] {
+                let id = tokenizer
+                    .encode(tag, EncodeOptions { add_special: false, parse_special: true });
+                let mut text = Vec::new();
+                piece(&tokenizer, id[0], &mut text);
+                assert_eq!((id.len(), text.as_slice()), (1, tag.as_bytes()), "{variable}");
+            }
+            // A last message that is not the assistant's has nothing to continue.
+            let prompt = Prompt::Chat {
+                messages: vec![user.clone()],
+                tools: None,
+                variables: Vec::new(),
+                continue_final: true,
+            };
+            assert!(matches!(
+                encode(&tokenizer, &chat, &prompt),
+                Err(EngineError::InvalidRequest(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn a_template_of_a_file_takes_the_place_of_the_models() {
+        let source = "{% for m in messages %}[{{ m.role }}] {{ m.content }}\n{% endfor %}\
+                      {% if add_generation_prompt %}[assistant] {% endif %}";
+        for (variable, tokenizer) in model_tokenizers() {
+            let template = tokenizer.compile_template(source).unwrap();
+            let chat = ChatOptions {
+                template: Some(std::sync::Arc::new(template)),
+                ..ChatOptions::default()
+            };
+            let prompt = Prompt::Chat {
+                messages: vec![ares_api::Message::new(Role::User, "hi")],
+                tools: None,
+                variables: Vec::new(),
+                continue_final: false,
+            };
+            assert_eq!(
+                rendered(&tokenizer, &chat, &prompt),
+                "[user] hi\n[assistant] ",
+                "{variable}"
+            );
+            // What is read off a template is read off this one: it has no thinking.
+            let format = chat_format(&tokenizer, &chat);
+            assert_eq!(format.thinking, None, "{variable}");
+            assert!(chat_format(&tokenizer, &ChatOptions::default()).thinking.is_some());
+            assert!(tokenizer.compile_template("{% for %}").is_err());
+        }
+    }
+
     #[test]
     fn a_request_variable_wins_over_the_one_the_server_set() {
         let chat = ChatOptions {

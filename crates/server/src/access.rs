@@ -17,9 +17,9 @@
 //!    with it.
 //! 3. **The page a request comes from** (`Origin`). Without a key, a request
 //!    that a browser sent from a page of another site gets 403, so that a page
-//!    cannot make a local server work for it. Local pages (their host is a
-//!    local name), pages of the server's own name and of an allowed host, and
-//!    the origins of `--cors-origins` pass. A program that is no browser sends
+//!    cannot make a local server work for it. Pages of this machine
+//!    (`localhost`, a loopback address), pages of the server's own name and of
+//!    an allowed host, and the origins of `--cors-origins` pass. A program that is no browser sends
 //!    no `Origin` and passes.
 //! 4. **The key.** With keys, every route but `/health` wants one of them, as
 //!    `Authorization: Bearer <key>` or as `x-api-key: <key>` (Anthropic's
@@ -87,7 +87,7 @@ impl Access {
             return true;
         }
         let Some(own) = origin_host(origin) else { return false };
-        local_host(own)
+        loopback_host(own)
             || host.is_some_and(|host| same_name(host, own))
             || self.hosts.iter().flatten().any(|name| same_name(name, own))
     }
@@ -136,6 +136,20 @@ fn local_host(host: &str) -> bool {
     bare.parse::<IpAddr>().is_ok()
         || host.eq_ignore_ascii_case("localhost")
         || host.to_ascii_lowercase().ends_with(".localhost")
+}
+
+/// Whether `host` is this machine: `localhost` and the names under it, and
+/// the loopback addresses. A page served from there is a local page.
+fn loopback_host(host: &str) -> bool {
+    let host = host.trim_end_matches('.');
+    let bare = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')).unwrap_or(host);
+    match bare.parse::<IpAddr>() {
+        Ok(address) => address.is_loopback(),
+        Err(_) => {
+            host.eq_ignore_ascii_case("localhost")
+                || host.to_ascii_lowercase().ends_with(".localhost")
+        }
+    }
 }
 
 /// The host of a `Host` header or of an authority: without its port, an
@@ -253,6 +267,16 @@ mod tests {
         }
         for host in ["example.com", "localhost.example.com", "127.0.0.1.nip.io", "[::1"] {
             assert!(!local_host(host), "{host}");
+        }
+    }
+
+    #[test]
+    fn local_pages_are_pages_of_this_machine() {
+        for host in ["localhost", "app.localhost", "127.0.0.1", "127.1.2.3", "[::1]"] {
+            assert!(loopback_host(host), "{host}");
+        }
+        for host in ["10.0.0.7", "192.168.1.50", "example.com", "[::2]"] {
+            assert!(!loopback_host(host), "{host}");
         }
     }
 

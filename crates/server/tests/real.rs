@@ -372,6 +372,88 @@ fn read_events(stream: &mut TcpStream, count: usize) -> Vec<u8> {
 const GERMAN: &str = "Erkl\u{e4}re in drei S\u{e4}tzen, warum der Himmel blau ist.";
 const ENGLISH: &str = "Explain in three sentences why the sky is blue.";
 
+/// Tokens and properties, the count of the thinking, the stop string that
+/// ended a reply and a prefill, with the model's own template.
+#[test]
+fn the_basics_of_a_server_work_with_a_real_model() {
+    let Some(model) = model() else { return };
+    let server = Server::start(&model, port(5), &[]);
+    let props = server.get("/props").json();
+    assert!(props["chat_template"].as_str().unwrap().contains("<|im_start|>"), "{props}");
+    assert_eq!(props["chat_template_caps"]["supports_reasoning"], true, "{props}");
+    assert_eq!(props["context_length"], 8192);
+
+    // The tokens of a chat request are the prompt the chat route counts, and
+    // tokens go back to their text.
+    let chat = server.chat(ENGLISH, json!({}));
+    let tokens = server.post("/tokenize", &chat).json()["tokens"].as_array().unwrap().len();
+    let counted = server.post("/v1/chat/completions/input_tokens", &chat).json();
+    assert_eq!(counted["input_tokens"], tokens);
+    let text = json!({"content": GERMAN, "with_pieces": true});
+    let pieces = server.post("/tokenize", &text).json()["tokens"].clone();
+    let ids: Vec<Value> = pieces.as_array().unwrap().iter().map(|p| p["id"].clone()).collect();
+    let back = server.post("/detokenize", &json!({"tokens": ids})).json();
+    assert_eq!(back["content"], GERMAN);
+
+    // A reply that thinks: its thinking is counted to the closing tag.
+    let reply =
+        server.post("/v1/chat/completions", &server.chat(ENGLISH, json!({"max_tokens": 600})));
+    let reply = reply.json();
+    let usage = &reply["usage"];
+    let reasoning = usage["completion_tokens_details"]["reasoning_tokens"].as_u64().unwrap();
+    let completion = usage["completion_tokens"].as_u64().unwrap();
+    let message = &reply["choices"][0]["message"];
+    let thought = message["reasoning_content"].as_str().unwrap_or_default();
+    let thought = json!({"content": thought});
+    let thought = server.post("/tokenize", &thought).json()["tokens"].as_array().unwrap().len();
+    if message["content"].as_str().is_some_and(|content| !content.is_empty()) {
+        // The reasoning's tokens and the layout and tag around it: a token or
+        // two the tokenizer and the model cut differently.
+        assert!(reasoning < completion, "{reply}");
+        assert!(reasoning.abs_diff(thought as u64 + 2) <= 4, "{reasoning} and {thought}: {reply}");
+    } else {
+        assert_eq!(reasoning, completion, "cut inside the thinking: {reply}");
+    }
+
+    // A stop string from the middle of a greedy reply ends it and is named.
+    let plain = json!({"max_tokens": 40, "chat_template_kwargs": {"enable_thinking": false}});
+    let free = server.post("/v1/chat/completions", &server.chat(ENGLISH, plain.clone())).json();
+    let answer = free["choices"][0]["message"]["content"].as_str().unwrap().to_owned();
+    let stop: String = answer.chars().skip(20).take(4).collect();
+    let mut stopped = plain.clone();
+    stopped["stop"] = json!([stop]);
+    let cut = server.post("/v1/chat/completions", &server.chat(ENGLISH, stopped)).json();
+    let choice = &cut["choices"][0];
+    assert_eq!(choice["stop_reason"], stop, "{cut}");
+    assert_eq!(choice["message"]["content"], answer[..answer.find(&stop).unwrap()], "{cut}");
+    let messages = json!({
+        "model": server.model,
+        "max_tokens": 40,
+        "thinking": {"type": "disabled"},
+        "messages": [{"role": "user", "content": ENGLISH}],
+        "stop_sequences": [stop],
+    });
+    let message = server.post("/v1/messages", &messages).json();
+    assert_eq!(message["stop_reason"], "stop_sequence", "{message}");
+    assert_eq!(message["stop_sequence"], stop);
+
+    // A prefill: the reply goes on from the given start of the answer.
+    let start: String = answer.chars().take(20).collect();
+    let mut prefill = messages.clone();
+    prefill["messages"] = json!([
+        {"role": "user", "content": ENGLISH},
+        {"role": "assistant", "content": start},
+    ]);
+    prefill["stop_sequences"] = json!([]);
+    let rest = server.post("/v1/messages", &prefill).json();
+    assert_eq!(rest["stop_reason"], "max_tokens", "{rest}");
+    let rest = rest["content"][0]["text"].as_str().unwrap_or_default().to_owned();
+    // The template lays the turn out as its own, so the reply need not be the
+    // free one's; it goes on, and does not begin the answer again.
+    assert!(!rest.trim().is_empty() && !rest.starts_with(&start), "{start:?} then {rest:?}");
+    server.stop();
+}
+
 #[test]
 fn a_chat_gives_the_same_text_streamed_and_plain_for_the_same_seed() {
     let Some(model) = model() else { return };
