@@ -253,6 +253,13 @@ impl ExpertShape {
         4 * u64::from(self.n_experts) * u64::from(n_rows)
     }
 
+    /// Bytes of one list of predicted experts ([`ExpertKernels::predict`]) for a step of
+    /// `n_rows` rows: the step's token, the number of experts and at most `top_k` per row,
+    /// in words, rounded up to 64 bytes.
+    pub fn predict_list_bytes(&self, n_rows: u32) -> u64 {
+        (4 * (2 + u64::from(self.top_k) * u64::from(n_rows))).next_multiple_of(64)
+    }
+
     /// Bytes of the scratch that holds the quantized hidden values of every
     /// (row, expert) pair of a step of `n_rows` rows.
     pub fn hidden_bytes(&self, n_rows: u32) -> u64 {
@@ -525,6 +532,45 @@ pub struct PruneLayer {
     pub near_count: u32,
 }
 
+/// A list of predicted experts as the host reads it: a copy of what
+/// [`ExpertKernels::predict`] wrote for one router.
+#[derive(Clone, Copy, Debug)]
+pub struct PredictedList<'a> {
+    bytes: &'a [u8],
+    n: usize,
+}
+
+impl<'a> PredictedList<'a> {
+    /// Reads `bytes` as the list of the step with `token`. `None` when the list is of
+    /// another step (no prediction was made in this one) or does not hold what it says.
+    pub fn parse(bytes: &'a [u8], token: u32) -> Option<Self> {
+        let word = |at: usize| -> Option<u32> {
+            Some(u32::from_le_bytes(bytes.get(4 * at..4 * at + 4)?.try_into().ok()?))
+        };
+        if word(0)? != token {
+            return None;
+        }
+        let n = word(1)? as usize;
+        (bytes.len() >= 4 * (2 + n)).then_some(Self { bytes, n })
+    }
+
+    /// The predicted experts, by their best rank among the rows' picks, then by number.
+    pub fn experts(&self) -> impl Iterator<Item = u32> + '_ {
+        (0..self.n).map(move |i| {
+            let at = 4 * (2 + i);
+            u32::from_le_bytes(self.bytes[at..at + 4].try_into().unwrap_or([0; 4]))
+        })
+    }
+
+    pub fn len(&self) -> usize {
+        self.n
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.n == 0
+    }
+}
+
 /// The kernels of the mixture of experts on one device.
 #[derive(Debug, Clone)]
 pub struct ExpertKernels {
@@ -535,6 +581,8 @@ pub struct ExpertKernels {
     group: Function,
     select_pruned: Function,
     pick_pruned: Function,
+    predict_logits: Function,
+    predict_pick: Function,
     /// Per type of [`EXPERT_TYPES`]: the gate and up kernel and the down kernel.
     typed: Vec<(Function, Function)>,
 }
@@ -560,6 +608,8 @@ impl ExpertKernels {
             group: module.function("ares_expert_group")?,
             select_pruned: module.function("ares_expert_select_pruned")?,
             pick_pruned: module.function("ares_expert_pick_pruned")?,
+            predict_logits: module.function("ares_expert_predict_logits")?,
+            predict_pick: module.function("ares_expert_predict_pick")?,
             typed,
         })
     }
@@ -792,6 +842,86 @@ impl ExpertKernels {
             .u32(token);
         // SAFETY: the argument list matches ares_expert_group.
         unsafe { self.group.launch(stream, [1, 1, 1], [threads, 1, 1], 0, args) }
+    }
+
+    /// Predicts what the routers `routers` of later layers (one or two, F32 like a layer's
+    /// own, of the layers of `shape`) will pick for the `n_rows` rows of `act`, the rows a
+    /// router of this step read (Pre-gated MoE, FATE): per router the experts that some row
+    /// would pick among its `top_k` (ranked by logit, which is the router's own order),
+    /// by their best rank over the rows, then by number. A list per router is written at
+    /// `lists`, `list_bytes` apart ([`ExpertShape::predict_list_bytes`], read with
+    /// [`PredictedList`]), headed by `token`. Two launches whatever the number of routers.
+    ///
+    /// # Safety
+    ///
+    /// On the stream's device and alive until the launches have run: `routers` as the router
+    /// of [`ExpertKernels::logits`]; `act` the activations of `n_rows` rows as
+    /// `Kernels::quantize_activations` writes them; `logits` `routers.len()` times
+    /// [`ExpertShape::logits_bytes`] bytes; `lists` `routers.len() * list_bytes` bytes, 4-byte
+    /// aligned. The outputs overlap neither each other nor the inputs.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn predict(
+        &self,
+        stream: &Stream,
+        shape: &ExpertShape,
+        routers: &[DevicePtr],
+        act: DevicePtr,
+        logits: DevicePtr,
+        lists: DevicePtr,
+        list_bytes: u64,
+        n_rows: u32,
+        token: u32,
+    ) -> Result<()> {
+        shape.check()?;
+        check_rows(n_rows)?;
+        let (first, second) = match routers {
+            [one] => (*one, *one),
+            [one, two] => (*one, *two),
+            _ => {
+                return Err(invalid(
+                    "expert prediction",
+                    format!("{} routers; a prediction takes one or two", routers.len()),
+                ));
+            }
+        };
+        if list_bytes < shape.predict_list_bytes(n_rows) || !list_bytes.is_multiple_of(4) {
+            return Err(invalid(
+                "expert prediction",
+                format!("lists of {list_bytes} bytes for {n_rows} rows"),
+            ));
+        }
+        for router in routers {
+            check_align("router matrix", *router, 4)?;
+        }
+        check_align("activations", act, 16)?;
+        check_align("router logits", logits, 4)?;
+        check_align("predicted experts", lists, 4)?;
+        let n = routers.len() as u32;
+        let args = Args::new()
+            .ptr(first)
+            .ptr(second)
+            .ptr(act)
+            .ptr(logits)
+            .u32(shape.n_embd)
+            .u32(shape.n_experts)
+            .u32(n_rows);
+        let blocks = shape.n_experts.div_ceil(MMVQ_ROWS_PER_BLOCK);
+        // SAFETY: the argument list matches ares_expert_predict_logits; the ranges are the
+        // caller's guarantee.
+        unsafe {
+            self.predict_logits.launch(stream, [blocks, n, 1], [MMVQ_THREADS, 1, 1], 0, args)?;
+        }
+        let threads = shape.n_experts.next_multiple_of(32);
+        let args = Args::new()
+            .ptr(logits)
+            .ptr(lists)
+            .u32((list_bytes / 4) as u32)
+            .u32(shape.n_experts)
+            .u32(shape.top_k)
+            .u32(n_rows)
+            .u32(token);
+        // SAFETY: the argument list matches ares_expert_predict_pick.
+        unsafe { self.predict_pick.launch(stream, [n, 1, 1], [threads, 1, 1], 0, args) }
     }
 
     /// The router's logits for any number of rows, from activations in the layout of

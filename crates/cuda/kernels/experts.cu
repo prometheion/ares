@@ -12,6 +12,7 @@
 #include "expert_layout.cuh"
 #include "expert_router.cuh"
 #include "expert_ffn.cuh"
+#include "expert_predict.cuh"
 
 // The router's logits: its matrix is F32 and multiplies the rows exactly.
 ARES_MMVF_KERNEL(ares_expert_logits, AresF32)

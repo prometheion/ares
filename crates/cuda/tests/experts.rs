@@ -32,8 +32,8 @@ use std::sync::OnceLock;
 use ares_core::GgmlType;
 use ares_cuda::{
     Device, DeviceBuffer, ExpertKernels, ExpertShape, HostShare, Kernels, NearEntry, PinnedBuffer,
-    PrefillPath, Prune, PruneLayer, PruneRule, PruneWeights, RouteRecord, Stream, Wait,
-    device_count,
+    PredictedList, PrefillPath, Prune, PruneLayer, PruneRule, PruneWeights, RouteRecord, Stream,
+    Wait, device_count,
 };
 
 fn gpus() -> Option<&'static [Device]> {
@@ -675,6 +675,100 @@ fn router_orders_equal_values_by_index() {
             let weights: Vec<f32> = record.weights(row).collect();
             assert_eq!(weights[0], weights[1]);
             assert_eq!(weights[2], weights[3]);
+        }
+    }
+}
+
+#[test]
+fn the_routers_of_later_layers_predict_what_they_would_pick() {
+    let Some(gpus) = gpus() else { return };
+    let next = synthetic_layer(GgmlType::IQ2_S, 31);
+    let after = synthetic_layer(GgmlType::IQ2_S, 32);
+    let shape = next.shape;
+    let n = shape.n_embd as usize;
+    let mut rng = Rng(17);
+    for n_rows in [1u32, 3, 8] {
+        let x: Vec<f32> = (0..n_rows as usize * n).map(|_| rng.activation()).collect();
+        for device in gpus {
+            let rig = Rig::new(device, &next, n_rows, 1);
+            let second = DeviceBuffer::new(device, shape.router_bytes()).unwrap();
+            second.write(0, &f32_bytes(&after.router)).unwrap();
+            let list_bytes = shape.predict_list_bytes(n_rows);
+            let lists = DeviceBuffer::new(device, 2 * list_bytes).unwrap();
+            let logits = DeviceBuffer::new(device, 2 * shape.logits_bytes(n_rows)).unwrap();
+            // The router of the next layer routes the rows itself as well: its prediction
+            // must name what it picks.
+            let record = rig.route(&shape, &x, n_rows, 5);
+            let record = RouteRecord::parse(&record, shape.top_k, n_rows).unwrap();
+            // SAFETY: the buffers were sized for this shape and number of rows.
+            unsafe {
+                rig.experts
+                    .predict(
+                        &rig.stream,
+                        &shape,
+                        &[rig.router.ptr(), second.ptr()],
+                        rig.act.ptr(),
+                        logits.ptr(),
+                        lists.ptr(),
+                        list_bytes,
+                        n_rows,
+                        99,
+                    )
+                    .unwrap();
+            }
+            rig.stream.synchronize().unwrap();
+            let mut host = vec![0u8; 2 * list_bytes as usize];
+            lists.read(0, &mut host).unwrap();
+            for (d, layer) in [&next, &after].into_iter().enumerate() {
+                let bytes = &host[d * list_bytes as usize..(d + 1) * list_bytes as usize];
+                assert!(PredictedList::parse(bytes, 98).is_none(), "a list of another step");
+                let list = PredictedList::parse(bytes, 99).expect("a list of this step");
+                // The reference: every expert some row picks, by its best rank, then number.
+                let mut best = BTreeMap::new();
+                for row in 0..n_rows as usize {
+                    let (_, picks) = reference_route(layer, &x[row * n..(row + 1) * n]);
+                    for (rank, (expert, _)) in picks.iter().enumerate() {
+                        let at = best.entry(*expert).or_insert(rank);
+                        *at = (*at).min(rank);
+                    }
+                }
+                let mut want: Vec<(usize, u32)> = best.into_iter().map(|(e, r)| (r, e)).collect();
+                want.sort_unstable();
+                let want: Vec<u32> = want.into_iter().map(|(_, e)| e).collect();
+                let got: Vec<u32> = list.experts().collect();
+                assert_eq!(got, want, "router {d}, {n_rows} rows on {}", device.info().name);
+                if d == 0 {
+                    let mut picked: Vec<u32> =
+                        (0..n_rows as usize).flat_map(|row| record.ids(row)).collect();
+                    picked.sort_unstable();
+                    picked.dedup();
+                    let mut named = got.clone();
+                    named.sort_unstable();
+                    assert_eq!(named, picked, "what the router picks when its layer runs");
+                }
+            }
+            // One router alone.
+            // SAFETY: as above.
+            unsafe {
+                rig.experts
+                    .predict(
+                        &rig.stream,
+                        &shape,
+                        &[second.ptr()],
+                        rig.act.ptr(),
+                        logits.ptr(),
+                        lists.ptr(),
+                        list_bytes,
+                        n_rows,
+                        100,
+                    )
+                    .unwrap();
+            }
+            rig.stream.synchronize().unwrap();
+            lists.read(0, &mut host).unwrap();
+            let one = PredictedList::parse(&host[..list_bytes as usize], 100).unwrap();
+            let two = PredictedList::parse(&host[list_bytes as usize..], 99).unwrap();
+            assert!(one.experts().eq(two.experts()), "the second list of before is untouched");
         }
     }
 }
