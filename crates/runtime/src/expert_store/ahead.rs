@@ -11,13 +11,14 @@
 //!
 //! - **Only what is picked more often than not.** When the tiers hold what a text uses, an
 //!   expert that no tier holds is one the text has not used, and a prediction that names it
-//!   is mostly wrong. So the store counts, per distance of the prediction (one layer or two)
-//!   and place in its list (the best rank among the rows' picks), how often an expert named
-//!   there that no tier held was then picked, read or not, and reads ahead only at the places
-//!   where that has been at least half the time: a read for nothing then costs the drive no
-//!   more than the reads that are used save the steps. Where the tiers hold little (one card,
-//!   a small RAM tier, a large file) most places qualify; where they hold nearly everything
-//!   few do, and nothing is read.
+//!   is mostly wrong. So the store counts, per kind of step (one row, or several: the rows
+//!   of a prompt or of a window pick far more experts that no tier holds), distance of the
+//!   prediction (one layer or two) and place in its list (the best rank among the rows'
+//!   picks), how often an expert named there that no tier held was then picked, read or
+//!   not, and reads ahead only at the places where that has been at least half the time: a
+//!   read for nothing then costs the drive no more than the reads that are used save the
+//!   steps. Where the tiers hold little (one card, a small RAM tier, a large file) more
+//!   places qualify; where they hold nearly everything few do, and nothing is read.
 //! - **In flight**: at most as many experts as the drives take of prefetches at once
 //!   ([`ares_io::Reader::prefetch_room`]). The reader keeps every prefetch behind every
 //!   demand read and halves the prefetch chunks at a drive while a demand chunk is there, so
@@ -50,16 +51,20 @@ const MIN_SAMPLES: f32 = 16.0;
 const MAX_SAMPLES: f32 = 512.0;
 
 /// How often an expert that no tier held and that a prediction named was then picked, per
-/// distance of the prediction (one layer, two layers) and place in its list.
+/// kind of step and distance of the prediction (one row or several, one layer or two: the
+/// four rows of the tables) and place in its list.
 #[derive(Clone, Debug, Default)]
 struct Odds {
-    named: [[f32; PLACES]; 2],
-    picked: [[f32; PLACES]; 2],
+    named: [[f32; PLACES]; 4],
+    picked: [[f32; PLACES]; 4],
 }
 
 impl Odds {
-    fn class(distance: usize, place: usize) -> (usize, usize) {
-        (distance.clamp(1, 2) - 1, place.min(PLACES - 1))
+    /// The class of a place `place` of a prediction `distance` layers ahead in a step of
+    /// `rows` rows.
+    fn class(rows: usize, distance: usize, place: usize) -> (usize, usize) {
+        let kind = usize::from(rows > 1);
+        (2 * kind + distance.clamp(1, 2) - 1, place.min(PLACES - 1))
     }
 
     /// Whether a read ahead at this place is used at least as often as not.
@@ -159,8 +164,9 @@ impl Ahead {
 }
 
 impl<D: SlotDevice> ExpertStore<D> {
-    /// A prediction made `distance` layers ahead (1 or 2) says that the router of `layer`,
-    /// which the running step has not reached, will pick `experts`, the likeliest first. Those
+    /// A prediction made `distance` layers ahead (1 or 2) in a step of `rows` rows says that
+    /// the router of `layer`, which the running step has not reached, will pick `experts`, the
+    /// likeliest first. Those
     /// that no tier holds and that are not on their way are read from the file into the RAM
     /// tier, the likeliest first and behind every read a step waits for, as far as the
     /// bounds of the read-ahead let them and only at the places of a list whose reads have
@@ -170,7 +176,7 @@ impl<D: SlotDevice> ExpertStore<D> {
     ///
     /// Nothing happens between steps, for a layer whose record has arrived, or for a layer
     /// whose experts are all resident.
-    pub fn ahead(&mut self, layer: usize, experts: &[u32], distance: usize) {
+    pub fn ahead(&mut self, layer: usize, experts: &[u32], distance: usize, rows: usize) {
         if !self.in_step
             || self.phase.get(layer) != Some(&Phase::Ahead)
             || self.layers[layer].resident
@@ -185,7 +191,7 @@ impl<D: SlotDevice> ExpertStore<D> {
                 continue;
             }
             let key = (layer, expert);
-            let class = Odds::class(distance, place);
+            let class = Odds::class(rows, distance, place);
             if let Some((state, named)) = self.ahead.named.get_mut(&key) {
                 // A nearer prediction counts for the expert from now on.
                 if *state == State::Queued && class.0 < named.0 {

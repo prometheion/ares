@@ -448,16 +448,21 @@ fn cold(rig: &Rig, layer: usize, n: usize) -> Vec<u32> {
 }
 
 impl Rig {
-    /// `steps` steps in which a prediction one layer ahead names `places` experts of layer 1
-    /// that no tier holds, the first `picked` of which its router then picks.
+    /// `steps` steps of one row in which a prediction one layer ahead names `places` experts
+    /// of layer 1 that no tier holds, the first `picked` of which its router then picks.
     fn predict_steps(&mut self, steps: usize, places: usize, picked: usize) {
+        self.predict_steps_of(1, steps, places, picked);
+    }
+
+    /// [`Rig::predict_steps`] with steps of `rows` rows.
+    fn predict_steps_of(&mut self, rows: usize, steps: usize, places: usize, picked: usize) {
         for _ in 0..steps {
             self.store.begin_step();
             self.store.routed(0, &[1]).unwrap();
             self.settle();
             let named = cold(self, 1, places);
             assert_eq!(named.len(), places, "the tiers leave enough experts in the file");
-            self.store.ahead(1, &named, 1);
+            self.store.ahead(1, &named, 1, rows);
             self.store.poll().unwrap();
             self.store.routed(1, &named[..picked]).unwrap();
             self.settle();
@@ -475,7 +480,7 @@ fn reads_ahead_start_where_predictions_have_been_picked_more_often_than_not() {
     rig.store.take_stats();
 
     // Between steps a prediction does nothing.
-    rig.store.ahead(1, &[10], 1);
+    rig.store.ahead(1, &[10], 1, 1);
     rig.store.poll().unwrap();
     assert_eq!(rig.store.stats().predicted, 0);
 
@@ -497,8 +502,8 @@ fn reads_ahead_start_where_predictions_have_been_picked_more_often_than_not() {
     let named = cold(&rig, 1, 1);
     // What a tier holds is named and not read; a layer whose record has arrived is not
     // predicted any more.
-    rig.store.ahead(1, &[named[0], 0], 1);
-    rig.store.ahead(0, &[12], 1);
+    rig.store.ahead(1, &[named[0], 0], 1, 1);
+    rig.store.ahead(0, &[12], 1, 1);
     rig.settle_guesses(|store| store.in_ram(1, named[0]));
     assert!(!rig.store.in_vram(1, named[0]), "a read ahead goes to RAM, not to VRAM");
     assert_eq!(rig.store.routed(1, &[named[0]]).unwrap(), 1);
@@ -512,6 +517,20 @@ fn reads_ahead_start_where_predictions_have_been_picked_more_often_than_not() {
 }
 
 #[test]
+fn what_steps_of_several_rows_pick_says_nothing_of_steps_of_one() {
+    let mut rig = rig(4, 8, recent_first);
+    // In steps of several rows the first place is picked every time; in steps of one row it
+    // is never picked.
+    rig.predict_steps_of(8, 17, 1, 1);
+    rig.predict_steps(17, 1, 0);
+    rig.store.take_stats();
+    rig.predict_steps(2, 1, 0);
+    rig.predict_steps_of(8, 2, 1, 1);
+    let stats = rig.store.take_stats();
+    assert_eq!((stats.ahead_reads, stats.ahead_used, stats.ahead_left), (2, 2, 2));
+}
+
+#[test]
 fn a_read_ahead_that_its_record_does_not_need_is_dropped() {
     let mut rig = rig(4, 8, recent_first);
     rig.predict_steps(17, 1, 1);
@@ -520,7 +539,7 @@ fn a_read_ahead_that_its_record_does_not_need_is_dropped() {
     rig.store.routed(0, &[1]).unwrap();
     rig.settle();
     let named = cold(&rig, 1, 1);
-    rig.store.ahead(1, &named, 1);
+    rig.store.ahead(1, &named, 1, 1);
     rig.store.poll().unwrap();
     // The record arrives before the read has come back, or after: either way the read is
     // done with and nothing waits for it.
@@ -550,7 +569,7 @@ fn reads_ahead_keep_to_what_the_drive_takes_of_prefetches() {
     rig.store.routed(0, &[1]).unwrap();
     rig.settle();
     let named = cold(&rig, 1, 3);
-    rig.store.ahead(1, &named, 1);
+    rig.store.ahead(1, &named, 1, 1);
     rig.store.poll().unwrap();
     assert_eq!(rig.store.stats().ahead_reads, 1, "one in flight");
     rig.settle_guesses(|store| named.iter().all(|e| store.in_ram(1, *e)));
