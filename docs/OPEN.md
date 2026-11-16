@@ -36,9 +36,19 @@ between cards stay with the model. Today the two models share almost nothing ins
 - [ ] 5. Token rows (embedding on the host, in the mapped file or on the card; the image rows).
 - [ ] 6. One driver for the draft block: Flash-Next's draft vocabulary and picks on the card,
       `--drafters mtp`; the 27B's drafts under a layer split. After the speculation piece.
-- [ ] 7. Drafters as kinds of the runtime (lookup, draft block, DFlash). After the speculation piece.
-- [ ] 8. DFlash on both models: each model gives only its tap (the 27B a copy of the residual,
-      Flash-Next the mean of its four streams); the loader reads the drafter's shape from the file.
+- [x] 7. Drafters as kinds of the runtime (lookup, draft block, DFlash): `Model::drafters`, the
+      drafter's id in word 6 of a segment, a price curve, acceptance and confidence per drafter.
+- [x] 8. DFlash2 chains on both models: each model gives only its tap (the 27B the residual `x`,
+      Flash-Next the mean of its four streams), its embedding rows and its draft head; the loader
+      reads the drafter's shape from the file and refuses DSpark, DFlash 1 and the other variants
+      by name. Open: Flash-Next under a split by layers (taps would cross devices), the ring in
+      the prefix cache's checkpoints, sampled drafts (the walk is greedy).
+- What trees (9, 10) find from 8: the lattice of every pass is kept (`Drafter::lattice`: 16
+  candidates and a 16 x 16 score table per position, tokens already mapped through the head
+  view); the walk is one function of it (`Lattice::chain`, kernel `ares_dflash_select`), which a
+  tree fill replaces; the drafts list has a place per window, which becomes a place per node;
+  the inject is per row and position, so a tree's kept path needs only its rows' positions
+  (a rejected branch's rows are never read, as now).
 - [ ] 9. Trees in the blocks, verified once for every drafter and both models.
 - [ ] 10. Tree fill from the DFlash lattice, MTP links mixed into a tree.
 

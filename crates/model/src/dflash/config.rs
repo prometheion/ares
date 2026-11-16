@@ -261,7 +261,7 @@ impl Config {
         if !self.n_embd.is_multiple_of(self.conv_group) {
             return fail(format!("groups of {} in a width of {}", self.conv_group, self.n_embd));
         }
-        if self.head_dim % 2 != 0 || self.head_dim > 256 {
+        if !self.head_dim.is_multiple_of(2) || self.head_dim > 256 {
             return fail(format!("heads of {} values", self.head_dim));
         }
         if self.n_head_kv == 0 || !self.n_head.is_multiple_of(self.n_head_kv) {
@@ -336,7 +336,7 @@ pub struct Vector<'g> {
 
 impl Vector<'_> {
     pub fn values(&self) -> Vec<f32> {
-        self.data.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect()
+        self.data.as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)).collect()
     }
 }
 

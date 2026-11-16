@@ -2233,7 +2233,9 @@ impl Conductor {
                         };
                         self.bars.extend(needs.iter().take(links));
                         self.bars.resize(self.bars.len() + links - links.min(needs.len()), 0.0);
-                        bars_of.get_or_insert(d);
+                        if self.drafters[d].kind == DrafterKind::Block {
+                            bars_of.get_or_insert(d);
+                        }
                     }
                     // A link of the chain picks with the sampler row of the
                     // row that verifies it, made as the first of the window:

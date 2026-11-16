@@ -127,12 +127,15 @@ fn silu(x: f32) -> f32 {
     x / (1.0 + (-x).exp())
 }
 
+/// The key and the value of one cell, each `n_head_kv * head_dim` values.
+pub type Cell = (Vec<f32>, Vec<f32>);
+
 /// The keys and values the drafter stored for a sequence, per layer and
 /// position.
 #[derive(Clone, Debug, Default)]
 pub struct Cells {
-    /// `[layer][position] -> (k, v)`, each `n_head_kv * head_dim` values.
-    pub layers: Vec<HashMap<u32, (Vec<f32>, Vec<f32>)>>,
+    /// `[layer][position] -> (k, v)`.
+    pub layers: Vec<HashMap<u32, Cell>>,
 }
 
 /// One pass's candidates and scores: for each draft position `j` (rows 1 to
@@ -216,6 +219,7 @@ impl<'g> Reference<'g> {
     /// token; `head` gives the logits of the model's head for rows of hidden
     /// states, `head_tokens` the token of each of its columns (none: column
     /// `i` is token `i`).
+    #[allow(clippy::too_many_arguments)]
     pub fn pass(
         &self,
         cells: &Cells,
