@@ -32,19 +32,17 @@ use super::placement::Placement;
 use crate::qwen35::Config;
 use crate::qwen35::weights::Weights;
 
-mod forms;
-mod kv;
 #[path = "mtp.rs"]
 mod mtp;
 mod resume;
 mod tensor;
 
+use crate::blocks::{forms, kv};
+
 pub use mtp::{DraftBytes, DraftChain, DraftStep, DraftTimes, Drafted};
 pub use resume::{CopyTimes, checkpoint_bytes, settle_cells, state_slot_bytes, transit_page_bytes};
 
-/// Bit 31 of a table entry: the page is in the pool of stored formats (the
-/// only pool the formats without a tile mean use).
-pub const PAGE_ENTRY: u32 = 1 << 31;
+pub use crate::blocks::PAGE_ENTRY;
 
 /// The formats of K and of V of the draft block: 4 bits, whatever the model's.
 /// The block's keys and values are read to propose a token that the model then

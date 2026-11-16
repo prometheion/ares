@@ -24,7 +24,7 @@ use super::{PAGE_ENTRY, invalid};
 /// The exact cells at the end of a sequence that a policy with these formats
 /// keeps (`ares_quant::KvFormat::default_exact_newest_cells`): the larger of
 /// the two formats' numbers.
-pub(super) fn newest_cells(k: CacheFormat, v: CacheFormat) -> u32 {
+pub(crate) fn newest_cells(k: CacheFormat, v: CacheFormat) -> u32 {
     let of = |format: CacheFormat| match format {
         CacheFormat::F16 | CacheFormat::Q8 => 0,
         CacheFormat::Q7 => 32,
@@ -36,19 +36,19 @@ pub(super) fn newest_cells(k: CacheFormat, v: CacheFormat) -> u32 {
 }
 
 /// Whether a group with these formats keeps exact entries.
-pub(super) fn has_exact(k: CacheFormat, v: CacheFormat) -> bool {
+pub(crate) fn has_exact(k: CacheFormat, v: CacheFormat) -> bool {
     k.has_mean() || v.has_mean()
 }
 
 /// The bytes of the exact pool for layers with these geometries: a slot is an
 /// entry in every layer.
-pub(super) fn exact_pool_bytes(geos: &[CacheGeometry], slots: u32) -> u64 {
+pub(crate) fn exact_pool_bytes(geos: &[CacheGeometry], slots: u32) -> u64 {
     geos.iter().map(|geo| geo.exact_entry_bytes()).sum::<u64>() * u64::from(slots)
 }
 
 /// What a device needs to size the exact pool of a group.
 #[derive(Clone, Copy, Debug)]
-pub(super) struct Sizing {
+pub(crate) struct Sizing {
     /// Sequences at once.
     pub slots: u32,
     /// The most rows of a step.
@@ -58,7 +58,7 @@ pub(super) struct Sizing {
 }
 
 /// The exact slots a group with these formats takes, 0 without exact entries.
-pub(super) fn slots_for(k: CacheFormat, v: CacheFormat, sizing: Sizing) -> u32 {
+pub(crate) fn slots_for(k: CacheFormat, v: CacheFormat, sizing: Sizing) -> u32 {
     if has_exact(k, v) {
         exact_slots(newest_cells(k, v), sizing.slots, sizing.rows, sizing.tails)
     } else {
@@ -69,7 +69,7 @@ pub(super) fn slots_for(k: CacheFormat, v: CacheFormat, sizing: Sizing) -> u32 {
 /// A layer of a group: its geometry, and where its entries lie in the group's
 /// exact pool and in the engine's pool of pages.
 #[derive(Clone, Copy, Debug)]
-pub(super) struct Layer {
+pub(crate) struct Layer {
     pub geo: CacheGeometry,
     pub pool: u64,
     pub exact: u64,
@@ -88,7 +88,7 @@ struct Jobs {
 
 /// The pool and the table of one group.
 #[derive(Debug)]
-pub(super) struct Pages {
+pub(crate) struct Pages {
     forms: Option<Forms>,
     exact: Option<DeviceBuffer>,
     /// The table of the group on the device, when it is not the step's.
@@ -109,7 +109,7 @@ impl Pages {
     /// step's (`step_table`: its entries are written into the table the
     /// runtime keeps).
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn new(
+    pub(crate) fn new(
         device: &Device,
         ledger: &mut Ledger,
         what: &str,
@@ -166,57 +166,57 @@ impl Pages {
     }
 
     /// The group has exact entries.
-    pub(super) fn has_exact(&self) -> bool {
+    pub(crate) fn has_exact(&self) -> bool {
         self.forms.is_some()
     }
 
     /// Bytes the pool and the table take on the device.
-    pub(super) fn bytes(&self) -> u64 {
+    pub(crate) fn bytes(&self) -> u64 {
         self.exact.as_ref().map_or(0, DeviceBuffer::len)
             + self.own.as_ref().map_or(0, DeviceBuffer::len)
     }
 
     /// The exact pool, for tests that read it.
-    pub(super) fn exact_buffer(&self) -> Option<&DeviceBuffer> {
+    pub(crate) fn exact_buffer(&self) -> Option<&DeviceBuffer> {
         self.exact.as_ref()
     }
 
     /// The group's own page table, for tests that read it.
     #[cfg(test)]
-    pub(super) fn own_table(&self) -> Option<&DeviceBuffer> {
+    pub(crate) fn own_table(&self) -> Option<&DeviceBuffer> {
         self.own.as_ref()
     }
 
     /// Exact slots in the pool, and in use.
-    pub(super) fn slots(&self) -> (u32, u32) {
+    pub(crate) fn slots(&self) -> (u32, u32) {
         self.forms.as_ref().map_or((0, 0), |f| (f.capacity(), f.in_use()))
     }
 
     /// The exact pool on the device (null without one).
-    pub(super) fn exact(&self) -> DevicePtr {
+    pub(crate) fn exact(&self) -> DevicePtr {
         self.exact.as_ref().map_or(DevicePtr::NULL, DeviceBuffer::ptr)
     }
 
     /// The table the group's kernels read: its own, or the step's.
-    pub(super) fn table(&self, step: DevicePtr) -> DevicePtr {
+    pub(crate) fn table(&self, step: DevicePtr) -> DevicePtr {
         self.own.as_ref().map_or(step, DeviceBuffer::ptr)
     }
 
     /// The group's page-table entries, which the plans of its attention are
     /// made from: what its table holds, or the conductor's entries.
-    pub(super) fn entries<'a>(&'a self, conductor: &'a [u32]) -> &'a [u32] {
+    pub(crate) fn entries<'a>(&'a self, conductor: &'a [u32]) -> &'a [u32] {
         if self.mirror.is_empty() { conductor } else { &self.mirror }
     }
 
     /// The runtime wrote `entries` into the step's table at `at`.
-    pub(super) fn written(&mut self, at: usize, entries: &[u32]) {
+    pub(crate) fn written(&mut self, at: usize, entries: &[u32]) {
         if self.own.is_none() && !self.mirror.is_empty() {
             self.mirror[at..at + entries.len()].copy_from_slice(entries);
         }
     }
 
     /// The exact slot of `page`, when the group holds it as an exact entry.
-    pub(super) fn exact_slot(&self, page: u32) -> Option<u32> {
+    pub(crate) fn exact_slot(&self, page: u32) -> Option<u32> {
         self.forms.as_ref()?.slot_of(page)
     }
 
@@ -224,7 +224,7 @@ impl Pages {
     /// group kept for it before: a page that comes back from the prefix
     /// cache's level on SSD in that form. Returns its slot and the conversions
     /// that made room, which must run before the slot is written.
-    pub(super) fn adopt_exact(&mut self, page: u32) -> Result<(u32, Vec<Convert>), ModelError> {
+    pub(crate) fn adopt_exact(&mut self, page: u32) -> Result<(u32, Vec<Convert>), ModelError> {
         let forms = self.forms.as_mut().ok_or_else(|| invalid("the group has no exact entries"))?;
         forms.release(page);
         let slot = forms.ensure(page, None).map_err(exhausted)?;
@@ -233,7 +233,7 @@ impl Pages {
     }
 
     /// The conversion of `page` into its converted entry, when it is exact.
-    pub(super) fn convert_page(&mut self, page: u32) -> Vec<Convert> {
+    pub(crate) fn convert_page(&mut self, page: u32) -> Vec<Convert> {
         match &mut self.forms {
             Some(forms) => {
                 forms.convert_page(page);
@@ -244,7 +244,7 @@ impl Pages {
     }
 
     /// The pool freed these pages.
-    pub(super) fn release(&mut self, pages: impl IntoIterator<Item = u32>) {
+    pub(crate) fn release(&mut self, pages: impl IntoIterator<Item = u32>) {
         if let Some(forms) = &mut self.forms {
             for page in pages {
                 forms.release(page);
@@ -254,7 +254,7 @@ impl Pages {
 
     /// The first `cells` cells of the sequence in `slot` are settled: the
     /// pages they fill are full.
-    pub(super) fn settled(&mut self, slot: u32, cells: u32, conductor: &[u32]) {
+    pub(crate) fn settled(&mut self, slot: u32, cells: u32, conductor: &[u32]) {
         let base = (slot * self.stride) as usize;
         if let Some(forms) = &mut self.forms {
             forms.settle(|tile| conductor[base + tile as usize] & !PAGE_ENTRY, cells);
@@ -264,13 +264,13 @@ impl Pages {
     /// The tile that the rows of the draft window of `slot` read converted
     /// from a position inside the window on, in the step last prepared, while
     /// the group's table names its exact entry.
-    pub(super) fn ahead(&self, slot: u32) -> Option<Ahead> {
+    pub(crate) fn ahead(&self, slot: u32) -> Option<Ahead> {
         self.forms.as_ref().and_then(|forms| forms.ahead(slot))
     }
 
     /// The most rows of a draft window of the group, when its formats bound
     /// them (`forms::window_limit`).
-    pub(super) fn window_limit(k: CacheFormat, v: CacheFormat) -> Option<u32> {
+    pub(crate) fn window_limit(k: CacheFormat, v: CacheFormat) -> Option<u32> {
         has_exact(k, v).then(|| window_limit(newest_cells(k, v)))
     }
 
@@ -279,7 +279,7 @@ impl Pages {
     /// the entries those imply. Returns the conversions to run. `windows`:
     /// the rows of a draft window attend together and must read every tile as
     /// they would alone ([`Pages::ahead`]).
-    pub(super) fn prepare(
+    pub(crate) fn prepare(
         &mut self,
         stream: &Stream,
         reaches: &[Reach],
@@ -350,7 +350,7 @@ impl Pages {
     /// the layers' geometries with their offsets in the exact pool and in the
     /// pages (`pages` is the start of the engine's pool of pages).
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn convert(
+    pub(crate) fn convert(
         &mut self,
         kernels: &AttentionKernels,
         stream: &Stream,
@@ -388,7 +388,7 @@ impl Pages {
     /// copied is partly used, so it is exact; the copy gets an exact slot of its
     /// own, and a page that is converted to make room for it is converted first).
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn copy_page(
+    pub(crate) fn copy_page(
         &mut self,
         kernels: &AttentionKernels,
         stream: &Stream,

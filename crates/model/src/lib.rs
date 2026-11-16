@@ -5,6 +5,7 @@
 //! `qwen35` (dense) and `qwen4exp` (a mixture of experts) exist so far, and
 //! `qwen3vl`, the image tower and merger that both read images through.
 
+mod blocks;
 pub mod chat;
 mod files;
 pub mod qwen35;

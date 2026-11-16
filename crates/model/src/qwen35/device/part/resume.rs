@@ -599,7 +599,7 @@ impl Part {
 
     /// Copies page `from` into page `to`, in every attention block and in the
     /// draft block: the converted entry, or, where the formats have a tile
-    /// mean, the exact entry (see `Pages::copy_page` in `part/kv.rs`).
+    /// mean, the exact entry (see `Pages::copy_page` in `blocks/kv.rs`).
     pub fn copy_page(
         &mut self,
         stream: &Stream,

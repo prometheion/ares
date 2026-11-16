@@ -18,9 +18,9 @@ use ares_cuda::{
 use ares_quant::{KvFormat, KvHead, KvPolicy};
 use ares_state::{PagePool, Sequence};
 
+use super::super::PAGE_ENTRY;
 use super::super::forms::Reach;
 use super::{Layer, Pages};
-use crate::qwen35::device::PAGE_ENTRY;
 
 const TILE: usize = 128;
 

@@ -620,10 +620,10 @@ Any K format combines with any V format. A page has to hold whole tiles: the
 stored rows of a tile depend on all of its cells, and a page is shared
 between sequences by the tokens up to its own end.
 
-**Where the tile formats keep their exact cells** (`qwen35`, `part/forms.rs`
-and `part/kv.rs`). The engine's pool holds converted entries only: page `p` is
-slot `p` of the converted pool of every attention layer, 128 cells in the
-format. The exact entries (a tile in `f16`) are a second pool on each device,
+**Where the tile formats keep their exact cells** (the K/V group of
+`ares-model`, `blocks/kv.rs` and `blocks/forms.rs`). The engine's pool holds
+converted entries only: page `p` is slot `p` of the converted pool of every
+attention layer, 128 cells in the format. The exact entries (a tile in `f16`) are a second pool on each device,
 for the attention blocks and for the draft block separately, which a page
 holds a slot of while it is exact: from its first write until it is full and
 has left the newest cells of every sequence that reads it. The conductor knows

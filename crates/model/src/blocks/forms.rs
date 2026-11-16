@@ -34,21 +34,21 @@
 use std::ops::Range;
 
 /// "No exact slot".
-pub(super) const NONE: u32 = u32::MAX;
+pub(crate) const NONE: u32 = u32::MAX;
 
 /// Cells of a tile.
 const TILE: u32 = ares_cuda::ENTRY_CELLS;
 
 /// A tile that goes from its exact slot into the converted entry of its page.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct Convert {
+pub(crate) struct Convert {
     pub exact: u32,
     pub page: u32,
 }
 
 /// What one sequence does in a step.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct Reach {
+pub(crate) struct Reach {
     pub slot: u32,
     /// The position of the first row: the cells before it are settled.
     pub pos0: u32,
@@ -62,7 +62,7 @@ pub(super) struct Reach {
 /// A tile that the later rows of a draft window read converted while the
 /// table still names its exact entry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct Ahead {
+pub(crate) struct Ahead {
     pub slot: u32,
     /// The first position whose row reads the tile converted.
     pub from: u32,
@@ -74,20 +74,20 @@ pub(super) struct Ahead {
 /// exact: the tile that leaves the newest cells inside the window must have
 /// been full before the window (so no more rows than `newest`), and only one
 /// tile may leave (so no more rows than a tile).
-pub(super) fn window_limit(newest: u32) -> u32 {
+pub(crate) fn window_limit(newest: u32) -> u32 {
     newest.min(TILE)
 }
 
 impl Reach {
     /// The tiles the rows read or write.
-    pub(super) fn tiles(&self) -> Range<u32> {
+    pub(crate) fn tiles(&self) -> Range<u32> {
         0..(self.pos0 + self.rows).div_ceil(TILE)
     }
 }
 
 /// The exact pool has no slot to give.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct Exhausted {
+pub(crate) struct Exhausted {
     pub capacity: u32,
     /// Exact pages that are not full (tails and the ends of sequences).
     pub partial: u32,
@@ -114,13 +114,13 @@ impl std::fmt::Display for Exhausted {
 /// most one more tile than `ceil(newest / 128)`; a step adds the tiles its
 /// rows begin, at most `ceil(rows / 128)` over all sequences and one more for
 /// every sequence that starts in the middle of a tile.
-pub(super) fn exact_slots(newest: u32, slots: u32, rows: u32, tails: u32) -> u32 {
+pub(crate) fn exact_slots(newest: u32, slots: u32, rows: u32, tails: u32) -> u32 {
     slots * (2 + newest.div_ceil(TILE)) + rows.div_ceil(TILE) + slots + tails
 }
 
 /// The state of the exact pool of one group of layers.
 #[derive(Debug)]
-pub(super) struct Forms {
+pub(crate) struct Forms {
     newest: u32,
     capacity: u32,
     /// Per page: its exact slot, or [`NONE`].
@@ -139,7 +139,7 @@ pub(super) struct Forms {
 impl Forms {
     /// An empty pool of `capacity` slots for `pages` pages whose groups keep
     /// their newest `newest` cells exact.
-    pub(super) fn new(capacity: u32, pages: u32, newest: u32) -> Self {
+    pub(crate) fn new(capacity: u32, pages: u32, newest: u32) -> Self {
         Self {
             newest,
             capacity,
@@ -154,34 +154,34 @@ impl Forms {
     }
 
     /// The exact slots of the pool.
-    pub(super) fn capacity(&self) -> u32 {
+    pub(crate) fn capacity(&self) -> u32 {
         self.capacity
     }
 
     /// The exact slots in use.
-    pub(super) fn in_use(&self) -> u32 {
+    pub(crate) fn in_use(&self) -> u32 {
         self.capacity - self.free.len() as u32
     }
 
     /// The exact slot of `page`.
-    pub(super) fn slot_of(&self, page: u32) -> Option<u32> {
+    pub(crate) fn slot_of(&self, page: u32) -> Option<u32> {
         Some(self.exact_of[page as usize]).filter(|slot| *slot != NONE)
     }
 
     /// The table entry of `page` in a group: its exact slot, or the converted
     /// entry (marked by `converted`).
-    pub(super) fn entry(&self, page: u32, converted: u32) -> u32 {
+    pub(crate) fn entry(&self, page: u32, converted: u32) -> u32 {
         self.slot_of(page).unwrap_or(page | converted)
     }
 
     /// The tiles of a sequence of `cells` settled cells that are converted:
     /// every full tile between the first and the window of the newest cells.
-    pub(super) fn converted_tiles(&self, cells: u32) -> Range<u32> {
+    pub(crate) fn converted_tiles(&self, cells: u32) -> Range<u32> {
         1..cells.saturating_sub(self.newest) / TILE
     }
 
     /// The pool freed `page`.
-    pub(super) fn release(&mut self, page: u32) {
+    pub(crate) fn release(&mut self, page: u32) {
         let p = page as usize;
         if let Some(slot) = self.slot_of(page) {
             self.free.push(slot);
@@ -192,12 +192,12 @@ impl Forms {
     }
 
     /// Notes that `page` holds all its cells, settled.
-    pub(super) fn settle_page(&mut self, page: u32) {
+    pub(crate) fn settle_page(&mut self, page: u32) {
         self.full[page as usize] = true;
     }
 
     /// The pages `row` names, up to the settled `cells`, are full.
-    pub(super) fn settle(&mut self, row: impl Fn(u32) -> u32, cells: u32) {
+    pub(crate) fn settle(&mut self, row: impl Fn(u32) -> u32, cells: u32) {
         for tile in 0..cells / TILE {
             self.settle_page(row(tile));
         }
@@ -213,7 +213,7 @@ impl Forms {
 
     /// Gives `page` an exact slot if it has none. A full page that no sequence
     /// of this step reads is converted to make room when the pool is empty.
-    pub(super) fn ensure(&mut self, page: u32, protect: Option<u32>) -> Result<u32, Exhausted> {
+    pub(crate) fn ensure(&mut self, page: u32, protect: Option<u32>) -> Result<u32, Exhausted> {
         if let Some(slot) = self.slot_of(page) {
             return Ok(slot);
         }
@@ -252,7 +252,7 @@ impl Forms {
     /// that leave the newest cells inside a draft window are converted too
     /// and keep their exact entries ([`Forms::ahead`]); a group whose rows
     /// attend one at a time has no use for that.
-    pub(super) fn prepare(
+    pub(crate) fn prepare(
         &mut self,
         reaches: &[Reach],
         page: impl Fn(u32, u32) -> u32,
@@ -312,7 +312,7 @@ impl Forms {
 
     /// Converts `page` now when it is exact, as when the window of a sequence
     /// has left it: the job waits in [`Forms::take_jobs`].
-    pub(super) fn convert_page(&mut self, page: u32) {
+    pub(crate) fn convert_page(&mut self, page: u32) {
         if self.exact_of[page as usize] != NONE {
             self.convert(page);
         }
@@ -320,12 +320,12 @@ impl Forms {
 
     /// The tile that the rows of the draft window of `slot` read converted
     /// from a position inside the window on, in the step last prepared.
-    pub(super) fn ahead(&self, slot: u32) -> Option<Ahead> {
+    pub(crate) fn ahead(&self, slot: u32) -> Option<Ahead> {
         self.ahead.iter().copied().find(|a| a.slot == slot)
     }
 
     /// The conversions that wait, in the order they must run.
-    pub(super) fn take_jobs(&mut self) -> Vec<Convert> {
+    pub(crate) fn take_jobs(&mut self) -> Vec<Convert> {
         std::mem::take(&mut self.jobs)
     }
 }
