@@ -4326,6 +4326,22 @@ tiers learn a text's experts between steps as they would without pruning, and a 
 expert that is used often enough comes in and is computed from then on. The stand-ins
 count as picks as well.
 
+*The table of similar experts* (`ExpertNeighbours`; made by `qwen4exp_prune calibrate`
+and `near`, `crates/model/examples/qwen4exp_prune/`). What matters of a stand-in is how
+near its output is to the output of the pick it stands in for, on the rows the router
+sends to that pick. So the table is measured on such rows: a calibration (texts of German,
+English and code other than the ones the rules are measured on, read in steps of eight
+rows) keeps every row's input of every layer's experts as the kernels read it (int8 codes
+and their scales) and the router's picks. For every expert X of a layer, the rows that
+picked it (the largest weight first, at most eight; the rows whose router score for X is
+highest when fewer than four did) are run through X and through each candidate Y on the
+CPU, with the engine's own CPU kernels, which compute what the device does. The closeness
+of Y to X is the squared cosine of the two outputs, each row weighing the square of X's
+weight there, and 0 where they point apart: the share of X's output that Y, scaled best,
+gives. Its least-squares scale is kept with it. The candidates are the 48 nearest by the
+outputs on 16 rows that all experts share and the 16 nearest by the router's rows; every
+expert keeps its 16 nearest.
+
 **Taking part in the prefix cache** (`prefix_cache()` is `None`: every prompt
 is computed from its first token, a request that gives way comes back as a
 prompt of all its tokens) needs the device side to carry out what the step
