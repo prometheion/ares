@@ -16,7 +16,9 @@
 //! - `ARES_TEST_QWEN3VL_MAX_ROWS`: the largest image to run, in rows, 1024
 //!   unless set (4096 for all);
 //! - `ARES_TEST_QWEN3VL_THREADS`: threads of the reference, all unless set;
-//! - `ARES_TEST_CUDA=1` for the tests that open a device.
+//! - `ARES_TEST_CUDA=1` for the tests that open a device, and
+//!   `ARES_TEST_QWEN3VL_DEVICES` (`0,1`) for the devices they run on, all unless
+//!   set.
 //!
 //! The tolerance is measured per image, as the reference's own tests measure
 //! theirs: how far the roundings of the device's products carry this image is
@@ -251,15 +253,15 @@ fn the_first_blocks_on_the_device_match_the_reference() {
     let config = Config::from_gguf(&projector.gguf).unwrap();
     let weights = Weights::load(&projector.gguf, &config).unwrap();
     let Some(cases) = cases(&config) else { return };
-    let picked: Vec<&Case> = cases
+    let chosen: Vec<&Case> = cases
         .iter()
         .filter(|c| {
             ["gray-64", "gradient-32x256", "rainbow-224", "text-large-768x256"]
                 .contains(&c.name.as_str())
         })
         .collect();
-    assert!(!picked.is_empty());
-    for case in picked {
+    assert!(!chosen.is_empty());
+    for case in chosen {
         let mut taps: Vec<Vec<f32>> = Vec::new();
         Reference::new(&config, &weights)
             .encode_traced(&case.pixels, case.width, case.height, &mut |stage, values| {
@@ -268,7 +270,7 @@ fn the_first_blocks_on_the_device_match_the_reference() {
                 }
             })
             .unwrap();
-        for device in devices {
+        for device in picked(devices) {
             let kernels = Kernels::load(device).unwrap();
             let stream = Stream::new(device, 0).unwrap();
             for home in [Home::Vram, Home::Ram] {

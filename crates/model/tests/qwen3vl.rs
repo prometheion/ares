@@ -6,8 +6,8 @@ mod common;
 use ares_core::GgmlType;
 use ares_gguf::{Gguf, GgufBuilder};
 use ares_model::qwen3vl::{
-    Arithmetic, Config, Error, Limits, Reference, Stage, Weights, normalize, resize_bicubic,
-    target_size,
+    Arithmetic, Config, Error, Limits, Reference, Stage, Weights, normalize, patch_position,
+    patch_rows, resize_bicubic, target_size,
 };
 use common::TempDir;
 
@@ -113,6 +113,31 @@ fn the_resize_is_the_bicubic_filter_of_pillow() {
 fn pixels_are_normalised_in_the_order_of_llama_cpp() {
     let c = real_shape();
     assert_eq!(normalize(&c, &[0, 255, 128]), [-1.0, 1.0, (128.0f32 / 255.0 - 0.5) / 0.5]);
+}
+
+#[test]
+fn patch_rows_cut_the_image_in_the_mergers_order() {
+    let c = real_shape();
+    // Four patches by two: one line of two groups.
+    let (width, height) = (64, 32);
+    let pixels: Vec<f32> = (0..width * height * 3).map(|i| i as f32).collect();
+    let (rows, nx, ny) = patch_rows(&c, &pixels, width, height).unwrap();
+    assert_eq!((nx, ny, rows.len()), (2, 1, 8 * 768));
+    let order = [(0, 0), (0, 1), (1, 0), (1, 1), (0, 2), (0, 3), (1, 2), (1, 3)];
+    for (i, (row, &(py, px))) in rows.as_chunks::<768>().0.iter().zip(&order).enumerate() {
+        assert_eq!(patch_position(i, nx), (py, px));
+        // Channel by channel, in a channel the patch's pixel rows.
+        for (j, v) in row.iter().enumerate() {
+            let (channel, ky, kx) = (j / 256, j / 16 % 16, j % 16);
+            assert_eq!(
+                *v,
+                pixels[((py * 16 + ky) * width + px * 16 + kx) * 3 + channel],
+                "{i} {j}"
+            );
+        }
+    }
+    assert!(patch_rows(&c, &pixels[..48 * 32 * 3], 48, 32).is_err());
+    assert!(patch_rows(&c, &pixels[1..], width, height).is_err());
 }
 
 // --- a made-up projector ---------------------------------------------------

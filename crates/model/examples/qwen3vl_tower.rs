@@ -14,11 +14,12 @@
 //! (events around the pass) and on the host (to the end of the pass). In the
 //! RAM home also the uploads alone, on the tower's copy stream: what of them a
 //! pass does not hide is its time less the VRAM home's. The homes take turns,
-//! round by round.
+//! round by round. Last the attention of one block alone, times the blocks:
+//! its share of a pass.
 
 use std::time::Instant;
 
-use ares_cuda::{Device, DeviceBuffer, Event, Kernels, Stream, Wait};
+use ares_cuda::{Device, DeviceBuffer, Event, HeadShape, Kernels, Stream, TowerKernels, Wait};
 use ares_gguf::Gguf;
 use ares_model::qwen3vl::{Config, DeviceTower, Home, Weights, patch_rows};
 
@@ -197,6 +198,45 @@ fn main() {
                 }
             }
             println!();
+        }
+
+        // The attention of one block alone (its time does not depend on the values).
+        let tower = TowerKernels::load(&device).unwrap();
+        let shape = HeadShape {
+            n_head: config.n_head as u32,
+            head_dim: config.head_dim() as u32,
+            n_patches: 4 * rows,
+        };
+        let heads = DeviceBuffer::new(&device, shape.bytes()).unwrap();
+        let attended =
+            DeviceBuffer::new(&device, u64::from(shape.n_patches) * config.n_embd as u64 * 4)
+                .unwrap();
+        let mut alone = Vec::new();
+        for round in 0..=args.rounds {
+            // SAFETY: both buffers have the sizes of `shape`; the pass waits below.
+            unsafe {
+                stream.fill(heads.ptr(), 0, shape.bytes() as usize).unwrap();
+                start.record(&stream).unwrap();
+                tower.attention(&stream, heads.ptr(), attended.ptr(), shape, 0.1).unwrap();
+            }
+            end.record(&stream).unwrap();
+            end.synchronize().unwrap();
+            if round > 0 {
+                alone.push(f64::from(end.elapsed_ms_since(&start).unwrap()));
+            }
+        }
+        let block = median(alone);
+        let all = block * config.n_layer as f64;
+        let flops = 4.0 * f64::from(shape.n_patches).powi(2) * config.n_embd as f64;
+        print!(
+            "{rows} rows: attention {block:.2} ms a block ({:.1} TFLOPS), {all:.0} ms for the {} \
+             blocks",
+            flops / block / 1e9,
+            config.n_layer
+        );
+        match vram {
+            Some(vram) => println!(", {:.0} % of the pass in VRAM", 100.0 * all / vram),
+            None => println!(),
         }
     }
 }

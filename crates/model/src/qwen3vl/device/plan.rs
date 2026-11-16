@@ -348,8 +348,10 @@ impl Plan {
         out.fill(0);
         let vector = |out: &mut [u8], at: u64, values: &[f32]| {
             let at = at as usize;
-            for (dst, v) in out[at..at + 4 * values.len()].chunks_exact_mut(4).zip(values) {
-                dst.copy_from_slice(&v.to_le_bytes());
+            for (dst, v) in
+                out[at..at + 4 * values.len()].as_chunks_mut::<4>().0.iter_mut().zip(values)
+            {
+                *dst = v.to_le_bytes();
             }
         };
         let matrix = |out: &mut [u8], m: &MatrixAt, source: &Matrix<'_>, rows: Range<u32>| {

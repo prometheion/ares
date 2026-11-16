@@ -78,7 +78,7 @@ fn bytes_of(buffer: &DeviceBuffer, n: usize) -> Vec<u8> {
 /// factor, which is exact.
 fn decode_act(bytes: &[u8], n_in: usize, n_rows: usize) -> Vec<f32> {
     let line = Kernels::ACTIVATION_LINE as usize;
-    let pitch = ((n_in * 2).div_ceil(line) + 1 | 1) * line / 2;
+    let pitch = (((n_in * 2).div_ceil(line) + 1) | 1) * line / 2;
     let factors = (n_rows * pitch * 2).next_multiple_of(16);
     let mut out = Vec::with_capacity(n_in * n_rows);
     for r in 0..n_rows {
@@ -421,19 +421,20 @@ fn rotation_and_attention_match_the_host() {
             };
             // The rows per head, against the host's rotation rounded to f16.
             let mut host = vec![vec![vec![0f32; patches * d]; n_head]; 3];
-            for p in 0..patches {
-                let (py, px) = (2 * (p / 4 / nx) + p % 4 / 2, 2 * (p / 4 % nx) + p % 2);
-                let pairs = d / 2;
-                let angle = |j: usize| {
-                    let mut theta = if j < pairs / 2 { py as f32 } else { px as f32 };
-                    for _ in 0..(if j < pairs / 2 { j } else { j - pairs / 2 }) {
-                        theta *= step;
-                    }
-                    theta
-                };
-                for part in 0..3 {
-                    for head in 0..n_head {
-                        let at = |k: usize| part * width + head * d + k;
+            let pairs = d / 2;
+            for (part, heads) in host.iter_mut().enumerate() {
+                for (head, rows) in heads.iter_mut().enumerate() {
+                    let at = |k: usize| part * width + head * d + k;
+                    for p in 0..patches {
+                        let (py, px) = (2 * (p / 4 / nx) + p % 4 / 2, 2 * (p / 4 % nx) + p % 2);
+                        let angle = |j: usize| {
+                            let half = pairs / 2;
+                            let mut theta = if j < half { py as f32 } else { px as f32 };
+                            for _ in 0..(if j < half { j } else { j - half }) {
+                                theta *= step;
+                            }
+                            theta
+                        };
                         let v = |k: usize| qkv[p * 3 * width + at(k)] + bias[at(k)];
                         for k in 0..pitch {
                             let ours = half_at(part, head, p, k);
@@ -444,8 +445,8 @@ fn rotation_and_attention_match_the_host() {
                             let value = if part == 2 {
                                 f64::from(v(k))
                             } else {
-                                let j = k % pairs;
-                                let (c, s) = (f64::from(angle(j).cos()), f64::from(angle(j).sin()));
+                                let theta = angle(k % pairs);
+                                let (c, s) = (f64::from(theta.cos()), f64::from(theta.sin()));
                                 if k < pairs {
                                     f64::from(v(k)) * c - f64::from(v(k + pairs)) * s
                                 } else {
@@ -456,9 +457,10 @@ fn rotation_and_attention_match_the_host() {
                             let ulp = f16_to_f32(f32_to_f16(expect.abs()) + 1) - expect.abs();
                             assert!(
                                 (ours - expect).abs() <= ulp,
-                                "{nx} x {ny}: part {part} head {head} patch {p} value {k}: {ours} against {expect}"
+                                "{nx} x {ny}: part {part} head {head} patch {p} value {k}: {ours} \
+                                 against {expect}"
                             );
-                            host[part][head][p * d + k] = ours;
+                            rows[p * d + k] = ours;
                         }
                     }
                 }

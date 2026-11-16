@@ -280,7 +280,9 @@ impl DeviceTower {
         ScratchPlan::new(&self.config, &self.plan, max_rows)
     }
 
-    /// A scratch for images of up to `max_rows` rows.
+    /// A scratch for images of up to `max_rows` rows. It serves every tower of
+    /// the same projector on this device (the two homes of one projector share
+    /// one).
     pub fn scratch(&self, max_rows: u32) -> Result<Scratch> {
         let plan = self.scratch_plan(max_rows);
         Ok(Scratch { buffer: DeviceBuffer::new(&self.device, plan.bytes)?, plan })
@@ -338,6 +340,14 @@ impl DeviceTower {
                 ),
             });
         };
+        let same = scratch.buffer.device().ordinal() == self.device.ordinal()
+            && scratch.plan == self.scratch_plan(scratch.max_rows());
+        if !same {
+            return Err(Error::Device {
+                what: "a scratch".to_owned(),
+                problem: "it was made for another device or another projector".to_owned(),
+            });
+        }
         let pass = Pass { scratch, nx, ny, rows, patches: 4 * rows, out, units };
         match &self.placed {
             Placed::Vram(arena) => {
@@ -519,11 +529,12 @@ impl DeviceTower {
         let (act, wide, act_ff, y) =
             (s.at(&s.plan.act), s.at(&s.plan.wide), s.at(&s.plan.act_ff), s.at(&s.plan.y));
         let row = |p0: u32| u64::from(p0) * u64::from(e) * 4;
-        // SAFETY (every launch below): the regions of the scratch were sized for
-        // `pass.rows <= scratch.max_rows()` rows by its plan, the weights of the unit
-        // lie at `base` as the plan laid them out, and `pass.out` holds the rows (the
-        // caller's guarantee).
+        // Every launch below reads and writes regions of the scratch, which its plan
+        // sized for `pass.rows <= scratch.max_rows()` rows, weights at `base`, where the
+        // plan laid the unit out, and `pass.out`, which holds the rows (the caller's
+        // guarantee).
         match &unit.kind {
+            // SAFETY: as said above.
             UnitKind::Stem(st) => unsafe {
                 let n = c.patch_len() as u32;
                 self.kernels.prepare_prefill_activations(
@@ -547,6 +558,7 @@ impl DeviceTower {
                 };
                 self.tower.positions(stream, x, w(st.bias), w(st.table), grid)?;
             },
+            // SAFETY: as said above.
             UnitKind::Block(_, b) => unsafe {
                 let shape = self.heads(pass.patches);
                 for (p0, n) in groups(pass.patches) {
@@ -607,6 +619,7 @@ impl DeviceTower {
                     self.tower.residual(stream, xg, y, w(b.down_bias), e, n)?;
                 }
             },
+            // SAFETY: as said above.
             UnitKind::Hidden(p) => unsafe {
                 // The merger's input in `heads`, a part's output behind it, the hidden
                 // layer in `attended`, its GELU (the input of mm.2) in `x`.
@@ -641,6 +654,7 @@ impl DeviceTower {
                     self.tower.gelu_f16(stream, attended, w(bias), x, width, width, r)?;
                 }
             },
+            // SAFETY: as said above.
             UnitKind::Output(p) => unsafe {
                 let r = pass.rows;
                 let part_out = heads.offset(s.plan.part_out);
