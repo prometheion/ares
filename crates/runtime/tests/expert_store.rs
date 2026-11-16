@@ -3,15 +3,17 @@
 //! says so: what the store does can then be checked at every point a device
 //! could be at.
 
+use std::any::Any;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use ares_core::GgmlType;
 use ares_gguf::{Gguf, GgufBuilder};
 use ares_io::{Config, ExpertMap, Reader};
 use ares_runtime::expert_store::{
-    ExpertStore, HostRegion, HostSlots, LayerSpec, StoreConfig, StorePlan,
+    ExpertStore, HostRegion, HostSlots, LayerSpec, Locker, StoreConfig, StoreError, StorePlan,
 };
 
 const LAYERS: usize = 3;
@@ -1875,5 +1877,182 @@ fn a_tier_keeps_two_slots_for_every_layer_whatever_it_is_told() {
     assert_eq!(rig.store.shrink_ram(Duration::ZERO).unwrap(), 0);
     for pair in [[2, 3], [4, 5], [0, 1]] {
         rig.step(&[&pair[..], &pair[..], &pair[..]]);
+    }
+}
+
+// --- pools whose pieces differ in size, locked as the driver locks -----------
+
+/// Ranges locked the way `cuMemHostRegister` locks them: a range that
+/// overlaps one that is locked is refused (the driver's
+/// `CUDA_ERROR_HOST_MEMORY_ALREADY_REGISTERED`), and a lock ends when what
+/// it returned is dropped.
+#[derive(Clone, Default)]
+struct DriverLocks(Arc<Mutex<Vec<(usize, usize)>>>);
+
+impl DriverLocks {
+    fn bytes(&self) -> usize {
+        self.0.lock().unwrap().iter().map(|(start, end)| end - start).sum()
+    }
+}
+
+struct DriverLock {
+    locks: DriverLocks,
+    start: usize,
+}
+
+impl Drop for DriverLock {
+    fn drop(&mut self) {
+        self.locks.0.lock().unwrap().retain(|(start, _)| *start != self.start);
+    }
+}
+
+impl Locker for DriverLocks {
+    unsafe fn lock(&mut self, ptr: *mut u8, len: usize) -> Result<Box<dyn Any + Send>, StoreError> {
+        let (start, end) = (ptr as usize, ptr as usize + len);
+        let mut locked = self.0.lock().unwrap();
+        if locked.iter().any(|(s, e)| *s < end && start < *e) {
+            return Err(StoreError::Plan(format!(
+                "{len} bytes at {ptr:p} overlap a locked range: already registered"
+            )));
+        }
+        locked.push((start, end));
+        Ok(Box::new(DriverLock { locks: self.clone(), start }))
+    }
+}
+
+/// Bytes of each matrix of an expert in the first four layers of
+/// [`mixed_model`], and in the fifth.
+const SMALL: usize = 4096;
+const LARGE: usize = 10240;
+
+/// Four layers of experts with matrices of `SMALL` bytes and a fifth with
+/// matrices of `LARGE` bytes: the RAM tier has a pool for each size.
+fn mixed_model(dir: &Scratch) -> Gguf {
+    let mut builder = GgufBuilder::new().str("general.architecture", "test");
+    for layer in 0..5 {
+        let dims = if layer < 4 { [32u64, 32] } else { [64, 40] };
+        let len = if layer < 4 { SMALL } else { LARGE };
+        for (part, name) in ["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"].iter().enumerate() {
+            let data: Vec<u8> =
+                (0..EXPERTS).flat_map(|e| (0..len).map(move |i| byte(layer, part, e, i))).collect();
+            let shape = [dims[0], dims[1], u64::from(EXPERTS)];
+            builder =
+                builder.tensor(&format!("blk.{layer}.{name}.weight"), &shape, GgmlType::F32, data);
+        }
+    }
+    let path = dir.0.join("mixed.gguf");
+    builder.write(&path).unwrap();
+    Gguf::open(&path).unwrap()
+}
+
+/// One step of the store over [`mixed_model`] that routes `picks` in every
+/// layer and checks that the device has their bytes.
+fn mixed_step(store: &mut ExpertStore<HostSlots>, picks: &[u32]) -> Result<(), StoreError> {
+    let settle = |store: &mut ExpertStore<HostSlots>| {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while {
+            store.poll().unwrap();
+            store.device_mut(0).run(usize::MAX);
+            store.poll().unwrap();
+            !store.is_settled()
+        } {
+            assert!(Instant::now() < deadline, "the store does not settle: {store:?}");
+            std::thread::sleep(Duration::from_micros(200));
+        }
+    };
+    store.begin_step();
+    for layer in 0..5 {
+        store.routed(layer, picks).unwrap();
+        settle(store);
+        let len = if layer < 4 { SMALL } else { LARGE };
+        for expert in picks {
+            let entry = store.device(0).entry(layer, *expert);
+            assert!(entry >= 0, "layer {layer} expert {expert} has no entry");
+            let (_, pool) = store.place(layer);
+            let slot = store.device(0).slot(pool, entry as u32);
+            for part in 0..3 {
+                let want: Vec<u8> = (0..len).map(|i| byte(layer, part, *expert, i)).collect();
+                assert_eq!(&slot[part * len..(part + 1) * len], &want[..], "layer {layer}");
+            }
+        }
+    }
+    store.end_step()?;
+    settle(store);
+    Ok(())
+}
+
+/// The end of a step gives a piece up and may then lock one: never a piece
+/// whose release has not been dropped, because its lock still covers it and
+/// the driver refuses to lock it again. This was how Flash-Next's requests
+/// failed with `CUDA_ERROR_HOST_MEMORY_ALREADY_REGISTERED` while the machine's
+/// memory moved: the tier gave up a small piece and then a large one, and the
+/// small one's pool, which then had the smallest share of its slots, wanted
+/// its piece back, which fit in what the large one left below the target.
+#[test]
+fn a_piece_that_is_given_up_is_not_locked_again_before_its_release_is_dropped() {
+    let dir = Scratch::new();
+    let gguf = mixed_model(&dir);
+    let map =
+        ExpertMap::discover(&gguf, &["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"]).unwrap();
+    let reader = Reader::open_gguf(&gguf, Config::default()).unwrap();
+    let spec = |len: u64| LayerSpec {
+        device: 0,
+        offsets: [0, len, 2 * len],
+        slot_bytes: 3 * len,
+        resident: false,
+    };
+    let layers: Vec<LayerSpec> =
+        (0..5).map(|layer| spec(if layer < 4 { SMALL } else { LARGE } as u64)).collect();
+    let vram_round = 3 * (4 * SMALL + LARGE) as u64;
+    let mut config = StoreConfig::new(1, 2, vec![4 * vram_round], u64::MAX / 4);
+    config.vram_reserve = 1;
+    config.rebalance_every = 0;
+    recent_first(&mut config);
+    let probe = StorePlan::new(config.clone(), &map, &reader, &layers, None).unwrap();
+    let (small, large) = (probe.ram_slot_bytes(0) as usize, probe.ram_slot_bytes(4) as usize);
+    // Six slots per layer: 24 small ones in pieces of three, 6 large ones in
+    // pieces of one, which are smaller than a piece of three small ones.
+    config.ram_bytes = 6 * (4 * small + large) as u64;
+    config.ram_piece = 3 * small as u64;
+    let (small_piece, large_piece) =
+        ((3 * small).next_multiple_of(4096), large.next_multiple_of(4096));
+    assert!(large * 2 > 3 * small, "one large slot per piece: {small} {large}");
+    assert!(large_piece + 4096 <= small_piece, "{small_piece} {large_piece}");
+    let plan = StorePlan::new(config, &map, &reader, &layers, None).unwrap();
+    assert_eq!((plan.slots(0).1, plan.slots(4).1), (6, 6));
+    let device = HostSlots::new(&plan.device_pools(0), 5, EXPERTS);
+    let locks = DriverLocks::default();
+    let region =
+        HostRegion::elastic(plan.ram_bytes(), plan.ram_bytes(), Box::new(locks.clone())).unwrap();
+    let mut store = ExpertStore::new(plan, map, reader, vec![device], region, None).unwrap();
+    let whole = store.ram_bytes().0;
+    assert_eq!(locks.bytes() as u64, whole, "every piece is locked at the start");
+    for picks in [[0, 1], [2, 3], [4, 5], [0, 1]] {
+        mixed_step(&mut store, &picks).unwrap();
+    }
+
+    // While a step runs the machine takes a little more than a large piece.
+    // The step's end gives up the last large piece (both pools have all
+    // their slots: the higher piece goes) and then the last small piece;
+    // the large pool has the smaller share then, and its piece fits in what
+    // is left below the target.
+    store.set_ram_target(whole - (large_piece + 4096) as u64);
+    mixed_step(&mut store, &[6, 7]).expect("the end of the step locks nothing twice");
+    let released = store.take_released();
+    let lens: Vec<usize> = released.iter().map(|piece| piece.len()).collect();
+    assert_eq!(lens, [large_piece, small_piece], "the pieces given up, in their order");
+    let (locked, _) = store.ram_bytes();
+    assert_eq!(locked, whole - (large_piece + small_piece) as u64, "nothing was locked again");
+    assert_eq!(locks.bytes(), locked as usize + large_piece + small_piece, "until released");
+    drop(released);
+    assert_eq!(locks.bytes() as u64, locked);
+
+    // Once the releases are dropped, the next step's end takes the large
+    // piece again, and the tier serves from it.
+    mixed_step(&mut store, &[8, 9]).unwrap();
+    assert_eq!(store.ram_bytes().0, locked + large_piece as u64);
+    assert_eq!(locks.bytes() as u64, store.ram_bytes().0, "the books and the locks agree");
+    for picks in [[10, 11], [0, 1], [12, 13], [6, 7]] {
+        mixed_step(&mut store, &picks).unwrap();
     }
 }

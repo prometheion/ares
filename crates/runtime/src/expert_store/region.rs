@@ -6,10 +6,17 @@
 //! released (unlocked, then `MADV_DONTNEED`), which is how the tier follows
 //! the memory the machine has. Page-locked memory is not reclaimed by the
 //! kernel, so nothing but this gives it back.
+//!
+//! A piece is locked once: a released piece keeps its lock until its
+//! [`Released`] is dropped, and it is not locked again before. The driver
+//! refuses to lock a range that a lock still covers
+//! (`CUDA_ERROR_HOST_MEMORY_ALREADY_REGISTERED`), and a release dropped after
+//! a second lock would give back memory the tier uses again.
 
 use std::any::Any;
 use std::ptr::NonNull;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use ares_core::Ledger;
 
@@ -26,7 +33,8 @@ const ALIGN: usize = 2 << 20;
 /// Page-locks pieces of a region.
 pub trait Locker: Send {
     /// Page-locks `len` bytes at `ptr`. What comes back unlocks them when it
-    /// is dropped.
+    /// is dropped. A range that a lock still covers is not locked again (a
+    /// device's lock fails then).
     ///
     /// # Safety
     ///
@@ -104,10 +112,13 @@ impl Drop for Mapping {
 
 /// A piece that the tier has given up: dropping it unlocks the memory and
 /// returns it to the system. That takes time, so it is dropped where nothing
-/// waits for it.
+/// waits for it. Until then the piece is not locked again.
 pub struct Released {
     lock: Option<Box<dyn Any + Send>>,
     map: Arc<Mapping>,
+    /// The region's mark that the piece is on its way back: cleared once it
+    /// is unlocked and returned.
+    releasing: Arc<AtomicBool>,
     at: usize,
     len: usize,
 }
@@ -138,6 +149,8 @@ impl Drop for Released {
         unsafe {
             libc::madvise(self.map.ptr.as_ptr().add(self.at).cast(), self.len, libc::MADV_DONTNEED);
         }
+        // The piece may be locked again; whoever sees this sees it unlocked.
+        self.releasing.store(false, Ordering::Release);
     }
 }
 
@@ -145,6 +158,8 @@ impl Drop for Released {
 pub struct HostRegion {
     /// Per piece: what holds it locked. Dropped before the mapping.
     locks: Vec<Option<Box<dyn Any + Send>>>,
+    /// Per piece: it was released and its [`Released`] is not dropped yet.
+    releasing: Vec<Arc<AtomicBool>>,
     locker: Box<dyn Locker>,
     map: Arc<Mapping>,
     len: usize,
@@ -174,6 +189,7 @@ impl HostRegion {
         let map = Arc::new(Mapping::new(len)?);
         Ok(Self {
             locks: vec![None],
+            releasing: vec![Arc::default()],
             locker,
             map,
             len,
@@ -219,6 +235,7 @@ impl HostRegion {
         debug_assert!(spans.iter().all(|(at, len)| at + len <= self.len));
         self.spans = spans.to_vec();
         self.locks = spans.iter().map(|_| None).collect();
+        self.releasing = spans.iter().map(|_| Arc::default()).collect();
     }
 
     pub(super) fn ptr(&self) -> NonNull<u8> {
@@ -250,6 +267,12 @@ impl HostRegion {
         self.locks[index].is_some()
     }
 
+    /// Whether piece `index` was released and its [`Released`] is not
+    /// dropped yet: its lock still covers it, so it cannot be locked again.
+    pub fn is_releasing(&self, index: usize) -> bool {
+        self.releasing[index].load(Ordering::Acquire)
+    }
+
     /// Bytes that are locked now.
     pub fn locked_bytes(&self) -> usize {
         (0..self.locks.len()).filter(|i| self.is_locked(*i)).map(|i| self.span(i).1).sum()
@@ -262,10 +285,17 @@ impl HostRegion {
         (unsafe { self.map.ptr.as_ptr().add(at) }, len)
     }
 
-    /// Locks piece `index` with the region's own locker.
+    /// Locks piece `index` with the region's own locker. A piece whose
+    /// release is not dropped yet is refused.
     pub(super) fn lock(&mut self, index: usize) -> Result<(), StoreError> {
         if self.is_locked(index) {
             return Ok(());
+        }
+        if self.is_releasing(index) {
+            return Err(StoreError::Plan(format!(
+                "piece {index} of the RAM tier would be locked again while its release still \
+                 holds its lock"
+            )));
         }
         let (ptr, len) = self.piece_ptr(index);
         // SAFETY: the piece is whole pages of the mapping, which outlives
@@ -279,7 +309,9 @@ impl HostRegion {
     pub(super) fn release(&mut self, index: usize) -> Option<Released> {
         let lock = self.locks[index].take()?;
         let (at, len) = self.span(index);
-        Some(Released { lock: Some(lock), map: self.map.clone(), at, len })
+        let releasing = self.releasing[index].clone();
+        releasing.store(true, Ordering::Release);
+        Some(Released { lock: Some(lock), map: self.map.clone(), releasing, at, len })
     }
 }
 
@@ -317,7 +349,11 @@ mod tests {
         let released = region.release(1).expect("locked");
         assert_eq!((released.len(), region.locked_bytes()), (8 * MIB, 8 * MIB));
         assert_eq!(resident(whole.0, whole.1), 16 * MIB, "not before it is dropped");
+        // Its lock is in the release until that is dropped: no second lock.
+        assert!(region.is_releasing(1) && !region.is_locked(1));
+        assert!(region.lock(1).is_err(), "a piece on its way back is not locked again");
         drop(released);
+        assert!(!region.is_releasing(1));
         assert_eq!(resident(whole.0, whole.1), 8 * MIB, "the piece went back to the system");
         assert!(region.release(1).is_none(), "not locked any more");
         // The piece reads as new memory when it is taken again.

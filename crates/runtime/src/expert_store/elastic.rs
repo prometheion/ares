@@ -14,7 +14,10 @@
 //! locked again and their slots come back empty
 //! ([`ExpertStore::grow_ram`]). Both happen between steps only: the driver's
 //! unlock waits for the device, and a device that computes a step may wait
-//! for the store.
+//! for the store. A piece that was given up keeps its lock until the owner
+//! drops its release ([`ExpertStore::take_released`]), and it is not locked
+//! again before: the end of a step that gave up pieces of two pools may
+//! find room for one of them right away.
 //!
 //! **Which experts go.** The slots of a piece belong to a few layers and hold
 //! whatever was read into them. Giving the piece up as it lies would take
@@ -296,7 +299,8 @@ impl<D: SlotDevice> ExpertStore<D> {
     /// for the device to finish what it has: drop them where no step runs
     /// on the devices (a kernel that waits for an expert would wait for the
     /// thread that waits for it), which is where
-    /// [`ExpertStore::shrink_ram`] gave them up.
+    /// [`ExpertStore::shrink_ram`] gave them up. Until they are dropped,
+    /// their pieces are not locked again.
     pub fn take_released(&mut self) -> Vec<Released> {
         std::mem::take(&mut self.pieces.released)
     }
@@ -351,11 +355,12 @@ impl<D: SlotDevice> ExpertStore<D> {
     }
 
     /// The piece to lock next: of the pool that has the smallest share of
-    /// its slots, the one at the lowest address.
+    /// its slots, the one at the lowest address. Not a piece whose release
+    /// has not been dropped: its lock still covers it.
     fn piece_to_lock(&self) -> Option<usize> {
         let shares = self.live_shares();
         (0..self.region.n_pieces())
-            .filter(|piece| !self.region.is_locked(*piece))
+            .filter(|piece| !self.region.is_locked(*piece) && !self.region.is_releasing(*piece))
             .filter_map(|piece| Some((shares[self.pieces.layout.slots_of(piece)?.0], piece)))
             .min_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)))
             .map(|(_, piece)| piece)
