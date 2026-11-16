@@ -4448,8 +4448,8 @@ rows says how far such roundings carry the image, and the device may be three
 times that far plus 0.1 %. The cases are the eleven square patterns of the
 reference dumps and the ten own images of the Pillow check (wide, tall, below
 the minimum, and one shrunk to 4060 rows), resized here; the reference's rows
-are kept in a directory, since an image of 4060 rows takes it over an hour on
-the CPU. Measured on both cards (2026-11-16, both projectors, every case up to
+are kept in a directory, since an image of 4060 rows takes it half an hour on
+12 threads of the CPU. Measured on both cards (2026-11-16, both projectors, every case up to
 1024 rows): the device is 3.0e-4 to 6.7e-3 from the exact rows, 0.62 to 1.8
 times as far as the reference with the device's roundings is, so no case used
 more than 37 % of its tolerance; the two homes gave the same rows bit for bit,
@@ -4493,9 +4493,13 @@ images of 256, 1024 and 4096 rows; load average 26 to 36):
   RTX 4070 where the tile kernels alone reach 50 at these sizes: the row kernels
   in between (norms, rotation, GELU, residual, the conversion of the
   attention's output) move about 560 MB a block at 1024 rows, about a third of
-  the time outside the attention. Bias, GELU and residual in the epilogues of
-  the products would take most of that away; not built.
+  the time outside the attention. Fusing more of them (the residual with the
+  norm after it, a bias into the products' epilogue) would take part of that
+  away; not built. A GELU cannot go into the epilogue as it is: the f16 form
+  needs the largest value of the whole row first.
 - Loading the tower takes 0.6 to 2.2 s with the file in the page cache.
+- Flash-Next's projector takes the same time (VRAM home: 28.3 and 140.8 ms on
+  the RTX 4070, 62.5 and 313.0 ms on the RTX 3060, at 256 and 1024 rows).
 - *f16 sums* flushed into `f32` every 64 values (the faster path of the capped
   cards) in every product but `ffn_down` and the patch matrix: 8 to 9 % faster
   at 1024 rows and 4.5 % at 4096 on both cards, and up to twice as far from the
