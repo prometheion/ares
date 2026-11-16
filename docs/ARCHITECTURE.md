@@ -4342,6 +4342,12 @@ tokens per second from run to run):
 - *Rows of a prompt in steps of eight rows* name experts in no tier that are picked a fifth
   of the time (20 % in the fingerprint's runs), and some places of their lists more often:
   the store reads 3.5 to 4.6 experts ahead a step there, of which a quarter are used.
+- *Wide steps.* On the made-up model of `steps_wider_than_eight_rows_match_the_reference`
+  (half of the experts in slots, steps of 9, 64, 256 and 3 rows) the next layer's
+  predictions read 162 to 167 experts ahead into staging, and the steps read 57 to 61 from
+  the file on demand where the build of before read 192; with four transit slots, 179 on
+  demand and 210 ahead where it read 336. On the real file this was not measured (the
+  shared GPU gave no turn for it).
 - *What reading ahead cost.* Reads for nothing take the drive from the reads the steps wait
   for (run 2 on one card: a miss from the file waited 3.7 ms at the median and 39.7 at the
   99th percentile, against 2.6 and 8.0 before), and as long as they took the slot of the
