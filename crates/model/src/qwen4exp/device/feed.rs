@@ -360,6 +360,11 @@ pub(super) struct Feed {
     /// it (what the predictions of the mixer name goes to the owner's layer of
     /// the store).
     owners: Option<Vec<u8>>,
+    /// Per layer of the store, in wide steps: whether the step before read experts of the
+    /// layer from the file (where the next one is predicted), and whether the running
+    /// step's record of the layer has been named to the store.
+    file_missed: Vec<bool>,
+    named_wide: Vec<bool>,
     groups: Vec<RouteGroup>,
     /// What the wide steps found and waited for, since the counters were read.
     wide: WideStats,
@@ -420,6 +425,8 @@ impl Feed {
             ahead_followed: vec![0; boards.len()],
             tokens: vec![0; boards.len()],
             owners: None,
+            file_missed: vec![true; layout.specs.len()],
+            named_wide: vec![false; layout.specs.len()],
             last_missing: vec![Vec::new(); layout.specs.len()],
             guessed: vec![false; layout.specs.len()],
             lookahead: Lookahead::default(),
@@ -522,6 +529,7 @@ impl Feed {
     /// no slot: they are brought into transit, and the reads of the layers ahead start on a
     /// guess.
     pub(super) fn named(&mut self, at: usize, missing: &[u32]) -> Result<(), Error> {
+        self.named_wide[at] = true;
         self.want(at, missing)?;
         self.last_missing[at] = missing.to_vec();
         self.guess_ahead(at + self.layout.per_layer)
@@ -531,6 +539,7 @@ impl Feed {
     /// those that have to be read had been guessed and how long the guessed reads took.
     pub(super) fn want(&mut self, at: usize, missing: &[u32]) -> Result<(), Error> {
         let named = self.store.transit_want(at, missing)?;
+        self.file_missed[at] = named.guessed + named.unguessed > 0;
         // The guess is the same for every distance: what is chosen is how many layers a
         // guessed read needs to arrive.
         let rule = LookaheadRule::default();
@@ -667,7 +676,20 @@ impl Feed {
             prune.mask.build(&self.store, &self.layout, prune.paused);
         }
         self.guessed.fill(false);
+        self.named_wide.fill(false);
         if rows > MAX_BATCH {
+            // The next layer's picks are predicted where the step before read from the file.
+            for index in 0..self.boards.len() {
+                let board = &self.boards[index];
+                for i in 0..board.layers().saturating_sub(1) {
+                    let layer = self.firsts[index] + i + 1;
+                    let wanted = (0..self.layout.per_layer).any(|part| {
+                        let part = if self.layout.per_layer > 1 { part } else { index };
+                        self.file_missed[self.layout.store_layer(part, layer)]
+                    });
+                    board.set_wide_wanted(i, wanted);
+                }
+            }
             // The first layers of every part have no layer before them to start their
             // guesses.
             for index in 0..self.boards.len() {
@@ -700,6 +722,7 @@ impl Feed {
         }
         if self.rows > MAX_BATCH {
             // The layers of a wide step are followed by `Misses`.
+            self.follow_wide_predictions()?;
             self.store.poll()?;
             return Ok(());
         }
@@ -743,6 +766,53 @@ impl Feed {
             self.follow_predictions(index)?;
         }
         self.store.poll()?;
+        Ok(())
+    }
+
+    /// Hands the store the picks the routers' parts predicted in a wide step for the layers
+    /// whose records have not been named yet: per layer of the store the experts some row
+    /// will pick, the most picked first, as the guesses of the layer
+    /// ([`ExpertStore::transit_guess`]: what no tier holds is read ahead into staging).
+    fn follow_wide_predictions(&mut self) -> Result<(), Error> {
+        let top_k = self.used as usize;
+        let n_experts = self.layout.shapes[0].n_experts as usize;
+        let per_layer = self.layout.per_layer;
+        for index in 0..self.boards.len() {
+            let board = self.boards[index].clone();
+            if !board.predicts_wide() {
+                continue;
+            }
+            for i in 0..board.layers().saturating_sub(1) {
+                let Some(ids) = board.take_wide(i, top_k)? else { continue };
+                let layer = self.firsts[index] + i + 1;
+                let mut counts = vec![0u32; n_experts];
+                for id in ids.as_chunks::<4>().0 {
+                    if let Some(count) = counts.get_mut(u32::from_le_bytes(*id) as usize) {
+                        *count += 1;
+                    }
+                }
+                for part in 0..per_layer {
+                    let owner = if per_layer > 1 { part } else { index };
+                    let at = self.layout.store_layer(owner, layer);
+                    if self.named_wide[at] || !self.has_transit(at) {
+                        continue;
+                    }
+                    let owners = self.owners.as_ref().filter(|_| per_layer > 1);
+                    let mut experts: Vec<u32> = (0..n_experts as u32)
+                        .filter(|e| counts[*e as usize] > 0)
+                        .filter(|e| {
+                            owners.is_none_or(|o| {
+                                o.get(layer * n_experts + *e as usize).copied() == Some(part as u8)
+                            })
+                        })
+                        .collect();
+                    experts.sort_by(|a, b| {
+                        counts[*b as usize].cmp(&counts[*a as usize]).then(a.cmp(b))
+                    });
+                    self.store.transit_guess(at, &experts)?;
+                }
+            }
+        }
         Ok(())
     }
 

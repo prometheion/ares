@@ -536,6 +536,13 @@ pub(crate) struct Frame {
     ahead_layers: u32,
     ahead_list_bytes: u64,
     ahead_logits_bytes: u64,
+    /// In wide steps (when the part predicts): the bytes of the f16 form of a step's rows,
+    /// of their logits and of their picks by the next layer's router; and, per layer, the
+    /// bytes of the picks' ids the host gets. 0 without wide steps.
+    wide_input_bytes: u64,
+    wide_logits_bytes: u64,
+    wide_record_bytes: u64,
+    wide_ids_bytes: u64,
 }
 
 fn invalid(message: impl Into<String>) -> ModelError {
@@ -760,6 +767,8 @@ impl Frame {
         } else {
             opts.predict.min(2).min(shape.shares.len().saturating_sub(1) as u32)
         };
+        // Wide steps predict the next layer's picks as well.
+        let wide_ahead = u64::from(ahead_layers > 0 && opts.max_rows > MAX_BATCH);
         s.logits = take(expert_shape.logits_bytes(opts.max_rows));
         s.hidden = take(expert_shape.hidden_bytes(decode_rows));
         s.sg = take(rows * shared_ff * 4);
@@ -870,6 +879,17 @@ impl Frame {
             ahead_layers,
             ahead_list_bytes: expert_shape.predict_list_bytes(decode_rows),
             ahead_logits_bytes: u64::from(ahead_layers) * expert_shape.logits_bytes(decode_rows),
+            wide_input_bytes: wide_ahead
+                * Kernels::prefill_activation_bytes(
+                    ares_cuda::PrefillPath::F16,
+                    n as u32,
+                    opts.max_rows,
+                ),
+            wide_logits_bytes: wide_ahead * expert_shape.logits_bytes(opts.max_rows),
+            wide_record_bytes: wide_ahead * wide::record_bytes(&expert_shape, opts.max_rows),
+            wide_ids_bytes: wide_ahead
+                * (4 * u64::from(expert_shape.top_k) * u64::from(opts.max_rows))
+                    .next_multiple_of(64),
         })
     }
 
@@ -909,7 +929,11 @@ impl Frame {
         if self.ahead_layers == 0 {
             return 0;
         }
-        self.ahead_logits_bytes.next_multiple_of(256) + self.predict_lists_bytes().max(64)
+        self.ahead_logits_bytes.next_multiple_of(256)
+            + self.predict_lists_bytes().max(64).next_multiple_of(256)
+            + self.wide_input_bytes.next_multiple_of(256)
+            + self.wide_logits_bytes.next_multiple_of(256)
+            + self.wide_record_bytes.next_multiple_of(256)
     }
 
     /// Bytes of page-locked host memory the part holds: the route records
@@ -917,7 +941,8 @@ impl Frame {
     /// tables and the status word.
     pub(crate) fn pinned_bytes(&self, opts: &Options, layers: usize) -> u64 {
         (self.record_stride + self.act_host_stride + self.addr_stage) * layers as u64
-            + u64::from(self.ahead_layers) * self.ahead_list_bytes * layers as u64
+            + (u64::from(self.ahead_layers) * self.ahead_list_bytes + self.wide_ids_bytes)
+                * layers as u64
             + self.inbox.len
             + self.tables_bytes(opts)
             + self.exact_host
@@ -1148,7 +1173,7 @@ impl Part {
         let predict = (f.ahead_layers > 0)
             .then(|| {
                 ledger.reserve(format!("{label} predicted picks"), f.predict_bytes())?;
-                predict::State::open(device, f.ahead_logits_bytes, f.predict_lists_bytes())
+                predict::State::open(device, &f)
             })
             .transpose()?;
         let scratch = DeviceBuffer::new(device, f.s.len)?;
@@ -1263,7 +1288,7 @@ impl Part {
                 f.record_stride as usize,
                 f.act_host_stride as usize,
                 c.n_embd,
-                (f.ahead_layers as usize, f.ahead_list_bytes as usize),
+                (f.ahead_layers as usize, f.ahead_list_bytes as usize, f.wide_ids_bytes as usize),
             )?),
             routed: stream_events(w.layers.len())?,
             inbox_host: PinnedBuffer::new(device, f.inbox.len as usize)?,

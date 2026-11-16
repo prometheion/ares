@@ -409,6 +409,7 @@ impl Part {
             self.side.wait_event(&self.routed[i])?;
             self.side.copy_to_host(self.board.record_dst(i), record, bytes as usize)?;
             self.board.copies_enqueued(i, &self.side)?;
+            self.enqueue_wide_prediction(stream, i, m, rows)?;
             self.mark(stream, Phase::Experts)?;
             if let Some(shared) = &w.shared {
                 self.product(stream, &shared.inp, m, self.at(s.s), rows)?;

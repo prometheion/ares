@@ -12,12 +12,20 @@
 //! last prediction of the step before ([`Part::predictions_done`]), which has ended long
 //! before.
 //!
+//! A wide step (a slice of a prompt) predicts the next layer only, where the board says the
+//! feed wants it (where the step before read that layer's experts from the file): the next
+//! layer's router as a float product on the f16 form of the rows, and its picks for every
+//! row, which the feed counts per expert and hands to the store as the guesses of that layer
+//! (`ExpertStore::transit_guess`). The step's stream waits only for the f16 copy of its rows,
+//! which the next layer overwrites.
+//!
 //! [`Board::ahead_list`]: super::super::board::Board::ahead_list
 
-use ares_cuda::{DeviceBuffer, DevicePtr, Event, Stream};
+use ares_core::GgmlType;
+use ares_cuda::{DeviceBuffer, DevicePtr, Event, Kernels, PrefillPath, Stream};
 use ares_runtime::ModelError;
 
-use super::{Part, invalid};
+use super::{Frame, Part, invalid};
 
 /// The buffers and the stream of the predictions of a part.
 pub(super) struct State {
@@ -27,6 +35,13 @@ pub(super) struct State {
     /// ahead.
     buffer: DeviceBuffer,
     lists: u64,
+    /// For wide steps, offsets in the buffer: the f16 form of the rows, their logits by the
+    /// next layer's router, and their picks.
+    wide_input: u64,
+    wide_logits: u64,
+    wide_record: u64,
+    /// Recorded on the stream behind the f16 copy of a wide step's rows.
+    input_copied: Event,
     /// Recorded on the stream behind the last prediction of a step.
     done: Event,
     /// Whether a prediction was enqueued since the step's stream last waited for `done`.
@@ -34,16 +49,22 @@ pub(super) struct State {
 }
 
 impl State {
-    pub(super) fn open(
-        device: &ares_cuda::Device,
-        logits_bytes: u64,
-        lists_bytes: u64,
-    ) -> Result<Self, ModelError> {
-        let lists = logits_bytes.next_multiple_of(256);
+    /// The buffers `f` sizes ([`Frame::predict_bytes`] in all).
+    pub(super) fn open(device: &ares_cuda::Device, f: &Frame) -> Result<Self, ModelError> {
+        let lists = f.ahead_logits_bytes.next_multiple_of(256);
+        let wide_input = lists + f.predict_lists_bytes().max(64).next_multiple_of(256);
+        let wide_logits = wide_input + f.wide_input_bytes.next_multiple_of(256);
+        let wide_record = wide_logits + f.wide_logits_bytes.next_multiple_of(256);
+        let len = wide_record + f.wide_record_bytes.next_multiple_of(256);
+        debug_assert_eq!(len, f.predict_bytes());
         Ok(Self {
             stream: Stream::new(device, 0)?,
-            buffer: DeviceBuffer::new(device, lists + lists_bytes.max(64))?,
+            buffer: DeviceBuffer::new(device, len)?,
             lists,
+            wide_input,
+            wide_logits,
+            wide_record,
+            input_copied: Event::new(device)?,
             done: Event::new(device)?,
             pending: false,
         })
@@ -102,6 +123,74 @@ impl Part {
             )?;
         }
         self.board.ahead_enqueued(i, &state.stream)?;
+        state.done.record(&state.stream)?;
+        state.pending = true;
+        Ok(())
+    }
+
+    /// Enqueues the prediction of the next layer's picks at layer `i` of a wide step of `rows`
+    /// rows, on the step's `stream`: `act` holds the rows the router of layer `i` read (in
+    /// the activations' layout) and the router's event has been recorded. Nothing when the
+    /// board does not want it there, at the part's last layer, or for a router whose weights
+    /// the f16 tile kernels do not take.
+    pub(super) fn enqueue_wide_prediction(
+        &mut self,
+        stream: &Stream,
+        i: usize,
+        act: DevicePtr,
+        rows: u32,
+    ) -> Result<(), ModelError> {
+        let Some(state) = self.predict.as_mut() else { return Ok(()) };
+        if self.f.wide_input_bytes == 0 || !self.board.wide_wanted(i) {
+            return Ok(());
+        }
+        let Some(next) = self.w.layers.get(i + 1) else { return Ok(()) };
+        let moe = next.moe;
+        let Some(router) = moe.router else { return Ok(()) };
+        let (n_in, n_out) = (moe.shape.n_embd, moe.shape.n_experts);
+        let tile = n_in.is_multiple_of(32).then_some(PrefillPath::F16);
+        let Some(path) = moe.router_range.path(tile) else { return Ok(()) };
+        let base = state.buffer.ptr();
+        let (input, logits, record) = (
+            base.offset(state.wide_input),
+            base.offset(state.wide_logits),
+            base.offset(state.wide_record),
+        );
+        let row_bytes = 4 * u64::from(n_in);
+        let f32_at = Kernels::quantized_activation_bytes(n_in, rows) - row_bytes * u64::from(rows);
+        let ids = 4 * u64::from(moe.shape.top_k) * u64::from(rows);
+        state.stream.wait_event(&self.routed[i])?;
+        // SAFETY: `act` holds the activations of `rows` rows, which the step's stream does
+        // not write again before it has waited for their f16 copy; the router is an F32
+        // matrix of the part's weights; the input, the logits and the record are this
+        // state's own buffer, sized for the most rows of a step. The board's ids of layer `i`
+        // are pinned memory that the host reads only after the event behind this copy.
+        unsafe {
+            self.kernels.prepare_prefill_activations(
+                &state.stream,
+                PrefillPath::F16,
+                act.offset(f32_at),
+                input,
+                n_in,
+                rows,
+            )?;
+            state.input_copied.record(&state.stream)?;
+            stream.wait_event(&state.input_copied)?;
+            self.kernels.matmul(
+                &state.stream,
+                GgmlType::F32,
+                path,
+                self.w.at(router),
+                input,
+                logits,
+                n_in,
+                n_out,
+                rows,
+            )?;
+            self.experts.pick_rows(&state.stream, &moe.shape, logits, record, rows)?;
+            state.stream.copy_to_host(self.board.wide_dst(i), record.offset(16), ids as usize)?;
+        }
+        self.board.wide_enqueued(i, rows, &state.stream)?;
         state.done.record(&state.stream)?;
         state.pending = true;
         Ok(())
