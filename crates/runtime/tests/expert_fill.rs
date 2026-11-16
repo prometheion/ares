@@ -337,11 +337,26 @@ fn a_fill_evicts_nothing_that_is_worth_something() {
     assert_eq!(rig.held(0), (set(&[1, 2]), set(&[3, 4])));
 
     // A member without heat is room.
-    rig.heat(0, &[(1, 9.0), (3, 7.0), (10, 50.0), (11, 40.0)]);
+    rig.heat(0, &[(1, 9.0), (2, 8.0), (3, 7.0), (10, 50.0), (11, 40.0)]);
     let mut fill = rig.store.plan_fill(&ALL, FillOrder::Heat);
     assert_eq!(fill.todo(), [(0, 10, FillTier::Ram)], "expert 4 is worth nothing now");
     rig.fill(&mut fill, FillPace::IDLE);
     assert_eq!(rig.held(0), (set(&[1, 2]), set(&[3, 10])));
+
+    // A member of VRAM without heat is room as well: the hottest outside
+    // comes up from RAM, and the next takes its place there.
+    rig.heat(0, &[(1, 9.0), (3, 7.0), (10, 50.0), (11, 40.0)]);
+    let mut fill = rig.store.plan_fill(&ALL, FillOrder::Heat);
+    assert_eq!(fill.todo(), [(0, 10, FillTier::Vram), (0, 11, FillTier::Ram)]);
+    rig.fill(&mut fill, FillPace::IDLE);
+    // It took the slot kept free; the end of the next step frees one again,
+    // the coldest.
+    rig.store.begin_step();
+    rig.store.end_step().unwrap();
+    rig.settle();
+    assert_eq!(rig.held(0), (set(&[1, 10]), set(&[3, 11])));
+    assert_eq!(rig.store.device(0).entry(0, 2), -1, "the cold member left the table");
+    rig.assert_usable(0, 10);
 }
 
 #[test]

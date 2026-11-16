@@ -3,11 +3,11 @@
 //! whenever the engine is idle, into the slots that are empty.
 //!
 //! **What is brought.** For every layer, the hottest experts that VRAM does
-//! not hold, as many as it has free slots, and behind them the next hottest
-//! that RAM does not hold, as many as RAM has room for. Room in RAM is a free
-//! slot or a slot whose member is worth nothing there: a copy of an expert
-//! that VRAM holds, or one without heat. Nothing that is worth something is
-//! evicted for a fill, and nothing without heat is brought.
+//! not hold, as many as it has room for, and behind them the next hottest
+//! that RAM does not hold, as many as RAM has room for. Room is a free slot or
+//! a slot whose member is worth nothing there: in VRAM one without heat, in
+//! RAM also a copy of an expert that VRAM holds. Nothing that is worth
+//! something is evicted for a fill, and nothing without heat is brought.
 //!
 //! **How.** An expert comes from the file into a RAM slot; one meant for VRAM
 //! goes on from there into a free slot of the layer's VRAM tier, its table
@@ -186,7 +186,13 @@ impl<D: SlotDevice> ExpertStore<D> {
                 .collect();
             outsiders
                 .sort_by(|a, b| heat[*b as usize].total_cmp(&heat[*a as usize]).then(a.cmp(b)));
-            let to_vram = vram.n_free().saturating_sub(keep).min(outsiders.len());
+            // Room in VRAM: free slots (less those kept free) and members
+            // without heat, such as what the steps that measured the price of a
+            // step brought.
+            let cold = (0..heat.len() as u32)
+                .filter(|e| vram.contains(*e) && heat[*e as usize] <= EMPTY_WORTH)
+                .count();
+            let to_vram = (vram.n_free().saturating_sub(keep) + cold).min(outsiders.len());
             // Room in RAM: free slots, members worth nothing there, and the
             // members that go up to VRAM now (their copies are then worth
             // nothing). Those meant for VRAM that are read pass through a slot
@@ -270,7 +276,7 @@ impl<D: SlotDevice> ExpertStore<D> {
             }
         }
 
-        // Uploads into the free slots of VRAM.
+        // Uploads into VRAM: a free slot, or one whose member has no heat.
         let keep = if self.serve() == Serve::Stream { self.config.vram_reserve } else { 0 };
         let mut waiting = VecDeque::new();
         while let Some(item) = fill.ready.pop_front() {
@@ -284,8 +290,12 @@ impl<D: SlotDevice> ExpertStore<D> {
                 fill.stats.dropped += 1;
                 continue;
             }
-            if self.vram.sets[layer].n_free() <= keep {
-                // Something else took the free slots: it stays in RAM.
+            let (vram, heat) = (&self.vram.sets[layer], self.heat.layer(layer));
+            let room = vram.n_free() > keep
+                || (0..heat.len() as u32)
+                    .any(|e| vram.contains(e) && heat[e as usize] <= EMPTY_WORTH);
+            if !room {
+                // Something else took the room: it stays in RAM.
                 fill.stats.ram += 1;
                 continue;
             }
