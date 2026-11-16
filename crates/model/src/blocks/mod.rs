@@ -18,10 +18,14 @@
 //!   mean ([`forms`]).
 //! - [`recurrent`]: the layers of the gated delta rule, their state in a
 //!   sequence's slot and the inputs a draft window keeps.
+//! - [`slots`]: the slot arena that holds every block's state per sequence,
+//!   its checkpoints in host memory, the copies and transfers of the prefix
+//!   cache over all K/V groups, and what the prefix cache is told.
 
 pub(crate) mod forms;
 pub(crate) mod kv;
 pub(crate) mod recurrent;
+pub(crate) mod slots;
 
 use ares_runtime::ModelError;
 

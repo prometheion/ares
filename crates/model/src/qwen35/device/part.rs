@@ -40,9 +40,12 @@ mod tensor;
 use crate::blocks::forms::Reach;
 use crate::blocks::kv;
 use crate::blocks::recurrent::{self, Inputs, Recurrent};
+use crate::blocks::slots::{Arena, Checkpoint, Extent, Places, SlotLayout};
 
+pub use crate::blocks::slots::CopyTimes;
 pub use mtp::{DraftBytes, DraftChain, DraftStep, DraftTimes, Drafted};
-pub use resume::{CopyTimes, checkpoint_bytes, settle_cells, state_slot_bytes, transit_page_bytes};
+pub(crate) use resume::declared;
+pub use resume::{checkpoint_bytes, state_slot_bytes};
 
 pub use crate::blocks::PAGE_ENTRY;
 
@@ -59,8 +62,8 @@ pub const DRAFT_KV: (CacheFormat, CacheFormat) = (CacheFormat::Q4, CacheFormat::
 /// The partly used pages (tails) per sequence slot that the prefix cache may
 /// hold. A tail keeps an exact entry for as long as it exists, so the exact
 /// pool is sized for them: one per slot serves a conversation that goes on from
-/// its last answer.
-pub const TAILS_PER_SLOT: u32 = 1;
+/// its last answer (`blocks/slots.rs`, the same for every model).
+pub const TAILS_PER_SLOT: u32 = crate::blocks::slots::TAILS_PER_SLOT;
 
 /// The choices of a device implementation.
 #[derive(Clone, Debug)]
@@ -476,10 +479,12 @@ pub struct Part {
     /// Per block of `w.blocks`.
     recurrent_at: Vec<Option<RecurrentAt>>,
     attention_at: Vec<Option<AttentionAt>>,
-    state: DeviceBuffer,
-    slot_bytes: u64,
-    /// The places for checkpoints on the host (`resume.rs`).
-    places: resume::Places,
+    /// The slot arena: the recurrent state of every sequence slot.
+    state: Arena,
+    /// What a checkpoint of a sequence keeps, and the places for checkpoints
+    /// on the host (`resume.rs`).
+    checkpoint: Checkpoint,
+    places: Places,
     /// Pages of the pool.
     n_pages: u32,
     /// The recurrent blocks: their state's format and a draft window's kept
@@ -696,7 +701,7 @@ impl Part {
         let (mut cd, mut vd, mut kd, mut nv, mut hq, mut hkv, mut f) = (0u64, 0, 0, 0, 0, 0, 0);
         let mut recurrent_at = Vec::new();
         let mut attention_at = Vec::new();
-        let (mut slot_bytes, mut pool) = (0u64, 0u64);
+        let (mut slot, mut pool) = (SlotLayout::new(), 0u64);
         let mut rec_layout = recurrent::Layout::new(opts.state, opts.window_rows);
         let sizing =
             kv::Sizing { slots: max_slots, rows: opts.max_rows, tails: max_slots * TAILS_PER_SLOT };
@@ -714,7 +719,7 @@ impl Part {
                     vd = vd.max(u64::from(s.value_dim()));
                     kd = kd.max(u64::from(s.key_dim()));
                     nv = nv.max(u64::from(s.n_v_heads));
-                    r_at = Some(rec_layout.layer(s, &mut slot_bytes));
+                    r_at = Some(rec_layout.layer(s, &mut slot));
                 }
                 MixerW::Attention(a) => {
                     let geo = geometry(c, opts.kv, a.n_kv);
@@ -849,13 +854,9 @@ impl Part {
         s.len = carve.len;
 
         ledger.reserve("qwen35 step scratch", s.len)?;
-        let state_bytes = (slot_bytes * u64::from(max_slots)).max(64);
-        ledger.reserve("qwen35 recurrent state", state_bytes)?;
         let scratch = DeviceBuffer::new(device, s.len)?;
-        let state = DeviceBuffer::new(device, state_bytes)?;
+        let state = Arena::new(device, ledger, "qwen35 recurrent state", slot.bytes(), max_slots)?;
         let rec = Recurrent::new(device, ledger, "qwen35", &rec_layout)?;
-        // A defined start: a slot is cleared again when a sequence starts in it.
-        state.write(0, &vec![0u8; state_bytes as usize])?;
         scratch.write(s.status, &[0u8; 16])?;
 
         // The records of the groups of a step: per group a header, its
@@ -908,9 +909,13 @@ impl Part {
         let dflash = dflash::open(c, weights, placement, opts, index, device, ledger, max_slots)?;
         // A checkpoint is the slot's recurrent state and, where the draft
         // block is, one row of its carry.
-        let checkpoint = slot_bytes + if mtp.is_some() { d * 4 } else { 0 };
+        let mut checkpoint = Checkpoint { extents: vec![state.extent()], host: 0 };
+        if let Some(m) = &mtp {
+            let (base, rows) = m.carry();
+            checkpoint.extents.push(Extent { base, stride: u64::from(rows) * d * 4, bytes: d * 4 });
+        }
         let places =
-            resume::Places::new(device, ram, checkpoint, checkpoints, opts.profile.is_some())?;
+            Places::new(device, ram, checkpoint.bytes(), checkpoints, opts.profile.is_some())?;
         let rope = &c.attention.rope;
         Ok(Self {
             index,
@@ -936,7 +941,7 @@ impl Part {
             recurrent_at,
             attention_at,
             state,
-            slot_bytes,
+            checkpoint,
             places,
             n_pages: pages,
             rec,
@@ -988,7 +993,7 @@ impl Part {
 
     /// Bytes of recurrent state per sequence on this device.
     pub fn state_bytes_per_slot(&self) -> u64 {
-        self.slot_bytes
+        self.state.slot_bytes()
     }
 
     /// Bytes of scratch for a step of the most rows.
@@ -1777,15 +1782,7 @@ impl Part {
 
     /// Clears the recurrent state of the slots in which a sequence starts.
     fn start_sequences(&self, env: &StepEnv<'_>) -> Result<(), ModelError> {
-        if self.slot_bytes == 0 {
-            return Ok(());
-        }
-        for s in env.segments.iter().filter(|s| s.pos0 == 0) {
-            let at = self.state.ptr().offset(u64::from(s.slot) * self.slot_bytes);
-            // SAFETY: the slot is inside the state arena (checked in `check`).
-            unsafe { env.stream.fill(at, 0, self.slot_bytes as usize)? };
-        }
-        Ok(())
+        self.state.clear_starting(env.stream, env.segments)
     }
 
     /// Enqueues one step: the embedding (or the hand-over from the device
@@ -1914,7 +1911,7 @@ impl Part {
                     self.w.at(r.dt_bias),
                     self.w.at(r.ssm_a),
                     self.state.ptr(),
-                    self.slot_bytes,
+                    self.state.slot_bytes(),
                 )?;
             }
         }
@@ -2153,7 +2150,7 @@ impl Part {
                 self.w.at(r.dt_bias),
                 self.w.at(r.ssm_a),
                 self.state.ptr(),
-                self.slot_bytes,
+                self.state.slot_bytes(),
             )?;
             self.gated_norm(stream, r, o, z, n)?;
             self.mark(stream, Phase::Layers)?;
@@ -2274,7 +2271,7 @@ impl Part {
         else {
             return None;
         };
-        let base = u64::from(slot) * self.slot_bytes;
+        let base = u64::from(slot) * self.state.slot_bytes();
         Some([
             (base + at.conv, r.shape.conv_state_len() * 4),
             (base + at.delta, r.shape.delta_state_len() * self.opts.state.bytes()),
@@ -2283,7 +2280,7 @@ impl Part {
 
     /// The arena of recurrent state.
     pub fn state(&self) -> &DeviceBuffer {
-        &self.state
+        self.state.buffer()
     }
 
     /// Where attention block `i` keeps tile `tile` of the sequence in `slot`,

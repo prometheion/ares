@@ -13,7 +13,7 @@
 //!   inputs into the state ([`Recurrent::commit`]), before the next step.
 //!
 //! The block declares its extents in a slot ([`Layout`]); the slot arena that
-//! holds them, beside the state of other blocks, is the model's. The products
+//! holds them, beside the state of other blocks, is [`super::slots::Arena`]. The products
 //! that write the inputs, the norm and gate of the output and the product
 //! after it are the model's launch plan.
 
@@ -25,6 +25,7 @@ use ares_cuda::{
 use ares_runtime::ModelError;
 
 use super::invalid;
+use super::slots::SlotLayout;
 
 /// Where a recurrent layer keeps the state of a sequence in a slot of the
 /// state arena, and where a draft window keeps the layer's inputs.
@@ -38,14 +39,16 @@ pub(crate) struct Layer {
     pub kept: [u64; 4],
 }
 
-/// Where the state of a layer of `shape` starts in a slot whose earlier state
-/// ends at `at`, and where the slot goes on: the convolution windows, the
-/// delta-rule matrices, and the next offset. Every part is aligned to 64
-/// bytes.
-pub(crate) fn extent(shape: &RecurrentShape, format: StateFormat, at: u64) -> (u64, u64, u64) {
-    let delta = (at + shape.conv_state_len() * 4).next_multiple_of(64);
-    let end = (delta + shape.delta_state_len() * format.bytes()).next_multiple_of(64);
-    (at, delta, end)
+/// Places the state of a layer of `shape` in `slot`: the convolution
+/// windows, then the delta-rule matrices. Returns where each starts.
+pub(crate) fn place(
+    shape: &RecurrentShape,
+    format: StateFormat,
+    slot: &mut SlotLayout,
+) -> (u64, u64) {
+    let conv = slot.take(shape.conv_state_len() * 4);
+    let delta = slot.take(shape.delta_state_len() * format.bytes());
+    (conv, delta)
 }
 
 /// Lays out the recurrent layers of a device: their extents in a slot, which
@@ -64,12 +67,10 @@ impl Layout {
         Self { format, window: u64::from(window_rows), kept: 0 }
     }
 
-    /// Places a layer of `shape` in a slot whose state so far ends at `*slot`
-    /// (moved past the layer's), and its kept inputs behind those of the
-    /// layers before.
-    pub(crate) fn layer(&mut self, shape: RecurrentShape, slot: &mut u64) -> Layer {
-        let (conv, delta, end) = extent(&shape, self.format, *slot);
-        *slot = end;
+    /// Places a layer of `shape` in `slot`, behind the extents declared there
+    /// before, and its kept inputs behind those of the layers before.
+    pub(crate) fn layer(&mut self, shape: RecurrentShape, slot: &mut SlotLayout) -> Layer {
+        let (conv, delta) = place(&shape, self.format, slot);
         let mut kept = [0u64; 4];
         let sizes = [
             u64::from(shape.conv_dim()),

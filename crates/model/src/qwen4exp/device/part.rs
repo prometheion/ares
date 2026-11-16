@@ -71,6 +71,7 @@ use super::load::{
 use super::prune::{PartPrune, PruneMask, PruneSetup};
 use crate::blocks::kv;
 use crate::blocks::recurrent::{self, Inputs, Recurrent};
+use crate::blocks::slots::{Arena, SlotLayout};
 use crate::qwen4exp::Config;
 use crate::qwen4exp::weights::Weights;
 
@@ -639,7 +640,7 @@ impl Frame {
         let iq = (c.indexer.n_head * c.indexer.key_dim) as u64;
         let id = c.indexer.key_dim as u64;
 
-        let (mut slot_bytes, mut pool_bytes, mut raw_bytes) = (0u64, 0u64, 0u64);
+        let (mut slot, mut pool_bytes, mut raw_bytes) = (SlotLayout::new(), 0u64, 0u64);
         let mut rec_layout = recurrent::Layout::new(opts.state, opts.window_rows);
         let mut recurrent = Vec::new();
         let mut attention = Vec::new();
@@ -661,8 +662,7 @@ impl Frame {
                 let kv_pool = pool_bytes;
                 let key_pool = (kv_pool + pages * geo.converted_entry_bytes()).next_multiple_of(64);
                 pool_bytes = (key_pool + pages * ix.key_slot_bytes(opts.keys)).next_multiple_of(64);
-                let carry = slot_bytes;
-                slot_bytes = (carry + ix.carry_len() * 4).next_multiple_of(64);
+                let carry = slot.take(ix.carry_len() * 4);
                 let exact = exact_at;
                 exact_at += u64::from(exact_slots) * geo.exact_entry_bytes();
                 let kept_raw = keep(id * 4);
@@ -678,14 +678,12 @@ impl Frame {
                     head_dim: r.head_dim as u32,
                     conv_kernel: r.conv_kernel as u32,
                 };
-                r_at = Some(rec_layout.layer(shape, &mut slot_bytes));
+                r_at = Some(rec_layout.layer(shape, &mut slot));
             }
             if streams && c.ngram.as_ref().is_some_and(|g| g.layer == layer) {
                 any_ngram = true;
-                let at = slot_bytes;
                 let history = ng.as_ref().map_or(0, NgramShape::history_len);
-                slot_bytes = (at + history * 4).next_multiple_of(64);
-                ngram_history = Some(at);
+                ngram_history = Some(slot.take(history * 4));
             }
             recurrent.push(r_at);
             attention.push(a_at);
@@ -840,7 +838,7 @@ impl Frame {
         let (exact_device, exact_host) =
             kv::group_bytes(&geos, exact_slots, u64::from(opts.table_entries()));
         Ok(Self {
-            slot_bytes: slot_bytes.max(64),
+            slot_bytes: slot.bytes().max(64),
             exact_slots,
             exact_device,
             exact_host,
@@ -995,7 +993,9 @@ pub struct Part {
     rope: RopeParams,
     attn_shape: AttentionShape,
     scratch: DeviceBuffer,
-    state: DeviceBuffer,
+    /// The slot arena: per sequence slot the recurrent state, the carried
+    /// keys of the indexer and the n-gram history.
+    state: Arena,
     tables: DeviceBuffer,
     /// The tables as the host last wrote them, in page-locked memory, which
     /// the copies of an update read; and the entries of the attention tables
@@ -1144,8 +1144,6 @@ impl Part {
                  matrices, a rank that is a multiple of 4 and at most 1024)",
             ));
         }
-        let state_bytes = f.slot_bytes * u64::from(opts.max_slots);
-        ledger.reserve(format!("{label} recurrent state"), state_bytes)?;
         ledger.reserve(format!("{label} step scratch"), f.s.len)?;
         let records_bytes = (f.record_stride * w.layers.len() as u64).max(64);
         ledger.reserve(format!("{label} route records"), records_bytes)?;
@@ -1180,14 +1178,20 @@ impl Part {
             })
             .transpose()?;
         let scratch = DeviceBuffer::new(device, f.s.len)?;
-        let state = DeviceBuffer::new(device, state_bytes)?;
+        // A defined start: the state of a slot is cleared again when a
+        // sequence starts in it.
+        let state = Arena::new(
+            device,
+            ledger,
+            &format!("{label} recurrent state"),
+            f.slot_bytes,
+            opts.max_slots,
+        )?;
         let tables = DeviceBuffer::new(device, tables_bytes)?;
         let rec = Recurrent::new(device, ledger, label, &f.rec)?;
         let kept_raw =
             (f.raw_bytes > 0).then(|| DeviceBuffer::new(device, f.raw_bytes)).transpose()?;
-        // A defined start: the state of a slot is cleared again when a
-        // sequence starts in it, the zeros stay zeros.
-        state.write(0, &vec![0u8; state_bytes as usize])?;
+        // The zeros stay zeros.
         scratch.write(f.s.zeros, &vec![0u8; (f.s.xn - f.s.zeros) as usize])?;
         scratch.write(f.s.status, &[0u8; 16])?;
         // The page tables start as page 0 everywhere: a row that reads an
@@ -2000,11 +2004,7 @@ impl Part {
             }
         }
         // A sequence that starts in a slot starts from zero state.
-        for s in env.segments.iter().filter(|s| s.pos0 == 0) {
-            let at = self.state.ptr().offset(u64::from(s.slot) * self.f.slot_bytes);
-            // SAFETY: the slot is inside the state arena (`check`).
-            unsafe { stream.fill(at, 0, self.f.slot_bytes as usize)? };
-        }
+        self.state.clear_starting(stream, env.segments)?;
         self.mark(stream, Phase::Other)
     }
 

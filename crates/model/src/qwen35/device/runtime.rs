@@ -21,9 +21,10 @@ use super::choose::{Balance, LayoutReport};
 use super::embed::{EmbeddingReport, HostRows, TableShape};
 use super::part::{
     DRAFT_KV, DraftBytes, DraftChain, DraftStep, Exchange, Options, PAGE_ENTRY, Part, PartSetup,
-    StepEnv, TAILS_PER_SLOT, checkpoint_bytes, page_bytes, settle_cells, transit_page_bytes,
+    StepEnv, TAILS_PER_SLOT, declared, page_bytes,
 };
 use super::placement::{HalfShares, Placement, PlacementError};
+use crate::blocks::slots::{self, Declared};
 use crate::chat;
 use crate::dflash::PassSeq;
 use crate::qwen35::{Config, Weights};
@@ -255,6 +256,14 @@ impl Qwen35 {
     /// - the format of the recurrent state, and how the products round;
     /// - which heads of every block each device holds, since the bytes are
     ///   laid out per device.
+    /// What each device part keeps of a sequence and of a page
+    /// (`part/resume.rs`), which the prefix cache is told.
+    fn declared(&self) -> Vec<Declared> {
+        (0..self.placement.n_devices())
+            .map(|d| declared(&self.config, &self.placement, d, &self.options))
+            .collect()
+    }
+
     fn state_fingerprint(&self) -> Vec<u8> {
         let mut out = b"qwen35 state 1\0".to_vec();
         for part in 0..self.gguf.n_parts() {
@@ -393,32 +402,14 @@ impl Model for Qwen35 {
     }
 
     fn prefix_cache(&self) -> Option<PrefixCache> {
-        Some(PrefixCache {
-            checkpoint_bytes: (0..self.placement.n_devices())
-                .map(|device| {
-                    checkpoint_bytes(&self.config, &self.placement, device, self.options.state)
-                })
-                .collect(),
-            tails_per_slot: Some(TAILS_PER_SLOT),
-        })
+        Some(slots::prefix_cache(&self.declared(), Some(TAILS_PER_SLOT)))
     }
 
     fn durable(&self, cells_per_page: u32) -> Option<Durable> {
         if cells_per_page != ENTRY_CELLS {
             return None;
         }
-        let devices = 0..self.placement.n_devices();
-        Some(Durable {
-            fingerprint: self.state_fingerprint(),
-            page_bytes: devices
-                .clone()
-                .map(|d| transit_page_bytes(&self.config, &self.placement, d, &self.options))
-                .collect(),
-            state_bytes: devices
-                .map(|d| checkpoint_bytes(&self.config, &self.placement, d, self.options.state))
-                .collect(),
-            settle_cells: settle_cells(&self.placement, &self.options),
-        })
+        Some(slots::durable(&self.declared(), self.state_fingerprint()))
     }
 
     fn page_entry(&self, page: u32) -> u32 {

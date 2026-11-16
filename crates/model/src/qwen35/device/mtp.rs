@@ -274,6 +274,13 @@ pub(super) struct Mtp {
 }
 
 impl Mtp {
+    /// Where the carry starts and its rows per slot: the first row of a
+    /// slot is the final hidden state of its last row, which its next chain
+    /// starts from, and what a checkpoint keeps of the block.
+    pub(super) fn carry(&self) -> (DevicePtr, u32) {
+        (self.carry.ptr(), self.carry_rows)
+    }
+
     /// Reserves and allocates what the block needs besides its weights and
     /// its pool.
     #[allow(clippy::too_many_arguments)]
@@ -591,15 +598,6 @@ impl Part {
     /// exact: see [`DRAFT_KV`]), for tests that read the cells it wrote.
     pub fn draft_exact_entries(&self) -> Option<&DeviceBuffer> {
         self.mtp.as_ref().and_then(|m| m.kv.exact_buffer())
-    }
-
-    /// The row of the carry that `slot`'s next chain starts from (the final
-    /// hidden state of its last row) and its bytes: what a checkpoint keeps
-    /// of the block. `None` on a device without the block.
-    pub(super) fn carry_row(&self, slot: u32) -> Option<(DevicePtr, u64)> {
-        let m = self.mtp.as_ref()?;
-        let row = u64::from(self.d) * 4;
-        Some((m.carry.ptr().offset(u64::from(slot) * u64::from(m.carry_rows) * row), row))
     }
 
     /// The hidden states kept per sequence and the rows per sequence, for
