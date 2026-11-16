@@ -4496,6 +4496,11 @@ images of 256, 1024 and 4096 rows; load average 26 to 36):
   the time outside the attention. Bias, GELU and residual in the epilogues of
   the products would take most of that away; not built.
 - Loading the tower takes 0.6 to 2.2 s with the file in the page cache.
+- *f16 sums* flushed into `f32` every 64 values (the faster path of the capped
+  cards) in every product but `ffn_down` and the patch matrix: 8 to 9 % faster
+  at 1024 rows and 4.5 % at 4096 on both cards, and up to twice as far from the
+  exact rows (4.0e-4 to 1.18e-2, at most 60 % of the tolerance). Not taken: the
+  output would get worse.
 
 ## What is taken from where
 
