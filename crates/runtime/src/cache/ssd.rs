@@ -699,16 +699,27 @@ impl Cache {
         self.ssd.as_ref().map_or_else(SsdCounters::default, Ssd::counters)
     }
 
-    /// A buffer for a checkpoint on its way out of its place: when the writer
-    /// holds every one, the loop waits for it briefly. This is the one place
-    /// where the step loop waits for the drive, besides a page that would be
-    /// lost otherwise.
-    pub(super) fn state_buffer(&mut self) -> Option<Vec<TransitPart>> {
+    /// A buffer for a checkpoint on its way out of its place, which is added
+    /// to `batch`: when the batch so far holds every one, it is carried out
+    /// first, and when the writer holds every one, the loop waits for it
+    /// briefly. This is the one place where the step loop waits for the
+    /// drive, besides a page that would be lost otherwise.
+    pub(super) fn state_room(
+        &mut self,
+        pool: &mut PagePool,
+        exec: &mut dyn Executor,
+        batch: &mut Vec<Transfer>,
+        notes: &mut Vec<Note>,
+    ) -> Option<Vec<TransitPart>> {
         let begun = Instant::now();
         let patience = if self.draining { DRAIN_LIMIT } else { PATIENCE };
         loop {
             if let Some(parts) = self.ssd.as_mut()?.state_buffer() {
                 return Some(parts);
+            }
+            if notes.iter().any(|note| matches!(note, Note::StateOut(_) | Note::StateIn { .. })) {
+                self.carry_out(pool, exec, std::mem::take(batch), std::mem::take(notes));
+                continue;
             }
             if begun.elapsed() >= patience || !self.wait_for_writer() {
                 return None;
@@ -872,7 +883,7 @@ impl Cache {
                     break;
                 }
                 let (index, hash) = (job.asked, job.pages[job.asked].0);
-                let Some(parts) = self.ram_buffer(false) else { return };
+                let Some(parts) = self.ram_buffer() else { return };
                 let ssd = self.ssd.as_mut().expect("checked above");
                 let located = ssd.shared.store().locate(Kind::Page, hash);
                 let Some(located) = located else {
@@ -914,7 +925,7 @@ impl Cache {
         let (mut batch, mut notes) = (Vec::new(), Vec::new());
         // What left the devices and what leaves RAM, first: the pages of the
         // pool and the places they leave may be taken by what comes back.
-        self.push_leaving(&mut batch, &mut notes);
+        self.push_leaving(pool, exec, &mut batch, &mut notes);
         let settle = u64::from(self.durable.as_ref().map_or(0, |durable| durable.settle_cells));
         let jobs = self.ssd.as_ref().map_or(0, |ssd| ssd.jobs.len());
         for at in 0..jobs {
@@ -936,7 +947,7 @@ impl Cache {
                 let mut grown = job.held.append(pool, per_page);
                 if grown.is_err() {
                     self.evict(pool, 1);
-                    self.push_leaving(&mut batch, &mut notes);
+                    self.push_leaving(pool, exec, &mut batch, &mut notes);
                     let ssd = self.ssd.as_mut().expect("only with a level on SSD");
                     grown = ssd.jobs[at].held.append(pool, per_page);
                 }
@@ -954,7 +965,7 @@ impl Cache {
                         Some(place) => {
                             // The checkpoint that had the place leaves it
                             // for the drive before this one comes in.
-                            self.push_leaving(&mut batch, &mut notes);
+                            self.push_leaving(pool, exec, &mut batch, &mut notes);
                             batch.push(Transfer {
                                 kind: TransferKind::StateIn,
                                 object: place,
@@ -1126,7 +1137,8 @@ impl Cache {
             if !worth || in_ram || ssd.has_or_queued(Kind::Page, page.hash) {
                 continue;
             }
-            let Some(parts) = self.ram_buffer(true) else { break };
+            let room = self.page_room(pool, exec, &mut batch, &mut notes, true);
+            let Some(parts) = room else { break };
             self.ssd.as_mut().expect("checked above").queue(Kind::Page, page.hash);
             batch.push(Transfer {
                 kind: TransferKind::PageOut,

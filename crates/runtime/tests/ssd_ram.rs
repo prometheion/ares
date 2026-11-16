@@ -67,8 +67,15 @@ fn store(dir: &Path) -> SsdConfig {
     SsdConfig { min_cells: MIN_CELLS, segment_bytes: 64 << 10, ..SsdConfig::new(dir, 1 << 30) }
 }
 
+/// The bytes of a page in RAM (one block of direct I/O), and the pages that
+/// pass through RAM on their way to the drive and back, which the budget of
+/// the prompt cache's RAM holds besides its checkpoints.
+const PAGE_BYTES: u64 = 4096;
+const FLOOR: u64 = 16 * PAGE_BYTES;
+
 /// Checkpoints at every second page boundary of a prompt and while
-/// generating, a budget of eight of them in RAM.
+/// generating, a budget of eight of them in RAM, and with a level on SSD the
+/// floor of pages.
 fn config(ssd: Option<SsdConfig>) -> RuntimeConfig {
     RuntimeConfig {
         pages: 256,
@@ -76,7 +83,7 @@ fn config(ssd: Option<SsdConfig>) -> RuntimeConfig {
         max_slots: 8,
         window_rows: 1,
         warm_up: false,
-        cache_ram: 8 * CHECKPOINT,
+        cache_ram: 8 * CHECKPOINT + if ssd.is_some() { FLOOR } else { 0 },
         checkpoint_prompt_interval: 2 * PAGE,
         checkpoint_generation_interval: 2 * PAGE,
         ssd,
@@ -170,16 +177,15 @@ impl Rig {
         snapshot(&self.rt)
     }
 
-    /// Waits until the level on SSD has written `pages` pages and has
-    /// nothing left to write.
-    fn written(&self, pages: u64) -> Snapshot {
+    /// Waits until the level on SSD has nothing left to write.
+    fn written(&self) -> Snapshot {
         let deadline = std::time::Instant::now() + LIMIT;
         loop {
             let s = self.snapshot();
-            if s.counters.ssd.pages_written >= pages && s.counters.ssd.pending == 0 {
+            if s.counters.ssd.pending == 0 {
                 return s;
             }
-            assert!(std::time::Instant::now() < deadline, "{pages} pages were not written: {s}");
+            assert!(std::time::Instant::now() < deadline, "the writer is stuck: {s}");
             std::thread::sleep(Duration::from_millis(1));
         }
     }
@@ -209,6 +215,12 @@ fn text_of(seed: u64, len: usize) -> String {
     Rng(seed).prompt(len)
 }
 
+/// What the store in `dir` holds, as an engine that opens it sees it.
+fn stored(model: &Arc<SyntheticModel>, dir: &Path) -> ares_runtime::SsdCounters {
+    let memory = Memory::new(PLENTY);
+    engine(model, config(Some(store(dir))), &memory, None).snapshot().counters.ssd
+}
+
 /// Whether the record carries the save of a checkpoint.
 fn saves(record: &RecordView<'_>) -> bool {
     (0..record.state_copies()).any(|i| record.state_copy(i).kind == StateCopyKind::Save)
@@ -219,19 +231,22 @@ fn a_checkpoint_leaves_for_the_drive_before_the_machine_gets_its_place_back() {
     let model = model();
     let first = text_of(1, 200);
 
-    // What the level on SSD writes of this text while memory is free.
+    // What the level on SSD holds of this text while memory is free: nothing
+    // while the engine runs, and what is worth keeping once it ends.
     let free = TempDir::new("free");
     let memory = Memory::new(PLENTY);
     let e = engine(&model, config(Some(store(&free.0))), &memory, None);
     let a = e.ask(&first, 20);
-    let unhurried = e.written(13);
-    assert!(unhurried.counters.ssd.states_written >= 4, "{unhurried}");
+    let unhurried = e.written();
+    assert_eq!(unhurried.counters.ssd.states_written, 0, "{unhurried}");
     e.consistent();
     drop(e);
+    let kept = stored(&model, &free.0);
+    assert!(kept.store_states >= 4, "{kept:?}");
 
     // The same text on a machine that runs out of memory while the step
-    // with the third save is under way: the allowance of the checkpoints
-    // falls to the one place of the floor, and the conductor is told to trim.
+    // with the third save is under way: the allowance of the prompt cache
+    // falls to its floor, one place, and the conductor is told to trim.
     let dir = TempDir::new("short");
     let memory = Memory::new(PLENTY);
     let (seen, short) = (Arc::new(AtomicUsize::new(0)), memory.clone());
@@ -245,22 +260,23 @@ fn a_checkpoint_leaves_for_the_drive_before_the_machine_gets_its_place_back() {
             }
         })),
     );
-    assert_eq!(e.ram.cache_allowance(), 8 * CHECKPOINT);
+    assert_eq!(e.ram.cache_allowance(), 8 * CHECKPOINT + FLOOR);
     let b = e.ask(&first, 20);
     assert_eq!(b.text, a.text);
     assert_eq!(b.text, fresh(&first, 20));
-    assert_eq!(e.ram.cache_allowance(), CHECKPOINT, "the floor: one place");
-    let s = e.written(13);
+    assert_eq!(e.ram.cache_allowance(), CHECKPOINT + FLOOR, "the floor: one place and pages");
+    let s = e.written();
     // The checkpoints that were in RAM went, the coldest first, and their
-    // places with them; every checkpoint that was due on the drive got
-    // there all the same, the one whose step was under way included: it
-    // left its place before the place was called unused.
+    // places with them; each went to the drive as it left, before its place
+    // was called unused (the oracle would have seen a read of a place that
+    // lost its memory).
     assert!(s.counters.checkpoints_dropped >= unhurried.counters.checkpoints_dropped + 2, "{s}");
-    assert_eq!(s.counters.ssd.states_written, unhurried.counters.ssd.states_written, "{s}");
+    assert!(s.counters.ssd.states_written >= 2, "{s}");
     assert_eq!(s.counters.ssd.states_skipped, 0, "{s}");
-    assert_eq!(s.counters.ssd.pages_written, 13, "{s}");
+    assert_eq!(s.counters.ssd.pages_written, 0, "the devices hold the pages: {s}");
     e.consistent();
     drop(e);
+    assert_eq!(stored(&model, &dir.0).store_pages, 13);
 
     // What was written is the right state: another engine resumes from it.
     let second = format!("{first}{}{}", b.text, text_of(2, 40));
@@ -281,13 +297,12 @@ fn a_prompt_resumes_from_ssd_while_the_machine_has_no_room_for_checkpoints() {
     let memory = Memory::new(PLENTY);
     let e = engine(&model, config(Some(store(&dir.0))), &memory, None);
     let a = e.ask(&first, 20);
-    e.written(13);
     drop(e);
 
     // Another engine on a machine that has nothing to spare from the start.
     let memory = Memory::new(0);
     let e = engine(&model, config(Some(store(&dir.0))), &memory, None);
-    assert_eq!(e.ram.cache_allowance(), CHECKPOINT, "nothing but the floor");
+    assert_eq!(e.ram.cache_allowance(), CHECKPOINT + FLOOR, "nothing but the floor");
     let second = format!("{first}{}{}", a.text, text_of(12, 40));
     let b = e.ask(&second, 20);
     assert_eq!(b.text, fresh(&second, 20));
@@ -304,12 +319,13 @@ fn a_prompt_resumes_from_ssd_while_the_machine_has_no_room_for_checkpoints() {
     assert!(s.counters.checkpoints_saved > 0, "{s}");
     assert!(e.peak.load(Ordering::SeqCst) <= 2 * CHECKPOINT, "{}", e.peak.load(Ordering::SeqCst));
     e.consistent();
-    // And they reached the drive (280 cells are 17 full pages, 13 of which
-    // the store had): a third turn resumes behind them, on the same machine
-    // without room.
-    let s = e.written(4);
+    // And they reach the drive when they leave the place, or when the engine
+    // ends (280 cells are 17 full pages, 13 of which the store had): a third
+    // turn resumes behind them, on the same machine without room.
+    let s = e.written();
     assert_eq!(s.counters.ssd.states_skipped, 0, "{s}");
     drop(e);
+    assert_eq!(stored(&model, &dir.0).store_pages, 17);
     let third = format!("{second}{}{}", b.text, text_of(13, 40));
     let e = engine(&model, config(Some(store(&dir.0))), &memory, None);
     let c = e.ask(&third, 20);
@@ -337,7 +353,6 @@ fn memory_that_comes_back_is_taken_again_and_the_level_on_ssd_never_notices() {
     let e = engine(&model, config(Some(store(&dir.0))), &memory, None);
     let first = text_of(21, 200);
     let a = e.ask(&first, 20);
-    e.written(13);
     let held = e.snapshot().counters.checkpoints_saved;
     assert!(held >= 4);
 
@@ -349,7 +364,11 @@ fn memory_that_comes_back_is_taken_again_and_the_level_on_ssd_never_notices() {
         assert!(std::time::Instant::now() < deadline, "nothing was given up");
         std::thread::sleep(Duration::from_millis(1));
     }
-    assert_eq!(e.ram.cache_allowance(), CHECKPOINT);
+    assert_eq!(e.ram.cache_allowance(), CHECKPOINT + FLOOR);
+    // The checkpoints that went were written as they went.
+    let s = e.written();
+    assert!(s.counters.ssd.states_written >= 1, "{s}");
+    assert_eq!(s.counters.ssd.states_skipped, 0, "{s}");
 
     // The second turn finds its pages in the devices and its checkpoints
     // gone from RAM but for one; it says the same as an engine that kept
@@ -360,11 +379,11 @@ fn memory_that_comes_back_is_taken_again_and_the_level_on_ssd_never_notices() {
     for _ in 0..100 {
         memory.has(PLENTY);
     }
-    assert_eq!(e.ram.cache_allowance(), 8 * CHECKPOINT, "all of the budget again");
+    assert_eq!(e.ram.cache_allowance(), 8 * CHECKPOINT + FLOOR, "all of the budget again");
     let third = format!("{second}{}{}", b.text, text_of(23, 40));
     let c = e.ask(&third, 20);
     assert_eq!(c.text, fresh(&third, 20));
-    let s = e.written(17);
+    let s = e.written();
     assert_eq!(s.counters.ssd.states_skipped, 0, "{s}");
     e.consistent();
 }
@@ -413,8 +432,7 @@ fn a_save_that_never_ran_is_never_read_for_the_drive() {
     for (handle, expected) in handles.into_iter().zip(&expected) {
         assert_eq!(&handle.finish().text, expected);
     }
-    let s = e.snapshot();
-    let s = e.written(s.counters.ssd.pages_written);
+    let s = e.written();
     // What was given up before its save ran is counted, was not saved (the
     // oracle would have seen a save into a place that is not in use) and was
     // not read for the drive (it would have seen that, too).
@@ -444,7 +462,6 @@ fn saves_and_checkpoints_from_ssd_pass_through_the_one_place_together() {
     let memory = Memory::new(PLENTY);
     let e = engine(&model, config(Some(store(&dir.0))), &memory, None);
     let a = e.ask(&base, 10);
-    e.written(38);
     drop(e);
 
     // A machine without room: one place. Prompts that resume from SSD (a
@@ -469,7 +486,7 @@ fn saves_and_checkpoints_from_ssd_pass_through_the_one_place_together() {
     let s = e.snapshot();
     assert!(s.counters.ssd.states_read >= 1, "{s}");
     assert!(s.counters.checkpoints_saved > 0, "{s}");
-    let s = e.written(s.counters.ssd.pages_written);
+    let s = e.written();
     drop(e);
 
     // Whatever reached the drive under these conditions is the right state:
@@ -492,7 +509,6 @@ fn memory_that_comes_and_goes_while_state_moves_stops_nothing() {
     let memory = Memory::new(PLENTY);
     let e = engine(&model, config(Some(store(&dir.0))), &memory, None);
     let a = e.ask(&base, 10);
-    e.written(25);
     drop(e);
 
     // A machine whose memory comes and goes every few milliseconds, watched
@@ -541,6 +557,6 @@ fn memory_that_comes_and_goes_while_state_moves_stops_nothing() {
     assert!(flips.load(Ordering::SeqCst) >= 2, "the memory changed while the requests ran");
     assert!(s.counters.checkpoints_dropped > 0, "the conductor trimmed: {s}");
     assert!(s.counters.ssd.states_read >= 1, "{s}");
-    e.written(s.counters.ssd.pages_written);
+    e.written();
     e.consistent();
 }

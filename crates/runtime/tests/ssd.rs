@@ -1,6 +1,10 @@
 //! The level of the prefix cache that is on SSD, in the conductor, against
 //! the host executor as an oracle.
 //!
+//! What is written: what leaves RAM, and what is worth keeping when an engine
+//! ends. The engines here keep little in RAM (their budget is a few
+//! checkpoints), so that what the devices give up reaches the drive soon.
+//!
 //! The executor keeps the cells of every page and the recurrent state of
 //! every slot and checkpoint place ([`ares_runtime::testing`]), and it carries
 //! out the transfers of the level on SSD: a page's cells and a place's state
@@ -63,8 +67,15 @@ fn store(dir: &Path) -> SsdConfig {
     SsdConfig { min_cells: MIN_CELLS, segment_bytes: 64 << 10, ..SsdConfig::new(dir, 1 << 30) }
 }
 
+/// The bytes of a page in RAM (one block of direct I/O), and the pages that
+/// pass through RAM on their way to the drive and back, which a budget for
+/// the prompt cache's RAM holds besides its checkpoints.
+const PAGE_BYTES: u64 = 4096;
+const FLOOR: u64 = 16 * PAGE_BYTES;
+
 /// Checkpoints at every second page boundary of a prompt and while
-/// generating, `places` of them in RAM.
+/// generating, `places` of them in RAM, and with a level on SSD the floor of
+/// pages.
 fn config(pages: u32, places: u64, ssd: Option<SsdConfig>) -> RuntimeConfig {
     RuntimeConfig {
         pages,
@@ -72,7 +83,7 @@ fn config(pages: u32, places: u64, ssd: Option<SsdConfig>) -> RuntimeConfig {
         max_slots: 8,
         window_rows: 1,
         warm_up: false,
-        cache_ram: places * CHECKPOINT,
+        cache_ram: places * CHECKPOINT + if ssd.is_some() { FLOOR } else { 0 },
         checkpoint_prompt_interval: 2 * PAGE,
         checkpoint_generation_interval: 2 * PAGE,
         ssd,
@@ -111,14 +122,14 @@ impl Rig {
     }
 
     /// Waits until the level on SSD has nothing left to write.
-    fn written(&self, pages: u64) -> Snapshot {
+    fn written(&self) -> Snapshot {
         let deadline = std::time::Instant::now() + LIMIT;
         loop {
             let s = self.snapshot();
-            if s.counters.ssd.pages_written >= pages && s.counters.ssd.pending == 0 {
+            if s.counters.ssd.pending == 0 {
                 return s;
             }
-            assert!(std::time::Instant::now() < deadline, "{pages} pages were not written: {s}");
+            assert!(std::time::Instant::now() < deadline, "the writer is stuck: {s}");
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
     }
@@ -148,6 +159,11 @@ fn text_of(seed: u64, len: usize) -> String {
     Rng(seed).prompt(len)
 }
 
+/// What the store in `dir` holds, as an engine that opens it sees it.
+fn stored(model: &Arc<SyntheticModel>, dir: &Path) -> ares_runtime::SsdCounters {
+    engine(model, config(256, 8, Some(store(dir)))).snapshot().counters.ssd
+}
+
 #[test]
 fn a_text_resumes_from_ssd_in_another_engine_with_the_same_tokens() {
     let dir = TempDir::new("restart");
@@ -158,14 +174,17 @@ fn a_text_resumes_from_ssd_in_another_engine_with_the_same_tokens() {
     let a = e.ask(&first, 20);
     assert_eq!(a.text, fresh(&first, 20));
     assert_eq!(a.report.cached_tokens, 0);
-    // 220 cells are 13 full pages; the checkpoints at the page boundaries of
-    // the prompt that lie deep enough went along.
-    let s = e.written(13);
-    assert_eq!(s.counters.ssd.pages_written, 13, "{s}");
-    assert!(s.counters.ssd.states_written >= 4, "{s}");
+    // Nothing is written while the devices hold the text.
+    let s = e.written();
+    assert_eq!((s.counters.ssd.pages_written, s.counters.ssd.states_written), (0, 0), "{s}");
     assert!(s.ssd_problem.is_none());
     e.consistent();
+    // The engine ends: 220 cells are 13 full pages, and the checkpoints at
+    // the page boundaries of the prompt that lie deep enough go along.
     drop(e);
+    let s = stored(&model, &dir.0);
+    assert_eq!(s.store_pages, 13, "{s:?}");
+    assert!(s.store_states >= 4, "{s:?}");
 
     // Another engine, whose devices hold nothing: the second turn of the
     // conversation finds the first on SSD.
@@ -201,23 +220,29 @@ fn what_the_devices_gave_up_comes_back_from_ssd() {
     let e = engine(&model, config(32, 4, Some(store(&dir.0))));
     let (one, two) = (text_of(3, 300), text_of(4, 300));
     let a = e.ask(&one, 10);
-    e.written(19);
     let b = e.ask(&two, 10);
     assert_eq!((a.report.cached_tokens, b.report.cached_tokens), (0, 0));
-    let s = e.written(2 * 19);
+    let s = e.written();
     assert!(s.counters.cache_pages_evicted > 0, "the second text made room: {s}");
+    // RAM keeps its floor of pages; what left the devices beyond that went to
+    // the drive, the end of the text first.
+    assert!(s.counters.ssd.pages_written > 0, "{s}");
+    assert!(s.counters.ssd.pages_written < 19, "{s}");
 
-    // The first text again: its pages are gone from the pool and come back.
+    // The first text again: its pages are gone from the pool and come back,
+    // from RAM and from the drive.
     let again = e.ask(&one, 10);
     assert_eq!(again.text, a.text);
     assert_eq!(again.text, fresh(&one, 10));
     let s = e.snapshot();
     assert!(again.report.cached_tokens >= 256, "{:?}", again.report);
     assert!(s.counters.ssd.pages_read > 0, "{s}");
+    assert!(s.counters.ram.pages_read > 0, "{s}");
     assert!(s.counters.ssd.pages_read < 18, "what the pool still held was not read: {s}");
-    // Nothing is written twice.
-    assert_eq!(s.counters.ssd.pages_written, 2 * 19, "{s}");
     e.consistent();
+    // Nothing is written twice.
+    drop(e);
+    assert_eq!(stored(&model, &dir.0).store_pages, 2 * 19);
 }
 
 #[test]
@@ -235,9 +260,9 @@ fn a_short_text_is_not_written() {
     // A text that grows past the rule is written from its first page.
     let long = text_of(5, 30) + &a.text + &text_of(6, 60);
     e.ask(&long, 10);
-    let s = e.written(6);
-    assert_eq!(s.counters.ssd.pages_written, 6, "110 cells are 6 full pages: {s}");
     e.consistent();
+    drop(e);
+    assert_eq!(stored(&model, &dir.0).store_pages, 6, "110 cells are 6 full pages");
 }
 
 #[test]
@@ -247,9 +272,8 @@ fn state_of_another_fingerprint_is_never_used_and_makes_room_first() {
     let at = |max_bytes| SsdConfig { max_bytes, ..store(&dir.0) };
     let e = engine(&model(1, |_| {}), config(256, 8, Some(at(1 << 30))));
     let a = e.ask(&prompt, 10);
-    let s = e.written(25);
-    let old_bytes = s.counters.ssd.store_bytes;
     drop(e);
+    let old_bytes = stored(&model(1, |_| {}), &dir.0).store_bytes;
     let stores = || std::fs::read_dir(&dir.0).unwrap().count();
     assert_eq!(stores(), 1);
 
@@ -259,7 +283,7 @@ fn state_of_another_fingerprint_is_never_used_and_makes_room_first() {
     let b = e.ask(&prompt, 10);
     assert_eq!(b.text, a.text, "the synthetic model's text does not depend on the number");
     assert_eq!(b.report.cached_tokens, 0);
-    let s = e.written(25);
+    let s = e.written();
     assert_eq!(s.counters.ssd.pages_read, 0, "{s}");
     e.consistent();
     drop(e);
@@ -285,17 +309,16 @@ fn the_size_limit_gives_up_the_texts_used_least_recently() {
     let at = SsdConfig { max_bytes: 700 << 10, segment_bytes: 160 << 10, ..store(&dir.0) };
     let texts: Vec<String> = (0..8).map(|i| text_of(20 + i, 300)).collect();
     let e = engine(&model, config(64, 4, Some(at.clone())));
-    // Each text is written before the next one takes its pages of the pool:
-    // the engine does not wait for the drive, and a page the pool gives up
-    // before it was written is not written.
+    // What the pool gives up goes to RAM, and from there to the drive.
     let mut answers = Vec::new();
-    for (i, text) in texts.iter().enumerate() {
+    for text in &texts {
         answers.push(e.ask(text, 8).text);
-        e.written((i as u64 + 1) * 19);
+        e.written();
     }
-    let s = e.written(8 * 19);
+    let s = e.written();
     assert!(s.counters.ssd.store_bytes <= at.max_bytes, "{s}");
     assert!(s.counters.ssd.store_pages < 8 * 19, "{s}");
+    assert_eq!(s.counters.ram.pages_dropped, 0, "{s}");
     drop(e);
 
     let e = engine(&model, config(64, 4, Some(at)));
@@ -318,9 +341,9 @@ fn damaged_and_missing_files_cost_only_time() {
     let (one, two) = (text_of(40, 500), text_of(41, 500));
     let e = engine(&model, config(256, 8, Some(store(&dir.0))));
     let a = e.ask(&one, 10);
-    e.written(31);
     let b = e.ask(&two, 10);
-    e.written(2 * 31);
+    // The engine ends: the pages of the devices are written, the least
+    // recently used first, so the first text's come first.
     drop(e);
 
     let fingerprint = std::fs::read_dir(&dir.0).unwrap().next().unwrap().unwrap().path();
@@ -377,10 +400,12 @@ fn one_place_for_checkpoints_is_enough() {
     let first = text_of(50, 330);
     let e = engine(&model, config(256, 1, Some(store(&dir.0))));
     let a = e.ask(&first, 30);
-    let s = e.written(22);
-    // Every checkpoint went through the one place and to the drive.
+    let s = e.written();
+    // Every checkpoint went through the one place, and to the drive as the
+    // next one took the place over.
     assert!(s.counters.ssd.states_written >= 8, "{s}");
     assert_eq!(s.counters.ssd.states_skipped, 0, "{s}");
+    assert_eq!(s.counters.ssd.pages_written, 0, "the devices hold the pages: {s}");
     drop(e);
 
     let second = format!("{first}{}{}", a.text, text_of(51, 20));
@@ -393,16 +418,15 @@ fn one_place_for_checkpoints_is_enough() {
 }
 
 #[test]
-fn pages_that_settle_late_are_written_late_and_at_the_end() {
+fn pages_that_settle_late_are_written_in_the_form_they_have() {
     let dir = TempDir::new("settle");
     // The model says its last 40 cells have not reached the form they keep.
     let model = model(1, |c| c.settle_cells = 40);
     let first = text_of(60, 200);
     let e = engine(&model, config(256, 8, Some(store(&dir.0))));
     let a = e.ask(&first, 20);
-    let s = e.written(13);
-    assert_eq!(s.counters.ssd.pages_written, 13, "the end writes the rest: {s}");
     drop(e);
+    assert_eq!(stored(&model, &dir.0).store_pages, 13, "the end writes them all");
     let second = format!("{first}{}{}", a.text, text_of(61, 40));
     let e = engine(&model, config(256, 8, Some(store(&dir.0))));
     let b = e.ask(&second, 20);
@@ -436,7 +460,6 @@ fn requests_that_share_a_run_from_ssd_wait_for_it_together() {
     let base = text_of(80, 600);
     let e = engine(&model, config(256, 8, Some(store(&dir.0))));
     let a = e.ask(&base, 10);
-    e.written(38);
     drop(e);
 
     let e = engine(&model, config(256, 8, Some(store(&dir.0))));

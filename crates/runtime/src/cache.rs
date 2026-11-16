@@ -816,20 +816,28 @@ impl Cache {
             return;
         }
         let (mut batch, mut notes) = (Vec::new(), Vec::new());
-        self.push_leaving(&mut batch, &mut notes);
+        self.push_leaving(pool, exec, &mut batch, &mut notes);
         self.carry_out(pool, exec, batch, notes);
     }
 
     /// Adds the copies of what is leaving to `batch`, in front of anything
-    /// that is added after them.
-    fn push_leaving(&mut self, batch: &mut Vec<Transfer>, notes: &mut Vec<Note>) {
+    /// that is added after them. When what it needs is held by transfers of
+    /// the batch, the batch so far is carried out first: the order of the
+    /// transfers stays what it was.
+    fn push_leaving(
+        &mut self,
+        pool: &mut PagePool,
+        exec: &mut dyn Executor,
+        batch: &mut Vec<Transfer>,
+        notes: &mut Vec<Note>,
+    ) {
         for leaving in std::mem::take(&mut self.leaving) {
             let precious = leaving.worth
                 && self
                     .ssd
                     .as_ref()
                     .is_some_and(|ssd| !ssd.has_or_queued(Kind::Page, leaving.hash));
-            match self.ram_buffer(precious) {
+            match self.page_room(pool, exec, batch, notes, precious) {
                 Some(parts) => {
                     batch.push(Transfer {
                         kind: TransferKind::PageOut,
@@ -846,7 +854,7 @@ impl Cache {
         // Checkpoints out of their places, for the drive. Making room for
         // the pages above may have added some.
         for out in std::mem::take(&mut self.states_out) {
-            match self.state_buffer() {
+            match self.state_room(pool, exec, batch, notes) {
                 Some(parts) => {
                     batch.push(Transfer {
                         kind: TransferKind::StateOut,
@@ -878,9 +886,8 @@ impl Cache {
 
     /// A buffer for a page in RAM: one that holds nothing, a new one when the
     /// allowance has room, or one that something which goes for nothing gave
-    /// up. A `precious` page (one that would be lost otherwise) waits for the
-    /// writer to finish what it holds, briefly, when that is the only way.
-    fn ram_buffer(&mut self, precious: bool) -> Option<Vec<crate::exec::TransitPart>> {
+    /// up. Never waits.
+    fn ram_buffer(&mut self) -> Option<Vec<crate::exec::TransitPart>> {
         let mut dropped = 0;
         loop {
             let ram = self.in_ram.as_mut()?;
@@ -895,10 +902,37 @@ impl Cache {
             {
                 return Some(parts);
             }
-            if self.give_up_free(&mut dropped) {
+            if !self.give_up_free(&mut dropped) {
+                return None;
+            }
+        }
+    }
+
+    /// [`Cache::ram_buffer`] for a page that is added to `batch`. A
+    /// `precious` page (one that would be lost otherwise) waits for room when
+    /// there is no other way: the buffers in the batch so far go into RAM
+    /// first, and the writer writes what only RAM holds, briefly.
+    fn page_room(
+        &mut self,
+        pool: &mut PagePool,
+        exec: &mut dyn Executor,
+        batch: &mut Vec<Transfer>,
+        notes: &mut Vec<Note>,
+        precious: bool,
+    ) -> Option<Vec<crate::exec::TransitPart>> {
+        loop {
+            if let Some(parts) = self.ram_buffer() {
+                return Some(parts);
+            }
+            if !precious || self.ssd.is_none() {
+                return None;
+            }
+            if !batch.is_empty() {
+                self.carry_out(pool, exec, std::mem::take(batch), std::mem::take(notes));
                 continue;
             }
-            if !(precious && self.wait_for_writer()) {
+            self.clean_ahead();
+            if !self.wait_for_writer() {
                 return None;
             }
         }
@@ -1114,7 +1148,7 @@ impl Cache {
                 // Room in the pool: a cached page nobody holds leaves the
                 // devices, and its copy into RAM runs before this one.
                 self.evict(pool, 1);
-                self.push_leaving(&mut batch, &mut notes);
+                self.push_leaving(pool, exec, &mut batch, &mut notes);
                 grown = held.append(pool, u64::from(cells));
             }
             if grown.is_err() {
@@ -1181,9 +1215,6 @@ impl Cache {
 
     /// What the transfers of a batch came to, in their order.
     fn finish(&mut self, pool: &mut PagePool, batch: Vec<Transfer>, notes: Vec<Note>) {
-        // A run from RAM enters the index in order, and ends at a page that
-        // did not come.
-        let mut cut: HashSet<u64> = HashSet::new();
         let mut state_in: Option<(u64, u32, bool)> = None;
         for (transfer, note) in batch.into_iter().zip(notes) {
             let Transfer { object, parts, ok, .. } = transfer;
@@ -1222,11 +1253,14 @@ impl Cache {
                     }
                     ram.insert(hash, entry, parts);
                 }
-                Note::FromRam { hash, parent, owner, .. } => {
+                Note::FromRam { hash, parent, owner } => {
                     let Some(ram) = &mut self.in_ram else { continue };
                     ram.give(hash, parts);
-                    if !ok || cut.contains(&owner.0) {
-                        cut.insert(owner.0);
+                    // A run from RAM enters the index in order, and ends at
+                    // a page that did not come: what follows it would hang
+                    // on nothing.
+                    let follows = parent == self.root || self.index.page(parent).is_some();
+                    if !ok || !follows {
                         continue;
                     }
                     let tail = ram.get(hash).and_then(|entry| entry.tail.clone());
