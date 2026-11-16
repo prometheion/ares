@@ -233,8 +233,8 @@ Everything `FEATURES.md` lists for the 27B and not for Flash-Next is owed:
         the position table's resize as kernels of their own; residual and norm statistics in
         `f32`. Held to the exact reference per image (see "The image tower" in
         `ARCHITECTURE.md`). Open: the row kernels between the products take about a third of
-        the time outside the attention (bias, GELU and residual in the products' epilogues);
-        the tower on Vulkan. **Question to the owner:** f16 sums flushed every 64 values in the
+        the time outside the attention (fusing the residual with the norm after it, a bias in
+        the products' epilogue); the tower on Vulkan. **Question to the owner:** f16 sums flushed every 64 values in the
         products other than `ffn_down` make an image 5 to 9 % faster on both cards and up to
         twice as far from the exact rows (still within the tolerance): take it?
   - [x] 3. Both homes for the tower's weights (`qwen3vl::Home`, a load option): resident in
