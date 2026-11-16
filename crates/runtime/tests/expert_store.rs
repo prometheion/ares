@@ -1366,6 +1366,19 @@ mod device {
         Some(Device::open(ordinal, Wait::Spin).expect("open device"))
     }
 
+    /// The pieces of two pools given up at the end of a step, with the RAM
+    /// tier locked for a device by the driver (`cuMemHostRegister`), which
+    /// refuses a second lock of a range.
+    #[test]
+    fn a_piece_that_is_given_up_is_not_registered_again_before_its_release_is_dropped() {
+        let Some(device) = gpu() else { return };
+        let region = |plan: &StorePlan| {
+            let mut pinned = Ledger::new("pinned RAM", 1 << 30);
+            HostRegion::pinned(&device, &mut pinned, plan.ram_bytes()).unwrap()
+        };
+        give_up_pieces_of_two_pools(region, || None);
+    }
+
     fn check(serve: Serve, ram_slots: u64, steps: usize) -> Option<Found> {
         let device = gpu()?;
         let found = run(&device, serve, ram_slots, steps);
@@ -1990,6 +2003,21 @@ fn mixed_step(store: &mut ExpertStore<HostSlots>, picks: &[u32]) -> Result<(), S
 /// its piece back, which fit in what the large one left below the target.
 #[test]
 fn a_piece_that_is_given_up_is_not_locked_again_before_its_release_is_dropped() {
+    let locks = DriverLocks::default();
+    let region = |plan: &StorePlan| {
+        let locker = Box::new(locks.clone());
+        HostRegion::elastic(plan.ram_bytes(), plan.ram_bytes(), locker).unwrap()
+    };
+    give_up_pieces_of_two_pools(region, || Some(locks.bytes() as u64));
+}
+
+/// The test above on [`mixed_model`], with the RAM tier in the region that
+/// `region` makes for the plan; `locked` tells the bytes its locker holds,
+/// where that is known.
+fn give_up_pieces_of_two_pools(
+    region: impl FnOnce(&StorePlan) -> HostRegion,
+    locked: impl Fn() -> Option<u64>,
+) {
     let dir = Scratch::new();
     let gguf = mixed_model(&dir);
     let map =
@@ -2021,12 +2049,15 @@ fn a_piece_that_is_given_up_is_not_locked_again_before_its_release_is_dropped() 
     let plan = StorePlan::new(config, &map, &reader, &layers, None).unwrap();
     assert_eq!((plan.slots(0).1, plan.slots(4).1), (6, 6));
     let device = HostSlots::new(&plan.device_pools(0), 5, EXPERTS);
-    let locks = DriverLocks::default();
-    let region =
-        HostRegion::elastic(plan.ram_bytes(), plan.ram_bytes(), Box::new(locks.clone())).unwrap();
+    let region = region(&plan);
     let mut store = ExpertStore::new(plan, map, reader, vec![device], region, None).unwrap();
     let whole = store.ram_bytes().0;
-    assert_eq!(locks.bytes() as u64, whole, "every piece is locked at the start");
+    let agree = |store: &ExpertStore<HostSlots>, more: usize, what: &str| {
+        if let Some(bytes) = locked() {
+            assert_eq!(bytes, store.ram_bytes().0 + more as u64, "{what}");
+        }
+    };
+    agree(&store, 0, "every piece is locked at the start");
     for picks in [[0, 1], [2, 3], [4, 5], [0, 1]] {
         mixed_step(&mut store, &picks).unwrap();
     }
@@ -2041,17 +2072,17 @@ fn a_piece_that_is_given_up_is_not_locked_again_before_its_release_is_dropped() 
     let released = store.take_released();
     let lens: Vec<usize> = released.iter().map(|piece| piece.len()).collect();
     assert_eq!(lens, [large_piece, small_piece], "the pieces given up, in their order");
-    let (locked, _) = store.ram_bytes();
-    assert_eq!(locked, whole - (large_piece + small_piece) as u64, "nothing was locked again");
-    assert_eq!(locks.bytes(), locked as usize + large_piece + small_piece, "until released");
+    let (after, _) = store.ram_bytes();
+    assert_eq!(after, whole - (large_piece + small_piece) as u64, "nothing was locked again");
+    agree(&store, large_piece + small_piece, "the releases hold their locks");
     drop(released);
-    assert_eq!(locks.bytes() as u64, locked);
+    agree(&store, 0, "until they are dropped");
 
     // Once the releases are dropped, the next step's end takes the large
     // piece again, and the tier serves from it.
     mixed_step(&mut store, &[8, 9]).unwrap();
-    assert_eq!(store.ram_bytes().0, locked + large_piece as u64);
-    assert_eq!(locks.bytes() as u64, store.ram_bytes().0, "the books and the locks agree");
+    assert_eq!(store.ram_bytes().0, after + large_piece as u64);
+    agree(&store, 0, "the books and the locks agree");
     for picks in [[10, 11], [0, 1], [12, 13], [6, 7]] {
         mixed_step(&mut store, &picks).unwrap();
     }
