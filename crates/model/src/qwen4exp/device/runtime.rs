@@ -1316,6 +1316,12 @@ impl Model for Qwen4Exp {
         }
     }
 
+    fn steps_wait_for_fetches(&self) -> bool {
+        // An expert that no tier in VRAM holds is brought while the step
+        // waits for it.
+        true
+    }
+
     fn pinned_ram(&self) -> u64 {
         self.pinned
     }

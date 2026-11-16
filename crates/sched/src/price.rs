@@ -39,6 +39,12 @@
 //! one step; and trying costs at most two steps per size and [`OLD`] steps,
 //! which also bring the tokens their rows verify.
 //!
+//! A model whose steps wait for what they fetch (experts that no tier of
+//! VRAM holds) has a dearest step that is not late: it is the step that
+//! fetched, and the rows that fetched are what a size costs. Its prices take
+//! the plain mean of the last eight ([`Estimate::Mean`]); the rules for old
+//! sizes are the same.
+//!
 //! Between two measured row counts the price is interpolated, below the
 //! smallest it is the smallest, above the largest it goes on with the slope of
 //! the last two. A row count that has never been measured is therefore
@@ -62,6 +68,18 @@ pub const OLD: u64 = 256;
 /// A step that took more than this many times its price is late: other work
 /// on the machine, not the step. It says nothing about what a cell costs.
 const LATE: f64 = 2.0;
+
+/// How the measurements of a count make its price.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Estimate {
+    /// The mean of the last eight without the largest: one step that other
+    /// work on the machine held up moves nothing.
+    #[default]
+    WithoutLargest,
+    /// The plain mean of the last eight: for a model whose steps wait for
+    /// what they fetch, where the dearest step is the size's own cost.
+    Mean,
+}
 
 /// What was measured of one count.
 #[derive(Clone, Debug)]
@@ -92,17 +110,20 @@ impl Point {
         self.len += 1;
     }
 
-    /// The mean of the measurements kept without the largest, the smallest
-    /// of up to three.
-    fn price(&self) -> f64 {
+    /// The smallest of up to three measurements (an old price and the trials
+    /// beside it), and from four on their mean as `estimate` says.
+    fn price(&self, estimate: Estimate) -> f64 {
         let samples = &self.samples[..self.len];
         let (smallest, largest) = samples
             .iter()
             .fold((f64::INFINITY, 0.0f64), |(low, high), ms| (low.min(*ms), high.max(*ms)));
-        if self.len > 3 {
-            (samples.iter().sum::<f64>() - largest) / (self.len - 1) as f64
-        } else {
-            smallest
+        if self.len <= 3 {
+            return smallest;
+        }
+        let sum = samples.iter().sum::<f64>();
+        match estimate {
+            Estimate::WithoutLargest => (sum - largest) / (self.len - 1) as f64,
+            Estimate::Mean => sum / self.len as f64,
         }
     }
 }
@@ -115,11 +136,17 @@ pub struct Curve {
     points: BTreeMap<u32, Point>,
     /// The measurements taken.
     seen: u64,
+    estimate: Estimate,
 }
 
 impl Curve {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A curve whose measurements make a price as `estimate` says.
+    pub fn with_estimate(estimate: Estimate) -> Self {
+        Self { estimate, ..Self::default() }
     }
 
     /// Whether anything was measured.
@@ -145,18 +172,20 @@ impl Curve {
     /// The price of the nearest count below `n` that is current.
     fn current_below(&self, n: u32) -> Option<f64> {
         let mut below = self.points.range(..n).rev();
-        below.find(|(_, point)| !self.is_old(point)).map(|(_, point)| point.price())
+        below.find(|(_, point)| !self.is_old(point)).map(|(_, point)| point.price(self.estimate))
     }
 
     /// The price of a measured count: its own while it is current, and held
     /// between the nearest current counts on either side when it is old.
     fn price_of(&self, n: u32, point: &Point) -> f64 {
-        let price = point.price();
+        let price = point.price(self.estimate);
         if !self.is_old(point) {
             return price;
         }
         let mut above = self.points.range(n + 1..);
-        let above = above.find(|(_, point)| !self.is_old(point)).map(|(_, point)| point.price());
+        let above = above
+            .find(|(_, point)| !self.is_old(point))
+            .map(|(_, point)| point.price(self.estimate));
         let floor = self.current_below(n).unwrap_or(0.0);
         price.min(above.unwrap_or(f64::INFINITY)).max(floor)
     }
@@ -248,7 +277,13 @@ impl Default for PriceTable {
 
 impl PriceTable {
     pub fn new() -> Self {
-        Self { rows: Curve::new(), context: StepTimeModel::new(0.98) }
+        Self::with_estimate(Estimate::default())
+    }
+
+    /// A table whose rows are priced as `estimate` says ([`Estimate::Mean`]
+    /// for a model whose steps wait for what they fetch).
+    pub fn with_estimate(estimate: Estimate) -> Self {
+        Self { rows: Curve::with_estimate(estimate), context: StepTimeModel::new(0.98) }
     }
 
     /// The price of a step of `rows` rows measured at load, with next to no
@@ -540,6 +575,23 @@ mod tests {
             let price = table.rows_ms(rows).unwrap();
             assert!((price - (30.0 + f64::from(rows))).abs() < 0.5, "{rows} rows: {price}");
         }
+    }
+
+    #[test]
+    fn steps_that_wait_for_what_they_fetch_are_priced_by_the_plain_mean() {
+        // A window of four rows on tiers that do not hold a text: one step in
+        // four fetches and takes 120 ms, the others 30.
+        let mut trimmed = Curve::new();
+        let mut plain = Curve::with_estimate(Estimate::Mean);
+        for step in 0..16 {
+            let ms = if step % 4 == 3 { 120.0 } else { 30.0 };
+            trimmed.observe(4, ms);
+            plain.observe(4, ms);
+        }
+        // Without the largest the fetch is gone from the price; the plain
+        // mean is what the size gives its tokens over.
+        assert!((trimmed.ms(4).unwrap() - (30.0 * 6.0 + 120.0) / 7.0).abs() < 1e-9);
+        assert!((plain.ms(4).unwrap() - 52.5).abs() < 1e-9);
     }
 
     #[test]

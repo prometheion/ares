@@ -87,9 +87,9 @@ use std::time::{Duration, Instant};
 use ares_api::{EngineError, Event, EventSink, FinishReason, RequestId, Sampling, Usage};
 use ares_sampler::{SampleParams, SampleRow, TokenMask};
 use ares_sched::{
-    Acceptance, Admission, AdmissionConfig, Arrival, Choice, Confidence, Curve, Limits, Load,
-    LookupCorpus, LookupDrafter, Offer, Outcome, PartKind, Pending, PoolView, PriceTable, Prices,
-    Request, SeqId, Share, Turn, Want, Wish, choose, plan,
+    Acceptance, Admission, AdmissionConfig, Arrival, Choice, Confidence, Curve, Estimate, Limits,
+    Load, LookupCorpus, LookupDrafter, Offer, Outcome, PartKind, Pending, PoolView, PriceTable,
+    Prices, Request, SeqId, Share, Turn, Want, Wish, choose, plan,
 };
 use ares_state::{
     Chain, ChainHash, Owner, PagePool, PageState, PrefixIndex, Priority, Resume, Sequence,
@@ -628,6 +628,10 @@ impl Conductor {
         let share = Share::new(config.prefill_slowdown);
         let own_engine = Acceptance::new(config.window_rows as usize, 0.999);
         let needs = Vec::with_capacity(config.window_rows as usize);
+        // A step that waits for what it fetches is dear because of what it
+        // fetched, not because the machine was busy.
+        let estimate =
+            if model.steps_wait_for_fetches() { Estimate::Mean } else { Estimate::WithoutLargest };
         let admission = AdmissionConfig {
             output_clip: config.output_clip,
             initial_ratio: config.output_ratio,
@@ -687,7 +691,7 @@ impl Conductor {
             exec,
             rx,
             active: 0,
-            prices: PriceTable::new(),
+            prices: PriceTable::with_estimate(estimate),
             chain: Curve::new(),
             own_engine,
             own_confidence: Confidence::new(0.999),

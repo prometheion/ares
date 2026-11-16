@@ -59,7 +59,7 @@ pub use draft::{Acceptance, BELIEF};
 pub use lookup::{LookupConfig, LookupCorpus, LookupDrafter, LookupMatch};
 pub use pass::{Pass, PassStep, Point, pass_rows_between, runs_as_pass};
 pub use plan::{Limits, Part, PartKind, Plan, Request, SeqId, Want, plan};
-pub use price::{Curve, OLD as PRICE_OLD, PriceTable};
+pub use price::{Curve, Estimate, OLD as PRICE_OLD, PriceTable};
 pub use share::{Pending, Share, Turn};
 pub use timing::{Load, StepCost, StepTimeModel};
 pub use window::{Choice, Offer, Prices, Wish, choose, rate};

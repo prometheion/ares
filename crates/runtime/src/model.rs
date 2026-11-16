@@ -418,6 +418,15 @@ pub trait Model: Send + Sync + 'static {
         None
     }
 
+    /// Whether a step of the model can wait for what it fetches while it
+    /// runs (experts that no tier in VRAM holds). The dearest of its steps is
+    /// then the step's own cost and not other work on the machine, and the
+    /// conductor prices its steps by the plain mean of what they took
+    /// ([`ares_sched::Estimate::Mean`]).
+    fn steps_wait_for_fetches(&self) -> bool {
+        false
+    }
+
     /// The page-locked RAM the model's device parts hold besides what the
     /// runtime books for the step record and the read-back (the buffers a
     /// step needs, whatever the cache of checkpoints or a tier of experts
