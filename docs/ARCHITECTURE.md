@@ -4283,7 +4283,11 @@ runs), so their reads can start a layer or two before their records
 - *Dropped when the record arrives.* The guesses for the layer that have not started are
   forgotten, the read of an expert the record did not pick is cancelled (what is at the
   drive comes back and is dropped), and a pick whose read is on its way is promoted to a
-  demand read, as for any guess.
+  demand read, as for any guess. Whoever else asked for the expert while the cancelled read
+  was on its way (a fill of the tiers between steps, a prediction of a step) took it as
+  coming and started no read of its own: when the read fails, the store reads the expert
+  again for it. (Without that, a fill right after a step left such an expert in no tier,
+  and the next step that picked it read it from the file.)
 - *Wide steps* (a slice of a prompt): at layer L the next layer's router is applied to
   the rows as a float product on the f16 tile kernels, on the predictions' stream (the
   step's stream waits only for the f16 copy of the rows, which the next layer's read

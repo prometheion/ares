@@ -1116,6 +1116,13 @@ impl<D: SlotDevice> ExpertStore<D> {
                 // A read ahead that the layer's record did not need was cancelled.
                 self.stats.failed_reads += u64::from(!op.ahead || op.demand);
                 self.ram.sets[op.layer].abort(&op.swap);
+                // Whoever wanted the expert while the read was on its way (a fill, a
+                // prediction of a step) counted on it and started no read of its own: it
+                // is read again. A demand's want reads it again by itself below.
+                let wanted = |w: &Wanted| !w.demand && w.layer == op.layer && w.expert == op.expert;
+                if op.ahead && self.wants.iter().any(wanted) {
+                    self.guesses.guess(&mut self.ram.sets, op.layer, &[op.expert], self.step);
+                }
             } else {
                 self.ram.sets[op.layer].commit(&op.swap);
                 if op.demand {

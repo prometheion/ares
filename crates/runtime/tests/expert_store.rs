@@ -582,6 +582,37 @@ fn a_read_ahead_that_its_record_does_not_need_is_dropped() {
     assert!(!rig.store.in_vram(1, named[0]));
 }
 
+/// A fill between steps that names an expert whose read ahead its record cancelled, while
+/// the cancelled read is still on its way, takes the read as coming and starts none of its
+/// own: the read then fails, and the store reads the expert again for the fill. Whether
+/// the read has come back before the fill depends on the reader's thread, so the scene is
+/// played often enough that some runs meet it.
+#[test]
+fn a_fill_gets_the_expert_whose_read_ahead_was_cancelled_on_its_way() {
+    let (mut lost, runs) = (Vec::new(), 100);
+    for run in 0..runs {
+        // One chunk of 64 bytes at the drive at a time: an expert's read is several.
+        let reader = Config { prefetch_depth: 1, prefetch_chunk: 64, ..Config::default() };
+        let mut rig = rig_reading(4, 8, None, reader, recent_first);
+        rig.predict_steps(2, 17, 1, 1);
+        rig.store.begin_step();
+        rig.store.routed(0, &[1]).unwrap();
+        rig.settle();
+        let named = cold(&rig, 1, 2);
+        rig.store.ahead(1, &named[..1], 1, 1);
+        rig.store.poll().unwrap();
+        // The record picks another expert: the read ahead is cancelled on its way.
+        rig.store.routed(1, &named[1..]).unwrap();
+        rig.store.end_step().unwrap();
+        rig.store.fill(1, &named[..1]).unwrap();
+        rig.settle();
+        if !rig.store.in_vram(1, named[0]) && !rig.store.in_ram(1, named[0]) {
+            lost.push(run);
+        }
+    }
+    assert!(lost.is_empty(), "the fills of runs {lost:?} of {runs} left the expert in no tier");
+}
+
 #[test]
 fn reads_ahead_keep_to_what_the_drive_takes_of_prefetches() {
     // The reader takes one chunk of 256 bytes of prefetches at once: less than an expert,
