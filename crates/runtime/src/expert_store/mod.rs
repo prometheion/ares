@@ -163,7 +163,9 @@ pub struct StoreConfig {
     pub ram_piece: u64,
     /// An expert that rows verifying drafts left without a read
     /// ([`ExpertStore::set_windows`]) is read into RAM as a guess, for the
-    /// steps after.
+    /// steps after: the token of a left row is most often the next step's,
+    /// whose first row needs the same experts. Without the read that row
+    /// waits for them in the next step, alone in its layer.
     pub read_left: bool,
 }
 
@@ -184,7 +186,7 @@ impl StoreConfig {
             transit_slots: Vec::new(),
             staging_slots: 0,
             ram_piece: PIECE as u64,
-            read_left: false,
+            read_left: true,
         }
     }
 }
