@@ -9,15 +9,15 @@
 //! stop); a model that is opened again starts from it.
 //!
 //! - **When the engine begins to serve** ([`Usage::serving`], where the
-//!   server used to read a warm-up text, after the runtime measured what a
-//!   step costs): the heat becomes the profile's (the measurement's steps
-//!   route a made-up text and are no use) and the tiers are filled from it in
-//!   one sweep through the file, VRAM's free slots with the hottest experts
-//!   of every layer and the RAM tier with the next. A thread keeps the
-//!   profile from then on.
+//!   server reads its warm-up text when there is no profile, after the
+//!   runtime measured what a step costs): the heat becomes the profile's (the
+//!   measurement's steps route a made-up text and are no use) and the tiers
+//!   are filled from it in one sweep through the file, VRAM with the hottest
+//!   experts of every layer and the RAM tier with the next, into what is
+//!   empty or worth nothing. A thread keeps the profile from then on.
 //! - **While nothing runs** (no step for [`IDLE_AFTER`]): that thread fills
-//!   the slots that are empty, VRAM's and the RAM tier's, from the heat, the
-//!   hottest first, a few experts at a time as prefetches. A step that begins
+//!   what is empty or worth nothing, in VRAM and in the RAM tier, from the
+//!   heat, the hottest first, a few experts at a time as prefetches. A step that begins
 //!   stops it at once: the store does nothing of a fill while a step runs,
 //!   and what is on its way then (two experts from the file, an upload per
 //!   device) takes its slot on its own.

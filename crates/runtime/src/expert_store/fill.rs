@@ -168,9 +168,13 @@ impl<D: SlotDevice> ExpertStore<D> {
         self.reads.is_empty() && self.device_ops.iter().flatten().all(VecDeque::is_empty)
     }
 
-    /// What a fill of `layers` from the heat would bring now, in `order`
-    /// (see the [module documentation](self)). Nothing starts before
-    /// [`ExpertStore::advance_fill`].
+    /// What a fill of `layers` from the heat would bring now, in `order`: for
+    /// every layer the hottest experts that VRAM does not hold, as many as it
+    /// has room for, and the next hottest that RAM does not hold, as many as
+    /// RAM has room for. Room is a free slot or one whose member is worth
+    /// nothing there (in VRAM one without heat, in RAM also a copy of an
+    /// expert that VRAM holds); nothing without heat is brought. Nothing
+    /// starts before [`ExpertStore::advance_fill`].
     pub fn plan_fill(&mut self, layers: &[usize], order: FillOrder) -> TierFill {
         // Slots that stay free in VRAM for the misses of a step, where the
         // store keeps them free between steps.
