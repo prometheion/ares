@@ -14,7 +14,7 @@ Order of work the owner has set: CUDA complete for both models first, Vulkan par
 
 | Piece | State |
 | --- | --- |
-| Speculation that pays on Flash-Next: prices that follow the tiers (built), rows of unmade links leave the step, the draft block's experts resident, no window row waits for a file read; built in the conductor and the expert store, not in one model | built, measured; rebased onto steps 0 to 2 of the shared model layer (branch `sched/live-prices`) |
+| Speculation that pays on Flash-Next: prices that follow the tiers (built), rows of unmade links leave the step, the draft block's experts resident, no window row waits for a file read; built in the conductor and the expert store, not in one model | built, measured; rebased onto `model/shared-blocks` (steps 0 to 3 of the shared model layer, server basics, image tower) and proven there: fingerprints without drafts unchanged, GPU tests green (branch `sched/live-prices`) |
 | Shared model layer, steps 0 to 3 (see below); step 3 brings Flash-Next K and V in `q7` to `q4` | agent working (`model/shared-blocks`) |
 | Image tower on the device, weights resident in VRAM or in RAM and uploaded per image (pieces 2 and 3) | agent working (`vision/tower-device`) |
 | Test files: `Qwen3.8-Flash-Next-UD-Q4_K_XL` (104 GiB), then Flash-Next's DFlash2 drafter (3.1 GiB) | downloading to `/mnt/data/ares-models`, 6 MB/s |
@@ -52,7 +52,11 @@ asked with and without drafts in turn gave 12 to 35 % more with them on the mean
 card (the RTX 4070, a third of the experts in VRAM) the block makes it 7 to 34 % slower.
 What is left is the file: at `--ram 8G` a quarter of the experts are only on the SSD, and a
 row of new text reads up to sixteen of them a token (Strata's 56 tokens per second run with
-the file in the page cache).
+the file in the page cache). Measured again after the rebase onto the shared model layer
+(machine load 15 to 22 from other builds): one server asked with and without drafts in turn,
+twelve requests each, gave 13 % more with them on the mean (German 8, English 5, code 30);
+single requests ranged from 46 % slower to 157 % faster, and servers started one after the
+other differed more by the load than by the drafts.
 - [x] Window prices that follow the tiers: a size's price is the mean of its last eight
       steps without the largest, and a size that has not run for 256 steps is tried again
       at the price of the nearest smaller size that runs (`ares_sched::Curve`).
