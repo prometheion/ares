@@ -17,6 +17,7 @@ Order of work the owner has set: CUDA complete for both models first, Vulkan par
 | Speculation that pays on Flash-Next: prices that follow the tiers (built), rows of unmade links leave the step, the draft block's experts resident, no window row waits for a file read; built in the conductor and the expert store, not in one model | agent working (branch `sched/live-prices`) |
 | RAM level of the prompt cache, written to the SSD only when evicted, at unload and at a stop | agent working (`cache/ram-level`) |
 | Shared model layer, steps 0 to 3 (see below); step 3 brings Flash-Next K and V in `q7` to `q4` | agent working (`model/shared-blocks`) |
+| Image tower on the device, weights resident in VRAM or in RAM and uploaded per image (pieces 2 and 3) | agent working (`vision/tower-device`) |
 | Test files: `Qwen3.8-Flash-Next-UD-Q4_K_XL` (104 GiB), then Flash-Next's DFlash2 drafter (3.1 GiB) | downloading to `/mnt/data/ares-models`, 6 MB/s |
 
 ## Shared model layer (the owner's rule, 2026-11-16)
