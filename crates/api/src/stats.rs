@@ -24,6 +24,16 @@ pub struct ExpertStats {
     pub read_bytes: u64,
     /// Microseconds layers waited for what they missed, summed over layers.
     pub wait_us: u64,
+    /// The read-ahead of predicted picks: experts the routers of later layers, applied
+    /// early, named for a layer before its own router ran, and of them those it picked;
+    /// reads of predicted experts that no tier held, started before the layer's router,
+    /// and their bytes; of those, the experts the router picked and those it did not.
+    pub predicted: u64,
+    pub predicted_picked: u64,
+    pub ahead_reads: u64,
+    pub ahead_read_bytes: u64,
+    pub ahead_used: u64,
+    pub ahead_wasted: u64,
     /// Bytes of page-locked RAM the tier of experts holds.
     pub ram_tier_bytes: u64,
     /// Experts in VRAM slots now, and in the RAM tier (copies of experts that

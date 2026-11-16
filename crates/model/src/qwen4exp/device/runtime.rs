@@ -48,7 +48,7 @@ use ares_tokenizer::{ChatOptions, Tokenizer};
 use super::board::Board;
 use super::draft::{Chain, DraftBlock, DraftReport, DraftTimes, Drafted, Watch};
 use super::feed::{
-    DraftLayer, Feed, Layout, build_store, cpu_pool, device_slots, expert_map, places,
+    DraftLayer, Feed, Layout, build_store, cpu_pool, device_slots, expert_map, owners, places,
     plan_transit, reader,
 };
 use super::misses::{Misses, Progress, WideStats};
@@ -902,6 +902,12 @@ impl Qwen4Exp {
         totals.read_bytes +=
             stats.demand_read_bytes + stats.guess_read_bytes + stats.transit_read_bytes;
         totals.wait_us += (stats.wait_ms * 1e3) as u64;
+        totals.predicted += stats.predicted;
+        totals.predicted_picked += stats.predicted_picked;
+        totals.ahead_reads += stats.ahead_reads;
+        totals.ahead_read_bytes += stats.ahead_read_bytes;
+        totals.ahead_used += stats.ahead_used;
+        totals.ahead_wasted += stats.ahead_wasted;
         Some(stats)
     }
 
@@ -1167,6 +1173,9 @@ impl Qwen4Exp {
                     let owners = prune::owners(&self.placement, c);
                     feed.set_prune(mask.clone(), owners, c.experts.count);
                     build.prune_mask = Some(mask);
+                }
+                if self.placement.tensor.is_some() {
+                    feed.set_owners(owners(&self.placement, c));
                 }
                 if let Some(board) = build.draft_board.clone() {
                     feed.set_draft(board);

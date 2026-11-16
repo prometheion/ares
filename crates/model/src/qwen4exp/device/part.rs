@@ -59,6 +59,7 @@ use ares_runtime::ModelError;
 use ares_runtime::expert_store::cpu::act_bytes as cpu_act_bytes;
 
 mod block;
+mod predict;
 mod wide;
 
 use super::board::Board;
@@ -126,6 +127,10 @@ pub struct Options {
     /// steps of up to [`MAX_BATCH`] rows (`device/prune.rs`); `None`, the
     /// default, prunes nothing.
     pub prune: Option<PruneSetup>,
+    /// How many layers after a layer the part that routes predicts the picks of, in a step
+    /// of the decode kernels (`part/predict.rs`): 0 to 2. The expert store reads ahead what
+    /// no tier holds of them; the model computes the same with any number.
+    pub predict: u32,
 }
 
 impl Default for Options {
@@ -145,6 +150,7 @@ impl Default for Options {
             host_logits: true,
             profile: None,
             prune: None,
+            predict: 2,
         }
     }
 }
@@ -524,6 +530,12 @@ pub(crate) struct Frame {
     /// Bytes of page-locked memory per layer for the address tables of the rounds of a
     /// wide step; 0 when steps have at most [`MAX_BATCH`] rows.
     addr_stage: u64,
+    /// The layers after a layer whose picks the part predicts (0 for none), the bytes of
+    /// one list of predicted picks, and of the logits of the routers ahead for the rows of a
+    /// decode step.
+    ahead_layers: u32,
+    ahead_list_bytes: u64,
+    ahead_logits_bytes: u64,
 }
 
 fn invalid(message: impl Into<String>) -> ModelError {
@@ -743,6 +755,11 @@ impl Frame {
             .record_bytes(decode_rows)
             .max(wide::record_bytes(&expert_shape, opts.max_rows));
         s.rec_full = take(record_bytes);
+        let ahead_layers = if shape.role == Role::Worker {
+            0
+        } else {
+            opts.predict.min(2).min(shape.shares.len().saturating_sub(1) as u32)
+        };
         s.logits = take(expert_shape.logits_bytes(opts.max_rows));
         s.hidden = take(expert_shape.hidden_bytes(decode_rows));
         s.sg = take(rows * shared_ff * 4);
@@ -850,7 +867,16 @@ impl Frame {
             } else {
                 0
             },
+            ahead_layers,
+            ahead_list_bytes: expert_shape.predict_list_bytes(decode_rows),
+            ahead_logits_bytes: u64::from(ahead_layers) * expert_shape.logits_bytes(decode_rows),
         })
+    }
+
+    /// Bytes of the lists of predicted picks of every layer of the part, on the device and
+    /// in page-locked memory.
+    fn predict_lists_bytes(&self) -> u64 {
+        u64::from(self.ahead_layers) * self.ahead_list_bytes * self.recurrent.len() as u64
     }
 
     /// Bytes of recurrent state per sequence slot.
@@ -875,6 +901,15 @@ impl Frame {
             + self.x_bytes
             + self.owner_bytes
             + self.exact_device
+            + self.predict_bytes()
+    }
+
+    /// Bytes of the predictions on the device, as `predict::State::open` allocates them.
+    fn predict_bytes(&self) -> u64 {
+        if self.ahead_layers == 0 {
+            return 0;
+        }
+        self.ahead_logits_bytes.next_multiple_of(256) + self.predict_lists_bytes().max(64)
     }
 
     /// Bytes of page-locked host memory the part holds: the route records
@@ -882,6 +917,7 @@ impl Frame {
     /// tables and the status word.
     pub(crate) fn pinned_bytes(&self, opts: &Options, layers: usize) -> u64 {
         (self.record_stride + self.act_host_stride + self.addr_stage) * layers as u64
+            + u64::from(self.ahead_layers) * self.ahead_list_bytes * layers as u64
             + self.inbox.len
             + self.tables_bytes(opts)
             + self.exact_host
@@ -983,6 +1019,8 @@ pub struct Part {
     block: Option<block::State>,
     /// The pruning of the routers of a part that routes.
     prune: Option<PartPrune>,
+    /// The predictions of the picks of the next layers, for a part that routes.
+    predict: Option<predict::State>,
 }
 
 impl std::fmt::Debug for Part {
@@ -1107,6 +1145,12 @@ impl Part {
         if f.raw_bytes > 0 {
             ledger.reserve(format!("{label} draft window keys of the indexer"), f.raw_bytes)?;
         }
+        let predict = (f.ahead_layers > 0)
+            .then(|| {
+                ledger.reserve(format!("{label} predicted picks"), f.predict_bytes())?;
+                predict::State::open(device, f.ahead_logits_bytes, f.predict_lists_bytes())
+            })
+            .transpose()?;
         let scratch = DeviceBuffer::new(device, f.s.len)?;
         let state = DeviceBuffer::new(device, state_bytes)?;
         let tables = DeviceBuffer::new(device, tables_bytes)?;
@@ -1219,6 +1263,7 @@ impl Part {
                 f.record_stride as usize,
                 f.act_host_stride as usize,
                 c.n_embd,
+                (f.ahead_layers as usize, f.ahead_list_bytes as usize),
             )?),
             routed: stream_events(w.layers.len())?,
             inbox_host: PinnedBuffer::new(device, f.inbox.len as usize)?,
@@ -1244,6 +1289,7 @@ impl Part {
             wide_state,
             block: None,
             prune: None,
+            predict,
             w,
             f,
         })
@@ -1812,6 +1858,8 @@ impl Part {
         if let Some(prune) = self.prune.as_ref().filter(|_| n <= MAX_BATCH) {
             prune.begin(stream)?;
         }
+        // The predictions of the step before read rows this step writes again.
+        self.predictions_done(stream)?;
         if std::mem::take(&mut self.status_pending) {
             // SAFETY: the status of the step before, copied when it ended.
             let status =
@@ -2717,6 +2765,9 @@ impl Part {
                 }
             }
             self.routed[i].record(stream)?;
+            if self.role != Role::Worker {
+                self.enqueue_prediction(i, m, rows, env.token)?;
+            }
             self.side.wait_event(&self.routed[i])?;
             self.side.copy_to_host(
                 self.board.record_dst(i),

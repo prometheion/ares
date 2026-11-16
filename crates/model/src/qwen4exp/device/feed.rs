@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ares_core::Ledger;
-use ares_cuda::{Device, ExpertShape, MAX_BATCH, RouteGroup, RouteRecord};
+use ares_cuda::{Device, ExpertShape, MAX_BATCH, PredictedList, RouteGroup, RouteRecord};
 use ares_gguf::Gguf;
 use ares_io::{ExpertMap, ExpertSpan, FileId, Reader};
 use ares_runtime::expert_store::cpu::{CpuPool, Placement as CpuPlacement, Topology};
@@ -329,6 +329,16 @@ pub(super) fn cpu_pool(workers: Option<usize>, reserved: usize) -> Result<CpuPoo
         .map_err(|e| invalid(format!("the CPU workers of the expert store: {e}")))
 }
 
+/// The part that owns each expert of each layer when the devices share every
+/// layer, `owners[layer * n_experts + expert]`: what [`Feed::set_owners`] takes.
+pub(super) fn owners(placement: &Placement, c: &Config) -> Vec<u8> {
+    (0..c.n_layer)
+        .flat_map(|layer| {
+            (0..c.experts.count as u32).map(move |expert| placement.owner(layer, expert) as u8)
+        })
+        .collect()
+}
+
 /// The expert store and the route records that feed it.
 pub(super) struct Feed {
     pub store: ExpertStore<CudaSlots>,
@@ -341,6 +351,15 @@ pub(super) struct Feed {
     /// Per part: the layers of the running step whose route records were
     /// handed to the store.
     followed: Vec<usize>,
+    /// Per part: the layers of the running step whose predictions of the picks
+    /// of the layers after them were handed to the store, and the token of the
+    /// last route record (a prediction of the step carries it).
+    ahead_followed: Vec<usize>,
+    tokens: Vec<u32>,
+    /// With both devices on every layer: per layer and expert, the part that owns
+    /// it (what the predictions of the mixer name goes to the owner's layer of
+    /// the store).
+    owners: Option<Vec<u8>>,
     groups: Vec<RouteGroup>,
     /// What the wide steps found and waited for, since the counters were read.
     wide: WideStats,
@@ -398,6 +417,9 @@ impl Feed {
     ) -> Self {
         Self {
             followed: vec![0; boards.len()],
+            ahead_followed: vec![0; boards.len()],
+            tokens: vec![0; boards.len()],
+            owners: None,
             last_missing: vec![Vec::new(); layout.specs.len()],
             guessed: vec![false; layout.specs.len()],
             lookahead: Lookahead::default(),
@@ -465,6 +487,12 @@ impl Feed {
     /// Whether the store has the route record of the draft block's last step.
     pub(super) fn draft_followed(&self) -> bool {
         self.draft.as_ref().is_none_or(|draft| draft.waiting.is_none())
+    }
+
+    /// With both devices on every layer: the part that owns each expert of each
+    /// layer, `owners[layer * n_experts + expert]`.
+    pub(super) fn set_owners(&mut self, owners: Vec<u8>) {
+        self.owners = Some(owners);
     }
 
     /// Sets whether wide steps read ahead on a guess (they do not unless told to).
@@ -633,6 +661,7 @@ impl Feed {
     pub(super) fn begin_step(&mut self, rows: u32) -> Result<(), Error> {
         self.rows = rows;
         self.followed.fill(0);
+        self.ahead_followed.fill(0);
         self.store.begin_step();
         if let Some(prune) = self.prune.as_ref().filter(|_| rows <= MAX_BATCH) {
             prune.mask.build(&self.store, &self.layout, prune.paused);
@@ -704,10 +733,66 @@ impl Feed {
                     &self.groups,
                     board.rows(i, self.rows as usize),
                 )?;
+                self.tokens[index] = record.token();
                 self.followed[index] += 1;
             }
         }
+        // The predictions of the picks of later layers, behind the records: of the layers
+        // whose record the store has, so that what a step waits for goes first.
+        for index in 0..self.boards.len() {
+            self.follow_predictions(index)?;
+        }
         self.store.poll()?;
+        Ok(())
+    }
+
+    /// Hands the store what the router part `index` predicted at the layers whose records
+    /// it has, for the layers after them ([`ExpertStore::ahead`]).
+    fn follow_predictions(&mut self, index: usize) -> Result<(), Error> {
+        let board = &self.boards[index];
+        if board.ahead() == 0 {
+            return Ok(());
+        }
+        let n_experts = self.layout.shapes[0].n_experts as usize;
+        while self.ahead_followed[index] < self.followed[index] {
+            let i = self.ahead_followed[index];
+            if !board.ahead_arrived(i)? {
+                break;
+            }
+            self.ahead_followed[index] += 1;
+            for d in 0..board.ahead() {
+                let target = i + 1 + d;
+                if target >= board.layers() {
+                    break;
+                }
+                // A list of another step: no prediction was made at this layer.
+                let Some(list) = PredictedList::parse(board.ahead_list(i, d), self.tokens[index])
+                else {
+                    continue;
+                };
+                let layer = self.firsts[index] + target;
+                match &self.owners {
+                    Some(owners) if self.layout.per_layer > 1 => {
+                        for part in 0..self.layout.per_layer {
+                            let experts: Vec<u32> = list
+                                .experts()
+                                .filter(|e| {
+                                    owners.get(layer * n_experts + *e as usize).copied()
+                                        == Some(part as u8)
+                                })
+                                .collect();
+                            if !experts.is_empty() {
+                                self.store.ahead(self.layout.store_layer(part, layer), &experts);
+                            }
+                        }
+                    }
+                    _ => {
+                        let experts: Vec<u32> = list.experts().collect();
+                        self.store.ahead(self.layout.store_layer(index, layer), &experts);
+                    }
+                }
+            }
+        }
         Ok(())
     }
 

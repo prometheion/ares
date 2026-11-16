@@ -11,7 +11,7 @@
 //!     [--text TOKENS.txt] [--text-file A.md,B.md] [--decode-at 1000,8000]
 //!     [--decode-steps 64]
 //!     [--prefill 2048] [--breakdown] [--serve model|stream|cpu] [--transit 32]
-//!     [--read-ahead on|off] [--fingerprint FILE] [--kv q8,q8]
+//!     [--read-ahead on|off] [--predict 2] [--fingerprint FILE] [--kv q8,q8]
 //! ```
 //!
 //! - `--spread`: how two devices share the model: a range of layers each
@@ -50,7 +50,9 @@
 //!   measure what they are worth; 0 brings them into the tier's slots, and without the
 //!   option the plan of the store decides. `--read-ahead on` starts the reads of the
 //!   layers ahead on a guess (what the wide step before missed there), to measure what the
-//!   guesses are worth.
+//!   guesses are worth. `--predict N` (0 to 2) is how many layers after a layer the router's
+//!   part predicts the picks of in steps of eight rows, which the store reads ahead of the
+//!   router when no tier holds them (2 unless told, as the engine runs).
 //! - `--kv K,V`: the formats of K and of V (`f16`, `q8` to `q4`; the default
 //!   is `q8,q8`). With `q7` to `q4` a second, small pool of exact entries
 //!   holds the first tile of a sequence and its newest cells. The draft
@@ -112,6 +114,7 @@ struct Args {
     stall_s: u64,
     transit: Option<u32>,
     read_ahead: bool,
+    predict: u32,
     fingerprint: Option<String>,
     kv: (CacheFormat, CacheFormat),
 }
@@ -149,6 +152,7 @@ fn parse() -> Result<Args, AnyError> {
         stall_s: 20,
         transit: None,
         read_ahead: false,
+        predict: Options::default().predict,
         fingerprint: None,
         kv: (CacheFormat::Q8, CacheFormat::Q8),
     };
@@ -221,6 +225,7 @@ fn parse() -> Result<Args, AnyError> {
                     other => return Err(format!("--read-ahead {other}: on or off").into()),
                 }
             }
+            "--predict" => args.predict = value()?.parse()?,
             "--serve" => {
                 args.serve = match value()?.as_str() {
                     "stream" => Serve::Stream,
@@ -304,7 +309,11 @@ fn store_line(stats: &StoreStats, steps: usize) -> String {
          the CPU, {:.1} uploaded for the step); where their bytes were: {:.1} in RAM, {:.1} in the \
          file ({:.1} MB read), {:.1} on their way; waiting per step {:.2} ms summed over layers; \
          a miss served from RAM {:.2} ms (median) / {:.2} (99 %), from the file {:.2} / {:.2} ms, a \
-         layer's CPU share {:.2} / {:.2} ms; between steps {:.1} experts promoted to VRAM per step",
+         layer's CPU share {:.2} / {:.2} ms; between steps {:.1} experts promoted to VRAM per step; \
+         predicted per step {:.1} experts ({:.1} % of them picked), read ahead {:.2} ({:.1} MB, \
+         {:.2} used, {:.2} wasted, {:.2} not read for want of room), a pick read ahead waited \
+         {:.2} ms (median) when its read was still on its way ({} times); misses waited for the \
+         file {:.2} ms per step, summed over them",
         100.0 * stats.hits as f64 / stats.picks.max(1) as f64,
         per(misses),
         per(stats.cpu_experts),
@@ -321,6 +330,40 @@ fn store_line(stats: &StoreStats, steps: usize) -> String {
         percentile(&stats.cpu_ms, 0.5),
         percentile(&stats.cpu_ms, 0.99),
         per(stats.promotions),
+        per(stats.predicted),
+        100.0 * stats.predicted_picked as f64 / stats.predicted.max(1) as f64,
+        per(stats.ahead_reads),
+        per(stats.ahead_read_bytes) / 1e6,
+        per(stats.ahead_used),
+        per(stats.ahead_wasted),
+        per(stats.ahead_left),
+        percentile(&stats.ahead_miss_ms, 0.5),
+        stats.ahead_miss_ms.len(),
+        stats.disk_miss_ms.iter().chain(&stats.ahead_miss_ms).map(|ms| f64::from(*ms)).sum::<f64>()
+            / steps.max(1) as f64,
+    )
+}
+
+/// Where the time of a miss from the file goes: the reader's latency of a demand read
+/// (a matrix of an expert, from its submission to its completion, the last 4096), the
+/// store's time from the start of an expert's reads to its bytes in RAM, and the time from
+/// the record to the expert in its slot.
+fn drive_line(stats: &StoreStats, session: &Session<'_>) -> String {
+    let reader = session.store().reader().stats();
+    let ms = |d: Duration| d.as_secs_f64() * 1e3;
+    format!(
+        "a demand read of a matrix {:.2} ms (median) / {:.2} (99 %) at the reader, a prefetch \
+         {:.2} / {:.2}; an expert's reads {:.2} ms (mean, start to bytes in RAM); a miss from the \
+         file {:.2} ms (mean, record to slot), from RAM {:.2}",
+        ms(reader.demand_latency.p50),
+        ms(reader.demand_latency.p99),
+        ms(reader.prefetch_latency.p50),
+        ms(reader.prefetch_latency.p99),
+        stats.demand_read_ms / stats.demand_reads.max(1) as f64,
+        stats.disk_miss_ms.iter().map(|m| f64::from(*m)).sum::<f64>()
+            / stats.disk_miss_ms.len().max(1) as f64,
+        stats.ram_miss_ms.iter().map(|m| f64::from(*m)).sum::<f64>()
+            / stats.ram_miss_ms.len().max(1) as f64,
     )
 }
 
@@ -539,6 +582,7 @@ fn run() -> Result<(), AnyError> {
             // The fingerprint verifies windows of four rows of drafts.
             logit_rows: if args.fingerprint.is_some() { 4 } else { 1 },
             window_rows: if args.fingerprint.is_some() { 8 } else { 0 },
+            predict: args.predict,
             ..Options::default()
         },
         headroom: args.headroom_mib << 20,
@@ -1011,6 +1055,7 @@ fn run() -> Result<(), AnyError> {
                 if timed { ", with timed events" } else { "" },
             );
             println!("  store: {}", store_line(&stats, ms.len()));
+            println!("  drive: {}", drive_line(&stats, &session));
             println!("{}", step_classes(&kinds));
             if timed {
                 breakdown(profile.as_deref(), &session);

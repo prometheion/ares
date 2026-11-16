@@ -33,7 +33,7 @@ use ares_model::qwen4exp::device::{
 };
 use ares_model::qwen4exp::synthetic::{NgramShape, Shape, Synthetic, Types};
 use ares_model::qwen4exp::{Config, LogitRows, Recorder, Reference, SequenceState, Weights};
-use ares_runtime::expert_store::{ExpertNeighbours, Near, ProfileKey, Serve};
+use ares_runtime::expert_store::{ExpertNeighbours, Near, ProfileKey, Serve, StoreStats};
 
 /// The spread the tests of two devices ask for: both on every layer when
 /// `ARES_TEST_SPREAD=tensor`.
@@ -695,8 +695,19 @@ fn windows_and_commits_give_what_certain_rows_give() {
 /// `serve` says, and returns the largest relative RMS difference of a row's
 /// logits from a run with every expert in its slot.
 fn run_with_misses(devices: &[Device], serve: Serve) -> f64 {
+    run_with_misses_tuned(devices, serve, "", |_, _| {}).0
+}
+
+/// [`run_with_misses`] with the options of the run with misses as `tune` makes them (from
+/// the model's configuration), and what its store counted.
+fn run_with_misses_tuned(
+    devices: &[Device],
+    serve: Serve,
+    tag: &str,
+    tune: impl Fn(&Config, &mut SessionOptions),
+) -> (f64, StoreStats) {
     let synthetic = model(31);
-    let name = format!("misses-{serve:?}");
+    let name = format!("misses-{serve:?}{tag}");
     let gguf = open(&name, &synthetic.bytes_with_experts(GgmlType::IQ2_S, GgmlType::Q2_0));
     let c = Config::from_gguf(&gguf).unwrap();
     let w = Weights::load(&gguf, &c).unwrap();
@@ -727,11 +738,12 @@ fn run_with_misses(devices: &[Device], serve: Serve) -> f64 {
         down_ty: GgmlType::Q2_0,
     };
     let layers_per_device = layers_per_device(c.n_layer, devices.len());
-    let opts = SessionOptions {
+    let mut opts = SessionOptions {
         slot_bytes: Some((slots * layers_per_device) as u64 * shape.slot_bytes().unwrap()),
         serve,
         ..options(devices.len(), c.n_layer, CacheFormat::Q8)
     };
+    tune(&c, &mut opts);
     let mut session = Session::open(&gguf, &c, &w, devices.to_vec(), opts).unwrap();
     let n_expert = c.experts.count as u32;
     session.fill(&mut |_| (0..n_expert).collect()).unwrap();
@@ -762,7 +774,7 @@ fn run_with_misses(devices: &[Device], serve: Serve) -> f64 {
         Serve::Cpu => assert_eq!(stats.cpu_experts, misses),
         Serve::Measured => {}
     }
-    worst
+    (worst, stats)
 }
 
 /// An expert that is in no slot when its layer runs is uploaded and waited
@@ -773,6 +785,44 @@ fn experts_uploaded_for_a_step_change_nothing() {
     let Some(devices) = devices() else { return };
     let worst = run_with_misses(&devices, Serve::Stream);
     assert_eq!(worst, 0.0);
+}
+
+/// The routers of the next layers predict the picks of a step of eight rows and the store
+/// reads ahead what no tier holds: the logits are, to the bit, those of a run with every
+/// expert in its slot, with the predictions and without them, and with a RAM tier of a few
+/// slots per layer the reads ahead are many.
+#[test]
+fn experts_read_ahead_of_their_router_change_nothing() {
+    let Some(devices) = devices() else { return };
+    let small_ram = |c: &Config, opts: &mut SessionOptions| {
+        let per_layer = if tensor().is_some() { devices.len() } else { 1 };
+        opts.ram_tier = Some((4 * c.n_layer * per_layer) as u64 * (64 << 10));
+    };
+    for predict in [0, 1, 2] {
+        let (worst, stats) =
+            run_with_misses_tuned(&devices, Serve::Stream, &format!("-ahead{predict}"), |c, o| {
+                small_ram(c, o);
+                o.part.predict = predict;
+            });
+        eprintln!(
+            "  predictions of {predict} layers ahead: {} named, {} of them picked; {} read \
+             ahead, {} used, {} wasted, {} left; {} demand reads",
+            stats.predicted,
+            stats.predicted_picked,
+            stats.ahead_reads,
+            stats.ahead_used,
+            stats.ahead_wasted,
+            stats.ahead_left,
+            stats.demand_reads,
+        );
+        assert_eq!(worst, 0.0);
+        if predict == 0 {
+            assert_eq!(stats.predicted, 0);
+        } else {
+            assert!(stats.predicted > 0 && stats.ahead_reads > 0, "{stats:?}");
+            assert!(stats.ahead_used > 0, "some reads ahead are picked: {stats:?}");
+        }
+    }
 }
 
 /// What every layer of a step gave: the residual after it, the output of its

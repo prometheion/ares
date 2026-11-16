@@ -1472,7 +1472,7 @@ pub(crate) fn model_list(models: &[crate::models::Listed]) -> serde_json::Value 
 /// The body of `GET /metrics`.
 pub(crate) fn metrics(stats: &ares_api::EngineStats) -> String {
     let (ram, ssd) = (&stats.ram, &stats.ssd);
-    let rows: [(&str, &str, &str, u64); 50] = [
+    let rows: [(&str, &str, &str, u64); 56] = [
         (
             "cache_ram_pages",
             "gauge",
@@ -1699,6 +1699,42 @@ pub(crate) fn metrics(stats: &ares_api::EngineStats) -> String {
             "counter",
             "Time layers waited for the experts they missed, summed over layers",
             stats.experts.wait_us,
+        ),
+        (
+            "expert_predicted_total",
+            "counter",
+            "Experts the routers of later layers, applied early, named for a layer",
+            stats.experts.predicted,
+        ),
+        (
+            "expert_predicted_picked_total",
+            "counter",
+            "Predicted experts the layer's own router then picked",
+            stats.experts.predicted_picked,
+        ),
+        (
+            "expert_ahead_reads_total",
+            "counter",
+            "Predicted experts in no tier read from the model file ahead of their router",
+            stats.experts.ahead_reads,
+        ),
+        (
+            "expert_ahead_read_bytes_total",
+            "counter",
+            "Bytes of experts read ahead of their router",
+            stats.experts.ahead_read_bytes,
+        ),
+        (
+            "expert_ahead_used_total",
+            "counter",
+            "Experts read ahead that their router then picked",
+            stats.experts.ahead_used,
+        ),
+        (
+            "expert_ahead_wasted_total",
+            "counter",
+            "Experts read ahead that their router did not pick",
+            stats.experts.ahead_wasted,
         ),
         (
             "expert_ram_tier_bytes",

@@ -696,6 +696,9 @@ impl<'g> Session<'g> {
             }
             feed.set_prune(mask, prune::owners(&placement, c), c.experts.count);
         }
+        if placement.tensor.is_some() {
+            feed.set_owners(super::feed::owners(&placement, c));
+        }
 
         let ngram = NgramFeed::open(gguf, c, opts.row_cache, opts.part.max_slots)?;
 
