@@ -109,11 +109,22 @@ fn rig_in_pieces(
     pieces: Option<(usize, usize)>,
     tune: impl FnOnce(&mut StoreConfig),
 ) -> Rig {
+    rig_reading(vram_slots, ram_slots, pieces, Config::default(), tune)
+}
+
+/// [`rig_in_pieces`] with a reader of the file made with `reader`.
+fn rig_reading(
+    vram_slots: u64,
+    ram_slots: u64,
+    pieces: Option<(usize, usize)>,
+    reader: Config,
+    tune: impl FnOnce(&mut StoreConfig),
+) -> Rig {
     let dir = Scratch::new();
     let gguf = model(&dir);
     let map =
         ExpertMap::discover(&gguf, &["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"]).unwrap();
-    let reader = Reader::open_gguf(&gguf, Config::default()).unwrap();
+    let reader = Reader::open_gguf(&gguf, reader).unwrap();
     let layers =
         [LayerSpec { device: 0, offsets: OFFSETS, slot_bytes: SLOT_BYTES, resident: false };
             LAYERS];
@@ -426,6 +437,86 @@ fn an_unsure_guess_is_uploaded_from_ram_but_not_read_from_the_file() {
         stats.demand_reads, 3,
         "experts 1 and 2 of layer 0, and expert 13 when it was picked"
     );
+}
+
+#[test]
+fn a_predicted_expert_in_no_tier_is_read_ahead_and_its_record_finds_it_in_ram() {
+    let mut rig = rig(4, 8, |_| {});
+    // Expert 0 of layer 1 is in VRAM; 10, 11 and 12 are only in the file.
+    rig.step(&[&[][..], &[0][..]]);
+    rig.store.take_stats();
+
+    // Between steps a prediction does nothing.
+    rig.store.ahead(1, &[10]);
+    rig.store.poll().unwrap();
+    assert_eq!(rig.store.stats().ahead_reads, 0);
+
+    rig.store.begin_step();
+    rig.store.routed(0, &[2]).unwrap();
+    rig.store.ahead(1, &[10, 0, 11]);
+    rig.settle_guesses(|store| store.in_ram(1, 10) && store.in_ram(1, 11));
+    assert!(!rig.store.in_vram(1, 10), "a read ahead goes to RAM, not to VRAM");
+    // A layer whose record has arrived is not predicted any more.
+    rig.store.ahead(0, &[12]);
+    // The router of layer 1 picks one of the two, and one that was not predicted.
+    assert_eq!(rig.store.routed(1, &[10, 12]).unwrap(), 2);
+    rig.settle();
+    rig.assert_usable(1, 10);
+    rig.store.end_step().unwrap();
+    rig.settle();
+    let stats = rig.store.take_stats();
+    assert_eq!((stats.predicted, stats.predicted_picked), (3, 1), "expert 0 was in VRAM");
+    assert_eq!((stats.ahead_reads, stats.ahead_used, stats.ahead_wasted), (2, 1, 1));
+    assert_eq!((stats.miss_from_ram, stats.miss_from_disk), (1, 2), "and expert 2 of layer 0");
+    assert_eq!(stats.demand_reads, 2, "expert 2 of layer 0 and expert 12 of layer 1");
+    assert_eq!(stats.ahead_read_bytes, stats.guess_read_bytes);
+    // What was read for nothing is the first to give way in RAM.
+    assert!(rig.store.in_ram(1, 11));
+}
+
+#[test]
+fn a_read_ahead_that_its_record_does_not_need_is_dropped() {
+    let mut rig = rig(4, 8, |_| {});
+    rig.store.begin_step();
+    rig.store.routed(0, &[2]).unwrap();
+    rig.store.ahead(1, &[10, 11]);
+    // The record arrives before the reads have come back, or after: either way the reads
+    // are done with and nothing waits for them.
+    rig.store.poll().unwrap();
+    assert_eq!(rig.store.routed(1, &[3]).unwrap(), 1);
+    rig.settle();
+    rig.store.end_step().unwrap();
+    rig.settle();
+    let stats = rig.store.take_stats();
+    assert_eq!(stats.ahead_wasted + stats.ahead_left, 2, "{stats:?}");
+    assert_eq!((stats.ahead_used, stats.failed_reads), (0, 0));
+    assert!(rig.store.is_settled());
+    // A read that came back stayed in RAM as a guess nobody used; a cancelled one left
+    // nothing.
+    for expert in [10, 11] {
+        assert!(!rig.store.in_vram(1, expert));
+    }
+}
+
+#[test]
+fn reads_ahead_keep_to_what_the_drive_takes_of_prefetches() {
+    // The reader takes one chunk of 256 bytes of prefetches at once: less than an expert,
+    // so one read ahead is on its way at a time.
+    let reader = Config { prefetch_depth: 1, prefetch_chunk: 256, ..Config::default() };
+    let mut rig = rig_reading(4, 8, None, reader, |_| {});
+    rig.store.begin_step();
+    rig.store.routed(0, &[2]).unwrap();
+    rig.settle();
+    rig.store.ahead(1, &[10, 11, 12]);
+    rig.store.poll().unwrap();
+    assert_eq!(rig.store.stats().ahead_reads, 1, "one in flight");
+    rig.settle_guesses(|store| [10, 11, 12].iter().all(|e| store.in_ram(1, *e)));
+    assert_eq!(rig.store.stats().ahead_reads, 3, "the others follow, one at a time");
+    rig.store.routed(1, &[11]).unwrap();
+    rig.settle();
+    rig.store.end_step().unwrap();
+    let stats = rig.store.take_stats();
+    assert_eq!((stats.ahead_used, stats.ahead_wasted), (1, 2));
 }
 
 #[test]

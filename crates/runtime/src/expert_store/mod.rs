@@ -43,7 +43,9 @@
 //! between steps, from the heat, and never makes a step wait. Whatever
 //! names experts before their layer runs (the routers of later layers applied
 //! early, the token table) calls [`ExpertStore::predicted`], and the store
-//! starts on them at lower priority.
+//! starts on them at lower priority. The routers of later layers applied on the
+//! device call [`ExpertStore::ahead`]: only what no tier holds is read, within
+//! bounds that keep the drive for the reads a step waits for (`ahead.rs`).
 //!
 //! What keeps this safe without a lock or a host wait is the order of the
 //! table: an entry appears on the device after the expert's bytes, and an
@@ -66,6 +68,7 @@
 //! start in one sweep through the file, when idle the hottest first and a few
 //! at a time, stopped by the next step.
 
+mod ahead;
 pub mod cpu;
 mod device;
 mod elastic;
@@ -317,6 +320,8 @@ struct ReadOp {
     parts_left: u8,
     failed: bool,
     demand: bool,
+    /// Started ahead of a router for a predicted pick ([`ExpertStore::ahead`]).
+    ahead: bool,
     since: Instant,
 }
 
@@ -436,6 +441,24 @@ pub struct StoreStats {
     /// computed.
     pub left_reads: u64,
     pub left_experts: u64,
+    /// The read-ahead of predicted picks ([`ExpertStore::ahead`]): experts a prediction
+    /// named for a layer before its router ran (each once per step), and of them those the
+    /// router then picked.
+    pub predicted: u64,
+    pub predicted_picked: u64,
+    /// Reads from the file started ahead of a router for predicted experts that no tier
+    /// held, and their bytes (whole blocks); of those, the experts the router then picked
+    /// and those it did not (their read cancelled or come back for nothing).
+    pub ahead_reads: u64,
+    pub ahead_read_bytes: u64,
+    pub ahead_used: u64,
+    pub ahead_wasted: u64,
+    /// Predicted experts in no tier that were not read: the bounds of the read-ahead left
+    /// no room before the layer's router ran.
+    pub ahead_left: u64,
+    /// For every pick whose read had started ahead and was still on its way when its
+    /// record arrived: milliseconds from the record to its bytes being in RAM.
+    pub ahead_miss_ms: Vec<f32>,
 }
 
 /// The expert tiers of a model and the work that feeds them.
@@ -479,6 +502,8 @@ pub struct ExpertStore<D: SlotDevice> {
     /// What a read from the file that a step waits for takes, in
     /// milliseconds: a mean that follows the reads.
     read_ms: f64,
+    /// The read-ahead of predicted picks of the running step and its bounds.
+    ahead: ahead::Ahead,
     stats: StoreStats,
 }
 
@@ -692,6 +717,7 @@ impl<D: SlotDevice> ExpertStore<D> {
             pieces,
             windows: windows::Windows::default(),
             read_ms: 3.0,
+            ahead: ahead::Ahead::new(&layers, &reader),
             stats: StoreStats::default(),
             block,
             config,
@@ -805,6 +831,7 @@ impl<D: SlotDevice> ExpertStore<D> {
         self.windows.set(&[], None);
         self.cpu_begin_step();
         self.transit_begin_step();
+        self.ahead_begin_step();
     }
 
     /// The windows of the step just begun that verify drafts, as (first row,
@@ -839,6 +866,7 @@ impl<D: SlotDevice> ExpertStore<D> {
         self.phase[layer] = Phase::Open;
         self.heat.record(layer, picks);
         self.guesses.forget_layer(layer);
+        self.ahead_routed(layer, picks);
         self.wants.retain(|w| w.layer != layer || w.demand);
         self.demand(layer, picks)
     }
@@ -1024,6 +1052,7 @@ impl<D: SlotDevice> ExpertStore<D> {
     pub fn end_step(&mut self) -> Result<(), StoreError> {
         self.in_step = false;
         self.phase.fill(Phase::Passed);
+        self.ahead_end_step();
         self.step += 1;
         self.stats.steps += 1;
         self.wants.retain(|w| w.demand);
@@ -1075,8 +1104,12 @@ impl<D: SlotDevice> ExpertStore<D> {
                 continue;
             }
             let Some(op) = self.reads.remove(&(done.key / 4)) else { continue };
+            if op.ahead {
+                self.ahead_read_done(done.key / 4, op.layer, op.expert, op.failed);
+            }
             if op.failed {
-                self.stats.failed_reads += 1;
+                // A read ahead that the layer's record did not need was cancelled.
+                self.stats.failed_reads += u64::from(!op.ahead || op.demand);
                 self.ram.sets[op.layer].abort(&op.swap);
             } else {
                 self.ram.sets[op.layer].commit(&op.swap);
@@ -1178,14 +1211,21 @@ impl<D: SlotDevice> ExpertStore<D> {
             at += 1;
         }
 
-        // Guesses, while lanes are free. A fill has the drive to itself.
+        // Guesses, while lanes are free. A fill has the drive to itself. Reads ahead of a
+        // router keep within bounds of their own (`ahead.rs`).
         let lanes = if self.filling { 4 * self.config.read_lanes } else { self.config.read_lanes };
         while self.reads.len() < lanes && !self.guesses.is_empty() && !self.pieces.shrinking {
             for layer in 0..self.layers.len() {
                 self.refresh_worth(layer);
             }
-            let Some(started) = self.guesses.start(&mut self.ram.sets, &self.ram_worth, self.step)
-            else {
+            let ahead = &self.ahead;
+            let room = ahead.has_room();
+            let Some(started) = self.guesses.start_where(
+                &mut self.ram.sets,
+                &self.ram_worth,
+                self.step,
+                &mut |layer, expert| room || !ahead.is_queued(layer, expert),
+            ) else {
                 break;
             };
             self.read(started.layer, started.swap, self.filling)?;
@@ -1278,10 +1318,12 @@ impl<D: SlotDevice> ExpertStore<D> {
         if demand {
             self.stats.demand_reads += 1;
             self.stats.demand_read_bytes += bytes;
+            self.ahead.demand_bytes += bytes;
         } else {
             self.stats.guess_reads += 1;
             self.stats.guess_read_bytes += bytes;
         }
+        let ahead = !demand && self.ahead_started(layer, swap.load, id, bytes);
         self.reads.insert(
             id,
             ReadOp {
@@ -1291,6 +1333,7 @@ impl<D: SlotDevice> ExpertStore<D> {
                 parts_left: 3,
                 failed: false,
                 demand,
+                ahead,
                 since: Instant::now(),
             },
         );

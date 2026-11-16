@@ -371,6 +371,8 @@ impl<D: SlotDevice> ExpertStore<D> {
         if self.serve() == Serve::Stream {
             return self.routed(layer, &picks);
         }
+        // What was read ahead for the layer is done with (`ahead.rs`).
+        self.ahead_routed(layer, &picks);
         let Some(hybrid) = self.hybrid.as_ref() else { return self.routed(layer, &picks) };
         let shape = hybrid.shapes[layer];
         if n_rows == 0 || n_rows > MAX_ROWS || act.len() < act_bytes(shape.n_embd as usize, n_rows)
