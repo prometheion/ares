@@ -26,6 +26,8 @@ the kernels exist; no model runs there yet.
   requests go on.
 - 27B: the token embedding lies in host RAM (380 to 518 MiB of VRAM saved on the first card).
 - Flash-Next: experts a prompt misses pass through transit slots; nothing is evicted for them.
+- Flash-Next: the routers of the next two layers, applied on the card, predict a token's
+  picks; the store reads ahead from the SSD what no tier holds, behind every demand read.
 - Measured (2026-11-12 to 15): 27B Q4_K_S on two cards reads prompts at about 1350 tokens/s
   and decodes a step in 24.5 ms; Flash-Next IQ2_XS on two cards generates 45 to 49 tokens/s
   without drafts.

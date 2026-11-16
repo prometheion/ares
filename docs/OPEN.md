@@ -110,13 +110,22 @@ other differed more by the load than by the drafts.
 - [ ] The heat counts the steps that measure the price of a step at the start (token 0, about a
       thousand rows); the server's start drops it (`Qwen4Exp::serving`), the runtime itself
       still counts it for a model without a profile.
-- [ ] Prediction on the device: the routers of the next two layers applied to the current
-      state in the router's own launch; read-ahead in chunks of 512 KiB, at most two while
-      a demand read runs. (A first attempt with the prediction on the host was rejected:
-      it changed the text and halved generation on two cards; branch `moe/read-ahead`
-      is kept as a record.)
+- [x] Prediction on the device (branch `moe/predict`): right after a layer's router, on a
+      stream of its own, the routers of the next two layers on the rows it read; the store
+      reads ahead what no tier holds, at most what the drives take of prefetches at once and
+      per step what the drive could read beside the step's demand reads; a drive takes two
+      prefetch chunks of 512 KiB beside a demand chunk (four alone). Wide steps predict the
+      next layer where the step before read from the file, read ahead through transit's
+      guesses. Fingerprint unchanged; measured in "Reading experts ahead of their router".
+      (A first attempt with the prediction on the host was rejected: it changed the text and
+      halved generation on two cards; branch `moe/read-ahead` is kept as a record.)
+- [ ] The shared expert's output in the prediction's input (Run My AI: 11 % fewer misses on
+      Ling): the part that routes has it only when it computes the shared expert itself
+      (not with `--shared worker`), and the routed experts add into the same buffer, so it
+      needs a copy on the step's stream. Not built; the prediction reads the router's input.
 - [ ] Long prompts layer by layer over the whole prompt, interruptible, with read-ahead of
-      the most used experts of the next two layers.
+      the most used experts of the next two layers. (Wide steps read the next layer's
+      predicted picks ahead now, within a step.)
 - [ ] A missed expert waits 2.3 to 3.2 ms for the file where the drive needs 1.4 ms: find
       the rest.
 - [x] Pruning as a fourth level next to VRAM, RAM and SSD (branch `moe/pruning`):

@@ -2303,9 +2303,12 @@ pages) and comes with the runtime.
   of a GPU backend), demand reads before read-ahead, which is cut into chunks
   and can be cancelled or promoted. The wide steps of `qwen4exp` submit all
   reads of a layer at once, into staging slots next to the RAM tier (see
-  "Wide steps" under "Qwen3.8-Flash-Next through the runtime"). Reading ahead
-  of the router is built in the store and has no guess worth reading yet:
-  next-layer router prediction, which starts reads early, is planned.
+  "Wide steps" under "Qwen3.8-Flash-Next through the runtime"). A drive takes
+  at most four prefetch chunks of 512 KiB at once, and two while a demand
+  chunk is there (`ares_io::Config::prefetch_depth`, Run My AI's rule). The
+  steps of eight rows of `qwen4exp` read ahead of the router what the routers
+  of the next layers, applied on the device, predict (see "Reading experts
+  ahead of their router" under "Qwen3.8-Flash-Next through the runtime").
 - **Several SSDs.** A model can have copies on more than one drive (a mirror
   directory per extra drive), and the parts of a split model can be on
   different drives. Every drive has its own queue depth, and each chunk of a
@@ -3991,8 +3994,9 @@ width (`device/part/wide.rs`, `device/misses.rs`):
   guess, for the layers ahead (`ares_weights::Lookahead` gives the distance), what the wide
   step before missed there and no tier holds. That guess is off (`SessionOptions::
   read_ahead`), because it is mostly wrong and costs more than it gives: see "Transit,
-  measured". A guess worth reading is the next layer's router applied to this layer's
-  input, which is not built.
+  measured". The next layers' routers applied to this layer's input are a better guess;
+  the steps of eight rows make it on the device (see "Reading experts ahead of their
+  router" below), a wide step does not yet.
 - *Both devices on every layer*: the mixer routes. The worker's host thread reads the
   record from the mixer's board (the mixer has enqueued the layer when `Flow::enqueued`
   says so), uploads it, and builds its table from the experts it owns
@@ -4224,6 +4228,83 @@ the higher load in the first pairs):
   chunks of 512 KiB at the drive), and an upload per device; that bound is the store's
   (`tests/expert_fill.rs`) and was not resolved by a measurement here, whose times are those of
   the request's own misses.
+
+**Reading experts ahead of their router.** A pick that no tier holds is read from the file
+when its layer's record reaches the host, and the layer waits for it. The routers of the
+next layers applied to the rows the router of this layer reads name most of what those
+layers will pick (Pre-gated MoE, FATE, ProMoE; Run My AI applies the routers of layers L+1
+and L+2 on the GPU and prefetches in chunks of 512 KiB, at most two while a demand read
+runs), so their reads can start a layer or two before their records
+(`device/part/predict.rs`, `expert_store/ahead.rs`, `ares_cuda::ExpertKernels::predict`):
+
+- *On the device.* In a step of the decode kernels (up to eight rows), right after the
+  router of layer L, the part that runs the router (one card, a range of layers, or the
+  mixer when both cards work on every layer) applies the routers of layers L+1 and L+2 of
+  its range (`Options::predict`, 2) to the rows the router of L read: the float weight
+  kernel with a router per row of its grid, and a block per router that ranks every
+  expert by its logit in each row (the router's own order) and lists those that some row
+  ranks among the first ten, by their best rank. Two launches and a copy of the lists
+  (a few hundred bytes) to the board in page-locked memory, on a stream of the
+  predictions that waits for the router's event; the step's stream never waits for it in
+  the step, and the predictions write only their own buffers (the logits and the lists),
+  so what the model computes is the same bit for bit. The next step waits for the last
+  prediction of the step before it writes the rows they read. The router's input is
+  the input of layer L's experts, without the shared expert's output, which is on the
+  other card when the worker computes it (`--shared worker`).
+- *On the host.* The feed hands the lists of a layer to the store behind the layer's
+  route record (`Feed::follow_predictions`; a list carries the step's token, and one of
+  another step is ignored), with both cards on every layer each expert to its owner's half
+  of the store layer. `ExpertStore::ahead` takes them for a layer the step has not routed:
+  what a tier holds or what is on its way is left alone; the others are read into the RAM
+  tier as guesses, the likeliest first and behind every demand read. A guess takes a slot
+  of the tier only when its read starts and never one of an expert the step needs, and
+  one that nobody used is worth nothing there, the first to give way.
+- *Only what is picked more often than not.* When the tiers hold what a text uses, an
+  expert that no tier holds is one the text has not used, and a prediction that names it is
+  mostly wrong: on two cards with `--ram 8G` a read ahead of every such expert was picked 3 %
+  of the time (0.11 used and 3.59 wasted of 3.7 reads a step, and 31 more that no bound let
+  start), as the first attempt had found on the host. So the store counts, per distance of
+  the prediction and place in its list (the best rank among the rows), how often an expert
+  named there that no tier held was then picked, read or not, and reads ahead only at the
+  places where that has been at least half the time (16 samples first; the counts are
+  halved beyond 512, so they follow the text and the tiers): then a read for nothing costs
+  the drive no more than the reads that are used save. Where the tiers hold little (one
+  card, a small RAM tier, a larger file) more places qualify.
+- *Bounds from the drive and the step.* At most as many experts on their way ahead as the
+  drives take of prefetches at once (`Reader::prefetch_room`: four chunks of 512 KiB per
+  drive, two experts of Flash-Next), and per step at most what the drive could read in the
+  time of a step beside the step's own demand reads (the drive's measured pace and means of
+  the steps that predicted). The reader keeps every prefetch behind every demand read and
+  takes only half its prefetch depth while a demand chunk is at the drive, so a demand
+  read shares the drive with at most two chunks of 512 KiB.
+- *Dropped when the record arrives.* The guesses for the layer that have not started are
+  forgotten, the read of an expert the record did not pick is cancelled (what is at the
+  drive comes back and is dropped), and a pick whose read is on its way is promoted to a
+  demand read, as for any guess.
+- *Wide steps* (a slice of a prompt): at layer L the next layer's router is applied to
+  the rows as a float product on the f16 tile kernels, on the predictions' stream (the
+  step's stream waits only for the f16 copy of the rows, which the next layer's read
+  overwrites), and every row's picks go to the board. The feed counts them per expert and
+  hands them, the most picked first, to the store as the guesses of layer L+1
+  (`ExpertStore::transit_guess`): what no tier holds is read into staging as prefetches, in
+  at most half of it, and the record of L+1 promotes what it names (`transit_want`) and
+  drops the rest (`transit_forget`). A layer of a wide step takes tens of milliseconds, so
+  one layer is lead enough. The prediction is made only at the layers where the wide step
+  before read the next layer's experts from the file (the board carries the feed's word to
+  the part), so a prompt whose experts are in the tiers pays nothing for it.
+- *The text is unchanged.* The fingerprint of the tool (`qwen4exp_run --fingerprint`: the
+  logits of a prompt of 600 tokens, 24 generated tokens and windows of drafts, bit for bit;
+  both cards with the split pinned, `--core-share 0.76 --shared worker`, every miss
+  uploaded, `--serve stream`) is the same with the predictions and the reads ahead as
+  without them, with `--ram-gib 8` and with `--ram-gib 4` (2026-11-16: `ffbe225f5e70e94b`
+  for all four). With the prompt in wide steps (`--rows 512`) no comparison holds bit for
+  bit: two runs of the build of before differ themselves (the many-row kernels add a row's
+  experts with `red.add`, `Accumulate::Atomic`, in the order of the schedule), and the
+  picks of a run with the predictions were those of one of them.
+- *Counted* (`StoreStats`, `/metrics`): experts predicted and of them those picked
+  (`ares_expert_predicted_total`, `ares_expert_predicted_picked_total`), reads ahead and
+  their bytes, those the record picked and those it did not (`ares_expert_ahead_*`, the
+  wide steps' guesses included).
 
 **What the gap between 17 and 22 ms is made of, and what the size of the tier
 did.** The tool counts, for every decode step at 1000 tokens, the experts the
