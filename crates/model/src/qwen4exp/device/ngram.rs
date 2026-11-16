@@ -141,7 +141,7 @@ impl NgramFeed {
         }
         out[..4].copy_from_slice(&sequence.position.to_le_bytes());
         out[4..8].copy_from_slice(&(sequence.recent.len() as u32).to_le_bytes());
-        for (word, token) in out[8..].chunks_exact_mut(4).zip(&sequence.recent) {
+        for (word, token) in out[8..].as_chunks_mut::<4>().0.iter_mut().zip(&sequence.recent) {
             word.copy_from_slice(&token.to_le_bytes());
         }
         Ok(out)

@@ -245,6 +245,14 @@ impl Qwen35 {
 }
 
 impl Qwen35 {
+    /// What each device part keeps of a sequence and of a page
+    /// (`part/resume.rs`), which the prefix cache is told.
+    fn declared(&self) -> Vec<Declared> {
+        (0..self.placement.n_devices())
+            .map(|d| declared(&self.config, &self.placement, d, &self.options))
+            .collect()
+    }
+
     /// Everything besides the tokens that changes the bytes of a page or of a
     /// checkpoint as the device parts hand them out
     /// ([`ares_runtime::Durable::fingerprint`]):
@@ -256,14 +264,6 @@ impl Qwen35 {
     /// - the format of the recurrent state, and how the products round;
     /// - which heads of every block each device holds, since the bytes are
     ///   laid out per device.
-    /// What each device part keeps of a sequence and of a page
-    /// (`part/resume.rs`), which the prefix cache is told.
-    fn declared(&self) -> Vec<Declared> {
-        (0..self.placement.n_devices())
-            .map(|d| declared(&self.config, &self.placement, d, &self.options))
-            .collect()
-    }
-
     fn state_fingerprint(&self) -> Vec<u8> {
         let mut out = b"qwen35 state 1\0".to_vec();
         for part in 0..self.gguf.n_parts() {
