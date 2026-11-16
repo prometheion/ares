@@ -1262,6 +1262,46 @@ fn with_the_fast_kernels_the_reply_with_drafts_is_the_reply_without() {
     server.stop();
 }
 
+/// The DFlash drafter (`ARES_TEST_DFLASH_27B`, the 27B's DFlash2 file) next
+/// to the draft block and alone, on both cards with the fast kernels: the
+/// reply with drafts is the reply without them, token for token, greedy and
+/// sampled, and the drafter's drafts are verified.
+#[test]
+fn with_the_dflash_drafter_the_reply_with_drafts_is_the_reply_without() {
+    let Some(model) = two_card_model() else { return };
+    let Some(dflash) = std::env::var_os("ARES_TEST_DFLASH_27B") else {
+        eprintln!("skipped: set ARES_TEST_DFLASH_27B to the 27B's DFlash2 file");
+        return;
+    };
+    let dflash = dflash.to_string_lossy().into_owned();
+    let greedy = json!({"max_tokens": 300, "temperature": 0});
+    let sampled =
+        json!({"max_tokens": 300, "temperature": 0.8, "top_k": 20, "top_p": 0.95, "seed": 4711});
+    for drafters in [format!("mtp,{dflash}"), dflash.clone()] {
+        let flags = [
+            "--devices",
+            "0,1",
+            "--split",
+            "tensor",
+            "--parallel",
+            "1",
+            "--precision",
+            "fast",
+            "--drafters",
+            drafters.as_str(),
+        ];
+        let server = Server::start(&model, port(9), &flags);
+        for (how, extra) in [("the most probable token", &greedy), ("sampled", &sampled)] {
+            for (question, parted) in replies_with_and_without_drafts_as(&server, extra) {
+                assert_eq!(parted, None, "--drafters {drafters}, {how}, {question}: they part");
+            }
+        }
+        let (_, _, drafted) = reply_tokens(&server, ENGLISH, true);
+        assert!(drafted.unwrap_or(0) > 0, "--drafters {drafters}: drafts were verified");
+        server.stop();
+    }
+}
+
 /// A server started with no drafters does not speculate, whatever the text
 /// repeats: the lookup in earlier text is no drafter on its own.
 #[test]

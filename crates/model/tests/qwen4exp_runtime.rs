@@ -1218,6 +1218,15 @@ fn start_flash(
     path: &std::path::Path,
     draft: Option<&std::path::Path>,
 ) -> (Runtime, Arc<Qwen4Exp>) {
+    start_flash_with(path, draft, None)
+}
+
+/// [`start_flash`] with a DFlash drafter as well, in windows of eight rows.
+fn start_flash_with(
+    path: &std::path::Path,
+    draft: Option<&std::path::Path>,
+    dflash: Option<Arc<ares_model::dflash::File>>,
+) -> (Runtime, Arc<Qwen4Exp>) {
     let placement = if device_count().expect("the CUDA driver") >= 2 {
         Placement::Shared
     } else {
@@ -1235,12 +1244,20 @@ fn start_flash(
     if let Some(draft) = draft {
         inner = inner.with_draft(Gguf::open(draft).unwrap()).expect("the draft block fits");
     }
+    let window = match (&dflash, draft) {
+        (Some(_), _) => 8,
+        (None, Some(_)) => 4,
+        (None, None) => 1,
+    };
+    if let Some(file) = dflash {
+        inner = inner.with_dflash(file).expect("the DFlash drafter fits");
+    }
     let inner = Arc::new(inner);
     let config = RuntimeConfig {
         pages: 16,
         cells_per_page: 128,
         max_slots: SLOTS,
-        window_rows: if draft.is_some() { 4 } else { 1 },
+        window_rows: window,
         warm_up: false,
         ..RuntimeConfig::default()
     };
@@ -1318,6 +1335,54 @@ fn flash_next_writes_with_drafts_what_it_writes_without() {
     assert!(counters.drafts_rejected > 0, "no draft was rejected");
     assert_eq!(drafted, plain, "drafts changed a greedy reply of Flash-Next");
     assert_eq!(sampled, plain_seeded, "drafts changed a sampled reply of Flash-Next");
+}
+
+/// The same with the DFlash drafter (`ARES_TEST_DFLASH_FLASHNEXT`), which reads
+/// the mean of the model's four streams: Flash-Next writes with its drafts,
+/// greedy, what it writes without, and some of them are accepted.
+#[test]
+fn flash_next_writes_with_dflash_drafts_what_it_writes_without() {
+    if !enabled() {
+        return;
+    }
+    let (Some(path), Some(file)) = (
+        std::env::var_os("ARES_TEST_QWEN4EXP_MODEL").map(PathBuf::from),
+        std::env::var_os("ARES_TEST_DFLASH_FLASHNEXT").map(PathBuf::from),
+    ) else {
+        eprintln!(
+            "skipped: set ARES_TEST_QWEN4EXP_MODEL to the first part of Flash-Next and \
+             ARES_TEST_DFLASH_FLASHNEXT to its DFlash2 file"
+        );
+        return;
+    };
+    let file = Arc::new(ares_model::dflash::File::open(&file).unwrap());
+    let (runtime, model) = start_flash(&path, None);
+    let plain = ask(&runtime, 1, &FLASH_PROMPT, 64);
+    runtime.shutdown();
+    drop(runtime);
+    drop(model);
+    let free = |device: u32| {
+        Device::open(device, Wait::Spin).and_then(|d| d.mem_info()).map_or(0, |m| m.free)
+    };
+    let begun = std::time::Instant::now();
+    while free(0) < 10 << 30 && begun.elapsed() < Duration::from_secs(120) {
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    let (runtime, model) = start_flash_with(&path, None, Some(file));
+    let drafted = ask(&runtime, 1, &FLASH_PROMPT, 64);
+    let stats = model.take_store_stats().expect("the parts are open");
+    let counters = runtime.snapshot().expect("the runtime is running").counters;
+    runtime.shutdown();
+    eprintln!(
+        "RES Flash-Next with DFlash: {} tokens in {} steps; tested by position {:?}, accepted {:?}",
+        counters.tokens,
+        counters.steps,
+        &counters.drafts_tested_at[2][..7],
+        &counters.drafts_accepted_at[2][..7],
+    );
+    assert_eq!(stats.cpu_experts, 0, "the CPU computed experts: {stats:?}");
+    assert!(counters.drafts_accepted_at[2][0] > 0, "no DFlash draft was accepted");
+    assert_eq!(drafted, plain, "DFlash drafts changed a greedy reply of Flash-Next");
 }
 
 /// The tier of experts in RAM under the runtime, on a machine whose memory the test sets:
