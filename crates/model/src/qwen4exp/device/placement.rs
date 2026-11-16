@@ -174,7 +174,7 @@ impl Placement {
             return Err(invalid(format!("{n_dev} devices for {n_layer} layers")));
         }
         let weights = whole_layers(c, w)?;
-        let head = head_bytes(w)?;
+        let head = head_bytes(w);
         // best[d][b]: the best worst share when devices 0..=d hold the layers
         // 0..b, and the first layer of device d in that split.
         let mut best = vec![vec![(f64::NEG_INFINITY, 0usize); n_layer + 1]; n_dev];
@@ -250,7 +250,7 @@ impl Placement {
             )));
         }
         let weights = whole_layers(c, w)?;
-        let head = head_bytes(w)?;
+        let head = head_bytes(w);
         let devices = devices
             .iter()
             .zip(bounds.windows(2))
@@ -309,7 +309,7 @@ impl Placement {
                 .push(LayerShare { heads: cut..all, shared: !choice.shared_on_mixer });
             debug_assert_eq!(shares[0].len(), layer + 1);
         }
-        let head = head_bytes(w)?;
+        let head = head_bytes(w);
         let all_experts: u64 =
             (0..c.n_layer).map(|l| expert_bytes(w, l) * c.experts.count as u64).sum();
         let mut plans = Vec::with_capacity(2);

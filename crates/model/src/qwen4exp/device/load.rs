@@ -386,26 +386,20 @@ impl<'g> Layout<'g> {
         })
     }
 
-    /// A matrix of the stream mixer: these multiply the `f32` values a mixer
-    /// kernel wrote, which only the float weight kernels read.
-    fn float_matrix(&mut self, what: &str, m: &Matrix<'g>) -> Result<Mat, ModelError> {
-        if !matches!(m.ty(), GgmlType::F32 | GgmlType::F16 | GgmlType::BF16) {
-            return Err(invalid(format!(
-                "{what} is {}: the device step multiplies it with unquantized activations and \
-                 takes F32, F16 and BF16 there",
-                m.ty()
-            )));
-        }
-        Ok(self.matrix(m))
+    /// A matrix of a stream mixer or of the n-gram block: these multiply the `f32` values a
+    /// kernel wrote, unquantized ([`Part::exact_product`](super::part::Part), the fused read),
+    /// in any weight type and in the bytes the file stores.
+    fn exact_matrix(&mut self, m: &Matrix<'g>) -> Mat {
+        self.matrix(m)
     }
 
-    fn mixer(&mut self, what: &str, m: &StreamMixer<'g>) -> Result<MixerW, ModelError> {
-        Ok(MixerW {
+    fn mixer(&mut self, m: &StreamMixer<'g>) -> MixerW {
+        MixerW {
             norm: self.floats(&m.norm),
-            down: self.float_matrix(what, &m.down)?,
-            up: self.float_matrix(what, &m.up)?,
-            inject: m.inject.as_ref().map(|i| self.float_matrix(what, i)).transpose()?,
-        })
+            down: self.exact_matrix(&m.down),
+            up: self.exact_matrix(&m.up),
+            inject: m.inject.as_ref().map(|i| self.exact_matrix(i)),
+        }
     }
 
     fn layer(
@@ -419,10 +413,7 @@ impl<'g> Layout<'g> {
         let name = |what: &str| format!("blk.{layer}.{what}");
         let streams = role != Role::Worker;
         let mixers = if streams {
-            Some((
-                self.mixer(&name("hc_attn"), &w.attn_mixer)?,
-                self.mixer(&name("hc_ffn"), &w.ffn_mixer)?,
-            ))
+            Some((self.mixer(&w.attn_mixer), self.mixer(&w.ffn_mixer)))
         } else {
             None
         };
@@ -519,29 +510,19 @@ impl<'g> Layout<'g> {
             down: self.matrix(&moe.shared_down),
         });
         let moe = MoeW { shape, router, router_range, shared };
-        let ngram = w
-            .ngram
-            .as_ref()
-            .filter(|_| streams)
-            .map(|g| -> Result<NgramW, ModelError> {
-                Ok(NgramW {
-                    key: self.float_matrix(&name("ple_key"), &g.key)?,
-                    value: self.float_matrix(&name("ple_value"), &g.value)?,
-                    norm_key: self.floats(&g.norm_key),
-                    norm_query: self.floats(&g.norm_query),
-                    norm_conv: self.floats(&g.norm_conv),
-                    taps: self.floats(&g.conv),
-                })
-            })
-            .transpose()?;
+        let ngram = w.ngram.as_ref().filter(|_| streams).map(|g| NgramW {
+            key: self.exact_matrix(&g.key),
+            value: self.exact_matrix(&g.value),
+            norm_key: self.floats(&g.norm_key),
+            norm_query: self.floats(&g.norm_query),
+            norm_conv: self.floats(&g.norm_conv),
+            taps: self.floats(&g.conv),
+        });
         Ok(LayerW { layer, mixers, core, moe, ngram })
     }
 
-    fn head(&mut self, w: &Weights<'g>) -> Result<HeadW, ModelError> {
-        Ok(HeadW {
-            mixer: self.mixer("output_hc", &w.output_mixer)?,
-            output: self.matrix(&w.output),
-        })
+    fn head(&mut self, w: &Weights<'g>) -> HeadW {
+        HeadW { mixer: self.mixer(&w.output_mixer), output: self.matrix(&w.output) }
     }
 
     fn draft_in(&mut self, w: &DraftWeights<'g>) -> DraftInW {
@@ -568,10 +549,10 @@ pub(crate) fn layer_bytes(
 }
 
 /// Bytes of the final mixer and the output head in an arena.
-pub(crate) fn head_bytes(w: &Weights<'_>) -> Result<u64, ModelError> {
+pub(crate) fn head_bytes(w: &Weights<'_>) -> u64 {
     let mut layout = Layout::default();
-    layout.head(w)?;
-    Ok(layout.len)
+    layout.head(w);
+    layout.len
 }
 
 /// The dense weights of one device.
@@ -635,7 +616,7 @@ impl DeviceWeights {
             .enumerate()
             .map(|(i, share)| layout.layer(c, first + i, &w.layers[first + i], role, share))
             .collect::<Result<Vec<_>, _>>()?;
-        let head = head.then(|| layout.head(w)).transpose()?;
+        let head = head.then(|| layout.head(w));
         let len = layout.len.max(ALIGN);
         ledger.reserve("qwen4exp dense weights", len)?;
         let arena = DeviceBuffer::new(device, len)?;
@@ -667,7 +648,7 @@ impl DeviceWeights {
     ) -> Result<Self, ModelError> {
         let mut layout = Layout { ranges: true, ..Layout::default() };
         let layer = layout.layer(c, 0, &w.layer, Role::Whole, &LayerShare::whole(c, 0))?;
-        let mixer = layout.mixer("output_hc", &w.output_mixer)?;
+        let mixer = layout.mixer(&w.output_mixer);
         let draft_in = layout.draft_in(w);
         let len = layout.len.max(ALIGN);
         ledger.reserve("qwen4exp draft block weights", len)?;

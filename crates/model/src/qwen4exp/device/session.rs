@@ -332,7 +332,8 @@ pub fn read_time(device: &Device, c: &Config, w: &Weights<'_>) -> Result<Duratio
     let (hc, n, rank) = (c.n_stream as u32, c.n_embd as u32, c.mixer_rank as u32);
     let mixer = &w.layers[0].attn_mixer;
     let wide = u64::from(hc) * u64::from(n);
-    let width = |ty: GgmlType| if ty == GgmlType::F32 { 4 } else { 2 };
+    // The bytes of a matrix of `values` values of the type it has in the file (whole blocks).
+    let bytes = |ty: GgmlType, values: u64| ty.bytes_for(values).unwrap_or(4 * values);
     let zeroed = |bytes: u64| -> Result<DeviceBuffer, Error> {
         let buffer = DeviceBuffer::new(device, bytes.max(64))?;
         buffer.write(0, &vec![0u8; bytes.max(64) as usize])?;
@@ -341,8 +342,8 @@ pub fn read_time(device: &Device, c: &Config, w: &Weights<'_>) -> Result<Duratio
     let kernels = Q4Kernels::load(device)?;
     let stream = Stream::new(device, 0)?;
     let (r, norm, xn) = (zeroed(wide * 4)?, zeroed(wide * 4)?, zeroed(wide * 4)?);
-    let down = zeroed(u64::from(rank) * wide * width(mixer.down.ty()))?;
-    let up = zeroed(wide * u64::from(rank) * width(mixer.up.ty()))?;
+    let down = zeroed(bytes(mixer.down.ty(), u64::from(rank) * wide))?;
+    let up = zeroed(bytes(mixer.up.ty(), wide * u64::from(rank)))?;
     let partials = zeroed(Q4Kernels::read_partials(1, hc, rank) * 4)?;
     let act = zeroed(Kernels::quantized_activation_bytes(n, 1))?;
     let run = |count: u32| -> Result<(), Error> {

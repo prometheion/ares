@@ -92,13 +92,19 @@ pub(super) struct State {
 /// Streams the chunks of a float product are spread over.
 const HELPERS: usize = 4;
 
-/// The ggml types of the dense matrices that have tile kernels and take part in wide steps.
+/// The ggml types of the quantized dense matrices that read prepared rows in wide steps: one
+/// form of the rows serves all of them, so every one of them has a say in it (the recurrent
+/// gates and the indexer's projections included, which most files store as floats).
 fn dense_types(w: &DeviceWeights) -> Vec<GgmlType> {
     let mut types = Vec::new();
     for layer in &w.layers {
         match &layer.core {
-            CoreW::Recurrent(r) => types.extend([r.qkv.ty, r.z.ty, r.out.ty]),
-            CoreW::Attention(a) => types.extend([a.q.ty, a.k.ty, a.v.ty, a.out.ty]),
+            CoreW::Recurrent(r) => {
+                types.extend([r.qkv.ty, r.z.ty, r.alpha.ty, r.beta.ty, r.out.ty])
+            }
+            CoreW::Attention(a) => {
+                types.extend([a.q.ty, a.k.ty, a.v.ty, a.out.ty, a.indexer_q.ty, a.indexer_k.ty])
+            }
             CoreW::None => {}
         }
         if let Some(shared) = &layer.moe.shared {
@@ -239,21 +245,23 @@ impl Part {
         Ok(())
     }
 
-    /// [`Part::wide_product`] for a float matrix (F32, F16, BF16), which reads the f32
-    /// section of the rows: on the float tile kernel, with the rows converted to f16 into a
-    /// scratch of this product's own. The sums are f32 ([`PrefillPath::F16`]) whatever the
+    /// [`Part::wide_product`] for a float matrix (F32, F16, BF16), and for every matrix the
+    /// step multiplies with unquantized values whatever its type ([`Part::exact_product`]):
+    /// it reads the f32 section of the rows, on the tile kernel of the matrix's type with the
+    /// rows converted to f16 into a scratch of this product's own. The sums are f32 ([`PrefillPath::F16`]) whatever the
     /// step's precision is: the path with f16 sums loses a row of small weights among larger
     /// ones (the recurrent gates have such rows), and with it the made-up model's layers
     /// were up to four times as far from the reference (`tests/qwen4exp_device.rs`,
     /// `every_layer_of_wide_steps_matches_the_reference`). A matrix with a weight beyond f16
     /// ([`Mat::range`]), or of a width the tile kernel or the scratch does not take, is
-    /// multiplied by the decode kernel, which computes with the weights as stored: eight rows
-    /// at a time, the chunks spread over the helper streams.
+    /// multiplied by the decode kernel that reads unquantized rows
+    /// ([`Kernels::matvec_exact`]), which computes with the weights as stored: eight rows at
+    /// a time, the chunks spread over the helper streams.
     ///
     /// # Safety
     ///
     /// As [`Part::product`].
-    unsafe fn wide_float(
+    pub(super) unsafe fn wide_float(
         &self,
         stream: &Stream,
         m: &Mat,
@@ -299,7 +307,7 @@ impl Part {
             // the step's stream touches until the helpers have been waited for.
             unsafe {
                 let helper = &wide.helpers[next];
-                self.kernels.matvec(helper, m.ty, w, chunk, at, m.n_in, m.n_out, k)?;
+                self.kernels.matvec_exact(helper, m.ty, w, chunk, at, m.n_in, m.n_out, k)?;
             }
             first += k;
             next = (next + 1) % wide.helpers.len();

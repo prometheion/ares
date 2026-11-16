@@ -2044,6 +2044,34 @@ impl Part {
         Ok(())
     }
 
+    /// `y = m x` for a matrix the step multiplies with unquantized values, whatever type
+    /// the file stores it in: the stream mixers' and the n-gram block's. Reads the f32
+    /// section of the rows at `act` ([`Kernels::matvec_exact`]; in a wide step
+    /// [`Part::wide_float`]).
+    ///
+    /// # Safety
+    ///
+    /// As [`Part::product`], with only the f32 section of the rows written.
+    unsafe fn exact_product(
+        &self,
+        stream: &Stream,
+        m: &Mat,
+        act: DevicePtr,
+        y: DevicePtr,
+        rows: u32,
+    ) -> Result<(), ModelError> {
+        // SAFETY: the matrix is in the arena as the file stores it; the rest is the
+        // caller's guarantee.
+        unsafe {
+            if Self::is_wide(rows) {
+                return self.wide_float(stream, m, act, y, rows);
+            }
+            let w = self.w.mat(m);
+            self.kernels.matvec_exact(stream, m.ty, w, act, y, m.n_in, m.n_out, rows)?;
+        }
+        Ok(())
+    }
+
     /// The read of a stream mixer, after the write `write` of the half block
     /// before it: leaves the mixed input as activations at `m` (with `push`
     /// in the peer's memory as well) and the inject values in `inj`.
@@ -2143,11 +2171,11 @@ impl Part {
                 }
                 None => self.q4.stream_norm(stream, r, norm, xn, rows, hc, n, self.eps),
             }?;
-            self.product(stream, &mixer.down, self.at(s.xn), self.at(s.down), rows)?;
+            self.exact_product(stream, &mixer.down, self.at(s.xn), self.at(s.down), rows)?;
             self.q4.squash(stream, self.at(s.down), lo, rows * rank, hc)?;
-            self.product(stream, &mixer.up, self.at(s.lo), self.at(s.gate), rows)?;
+            self.exact_product(stream, &mixer.up, self.at(s.lo), self.at(s.gate), rows)?;
             if let (Some(inject), Some(inj)) = (&mixer.inject, inj) {
-                self.product(stream, inject, self.at(s.xn), inj, rows)?;
+                self.exact_product(stream, inject, self.at(s.xn), inj, rows)?;
             }
             self.q4.mix_quant(stream, xn, self.at(s.gate), m, rows, hc, n)?;
             if let Some(to) = push {
@@ -2419,8 +2447,8 @@ impl Part {
             self.mark(stream, Phase::Exchange)?;
             self.q4.ngram_decode(stream, shape, self.inbox_at(ib.ngram), emb, rows)?;
             self.mark(stream, Phase::Other)?;
-            self.product(stream, &g.key, self.at(s.emb), self.at(s.key), rows)?;
-            self.product(stream, &g.value, self.at(s.emb), self.at(s.value), rows)?;
+            self.exact_product(stream, &g.key, self.at(s.emb), self.at(s.key), rows)?;
+            self.exact_product(stream, &g.value, self.at(s.emb), self.at(s.value), rows)?;
             self.mark(stream, Phase::Dense)?;
             self.q4.ngram_gate(
                 stream,
