@@ -32,10 +32,10 @@ fn gpu() -> Option<&'static Device> {
         .as_ref()
 }
 
-/// What the draft block may propose in a case.
+/// What the MTP block may propose in a case.
 #[derive(Clone, Debug)]
 enum Drafts {
-    /// The model has no draft block placed.
+    /// The model has no MTP block placed.
     No,
     /// It proposes the tokens of a list.
     Listed(Vec<u32>),
@@ -81,8 +81,8 @@ fn placement(c: &Config, drafts: &Drafts) -> Placement {
     let single = Placement::single(c);
     match drafts {
         Drafts::No => single,
-        Drafts::Listed(tokens) => single.with_draft(c, Some(tokens)).unwrap(),
-        Drafts::Any => single.with_draft(c, None).unwrap(),
+        Drafts::Listed(tokens) => single.with_mtp(c, Some(tokens)).unwrap(),
+        Drafts::Any => single.with_mtp(c, None).unwrap(),
     }
 }
 
@@ -99,7 +99,7 @@ fn the_rows_a_draft_chain_picks_are_the_draft_heads_and_the_host_stages_the_rest
     let synth = Synth::new(spec(false, true, GgmlType::F32));
     let gguf = Gguf::open(dir.file("model.gguf", &synth.builder().build())).unwrap();
     let c = Config::from_gguf(&gguf).unwrap();
-    // No draft block: nothing is kept, every row of every step comes from the host.
+    // No MTP block: nothing is kept, every row of every step comes from the host.
     let none = placement(&c, &Drafts::No);
     assert_eq!((none.kept_rows(), none.stages_rows(&c)), (0, true));
     // A draft vocabulary: the rows of its tokens, no matter in which order they were listed.

@@ -15,7 +15,7 @@
 //! table that the draft chain's gather decodes (see `embed.rs`: the rest of
 //! the table lies in host memory) and a head whose rows they are. A slice is cut
 //! in the file's layout and then rearranged, because the device layout mixes
-//! 16 rows; for the same reason a head whose first rows the draft block reads
+//! 16 rows; for the same reason a head whose first rows the MTP block reads
 //! as a matrix of their own is laid out in two parts when a part takes the
 //! device layout ([`HeadW`]).
 //!
@@ -124,10 +124,10 @@ pub(crate) struct BlockW {
     pub ffn: Option<FfnW>,
 }
 
-/// The model's draft block (its next-token-prediction block) on the device
+/// The model's MTP block (its next-token-prediction block) on the device
 /// that holds it, whole.
 #[derive(Clone, Debug)]
-pub(crate) struct DraftW {
+pub(crate) struct MtpW {
     /// The projection of the embedding and the hidden state, as the two
     /// matrices its columns make: `x = proj_e e' + proj_h h'`.
     pub proj_e: Mat,
@@ -509,7 +509,7 @@ fn gather(values: &[f32], ranges: &[Range<usize>]) -> Vec<f32> {
 /// The rows of the output head on a device.
 #[derive(Clone, Debug)]
 pub(crate) struct HeadW {
-    /// The rows as matrices, in order: one, or two when the draft block
+    /// The rows as matrices, in order: one, or two when the MTP block
     /// reads the first rows as a matrix of their own and a part lies in its
     /// device layout, of which a product cannot read the first rows alone:
     /// the draft head, then the rest.
@@ -540,7 +540,7 @@ pub(crate) struct LoadOptions {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct EmbedW {
     pub table: TableShape,
-    /// The rows the draft chain can pick; none without a draft block here.
+    /// The rows the draft chain can pick; none without an MTP block here.
     pub kept: Option<KeptW>,
 }
 
@@ -573,7 +573,7 @@ struct Tables {
     output_norm: u64,
     head: Option<HeadW>,
     head_tokens: Option<u64>,
-    draft: Option<DraftW>,
+    draft: Option<MtpW>,
     draft_head: Option<Mat>,
 }
 
@@ -590,10 +590,10 @@ pub(crate) struct DeviceWeights {
     /// The tokens of those rows (u32 each) when a draft vocabulary reorders
     /// the head: the offset of the list in the arena.
     pub head_tokens: Option<u64>,
-    /// The draft block, on the device that holds it.
-    pub draft: Option<DraftW>,
+    /// The MTP block, on the device that holds it.
+    pub draft: Option<MtpW>,
     /// The draft head (the first rows of the output head here), on the device
-    /// of the draft plan, for the draft block or a drafter from a file.
+    /// of the draft plan, for the MTP block or a drafter from a file.
     pub draft_head: Option<Mat>,
     /// How long the upload took, the rearranging of the matrices in their
     /// device layout included.
@@ -632,7 +632,7 @@ impl DeviceWeights {
     }
 
     /// Lays out and uploads what `plan` gives device `index`; `draft` is the
-    /// placement's draft block, whose device holds it and whose order of the
+    /// placement's MTP block, whose device holds it and whose order of the
     /// head's rows every device follows.
     #[allow(clippy::too_many_arguments)]
     pub fn load(
@@ -750,7 +750,7 @@ fn runs_of(tokens: &[u32]) -> Vec<Range<usize>> {
 /// Lays out what `plan` gives device `index`: the rows of the embedding table
 /// the draft chain picks and the head first (the largest matrices find room
 /// behind them in the arena to be rearranged from), then the blocks, then
-/// the draft block.
+/// the MTP block.
 fn tables<'g>(
     layout: &mut Layout<'g, '_>,
     c: &Config,
@@ -772,7 +772,7 @@ fn tables<'g>(
     // (below).
     let tied = w.output.is_none();
     if own_draft.is_some() && !plan.embedding {
-        return Err(ModelError::Invalid("the draft block's device does not embed".into()));
+        return Err(ModelError::Invalid("the MTP block's device does not embed".into()));
     }
     let chain_tokens = own_mtp.map(|d| match order {
         Some(order) => runs_of(&order[..d.head_rows as usize]),
@@ -783,12 +783,12 @@ fn tables<'g>(
         _ => None,
     };
     // The head's logits are wanted for the rows of a decode step and for
-    // one row of a prompt. The draft block reads the head's first rows as
+    // one row of a prompt. The MTP block reads the head's first rows as
     // a matrix of their own (the draft vocabulary): where those are not
     // all rows of the head here, they are laid out apart from the rest.
     let head_usage = Usage { decode_rows: model.decode_rows, prompt: false };
     let draft_rows = own_draft.map(|d| d.head_rows as usize);
-    // A tied head with a draft block here is one matrix in the file's
+    // A tied head with an MTP block here is one matrix in the file's
     // layout, so that its first rows are the rows of the draft head and of
     // the embedding the chain reads.
     let in_file = tied && own_mtp.is_some();
@@ -828,7 +828,7 @@ fn tables<'g>(
         }),
         (Some(_), None) => {
             return Err(ModelError::Invalid(
-                "the draft block's device holds no row of the output head".into(),
+                "the MTP block's device holds no row of the output head".into(),
             ));
         }
         (None, _) => None,
@@ -845,7 +845,7 @@ fn tables<'g>(
         _ => None,
     };
     let draft = match (own_mtp, &head) {
-        (Some(plan), Some(head)) => Some(draft_block(layout, c, w, plan, head)?),
+        (Some(plan), Some(head)) => Some(mtp(layout, c, w, plan, head)?),
         _ => None,
     };
     Ok(Tables { blocks, embedding, output_norm, head, head_tokens, draft, draft_head })
@@ -918,15 +918,15 @@ fn draft_head_of(plan: &DraftPlan, head: &HeadW) -> Result<Mat, ModelError> {
     Ok(draft_head)
 }
 
-/// Lays out the draft block: the model's next-token-prediction block with all
+/// Lays out the MTP block: the model's next-token-prediction block with all
 /// its heads, and the draft head as the first rows of `head`.
-fn draft_block<'g>(
+fn mtp<'g>(
     layout: &mut Layout<'g, '_>,
     c: &Config,
     w: &Weights<'g>,
     plan: &DraftPlan,
     head: &HeadW,
-) -> Result<DraftW, ModelError> {
+) -> Result<MtpW, ModelError> {
     let n = w.nextn.as_ref().ok_or_else(|| {
         ModelError::Invalid("the model has no next-token-prediction block".into())
     })?;
@@ -989,7 +989,7 @@ fn draft_block<'g>(
         [columns_shape(&n.eh_proj, &one(0..d))?, columns_shape(&n.eh_proj, &one(d..2 * d))?];
     let proj_e = layout.choose(&halves[..1], follows, Prep::Launch, None)?;
     let proj_h = layout.choose(&halves[1..], follows, Prep::Launch, None)?;
-    Ok(DraftW {
+    Ok(MtpW {
         proj_e: layout.columns(&n.eh_proj, one(0..d), proj_e[0]),
         proj_h: layout.columns(&n.eh_proj, one(d..2 * d), proj_h[0]),
         enorm: layout.floats(&n.enorm),

@@ -246,7 +246,7 @@ fn draft_vocabulary() -> Option<Arc<[u32]>> {
 /// Tokens per second of a request that writes from nothing and of one that
 /// writes its prompt again with edits, in German and in English, with the
 /// window `ARES_WIRE_CASE` names (none, or w4, w8, w16: the rows of a
-/// sequence's window, the model's draft block and the n-gram drafter
+/// sequence's window, the model's MTP block and the n-gram drafter
 /// as the policy chooses them for every step). The model runs as it is
 /// served: a tensor split over both devices, the fast kernels, the most
 /// probable token.

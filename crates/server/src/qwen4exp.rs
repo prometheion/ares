@@ -21,7 +21,7 @@ use ares_model::qwen4exp::device::{
     Options, ProfileFound, ProfileReport, PruneSetup, Qwen4Exp, SessionOptions, Spread,
     TensorChoice, place, profile_key, step_rows,
 };
-use ares_model::qwen4exp::{Config, DraftWeights};
+use ares_model::qwen4exp::{Config, MtpWeights};
 use ares_runtime::expert_store::ExpertNeighbours;
 use ares_runtime::{GpuConfig, Model, Runtime, RuntimeConfig, SsdConfig, required_ram};
 use ares_tokenizer::Tokenizer;
@@ -139,7 +139,7 @@ pub(crate) fn load(
         .map(|path| {
             let named = |e: String| refuse(format!("--drafters {}: {e}", path.display()));
             let file = Gguf::open(&path).map_err(|e| named(e.to_string()))?;
-            DraftWeights::load(&file, &config).map_err(|e| named(e.to_string()))?;
+            MtpWeights::load(&file, &config).map_err(|e| named(e.to_string()))?;
             Ok::<_, LoadError>((path, file))
         })
         .transpose()?;
@@ -406,7 +406,7 @@ pub(crate) fn load(
     let drafting = drafts;
     if let Some((path, file)) = drafter {
         model = model
-            .with_draft(file)
+            .with_mtp(file)
             .map_err(|e| LoadError::Model(format!("--drafters {}: {e}", path.display())))?;
     }
     if let Some(file) = dflash.clone() {
@@ -619,9 +619,9 @@ pub(crate) fn load(
             100.0 * ram_slots as f64 / all as f64,
         );
     }
-    if let Some(report) = model.draft_report() {
+    if let Some(report) = model.mtp_report() {
         watch_drafts(std::sync::Arc::downgrade(&model));
-        let (vram, ram_slots) = model.draft_slots().unwrap_or((0, 0));
+        let (vram, ram_slots) = model.mtp_slots().unwrap_or((0, 0));
         tracing::info!(
             "MTP block, on device {}: dense weights {}, K, V and keys {}, buffers {}; its {} \
              experts share the tiers: {vram} slots in VRAM, {ram_slots} in RAM",
@@ -886,7 +886,7 @@ fn watch_drafts(model: std::sync::Weak<Qwen4Exp>) {
         loop {
             std::thread::sleep(DRAFT_WATCH);
             let Some(model) = model.upgrade() else { return };
-            let times = model.draft_times();
+            let times = model.mtp_times();
             if times.links == links {
                 continue;
             }

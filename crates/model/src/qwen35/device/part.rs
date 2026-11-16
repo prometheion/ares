@@ -43,13 +43,13 @@ use crate::blocks::recurrent::{self, Inputs, Recurrent};
 use crate::blocks::slots::{Arena, Checkpoint, Extent, Places, SlotLayout};
 
 pub use crate::blocks::slots::CopyTimes;
-pub use mtp::{DraftBytes, DraftChain, DraftStep, DraftTimes, Drafted};
+pub use mtp::{Drafted, MtpBytes, MtpChain, MtpStep, MtpTimes};
 pub(crate) use resume::declared;
 pub use resume::{checkpoint_bytes, state_slot_bytes};
 
 pub use crate::blocks::PAGE_ENTRY;
 
-/// The formats of K and of V of the draft block: 4 bits, whatever the model's.
+/// The formats of K and of V of the MTP block: 4 bits, whatever the model's.
 /// The block's keys and values are read to propose a token that the model then
 /// verifies, and they cost the same VRAM per cell as any layer's. With them in
 /// `q4` against `q8` the share of drafts the model accepts is the same: the
@@ -57,7 +57,7 @@ pub use crate::blocks::PAGE_ENTRY;
 /// sampled), the second 65.8 % against 64.7 % and 66.6 % against 64.5 %, over
 /// 11 000 drafts each (Qwen3.8-27B, German, English and code); the differences
 /// are inside the noise (`z` below 1.3).
-pub const DRAFT_KV: (CacheFormat, CacheFormat) = (CacheFormat::Q4, CacheFormat::Q4);
+pub const MTP_KV: (CacheFormat, CacheFormat) = (CacheFormat::Q4, CacheFormat::Q4);
 
 /// The partly used pages (tails) per sequence slot that the prefix cache may
 /// hold. A tail keeps an exact entry for as long as it exists, so the exact
@@ -103,7 +103,7 @@ pub struct Options {
     /// The most rows of a step that verifies drafts (a window whose rows may
     /// be rejected keeps its inputs per recurrent block); 0 for none.
     pub window_rows: u32,
-    /// The tokens the model's own draft block may propose (a model with a
+    /// The tokens the model's MTP block may propose (a model with a
     /// next-token-prediction block drafts with it whenever `window_rows`
     /// allows drafts): the rows of these tokens come first in the output
     /// head, and the draft head reads only them. `None`: the tokens whose
@@ -112,7 +112,7 @@ pub struct Options {
     pub draft_vocabulary: Option<Arc<[u32]>>,
     /// Whether the next-token-prediction block drafts, when the model has one
     /// and windows may carry drafts.
-    pub draft_block: bool,
+    pub mtp: bool,
     /// A DFlash drafter from a file of its own: it drafts when windows may
     /// carry drafts, on the device that embeds (not under a layer split).
     pub dflash: Option<Arc<crate::dflash::File>>,
@@ -145,7 +145,7 @@ impl Default for Options {
             logit_rows: 8,
             window_rows: 0,
             draft_vocabulary: None,
-            draft_block: true,
+            mtp: true,
             dflash: None,
             pipeline_rows: 256,
             profile: None,
@@ -532,7 +532,7 @@ pub struct Part {
     /// decode kernels in several launches ([`Part::in_batches`]).
     batched: std::cell::Cell<bool>,
     page_bytes: u64,
-    /// The model's own draft block, on the device that holds it.
+    /// The model's MTP block, on the device that holds it.
     mtp: Option<mtp::Mtp>,
     /// A DFlash drafter from a file of its own, on the device of the draft
     /// plan.
@@ -567,15 +567,15 @@ pub fn page_bytes(c: &Config, placement: &Placement, index: usize, opts: &Option
                 .then(|| geometry(c, opts.kv, slice.heads.len() as u32).converted_entry_bytes())
         })
         .sum::<u64>()
-        // The draft block's keys and values, on the device that holds it.
+        // The MTP block's keys and values, on the device that holds it.
         + placement.mtp().filter(|d| d.device == index).map_or(0, |_| {
-            geometry(c, DRAFT_KV, c.attention.n_head_kv as u32).converted_entry_bytes()
+            geometry(c, MTP_KV, c.attention.n_head_kv as u32).converted_entry_bytes()
         })
 }
 
 /// The bytes of exact K/V entries a device holds for `slots` sequences, when
 /// the formats of `opts` have a tile mean: the exact pool of its attention
-/// blocks and of its draft block.
+/// blocks and of its MTP block.
 pub fn exact_bytes(
     c: &Config,
     placement: &Placement,
@@ -597,11 +597,11 @@ pub fn exact_bytes(
     let draft: Vec<CacheGeometry> = placement
         .mtp()
         .filter(|d| d.device == index)
-        .map(|_| geometry(c, DRAFT_KV, c.attention.n_head_kv as u32))
+        .map(|_| geometry(c, MTP_KV, c.attention.n_head_kv as u32))
         .into_iter()
         .collect();
     kv::exact_pool_bytes(&main, kv::slots_for(opts.kv.0, opts.kv.1, sizing))
-        + kv::exact_pool_bytes(&draft, kv::slots_for(DRAFT_KV.0, DRAFT_KV.1, sizing))
+        + kv::exact_pool_bytes(&draft, kv::slots_for(MTP_KV.0, MTP_KV.1, sizing))
 }
 
 fn geometry(c: &Config, kv: (CacheFormat, CacheFormat), kv_heads: u32) -> CacheGeometry {
@@ -765,11 +765,11 @@ impl Part {
             table_stride,
             false,
         )?;
-        // The draft block: its pool after the blocks', and room in the step's
+        // The MTP block: its pool after the blocks', and room in the step's
         // buffers for the rows it computes there (`mtp.rs`).
-        let draft_sizes = mtp::sizes(c, &w, max_slots, pages, plan_config.target_blocks, pool);
-        let without_draft = (hq, hkv, state_slots);
-        if let Some(sizes) = &draft_sizes {
+        let mtp_sizes = mtp::sizes(c, &w, max_slots, pages, plan_config.target_blocks, pool);
+        let without_mtp = (hq, hkv, state_slots);
+        if let Some(sizes) = &mtp_sizes {
             pool += sizes.pool;
             hq = hq.max(sizes.kv_values);
             hkv = hkv.max(sizes.kv_values);
@@ -835,7 +835,7 @@ impl Part {
                 d as u32,
                 opts.logit_rows.next_multiple_of(MAX_BATCH),
             ))
-            .max(draft_sizes.as_ref().map_or(0, |sizes| sizes.act_q))
+            .max(mtp_sizes.as_ref().map_or(0, |sizes| sizes.act_q))
                 + 256,
         );
         s.act_h = take(
@@ -844,7 +844,7 @@ impl Part {
                 widest as u32,
                 opts.max_rows.max(opts.logit_rows),
             )
-            .max(draft_sizes.as_ref().map_or(0, |sizes| sizes.act_h)),
+            .max(mtp_sizes.as_ref().map_or(0, |sizes| sizes.act_h)),
         );
         s.picked = take(logit_rows * d * 4);
         s.logits = take(logit_rows * head_rows * 4);
@@ -884,7 +884,7 @@ impl Part {
             (heads.len() as u64 * (groups * (64 << 10) + 96 * rows)).next_multiple_of(64).max(64)
         };
         ledger.reserve("qwen35 attention plans", plan_bytes)?;
-        let has_attention = attention_at.iter().any(Option::is_some) || draft_sizes.is_some();
+        let has_attention = attention_at.iter().any(Option::is_some) || mtp_sizes.is_some();
         let attention = has_attention.then(|| AttentionKernels::load(device)).transpose()?;
         let marks = opts.profile.as_ref().map(|profile| Marks {
             profile: profile.clone(),
@@ -892,10 +892,10 @@ impl Part {
             merges: Vec::new(),
             phases: Vec::new(),
         });
-        // What the step's buffers grew by for the draft block, at most: K and
+        // What the step's buffers grew by for the MTP block, at most: K and
         // V of all its heads, queries as wide, partial states.
-        let draft_growth = rows * 4 * (2 * (hkv - without_draft.1) + 5 * (hq - without_draft.0))
-            + (state_slots - without_draft.2);
+        let mtp_growth = rows * 4 * (2 * (hkv - without_mtp.1) + 5 * (hq - without_mtp.0))
+            + (state_slots - without_mtp.2);
         let mtp = mtp::Mtp::open(
             c,
             device,
@@ -903,8 +903,8 @@ impl Part {
             &w,
             opts,
             mtp::Setup { max_slots, pages, table_stride, main_exact: exact_slots > 0 },
-            draft_sizes,
-            draft_growth,
+            mtp_sizes,
+            mtp_growth,
         )?;
         let dflash = dflash::open(c, weights, placement, opts, index, device, ledger, max_slots)?;
         // A checkpoint is the slot's recurrent state and, where the draft
@@ -1017,7 +1017,7 @@ impl Part {
         self.kv.bytes()
     }
 
-    /// The exact slots of the attention blocks and of the draft block: how many
+    /// The exact slots of the attention blocks and of the MTP block: how many
     /// there are and how many hold a page now.
     pub fn exact_slots(&self) -> [(u32, u32); 2] {
         [self.kv.slots(), self.mtp.as_ref().map_or((0, 0), |m| m.kv.slots())]
@@ -1112,7 +1112,7 @@ impl Part {
     /// run: the next step's enqueue calls this, and a caller that reads the
     /// profile after the last step does.
     pub fn flush_profile(&mut self) -> Result<(), ModelError> {
-        self.draft_flush()?;
+        self.mtp_flush()?;
         let Some(marks) = &mut self.marks else { return Ok(()) };
         if marks.phases.len() > 1 {
             let mut ms = [0.0f64; 6];
@@ -1656,23 +1656,23 @@ impl Part {
         let (kernels, status) = (self.attention.as_ref(), self.at(self.s.status));
         let (stream, tables, pages) = (env.stream, env.tables, env.pages);
         self.kv.prepare(kernels, stream, &reaches, &self.page_tab, tables, pages, status, true)?;
-        self.prepare_draft_kv(env, &reaches)
+        self.prepare_mtp_kv(env, &reaches)
     }
 
-    /// The draft block's part of [`Part::prepare_kv`]: its exact entries and
+    /// The MTP block's part of [`Part::prepare_kv`]: its exact entries and
     /// table for the cells the step's rows reach.
-    fn prepare_draft_kv(&mut self, env: &StepEnv<'_>, reaches: &[Reach]) -> Result<(), ModelError> {
+    fn prepare_mtp_kv(&mut self, env: &StepEnv<'_>, reaches: &[Reach]) -> Result<(), ModelError> {
         let (kernels, status) = (self.attention.as_ref(), self.at(self.s.status));
         let (stream, tables, pages) = (env.stream, env.tables, env.pages);
         if let Some(m) = &mut self.mtp {
-            // The draft block attends a link at a time: no window reads its tiles.
+            // The MTP block attends a link at a time: no window reads its tiles.
             m.kv.prepare(kernels, stream, reaches, &self.page_tab, tables, pages, status, false)?;
         }
         Ok(())
     }
 
-    /// A step that only drafts: the chains of the draft block for the windows
-    /// of [`Part::draft_step`], and nothing of the model. The block's cells of
+    /// A step that only drafts: the chains of the MTP block for the windows
+    /// of [`Part::mtp_step`], and nothing of the model. The block's cells of
     /// the chain are provisional as in any step; the round that verifies the
     /// drafts writes them from the model's hidden states.
     pub fn enqueue_chains(&mut self, env: &StepEnv<'_>) -> Result<(), ModelError> {
@@ -1683,8 +1683,8 @@ impl Part {
             ));
         }
         let reaches = kv::reaches(env.segments, env.replay);
-        self.prepare_draft_kv(env, &reaches)?;
-        self.draft_before(env)
+        self.prepare_mtp_kv(env, &reaches)?;
+        self.mtp_before(env)
     }
 
     /// Tells the part that the pool freed these pages, so it gives back what
@@ -1793,9 +1793,9 @@ impl Part {
         self.dflash_begin(env)?;
         self.start_sequences(env)?;
         self.stage_embedding(env)?;
-        // The draft block's chains come first: the rows that verify their
+        // The MTP block's chains come first: the rows that verify their
         // drafts read them from the step record.
-        self.draft_before(env)?;
+        self.mtp_before(env)?;
         if self.split == Split::Tensor {
             self.enqueue_tensor(env)?;
         } else if self.groups.is_empty() {
@@ -1838,7 +1838,7 @@ impl Part {
             result?;
         }
         let logits = self.enqueue_head(env)?;
-        self.draft_after(env)?;
+        self.mtp_after(env)?;
         self.dflash_inject(env)?;
         self.finish(env)?;
         Ok(logits)
@@ -1893,7 +1893,7 @@ impl Part {
         if !std::mem::take(&mut self.has_deferred) {
             return Err(invalid("there is no draft window to commit"));
         }
-        self.draft_commit(stream, step, dims)?;
+        self.mtp_commit(stream, step, dims)?;
         for (block, at) in self.w.blocks.iter().zip(&self.recurrent_at) {
             let (MixerW::Recurrent(r), Some(at)) = (&block.mixer, at) else { continue };
             // (A part without recurrent blocks keeps no inputs and has

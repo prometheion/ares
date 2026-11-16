@@ -25,7 +25,7 @@
 //! The profile is per layer of the model and expert, whatever the placement:
 //! when both devices share every layer, an expert's heat is the larger of
 //! the two halves of the store's layer, and it is seeded where the expert is
-//! owned. The draft block's experts are not in it.
+//! owned. The MTP block's experts are not in it.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};

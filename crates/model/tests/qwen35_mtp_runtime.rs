@@ -12,7 +12,7 @@
 //!   the most probable token and for sampled tokens (same seed);
 //! - drafts are made on the device and a good share of them is accepted;
 //! - the same with the DFlash drafter (`ARES_TEST_DFLASH_27B` names its file),
-//!   alone and next to the draft block.
+//!   alone and next to the MTP block.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, mpsc};
@@ -92,13 +92,13 @@ fn answers(
     answers_with(model, vocabulary, drafts, questions, true, None)
 }
 
-/// [`answers`] with the draft block or not, and a DFlash drafter or not.
+/// [`answers`] with the MTP block or not, and a DFlash drafter or not.
 fn answers_with(
     model: &Path,
     vocabulary: Option<&Arc<[u32]>>,
     drafts: u32,
     questions: &[&str],
-    draft_block: bool,
+    mtp: bool,
     dflash: Option<&Arc<ares_model::dflash::File>>,
 ) -> (Vec<String>, Counters) {
     let options = kv_env::with_env(Options {
@@ -107,7 +107,7 @@ fn answers_with(
         logit_rows: 16,
         window_rows: if drafts > 0 { drafts + 1 } else { 0 },
         draft_vocabulary: vocabulary.cloned(),
-        draft_block,
+        mtp,
         dflash: dflash.cloned(),
         ..Options::default()
     });
@@ -238,14 +238,14 @@ fn the_text_with_dflash_drafts_is_the_text_without() {
         "Write a Python function that returns the n-th Fibonacci number.",
     ];
     let (plain, _) = answers(&model, vocabulary.as_ref(), 0, &questions);
-    for draft_block in [false, true] {
+    for mtp in [false, true] {
         let (drafted, counters) =
-            answers_with(&model, vocabulary.as_ref(), 7, &questions, draft_block, Some(&file));
+            answers_with(&model, vocabulary.as_ref(), 7, &questions, mtp, Some(&file));
         let (tested, accepted) = (counters.drafts_tested_at[2], counters.drafts_accepted_at[2]);
         eprintln!(
             "RES dflash{}: {} passes, {:.2} ms per drafting step; accepted by position {:?} of \
              {:?}; block accepted {:?} of {:?}; {} tokens in {} steps",
-            if draft_block { " and draft block" } else { "" },
+            if mtp { " and MTP block" } else { "" },
             counters.model_draft_steps,
             counters.model_draft_us as f64 / 1e3 / counters.model_draft_steps.max(1) as f64,
             &accepted[..7],
@@ -260,7 +260,7 @@ fn the_text_with_dflash_drafts_is_the_text_without() {
             eprintln!("RES answer {i}: {same} of {} characters equal", a.chars().count());
         }
         assert_eq!(plain, drafted, "the DFlash drafts changed the text");
-        if !draft_block {
+        if !mtp {
             assert!(tested[0] >= 20, "the DFlash drafter drafted: {tested:?}");
             assert!(accepted[0] * 3 >= tested[0], "a third of the first drafts: {accepted:?}");
         }

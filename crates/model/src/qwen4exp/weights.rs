@@ -93,7 +93,7 @@ impl<'g> Matrix<'g> {
 /// expert `e` is the `e`-th contiguous slab of `rows` rows. Nothing is read
 /// until an expert is asked for.
 ///
-/// A file that stores two kinds in one tensor (the draft block's gate and up)
+/// A file that stores two kinds in one tensor (the MTP block's gate and up)
 /// gives two stacks over the same bytes: the slabs of a stack are then `stride`
 /// bytes apart and start `skip` bytes into the tensor.
 #[derive(Clone, Copy, Debug)]
@@ -397,12 +397,12 @@ impl<'g> Weights<'g> {
     }
 }
 
-/// The weights of the model's draft block (section 4 of the specification):
+/// The weights of the model's MTP block (section 4 of the specification):
 /// one layer of the attention kind with its own mixture of experts, the two
 /// projections that make its input, and its own final mixer. Its output head
 /// is the model's.
 #[derive(Clone, Debug)]
-pub struct DraftWeights<'g> {
+pub struct MtpWeights<'g> {
     /// Norm weight over the embedding of the paired token, `N` values
     /// (`pre_fc_norm_embedding`).
     pub norm_embedding: Vec<f32>,
@@ -420,20 +420,20 @@ pub struct DraftWeights<'g> {
     pub output_mixer: StreamMixer<'g>,
 }
 
-/// The value of `general.architecture` in a file that holds a draft block as
+/// The value of `general.architecture` in a file that holds an MTP block as
 /// Strata packs it: the checkpoint's tensor names under `mtp.`, norm weights
 /// as the checkpoint has them, gate and up of the routed experts in one tensor
 /// and the indexer's two projections in one.
 pub const DRAFT_ARCHITECTURE: &str = "qwen4exp-mtp";
 
-impl<'g> DraftWeights<'g> {
+impl<'g> MtpWeights<'g> {
     /// Builds the table from the tensors of `gguf`, a file of the architecture
     /// [`DRAFT_ARCHITECTURE`], for the model `config` describes: every shape
     /// must be that of the model's own attention layers.
     pub fn load(gguf: &'g Gguf, config: &Config) -> Result<Self> {
         let found = gguf.architecture().unwrap_or_default();
         if found != DRAFT_ARCHITECTURE {
-            return Err(Error::NotADraftBlock {
+            return Err(Error::NotAnMtpBlock {
                 found: found.to_owned(),
                 expected: DRAFT_ARCHITECTURE,
             });
@@ -521,7 +521,7 @@ impl<'g> DraftWeights<'g> {
     }
 }
 
-/// Where one matrix of every routed expert of a draft block is in the block's
+/// Where one matrix of every routed expert of an MTP block is in the block's
 /// file: the part of the file, the offset of expert 0's matrix, the bytes
 /// from one expert's matrix to the next, and the bytes of a matrix.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -536,7 +536,7 @@ pub struct ExpertPlace {
     pub len: usize,
 }
 
-impl DraftWeights<'_> {
+impl MtpWeights<'_> {
     /// Where gate, up and down of the routed experts are in `gguf`, the file
     /// the table was built from: what a reader of the file needs to fetch an
     /// expert. `None` when `gguf` is another file.
@@ -642,7 +642,7 @@ impl<'g> Loader<'g> {
     }
 
     /// A vector whose stored values are `w` of a norm that multiplies by
-    /// `1 + w` (the draft block's file keeps the checkpoint's values).
+    /// `1 + w` (the MTP block's file keeps the checkpoint's values).
     fn norm_plus_one(&mut self, name: &str, len: usize) -> Result<Vec<f32>> {
         let mut w = self.vector(name, len)?;
         for v in &mut w {

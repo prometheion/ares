@@ -24,7 +24,7 @@ use ares_model::qwen4exp::device::{
 };
 use ares_model::qwen4exp::synthetic::{NgramShape, Shape, Synthetic, Types};
 use ares_model::qwen4exp::{
-    Config, DraftState, DraftWeights, LogitRows, Reference, SequenceState, Weights,
+    Config, LogitRows, MtpState, MtpWeights, Reference, SequenceState, Weights,
 };
 use ares_runtime::expert_store::Serve;
 use ares_runtime::{
@@ -345,7 +345,7 @@ fn start_at(
     start_with(path, None, placement, pages, config, rows, Cache::On)
 }
 
-/// The file of a made-up draft block for the made-up model of `seed`, its
+/// The file of a made-up MTP block for the made-up model of `seed`, its
 /// experts in the types of the model's.
 fn draft_path(seed: u64) -> PathBuf {
     let path = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("q4rt-{seed}-draft.gguf"));
@@ -354,7 +354,7 @@ fn draft_path(seed: u64) -> PathBuf {
     path
 }
 
-/// [`start`] for a model that drafts with its draft block: windows of up to
+/// [`start`] for a model that drafts with its MTP block: windows of up to
 /// eight rows.
 fn start_drafting(seed: u64, placement: Placement, pages: u32) -> (Runtime, Arc<Qwen4Exp>) {
     let config = RuntimeConfig { window_rows: 8, ..RuntimeConfig::default() };
@@ -390,7 +390,7 @@ fn start_drafting_unpriced(
     )
 }
 
-/// [`start_at`], with the draft block of the file `draft` when there is one.
+/// [`start_at`], with the MTP block of the file `draft` when there is one.
 fn start_with(
     path: &std::path::Path,
     draft: Option<&std::path::Path>,
@@ -407,7 +407,7 @@ fn start_with(
     let mut inner =
         Qwen4Exp::new(gguf, byte_tokenizer(None), "made", &devices, opts, CELLS).unwrap();
     if let Some(draft) = draft {
-        inner = inner.with_draft(Gguf::open(draft).unwrap()).expect("the draft block fits");
+        inner = inner.with_mtp(Gguf::open(draft).unwrap()).expect("the MTP block fits");
     }
     let inner = Arc::new(inner);
     let config = RuntimeConfig { pages, cells_per_page: 128, max_slots: SLOTS, ..config };
@@ -496,8 +496,8 @@ fn warm(model: &Qwen4Exp) {
         vram_slots >= model.config().n_layer * model.config().experts.count,
         "every expert has a slot"
     );
-    if let Some((vram_slots, _)) = model.draft_slots() {
-        assert!(vram_slots >= model.config().experts.count, "every expert of the draft block");
+    if let Some((vram_slots, _)) = model.mtp_slots() {
+        assert!(vram_slots >= model.config().experts.count, "every expert of the MTP block");
     }
     model.take_store_stats();
 }
@@ -968,7 +968,7 @@ fn a_cancelled_request_frees_its_place_for_the_next() {
 }
 
 /// The tokens `prompt` and what a request wrote after it, as the CPU
-/// reference of the model and of its draft block see them: the residual
+/// reference of the model and of its MTP block see them: the residual
 /// after the last layer of every cell, and the block's cells that follow.
 struct Followed {
     tokens: Vec<u32>,
@@ -976,13 +976,13 @@ struct Followed {
     wide: usize,
 }
 
-/// The chains the draft block of the made-up model `seed` made for a request
+/// The chains the MTP block of the made-up model `seed` made for a request
 /// that read `prompt` and wrote `answer`, against the CPU reference's chains
 /// from the same cells: per link, how many were compared (a link is compared
 /// when the links before it agreed) and how many agreed.
 fn chains_against_the_reference(
     seed: u64,
-    chains: &[ares_model::qwen4exp::device::Drafted],
+    chains: &[ares_model::qwen4exp::device::MtpDrafted],
     prompt: &[u32],
     answer: &[u32],
 ) -> ([usize; 8], [usize; 8]) {
@@ -990,7 +990,7 @@ fn chains_against_the_reference(
     let file = Gguf::open(draft_path(seed)).unwrap();
     let c = Config::from_gguf(&gguf).unwrap();
     let w = Weights::load(&gguf, &c).unwrap();
-    let head = DraftWeights::load(&file, &c).unwrap();
+    let head = MtpWeights::load(&file, &c).unwrap();
     let reference = Reference::new(&c, &w);
     let tokens: Vec<u32> = prompt.iter().chain(answer).copied().collect();
     let trunk = reference.window(&SequenceState::new(&c), &tokens, LogitRows::All).unwrap();
@@ -1008,7 +1008,7 @@ fn chains_against_the_reference(
     let follow = reference
         .draft_window(
             &head,
-            &DraftState::new(),
+            &MtpState::new(),
             &f.trunk[..cells * f.wide],
             &f.tokens[1..],
             LogitRows::None,
@@ -1022,8 +1022,8 @@ fn chains_against_the_reference(
         if newest == 0 || newest >= f.tokens.len() || f.tokens[newest] != chain.token {
             continue;
         }
-        let mut state = DraftState::new();
-        reference.draft_commit(&mut state, &follow, newest - 1).unwrap();
+        let mut state = MtpState::new();
+        reference.mtp_commit(&mut state, &follow, newest - 1).unwrap();
         let row = &f.trunk[(newest - 1) * f.wide..newest * f.wide];
         let want =
             reference.draft_chain(&head, &state, row, chain.token, chain.drafts.len()).unwrap();
@@ -1043,13 +1043,13 @@ fn chains_against_the_reference(
     (compared, agreed)
 }
 
-/// The model drafts with its own draft block in every placement, and the
+/// The model drafts with its own MTP block in every placement, and the
 /// block on the device drafts what the CPU reference's chain drafts from the
 /// same cells: its input from the model's residual and the paired token, its
 /// keys and values of the cells the model has passed, its experts through
 /// the store, its own final mixer and the model's head, link after link.
 #[test]
-fn the_draft_block_drafts_what_the_reference_drafts_in_every_placement() {
+fn the_mtp_block_drafts_what_the_reference_drafts_in_every_placement() {
     if !enabled() {
         return;
     }
@@ -1057,13 +1057,13 @@ fn the_draft_block_drafts_what_the_reference_drafts_in_every_placement() {
     for placement in placements() {
         let (runtime, model) = start_drafting_unpriced(1, placement, 16);
         warm(&model);
-        model.take_drafted();
+        model.take_mtp_chains();
         let answer = ask(&runtime, 1, &prompt, 40);
         assert_nothing_missed(&model, "an answer with drafts and filled tiers");
-        let chains = model.take_drafted();
+        let chains = model.take_mtp_chains();
         let counters = runtime.snapshot().expect("the runtime is running").counters;
-        let report = model.draft_report().expect("the model has a draft block");
-        let times = model.draft_times();
+        let report = model.mtp_report().expect("the model has an MTP block");
+        let times = model.mtp_times();
         runtime.shutdown();
         let (compared, agreed) = chains_against_the_reference(1, &chains, &prompt, &answer);
         eprintln!(
@@ -1098,7 +1098,7 @@ fn the_draft_block_drafts_what_the_reference_drafts_in_every_placement() {
     }
 }
 
-/// Drafts change no token: with the draft block a reply is what it is
+/// Drafts change no token: with the MTP block a reply is what it is
 /// without, greedy and sampled with a seed, in every placement. The made-up
 /// block guesses badly, so most of its drafts are rejected and rolled back;
 /// the text repeats and the request is asked again, so that the n-gram drafter in
@@ -1151,7 +1151,7 @@ fn drafts_change_no_token_in_any_placement() {
         );
         assert_nothing_missed(&model, "the answers with drafts and filled tiers");
         let counters = runtime.snapshot().expect("the runtime is running").counters;
-        let times = model.draft_times();
+        let times = model.mtp_times();
         runtime.shutdown();
         eprintln!(
             "RES {placement:?}: {} tokens; draft rows {}, accepted {}, rejected {}; the block \
@@ -1271,7 +1271,7 @@ fn start_flash_with(
     let mut inner =
         Qwen4Exp::new(gguf, byte_tokenizer(None), "made", &devices, opts, CELLS).unwrap();
     if let Some(draft) = draft {
-        inner = inner.with_draft(Gguf::open(draft).unwrap()).expect("the draft block fits");
+        inner = inner.with_mtp(Gguf::open(draft).unwrap()).expect("the MTP block fits");
     }
     let window = match (&dflash, draft) {
         (Some(_), _) => 8,
@@ -1319,7 +1319,7 @@ fn flash_next_writes_with_drafts_what_it_writes_without() {
     ) else {
         eprintln!(
             "skipped: set ARES_TEST_QWEN4EXP_MODEL to the first part of Flash-Next and \
-             ARES_TEST_QWEN4EXP_DRAFT to the file of its draft block"
+             ARES_TEST_QWEN4EXP_DRAFT to the file of its MTP block"
         );
         return;
     };
@@ -1331,7 +1331,7 @@ fn flash_next_writes_with_drafts_what_it_writes_without() {
     let drafted = ask(&runtime, 1, &FLASH_PROMPT, 64);
     let (sampled, _) = ask_sampled(&runtime, 2, &FLASH_PROMPT, 48, seeded.clone(), true);
     let counters = runtime.snapshot().expect("the runtime is running").counters;
-    let times = model.draft_times();
+    let times = model.mtp_times();
     let (plain, _) = ask_sampled(&runtime, 3, &FLASH_PROMPT, 64, greedy, false);
     let (plain_seeded, _) = ask_sampled(&runtime, 4, &FLASH_PROMPT, 48, seeded, false);
     let undrafted = runtime.snapshot().expect("the runtime is running").counters.draft_rows

@@ -13,17 +13,17 @@
 //!   tokens, in the order of its rows, into a staging buffer and uploads them
 //!   on its stream beside the step record, in one copy. The gather decodes
 //!   them where they lie, as it decodes any table.
-//! - **The device itself.** The tokens the draft block's chain picks on the
+//! - **The device itself.** The tokens the MTP block's chain picks on the
 //!   device, inside the step, are not known to the host. The device therefore
 //!   keeps the rows of every token the chain can pick: the rows of the draft
 //!   head (`KeptW` in `load.rs`), which are those of the draft vocabulary, or
 //!   without one the first rows of the head on the device. A device without a
-//!   draft block keeps no row, and a draft block that can pick every token
+//!   MTP block keeps no row, and an MTP block that can pick every token
 //!   keeps the whole table and needs nothing from the host.
 //!
 //! A tied model (a file without `output.weight`, whose head is the table)
 //! has no rows of its own to keep for the chain: the head's rows on the
-//! draft block's device are laid out in the file's layout, and the rows of
+//! MTP block's device are laid out in the file's layout, and the rows of
 //! the draft head, which are the first ones, serve the gather as well.
 
 use ares_core::GgmlType;

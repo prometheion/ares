@@ -9,8 +9,8 @@
 //!   slot starts from zeros ([`Arena::clear_starting`]).
 //! - **A checkpoint** of a device part ([`Checkpoint`]) is what a sequence
 //!   resumes from on that device: its slot of the arena and whatever else a
-//!   model keeps of a sequence outside it ([`Extent`]: a draft block's carry,
-//!   or the arena of a draft block that is a part of its own), and bytes the
+//!   model keeps of a sequence outside it ([`Extent`]: an MTP block's carry,
+//!   or the arena of an MTP block that is a part of its own), and bytes the
 //!   host keeps of the sequence itself (the tokens an n-gram feed reads). It
 //!   lies in page-locked host memory, in one of the places the conductor
 //!   names ([`Places`]): a save is a copy from the device and a restore a copy
@@ -555,7 +555,7 @@ pub(crate) struct PageGroup<'a> {
     pub pages: DevicePtr,
     pub kernels: &'a AttentionKernels,
     pub status: DevicePtr,
-    /// The group writes a cell after the model's cells of it (a draft block
+    /// The group writes a cell after the model's cells of it (an MTP block
     /// one token behind): a partly used page may have none of the group's
     /// cells yet, and then it has no exact entry in a group that keeps them,
     /// and a copy of it copies nothing of the group.

@@ -53,7 +53,7 @@ impl Part {
     /// What a page holds of the part in the pools at `pools`: the K/V group
     /// of its attention layers, and per attention layer the array of its
     /// pooled keys. `lags`: the part writes a cell after the model's cells of
-    /// it (the draft block).
+    /// it (the MTP block).
     pub(crate) fn page_parts(
         &mut self,
         pools: DevicePtr,

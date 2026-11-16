@@ -1,16 +1,16 @@
-//! The draft block of the model (section 4 of the specification): one layer of
+//! The MTP block of the model (section 4 of the specification): one layer of
 //! the attention kind that guesses one token further than the trunk.
 //!
 //! Cell `i` of the block pairs the trunk's residual after its last layer at
 //! cell `i` ([`Window::trunk_out`](super::Window::trunk_out)) with the token at
 //! cell `i + 1`; the largest logit of its row is a guess for the token at cell
 //! `i + 2`. A chain goes on at cell `i + 1` from the block's own residual of
-//! cell `i` ([`DraftWindow::out`]) and the token it guessed.
+//! cell `i` ([`MtpWindow::out`]) and the token it guessed.
 //!
-//! The block keeps cells of its own ([`DraftState`]): keys and values of every
+//! The block keeps cells of its own ([`MtpState`]): keys and values of every
 //! cell and the keys of its indexer, as an attention layer of the trunk does.
-//! Rows are run as a [`DraftWindow`], which does not change the state, and a
-//! prefix of them is committed with [`Reference::draft_commit`].
+//! Rows are run as a [`MtpWindow`], which does not change the state, and a
+//! prefix of them is committed with [`Reference::mtp_commit`].
 //!
 //! Where Strata and the fork differ (differences 8 to 10 of the
 //! specification): every stream of the residual is normed by itself, as the
@@ -24,27 +24,27 @@
 
 use crate::qwen4exp::config::Config;
 use crate::qwen4exp::error::{Error, Result};
-use crate::qwen4exp::weights::{DraftWeights, Mixer};
+use crate::qwen4exp::weights::{Mixer, MtpWeights};
 
 use super::ops::matmul;
 use super::{
     LayerRows, LayerState, LogitRows, Observer, Reference, Routing, commit_attention, pieces,
 };
 
-/// The cells of the draft block of one sequence.
+/// The cells of the MTP block of one sequence.
 #[derive(Clone, Debug, PartialEq)]
-pub struct DraftState {
+pub struct MtpState {
     position: usize,
     layer: LayerState,
 }
 
-impl Default for DraftState {
+impl Default for MtpState {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl DraftState {
+impl MtpState {
     /// The state of a block that has seen no cell.
     pub fn new() -> Self {
         Self {
@@ -81,9 +81,9 @@ impl DraftState {
     }
 }
 
-/// What rows of the draft block compute from a committed state.
+/// What rows of the MTP block compute from a committed state.
 #[derive(Clone, Debug)]
-pub struct DraftWindow {
+pub struct MtpWindow {
     /// The paired tokens of the rows.
     pub tokens: Vec<u32>,
     /// The cell of row 0.
@@ -106,7 +106,7 @@ pub struct DraftWindow {
     n_vocab: usize,
 }
 
-impl DraftWindow {
+impl MtpWindow {
     /// The number of rows.
     pub fn rows(&self) -> usize {
         self.tokens.len()
@@ -133,7 +133,7 @@ impl DraftWindow {
 }
 
 impl Reference<'_, '_> {
-    /// The input of the draft block for `n` rows: `rt` is the residual each
+    /// The input of the MTP block for `n` rows: `rt` is the residual each
     /// row starts from (`n * D` values: the trunk's after its last layer, or
     /// the block's own of the link before) and `tokens` the paired tokens.
     ///
@@ -147,7 +147,7 @@ impl Reference<'_, '_> {
     ///
     /// Panics when `rt` is not one row per token or a token is not in the
     /// vocabulary.
-    pub fn draft_input(&self, head: &DraftWeights<'_>, rt: &[f32], tokens: &[u32]) -> Vec<f32> {
+    pub fn mtp_input(&self, head: &MtpWeights<'_>, rt: &[f32], tokens: &[u32]) -> Vec<f32> {
         let c = self.config;
         let (n, n_embd, wide) = (tokens.len(), c.n_embd, c.wide());
         assert_eq!(rt.len(), n * wide, "rt must be one row of the residual per token");
@@ -174,19 +174,19 @@ impl Reference<'_, '_> {
         r
     }
 
-    /// Runs rows of the draft block from its committed `state`: row `t` is
+    /// Runs rows of the MTP block from its committed `state`: row `t` is
     /// cell `state.position() + t`, starts from `rt[t]` (`D` values) and is
     /// paired with `tokens[t]`. Rows of one call see the keys and values of
     /// the rows before them, as the rows of a trunk window do. The state is
     /// not changed.
     pub fn draft_window(
         &self,
-        head: &DraftWeights<'_>,
-        state: &DraftState,
+        head: &MtpWeights<'_>,
+        state: &MtpState,
         rt: &[f32],
         tokens: &[u32],
         logits: LogitRows,
-    ) -> Result<DraftWindow> {
+    ) -> Result<MtpWindow> {
         self.draft_window_observed(head, state, rt, tokens, logits, &mut ())
     }
 
@@ -194,13 +194,13 @@ impl Reference<'_, '_> {
     /// `config.n_layer`.
     pub fn draft_window_observed(
         &self,
-        head: &DraftWeights<'_>,
-        state: &DraftState,
+        head: &MtpWeights<'_>,
+        state: &MtpState,
         rt: &[f32],
         tokens: &[u32],
         logits: LogitRows,
         observer: &mut dyn Observer,
-    ) -> Result<DraftWindow> {
+    ) -> Result<MtpWindow> {
         let c = self.config;
         let n = tokens.len();
         if n == 0 {
@@ -215,11 +215,11 @@ impl Reference<'_, '_> {
         }
         let layer = c.n_layer;
         let Mixer::Attention(attention) = &head.layer.mixer else {
-            unreachable!("the draft block is loaded as an attention layer");
+            unreachable!("the MTP block is loaded as an attention layer");
         };
 
-        let input = self.draft_input(head, rt, tokens);
-        observer.tensor(Some(layer), "draft_in", n, &input);
+        let input = self.mtp_input(head, rt, tokens);
+        observer.tensor(Some(layer), "mtp_in", n, &input);
         let mut r = input.clone();
         let (m, inj) = self.read(&head.layer.attn_mixer, &r, n);
         observer.tensor(Some(layer), "attn_in", n, &m);
@@ -251,7 +251,7 @@ impl Reference<'_, '_> {
         } else {
             matmul(self.threads, &self.weights.output, &head_in, logit_rows.len())
         };
-        Ok(DraftWindow {
+        Ok(MtpWindow {
             tokens: tokens.to_vec(),
             start: state.position,
             input,
@@ -267,10 +267,10 @@ impl Reference<'_, '_> {
 
     /// Applies the first `accepted` rows of `window` to `state`, which must be
     /// where the window started.
-    pub fn draft_commit(
+    pub fn mtp_commit(
         &self,
-        state: &mut DraftState,
-        window: &DraftWindow,
+        state: &mut MtpState,
+        window: &MtpWindow,
         accepted: usize,
     ) -> Result<()> {
         if accepted > window.rows() {
@@ -291,8 +291,8 @@ impl Reference<'_, '_> {
     /// state is not changed: the cells of a chain are provisional.
     pub fn draft_chain(
         &self,
-        head: &DraftWeights<'_>,
-        state: &DraftState,
+        head: &MtpWeights<'_>,
+        state: &MtpState,
         rt: &[f32],
         token: u32,
         links: usize,
@@ -302,7 +302,7 @@ impl Reference<'_, '_> {
         let mut drafts = Vec::with_capacity(links);
         for _ in 0..links {
             let window = self.draft_window(head, &state, &rt, &[token], LogitRows::All)?;
-            self.draft_commit(&mut state, &window, 1)?;
+            self.mtp_commit(&mut state, &window, 1)?;
             token = window.draft(0).expect("the row has logits");
             drafts.push(token);
             rt = window.out;
@@ -311,8 +311,8 @@ impl Reference<'_, '_> {
     }
 }
 
-/// The configuration of the draft block of a model as a model of one layer:
+/// The configuration of the MTP block of a model as a model of one layer:
 /// what a device part that runs the block alone is built from.
-pub(crate) fn block_config(c: &Config) -> Config {
+pub(crate) fn mtp_config(c: &Config) -> Config {
     Config { n_layer: 1, attention_layers: vec![true], ngram: None, ..c.clone() }
 }

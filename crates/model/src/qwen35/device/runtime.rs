@@ -20,8 +20,8 @@ use ares_tokenizer::{ChatOptions, Tokenizer};
 use super::choose::{Balance, LayoutReport};
 use super::embed::{EmbeddingReport, HostRows, TableShape};
 use super::part::{
-    DRAFT_KV, DraftBytes, DraftChain, DraftStep, Exchange, Options, PAGE_ENTRY, Part, PartSetup,
-    StepEnv, TAILS_PER_SLOT, declared, page_bytes,
+    Exchange, MTP_KV, MtpBytes, MtpChain, MtpStep, Options, PAGE_ENTRY, Part, PartSetup, StepEnv,
+    TAILS_PER_SLOT, declared, page_bytes,
 };
 use super::placement::{HalfShares, Placement, PlacementError};
 use crate::blocks::slots::{self, Declared};
@@ -57,7 +57,7 @@ pub struct PartReport {
     /// Recurrent state per sequence.
     pub state_bytes_per_slot: u64,
     /// One checkpoint of this device's share: the recurrent state of a
-    /// sequence and, where the draft block is, its carry row.
+    /// sequence and, where the MTP block is, its carry row.
     pub checkpoint_bytes: u64,
     /// The scratch of a step of the most rows.
     pub scratch_bytes: u64,
@@ -68,8 +68,8 @@ pub struct PartReport {
     /// The exact K/V entries of the attention blocks, when their formats have a
     /// tile mean: the second, small pool.
     pub exact_bytes: u64,
-    /// What the model's draft block takes, on the device that holds it.
-    pub draft: Option<DraftBytes>,
+    /// What the model's MTP block takes, on the device that holds it.
+    pub draft: Option<MtpBytes>,
     /// Where the token embedding lies and what it takes.
     pub embedding: EmbeddingReport,
     /// Which weight matrices got which layout, and what the choice took.
@@ -155,10 +155,10 @@ impl Qwen35 {
         // device that embeds has the first rows of the head (not a layer
         // split). A DFlash drafter needs the same device and head.
         let drafts = options.window_rows > 1 && placement.split != Split::Layer;
-        let mtp = config.n_nextn == 1 && options.draft_block;
+        let mtp = config.n_nextn == 1 && options.mtp;
         let vocabulary = options.draft_vocabulary.as_deref();
         let placement = if drafts && mtp {
-            placement.with_draft(&config, vocabulary)?
+            placement.with_mtp(&config, vocabulary)?
         } else if drafts && options.dflash.is_some() {
             placement.with_head_view(&config, vocabulary, false)?
         } else {
@@ -269,7 +269,7 @@ impl Qwen35 {
         for part in 0..self.gguf.n_parts() {
             crate::files::identity(self.gguf.path(part as u16), &mut out);
         }
-        let draft = self.placement.mtp().map(|draft| (draft.device, DRAFT_KV));
+        let draft = self.placement.mtp().map(|draft| (draft.device, MTP_KV));
         let settings = format!(
             "kv {:?} draft {:?} state {:?} precision {:?} split {:?}",
             self.options.kv,
@@ -508,9 +508,9 @@ struct Qwen35Device {
     segments: Vec<Segment>,
     /// The rows of the step that are replays.
     replay: Vec<Range<u32>>,
-    /// The windows of the step whose drafts the model's draft block makes,
+    /// The windows of the step whose drafts the model's MTP block makes,
     /// and those the DFlash drafter makes.
-    chains: Vec<DraftChain>,
+    chains: Vec<MtpChain>,
     passes: Vec<PassSeq>,
     /// The ids the record names the two drafters by, when the model has them.
     block_id: Option<u32>,
@@ -610,7 +610,7 @@ impl DeviceModel for Qwen35Device {
             }
         }
         // The windows whose drafts a drafter of the part makes, each at its
-        // place in the step's list of drafts: the draft block's chains, with
+        // place in the step's list of drafts: the MTP block's chains, with
         // their newest token and the settings of the rows that verify the
         // drafts (all rows of a window are wanted, so the sampler rows of a
         // window are consecutive; `wanted` counts the wanted rows before it),
@@ -636,7 +636,7 @@ impl DeviceModel for Qwen35Device {
                     .map(|r| record.run(r))
                     .map(|(first, count)| segment.row0.clamp(first, first + count) - first)
                     .sum();
-                self.chains.push(DraftChain {
+                self.chains.push(MtpChain {
                     segment: i as u32,
                     token: record.row(segment.row0).token,
                     rows: (0..links).map(|j| record.sampler(wanted + j).for_draft()).collect(),
@@ -657,8 +657,8 @@ impl DeviceModel for Qwen35Device {
             }
             place += links;
         }
-        if self.part.has_draft_block() {
-            self.part.draft_step(DraftStep {
+        if self.part.has_mtp() {
+            self.part.mtp_step(MtpStep {
                 tokens: step.record_on_device.offset(record.tokens_offset()),
                 chains: std::mem::take(&mut self.chains),
                 chances: record.draft_chances(),
@@ -670,9 +670,9 @@ impl DeviceModel for Qwen35Device {
         let exchange = LinkExchange { links: step.links, index: step.index, stream: step.stream };
         if record.drafts_only() {
             // The drafts and nothing of the model: the round that verifies
-            // them is the next record. The draft block's chains first, then
+            // them is the next record. The MTP block's chains first, then
             // the DFlash drafter's passes into the same list.
-            if self.part.has_draft_block() {
+            if self.part.has_mtp() {
                 self.part.enqueue_chains(&StepEnv {
                     stream: step.stream,
                     step: step.record_on_device,
@@ -729,6 +729,6 @@ impl DeviceModel for Qwen35Device {
     fn model_draft_ms(&mut self) -> f64 {
         // A failed read of the events is not worth failing the step for:
         // the cost then stays what it was measured as before.
-        self.part.draft_chain_ms().unwrap_or(0.0)
+        self.part.draft_ms().unwrap_or(0.0)
     }
 }

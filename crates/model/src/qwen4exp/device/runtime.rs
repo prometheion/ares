@@ -48,15 +48,15 @@ use ares_state::PageLayout;
 use ares_tokenizer::{ChatOptions, Tokenizer};
 
 use super::board::Board;
-use super::draft::{Chain, DraftBlock, DraftReport, DraftTimes, Drafted, Watch};
 use super::feed::{
-    DraftLayer, Feed, Layout, build_store, cpu_pool, device_slots, expert_map, owners, places,
+    Feed, Layout, MtpExperts, build_store, cpu_pool, device_slots, expert_map, owners, places,
     plan_transit, reader,
 };
 use super::misses::{Misses, Progress, WideStats};
+use super::mtp::{Chain, MtpBlock, MtpDrafted, MtpReport, MtpTimes, Watch};
 use super::ngram::{self, NgramFeed};
 use super::part::{
-    DRAFT_KV, ExpertAt, Frame, Options, PAGE_ENTRY, Part, PartSetup, PartShape, Ports, StepEnv,
+    ExpertAt, Frame, MTP_KV, Options, PAGE_ENTRY, Part, PartSetup, PartShape, Ports, StepEnv,
 };
 use super::placement::{MARGIN, PartPlan, Placement};
 use super::prune::{self, PruneMask};
@@ -65,8 +65,8 @@ use super::session::{Chosen, Fill, PartReport, SessionOptions, choose};
 use super::usage::{Log, ProfileReport, Usage, UsageStats};
 use crate::blocks::slots::{self, Declared, TAILS_PER_SLOT};
 use crate::chat;
-use crate::qwen4exp::reference::block_config;
-use crate::qwen4exp::weights::{DraftWeights, Weights};
+use crate::qwen4exp::reference::mtp_config;
+use crate::qwen4exp::weights::{MtpWeights, Weights};
 use crate::qwen4exp::{Config, Error as FileError};
 
 /// How many layers a device thread enqueues ahead of the last layer of its
@@ -221,9 +221,9 @@ struct Build {
     n_slots: Vec<usize>,
     slot_bytes: Vec<u64>,
     flow: Option<Arc<Flow>>,
-    /// The route records of the draft block, and where its experts are.
-    draft_board: Option<Arc<Board>>,
-    draft_place: Option<ExpertAt>,
+    /// The route records of the MTP block, and where its experts are.
+    mtp_board: Option<Arc<Board>>,
+    mtp_place: Option<ExpertAt>,
     /// What the tiers hold, for the routers' pruning.
     prune_mask: Option<Arc<PruneMask>>,
 }
@@ -249,7 +249,7 @@ const GROW_SLICE: Duration = Duration::from_millis(40);
 pub(super) struct Flow {
     feed: Mutex<Feed>,
     ngram: Mutex<NgramFeed>,
-    /// The tokens the draft block picked for the rows of a step, as (row,
+    /// The tokens the MTP block picked for the rows of a step, as (row,
     /// token), and the step they are for: the device thread that holds the
     /// block tells the others, which need them for the embeddings and the
     /// rows of the n-gram table.
@@ -340,7 +340,7 @@ impl Flow {
     /// worth): their rows past the first wait for the file only while they
     /// are worth it. A step that
     /// only drafts (`windows` is `None`) is no step of the store: its routing
-    /// is the draft block's, whose experts are resident, and the work between
+    /// is the MTP block's, whose experts are resident, and the work between
     /// two steps of the store (the heat's decay, the slots that move, the RAM
     /// tier that grows) is counted in the model's steps.
     fn begin(
@@ -473,7 +473,7 @@ impl Flow {
         }
     }
 
-    /// The draft block has made the drafts of step `step`.
+    /// The MTP block has made the drafts of step `step`.
     fn publish(&self, step: u64, drafts: Vec<(u32, u32)>) {
         *self.drafts.lock().unwrap_or_else(|e| e.into_inner()) = (step, drafts);
     }
@@ -488,7 +488,7 @@ impl Flow {
                     return Ok(drafts.1.clone());
                 }
             }
-            self.check(started, "the draft block drafted on another device")?;
+            self.check(started, "the MTP block drafted on another device")?;
             self.pump()?;
             std::hint::spin_loop();
         }
@@ -648,12 +648,12 @@ pub struct Qwen4Exp {
     /// What each device keeps of a sequence and of a page, for the prefix
     /// cache (`resume.rs`).
     declared: Vec<Declared>,
-    /// The file of the model's draft block, when it drafts.
-    draft: Option<Arc<Gguf>>,
+    /// The file of the model's MTP block, when it drafts.
+    mtp: Option<Arc<Gguf>>,
     /// A DFlash drafter, when it drafts.
     dflash: Option<Arc<crate::dflash::File>>,
-    draft_report: Mutex<Option<DraftReport>>,
-    draft_watch: Arc<Mutex<Watch>>,
+    mtp_report: Mutex<Option<MtpReport>>,
+    mtp_watch: Arc<Mutex<Watch>>,
     /// The usage profile of the experts, for a model that keeps one.
     usage: Usage,
 }
@@ -761,8 +761,8 @@ impl Qwen4Exp {
                 n_slots: vec![0; n],
                 slot_bytes: vec![0; n],
                 flow: None,
-                draft_board: None,
-                draft_place: None,
+                mtp_board: None,
+                mtp_place: None,
                 prune_mask: None,
             }),
             flow: OnceLock::new(),
@@ -770,10 +770,10 @@ impl Qwen4Exp {
             pinned,
             page_bytes,
             declared,
-            draft: None,
+            mtp: None,
             dflash: None,
-            draft_report: Mutex::new(None),
-            draft_watch: Arc::default(),
+            mtp_report: Mutex::new(None),
+            mtp_watch: Arc::default(),
             usage: Usage::default(),
         })
     }
@@ -813,8 +813,8 @@ impl Qwen4Exp {
         self.usage.stats()
     }
 
-    /// Gives the model its draft block from `draft`, a file of the block as
-    /// Strata packs it ([`DraftWeights`]): windows then take the block's
+    /// Gives the model its MTP block from `draft`, a file of the block as
+    /// Strata packs it ([`MtpWeights`]): windows then take the block's
     /// drafts, as many rows as `opts.part.window_rows` allows. The block runs
     /// on the device that holds the output head, in every placement, and its
     /// routed experts go through the expert store with the model's. Before the
@@ -849,10 +849,10 @@ impl Qwen4Exp {
         Ok(self)
     }
 
-    pub fn with_draft(mut self, draft: Gguf) -> Result<Self, OpenError> {
+    pub fn with_mtp(mut self, file: Gguf) -> Result<Self, OpenError> {
         let choice = |why: &str| Err(OpenError::Choice(why.to_owned()));
         if self.opts.part.window_rows < 2 {
-            return choice("a draft block needs windows of at least two rows");
+            return choice("an MTP block needs windows of at least two rows");
         }
         if self.opts.part.window_rows > MAX_BATCH {
             return choice(
@@ -860,16 +860,16 @@ impl Qwen4Exp {
             );
         }
         let (c, n) = (&self.config, self.placement.n_devices());
-        let head = DraftWeights::load(&draft, c)?;
+        let head = MtpWeights::load(&file, c)?;
         let weights = Weights::load(&self.gguf, c)?;
         let device = self.head_device();
-        let layer = DraftLayer { gguf: &draft, weights: &head, device };
+        let layer = MtpExperts { gguf: &file, weights: &head, device };
         let (layout, _map) = Layout::new(&self.gguf, c, &weights, &self.placement, Some(&layer))?;
         // What the block keeps of a sequence (its slot and the carry) and of
         // a page (its K/V group and pooled keys), next to the head's part.
-        let block = block_config(c);
+        let block = mtp_config(c);
         let block_opts = Options {
-            kv: DRAFT_KV,
+            kv: MTP_KV,
             max_rows: MAX_BATCH,
             logit_rows: MAX_BATCH,
             window_rows: 0,
@@ -891,7 +891,7 @@ impl Qwen4Exp {
         self.layout = layout;
         debug_assert!(device < n);
         drop((head, weights));
-        self.draft = Some(Arc::new(draft));
+        self.mtp = Some(Arc::new(file));
         Ok(self)
     }
 
@@ -902,23 +902,23 @@ impl Qwen4Exp {
             .unwrap_or(0)
     }
 
-    /// What the draft block took on its device, once the runtime has opened
+    /// What the MTP block took on its device, once the runtime has opened
     /// the parts; `None` for a model without one.
-    pub fn draft_report(&self) -> Option<DraftReport> {
-        *self.draft_report.lock().unwrap_or_else(|e| e.into_inner())
+    pub fn mtp_report(&self) -> Option<MtpReport> {
+        *self.mtp_report.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// What the draft block's steps took and how its drafts fared since the
+    /// What the MTP block's steps took and how its drafts fared since the
     /// engine started.
-    pub fn draft_times(&self) -> DraftTimes {
-        self.draft_watch.lock().unwrap_or_else(|e| e.into_inner()).times
+    pub fn mtp_times(&self) -> MtpTimes {
+        self.mtp_watch.lock().unwrap_or_else(|e| e.into_inner()).times
     }
 
-    /// The newest chains the draft block made, oldest first (the last 1024),
+    /// The newest chains the MTP block made, oldest first (the last 1024),
     /// and forgets them: for tests and measurements that compare its drafts
     /// with the reference's.
-    pub fn take_drafted(&self) -> Vec<Drafted> {
-        self.draft_watch.lock().unwrap_or_else(|e| e.into_inner()).recent.drain(..).collect()
+    pub fn take_mtp_chains(&self) -> Vec<MtpDrafted> {
+        self.mtp_watch.lock().unwrap_or_else(|e| e.into_inner()).recent.drain(..).collect()
     }
 
     /// Renders chat prompts with `options`: whether the model thinks, and the
@@ -999,17 +999,17 @@ impl Qwen4Exp {
         Some((vram, ram, ram_bytes))
     }
 
-    /// The slots of the draft block's experts in VRAM and in the RAM tier;
-    /// `None` without a draft block or before the parts are open.
-    pub fn draft_slots(&self) -> Option<(usize, usize)> {
-        self.draft.as_ref()?;
+    /// The slots of the MTP block's experts in VRAM and in the RAM tier;
+    /// `None` without an MTP block or before the parts are open.
+    pub fn mtp_slots(&self) -> Option<(usize, usize)> {
+        self.mtp.as_ref()?;
         Some(self.flow.get()?.lock_feed().store.slots(0))
     }
 
     /// Brings the experts `experts_of(layer)` names for every layer into the
     /// tiers before anything is served, most wanted first, as far as the slots
     /// go (a recorded routing, or every expert for a model that fits); the
-    /// draft block is asked for as the layer behind the model's last. Call it
+    /// MTP block is asked for as the layer behind the model's last. Call it
     /// while no request runs; `None` before the parts are open.
     pub fn fill(
         &self,
@@ -1064,24 +1064,24 @@ impl Qwen4Exp {
         )?;
         let serve = self.opts.serve;
         let layout = &self.layout;
-        // The draft block, next to the part that holds the head: before the
+        // The MTP block, next to the part that holds the head: before the
         // room for slots is counted.
         let embedding = Embedding::new(&self.gguf, &weights)?;
-        let mut block = match (&self.draft, part.output()) {
+        let mut block = match (&self.mtp, part.output()) {
             (Some(draft), Some(output)) if index == self.head_device() => {
-                let head = DraftWeights::load(draft, c).map_err(|e| invalid(e.to_string()))?;
-                let block = DraftBlock::open(
+                let head = MtpWeights::load(draft, c).map_err(|e| invalid(e.to_string()))?;
+                let block = MtpBlock::open(
                     c,
                     &head,
                     o,
                     index,
                     output,
                     embedding.clone(),
-                    self.draft_watch.clone(),
+                    self.mtp_watch.clone(),
                     cx.device,
                     cx.ledger,
                 )?;
-                *self.draft_report.lock().unwrap_or_else(|e| e.into_inner()) = Some(block.report());
+                *self.mtp_report.lock().unwrap_or_else(|e| e.into_inner()) = Some(block.report());
                 Some(block)
             }
             _ => None,
@@ -1118,7 +1118,7 @@ impl Qwen4Exp {
         // The room each device has left decides the slots of the store.
         let (ports, board) = (part.ports(), part.board());
         let cores: Vec<bool> = (0..layer_count).map(|i| part.has_core(i)).collect();
-        let draft_board = block.as_ref().map(DraftBlock::board);
+        let mtp_board = block.as_ref().map(MtpBlock::board);
         self.meeting.meet(
             n,
             |build| {
@@ -1126,15 +1126,15 @@ impl Qwen4Exp {
                 build.ports[index] = ports;
                 build.cores[index] = cores;
                 build.boards[index] = Some(board);
-                if draft_board.is_some() {
-                    build.draft_board = draft_board;
+                if mtp_board.is_some() {
+                    build.mtp_board = mtp_board;
                 }
                 Ok(())
             },
             |build| {
                 let vram: Vec<u64> = (0..n)
                     .map(|d| {
-                        let own = layout.draft_bytes(d)
+                        let own = layout.mtp_bytes(d)
                             + if self.placement.tensor.is_some() {
                                 layout.expert_bytes
                             } else {
@@ -1145,17 +1145,17 @@ impl Qwen4Exp {
                             .min(self.opts.slot_bytes.unwrap_or(u64::MAX))
                     })
                     .collect();
-                let reader = reader(&self.gguf, self.draft.as_deref()).map_err(model_error)?;
+                let reader = reader(&self.gguf, self.mtp.as_deref()).map_err(model_error)?;
                 let head = self
-                    .draft
+                    .mtp
                     .as_ref()
-                    .map(|draft| DraftWeights::load(draft, c))
+                    .map(|draft| MtpWeights::load(draft, c))
                     .transpose()
                     .map_err(|e| invalid(e.to_string()))?;
-                let draft_layer = self.draft.as_ref().zip(head.as_ref()).map(|(gguf, weights)| {
-                    DraftLayer { gguf, weights, device: self.head_device() }
+                let mtp_experts = self.mtp.as_ref().zip(head.as_ref()).map(|(gguf, weights)| {
+                    MtpExperts { gguf, weights, device: self.head_device() }
                 });
-                let map = expert_map(&self.gguf, c, layout.per_layer, draft_layer.as_ref())
+                let map = expert_map(&self.gguf, c, layout.per_layer, mtp_experts.as_ref())
                     .map_err(model_error)?;
                 // The tier is planned for all it can ever hold, what the limit
                 // leaves and the experts without a slot in VRAM can use, and
@@ -1264,10 +1264,10 @@ impl Qwen4Exp {
                     .iter()
                     .map(|b| b.clone().ok_or_else(|| invalid("a part has no route records")))
                     .collect::<Result<Vec<_>, _>>()?;
-                if self.draft.is_some() {
+                if self.mtp.is_some() {
                     let (device, pool) = store.place(0);
                     let slots = store.device(device);
-                    build.draft_place = Some(ExpertAt {
+                    build.mtp_place = Some(ExpertAt {
                         table: slots.table(0),
                         pool: slots.pool(pool).0,
                         host: slots.host_share(0),
@@ -1286,9 +1286,9 @@ impl Qwen4Exp {
                 if self.placement.tensor.is_some() {
                     feed.set_owners(owners(&self.placement, c));
                 }
-                if let Some(board) = build.draft_board.clone() {
-                    feed.set_draft(board);
-                    feed.fill_draft(c.experts.count).map_err(model_error)?;
+                if let Some(board) = build.mtp_board.clone() {
+                    feed.set_mtp(board);
+                    feed.fill_mtp(c.experts.count).map_err(model_error)?;
                 }
                 let ngram = NgramFeed::open(&self.gguf, c, self.opts.row_cache, o.max_slots)
                     .map_err(model_error)?;
@@ -1330,8 +1330,7 @@ impl Qwen4Exp {
             let build = self.meeting.lock();
             let build = &build.value;
             if let Some(block) = &mut block {
-                let at =
-                    build.draft_place.ok_or_else(|| invalid("the draft block has no slots"))?;
+                let at = build.mtp_place.ok_or_else(|| invalid("the MTP block has no slots"))?;
                 block.set_experts(at)?;
             }
             let peer = self.placement.tensor.as_ref().map(|tensor| {
@@ -1400,10 +1399,10 @@ impl Qwen4Exp {
             wide: c.wide() as u32,
             per_step: 8 * (c.n_layer as u32 + 1),
             embedding: first.then_some(embedding),
-            draft: block,
-            drafts: self.draft.is_some() || self.dflash.is_some(),
-            block_id: self.draft.as_ref().map(|_| 1),
-            dflash_id: self.dflash.as_ref().map(|_| 1 + u32::from(self.draft.is_some())),
+            mtp: block,
+            drafts: self.mtp.is_some() || self.dflash.is_some(),
+            mtp_id: self.mtp.as_ref().map(|_| 1),
+            dflash_id: self.dflash.as_ref().map(|_| 1 + u32::from(self.mtp.is_some())),
             dflash_embedding,
             passes: Vec::new(),
             block_places: Vec::new(),
@@ -1443,7 +1442,7 @@ impl Qwen4Exp {
     /// checkpoint as the device parts hand them out
     /// ([`ares_runtime::Durable::fingerprint`]):
     ///
-    /// - the model's files and the draft block's (size, header and samples
+    /// - the model's files and the MTP block's (size, header and samples
     ///   of the weights);
     /// - the formats of K and V, of the pooled keys and of the recurrent
     ///   state, and how the products of a prompt round;
@@ -1457,20 +1456,20 @@ impl Qwen4Exp {
         for part in 0..self.gguf.n_parts() {
             crate::files::identity(self.gguf.path(part as u16), &mut out);
         }
-        if let Some(draft) = &self.draft {
-            out.extend_from_slice(b"draft block\0");
+        if let Some(draft) = &self.mtp {
+            out.extend_from_slice(b"mtp block\0");
             for part in 0..draft.n_parts() {
                 crate::files::identity(draft.path(part as u16), &mut out);
             }
         }
         let o = &self.opts.part;
         let settings = format!(
-            "kv {:?} keys {:?} state {:?} precision {:?} draft {:?}",
+            "kv {:?} keys {:?} state {:?} precision {:?} mtp {:?}",
             o.kv,
             o.keys,
             o.state,
             o.precision,
-            self.draft.as_ref().map(|_| DRAFT_KV)
+            self.mtp.as_ref().map(|_| MTP_KV)
         );
         out.extend_from_slice(settings.as_bytes());
         for device in 0..self.placement.n_devices() {
@@ -1572,7 +1571,7 @@ impl Model for Qwen4Exp {
 
     fn drafters(&self) -> Vec<Drafter> {
         let mut drafters = Vec::new();
-        if self.draft.is_some() {
+        if self.mtp.is_some() {
             drafters.push(Drafter {
                 kind: DrafterKind::Mtp,
                 drafts: self.opts.part.window_rows.saturating_sub(1),
@@ -1650,18 +1649,18 @@ struct Qwen4ExpDevice {
     /// The step that ended last: its segments as (slot, direct, rows, first
     /// row), and its wanted rows.
     shape: Vec<(u32, bool, u32, u32)>,
-    /// The model's draft block, on the part that holds the output head.
-    draft: Option<DraftBlock>,
+    /// The model's MTP block, on the part that holds the output head.
+    mtp: Option<MtpBlock>,
     /// Whether the model drafts (on this part or another).
     drafts: bool,
-    /// The ids the record names the draft block and the DFlash drafter by.
-    block_id: Option<u32>,
+    /// The ids the record names the MTP block and the DFlash drafter by.
+    mtp_id: Option<u32>,
     dflash_id: Option<u32>,
     /// The embedding rows, for the DFlash drafter's newest tokens, on the part
     /// that holds it.
     dflash_embedding: Option<Embedding>,
     /// The windows of the step whose drafts the DFlash drafter makes, and
-    /// where the draft block's chains have their drafts in the step's list.
+    /// where the MTP block's chains have their drafts in the step's list.
     passes: Vec<crate::dflash::PassSeq>,
     block_places: Vec<u32>,
     /// Where the part left the residual of the rows of its last step.
@@ -1771,7 +1770,7 @@ impl Qwen4ExpDevice {
                         place,
                     });
                     place += links;
-                } else if segment.n_rows >= 2 && Some(drafter) != self.block_id {
+                } else if segment.n_rows >= 2 && Some(drafter) != self.mtp_id {
                     return Err(invalid(format!("the model has no drafter {drafter}")));
                 } else if segment.n_rows >= 2 {
                     self.block_places.push(place);
@@ -1818,7 +1817,7 @@ impl Qwen4ExpDevice {
             let (first, count) = record.run(run);
             self.out_rows.extend(first..first + count);
         }
-        // The step begins for the store: the draft block routes in it before
+        // The step begins for the store: the MTP block routes in it before
         // any layer of the model. The number of the step marks its route
         // records and its exchanges: a kernel waits for a flag that is behind
         // the number, and the flags start at 0, so no step may be numbered 0
@@ -1852,9 +1851,9 @@ impl Qwen4ExpDevice {
             }
         }
 
-        // The draft block follows the rows of the last step that count, in
+        // The MTP block follows the rows of the last step that count, in
         // the tables of that step.
-        if let (Some(block), Some(residual)) = (&mut self.draft, self.residual.take()) {
+        if let (Some(block), Some(residual)) = (&mut self.mtp, self.residual.take()) {
             let outcome = |slot: u32, row0: u32| {
                 (0..record.commits())
                     .map(|i| record.commit(i))
@@ -1867,7 +1866,7 @@ impl Qwen4ExpDevice {
         // The pages the pool freed give back what the K/V groups keep for them.
         let freed: Vec<u32> = (0..record.freed()).map(|i| record.freed_page(i)).collect();
         self.part.release_pages(freed.iter().copied());
-        if let Some(block) = &mut self.draft {
+        if let Some(block) = &mut self.mtp {
             block.release_pages(&freed);
         }
 
@@ -1879,7 +1878,7 @@ impl Qwen4ExpDevice {
                 let entries = (taken..taken + update.count).map(|k| record.entry(k));
                 self.part.update_table(stream, update.slot, update.first, entries)?;
             }
-            if let Some(block) = &mut self.draft {
+            if let Some(block) = &mut self.mtp {
                 let entries = (taken..taken + update.count).map(|k| record.entry(k));
                 block.update_table(stream, update.slot, update.first, entries)?;
             }
@@ -1887,21 +1886,21 @@ impl Qwen4ExpDevice {
         }
 
         // The copies of the prefix cache, behind the commit of the step before
-        // and the draft block's following of it: the saves, the page copies,
+        // and the MTP block's following of it: the saves, the page copies,
         // the restores.
         self.resume.copies(
             stream,
             step.pages,
             record,
             &mut self.part,
-            self.draft.as_mut(),
+            self.mtp.as_mut(),
             &self.flow,
         )?;
 
         // A step that only drafts: the chains, and nothing of the model. It
         // leaves no window for the next record to commit.
         if record.drafts_only() {
-            if let Some(block) = &mut self.draft {
+            if let Some(block) = &mut self.mtp {
                 let chances = record.draft_chances();
                 block.draft(
                     stream,
@@ -1928,7 +1927,7 @@ impl Qwen4ExpDevice {
                 // A failed read ahead costs nothing but the read of the step.
                 let _ = self.flow.lock_ngram().expect(&next);
             }
-            // The DFlash drafter's passes. With windows of the draft block in
+            // The DFlash drafter's passes. With windows of the MTP block in
             // the same step, its drafts (which the host has) go into the
             // drafter's list at their places, so the step has one list.
             if !self.passes.is_empty() && self.part.dflash().is_some() {
@@ -1958,10 +1957,10 @@ impl Qwen4ExpDevice {
         }
         self.part.dflash_no_pass();
 
-        // The newest cell of every sequence in the draft block and the chains
+        // The newest cell of every sequence in the MTP block and the chains
         // of the windows that take its drafts; the other device threads wait
         // for the drafts, which are rows of this step.
-        if let Some(block) = &mut self.draft {
+        if let Some(block) = &mut self.mtp {
             let chances = record.draft_chances();
             block.draft(
                 stream,
@@ -2075,7 +2074,7 @@ impl Qwen4ExpDevice {
         }
         let n_out = self.part.end(&env!(fetched.as_deref(), None))?;
         self.part.dflash_inject(stream)?;
-        if self.draft.is_some() {
+        if self.mtp.is_some() {
             self.residual = Some(self.part.residual());
         }
         if self.by_layers && self.index + 1 < self.devices {
@@ -2155,11 +2154,11 @@ impl DeviceModel for Qwen4ExpDevice {
 
     fn model_drafts(&self) -> Option<ModelDrafts> {
         // A step with the DFlash drafter's windows has one list, the
-        // drafter's; one with the draft block's alone has the block's.
+        // drafter's; one with the MTP block's alone has the block's.
         if let Some(d) = self.part.dflash().filter(|d| d.drafted() > 0) {
             return Some(ModelDrafts { ptr: d.own_list(), tokens: d.drafted() });
         }
-        let (ptr, tokens) = self.draft.as_ref()?.drafted()?;
+        let (ptr, tokens) = self.mtp.as_ref()?.drafted()?;
         Some(ModelDrafts { ptr, tokens })
     }
 
@@ -2168,12 +2167,12 @@ impl DeviceModel for Qwen4ExpDevice {
         cx: &TransferContext<'_>,
         item: &mut DeviceTransfer,
     ) -> Result<(), ModelError> {
-        self.resume.transfer(cx.stream, cx.pages, item, &mut self.part, self.draft.as_mut())
+        self.resume.transfer(cx.stream, cx.pages, item, &mut self.part, self.mtp.as_mut())
     }
 
     fn model_draft_ms(&mut self) -> f64 {
         let pass = self.part.dflash_pass_ms();
-        self.draft.as_ref().map_or(0.0, DraftBlock::chain_ms) + pass
+        self.mtp.as_ref().map_or(0.0, MtpBlock::chain_ms) + pass
     }
 
     fn model_draft_probs(&mut self, out: &mut Vec<f32>) {
@@ -2185,7 +2184,7 @@ impl DeviceModel for Qwen4ExpDevice {
                     out[from + j as usize] = d.prob(j);
                 }
             }
-            if let Some(block) = self.draft.as_ref().filter(|b| b.drafted().is_some()) {
+            if let Some(block) = self.mtp.as_ref().filter(|b| b.drafted().is_some()) {
                 // The block's probabilities, chain after chain, at the places
                 // of its windows.
                 let mut probs = block.probs().iter();
@@ -2199,7 +2198,7 @@ impl DeviceModel for Qwen4ExpDevice {
             }
             return;
         }
-        if let Some(block) = self.draft.as_ref().filter(|block| block.drafted().is_some()) {
+        if let Some(block) = self.mtp.as_ref().filter(|block| block.drafted().is_some()) {
             out.extend_from_slice(block.probs());
         }
     }

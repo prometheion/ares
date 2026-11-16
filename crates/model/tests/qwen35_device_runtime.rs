@@ -259,7 +259,7 @@ fn ask(runtime: &Runtime, id: u64, question: &str, max_tokens: u32) -> String {
 }
 
 /// The whole engine: chat requests through the conductor, alone and two at
-/// once. (The 0.8B has no draft block, so nothing is drafted: the drafts of the
+/// once. (The 0.8B has no MTP block, so nothing is drafted: the drafts of the
 /// 27B are checked in `qwen35_mtp_runtime`.)
 #[test]
 fn the_engine_answers_alone_and_two_at_once() {
@@ -405,7 +405,7 @@ fn check_probabilities(name: &str, probs: &[TokenProbs], top: Option<usize>) {
 
 /// Every kind of sampler setting through the whole engine on the real model:
 /// each answers, and the probabilities that were asked for come with it. (This
-/// model has no draft block, so nothing is drafted; that drafts do not change
+/// model has no MTP block, so nothing is drafted; that drafts do not change
 /// the answer under these settings is checked on the 27B, in
 /// `qwen35_mtp_runtime`.)
 #[test]
@@ -627,7 +627,7 @@ fn windows_against_single_rows(
 /// row of a draft window picks the token of the row alone with the same logit
 /// bit for bit, over a few hundred generated tokens: the text does not depend
 /// on what was drafted. With the fast kernels, which is how the model is
-/// served. The layer split has no draft block of its own (its drafts would
+/// served. The layer split has no MTP block of its own (its drafts would
 /// come from the n-gram drafter), which changes nothing for a window: the rows are
 /// verified the same way.
 #[test]

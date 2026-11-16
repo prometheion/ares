@@ -276,7 +276,7 @@ impl Synthetic {
         std::fs::write(path, self.bytes())
     }
 
-    /// The bytes of a file that holds a draft block for this model, laid out
+    /// The bytes of a file that holds an MTP block for this model, laid out
     /// as Strata packs the real one (section 2.5 of the specification): the
     /// architecture `qwen4exp-mtp`, the checkpoint's tensor names under `mtp.`,
     /// norm weights as the `w` of `1 + w`, gate and up of the routed experts in
@@ -290,7 +290,7 @@ impl Synthetic {
     pub fn draft_bytes(&self, experts: Option<(GgmlType, GgmlType)>) -> Vec<u8> {
         let mut file = File::default();
         file.string("general.architecture", "qwen4exp-mtp");
-        file.string("general.name", "ares synthetic qwen4exp draft block");
+        file.string("general.name", "ares synthetic qwen4exp MTP block");
         let s = &self.shape;
         let (n, wide, lr) = (s.n_embd, s.wide(), s.mixer_rank);
         let shipped = self.types != Types::F32;

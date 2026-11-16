@@ -9,8 +9,8 @@
 //!   recurrent state of every sequence slot, the K/V and key pools of its
 //!   attention layers, the scratch of a step, and [`Part::enqueue`], which
 //!   queues the kernels of a step and does not wait.
-//! - `draft.rs` runs the model's draft block next to the part that holds the
-//!   output head, for a model the runtime drives ([`Qwen4Exp::with_draft`]).
+//! - `draft.rs` runs the model's MTP block next to the part that holds the
+//!   output head, for a model the runtime drives ([`Qwen4Exp::with_mtp`]).
 //! - `prune.rs` lets the routers leave out, or stand an expert of a tier in
 //!   for, a pick that only the file holds ([`PruneSetup`]; off unless asked).
 //! - [`Session`] drives a whole model, on one device or several, from one
@@ -22,10 +22,10 @@
 //! here is measured against (`tests/qwen4exp_device.rs`).
 
 mod board;
-mod draft;
 mod feed;
 mod load;
 mod misses;
+mod mtp;
 mod ngram;
 mod part;
 pub mod placement;
@@ -36,9 +36,9 @@ mod session;
 mod usage;
 
 pub use board::Board;
-pub use draft::{DraftReport, DraftTimes, Drafted};
 pub use load::{LayerShare, Role};
 pub use misses::WideStats;
+pub use mtp::{MtpDrafted, MtpReport, MtpTimes};
 pub use part::{
     ExpertAt, Options, PAGE_ENTRY, PHASES, Part, PartSetup, Phase, Ports, Profile, StepEnv,
 };

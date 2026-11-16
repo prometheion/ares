@@ -1,5 +1,5 @@
 //! The **K/V group**: attention layers on a device whose K and V share one
-//! pair of formats (a model's attention layers, or a draft block), with their
+//! pair of formats (a model's attention layers, or an MTP block), with their
 //! entries in the engine's pages, the pool of exact entries and the group's
 //! page table. A group owns the rules of how the rows of a step touch them:
 //!

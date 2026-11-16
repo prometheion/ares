@@ -636,8 +636,8 @@ fn place(
     };
     let drafts = options.window_rows > 1 && placement.split != Split::Layer;
     let vocabulary = options.draft_vocabulary.as_deref();
-    if drafts && c.n_nextn == 1 && options.draft_block {
-        placement.with_draft(c, vocabulary).map_err(model)
+    if drafts && c.n_nextn == 1 && options.mtp {
+        placement.with_mtp(c, vocabulary).map_err(model)
     } else if drafts && options.dflash.is_some() {
         placement.with_head_view(c, vocabulary, false).map_err(model)
     } else {
@@ -937,7 +937,7 @@ fn load_qwen35(
         logit_rows: window_rows.max(parallel),
         window_rows,
         draft_vocabulary: vocabulary.clone(),
-        draft_block: mtp,
+        mtp,
         dflash: dflash.clone(),
         ..Options::default()
     };

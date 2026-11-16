@@ -58,8 +58,8 @@ use ares_cuda::{
 use ares_runtime::ModelError;
 use ares_runtime::expert_store::cpu::act_bytes as cpu_act_bytes;
 
-mod block;
 mod dflash;
+mod mtp;
 mod predict;
 mod resume;
 mod wide;
@@ -78,11 +78,11 @@ use crate::qwen4exp::weights::Weights;
 
 pub use crate::blocks::PAGE_ENTRY;
 
-/// The formats of K and of V of the draft block: 4 bits, whatever the model's,
-/// as on the 27B (`qwen35::device::DRAFT_KV`, measured there: the share of
+/// The formats of K and of V of the MTP block: 4 bits, whatever the model's,
+/// as on the 27B (`qwen35::device::MTP_KV`, measured there: the share of
 /// drafts the model accepts is the same as with `q8`). Not measured on this
 /// model.
-pub const DRAFT_KV: (CacheFormat, CacheFormat) = (CacheFormat::Q4, CacheFormat::Q4);
+pub const MTP_KV: (CacheFormat, CacheFormat) = (CacheFormat::Q4, CacheFormat::Q4);
 
 /// The most pieces a row's device-made list is cut into.
 const MAX_PIECES: u32 = 16;
@@ -1052,8 +1052,8 @@ pub struct Part {
     /// What steps wider than the decode kernels take need; `None` when no step has more
     /// than [`MAX_BATCH`] rows.
     wide_state: Option<wide::State>,
-    /// What a part that runs the model's draft block needs besides a layer.
-    block: Option<block::State>,
+    /// What a part that runs the model's MTP block needs besides a layer.
+    mtp: Option<mtp::State>,
     /// The pruning of the routers of a part that routes.
     prune: Option<PartPrune>,
     /// The predictions of the picks of the next layers, for a part that routes.
@@ -1330,7 +1330,7 @@ impl Part {
             status_pending: false,
             marks,
             wide_state,
-            block: None,
+            mtp: None,
             prune: None,
             predict,
             dflash: None,
@@ -2581,7 +2581,7 @@ impl Part {
 
     /// The attention half of layer `i`. With `keys_only` the rows write their
     /// keys and values and the indexer's keys and read nothing: what a draft
-    /// block does to follow the model (`part/block.rs`).
+    /// block does to follow the model (`part/mtp.rs`).
     fn attend_rows(
         &mut self,
         env: &StepEnv<'_>,

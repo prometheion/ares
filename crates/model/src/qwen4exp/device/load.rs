@@ -24,7 +24,7 @@ use ares_runtime::ModelError;
 
 use crate::qwen4exp::Config;
 use crate::qwen4exp::weights::{
-    DraftWeights, Layer, Matrix, Mixer, RecurrentWeights, StreamMixer, Weights,
+    Layer, Matrix, Mixer, MtpWeights, RecurrentWeights, StreamMixer, Weights,
 };
 
 /// What a part is to the residual streams of the model.
@@ -186,11 +186,11 @@ pub(crate) struct HeadW {
     pub output: Mat,
 }
 
-/// What makes the input of the model's draft block: the norm weights (`f32`
+/// What makes the input of the model's MTP block: the norm weights (`f32`
 /// offsets) and the projections of the paired token's embedding and of the
 /// residual streams.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct DraftInW {
+pub(crate) struct MtpInW {
     pub norm_embedding: u64,
     pub norm_hidden: u64,
     pub fc_embedding: Mat,
@@ -198,7 +198,7 @@ pub(crate) struct DraftInW {
 }
 
 /// The offset that marks the one matrix a part reads in another part's arena
-/// (the output head, which a draft block shares with the model).
+/// (the output head, which an MTP block shares with the model).
 const BORROWED: u64 = u64::MAX;
 
 /// What goes to one place of the arena.
@@ -477,7 +477,7 @@ impl<'g> Layout<'g> {
             _ if !streams => None,
             GgmlType::F32 => Some(self.push(Source::File(moe.router.bytes()))),
             // The router kernels (the decode step's, the prediction's, the wide step's) multiply
-            // f32 rows: a router in another type (the draft block's file has BF16; quantizers
+            // f32 rows: a router in another type (the MTP block's file has BF16; quantizers
             // keep it F32 as a rule) is decoded once, here, at four bytes a weight.
             _ => {
                 let (rows, cols) = (moe.router.rows(), moe.router.cols());
@@ -526,8 +526,8 @@ impl<'g> Layout<'g> {
         HeadW { mixer: self.mixer(&w.output_mixer), output: self.matrix(&w.output) }
     }
 
-    fn draft_in(&mut self, w: &DraftWeights<'g>) -> DraftInW {
-        DraftInW {
+    fn mtp_in(&mut self, w: &MtpWeights<'g>) -> MtpInW {
+        MtpInW {
             norm_embedding: self.floats(&w.norm_embedding),
             norm_hidden: self.floats(&w.norm_hidden),
             fc_embedding: self.matrix(&w.fc_embedding),
@@ -562,8 +562,8 @@ pub(crate) struct DeviceWeights {
     arena: DeviceBuffer,
     pub layers: Vec<LayerW>,
     pub head: Option<HeadW>,
-    /// The input projections of a draft block; `None` for a part of the model.
-    pub draft_in: Option<DraftInW>,
+    /// The input projections of an MTP block; `None` for a part of the model.
+    pub mtp_in: Option<MtpInW>,
     /// Where the matrix at [`BORROWED`] is: in the arena of another part on
     /// the same device, which outlives this one.
     borrowed: DevicePtr,
@@ -581,7 +581,7 @@ impl DeviceWeights {
         if m.at == BORROWED { self.borrowed } else { self.at(m.at) }
     }
 
-    /// The output head and where it is on the device, for a draft block on
+    /// The output head and where it is on the device, for an MTP block on
     /// the same device to read it. `None` for a part without the head.
     pub fn output(&self) -> Option<(Mat, DevicePtr)> {
         self.head.map(|head| (head.output, self.mat(&head.output)))
@@ -630,13 +630,13 @@ impl DeviceWeights {
             arena,
             layers: on_device,
             head,
-            draft_in: None,
+            mtp_in: None,
             borrowed: DevicePtr::NULL,
             upload: started.elapsed(),
         })
     }
 
-    /// Lays out and uploads the dense weights of a draft block: its one layer
+    /// Lays out and uploads the dense weights of an MTP block: its one layer
     /// (`c` and `w` describe it as a model of one layer), its input projections
     /// and its own final mixer. Its output head is `output`, the model's, which
     /// is on `device` already.
@@ -644,15 +644,15 @@ impl DeviceWeights {
         device: &Device,
         ledger: &mut Ledger,
         c: &Config,
-        w: &DraftWeights<'_>,
+        w: &MtpWeights<'_>,
         output: (Mat, DevicePtr),
     ) -> Result<Self, ModelError> {
         let mut layout = Layout { ranges: true, ..Layout::default() };
         let layer = layout.layer(c, 0, &w.layer, Role::Whole, &LayerShare::whole(c, 0))?;
         let mixer = layout.mixer(&w.output_mixer);
-        let draft_in = layout.draft_in(w);
+        let mtp_in = layout.mtp_in(w);
         let len = layout.len.max(ALIGN);
-        ledger.reserve("qwen4exp draft block weights", len)?;
+        ledger.reserve("qwen4exp MTP block weights", len)?;
         let arena = DeviceBuffer::new(device, len)?;
         let started = Instant::now();
         let mut staging = Vec::new();
@@ -663,7 +663,7 @@ impl DeviceWeights {
             arena,
             layers: vec![layer],
             head: Some(HeadW { mixer, output: Mat { at: BORROWED, ..output.0 } }),
-            draft_in: Some(draft_in),
+            mtp_in: Some(mtp_in),
             borrowed: output.1,
             upload: started.elapsed(),
         })

@@ -421,7 +421,7 @@ impl SampleRow {
         (self.words[W_FLAGS] & F_MASK != 0).then_some(self.words[W_MASK])
     }
 
-    /// The row as a model's own draft block picks with it: the same settings,
+    /// The row as a model's MTP block picks with it: the same settings,
     /// noise and position, with what only the step's record can supply (the
     /// corrections and the mask) and what only the verifying row reports
     /// (probabilities, the surprise) taken away. A draft is a guess that the

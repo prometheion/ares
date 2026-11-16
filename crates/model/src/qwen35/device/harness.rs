@@ -57,7 +57,7 @@ impl Harness {
     }
 
     /// [`Harness::open`] for a placement on one device: [`Placement::single`],
-    /// possibly with the draft block ([`Placement::with_draft`]).
+    /// possibly with the MTP block ([`Placement::with_mtp`]).
     pub fn open_placed(
         device: &Device,
         c: &Config,

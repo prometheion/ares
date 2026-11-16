@@ -1,4 +1,4 @@
-//! What the prefix cache needs of the model's own draft block, on the real
+//! What the prefix cache needs of the model's MTP block, on the real
 //! Qwen3.8-27B's block: only the block, the embedding rows it keeps and the
 //! output head go to the device (two gigabytes), and the hidden states the model
 //! would compute are made up by the test.
@@ -27,7 +27,7 @@ use ares_cuda::{
 };
 use ares_gguf::Gguf;
 use ares_model::qwen35::device::{
-    DraftChain, DraftStep, Options, PAGE_ENTRY, Part, PartSetup, Placement, StepEnv, page_bytes,
+    MtpChain, MtpStep, Options, PAGE_ENTRY, Part, PartSetup, Placement, StepEnv, page_bytes,
 };
 use ares_model::qwen35::{Config, Weights};
 use ares_runtime::PinnedRam;
@@ -35,7 +35,7 @@ use ares_sampler::SampleParams;
 
 const PAGE: u32 = ENTRY_CELLS;
 
-/// The draft block on a device, with the buffers the runtime would own: two
+/// The MTP block on a device, with the buffers the runtime would own: two
 /// slots and a pool of sixteen pages.
 struct Rig {
     stream: Stream,
@@ -135,7 +135,7 @@ impl Rig {
             exchange: None,
             replay: &rows,
         };
-        self.part.enqueue_drafts(&env).unwrap();
+        self.part.enqueue_mtp(&env).unwrap();
         self.part.enqueue_follow(&env, hidden).unwrap();
         self.stream.synchronize().unwrap();
     }
@@ -161,23 +161,23 @@ impl Rig {
         };
         let rows = vec![SampleParams::GREEDY.row(0); links];
         self.part
-            .draft_step(DraftStep {
+            .mtp_step(MtpStep {
                 tokens: self.record.ptr().offset(off_tokens),
-                chains: vec![DraftChain { segment: 0, token, rows, needs: Vec::new(), place: 0 }],
+                chains: vec![MtpChain { segment: 0, token, rows, needs: Vec::new(), place: 0 }],
                 chances: None,
             })
             .unwrap();
-        self.part.enqueue_drafts(&env).unwrap();
+        self.part.enqueue_mtp(&env).unwrap();
         self.stream.synchronize().unwrap();
         let drafted = self.part.drafted().expect("the step drafted");
-        let (scratch, _) = self.part.draft_scratch(0).unwrap();
+        let (scratch, _) = self.part.mtp_scratch(0).unwrap();
         let mut bytes = vec![0u8; links * 4];
         scratch.read(drafted.ptr.as_raw() - scratch.ptr().as_raw(), &mut bytes).unwrap();
         let drafts =
             bytes.as_chunks::<4>().0.iter().map(|b| u32::from_le_bytes(*b)).collect::<Vec<_>>();
         let outputs = (0..links as u32)
             .map(|link| {
-                let (scratch, [out, ..]) = self.part.draft_scratch(link).unwrap();
+                let (scratch, [out, ..]) = self.part.mtp_scratch(link).unwrap();
                 let mut bytes = vec![0u8; self.d * 4];
                 scratch.read(out, &mut bytes).unwrap();
                 bytes
@@ -188,7 +188,7 @@ impl Rig {
 
     /// The carry row of `slot`.
     fn carry(&self, slot: u32) -> Vec<u8> {
-        let (carry, rows) = self.part.draft_carry().expect("the part has the block");
+        let (carry, rows) = self.part.mtp_carry().expect("the part has the block");
         let mut bytes = vec![0u8; self.d * 4];
         carry.read(u64::from(slot) * u64::from(rows) * self.d as u64 * 4, &mut bytes).unwrap();
         bytes
@@ -199,7 +199,7 @@ impl Rig {
     fn pool(&self) -> Vec<u8> {
         let mut bytes = vec![0u8; self.pages.len() as usize];
         self.pages.read(0, &mut bytes).unwrap();
-        if let Some(exact) = self.part.draft_exact_entries() {
+        if let Some(exact) = self.part.mtp_exact_entries() {
             let mut more = vec![0u8; exact.len() as usize];
             exact.read(0, &mut more).unwrap();
             bytes.extend(more);
@@ -272,16 +272,15 @@ fn setup() -> Option<Setup> {
     Some(Setup { device: Device::open(ordinal, Wait::Block).unwrap(), config, gguf })
 }
 
-/// Only the draft block, the embedding rows it keeps and the head on the device.
+/// Only the MTP block, the embedding rows it keeps and the head on the device.
 fn placement(c: &Config) -> Placement {
     let mut placement = Placement::single(c);
     placement.devices[0].blocks = vec![None; c.n_layer];
-    placement.with_draft(c, None).unwrap()
+    placement.with_mtp(c, None).unwrap()
 }
 
 #[test]
-fn a_sequence_that_restores_the_draft_blocks_carry_and_reads_a_copied_page_drafts_as_the_first_did()
-{
+fn a_sequence_that_restores_the_mtp_blocks_carry_and_reads_a_copied_page_drafts_as_the_first_did() {
     let Some(s) = setup() else { return };
     let weights = Weights::load(&s.gguf, &s.config).unwrap();
     let placement = placement(&s.config);
@@ -321,7 +320,7 @@ fn a_sequence_that_restores_the_draft_blocks_carry_and_reads_a_copied_page_draft
         assert_eq!(at, None, "link {link} parts at byte {at:?}");
     }
     eprintln!(
-        "RES the draft block drafted {:?} after a restored carry and a copied page, as it did \
+        "RES the MTP block drafted {:?} after a restored carry and a copied page, as it did \
          without, with the outputs of {} links bit for bit",
         got.drafts,
         got.outputs.len()
@@ -345,7 +344,7 @@ fn a_sequence_that_restores_the_draft_blocks_carry_and_reads_a_copied_page_draft
 }
 
 #[test]
-fn a_replay_leaves_the_draft_blocks_cells_alone_and_its_carry_at_the_last_row() {
+fn a_replay_leaves_the_mtp_blocks_cells_alone_and_its_carry_at_the_last_row() {
     let Some(s) = setup() else { return };
     let weights = Weights::load(&s.gguf, &s.config).unwrap();
     let placement = placement(&s.config);

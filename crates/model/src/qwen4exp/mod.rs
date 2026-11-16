@@ -14,7 +14,6 @@ pub mod weights;
 pub use config::{Config, SelectionRule};
 pub use error::{Error, Result};
 pub use reference::{
-    DraftState, DraftWindow, LogitRows, Observer, Recorder, Reference, Routing, SequenceState,
-    Window,
+    LogitRows, MtpState, MtpWindow, Observer, Recorder, Reference, Routing, SequenceState, Window,
 };
-pub use weights::{DraftWeights, Weights};
+pub use weights::{MtpWeights, Weights};

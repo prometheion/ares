@@ -28,7 +28,7 @@ use super::placement::Placement;
 use super::prune::{PruneMask, PruneStats};
 use super::session::Fill;
 use crate::qwen4exp::Config;
-use crate::qwen4exp::weights::{DraftWeights, Moe, Weights};
+use crate::qwen4exp::weights::{Moe, MtpWeights, Weights};
 
 fn invalid(message: impl Into<String>) -> Error {
     Error::Invalid(message.into())
@@ -36,13 +36,13 @@ fn invalid(message: impl Into<String>) -> Error {
 
 /// Where the experts' tensors are in the file, for a store with `per_layer`
 /// entries for each layer of the model. With `draft`, the experts of the
-/// model's draft block are the store's layer 0, in a file of their own that
+/// model's MTP block are the store's layer 0, in a file of their own that
 /// the reader opens behind the model's parts ([`reader`]).
 pub(super) fn expert_map(
     gguf: &Gguf,
     c: &Config,
     per_layer: usize,
-    draft: Option<&DraftLayer<'_>>,
+    mtp: Option<&MtpExperts<'_>>,
 ) -> Result<ExpertMap, Error> {
     let patterns = ["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"];
     let mut map = if per_layer > 1 {
@@ -55,11 +55,11 @@ pub(super) fn expert_map(
     } else {
         ExpertMap::discover(gguf, &patterns)?
     };
-    if let Some(draft) = draft {
-        let places = draft
+    if let Some(mtp) = mtp {
+        let places = mtp
             .weights
-            .expert_places(draft.gguf)
-            .ok_or_else(|| invalid("the draft block's experts are not in its file"))?;
+            .expert_places(mtp.gguf)
+            .ok_or_else(|| invalid("the mtp block's experts are not in its file"))?;
         let spans = places.map(|p| ExpertSpan {
             file: FileId(gguf.n_parts() as u16 + p.part),
             base: p.base,
@@ -72,24 +72,24 @@ pub(super) fn expert_map(
 }
 
 /// The reader of the model's parts and, behind them, of the parts of the
-/// file of its draft block.
-pub(super) fn reader(gguf: &Gguf, draft: Option<&Gguf>) -> Result<Reader, Error> {
+/// file of its MTP block.
+pub(super) fn reader(gguf: &Gguf, mtp: Option<&Gguf>) -> Result<Reader, Error> {
     let config = ares_io::Config::default();
-    let Some(draft) = draft else {
+    let Some(mtp) = mtp else {
         return Ok(Reader::open_gguf(gguf, config)?);
     };
     let paths: Vec<&std::path::Path> = (0..gguf.n_parts())
         .map(|part| gguf.path(part as u16))
-        .chain((0..draft.n_parts()).map(|part| draft.path(part as u16)))
+        .chain((0..mtp.n_parts()).map(|part| mtp.path(part as u16)))
         .collect();
     Ok(Reader::open(&paths, config)?)
 }
 
-/// The draft block of a model as the store sees it.
+/// The MTP block of a model as the store sees it.
 #[derive(Clone, Copy, Debug)]
-pub(super) struct DraftLayer<'a> {
+pub(super) struct MtpExperts<'a> {
     pub gguf: &'a Gguf,
-    pub weights: &'a DraftWeights<'a>,
+    pub weights: &'a MtpWeights<'a>,
     /// The device that runs the block: the one with the output head.
     pub device: usize,
 }
@@ -108,13 +108,13 @@ pub(super) struct Layout {
     /// The bytes of the experts a device would hold if it held its share of
     /// them all.
     pub expert_bytes: u64,
-    /// The store's layers in front of the model's: 1 with a draft block, whose
+    /// The store's layers in front of the model's: 1 with an MTP block, whose
     /// experts are layer 0 (a step routes it before any layer of the model),
     /// 0 without.
     pub base: usize,
-    /// The device of the draft block and the bytes of all its experts, which
+    /// The device of the MTP block and the bytes of all its experts, which
     /// stay resident there.
-    pub draft: Option<(usize, u64)>,
+    pub mtp: Option<(usize, u64)>,
 }
 
 impl Layout {
@@ -125,12 +125,12 @@ impl Layout {
         c: &Config,
         w: &Weights<'_>,
         placement: &Placement,
-        draft: Option<&DraftLayer<'_>>,
+        mtp: Option<&MtpExperts<'_>>,
     ) -> Result<(Self, ExpertMap), Error> {
         let per_layer = if placement.tensor.is_some() { placement.devices.len() } else { 1 };
         let store_layers = c.n_layer * per_layer;
-        let map = expert_map(gguf, c, per_layer, draft)?;
-        let base = usize::from(draft.is_some());
+        let map = expert_map(gguf, c, per_layer, mtp)?;
+        let base = usize::from(mtp.is_some());
         let mut specs = Vec::with_capacity(base + store_layers);
         let mut shapes = Vec::with_capacity(base + store_layers);
         let mut expert_bytes = 0u64;
@@ -155,14 +155,14 @@ impl Layout {
                 resident,
             })
         };
-        let mut draft_bytes = None;
-        if let Some(draft) = draft {
-            // The draft block's experts stay in VRAM, all of them: a chain
+        let mut mtp_bytes = None;
+        if let Some(mtp) = mtp {
+            // The MTP block's experts stay in VRAM, all of them: a chain
             // routes them in every link, and a link that waits for an expert
             // costs what a token costs.
-            let shape = shape_of(&draft.weights.layer.moe);
-            let spec = spec_of(&shape, draft.device, "the draft block", true)?;
-            draft_bytes = Some((draft.device, spec.slot_bytes * c.experts.count as u64));
+            let shape = shape_of(&mtp.weights.layer.moe);
+            let spec = spec_of(&shape, mtp.device, "the mtp block", true)?;
+            mtp_bytes = Some((mtp.device, spec.slot_bytes * c.experts.count as u64));
             specs.push(spec);
             shapes.push(shape);
         }
@@ -181,20 +181,20 @@ impl Layout {
             specs.push(spec);
             shapes.push(shape);
         }
-        Ok((Self { specs, shapes, per_layer, expert_bytes, base, draft: draft_bytes }, map))
+        Ok((Self { specs, shapes, per_layer, expert_bytes, base, mtp: mtp_bytes }, map))
     }
 
-    /// The bytes of the draft block's experts on `device`: all of them on the
+    /// The bytes of the MTP block's experts on `device`: all of them on the
     /// device that runs the block, none elsewhere.
-    pub(super) fn draft_bytes(&self, device: usize) -> u64 {
-        self.draft.filter(|(on, _)| *on == device).map_or(0, |(_, bytes)| bytes)
+    pub(super) fn mtp_bytes(&self, device: usize) -> u64 {
+        self.mtp.filter(|(on, _)| *on == device).map_or(0, |(_, bytes)| bytes)
     }
 
     /// The most bytes a tier in host memory can use: one slot per expert that
     /// has none in VRAM is all it ever holds, and a slot is the expert and a
     /// few blocks of the file.
     pub(super) fn ram_wanted(&self, vram_bytes: u64) -> u64 {
-        let all = self.expert_bytes + self.draft.map_or(0, |(_, bytes)| bytes);
+        let all = self.expert_bytes + self.mtp.map_or(0, |(_, bytes)| bytes);
         (all + (all >> 4)).saturating_sub(vram_bytes).max(64 << 20)
     }
 
@@ -203,7 +203,7 @@ impl Layout {
         self.base + if self.per_layer > 1 { layer * self.per_layer + part } else { layer }
     }
 
-    /// The store's layers of the model, without the draft block's.
+    /// The store's layers of the model, without the MTP block's.
     pub(super) fn model_layers(&self) -> std::ops::Range<usize> {
         self.base..self.specs.len()
     }
@@ -382,9 +382,9 @@ pub(super) struct Feed {
     ahead_seen: (u64, f64),
     /// Whether the reads of the layers ahead are started on a guess.
     read_ahead: bool,
-    /// The route records of the model's draft block, whose experts are layer
+    /// The route records of the model's MTP block, whose experts are layer
     /// 0 of the store.
-    draft: Option<DraftRecords>,
+    mtp: Option<MtpRecords>,
     /// The pruning of the routers, when the model prunes (`prune.rs`).
     prune: Option<FeedPrune>,
 }
@@ -405,10 +405,10 @@ struct FeedPrune {
     counts: Vec<u32>,
 }
 
-/// The route records of a draft block. Its steps run one after the other
+/// The route records of an MTP block. Its steps run one after the other
 /// inside a step of the model, each with a record of its own in the same
 /// place of the block's board.
-struct DraftRecords {
+struct MtpRecords {
     board: Arc<Board>,
     /// The rows of the block's step whose record the store has not seen yet.
     waiting: Option<u32>,
@@ -442,7 +442,7 @@ impl Feed {
             rows: 0,
             groups: Vec::new(),
             wide: WideStats::default(),
-            draft: None,
+            mtp: None,
             prune: None,
         }
     }
@@ -479,23 +479,23 @@ impl Feed {
         self.prune.as_mut().map(|p| std::mem::take(&mut p.stats)).unwrap_or_default()
     }
 
-    /// The board of the model's draft block: its records are those of layer 0
+    /// The board of the model's MTP block: its records are those of layer 0
     /// of the store.
-    pub(super) fn set_draft(&mut self, board: Arc<Board>) {
-        self.draft = Some(DraftRecords { board, waiting: None });
+    pub(super) fn set_mtp(&mut self, board: Arc<Board>) {
+        self.mtp = Some(MtpRecords { board, waiting: None });
     }
 
-    /// A step of the draft block with `rows` rows was enqueued: its route
+    /// A step of the MTP block with `rows` rows was enqueued: its route
     /// record is on its way to the block's board.
-    pub(super) fn draft_routed(&mut self, rows: u32) {
-        if let Some(draft) = &mut self.draft {
-            draft.waiting = Some(rows);
+    pub(super) fn mtp_routed(&mut self, rows: u32) {
+        if let Some(mtp) = &mut self.mtp {
+            mtp.waiting = Some(rows);
         }
     }
 
-    /// Whether the store has the route record of the draft block's last step.
-    pub(super) fn draft_followed(&self) -> bool {
-        self.draft.as_ref().is_none_or(|draft| draft.waiting.is_none())
+    /// Whether the store has the route record of the MTP block's last step.
+    pub(super) fn mtp_followed(&self) -> bool {
+        self.mtp.as_ref().is_none_or(|mtp| mtp.waiting.is_none())
     }
 
     /// With both devices on every layer: the part that owns each expert of each
@@ -604,8 +604,8 @@ impl Feed {
         self.store.take_stats();
         let before = self.store.reader().stats();
         let shared = self.layout.per_layer > 1;
-        if self.draft.is_some() {
-            // The draft block is asked as the layer behind the model's last.
+        if self.mtp.is_some() {
+            // The MTP block is asked as the layer behind the model's last.
             let mut order = experts_of(n_layer);
             let (vram, ram) = self.store.slots(0);
             order.truncate((vram + ram).min(n_experts));
@@ -652,12 +652,12 @@ impl Feed {
         Ok(())
     }
 
-    /// Brings the experts of the draft block into the tiers as far as its
+    /// Brings the experts of the MTP block into the tiers as far as its
     /// slots go, before the first step: the block's router runs for every
     /// link of a chain, and the first chains of a server decide what the
     /// conductor takes a link to cost. No step may run meanwhile.
-    pub(super) fn fill_draft(&mut self, n_experts: usize) -> Result<(), Error> {
-        if self.draft.is_none() {
+    pub(super) fn fill_mtp(&mut self, n_experts: usize) -> Result<(), Error> {
+        if self.mtp.is_none() {
             return Ok(());
         }
         let (vram, ram) = self.store.slots(0);
@@ -705,12 +705,12 @@ impl Feed {
     /// the order of its layers, of the first `enqueued[part]` layers, and lets
     /// the store work. Never waits.
     pub(super) fn pump(&mut self, enqueued: &[usize]) -> Result<(), Error> {
-        if let Some(draft) = &mut self.draft
-            && let Some(rows) = draft.waiting
-            && draft.board.arrived(0)?
+        if let Some(mtp) = &mut self.mtp
+            && let Some(rows) = mtp.waiting
+            && mtp.board.arrived(0)?
         {
-            let record = RouteRecord::parse(draft.board.record(0), self.used, rows)
-                .ok_or_else(|| invalid("a route record of the draft block that is none"))?;
+            let record = RouteRecord::parse(mtp.board.record(0), self.used, rows)
+                .ok_or_else(|| invalid("a route record of the mtp block that is none"))?;
             self.groups.clear();
             self.groups.extend(record.groups());
             self.store.routed_rows(
@@ -718,9 +718,9 @@ impl Feed {
                 record.token(),
                 rows as usize,
                 &self.groups,
-                draft.board.rows(0, rows as usize),
+                mtp.board.rows(0, rows as usize),
             )?;
-            draft.waiting = None;
+            mtp.waiting = None;
         }
         if self.rows > MAX_BATCH {
             // The layers of a wide step are followed by `Misses`.

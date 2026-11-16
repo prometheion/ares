@@ -118,7 +118,7 @@ reference does not imitate another implementation's rounding.
 - Quantized weights: on the CPU the fork rounds activations to 8 bits for them, so
   only the unquantized model is compared. The decoders are checked against ggml in
   `ares-quant`.
-- Images, and the MTP draft block (the fork cannot read Strata's MTP file).
+- Images, and the MTP MTP block (the fork cannot read Strata's MTP file).
 - The fork's own generator, `test-llama-archs -a qwen4exp -o DIR`: the prebuilt
   binary in `build/bin` is older than the libraries (2026-10-20 against 2026-11-03)
   and fails with "key not found in model: qwen4exp.ssm.group_count". It was not

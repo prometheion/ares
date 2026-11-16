@@ -1,4 +1,4 @@
-//! A part that is the model's draft block (section 4 of the specification):
+//! A part that is the model's MTP block (section 4 of the specification):
 //! one layer of the attention kind with a mixture of experts of its own, as a
 //! model of one layer whose residual comes from elsewhere and whose output
 //! head is the model's.
@@ -9,7 +9,7 @@
 //!
 //! - **The input.** A row starts from a residual (the trunk's after its last
 //!   layer, or the block's own of the link before) and the embedding of the
-//!   token it is paired with ([`Part::block_input`]):
+//!   token it is paired with ([`Part::mtp_input`]):
 //!
 //!   ```text
 //!   e     = fc_embedding (rms(embedding) * norm_embedding)
@@ -32,12 +32,12 @@ use ares_core::Ledger;
 use ares_cuda::{Device, DeviceBuffer, DevicePtr, Kernels, MAX_BATCH, PinnedBuffer, Stream};
 use ares_runtime::ModelError;
 
-use super::{DRAFT_KV, Frame, Options, Part, PartShape, Role, StepEnv, invalid};
+use super::{Frame, MTP_KV, Options, Part, PartShape, Role, StepEnv, invalid};
 use crate::qwen4exp::Config;
 use crate::qwen4exp::device::load::{CoreW, DeviceWeights, Mat};
-use crate::qwen4exp::weights::DraftWeights;
+use crate::qwen4exp::weights::MtpWeights;
 
-/// The buffers of a draft block's input, for [`MAX_BATCH`] rows.
+/// The buffers of an MTP block's input, for [`MAX_BATCH`] rows.
 pub(super) struct State {
     /// The embeddings of the paired tokens, once per stream, as the host
     /// stages them.
@@ -57,15 +57,15 @@ pub(super) struct State {
 }
 
 impl Part {
-    /// Builds the part of a draft block: `c` is the block as a model of one
-    /// layer (`reference::block_config`), `w` its weights, and `output` the
+    /// Builds the part of an MTP block: `c` is the block as a model of one
+    /// layer (`reference::mtp_config`), `w` its weights, and `output` the
     /// model's output head on `device` with its description
     /// ([`Part::output`] of the part that holds it, which must outlive this
     /// one). `opts.max_rows` must be at most [`MAX_BATCH`]: the block runs the
     /// decode kernels.
-    pub(crate) fn open_block(
+    pub(crate) fn open_mtp(
         c: &Config,
-        w: &DraftWeights<'_>,
+        w: &MtpWeights<'_>,
         opts: &Options,
         index: usize,
         output: (Mat, DevicePtr),
@@ -73,16 +73,16 @@ impl Part {
         ledger: &mut Ledger,
     ) -> Result<Self, ModelError> {
         if c.n_layer != 1 || !c.is_attention(0) || c.ngram.is_some() {
-            return Err(invalid("a draft block is one attention layer without the n-gram block"));
+            return Err(invalid("an MTP block is one attention layer without the n-gram block"));
         }
         if opts.max_rows > MAX_BATCH {
             return Err(invalid(format!(
-                "a draft block runs steps of up to {MAX_BATCH} rows, not {}",
+                "an MTP block runs steps of up to {MAX_BATCH} rows, not {}",
                 opts.max_rows
             )));
         }
         // The block's K and V are in 4 bits, whatever the model's.
-        let opts = &Options { kv: DRAFT_KV, prune: None, ..opts.clone() };
+        let opts = &Options { kv: MTP_KV, prune: None, ..opts.clone() };
         let shape = PartShape::whole(c, 0..1, true);
         let f = Frame::new(c, opts, &shape, device.info().multiprocessors)?;
         let weights = DeviceWeights::load_block(device, ledger, c, w, output)?;
@@ -97,7 +97,7 @@ impl Part {
             device,
             ledger,
             false,
-            "qwen4exp draft block",
+            "qwen4exp MTP block",
         )?;
         let rows = u64::from(MAX_BATCH);
         let row = c.wide() as u64 * 4;
@@ -105,8 +105,8 @@ impl Part {
         let act = 4 * rows * row;
         let len = act + Kernels::quantized_activation_bytes(c.n_embd as u32, MAX_BATCH);
         let saved = part.f.slot_bytes * u64::from(opts.max_slots);
-        ledger.reserve("qwen4exp draft block input", len + saved)?;
-        part.block = Some(State {
+        ledger.reserve("qwen4exp MTP block input", len + saved)?;
+        part.mtp = Some(State {
             emb_host: PinnedBuffer::new(device, (rows * row) as usize)?,
             scratch: DeviceBuffer::new(device, len)?,
             emb,
@@ -120,12 +120,12 @@ impl Part {
     }
 
     /// The model's output head on this part's device and its description, for
-    /// a draft block on the same device; `None` for a part without the head.
+    /// an MTP block on the same device; `None` for a part without the head.
     pub(crate) fn output(&self) -> Option<(Mat, DevicePtr)> {
         if self.role == Role::Worker { None } else { self.w.output() }
     }
 
-    /// Enqueues the input of a draft block for `rows` rows and returns where
+    /// Enqueues the input of an MTP block for `rows` rows and returns where
     /// it is (`rows * D` f32, valid until the next call): what
     /// [`StepEnv::inbound`] of the block's step names. `residual` addresses
     /// the rows' residuals on this device (`rows * D` f32) and `embeddings`
@@ -137,7 +137,7 @@ impl Part {
     /// 16-byte aligned, that stay as they are until the launches have run.
     /// The device must have run the block's last step: its host buffers are
     /// written again here.
-    pub unsafe fn block_input(
+    pub unsafe fn mtp_input(
         &mut self,
         stream: &Stream,
         residual: DevicePtr,
@@ -145,11 +145,11 @@ impl Part {
         rows: u32,
     ) -> Result<DevicePtr, ModelError> {
         let (n, hc, wide, eps) = (self.n, self.hc, self.wide, self.eps);
-        let input = self.w.draft_in.ok_or_else(|| invalid("the part is no draft block"))?;
-        let block = self.block.as_mut().ok_or_else(|| invalid("the part is no draft block"))?;
+        let input = self.w.mtp_in.ok_or_else(|| invalid("the part is no MTP block"))?;
+        let block = self.mtp.as_mut().ok_or_else(|| invalid("the part is no MTP block"))?;
         if rows == 0 || rows > MAX_BATCH || embeddings.len() != (rows * n) as usize {
             return Err(invalid(format!(
-                "the input of a draft block for {rows} rows from {} embedding values",
+                "the input of an MTP block for {rows} rows from {} embedding values",
                 embeddings.len()
             )));
         }
@@ -268,7 +268,7 @@ impl Part {
     }
 
     fn slot_copy(&self, slot: u32) -> Result<(DevicePtr, DevicePtr, usize), ModelError> {
-        let block = self.block.as_ref().ok_or_else(|| invalid("the part is no draft block"))?;
+        let block = self.mtp.as_ref().ok_or_else(|| invalid("the part is no MTP block"))?;
         if slot >= self.opts.max_slots {
             return Err(invalid(format!("slot {slot} of {}", self.opts.max_slots)));
         }

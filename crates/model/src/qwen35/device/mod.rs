@@ -30,7 +30,7 @@ pub use choose::{Balance, LayoutProbe, LayoutReport, Layouts};
 pub use embed::EmbeddingReport;
 pub use harness::Harness;
 pub use part::{
-    CopyTimes, DRAFT_KV, DraftBytes, DraftChain, DraftStep, DraftTimes, Drafted, Exchange, Options,
+    CopyTimes, Drafted, Exchange, MTP_KV, MtpBytes, MtpChain, MtpStep, MtpTimes, Options,
     PAGE_ENTRY, PHASES, Part, PartSetup, Phase, Profile, StepEnv, TAILS_PER_SLOT, checkpoint_bytes,
     exact_bytes, page_bytes, state_slot_bytes,
 };

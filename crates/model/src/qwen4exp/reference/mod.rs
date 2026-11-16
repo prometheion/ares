@@ -29,16 +29,16 @@
 //! fixed order.
 //!
 //! Only text is implemented: the rotary position of a cell is its index, and
-//! every cell hashes its own token. The MTP draft block (section 4) is in
+//! every cell hashes its own token. The MTP MTP block (section 4) is in
 //! `draft.rs`: the mixer, attention and expert functions of this module with
 //! the block's own weights, on what [`Window::trunk_out`] holds.
 
 mod blocks;
-mod draft;
+mod mtp;
 mod ops;
 
-pub(crate) use draft::block_config;
-pub use draft::{DraftState, DraftWindow};
+pub(crate) use mtp::mtp_config;
+pub use mtp::{MtpState, MtpWindow};
 
 /// The operations of the reference that GPU kernels are held to one by one.
 /// Each is a pure function over slices with one documented order of
@@ -287,7 +287,7 @@ pub struct Window {
     /// values, stream `c` of a row at `[c * N, (c + 1) * N)`.
     pub residual: Vec<Vec<f32>>,
     /// The residual after the last layer, `rows * D` values: what the final
-    /// mixer reads and what the MTP draft block starts from.
+    /// mixer reads and what the MTP MTP block starts from.
     pub trunk_out: Vec<f32>,
     /// The output of the final mixer, `rows * N` values.
     pub final_mix: Vec<f32>,

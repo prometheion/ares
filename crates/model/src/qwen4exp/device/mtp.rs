@@ -1,6 +1,6 @@
-//! The model's draft block (section 4 of the specification) as a device
+//! The model's MTP block (section 4 of the specification) as a device
 //! thread of the runtime drives it: a part of one layer on the device that
-//! holds the output head ([`Part::open_block`]), which runs steps of its own
+//! holds the output head ([`Part::open_mtp`]), which runs steps of its own
 //! in front of every step of the model.
 //!
 //! Cell `i` of the block pairs the model's residual after its last layer at
@@ -70,8 +70,8 @@ use super::runtime::{Embedding, Flow};
 use crate::blocks::slots::{Extent, PageArray, PageGroup};
 use crate::qwen4exp::Config;
 use crate::qwen4exp::device::load::Mat;
-use crate::qwen4exp::reference::block_config;
-use crate::qwen4exp::weights::DraftWeights;
+use crate::qwen4exp::reference::mtp_config;
+use crate::qwen4exp::weights::MtpWeights;
 
 fn invalid(message: impl Into<String>) -> ModelError {
     ModelError::Invalid(message.into())
@@ -127,7 +127,7 @@ struct Row {
 
 /// What the block took and did, for reports.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct DraftReport {
+pub struct MtpReport {
     /// The device part that holds the block.
     pub index: usize,
     /// Bytes of its dense weights on the device.
@@ -140,7 +140,7 @@ pub struct DraftReport {
 
 /// Device and host time of the block, added up over steps.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct DraftTimes {
+pub struct MtpTimes {
     /// Steps of the model in which a chain ran.
     pub chain_steps: u64,
     /// Links of all chains of those steps (a link of several sequences counts
@@ -162,7 +162,7 @@ pub struct DraftTimes {
 /// A chain the block made: for tests and measurements that compare its
 /// drafts with the reference's.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Drafted {
+pub struct MtpDrafted {
     /// The sequence slot.
     pub slot: u32,
     /// The cell of the model the chain's first draft is a guess for: one
@@ -174,19 +174,19 @@ pub struct Drafted {
     pub drafts: Vec<u32>,
 }
 
-/// What a draft block tells whoever watches it.
+/// What an MTP block tells whoever watches it.
 #[derive(Debug, Default)]
 pub(super) struct Watch {
-    pub times: DraftTimes,
+    pub times: MtpTimes,
     /// The newest chains, oldest first, at most [`Watch::KEPT`].
-    pub recent: std::collections::VecDeque<Drafted>,
+    pub recent: std::collections::VecDeque<MtpDrafted>,
 }
 
 impl Watch {
     const KEPT: usize = 1024;
 }
 
-pub(super) struct DraftBlock {
+pub(super) struct MtpBlock {
     part: Part,
     embedding: Embedding,
     sampler: SamplerKernels,
@@ -231,19 +231,19 @@ pub(super) struct DraftBlock {
     n_vocab: u32,
     max_slots: u32,
     last_chain_ms: f64,
-    times: DraftTimes,
+    times: MtpTimes,
     watch: Arc<std::sync::Mutex<Watch>>,
     x: Vec<f32>,
-    report: DraftReport,
+    report: MtpReport,
 }
 
-impl std::fmt::Debug for DraftBlock {
+impl std::fmt::Debug for MtpBlock {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("DraftBlock").field("report", &self.report).finish_non_exhaustive()
+        f.debug_struct("MtpBlock").field("report", &self.report).finish_non_exhaustive()
     }
 }
 
-impl DraftBlock {
+impl MtpBlock {
     /// Builds the block on `device`, next to the model part `index` that
     /// holds the output head `output`. `opts` are the model part's: the block
     /// has the same sequences, pages and formats, and steps of up to
@@ -251,7 +251,7 @@ impl DraftBlock {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn open(
         c: &Config,
-        w: &DraftWeights<'_>,
+        w: &MtpWeights<'_>,
         opts: &Options,
         index: usize,
         output: (Mat, DevicePtr),
@@ -260,7 +260,7 @@ impl DraftBlock {
         device: &Device,
         ledger: &mut Ledger,
     ) -> Result<Self, ModelError> {
-        let block = block_config(c);
+        let block = mtp_config(c);
         let opts = Options {
             max_rows: MAX_BATCH,
             logit_rows: MAX_BATCH,
@@ -270,10 +270,10 @@ impl DraftBlock {
             ..opts.clone()
         };
         let before = ledger.reserved();
-        let part = Part::open_block(&block, w, &opts, index, output, device, ledger)?;
+        let part = Part::open_mtp(&block, w, &opts, index, output, device, ledger)?;
         let weights = part.weight_bytes();
         let pool_bytes = part.pool_bytes();
-        ledger.reserve("qwen4exp draft block K, V and keys", pool_bytes)?;
+        ledger.reserve("qwen4exp MTP block K, V and keys", pool_bytes)?;
         let pools = DeviceBuffer::new(device, pool_bytes.max(64))?;
         let wide = c.wide() as u64;
         let rows = u64::from(MAX_BATCH);
@@ -286,7 +286,7 @@ impl DraftBlock {
         let work_bytes = exchange_at + u64::from(SamplerKernels::exchange_values(MAX_BATCH, 1)) * 4;
         let drafts_bytes = rows * 4;
         ledger.reserve(
-            "qwen4exp draft block carries and picks",
+            "qwen4exp MTP block carries and picks",
             carry_bytes + staged_bytes + work_bytes + drafts_bytes,
         )?;
         let carry = DeviceBuffer::new(device, carry_bytes)?;
@@ -295,7 +295,7 @@ impl DraftBlock {
         work.write(scratch_at, &vec![0u8; scratch_bytes as usize])?;
         let picks_host = (rows as usize * SampleRow::BYTES).next_multiple_of(64);
         let drafts_host = (picks_host + rows as usize * SamplePick::BYTES).next_multiple_of(64);
-        let report = DraftReport {
+        let report = MtpReport {
             index,
             weights,
             pools: pool_bytes,
@@ -329,7 +329,7 @@ impl DraftBlock {
             n_vocab: c.n_vocab as u32,
             max_slots: opts.max_slots,
             last_chain_ms: 0.0,
-            times: DraftTimes::default(),
+            times: MtpTimes::default(),
             watch,
             x: Vec::new(),
             report,
@@ -347,7 +347,7 @@ impl DraftBlock {
         self.part.set_experts(vec![at])
     }
 
-    pub(super) fn report(&self) -> DraftReport {
+    pub(super) fn report(&self) -> MtpReport {
         self.report
     }
 
@@ -624,7 +624,7 @@ impl DraftBlock {
             if watch.recent.len() == Watch::KEPT {
                 watch.recent.pop_front();
             }
-            watch.recent.push_back(Drafted {
+            watch.recent.push_back(MtpDrafted {
                 slot: s.slot,
                 position: s.pos0 as u32 + 1,
                 token: tokens[s.row0 as usize],
@@ -723,7 +723,7 @@ impl DraftBlock {
     ) -> Result<Option<Vec<(u32, f32)>>, ModelError> {
         let n = rows.len() as u32;
         if n == 0 || n > MAX_BATCH {
-            return Err(invalid(format!("a step of the draft block of {n} rows")));
+            return Err(invalid(format!("a step of the MTP block of {n} rows")));
         }
         let row_bytes = self.wide * 4;
         // The inputs of a step are staged in host memory the device copies
@@ -732,7 +732,7 @@ impl DraftBlock {
         if std::mem::take(&mut self.writing) {
             let started = Instant::now();
             while !self.wrote.is_done()? {
-                flow.check(started, "the draft block wrote keys")?;
+                flow.check(started, "the MTP block wrote keys")?;
                 flow.pump()?;
                 std::hint::spin_loop();
             }
@@ -778,7 +778,7 @@ impl DraftBlock {
         }
         // SAFETY: the staged rows were enqueued above and are not written
         // again before the next step of the block.
-        let input = unsafe { self.part.block_input(stream, self.staged.ptr(), &self.x, n)? };
+        let input = unsafe { self.part.mtp_input(stream, self.staged.ptr(), &self.x, n)? };
 
         // The rows of a sequence are one segment.
         let mut segments: Vec<Segment> = Vec::new();
@@ -835,7 +835,7 @@ impl DraftBlock {
             return Err(invalid("a sampler row for every row of a link"));
         }
         self.part.enqueue_layer(&env, 0)?;
-        flow.lock_feed().draft_routed(n);
+        flow.lock_feed().mtp_routed(n);
         self.part.end(&env)?;
         // SAFETY: the sections of the pinned buffer and of the work buffer
         // hold `MAX_BATCH` rows; the logits are those of the `n` rows the
@@ -889,10 +889,10 @@ impl DraftBlock {
         // what the block's router asked for by then.
         let started = Instant::now();
         loop {
-            if self.picked.is_done()? && flow.lock_feed().draft_followed() {
+            if self.picked.is_done()? && flow.lock_feed().mtp_followed() {
                 break;
             }
-            flow.check(started, "the draft block made its picks")?;
+            flow.check(started, "the MTP block made its picks")?;
             flow.pump()?;
             std::hint::spin_loop();
         }
@@ -908,7 +908,7 @@ impl DraftBlock {
             let pick = SamplePick::from_bytes(bytes);
             if pick.status != 0 || pick.token >= self.n_vocab {
                 return Err(invalid(format!(
-                    "the draft block's row {i}: the sampler reported status {:#x} and token {}",
+                    "the MTP block's row {i}: the sampler reported status {:#x} and token {}",
                     pick.status, pick.token
                 )));
             }

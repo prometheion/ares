@@ -1,4 +1,4 @@
-//! The draft block of `qwen4exp` in the CPU reference, on a small made-up
+//! The MTP block of `qwen4exp` in the CPU reference, on a small made-up
 //! model and a made-up block for it: no model file is needed.
 //!
 //! What is tested is the block against itself (a row has the same bits alone,
@@ -13,7 +13,7 @@ use ares_core::GgmlType;
 use ares_gguf::Gguf;
 use ares_model::qwen4exp::synthetic::{Synthetic, Types};
 use ares_model::qwen4exp::{
-    Config, DraftState, DraftWeights, Error, LogitRows, Reference, SequenceState, Weights,
+    Config, Error, LogitRows, MtpState, MtpWeights, Reference, SequenceState, Weights,
 };
 
 fn open(name: &str, bytes: &[u8]) -> Gguf {
@@ -38,7 +38,7 @@ fn the_made_up_block_loads_as_described() {
     let gguf = open("loads-model", &model.bytes());
     let file = open("loads", &model.draft_bytes(Some((GgmlType::Q8_0, GgmlType::F16))));
     let config = Config::from_gguf(&gguf).expect("config");
-    let head = DraftWeights::load(&file, &config).expect("the block");
+    let head = MtpWeights::load(&file, &config).expect("the block");
     let s = &model.shape;
 
     // Gate and up are the two halves of an expert's slab of the fused tensor.
@@ -72,17 +72,17 @@ fn the_made_up_block_loads_as_described() {
 }
 
 #[test]
-fn a_model_file_is_not_a_draft_block_and_a_block_of_another_shape_is_refused() {
+fn a_model_file_is_not_an_mtp_block_and_a_block_of_another_shape_is_refused() {
     let model = Synthetic::small(12);
     let gguf = open("refused-model", &model.bytes());
     let config = Config::from_gguf(&gguf).expect("config");
-    let error = DraftWeights::load(&gguf, &config).expect_err("a model is no block");
-    assert!(matches!(error, Error::NotADraftBlock { .. }), "{error}");
+    let error = MtpWeights::load(&gguf, &config).expect_err("a model is no block");
+    assert!(matches!(error, Error::NotAnMtpBlock { .. }), "{error}");
 
     let mut other = model.clone();
     other.shape.expert_ff *= 2;
     let file = open("refused-shape", &other.draft_bytes(None));
-    let error = DraftWeights::load(&file, &config).expect_err("another shape");
+    let error = MtpWeights::load(&file, &config).expect_err("another shape");
     assert!(matches!(error, Error::TensorShape { .. }), "{error}");
 }
 
@@ -93,11 +93,11 @@ fn the_input_is_the_projected_streams_plus_the_projected_embedding() {
     let file = open("input", &model.draft_bytes(None));
     let config = Config::from_gguf(&gguf).expect("config");
     let weights = Weights::load(&gguf, &config).expect("weights");
-    let head = DraftWeights::load(&file, &config).expect("the block");
+    let head = MtpWeights::load(&file, &config).expect("the block");
     let reference = Reference::new(&config, &weights).threads(2);
     let tokens = model.shape.tokens(4, 3);
     let rt = trunk_out(&reference, &config, &tokens[..3]);
-    let input = reference.draft_input(&head, &rt, &tokens[1..]);
+    let input = reference.mtp_input(&head, &rt, &tokens[1..]);
 
     // The same in plain f64 sums, one value at a time.
     let (n, wide) = (config.n_embd, config.wide());
@@ -150,7 +150,7 @@ fn a_row_has_the_same_bits_alone_in_a_window_and_after_a_commit() {
     let file = open("rows", &model.draft_bytes(None));
     let config = Config::from_gguf(&gguf).expect("config");
     let weights = Weights::load(&gguf, &config).expect("weights");
-    let head = DraftWeights::load(&file, &config).expect("the block");
+    let head = MtpWeights::load(&file, &config).expect("the block");
     let reference = Reference::new(&config, &weights).threads(2);
     // Past the dense limit of the made-up model (11 cells), so the block's
     // own indexer selects.
@@ -160,13 +160,13 @@ fn a_row_has_the_same_bits_alone_in_a_window_and_after_a_commit() {
     let wide = config.wide();
 
     let whole = reference
-        .draft_window(&head, &DraftState::new(), &rt, &tokens[1..], LogitRows::All)
+        .draft_window(&head, &MtpState::new(), &rt, &tokens[1..], LogitRows::All)
         .expect("one window");
     assert_eq!(whole.rows(), n);
     assert!(whole.logits.iter().all(|v| v.is_finite()));
 
     // Row by row, each committed; and in two windows with a rejected tail.
-    let mut state = DraftState::new();
+    let mut state = MtpState::new();
     for t in 0..n {
         let row = reference
             .draft_window(
@@ -180,25 +180,25 @@ fn a_row_has_the_same_bits_alone_in_a_window_and_after_a_commit() {
         assert_eq!(bits(&row.out), bits(&whole.out[t * wide..(t + 1) * wide]), "row {t}");
         assert_eq!(bits(row.logits_of(0).unwrap()), bits(whole.logits_of(t).unwrap()));
         assert_eq!(row.draft(0), whole.draft(t));
-        reference.draft_commit(&mut state, &row, 1).expect("commit");
+        reference.mtp_commit(&mut state, &row, 1).expect("commit");
     }
-    let mut split = DraftState::new();
+    let mut split = MtpState::new();
     let first = reference
         .draft_window(&head, &split, &rt[..9 * wide], &tokens[1..10], LogitRows::None)
         .expect("nine rows");
     // Six of the nine count; the other three leave no trace.
-    reference.draft_commit(&mut split, &first, 6).expect("commit");
+    reference.mtp_commit(&mut split, &first, 6).expect("commit");
     assert_eq!(split.position(), 6);
     let rest = reference
         .draft_window(&head, &split, &rt[6 * wide..], &tokens[7..], LogitRows::All)
         .expect("the rest");
     assert_eq!(bits(&rest.out), bits(&whole.out[6 * wide..]));
-    reference.draft_commit(&mut split, &rest, n - 6).expect("commit");
+    reference.mtp_commit(&mut split, &rest, n - 6).expect("commit");
     assert_eq!(split, state);
     assert_eq!(state.kv().0.len(), n * config.attention_dims().1);
 
     assert!(matches!(
-        reference.draft_commit(&mut split, &rest, 1),
+        reference.mtp_commit(&mut split, &rest, 1),
         Err(Error::WindowPosition { .. })
     ));
 }
@@ -210,7 +210,7 @@ fn a_chain_is_its_links_one_by_one_and_leaves_the_state() {
     let file = open("chain", &model.draft_bytes(None));
     let config = Config::from_gguf(&gguf).expect("config");
     let weights = Weights::load(&gguf, &config).expect("weights");
-    let head = DraftWeights::load(&file, &config).expect("the block");
+    let head = MtpWeights::load(&file, &config).expect("the block");
     let reference = Reference::new(&config, &weights).threads(2);
     let n = 6;
     let tokens = model.shape.tokens(n + 1, 8);
@@ -218,11 +218,11 @@ fn a_chain_is_its_links_one_by_one_and_leaves_the_state() {
     let wide = config.wide();
 
     // The block has followed the first five cells; the chain starts at the sixth.
-    let mut state = DraftState::new();
+    let mut state = MtpState::new();
     let followed = reference
         .draft_window(&head, &state, &rt[..5 * wide], &tokens[1..6], LogitRows::None)
         .expect("follow");
-    reference.draft_commit(&mut state, &followed, 5).expect("commit");
+    reference.mtp_commit(&mut state, &followed, 5).expect("commit");
     let before = state.clone();
     let drafts =
         reference.draft_chain(&head, &state, &rt[5 * wide..], tokens[6], 3).expect("a chain");
@@ -237,7 +237,7 @@ fn a_chain_is_its_links_one_by_one_and_leaves_the_state() {
             reference.draft_window(&head, &state, &r, &[token], LogitRows::All).expect("link");
         assert_eq!(link.start, 5 + j);
         assert_eq!(link.draft(0), Some(*draft), "link {j}");
-        reference.draft_commit(&mut state, &link, 1).expect("commit");
+        reference.mtp_commit(&mut state, &link, 1).expect("commit");
         (r, token) = (link.out, *draft);
     }
 }

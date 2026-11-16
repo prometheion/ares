@@ -14,7 +14,7 @@
 //! - `--max-rows N`: the rows of a step (and so the scratch); by default the
 //!   default of the model's options.
 //! - `--kv K,V`: the formats of K and of V of the attention blocks (`f16`, `q8`
-//!   to `q4`; the default is `q8,q8`); the draft block's are always `q4`.
+//!   to `q4`; the default is `q8,q8`); the MTP block's are always `q4`.
 //!   With `q7` to `q4` a second, small pool of exact entries holds the first
 //!   tile of a sequence and its newest cells.
 //! - `--chat`: a German and an English question through the chat template,
@@ -44,7 +44,7 @@
 //!   new code, a rewrite of a given file, then two more of each of the first
 //!   three kinds) of `--generate` tokens, each
 //!   most-probable-token and, with `--sample`, sampled, with windows of up to
-//!   `W` rows (0: no drafts). With a model that has a draft block the engine
+//!   `W` rows (0: no drafts). With a model that has an MTP block the engine
 //!   drafts with it and with the n-gram drafter, and chooses for every
 //!   step whose drafts and how many from the price of a step (measured at
 //!   load) and the acceptance (measured while running); `--draft-vocab FILE`
@@ -56,8 +56,8 @@
 //!   sets a variable of the chat template (`reasoning_effort=medium`). Reports
 //!   tokens per second, acceptance by draft position, the lengths of the
 //!   drafts and the time of a step by kind.
-//!   `--dflash FILE` drafts with a DFlash2 drafter as well, `--no-draft-block`
-//!   without the model's draft block.
+//!   `--dflash FILE` drafts with a DFlash2 drafter as well, `--no-mtp`
+//!   without the model's MTP block.
 //! - `--conversation TOKENS`: the prefix cache on the devices. A conversation
 //!   whose history is about `TOKENS` tokens (a slice of `--text`) has a second
 //!   turn, and a conversation of the same size that the engine has never seen
@@ -167,9 +167,9 @@ struct Args {
     undrafted: bool,
     requests: usize,
     draft_vocab: Option<PathBuf>,
-    /// A DFlash drafter file, and whether the model's draft block drafts.
+    /// A DFlash drafter file, and whether the model's MTP block drafts.
     dflash: Option<PathBuf>,
-    draft_block: bool,
+    mtp: bool,
     out: Option<PathBuf>,
     chat_vars: Vec<(String, String)>,
     layouts: Layouts,
@@ -216,7 +216,7 @@ fn parse() -> Args {
         requests: usize::MAX,
         draft_vocab: None,
         dflash: None,
-        draft_block: true,
+        mtp: true,
         out: None,
         chat_vars: Vec::new(),
         layouts: Layouts::default(),
@@ -273,7 +273,7 @@ fn parse() -> Args {
             "--requests" => args.requests = value().parse().expect("requests"),
             "--draft-vocab" => args.draft_vocab = Some(value().into()),
             "--dflash" => args.dflash = Some(value().into()),
-            "--no-draft-block" => args.draft_block = false,
+            "--no-mtp" => args.mtp = false,
             "--out" => args.out = Some(value().into()),
             "--layouts" => {
                 args.layouts = match value().as_str() {
@@ -928,7 +928,7 @@ fn ask(
 }
 
 /// `--engine`: chat requests through the conductor, with the picks made on
-/// the devices and, when the model has a draft block, its own drafts.
+/// the devices and, when the model has an MTP block, its own drafts.
 fn engine(args: &Args, spread: &Spread, window: u32) {
     use ares_runtime::{DevicePhase, GpuConfig, Model, Phase, Runtime, RuntimeConfig};
     let vocabulary: Option<Arc<[u32]>> = args.draft_vocab.as_ref().map(|path| {
@@ -949,7 +949,7 @@ fn engine(args: &Args, spread: &Spread, window: u32) {
         logit_rows: (2 * window).max(16),
         window_rows: if window > 1 { 2 * window } else { 0 },
         draft_vocabulary: vocabulary,
-        draft_block: args.draft_block,
+        mtp: args.mtp,
         dflash: args.dflash.as_ref().map(|path| {
             Arc::new(ares_model::dflash::File::open(path).expect("the DFlash drafter"))
         }),
@@ -1005,7 +1005,7 @@ fn engine(args: &Args, spread: &Spread, window: u32) {
         print_layouts(report, args.show_layouts);
         if let Some(d) = &report.draft {
             println!(
-                "RES device {} draft block: weights {:.1} MiB, K/V {:.3} MiB per 1000 tokens, exact \
+                "RES device {} MTP block: weights {:.1} MiB, K/V {:.3} MiB per 1000 tokens, exact \
                  K/V entries {:.2} MiB, kept hidden states {:.2} MiB, chain scratch {:.2} MiB, \
                  records {:.2} MiB, step scratch grown by at most {:.2} MiB",
                 report.index,
@@ -1132,7 +1132,7 @@ fn engine(args: &Args, spread: &Spread, window: u32) {
             }
             if c.model_draft_steps > 0 {
                 println!(
-                    "RES {name} {how}: draft block {:.2} ms per step that drafts ({:.2} links), \
+                    "RES {name} {how}: MTP block {:.2} ms per step that drafts ({:.2} links), \
                      {:.2} ms per link",
                     c.model_draft_us as f64 / 1e3 / c.model_draft_steps as f64,
                     c.model_draft_links as f64 / c.model_draft_steps as f64,

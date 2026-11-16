@@ -355,7 +355,7 @@ becomes a block is in `ARCHITECTURE.md` ("The shared model layer"). Left, in the
       page copy over all groups); then the prefix cache of Flash-Next on it (2026-11-16).
 - [ ] Token rows (table at home on the host, in the mapped file or on the device; kept rows of
       a head view; a second row source for images); Flash-Next's embedding from staged rows.
-- [ ] One draft-block driver for both models (chain on the device, picks by the sampler); the
+- [ ] One MTP driver for both models (chain on the device, picks by the sampler); the
       27B's drafts under a layer split; Flash-Next's draft vocabulary and `--drafters mtp`.
 - [x] Drafter kinds in the runtime, taps and DFlash (chains).
 - [ ] Trees in the blocks, tree fill.

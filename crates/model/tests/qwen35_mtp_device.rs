@@ -1,10 +1,10 @@
-//! The draft block on a device against its CPU reference, on the real 27B.
+//! The MTP block on a device against its CPU reference, on the real 27B.
 //!
 //! Needs a GPU (`ARES_TEST_CUDA=1`), the model (`ARES_TEST_QWEN35_27B`) and a
 //! capture of it made by `tools/capture` (`ARES_TEST_QWEN35_CAPTURE27`, with
 //! `german/base` and `english/base`): the tokens of a prompt and of what
 //! follows it, and the model's final hidden state of every position. Only the
-//! draft block, the embedding rows it keeps and the output head go to the device
+//! MTP block, the embedding rows it keeps and the output head go to the device
 //! (two gigabytes); the hidden states the model would compute are put there by the
 //! test, so the block is compared on its own:
 //!
@@ -31,7 +31,7 @@ use ares_cuda::{
 };
 use ares_gguf::Gguf;
 use ares_model::qwen35::device::{
-    DraftChain, DraftStep, Options, PAGE_ENTRY, Part, PartSetup, Placement, Profile, StepEnv,
+    MtpChain, MtpStep, Options, PAGE_ENTRY, Part, PartSetup, Placement, Profile, StepEnv,
     page_bytes,
 };
 use ares_model::qwen35::{Config, MtpState, Reference, Weights};
@@ -85,7 +85,7 @@ fn floats(bytes: &[u8]) -> Vec<f32> {
     bytes.as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)).collect()
 }
 
-/// The draft block on a device, with the buffers the runtime would own.
+/// The MTP block on a device, with the buffers the runtime would own.
 struct Rig {
     stream: Stream,
     part: Part,
@@ -171,7 +171,7 @@ impl Rig {
             exchange: None,
             replay: &[],
         };
-        self.part.enqueue_drafts(&env).unwrap();
+        self.part.enqueue_mtp(&env).unwrap();
         self.part.enqueue_follow(&env, hidden).unwrap();
         self.stream.synchronize().unwrap();
     }
@@ -199,9 +199,9 @@ impl Rig {
             replay: &[],
         };
         self.part
-            .draft_step(DraftStep {
+            .mtp_step(MtpStep {
                 tokens: self.record.ptr().offset(off_tokens),
-                chains: vec![DraftChain {
+                chains: vec![MtpChain {
                     segment: 0,
                     token,
                     rows: rows.to_vec(),
@@ -211,13 +211,13 @@ impl Rig {
                 chances: None,
             })
             .unwrap();
-        self.part.enqueue_drafts(&env).unwrap();
+        self.part.enqueue_mtp(&env).unwrap();
         self.stream.synchronize().unwrap();
         self.part.flush_profile().unwrap();
 
         let drafted = self.part.drafted().expect("the step drafted");
         assert_eq!(drafted.tokens as usize, k);
-        let (scratch, _) = self.part.draft_scratch(0).unwrap();
+        let (scratch, _) = self.part.mtp_scratch(0).unwrap();
         let mut bytes = vec![0u8; k * 4];
         scratch.read(drafted.ptr.as_raw() - scratch.ptr().as_raw(), &mut bytes).unwrap();
         let drafts: Vec<u32> =
@@ -226,7 +226,7 @@ impl Rig {
         let mut picks = Vec::new();
         let mut logits = Vec::new();
         for link in 0..k as u32 {
-            let (scratch, [out, logits_at, picks_at]) = self.part.draft_scratch(link).unwrap();
+            let (scratch, [out, logits_at, picks_at]) = self.part.mtp_scratch(link).unwrap();
             let mut bytes = vec![0u8; self.d * 4];
             scratch.read(out, &mut bytes).unwrap();
             outputs.push(floats(&bytes));
@@ -256,7 +256,7 @@ struct Chain {
 }
 
 #[test]
-fn the_draft_block_on_the_device_drafts_what_the_reference_drafts() {
+fn the_mtp_block_on_the_device_drafts_what_the_reference_drafts() {
     if std::env::var_os("ARES_TEST_CUDA").is_none() {
         eprintln!("skipped: set ARES_TEST_CUDA=1 to run the tests that open GPUs");
         return;
@@ -274,10 +274,10 @@ fn the_draft_block_on_the_device_drafts_what_the_reference_drafts() {
     let reference = Reference::new(&config, &weights);
     let d = config.n_embd;
 
-    // Only the draft block, the embedding rows it keeps and the head on the device.
+    // Only the MTP block, the embedding rows it keeps and the head on the device.
     let mut placement = Placement::single(&config);
     placement.devices[0].blocks = vec![None; config.n_layer];
-    let placement = placement.with_draft(&config, vocabulary.as_deref()).unwrap();
+    let placement = placement.with_mtp(&config, vocabulary.as_deref()).unwrap();
     let draft = placement.draft.clone().unwrap();
     // The tokens the draft head can pick, for the reference.
     let draft_tokens: Vec<u32> = (0..draft.head_rows).map(|r| placement.head_token(r)).collect();
@@ -337,8 +337,8 @@ fn the_draft_block_on_the_device_drafts_what_the_reference_drafts() {
         let mut rig = Rig::open(&device, &config, &weights, &placement, &opts);
         let bytes = rig.part.draft_bytes().unwrap();
         println!(
-            "{precision:?}: the part holds {:.1} MiB of weights (kept embedding rows, head, draft block); the \
-             draft block: weights {:.1} MiB, K/V {:.3} MiB per 1000 tokens, kept hidden states \
+            "{precision:?}: the part holds {:.1} MiB of weights (kept embedding rows, head, MTP block); the \
+             MTP block: weights {:.1} MiB, K/V {:.3} MiB per 1000 tokens, kept hidden states \
              {:.2} MiB, chain scratch {:.2} MiB, step records {:.2} MiB, step scratch grown by {:.2} MiB",
             rig.part.weight_bytes() as f64 / 1048576.0,
             bytes.weights as f64 / 1048576.0,
@@ -387,7 +387,7 @@ fn the_draft_block_on_the_device_drafts_what_the_reference_drafts() {
                         StepRecord::new(&[segment], &generated[..WINDOW], None, &[]).unwrap();
                     record.set_accepted(0, WINDOW as u32).unwrap();
                     rig.record.write(0, record.as_bytes()).unwrap();
-                    rig.part.commit_drafts(&rig.stream, rig.record.ptr(), record.dims()).unwrap();
+                    rig.part.commit_mtp(&rig.stream, rig.record.ptr(), record.dims()).unwrap();
                     rig.stream.synchronize().unwrap();
                 }
                 let want = &wanted[round];
@@ -454,7 +454,7 @@ fn the_draft_block_on_the_device_drafts_what_the_reference_drafts() {
                 got.picks[0].token, got.picks[0].cand_token[0]
             );
         }
-        let times = rig.part.draft_times();
+        let times = rig.part.mtp_times();
         println!(
             "{precision:?}: {} links in {} chains: {:.3} ms per link on the device",
             times.links,

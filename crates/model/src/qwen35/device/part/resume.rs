@@ -5,7 +5,7 @@
 //!
 //! **A checkpoint** of a part is what a sequence resumes from on this device:
 //! its slot of the arena (the convolution windows and delta-rule matrices of
-//! its blocks) and, on the device that holds the draft block, the block's
+//! its blocks) and, on the device that holds the MTP block, the block's
 //! carry (the final hidden state of the sequence's last row, which the
 //! block's keys and values of the next row are computed from).
 //!
@@ -19,7 +19,7 @@
 use ares_cuda::{DevicePtr, StateFormat, Stream};
 use ares_runtime::{DeviceTransfer, ModelError, RecordView, TransferKind};
 
-use super::{DRAFT_KV, Options, Part, Profile, geometry, invalid};
+use super::{MTP_KV, Options, Part, Profile, geometry, invalid};
 use crate::blocks::recurrent;
 use crate::blocks::slots::{
     self, CopyCounts, CopyTimes, Declared, GroupDecl, PageGroup, Pages, Places, SlotLayout,
@@ -55,7 +55,7 @@ pub fn state_slot_bytes(
 }
 
 /// The bytes of one checkpoint on device `index`: its recurrent state, and the
-/// draft block's carry row where the block is.
+/// MTP block's carry row where the block is.
 pub fn checkpoint_bytes(
     c: &Config,
     placement: &Placement,
@@ -88,14 +88,14 @@ pub(crate) fn declared(
         })
         .collect();
     let mut groups = vec![GroupDecl { formats: opts.kv, layers: attention }];
-    // The draft block's formats decide when a page has its final form on
+    // The MTP block's formats decide when a page has its final form on
     // every device, wherever the block is.
     if let Some(draft) = placement.mtp() {
         let layers = match draft.device == index {
-            true => vec![geometry(c, DRAFT_KV, c.attention.n_head_kv as u32)],
+            true => vec![geometry(c, MTP_KV, c.attention.n_head_kv as u32)],
             false => Vec::new(),
         };
-        groups.push(GroupDecl { formats: DRAFT_KV, layers });
+        groups.push(GroupDecl { formats: MTP_KV, layers });
     }
     Declared { checkpoint: checkpoint_bytes(c, placement, index, opts.state), groups, arrays: 0 }
 }
@@ -112,7 +112,7 @@ impl Part {
     }
 
     /// Copies the checkpoint state of `slot` into `place` on the host: the
-    /// slot's recurrent state and the draft block's carry row of the slot.
+    /// slot's recurrent state and the MTP block's carry row of the slot.
     /// Queued on `stream`; the place is not read before the stream has passed.
     pub fn save_state(&mut self, stream: &Stream, slot: u32, place: u32) -> Result<(), ModelError> {
         self.state.check(slot)?;
@@ -131,7 +131,7 @@ impl Part {
     }
 
     /// Everything the part keeps per page: the K/V group of the attention
-    /// blocks and the draft block's, both in the engine's pool of pages.
+    /// blocks and the MTP block's, both in the engine's pool of pages.
     fn pages(&mut self, pages: DevicePtr) -> Result<Pages<'_>, ModelError> {
         let kernels = self.attention.as_ref().ok_or_else(|| invalid("attention kernels"))?;
         let status = self.scratch.ptr().offset(self.s.status);
@@ -145,7 +145,7 @@ impl Part {
 
     /// Carries out this part's share of a transfer of the prefix cache's level
     /// on SSD (`ares_runtime::DeviceModel::transfer`): a page's K/V entries of
-    /// every attention block and of the draft block, in the form they have,
+    /// every attention block and of the MTP block, in the form they have,
     /// or a checkpoint place. Runs between steps; the caller waits for the
     /// stream.
     pub fn transfer(
@@ -169,7 +169,7 @@ impl Part {
     }
 
     /// Copies page `from` into page `to`, in every attention block and in the
-    /// draft block: the converted entry, or, where the formats have a tile
+    /// MTP block: the converted entry, or, where the formats have a tile
     /// mean, the exact entry (`Group::copy_page` of `blocks/kv.rs`).
     pub fn copy_page(
         &mut self,

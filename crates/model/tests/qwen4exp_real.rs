@@ -12,7 +12,7 @@
 
 use ares_gguf::Gguf;
 use ares_model::qwen4exp::{
-    Config, DraftState, DraftWeights, LogitRows, Reference, SequenceState, Weights,
+    Config, LogitRows, MtpState, MtpWeights, Reference, SequenceState, Weights,
 };
 
 /// `<|im_start|>user\nErkläre in drei Sätzen, warum der Himmel blau
@@ -91,7 +91,7 @@ const ENGLISH: [u32; 99] = [
 /// The tokens of [`ENGLISH`] that were given; the others the model wrote.
 const ENGLISH_GIVEN: usize = 19;
 
-/// What the draft block of the real model rests on. The file of the block has
+/// What the MTP block of the real model rests on. The file of the block has
 /// no outputs to compare with, so the test measures what the block is for: fed
 /// the trunk's residual of a cell and the token behind it, how often its
 /// largest logit is the token the trunk writes one further, on text the trunk
@@ -107,14 +107,14 @@ const ENGLISH_GIVEN: usize = 19;
 /// `ARES_TEST_QWEN4EXP_DRAFT_TOKENS` runs fewer than the 99 tokens (a token of
 /// the trunk takes about nine seconds on a machine that is busy).
 #[test]
-fn the_draft_block_guesses_what_the_trunk_writes() {
+fn the_mtp_block_guesses_what_the_trunk_writes() {
     let (Some(path), Some(draft)) = (
         std::env::var_os("ARES_TEST_QWEN4EXP_MODEL"),
         std::env::var_os("ARES_TEST_QWEN4EXP_DRAFT"),
     ) else {
         eprintln!(
             "skipped: set ARES_TEST_QWEN4EXP_MODEL to the first part of the model file and \
-             ARES_TEST_QWEN4EXP_DRAFT to the file of its draft block"
+             ARES_TEST_QWEN4EXP_DRAFT to the file of its MTP block"
         );
         return;
     };
@@ -125,10 +125,10 @@ fn the_draft_block_guesses_what_the_trunk_writes() {
         .clamp(ENGLISH_GIVEN + 8, ENGLISH.len());
     let started = std::time::Instant::now();
     let gguf = Gguf::open(&path).expect("the model file opens");
-    let file = Gguf::open(&draft).expect("the file of the draft block opens");
+    let file = Gguf::open(&draft).expect("the file of the MTP block opens");
     let config = Config::from_gguf(&gguf).expect("config");
     let weights = Weights::load(&gguf, &config).expect("weights");
-    let head = DraftWeights::load(&file, &config).expect("the draft block");
+    let head = MtpWeights::load(&file, &config).expect("the MTP block");
     assert_eq!(head.layer.moe.gate.expert_bytes(), 460_800);
     assert_eq!(head.layer.moe.up.span(), (460_800, 921_600));
 
@@ -145,13 +145,7 @@ fn the_draft_block_guesses_what_the_trunk_writes() {
     // of cell i with token i + 1 and guesses token i + 2.
     let cells = n - 1;
     let follow = reference
-        .draft_window(
-            &head,
-            &DraftState::new(),
-            &trunk[..cells * wide],
-            &tokens[1..],
-            LogitRows::All,
-        )
+        .draft_window(&head, &MtpState::new(), &trunk[..cells * wide], &tokens[1..], LogitRows::All)
         .expect("the block follows");
     let (mut right, mut asked) = (0, 0);
     for cell in ENGLISH_GIVEN - 2..cells - 1 {
@@ -168,8 +162,8 @@ fn the_draft_block_guesses_what_the_trunk_writes() {
     // links before it were right, as a verify window counts them.
     let (mut offered, mut accepted) = ([0usize; 3], [0usize; 3]);
     for cell in (ENGLISH_GIVEN - 2..cells.saturating_sub(3)).step_by(8) {
-        let mut state = DraftState::new();
-        reference.draft_commit(&mut state, &follow, cell).expect("the cells before");
+        let mut state = MtpState::new();
+        reference.mtp_commit(&mut state, &follow, cell).expect("the cells before");
         let drafts = reference
             .draft_chain(&head, &state, &trunk[cell * wide..(cell + 1) * wide], tokens[cell + 1], 3)
             .expect("a chain");

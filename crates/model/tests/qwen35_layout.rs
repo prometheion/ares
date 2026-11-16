@@ -747,7 +747,7 @@ fn answers(
 /// `docs/ARCHITECTURE.md`), so the texts agree as far as that stays below the
 /// margin of their picks, which it did for the two questions here with
 /// every matrix in its device layout. The measured choice puts other matrices in
-/// the file's layout in every load (more with a draft block), so its two
+/// the file's layout in every load (more with an MTP block), so its two
 /// models are not one model, and in the file's layout the difference above is
 /// four to seven times larger: its texts are reported, not compared.
 #[test]

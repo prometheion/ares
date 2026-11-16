@@ -2,7 +2,7 @@
 //! text the engine has computed starts from its pages and from the
 //! checkpoints of the state per sequence (the recurrent state, the carried
 //! keys of the indexers, the n-gram history and what the n-gram feed knows of
-//! the sequence, the draft block's carry and keys) instead of reading
+//! the sequence, the MTP block's carry and keys) instead of reading
 //! everything again, from the cards, from RAM and from SSD.
 //!
 //! A made-up model of the architecture runs through the runtime on the GPUs,
@@ -100,7 +100,7 @@ fn gguf_path(seed: u64) -> PathBuf {
     path
 }
 
-/// The file of a made-up draft block for the made-up model of `seed`.
+/// The file of a made-up MTP block for the made-up model of `seed`.
 fn draft_path(seed: u64) -> PathBuf {
     let path = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("q4px-{seed}-draft.gguf"));
     if !path.exists() {
@@ -286,7 +286,7 @@ struct Setup {
     placement: Placement,
     /// With the model's prefix cache.
     cached: bool,
-    /// With the model's draft block, drafting in windows of up to eight rows.
+    /// With the model's MTP block, drafting in windows of up to eight rows.
     draft: bool,
     kv: (CacheFormat, CacheFormat),
     /// Checkpoints the prompt cache has room for in RAM.
@@ -332,8 +332,8 @@ fn rig(setup: &Setup) -> Rig {
     let mut inner = Qwen4Exp::new(gguf, byte_tokenizer(), "made", &devices, opts, CELLS).unwrap();
     if setup.draft {
         inner = inner
-            .with_draft(Gguf::open(draft_path(setup.seed)).unwrap())
-            .expect("the draft block fits");
+            .with_mtp(Gguf::open(draft_path(setup.seed)).unwrap())
+            .expect("the MTP block fits");
     }
     let inner = Arc::new(inner);
     let spec = inner.prefix_cache().expect("qwen4exp takes part");
@@ -621,7 +621,7 @@ fn a_prompt_that_parts_from_a_cached_one_inside_a_page_is_answered_as_without_a_
 }
 
 #[test]
-fn a_sequence_that_drafts_with_the_draft_block_resumes_with_its_carry_and_its_keys() {
+fn a_sequence_that_drafts_with_the_mtp_block_resumes_with_its_carry_and_its_keys() {
     if !enabled() {
         return;
     }

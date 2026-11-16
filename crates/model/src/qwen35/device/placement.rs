@@ -87,8 +87,8 @@ pub struct Placement {
     pub split: Split,
     /// One plan per device.
     pub devices: Vec<DevicePlan>,
-    /// Where the model's own draft block is, when it drafts
-    /// ([`Placement::with_draft`]).
+    /// Where the model's MTP block is, when it drafts
+    /// ([`Placement::with_mtp`]).
     pub draft: Option<DraftPlan>,
 }
 
@@ -347,11 +347,7 @@ impl Placement {
     /// each once); without it, it proposes the tokens whose rows of the head
     /// are on its device (all of them unless the head is cut by a tensor
     /// split).
-    pub fn with_draft(
-        self,
-        c: &Config,
-        vocabulary: Option<&[u32]>,
-    ) -> Result<Self, PlacementError> {
+    pub fn with_mtp(self, c: &Config, vocabulary: Option<&[u32]>) -> Result<Self, PlacementError> {
         if c.n_nextn == 0 {
             return Err(PlacementError("the model has no next-token-prediction block".into()));
         }
@@ -360,7 +356,7 @@ impl Placement {
 
     /// The draft head on the device that embeds, for the next-token-prediction
     /// block (`mtp`) or for a drafter from a file of its own only: see
-    /// [`Placement::with_draft`].
+    /// [`Placement::with_mtp`].
     pub fn with_head_view(
         mut self,
         c: &Config,
@@ -371,7 +367,7 @@ impl Placement {
         let on_device = self.devices[device].head.clone();
         if on_device.start != 0 || on_device.is_empty() {
             return Err(PlacementError(
-                "the draft block needs the device that embeds and the first rows of the output \
+                "the MTP block needs the device that embeds and the first rows of the output \
                  head on one device, which a layer split does not give"
                     .into(),
             ));
@@ -391,7 +387,7 @@ impl Placement {
                 }
                 if list.is_empty() || list.len() as u32 > on_device.end {
                     return Err(PlacementError(format!(
-                        "a draft vocabulary of {} tokens; the draft block's device holds {} \
+                        "a draft vocabulary of {} tokens; the MTP block's device holds {} \
                          rows of the head",
                         list.len(),
                         on_device.end
@@ -431,8 +427,8 @@ impl Placement {
     }
 
     /// The rows of the token embedding table that lie on the device that
-    /// embeds: those of the tokens the draft block can pick, none without a
-    /// draft block. The device gets the other rows from the host.
+    /// embeds: those of the tokens the MTP block can pick, none without a
+    /// MTP block. The device gets the other rows from the host.
     pub fn kept_rows(&self) -> u32 {
         self.mtp().map_or(0, |d| d.head_rows)
     }
