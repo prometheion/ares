@@ -544,7 +544,7 @@ impl PinnedRam {
     /// least; padded to a block of direct I/O) for device part `part`,
     /// booked, and page-locked when the books know the devices. `Err` when
     /// the limit has no room or the memory cannot be locked.
-    pub(crate) fn cache_buffer(&self, part: usize, bytes: usize) -> Result<CacheBuffer, String> {
+    pub fn cache_buffer(&self, part: usize, bytes: usize) -> Result<CacheBuffer, String> {
         let len = ares_store::padded(bytes.max(1));
         self.book_cache(len as u64, "pages")?;
         self.books().pages += len as u64;
