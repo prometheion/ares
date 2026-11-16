@@ -351,18 +351,23 @@ fn read_reference(path: &Path) -> Result<Vec<Vec<(u32, f32)>>, AnyError> {
     Ok(rows)
 }
 
-/// Opens the model on the devices as the server does, the tiers filled from
-/// the usage profile. Returns the session and the rows of a step.
+/// Opens the model on the devices as the server does (with steps of `rows`
+/// rows, or as many as the server takes), the tiers filled from the usage
+/// profile.
 fn open<'g>(
     args: &Args,
     gguf: &'g Gguf,
     c: &Config,
     w: &'g Weights<'g>,
     prune: Option<PruneSetup>,
+    rows: Option<u32>,
 ) -> Result<Session<'g>, AnyError> {
     let devices: Vec<Device> =
         args.devices.iter().map(|d| Device::open(*d, Wait::Spin)).collect::<Result<_, _>>()?;
-    let rows = step_rows(gguf, &devices, &Options::default())?;
+    let rows = match rows {
+        Some(rows) => rows,
+        None => step_rows(gguf, &devices, &Options::default())?,
+    };
     let mut opts = session_options(args, c, rows);
     opts.part.prune = prune;
     let begun = Instant::now();
@@ -436,9 +441,7 @@ fn measure(args: &Args) -> Result<(), AnyError> {
     let reference = args.reference.clone().ok_or("--ref DIR is needed")?;
     std::fs::create_dir_all(&reference)?;
     let texts = tokens_of_texts(&tokenizer, &args.texts)?;
-    let mut session = open(args, &gguf, &c, &w, setup)?;
-    let rows = session.parts()[0].layer_range().len().max(1);
-    let _ = rows;
+    let mut session = open(args, &gguf, &c, &w, setup, None)?;
     let step_rows = 512.min(args.prompt.max(1));
     let mut all = Totals::default();
     let mut lines = Vec::new();
@@ -565,10 +568,7 @@ fn calibrate(args: &Args) -> Result<(), AnyError> {
     let tokenizer = Tokenizer::from_gguf(&gguf)?;
     let texts = tokens_of_texts(&tokenizer, &args.texts)?;
     let out = args.out.clone().ok_or("--out FILE is needed")?;
-    let devices: Vec<Device> =
-        args.devices.iter().map(|d| Device::open(*d, Wait::Spin)).collect::<Result<_, _>>()?;
-    let opts = session_options(args, &c, 8);
-    let mut session = Session::open(&gguf, &c, &w, devices, opts)?;
+    let mut session = open(args, &gguf, &c, &w, None, Some(8))?;
     let mut writer = near::CalibrationWriter::create(&out, &c)?;
     let k = c.experts.used;
     for tokens in &texts {
