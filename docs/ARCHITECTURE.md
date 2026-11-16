@@ -4342,6 +4342,27 @@ tokens per second from run to run):
 - *Rows of a prompt in steps of eight rows* name experts in no tier that are picked a fifth
   of the time (20 % in the fingerprint's runs), and some places of their lists more often:
   the store reads 3.5 to 4.6 experts ahead a step there, of which a quarter are used.
+- *Through the server* (2026-11-16 19:25 to 19:37, `--ram 8G`, the same copy of a usage
+  profile at every start, three questions of 25 to 35 tokens, German, English and code, 128
+  tokens each, greedy, twice; the build of before and the one with the predictions one
+  after the other in one turn of the GPU; the counters per step are over the prompts' wide
+  steps and the generating steps together):
+
+  | Cards | Build | Generation, round 1: German / English / code | Round 2 | Prompt, round 2 | Reads from the file per step | Read ahead per step, used | Wait per step | Load |
+  | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+  | two | with predictions | 28.3 / 33.7 / 18.5 tokens/s | 38.0 / 45.7 / 29.4 | 103 / 106 / 122 tokens/s | 6.2 | 2.4, 0.9 | 21.0 ms | 10 to 11 |
+  | two | before | 31.7 / 33.9 / 19.5 | 40.2 / 34.7 / 31.1 | 118 / 114 / 121 | 7.7 | | 20.6 ms | 8 to 9 |
+  | one (RTX 4070) | before | 11.7 / 8.6 / 5.5 | 13.4 / 10.0 / 2.5 | 14 / 13 / 15 | 65.1 | | 163 ms | 8 to 22 |
+  | one | with predictions | 5.1 / 6.9 / 5.8 | 16.0 / 12.9 / 7.4 | 20 / 19 / 19 | 53.5 | 15.8, 9.5 | 140 ms | 25 to 12 |
+
+  On two cards the two builds do not differ beyond the spread of the runs. On one card,
+  where a step reads 50 to 100 experts from the file, 60 % of the reads ahead were picked,
+  the reads on demand fell from 65 to 54 a step and the wait for the misses from 163 to 140
+  ms a step; the second round generated at 16.0 / 12.9 / 7.4 tokens per second against
+  13.4 / 10.0 / 2.5 and read its prompts at 19 to 20 against 13 to 15 (the first round of
+  the build with the predictions ran at a load of 25 against 8, and lost). One pair each,
+  on a machine shared with three other agents: an indication, not a measurement of the
+  difference.
 - *Wide steps.* On the made-up model of `steps_wider_than_eight_rows_match_the_reference`
   (half of the experts in slots, steps of 9, 64, 256 and 3 rows) the next layer's
   predictions read 162 to 167 experts ahead into staging, and the steps read 57 to 61 from

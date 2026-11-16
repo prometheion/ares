@@ -120,8 +120,13 @@ other differed more by the load than by the drafts.
       file, read ahead through transit's guesses. Fingerprint unchanged. Measured: on the
       IQ2_XS file with `--ram 8G` or `4G`, one card or two, a generated row's predicted
       experts in no tier are picked 3 to 8 % of the time, so nothing is read ahead in
-      generation; rows of prompts in steps of eight read some (a quarter used). No speed
-      difference could be shown beside the spread of runs on the shared machine.
+      generation; rows of prompts in steps of eight read some (a quarter used). Through the
+      server on one card (50 to 100 reads from the file a step) 60 % of the reads ahead were
+      picked and the reads on demand fell from 65 to 54 a step (one pair of runs); on two
+      cards no difference beside the spread of runs on the shared machine.
+- [ ] Measurements owed (no turn of the shared GPU was left): the Q4_K_XL file (104 GiB), base
+      against the predictions; prompts on the real file in wide steps (`--prefill 4000 --rows
+      512`); more than one pair per configuration on a quiet machine.
 - [ ] The prediction made only where it can pay: in steps of one row on these tiers no place
       qualifies, and the card still applies two routers per layer (not seen in the step
       times). A step could predict only now and then while no place qualifies, to keep the
