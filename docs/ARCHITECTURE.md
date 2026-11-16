@@ -189,6 +189,40 @@ Both test architectures are specified under [reference/](reference/):
 [qwen4exp](reference/qwen4exp-architecture.md). The projector for images is
 described under [The image tower](#the-image-tower).
 
+### The shared model layer
+
+Ares supports a few models, and each gets its maximum through a launch plan of
+its own; what can be shared is shared in `ares-model`'s module `blocks`. A
+**block** is a struct that owns one kind of state and every rule about it:
+where the state lives, which rows of a step touch it how, and what a draft
+window, a commit, a replay or a copy does to it. It has no graph and no list
+of operators; a model calls its methods in the model's own order, with device
+pointers that the model's own products wrote, and a block adds no launch to
+what the model enqueued before it existed.
+
+**The rule.** A part of a model becomes a shared block when it owns state that
+the runtime's contracts touch (pages, slot state, checkpoints, windows,
+commits, replays, trees) or when it drafts. Everything between two pieces of
+state stays with the model, in its launch plan: the products, the norms and
+gates, the activation forms, which kernel runs at which row count, fused
+launches and the exchanges between devices. A model may replace a launch of a
+block with a fused kernel of its own as long as the block's tests pass with
+it; it may not keep state outside a block. A stateless part (a norm, an FFN)
+is shared only when a second model uses it as it is.
+
+The blocks so far:
+
+- **The K/V group** (`blocks/kv.rs`, with the tile forms of the exact pool in
+  `blocks/forms.rs`): attention layers whose K and V share one pair of
+  formats, with their entries in the engine's pages, the exact pool of the
+  formats with a tile mean and the group's table. It appends a step's rows
+  (not those of a replay), plans them (a prompt's together, a generated row
+  as the only row of a step, with the tile that leaves the newest cells
+  inside a draft window read converted from its position on), prepares a
+  step (conversions, exact slots, the table), settles a draft window at its
+  commit, and copies, sends to the host and takes back a page in the form it
+  has. The 27B has two groups: its attention blocks, and its draft block.
+
 ## A step
 
 ```

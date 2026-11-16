@@ -1,20 +1,38 @@
-//! The K/V pages of one group of attention layers, as a device keeps them
-//! besides the converted pool in the engine's page pool: the pool of exact
-//! entries and the page table of the group.
+//! The **K/V group**: attention layers on a device whose K and V share one
+//! pair of formats (a model's attention layers, or a draft block), with their
+//! entries in the engine's pages, the pool of exact entries and the group's
+//! page table. A group owns the rules of how the rows of a step touch them:
 //!
-//! A group is the model's attention blocks, or the draft block: layers that
-//! share one pair of formats and so one policy of which tiles are exact. The
-//! formats `f16` and `q8` have no exact entries and no pool: the group reads
-//! the step's page table, which names the converted entry of every page. With a
-//! tile mean (`q7` to `q4`) the group's entries for the exact tiles name slots
-//! of the exact pool, so it keeps a table of its own on the device (or, for the
-//! model's attention blocks, writes into the step's) and brings it up to date
-//! at the start of every step, from [`Forms`].
+//! - **Append**: the rows of a step write their K and V, except the rows of a
+//!   replay, which read the cells their sequence has cached already and write
+//!   none ([`Group::append`]).
+//! - **Plan**: the rows of a prompt are planned together; a row that is
+//!   generated, alone or in a draft window, attends as the only row of a step
+//!   would, so that what was drafted changes no bit of it
+//!   ([`Group::plan_rows`]).
+//! - **Prepare and settle**: at the start of a step the tiles that left their
+//!   sequence's newest cells are converted and the pages the rows write get
+//!   exact slots ([`Group::prepare`]); the tiles of a draft window settle when
+//!   its commit says how many of its rows count ([`Group::commit_windows`]).
+//! - **Copy, transfer, release**: a page is copied, and moved to the host and
+//!   back, in the form it has; a page the pool freed gives its exact slot back.
+//!
+//! The formats `f16` and `q8` have no exact entries and no pool: the group
+//! reads the step's page table, which names the converted entry of every page.
+//! With a tile mean (`q7` to `q4`) the group's entries for the exact tiles name
+//! slots of the exact pool, so it keeps a table of its own on the device (or,
+//! for the model's attention layers, writes into the step's) and brings it up
+//! to date at the start of every step, from [`Forms`].
+//!
+//! The products that feed a group, the norms, the queries and which kernel
+//! runs at which row count are the model's.
+
+use std::ops::Range;
 
 use ares_core::Ledger;
 use ares_cuda::{
-    AttentionKernels, CacheFormat, CacheGeometry, Device, DeviceBuffer, DevicePtr, PinnedBuffer,
-    Stream,
+    AttendBuffers, AttentionKernels, AttnRow, CacheFormat, CacheGeometry, Device, DeviceBuffer,
+    DevicePtr, ENTRY_CELLS, PinnedBuffer, Plan, PlanBuffers, PlanConfig, Planner, Segment, Stream,
 };
 use ares_runtime::ModelError;
 
@@ -75,6 +93,54 @@ pub(crate) struct Layer {
     pub exact: u64,
 }
 
+/// What the segments of a step do to the sequences of a group: `replay` are
+/// the rows of the step that are a replay (rows of the whole step), which read
+/// the cells their sequence has cached already and write none.
+pub(crate) fn reaches(segments: &[Segment], replay: &[Range<u32>]) -> Vec<Reach> {
+    segments
+        .iter()
+        .map(|s| Reach {
+            slot: s.slot,
+            pos0: s.pos0 as u32,
+            rows: s.n_rows,
+            writes: !replay.iter().any(|r| r.start <= s.row0 && s.row0 < r.end),
+            settles: s.direct,
+        })
+        .collect()
+}
+
+/// The rows of `first..first + n` of a step that write cells, as ranges of
+/// rows counted from `first`: every row but those of the `replay` ranges
+/// (rows of the whole step, in order).
+pub(crate) fn writing_rows(
+    replay: &[Range<u32>],
+    first: u32,
+    n: u32,
+) -> impl Iterator<Item = Range<u32>> + '_ {
+    let end = first + n;
+    let mut at = first;
+    std::iter::from_fn(move || {
+        while at < end {
+            // Inside a replay: its rows write nothing.
+            if let Some(r) = replay.iter().find(|r| r.start <= at && at < r.end) {
+                at = r.end;
+                continue;
+            }
+            // Up to the next replay or the end.
+            let stop = replay
+                .iter()
+                .map(|r| r.start)
+                .filter(|s| *s > at)
+                .min()
+                .map_or(end, |s| s.min(end));
+            let run = at - first..stop - first;
+            at = stop;
+            return Some(run);
+        }
+        None
+    })
+}
+
 /// The pairs of a conversion job on the device: the exact slot, then the page
 /// whose converted entry receives it.
 #[derive(Debug)]
@@ -86,9 +152,10 @@ struct Jobs {
     room: usize,
 }
 
-/// The pool and the table of one group.
+/// One K/V group: its layers, their exact pool and the group's table.
 #[derive(Debug)]
-pub(crate) struct Pages {
+pub(crate) struct Group {
+    layers: Vec<Layer>,
     forms: Option<Forms>,
     exact: Option<DeviceBuffer>,
     /// The table of the group on the device, when it is not the step's.
@@ -100,29 +167,34 @@ pub(crate) struct Pages {
     mirror: Vec<u32>,
     stage: Option<PinnedBuffer>,
     jobs: Option<Jobs>,
+    /// The draft windows of the step last prepared: the slot and the position
+    /// of the first row.
+    windows: Vec<(u32, u32)>,
 }
 
-impl Pages {
-    /// The pool and table for layers of these `geos`, with `slots` exact slots
-    /// (none for a group without exact entries). `own_table` gives the group a
-    /// table of its own; a group with exact entries has one when it is not the
-    /// step's (`step_table`: its entries are written into the table the
-    /// runtime keeps).
+impl Group {
+    /// The group of `layers`, whose K and V are in `formats`, with `slots`
+    /// exact slots (none for a group without exact entries). `own_table` gives
+    /// the group a table of its own; a group with exact entries has one when
+    /// it is not the step's (`step_table`: its entries are written into the
+    /// table the runtime keeps).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         device: &Device,
         ledger: &mut Ledger,
         what: &str,
-        geos: &[CacheGeometry],
+        layers: Vec<Layer>,
+        formats: (CacheFormat, CacheFormat),
         slots: u32,
-        newest: u32,
         pages: u32,
         max_slots: u32,
         stride: u32,
         own_table: bool,
     ) -> Result<Self, ModelError> {
+        let newest = newest_cells(formats.0, formats.1);
+        let geos: Vec<CacheGeometry> = layers.iter().map(|layer| layer.geo).collect();
         let entries = max_slots as usize * stride as usize;
-        let exact_bytes = exact_pool_bytes(geos, slots);
+        let exact_bytes = exact_pool_bytes(&geos, slots);
         if slots > 0 {
             ledger.reserve(format!("qwen35 {what}: exact K/V entries"), exact_bytes)?;
         }
@@ -155,6 +227,7 @@ impl Pages {
             None
         };
         Ok(Self {
+            layers,
             forms: (slots > 0).then(|| Forms::new(slots, pages, newest)),
             exact: (slots > 0).then(|| DeviceBuffer::new(device, exact_bytes)).transpose()?,
             own,
@@ -162,6 +235,7 @@ impl Pages {
             mirror: if synced { vec![0; entries] } else { Vec::new() },
             stage,
             jobs,
+            windows: Vec::new(),
         })
     }
 
@@ -195,6 +269,12 @@ impl Pages {
     /// The exact pool on the device (null without one).
     pub(crate) fn exact(&self) -> DevicePtr {
         self.exact.as_ref().map_or(DevicePtr::NULL, DeviceBuffer::ptr)
+    }
+
+    /// Where the exact entries of `layer` are: null when the formats have no
+    /// exact entries.
+    pub(crate) fn exact_pool(&self, layer: &Layer) -> DevicePtr {
+        if self.has_exact() { self.exact().offset(layer.exact) } else { DevicePtr::NULL }
     }
 
     /// The table the group's kernels read: its own, or the step's.
@@ -275,11 +355,45 @@ impl Pages {
     }
 
     /// Prepares a step: converts what left its window, gives the pages the rows
-    /// write exact slots, and writes the group's table where it differs from
-    /// the entries those imply. Returns the conversions to run. `windows`:
-    /// the rows of a draft window attend together and must read every tile as
-    /// they would alone ([`Pages::ahead`]).
+    /// write exact slots, writes the group's table where it differs from the
+    /// entries those imply, and queues the conversions in front of the step's
+    /// kernels (`pages` is the start of the engine's pool of pages, `status`
+    /// the word the kernels report to). `windows`: the rows of a draft window
+    /// attend together and must read every tile as they would alone
+    /// ([`Group::ahead`]); a group whose rows attend one at a time has no use
+    /// for that.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn prepare(
+        &mut self,
+        kernels: Option<&AttentionKernels>,
+        stream: &Stream,
+        reaches: &[Reach],
+        conductor: &[u32],
+        step_table: DevicePtr,
+        pages: DevicePtr,
+        status: DevicePtr,
+        windows: bool,
+    ) -> Result<(), ModelError> {
+        let jobs = self.prepare_table(stream, reaches, conductor, step_table, windows)?;
+        self.windows.clear();
+        self.windows.extend(reaches.iter().filter(|r| !r.settles).map(|r| (r.slot, r.pos0)));
+        self.convert(kernels, stream, pages, status, &jobs, 1)
+    }
+
+    /// The draft windows of the step last prepared ended: for each, its slot
+    /// and the rows of it that count. The cells of its sequence up to them are
+    /// settled.
+    pub(crate) fn commit_windows(&mut self, accepted: &[(u32, u32)], conductor: &[u32]) {
+        for &(slot, accepted) in accepted {
+            let Some(&(_, pos0)) = self.windows.iter().find(|(s, _)| *s == slot) else { continue };
+            self.settled(slot, pos0 + accepted, conductor);
+        }
+        self.windows.clear();
+    }
+
+    /// The first part of [`Group::prepare`]: the forms and the table. Returns
+    /// the conversions to run.
+    fn prepare_table(
         &mut self,
         stream: &Stream,
         reaches: &[Reach],
@@ -346,25 +460,24 @@ impl Pages {
         Ok(self.forms.as_mut().map(Forms::take_jobs).unwrap_or_default())
     }
 
-    /// Queues the conversion of `jobs` in every layer of the group: `layers` are
-    /// the layers' geometries with their offsets in the exact pool and in the
-    /// pages (`pages` is the start of the engine's pool of pages).
-    #[allow(clippy::too_many_arguments)]
+    /// Queues the conversion of `jobs` in every layer of the group (`pages` is
+    /// the start of the engine's pool of pages). `region` (0 or 1) is where
+    /// the jobs lie on the device: a step's two flushes have one each.
     pub(crate) fn convert(
         &mut self,
-        kernels: &AttentionKernels,
+        kernels: Option<&AttentionKernels>,
         stream: &Stream,
         pages: DevicePtr,
         status: DevicePtr,
-        layers: &[Layer],
         jobs: &[Convert],
         region: usize,
     ) -> Result<(), ModelError> {
         if jobs.is_empty() {
             return Ok(());
         }
+        let kernels = kernels.ok_or_else(|| invalid("attention kernels"))?;
         let device_jobs = self.upload(stream, jobs, region)?;
-        for layer in layers {
+        for layer in &self.layers {
             // SAFETY: the jobs name exact slots and pages of the pools of this
             // layer, which hold `capacity` and `pages` entries; the status word
             // is in the part's scratch.
@@ -387,19 +500,17 @@ impl Pages {
     /// converted entry, or, with exact entries, the exact one (a page that is
     /// copied is partly used, so it is exact; the copy gets an exact slot of its
     /// own, and a page that is converted to make room for it is converted first).
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn copy_page(
         &mut self,
         kernels: &AttentionKernels,
         stream: &Stream,
         pages: DevicePtr,
         status: DevicePtr,
-        layers: &[Layer],
         from: u32,
         to: u32,
     ) -> Result<(), ModelError> {
         let Some(forms) = &mut self.forms else {
-            for layer in layers {
+            for layer in &self.layers {
                 let entry = layer.geo.converted_entry_bytes();
                 let place = |page: u32| pages.offset(layer.pool + u64::from(page) * entry);
                 // SAFETY: both entries are in the layer's pool, which has an entry for
@@ -416,8 +527,8 @@ impl Pages {
         })?;
         let target = forms.ensure(to, Some(from)).map_err(exhausted)?;
         let jobs = forms.take_jobs();
-        self.convert(kernels, stream, pages, status, layers, &jobs, 0)?;
-        for layer in layers {
+        self.convert(Some(kernels), stream, pages, status, &jobs, 0)?;
+        for layer in &self.layers {
             let entry = layer.geo.exact_entry_bytes();
             let place = |slot: u32| self.exact().offset(layer.exact + u64::from(slot) * entry);
             // SAFETY: both slots are in the exact pool of the layer, and they are different
@@ -425,6 +536,294 @@ impl Pages {
             unsafe { stream.copy(place(target), place(source), entry as usize)? };
         }
         Ok(())
+    }
+
+    /// Adds the rows of `segments` to `planner`, a planner for the geometry of
+    /// the group's layers (`stride`: the entries per slot of the tables). The
+    /// rows of a prompt (a direct segment of several rows) are planned
+    /// together. A row that is generated, alone or in a window with drafts,
+    /// attends as the only row of a step would: what was drafted must not
+    /// change a bit of it. Where a tile leaves the newest cells inside the
+    /// window, the rows from there on read it converted ([`Group::ahead`]).
+    pub(crate) fn plan_rows(
+        &self,
+        planner: &mut Planner,
+        segments: &[Segment],
+        conductor: &[u32],
+        stride: u32,
+    ) {
+        for s in segments {
+            let table = s.slot * stride;
+            let need = (s.pos0 as u32 + s.n_rows).div_ceil(ENTRY_CELLS) as usize;
+            let entries = &self.entries(conductor)[table as usize..table as usize + need];
+            let pos0 = s.pos0 as u32;
+            if s.direct && s.n_rows > 1 {
+                // The rows of a prompt.
+                planner.dense(table, entries, s.row0, s.n_rows, pos0);
+                continue;
+            }
+            let end = pos0 + s.n_rows;
+            match self.ahead(s.slot).filter(|a| pos0 < a.from && a.from < end) {
+                None => planner.window(table, entries, s.row0, s.n_rows, pos0, None),
+                Some(a) => {
+                    let before = a.from - pos0;
+                    let swap = Some((a.tile, a.page | PAGE_ENTRY));
+                    planner.window(table, entries, s.row0, before, pos0, None);
+                    planner.window(
+                        table,
+                        entries,
+                        s.row0 + before,
+                        s.n_rows - before,
+                        a.from,
+                        swap,
+                    );
+                }
+            }
+        }
+    }
+
+    /// The attention plans of a step of `n_rows` rows with `segments`
+    /// ([`Group::plan_rows`]): one for each number of KV heads among the
+    /// group's layers, with that number. `state_bytes` are the bytes of
+    /// partial states the device reserved for a plan.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn plans(
+        &self,
+        config: PlanConfig,
+        n_rows: u32,
+        segments: &[Segment],
+        conductor: &[u32],
+        stride: u32,
+        state_bytes: u64,
+    ) -> Result<Vec<(u32, Plan)>, ModelError> {
+        let mut plans: Vec<(u32, Plan)> = Vec::new();
+        for layer in &self.layers {
+            if plans.iter().any(|(heads, _)| *heads == layer.geo.kv_heads) {
+                continue;
+            }
+            let mut planner = Planner::new(layer.geo, config, n_rows);
+            self.plan_rows(&mut planner, segments, conductor, stride);
+            let plan = planner.finish();
+            let state = plan.state_bytes(&layer.geo);
+            if state > state_bytes {
+                return Err(invalid(format!(
+                    "the attention plan needs {state} bytes of partial states, {state_bytes} are \
+                     reserved"
+                )));
+            }
+            plans.push((layer.geo.kv_heads, plan));
+        }
+        Ok(plans)
+    }
+
+    /// Appends K and V of the rows `first..first + n` of a step to `layer`,
+    /// except those of a `replay` (rows of the whole step, which read the
+    /// cells their sequence has cached and write none): one launch per run of
+    /// rows that write. `rows` are the plan's rows of the `n` rows, `k` and
+    /// `v` their keys and values (`[row][kv head][head_dim]` f32 as the
+    /// geometry says), `step_table` the step's page table and `pages` the start
+    /// of the engine's pool of pages.
+    ///
+    /// # Safety
+    ///
+    /// As for [`AttentionKernels::append`], for the `n` rows.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) unsafe fn append(
+        &self,
+        kernels: &AttentionKernels,
+        stream: &Stream,
+        layer: &Layer,
+        rows: DevicePtr,
+        k: DevicePtr,
+        v: DevicePtr,
+        step_table: DevicePtr,
+        pages: DevicePtr,
+        status: DevicePtr,
+        replay: &[Range<u32>],
+        first: u32,
+        n: u32,
+    ) -> Result<(), ModelError> {
+        let geo = &layer.geo;
+        let (tables, exact, pool) =
+            (self.table(step_table), self.exact_pool(layer), pages.offset(layer.pool));
+        let kv_row = u64::from(geo.kv_total) * u64::from(geo.head_dim) * 4;
+        for run in writing_rows(replay, first, n) {
+            let at = u64::from(run.start);
+            // SAFETY: the run is inside the `n` rows, which the caller's
+            // contract covers.
+            unsafe {
+                kernels.append(
+                    stream,
+                    geo,
+                    rows.offset(at * std::mem::size_of::<AttnRow>() as u64),
+                    run.end - run.start,
+                    k.offset(at * kv_row),
+                    v.offset(at * kv_row),
+                    tables,
+                    exact,
+                    pool,
+                    status,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The attention of the rows of `plan` over the cells of `layer`, from the
+    /// queries `q` into `out` (gated by `gate` where the model has one), with
+    /// `scratch` for the partial states.
+    ///
+    /// # Safety
+    ///
+    /// As for [`AttentionKernels::attend`]: the tables hold the entries the
+    /// plan names and the pools the pages those entries name.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) unsafe fn attend(
+        &self,
+        kernels: &AttentionKernels,
+        stream: &Stream,
+        layer: &Layer,
+        plan: &PlanBuffers,
+        step_table: DevicePtr,
+        pages: DevicePtr,
+        q: DevicePtr,
+        gate: Option<DevicePtr>,
+        out: DevicePtr,
+        scratch: DevicePtr,
+        scale: f32,
+    ) -> Result<(), ModelError> {
+        let buffers = AttendBuffers {
+            tables: self.table(step_table),
+            exact_pool: self.exact_pool(layer),
+            converted_pool: pages.offset(layer.pool),
+            q,
+            gate,
+            out,
+            scratch,
+        };
+        // SAFETY: the caller's contract.
+        unsafe { kernels.attend(stream, &layer.geo, plan, &buffers, scale)? };
+        Ok(())
+    }
+
+    /// Copies the entries of `page` in the group's layers to `dst` on the
+    /// host, in the form the group holds them in. Returns the bytes and
+    /// whether they are exact entries.
+    ///
+    /// # Safety
+    ///
+    /// `dst` must hold `room` bytes, which the caller reads only after it has
+    /// waited for the stream.
+    pub(crate) unsafe fn page_out(
+        &self,
+        stream: &Stream,
+        pages: DevicePtr,
+        page: u32,
+        dst: *mut u8,
+        room: usize,
+    ) -> Result<(usize, bool), ModelError> {
+        let (slot, exact_pool) = (self.exact_slot(page), self.exact());
+        let mut at = 0usize;
+        for layer in &self.layers {
+            let (src, bytes) = match slot {
+                Some(slot) => {
+                    let entry = layer.geo.exact_entry_bytes();
+                    (exact_pool.offset(layer.exact + u64::from(slot) * entry), entry as usize)
+                }
+                None => {
+                    let entry = layer.geo.converted_entry_bytes();
+                    (pages.offset(layer.pool + u64::from(page) * entry), entry as usize)
+                }
+            };
+            if at + bytes > room {
+                return Err(invalid("a page in transit has less room than its entries"));
+            }
+            // SAFETY: the entry is in the layer's pool (the page and the slot
+            // are below the pools' sizes) and `dst` has room for it (checked
+            // above); the caller waits for the stream before it reads.
+            unsafe { stream.copy_to_host(dst.add(at), src, bytes)? };
+            at += bytes;
+        }
+        Ok((at, slot.is_some()))
+    }
+
+    /// Copies the entries of `page` in the group's layers from `src` on the
+    /// host, which holds them as exact entries (`exact`) or as converted ones.
+    /// An exact page that is not to `keep` its form is converted at once.
+    /// Returns the bytes read. Runs between steps: conversions that it needs
+    /// are waited for.
+    ///
+    /// # Safety
+    ///
+    /// `src` must hold `len` bytes, which stay as they are until the caller
+    /// has waited for the stream.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) unsafe fn page_in(
+        &mut self,
+        kernels: Option<&AttentionKernels>,
+        stream: &Stream,
+        pages: DevicePtr,
+        status: DevicePtr,
+        page: u32,
+        src: *const u8,
+        len: usize,
+        exact: bool,
+        keep: bool,
+    ) -> Result<usize, ModelError> {
+        let slot = if exact {
+            let (slot, jobs) = self.adopt_exact(page)?;
+            self.convert_now(kernels, stream, pages, status, &jobs)?;
+            Some(slot)
+        } else {
+            // Whatever the group kept for the page's number belongs to a page
+            // that is gone.
+            self.release([page]);
+            None
+        };
+        let exact_pool = self.exact();
+        let mut at = 0usize;
+        for layer in &self.layers {
+            let (dst, bytes) = match slot {
+                Some(slot) => {
+                    let entry = layer.geo.exact_entry_bytes();
+                    (exact_pool.offset(layer.exact + u64::from(slot) * entry), entry as usize)
+                }
+                None => {
+                    let entry = layer.geo.converted_entry_bytes();
+                    (pages.offset(layer.pool + u64::from(page) * entry), entry as usize)
+                }
+            };
+            if at + bytes > len {
+                return Err(invalid("a page in transit is shorter than its entries"));
+            }
+            // SAFETY: as in `page_out`, the other way; `src` holds `len` bytes
+            // and stays as it is until the caller has waited for the stream.
+            unsafe { stream.copy_from_host(dst, src.add(at), bytes)? };
+            at += bytes;
+        }
+        if exact && !keep {
+            let jobs = self.convert_page(page);
+            self.convert_now(kernels, stream, pages, status, &jobs)?;
+        }
+        Ok(at)
+    }
+
+    /// Runs conversions that a page on its way in made necessary, and waits
+    /// for them: the group's list of jobs on the device is written once per
+    /// step otherwise, and a transfer is no step.
+    fn convert_now(
+        &mut self,
+        kernels: Option<&AttentionKernels>,
+        stream: &Stream,
+        pages: DevicePtr,
+        status: DevicePtr,
+        jobs: &[Convert],
+    ) -> Result<(), ModelError> {
+        if jobs.is_empty() {
+            return Ok(());
+        }
+        self.convert(kernels, stream, pages, status, jobs, 0)?;
+        Ok(stream.synchronize()?)
     }
 
     /// Puts `jobs` on the device, in region `region` (0 or 1), and returns

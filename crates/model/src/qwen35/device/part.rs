@@ -16,11 +16,11 @@ use std::sync::{Arc, Mutex};
 
 use ares_core::Ledger;
 use ares_cuda::{
-    ActivationForm, AttendBuffers, AttentionKernels, AttentionShape, CacheFormat, CacheGeometry,
-    CommitSet, Device, DeviceBuffer, DevicePtr, ENTRY_CELLS, EmbedRows, Event, Kernels,
-    LayerKernels, MAX_BATCH, OutputGate, PUSH_MAX_VALUES, PinnedBuffer, PlanBuffers, PlanConfig,
-    Planner, Precision, PrefillPath, RopeParams, Segment, StateFormat, StepDims, Stream,
-    WeightLayout, WeightRange,
+    ActivationForm, AttentionKernels, AttentionShape, CacheFormat, CacheGeometry, CommitSet,
+    Device, DeviceBuffer, DevicePtr, ENTRY_CELLS, EmbedRows, Event, Kernels, LayerKernels,
+    MAX_BATCH, OutputGate, PUSH_MAX_VALUES, PinnedBuffer, PlanBuffers, PlanConfig, Planner,
+    Precision, PrefillPath, RopeParams, Segment, StateFormat, StepDims, Stream, WeightLayout,
+    WeightRange,
 };
 use ares_cuda::{PUSH_MAX_ROWS, PushSlot};
 use ares_runtime::{Logits, ModelError, PinnedRam, Split};
@@ -37,7 +37,7 @@ mod mtp;
 mod resume;
 mod tensor;
 
-use crate::blocks::{forms, kv};
+use crate::blocks::kv;
 
 pub use mtp::{DraftBytes, DraftChain, DraftStep, DraftTimes, Drafted};
 pub use resume::{CopyTimes, checkpoint_bytes, settle_cells, state_slot_bytes, transit_page_bytes};
@@ -398,15 +398,9 @@ struct RecurrentAt {
     kept: [u64; 4],
 }
 
-/// Where an attention block has its pool, and its geometry.
-#[derive(Clone, Copy, Debug)]
-struct AttentionAt {
-    geo: CacheGeometry,
-    /// Bytes from the start of the pages.
-    pool: u64,
-    /// Bytes from the start of the group's exact pool (0 without one).
-    exact: u64,
-}
+/// Where an attention block has its pool, and its geometry: a layer of its
+/// K/V group.
+type AttentionAt = kv::Layer;
 
 /// The prepared forms of an input that the products of a group of matrices
 /// read.
@@ -454,15 +448,6 @@ struct Group {
     record: u64,
 }
 
-/// A group of layers that keeps K/V pages.
-#[derive(Clone, Copy, Debug)]
-enum Which {
-    /// The model's attention blocks.
-    Attention,
-    /// The draft block.
-    Draft,
-}
-
 /// One device's part of the model.
 pub struct Part {
     index: usize,
@@ -504,11 +489,9 @@ pub struct Part {
     /// The page tables as the conductor wrote them: the entries of the pool's
     /// pages.
     page_tab: Vec<u32>,
-    /// The exact pool and the table of the model's attention blocks.
-    kv: kv::Pages,
-    /// The draft windows of the last step that wait for their commit: the
-    /// slot and the position of the first row.
-    windows: Vec<(u32, u32)>,
+    /// The K/V group of the model's attention blocks: their exact pool and
+    /// table, and the rules of their rows.
+    kv: kv::Group,
     plan_config: PlanConfig,
     /// The attention plans of the step, by group and number of KV heads.
     plans: Vec<(usize, u32, PlanBuffers)>,
@@ -767,16 +750,15 @@ impl Part {
             recurrent_at.push(r_at);
             attention_at.push(a_at);
         }
-        // The exact pool of the attention blocks, when their formats have a tile
-        // mean.
-        let main_geos: Vec<CacheGeometry> = attention_at.iter().flatten().map(|a| a.geo).collect();
-        let kv = kv::Pages::new(
+        // The K/V group of the attention blocks, with the exact pool when their
+        // formats have a tile mean.
+        let kv = kv::Group::new(
             device,
             ledger,
             "attention blocks",
-            &main_geos,
+            attention_at.iter().flatten().copied().collect(),
+            opts.kv,
             exact_slots,
-            kv::newest_cells(opts.kv.0, opts.kv.1),
             pages,
             max_slots,
             table_stride,
@@ -970,7 +952,6 @@ impl Part {
             max_slots,
             page_tab: vec![0; max_slots as usize * table_stride as usize],
             kv,
-            windows: Vec::new(),
             plan_config,
             plans: Vec::new(),
             plan_host: PinnedBuffer::new(device, plan_bytes as usize)?,
@@ -1059,12 +1040,6 @@ impl Part {
 
     fn at(&self, offset: u64) -> DevicePtr {
         self.scratch.ptr().offset(offset)
-    }
-
-    /// Where the exact entries of the attention block `at` are: null when the
-    /// formats have no exact entries.
-    fn exact_pool(&self, at: &AttentionAt) -> DevicePtr {
-        if self.kv.has_exact() { self.kv.exact().offset(at.exact) } else { DevicePtr::NULL }
     }
 
     /// Where the rows of the group being enqueued start in a buffer of the
@@ -1574,7 +1549,7 @@ impl Part {
                 )));
             }
         }
-        if let Some(limit) = kv::Pages::window_limit(self.opts.kv.0, self.opts.kv.1)
+        if let Some(limit) = kv::Group::window_limit(self.opts.kv.0, self.opts.kv.1)
             && let Some(s) = env.segments.iter().find(|s| !s.direct && s.n_rows > limit)
         {
             return Err(invalid(format!(
@@ -1626,53 +1601,17 @@ impl Part {
             [Group { first_row: 0, dims: env.dims, segments: env.segments.to_vec(), record: 0 }];
         let groups = if self.groups.is_empty() { &whole[..] } else { &self.groups[..] };
         for (g, group) in groups.iter().enumerate() {
-            for at in self.attention_at.iter().flatten() {
-                if self.plans.iter().any(|(pg, heads, _)| *pg == g && *heads == at.geo.kv_heads) {
-                    continue;
-                }
-                let mut planner = Planner::new(at.geo, self.plan_config, group.dims.n_rows);
-                for s in &group.segments {
-                    let table = s.slot * self.table_stride;
-                    let need = (s.pos0 as u32 + s.n_rows).div_ceil(ENTRY_CELLS) as usize;
-                    let entries =
-                        &self.kv.entries(&self.page_tab)[table as usize..table as usize + need];
-                    let pos0 = s.pos0 as u32;
-                    if s.direct && s.n_rows > 1 {
-                        // The rows of a prompt.
-                        planner.dense(table, entries, s.row0, s.n_rows, pos0);
-                        continue;
-                    }
-                    // A row that is generated, alone or in a window with
-                    // drafts, attends as the only row of a step would: what
-                    // was drafted must not change a bit of it. Where a tile
-                    // leaves the newest cells inside the window, the rows from
-                    // there on read it converted.
-                    let end = pos0 + s.n_rows;
-                    match self.kv.ahead(s.slot).filter(|a| pos0 < a.from && a.from < end) {
-                        None => planner.window(table, entries, s.row0, s.n_rows, pos0, None),
-                        Some(a) => {
-                            let before = a.from - pos0;
-                            let swap = Some((a.tile, a.page | PAGE_ENTRY));
-                            planner.window(table, entries, s.row0, before, pos0, None);
-                            planner.window(
-                                table,
-                                entries,
-                                s.row0 + before,
-                                s.n_rows - before,
-                                a.from,
-                                swap,
-                            );
-                        }
-                    }
-                }
-                let plan = planner.finish();
-                let state = plan.state_bytes(&at.geo);
-                if state > self.s.attn_state_bytes {
-                    return Err(invalid(format!(
-                        "the attention plan needs {state} bytes of partial states, {} are reserved",
-                        self.s.attn_state_bytes
-                    )));
-                }
+            // The K/V group plans the rows: a prompt's together, a generated
+            // row as the only row of a step.
+            let plans = self.kv.plans(
+                self.plan_config,
+                group.dims.n_rows,
+                &group.segments,
+                &self.page_tab,
+                self.table_stride,
+                self.s.attn_state_bytes,
+            )?;
+            for (heads, plan) in plans {
                 // The plan goes to the device with the one copy below, which
                 // the stream orders in front of the step's kernels; nothing
                 // is allocated and the host does not wait.
@@ -1689,7 +1628,7 @@ impl Part {
                     }
                     None => plan.upload(&self.device)?,
                 };
-                self.plans.push((g, at.geo.kv_heads, buffers));
+                self.plans.push((g, heads, buffers));
             }
         }
         if planned > 0 {
@@ -1713,61 +1652,15 @@ impl Part {
     /// name them. The conversions are queued here, in front of the step's
     /// kernels.
     fn prepare_kv(&mut self, env: &StepEnv<'_>) -> Result<(), ModelError> {
-        let reaches: Vec<forms::Reach> = env
-            .segments
-            .iter()
-            .map(|s| forms::Reach {
-                slot: s.slot,
-                pos0: s.pos0 as u32,
-                rows: s.n_rows,
-                writes: !env.replay.iter().any(|r| r.start <= s.row0 && s.row0 < r.end),
-                settles: s.direct,
-            })
-            .collect();
-        let jobs = self.kv.prepare(env.stream, &reaches, &self.page_tab, env.tables, true)?;
-        self.convert(env.stream, env.pages, Which::Attention, &jobs, 1)?;
+        let reaches = kv::reaches(env.segments, env.replay);
+        let (kernels, status) = (self.attention.as_ref(), self.at(self.s.status));
+        let (stream, tables, pages) = (env.stream, env.tables, env.pages);
+        self.kv.prepare(kernels, stream, &reaches, &self.page_tab, tables, pages, status, true)?;
         if let Some(m) = &mut self.mtp {
             // The draft block attends a link at a time: no window reads its tiles.
-            let jobs = m.kv.prepare(env.stream, &reaches, &self.page_tab, env.tables, false)?;
-            self.convert(env.stream, env.pages, Which::Draft, &jobs, 1)?;
+            m.kv.prepare(kernels, stream, &reaches, &self.page_tab, tables, pages, status, false)?;
         }
         Ok(())
-    }
-
-    /// The layers of a group with their places in the pools.
-    fn layers_of(&self, which: Which) -> Vec<kv::Layer> {
-        let layer = |at: &AttentionAt| kv::Layer { geo: at.geo, pool: at.pool, exact: at.exact };
-        match which {
-            Which::Attention => self.attention_at.iter().flatten().map(layer).collect(),
-            Which::Draft => self.mtp.iter().map(|m| layer(&m.at)).collect(),
-        }
-    }
-
-    /// Queues the conversion of tiles from their exact slots into the
-    /// converted entries of their pages, in every layer of a group.
-    fn convert(
-        &mut self,
-        stream: &Stream,
-        pages: DevicePtr,
-        which: Which,
-        jobs: &[forms::Convert],
-        region: usize,
-    ) -> Result<(), ModelError> {
-        if jobs.is_empty() {
-            return Ok(());
-        }
-        let kernels = self.attention.clone().ok_or_else(|| invalid("attention kernels"))?;
-        let status = self.at(self.s.status);
-        let layers = self.layers_of(which);
-        match which {
-            Which::Attention => {
-                self.kv.convert(&kernels, stream, pages, status, &layers, jobs, region)
-            }
-            Which::Draft => {
-                let m = self.mtp.as_mut().ok_or_else(|| invalid("no draft block"))?;
-                m.kv.convert(&kernels, stream, pages, status, &layers, jobs, region)
-            }
-        }
     }
 
     /// Tells the part that the pool freed these pages, so it gives back what
@@ -1782,15 +1675,11 @@ impl Part {
     /// Tells the part how the draft windows of the last step ended: for each,
     /// the slot and the cells of its sequence that are settled now.
     pub fn commit_windows(&mut self, accepted: impl IntoIterator<Item = (u32, u32)>) {
-        for (slot, accepted) in accepted {
-            let Some(&(_, pos0)) = self.windows.iter().find(|(s, _)| *s == slot) else { continue };
-            let cells = pos0 + accepted;
-            self.kv.settled(slot, cells, &self.page_tab);
-            if let Some(m) = &mut self.mtp {
-                m.kv.settled(slot, cells, &self.page_tab);
-            }
+        let accepted: Vec<(u32, u32)> = accepted.into_iter().collect();
+        self.kv.commit_windows(&accepted, &self.page_tab);
+        if let Some(m) = &mut self.mtp {
+            m.kv.commit_windows(&accepted, &self.page_tab);
         }
-        self.windows.clear();
     }
 
     /// Cuts a step into groups of rows, which a layer split hands over one by
@@ -2047,9 +1936,6 @@ impl Part {
             self.status_pending = true;
         }
         self.has_deferred = env.segments.iter().any(|s| !s.direct);
-        self.windows.clear();
-        self.windows
-            .extend(env.segments.iter().filter(|s| !s.direct).map(|s| (s.slot, s.pos0 as u32)));
         self.mark(env.stream, Phase::Other)
     }
 
@@ -2314,8 +2200,6 @@ impl Part {
         let (q, gate) = (self.rows(s.q, hq), self.rows(s.kv, hq));
         let (k, o) = (self.rows(s.k, hkv), self.rows(s.o, hq));
         let rope = self.rows(s.rope, self.rope.dim);
-        let pool = env.pages.offset(at.pool);
-        let (tables, exact) = (self.kv.table(env.tables), self.exact_pool(&at));
         let shape = AttentionShape { n_head: a.n_head, n_kv_head: a.n_kv, head_dim: hd };
         // SAFETY: scratch and weights as in `recurrent`; the tables hold the
         // entries the plan names (the plan was built from their host copy)
@@ -2350,34 +2234,31 @@ impl Part {
                 .ok_or_else(|| invalid("the step has no attention plan"))?;
             // The rows of a replay read cells that are cached already and
             // append none.
-            resume::append_writing(
+            self.kv.append(
                 &kernels,
                 stream,
-                &at.geo,
+                &at,
                 plan.rows(),
                 k,
                 v,
-                tables,
-                exact,
-                pool,
+                env.tables,
+                env.pages,
                 self.at(s.status),
                 env.replay,
                 self.row_base,
                 n,
             )?;
-            kernels.attend(
+            self.kv.attend(
+                &kernels,
                 stream,
-                &at.geo,
+                &at,
                 plan,
-                &AttendBuffers {
-                    tables,
-                    exact_pool: exact,
-                    converted_pool: pool,
-                    q,
-                    gate: Some(gate),
-                    out: o,
-                    scratch: self.at(s.attn_state),
-                },
+                env.tables,
+                env.pages,
+                q,
+                Some(gate),
+                o,
+                self.at(s.attn_state),
                 1.0 / (self.attn_head_dim as f32).sqrt(),
             )?;
             self.mark(stream, Phase::Attention)?;

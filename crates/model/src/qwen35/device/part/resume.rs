@@ -21,17 +21,14 @@
 //! **A replay** appends nothing: its rows read the cells that are cached
 //! already and only advance the recurrent state.
 
-use std::ops::Range;
 use std::sync::Arc;
 
-use ares_cuda::{
-    AttentionKernels, AttnRow, CacheGeometry, Device, DevicePtr, Event, StateFormat, Stream,
-};
+use ares_cuda::{Device, DevicePtr, Event, StateFormat, Stream};
 use ares_runtime::{
     DeviceTransfer, ModelError, PinnedRam, PlaceChunks, RecordView, StateCopyKind, TransferKind,
 };
 
-use super::{DRAFT_KV, Options, Part, Profile, Which, geometry, kv};
+use super::{DRAFT_KV, Options, Part, Profile, geometry, kv};
 use crate::qwen35::Config;
 use crate::qwen35::device::placement::Placement;
 
@@ -137,85 +134,6 @@ pub fn settle_cells(placement: &Placement, opts: &Options) -> u32 {
 /// The tag of a page in transit: which groups' entries are exact ones.
 const EXACT_ATTENTION: u32 = 1;
 const EXACT_DRAFT: u32 = 2;
-
-/// The rows of `first..first + n` of a step that write cells, as ranges of
-/// rows counted from `first`: every row but those of the `replay` ranges
-/// (rows of the whole step, in order).
-pub(super) fn writing_rows(
-    replay: &[Range<u32>],
-    first: u32,
-    n: u32,
-) -> impl Iterator<Item = Range<u32>> + '_ {
-    let end = first + n;
-    let mut at = first;
-    std::iter::from_fn(move || {
-        while at < end {
-            // Inside a replay: its rows write nothing.
-            if let Some(r) = replay.iter().find(|r| r.start <= at && at < r.end) {
-                at = r.end;
-                continue;
-            }
-            // Up to the next replay or the end.
-            let stop = replay
-                .iter()
-                .map(|r| r.start)
-                .filter(|s| *s > at)
-                .min()
-                .map_or(end, |s| s.min(end));
-            let run = at - first..stop - first;
-            at = stop;
-            return Some(run);
-        }
-        None
-    })
-}
-
-/// Appends the K and V rows of the rows of `first..first + n` of a step that
-/// write cells: one launch per run of them. `rows` are the plan's rows of the
-/// group, `k` and `v` its rows of keys and values (`[row][kv head][head_dim]`
-/// f32 as the geometry says).
-///
-/// # Safety
-///
-/// As for [`AttentionKernels::append`], for the rows of the group.
-#[allow(clippy::too_many_arguments)]
-pub(super) unsafe fn append_writing(
-    kernels: &AttentionKernels,
-    stream: &Stream,
-    geo: &CacheGeometry,
-    rows: DevicePtr,
-    k: DevicePtr,
-    v: DevicePtr,
-    tables: DevicePtr,
-    exact_pool: DevicePtr,
-    pool: DevicePtr,
-    status: DevicePtr,
-    replay: &[Range<u32>],
-    first: u32,
-    n: u32,
-) -> Result<(), ModelError> {
-    let kv_row = u64::from(geo.kv_total) * u64::from(geo.head_dim) * 4;
-    for run in writing_rows(replay, first, n) {
-        let at = u64::from(run.start);
-        // SAFETY: the run is inside the group's rows, which the caller's
-        // contract covers.
-        unsafe {
-            kernels.append(
-                stream,
-                geo,
-                rows.offset(at * std::mem::size_of::<AttnRow>() as u64),
-                run.end - run.start,
-                k.offset(at * kv_row),
-                v.offset(at * kv_row),
-                tables,
-                exact_pool,
-                pool,
-                status,
-            )?;
-        }
-    }
-    Ok(())
-}
 
 /// How many copies of each kind a step made, and the events around them.
 #[derive(Clone, Copy, Debug, Default)]
@@ -368,126 +286,6 @@ impl Part {
         Ok(())
     }
 
-    fn group(&mut self, which: Which) -> Option<&mut kv::Pages> {
-        match which {
-            Which::Attention => Some(&mut self.kv),
-            Which::Draft => self.mtp.as_mut().map(|m| &mut m.kv),
-        }
-    }
-
-    /// Runs conversions that a page on its way in made necessary, and waits
-    /// for them: the group's list of jobs on the device is written once per
-    /// step otherwise, and a transfer is no step.
-    fn convert_now(
-        &mut self,
-        stream: &Stream,
-        pages: DevicePtr,
-        which: Which,
-        jobs: &[super::forms::Convert],
-    ) -> Result<(), ModelError> {
-        if jobs.is_empty() {
-            return Ok(());
-        }
-        self.convert(stream, pages, which, jobs, 0)?;
-        Ok(stream.synchronize()?)
-    }
-
-    /// Copies the entries of `page` in the layers of one group to `dst`, in
-    /// the form the group holds them in. Returns the bytes and whether they
-    /// are exact entries.
-    fn group_out(
-        &mut self,
-        stream: &Stream,
-        pages: DevicePtr,
-        which: Which,
-        page: u32,
-        dst: *mut u8,
-        room: usize,
-    ) -> Result<(usize, bool), ModelError> {
-        let layers = self.layers_of(which);
-        let Some(group) = self.group(which) else { return Ok((0, false)) };
-        let (slot, exact_pool) = (group.exact_slot(page), group.exact());
-        let mut at = 0usize;
-        for layer in &layers {
-            let (src, bytes) = match slot {
-                Some(slot) => {
-                    let entry = layer.geo.exact_entry_bytes();
-                    (exact_pool.offset(layer.exact + u64::from(slot) * entry), entry as usize)
-                }
-                None => {
-                    let entry = layer.geo.converted_entry_bytes();
-                    (pages.offset(layer.pool + u64::from(page) * entry), entry as usize)
-                }
-            };
-            if at + bytes > room {
-                return Err(super::invalid("a page in transit has less room than its entries"));
-            }
-            // SAFETY: the entry is in the layer's pool (the page and the slot
-            // are below the pools' sizes) and `dst` has room for it (checked
-            // above); the caller waits for the stream before it reads.
-            unsafe { stream.copy_to_host(dst.add(at), src, bytes)? };
-            at += bytes;
-        }
-        Ok((at, slot.is_some()))
-    }
-
-    /// Copies the entries of `page` in the layers of one group from `src`,
-    /// which holds them as exact entries (`exact`) or as converted ones. An
-    /// exact page that is not to `keep` its form is converted at once. Returns
-    /// the bytes read.
-    #[allow(clippy::too_many_arguments)]
-    fn group_in(
-        &mut self,
-        stream: &Stream,
-        pages: DevicePtr,
-        which: Which,
-        page: u32,
-        src: *const u8,
-        len: usize,
-        exact: bool,
-        keep: bool,
-    ) -> Result<usize, ModelError> {
-        let layers = self.layers_of(which);
-        let Some(group) = self.group(which) else { return Ok(0) };
-        let slot = if exact {
-            let (slot, jobs) = group.adopt_exact(page)?;
-            self.convert_now(stream, pages, which, &jobs)?;
-            Some(slot)
-        } else {
-            // Whatever the group kept for the page's number belongs to a page
-            // that is gone.
-            group.release([page]);
-            None
-        };
-        let exact_pool = self.group(which).map_or(DevicePtr::NULL, |group| group.exact());
-        let mut at = 0usize;
-        for layer in &layers {
-            let (dst, bytes) = match slot {
-                Some(slot) => {
-                    let entry = layer.geo.exact_entry_bytes();
-                    (exact_pool.offset(layer.exact + u64::from(slot) * entry), entry as usize)
-                }
-                None => {
-                    let entry = layer.geo.converted_entry_bytes();
-                    (pages.offset(layer.pool + u64::from(page) * entry), entry as usize)
-                }
-            };
-            if at + bytes > len {
-                return Err(super::invalid("a page in transit is shorter than its entries"));
-            }
-            // SAFETY: as in `group_out`, the other way; `src` holds `len`
-            // bytes and stays as it is until the caller has waited for the
-            // stream.
-            unsafe { stream.copy_from_host(dst, src.add(at), bytes)? };
-            at += bytes;
-        }
-        if exact && !keep {
-            let jobs = self.group(which).map(|group| group.convert_page(page)).unwrap_or_default();
-            self.convert_now(stream, pages, which, &jobs)?;
-        }
-        Ok(at)
-    }
-
     /// Carries out this part's share of a transfer of the prefix cache's level
     /// on SSD (`ares_runtime::DeviceModel::transfer`): a page's K/V entries of
     /// every attention block and of the draft block, in the form they have,
@@ -499,19 +297,26 @@ impl Part {
         pages: DevicePtr,
         item: &mut DeviceTransfer,
     ) -> Result<(), ModelError> {
-        let groups = [(Which::Attention, EXACT_ATTENTION), (Which::Draft, EXACT_DRAFT)];
+        let (kernels, status) = (self.attention.as_ref(), self.at(self.s.status));
+        let groups = [
+            (Some(&mut self.kv), EXACT_ATTENTION),
+            (self.mtp.as_mut().map(|m| &mut m.kv), EXACT_DRAFT),
+        ];
         match item.kind {
             TransferKind::PageOut | TransferKind::PageIn if item.object >= self.n_pages => Err(
                 super::invalid(format!("page {} of {} in a transfer", item.object, self.n_pages)),
             ),
             TransferKind::PageOut => {
                 (item.len, item.tag) = (0, 0);
-                for (which, bit) in groups {
-                    // SAFETY: the transfer's memory holds `room` bytes.
-                    let dst = unsafe { item.ptr.add(item.len) };
-                    let room = item.room - item.len;
-                    let (bytes, exact) =
-                        self.group_out(stream, pages, which, item.object, dst, room)?;
+                for (group, bit) in groups {
+                    let Some(group) = group else { continue };
+                    // SAFETY: the transfer's memory holds `room` bytes from
+                    // `item.ptr`, which the caller reads after it has waited for
+                    // the stream.
+                    let (bytes, exact) = unsafe {
+                        let dst = item.ptr.add(item.len);
+                        group.page_out(stream, pages, item.object, dst, item.room - item.len)?
+                    };
                     item.len += bytes;
                     item.tag |= if exact { bit } else { 0 };
                 }
@@ -522,20 +327,25 @@ impl Part {
                     return Err(super::invalid("a page in transit is longer than its room"));
                 }
                 let mut at = 0usize;
-                for (which, bit) in groups {
-                    // SAFETY: `at` is within the `len` bytes of the transfer.
-                    let src = unsafe { item.ptr.add(at) };
+                for (group, bit) in groups {
+                    let Some(group) = group else { continue };
                     let exact = item.tag & bit != 0;
-                    at += self.group_in(
-                        stream,
-                        pages,
-                        which,
-                        item.object,
-                        src,
-                        item.len - at,
-                        exact,
-                        item.keep_form,
-                    )?;
+                    // SAFETY: `at` is within the `len` bytes of the transfer,
+                    // which stay as they are until the caller has waited for the
+                    // stream.
+                    at += unsafe {
+                        group.page_in(
+                            kernels,
+                            stream,
+                            pages,
+                            status,
+                            item.object,
+                            item.ptr.add(at),
+                            item.len - at,
+                            exact,
+                            item.keep_form,
+                        )?
+                    };
                 }
                 if at != item.len {
                     return Err(super::invalid(format!(
@@ -599,7 +409,7 @@ impl Part {
 
     /// Copies page `from` into page `to`, in every attention block and in the
     /// draft block: the converted entry, or, where the formats have a tile
-    /// mean, the exact entry (see `Pages::copy_page` in `blocks/kv.rs`).
+    /// mean, the exact entry (`Group::copy_page` of `blocks/kv.rs`).
     pub fn copy_page(
         &mut self,
         stream: &Stream,
@@ -615,11 +425,9 @@ impl Part {
         }
         let kernels = self.attention.clone().ok_or_else(|| super::invalid("attention kernels"))?;
         let status = self.at(self.s.status);
-        let main = self.layers_of(super::Which::Attention);
-        self.kv.copy_page(&kernels, stream, pages, status, &main, from, to)?;
+        self.kv.copy_page(&kernels, stream, pages, status, from, to)?;
         if let Some(m) = &mut self.mtp {
-            let layer = [super::kv::Layer { geo: m.at.geo, pool: m.at.pool, exact: m.at.exact }];
-            m.kv.copy_page(&kernels, stream, pages, status, &layer, from, to)?;
+            m.kv.copy_page(&kernels, stream, pages, status, from, to)?;
         }
         Ok(())
     }
@@ -743,39 +551,5 @@ impl Profile {
     /// the next step's are enqueued.
     pub fn copies(&self) -> Vec<CopyTimes> {
         self.inner.lock().unwrap_or_else(|e| e.into_inner()).copies.clone()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The runs of `first..first + n` as (start, end), for replays given as
-    /// (start, end).
-    fn runs(replay: &[(u32, u32)], first: u32, n: u32) -> Vec<(u32, u32)> {
-        let replay: Vec<Range<u32>> = replay.iter().map(|(a, b)| *a..*b).collect();
-        writing_rows(&replay, first, n).map(|r| (r.start, r.end)).collect()
-    }
-
-    #[test]
-    fn a_step_without_replays_writes_all_its_rows_in_one_run() {
-        assert_eq!(runs(&[], 0, 7), [(0, 7)]);
-        assert_eq!(runs(&[], 5, 3), [(0, 3)]);
-        assert!(runs(&[], 4, 0).is_empty());
-    }
-
-    #[test]
-    fn replayed_rows_are_left_out_of_the_runs() {
-        // Rows 0..4 write, 4..9 replay, 9..12 write, 12..14 replay, 14..16 write.
-        let replay = [(4, 9), (12, 14)];
-        assert_eq!(runs(&replay, 0, 16), [(0, 4), (9, 12), (14, 16)]);
-        // A group of rows 6..15 of that step: the runs count from its first row.
-        assert_eq!(runs(&replay, 6, 9), [(3, 6), (8, 9)]);
-        // A group inside a replay writes nothing.
-        assert!(runs(&replay, 5, 3).is_empty());
-        // A group that ends inside a replay.
-        assert_eq!(runs(&replay, 2, 5), [(0, 2)]);
-        // A step of replays alone.
-        assert!(runs(&[(0, 6)], 0, 6).is_empty());
     }
 }

@@ -222,8 +222,8 @@ struct Clock {
 pub(super) struct Mtp {
     sampler: SamplerKernels,
     pub(super) at: AttentionAt,
-    /// The exact pool and the table of the block's layer.
-    pub(super) kv: kv::Pages,
+    /// The K/V group of the block's layer: its exact pool and table.
+    pub(super) kv: kv::Group,
     w: DraftW,
     /// Per slot `carry_rows` rows of `d` values (see `sampler_draft.cuh`).
     carry: DeviceBuffer,
@@ -337,13 +337,13 @@ impl Mtp {
         let sizing =
             kv::Sizing { slots: max_slots, rows: opts.max_rows, tails: max_slots * TAILS_PER_SLOT };
         let exact_slots = kv::slots_for(DRAFT_KV.0, DRAFT_KV.1, sizing);
-        let pages_kv = kv::Pages::new(
+        let pages_kv = kv::Group::new(
             device,
             ledger,
             "draft block",
-            &[sizes.at.geo],
+            vec![sizes.at],
+            DRAFT_KV,
             exact_slots,
-            kv::newest_cells(DRAFT_KV.0, DRAFT_KV.1),
             pages,
             max_slots,
             table_stride,
@@ -1100,16 +1100,15 @@ impl Part {
                 k,
             )?;
             // The rows of a replay have their cells in the pool already.
-            super::resume::append_writing(
+            m.kv.append(
                 &attention,
                 stream,
-                &geo,
+                &m.at,
                 m.records.ptr().offset(m.follow_rows),
                 k,
                 v,
-                m.kv.table(env.tables),
-                exact_pool(m),
-                env.pages.offset(m.at.pool),
+                env.tables,
+                env.pages,
                 self.at(s.status),
                 env.replay,
                 0,

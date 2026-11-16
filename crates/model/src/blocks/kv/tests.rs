@@ -20,7 +20,7 @@ use ares_state::{PagePool, Sequence};
 
 use super::super::PAGE_ENTRY;
 use super::super::forms::Reach;
-use super::{Layer, Pages};
+use super::{Group, Layer, writing_rows};
 
 const TILE: usize = 128;
 
@@ -127,7 +127,7 @@ struct Rig<'a> {
     stream: Stream,
     geo: CacheGeometry,
     policy: KvPolicy,
-    pages: Pages,
+    pages: Group,
     converted: DeviceBuffer,
     status: DeviceBuffer,
     pool: PagePool,
@@ -158,19 +158,26 @@ impl<'a> Rig<'a> {
         let policy = KvPolicy::new(k, v);
         let stride = 24;
         let mut ledger = Ledger::new("test", 1 << 34);
-        let group = Pages::new(
+        let layers = vec![Layer { geo, pool: 0, exact: 0 }];
+        let formats = (geo.k, geo.v);
+        let group = Group::new(
             device,
             &mut ledger,
             "test",
-            &[geo],
+            layers,
+            formats,
             exact,
-            policy.exact_newest_cells as u32,
             pages,
             slots,
             stride,
             true,
         )
         .unwrap();
+        assert_eq!(
+            super::newest_cells(geo.k, geo.v),
+            policy.exact_newest_cells as u32,
+            "the group keeps the newest cells the policy keeps"
+        );
         Self {
             kernels: AttentionKernels::load(device).unwrap(),
             stream: Stream::new(device, 0).unwrap(),
@@ -184,10 +191,6 @@ impl<'a> Rig<'a> {
             stride,
             device,
         }
-    }
-
-    fn layer(&self) -> Layer {
-        Layer { geo: self.geo, pool: 0, exact: 0 }
     }
 
     fn seq(&self, slot: u32) -> Seq {
@@ -226,14 +229,12 @@ impl<'a> Rig<'a> {
             let dirty_from = grown.first_cell as usize / TILE;
             if let Some(copy) = grown.copy {
                 self.frees();
-                let layer = [self.layer()];
                 self.pages
                     .copy_page(
                         &self.kernels,
                         &self.stream,
                         self.converted.ptr(),
                         self.status.ptr(),
-                        &layer,
                         copy.from.0,
                         copy.to.0,
                     )
@@ -272,20 +273,16 @@ impl<'a> Rig<'a> {
             plan.push((first as usize, tokens.len()));
         }
         self.frees();
-        let jobs = self
-            .pages
-            .prepare(&self.stream, &reaches, &self.page_tab, DevicePtr::NULL, false)
-            .unwrap();
-        let layer = [self.layer()];
         self.pages
-            .convert(
-                &self.kernels,
+            .prepare(
+                Some(&self.kernels),
                 &self.stream,
+                &reaches,
+                &self.page_tab,
+                DevicePtr::NULL,
                 self.converted.ptr(),
                 self.status.ptr(),
-                &layer,
-                &jobs,
-                1,
+                false,
             )
             .unwrap();
         let rows_dev = upload(self.device, &AttnRow::to_bytes(&rows));
@@ -335,18 +332,16 @@ impl<'a> Rig<'a> {
             writes: false,
             settles: false,
         };
-        let jobs =
-            self.pages.prepare(&self.stream, &[r], &self.page_tab, DevicePtr::NULL, false).unwrap();
-        let layer = [self.layer()];
         self.pages
-            .convert(
-                &self.kernels,
+            .prepare(
+                Some(&self.kernels),
                 &self.stream,
+                &[r],
+                &self.page_tab,
+                DevicePtr::NULL,
                 self.converted.ptr(),
                 self.status.ptr(),
-                &layer,
-                &jobs,
-                1,
+                false,
             )
             .unwrap();
         self.stream.synchronize().unwrap();
@@ -677,4 +672,33 @@ fn the_table_of_a_new_group_is_zero_on_the_device_whatever_the_memory_held() {
             device.info().name
         );
     }
+}
+
+/// The runs of `first..first + n` as (start, end), for replays given as
+/// (start, end).
+fn runs(replay: &[(u32, u32)], first: u32, n: u32) -> Vec<(u32, u32)> {
+    let replay: Vec<std::ops::Range<u32>> = replay.iter().map(|(a, b)| *a..*b).collect();
+    writing_rows(&replay, first, n).map(|r| (r.start, r.end)).collect()
+}
+
+#[test]
+fn a_step_without_replays_writes_all_its_rows_in_one_run() {
+    assert_eq!(runs(&[], 0, 7), [(0, 7)]);
+    assert_eq!(runs(&[], 5, 3), [(0, 3)]);
+    assert!(runs(&[], 4, 0).is_empty());
+}
+
+#[test]
+fn replayed_rows_are_left_out_of_the_runs() {
+    // Rows 0..4 write, 4..9 replay, 9..12 write, 12..14 replay, 14..16 write.
+    let replay = [(4, 9), (12, 14)];
+    assert_eq!(runs(&replay, 0, 16), [(0, 4), (9, 12), (14, 16)]);
+    // A group of rows 6..15 of that step: the runs count from its first row.
+    assert_eq!(runs(&replay, 6, 9), [(3, 6), (8, 9)]);
+    // A group inside a replay writes nothing.
+    assert!(runs(&replay, 5, 3).is_empty());
+    // A group that ends inside a replay.
+    assert_eq!(runs(&replay, 2, 5), [(0, 2)]);
+    // A step of replays alone.
+    assert!(runs(&[(0, 6)], 0, 6).is_empty());
 }

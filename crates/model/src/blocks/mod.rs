@@ -13,8 +13,9 @@
 //! norms and gates, the activation forms, which kernel runs at which row count,
 //! fused launches and the exchanges between devices.
 //!
-//! - [`kv`]: the K/V pages of a group of attention layers, with the pool of
-//!   exact entries of the formats with a tile mean ([`forms`]).
+//! - [`kv`]: the K/V group, attention layers that share a pair of K/V formats,
+//!   with their pages and the pool of exact entries of the formats with a tile
+//!   mean ([`forms`]).
 
 pub(crate) mod forms;
 pub(crate) mod kv;
