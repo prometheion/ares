@@ -64,7 +64,8 @@ impl SplitKind {
 pub enum Drafter {
     /// The model's own draft block (multi-token prediction).
     Mtp,
-    /// A block drafter from a file of its own (DFlash2). Not built yet.
+    /// A drafter from a file of its own: a DFlash2 drafter (architecture
+    /// `dflash`), or the draft block of a model whose file carries none.
     Block(PathBuf),
 }
 

@@ -92,6 +92,10 @@ fn options_that_mean_nothing_for_a_mixture_of_experts_are_refused_by_name() {
     let stderr = refuses(&["--drafters", "mtp"], "--drafters");
     assert!(stderr.contains("a file of its own"), "{stderr}");
     let stderr = refuses(&["--drafters", "mtp,/models/dflash2.gguf"], "--drafters");
+    assert!(stderr.contains("a file of its own"), "{stderr}");
+    // One draft block and one DFlash drafter at most: two files that are no
+    // DFlash drafter are two draft blocks.
+    let stderr = refuses(&["--drafters", "/models/a.gguf,/models/b.gguf"], "--drafters");
     assert!(stderr.contains("one draft block"), "{stderr}");
     refuses(&["--window", "8"], "--window");
 }

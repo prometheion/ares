@@ -1660,6 +1660,113 @@ links is where text is copied (the rewrite) and for English prose, and zero
 or inside the spread for German and code; nothing is lost where it does not
 pay, because the policy drafts what the price and the acceptance say pay.
 
+### Drafters as kinds
+
+A drafter is a kind the runtime knows, not a feature of one model. The lookup
+in earlier text is the runtime's own and has id 0; a model lists the drafters
+it runs on its devices (`Model::drafters`: a kind and the most drafts it makes
+per sequence and step), and the record names them by their place in that list
+plus one. Two kinds exist:
+
+- **Draft block** (`DrafterKind::Block`): one more layer of the model's own
+  kind, a chain of links, each of which costs device time and can end the
+  chain by the drafter's probability (the draft bars).
+- **DFlash** (`DrafterKind::Dflash`): a drafter model from a file of its own
+  that reads taps of the model; one pass makes every draft of a window, so a
+  draft more costs no device time once the pass runs.
+
+A window whose drafts a model drafter makes has the own-drafts flag in its
+segment and the drafter's id in word 6. The conductor keeps per drafter a curve
+of what its drafts cost (measured at warm-up for 1 to the longest window, then
+by the steps that only draft), an acceptance per position (per sequence and of
+the engine) and a confidence by the drafter's probability. `want` offers every
+drafter's chances for every sequence, `ares_sched::choose` takes the drafter
+and the length that raise the rate of the whole round most, and one step that
+only drafts makes the drafts of every window that takes a model drafter (a
+step in which two sequences took two drafters prices both curves with the
+step's time). The device part keeps one list of drafts per step, written at
+each window's place in segment order, whichever drafter made them; the
+statistics count drafts by source (lookup, draft block, DFlash).
+
+### The DFlash drafter
+
+`ares_model::dflash` is the drafter for every model that has a DFlash2 file.
+What it is (from the fork's `src/models/dflash.cpp`, `common/speculative.cpp`
+and the DFlash study `/var/tmp/ares-dflash-study/REPORT.md`): five layers of
+the model's width with no embedding table and no head, which are the model's.
+For every computed token the model hands over its residual stream before the
+target layers (the *taps*); the drafter fuses them (`fc`, a norm) and stores
+every layer's key and value of the result at the token's position. A pass
+takes the block `[newest token, mask x 7]` at the next positions, runs it
+through its layers (RMS norm, a dynamic convolution of two taps over the
+block before and after attention and the feed-forward part, attention that
+is not causal inside the block over the stored cells of the last 2048
+positions and the block itself, SwiGLU), normalises, multiplies by the model's
+draft head, keeps the 16 best tokens of rows 1 to 7, and scores each candidate
+after each candidate of the position before through the selector (a gate of
+256 values per row, rows of two tables of 256 values per token). The chain is
+the greedy walk through that lattice: at each position the best score after
+the pick before; its probability is the pick's share of the softmax of that
+row, which the conductor reads like the draft block's.
+
+**What is shared and what is the model's.** The loader reads the shape from
+the file (block size, taps, selector, convolution, rotary base and sections,
+window, mask token) and refuses a variant it does not run by its name: DSpark
+(a Markov head, yarn rotary, drafts from the anchor), DFlash 1 (no selector),
+LiLiCorr, the DeepSeek-V4 and Mistral Large 4 drafters, gated attention, a
+vocabulary or head of its own, a norm per tap. Everything stateful is the
+drafter's: the fusion, the ring, the pass, the selector, the walk, the list.
+A model gives three things:
+
+| | the 27B (`qwen35/device/part/dflash.rs`) | Flash-Next (`qwen4exp/device/part/dflash.rs`) |
+| --- | --- | --- |
+| tap | the residual `x` before each target block; under a tensor split every device holds it after the merge, the drafter's device reads its own | the mean of the four hyper-connection streams before each target layer: the residual after the read of the layer's first mixer (the read applies the write before it), `hc` streams of `n` values per row |
+| embedding of a token | its row of the table in page-locked host memory, decoded on the host | its row decoded on the host from the mapped file |
+| draft head | the draft plan's (the first rows of the output head on the device that embeds, the draft vocabulary when there is one), in its own layout and products | the output head in the file's layout, the drafter's products |
+| device | the draft plan's device: one device, or a tensor split | the part that holds the streams and the head: one device, or the mixer of two devices on every layer |
+
+**Inject.** A tap goes through its share of `fc` as soon as the model's layer
+gives it (the fusion is split into one matrix per tap at load), so no tap is
+kept; after the model's last layer the sum is normed and every layer's key
+(per-head norm, rotary turn) and value are written into the ring of the row's
+sequence. Every row of every step is injected: prompt rows, replayed rows, and
+a window's draft rows too. The ring has `2048 + max(block, window rows)`
+cells per layer and slot, position `p` in cell `p mod cells`, so a rejected
+row's cell lies at a position at or past the newest token, which the next
+pass does not read, and maps to no cell the pass reads; the row accepted there
+later overwrites it. This is the study's "inject the kept rows at the commit"
+without keeping taps across steps, at the cost of fusing the rejected rows
+(the weights are read once for all rows of a step either way). The host keeps
+for each slot which positions its ring holds since the sequence took it; a
+segment that does not continue them (a new sequence, a sequence that resumed
+from the prefix cache) starts it again, and a pass reads no cell before that.
+
+**Pass.** In the step that only drafts: the newest token's row and the mask
+token's row (decoded once at load) are uploaded with the pass's records, the
+layers run on the decode kernels (8 rows a sequence) with 8-bit activations
+like the model's own decode products, the head is the model's, and the best
+16 per row, the selector's gate, the scores and the walk are kernels of
+`kernels/dflash.cu` (one block per sequence for the selector, which decodes
+the table rows it needs). The drafts go into the step record's token array and
+the step's list at the window's place.
+
+**Memory.** On the drafter's device, in its ledger before the pool is sized:
+the weights as the file stores them (27B: MEM27W; Flash-Next: MEMFNW), the
+ring (27B: 5 layers x 2064 cells x 8 heads x 128 x K and V in f16 = 42 MiB per
+sequence slot; Flash-Next the same), the scratch (the pass of every slot at
+once, the logits of the head for 7 rows per slot, the fusion of a step of the
+most rows). The server counts all of it in the plan of that device: a start
+that cannot fit is refused by the ledger with what holds the device.
+
+**Not built.** Trees (steps 9, 10): the lattice is computed and kept per pass
+(`Drafter::lattice`), the walk takes its first-choice path only. The ring in
+the prefix cache's checkpoints: a sequence that resumes starts its ring at the
+resume point. Flash-Next under a split by layers (the first device's taps
+would have to cross to the head's device). Sampled drafts (the walk is greedy;
+the target's sampled picks verify them as any other drafts).
+
+DFLASH-NUMBERS
+
 ## Sampling
 
 A request can set what the model's logits go through before a token is drawn

@@ -1080,9 +1080,9 @@ fn the_choice_of_drafters_is_refused_by_name_before_a_device_is_touched() {
         eprintln!("skipped: set ARES_TEST_QWEN35_MODEL to a small qwen35 model file");
         return;
     };
-    // A block drafter from a file is accepted by the option and not built.
-    let (status, said) = refused(&model, &["--drafters", "mtp,/models/dflash2.gguf"]);
-    assert!(!status.success() && said.contains("not built yet"), "{said}");
+    // A drafter from a file that is not there is refused by its name.
+    let (status, said) = refused(&model, &["--drafters", "/models/dflash2.gguf"]);
+    assert!(!status.success() && said.contains("/models/dflash2.gguf"), "{said}");
     // The small model has no draft block of its own.
     let (status, said) = refused(&model, &["--drafters", "mtp"]);
     assert!(!status.success() && said.contains("no draft block"), "{said}");
