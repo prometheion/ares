@@ -1072,8 +1072,6 @@ impl Qwen4Exp {
                 }
                 config.ram_bytes = reach;
                 config.ram_piece = self.opts.ram_piece.unwrap_or(PIECE) as u64;
-                // MEASURE-ONLY: removed before the work is handed back.
-                config.read_left = std::env::var_os("ARES_MEASURE_READ_LEFT").is_some();
                 let plan = StorePlan::new(config, &map, &reader, &layout.specs, None)
                     .map_err(|e| invalid(e.to_string()))?;
                 build.plan = Some(PlanBox { plan, map, reader, ram_start });
@@ -1573,12 +1571,8 @@ impl Qwen4ExpDevice {
         // The windows whose rows past the first verify drafts; a step that
         // only drafts runs none of the model's rows and is no step of the
         // store.
-        // MEASURE-ONLY: ARES_MEASURE_NO_LEAVE, removed before the work is handed back.
-        let windows: Vec<(u32, u32)> = if std::env::var_os("ARES_MEASURE_NO_LEAVE").is_some() {
-            Vec::new()
-        } else {
-            self.segments.iter().filter(|s| !s.direct).map(|s| (s.row0, s.n_rows)).collect()
-        };
+        let windows: Vec<(u32, u32)> =
+            self.segments.iter().filter(|s| !s.direct).map(|s| (s.row0, s.n_rows)).collect();
         let worth: Option<Vec<f32>> = record
             .row_worth(0)
             .map(|_| (0..rows).map(|row| record.row_worth(row).unwrap_or(0.0)).collect());
