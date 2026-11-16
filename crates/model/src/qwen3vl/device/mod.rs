@@ -395,8 +395,11 @@ impl DeviceTower {
                 for (u, unit) in units.iter().enumerate() {
                     let slot = u % 2;
                     stream.wait_event(&s.uploaded[slot])?;
-                    self.run_unit(stream, &pass, unit, s.slots[slot].ptr())?;
+                    // A unit that fails half enqueued still marks its slot, so that the
+                    // next upload into it waits for the launches it did enqueue.
+                    let ran = self.run_unit(stream, &pass, unit, s.slots[slot].ptr());
                     s.consumed[slot].record(stream)?;
+                    ran?;
                     if u + 2 < units.len() {
                         upload(u + 2)?;
                     }

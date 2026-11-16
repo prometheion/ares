@@ -11,8 +11,8 @@
 //!   normalised with `qwen3vl::image` here;
 //! - `ARES_TEST_QWEN3VL_ROWS`: a directory where the reference's rows of every
 //!   case are kept (`<27b|flash>/<case>.<exact|half>.f32`), computed when
-//!   missing (the reference takes about 16 minutes on 16 threads for an image
-//!   of 4060 rows); delete it when the reference changes;
+//!   missing (the reference took 21 to 36 minutes on 12 threads, under other
+//!   load, for an image of 4060 rows); delete it when the reference changes;
 //! - `ARES_TEST_QWEN3VL_MAX_ROWS`: the largest image to run, in rows, 1024
 //!   unless set (4096 for all);
 //! - `ARES_TEST_QWEN3VL_THREADS`: threads of the reference, all unless set;
