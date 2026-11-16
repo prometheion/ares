@@ -267,6 +267,9 @@ impl Config {
         if self.n_head_kv == 0 || !self.n_head.is_multiple_of(self.n_head_kv) {
             return fail(format!("{} heads over {} K/V heads", self.n_head, self.n_head_kv));
         }
+        if self.target_layers.len() > 64 {
+            return fail(format!("{} target layers (64 at most)", self.target_layers.len()));
+        }
         if self.mask_token as usize >= self.n_vocab {
             return fail(format!("mask token {} of {} tokens", self.mask_token, self.n_vocab));
         }

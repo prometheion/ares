@@ -292,9 +292,10 @@ pub struct Drafter {
     rings: Vec<SlotRing>,
     /// The embedding of the mask token.
     mask_row: Vec<f32>,
-    /// Rows of the step being enqueued, and taps it has had.
+    /// Rows of the step being enqueued, and the taps it has had (a bit per
+    /// tap: a step cut into groups of rows gives each tap once per group).
     inject_rows: u32,
-    taps: usize,
+    taps: u64,
     /// The sequences of the pass being enqueued.
     pass: Vec<PassSeq>,
     /// The drafts' shares of the last pass, copied to the host.
@@ -692,7 +693,7 @@ impl Drafter {
             // SAFETY: both hold `rows * d` f32.
             unsafe { kernels.add_f32(stream, row_off(self.s.fused), part, rows * d)? };
         }
-        self.taps += 1;
+        self.taps |= 1 << tap;
         Ok(())
     }
 
@@ -702,10 +703,10 @@ impl Drafter {
         if n == 0 {
             return Ok(());
         }
-        if self.taps != self.w.fc.len() {
+        if self.taps.count_ones() as usize != self.w.fc.len() {
             return Err(invalid(format!(
                 "the step gave {} taps of the {} the drafter reads",
-                self.taps,
+                self.taps.count_ones(),
                 self.w.fc.len()
             )));
         }
