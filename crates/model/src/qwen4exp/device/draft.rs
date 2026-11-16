@@ -38,6 +38,19 @@
 //! The block's pages are its own memory, addressed through the page tables
 //! the conductor gives the model: page `p` of a sequence holds the same cells
 //! of the model's attention layers and of the block.
+//!
+//! **The prefix cache** (`resume.rs`). A checkpoint keeps the block's slot
+//! (its indexer's carried keys) and the sequence's carry; a page copy and a
+//! page in transit take the block's cells and keys with the model's. The rows
+//! of a replay have their cells in the cache, the block's too (whoever
+//! computed them had the same tokens), so the block follows a replay with the
+//! carry alone and writes nothing. Since cell `i` waits for the token of
+//! cell `i + 1`, the last cell of a page is written one step after the page
+//! is full, when the sequence goes on: a page whose sequence ended at its end
+//! is settled without it (its tile can then be converted when the pool needs
+//! room), and a row that would write into a tile that is converted already
+//! (a cached page that another sequence went past) reads the cell and writes
+//! nothing, as a replay. Either way only the drafts can differ.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -50,9 +63,12 @@ use ares_cuda::{
 use ares_runtime::{DraftChances, ModelError, draft_chance};
 use ares_sampler::{SamplePick, SampleRow};
 
+use std::ops::Range;
+
 use super::board::Board;
 use super::part::{ExpertAt, Options, Part, StepEnv};
 use super::runtime::{Embedding, Flow};
+use crate::blocks::slots::{Extent, PageArray, PageGroup};
 use crate::qwen4exp::Config;
 use crate::qwen4exp::device::load::Mat;
 use crate::qwen4exp::reference::block_config;
@@ -70,6 +86,8 @@ struct Tail {
     row0: u32,
     tokens: Vec<u32>,
     direct: bool,
+    /// The rows are a replay: their cells are cached, the block's too.
+    replay: bool,
     /// The drafts of the block among the rows: 0 for rows that took none.
     links: u32,
 }
@@ -346,6 +364,21 @@ impl DraftBlock {
         self.part.update_table(stream, slot, first, entries)
     }
 
+    /// What a checkpoint keeps of the block: its slot (the carried keys of
+    /// its indexer) and the sequence's carry.
+    pub(super) fn extents(&self) -> [Extent; 2] {
+        let row = self.wide * 4;
+        [self.part.arena_extent(), Extent { base: self.carry.ptr(), stride: row, bytes: row }]
+    }
+
+    /// What a page holds of the block: its K/V group and its indexer's pooled
+    /// keys, in the block's own pools.
+    pub(super) fn page_parts(
+        &mut self,
+    ) -> Result<(Option<PageGroup<'_>>, Vec<PageArray>), ModelError> {
+        self.part.page_parts(self.pools.ptr())
+    }
+
     /// The pool freed these pages: the block gives back what it kept for them.
     pub(super) fn release_pages(&mut self, pages: &[u32]) {
         self.part.release_pages(pages.iter().copied());
@@ -366,6 +399,9 @@ impl DraftBlock {
         let begun = Instant::now();
         let tails = std::mem::take(&mut self.tails);
         let mut rows: Vec<Row> = Vec::new();
+        // The sequences that end at the end of a page: the block's last cell of
+        // the page waits for a token that may never come.
+        let mut at_page_end: Vec<(u32, u32)> = Vec::new();
         for tail in &tails {
             let n = tail.tokens.len() as u32;
             let counted = if tail.direct {
@@ -380,12 +416,17 @@ impl DraftBlock {
             if counted == 0 {
                 continue;
             }
+            let cells = tail.pos0 + counted;
+            if cells.is_multiple_of(ares_cuda::ENTRY_CELLS) {
+                at_page_end.push((tail.slot, cells));
+            }
             // Draft `j` was verified when every draft before it was accepted.
             for link in 0..tail.links.min(counted) as usize {
                 self.times.offered[link] += 1;
                 self.times.accepted[link] += u64::from(link as u32 + 1 < counted);
             }
-            for r in 0..counted - 1 {
+            // The cells of a replay are cached, the block's with them.
+            for r in (0..counted - 1).filter(|_| !tail.replay) {
                 rows.push(Row {
                     slot: tail.slot,
                     cell: tail.pos0 + r,
@@ -412,6 +453,11 @@ impl DraftBlock {
         for chunk in rows.chunks(MAX_BATCH as usize) {
             self.step(stream, flow, chunk, residual, None)?;
         }
+        // Behind those rows the pages they fill are settled, the last cell of
+        // a page whose sequence stops at its end with them.
+        for (slot, cells) in at_page_end {
+            self.part.settle(slot, cells);
+        }
         self.times.key_ms += begun.elapsed().as_secs_f64() * 1e3;
         self.watch.lock().unwrap_or_else(|e| e.into_inner()).times = self.times;
         Ok(())
@@ -421,7 +467,9 @@ impl DraftBlock {
     /// chains. `tokens` are the tokens of the step's rows; the rows that take
     /// the block's drafts get them. After the tables of the step are written.
     /// `only` is a step that only drafts: the model's step after it verifies
-    /// the drafts and finds the newest cells of these chains written.
+    /// the drafts and finds the newest cells of these chains written. The
+    /// segments that start in `replay` (rows of the step) are a replay, whose
+    /// newest cell is cached.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn draft(
         &mut self,
@@ -432,6 +480,7 @@ impl DraftBlock {
         chains: &[Chain],
         chances: Option<&DraftChances>,
         only: bool,
+        replay: &[Range<u32>],
     ) -> Result<(), ModelError> {
         self.n_drafts = 0;
         self.last_chain_ms = 0.0;
@@ -448,7 +497,10 @@ impl DraftBlock {
             .iter()
             .enumerate()
             .filter(|(i, s)| {
-                s.pos0 > 0 && !drafting(*i) && !done.contains(&(s.slot, s.pos0 as u32 - 1))
+                s.pos0 > 0
+                    && !drafting(*i)
+                    && !done.contains(&(s.slot, s.pos0 as u32 - 1))
+                    && !replay.iter().any(|r| r.contains(&s.row0))
             })
             .map(|(_, s)| Row {
                 slot: s.slot,
@@ -612,8 +664,8 @@ impl DraftBlock {
     }
 
     /// Remembers the rows of the model's step that is enqueued now: the next
-    /// step follows them.
-    pub(super) fn keep(&mut self, segments: &[Segment], tokens: &[u32]) {
+    /// step follows them. `replay` are the rows of the step that are a replay.
+    pub(super) fn keep(&mut self, segments: &[Segment], tokens: &[u32], replay: &[Range<u32>]) {
         let made = std::mem::take(&mut self.made);
         self.tails.clear();
         self.tails.extend(segments.iter().map(|s| {
@@ -623,6 +675,7 @@ impl DraftBlock {
                 row0: s.row0,
                 tokens: tokens[s.row0 as usize..(s.row0 + s.n_rows) as usize].to_vec(),
                 direct: s.direct,
+                replay: replay.iter().any(|r| r.contains(&s.row0)),
                 // The drafts of the chain that the window verifies.
                 links: made
                     .iter()
@@ -745,7 +798,16 @@ impl DraftBlock {
         }
         let tokens: Vec<u32> = rows.iter().map(|r| r.token).collect();
         let out_rows: Vec<u32> = if sample.is_some() { (0..n).collect() } else { Vec::new() };
-        let record = StepRecord::new(&segments, &tokens, None, &out_rows)?;
+        let mut record = StepRecord::new(&segments, &tokens, None, &out_rows)?;
+        // A sequence's row that would write into a tile held converted reads
+        // its cell and writes nothing (see the module's documentation).
+        let mut replay = Vec::new();
+        for (i, s) in segments.iter().enumerate() {
+            if self.part.writes_converted(s.slot, s.pos0 as u32) {
+                record.mark_replay(i)?;
+                replay.push(s.row0..s.row0 + s.n_rows);
+            }
+        }
         // The token marks the block's route records: never 0, and never the
         // same for two steps that follow each other.
         self.serial = self.serial.wrapping_add(1).max(1);
@@ -759,6 +821,7 @@ impl DraftBlock {
             inbound: Some(input),
             xbase: 0,
             pools: self.pools.ptr(),
+            replay: &replay,
         };
         self.part.begin(&env)?;
         let Some(params) = sample else {

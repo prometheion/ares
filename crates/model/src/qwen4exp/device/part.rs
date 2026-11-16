@@ -61,6 +61,7 @@ use ares_runtime::expert_store::cpu::act_bytes as cpu_act_bytes;
 mod block;
 mod dflash;
 mod predict;
+mod resume;
 mod wide;
 
 use super::board::Board;
@@ -71,7 +72,7 @@ use super::load::{
 use super::prune::{PartPrune, PruneMask, PruneSetup};
 use crate::blocks::kv;
 use crate::blocks::recurrent::{self, Inputs, Recurrent};
-use crate::blocks::slots::{Arena, SlotLayout};
+use crate::blocks::slots::{Arena, SlotLayout, TAILS_PER_SLOT};
 use crate::qwen4exp::Config;
 use crate::qwen4exp::weights::Weights;
 
@@ -294,6 +295,11 @@ pub struct StepEnv<'a> {
     /// The memory of the pools of K/V and keys on this device: the pages
     /// times [`Part::page_bytes`] bytes; the part lays out what is in it.
     pub pools: DevicePtr,
+    /// The rows of the step that are a replay (rows of the whole step): they
+    /// read the cells their sequence has cached already and write neither K
+    /// and V nor pooled keys. Their segments carry the replay flag in
+    /// `record`.
+    pub replay: &'a [Range<u32>],
 }
 
 impl std::fmt::Debug for StepEnv<'_> {
@@ -626,9 +632,13 @@ impl Frame {
         let ng = ngram_shape(c);
         let plan_config = PlanConfig::for_multiprocessors(multiprocessors);
         let pages = u64::from(opts.pages());
-        // The exact slots of the K/V group, when its formats have a tile mean:
-        // no prefix cache holds tails here.
-        let sizing = kv::Sizing { slots: opts.max_slots, rows: opts.max_rows, tails: 0 };
+        // The exact slots of the K/V group, when its formats have a tile mean,
+        // with the tails the prefix cache may hold.
+        let sizing = kv::Sizing {
+            slots: opts.max_slots,
+            rows: opts.max_rows,
+            tails: opts.max_slots * TAILS_PER_SLOT,
+        };
         let exact_slots = kv::slots_for(opts.kv.0, opts.kv.1, sizing);
         let mut exact_at = 0u64;
 
@@ -1912,7 +1922,7 @@ impl Part {
         // newest cells are converted, the pages the rows write get exact slots,
         // and the table names them; the conversions run in front of the step.
         if let Some(kv) = &mut self.kv {
-            let reaches = kv::reaches(env.segments, &[]);
+            let reaches = kv::reaches(env.segments, env.replay);
             let status = self.scratch.ptr().offset(self.f.s.status);
             let (tables, pools) = (self.tables.ptr(), env.pools);
             let kernels = self.attention.as_ref();
@@ -2622,7 +2632,7 @@ impl Part {
                 tables,
                 env.pools,
                 self.at(s.status),
-                &[],
+                env.replay,
                 0,
                 rows,
             )?;

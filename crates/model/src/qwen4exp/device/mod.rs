@@ -30,6 +30,7 @@ mod ngram;
 mod part;
 pub mod placement;
 mod prune;
+mod resume;
 mod runtime;
 mod session;
 mod usage;

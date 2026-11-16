@@ -18,6 +18,12 @@ fn invalid(message: impl Into<String>) -> Error {
     Error::Invalid(message.into())
 }
 
+/// The bytes a checkpoint keeps of what the feed knows of a sequence, for a
+/// model with the n-gram block `ngram` ([`NgramFeed::save`]).
+pub(super) fn saved_bytes(ngram: Option<&Ngram>) -> u64 {
+    ngram.map_or(0, |g| 8 + 4 * g.ngram_size.saturating_sub(1) as u64)
+}
+
 struct Sequence {
     position: u32,
     /// The last tokens of the sequence, as many as the n-gram hash reads.
@@ -112,6 +118,63 @@ impl NgramFeed {
             ))),
             None => Err(invalid(format!("slot {slot} of the session"))),
         }
+    }
+
+    /// The bytes of what the feed knows of one sequence, as a checkpoint
+    /// keeps it ([`NgramFeed::save`]): its position, the number of its last
+    /// tokens, and room for as many of them as the hash reads. 0 for a model
+    /// without the n-gram block.
+    pub(super) fn saved_bytes(&self) -> u64 {
+        saved_bytes(self.ngram.as_ref())
+    }
+
+    /// What the feed knows of the sequence in `slot`: [`NgramFeed::saved_bytes`]
+    /// bytes, for a checkpoint of the sequence.
+    pub(super) fn save(&self, slot: u32) -> Result<Vec<u8>, Error> {
+        let sequence = self
+            .sequences
+            .get(slot as usize)
+            .ok_or_else(|| invalid(format!("slot {slot} of the session")))?;
+        let mut out = vec![0u8; self.saved_bytes() as usize];
+        if out.is_empty() {
+            return Ok(out);
+        }
+        out[..4].copy_from_slice(&sequence.position.to_le_bytes());
+        out[4..8].copy_from_slice(&(sequence.recent.len() as u32).to_le_bytes());
+        for (word, token) in out[8..].chunks_exact_mut(4).zip(&sequence.recent) {
+            word.copy_from_slice(&token.to_le_bytes());
+        }
+        Ok(out)
+    }
+
+    /// The sequence in `slot` goes on from what [`NgramFeed::save`] gave of
+    /// another (a checkpoint the slot was restored from): its rows start
+    /// where that sequence was, after the same tokens.
+    pub(super) fn restore(&mut self, slot: u32, saved: &[u8]) -> Result<(), Error> {
+        if saved.len() as u64 != self.saved_bytes() {
+            return Err(invalid(format!(
+                "{} bytes of an n-gram sequence; the feed keeps {}",
+                saved.len(),
+                self.saved_bytes()
+            )));
+        }
+        if saved.is_empty() {
+            return Ok(());
+        }
+        let word = |at: usize| {
+            u32::from_le_bytes([saved[at], saved[at + 1], saved[at + 2], saved[at + 3]])
+        };
+        let count = word(4) as usize;
+        if 8 + 4 * count > saved.len() {
+            return Err(invalid(format!("{count} tokens of an n-gram sequence")));
+        }
+        let sequence = self
+            .sequences
+            .get_mut(slot as usize)
+            .ok_or_else(|| invalid(format!("slot {slot} of the session")))?;
+        sequence.position = word(0);
+        sequence.recent = (0..count).map(|i| word(8 + 4 * i)).collect();
+        Ok(())
     }
 
     /// Whether draft windows wait to be settled.

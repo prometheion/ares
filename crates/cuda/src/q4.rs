@@ -614,7 +614,9 @@ impl Q4Kernels {
     /// `u[row][e] = rope(rms(iq[row][e]) * q_norm)` and the pooled keys of the
     /// blocks the segments complete (the mean of a block's raw keys through
     /// the RMS norm with `k_norm` and the rotation of the block's first cell),
-    /// written into the key pool. The carried state is read, not written.
+    /// written into the key pool, except those of a replay segment (flagged
+    /// in the record: its blocks are cached). The carried state is read, not
+    /// written.
     ///
     /// - `attn_rows`: the attention plan's rows ([`AttnRow`] per row of the step).
     /// - `iq` `[row][n_head][key_dim]` and `raw` `[row][key_dim]`: the two

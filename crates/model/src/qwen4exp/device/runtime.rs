@@ -26,6 +26,7 @@
 //!   Cancellation and new requests are handled between steps, as for any
 //!   model.
 
+use std::ops::Range;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, TryLockError};
 use std::time::{Duration, Instant};
@@ -39,8 +40,9 @@ use ares_runtime::expert_store::{
     CudaSlots, HostRegion, PIECE, Serve, StoreConfig, StorePlan, StoreStats,
 };
 use ares_runtime::{
-    ContextSpec, DeviceContext, DeviceModel, Drafter, DrafterKind, LinkSpec, Logits, Model,
-    ModelError, OwnDrafts, Pick, PinnedRam, Split, StepContext,
+    ContextSpec, DeviceContext, DeviceModel, DeviceTransfer, Drafter, DrafterKind, Durable,
+    LinkSpec, Logits, Model, ModelError, OwnDrafts, Pick, PinnedRam, PrefixCache, Split,
+    StepContext, TransferContext,
 };
 use ares_state::PageLayout;
 use ares_tokenizer::{ChatOptions, Tokenizer};
@@ -52,15 +54,18 @@ use super::feed::{
     plan_transit, reader,
 };
 use super::misses::{Misses, Progress, WideStats};
-use super::ngram::NgramFeed;
+use super::ngram::{self, NgramFeed};
 use super::part::{
-    ExpertAt, Frame, Options, PAGE_ENTRY, Part, PartSetup, PartShape, Ports, StepEnv,
+    DRAFT_KV, ExpertAt, Frame, Options, PAGE_ENTRY, Part, PartSetup, PartShape, Ports, StepEnv,
 };
 use super::placement::{MARGIN, PartPlan, Placement};
 use super::prune::{self, PruneMask};
+use super::resume::Resume;
 use super::session::{Chosen, Fill, PartReport, SessionOptions, choose};
 use super::usage::{Log, ProfileReport, Usage, UsageStats};
+use crate::blocks::slots::{self, Declared, TAILS_PER_SLOT};
 use crate::chat;
+use crate::qwen4exp::reference::block_config;
 use crate::qwen4exp::weights::{DraftWeights, Weights};
 use crate::qwen4exp::{Config, Error as FileError};
 
@@ -322,7 +327,7 @@ impl Flow {
         }
     }
 
-    fn lock_ngram(&self) -> MutexGuard<'_, NgramFeed> {
+    pub(super) fn lock_ngram(&self) -> MutexGuard<'_, NgramFeed> {
         self.ngram.lock().unwrap_or_else(|e| e.into_inner())
     }
 
@@ -640,6 +645,9 @@ pub struct Qwen4Exp {
     pinned: u64,
     /// The bytes one page of the pools takes on each device.
     page_bytes: Vec<u64>,
+    /// What each device keeps of a sequence and of a page, for the prefix
+    /// cache (`resume.rs`).
+    declared: Vec<Declared>,
     /// The file of the model's draft block, when it drafts.
     draft: Option<Arc<Gguf>>,
     /// A DFlash drafter, when it drafts.
@@ -695,11 +703,24 @@ impl Qwen4Exp {
         let (placement, page_bytes) = place_in(&config, &weights, devices, &opts)?;
         let (layout, _map) = Layout::new(&gguf, &config, &weights, &placement, None)?;
         let mut pinned = 0;
+        let mut declared = Vec::with_capacity(devices.len());
         for (index, device) in devices.iter().enumerate() {
             let PartPlan { role, first, shares, head } = placement.part(&config, index);
             let layers = shares.len();
+            // The part that holds the n-gram block drives the feed of its rows,
+            // whose checkpoint keeps what the feed knows of a sequence.
+            let feeds = role != super::Role::Worker
+                && config
+                    .ngram
+                    .as_ref()
+                    .is_some_and(|g| (first..first + layers).contains(&g.layer));
             let shape = PartShape { role, first, shares, head };
             let frame = Frame::new(&config, &opts.part, &shape, device.info().multiprocessors)?;
+            let mut part = frame.declared(&opts.part);
+            if feeds {
+                part.checkpoint += ngram::saved_bytes(config.ngram.as_ref());
+            }
+            declared.push(part);
             let shares = if opts.serve == Serve::Stream {
                 0
             } else {
@@ -748,6 +769,7 @@ impl Qwen4Exp {
             reports: Mutex::new(Vec::new()),
             pinned,
             page_bytes,
+            declared,
             draft: None,
             dflash: None,
             draft_report: Mutex::new(None),
@@ -843,6 +865,24 @@ impl Qwen4Exp {
         let device = self.head_device();
         let layer = DraftLayer { gguf: &draft, weights: &head, device };
         let (layout, _map) = Layout::new(&self.gguf, c, &weights, &self.placement, Some(&layer))?;
+        // What the block keeps of a sequence (its slot and the carry) and of
+        // a page (its K/V group and pooled keys), next to the head's part.
+        let block = block_config(c);
+        let block_opts = Options {
+            kv: DRAFT_KV,
+            max_rows: MAX_BATCH,
+            logit_rows: MAX_BATCH,
+            window_rows: 0,
+            host_logits: false,
+            profile: None,
+            ..self.opts.part.clone()
+        };
+        let frame = Frame::new(&block, &block_opts, &PartShape::whole(&block, 0..1, true), 1)?;
+        let mut declared = frame.declared(&block_opts);
+        let part = &mut self.declared[device];
+        part.checkpoint += declared.checkpoint + c.wide() as u64 * 4;
+        part.groups.append(&mut declared.groups);
+        part.arrays += declared.arrays;
         // The block's host share and its staged rows and picks.
         if self.opts.serve != Serve::Stream {
             self.pinned += layout.shapes[0].host_share_bytes(MAX_BATCH);
@@ -1325,6 +1365,17 @@ impl Qwen4Exp {
             upload: part.upload_time(),
         });
         let first = part.layer_range().start == 0 && part.role() != super::Role::Worker;
+        // The checkpoints of this device: what the model said it keeps of a
+        // sequence here is what it copies.
+        let feeds = part.ngram_layer().map_or(0, |_| ngram::saved_bytes(c.ngram.as_ref()));
+        let resume = Resume::open(device, ram, cx.checkpoints, &part, block.as_ref(), feeds)?;
+        if resume.bytes() != self.declared[index].checkpoint {
+            return Err(invalid(format!(
+                "a checkpoint of device part {index} takes {} bytes; the model declared {}",
+                resume.bytes(),
+                self.declared[index].checkpoint
+            )));
+        }
         Ok(Box::new(Qwen4ExpDevice {
             index,
             devices: n,
@@ -1365,7 +1416,58 @@ impl Qwen4Exp {
             accepted: Vec::new(),
             windows: Vec::new(),
             shape: Vec::new(),
+            replay: Vec::new(),
+            resume,
         }))
+    }
+}
+
+impl Qwen4Exp {
+    /// Everything besides the tokens that changes the bytes of a page or of a
+    /// checkpoint as the device parts hand them out
+    /// ([`ares_runtime::Durable::fingerprint`]):
+    ///
+    /// - the model's files and the draft block's (size, header and samples
+    ///   of the weights);
+    /// - the formats of K and V, of the pooled keys and of the recurrent
+    ///   state, and how the products of a prompt round;
+    /// - what each device holds of every layer (its role, its heads, the
+    ///   shared expert), since the bytes are laid out per device.
+    ///
+    /// How a missed expert is served is not in it: the CPU's sums of a miss
+    /// differ from a device's by rounding, as two runs differ in their misses.
+    fn state_fingerprint(&self) -> Vec<u8> {
+        let mut out = b"qwen4exp state 1\0".to_vec();
+        for part in 0..self.gguf.n_parts() {
+            crate::files::identity(self.gguf.path(part as u16), &mut out);
+        }
+        if let Some(draft) = &self.draft {
+            out.extend_from_slice(b"draft block\0");
+            for part in 0..draft.n_parts() {
+                crate::files::identity(draft.path(part as u16), &mut out);
+            }
+        }
+        let o = &self.opts.part;
+        let settings = format!(
+            "kv {:?} keys {:?} state {:?} precision {:?} draft {:?}",
+            o.kv,
+            o.keys,
+            o.state,
+            o.precision,
+            self.draft.as_ref().map(|_| DRAFT_KV)
+        );
+        out.extend_from_slice(settings.as_bytes());
+        for device in 0..self.placement.n_devices() {
+            let PartPlan { role, first, shares, head } = self.placement.part(&self.config, device);
+            out.push(0xff);
+            out.extend_from_slice(format!("{role:?} {first} {head}").as_bytes());
+            for share in shares {
+                out.extend_from_slice(&share.heads.start.to_le_bytes());
+                out.extend_from_slice(&share.heads.end.to_le_bytes());
+                out.push(u8::from(share.shared));
+            }
+        }
+        out
     }
 }
 
@@ -1472,6 +1574,15 @@ impl Model for Qwen4Exp {
         self.config.indexer.dense_limit() as u32
     }
 
+    fn prefix_cache(&self) -> Option<PrefixCache> {
+        Some(slots::prefix_cache(&self.declared, Some(TAILS_PER_SLOT)))
+    }
+
+    fn durable(&self, cells_per_page: u32) -> Option<Durable> {
+        (cells_per_page == ENTRY_CELLS)
+            .then(|| slots::durable(&self.declared, self.state_fingerprint()))
+    }
+
     fn page_entry(&self, page: u32) -> u32 {
         page | PAGE_ENTRY
     }
@@ -1542,6 +1653,10 @@ struct Qwen4ExpDevice {
     chains: Vec<Chain>,
     /// The step being run only drafts.
     only_drafts: bool,
+    /// The rows of the step that are a replay.
+    replay: Vec<Range<u32>>,
+    /// The checkpoints of the prefix cache on this device.
+    resume: Resume,
 }
 
 impl std::fmt::Debug for Qwen4ExpDevice {
@@ -1615,12 +1730,13 @@ impl Qwen4ExpDevice {
         self.chains.clear();
         self.passes.clear();
         self.block_places.clear();
+        self.replay.clear();
         let (mut bar, mut place) = (0, 0);
         for i in 0..record.segments() {
-            if record.replay(i) {
-                return Err(invalid("the model has no prefix cache to replay from"));
-            }
             let segment = record.segment(i);
+            if record.replay(i) {
+                self.replay.push(segment.row0..segment.row0 + segment.n_rows);
+            }
             if let Some(drafter) = record.drafter(i) {
                 if !self.drafts {
                     return Err(invalid("the model drafts nothing itself"));
@@ -1754,6 +1870,18 @@ impl Qwen4ExpDevice {
             taken += update.count;
         }
 
+        // The copies of the prefix cache, behind the commit of the step before
+        // and the draft block's following of it: the saves, the page copies,
+        // the restores.
+        self.resume.copies(
+            stream,
+            step.pages,
+            record,
+            &mut self.part,
+            self.draft.as_mut(),
+            &self.flow,
+        )?;
+
         // A step that only drafts: the chains, and nothing of the model. It
         // leaves no window for the next record to commit.
         if record.drafts_only() {
@@ -1767,6 +1895,7 @@ impl Qwen4ExpDevice {
                     &self.chains,
                     chances.as_ref(),
                     true,
+                    &self.replay,
                 )?;
                 // The round after this step verifies these drafts, or the
                 // first of them: the rows of the n-gram table that its rows
@@ -1826,6 +1955,7 @@ impl Qwen4ExpDevice {
                 &self.chains,
                 chances.as_ref(),
                 false,
+                &self.replay,
             )?;
             let drafts: Vec<(u32, u32)> = drafted
                 .iter()
@@ -1834,7 +1964,7 @@ impl Qwen4ExpDevice {
                 .map(|(row, _)| (row as u32, self.tokens[row]))
                 .collect();
             self.flow.publish(number, drafts);
-            block.keep(&self.segments, &self.tokens);
+            block.keep(&self.segments, &self.tokens, &self.replay);
         } else if !self.chains.is_empty() {
             for (row, token) in self.flow.await_drafts(number)? {
                 self.tokens[row as usize] = token;
@@ -1874,8 +2004,13 @@ impl Qwen4ExpDevice {
                 embedding.decode(*token, out)?;
             }
         }
-        let host = StepRecord::new(&self.segments, &self.tokens, None, &self.out_rows)?;
-        let (segments, x) = (&self.segments, &self.x);
+        let mut host = StepRecord::new(&self.segments, &self.tokens, None, &self.out_rows)?;
+        for (i, s) in self.segments.iter().enumerate() {
+            if self.replay.iter().any(|r| r.contains(&s.row0)) {
+                host.mark_replay(i)?;
+            }
+        }
+        let (segments, x, replay) = (&self.segments, &self.x, &self.replay);
 
         // The step: every layer, with the host serving the store behind it.
         let (token, xbase) =
@@ -1897,6 +2032,7 @@ impl Qwen4ExpDevice {
                     inbound: $inbound,
                     xbase,
                     pools: step.pages,
+                    replay,
                 }
             };
         }
@@ -2009,6 +2145,14 @@ impl DeviceModel for Qwen4ExpDevice {
         }
         let (ptr, tokens) = self.draft.as_ref()?.drafted()?;
         Some(OwnDrafts { ptr, tokens })
+    }
+
+    fn transfer(
+        &mut self,
+        cx: &TransferContext<'_>,
+        item: &mut DeviceTransfer,
+    ) -> Result<(), ModelError> {
+        self.resume.transfer(cx.stream, cx.pages, item, &mut self.part, self.draft.as_mut())
     }
 
     fn own_draft_ms(&mut self) -> f64 {

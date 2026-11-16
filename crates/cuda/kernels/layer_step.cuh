@@ -26,6 +26,10 @@
 // generation row without drafts). The delta-rule window kernel then writes the
 // recurrent state itself and the deferred commit skips the segment.
 #define ARES_SEG_DIRECT 1u
+// Segment flag: the rows are a replay (always direct too): their cells are
+// cached already and they write none. The runtime's record sets it (its flag 2
+// is the model's own drafts, which no kernel here reads).
+#define ARES_SEG_REPLAY 4u
 
 struct AresSeg {
     uint32_t row0;      // first row of the segment among the rows of the step

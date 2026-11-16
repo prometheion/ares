@@ -95,7 +95,8 @@ static __device__ __forceinline__ float q4_rotated(const float* x, const float2*
 //   begins inside the window and by the carried rotation otherwise. The key is
 //   written into the key pool, also for a segment whose rows may be rejected:
 //   a key is read only by rows that see its whole block, and a block that is
-//   cut by a rejection is completed and written again later.
+//   cut by a rejection is completed and written again later. A replay
+//   (ARES_SEG_REPLAY) writes no key: its blocks are cached.
 //
 // Nothing of the carried state is written. `rope` is the table of
 // ares_rope_table ([row][rot / 2] pairs of cos, sin). ID is at most 256.
@@ -142,7 +143,8 @@ ARES_KERNEL ares_q4_indexer_window(const AresStep* step, const Q4AttnRow* attn_r
         return;
     }
     const AresSeg seg = ares_step_segs(step)[s];
-    if (seg.n_rows == 0) {
+    // A replay's blocks are in the key pool already, which other sequences read.
+    if (seg.n_rows == 0 || (seg.flags & ARES_SEG_REPLAY) != 0) {
         return;
     }
     const Q4AttnRow first_row = attn_rows[seg.row0];

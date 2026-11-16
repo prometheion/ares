@@ -301,6 +301,7 @@ macro_rules! step_env {
             inbound: $inbound,
             xbase: $step.xbase,
             pools: $self.pools[$device].ptr(),
+            replay: &[],
         }
     };
 }

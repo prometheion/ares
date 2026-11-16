@@ -60,6 +60,9 @@ static IMAGE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/layers.fatbin"))
 const SEG_BYTES: usize = 32;
 const HEADER_BYTES: usize = 32;
 const FLAG_DIRECT: u32 = 1;
+/// The rows of the segment are a replay: their cells are cached already, and
+/// they write none (the runtime's record has the same bit).
+const FLAG_REPLAY: u32 = 4;
 
 /// One sequence's rows in a step.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -235,6 +238,29 @@ impl StepRecord {
     /// The sizes that decide grids.
     pub fn dims(&self) -> StepDims {
         self.dims
+    }
+
+    /// Marks segment `segment`, a direct one, as a replay: its rows read the
+    /// cells their sequence has cached already and write none, and the
+    /// kernels that write per segment (the pooled keys of an indexer) leave
+    /// it out.
+    pub fn mark_replay(&mut self, segment: usize) -> Result<()> {
+        let at = HEADER_BYTES + segment * SEG_BYTES + 20;
+        if segment >= self.dims.n_segs as usize {
+            return Err(Error::Invalid {
+                what: "step record",
+                detail: format!("segment {segment} of {}", self.dims.n_segs),
+            });
+        }
+        let flags = u32::from_le_bytes(self.bytes[at..at + 4].try_into().unwrap());
+        if flags & FLAG_DIRECT == 0 {
+            return Err(Error::Invalid {
+                what: "step record",
+                detail: format!("segment {segment} is a replay and not direct"),
+            });
+        }
+        self.bytes[at..at + 4].copy_from_slice(&(flags | FLAG_REPLAY).to_le_bytes());
+        Ok(())
     }
 
     /// Sets the number of accepted rows of segment `segment` (at most its rows).
