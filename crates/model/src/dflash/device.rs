@@ -299,6 +299,8 @@ pub struct Drafter {
     pass: Vec<PassSeq>,
     /// The drafts' shares of the last pass, copied to the host.
     probs_host: PinnedBuffer,
+    /// Drafts of another drafter on their way into the list.
+    put_host: PinnedBuffer,
     drafted: u32,
     clock: [Event; 2],
     clock_pending: bool,
@@ -465,6 +467,7 @@ impl Drafter {
             taps: 0,
             pass: Vec::new(),
             probs_host: PinnedBuffer::new(device, drafted * 4)?,
+            put_host: PinnedBuffer::new(device, drafted * 4)?,
             drafted: 0,
             clock: [Event::timed(device)?, Event::timed(device)?],
             clock_pending: false,
@@ -508,22 +511,56 @@ impl Drafter {
         rows: u32,
         y: DevicePtr,
     ) -> Result<(), ModelError> {
+        self.product_at(kernels, stream, m.ty, self.weight(m.at), m.n_in, m.n_out, x, rows, y)
+    }
+
+    /// `y = w x` for a matrix `w` of type `ty` as the file stores it, `rows`
+    /// rows of activations at `x`: the decode kernels up to 8 rows, the tile
+    /// kernels above.
+    #[allow(clippy::too_many_arguments)]
+    fn product_at(
+        &self,
+        kernels: &Kernels,
+        stream: &Stream,
+        ty: GgmlType,
+        w: DevicePtr,
+        n_in: u32,
+        n_out: u32,
+        x: DevicePtr,
+        rows: u32,
+        y: DevicePtr,
+    ) -> Result<(), ModelError> {
         let act = self.at(self.s.act);
-        let w = self.weight(m.at);
         // SAFETY: `x` holds `rows` rows of `n_in` f32 and `y` of `n_out`, the
         // activations' scratch the bytes of the widest input at the most rows;
-        // the matrix is in the arena as the file stores it.
+        // the matrix is on the device as the file stores it.
         unsafe {
             if rows <= MAX_BATCH {
-                kernels.quantize_activations(stream, x, act, m.n_in, rows)?;
-                kernels.matvec(stream, m.ty, w, act, y, m.n_in, m.n_out, rows)?;
+                kernels.quantize_activations(stream, x, act, n_in, rows)?;
+                kernels.matvec(stream, ty, w, act, y, n_in, n_out, rows)?;
             } else {
-                let path = if m.ty.is_quantized() { PrefillPath::Int8 } else { PrefillPath::F16 };
-                kernels.prepare_prefill_activations(stream, path, x, act, m.n_in, rows)?;
-                kernels.matmul(stream, m.ty, path, w, act, y, m.n_in, m.n_out, rows)?;
+                let path = if ty.is_quantized() { PrefillPath::Int8 } else { PrefillPath::F16 };
+                kernels.prepare_prefill_activations(stream, path, x, act, n_in, rows)?;
+                kernels.matmul(stream, ty, path, w, act, y, n_in, n_out, rows)?;
             }
         }
         Ok(())
+    }
+
+    /// The model's draft head over the rows [`Drafter::pass_layers`] returned,
+    /// for a model whose head lies as the file stores it: `w` of type `ty`, a
+    /// row of `n_embd` values per column of the logits.
+    pub fn head_product(
+        &self,
+        kernels: &Kernels,
+        stream: &Stream,
+        ty: GgmlType,
+        w: DevicePtr,
+        h: DevicePtr,
+        rows: u32,
+    ) -> Result<(), ModelError> {
+        let d = self.c.n_embd as u32;
+        self.product_at(kernels, stream, ty, w, d, self.setup.head_rows, h, rows, self.logits())
     }
 
     /// The start of a step of the model: its rows, as `(slot, position)` in
@@ -1041,6 +1078,36 @@ impl Drafter {
     /// other list: a draft per draft row of every slot.
     pub fn own_list(&self) -> DevicePtr {
         self.at(self.s.drafts)
+    }
+
+    /// Puts drafts another drafter of the model made into the list at
+    /// `place`, so that a step with windows of both has one list. After the
+    /// pass of the step.
+    pub fn put_drafts(
+        &mut self,
+        stream: &Stream,
+        place: u32,
+        drafts: &[u32],
+    ) -> Result<(), ModelError> {
+        let at = place as usize * 4;
+        let end = at + drafts.len() * 4;
+        if end > self.put_host.len() || end > self.s.probs as usize - self.s.drafts as usize {
+            return Err(invalid("drafts past the drafter's list"));
+        }
+        for (i, t) in drafts.iter().enumerate() {
+            self.put_host[at + i * 4..at + i * 4 + 4].copy_from_slice(&t.to_le_bytes());
+        }
+        // SAFETY: the range is inside the pinned buffer and the list; the
+        // pinned bytes stay until the step has run.
+        unsafe {
+            stream.copy_from_host(
+                self.at(self.s.drafts).offset(at as u64),
+                self.put_host.as_ptr().add(at),
+                drafts.len() * 4,
+            )?;
+        }
+        self.drafted = self.drafted.max(place + drafts.len() as u32);
+        Ok(())
     }
 
     /// The sequences of the last pass.

@@ -97,18 +97,38 @@ pub(crate) fn load(
     // the model file carries none. Without it nothing speculates (the lookup
     // in earlier text takes part only next to a model drafter), no window is
     // reserved, and the options of drafting mean nothing.
-    let drafter = match options.drafters.as_deref() {
-        None | Some([]) => None,
-        Some([Drafter::Block(path)]) => Some(path.clone()),
-        Some([Drafter::Mtp]) => {
-            return Err(refuse(
-                "--drafters mtp: this model file carries no draft block; the block is a file of \
-                 its own, which --drafters names by its path",
-            ));
+    // A DFlash drafter (a file of architecture `dflash`) may come with it.
+    let mut blocks = Vec::new();
+    let mut dflash = None;
+    for drafter in options.drafters.iter().flatten() {
+        match drafter {
+            Drafter::Mtp => {
+                return Err(refuse(
+                    "--drafters mtp: this model file carries no draft block; the block is a \
+                     file of its own, which --drafters names by its path",
+                ));
+            }
+            Drafter::Block(path) => {
+                let is_dflash = Gguf::open(path)
+                    .map(|g| g.architecture() == Some(ares_model::dflash::ARCHITECTURE))
+                    .unwrap_or(false);
+                if is_dflash && dflash.is_none() {
+                    let file = ares_model::dflash::File::open(path)
+                        .map_err(|e| refuse(format!("--drafters: {e}")))?;
+                    dflash = Some(std::sync::Arc::new(file));
+                } else {
+                    blocks.push(path.clone());
+                }
+            }
         }
-        Some(_) => {
+    }
+    let drafter = match blocks.as_slice() {
+        [] => None,
+        [path] => Some(path.clone()),
+        _ => {
             return Err(refuse(
-                "--drafters: this model drafts with one draft block; name its file alone",
+                "--drafters: this model drafts with one draft block and one DFlash drafter at \
+                 most",
             ));
         }
     };
@@ -123,10 +143,11 @@ pub(crate) fn load(
         })
         .transpose()?;
     let window = options.window.unwrap_or(DRAFT_WINDOW);
-    if options.window.is_some() && drafter.is_none() {
+    let drafts = drafter.is_some() || dflash.is_some();
+    if options.window.is_some() && !drafts {
         return Err(refuse("--window without a model drafter does nothing"));
     }
-    if drafter.is_some() && !(2..=MAX_ROWS).contains(&window) {
+    if drafts && !(2..=MAX_ROWS).contains(&window) {
         return Err(refuse(format!(
             "--window {window}: a window is the newest token and its drafts, 2 to {MAX_ROWS} \
              rows (a step that verifies drafts has {MAX_ROWS} rows for all sequences together)"
@@ -146,7 +167,7 @@ pub(crate) fn load(
     }
     // Rows of a step that verifies drafts, for all sequences together, and
     // the rows whose logits a step can want.
-    let window_rows = if drafter.is_some() { MAX_ROWS } else { 0 };
+    let window_rows = if drafts { MAX_ROWS } else { 0 };
     let logit_rows = window_rows.max(parallel);
     if options.context == Some(0) {
         return Err(refuse("--context must be at least 1"));
@@ -302,16 +323,26 @@ pub(crate) fn load(
         "plan: K in {}, V in {}; {}",
         plan::format_name(kv.0),
         plan::format_name(kv.1),
-        match &drafter {
-            Some((path, _)) => format!(
-                "the model's draft block ({}) drafts, on the device that holds the output \
-                 head: windows of up to {window} rows a sequence, {MAX_ROWS} rows a step, as \
-                 long as they pay; the lookup in earlier text joins",
-                path.display()
-            ),
-            None => "no speculation: the model drafts with a draft block from a file of its \
-                     own (--drafters <file>), and earlier text alone is not a drafter"
+        match (&drafter, &dflash) {
+            (None, None) => "no speculation: the model drafts with a draft block from a file \
+                             of its own (--drafters <file>), and earlier text alone is not a \
+                             drafter"
                 .to_owned(),
+            (block, dflash) => format!(
+                "{}{}{} draft{}, on the device that holds the output head: windows of up to \
+                 {window} rows a sequence, {MAX_ROWS} rows a step, as long as they pay; the \
+                 lookup in earlier text joins",
+                block
+                    .as_ref()
+                    .map(|(path, _)| format!("the model's draft block ({})", path.display()))
+                    .unwrap_or_default(),
+                if block.is_some() && dflash.is_some() { " and " } else { "" },
+                dflash
+                    .as_ref()
+                    .map(|f| format!("the DFlash drafter ({})", f.gguf.path(0).display()))
+                    .unwrap_or_default(),
+                if block.is_some() && dflash.is_some() { "" } else { "s" },
+            ),
         },
     );
     for ((plan, h), per_page) in placement.devices.iter().zip(&held).zip(&page_bytes) {
@@ -347,10 +378,16 @@ pub(crate) fn load(
         model =
             model.with_usage_profile(&dir, std::sync::Arc::new(|line| tracing::warn!("{line}")));
     }
-    let drafting = drafter.is_some();
+    let drafting = drafts;
     if let Some((path, file)) = drafter {
         model = model
             .with_draft(file)
+            .map_err(|e| LoadError::Model(format!("--drafters {}: {e}", path.display())))?;
+    }
+    if let Some(file) = dflash.clone() {
+        let path = file.gguf.path(0).to_owned();
+        model = model
+            .with_dflash(file)
             .map_err(|e| LoadError::Model(format!("--drafters {}: {e}", path.display())))?;
     }
     let model = std::sync::Arc::new(model);

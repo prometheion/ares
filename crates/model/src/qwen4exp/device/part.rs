@@ -59,6 +59,7 @@ use ares_runtime::ModelError;
 use ares_runtime::expert_store::cpu::act_bytes as cpu_act_bytes;
 
 mod block;
+mod dflash;
 mod predict;
 mod wide;
 
@@ -1046,6 +1047,8 @@ pub struct Part {
     prune: Option<PartPrune>,
     /// The predictions of the picks of the next layers, for a part that routes.
     predict: Option<predict::State>,
+    /// A DFlash drafter, on the part that holds the streams and the head.
+    dflash: Option<crate::dflash::Drafter>,
 }
 
 impl std::fmt::Debug for Part {
@@ -1315,6 +1318,7 @@ impl Part {
             block: None,
             prune: None,
             predict,
+            dflash: None,
             w,
             f,
         })
@@ -2288,6 +2292,8 @@ impl Part {
             token: self.exchange_no(env, i, X_CORE_INPUT),
         });
         self.read(stream, &attn_mixer, write, Some(self.at(s.inj_a)), self.at(s.m), push, rows)?;
+        // The residual streams before this layer are in place now.
+        self.dflash_tap(env, layer.layer)?;
         let own = match &layer.core {
             CoreW::Recurrent(r) => {
                 self.recurrent(env, i, r)?;
