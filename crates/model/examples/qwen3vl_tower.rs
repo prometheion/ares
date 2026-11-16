@@ -169,9 +169,11 @@ fn main() {
             v.sort_by(f64::total_cmp);
             v[v.len() / 2]
         };
-        let vram = args.homes.iter().position(|h| *h == Home::Vram).map(|i| {
-            median(times[i].iter().map(|t| t.0).collect())
-        });
+        let vram = args
+            .homes
+            .iter()
+            .position(|h| *h == Home::Vram)
+            .map(|i| median(times[i].iter().map(|t| t.0).collect()));
         for (i, home) in args.homes.iter().enumerate() {
             let device_ms: Vec<f64> = times[i].iter().map(|t| t.0).collect();
             let host_ms: Vec<f64> = times[i].iter().map(|t| t.1).collect();
@@ -185,10 +187,7 @@ fn main() {
             if *home == Home::Ram && !uploads.is_empty() {
                 let upload = median(uploads.clone());
                 let image = loaded[i].tower.plan().image_bytes() as f64;
-                print!(
-                    "; uploads alone {upload:.1} ms ({:.2} GB/s)",
-                    image / upload / 1e6
-                );
+                print!("; uploads alone {upload:.1} ms ({:.2} GB/s)", image / upload / 1e6);
                 if let Some(vram) = vram {
                     let unhidden = (median(device_ms) - vram).max(0.0);
                     print!(

@@ -299,3 +299,104 @@ fn the_first_blocks_on_the_device_match_the_reference() {
         }
     }
 }
+
+/// How many times the distance that the f16 operands of the products carry an
+/// image (the reference with them against the exact one) the device may be from
+/// the exact rows: it makes those roundings, in another order.
+const ROUNDING_NOISE: f64 = 3.0;
+/// And this much besides, for images on which the roundings change little.
+const FLOOR: f64 = 1e-3;
+
+/// The devices to run on: `ARES_TEST_QWEN3VL_DEVICES` (`0,1`), all unless set.
+fn picked(devices: &[Device]) -> Vec<&Device> {
+    match std::env::var("ARES_TEST_QWEN3VL_DEVICES") {
+        Ok(list) => list.split(',').map(|i| &devices[i.trim().parse::<usize>().unwrap()]).collect(),
+        Err(_) => devices.iter().collect(),
+    }
+}
+
+/// Every case on every device in both homes: the two homes give the same rows
+/// bit for bit, and those are within the image's own tolerance of the exact
+/// reference.
+fn against_the_reference(variable: &str, tag: &'static str, n_out: usize) {
+    let (Some(devices), Some(projector)) = (gpus(), Projector::open(variable, tag)) else {
+        return;
+    };
+    let config = Config::from_gguf(&projector.gguf).unwrap();
+    assert_eq!(config.n_out, n_out);
+    let weights = Weights::load(&projector.gguf, &config).unwrap();
+    let Some(cases) = cases(&config) else { return };
+    if env_path("ARES_TEST_QWEN3VL_ROWS").is_none() {
+        return;
+    }
+    let references: Vec<(Vec<f32>, f64)> = cases
+        .iter()
+        .map(|case| {
+            let exact = reference_rows(&projector, &config, &weights, case, Arithmetic::Exact);
+            let half =
+                reference_rows(&projector, &config, &weights, case, Arithmetic::HalfOperands);
+            let between = distance(&half, &exact).0;
+            (exact, between)
+        })
+        .collect();
+    let largest = cases.iter().map(Case::rows).max().unwrap() as u32;
+    for device in picked(devices) {
+        let kernels = Kernels::load(device).unwrap();
+        let stream = Stream::new(device, 0).unwrap();
+        let mut vram = DeviceTower::load(device, &kernels, &config, &weights, Home::Vram).unwrap();
+        let mut ram = DeviceTower::load(device, &kernels, &config, &weights, Home::Ram).unwrap();
+        let scratch = vram.scratch(largest).unwrap();
+        let mut worst = (0.0f64, String::new());
+        for (case, (exact, between)) in cases.iter().zip(&references) {
+            let started = Instant::now();
+            let resident =
+                vram.encode(&stream, &scratch, &case.pixels, case.width, case.height).unwrap();
+            let seconds = started.elapsed().as_secs_f64();
+            let streamed =
+                ram.encode(&stream, &scratch, &case.pixels, case.width, case.height).unwrap();
+            assert_eq!(
+                (resident.nx * resident.ny, resident.width),
+                (case.rows(), n_out),
+                "{}",
+                case.name
+            );
+            assert!(resident.data.iter().all(|v| v.is_finite()), "{}: not finite", case.name);
+            let differing = resident
+                .data
+                .iter()
+                .zip(&streamed.data)
+                .filter(|(a, b)| a.to_bits() != b.to_bits());
+            assert_eq!(differing.count(), 0, "{}: the homes differ", case.name);
+            let (rel, max) = distance(&resident.data, exact);
+            let allowed = ROUNDING_NOISE * between + FLOOR;
+            eprintln!(
+                "{tag} {} on {}: {} rows, rel {rel:.2e} max {max:.2e} from the exact reference \
+                 (f16 operands carry it {between:.2e}, allowed {allowed:.2e}), {:.0} ms",
+                case.name,
+                device.info().name,
+                case.rows(),
+                seconds * 1000.0
+            );
+            if rel / allowed > worst.0 {
+                worst = (rel / allowed, case.name.clone());
+            }
+            assert!(rel < allowed, "{tag} {}: rel {rel:.2e} of {allowed:.2e}", case.name);
+        }
+        eprintln!(
+            "{tag} on {}: the closest to its tolerance is {} at {:.0} % of it",
+            device.info().name,
+            worst.1,
+            100.0 * worst.0
+        );
+    }
+}
+
+#[test]
+fn the_27b_tower_on_the_device_gives_the_reference_rows() {
+    against_the_reference("ARES_TEST_QWEN3VL_27B", "27b", 5120);
+}
+
+#[test]
+fn the_flash_next_tower_on_the_device_gives_the_reference_rows() {
+    against_the_reference("ARES_TEST_QWEN3VL_FLASH", "flash", 2560);
+}
