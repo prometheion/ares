@@ -93,6 +93,8 @@ pub(crate) struct Probe {
     /// The matched pages that no sequence holds now: taking them makes them
     /// unavailable for eviction.
     pub idle: u32,
+    /// Pages and tails that came back from RAM for this look.
+    pub brought: u32,
 }
 
 /// What an eviction gave up.
@@ -416,10 +418,12 @@ impl Cache {
     ) -> Probe {
         let looked = &tokens[..tokens.len() - 1];
         let mut found = self.index.lookup_chain(chain, looked);
-        if let (Some(exec), None) = (exec, found.computing)
-            && self.import_from_ram(pool, exec, chain, tokens, &found)
-        {
-            found = self.index.lookup_chain(chain, looked);
+        let mut brought = 0;
+        if let (Some(exec), None) = (exec, found.computing) {
+            brought = self.import_from_ram(pool, exec, chain, tokens, &found);
+            if brought > 0 {
+                found = self.index.lookup_chain(chain, looked);
+            }
         }
         // What the index does not have may be on SSD: a run of pages that is
         // brought back holds the prompt as a page that is being computed does.
@@ -445,7 +449,7 @@ impl Cache {
             .chain(found.tail.map(|tail| tail.page))
             .filter(|page| pool.refcount(*page) == 1)
             .count() as u32;
-        Probe { found, resume, idle }
+        Probe { found, resume, idle, brought }
     }
 
     /// The first position in `(from, to]` at which a checkpoint is due for a
@@ -1063,8 +1067,8 @@ impl Cache {
     /// prompt of `tokens` (named in `chain`) back to the devices, where it
     /// enters the index. For a model with recurrent state the run ends at
     /// the deepest checkpoint it has, unless a tail with the state at its
-    /// end follows or the drive goes on to a deeper one. Returns whether
-    /// anything came.
+    /// end follows or the drive goes on to a deeper one. Returns the pages
+    /// and tails that came.
     fn import_from_ram(
         &mut self,
         pool: &mut PagePool,
@@ -1072,8 +1076,8 @@ impl Cache {
         chain: &Chain,
         tokens: &[u32],
         found: &PrefixMatch,
-    ) -> bool {
-        let Some(ram) = &self.in_ram else { return false };
+    ) -> u32 {
+        let Some(ram) = &self.in_ram else { return 0 };
         let per_page = self.cells_per_page as usize;
         let looked = &tokens[..tokens.len() - 1];
         let have = found.pages.len();
@@ -1111,7 +1115,7 @@ impl Cache {
             (run, tail.map(|(.., hash)| hash))
         };
         if run == 0 && tail.is_none() {
-            return false;
+            return 0;
         }
         // What the index matched is held, so that room made for the run does
         // not take it; the run is taken out of RAM's order first, so that
@@ -1177,11 +1181,11 @@ impl Cache {
                 ram.give(hash, parts);
             }
         }
-        let came = notes.iter().any(|note| matches!(note, Note::FromRam { .. }));
+        let read = self.in_ram.as_ref().map_or(0, |ram| ram.counters.pages_read);
         self.carry_out(pool, exec, batch, notes);
         held.release(pool);
         kept.release(pool);
-        came
+        (self.in_ram.as_ref().map_or(0, |ram| ram.counters.pages_read) - read) as u32
     }
 
     /// Carries out `batch` and what it came to.
@@ -1596,7 +1600,7 @@ mod tests {
         }
 
         /// The devices give up every page nobody holds: into RAM.
-        fn to_ram(&mut self, devices: &mut Devices) {
+        fn all_into_ram(&mut self, devices: &mut Devices) {
             self.cache.evict(&mut self.pool, u32::MAX);
             self.cache.settle_leaving(&mut self.pool, devices);
         }
@@ -1845,7 +1849,7 @@ mod tests {
             for i in 0..10 {
                 f.text(i);
             }
-            f.to_ram(&mut devices);
+            f.all_into_ram(&mut devices);
             assert_eq!(f.cache.ram_counters().pages, 33);
             assert_eq!(f.ram.cache_pages(), 33 * PAGE);
             assert_eq!(f.written().pages_written, 0, "nothing while RAM holds them");
@@ -1879,14 +1883,14 @@ mod tests {
         // room for its reserve of sixteen pages.
         let mut f = Following::with("ahead", true, STATE + RESERVE * PAGE + 4 * PAGE);
         let mut devices = Devices::default();
-        f.to_ram(&mut devices);
+        f.all_into_ram(&mut devices);
         f.pumped(&mut devices);
         let written = f.written();
         assert_eq!(written.pages_written, 0, "three pages and the reserve fit: {written:?}");
         // More texts: RAM fills, and writes the coldest, the first text first.
         for i in 0..8 {
             f.text(i);
-            f.to_ram(&mut devices);
+            f.all_into_ram(&mut devices);
             f.pumped(&mut devices);
         }
         let written = f.written();

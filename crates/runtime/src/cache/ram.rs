@@ -440,10 +440,9 @@ impl RamLevel {
 
     /// A buffer is not needed now: it is kept for the next page.
     pub fn recycle(&mut self, parts: Vec<TransitPart>) {
-        match parts.first().map(|part| &part.mem) {
-            Some(HostBytes::Cache(_)) => self.free.push(parts),
-            // Memory in transit that is not the level's own.
-            _ => {}
+        // Memory in transit that is not the level's own is not kept.
+        if let Some(HostBytes::Cache(_)) = parts.first().map(|part| &part.mem) {
+            self.free.push(parts);
         }
     }
 

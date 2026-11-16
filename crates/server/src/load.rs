@@ -1291,7 +1291,7 @@ fn load_qwen35(
             None => tracing::info!(
                 "prompt cache on SSD: {}, at most {} for everything in it; this model's store \
                  holds {} pages and {} checkpoints in {}; texts of {} tokens and more are \
-                 written as they are computed",
+                 written when they leave RAM, and when the model is unloaded",
                 ssd.dir.display(),
                 Bytes(ssd.max_bytes),
                 held.store_pages,

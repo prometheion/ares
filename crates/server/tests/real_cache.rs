@@ -1,8 +1,9 @@
-//! The prompt cache on SSD on real devices: `ares --cache <dir>` writes the
-//! state of what it computes, and a prompt that starts with it resumes from
-//! the drive after the state left the devices, after a restart of the server,
-//! and after the model was unloaded and loaded again in router mode, with the
-//! reply of the first run.
+//! The prompt cache in RAM and on SSD on real devices: what leaves the
+//! devices is kept in RAM and comes back from there; `ares --cache <dir>`
+//! writes what is worth keeping when the server stops or the model is
+//! unloaded (and what leaves RAM), and a prompt that starts with it resumes
+//! from the drive after a restart of the server, and after the model was
+//! unloaded and loaded again in router mode, with the reply of the first run.
 //!
 //! Needs `ARES_TEST_CUDA=1` and `ARES_TEST_QWEN35_MODEL` (a small `qwen35`
 //! file, Qwen3.5-0.8B). `ARES_TEST_DEVICE` names the device of the small model

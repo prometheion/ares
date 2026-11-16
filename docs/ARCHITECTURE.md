@@ -733,7 +733,9 @@ on the cards. What RAM holds and what goes first is
   copies: a page that comes back and leaves the devices again costs no copy.
   A request that the accounting starts in the middle of a plan takes what the
   index has; only an arrival and a look before the plan bring pages back,
-  since they take pages of the pool that the plan must see.
+  since they take pages of the pool that the plan must see. A waiting
+  request brings pages back once (and once more after it gave way): two
+  requests that wait would otherwise take each other's pages at every step.
 - **What goes first.** By class, then the least recently used: copies of
   pages that the devices hold; what the drive holds and what is not worth
   writing (a text shorter than the level on SSD's least, a tail, a

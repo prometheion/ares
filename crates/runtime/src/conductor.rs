@@ -252,6 +252,10 @@ struct Active {
     waits_for: Option<ChainHash>,
     /// Whether the request was held back once at least.
     was_held: bool,
+    /// Whether pages of its prompt came back from RAM while it waited. It
+    /// brings pages back once: two requests that wait would otherwise take
+    /// the pool's pages from each other at every step.
+    brought_back: bool,
     /// The number of evictions the accounting was last told about the cache
     /// at.
     looked_at: u64,
@@ -963,16 +967,18 @@ impl Conductor {
         let room = self.context_length.saturating_sub(prompt_len);
         // What the cache has for the prompt now. A request whose first
         // missing page another sequence is computing is held back.
-        let (chain, cached, idle, waits_for) = match &mut self.cache {
+        let (chain, cached, idle, waits_for, brought_back) = match &mut self.cache {
             Some(cache) => {
                 let chain = cache.chain(&prompt);
                 // What RAM has of it comes back now, before the step is
                 // planned, so that the accounting sees the pages it took.
                 let probe = cache.probe(&mut self.pool, Some(&mut *self.exec), &chain, &prompt);
                 let waits = probe.found.computing.map(|(hash, _)| hash);
-                (chain, probe.resume.cached_cells as u32, probe.idle, waits)
+                (chain, probe.resume.cached_cells as u32, probe.idle, waits, probe.brought > 0)
             }
-            None => (Chain::new(ChainHash::root(&[]), self.config.cells_per_page), 0, 0, None),
+            None => {
+                (Chain::new(ChainHash::root(&[]), self.config.cells_per_page), 0, 0, None, false)
+            }
         };
         let arrival = Arrival {
             seq,
@@ -1016,6 +1022,7 @@ impl Conductor {
             checkpoint_at: 0,
             waits_for,
             was_held: waits_for.is_some(),
+            brought_back,
             looked_at: self.cache.as_ref().map_or(0, |cache| cache.evictions),
             cached_prompt: 0,
             replayed: 0,
@@ -1187,6 +1194,9 @@ impl Conductor {
         std::mem::take(&mut a.cells).release(&mut self.pool);
         a.known = a.tokens.len() as u32;
         a.replay_left = 0;
+        // What it computed may leave the devices while it waits: it may
+        // bring it back from RAM once more.
+        a.brought_back = false;
         a.draft.clear();
         a.lookup.clear();
         a.own = false;
@@ -1355,9 +1365,12 @@ impl Conductor {
                 continue;
             }
             a.looked_at = cache.evictions;
-            // Before the step is planned: what RAM has comes back now.
+            // Before the step is planned: what RAM has comes back now, once.
             let tokens = &a.tokens[..a.known as usize];
-            let probe = cache.probe(&mut self.pool, Some(&mut *self.exec), &a.chain, tokens);
+            let exec: Option<&mut dyn Executor> =
+                if a.brought_back { None } else { Some(&mut *self.exec) };
+            let probe = cache.probe(&mut self.pool, exec, &a.chain, tokens);
+            a.brought_back |= probe.brought > 0;
             if a.ran {
                 // It gave way and comes back: the rows the cache does not hold.
                 let rows = probe.resume.compute.end.saturating_sub(probe.resume.compute.start);
