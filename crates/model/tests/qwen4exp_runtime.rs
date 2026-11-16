@@ -833,9 +833,9 @@ fn a_model_with_no_drafter_of_its_own_is_not_drafted_for_even_from_a_text_that_r
         return;
     }
     for placement in placements() {
-        // The model has no draft head built yet, and the lookup in earlier
-        // text takes part only next to a model drafter, never alone. The
-        // text repeats, so that the lookup would have drafts to offer, and
+        // The model has no draft head built yet, and the n-gram drafter
+        // takes part only next to a model drafter, never alone. The
+        // text repeats, so that the n-gram drafter would have drafts to offer, and
         // the runtime has the room for windows of eight rows all the same.
         let mut prompt = prompt(12, 5);
         prompt.extend_from_within(..);
@@ -1101,7 +1101,7 @@ fn the_draft_block_drafts_what_the_reference_drafts_in_every_placement() {
 /// Drafts change no token: with the draft block a reply is what it is
 /// without, greedy and sampled with a seed, in every placement. The made-up
 /// block guesses badly, so most of its drafts are rejected and rolled back;
-/// the text repeats and the request is asked again, so that the lookup in
+/// the text repeats and the request is asked again, so that the n-gram drafter in
 /// earlier text joins and has drafts that are accepted, which the block then
 /// has to follow. Two sequences that share their steps write what each
 /// writes alone up to a near tie, with drafts and without.
@@ -1140,7 +1140,7 @@ fn drafts_change_no_token_in_any_placement() {
         let (runtime, model) = start_drafting(2, placement, 16);
         warm(&model);
         let first = ask(&runtime, 1, &repeats, 120);
-        // The same again: the lookup has the whole answer to offer.
+        // The same again: the n-gram drafter has the whole answer to offer.
         let again = ask(&runtime, 2, &repeats, 120);
         let (sampled, _) = ask_sampled(&runtime, 3, &repeats, 60, seeded.clone(), true);
         let (undrafted, _) = ask_sampled(&runtime, 4, &repeats, 120, greedy.clone(), false);
@@ -1327,7 +1327,7 @@ fn flash_next_writes_with_drafts_what_it_writes_without() {
     let seeded = Sampling { temperature: Some(0.8), seed: Some(5), ..Sampling::default() };
     let (runtime, model) = start_flash(&path, Some(&draft));
     // The replies with drafts first: a reply that repeats one the engine has
-    // written is drafted by the lookup in earlier text alone.
+    // written is drafted by the n-gram drafter alone.
     let drafted = ask(&runtime, 1, &FLASH_PROMPT, 64);
     let (sampled, _) = ask_sampled(&runtime, 2, &FLASH_PROMPT, 48, seeded.clone(), true);
     let counters = runtime.snapshot().expect("the runtime is running").counters;

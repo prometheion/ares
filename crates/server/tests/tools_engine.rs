@@ -42,7 +42,7 @@ fn served_ending(trigger: Option<&str>, close: Option<&str>, end: u8) -> Router 
     let mut config = SyntheticConfig::small(Split::Single, 1);
     config.context_length = 2048;
     config.eos = Some(u32::from(end));
-    // Text that loops, so that the lookup in earlier text has drafts to offer,
+    // Text that loops, so that the n-gram drafter has drafts to offer,
     // next to a draft block of the model's own.
     config.context.window = 1;
     config.context.epoch = 40;

@@ -86,8 +86,8 @@ impl Served {
         Self::serve(model, config, vec![Device::open(ordinal, Wait::Block).unwrap()])
     }
 
-    /// The 27B over both cards with its draft block and the lookup in earlier
-    /// text, with exact products so that a row computes the same in a window
+    /// The 27B over both cards with its draft block and the n-gram drafter
+    ///, with exact products so that a row computes the same in a window
     /// as alone. The context is 1024 tokens, as in `real_sampling.rs`: the
     /// prompt with the tools and the replies of the test fit.
     fn start_drafting(path: &PathBuf) -> Self {
@@ -137,7 +137,7 @@ impl Served {
     }
 
     /// The drafts of the model's own draft block that the engine has verified
-    /// and accepted so far, and those of the lookup in earlier text.
+    /// and accepted so far, and those of the n-gram drafter.
     fn drafts(&self) -> [(u64, u64); 2] {
         let counters = self.runtime.snapshot().expect("the conductor answers").counters;
         [1, 0].map(|source| {
@@ -567,7 +567,7 @@ async fn the_27b_calls_the_same_with_drafts_and_without() {
     let Some(path) = large() else { return };
     let served = Served::start_drafting(&path);
     // The replies of the first two are a call from their first token: the
-    // rule binds all of them, and the drafts are the lookup's. The third
+    // rule binds all of them, and the drafts are the n-gram drafter's. The third
     // thinks first, which the rule leaves free: there the request takes the
     // drafts of the model's draft block, up to the token that makes the rule
     // bind.
@@ -589,17 +589,17 @@ async fn the_27b_calls_the_same_with_drafts_and_without() {
         plain["draft"] = json!(false);
         let (without, plain_timings) = served.ask_timed(&plain).await;
         // What the engine counted for the request with drafts, and the speed
-        // the server reports for the two: one run each, and the lookup has
+        // the server reports for the two: one run each, and the n-gram drafter has
         // the text of the replies before this one, so these are no benchmark.
-        let [own, lookup] = [0, 1].map(|i| (after[i].0 - before[i].0, after[i].1 - before[i].1));
+        let [own, ngram] = [0, 1].map(|i| (after[i].0 - before[i].0, after[i].1 - before[i].1));
         println!(
             "RES 27B {what}: {} tokens; of the draft block's drafts {} verified and {} accepted, \
-             of the lookup's {} and {}; {} tokens/s with drafts, {} without",
+             of the n-gram drafter's {} and {}; {} tokens/s with drafts, {} without",
             timings["predicted_n"],
             own.0,
             own.1,
-            lookup.0,
-            lookup.1,
+            ngram.0,
+            ngram.1,
             timings["predicted_per_second"],
             plain_timings["predicted_per_second"]
         );

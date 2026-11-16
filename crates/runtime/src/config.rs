@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use ares_sched::LookupConfig;
+use ares_sched::NgramConfig;
 
 /// The settings of the conductor and its bookkeeping.
 #[derive(Clone, Debug)]
@@ -62,7 +62,7 @@ pub struct RuntimeConfig {
     pub window_rows: u32,
     /// The corpus that drafts are looked up in: its memory and the shortest
     /// match it drafts from.
-    pub lookup: LookupConfig,
+    pub ngram: NgramConfig,
     /// The chance that a draft is accepted before the engine has seen any of
     /// that drafter at that position: where every estimate starts from.
     pub draft_prior: f64,
@@ -109,7 +109,7 @@ impl Default for RuntimeConfig {
             ssd: None,
             max_rows: 0,
             window_rows: 8,
-            lookup: LookupConfig::default(),
+            ngram: NgramConfig::default(),
             draft_prior: 0.6,
             prefill_slowdown: 2.0,
             starvation_steps: 8,

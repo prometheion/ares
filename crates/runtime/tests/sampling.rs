@@ -26,7 +26,7 @@ fn model() -> Arc<SyntheticModel> {
     config.context_length = 512;
     // Text that loops, so that drafts from earlier text come true, and a draft
     // block of the model's own that gets the first links right more often
-    // than the last (the lookup in earlier text takes part only next to one).
+    // than the last (the n-gram drafter takes part only next to one).
     config.context.window = 1;
     config.context.epoch = 40;
     config.context.buckets = 512;
@@ -247,7 +247,7 @@ fn a_filter_makes_a_mask_for_every_wanted_row_and_the_record_carries_it() {
     });
     let calls = Arc::new(Mutex::new(Vec::new()));
     // The filter lets one token through at each place, so that the reply
-    // repeats at once and the lookup in earlier text has drafts to offer (the
+    // repeats at once and the n-gram drafter has drafts to offer (the
     // filter binds every row, so the request takes no drafts from the model's
     // own block).
     let mut r = request("filtered", Some(200));

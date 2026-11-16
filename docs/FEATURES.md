@@ -18,7 +18,7 @@ the kernels exist; no model runs there yet.
 | Prefix cache | yes, with the RAM and SSD levels | yes, with the RAM and SSD levels; its RAM is what the tier of experts leaves |
 
 ## Speed
-- Speculative decoding: the model's own drafts and a lookup in earlier text; the chain runs
+- Speculative decoding: the model's own drafts and the n-gram drafter; the chain runs
   in a step of its own and the round verifies as many of its drafts as pay, by the
   probability the drafter gave each and the measured price of a step. On the 27B the text
   with drafts is token for token the text without. On Flash-Next a draft row waits for an

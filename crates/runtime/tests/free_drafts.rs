@@ -6,7 +6,7 @@
 //! synthetic model with a host executor.
 //!
 //! The model's text never repeats here (its next token depends on the
-//! position), so the lookup in earlier text has nothing to offer inside a
+//! position), so the n-gram drafter has nothing to offer inside a
 //! request and every draft is the draft block's. The executor states what a
 //! step costs and takes no time for it ([`HostExecutor::without_sleeping`]),
 //! so the windows the policy chooses are the same on a machine however busy.
@@ -292,7 +292,7 @@ fn check_windows(windows: &[Window], tokens: &[u32], tag: &[u32], at: usize) -> 
 
 /// The reply with the rule of `kind` bound after `tag`, which the free text
 /// ends at `end`: without drafts, with them, and a second time, when the
-/// lookup in earlier text knows the whole reply. Returns what the window
+/// n-gram drafter knows the whole reply. Returns what the window
 /// that gave the binding token did in the first run with drafts.
 fn bind_at(
     model: &Arc<SyntheticModel>,
@@ -332,7 +332,7 @@ fn bind_at(
     let tokens: Vec<u32> = prompt.bytes().map(u32::from).chain(tokens_of(&drafted.text)).collect();
     let binding =
         check_windows(&windows.lock().unwrap(), &tokens, &tokens_of(tag), prompt.len() + end);
-    // Again: the lookup has the reply now, and offers it next to the block.
+    // Again: the n-gram drafter has the reply now, and offers it next to the block.
     let again = run_one(&rt, ruled(prompt, &structure, true));
     assert_eq!(again, expected, "{kind:?} bound after {end}: the second time");
     binding

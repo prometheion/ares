@@ -393,7 +393,7 @@ impl<'a> RecordWriter<'a> {
     /// this record are placeholders.
     pub fn own_drafts(&mut self, drafter: u32) -> Result<(), RecordFull> {
         assert!(self.segs_written > 0, "a segment was written");
-        assert!(drafter > 0, "drafter 0 is the lookup, whose drafts are tokens");
+        assert!(drafter > 0, "drafter 0 is the n-gram drafter, whose drafts are tokens");
         let at = HEADERS + (self.segs_written as usize - 1) * SEG_BYTES + 20;
         let capacity = self.buf.len();
         let words = self.buf.get_mut(at..at + 8).ok_or(RecordFull { capacity })?;

@@ -6,7 +6,7 @@
 //! on two).
 //!
 //! The measurement of the drafters runs only when `ARES_WIRE_CASE` names
-//! one of its cases (`none`, `own3`, `own16`, `lookup16`, `both16`): each
+//! one of its cases (`none`, `w4`, `w8`, `w16`): each
 //! loads the 27B once and takes about a minute. `ARES_TEST_DRAFT_VOCAB` names
 //! a draft vocabulary (a token id per line) and `ARES_WIRE_OUT` a directory
 //! for the texts.
@@ -246,7 +246,7 @@ fn draft_vocabulary() -> Option<Arc<[u32]>> {
 /// Tokens per second of a request that writes from nothing and of one that
 /// writes its prompt again with edits, in German and in English, with the
 /// window `ARES_WIRE_CASE` names (none, or w4, w8, w16: the rows of a
-/// sequence's window, the model's draft block and the lookup in earlier text
+/// sequence's window, the model's draft block and the n-gram drafter
 /// as the policy chooses them for every step). The model runs as it is
 /// served: a tensor split over both devices, the fast kernels, the most
 /// probable token.
@@ -319,7 +319,7 @@ fn what_each_drafter_is_worth_on_the_27b() {
         };
         eprintln!(
             "RES {case} | {name}: {tokens} tokens after a prompt of {}, first after {:.2} s, then \
-             {:.1} tokens/s; {} steps with {:.2} tokens each, {} draft rows ({} cut again); lookup \
+             {:.1} tokens/s; {} steps with {:.2} tokens each, {} draft rows ({} cut again); ngram \
              {}; own {} in {} links of {:.2} ms",
             answer.usage.prompt_tokens,
             answer.first,

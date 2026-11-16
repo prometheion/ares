@@ -861,7 +861,7 @@ fn load_qwen35(
         return Err(refuse("--parallel must be at least 1"));
     }
     // The model drafters that take part: all the model has unless the operator
-    // names them. Nothing speculates without one, the lookup in earlier text
+    // names them. Nothing speculates without one, the n-gram drafter
     // included.
     let mtp = draft_block_takes_part(
         options,

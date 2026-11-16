@@ -136,8 +136,8 @@ OPTIONS:
                                model's own draft block) or none; a file name is
                                a drafter from a file of its own (a DFlash2
                                drafter, or Flash-Next's draft block). The
-                               lookup in earlier text takes part with them
-                               and never alone; with none the
+                               n-gram drafter takes part with them and
+                               never alone; with none the
                                server does not speculate. The length of a draft
                                and whose it is are chosen for every step from
                                the price of a step and the acceptance measured

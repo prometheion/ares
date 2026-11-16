@@ -164,7 +164,7 @@ impl Served {
     }
 
     /// Starts the engine on the 27B over both cards with its draft block and
-    /// the lookup in earlier text, with exact products so that a row computes
+    /// the n-gram drafter, with exact products so that a row computes
     /// the same in a window as alone.
     fn start_drafting(path: &PathBuf, rule: Option<Rule>) -> Self {
         let options = Options {
@@ -635,7 +635,7 @@ async fn a_mask_restricts_every_row_of_a_reply_with_drafts_and_without() {
     // The rule the engine applies, which the test switches between the
     // replies: none, or one of two. A rule makes a mask for every row, so
     // that no draft of the model's own is verified with it (the host cannot
-    // mask a row for drafts it does not have yet); the lookup's are.
+    // mask a row for drafts it does not have yet); the n-gram drafter's are.
     let mode = Arc::new(AtomicUsize::new(NONE));
     let most = Arc::new(AtomicUsize::new(0));
     let rule: Rule = {

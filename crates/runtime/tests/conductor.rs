@@ -201,7 +201,7 @@ fn text_that_does_not_repeat_gets_few_drafts_accepted() {
     // The model's own draft is a guess among 256 tokens and never right: the
     // planner learns to stop asking for it after a few windows. (The steps
     // are timed by the conductor's clock here, so how few depends on how busy
-    // the machine is. What the lookup finds depends on it too: the requests
+    // the machine is. What the n-gram drafter finds depends on it too: the requests
     // run side by side, and their texts meet where two of them reach the same
     // token at the same position.)
     let own_windows: u64 =
@@ -813,7 +813,7 @@ fn launches_ms(rows: u32) -> f64 {
 }
 
 /// A model whose draft block is right this often and whose text gives the
-/// lookup nothing, so that every draft is the block's.
+/// n-gram drafter nothing, so that every draft is the block's.
 fn drafting_model(accuracy: &[f64], max_rows: u32) -> Arc<SyntheticModel> {
     model(|c| {
         never_repeating(c);
@@ -860,8 +860,8 @@ fn snapshot_of(rt: &Runtime) -> ares_runtime::Snapshot {
 }
 
 #[test]
-fn a_model_with_no_drafter_does_not_speculate_and_the_lookup_does_not_run_alone() {
-    // Text that repeats exactly, which the lookup would copy.
+fn a_model_with_no_drafter_does_not_speculate_and_the_ngram_drafter_does_not_run_alone() {
+    // Text that repeats exactly, which the n-gram drafter would copy.
     let model = model(|c| {
         c.context.window = 1;
         c.context.epoch = 0;
@@ -893,7 +893,7 @@ fn a_window_of_one_row_is_no_speculation_even_for_a_model_with_a_drafter_and_tex
 }
 
 #[test]
-fn the_lookup_joins_the_model_drafter_when_there_is_one() {
+fn the_ngram_drafter_joins_the_model_drafter_when_there_is_one() {
     let model = model(never_repeating);
     // A step costs the same whatever it carries, and the executor says so.
     let rt = runtime_with(&model, RuntimeConfig { window_rows: 8, ..config(true, 4096) }, |e| {
@@ -904,7 +904,7 @@ fn the_lookup_joins_the_model_drafter_when_there_is_one() {
     alone(&rt, "written twice", Some(200));
     let c = snapshot_of(&rt).counters;
     // The draft block is never right here: what is drafted and accepted
-    // comes from the lookup in the first request's text.
+    // comes from the n-gram drafter in the first request's text.
     assert!(c.drafts_accepted_at[0].iter().sum::<u64>() > 150, "{c:?}");
     assert_eq!(c.drafts_accepted_at[1].iter().sum::<u64>(), 0, "{c:?}");
     assert!(c.steps - before.steps < 80, "{c:?}");

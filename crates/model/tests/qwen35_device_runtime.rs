@@ -628,7 +628,7 @@ fn windows_against_single_rows(
 /// bit for bit, over a few hundred generated tokens: the text does not depend
 /// on what was drafted. With the fast kernels, which is how the model is
 /// served. The layer split has no draft block of its own (its drafts would
-/// come from a lookup), which changes nothing for a window: the rows are
+/// come from the n-gram drafter), which changes nothing for a window: the rows are
 /// verified the same way.
 #[test]
 fn a_row_of_a_draft_window_picks_what_it_picks_alone_on_every_placement() {

@@ -125,8 +125,8 @@ impl ContextSpec {
     }
 }
 
-/// The kinds of drafter the runtime knows besides its own lookup in earlier
-/// text. A model lists the drafters it runs ([`Model::drafters`]); what the
+/// The kinds of drafter a model runs on its devices, besides the runtime's own
+/// n-gram drafter. A model lists them ([`Model::drafters`]); what the
 /// conductor needs of one is its kind and the most drafts it makes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum DrafterKind {
@@ -150,7 +150,7 @@ impl DrafterKind {
     }
 
     /// Where the statistics count the drafts of this kind
-    /// ([`Counters::drafts_tested_at`](crate::Counters)): the lookup is 0.
+    /// ([`Counters::drafts_tested_at`](crate::Counters)): the n-gram drafter is 0.
     pub fn source(self) -> usize {
         match self {
             DrafterKind::Block => 1,
@@ -528,7 +528,7 @@ pub trait Model: Send + Sync + 'static {
 
     /// The drafters the model runs on its devices, none by default. The
     /// record names a drafter by its place in this list plus one (0 is the
-    /// runtime's lookup, whose drafts are tokens of the record): a window
+    /// runtime's n-gram drafter, whose drafts are tokens of the record): a window
     /// whose drafts drafter `i` makes has the record's own-drafts flag, the
     /// drafter's id, and no tokens for its draft rows.
     fn drafters(&self) -> Vec<Drafter> {

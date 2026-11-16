@@ -45,7 +45,7 @@
 //!   three kinds) of `--generate` tokens, each
 //!   most-probable-token and, with `--sample`, sampled, with windows of up to
 //!   `W` rows (0: no drafts). With a model that has a draft block the engine
-//!   drafts with it and with the lookup in earlier text, and chooses for every
+//!   drafts with it and with the n-gram drafter, and chooses for every
 //!   step whose drafts and how many from the price of a step (measured at
 //!   load) and the acceptance (measured while running); `--draft-vocab FILE`
 //!   restricts the block's drafts to the tokens of a list (an id per line).
@@ -1098,7 +1098,7 @@ fn engine(args: &Args, spread: &Spread, window: u32) {
                 step.p50_us / 1e3,
                 step.mean_us / 1e3,
             );
-            for (source, label) in [(0, "lookup"), (1, "block"), (2, "dflash")] {
+            for (source, label) in [(0, "ngram"), (1, "block"), (2, "dflash")] {
                 let tested = c.drafts_tested_at[source];
                 if tested[0] == 0 {
                     continue;
@@ -1114,7 +1114,7 @@ fn engine(args: &Args, spread: &Spread, window: u32) {
                     rates.join(", ")
                 );
             }
-            for (source, label) in [(0, "lookup"), (1, "block"), (2, "dflash")] {
+            for (source, label) in [(0, "ngram"), (1, "block"), (2, "dflash")] {
                 let lengths = c.draft_lengths[source];
                 if lengths.iter().all(|n| *n == 0) {
                     continue;

@@ -236,7 +236,7 @@ pub struct DeviceTimes {
 /// the last.
 pub const DRAFT_POSITIONS: usize = 16;
 
-/// Where drafts come from, for the statistics: the lookup, a draft block, a
+/// Where drafts come from, for the statistics: the n-gram drafter, a draft block, a
 /// DFlash drafter.
 pub const DRAFT_SOURCES: usize = 3;
 
@@ -257,7 +257,7 @@ pub struct Counters {
     /// Drafts by where they came from and their position in the draft,
     /// `[source][position]`: how many were tested (every draft before them
     /// was accepted) and how many of those were accepted. Source 0 is the
-    /// lookup of earlier text, 1 a draft block of the model, 2 a DFlash
+    /// n-gram drafter, 1 a draft block of the model, 2 a DFlash
     /// drafter ([`DrafterKind::source`](crate::DrafterKind::source)); the last
     /// position counts the ones past it too.
     pub drafts_tested_at: [[u64; DRAFT_POSITIONS]; DRAFT_SOURCES],

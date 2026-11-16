@@ -1,15 +1,15 @@
-//! Drafting by lookup in everything the engine has read and written.
+//! The n-gram drafter: drafts from everything the engine has read and written.
 //!
 //! Models copy a lot: they quote the prompt, rewrite a file with one line
 //! changed, repeat a function signature, and agents send the same documents
 //! in request after request. Whenever the text being generated has an earlier
-//! occurrence, the tokens that followed it are a draft that costs a lookup.
+//! occurrence, the tokens that followed it are a draft that costs a walk in an automaton.
 //!
-//! [`LookupCorpus`] is one suffix automaton over the text of all sequences,
-//! and [`LookupDrafter`] is one sequence's place in it. For the current end
+//! [`NgramCorpus`] is one suffix automaton over the text of all sequences,
+//! and [`NgramDrafter`] is one sequence's place in it. For the current end
 //! of a sequence it finds the **longest** suffix that occurred before,
 //! anywhere, in this request or another, and proposes what followed its most
-//! recent occurrence. A lookup by the last `n` tokens of one sequence, which
+//! recent occurrence. A match of the last `n` tokens of one sequence, which
 //! this replaced, cannot tell two places apart that end in the same `n`
 //! tokens, and it knows nothing of other requests.
 //!
@@ -36,7 +36,7 @@
 //! keeps where its most recent occurrence went on (`cont`) and how many of
 //! its occurrences went on at all (`seen`). Both are written when a token is
 //! appended, for the states of the text before that token, along at most
-//! [`LookupConfig::max_hops`] suffix links. The longest suffixes come first
+//! [`NgramConfig::max_hops`] suffix links. The longest suffixes come first
 //! on that walk, so the cap leaves out only short ones.
 //!
 //! # Confidence
@@ -48,7 +48,7 @@
 //! at that token, and how the earlier occurrences of that context went on
 //! (it occurred once; several times and always like this; mostly; seldom).
 //! The table starts from acceptance measured by replaying real text and
-//! follows what verification reports ([`LookupDrafter::observe`]), so it
+//! follows what verification reports ([`NgramDrafter::observe`]), so it
 //! stays right for the model and the sampling in use.
 
 /// No state, no position.
@@ -57,14 +57,14 @@ const NONE: u32 = u32::MAX;
 const ROOT: u32 = 0;
 /// An unused slot of the transition table.
 const EMPTY: u64 = u64::MAX;
-/// How many tokens back a drafter can be cut ([`LookupDrafter::truncate`]).
+/// How many tokens back a drafter can be cut ([`NgramDrafter::truncate`]).
 const HISTORY: usize = 32;
 /// The longest draft a drafter remembers the table cells of.
 const MAX_DRAFT: usize = 64;
 
-/// The settings of a [`LookupCorpus`].
+/// The settings of a [`NgramCorpus`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct LookupConfig {
+pub struct NgramConfig {
     /// The most memory the corpus takes, for both automata (never less than
     /// two automata of 64 tokens, about 14 KiB). A token costs
     /// 112 to 176 bytes (8 for the text, 40 for its two states, 64 to 128 for
@@ -81,7 +81,7 @@ pub struct LookupConfig {
     pub max_hops: u32,
 }
 
-impl Default for LookupConfig {
+impl Default for NgramConfig {
     fn default() -> Self {
         Self { max_bytes: 64 << 20, min_match: 2, max_hops: 8 }
     }
@@ -360,7 +360,7 @@ fn cell(len: u32, occurrences: u32, agreeing: u32) -> u8 {
 /// 17-32, more) and agreement (columns: once, always, mostly, seldom), as
 /// measured by replaying the text of this repository (English prose, Rust
 /// and a little German) with the vocabulary of Qwen3.5, plain and as edits
-/// of a prompt: `examples/lookup_bench.rs` prints this table. A context that
+/// of a prompt: `examples/ngram_bench.rs` prints this table. A context that
 /// went on in several ways is worth about the same at any length; one that
 /// always went on the same way, or occurred once, is worth more the longer
 /// it is.
@@ -379,7 +379,7 @@ const PRIOR: [[f32; AGREEMENTS]; LENGTHS] = [
 
 /// What the automaton knows about a drafter's current match.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct LookupMatch {
+pub struct NgramMatch {
     /// The length of the matched suffix in tokens.
     pub len: u32,
     /// How many earlier occurrences of it went on.
@@ -389,19 +389,19 @@ pub struct LookupMatch {
 }
 
 /// The text of all sequences, searchable: one suffix automaton that every
-/// [`LookupDrafter`] reads and extends.
+/// [`NgramDrafter`] reads and extends.
 ///
 /// The corpus is two automata, a young one that grows and an old one that is
 /// only read. When the young one is full the old one is dropped and the
 /// young one takes its place, so text is found for one to two automata's
 /// worth of tokens after it was read, and memory never exceeds
-/// [`LookupConfig::max_bytes`]. It also holds the table from which the
+/// [`NgramConfig::max_bytes`]. It also holds the table from which the
 /// confidence of a proposed token is read (by the length of the matched
 /// context and by how its earlier occurrences went on), which starts from
-/// measured acceptance and follows what [`LookupDrafter::observe`] reports.
+/// measured acceptance and follows what [`NgramDrafter::observe`] reports.
 #[derive(Debug)]
-pub struct LookupCorpus {
-    config: LookupConfig,
+pub struct NgramCorpus {
+    config: NgramConfig,
     young: Automaton,
     old: Option<Automaton>,
     /// The number of the young automaton. A drafter that was last used with
@@ -413,10 +413,10 @@ pub struct LookupCorpus {
     rate: [[f32; AGREEMENTS]; LENGTHS],
 }
 
-impl LookupCorpus {
+impl NgramCorpus {
     /// A corpus within `config.max_bytes`. The memory is taken as the text
     /// comes in, never more than that.
-    pub fn new(config: LookupConfig) -> Self {
+    pub fn new(config: NgramConfig) -> Self {
         // The largest automaton of which two fit; a small one at the least.
         let (mut low, mut high) = (64usize, 64usize);
         while 2 * Automaton::bytes(high * 2) <= config.max_bytes && high < (u32::MAX / 8) as usize {
@@ -479,10 +479,10 @@ impl LookupCorpus {
     }
 }
 
-/// One sequence's place in a [`LookupCorpus`], with the corpus passed to
+/// One sequence's place in a [`NgramCorpus`], with the corpus passed to
 /// every call.
 #[derive(Clone, Debug)]
-pub struct LookupDrafter {
+pub struct NgramDrafter {
     len: usize,
     /// The automaton `state` and `tail` belong to; `u64::MAX` before the
     /// first token.
@@ -507,13 +507,13 @@ pub struct LookupDrafter {
     proposed: usize,
 }
 
-impl Default for LookupDrafter {
+impl Default for NgramDrafter {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl LookupDrafter {
+impl NgramDrafter {
     /// The drafter of a sequence that has no tokens yet.
     pub fn new() -> Self {
         Self {
@@ -545,7 +545,7 @@ impl LookupDrafter {
     /// Catches up with a corpus that started a new automaton since this
     /// drafter was last used: what was its own state is a match in the old
     /// automaton now, and its text starts anew in the young one.
-    fn sync(&mut self, corpus: &LookupCorpus) {
+    fn sync(&mut self, corpus: &NgramCorpus) {
         if self.generation == corpus.generation {
             return;
         }
@@ -564,7 +564,7 @@ impl LookupDrafter {
 
     /// Adds a token of the sequence (prompt or accepted output) to the
     /// corpus.
-    pub fn push(&mut self, corpus: &mut LookupCorpus, token: u32) {
+    pub fn push(&mut self, corpus: &mut NgramCorpus, token: u32) {
         if corpus.young.is_full() {
             corpus.rotate();
         }
@@ -581,8 +581,8 @@ impl LookupDrafter {
         self.valid = (self.valid + 1).min(HISTORY);
     }
 
-    /// Adds several tokens, as [`LookupDrafter::push`] does one.
-    pub fn extend(&mut self, corpus: &mut LookupCorpus, tokens: &[u32]) {
+    /// Adds several tokens, as [`NgramDrafter::push`] does one.
+    pub fn extend(&mut self, corpus: &mut NgramCorpus, tokens: &[u32]) {
         for token in tokens {
             self.push(corpus, *token);
         }
@@ -597,7 +597,7 @@ impl LookupDrafter {
     /// The last 31 tokens can be cut exactly. A deeper cut keeps the count
     /// and loses the context: the drafter matches again from the tokens that
     /// follow.
-    pub fn truncate(&mut self, corpus: &LookupCorpus, len: usize) {
+    pub fn truncate(&mut self, corpus: &NgramCorpus, len: usize) {
         if len >= self.len {
             return;
         }
@@ -619,7 +619,7 @@ impl LookupDrafter {
     }
 
     /// The match to draft from: the automaton, the state and the length.
-    fn find<'a>(&mut self, corpus: &'a LookupCorpus) -> Option<(&'a Automaton, u32, u32)> {
+    fn find<'a>(&mut self, corpus: &'a NgramCorpus) -> Option<(&'a Automaton, u32, u32)> {
         self.sync(corpus);
         let config = &corpus.config;
         let blocked = |generation: u64| {
@@ -649,13 +649,13 @@ impl LookupDrafter {
 
     /// Proposes up to `max` tokens that followed the most recent earlier
     /// occurrence of the longest suffix of the sequence that has one, of at
-    /// least [`LookupConfig::min_match`] tokens. `tokens` receives the draft
+    /// least [`NgramConfig::min_match`] tokens. `tokens` receives the draft
     /// and `confidence`, for each token, the probability that it is accepted
     /// given that the ones before it were. Returns the length of the match;
     /// 0 with an empty draft when there is none.
     pub fn draft(
         &mut self,
-        corpus: &LookupCorpus,
+        corpus: &NgramCorpus,
         max: usize,
         tokens: &mut Vec<u32>,
         confidence: &mut Vec<f64>,
@@ -684,19 +684,19 @@ impl LookupDrafter {
         if tokens.is_empty() { 0 } else { matched as usize }
     }
 
-    /// The match [`LookupDrafter::draft`] would draft from, with how often
+    /// The match [`NgramDrafter::draft`] would draft from, with how often
     /// its earlier occurrences went on the way the draft starts.
-    pub fn matched(&mut self, corpus: &LookupCorpus) -> Option<LookupMatch> {
+    pub fn matched(&mut self, corpus: &NgramCorpus) -> Option<NgramMatch> {
         let (automaton, state, len) = self.find(corpus)?;
         let s = &automaton.states[state as usize];
         let first = automaton.text[s.cont as usize];
         let agreeing =
             automaton.step(state, first).map_or(0, |next| automaton.states[next as usize].seen);
-        Some(LookupMatch { len, occurrences: s.seen, agreeing: agreeing.min(s.seen) })
+        Some(NgramMatch { len, occurrences: s.seen, agreeing: agreeing.min(s.seen) })
     }
 
     /// The table cell of each token of the last draft, as row times four plus
-    /// column of [`LookupCorpus::table`]. This is what a calibration run
+    /// column of [`NgramCorpus::table`]. This is what a calibration run
     /// counts acceptance by.
     pub fn cells(&self) -> &[u8] {
         &self.cells[..self.proposed]
@@ -705,7 +705,7 @@ impl LookupDrafter {
     /// Records the outcome of the last draft: its first `verified` tokens
     /// were verified and the first `accepted` of them were right. The corpus
     /// learns from it what to expect of such matches.
-    pub fn observe(&mut self, corpus: &mut LookupCorpus, verified: usize, accepted: usize) {
+    pub fn observe(&mut self, corpus: &mut NgramCorpus, verified: usize, accepted: usize) {
         const STEP: f32 = 0.02;
         for (i, cell) in self.cells.iter().enumerate().take(verified.min(self.proposed)) {
             let rate = &mut corpus.rate[*cell as usize / AGREEMENTS][*cell as usize % AGREEMENTS];
@@ -725,11 +725,11 @@ impl LookupDrafter {
 mod tests {
     use super::*;
 
-    fn corpus() -> LookupCorpus {
-        LookupCorpus::new(LookupConfig { max_bytes: 1 << 20, min_match: 3, max_hops: 24 })
+    fn corpus() -> NgramCorpus {
+        NgramCorpus::new(NgramConfig { max_bytes: 1 << 20, min_match: 3, max_hops: 24 })
     }
 
-    fn draft(drafter: &mut LookupDrafter, corpus: &LookupCorpus, max: usize) -> Vec<u32> {
+    fn draft(drafter: &mut NgramDrafter, corpus: &NgramCorpus, max: usize) -> Vec<u32> {
         let (mut tokens, mut confidence) = (Vec::new(), Vec::new());
         drafter.draft(corpus, max, &mut tokens, &mut confidence);
         assert_eq!(tokens.len(), confidence.len());
@@ -740,7 +740,7 @@ mod tests {
     #[test]
     fn continues_an_earlier_occurrence() {
         let mut corpus = corpus();
-        let mut drafter = LookupDrafter::new();
+        let mut drafter = NgramDrafter::new();
         // A "file" in the prompt, then the model starts to write it again.
         drafter.extend(&mut corpus, &[10, 11, 12, 13, 14, 15, 16, 99, 98]);
         assert!(draft(&mut drafter, &corpus, 8).is_empty(), "nothing repeats yet");
@@ -751,7 +751,7 @@ mod tests {
         assert_eq!(draft(&mut drafter, &corpus, 100), [13, 14, 15, 16, 99, 98, 10, 11, 12]);
         assert_eq!(drafter.matched(&corpus).map(|m| m.len), Some(3));
 
-        // The drafts are accepted: the next lookup continues further, and
+        // The drafts are accepted: the next draft continues further, and
         // the match is as long as what was copied so far.
         drafter.extend(&mut corpus, &[13, 14]);
         assert_eq!(draft(&mut drafter, &corpus, 2), [15, 16]);
@@ -762,7 +762,7 @@ mod tests {
     #[test]
     fn the_longest_match_decides_where_the_last_tokens_alone_cannot() {
         let mut corpus = corpus();
-        let mut drafter = LookupDrafter::new();
+        let mut drafter = NgramDrafter::new();
         // Two functions that end in the same three tokens and go on
         // differently. The text then repeats the first one.
         let first = [1, 2, 3, 7, 8, 9, 100, 101];
@@ -779,20 +779,20 @@ mod tests {
     #[test]
     fn prefers_the_most_recent_occurrence_of_the_longest_match() {
         let mut corpus = corpus();
-        let mut drafter = LookupDrafter::new();
+        let mut drafter = NgramDrafter::new();
         drafter.extend(&mut corpus, &[1, 2, 3, 30, 0, 1, 2, 3, 40, 0, 1, 2, 3]);
         assert_eq!(draft(&mut drafter, &corpus, 1), [40]);
         // Longer matches exist here: "0 1 2 3" occurred once before.
         assert_eq!(
             drafter.matched(&corpus),
-            Some(LookupMatch { len: 4, occurrences: 1, agreeing: 1 })
+            Some(NgramMatch { len: 4, occurrences: 1, agreeing: 1 })
         );
     }
 
     #[test]
     fn a_repeating_pattern_drafts_up_to_the_end_of_what_exists() {
         let mut corpus = corpus();
-        let mut drafter = LookupDrafter::new();
+        let mut drafter = NgramDrafter::new();
         drafter.extend(&mut corpus, &[7, 8, 9, 7, 8, 9, 7, 8]);
         // "7 8 9 7 8" matched at its first occurrence; what followed is
         // "9 7 8", up to the sequence's own end.
@@ -802,7 +802,7 @@ mod tests {
     #[test]
     fn short_sequences_and_new_text_have_no_drafts() {
         let mut corpus = corpus();
-        let mut drafter = LookupDrafter::new();
+        let mut drafter = NgramDrafter::new();
         assert!(drafter.is_empty());
         assert!(draft(&mut drafter, &corpus, 4).is_empty());
         drafter.extend(&mut corpus, &[1, 1, 1]);
@@ -820,26 +820,26 @@ mod tests {
         // An agent's first request: a document and an answer.
         let document: Vec<u32> = (100..140).collect();
         let answer: Vec<u32> = (500..520).collect();
-        let mut first = LookupDrafter::new();
+        let mut first = NgramDrafter::new();
         first.extend(&mut corpus, &document);
         first.extend(&mut corpus, &answer);
 
         // A second request quotes a part of the document in other words.
-        let mut second = LookupDrafter::new();
+        let mut second = NgramDrafter::new();
         second.extend(&mut corpus, &[1, 2, 3, 110, 111, 112, 113]);
         assert_eq!(draft(&mut second, &corpus, 4), [114, 115, 116, 117]);
         assert_eq!(second.matched(&corpus).map(|m| m.len), Some(4));
 
         // A third sends the same document again: the whole of it matches,
         // and the draft is the first request's answer.
-        let mut third = LookupDrafter::new();
+        let mut third = NgramDrafter::new();
         third.extend(&mut corpus, &document);
         assert_eq!(draft(&mut third, &corpus, 5), answer[..5]);
         assert_eq!(third.matched(&corpus).map(|m| m.len), Some(40));
 
         // Requests that run at the same time keep their texts apart: each
         // continues its own, token by token, in any interleaving.
-        let (mut a, mut b) = (LookupDrafter::new(), LookupDrafter::new());
+        let (mut a, mut b) = (NgramDrafter::new(), NgramDrafter::new());
         for i in 0..12 {
             a.push(&mut corpus, 100 + i);
             b.push(&mut corpus, 500 + i);
@@ -851,7 +851,7 @@ mod tests {
     #[test]
     fn confidence_grows_with_the_match_and_with_agreement() {
         let mut corpus = corpus();
-        let mut drafter = LookupDrafter::new();
+        let mut drafter = NgramDrafter::new();
         // "1 2 3" went on with 4 five times and with 9 once (the last time).
         for _ in 0..5 {
             drafter.extend(&mut corpus, &[1, 2, 3, 4, 70, 71]);
@@ -893,7 +893,7 @@ mod tests {
     #[test]
     fn the_table_follows_what_verification_reports() {
         let mut corpus = corpus();
-        let mut drafter = LookupDrafter::new();
+        let mut drafter = NgramDrafter::new();
         drafter.extend(&mut corpus, &[1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3]);
         let (mut tokens, mut confidence) = (Vec::new(), Vec::new());
         drafter.draft(&corpus, 3, &mut tokens, &mut confidence);
@@ -918,7 +918,7 @@ mod tests {
     #[test]
     fn a_rollback_does_not_propose_what_was_removed() {
         let mut corpus = corpus();
-        let mut drafter = LookupDrafter::new();
+        let mut drafter = NgramDrafter::new();
         drafter.extend(&mut corpus, &[1, 2, 3, 4, 5, 6, 0, 1, 2, 3]);
         assert_eq!(draft(&mut drafter, &corpus, 2), [4, 5]);
         // The model writes "4 5 6", which is rolled back (a banned string).
@@ -936,7 +936,7 @@ mod tests {
 
         // A cut deeper than the drafter remembers keeps the count and starts
         // matching anew.
-        let mut long = LookupDrafter::new();
+        let mut long = NgramDrafter::new();
         let text: Vec<u32> = (1000..1100).collect();
         long.extend(&mut corpus, &text);
         long.truncate(&corpus, 20);
@@ -951,25 +951,25 @@ mod tests {
 
     #[test]
     fn equal_matches_in_both_automata_take_the_newer_text() {
-        let config = LookupConfig { max_bytes: 256 << 10, min_match: 3, max_hops: 24 };
-        let mut corpus = LookupCorpus::new(config);
+        let config = NgramConfig { max_bytes: 256 << 10, min_match: 3, max_hops: 24 };
+        let mut corpus = NgramCorpus::new(config);
         let passage = [1, 2, 3, 4, 5, 6, 7, 8];
-        let mut first = LookupDrafter::new();
+        let mut first = NgramDrafter::new();
         first.extend(&mut corpus, &passage);
         first.push(&mut corpus, 100);
         // Enough other text for one turnover: the passage is in the old
         // automaton now.
-        let mut other = LookupDrafter::new();
+        let mut other = NgramDrafter::new();
         let mut token = 1000;
         while corpus.generation == 0 {
             other.push(&mut corpus, token);
             token += 1;
         }
         // It is written again and goes on differently this time.
-        let mut second = LookupDrafter::new();
+        let mut second = NgramDrafter::new();
         second.extend(&mut corpus, &passage);
         second.push(&mut corpus, 200);
-        let mut reader = LookupDrafter::new();
+        let mut reader = NgramDrafter::new();
         reader.extend(&mut corpus, &passage);
         assert_eq!(reader.matched(&corpus).map(|m| m.len), Some(8));
         assert_eq!(draft(&mut reader, &corpus, 1), [200]);
@@ -978,8 +978,8 @@ mod tests {
 
     #[test]
     fn memory_is_bounded_and_old_text_is_forgotten() {
-        let config = LookupConfig { max_bytes: 256 << 10, min_match: 3, max_hops: 24 };
-        let mut corpus = LookupCorpus::new(config);
+        let config = NgramConfig { max_bytes: 256 << 10, min_match: 3, max_hops: 24 };
+        let mut corpus = NgramCorpus::new(config);
         assert!(corpus.bytes() <= config.max_bytes, "{}", corpus.bytes());
         let per_generation = corpus.tokens_per_generation();
         assert!(per_generation >= 512, "{per_generation}");
@@ -987,7 +987,7 @@ mod tests {
         // A passage, then far more text than the corpus holds, from several
         // requests; one of them lives through all of it.
         let passage: Vec<u32> = (1_000_000..1_000_050).collect();
-        let mut writer = LookupDrafter::new();
+        let mut writer = NgramDrafter::new();
         writer.extend(&mut corpus, &passage);
         let mut state = 0x2545_f491_4f6c_dd1du64;
         let mut noise = || {
@@ -998,7 +998,7 @@ mod tests {
         };
         let mut pushed = passage.len();
         while pushed < 10 * per_generation {
-            let mut other = LookupDrafter::new();
+            let mut other = NgramDrafter::new();
             for _ in 0..300 {
                 other.push(&mut corpus, noise());
                 writer.push(&mut corpus, noise());
@@ -1009,7 +1009,7 @@ mod tests {
         assert_eq!(writer.len(), 50 + (pushed - 50) / 2);
 
         // The passage is long gone.
-        let mut reader = LookupDrafter::new();
+        let mut reader = NgramDrafter::new();
         reader.extend(&mut corpus, &passage[..10]);
         assert!(draft(&mut reader, &corpus, 4).is_empty());
         // Recent text is found, also by the request that lived through the

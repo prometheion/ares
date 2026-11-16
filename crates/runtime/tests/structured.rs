@@ -20,8 +20,8 @@ fn model() -> Arc<SyntheticModel> {
     let mut config = SyntheticConfig::small(Split::Single, 1);
     config.context_length = 1024;
     config.eos = Some(u32::from(END));
-    // Text that loops, so that the lookup in earlier text has drafts to offer,
-    // next to a draft block of the model's own (the lookup takes part only
+    // Text that loops, so that the n-gram drafter has drafts to offer,
+    // next to a draft block of the model's own (the n-gram drafter takes part only
     // next to one).
     config.context.window = 1;
     config.context.epoch = 40;
@@ -112,7 +112,7 @@ fn a_grammar_is_obeyed_and_drafts_change_nothing() {
 
 #[test]
 fn a_draft_the_grammar_forbids_is_cut_before_it_is_verified() {
-    // Runs of one letter: the lookup in earlier text goes on with the letter
+    // Runs of one letter: the n-gram drafter goes on with the letter
     // the grammar is about to leave, and the grammar leaves one token to pick.
     let model = model();
     let grammar = "root ::= \"a\"{30} \"b\"{30} \"a\"{30} \"b\"{30}";

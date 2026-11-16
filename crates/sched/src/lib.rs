@@ -31,7 +31,7 @@
 //!   [`Confidence`] is how often a draft is accepted by the probability its
 //!   drafter gave it, and [`need`] the bar a chain is cut by as it is made:
 //!   the same rule, with the chances of the drafts it has.
-//! - [`LookupCorpus`] and [`LookupDrafter`] propose drafts by continuing the
+//! - [`NgramCorpus`] and [`NgramDrafter`] propose drafts by continuing the
 //!   longest earlier occurrence of the current text, in any sequence: one
 //!   suffix automaton over everything the engine has read and written, with
 //!   a confidence per proposed token. This is what makes copying (file
@@ -45,7 +45,7 @@
 mod admission;
 mod confidence;
 mod draft;
-mod lookup;
+mod ngram;
 mod pass;
 mod plan;
 mod price;
@@ -56,7 +56,7 @@ mod window;
 pub use admission::{Admission, AdmissionConfig, Arrival, Claims, ExceedsPool, Outcome, PoolView};
 pub use confidence::{BINS as CONFIDENCE_BINS, Confidence, links_made, need};
 pub use draft::{Acceptance, BELIEF};
-pub use lookup::{LookupConfig, LookupCorpus, LookupDrafter, LookupMatch};
+pub use ngram::{NgramConfig, NgramCorpus, NgramDrafter, NgramMatch};
 pub use pass::{Pass, PassStep, Point, pass_rows_between, runs_as_pass};
 pub use plan::{Limits, Part, PartKind, Plan, Request, SeqId, Want, plan};
 pub use price::{Curve, Estimate, OLD as PRICE_OLD, PriceTable};

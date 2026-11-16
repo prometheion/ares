@@ -88,7 +88,7 @@ use ares_api::{EngineError, Event, EventSink, FinishReason, RequestId, Sampling,
 use ares_sampler::{SampleParams, SampleRow, TokenMask};
 use ares_sched::{
     Acceptance, Admission, AdmissionConfig, Arrival, Choice, Confidence, Curve, Estimate, Limits,
-    Load, LookupCorpus, LookupDrafter, Offer, Outcome, PartKind, Pending, PoolView, PriceTable,
+    Load, NgramCorpus, NgramDrafter, Offer, Outcome, PartKind, Pending, PoolView, PriceTable,
     Prices, Request, SeqId, Share, Turn, Want, Wish, choose, plan,
 };
 use ares_state::{
@@ -105,10 +105,10 @@ use crate::timing::{Calibration, DRAFT_POSITIONS, Phase, RequestReport, Snapshot
 use crate::watch::Watch;
 
 /// The drafters, as the choice of a window and the step record number them:
-/// the lookup in earlier text, which costs nothing to ask, is 0; the model's
+/// the n-gram drafter, which costs nothing to ask, is 0; the model's
 /// drafters ([`Model::drafters`]) follow from 1 in the model's order, each
 /// with the device time its drafts cost.
-const LOOKUP: usize = 0;
+const NGRAM: usize = 0;
 
 /// What a round leaves of the measured acceptance of the model's own drafter
 /// for a sequence that was offered it and did not take it, and of the
@@ -288,7 +288,7 @@ struct Active {
     /// The sequence's place in the corpus of all text. Its tokens enter the
     /// corpus when they are certain: prompt tokens when the step that
     /// computed their rows is back, generated tokens when they are accepted.
-    drafter: LookupDrafter,
+    drafter: NgramDrafter,
     /// How the drafts of each of the model's drafters have done for this
     /// sequence, per position.
     own_acceptance: Vec<Acceptance>,
@@ -311,13 +311,13 @@ struct Active {
     draft: Vec<u32>,
     own: Option<usize>,
     own_probs: Vec<f32>,
-    /// What the lookup proposes for the coming step, with the chance of each
-    /// token (the lookup still learns from what turns out to be right when
+    /// What the n-gram drafter proposes for the coming step, with the chance of each
+    /// token (the n-gram drafter still learns from what turns out to be right when
     /// the model's drafts were taken instead), the chance of each position of
     /// each model drafter's draft for the step (`offered`), and of the one
     /// taken (`own_chances`).
-    lookup: Vec<u32>,
-    lookup_chances: Vec<f64>,
+    ngram: Vec<u32>,
+    ngram_chances: Vec<f64>,
     offered: Vec<Vec<f64>>,
     own_chances: Vec<f64>,
     /// For a window that takes the model's own drafts: the reach its chain
@@ -375,7 +375,7 @@ impl Active {
         model: &dyn Model,
         spec: &ContextSpec,
         context_length: u32,
-        corpus: &mut LookupCorpus,
+        corpus: &mut NgramCorpus,
         picked: &[u32],
     ) {
         for (i, &token) in picked.iter().enumerate() {
@@ -579,7 +579,7 @@ pub(crate) struct Conductor {
     /// share's decision.
     prompt_rows: Vec<u32>,
     /// The text of all sequences, which drafts are looked up in.
-    corpus: LookupCorpus,
+    corpus: NgramCorpus,
     stats: Stats,
     step_no: u64,
     after_idle: bool,
@@ -674,7 +674,7 @@ impl Conductor {
             waiting: Vec::new(),
             by_id: HashMap::with_capacity(slots),
             next_seq: 0,
-            corpus: LookupCorpus::new(config.lookup),
+            corpus: NgramCorpus::new(config.ngram),
             stats: Stats::new(exec.devices(), config.stats_window),
             output: StepOutput {
                 picks: Vec::with_capacity(max_rows as usize),
@@ -1100,7 +1100,7 @@ impl Conductor {
             computed: 0,
             tokens,
             states,
-            drafter: LookupDrafter::new(),
+            drafter: NgramDrafter::new(),
             own_acceptance: (0..self.drafters.len())
                 .map(|_| Acceptance::new(self.config.window_rows as usize, 0.95))
                 .collect(),
@@ -1113,8 +1113,8 @@ impl Conductor {
             counted_waiting: false,
             draft: Vec::with_capacity(self.config.window_rows as usize),
             own: None,
-            lookup: Vec::with_capacity(self.config.window_rows as usize),
-            lookup_chances: Vec::with_capacity(self.config.window_rows as usize),
+            ngram: Vec::with_capacity(self.config.window_rows as usize),
+            ngram_chances: Vec::with_capacity(self.config.window_rows as usize),
             offered: (0..self.drafters.len()).map(|_| Vec::new()).collect(),
             own_chances: Vec::with_capacity(self.config.window_rows as usize),
             own_needs: Vec::with_capacity(self.config.window_rows as usize),
@@ -1275,7 +1275,7 @@ impl Conductor {
         // bring it back from RAM once more.
         a.brought_back = false;
         a.draft.clear();
-        a.lookup.clear();
+        a.ngram.clear();
         a.own = None;
         a.waited_steps = 0;
         // What it needs to come back: the rows the cache does not hold, which
@@ -1485,7 +1485,7 @@ impl Conductor {
     ///
     /// The drafts of the windows are chosen together, by the rate of the
     /// whole step ([`ares_sched::choose`]): each sequence offers what the
-    /// lookup in earlier text proposes (with its confidence in each token) and
+    /// n-gram drafter proposes (with its confidence in each token) and
     /// what the model's own draft block is likely to get right at each
     /// position (measured for this sequence, from what the engine saw where it
     /// has none yet), and the step takes the rows that pay, from the drafter
@@ -1537,8 +1537,8 @@ impl Conductor {
             }
             a.draft.clear();
             a.own = None;
-            a.lookup.clear();
-            a.lookup_chances.clear();
+            a.ngram.clear();
+            a.ngram_chances.clear();
             a.own_chances.clear();
             a.offered.iter_mut().for_each(Vec::clear);
             if drafting && a.draft_allowed {
@@ -1570,21 +1570,21 @@ impl Conductor {
                     None => cap,
                 };
                 if cap > 0 {
-                    // The lookup first: its proposal costs nothing, and it
+                    // The n-gram drafter first: its proposal costs nothing, and it
                     // learns from what is right whether it is taken or not.
-                    a.drafter.draft(&self.corpus, cap, &mut a.lookup, &mut a.lookup_chances);
+                    a.drafter.draft(&self.corpus, cap, &mut a.ngram, &mut a.ngram_chances);
                     // A draft that a rule of the request forbids cannot be
                     // picked: it and the ones after it are not offered.
                     a.sampler.cut_drafts(
                         &a.tokens,
                         a.prompt_len as usize,
-                        &mut a.lookup,
-                        &mut a.lookup_chances,
+                        &mut a.ngram,
+                        &mut a.ngram_chances,
                     );
                     // The model's drafters know no rule: a request with one
                     // asks for them while the rule leaves its next token
                     // free. The round verifies their drafts with their masks
-                    // and corrections, as a lookup's.
+                    // and corrections, as an n-gram draft's.
                     let free = a.sampler.allows_own_drafts(&a.tokens, a.prompt_len as usize);
                     for (d, drafter) in self.drafters.iter().enumerate() {
                         let own = if free { cap.min(drafter.drafts as usize) } else { 0 };
@@ -1602,7 +1602,7 @@ impl Conductor {
                     }
                 }
             }
-            if a.lookup_chances.is_empty() && a.offered.iter().all(Vec::is_empty) {
+            if a.ngram_chances.is_empty() && a.offered.iter().all(Vec::is_empty) {
                 quiet += 1;
                 quiet_cells += a.cells.len().min(span);
             }
@@ -1615,7 +1615,7 @@ impl Conductor {
         if !drafting {
             return;
         }
-        // The offers of every generating sequence that has any: the lookup's,
+        // The offers of every generating sequence that has any: the n-gram drafter's,
         // then each model drafter's under its id.
         let mut offers: Vec<Vec<Offer<'_>>> = Vec::new();
         let mut asking: Vec<usize> = Vec::new();
@@ -1623,11 +1623,11 @@ impl Conductor {
             let Some(a) = a.as_ref().filter(|a| a.generating() && a.draft_allowed) else {
                 continue;
             };
-            if a.lookup_chances.is_empty() && a.offered.iter().all(Vec::is_empty) {
+            if a.ngram_chances.is_empty() && a.offered.iter().all(Vec::is_empty) {
                 continue;
             }
             offers.push(
-                std::iter::once(Offer { drafter: LOOKUP, chances: &a.lookup_chances })
+                std::iter::once(Offer { drafter: NGRAM, chances: &a.ngram_chances })
                     .chain(
                         a.offered
                             .iter()
@@ -1653,7 +1653,7 @@ impl Conductor {
             self.prices.trial_ms(Load { rows: load.rows + quiet, cells: load.cells + quiet_cells })
         };
         let chain = |drafter: usize, links: u32| match drafter {
-            LOOKUP => 0.0,
+            NGRAM => 0.0,
             d => expected_chain_ms(&self.chains[d - 1], &passes[d - 1], links),
         };
         let prices = Prices { step: &step, chain: &chain, spare_rows };
@@ -1682,7 +1682,7 @@ impl Conductor {
             let Choice { drafter, drafts } = choice;
             let drafts = drafts as usize;
             match drafter {
-                Some(LOOKUP) => a.draft.extend_from_slice(&a.lookup[..drafts]),
+                Some(NGRAM) => a.draft.extend_from_slice(&a.ngram[..drafts]),
                 Some(id) => {
                     let d = id - 1;
                     a.own = Some(d);
@@ -2292,7 +2292,7 @@ impl Conductor {
                     // Before the step has a price nothing is known of it.
                     if !drafts_only && part.rows > 1 && self.token_ms > 0.0 {
                         let chances =
-                            if a.own.is_some() { &a.own_chances } else { &a.lookup_chances };
+                            if a.own.is_some() { &a.own_chances } else { &a.ngram_chances };
                         self.worth.resize(row_index as usize + 1, 0.0);
                         let mut reach = 1.0;
                         for k in 0..part.rows as usize - 1 {
@@ -2406,7 +2406,7 @@ impl Conductor {
                     // Draft `i` is accepted when it equals what the model
                     // picked after the row before it, and only if all the
                     // drafts before it were.
-                    // Every draft of the window is known: a lookup's, and of
+                    // Every draft of the window is known: an n-gram draft's, and of
                     // the model's own those its chain made that the round
                     // took. Their rows carry the masks the drafts before them
                     // make, so every pick is the request's.
@@ -2466,13 +2466,13 @@ impl Conductor {
                             counters.drafts_accepted_at[source][at] += u64::from(i < right);
                         }
                     }
-                    // A proposal of the lookup that was not taken (the model's
+                    // A proposal of the n-gram drafter that was not taken (the model's
                     // drafts were, or none) learns from the tokens that are now
                     // known: the first of them is known in every window.
-                    if (a.own.is_some() || drafts == 0) && !a.lookup.is_empty() {
-                        let known = a.lookup.len().min(accepted + 1);
+                    if (a.own.is_some() || drafts == 0) && !a.ngram.is_empty() {
+                        let known = a.ngram.len().min(accepted + 1);
                         let right =
-                            (0..known).take_while(|&i| picks[i].token == a.lookup[i]).count();
+                            (0..known).take_while(|&i| picks[i].token == a.ngram[i]).count();
                         a.drafter.observe(&mut self.corpus, known, right);
                     }
                     self.scratch_tokens.clear();

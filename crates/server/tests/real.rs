@@ -1183,7 +1183,7 @@ fn a_request_can_switch_drafts_off_and_the_reply_has_a_hash_of_its_tokens() {
     let Some(model) = draft_model() else { return };
     let server = Server::start(&model, port(9), &["--parallel", "1", "--precision", "fast"]);
     let (_, _, drafted) = reply_tokens(&server, ENGLISH, true);
-    assert!(drafted.unwrap_or(0) > 0, "the draft block and the lookup draft: {drafted:?}");
+    assert!(drafted.unwrap_or(0) > 0, "the draft block and the n-gram drafter: {drafted:?}");
     let (_, _, none) = reply_tokens(&server, ENGLISH, false);
     assert_eq!(none, Some(0), "no draft row for a request that asks for none");
     // The hash is a function of the tokens.
@@ -1318,7 +1318,7 @@ fn with_the_dflash_drafter_the_reply_with_drafts_is_the_reply_without() {
 }
 
 /// A server started with no drafters does not speculate, whatever the text
-/// repeats: the lookup in earlier text is no drafter on its own.
+/// repeats: the n-gram drafter is no drafter on its own.
 #[test]
 fn a_server_with_no_drafters_never_drafts_and_one_with_the_draft_block_does() {
     let Some(model) = draft_model() else { return };
@@ -1345,7 +1345,7 @@ fn a_server_with_no_drafters_never_drafts_and_one_with_the_draft_block_does() {
     server.stop();
 }
 
-/// A model with no draft block has no drafter, and the lookup does not run
+/// A model with no draft block has no drafter, and the n-gram drafter does not run
 /// without one.
 #[test]
 fn a_model_with_no_draft_block_is_served_with_no_speculation_at_all() {
@@ -1573,7 +1573,7 @@ fn flash_next_drafts_with_its_draft_block() {
     );
     let text = answer(&ask(GERMAN, true));
     assert!(mentions(&text, GERMAN_WORDS), "a German answer about light: {text:?}");
-    // The same question again: the lookup in earlier text has the answer.
+    // The same question again: the n-gram drafter has the answer.
     let again = answer(&ask(HASH_TABLE, true));
     assert!(again.starts_with("A hash table stores data"), "the second time: {again:?}");
     let (proposed, accepted) =

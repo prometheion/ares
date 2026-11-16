@@ -1,4 +1,4 @@
-//! A randomised check of the lookup drafter against a search of all text.
+//! A randomised check of the n-gram drafter against a search of all text.
 //!
 //! Several sequences write tokens from a small alphabet in a random
 //! interleaving, so that everything repeats and most contexts went on in
@@ -14,7 +14,7 @@
 //! reported match, memory stays within its bound, and text that was written
 //! within one automaton's capacity is still found.
 
-use ares_sched::{LookupConfig, LookupCorpus, LookupDrafter, LookupMatch};
+use ares_sched::{NgramConfig, NgramCorpus, NgramDrafter, NgramMatch};
 
 struct Rng(u64);
 
@@ -46,7 +46,7 @@ fn search(
     own: usize,
     min_match: usize,
     max: usize,
-) -> Option<(LookupMatch, Vec<u32>)> {
+) -> Option<(NgramMatch, Vec<u32>)> {
     let end = &texts[own].tokens;
     // Every place that went on, with the length of its match.
     let mut places: Vec<(usize, usize, usize)> = Vec::new();
@@ -68,7 +68,7 @@ fn search(
         .filter(|(_, j, e)| texts[*j].tokens[e + 1] == first && e + 2 < texts[*j].tokens.len())
         .count();
     let draft = texts[j].tokens[e + 1..].iter().take(max).copied().collect();
-    let found = LookupMatch {
+    let found = NgramMatch {
         len: len as u32,
         occurrences: places.len() as u32,
         agreeing: agreeing.min(places.len()) as u32,
@@ -84,15 +84,15 @@ fn the_automaton_finds_what_a_search_of_all_text_finds() {
         [(1u64, 2u64, 3u32), (2, 3, 2), (3, 4, 3), (4, 6, 1), (5, 3, 5)]
     {
         let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15));
-        let config = LookupConfig { max_bytes: 64 << 20, min_match, max_hops: u32::MAX };
-        let mut corpus = LookupCorpus::new(config);
+        let config = NgramConfig { max_bytes: 64 << 20, min_match, max_hops: u32::MAX };
+        let mut corpus = NgramCorpus::new(config);
         let mut texts: Vec<Text> = Vec::new();
-        let mut drafters: Vec<LookupDrafter> = Vec::new();
+        let mut drafters: Vec<NgramDrafter> = Vec::new();
         let mut clock = 0u64;
         for _ in 0..2500 {
             // A new sequence now and then; otherwise one of them writes.
             if drafters.is_empty() || (drafters.len() < 6 && rng.below(60) == 0) {
-                drafters.push(LookupDrafter::new());
+                drafters.push(NgramDrafter::new());
                 texts.push(Text::default());
             }
             let i = rng.below(drafters.len() as u64) as usize;
@@ -134,8 +134,8 @@ fn the_automaton_finds_what_a_search_of_all_text_finds() {
 
 #[test]
 fn drafts_are_real_text_with_little_memory_a_capped_walk_and_rollbacks() {
-    let config = LookupConfig { max_bytes: 192 << 10, min_match: 3, max_hops: 6 };
-    let mut corpus = LookupCorpus::new(config);
+    let config = NgramConfig { max_bytes: 192 << 10, min_match: 3, max_hops: 6 };
+    let mut corpus = NgramCorpus::new(config);
     let per_generation = corpus.tokens_per_generation();
     assert!(corpus.bytes() <= config.max_bytes);
     let mut rng = Rng(0xfeed_f00d);
@@ -145,12 +145,12 @@ fn drafts_are_real_text_with_little_memory_a_capped_walk_and_rollbacks() {
     let mut written: Vec<Vec<u32>> = Vec::new();
     let mut texts: Vec<Vec<u32>> = Vec::new();
     let mut piece: Vec<usize> = Vec::new();
-    let mut drafters: Vec<LookupDrafter> = Vec::new();
+    let mut drafters: Vec<NgramDrafter> = Vec::new();
     let (mut drafts, mut found_recent, mut asked_recent) = (0u64, 0u64, 0u64);
     let mut pushed = 0usize;
     while pushed < 12 * per_generation {
         if drafters.len() < 5 && (drafters.is_empty() || rng.below(200) == 0) {
-            drafters.push(LookupDrafter::new());
+            drafters.push(NgramDrafter::new());
             texts.push(Vec::new());
             piece.push(written.len());
             written.push(Vec::new());
@@ -215,13 +215,13 @@ fn drafts_are_real_text_with_little_memory_a_capped_walk_and_rollbacks() {
     // rest of an automaton, and the passage is found again.
     for round in 0..20u32 {
         let passage: Vec<u32> = (0..24).map(|i| 1_000_000 + round * 100 + i).collect();
-        let mut writer = LookupDrafter::new();
+        let mut writer = NgramDrafter::new();
         writer.extend(&mut corpus, &passage);
-        let mut other = LookupDrafter::new();
+        let mut other = NgramDrafter::new();
         for _ in 0..per_generation - 64 {
             other.push(&mut corpus, rng.below(40) as u32);
         }
-        let mut reader = LookupDrafter::new();
+        let mut reader = NgramDrafter::new();
         reader.extend(&mut corpus, &passage[..6]);
         let (mut tokens, mut confidence) = (Vec::new(), Vec::new());
         asked_recent += 1;
@@ -239,14 +239,14 @@ fn text_with_one_place_to_continue_from_is_drafted_from_the_third_token_on() {
     // drafter must propose the continuation at every point of the second
     // pass, from the third token on, which is the shortest match here.
     let passage: Vec<u32> = (0..200).map(|i| (i * 7919) % 1000 + 10).collect();
-    let config = LookupConfig { min_match: 3, ..LookupConfig::default() };
-    let mut corpus = LookupCorpus::new(config);
-    let mut lookup = LookupDrafter::new();
-    lookup.extend(&mut corpus, &passage);
+    let config = NgramConfig { min_match: 3, ..NgramConfig::default() };
+    let mut corpus = NgramCorpus::new(config);
+    let mut drafter = NgramDrafter::new();
+    drafter.extend(&mut corpus, &passage);
     let (mut tokens, mut confidence) = (Vec::new(), Vec::new());
     for (i, token) in passage.iter().enumerate().take(150) {
-        lookup.push(&mut corpus, *token);
-        lookup.draft(&corpus, 8, &mut tokens, &mut confidence);
+        drafter.push(&mut corpus, *token);
+        drafter.draft(&corpus, 8, &mut tokens, &mut confidence);
         if i >= 2 {
             assert_eq!(tokens, passage[i + 1..i + 9], "after {} tokens of the second pass", i + 1);
         } else {

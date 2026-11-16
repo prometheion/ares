@@ -37,8 +37,8 @@ OPTIONS
   --rounds R            requests per client with --load (default 3)
   --tokens N            tokens per request with --load (default 128)
   --prompt N            prompt characters with --load (default 24)
-  --speculation on|off  drafts: the model's own draft block and the lookup in earlier
-                        text (default off)
+  --speculation on|off  drafts: the model's own draft block and the n-gram drafter
+                        (default off)
 ";
 
 struct Options {

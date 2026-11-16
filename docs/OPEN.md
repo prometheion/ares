@@ -60,7 +60,7 @@ between cards stay with the model. Today the two models share almost nothing ins
       `--drafters <file>` for a separate MTP or DFlash file); the draft vocabulary as one
       head view for every drafter that projects to the vocabulary, on every model. Brings
       Flash-Next's draft vocabulary and picks on the card, the 27B's drafts under a layer split.
-- [x] 7. Drafters as kinds of the runtime (lookup, draft block, DFlash): `Model::drafters`, the
+- [x] 7. Drafters as kinds of the runtime (ngram, draft block, DFlash): `Model::drafters`, the
       drafter's id in word 6 of a segment, a price curve, acceptance and confidence per drafter.
 - [x] 8. DFlash2 chains on both models: each model gives only its tap (the 27B the residual `x`,
       Flash-Next the mean of its four streams), its embedding rows and its draft head; the loader

@@ -117,7 +117,7 @@ pub struct LoadOptions {
     /// The model drafters that take part. `None`: every one that is
     /// available (the model's own draft block, if the file has one). An empty
     /// list: none, and with none the engine does not speculate at all. The
-    /// lookup in earlier text takes part with them and never alone.
+    /// n-gram drafter takes part with them and never alone.
     pub drafters: Option<Vec<Drafter>>,
     /// The most rows of one sequence's window ([`DEFAULT_WINDOW`]).
     pub window: Option<u32>,

@@ -1,8 +1,8 @@
-//! Measures the lookup drafter on real text, against a lookup by the last
+//! Measures the n-gram drafter on real text, against a match of the last
 //! three tokens of one request (what the engine had before it).
 //!
 //! ```sh
-//! cargo run --release -p ares-sched --example lookup_bench -- <model.gguf> [repository]
+//! cargo run --release -p ares-sched --example ngram_bench -- <model.gguf> [repository]
 //! ```
 //!
 //! The text is this repository's own: its documentation (English), its Rust
@@ -16,7 +16,7 @@
 //! Three ways to replay, per kind of text:
 //!
 //! - **plain**: every file is a request that generates the file from an
-//!   empty prompt. A lookup drafter can only help where the text repeats
+//!   empty prompt. The n-gram drafter can only help where the text repeats
 //!   itself, so this is its floor.
 //! - **edit**: the file is the prompt, and the request writes it again with a
 //!   few tokens changed every 150. This is what the drafter is for.
@@ -29,7 +29,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use ares_gguf::Gguf;
-use ares_sched::{Load, LookupConfig, LookupCorpus, LookupDrafter, Offer, Prices, Wish, choose};
+use ares_sched::{Load, NgramConfig, NgramCorpus, NgramDrafter, Offer, Prices, Wish, choose};
 use ares_tokenizer::{EncodeOptions, Tokenizer};
 
 const MAX_DRAFT: usize = 16;
@@ -77,9 +77,9 @@ const HEADER: &str = "| drafter | proposals per token | proposed length | accept
 tokens from drafts | wasted rows per token | tokens per step | tokens/s at 33 + 1.1 ms |\n\
 | --- | --- | --- | --- | --- | --- | --- | --- |";
 
-/// The baseline: a lookup by the last `n` tokens of one sequence, continuing
+/// The baseline: a match of the last `n` tokens of one sequence, continuing
 /// the most recent earlier occurrence of them.
-struct NgramDrafter {
+struct TailMatch {
     n: usize,
     tokens: Vec<u32>,
     /// Hash of a run of `n` tokens to the index of its last token, for the
@@ -87,7 +87,7 @@ struct NgramDrafter {
     last_end: HashMap<u64, u32>,
 }
 
-impl NgramDrafter {
+impl TailMatch {
     fn new(n: usize) -> Self {
         Self { n, tokens: Vec::new(), last_end: HashMap::new() }
     }
@@ -137,9 +137,9 @@ fn accepted(draft: &[u32], rest: &[u32]) -> usize {
     draft.iter().zip(rest).take_while(|(a, b)| a == b).count()
 }
 
-/// The request writes `output` after `prompt`, drafted by the n-gram lookup.
-fn replay_ngram(prompt: &[u32], output: &[u32], tally: &mut Tally) {
-    let mut drafter = NgramDrafter::new(3);
+/// The request writes `output` after `prompt`, drafted by a match of the last `n` tokens.
+fn replay_tail(prompt: &[u32], output: &[u32], tally: &mut Tally) {
+    let mut drafter = TailMatch::new(3);
     drafter.extend(prompt);
     let mut at = 0;
     while at < output.len() {
@@ -157,17 +157,17 @@ fn replay_ngram(prompt: &[u32], output: &[u32], tally: &mut Tally) {
 /// Acceptance by table cell: tokens that were reached, and of them accepted.
 type Cells = [[u64; 2]; 40];
 
-/// The same with the lookup drafter. `by_confidence` cuts every draft to the
+/// The same with the n-gram drafter. `by_confidence` cuts every draft to the
 /// length that [`choose`] picks from the drafter's confidences.
-fn replay_lookup(
-    corpus: &mut LookupCorpus,
+fn replay_ngram(
+    corpus: &mut NgramCorpus,
     prompt: &[u32],
     output: &[u32],
     by_confidence: bool,
     tally: &mut Tally,
     cells: &mut Cells,
 ) {
-    let mut drafter = LookupDrafter::new();
+    let mut drafter = NgramDrafter::new();
     drafter.extend(corpus, prompt);
     let (mut draft, mut confidence) = (Vec::new(), Vec::new());
     let mut at = 0;
@@ -244,14 +244,14 @@ fn tokenize(tokenizer: &Tokenizer, paths: &[PathBuf]) -> Vec<Vec<u32>> {
         .collect()
 }
 
-/// The default settings, or `LOOKUP_MIN_MATCH` and `LOOKUP_MAX_HOPS` from the
+/// The default settings, or `NGRAM_MIN_MATCH` and `NGRAM_MAX_HOPS` from the
 /// environment, to see what they are worth.
-fn config() -> LookupConfig {
+fn config() -> NgramConfig {
     let from_env = |name: &str| std::env::var(name).ok().and_then(|v| v.parse::<u32>().ok());
-    let default = LookupConfig::default();
-    LookupConfig {
-        min_match: from_env("LOOKUP_MIN_MATCH").unwrap_or(default.min_match),
-        max_hops: from_env("LOOKUP_MAX_HOPS").unwrap_or(default.max_hops),
+    let default = NgramConfig::default();
+    NgramConfig {
+        min_match: from_env("NGRAM_MIN_MATCH").unwrap_or(default.min_match),
+        max_hops: from_env("NGRAM_MAX_HOPS").unwrap_or(default.max_hops),
         ..default
     }
 }
@@ -265,11 +265,11 @@ fn measure(kind: &str, texts: &[Vec<u32>], cells: &mut Cells) {
         ("edit", "the file is the prompt and is written again with edits"),
         ("again", "an earlier request wrote the file; a new one writes it with edits"),
     ] {
-        let (mut ngram, mut own, mut shared, mut cut) =
+        let (mut tail, mut own, mut shared, mut cut) =
             (Tally::default(), Tally::default(), Tally::default(), Tally::default());
         // One corpus for all requests of a run, as the engine has it.
-        let mut corpus = LookupCorpus::new(config);
-        let mut corpus_cut = LookupCorpus::new(config);
+        let mut corpus = NgramCorpus::new(config);
+        let mut corpus_cut = NgramCorpus::new(config);
         for text in texts {
             let (prompt, output): (&[u32], Vec<u32>) = match replay {
                 "plain" => (&[], text.clone()),
@@ -278,22 +278,22 @@ fn measure(kind: &str, texts: &[Vec<u32>], cells: &mut Cells) {
             };
             if replay == "again" {
                 // The earlier request.
-                LookupDrafter::new().extend(&mut corpus, text);
-                LookupDrafter::new().extend(&mut corpus_cut, text);
+                NgramDrafter::new().extend(&mut corpus, text);
+                NgramDrafter::new().extend(&mut corpus_cut, text);
             }
-            replay_ngram(prompt, &output, &mut ngram);
+            replay_tail(prompt, &output, &mut tail);
             // A corpus of its own per request: what the automaton gains over
-            // the n-gram lookup without any sharing.
-            let mut alone = LookupCorpus::new(config);
-            replay_lookup(&mut alone, prompt, &output, false, &mut own, &mut [[0; 2]; 40]);
-            replay_lookup(&mut corpus, prompt, &output, false, &mut shared, cells);
-            replay_lookup(&mut corpus_cut, prompt, &output, true, &mut cut, &mut [[0; 2]; 40]);
+            // a match of the last tokens without any sharing.
+            let mut alone = NgramCorpus::new(config);
+            replay_ngram(&mut alone, prompt, &output, false, &mut own, &mut [[0; 2]; 40]);
+            replay_ngram(&mut corpus, prompt, &output, false, &mut shared, cells);
+            replay_ngram(&mut corpus_cut, prompt, &output, true, &mut cut, &mut [[0; 2]; 40]);
         }
         println!("**{replay}** ({describe})\n\n{HEADER}");
-        println!("{}", ngram.row("n-gram (3), per request"));
-        println!("{}", own.row("lookup, corpus per request"));
-        println!("{}", shared.row("lookup, shared corpus"));
-        println!("{}", cut.row("lookup, shared, length by confidence"));
+        println!("{}", tail.row("last 3 tokens, per request"));
+        println!("{}", own.row("ngram, corpus per request"));
+        println!("{}", shared.row("ngram, shared corpus"));
+        println!("{}", cut.row("ngram, shared, length by confidence"));
         let none = 1000.0 / (BASE_MS + PER_ROW_MS);
         println!("\nWithout drafts: {none:.1} tokens/s.\n");
     }
@@ -308,7 +308,7 @@ fn timing(texts: &[Vec<u32>]) {
         let start = Instant::now();
         let mut drafters = Vec::new();
         for text in texts {
-            let mut drafter = NgramDrafter::new(3);
+            let mut drafter = TailMatch::new(3);
             drafter.extend(text);
             drafters.push(drafter);
         }
@@ -317,7 +317,7 @@ fn timing(texts: &[Vec<u32>]) {
         let start = Instant::now();
         let mut hits = 0usize;
         for text in texts {
-            let mut drafter = NgramDrafter::new(3);
+            let mut drafter = TailMatch::new(3);
             for token in text {
                 drafter.push(*token);
                 hits += drafter.draft(MAX_DRAFT).len();
@@ -325,18 +325,18 @@ fn timing(texts: &[Vec<u32>]) {
         }
         best[1] = best[1].min(start.elapsed().as_nanos() as f64 / total as f64 - best[0]);
 
-        let mut corpus = LookupCorpus::new(config());
+        let mut corpus = NgramCorpus::new(config());
         let start = Instant::now();
         for text in texts {
-            LookupDrafter::new().extend(&mut corpus, text);
+            NgramDrafter::new().extend(&mut corpus, text);
         }
         best[2] = best[2].min(start.elapsed().as_nanos() as f64 / total as f64);
 
-        let mut corpus = LookupCorpus::new(config());
+        let mut corpus = NgramCorpus::new(config());
         let (mut draft, mut confidence) = (Vec::new(), Vec::new());
         let start = Instant::now();
         for text in texts {
-            let mut drafter = LookupDrafter::new();
+            let mut drafter = NgramDrafter::new();
             for token in text {
                 drafter.push(&mut corpus, *token);
                 hits += drafter.draft(&corpus, MAX_DRAFT, &mut draft, &mut confidence);
@@ -347,9 +347,9 @@ fn timing(texts: &[Vec<u32>]) {
     }
     println!("\n### Cost on the host, {total} tokens, best of 5\n");
     println!("| drafter | ns per token read | ns per draft asked |\n| --- | --- | --- |");
-    println!("| n-gram (3) | {:.0} | {:.0} |", best[0], best[1]);
-    println!("| lookup | {:.0} | {:.0} |", best[2], best[3]);
-    let corpus = LookupCorpus::new(config());
+    println!("| last 3 tokens | {:.0} | {:.0} |", best[0], best[1]);
+    println!("| ngram | {:.0} | {:.0} |", best[2], best[3]);
+    let corpus = NgramCorpus::new(config());
     println!(
         "\nA corpus of {} MiB holds {} to {} tokens.",
         corpus.bytes() >> 20,
@@ -360,7 +360,7 @@ fn timing(texts: &[Vec<u32>]) {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
-    let model = args.next().ok_or("usage: lookup_bench <model.gguf> [repository]")?;
+    let model = args.next().ok_or("usage: ngram_bench <model.gguf> [repository]")?;
     let root = args
         .next()
         .map_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."), PathBuf::from);

@@ -9,7 +9,7 @@ repository.workspace = true
 
 [dependencies]
 
-# The measurement of the lookup drafter on real text (examples/lookup_bench.rs)
+# The measurement of the n-gram drafter on real text (examples/ngram_bench.rs)
 # tokenizes with a model's vocabulary.
 [dev-dependencies]
 ares-gguf.workspace = true

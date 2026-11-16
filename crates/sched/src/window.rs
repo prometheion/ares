@@ -8,7 +8,7 @@
 //! many sequences they belong to. Nothing in the rule is a number: the price
 //! of a step by its rows is the table of [`PriceTable`](crate::PriceTable), the
 //! chances are the acceptance measured per drafter, position and sequence
-//! ([`Acceptance`](crate::Acceptance)), the lookup's chances are its own
+//! ([`Acceptance`](crate::Acceptance)), the n-gram drafter's chances are its own
 //! confidence in each token.
 //!
 //! The choice is made for the whole step together, because it is a choice of
@@ -35,7 +35,7 @@ use crate::timing::Load;
 #[derive(Clone, Copy, Debug)]
 pub struct Offer<'a> {
     /// The drafter, as the caller numbers them. A drafter that costs nothing
-    /// to ask (the lookup) has a chain that costs nothing, see
+    /// to ask (the n-gram drafter) has a chain that costs nothing, see
     /// [`Prices::chain`].
     pub drafter: usize,
     pub chances: &'a [f64],
@@ -337,7 +337,7 @@ mod tests {
         }
     }
 
-    const LOOKUP: usize = 0;
+    const NGRAM: usize = 0;
     const CHAIN: usize = 1;
 
     fn free(_: usize, _: u32) -> f64 {
@@ -349,13 +349,13 @@ mod tests {
         // 25 ms for the weights, 0.15 ms a row, 6 ms for a second launch.
         let price = step(25.0, 0.15, 6.0);
         let sure = [0.97; 16];
-        let offers = [Offer { drafter: LOOKUP, chances: &sure }];
+        let offers = [Offer { drafter: NGRAM, chances: &sure }];
         let wishes = [Wish { reads: 1000, offers: &offers }];
         let prices = Prices { step: &price, chain: &free, spare_rows: 15 };
         let pick = choose(&wishes, &prices);
         // A ninth row costs a second launch: 7 drafts fill the first, and the
         // next 8 are worth 0.97^8 and more, which pays 6 ms.
-        assert_eq!(pick[0].drafter, Some(LOOKUP));
+        assert_eq!(pick[0].drafter, Some(NGRAM));
         assert_eq!(pick[0].drafts, 15, "{pick:?}");
 
         // Rows that cost a whole millisecond each are worth less: drafts that are
@@ -363,7 +363,7 @@ mod tests {
         let dear = step(25.0, 1.1, 6.0);
         let prices = Prices { step: &dear, chain: &free, spare_rows: 15 };
         let half = [0.55; 16];
-        let offers = [Offer { drafter: LOOKUP, chances: &half }];
+        let offers = [Offer { drafter: NGRAM, chances: &half }];
         let wishes = [Wish { reads: 1000, offers: &offers }];
         assert_eq!(choose(&wishes, &prices)[0].drafts, 4);
 
@@ -372,7 +372,7 @@ mod tests {
         let cliff = step(25.0, 0.15, 14.0);
         let prices = Prices { step: &cliff, chain: &free, spare_rows: 15 };
         let strong = [0.92; 16];
-        let offers = [Offer { drafter: LOOKUP, chances: &strong }];
+        let offers = [Offer { drafter: NGRAM, chances: &strong }];
         let wishes = [Wish { reads: 1000, offers: &offers }];
         assert_eq!(choose(&wishes, &prices)[0].drafts, 7);
     }
@@ -415,12 +415,12 @@ mod tests {
         let copy = [0.95; 8];
         let guess = [0.55, 0.4, 0.3];
         let a =
-            [Offer { drafter: LOOKUP, chances: &copy }, Offer { drafter: CHAIN, chances: &guess }];
+            [Offer { drafter: NGRAM, chances: &copy }, Offer { drafter: CHAIN, chances: &guess }];
         let b = [Offer { drafter: CHAIN, chances: &guess }];
         let wishes = [Wish { reads: 100, offers: &a }, Wish { reads: 100, offers: &b }];
         let prices = Prices { step: &price, chain: &chain, spare_rows: 12 };
         let pick = choose(&wishes, &prices);
-        assert_eq!(pick[0], Choice { drafter: Some(LOOKUP), drafts: 8 }, "{pick:?}");
+        assert_eq!(pick[0], Choice { drafter: Some(NGRAM), drafts: 8 }, "{pick:?}");
         assert_eq!(pick[1], Choice { drafter: Some(CHAIN), drafts: 1 }, "{pick:?}");
     }
 
@@ -429,8 +429,8 @@ mod tests {
         let price = step(25.0, 0.1, 0.0);
         let strong = [0.9, 0.9, 0.9, 0.9];
         let weak = [0.6, 0.6, 0.6, 0.6];
-        let a = [Offer { drafter: LOOKUP, chances: &weak }];
-        let b = [Offer { drafter: LOOKUP, chances: &strong }];
+        let a = [Offer { drafter: NGRAM, chances: &weak }];
+        let b = [Offer { drafter: NGRAM, chances: &strong }];
         let wishes = [Wish { reads: 10, offers: &a }, Wish { reads: 10, offers: &b }];
         let prices = Prices { step: &price, chain: &free, spare_rows: 5 };
         let pick = choose(&wishes, &prices);
@@ -446,11 +446,10 @@ mod tests {
         let none = |_: Load| None;
         let a = [0.9, 0.9, 0.9];
         let b = [0.2, 0.2];
-        let offers =
-            [Offer { drafter: CHAIN, chances: &b }, Offer { drafter: LOOKUP, chances: &a }];
+        let offers = [Offer { drafter: CHAIN, chances: &b }, Offer { drafter: NGRAM, chances: &a }];
         let wishes = [Wish { reads: 10, offers: &offers }];
         let prices = Prices { step: &none, chain: &free, spare_rows: 10 };
-        assert_eq!(choose(&wishes, &prices), [Choice { drafter: Some(LOOKUP), drafts: 3 }]);
+        assert_eq!(choose(&wishes, &prices), [Choice { drafter: Some(NGRAM), drafts: 3 }]);
         let prices = Prices { spare_rows: 1, ..prices };
         assert_eq!(choose(&wishes, &prices)[0].drafts, 1);
     }

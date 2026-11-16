@@ -95,7 +95,7 @@ pub(crate) fn load(
         ));
     }
     // The model's draft block is a file of its own, which --drafters names:
-    // the model file carries none. Without it nothing speculates (the lookup
+    // the model file carries none. Without it nothing speculates (the n-gram drafter
     // in earlier text takes part only next to a model drafter), no window is
     // reserved, and the options of drafting mean nothing.
     // A DFlash drafter (a file of architecture `dflash`) may come with it.
@@ -356,7 +356,7 @@ pub(crate) fn load(
             (block, dflash) => format!(
                 "{}{}{} draft{}, on the device that holds the output head: windows of up to \
                  {window} rows a sequence, {MAX_ROWS} rows a step, as long as they pay; the \
-                 lookup in earlier text joins",
+                 n-gram drafter joins",
                 block
                     .as_ref()
                     .map(|(path, _)| format!("the model's draft block ({})", path.display()))
