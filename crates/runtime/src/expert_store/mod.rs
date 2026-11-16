@@ -472,6 +472,9 @@ pub struct ExpertStore<D: SlotDevice> {
     pieces: Pieces,
     /// The running step's windows that verify drafts, and the rows left.
     windows: windows::Windows,
+    /// What a read from the file that a step waits for takes, in
+    /// milliseconds: a mean that follows the reads.
+    read_ms: f64,
     stats: StoreStats,
 }
 
@@ -684,6 +687,7 @@ impl<D: SlotDevice> ExpertStore<D> {
             transit: Transit::new(transit),
             pieces,
             windows: windows::Windows::default(),
+            read_ms: 3.0,
             stats: StoreStats::default(),
             block,
             config,
@@ -785,19 +789,23 @@ impl<D: SlotDevice> ExpertStore<D> {
         self.filling = false;
         self.in_step = true;
         self.phase.fill(Phase::Ahead);
-        self.windows.set(&[]);
+        self.windows.set(&[], None);
         self.cpu_begin_step();
         self.transit_begin_step();
     }
 
     /// The windows of the step just begun that verify drafts, as (first row,
-    /// rows). A row past the first of a window never waits for the file: an
-    /// expert in no tier but the file that only such rows pick is not read
-    /// for them, and they and the rows after them in their window are left
-    /// without it ([`ExpertStore::rows_left`]). Only a store with a CPU half
-    /// leaves anything (the CPU claims the expert and adds nothing).
-    pub fn set_windows(&mut self, windows: &[(u32, u32)]) {
-        self.windows.set(windows);
+    /// rows), and what each row of the step is worth in milliseconds
+    /// (`worth[row]`, the step record's row worth). A row past the first of a
+    /// window waits for the file only while it is worth the wait: an expert
+    /// in no tier but the file that only such rows pick is read for them while
+    /// the rows it would leave behind are worth more than the read costs the
+    /// layer (`windows.rs`); otherwise they and the rows after them in their
+    /// window are left without it ([`ExpertStore::rows_left`]). Without
+    /// `worth` no row is left. Only a store with a CPU half leaves anything
+    /// (the CPU claims the expert and adds nothing).
+    pub fn set_windows(&mut self, windows: &[(u32, u32)], worth: Option<&[f32]>) {
+        self.windows.set(windows, worth);
     }
 
     /// The rows of the running or last step, a bit each, whose results are
@@ -1060,7 +1068,9 @@ impl<D: SlotDevice> ExpertStore<D> {
             } else {
                 self.ram.sets[op.layer].commit(&op.swap);
                 if op.demand {
-                    self.stats.demand_read_ms += op.since.elapsed().as_secs_f64() * 1e3;
+                    let ms = op.since.elapsed().as_secs_f64() * 1e3;
+                    self.stats.demand_read_ms += ms;
+                    self.read_ms += 0.1 * (ms - self.read_ms);
                 }
             }
         }

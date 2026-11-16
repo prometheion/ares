@@ -632,6 +632,13 @@ impl DraftBlock {
         }));
     }
 
+    /// The links the chain of `slot` made in the last step that drafted, until
+    /// the model's step that verifies them is kept; 0 for a slot that did not
+    /// draft.
+    pub(super) fn made(&self, slot: u32) -> u32 {
+        self.made.iter().find(|(at, _)| *at == slot).map_or(0, |(_, made)| *made)
+    }
+
     /// The probability the block gave each draft of the step, in the order
     /// of the drafts; NaN for a link that was not made.
     pub(super) fn probs(&self) -> &[f32] {

@@ -398,6 +398,15 @@ impl<D: SlotDevice> ExpertStore<D> {
         let mut candidates: Vec<(usize, Miss, Source)> = Vec::new();
         // The misses left without a read or a job: claimed, they add nothing.
         let mut left: Vec<usize> = Vec::new();
+        // Whether the layer waits for the file anyway: a read that a row which
+        // must run needs. A read for draft rows next to it costs nothing more.
+        let mut layer_waits = groups.iter().any(|group| {
+            let (vram, ram) = (&self.vram.sets[layer], &self.ram.sets[layer]);
+            !vram.contains(group.expert)
+                && !vram.is_loading(group.expert)
+                && !ram.contains(group.expert)
+                && !self.windows.may_leave(group.rows)
+        });
         for (g, group) in groups.iter().enumerate() {
             let expert = group.expert;
             self.stats.picks += 1;
@@ -432,12 +441,21 @@ impl<D: SlotDevice> ExpertStore<D> {
                 self.stats.miss_from_disk += 1;
                 Source::Disk
             };
-            // A row that verifies a draft does not wait for the file
-            // (`windows.rs`), and a row left already needs nothing.
+            // A row that verifies a draft waits for the file only while it is
+            // worth the wait (`windows.rs`), and a row left already needs
+            // nothing.
             let from_file = source == Source::Disk || source == Source::OnItsWay;
-            if (from_file && self.windows.may_leave(group.rows))
-                || self.windows.all_left(group.rows)
-            {
+            let mut leave = self.windows.all_left(group.rows);
+            if !leave && from_file && self.windows.may_leave(group.rows) {
+                let cost = if layer_waits { 0.0 } else { self.read_ms as f32 };
+                if self.windows.stake(group.rows) > cost {
+                    self.windows.charge(group.rows, cost);
+                    layer_waits = true;
+                } else {
+                    leave = true;
+                }
+            }
+            if leave {
                 if from_file {
                     self.stats.left_reads += 1;
                     // The token of a left row is likely the next step's

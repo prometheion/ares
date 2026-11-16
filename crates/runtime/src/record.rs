@@ -17,7 +17,7 @@
 //! | section | words | content |
 //! | --- | --- | --- |
 //! | kernel header | 8 | rows, segments, wanted rows, 0, byte offsets of segments, tokens, positions, wanted rows |
-//! | runtime header | 28 | magic, step number, counts of runs, updates, entries, commits, copies, corrections, masks and freed pages, byte offsets of the sections below, the longest segment, the longest commit, the words of a mask, the record's flags (1: drafts only) |
+//! | runtime header | 32 | magic, step number, counts of runs, updates, entries, commits, copies, corrections, masks and freed pages, byte offsets of the sections below, the longest segment, the longest commit, the words of a mask, the record's flags (1: drafts only), the rows of the row worth and its offset, 2 unused |
 //! | segments | 8 each | first row, rows, sequence slot, accepted rows, first position, flags (1: direct), 0, 0 |
 //! | tokens | 1 per row | |
 //! | positions | 4 per row | time, height, width, extra: `(p, p, p, 0)` for text |
@@ -34,6 +34,7 @@
 //! | page copies | 3 each | page to copy from, page to copy to, cells to copy |
 //! | freed pages | 1 each | pages the pool freed since the last record |
 //! | draft bars | 16 + 1 each | for the windows whose drafts the model makes: the chance of a draft by its probability (16 ranges, `f32`), then for every draft row of those windows, in the order of the segments, the reach its chain needs for that link to be made (`f32`) |
+//! | row worth | 1 per row | what each row is worth in milliseconds (`f32`): for a row of a window past its first, the chance that the window's drafts up to the row's own are all accepted times the milliseconds a token costs; 0 for every other row |
 //!
 //! A segment is **direct** when all of its rows are certain to be accepted (a
 //! slice of a prompt, a generation row without drafts): the recurrent kernels
@@ -110,6 +111,13 @@
 //! ([`StepOutput::drafts`](crate::StepOutput)). A record without the section,
 //! and a drafter that cannot stop, make every link.
 //!
+//! **Row worth** says what each draft row of a step is worth, for a model that
+//! may leave such a row without something it would have to wait for (an expert
+//! in no tier but the file): row `k` of a window counts only when the drafts
+//! before it were right, so leaving it loses the tokens of row `k` and of the
+//! rows after it, the sum of their worth. A record without the section leaves
+//! no row.
+//!
 //! The *context* is a number the host derives from the sequence's tokens up to
 //! and including the row's token. A real model has no use for it (attention
 //! reads the sequence's pages); the synthetic model has no attention kernel,
@@ -122,7 +130,7 @@ const MAGIC: u32 = 0x5354_4550;
 /// Bytes of the kernels' header.
 const KERNEL_HEADER: usize = 32;
 /// Words of both headers, a multiple of four so the segments start at a multiple of 16 bytes.
-const HEADER_WORDS: usize = 36;
+const HEADER_WORDS: usize = 40;
 /// Bytes of both headers.
 const HEADERS: usize = HEADER_WORDS * 4;
 const SEG_BYTES: usize = 32;
@@ -161,6 +169,8 @@ const H_OFF_FREED: usize = 32;
 const H_BARS: usize = 33;
 const H_OFF_BARS: usize = 34;
 const H_FLAGS: usize = 35;
+const H_WORTH: usize = 36;
+const H_OFF_WORTH: usize = 37;
 /// The record's step makes the chains of its own-draft windows and nothing
 /// else.
 const RECORD_DRAFTS_ONLY: u32 = 1;
@@ -258,7 +268,8 @@ pub fn max_bytes(max_rows: u32, max_slots: u32, wanted: u32, vocab: u32) -> usiz
         + segments * 12
         + 16 * 8
         + FREED_PER_RECORD * 4
-        + (BAR_CHANCES + rows) * 4;
+        + (BAR_CHANCES + rows) * 4
+        + rows * 4;
     bytes.next_multiple_of(256)
 }
 
@@ -328,6 +339,7 @@ impl<'a> RecordWriter<'a> {
             H_OFF_MASKS,
             H_OFF_FREED,
             H_OFF_BARS,
+            H_OFF_WORTH,
         ] {
             header[h] = end as u32;
         }
@@ -626,6 +638,18 @@ impl<'a> RecordWriter<'a> {
         Ok(())
     }
 
+    /// What every row of the step is worth in milliseconds, a value per row
+    /// (see the module documentation).
+    pub fn row_worth(&mut self, worth: &[f32]) -> Result<(), RecordFull> {
+        let off = self.end;
+        let words: Vec<u32> = worth.iter().map(|value| value.to_bits()).collect();
+        self.put(off, &words)?;
+        self.header[H_WORTH] = worth.len() as u32;
+        self.header[H_OFF_WORTH] = off as u32;
+        self.end = align(off + words.len() * 4);
+        Ok(())
+    }
+
     /// Writes the headers and returns the bytes used, a multiple of 16 so the
     /// copy is a whole number of the device's transfer units.
     pub fn finish(mut self) -> Result<usize, RecordFull> {
@@ -695,6 +719,7 @@ impl<'a> RecordView<'a> {
             header[H_OFF_FREED] as usize + header[H_FREED] as usize * 4,
             header[H_OFF_BARS] as usize
                 + if header[H_BARS] > 0 { (BAR_CHANCES + header[H_BARS] as usize) * 4 } else { 0 },
+            header[H_OFF_WORTH] as usize + header[H_WORTH] as usize * 4,
         ];
         if ends.iter().any(|end| *end > bytes.len()) {
             return Err(RecordError::Truncated);
@@ -962,6 +987,14 @@ impl<'a> RecordView<'a> {
         (self.draft_bars() > 0).then(|| {
             let at = self.header[H_OFF_BARS] as usize;
             std::array::from_fn(|bin| f32::from_bits(self.word(at + bin * 4)))
+        })
+    }
+
+    /// What row `row` of the step is worth in milliseconds; `None` for a
+    /// record without the section (see the module documentation).
+    pub fn row_worth(&self, row: u32) -> Option<f32> {
+        (row < self.header[H_WORTH]).then(|| {
+            f32::from_bits(self.word(self.header[H_OFF_WORTH] as usize + row as usize * 4))
         })
     }
 

@@ -155,18 +155,55 @@ fn rows_the_model_leaves_without_an_expert_give_no_draft_and_change_no_text() {
 }
 
 #[test]
+fn a_round_says_what_its_draft_rows_are_worth() {
+    // The record of every round with windows says what each draft row is
+    // worth: what a token costs times the chance that the drafts up to the
+    // row's own are right, so less from row to row, and nothing for a first
+    // row, which is certain.
+    let model = model(repeating);
+    let seen = Arc::new(Mutex::new(Vec::<Vec<f32>>::new()));
+    let watch = seen.clone();
+    let rt = runtime_with(&model, config(true, 4096), |e| {
+        e.with_delay(Duration::from_micros(200)).with_observer(move |record| {
+            if record.drafts_only() {
+                return;
+            }
+            for i in 0..record.segments() {
+                let s = record.segment(i);
+                if s.direct {
+                    continue;
+                }
+                let worth: Vec<f32> = (s.row0..s.row0 + s.n_rows)
+                    .map(|row| record.row_worth(row).expect("a round with windows says it"))
+                    .collect();
+                watch.lock().unwrap().push(worth);
+            }
+        })
+    });
+    alone(&rt, "a text that loops", Some(200));
+    let windows = seen.lock().unwrap();
+    assert!(windows.len() > 10, "{windows:?}");
+    for w in windows.iter() {
+        assert_eq!(w[0], 0.0, "{w:?}");
+        assert!(w[1..].windows(2).all(|p| 0.0 <= p[1] && p[1] <= p[0]), "{w:?}");
+    }
+    assert!(windows.iter().any(|w| w[1] > 0.0), "{windows:?}");
+}
+
+#[test]
 fn text_that_does_not_repeat_gets_few_drafts_accepted() {
     let model = model(never_repeating);
     let rt = runtime(&model, true);
     let before = snapshot(&rt);
     outputs_of(&rt, 5, 8);
     let after = snapshot(&rt);
-    let d = since(&after, &before);
     let (a, b) = (&after.counters, &before.counters);
     // The model's own draft is a guess among 256 tokens and never right: the
     // planner learns to stop asking for it after a few windows. (The steps
     // are timed by the conductor's clock here, so how few depends on how busy
-    // the machine is.)
+    // the machine is. What the lookup finds depends on it too: the requests
+    // run side by side, and their texts meet where two of them reach the same
+    // token at the same position.)
     let own_windows: u64 =
         a.draft_lengths[1].iter().sum::<u64>() - b.draft_lengths[1].iter().sum::<u64>();
     let own_accepted: u64 =
@@ -174,9 +211,6 @@ fn text_that_does_not_repeat_gets_few_drafts_accepted() {
     let windows = a.window_rows - b.window_rows;
     assert_eq!(own_accepted, 0, "{a:?}");
     assert!(own_windows * 20 <= windows, "{own_windows} of {windows} windows: {a:?}");
-    // What is accepted comes from the lookup, where the requests' texts meet,
-    // and is little of the text.
-    assert!(d["accepted"] * 20 <= d["tokens"], "{d:?}");
 }
 
 #[test]

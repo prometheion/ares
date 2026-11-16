@@ -328,12 +328,18 @@ impl Flow {
     /// part makes its stream wait for what the store removed from the tables
     /// since the step before.
     /// `windows` are the step's windows that verify drafts, as (first row,
-    /// rows): their rows past the first never wait for the file.
+    /// rows), with what each row of the step is worth (the record's row
+    /// worth): their rows past the first wait for the file only while they
+    /// are worth it. A step that
+    /// only drafts (`windows` is `None`) is no step of the store: its routing
+    /// is the draft block's, whose experts are resident, and the work between
+    /// two steps of the store (the heat's decay, the slots that move, the RAM
+    /// tier that grows) is counted in the model's steps.
     fn begin(
         &self,
         step: u64,
         rows: u32,
-        windows: &[(u32, u32)],
+        windows: Option<StepWindows<'_>>,
         index: usize,
         stream: &Stream,
     ) -> Result<(), ModelError> {
@@ -343,8 +349,10 @@ impl Flow {
                 counter.store(0, Ordering::Release);
             }
             self.finished.store(0, Ordering::Release);
-            feed.begin_step(rows).map_err(model_error)?;
-            feed.store.set_windows(windows);
+            if let Some((windows, worth)) = windows {
+                feed.begin_step(rows).map_err(model_error)?;
+                feed.store.set_windows(windows, worth);
+            }
             self.begun.store(step, Ordering::Release);
         }
         feed.store.device_mut(index).fence(stream).map_err(|e| invalid(e.to_string()))
@@ -479,9 +487,9 @@ impl Flow {
     }
 
     /// A part has ended its step on the device: the last of them ends it for
-    /// the store.
-    fn finish(&self) -> Result<(), ModelError> {
-        if self.finished.fetch_add(1, Ordering::AcqRel) + 1 == self.parts() {
+    /// the store, unless it only drafted (`store` false).
+    fn finish(&self, store: bool) -> Result<(), ModelError> {
+        if self.finished.fetch_add(1, Ordering::AcqRel) + 1 == self.parts() && store {
             let mut feed = self.lock_feed();
             feed.end_step().map_err(model_error)?;
             // What the tier gave up at the end of this step is unlocked
@@ -492,6 +500,10 @@ impl Flow {
         Ok(())
     }
 }
+
+/// The windows of a step that verify drafts, as (first row, rows), and what
+/// every row of the step is worth in milliseconds (the record's row worth).
+type StepWindows<'a> = (&'a [(u32, u32)], Option<&'a [f32]>);
 
 // --- the embedding table on the host ----------------------------------------
 
@@ -1247,6 +1259,7 @@ impl Qwen4Exp {
             drafts: self.draft.is_some(),
             residual: None,
             chains: Vec::new(),
+            only_drafts: false,
             drives_ngram: part.ngram_layer().is_some(),
             routing: Routing {
                 mixer: self.placement.tensor.as_ref().map(|t| t.mixer).filter(|m| *m != index),
@@ -1425,6 +1438,8 @@ struct Qwen4ExpDevice {
     /// Where the part left the residual of the rows of its last step.
     residual: Option<DevicePtr>,
     chains: Vec<Chain>,
+    /// The step being run only drafts.
+    only_drafts: bool,
 }
 
 impl std::fmt::Debug for Qwen4ExpDevice {
@@ -1556,15 +1571,20 @@ impl Qwen4ExpDevice {
         // (the conductor's first warm-up record is).
         let number = u64::from(record.step()) + 1;
         // The windows whose rows past the first verify drafts; a step that
-        // only drafts runs none of the model's rows.
+        // only drafts runs none of the model's rows and is no step of the
+        // store.
         // MEASURE-ONLY: ARES_MEASURE_NO_LEAVE, removed before the work is handed back.
-        let windows: Vec<(u32, u32)> =
-            if record.drafts_only() || std::env::var_os("ARES_MEASURE_NO_LEAVE").is_some() {
-                Vec::new()
-            } else {
-                self.segments.iter().filter(|s| !s.direct).map(|s| (s.row0, s.n_rows)).collect()
-            };
-        self.flow.begin(number, rows, &windows, self.index, stream)?;
+        let windows: Vec<(u32, u32)> = if std::env::var_os("ARES_MEASURE_NO_LEAVE").is_some() {
+            Vec::new()
+        } else {
+            self.segments.iter().filter(|s| !s.direct).map(|s| (s.row0, s.n_rows)).collect()
+        };
+        let worth: Option<Vec<f32>> = record
+            .row_worth(0)
+            .map(|_| (0..rows).map(|row| record.row_worth(row).unwrap_or(0.0)).collect());
+        self.only_drafts = record.drafts_only();
+        let windows = (!self.only_drafts).then_some((windows.as_slice(), worth.as_deref()));
+        self.flow.begin(number, rows, windows, self.index, stream)?;
 
         // The draft windows of the step before: how many rows count.
         if self.part.has_deferred() {
@@ -1630,6 +1650,20 @@ impl Qwen4ExpDevice {
                     chances.as_ref(),
                     true,
                 )?;
+                // The round after this step verifies these drafts, or the
+                // first of them: the rows of the n-gram table that its rows
+                // need are read now, while the conductor decides.
+                let next: Vec<(u32, &[u32])> = self
+                    .chains
+                    .iter()
+                    .map(|chain| {
+                        let s = &self.segments[chain.segment];
+                        let made = block.made(s.slot) as usize;
+                        (s.slot, &self.tokens[s.row0 as usize..s.row0 as usize + 1 + made])
+                    })
+                    .collect();
+                // A failed read ahead costs nothing but the read of the step.
+                let _ = self.flow.lock_ngram().expect(&next);
             }
             self.windows.clear();
             return Ok(None);
@@ -1773,7 +1807,7 @@ impl Qwen4ExpDevice {
             flow.pump()?;
             std::hint::spin_loop();
         }
-        flow.finish()
+        flow.finish(!self.only_drafts)
     }
 }
 
@@ -1839,7 +1873,11 @@ impl DeviceModel for Qwen4ExpDevice {
     fn rows_not_exact(&mut self, out: &mut Vec<u32>) {
         // The store left rows that verify drafts without an expert only the
         // file held; every part reports what the store knows when it has
-        // ended, and the last to end knows all of it.
+        // ended, and the last to end knows all of it. A step that only
+        // drafted has no rows.
+        if self.only_drafts {
+            return;
+        }
         let left = self.flow.lock_feed().store.rows_left();
         out.extend((0..32).filter(|row| left >> row & 1 != 0));
     }

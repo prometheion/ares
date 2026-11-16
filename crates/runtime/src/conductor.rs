@@ -599,6 +599,10 @@ pub(crate) struct Conductor {
     commits: Vec<Commit>,
     /// The draft bars of the step's windows that take the model's own drafts.
     bars: Vec<f32>,
+    /// What every row of the step is worth in milliseconds (the record's row
+    /// worth), and what a token costs at the rate the round was chosen for.
+    worth: Vec<f32>,
+    token_ms: f64,
     /// The bar of each link after the first, as the last round set them.
     needs: Vec<f32>,
     /// The window a step of the warm-up left uncommitted.
@@ -701,6 +705,8 @@ impl Conductor {
             own_engine,
             own_confidence: Confidence::new(0.999),
             bars: Vec::with_capacity(max_rows as usize),
+            worth: Vec::with_capacity(max_rows as usize),
+            token_ms: 0.0,
             needs,
             share,
             prompt_rows: Vec::with_capacity(slots),
@@ -1630,6 +1636,7 @@ impl Conductor {
         // chance of a draft it has not made yet) is worth the link's time at
         // the rate this step is expected to have.
         let rate = ares_sched::rate(&wishes, &prices, &choices);
+        self.token_ms = if rate > 0.0 { 1.0 / rate } else { 0.0 };
         let mean = self.own_confidence.mean(self.config.draft_prior);
         let need_of = |link: u32| {
             let upto = |links: u32| self.chain.ms(links).unwrap_or(0.0);
@@ -2037,12 +2044,21 @@ impl Conductor {
         };
         let chain = |_: usize, _: u32| 0.0;
         let spare_rows = self.model.draft_rows().saturating_sub(self.parts.len() as u32);
-        let choices = choose(&wishes, &Prices { step: &step, chain: &chain, spare_rows });
+        let prices = Prices { step: &step, chain: &chain, spare_rows };
+        let choices = choose(&wishes, &prices);
+        let rate = ares_sched::rate(&wishes, &prices, &choices);
         drop(wishes);
-        for (index, choice) in asking.into_iter().zip(choices) {
+        if rate > 0.0 {
+            self.token_ms = 1.0 / rate;
+        }
+        for ((index, choice), own) in asking.into_iter().zip(choices).zip(chances.iter()) {
             let part = &mut self.parts[index];
             let a = self.slots[part.slot as usize].as_mut().expect("running");
             let taken = (choice.drafts as usize).min(a.draft.len());
+            // The chance of each draft the round verifies, for what its row
+            // is worth.
+            a.own_chances.clear();
+            a.own_chances.extend(own.iter().take(taken).copied());
             let dropped = part.rows as usize - 1 - taken;
             self.stats.counters.own_drafts_unverified += (a.draft.len() - taken) as u64;
             a.draft.truncate(taken);
@@ -2078,6 +2094,7 @@ impl Conductor {
         self.step_rows.clear();
         self.updates.clear();
         self.bars.clear();
+        self.worth.clear();
         let mut row_index = 0u32;
         let counters = &mut self.stats.counters;
         let window = self.spec.window.max(1) as usize;
@@ -2202,6 +2219,18 @@ impl Conductor {
                         Some((first, count)) if *first + *count == row_index => *count += part.rows,
                         _ => self.runs.push((row_index, part.rows)),
                     }
+                    // What each draft row is worth: the chance that the
+                    // drafts up to its own are right, times what a token
+                    // costs.
+                    if !drafts_only && part.rows > 1 {
+                        let chances = if a.own { &a.own_chances } else { &a.lookup_chances };
+                        self.worth.resize(row_index as usize + 1, 0.0);
+                        let mut reach = 1.0;
+                        for k in 0..part.rows as usize - 1 {
+                            reach *= chances.get(k).copied().unwrap_or(0.0);
+                            self.worth.push((reach * self.token_ms) as f32);
+                        }
+                    }
                 }
             }
             row_index += part.rows;
@@ -2249,6 +2278,10 @@ impl Conductor {
         writer.freed(&self.freed).map_err(full)?;
         if !self.bars.is_empty() {
             writer.draft_bars(&self.own_confidence.chances(), &self.bars).map_err(full)?;
+        }
+        if !self.worth.is_empty() {
+            self.worth.resize(row_index as usize, 0.0);
+            writer.row_worth(&self.worth).map_err(full)?;
         }
         if let Some(cache) = &mut self.cache {
             cache.write_copies(&mut writer).map_err(full)?;
