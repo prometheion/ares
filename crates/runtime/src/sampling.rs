@@ -332,27 +332,20 @@ impl RequestSampler {
         !self.params.stateful()
     }
 
-    /// Whether the drafts of the coming window may be made by the model on
-    /// the device. Those are not known when the step's record is written, so a
-    /// request whose rows are corrected for the drafts before them (penalties,
-    /// DRY) takes only the drafts the host makes. A request with a rule takes
-    /// the model's drafts while the rule is not bound: after `tokens`, the
-    /// tokens of the request so far (the prompt first), the next token is
-    /// free. Where the rule starts to bind inside such a window is found when
-    /// the picks are back ([`RequestSampler::free_rows`]).
+    /// Whether the model's own drafter is asked for a chain for this request.
+    /// Its chain runs in a step of its own, before the round, and knows no
+    /// rule and no correction; the round verifies its drafts as it verifies
+    /// any, with their masks and corrections. A request with a rule asks for
+    /// a chain while the rule is not bound (after `tokens`, the tokens of the
+    /// request so far, the prompt first, the next token is free): a chain
+    /// made where the rule binds would mostly be cut.
     pub fn allows_own_drafts(&mut self, tokens: &[u32], prompt_len: usize) -> bool {
-        self.allows_drafts()
-            && !self.corrections.path_dependent()
-            && self.free_rows(tokens, prompt_len, &[]) > 0
+        self.allows_drafts() && self.free_rows(tokens, prompt_len, &[]) > 0
     }
 
-    /// How many rows of a window that verified the model's own drafts were
-    /// rows the request's rule leaves free: row `k` follows `tokens` (the
-    /// request so far, the prompt first) and the first `k` of `accepted`, the
-    /// drafts the window's picks confirmed. Such a window has no masks, so
-    /// the pick of a row is the request's token only if the row is free; the
-    /// first row that is not ends what the window gives. Without a rule every
-    /// row is free.
+    /// How many rows after `tokens` (the request so far, the prompt first) and
+    /// the first `k` of `accepted` are rows the request's rule leaves free.
+    /// Without a rule every row is free.
     pub fn free_rows(&mut self, tokens: &[u32], prompt_len: usize, accepted: &[u32]) -> usize {
         match &mut self.filter {
             Some(filter) => filter.free_rows(&tokens[prompt_len.min(tokens.len())..], accepted),

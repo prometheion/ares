@@ -438,8 +438,10 @@ impl<D: SlotDevice> ExpertStore<D> {
             if (from_file && self.windows.may_leave(group.rows))
                 || self.windows.all_left(group.rows)
             {
-                if from_file && !self.windows.all_left(group.rows) {
+                if from_file {
                     self.stats.left_reads += 1;
+                    // The token of a left row is likely the next step's
+                    // first, which will route here again.
                     if self.config.read_left {
                         self.guesses.guess(&mut self.ram.sets, layer, &[expert], self.step + 1);
                     }

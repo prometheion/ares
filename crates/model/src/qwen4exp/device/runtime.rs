@@ -1557,11 +1557,13 @@ impl Qwen4ExpDevice {
         let number = u64::from(record.step()) + 1;
         // The windows whose rows past the first verify drafts; a step that
         // only drafts runs none of the model's rows.
-        let windows: Vec<(u32, u32)> = if record.drafts_only() {
-            Vec::new()
-        } else {
-            self.segments.iter().filter(|s| !s.direct).map(|s| (s.row0, s.n_rows)).collect()
-        };
+        // MEASURE-ONLY: ARES_MEASURE_NO_LEAVE, removed before the work is handed back.
+        let windows: Vec<(u32, u32)> =
+            if record.drafts_only() || std::env::var_os("ARES_MEASURE_NO_LEAVE").is_some() {
+                Vec::new()
+            } else {
+                self.segments.iter().filter(|s| !s.direct).map(|s| (s.row0, s.n_rows)).collect()
+            };
         self.flow.begin(number, rows, &windows, self.index, stream)?;
 
         // The draft windows of the step before: how many rows count.

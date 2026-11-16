@@ -1554,11 +1554,10 @@ impl Conductor {
                         &mut a.lookup,
                         &mut a.lookup_chances,
                     );
-                    // The model's own drafts are made on the device while the
-                    // step runs, so a row can be neither corrected nor masked
-                    // for the drafts before it: a request with penalties takes
-                    // none, and one with a rule takes them while the rule
-                    // leaves its next token free.
+                    // The model's own chain knows no rule: a request with
+                    // one asks for it while the rule leaves its next token
+                    // free. The round verifies its drafts with their masks and
+                    // corrections, as a lookup's.
                     let own = if a.sampler.allows_own_drafts(&a.tokens, a.prompt_len as usize) {
                         cap.min(self.model.own_drafts() as usize)
                     } else {

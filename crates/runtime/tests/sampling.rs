@@ -89,6 +89,11 @@ fn the_rows_of_a_window_carry_the_corrections_of_their_own_paths() {
     let seen = verified.clone();
     let wanted_corrections = corrections.clone();
     let rt = runtime(&model(), true, move |record| {
+        // A step that only drafts verifies nothing: its links pick without the
+        // corrections of the drafts before them, which are not made yet.
+        if record.drafts_only() {
+            return;
+        }
         let wanted = wanted_rows(record);
         for (index, &(row, segment)) in wanted.iter().enumerate() {
             let s = record.segment(segment);

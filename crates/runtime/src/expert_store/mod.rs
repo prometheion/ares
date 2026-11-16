@@ -427,8 +427,9 @@ pub struct StoreStats {
     pub pieces_locked: u64,
     pub piece_evictions: u64,
     /// Experts that only the file held and that only rows verifying drafts
-    /// picked, which were not read for them; and the experts that only rows
-    /// left already picked, which were not computed.
+    /// or rows left already picked, which were not read for them; and the
+    /// experts in a tier that only rows left already picked, which were not
+    /// computed.
     pub left_reads: u64,
     pub left_experts: u64,
 }

@@ -1136,10 +1136,11 @@ fn engine(args: &Args, spread: &Spread, window: u32) {
                     .map(|(bin, (t, a))| format!("{:.2}: {a}/{t}", bin as f64 / 16.0))
                     .collect();
                 println!(
-                    "RES {name} {how}: own links asked {}, not made {}; accepted of verified by \
-                     the drafter's probability (ranges of 1/16, from): {}",
+                    "RES {name} {how}: own links asked {}, not made {}, made and not verified {}; \
+                     accepted of verified by the drafter's probability (ranges of 1/16, from): {}",
                     c.own_links_asked,
                     c.own_links_cut,
+                    c.own_drafts_unverified,
                     by_p.join(", ")
                 );
             }

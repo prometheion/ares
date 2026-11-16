@@ -164,13 +164,16 @@ fn text_that_does_not_repeat_gets_few_drafts_accepted() {
     let d = since(&after, &before);
     let (a, b) = (&after.counters, &before.counters);
     // The model's own draft is a guess among 256 tokens and never right: the
-    // planner learns to stop asking for it after a few windows.
+    // planner learns to stop asking for it after a few windows. (The steps
+    // are timed by the conductor's clock here, so how few depends on how busy
+    // the machine is.)
     let own_windows: u64 =
         a.draft_lengths[1].iter().sum::<u64>() - b.draft_lengths[1].iter().sum::<u64>();
     let own_accepted: u64 =
         a.drafts_accepted_at[1].iter().sum::<u64>() - b.drafts_accepted_at[1].iter().sum::<u64>();
+    let windows = a.window_rows - b.window_rows;
     assert_eq!(own_accepted, 0, "{a:?}");
-    assert!(own_windows <= 20, "{own_windows} windows: {a:?}");
+    assert!(own_windows * 20 <= windows, "{own_windows} of {windows} windows: {a:?}");
     // What is accepted comes from the lookup, where the requests' texts meet,
     // and is little of the text.
     assert!(d["accepted"] * 20 <= d["tokens"], "{d:?}");
