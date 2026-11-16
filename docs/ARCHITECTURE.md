@@ -4844,6 +4844,14 @@ RAM and on SSD; what differs is what a checkpoint and a page hold:
   the freed pages and the tables, then the saves, the page copies and the
   restores, then the chains and the rows; a record that only drafts does its
   copies too.
+- **The split of two devices on every layer** is measured at each load (the
+  read times of a stream mixer decide the mixer and its share of the
+  recurrent heads), and the state of a sequence is laid out by it, so the
+  fingerprint of the state on SSD covers it. With `--cache` the server keeps
+  the split it measured for a model on its devices next to the stores
+  (`<model>.split`) and places the model with it again; without that a
+  restart measured another split and found nothing on the drive. Within one
+  load every placement takes the split the first one measured.
 - **Memory.** A checkpoint of the IQ2_XS file is about 112 MiB over the two
   cards in `f32` (36 recurrent layers of 48 value heads of 128 x 128; the
   draft block adds its carry of 40 KiB and its indexer's 1.8 KiB). The places
@@ -4854,6 +4862,25 @@ RAM and on SSD; what differs is what a checkpoint and a page hold:
   to the drive and back, which hold the last checkpoint of a conversation and
   pages that leave the cards on their way to the drive; without `--cache`, no
   checkpoint is taken and a hit replays every cached row.
+- **Measured** 2026-11-16 with the server (`real_cache.rs`): Swift IQ2_XS on the
+  RTX 4070 and the RTX 3060, both on every layer, `--ram 8G --context 20480
+  --parallel 2 --cache <dir>`, a conversation of 660 facts and two questions
+  (9851 prompt tokens in its second turn), time to the first token of the
+  second turn; two runs, loads 6 to 10 and 5 to 7:
+
+  | Second turn | First token after | From the cache |
+  | --- | --- | --- |
+  | Computed from nothing (a server that never saw it) | 25.1 s; 31.8 s | 0 |
+  | From the cards | 0.65 s; 0.68 s | 9827 tokens |
+  | After two other conversations took the pool | 1.15 s; 1.18 s | 9728 tokens, 68 pages from SSD, none from RAM |
+  | After a restart of the server | 2.28 s | 9728 tokens from the drive |
+
+  Every reply was the one of the server that never saw the conversation. RAM
+  held what the tier left the cache, its floor: one checkpoint place (118 MB)
+  and 1.9 MB of pages, so the pages that left the cards went on to the drive
+  and came back from there. With `--ram` large enough for the tier and the
+  cache, they come back from RAM (`qwen4exp_prefix.rs` shows it on a made-up
+  model).
 
 **Wide steps, measured** (2026-11-12, RTX 4070 and RTX 3060, the engine of before (`0a43601`,
 steps of eight rows) and the one with wide steps started one after the other, both with the
