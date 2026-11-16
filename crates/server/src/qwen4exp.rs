@@ -522,7 +522,8 @@ pub(crate) fn load(
     let runtime = started.map_err(|e| {
         let error = e.to_string();
         let short_of_memory = error.to_lowercase().contains("memory");
-        let error = LoadError::Start(if error.contains("RAM budget") {
+        // The RAM tier's own refusal (not the VRAM budget's, whose words contain these).
+        let error = LoadError::Start(if error.contains("the RAM budget") {
             format!(
                 "{error}. The tier of experts is what --ram leaves after the {} the engine \
                  needs for its buffers: name a larger --ram",

@@ -37,9 +37,6 @@ use super::region::Released;
 use super::tier::{Pool, Tier};
 use super::{ExpertStore, SlotDevice, StoreError};
 
-/// The fewest slots a layer keeps in the RAM tier.
-const FLOOR: usize = 2;
-
 /// How long the end of a step waits for the reads and copies that are on
 /// their way before it gives pieces up; when they take longer, the next step
 /// ends with another try.
@@ -384,8 +381,10 @@ impl<D: SlotDevice> ExpertStore<D> {
         }
         let stride = self.ram.pools[pool].stride as usize;
         let members = self.pool_layers(pool);
-        let spare: Vec<usize> =
-            members.iter().map(|layer| self.ram.slots(*layer).saturating_sub(FLOOR)).collect();
+        let spare: Vec<usize> = members
+            .iter()
+            .map(|layer| self.ram.slots(*layer).saturating_sub(self.ram.floor[*layer]))
+            .collect();
         let total: usize = spare.iter().sum();
         if total < dying.len() {
             return false;

@@ -37,7 +37,7 @@ use ares_cuda::{Device, DevicePtr, ENTRY_CELLS, Event, MAX_BATCH, Segment, StepR
 use ares_gguf::Gguf;
 use ares_io::Reader;
 use ares_runtime::expert_store::{
-    CudaSlots, HostRegion, PIECE, Serve, StoreConfig, StorePlan, StoreStats,
+    CudaSlots, HostRegion, PIECE, Serve, StoreConfig, StoreError, StorePlan, StoreStats,
 };
 use ares_runtime::{
     ContextSpec, DeviceContext, DeviceModel, DeviceTransfer, Drafter, DrafterKind, Durable,
@@ -1173,13 +1173,29 @@ impl Qwen4Exp {
                 if let Some(reserve) = self.opts.reserve {
                     config.vram_reserve = reserve;
                 }
+                config.cpu_serves = serve != Serve::Stream;
                 if o.max_rows > MAX_BATCH {
                     plan_transit(&mut config, layout, &reader, self.opts.transit);
                 }
                 config.ram_bytes = reach;
                 config.ram_piece = self.opts.ram_piece.unwrap_or(PIECE) as u64;
-                let plan = StorePlan::new(config, &map, &reader, &layout.specs, None)
-                    .map_err(|e| invalid(e.to_string()))?;
+                let plan =
+                    StorePlan::new(config, &map, &reader, &layout.specs, None).map_err(|e| {
+                        // With both devices on every layer each holds a share of the
+                        // experts of every layer, and every one of those needs its slots.
+                        let shared = self.placement.tensor.is_some()
+                            && matches!(e, StoreError::Plan(ref text) if text.starts_with("device"));
+                        invalid(if shared {
+                            format!(
+                                "{e}. Both devices hold a share of the experts of each of the {} \
+                                 layers; with the layers split between the devices (--split layer) \
+                                 each holds the slots of its own layers only",
+                                c.n_layer
+                            )
+                        } else {
+                            e.to_string()
+                        })
+                    })?;
                 build.plan = Some(PlanBox { plan, map, reader, ram_start });
                 Ok(())
             },

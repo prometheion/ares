@@ -250,6 +250,12 @@ pub struct SlotSet {
     loading_in: Vec<u32>,
     /// Expert -> the first step that no longer needs it (0: never needed).
     protected_until: Vec<u64>,
+    /// Expert -> the first step whose router did not pick it ([`SlotSet::routed`]; 0:
+    /// never picked). Only read where [`SlotSet::keep_picks`] was set.
+    picked_until: Vec<u64>,
+    /// Whether a read never evicts an expert the running step picked
+    /// ([`SlotSet::keep_picks`]).
+    keeps_picks: bool,
     slots: Vec<Slot>,
     /// Per slot: the expert in it came as a guess and nobody has used it.
     unused_guess: Vec<bool>,
@@ -265,10 +271,40 @@ impl SlotSet {
             slot_of: vec![NO_SLOT; n_experts],
             loading_in: vec![NO_SLOT; n_experts],
             protected_until: vec![0; n_experts],
+            picked_until: vec![0; n_experts],
+            keeps_picks: false,
             slots: vec![Slot::Empty; n_slots],
             unused_guess: vec![false; n_slots],
             held: vec![0; n_experts],
         }
+    }
+
+    /// Makes every read keep the experts the running step picked ([`SlotSet::routed`]),
+    /// however urgent: a demand read that finds nothing else to evict gets
+    /// [`Start::NoRoom`]. For a tier whose slots the step's kernels read while it runs (VRAM,
+    /// where a slot's entry is taken when the layer is routed): a layer with fewer slots than
+    /// its step's picks serves the rest elsewhere instead of evicting what a kernel is about to
+    /// read.
+    pub fn keep_picks(&mut self) {
+        self.keeps_picks = true;
+    }
+
+    /// The slots a read for step `step` can take without evicting an expert the step picked
+    /// ([`SlotSet::routed`]): the empty ones and those of members that no copy holds and the
+    /// step did not pick.
+    pub fn room(&self, step: u64) -> usize {
+        self.slots
+            .iter()
+            .filter(|s| match s {
+                Slot::Empty => true,
+                Slot::Holds(e) => self.held[*e as usize] == 0 && !self.picked(*e, step),
+                _ => false,
+            })
+            .count()
+    }
+
+    fn picked(&self, expert: u32, step: u64) -> bool {
+        self.picked_until[expert as usize] > step
     }
 
     /// The number of slots that hold nothing and wait for nothing.
@@ -442,6 +478,8 @@ impl SlotSet {
     pub fn routed(&mut self, experts: &[u32], step: u64) {
         self.predicted(experts, step);
         for expert in experts {
+            let picked = &mut self.picked_until[*expert as usize];
+            *picked = (*picked).max(step.saturating_add(1));
             let slot = match (self.slot_of[*expert as usize], self.loading_in[*expert as usize]) {
                 (NO_SLOT, NO_SLOT) => continue,
                 (NO_SLOT, loading) => loading,
@@ -475,6 +513,7 @@ impl SlotSet {
     /// [`SlotSet::predicted`] said about the expert.
     pub fn unprotect(&mut self, expert: u32) {
         self.protected_until[expert as usize] = 0;
+        self.picked_until[expert as usize] = 0;
     }
 
     fn needed(&self, expert: u32, step: u64) -> bool {
@@ -498,7 +537,8 @@ impl SlotSet {
     ///   [`Want::Spare`] guess evicts only a member worth nothing.
     /// - A demand read evicts one only when every other member is needed
     ///   too, and then the coldest of them: the expert it waits for is more
-    ///   urgent than a prediction.
+    ///   urgent than a prediction. Where [`SlotSet::keep_picks`] was set it
+    ///   never evicts one the step picked, and gets [`Start::NoRoom`] instead.
     ///
     /// A demand read marks the expert as needed and used, like
     /// [`SlotSet::routed`], and turns a guess that is already on its way
@@ -530,7 +570,12 @@ impl SlotSet {
             .iter()
             .enumerate()
             .filter_map(|(slot, s)| match s {
-                Slot::Holds(e) if self.held[*e as usize] == 0 => Some((slot, *e)),
+                Slot::Holds(e)
+                    if self.held[*e as usize] == 0
+                        && !(self.keeps_picks && self.picked(*e, step)) =>
+                {
+                    Some((slot, *e))
+                }
                 _ => None,
             })
             .min_by(|a, b| self.eviction_order(*a, *b, step, heat));
@@ -559,7 +604,12 @@ impl SlotSet {
             .iter()
             .enumerate()
             .filter_map(|(slot, s)| match s {
-                Slot::Holds(e) if self.held[*e as usize] == 0 => Some((slot, *e)),
+                Slot::Holds(e)
+                    if self.held[*e as usize] == 0
+                        && !(self.keeps_picks && self.picked(*e, step)) =>
+                {
+                    Some((slot, *e))
+                }
                 _ => None,
             })
             .min_by(|a, b| self.eviction_order(*a, *b, step, heat))
@@ -689,6 +739,32 @@ impl SlotSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_tier_that_keeps_picks_never_evicts_one_for_a_demand_read() {
+        let heat = [1.0f32; 8];
+        let mut set = SlotSet::new(8, 2);
+        set.keep_picks();
+        for expert in [0, 1] {
+            let Start::Slot(swap) = set.start_read(expert, Want::Demand, 1, &heat) else {
+                panic!("a free slot")
+            };
+            set.commit(&swap);
+        }
+        // Step 2 picks both members: no room for a third, and a demand read waits.
+        set.routed(&[0, 1], 2);
+        assert_eq!(set.room(2), 0);
+        assert_eq!(set.start_read(5, Want::Demand, 2, &heat), Start::NoRoom);
+        // In step 3 nothing is picked: both slots are room again.
+        assert_eq!(set.room(3), 2);
+        assert!(matches!(set.start_read(5, Want::Demand, 3, &heat), Start::Slot(_)));
+        // A tier that does not keep picks evicts the coldest needed member, as before.
+        let mut open = SlotSet::new(8, 1);
+        let Start::Slot(swap) = open.start_read(0, Want::Demand, 1, &heat) else { panic!() };
+        open.commit(&swap);
+        open.routed(&[0], 2);
+        assert!(matches!(open.start_read(5, Want::Demand, 2, &heat), Start::Slot(_)));
+    }
 
     #[test]
     fn a_spare_read_takes_only_room_nobody_uses() {

@@ -748,7 +748,8 @@ mod hybrid {
         _dir: Scratch,
     }
 
-    fn rig(vram_slots: u64, ram_slots: u64, serve: Serve) -> Rig {
+    /// The model file of the rigs, its map and reader, and the layers' slots.
+    fn model() -> (Scratch, ExpertMap, Reader, [LayerSpec; LAYERS]) {
         let dir = Scratch::new();
         let mut builder = GgufBuilder::new().str("general.architecture", "test");
         for layer in 0..LAYERS {
@@ -778,7 +779,12 @@ mod hybrid {
             slot_bytes,
             resident: false,
         };
-        let layers = [spec; LAYERS];
+        (dir, map, reader, [spec; LAYERS])
+    }
+
+    fn rig(vram_slots: u64, ram_slots: u64, serve: Serve) -> Rig {
+        let (dir, map, reader, layers) = model();
+        let slot_bytes = layers[0].slot_bytes;
         let mut config =
             StoreConfig::new(1, 2, vec![vram_slots * slot_bytes * LAYERS as u64], u64::MAX / 4);
         config.vram_reserve = 0;
@@ -1049,6 +1055,90 @@ mod hybrid {
         assert_eq!((stats.cpu_experts, stats.picks), (2, 3));
         assert!(stats.uploads >= 1);
         rig.store.end_step().unwrap();
+    }
+
+    /// A layer whose VRAM slots are fewer than its step picks: the store uploads into the
+    /// slots whose experts the step did not pick, and the CPU takes the misses beyond them,
+    /// although the cost model gives them to the link. An upload never evicts a pick: the
+    /// kernels of the layer are about to read it.
+    #[test]
+    fn misses_beyond_the_slots_a_step_left_go_to_the_cpu() {
+        let mut rig = rig(2, 8, Serve::Measured);
+        let act = rig.act.clone();
+        // A first step times an upload: the model then gives the link all misses but one.
+        rig.store.begin_step();
+        assert_eq!(rig.store.routed_rows(0, 1, 1, &[group(3, 1.0)], &act).unwrap(), 1);
+        rig.until("the upload", |store| store.device(0).entry(0, 3) >= 0);
+        rig.store.end_step().unwrap();
+        rig.until("settled", |store| store.is_settled() && store.device(0).waiting() == 0);
+        let slot3 = rig.store.device(0).entry(0, 3);
+        assert!(slot3 >= 0);
+        // Expert 3 holds one of the two slots and is picked again: one slot is left for three
+        // misses, so one is uploaded and two are computed by the CPU.
+        let groups = [group(3, 0.25), group(5, 0.25), group(6, 0.25), group(7, 0.25)];
+        let cpu_before = rig.store.stats().cpu_experts;
+        rig.store.begin_step();
+        assert_eq!(rig.store.routed_rows(0, 2, 1, &groups, &act).unwrap(), 3);
+        let sums = rig.delivered(0, 2);
+        let (_, claimed) = rig.store.device(0).share(0).claimed.clone().expect("a claim");
+        assert_eq!(claimed.len(), 2, "claimed {claimed:?}");
+        assert_eq!(rig.store.stats().cpu_experts, cpu_before + 2);
+        let claimed_groups: Vec<RouteGroup> = claimed.iter().map(|g| groups[*g as usize]).collect();
+        assert_close(&sums, &reference(0, &act, &claimed_groups));
+        rig.until("idle device", |store| store.device(0).waiting() == 0);
+        let device = rig.store.device(0);
+        assert_eq!(device.entry(0, 3), slot3, "the pick lost its slot");
+        let slot = device.slot(rig.store.place(0).1, slot3 as u32);
+        assert_eq!(slot[..64], matrix(0, 0, 3)[..64], "the pick's slot was written over");
+        rig.store.end_step().unwrap();
+    }
+
+    /// Where the CPU computes what VRAM cannot take, a layer may have fewer VRAM slots than
+    /// a step can pick, and RAM keeps the rest; without the CPU the plan is refused, and the
+    /// refusal names the device and what each layer needs.
+    #[test]
+    fn a_plan_with_fewer_vram_slots_than_a_step_keeps_the_rest_in_ram() {
+        let (_dir, map, reader, layers) = model();
+        let slot_bytes = layers[0].slot_bytes;
+        // Steps of 4 rows of 2 picks; room for 2 slots per layer in VRAM.
+        let config = |cpu_serves: bool, ram: u64| {
+            let mut config =
+                StoreConfig::new(4, 2, vec![2 * slot_bytes * LAYERS as u64], u64::MAX / 4);
+            config.vram_reserve = 0;
+            config.cpu_serves = cpu_serves;
+            if ram > 0 {
+                config.ram_bytes = ram;
+            }
+            config
+        };
+        let error = StorePlan::new(config(false, 0), &map, &reader, &layers, None).unwrap_err();
+        let text = error.to_string();
+        assert!(text.contains("device 0") && text.contains("needs 8 slots"), "{text}");
+        let probe = StorePlan::new(config(true, 0), &map, &reader, &layers, None).unwrap();
+        let ram_slot = probe.ram_slot_bytes(0);
+        let plan = StorePlan::new(
+            config(true, 8 * ram_slot * LAYERS as u64),
+            &map,
+            &reader,
+            &layers,
+            None,
+        )
+        .unwrap();
+        for layer in 0..LAYERS {
+            let (vram, ram) = plan.slots(layer);
+            assert_eq!(vram, 2);
+            assert!(ram >= 6, "layer {layer} has {ram} slots in RAM");
+        }
+        let error = StorePlan::new(
+            config(true, 4 * ram_slot * LAYERS as u64),
+            &map,
+            &reader,
+            &layers,
+            None,
+        )
+        .unwrap_err();
+        let text = error.to_string();
+        assert!(text.contains("the RAM budget") && text.contains("needs 6 slots in RAM"), "{text}");
     }
 
     /// Two promotions chosen at the end of one step, in a layer whose RAM

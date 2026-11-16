@@ -508,6 +508,11 @@ impl<D: SlotDevice> ExpertStore<D> {
         let kept = candidates.iter().zip(&on_cpu).filter(|(c, cpu)| **cpu && in_ram(c)).count()
             + hybrid.promoting.iter().filter(|(l, _)| *l == layer).count();
         let mut room = self.ram.sets[layer].n_slots().saturating_sub(kept);
+        // An upload takes a slot whose expert the step did not pick (the VRAM tier never
+        // evicts a pick: its kernels are about to read it). A layer with fewer slots than its
+        // step picks has room for only some of the misses; the CPU takes the others, which the
+        // floor of the layer's RAM slots leaves it room for (`Floors`).
+        let mut vram_room = self.vram.sets[layer].room(self.step);
 
         let mut claimed: Vec<u32> = Vec::new();
         let mut claimed_experts: Vec<u32> = Vec::new();
@@ -517,11 +522,12 @@ impl<D: SlotDevice> ExpertStore<D> {
         for ((g, _, source), cpu) in candidates.iter().zip(&on_cpu) {
             let group = &groups[*g];
             self.wants.retain(|w| w.layer != layer || w.expert != group.expert);
-            let cpu = *cpu && (*source == Source::Ram || room > 0);
+            let cpu = (*cpu || vram_room == 0) && (*source == Source::Ram || room > 0);
             if cpu && *source != Source::Ram {
                 room -= 1;
             }
             if !cpu {
+                vram_room = vram_room.saturating_sub(1);
                 self.wants.push(Wanted {
                     layer,
                     expert: group.expert,

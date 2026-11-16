@@ -25,13 +25,16 @@ pub(crate) struct Tier {
     pub pools: Vec<Pool>,
     pub pool_of: Vec<usize>,
     pub sets: Vec<SlotSet>,
+    /// The fewest slots each layer keeps, also when slots pass between layers or go back
+    /// to the system.
+    pub floor: Vec<usize>,
     slot: Vec<Vec<u32>>,
 }
 
 impl Tier {
     /// A tier for layers of `n_experts` experts: `layers[l]` is the place and
     /// the slot size of layer `l`, `budget[place]` the bytes the tier may
-    /// take there, `floor` the fewest slots a layer must have. `heat[l]` is
+    /// take there, `floor[l]` the fewest slots layer `l` must have. `heat[l]` is
     /// what is known of each layer's routing; the slots of a pool are divided
     /// by it ([`split_slots`]), evenly when it says nothing.
     ///
@@ -39,13 +42,13 @@ impl Tier {
     /// whatever the heat says; their bytes come out of the budget of the
     /// layer's place first.
     ///
-    /// Returns `None` when a budget does not hold the fixed slots and `floor`
-    /// slots for every other layer.
+    /// Returns `None` when a budget does not hold the fixed slots and the
+    /// floor of every other layer.
     pub fn plan(
         n_experts: usize,
         layers: &[(usize, u64)],
         budget: &[u64],
-        floor: usize,
+        floor: &[usize],
         heat: &[&[f32]],
         fixed: &[Option<usize>],
     ) -> Option<Self> {
@@ -97,13 +100,14 @@ impl Tier {
                 .sum();
             let rounds = budget.get(pool.place).copied().unwrap_or(0) / per_round.max(1);
             let slots = (rounds as usize).min(n_experts) * members.len();
-            if slots < floor * members.len() {
+            let floors: Vec<usize> = members.iter().map(|l| floor[*l]).collect();
+            if slots < floors.iter().sum() {
                 return None;
             }
             let needs: Vec<LayerNeed<'_>> =
                 members.iter().map(|l| LayerNeed { heat: heat[*l], expert_bytes: 1 }).collect();
             let split = split_slots(&needs, slots as u64, None, &SplitRule::default());
-            for (layer, n) in members.iter().zip(raise_to_floor(split, floor)) {
+            for (layer, n) in members.iter().zip(raise_to_floor(split, &floors)) {
                 counts[*layer] = n;
             }
             pool.slots = slots as u32;
@@ -119,7 +123,8 @@ impl Tier {
             })
             .collect();
         let sets = counts.iter().map(|n| SlotSet::new(n_experts, *n)).collect();
-        Some(Self { pools, pool_of, sets, slot })
+        let floor = (0..layers.len()).map(|l| fixed_of(l).unwrap_or(floor[l])).collect();
+        Some(Self { pools, pool_of, sets, floor, slot })
     }
 
     /// The slot of the layer's pool behind the layer's slot number `local`.
@@ -168,19 +173,19 @@ impl Tier {
     }
 }
 
-/// Raises every count below `floor` to it and takes the slots from the
-/// largest counts.
-fn raise_to_floor(mut counts: Vec<usize>, floor: usize) -> Vec<usize> {
+/// Raises every count below its floor to it and takes the slots from the
+/// largest counts above theirs.
+fn raise_to_floor(mut counts: Vec<usize>, floor: &[usize]) -> Vec<usize> {
     let mut owed = 0;
-    for n in &mut counts {
-        if *n < floor {
+    for (n, floor) in counts.iter_mut().zip(floor) {
+        if *n < *floor {
             owed += floor - *n;
-            *n = floor;
+            *n = *floor;
         }
     }
     while owed > 0 {
         let Some(largest) =
-            (0..counts.len()).filter(|i| counts[*i] > floor).max_by_key(|i| counts[*i])
+            (0..counts.len()).filter(|i| counts[*i] > floor[*i]).max_by_key(|i| counts[*i])
         else {
             break;
         };
@@ -200,7 +205,7 @@ mod tests {
         let heat: Vec<&[f32]> = vec![&flat; 4];
         // Two sizes on device 0, one layer on device 1.
         let layers = [(0, 100), (0, 60), (0, 100), (1, 100)];
-        let tier = Tier::plan(16, &layers, &[1300, 450], 2, &heat, &[]).expect("fits");
+        let tier = Tier::plan(16, &layers, &[1300, 450], &[2; 4], &heat, &[]).expect("fits");
         assert_eq!(tier.pools.len(), 3);
         assert_eq!(tier.pool_of, [0, 1, 0, 2]);
         // 1300 bytes / (100 + 60 + 100) per round = 5 slots per layer.
@@ -208,15 +213,15 @@ mod tests {
         assert_eq!(tier.bytes(0), 1300);
         assert_eq!(tier.bytes(1), 400);
         assert_eq!((tier.slot(0, 0), tier.slot(2, 0), tier.slot(1, 4)), (0, 5, 4));
-        assert!(Tier::plan(16, &layers, &[1300, 150], 2, &heat, &[]).is_none());
+        assert!(Tier::plan(16, &layers, &[1300, 150], &[2; 4], &heat, &[]).is_none());
     }
 
     #[test]
     fn a_profile_moves_slots_to_the_layer_that_needs_them() {
         let narrow: Vec<f32> = (0..16).map(|e| if e < 2 { 50.0 } else { 0.0 }).collect();
         let wide = vec![6.0f32; 16];
-        let tier =
-            Tier::plan(16, &[(0, 10), (0, 10)], &[160], 2, &[&narrow, &wide], &[]).expect("fits");
+        let tier = Tier::plan(16, &[(0, 10), (0, 10)], &[160], &[2; 2], &[&narrow, &wide], &[])
+            .expect("fits");
         assert_eq!(tier.slots(0) + tier.slots(1), 16);
         assert!(tier.slots(1) > tier.slots(0), "{} {}", tier.slots(0), tier.slots(1));
         assert!(tier.slots(0) >= 2);
@@ -229,21 +234,35 @@ mod tests {
         // Layer 0 keeps all 16 of its experts; it has the size of layer 1.
         let layers = [(0, 10), (0, 10), (0, 10)];
         let fixed = [Some(16), None, None];
-        let tier = Tier::plan(16, &layers, &[300], 2, &heat, &fixed).expect("fits");
+        let tier = Tier::plan(16, &layers, &[300], &[2; 3], &heat, &fixed).expect("fits");
         assert_eq!(tier.pools.len(), 2);
         assert_eq!(tier.pool_of, [0, 1, 1]);
         assert_eq!((tier.slots(0), tier.slots(1), tier.slots(2)), (16, 7, 7));
         assert_eq!(tier.bytes(0), 160 + 140);
         // The fixed slots come first: what is left must hold the others' floor.
-        assert!(Tier::plan(16, &layers, &[190], 2, &heat, &fixed).is_none());
-        assert!(Tier::plan(16, &layers, &[150], 2, &heat, &fixed).is_none());
+        assert!(Tier::plan(16, &layers, &[190], &[2; 3], &heat, &fixed).is_none());
+        assert!(Tier::plan(16, &layers, &[150], &[2; 3], &heat, &fixed).is_none());
+    }
+
+    #[test]
+    fn every_layer_gets_its_own_floor() {
+        let narrow: Vec<f32> = (0..16).map(|e| if e < 2 { 50.0 } else { 0.0 }).collect();
+        let wide = vec![6.0f32; 16];
+        // The profile wants nearly every slot for layer 1; layer 0's floor of 6 holds.
+        let tier = Tier::plan(16, &[(0, 10), (0, 10)], &[160], &[6, 2], &[&wide, &narrow], &[])
+            .expect("fits");
+        assert!(tier.slots(0) >= 6 && tier.slots(1) >= 2, "{} {}", tier.slots(0), tier.slots(1));
+        assert_eq!(tier.floor, [6, 2]);
+        assert!(
+            Tier::plan(16, &[(0, 10), (0, 10)], &[160], &[9, 8], &[&wide, &narrow], &[]).is_none()
+        );
     }
 
     #[test]
     fn a_slot_passes_between_layers() {
         let flat = vec![1.0f32; 8];
         let mut tier =
-            Tier::plan(8, &[(0, 10), (0, 10)], &[80], 1, &[&flat, &flat], &[]).expect("fits");
+            Tier::plan(8, &[(0, 10), (0, 10)], &[80], &[1; 2], &[&flat, &flat], &[]).expect("fits");
         assert_eq!((tier.slots(0), tier.slots(1)), (4, 4));
         let given = tier.sets[0].give_back(1, 0, &flat);
         let taken = tier.move_slot(0, given[0].slot, 1);
