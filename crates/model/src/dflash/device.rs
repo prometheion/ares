@@ -305,6 +305,8 @@ pub struct Drafter {
     clock: [Event; 2],
     clock_pending: bool,
     last_ms: f64,
+    /// The layers a pass runs: all but in tests ([`Drafter::run_layers`]).
+    layers_run: usize,
 }
 
 impl Drafter {
@@ -472,6 +474,7 @@ impl Drafter {
             clock: [Event::timed(device)?, Event::timed(device)?],
             clock_pending: false,
             last_ms: 0.0,
+            layers_run: c.n_layer,
         })
     }
 
@@ -863,7 +866,7 @@ impl Drafter {
         let positions = self.rec(self.pass_positions);
         let group = c.conv_group as u32;
         let kernel = c.conv_kernel as u32;
-        for (l, layer) in self.w.layers.iter().enumerate() {
+        for (l, layer) in self.w.layers.iter().enumerate().take(self.layers_run) {
             // SAFETY: every buffer holds `rows` rows of its width (sized for
             // every slot drafting at once); the arena holds the weights.
             unsafe {
@@ -1146,6 +1149,33 @@ impl Drafter {
         let bytes = u64::from(ring.cells) * u64::from(ring.kv) * 2;
         let at = ((u64::from(slot) * u64::from(ring.layers) + u64::from(layer)) * 2) * bytes;
         (&self.ring, at, bytes)
+    }
+
+    /// For tests: where a buffer of the pass is in the scratch (`x`, `q`, `k`,
+    /// `v`, `o`, `a`, `ffn_in`, `g1`, `dynamic`, `xc`, `xn`), as it is when
+    /// the pass has run: the last layer's.
+    pub fn pass_buffer(&self, name: &str) -> Option<u64> {
+        let s = &self.s;
+        Some(match name {
+            "x" => s.x,
+            "q" => s.q,
+            "k" => s.k,
+            "v" => s.v,
+            "o" => s.o,
+            "a" => s.a,
+            "ffn_in" => s.ffn_in,
+            "g1" => s.g1,
+            "dynamic" => s.dynamic,
+            "xc" => s.xc,
+            "xn" => s.xn,
+            _ => return None,
+        })
+    }
+
+    /// For tests: passes run only the first `n` layers, as
+    /// [`Reference::layers`](super::Reference) does.
+    pub fn run_layers(&mut self, n: usize) {
+        self.layers_run = n.min(self.c.n_layer);
     }
 
     /// The cells per slot of the ring.

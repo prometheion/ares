@@ -201,11 +201,14 @@ pub struct Reference<'g> {
     /// Whether the products round their activations as the device's weight
     /// kernels do ([`round_activations`]); exact f32 otherwise.
     pub rounds: bool,
+    /// The layers a pass runs: all but in tests that compare a part of it.
+    pub layers: usize,
 }
 
 impl<'g> Reference<'g> {
     pub fn new(c: Config, w: Weights<'g>) -> Self {
-        Self { c, w, rounds: false }
+        let layers = c.n_layer;
+        Self { c, w, rounds: false, layers }
     }
 
     /// The reference with the device's rounding of activations: what the
@@ -263,7 +266,7 @@ impl<'g> Reference<'g> {
         for _ in 1..b {
             x.extend_from_slice(rows.1);
         }
-        for (l, lw) in self.w.layers.iter().enumerate() {
+        for (l, lw) in self.w.layers.iter().enumerate().take(self.layers) {
             x = self.layer(l, lw, cells, from, position, &x);
         }
         let mut h = x;
