@@ -42,7 +42,7 @@ OPTIONS
   --ffn N               feed-forward inner width (default 17408)
   --type NAME           weight type: q4_K, q5_K, q6_K, q8_0, iq4_xs ... (default q4_K)
   --distinct N          distinct layers of weights (default 4)
-  --speculation on|off  drafts from the model's own draft block and the n-gram drafter
+  --speculation on|off  drafts from the model's MTP block and the n-gram drafter
                         (default off: the text does not repeat)
   --repeating           make the text loop (window 1, epoch 40) so drafts are accepted
   --device-spin US      device threads spin this long for work before parking (default 2000)
@@ -490,7 +490,7 @@ fn main() {
             sc = sc.repetitive(1, 40);
         }
         if o.speculation {
-            sc = sc.with_own_drafts(7, &[0.9, 0.85, 0.8, 0.7, 0.6, 0.5, 0.4]);
+            sc = sc.with_mtp(7, &[0.9, 0.85, 0.8, 0.7, 0.6, 0.5, 0.4]);
         }
         if split == Split::Tensor && !o.fake {
             // Slice the rows by memory bandwidth, as a split planner would.

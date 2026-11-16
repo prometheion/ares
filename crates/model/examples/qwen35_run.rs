@@ -1098,7 +1098,7 @@ fn engine(args: &Args, spread: &Spread, window: u32) {
                 step.p50_us / 1e3,
                 step.mean_us / 1e3,
             );
-            for (source, label) in [(0, "ngram"), (1, "block"), (2, "dflash")] {
+            for (source, label) in [(0, "ngram"), (1, "mtp"), (2, "dflash")] {
                 let tested = c.drafts_tested_at[source];
                 if tested[0] == 0 {
                     continue;
@@ -1114,7 +1114,7 @@ fn engine(args: &Args, spread: &Spread, window: u32) {
                     rates.join(", ")
                 );
             }
-            for (source, label) in [(0, "ngram"), (1, "block"), (2, "dflash")] {
+            for (source, label) in [(0, "ngram"), (1, "mtp"), (2, "dflash")] {
                 let lengths = c.draft_lengths[source];
                 if lengths.iter().all(|n| *n == 0) {
                     continue;
@@ -1130,20 +1130,20 @@ fn engine(args: &Args, spread: &Spread, window: u32) {
                     shown.join(", ")
                 );
             }
-            if c.own_draft_steps > 0 {
+            if c.model_draft_steps > 0 {
                 println!(
                     "RES {name} {how}: draft block {:.2} ms per step that drafts ({:.2} links), \
                      {:.2} ms per link",
-                    c.own_draft_us as f64 / 1e3 / c.own_draft_steps as f64,
-                    c.own_draft_links as f64 / c.own_draft_steps as f64,
-                    c.own_draft_us as f64 / 1e3 / c.own_draft_links.max(1) as f64,
+                    c.model_draft_us as f64 / 1e3 / c.model_draft_steps as f64,
+                    c.model_draft_links as f64 / c.model_draft_steps as f64,
+                    c.model_draft_us as f64 / 1e3 / c.model_draft_links.max(1) as f64,
                 );
             }
-            if c.own_links_asked > 0 {
+            if c.model_links_asked > 0 {
                 let by_p: Vec<String> = c
-                    .own_tested_by_p
+                    .model_tested_by_p
                     .iter()
-                    .zip(&c.own_accepted_by_p)
+                    .zip(&c.model_accepted_by_p)
                     .enumerate()
                     .filter(|(_, (tested, _))| **tested > 0)
                     .map(|(bin, (t, a))| format!("{:.2}: {a}/{t}", bin as f64 / 16.0))
@@ -1151,9 +1151,9 @@ fn engine(args: &Args, spread: &Spread, window: u32) {
                 println!(
                     "RES {name} {how}: own links asked {}, not made {}, made and not verified {}; \
                      accepted of verified by the drafter's probability (ranges of 1/16, from): {}",
-                    c.own_links_asked,
-                    c.own_links_cut,
-                    c.own_drafts_unverified,
+                    c.model_links_asked,
+                    c.model_links_cut,
+                    c.model_drafts_unverified,
                     by_p.join(", ")
                 );
             }

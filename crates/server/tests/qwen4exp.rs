@@ -86,17 +86,17 @@ fn options_that_mean_nothing_for_a_mixture_of_experts_are_refused_by_name() {
     assert!(stderr.contains("--split"), "it says what to use instead: {stderr}");
     refuses(&["--precision", "exact"], "--precision");
     refuses(&["--draft-vocab", "tokens.txt"], "--draft-vocab");
-    // The model file carries no draft block: the block is a file of its own.
+    // The model file carries no MTP block: the block is a file of its own.
     // Without it no model drafter takes part, nothing speculates and a window
     // would be room for nothing.
     let stderr = refuses(&["--drafters", "mtp"], "--drafters");
     assert!(stderr.contains("a file of its own"), "{stderr}");
     let stderr = refuses(&["--drafters", "mtp,/models/dflash2.gguf"], "--drafters");
     assert!(stderr.contains("a file of its own"), "{stderr}");
-    // One draft block and one DFlash drafter at most: two files that are no
-    // DFlash drafter are two draft blocks.
+    // One MTP block and one DFlash drafter at most: two files that are no
+    // DFlash drafter are two MTP blocks.
     let stderr = refuses(&["--drafters", "/models/a.gguf,/models/b.gguf"], "--drafters");
-    assert!(stderr.contains("one draft block"), "{stderr}");
+    assert!(stderr.contains("one MTP block"), "{stderr}");
     refuses(&["--window", "8"], "--window");
 }
 
@@ -106,8 +106,8 @@ fn rows_that_do_not_fit_a_step_are_refused_with_the_option_that_makes_them() {
     assert!(stderr.contains("8 rows"), "{stderr}");
 }
 
-/// The file of a made-up draft block for the made-up model.
-fn draft_block() -> &'static PathBuf {
+/// The file of a made-up MTP block for the made-up model.
+fn mtp_file() -> &'static PathBuf {
     static PATH: LazyLock<PathBuf> = LazyLock::new(|| {
         let path = model().with_file_name("made-draft.gguf");
         std::fs::write(&path, made_up().draft_bytes(Some((GgmlType::IQ2_S, GgmlType::Q2_0))))
@@ -118,8 +118,8 @@ fn draft_block() -> &'static PathBuf {
 }
 
 #[test]
-fn a_drafter_that_is_no_draft_block_of_the_model_is_refused_by_name() {
-    // A model is no draft block.
+fn a_drafter_that_is_no_mtp_block_of_the_model_is_refused_by_name() {
+    // A model is no MTP block.
     let itself = model().to_str().unwrap();
     let stderr = refuses(&["--drafters", itself], "--drafters");
     assert!(stderr.contains("qwen4exp-mtp"), "it says what a block's file is: {stderr}");
@@ -135,7 +135,7 @@ fn a_drafter_that_is_no_draft_block_of_the_model_is_refused_by_name() {
 
 #[test]
 fn the_window_of_a_drafting_model_fits_the_step_that_verifies() {
-    let block = draft_block().to_str().unwrap();
+    let block = mtp_file().to_str().unwrap();
     // A window is the newest token and at least one draft, and a step that
     // verifies drafts has the eight rows of the decode kernels.
     let stderr = refuses(&["--drafters", block, "--window", "9"], "--window");

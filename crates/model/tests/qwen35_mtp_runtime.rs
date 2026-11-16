@@ -190,9 +190,9 @@ fn the_text_with_the_models_own_drafts_is_the_text_without() {
     eprintln!(
         "RES own drafts: {} links in {} steps, {:.2} ms per link; accepted by position {:?} of {:?}; \
          {} tokens in {} steps",
-        counters.own_draft_links,
-        counters.own_draft_steps,
-        counters.own_draft_us as f64 / 1e3 / counters.own_draft_links.max(1) as f64,
+        counters.model_draft_links,
+        counters.model_draft_steps,
+        counters.model_draft_us as f64 / 1e3 / counters.model_draft_links.max(1) as f64,
         &accepted[..3],
         &tested[..3],
         counters.tokens,
@@ -246,8 +246,8 @@ fn the_text_with_dflash_drafts_is_the_text_without() {
             "RES dflash{}: {} passes, {:.2} ms per drafting step; accepted by position {:?} of \
              {:?}; block accepted {:?} of {:?}; {} tokens in {} steps",
             if draft_block { " and draft block" } else { "" },
-            counters.own_draft_steps,
-            counters.own_draft_us as f64 / 1e3 / counters.own_draft_steps.max(1) as f64,
+            counters.model_draft_steps,
+            counters.model_draft_us as f64 / 1e3 / counters.model_draft_steps.max(1) as f64,
             &accepted[..7],
             &tested[..7],
             &counters.drafts_accepted_at[1][..3],

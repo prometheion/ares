@@ -7,7 +7,7 @@
 //!
 //! The model's text never repeats here (its next token depends on the
 //! position), so the n-gram drafter has nothing to offer inside a
-//! request and every draft is the draft block's. The executor states what a
+//! request and every draft is the MTP block's. The executor states what a
 //! step costs and takes no time for it ([`HostExecutor::without_sleeping`]),
 //! so the windows the policy chooses are the same on a machine however busy.
 //!
@@ -35,10 +35,10 @@ const END: u8 = b'~';
 /// The rows of a window: the newest token and seven drafts.
 const WINDOW: u32 = 8;
 
-/// A draft block that gets the first links right more often than the last.
+/// An MTP block that gets the first links right more often than the last.
 const FALLIBLE: &[f64] = &[0.9, 0.85, 0.8, 0.7, 0.6, 0.5, 0.4];
 
-/// A model whose text never repeats and whose draft block is right this
+/// A model whose text never repeats and whose MTP block is right this
 /// often (empty: always).
 fn model(accuracy: &[f64]) -> Arc<SyntheticModel> {
     model_ending(accuracy, Some(u32::from(END)))
@@ -52,8 +52,8 @@ fn model_ending(accuracy: &[f64], eos: Option<u32>) -> Arc<SyntheticModel> {
     config.context.window = 1;
     config.context.epoch = 1;
     config.context.buckets = 512;
-    config.own_drafts = WINDOW - 1;
-    config.own_accuracy = accuracy.to_vec();
+    config.mtp_links = WINDOW - 1;
+    config.mtp_accuracy = accuracy.to_vec();
     Arc::new(SyntheticModel::new(config).unwrap())
 }
 
@@ -65,7 +65,7 @@ struct Window {
     at: usize,
     /// The tokens of the rows: the newest token, then the drafts.
     tokens: Vec<u32>,
-    /// A chain of the draft block, in a step that only drafts; for a window
+    /// A chain of the MTP block, in a step that only drafts; for a window
     /// that verifies, whether its drafts are of the chain that ran just
     /// before it at the same place.
     chain: bool,
@@ -77,7 +77,7 @@ struct Window {
 type Windows = Arc<Mutex<Vec<Window>>>;
 
 /// A runtime on a device whose step costs 3 ms and 0.03 ms a row, and whose
-/// draft block takes 0.3 ms a link. It writes down the windows of the request
+/// MTP block takes 0.3 ms a link. It writes down the windows of the request
 /// whose prompt has `prompt_len` tokens.
 fn runtime(model: &Arc<SyntheticModel>, windows: &Windows, prompt_len: usize) -> Runtime {
     let config = RuntimeConfig {
@@ -109,7 +109,7 @@ fn runtime(model: &Arc<SyntheticModel>, windows: &Windows, prompt_len: usize) ->
                 at,
                 tokens: rows.clone().map(|row| record.row(row).token).collect(),
                 chain: record.drafts_only(),
-                own: record.own_drafts(i),
+                own: record.model_drafts(i),
                 masked: rows.map(|row| record.sampler(sampler_of[&row]).mask().is_some()).collect(),
             });
         }
@@ -127,8 +127,8 @@ fn quiet(model: &Arc<SyntheticModel>) -> Runtime {
     runtime(model, &Windows::default(), usize::MAX)
 }
 
-/// The drafts of the model's own block that became tokens.
-fn own_accepted(rt: &Runtime) -> u64 {
+/// The MTP drafts that became tokens.
+fn mtp_accepted(rt: &Runtime) -> u64 {
     snapshot(rt).counters.drafts_accepted_at[1].iter().sum()
 }
 
@@ -229,9 +229,9 @@ struct Binding {
     /// Which of the window's picks the binding token was: 0 is the pick of
     /// the newest token's row, `k` the pick of the row of draft `k - 1`.
     pick: usize,
-    /// The window's drafts were the draft block's.
+    /// The window's drafts were the MTP block's.
     own: bool,
-    /// The draft block proposed the binding token itself, and was right in
+    /// The MTP block proposed the binding token itself, and was right in
     /// everything before it.
     proposed: bool,
     /// The block's chain went on past the binding token, and the round did
@@ -366,7 +366,7 @@ fn the_binding_token_at_every_place_of_a_window_ends_what_the_window_gives() {
             );
             assert!(
                 proposed > 5,
-                "{kind:?}: the draft block proposed the binding token {proposed} times"
+                "{kind:?}: the MTP block proposed the binding token {proposed} times"
             );
             if accuracy.is_empty() {
                 // A block that is always right has every window whole, so the
@@ -380,7 +380,7 @@ fn the_binding_token_at_every_place_of_a_window_ends_what_the_window_gives() {
 
 #[test]
 fn a_chain_past_the_binding_token_is_verified_up_to_it() {
-    // One case spelled out. The draft block is always right, so a chain that
+    // One case spelled out. The MTP block is always right, so a chain that
     // begins three tokens before the end of the tag drafts the tag's last
     // token and the free text after it, without a mask: its step knows no
     // rule. The round verifies the drafts up to the tag, the last with the
@@ -404,7 +404,7 @@ fn a_chain_past_the_binding_token_is_verified_up_to_it() {
             giving,
             chain,
             run,
-            own_accepted(&rt),
+            mtp_accepted(&rt),
         ))
     });
     let (end, giving, chain, run, accepted) =
@@ -494,7 +494,7 @@ fn the_models_drafts_come_back_when_a_rule_is_free_again() {
                 assert_eq!(w.masked[0], bound, "stretches of {period}: {w:?}");
                 assert!(!(w.own && bound), "stretches of {period}: {w:?}");
             }
-            assert!(own_accepted(&rt) > 20, "stretches of {period}: {}", own_accepted(&rt));
+            assert!(mtp_accepted(&rt) > 20, "stretches of {period}: {}", mtp_accepted(&rt));
         }
     }
 }
@@ -511,7 +511,7 @@ fn a_reply_with_a_long_free_part_takes_as_many_of_the_models_drafts_as_one_witho
     let plain = quiet(&model);
     let run = run_one(&plain, request(&prompt, Some(end as u32 + 1)));
     assert_eq!(run.text.chars().collect::<Vec<_>>(), text[..=end]);
-    let (without, steps_without) = (own_accepted(&plain), snapshot(&plain).counters.steps);
+    let (without, steps_without) = (mtp_accepted(&plain), snapshot(&plain).counters.steps);
     assert!(without > 180, "the block drafts most of the free text: {without} of {end} tokens");
     for kind in [Kind::Reasoning, Kind::Trigger] {
         let structure = rule(kind, &tag);
@@ -520,7 +520,7 @@ fn a_reply_with_a_long_free_part_takes_as_many_of_the_models_drafts_as_one_witho
         let rt = quiet(&model);
         let drafted = run_one(&rt, ruled(&prompt, &structure, true));
         assert_eq!(drafted, expected, "{kind:?}");
-        let with = own_accepted(&rt);
+        let with = mtp_accepted(&rt);
         let counters = snapshot(&rt).counters;
         let bound = u64::from(drafted.usage.completion_tokens) - (end as u64 + 1);
         eprintln!(

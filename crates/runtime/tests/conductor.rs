@@ -57,24 +57,24 @@ fn roomy(c: &mut SyntheticConfig) {
 }
 
 /// A model whose text loops and changes its loop every 40 positions, and whose
-/// draft block gets the first links right more often than the last.
+/// MTP block gets the first links right more often than the last.
 fn repeating(c: &mut SyntheticConfig) {
     c.context.window = 1;
     c.context.epoch = 40;
     c.context.buckets = 512;
-    c.own_drafts = 7;
-    c.own_accuracy = vec![0.9, 0.85, 0.8, 0.7, 0.6, 0.5, 0.4];
+    c.mtp_links = 7;
+    c.mtp_accuracy = vec![0.9, 0.85, 0.8, 0.7, 0.6, 0.5, 0.4];
 }
 
-/// Gives the model a draft block with these chances for its links.
+/// Gives the model an MTP block with these chances for its links.
 fn drafter(c: &mut SyntheticConfig, accuracy: &[f64]) {
     c.context.window = 1;
-    c.own_drafts = 7;
-    c.own_accuracy = accuracy.to_vec();
+    c.mtp_links = 7;
+    c.mtp_accuracy = accuracy.to_vec();
 }
 
 /// A model whose text never repeats inside a request (its next token depends
-/// on the position, which changes at every token) and whose draft block is
+/// on the position, which changes at every token) and whose MTP block is
 /// never right: only text another request wrote can be drafted.
 fn never_repeating(c: &mut SyntheticConfig) {
     drafter(c, &[0.0]);
@@ -198,19 +198,19 @@ fn text_that_does_not_repeat_gets_few_drafts_accepted() {
     outputs_of(&rt, 5, 8);
     let after = snapshot(&rt);
     let (a, b) = (&after.counters, &before.counters);
-    // The model's own draft is a guess among 256 tokens and never right: the
+    // The MTP draft is a guess among 256 tokens and never right: the
     // planner learns to stop asking for it after a few windows. (The steps
     // are timed by the conductor's clock here, so how few depends on how busy
     // the machine is. What the n-gram drafter finds depends on it too: the requests
     // run side by side, and their texts meet where two of them reach the same
     // token at the same position.)
-    let own_windows: u64 =
+    let mtp_windows: u64 =
         a.draft_lengths[1].iter().sum::<u64>() - b.draft_lengths[1].iter().sum::<u64>();
-    let own_accepted: u64 =
+    let mtp_accepted: u64 =
         a.drafts_accepted_at[1].iter().sum::<u64>() - b.drafts_accepted_at[1].iter().sum::<u64>();
     let windows = a.window_rows - b.window_rows;
-    assert_eq!(own_accepted, 0, "{a:?}");
-    assert!(own_windows * 20 <= windows, "{own_windows} of {windows} windows: {a:?}");
+    assert_eq!(mtp_accepted, 0, "{a:?}");
+    assert!(mtp_windows * 20 <= windows, "{mtp_windows} of {windows} windows: {a:?}");
 }
 
 #[test]
@@ -803,7 +803,7 @@ fn a_slowdown_that_leaves_generation_no_time_is_refused_at_start() {
 
 /// A device whose weight kernels read their rows in launches of eight: a step
 /// costs 3 ms and 0.03 ms a row, and 3 ms more from the ninth row on and again
-/// from the seventeenth. A link of the draft block's chain costs 0.3 ms.
+/// from the seventeenth. A link of the MTP block's chain costs 0.3 ms.
 fn launches(rows: u32) -> Duration {
     Duration::from_micros(3000 + 30 * u64::from(rows) + 3000 * u64::from(rows.div_ceil(8) - 1))
 }
@@ -812,13 +812,13 @@ fn launches_ms(rows: u32) -> f64 {
     launches(rows).as_secs_f64() * 1e3
 }
 
-/// A model whose draft block is right this often and whose text gives the
+/// A model whose MTP block is right this often and whose text gives the
 /// n-gram drafter nothing, so that every draft is the block's.
 fn drafting_model(accuracy: &[f64], max_rows: u32) -> Arc<SyntheticModel> {
     model(|c| {
         never_repeating(c);
-        c.own_drafts = 15;
-        c.own_accuracy = accuracy.to_vec();
+        c.mtp_links = 15;
+        c.mtp_accuracy = accuracy.to_vec();
         c.max_rows = max_rows;
         c.context_length = 2048;
     })
@@ -877,7 +877,7 @@ fn a_model_with_no_drafter_does_not_speculate_and_the_ngram_drafter_does_not_run
 
 #[test]
 fn a_window_of_one_row_is_no_speculation_even_for_a_model_with_a_drafter_and_text_that_repeats() {
-    // What `--drafters none` makes of a model whose file has a draft block.
+    // What `--drafters none` makes of a model whose file has an MTP block.
     let model = model(repeating);
     let rt = runtime(&model, false);
     alone(&rt, "a text that loops", Some(300));
@@ -903,7 +903,7 @@ fn the_ngram_drafter_joins_the_model_drafter_when_there_is_one() {
     let before = snapshot_of(&rt).counters;
     alone(&rt, "written twice", Some(200));
     let c = snapshot_of(&rt).counters;
-    // The draft block is never right here: what is drafted and accepted
+    // The MTP block is never right here: what is drafted and accepted
     // comes from the n-gram drafter in the first request's text.
     assert!(c.drafts_accepted_at[0].iter().sum::<u64>() > 150, "{c:?}");
     assert_eq!(c.drafts_accepted_at[1].iter().sum::<u64>(), 0, "{c:?}");
@@ -912,7 +912,7 @@ fn the_ngram_drafter_joins_the_model_drafter_when_there_is_one() {
 
 #[test]
 fn drafts_are_as_long_as_they_pay_and_stop_at_the_edge_of_a_launch() {
-    // A draft block that is right nearly always: seven links fill the eight
+    // An MTP block that is right nearly always: seven links fill the eight
     // rows of a launch, and a second launch costs more than the rows after it
     // are worth.
     let steps: Steps = Arc::default();
@@ -1045,15 +1045,15 @@ fn windows_priced_out_on_a_cold_start_are_tried_again_and_chosen_when_they_pay()
     }
 }
 
-/// A model whose draft block is right six times in ten at every link and
+/// A model whose MTP block is right six times in ten at every link and
 /// says so: 0.95 for a draft that is right and 0.15 for one that is wrong
 /// (`sure`), or nothing.
 fn unsure_drafts(sure: bool) -> (Run, ares_runtime::Snapshot) {
     let model = model(|c| {
         never_repeating(c);
-        c.own_drafts = 7;
-        c.own_accuracy = vec![0.6];
-        c.own_probability = sure.then_some((0.95, 0.15));
+        c.mtp_links = 7;
+        c.mtp_accuracy = vec![0.6];
+        c.mtp_probability = sure.then_some((0.95, 0.15));
         c.context_length = 2048;
     });
     // A step of 3 ms and 0.03 ms a row, a link of 0.3 ms: the chain is what
@@ -1088,22 +1088,22 @@ fn a_chain_ends_at_the_first_draft_its_drafter_is_unsure_of() {
     let wasted = made(&c) - accepted(&c);
     assert!(windows > 100 && wasted <= windows, "{c:?}");
     let (sure, unsure) = (15, 2);
-    assert_eq!(c.own_tested_by_p[sure], c.own_accepted_by_p[sure]);
-    assert_eq!((c.own_tested_by_p[unsure], c.own_accepted_by_p[unsure]), (wasted, 0));
-    assert_eq!(accepted(&c), c.own_accepted_by_p[sure]);
-    assert!(c.own_links_cut > 0, "{c:?}");
+    assert_eq!(c.model_tested_by_p[sure], c.model_accepted_by_p[sure]);
+    assert_eq!((c.model_tested_by_p[unsure], c.model_accepted_by_p[unsure]), (wasted, 0));
+    assert_eq!(accepted(&c), c.model_accepted_by_p[sure]);
+    assert!(c.model_links_cut > 0, "{c:?}");
     // The drafter that says nothing makes every link it is asked for, so a
     // link is asked for only where the average draft pays for it; the one
     // that ends its chains itself is asked for more, makes them where its
     // drafts are sure, and gets more tokens out of a step.
-    assert_eq!((p.own_links_cut, p.own_tested_by_p), (0, [0; 16]));
+    assert_eq!((p.model_links_cut, p.model_tested_by_p), (0, [0; 16]));
     let per_step = |c: &ares_runtime::Counters| c.tokens as f64 / c.steps as f64;
     eprintln!("RES tokens per step {:.3} with the cut, {:.3} without", per_step(&c), per_step(&p));
     assert!(per_step(&c) > 1.1 * per_step(&p), "{} {}", per_step(&c), per_step(&p));
     // What a step costs is known exactly here (3 ms, 0.03 ms a row, and the
     // chain): the same tokens take less time.
     let ms = |c: &ares_runtime::Counters| {
-        c.steps as f64 * 3.0 + c.rows as f64 * 0.03 + c.own_draft_us as f64 / 1e3
+        c.steps as f64 * 3.0 + c.rows as f64 * 0.03 + c.model_draft_us as f64 / 1e3
     };
     assert_eq!(c.tokens, p.tokens);
     eprintln!("RES {:.1} ms with the cut, {:.1} ms without", ms(&c), ms(&p));

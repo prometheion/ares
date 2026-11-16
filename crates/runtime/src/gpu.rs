@@ -1024,7 +1024,7 @@ impl Worker {
                 }
             }
         }
-        let own = self.model.own_drafts().filter(|own| own.tokens > 0);
+        let own = self.model.model_drafts().filter(|own| own.tokens > 0);
         if let Some(own) = own {
             if own.tokens > self.max_rows {
                 return Err(ModelError::Invalid(format!(
@@ -1099,7 +1099,7 @@ impl Worker {
         // What the drafter says of its drafts: a link it did not make is no
         // draft, whatever the device holds in its place.
         self.draft_probs.clear();
-        self.model.own_draft_probs(&mut self.draft_probs);
+        self.model.model_draft_probs(&mut self.draft_probs);
         if self.draft_probs.len() == self.drafts.len() {
             for (draft, p) in self.drafts.iter_mut().zip(&self.draft_probs) {
                 if p.is_nan() {
@@ -1112,7 +1112,7 @@ impl Worker {
         if produced {
             self.model.picked(&self.picks);
         }
-        self.draft_ms = self.model.own_draft_ms();
+        self.draft_ms = self.model.model_draft_ms();
         self.inexact.clear();
         self.model.rows_not_exact(&mut self.inexact);
         times.pick_ns = sampler_ns + pick_begun.elapsed().as_nanos() as u64;

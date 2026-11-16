@@ -20,9 +20,9 @@ pub const CELLS_PER_PAGE: u32 = ares_cuda::ENTRY_CELLS;
 /// rows a step reads the weights once; a ninth row is a second launch of
 /// them, and the price of that is measured on the devices at load and decides
 /// whether a longer window pays (it did not in the measurements of the model's
-/// own draft block). Rows of windows are VRAM, which is why the room for them
+/// own MTP block). Rows of windows are VRAM, which is why the room for them
 /// is a choice: each takes the inputs the model keeps for the commit, its
-/// logits and a link of the draft block's chain, about 5 MiB of the 27B
+/// logits and a link of the MTP block's chain, about 5 MiB of the 27B
 /// together. The window is not how long a draft is: that is chosen for every
 /// step from the measured price and acceptance.
 pub const DEFAULT_WINDOW: u32 = ares_cuda::MAX_BATCH;
@@ -62,11 +62,11 @@ impl SplitKind {
 /// A model drafter, as the operator names it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Drafter {
-    /// The model's own draft block (multi-token prediction).
+    /// `mtp`: the MTP block (multi-token prediction) in the model file.
     Mtp,
     /// A drafter from a file of its own: a DFlash2 drafter (architecture
-    /// `dflash`), or the draft block of a model whose file carries none.
-    Block(PathBuf),
+    /// `dflash`), or the MTP block of a model whose file carries none.
+    File(PathBuf),
 }
 
 /// What a mixture of experts does with a pick whose expert only the SSD holds
@@ -115,13 +115,13 @@ pub struct LoadOptions {
     /// How the matrix products round.
     pub precision: Precision,
     /// The model drafters that take part. `None`: every one that is
-    /// available (the model's own draft block, if the file has one). An empty
+    /// available (the model's MTP block, if the file has one). An empty
     /// list: none, and with none the engine does not speculate at all. The
     /// n-gram drafter takes part with them and never alone.
     pub drafters: Option<Vec<Drafter>>,
     /// The most rows of one sequence's window ([`DEFAULT_WINDOW`]).
     pub window: Option<u32>,
-    /// A file with the token ids the model's draft block may propose.
+    /// A file with the token ids the model's MTP block may propose.
     pub draft_vocabulary: Option<PathBuf>,
     /// Variables of the chat template.
     pub chat_variables: Vec<(String, Json)>,

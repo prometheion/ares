@@ -41,7 +41,7 @@ use ares_runtime::expert_store::{
 };
 use ares_runtime::{
     ContextSpec, DeviceContext, DeviceModel, DeviceTransfer, Drafter, DrafterKind, Durable,
-    LinkSpec, Logits, Model, ModelError, OwnDrafts, Pick, PinnedRam, PrefixCache, Split,
+    LinkSpec, Logits, Model, ModelDrafts, ModelError, Pick, PinnedRam, PrefixCache, Split,
     StepContext, TransferContext,
 };
 use ares_state::PageLayout;
@@ -1574,7 +1574,7 @@ impl Model for Qwen4Exp {
         let mut drafters = Vec::new();
         if self.draft.is_some() {
             drafters.push(Drafter {
-                kind: DrafterKind::Block,
+                kind: DrafterKind::Mtp,
                 drafts: self.opts.part.window_rows.saturating_sub(1),
             });
         }
@@ -2153,14 +2153,14 @@ impl DeviceModel for Qwen4ExpDevice {
         let _ = self.flow.lock_ngram().expect(&next);
     }
 
-    fn own_drafts(&self) -> Option<OwnDrafts> {
+    fn model_drafts(&self) -> Option<ModelDrafts> {
         // A step with the DFlash drafter's windows has one list, the
         // drafter's; one with the draft block's alone has the block's.
         if let Some(d) = self.part.dflash().filter(|d| d.drafted() > 0) {
-            return Some(OwnDrafts { ptr: d.own_list(), tokens: d.drafted() });
+            return Some(ModelDrafts { ptr: d.own_list(), tokens: d.drafted() });
         }
         let (ptr, tokens) = self.draft.as_ref()?.drafted()?;
-        Some(OwnDrafts { ptr, tokens })
+        Some(ModelDrafts { ptr, tokens })
     }
 
     fn transfer(
@@ -2171,12 +2171,12 @@ impl DeviceModel for Qwen4ExpDevice {
         self.resume.transfer(cx.stream, cx.pages, item, &mut self.part, self.draft.as_mut())
     }
 
-    fn own_draft_ms(&mut self) -> f64 {
+    fn model_draft_ms(&mut self) -> f64 {
         let pass = self.part.dflash_pass_ms();
         self.draft.as_ref().map_or(0.0, DraftBlock::chain_ms) + pass
     }
 
-    fn own_draft_probs(&mut self, out: &mut Vec<f32>) {
+    fn model_draft_probs(&mut self, out: &mut Vec<f32>) {
         if let Some(d) = self.part.dflash().filter(|d| d.drafted() > 0) {
             let from = out.len();
             out.resize(from + d.drafted() as usize, f32::NAN);

@@ -94,7 +94,7 @@ pub(crate) fn load(
              arithmetic",
         ));
     }
-    // The model's draft block is a file of its own, which --drafters names:
+    // The model's MTP block is a file of its own, which --drafters names:
     // the model file carries none. Without it nothing speculates (the n-gram drafter
     // in earlier text takes part only next to a model drafter), no window is
     // reserved, and the options of drafting mean nothing.
@@ -105,11 +105,11 @@ pub(crate) fn load(
         match drafter {
             Drafter::Mtp => {
                 return Err(refuse(
-                    "--drafters mtp: this model file carries no draft block; the block is a \
+                    "--drafters mtp: this model file carries no MTP block; the block is a \
                      file of its own, which --drafters names by its path",
                 ));
             }
-            Drafter::Block(path) => {
+            Drafter::File(path) => {
                 let is_dflash = Gguf::open(path)
                     .map(|g| g.architecture() == Some(ares_model::dflash::ARCHITECTURE))
                     .unwrap_or(false);
@@ -128,12 +128,12 @@ pub(crate) fn load(
         [path] => Some(path.clone()),
         _ => {
             return Err(refuse(
-                "--drafters: this model drafts with one draft block and one DFlash drafter at \
+                "--drafters: this model drafts with one MTP block and one DFlash drafter at \
                  most",
             ));
         }
     };
-    // The file is read before a device is touched: one that is no draft block
+    // The file is read before a device is touched: one that is no MTP block
     // of this model is refused by name.
     let drafter = drafter
         .map(|path| {
@@ -156,7 +156,7 @@ pub(crate) fn load(
     }
     if options.draft_vocabulary.is_some() {
         return Err(refuse(
-            "--draft-vocab does nothing for this model: its draft block picks from the whole \
+            "--draft-vocab does nothing for this model: its MTP block picks from the whole \
              output head",
         ));
     }
@@ -349,7 +349,7 @@ pub(crate) fn load(
         plan::format_name(kv.0),
         plan::format_name(kv.1),
         match (&drafter, &dflash) {
-            (None, None) => "no speculation: the model drafts with a draft block from a file \
+            (None, None) => "no speculation: the model drafts with an MTP block from a file \
                              of its own (--drafters <file>), and earlier text alone is not a \
                              drafter"
                 .to_owned(),
@@ -359,7 +359,7 @@ pub(crate) fn load(
                  n-gram drafter joins",
                 block
                     .as_ref()
-                    .map(|(path, _)| format!("the model's draft block ({})", path.display()))
+                    .map(|(path, _)| format!("the model's MTP block ({})", path.display()))
                     .unwrap_or_default(),
                 if block.is_some() && dflash.is_some() { " and " } else { "" },
                 dflash
@@ -623,7 +623,7 @@ pub(crate) fn load(
         watch_drafts(std::sync::Arc::downgrade(&model));
         let (vram, ram_slots) = model.draft_slots().unwrap_or((0, 0));
         tracing::info!(
-            "draft block, on device {}: dense weights {}, K, V and keys {}, buffers {}; its {} \
+            "MTP block, on device {}: dense weights {}, K, V and keys {}, buffers {}; its {} \
              experts share the tiers: {vram} slots in VRAM, {ram_slots} in RAM",
             held[report.index].device.ordinal(),
             Bytes(report.weights),
@@ -874,10 +874,10 @@ fn warm_up(runtime: &Runtime, model: &str) -> Result<f64, LoadError> {
     Ok(begun.elapsed().as_secs_f64())
 }
 
-/// How often the log says what the draft block did, while it does something.
+/// How often the log says what the MTP block did, while it does something.
 const DRAFT_WATCH: Duration = Duration::from_secs(20);
 
-/// Logs what the model's draft block did since the engine started, whenever
+/// Logs what the model's MTP block did since the engine started, whenever
 /// that has changed: the links it made and what one cost, and how the drafts
 /// of each link fared with the rows that verified them. Ends with the model.
 fn watch_drafts(model: std::sync::Weak<Qwen4Exp>) {
@@ -900,7 +900,7 @@ fn watch_drafts(model: std::sync::Weak<Qwen4Exp>) {
                 ", ",
             );
             tracing::info!(
-                "draft block: {} links in {} steps, {:.2} ms a link ({:.2} ms a step that \
+                "MTP block: {} links in {} steps, {:.2} ms a link ({:.2} ms a step that \
                  drafts); accepted per link, of the drafts that were verified: {rates}; {} rows \
                  only wrote keys, {:.3} ms of the host each",
                 times.links,

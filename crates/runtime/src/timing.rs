@@ -236,7 +236,7 @@ pub struct DeviceTimes {
 /// the last.
 pub const DRAFT_POSITIONS: usize = 16;
 
-/// Where drafts come from, for the statistics: the n-gram drafter, a draft block, a
+/// Where drafts come from, for the statistics: the n-gram drafter, an MTP block, a
 /// DFlash drafter.
 pub const DRAFT_SOURCES: usize = 3;
 
@@ -257,7 +257,7 @@ pub struct Counters {
     /// Drafts by where they came from and their position in the draft,
     /// `[source][position]`: how many were tested (every draft before them
     /// was accepted) and how many of those were accepted. Source 0 is the
-    /// n-gram drafter, 1 a draft block of the model, 2 a DFlash
+    /// n-gram drafter, 1 an MTP block of the model, 2 a DFlash
     /// drafter ([`DrafterKind::source`](crate::DrafterKind::source)); the last
     /// position counts the ones past it too.
     pub drafts_tested_at: [[u64; DRAFT_POSITIONS]; DRAFT_SOURCES],
@@ -265,19 +265,19 @@ pub struct Counters {
     /// Windows by where their drafts came from and how many drafts they
     /// verified, `[source][drafts]`: the chain lengths the policy chose.
     pub draft_lengths: [[u64; DRAFT_POSITIONS + 1]; DRAFT_SOURCES],
-    /// Steps in which the model's own draft block drafted, the links of its
+    /// Steps in which the model's MTP block drafted, the links of its
     /// chains (the longest chain of each step) and their device time in
     /// microseconds.
-    pub own_draft_steps: u64,
-    pub own_draft_links: u64,
-    pub own_draft_us: u64,
-    /// Links the windows asked the model's own draft block for, the links it
+    pub model_draft_steps: u64,
+    pub model_draft_links: u64,
+    pub model_draft_us: u64,
+    /// Links the windows asked the model's MTP block for, the links it
     /// did not make of them because it ended a chain at its bar, and the
     /// drafts it made that the round did not verify (the conductor took fewer
     /// by what the drafter said of them).
-    pub own_links_asked: u64,
-    pub own_links_cut: u64,
-    pub own_drafts_unverified: u64,
+    pub model_links_asked: u64,
+    pub model_links_cut: u64,
+    pub model_drafts_unverified: u64,
     /// Windows a row of which the model left without what it would have
     /// waited for (an expert only the file held): their drafts from that row
     /// on were not accepted.
@@ -285,8 +285,8 @@ pub struct Counters {
     /// The model's own drafts that were verified, by the probability the
     /// drafter gave them (the ranges of [`ares_sched::Confidence`]), and how
     /// many of them were accepted.
-    pub own_tested_by_p: [u64; ares_sched::CONFIDENCE_BINS],
-    pub own_accepted_by_p: [u64; ares_sched::CONFIDENCE_BINS],
+    pub model_tested_by_p: [u64; ares_sched::CONFIDENCE_BINS],
+    pub model_accepted_by_p: [u64; ares_sched::CONFIDENCE_BINS],
     /// Steps that carried prompt rows and generating rows together.
     pub mixed_steps: u64,
     /// Tokens delivered to requests (accepted picks).

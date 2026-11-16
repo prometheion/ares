@@ -98,11 +98,11 @@ pub(crate) fn refuse(message: impl Into<String>) -> LoadError {
     LoadError::Options(message.into())
 }
 
-/// Whether the model's own draft block takes part in speculation: when
+/// Whether the model's MTP block takes part in speculation: when
 /// `--drafters` names `mtp`, or names nothing and the model has one
 /// (`has_block`). `--drafters mtp` for a model with none is refused, saying
 /// `no_block`.
-pub(crate) fn draft_block_takes_part(
+pub(crate) fn mtp_takes_part(
     options: &LoadOptions,
     has_block: bool,
     no_block: &str,
@@ -128,7 +128,7 @@ pub(crate) fn dflash_drafter(
         .iter()
         .flatten()
         .filter_map(|d| match d {
-            Drafter::Block(path) => Some(path),
+            Drafter::File(path) => Some(path),
             Drafter::Mtp => None,
         })
         .collect();
@@ -379,7 +379,7 @@ fn block_bytes(w: &Weights<'_>, layer: usize) -> (u64, u64) {
 ///
 /// The weights follow the loader (`qwen35::device::load`): a device's slice of
 /// every block, the embedding rows the draft chain picks, its rows of the head,
-/// the draft block.
+/// the MTP block.
 /// The scratch of a step follows `Part::open` with the widths of the whole
 /// model, which a slice does not exceed. Both are estimates: the loader
 /// aligns and rearranges, and the part has more small buffers than are
@@ -484,7 +484,7 @@ fn footprint(
             Footprint {
                 weights,
                 // The margin: alignment of the arena, the sampler, records,
-                // attention plans, links, the draft block's buffers.
+                // attention plans, links, the MTP block's buffers.
                 step: rows * per_row + logits + weights / 64 + 64 * MIB + step_extra,
                 per_sequence,
                 per_page: page_bytes(c, placement, index, options),
@@ -617,7 +617,7 @@ fn read_vocabulary(path: &Path) -> Result<Arc<[u32]>, LoadError> {
     Ok(tokens.into())
 }
 
-/// The placement of `spread`, with the draft block where `Qwen35::new` puts
+/// The placement of `spread`, with the MTP block where `Qwen35::new` puts
 /// it, to estimate with.
 fn place(
     c: &Config,
@@ -846,7 +846,7 @@ fn load_qwen35(
         config.n_embd,
         config.n_vocab,
         config.n_ctx,
-        if config.n_nextn == 1 { "with a draft block" } else { "no draft block" },
+        if config.n_nextn == 1 { "with an MTP block" } else { "no MTP block" },
     );
 
     // What can be refused before a device is touched.
@@ -863,24 +863,24 @@ fn load_qwen35(
     // The model drafters that take part: all the model has unless the operator
     // names them. Nothing speculates without one, the n-gram drafter
     // included.
-    let mtp = draft_block_takes_part(
+    let mtp = mtp_takes_part(
         options,
         config.n_nextn == 1,
-        "this model file has no draft block (multi-token prediction)",
+        "this model file has no MTP block (multi-token prediction)",
     )?;
-    // The model's draft block is not built for a layer split (the block, the
+    // The model's MTP block is not built for a layer split (the block, the
     // device that embeds and the first rows of the head must be one device).
     let layer = options.split == Some(SplitKind::Layer);
     if mtp && layer && options.drafters.is_some() {
         return Err(refuse(
-            "--drafters mtp: the model's draft block is not built for a layer split; use a \
+            "--drafters mtp: the model's MTP block is not built for a layer split; use a \
              single device or a tensor split",
         ));
     }
     let blocked_by_layer = mtp && layer;
     let mtp = mtp && !layer;
     // A DFlash drafter from a file: on the device that embeds and holds the
-    // first rows of the head, as the draft block.
+    // first rows of the head, as the MTP block.
     let dflash = dflash_drafter(options)?;
     if let Some(file) = &dflash {
         if layer {
@@ -906,7 +906,7 @@ fn load_qwen35(
     let drafts = mtp || dflash.is_some();
     if options.window.is_some() && !drafts {
         return Err(refuse(if blocked_by_layer {
-            "--window: the model's draft block is not built for a layer split, so no window is \
+            "--window: the model's MTP block is not built for a layer split, so no window is \
              reserved"
         } else {
             "--window without a model drafter does nothing"
@@ -915,7 +915,7 @@ fn load_qwen35(
     let vocabulary = match &options.draft_vocabulary {
         Some(_) if !drafts => {
             return Err(refuse(
-                "a draft vocabulary is for the model's draft block, and no drafter of that kind \
+                "a draft vocabulary is for the model's MTP block, and no drafter of that kind \
                  takes part",
             ));
         }
@@ -1069,7 +1069,7 @@ fn load_qwen35(
     let placement = place(&config, &weights, &spread, &part_options)?;
     if vocabulary.is_some() && placement.draft.is_none() {
         return Err(refuse(
-            "a draft vocabulary is for the model's draft block, which is not built for a layer \
+            "a draft vocabulary is for the model's MTP block, which is not built for a layer \
              split",
         ));
     }
@@ -1171,20 +1171,20 @@ fn load_qwen35(
             ares_cuda::Precision::Exact => "exact (f16 on the tensor cores for every product)",
         },
         match (drafts, &placement.draft) {
-            (false, _) if blocked_by_layer => "no speculation: the model's draft block is not \
+            (false, _) if blocked_by_layer => "no speculation: the model's MTP block is not \
                  built for a layer split, and earlier text alone is not a drafter"
                 .to_owned(),
             (false, _) => match options.drafters {
                 Some(_) => "no drafters (--drafters none): no speculation".to_owned(),
-                None => "no model drafter (the file has no draft block): no speculation".to_owned(),
+                None => "no model drafter (the file has no MTP block): no speculation".to_owned(),
             },
             (true, Some(draft)) => format!(
                 "drafts from {} on device {} ({}) and from earlier text, windows of up to \
                  {window} rows; whose drafts and how many are chosen for every step from the \
                  price of a step, measured at load, and the acceptance, measured while running",
                 match (mtp, &dflash) {
-                    (true, Some(_)) => "the model's draft block and the DFlash drafter",
-                    (true, None) => "the model's draft block",
+                    (true, Some(_)) => "the model's MTP block and the DFlash drafter",
+                    (true, None) => "the model's MTP block",
                     (false, _) => "the DFlash drafter",
                 },
                 held[draft.device].device.ordinal(),
@@ -1194,7 +1194,7 @@ fn load_qwen35(
                 }
             ),
             (true, None) => {
-                "no speculation: the model has no draft block on a device of this placement"
+                "no speculation: the model has no MTP block on a device of this placement"
                     .to_owned()
             }
         }
@@ -1437,7 +1437,7 @@ fn load_qwen35(
         tracing::info!(
             "device {} ({}): weights {} in {:.1} s{}{}, recurrent state {} ({} per sequence), K \
              and V {} ({} per 1000 tokens), exact K/V entries {}, step scratch {}, inputs kept \
-             for draft windows {}, draft block buffers {}, everything else {}; taken {}, free {}",
+             for draft windows {}, MTP block buffers {}, everything else {}; taken {}, free {}",
             h.device.ordinal(),
             report.device,
             Bytes(report.weight_bytes),
@@ -1445,7 +1445,7 @@ fn load_qwen35(
             report
                 .draft
                 .as_ref()
-                .map(|d| format!(" (of which the draft block {})", Bytes(d.weights)))
+                .map(|d| format!(" (of which the MTP block {})", Bytes(d.weights)))
                 .unwrap_or_default(),
             embedding_note(&report.embedding),
             Bytes(state),

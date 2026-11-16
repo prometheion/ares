@@ -130,12 +130,13 @@ impl ContextSpec {
 /// conductor needs of one is its kind and the most drafts it makes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum DrafterKind {
-    /// One more layer of the model's own kind (multi-token prediction), from
-    /// the model file or a file of its own: a chain of links, each of which
-    /// costs device time, and which can end early by its probabilities.
-    Block,
-    /// A block drafter from a file of its own that reads taps of the model
-    /// (DFlash2): one pass makes every draft of a window, so a draft more
+    /// `mtp`: one more layer of the model's own kind (multi-token
+    /// prediction), from the model file or a file of its own: a chain of
+    /// links, each of which costs device time, and which can end early by its
+    /// probabilities.
+    Mtp,
+    /// `dflash`: a block drafter from a file of its own that reads taps of
+    /// the model (DFlash2): one pass makes every draft of a window, so a draft more
     /// costs no device time once the pass runs.
     Dflash,
 }
@@ -144,7 +145,7 @@ impl DrafterKind {
     /// The name the statistics and the logs use.
     pub fn name(self) -> &'static str {
         match self {
-            DrafterKind::Block => "draft block",
+            DrafterKind::Mtp => "mtp",
             DrafterKind::Dflash => "dflash",
         }
     }
@@ -153,7 +154,7 @@ impl DrafterKind {
     /// ([`Counters::drafts_tested_at`](crate::Counters)): the n-gram drafter is 0.
     pub fn source(self) -> usize {
         match self {
-            DrafterKind::Block => 1,
+            DrafterKind::Mtp => 1,
             DrafterKind::Dflash => 2,
         }
     }
@@ -333,11 +334,11 @@ pub struct Logits {
 
 /// Where a device part left the tokens it drafted itself for the windows of a
 /// step: `tokens` u32 on the device, the drafts of each window with the
-/// record's own-drafts flag in the order of the record's segments, window
+/// record's model-drafts flag in the order of the record's segments, window
 /// after window, whichever of the model's drafters made them. `u32::MAX` is a
 /// draft the part could not make.
 #[derive(Clone, Copy, Debug)]
-pub struct OwnDrafts {
+pub struct ModelDrafts {
     pub ptr: DevicePtr,
     pub tokens: u32,
 }
@@ -382,8 +383,8 @@ pub trait DeviceModel: Send {
     }
 
     /// Where the step enqueued last left the tokens this part drafted itself
-    /// (a model with a draft block of its own); `None` when it drafted none.
-    fn own_drafts(&self) -> Option<OwnDrafts> {
+    /// (a model with an MTP block); `None` when it drafted none.
+    fn model_drafts(&self) -> Option<ModelDrafts> {
         None
     }
 
@@ -401,17 +402,17 @@ pub trait DeviceModel: Send {
 
     /// Device milliseconds the part's own drafter took in the step that ran
     /// last. Asked after that step has ended.
-    fn own_draft_ms(&mut self) -> f64 {
+    fn model_draft_ms(&mut self) -> f64 {
         0.0
     }
 
     /// The probability the part's drafter gave each draft of the step that ran
-    /// last, in the order of [`DeviceModel::own_drafts`], appended to `out`:
+    /// last, in the order of [`DeviceModel::model_drafts`], appended to `out`:
     /// as many as there are drafts, or none from a drafter that does not
     /// report them. A link that was not made (the chain ended before it) is
     /// NaN, and its draft is not a draft whatever the device holds there.
     /// Asked after the step has ended.
-    fn own_draft_probs(&mut self, _out: &mut Vec<f32>) {}
+    fn model_draft_probs(&mut self, _out: &mut Vec<f32>) {}
 
     /// The rows of the step that ran last whose results are not what each row
     /// would give alone, appended to `out` in any order. Only rows of a window
@@ -529,7 +530,7 @@ pub trait Model: Send + Sync + 'static {
     /// The drafters the model runs on its devices, none by default. The
     /// record names a drafter by its place in this list plus one (0 is the
     /// runtime's n-gram drafter, whose drafts are tokens of the record): a window
-    /// whose drafts drafter `i` makes has the record's own-drafts flag, the
+    /// whose drafts drafter `i` makes has the record's model-drafts flag, the
     /// drafter's id, and no tokens for its draft rows.
     fn drafters(&self) -> Vec<Drafter> {
         Vec::new()

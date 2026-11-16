@@ -11,7 +11,7 @@ use ares_cuda::{DevicePtr, ENTRY_CELLS, PushSlot, Segment, Stream};
 use ares_gguf::Gguf;
 use ares_runtime::{
     ContextSpec, DeviceContext, DeviceModel, DeviceTransfer, Drafter, DrafterKind, Durable,
-    LinkSpec, Links, Logits, Model, ModelError, OwnDrafts, PrefixCache, Split, StepContext,
+    LinkSpec, Links, Logits, Model, ModelDrafts, ModelError, PrefixCache, Split, StepContext,
     TransferContext,
 };
 use ares_state::PageLayout;
@@ -391,7 +391,7 @@ impl Model for Qwen35 {
         let mut drafters = Vec::new();
         if self.placement.mtp().is_some() {
             drafters.push(Drafter {
-                kind: DrafterKind::Block,
+                kind: DrafterKind::Mtp,
                 drafts: self.options.window_rows.saturating_sub(1),
             });
         }
@@ -718,15 +718,15 @@ impl DeviceModel for Qwen35Device {
         self.part.head_tokens()
     }
 
-    fn own_drafts(&self) -> Option<OwnDrafts> {
-        self.part.drafted().map(|d| OwnDrafts { ptr: d.ptr, tokens: d.tokens })
+    fn model_drafts(&self) -> Option<ModelDrafts> {
+        self.part.drafted().map(|d| ModelDrafts { ptr: d.ptr, tokens: d.tokens })
     }
 
-    fn own_draft_probs(&mut self, out: &mut Vec<f32>) {
+    fn model_draft_probs(&mut self, out: &mut Vec<f32>) {
         self.part.draft_probs(out);
     }
 
-    fn own_draft_ms(&mut self) -> f64 {
+    fn model_draft_ms(&mut self) -> f64 {
         // A failed read of the events is not worth failing the step for:
         // the cost then stays what it was measured as before.
         self.part.draft_chain_ms().unwrap_or(0.0)

@@ -60,7 +60,7 @@ between cards stay with the model. Today the two models share almost nothing ins
       `--drafters <file>` for a separate MTP or DFlash file); the draft vocabulary as one
       head view for every drafter that projects to the vocabulary, on every model. Brings
       Flash-Next's draft vocabulary and picks on the card, the 27B's drafts under a layer split.
-- [x] 7. Drafters as kinds of the runtime (ngram, draft block, DFlash): `Model::drafters`, the
+- [x] 7. Drafters as kinds of the runtime (ngram, MTP block, DFlash): `Model::drafters`, the
       drafter's id in word 6 of a segment, a price curve, acceptance and confidence per drafter.
 - [x] 8. DFlash2 chains on both models: each model gives only its tap (the 27B the residual `x`,
       Flash-Next the mean of its four streams), its embedding rows and its draft head; the loader
@@ -88,8 +88,8 @@ between cards stay with the model. Today the two models share almost nothing ins
       Suspected: a page on its way from RAM to the SSD is found in neither while the write runs.
 
 ### Speculation that pays (output unchanged)
-The draft block is in `main` (`--drafters <file>`): exact. Measured 2026-11-16 on two cards
-with `--ram 8G` (the runs are in "What made the draft block of Flash-Next pay" in
+The MTP block is in `main` (`--drafters <file>`): exact. Measured 2026-11-16 on two cards
+with `--ram 8G` (the runs are in "What made the MTP block of Flash-Next pay" in
 `ARCHITECTURE.md`): with the block 21 to 35 tokens per second on new text and 27 to 64 the
 second time, against 13 to 22 and 17 to 29 without it at about the same load; one server
 asked with and without drafts in turn gave 12 to 35 % more with them on the mean. On one
@@ -104,7 +104,7 @@ other differed more by the load than by the drafts.
 - [x] Window prices that follow the tiers: a size's price is the mean of its last eight
       steps without the largest, and a size that has not run for 256 steps is tried again
       at the price of the nearest smaller size that runs (`ares_sched::Curve`).
-- [x] All 512 experts of the draft block resident in VRAM (675 MiB, a pool of their own
+- [x] All 512 experts of the MTP block resident in VRAM (675 MiB, a pool of their own
       outside the tiers, `LayerSpec::resident`): a link costs 1.4 to 1.6 ms where it took
       5 to 9.
 - [x] Chain cut per token by the draft's own probability: the links. The block reports the
@@ -121,7 +121,7 @@ other differed more by the load than by the drafts.
       `--ram 8G` and took the gain away.
 - [x] What a row was left without is read ahead for the next round (`StoreConfig::read_left`):
       without it leaving only moved the read to the next round's first row.
-- [ ] Draft vocabulary (German, English, code) for the draft block: the block's head is the
+- [ ] Draft vocabulary (German, English, code) for the MTP block: the block's head is the
       model's whole output head (248 320 rows) on the device with the head; a subset of its
       rows gathered next to it, and the block's sampler mapping back to token ids, as the
       27B does it (`--draft-vocab`). Not started.
@@ -166,7 +166,7 @@ prompt (0.98 to 1.00 reads per distinct expert). To be read in its code before i
       reach 0.7 to 0.8; the gain of larger ones could not be measured on the shared drive), or
       answering once VRAM is filled and filling the RAM tier behind it until the first request
       (which then misses what RAM would have held).
-- [ ] The draft block's experts in the usage profile (they are filled in the order of their
+- [ ] The MTP block's experts in the usage profile (they are filled in the order of their
       numbers at the start, as before).
 - [ ] The slots per layer from the profile when the store is planned (`StorePlan::new` takes
       a heat; the runtime passes none, and the slots move between layers by need as it runs).
@@ -292,12 +292,12 @@ prompt (0.98 to 1.00 reads per distinct expert). To be read in its code before i
 
 ### Parity with the 27B (the owner's rule: what one model can, the other must)
 Everything `FEATURES.md` lists for the 27B and not for Flash-Next is owed:
-- [x] K and V in `q7` to `q4`, separately for K and V; the draft block's K and V in `q4`
+- [x] K and V in `q7` to `q4`, separately for K and V; the MTP block's K and V in `q4`
       (2026-11-16, the shared K/V group). Open: a row of a draft window past the dense limit
       that reaches across the point where a tile leaves the newest cells reads that tile exact,
       not converted as the row alone would (rows within the limit read it as alone); the
       share of drafts accepted with the block's `q4` was not measured on this model.
-- [x] The prefix cache with its RAM and SSD levels (2026-11-16). Open: the draft block's last
+- [x] The prefix cache with its RAM and SSD levels (2026-11-16). Open: the MTP block's last
       cell of a page waits for the next token (the block is one token behind), so a page that is
       cached at a sequence's end has it unwritten and a sequence that resumes there writes it
       into the shared page while its tile is exact; only drafts can differ. With `--ram` small
@@ -312,7 +312,7 @@ Everything `FEATURES.md` lists for the 27B and not for Flash-Next is owed:
       On the made-up Flash-Next under a limit the tier takes whole the place kept its first
       checkpoint over three turns (1 saved, 2 restored, 242 of 498 found rows replayed): a later
       checkpoint did not take the place over there; not looked into.
-- [ ] The draft block read from the model file (`--drafters mtp`) and a draft vocabulary.
+- [ ] The MTP block read from the model file (`--drafters mtp`) and a draft vocabulary.
 - Not owed (the owner, 2026-11-16): replies that are bit for bit the same from run to run.
   They differ slightly when the CPU computes missed experts, and that is accepted.
 - [ ] Structured output, tool calls and the Messages and Responses routes have never run on
@@ -334,13 +334,13 @@ Everything `FEATURES.md` lists for the 27B and not for Flash-Next is owed:
       differently from single rows.
 - [ ] Layout choice that is stable: it rests on the fastest of three probe rounds; a link of
       the draft chain costs 1.49 ms where 1.44 ms is possible; the choice changes between
-      loads and with the draft block; the 0.8B decodes 5 % slower than it could.
+      loads and with the MTP block; the 0.8B decodes 5 % slower than it could.
 - [ ] `qwen35_run` aborts a direct prompt run with `--kv q5,q5` (reserve for partial states).
 - [ ] Float matrices under the fast precision use f16 sums (0.04 to 0.06 % rms) where the
       F32 matrices of an IQ4_XS file were exact before: decide with a KL measurement.
 - [ ] VRAM and quality against the fork at equal settings: never measured.
 - [ ] Prompt on the RTX 3060 alone is 3 % behind the fork.
-- [ ] The model's own drafts for the thinking rows of a request that has to call a tool;
+- [ ] The model's drafts for the thinking rows of a request that has to call a tool;
       drafts while a rule is bound.
 - [ ] Sampler: a row with no finite logit reports `-0.0` where the reference says minus
       infinity; deciding a level got slower (35 to 42 us); a list of the set's tokens after
@@ -384,7 +384,7 @@ becomes a block is in `ARCHITECTURE.md` ("The shared model layer"). Left, in the
       fusion, `rows x n_embd`) must reach the head's device; the hand-over lane could carry it.
 - [ ] The DFlash ring in the prefix cache's checkpoints (42 MiB a slot in f16): a sequence that
       resumes from the cache drafts from the resume point's context only until its ring fills.
-- [ ] Sampled DFlash drafts: the walk is greedy; keyed noise in the scores (as the draft block's
+- [ ] Sampled DFlash drafts: the walk is greedy; keyed noise in the scores (as the MTP block's
       picks have) would raise sampled acceptance (study: 2 to 8 %).
 - [ ] The 27B with the DFlash drafter at the default split and a 32k context in `qwen35_run`:
       the tool sizes its pool without the drafter and the device's ledger refuses the drafter
@@ -547,7 +547,7 @@ Measured per phase on a quiet machine against the fork and Strata, the largest f
       pairs at load 5 to 10): medians 23.3 to 25.2 ms before, 21.8 to 24.7 after, fastest 18.4 both.
 - [ ] Flash-Next with the owner's real limit (a RAM tier of 24 to 26 GiB), one card and two.
 - [ ] The SSD cache's times to the first token (taken under load so far).
-- [ ] Flash-Next with its draft block once speculation pays; target above 56 tokens/s.
+- [ ] Flash-Next with its MTP block once speculation pays; target above 56 tokens/s.
 - [ ] Before a release: both models against the fork, Strata and TokenWing (Flash-Next), speed,
       VRAM, quality.
 

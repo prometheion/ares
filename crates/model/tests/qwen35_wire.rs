@@ -330,8 +330,8 @@ fn what_each_drafter_is_worth_on_the_27b() {
             c.drafts_rejected,
             by_source(0),
             by_source(1),
-            c.own_draft_links,
-            c.own_draft_us as f64 / 1e3 / c.own_draft_links.max(1) as f64,
+            c.model_draft_links,
+            c.model_draft_us as f64 / 1e3 / c.model_draft_links.max(1) as f64,
         );
         if let Some(dir) = &out {
             std::fs::create_dir_all(dir).unwrap();

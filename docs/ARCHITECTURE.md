@@ -181,8 +181,8 @@ machine (RTX 4070 + RTX 3060, Qwen3.8-27B) or read from the engines listed in
 | `ares-weights` | Expert heat, tiers that are elected and fed by reads (admission, protection, guesses bound late, slots given back), slots per layer by need, the waves of experts of a pass, a token table for the first layers, the lookahead distance, which experts a tier holds (for the routers' pruning) | Done, unit tested; the expert store uses the slot sets, the heat, the swap rule and the split of slots; the guess queue, the token table and the waves are not used by a running model yet (the lookahead distance only by a guess of `qwen4exp` that is switched off) |
 | `ares-api` | Request (with every sampling field), event (text and probabilities), decision and error types; the `Engine` trait between HTTP and the runtime (`submit` for generation, `decide` for decisions, `stats`, `chat_format` for what a model's chat template declares about thinking) | Done, unit tested |
 | `ares-server` | The `ares` binary: loads a model on the devices and serves it over an OpenAI-compatible HTTP API, with the plan of devices, split, shares and context made from what the devices report | Serves `qwen35` and `qwen4exp` models (chat and plain completions, streamed and not, every sampling field and the probabilities of the tokens, `n` completions, timings, metrics, staged shutdown, the reasoning of a reply apart from its content and in the history, with llama-server's controls for thinking, tool calls held to the tools' schemas by a grammar, also when the model opens the call inside its thinking); 213 tests without a GPU, 17 that start the real binary (some need the 27B or the files of Flash-Next) and 26 that run the engine in the test's process (the 8 of tool calls have not been run); for `qwen35` the prefix cache is on, with `--ram` for the engine's RAM, for `qwen4exp` the RAM is mostly the tier of experts; a router mode that serves several models from a preset file, loads them on request and unloads them for room or when idle (host tests of the preset reader and of the state machine on a scripted loader; its 2 tests on real devices have not been run); no multimodal input, `/v1/systemone` answers 501 |
-| `ares-runtime` | The conductor thread and one thread per device, the step loop that connects plan, state and kernels, admission, speculation with the n-gram drafter and with a model's own drafts, the `Model` trait a model implements, a synthetic model that drives the real kernels, and the expert store (VRAM slots, RAM tier, reads, the CPU computing what is not on a GPU) | Drives `qwen35` on one device, in tensor split and in layer split, with picks made on the device; implements `Engine::submit` (not `decide`); the prefix cache is in the conductor, checked against the host executor as an oracle and carried out by `qwen35` on the devices (checkpoints in page-locked RAM within one RAM limit, `PinnedRam`), and there is no spill of pages to RAM (a request that gives way stays in the pool's cache); the expert store is driven by the device threads of `qwen4exp` (see [Qwen3.8-Flash-Next through the runtime](#qwen38-flash-next-through-the-runtime)) |
-| `ares-model` | Model architectures: configuration and weight table from a GGUF, a CPU reference of the forward pass with explicit state (window and commit) that GPU implementations are compared with block by block, and the implementation on the devices | `qwen35` (Qwen3.5-0.8B, Qwen3.8-27B) runs through the runtime and the server, with the model's draft block. `qwen4exp` (Qwen3.8-Flash-Next) runs through the runtime and the server on one or two cards, without speculation (it has no draft head built, and the n-gram drafter takes part only next to a model drafter), and through a session of its own that tests and measurements use. See [Several devices](#several-devices). The image tower `qwen3vl` (a CPU reference and the pass on one device, its weights in VRAM or in page-locked RAM) is not spliced into either model yet |
+| `ares-runtime` | The conductor thread and one thread per device, the step loop that connects plan, state and kernels, admission, speculation with the n-gram drafter and with a model's drafts, the `Model` trait a model implements, a synthetic model that drives the real kernels, and the expert store (VRAM slots, RAM tier, reads, the CPU computing what is not on a GPU) | Drives `qwen35` on one device, in tensor split and in layer split, with picks made on the device; implements `Engine::submit` (not `decide`); the prefix cache is in the conductor, checked against the host executor as an oracle and carried out by `qwen35` on the devices (checkpoints in page-locked RAM within one RAM limit, `PinnedRam`), and there is no spill of pages to RAM (a request that gives way stays in the pool's cache); the expert store is driven by the device threads of `qwen4exp` (see [Qwen3.8-Flash-Next through the runtime](#qwen38-flash-next-through-the-runtime)) |
+| `ares-model` | Model architectures: configuration and weight table from a GGUF, a CPU reference of the forward pass with explicit state (window and commit) that GPU implementations are compared with block by block, and the implementation on the devices | `qwen35` (Qwen3.5-0.8B, Qwen3.8-27B) runs through the runtime and the server, with the model's MTP block. `qwen4exp` (Qwen3.8-Flash-Next) runs through the runtime and the server on one or two cards, without speculation (it has no draft head built, and the n-gram drafter takes part only next to a model drafter), and through a session of its own that tests and measurements use. See [Several devices](#several-devices). The image tower `qwen3vl` (a CPU reference and the pass on one device, its weights in VRAM or in page-locked RAM) is not spliced into either model yet |
 
 Both test architectures are specified under [reference/](reference/):
 [qwen35](reference/qwen35-architecture.md) and
@@ -221,8 +221,8 @@ The blocks so far:
   inside a draft window read converted from its position on), prepares a
   step (conversions, exact slots, the table), settles a draft window at its
   commit, and copies, sends to the host and takes back a page in the form it
-  has. The 27B has two groups: its attention blocks, and its draft block.
-  Flash-Next's attention layers are a group too, and so is its draft block
+  has. The 27B has two groups: its attention blocks, and its MTP block.
+  Flash-Next's attention layers are a group too, and so is its MTP block
   (a part of one layer), whose K and V are `q4` whatever the model's. Its
   table is the attention half of the part's tables, which hold the
   conductor's entries; the group writes the entries of exact tiles over them
@@ -259,8 +259,8 @@ The blocks so far:
   (`SlotLayout`: the recurrent block its windows and matrices, Flash-Next's
   indexers their carried keys and its n-gram block its history), and a
   sequence that starts in a slot starts from zeros. A **checkpoint** is the
-  extents a model declares (the slot, and state outside it: a draft block's
-  carry, the slot of a draft block that is a part of its own) and bytes the
+  extents a model declares (the slot, and state outside it: an MTP block's
+  carry, the slot of an MTP block that is a part of its own) and bytes the
   host keeps of the sequence itself (Flash-Next's n-gram feed: its position
   and last tokens), in a place in page-locked RAM (`Places`, locked in chunks
   as they come into use). A **page** is every K/V group of the device (tag bit
@@ -273,7 +273,7 @@ The blocks so far:
   it opens (`Declared`: the bytes of a checkpoint, the groups with their
   formats and geometries, the bytes of the arrays); the fingerprint stays the
   model's. Both models run on it: the 27B's checkpoint is its slot and its
-  draft block's carry row, Flash-Next's is described in "Qwen3.8-Flash-Next
+  MTP block's carry row, Flash-Next's is described in "Qwen3.8-Flash-Next
   through the runtime". Moved from the 27B as it was (its five fingerprint
   cases bit for bit, the same copies and kernels in the same order; measured
   2026-11-16 in alternation, three runs each at loads of 6 to 28: a decode
@@ -513,7 +513,7 @@ one array per part, indexed by page number.
   copies themselves are the device's part (`qwen35` does them, see below).
   The state is `f32` today: 150
   MiB for Qwen3.8-27B over both cards (94 and 56 MiB at shares of 0.625 /
-  0.375), plus 20 KiB for the draft block's carry.
+  0.375), plus 20 KiB for the MTP block's carry.
   - Where: only at page boundaries and at the end of a tail. Inside a prompt
     at least 32 768 cells apart, while generating at least 2 048, measured
     from the last checkpoint on the sequence's own path; always at the
@@ -590,22 +590,22 @@ one array per part, indexed by page number.
   rows):
   - **A checkpoint** of a device part is its slot of the recurrent state (the
     convolution windows and delta-rule matrices of its blocks) and, on the
-    device that holds the draft block, one row of the block's carry. It lies
+    device that holds the MTP block, one row of the block's carry. It lies
     in **page-locked host memory**, not in VRAM: a save is a copy from the
     device and a restore a copy to it, queued on the step's stream, so the
     stream orders them against the kernels. The places are locked in chunks
     (at least 32 MiB) when one is first used, within the engine's RAM limit
     (see "Host memory").
   - **A page copy** copies the whole entry of the page, for every attention
-    block and for the draft block's own array (the cells of an entry lie in
+    block and for the MTP block's own array (the cells of an entry lie in
     planes per head, and cells past those the sequence has are written before
     they are read).
   - **A replay** is a prompt step whose rows append nothing: the K/V append of
-    every attention block and of the draft block's follow of the model runs
+    every attention block and of the MTP block's follow of the model runs
     per run of rows that write, and the rows of a replay are left out. All
     else runs as for a prompt, which advances the recurrent state and leaves
     the carry at the last row.
-  - **The draft block's state per sequence** is its carry (the final hidden
+  - **The MTP block's state per sequence** is its carry (the final hidden
     state of the sequence's last row: the first row of a segment reads it for
     the block's keys and values at its position, and the next chain of drafts
     starts from it) and its keys and values, which lie in the pool's pages
@@ -646,7 +646,7 @@ one array per part, indexed by page number.
     tokens reads at 1228 to 1241 tokens per second before and 1227 to 1241
     after, a decode step without drafts at 1000 tokens takes 26.0 and 25.9 ms
     before and 26.0 and 26.1 ms after (the 24.8 ms of an earlier day is not
-    this machine's today), and with the model's own drafts (3 per window, the
+    this machine's today), and with the model's drafts (3 per window, the
     fork's draft vocabulary, 300 tokens, most probable token) German, English
     and code give 79.5 / 76.2, 73.3 / 76.5 and 75.9 / 74.4 tokens per second
     before and 77.8 / 77.6, 76.5 / 80.3 and 78.3 / 81.5 after (78.4, 75.2 and
@@ -718,7 +718,7 @@ between sequences by the tokens up to its own end.
 `ares-model`, `blocks/kv.rs` and `blocks/forms.rs`). The engine's pool holds
 converted entries only: page `p` is slot `p` of the converted pool of every
 attention layer, 128 cells in the format. The exact entries (a tile in `f16`) are a second pool on each device,
-for the attention blocks and for the draft block separately, which a page
+for the attention blocks and for the MTP block separately, which a page
 holds a slot of while it is exact: from its first write until it is full and
 has left the newest cells of every sequence that reads it. The conductor knows
 nothing of this beyond one thing, the pages the pool freed, which every step
@@ -873,7 +873,7 @@ on the cards. What RAM holds and what goes first is
   `ares_cache_ram_transfer_nanoseconds_total`.
 - **Measured** 2026-11-16 with the server: Qwen3.8-27B Q4_K_S on the RTX 4070
   and the RTX 3060, tensor split 0.625 / 0.375, two sequence slots, the
-  model's draft block on, `--ram 3G`, `--context 32768` (so that another
+  model's MTP block on, `--ram 3G`, `--context 32768` (so that another
   conversation of 29 322 tokens pushes the first one out of the cards), and
   `--cache` on the btrfs volume (compressed, shared with other work). A
   conversation A of about 8k or 30k tokens (a list of facts and a
@@ -977,7 +977,7 @@ and after a restart of the server. Nothing is written as it is computed.
   prompt then starts as from any cached prefix. A record that cannot be read
   or fails its checksum ends its run and is forgotten; the prompt computes
   from there.
-- **Forms.** With `q7` to `q4`, and for the draft block always, a page is an
+- **Forms.** With `q7` to `q4`, and for the MTP block always, a page is an
   exact entry while it is the first tile or among the newest cells and a
   converted one later. A page goes to RAM, and from there to the store, in
   the form it has when it leaves the devices, with a tag; the pages a request
@@ -1047,7 +1047,7 @@ and after a restart of the server. Nothing is written as it is computed.
   computed, through buffers of ordinary memory) 2026-11-15 with the server and
   `--cache`: Qwen3.8-27B Q4_K_S
   on the RTX 4070 and the RTX 3060, tensor split 0.625 / 0.375, two sequence
-  slots, the model's draft block on. A conversation whose first prompt has
+  slots, the model's MTP block on. A conversation whose first prompt has
   29 322 tokens (a list of 1900 lines and a question) and whose second turn
   adds the reply and another question (29 354 tokens); requests on
   `/v1/completions`, most probable token, time to the first token of the
@@ -1148,12 +1148,12 @@ the grammar refuses before it is verified (vLLM).
 a flag or a constant of this machine:
 
 - *Drafting is always on.* The operator chooses which **model** drafters take
-  part (`--drafters`: the model's own draft block, `mtp`, by default if the
+  part (`--drafters`: the model's MTP block, `mtp`, by default if the
   file has one; `none`; later a block drafter from a file of its own) and the
   room for windows (`--window`). The n-gram drafter costs nothing to
   ask and takes part as soon as at least one model drafter does, never on its
   own: a server with no model drafter (`--drafters none`, a file without a
-  draft block, a layer split, which has no draft block) does not speculate,
+  MTP block, a layer split, which has no MTP block) does not speculate,
   and says so in the plan.
 - *The price of a step is a table*, by its rows, because the weight kernels
   read their rows in launches of eight and a ninth row is a second launch
@@ -1271,7 +1271,7 @@ chains are asked longer than the average draft would carry and the chain
 decides per token how far it goes.
 
 **The chain runs in a step of its own, and the round verifies what pays of
-it.** A round in which sequences take the model's own drafts is two records
+it.** A round in which sequences take the model's drafts is two records
 (`Conductor::chains_first`). The first only drafts (a flag of the record): its
 segments are the windows whose drafts the model makes, as long as their
 chains are asked, with the sampler rows their links pick with and the draft
@@ -1315,7 +1315,7 @@ What each drafter does with the bars in the step that only drafts:
   table would not carry the reach over it) the device thread waits for those
   picks before it enqueues the next link; where no pick could end it,
   nothing is waited for.
-- *The draft block of Flash-Next* reads every pick on the host as before, so a
+- *The MTP block of Flash-Next* reads every pick on the host as before, so a
   chain that ends there costs no wait of its own.
 
 Measured 2026-11-15, the build before this work against the build with it,
@@ -1389,7 +1389,7 @@ were accepted. It was slower for them:
 
 | Tokens per second, German, English, code | round 1 | round 2 | round 3 |
 | --- | --- | --- | --- |
-| with the draft block (load 15 to 19) | 17.9, 18.5, 15.9 | 24.0, 23.8, 21.9 | 55.1, 27.0, 23.1 |
+| with the MTP block (load 15 to 19) | 17.9, 18.5, 15.9 | 24.0, 23.8, 21.9 | 55.1, 27.0, 23.1 |
 | without (load 9) | 34.8, 29.0, 19.9 | 38.5, 35.1, 23.3 | 39.7, 39.3, 26.0 |
 
 A step with a window reads 9 to 56 experts from the file where a step of one
@@ -1402,7 +1402,7 @@ before this work chose windows in seven of nine requests of the same run and
 was no faster (28.9, 14.1, 8.6; 11.8, 12.6, 10.6; 12.9, 18.6, 14.6 at loads
 of 20 to 42). What came of it on 2026-11-16 follows.
 
-**What made the draft block of Flash-Next pay** (2026-11-16, RTX 4070 and RTX
+**What made the MTP block of Flash-Next pay** (2026-11-16, RTX 4070 and RTX
 3060, both on every layer, `--ram 8G`, thinking off, greedy, 200 tokens of
 German prose, English prose and code, each prompt twice; the machine was
 shared with other agents' builds and servers all night, at load averages of
@@ -1556,7 +1556,7 @@ microseconds to read and a draft 0.4, eight and thirty times what the match of
 the last three costs; a long prompt is therefore read into the corpus as its rows
 are committed, not at once.
 
-**The model's own drafts** (`qwen35`, the next-token-prediction block of the
+**The model's drafts** (`qwen35`, the next-token-prediction block of the
 27B). The block's chain runs in the step that only drafts (see above), on the
 device that embeds (which keeps the rows of the tokens the chain can pick, see
 "The token embedding of `qwen35`"), each link's pick made by the sampler with
@@ -1665,10 +1665,10 @@ price table and the per-position estimates:
 (The numbers without drafts are through HTTP, the others from the tool, which
 runs the same engine; the run to run spread of a cell is about 5 %.) The
 windows of 4 and 8 rows differ where text is copied: the rewrite verifies
-chains of 7 links in six steps of ten and of 6 in three (the draft block is
+chains of 7 links in six steps of ten and of 6 in three (the MTP block is
 right 0.85 to 1.00 at each of the seven positions there, the n-gram drafter as well)
 and gains 28 to 36 % over 3 links, with 5.6 tokens a step against 3.6. Prose
-and code gain nothing from a longer chain: their draft block is right 0.6 to
+and code gain nothing from a longer chain: their MTP block is right 0.6 to
 0.8 at each position, so the chance of a whole chain falls with its length
 (0.7 to the fifth is 0.17), and the policy chooses chains of 3 to 6 from the
 price it measured (a link of the chain costs 1.5 ms, a row a fraction of a
@@ -1698,14 +1698,14 @@ it runs on its devices (`Model::drafters`: a kind and the most drafts it makes
 per sequence and step), and the record names them by their place in that list
 plus one. Two kinds exist:
 
-- **Draft block** (`DrafterKind::Block`): one more layer of the model's own
+- **MTP block** (`DrafterKind::Mtp`): one more layer of the model's own
   kind, a chain of links, each of which costs device time and can end the
   chain by the drafter's probability (the draft bars).
 - **DFlash** (`DrafterKind::Dflash`): a drafter model from a file of its own
   that reads taps of the model; one pass makes every draft of a window, so a
   draft more costs no device time once the pass runs.
 
-A window whose drafts a model drafter makes has the own-drafts flag in its
+A window whose drafts a model drafter makes has the model-drafts flag in its
 segment and the drafter's id in word 6. The conductor keeps per drafter a curve
 of what its drafts cost (measured at warm-up for 1 to the longest window, then
 by the steps that only draft), an acceptance per position (per sequence and of
@@ -1716,7 +1716,7 @@ only drafts makes the drafts of every window that takes a model drafter (a
 step in which two sequences took two drafters prices both curves with the
 step's time). The device part keeps one list of drafts per step, written at
 each window's place in segment order, whichever drafter made them; the
-statistics count drafts by source (ngram, draft block, DFlash).
+statistics count drafts by source (ngram, MTP block, DFlash).
 
 ### The DFlash drafter
 
@@ -1737,7 +1737,7 @@ after each candidate of the position before through the selector (a gate of
 256 values per row, rows of two tables of 256 values per token). The chain is
 the greedy walk through that lattice: at each position the best score after
 the pick before; its probability is the pick's share of the softmax of that
-row, which the conductor reads like the draft block's.
+row, which the conductor reads like the MTP block's.
 
 **What is shared and what is the model's.** The loader reads the shape from
 the file (block size, taps, selector, convolution, rotary base and sections,
@@ -1799,7 +1799,7 @@ the target's sampled picks verify them as any other drafts).
 the draft vocabulary, windows of 8, `qwen35_run --engine` with the speculation's seven requests of
 300 tokens, thinking on; load 4 to 22; `/var/tmp/ares-drafters/out`, means of the runs in brackets):
 
-| request | ngram + draft block (3 runs, load 4 to 6) | ngram + draft block + DFlash (3, load 11 to 22) | ngram + DFlash (3, load 5 to 21) |
+| request | ngram + MTP block (3 runs, load 4 to 6) | ngram + MTP block + DFlash (3, load 11 to 22) | ngram + DFlash (3, load 5 to 21) |
 | --- | ---: | ---: | ---: |
 | german | 89.4 (2.92) | 85.9 (3.07) | 90.6 (3.07) |
 | english | 86.3 (2.81) | 106.7 (3.83) | 113.2 (3.83) |
@@ -1811,7 +1811,7 @@ the draft vocabulary, windows of 8, `qwen35_run --engine` with the speculation's
 
 Tokens per second (tokens per step). The second column holds a run whose load rose from 11 to 33
 while it ran (74.7 to 144.2 tokens per second); without it the column is within 2 % of the third.
-Over the draft block alone the drafter gains +1, +31, +6, +20, +4, +1 and +21 % (tokens per step
+Over the MTP block alone the drafter gains +1, +31, +6, +20, +4, +1 and +21 % (tokens per step
 +5 to +36 %), and loses nowhere: the policy takes it where it pays. The DFlash drafter's drafts are
 accepted 0.78, 0.78, 0.74, 0.74, 0.81, 0.81 and 0.85 of the times each position is reached (1303 of
 1666 first drafts).
@@ -1837,13 +1837,13 @@ accepted 0.78, 0.78, 0.74, 0.74, 0.81, 0.81 and 0.85 of the times each position 
 - Flash-Next on two cards with `--ram 8G` (the server, German, English and code of 200 tokens, two
   rounds; tokens per second of generation, round 1 / round 2, load 4 to 15):
 
-  | request, round | draft block (2 runs) | draft block + DFlash (2) | DFlash (2) |
+  | request, round | MTP block (2 runs) | MTP block + DFlash (2) | DFlash (2) |
   | --- | ---: | ---: | ---: |
   | German, 1 / 2 | 27.2 / 36.8 | 26.4 / 41.4 | 31.1 / 37.4 |
   | English, 1 / 2 | 32.5 / 38.2 | 31.9 / 45.9 | 33.3 / 51.4 |
   | code, 1 / 2 | 19.9 / 31.6 | 22.4 / 32.2 | 24.9 / 38.5 |
 
-  The runs with the draft block alone ran at a load of 11 to 13, those with the drafter alone at 4
+  The runs with the MTP block alone ran at a load of 11 to 13, those with the drafter alone at 4
   to 5. The runs
   spread as the speculation's did (the tiers warm in round 1, and other agents' builds moved
   the load by a factor of two within a run); the order of the means is the measurement, not the
@@ -1901,9 +1901,9 @@ pick what the sequence picks one token at a time. They are:
   on the tokens that end a generation.
 
 A request with corrections that depend on the path (penalties, DRY) takes no
-drafts from the model's own draft block: those are made on the device while the
+drafts from the model's MTP block: those are made on the device while the
 step runs, and the host cannot correct a row for drafts it does not have yet. It
-takes the n-gram drafts, which the host has, wherever the model has a draft block
+takes the n-gram drafts, which the host has, wherever the model has an MTP block
 (the n-gram drafter joins next to a model drafter and never runs alone). A request with
 a mask is in the same position only while its rule binds: where the rule leaves
 the reply free it takes the model's drafts like any other request (see "Drafts"
@@ -1993,7 +1993,7 @@ and `requests_with_different_settings_in_one_step_do_not_affect_each_other_on_ev
 in `crates/runtime/tests/gpu.rs`), and `crates/runtime/tests/sampling.rs` checks
 the records of the windows against the definitions. The n-gram drafter
 drafts only next to a model drafter, so the tests on a real model use the 27B and
-its draft block, on both cards with exact products. There the texts were equal
+its MTP block, on both cards with exact products. There the texts were equal
 with drafts and without in all 14 settings through the server
 (`crates/server/tests/real_sampling.rs`: 437 draft rows verified, 425 of them
 right), equal under two rules about the tokens, and equal for requests that run
@@ -2163,7 +2163,7 @@ independent of the vocabulary. That is not built. For one row a pick is its
 launches: 3 microseconds each on the RTX 4070 and 5 on the RTX 3060, 22 of
 them for top-k with top-p.
 
-*In a decode step.* The 27B with its draft block and the vocabulary list on
+*In a decode step.* The 27B with its MTP block and the vocabulary list on
 both cards (`qwen35_run --engine 8 --generate 300 --sample`, seven prompts,
 windows of up to 16 rows, the logits of a row split between the cards; the
 kernels before and after in runs back to back, two pairs, load average 4 to 21):
@@ -2316,10 +2316,10 @@ cuts a forbidden draft, and the ones after it, from the n-gram drafter's proposa
 before the window is chosen (`TokenFilter::admitted`), so the rows are not paid
 for: a test with runs of one letter has every draft verified accepted, and 74 of
 119 without the cut. Tokens the rule forces (one token allowed) are not offered
-as drafts: the n-gram drafter is the drafter that joins next to a draft block, and a
+as drafts: the n-gram drafter is the drafter that joins next to an MTP block, and a
 forced token would be a third source with a chance of one; it is not built.
 
-*The model's own drafts.* The tokens of the draft block's drafts are not known
+*The model's drafts.* The tokens of the MTP block's drafts are not known
 when the record is written, so the rows of a window that takes them carry no
 mask. For the rows a rule leaves free that is exact: no mask applies there with
 drafts or without. Most rules are free for most of a reply (the reasoning before
@@ -2341,7 +2341,7 @@ drafts. A filter that does not say which rows it leaves free is taken to bind
 every row.
 
 On the host (`crates/runtime/tests/free_drafts.rs`, the synthetic model with
-text that never repeats and a draft block that is right nine times in ten, a
+text that never repeats and an MTP block that is right nine times in ten, a
 window of 8 rows, a step priced at 3 ms and 0.03 ms a row and 0.3 ms a link of
 the chain): a reply of 310 free tokens and 6 bound ones had 255 of the block's
 drafts accepted and took 60 steps, and one of 310 free tokens and a call of 42
@@ -2353,7 +2353,7 @@ a filter that is free and bound in turn, after which the drafts come back.
 On the devices the synthetic model shows the same on every placement
 (`a_rule_that_is_free_in_stretches_takes_the_models_drafts_on_every_placement`
 in `crates/runtime/tests/gpu.rs`: a rule that binds the last three of every 7,
-10 or 13 tokens, on a second runtime of a model whose draft block has seen the
+10 or 13 tokens, on a second runtime of a model whose MTP block has seen the
 reply): of a reply of 150 tokens, 22 to 30 windows took the block's drafts and
 56 to 92 of its drafts were accepted, and the reply is the one without drafts.
 On the 27B over both cards (`the_27b_calls_the_same_with_drafts_and_without`
@@ -2448,7 +2448,7 @@ pages) and comes with the runtime.
   tiers. Its bytes come out of the device's budget before the tiers get
   theirs (a budget that does not hold them is refused with what they need),
   a few RAM slots pass its experts through from the file when the store is
-  filled, and nothing evicts them or moves its slots. A model's draft block
+  filled, and nothing evicts them or moves its slots. A model's MTP block
   is such a layer: its router runs in every link of every chain, and a link
   that waits for an expert costs what a token costs. Flash-Next's block has
   512 experts in Q2_0, 675 MiB on the device with the output head.
@@ -3416,7 +3416,7 @@ for these rows each is fixed by the row alone:
   quantized K and V, is not taken for these rows: a window of rows has no
   kernel with its arithmetic that reads the cells once (its work is per
   vector, eight rows would cost it eight times one). It still serves the rows
-  that see a list of ranges (`qwen4exp`) and the links of the draft block's
+  that see a list of ranges (`qwen4exp`) and the links of the MTP block's
   chain, whose results are proposals.
 - The entries are the caller's: with `q7` to `q4` the rows of a window past
   the position at which a tile leaves the newest cells read it converted (see
@@ -3600,7 +3600,7 @@ per second with drafts from the MTP block and its production flags.
 | Decode without drafts, 1000 tokens of context | 24.8 ms (40.4 tokens/s) | 26.2 ms | 41.4 ms | 28 ms |
 | With the model's drafts, German / English / code | 79.3 / 75.6 / 79.0 tokens/s | | not built | 62 to 67 |
 | The same, sampled | 76.4 / 72.4 / 83.4 tokens/s | | | 63 to 66 |
-| VRAM taken at a context of 4096 | 9500 / 5410 MiB, with the draft block 10064 / 5540 | 10590 / 4362 MiB | 9582 / 5940 MiB | |
+| VRAM taken at a context of 4096 | 9500 / 5410 MiB, with the MTP block 10064 / 5540 | 10590 / 4362 MiB | 9582 / 5940 MiB | |
 
 The fork's numbers with drafts were measured on the same day on the same
 questions by running it with a copy of its production preset; the other fork
@@ -3635,7 +3635,7 @@ choosing them from a measurement at load is not built.
 **A decode step** without drafts is 24.8 ms, of which the weight products
 are 21 (the floor the memory bandwidth of the two cards sets is 22.0 ms for
 a pass over all weights). With the model's drafts a step is 34.1 ms for 2.5
-to 2.7 tokens: the draft block's chain takes about 4 ms of it (1.46 ms per
+to 2.7 tokens: the MTP block's chain takes about 4 ms of it (1.46 ms per
 draft token), the sampler 0.06 ms on the RTX 4070 and 0.28 ms on the RTX
 3060, the host 0.02 ms. At 32000 tokens of context a step without drafts
 was 28.2 ms *(measured by the agent that built the tensor split)*.
@@ -3663,17 +3663,17 @@ types). Where they come from (`device/embed.rs`):
   page-locked staging buffer, one row per row of the step, and uploads them
   on the step's stream in one copy right after the record; no event, no wait.
   A prompt step of 512 rows uploads 1.1 MiB of the UD-Q4_K_S file's table.
-- **The device itself, for the draft chain.** The model's own draft block
+- **The device itself, for the draft chain.** The model's MTP block
   picks tokens inside the step, on the device, and embeds them (the chain's
   next link, the verify window, the block following the model) before the
-  host knows them. So the device that holds the draft block keeps the rows of
+  host knows them. So the device that holds the MTP block keeps the rows of
   every token the chain can pick, which are the rows of the draft head: with
   a draft vocabulary those tokens in ascending order (the same list that
   orders the head, so the gather finds a row by binary search and nothing
   extra is stored), without one the first rows of the head on the device (the
   whole table when the device holds the whole head, and then the host stages
-  nothing). A device without a draft block keeps no row. The newest token of
-  a chain, which the host knows, is staged with the draft block's records.
+  nothing). A device without an MTP block keeps no row. The newest token of
+  a chain, which the host knows, is staged with the MTP block's records.
   The gather takes a row from the kept rows when they hold its token and
   from the staged row of its position otherwise.
 - **A tied head** (a file without `output.weight`, whose head is the table)
@@ -3699,7 +3699,7 @@ asked to, and what the devices hold would depend on it. The price is paid by
 an operator with little RAM and much VRAM, who must give the table its RAM
 (0.2 GiB to 0.5 GiB for the files above) and cannot choose the device
 instead. That choice is not built; the gather reads a whole table on the
-device already (the draft block without a vocabulary), so it would be a
+device already (the MTP block without a vocabulary), so it would be a
 decision of the placement.
 
 Measured on 2026-11-12 with `qwen35_run` on an RTX 4070 and an RTX 3060, a
@@ -3804,7 +3804,7 @@ before and after the change (1.48 ms to 1.50 ms against 1.48 ms to 1.51 ms in
 the device layout, 1.45 ms to 1.48 ms against 1.45 ms to 1.46 ms in the
 file's). What changed is the choice of the layouts on the first card ("Device
 layouts in the model"): before, the draft head (q6_K, 66 343 rows) and the
-two wide matrices of the draft block's feed-forward part (q6_K, 17 408 rows)
+two wide matrices of the MTP block's feed-forward part (q6_K, 17 408 rows)
 took the file's layout, now the device layout. The chooser times each layout
 in three rounds on a buffer as large as the device's weights and takes the
 fastest. For these matrices at one row every round of the file's layout
@@ -3822,7 +3822,7 @@ with the file's. A round that is 2 % or more faster than the other two of
 its product occurs in 7 to 9 of the 232 products timed on the first card, in
 other products with another size of the buffer. This is left as it is:
 getting the faster link back for a reason would take a probe that reads the
-draft block's matrices as a chain reads them (several times a step, a few
+MTP block's matrices as a chain reads them (several times a step, a few
 hundred megabytes apart) and a choice that does not rest on one round of
 three, and either changes the layouts of other matrices on both cards, which
 has to be measured as a change of its own.
@@ -3856,7 +3856,7 @@ rows), IQ4_XS and IQ4_NL of 3072 and 4608 columns (+3 to +6 %), Q4_K of 3072
 columns on the RTX 3060 (+4 %), Q5_K of 10752 rows on the RTX 4070 (+4 %) and
 IQ4_XS of 6400 and 6656 rows on the RTX 3060 (+1 to +3 %).
 
-With the model's own drafts (three, the fork's draft vocabulary, 300 tokens)
+With the model's drafts (three, the fork's draft vocabulary, 300 tokens)
 German, English and code give, in two loads each, 85.2 / 78.2 / 89.8 and 86.6
 / 80.5 / 86.6 tokens per second for the most probable token and 81.6 / 77.3 /
 93.9 and 82.4 / 76.8 / 91.5 sampled; the start commit gave 82.0 / 81.1 / 82.2
@@ -3935,7 +3935,7 @@ gives way and comes back, several sequences in a step. The model is
 stays as the tool's and the tests' way to step it by hand (and for the probes
 that compare layer by layer).
 
-**It drafts with its draft block, from a file of the block.** The model's draft
+**It drafts with its MTP block, from a file of the block.** The model's draft
 head is a block of its own (section 4 of the
 [specification](reference/qwen4exp-architecture.md)): one layer of the attention
 kind with its own mixture of 512 experts, two projections that make its input
@@ -4118,7 +4118,7 @@ the device for the sampler.
 
 **Wide steps: a prompt on the many-row kernels.** A step of up to eight rows is as
 described above, and a round of generation stays there: one row for each sequence, and with
-a draft block the drafts they verify, eight rows for all of them together. The piece of a prompt that the conductor sends between rounds, up to
+an MTP block the drafts they verify, eight rows for all of them together. The piece of a prompt that the conductor sends between rounds, up to
 `Model::prompt_rows` rows, which for this model is `Model::max_rows` (`step_rows`, below),
 with the newest token of every generating sequence riding along, runs every layer at that
 width (`device/part/wide.rs`, `device/misses.rs`):
@@ -4292,7 +4292,7 @@ thirty-second of the room for slots (17 408 to 18 432 tokens for two sequences
 on this machine) where the 27B gets what is left. Options that mean nothing for the
 model are errors that name them: `--shares`, `--precision exact`,
 `--draft-vocab`, more sequences than the eight rows of a
-generating step (`--parallel`), `--drafters mtp` (the model file carries no draft block;
+generating step (`--parallel`), `--drafters mtp` (the model file carries no MTP block;
 `--drafters FILE` names the block's file), and `--window` without a drafter or beyond
 the eight rows of a step that verifies.
 
@@ -4915,7 +4915,7 @@ RAM and on SSD; what differs is what a checkpoint and a page hold:
 
 - **A checkpoint** of a device is the slot of its part (the convolution
   windows and delta-rule matrices of its recurrent layers, the carried keys of
-  its indexers, the n-gram history); on the device of the draft block, the
+  its indexers, the n-gram history); on the device of the MTP block, the
   block's slot (its indexer's carried keys) and its carry (the residual of the
   sequence's last row that counts, which the block's next cell is paired
   with); and on the device that holds the n-gram layer, what the n-gram feed
@@ -4924,7 +4924,7 @@ RAM and on SSD; what differs is what a checkpoint and a page hold:
   host's: it is written into the place when the save is queued and read from
   it when the restore is, so it travels with the place to RAM and to the drive.
 - **A page** is the K/V entries and the pooled keys of the part's attention
-  layers and of the draft block (whose pools are its own buffer, with the
+  layers and of the MTP block (whose pools are its own buffer, with the
   same page numbers): a page copy copies all of it, a page goes to the host
   and back with all of it, each group's entries in the form they have.
 - **A replay** writes neither K and V nor pooled keys: the K/V append skips its
@@ -4932,10 +4932,10 @@ RAM and on SSD; what differs is what a checkpoint and a page hold:
   record's replay flag (bit 4, the runtime record's; `StepRecord::mark_replay`
   for the records the part builds itself). Its rows advance the recurrent
   state, the indexers' carried keys, the n-gram history and the feed as a
-  prompt's do. The draft block's cells of the replayed rows are cached too (the
+  prompt's do. The MTP block's cells of the replayed rows are cached too (the
   sequence that computed them had the same tokens up to the end of the
   replay), so the block follows a replay with its carry alone.
-- **The draft block one token behind.** The block's cell `i` pairs the
+- **The MTP block one token behind.** The block's cell `i` pairs the
   residual of cell `i` with the token of cell `i + 1`, so the last cell of a
   page is written one step after the page is full, and only when the sequence
   goes on. A sequence that stops at the end of a page leaves the block's last
@@ -4960,7 +4960,7 @@ RAM and on SSD; what differs is what a checkpoint and a page hold:
   filled again (keeping the ring in the checkpoints is open). Only drafts
   depend on it.
 - **The order** in a record: the commit of the step before (with the n-gram
-  feed's settling of the windows), the draft block's following of that step,
+  feed's settling of the windows), the MTP block's following of that step,
   the freed pages and the tables, then the saves, the page copies and the
   restores, then the chains and the rows; a record that only drafts does its
   copies too.
@@ -4974,7 +4974,7 @@ RAM and on SSD; what differs is what a checkpoint and a page hold:
   load every placement takes the split the first one measured.
 - **Memory.** A checkpoint of the IQ2_XS file is about 112 MiB over the two
   cards in `f32` (36 recurrent layers of 48 value heads of 128 x 128; the
-  draft block adds its carry of 40 KiB and its indexer's 1.8 KiB). The places
+  MTP block adds its carry of 40 KiB and its indexer's 1.8 KiB). The places
   are the prompt cache's, the lowest user of the engine's page-locked RAM:
   the tier of experts has the allowance first, and the cache in RAM holds what
   the tier leaves. With a full tier the cache has nothing beyond its floor:
@@ -6367,7 +6367,7 @@ synthetic model: `crates/runtime/tests/tools.rs` under the rule, and
 reply is also the same whole and streamed; both with a call after the thinking
 and with one inside it). A request with tools that may be
 called has a rule. With `auto` the rule is free for the thinking and for the
-text before a call: there the request takes the model's own drafts like a
+text before a call: there the request takes the model's drafts like a
 request without tools, and the conductor stops taking what a window gives at
 the token that makes the rule bind (the trigger, also when it stands inside the
 thinking; see "Drafts" under [Sampling](#sampling)). Inside a call it takes the

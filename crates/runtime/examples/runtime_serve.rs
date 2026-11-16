@@ -37,7 +37,7 @@ OPTIONS
   --rounds R            requests per client with --load (default 3)
   --tokens N            tokens per request with --load (default 128)
   --prompt N            prompt characters with --load (default 24)
-  --speculation on|off  drafts: the model's own draft block and the n-gram drafter
+  --speculation on|off  drafts: the model's MTP block and the n-gram drafter
                         (default off)
 ";
 
@@ -187,7 +187,7 @@ async fn main() {
         sc.layers = 1;
     }
     if o.speculation {
-        sc = sc.with_own_drafts(7, &[0.9, 0.85, 0.8, 0.7, 0.6, 0.5, 0.4]);
+        sc = sc.with_mtp(7, &[0.9, 0.85, 0.8, 0.7, 0.6, 0.5, 0.4]);
     }
     let model = Arc::new(SyntheticModel::new(sc).expect("a valid model"));
     let config = RuntimeConfig {

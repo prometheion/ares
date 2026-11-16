@@ -43,12 +43,12 @@ fn served_ending(trigger: Option<&str>, close: Option<&str>, end: u8) -> Router 
     config.context_length = 2048;
     config.eos = Some(u32::from(end));
     // Text that loops, so that the n-gram drafter has drafts to offer,
-    // next to a draft block of the model's own.
+    // next to an MTP block of the model's.
     config.context.window = 1;
     config.context.epoch = 40;
     config.context.buckets = 512;
-    config.own_drafts = 7;
-    config.own_accuracy = vec![0.9, 0.85, 0.8, 0.7, 0.6, 0.5, 0.4];
+    config.mtp_links = 7;
+    config.mtp_accuracy = vec![0.9, 0.85, 0.8, 0.7, 0.6, 0.5, 0.4];
     config.chat = trigger.map(|trigger| ChatFormat {
         thinking: close.map(|close| ThinkingFormat {
             start: "<think>".into(),

@@ -47,8 +47,8 @@ fn repeating(c: &mut SyntheticConfig) {
     c.context.window = 1;
     c.context.epoch = 40;
     c.context.buckets = 512;
-    c.own_drafts = 7;
-    c.own_accuracy = vec![0.9, 0.85, 0.8, 0.7, 0.6, 0.5, 0.4];
+    c.mtp_links = 7;
+    c.mtp_accuracy = vec![0.9, 0.85, 0.8, 0.7, 0.6, 0.5, 0.4];
 }
 
 /// The rows of a window: drafts or none.

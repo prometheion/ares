@@ -1,5 +1,5 @@
 //! What a request can ask of the sampler, through the server, with the real
-//! Qwen3.5-0.8B on a GPU, and with the 27B and its draft block for what drafts
+//! Qwen3.5-0.8B on a GPU, and with the 27B and its MTP block for what drafts
 //! do to it.
 //!
 //! The server runs in this process over the real engine (requests go through
@@ -66,7 +66,7 @@ fn model_path() -> Option<PathBuf> {
     }
 }
 
-/// The 27B, whose draft block gives the drafts the tests compare with none.
+/// The 27B, whose MTP block gives the drafts the tests compare with none.
 fn drafting_model() -> Option<PathBuf> {
     if std::env::var_os("ARES_TEST_CUDA").is_none() {
         eprintln!("skipped: set ARES_TEST_CUDA=1 to run the tests that open GPUs");
@@ -163,7 +163,7 @@ impl Served {
         Self::serve(model, config, vec![Device::open(ordinal, Wait::Block).unwrap()], rule)
     }
 
-    /// Starts the engine on the 27B over both cards with its draft block and
+    /// Starts the engine on the 27B over both cards with its MTP block and
     /// the n-gram drafter, with exact products so that a row computes
     /// the same in a window as alone.
     fn start_drafting(path: &PathBuf, rule: Option<Rule>) -> Self {

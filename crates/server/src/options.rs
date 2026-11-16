@@ -174,7 +174,7 @@ fn list<T: std::str::FromStr>(
 }
 
 /// The model drafters of `--drafters`: names separated by commas. `mtp` is
-/// the model's own draft block, `none` (alone) is no drafter, anything else is
+/// the model's MTP block, `none` (alone) is no drafter, anything else is
 /// the file of a block drafter.
 fn drafters(value: &str) -> Result<Vec<Drafter>, Invalid> {
     let expected = "mtp, none, or a drafter file; several separated by commas";
@@ -186,7 +186,7 @@ fn drafters(value: &str) -> Result<Vec<Drafter>, Invalid> {
         let drafter = match name {
             "" | "none" => return Err(invalid("--drafters", value, expected)),
             "mtp" => Drafter::Mtp,
-            file => Drafter::Block(PathBuf::from(file)),
+            file => Drafter::File(PathBuf::from(file)),
         };
         if list.contains(&drafter) {
             return Err(invalid("--drafters", value, expected));

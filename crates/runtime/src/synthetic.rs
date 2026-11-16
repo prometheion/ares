@@ -41,8 +41,8 @@ use ares_state::PageLayout;
 
 use crate::exec::Pick;
 use crate::model::{
-    ContextSpec, DeviceContext, DeviceModel, DrafterKind, LinkSpec, Logits, Model, ModelError,
-    OwnDrafts, PrefixCache, Split, StepContext,
+    ContextSpec, DeviceContext, DeviceModel, DrafterKind, LinkSpec, Logits, Model, ModelDrafts,
+    ModelError, PrefixCache, Split, StepContext,
 };
 use crate::text::{printable, unprintable};
 
@@ -122,19 +122,19 @@ pub struct SyntheticConfig {
     /// The links of a chain of drafts the model makes itself, like the draft
     /// block of a real one: 0 for none. The context must read one token
     /// (`context.window == 1`) so that a draft's context follows from the
-    /// draft alone. The host executor drafts by [`SyntheticConfig::own_accuracy`]; the
+    /// draft alone. The host executor drafts by [`SyntheticConfig::mtp_accuracy`]; the
     /// device part drafts what it has seen the model pick after the same token
     /// in the same context ([`SyntheticModel`]), which is right wherever the
     /// text repeats and the sampler picks as it did.
-    pub own_drafts: u32,
+    pub mtp_links: u32,
     /// For the host executor: the chance that link `i` of a chain makes the
     /// draft the model itself would pick, given that the links before it did;
     /// the last number serves the links after it. Empty: every link is right.
-    pub own_accuracy: Vec<f64>,
+    pub mtp_accuracy: Vec<f64>,
     /// For the host executor: the probability its drafter reports for a draft
     /// that is right and for one that is wrong. `None`: it reports none, and
     /// makes every link it is asked for.
-    pub own_probability: Option<(f32, f32)>,
+    pub mtp_probability: Option<(f32, f32)>,
     pub seed: u64,
 }
 
@@ -165,9 +165,9 @@ impl SyntheticConfig {
             prefix_cache: None,
             durable: None,
             settle_cells: 0,
-            own_drafts: 0,
-            own_accuracy: Vec::new(),
-            own_probability: None,
+            mtp_links: 0,
+            mtp_accuracy: Vec::new(),
+            mtp_probability: None,
             seed: 0x5eed,
         }
     }
@@ -196,12 +196,12 @@ impl SyntheticConfig {
         self
     }
 
-    /// Gives the model a draft block of its own with `links` links, of which
+    /// Gives the model an MTP block with `links` links, of which
     /// link `i` is right with the chance `accuracy[i]` (see
-    /// [`SyntheticConfig::own_accuracy`]). Needs a context of one token.
-    pub fn with_own_drafts(mut self, links: u32, accuracy: &[f64]) -> Self {
-        self.own_drafts = links;
-        self.own_accuracy = accuracy.to_vec();
+    /// [`SyntheticConfig::mtp_accuracy`]). Needs a context of one token.
+    pub fn with_mtp(mut self, links: u32, accuracy: &[f64]) -> Self {
+        self.mtp_links = links;
+        self.mtp_accuracy = accuracy.to_vec();
         self.context.window = 1;
         self
     }
@@ -371,13 +371,13 @@ impl SyntheticConfig {
                 self.layers_per_device, self.layers, self.devices
             ));
         }
-        if self.own_drafts > 0 && self.context.window != 1 {
+        if self.mtp_links > 0 && self.context.window != 1 {
             return bad(
                 "a draft's context follows from the draft alone only if it reads one token".into(),
             );
         }
-        if self.own_accuracy.iter().any(|p| !(0.0..=1.0).contains(p)) {
-            return bad(format!("accuracies {:?} are not chances", self.own_accuracy));
+        if self.mtp_accuracy.iter().any(|p| !(0.0..=1.0).contains(p)) {
+            return bad(format!("accuracies {:?} are not chances", self.mtp_accuracy));
         }
         if self.eos.is_some_and(|t| t >= self.vocab()) {
             return bad(format!(
@@ -398,7 +398,7 @@ impl SyntheticConfig {
 pub struct SyntheticModel {
     config: Arc<SyntheticConfig>,
     /// What the device parts have seen the model pick after a token in a
-    /// context: their draft block drafts from it. The parts share it, so that
+    /// context: their MTP block drafts from it. The parts share it, so that
     /// all of them draft the same tokens.
     seen: Arc<Mutex<HashMap<(u32, u32), u32>>>,
 }
@@ -433,7 +433,7 @@ impl SyntheticModel {
         self.config.context_of(token, position)
     }
 
-    /// What the model's draft block would draft for the window whose newest
+    /// What the model's MTP block would draft for the window whose newest
     /// token is `token` at `position` with `context`: `links` tokens. Link `j`
     /// is the token the model itself picks after the ones before it when a
     /// hash of where it is falls under the link's accuracy, and another token
@@ -446,7 +446,7 @@ impl SyntheticModel {
     }
 
     /// [`SyntheticModel::host_drafts`] with the probability the drafter gives
-    /// each draft ([`SyntheticConfig::own_probability`]; NaN when it reports
+    /// each draft ([`SyntheticConfig::mtp_probability`]; NaN when it reports
     /// none).
     pub fn host_chain(
         &self,
@@ -457,7 +457,7 @@ impl SyntheticModel {
     ) -> Vec<(u32, f32)> {
         let c = &self.config;
         let accuracy = |j: u32| {
-            c.own_accuracy.get(j as usize).or(c.own_accuracy.last()).copied().unwrap_or(1.0)
+            c.mtp_accuracy.get(j as usize).or(c.mtp_accuracy.last()).copied().unwrap_or(1.0)
         };
         let (mut token, mut context) = (token, context);
         let mut drafts = Vec::with_capacity(links as usize);
@@ -469,7 +469,7 @@ impl SyntheticModel {
             h = (h ^ (h >> 33)).wrapping_mul(0xc4ce_b9fe_1a85_ec53);
             let unit = (h >> 11) as f64 / (1u64 << 53) as f64;
             let right = unit < accuracy(j);
-            let p = c.own_probability.map_or(
+            let p = c.mtp_probability.map_or(
                 f32::NAN,
                 |(sure, unsure)| {
                     if right { sure } else { unsure }
@@ -595,9 +595,9 @@ impl Model for SyntheticModel {
     }
 
     fn drafters(&self) -> Vec<crate::Drafter> {
-        match self.config.own_drafts {
+        match self.config.mtp_links {
             0 => Vec::new(),
-            drafts => vec![crate::Drafter { kind: DrafterKind::Block, drafts }],
+            drafts => vec![crate::Drafter { kind: DrafterKind::Mtp, drafts }],
         }
     }
 
@@ -690,7 +690,7 @@ struct SyntheticDevice {
     drafter: Option<Drafter>,
 }
 
-/// The draft block of a device part: it drafts what the model picked the last
+/// The MTP block of a device part: it drafts what the model picked the last
 /// time it read the same token in the same context.
 #[derive(Debug)]
 struct Drafter {
@@ -787,7 +787,7 @@ impl SyntheticDevice {
             q: scratch(q_bytes)?,
             inputs: Vec::new(),
             wanted: Vec::new(),
-            drafter: (c.own_drafts > 0)
+            drafter: (c.mtp_links > 0)
                 .then(|| -> Result<Drafter, ModelError> {
                     let bytes = 4 * rows;
                     Ok(Drafter {
@@ -820,7 +820,7 @@ impl SyntheticDevice {
         let mut drafts = Vec::new();
         {
             let seen = drafter.seen.lock().expect("what the model picked");
-            for i in (0..record.segments()).filter(|i| record.own_drafts(*i)) {
+            for i in (0..record.segments()).filter(|i| record.model_drafts(*i)) {
                 let segment = record.segment(i);
                 let newest = record.row(segment.row0);
                 let mut input = Some((newest.token, newest.context));
@@ -1068,9 +1068,9 @@ impl DeviceModel for SyntheticDevice {
         }
     }
 
-    fn own_drafts(&self) -> Option<OwnDrafts> {
+    fn model_drafts(&self) -> Option<ModelDrafts> {
         let drafter = self.drafter.as_ref()?;
-        Some(OwnDrafts { ptr: drafter.on_device.ptr(), tokens: drafter.count })
+        Some(ModelDrafts { ptr: drafter.on_device.ptr(), tokens: drafter.count })
     }
 
     fn enqueue(&mut self, cx: &StepContext<'_>) -> Result<Option<Logits>, ModelError> {

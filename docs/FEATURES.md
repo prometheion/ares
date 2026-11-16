@@ -11,14 +11,14 @@ the kernels exist; no model runs there yet.
 | --- | --- | --- |
 | Placements | one card, tensor split, layer split | one card, by layers, both cards on every layer |
 | Weight types | all 28 GGUF types | all 28 in every tensor: experts, stream mixers and the n-gram block (exact) too |
-| K and V | `f16`, `q8` to `q4`, chosen separately (`--kv`) | `f16`, `q8` to `q4`, chosen separately (`--kv`); the draft block's in `q4` |
+| K and V | `f16`, `q8` to `q4`, chosen separately (`--kv`) | `f16`, `q8` to `q4`, chosen separately (`--kv`); the MTP block's in `q4` |
 | Larger than VRAM | no | experts in VRAM slots, a RAM tier and on the SSD; the CPU computes missed ones, and what a step picks beyond a card's slots |
-| Own drafts (MTP) | draft block in the file, with a draft vocabulary | draft block from a file (`--drafters <file>`), its experts resident in VRAM; exact |
+| MTP | MTP block in the file, with a draft vocabulary | MTP block from a file (`--drafters <file>`), its experts resident in VRAM; exact |
 | DFlash2 drafter (`--drafters <file>`) | chains, one card or tensor split, with the draft vocabulary; exact | chains, one card or both cards on every layer; the mean of the four streams |
 | Prefix cache | yes, with the RAM and SSD levels | yes, with the RAM and SSD levels; its RAM is what the tier of experts leaves |
 
 ## Speed
-- Speculative decoding: the model's own drafts and the n-gram drafter; the chain runs
+- Speculative decoding: the model's drafts and the n-gram drafter; the chain runs
   in a step of its own and the round verifies as many of its drafts as pay, by the
   probability the drafter gave each and the measured price of a step. On the 27B the text
   with drafts is token for token the text without. On Flash-Next a draft row waits for an
@@ -36,7 +36,7 @@ the kernels exist; no model runs there yet.
 
 ## Caches and memory
 - Prefix cache (both models): automatic, shared by all requests; checkpoints of the state per
-  sequence (recurrent state, Flash-Next's indexer keys, n-gram history and feed, draft block).
+  sequence (recurrent state, Flash-Next's indexer keys, n-gram history and feed, MTP block).
 - Prompt cache in RAM: what leaves the cards is kept in page-locked RAM inside `--ram`,
   the lowest user of it (below Flash-Next's tier of experts), and comes back from there;
   elastic, without a flag; one checkpoint place is always kept, so a conversation resumes

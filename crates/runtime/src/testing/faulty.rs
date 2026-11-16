@@ -6,7 +6,7 @@ use ares_api::{EngineError, ModelCard, Prompt};
 use ares_state::PageLayout;
 
 use crate::model::{
-    ContextSpec, DeviceContext, DeviceModel, LinkSpec, Logits, Model, ModelError, OwnDrafts,
+    ContextSpec, DeviceContext, DeviceModel, LinkSpec, Logits, Model, ModelDrafts, ModelError,
     PrefixCache, Split, StepContext,
 };
 
@@ -172,11 +172,11 @@ impl DeviceModel for FaultyPart {
         self.inner.logit_tokens()
     }
 
-    fn own_drafts(&self) -> Option<OwnDrafts> {
-        self.inner.own_drafts()
+    fn model_drafts(&self) -> Option<ModelDrafts> {
+        self.inner.model_drafts()
     }
 
-    fn own_draft_ms(&mut self) -> f64 {
-        self.inner.own_draft_ms()
+    fn model_draft_ms(&mut self) -> f64 {
+        self.inner.model_draft_ms()
     }
 }

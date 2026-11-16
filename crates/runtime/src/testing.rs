@@ -283,7 +283,7 @@ impl HostExecutor {
     /// Makes each link of the model's own draft chain take `link` on the
     /// device, in addition to the step: the chain of a step is as long as the
     /// longest chain its drafter made (a drafter that reports probabilities,
-    /// [`crate::SyntheticConfig::own_probability`], ends a chain at the
+    /// [`crate::SyntheticConfig::mtp_probability`], ends a chain at the
     /// record's draft bars).
     pub fn with_link_cost(mut self, link: Duration) -> Self {
         self.link = link;
@@ -368,9 +368,9 @@ impl Executor for HostExecutor {
         let mut patches = Vec::new();
         {
             let view = RecordView::new(&self.record[..meta.record_bytes]).map_err(broken)?;
-            let reports = self.model.config().own_probability.is_some();
+            let reports = self.model.config().mtp_probability.is_some();
             let mut bar = 0;
-            for i in (0..view.segments()).filter(|i| view.own_drafts(*i)) {
+            for i in (0..view.segments()).filter(|i| view.model_drafts(*i)) {
                 let segment = view.segment(i);
                 let newest = view.row(segment.row0);
                 let links = segment.n_rows - 1;

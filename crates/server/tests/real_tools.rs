@@ -4,7 +4,7 @@
 //! question needs the tool and the reply is the same streamed, a history with
 //! calls and results is answered, a call the model opens inside its thinking
 //! is a call, and the reply with drafts is the reply without, also where the
-//! 27B thinks before it calls and takes the drafts of its draft block. Lines
+//! 27B thinks before it calls and takes the drafts of its MTP block. Lines
 //! that start with `RES` say what the models did.
 //!
 //! The server runs in this process over the real engine (requests go through
@@ -86,7 +86,7 @@ impl Served {
         Self::serve(model, config, vec![Device::open(ordinal, Wait::Block).unwrap()])
     }
 
-    /// The 27B over both cards with its draft block and the n-gram drafter
+    /// The 27B over both cards with its MTP block and the n-gram drafter
     ///, with exact products so that a row computes the same in a window
     /// as alone. The context is 1024 tokens, as in `real_sampling.rs`: the
     /// prompt with the tools and the replies of the test fit.
@@ -136,7 +136,7 @@ impl Served {
         self.ask_timed(body).await.0
     }
 
-    /// The drafts of the model's own draft block that the engine has verified
+    /// The drafts of the model's MTP block that the engine has verified
     /// and accepted so far, and those of the n-gram drafter.
     fn drafts(&self) -> [(u64, u64); 2] {
         let counters = self.runtime.snapshot().expect("the conductor answers").counters;
@@ -569,7 +569,7 @@ async fn the_27b_calls_the_same_with_drafts_and_without() {
     // The replies of the first two are a call from their first token: the
     // rule binds all of them, and the drafts are the n-gram drafter's. The third
     // thinks first, which the rule leaves free: there the request takes the
-    // drafts of the model's draft block, up to the token that makes the rule
+    // drafts of the model's MTP block, up to the token that makes the rule
     // bind.
     let thinking = json!({"chat_template_kwargs": {"enable_thinking": true}, "max_tokens": 600});
     for (what, extra) in [
@@ -593,7 +593,7 @@ async fn the_27b_calls_the_same_with_drafts_and_without() {
         // the text of the replies before this one, so these are no benchmark.
         let [own, ngram] = [0, 1].map(|i| (after[i].0 - before[i].0, after[i].1 - before[i].1));
         println!(
-            "RES 27B {what}: {} tokens; of the draft block's drafts {} verified and {} accepted, \
+            "RES 27B {what}: {} tokens; of the MTP block's drafts {} verified and {} accepted, \
              of the n-gram drafter's {} and {}; {} tokens/s with drafts, {} without",
             timings["predicted_n"],
             own.0,
@@ -605,7 +605,7 @@ async fn the_27b_calls_the_same_with_drafts_and_without() {
         );
         if what.contains("thinking") {
             assert!(!reply.reasoning.is_empty(), "{what}: the 27B did not think: {reply:?}");
-            assert!(own.1 > 0, "{what}: no draft of the draft block was accepted in the thinking");
+            assert!(own.1 > 0, "{what}: no draft of the MTP block was accepted in the thinking");
         }
         assert_eq!(without.hash, reply.hash, "{what}: the tokens with drafts are those without");
         assert_eq!(without, reply, "{what}");

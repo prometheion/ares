@@ -57,7 +57,7 @@ pub struct RuntimeConfig {
     /// is chosen per step from the price of the step and the acceptance
     /// measured so far; this is the room, which the model reserves memory
     /// for (a row of a window keeps its inputs, its logits and a link of the
-    /// draft block's chain). A model with no drafter of its own
+    /// MTP block's chain). A model with no drafter of its own
     /// ([`crate::Model::drafters`]) does not draft at all, whatever this is.
     pub window_rows: u32,
     /// The corpus that drafts are looked up in: its memory and the shortest
@@ -88,7 +88,7 @@ pub struct RuntimeConfig {
     /// loading of kernels and the first use of each path, so it is not in the
     /// first request's time; and then steps of every row count a window can
     /// have and of a few above it, which measure the price of a step on the
-    /// devices (and, for a model with a draft block, of every length of its
+    /// devices (and, for a model with an MTP block, of every length of its
     /// chain), where drafts and the pieces of a prompt are decided from. The
     /// measurements are kept up to date by every step that runs.
     pub warm_up: bool,

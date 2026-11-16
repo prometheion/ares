@@ -391,7 +391,7 @@ impl<'a> RecordWriter<'a> {
     /// tokens the model's drafter `drafter` makes (its id: its place in
     /// [`Model::drafters`](crate::Model::drafters) plus one): their tokens in
     /// this record are placeholders.
-    pub fn own_drafts(&mut self, drafter: u32) -> Result<(), RecordFull> {
+    pub fn model_drafts(&mut self, drafter: u32) -> Result<(), RecordFull> {
         assert!(self.segs_written > 0, "a segment was written");
         assert!(drafter > 0, "drafter 0 is the n-gram drafter, whose drafts are tokens");
         let at = HEADERS + (self.segs_written as usize - 1) * SEG_BYTES + 20;
@@ -809,7 +809,7 @@ impl<'a> RecordView<'a> {
 
     /// Whether segment `i` is a window whose draft rows take the tokens the
     /// model drafts itself.
-    pub fn own_drafts(&self, i: u32) -> bool {
+    pub fn model_drafts(&self, i: u32) -> bool {
         self.drafter(i).is_some()
     }
 
@@ -1093,7 +1093,7 @@ mod tests {
         let record = RecordView::new(&buf[..used]).unwrap();
         let greedy = SampleParams::GREEDY.row(0);
         assert!((0..3).all(|i| record.sampler(i) == greedy && !record.sampler(i).sampled()));
-        assert!(!record.own_drafts(0) && !record.own_drafts(1));
+        assert!(!record.model_drafts(0) && !record.model_drafts(1));
 
         // A window whose drafts the model makes itself, sampled.
         let params = SampleParams {
@@ -1106,7 +1106,7 @@ mod tests {
         let mut buf = vec![0x55u8; 1024];
         let mut w = RecordWriter::new(&mut buf, 1, 2, 4).unwrap();
         w.segment(0, 40, 3, false).unwrap();
-        w.own_drafts(2).unwrap();
+        w.model_drafts(2).unwrap();
         w.row(Row { slot: 0, position: 40, token: 9, context: 0 }).unwrap();
         w.row(Row { slot: 0, position: 41, token: 0, context: 0 }).unwrap();
         w.row(Row { slot: 0, position: 42, token: 0, context: 0 }).unwrap();
@@ -1116,7 +1116,7 @@ mod tests {
         w.samplers((40..43).map(|p| params.row(p))).unwrap();
         let used = w.finish().unwrap();
         let record = RecordView::new(&buf[..used]).unwrap();
-        assert!(record.own_drafts(0) && !record.own_drafts(1));
+        assert!(record.model_drafts(0) && !record.model_drafts(1));
         assert_eq!((record.drafter(0), record.drafter(1)), (Some(2), None), "the drafter's id");
         // The flag is not the kernels' "direct" flag.
         assert!(!record.segment(0).direct && record.segment(1).direct);
@@ -1246,7 +1246,7 @@ mod tests {
         assert_eq!(with_copies % 16, 0);
         assert!(record.replay(0) && !record.replay(1) && !record.replay(2));
         assert!(record.segment(0).direct, "a replay is direct");
-        assert!(!record.own_drafts(0));
+        assert!(!record.model_drafts(0));
         assert_eq!((record.state_copies(), record.page_copies()), (2, 1));
         assert_eq!((record.state_copy(0), record.state_copy(1)), (states[0], states[1]));
         assert_eq!(record.page_copy(0), pages[0]);

@@ -86,7 +86,7 @@ pub use gpu::{GpuConfig, GpuExecutor, required_ram};
 pub use links::{Links, MAX_DEVICES};
 pub use model::{
     ContextSpec, DeviceContext, DeviceModel, DeviceTransfer, Drafter, DrafterKind, Durable,
-    LinkSpec, Logits, Model, ModelError, OwnDrafts, PrefixCache, Split, StepContext,
+    LinkSpec, Logits, Model, ModelDrafts, ModelError, PrefixCache, Split, StepContext,
     TransferContext,
 };
 pub use ram::{

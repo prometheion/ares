@@ -1071,7 +1071,7 @@ fn the_draft_block_drafts_what_the_reference_drafts_in_every_placement() {
              {agreed:?} of {compared:?}; draft rows {}, accepted {}, rejected {}; the block on \
              part {}: weights {} B, pools {} B, buffers {} B; {:.2} ms a link",
             chains.len(),
-            counters.own_draft_links,
+            counters.model_draft_links,
             counters.draft_rows,
             counters.drafts_accepted,
             counters.drafts_rejected,
@@ -1081,7 +1081,7 @@ fn the_draft_block_drafts_what_the_reference_drafts_in_every_placement() {
             report.buffers,
             times.chain_ms / times.links.max(1) as f64,
         );
-        assert!(counters.own_draft_links > 0, "{placement:?}: the block drafted nothing");
+        assert!(counters.model_draft_links > 0, "{placement:?}: the block drafted nothing");
         // A made-up block is never right, so the policy stops asking it after
         // a chain or a few: what there is must be the reference's. A made-up
         // model has near ties that the device's arithmetic flips, so one
@@ -1161,14 +1161,14 @@ fn drafts_change_no_token_in_any_placement() {
             counters.draft_rows,
             counters.drafts_accepted,
             counters.drafts_rejected,
-            counters.own_draft_links,
-            counters.own_draft_steps,
+            counters.model_draft_links,
+            counters.model_draft_steps,
             times.offered,
             times.accepted,
             times.key_rows,
         );
         assert!(plain.len() > 12, "{placement:?}: the answer is {} tokens", plain.len());
-        assert!(counters.own_draft_links > 0, "{placement:?}: the block drafted nothing");
+        assert!(counters.model_draft_links > 0, "{placement:?}: the block drafted nothing");
         assert!(counters.drafts_accepted > 0, "{placement:?}: no draft was accepted");
         assert!(counters.drafts_rejected > 0, "{placement:?}: no draft was rejected");
         // Alone, a sequence writes with drafts what it writes without, token

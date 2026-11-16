@@ -133,22 +133,22 @@ OPTIONS:
                                       else runs in a step
                                [default: fast]
         --drafters <LIST>      The model drafters that take part, such as mtp (the
-                               model's own draft block) or none; a file name is
+                               model's own MTP block) or none; a file name is
                                a drafter from a file of its own (a DFlash2
-                               drafter, or Flash-Next's draft block). The
+                               drafter, or Flash-Next's MTP block). The
                                n-gram drafter takes part with them and
                                never alone; with none the
                                server does not speculate. The length of a draft
                                and whose it is are chosen for every step from
                                the price of a step and the acceptance measured
                                [default: all the model has: mtp if the file has
-                               a draft block]
+                               an MTP block]
         --window <ROWS>        Most rows of one sequence's window, its newest
                                token and the drafts verified with it. The room
                                for them is VRAM (about 5 MiB a row for the 27B,
                                for every sequence) [default: 8, the rows one
                                launch of the few-row weight kernels takes]
-        --draft-vocab <FILE>   Token ids (one per line) the model's draft block may
+        --draft-vocab <FILE>   Token ids (one per line) the model's MTP block may
                                propose: a shorter list makes a draft cheaper
                                [default: every token whose head row is on the
                                block's device]
@@ -975,7 +975,7 @@ mod tests {
         assert_eq!(drafters("none"), Some(Vec::new()));
         assert_eq!(
             drafters("mtp, /models/dflash2.gguf"),
-            Some(vec![Drafter::Mtp, Drafter::Block(PathBuf::from("/models/dflash2.gguf"))])
+            Some(vec![Drafter::Mtp, Drafter::File(PathBuf::from("/models/dflash2.gguf"))])
         );
         assert_eq!(run(&["--model=m"]).load.drafters, None, "all that are available");
         for list in ["", "none,mtp", "mtp,mtp", "mtp,,x"] {

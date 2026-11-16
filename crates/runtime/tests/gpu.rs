@@ -381,12 +381,12 @@ fn feature_request(prompt: &str, sampling: Sampling) -> ares_api::GenerateReques
     r
 }
 
-/// A synthetic model with text that repeats and a draft block of its own, which
+/// A synthetic model with text that repeats and an MTP block, which
 /// is what lets a window verify drafts at all (the n-gram drafter
 /// takes part next to a model drafter).
 fn drafting(split: Split, devices: usize) -> Setup {
     let mut s = setup(split, devices);
-    s.model = s.model.repetitive(1, 40).with_own_drafts(4, &[]);
+    s.model = s.model.repetitive(1, 40).with_mtp(4, &[]);
     s
 }
 
@@ -562,7 +562,7 @@ impl TokenFilter for Stretches {
 /// drafts and without, on every placement.
 ///
 /// The text never repeats, so the n-gram drafter has nothing to
-/// offer. The synthetic model's draft block drafts what it has seen the model
+/// offer. The synthetic model's MTP block drafts what it has seen the model
 /// pick, so the reply is made once without drafts on one runtime, and again
 /// with drafts on a second runtime of the same model: its block knows the
 /// reply, bound tokens included, and its n-gram drafter knows nothing.
@@ -571,7 +571,7 @@ fn a_rule_that_is_free_in_stretches_takes_the_models_drafts_on_every_placement()
     on_every_placement(|split, devices| {
         for period in [7usize, 10, 13] {
             let mut s = setup(split, devices);
-            s.model = s.model.repetitive(1, 1).with_own_drafts(4, &[]);
+            s.model = s.model.repetitive(1, 1).with_mtp(4, &[]);
             let used = s.model.devices;
             let model = Arc::new(SyntheticModel::new(s.model).unwrap());
             let open = || {

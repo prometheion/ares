@@ -1098,9 +1098,9 @@ fn the_choice_of_drafters_is_refused_by_name_before_a_device_is_touched() {
     // A drafter from a file that is not there is refused by its name.
     let (status, said) = refused(&model, &["--drafters", "/models/dflash2.gguf"]);
     assert!(!status.success() && said.contains("/models/dflash2.gguf"), "{said}");
-    // The small model has no draft block of its own.
+    // The small model has no MTP block of its own.
     let (status, said) = refused(&model, &["--drafters", "mtp"]);
-    assert!(!status.success() && said.contains("no draft block"), "{said}");
+    assert!(!status.success() && said.contains("no MTP block"), "{said}");
     // A window, or a vocabulary, for no drafter does nothing.
     let (status, said) = refused(&model, &["--drafters", "none", "--window", "8"]);
     assert!(!status.success() && said.contains("without a model drafter"), "{said}");
@@ -1110,7 +1110,7 @@ fn the_choice_of_drafters_is_refused_by_name_before_a_device_is_touched() {
 
 // --- drafts -------------------------------------------------------------------
 //
-// These need a model with a draft block: `ARES_TEST_DRAFT_MODEL`, a
+// These need a model with an MTP block: `ARES_TEST_DRAFT_MODEL`, a
 // quantization of the 27B that fits one card, such as
 // `Qwen3.8-27B-UD-IQ2_XXS-with-draft-block.gguf` (served with the fast
 // kernels: it has no exact prefill kernels), and for the test of exact
@@ -1121,13 +1121,13 @@ fn draft_model() -> Option<PathBuf> {
     match std::env::var_os("ARES_TEST_DRAFT_MODEL") {
         Some(path) => Some(path.into()),
         None => {
-            eprintln!("skipped: set ARES_TEST_DRAFT_MODEL to a model file with a draft block");
+            eprintln!("skipped: set ARES_TEST_DRAFT_MODEL to a model file with an MTP block");
             None
         }
     }
 }
 
-/// The 27B with its draft block for the tests that need exact products and so
+/// The 27B with its MTP block for the tests that need exact products and so
 /// a type of weights with a prefill kernel for them: `ARES_TEST_QWEN35_27B`
 /// (Qwen3.8-27B-UD-Q4_K_S.gguf), served on both cards.
 fn two_card_model() -> Option<PathBuf> {
@@ -1183,7 +1183,7 @@ fn a_request_can_switch_drafts_off_and_the_reply_has_a_hash_of_its_tokens() {
     let Some(model) = draft_model() else { return };
     let server = Server::start(&model, port(9), &["--parallel", "1", "--precision", "fast"]);
     let (_, _, drafted) = reply_tokens(&server, ENGLISH, true);
-    assert!(drafted.unwrap_or(0) > 0, "the draft block and the n-gram drafter: {drafted:?}");
+    assert!(drafted.unwrap_or(0) > 0, "the MTP block and the n-gram drafter: {drafted:?}");
     let (_, _, none) = reply_tokens(&server, ENGLISH, false);
     assert_eq!(none, Some(0), "no draft row for a request that asks for none");
     // The hash is a function of the tokens.
@@ -1278,7 +1278,7 @@ fn with_the_fast_kernels_the_reply_with_drafts_is_the_reply_without() {
 }
 
 /// The DFlash drafter (`ARES_TEST_DFLASH_27B`, the 27B's DFlash2 file) next
-/// to the draft block and alone, on both cards with the fast kernels: the
+/// to the MTP block and alone, on both cards with the fast kernels: the
 /// reply with drafts is the reply without them, token for token, greedy and
 /// sampled, and the drafter's drafts are verified.
 #[test]
@@ -1320,7 +1320,7 @@ fn with_the_dflash_drafter_the_reply_with_drafts_is_the_reply_without() {
 /// A server started with no drafters does not speculate, whatever the text
 /// repeats: the n-gram drafter is no drafter on its own.
 #[test]
-fn a_server_with_no_drafters_never_drafts_and_one_with_the_draft_block_does() {
+fn a_server_with_no_drafters_never_drafts_and_one_with_the_mtp_block_does() {
     let Some(model) = draft_model() else { return };
     let repeat = "Write the sentence 'The quick brown fox jumps over the lazy dog.' ten times.";
     let flags = ["--parallel", "1", "--precision", "fast"];
@@ -1341,14 +1341,14 @@ fn a_server_with_no_drafters_never_drafts_and_one_with_the_draft_block_does() {
     server.stop();
     let server = Server::start(&model, port(9), &flags);
     let (_, _, drafted) = reply_tokens(&server, repeat, true);
-    assert!(drafted.unwrap_or(0) > 0, "the same request drafts with the model's draft block");
+    assert!(drafted.unwrap_or(0) > 0, "the same request drafts with the model's MTP block");
     server.stop();
 }
 
-/// A model with no draft block has no drafter, and the n-gram drafter does not run
+/// A model with no MTP block has no drafter, and the n-gram drafter does not run
 /// without one.
 #[test]
-fn a_model_with_no_draft_block_is_served_with_no_speculation_at_all() {
+fn a_model_with_no_mtp_block_is_served_with_no_speculation_at_all() {
     let Some(model) = model() else { return };
     let repeat = "Write the sentence 'The quick brown fox jumps over the lazy dog.' ten times.";
     let mut server = Server::start(&model, port(9), &["--parallel", "1"]);
@@ -1530,16 +1530,16 @@ fn flash_next_answers_in_both_placements() {
     }
 }
 
-/// Flash-Next with its draft block (`ARES_TEST_QWEN4EXP_DRAFT` names the
+/// Flash-Next with its MTP block (`ARES_TEST_QWEN4EXP_DRAFT` names the
 /// block's file; without it the test is skipped): the plan says that the
 /// block drafts and what it took, the answer to the question the reference
 /// answered starts as the reference's does, drafts are verified and some are
 /// accepted, and a request that says no drafts gets none.
 #[test]
-fn flash_next_drafts_with_its_draft_block() {
+fn flash_next_drafts_with_its_mtp_block() {
     let Some(model) = flash_model() else { return };
     let Some(block) = std::env::var_os("ARES_TEST_QWEN4EXP_DRAFT") else {
-        eprintln!("skipped: set ARES_TEST_QWEN4EXP_DRAFT to the file of Flash-Next's draft block");
+        eprintln!("skipped: set ARES_TEST_QWEN4EXP_DRAFT to the file of Flash-Next's MTP block");
         return;
     };
     let block = block.to_str().expect("a path in UTF-8").to_owned();
@@ -1554,7 +1554,7 @@ fn flash_next_drafts_with_its_draft_block() {
         SLOW,
     );
     let log = server.logged().join("\n");
-    assert!(log.contains("draft block") && log.contains("drafts"), "the plan names it: {log}");
+    assert!(log.contains("MTP block") && log.contains("drafts"), "the plan names it: {log}");
     assert!(log.contains("experts share the tiers"), "and what it took: {log}");
     let client: &Client = &server;
     let ask = |question: &str, draft: bool| {

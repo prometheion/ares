@@ -339,7 +339,7 @@ impl RequestSampler {
     /// a chain while the rule is not bound (after `tokens`, the tokens of the
     /// request so far, the prompt first, the next token is free): a chain
     /// made where the rule binds would mostly be cut.
-    pub fn allows_own_drafts(&mut self, tokens: &[u32], prompt_len: usize) -> bool {
+    pub fn allows_model_drafts(&mut self, tokens: &[u32], prompt_len: usize) -> bool {
         self.allows_drafts() && self.free_rows(tokens, prompt_len, &[]) > 0
     }
 
