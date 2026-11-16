@@ -942,6 +942,8 @@ fn engine(args: &Args, spread: &Spread, window: u32) {
         draft_vocabulary: vocabulary,
         pipeline_rows: args.pipeline_rows,
         profile: args.profile.then(|| profile.clone()),
+        draft_block: true,
+        dflash: None,
     };
     let devices: Vec<Device> =
         args.devices.iter().map(|d| Device::open(*d, Wait::Block).expect("open device")).collect();

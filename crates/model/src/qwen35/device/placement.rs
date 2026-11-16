@@ -114,6 +114,11 @@ pub struct DraftPlan {
     /// The rows of the head on `device` (its first ones) that the draft head
     /// reads.
     pub head_rows: u32,
+    /// Whether the next-token-prediction block drafts. Without it the plan is
+    /// the draft head of a drafter from a file of its own (DFlash), which runs
+    /// on the same device for the same reasons: it embeds the newest token and
+    /// reads the head's first rows.
+    pub mtp: bool,
 }
 
 /// The cut points of `units` units over devices with the cumulative shares
@@ -343,13 +348,25 @@ impl Placement {
     /// are on its device (all of them unless the head is cut by a tensor
     /// split).
     pub fn with_draft(
-        mut self,
+        self,
         c: &Config,
         vocabulary: Option<&[u32]>,
     ) -> Result<Self, PlacementError> {
         if c.n_nextn == 0 {
             return Err(PlacementError("the model has no next-token-prediction block".into()));
         }
+        self.with_head_view(c, vocabulary, true)
+    }
+
+    /// The draft head on the device that embeds, for the next-token-prediction
+    /// block (`mtp`) or for a drafter from a file of its own only: see
+    /// [`Placement::with_draft`].
+    pub fn with_head_view(
+        mut self,
+        c: &Config,
+        vocabulary: Option<&[u32]>,
+        mtp: bool,
+    ) -> Result<Self, PlacementError> {
         let device = self.embedding_device();
         let on_device = self.devices[device].head.clone();
         if on_device.start != 0 || on_device.is_empty() {
@@ -386,8 +403,13 @@ impl Placement {
                 (Some(Arc::from(order)), list.len() as u32)
             }
         };
-        self.draft = Some(DraftPlan { device, head_order, head_rows });
+        self.draft = Some(DraftPlan { device, head_order, head_rows, mtp });
         Ok(self)
+    }
+
+    /// The draft plan when the next-token-prediction block drafts.
+    pub fn mtp(&self) -> Option<&DraftPlan> {
+        self.draft.as_ref().filter(|d| d.mtp)
     }
 
     /// The token of row `row` of the output head.
@@ -412,7 +434,7 @@ impl Placement {
     /// embeds: those of the tokens the draft block can pick, none without a
     /// draft block. The device gets the other rows from the host.
     pub fn kept_rows(&self) -> u32 {
-        self.draft.as_ref().map_or(0, |d| d.head_rows)
+        self.mtp().map_or(0, |d| d.head_rows)
     }
 
     /// Whether the host stages rows of the table for the steps: the device

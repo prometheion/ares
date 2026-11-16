@@ -10,7 +10,9 @@
 //!
 //! - the text with the model's own drafts is the text without them, for
 //!   the most probable token and for sampled tokens (same seed);
-//! - drafts are made on the device and a good share of them is accepted.
+//! - drafts are made on the device and a good share of them is accepted;
+//! - the same with the DFlash drafter (`ARES_TEST_DFLASH_27B` names its file),
+//!   alone and next to the draft block.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, mpsc};
@@ -87,12 +89,26 @@ fn answers(
     drafts: u32,
     questions: &[&str],
 ) -> (Vec<String>, Counters) {
+    answers_with(model, vocabulary, drafts, questions, true, None)
+}
+
+/// [`answers`] with the draft block or not, and a DFlash drafter or not.
+fn answers_with(
+    model: &Path,
+    vocabulary: Option<&Arc<[u32]>>,
+    drafts: u32,
+    questions: &[&str],
+    draft_block: bool,
+    dflash: Option<&Arc<ares_model::dflash::File>>,
+) -> (Vec<String>, Counters) {
     let options = kv_env::with_env(Options {
         precision: Precision::Exact,
         max_rows: 128,
         logit_rows: 16,
         window_rows: if drafts > 0 { drafts + 1 } else { 0 },
         draft_vocabulary: vocabulary.cloned(),
+        draft_block,
+        dflash: dflash.cloned(),
         ..Options::default()
     });
     let model = Arc::new(
@@ -193,4 +209,60 @@ fn the_text_with_the_models_own_drafts_is_the_text_without() {
     assert_eq!(plain, drafted, "the model's own drafts changed the text");
     assert!(tested[0] >= 50, "the model drafted: {tested:?}");
     assert!(accepted[0] * 3 >= tested[0], "a third of the first drafts is accepted: {accepted:?}");
+}
+
+#[test]
+fn the_text_with_dflash_drafts_is_the_text_without() {
+    if std::env::var_os("ARES_TEST_CUDA").is_none() {
+        eprintln!("skipped: set ARES_TEST_CUDA=1 to run the tests that open GPUs");
+        return;
+    }
+    let Some(model) = env_path("ARES_TEST_QWEN35_27B") else { return };
+    let Some(file) = env_path("ARES_TEST_DFLASH_27B") else { return };
+    if device_count().unwrap() < 2 {
+        eprintln!("skipped: the 27B needs two devices");
+        return;
+    }
+    let file = Arc::new(ares_model::dflash::File::open(&file).unwrap());
+    let vocabulary: Option<Arc<[u32]>> = std::env::var_os("ARES_TEST_DRAFT_VOCAB").map(|path| {
+        std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .map(|l| l.parse().unwrap())
+            .collect()
+    });
+    let questions = [
+        "Explain in three sentences why the sky is blue.",
+        "Write a Python function that returns the n-th Fibonacci number.",
+    ];
+    let (plain, _) = answers(&model, vocabulary.as_ref(), 0, &questions);
+    for draft_block in [false, true] {
+        let (drafted, counters) =
+            answers_with(&model, vocabulary.as_ref(), 7, &questions, draft_block, Some(&file));
+        let (tested, accepted) = (counters.drafts_tested_at[2], counters.drafts_accepted_at[2]);
+        eprintln!(
+            "RES dflash{}: {} passes, {:.2} ms per drafting step; accepted by position {:?} of \
+             {:?}; block accepted {:?} of {:?}; {} tokens in {} steps",
+            if draft_block { " and draft block" } else { "" },
+            counters.own_draft_steps,
+            counters.own_draft_us as f64 / 1e3 / counters.own_draft_steps.max(1) as f64,
+            &accepted[..7],
+            &tested[..7],
+            &counters.drafts_accepted_at[1][..3],
+            &counters.drafts_tested_at[1][..3],
+            counters.tokens,
+            counters.steps,
+        );
+        for (i, (a, b)) in plain.iter().zip(&drafted).enumerate() {
+            let same = a.chars().zip(b.chars()).take_while(|(x, y)| x == y).count();
+            eprintln!("RES answer {i}: {same} of {} characters equal", a.chars().count());
+        }
+        assert_eq!(plain, drafted, "the DFlash drafts changed the text");
+        if !draft_block {
+            assert!(tested[0] >= 20, "the DFlash drafter drafted: {tested:?}");
+            assert!(accepted[0] * 3 >= tested[0], "a third of the first drafts: {accepted:?}");
+        }
+    }
 }

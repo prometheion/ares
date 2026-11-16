@@ -574,6 +574,7 @@ struct Tables {
     head: Option<HeadW>,
     head_tokens: Option<u64>,
     draft: Option<DraftW>,
+    draft_head: Option<Mat>,
 }
 
 /// The weights of one device.
@@ -591,6 +592,9 @@ pub(crate) struct DeviceWeights {
     pub head_tokens: Option<u64>,
     /// The draft block, on the device that holds it.
     pub draft: Option<DraftW>,
+    /// The draft head (the first rows of the output head here), on the device
+    /// of the draft plan, for the draft block or a drafter from a file.
+    pub draft_head: Option<Mat>,
     /// How long the upload took, the rearranging of the matrices in their
     /// device layout included.
     pub upload: Duration,
@@ -657,7 +661,7 @@ impl DeviceWeights {
         let Layout { len, mut chooser, ranges, .. } = layout;
         chooser.decide(len, balance.map(|b| (b, index)))?;
         let mut layout = Layout { items: Vec::new(), len: 0, chooser, model, normed, ranges };
-        let Tables { blocks, embedding, output_norm, head, head_tokens, draft } =
+        let Tables { blocks, embedding, output_norm, head, head_tokens, draft, draft_head } =
             tables(&mut layout, c, w, plan, draft, index)?;
         let Layout { items, len, chooser, .. } = layout;
         let layouts = chooser.finish();
@@ -724,6 +728,7 @@ impl DeviceWeights {
             head,
             head_tokens,
             draft,
+            draft_head,
             upload: begun.elapsed(),
             layouts,
         })
@@ -756,6 +761,9 @@ fn tables<'g>(
 ) -> Result<Tables, ModelError> {
     let model = layout.model;
     let own_draft = draft.filter(|d| d.device == index);
+    // The next-token-prediction block and the rows of the embedding table its
+    // chain picks from, when it drafts; the draft head for any drafter.
+    let own_mtp = own_draft.filter(|d| d.mtp);
     let order = draft.and_then(|d| d.head_order.as_deref());
     // The embedding table stays on the host (`embed.rs`); the device that
     // embeds keeps the rows of the draft head, the tokens its chain picks.
@@ -766,7 +774,7 @@ fn tables<'g>(
     if own_draft.is_some() && !plan.embedding {
         return Err(ModelError::Invalid("the draft block's device does not embed".into()));
     }
-    let chain_tokens = own_draft.map(|d| match order {
+    let chain_tokens = own_mtp.map(|d| match order {
         Some(order) => runs_of(&order[..d.head_rows as usize]),
         None => one(0..d.head_rows as usize),
     });
@@ -783,7 +791,7 @@ fn tables<'g>(
     // A tied head with a draft block here is one matrix in the file's
     // layout, so that its first rows are the rows of the draft head and of
     // the embedding the chain reads.
-    let in_file = tied && own_draft.is_some();
+    let in_file = tied && own_mtp.is_some();
     let mut head_tokens = None;
     let head = if plan.head.is_empty() {
         None
@@ -809,7 +817,7 @@ fn tables<'g>(
         };
         Some(head_rows(layout, w.head(), parts, head_usage, plan.head.start, in_file)?)
     };
-    let kept = match (own_draft, &head) {
+    let kept = match (own_mtp, &head) {
         (Some(d), Some(head)) => Some(match own_rows {
             Some(rows) => KeptW { rows, tokens: head_tokens, shared_with_head: false },
             None => KeptW {
@@ -832,11 +840,15 @@ fn tables<'g>(
         blocks.push(block(layout, c, w, layer, slice)?);
     }
     let output_norm = layout.floats(&w.output_norm);
-    let draft = match (own_draft, &head) {
+    let draft_head = match (own_draft, &head) {
+        (Some(plan), Some(head)) => Some(draft_head_of(plan, head)?),
+        _ => None,
+    };
+    let draft = match (own_mtp, &head) {
         (Some(plan), Some(head)) => Some(draft_block(layout, c, w, plan, head)?),
         _ => None,
     };
-    Ok(Tables { blocks, embedding, output_norm, head, head_tokens, draft })
+    Ok(Tables { blocks, embedding, output_norm, head, head_tokens, draft, draft_head })
 }
 
 /// Lays out the rows of the output head `m` that a device holds ([`head_parts`]),
@@ -880,6 +892,32 @@ fn head_parts<'g>(
     Ok(HeadW { parts, n_out, first_token })
 }
 
+/// The draft head: the first part of a head in two parts, or the first rows of
+/// a head in one, which the file's layout lets a product read alone (a head in
+/// its device layout is in one part only when the draft head is all of it).
+fn draft_head_of(plan: &DraftPlan, head: &HeadW) -> Result<Mat, ModelError> {
+    if plan.head_rows == 0 || plan.head_rows > head.n_out {
+        return Err(ModelError::Invalid(format!(
+            "a draft head of {} rows; the device holds {} rows of the head",
+            plan.head_rows, head.n_out
+        )));
+    }
+    let first = head.parts[0];
+    let draft_head = match (head.parts.len(), first.layout) {
+        (2, _) | (_, WeightLayout::File) => Mat { n_out: plan.head_rows, ..first },
+        _ if plan.head_rows == first.n_out => first,
+        _ => {
+            return Err(ModelError::Invalid(
+                "the draft head is a part of a head that lies in its device layout".into(),
+            ));
+        }
+    };
+    if head.parts.len() == 2 && plan.head_rows != first.n_out {
+        return Err(ModelError::Invalid("the head was not cut at the draft head".into()));
+    }
+    Ok(draft_head)
+}
+
 /// Lays out the draft block: the model's next-token-prediction block with all
 /// its heads, and the draft head as the first rows of `head`.
 fn draft_block<'g>(
@@ -899,29 +937,7 @@ fn draft_block<'g>(
                 .into(),
         ));
     }
-    if plan.head_rows == 0 || plan.head_rows > head.n_out {
-        return Err(ModelError::Invalid(format!(
-            "a draft head of {} rows; the device holds {} rows of the head",
-            plan.head_rows, head.n_out
-        )));
-    }
-    // The draft head: the first part of a head in two parts, or the first
-    // rows of a head in one, which the file's layout lets a product read
-    // alone (a head in its device layout is in one part only when the draft
-    // head is all of it).
-    let first = head.parts[0];
-    let draft_head = match (head.parts.len(), first.layout) {
-        (2, _) | (_, WeightLayout::File) => Mat { n_out: plan.head_rows, ..first },
-        _ if plan.head_rows == first.n_out => first,
-        _ => {
-            return Err(ModelError::Invalid(
-                "the draft head is a part of a head that lies in its device layout".into(),
-            ));
-        }
-    };
-    if head.parts.len() == 2 && plan.head_rows != first.n_out {
-        return Err(ModelError::Invalid("the head was not cut at the draft head".into()));
-    }
+    let draft_head = draft_head_of(plan, head)?;
     let (d, ac) = (c.n_embd, &c.attention);
     let (a, b) = (&n.attention, &n.block);
     // A link of a chain is one row per sequence that drafts. The projections

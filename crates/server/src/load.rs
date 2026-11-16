@@ -101,7 +101,7 @@ pub(crate) fn refuse(message: impl Into<String>) -> LoadError {
 /// Whether the model's own draft block takes part in speculation: when
 /// `--drafters` names `mtp`, or names nothing and the model has one
 /// (`has_block`). `--drafters mtp` for a model with none is refused, saying
-/// `no_block`, and so is a drafter from a file, which is not built yet.
+/// `no_block`.
 pub(crate) fn draft_block_takes_part(
     options: &LoadOptions,
     has_block: bool,
@@ -110,20 +110,35 @@ pub(crate) fn draft_block_takes_part(
     let Some(list) = &options.drafters else {
         return Ok(has_block);
     };
-    for drafter in list {
-        if let Drafter::Block(path) = drafter {
-            return Err(refuse(format!(
-                "--drafters {}: block drafters from a file of their own (DFlash2) are not \
-                 built yet",
-                path.display()
-            )));
-        }
-    }
     let asked = list.contains(&Drafter::Mtp);
     if asked && !has_block {
         return Err(refuse(format!("--drafters mtp: {no_block}")));
     }
     Ok(asked)
+}
+
+/// The drafter from a file of its own that `--drafters` names (DFlash2),
+/// opened and its shape read: one at most. A file that is not a drafter the
+/// engine runs is refused by what it is.
+pub(crate) fn dflash_drafter(
+    options: &LoadOptions,
+) -> Result<Option<std::sync::Arc<ares_model::dflash::File>>, LoadError> {
+    let files: Vec<&std::path::PathBuf> = options
+        .drafters
+        .iter()
+        .flatten()
+        .filter_map(|d| match d {
+            Drafter::Block(path) => Some(path),
+            Drafter::Mtp => None,
+        })
+        .collect();
+    match files.as_slice() {
+        [] => Ok(None),
+        [path] => ares_model::dflash::File::open(path)
+            .map(|file| Some(std::sync::Arc::new(file)))
+            .map_err(|e| refuse(format!("--drafters: {e}"))),
+        _ => Err(refuse("--drafters: one drafter from a file at most")),
+    }
 }
 
 /// A device that was opened, and what it had free then.
@@ -427,14 +442,14 @@ fn footprint(
             // of their own unless the head is the table, whose rows they
             // are then.
             if let Some(draft) =
-                placement.draft.as_ref().filter(|draft| draft.device == index && w.output.is_some())
+                placement.mtp().filter(|draft| draft.device == index && w.output.is_some())
             {
                 weights +=
                     part_of(matrix_bytes(&w.token_embd), draft.head_rows as usize, c.n_vocab);
             }
             weights += part_of(matrix_bytes(w.head()), plan.head.len(), c.n_vocab);
             if let (Some(_), Some(nextn)) =
-                (placement.draft.as_ref().filter(|draft| draft.device == index), &w.nextn)
+                (placement.mtp().filter(|draft| draft.device == index), &w.nextn)
             {
                 let at = &nextn.attention;
                 weights += matrix_bytes(&nextn.block.ffn_gate)
@@ -446,12 +461,31 @@ fn footprint(
                     + matrix_bytes(&at.out)
                     + matrix_bytes(&nextn.eh_proj);
             }
+            // A DFlash drafter on the device of the draft plan: its weights,
+            // its ring per sequence, its scratch.
+            let mut step_extra = 0u64;
+            if let (Some(file), Some(draft)) =
+                (&options.dflash, placement.draft.as_ref().filter(|d| d.device == index))
+                && let Ok(fw) = file.weights()
+            {
+                let setup = |slots: u32| ares_model::dflash::DrafterSetup {
+                    max_slots: slots,
+                    max_rows: options.max_rows,
+                    window_rows: options.window_rows,
+                    head_rows: draft.head_rows,
+                };
+                let one = ares_model::dflash::bytes_of(&file.config, &fw, &setup(1));
+                let two = ares_model::dflash::bytes_of(&file.config, &fw, &setup(2));
+                weights += one.weights;
+                per_sequence += two.total() - one.total();
+                step_extra += one.scratch + one.records;
+            }
             let logits = u64::from(options.logit_rows) * 4 * (d + plan.head.len() as u64);
             Footprint {
                 weights,
                 // The margin: alignment of the arena, the sampler, records,
                 // attention plans, links, the draft block's buffers.
-                step: rows * per_row + logits + weights / 64 + 64 * MIB,
+                step: rows * per_row + logits + weights / 64 + 64 * MIB + step_extra,
                 per_sequence,
                 per_page: page_bytes(c, placement, index, options),
                 exact: exact_bytes(c, placement, index, options, parallel),
@@ -600,8 +634,12 @@ fn place(
         }
         Spread::Layer(shares) => Placement::layer(c, w, shares).map_err(model)?,
     };
-    if c.n_nextn == 1 && options.window_rows > 1 && placement.split != Split::Layer {
-        placement.with_draft(c, options.draft_vocabulary.as_deref()).map_err(model)
+    let drafts = options.window_rows > 1 && placement.split != Split::Layer;
+    let vocabulary = options.draft_vocabulary.as_deref();
+    if drafts && c.n_nextn == 1 && options.draft_block {
+        placement.with_draft(c, vocabulary).map_err(model)
+    } else if drafts && options.dflash.is_some() {
+        placement.with_head_view(c, vocabulary, false).map_err(model)
     } else {
         Ok(placement)
     }
@@ -850,8 +888,32 @@ fn load_qwen35(
     }
     let blocked_by_layer = mtp && layer;
     let mtp = mtp && !layer;
+    // A DFlash drafter from a file: on the device that embeds and holds the
+    // first rows of the head, as the draft block.
+    let dflash = dflash_drafter(options)?;
+    if let Some(file) = &dflash {
+        if layer {
+            return Err(refuse(
+                "--drafters: the DFlash drafter is not built for a layer split; use a single \
+                 device or a tensor split",
+            ));
+        }
+        file.config
+            .fits(config.n_embd, config.n_layer, config.n_vocab)
+            .map_err(|e| refuse(format!("--drafters: {e}")))?;
+        tracing::info!(
+            "drafter: DFlash from {}, {} layers, blocks of {} tokens, taps of layers {:?}, {} \
+             of weights",
+            file.gguf.path(0).display(),
+            file.config.n_layer,
+            file.config.block,
+            file.config.target_layers,
+            Bytes(file.bytes()),
+        );
+    }
     let window = options.window.unwrap_or(DEFAULT_WINDOW);
-    if options.window.is_some() && !mtp {
+    let drafts = mtp || dflash.is_some();
+    if options.window.is_some() && !drafts {
         return Err(refuse(if blocked_by_layer {
             "--window: the model's draft block is not built for a layer split, so no window is \
              reserved"
@@ -860,7 +922,7 @@ fn load_qwen35(
         }));
     }
     let vocabulary = match &options.draft_vocabulary {
-        Some(_) if !mtp => {
+        Some(_) if !drafts => {
             return Err(refuse(
                 "a draft vocabulary is for the model's draft block, and no drafter of that kind \
                  takes part",
@@ -877,13 +939,15 @@ fn load_qwen35(
     let (ordinals, mut held) = hold_devices(options)?;
 
     // The model's settings that do not depend on the placement.
-    let window_rows = if mtp { parallel.saturating_mul(window) } else { 0 };
+    let window_rows = if drafts { parallel.saturating_mul(window) } else { 0 };
     let part_options = Options {
         precision: options.precision,
         kv,
         logit_rows: window_rows.max(parallel),
         window_rows,
         draft_vocabulary: vocabulary.clone(),
+        draft_block: mtp,
+        dflash: dflash.clone(),
         ..Options::default()
     };
     if part_options.max_rows < window_rows {
@@ -1115,7 +1179,7 @@ fn load_qwen35(
             ares_cuda::Precision::Fast => "fast (8-bit activations for a few rows)",
             ares_cuda::Precision::Exact => "exact (f16 on the tensor cores for every product)",
         },
-        match (mtp, &placement.draft) {
+        match (drafts, &placement.draft) {
             (false, _) if blocked_by_layer => "no speculation: the model's draft block is not \
                  built for a layer split, and earlier text alone is not a drafter"
                 .to_owned(),
@@ -1124,10 +1188,14 @@ fn load_qwen35(
                 None => "no model drafter (the file has no draft block): no speculation".to_owned(),
             },
             (true, Some(draft)) => format!(
-                "drafts from the model's draft block on device {} ({}) and from earlier text, \
-                 windows of up to {window} rows; whose drafts and how many are chosen for every \
-                 step from the price of a step, measured at load, and the acceptance, measured \
-                 while running",
+                "drafts from {} on device {} ({}) and from earlier text, windows of up to \
+                 {window} rows; whose drafts and how many are chosen for every step from the \
+                 price of a step, measured at load, and the acceptance, measured while running",
+                match (mtp, &dflash) {
+                    (true, Some(_)) => "the model's draft block and the DFlash drafter",
+                    (true, None) => "the model's draft block",
+                    (false, _) => "the DFlash drafter",
+                },
                 held[draft.device].device.ordinal(),
                 match &vocabulary {
                     Some(list) => format!("a vocabulary of {} tokens", list.len()),
@@ -1231,7 +1299,7 @@ fn load_qwen35(
         cells_per_page: CELLS_PER_PAGE,
         max_slots: parallel,
         queue: options.queue,
-        window_rows: if mtp { window } else { 1 },
+        window_rows: if drafts { window } else { 1 },
         cache_ram: lockable - required,
         ssd: ssd.clone(),
         ..RuntimeConfig::default()

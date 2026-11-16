@@ -7,6 +7,7 @@
 
 mod blocks;
 pub mod chat;
+pub mod dflash;
 mod files;
 pub mod qwen35;
 pub mod qwen3vl;

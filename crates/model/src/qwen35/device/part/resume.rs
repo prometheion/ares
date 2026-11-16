@@ -103,8 +103,7 @@ pub fn transit_page_bytes(c: &Config, placement: &Placement, index: usize, opts:
         })
         .sum::<u64>()
         + placement
-            .draft
-            .as_ref()
+            .mtp()
             .filter(|d| d.device == index)
             .map_or(0, |_| entry(DRAFT_KV, c.attention.n_head_kv as u32))
 }
@@ -114,7 +113,7 @@ pub fn transit_page_bytes(c: &Config, placement: &Placement, index: usize, opts:
 /// blocks and of the draft block keep exact. A step converts the tiles that
 /// lie before them at its start. 0 when no group has exact entries.
 pub fn settle_cells(placement: &Placement, opts: &Options) -> u32 {
-    let draft = placement.draft.as_ref().map_or(0, |_| kv::newest_cells(DRAFT_KV.0, DRAFT_KV.1));
+    let draft = placement.mtp().map_or(0, |_| kv::newest_cells(DRAFT_KV.0, DRAFT_KV.1));
     kv::newest_cells(opts.kv.0, opts.kv.1).max(draft)
 }
 

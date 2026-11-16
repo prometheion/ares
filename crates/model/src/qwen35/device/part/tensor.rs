@@ -135,6 +135,9 @@ impl Part {
                 for g in 0..count {
                     let group = self.enter(env, groups, g);
                     self.collect(&group, g as u32, readers)?;
+                    if half == Half::Mixer {
+                        self.dflash_tap(&group, i)?;
+                    }
                     self.half(&group, i, &block, half)?;
                     self.post(&group, g as u32)?;
                 }

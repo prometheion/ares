@@ -72,6 +72,9 @@ pub struct DraftChain {
     /// The reach the chain needs for each link to be made (the step record's
     /// draft bars); empty for a chain that makes every link.
     pub needs: Vec<f32>,
+    /// Where its drafts go in the step's list of drafts, which the drafts of
+    /// every drafter of the part share in the order of the record's windows.
+    pub place: u32,
 }
 
 /// What the block drafts in the coming step.
@@ -516,9 +519,13 @@ impl Part {
     /// Device milliseconds of the chains of the step that ran last (0 when it
     /// drafted nothing). The step must have ended.
     pub fn draft_chain_ms(&mut self) -> Result<f64, ModelError> {
-        let Some(m) = &mut self.mtp else { return Ok(0.0) };
+        let pass = match &mut self.dflash {
+            Some(d) => d.pass_ms()?,
+            None => 0.0,
+        };
+        let Some(m) = &mut self.mtp else { return Ok(pass) };
         m.flush_clock()?;
-        Ok(m.clock.last_chain_ms)
+        Ok(m.clock.last_chain_ms + pass)
     }
 
     /// Tells the part what its draft block drafts in the step that is
@@ -540,22 +547,43 @@ impl Part {
         Ok(())
     }
 
-    /// Where the step enqueued last left its drafts; `None` when it drafted
-    /// nothing.
+    /// Where the step enqueued last left its drafts, the draft block's and
+    /// the DFlash drafter's in one list; `None` when it drafted nothing.
     pub fn drafted(&self) -> Option<Drafted> {
-        let m = self.mtp.as_ref()?;
-        (m.drafted > 0).then(|| Drafted { ptr: m.at(m.s.drafts), tokens: m.drafted })
+        let block = self.mtp.as_ref().map_or(0, |m| m.drafted);
+        let dflash = self.dflash.as_ref().map_or(0, |d| d.drafted());
+        let tokens = block.max(dflash);
+        (tokens > 0).then(|| Drafted { ptr: self.draft_list(), tokens })
     }
 
-    /// The probability the block gave each draft of the step that ran last,
+    /// The step's list of drafts, which every drafter of the part writes at
+    /// the places of its windows: the draft block's when the part has one.
+    pub fn draft_list(&self) -> DevicePtr {
+        match (&self.mtp, &self.dflash) {
+            (Some(m), _) => m.at(m.s.drafts),
+            (None, Some(d)) => d.own_list(),
+            (None, None) => DevicePtr::NULL,
+        }
+    }
+
+    /// The probability the drafter gave each draft of the step that ran last,
     /// in the order of [`Part::drafted`], appended to `out`; NaN for a link
     /// that was not made. The step has ended.
     pub fn draft_probs(&self, out: &mut Vec<f32>) {
-        let Some(m) = self.mtp.as_ref().filter(|m| m.drafted > 0) else { return };
+        let Some(drafted) = self.drafted() else { return };
         let from = out.len();
-        out.resize(from + m.drafted as usize, f32::NAN);
-        for &(link, row, place) in m.layout.iter().filter(|(link, ..)| *link < m.made) {
-            out[from + place as usize] = m.confidence(link, row);
+        out.resize(from + drafted.tokens as usize, f32::NAN);
+        if let Some(m) = self.mtp.as_ref().filter(|m| m.drafted > 0) {
+            for &(link, row, place) in m.layout.iter().filter(|(link, ..)| *link < m.made) {
+                out[from + place as usize] = m.confidence(link, row);
+            }
+        }
+        if let Some(d) = self.dflash.as_ref().filter(|d| d.drafted() > 0) {
+            for s in d.last_pass() {
+                for j in s.place..s.place + s.wanted {
+                    out[from + j as usize] = d.prob(j);
+                }
+            }
         }
     }
 
@@ -748,8 +776,8 @@ impl Part {
                     chain.rows.len()
                 )));
             }
-            first.push(total);
-            total += chain.rows.len() as u32;
+            first.push(chain.place);
+            total = total.max(chain.place + chain.rows.len() as u32);
         }
         let mut order: Vec<usize> = (0..step.chains.len()).collect();
         order.sort_by_key(|&c| std::cmp::Reverse(step.chains[c].rows.len()));

@@ -109,6 +109,7 @@ fn main() {
         ("q4.cu", "q4.fatbin", FLOOR),
         ("tower.cu", "tower.fatbin", TENSOR_FLOOR),
         ("sampler.cu", "sampler.fatbin", FLOOR),
+        ("dflash.cu", "dflash.fatbin", FLOOR),
     ];
     let children: Vec<_> = modules
         .iter()

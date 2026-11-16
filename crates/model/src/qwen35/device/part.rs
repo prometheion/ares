@@ -31,6 +31,7 @@ use super::placement::Placement;
 use crate::qwen35::Config;
 use crate::qwen35::weights::Weights;
 
+mod dflash;
 #[path = "mtp.rs"]
 mod mtp;
 mod resume;
@@ -106,6 +107,12 @@ pub struct Options {
     /// rows are on the block's device, which are all of them unless a tensor
     /// split cuts the head.
     pub draft_vocabulary: Option<Arc<[u32]>>,
+    /// Whether the next-token-prediction block drafts, when the model has one
+    /// and windows may carry drafts.
+    pub draft_block: bool,
+    /// A DFlash drafter from a file of its own: it drafts when windows may
+    /// carry drafts, on the device that embeds (not under a layer split).
+    pub dflash: Option<Arc<crate::dflash::File>>,
     /// Under a layer split, the rows a device hands to the next at a time: a
     /// step of at least twice as many certain rows is cut into groups of this
     /// size, and the devices work on different groups of the step at once.
@@ -135,6 +142,8 @@ impl Default for Options {
             logit_rows: 8,
             window_rows: 0,
             draft_vocabulary: None,
+            draft_block: true,
+            dflash: None,
             pipeline_rows: 256,
             profile: None,
         }
@@ -520,6 +529,9 @@ pub struct Part {
     page_bytes: u64,
     /// The model's own draft block, on the device that holds it.
     mtp: Option<mtp::Mtp>,
+    /// A DFlash drafter from a file of its own, on the device of the draft
+    /// plan.
+    dflash: Option<crate::dflash::Drafter>,
 }
 
 impl std::fmt::Debug for Part {
@@ -551,7 +563,7 @@ pub fn page_bytes(c: &Config, placement: &Placement, index: usize, opts: &Option
         })
         .sum::<u64>()
         // The draft block's keys and values, on the device that holds it.
-        + placement.draft.as_ref().filter(|d| d.device == index).map_or(0, |_| {
+        + placement.mtp().filter(|d| d.device == index).map_or(0, |_| {
             geometry(c, DRAFT_KV, c.attention.n_head_kv as u32).converted_entry_bytes()
         })
 }
@@ -578,8 +590,7 @@ pub fn exact_bytes(
         })
         .collect();
     let draft: Vec<CacheGeometry> = placement
-        .draft
-        .as_ref()
+        .mtp()
         .filter(|d| d.device == index)
         .map(|_| geometry(c, DRAFT_KV, c.attention.n_head_kv as u32))
         .into_iter()
@@ -894,6 +905,7 @@ impl Part {
             draft_sizes,
             draft_growth,
         )?;
+        let dflash = dflash::open(c, weights, placement, opts, index, device, ledger, max_slots)?;
         // A checkpoint is the slot's recurrent state and, where the draft
         // block is, one row of its carry.
         let checkpoint = slot_bytes + if mtp.is_some() { d * 4 } else { 0 };
@@ -952,6 +964,7 @@ impl Part {
             batched: std::cell::Cell::new(false),
             page_bytes,
             mtp,
+            dflash,
         })
     }
 
@@ -1780,6 +1793,7 @@ impl Part {
     /// next device. Returns where the logits of the wanted rows will be.
     pub fn enqueue(&mut self, env: &StepEnv<'_>) -> Result<Option<Logits>, ModelError> {
         self.begin(env)?;
+        self.dflash_begin(env)?;
         self.start_sequences(env)?;
         self.stage_embedding(env)?;
         // The draft block's chains come first: the rows that verify their
@@ -1828,6 +1842,7 @@ impl Part {
         }
         let logits = self.enqueue_head(env)?;
         self.draft_after(env)?;
+        self.dflash_inject(env)?;
         self.finish(env)?;
         Ok(logits)
     }
@@ -2070,6 +2085,7 @@ impl Part {
         if self.split == Split::Tensor {
             return Err(invalid("a block of a tensor split cannot be enqueued without its merges"));
         }
+        self.dflash_tap(env, i)?;
         let block: BlockW = self.w.blocks[i].clone();
         match &block.mixer {
             MixerW::Recurrent(r) => {

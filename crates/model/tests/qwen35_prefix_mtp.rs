@@ -163,7 +163,7 @@ impl Rig {
         self.part
             .draft_step(DraftStep {
                 tokens: self.record.ptr().offset(off_tokens),
-                chains: vec![DraftChain { segment: 0, token, rows, needs: Vec::new() }],
+                chains: vec![DraftChain { segment: 0, token, rows, needs: Vec::new(), place: 0 }],
                 chances: None,
             })
             .unwrap();

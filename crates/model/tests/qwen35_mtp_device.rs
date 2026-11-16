@@ -206,6 +206,7 @@ impl Rig {
                     token,
                     rows: rows.to_vec(),
                     needs: Vec::new(),
+                    place: 0,
                 }],
                 chances: None,
             })

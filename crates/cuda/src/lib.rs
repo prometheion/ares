@@ -21,6 +21,7 @@
 
 mod attention;
 mod device;
+mod dflash;
 mod driver;
 mod error;
 mod experts;
@@ -42,6 +43,10 @@ pub use attention::{
 };
 pub use device::{
     Device, DeviceInfo, MemInfo, PciAddress, Wait, device_count, devices, peer_access,
+};
+pub use dflash::{
+    DFLASH_HEAD_DIM, DFLASH_MAX_BLOCK, DFLASH_MAX_RANK, DFLASH_MAX_TOP_K, DflashKernels,
+    DflashSelect, DflashSeq, Ring, Selector,
 };
 pub use driver::{LIBRARY_ENV, driver_version};
 pub use error::{Error, Result};

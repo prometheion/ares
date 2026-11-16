@@ -117,6 +117,11 @@ impl HostRows {
         self.shape.row_bytes() as usize
     }
 
+    /// The table's type and size.
+    pub fn shape(&self) -> TableShape {
+        self.shape
+    }
+
     /// The page-locked bytes this holds.
     pub fn locked(&self) -> u64 {
         (self.table.len() + self.stage.len()) as u64

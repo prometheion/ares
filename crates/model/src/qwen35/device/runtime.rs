@@ -25,6 +25,7 @@ use super::part::{
 };
 use super::placement::{HalfShares, Placement, PlacementError};
 use crate::chat;
+use crate::dflash::PassSeq;
 use crate::qwen35::{Config, Weights};
 
 /// How to spread the model over the devices.
@@ -149,14 +150,24 @@ impl Qwen35 {
             (placement, table)
         };
         // A model with a next-token-prediction block drafts with it wherever
-        // it can: when windows may carry drafts, and the device that embeds
-        // has the first rows of the head (not a layer split).
-        let placement =
-            if config.n_nextn == 1 && options.window_rows > 1 && placement.split != Split::Layer {
-                placement.with_draft(&config, options.draft_vocabulary.as_deref())?
-            } else {
-                placement
-            };
+        // it can (and is asked to): when windows may carry drafts, and the
+        // device that embeds has the first rows of the head (not a layer
+        // split). A DFlash drafter needs the same device and head.
+        let drafts = options.window_rows > 1 && placement.split != Split::Layer;
+        let mtp = config.n_nextn == 1 && options.draft_block;
+        let vocabulary = options.draft_vocabulary.as_deref();
+        let placement = if drafts && mtp {
+            placement.with_draft(&config, vocabulary)?
+        } else if drafts && options.dflash.is_some() {
+            placement.with_head_view(&config, vocabulary, false)?
+        } else {
+            placement
+        };
+        if let Some(file) = &options.dflash {
+            file.config
+                .fits(config.n_embd, config.n_layer, config.n_vocab)
+                .map_err(|e| PlacementError(e.to_string()))?;
+        }
         let tokenizer =
             Tokenizer::from_gguf(&gguf).map_err(|e| OpenError::Tokenizer(e.to_string()))?;
         let context = context.clamp(1, config.n_ctx as u32);
@@ -218,6 +229,14 @@ impl Qwen35 {
         reports
     }
 
+    /// The drafts of one pass of the DFlash drafter, when it drafts: a block's
+    /// less the newest token, at most a window's.
+    fn dflash_drafts(&self) -> Option<u32> {
+        let file = self.options.dflash.as_ref()?;
+        self.placement.draft.as_ref()?;
+        Some((file.config.drafts() as u32).min(self.options.window_rows.saturating_sub(1)))
+    }
+
     /// The most rows of a sum across the devices that is pushed.
     fn rows_per_sum(&self) -> u32 {
         (ares_cuda::PUSH_MAX_VALUES / self.config.n_embd as u32).clamp(1, self.options.max_rows)
@@ -241,7 +260,7 @@ impl Qwen35 {
         for part in 0..self.gguf.n_parts() {
             crate::files::identity(self.gguf.path(part as u16), &mut out);
         }
-        let draft = self.placement.draft.as_ref().map(|draft| (draft.device, DRAFT_KV));
+        let draft = self.placement.mtp().map(|draft| (draft.device, DRAFT_KV));
         let settings = format!(
             "kv {:?} draft {:?} state {:?} precision {:?} split {:?}",
             self.options.kv,
@@ -360,13 +379,17 @@ impl Model for Qwen35 {
     }
 
     fn drafters(&self) -> Vec<Drafter> {
-        match self.placement.draft {
-            Some(_) => vec![Drafter {
+        let mut drafters = Vec::new();
+        if self.placement.mtp().is_some() {
+            drafters.push(Drafter {
                 kind: DrafterKind::Block,
                 drafts: self.options.window_rows.saturating_sub(1),
-            }],
-            None => Vec::new(),
+            });
         }
+        if let Some(drafts) = self.dflash_drafts() {
+            drafters.push(Drafter { kind: DrafterKind::Dflash, drafts });
+        }
+        drafters
     }
 
     fn prefix_cache(&self) -> Option<PrefixCache> {
@@ -468,12 +491,18 @@ impl Model for Qwen35 {
             layouts: part.layouts().clone(),
             ledger: cx.ledger.entries().map(|(name, bytes)| (name.to_owned(), bytes)).collect(),
         });
+        // The ids of the drafters in the record, in the order of `drafters`.
+        let block_id = self.placement.mtp().map(|_| 1);
+        let dflash_id = self.dflash_drafts().map(|_| 1 + u32::from(block_id.is_some()));
         Ok(Box::new(Qwen35Device {
             part,
             tokens: Vec::new(),
             segments: Vec::new(),
             replay: Vec::new(),
             chains: Vec::new(),
+            passes: Vec::new(),
+            block_id,
+            dflash_id,
         }))
     }
 }
@@ -488,8 +517,13 @@ struct Qwen35Device {
     segments: Vec<Segment>,
     /// The rows of the step that are replays.
     replay: Vec<Range<u32>>,
-    /// The windows of the step whose drafts the model's draft block makes.
+    /// The windows of the step whose drafts the model's draft block makes,
+    /// and those the DFlash drafter makes.
     chains: Vec<DraftChain>,
+    passes: Vec<PassSeq>,
+    /// The ids the record names the two drafters by, when the model has them.
+    block_id: Option<u32>,
+    dflash_id: Option<u32>,
 }
 
 /// The runtime's links as a part uses them.
@@ -584,25 +618,29 @@ impl DeviceModel for Qwen35Device {
                 self.replay.push(segment.row0..segment.row0 + segment.n_rows);
             }
         }
-        if self.part.has_draft_block() {
-            // The windows that take the block's drafts: each with its newest
-            // token and the settings of the rows that verify the drafts. All
-            // rows of a window are wanted, so the sampler rows of a window
-            // are consecutive; `wanted` counts the wanted rows before it.
-            self.chains.clear();
-            let mut bar = 0;
-            for (i, segment) in self.segments.iter().enumerate() {
-                if !record.own_drafts(i as u32) || segment.n_rows < 2 {
-                    continue;
-                }
-                // The bars of the window's links, when the record has them.
-                let links = segment.n_rows - 1;
-                let needs = if record.draft_bars() >= bar + links {
-                    (bar..bar + links).map(|k| record.draft_need(k)).collect()
-                } else {
-                    Vec::new()
-                };
-                bar += links;
+        // The windows whose drafts a drafter of the part makes, each at its
+        // place in the step's list of drafts: the draft block's chains, with
+        // their newest token and the settings of the rows that verify the
+        // drafts (all rows of a window are wanted, so the sampler rows of a
+        // window are consecutive; `wanted` counts the wanted rows before it),
+        // and the DFlash drafter's passes.
+        self.chains.clear();
+        self.passes.clear();
+        let (mut bar, mut place) = (0, 0);
+        for (i, segment) in self.segments.iter().enumerate() {
+            let Some(drafter) = record.drafter(i as u32) else { continue };
+            if segment.n_rows < 2 {
+                continue;
+            }
+            let links = segment.n_rows - 1;
+            // The bars of the window's links, when the record has them.
+            let needs = if record.draft_bars() >= bar + links {
+                (bar..bar + links).map(|k| record.draft_need(k)).collect()
+            } else {
+                Vec::new()
+            };
+            bar += links;
+            if Some(drafter) == self.block_id {
                 let wanted: u32 = (0..record.runs())
                     .map(|r| record.run(r))
                     .map(|(first, count)| segment.row0.clamp(first, first + count) - first)
@@ -610,22 +648,39 @@ impl DeviceModel for Qwen35Device {
                 self.chains.push(DraftChain {
                     segment: i as u32,
                     token: record.row(segment.row0).token,
-                    rows: (0..segment.n_rows - 1)
-                        .map(|j| record.sampler(wanted + j).for_draft())
-                        .collect(),
+                    rows: (0..links).map(|j| record.sampler(wanted + j).for_draft()).collect(),
                     needs,
+                    place,
                 });
+            } else if Some(drafter) == self.dflash_id {
+                self.passes.push(PassSeq {
+                    slot: segment.slot,
+                    position: segment.pos0 as u32,
+                    newest: record.row(segment.row0).token,
+                    record_row: segment.row0 + 1,
+                    wanted: links,
+                    place,
+                });
+            } else {
+                return Err(ModelError::Invalid(format!("the part has no drafter {drafter}")));
             }
+            place += links;
+        }
+        if self.part.has_draft_block() {
             self.part.draft_step(DraftStep {
                 tokens: step.record_on_device.offset(record.tokens_offset()),
                 chains: std::mem::take(&mut self.chains),
                 chances: record.draft_chances(),
             })?;
         }
+        if self.part.has_dflash() && self.passes.is_empty() {
+            self.part.dflash_no_pass();
+        }
         let exchange = LinkExchange { links: step.links, index: step.index, stream: step.stream };
         if record.drafts_only() {
-            // The chains and nothing of the model: the round that verifies
-            // their drafts is the next record.
+            // The drafts and nothing of the model: the round that verifies
+            // them is the next record. The draft block's chains first, then
+            // the DFlash drafter's passes into the same list.
             if self.part.has_draft_block() {
                 self.part.enqueue_chains(&StepEnv {
                     stream: step.stream,
@@ -638,6 +693,11 @@ impl DeviceModel for Qwen35Device {
                     exchange: None,
                     replay: &self.replay,
                 })?;
+            }
+            if !self.passes.is_empty() {
+                let list = self.part.draft_list();
+                let tokens = step.record_on_device.offset(record.tokens_offset());
+                self.part.dflash_pass(step.stream, tokens, &self.passes, list)?;
             }
             return Ok(None);
         }
