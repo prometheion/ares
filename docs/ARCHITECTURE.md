@@ -1751,7 +1751,7 @@ the table rows it needs). The drafts go into the step record's token array and
 the step's list at the window's place.
 
 **Memory.** On the drafter's device, in its ledger before the pool is sized:
-the weights as the file stores them (27B: MEM27W; Flash-Next: MEMFNW), the
+the weights as the file stores them (27B: 1080 MiB; Flash-Next: 335 MiB, from its `Q4_K_M` file), the
 ring (27B: 5 layers x 2064 cells x 8 heads x 128 x K and V in f16 = 42 MiB per
 sequence slot; Flash-Next the same), the scratch (the pass of every slot at
 once, the logits of the head for 7 rows per slot, the fusion of a step of the
@@ -1765,7 +1765,65 @@ resume point. Flash-Next under a split by layers (the first device's taps
 would have to cross to the head's device). Sampled drafts (the walk is greedy;
 the target's sampled picks verify them as any other drafts).
 
-DFLASH-NUMBERS
+**Measured** (2026-11-16, tensor split 0.625 / 0.375, `Q4_K_S`, `q5` K and V, a context of 16384,
+the draft vocabulary, windows of 8, `qwen35_run --engine` with the speculation's seven requests of
+300 tokens, thinking on; load 4 to 22; `/var/tmp/ares-drafters/out`, means of the runs in brackets):
+
+| request | lookup + draft block (3 runs, load 4 to 6) | lookup + draft block + DFlash (3, load 11 to 22) | lookup + DFlash (3, load 5 to 21) |
+| --- | ---: | ---: | ---: |
+| german | 89.4 (2.92) | 85.9 (3.07) | 90.6 (3.07) |
+| english | 86.3 (2.81) | 106.7 (3.83) | 113.2 (3.83) |
+| code | 88.5 (2.87) | 88.0 (3.11) | 94.0 (3.15) |
+| rewrite | 148.6 (5.51) | 164.4 (6.30) | 177.6 (6.43) |
+| german2 | 94.5 (3.18) | 94.2 (3.30) | 98.2 (3.30) |
+| english2 | 94.5 (3.05) | 90.8 (3.14) | 95.3 (3.18) |
+| code2 | 102.6 (3.61) | 120.1 (4.27) | 123.9 (4.27) |
+
+Tokens per second (tokens per step). The second column holds a run whose load rose from 11 to 33
+while it ran (74.7 to 144.2 tokens per second); without it the column is within 2 % of the third.
+Over the draft block alone the drafter gains +1, +31, +6, +20, +4, +1 and +21 % (tokens per step
++5 to +36 %), and loses nowhere: the policy takes it where it pays. The DFlash drafter's drafts are
+accepted 0.78, 0.78, 0.74, 0.74, 0.81, 0.81 and 0.85 of the times each position is reached (1303 of
+1666 first drafts).
+
+- The drafter is right where the study counted it: tokens per step on these reasoning texts
+  3.07 / 3.83 / 3.15 (German, English, code question) against the study's 3.25 / 4.27 / 3.32 for its chain of 7 on the fork's texts
+  (`REPORT.md` 3.4, the three questions); the first draft is accepted 0.72 to 0.82 of the time,
+  every later one 0.6 to 0.9 of the times it is reached. With both drafters the policy took the
+  DFlash drafter for nearly every window (the G-text test: 38 of 38 drafting rounds).
+- The step that only drafts costs 4.2 to 5.5 ms with the drafter (its warm-up curve), against the
+  study's estimate of 3.9 ms and the fork's 12.5 ms; the inject adds its products to every step
+  on the drafter's device (98 MiB of weights for the 27B's file, about 0.3 ms).
+- VRAM on the RTX 4070 (the drafter's device): weights 1079.6 MiB, rings 80.6 MiB (two slots),
+  scratch 107.9 MiB, records 0.3 MiB: 1.24 GiB. At a context of 32768 `qwen35_run` (which sizes
+  its pool without the drafter) is refused by the device's ledger: "cannot reserve 1.05 GiB for
+  'dflash drafter: weights': 976.4 MiB free of 11.23 GiB"; the server's plan counts the drafter
+  and shrinks the pool instead.
+- Exact: the 27B's text with DFlash drafts is the text without them, alone and next to the draft
+  block, greedy and sampled (`qwen35_mtp_runtime.rs` exact products; the server's
+  `with_the_dflash_drafter_the_reply_with_drafts_is_the_reply_without` with the fast kernels, three
+  questions of 300 tokens). Flash-Next (two cards, both on every layer, every miss uploaded) writes
+  with them what it writes without, 3.0 tokens a step, the first draft accepted 14 of 18.
+- Flash-Next on two cards with `--ram 8G` (the server, German, English and code of 200 tokens, two
+  rounds; tokens per second of generation, round 1 / round 2, load 4 to 15):
+
+  | request, round | draft block (2 runs) | draft block + DFlash (2) | DFlash (2) |
+  | --- | ---: | ---: | ---: |
+  | German, 1 / 2 | 27.2 / 36.8 | 26.4 / 41.4 | 31.1 / 37.4 |
+  | English, 1 / 2 | 32.5 / 38.2 | 31.9 / 45.9 | 33.3 / 51.4 |
+  | code, 1 / 2 | 19.9 / 31.6 | 22.4 / 32.2 | 24.9 / 38.5 |
+
+  The runs with the draft block alone ran at a load of 11 to 13, those with the drafter alone at 4
+  to 5. The runs
+  spread as the speculation's did (the tiers warm in round 1, and other agents' builds moved
+  the load by a factor of two within a run); the order of the means is the measurement, not the
+  per-request numbers.
+
+The drafter's own pass on the device is held to the CPU reference (`tests/dflash.rs`): with the
+reference's activations rounded as the weight kernels round them, queries, keys and values are equal
+to 3e-5, attention to 4e-4 (the ring is f16), the input of the feed-forward part to 2e-3, and after
+five layers the hidden states to 1.4 % (27B) and 3 % (Flash-Next), every draft of a pass is the
+reference's and 14 to 16 of the 16 candidates per position are shared.
 
 ## Sampling
 

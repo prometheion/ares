@@ -288,7 +288,8 @@ becomes a block is in `ARCHITECTURE.md` ("The shared model layer"). Left, in the
       a head view; a second row source for images); Flash-Next's embedding from staged rows.
 - [ ] One draft-block driver for both models (chain on the device, picks by the sampler); the
       27B's drafts under a layer split; Flash-Next's draft vocabulary and `--drafters mtp`.
-- [ ] Drafter kinds in the runtime, taps and DFlash, trees in the blocks, tree fill.
+- [x] Drafter kinds in the runtime, taps and DFlash (chains).
+- [ ] Trees in the blocks, tree fill.
 - [ ] Flash-Next past the dense limit: a draft window's row that reaches across the point where
       a tile leaves the newest cells reads that tile exact, the row alone reads it converted
       (`Group::ahead` is planned for rows within the limit only; the lists are made on the
@@ -298,16 +299,20 @@ becomes a block is in `ARCHITECTURE.md` ("The shared model layer"). Left, in the
       together with other sequences); its cost with three sequences was not measured.
 
 ## Drafters (every model)
-- [ ] DFlash2 with draft trees, as a kind of drafter the runtime knows, for every model that
-      has a DFlash2 drafter file (dense and MoE alike), not as a feature of one model: the
-      drafter model on the device, a tree instead of a chain (fill, node allocation), tree
-      verification in the windows, the policy choosing among lookup, MTP and DFlash2 or all
-      of them. Built on the shared layer (steps 7 to 10 above), for both models at once.
-      Study: `/var/tmp/ares-dflash-study/REPORT.md`. Drafter files: the 27B's
-      (`~/Services/models/dflash-test/Qwen3.8-27B-DFlash2-Q4_K_M.gguf`; the 27B's DSpark file
-      has the same architecture name with another shape: block of 7, other taps, no selector);
-      Flash-Next's from `incoai/Qwen3.8-Flash-Next-DFlash2-GGUF` (downloading; trained on the
-      mean of the model's four hyper-connection streams, which llama.cpp cannot drive yet).
+- [x] DFlash2 as a kind of drafter the runtime knows, chains, for both models (steps 7, 8):
+      `ares_model::dflash`, `--drafters <file>`. The 27B's file and Flash-Next's (trained on the
+      mean of its four hyper-connection streams, which llama.cpp cannot drive) both draft.
+- [ ] DFlash2 trees (steps 9, 10): tree verification in the blocks, tree fill from the lattice,
+      node allocation over sequences. Study: `/var/tmp/ares-dflash-study/REPORT.md`.
+- [ ] DFlash2 on Flash-Next split by layers: the first device's taps (or its share of the
+      fusion, `rows x n_embd`) must reach the head's device; the hand-over lane could carry it.
+- [ ] The DFlash ring in the prefix cache's checkpoints (42 MiB a slot in f16): a sequence that
+      resumes from the cache drafts from the resume point's context only until its ring fills.
+- [ ] Sampled DFlash drafts: the walk is greedy; keyed noise in the scores (as the draft block's
+      picks have) would raise sampled acceptance (study: 2 to 8 %).
+- [ ] The 27B with the DFlash drafter at the default split and a 32k context in `qwen35_run`:
+      the tool sizes its pool without the drafter and the device's ledger refuses the drafter
+      (the server's plan counts it).
 
 ## Prompt cache (every model; RAM first, then SSD, as in the owner's fork)
 - [x] RAM level for the K/V state that leaves VRAM; write to SSD when the RAM level evicts
