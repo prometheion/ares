@@ -178,7 +178,7 @@ machine (RTX 4070 + RTX 3060, Qwen3.8-27B) or read from the engines listed in
 | `ares-store` | State on disk: pages and checkpoints by content hash in segment files, per fingerprint, with a size limit, read and written with direct I/O outside of its index | Done as a store of opaque bytes, tested against restarts, the limit and damaged files; the prefix cache of `qwen35` keeps its level on SSD in it (`--cache`) |
 | `ares-io` | Reads of weights straight from the model file: io_uring with direct I/O, demand before prefetch, cancel and promote, copies of a file on several drives with the reads spread over them, a map from experts to file ranges, row reads behind a cache | Done, tested against real files and on two drives; 1.4 to 1.7 GiB/s of random expert-sized reads per SSD of the development machine and 2.9 to 3.0 GiB/s over both; the expert store and the n-gram rows of `qwen4exp` read through it |
 | `ares-sched` | Step planner (generation, decision rows and prompts in one step), admission (pages claimed per step, a reservation that corrects itself, a queue instead of refusals), the order of a pass for long prompts of a model with experts, step time model with a term for the context, draft length choice, the lookup drafter on a suffix automaton shared by all sequences | Done; unit and model tests; the conductor uses the planner, admission (without spill), the lookup drafter and the step cost |
-| `ares-weights` | Expert heat, tiers that are elected and fed by reads (admission, protection, guesses bound late, slots given back), slots per layer by need, the waves of experts of a pass, a token table for the first layers, the lookahead distance, routing bias for pruning | Done, unit tested; the expert store uses the slot sets, the heat, the swap rule and the split of slots; the guess queue, the token table, the waves and pruning are not used by a running model yet (the lookahead distance only by a guess of `qwen4exp` that is switched off) |
+| `ares-weights` | Expert heat, tiers that are elected and fed by reads (admission, protection, guesses bound late, slots given back), slots per layer by need, the waves of experts of a pass, a token table for the first layers, the lookahead distance, which experts a tier holds (for the routers' pruning) | Done, unit tested; the expert store uses the slot sets, the heat, the swap rule and the split of slots; the guess queue, the token table and the waves are not used by a running model yet (the lookahead distance only by a guess of `qwen4exp` that is switched off) |
 | `ares-api` | Request (with every sampling field), event (text and probabilities), decision and error types; the `Engine` trait between HTTP and the runtime (`submit` for generation, `decide` for decisions, `stats`, `chat_format` for what a model's chat template declares about thinking) | Done, unit tested |
 | `ares-server` | The `ares` binary: loads a model on the devices and serves it over an OpenAI-compatible HTTP API, with the plan of devices, split, shares and context made from what the devices report | Serves `qwen35` and `qwen4exp` models (chat and plain completions, streamed and not, every sampling field and the probabilities of the tokens, `n` completions, timings, metrics, staged shutdown, the reasoning of a reply apart from its content and in the history, with llama-server's controls for thinking, tool calls held to the tools' schemas by a grammar, also when the model opens the call inside its thinking); 213 tests without a GPU, 17 that start the real binary (some need the 27B or the files of Flash-Next) and 26 that run the engine in the test's process (the 8 of tool calls have not been run); for `qwen35` the prefix cache is on, with `--ram` for the engine's RAM, for `qwen4exp` the RAM is mostly the tier of experts; a router mode that serves several models from a preset file, loads them on request and unloads them for room or when idle (host tests of the preset reader and of the state machine on a scripted loader; its 2 tests on real devices have not been run); no multimodal input, `/v1/systemone` answers 501 |
 | `ares-runtime` | The conductor thread and one thread per device, the step loop that connects plan, state and kernels, admission, speculation with the lookup drafter and with a model's own drafts, the `Model` trait a model implements, a synthetic model that drives the real kernels, and the expert store (VRAM slots, RAM tier, reads, the CPU computing what is not on a GPU) | Drives `qwen35` on one device, in tensor split and in layer split, with picks made on the device; implements `Engine::submit` (not `decide`); the prefix cache is in the conductor, checked against the host executor as an oracle and carried out by `qwen35` on the devices (checkpoints in page-locked RAM within one RAM limit, `PinnedRam`), and there is no spill of pages to RAM (a request that gives way stays in the pool's cache); the expert store is driven by the device threads of `qwen4exp` (see [Qwen3.8-Flash-Next through the runtime](#qwen38-flash-next-through-the-runtime)) |
@@ -2286,12 +2286,16 @@ pages) and comes with the runtime.
   the next round's first, which routes to the same experts and would
   otherwise wait for them there, alone in its layer. See "Speculation" for
   what was measured.
-- **Dynamic expert pruning.** `SlotSet::write_route_bias` turns a tier into a
-  routing constraint. With a large penalty the router only uses experts that
-  are present, except for its strongest raw picks, which the router kernel
-  exempts; re-electing the tier every x tokens keeps the experts a run needs
-  and drops the rest. This trades a bounded loss of quality for never
-  fetching cold experts and is off by default.
+- **Dynamic expert pruning, a fourth level.** A pick of the router whose
+  expert only the file holds may be left out, or another expert that a tier
+  holds may stand in for it, so that the step does not wait for the drive;
+  the router of a decode step does it on the device right after its top-k
+  (`ExpertKernels::route_pruned`, `ares_cuda::Prune`), off unless asked.
+  See "Pruning as a fourth level" under "Qwen3.8-Flash-Next through the
+  runtime". Until 2026-11-16 this line described `SlotSet::write_route_bias`,
+  a bias for the router's scores with the strongest picks exempt; nothing
+  called it and the router kernel had no input for it, so it was removed;
+  the rule `router` is what it set out to be.
 - **Reading from SSD** (`ares-io`; the expert store and the n-gram rows of
   `qwen4exp` read through it): experts
   are read in place from the GGUF at `offset + e * stride` with direct I/O
@@ -4274,6 +4278,53 @@ how much RAM is free is the user's to say. (Since 2026-11-15 the default limit
 is all the machine has and the tier follows what is available, giving memory
 back when another user of the machine needs it; see "Host memory" and the
 measurement there.)
+
+**Pruning as a fourth level** (`device/prune.rs`, `ExpertKernels::route_pruned`,
+`kernels/expert_router.cuh`). Next to VRAM, RAM and the file, a pick may also be
+*pruned*: when its expert only the file holds, the router can leave it out or let an
+expert a tier holds stand in for it, and the step does not wait for the drive. It is
+off unless asked for, because it changes the output. Three rules, behind one dial:
+
+- *skip* (Strata's tail skip): the pick contributes nothing.
+- *router*: the router's best expert that a tier holds and that the row did not pick
+  stands in for it (the j-th touched pick of a row gets the j-th best such expert). This
+  is what a routing bias with the strongest picks exempt gives, which the store described
+  and never had (`SlotSet::write_route_bias`, removed).
+- *similar* (the owner's idea): the first of the pick's most similar experts that a tier
+  holds and that the row did not pick stands in for it; a pick without one stays. How
+  alike two experts are is measured once per model file and kept beside the usage profile
+  (`ExpertNeighbours`, `<fingerprint>.near`): see "The table of similar experts" below.
+
+The dial says which picks a rule may touch: those from a rank on (`from_rank`, 0 the
+strongest of the row's ten), with a weight below a bound, and for *similar* a stand-in
+of at least a closeness. The weights of what is computed are the router's (a stand-in
+takes the weight of the pick it stands in for; a pick left out leaves the others as they
+are, as Strata does), renormalised over what is computed (every computed expert its own
+probability over their sum), or, for *similar*, the router's times the table's scale.
+
+*Where.* On the device, right after the top-k, before the groups of the route record are
+made (`ares_expert_select_pruned`, `ares_expert_pick_pruned`, new entry points beside
+the plain ones, which stay as they were). The record keeps the router's picks and weights
+(`RouteRecord::ids`, `weights`); its groups, which the expert kernels, the split between
+two cards and the store work from, are what is computed. So the store never sees a pruned
+pick, and a row with no touched pick computes what it computes without pruning, bit for
+bit. Which experts a tier holds is a byte per expert of every layer of the model that the
+host writes at the start of every step from the store (`PruneMask`: VRAM on any card, the
+RAM tier, or on its way to either; `ExpertStore::mark_present`), two page-locked buffers
+taking turns; every part that routes copies its layers' bytes onto its card on its stream
+before its first layer (`PartPrune::begin`). The router's slot table could not say it: with
+both cards on every layer the mixer's table holds only its own experts, and none says what
+RAM holds. An expert that arrives during the step counts from the next one. Only steps of
+up to eight rows are pruned (generation, windows of drafts); a slice of a prompt is read
+whole. The decision is per row, so a row's result does not depend on what the other rows
+of a window routed (Strata decides per expert over the window: an expert that some row
+needs strongly is read for all).
+
+*The heat* still counts what the router wanted: the store gets the picks that were left
+out or stood in for as heat of their own (`Feed`, `ExpertStore::record_counts`), so the
+tiers learn a text's experts between steps as they would without pruning, and a pruned
+expert that is used often enough comes in and is computed from then on. The stand-ins
+count as picks as well.
 
 **Taking part in the prefix cache** (`prefix_cache()` is `None`: every prompt
 is computed from its first token, a request that gives way comes back as a
