@@ -150,6 +150,19 @@ impl std::fmt::Debug for DeviceTower {
     }
 }
 
+impl Drop for DeviceTower {
+    /// In the RAM home the uploads read the page-locked image and the passes
+    /// read the slots: both wait for what is under way before they are freed.
+    fn drop(&mut self) {
+        if let Placed::Ram(s) = &self.placed {
+            let _ = s.copy.synchronize();
+            for event in &s.consumed {
+                let _ = event.synchronize();
+            }
+        }
+    }
+}
+
 /// The groups of a block's row-by-row work: (first patch, patches).
 fn groups(patches: u32) -> impl Iterator<Item = (u32, u32)> {
     (0..patches)
