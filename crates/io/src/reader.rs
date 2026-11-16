@@ -29,9 +29,12 @@ pub struct Config {
     /// wait of a demand read that arrives behind them. Every drive the files
     /// are on has this depth of its own.
     pub queue_depth: usize,
-    /// Of those, the most that may come from prefetches, again per drive.
+    /// Of those, the most that may come from prefetches, again per drive,
+    /// and half of it (rounded up) while a demand chunk is at the drive.
     /// This is what bounds the wait of a demand read behind guesses to
-    /// `prefetch_depth * prefetch_chunk` bytes of device time.
+    /// `prefetch_depth * prefetch_chunk` bytes of device time, and what a
+    /// demand read that is at the drive shares it with to half of that
+    /// (Run My AI's rule: four chunks of 512 KiB, two beside a demand read).
     pub prefetch_depth: usize,
     /// Size of the pieces a prefetch is cut into (rounded up to the file's
     /// block size).
@@ -226,6 +229,8 @@ impl Shared {
 pub struct Reader {
     shared: Arc<Shared>,
     thread: Option<JoinHandle<()>>,
+    /// Bytes of prefetches one drive takes at once.
+    prefetch_bytes: usize,
 }
 
 impl std::fmt::Debug for Shared {
@@ -344,7 +349,11 @@ impl Reader {
             .spawn(move || worker::run(worker_shared, depth, regions, ready_tx))
             .map_err(Error::Thread)?;
         match ready_rx.recv() {
-            Ok(Ok(())) => Ok(Self { shared, thread: Some(thread) }),
+            Ok(Ok(())) => Ok(Self {
+                shared,
+                thread: Some(thread),
+                prefetch_bytes: config.prefetch_depth * config.prefetch_chunk,
+            }),
             Ok(Err(error)) => {
                 let _ = thread.join();
                 Err(error)
@@ -404,6 +413,13 @@ impl Reader {
     /// one disk are one drive.
     pub fn drives(&self) -> &[DriveInfo] {
         &self.shared.drives
+    }
+
+    /// Bytes of prefetches the drives take at once, over all drives: what a reader of
+    /// guesses can have at the drives without holding up demand reads more than
+    /// [`Config::prefetch_depth`] says.
+    pub fn prefetch_room(&self) -> usize {
+        self.prefetch_bytes * self.shared.drives.len().max(1)
     }
 
     /// What each drive has delivered and is doing, in the order of

@@ -116,9 +116,16 @@ struct Drive {
 }
 
 impl Drive {
+    /// Whether a chunk of `class` may go to the drive now. A prefetch has the prefetch depth
+    /// while no demand chunk is at the drive and half of it beside one: a chunk at the drive
+    /// cannot be called back, so what a demand read that arrives shares the drive with is
+    /// what bounds its wait, and a demand read that is there shares it with less.
     fn has_room(&self, class: Class, limits: &Limits) -> bool {
+        let demand_here = self.in_flight > self.in_flight_prefetch;
+        let prefetch =
+            if demand_here { limits.prefetch_depth.div_ceil(2) } else { limits.prefetch_depth };
         self.in_flight < limits.depth
-            && (class == Class::Demand || self.in_flight_prefetch < limits.prefetch_depth)
+            && (class == Class::Demand || self.in_flight_prefetch < prefetch)
     }
 
     /// How long a chunk started now is expected to take per MiB. A number that
@@ -872,9 +879,35 @@ mod tests {
         let d = s.take_chunk(Instant::now()).unwrap();
         assert_eq!(s.req(d.req).key, 2);
         s.chunk_done(&a, ChunkResult::Bytes(a.len), Instant::now());
+        assert!(!s.startable(), "beside a demand chunk a prefetch has half the depth");
+        s.chunk_done(&d, ChunkResult::Bytes(d.len), Instant::now());
         assert!(s.startable(), "a finished prefetch chunk frees a prefetch slot");
         s.chunk_done(&b, ChunkResult::Bytes(b.len), Instant::now());
-        s.chunk_done(&d, ChunkResult::Bytes(d.len), Instant::now());
+    }
+
+    #[test]
+    fn beside_a_demand_chunk_prefetches_have_half_the_depth() {
+        let mut s = sched(16, 4);
+        s.submit(read(1, Class::Prefetch, 0, 16 * 1024), Instant::now()).unwrap();
+        let mut prefetches: Vec<_> =
+            (0..4).map(|_| s.take_chunk(Instant::now()).unwrap()).collect();
+        assert!(s.take_chunk(Instant::now()).is_none(), "four prefetch chunks while alone");
+        s.submit(read(2, Class::Demand, 0, 512), Instant::now()).unwrap();
+        let demand = s.take_chunk(Instant::now()).unwrap();
+        assert_eq!(s.req(demand.req).key, 2);
+        // The four that were there stay; as they come back, only two follow them while the
+        // demand chunk is at the drive.
+        for chunk in prefetches.drain(..) {
+            s.chunk_done(&chunk, ChunkResult::Bytes(chunk.len), Instant::now());
+        }
+        let beside: Vec<_> = std::iter::from_fn(|| s.take_chunk(Instant::now())).collect();
+        assert_eq!(beside.len(), 2, "two prefetch chunks beside a demand chunk");
+        s.chunk_done(&demand, ChunkResult::Bytes(demand.len), Instant::now());
+        let after: Vec<_> = std::iter::from_fn(|| s.take_chunk(Instant::now())).collect();
+        assert_eq!(after.len(), 2, "the whole depth again when the demand read is back");
+        for chunk in beside.iter().chain(&after) {
+            s.chunk_done(chunk, ChunkResult::Bytes(chunk.len), Instant::now());
+        }
     }
 
     #[test]
