@@ -236,7 +236,13 @@ The blocks so far:
   cells in exact entries, read on the tensor cores, each with its pieces. A
   generated row has the pieces it has as the only row of a step, the rows of
   a prompt share the step's. The selection is Flash-Next's; the group owns
-  which entries the lists name.
+  which entries the lists name. Measured 2026-11-16 (IQ2_XS on both cards):
+  K, V and the indexer's keys take 13.92 MiB per 1000 cells with `q8`, 8.24
+  with `q4`; at 131 072 cells placed by layers that is 912, 636 and 540 MiB
+  per card with `q8`, `q5` and `q4`, and the expert slots grow by 538 and
+  726 MiB (about 515 slots with `q4`). With `q8` a decode row is planned as
+  before (the same bits; the attention takes 0.51 ms of a step on the first
+  card before and after).
 - **The recurrent block** (`blocks/recurrent.rs`): the layers of the gated
   delta rule with their extents in a sequence's slot (a convolution window
   and the delta-rule matrices per layer) and the inputs a draft window keeps.
