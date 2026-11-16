@@ -56,11 +56,22 @@
 //!
 //! One thread owns the store and calls it; the store never blocks. Reads run
 //! on the I/O thread of `ares-io`, copies on the device.
+//!
+//! # Between steps
+//!
+//! The heat can outlive the store: [`ExpertProfile`] is a small file of it,
+//! made for one model file (`profile.rs`). From the heat, a seeded one or the
+//! store's own, [`ExpertStore::plan_fill`] and [`ExpertStore::advance_fill`]
+//! fill what is empty in the tiers while no step runs (`fill.rs`): at the
+//! start in one sweep through the file, when idle the hottest first and a few
+//! at a time, stopped by the next step.
 
 pub mod cpu;
 mod device;
 mod elastic;
+mod fill;
 mod hybrid;
+mod profile;
 mod region;
 mod tier;
 mod transit;
@@ -77,7 +88,9 @@ use ares_weights::{
 
 pub use device::{CudaSlots, HostShareState, HostSlots, SlotDevice};
 use elastic::{Layout, Pieces};
+pub use fill::{FillOrder, FillPace, FillStats, FillTier, TierFill};
 pub use hybrid::{CostModel, Miss, PromoteRule, Serve};
+pub use profile::{ExpertProfile, Ignored, PROFILE_FORMAT, ProfileKey};
 pub use region::{HostRegion, Locker, PIECE, Released};
 pub use tier::Pool;
 use tier::Tier;
