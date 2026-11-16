@@ -1270,10 +1270,15 @@ fn start_flash_with(
 }
 
 /// On the real model drafts change no token: Flash-Next writes with its draft
-/// block, token for token, what it writes without, greedy and sampled with a
-/// seed, and the block's drafts are accepted. The CPU serves no miss in either
-/// run (see [`start_flash`]), so the comparison is not one of two arithmetics.
-/// Needs `ARES_TEST_QWEN4EXP_MODEL` and `ARES_TEST_QWEN4EXP_DRAFT`.
+/// block, token for token, what it writes without drafts, greedy and sampled
+/// with a seed, and the block's drafts are accepted. The CPU serves no miss
+/// (see [`start_flash`]), and both replies come from one engine: two engines
+/// on two cards each measure at their start how the cards share every layer
+/// (the time of a read of a stream mixer on each), the share differs from
+/// start to start (0.733 to 0.751 of the key heads on the faster card in eight
+/// starts), and with it how the sums of a layer are cut between the cards, so
+/// the comparison would be one of two arithmetics, which a near tie tells
+/// apart. Needs `ARES_TEST_QWEN4EXP_MODEL` and `ARES_TEST_QWEN4EXP_DRAFT`.
 #[test]
 fn flash_next_writes_with_drafts_what_it_writes_without() {
     if !enabled() {
@@ -1289,32 +1294,20 @@ fn flash_next_writes_with_drafts_what_it_writes_without() {
         );
         return;
     };
+    let greedy = Sampling { temperature: Some(0.0), ..Sampling::default() };
     let seeded = Sampling { temperature: Some(0.8), seed: Some(5), ..Sampling::default() };
-    let (runtime, model) = start_flash(&path, None);
-    let plain = ask(&runtime, 1, &FLASH_PROMPT, 64);
-    let (plain_seeded, _) = ask_sampled(&runtime, 2, &FLASH_PROMPT, 48, seeded.clone(), true);
-    let stats = model.take_store_stats().expect("the parts are open");
-    runtime.shutdown();
-    drop(runtime);
-    drop(model);
-    assert_eq!(stats.cpu_experts, 0, "the CPU computed experts: {stats:?}");
-    assert_eq!(plain[..4], FLASH_CONTINUATION, "the reference's first tokens");
-    // The cards give the first engine's memory back before the second plans
-    // with what is free.
-    let free = |device: u32| {
-        Device::open(device, Wait::Spin).and_then(|d| d.mem_info()).map_or(0, |m| m.free)
-    };
-    let begun = std::time::Instant::now();
-    while free(0) < 10 << 30 && begun.elapsed() < Duration::from_secs(120) {
-        std::thread::sleep(Duration::from_millis(500));
-    }
-
     let (runtime, model) = start_flash(&path, Some(&draft));
+    // The replies with drafts first: a reply that repeats one the engine has
+    // written is drafted by the lookup in earlier text alone.
     let drafted = ask(&runtime, 1, &FLASH_PROMPT, 64);
-    let (sampled, _) = ask_sampled(&runtime, 2, &FLASH_PROMPT, 48, seeded, true);
-    let stats = model.take_store_stats().expect("the parts are open");
+    let (sampled, _) = ask_sampled(&runtime, 2, &FLASH_PROMPT, 48, seeded.clone(), true);
     let counters = runtime.snapshot().expect("the runtime is running").counters;
     let times = model.draft_times();
+    let (plain, _) = ask_sampled(&runtime, 3, &FLASH_PROMPT, 64, greedy, false);
+    let (plain_seeded, _) = ask_sampled(&runtime, 4, &FLASH_PROMPT, 48, seeded, false);
+    let undrafted = runtime.snapshot().expect("the runtime is running").counters.draft_rows
+        - counters.draft_rows;
+    let stats = model.take_store_stats().expect("the parts are open");
     runtime.shutdown();
     eprintln!(
         "RES Flash-Next: {} and {} tokens; draft rows {}, accepted {}, rejected {}; the block \
@@ -1331,6 +1324,8 @@ fn flash_next_writes_with_drafts_what_it_writes_without() {
         times.accepted,
     );
     assert_eq!(stats.cpu_experts, 0, "the CPU computed experts: {stats:?}");
+    assert_eq!(plain[..4], FLASH_CONTINUATION, "the reference's first tokens");
+    assert_eq!(undrafted, 0, "the requests without drafts were drafted for");
     assert!(times.accepted[0] > 0, "none of the block's drafts was accepted: {times:?}");
     assert!(counters.drafts_rejected > 0, "no draft was rejected");
     assert_eq!(drafted, plain, "drafts changed a greedy reply of Flash-Next");
@@ -1339,7 +1334,8 @@ fn flash_next_writes_with_drafts_what_it_writes_without() {
 
 /// The same with the DFlash drafter (`ARES_TEST_DFLASH_FLASHNEXT`), which reads
 /// the mean of the model's four streams: Flash-Next writes with its drafts,
-/// greedy, what it writes without, and some of them are accepted.
+/// greedy, what it writes without, on one engine, and some of them are
+/// accepted.
 #[test]
 fn flash_next_writes_with_dflash_drafts_what_it_writes_without() {
     if !enabled() {
@@ -1356,22 +1352,15 @@ fn flash_next_writes_with_dflash_drafts_what_it_writes_without() {
         return;
     };
     let file = Arc::new(ares_model::dflash::File::open(&file).unwrap());
-    let (runtime, model) = start_flash(&path, None);
-    let plain = ask(&runtime, 1, &FLASH_PROMPT, 64);
-    runtime.shutdown();
-    drop(runtime);
-    drop(model);
-    let free = |device: u32| {
-        Device::open(device, Wait::Spin).and_then(|d| d.mem_info()).map_or(0, |m| m.free)
-    };
-    let begun = std::time::Instant::now();
-    while free(0) < 10 << 30 && begun.elapsed() < Duration::from_secs(120) {
-        std::thread::sleep(Duration::from_millis(500));
-    }
+    let greedy = Sampling { temperature: Some(0.0), ..Sampling::default() };
     let (runtime, model) = start_flash_with(&path, None, Some(file));
+    // The reply with drafts first, as above.
     let drafted = ask(&runtime, 1, &FLASH_PROMPT, 64);
-    let stats = model.take_store_stats().expect("the parts are open");
     let counters = runtime.snapshot().expect("the runtime is running").counters;
+    let (plain, _) = ask_sampled(&runtime, 2, &FLASH_PROMPT, 64, greedy, false);
+    let undrafted = runtime.snapshot().expect("the runtime is running").counters.draft_rows
+        - counters.draft_rows;
+    let stats = model.take_store_stats().expect("the parts are open");
     runtime.shutdown();
     eprintln!(
         "RES Flash-Next with DFlash: {} tokens in {} steps; tested by position {:?}, accepted {:?}",
@@ -1381,6 +1370,8 @@ fn flash_next_writes_with_dflash_drafts_what_it_writes_without() {
         &counters.drafts_accepted_at[2][..7],
     );
     assert_eq!(stats.cpu_experts, 0, "the CPU computed experts: {stats:?}");
+    assert_eq!(plain[..4], FLASH_CONTINUATION, "the reference's first tokens");
+    assert_eq!(undrafted, 0, "the request without drafts was drafted for");
     assert!(counters.drafts_accepted_at[2][0] > 0, "no DFlash draft was accepted");
     assert_eq!(drafted, plain, "DFlash drafts changed a greedy reply of Flash-Next");
 }
