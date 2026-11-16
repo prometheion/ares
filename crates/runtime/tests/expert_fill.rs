@@ -227,10 +227,11 @@ fn the_start_reads_in_the_order_of_the_file_and_the_idle_fill_the_hottest_first(
     rig.heat(2, &[(4, 4.0), (8, 0.7)]);
     rig.heat(1, &[(15, 6.0)]);
 
-    // At the start: layer by layer, each in the order of its tensors.
+    // At the start: layer by layer, in each those for VRAM, then those for
+    // RAM, each in the order of the layer's tensors.
     let file = rig.store.plan_fill(&ALL, FillOrder::File).todo();
     let order: Vec<(usize, u32)> = file.iter().map(|(l, e, _)| (*l, *e)).collect();
-    assert_eq!(order, [(0, 1), (0, 3), (0, 6), (0, 9), (0, 12), (1, 15), (2, 4), (2, 8)]);
+    assert_eq!(order, [(0, 3), (0, 6), (0, 12), (0, 1), (0, 9), (1, 15), (2, 4), (2, 8)]);
     let to_vram: BTreeSet<(usize, u32)> =
         file.iter().filter(|i| i.2 == FillTier::Vram).map(|(l, e, _)| (*l, *e)).collect();
     assert_eq!(to_vram, [(0, 6), (0, 12), (0, 3), (1, 15), (2, 4), (2, 8)].into());
@@ -252,7 +253,22 @@ fn the_start_reads_in_the_order_of_the_file_and_the_idle_fill_the_hottest_first(
         rig.settle();
         arrived.extend(rig.everything().difference(&before).copied());
     }
-    assert_eq!(arrived, [(0, 1), (0, 3), (0, 6), (0, 9), (0, 12), (1, 15), (2, 4), (2, 8)]);
+    assert_eq!(arrived, [(0, 3), (0, 6), (0, 12), (0, 1), (0, 9), (1, 15), (2, 4), (2, 8)]);
+}
+
+#[test]
+fn what_goes_up_passes_through_ram_before_what_stays_there_takes_its_slots() {
+    // Six VRAM slots (one kept free) and two RAM slots a layer: five experts
+    // go up through the two RAM slots, two stay there. In the order of their
+    // numbers those that stay would take both RAM slots before the last two
+    // that go up had passed.
+    let mut rig = rig(6, 2, None);
+    rig.heat(0, &[(0, 1.0), (1, 10.0), (2, 9.0), (3, 8.0), (4, 2.0), (5, 7.0), (6, 6.0)]);
+    let mut fill = rig.store.plan_fill(&ALL, FillOrder::File);
+    rig.fill(&mut fill, FillPace::START);
+    assert_eq!(rig.held(0), (set(&[1, 2, 3, 5, 6]), set(&[0, 4])));
+    let stats = fill.stats();
+    assert_eq!((stats.vram, stats.ram, stats.reads, stats.dropped), (5, 2, 7, 0));
 }
 
 #[test]

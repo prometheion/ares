@@ -42,8 +42,11 @@ const EMPTY_WORTH: f32 = 1e-6;
 /// The order in which a fill brings its experts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FillOrder {
-    /// As they lie in the file: one sweep through the tensors of every layer.
-    /// For a fill that runs to its end before anything is served.
+    /// Layer by layer as the layers lie in the file, and in each layer those
+    /// meant for VRAM, then those meant for RAM, each as they lie in the
+    /// layer's tensors. For a fill that runs to its end before anything is
+    /// served. (The experts meant for VRAM pass through slots of the RAM
+    /// tier, so they come first: those meant for RAM stay where they land.)
     File,
     /// The experts meant for VRAM first, then those meant for RAM, each the
     /// hottest first over all layers. For a fill that a step may stop.
@@ -207,13 +210,22 @@ impl<D: SlotDevice> ExpertStore<D> {
         }
         match order {
             FillOrder::File => {
-                let place = |item: &Item| {
+                // Where an expert's first matrix lies in the files; the
+                // layer's place is its first expert's, which the layers of
+                // the store that share the model's layer share.
+                let place = |layer: usize, expert: u32| {
                     self.map
-                        .ranges(item.layer, item.expert as usize)
+                        .ranges(layer, expert as usize)
                         .and_then(|mut ranges| ranges.next())
                         .map_or((u16::MAX, u64::MAX), |range| (range.file.0, range.offset))
                 };
-                items.sort_by_key(|(item, _)| place(item));
+                items.sort_by_key(|(item, _)| {
+                    (
+                        place(item.layer, 0),
+                        item.tier == FillTier::Ram,
+                        place(item.layer, item.expert),
+                    )
+                });
             }
             FillOrder::Heat => items.sort_by(|(a, heat_a), (b, heat_b)| {
                 (a.tier == FillTier::Ram)
