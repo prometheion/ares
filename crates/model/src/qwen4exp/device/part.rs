@@ -66,6 +66,7 @@ use super::load::{
     AttentionW, CoreW, DeviceWeights, LayerShare, LayerW, Mat, MixerW, MoeW, NgramW, RecurrentW,
     Role, SharedW,
 };
+use super::prune::{PartPrune, PruneMask, PruneSetup};
 use crate::blocks::kv;
 use crate::blocks::recurrent::{self, Inputs, Recurrent};
 use crate::qwen4exp::Config;
@@ -121,6 +122,10 @@ pub struct Options {
     pub host_logits: bool,
     /// Where the parts add up the device time of their kernels, by kind.
     pub profile: Option<Arc<Profile>>,
+    /// What the routers do with a pick whose expert only the file holds, in
+    /// steps of up to [`MAX_BATCH`] rows (`device/prune.rs`); `None`, the
+    /// default, prunes nothing.
+    pub prune: Option<PruneSetup>,
 }
 
 impl Default for Options {
@@ -139,6 +144,7 @@ impl Default for Options {
             precision: Precision::Fast,
             host_logits: true,
             profile: None,
+            prune: None,
         }
     }
 }
@@ -975,6 +981,8 @@ pub struct Part {
     wide_state: Option<wide::State>,
     /// What a part that runs the model's draft block needs besides a layer.
     block: Option<block::State>,
+    /// The pruning of the routers of a part that routes.
+    prune: Option<PartPrune>,
 }
 
 impl std::fmt::Debug for Part {
@@ -1025,7 +1033,13 @@ impl Part {
         let f = Frame::new(c, opts, &shape, device.info().multiprocessors)?;
         let w = DeviceWeights::load(device, ledger, c, weights, role, first, &shape.shares, head)?;
         let starts = first == 0 && role != Role::Worker;
-        Self::assemble(c, opts, index, role, head, f, w, device, ledger, starts, "qwen4exp")
+        let layers = first..first + shape.shares.len();
+        let mut part =
+            Self::assemble(c, opts, index, role, head, f, w, device, ledger, starts, "qwen4exp")?;
+        if let Some(setup) = opts.prune.as_ref().filter(|_| role != Role::Worker) {
+            part.prune = Some(PartPrune::new(device, ledger, setup, layers, c.experts.count)?);
+        }
+        Ok(part)
     }
 
     /// The part around its weights `w` and its frame `f`: reserves (under
@@ -1229,6 +1243,7 @@ impl Part {
             marks,
             wide_state,
             block: None,
+            prune: None,
             w,
             f,
         })
@@ -1317,6 +1332,15 @@ impl Part {
         }
         self.expert_at = at;
         Ok(())
+    }
+
+    /// Gives the routers of the part the mask of what the tiers hold, which
+    /// the host writes at the start of every step; without it a part opened
+    /// with [`Options::prune`] prunes nothing.
+    pub fn set_prune_mask(&mut self, mask: Arc<PruneMask>) {
+        if let Some(prune) = &mut self.prune {
+            prune.set_mask(mask);
+        }
     }
 
     /// What the part is to the residual streams.
@@ -1785,6 +1809,9 @@ impl Part {
             marks.on = !marks.profile.paused.load(Ordering::Relaxed);
         }
         self.mark(stream, Phase::Other)?;
+        if let Some(prune) = self.prune.as_ref().filter(|_| n <= MAX_BATCH) {
+            prune.begin(stream)?;
+        }
         if std::mem::take(&mut self.status_pending) {
             // SAFETY: the status of the step before, copied when it ended.
             let status =
@@ -2656,17 +2683,25 @@ impl Part {
                 // while the shared expert is computed.
                 let router = w.router.ok_or_else(|| invalid("a layer without its router"))?;
                 let full = if peer.is_some() { self.at(s.rec_full) } else { record };
-                self.experts.route(
-                    stream,
-                    &w.shape,
-                    self.w.at(router),
-                    m,
-                    self.at(s.logits),
-                    at.table,
-                    full,
-                    rows,
-                    env.token,
-                )?;
+                let (router, logits) = (self.w.at(router), self.at(s.logits));
+                match &self.prune {
+                    Some(prune) => self.experts.route_pruned(
+                        stream,
+                        &w.shape,
+                        router,
+                        m,
+                        logits,
+                        at.table,
+                        full,
+                        rows,
+                        env.token,
+                        prune.prune(),
+                        &prune.layer(i),
+                    )?,
+                    None => self.experts.route(
+                        stream, &w.shape, router, m, logits, at.table, full, rows, env.token,
+                    )?,
+                }
                 if let (Some(ports), Some(owner)) = (peer, &self.owner) {
                     // Each device gets the record of the experts it owns.
                     // Without the shared expert this part's experts add to

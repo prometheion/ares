@@ -23,14 +23,17 @@ use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
 use ares_core::GgmlType;
-use ares_cuda::{CacheFormat, Device, ExpertShape, Precision, Wait, device_count};
+use ares_cuda::{
+    CacheFormat, Device, ExpertShape, Precision, Prune, PruneRule, PruneWeights, Wait, device_count,
+};
 use ares_gguf::Gguf;
 use ares_model::qwen4exp::device::{
-    LayerOut, Options, PHASES, Phase, Probe, Profile, Rows, Session, SessionOptions, Spread, Wanted,
+    LayerOut, Options, PHASES, Phase, Probe, Profile, PruneSetup, Rows, Session, SessionOptions,
+    Spread, Wanted,
 };
 use ares_model::qwen4exp::synthetic::{NgramShape, Shape, Synthetic, Types};
 use ares_model::qwen4exp::{Config, LogitRows, Recorder, Reference, SequenceState, Weights};
-use ares_runtime::expert_store::Serve;
+use ares_runtime::expert_store::{ExpertNeighbours, Near, ProfileKey, Serve};
 
 /// The spread the tests of two devices ask for: both on every layer when
 /// `ARES_TEST_SPREAD=tensor`.
@@ -1284,5 +1287,128 @@ fn a_long_step_that_misses_experts_ends() {
             stats.picks
         );
         assert!(misses > 500, "the run was to miss experts: {misses}");
+    }
+}
+
+/// The routers' pruning (`device/prune.rs`): with every expert in a tier it
+/// touches nothing, and the logits are those of a session without it, bit for
+/// bit; with most experts only in the file, each rule leaves out or stands in
+/// for what the file alone holds, so that no step waits for a read, and every
+/// logit stays a number.
+#[test]
+fn pruning_touches_only_what_the_file_alone_holds() {
+    let Some(devices) = devices() else { return };
+    let mut synthetic = model(53);
+    synthetic.shape.n_expert = if tensor().is_some() { 384 } else { 192 };
+    let gguf = open("prune", &synthetic.bytes_with_experts(GgmlType::IQ2_S, GgmlType::Q2_0));
+    let c = Config::from_gguf(&gguf).unwrap();
+    let w = Weights::load(&gguf, &c).unwrap();
+    let text = synthetic.shape.tokens(48, 17);
+    let run = |session: &mut Session<'_>| -> Vec<Vec<f32>> {
+        let mut logits = Vec::new();
+        for tokens in text[..16].chunks(8) {
+            session.step(&[Rows { slot: 0, tokens, direct: true, wanted: Wanted::All }]).unwrap();
+            logits.extend((0..tokens.len()).map(|row| session.logits(row).unwrap().to_vec()));
+        }
+        for token in text[16..].chunks(1) {
+            session
+                .step(&[Rows { slot: 0, tokens: token, direct: true, wanted: Wanted::Last }])
+                .unwrap();
+            logits.push(session.logits(0).unwrap().to_vec());
+        }
+        logits
+    };
+    let n_expert = c.experts.count;
+    // Each expert's most similar ones: its next numbers, nearer first.
+    let key = ProfileKey::new(b"made-up model", c.n_layer as u32, n_expert as u32);
+    let mut near = ExpertNeighbours::new(key, 4);
+    for layer in 0..c.n_layer {
+        for expert in 0..n_expert {
+            for (i, entry) in near.of_mut(layer, expert).iter_mut().enumerate() {
+                let other = (expert + 1 + 7 * i) % n_expert;
+                *entry = Near { expert: other as u16, closeness: 0.9 - 0.1 * i as f32, scale: 1.0 };
+            }
+        }
+    }
+    let near = Arc::new(near);
+    let setup = |rule: PruneRule, weights: PruneWeights| PruneSetup {
+        prune: Prune { weights, ..Prune::new(rule, 0) },
+        near: Some(near.clone()),
+    };
+    let base = options(devices.len(), c.n_layer, CacheFormat::Q8);
+
+    // Every expert in VRAM: nothing to prune.
+    let want = run(&mut session(&gguf, &c, &w, devices.clone(), CacheFormat::Q8));
+    let opts = SessionOptions {
+        part: Options {
+            prune: Some(setup(PruneRule::Skip, PruneWeights::Keep)),
+            ..base.part.clone()
+        },
+        ..base.clone()
+    };
+    let mut pruned = Session::open(&gguf, &c, &w, devices.clone(), opts).unwrap();
+    pruned.fill(&mut |_| (0..n_expert as u32).collect()).unwrap();
+    pruned.take_prune_stats();
+    let got = run(&mut pruned);
+    assert_eq!(got, want, "pruning touched a pick whose expert has a slot");
+    let stats = pruned.take_prune_stats();
+    assert!(stats.picks > 0);
+    assert_eq!(stats.skipped + stats.stood_in, 0);
+    drop(pruned);
+
+    // A slot per pick a step can need in VRAM, as few in RAM: most experts
+    // are only in the file.
+    let shape = ExpertShape {
+        n_embd: c.n_embd as u32,
+        n_ff: c.experts.ff as u32,
+        n_experts: n_expert as u32,
+        top_k: c.experts.used as u32,
+        gate_ty: GgmlType::IQ2_S,
+        down_ty: GgmlType::Q2_0,
+    };
+    let per_layer = c.experts.used * 8;
+    let slots = (per_layer * layers_per_device(c.n_layer, devices.len())) as u64;
+    for (rule, weights) in [
+        (PruneRule::Skip, PruneWeights::Keep),
+        (PruneRule::Skip, PruneWeights::Renormalise),
+        (PruneRule::Router, PruneWeights::Renormalise),
+        (PruneRule::Similar, PruneWeights::Keep),
+        (PruneRule::Similar, PruneWeights::Scaled),
+    ] {
+        let opts = SessionOptions {
+            part: Options { prune: Some(setup(rule, weights)), ..base.part.clone() },
+            slot_bytes: Some(slots * shape.slot_bytes().unwrap()),
+            ram_tier: Some(slots * shape.slot_bytes().unwrap() * 2),
+            serve: Serve::Stream,
+            ..base.clone()
+        };
+        let mut session = Session::open(&gguf, &c, &w, devices.clone(), opts).unwrap();
+        session.fill(&mut |_| (0..n_expert as u32).collect()).unwrap();
+        session.take_store_stats();
+        session.take_prune_stats();
+        let got = run(&mut session);
+        let store = session.take_store_stats();
+        let pruned = session.take_prune_stats();
+        eprintln!(
+            "  {} device(s), {rule:?} with {weights:?} weights: {} picks, {} left out, {} stood in              for; {} in a slot, {} from RAM, {} from the file",
+            devices.len(),
+            pruned.picks,
+            pruned.skipped,
+            pruned.stood_in,
+            store.hits,
+            store.miss_from_ram,
+            store.miss_from_disk,
+        );
+        assert!(got.iter().flatten().all(|v| v.is_finite()), "{rule:?}: a logit that is no number");
+        assert!(pruned.skipped + pruned.stood_in > 0, "{rule:?} touched nothing");
+        match rule {
+            // Every pick only the file holds is left out or stood in for.
+            PruneRule::Skip | PruneRule::Router => assert_eq!(store.miss_from_disk, 0),
+            // A pick none of whose similar experts is in a tier stays.
+            PruneRule::Similar => assert!(pruned.stood_in > 0),
+        }
+        if rule != PruneRule::Skip {
+            assert_eq!(pruned.skipped, 0, "{rule:?} left a pick out");
+        }
     }
 }

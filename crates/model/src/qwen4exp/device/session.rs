@@ -21,6 +21,7 @@
 //! token ([`Session::expect`] for a caller that knows better), not when the
 //! next step reaches the layer that reads them.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ares_core::{GgmlType, Ledger};
@@ -31,7 +32,8 @@ use ares_cuda::{
 use ares_gguf::Gguf;
 use ares_io::Reader;
 use ares_runtime::expert_store::{
-    CudaSlots, ExpertStore, HostRegion, Serve, StoreConfig, StorePlan, StoreStats,
+    CudaSlots, ExpertProfile, ExpertStore, FillStats, HostRegion, Serve, StoreConfig, StorePlan,
+    StoreStats,
 };
 
 use super::Error;
@@ -41,6 +43,8 @@ use super::misses::{Misses, Progress, WideStats};
 use super::ngram::NgramFeed;
 use super::part::{Options, Part, PartSetup, StepEnv};
 use super::placement::{DeviceMemory, PartPlan, Placement, TensorChoice, ram_tier_bytes};
+use super::prune::{self, PruneMask, PruneStats};
+use super::usage;
 use crate::qwen4exp::Config;
 use crate::qwen4exp::weights::Weights;
 
@@ -683,6 +687,15 @@ impl<'g> Session<'g> {
         let firsts = parts.iter().map(|part| part.layer_range().start).collect();
         let mut feed = Feed::new(store, boards, firsts, layout, c.experts.used as u32);
         feed.set_read_ahead(opts.read_ahead);
+        if opts.part.prune.is_some() {
+            pinned
+                .reserve("qwen4exp pruning mask", PruneMask::bytes(c.n_layer, c.experts.count))?;
+            let mask = Arc::new(PruneMask::new(&devices[0], c.n_layer, c.experts.count)?);
+            for part in &mut parts {
+                part.set_prune_mask(mask.clone());
+            }
+            feed.set_prune(mask, prune::owners(&placement, c), c.experts.count);
+        }
 
         let ngram = NgramFeed::open(gguf, c, opts.row_cache, opts.part.max_slots)?;
 
@@ -751,6 +764,12 @@ impl<'g> Session<'g> {
         self.feed.store.take_stats()
     }
 
+    /// What the routers pruned since the last call (`SessionOptions::part`'s
+    /// `prune`).
+    pub fn take_prune_stats(&mut self) -> PruneStats {
+        self.feed.take_prune()
+    }
+
     /// The memory of every part.
     pub fn report(&self) -> Vec<PartReport> {
         self.parts
@@ -801,6 +820,20 @@ impl<'g> Session<'g> {
     /// Starts the sequence in `slot` over: its next row is cell 0.
     pub fn restart(&mut self, slot: u32) -> Result<(), Error> {
         self.ngram.restart(slot)
+    }
+
+    /// Seeds the store's heat with a usage `profile` of the model and fills
+    /// the tiers from it in one sweep through the file, as the runtime does
+    /// when it begins to serve: VRAM with the hottest experts of every layer,
+    /// the RAM tier with the next. Returns what was brought and how long it
+    /// took.
+    pub fn fill_from_profile(
+        &mut self,
+        profile: &ExpertProfile,
+    ) -> Result<(FillStats, Duration), Error> {
+        let feed = &mut self.feed;
+        let layout = feed.layout().clone();
+        Ok(usage::seed_and_fill(&mut feed.store, &layout, &self.placement, profile)?)
     }
 
     /// Brings the experts `experts_of(layer)` names for every layer into the

@@ -34,7 +34,8 @@ use std::time::{Duration, Instant};
 
 use ares_gguf::Gguf;
 use ares_runtime::expert_store::{
-    CudaSlots, ExpertProfile, ExpertStore, FillOrder, FillPace, FillStats, ProfileKey, TierFill,
+    CudaSlots, ExpertProfile, ExpertStore, FillOrder, FillPace, FillStats, ProfileKey, StoreError,
+    TierFill,
 };
 
 use super::feed::Layout;
@@ -255,11 +256,7 @@ impl Usage {
     /// the start can fill the tiers from it. `log` gets the lines the owner
     /// should know of (a profile that cannot be written).
     pub(super) fn open(dir: &Path, gguf: &Gguf, c: &Config, log: Log) -> Self {
-        let mut identity = b"qwen4exp\0".to_vec();
-        for part in 0..gguf.n_parts() {
-            crate::files::identity(gguf.path(part as u16), &mut identity);
-        }
-        let key = ProfileKey::new(&identity, c.n_layer as u32, c.experts.count as u32);
+        let key = profile_key(gguf, c);
         let (found, profile) = match ExpertProfile::read(dir, &key) {
             Ok(Some(profile)) => (ProfileFound::Found { known: profile.known() }, Some(profile)),
             Ok(None) => (ProfileFound::None, None),
@@ -337,6 +334,48 @@ impl Usage {
         }
         Some(stats)
     }
+}
+
+/// The key of the usage profile of the model in `gguf`: the fingerprint of
+/// its files and the shape of its experts. The table of similar experts
+/// (`ExpertNeighbours`) is kept under the same key.
+pub fn profile_key(gguf: &Gguf, c: &Config) -> ProfileKey {
+    let mut identity = b"qwen4exp\0".to_vec();
+    for part in 0..gguf.n_parts() {
+        crate::files::identity(gguf.path(part as u16), &mut identity);
+    }
+    ProfileKey::new(&identity, c.n_layer as u32, c.experts.count as u32)
+}
+
+/// Seeds the heat of `store` with `profile` and fills the tiers from it in one
+/// sweep through the file, as a start of the runtime does
+/// ([`Usage::serving`]), for a store that one thread drives (`Session`).
+pub(super) fn seed_and_fill(
+    store: &mut ExpertStore<CudaSlots>,
+    layout: &Layout,
+    placement: &Placement,
+    profile: &ExpertProfile,
+) -> Result<(FillStats, Duration), StoreError> {
+    let map = LayerMap::new(*profile.key(), layout, placement);
+    map.seed(store, profile);
+    let begun = Instant::now();
+    let mut fill = store.plan_fill(&map.store_layers(), FillOrder::File);
+    let mut seen = (usize::MAX, Instant::now());
+    loop {
+        store.advance_fill(&mut fill, FillPace::START)?;
+        if fill.is_done() && store.is_quiet() {
+            break;
+        }
+        let left = fill.left() + usize::from(!store.is_quiet());
+        if left != seen.0 {
+            seen = (left, Instant::now());
+        } else if seen.1.elapsed() > START_STALL {
+            break;
+        }
+        std::thread::sleep(Duration::from_micros(200));
+    }
+    store.take_stats();
+    Ok((fill.stats(), begun.elapsed()))
 }
 
 /// Fills the tiers of the model's layers from the heat, in one sweep through

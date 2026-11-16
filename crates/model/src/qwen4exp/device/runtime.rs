@@ -57,6 +57,7 @@ use super::part::{
     ExpertAt, Frame, Options, PAGE_ENTRY, Part, PartSetup, PartShape, Ports, StepEnv,
 };
 use super::placement::{MARGIN, PartPlan, Placement};
+use super::prune::{self, PruneMask};
 use super::session::{Chosen, Fill, PartReport, SessionOptions, choose};
 use super::usage::{Log, ProfileReport, Usage, UsageStats};
 use crate::chat;
@@ -218,6 +219,8 @@ struct Build {
     /// The route records of the draft block, and where its experts are.
     draft_board: Option<Arc<Board>>,
     draft_place: Option<ExpertAt>,
+    /// What the tiers hold, for the routers' pruning.
+    prune_mask: Option<Arc<PruneMask>>,
 }
 
 /// The plan of the expert store and what it was made from.
@@ -704,6 +707,9 @@ impl Qwen4Exp {
             // The entries the store copies through are a ring of 256 KiB.
             pinned += frame.pinned_bytes(&opts.part, layers) + shares + (256 << 10);
         }
+        if opts.part.prune.is_some() {
+            pinned += PruneMask::bytes(config.n_layer, config.experts.count);
+        }
         let created = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |since| since.as_secs());
@@ -734,6 +740,7 @@ impl Qwen4Exp {
                 flow: None,
                 draft_board: None,
                 draft_place: None,
+                prune_mask: None,
             }),
             flow: OnceLock::new(),
             reports: Mutex::new(Vec::new()),
@@ -1154,6 +1161,13 @@ impl Qwen4Exp {
                 let mut feed =
                     Feed::new(store, boards, firsts, layout.clone(), c.experts.used as u32);
                 feed.set_read_ahead(self.opts.read_ahead);
+                if o.prune.is_some() {
+                    let mask = PruneMask::new(device, c.n_layer, c.experts.count)?;
+                    let mask = Arc::new(mask);
+                    let owners = prune::owners(&self.placement, c);
+                    feed.set_prune(mask.clone(), owners, c.experts.count);
+                    build.prune_mask = Some(mask);
+                }
                 if let Some(board) = build.draft_board.clone() {
                     feed.set_draft(board);
                     feed.fill_draft(c.experts.count).map_err(model_error)?;
@@ -1194,7 +1208,7 @@ impl Qwen4Exp {
         )?;
 
         // This part learns where its experts are, and its peer's ports.
-        let (places, flow, peer, n_slots, slot_bytes) = {
+        let (places, flow, peer, n_slots, slot_bytes, prune_mask) = {
             let build = self.meeting.lock();
             let build = &build.value;
             if let Some(block) = &mut block {
@@ -1212,9 +1226,13 @@ impl Qwen4Exp {
                 peer,
                 build.n_slots[index],
                 build.slot_bytes[index],
+                build.prune_mask.clone(),
             )
         };
         part.set_experts(places)?;
+        if let Some(mask) = prune_mask {
+            part.set_prune_mask(mask);
+        }
         if let Some((ports, cores, mixer)) = peer {
             let ports = ports.ok_or_else(|| invalid("a part that shares layers has no ports"))?;
             part.set_peer(ports, cores)?;

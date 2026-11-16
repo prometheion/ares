@@ -82,7 +82,7 @@ impl Part {
             )));
         }
         // The block's K and V are in 4 bits, whatever the model's.
-        let opts = &Options { kv: DRAFT_KV, ..opts.clone() };
+        let opts = &Options { kv: DRAFT_KV, prune: None, ..opts.clone() };
         let shape = PartShape::whole(c, 0..1, true);
         let f = Frame::new(c, opts, &shape, device.info().multiprocessors)?;
         let weights = DeviceWeights::load_block(device, ledger, c, w, output)?;

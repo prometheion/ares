@@ -25,6 +25,7 @@ use super::board::Board;
 use super::misses::WideStats;
 use super::part::ExpertAt;
 use super::placement::Placement;
+use super::prune::{PruneMask, PruneStats};
 use super::session::Fill;
 use crate::qwen4exp::Config;
 use crate::qwen4exp::weights::{DraftWeights, Moe, Weights};
@@ -358,6 +359,21 @@ pub(super) struct Feed {
     /// The route records of the model's draft block, whose experts are layer
     /// 0 of the store.
     draft: Option<DraftRecords>,
+    /// The pruning of the routers, when the model prunes (`prune.rs`).
+    prune: Option<FeedPrune>,
+}
+
+/// What the store's side of pruning keeps: the mask it writes at the start
+/// of a step, which experts each part owns, and the counts.
+struct FeedPrune {
+    mask: Arc<PruneMask>,
+    /// With two devices on every layer: the mixer's index and, per layer and
+    /// expert, 1 where the other device owns the expert.
+    owner: Option<(usize, Vec<u8>)>,
+    n_experts: usize,
+    stats: PruneStats,
+    /// Per expert of a layer: picks that were pruned, as heat.
+    counts: Vec<u32>,
 }
 
 /// The route records of a draft block. Its steps run one after the other
@@ -393,7 +409,32 @@ impl Feed {
             groups: Vec::new(),
             wide: WideStats::default(),
             draft: None,
+            prune: None,
         }
+    }
+
+    /// The model prunes: `mask` is the one its parts copy at the start of a
+    /// step, which the store writes from here on. With two devices on every
+    /// layer, `owner` is the mixer's index and, per layer and expert, 1 where
+    /// the other device owns the expert.
+    pub(super) fn set_prune(
+        &mut self,
+        mask: Arc<PruneMask>,
+        owner: Option<(usize, Vec<u8>)>,
+        n_experts: usize,
+    ) {
+        self.prune = Some(FeedPrune {
+            mask,
+            owner,
+            n_experts,
+            stats: PruneStats::default(),
+            counts: vec![0; n_experts],
+        });
+    }
+
+    /// What pruning did since the last call.
+    pub(super) fn take_prune(&mut self) -> PruneStats {
+        self.prune.as_mut().map(|p| std::mem::take(&mut p.stats)).unwrap_or_default()
     }
 
     /// The board of the model's draft block: its records are those of layer 0
@@ -582,6 +623,9 @@ impl Feed {
         self.rows = rows;
         self.followed.fill(0);
         self.store.begin_step();
+        if let Some(prune) = self.prune.as_ref().filter(|_| rows <= MAX_BATCH) {
+            prune.mask.build(&self.store, &self.layout);
+        }
         self.guessed.fill(false);
         if rows > MAX_BATCH {
             // The first layers of every part have no layer before them to start their
@@ -630,6 +674,16 @@ impl Feed {
                 let at = self.layout.store_layer(index, self.firsts[index] + i);
                 self.groups.clear();
                 self.groups.extend(record.groups());
+                if let Some(prune) = &mut self.prune {
+                    prune.follow(
+                        &mut self.store,
+                        at,
+                        index,
+                        self.firsts[index] + i,
+                        &record,
+                        &self.groups,
+                    );
+                }
                 // The store uploads what the layer misses or computes it from
                 // the layer's rows, by what its measured costs say.
                 self.store.routed_rows(
@@ -718,4 +772,53 @@ pub(super) fn build_store(
         store.enable_cpu(pool, layout.shapes.clone(), serve)?;
     }
     Ok(store)
+}
+
+impl FeedPrune {
+    /// Counts what the router of `layer` (store layer `at`, on part `index`)
+    /// pruned in the record, and gives the picks it left out or stood an
+    /// expert in for their heat: the router wanted them, and the tiers are to
+    /// learn that, so that a text's experts come in between steps.
+    fn follow(
+        &mut self,
+        store: &mut ExpertStore<CudaSlots>,
+        at: usize,
+        index: usize,
+        layer: usize,
+        record: &RouteRecord<'_>,
+        groups: &[RouteGroup],
+    ) {
+        let n = self.n_experts;
+        let owned = |e: u32| match &self.owner {
+            None => true,
+            Some((mixer, owner)) => (owner[layer * n + e as usize] != 0) == (index != *mixer),
+        };
+        let mut pruned = 0u64;
+        let mut stood_in = 0u64;
+        let mut any = false;
+        for row in 0..record.rows() {
+            let bit = 1u32 << row;
+            let ids: Vec<u32> = record.ids(row).collect();
+            for id in &ids {
+                if !owned(*id) {
+                    continue;
+                }
+                self.stats.picks += 1;
+                if !groups.iter().any(|g| g.expert == *id && g.rows & bit != 0) {
+                    pruned += 1;
+                    self.counts[*id as usize] += 1;
+                    any = true;
+                }
+            }
+            stood_in +=
+                groups.iter().filter(|g| g.rows & bit != 0 && !ids.contains(&g.expert)).count()
+                    as u64;
+        }
+        self.stats.stood_in += stood_in;
+        self.stats.skipped += pruned.saturating_sub(stood_in);
+        if any {
+            store.record_counts(at, &self.counts, 1.0);
+            self.counts.fill(0);
+        }
+    }
 }
