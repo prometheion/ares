@@ -1076,6 +1076,10 @@ impl DeviceModel for SyntheticDevice {
             return Ok(None);
         }
         self.read_inputs(cx)?;
+        // A step that only drafts has made its drafts above; no row runs.
+        if cx.record.drafts_only() {
+            return Ok(None);
+        }
         match self.config.split {
             Split::Shared => {
                 return Err(ModelError::Invalid("the synthetic model has no shared split".into()));

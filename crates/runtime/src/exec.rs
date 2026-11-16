@@ -75,6 +75,10 @@ pub struct StepOutput {
     pub draft_probs: Vec<f32>,
     /// Device milliseconds the model's own drafter took.
     pub draft_ms: f64,
+    /// The rows of the step, in order, whose results are not what the rows
+    /// would give alone ([`DeviceModel::rows_not_exact`](crate::DeviceModel::rows_not_exact)):
+    /// no draft is accepted from such a row of a window on.
+    pub inexact: Vec<u32>,
     /// What each device measured.
     pub devices: Vec<DeviceTimes>,
     /// The milliseconds the step took, the drafter's included, from an executor

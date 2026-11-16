@@ -166,6 +166,7 @@ struct DeviceResult {
     drafts: Vec<u32>,
     draft_probs: Vec<f32>,
     draft_ms: f64,
+    inexact: Vec<u32>,
     /// What this device made of the transfers of a batch, in their order: the
     /// bytes and the tag of its share, or `None` for one it could not carry
     /// out.
@@ -403,6 +404,7 @@ impl Executor for GpuExecutor {
         out.drafts.clear();
         out.draft_probs.clear();
         out.draft_ms = 0.0;
+        out.inexact.clear();
         out.devices.clear();
         let mut have_picks = false;
         // The device that failed is the one to name: the others only report
@@ -435,7 +437,10 @@ impl Executor for GpuExecutor {
                 out.drafts.extend_from_slice(&result.drafts);
             }
             out.draft_ms += result.draft_ms;
+            out.inexact.extend_from_slice(&result.inexact);
         }
+        out.inexact.sort_unstable();
+        out.inexact.dedup();
         Ok(woke)
     }
 
@@ -601,6 +606,7 @@ struct Worker {
     drafts: Vec<u32>,
     draft_probs: Vec<f32>,
     draft_ms: f64,
+    inexact: Vec<u32>,
 }
 
 /// A device in an error message: its name and the driver's number for it.
@@ -688,6 +694,7 @@ fn worker_main(init: Init, ready: mpsc::Sender<Result<(), RuntimeError>>) {
                             std::mem::swap(&mut result.logprobs, &mut worker.logprobs);
                             std::mem::swap(&mut result.drafts, &mut worker.drafts);
                             std::mem::swap(&mut result.draft_probs, &mut worker.draft_probs);
+                            std::mem::swap(&mut result.inexact, &mut worker.inexact);
                             result.draft_ms = worker.draft_ms;
                         }
                         Err((cause, secondary)) => {
@@ -856,6 +863,7 @@ impl Worker {
             drafts: Vec::with_capacity(max_rows as usize),
             draft_probs: Vec::with_capacity(max_rows as usize),
             draft_ms: 0.0,
+            inexact: Vec::with_capacity(max_rows as usize),
             device,
             stream,
             kernels,
@@ -1105,6 +1113,8 @@ impl Worker {
             self.model.picked(&self.picks);
         }
         self.draft_ms = self.model.own_draft_ms();
+        self.inexact.clear();
+        self.model.rows_not_exact(&mut self.inexact);
         times.pick_ns = sampler_ns + pick_begun.elapsed().as_nanos() as u64;
         times.finished_at_ns = self.clock.now_ns();
         Ok((times, produced))

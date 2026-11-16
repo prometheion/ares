@@ -619,6 +619,24 @@ impl DeviceModel for Qwen35Device {
             })?;
         }
         let exchange = LinkExchange { links: step.links, index: step.index, stream: step.stream };
+        if record.drafts_only() {
+            // The chains and nothing of the model: the round that verifies
+            // their drafts is the next record.
+            if self.part.has_draft_block() {
+                self.part.enqueue_chains(&StepEnv {
+                    stream: step.stream,
+                    step: step.record_on_device,
+                    dims: record.dims(),
+                    tokens: &self.tokens,
+                    segments: &self.segments,
+                    tables: step.tables,
+                    pages: step.pages,
+                    exchange: None,
+                    replay: &self.replay,
+                })?;
+            }
+            return Ok(None);
+        }
         self.part.enqueue(&StepEnv {
             stream: step.stream,
             step: step.record_on_device,

@@ -36,6 +36,7 @@ mod mtp;
 mod resume;
 mod tensor;
 
+use crate::blocks::forms::Reach;
 use crate::blocks::kv;
 use crate::blocks::recurrent::{self, Inputs, Recurrent};
 
@@ -1637,11 +1638,35 @@ impl Part {
         let (kernels, status) = (self.attention.as_ref(), self.at(self.s.status));
         let (stream, tables, pages) = (env.stream, env.tables, env.pages);
         self.kv.prepare(kernels, stream, &reaches, &self.page_tab, tables, pages, status, true)?;
+        self.prepare_draft_kv(env, &reaches)
+    }
+
+    /// The draft block's part of [`Part::prepare_kv`]: its exact entries and
+    /// table for the cells the step's rows reach.
+    fn prepare_draft_kv(&mut self, env: &StepEnv<'_>, reaches: &[Reach]) -> Result<(), ModelError> {
+        let (kernels, status) = (self.attention.as_ref(), self.at(self.s.status));
+        let (stream, tables, pages) = (env.stream, env.tables, env.pages);
         if let Some(m) = &mut self.mtp {
             // The draft block attends a link at a time: no window reads its tiles.
-            m.kv.prepare(kernels, stream, &reaches, &self.page_tab, tables, pages, status, false)?;
+            m.kv.prepare(kernels, stream, reaches, &self.page_tab, tables, pages, status, false)?;
         }
         Ok(())
+    }
+
+    /// A step that only drafts: the chains of the draft block for the windows
+    /// of [`Part::draft_step`], and nothing of the model. The block's cells of
+    /// the chain are provisional as in any step; the round that verifies the
+    /// drafts writes them from the model's hidden states.
+    pub fn enqueue_chains(&mut self, env: &StepEnv<'_>) -> Result<(), ModelError> {
+        self.check(env)?;
+        if self.has_deferred {
+            return Err(invalid(
+                "the draft windows of the last step were not committed before this step",
+            ));
+        }
+        let reaches = kv::reaches(env.segments, env.replay);
+        self.prepare_draft_kv(env, &reaches)?;
+        self.draft_before(env)
     }
 
     /// Tells the part that the pool freed these pages, so it gives back what

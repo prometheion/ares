@@ -396,6 +396,8 @@ impl<D: SlotDevice> ExpertStore<D> {
         let now = Instant::now();
         let mut missing = 0;
         let mut candidates: Vec<(usize, Miss, Source)> = Vec::new();
+        // The misses left without a read or a job: claimed, they add nothing.
+        let mut left: Vec<usize> = Vec::new();
         for (g, group) in groups.iter().enumerate() {
             let expert = group.expert;
             self.stats.picks += 1;
@@ -430,6 +432,24 @@ impl<D: SlotDevice> ExpertStore<D> {
                 self.stats.miss_from_disk += 1;
                 Source::Disk
             };
+            // A row that verifies a draft does not wait for the file
+            // (`windows.rs`), and a row left already needs nothing.
+            let from_file = source == Source::Disk || source == Source::OnItsWay;
+            if (from_file && self.windows.may_leave(group.rows))
+                || self.windows.all_left(group.rows)
+            {
+                if from_file && !self.windows.all_left(group.rows) {
+                    self.stats.left_reads += 1;
+                    if self.config.read_left {
+                        self.guesses.guess(&mut self.ram.sets, layer, &[expert], self.step + 1);
+                    }
+                } else {
+                    self.stats.left_experts += 1;
+                }
+                self.windows.leave(group.rows);
+                left.push(g);
+                continue;
+            }
             let miss = Miss {
                 pairs: group.rows.count_ones(),
                 heat: self.heat.layer(layer)[expert as usize],
@@ -437,7 +457,7 @@ impl<D: SlotDevice> ExpertStore<D> {
             };
             candidates.push((g, miss, source));
         }
-        if candidates.is_empty() {
+        if candidates.is_empty() && left.is_empty() {
             if missing > 0 {
                 self.poll()?;
             }
@@ -509,6 +529,10 @@ impl<D: SlotDevice> ExpertStore<D> {
                     cpu: true,
                 });
             }
+        }
+        for g in left {
+            claimed.push(g as u32);
+            claimed_experts.push(groups[g].expert);
         }
         self.waits.push((layer, now));
         if !claimed.is_empty() {

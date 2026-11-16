@@ -369,6 +369,15 @@ pub trait DeviceModel: Send {
     /// NaN, and its draft is not a draft whatever the device holds there.
     /// Asked after the step has ended.
     fn own_draft_probs(&mut self, _out: &mut Vec<f32>) {}
+
+    /// The rows of the step that ran last whose results are not what each row
+    /// would give alone, appended to `out` in any order. Only rows of a window
+    /// past its first may be such a row, and only together with every row of
+    /// the window after it: a model that leaves a row that verifies a draft
+    /// without something it would have had to wait for (an expert in no tier
+    /// but the file) says so, and the conductor accepts no draft from that row
+    /// on. Asked after the step has ended, on every device.
+    fn rows_not_exact(&mut self, _out: &mut Vec<u32>) {}
 }
 
 /// An architecture.

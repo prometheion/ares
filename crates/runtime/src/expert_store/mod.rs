@@ -75,6 +75,7 @@ mod profile;
 mod region;
 mod tier;
 mod transit;
+mod windows;
 
 use std::collections::{HashMap, VecDeque};
 use std::time::Instant;
@@ -160,6 +161,10 @@ pub struct StoreConfig {
     /// gives back to the system at a time. A piece is whole slots of one
     /// pool.
     pub ram_piece: u64,
+    /// An expert that rows verifying drafts left without a read
+    /// ([`ExpertStore::set_windows`]) is read into RAM as a guess, for the
+    /// steps after.
+    pub read_left: bool,
 }
 
 impl StoreConfig {
@@ -179,6 +184,7 @@ impl StoreConfig {
             transit_slots: Vec::new(),
             staging_slots: 0,
             ram_piece: PIECE as u64,
+            read_left: false,
         }
     }
 }
@@ -420,6 +426,11 @@ pub struct StoreStats {
     pub pieces_released: u64,
     pub pieces_locked: u64,
     pub piece_evictions: u64,
+    /// Experts that only the file held and that only rows verifying drafts
+    /// picked, which were not read for them; and the experts that only rows
+    /// left already picked, which were not computed.
+    pub left_reads: u64,
+    pub left_experts: u64,
 }
 
 /// The expert tiers of a model and the work that feeds them.
@@ -458,6 +469,8 @@ pub struct ExpertStore<D: SlotDevice> {
     hybrid: Option<hybrid::Hybrid>,
     transit: Transit,
     pieces: Pieces,
+    /// The running step's windows that verify drafts, and the rows left.
+    windows: windows::Windows,
     stats: StoreStats,
 }
 
@@ -669,6 +682,7 @@ impl<D: SlotDevice> ExpertStore<D> {
             hybrid: None,
             transit: Transit::new(transit),
             pieces,
+            windows: windows::Windows::default(),
             stats: StoreStats::default(),
             block,
             config,
@@ -770,8 +784,26 @@ impl<D: SlotDevice> ExpertStore<D> {
         self.filling = false;
         self.in_step = true;
         self.phase.fill(Phase::Ahead);
+        self.windows.set(&[]);
         self.cpu_begin_step();
         self.transit_begin_step();
+    }
+
+    /// The windows of the step just begun that verify drafts, as (first row,
+    /// rows). A row past the first of a window never waits for the file: an
+    /// expert in no tier but the file that only such rows pick is not read
+    /// for them, and they and the rows after them in their window are left
+    /// without it ([`ExpertStore::rows_left`]). Only a store with a CPU half
+    /// leaves anything (the CPU claims the expert and adds nothing).
+    pub fn set_windows(&mut self, windows: &[(u32, u32)]) {
+        self.windows.set(windows);
+    }
+
+    /// The rows of the running or last step, a bit each, whose results are
+    /// not what the rows would give alone: the rows of a window from the
+    /// first that was left without an expert on.
+    pub fn rows_left(&self) -> u32 {
+        self.windows.left()
     }
 
     /// The route record of `layer` of the running step has arrived: `picks`

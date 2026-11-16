@@ -1,6 +1,9 @@
 //! A request with a rule takes the model's own drafts while the rule is not
-//! bound, and stops taking what a window gives at the token that makes it bind.
-//! On the synthetic model with a host executor.
+//! bound. The drafter's chain runs in a step that only drafts and knows no
+//! rule; the round then verifies its drafts as it verifies any: the drafts the
+//! rule forbids are cut, and every row has the mask its path gives it, so the
+//! token that makes the rule bind ends what the drafter's chain gives. On the
+//! synthetic model with a host executor.
 //!
 //! The model's text never repeats here (its next token depends on the
 //! position), so the lookup in earlier text has nothing to offer inside a
@@ -54,14 +57,18 @@ fn model_ending(accuracy: &[f64], eos: Option<u32>) -> Arc<SyntheticModel> {
     Arc::new(SyntheticModel::new(config).unwrap())
 }
 
-/// A window of a step, as its record has it when the devices read it.
+/// A window of a step, as its record has it when the devices read it: the
+/// chain of a step that only drafts, or a window that verifies.
 #[derive(Clone, Debug)]
 struct Window {
     /// Where the newest token is in the request's tokens, the prompt first.
     at: usize,
     /// The tokens of the rows: the newest token, then the drafts.
     tokens: Vec<u32>,
-    /// The drafts are the draft block's.
+    /// A chain of the draft block, in a step that only drafts; for a window
+    /// that verifies, whether its drafts are of the chain that ran just
+    /// before it at the same place.
+    chain: bool,
     own: bool,
     /// Whether each row carries a mask.
     masked: Vec<bool>,
@@ -101,6 +108,7 @@ fn runtime(model: &Arc<SyntheticModel>, windows: &Windows, prompt_len: usize) ->
             windows.lock().unwrap().push(Window {
                 at,
                 tokens: rows.clone().map(|row| record.row(row).token).collect(),
+                chain: record.drafts_only(),
                 own: record.own_drafts(i),
                 masked: rows.map(|row| record.sampler(sampler_of[&row]).mask().is_some()).collect(),
             });
@@ -218,57 +226,67 @@ fn ruled(prompt: &str, structure: &Structure, draft: bool) -> GenerateRequest {
 /// What the window that gave the binding token did.
 #[derive(Debug)]
 struct Binding {
-    /// The window's rows, and which of its picks the binding token was: 0 is
-    /// the pick of the newest token's row, `k` the pick of the row of draft
-    /// `k - 1`.
-    rows: usize,
+    /// Which of the window's picks the binding token was: 0 is the pick of
+    /// the newest token's row, `k` the pick of the row of draft `k - 1`.
     pick: usize,
     /// The window's drafts were the draft block's.
     own: bool,
     /// The draft block proposed the binding token itself, and was right in
-    /// everything before it: the row after the binding token was verified
-    /// with the token it should have, and without the mask it should have.
+    /// everything before it.
     proposed: bool,
+    /// The block's chain went on past the binding token, and the round did
+    /// not verify those drafts: the rule forbids them.
+    cut: bool,
+}
+
+/// The windows that verify, each with whether its drafts are of the chain
+/// that ran just before it, and that chain.
+fn verified(windows: &[Window]) -> Vec<(Window, Option<Window>)> {
+    let mut out = Vec::new();
+    for (i, w) in windows.iter().enumerate() {
+        if w.chain {
+            continue;
+        }
+        let chain = i.checked_sub(1).map(|j| &windows[j]).filter(|c| c.chain && c.at == w.at);
+        out.push((Window { own: chain.is_some(), ..w.clone() }, chain.cloned()));
+    }
+    out
 }
 
 /// Checks the windows of a reply whose binding token is the token at `at` of
 /// the request's `tokens`, the second token of `tag`, and returns what the
 /// window that gave it did.
 fn check_windows(windows: &[Window], tokens: &[u32], tag: &[u32], at: usize) -> Binding {
+    let verified = verified(windows);
     // The window that gave the binding token is the last that began before it.
-    let giving = windows.iter().rfind(|w| w.at < at).expect("a window before the binding token");
+    let (giving, chain) =
+        verified.iter().rfind(|(w, _)| w.at < at).expect("a window before the binding token");
     let pick = at - giving.at - 1;
     assert!(pick < giving.tokens.len(), "the binding token came from {giving:?}");
-    // Never beyond: the binding token is the newest token of a window, whose
-    // first row has the mask the rule gives it.
-    let next = windows.iter().find(|w| w.at == at).unwrap_or_else(|| {
-        panic!("no window began at the binding token {at}: a window was accepted across it")
-    });
-    assert!(next.masked[0], "the row of the binding token has no mask: {next:?}");
-    for w in windows {
+    for (w, _) in &verified {
         if w.at >= at {
-            // The rule is bound: the drafts are the host's, and every row has
-            // the mask of its path.
-            assert!(!w.own && w.masked.iter().all(|m| *m), "bound, at {at}: {w:?}");
-        } else {
-            // Free rows have no mask. With the host's drafts a row whose path
-            // (the reply and the drafts before the row) has the tag has its
-            // mask; with the model's own drafts no row has one.
-            for (k, masked) in w.masked.iter().enumerate() {
-                let path = [&tokens[..=w.at], &w.tokens[1..=k]].concat();
-                let bound = path.windows(2).any(|pair| pair == tag);
-                assert_eq!(*masked, bound && !w.own, "row {k}, binding at {at}: {w:?}");
-            }
+            // The rule binds the first row: the drafts are the host's.
+            assert!(!w.own, "bound, at {at}: {w:?}");
+        }
+        // Every row whose path (the reply and the drafts before the row) has
+        // the tag has its mask, whoever made the drafts; a free row has none.
+        for (k, masked) in w.masked.iter().enumerate() {
+            let path = [&tokens[..=w.at], &w.tokens[1..=k]].concat();
+            let bound = path.windows(2).any(|pair| pair == tag);
+            assert_eq!(*masked, bound, "row {k}, binding at {at}: {w:?}");
         }
     }
     let right = |w: &Window, k: usize| tokens.get(w.at + k) == Some(&w.tokens[k]);
+    let proposed = chain.as_ref().is_some_and(|chain| {
+        pick + 1 < chain.tokens.len() && (1..=pick + 1).all(|k| right(chain, k))
+    });
     Binding {
-        rows: giving.tokens.len(),
         pick,
         own: giving.own,
-        proposed: giving.own
-            && pick + 1 < giving.tokens.len()
-            && (1..=pick + 1).all(|k| right(giving, k)),
+        proposed,
+        cut: proposed
+            && chain.as_ref().is_some_and(|chain| chain.tokens.len() > pick + 2)
+            && giving.tokens.len() <= pick + 2,
     }
 }
 
@@ -338,11 +356,14 @@ fn the_binding_token_at_every_place_of_a_window_ends_what_the_window_gives() {
                 if binding.own {
                     picks.insert(binding.pick);
                     proposed += usize::from(binding.proposed);
-                    cut += usize::from(binding.pick + 1 < binding.rows);
+                    cut += usize::from(binding.cut);
                 }
             }
             assert!(tried >= 40, "{kind:?}: only {tried} places had a tag of their own");
-            assert!(cut > 10, "{kind:?}: only {cut} windows had rows after the binding token");
+            assert!(
+                cut > 10,
+                "{kind:?}: only {cut} chains went on past the binding token and were cut there"
+            );
             assert!(
                 proposed > 5,
                 "{kind:?}: the draft block proposed the binding token {proposed} times"
@@ -358,36 +379,48 @@ fn the_binding_token_at_every_place_of_a_window_ends_what_the_window_gives() {
 }
 
 #[test]
-fn a_draft_of_the_binding_token_is_right_and_the_row_after_it_is_not_taken() {
-    // One case spelled out. The draft block is always right, so a window that
+fn a_chain_past_the_binding_token_is_verified_up_to_it() {
+    // One case spelled out. The draft block is always right, so a chain that
     // begins three tokens before the end of the tag drafts the tag's last
-    // token and the free text after it, and the model, asked without a mask,
-    // confirms all of it. Only the tokens up to the tag may be taken.
+    // token and the free text after it, without a mask: its step knows no
+    // rule. The round verifies the drafts up to the tag, the last with the
+    // mask the tag gives it, and not the free text after it, which the rule
+    // forbids.
     let model = model(&[]);
     let (prompt, text) = free_text(&model, 100);
     let letter = |c: char| ('x'..='z').contains(&c);
-    let found =
-        (40..90).filter(|end| !letter(text[end + 1])).find_map(|end| {
-            let tag = tag_at(&text, end)?;
-            let structure = rule(Kind::Reasoning, &tag);
-            let windows = Windows::default();
-            let rt = runtime(&model, &windows, prompt.len());
-            let run = run_one(&rt, ruled(&prompt, &structure, true));
-            let at = prompt.len() + end;
-            let windows = windows.lock().unwrap();
-            let giving = windows.iter().rfind(|w| w.at < at)?.clone();
-            (giving.own && giving.tokens.len() == WINDOW as usize && at - giving.at == 3)
-                .then_some((end, giving, run, own_accepted(&rt)))
-        });
-    let (end, giving, run, accepted) = found.expect("a window that begins three before the tag");
+    let found = (40..90).filter(|end| !letter(text[end + 1])).find_map(|end| {
+        let tag = tag_at(&text, end)?;
+        let structure = rule(Kind::Reasoning, &tag);
+        let windows = Windows::default();
+        let rt = runtime(&model, &windows, prompt.len());
+        let run = run_one(&rt, ruled(&prompt, &structure, true));
+        let at = prompt.len() + end;
+        let windows = windows.lock().unwrap();
+        let (giving, chain) = verified(&windows).into_iter().rfind(|(w, _)| w.at < at)?;
+        let chain = chain?;
+        (chain.tokens.len() == WINDOW as usize && at - giving.at == 3).then_some((
+            end,
+            giving,
+            chain,
+            run,
+            own_accepted(&rt),
+        ))
+    });
+    let (end, giving, chain, run, accepted) =
+        found.expect("a chain that begins three before the tag");
     let free: Vec<u32> = tokens_of(&text.iter().collect::<String>());
     let at = prompt.len() + end;
-    // The window's drafts are the free text, through the tag and past it.
-    let drafted = &giving.tokens[1..];
-    let from = giving.at - prompt.len() + 1;
+    // The chain's drafts are the free text, through the tag and past it.
+    let drafted = &chain.tokens[1..];
+    let from = chain.at - prompt.len() + 1;
     assert_eq!(drafted, &free[from..from + drafted.len()], "the block drafted the free text");
+    assert!(chain.masked.iter().all(|m| !m), "no row of the chain has a mask");
+    // The round verifies the drafts through the tag's last token, whose row
+    // has the mask, and no more.
     assert_eq!(giving.at + 3, at, "its third draft is the tag's last token");
-    assert!(giving.masked.iter().all(|m| !m), "no row of it has a mask");
+    assert_eq!(giving.tokens, chain.tokens[..4], "{giving:?}");
+    assert_eq!(giving.masked, [false, false, false, true], "{giving:?}");
     // The reply has the tag and then the answer, not the free text.
     let (reasoning, answer) = run.text.split_at(text[..=end].iter().collect::<String>().len());
     assert_eq!(reasoning.chars().collect::<Vec<_>>(), text[..=end]);

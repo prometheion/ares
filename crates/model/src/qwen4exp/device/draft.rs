@@ -193,9 +193,14 @@ pub(super) struct DraftBlock {
     n_drafts: u32,
     /// The probability the block gave each draft of the step, in the order of
     /// the drafts; NaN for a link that was not made. And the links each
-    /// window's chain made, by its segment.
+    /// sequence's chain made, by its slot, until the model's step that
+    /// verifies them is kept.
     probs: Vec<f32>,
-    made: Vec<(usize, u32)>,
+    made: Vec<(u32, u32)>,
+    /// The newest cells (slot, cell) that the chains of a step that only
+    /// drafts ran as their link 0: the model's step that verifies the drafts
+    /// does not write them again.
+    newest_done: Vec<(u32, u32)>,
     picked: Event,
     /// Recorded behind a step whose rows only wrote keys, and whether the
     /// device may still be running such a step: the host writes the block's
@@ -296,6 +301,7 @@ impl DraftBlock {
             n_drafts: 0,
             probs: Vec::new(),
             made: Vec::new(),
+            newest_done: Vec::new(),
             picked: Event::new(device)?,
             wrote: Event::new(device)?,
             writing: false,
@@ -414,6 +420,9 @@ impl DraftBlock {
     /// Steps 2 and 3: the newest cell of every sequence of the step, and the
     /// chains. `tokens` are the tokens of the step's rows; the rows that take
     /// the block's drafts get them. After the tables of the step are written.
+    /// `only` is a step that only drafts: the model's step after it verifies
+    /// the drafts and finds the newest cells of these chains written.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn draft(
         &mut self,
         stream: &Stream,
@@ -422,18 +431,25 @@ impl DraftBlock {
         tokens: &mut [u32],
         chains: &[Chain],
         chances: Option<&DraftChances>,
+        only: bool,
     ) -> Result<(), ModelError> {
         self.n_drafts = 0;
         self.last_chain_ms = 0.0;
         self.probs.clear();
-        self.made.clear();
+        if !chains.is_empty() {
+            self.made.clear();
+        }
+        let done = std::mem::take(&mut self.newest_done);
         let drafting = |i: usize| chains.iter().any(|c| c.segment == i);
-        // The newest cells of the sequences that do not draft.
+        // The newest cells of the sequences that do not draft, and whose
+        // chain did not write them in a step that only drafted.
         let begun = Instant::now();
         let quiet: Vec<Row> = segments
             .iter()
             .enumerate()
-            .filter(|(i, s)| s.pos0 > 0 && !drafting(*i))
+            .filter(|(i, s)| {
+                s.pos0 > 0 && !drafting(*i) && !done.contains(&(s.slot, s.pos0 as u32 - 1))
+            })
             .map(|(_, s)| Row {
                 slot: s.slot,
                 cell: s.pos0 as u32 - 1,
@@ -547,8 +563,11 @@ impl DraftBlock {
         for c in by_segment {
             let chain = &chains[c];
             let made = probs[c].len();
-            self.made.push((chain.segment, made as u32));
             let s = &segments[chain.segment];
+            self.made.push((s.slot, made as u32));
+            if only {
+                self.newest_done.push((s.slot, (s.pos0 as u32).saturating_sub(1)));
+            }
             let rows = (s.row0 + 1) as usize..(s.row0 + 1) as usize + made;
             if watch.recent.len() == Watch::KEPT {
                 watch.recent.pop_front();
@@ -595,14 +614,21 @@ impl DraftBlock {
     /// Remembers the rows of the model's step that is enqueued now: the next
     /// step follows them.
     pub(super) fn keep(&mut self, segments: &[Segment], tokens: &[u32]) {
+        let made = std::mem::take(&mut self.made);
         self.tails.clear();
-        self.tails.extend(segments.iter().enumerate().map(|(i, s)| Tail {
-            slot: s.slot,
-            pos0: s.pos0.max(0) as u32,
-            row0: s.row0,
-            tokens: tokens[s.row0 as usize..(s.row0 + s.n_rows) as usize].to_vec(),
-            direct: s.direct,
-            links: self.made.iter().find(|(segment, _)| *segment == i).map_or(0, |(_, made)| *made),
+        self.tails.extend(segments.iter().map(|s| {
+            Tail {
+                slot: s.slot,
+                pos0: s.pos0.max(0) as u32,
+                row0: s.row0,
+                tokens: tokens[s.row0 as usize..(s.row0 + s.n_rows) as usize].to_vec(),
+                direct: s.direct,
+                // The drafts of the chain that the window verifies.
+                links: made
+                    .iter()
+                    .find(|(slot, _)| *slot == s.slot)
+                    .map_or(0, |(_, made)| (*made).min(s.n_rows - 1)),
+            }
         }));
     }
 

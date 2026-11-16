@@ -304,10 +304,13 @@ struct Active {
     /// Whether the request was counted as one that had to wait.
     counted_waiting: bool,
     /// Drafts for the coming step; cut to the rows the plan grants. When the
-    /// model drafts them itself (`own`), placeholders until the step brings
-    /// the drafts back.
+    /// model drafts them itself (`own`), placeholders until its chain has run
+    /// (the step that only drafts), and then the drafts it made that the
+    /// round verifies, with the probability it gave each (`own_probs`; empty
+    /// from a drafter that does not say).
     draft: Vec<u32>,
     own: bool,
+    own_probs: Vec<f32>,
     /// What the lookup proposes for the coming step, with the chance of each
     /// token (the lookup still learns from what turns out to be right when
     /// the model's own drafts were taken instead), and the chance of each
@@ -526,7 +529,8 @@ enum Probe {
     Prompt,
     /// A window that verifies drafts: not certain, every row wanted.
     Window,
-    /// A window whose draft rows the model's draft block fills in.
+    /// The chain of the model's own drafter for a window: a step that only
+    /// drafts.
     Chain,
 }
 
@@ -668,6 +672,7 @@ impl Conductor {
                 drafts: Vec::with_capacity(max_rows as usize),
                 draft_probs: Vec::with_capacity(max_rows as usize),
                 draft_ms: 0.0,
+                inexact: Vec::new(),
                 devices: Vec::with_capacity(exec.devices()),
                 step_ms: None,
             },
@@ -757,14 +762,14 @@ impl Conductor {
             }
             self.prices.measured(rows, fastest);
         }
-        // The chain: windows of 2 rows to the longest one sequence has, whose
-        // first row is the newest token and the others the drafts the chain
-        // makes.
+        // The chain: steps that only draft, for windows of 2 rows to the
+        // longest one sequence has, whose first row is the newest token and the
+        // others the drafts the chain makes.
         let longest = self.config.window_rows.min(window).min(top);
         for links in 1..longest {
             let mut fastest = f64::INFINITY;
             for _ in 0..2 {
-                fastest = fastest.min(self.probe(links + 1, Probe::Chain)?.1);
+                fastest = fastest.min(self.probe(links + 1, Probe::Chain)?.0);
             }
             self.chain.set(links, fastest);
         }
@@ -781,7 +786,8 @@ impl Conductor {
     }
 
     /// One step of `rows` rows of the sequence in slot 0, from position 0,
-    /// shaped as `shape` says. Returns the time of the step in milliseconds
+    /// shaped as `shape` says (a chain is a step that only drafts, for a
+    /// window of `rows` rows). Returns the time of the step in milliseconds
     /// and what the model's own draft chain took of it.
     fn probe(&mut self, rows: u32, shape: Probe) -> Result<(f64, f64), ExecError> {
         let cells = self.config.cells_per_page;
@@ -794,6 +800,7 @@ impl Conductor {
             let deferred = shape != Probe::Prompt && rows > 1;
             writer.segment(0, 0, rows, !deferred).expect("room for a segment");
             if shape == Probe::Chain && deferred {
+                writer.drafts_only();
                 writer.own_drafts().expect("room for the flag");
             }
             for position in 0..rows {
@@ -821,7 +828,9 @@ impl Conductor {
                 .expect("room for the page-table entries");
             writer.finish().expect("room for the header")
         };
-        if shape != Probe::Prompt && rows > 1 {
+        // A window leaves its rows for the next record to commit; a step that
+        // only drafts leaves none.
+        if shape == Probe::Window && rows > 1 {
             self.pending_probe = Some(Commit { row0: 0, rows, slot: 0, accepted: 1 });
         }
         self.step_no += 1;
@@ -835,7 +844,7 @@ impl Conductor {
         let ms = begun.elapsed().as_secs_f64() * 1e3;
         // An executor that knows the time of its steps without a clock says so.
         let ms = self.output.step_ms.take().unwrap_or(ms);
-        Ok((ms - self.output.draft_ms, self.output.draft_ms))
+        Ok((ms, self.output.draft_ms))
     }
 
     /// The loop. Returns after a shutdown, when every request has ended.
@@ -1090,6 +1099,7 @@ impl Conductor {
             lookup_chances: Vec::with_capacity(self.config.window_rows as usize),
             own_chances: Vec::with_capacity(self.config.window_rows as usize),
             own_needs: Vec::with_capacity(self.config.window_rows as usize),
+            own_probs: Vec::with_capacity(self.config.window_rows as usize),
             pending: Vec::new(),
             emitted: String::new(),
             finished: None,
@@ -1831,11 +1841,22 @@ impl Conductor {
         }
 
         // What left the devices while the step was planned is copied into
-        // RAM before the step writes its pages again.
+        // RAM before a step writes its pages again: the step that only drafts
+        // writes the cells of the draft block's chains.
         if let Some(cache) = &mut self.cache {
             cache.settle_leaving(&mut self.pool, &mut *self.exec);
         }
-        let used = match self.write_record() {
+        // The chains of the model's own drafter run first, as a step of their
+        // own, and the round verifies what the conductor takes of them.
+        let chain_ms = if self.parts.iter().any(|p| self.takes_own_drafts(p)) {
+            match self.chains_first() {
+                Ok(ms) => ms,
+                Err(message) => return self.fail(message),
+            }
+        } else {
+            0.0
+        };
+        let used = match self.write_record(false) {
             Ok(used) => used,
             Err(message) => return self.fail(message),
         };
@@ -1865,32 +1886,12 @@ impl Conductor {
         let t_back = Instant::now();
         self.stats.record(Phase::Wait, (t_back - t_wait).as_nanos() as u64);
         self.stats.counters.conductor_wakes.record(woke);
-        // What the model's own drafter took is not a cost of the rows: it is
-        // learned on its own, by the links of the longest chain of the step.
-        let mut own_links = 0;
-        let mut at = 0;
-        for part in &self.parts {
-            if self.slots[part.slot as usize].as_ref().is_some_and(|a| a.own) {
-                // The links the drafter made of the ones this window asked for.
-                let asked = part.rows.saturating_sub(1) as usize;
-                let drafts = self.output.drafts.get(at..).unwrap_or(&[]);
-                let made = drafts.iter().take(asked).take_while(|d| **d != u32::MAX).count();
-                own_links = own_links.max(made as u32);
-                at += asked;
-            }
-        }
-        let draft_ms = self.output.draft_ms;
-        if own_links > 0 && draft_ms > 0.0 {
-            let counters = &mut self.stats.counters;
-            counters.own_draft_steps += 1;
-            counters.own_draft_links += u64::from(own_links);
-            counters.own_draft_us += (draft_ms * 1e3) as u64;
-            self.chain.observe(own_links, draft_ms);
-        }
         let step_ms = (t_back - t_dispatch).as_secs_f64() * 1e3;
         // An executor that knows the time of its steps without a clock says so.
         let step_ms = self.output.step_ms.take().unwrap_or(step_ms);
-        self.prices.observe(load, step_ms - draft_ms);
+        self.prices.observe(load, step_ms);
+        // The round took its chains and its rows.
+        let step_ms = step_ms + chain_ms;
         self.share.spent(turn, step_ms, generating, self.prompt_rows.iter().any(|rows| *rows > 0));
         let last_done = self.output.devices.iter().map(|d| d.finished_at_ns).max().unwrap_or(0);
         self.last_done_ns = Some(last_done);
@@ -1914,14 +1915,165 @@ impl Conductor {
         self.stats.counters.steps += 1;
     }
 
+    /// Whether `part` is a window whose drafts the model's own drafter makes.
+    fn takes_own_drafts(&self, part: &StepPart) -> bool {
+        part.rows > 1
+            && matches!(part.kind, PartKind::Window)
+            && self.slots[part.slot as usize].as_ref().is_some_and(|a| a.own)
+    }
+
+    /// The step that only drafts: the model's own drafter makes the chains of
+    /// the windows that take its drafts, as long as they were asked (or as far
+    /// as their bars let them go), and nothing else runs. The drafts come
+    /// back with what the drafter said of each, and the round then verifies
+    /// as many of each chain as pay ([`Conductor::verify_lengths`]). Returns
+    /// what the step took, in milliseconds: the price of the chain.
+    fn chains_first(&mut self) -> Result<f64, String> {
+        let used = self.write_record(true)?;
+        let t_dispatch = Instant::now();
+        self.step_no += 1;
+        let meta = StepMeta { step: self.step_no, record_bytes: used, after_idle: self.after_idle };
+        if let (false, Some(done)) = (self.after_idle, self.last_done_ns) {
+            self.stats.record(Phase::Turnaround, self.clock.now_ns().saturating_sub(done));
+        }
+        self.after_idle = false;
+        self.exec.dispatch(&meta).map_err(|error| error.to_string())?;
+        let t_wait = Instant::now();
+        self.stats.record(Phase::Dispatch, (t_wait - t_dispatch).as_nanos() as u64);
+        let woke = self
+            .exec
+            .collect(self.config.conductor_spin, &mut self.output)
+            .map_err(|error| error.to_string())?;
+        let t_back = Instant::now();
+        self.stats.record(Phase::Wait, (t_back - t_wait).as_nanos() as u64);
+        self.stats.counters.conductor_wakes.record(woke);
+        self.last_done_ns = self.output.devices.iter().map(|d| d.finished_at_ns).max();
+        let step_ms = (t_back - t_dispatch).as_secs_f64() * 1e3;
+        let step_ms = self.output.step_ms.take().unwrap_or(step_ms);
+
+        // The drafts of every chain, in the order of the windows: those of the
+        // links that were made, and what the drafter said of them.
+        let reports = self.output.draft_probs.len() == self.output.drafts.len();
+        let (mut at, mut longest) = (0usize, 0usize);
+        for part in &self.parts {
+            let a = self.slots[part.slot as usize].as_mut().expect("running");
+            if !(a.own && part.rows > 1 && matches!(part.kind, PartKind::Window)) {
+                continue;
+            }
+            let asked = part.rows as usize - 1;
+            let end = (at + asked).min(self.output.drafts.len());
+            let drafts = &self.output.drafts[at..end];
+            let made = drafts.iter().take_while(|draft| **draft != u32::MAX).count();
+            a.draft.clear();
+            a.draft.extend_from_slice(&drafts[..made]);
+            a.own_probs.clear();
+            if reports {
+                a.own_probs.extend_from_slice(&self.output.draft_probs[at..at + made]);
+            }
+            at = end;
+            longest = longest.max(made);
+            let counters = &mut self.stats.counters;
+            counters.own_links_asked += asked as u64;
+            counters.own_links_cut += (asked - made) as u64;
+        }
+        if longest > 0 {
+            let counters = &mut self.stats.counters;
+            counters.own_draft_steps += 1;
+            counters.own_draft_links += longest as u64;
+            counters.own_draft_us += (step_ms * 1e3) as u64;
+            self.chain.observe(longest as u32, step_ms);
+        }
+        self.verify_lengths();
+        Ok(step_ms)
+    }
+
+    /// How many drafts of each chain of the model's own drafter the round
+    /// verifies, now that they are made: each draft is worth the chance that
+    /// it and the ones before it are accepted, read from the probability the
+    /// drafter gave it ([`ares_sched::Confidence`]; by its position where the
+    /// drafter says nothing), and the round takes as many as raise its rate
+    /// ([`ares_sched::choose`], with the chains paid for). The rows of the
+    /// drafts it does not take leave the step, and their cells the table.
+    fn verify_lengths(&mut self) {
+        let span = u64::from(self.span);
+        // The rows of the round that are not such windows are its rows all
+        // the same.
+        let (mut fixed, mut fixed_cells) = (0u32, 0u64);
+        let mut asking: Vec<usize> = Vec::new();
+        let mut chances: Vec<Vec<f64>> = Vec::new();
+        for (index, part) in self.parts.iter().enumerate() {
+            let a = self.slots[part.slot as usize].as_mut().expect("running");
+            if !(a.own && part.rows > 1 && matches!(part.kind, PartKind::Window)) {
+                fixed += part.rows;
+                fixed_cells += load_of(self.span, part.from, part.rows).cells;
+                continue;
+            }
+            let mut own = Vec::with_capacity(a.draft.len());
+            if a.own_probs.len() == a.draft.len() {
+                own.extend(a.own_probs.iter().map(|p| self.own_confidence.chance(*p)));
+            } else {
+                a.own_acceptance.rates(
+                    &self.own_engine,
+                    self.config.draft_prior,
+                    a.draft.len(),
+                    &mut own,
+                );
+            }
+            // A draft that a rule of the request forbids cannot be picked: it
+            // and the ones after it are not verified.
+            a.sampler.cut_drafts(&a.tokens, a.prompt_len as usize, &mut a.draft, &mut own);
+            a.own_probs.truncate(a.draft.len());
+            asking.push(index);
+            chances.push(own);
+        }
+        let offers: Vec<[Offer<'_>; 1]> =
+            chances.iter().map(|own| [Offer { drafter: OWN, chances: own }]).collect();
+        let wishes: Vec<Wish<'_>> = asking
+            .iter()
+            .zip(&offers)
+            .map(|(index, offers)| Wish { reads: self.parts[*index].from.min(span), offers })
+            .collect();
+        let step = |load: Load| {
+            self.prices.trial_ms(Load { rows: load.rows + fixed, cells: load.cells + fixed_cells })
+        };
+        let chain = |_: usize, _: u32| 0.0;
+        let spare_rows = self.model.draft_rows().saturating_sub(self.parts.len() as u32);
+        let choices = choose(&wishes, &Prices { step: &step, chain: &chain, spare_rows });
+        drop(wishes);
+        for (index, choice) in asking.into_iter().zip(choices) {
+            let part = &mut self.parts[index];
+            let a = self.slots[part.slot as usize].as_mut().expect("running");
+            let taken = (choice.drafts as usize).min(a.draft.len());
+            let dropped = part.rows as usize - 1 - taken;
+            self.stats.counters.own_drafts_unverified += (a.draft.len() - taken) as u64;
+            a.draft.truncate(taken);
+            a.own_probs.truncate(taken);
+            part.rows = 1 + taken as u32;
+            let keep = a.cells.len() - dropped as u64;
+            a.cells.truncate(&mut self.pool, keep);
+        }
+    }
+
     /// Writes the step record for the parts in `self.parts`. Returns its
-    /// length in bytes.
-    fn write_record(&mut self) -> Result<usize, String> {
+    /// length in bytes. With `drafts_only`, the record of the step that only
+    /// drafts ([`Conductor::chains_first`]): the windows whose drafts the
+    /// model's own drafter makes, as long as their chains are asked, with
+    /// their draft bars. Without, the round or the piece itself, every window
+    /// with its drafts as tokens. The commit of the step before goes with
+    /// whichever comes first.
+    fn write_record(&mut self, drafts_only: bool) -> Result<usize, String> {
         let full = |e: record::RecordFull| format!("{e}");
-        let rows: u32 = self.parts.iter().map(|p| p.rows).sum();
+        let (mut segments, mut rows) = (0u32, 0u32);
+        for part in self.parts.iter().filter(|p| !drafts_only || self.takes_own_drafts(p)) {
+            segments += 1;
+            rows += part.rows;
+        }
         let buffer = self.exec.record();
-        let mut writer = RecordWriter::new(buffer, self.step_no + 1, self.parts.len() as u32, rows)
-            .map_err(full)?;
+        let mut writer =
+            RecordWriter::new(buffer, self.step_no + 1, segments, rows).map_err(full)?;
+        if drafts_only {
+            writer.drafts_only();
+        }
         self.runs.clear();
         self.samplers.clear();
         self.step_rows.clear();
@@ -1933,6 +2085,13 @@ impl Conductor {
         let mut has_prompt = false;
         let mut has_generation = false;
         for part in &self.parts {
+            let own = drafts_only
+                && part.rows > 1
+                && matches!(part.kind, PartKind::Window)
+                && self.slots[part.slot as usize].as_ref().is_some_and(|a| a.own);
+            if drafts_only && !own {
+                continue;
+            }
             let a = self.slots[part.slot as usize].as_mut().expect("running");
             // The position of the first row.
             let first_cell = part.from as u32;
@@ -1975,31 +2134,31 @@ impl Conductor {
                     }
                 }
                 PartKind::Window | PartKind::Score { .. } => {
-                    has_generation = true;
-                    counters.window_rows += 1;
-                    counters.draft_rows += u64::from(part.rows - 1);
+                    has_generation = !drafts_only;
+                    if !drafts_only {
+                        counters.window_rows += 1;
+                        counters.draft_rows += u64::from(part.rows - 1);
+                    }
                     let newest = a.tokens.len() - 1;
                     // A window with drafts leaves recurrent state alone until
                     // the next step commits the rows that were accepted.
                     writer
                         .segment(part.slot, first_cell, part.rows, part.rows == 1)
                         .map_err(full)?;
-                    if a.own {
+                    if own {
                         // The draft rows' tokens below are placeholders: the
-                        // model's draft block writes them on the device.
+                        // model's drafter makes them.
                         writer.own_drafts().map_err(full)?;
                         let links = part.rows as usize - 1;
                         self.bars.extend(a.own_needs.iter().take(links));
                         self.bars
                             .resize(self.bars.len() + links - links.min(a.own_needs.len()), 0.0);
                     }
-                    // The model's own drafts are not known yet. A request
-                    // takes them only while no row depends on the drafts
-                    // before it as far as the host can tell (no penalties,
-                    // and a rule that leaves the first row free), so every
-                    // row is made as the first: without a mask. The commit
-                    // stops at the row a rule would have bound.
-                    let known: &[u32] = if a.own { &[] } else { &a.draft };
+                    // A link of the chain picks with the sampler row of the
+                    // row that verifies it, made as the first of the window:
+                    // without a mask for the drafts before it, which are not
+                    // known yet. The round verifies them with their masks.
+                    let known: &[u32] = if own { &[] } else { &a.draft };
                     for k in 0..part.rows as usize {
                         let row = a.sampler.row(
                             first_cell + k as u32,
@@ -2048,7 +2207,9 @@ impl Conductor {
             }
             row_index += part.rows;
         }
-        counters.rows += u64::from(row_index);
+        if !drafts_only {
+            counters.rows += u64::from(row_index);
+        }
         if has_prompt && has_generation {
             counters.mixed_steps += 1;
         }
@@ -2057,6 +2218,11 @@ impl Conductor {
         writer.masks(&self.step_rows.masks, self.mask_words).map_err(full)?;
         writer.samplers(self.samplers.iter().copied()).map_err(full)?;
         writer.commits(&self.commits).map_err(full)?;
+        if drafts_only {
+            // The devices commit these with this record: the round's must not
+            // carry them again.
+            self.commits.clear();
+        }
         // Page-table changes since the devices last saw the tables.
         for part in &self.parts {
             let a = self.slots[part.slot as usize].as_mut().expect("running");
@@ -2095,7 +2261,6 @@ impl Conductor {
     /// sequence.
     fn commit(&mut self) {
         let mut cursor = 0usize;
-        let mut draft_cursor = 0usize;
         let mut row0 = 0u32;
         self.commits.clear();
         for part in &self.parts {
@@ -2140,57 +2305,40 @@ impl Conductor {
                     // Draft `i` is accepted when it equals what the model
                     // picked after the row before it, and only if all the
                     // drafts before it were.
+                    // Every draft of the window is known: a lookup's, and of
+                    // the model's own those its chain made that the round
+                    // took. Their rows carry the masks the drafts before them
+                    // make, so every pick is the request's.
                     let drafts = part.rows as usize - 1;
-                    // The drafts that were made: all of a lookup's, and of the
-                    // model's own the links before its chain ended.
-                    let mut made = drafts;
-                    let mut probs: &[f32] = &[];
-                    if a.own {
-                        // The drafts the model made on the device came back
-                        // with the picks. A model that brings fewer than it
-                        // was asked for has none of them accepted.
-                        let end = (draft_cursor + drafts).min(self.output.drafts.len());
-                        a.draft.clear();
-                        a.draft.extend_from_slice(&self.output.drafts[draft_cursor..end]);
-                        a.draft.resize(drafts, u32::MAX);
-                        if self.output.draft_probs.len() == self.output.drafts.len() {
-                            probs = &self.output.draft_probs[draft_cursor..end];
-                        }
-                        draft_cursor = end;
-                        made = a.draft.iter().take_while(|draft| **draft != u32::MAX).count();
+                    // A row the model left without what it would have waited
+                    // for, and every row of the window after it, has no pick
+                    // that counts: the rows before it test the drafts, and the
+                    // last of them gives the token after the accepted ones.
+                    let exact = self
+                        .output
+                        .inexact
+                        .iter()
+                        .find(|row| (first_row + 1..first_row + part.rows).contains(row))
+                        .map_or(part.rows, |row| row - first_row)
+                        as usize;
+                    if exact < part.rows as usize {
+                        self.stats.counters.windows_left += 1;
                     }
+                    let made = drafts.min(a.draft.len()).min(exact);
+                    let probs: &[f32] = if a.own { &a.own_probs } else { &[] };
                     let right = (0..made).take_while(|&i| picks[i].token == a.draft[i]).count();
-                    // The rows of a window that took the model's own drafts
-                    // carry no mask, because the host did not know the drafts.
-                    // That is exact for the rows the request's rule leaves
-                    // free, and a request takes such a window only while its
-                    // first row is. When a token of the window makes the rule
-                    // bind (the tag that closes the reasoning, a trigger), the
-                    // rows after it needed a mask and their picks are not the
-                    // request's: the window gives its tokens up to and
-                    // including that one, whose row runs again with its mask.
-                    let free = match a.own {
-                        true => {
-                            a.sampler.free_rows(&a.tokens, a.prompt_len as usize, &a.draft[..right])
-                        }
-                        false => right + 1,
-                    };
-                    let accepted = right.min(free.saturating_sub(1));
+                    let accepted = right.min(exact - 1);
                     if drafts > 0 {
                         let source = usize::from(a.own);
                         if a.own {
-                            // What the rule cut off was not tested; the draft
-                            // of the token that made it bind was, and was
-                            // right.
-                            // A link the drafter did not make was no draft.
-                            let tested = made.min(free);
+                            // A draft after the first rejected one was not
+                            // tested.
+                            let tested = made.min(right + 1);
                             a.own_acceptance.observe(tested, right.min(tested));
                             self.own_engine.observe(tested, right.min(tested));
                             // What its probability said of each draft that
-                            // was made and tested.
+                            // was tested.
                             let counters = &mut self.stats.counters;
-                            counters.own_links_asked += drafts as u64;
-                            counters.own_links_cut += (drafts - made) as u64;
                             for (i, p) in probs.iter().enumerate().take(tested) {
                                 if i > right {
                                     break;
@@ -2203,21 +2351,18 @@ impl Conductor {
                         } else {
                             // The corpus learns what matches like this one
                             // are worth.
-                            a.drafter.observe(&mut self.corpus, drafts, accepted);
+                            a.drafter.observe(&mut self.corpus, made, right);
                         }
                         let counters = &mut self.stats.counters;
                         counters.draft_lengths[source][made.min(DRAFT_POSITIONS)] += 1;
                         counters.drafts_accepted += accepted as u64;
                         counters.drafts_rejected += (made - accepted) as u64;
                         // Positions up to the first rejected one were tested;
-                        // a draft the rule cut off was not rejected, and a
-                        // link that was not made was no draft.
-                        let tested =
-                            if accepted < right { accepted } else { made.min(accepted + 1) };
-                        for i in 0..tested {
+                        // a draft no exact row tested was no draft.
+                        for i in 0..made.min(right + 1) {
                             let at = i.min(counters.drafts_tested_at[source].len() - 1);
                             counters.drafts_tested_at[source][at] += 1;
-                            counters.drafts_accepted_at[source][at] += u64::from(i < accepted);
+                            counters.drafts_accepted_at[source][at] += u64::from(i < right);
                         }
                     }
                     // A proposal of the lookup that was not taken (the model's

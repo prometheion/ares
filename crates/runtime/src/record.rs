@@ -17,7 +17,7 @@
 //! | section | words | content |
 //! | --- | --- | --- |
 //! | kernel header | 8 | rows, segments, wanted rows, 0, byte offsets of segments, tokens, positions, wanted rows |
-//! | runtime header | 28 | magic, step number, counts of runs, updates, entries, commits, copies, corrections, masks and freed pages, byte offsets of the sections below, the longest segment, the longest commit, the words of a mask |
+//! | runtime header | 28 | magic, step number, counts of runs, updates, entries, commits, copies, corrections, masks and freed pages, byte offsets of the sections below, the longest segment, the longest commit, the words of a mask, the record's flags (1: drafts only) |
 //! | segments | 8 each | first row, rows, sequence slot, accepted rows, first position, flags (1: direct), 0, 0 |
 //! | tokens | 1 per row | |
 //! | positions | 4 per row | time, height, width, extra: `(p, p, p, 0)` for text |
@@ -45,9 +45,24 @@
 //!
 //! A window whose drafts the model makes itself (flag 2 of its segment) has
 //! no tokens for its draft rows when the record is written: the model's draft
-//! block picks them on the device, before the rows are embedded, and writes
-//! them into the token array of the device's copy of the record. The host
-//! reads them back with the picks.
+//! block makes them, link after link, and the host reads them back.
+//!
+//! # A step that only drafts
+//!
+//! A round in which some sequences take the model's own drafts is two
+//! records. The first is **drafts only** (flag 1 of the record): its segments
+//! are the windows whose drafts the model makes, as long as the conductor
+//! asks the chains to be at most, with the sampler rows their links pick
+//! with (link `j` with the sampler row of the window's row `j`) and the draft
+//! bars. The model makes the chains and nothing else: no row of the model
+//! runs, no logits are made, nothing is picked, and no window is left for the
+//! next record to commit. What the record carries besides (the commit of the
+//! step before, the copies, the page tables, the freed pages) is carried out
+//! as in any record. The drafts come back with their probabilities
+//! ([`StepOutput::drafts`](crate::StepOutput)). The second record is the
+//! round itself, with every window's drafts as tokens: the conductor has
+//! chosen how many rows of each chain to verify by what the drafter said of
+//! them, and the rows of the drafts it did not take are not in the step.
 //!
 //! # The prefix cache
 //!
@@ -92,9 +107,8 @@
 //! each read from the table by the probability the drafter gave it, and link
 //! `j` is made while the reach is at least the bar of its row. Link 0 has no
 //! bar. A link that is not made comes back as `u32::MAX`
-//! ([`StepOutput::drafts`](crate::StepOutput)); its row stays in the step. A
-//! record without the section, and a drafter that cannot stop, make every
-//! link.
+//! ([`StepOutput::drafts`](crate::StepOutput)). A record without the section,
+//! and a drafter that cannot stop, make every link.
 //!
 //! The *context* is a number the host derives from the sequence's tokens up to
 //! and including the row's token. A real model has no use for it (attention
@@ -146,6 +160,10 @@ const H_FREED: usize = 31;
 const H_OFF_FREED: usize = 32;
 const H_BARS: usize = 33;
 const H_OFF_BARS: usize = 34;
+const H_FLAGS: usize = 35;
+/// The record's step makes the chains of its own-draft windows and nothing
+/// else.
+const RECORD_DRAFTS_ONLY: u32 = 1;
 /// The ranges of the table of chances at the head of the draft bars.
 const BAR_CHANCES: usize = ares_sched::CONFIDENCE_BINS;
 
@@ -366,6 +384,12 @@ impl<'a> RecordWriter<'a> {
         let flags = u32::from_le_bytes([word[0], word[1], word[2], word[3]]) | FLAG_OWN_DRAFTS;
         word.copy_from_slice(&flags.to_le_bytes());
         Ok(())
+    }
+
+    /// Makes the record a step that only drafts: the model makes the chains of
+    /// its windows whose drafts it makes itself, and runs no row.
+    pub fn drafts_only(&mut self) {
+        self.header[H_FLAGS] |= RECORD_DRAFTS_ONLY;
     }
 
     /// Marks the segment written last as a replay: its rows rebuild recurrent
@@ -758,6 +782,12 @@ impl<'a> RecordView<'a> {
     pub fn own_drafts(&self, i: u32) -> bool {
         assert!(i < self.segments(), "segment {i} of {}", self.segments());
         self.word(self.header[4] as usize + i as usize * SEG_BYTES + 20) & FLAG_OWN_DRAFTS != 0
+    }
+
+    /// Whether the step only drafts: it makes the chains of its windows whose
+    /// drafts the model makes itself, and no row runs (see the module).
+    pub fn drafts_only(&self) -> bool {
+        self.header[H_FLAGS] & RECORD_DRAFTS_ONLY != 0
     }
 
     /// Whether segment `i` is a replay: its rows rebuild recurrent state from

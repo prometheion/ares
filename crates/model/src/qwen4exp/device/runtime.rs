@@ -327,7 +327,16 @@ impl Flow {
     /// `stream`): the first part to arrive begins it for the store, every
     /// part makes its stream wait for what the store removed from the tables
     /// since the step before.
-    fn begin(&self, step: u64, rows: u32, index: usize, stream: &Stream) -> Result<(), ModelError> {
+    /// `windows` are the step's windows that verify drafts, as (first row,
+    /// rows): their rows past the first never wait for the file.
+    fn begin(
+        &self,
+        step: u64,
+        rows: u32,
+        windows: &[(u32, u32)],
+        index: usize,
+        stream: &Stream,
+    ) -> Result<(), ModelError> {
         let mut feed = self.lock_feed();
         if self.begun.load(Ordering::Acquire) != step {
             for counter in self.enqueued.iter().chain(&self.followed) {
@@ -335,6 +344,7 @@ impl Flow {
             }
             self.finished.store(0, Ordering::Release);
             feed.begin_step(rows).map_err(model_error)?;
+            feed.store.set_windows(windows);
             self.begun.store(step, Ordering::Release);
         }
         feed.store.device_mut(index).fence(stream).map_err(|e| invalid(e.to_string()))
@@ -1050,6 +1060,8 @@ impl Qwen4Exp {
                 }
                 config.ram_bytes = reach;
                 config.ram_piece = self.opts.ram_piece.unwrap_or(PIECE) as u64;
+                // MEASURE-ONLY: removed before the work is handed back.
+                config.read_left = std::env::var_os("ARES_MEASURE_READ_LEFT").is_some();
                 let plan = StorePlan::new(config, &map, &reader, &layout.specs, None)
                     .map_err(|e| invalid(e.to_string()))?;
                 build.plan = Some(PlanBox { plan, map, reader, ram_start });
@@ -1543,7 +1555,14 @@ impl Qwen4ExpDevice {
         // the number, and the flags start at 0, so no step may be numbered 0
         // (the conductor's first warm-up record is).
         let number = u64::from(record.step()) + 1;
-        self.flow.begin(number, rows, self.index, stream)?;
+        // The windows whose rows past the first verify drafts; a step that
+        // only drafts runs none of the model's rows.
+        let windows: Vec<(u32, u32)> = if record.drafts_only() {
+            Vec::new()
+        } else {
+            self.segments.iter().filter(|s| !s.direct).map(|s| (s.row0, s.n_rows)).collect()
+        };
+        self.flow.begin(number, rows, &windows, self.index, stream)?;
 
         // The draft windows of the step before: how many rows count.
         if self.part.has_deferred() {
@@ -1595,6 +1614,25 @@ impl Qwen4ExpDevice {
             taken += update.count;
         }
 
+        // A step that only drafts: the chains, and nothing of the model. It
+        // leaves no window for the next record to commit.
+        if record.drafts_only() {
+            if let Some(block) = &mut self.draft {
+                let chances = record.draft_chances();
+                block.draft(
+                    stream,
+                    &self.flow,
+                    &self.segments,
+                    &mut self.tokens,
+                    &self.chains,
+                    chances.as_ref(),
+                    true,
+                )?;
+            }
+            self.windows.clear();
+            return Ok(None);
+        }
+
         // The newest cell of every sequence in the draft block and the chains
         // of the windows that take its drafts; the other device threads wait
         // for the drafts, which are rows of this step.
@@ -1607,6 +1645,7 @@ impl Qwen4ExpDevice {
                 &mut self.tokens,
                 &self.chains,
                 chances.as_ref(),
+                false,
             )?;
             let drafts: Vec<(u32, u32)> = drafted
                 .iter()
@@ -1793,6 +1832,14 @@ impl DeviceModel for Qwen4ExpDevice {
         if let Some(block) = self.draft.as_ref().filter(|block| block.drafted().is_some()) {
             out.extend_from_slice(block.probs());
         }
+    }
+
+    fn rows_not_exact(&mut self, out: &mut Vec<u32>) {
+        // The store left rows that verify drafts without an expert only the
+        // file held; every part reports what the store knows when it has
+        // ended, and the last to end knows all of it.
+        let left = self.flow.lock_feed().store.rows_left();
+        out.extend((0..32).filter(|row| left >> row & 1 != 0));
     }
 }
 

@@ -137,15 +137,43 @@ fn speculation_changes_the_number_of_steps_and_not_the_text() {
 }
 
 #[test]
+fn rows_the_model_leaves_without_an_expert_give_no_draft_and_change_no_text() {
+    // A model whose rows that verify drafts never wait for the file: some of
+    // them are left without an expert and pick something else, and say so.
+    let model = model(repeating);
+    let plain = runtime(&model, false);
+    let expected = outputs_of(&plain, 41, 6);
+    let leaving = runtime_with(&model, config(true, 4096), |e| {
+        e.with_delay(Duration::from_micros(200))
+            .leaving(|step, row| (step + u64::from(row)) % 3 == 0)
+    });
+    let before = snapshot(&leaving);
+    assert_eq!(outputs_of(&leaving, 41, 6), expected, "a left row changed the text");
+    let c = snapshot(&leaving).counters;
+    assert!(c.windows_left - before.counters.windows_left > 20, "{c:?}");
+    assert!(c.drafts_accepted - before.counters.drafts_accepted > 50, "{c:?}");
+}
+
+#[test]
 fn text_that_does_not_repeat_gets_few_drafts_accepted() {
     let model = model(never_repeating);
     let rt = runtime(&model, true);
     let before = snapshot(&rt);
     outputs_of(&rt, 5, 8);
-    let d = since(&snapshot(&rt), &before);
-    // A draft is a guess among 256 tokens: nearly all are cut again, and the
-    // planner learns to stop asking for them.
-    assert!(d["accepted"] * 20 <= d["draft_rows"].max(1), "{d:?}");
+    let after = snapshot(&rt);
+    let d = since(&after, &before);
+    let (a, b) = (&after.counters, &before.counters);
+    // The model's own draft is a guess among 256 tokens and never right: the
+    // planner learns to stop asking for it after a few windows.
+    let own_windows: u64 =
+        a.draft_lengths[1].iter().sum::<u64>() - b.draft_lengths[1].iter().sum::<u64>();
+    let own_accepted: u64 =
+        a.drafts_accepted_at[1].iter().sum::<u64>() - b.drafts_accepted_at[1].iter().sum::<u64>();
+    assert_eq!(own_accepted, 0, "{a:?}");
+    assert!(own_windows <= 20, "{own_windows} windows: {a:?}");
+    // What is accepted comes from the lookup, where the requests' texts meet,
+    // and is little of the text.
+    assert!(d["accepted"] * 20 <= d["tokens"], "{d:?}");
 }
 
 #[test]
@@ -617,6 +645,11 @@ type Steps = Arc<Mutex<Vec<Seen>>>;
 fn watch(steps: &Steps) -> impl FnMut(&ares_runtime::RecordView<'_>) + Send + 'static {
     let steps = steps.clone();
     move |record| {
+        // A step that only drafts (the chains of the model's own drafter)
+        // runs no row: the steps watched are those that do.
+        if record.drafts_only() {
+            return;
+        }
         let mut seen = Seen { rows: record.rows(), prompt_rows: 0, riders: 0, windows: 0 };
         for i in 0..record.segments() {
             let segment = record.segment(i);
@@ -1112,9 +1145,10 @@ fn the_conductor_measures_the_steps_of_an_executor_that_does_not_say_what_they_t
     for (rows, ms) in &calibration.step_ms {
         assert!(*ms >= launches_ms(*rows) - 1e-6, "{rows} rows in {ms} ms");
     }
-    // The chain's time is the executor's word, here as on a device.
+    // A chain is a step that only drafts, and is measured like any step:
+    // never shorter than the executor took for its links.
     assert!(
-        calibration.chain_ms.iter().all(|(links, ms)| (ms / f64::from(*links) - 0.3).abs() < 1e-9),
+        calibration.chain_ms.iter().all(|(links, ms)| *ms >= 0.3 * f64::from(*links) - 1e-6),
         "{:?}",
         calibration.chain_ms
     );

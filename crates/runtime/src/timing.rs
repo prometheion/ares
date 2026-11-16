@@ -266,10 +266,17 @@ pub struct Counters {
     pub own_draft_steps: u64,
     pub own_draft_links: u64,
     pub own_draft_us: u64,
-    /// Links the windows asked the model's own draft block for, and the links
-    /// it did not make of them because it ended a chain at its bar.
+    /// Links the windows asked the model's own draft block for, the links it
+    /// did not make of them because it ended a chain at its bar, and the
+    /// drafts it made that the round did not verify (the conductor took fewer
+    /// by what the drafter said of them).
     pub own_links_asked: u64,
     pub own_links_cut: u64,
+    pub own_drafts_unverified: u64,
+    /// Windows a row of which the model left without what it would have
+    /// waited for (an expert only the file held): their drafts from that row
+    /// on were not accepted.
+    pub windows_left: u64,
     /// The model's own drafts that were verified, by the probability the
     /// drafter gave them (the ranges of [`ares_sched::Confidence`]), and how
     /// many of them were accepted.

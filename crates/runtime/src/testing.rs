@@ -163,6 +163,11 @@ pub struct HostExecutor {
     problems: Problems,
     /// The books of the page-locked RAM the checkpoint places lie in.
     ram: Option<PinnedRam>,
+    /// Which rows of a window (by step number and row) the model leaves
+    /// without what it would have waited for, and the rows of the step that
+    /// was dispatched that are not exact for it.
+    leaving: Option<Box<dyn Fn(u64, u32) -> bool + Send>>,
+    inexact: Vec<u32>,
 }
 
 impl std::fmt::Debug for HostExecutor {
@@ -215,6 +220,8 @@ impl HostExecutor {
             oracle: None,
             problems: Arc::default(),
             ram: None,
+            leaving: None,
+            inexact: Vec::new(),
         }
     }
 
@@ -314,6 +321,17 @@ impl HostExecutor {
         self
     }
 
+    /// Leaves rows of windows without what they would have waited for, as a
+    /// model does whose rows that verify drafts never wait for the file:
+    /// `left(step, row)` names them. Such a row (past the first of a window)
+    /// and every row of its window after it pick another token than the
+    /// model's, and the executor says that they are not exact
+    /// ([`StepOutput::inexact`]).
+    pub fn leaving(mut self, left: impl Fn(u64, u32) -> bool + Send + 'static) -> Self {
+        self.leaving = Some(Box::new(left));
+        self
+    }
+
     /// Makes the step with this number fail, as a device error would.
     pub fn failing_at(mut self, step: u64) -> Self {
         self.fail_at_step = Some(step);
@@ -342,9 +360,8 @@ impl Executor for HostExecutor {
     fn dispatch(&mut self, meta: &StepMeta) -> Result<(), ExecError> {
         let broken =
             |e: crate::record::RecordError| ExecError::Device { device: 0, message: e.to_string() };
-        // The model's own drafts: the device fills in the draft rows of the
-        // windows that take them before the blocks read them, and hands the
-        // drafts back with the picks.
+        // The model's own drafts: a step that only drafts makes the chains of
+        // the windows that take them and hands the drafts back.
         self.drafts.clear();
         self.draft_probs.clear();
         let mut longest = 0;
@@ -401,10 +418,12 @@ impl Executor for HostExecutor {
             observer(&view);
         }
         self.failing = self.fail_at_step == Some(meta.step);
+        // A step that only drafts runs no row: it takes its chain.
         self.step_delay = draft_time
-            + match &self.step_cost {
-                Some(cost) => cost(view.rows()),
-                None => self.delay,
+            + match (&self.step_cost, view.drafts_only()) {
+                (_, true) => Duration::ZERO,
+                (Some(cost), false) => cost(view.rows()),
+                (None, false) => self.delay,
             };
         self.picks.clear();
         let mut tables = self.tables.lock().expect("tables");
@@ -431,6 +450,7 @@ impl Executor for HostExecutor {
                     &self.problems,
                 )
             }
+            None if view.drafts_only() => {}
             None => {
                 if self.model.config().prefix_cache.is_some() {
                     return Err(ExecError::Device {
@@ -452,6 +472,32 @@ impl Executor for HostExecutor {
         }
         drop(tables);
         Self::apply_masks(&view, &mut self.picks, self.model.config().vocab());
+        // Rows the model left: from the first in a window on, another token.
+        self.inexact.clear();
+        if let Some(left) = &self.leaving {
+            let mut pick_of = std::collections::HashMap::new();
+            for run in 0..view.runs() {
+                let (first, count) = view.run(run);
+                for row in first..first + count {
+                    pick_of.insert(row, pick_of.len());
+                }
+            }
+            let vocab = self.model.config().vocab();
+            for i in 0..view.segments() {
+                let segment = view.segment(i);
+                let rows = segment.row0 + 1..segment.row0 + segment.n_rows;
+                if segment.direct || view.drafts_only() {
+                    continue;
+                }
+                let Some(first) = rows.clone().find(|row| left(meta.step, *row)) else { continue };
+                for row in first..segment.row0 + segment.n_rows {
+                    self.inexact.push(row);
+                    if let Some(pick) = pick_of.get(&row).and_then(|at| self.picks.get_mut(*at)) {
+                        pick.token = (pick.token + 1) % vocab;
+                    }
+                }
+            }
+        }
         self.dispatched_at = Instant::now();
         Ok(())
     }
@@ -480,6 +526,8 @@ impl Executor for HostExecutor {
         out.draft_probs.clear();
         out.draft_probs.extend_from_slice(&self.draft_probs);
         out.draft_ms = self.draft_ms;
+        out.inexact.clear();
+        out.inexact.extend_from_slice(&self.inexact);
         // A step that was given a cost took exactly that, whatever the clock
         // says; one that was given none is the conductor's to measure.
         let priced = self.step_cost.is_some() || !self.delay.is_zero();
@@ -912,6 +960,11 @@ impl Oracle {
                     ));
                 }
             }
+        }
+
+        // A step that only drafts runs no row and leaves no window.
+        if view.drafts_only() {
+            return;
         }
 
         // The rows.
