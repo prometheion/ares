@@ -15,7 +15,6 @@ Order of work the owner has set: CUDA complete for both models first, Vulkan par
 | Piece | State |
 | --- | --- |
 | Speculation that pays on Flash-Next: prices that follow the tiers (built), rows of unmade links leave the step, the draft block's experts resident, no window row waits for a file read; built in the conductor and the expert store, not in one model | agent working (branch `sched/live-prices`) |
-| Expert usage profile in place of the warm-up text, idle fill of the tiers | agent working (`moe/expert-profile`) |
 | RAM level of the prompt cache, written to the SSD only when evicted, at unload and at a stop | agent working (`cache/ram-level`) |
 | Shared model layer, steps 0 to 3 (see below); step 3 brings Flash-Next K and V in `q7` to `q4` | agent working (`model/shared-blocks`) |
 | Test files: `Qwen3.8-Flash-Next-UD-Q4_K_XL` (104 GiB), then Flash-Next's DFlash2 drafter (3.1 GiB) | downloading to `/mnt/data/ares-models`, 6 MB/s |
@@ -60,9 +59,25 @@ with it; the runs are too noisy to tell the two apart.
 - [ ] `--drafters mtp` for a model file that carries its block; drafts in the measuring tool.
 
 ### Experts from the SSD
-- [ ] Usage profile: the server keeps its expert heat in a file, loads it at start in place
-      of the canned warm-up text (41 to 44 s at every start), keeps it current, and fills
-      empty slots from it when idle.
+- [x] Usage profile: the server keeps its expert heat in a file, loads it at start in place
+      of the canned warm-up text, keeps it current, and fills empty slots from it when idle
+      (branch `moe/expert-profile`). Measured 2026-11-16: the first requests after a start from
+      a profile of use miss as few experts as a warm server's (2.7 to 4.5 reads from the file
+      per step against 6 to 15.6 after the warm-up); the fill takes 12.6 to 13.1 s on one card
+      (warm-up 25 to 32 s) but 20 to 24 s on two (warm-up 21.6 to 27.8 s, no longer 41 to 44):
+      both read 20 to 25 GiB and are bound by the drive.
+- [ ] A start on two cards that is much faster than the warm-up: reads of several neighbouring
+      experts at once into a buffer (the sorted single reads reach 1.25 GiB/s where random ones
+      reach 0.7 to 0.8; the gain of larger ones could not be measured on the shared drive), or
+      answering once VRAM is filled and filling the RAM tier behind it until the first request
+      (which then misses what RAM would have held).
+- [ ] The draft block's experts in the usage profile (they are filled in the order of their
+      numbers at the start, as before).
+- [ ] The slots per layer from the profile when the store is planned (`StorePlan::new` takes
+      a heat; the runtime passes none, and the slots move between layers by need as it runs).
+- [ ] The heat counts the steps that measure the price of a step at the start (token 0, about a
+      thousand rows); the server's start drops it (`Qwen4Exp::serving`), the runtime itself
+      still counts it for a model without a profile.
 - [ ] Prediction on the device: the routers of the next two layers applied to the current
       state in the router's own launch; read-ahead in chunks of 512 KiB, at most two while
       a demand read runs. (A first attempt with the prediction on the host was rejected:

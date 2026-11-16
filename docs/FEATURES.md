@@ -35,6 +35,8 @@ the kernels exist; no model runs there yet.
   share named. Below it the engine follows the machine: when other programs need memory it
   gives page-locked memory back between steps (checkpoints first, the expert tier last) and
   takes it again when the memory is free; the reserve it keeps is derived, not fixed.
+- Flash-Next: a usage profile of the experts (in the `--cache` directory, else `~/.cache/ares`)
+  fills the tiers at the start in place of the warm-up text, and their empty slots while idle.
 
 ## Sampling
 - Temperature and dynamic temperature, top-k, top-p, min-p, typical, top-n-sigma, XTC,

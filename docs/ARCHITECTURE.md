@@ -1764,11 +1764,13 @@ reference for this part. It is the next piece of `ares-state` (residency of
 pages) and comes with the runtime.
 
 - **MoE tiers.** Experts live on VRAM, pinned RAM or SSD. `ExpertHeat` counts
-  routed picks with decay (seeded from a routing profile when one ships with
-  the model); a `SlotSet` per layer and tier elects the hottest experts and
-  re-elects every few tokens with a margin against thrashing and a cap on
-  swaps. A swap hides the evicted expert at once and shows the new one when
-  its data has arrived. On a synthetic workload whose topic changes every 500
+  routed picks with decay (seeded from the usage profile an earlier run of the
+  model wrote, which also fills the tiers at the start and, while nothing runs,
+  their empty slots: see "The usage profile of the experts" under
+  "Qwen3.8-Flash-Next through the runtime"); a `SlotSet` per layer and tier
+  elects the hottest experts and re-elects every few tokens with a margin
+  against thrashing and a cap on swaps. A swap hides the evicted expert at once
+  and shows the new one when its data has arrived. On a synthetic workload whose topic changes every 500
   tokens, re-election serves 79 % of the picks from a tier of a quarter of the
   experts where a tier filled once serves 29 %.
 - **Dynamic expert pruning.** `SlotSet::write_route_bias` turns a tier into a
@@ -3525,7 +3527,8 @@ first card and 0.4 on the second, 13 824 expert slots, 5 808 and 8 016, are 56 %
 of the experts, K and V are 13.9 MiB per 1000 tokens, 18 432 tokens in all) and
 10.6 to 11.9 GB of RAM (10.2 GiB of them the tier of 7 488 slots, 30 % of the
 experts), so 87 % of the experts have a slot. Starting takes 11 to 15 s to load and 41 to 44 s
-for the warm-up; the first request after a start without the warm-up took 77
+for the warm-up (20 to 32 s on 2026-11-16, and a start from a usage profile fills the tiers
+instead: see "The usage profile of the experts" below); the first request after a start without the warm-up took 77
 s for a prompt of 1000 tokens (13 tokens/s), with it 13 to 23 s in four
 sessions and 53 s in one at a load of 15 to 18; a text the warm-up did not
 resemble keeps being slow until its experts have slots.
@@ -3578,6 +3581,124 @@ default limit (half of the RAM the machine has available when the server
 starts) and 22 GiB available, 10.9 GiB, 7 970 experts. Before this change the
 tier was a third of the available RAM, at most 8 GiB, whatever the RAM limit
 said, and the page-locked buffers of the parts were outside the books.
+
+**The usage profile of the experts.** The tiers start empty, and what they learn
+while the model serves, the store's heat, went with the model. A start filled
+them by reading a text of German, English and code (41 to 44 s on 2026-11-11, 20
+to 32 s on 2026-11-16), and the first texts unlike it waited for the drive. Now the heat outlives the
+model, as Strata's `expert_profile_save` and Run My AI's table of usage do
+(`expert_store/profile.rs`, `expert_store/fill.rs`, `qwen4exp/device/usage.rs`):
+
+- *What it is.* The heat of every expert of every layer of the model as the store
+  has it: one for every pick, the counts of a wide step's rows, times 0.9 every 32
+  steps and nothing while idle, so a count in which recent picks weigh more (half of
+  it is from the last 210 steps or so; the ratios survive the decay, so it ranks by
+  the whole history). It is per layer of the model and expert, whatever the
+  placement: with both cards on every layer an expert's heat is the larger of the
+  two halves of the store's layer (a decode step counts an expert on its owner's
+  half, a wide step on both), and it is seeded on its owner's half. The draft
+  block's experts are not in it.
+- *Where.* A file of 96 KiB for Flash-Next (`<fingerprint>.experts`) in the
+  `--cache` directory when one is named (a file next to the prompt cache's stores,
+  which are directories) and else in the user's cache directory
+  (`$XDG_CACHE_HOME/ares`, `~/.cache/ares`); no option of its own. The name is a
+  fingerprint of the model's files (size, header and samples, as the prompt cache's
+  store has it) and of the shape of its experts; the file says again what it was
+  made for and ends in a checksum, so a profile of another file, a damaged one or
+  one of another format is ignored and the log says which (`Ignored`). It is
+  written through a temporary file in the same directory, made durable and renamed
+  over the old one: a reader finds the old profile or the new one, whole.
+- *When it is written.* Right after the warm-up of a start that had none; once a
+  minute while steps run (a thread of the model, `ares-expert-usage`, compares the
+  store's count of steps with the one of the last write); and when the model is
+  dropped, at an unload and at a clean stop.
+- *The start* (`Qwen4Exp::serving`, which the server calls where it read the
+  warm-up text, after the runtime measured the price of a step): the heat becomes
+  the profile's, so that the steps of the measurement, which route token 0 a
+  thousand times, do not enter it, and the tiers are filled from it
+  (`ExpertStore::plan_fill`, `advance_fill`). For every layer: the hottest experts
+  VRAM has room for, and behind them the next hottest as far as the RAM tier has
+  room. Room is a free slot or a member worth nothing there: in VRAM one without heat
+  (the measurement's steps leave some 2 900 of them on two cards), in RAM also a copy
+  of an expert VRAM holds; nothing that is worth something is evicted for a fill, and
+  nothing without heat is brought. The experts are read layer by layer in the order
+  of the file, in each layer those for VRAM before those for RAM (the ones for VRAM
+  pass through RAM slots, which those for RAM would otherwise have taken first), each
+  group as it lies in the layer's tensors, 32 at a time as demand reads (three reads
+  of about 0.5 MiB each), each into its RAM slot and the ones for VRAM from there into
+  their VRAM slot, the table entry behind the bytes, after which the copy in RAM is the
+  first to give way. A filled expert is a member worth its heat, not a guess that
+  nobody used. The store's lock is let go between the turns, so the watch of the
+  machine's memory can shrink the tier meanwhile. Without a profile the start reads
+  the warm-up text as before and writes the profile at once.
+- *While nothing runs* (no step for a second): the same thread fills what is empty,
+  VRAM's free slots and the RAM tier's room, from the heat, those for VRAM first and
+  the hottest first over all layers, two experts at a time as prefetches (which the
+  reader keeps behind every demand read: a demand read waits at most for the four
+  chunks of 512 KiB a drive takes of prefetches, see `ares_io::Config`) and one upload
+  per device. A step that begins stops it at once: the store does nothing of a fill
+  while a step runs, what is on its way takes its slot when it arrives, and the plan
+  is made again when the engine is idle the next time. It follows the elastic tier:
+  it reads only into the slots the tier holds now, and into nothing while the tier
+  gives memory back or holds more than it may (the reads it has on their way then
+  are all a release waits for), and the pieces the tier takes again are filled.
+
+*Measured* (2026-11-16, RTX 4070 and RTX 3060, `--ram 8G`, `--chat-var
+enable_thinking=false`; the server of before, bc26683, and the one with the profile started
+one after the other; three questions of 35 to 44 tokens, German, English and code, 128 tokens
+each, greedy, sent as soon as the server answered, then the same three again. "Profile of the
+warm-up" is the one a start without a profile writes right after its warm-up, so both start
+from the same text; "profile after use" is the one such a server wrote at its stop after the
+six requests. The drive was shared with other agents' builds and runs the whole time and gave
+random reads of experts 0.2 to 1.0 GB/s against 1.3 to 1.7 when quiet, which decides every
+phase of a start that reads, and the load fell during the series, so the runs of before had
+the higher load in the first pairs):
+
+| Cards | Server | Warm-up, or fill from the profile | Answers after | First round, tokens/s: German / English / code | Reads from the file per step, first round | Second round, tokens/s | Load average |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| two | before | warm-up 27.6 s (25.7 GiB read since the start) | 68.2 s | 11.6 / 8.8 / 8.2 | 10.8 / 7.3 / 15.6 | 14.1 / 12.4 / 10.5 | 25 |
+| two | profile of the warm-up | 20.2 s, 11 303 into VRAM and 3 947 into RAM, 20.6 GiB | 35.5 s | 21.5 / 27.0 / 19.7 | 12.9 / 8.8 / 15.1 | 20.3 / 16.8 / 8.2 | 12 |
+| two | before | warm-up 27.8 s (25.0 GiB) | 96.8 s | 11.9 / 12.1 / 5.8 | 11.1 / 7.5 / 15.5 | 15.3 / 14.3 / 9.7 | 24 to 29 |
+| two | profile of the warm-up | 21.8 s, 20.6 GiB | 38.8 s | 26.6 / 31.5 / 16.2 | 11.7 / 6.6 / 15.1 | 35.1 / 43.0 / 27.8 | 8 |
+| two | profile after use | 23.8 s, 10 795 and 5 420, 21.9 GiB | 42.9 s | 29.3 / 31.2 / 25.8 | 2.9 / 2.7 / 4.5 | 36.4 / 28.3 / 19.7 | 14 |
+| two | before | warm-up 21.6 s (25.0 GiB) | 39.9 s | 27.7 / 31.1 / 17.2 | 11.4 / 6.0 / 15.1 | 31.8 / 40.0 / 22.6 | 9 to 10 |
+| two | profile after use | 23.0 s, 22.0 GiB | 38.9 s | 32.3 / 37.7 / 31.5 | 3.9 / 3.1 / 4.5 | 41.1 / 39.4 / 34.3 | 6 |
+| one (RTX 4070) | before | warm-up 31.9 s (29.1 GiB) | 40.5 s | 5.7 / 7.3 / 5.3 | 70 / 68 / 101 | 10.2 / 9.6 / 6.2 | 8 to 12 |
+| one | profile of the warm-up | 12.6 s, 3 064 and 5 231, 11.2 GiB | 27.8 s | 7.1 / 7.3 / 4.4 | 58 / 55 / 100 | 7.1 / 8.3 / 5.4 | 16 |
+| one | before | warm-up 25.0 s (27.3 GiB) | 39.4 s | 7.7 / 6.9 / 4.0 | 71 / 79 / 99 | 4.9 / 10.2 / 2.0 | 14 to 17 |
+| one | profile of the warm-up | 13.1 s, 11.2 GiB | 21.7 s | 11.0 / 10.4 / 6.3 | 56 / 59 / 97 | 13.6 / 16.0 / 7.5 | 6 to 8 |
+
+- *The start.* What changed is the warm-up against the fill; loading the weights and measuring
+  the price of a step, the same in both, took 15 to 69 s by what the drive gave. On one card the
+  fill took 12.6 and 13.1 s against a warm-up of 31.9 and 25.0 s (VRAM holds 5 040 experts there,
+  so it reads 11.2 GiB). On two cards it took 20 to 24 s against 21.6 to 27.8 s: it reads 20.6 to
+  22 GiB, about as much as the warm-up does (25 GiB with the price measurement), and both are
+  bound by the drive; at a load of 3 to 7 the engine's own test of the real file took 20.7 s for
+  the warm-up and 17.0 s for the fill (21.3 GiB, 1.25 GiB/s). The warm-up is not the 41 to 44 s
+  of 2026-11-11 any more, so on two cards a start from the profile is as fast as one with the
+  warm-up, not much faster.
+- *The first requests* after a start from a profile of what the server was used for missed 2.7 to
+  4.5 experts per step from the file, as a warm server does in its second round (2.5 to 6.9),
+  where a start with the warm-up missed 6.0 to 15.6, and generated at 26 to 38 tokens per
+  second, the second round's speed. With the profile of the warm-up they missed what the
+  warm-up start misses, as they should; the speeds of the first pairs differ by the load more
+  than by anything else.
+- *The reads.* Sorted by their place in the file the fill's reads reached 1.25 GiB/s where
+  random reads of experts reached 0.67 to 0.80 GiB/s on the same drive in the same hour.
+  Reads of several neighbouring experts at once (into a buffer, copied into their slots) are
+  not built; how much more they would give on this drive could not be measured, as the drive
+  was never quiet.
+- *The idle fill* (two cards, a start without a profile, nothing asked for 90 s, the tiers'
+  gauges every half second): the warm-up left 13 328 of 13 344 VRAM slots and 4 573 of 5 568 RAM
+  slots with experts; a second after the start the idle fill began and had the RAM tier at 5 558
+  after 5.5 s (2.4 GiB read, 0.43 GiB/s at two experts in flight), a short request at 6 s
+  stopped it (its first token after 1.2 s, the request a new text with 74 reads from the file per
+  step), and a second after the request it went on and had both tiers full at 11.4 s (2.5 GiB
+  read by the fill in all). What a request that arrives finds on its way is at most two
+  experts' reads, as prefetches that the reader keeps behind its demand reads (at most four
+  chunks of 512 KiB at the drive), and an upload per device; that bound is the store's
+  (`tests/expert_fill.rs`) and was not resolved by a measurement here, whose times are those of
+  the request's own misses.
 
 **What the gap between 17 and 22 ms is made of, and what the size of the tier
 did.** The tool counts, for every decode step at 1000 tokens, the experts the
@@ -4261,7 +4382,9 @@ look by look. The users:
   begins meanwhile. When the allowance rises, a piece is locked at the end
   of every step (that step ends 30 to 70 ms later), or by the watch for 40
   ms at a time while nothing runs, and its slots come back empty; they fill
-  from what the routers pick. The piece that holds staging is never given
+  from what the routers pick, and from the heat while nothing runs (see "The
+  usage profile of the experts"), which reads nothing into the tier while it
+  holds more than it may. The piece that holds staging is never given
   up, and the tier says so when it can give no more;
 - the checkpoints of recurrent state of the prefix cache, which a device
   part locks in chunks of at least 32 MiB when a place is first used
@@ -4450,7 +4573,9 @@ engine. What that needs:
   when one is first used, not in the background; see "Host memory".)
 - **Unloading frees and returns.** Nothing is written at unload beyond what
   was already queued for the drive: state on SSD is written as it is
-  produced (see "On SSD" under "Sequence state"). With `--cache` a model that
+  produced (see "On SSD" under "Sequence state"), and a mixture of experts
+  writes the usage profile of its experts (96 KiB for Flash-Next) if steps
+  ran since it last did. With `--cache` a model that
   is loaded again finds its conversations in its store; without it the
   prefix cache of a model goes with it. The
   unload ends the engine's requests, joins its threads, drops the engine and
