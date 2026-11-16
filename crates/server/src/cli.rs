@@ -62,30 +62,33 @@ OPTIONS:
                                part of it, and a model without one takes what is
                                left. What the engine needs to run is taken from it
                                first (with --cache that includes one checkpoint and
-                               the buffers state passes through on its way to the
-                               drive and back); the rest is for the experts of a
-                               mixture of experts that have no slot in VRAM, and
-                               for the checkpoints of recurrent state that let a
-                               conversation continue from what was computed. Below
-                               the limit the engine holds what the machine has
-                               available less a small headroom, and gives memory
-                               back when other programs need it [default: all the
+                               the pages and checkpoints state passes through on its
+                               way to the drive and back); the rest is for the
+                               experts of a mixture of experts that have no slot in
+                               VRAM, and then for the prompt cache in RAM: the K and
+                               V that left the devices and the checkpoints of
+                               recurrent state that let a conversation continue
+                               from what was computed. Below the limit the engine
+                               holds what the machine has available less a small
+                               headroom, and gives memory back when other programs
+                               need it, the prompt cache first [default: all the
                                machine has]
 
-    Prompt cache on SSD.
+    Prompt cache on SSD, below the one in RAM.
         --cache <DIR>          A directory in which the engine keeps the state of
                                what it has computed (K and V, and checkpoints of
                                recurrent state), so that a prompt that starts with
-                               it resumes from there after the state has left the
-                               devices, after the model was unloaded and after a
-                               restart. Texts of 2048 tokens and more are written,
-                               as they are computed; a store fits one model file
-                               with its formats and split, and the directory may
-                               be shared by all models. A mixture of experts keeps
-                               the usage profile of its experts there, which fills
-                               its tiers at the next start [default: none, and
-                               nothing is written; the profiles are then kept in
-                               ~/.cache/ares]
+                               it resumes from there after the state has left RAM,
+                               after the model was unloaded and after a restart.
+                               Texts of 2048 tokens and more are written when they
+                               leave RAM, and what RAM and the devices hold when
+                               the model is unloaded or the server stops; a store
+                               fits one model file with its formats and split, and
+                               the directory may be shared by all models. A
+                               mixture of experts keeps the usage profile of its
+                               experts there, which fills its tiers at the next
+                               start [default: none, and nothing is written; the
+                               profiles are then kept in ~/.cache/ares]
         --cache-size <SIZE>    The most that directory may take, such as 64G; what
                                was used least recently goes first [default: 32G]
 

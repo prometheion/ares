@@ -1151,11 +1151,11 @@ fn load_qwen35(
     // it first: its step buffers and, where the token embedding table lies in
     // host memory, the table and the rows of a step. A limit below that is
     // refused: the table does not go back to a device, whose memory is what
-    // bounds the context. The rest is the budget of the checkpoints of
-    // recurrent state (the only other user in a model without experts),
-    // which are locked as they come into use, as far as the machine has the
-    // memory, and given back when it gets short. The prompt cache on SSD
-    // adds two needs of its own, below.
+    // bounds the context. The rest is the prompt cache's in RAM (the only
+    // other user in a model without experts): checkpoints of recurrent state
+    // and the pages that left the devices, locked as they come into use, as
+    // far as the machine has the memory, and given back when it gets short.
+    // The prompt cache on SSD adds two needs of its own, below.
     let required = required_ram(&*model, parallel);
     let table = model.pinned_ram();
     let mut needs = vec![("its step buffers", required - table)];
@@ -1167,33 +1167,37 @@ fn load_qwen35(
         ));
     }
     let checkpoint = model.prefix_cache().map_or(0, |cache| cache.bytes());
-    // The prompt cache on SSD moves a checkpoint through a place in RAM, on
-    // its way to the drive and back: with a directory for it, one place is
-    // what the engine needs, whatever else the limit leaves for checkpoints
-    // and whatever the machine has (the cache's floor in the engine's books).
-    // And it moves pages and checkpoints through buffers of ordinary memory,
-    // which the engine holds once they are in use: they are not page-locked,
-    // so they are not in those books, and they count against the limit here.
+    // The prompt cache on SSD moves state through RAM on its way to the
+    // drive and back: with a directory for it, one checkpoint place and a
+    // few pages are what the engine needs, whatever else the limit leaves
+    // for the prompt cache and whatever the machine has (the cache's floor
+    // in the engine's books). And it copies checkpoints out of their places
+    // into buffers of ordinary memory, which the engine holds once they are
+    // in use: they are not page-locked, so they are not in those books, and
+    // they count against the limit here.
     let ssd = options.cache.as_ref().map(|dir| {
         SsdConfig::new(dir, options.cache_size.unwrap_or(crate::plan::DEFAULT_CACHE_SIZE))
     });
     let durable = ssd.as_ref().and_then(|_| model.durable(CELLS_PER_PAGE));
     let transit = durable.as_ref().map_or(0, SsdConfig::transit_ram);
-    let through = durable.is_some() && checkpoint > 0;
+    let floor = durable.as_ref().map_or(0, |durable| SsdConfig::floor_ram(durable, checkpoint));
+    let through = floor > 0;
     if through {
         needs.push((
-            "one checkpoint of recurrent state on its way to the prompt cache on SSD or back",
-            checkpoint,
+            "one checkpoint of recurrent state and the pages on their way to the prompt cache \
+             on SSD or back (page-locked)",
+            floor,
         ));
     }
     if transit > 0 {
         needs.push((
-            "the pages and checkpoints in transit to the prompt cache on SSD and back, at \
-             their most (ordinary memory, taken as it is first used)",
+            "the checkpoints in transit to the prompt cache on SSD and back, at their most \
+             (ordinary memory, taken as it is first used)",
             transit,
         ));
     }
-    let (ram, why_ram) = ram_limit_of(options, site, &needs, "none is spared for checkpoints")?;
+    let (ram, why_ram) =
+        ram_limit_of(options, site, &needs, "none is spared for the prompt cache in RAM")?;
     // What the engine may page-lock: the limit less the buffers in transit.
     let lockable = ram - transit;
     let runtime_config = RuntimeConfig {
@@ -1212,9 +1216,10 @@ fn load_qwen35(
     };
     tracing::info!(
         "plan: RAM, at most {} for the engine ({why_ram}): {} for its step buffers{}{}, the \
-         rest for checkpoints of recurrent state, {} each over all devices, {}; the memory is \
-         page-locked as checkpoints are taken, and the coldest checkpoints are given up when \
-         the machine needs it{}",
+         rest for the prompt cache in RAM, the pages that left the devices and checkpoints of \
+         recurrent state, {} each over all devices, {}; the memory is page-locked as pages \
+         leave the devices and checkpoints are taken, and the coldest are given up when the \
+         machine needs it{}",
         Bytes(ram),
         Bytes(required - table),
         match table {
@@ -1227,8 +1232,8 @@ fn load_qwen35(
         match transit {
             0 => String::new(),
             bytes => format!(
-                ", at most {} for pages and checkpoints in transit between the devices and \
-                 the prompt cache's store on SSD (ordinary memory, taken as it is first used)",
+                ", at most {} for checkpoints in transit between RAM and the prompt cache's \
+                 store on SSD (ordinary memory, taken as it is first used)",
                 Bytes(bytes)
             ),
         },
@@ -1238,10 +1243,14 @@ fn load_qwen35(
             bytes => format!("room for {}", (lockable - required) / bytes),
         },
         match through {
-            true =>
-                ", down to the one that checkpoints pass through on their way to the prompt \
-                 cache's store on SSD and back: that place is kept whatever the machine has",
-            false => "",
+            true => format!(
+                ", down to {} that state passes through on its way to the prompt cache's store \
+                 on SSD and back, a checkpoint place and pages, which are kept whatever the \
+                 machine has; only what leaves RAM is written there, and what is worth keeping \
+                 when the model is unloaded",
+                Bytes(floor)
+            ),
+            false => String::new(),
         }
     );
     tracing::info!("loading the weights");

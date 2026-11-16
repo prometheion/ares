@@ -14,7 +14,7 @@ the kernels exist; no model runs there yet.
 | K and V | `f16`, `q8` to `q4`, chosen separately (`--kv`) | `f16` or `q8` (default `q8`); `q7` to `q4` are refused |
 | Larger than VRAM | no | experts in VRAM slots, a RAM tier and on the SSD; the CPU computes missed ones |
 | Own drafts (MTP) | draft block in the file, with a draft vocabulary | draft block from a file (`--drafters <file>`); exact, no gain yet |
-| Prefix cache | yes, with the SSD level | no |
+| Prefix cache | yes, with the RAM and SSD levels | no |
 
 ## Speed
 - Speculative decoding: the model's own drafts and a lookup in earlier text; window length
@@ -29,8 +29,11 @@ the kernels exist; no model runs there yet.
 
 ## Caches and memory
 - Prefix cache (27B): automatic, shared by all requests; checkpoints of the recurrent state.
-- Prompt cache on SSD: `--cache <DIR>`, `--cache-size` (default 32G). A conversation resumes
-  after its state left the cards, after an unload and after a restart.
+- Prompt cache in RAM (27B): what leaves the cards is kept in page-locked RAM inside `--ram`,
+  the lowest user of it, and comes back from there; elastic, without a flag.
+- Prompt cache on SSD: `--cache <DIR>`, `--cache-size` (default 32G), below RAM. Only what
+  leaves RAM is written, and what is worth keeping at an unload or a stop; a conversation
+  resumes after an unload and after a restart.
 - `--ram`: one limit for all page-locked host memory; too small a limit is refused with every
   share named. Below it the engine follows the machine: when other programs need memory it
   gives page-locked memory back between steps (checkpoints first, the expert tier last) and

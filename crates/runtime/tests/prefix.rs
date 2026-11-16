@@ -514,7 +514,7 @@ fn rejected_drafts_inside_a_tail_are_cut_and_the_next_turn_takes_exactly_what_wa
 }
 
 #[test]
-fn eviction_under_page_pressure_and_a_small_cache_ram_keeps_every_answer_equal() {
+fn eviction_under_page_pressure_and_a_small_budget_of_ram_keeps_every_answer_equal() {
     let mut rng = Rng(21);
     let model = model(Some(CHECKPOINT), |c| c.context_length = 256);
     // 30 pages of 16 cells, and room for 3 checkpoints.

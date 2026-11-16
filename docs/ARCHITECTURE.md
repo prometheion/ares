@@ -418,8 +418,9 @@ one array per part, indexed by page number.
   can only be resumed where a copy of it was kept, and a copy is large (75
   MiB as `f16` for Qwen3.8-27B), so `CheckpointPolicy` decides where copies
   go and which are dropped. The conductor keeps them as places within a budget
-  of bytes (`RuntimeConfig::checkpoint_budget`); the copies themselves are the
-  device's part (`qwen35` does them, see below). The state is `f32` today: 150
+  of bytes (`RuntimeConfig::cache_ram`, which the pages in RAM share); the
+  copies themselves are the device's part (`qwen35` does them, see below).
+  The state is `f32` today: 150
   MiB for Qwen3.8-27B over both cards (94 and 56 MiB at shares of 0.625 /
   0.375), plus 20 KiB for the draft block's carry.
   - Where: only at page boundaries and at the end of a tail. Inside a prompt
@@ -703,15 +704,76 @@ crossing, and lets a prefix shared by many rows of a step be attended to
 once. A plain f32 implementation agrees with the reference to 2e-6; the
 tolerance for kernels is ten times that.
 
-**On SSD.** The prefix cache has a level on SSD (`ares --cache <dir>`;
-`crates/runtime/src/cache/ssd.rs` over `ares-store`). What a sequence
-computes is written to a store as it is computed, and a prompt whose start is
-in the store and not in the devices has it brought back before it starts. A
-conversation therefore resumes after its pages left the devices, after its
-model was unloaded (router mode), and after a restart of the server. A model
-takes part when its device side moves state to the host and back
-(`Model::durable`, `DeviceModel::transfer`); `qwen35` does, `qwen4exp` has no
-prefix cache yet.
+**In RAM.** The prefix cache has a level in host memory below the devices,
+with or without a level on SSD under it, for every model whose device side
+moves its state to the host and back (`Model::durable`,
+`DeviceModel::transfer`; `qwen35` does, `qwen4exp` has no prefix cache yet).
+The levels are the devices, RAM and the drive, as in the owner's llama.cpp
+fork; there is no level of the prompt cache in VRAM besides the working state
+on the cards. What RAM holds and what goes first is
+`crates/runtime/src/cache/ram.rs`; when things move, `cache.rs`.
+
+- **What it holds.** A page or tail that the index gives up is copied out of
+  the pool into RAM before anything writes its page of the pool again
+  (`Cache::settle_leaving`, which runs before every record and at the front
+  of every batch of transfers), under the name the index gave it; its
+  checkpoint goes with it and stays in its place. A copy is a buffer per
+  device share of the page, page-locked for the device that copies it
+  (`PinnedRam::cache_buffer`), so the copies are DMA both ways.
+- **A hit.** A prompt that arrives, and a waiting one that is looked at
+  again, has what RAM holds after the pages of the index copied back before
+  the step is planned (`Cache::probe` with the executor): the pages take
+  pages of the pool (cached pages nobody holds make room, and go to RAM
+  first, in the same batch), they enter the index in order, and the
+  checkpoint that hung on one of them is attached to it, in its place. A
+  tail whose tokens the prompt goes on with comes along with the state at
+  its end, so the next turn of a conversation replays nothing. For a model
+  with recurrent state the run ends at its deepest checkpoint, unless a tail
+  with its state follows or the drive goes on to a deeper one. RAM keeps its
+  copies: a page that comes back and leaves the devices again costs no copy.
+  A request that the accounting starts in the middle of a plan takes what the
+  index has; only an arrival and a look before the plan bring pages back,
+  since they take pages of the pool that the plan must see.
+- **What goes first.** By class, then the least recently used: copies of
+  pages that the devices hold; what the drive holds and what is not worth
+  writing (a text shorter than the level on SSD's least, a tail, a
+  checkpoint that later requests have left behind), and everything when
+  there is no level on SSD; then the rest, which is written first. A page is
+  the most recently used of what left the devices when it arrives, and the
+  devices give a text up from its end, so a text goes from its end here too.
+  A checkpoint goes on its own or with its page.
+- **Memory.** The pages and the checkpoints are the prompt cache's share of
+  the engine's page-locked RAM, its lowest user ("Host memory"): the cache
+  takes what the allowance leaves and gives back what it does not hold any
+  more (`Cache::trim`): what goes for nothing first, then what only RAM
+  holds, which is written and goes when the writer is done with it, then the
+  coldest checkpoints of the index. Checkpoints come before pages: a new
+  checkpoint makes RAM give up what goes for nothing, then the checkpoints
+  that hang on pages in RAM, then the index's by its ranking; pages above
+  their floor make room for checkpoints, not the other way round.
+- **Room for what comes.** When RAM is full, the coldest of what only it
+  holds is written ahead, so that there is room for 16 pages without waiting
+  for the drive (`Cache::clean_ahead`). With a level on SSD the cache keeps
+  one checkpoint place and 16 pages whatever the machine has, its floor in
+  the books: state passes through them to the drive and back, so a prompt
+  resumes from SSD while the machine has no room for the cache, and a page
+  that leaves the devices reaches the drive through them. Such a page waits
+  for the writer when nothing else gives room (`Cache::page_room`), and
+  reads from the drive take half of the floor at most, so that pages that
+  leave the devices for them find the other half.
+- **Counted** in `/metrics`: `ares_cache_ram_pages`, `ares_cache_ram_bytes`,
+  `ares_cache_ram_pages_in_total`, `ares_cache_ram_pages_read_total`,
+  `ares_cache_ram_pages_dropped_total` (pages worth keeping that went
+  unwritten: no room, or no level on SSD) and
+  `ares_cache_ram_transfer_nanoseconds_total`.
+
+**On SSD.** The prefix cache has a level on SSD below RAM (`ares --cache
+<dir>`; `crates/runtime/src/cache/ssd.rs` over `ares-store`). What leaves RAM
+is written to a store, and so is what is worth keeping when an engine ends; a
+prompt whose start is in none of the levels above but in the store has it
+brought back before it starts. A conversation therefore resumes after its
+pages left the devices and RAM, after its model was unloaded (router mode),
+and after a restart of the server. Nothing is written as it is computed.
 
 - **The store** (`ares-store`) keeps two kinds of records under the chain
   hash of a page, the page and the checkpoint of recurrent state at its end,
@@ -724,65 +786,63 @@ prefix cache yet.
   rebuilt from the record headers when the store is opened. One process uses
   a store at a time (a lock file); a second server on the same directory and
   fingerprint runs without the level and says so.
-- **Bytes move outside of steps.** The conductor calls
-  `Executor::transfer` between steps (`Cache::pump`, at the top of its loop,
-  before it gives up the checkpoints that host memory has no room for; see
-  "RAM" below): the device threads copy pages and checkpoint places to or
-  from buffers in host memory and wait for their streams. One writer thread writes the
-  buffers to the store and syncs the drive a second after its last record
-  (and every ten seconds while records keep coming); four reader threads
-  read and check what comes back. The step loop does not wait for the drive:
-  pages that the drive takes slower than they are computed stay queued (they
-  are in the pool), and a page the pool gives up before its turn is not
-  written. The one exception is a checkpoint that must leave its place when
-  three are with the writer already: the loop waits up to 250 ms for a
-  buffer, and gives that checkpoint up after that. The store's index is locked to reserve or
-  find a record, never while bytes move. The buffers (16 pages and up to 3
-  checkpoints, made when first used) are ordinary memory aligned for direct
-  I/O, not page-locked, so a copy to or from them blocks its device thread,
-  which is what a transfer does anyway.
-- **What is written when.** A full page is queued at the commit after which
-  it has the form it keeps: at once with `f16` and `q8` and no draft block,
-  and else when the sequence's last step began past it by the newest cells
-  the device keeps exact (`Durable::settle_cells`; a device converts the
-  tiles behind them at the start of a step). The rest is queued when the
-  sequence ends, gives way or is cancelled. A
-  checkpoint at a page boundary (the anchor of a prompt, the intervals in a
-  prompt and while generating) is copied out of its place in the pump that
-  follows the step whose record carried its save, while the place still holds
-  it. A record the store has is not written again. Nothing is written when a
-  model is unloaded or the server stops beyond what was already queued.
-  The partly used last page of a sequence and the state at its end are not
-  written: after a restart the next turn restores the checkpoint before them
-  (the anchor of the last prompt, or a later one from the reply) and computes
-  from there, which costs the rows of the last reply once.
-- **The rule against wear.** Nothing of a text is written before its
-  sequence holds 2048 settled cells; then its pages are written from the
-  first on, and its checkpoints from that depth on. Below that a text is
-  computed again in about a second and a half on the 27B, and what would be
-  written is mostly its checkpoint, which is as large as the pages of several
-  thousand cells. Pages of a short prompt that a long one later starts with
-  are written then, by the long one.
+- **Bytes move outside of steps.** A page is written straight from its
+  buffer in RAM by one writer thread, which syncs the drive a second after its
+  last record (and every ten seconds while records keep coming); the buffer
+  goes back to RAM, whose page is then on the drive too. A checkpoint is
+  copied out of its place into a buffer of its own first (three of them,
+  ordinary memory), by the device threads (`Executor::transfer`), before its
+  place can be written again or lose its memory. Four reader threads read
+  what comes back into buffers of RAM (half the floor of pages in flight at
+  most) and check it; the conductor moves it to the devices between steps
+  (`Cache::pump`, at the top of its loop). The step loop does not wait for
+  the drive, but in two cases: a checkpoint that must leave its place when
+  the writer holds every buffer (up to 250 ms, then it is given up and
+  counted), and a page worth keeping that leaves the devices when RAM has
+  nothing else to give room (it waits for the writer to finish a page). The
+  store's index is locked to reserve or find a record, never while bytes
+  move.
+- **What is written when.** A page when it leaves RAM, or ahead of that when
+  RAM is full, if it is worth writing: its sequence held 2048 settled cells
+  at some point (`SsdConfig::min_cells`; below that a text is computed again
+  in about a second and a half on the 27B, and what would be written is
+  mostly its checkpoint, which is as large as the pages of several thousand
+  cells). Then all its pages are worth writing, from the first on, and a page
+  that is written makes the one before it worth writing, so that a text on
+  the drive is found from its start. A checkpoint at a page boundary at least
+  that deep when it leaves RAM, unless later requests have left it behind (a
+  deeper checkpoint on its branch is where a prompt resumes). When an engine
+  ends (a clean stop, an unload in router mode) everything worth writing that
+  the drive does not have is written, the checkpoints first, then what only
+  RAM holds, the coldest first, then the pages of the devices; the engine
+  waits for the writer up to two minutes. A record the store has is not
+  written again. The partly used last page of a sequence and the state at its
+  end are never written: after a restart the next turn restores the
+  checkpoint before them (the anchor of the last prompt, or a later one from
+  the reply) and computes from there, which costs the rows of the last reply
+  once.
 - **A hit.** `Cache::probe` asks the store for the pages after the ones the
-  index has. For a model with recurrent state the run ends at its deepest
-  checkpoint in the store (the pages behind it would be replayed row by row,
-  which takes as long as computing them), and without a checkpoint nothing is
-  brought back. The run is announced in the index under an owner of its own,
-  so the prompt, and any other prompt that shares it, is held as for a page
-  that another sequence computes. The readers bring the pages and the
-  checkpoint into host memory, the conductor gives each page a page of the
-  pool (cached pages nobody holds make room), the devices take the bytes, and
-  the pages enter the index in order, the last one with the checkpoint, which
-  went into a checkpoint place. The prompt then starts as from any cached
-  prefix. A record that cannot be read or fails its checksum ends its run and
-  is forgotten; the prompt computes from there.
+  index (and RAM) have. For a model with recurrent state the run ends at its
+  deepest checkpoint in the store (the pages behind it would be replayed row
+  by row, which takes as long as computing them), and without a checkpoint
+  nothing is brought back. The run is announced in the index under an owner
+  of its own, so the prompt, and any other prompt that shares it, is held as
+  for a page that another sequence computes. The readers bring the pages and
+  the checkpoint into host memory, the conductor gives each page a page of
+  the pool (cached pages nobody holds make room), the devices take the bytes,
+  and the pages enter the index in order, the last one with the checkpoint,
+  which went into a checkpoint place; the buffers stay in RAM as copies. The
+  prompt then starts as from any cached prefix. A record that cannot be read
+  or fails its checksum ends its run and is forgotten; the prompt computes
+  from there.
 - **Forms.** With `q7` to `q4`, and for the draft block always, a page is an
   exact entry while it is the first tile or among the newest cells and a
-  converted one later. A page goes to the store in the form it has, with a
-  tag; the delay above lets most pages be written converted. A page that
-  comes back exact takes an exact slot when it is the first tile or lies at
-  the end of the run, and is converted on the way in otherwise, as the window
-  of a sequence that went on would have converted it.
+  converted one later. A page goes to RAM, and from there to the store, in
+  the form it has when it leaves the devices, with a tag; the pages a request
+  leaves behind its end are exact entries. A page that comes back exact takes
+  an exact slot when it is the first tile or lies at the end of the run, and
+  is converted on the way in otherwise, as the window of a sequence that went
+  on would have converted it.
 - **The fingerprint** covers everything besides the tokens that changes the
   stored bytes: the model's files (their size, their first 64 KiB and 16
   samples of 4 KiB spread over each), the formats of K and of V, the draft
@@ -805,52 +865,43 @@ prefix cache yet.
   segments and the write is tried once more, a directory that vanished is made
   again (what was written between its loss and the next sync is lost), and a
   damaged or missing file costs the runs that needed it.
-- **RAM.** A checkpoint goes to the drive and comes back through a
-  checkpoint place, so one place is what the level needs of the RAM limit;
-  with more room the places keep the hot checkpoints as before. The places
-  are the lowest user of the engine's page-locked memory, which follows what
-  the machine has ("Host memory"), and this is how the two meet:
-  - *One place is kept whatever the machine has.* It is the floor of the
-    checkpoints in the engine's books (`PinnedRam::want_checkpoints`), as
-    the staging of the experts is the floor of their tier: the machine is
-    not given it, and a tier of experts could not take it. On a machine with
-    no room for checkpoints a prompt still resumes from SSD (its checkpoint
-    lands in that place and is restored from it), and the checkpoints of
-    what is computed still reach the drive, one after the other through
-    places: the one a restore reads and the one of the next save, never
-    more. Without `--cache` there is no floor, and the same machine leaves
-    the cache no checkpoint at all.
-  - *One order between steps.* The conductor pumps the level on SSD first
-    and gives checkpoints up after, in the same turn of its loop. A
-    checkpoint whose save has run has therefore left its place for a buffer
-    in transit before the place is called unused and its memory can go back
-    to the system; what is in a buffer or with the writer is written
-    whatever happens to the place. When the writer holds every buffer, that
-    checkpoint is given up after the 250 ms above, as without a machine to
-    follow. A place that the level on SSD has yet to read is not called
-    unused whichever of the two comes first, and a device part that is asked
-    to read a checkpoint out of a place whose memory went back fails that
-    transfer instead of locking new memory to read from
-    (`PlaceChunks::held`).
+- **RAM.** The level on SSD lies below the one in RAM, which follows what the
+  machine has ("Host memory"), and this is how the two meet:
+  - *A floor is kept whatever the machine has*: one checkpoint place and 16
+    pages (`PinnedRam::want_cache`), as the staging of the experts is the
+    floor of their tier: the machine is not given it, and a tier of experts
+    could not take it. On a machine with no room for the prompt cache a
+    prompt still resumes from SSD (its checkpoint lands in that place and is
+    restored from it, its pages pass through the floor), and what leaves the
+    devices still reaches the drive, through the floor and at the drive's
+    pace. Without `--cache` there is no floor, and the same machine leaves the
+    cache nothing in RAM.
+  - *A checkpoint leaves its place before the place is called unused*: the
+    trim copies what it gives up out of the places first, and a place whose
+    copy has not run keeps its memory. A device part that is asked to read a
+    checkpoint out of a place whose memory went back fails that transfer
+    instead of locking new memory to read from (`PlaceChunks::held`).
   - *A save that has not run has nothing to write.* A checkpoint that is
     given up before the record with its save was written (memory ran short
     between two steps, or a checkpoint from the drive needed the place)
     loses that save, and the level on SSD forgets it with it: nothing is
-    copied out of a place that never held it. The pages of that text are
-    written all the same; the next checkpoint of the sequence, or of the
-    next turn, is the one a later prompt resumes from.
+    copied out of a place that never held it. The next checkpoint of the
+    sequence, or of the next turn, is the one a later prompt resumes from.
   - *Nothing of this is silent.* The checkpoints that went from RAM are
-    counted (`ares_checkpoints_dropped_total`), and so are the ones that
-    were due on the drive and were not written, for either reason
-    (`ares_cache_ssd_checkpoints_skipped_total`).
-  - *The buffers in transit* (16 pages and 3 checkpoints at their most, 545
-    MB with the 27B in `q8`: 16 x 4.62 MB and 3 x 157 MB) are ordinary
-    memory outside the books of page-locked memory. The server counts their
-    most against `--ram` next to those books: a limit below what the engine
-    needs to run with them is refused, and the plan line of the log names
-    them and the place that is kept. The watch over the machine sees them as
-    memory of its own process, not as another program that grows.
-- **Measured** 2026-11-15 with the server and `--cache`: Qwen3.8-27B Q4_K_S
+    counted (`ares_checkpoints_dropped_total`), the ones that were due on the
+    drive and were not written (`ares_cache_ssd_checkpoints_skipped_total`),
+    and pages worth keeping that went unwritten
+    (`ares_cache_ram_pages_dropped_total`).
+  - *The buffers of checkpoints in transit* (3 at their most, 471 MB with the
+    27B: 3 x 157 MB) are ordinary memory outside the books of page-locked
+    memory. The server counts their most against `--ram` next to those books:
+    a limit below what the engine needs to run with them and the floor is
+    refused, and the plan line of the log names them and the floor. The
+    watch over the machine sees them as memory of its own process, not as
+    another program that grows.
+- **Measured before the level in RAM** (pages were written as they were
+  computed, through buffers of ordinary memory) 2026-11-15 with the server and
+  `--cache`: Qwen3.8-27B Q4_K_S
   on the RTX 4070 and the RTX 3060, tensor split 0.625 / 0.375, two sequence
   slots, the model's draft block on. A conversation whose first prompt has
   29 322 tokens (a list of 1900 lines and a question) and whose second turn
@@ -4279,10 +4330,10 @@ without a limit that was named.
 
 | User | Kind | When memory is short |
 | --- | --- | --- |
-| What the engine needs to run: step buffers, read-back buffers, the token embedding table where it lies on the host; with `--cache` also one checkpoint place and the buffers that state passes through on its way to the drive and back (ordinary memory) | Required | Never gives way. A limit below it is refused at load |
+| What the engine needs to run: step buffers, read-back buffers, the token embedding table where it lies on the host; with `--cache` also the floor of the prompt cache (one checkpoint place and 16 pages) and the buffers that checkpoints pass through on their way to the drive and back (ordinary memory) | Required | Never gives way. A limit below it is refused at load |
 | RAM tier of MoE experts | Elastic, the highest | Gets all that is not required, as far as it can use it, and is the last to shrink: it gives pieces back only when the prompt cache has nothing left in RAM |
 | Staging of the experts on their way from the file into transit | Part of the tier | The pieces that hold it are never given up |
-| Prompt cache in RAM (checkpoints of recurrent state; pages of finished conversations when they are built) | Elastic, the lowest | Goes first: down to nothing without `--cache`, and a checkpoint that goes is gone; down to the one place above with `--cache`, where the checkpoints at page boundaries are on SSD as well and a prompt that needs one brings it back |
+| Prompt cache in RAM (checkpoints of recurrent state, and the pages that left the devices) | Elastic, the lowest | Goes first: what the devices or the drive also hold goes at once; what only RAM holds is written to the drive first with `--cache` and goes when it is written, down to the floor above; without `--cache` it goes at once, down to nothing |
 
 Nothing is reserved for K/V pages that leave VRAM (KV offload, not built):
 that is an exceptional case, and when it happens it takes from the users
@@ -4386,26 +4437,33 @@ look by look. The users:
   usage profile of the experts"), which reads nothing into the tier while it
   holds more than it may. The piece that holds staging is never given
   up, and the tier says so when it can give no more;
-- the checkpoints of recurrent state of the prefix cache, which a device
-  part locks in chunks of at least 32 MiB when a place is first used
-  (`PlaceChunks`). The conductor keeps no more checkpoints than their
-  allowance holds: it takes none when the allowance has no room, gives the
-  coldest up when it falls (between steps; an idle conductor is woken for
-  it), and tells the books which places are in use. A chunk in which no place
+- the prompt cache in RAM, one user in the books (`PinnedRam::want_cache`,
+  `cache_allowance`, `on_cache`): its pages, a buffer per device share of a
+  page that the cache locks when a page leaves the devices
+  (`PinnedRam::cache_buffer`, `cuMemHostAlloc` for that device; kept for the
+  next page and given back when the allowance falls), and the checkpoints of
+  recurrent state, which a device part locks in chunks of at least 32 MiB
+  when a place is first used (`PlaceChunks`). The conductor keeps no more
+  than the allowance holds: it takes nothing new when the allowance has no
+  room, gives up what goes for nothing first when it falls and writes what
+  only RAM holds before that goes (between steps; an idle conductor is woken
+  for it; see "In RAM" under "Sequence state"), and tells the books which
+  places are in use. A chunk in which no place
   is in use is unlocked and freed (`PinnedRam::sweep_checkpoints`), and
   locked again when a place in it is used again. In a model whose checkpoint
   is larger than a chunk (the 27B), a chunk is a place; in a small model a
   chunk goes only when all its places are free, and checkpoints are not moved
   to make one free. With the prompt cache on SSD the allowance has a floor
-  of one place, and the conductor gives checkpoints up only after the level
-  on SSD has taken what is due out of their places (see "RAM" under "On
-  SSD"). The cache counts the floor as one place; the books forgive the
-  chunk that place lies in on every device, since in a small model a chunk
-  holds several places and goes only as a whole;
-- the buffers of the prompt cache on SSD (`--cache`): ordinary memory,
-  aligned for direct I/O, allocated when first used and kept. They are not
-  in the books; the server takes their most (`SsdConfig::transit_ram`) off
-  the limit before it hands the rest to the books.
+  of one place and 16 pages, and the conductor gives checkpoints up only
+  after they left their places for the drive (see "RAM" under "On SSD").
+  The cache counts the floor as one place and the pages; the books forgive
+  the chunk that place lies in on every device, since in a small model a
+  chunk holds several places and goes only as a whole;
+- the buffers that checkpoints pass through on their way to the drive and
+  back (`--cache`): ordinary memory, aligned for direct I/O, allocated when
+  first used and kept. They are not in the books; the server takes their
+  most (`SsdConfig::transit_ram`) off the limit before it hands the rest to
+  the books.
 
 Inside one engine there is nobody else today: a mixture of experts has no
 prefix cache and a dense model has no experts, so the two elastic users never
@@ -4413,21 +4471,21 @@ meet in one set of books, and a prompt's working memory, staging and
 checkpoints do not borrow from each other at run time (staging is a fixed
 part of the tier, sized at load for the tier as it starts). The ranks decide
 between the engines of a server (see "Several models"). What does meet inside
-a dense model's engine is the checkpoints and the level of the prompt cache
-on SSD, which reads checkpoints out of the places and writes them back in;
-the rules for that are under "On SSD".
+a dense model's engine is the checkpoints, the pages in RAM and the level of
+the prompt cache on SSD, which reads checkpoints out of the places and writes
+them back in; the rules for that are under "In RAM" and "On SSD".
 
 The limit is `GpuConfig::ram_limit`, which the server sets from `--ram`
 (default: all the machine has; the log states it, what the machine has
-available and the headroom at that moment), less the most the buffers of the
-prompt cache on SSD take when `--cache` is given, since those are host memory
-of the engine that the books do not hold. For a model with a prefix cache,
-what the limit leaves after the required memory is the checkpoint budget of
-the conductor (`RuntimeConfig::checkpoint_budget`), so the places the
-conductor hands out never lock more than the limit; for a mixture of experts
-it is what the tier is planned for. A dense model's server therefore lets the
-checkpoints use what the machine has, less the headroom, and gives the
-coldest up when the machine needs the memory. A lock that does not fit the
+available and the headroom at that moment), less the most the buffers of
+checkpoints in transit to the drive take when `--cache` is given, since those
+are host memory of the engine that the books do not hold. For a model with a
+prefix cache, what the limit leaves after the required memory is the budget
+of the prompt cache in RAM (`RuntimeConfig::cache_ram`), so the places and
+pages the conductor takes never lock more than the limit; for a mixture of
+experts it is what the tier is planned for. A dense model's server therefore
+lets the prompt cache use what the machine has, less the headroom, and gives
+the coldest up when the machine needs the memory. A lock that does not fit the
 limit fails the step with the books in the message. The first use of a place
 waits for the lock on the device's thread (21 to 22.5 ms for 93.5 MiB, 11.8
 ms for 56.1 MiB, measured with the 27B); locking ahead in the background is
@@ -4536,11 +4594,11 @@ Nothing that costs speed happens silently:
   `pieces_locked`, `piece_evictions`); a line in the log for it is not
   written yet.
 - **When the prompt cache in RAM shrinks**, that is routine and only counted
-  (`ares_checkpoints_dropped_total`). (Pages are not in RAM yet; the
-  checkpoints are the prompt cache's only RAM today, and with `--cache` the
-  ones at page boundaries are on SSD as well. One that was due there and was
-  given up unwritten is counted apart,
-  `ares_cache_ssd_checkpoints_skipped_total`.)
+  (`ares_checkpoints_dropped_total`, `ares_cache_ram_pages`,
+  `ares_cache_ram_bytes`). With `--cache` what only RAM holds goes to the
+  drive before its memory goes; what was due there and was given up
+  unwritten is counted apart (`ares_cache_ssd_checkpoints_skipped_total`,
+  `ares_cache_ram_pages_dropped_total`).
 
 The same facts are available as counters to whoever monitors the server.
 
@@ -4571,13 +4629,13 @@ engine. What that needs:
   in the background and only as far as offload needs it. (Today the only such
   memory is the checkpoints' places, which a device thread locks in chunks
   when one is first used, not in the background; see "Host memory".)
-- **Unloading frees and returns.** Nothing is written at unload beyond what
-  was already queued for the drive: state on SSD is written as it is
-  produced (see "On SSD" under "Sequence state"), and a mixture of experts
-  writes the usage profile of its experts (96 KiB for Flash-Next) if steps
-  ran since it last did. With `--cache` a model that
-  is loaded again finds its conversations in its store; without it the
-  prefix cache of a model goes with it. The
+- **Unloading frees and returns.** With `--cache`, what is worth keeping of
+  the prompt cache is written at unload: what only RAM holds and the pages
+  and checkpoints of the devices (see "On SSD" under "Sequence state"), and
+  a model that is loaded again finds its conversations in its store; without
+  it the prefix cache of a model goes with it. A mixture of experts writes
+  the usage profile of its experts (96 KiB for Flash-Next) if steps ran
+  since it last did. The
   unload ends the engine's requests, joins its threads, drops the engine and
   compares what every device reports as free before and after with what the
   model took at its load; the log has both and the time.

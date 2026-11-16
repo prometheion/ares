@@ -895,6 +895,13 @@ async fn metrics_are_the_engines_statistics_as_text() {
             wait_us: 12_000,
             ..ExpertStats::default()
         },
+        ram: ares_api::RamCacheStats {
+            pages: 20,
+            bytes: 92_405_760,
+            pages_in: 25,
+            pages_read: 5,
+            ..ares_api::RamCacheStats::default()
+        },
         ssd: ares_api::SsdStats {
             pages_written: 7,
             bytes_written: 4096,
@@ -908,6 +915,11 @@ async fn metrics_are_the_engines_statistics_as_text() {
     let text = body_text(response).await;
     for line in [
         "ares_requests_finished_total 2",
+        "ares_cache_ram_pages 20",
+        "ares_cache_ram_bytes 92405760",
+        "ares_cache_ram_pages_in_total 25",
+        "ares_cache_ram_pages_read_total 5",
+        "ares_cache_ram_pages_dropped_total 0",
         "ares_cache_ssd_pages_written_total 7",
         "ares_cache_ssd_written_bytes_total 4096",
         "ares_cache_ssd_pages_read_total 3",

@@ -610,7 +610,7 @@ fn requests_that_give_way_under_a_small_page_pool_come_back_from_the_cache() {
 }
 
 #[test]
-fn a_small_cache_ram_gives_up_checkpoints_and_the_answers_stay_the_same() {
+fn a_small_budget_of_ram_gives_up_checkpoints_and_the_answers_stay_the_same() {
     let Some(path) = model_path() else { return };
     for layout in layouts() {
         let cold = rig(&path, layout, false, &|_, _| {});
@@ -906,10 +906,11 @@ fn a_prompt_resumes_from_ssd_on_a_machine_without_room_for_checkpoints() {
         assert!(writer.snapshot().ssd_problem.is_none(), "{:?}", writer.snapshot().ssd_problem);
         let wrote = writer.ask(&first, 40);
         assert_same("the answer of the engine that writes", &cold, &wrote);
-        // Two checkpoints: at most one lies in the reply, so one lies in the
-        // prompt, where the next engine resumes.
-        let ssd = written(&writer, 2);
-        assert!(ssd.pages_written >= 1, "{ssd:?}");
+        // RAM and the devices hold the text: nothing is written until the
+        // engine ends, which writes its pages and the checkpoint in the
+        // prompt where the next engine resumes.
+        let ssd = written(&writer, 0);
+        assert_eq!((ssd.pages_written, ssd.states_written), (0, 0), "{ssd:?}");
         drop(writer);
 
         // Another engine, on a machine that has nothing to spare from the

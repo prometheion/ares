@@ -1379,8 +1379,39 @@ pub(crate) fn model_list(models: &[crate::models::Listed]) -> serde_json::Value 
 
 /// The body of `GET /metrics`.
 pub(crate) fn metrics(stats: &ares_api::EngineStats) -> String {
-    let ssd = &stats.ssd;
-    let rows: [(&str, &str, &str, u64); 44] = [
+    let (ram, ssd) = (&stats.ram, &stats.ssd);
+    let rows: [(&str, &str, &str, u64); 50] = [
+        (
+            "cache_ram_pages",
+            "gauge",
+            "Pages of sequence state the prompt cache holds in RAM",
+            ram.pages,
+        ),
+        ("cache_ram_bytes", "gauge", "Page-locked RAM the prompt cache's pages hold", ram.bytes),
+        (
+            "cache_ram_pages_in_total",
+            "counter",
+            "Pages that left the devices and were copied into the prompt cache in RAM",
+            ram.pages_in,
+        ),
+        (
+            "cache_ram_pages_read_total",
+            "counter",
+            "Pages a prompt took back to the devices from the prompt cache in RAM",
+            ram.pages_read,
+        ),
+        (
+            "cache_ram_pages_dropped_total",
+            "counter",
+            "Pages worth keeping that the prompt cache in RAM gave up unwritten",
+            ram.pages_dropped,
+        ),
+        (
+            "cache_ram_transfer_nanoseconds_total",
+            "counter",
+            "Time the step loop waited while pages moved between the devices and RAM",
+            ram.transfer_ns,
+        ),
         (
             "cache_ssd_pages_written_total",
             "counter",

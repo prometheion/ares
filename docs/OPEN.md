@@ -167,12 +167,16 @@ Everything `FEATURES.md` lists for the 27B and not for Flash-Next is owed:
       mean of the model's four hyper-connection streams, which llama.cpp cannot drive yet).
 
 ## Prompt cache (every model; RAM first, then SSD, as in the owner's fork)
-- [ ] RAM level for the K/V state that leaves VRAM; write to SSD when the RAM level evicts
-      (full or shrinking), at unload and at a clean stop. Today pages are written through
-      as they are computed and only checkpoints lie in RAM.
-- [ ] The same for Flash-Next.
-- [ ] One size limit for all models on a directory; the transit buffers inside `--ram`;
-      a test of the full drive; a layout that does not depend on the split.
+- [x] RAM level for the K/V state that leaves VRAM; write to SSD when the RAM level evicts
+      (full or shrinking), at unload and at a clean stop (branch `cache/ram-level`).
+- [ ] The same for Flash-Next (its prefix cache first; the interfaces are the model's
+      `durable` and `transfer`, nothing of the levels is 27B-only).
+- [ ] Locking a page's buffers costs about 0.5 ms per MB when RAM grows (a page of the 27B is
+      4.6 MB): lock ahead in the background while a step runs.
+- [ ] A checkpoint that later requests left behind is not written when it leaves the index;
+      one that leaves with its page, after the deeper ones of its text left, is.
+- [ ] One size limit for all models on a directory; a test of the full drive; a layout that
+      does not depend on the split.
 - [ ] Cache policy: resume point at the prompt's end, memory of reply tokens, marks, warm pass.
 - [ ] On `/v1/responses` a second turn took 1 of 35 prompt tokens from the cache where
       `/v1/messages` took 18: the history is rendered differently somewhere.

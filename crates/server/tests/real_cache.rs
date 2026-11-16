@@ -211,15 +211,12 @@ impl Server {
             .unwrap_or_else(|| panic!("no metric {name} in:\n{body}")) as u64
     }
 
-    /// Waits until the store has taken everything that was queued for it:
-    /// pages were written and nothing waits for the writer. Returns the pages
-    /// written.
+    /// Waits until nothing waits for the writer. Returns the pages written.
     fn settled(&self) -> u64 {
         let deadline = Instant::now() + LIMIT;
         loop {
-            let written = self.metric("cache_ssd_pages_written_total");
-            if written > 0 && self.metric("cache_ssd_pending") == 0 {
-                return written;
+            if self.metric("cache_ssd_pending") == 0 {
+                return self.metric("cache_ssd_pages_written_total");
             }
             assert!(Instant::now() < deadline, "the store never came to rest");
             thread::sleep(Duration::from_millis(100));
@@ -287,10 +284,11 @@ fn name_of(model: &Path) -> String {
     model.file_stem().unwrap().to_string_lossy().into_owned()
 }
 
-/// One model on its devices with `flags`: a conversation is computed and
-/// written, the server is restarted, and the second turn resumes from the
-/// drive with the reply of the first run; then other conversations take the
-/// pages of the pool, and the first one comes back from the drive once more.
+/// One model on its devices with `flags`: a conversation is computed, which
+/// RAM and the devices hold, so nothing is written; the server stops, which
+/// writes it, and the second turn resumes from the drive with the reply of
+/// the first run; then other conversations take the pages of the pool, and
+/// the first one comes back from RAM, still without a write.
 fn resumes_after_a_restart_and_after_eviction(model: &Path, flags: &[&str], tag: &str, at: u16) {
     let dir = scratch(tag);
     let cache = dir.display().to_string();
@@ -309,21 +307,19 @@ fn resumes_after_a_restart_and_after_eviction(model: &Path, flags: &[&str], tag:
     assert_eq!(one.cached_tokens, 0);
     assert!(two.cached_tokens > 2048, "the second turn starts from the first: {two:?}");
     assert_eq!(two.text, reference.text);
-    let pages = server.settled();
-    let states = server.metric("cache_ssd_checkpoints_written_total");
-    assert!(pages >= u64::from(lines) * 8 / 128, "{pages} pages for {} tokens", two.prompt_tokens);
-    assert!(states >= 1, "the checkpoint the second turn started from is on the drive");
+    // Nothing is written while the devices and RAM hold the conversation.
+    assert_eq!(server.settled(), 0);
+    assert_eq!(server.metric("cache_ssd_written_bytes_total"), 0);
     assert_eq!(server.metric("cache_ssd_pages_read_total"), 0);
-    eprintln!(
-        "{tag}: {} prompt tokens, {pages} pages and {states} checkpoints written, {} bytes",
-        two.prompt_tokens,
-        server.metric("cache_ssd_written_bytes_total")
-    );
     let log = server.stop();
     assert!(log.iter().any(|line| line.contains("prompt cache on SSD")), "{log:#?}");
 
-    // A new process: the devices hold nothing of the conversation.
+    // A new process: the devices hold nothing of the conversation, and the
+    // drive what the last one wrote when it stopped.
     let mut server = Server::start(&args(model, &with_cache), port(at));
+    let stored = server.metric("cache_ssd_bytes");
+    assert!(stored >= u64::from(lines) * 8 / 128 * 4096, "{stored} bytes on the drive");
+    eprintln!("{tag}: {} prompt tokens, {stored} bytes written at the stop", two.prompt_tokens);
     let began = Instant::now();
     let again = server.complete(&name, &second, 12);
     let took = began.elapsed();
@@ -339,17 +335,20 @@ fn resumes_after_a_restart_and_after_eviction(model: &Path, flags: &[&str], tag:
         server.metric("cache_ssd_read_bytes_total")
     );
 
-    // Other conversations until the pool has given up the first one's pages.
+    // Other conversations until the pool has given up the first one's pages,
+    // which RAM keeps: they come back from there, and nothing is written.
     for seed in 2..6 {
         turns(&server, &name, seed, lines);
     }
-    let before = server.metric("cache_ssd_pages_read_total");
+    let before = server.metric("cache_ram_pages_read_total");
     let back = server.complete(&name, &second, 12);
     assert_eq!(back.text, reference.text, "the reply after eviction");
     assert!(back.cached_tokens > 2048, "{back:?}");
-    let read = server.metric("cache_ssd_pages_read_total") - before;
-    assert!(read > 0, "the pages came back from the drive: {:#?}", server.logged());
-    eprintln!("{tag}: after eviction {read} pages came back from the drive");
+    let read = server.metric("cache_ram_pages_read_total") - before;
+    assert!(read > 0, "the pages came back from RAM: {:#?}", server.logged());
+    assert!(server.metric("cache_ram_pages_in_total") > 0);
+    assert_eq!(server.settled(), 0, "nothing was written while RAM held it");
+    eprintln!("{tag}: after eviction {read} pages came back from RAM");
     server.stop();
 }
 
