@@ -15,6 +15,9 @@
 //!
 //! [`Arithmetic::ForkCpu`] adds the roundings of llama.cpp's CPU path so that
 //! its numbers can be compared closely; it is not what a device should match.
+//! [`Arithmetic::HalfOperands`] adds the roundings of the device's products
+//! (f16 operands), so that the distance between it and the exact pass says how
+//! far such roundings carry an image: the yardstick of the device's tests.
 
 use std::ops::Range;
 
@@ -23,7 +26,9 @@ use ares_quant::{bf16_to_f32, f16_to_f32, f32_to_bf16, f32_to_f16};
 
 use crate::qwen3vl::config::Config;
 use crate::qwen3vl::error::{Error, Result};
-use crate::qwen3vl::image::{Limits, normalize, resize_bicubic, target_size};
+use crate::qwen3vl::image::{
+    Limits, normalize, patch_position, patch_rows, resize_bicubic, target_size,
+};
 use crate::qwen3vl::weights::{Linear, Norm, Weights};
 
 /// Which roundings the reference applies.
@@ -36,6 +41,17 @@ pub enum Arithmetic {
     /// rounded to the type the matrix is stored in (bf16 for a BF16 matrix),
     /// and the GELU through f16 on both sides.
     ForkCpu,
+    /// With the roundings of the device's tensor cores, whose operands are
+    /// f16: the input rows of every matrix product divided by the power of two
+    /// above their largest value and rounded to f16 (the form of
+    /// `ares_cuda::Kernels::prepare_prefill_activations`), every weight of a
+    /// matrix rounded to the nearest f16 (the patch matrix too, after the two
+    /// kernels are added), and in the attention the rotated queries and keys,
+    /// the values and the probabilities rounded to f16 (the probabilities are
+    /// summed as rounded). Sums stay as in [`Arithmetic::Exact`]. The device
+    /// computes the same roundings in another order, so it does not equal
+    /// this bit for bit; what it is for is the size of their effect on an image.
+    HalfOperands,
 }
 
 /// A point of the pass whose values [`Reference::encode_traced`] hands out.
@@ -179,26 +195,13 @@ impl<'a> Reference<'a> {
         tap: &mut dyn FnMut(Stage, &[f32]),
     ) -> Result<Rows> {
         let (c, w) = (self.config, self.weights);
-        let align = c.align();
-        if width == 0
-            || height == 0
-            || !width.is_multiple_of(align)
-            || !height.is_multiple_of(align)
-        {
-            return Err(image(width, height, &format!("is not made of squares of {align} pixels")));
-        }
-        if pixels.len() != width * height * 3 {
-            return Err(image(width, height, "does not have three values for every pixel"));
-        }
-        let (pw, ph) = (width / c.patch, height / c.patch);
-        let (nx, ny) = (pw / 2, ph / 2);
+        let (rows, nx, ny) = patch_rows(c, pixels, width, height)?;
+        let (pw, ph) = (2 * nx, 2 * ny);
         let (n_patches, e) = (pw * ph, c.n_embd);
         // Where patch `i` of the merger's order lies in the grid: (row, column).
-        let order: Vec<(usize, usize)> = (0..n_patches)
-            .map(|i| (2 * (i / 4 / nx) + i % 4 / 2, 2 * (i / 4 % nx) + i % 2))
-            .collect();
+        let order: Vec<(usize, usize)> = (0..n_patches).map(|i| patch_position(i, nx)).collect();
 
-        let mut x = self.patches(pixels, width, &order);
+        let mut x = self.patches(rows, n_patches);
         tap(Stage::Patches, &x);
         add(&mut x, &self.positions(pw, ph, &order));
         tap(Stage::Positions, &x);
@@ -207,11 +210,17 @@ impl<'a> Reference<'a> {
         for (l, block) in w.blocks.iter().enumerate() {
             let normed = layer_norm(&block.ln1, c.eps, &x);
             tap(Stage::Ln1(l), &normed);
-            let qkv = self.linear(&block.qkv, &normed, n_patches);
+            let mut qkv = self.linear(&block.qkv, &normed, n_patches);
             tap(Stage::Qkv(l), &qkv);
-            let query = self.rotate(&qkv, 0, &rotation);
+            let mut query = self.rotate(&qkv, 0, &rotation);
+            let mut key = self.rotate(&qkv, e, &rotation);
+            if self.arithmetic == Arithmetic::HalfOperands {
+                // The values are read from `qkv`; queries and keys are copies.
+                for v in query.iter_mut().chain(key.iter_mut()).chain(qkv.iter_mut()) {
+                    *v = to_half(*v);
+                }
+            }
             tap(Stage::QueryRotated(l), &query);
-            let key = self.rotate(&qkv, e, &rotation);
             tap(Stage::KeyRotated(l), &key);
             let attended = self.attention(&query, &key, &qkv);
             tap(Stage::Attention(l), &attended);
@@ -244,24 +253,23 @@ impl<'a> Reference<'a> {
         Ok(Rows { nx, ny, width: c.n_out, data })
     }
 
-    /// The patches in the merger's order, through the patch matrix, plus the
-    /// patch bias. The matrix is the sum of the two kernels, formed in `f32`.
-    fn patches(&self, pixels: &[f32], width: usize, order: &[(usize, usize)]) -> Vec<f32> {
+    /// The patch rows (in the merger's order) through the patch matrix, plus
+    /// the patch bias. The matrix is the sum of the two kernels, formed in
+    /// `f32`.
+    fn patches(&self, mut rows: Vec<f32>, n_patches: usize) -> Vec<f32> {
         let (c, w) = (self.config, self.weights);
-        let fork = self.arithmetic == Arithmetic::ForkCpu;
-        let through = |v: f32| if fork { f16_to_f32(f32_to_f16(v)) } else { v };
-        let matrix: Vec<f32> =
-            w.patch[0].iter().zip(&w.patch[1]).map(|(a, b)| through(*a) + through(*b)).collect();
-        let mut rows = Vec::with_capacity(order.len() * c.patch_len());
-        for &(py, px) in order {
-            for channel in 0..3 {
-                for ky in 0..c.patch {
-                    let start = ((py * c.patch + ky) * width + px * c.patch) * 3 + channel;
-                    rows.extend((0..c.patch).map(|kx| through(pixels[start + kx * 3])));
-                }
+        let mut matrix: Vec<f32> = match self.arithmetic {
+            Arithmetic::ForkCpu => {
+                rows.iter_mut().for_each(|v| *v = to_half(*v));
+                w.patch[0].iter().zip(&w.patch[1]).map(|(a, b)| to_half(*a) + to_half(*b)).collect()
             }
+            _ => w.patch[0].iter().zip(&w.patch[1]).map(|(a, b)| a + b).collect(),
+        };
+        if self.arithmetic == Arithmetic::HalfOperands {
+            matrix.iter_mut().for_each(|v| *v = to_half(*v));
+            half_rows(&mut rows, c.patch_len());
         }
-        let mut x = matmul(self.threads, &matrix, c.n_embd, c.patch_len(), &rows, order.len());
+        let mut x = matmul(self.threads, &matrix, c.n_embd, c.patch_len(), &rows, n_patches);
         add_bias(&mut x, &w.patch_bias);
         x
     }
@@ -277,13 +285,7 @@ impl<'a> Reference<'a> {
             order.iter().for_each(|&(py, px)| out.extend_from_slice(at(py, px)));
             return out;
         }
-        let factor = |n: usize| {
-            if n > 1 && side > 1 {
-                (n - 1) as f32 / (side - 1) as f32
-            } else {
-                n as f32 / side as f32
-            }
-        };
+        let factor = |n: usize| position_factor(n, side);
         // The two table cells around a coordinate and the weight of the second.
         let around = |i: usize, sf: f32| {
             let pos = i as f32 / sf;
@@ -312,7 +314,7 @@ impl<'a> Reference<'a> {
     /// built as llama.cpp builds it, by multiplying on in `f32`.
     fn rotation(&self, order: &[(usize, usize)]) -> Vec<(f32, f32)> {
         let pairs = self.config.head_dim() / 2;
-        let step = 10000f32.powf(-2.0 / pairs as f32);
+        let step = rotation_step(self.config);
         let mut table = Vec::with_capacity(order.len() * pairs);
         for &(row, col) in order {
             let mut theta = row as f32;
@@ -354,7 +356,8 @@ impl<'a> Reference<'a> {
     fn attention(&self, query: &[f32], key: &[f32], qkv: &[f32]) -> Vec<f32> {
         let (e, d) = (self.config.n_embd, self.config.head_dim());
         let n = query.len() / e;
-        let scale = f64::from(1.0 / (d as f32).sqrt());
+        let scale = f64::from(attention_scale(self.config));
+        let half = self.arithmetic == Arithmetic::HalfOperands;
         let mut out = vec![0.0f32; n * e];
         for head in 0..self.config.n_head {
             let of = |rows: &[f32], width: usize, offset: usize| -> Vec<f32> {
@@ -363,7 +366,7 @@ impl<'a> Reference<'a> {
             };
             let (q, k, v) = (of(query, e, 0), of(key, e, 0), of(qkv, 3 * e, 2 * e));
             let attended = parallel(self.threads, n, |range| {
-                fast(|| attend(&q[range.start * d..range.end * d], &k, &v, d, scale))
+                fast(|| attend(&q[range.start * d..range.end * d], &k, &v, d, scale, half))
             });
             for (dst, src) in out.chunks_exact_mut(e).zip(attended.chunks_exact(d)) {
                 dst[head * d..(head + 1) * d].copy_from_slice(src);
@@ -375,19 +378,26 @@ impl<'a> Reference<'a> {
     /// `x` through a matrix, plus its bias: `n` rows.
     fn linear(&self, layer: &Linear<'_>, x: &[f32], n: usize) -> Vec<f32> {
         let m = &layer.weight;
-        let rounded: Vec<f32>;
+        let mut rounded: Vec<f32>;
+        let mut weights = m.decode();
         let x = match (self.arithmetic, m.ty()) {
             (Arithmetic::ForkCpu, GgmlType::BF16) => {
                 rounded = x.iter().map(|v| bf16_to_f32(f32_to_bf16(*v))).collect();
                 &rounded
             }
             (Arithmetic::ForkCpu, GgmlType::F16) => {
-                rounded = x.iter().map(|v| f16_to_f32(f32_to_f16(*v))).collect();
+                rounded = x.iter().map(|v| to_half(*v)).collect();
+                &rounded
+            }
+            (Arithmetic::HalfOperands, _) => {
+                weights.iter_mut().for_each(|v| *v = to_half(*v));
+                rounded = x.to_vec();
+                half_rows(&mut rounded, m.cols());
                 &rounded
             }
             _ => x,
         };
-        let mut y = matmul(self.threads, &m.decode(), m.rows(), m.cols(), x, n);
+        let mut y = matmul(self.threads, &weights, m.rows(), m.cols(), x, n);
         add_bias(&mut y, &layer.bias);
         y
     }
@@ -410,6 +420,48 @@ impl<'a> Reference<'a> {
 
 fn image(width: usize, height: usize, problem: &str) -> Error {
     Error::Image { width, height, problem: problem.to_owned() }
+}
+
+/// How many cells of the position table's side of `side` cells one cell of a
+/// side of `n` cells moves by: `(n - 1) / (side - 1)` in `f32` (ggml's resize
+/// with aligned corners), or `n / side` where that has no meaning.
+pub(crate) fn position_factor(n: usize, side: usize) -> f32 {
+    if n > 1 && side > 1 { (n - 1) as f32 / (side - 1) as f32 } else { n as f32 / side as f32 }
+}
+
+/// The factor between the angles of two neighbouring pairs of a half of a
+/// head: `10000^(-2 / (head_dim / 2))`, in `f32` as llama.cpp forms it.
+pub(crate) fn rotation_step(config: &Config) -> f32 {
+    10000f32.powf(-2.0 / (config.head_dim() / 2) as f32)
+}
+
+/// What the attention's scores are multiplied by: `1 / sqrt(head_dim)`.
+pub(crate) fn attention_scale(config: &Config) -> f32 {
+    1.0 / (config.head_dim() as f32).sqrt()
+}
+
+/// A value rounded to the nearest f16.
+fn to_half(v: f32) -> f32 {
+    f16_to_f32(f32_to_f16(v))
+}
+
+/// Rows of `n` values as the device's tile kernels take them: each row
+/// divided by the power of two above its largest magnitude, rounded to f16 and
+/// multiplied back.
+fn half_rows(x: &mut [f32], n: usize) {
+    for row in x.chunks_exact_mut(n) {
+        let largest = row.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        // frexp: largest = f * 2^e with f in [0.5, 1). A normal number is
+        // 1.m * 2^(E - 127), its e therefore E - 126.
+        let e = match largest.to_bits() >> 23 {
+            _ if largest == 0.0 || !largest.is_finite() => 0,
+            0 => largest.log2().floor() as i32 + 1,
+            exponent => exponent as i32 - 126,
+        };
+        let e = e.clamp(-100, 100);
+        let (down, up) = (2f32.powi(-e), 2f32.powi(e));
+        row.iter_mut().for_each(|v| *v = to_half(*v * down) * up);
+    }
 }
 
 /// `0.5 x (1 + tanh(sqrt(2 / pi) x (1 + 0.044715 x^2)))`.
@@ -508,9 +560,10 @@ fn matmul(threads: usize, w: &[f32], rows: usize, cols: usize, x: &[f32], n: usi
 /// The attention of the queries `q` (rows of `d`) of one head over all keys
 /// and values of that head. Per query: the scores `q . k_j * scale`, their
 /// largest value taken off, the exponentials summed in the order of `j`, the
-/// values weighted and summed in the order of `j`, and the division.
+/// values weighted and summed in the order of `j`, and the division. With
+/// `half` the exponentials are rounded to f16 before they are summed and used.
 #[inline(always)]
-fn attend(q: &[f32], k: &[f32], v: &[f32], d: usize, scale: f64) -> Vec<f32> {
+fn attend(q: &[f32], k: &[f32], v: &[f32], d: usize, scale: f64, half: bool) -> Vec<f32> {
     const QUERIES: usize = 16;
     const KEYS: usize = 256;
     let n = k.len() / d;
@@ -531,6 +584,9 @@ fn attend(q: &[f32], k: &[f32], v: &[f32], d: usize, scale: f64) -> Vec<f32> {
             let top = row.iter().copied().fold(f64::NEG_INFINITY, f64::max);
             for s in row {
                 *s = (*s - top).exp();
+                if half {
+                    *s = f64::from(to_half(*s as f32));
+                }
                 *total += *s;
             }
         }

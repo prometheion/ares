@@ -1,6 +1,6 @@
 //! The pixel work in front of the tower: which size an image is resized to,
-//! the resize, and the normalisation. Pixels are 8-bit RGB, row after row,
-//! three bytes a pixel.
+//! the resize, the normalisation, and the patch rows the tower reads. Pixels
+//! are 8-bit RGB, row after row, three bytes a pixel.
 //!
 //! All three follow the preprocessing of llama.cpp's `mtmd` for this projector
 //! operation by operation, so that the same pixels reach the tower: the size
@@ -209,4 +209,47 @@ pub fn normalize(config: &Config, rgb: &[u8]) -> Vec<f32> {
         }
     }
     out
+}
+
+/// Where patch `i` of the merger's order lies in a grid of `nx` groups of
+/// 2 x 2 patches per line: (row, column) in patches. The groups follow each
+/// other row by row, and inside a group the patches are (0,0), (0,1), (1,0),
+/// (1,1).
+pub fn patch_position(i: usize, nx: usize) -> (usize, usize) {
+    (2 * (i / 4 / nx) + i % 4 / 2, 2 * (i / 4 % nx) + i % 2)
+}
+
+/// The tower's input: normalised pixels (three `f32` a pixel, row after row,
+/// both sides multiples of [`Config::align`]) cut into patches, one row of
+/// [`Config::patch_len`] values per patch in the merger's order
+/// ([`patch_position`]), each row channel by channel and in a channel the
+/// patch's pixel rows. With them the grid: (groups per line, lines).
+pub fn patch_rows(
+    config: &Config,
+    pixels: &[f32],
+    width: usize,
+    height: usize,
+) -> Result<(Vec<f32>, usize, usize)> {
+    let align = config.align();
+    let image = |problem: String| Error::Image { width, height, problem };
+    if width == 0 || height == 0 || !width.is_multiple_of(align) || !height.is_multiple_of(align) {
+        return Err(image(format!("is not made of squares of {align} pixels")));
+    }
+    if pixels.len() != width * height * 3 {
+        return Err(image("does not have three values for every pixel".to_owned()));
+    }
+    let patch = config.patch;
+    let (nx, ny) = (width / align, height / align);
+    let n_patches = 4 * nx * ny;
+    let mut rows = Vec::with_capacity(n_patches * config.patch_len());
+    for i in 0..n_patches {
+        let (py, px) = patch_position(i, nx);
+        for channel in 0..3 {
+            for ky in 0..patch {
+                let start = ((py * patch + ky) * width + px * patch) * 3 + channel;
+                rows.extend((0..patch).map(|kx| pixels[start + kx * 3]));
+            }
+        }
+    }
+    Ok((rows, nx, ny))
 }

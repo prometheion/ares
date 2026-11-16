@@ -9,7 +9,8 @@
 //! - [`Device`] opens a device. [`DeviceBuffer`] and [`PinnedBuffer`] own
 //!   memory on it and next to it.
 //! - [`Stream`] and [`Event`] order work on a device and between devices.
-//! - [`Kernels`] holds the engine's compiled kernels on a device.
+//! - [`Kernels`] holds the engine's compiled kernels on a device;
+//!   [`TowerKernels`] those of the image tower besides its products.
 //! - [`Mesh`] sums partial results across devices (tensor split) and [`Lane`]
 //!   hands activations from one device to the next (layer split), over peer
 //!   access or the host, without the host waiting.
@@ -32,6 +33,7 @@ mod q4;
 mod sampler;
 mod stream;
 mod sys;
+mod tower;
 
 pub use attention::{
     ATTN_STATUS_DIRECT_MEAN, ATTN_STATUS_NONFINITE, ATTN_STATUS_OVERFLOW, AttendBuffers,
@@ -68,3 +70,4 @@ pub use sampler::{
     Descent, PassMode, Phase, SAMPLE_MAX_VOCAB, SampleBatch, SamplePlan, SampleStep, SamplerKernels,
 };
 pub use stream::{Event, Stream};
+pub use tower::{HeadShape, PositionGrid, TowerKernels};

@@ -75,6 +75,17 @@ pub enum Error {
         #[source]
         source: ares_quant::Error,
     },
+    /// Something the device implementation cannot lay out or run.
+    #[error("{what} cannot run on the device: {problem}")]
+    Device {
+        /// The tensor or part of the pass.
+        what: String,
+        /// Why, as a sentence.
+        problem: String,
+    },
+    /// The device failed.
+    #[error("device: {0}")]
+    Cuda(#[from] ares_cuda::Error),
     /// Pixels that the tower cannot take.
     #[error("an image of {width} x {height} pixels {problem}")]
     Image {

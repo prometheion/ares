@@ -24,7 +24,8 @@
 //! for it and nothing stands in for them. The many-row expert kernels
 //! (`kernels/expertrows.cu` and `expertrows_{k,i,l,f}.cu`, which hold the kernels of the
 //! other weight types and are modules of their own so that they compile side by side) are
-//! built the same way and for the same reason.
+//! built the same way and for the same reason, as is the image tower's module
+//! (`kernels/tower.cu`), whose attention uses the same instructions.
 //!
 //! Environment:
 //! - `NVCC`: path of the compiler (default: `$CUDA_PATH/bin/nvcc`,
@@ -106,6 +107,7 @@ fn main() {
         ("expertrows_l.cu", "expertrows_l.fatbin", TENSOR_FLOOR),
         ("expertrows_f.cu", "expertrows_f.fatbin", TENSOR_FLOOR),
         ("q4.cu", "q4.fatbin", FLOOR),
+        ("tower.cu", "tower.fatbin", TENSOR_FLOOR),
         ("sampler.cu", "sampler.fatbin", FLOOR),
     ];
     let children: Vec<_> = modules

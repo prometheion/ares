@@ -4,9 +4,10 @@
 //! `general.architecture = "clip"` beside the language model's.
 //!
 //! What is here is the configuration, the weight table, the pixel work (size
-//! rule, resize, normalisation) and a CPU reference of the pass. The reference
-//! is a test oracle for a device implementation, not a serving path. It takes
-//! pixels; decoding image files is not its business.
+//! rule, resize, normalisation, patch rows), a CPU reference of the pass and the
+//! pass on a device ([`DeviceTower`], with its weights in VRAM or in page-locked
+//! RAM). The reference is the test oracle of the device, not a serving path. Both
+//! take pixels; decoding image files is not their business.
 //!
 //! The pass, with `pw` x `ph` patches of `patch` x `patch` pixels and
 //! `nx = pw / 2`, `ny = ph / 2`:
@@ -24,13 +25,15 @@
 //!    merger's two matrices with the GELU between: `nx * ny` rows.
 
 pub mod config;
+pub mod device;
 mod error;
 pub mod image;
 pub mod reference;
 pub mod weights;
 
 pub use config::Config;
+pub use device::{DeviceTower, Home, Scratch};
 pub use error::{Error, Result};
-pub use image::{Limits, normalize, resize_bicubic, target_size};
+pub use image::{Limits, normalize, patch_position, patch_rows, resize_bicubic, target_size};
 pub use reference::{Arithmetic, Reference, Rows, Stage};
 pub use weights::Weights;
