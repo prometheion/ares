@@ -18,7 +18,7 @@ Vulkan parity last.
 | Piece | State |
 | --- | --- |
 | Shared model layer steps 5 and 6: token rows, one MTP driver, drafter kinds named `ngram`, `mtp`, `dflash` everywhere, MTP from a separate file for every model, the draft vocabulary for every drafter and model | agent working (`model/mtp-driver`) |
-| Flash-Next's float-path tensors in all 28 types (UD-Q4_K_XL has them in Q8_0), every placement for any quantization mix that fits, refusals that name the real limit | agent working (`moe/q4-load`) |
+| Flash-Next's float-path tensors in all 28 types (UD-Q4_K_XL has them in Q8_0), every placement for any quantization mix that fits, refusals that name the real limit | built (`moe/q4-load`), to be verified and merged; what is left is below |
 
 ## Shared model layer (the owner's rule, 2026-11-16)
 Generic for Ares, not like llama.cpp: a few models, shared code where it can be, each model
@@ -53,8 +53,29 @@ between cards stay with the model. Today the two models share almost nothing ins
 - [ ] Turing.
 - [ ] K/V of a running sequence beyond VRAM (P16; an exception, low priority).
 
+## Weight types (`moe/q4-load`, 2026-11-17)
+Every tensor of both models takes every weight type the shape allows (the audit of every place
+that refused a type is in the branch's notes; ARCHITECTURE.md "Files in any type" and "A layer
+with fewer slots in VRAM than a step picks"). Left:
+- [ ] Gate and up of a layer's routed experts in two types are refused (the expert kernels read
+      both with one decoder): kernels per pair of types or two launches; the owner to decide.
+- [ ] A router of a type other than F32 is decoded to F32 at load, four bytes a weight (files
+      keep it F32); its kernels (decode, prediction, wide steps) would take the type.
+- [ ] Where VRAM holds fewer slots than a step picks, every layer's slots are at its floor, so
+      the heat no longer moves slots between layers; the floors in RAM cost `--ram`: UD-Q4_K_XL
+      needs 9G on one card and 10G with both cards on every layer (8G by layers).
+- [ ] The DFlash drafter's float matrices take the f16 tile path above eight rows without the
+      range check of Flash-Next's (`WeightRange`).
+- [ ] Shapes, not types: rows whose width a type's block does not divide cannot be stored in it
+      (Flash-Next's expert down projections of 640 values, the n-gram table's rows of 160, the
+      image tower's `ffn_down` of 4304); the 27B's tensor split cuts in units of 256.
+
 ## Optimising (after CUDA is complete, before Vulkan; the owner, 2026-11-16)
 Measured per phase on a quiet machine against the fork and Strata, the largest first. Known levers:
+- [ ] The fused read of a Q8_0 mixer (UD-Q4_K_XL) takes 43.8 us on the RTX 4070 where BF16 takes
+      24.9: it decodes byte by byte (a load of four codes at once would cut it); sixteen rare types
+      read through the decoder chosen at run time; the float read is 2 % slower than before the
+      types (5400 against 5112 instructions).
 - [ ] An expert from the SSD is three reads (its matrices lie apart in the file): 2.8 to 3.6 ms
       where the drive needs 1.4 ms per read. One read per expert (a layout of the SSD level).
 - [ ] Long prompts layer by layer with read-ahead; the profile's fill in large ordered reads.
@@ -69,6 +90,8 @@ Measured per phase on a quiet machine against the fork and Strata, the largest f
       than CUDA today); the delta rule's f16 state rounded per row; the sampler's `-0.0`.
 
 ## Measurements owed on a quiet machine
+- [ ] Flash-Next IQ2_XS decode step before and after `moe/q4-load` (eight pairs under load 10 to 19:
+      means 25.1 and 26.7 ms, within the spread; the read itself is 2 % slower).
 - [ ] Flash-Next with the owner's real limit (a RAM tier of 24 to 26 GiB), one card and two.
 - [ ] The SSD cache's times to the first token (taken under load so far).
 - [ ] Flash-Next with its draft block once speculation pays; target above 56 tokens/s.
