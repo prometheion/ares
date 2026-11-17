@@ -621,7 +621,7 @@ fn shares_text(shares: &[f64]) -> String {
 /// The token ids of a draft vocabulary file: one per line, `#` for comments.
 pub(crate) fn read_vocabulary(path: &Path) -> Result<Arc<[u32]>, LoadError> {
     let text = std::fs::read_to_string(path)
-        .map_err(|e| refuse(format!("cannot read the draft vocabulary {}: {e}", path.display())))?;
+        .map_err(|e| refuse(format!("--draft-vocab {}: cannot read it: {e}", path.display())))?;
     let mut tokens = Vec::new();
     for (number, line) in text.lines().enumerate() {
         let line = line.trim();
@@ -630,14 +630,14 @@ pub(crate) fn read_vocabulary(path: &Path) -> Result<Arc<[u32]>, LoadError> {
         }
         tokens.push(line.parse::<u32>().map_err(|_| {
             refuse(format!(
-                "draft vocabulary {}, line {}: '{line}' is not a token id",
+                "--draft-vocab {}, line {}: '{line}' is not a token id",
                 path.display(),
                 number + 1
             ))
         })?);
     }
     if tokens.is_empty() {
-        return Err(refuse(format!("the draft vocabulary {} is empty", path.display())));
+        return Err(refuse(format!("--draft-vocab {}: the list is empty", path.display())));
     }
     Ok(tokens.into())
 }

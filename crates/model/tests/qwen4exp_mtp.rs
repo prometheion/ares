@@ -72,12 +72,21 @@ fn the_made_up_block_loads_as_described() {
 }
 
 #[test]
-fn a_model_file_is_not_an_mtp_block_and_a_block_of_another_shape_is_refused() {
+fn a_model_file_gives_its_block_only_when_it_carries_one_and_a_block_of_another_shape_is_refused() {
     let model = Synthetic::small(12);
     let gguf = open("refused-model", &model.bytes());
     let config = Config::from_gguf(&gguf).expect("config");
-    let error = MtpWeights::load(&gguf, &config).expect_err("a model is no block");
-    assert!(matches!(error, Error::NotAnMtpBlock { .. }), "{error}");
+    // A model file gives its MTP block (`--drafters mtp`) when it carries
+    // one; one that carries none is refused by the first tensor it lacks.
+    let error = MtpWeights::load(&gguf, &config).expect_err("a model without its block");
+    assert!(matches!(&error, Error::MissingTensor { name } if name.starts_with("mtp.")), "{error}");
+    let experts = (GgmlType::F32, GgmlType::F32);
+    let carries = open("model-with-block", &model.bytes_with_mtp(experts));
+    let in_model = MtpWeights::load(&carries, &config).expect("the block of the model file");
+    let own = open("own-block", &model.draft_bytes(Some(experts)));
+    let alone = MtpWeights::load(&own, &config).expect("the block of a file of its own");
+    assert_eq!(in_model.fc_embedding.bytes(), alone.fc_embedding.bytes(), "the same block");
+    assert_eq!(in_model.norm_hidden, alone.norm_hidden);
 
     let mut other = model.clone();
     other.shape.expert_ff *= 2;

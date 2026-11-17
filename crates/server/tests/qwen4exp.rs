@@ -85,19 +85,29 @@ fn options_that_mean_nothing_for_a_mixture_of_experts_are_refused_by_name() {
     let stderr = refuses(&["--shares", "0.5,0.5"], "--shares");
     assert!(stderr.contains("--split"), "it says what to use instead: {stderr}");
     refuses(&["--precision", "exact"], "--precision");
-    refuses(&["--draft-vocab", "tokens.txt"], "--draft-vocab");
-    // The model file carries no MTP block: the block is a file of its own.
-    // Without it no model drafter takes part, nothing speculates and a window
-    // would be room for nothing.
-    let stderr = refuses(&["--drafters", "mtp"], "--drafters");
-    assert!(stderr.contains("a file of its own"), "{stderr}");
-    let stderr = refuses(&["--drafters", "mtp,/models/dflash2.gguf"], "--drafters");
-    assert!(stderr.contains("a file of its own"), "{stderr}");
-    // One MTP block and one DFlash drafter at most: two files that are no
-    // DFlash drafter are two MTP blocks.
-    let stderr = refuses(&["--drafters", "/models/a.gguf,/models/b.gguf"], "--drafters");
-    assert!(stderr.contains("one MTP block"), "{stderr}");
+    // Without a model drafter nothing speculates: a draft vocabulary would
+    // order the head for no drafter, and a window would be room for nothing.
+    let stderr = refuses(&["--draft-vocab", "tokens.txt"], "--draft-vocab");
+    assert!(stderr.contains("without a model drafter"), "{stderr}");
     refuses(&["--window", "8"], "--window");
+    // This model file carries no MTP block: `--drafters mtp` names the block
+    // of the model file, and a file of the block is named by its path.
+    let stderr = refuses(&["--drafters", "mtp"], "--drafters mtp");
+    assert!(stderr.contains("carries no MTP block"), "{stderr}");
+}
+
+#[test]
+fn the_model_drafts_with_one_mtp_block_and_one_dflash_drafter_at_most() {
+    let block = mtp_file().to_str().unwrap();
+    // Two files of an MTP block are two blocks.
+    let copy = model().with_file_name("made-draft-copy.gguf");
+    std::fs::copy(mtp_file(), &copy).unwrap();
+    let two = format!("{block},{}", copy.display());
+    let stderr = refuses(&["--drafters", &two], "--drafters");
+    assert!(stderr.contains("one MTP block and one DFlash drafter at most"), "{stderr}");
+    // `mtp` names the block of the model file, and a file names another one.
+    let stderr = refuses(&["--drafters", &format!("mtp,{block}")], "--drafters");
+    assert!(stderr.contains("the model drafts with one"), "{stderr}");
 }
 
 #[test]
@@ -140,6 +150,18 @@ fn the_window_of_a_drafting_model_fits_the_step_that_verifies() {
     // verifies drafts has the eight rows of the decode kernels.
     let stderr = refuses(&["--drafters", block, "--window", "9"], "--window");
     assert!(stderr.contains("2 to 8"), "{stderr}");
-    // The block picks from the whole head.
-    refuses(&["--drafters", block, "--draft-vocab", "tokens.txt"], "--draft-vocab");
+}
+
+#[test]
+fn a_draft_vocabulary_of_the_block_is_read_before_a_device_is_touched() {
+    // The draft vocabulary is the head view of every drafter of the model,
+    // the MTP block's too: a list that cannot be read is refused by name.
+    let block = mtp_file().to_str().unwrap();
+    let stderr =
+        refuses(&["--drafters", block, "--draft-vocab", "/nowhere/v.txt"], "--draft-vocab");
+    assert!(stderr.contains("/nowhere/v.txt"), "{stderr}");
+    let list = model().with_file_name("made-vocabulary.txt");
+    std::fs::write(&list, "# tokens\n5\n7\nseven\n").unwrap();
+    let stderr = refuses(&["--drafters", block, "--draft-vocab", list.to_str().unwrap()], "line 4");
+    assert!(stderr.contains("'seven' is not a token id"), "{stderr}");
 }

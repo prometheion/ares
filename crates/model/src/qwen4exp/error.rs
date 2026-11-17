@@ -43,7 +43,7 @@ pub enum Error {
         what: String,
     },
     /// A file that was named as the model's MTP block is something else.
-    #[error("general.architecture is {found}; the file of this model's MTP block has {expected}")]
+    #[error("general.architecture is {found}; an MTP block is a file of {expected} or the model's")]
     NotAnMtpBlock {
         /// The architecture the file names.
         found: String,
