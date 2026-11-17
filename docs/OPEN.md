@@ -17,7 +17,7 @@ Vulkan parity last.
 
 | Piece | State |
 | --- | --- |
-| Shared model layer steps 5 and 6: token rows, one MTP driver, drafter kinds named `ngram`, `mtp`, `dflash` everywhere, MTP from a separate file for every model, the draft vocabulary for every drafter and model | agent working (`model/mtp-driver`) |
+| Shared model layer steps 5 and 6: token rows, one MTP driver, drafter kinds named `ngram`, `mtp`, `dflash` everywhere, MTP from a separate file for every model, the draft vocabulary for every drafter and model | built on `model/mtp-driver` (9 commits), not merged: two server tests of the 27B with drafts end in `CUDA_ERROR_ILLEGAL_ADDRESS`, three host tests expect the old behaviour, measurements and docs unfinished (the agent ran out of context) |
 | Flash-Next's float-path tensors in all 28 types (UD-Q4_K_XL has them in Q8_0), every placement for any quantization mix that fits, refusals that name the real limit | built (`moe/q4-load`), to be verified and merged; what is left is below |
 
 ## Shared model layer (the owner's rule, 2026-11-16)
