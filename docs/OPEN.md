@@ -1,7 +1,7 @@
 # What is still open
 
-Updated 2026-11-17, `main` at the shared layer's step 4, DFlash on both models, pruning and the
-experts' read-ahead (nothing pushed). What is there is listed in
+Updated 2026-11-17, `main` at the shared layer's steps 5 and 6 (one MTP driver, drafter kinds
+`ngram`, `mtp`, `dflash`) and the float path in every type (nothing pushed). What is there is listed in
 [`FEATURES.md`](FEATURES.md).
 This file is brought up to date at every merge into `main`. It lists work, defects and
 measurements that are owed; what a feature must do in detail is in
@@ -16,7 +16,8 @@ Vulkan parity last.
 ## Next, in this order (the owner, 2026-11-17, after the gap study)
 For "CUDA complete", the order in which the items below are taken up; each item stays in its
 section further down.
-1. Pin Claude Code's billing stamp at the start of its system prompt (prompt cache).
+1. Pin Claude Code's billing stamp at the start of its system prompt as upstream llama.cpp does
+   (the owner, 2026-11-17: on `/v1/messages` the five characters after `cch=` become `fffff`).
 2. A root checkpoint at the end of the system prompt and the tool list, and denser checkpoints
    inside a long prompt, for both models (prompt cache).
 3. Large prompt chunks for Flash-Next with expert slots borrowed in VRAM, batch and micro-batch
@@ -36,7 +37,7 @@ stored responses, TLS.
 
 | Piece | State |
 | --- | --- |
-| Shared model layer steps 5 and 6: token rows, one MTP driver, drafter kinds named `ngram`, `mtp`, `dflash` everywhere, MTP from a separate file for every model, the draft vocabulary for every drafter and model | done on `model/mtp-driver` (rebased on `main` 0c2b024), to be merged: the server's `CUDA_ERROR_ILLEGAL_ADDRESS` was a stale attention plan of a link a draft bar ended (fixed, with a test); fingerprints equal `main`'s; GPU suites and host checks green; numbers in `ARCHITECTURE.md` ("The MTP driver") |
+| (nothing in work: the owner starts the next pieces) | |
 
 ## Shared model layer (the owner's rule, 2026-11-16)
 Generic for Ares, not like llama.cpp: a few models, shared code where it can be, each model
@@ -528,7 +529,7 @@ with fewer slots in VRAM than a step picks"). Left:
 ## Optimising (after CUDA is complete, before Vulkan; the owner, 2026-11-16)
 Measured per phase on a quiet machine against the fork and Strata, the largest first. Known levers:
 - [ ] VRAM on loan to the expert tier: K/V pages a conversation does not need yet (Strata's
-      `--kv-grow`), the draft block's 675 MiB while a long prompt runs (gap study `/var/tmp/ares-survey/gap-study-2026-11-17.md`).
+      `--kv-grow`), the MTP block's 675 MiB while a long prompt runs (gap study `/var/tmp/ares-survey/gap-study-2026-11-17.md`).
 - [ ] Checkpoints of the recurrent state in int8 (SGLang's `mamba_checkpoint_pool.py`): a quarter
       of Flash-Next's 112 MiB, which matters because a full tier leaves one place; after a KL
       measurement (gap study `/var/tmp/ares-survey/gap-study-2026-11-17.md`).
