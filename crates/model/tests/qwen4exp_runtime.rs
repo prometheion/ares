@@ -1577,3 +1577,91 @@ fn the_usage_profile_outlives_the_engine_and_fills_the_tiers() {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+/// The MTP block in the model file (what `--drafters mtp` reads) drafts as
+/// the block of a file of its own does, and with a draft vocabulary every
+/// draft is a token of it (the head view, which the model's own head reads in
+/// its order too); drafts change no token either way.
+#[test]
+fn the_mtp_block_of_the_model_file_and_a_draft_vocabulary_change_no_token() {
+    if !enabled() {
+        return;
+    }
+    let seed = 2;
+    let path = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("q4rt-{seed}-mtp.gguf"));
+    std::fs::write(&path, model(seed).bytes_with_mtp((GgmlType::IQ2_S, GgmlType::Q2_0)))
+        .expect("the test directory is writable");
+    let mut repeats = prompt(12, 5);
+    repeats.extend_from_within(..);
+    let placement = Placement::One;
+    let (runtime, plain_model) = start(seed, placement, 16, RuntimeConfig::default());
+    warm(&plain_model);
+    let plain = ask(&runtime, 1, &repeats, 80);
+    runtime.shutdown();
+    drop(plain_model);
+
+    // The block of the model file.
+    let config = RuntimeConfig { window_rows: 8, ..RuntimeConfig::default() };
+    let (runtime, drafting) =
+        start_with(&path, Some(&path), placement, 16, config.clone(), MAX_ROWS, Cache::On);
+    warm(&drafting);
+    let with_block = ask(&runtime, 1, &repeats, 80);
+    let counters = runtime.snapshot().expect("the runtime is running").counters;
+    runtime.shutdown();
+    drop(drafting);
+    eprintln!(
+        "RES the block of the model file: {} links in {} steps, draft rows {}, accepted {}",
+        counters.model_draft_links,
+        counters.model_draft_steps,
+        counters.draft_rows,
+        counters.drafts_accepted
+    );
+    assert!(counters.model_draft_links > 0, "the block of the model file drafted nothing");
+    assert_eq!(with_block, plain, "the block of the model file changed the text");
+
+    // A draft vocabulary of every third token.
+    let vocabulary: Vec<u32> = (0..model(seed).shape.n_vocab as u32).step_by(3).collect();
+    let devices = open_devices(placement);
+    let gguf = Gguf::open(gguf_path(seed)).unwrap();
+    let n_layer = Config::from_gguf(&gguf).unwrap().n_layer;
+    let opts = options(placement, n_layer, 16, MAX_ROWS, MAX_ROWS);
+    let inner = Qwen4Exp::new(gguf, byte_tokenizer(None), "made", &devices, opts, CELLS)
+        .unwrap()
+        .with_mtp(Gguf::open(draft_path(seed)).unwrap())
+        .expect("the MTP block fits")
+        .with_draft_vocabulary(&vocabulary)
+        .expect("a draft vocabulary");
+    let inner = Arc::new(inner);
+    let config = RuntimeConfig {
+        pages: 16,
+        cells_per_page: 128,
+        max_slots: SLOTS,
+        window_rows: 8,
+        ..config
+    };
+    let model: Arc<dyn Model> = Arc::new(Made(inner.clone(), Cache::On));
+    let mut gpu = GpuConfig::new(&config, &*model);
+    gpu.ram_limit += 256 << 20;
+    gpu.vram_headroom = 512 << 20;
+    let runtime = Runtime::start_gpu(model, devices, config, gpu).expect("the runtime starts");
+    warm(&inner);
+    inner.take_mtp_chains();
+    let with_vocabulary = ask(&runtime, 1, &repeats, 80);
+    let chains = inner.take_mtp_chains();
+    let report = inner.mtp_report().expect("the model has an MTP block");
+    runtime.shutdown();
+    let drafts: Vec<u32> = chains.iter().flat_map(|c| c.drafts.iter().copied()).collect();
+    eprintln!(
+        "RES a draft vocabulary of {} tokens: {} chains, {} drafts; the block keeps {} rows of \
+         the embedding table ({} B)",
+        vocabulary.len(),
+        chains.len(),
+        drafts.len(),
+        report.kept_rows,
+        report.kept_bytes
+    );
+    assert_eq!(report.kept_rows as usize, vocabulary.len());
+    assert!(!drafts.is_empty(), "the block drafted nothing with a draft vocabulary");
+    assert!(drafts.iter().all(|t| vocabulary.contains(t)), "a draft outside the vocabulary");
+    assert_eq!(with_vocabulary, plain, "drafts from a draft vocabulary changed the text");
+}

@@ -89,17 +89,31 @@ fn answers(
     drafts: u32,
     questions: &[&str],
 ) -> (Vec<String>, Counters) {
-    answers_with(model, vocabulary, drafts, questions, true, None)
+    answers_with(model, vocabulary, drafts, questions, &Drafting::default())
 }
 
-/// [`answers`] with the MTP block or not, and a DFlash drafter or not.
+/// The drafters of a run and where the model is.
+struct Drafting {
+    /// The MTP block takes part, the model file's or that of `mtp_file`.
+    mtp: bool,
+    mtp_file: Option<PathBuf>,
+    dflash: Option<Arc<ares_model::dflash::File>>,
+    spread: Spread,
+}
+
+impl Default for Drafting {
+    fn default() -> Self {
+        Self { mtp: true, mtp_file: None, dflash: None, spread: Spread::Tensor(vec![0.625, 0.375]) }
+    }
+}
+
+/// [`answers`] with the drafters and the placement of `drafting`.
 fn answers_with(
     model: &Path,
     vocabulary: Option<&Arc<[u32]>>,
     drafts: u32,
     questions: &[&str],
-    mtp: bool,
-    dflash: Option<&Arc<ares_model::dflash::File>>,
+    drafting: &Drafting,
 ) -> (Vec<String>, Counters) {
     let options = kv_env::with_env(Options {
         precision: Precision::Exact,
@@ -107,19 +121,13 @@ fn answers_with(
         logit_rows: 16,
         window_rows: if drafts > 0 { drafts + 1 } else { 0 },
         draft_vocabulary: vocabulary.cloned(),
-        mtp,
-        dflash: dflash.cloned(),
+        mtp: drafting.mtp,
+        mtp_file: drafting.mtp_file.as_ref().map(|path| Arc::new(Gguf::open(path).unwrap())),
+        dflash: drafting.dflash.clone(),
         ..Options::default()
     });
     let model = Arc::new(
-        Qwen35::new(
-            Gguf::open(model).unwrap(),
-            "q",
-            &Spread::Tensor(vec![0.625, 0.375]),
-            options,
-            1024,
-        )
-        .unwrap(),
+        Qwen35::new(Gguf::open(model).unwrap(), "q", &drafting.spread, options, 1024).unwrap(),
     );
     assert_eq!(model.placement().draft.is_some(), drafts > 0);
     let config = RuntimeConfig {
@@ -239,8 +247,9 @@ fn the_text_with_dflash_drafts_is_the_text_without() {
     ];
     let (plain, _) = answers(&model, vocabulary.as_ref(), 0, &questions);
     for mtp in [false, true] {
+        let drafting = Drafting { mtp, dflash: Some(file.clone()), ..Drafting::default() };
         let (drafted, counters) =
-            answers_with(&model, vocabulary.as_ref(), 7, &questions, mtp, Some(&file));
+            answers_with(&model, vocabulary.as_ref(), 7, &questions, &drafting);
         let (tested, accepted) = (counters.drafts_tested_at[2], counters.drafts_accepted_at[2]);
         eprintln!(
             "RES dflash{}: {} passes, {:.2} ms per drafting step; accepted by position {:?} of \
@@ -264,5 +273,57 @@ fn the_text_with_dflash_drafts_is_the_text_without() {
             assert!(tested[0] >= 20, "the DFlash drafter drafted: {tested:?}");
             assert!(accepted[0] * 3 >= tested[0], "a third of the first drafts: {accepted:?}");
         }
+    }
+}
+
+/// The MTP block drafts under a layer split too (on the last device, which
+/// holds the head and the final hidden states), and from a file of its own:
+/// `ARES_TEST_QWEN35_MTP_FILE` names a file of architecture `qwen35-mtp` with
+/// the 27B's block (made from the model file's own, it drafts what that one
+/// drafts). The texts with drafts are the texts without in each placement.
+#[test]
+fn the_text_with_mtp_drafts_is_the_text_without_under_a_layer_split_and_from_a_file() {
+    if std::env::var_os("ARES_TEST_CUDA").is_none() {
+        eprintln!("skipped: set ARES_TEST_CUDA=1 to run the tests that open GPUs");
+        return;
+    }
+    let Some(model) = env_path("ARES_TEST_QWEN35_27B") else { return };
+    if device_count().unwrap() < 2 {
+        eprintln!("skipped: the 27B needs two devices");
+        return;
+    }
+    let mtp_file = std::env::var_os("ARES_TEST_QWEN35_MTP_FILE").map(PathBuf::from);
+    let questions = [
+        "Erkl\u{e4}re in drei S\u{e4}tzen, warum der Himmel blau ist.",
+        "Write a Python function that returns the n-th Fibonacci number.",
+    ];
+    let layer = Spread::Layer(vec![0.5, 0.5]);
+    let plain_drafting = Drafting { mtp: false, spread: layer.clone(), ..Drafting::default() };
+    let (plain, _) = answers_with(&model, None, 0, &questions, &plain_drafting);
+    let mut runs = vec![("the model file's block", None)];
+    runs.extend(mtp_file.map(|file| ("the block of a file of its own", Some(file))));
+    let mut accepted_of = Vec::new();
+    for (what, file) in runs {
+        let drafting = Drafting { mtp_file: file, spread: layer.clone(), ..Drafting::default() };
+        let (drafted, counters) = answers_with(&model, None, 3, &questions, &drafting);
+        let (tested, accepted) = (counters.drafts_tested_at[1], counters.drafts_accepted_at[1]);
+        eprintln!(
+            "RES layer split, {what}: {} links in {} steps, {:.2} ms per link; accepted by \
+             position {:?} of {:?}; {} tokens in {} steps",
+            counters.model_draft_links,
+            counters.model_draft_steps,
+            counters.model_draft_us as f64 / 1e3 / counters.model_draft_links.max(1) as f64,
+            &accepted[..3],
+            &tested[..3],
+            counters.tokens,
+            counters.steps,
+        );
+        assert_eq!(plain, drafted, "the MTP drafts under a layer split changed the text ({what})");
+        assert!(tested[0] >= 50, "the model drafted: {tested:?}");
+        assert!(accepted[0] * 3 >= tested[0], "a third of the first drafts: {accepted:?}");
+        accepted_of.push((tested, accepted));
+    }
+    if let [own, file] = accepted_of.as_slice() {
+        assert_eq!(own, file, "the block from a file drafts what the model file's block drafts");
     }
 }

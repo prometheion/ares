@@ -291,6 +291,24 @@ impl Synthetic {
         let mut file = File::default();
         file.string("general.architecture", "qwen4exp-mtp");
         file.string("general.name", "ares synthetic qwen4exp MTP block");
+        self.mtp_tensors(&mut file, experts);
+        file.build()
+    }
+
+    /// The bytes of the model file with its MTP block in it: the model's
+    /// tensors (the routed experts as [`Synthetic::bytes_with_experts`] gives
+    /// them) and the block's of [`Synthetic::draft_bytes`], under the same
+    /// names, for `--drafters mtp`.
+    pub fn bytes_with_mtp(&self, experts: (GgmlType, GgmlType)) -> Vec<u8> {
+        let mut file = File::default();
+        self.metadata(&mut file);
+        self.tensors(&mut file, Some(experts), None);
+        self.mtp_tensors(&mut file, Some(experts));
+        file.build()
+    }
+
+    /// Adds the tensors of the MTP block to `file`.
+    fn mtp_tensors(&self, file: &mut File, experts: Option<(GgmlType, GgmlType)>) {
         let s = &self.shape;
         let (n, wide, lr) = (s.n_embd, s.wide(), s.mixer_rank);
         let shipped = self.types != Types::F32;
@@ -309,10 +327,10 @@ impl Synthetic {
         };
         // The two projections keep the scale of what they read: the residual
         // of a made-up trunk and its embeddings have an RMS of about one.
-        matrix(&mut file, "mtp.fc_embedding.weight", &[n, n], 0.7, dense);
-        matrix(&mut file, "mtp.fc_hidden.weight", &[n, n], 0.7, dense);
-        vector(&mut file, "mtp.pre_fc_norm_embedding.weight", &[n], 0.1, 0.0);
-        vector(&mut file, "mtp.pre_fc_norm_hidden.weight", &[wide], 0.1, 0.0);
+        matrix(file, "mtp.fc_embedding.weight", &[n, n], 0.7, dense);
+        matrix(file, "mtp.fc_hidden.weight", &[n, n], 0.7, dense);
+        vector(file, "mtp.pre_fc_norm_embedding.weight", &[n], 0.1, 0.0);
+        vector(file, "mtp.pre_fc_norm_hidden.weight", &[wide], 0.1, 0.0);
         let mixers = [
             ("mtp.layers.0.attn_hyper_connection", true),
             ("mtp.layers.0.mlp_hyper_connection", true),
@@ -320,39 +338,33 @@ impl Synthetic {
         ];
         for (prefix, inject) in mixers {
             let name = |what: &str| format!("{prefix}.{what}");
-            vector(&mut file, &name("hc_norm.weight"), &[wide], 0.1, 0.0);
-            matrix(&mut file, &name("input_mix_weight_down.weight"), &[wide, lr], 2.0, bf16);
-            matrix(&mut file, &name("input_mix_weight_up.weight"), &[lr, wide], 2.0, bf16);
+            vector(file, &name("hc_norm.weight"), &[wide], 0.1, 0.0);
+            matrix(file, &name("input_mix_weight_down.weight"), &[wide, lr], 2.0, bf16);
+            matrix(file, &name("input_mix_weight_up.weight"), &[lr, wide], 2.0, bf16);
             if inject {
-                matrix(
-                    &mut file,
-                    &name("block_inject_weight.weight"),
-                    &[wide, s.n_stream],
-                    2.0,
-                    bf16,
-                );
+                matrix(file, &name("block_inject_weight.weight"), &[wide, s.n_stream], 2.0, bf16);
             }
         }
         let name = |what: &str| format!("mtp.layers.0.{what}");
         let (q_dim, kv_dim) = (s.n_head * s.head_dim, s.n_head_kv * s.head_dim);
-        matrix(&mut file, &name("self_attn.q_proj.weight"), &[n, q_dim * 2], 1.5, dense);
-        matrix(&mut file, &name("self_attn.k_proj.weight"), &[n, kv_dim], 1.5, dense);
-        matrix(&mut file, &name("self_attn.v_proj.weight"), &[n, kv_dim], 1.5, dense);
-        matrix(&mut file, &name("self_attn.o_proj.weight"), &[q_dim, n], 1.5, dense);
-        vector(&mut file, &name("self_attn.q_norm.weight"), &[s.head_dim], 0.2, 0.5);
-        vector(&mut file, &name("self_attn.k_norm.weight"), &[s.head_dim], 0.2, 0.5);
+        matrix(file, &name("self_attn.q_proj.weight"), &[n, q_dim * 2], 1.5, dense);
+        matrix(file, &name("self_attn.k_proj.weight"), &[n, kv_dim], 1.5, dense);
+        matrix(file, &name("self_attn.v_proj.weight"), &[n, kv_dim], 1.5, dense);
+        matrix(file, &name("self_attn.o_proj.weight"), &[q_dim, n], 1.5, dense);
+        vector(file, &name("self_attn.q_norm.weight"), &[s.head_dim], 0.2, 0.5);
+        vector(file, &name("self_attn.k_norm.weight"), &[s.head_dim], 0.2, 0.5);
         let idx = s.indexer_dim;
         matrix(
-            &mut file,
+            file,
             &name("self_attn.indexer.index_qk_proj.weight"),
             &[n, (s.indexer_heads + 1) * idx],
             1.5,
             bf16,
         );
-        vector(&mut file, &name("self_attn.indexer.q_layernorm.weight"), &[idx], 0.1, 0.0);
-        vector(&mut file, &name("self_attn.indexer.k_layernorm.weight"), &[idx], 0.1, 0.0);
+        vector(file, &name("self_attn.indexer.q_layernorm.weight"), &[idx], 0.1, 0.0);
+        vector(file, &name("self_attn.indexer.k_layernorm.weight"), &[idx], 0.1, 0.0);
         // The real block's router is BF16 where the model's own are F32.
-        matrix(&mut file, &name("mlp.gate.weight"), &[n, s.n_expert], 6.0, bf16);
+        matrix(file, &name("mlp.gate.weight"), &[n, s.n_expert], 6.0, bf16);
         let stack = |file: &mut File, what: &str, dims: &[usize], gain: f32, which: usize| {
             let name = name(what);
             match experts.map(|types| [types.0, types.1][which]) {
@@ -365,25 +377,12 @@ impl Synthetic {
                 None => matrix(file, &name, dims, gain, lazy),
             }
         };
-        stack(&mut file, "mlp.experts.gate_up_proj", &[n, 2 * s.expert_ff, s.n_expert], 1.5, 0);
-        stack(&mut file, "mlp.experts.down_proj", &[s.expert_ff, n, s.n_expert], 1.0, 1);
-        matrix(&mut file, &name("mlp.shared_expert_gate.weight"), &[n, 1], 2.0, bf16);
-        matrix(
-            &mut file,
-            &name("mlp.shared_expert.gate_proj.weight"),
-            &[n, s.shared_ff],
-            1.5,
-            dense,
-        );
-        matrix(&mut file, &name("mlp.shared_expert.up_proj.weight"), &[n, s.shared_ff], 1.5, dense);
-        matrix(
-            &mut file,
-            &name("mlp.shared_expert.down_proj.weight"),
-            &[s.shared_ff, n],
-            1.0,
-            dense,
-        );
-        file.build()
+        stack(file, "mlp.experts.gate_up_proj", &[n, 2 * s.expert_ff, s.n_expert], 1.5, 0);
+        stack(file, "mlp.experts.down_proj", &[s.expert_ff, n, s.n_expert], 1.0, 1);
+        matrix(file, &name("mlp.shared_expert_gate.weight"), &[n, 1], 2.0, bf16);
+        matrix(file, &name("mlp.shared_expert.gate_proj.weight"), &[n, s.shared_ff], 1.5, dense);
+        matrix(file, &name("mlp.shared_expert.up_proj.weight"), &[n, s.shared_ff], 1.5, dense);
+        matrix(file, &name("mlp.shared_expert.down_proj.weight"), &[s.shared_ff, n], 1.0, dense);
     }
 
     fn metadata(&self, file: &mut File) {
