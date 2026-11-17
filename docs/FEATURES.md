@@ -1,6 +1,6 @@
 # What Ares can do today
 
-Updated 2026-11-16 for `main`. One line per feature; how it works is in
+Updated 2026-11-17 for `main`. One line per feature; how it works is in
 [`ARCHITECTURE.md`](ARCHITECTURE.md), what is missing in [`OPEN.md`](OPEN.md).
 Everything here runs on CUDA and was tested on an RTX 4070 with an RTX 3060. On Vulkan
 the kernels exist; no model runs there yet.
@@ -13,8 +13,8 @@ the kernels exist; no model runs there yet.
 | Weight types | all 28 GGUF types | all 28 in every tensor: experts, stream mixers and the n-gram block (exact) too |
 | K and V | `f16`, `q8` to `q4`, chosen separately (`--kv`) | `f16`, `q8` to `q4`, chosen separately (`--kv`); the MTP block's in `q4` |
 | Larger than VRAM | no | experts in VRAM slots, a RAM tier and on the SSD; the CPU computes missed ones, and what a step picks beyond a card's slots |
-| MTP | MTP block in the file, with a draft vocabulary | MTP block from a file (`--drafters <file>`), its experts resident in VRAM; exact |
-| DFlash2 drafter (`--drafters <file>`) | chains, one card or tensor split, with the draft vocabulary; exact | chains, one card or both cards on every layer; the mean of the four streams |
+| MTP (one driver) | the block in the model file (`--drafters mtp`) or a file of its own (`--drafters <file>`), every placement, chain and picks on the card, a draft vocabulary; exact | the block from a file of its own or a model file that carries it, its experts resident in VRAM, chain and picks on the card, a draft vocabulary; exact |
+| DFlash2 drafter (`--drafters <file>`) | chains, one card or tensor split, with the draft vocabulary; exact | chains, one card or both cards on every layer, with the draft vocabulary; the mean of the four streams |
 | Prefix cache | yes, with the RAM and SSD levels | yes, with the RAM and SSD levels; its RAM is what the tier of experts leaves |
 
 ## Speed
@@ -25,7 +25,8 @@ the kernels exist; no model runs there yet.
   expert from the SSD only while it is worth the wait.
 - Prompts are read in steps of 512 rows, in pieces between rounds of generation, so running
   requests go on.
-- 27B: the token embedding lies in host RAM (380 to 518 MiB of VRAM saved on the first card).
+- The token embedding stays in host RAM (27B: page-locked, 380 to 518 MiB of VRAM saved on the
+  first card; Flash-Next: the mapped file): a step stages its rows and the card decodes them.
 - Flash-Next: experts a prompt misses pass through transit slots; nothing is evicted for them.
 - Flash-Next: the routers of the next two layers, applied on the card, predict a step's
   picks; the store reads ahead from the SSD what no tier holds where such predictions have

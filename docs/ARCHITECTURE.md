@@ -1618,7 +1618,13 @@ layer). Everything else is the driver's:
   and before a link only where a bar may end a chain. The cells of links after
   the first are provisional: the layer's per-sequence state is saved behind
   link 0 and put back behind the last, and their keys and values are written
-  again when the model has passed them.
+  again when the model has passed them. A bar can end a chain before links the
+  driver laid out run, so what a layer keeps for the links of a step (the
+  27B's attention plans) is dropped when the next step's links are laid out
+  (`MtpLayer::forget_links`); until 2026-11-17 the next chain's first link took
+  such a plan and its attention read past its tables (`CUDA_ERROR_ILLEGAL_ADDRESS`
+  in the server after a few requests; `qwen35_mtp_device.rs` now cuts a chain
+  and runs it again).
 
 The round that verifies the drafts is an ordinary step whose windows carry the
 drafts as tokens. The conductor chooses per sequence and step between an n-gram

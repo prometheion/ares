@@ -52,8 +52,12 @@ between cards stay with the model. Today the two models share almost nothing ins
 - [x] 3. Flash-Next onto the K/V group: K and V in `q7` to `q4`, windows as if alone.
 - [x] 4. Slot state and checkpoints as one contract: Flash-Next's prefix cache with RAM and SSD
       (2026-11-16, `blocks/slots.rs`; the 27B moved onto it bit for bit).
-- [ ] 5. Token rows (embedding on the host, in the mapped file or on the card; the image rows).
-- [ ] 6. One driver for MTP, with the owner's rules (2026-11-16/17): as little per model as can
+- [x] 5. Token rows (embedding on the host, in the mapped file or on the card; the image rows):
+      `blocks/rows.rs`, 2026-11-17. The 27B moved onto it bit for bit; Flash-Next stages its
+      IQ4_XS rows from the mapped file and the card decodes them, bit for bit as the host did.
+      Open: no image tower uses the second row source yet; DFlash's newest token and mask rows
+      are still decoded on the host for every pass (both models).
+- [x] 6. One driver for MTP (`blocks/mtp.rs`, `blocks/head.rs`, 2026-11-17), with the owner's rules (2026-11-16/17): as little per model as can
       be (the model gives its layer and its tap); one set of names for the drafter kinds,
       `ngram`, `mtp`, `dflash`, in types, files, metrics, options and docs; MTP from a
       separate file for every model (`--drafters mtp` for the block in the model file,
@@ -79,7 +83,7 @@ between cards stay with the model. Today the two models share almost nothing ins
 ## Qwen3.8 Flash-Next (`qwen4exp`)
 
 ### Defects seen in the merge check of 2026-11-17 (intermittent, slower but not wrong)
-- [ ] `ares-server --test real` `flash_next_drafts_with_its_draft_block` sometimes verifies no
+- [ ] `ares-server --test real` `flash_next_drafts_with_its_mtp_block` sometimes verifies no
       draft at all (0 of 0) for a whole run; passes in other runs. Suspected: the conductor's
       prices measured cold at the start shut the windows out while warm-up is off with drafts.
 - [ ] `ares-server --test real_cache` `flash_next_resumes_a_conversation_from_the_cards_from_ram_and_from_ssd`
@@ -121,17 +125,17 @@ other differed more by the load than by the drafts.
       `--ram 8G` and took the gain away.
 - [x] What a row was left without is read ahead for the next round (`StoreConfig::read_left`):
       without it leaving only moved the read to the next round's first row.
-- [ ] Draft vocabulary (German, English, code) for the MTP block: the block's head is the
-      model's whole output head (248 320 rows) on the device with the head; a subset of its
-      rows gathered next to it, and the block's sampler mapping back to token ids, as the
-      27B does it (`--draft-vocab`). Not started.
+- [x] Draft vocabulary (German, English, code) for the MTP block and the DFlash drafter: the
+      head view of every drafter (`--draft-vocab`, 2026-11-17; shared layer step 6).
 - [ ] A window's price by what its rows read: on one card a round with drafts reads 100 to
       260 experts from the file against 45 to 100 for a row, and what those reads push out of
       the tiers and hold up for the next steps is charged to no step, so the conductor keeps
       choosing windows that cost more than they bring. A price per row by the tier its
       experts come from (the study's `dense(rows) + chain(links) + misses x cost per tier`),
       or the block not resident where VRAM holds a third of the experts, are the leads.
-- [ ] `--drafters mtp` for a model file that carries its block; drafts in the measuring tool.
+- [x] `--drafters mtp` for a model file that carries its block (2026-11-17).
+- [ ] Drafts in the measuring tool (`qwen4exp_run` has none; the server and the runtime's
+      tests measure them).
 
 ### Experts from the SSD
 Reference now in the open (2026-11-17): Run My AI's engine TokenWing, MIT, built on llama.cpp,
@@ -312,7 +316,8 @@ Everything `FEATURES.md` lists for the 27B and not for Flash-Next is owed:
       On the made-up Flash-Next under a limit the tier takes whole the place kept its first
       checkpoint over three turns (1 saved, 2 restored, 242 of 498 found rows replayed): a later
       checkpoint did not take the place over there; not looked into.
-- [ ] The MTP block read from the model file (`--drafters mtp`) and a draft vocabulary.
+- [x] The MTP block read from the model file (`--drafters mtp`) and a draft vocabulary
+      (2026-11-17).
 - Not owed (the owner, 2026-11-16): replies that are bit for bit the same from run to run.
   They differ slightly when the CPU computes missed experts, and that is accepted.
 - [ ] Structured output, tool calls and the Messages and Responses routes have never run on
@@ -320,8 +325,12 @@ Everything `FEATURES.md` lists for the 27B and not for Flash-Next is owed:
       tools exists and was not run).
 
 ## Qwen3.8 27B (`qwen35`)
-- [ ] Drafts under a layer split (Flash-Next drafts in every placement; the 27B not under
-      `--split layer`): parity owed to the 27B, step 6 of the shared layer.
+- [ ] Seen 2026-11-17 (main 4bec4b9 as well): with `max_tokens` 40 the first greedy reply to
+      real.rs's German question after a start (IQ2_XXS, one card, fast kernels) and the same
+      request again, its prefix from the cache, are different tokens (hashes 4d9a1bef2efe92d9
+      and c1f7796b6753a9e5), with drafts and without; at 160 tokens all agree. Not looked into.
+- [x] Drafts under a layer split (2026-11-17, step 6 of the shared layer: the MTP block on the
+      last device, with the head).
 - [ ] The draft chain's cut costs a wait of the host per link where a bar can end it (the
       device thread reads the link's picks before it enqueues the next); since 2026-11-16 the
       chain is a step of its own and the round verifies only what pays of it, so the cut
@@ -347,15 +356,15 @@ Everything `FEATURES.md` lists for the 27B and not for Flash-Next is owed:
       the first cut; on two cards most of the sampler's time on the RTX 3060 is the exchange.
 - [ ] F32 tile kernel is 2.5 times slower than BF16 (untuned).
 
-## Shared model layer (every model; the study `shared-model-layer.md`, steps 0 to 4 done)
+## Shared model layer (every model; the study `shared-model-layer.md`, steps 0 to 8 done)
 The K/V group, the recurrent block and the slot arena with its checkpoints are shared
 (`crates/model/src/blocks`); the rule for what
 becomes a block is in `ARCHITECTURE.md` ("The shared model layer"). Left, in the study's order:
 - [x] Slot arena and checkpoints as a block (extents from the blocks, save, restore, transfer,
       page copy over all groups); then the prefix cache of Flash-Next on it (2026-11-16).
-- [ ] Token rows (table at home on the host, in the mapped file or on the device; kept rows of
+- [x] Token rows (table at home on the host, in the mapped file or on the device; kept rows of
       a head view; a second row source for images); Flash-Next's embedding from staged rows.
-- [ ] One MTP driver for both models (chain on the device, picks by the sampler); the
+- [x] One MTP driver for both models (chain on the device, picks by the sampler); the
       27B's drafts under a layer split; Flash-Next's draft vocabulary and `--drafters mtp`.
 - [x] Drafter kinds in the runtime, taps and DFlash (chains).
 - [ ] Trees in the blocks, tree fill.
