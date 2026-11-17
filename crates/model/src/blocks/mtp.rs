@@ -186,6 +186,10 @@ pub(crate) trait MtpLayer {
         out: DevicePtr,
         logits: DevicePtr,
     ) -> Result<LinkLogits, ModelError>;
+    /// The links of a new step are laid out next: what the layer kept for the
+    /// links of the step before (its [`MtpLayer::bytes`] of them) is dropped,
+    /// also for links that a draft bar ended before they were made.
+    fn forget_links(&mut self);
     /// Keeps the per-sequence state of `slots` that links change, behind the
     /// first link; [`MtpLayer::restore`] puts it back behind the last.
     fn save(&mut self, stream: &Stream, slots: &[u32]) -> Result<(), ModelError>;
@@ -969,6 +973,7 @@ impl Driver {
         self.drafted = 0;
         self.made = 0;
         self.layout.clear();
+        layer.forget_links();
         if step.chains.is_empty() {
             return Ok(None);
         }

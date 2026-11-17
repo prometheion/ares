@@ -526,6 +526,11 @@ impl MtpLayer for PartLayer<'_> {
         Ok(LinkLogits { ptr: logits, stride: w.head.n_out })
     }
 
+    fn forget_links(&mut self) {
+        // The plans of links a draft bar ended were never taken by `link`.
+        self.layer.plans.clear();
+    }
+
     fn save(&mut self, _stream: &Stream, _slots: &[u32]) -> Result<(), ModelError> {
         // The block keeps no state per sequence besides its cells.
         Ok(())

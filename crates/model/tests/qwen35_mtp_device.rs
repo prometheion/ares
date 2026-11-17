@@ -35,7 +35,7 @@ use ares_model::qwen35::device::{
     page_bytes,
 };
 use ares_model::qwen35::{Config, MtpState, Reference, Weights};
-use ares_runtime::PinnedRam;
+use ares_runtime::{DraftChances, PinnedRam};
 use ares_sampler::{SAMPLE_CANDIDATES, SampleParams, SamplePick, SampleRow, sample_reference};
 
 fn env_path(name: &str) -> Option<PathBuf> {
@@ -79,6 +79,10 @@ fn rel(a: &[f32], b: &[f32]) -> f64 {
         n += f64::from(*y).powi(2);
     }
     (d / n).sqrt()
+}
+
+fn bits(x: &[f32]) -> Vec<u32> {
+    x.iter().map(|v| v.to_bits()).collect()
 }
 
 fn floats(bytes: &[u8]) -> Vec<f32> {
@@ -193,6 +197,19 @@ impl Rig {
     /// the drafts, each link's output and pick, the logits of the last link,
     /// and the tokens of the step record after the chain.
     fn chain(&mut self, pos0: u32, token: u32, rows: &[SampleRow]) -> Chain {
+        self.chain_with(pos0, token, rows, Vec::new(), None)
+    }
+
+    /// [`Rig::chain`] with draft bars: `needs` per link, `chances` the chance
+    /// of a draft by its probability.
+    fn chain_with(
+        &mut self,
+        pos0: u32,
+        token: u32,
+        rows: &[SampleRow],
+        needs: Vec<f32>,
+        chances: Option<DraftChances>,
+    ) -> Chain {
         let k = rows.len();
         let segment =
             Segment { row0: 0, n_rows: k as u32 + 1, slot: 0, pos0: pos0 as i32, direct: false };
@@ -214,14 +231,8 @@ impl Rig {
         self.part
             .mtp_step(MtpStep {
                 tokens: self.record.ptr().offset(off_tokens),
-                chains: vec![MtpChain {
-                    segment: 0,
-                    token,
-                    rows: rows.to_vec(),
-                    needs: Vec::new(),
-                    place: 0,
-                }],
-                chances: None,
+                chains: vec![MtpChain { segment: 0, token, rows: rows.to_vec(), needs, place: 0 }],
+                chances,
             })
             .unwrap();
         self.part.enqueue_chains(&env).unwrap();
@@ -382,6 +393,7 @@ fn the_mtp_block_on_the_device_drafts_what_the_reference_drafts() {
                 .map(|dir| read_i32(&dir.join(prompt_name).join("mtp.chain.tokens.i32")));
             // The second chain starts after a window of WINDOW accepted rows.
             let starts = [(n, generated[0]), (n + WINDOW, generated[WINDOW])];
+            let mut second = None;
             for (round, (pos0, token)) in starts.into_iter().enumerate() {
                 if round == 1 {
                     // The window: the newest token and four more, all accepted.
@@ -434,6 +446,27 @@ fn the_mtp_block_on_the_device_drafts_what_the_reference_drafts() {
                 if precision == Precision::Exact {
                     assert_eq!(got.drafts, want_tokens, "the chain is the reference's");
                 }
+                second = Some(got);
+            }
+            let second = second.expect("two chains");
+
+            // A chain that its bar ends after the first link: the plans of the
+            // links it did not make are not the next chain's (the next chain
+            // read past its tables with them, 2026-11-17). The same chain again
+            // is then the chain it was, bit for bit.
+            rig.part.draft_ms().unwrap();
+            let links = rig.part.mtp_times().links;
+            let even: DraftChances = std::array::from_fn(|_| 0.5);
+            let (pos0, token) = ((n + WINDOW) as u32, generated[WINDOW]);
+            let bars = vec![0.0, 1.0, 1.0, 1.0];
+            let cut = rig.chain_with(pos0, token, &greedy, bars, Some(even));
+            rig.part.draft_ms().unwrap();
+            assert_eq!(rig.part.mtp_times().links, links + 1, "the bar ended the chain");
+            assert_eq!(cut.drafts[0], second.drafts[0]);
+            let again = rig.chain(pos0, token, &greedy);
+            assert_eq!(again.drafts, second.drafts, "the chain after a chain that was cut");
+            for (a, b) in again.outputs.iter().zip(&second.outputs) {
+                assert_eq!(bits(a), bits(b));
             }
 
             // With sampling a link's pick is the sampler's pick from its logits.

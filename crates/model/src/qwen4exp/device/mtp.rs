@@ -220,6 +220,10 @@ impl MtpLayer for BlockLayer<'_> {
         Ok(LinkLogits { ptr: self.part.head_logits(), stride: self.head_rows })
     }
 
+    fn forget_links(&mut self) {
+        // Nothing is kept: the part plans a link when it runs it.
+    }
+
     fn save(&mut self, stream: &Stream, slots: &[u32]) -> Result<(), ModelError> {
         slots.iter().try_for_each(|&slot| self.part.save_slot(stream, slot))
     }
