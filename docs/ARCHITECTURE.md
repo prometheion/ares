@@ -1638,6 +1638,24 @@ it. Its weights come from the model file (`--drafters mtp`) or a file of its
 own (`--drafters FILE`: `qwen35-mtp` for the 27B, the block's tensors under the
 model file's names `blk.<n_layer>.*`; `qwen4exp-mtp` for Flash-Next).
 
+Measured 2026-11-17, `main` before the driver against the driver, in alternation,
+loads 2 to 6. The 27B on two cards (tensor split, no draft vocabulary, the seven
+requests of `qwen35_run --engine 8` with 200 tokens each): 75.1 and 74.6 tokens/s
+on the mean of two runs each; a link takes 1.48 ms on the device (1.50 with exact
+products) and 2.5 to 2.6 ms per link of a step that drafts in the engine on both
+builds (the driver's step that drafts also follows the accepted rows of the round
+before). Under a layer split without a draft vocabulary a link reads the whole
+output head on the last card: 4.70 ms a link through the runtime on the RTX 3060.
+Flash-Next (two cards, `--ram 8G`, the server, twelve requests of German, English
+and code each): a link takes 1.38 to 1.40 ms where it took 1.65 to 2.02 with the
+host's wait for every pick, and 0.85 to 0.88 ms with the draft vocabulary of
+66 343 tokens; 39.0 tokens/s on the mean against 41.1 before (requests from 31 to
+59), 39.3 with the vocabulary. With cheaper links the conductor verifies more of
+the block's drafts, at a lower rate (the first link's: 54 to 58 % against 63 to
+71 %). The DFlash drafter's step that only drafts takes 5.19 ms with the whole
+head and 3.03 ms with the vocabulary (`qwen4exp_runtime`); the replies with
+drafts are the replies without, with the vocabulary too.
+
 Measured 2026-11-10 on Qwen3.8-27B (tensor split 0.625 / 0.375, RTX 4070 and
 RTX 3060, at most three drafts, the fork's draft vocabulary of 66 343 tokens,
 300 tokens per request through the chat template with the fork's

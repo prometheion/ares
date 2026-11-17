@@ -36,7 +36,7 @@ stored responses, TLS.
 
 | Piece | State |
 | --- | --- |
-| Shared model layer steps 5 and 6: token rows, one MTP driver, drafter kinds named `ngram`, `mtp`, `dflash` everywhere, MTP from a separate file for every model, the draft vocabulary for every drafter and model | built on `model/mtp-driver`; a second agent finishes it (rebase onto main, a `CUDA_ERROR_ILLEGAL_ADDRESS` in two server tests of the 27B with drafts, three host tests, measurements, docs) |
+| Shared model layer steps 5 and 6: token rows, one MTP driver, drafter kinds named `ngram`, `mtp`, `dflash` everywhere, MTP from a separate file for every model, the draft vocabulary for every drafter and model | done on `model/mtp-driver` (rebased on `main` 0c2b024), to be merged: the server's `CUDA_ERROR_ILLEGAL_ADDRESS` was a stale attention plan of a link a draft bar ended (fixed, with a test); fingerprints equal `main`'s; GPU suites and host checks green; numbers in `ARCHITECTURE.md` ("The MTP driver") |
 
 ## Shared model layer (the owner's rule, 2026-11-16)
 Generic for Ares, not like llama.cpp: a few models, shared code where it can be, each model
@@ -134,6 +134,11 @@ other differed more by the load than by the drafts.
       experts come from (the study's `dense(rows) + chain(links) + misses x cost per tier`),
       or the block not resident where VRAM holds a third of the experts, are the leads.
 - [x] `--drafters mtp` for a model file that carries its block (2026-11-17).
+- [ ] With the shared MTP driver (links of 1.4 ms, 0.9 with the draft vocabulary, where they took
+      1.7 to 2.0 with the host's wait) Flash-Next answered at 39.0 tokens/s on the mean of twelve
+      requests against 41.1 before (2026-11-17, alternating, loads 2 to 6; requests from 31 to
+      59): the conductor verifies more of the cheaper drafts at a lower rate (the first link's
+      54 to 58 % against 63 to 71 %). A window's price by what its rows read (below) is the lead.
 - [ ] Drafts in the measuring tool (`qwen4exp_run` has none; the server and the runtime's
       tests measure them).
 
