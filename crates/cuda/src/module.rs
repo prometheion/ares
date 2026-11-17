@@ -157,16 +157,26 @@ impl Function {
     /// How the compiler laid the kernel out: registers per thread and static
     /// shared bytes per block.
     pub fn resources(&self) -> Result<(u32, u32)> {
+        Ok((
+            self.attribute(CU_FUNC_ATTRIBUTE_NUM_REGS)?,
+            self.attribute(CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES)?,
+        ))
+    }
+
+    /// The most threads a block of the kernel can have on its device: what its registers
+    /// leave of the device's limit.
+    pub fn max_threads(&self) -> Result<u32> {
+        self.attribute(CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK)
+    }
+
+    fn attribute(&self, attribute: i32) -> Result<u32> {
         let driver = self._module.0.device.bind()?;
-        let get = |attribute: i32| -> Result<u32> {
-            let mut value: i32 = 0;
-            // SAFETY: the pointer is valid for the write of one int.
-            driver.check("cuFuncGetAttribute", unsafe {
-                (driver.api.func_get_attribute)(&mut value, attribute, self.raw)
-            })?;
-            Ok(value.max(0) as u32)
-        };
-        Ok((get(CU_FUNC_ATTRIBUTE_NUM_REGS)?, get(CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES)?))
+        let mut value: i32 = 0;
+        // SAFETY: the pointer is valid for the write of one int.
+        driver.check("cuFuncGetAttribute", unsafe {
+            (driver.api.func_get_attribute)(&mut value, attribute, self.raw)
+        })?;
+        Ok(value.max(0) as u32)
     }
 
     /// How many blocks of `threads` threads with `dynamic_shared` bytes of

@@ -373,9 +373,13 @@ pub struct Q4Kernels {
     ngram_gate: Function,
     ngram_window: Function,
     ngram_commit: Function,
-    /// The two launches of the fused read per type of the matrix they read: the float
-    /// types share one pair, which takes the type as an argument.
-    reads: Vec<(GgmlType, Function, Function)>,
+    /// The two launches of the fused read per type of the matrix they read (the float
+    /// types share one pair, which takes the type as an argument), with the most threads
+    /// a block of each can have on this device.
+    reads: Vec<Read>,
+    /// The pair that decodes every type by its id at run time, and `inject` of any type,
+    /// with the same.
+    read_any: Read,
     swap: Function,
     route_split: Function,
     route_recv: Function,
@@ -408,6 +412,7 @@ impl Q4Kernels {
             ngram_window: module.function("ares_q4_ngram_window")?,
             ngram_commit: module.function("ares_q4_ngram_commit")?,
             reads: Self::load_reads(&module, &Module::load(device, READS_IMAGE)?)?,
+            read_any: Read::load(&module, "_any")?,
             swap: module.function("ares_q4_swap")?,
             route_split: module.function("ares_q4_route_split")?,
             route_recv: module.function("ares_q4_route_recv")?,
@@ -422,34 +427,28 @@ impl Q4Kernels {
     /// The pairs of the fused read for every weight type: those of the float types and the
     /// one that decodes by the type at run time from `module`, those of [`INLINED_READS`]
     /// from `typed`, by the names `kernels/q4_reads.cu` gives them.
-    fn load_reads(module: &Module, typed: &Module) -> Result<Vec<(GgmlType, Function, Function)>> {
-        let pair = |m: &Module, suffix: &str| -> Result<(Function, Function)> {
-            Ok((
-                m.function(&format!("ares_q4_read_down{suffix}"))?,
-                m.function(&format!("ares_q4_read_up{suffix}"))?,
-            ))
-        };
-        let float = pair(module, "")?;
-        let any = pair(module, "_any")?;
+    fn load_reads(module: &Module, typed: &Module) -> Result<Vec<Read>> {
+        let float = Read::load(module, "")?;
+        let any = Read::load(module, "_any")?;
         ALL_TYPES
             .into_iter()
             .filter(|ty| ty.is_weight())
             .map(|ty| {
-                let (down, up) = if is_float(ty) {
+                let read = if is_float(ty) {
                     float.clone()
                 } else if INLINED_READS.contains(&ty) {
-                    pair(typed, &format!("_{}", ty.name()))?
+                    Read::load(typed, &format!("_{}", ty.name()))?
                 } else {
                     any.clone()
                 };
-                Ok((ty, down, up))
+                Ok(Read { ty, ..read })
             })
             .collect()
     }
 
     /// The pair of the fused read for a matrix of `ty`.
-    fn reads_of(&self, ty: GgmlType) -> Result<&(GgmlType, Function, Function)> {
-        self.reads.iter().find(|(t, ..)| *t == ty).ok_or_else(|| {
+    fn reads_of(&self, ty: GgmlType) -> Result<&Read> {
+        self.reads.iter().find(|r| r.ty == ty).ok_or_else(|| {
             invalid("read", format!("a mixer matrix of {ty}, which holds no weights"))
         })
     }
@@ -1182,6 +1181,32 @@ impl MixerMatrix {
     }
 }
 
+/// The two launches of a fused read for matrices of one type, and the most threads a block
+/// of each can have on the device (what its registers leave).
+#[derive(Clone, Debug)]
+struct Read {
+    ty: GgmlType,
+    down: Function,
+    up: Function,
+    max_threads: u32,
+    max_threads_up: u32,
+}
+
+impl Read {
+    /// The pair `ares_q4_read_down{suffix}`, `ares_q4_read_up{suffix}` of `module`.
+    fn load(module: &Module, suffix: &str) -> Result<Self> {
+        let down = module.function(&format!("ares_q4_read_down{suffix}"))?;
+        let up = module.function(&format!("ares_q4_read_up{suffix}"))?;
+        Ok(Self {
+            ty: GgmlType::F32,
+            max_threads: down.max_threads()?,
+            max_threads_up: up.max_threads()?,
+            down,
+            up,
+        })
+    }
+}
+
 /// What the write in front of a read adds to the streams
 /// ([`Q4Kernels::read_down`]).
 #[derive(Clone, Copy, Debug)]
@@ -1327,12 +1352,20 @@ impl Q4Kernels {
         };
         let (peer_out, peer_flags, token) =
             peer.map_or((null, null, 0), |p| (p.data, p.flags, p.token));
-        let mut function = &self.reads_of(GgmlType::F32)?.1;
+        let mut function = &self.reads_of(GgmlType::F32)?.down;
         let (weights, xn, down, inject, types, tiles) = match norm {
             Some((weights, xn, down, inject)) => {
                 let down_ty = down.code(hc * n)?;
                 let inject_ty = inject.map(|m| m.code(hc * n)).transpose()?;
-                function = &self.reads_of(down.ty)?.1;
+                // The read of `down`'s type takes a float `inject` and blocks as wide as its
+                // registers allow; any other takes the read that decodes everything by its type.
+                let read = self.reads_of(down.ty)?;
+                let float_inject = inject.is_none_or(|m| is_float(m.ty));
+                function = if float_inject && threads <= read.max_threads {
+                    &read.down
+                } else {
+                    &self.read_any.down
+                };
                 if rank == 0 || rank > READ_MAX_RANK {
                     return Err(invalid("read", format!("a mixer of rank {rank}")));
                 }
@@ -1436,7 +1469,9 @@ impl Q4Kernels {
             .u32(n)
             .u32(rank)
             .u32(tpr);
-        let function = &self.reads_of(up.ty)?.2;
+        let read = self.reads_of(up.ty)?;
+        let fits = 32 * hc * tpr <= read.max_threads_up;
+        let function = if fits { &read.up } else { &self.read_any.up };
         // SAFETY: the argument list matches the ares_q4_read_up kernels (one per type of
         // `up`).
         unsafe { function.launch(stream, [n / 32, rows, 1], [32 * hc * tpr, 1, 1], 0, args) }

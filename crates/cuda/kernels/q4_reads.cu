@@ -10,12 +10,12 @@
 
 #include "q4_fused.cuh"
 
-ARES_Q4_READS(_q8_0, AresQ4Blocks<8>)
-ARES_Q4_READS(_q4_0, AresQ4Blocks<2>)
-ARES_Q4_READS(_q4_1, AresQ4Blocks<3>)
-ARES_Q4_READS(_q5_0, AresQ4Blocks<6>)
-ARES_Q4_READS(_q5_1, AresQ4Blocks<7>)
-ARES_Q4_READS(_iq4_nl, AresQ4Blocks<20>)
-ARES_Q4_READS(_q4_K, AresQ4Blocks<12>)
-ARES_Q4_READS(_q5_K, AresQ4Blocks<13>)
-ARES_Q4_READS(_q6_K, AresQ4Blocks<14>)
+ARES_Q4_READS(_q8_0, AresQ4Blocks<8>, AresQ4Float, )
+ARES_Q4_READS(_q4_0, AresQ4Blocks<2>, AresQ4Float, )
+ARES_Q4_READS(_q4_1, AresQ4Blocks<3>, AresQ4Float, )
+ARES_Q4_READS(_q5_0, AresQ4Blocks<6>, AresQ4Float, )
+ARES_Q4_READS(_q5_1, AresQ4Blocks<7>, AresQ4Float, )
+ARES_Q4_READS(_iq4_nl, AresQ4Blocks<20>, AresQ4Float, )
+ARES_Q4_READS(_q4_K, AresQ4Blocks<12>, AresQ4Float, )
+ARES_Q4_READS(_q5_K, AresQ4Blocks<13>, AresQ4Float, )
+ARES_Q4_READS(_q6_K, AresQ4Blocks<14>, AresQ4Float, )

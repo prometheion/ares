@@ -18,5 +18,5 @@
 // The fused read of the stream mixer for float matrices, and for every weight type by its
 // type at run time; q4_reads.cu has it for the common quantized types with their decoders
 // inlined.
-ARES_Q4_READS(, AresQ4Float)
-ARES_Q4_READS(_any, AresQ4Any)
+ARES_Q4_READS(, AresQ4Float, AresQ4Float, )
+ARES_Q4_READS(_any, AresQ4Any, AresQ4Any, __launch_bounds__(1024))

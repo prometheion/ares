@@ -37,6 +37,7 @@ pub(crate) const CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN: c_int = 
 pub(crate) const CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR: c_int = 75;
 pub(crate) const CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR: c_int = 76;
 
+pub(crate) const CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK: c_int = 0;
 pub(crate) const CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES: c_int = 1;
 pub(crate) const CU_FUNC_ATTRIBUTE_NUM_REGS: c_int = 4;
 pub(crate) const CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES: c_int = 8;

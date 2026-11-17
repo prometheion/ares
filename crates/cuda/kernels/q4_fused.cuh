@@ -15,8 +15,12 @@
 // and the sums are those of the same matrix in F32. The two launches come in one
 // kernel per reader of `down` and `up`: `ares_q4_read_down` and `ares_q4_read_up`
 // for the float types, `_<type>` for the common quantized types (q4_reads.cu) and
-// `_any` for every type by its id at run time; `inject`, a few rows, decodes by
-// its type at run time.
+// `_any` for every type by its id at run time. `inject` (a few rows, F32 in the
+// files) is a float type for all of them but `_any`, which takes it in any type:
+// a quantized `inject` takes the `_any` read whatever `down` is. (A call to the
+// run-time decoder inside the unrolled read keeps many values live across it:
+// the first launch took 110 registers instead of 72 with it, too many for 640
+// threads; the `_any` launch is bounded to 1024 threads and spills.)
 //
 // **Two devices.** One device, the mixer, holds the residual streams and runs
 // every read. The other, the worker, gets the mixed input of each half block
@@ -168,8 +172,8 @@ static __device__ __forceinline__ bool ares_q4_wait(const uint32_t* flag, uint32
 // `downp` is followed by `injp` (at rows * hc * rank values). `shape` holds
 // the type of `down` in its lowest byte, the type of `inject` in the next (ggml
 // type ids), then hc, then tiles; the grid's height is the number of rows. `W`
-// reads `down`.
-template <class W>
+// reads `down` and `I` reads `inject`.
+template <class W, class I>
 static __device__ __forceinline__ void ares_q4_read_down_t(const float* r_src, float* r_dst, const float* block_out,
                                                            const float* peer_out, const uint32_t* peer_flags,
                                                            uint32_t token, const float* inj, const float* norm,
@@ -289,12 +293,12 @@ static __device__ __forceinline__ void ares_q4_read_down_t(const float* r_src, f
     for (int j = 0; j < ARES_Q4_MAX_STREAMS; j++) {
         float a = 0.0f;
         if (static_cast<uint32_t>(j) < nk) {
-            const uint8_t* w = AresQ4Any::row(inject, j, row_values, inject_ty);
+            const uint8_t* w = I::row(inject, j, row_values, inject_ty);
 #pragma unroll
             for (int k = 0; k < ARES_Q4_RESIDENT; k++) {
                 const uint32_t i = threadIdx.x + k * blockDim.x;
                 if (i < chunks) {
-                    a += ares_q4_dot4(AresQ4Any::load4(w, first + static_cast<size_t>(i) * 4, inject_ty), v[k]);
+                    a += ares_q4_dot4(I::load4(w, first + static_cast<size_t>(i) * 4, inject_ty), v[k]);
                 }
             }
         }
@@ -441,16 +445,17 @@ static __device__ __forceinline__ void ares_q4_read_up_t(const float* xn, const 
     }
 }
 
-// The two launches of a read for one reader of `down` and `up`: `SUFFIX` names them
-// (`ares_q4_read_down##SUFFIX`, `ares_q4_read_up##SUFFIX`).
-#define ARES_Q4_READS(SUFFIX, W)                                                                              \
-    ARES_KERNEL ares_q4_read_down##SUFFIX(                                                                    \
+// The two launches of a read for one reader of `down` and `up` (`W`) and one of `inject`
+// (`I`): `SUFFIX` names them (`ares_q4_read_down##SUFFIX`, `ares_q4_read_up##SUFFIX`), and
+// `BOUNDS` is empty or the launch bounds of the first.
+#define ARES_Q4_READS(SUFFIX, W, I, BOUNDS)                                                                   \
+    extern "C" __global__ void BOUNDS ares_q4_read_down##SUFFIX(                                              \
         const float* r_src, float* r_dst, const float* block_out, const float* peer_out,                     \
         const uint32_t* peer_flags, uint32_t token, const float* inj, const float* norm, float* xn,           \
         const uint8_t* down, const uint8_t* inject, float* downp, uint32_t shape, uint32_t n, uint32_t rank,  \
         float eps) {                                                                                          \
-        ares_q4_read_down_t<W>(r_src, r_dst, block_out, peer_out, peer_flags, token, inj, norm, xn, down,     \
-                               inject, downp, shape, n, rank, eps);                                           \
+        ares_q4_read_down_t<W, I>(r_src, r_dst, block_out, peer_out, peer_flags, token, inj, norm, xn, down,  \
+                                  inject, downp, shape, n, rank, eps);                                        \
     }                                                                                                         \
     ARES_KERNEL ares_q4_read_up##SUFFIX(const float* xn, const float* downp, const uint8_t* up, int8_t* act,  \
                                         float* inj, int8_t* peer_act, uint32_t* peer_flags, uint32_t token,   \
