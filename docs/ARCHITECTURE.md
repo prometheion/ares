@@ -4343,7 +4343,10 @@ read keeps many values live across it. So `inject` is a float type in every read
 that decodes everything by its type, which is bounded to 1024 threads; a quantized `inject`,
 and a block wider than a read's registers allow on the device (`Function::max_threads`),
 take that one. The float read is the code of before (72 registers), the inlined ones take 72
-to 85. The IQ2_XS file's fingerprint is unchanged (`ffbe225f5e70e94b`).
+to 85. The IQ2_XS file's fingerprint is unchanged (`ffbe225f5e70e94b`). A made-up model
+per type (`tests/qwen4exp_device.rs`, the float path in each of the 28 types, the mixers of
+rank 256) matches the reference layer by layer on one card and with both cards on every
+layer, in steps of up to eight rows and in a wide step, as the model with BF16 does.
 
 The cost, measured 2026-11-17 (`qwen4exp_run --read-time`, one row, the fastest of five
 times 64, load 11 to 13): a read of the IQ2_XS file's BF16 mixer takes 24.9 us on the RTX
