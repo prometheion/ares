@@ -13,6 +13,25 @@ Order of work the owner has set: CUDA complete for both models first, then optim
 kernels, better prefetching: measured per phase on a quiet machine against the fork and Strata),
 Vulkan parity last.
 
+## Next, in this order (the owner, 2026-11-17, after the gap study)
+For "CUDA complete", the order in which the items below are taken up; each item stays in its
+section further down.
+1. Pin Claude Code's billing stamp at the start of its system prompt (prompt cache).
+2. A root checkpoint at the end of the system prompt and the tool list, and denser checkpoints
+   inside a long prompt, for both models (prompt cache).
+3. Large prompt chunks for Flash-Next with expert slots borrowed in VRAM, batch and micro-batch
+   adjustable, adaptive when another request waits (experts from the SSD).
+4. Tools, structured output and the Messages and Responses routes on the real Flash-Next, and
+   against Claude Code itself (parity, server).
+5. Flash-Next's draft vocabulary (step 6 of the shared layer, being finished).
+6. K/V of a running sequence beyond VRAM for Flash-Next at long contexts (whole features).
+7. Priorities of requests (server).
+8. Then the rest of CUDA complete: image input pieces 4 to 8, gate and up in two types, the
+   roles of the cards, the open defects, the server items.
+Later than their place suggests: the classic draft model (VRAM; better with an aux card), draft
+trees (steps 9 and 10: little gain on a mixture of experts; for the 27B later), Turing, Jev mode,
+stored responses, TLS.
+
 ## In work now
 
 | Piece | State |
@@ -54,8 +73,8 @@ between cards stay with the model. Today the two models share almost nothing ins
   tree fill replaces; the drafts list has a place per window, which becomes a place per node;
   the inject is per row and position, so a tree's kept path needs only its rows' positions
   (a rejected branch's rows are never read, as now).
-- [ ] 9. Trees in the blocks, verified once for every drafter and both models.
-- [ ] 10. Tree fill from the DFlash lattice, MTP links mixed into a tree.
+- [ ] 9. Trees in the blocks, verified once for every drafter and both models. Later (the owner, 2026-11-17).
+- [ ] 10. Tree fill from the DFlash lattice, MTP links mixed into a tree. Later.
 
 ## Qwen3.8 Flash-Next (`qwen4exp`)
 
@@ -341,7 +360,7 @@ becomes a block is in `ARCHITECTURE.md` ("The shared model layer"). Left, in the
 ## Drafters (every model)
 - [ ] A classic draft model as a fourth drafter kind (llama.cpp's `-md`): a small model with the
       same vocabulary drafts with its own forward passes and its own K/V; chosen by the same price
-      rule as `ngram`, `mtp` and `dflash` (the owner, 2026-11-17).
+      rule as `ngram`, `mtp` and `dflash` (the owner, 2026-11-17). Later (the owner, 2026-11-17).
 - [ ] Roles of the cards (the owner, 2026-11-17; Strata has Main, Helper and Off per card): main
       cards hold the model and its expert cache; an aux card holds drafters (a draft model, DFlash,
       an MTP block) and, for a mixture of experts, its free VRAM as one more expert tier between
@@ -461,8 +480,8 @@ becomes a block is in `ARCHITECTURE.md` ("The shared model layer"). Left, in the
   - [ ] 8. Caching: cells named by a digest of the resized pixels, 64-bit names through the index and the SSD level.
 - [ ] Audio, video and Gemma 4 are backlog: none of them blocks the first release (the owner,
       2026-11-16).
-- [ ] Jev mode: `/v1/systemone` exists and answers 501; `Engine::decide` on the real runtime.
-- [ ] Turing.
+- [ ] Jev mode: `/v1/systemone` exists and answers 501; `Engine::decide` on the real runtime. Later.
+- [ ] Turing. Later.
 - [ ] K/V of a running sequence beyond VRAM (P16; an exception, low priority).
 
 ## Weight types (`moe/q4-load`, 2026-11-17)
