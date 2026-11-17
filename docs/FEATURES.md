@@ -10,9 +10,9 @@ the kernels exist; no model runs there yet.
 | | Qwen3.8 27B (`qwen35`, dense) | Qwen3.8 Flash-Next (`qwen4exp`, MoE) |
 | --- | --- | --- |
 | Placements | one card, tensor split, layer split | one card, by layers, both cards on every layer |
-| Weight types | all 28 GGUF types | all 28, experts included |
+| Weight types | all 28 GGUF types | all 28 in every tensor: experts, stream mixers and the n-gram block (exact) too |
 | K and V | `f16`, `q8` to `q4`, chosen separately (`--kv`) | `f16`, `q8` to `q4`, chosen separately (`--kv`); the draft block's in `q4` |
-| Larger than VRAM | no | experts in VRAM slots, a RAM tier and on the SSD; the CPU computes missed ones |
+| Larger than VRAM | no | experts in VRAM slots, a RAM tier and on the SSD; the CPU computes missed ones, and what a step picks beyond a card's slots |
 | Own drafts (MTP) | draft block in the file, with a draft vocabulary | draft block from a file (`--drafters <file>`), its experts resident in VRAM; exact |
 | DFlash2 drafter (`--drafters <file>`) | chains, one card or tensor split, with the draft vocabulary; exact | chains, one card or both cards on every layer; the mean of the four streams |
 | Prefix cache | yes, with the RAM and SSD levels | yes, with the RAM and SSD levels; its RAM is what the tier of experts leaves |

@@ -4306,6 +4306,79 @@ starts) and 22 GiB available, 10.9 GiB, 7 970 experts. Before this change the
 tier was a third of the available RAM, at most 8 GiB, whatever the RAM limit
 said, and the page-locked buffers of the parts were outside the books.
 
+**Files in any type.** Some matrices of the model are multiplied with values that are
+not quantized: the stream mixers' (down, up and inject of every half block, and the
+mixer in front of the head) and the n-gram block's key and value projections, which the
+reference multiplies in f32. Files store them in any of the 28 weight types: Swift's
+IQ2_XS in BF16, Unsloth's UD-Q4_K_XL in Q8_0 (the 194 mixer matrices of 10240 by 320 are
+644 MiB there, 2425 MiB as F32). They stay on the card as the file stores them, and every
+product with them decodes each weight as ggml does and sums in f32
+(`kernels/weight_value.cuh` has a decoder per type):
+
+- *Steps of up to eight rows.* The fused read of a mixer (`ares_q4_read_down`,
+  `ares_q4_read_up`) decodes in the thread that multiplies: the float types as before, nine
+  quantized types with their decoder inlined (Q8_0, Q4_0, Q4_1, Q5_0, Q5_1, IQ4_NL, Q4_K,
+  Q5_K, Q6_K: `kernels/q4_reads.cu`, which takes nvcc some 100 seconds), every other type
+  through a decoder chosen by the type at run time (inlined for all 25 types the module took
+  five minutes to compile). `inject` has few rows and always decodes by its type. The
+  separate kernels and the n-gram block take `Kernels::matvec_exact`, the float decode
+  kernel with a decoder per weight: its sums run in the order of the float kernel, so a
+  matrix gives the bits its decoded copy in F32 gives, except for the last bit of a weight
+  of a type with an offset (`d * q + m`, which the device may fuse; Q4_1, Q5_1, Q2_K, Q4_K,
+  Q5_K).
+- *Wide steps.* The tile kernel of the matrix's type with the rows converted to f16, as the
+  float matrices of a wide step have it (`Part::wide_float`).
+- *The router* stays F32 as the files store it; a router in another type is decoded to F32
+  once at load (the draft block's file has BF16), four bytes a weight.
+- *The n-gram table* may be of any type whose block divides its rows of 160 values (the
+  floats and the 32-value types): the device decodes the fetched rows value by value.
+
+Measured 2026-11-17 on both cards (`tests/mmvq.rs`, `tests/q4.rs`): the decode kernel of
+every one of the 28 types gave the bits of its decoded copy in F32 on every output (9207
+per type), 3e-8 to 2e-7 of the sums' magnitude from the f64 product; the fused read of the
+mixer with all three matrices in a type gave the bits of the F32 copy as well. The fused read
+first took 110 registers a thread instead of 72, too many for the 640 threads of a stream of
+2560 (a launch that failed): a call to the decoder chosen at run time inside the unrolled
+read keeps many values live across it. So `inject` is a float type in every read but the one
+that decodes everything by its type, which is bounded to 1024 threads; a quantized `inject`,
+and a block wider than a read's registers allow on the device (`Function::max_threads`),
+take that one. The float read is the code of before (72 registers), the inlined ones take 72
+to 85. The IQ2_XS file's fingerprint is unchanged (`ffbe225f5e70e94b`).
+
+STEP_MEASURED
+
+**A layer with fewer slots in VRAM than a step picks.** A decode step of eight rows can
+pick 80 experts of a layer, and the store used to give every layer that many slots in
+VRAM and eight free, so that every miss of a step could be uploaded without evicting
+another pick. With the experts of UD-Q4_K_XL (3.0 MiB a slot in VRAM) that is 12.3 GiB
+per card on one card or with both cards on every layer (each card holds a share of all 48
+layers), and the plan refused. Where the CPU computes misses (every `--serve` but `stream`), a card
+whose bytes do not hold that many now gives each of its layers as many slots as they hold
+(at least a row's ten picks and the eight free), and the RAM tier keeps the rest of a step
+for the CPU: each layer's floor in RAM is the step's picks and the free slots less its
+VRAM slots, so the two tiers of a layer together hold a step. During a step an upload
+takes only a slot whose expert the step did not pick (`SlotSet::room`), the misses beyond
+those go to the CPU whatever the cost model said, and the VRAM tier never evicts a pick
+(`SlotSet::keep_picks`; it used to, as a last resort that the old floor never reached).
+The refusals name the limit: the card, the slots its bytes hold per layer and what a
+layer needs, or the RAM the floors need (then `--ram`).
+
+UD-Q4_K_XL through the server, 2026-11-17 (load average 16 to 30 from other builds on the
+machine; a German question, 91 tokens, a code question, 200, a story, 256; greedy; the
+three placements gave the same text, correct):
+
+| Placement, `--ram` | VRAM slots per layer | RAM tier | German | Code | Story (tokens/s) |
+| --- | --- | --- | --- | --- | --- |
+| By layers, 8G | 105 (RTX 4070), 110 (RTX 3060) | 7.81 GiB, 2349 slots | 4.12 | 1.75 | 3.60 |
+| One card (RTX 4070), 9G | 37 | 8.87 GiB, 2666 slots | 2.93 | 1.79 | 2.77 |
+| Both cards on every layer, 10G | 46 (mixer), 69 (worker) | 9.84 GiB, 2956 slots | 4.37 | 2.55 | 4.31 |
+
+With `--ram 8G` the last two are refused by the RAM their floors need: one card holds 37
+slots per layer and needs 51 in RAM (7345 MiB, the tier had 7211); with both cards on every
+layer the mixer's card holds 47 and the two cards' layers need 8785 MiB in RAM (the tier had
+7195). The refusal says so and names `--ram`.
+
+
 **The usage profile of the experts.** The tiers start empty, and what they learn
 while the model serves, the store's heat, went with the model. A start filled
 them by reading a text of German, English and code (41 to 44 s on 2026-11-11, 20
