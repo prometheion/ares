@@ -134,6 +134,16 @@ other differed more by the load than by the drafts.
 - [ ] `--drafters mtp` for a model file that carries its block; drafts in the measuring tool.
 
 ### Experts from the SSD
+Reference now in the open (2026-11-17): Run My AI's engine TokenWing, MIT, built on llama.cpp,
+https://github.com/runmyai/tokenwing (`docs/how-it-works.md`, `docs/architecture.md`,
+`docs/settings.md`); it runs Qwen3.8 Flash-Next (IQ3_S and UD-Q4_K_XL). Its README: expert reads
+with O_DIRECT through 8 I/O threads and a priority queue; the routers of layers L+1 and L+2 on
+layer L's hidden state (75.7 % of picks predicted one layer ahead, 67.2 % two, on Ling 3.0
+Flash); a RAM cache per layer (`--moe-stream-window`), a VRAM cache that follows the text (up to
+64 experts swapped every 8 tokens, `--moe-stream-vram-follow`); use counts halved every 64
+tokens, the lowest leaves first; prompts layer by layer, so each expert is read about once per
+prompt (0.98 to 1.00 reads per distinct expert). To be read in its code before items 3 above
+(large prompt chunks) and the prediction's next step are built.
 - [ ] Prompt batch and micro-batch adjustable as in llama.cpp, and a large micro-batch by
       default for a mixture of experts (Strata reads prompts in chunks of 8192: each expert is read
       once per chunk, not once per 512 rows); adaptive: a lone prompt takes the large chunk, and
@@ -538,7 +548,8 @@ Measured per phase on a quiet machine against the fork and Strata, the largest f
 - [ ] Flash-Next with the owner's real limit (a RAM tier of 24 to 26 GiB), one card and two.
 - [ ] The SSD cache's times to the first token (taken under load so far).
 - [ ] Flash-Next with its draft block once speculation pays; target above 56 tokens/s.
-- [ ] Before a release: both models against the fork and against Strata, speed, VRAM, quality.
+- [ ] Before a release: both models against the fork, Strata and TokenWing (Flash-Next), speed,
+      VRAM, quality.
 
 ## Questions to the owner
 - None open.
