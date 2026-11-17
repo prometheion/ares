@@ -619,6 +619,7 @@ impl<'g> Session<'g> {
         if let Some(reserve) = opts.reserve {
             config.vram_reserve = reserve;
         }
+        config.cpu_serves = opts.serve != Serve::Stream;
         if opts.part.max_rows > MAX_BATCH {
             plan_transit(&mut config, &layout, &reader, opts.transit);
         }
