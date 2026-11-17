@@ -4345,7 +4345,16 @@ and a block wider than a read's registers allow on the device (`Function::max_th
 take that one. The float read is the code of before (72 registers), the inlined ones take 72
 to 85. The IQ2_XS file's fingerprint is unchanged (`ffbe225f5e70e94b`).
 
-STEP_MEASURED
+The cost, measured 2026-11-17 (`qwen4exp_run --read-time`, one row, the fastest of five
+times 64, load 11 to 13): a read of the IQ2_XS file's BF16 mixer takes 24.9 us on the RTX
+4070 and 73.9 us on the RTX 3060, against 24.4 and 73.1 before the types (the templated read
+has some more address arithmetic); the Q8_0 mixer of UD-Q4_K_XL takes 43.8 and 97.0 us. It
+reads half the bytes of BF16, and decoding each weight is what it costs: on the mixer's card
+of the two cards on every layer, 97 reads a step, about 1.9 ms more than BF16 would take, for
+568 MiB of VRAM less (1.8 GiB less than F32). The IQ2_XS file's decode step at 1000 tokens
+on two cards (eight pairs of runs of the build before and after, load 10 to 19): medians of
+22.6 to 27.0 ms before and 23.9 to 29.7 after, means 25.1 and 26.7, with the store's numbers
+equal; the spread of the loaded machine is larger than the difference.
 
 **A layer with fewer slots in VRAM than a step picks.** A decode step of eight rows can
 pick 80 experts of a layer, and the store used to give every layer that many slots in
@@ -4373,10 +4382,27 @@ three placements gave the same text, correct):
 | One card (RTX 4070), 9G | 37 | 8.87 GiB, 2666 slots | 2.93 | 1.79 | 2.77 |
 | Both cards on every layer, 10G | 46 (mixer), 69 (worker) | 9.84 GiB, 2956 slots | 4.37 | 2.55 | 4.31 |
 
+With pruning (`--expert-prune`, the same three questions, tokens/s German / code / story):
+
+| Placement, `--ram` | Off | `skip:8` | `skip:4` |
+| --- | --- | --- | --- |
+| By layers, 8G | 4.12 / 1.75 / 3.60 | 6.49 / 3.93 / 7.68 | 12.54 / 8.73 / 13.08 |
+| One card, 9G | 2.93 / 1.79 / 2.77 | 4.93 / 2.88 / 4.88 | 10.72 / 6.63 / 11.17 |
+| Both cards on every layer, 10G | 4.37 / 2.55 / 4.31 | 7.96 / 4.47 / 7.48 | 15.22 / 10.58 / 15.42 |
+
+The pruned answers differ in their words and are still right.
+
 With `--ram 8G` the last two are refused by the RAM their floors need: one card holds 37
 slots per layer and needs 51 in RAM (7345 MiB, the tier had 7211); with both cards on every
 layer the mixer's card holds 47 and the two cards' layers need 8785 MiB in RAM (the tier had
 7195). The refusal says so and names `--ram`.
+
+The tool's decode steps at 1000 tokens of the corpus (`qwen4exp_run --serve model`, one row
+a step, 64 steps, load 4 to 13): by layers with 8 GiB 96.9 ms (median; 87 % of the picks in
+a slot, 62 misses a step of which the CPU computed 38), one card with 9 GiB 225 ms (58 %, 200
+misses, 76 on the CPU), both cards on every layer with 10 GiB 79.1 ms (86 %, 65 misses, 45 on
+the CPU). The mixers took 2.5 ms a step on the RTX 4070 and 4.7 ms on the RTX 3060 by layers,
+4.9 ms on one card: the drive and the experts are the step.
 
 
 **The usage profile of the experts.** The tiers start empty, and what they learn
