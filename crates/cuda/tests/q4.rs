@@ -475,7 +475,9 @@ fn the_fused_read_takes_every_weight_type() {
                 }
             }
             report(&format!("fused read {ty} rel_max ({differ} values differ from F32)"), worst);
-            assert!(worst < 1e-5, "{ty}: {worst}");
+            // The sums run over 10240 values in f32: 6e-5 of the largest output for IQ4_XS,
+            // whose weights are large, with the same bits as the F32 copy gives.
+            assert!(worst < 2e-4, "{ty}: {worst}");
             if !offset_types.contains(&ty) {
                 assert_eq!(
                     differ, 0,
