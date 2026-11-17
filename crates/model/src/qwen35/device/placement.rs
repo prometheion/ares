@@ -32,6 +32,7 @@ use std::sync::Arc;
 
 use ares_runtime::Split;
 
+use crate::blocks::head::HeadView;
 use crate::qwen35::Config;
 use crate::qwen35::weights::{Matrix, Mixer, Weights};
 
@@ -372,33 +373,9 @@ impl Placement {
                     .into(),
             ));
         }
-        let (head_order, head_rows) = match vocabulary {
-            None => (None, on_device.end),
-            Some(list) => {
-                let n_vocab = c.n_vocab as u32;
-                let mut listed = vec![false; c.n_vocab];
-                for &token in list {
-                    if token >= n_vocab || std::mem::replace(&mut listed[token as usize], true) {
-                        return Err(PlacementError(format!(
-                            "draft vocabulary: token {token} is listed twice or is not one of \
-                             the {n_vocab} tokens"
-                        )));
-                    }
-                }
-                if list.is_empty() || list.len() as u32 > on_device.end {
-                    return Err(PlacementError(format!(
-                        "a draft vocabulary of {} tokens; the MTP block's device holds {} \
-                         rows of the head",
-                        list.len(),
-                        on_device.end
-                    )));
-                }
-                // The listed tokens in ascending order, then the others.
-                let mut order: Vec<u32> = (0..n_vocab).filter(|t| listed[*t as usize]).collect();
-                order.extend((0..n_vocab).filter(|t| !listed[*t as usize]));
-                (Some(Arc::from(order)), list.len() as u32)
-            }
-        };
+        let view =
+            HeadView::new(c.n_vocab as u32, on_device.end, vocabulary).map_err(PlacementError)?;
+        let (head_order, head_rows) = (view.order, view.rows);
         self.draft = Some(DraftPlan { device, head_order, head_rows, mtp });
         Ok(self)
     }

@@ -53,7 +53,7 @@ use super::feed::{
     plan_transit, reader,
 };
 use super::misses::{Misses, Progress, WideStats};
-use super::mtp::{Chain, MtpBlock, MtpDrafted, MtpReport, MtpTimes, Watch};
+use super::mtp::{MtpBlock, MtpDrafted, MtpReport, MtpTimes, Watch};
 use super::ngram::{self, NgramFeed};
 use super::part::{
     ExpertAt, Frame, MTP_KV, Options, PAGE_ENTRY, Part, PartSetup, PartShape, Ports, StepEnv,
@@ -63,6 +63,8 @@ use super::prune::{self, PruneMask};
 use super::resume::Resume;
 use super::session::{Chosen, Fill, PartReport, SessionOptions, choose};
 use super::usage::{Log, ProfileReport, Usage, UsageStats};
+use crate::blocks::head::HeadView;
+use crate::blocks::mtp::{MtpChain, MtpStep};
 use crate::blocks::rows::{HostTable, TOKEN_EMBD};
 use crate::blocks::slots::{self, Declared, TAILS_PER_SLOT};
 use crate::chat;
@@ -222,8 +224,8 @@ struct Build {
     n_slots: Vec<usize>,
     slot_bytes: Vec<u64>,
     flow: Option<Arc<Flow>>,
-    /// The route records of the MTP block, and where its experts are.
-    mtp_board: Option<Arc<Board>>,
+    /// Whether a part holds the MTP block, and where its experts are.
+    mtp: bool,
     mtp_place: Option<ExpertAt>,
     /// What the tiers hold, for the routers' pruning.
     prune_mask: Option<Arc<PruneMask>>,
@@ -250,11 +252,6 @@ const GROW_SLICE: Duration = Duration::from_millis(40);
 pub(super) struct Flow {
     feed: Mutex<Feed>,
     ngram: Mutex<NgramFeed>,
-    /// The tokens the MTP block picked for the rows of a step, as (row,
-    /// token), and the step they are for: the device thread that holds the
-    /// block tells the others, which need them for the embeddings and the
-    /// rows of the n-gram table.
-    drafts: Mutex<(u64, Vec<(u32, u32)>)>,
     /// Per part: the layers of the running step that it has enqueued, and the
     /// layers whose route records the store has handled.
     enqueued: Vec<AtomicUsize>,
@@ -474,27 +471,6 @@ impl Flow {
         }
     }
 
-    /// The MTP block has made the drafts of step `step`.
-    fn publish(&self, step: u64, drafts: Vec<(u32, u32)>) {
-        *self.drafts.lock().unwrap_or_else(|e| e.into_inner()) = (step, drafts);
-    }
-
-    /// Waits for the drafts of step `step`, serving the store meanwhile.
-    fn await_drafts(&self, step: u64) -> Result<Vec<(u32, u32)>, ModelError> {
-        let started = Instant::now();
-        loop {
-            {
-                let drafts = self.drafts.lock().unwrap_or_else(|e| e.into_inner());
-                if drafts.0 == step {
-                    return Ok(drafts.1.clone());
-                }
-            }
-            self.check(started, "the MTP block drafted on another device")?;
-            self.pump()?;
-            std::hint::spin_loop();
-        }
-    }
-
     /// A part has ended its step on the device: the last of them ends it for
     /// the store, unless it only drafted (`store` false).
     fn finish(&self, store: bool) -> Result<(), ModelError> {
@@ -624,6 +600,9 @@ pub struct Qwen4Exp {
     usage: Usage,
     /// The token embedding table where the file is mapped (`blocks/rows.rs`).
     rows: Arc<HostTable>,
+    /// The order of the output head's rows and the draft head's rows, which
+    /// every drafter reads (`blocks/head.rs`).
+    view: HeadView,
 }
 
 impl std::fmt::Debug for Qwen4Exp {
@@ -708,6 +687,7 @@ impl Qwen4Exp {
         let format = chat::chat_format(&tokenizer, &ChatOptions::default());
         let gguf = Arc::new(gguf);
         let rows = Arc::new(HostTable::mapped(gguf.clone(), TOKEN_EMBD)?);
+        let config_vocab = config.n_vocab as u32;
         Ok(Self {
             gguf,
             config,
@@ -731,7 +711,7 @@ impl Qwen4Exp {
                 n_slots: vec![0; n],
                 slot_bytes: vec![0; n],
                 flow: None,
-                mtp_board: None,
+                mtp: false,
                 mtp_place: None,
                 prune_mask: None,
             }),
@@ -746,7 +726,19 @@ impl Qwen4Exp {
             mtp_watch: Arc::default(),
             usage: Usage::default(),
             rows,
+            view: HeadView::new(config_vocab, config_vocab, None).map_err(OpenError::Choice)?,
         })
+    }
+
+    /// Gives every drafter of the model a draft vocabulary (`blocks/head.rs`):
+    /// the output head's rows of its tokens come first, the drafters read only
+    /// them, and the device of the head keeps the rows of the embedding table
+    /// of only them. Before the runtime opens the parts.
+    pub fn with_draft_vocabulary(mut self, tokens: &[u32]) -> Result<Self, OpenError> {
+        let n = self.config.n_vocab as u32;
+        self.view = HeadView::new(n, n, Some(tokens)).map_err(OpenError::Choice)?;
+        self.opts.part.head_order = self.view.order.clone();
+        Ok(self)
     }
 
     /// Keeps the usage profile of the model's experts in `dir` (see
@@ -1047,6 +1039,8 @@ impl Qwen4Exp {
                     o,
                     index,
                     output,
+                    part.head_tokens(),
+                    &self.view,
                     self.rows.clone(),
                     self.mtp_watch.clone(),
                     cx.device,
@@ -1070,6 +1064,7 @@ impl Qwen4Exp {
                     cx.max_slots,
                     c.n_layer,
                     c.n_vocab,
+                    self.view.rows,
                     mask,
                 )?;
                 Some(self.rows.clone())
@@ -1089,7 +1084,7 @@ impl Qwen4Exp {
         // The room each device has left decides the slots of the store.
         let (ports, board) = (part.ports(), part.board());
         let cores: Vec<bool> = (0..layer_count).map(|i| part.has_core(i)).collect();
-        let mtp_board = block.as_ref().map(MtpBlock::board);
+        let holds_mtp = block.is_some();
         self.meeting.meet(
             n,
             |build| {
@@ -1097,9 +1092,7 @@ impl Qwen4Exp {
                 build.ports[index] = ports;
                 build.cores[index] = cores;
                 build.boards[index] = Some(board);
-                if mtp_board.is_some() {
-                    build.mtp_board = mtp_board;
-                }
+                build.mtp |= holds_mtp;
                 Ok(())
             },
             |build| {
@@ -1257,8 +1250,8 @@ impl Qwen4Exp {
                 if self.placement.tensor.is_some() {
                     feed.set_owners(owners(&self.placement, c));
                 }
-                if let Some(board) = build.mtp_board.clone() {
-                    feed.set_mtp(board);
+                if build.mtp {
+                    feed.set_mtp();
                     feed.fill_mtp(c.experts.count).map_err(model_error)?;
                 }
                 let ngram = NgramFeed::open(&self.gguf, c, self.opts.row_cache, o.max_slots)
@@ -1266,7 +1259,6 @@ impl Qwen4Exp {
                 let flow = Arc::new(Flow {
                     feed: Mutex::new(feed),
                     ngram: Mutex::new(ngram),
-                    drafts: Mutex::new((0, Vec::new())),
                     enqueued: (0..n).map(|_| AtomicUsize::new(0)).collect(),
                     followed: (0..n).map(|_| AtomicUsize::new(0)).collect(),
                     begun: AtomicU64::new(0),
@@ -1374,7 +1366,6 @@ impl Qwen4Exp {
             dflash_id: self.dflash.as_ref().map(|_| 1 + u32::from(self.mtp.is_some())),
             dflash_embedding,
             passes: Vec::new(),
-            block_places: Vec::new(),
             residual: None,
             chains: Vec::new(),
             only_drafts: false,
@@ -1624,13 +1615,12 @@ struct Qwen4ExpDevice {
     /// The embedding rows, for the DFlash drafter's newest tokens, on the part
     /// that holds it.
     dflash_embedding: Option<Arc<HostTable>>,
-    /// The windows of the step whose drafts the DFlash drafter makes, and
-    /// where the MTP block's chains have their drafts in the step's list.
+    /// The windows of the step whose drafts the DFlash drafter makes.
     passes: Vec<crate::dflash::PassSeq>,
-    block_places: Vec<u32>,
     /// Where the part left the residual of the rows of its last step.
     residual: Option<DevicePtr>,
-    chains: Vec<Chain>,
+    /// The windows of the step whose drafts the MTP block makes.
+    chains: Vec<MtpChain>,
     /// The step being run only drafts.
     only_drafts: bool,
     /// The rows of the step that are a replay.
@@ -1709,7 +1699,6 @@ impl Qwen4ExpDevice {
         self.segments.clear();
         self.chains.clear();
         self.passes.clear();
-        self.block_places.clear();
         self.replay.clear();
         let (mut bar, mut place) = (0, 0);
         for i in 0..record.segments() {
@@ -1738,7 +1727,7 @@ impl Qwen4ExpDevice {
                 } else if segment.n_rows >= 2 && Some(drafter) != self.mtp_id {
                     return Err(invalid(format!("the model has no drafter {drafter}")));
                 } else if segment.n_rows >= 2 {
-                    self.block_places.push(place);
+                    let at = place;
                     place += segment.n_rows - 1;
                     // All rows of a window are wanted, so its sampler rows are
                     // consecutive; `wanted` counts the wanted rows before it.
@@ -1754,10 +1743,12 @@ impl Qwen4ExpDevice {
                         Vec::new()
                     };
                     bar += links;
-                    self.chains.push(Chain {
-                        segment: i as usize,
+                    self.chains.push(MtpChain {
+                        segment: i,
+                        token: record.row(segment.row0).token,
                         rows: (0..links).map(|j| record.sampler(wanted + j).for_draft()).collect(),
                         needs,
+                        place: at,
                     });
                 }
             }
@@ -1766,7 +1757,7 @@ impl Qwen4ExpDevice {
         // The rows that take the block's drafts have no token yet.
         let mut drafted = vec![false; rows as usize];
         for chain in &self.chains {
-            let s = &self.segments[chain.segment];
+            let s = &self.segments[chain.segment as usize];
             drafted[(s.row0 + 1) as usize..(s.row0 + s.n_rows) as usize].fill(true);
         }
         self.tokens.clear();
@@ -1825,7 +1816,7 @@ impl Qwen4ExpDevice {
                     .find(|c| c.slot == slot && c.row0 == row0)
                     .map(|c| c.accepted)
             };
-            block.follow(stream, &self.flow, &outcome, residual)?;
+            block.follow(stream, &outcome, residual)?;
         }
 
         // The pages the pool freed give back what the K/V groups keep for them.
@@ -1865,38 +1856,16 @@ impl Qwen4ExpDevice {
         // A step that only drafts: the chains, and nothing of the model. It
         // leaves no window for the next record to commit.
         if record.drafts_only() {
+            let tokens = step.record_on_device.offset(record.tokens_offset());
             if let Some(block) = &mut self.mtp {
-                let chances = record.draft_chances();
-                block.draft(
-                    stream,
-                    &self.flow,
-                    &self.segments,
-                    &mut self.tokens,
-                    &self.chains,
-                    chances.as_ref(),
-                    true,
-                    &self.replay,
-                )?;
-                // The round after this step verifies these drafts, or the
-                // first of them: the rows of the n-gram table that its rows
-                // need are read now, while the conductor decides.
-                let next: Vec<(u32, &[u32])> = self
-                    .chains
-                    .iter()
-                    .map(|chain| {
-                        let s = &self.segments[chain.segment];
-                        let made = block.made(s.slot) as usize;
-                        (s.slot, &self.tokens[s.row0 as usize..s.row0 as usize + 1 + made])
-                    })
-                    .collect();
-                // A failed read ahead costs nothing but the read of the step.
-                let _ = self.flow.lock_ngram().expect(&next);
+                let chains = std::mem::take(&mut self.chains);
+                let step = MtpStep { tokens, chains, chances: record.draft_chances() };
+                block.step(stream, &self.segments, &self.tokens, &self.replay, Some(step), true)?;
             }
-            // The DFlash drafter's passes. With windows of the MTP block in
-            // the same step, its drafts (which the host has) go into the
-            // drafter's list at their places, so the step has one list.
+            // The DFlash drafter's passes, into the step's one list: the MTP
+            // block's when it is on this device too.
             if !self.passes.is_empty() && self.part.dflash().is_some() {
-                let embedding = self
+                let table = self
                     .dflash_embedding
                     .as_ref()
                     .ok_or_else(|| invalid("the DFlash drafter is on another part"))?;
@@ -1904,16 +1873,11 @@ impl Qwen4ExpDevice {
                 let embed = |token: u32| {
                     let mut out = vec![0f32; n];
                     // A token past the table is zeros, as the model's rows are.
-                    let _ = embedding.decode(token, &mut out);
+                    let _ = table.decode(token, &mut out);
                     out
                 };
-                let tokens = step.record_on_device.offset(record.tokens_offset());
-                self.part.dflash_pass(stream, tokens, &self.passes, &embed)?;
-                for (chain, &place) in self.chains.iter().zip(&self.block_places) {
-                    let s = &self.segments[chain.segment];
-                    let drafts = &self.tokens[(s.row0 + 1) as usize..(s.row0 + s.n_rows) as usize];
-                    self.part.dflash_put(stream, place, drafts)?;
-                }
+                let list = self.mtp.as_ref().map(MtpBlock::list);
+                self.part.dflash_pass(stream, tokens, &self.passes, &embed, list)?;
             } else {
                 self.part.dflash_no_pass();
             }
@@ -1922,33 +1886,14 @@ impl Qwen4ExpDevice {
         }
         self.part.dflash_no_pass();
 
-        // The newest cell of every sequence in the MTP block and the chains
-        // of the windows that take its drafts; the other device threads wait
-        // for the drafts, which are rows of this step.
+        // The newest cell of every sequence in the MTP block. Its chains run
+        // in a step that only drafts: the rows that verify them have their
+        // tokens, which every device thread needs.
+        if !self.chains.is_empty() {
+            return Err(invalid("the MTP block's chains run in a step that only drafts"));
+        }
         if let Some(block) = &mut self.mtp {
-            let chances = record.draft_chances();
-            block.draft(
-                stream,
-                &self.flow,
-                &self.segments,
-                &mut self.tokens,
-                &self.chains,
-                chances.as_ref(),
-                false,
-                &self.replay,
-            )?;
-            let drafts: Vec<(u32, u32)> = drafted
-                .iter()
-                .enumerate()
-                .filter(|(_, drafted)| **drafted)
-                .map(|(row, _)| (row as u32, self.tokens[row]))
-                .collect();
-            self.flow.publish(number, drafts);
-            block.keep(&self.segments, &self.tokens, &self.replay);
-        } else if !self.chains.is_empty() {
-            for (row, token) in self.flow.await_drafts(number)? {
-                self.tokens[row as usize] = token;
-            }
+            block.step(stream, &self.segments, &self.tokens, &self.replay, None, false)?;
         }
 
         // The rows of the n-gram table, and where the sequences are now.
@@ -2062,11 +2007,26 @@ impl Qwen4ExpDevice {
             flow.pump()?;
             std::hint::spin_loop();
         }
+        // The MTP block's chains of a step that only drafts made their drafts
+        // on the device; the round after it verifies them, or the first of
+        // them, and the rows of the n-gram table its rows need are read now,
+        // while the conductor decides.
+        if let Some(block) = self.mtp.as_mut().filter(|_| self.only_drafts) {
+            let chains = block.chains();
+            let next: Vec<(u32, &[u32])> =
+                chains.iter().map(|(slot, tokens)| (*slot, tokens.as_slice())).collect();
+            // A failed read ahead costs nothing but the read of the step.
+            let _ = flow.lock_ngram().expect(&next);
+        }
         flow.finish(!self.only_drafts)
     }
 }
 
 impl DeviceModel for Qwen4ExpDevice {
+    fn logit_tokens(&self) -> DevicePtr {
+        self.part.head_tokens()
+    }
+
     fn logits_per_row(&self) -> u32 {
         if self.part.has_head() { self.n_vocab } else { 0 }
     }
@@ -2111,13 +2071,18 @@ impl DeviceModel for Qwen4ExpDevice {
     }
 
     fn model_drafts(&self) -> Option<ModelDrafts> {
-        // A step with the DFlash drafter's windows has one list, the
-        // drafter's; one with the MTP block's alone has the block's.
-        if let Some(d) = self.part.dflash().filter(|d| d.drafted() > 0) {
-            return Some(ModelDrafts { ptr: d.own_list(), tokens: d.drafted() });
-        }
-        let (ptr, tokens) = self.mtp.as_ref()?.drafted()?;
-        Some(ModelDrafts { ptr, tokens })
+        // The step's one list: the MTP block's when the device has it (the
+        // DFlash drafter writes its drafts into it), else the DFlash
+        // drafter's.
+        let mtp = self.mtp.as_ref().map_or(0, MtpBlock::drafted);
+        let dflash = self.part.dflash().map_or(0, |d| d.drafted());
+        let tokens = mtp.max(dflash);
+        let ptr = match (&self.mtp, self.part.dflash()) {
+            (Some(block), _) => block.list(),
+            (None, Some(d)) => d.own_list(),
+            (None, None) => return None,
+        };
+        (tokens > 0).then_some(ModelDrafts { ptr, tokens })
     }
 
     fn transfer(
@@ -2130,34 +2095,22 @@ impl DeviceModel for Qwen4ExpDevice {
 
     fn model_draft_ms(&mut self) -> f64 {
         let pass = self.part.dflash_pass_ms();
-        self.mtp.as_ref().map_or(0.0, MtpBlock::chain_ms) + pass
+        self.mtp.as_mut().map_or(0.0, MtpBlock::chain_ms) + pass
     }
 
     fn model_draft_probs(&mut self, out: &mut Vec<f32>) {
+        let Some(drafts) = self.model_drafts() else { return };
+        let from = out.len();
+        out.resize(from + drafts.tokens as usize, f32::NAN);
+        if let Some(block) = &self.mtp {
+            block.probs(&mut out[from..]);
+        }
         if let Some(d) = self.part.dflash().filter(|d| d.drafted() > 0) {
-            let from = out.len();
-            out.resize(from + d.drafted() as usize, f32::NAN);
             for s in d.last_pass() {
                 for j in s.place..s.place + s.wanted {
                     out[from + j as usize] = d.prob(j);
                 }
             }
-            if let Some(block) = self.mtp.as_ref().filter(|b| b.drafted().is_some()) {
-                // The block's probabilities, chain after chain, at the places
-                // of its windows.
-                let mut probs = block.probs().iter();
-                for (chain, &place) in self.chains.iter().zip(&self.block_places) {
-                    for j in 0..chain.rows.len() as u32 {
-                        if let Some(p) = probs.next() {
-                            out[from + (place + j) as usize] = *p;
-                        }
-                    }
-                }
-            }
-            return;
-        }
-        if let Some(block) = self.mtp.as_ref().filter(|block| block.drafted().is_some()) {
-            out.extend_from_slice(block.probs());
         }
     }
 

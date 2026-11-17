@@ -32,7 +32,8 @@ use std::ops::Range;
 use ares_core::Ledger;
 use ares_cuda::{
     AttendBuffers, AttentionKernels, AttnRow, CacheFormat, CacheGeometry, Device, DeviceBuffer,
-    DevicePtr, ENTRY_CELLS, PinnedBuffer, Plan, PlanBuffers, PlanConfig, Planner, Segment, Stream,
+    DevicePtr, ENTRY_CELLS, Event, PinnedBuffer, Plan, PlanBuffers, PlanConfig, Planner, Segment,
+    Stream,
 };
 use ares_runtime::ModelError;
 
@@ -179,6 +180,13 @@ pub(crate) struct Group {
     mirror: Vec<u32>,
     stage: Option<PinnedBuffer>,
     jobs: Option<Jobs>,
+    /// Recorded behind the last copy from `stage` and from each region of the
+    /// jobs, and whether it is on its way: a part that prepares several steps
+    /// of its own within one step of the model (an MTP block's links), or a
+    /// record with several page copies, writes a pinned buffer again only when
+    /// the device has read it.
+    sent: [Event; 3],
+    sending: [bool; 3],
     /// The draft windows of the step last prepared: the slot and the position
     /// of the first row.
     windows: Vec<(u32, u32)>,
@@ -247,6 +255,8 @@ impl Group {
             mirror: if synced { vec![0; entries] } else { Vec::new() },
             stage,
             jobs,
+            sent: [Event::new(device)?, Event::new(device)?, Event::new(device)?],
+            sending: [false; 3],
             windows: Vec::new(),
         })
     }
@@ -441,6 +451,7 @@ impl Group {
         if self.mirror.is_empty() {
             return Ok(Vec::new());
         }
+        self.wait_sent(0)?;
         let Some(stage) = &mut self.stage else { return Ok(Vec::new()) };
         let table = self.own.as_ref().map_or(step_table, DeviceBuffer::ptr);
         let mut used = 0usize;
@@ -483,6 +494,10 @@ impl Group {
                     )?;
                 }
             }
+        }
+        if used > 0 {
+            self.sent[0].record(stream)?;
+            self.sending[0] = true;
         }
         Ok(self.forms.as_mut().map(Forms::take_jobs).unwrap_or_default())
     }
@@ -861,6 +876,7 @@ impl Group {
         jobs: &[Convert],
         region: usize,
     ) -> Result<DevicePtr, ModelError> {
+        self.wait_sent(1 + region)?;
         let slots = self.jobs.as_mut().ok_or_else(|| invalid("no conversion jobs"))?;
         if jobs.len() > slots.room {
             return Err(invalid(format!(
@@ -884,7 +900,19 @@ impl Group {
                 jobs.len() * 8,
             )?;
         }
-        Ok(slots.device.ptr().offset(at as u64))
+        let at = slots.device.ptr().offset(at as u64);
+        self.sent[1 + region].record(stream)?;
+        self.sending[1 + region] = true;
+        Ok(at)
+    }
+
+    /// Waits until the device has read pinned buffer `which` (0: the stage of
+    /// the table, 1 and 2: the regions of the jobs) since it was last sent.
+    fn wait_sent(&mut self, which: usize) -> Result<(), ModelError> {
+        if std::mem::take(&mut self.sending[which]) {
+            self.sent[which].synchronize()?;
+        }
+        Ok(())
     }
 }
 

@@ -17,8 +17,13 @@
 //!   R[c]  = fc_hidden hn[c] + e
 //!   ```
 //!
-//!   The host decodes the embedding, as it does for the model's first layer,
-//!   and stages it once per stream, so that the sum is one launch.
+//!   The MTP driver gathers the embeddings on the device (`blocks/mtp.rs`);
+//!   `e` is added to every stream by the stream write.
+//! - **Steps one after the other without the host.** The driver enqueues a
+//!   chain's links and the rows that follow the model back to back, so the
+//!   part sends each step's record and plan from a buffer of a ring
+//!   ([`Part::set_inbox_ring`]) that it writes again only when the device has
+//!   read it.
 //! - **Rows that only write.** A cell of the block the model has passed gets
 //!   its keys and values and the indexer's key and reads nothing
 //!   ([`Part::enqueue_keys`]): the first half of the layer up to the write,
@@ -29,7 +34,7 @@
 //!   keys and values of their cells are overwritten when the model has passed.
 
 use ares_core::Ledger;
-use ares_cuda::{Device, DeviceBuffer, DevicePtr, Kernels, MAX_BATCH, PinnedBuffer, Stream};
+use ares_cuda::{Device, DeviceBuffer, DevicePtr, Kernels, MAX_BATCH, Stream};
 use ares_runtime::ModelError;
 
 use super::{Frame, MTP_KV, Options, Part, PartShape, Role, StepEnv, invalid};
@@ -37,17 +42,17 @@ use crate::qwen4exp::Config;
 use crate::qwen4exp::device::load::{CoreW, DeviceWeights, Mat};
 use crate::qwen4exp::weights::MtpWeights;
 
+/// The buffers of the ring a part that runs an MTP block sends the records and
+/// the plans of its steps from.
+const INBOX_RING: usize = 8;
+
 /// The buffers of an MTP block's input, for [`MAX_BATCH`] rows.
 pub(super) struct State {
-    /// The embeddings of the paired tokens, once per stream, as the host
-    /// stages them.
-    emb_host: PinnedBuffer,
     scratch: DeviceBuffer,
-    /// Offsets in the scratch: the staged embeddings (`rows * D` f32), the
-    /// normed values (`rows * D`), the projected embeddings (`rows * D`), the
-    /// input of the block (`rows * D`), and quantized activations of
-    /// [`MAX_BATCH`] rows of `N` values.
-    emb: u64,
+    /// Offsets in the scratch: the normed values (`rows * D` f32), the
+    /// projected embeddings (`rows * N`), the input of the block
+    /// (`rows * D`), and quantized activations of [`MAX_BATCH`] rows of `N`
+    /// values.
     normed: u64,
     e: u64,
     input: u64,
@@ -101,21 +106,20 @@ impl Part {
         )?;
         let rows = u64::from(MAX_BATCH);
         let row = c.wide() as u64 * 4;
-        let (emb, normed, e, input) = (0, rows * row, 2 * rows * row, 3 * rows * row);
-        let act = 4 * rows * row;
+        let (normed, e, input) = (0, rows * row, 2 * rows * row);
+        let act = 3 * rows * row;
         let len = act + Kernels::quantized_activation_bytes(c.n_embd as u32, MAX_BATCH);
         let saved = part.f.slot_bytes * u64::from(opts.max_slots);
         ledger.reserve("qwen4exp MTP block input", len + saved)?;
         part.mtp = Some(State {
-            emb_host: PinnedBuffer::new(device, (rows * row) as usize)?,
             scratch: DeviceBuffer::new(device, len)?,
-            emb,
             normed,
             e,
             input,
             act,
             saved: DeviceBuffer::new(device, saved)?,
         });
+        part.set_inbox_ring(device, INBOX_RING)?;
         Ok(part)
     }
 
@@ -129,58 +133,35 @@ impl Part {
     /// it is (`rows * D` f32, valid until the next call): what
     /// [`StepEnv::inbound`] of the block's step names. `residual` addresses
     /// the rows' residuals on this device (`rows * D` f32) and `embeddings`
-    /// holds the embeddings of the paired tokens (`rows * N` values).
+    /// the embeddings of the paired tokens (`rows * N` f32).
     ///
     /// # Safety
     ///
-    /// `residual` must address `rows * D` f32 values on this part's device,
-    /// 16-byte aligned, that stay as they are until the launches have run.
-    /// The device must have run the block's last step: its host buffers are
-    /// written again here.
+    /// `residual` and `embeddings` must address their values on this part's
+    /// device, 16-byte aligned, and stay as they are until the launches have
+    /// run.
     pub unsafe fn mtp_input(
         &mut self,
         stream: &Stream,
         residual: DevicePtr,
-        embeddings: &[f32],
+        embeddings: DevicePtr,
         rows: u32,
     ) -> Result<DevicePtr, ModelError> {
-        let (n, hc, wide, eps) = (self.n, self.hc, self.wide, self.eps);
+        let (n, hc, eps) = (self.n, self.hc, self.eps);
         let input = self.w.mtp_in.ok_or_else(|| invalid("the part is no MTP block"))?;
+        let zeros = self.at(self.f.s.zeros);
         let block = self.mtp.as_mut().ok_or_else(|| invalid("the part is no MTP block"))?;
-        if rows == 0 || rows > MAX_BATCH || embeddings.len() != (rows * n) as usize {
-            return Err(invalid(format!(
-                "the input of an MTP block for {rows} rows from {} embedding values",
-                embeddings.len()
-            )));
+        if rows == 0 || rows > MAX_BATCH {
+            return Err(invalid(format!("the input of an MTP block for {rows} rows")));
         }
         let at = |offset: u64| block.scratch.ptr().offset(offset);
-        let values = (rows * wide) as usize;
-        // SAFETY: the pinned buffer and every section of the scratch hold
-        // `MAX_BATCH` rows of `D` values; the copies of the step before have
-        // run (the caller's guarantee).
+        // SAFETY: every section of the scratch holds `MAX_BATCH` rows of `D`
+        // values; the rest is the caller's guarantee.
         unsafe {
-            let staged = block.emb_host.as_mut_ptr().cast::<f32>();
-            for (row, x) in embeddings.chunks_exact(n as usize).enumerate() {
-                for stream_no in 0..hc as usize {
-                    let to = staged.add((row * hc as usize + stream_no) * n as usize);
-                    std::ptr::copy_nonoverlapping(x.as_ptr(), to, n as usize);
-                }
-            }
-            stream.copy_from_host(at(block.emb), block.emb_host.as_ptr(), values * 4)?;
-            // e, once per stream.
-            self.kernels.rms_norm_f32(
-                stream,
-                at(block.emb),
-                self.w.at(input.norm_embedding),
-                at(block.normed),
-                n,
-                rows * hc,
-                eps,
-            )?;
-            let project = |m: &Mat, from: u64, to: u64| -> Result<(), ModelError> {
+            let project = |m: &Mat, from: u64, to: u64, count: u32| -> Result<(), ModelError> {
                 let mut done = 0;
-                while done < rows * hc {
-                    let batch = (rows * hc - done).min(MAX_BATCH);
+                while done < count {
+                    let batch = (count - done).min(MAX_BATCH);
                     let x = at(from + u64::from(done * n) * 4);
                     self.kernels.quantize_activations(stream, x, at(block.act), n, batch)?;
                     self.kernels.matvec(
@@ -197,9 +178,20 @@ impl Part {
                 }
                 Ok(())
             };
-            project(&input.fc_embedding, block.normed, block.e)?;
+            // e, once per row.
+            self.kernels.rms_norm_f32(
+                stream,
+                embeddings,
+                self.w.at(input.norm_embedding),
+                at(block.normed),
+                n,
+                rows,
+                eps,
+            )?;
+            project(&input.fc_embedding, block.normed, block.e, rows)?;
             // The residual, every stream normed by itself, then each stream
-            // through its projection.
+            // through its projection, and `e` added to every stream (the
+            // write adds `e * 2 sigmoid(0)`, which is `e`).
             self.q4.stream_norm(
                 stream,
                 residual,
@@ -210,8 +202,8 @@ impl Part {
                 n,
                 eps,
             )?;
-            project(&input.fc_hidden, block.normed, block.input)?;
-            self.kernels.add_f32(stream, at(block.input), at(block.e), rows * wide)?;
+            project(&input.fc_hidden, block.normed, block.input, rows * hc)?;
+            self.q4.stream_write(stream, at(block.input), at(block.e), zeros, rows, hc, n)?;
         }
         Ok(at(block.input))
     }

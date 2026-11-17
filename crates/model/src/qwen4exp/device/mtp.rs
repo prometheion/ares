@@ -1,39 +1,27 @@
-//! The model's MTP block (section 4 of the specification) as a device
-//! thread of the runtime drives it: a part of one layer on the device that
-//! holds the output head ([`Part::open_mtp`]), which runs steps of its own
-//! in front of every step of the model.
+//! Flash-Next's MTP block (section 4 of the specification) as the layer of
+//! the shared MTP driver (`blocks/mtp.rs`), which runs its chains, its picks
+//! on the device, its carry and its following of the model.
 //!
-//! Cell `i` of the block pairs the model's residual after its last layer at
-//! cell `i` with the token at cell `i + 1`, so the block is always one token
-//! behind the model, and what it does in a step is decided by what the model
-//! did in the step before:
+//! The layer is a part of one layer on the device that holds the output head
+//! ([`Part::open_mtp`]): attention with its indexer and a mixture of experts
+//! between stream mixers, which runs steps of its own in front of the
+//! model's. The model gives the driver its hidden state where it is tapped:
+//! the residual streams after the last layer (`hc` streams of `n` values a
+//! row), which the model part keeps until its next step begins. The block's
+//! cell `i` pairs the residual at cell `i` with the token at cell `i + 1`, so a
+//! pair of the token at position `p` is cell `p - 1` (the driver's lag of 1).
 //!
-//! 1. **Following.** The rows of the model's last step that count (all of a
-//!    slice of a prompt, the accepted rows of a window, which the record of
-//!    this step tells) give the block the cells in front of the last one: each
-//!    pairs a row's residual, which is still in the model part's scratch, with
-//!    the next row's token. They only write keys and values. The residual of
-//!    the last row that counts is copied to the sequence's *carry*.
-//! 2. **The newest cell.** The first row of a sequence in this step is certain
-//!    and names the token the carry is paired with. For a sequence that drafts
-//!    this is link 0 of its chain, which runs the whole block and picks; for
-//!    any other it writes keys and values only.
-//! 3. **The chain.** Link `j` starts from the block's own residual of link
-//!    `j - 1` and its pick. These cells are provisional: the keys of the
-//!    indexer the sequence carries are saved behind link 0 and put back behind
-//!    the last link, and the keys and values are overwritten when the model
-//!    has passed the cells (step 1 of a later step).
-//!
-//! Every link ends with a wait of the host: the pick is read back, because the
-//! embedding of the next link's token is decoded on the host, as are the
-//! embeddings and the rows of the n-gram table of the rows that verify the
-//! drafts. While it waits the thread serves the expert store, which brings the
-//! experts the block's router picked like those of any layer (the block is
-//! layer 0 of the store). With the pick the host has the probability the
-//! block gave it, and a chain ends where the step's draft bars say one more
-//! link is not expected to pay: the links after it are not made, their rows
-//! of the window take the last draft again, and the runtime is told that they
-//! are no drafts.
+//! - **Rows that only write.** A cell the model has passed gets its keys and
+//!   values and the indexer's key, and reads nothing
+//!   ([`Part::enqueue_keys`]), in steps of up to [`MAX_BATCH`] rows.
+//! - **Links.** The whole layer, the final mixer and the draft head: the first
+//!   rows of the model's output head as the head view orders them. The
+//!   block's experts are resident in VRAM (layer 0 of the expert store), so a
+//!   link never waits for the store, and the chain stays on the device: the
+//!   host neither waits for a link nor reads its picks before the step ends.
+//! - **State that is put back.** The indexer's carried keys of a sequence are
+//!   saved behind link 0 and put back behind the last link; keys and values of
+//!   the links' cells are written again when the model has passed them.
 //!
 //! The block's pages are its own memory, addressed through the page tables
 //! the conductor gives the model: page `p` of a sequence holds the same cells
@@ -54,19 +42,17 @@
 
 use std::ops::Range;
 use std::sync::Arc;
-use std::time::Instant;
 
 use ares_core::Ledger;
 use ares_cuda::{
-    Device, DeviceBuffer, DevicePtr, Event, MAX_BATCH, PinnedBuffer, SampleBatch, SamplePlan,
-    SamplerKernels, Segment, StepRecord, Stream,
+    Device, DeviceBuffer, DevicePtr, KeptRows, LayerKernels, MAX_BATCH, Segment, Stream,
 };
-use ares_runtime::{DraftChances, ModelError, draft_chance};
-use ares_sampler::{SamplePick, SampleRow};
+use ares_runtime::ModelError;
 
-use super::board::Board;
 use super::part::{ExpertAt, Options, Part, StepEnv};
-use super::runtime::Flow;
+use crate::blocks::head::HeadView;
+use crate::blocks::mtp::{Driver, DriverSetup, LinkLogits, MtpLayer, Rows};
+pub use crate::blocks::mtp::{MtpStep, MtpTimes};
 use crate::blocks::rows::HostTable;
 use crate::blocks::slots::{Extent, PageArray, PageGroup};
 use crate::qwen4exp::Config;
@@ -78,55 +64,7 @@ fn invalid(message: impl Into<String>) -> ModelError {
     ModelError::Invalid(message.into())
 }
 
-/// What the model's last step left of a sequence for the block to follow.
-#[derive(Clone, Debug)]
-struct Tail {
-    slot: u32,
-    pos0: u32,
-    row0: u32,
-    tokens: Vec<u32>,
-    direct: bool,
-    /// The rows are a replay: their cells are cached, the block's too.
-    replay: bool,
-    /// The drafts of the block among the rows: 0 for rows that took none.
-    links: u32,
-}
-
-/// A window of the step that takes the block's drafts.
-#[derive(Clone, Debug)]
-pub(super) struct Chain {
-    /// The segment of the step that verifies the drafts: its first row is the
-    /// sequence's newest token, the others take the drafts.
-    pub segment: usize,
-    /// How the rows that verify the drafts are sampled, one per draft: link
-    /// `j` and row `j` of the window pick the same position.
-    pub rows: Vec<SampleRow>,
-    /// The reach the chain needs for each link to be made (the step record's
-    /// draft bars); empty for a chain that makes every link.
-    pub needs: Vec<f32>,
-}
-
-/// Where a row of a block step takes its residual from.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Source {
-    /// The carry of the row's sequence.
-    Carry,
-    /// A row of the model's last step.
-    Model(u32),
-    /// A row of the block's own last step.
-    Link(u32),
-}
-
-/// One row of a step of the block.
-#[derive(Clone, Copy, Debug)]
-struct Row {
-    slot: u32,
-    cell: u32,
-    token: u32,
-    source: Source,
-}
-
-/// What the block took and did, for reports.
+/// What the block took, for reports.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct MtpReport {
     /// The device part that holds the block.
@@ -135,29 +73,12 @@ pub struct MtpReport {
     pub weights: u64,
     /// Bytes of its keys, values and indexer keys for all pages.
     pub pools: u64,
-    /// Bytes of its scratch, carries and tables.
+    /// Bytes of its scratch, carries, tables and step records.
     pub buffers: u64,
-}
-
-/// Device and host time of the block, added up over steps.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct MtpTimes {
-    /// Steps of the model in which a chain ran.
-    pub chain_steps: u64,
-    /// Links of all chains of those steps (a link of several sequences counts
-    /// once).
-    pub links: u64,
-    /// Milliseconds of the chains, from the first link's enqueue to the last
-    /// pick on the host.
-    pub chain_ms: f64,
-    /// Rows that only wrote keys, and the milliseconds the host took to
-    /// enqueue them (the device runs them while the model's step is enqueued).
-    pub key_rows: u64,
-    pub key_ms: f64,
-    /// Per link of a chain: how often its draft was verified (every draft
-    /// before it had been accepted) and how often it was accepted then.
-    pub offered: [u64; MAX_BATCH as usize],
-    pub accepted: [u64; MAX_BATCH as usize],
+    /// Rows of the embedding table kept on the device for the tokens a link
+    /// can pick (the head view's), and their bytes.
+    pub kept_rows: u32,
+    pub kept_bytes: u64,
 }
 
 /// A chain the block made: for tests and measurements that compare its
@@ -187,54 +108,31 @@ impl Watch {
     const KEPT: usize = 1024;
 }
 
+/// A chain of the step that ran last, until its drafts are read.
+#[derive(Clone, Copy, Debug)]
+struct Asked {
+    slot: u32,
+    position: u32,
+    token: u32,
+    place: u32,
+    links: u32,
+}
+
 pub(super) struct MtpBlock {
     part: Part,
-    embedding: Arc<HostTable>,
-    sampler: SamplerKernels,
+    driver: Driver,
+    layers: LayerKernels,
     /// Keys, values and indexer keys of the block's cells, for every page.
     pools: DeviceBuffer,
-    /// Per sequence slot the residual its next cell starts from (`D` f32).
-    carry: DeviceBuffer,
-    /// The residuals of the rows of a block step, gathered.
-    staged: DeviceBuffer,
-    /// The sampler's rows, picks, scratch and exchange.
-    work: DeviceBuffer,
-    picks_at: u64,
-    scratch_at: u64,
-    exchange_at: u64,
-    /// The host's side of the rows, the picks and the drafts.
-    io: PinnedBuffer,
-    picks_host: usize,
-    drafts_host: usize,
-    /// The drafts of the step, for the runtime to read with the picks.
-    drafts: DeviceBuffer,
-    n_drafts: u32,
-    /// The probability the block gave each draft of the step, in the order of
-    /// the drafts; NaN for a link that was not made. And the links each
-    /// sequence's chain made, by its slot, until the model's step that
-    /// verifies them is kept.
-    probs: Vec<f32>,
-    made: Vec<(u32, u32)>,
-    /// The newest cells (slot, cell) that the chains of a step that only
-    /// drafts ran as their link 0: the model's step that verifies the drafts
-    /// does not write them again.
-    newest_done: Vec<(u32, u32)>,
-    picked: Event,
-    /// Recorded behind a step whose rows only wrote keys, and whether the
-    /// device may still be running such a step: the host writes the block's
-    /// step inputs again only when it has run.
-    wrote: Event,
-    writing: bool,
-    tails: Vec<Tail>,
+    /// The rows of the embedding table of the tokens a link can pick, and
+    /// their tokens when they are not the first ones: the driver reads them.
+    _kept: DeviceBuffer,
+    _kept_tokens: Option<DeviceBuffer>,
     serial: u32,
-    n: usize,
     wide: u64,
-    n_vocab: u32,
-    max_slots: u32,
-    last_chain_ms: f64,
-    times: MtpTimes,
+    head_rows: u32,
     watch: Arc<std::sync::Mutex<Watch>>,
-    x: Vec<f32>,
+    asked: Vec<Asked>,
     report: MtpReport,
 }
 
@@ -244,11 +142,107 @@ impl std::fmt::Debug for MtpBlock {
     }
 }
 
+/// The block's part as the driver drives it.
+struct BlockLayer<'a> {
+    part: &'a mut Part,
+    serial: &'a mut u32,
+    pools: DevicePtr,
+    wide: u64,
+    head_rows: u32,
+}
+
+impl BlockLayer<'_> {
+    /// The step of the block for `rows`, whose input starts from the rows'
+    /// hidden states and embeddings.
+    fn env<'b>(&mut self, rows: &'b Rows<'b>, input: DevicePtr) -> StepEnv<'b> {
+        // The token marks the block's route records: never 0, and never the
+        // same for two steps that follow each other.
+        *self.serial = self.serial.wrapping_add(1).max(1);
+        StepEnv {
+            stream: rows.stream,
+            record: rows.record,
+            segments: rows.segments,
+            token: *self.serial,
+            tokens: &[],
+            ngram: None,
+            inbound: Some(input),
+            xbase: 0,
+            pools: self.pools,
+            replay: rows.replay,
+        }
+    }
+}
+
+impl MtpLayer for BlockLayer<'_> {
+    fn lag(&self) -> u32 {
+        1
+    }
+
+    fn keys_inputs(&self) -> Option<(DevicePtr, DevicePtr)> {
+        None
+    }
+
+    fn bytes(&mut self, _: &[Segment], _: bool, _: &mut [u8]) -> Result<usize, ModelError> {
+        // The part sends its records and plans itself, from its ring.
+        Ok(0)
+    }
+
+    fn keys(&mut self, rows: &Rows<'_>) -> Result<(), ModelError> {
+        let n = rows.record.dims().n_rows;
+        // SAFETY: the driver's rows hold `n` hidden states and embeddings.
+        let input = unsafe { self.part.mtp_input(rows.stream, rows.h, rows.e, n)? };
+        let env = self.env(rows, input);
+        self.part.begin(&env)?;
+        self.part.enqueue_keys(&env, 0)?;
+        self.part.end_keys(&env)
+    }
+
+    fn link(
+        &mut self,
+        rows: &Rows<'_>,
+        out: DevicePtr,
+        _logits: DevicePtr,
+    ) -> Result<LinkLogits, ModelError> {
+        let n = rows.record.dims().n_rows;
+        // SAFETY: as in `keys`.
+        let input = unsafe { self.part.mtp_input(rows.stream, rows.h, rows.e, n)? };
+        let env = self.env(rows, input);
+        self.part.begin(&env)?;
+        self.part.enqueue_layer(&env, 0)?;
+        self.part.end(&env)?;
+        // The residual of the link's rows is the next link's hidden state.
+        // SAFETY: the part's residual holds the link's rows, `out` the
+        // driver's room for them.
+        unsafe {
+            let bytes = (u64::from(n) * self.wide * 4) as usize;
+            rows.stream.copy(out, self.part.residual(), bytes)?;
+        }
+        Ok(LinkLogits { ptr: self.part.head_logits(), stride: self.head_rows })
+    }
+
+    fn save(&mut self, stream: &Stream, slots: &[u32]) -> Result<(), ModelError> {
+        slots.iter().try_for_each(|&slot| self.part.save_slot(stream, slot))
+    }
+
+    fn restore(&mut self, stream: &Stream, slots: &[u32]) -> Result<(), ModelError> {
+        slots.iter().try_for_each(|&slot| self.part.restore_slot(stream, slot))
+    }
+
+    fn writes_converted(&self, slot: u32, cell: u32) -> bool {
+        self.part.writes_converted(slot, cell)
+    }
+
+    fn settle(&mut self, slot: u32, cells: u32) {
+        self.part.settle(slot, cells);
+    }
+}
+
 impl MtpBlock {
     /// Builds the block on `device`, next to the model part `index` that
-    /// holds the output head `output`. `opts` are the model part's: the block
-    /// has the same sequences, pages and formats, and steps of up to
-    /// [`MAX_BATCH`] certain rows.
+    /// holds the output head `output` (in the order of `view`, whose tokens
+    /// `head_tokens` names on the device). `opts` are the model part's: the
+    /// block has the same sequences, pages and formats, and steps of up to
+    /// [`MAX_BATCH`] rows. `table` is the embedding table on the host.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn open(
         c: &Config,
@@ -256,12 +250,17 @@ impl MtpBlock {
         opts: &Options,
         index: usize,
         output: (Mat, DevicePtr),
-        embedding: Arc<HostTable>,
+        head_tokens: DevicePtr,
+        view: &HeadView,
+        table: Arc<HostTable>,
         watch: Arc<std::sync::Mutex<Watch>>,
         device: &Device,
         ledger: &mut Ledger,
     ) -> Result<Self, ModelError> {
         let block = mtp_config(c);
+        // The model's steps, which the block follows, have up to this many
+        // rows; its own have up to `MAX_BATCH`.
+        let model_rows = opts.max_rows;
         let opts = Options {
             max_rows: MAX_BATCH,
             logit_rows: MAX_BATCH,
@@ -271,76 +270,84 @@ impl MtpBlock {
             ..opts.clone()
         };
         let before = ledger.reserved();
-        let part = Part::open_mtp(&block, w, &opts, index, output, device, ledger)?;
+        // The draft head is the first rows of the head in the view's order.
+        let (mat, at) = output;
+        if view.rows == 0 || view.rows > mat.n_out {
+            return Err(invalid(format!(
+                "a draft head of {} rows of a head of {}",
+                view.rows, mat.n_out
+            )));
+        }
+        let head = (Mat { n_out: view.rows, ..mat }, at);
+        let part = Part::open_mtp(&block, w, &opts, index, head, device, ledger)?;
         let weights = part.weight_bytes();
         let pool_bytes = part.pool_bytes();
         ledger.reserve("qwen4exp MTP block K, V and keys", pool_bytes)?;
         let pools = DeviceBuffer::new(device, pool_bytes.max(64))?;
+        // The rows of the embedding table of the tokens a link can pick.
+        let shape = table.shape();
+        let tokens = view.draft_tokens();
+        let kept_bytes = u64::from(view.rows) * shape.row_bytes();
+        ledger.reserve("qwen4exp MTP block: kept embedding rows", kept_bytes)?;
+        let kept = DeviceBuffer::new(device, kept_bytes.max(64))?;
+        let mut bytes = vec![0u8; kept_bytes as usize];
+        table.stage(&tokens, &mut bytes)?;
+        kept.write(0, &bytes)?;
+        let kept_tokens = if view.order.is_none() {
+            None
+        } else {
+            let list: Vec<u8> = tokens.iter().flat_map(|t| t.to_le_bytes()).collect();
+            let buffer = DeviceBuffer::new(device, list.len() as u64)?;
+            buffer.write(0, &list)?;
+            Some(buffer)
+        };
         let wide = c.wide() as u64;
-        let rows = u64::from(MAX_BATCH);
-        let carry_bytes = u64::from(opts.max_slots) * wide * 4;
-        let staged_bytes = rows * wide * 4;
-        let picks_at = (rows * SampleRow::BYTES as u64).next_multiple_of(64);
-        let scratch_at = (picks_at + rows * SamplePick::BYTES as u64).next_multiple_of(64);
-        let scratch_bytes = SamplerKernels::scratch_bytes(MAX_BATCH);
-        let exchange_at = (scratch_at + scratch_bytes).next_multiple_of(64);
-        let work_bytes = exchange_at + u64::from(SamplerKernels::exchange_values(MAX_BATCH, 1)) * 4;
-        let drafts_bytes = rows * 4;
-        ledger.reserve(
-            "qwen4exp MTP block carries and picks",
-            carry_bytes + staged_bytes + work_bytes + drafts_bytes,
+        let kept_rows = KeptRows {
+            rows: kept.ptr(),
+            tokens: kept_tokens.as_ref().map_or(DevicePtr::NULL, DeviceBuffer::ptr),
+            count: view.rows,
+        };
+        let driver = Driver::open(
+            device,
+            ledger,
+            DriverSetup {
+                label: "qwen4exp MTP block",
+                width: wide as u32,
+                max_slots: opts.max_slots,
+                max_rows: model_rows,
+                window_rows: MAX_BATCH,
+                head_rows: view.rows,
+                head_tokens,
+                table: shape,
+                kept: kept_rows,
+                host: Some(table),
+            },
+            MAX_BATCH,
+            false,
+            |_, _| 0,
         )?;
-        let carry = DeviceBuffer::new(device, carry_bytes)?;
-        carry.write(0, &vec![0u8; carry_bytes as usize])?;
-        let work = DeviceBuffer::new(device, work_bytes)?;
-        work.write(scratch_at, &vec![0u8; scratch_bytes as usize])?;
-        let picks_host = (rows as usize * SampleRow::BYTES).next_multiple_of(64);
-        let drafts_host = (picks_host + rows as usize * SamplePick::BYTES).next_multiple_of(64);
         let report = MtpReport {
             index,
             weights,
             pools: pool_bytes,
-            buffers: ledger.reserved() - before - weights - pool_bytes,
+            buffers: ledger.reserved() - before - weights - pool_bytes - kept_bytes,
+            kept_rows: view.rows,
+            kept_bytes,
         };
         Ok(Self {
-            embedding,
-            sampler: SamplerKernels::load(device)?,
-            pools,
-            carry,
-            staged: DeviceBuffer::new(device, staged_bytes)?,
-            work,
-            picks_at,
-            scratch_at,
-            exchange_at,
-            io: PinnedBuffer::new(device, drafts_host + rows as usize * 4)?,
-            picks_host,
-            drafts_host,
-            drafts: DeviceBuffer::new(device, drafts_bytes)?,
-            n_drafts: 0,
-            probs: Vec::new(),
-            made: Vec::new(),
-            newest_done: Vec::new(),
-            picked: Event::new(device)?,
-            wrote: Event::new(device)?,
-            writing: false,
-            tails: Vec::new(),
-            serial: 0,
-            n: c.n_embd,
-            wide,
-            n_vocab: c.n_vocab as u32,
-            max_slots: opts.max_slots,
-            last_chain_ms: 0.0,
-            times: MtpTimes::default(),
-            watch,
-            x: Vec::new(),
-            report,
+            layers: part.layers(),
             part,
+            driver,
+            pools,
+            _kept: kept,
+            _kept_tokens: kept_tokens,
+            serial: 0,
+            wide,
+            head_rows: view.rows,
+            watch,
+            asked: Vec::new(),
+            report,
         })
-    }
-
-    /// Where the block leaves its route records.
-    pub(super) fn board(&self) -> Arc<Board> {
-        self.part.board()
     }
 
     /// Tells the block where its experts are: layer 0 of the store.
@@ -368,7 +375,10 @@ impl MtpBlock {
     /// its indexer) and the sequence's carry.
     pub(super) fn extents(&self) -> [Extent; 2] {
         let row = self.wide * 4;
-        [self.part.arena_extent(), Extent { base: self.carry.ptr(), stride: row, bytes: row }]
+        [
+            self.part.arena_extent(),
+            Extent { base: self.driver.carry().ptr(), stride: row, bytes: row },
+        ]
     }
 
     /// What a page holds of the block: its K/V group and its indexer's pooled
@@ -385,536 +395,141 @@ impl MtpBlock {
         self.part.release_pages(pages.iter().copied());
     }
 
-    /// Step 1: the cells the model's last step has passed. `accepted` says how
-    /// many rows of the window of a slot that started at a row count (`None`
-    /// when the record names no outcome for it), and `residual` is where the
-    /// model's part left the residual of that step's rows (`D` f32 a row).
-    /// Before the tables of the new step are written.
+    /// Runs `f` with the driver and the block's part as its layer.
+    fn with_layer<T>(
+        &mut self,
+        f: impl FnOnce(&mut Driver, &mut BlockLayer<'_>, &LayerKernels) -> Result<T, ModelError>,
+    ) -> Result<T, ModelError> {
+        let mut layer = BlockLayer {
+            part: &mut self.part,
+            serial: &mut self.serial,
+            pools: self.pools.ptr(),
+            wide: self.wide,
+            head_rows: self.head_rows,
+        };
+        f(&mut self.driver, &mut layer, &self.layers)
+    }
+
+    /// Step 1, before the tables of the step are written: the cells the
+    /// model's last step has passed. `accepted` says how many rows of the
+    /// window of a slot that started at a row count (`None` when the record
+    /// names no outcome for it), and `residual` is where the model's part
+    /// left the residual of that step's rows (`D` f32 a row).
     pub(super) fn follow(
         &mut self,
         stream: &Stream,
-        flow: &Flow,
         accepted: &dyn Fn(u32, u32) -> Option<u32>,
         residual: DevicePtr,
     ) -> Result<(), ModelError> {
-        let begun = Instant::now();
-        let tails = std::mem::take(&mut self.tails);
-        let mut rows: Vec<Row> = Vec::new();
-        // The sequences that end at the end of a page: the block's last cell of
-        // the page waits for a token that may never come.
-        let mut at_page_end: Vec<(u32, u32)> = Vec::new();
-        for tail in &tails {
-            let n = tail.tokens.len() as u32;
-            let counted = if tail.direct {
-                n
-            } else {
-                accepted(tail.slot, tail.row0)
-                    .ok_or_else(|| {
-                        invalid(format!("no outcome for the window of slot {}", tail.slot))
-                    })?
-                    .min(n)
-            };
-            if counted == 0 {
-                continue;
-            }
-            let cells = tail.pos0 + counted;
-            if cells.is_multiple_of(ares_cuda::ENTRY_CELLS) {
-                at_page_end.push((tail.slot, cells));
-            }
-            // Draft `j` was verified when every draft before it was accepted.
-            for link in 0..tail.links.min(counted) as usize {
-                self.times.offered[link] += 1;
-                self.times.accepted[link] += u64::from(link as u32 + 1 < counted);
-            }
-            // The cells of a replay are cached, the block's with them.
-            for r in (0..counted - 1).filter(|_| !tail.replay) {
-                rows.push(Row {
-                    slot: tail.slot,
-                    cell: tail.pos0 + r,
-                    token: tail.tokens[r as usize + 1],
-                    source: Source::Model(tail.row0 + r),
-                });
-            }
-            // The residual of the last row that counts waits for its token.
-            let last = u64::from(tail.row0 + counted - 1);
-            // SAFETY: a row of the model part's residual, which holds the rows
-            // of its last step until its next step begins, and a slot of the
-            // carries.
-            unsafe {
-                stream.copy(
-                    self.carry.ptr().offset(u64::from(tail.slot) * self.wide * 4),
-                    residual.offset(last * self.wide * 4),
-                    (self.wide * 4) as usize,
-                )?;
-            }
-        }
-        self.times.key_rows += rows.len() as u64;
-        // Rows of a sequence stay together and in order; a step takes
-        // `MAX_BATCH` of them.
-        for chunk in rows.chunks(MAX_BATCH as usize) {
-            self.step(stream, flow, chunk, residual, None)?;
-        }
-        // Behind those rows the pages they fill are settled, the last cell of
-        // a page whose sequence stops at its end with them.
-        for (slot, cells) in at_page_end {
-            self.part.settle(slot, cells);
-        }
-        self.times.key_ms += begun.elapsed().as_secs_f64() * 1e3;
-        self.watch.lock().unwrap_or_else(|e| e.into_inner()).times = self.times;
+        self.with_layer(|driver, layer, layers| {
+            let pools = layer.pools;
+            driver.follow(layer, layers, stream, accepted, residual, DevicePtr::NULL, pools)
+        })?;
+        self.watch.lock().unwrap_or_else(|e| e.into_inner()).times = self.driver.times();
         Ok(())
     }
 
-    /// Steps 2 and 3: the newest cell of every sequence of the step, and the
-    /// chains. `tokens` are the tokens of the step's rows; the rows that take
-    /// the block's drafts get them. After the tables of the step are written.
-    /// `only` is a step that only drafts: the model's step after it verifies
-    /// the drafts and finds the newest cells of these chains written. The
-    /// segments that start in `replay` (rows of the step) are a replay, whose
-    /// newest cell is cached.
+    /// Steps 2 and 3, after the tables of the step are written: the newest
+    /// cell of every sequence of the step and the chains of `step`. `tokens`
+    /// are the tokens of the step's rows, `replay` its rows that are a
+    /// replay. `only` is a step that only drafts. Unless `only`, the step's
+    /// rows are kept for the next step to follow.
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn draft(
+    pub(super) fn step(
         &mut self,
         stream: &Stream,
-        flow: &Flow,
         segments: &[Segment],
-        tokens: &mut [u32],
-        chains: &[Chain],
-        chances: Option<&DraftChances>,
-        only: bool,
+        tokens: &[u32],
         replay: &[Range<u32>],
+        step: Option<MtpStep>,
+        only: bool,
     ) -> Result<(), ModelError> {
-        self.n_drafts = 0;
-        self.last_chain_ms = 0.0;
-        self.probs.clear();
-        if !chains.is_empty() {
-            self.made.clear();
+        self.asked.clear();
+        if let Some(step) = step.filter(|s| !s.chains.is_empty()) {
+            for chain in &step.chains {
+                let s = segments
+                    .get(chain.segment as usize)
+                    .ok_or_else(|| invalid(format!("the step has no segment {}", chain.segment)))?;
+                self.asked.push(Asked {
+                    slot: s.slot,
+                    position: s.pos0 as u32 + 1,
+                    token: tokens[s.row0 as usize],
+                    place: chain.place,
+                    links: chain.rows.len() as u32,
+                });
+            }
+            self.driver.draft_step(step)?;
         }
-        let done = std::mem::take(&mut self.newest_done);
-        let drafting = |i: usize| chains.iter().any(|c| c.segment == i);
-        // The newest cells of the sequences that do not draft, and whose
-        // chain did not write them in a step that only drafted.
-        let begun = Instant::now();
-        let quiet: Vec<Row> = segments
-            .iter()
-            .enumerate()
-            .filter(|(i, s)| {
-                s.pos0 > 0
-                    && !drafting(*i)
-                    && !done.contains(&(s.slot, s.pos0 as u32 - 1))
-                    && !replay.iter().any(|r| r.contains(&s.row0))
-            })
-            .map(|(_, s)| Row {
-                slot: s.slot,
-                cell: s.pos0 as u32 - 1,
-                token: tokens[s.row0 as usize],
-                source: Source::Carry,
-            })
-            .collect();
-        self.times.key_rows += quiet.len() as u64;
-        for chunk in quiet.chunks(MAX_BATCH as usize) {
-            self.step(stream, flow, chunk, DevicePtr::NULL, None)?;
-        }
-        self.times.key_ms += begun.elapsed().as_secs_f64() * 1e3;
-        if chains.is_empty() {
-            return Ok(());
-        }
-        if chains.len() > MAX_BATCH as usize {
-            return Err(invalid(format!("{} chains in a step", chains.len())));
-        }
+        self.with_layer(|driver, layer, layers| {
+            let pools = layer.pools;
+            driver.step(
+                layer,
+                layers,
+                stream,
+                segments,
+                tokens,
+                replay,
+                DevicePtr::NULL,
+                pools,
+                only,
+            )
+        })
+    }
 
-        // The chains, longest first, so that the rows of a link are the first
-        // rows of the link before.
-        let begun = Instant::now();
-        let mut order: Vec<usize> = (0..chains.len()).collect();
-        order.sort_by_key(|&c| std::cmp::Reverse(chains[c].rows.len()));
-        let n_links = chains[order[0]].rows.len();
-        let mut newest: Vec<u32> = vec![0; chains.len()];
-        // Per chain: the product of the chances of its drafts, their
-        // probabilities, and its row in the link before.
-        let mut reach = vec![1.0f64; chains.len()];
-        let mut probs: Vec<Vec<f32>> = vec![Vec::new(); chains.len()];
-        let mut at = vec![0u32; chains.len()];
-        let mut links_run = 0u64;
-        for &c in &order {
-            let segment = segments
-                .get(chains[c].segment)
-                .ok_or_else(|| invalid(format!("the step has no segment {}", chains[c].segment)))?;
-            if segment.n_rows as usize != chains[c].rows.len() + 1 {
-                return Err(invalid(format!(
-                    "segment {segment:?} does not verify {} drafts",
-                    chains[c].rows.len()
-                )));
-            }
-            newest[c] = tokens[segment.row0 as usize];
-        }
-        for j in 0..n_links {
-            // A chain goes on while it has made every link so far and its
-            // reach is at the bar of the next.
-            let goes_on = |c: usize| {
-                let need = chains[c].needs.get(j).copied().unwrap_or(0.0);
-                probs[c].len() == j && (j == 0 || chances.is_none() || reach[c] >= f64::from(need))
-            };
-            let live: Vec<usize> =
-                order.iter().copied().filter(|&c| chains[c].rows.len() > j && goes_on(c)).collect();
-            if live.is_empty() {
-                break;
-            }
-            links_run += 1;
-            let rows: Vec<Row> = live
-                .iter()
-                .map(|&c| {
-                    let s = &segments[chains[c].segment];
-                    Row {
-                        slot: s.slot,
-                        // A window at the start of a sequence has no cell in
-                        // front of it (the conductor's probes are such).
-                        cell: (s.pos0 as u32).saturating_sub(1) + j as u32,
-                        token: newest[c],
-                        source: if j == 0 { Source::Carry } else { Source::Link(at[c]) },
-                    }
-                })
-                .collect();
-            let params: Vec<SampleRow> = live.iter().map(|&c| chains[c].rows[j]).collect();
-            let picks = self
-                .step(stream, flow, &rows, DevicePtr::NULL, Some(&params))?
-                .ok_or_else(|| invalid("a link without picks"))?;
-            if j == 0 {
-                // Link 0 is the cell of a certain token; what follows is not.
-                for row in &rows {
-                    self.part.save_slot(stream, row.slot)?;
-                }
-            }
-            for (row, &c) in live.iter().enumerate() {
-                let s = &segments[chains[c].segment];
-                let (token, p) = picks[row];
-                tokens[(s.row0 + 1) as usize + j] = token;
-                newest[c] = token;
-                at[c] = row as u32;
-                probs[c].push(p);
-                if let Some(chances) = chances {
-                    reach[c] *= f64::from(draft_chance(chances, p));
-                }
-            }
-        }
-        // The rows of the links that were not made take the last draft of
-        // their chain again: any token serves, and nothing counts them.
-        for (c, chain) in chains.iter().enumerate() {
-            let s = &segments[chain.segment];
-            for j in probs[c].len()..chain.rows.len() {
-                tokens[(s.row0 + 1) as usize + j] = newest[c];
-            }
-        }
-        for &c in &order {
-            self.part.restore_slot(stream, segments[chains[c].segment].slot)?;
-        }
+    /// The step's list of drafts, which every drafter of the device writes at
+    /// the places of its windows.
+    pub(super) fn list(&self) -> DevicePtr {
+        self.driver.list()
+    }
 
-        // The drafts in the order of the step's segments, for the runtime.
-        let mut by_segment: Vec<usize> = (0..chains.len()).collect();
-        by_segment.sort_by_key(|&c| chains[c].segment);
-        let mut n = 0usize;
+    /// The drafts the step enqueued last made, at most: 0 for none.
+    pub(super) fn drafted(&self) -> u32 {
+        self.driver.drafted()
+    }
+
+    /// The probability the block gave each of its drafts of the step that ran
+    /// last, written into `out` at the drafts' places. The step has ended.
+    pub(super) fn probs(&self, out: &mut [f32]) {
+        self.driver.probs(out);
+    }
+
+    /// Device milliseconds of the chains of the step that ran last.
+    pub(super) fn chain_ms(&mut self) -> f64 {
+        self.driver.chain_ms().unwrap_or(0.0)
+    }
+
+    /// The chains of the step that ran last, with their drafts as the host
+    /// reads them now that the step has ended: the slot, and the newest token
+    /// followed by the drafts the chain made. They go to the watchers too.
+    pub(super) fn chains(&mut self) -> Vec<(u32, Vec<u32>)> {
+        if self.asked.is_empty() {
+            return Vec::new();
+        }
+        let end = self.asked.iter().map(|a| a.place + a.links).max().unwrap_or(0);
+        let mut drafts = vec![u32::MAX; end as usize];
+        self.driver.picked(&mut drafts);
+        let mut out = Vec::with_capacity(self.asked.len());
         let mut watch = self.watch.lock().unwrap_or_else(|e| e.into_inner());
-        for c in by_segment {
-            let chain = &chains[c];
-            let made = probs[c].len();
-            let s = &segments[chain.segment];
-            self.made.push((s.slot, made as u32));
-            if only {
-                self.newest_done.push((s.slot, (s.pos0 as u32).saturating_sub(1)));
-            }
-            let rows = (s.row0 + 1) as usize..(s.row0 + 1) as usize + made;
+        for a in std::mem::take(&mut self.asked) {
+            let made: Vec<u32> = drafts[a.place as usize..(a.place + a.links) as usize]
+                .iter()
+                .copied()
+                .take_while(|t| *t != u32::MAX)
+                .collect();
             if watch.recent.len() == Watch::KEPT {
                 watch.recent.pop_front();
             }
             watch.recent.push_back(MtpDrafted {
-                slot: s.slot,
-                position: s.pos0 as u32 + 1,
-                token: tokens[s.row0 as usize],
-                drafts: tokens[rows].to_vec(),
+                slot: a.slot,
+                position: a.position,
+                token: a.token,
+                drafts: made.clone(),
             });
-            for j in 0..chain.rows.len() {
-                if n >= MAX_BATCH as usize {
-                    return Err(invalid("more drafts than a step of the block has rows"));
-                }
-                let token = if j < made { tokens[(s.row0 + 1) as usize + j] } else { u32::MAX };
-                self.probs.push(probs[c].get(j).copied().unwrap_or(f32::NAN));
-                // SAFETY: the drafts' section of the pinned buffer holds
-                // `MAX_BATCH` words.
-                unsafe {
-                    let to = self.io.as_mut_ptr().add(self.drafts_host + 4 * n).cast::<u32>();
-                    to.write_unaligned(token);
-                }
-                n += 1;
-            }
+            let mut tokens = vec![a.token];
+            tokens.extend(made);
+            out.push((a.slot, tokens));
         }
-        // SAFETY: the section is not written again before the next step's
-        // chains, which run after this step has ended.
-        unsafe {
-            stream.copy_from_host(
-                self.drafts.ptr(),
-                self.io.as_ptr().add(self.drafts_host),
-                4 * n,
-            )?;
-        }
-        self.n_drafts = n as u32;
-        self.last_chain_ms = begun.elapsed().as_secs_f64() * 1e3;
-        self.times.chain_steps += 1;
-        self.times.links += links_run;
-        self.times.chain_ms += self.last_chain_ms;
-        watch.times = self.times;
-        Ok(())
-    }
-
-    /// Remembers the rows of the model's step that is enqueued now: the next
-    /// step follows them. `replay` are the rows of the step that are a replay.
-    pub(super) fn keep(&mut self, segments: &[Segment], tokens: &[u32], replay: &[Range<u32>]) {
-        let made = std::mem::take(&mut self.made);
-        self.tails.clear();
-        self.tails.extend(segments.iter().map(|s| {
-            Tail {
-                slot: s.slot,
-                pos0: s.pos0.max(0) as u32,
-                row0: s.row0,
-                tokens: tokens[s.row0 as usize..(s.row0 + s.n_rows) as usize].to_vec(),
-                direct: s.direct,
-                replay: replay.iter().any(|r| r.contains(&s.row0)),
-                // The drafts of the chain that the window verifies.
-                links: made
-                    .iter()
-                    .find(|(slot, _)| *slot == s.slot)
-                    .map_or(0, |(_, made)| (*made).min(s.n_rows - 1)),
-            }
-        }));
-    }
-
-    /// The links the chain of `slot` made in the last step that drafted, until
-    /// the model's step that verifies them is kept; 0 for a slot that did not
-    /// draft.
-    pub(super) fn made(&self, slot: u32) -> u32 {
-        self.made.iter().find(|(at, _)| *at == slot).map_or(0, |(_, made)| *made)
-    }
-
-    /// The probability the block gave each draft of the step, in the order
-    /// of the drafts; NaN for a link that was not made.
-    pub(super) fn probs(&self) -> &[f32] {
-        &self.probs
-    }
-
-    /// Where the step left the drafts and how many.
-    pub(super) fn drafted(&self) -> Option<(DevicePtr, u32)> {
-        (self.n_drafts > 0).then(|| (self.drafts.ptr(), self.n_drafts))
-    }
-
-    /// Milliseconds the chains of the last step took.
-    pub(super) fn chain_ms(&self) -> f64 {
-        self.last_chain_ms
-    }
-
-    /// One step of the block for `rows` (at most [`MAX_BATCH`], the rows of a
-    /// sequence consecutive and in the order of their cells). With `sample`
-    /// the rows run the whole block and pick, and the picks are returned once
-    /// the device has made them; without, they write keys only and nothing is
-    /// waited for.
-    fn step(
-        &mut self,
-        stream: &Stream,
-        flow: &Flow,
-        rows: &[Row],
-        model: DevicePtr,
-        sample: Option<&[SampleRow]>,
-    ) -> Result<Option<Vec<(u32, f32)>>, ModelError> {
-        let n = rows.len() as u32;
-        if n == 0 || n > MAX_BATCH {
-            return Err(invalid(format!("a step of the MTP block of {n} rows")));
-        }
-        let row_bytes = self.wide * 4;
-        // The inputs of a step are staged in host memory the device copies
-        // from when it gets there: a step that nobody waited for has to have
-        // run before they are written again.
-        if std::mem::take(&mut self.writing) {
-            let started = Instant::now();
-            while !self.wrote.is_done()? {
-                flow.check(started, "the MTP block wrote keys")?;
-                flow.pump()?;
-                std::hint::spin_loop();
-            }
-        }
-        // The residuals, gathered; rows of the model that follow each other
-        // are one copy.
-        let link = self.part.residual();
-        let mut at = 0usize;
-        while at < rows.len() {
-            let mut run = 1;
-            let from = match rows[at].source {
-                Source::Carry => {
-                    if rows[at].slot >= self.max_slots {
-                        return Err(invalid(format!("slot {} of the carries", rows[at].slot)));
-                    }
-                    self.carry.ptr().offset(u64::from(rows[at].slot) * row_bytes)
-                }
-                Source::Link(row) => link.offset(u64::from(row) * row_bytes),
-                Source::Model(row) => {
-                    while at + run < rows.len()
-                        && rows[at + run].source == Source::Model(row + run as u32)
-                    {
-                        run += 1;
-                    }
-                    model.offset(u64::from(row) * row_bytes)
-                }
-            };
-            // SAFETY: the staged rows hold `MAX_BATCH` rows; the sources are
-            // rows of the carries, of the block part's residual of its last
-            // step and of the model part's of its last step (the caller's).
-            unsafe {
-                stream.copy(
-                    self.staged.ptr().offset(at as u64 * row_bytes),
-                    from,
-                    run * row_bytes as usize,
-                )?;
-            }
-            at += run;
-        }
-        self.x.resize(rows.len() * self.n, 0.0);
-        for (row, x) in rows.iter().zip(self.x.chunks_exact_mut(self.n)) {
-            self.embedding.decode(row.token, x)?;
-        }
-        // SAFETY: the staged rows were enqueued above and are not written
-        // again before the next step of the block.
-        let input = unsafe { self.part.mtp_input(stream, self.staged.ptr(), &self.x, n)? };
-
-        // The rows of a sequence are one segment.
-        let mut segments: Vec<Segment> = Vec::new();
-        for (i, row) in rows.iter().enumerate() {
-            match segments.last_mut() {
-                Some(s) if s.slot == row.slot && s.pos0 as u32 + s.n_rows == row.cell => {
-                    s.n_rows += 1;
-                }
-                _ => segments.push(Segment {
-                    row0: i as u32,
-                    n_rows: 1,
-                    slot: row.slot,
-                    pos0: row.cell as i32,
-                    direct: true,
-                }),
-            }
-        }
-        let tokens: Vec<u32> = rows.iter().map(|r| r.token).collect();
-        let out_rows: Vec<u32> = if sample.is_some() { (0..n).collect() } else { Vec::new() };
-        let mut record = StepRecord::new(&segments, &tokens, None, &out_rows)?;
-        // A sequence's row that would write into a tile held converted reads
-        // its cell and writes nothing (see the module's documentation).
-        let mut replay = Vec::new();
-        for (i, s) in segments.iter().enumerate() {
-            if self.part.writes_converted(s.slot, s.pos0 as u32) {
-                record.mark_replay(i)?;
-                replay.push(s.row0..s.row0 + s.n_rows);
-            }
-        }
-        // The token marks the block's route records: never 0, and never the
-        // same for two steps that follow each other.
-        self.serial = self.serial.wrapping_add(1).max(1);
-        let env = StepEnv {
-            stream,
-            record: &record,
-            segments: &segments,
-            token: self.serial,
-            tokens: &[],
-            ngram: None,
-            inbound: Some(input),
-            xbase: 0,
-            pools: self.pools.ptr(),
-            replay: &replay,
-        };
-        self.part.begin(&env)?;
-        let Some(params) = sample else {
-            self.part.enqueue_keys(&env, 0)?;
-            self.part.end_keys(&env)?;
-            self.wrote.record(stream)?;
-            self.writing = true;
-            return Ok(None);
-        };
-        if params.len() != rows.len() {
-            return Err(invalid("a sampler row for every row of a link"));
-        }
-        self.part.enqueue_layer(&env, 0)?;
-        flow.lock_feed().mtp_routed(n);
-        self.part.end(&env)?;
-        // SAFETY: the sections of the pinned buffer and of the work buffer
-        // hold `MAX_BATCH` rows; the logits are those of the `n` rows the
-        // block part just enqueued; the scratch was cleared when the block
-        // was opened and only the sampler writes it.
-        unsafe {
-            for (i, row) in params.iter().enumerate() {
-                std::ptr::copy_nonoverlapping(
-                    row.to_bytes().as_ptr(),
-                    self.io.as_mut_ptr().add(i * SampleRow::BYTES),
-                    SampleRow::BYTES,
-                );
-            }
-            stream.copy_from_host(
-                self.work.ptr(),
-                self.io.as_ptr(),
-                params.len() * SampleRow::BYTES,
-            )?;
-            let batch = SampleBatch {
-                logits: self.part.head_logits(),
-                stride: self.n_vocab,
-                n_rows: n,
-                capacity: MAX_BATCH,
-                n_local: self.n_vocab,
-                tokens: DevicePtr::NULL,
-                first: 0,
-                inverse: DevicePtr::NULL,
-                vocab: 0,
-                params: self.work.ptr(),
-                entries: DevicePtr::NULL,
-                masks: DevicePtr::NULL,
-                mask_words: 0,
-                out: self.work.ptr().offset(self.picks_at),
-                logprobs: DevicePtr::NULL,
-                scratch: self.work.ptr().offset(self.scratch_at),
-                exchange: self.work.ptr().offset(self.exchange_at),
-                devices: 1,
-                rank: 0,
-            };
-            self.sampler.sample(stream, &batch, SamplePlan::of(params), |_, _| {
-                Ok::<(), ares_cuda::Error>(())
-            })?;
-            stream.copy_to_host(
-                self.io.as_mut_ptr().add(self.picks_host),
-                self.work.ptr().offset(self.picks_at),
-                rows.len() * SamplePick::BYTES,
-            )?;
-        }
-        self.picked.record(stream)?;
-        // The host goes on when the picks are here; the store has brought
-        // what the block's router asked for by then.
-        let started = Instant::now();
-        loop {
-            if self.picked.is_done()? && flow.lock_feed().mtp_followed() {
-                break;
-            }
-            flow.check(started, "the MTP block made its picks")?;
-            flow.pump()?;
-            std::hint::spin_loop();
-        }
-        let mut picks = Vec::with_capacity(rows.len());
-        for i in 0..rows.len() {
-            // SAFETY: the copy of the picks has run.
-            let bytes = unsafe {
-                std::slice::from_raw_parts(
-                    self.io.as_ptr().add(self.picks_host + i * SamplePick::BYTES),
-                    SamplePick::BYTES,
-                )
-            };
-            let pick = SamplePick::from_bytes(bytes);
-            if pick.status != 0 || pick.token >= self.n_vocab {
-                return Err(invalid(format!(
-                    "the MTP block's row {i}: the sampler reported status {:#x} and token {}",
-                    pick.status, pick.token
-                )));
-            }
-            picks.push((pick.token, pick.confidence()));
-        }
-        Ok(Some(picks))
+        watch.times = self.driver.times();
+        out
     }
 }

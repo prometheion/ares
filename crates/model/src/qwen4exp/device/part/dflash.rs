@@ -35,6 +35,7 @@ impl Part {
         max_slots: u32,
         n_layer: usize,
         n_vocab: usize,
+        head_rows: u32,
         mask_row: Vec<f32>,
     ) -> Result<(), ModelError> {
         if self.role == Role::Worker || self.w.head.is_none() {
@@ -57,7 +58,7 @@ impl Part {
             max_slots,
             max_rows: self.opts.max_rows,
             window_rows: self.opts.window_rows,
-            head_rows: n_vocab as u32,
+            head_rows,
         };
         self.dflash = Some(Drafter::open(&file.config, &w, device, ledger, setup, mask_row)?);
         Ok(())
@@ -66,17 +67,6 @@ impl Part {
     /// The drafter of this part, for its report and its tests.
     pub fn dflash(&self) -> Option<&Drafter> {
         self.dflash.as_ref()
-    }
-
-    /// Puts drafts another drafter made into the drafter's list at `place`.
-    pub fn dflash_put(
-        &mut self,
-        stream: &Stream,
-        place: u32,
-        drafts: &[u32],
-    ) -> Result<(), ModelError> {
-        let Some(d) = &mut self.dflash else { return Err(invalid("no DFlash drafter")) };
-        d.put_drafts(stream, place, drafts)
     }
 
     /// Device milliseconds of the drafter's last pass (0 without one).
@@ -121,22 +111,25 @@ impl Part {
     }
 
     /// The drafter's pass for the windows `seqs` of a step that only drafts:
-    /// the layers, the output head and the selector. `embed` decodes a row of
-    /// the embedding table. The drafts go into the step record's token array
-    /// and into the drafter's list.
+    /// the layers, the draft head (the head view's first rows of the output
+    /// head) and the selector. `embed` decodes a row of the embedding table.
+    /// The drafts go into the step record's token array and into `list` (the
+    /// MTP block's when it drafts on this device too), or the drafter's own.
     pub fn dflash_pass(
         &mut self,
         stream: &Stream,
         record_tokens: DevicePtr,
         seqs: &[PassSeq],
         embed: &dyn Fn(u32) -> Vec<f32>,
+        list: Option<DevicePtr>,
     ) -> Result<(), ModelError> {
         let head = self.w.head.ok_or_else(|| invalid("no head on this part"))?;
         let output = self.w.mat(&head.output);
+        let tokens = self.head_tokens();
         let Some(d) = &mut self.dflash else { return Err(invalid("no DFlash drafter")) };
         let (h, rows) = d.pass_layers(&self.kernels, stream, seqs, embed)?;
         d.head_product(&self.kernels, stream, head.output.ty, output, h, rows)?;
-        let list = d.own_list();
-        d.pass_select(&self.kernels, stream, DevicePtr::NULL, record_tokens, list)
+        let list = list.unwrap_or_else(|| d.own_list());
+        d.pass_select(&self.kernels, stream, tokens, record_tokens, list)
     }
 }

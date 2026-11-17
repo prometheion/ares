@@ -382,9 +382,10 @@ pub(super) struct Feed {
     ahead_seen: (u64, f64),
     /// Whether the reads of the layers ahead are started on a guess.
     read_ahead: bool,
-    /// The route records of the model's MTP block, whose experts are layer
-    /// 0 of the store.
-    mtp: Option<MtpRecords>,
+    /// Whether the model has an MTP block, whose experts are layer 0 of the
+    /// store, resident in VRAM: its chains run on the device without the
+    /// host, and the store sees none of its route records.
+    mtp: bool,
     /// The pruning of the routers, when the model prunes (`prune.rs`).
     prune: Option<FeedPrune>,
 }
@@ -403,15 +404,6 @@ struct FeedPrune {
     stats: PruneStats,
     /// Per expert of a layer: picks that were pruned, as heat.
     counts: Vec<u32>,
-}
-
-/// The route records of an MTP block. Its steps run one after the other
-/// inside a step of the model, each with a record of its own in the same
-/// place of the block's board.
-struct MtpRecords {
-    board: Arc<Board>,
-    /// The rows of the block's step whose record the store has not seen yet.
-    waiting: Option<u32>,
 }
 
 impl Feed {
@@ -442,7 +434,7 @@ impl Feed {
             rows: 0,
             groups: Vec::new(),
             wide: WideStats::default(),
-            mtp: None,
+            mtp: false,
             prune: None,
         }
     }
@@ -479,23 +471,9 @@ impl Feed {
         self.prune.as_mut().map(|p| std::mem::take(&mut p.stats)).unwrap_or_default()
     }
 
-    /// The board of the model's MTP block: its records are those of layer 0
-    /// of the store.
-    pub(super) fn set_mtp(&mut self, board: Arc<Board>) {
-        self.mtp = Some(MtpRecords { board, waiting: None });
-    }
-
-    /// A step of the MTP block with `rows` rows was enqueued: its route
-    /// record is on its way to the block's board.
-    pub(super) fn mtp_routed(&mut self, rows: u32) {
-        if let Some(mtp) = &mut self.mtp {
-            mtp.waiting = Some(rows);
-        }
-    }
-
-    /// Whether the store has the route record of the MTP block's last step.
-    pub(super) fn mtp_followed(&self) -> bool {
-        self.mtp.as_ref().is_none_or(|mtp| mtp.waiting.is_none())
+    /// The model has an MTP block: its experts are layer 0 of the store.
+    pub(super) fn set_mtp(&mut self) {
+        self.mtp = true;
     }
 
     /// With both devices on every layer: the part that owns each expert of each
@@ -604,7 +582,7 @@ impl Feed {
         self.store.take_stats();
         let before = self.store.reader().stats();
         let shared = self.layout.per_layer > 1;
-        if self.mtp.is_some() {
+        if self.mtp {
             // The MTP block is asked as the layer behind the model's last.
             let mut order = experts_of(n_layer);
             let (vram, ram) = self.store.slots(0);
@@ -657,7 +635,7 @@ impl Feed {
     /// link of a chain, and the first chains of a server decide what the
     /// conductor takes a link to cost. No step may run meanwhile.
     pub(super) fn fill_mtp(&mut self, n_experts: usize) -> Result<(), Error> {
-        if self.mtp.is_none() {
+        if !self.mtp {
             return Ok(());
         }
         let (vram, ram) = self.store.slots(0);
@@ -705,23 +683,6 @@ impl Feed {
     /// the order of its layers, of the first `enqueued[part]` layers, and lets
     /// the store work. Never waits.
     pub(super) fn pump(&mut self, enqueued: &[usize]) -> Result<(), Error> {
-        if let Some(mtp) = &mut self.mtp
-            && let Some(rows) = mtp.waiting
-            && mtp.board.arrived(0)?
-        {
-            let record = RouteRecord::parse(mtp.board.record(0), self.used, rows)
-                .ok_or_else(|| invalid("a route record of the mtp block that is none"))?;
-            self.groups.clear();
-            self.groups.extend(record.groups());
-            self.store.routed_rows(
-                0,
-                record.token(),
-                rows as usize,
-                &self.groups,
-                mtp.board.rows(0, rows as usize),
-            )?;
-            mtp.waiting = None;
-        }
         if self.rows > MAX_BATCH {
             // The layers of a wide step are followed by `Misses`.
             self.follow_wide_predictions()?;

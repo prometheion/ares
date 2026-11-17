@@ -1348,7 +1348,7 @@ fn flash_next_writes_with_drafts_what_it_writes_without() {
         counters.drafts_accepted,
         counters.drafts_rejected,
         times.links,
-        times.chain_steps,
+        times.steps,
         times.chain_ms / times.links.max(1) as f64,
         times.offered,
         times.accepted,

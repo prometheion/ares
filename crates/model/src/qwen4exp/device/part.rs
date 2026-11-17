@@ -135,6 +135,10 @@ pub struct Options {
     /// of the decode kernels (`part/predict.rs`): 0 to 2. The expert store reads ahead what
     /// no tier holds of them; the model computes the same with any number.
     pub predict: u32,
+    /// The order of the output head's rows when a draft vocabulary changes it
+    /// (`blocks/head.rs`): row `r` is token `head_order[r]`, and the logits
+    /// come in that order. `None`: row `r` is token `r`.
+    pub head_order: Option<Arc<[u32]>>,
 }
 
 impl Default for Options {
@@ -155,6 +159,7 @@ impl Default for Options {
             profile: None,
             prune: None,
             predict: 2,
+            head_order: None,
         }
     }
 }
@@ -1040,6 +1045,11 @@ pub struct Part {
     routed: Vec<Event>,
     inbox_host: PinnedBuffer,
     inbox: DeviceBuffer,
+    /// For a part whose steps follow each other without the host waiting (an
+    /// MTP block's): buffers the records and plans are sent from in turn, the
+    /// event behind each one's copy, and the next to use.
+    inbox_ring: Vec<(PinnedBuffer, Event)>,
+    ring_at: usize,
     logits_host: PinnedBuffer,
     expert_at: Vec<ExpertAt>,
     /// The plan of the step being enqueued.
@@ -1059,6 +1069,8 @@ pub struct Part {
     deferred: Option<(StepRecord, Vec<(u32, bool)>)>,
     status_host: PinnedBuffer,
     status_pending: bool,
+    /// Recorded behind the copy of the status word.
+    status_copied: Event,
     marks: Option<Marks>,
     /// What steps wider than the decode kernels take need; `None` when no step has more
     /// than [`MAX_BATCH`] rows.
@@ -1075,6 +1087,9 @@ pub struct Part {
     token_rows: Option<Arc<HostTable>>,
     /// Rows of the next step that another source computed (`blocks/rows.rs`).
     spliced: Vec<(u32, DevicePtr)>,
+    /// The tokens of the head's rows (u32 each) when a draft vocabulary
+    /// orders them, on the part with the head.
+    head_tokens: Option<DeviceBuffer>,
 }
 
 impl std::fmt::Debug for Part {
@@ -1123,11 +1138,30 @@ impl Part {
         }
         let shape = PartShape { role, first, shares, head };
         let f = Frame::new(c, opts, &shape, device.info().multiprocessors)?;
-        let w = DeviceWeights::load(device, ledger, c, weights, role, first, &shape.shares, head)?;
+        // The head's rows in the view's order, and the token of each.
+        let order = opts.head_order.as_deref().filter(|_| head && role != Role::Worker);
+        let w = DeviceWeights::load(
+            device,
+            ledger,
+            c,
+            weights,
+            role,
+            first,
+            &shape.shares,
+            head,
+            order,
+        )?;
         let starts = first == 0 && role != Role::Worker;
         let layers = first..first + shape.shares.len();
         let mut part =
             Self::assemble(c, opts, index, role, head, f, w, device, ledger, starts, "qwen4exp")?;
+        if let Some(order) = order {
+            let bytes: Vec<u8> = order.iter().flat_map(|t| t.to_le_bytes()).collect();
+            ledger.reserve("qwen4exp head view tokens", bytes.len() as u64)?;
+            let tokens = DeviceBuffer::new(device, bytes.len() as u64)?;
+            tokens.write(0, &bytes)?;
+            part.head_tokens = Some(tokens);
+        }
         if let Some(setup) = opts.prune.as_ref().filter(|_| role != Role::Worker) {
             part.prune = Some(PartPrune::new(device, ledger, setup, layers, c.experts.count)?);
         }
@@ -1326,6 +1360,8 @@ impl Part {
             routed: stream_events(w.layers.len())?,
             inbox_host: PinnedBuffer::new(device, f.inbox.host_len as usize)?,
             inbox: DeviceBuffer::new(device, f.inbox.len)?,
+            inbox_ring: Vec::new(),
+            ring_at: 0,
             logits_host: PinnedBuffer::new(
                 device,
                 (u64::from(opts.logit_rows)
@@ -1343,6 +1379,7 @@ impl Part {
             deferred: None,
             status_host: PinnedBuffer::new(device, 16)?,
             status_pending: false,
+            status_copied: Event::new(device)?,
             marks,
             wide_state,
             mtp: None,
@@ -1351,6 +1388,7 @@ impl Part {
             dflash: None,
             token_rows: None,
             spliced: Vec::new(),
+            head_tokens: None,
             w,
             f,
         })
@@ -1438,6 +1476,31 @@ impl Part {
             )));
         }
         self.expert_at = at;
+        Ok(())
+    }
+
+    /// The layer kernels of the part, for a block that drives it.
+    pub(crate) fn layers(&self) -> LayerKernels {
+        self.layers.clone()
+    }
+
+    /// The tokens of the columns of the head's logits (a u32 each) when a
+    /// draft vocabulary orders the head's rows; null when column `i` is token
+    /// `i`.
+    pub fn head_tokens(&self) -> DevicePtr {
+        self.head_tokens.as_ref().map_or(DevicePtr::NULL, DeviceBuffer::ptr)
+    }
+
+    /// Gives the part `n` buffers to send the records and plans of its steps
+    /// from in turn, so that its steps can follow each other without the host
+    /// waiting for the device between them (an MTP block's).
+    pub(crate) fn set_inbox_ring(&mut self, device: &Device, n: usize) -> Result<(), ModelError> {
+        // The record, the plan and the hands, which come first in the inbox.
+        let len = self.f.inbox.ngram as usize;
+        self.inbox_ring = (0..n)
+            .map(|_| Ok((PinnedBuffer::new(device, len.max(64))?, Event::new(device)?)))
+            .collect::<Result<_, ModelError>>()?;
+        self.ring_at = 0;
         Ok(())
     }
 
@@ -1936,7 +1999,10 @@ impl Part {
         }
         // The predictions of the step before read rows this step writes again.
         self.predictions_done(stream)?;
-        if std::mem::take(&mut self.status_pending) {
+        // The status of the step before, once its copy has run: a part whose
+        // steps follow each other without the host waiting reads it later.
+        if self.status_pending && self.status_copied.is_done()? {
+            self.status_pending = false;
             // SAFETY: the status of the step before, copied when it ended.
             let status =
                 unsafe { u32::from_le_bytes(*self.status_host.as_ptr().cast::<[u8; 4]>()) };
@@ -1963,9 +2029,21 @@ impl Part {
         }
         let plan = has_attention.then(|| self.build_plan(env)).transpose()?;
         let ib = self.f.inbox;
-        let host = self.inbox_host.as_mut_ptr();
+        // The record and the plan go from the inbox, or from the next buffer
+        // of the ring once the device has read what it held.
+        let ring = (!self.inbox_ring.is_empty()).then_some(self.ring_at);
+        let host = match ring {
+            Some(k) => {
+                self.ring_at = (k + 1) % self.inbox_ring.len();
+                let (buffer, sent) = &mut self.inbox_ring[k];
+                sent.synchronize()?;
+                buffer.as_mut_ptr()
+            }
+            None => self.inbox_host.as_mut_ptr(),
+        };
         // SAFETY: the pinned buffer has the sections of `Inbox`; the copies
-        // of the step before have run (its stream ran empty).
+        // of the step before have run (its stream ran empty), or of the
+        // buffer of the ring.
         unsafe {
             std::ptr::copy_nonoverlapping(
                 record.as_ptr(),
@@ -2027,7 +2105,10 @@ impl Part {
         // SAFETY: the inbox and the scratch are this part's, sized for the
         // most rows; the inbound residual is the caller's guarantee.
         unsafe {
-            stream.copy_from_host(self.inbox.ptr(), self.inbox_host.as_ptr(), sent as usize)?;
+            stream.copy_from_host(self.inbox.ptr(), host.cast_const(), sent as usize)?;
+            if let Some(k) = ring {
+                self.inbox_ring[k].1.record(stream)?;
+            }
             if let (Some(bytes), Some(table)) = (staged, &self.token_rows) {
                 // The rows of the step, and their values where the write
                 // reads them; rows another source computed go over theirs.
@@ -2995,6 +3076,7 @@ impl Part {
             unsafe {
                 stream.copy_to_host(self.status_host.as_mut_ptr(), self.at(s.status), 4)?;
             }
+            self.status_copied.record(stream)?;
             self.status_pending = true;
         }
         if env.segments.iter().any(|s| !s.direct) {

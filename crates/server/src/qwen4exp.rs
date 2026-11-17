@@ -902,13 +902,12 @@ fn watch_drafts(model: std::sync::Weak<Qwen4Exp>) {
             tracing::info!(
                 "MTP block: {} links in {} steps, {:.2} ms a link ({:.2} ms a step that \
                  drafts); accepted per link, of the drafts that were verified: {rates}; {} rows \
-                 only wrote keys, {:.3} ms of the host each",
+                 only wrote keys",
                 times.links,
-                times.chain_steps,
+                times.steps,
                 times.chain_ms / times.links.max(1) as f64,
-                times.chain_ms / times.chain_steps.max(1) as f64,
+                times.chain_ms / times.steps.max(1) as f64,
                 times.key_rows,
-                times.key_ms / times.key_rows.max(1) as f64,
             );
         }
     };

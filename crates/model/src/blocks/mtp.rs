@@ -54,7 +54,7 @@ use std::sync::Arc;
 use ares_core::Ledger;
 use ares_cuda::{
     Device, DeviceBuffer, DevicePtr, ENTRY_CELLS, EmbedRows, Event, KeptRows, LayerKernels,
-    PinnedBuffer, SampleBatch, SamplePlan, SamplerKernels, Segment, StepRecord, Stream,
+    MAX_BATCH, PinnedBuffer, SampleBatch, SamplePlan, SamplerKernels, Segment, StepRecord, Stream,
 };
 use ares_runtime::{DraftChances, ModelError, draft_chance};
 use ares_sampler::{SamplePick, SampleRow};
@@ -102,7 +102,8 @@ pub struct Drafted {
     pub tokens: u32,
 }
 
-/// Device time of the block and what it wrote, added up over steps.
+/// Device time of the block, what it wrote and how its drafts fared, added
+/// up over steps.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct MtpTimes {
     /// Steps in which a chain ran.
@@ -115,6 +116,10 @@ pub struct MtpTimes {
     /// Rows that only wrote keys and values (following the model and the
     /// newest cells of sequences that did not draft).
     pub key_rows: u64,
+    /// Per link of a chain: how often its draft was verified (every draft
+    /// before it had been accepted) and how often it was accepted then.
+    pub offered: [u64; MAX_BATCH as usize],
+    pub accepted: [u64; MAX_BATCH as usize],
 }
 
 /// A launch of the layer: rows of the block, each a pair of a token and the
@@ -226,6 +231,8 @@ struct Tail {
     tokens: Vec<u32>,
     direct: bool,
     replay: bool,
+    /// The drafts of the block among the rows: 0 for rows that took none.
+    links: u32,
 }
 
 /// One row of a launch that only writes keys, before it is laid out.
@@ -334,6 +341,9 @@ pub(crate) struct Driver {
     /// draft of each row of each link: `(link, row, place)`.
     made: u32,
     layout: Vec<(u32, u32, u32)>,
+    /// The links each sequence's chain made, by its slot, until the model's
+    /// step that verifies them is kept.
+    chain_links: Vec<(u32, u32)>,
     clock: Clock,
     times: MtpTimes,
 }
@@ -444,6 +454,7 @@ impl Driver {
             picked: Event::new(device)?,
             made: 0,
             layout: Vec::new(),
+            chain_links: Vec::new(),
             clock: Clock {
                 chain: [Event::timed(device)?, Event::timed(device)?],
                 pending: false,
@@ -761,6 +772,11 @@ impl Driver {
             if counted == 0 {
                 continue;
             }
+            // Draft `j` was verified when every draft before it was accepted.
+            for link in 0..tail.links.min(counted).min(MAX_BATCH) as usize {
+                self.times.offered[link] += 1;
+                self.times.accepted[link] += u64::from(link as u32 + 1 < counted);
+            }
             let cells = tail.pos0 + counted;
             if lag > 0 && cells.is_multiple_of(ENTRY_CELLS) {
                 at_page_end.push((tail.slot, cells));
@@ -900,15 +916,41 @@ impl Driver {
     /// Remembers the rows of the model's step that is enqueued now: the next
     /// step follows them.
     fn keep(&mut self, segments: &[Segment], tokens: &[u32], replay: &[Range<u32>]) {
+        let made = std::mem::take(&mut self.chain_links);
         self.tails.clear();
-        self.tails.extend(segments.iter().map(|s| Tail {
-            slot: s.slot,
-            pos0: s.pos0.max(0) as u32,
-            row0: s.row0,
-            tokens: tokens[s.row0 as usize..(s.row0 + s.n_rows) as usize].to_vec(),
-            direct: s.direct,
-            replay: replay.iter().any(|r| r.contains(&s.row0)),
+        self.tails.extend(segments.iter().map(|s| {
+            Tail {
+                slot: s.slot,
+                pos0: s.pos0.max(0) as u32,
+                row0: s.row0,
+                tokens: tokens[s.row0 as usize..(s.row0 + s.n_rows) as usize].to_vec(),
+                direct: s.direct,
+                replay: replay.iter().any(|r| r.contains(&s.row0)),
+                // The drafts of the chain that the window verifies.
+                links: made
+                    .iter()
+                    .find(|(slot, _)| *slot == s.slot)
+                    .map_or(0, |(_, made)| (*made).min(s.n_rows.saturating_sub(1))),
+            }
         }));
+    }
+
+    /// The drafts the step that ran last made, written at their places in
+    /// `out` (`u32::MAX` stays where a link was not made). The step has
+    /// ended.
+    pub fn picked(&self, out: &mut [u32]) {
+        for &(link, row, place) in self.layout.iter().filter(|(link, ..)| *link < self.made) {
+            let at =
+                (link as usize * self.setup.max_slots as usize + row as usize) * SamplePick::BYTES;
+            // SAFETY: the buffer holds a record for every row of every link,
+            // and the device is not writing it any more.
+            let bytes = unsafe {
+                std::slice::from_raw_parts(self.picks_host.as_ptr().add(at), SamplePick::BYTES)
+            };
+            if let Some(token) = out.get_mut(place as usize) {
+                *token = SamplePick::from_bytes(bytes).token;
+            }
+        }
     }
 
     /// Lays out the records of the step's chains, longest first, so that the
@@ -980,7 +1022,9 @@ impl Driver {
             // device from the picks of the link before.
             let tokens: Vec<u32> =
                 chains.iter().map(|c| if j == 0 { c.token } else { 0 }).collect();
-            let record = StepRecord::new(&link_segments, &tokens, None, &[])?;
+            // Every row of a link has its logits.
+            let wanted: Vec<u32> = (0..n).collect();
+            let record = StepRecord::new(&link_segments, &tokens, None, &wanted)?;
             let bytes = record.as_bytes();
             let at_record = *end;
             let at_params = (at_record + bytes.len() as u64).next_multiple_of(16);
@@ -1238,6 +1282,11 @@ impl Driver {
         }
         // What the links changed of the sequences' state is put back.
         layer.restore(stream, &slots)?;
+        self.chain_links.clear();
+        for (row, &c) in order.iter().enumerate() {
+            let slot = links[0].segments[row].slot;
+            self.chain_links.push((slot, (step.chains[c].rows.len() as u32).min(self.made)));
+        }
         self.clock.links = u64::from(self.made);
         self.clock.chain[1].record(stream)?;
         Ok(())

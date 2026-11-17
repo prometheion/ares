@@ -36,6 +36,7 @@ use ares_runtime::ModelError;
 
 use super::choose::{Balance, Chooser, LayoutReport, Layouts, Prep, Shape, Usage};
 use super::placement::{BlockSlice, DevicePlan, DraftPlan};
+use crate::blocks::head::runs_of;
 use crate::blocks::rows::TableShape;
 use crate::qwen35::Config;
 use crate::qwen35::weights::{Matrix, Mixer, Weights};
@@ -738,18 +739,6 @@ impl DeviceWeights {
             layouts,
         })
     }
-}
-
-/// The rows of the tokens `tokens` as runs of consecutive tokens.
-fn runs_of(tokens: &[u32]) -> Vec<Range<usize>> {
-    let mut runs: Vec<Range<usize>> = Vec::new();
-    for &token in tokens {
-        match runs.last_mut() {
-            Some(run) if run.end == token as usize => run.end += 1,
-            _ => runs.push(token as usize..token as usize + 1),
-        }
-    }
-    runs
 }
 
 /// Lays out what `plan` gives device `index`: the rows of the embedding table

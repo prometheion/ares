@@ -22,6 +22,7 @@ use ares_core::{GgmlType, Ledger};
 use ares_cuda::{Device, DeviceBuffer, DevicePtr, ExpertShape, RecurrentShape, WeightRange};
 use ares_runtime::ModelError;
 
+use crate::blocks::head::runs_of;
 use crate::qwen4exp::Config;
 use crate::qwen4exp::weights::{
     Layer, Matrix, Mixer, MtpWeights, RecurrentWeights, StreamMixer, Weights,
@@ -522,8 +523,16 @@ impl<'g> Layout<'g> {
         Ok(LayerW { layer, mixers, core, moe, ngram })
     }
 
-    fn head(&mut self, w: &Weights<'g>) -> HeadW {
-        HeadW { mixer: self.mixer(&w.output_mixer), output: self.matrix(&w.output) }
+    /// The final mixer and the head, its rows in the order of a head view
+    /// when one orders them (`blocks/head.rs`).
+    fn head(&mut self, w: &Weights<'g>, order: Option<&[u32]>) -> HeadW {
+        HeadW {
+            mixer: self.mixer(&w.output_mixer),
+            output: match order {
+                Some(order) => self.rows(&w.output, runs_of(order)),
+                None => self.matrix(&w.output),
+            },
+        }
     }
 
     fn mtp_in(&mut self, w: &MtpWeights<'g>) -> MtpInW {
@@ -552,7 +561,7 @@ pub(crate) fn layer_bytes(
 /// Bytes of the final mixer and the output head in an arena.
 pub(crate) fn head_bytes(w: &Weights<'_>) -> u64 {
     let mut layout = Layout::default();
-    layout.head(w);
+    layout.head(w, None);
     layout.len
 }
 
@@ -599,7 +608,8 @@ impl DeviceWeights {
 
     /// Lays out and uploads what a part of `role` holds of the layers from
     /// `first` on (`shares` says what of each), and the final mixer and the
-    /// output head when `head` is set, after reserving them in the ledger.
+    /// output head when `head` is set (its rows in `order` when a head view
+    /// orders them), after reserving them in the ledger.
     #[allow(clippy::too_many_arguments)]
     pub fn load(
         device: &Device,
@@ -610,6 +620,7 @@ impl DeviceWeights {
         first: usize,
         shares: &[LayerShare],
         head: bool,
+        order: Option<&[u32]>,
     ) -> Result<Self, ModelError> {
         let mut layout = Layout { ranges: true, ..Layout::default() };
         let on_device = shares
@@ -617,7 +628,7 @@ impl DeviceWeights {
             .enumerate()
             .map(|(i, share)| layout.layer(c, first + i, &w.layers[first + i], role, share))
             .collect::<Result<Vec<_>, _>>()?;
-        let head = head.then(|| layout.head(w));
+        let head = head.then(|| layout.head(w, order));
         let len = layout.len.max(ALIGN);
         ledger.reserve("qwen4exp dense weights", len)?;
         let arena = DeviceBuffer::new(device, len)?;

@@ -23,6 +23,7 @@
 //!   cache over all K/V groups, and what the prefix cache is told.
 
 pub(crate) mod forms;
+pub(crate) mod head;
 pub(crate) mod kv;
 pub(crate) mod mtp;
 pub(crate) mod recurrent;
