@@ -1238,23 +1238,27 @@ const FLASH_PROMPT: [u32; 22] = [
 ];
 const FLASH_CONTINUATION: [u32; 4] = [248068, 198, 760, 1156];
 
+/// The draft vocabulary of `ARES_TEST_DRAFT_VOCAB` (a token id per line), when
+/// it is set.
+fn draft_vocabulary() -> Option<Vec<u32>> {
+    let text = std::fs::read_to_string(std::env::var_os("ARES_TEST_DRAFT_VOCAB")?)
+        .expect("the draft vocabulary is readable");
+    let ids = text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#'));
+    Some(ids.map(|l| l.parse().expect("a token id per line")).collect())
+}
+
 /// The runtime over the real model on both cards (or the one there is), with
 /// every miss uploaded and none computed by the CPU, whose arithmetic is not
 /// the device's: what a row computes then does not depend on where its
 /// experts were found. With `draft` the model drafts with that block, in
-/// windows of four rows whose price is learned from the steps that run.
-fn start_flash(
-    path: &std::path::Path,
-    draft: Option<&std::path::Path>,
-) -> (Runtime, Arc<Qwen4Exp>) {
-    start_flash_with(path, draft, None)
-}
-
-/// [`start_flash`] with a DFlash drafter as well, in windows of eight rows.
+/// windows of four rows whose price is learned from the steps that run; with
+/// `dflash` with that drafter as well, in windows of eight rows; `vocabulary`
+/// is the head view of a draft vocabulary for the model's drafters.
 fn start_flash_with(
     path: &std::path::Path,
     draft: Option<&std::path::Path>,
     dflash: Option<Arc<ares_model::dflash::File>>,
+    vocabulary: Option<&[u32]>,
 ) -> (Runtime, Arc<Qwen4Exp>) {
     let placement = if device_count().expect("the CUDA driver") >= 2 {
         Placement::Shared
@@ -1281,6 +1285,9 @@ fn start_flash_with(
     if let Some(file) = dflash {
         inner = inner.with_dflash(file).expect("the DFlash drafter fits");
     }
+    if let Some(tokens) = vocabulary {
+        inner = inner.with_draft_vocabulary(tokens).expect("a draft vocabulary");
+    }
     let inner = Arc::new(inner);
     let config = RuntimeConfig {
         pages: 16,
@@ -1301,7 +1308,7 @@ fn start_flash_with(
 /// On the real model drafts change no token: Flash-Next writes with its draft
 /// block, token for token, what it writes without drafts, greedy and sampled
 /// with a seed, and the block's drafts are accepted. The CPU serves no miss
-/// (see [`start_flash`]), and both replies come from one engine: two engines
+/// (see [`start_flash_with`]), and both replies come from one engine: two engines
 /// on two cards each measure at their start how the cards share every layer
 /// (the time of a read of a stream mixer on each), the share differs from
 /// start to start (0.733 to 0.751 of the key heads on the faster card in eight
@@ -1323,45 +1330,55 @@ fn flash_next_writes_with_drafts_what_it_writes_without() {
         );
         return;
     };
-    let greedy = Sampling { temperature: Some(0.0), ..Sampling::default() };
-    let seeded = Sampling { temperature: Some(0.8), seed: Some(5), ..Sampling::default() };
-    let (runtime, model) = start_flash(&path, Some(&draft));
-    // The replies with drafts first: a reply that repeats one the engine has
-    // written is drafted by the n-gram drafter alone.
-    let drafted = ask(&runtime, 1, &FLASH_PROMPT, 64);
-    let (sampled, _) = ask_sampled(&runtime, 2, &FLASH_PROMPT, 48, seeded.clone(), true);
-    let counters = runtime.snapshot().expect("the runtime is running").counters;
-    let times = model.mtp_times();
-    let (plain, _) = ask_sampled(&runtime, 3, &FLASH_PROMPT, 64, greedy, false);
-    let (plain_seeded, _) = ask_sampled(&runtime, 4, &FLASH_PROMPT, 48, seeded, false);
-    let undrafted = runtime.snapshot().expect("the runtime is running").counters.draft_rows
-        - counters.draft_rows;
-    let stats = model.take_store_stats().expect("the parts are open");
-    runtime.shutdown();
-    eprintln!(
-        "RES Flash-Next: {} and {} tokens; draft rows {}, accepted {}, rejected {}; the block \
-         made {} links in {} steps, {:.2} ms a link; verified per link {:?}, accepted {:?}; \
-         prefix cache: {} hits, {} rows replayed",
-        plain.len(),
-        plain_seeded.len(),
-        counters.draft_rows,
-        counters.drafts_accepted,
-        counters.drafts_rejected,
-        times.links,
-        times.steps,
-        times.chain_ms / times.links.max(1) as f64,
-        times.offered,
-        times.accepted,
-        counters.prefix_hits,
-        counters.replay_rows,
-    );
-    assert_eq!(stats.cpu_experts, 0, "the CPU computed experts: {stats:?}");
-    assert_eq!(plain[..4], FLASH_CONTINUATION, "the reference's first tokens");
-    assert_eq!(undrafted, 0, "the requests without drafts were drafted for");
-    assert!(times.accepted[0] > 0, "none of the block's drafts was accepted: {times:?}");
-    assert!(counters.drafts_rejected > 0, "no draft was rejected");
-    assert_eq!(drafted, plain, "drafts changed a greedy reply of Flash-Next");
-    assert_eq!(sampled, plain_seeded, "drafts changed a sampled reply of Flash-Next");
+    // The whole head, and with `ARES_TEST_DRAFT_VOCAB` the head view of a
+    // draft vocabulary on an engine of its own.
+    let vocabulary = draft_vocabulary();
+    for vocabulary in
+        [None, vocabulary.as_deref()].into_iter().take(1 + vocabulary.is_some() as usize)
+    {
+        let view = vocabulary
+            .map_or("the whole head".to_owned(), |v| format!("a draft vocabulary of {}", v.len()));
+        let greedy = Sampling { temperature: Some(0.0), ..Sampling::default() };
+        let seeded = Sampling { temperature: Some(0.8), seed: Some(5), ..Sampling::default() };
+        let (runtime, model) = start_flash_with(&path, Some(&draft), None, vocabulary);
+        // The replies with drafts first: a reply that repeats one the engine has
+        // written is drafted by the n-gram drafter alone.
+        let drafted = ask(&runtime, 1, &FLASH_PROMPT, 64);
+        let (sampled, _) = ask_sampled(&runtime, 2, &FLASH_PROMPT, 48, seeded.clone(), true);
+        let counters = runtime.snapshot().expect("the runtime is running").counters;
+        let times = model.mtp_times();
+        let (plain, _) = ask_sampled(&runtime, 3, &FLASH_PROMPT, 64, greedy, false);
+        let (plain_seeded, _) = ask_sampled(&runtime, 4, &FLASH_PROMPT, 48, seeded, false);
+        let undrafted = runtime.snapshot().expect("the runtime is running").counters.draft_rows
+            - counters.draft_rows;
+        let stats = model.take_store_stats().expect("the parts are open");
+        runtime.shutdown();
+        eprintln!(
+            "RES Flash-Next, {view}: {} and {} tokens; draft rows {}, accepted {}, rejected {}; the \
+         block made {} links in {} steps, {:.2} ms a link ({:.2} ms a step that drafts); \
+         verified per link {:?}, accepted {:?}; prefix cache: {} hits, {} rows replayed",
+            plain.len(),
+            plain_seeded.len(),
+            counters.draft_rows,
+            counters.drafts_accepted,
+            counters.drafts_rejected,
+            times.links,
+            times.steps,
+            times.chain_ms / times.links.max(1) as f64,
+            times.chain_ms / times.steps.max(1) as f64,
+            times.offered,
+            times.accepted,
+            counters.prefix_hits,
+            counters.replay_rows,
+        );
+        assert_eq!(stats.cpu_experts, 0, "the CPU computed experts: {stats:?}");
+        assert_eq!(plain[..4], FLASH_CONTINUATION, "the reference's first tokens");
+        assert_eq!(undrafted, 0, "the requests without drafts were drafted for");
+        assert!(times.accepted[0] > 0, "none of the block's drafts was accepted: {times:?}");
+        assert!(counters.drafts_rejected > 0, "no draft was rejected");
+        assert_eq!(drafted, plain, "drafts changed a greedy reply of Flash-Next, {view}");
+        assert_eq!(sampled, plain_seeded, "drafts changed a sampled reply of Flash-Next, {view}");
+    }
 }
 
 /// The same with the DFlash drafter (`ARES_TEST_DFLASH_FLASHNEXT`), which reads
@@ -1384,33 +1401,43 @@ fn flash_next_writes_with_dflash_drafts_what_it_writes_without() {
         return;
     };
     let file = Arc::new(ares_model::dflash::File::open(&file).unwrap());
-    let greedy = Sampling { temperature: Some(0.0), ..Sampling::default() };
-    let (runtime, model) = start_flash_with(&path, None, Some(file));
-    // The reply with drafts first, as above.
-    let drafted = ask(&runtime, 1, &FLASH_PROMPT, 64);
-    let counters = runtime.snapshot().expect("the runtime is running").counters;
-    let (plain, _) = ask_sampled(&runtime, 2, &FLASH_PROMPT, 64, greedy, false);
-    let undrafted = runtime.snapshot().expect("the runtime is running").counters.draft_rows
-        - counters.draft_rows;
-    let stats = model.take_store_stats().expect("the parts are open");
-    runtime.shutdown();
-    eprintln!(
-        "RES Flash-Next with DFlash: {} tokens in {} steps; tested by position {:?}, accepted \
-         {:?}; prefix cache: {} hits, {} cells cached, {} rows replayed, {} checkpoints restored",
-        counters.tokens,
-        counters.steps,
-        &counters.drafts_tested_at[2][..7],
-        &counters.drafts_accepted_at[2][..7],
-        counters.prefix_hits,
-        counters.cached_cells,
-        counters.replay_rows,
-        counters.checkpoints_restored,
-    );
-    assert_eq!(stats.cpu_experts, 0, "the CPU computed experts: {stats:?}");
-    assert_eq!(plain[..4], FLASH_CONTINUATION, "the reference's first tokens");
-    assert_eq!(undrafted, 0, "the request without drafts was drafted for");
-    assert!(counters.drafts_accepted_at[2][0] > 0, "no DFlash draft was accepted");
-    assert_eq!(drafted, plain, "DFlash drafts changed a greedy reply of Flash-Next");
+    let vocabulary = draft_vocabulary();
+    for vocabulary in
+        [None, vocabulary.as_deref()].into_iter().take(1 + vocabulary.is_some() as usize)
+    {
+        let view = vocabulary
+            .map_or("the whole head".to_owned(), |v| format!("a draft vocabulary of {}", v.len()));
+        let greedy = Sampling { temperature: Some(0.0), ..Sampling::default() };
+        let (runtime, model) = start_flash_with(&path, None, Some(file.clone()), vocabulary);
+        // The reply with drafts first, as above.
+        let drafted = ask(&runtime, 1, &FLASH_PROMPT, 64);
+        let counters = runtime.snapshot().expect("the runtime is running").counters;
+        let (plain, _) = ask_sampled(&runtime, 2, &FLASH_PROMPT, 64, greedy, false);
+        let undrafted = runtime.snapshot().expect("the runtime is running").counters.draft_rows
+            - counters.draft_rows;
+        let stats = model.take_store_stats().expect("the parts are open");
+        runtime.shutdown();
+        eprintln!(
+            "RES Flash-Next with DFlash, {view}: {} tokens in {} steps, {:.2} ms a step that only \
+         drafts ({} of them); tested by position {:?}, accepted {:?}; prefix cache: {} hits, {} \
+         cells cached, {} rows replayed, {} checkpoints restored",
+            counters.tokens,
+            counters.steps,
+            counters.model_draft_us as f64 / 1e3 / counters.model_draft_steps.max(1) as f64,
+            counters.model_draft_steps,
+            &counters.drafts_tested_at[2][..7],
+            &counters.drafts_accepted_at[2][..7],
+            counters.prefix_hits,
+            counters.cached_cells,
+            counters.replay_rows,
+            counters.checkpoints_restored,
+        );
+        assert_eq!(stats.cpu_experts, 0, "the CPU computed experts: {stats:?}");
+        assert_eq!(plain[..4], FLASH_CONTINUATION, "the reference's first tokens");
+        assert_eq!(undrafted, 0, "the request without drafts was drafted for");
+        assert!(counters.drafts_accepted_at[2][0] > 0, "no DFlash draft was accepted");
+        assert_eq!(drafted, plain, "DFlash drafts changed a greedy reply of Flash-Next, {view}");
+    }
 }
 
 /// The tier of experts in RAM under the runtime, on a machine whose memory the test sets:
