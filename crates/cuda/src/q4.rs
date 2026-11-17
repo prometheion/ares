@@ -42,10 +42,11 @@
 //!
 //! Per row of the step the stored bytes of the table rows of all heads, in
 //! head order, in one buffer that goes to the device with the step
-//! ([`NgramShape::fetched_row_bytes`]: 1440 bytes per row for Flash-Next). The
-//! host computes the row ids from the row's token and the tokens of the two
-//! cells before it in the same sequence (for a row inside a window those are
-//! the rows before it) and reads the rows from the model file. Then:
+//! ([`NgramShape::fetched_row_bytes`]: 1440 bytes per row for Flash-Next's
+//! IQ4_NL table; the table may be of any weight type). The host computes the
+//! row ids from the row's token and the tokens of the two cells before it in
+//! the same sequence (for a row inside a window those are the rows before it)
+//! and reads the rows from the model file. Then:
 //!
 //! ```text
 //! ngram_decode       fetched -> emb
@@ -294,6 +295,9 @@ pub struct NgramShape {
     pub heads: u32,
     /// Values of a table row (160).
     pub row_dim: u32,
+    /// The type of the table's rows as the file stores them (IQ4_NL in the real file): any
+    /// weight type whose blocks divide `row_dim`.
+    pub ty: GgmlType,
     /// Taps of the convolution (4).
     pub conv_kernel: u32,
     /// Its dilation: the n-gram size (3).
@@ -316,9 +320,15 @@ impl NgramShape {
         self.back() as u64 * self.wide() as u64
     }
 
-    /// Bytes the host supplies per row of a step: the IQ4_NL rows of all heads.
+    /// Bytes of one table row as the file stores it.
+    pub const fn table_row_bytes(&self) -> u64 {
+        let (values, bytes) = self.ty.block();
+        (self.row_dim / values) as u64 * bytes as u64
+    }
+
+    /// Bytes the host supplies per row of a step: the table rows of all heads.
     pub const fn fetched_row_bytes(&self) -> u64 {
-        self.heads as u64 * (self.row_dim as u64 / 32) * 18
+        self.heads as u64 * self.table_row_bytes()
     }
 
     fn check(&self) -> Result<()> {
@@ -326,10 +336,14 @@ impl NgramShape {
         if self.n_stream == 0 || self.n_embd == 0 {
             return bad(format!("{} streams of {}", self.n_stream, self.n_embd));
         }
-        if !self.row_dim.is_multiple_of(32) || self.heads * self.row_dim != self.n_embd {
+        if !self.ty.is_weight()
+            || self.row_dim == 0
+            || !self.row_dim.is_multiple_of(self.ty.block_values())
+            || self.heads * self.row_dim != self.n_embd
+        {
             return bad(format!(
-                "{} rows of {} values for a width of {}",
-                self.heads, self.row_dim, self.n_embd
+                "{} rows of {} values of {} for a width of {}",
+                self.heads, self.row_dim, self.ty, self.n_embd
             ));
         }
         if self.conv_kernel < 2 || self.conv_kernel > 8 || self.dilation == 0 || self.back() > 32 {
@@ -934,12 +948,13 @@ impl Q4Kernels {
     }
 
     /// Decodes the fetched table rows of the n-gram embedding: `fetched` holds
-    /// [`NgramShape::fetched_row_bytes`] bytes per row of the step (the IQ4_NL
-    /// rows of the heads in order), `emb` gets `n_rows * n_embd` f32.
+    /// [`NgramShape::fetched_row_bytes`] bytes per row of the step (the table
+    /// rows of the heads in order, in the table's type), `emb` gets
+    /// `n_rows * n_embd` f32.
     ///
     /// # Safety
     ///
-    /// `fetched` (2-byte aligned) and `emb` must address these sizes on the
+    /// `fetched` (4-byte aligned) and `emb` must address these sizes on the
     /// stream's device.
     pub unsafe fn ngram_decode(
         &self,
@@ -950,17 +965,27 @@ impl Q4Kernels {
         n_rows: u32,
     ) -> Result<()> {
         shape.check()?;
-        check_align("n-gram rows", &[fetched], 2)?;
-        let n_blocks = n_rows
-            .checked_mul(shape.n_embd / 32)
+        // An F32 table is read in words, the f16 fields of the others in halves: every row
+        // of every type keeps that alignment (the blocks of MXFP4, 17 bytes, are read in
+        // bytes).
+        check_align("n-gram rows", &[fetched], 4)?;
+        let row_bytes = shape.table_row_bytes();
+        let n_values = n_rows
+            .checked_mul(shape.n_embd)
             .ok_or_else(|| invalid("n-gram rows", format!("{n_rows} rows")))?;
-        if n_blocks == 0 {
+        if n_values == 0 {
             return Ok(());
         }
-        let args = Args::new().ptr(fetched).ptr(emb).u32(n_blocks);
+        let args = Args::new()
+            .ptr(fetched)
+            .ptr(emb)
+            .u32(shape.ty.id())
+            .u32(shape.row_dim)
+            .u32(row_bytes as u32)
+            .u32(n_values);
         // SAFETY: the argument list matches ares_q4_ngram_decode.
         unsafe {
-            self.ngram_decode.launch(stream, [n_blocks.div_ceil(8), 1, 1], [256, 1, 1], 0, args)
+            self.ngram_decode.launch(stream, [n_values.div_ceil(256), 1, 1], [256, 1, 1], 0, args)
         }
     }
 

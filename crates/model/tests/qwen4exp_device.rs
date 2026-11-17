@@ -1179,6 +1179,119 @@ fn expert_types_match_the_reference(part: usize) {
     }
 }
 
+/// The matrices the device multiplies unquantized (the stream mixers' down, up and inject,
+/// the n-gram block's key and value) in every weight type, each layer of steps of up to eight
+/// rows (the fused read and the exact decode kernel) and of a wide step (the type's tile
+/// kernel) fed the reference's input: within the bounds of the shipped types (BF16), where
+/// the reference decodes the same weights. The rank of the mixers is 256 and every row
+/// width a multiple of 256, so that every type can hold them; the n-gram table takes the type
+/// too where it can hold rows of 32 values (the 32-value types the writer encodes), else
+/// IQ4_NL.
+fn float_path_types_match_the_reference(part: usize) {
+    let Some(devices) = devices() else { return };
+    let types: Vec<GgmlType> = ExpertShape::types().collect();
+    let table_types = [
+        GgmlType::F32,
+        GgmlType::F16,
+        GgmlType::BF16,
+        GgmlType::Q4_0,
+        GgmlType::Q4_1,
+        GgmlType::Q5_0,
+        GgmlType::Q5_1,
+        GgmlType::Q8_0,
+    ];
+    for ty in types.into_iter().skip(7 * part).take(7) {
+        let mut synthetic = model(23);
+        synthetic.shape.mixer_rank = 256;
+        synthetic.lazy_type = Some(if table_types.contains(&ty) { ty } else { GgmlType::IQ4_NL });
+        let gguf = open(
+            &format!("float-path-{}", ty.name()),
+            &synthetic.bytes_with_types(Some((GgmlType::IQ2_S, GgmlType::Q2_0)), ty),
+        );
+        let c = Config::from_gguf(&gguf).unwrap();
+        let w = Weights::load(&gguf, &c).unwrap();
+        assert_eq!(w.layers[0].attn_mixer.down.ty(), ty);
+        let reference = Reference::new(&c, &w);
+        let mut opts = options(devices.len(), c.n_layer, CacheFormat::Q8);
+        opts.part.max_rows = 64;
+        let mut session =
+            Session::open(&gguf, &c, &w, devices.clone(), opts).expect("the model opens");
+        let n_expert = c.experts.count as u32;
+        session.fill(&mut |_| (0..n_expert).collect()).expect("the tiers fill");
+        let steps = [8usize, 5, 1, 17, 3];
+        let all = synthetic.shape.tokens(steps.iter().sum(), 3);
+        let mut state = SequenceState::new(&c);
+        // Per kind of step (up to eight rows, wide), per kind of layer.
+        let mut worst = [[[0.0f64; 3]; 2]; 2];
+        let (mut rows, mut same_picks, mut at) = (0, 0, 0);
+        for &count in &steps {
+            let tokens = &all[at..at + count];
+            let wide = usize::from(count > 8);
+            let layers = expected(&reference, &c, &w, &state, tokens);
+            let mut probe = Compare {
+                expected: &layers,
+                attention: &c.attention_layers,
+                worst: worst[wide],
+                rows: 0,
+                same_picks: 0,
+            };
+            session
+                .step_probed(
+                    &[Rows { slot: 0, tokens, direct: true, wanted: Wanted::None }],
+                    &mut probe,
+                )
+                .unwrap();
+            worst[wide] = probe.worst;
+            rows += probe.rows;
+            same_picks += probe.same_picks;
+            let window = reference.window(&state, tokens, LogitRows::None).unwrap();
+            reference.commit(&mut state, &window, count).unwrap();
+            at += count;
+        }
+        for (wide, worst) in worst.iter().enumerate() {
+            let what = format!("{ty}, {}", ["up to eight rows", "wide"][wide]);
+            eprintln!(
+                "  ERR {what}, {} device(s): recurrent layers: core {:.2e}, experts {:.2e}, \
+                 residual {:.2e}; attention layers: core {:.2e}, experts {:.2e}, residual {:.2e}",
+                devices.len(),
+                worst[0][0],
+                worst[0][1],
+                worst[0][2],
+                worst[1][0],
+                worst[1][1],
+                worst[1][2],
+            );
+            assert!(worst[0][0] < 2e-3, "{what}: recurrent core {:.2e}", worst[0][0]);
+            assert!(worst[1][0] < 3e-2, "{what}: attention core {:.2e}", worst[1][0]);
+            for kind in worst {
+                assert!(kind[1] < 8e-2, "{what}: experts {:.2e}", kind[1]);
+                assert!(kind[2] < 4e-2, "{what}: residual {:.2e}", kind[2]);
+            }
+        }
+        assert!(same_picks * 100 >= rows * 97, "{ty}: {same_picks} of {rows} routings");
+    }
+}
+
+#[test]
+fn float_path_matrices_of_every_weight_type_match_the_reference_1() {
+    float_path_types_match_the_reference(0);
+}
+
+#[test]
+fn float_path_matrices_of_every_weight_type_match_the_reference_2() {
+    float_path_types_match_the_reference(1);
+}
+
+#[test]
+fn float_path_matrices_of_every_weight_type_match_the_reference_3() {
+    float_path_types_match_the_reference(2);
+}
+
+#[test]
+fn float_path_matrices_of_every_weight_type_match_the_reference_4() {
+    float_path_types_match_the_reference(3);
+}
+
 /// The bounds of one row's expert output and of its residual against the reference's
 /// (relative RMS). In steps of up to eight rows the decode kernels round the activations and
 /// the hidden values to 8 bits: 1.4e-2 to 2.8e-2 and 3.4e-3 to 6.0e-3 over the 28 pairs of

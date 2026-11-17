@@ -38,8 +38,15 @@ const ATTENTION_LAYERS: f64 = 12.0;
 const EPS: f32 = 1e-6;
 const INDEXER: IndexerShape =
     IndexerShape { n_head: 4, key_dim: 128, block: 4, top_k: 2048, rope_dim: 64 };
-const NGRAM: NgramShape =
-    NgramShape { n_stream: HC, n_embd: N, heads: 16, row_dim: 160, conv_kernel: 4, dilation: 3 };
+const NGRAM: NgramShape = NgramShape {
+    n_stream: HC,
+    n_embd: N,
+    heads: 16,
+    row_dim: 160,
+    ty: GgmlType::IQ4_NL,
+    conv_kernel: 4,
+    dilation: 3,
+};
 const ROPE: RopeParams = RopeParams { dim: 64, freq_base: 10_000_000.0, sections: [11, 11, 10, 0] };
 
 struct Rig {

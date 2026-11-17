@@ -1468,10 +1468,67 @@ fn selected_lists_reach_the_attention_kernels() {
 // ---------------------------------------------------------------------------
 // The hashed n-gram embedding.
 
-const NGRAM_REAL: NgramShape =
-    NgramShape { n_stream: 4, n_embd: 2560, heads: 16, row_dim: 160, conv_kernel: 4, dilation: 3 };
-const NGRAM_SMALL: NgramShape =
-    NgramShape { n_stream: 3, n_embd: 96, heads: 3, row_dim: 32, conv_kernel: 3, dilation: 2 };
+const NGRAM_REAL: NgramShape = NgramShape {
+    n_stream: 4,
+    n_embd: 2560,
+    heads: 16,
+    row_dim: 160,
+    ty: GgmlType::IQ4_NL,
+    conv_kernel: 4,
+    dilation: 3,
+};
+const NGRAM_SMALL: NgramShape = NgramShape {
+    n_stream: 3,
+    n_embd: 96,
+    heads: 3,
+    row_dim: 32,
+    ty: GgmlType::IQ4_NL,
+    conv_kernel: 3,
+    dilation: 2,
+};
+
+/// The table rows of the n-gram block in every weight type: rows of 256 values (every
+/// type's block divides them), decoded as `ares_quant::dequantize` decodes them, up to the
+/// last bit of a value of a type with an offset (`d * q + m`, which the device may fuse).
+#[test]
+fn the_ngram_rows_of_every_weight_type_are_decoded() {
+    let Some(gpus) = gpus() else { return };
+    for device in gpus {
+        let gpu = Gpu::new(device);
+        let mut rng = Rng(0x51c3_0d2a_77e4_9b01);
+        for (ty, _) in blocks::TYPES {
+            let shape = NgramShape {
+                n_stream: 2,
+                n_embd: 512,
+                heads: 2,
+                row_dim: 256,
+                ty,
+                conv_kernel: 4,
+                dilation: 3,
+            };
+            let rows = 3usize;
+            let n = shape.n_embd as usize;
+            let values = rows * n;
+            let fetched =
+                blocks::random_blocks(&mut || rng.next(), ty, values / ty.block_values() as usize);
+            assert_eq!(fetched.len(), rows * shape.fetched_row_bytes() as usize);
+            let mut want = vec![0.0f32; values];
+            ares_quant::dequantize(ty, &fetched, &mut want).unwrap();
+            let fetched_b = gpu.bytes(&fetched);
+            let emb_b = gpu.empty((values * 4) as u64);
+            unsafe {
+                gpu.q4
+                    .ngram_decode(&gpu.stream, shape, fetched_b.ptr(), emb_b.ptr(), rows as u32)
+                    .unwrap();
+            }
+            let got = gpu.read(&emb_b, values);
+            let scale = want.iter().filter(|v| v.is_finite()).fold(0.0f32, |m, v| m.max(v.abs()));
+            for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+                assert!((g - w).abs() <= 2e-6 * scale, "{ty} value {i}: {g} for {w}");
+            }
+        }
+    }
+}
 
 #[test]
 fn the_ngram_rows_are_decoded_and_gated() {

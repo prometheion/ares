@@ -402,7 +402,7 @@ impl Drafter {
             });
         }
         drop(mat);
-        let mut vector = |v: &Vector<'_>| put(v.data);
+        let mut vector = |v: &Vector<'_>| put(&v.data);
         for (dl, l) in layers.iter_mut().zip(&w.layers) {
             dl.attn_norm = vector(&l.attn_norm)?;
             dl.attn_conv_base = vector(&l.attn_conv_base)?;
@@ -543,7 +543,13 @@ impl Drafter {
                 kernels.quantize_activations(stream, x, act, n_in, rows)?;
                 kernels.matvec(stream, ty, w, act, y, n_in, n_out, rows)?;
             } else {
-                let path = if ty.is_quantized() { PrefillPath::Int8 } else { PrefillPath::F16 };
+                // The integer path where the type has one; the f16 path (exact weights, f16
+                // rows) for the floats and the types without.
+                let path = if ty.is_quantized() && kernels.has_prefill_path(ty, PrefillPath::Int8) {
+                    PrefillPath::Int8
+                } else {
+                    PrefillPath::F16
+                };
                 kernels.prepare_prefill_activations(stream, path, x, act, n_in, rows)?;
                 kernels.matmul(stream, ty, path, w, act, y, n_in, n_out, rows)?;
             }

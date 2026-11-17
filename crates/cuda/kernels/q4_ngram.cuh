@@ -3,7 +3,7 @@
 // reads the table rows from the file; the device gets, per row of the step,
 // the stored bytes of the rows of all heads and does the rest:
 //
-//   emb     = the fetched rows decoded, side by side                  ares_q4_ngram_decode
+//   emb     = the fetched rows decoded, side by side (any weight type) ares_q4_ngram_decode
 //   key     = ple_key @ emb,  value = ple_value @ emb                 (weight kernels)
 //   g[c]    = sigmoid(sign(s) sqrt(max(|s|, 1e-6))),
 //             s = (rms(key[c]) nk[c] . rms(R[c]) nq[c]) / sqrt(N)
@@ -20,29 +20,25 @@
 #include "common.cuh"
 #include "layer_math.cuh"
 #include "layer_step.cuh"
+#include "weight_value.cuh"
 
 #define Q4_NGRAM_MAX_TAPS 8
 #define Q4_NGRAM_MAX_BACK 32
 
-static __device__ const int8_t q4_iq4nl_values[16] = {-127, -104, -83, -65, -49, -35, -22, -10,
-                                                      1,    13,   25,  38,  53,  69,  89,  113};
-
-// Decodes the fetched table rows: IQ4_NL blocks of 18 bytes (an f16 scale,
-// then 16 bytes where byte j holds value j in its low nibble and value j + 16
-// in its high one). `fetched` holds, per row of the step, the rows of all
-// heads one after the other, so block number b of the buffer is values
-// 32 b .. 32 b + 31 of `emb`. One warp per block.
-ARES_KERNEL ares_q4_ngram_decode(const uint8_t* fetched, float* emb, uint32_t n_blocks) {
-    const size_t block = static_cast<size_t>(blockIdx.x) * (blockDim.x >> 5) + (threadIdx.x >> 5);
-    if (block >= n_blocks) {
+// Decodes the fetched table rows: per row of the step the rows of all heads one
+// after the other, each `row_dim` values of type `ty` (a ggml type id) in
+// `row_bytes` bytes, so table row t of the buffer is values t * row_dim ..
+// (t + 1) * row_dim - 1 of `emb`. One thread per value (weight_value.cuh decodes
+// it: the real table is IQ4_NL, and the arithmetic is that of the kernel this one
+// replaced, which decoded IQ4_NL alone).
+ARES_KERNEL ares_q4_ngram_decode(const uint8_t* fetched, float* emb, uint32_t ty, uint32_t row_dim,
+                                 uint32_t row_bytes, uint32_t n_values) {
+    const uint32_t v = blockIdx.x * blockDim.x + threadIdx.x;
+    if (v >= n_values) {
         return;
     }
-    const uint32_t lane = threadIdx.x & 31;
-    const uint8_t* b = fetched + block * 18;
-    const float d = ares_half_at(b);
-    const uint32_t byte = b[2 + (lane & 15)];
-    const uint32_t nibble = lane < 16 ? (byte & 15u) : (byte >> 4);
-    emb[block * 32 + lane] = d * static_cast<float>(q4_iq4nl_values[nibble]);
+    const uint32_t table_row = v / row_dim;
+    emb[v] = ares_embed_value(fetched + static_cast<size_t>(table_row) * row_bytes, ty, v - table_row * row_dim);
 }
 
 // The sum of `v` over all threads of the block in f64. `partial` has one

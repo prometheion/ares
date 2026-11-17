@@ -394,6 +394,7 @@ mod tests {
             head_vocab,
             head_offset,
             table_rows: 320001536,
+            table_type: ares_core::GgmlType::IQ4_NL,
         }
     }
 

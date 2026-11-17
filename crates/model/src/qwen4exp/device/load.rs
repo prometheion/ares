@@ -472,27 +472,28 @@ impl<'g> Layout<'g> {
             down_ty: moe.down.ty(),
         };
         shape.check()?;
+        let mut router_range = if streams { self.range(&moe.router) } else { WeightRange::Any };
         let router = match moe.router.ty() {
             _ if !streams => None,
             GgmlType::F32 => Some(self.push(Source::File(moe.router.bytes()))),
-            // The router kernel multiplies f32 rows: a router in another float
-            // type (the draft block's file has BF16) is widened once, here.
-            GgmlType::F16 | GgmlType::BF16 => {
+            // The router kernels (the decode step's, the prediction's, the wide step's) multiply
+            // f32 rows: a router in another type (the draft block's file has BF16; quantizers
+            // keep it F32 as a rule) is decoded once, here, at four bytes a weight.
+            _ => {
                 let (rows, cols) = (moe.router.rows(), moe.router.cols());
                 let mut values = vec![0.0f32; rows * cols];
                 for (row, out) in values.chunks_exact_mut(cols).enumerate() {
                     moe.router.decode_row(row, out);
                 }
+                if self.ranges {
+                    let largest = values.iter().fold(0.0f32, |m, v| {
+                        if v.is_nan() { f32::INFINITY } else { m.max(v.abs()) }
+                    });
+                    router_range = WeightRange::of_largest(largest);
+                }
                 Some(self.floats(&values))
             }
-            other => {
-                return Err(invalid(format!(
-                    "{} is {other}: the router kernel takes a float type",
-                    name("ffn_gate_inp"),
-                )));
-            }
         };
-        let router_range = if streams { self.range(&moe.router) } else { WeightRange::Any };
         let largest = moe.shared_gate_inp.iter().fold(0.0f32, |m, v| {
             // A value that is not a number counts as beyond every range.
             if v.is_nan() { f32::INFINITY } else { m.max(v.abs()) }

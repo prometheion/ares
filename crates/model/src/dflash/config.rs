@@ -1,6 +1,8 @@
 //! The shape of a DFlash drafter, read from its file, and the variants of the
 //! architecture that this implementation refuses.
 
+use std::borrow::Cow;
+
 use ares_core::GgmlType;
 use ares_gguf::{Gguf, TensorInfo};
 
@@ -334,7 +336,8 @@ pub struct Matrix<'g> {
 #[derive(Clone, Debug)]
 pub struct Vector<'g> {
     pub name: String,
-    pub data: &'g [u8],
+    /// The values as f32: the file's bytes for an F32 tensor, decoded for any other type.
+    pub data: Cow<'g, [u8]>,
 }
 
 impl Vector<'_> {
@@ -436,13 +439,23 @@ impl<'g> Weights<'g> {
         let mut vector = |name: &str, dims: &[u64]| -> Result<Vector<'g>> {
             let t = info(name)?;
             let found = t.dims.as_slice().to_vec();
-            if t.ty != GgmlType::F32 || found != dims {
+            if found != dims {
                 return Err(Error::Tensor {
                     name: name.into(),
-                    problem: format!("is {} {found:?}, the configuration needs F32 {dims:?}", t.ty),
+                    problem: format!("has dims {found:?}, the configuration needs {dims:?}"),
                 });
             }
-            Ok(Vector { name: name.into(), data: gguf.data(t) })
+            // The kernels read these as f32: another type is decoded once, here.
+            let data = if t.ty == GgmlType::F32 {
+                Cow::Borrowed(gguf.data(t))
+            } else {
+                let mut values = vec![0f32; dims.iter().product::<u64>() as usize];
+                ares_quant::dequantize(t.ty, gguf.data(t), &mut values).map_err(|e| {
+                    Error::Tensor { name: name.into(), problem: format!("is {}: {e}", t.ty) }
+                })?;
+                Cow::Owned(values.iter().flat_map(|v| v.to_le_bytes()).collect())
+            };
+            Ok(Vector { name: name.into(), data })
         };
         let (d64, hd64) = (d as u64, hd as u64);
         let conv = [d64, c.conv_kernel as u64, 2];

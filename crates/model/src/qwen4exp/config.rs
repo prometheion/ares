@@ -6,6 +6,7 @@
 //! could change the computation and would be ignored silently otherwise), and
 //! the values must describe a model that the reference can run.
 
+use ares_core::GgmlType;
 use ares_gguf::{Gguf, Value};
 
 use crate::qwen4exp::error::{Error, Result};
@@ -199,6 +200,8 @@ pub struct Ngram {
     pub head_offset: Vec<u64>,
     /// The rows of `per_layer_token_embd.weight`.
     pub table_rows: u64,
+    /// The type the file stores the table's rows in (IQ4_NL in the real file).
+    pub table_type: GgmlType,
 }
 
 impl Ngram {
@@ -604,6 +607,7 @@ impl Config {
             head_vocab: keys.required_uints("ple.head_vocab_sizes")?,
             head_offset: keys.required_uints("ple.head_offsets")?,
             table_rows: table.dims.get(1),
+            table_type: table.ty,
         };
         let heads = ngram.n_heads();
         if heads * ngram.row_dim != config.n_embd {

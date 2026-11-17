@@ -597,6 +597,7 @@ fn ngram_shape(c: &Config) -> Option<NgramShape> {
         n_embd: c.n_embd as u32,
         heads: g.n_heads() as u32,
         row_dim: g.row_dim as u32,
+        ty: g.table_type,
         conv_kernel: g.conv_kernel as u32,
         dilation: g.ngram_size as u32,
     })

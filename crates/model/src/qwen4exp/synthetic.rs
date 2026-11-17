@@ -228,7 +228,7 @@ impl Synthetic {
     pub fn bytes(&self) -> Vec<u8> {
         let mut file = File::default();
         self.metadata(&mut file);
-        self.tensors(&mut file, None);
+        self.tensors(&mut file, None, None);
         file.build()
     }
 
@@ -246,7 +246,28 @@ impl Synthetic {
     pub fn bytes_with_experts(&self, gate_ty: GgmlType, down_ty: GgmlType) -> Vec<u8> {
         let mut file = File::default();
         self.metadata(&mut file);
-        self.tensors(&mut file, Some((gate_ty, down_ty)));
+        self.tensors(&mut file, Some((gate_ty, down_ty)), None);
+        file.build()
+    }
+
+    /// The bytes of the GGUF file with the routed experts as [`Synthetic::bytes_with_experts`]
+    /// makes them (as [`Synthetic::bytes`] when `experts` is `None`) and the matrices the
+    /// device multiplies unquantized in `float_path`: the stream mixers' (`hc_*` and
+    /// `output_hc_*`: down, up and inject) and the n-gram block's projections (`ple_key`,
+    /// `ple_value`). A type without an encoder holds made-up blocks, as for the experts.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a type cannot hold the rows of this shape: `float_path` needs rows of
+    /// `n_stream * n_embd`, `mixer_rank` and `n_embd` values.
+    pub fn bytes_with_types(
+        &self,
+        experts: Option<(GgmlType, GgmlType)>,
+        float_path: GgmlType,
+    ) -> Vec<u8> {
+        let mut file = File::default();
+        self.metadata(&mut file);
+        self.tensors(&mut file, experts, Some(float_path));
         file.build()
     }
 
@@ -436,7 +457,12 @@ impl Synthetic {
         file.string_array("tokenizer.ggml.merges", &[]);
     }
 
-    fn tensors(&self, file: &mut File, experts: Option<(GgmlType, GgmlType)>) {
+    fn tensors(
+        &self,
+        file: &mut File,
+        experts: Option<(GgmlType, GgmlType)>,
+        float_path: Option<GgmlType>,
+    ) {
         let s = &self.shape;
         let (n, wide, lr) = (s.n_embd, s.wide(), s.mixer_rank);
         let shipped = self.types != Types::F32;
@@ -452,10 +478,21 @@ impl Synthetic {
             file.tensor(name, dims, ty, &values);
         };
 
+        // A matrix the device multiplies unquantized: BF16 as shipped, or `float_path`.
+        let exact = |file: &mut File, name: &str, dims: &[usize], gain: f32| match float_path {
+            Some(ty) if !has_encoder(ty) => {
+                let rms = gain / (dims[0] as f32).sqrt();
+                let data = self.made_up_blocks(name, ty, dims, rms);
+                file.raw_tensor(name, dims, ty, data);
+            }
+            Some(ty) => matrix(file, name, dims, gain, ty),
+            None => matrix(file, name, dims, gain, bf16),
+        };
+
         matrix(file, "token_embd.weight", &[n, s.n_vocab], (n as f32).sqrt(), f32t);
         matrix(file, "output.weight", &[n, s.n_vocab], 3.0, f32t);
-        matrix(file, "output_hc_down.weight", &[wide, lr], 2.0, bf16);
-        matrix(file, "output_hc_up.weight", &[lr, wide], 2.0, bf16);
+        exact(file, "output_hc_down.weight", &[wide, lr], 2.0);
+        exact(file, "output_hc_up.weight", &[lr, wide], 2.0);
         if let Some(g) = &s.ngram {
             let heads = (g.ngram_size - 1) * g.heads_per_ngram;
             let rows = (g.head_vocab.iter().sum::<u64>() + g.spare_rows) as usize;
@@ -465,15 +502,9 @@ impl Synthetic {
         for layer in 0..s.n_layer {
             let name = |what: &str| format!("blk.{layer}.{what}");
             for which in ["attn", "ffn"] {
-                matrix(file, &name(&format!("hc_{which}_down.weight")), &[wide, lr], 2.0, bf16);
-                matrix(file, &name(&format!("hc_{which}_up.weight")), &[lr, wide], 2.0, bf16);
-                matrix(
-                    file,
-                    &name(&format!("hc_{which}_inject.weight")),
-                    &[wide, s.n_stream],
-                    2.0,
-                    bf16,
-                );
+                exact(file, &name(&format!("hc_{which}_down.weight")), &[wide, lr], 2.0);
+                exact(file, &name(&format!("hc_{which}_up.weight")), &[lr, wide], 2.0);
+                exact(file, &name(&format!("hc_{which}_inject.weight")), &[wide, s.n_stream], 2.0);
             }
             // The router's logits are spread over several units.
             matrix(file, &name("ffn_gate_inp.weight"), &[n, s.n_expert], 6.0, f32t);
@@ -520,8 +551,8 @@ impl Synthetic {
                 matrix(file, &name("ssm_out.weight"), &[vd, n], 1.5, dense);
             }
             if s.ngram.as_ref().is_some_and(|g| g.layer == layer) {
-                matrix(file, &name("ple_key.weight"), &[n, wide], 1.5, bf16);
-                matrix(file, &name("ple_value.weight"), &[n, n], 1.5, bf16);
+                exact(file, &name("ple_key.weight"), &[n, wide], 1.5);
+                exact(file, &name("ple_value.weight"), &[n, n], 1.5);
             }
         }
 
