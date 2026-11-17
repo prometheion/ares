@@ -120,6 +120,11 @@ other differed more by the load than by the drafts.
       once per chunk, not once per 512 rows); adaptive: a lone prompt takes the large chunk, and
       when another request waits the pieces shrink to a bound in time (the owner, 2026-11-17).
       Several requests at once ("parallel calling") belongs to the optimising phase.
+      The large chunks need what Strata pays them with: the prompt borrows expert slots in
+      VRAM and refills them afterwards (Strata `DETAILS.md:1383-1385`); Strata reads IQ2_XS
+      prompts at 1250 to 2090 tokens/s on a 12 GB card with every expert in RAM, Ares here 40
+      to 210 from the SSD (gap study `/var/tmp/ares-survey/gap-study-2026-11-17.md`). Strata's trade for a short request behind a long prompt: 5.4 s
+      against 1.8 s of waiting, 6.0 s against 8.0 s for the long prompt.
 - [x] Usage profile: the server keeps its expert heat in a file, loads it at start in place
       of the canned warm-up text, keeps it current, and fills empty slots from it when idle
       (branch `moe/expert-profile`). Measured 2026-11-16: the first requests after a start from
@@ -357,6 +362,15 @@ becomes a block is in `ARCHITECTURE.md` ("The shared model layer"). Left, in the
       (the server's plan counts it).
 
 ## Prompt cache (every model; RAM first, then SSD, as in the owner's fork)
+- [ ] A root checkpoint at the end of the system prompt and of the tool list, and denser
+      checkpoints inside a long prompt, for both models: today a new conversation that shares a
+      12k-token system prompt replays every row (about 10 s on the 27B, a minute on Flash-Next);
+      the owner's fork runs `checkpoint-root = 2048` (gap study `/var/tmp/ares-survey/gap-study-2026-11-17.md`).
+- [ ] Claude Code writes a new billing stamp (`x-anthropic-billing-header ... cch=...`) at the
+      start of its system prompt on every request, so every turn misses the cache from there;
+      upstream llama.cpp, the owner's fork and Strata pin it (gap study `/var/tmp/ares-survey/gap-study-2026-11-17.md`).
+- [ ] Saving and loading a conversation's state by name (llama.cpp's `slot-save-path`, in the
+      owner's preset), and pinning one in the cache (gap study `/var/tmp/ares-survey/gap-study-2026-11-17.md`).
 - [x] RAM level for the K/V state that leaves VRAM; write to SSD when the RAM level evicts
       (full or shrinking), at unload and at a clean stop (branch `cache/ram-level`).
 - [x] The same for Flash-Next (2026-11-16: its prefix cache on the shared slot block; no
@@ -470,6 +484,15 @@ with fewer slots in VRAM than a step picks"). Left:
 
 ## Optimising (after CUDA is complete, before Vulkan; the owner, 2026-11-16)
 Measured per phase on a quiet machine against the fork and Strata, the largest first. Known levers:
+- [ ] VRAM on loan to the expert tier: K/V pages a conversation does not need yet (Strata's
+      `--kv-grow`), the draft block's 675 MiB while a long prompt runs (gap study `/var/tmp/ares-survey/gap-study-2026-11-17.md`).
+- [ ] Checkpoints of the recurrent state in int8 (SGLang's `mamba_checkpoint_pool.py`): a quarter
+      of Flash-Next's 112 MiB, which matters because a full tier leaves one place; after a KL
+      measurement (gap study `/var/tmp/ares-survey/gap-study-2026-11-17.md`).
+- [ ] Steps that overlap the host's scheduling with the GPU (vLLM's default now), CUDA graphs:
+      first measure the gaps between kernels and the host waits (grammar mask, draft chain) (gap study `/var/tmp/ares-survey/gap-study-2026-11-17.md`).
+- [ ] The lookup's corpus kept over a restart; the lookup's confidence calibrated on German text;
+      what `cache_prompt: true` should do (the owner to decide) (gap study `/var/tmp/ares-survey/gap-study-2026-11-17.md`).
 - [ ] The fused read of a Q8_0 mixer (UD-Q4_K_XL) takes 43.8 us on the RTX 4070 where BF16 takes
       24.9: it decodes byte by byte (a load of four codes at once would cut it); sixteen rare types
       read through the decoder chosen at run time; the float read is 2 % slower than before the
@@ -488,6 +511,9 @@ Measured per phase on a quiet machine against the fork and Strata, the largest f
       than CUDA today); the delta rule's f16 state rounded per row; the sampler's `-0.0`.
 
 ## Measurements owed on a quiet machine
+- [ ] Real models with 1, 2 and 4 concurrent clients against the fork and Strata (Strata saw four
+      requests on a 12 GB card with experts outside VRAM 11 to 24 % slower in sum: parallel
+      requests buy waiting time there, throughput on the 27B) (gap study `/var/tmp/ares-survey/gap-study-2026-11-17.md`).
 - [x] Flash-Next IQ2_XS decode step before and after `moe/q4-load` (2026-11-17, four alternating
       pairs at load 5 to 10): medians 23.3 to 25.2 ms before, 21.8 to 24.7 after, fastest 18.4 both.
 - [ ] Flash-Next with the owner's real limit (a RAM tier of 24 to 26 GiB), one card and two.
