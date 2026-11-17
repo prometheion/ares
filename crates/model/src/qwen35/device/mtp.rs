@@ -1,101 +1,54 @@
-//! The model's MTP block on its device: the next-token-prediction block
-//! of `qwen35` (multi-token prediction), run as a drafter.
+//! The 27B's MTP block on its device: the next-token-prediction block of
+//! `qwen35` (multi-token prediction) as the layer of the shared MTP driver
+//! (`blocks/mtp.rs`), which runs its chains, its picks, its carry and its
+//! following of the model.
 //!
-//! What the block computes is in `reference/mtp.rs`. Here it runs in two ways,
-//! both inside the step and without a trip to the host:
+//! What the block computes is in `reference/mtp.rs`:
 //!
-//! - **The chain**, before the model's own blocks. For every sequence that
-//!   drafts with the block, link 0 reads the sequence's newest token and the
-//!   final hidden state that token was picked from (kept on the device from
-//!   the step before, see `kernels/sampler_draft.cuh`) and picks the token
-//!   after it; link `j` reads the pick and the output of link `j - 1`. Each
-//!   pick is made on the device by the sampler, from the draft head, with the
-//!   settings and the noise of the row that will verify it, and is written
-//!   straight into the token array of the step record, where the embedding of
-//!   the verify window reads it, and into a list the host reads at the end of
-//!   the step together with the picks. The host reads every link's picks as
-//!   well, for the probability the block gave each draft; where the step's
-//!   draft bars may end a chain it waits for them before it enqueues the next
-//!   link, and a link that is not made costs nothing (its rows of the verify
-//!   window get the last draft again, and the host is told they are none).
-//! - **Following the model**, after its blocks. The block's keys and values
-//!   at a position depend on that position's token and the model's hidden
-//!   state of the position before only, so for every row of the step they are
-//!   computed from what the model just computed and written into the block's
-//!   own K/V pool (the same pages and tables as the model's attention blocks,
-//!   one more array of entries). Rows of a window whose drafts are rejected
-//!   are written too: their cells are past the sequence's end and the next
-//!   step overwrites them. This is also what replaces the provisional keys
-//!   and values a chain wrote from its own outputs.
+//! ```text
+//! x      = eh_proj [enorm(e); hnorm(h)]        e: the token's embedding, h: the hidden state before
+//! x      = x + attention(attn_norm(x))          over the block's own keys and values
+//! x      = x + ffn(post_norm(x))
+//! out    = shared_head_norm(x)                  the next link's h
+//! logits = draft head @ out                     the head view's rows of the output head
+//! ```
 //!
-//! The whole block is on one device, the one that embeds, and its head is the
-//! first rows of the output head there (the draft vocabulary when the
-//! placement has one), so it takes no weights twice. That device keeps the
-//! rows of the embedding table for the tokens the chain can pick (`embed.rs`):
-//! a link embeds its pick from them, and the embedding of the verify window
-//! reads them for the same tokens. The newest token of a chain is known to
-//! the host, which stages its row with the step's records. The chain works
-//! in a scratch of its own, sized for the sequences that can draft at once;
-//! following the model reuses the step's scratch, which is free by then.
+//! The model gives the driver its hidden state where it is tapped: the final
+//! hidden state of every row of a step (`output_norm` of the residual stream
+//! after the last block, in the step's `xn`), on the device that holds the
+//! block. A pair of the token at position `p` and the hidden state of `p - 1`
+//! is the block's cell `p`.
+//!
+//! The block is whole on one device, the one with the head view: the device
+//! that embeds under a tensor split or alone, the last one under a layer
+//! split, which holds the head and the final hidden states. Its head is the
+//! head view's first rows of the output head there, so it takes no weights
+//! twice, and the device keeps the rows of the embedding table for the tokens
+//! the chain can pick (`blocks/rows.rs`). A link of the chain works in a
+//! scratch of the block's own, sized for the sequences that can draft at once;
+//! rows that only write keys use the step's scratch, which is free at the start
+//! of a step (only the hidden states of the last step are kept there, in `xn`,
+//! until they are followed).
+
+use std::collections::VecDeque;
+use std::sync::Arc;
 
 use ares_core::Ledger;
 use ares_cuda::{
-    AttendBuffers, AttentionShape, AttnRow, DeviceBuffer, DevicePtr, ENTRY_CELLS, Event, Kernels,
-    PinnedBuffer, Planner, PrefillPath, SampleBatch, SamplePlan, SamplerKernels, Segment, StepDims,
-    StepRecord,
+    AttendBuffers, AttentionShape, AttnRow, DeviceBuffer, DevicePtr, ENTRY_CELLS, KeptRows,
+    Kernels, LayerKernels, Plan, Planner, PrefillPath, Segment, Stream,
 };
-use ares_runtime::{DraftChances, ModelError, draft_chance};
-use ares_sampler::{SamplePick, SampleRow};
+use ares_runtime::ModelError;
 
-use super::super::load::{DeviceWeights, MixerW, MtpW};
+use super::super::load::{DeviceWeights, Mat, MixerW, MtpW};
 use super::kv;
 use super::{
     AttentionAt, MTP_KV, Options, Part, Phase, Prepared, StepEnv, TAILS_PER_SLOT, geometry, invalid,
 };
+pub use crate::blocks::mtp::{Drafted, MtpChain, MtpStep, MtpTimes};
+use crate::blocks::mtp::{Driver, DriverSetup, LinkLogits, MtpLayer, Rows};
+use crate::blocks::rows::HostTable;
 use crate::qwen35::Config;
-
-/// Bytes reserved per link and sequence for the attention plan of a link.
-const PLAN_BYTES: u64 = 32 * 1024;
-
-/// A sequence that drafts with the block in the coming step.
-#[derive(Clone, Debug, PartialEq)]
-pub struct MtpChain {
-    /// The segment of the step that verifies the drafts: its first row is
-    /// the sequence's newest token, its other rows take the drafts.
-    pub segment: u32,
-    /// The newest token.
-    pub token: u32,
-    /// How the rows that verify the drafts are sampled, one per draft: link
-    /// `j` of the chain and row `j` of the window pick the same position.
-    pub rows: Vec<SampleRow>,
-    /// The reach the chain needs for each link to be made (the step record's
-    /// draft bars); empty for a chain that makes every link.
-    pub needs: Vec<f32>,
-    /// Where its drafts go in the step's list of drafts, which the drafts of
-    /// every drafter of the part share in the order of the record's windows.
-    pub place: u32,
-}
-
-/// What the block drafts in the coming step.
-#[derive(Clone, Debug, PartialEq)]
-pub struct MtpStep {
-    /// The token array of the step record on this device: the chain writes
-    /// the drafts into it.
-    pub tokens: DevicePtr,
-    pub chains: Vec<MtpChain>,
-    /// The chance of a draft by its probability, which the reach of a chain
-    /// is made of; `None` when the chains make every link.
-    pub chances: Option<DraftChances>,
-}
-
-/// Where a step left the tokens it drafted: `tokens` u32 on the device, the
-/// drafts of each chain of the [`MtpStep`] in order, chain after chain.
-/// `u32::MAX` is a draft that could not be picked.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Drafted {
-    pub ptr: DevicePtr,
-    pub tokens: u32,
-}
 
 /// What the MTP block takes on its device, in bytes.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -116,20 +69,6 @@ pub struct MtpBytes {
     pub records: u64,
     /// What the step's own scratch grew by for the block.
     pub step_scratch: u64,
-}
-
-/// Device time of the MTP block, added up over steps.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct MtpTimes {
-    /// Steps counted.
-    pub steps: u64,
-    /// Links of all chains of those steps (a link of several sequences
-    /// counts once).
-    pub links: u64,
-    /// Milliseconds of the chains.
-    pub chain_ms: f64,
-    /// Milliseconds of following the model.
-    pub follow_ms: f64,
 }
 
 /// What the block needs to know of the part it is in.
@@ -168,11 +107,11 @@ pub(super) fn sizes(
     target_blocks: u32,
     pool: u64,
 ) -> Option<MtpSizes> {
-    let draft = w.draft.as_ref()?;
-    let MixerW::Attention(a) = &draft.block.mixer else { return None };
+    let mtp = w.mtp.as_ref()?;
+    let MixerW::Attention(a) = &mtp.block.mixer else { return None };
     let geo = geometry(c, MTP_KV, a.n_kv);
     let rows = max_slots;
-    let widest = draft.block.ffn.as_ref().map_or(0, |f| f.gate.n_out).max(a.out.n_in).max(a.q.n_in);
+    let widest = mtp.block.ffn.as_ref().map_or(0, |f| f.gate.n_out).max(a.out.n_in).max(a.q.n_in);
     let slots = 20 * u64::from(target_blocks) / u64::from(a.n_kv) + 64;
     Some(MtpSizes {
         at: AttentionAt { geo, pool, exact: 0 },
@@ -184,11 +123,15 @@ pub(super) fn sizes(
     })
 }
 
-/// Offsets of the chain's scratch.
+/// Bytes reserved per link and sequence for the attention plan of a link.
+const PLAN_BYTES: u64 = 32 * 1024;
+
+/// Bytes of an [`AttnRow`]: four words.
+const ATTN_ROW_BYTES: u64 = 16;
+
+/// Offsets of the scratch of a link, for the sequences that draft at once.
 #[derive(Clone, Copy, Debug, Default)]
 struct Scratch {
-    e: u64,
-    h: u64,
     x: u64,
     xn: u64,
     p: u64,
@@ -202,86 +145,46 @@ struct Scratch {
     g1: u64,
     g2: u64,
     rope: u64,
-    /// Per link the block's output of every chain: the next link's hidden state.
-    out: u64,
-    logits: u64,
-    /// Per link the picks of every chain.
-    picks: u64,
-    drafts: u64,
-    sampler: u64,
-    exchange: u64,
     len: u64,
 }
 
-/// The events around one step's draft work.
+/// The 27B's MTP layer: its weights, its K/V group and the scratch of a
+/// link.
 #[derive(Debug)]
-struct Clock {
-    /// Start and end of the chains: always recorded, because what a link
-    /// costs decides how many are worth drafting.
-    chain: [Event; 2],
-    /// Start and end of following the model, when the part keeps a profile.
-    follow: Option<[Event; 2]>,
-    /// Whether the last step recorded them and they are not read yet.
-    chain_pending: bool,
-    follow_pending: bool,
-    links: u64,
-    /// Milliseconds of the chains of the last step.
-    last_chain_ms: f64,
-}
-
-/// The MTP block of a part.
-#[derive(Debug)]
-pub(super) struct Mtp {
-    sampler: SamplerKernels,
+pub(super) struct Layer {
     pub(super) at: AttentionAt,
     /// The K/V group of the block's layer: its exact pool and table.
     pub(super) kv: kv::Group,
     w: MtpW,
-    /// Per slot `carry_rows` rows of `d` values (see `sampler_draft.cuh`).
-    carry: DeviceBuffer,
-    carry_rows: u32,
     scratch: DeviceBuffer,
     s: Scratch,
-    /// What a step's kernels read besides the step record: the records,
-    /// settings, indices and plans of the links and the rows of the step,
-    /// written on the host and uploaded with one copy.
-    host: PinnedBuffer,
-    records: DeviceBuffer,
-    max_chains: u32,
-    max_links: u32,
-    /// The tokens of the head's rows on the device, or null when row `r` is
-    /// token `r`.
-    head_tokens: DevicePtr,
-    pending: Option<MtpStep>,
-    /// Where the rows of the step are in `records`, for following.
-    follow_rows: u64,
-    /// Where the rows of the chains' newest tokens that the host staged are
-    /// in `records` (link 0 embeds them); null when it staged none.
-    newest: DevicePtr,
-    drafted: u32,
-    /// The picks of every link of the step, as the device copies them out,
-    /// and the event behind the newest copy.
-    picks_host: PinnedBuffer,
-    picked: Event,
-    /// The links the chains of the step made, and where the host's list has
-    /// the draft of each row of each link: `(link, row, place)`.
-    made: u32,
-    layout: Vec<(u32, u32, u32)>,
-    clock: Clock,
-    times: MtpTimes,
+    /// The attention plans of the links laid out for the step, in their order.
+    plans: VecDeque<Plan>,
     step_scratch: u64,
 }
 
-impl Mtp {
-    /// Where the carry starts and its rows per slot: the first row of a
-    /// slot is the final hidden state of its last row, which its next chain
-    /// starts from, and what a checkpoint keeps of the block.
-    pub(super) fn carry(&self) -> (DevicePtr, u32) {
-        (self.carry.ptr(), self.carry_rows)
+impl Layer {
+    fn at(&self, offset: u64) -> DevicePtr {
+        self.scratch.ptr().offset(offset)
     }
 
+    /// Where the block's exact entries are: null when its formats have none.
+    fn exact_pool(&self) -> DevicePtr {
+        if self.kv.has_exact() { self.kv.exact().offset(self.at.exact) } else { DevicePtr::NULL }
+    }
+}
+
+/// The driver and the layer of a part's MTP block.
+#[derive(Debug)]
+pub(super) struct Mtp {
+    pub(super) driver: Driver,
+    pub(super) layer: Layer,
+}
+
+impl Mtp {
     /// Reserves and allocates what the block needs besides its weights and
-    /// its pool.
+    /// its pool; `table` is the embedding table on the host, for the tokens
+    /// whose rows the device does not keep.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn open(
         c: &Config,
@@ -292,29 +195,24 @@ impl Mtp {
         setup: Setup,
         sizes: Option<MtpSizes>,
         step_scratch: u64,
+        table: Option<Arc<HostTable>>,
     ) -> Result<Option<Self>, ModelError> {
         let Setup { max_slots, pages, table_stride, main_exact } = setup;
-        let (Some(sizes), Some(draft)) = (sizes, w.draft.as_ref()) else { return Ok(None) };
-        let MixerW::Attention(a) = &draft.block.mixer else {
+        let (Some(sizes), Some(mtp)) = (sizes, w.mtp.as_ref()) else { return Ok(None) };
+        let MixerW::Attention(a) = &mtp.block.mixer else {
             return Err(invalid("the MTP block is an attention block"));
         };
-        let ffn = draft.block.ffn.as_ref().ok_or_else(|| invalid("the MTP block has no ffn"))?;
-        let Some(embedding) = &w.embedding else {
-            return Err(invalid("the MTP block's device does not embed"));
-        };
-        if embedding.kept.is_none() {
+        let ffn = mtp.block.ffn.as_ref().ok_or_else(|| invalid("the MTP block has no ffn"))?;
+        let Some((shape, kept)) = w.embedding.and_then(|e| Some((e.table, e.kept?))) else {
             return Err(invalid("the MTP block's device keeps no rows of the embedding table"));
+        };
+        if kept.rows.n_out < shape.n_vocab && table.is_none() {
+            return Err(invalid("the MTP block's device has no embedding table on the host"));
         }
-        // The newest tokens' rows go with the records when the host stages rows.
-        let staged_rows =
-            if embedding.stages() { u64::from(max_slots) * embedding.table.row_bytes() } else { 0 };
         let d = c.n_embd as u64;
         let rows = u64::from(max_slots);
-        let links = u64::from(opts.window_rows.saturating_sub(1).max(1));
         let (hq, hkv) = (u64::from(a.n_head) * u64::from(sizes.at.geo.head_dim), sizes.kv_values);
         let inner = u64::from(ffn.gate.n_out);
-        let head_rows = u64::from(draft.head.n_out);
-
         let mut s = Scratch::default();
         let mut len = 0u64;
         let mut take = |bytes: u64| {
@@ -322,8 +220,6 @@ impl Mtp {
             len = (len + bytes.max(16)).next_multiple_of(64);
             at
         };
-        s.e = take(rows * d * 4);
-        s.h = take(rows * d * 4);
         s.x = take(rows * d * 4);
         s.xn = take(rows * d * 4);
         s.p = take(rows * d * 4);
@@ -337,34 +233,13 @@ impl Mtp {
         s.g1 = take(rows * inner * 4);
         s.g2 = take(rows * inner * 4);
         s.rope = take(rows * (c.attention.rope.dim as u64 / 2) * 8);
-        s.out = take(links * rows * d * 4);
-        s.logits = take(rows * head_rows * 4);
-        s.picks = take(links * rows * SamplePick::BYTES as u64);
-        s.drafts = take(links * rows * 4);
-        s.sampler = take(SamplerKernels::scratch_bytes(max_slots));
-        s.exchange = take(u64::from(SamplerKernels::exchange_values(max_slots, 1)) * 4);
         s.len = len;
-
-        let carry_rows = opts.window_rows.max(1);
-        let carry_bytes = rows * u64::from(carry_rows) * d * 4;
-        // Per link: a record, the settings, two index arrays and a plan per
-        // sequence; then the carry index of link 0 and the rows of the step.
-        let per_link =
-            64 + rows * (32 + 4 + 16 + 16) + rows * (32 + 8 + 8) + 64 + rows * PLAN_BYTES;
-        let record_bytes =
-            (links * per_link + rows * 4 + u64::from(opts.max_rows) * 16 + 256 + staged_rows)
-                .next_multiple_of(64);
-        ledger.reserve("qwen35 MTP block: hidden states kept", carry_bytes)?;
-        ledger.reserve("qwen35 MTP block: chain scratch", s.len)?;
-        ledger.reserve("qwen35 MTP block: step records", record_bytes)?;
-        let carry = DeviceBuffer::new(device, carry_bytes)?;
+        ledger.reserve("qwen35 MTP block: link scratch", s.len)?;
         let scratch = DeviceBuffer::new(device, s.len)?;
-        carry.write(0, &vec![0u8; carry_bytes as usize])?;
-        scratch.write(s.sampler, &vec![0u8; SamplerKernels::scratch_bytes(max_slots) as usize])?;
         let sizing =
             kv::Sizing { slots: max_slots, rows: opts.max_rows, tails: max_slots * TAILS_PER_SLOT };
         let exact_slots = kv::slots_for(MTP_KV.0, MTP_KV.1, sizing);
-        let pages_kv = kv::Group::new(
+        let group = kv::Group::new(
             device,
             ledger,
             "qwen35 MTP block",
@@ -376,112 +251,318 @@ impl Mtp {
             table_stride,
             exact_slots > 0 || main_exact,
         )?;
-        let clock = Clock {
-            chain: [Event::timed(device)?, Event::timed(device)?],
-            follow: match opts.profile {
-                Some(_) => Some([Event::timed(device)?, Event::timed(device)?]),
-                None => None,
-            },
-            chain_pending: false,
-            follow_pending: false,
-            links: 0,
-            last_chain_ms: 0.0,
+        let kept_rows = KeptRows {
+            rows: w.mat(&kept.rows),
+            tokens: kept.tokens.map_or(DevicePtr::NULL, |at| w.at(at)),
+            count: kept.rows.n_out,
         };
+        let layer_bytes = |rows: u32, links: bool| {
+            u64::from(rows) * if links { PLAN_BYTES } else { ATTN_ROW_BYTES }
+        };
+        let driver = Driver::open(
+            device,
+            ledger,
+            DriverSetup {
+                label: "qwen35 MTP block",
+                width: c.n_embd as u32,
+                max_slots,
+                max_rows: opts.max_rows,
+                window_rows: opts.window_rows,
+                head_rows: mtp.head.n_out,
+                head_tokens: w.head_tokens.map_or(DevicePtr::NULL, |at| w.at(at)),
+                table: shape,
+                kept: kept_rows,
+                host: table,
+            },
+            opts.max_rows,
+            true,
+            layer_bytes,
+        )?;
         Ok(Some(Self {
-            sampler: SamplerKernels::load(device)?,
-            at: sizes.at,
-            kv: pages_kv,
-            w: draft.clone(),
-            carry,
-            carry_rows,
-            scratch,
-            s,
-            host: PinnedBuffer::new(device, record_bytes as usize)?,
-            records: DeviceBuffer::new(device, record_bytes)?,
-            max_chains: max_slots,
-            max_links: links as u32,
-            head_tokens: w.head_tokens.map_or(DevicePtr::NULL, |at| w.at(at)),
-            pending: None,
-            follow_rows: 0,
-            newest: DevicePtr::NULL,
-            drafted: 0,
-            picks_host: PinnedBuffer::new(device, (links * rows) as usize * SamplePick::BYTES)?,
-            picked: Event::new(device)?,
-            made: 0,
-            layout: Vec::new(),
-            clock,
-            times: MtpTimes::default(),
-            step_scratch,
+            driver,
+            layer: Layer {
+                at: sizes.at,
+                kv: group,
+                w: mtp.clone(),
+                scratch,
+                s,
+                plans: VecDeque::new(),
+                step_scratch,
+            },
         }))
     }
+}
 
-    fn at(&self, offset: u64) -> DevicePtr {
-        self.scratch.ptr().offset(offset)
+/// The layer with the part around it, as the driver drives it.
+struct PartLayer<'a> {
+    part: &'a mut Part,
+    layer: &'a mut Layer,
+}
+
+impl MtpLayer for PartLayer<'_> {
+    fn lag(&self) -> u32 {
+        0
     }
 
-    /// How sure link `link` was of the pick of its row `row`. The copy of the
-    /// link's picks has run.
-    fn confidence(&self, link: u32, row: u32) -> f32 {
-        let at = (link as usize * self.max_chains as usize + row as usize) * SamplePick::BYTES;
-        // SAFETY: the buffer holds a record for every row of every link, and
-        // the device is not writing this one any more.
-        let bytes = unsafe {
-            std::slice::from_raw_parts(self.picks_host.as_ptr().add(at), SamplePick::BYTES)
-        };
-        SamplePick::from_bytes(bytes).confidence()
+    fn keys_inputs(&self) -> Option<(DevicePtr, DevicePtr)> {
+        Some((self.part.at(self.part.s.p), self.part.at(self.part.s.x)))
     }
 
-    /// Adds the events of the last step to the times. The step has run.
-    fn flush_clock(&mut self) -> Result<(), ModelError> {
-        let clock = &mut self.clock;
-        if clock.chain_pending || clock.follow_pending {
-            self.times.steps += 1;
+    fn bytes(
+        &mut self,
+        segments: &[Segment],
+        links: bool,
+        out: &mut [u8],
+    ) -> Result<usize, ModelError> {
+        let (part, layer) = (&*self.part, &mut *self.layer);
+        let full = || invalid("the MTP block's step records do not fit their buffer");
+        if !links {
+            // The rows' places in the pages, for the append of their keys and
+            // values.
+            let n: u32 = segments.iter().map(|s| s.n_rows).sum();
+            let mut rows = vec![AttnRow::default(); n as usize];
+            for s in segments {
+                for i in 0..s.n_rows {
+                    rows[(s.row0 + i) as usize] = AttnRow {
+                        table: s.slot * part.table_stride,
+                        pos: s.pos0 as u32 + i,
+                        slot_base: 0,
+                        n_slots: 0,
+                    };
+                }
+            }
+            let bytes = AttnRow::to_bytes(&rows);
+            out.get_mut(..bytes.len()).ok_or_else(full)?.copy_from_slice(&bytes);
+            return Ok(bytes.len());
         }
-        if std::mem::take(&mut clock.chain_pending) {
-            clock.last_chain_ms = f64::from(clock.chain[1].elapsed_ms_since(&clock.chain[0])?);
-            self.times.chain_ms += clock.last_chain_ms;
-            self.times.links += std::mem::take(&mut clock.links);
+        // A link's attention plan: each row the only row of its step, over
+        // the block's cells up to its own.
+        let geo = layer.at.geo;
+        let mut planner = Planner::new(geo, part.plan_config, segments.len() as u32);
+        for (row, segment) in segments.iter().enumerate() {
+            let table = segment.slot * part.table_stride;
+            let need = (segment.pos0 as u32 + 1).div_ceil(ENTRY_CELLS) as usize;
+            let entries = &layer.kv.entries(&part.page_tab)[table as usize..table as usize + need];
+            planner.dense(table, entries, row as u32, 1, segment.pos0 as u32);
         }
-        if let (true, Some(follow)) = (std::mem::take(&mut clock.follow_pending), &clock.follow) {
-            self.times.follow_ms += f64::from(follow[1].elapsed_ms_since(&follow[0])?);
+        let plan = planner.finish();
+        if plan.state_bytes(&geo) > part.s.attn_state_bytes {
+            return Err(invalid("a link's attention plan needs more partial states"));
+        }
+        let bytes = plan.layout().bytes as usize;
+        plan.write(out.get_mut(..bytes).ok_or_else(full)?);
+        layer.plans.push_back(plan);
+        Ok(bytes)
+    }
+
+    fn keys(&mut self, rows: &Rows<'_>) -> Result<(), ModelError> {
+        let (part, layer) = (&mut *self.part, &*self.layer);
+        let (stream, dims) = (rows.stream, rows.record.dims());
+        let (n, d, eps) = (dims.n_rows, part.d, part.eps);
+        let w = &layer.w;
+        let MixerW::Attention(a) = &w.block.mixer else { return Err(invalid("MTP attention")) };
+        let attention = part.attention.clone().ok_or_else(|| invalid("attention kernels"))?;
+        let geo = layer.at.geo;
+        let s = part.s;
+        let (x, xn, p) = (part.at(s.x), part.at(s.xn), part.at(s.p));
+        let (k_raw, k, v) = (part.at(s.w2), part.at(s.k), part.at(s.v));
+        // Only the keys are wanted of what prepares attention's inputs: the
+        // queries it computes next to them come from, and go to, memory
+        // nothing reads.
+        let shape = AttentionShape { n_head: a.n_kv, n_kv_head: a.n_kv, head_dim: geo.head_dim };
+        // SAFETY: at the start of a step the step's scratch is free but for
+        // the hidden states the driver gathered into `x` and the embeddings
+        // in `p`; its buffers hold the step's rows of `d` values and of all
+        // KV heads of the block (`Part::open` sized them for it). Weights,
+        // tables and pool as in `Part::attend`.
+        unsafe {
+            part.kernels.rms_norm_f32(stream, p, part.w.at(w.enorm), xn, d, n, eps)?;
+            part.prepare(stream, xn, d, n, &[&w.proj_e], Prepared::default())?;
+            part.product(stream, &w.proj_e, n, p)?;
+            part.kernels.rms_norm_f32(stream, x, part.w.at(w.hnorm), xn, d, n, eps)?;
+            part.prepare(stream, xn, d, n, &[&w.proj_h], Prepared::default())?;
+            part.product(stream, &w.proj_h, n, x)?;
+            part.kernels.add_f32(stream, x, p, n * d)?;
+            part.kernels.rms_norm_f32(stream, x, part.w.at(w.block.attn_norm), xn, d, n, eps)?;
+            part.prepare(stream, xn, d, n, &[&a.k, &a.v], Prepared::default())?;
+            part.product(stream, &a.k, n, k_raw)?;
+            part.product(stream, &a.v, n, v)?;
+            part.layers.rope_table(stream, rows.step, dims, part.at(s.rope), part.rope)?;
+            part.layers.attn_prep(
+                stream,
+                rows.step,
+                dims,
+                shape,
+                part.rope.dim,
+                eps,
+                part.at(s.w1),
+                k_raw,
+                part.w.at(a.q_norm),
+                part.w.at(a.k_norm),
+                part.at(s.rope),
+                part.at(s.q),
+                None,
+                k,
+            )?;
+            layer.kv.append(
+                &attention,
+                stream,
+                &layer.at,
+                rows.bytes,
+                k,
+                v,
+                rows.tables,
+                rows.pages,
+                part.at(s.status),
+                rows.replay,
+                0,
+                n,
+            )?;
         }
         Ok(())
     }
-}
 
-/// One link of a step's chains, as its kernels need it.
-struct Link {
-    /// Rows: the chains that are at least this long.
-    n: u32,
-    /// The rows of the next link.
-    n_next: u32,
-    dims: StepDims,
-    /// Offsets in the records buffer.
-    record: u64,
-    tokens: u64,
-    params: u64,
-    record_rows: u64,
-    draft_at: u64,
-    plan_at: u64,
-    plan: ares_cuda::Plan,
-    sample: SamplePlan,
-}
-
-/// Where the block's exact entries are: null when its formats have none.
-fn exact_pool(m: &Mtp) -> DevicePtr {
-    if m.kv.has_exact() { m.kv.exact().offset(m.at.exact) } else { DevicePtr::NULL }
-}
-
-fn words(buf: &mut [u8], at: u64, values: impl IntoIterator<Item = u32>) -> u64 {
-    let mut end = at as usize;
-    for v in values {
-        buf[end..end + 4].copy_from_slice(&v.to_le_bytes());
-        end += 4;
+    fn link(
+        &mut self,
+        rows: &Rows<'_>,
+        out: DevicePtr,
+        logits: DevicePtr,
+    ) -> Result<LinkLogits, ModelError> {
+        let (part, layer) = (&mut *self.part, &mut *self.layer);
+        let (stream, dims) = (rows.stream, rows.record.dims());
+        let (n, d, eps) = (dims.n_rows, part.d, part.eps);
+        let plan = layer.plans.pop_front().ok_or_else(|| invalid("a link without its plan"))?;
+        let w = &layer.w;
+        let MixerW::Attention(a) = &w.block.mixer else { return Err(invalid("MTP attention")) };
+        let ffn = w.block.ffn.as_ref().ok_or_else(|| invalid("MTP ffn"))?;
+        let attention = part.attention.clone().ok_or_else(|| invalid("attention kernels"))?;
+        let geo = layer.at.geo;
+        let s = layer.s;
+        let (e, h) = (rows.e, rows.h);
+        let (x, xn, p) = (layer.at(s.x), layer.at(s.xn), layer.at(s.p));
+        let (tables, exact) = (layer.kv.table(rows.tables), layer.exact_pool());
+        let pool = rows.pages.offset(layer.at.pool);
+        let shape = AttentionShape { n_head: a.n_head, n_kv_head: a.n_kv, head_dim: geo.head_dim };
+        let inner = ffn.gate.n_out;
+        // SAFETY: the link's scratch holds `max_slots` rows of every buffer
+        // and `n` is at most that; the records hold what `bytes` wrote for
+        // this link; weights, tables and pool as in `Part::attend`.
+        unsafe {
+            let plan = plan.on_device(rows.bytes);
+            // x = proj_e e' + proj_h h'
+            part.kernels.rms_norm_f32(stream, e, part.w.at(w.enorm), xn, d, n, eps)?;
+            part.prepare(stream, xn, d, n, &[&w.proj_e], Prepared::default())?;
+            part.product(stream, &w.proj_e, n, x)?;
+            part.kernels.rms_norm_f32(stream, h, part.w.at(w.hnorm), xn, d, n, eps)?;
+            part.prepare(stream, xn, d, n, &[&w.proj_h], Prepared::default())?;
+            part.product(stream, &w.proj_h, n, p)?;
+            part.kernels.add_f32(stream, x, p, n * d)?;
+            // Attention over the block's own keys and values.
+            part.kernels.rms_norm_f32(stream, x, part.w.at(w.block.attn_norm), xn, d, n, eps)?;
+            part.prepare(stream, xn, d, n, &[&a.q, &a.k, &a.v], Prepared::default())?;
+            part.product(stream, &a.q, n, layer.at(s.qg))?;
+            part.product(stream, &a.k, n, layer.at(s.k_raw))?;
+            part.product(stream, &a.v, n, layer.at(s.v))?;
+            part.layers.rope_table(stream, rows.step, dims, layer.at(s.rope), part.rope)?;
+            part.layers.attn_prep(
+                stream,
+                rows.step,
+                dims,
+                shape,
+                part.rope.dim,
+                eps,
+                layer.at(s.qg),
+                layer.at(s.k_raw),
+                part.w.at(a.q_norm),
+                part.w.at(a.k_norm),
+                layer.at(s.rope),
+                layer.at(s.q),
+                Some(layer.at(s.gate)),
+                layer.at(s.k),
+            )?;
+            attention.append(
+                stream,
+                &geo,
+                plan.rows(),
+                n,
+                layer.at(s.k),
+                layer.at(s.v),
+                tables,
+                exact,
+                pool,
+                part.at(part.s.status),
+            )?;
+            attention.attend(
+                stream,
+                &geo,
+                &plan,
+                &AttendBuffers {
+                    tables,
+                    exact_pool: exact,
+                    converted_pool: pool,
+                    q: layer.at(s.q),
+                    gate: Some(layer.at(s.gate)),
+                    out: layer.at(s.o),
+                    scratch: part.at(part.s.attn_state),
+                },
+                1.0 / (part.attn_head_dim as f32).sqrt(),
+            )?;
+            part.prepare(stream, layer.at(s.o), a.out.n_in, n, &[&a.out], Prepared::default())?;
+            part.product(stream, &a.out, n, p)?;
+            part.kernels.add_f32(stream, x, p, n * d)?;
+            // The feed-forward part.
+            part.kernels.rms_norm_f32(stream, x, part.w.at(w.block.post_norm), xn, d, n, eps)?;
+            part.prepare(stream, xn, d, n, &[&ffn.gate, &ffn.up], Prepared::default())?;
+            part.product(stream, &ffn.gate, n, layer.at(s.g1))?;
+            part.product(stream, &ffn.up, n, layer.at(s.g2))?;
+            part.swiglu(stream, layer.at(s.g1), layer.at(s.g2), inner, n, &ffn.down)?;
+            part.product(stream, &ffn.down, n, p)?;
+            part.kernels.add_f32(stream, x, p, n * d)?;
+            // The output and the draft head.
+            part.kernels.rms_norm_f32(stream, x, part.w.at(w.head_norm), out, d, n, eps)?;
+            part.prepare(stream, out, d, n, &[&w.head], Prepared::default())?;
+            part.product(stream, &w.head, n, logits)?;
+        }
+        Ok(LinkLogits { ptr: logits, stride: w.head.n_out })
     }
-    (end as u64).next_multiple_of(16)
+
+    fn save(&mut self, _stream: &Stream, _slots: &[u32]) -> Result<(), ModelError> {
+        // The block keeps no state per sequence besides its cells.
+        Ok(())
+    }
+
+    fn restore(&mut self, _stream: &Stream, _slots: &[u32]) -> Result<(), ModelError> {
+        Ok(())
+    }
+
+    fn writes_converted(&self, slot: u32, cell: u32) -> bool {
+        self.layer.kv.writes_converted(slot, cell, &self.part.page_tab)
+    }
+
+    fn settle(&mut self, slot: u32, cells: u32) {
+        self.layer.kv.settled(slot, cells, &self.part.page_tab);
+    }
 }
+
+/// What a closure over the MTP block gets: the driver, the layer with the
+/// part around it, and the part's layer kernels.
+type WithMtp<'a, 'b> = (&'a mut Driver, &'a mut PartLayer<'b>, &'a LayerKernels);
 
 impl Part {
+    /// Runs `f` with the MTP driver and the layer with the part around it;
+    /// `None` without the block.
+    fn with_mtp<T>(
+        &mut self,
+        f: impl FnOnce(WithMtp<'_, '_>) -> Result<T, ModelError>,
+    ) -> Result<Option<T>, ModelError> {
+        let Some(mut m) = self.mtp.take() else { return Ok(None) };
+        let layers = self.layers.clone();
+        let result =
+            f((&mut m.driver, &mut PartLayer { part: self, layer: &mut m.layer }, &layers));
+        self.mtp = Some(m);
+        result.map(Some)
+    }
+
     /// Whether this part holds the model's MTP block.
     pub fn has_mtp(&self) -> bool {
         self.mtp.is_some()
@@ -489,76 +570,67 @@ impl Part {
 
     /// The most drafts the block makes per sequence in a step.
     pub fn mtp_links(&self) -> u32 {
-        self.mtp.as_ref().map_or(0, |m| m.max_links)
+        self.mtp.as_ref().map_or(0, |m| m.driver.max_links())
     }
 
     /// What the block takes on this device.
-    pub fn draft_bytes(&self) -> Option<MtpBytes> {
+    pub fn mtp_bytes(&self) -> Option<MtpBytes> {
         let m = self.mtp.as_ref()?;
-        let mat = |mat: &super::super::load::Mat| mat.bytes();
-        let MixerW::Attention(a) = &m.w.block.mixer else { return None };
-        let ffn = m.w.block.ffn.as_ref()?;
+        let w = &m.layer.w;
+        let MixerW::Attention(a) = &w.block.mixer else { return None };
+        let ffn = w.block.ffn.as_ref()?;
         let weights =
-            [&m.w.proj_e, &m.w.proj_h, &a.q, &a.k, &a.v, &a.out, &ffn.gate, &ffn.up, &ffn.down]
+            [&w.proj_e, &w.proj_h, &a.q, &a.k, &a.v, &a.out, &ffn.gate, &ffn.up, &ffn.down]
                 .iter()
-                .map(|x| mat(x))
+                .map(|x| Mat::bytes(x))
                 .sum::<u64>()
                 + 5 * u64::from(self.d) * 4;
+        let (carry, scratch, records) = m.driver.bytes();
         Some(MtpBytes {
             weights,
-            page: m.at.geo.converted_entry_bytes(),
-            exact: m.kv.bytes(),
-            carry: m.carry.len(),
-            scratch: m.scratch.len(),
-            records: m.records.len(),
-            step_scratch: m.step_scratch,
+            page: m.layer.at.geo.converted_entry_bytes(),
+            exact: m.layer.kv.bytes(),
+            carry,
+            scratch: scratch + m.layer.scratch.len(),
+            records,
+            step_scratch: m.layer.step_scratch,
         })
     }
 
-    /// Device time of the MTP block so far (following the model is counted
-    /// only when the part keeps a profile). Includes the last step only after
-    /// the next one was enqueued or [`Part::flush_profile`] was called.
+    /// Device time of the MTP block so far. Includes the last step only
+    /// after the next one was enqueued or [`Part::draft_ms`] was called.
     pub fn mtp_times(&self) -> MtpTimes {
-        self.mtp.as_ref().map_or_else(MtpTimes::default, |m| m.times)
+        self.mtp.as_ref().map_or_else(MtpTimes::default, |m| m.driver.times())
     }
 
-    /// Device milliseconds of the chains of the step that ran last (0 when it
-    /// drafted nothing). The step must have ended.
+    /// Device milliseconds of the drafters of the step that ran last: the
+    /// MTP block's chains and the DFlash drafter's pass (0 when it drafted
+    /// nothing). The step must have ended.
     pub fn draft_ms(&mut self) -> Result<f64, ModelError> {
         let pass = match &mut self.dflash {
             Some(d) => d.pass_ms()?,
             None => 0.0,
         };
-        let Some(m) = &mut self.mtp else { return Ok(pass) };
-        m.flush_clock()?;
-        Ok(m.clock.last_chain_ms + pass)
+        let chain = match &mut self.mtp {
+            Some(m) => m.driver.chain_ms()?,
+            None => 0.0,
+        };
+        Ok(chain + pass)
     }
 
-    /// Tells the part what its MTP block drafts in the step that is
-    /// enqueued next. Without this call a step drafts nothing.
+    /// Tells the part what its MTP block drafts in the step that is enqueued
+    /// next. Without this call a step drafts nothing.
     pub fn mtp_step(&mut self, step: MtpStep) -> Result<(), ModelError> {
         let m = self.mtp.as_mut().ok_or_else(|| invalid("this part holds no MTP block"))?;
-        if step.chains.len() > m.max_chains as usize
-            || step.chains.iter().any(|c| c.rows.is_empty() || c.rows.len() > m.max_links as usize)
-        {
-            return Err(invalid(format!(
-                "{} sequences draft, the longest {} tokens; the block takes {} sequences of 1 to {}",
-                step.chains.len(),
-                step.chains.iter().map(|c| c.rows.len()).max().unwrap_or(0),
-                m.max_chains,
-                m.max_links
-            )));
-        }
-        m.pending = Some(step);
-        Ok(())
+        m.driver.draft_step(step)
     }
 
     /// Where the step enqueued last left its drafts, the MTP block's and
     /// the DFlash drafter's in one list; `None` when it drafted nothing.
     pub fn drafted(&self) -> Option<Drafted> {
-        let block = self.mtp.as_ref().map_or(0, |m| m.drafted);
+        let mtp = self.mtp.as_ref().map_or(0, |m| m.driver.drafted());
         let dflash = self.dflash.as_ref().map_or(0, |d| d.drafted());
-        let tokens = block.max(dflash);
+        let tokens = mtp.max(dflash);
         (tokens > 0).then(|| Drafted { ptr: self.draft_list(), tokens })
     }
 
@@ -566,7 +638,7 @@ impl Part {
     /// the places of its windows: the MTP block's when the part has one.
     pub fn draft_list(&self) -> DevicePtr {
         match (&self.mtp, &self.dflash) {
-            (Some(m), _) => m.at(m.s.drafts),
+            (Some(m), _) => m.driver.list(),
             (None, Some(d)) => d.own_list(),
             (None, None) => DevicePtr::NULL,
         }
@@ -579,10 +651,8 @@ impl Part {
         let Some(drafted) = self.drafted() else { return };
         let from = out.len();
         out.resize(from + drafted.tokens as usize, f32::NAN);
-        if let Some(m) = self.mtp.as_ref().filter(|m| m.drafted > 0) {
-            for &(link, row, place) in m.layout.iter().filter(|(link, ..)| *link < m.made) {
-                out[from + place as usize] = m.confidence(link, row);
-            }
+        if let Some(m) = &self.mtp {
+            m.driver.probs(&mut out[from..]);
         }
         if let Some(d) = self.dflash.as_ref().filter(|d| d.drafted() > 0) {
             for s in d.last_pass() {
@@ -596,30 +666,21 @@ impl Part {
     /// The block's exact K/V entries (its cells are in them while their tile is
     /// exact: see [`MTP_KV`]), for tests that read the cells it wrote.
     pub fn mtp_exact_entries(&self) -> Option<&DeviceBuffer> {
-        self.mtp.as_ref().and_then(|m| m.kv.exact_buffer())
+        self.mtp.as_ref().and_then(|m| m.layer.kv.exact_buffer())
     }
 
-    /// The hidden states kept per sequence and the rows per sequence, for
-    /// tests that put a hidden state on the device.
-    pub fn mtp_carry(&self) -> Option<(&DeviceBuffer, u32)> {
-        self.mtp.as_ref().map(|m| (&m.carry, m.carry_rows))
+    /// The hidden states kept per sequence slot (`d` f32 each, and a row of
+    /// zeros behind them), for tests that put a hidden state on the device.
+    pub fn mtp_carry(&self) -> Option<&DeviceBuffer> {
+        self.mtp.as_ref().map(|m| m.driver.carry())
     }
 
     /// The chain's scratch and, in it, the offsets of the block's output of
     /// link `link` (a row of `d` values per chain), of the logits of the last
     /// link that ran (a row of the draft head per chain) and of the picks of
-    /// link `link` ([`SamplePick`] records): for tests.
+    /// link `link` ([`ares_sampler::SamplePick`] records): for tests.
     pub fn mtp_scratch(&self, link: u32) -> Option<(&DeviceBuffer, [u64; 3])> {
-        let m = self.mtp.as_ref()?;
-        let rows = u64::from(m.max_chains);
-        Some((
-            &m.scratch,
-            [
-                m.s.out + u64::from(link) * rows * u64::from(self.d) * 4,
-                m.s.logits,
-                m.s.picks + u64::from(link) * rows * SamplePick::BYTES as u64,
-            ],
-        ))
+        self.mtp.as_ref().map(|m| m.driver.scratch(link))
     }
 
     /// The tokens of the columns of this part's logits (a u32 each) when a
@@ -631,643 +692,108 @@ impl Part {
 
     /// The rows of the draft head.
     pub fn draft_head_rows(&self) -> u32 {
-        self.mtp.as_ref().map_or(0, |m| m.w.head.n_out)
+        self.mtp.as_ref().map_or(0, |m| m.driver.head_rows())
     }
 
-    /// The commit of the last step's windows, for the MTP block: the hidden
-    /// state of each window's last accepted row becomes the one its sequence
-    /// goes on from.
-    pub(super) fn mtp_commit(
+    /// Step 1 of the MTP block at the start of a step, before its copies of
+    /// the prefix cache: the rows of the last step that count (the outcome
+    /// of its windows is what [`Part::commit_windows`] was told), from the
+    /// final hidden states that step left in `xn`. A step follows first
+    /// itself when this was not called.
+    pub fn mtp_follow(
         &mut self,
-        stream: &ares_cuda::Stream,
-        step: DevicePtr,
-        dims: StepDims,
+        stream: &Stream,
+        tables: DevicePtr,
+        pages: DevicePtr,
     ) -> Result<(), ModelError> {
-        let Some(m) = &self.mtp else { return Ok(()) };
-        // SAFETY: `step` is the commit record the caller uploaded; the carry
-        // holds `carry_rows` rows for every slot.
-        unsafe {
-            m.sampler.commit_hidden(
-                stream,
-                step,
-                dims.n_segs,
-                m.carry.ptr(),
-                m.carry_rows,
-                self.d,
-            )?;
-        }
+        let tap = self.at(self.s.xn);
+        let outcomes = std::mem::take(&mut self.outcomes);
+        let accepted = |slot: u32, _row0: u32| {
+            outcomes.iter().find(|(s, _)| *s == slot).map(|(_, accepted)| *accepted)
+        };
+        self.with_mtp(|(driver, layer, layers)| {
+            driver.follow(layer, layers, stream, &accepted, tap, tables, pages)
+        })?;
         Ok(())
     }
 
-    /// For tests of the block alone: the MTP block's part of
-    /// [`Part::enqueue_commit`].
-    pub fn commit_mtp(
-        &mut self,
-        stream: &ares_cuda::Stream,
-        step: DevicePtr,
-        dims: StepDims,
-    ) -> Result<(), ModelError> {
-        self.mtp_commit(stream, step, dims)
+    /// Before the model's blocks: the block follows the last step if that
+    /// was not done, writes the newest cells of the sequences that do not
+    /// draft and enqueues the chains. `only` is a step that only drafts.
+    pub(super) fn mtp_before(&mut self, env: &StepEnv<'_>, only: bool) -> Result<(), ModelError> {
+        if self.mtp.is_none() {
+            return Ok(());
+        }
+        self.mtp_follow(env.stream, env.tables, env.pages)?;
+        self.with_mtp(|(driver, layer, layers)| {
+            driver.step(
+                layer,
+                layers,
+                env.stream,
+                env.segments,
+                env.tokens,
+                env.replay,
+                env.tables,
+                env.pages,
+                only,
+            )
+        })?;
+        self.mark(env.stream, Phase::Other)
     }
 
-    /// Before the model's blocks: uploads what the MTP block's kernels of
-    /// this step read and enqueues the chains.
-    pub(super) fn mtp_before(&mut self, env: &StepEnv<'_>) -> Result<(), ModelError> {
-        let Some(mut m) = self.mtp.take() else { return Ok(()) };
-        let result = self.mtp_chains(env, &mut m);
-        self.mtp = Some(m);
-        result
-    }
-
-    /// After the model's blocks and its head: the block's keys and values of
-    /// the step's rows, and the hidden states the next step starts from.
+    /// After the model's blocks and its head: the final hidden state of the
+    /// step's rows, which the block follows at the start of the next step.
     pub(super) fn mtp_after(&mut self, env: &StepEnv<'_>) -> Result<(), ModelError> {
-        let Some(mut m) = self.mtp.take() else { return Ok(()) };
+        if self.mtp.is_none() {
+            return Ok(());
+        }
         let (x, xn) = (self.at(self.s.x), self.at(self.s.xn));
-        let result = (|| {
-            if let Some(follow) = &m.clock.follow {
-                follow[0].record(env.stream)?;
-            }
-            // SAFETY: `x` holds the residual stream of the step's rows after
-            // the last block, `xn` has room for as many rows.
-            unsafe {
-                self.kernels.rms_norm_f32(
-                    env.stream,
-                    x,
-                    self.w.at(self.w.output_norm),
-                    xn,
-                    self.d,
-                    env.dims.n_rows,
-                    self.eps,
-                )?;
-            }
-            self.mtp_follow(env, &m)?;
-            if let Some(follow) = &m.clock.follow {
-                follow[1].record(env.stream)?;
-                m.clock.follow_pending = true;
-            }
-            self.mark(env.stream, Phase::Other)
-        })();
-        self.mtp = Some(m);
-        result
+        // SAFETY: `x` holds the residual stream of the step's rows after
+        // the last block, `xn` has room for as many rows.
+        unsafe {
+            self.kernels.rms_norm_f32(
+                env.stream,
+                x,
+                self.w.at(self.w.output_norm),
+                xn,
+                self.d,
+                env.dims.n_rows,
+                self.eps,
+            )?;
+        }
+        self.mark(env.stream, Phase::Other)
     }
 
-    /// For tests of the block alone: follows the rows of `env` with `hidden`
-    /// as the model's final hidden states of those rows (`d` values each),
-    /// after [`Part::enqueue_mtp`] for the same step.
-    pub fn enqueue_follow(&mut self, env: &StepEnv<'_>, hidden: &[f32]) -> Result<(), ModelError> {
-        let Some(m) = self.mtp.take() else { return Err(invalid("no MTP block")) };
-        let result = (|| {
-            if hidden.len() != env.dims.n_rows as usize * self.d as usize {
-                return Err(invalid("one hidden state per row of the step"));
-            }
-            let bytes: Vec<u8> = hidden.iter().flat_map(|v| v.to_le_bytes()).collect();
-            env.stream.synchronize()?;
-            self.scratch.write(self.s.xn, &bytes)?;
-            self.stage_embedding(env)?;
-            self.mtp_follow(env, &m)
-        })();
-        self.mtp = Some(m);
-        result
-    }
-
-    /// For tests of the block alone: what [`Part::enqueue`] does for the
-    /// MTP block before the model's blocks, with the preparation of the
-    /// step's K/V entries that comes first there.
-    pub fn enqueue_mtp(&mut self, env: &StepEnv<'_>) -> Result<(), ModelError> {
+    /// For tests of the block alone: a step of the model whose final hidden
+    /// states are `hidden` (`d` values per row of `env`), which the block
+    /// follows at the start of the next step. The block does what it does in
+    /// such a step first: it follows the step before, writes the newest cells
+    /// and makes the chains of [`Part::mtp_step`].
+    pub fn enqueue_mtp_step(
+        &mut self,
+        env: &StepEnv<'_>,
+        hidden: &[f32],
+    ) -> Result<(), ModelError> {
         if self.mtp.is_none() {
             return Err(invalid("no MTP block"));
+        }
+        if hidden.len() != env.dims.n_rows as usize * self.d as usize {
+            return Err(invalid("one hidden state per row of the step"));
         }
         // The exact entries and the table of the block's layer are made ready
         // for the step, as `Part::enqueue` does in its first stage.
         self.prepare_kv(env)?;
-        self.mtp_before(env)
-    }
-
-    /// Writes the records of the step and enqueues their upload and the
-    /// chains.
-    fn mtp_chains(&mut self, env: &StepEnv<'_>, m: &mut Mtp) -> Result<(), ModelError> {
-        m.flush_clock()?;
-        m.clock.last_chain_ms = 0.0;
-        let step = m.pending.take().unwrap_or(MtpStep {
-            tokens: DevicePtr::NULL,
-            chains: Vec::new(),
-            chances: None,
-        });
-        let stream = env.stream;
-        let geo = m.at.geo;
-
-        // The chains, longest first, so that the chains of a link are the
-        // first rows of the link before; `first[c]` is where chain `c` of the
-        // caller's order has its drafts in the list for the host.
-        let mut first = Vec::with_capacity(step.chains.len());
-        let mut total = 0u32;
-        for chain in &step.chains {
-            let segment = env
-                .segments
-                .get(chain.segment as usize)
-                .ok_or_else(|| invalid(format!("the step has no segment {}", chain.segment)))?;
-            if segment.direct || segment.n_rows as usize != chain.rows.len() + 1 {
-                return Err(invalid(format!(
-                    "segment {segment:?} does not verify {} drafts",
-                    chain.rows.len()
-                )));
-            }
-            first.push(chain.place);
-            total = total.max(chain.place + chain.rows.len() as u32);
-        }
-        let mut order: Vec<usize> = (0..step.chains.len()).collect();
-        order.sort_by_key(|&c| std::cmp::Reverse(step.chains[c].rows.len()));
-        let n_links = order.first().map_or(0, |&c| step.chains[c].rows.len());
-
-        let capacity = m.host.len() as u64;
-        let full = || invalid("the MTP block's step records do not fit their buffer");
-        let buf: &mut [u8] = &mut m.host;
-        let mut end = 0u64;
-        let mut links = Vec::with_capacity(n_links);
-        for j in 0..n_links {
-            let chains: Vec<&MtpChain> = order
-                .iter()
-                .map(|&c| &step.chains[c])
-                .take_while(|chain| chain.rows.len() > j)
-                .collect();
-            let n = chains.len() as u32;
-            let n_next =
-                order.iter().filter(|&&c| step.chains[c].rows.len() > j + 1).count() as u32;
-            let segments: Vec<Segment> = chains
-                .iter()
-                .enumerate()
-                .map(|(row, chain)| {
-                    let s = env.segments[chain.segment as usize];
-                    Segment {
-                        row0: row as u32,
-                        n_rows: 1,
-                        slot: s.slot,
-                        pos0: s.pos0 + j as i32,
-                        direct: true,
-                    }
-                })
-                .collect();
-            // Link 0 reads the newest tokens; the others get theirs on the
-            // device from the picks of the link before.
-            let tokens: Vec<u32> =
-                chains.iter().map(|c| if j == 0 { c.token } else { 0 }).collect();
-            let record = StepRecord::new(&segments, &tokens, None, &[])?;
-            let bytes = record.as_bytes();
-            let mut planner = Planner::new(geo, self.plan_config, n);
-            for (row, segment) in segments.iter().enumerate() {
-                let table = segment.slot * self.table_stride;
-                let need = (segment.pos0 as u32 + 1).div_ceil(ENTRY_CELLS) as usize;
-                let entries = &m.kv.entries(&self.page_tab)[table as usize..table as usize + need];
-                planner.dense(table, entries, row as u32, 1, segment.pos0 as u32);
-            }
-            let plan = planner.finish();
-            let plan_bytes = plan.layout().bytes;
-            if plan.state_bytes(&geo) > self.s.attn_state_bytes {
-                return Err(invalid("a draft link's attention plan needs more partial states"));
-            }
-            let record_at = end;
-            let after = record_at + (bytes.len() as u64).next_multiple_of(16);
-            let need = after + u64::from(n) * (32 + 8 + 8) + 48 + plan_bytes;
-            if need > capacity {
-                return Err(full());
-            }
-            buf[record_at as usize..record_at as usize + bytes.len()].copy_from_slice(bytes);
-            let off_tokens =
-                u32::from_le_bytes(bytes[20..24].try_into().expect("the record's header"));
-            let params = after;
-            let mut at = params;
-            for chain in &chains {
-                buf[at as usize..at as usize + SampleRow::BYTES]
-                    .copy_from_slice(&chain.rows[j].to_bytes());
-                at += SampleRow::BYTES as u64;
-            }
-            let record_rows = at;
-            let rows_of =
-                chains.iter().map(|c| env.segments[c.segment as usize].row0 + 1 + j as u32);
-            let draft_at = words(buf, record_rows, rows_of);
-            let slots = order.iter().take(n as usize).map(|&c| first[c] + j as u32);
-            let plan_at = words(buf, draft_at, slots);
-            plan.write(&mut buf[plan_at as usize..(plan_at + plan_bytes) as usize]);
-            end = (plan_at + plan_bytes).next_multiple_of(16);
-            links.push(Link {
-                n,
-                n_next,
-                dims: record.dims(),
-                record: record_at,
-                tokens: record_at + u64::from(off_tokens),
-                params,
-                record_rows,
-                draft_at,
-                plan_at,
-                sample: SamplePlan::of(chains.iter().map(|c| &c.rows[j])),
-                plan,
-            });
-        }
-        // The rows of the carry link 0 starts from: row 0 of each sequence.
-        let carry_index = end;
-        let starts = order
-            .iter()
-            .map(|&c| env.segments[step.chains[c].segment as usize].slot * m.carry_rows);
-        if carry_index + order.len() as u64 * 4 + 16 + u64::from(env.dims.n_rows) * 16 > capacity {
-            return Err(full());
-        }
-        let follow_rows = words(buf, carry_index, starts);
-        let mut rows = Vec::with_capacity(env.dims.n_rows as usize);
-        rows.resize(env.dims.n_rows as usize, AttnRow::default());
-        for s in env.segments {
-            for i in 0..s.n_rows {
-                rows[(s.row0 + i) as usize] = AttnRow {
-                    table: s.slot * self.table_stride,
-                    pos: s.pos0 as u32 + i,
-                    slot_base: 0,
-                    n_slots: 0,
-                };
-            }
-        }
-        let row_bytes = AttnRow::to_bytes(&rows);
-        buf[follow_rows as usize..follow_rows as usize + row_bytes.len()]
-            .copy_from_slice(&row_bytes);
-        end = follow_rows + row_bytes.len() as u64;
-        // The rows of the newest tokens, for link 0, in the order of its rows;
-        // the host stages them when the device does not keep every row.
-        let newest_at = end.next_multiple_of(16);
-        m.newest = match &self.embed {
-            Some(host) => {
-                let size = host.row_bytes();
-                let rows = order.iter().map(|&c| step.chains[c].token);
-                if newest_at + order.len() as u64 * size as u64 > capacity {
-                    return Err(full());
-                }
-                for (i, token) in rows.enumerate() {
-                    if let Some(row) = host.table().row(token) {
-                        let at = newest_at as usize + i * size;
-                        buf[at..at + size].copy_from_slice(row);
-                    }
-                }
-                end = newest_at + order.len() as u64 * size as u64;
-                m.records.ptr().offset(newest_at)
-            }
-            None => DevicePtr::NULL,
-        };
-        m.follow_rows = follow_rows;
-        m.drafted = total;
-        m.made = links.len() as u32;
-        m.layout.clear();
-        // SAFETY: the pinned buffer is not written again before the next
-        // step's records, which are written after this step has run; the
-        // device buffer has its size.
-        unsafe { stream.copy_from_host(m.records.ptr(), m.host.as_ptr(), end as usize)? };
-        if links.is_empty() {
-            return Ok(());
-        }
-
-        m.clock.chain[0].record(stream)?;
-        m.clock.chain_pending = true;
-        m.clock.links = links.len() as u64;
-        let rec = |at: u64| m.records.ptr().offset(at);
-        // SAFETY: the carry holds a row 0 for every slot and the chain's
-        // scratch a row of `d` values per chain.
-        unsafe {
-            m.sampler.gather_hidden(
-                stream,
-                m.at(m.s.h),
-                m.carry.ptr(),
-                rec(carry_index),
-                links[0].n,
-                self.d,
-            )?;
-        }
-        // The reach of each chain, in the order of the links' rows: the
-        // product of the chances of its drafts, as far as the host has read
-        // their picks.
-        let mut reach = vec![1.0f64; order.len()];
-        let lowest = step.chances.map(|c| f64::from(c.iter().copied().fold(1.0, f32::min)));
-        let pick_bytes = SamplePick::BYTES;
-        let mut read = 0;
-        for (j, link) in links.iter().enumerate() {
-            let next_tokens = links.get(j + 1).map_or(DevicePtr::NULL, |next| rec(next.tokens));
-            self.mtp_link(env, m, j as u32, link, step.tokens, next_tokens)?;
-            let at = j * m.max_chains as usize * pick_bytes;
-            // SAFETY: the host's buffer holds a record for every row of every
-            // link, like the device's, and is read when the copy has run.
-            unsafe {
-                stream.copy_to_host(
-                    m.picks_host.as_mut_ptr().add(at),
-                    m.at(m.s.picks + at as u64),
-                    link.n as usize * pick_bytes,
-                )?;
-            }
-            m.layout.extend(
-                (0..link.n).map(|row| (j as u32, row, first[order[row as usize]] + j as u32)),
-            );
-            let (Some(next), Some(chances), Some(lowest)) =
-                (links.get(j + 1), &step.chances, lowest)
-            else {
-                continue;
-            };
-            // The next link is made while a chain that has it reaches its
-            // bar. Whether one can miss it is known without the picks when
-            // even the least chance for every link not read yet leaves the
-            // reach above the bar: then nothing is waited for.
-            let need = |row: usize| {
-                f64::from(step.chains[order[row]].needs.get(j + 1).copied().unwrap_or(0.0))
-            };
-            let least = lowest.powi((j + 1 - read) as i32);
-            if (0..next.n as usize).any(|row| reach[row] * least >= need(row)) {
-                continue;
-            }
-            m.picked.record(stream)?;
-            m.picked.synchronize()?;
-            for (k, link) in links.iter().enumerate().take(j + 1).skip(read) {
-                for (row, reach) in reach.iter_mut().enumerate().take(link.n as usize) {
-                    *reach *= f64::from(draft_chance(chances, m.confidence(k as u32, row as u32)));
-                }
-            }
-            read = j + 1;
-            if (0..next.n as usize).all(|row| reach[row] < need(row)) {
-                m.made = j as u32 + 1;
-                break;
-            }
-        }
-        // The rows of the links that were not made take the last draft of
-        // their chain again: a token the device has the embedding of. The
-        // host is told that they are no drafts.
-        let last = m.made as usize - 1;
-        for dead in &links[m.made as usize..] {
-            // SAFETY: as in `mtp_link`; the picks of link `last` hold a
-            // record for each of the chains that are longer.
-            unsafe {
-                m.sampler.draft_put(
-                    stream,
-                    m.at(m.s.picks + (last * m.max_chains as usize * pick_bytes) as u64),
-                    dead.n,
-                    DevicePtr::NULL,
-                    0,
-                    step.tokens,
-                    rec(dead.record_rows),
-                    m.at(m.s.drafts),
-                    rec(dead.draft_at),
-                )?;
-            }
-        }
-        m.clock.links = u64::from(m.made);
-        m.clock.chain[1].record(stream)?;
-        self.mark(stream, Phase::Other)
-    }
-
-    /// Enqueues link `j`: the block on the rows of the link, the draft head,
-    /// the picks, and the picks to where they are read.
-    fn mtp_link(
-        &mut self,
-        env: &StepEnv<'_>,
-        m: &Mtp,
-        j: u32,
-        link: &Link,
-        record_tokens: DevicePtr,
-        next_tokens: DevicePtr,
-    ) -> Result<(), ModelError> {
-        let (stream, n, d, eps) = (env.stream, link.n, self.d, self.eps);
-        let w = &m.w;
-        let MixerW::Attention(a) = &w.block.mixer else { return Err(invalid("draft attention")) };
-        let ffn = w.block.ffn.as_ref().ok_or_else(|| invalid("draft ffn"))?;
-        // Link 0 embeds the newest tokens, whose rows the host staged; the
-        // others embed the picks of the link before, which the device keeps.
-        let source = self
-            .w
-            .embed_rows(if j == 0 { m.newest } else { DevicePtr::NULL })
-            .ok_or_else(|| invalid("the MTP block's device does not embed"))?;
-        let attention = self.attention.clone().ok_or_else(|| invalid("attention kernels"))?;
-        let geo = m.at.geo;
-        let s = m.s;
-        let rows = u64::from(m.max_chains);
-        let rec = m.records.ptr();
-        let step = rec.offset(link.record);
-        let (e, x, xn, p) = (m.at(s.e), m.at(s.x), m.at(s.xn), m.at(s.p));
-        // Link 0 reads the hidden states gathered from the carries, link j the
-        // output of the link before.
-        let out_of = |link: u32| m.at(s.out + u64::from(link) * rows * u64::from(d) * 4);
-        let h = if j == 0 { m.at(s.h) } else { out_of(j - 1) };
-        let out = out_of(j);
-        let picks = m.at(s.picks + u64::from(j) * rows * SamplePick::BYTES as u64);
-        let pool = env.pages.offset(m.at.pool);
-        let (tables, exact) = (m.kv.table(env.tables), exact_pool(m));
-        let shape = AttentionShape { n_head: a.n_head, n_kv_head: a.n_kv, head_dim: geo.head_dim };
-        let inner = ffn.gate.n_out;
-        // SAFETY: the chain's scratch holds `max_chains` rows of every buffer
-        // and `n` is at most that; the records hold what `mtp_chains` wrote
-        // for this link; weights, tables and pool as in `Part::attend`.
-        unsafe {
-            let plan = link.plan.on_device(rec.offset(link.plan_at));
-            self.layers.embed_gather(stream, step, link.dims, &source, e)?;
-            // x = proj_e e' + proj_h h'
-            self.kernels.rms_norm_f32(stream, e, self.w.at(w.enorm), xn, d, n, eps)?;
-            self.prepare(stream, xn, d, n, &[&w.proj_e], Prepared::default())?;
-            self.product(stream, &w.proj_e, n, x)?;
-            self.kernels.rms_norm_f32(stream, h, self.w.at(w.hnorm), xn, d, n, eps)?;
-            self.prepare(stream, xn, d, n, &[&w.proj_h], Prepared::default())?;
-            self.product(stream, &w.proj_h, n, p)?;
-            self.kernels.add_f32(stream, x, p, n * d)?;
-            // Attention over the block's own keys and values.
-            self.kernels.rms_norm_f32(stream, x, self.w.at(w.block.attn_norm), xn, d, n, eps)?;
-            self.prepare(stream, xn, d, n, &[&a.q, &a.k, &a.v], Prepared::default())?;
-            self.product(stream, &a.q, n, m.at(s.qg))?;
-            self.product(stream, &a.k, n, m.at(s.k_raw))?;
-            self.product(stream, &a.v, n, m.at(s.v))?;
-            self.layers.rope_table(stream, step, link.dims, m.at(s.rope), self.rope)?;
-            self.layers.attn_prep(
-                stream,
-                step,
-                link.dims,
-                shape,
-                self.rope.dim,
-                eps,
-                m.at(s.qg),
-                m.at(s.k_raw),
-                self.w.at(a.q_norm),
-                self.w.at(a.k_norm),
-                m.at(s.rope),
-                m.at(s.q),
-                Some(m.at(s.gate)),
-                m.at(s.k),
-            )?;
-            attention.append(
-                stream,
-                &geo,
-                plan.rows(),
-                n,
-                m.at(s.k),
-                m.at(s.v),
-                tables,
-                exact,
-                pool,
-                self.at(self.s.status),
-            )?;
-            attention.attend(
-                stream,
-                &geo,
-                &plan,
-                &AttendBuffers {
-                    tables,
-                    exact_pool: exact,
-                    converted_pool: pool,
-                    q: m.at(s.q),
-                    gate: Some(m.at(s.gate)),
-                    out: m.at(s.o),
-                    scratch: self.at(self.s.attn_state),
-                },
-                1.0 / (self.attn_head_dim as f32).sqrt(),
-            )?;
-            self.prepare(stream, m.at(s.o), a.out.n_in, n, &[&a.out], Prepared::default())?;
-            self.product(stream, &a.out, n, p)?;
-            self.kernels.add_f32(stream, x, p, n * d)?;
-            // The feed-forward part.
-            self.kernels.rms_norm_f32(stream, x, self.w.at(w.block.post_norm), xn, d, n, eps)?;
-            self.prepare(stream, xn, d, n, &[&ffn.gate, &ffn.up], Prepared::default())?;
-            self.product(stream, &ffn.gate, n, m.at(s.g1))?;
-            self.product(stream, &ffn.up, n, m.at(s.g2))?;
-            self.swiglu(stream, m.at(s.g1), m.at(s.g2), inner, n, &ffn.down)?;
-            self.product(stream, &ffn.down, n, p)?;
-            self.kernels.add_f32(stream, x, p, n * d)?;
-            // The output, the draft head and the picks.
-            self.kernels.rms_norm_f32(stream, x, self.w.at(w.head_norm), out, d, n, eps)?;
-            self.prepare(stream, out, d, n, &[&w.head], Prepared::default())?;
-            self.product(stream, &w.head, n, m.at(s.logits))?;
-            let batch = SampleBatch {
-                logits: m.at(s.logits),
-                stride: w.head.n_out,
-                n_rows: n,
-                capacity: m.max_chains,
-                n_local: w.head.n_out,
-                tokens: m.head_tokens,
-                first: 0,
-                // A draft is picked from the logits as they are: no corrections,
-                // masks or probabilities (see `SampleRow::for_draft`).
-                inverse: DevicePtr::NULL,
-                vocab: 0,
-                params: rec.offset(link.params),
-                entries: DevicePtr::NULL,
-                masks: DevicePtr::NULL,
-                mask_words: 0,
-                out: picks,
-                logprobs: DevicePtr::NULL,
-                scratch: m.at(s.sampler),
-                exchange: m.at(s.exchange),
-                devices: 1,
-                rank: 0,
-            };
-            m.sampler.sample(stream, &batch, link.sample, |_, _| Ok::<(), ares_cuda::Error>(()))?;
-            m.sampler.draft_put(
-                stream,
-                picks,
-                n,
-                next_tokens,
-                link.n_next,
-                record_tokens,
-                rec.offset(link.record_rows),
-                m.at(s.drafts),
-                rec.offset(link.draft_at),
-            )?;
-        }
-        Ok(())
-    }
-
-    /// The block's keys and values of the step's rows from the final hidden
-    /// states in the step's `xn`, and those hidden states into the carries.
-    fn mtp_follow(&mut self, env: &StepEnv<'_>, m: &Mtp) -> Result<(), ModelError> {
-        let (stream, dims, n, d, eps) = (env.stream, env.dims, env.dims.n_rows, self.d, self.eps);
-        let w = &m.w;
-        let MixerW::Attention(a) = &w.block.mixer else { return Err(invalid("draft attention")) };
-        let source = self.embed_rows()?;
-        let attention = self.attention.clone().ok_or_else(|| invalid("attention kernels"))?;
-        let geo = m.at.geo;
-        let s = self.s;
-        let (x, xn, p) = (self.at(s.x), self.at(s.xn), self.at(s.p));
-        let (k_raw, k, v) = (self.at(s.w2), self.at(s.k), self.at(s.v));
-        // Only the keys are wanted of what prepares attention's inputs: the
-        // queries it computes next to them come from, and go to, memory
-        // nothing reads.
-        let shape = AttentionShape { n_head: a.n_kv, n_kv_head: a.n_kv, head_dim: geo.head_dim };
-        // SAFETY: after the model's blocks and its head the step's scratch is
-        // free; its buffers hold the step's rows of `d` values and of all KV
-        // heads of the block (`Part::open` sized them for it); `xn` holds the
-        // final hidden states. Weights, tables and pool as in `Part::attend`.
-        unsafe {
-            // The hidden state of the position before each row, then this
-            // step's into the carries.
-            m.sampler.shift_hidden(
-                stream,
-                env.step,
-                dims.n_segs,
-                dims.max_seg_rows,
-                xn,
-                m.carry.ptr(),
-                m.carry_rows,
-                x,
-                d,
-            )?;
-            m.sampler.keep_hidden(
-                stream,
-                env.step,
-                dims.n_segs,
-                dims.max_seg_rows,
-                xn,
-                m.carry.ptr(),
-                m.carry_rows,
-                d,
-            )?;
-            self.layers.embed_gather(stream, env.step, dims, &source, p)?;
-            self.kernels.rms_norm_f32(stream, p, self.w.at(w.enorm), xn, d, n, eps)?;
-            self.prepare(stream, xn, d, n, &[&w.proj_e], Prepared::default())?;
-            self.product(stream, &w.proj_e, n, p)?;
-            self.kernels.rms_norm_f32(stream, x, self.w.at(w.hnorm), xn, d, n, eps)?;
-            self.prepare(stream, xn, d, n, &[&w.proj_h], Prepared::default())?;
-            self.product(stream, &w.proj_h, n, x)?;
-            self.kernels.add_f32(stream, x, p, n * d)?;
-            self.kernels.rms_norm_f32(stream, x, self.w.at(w.block.attn_norm), xn, d, n, eps)?;
-            self.prepare(stream, xn, d, n, &[&a.k, &a.v], Prepared::default())?;
-            self.product(stream, &a.k, n, k_raw)?;
-            self.product(stream, &a.v, n, v)?;
-            self.layers.rope_table(stream, env.step, dims, self.at(s.rope), self.rope)?;
-            self.layers.attn_prep(
-                stream,
-                env.step,
-                dims,
-                shape,
-                self.rope.dim,
-                eps,
-                self.at(s.w1),
-                k_raw,
-                self.w.at(a.q_norm),
-                self.w.at(a.k_norm),
-                self.at(s.rope),
-                self.at(s.q),
-                None,
-                k,
-            )?;
-            // The rows of a replay have their cells in the pool already.
-            m.kv.append(
-                &attention,
-                stream,
-                &m.at,
-                m.records.ptr().offset(m.follow_rows),
-                k,
-                v,
-                env.tables,
-                env.pages,
-                self.at(s.status),
-                env.replay,
-                0,
-                n,
-            )?;
-        }
+        self.mtp_before(env, false)?;
+        let bytes: Vec<u8> = hidden.iter().flat_map(|v| v.to_le_bytes()).collect();
+        env.stream.synchronize()?;
+        self.scratch.write(self.s.xn, &bytes)?;
         Ok(())
     }
 
     /// Adds the MTP block's events of the last step to its times.
     pub(super) fn mtp_flush(&mut self) -> Result<(), ModelError> {
         match &mut self.mtp {
-            Some(m) => m.flush_clock(),
+            Some(m) => m.driver.chain_ms().map(|_| ()),
             None => Ok(()),
         }
     }

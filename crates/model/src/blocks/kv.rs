@@ -353,6 +353,21 @@ impl Group {
         }
     }
 
+    /// Whether a row of the sequence in `slot` that writes cell `cell` would
+    /// write into a tile the group holds converted: a tile the sequence filled
+    /// before (the cell is not the tile's first) whose page has no exact
+    /// entry, because it was cached and another sequence went past it or the
+    /// pool needed room. Such a tile is not written again: its other cells
+    /// exist only in the converted entry. `conductor` is the conductor's
+    /// table, `stride` entries per slot.
+    pub(crate) fn writes_converted(&self, slot: u32, cell: u32, conductor: &[u32]) -> bool {
+        if !self.has_exact() || cell.is_multiple_of(ENTRY_CELLS) {
+            return false;
+        }
+        let at = (slot * self.stride + cell / ENTRY_CELLS) as usize;
+        conductor.get(at).is_some_and(|entry| self.exact_slot(entry & !PAGE_ENTRY).is_none())
+    }
+
     /// The tile that the rows of the draft window of `slot` read converted
     /// from a position inside the window on, in the step last prepared, while
     /// the group's table names its exact entry.

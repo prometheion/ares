@@ -138,7 +138,7 @@ impl Part {
         let mut groups =
             vec![PageGroup { group: &mut self.kv, pages, kernels, status, lags: false }];
         if let Some(m) = &mut self.mtp {
-            groups.push(PageGroup { group: &mut m.kv, pages, kernels, status, lags: false });
+            groups.push(PageGroup { group: &mut m.layer.kv, pages, kernels, status, lags: false });
         }
         Ok(Pages { groups, arrays: Vec::new(), count: self.n_pages })
     }

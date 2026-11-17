@@ -578,7 +578,7 @@ struct Tables {
     output_norm: u64,
     head: Option<HeadW>,
     head_tokens: Option<u64>,
-    draft: Option<MtpW>,
+    mtp: Option<MtpW>,
     draft_head: Option<Mat>,
 }
 
@@ -596,7 +596,7 @@ pub(crate) struct DeviceWeights {
     /// the head: the offset of the list in the arena.
     pub head_tokens: Option<u64>,
     /// The MTP block, on the device that holds it.
-    pub draft: Option<MtpW>,
+    pub mtp: Option<MtpW>,
     /// The draft head (the first rows of the output head here), on the device
     /// of the draft plan, for the MTP block or a drafter from a file.
     pub draft_head: Option<Mat>,
@@ -666,7 +666,7 @@ impl DeviceWeights {
         let Layout { len, mut chooser, ranges, .. } = layout;
         chooser.decide(len, balance.map(|b| (b, index)))?;
         let mut layout = Layout { items: Vec::new(), len: 0, chooser, model, normed, ranges };
-        let Tables { blocks, embedding, output_norm, head, head_tokens, draft, draft_head } =
+        let Tables { blocks, embedding, output_norm, head, head_tokens, mtp, draft_head } =
             tables(&mut layout, c, w, plan, draft, index)?;
         let Layout { items, len, chooser, .. } = layout;
         let layouts = chooser.finish();
@@ -732,7 +732,7 @@ impl DeviceWeights {
             output_norm,
             head,
             head_tokens,
-            draft,
+            mtp,
             draft_head,
             upload: begun.elapsed(),
             layouts,
@@ -849,11 +849,11 @@ fn tables<'g>(
         (Some(plan), Some(head)) => Some(draft_head_of(plan, head)?),
         _ => None,
     };
-    let draft = match (own_mtp, &head) {
+    let mtp = match (own_mtp, &head) {
         (Some(plan), Some(head)) => Some(mtp(layout, c, w, plan, head)?),
         _ => None,
     };
-    Ok(Tables { blocks, embedding, output_norm, head, head_tokens, draft, draft_head })
+    Ok(Tables { blocks, embedding, output_norm, head, head_tokens, mtp, draft_head })
 }
 
 /// Lays out the rows of the output head `m` that a device holds ([`head_parts`]),

@@ -1423,8 +1423,8 @@ fn load_qwen35(
     for ((h, report), f) in held.iter().zip(model.reports()).zip(&footprint) {
         let state = report.state_bytes_per_slot * u64::from(parallel);
         let kv_bytes = report.page_bytes * u64::from(pages);
-        let draft = report.draft.as_ref().map_or(0, |d| d.carry + d.scratch + d.records);
-        let exact = report.exact_bytes + report.draft.as_ref().map_or(0, |d| d.exact);
+        let draft = report.mtp.as_ref().map_or(0, |d| d.carry + d.scratch + d.records);
+        let exact = report.exact_bytes + report.mtp.as_ref().map_or(0, |d| d.exact);
         let known = report.weight_bytes
             + state
             + kv_bytes
@@ -1443,7 +1443,7 @@ fn load_qwen35(
             Bytes(report.weight_bytes),
             report.upload.as_secs_f64(),
             report
-                .draft
+                .mtp
                 .as_ref()
                 .map(|d| format!(" (of which the MTP block {})", Bytes(d.weights)))
                 .unwrap_or_default(),

@@ -70,7 +70,7 @@ pub struct PartReport {
     /// tile mean: the second, small pool.
     pub exact_bytes: u64,
     /// What the model's MTP block takes, on the device that holds it.
-    pub draft: Option<MtpBytes>,
+    pub mtp: Option<MtpBytes>,
     /// Where the token embedding lies and what it takes.
     pub embedding: EmbeddingReport,
     /// Which weight matrices got which layout, and what the choice took.
@@ -478,7 +478,7 @@ impl Model for Qwen35 {
             kept_bytes: part.kept_bytes(),
             page_bytes: part.page_bytes(),
             exact_bytes: part.exact_bytes(),
-            draft: part.draft_bytes(),
+            mtp: part.mtp_bytes(),
             embedding: part.embedding_report(),
             layouts: part.layouts().clone(),
             ledger: cx.ledger.entries().map(|(name, bytes)| (name.to_owned(), bytes)).collect(),
@@ -599,6 +599,9 @@ impl DeviceModel for Qwen35Device {
         if let Some((offset, dims)) = record.commit_record() {
             self.part.enqueue_commit(step.stream, step.record_on_device.offset(offset), dims)?;
         }
+        // The MTP block follows the rows of the last step that count, before
+        // the copies take its cells.
+        self.part.mtp_follow(step.stream, step.tables, step.pages)?;
         self.part.enqueue_copies(step.stream, step.pages, record)?;
         self.tokens.clear();
         self.tokens.extend((0..record.rows()).map(|i| record.row(i).token));

@@ -153,8 +153,10 @@ impl Rig {
         (record, u64::from(off_tokens))
     }
 
-    /// Follows `tokens` from `pos0` with `hidden` as the model's final hidden
-    /// states of those rows; `direct` as the segment would be in a step.
+    /// A step of `tokens` from `pos0` whose final hidden states are `hidden`;
+    /// `direct` as the segment would be in a step. The MTP block follows the
+    /// rows of a direct step at once (as the next step would); a window's
+    /// rows wait for [`Rig::commit`].
     fn follow(&mut self, pos0: u32, tokens: &[u32], hidden: &[f32], direct: bool) {
         let segment =
             Segment { row0: 0, n_rows: tokens.len() as u32, slot: 0, pos0: pos0 as i32, direct };
@@ -171,8 +173,18 @@ impl Rig {
             exchange: None,
             replay: &[],
         };
-        self.part.enqueue_mtp(&env).unwrap();
-        self.part.enqueue_follow(&env, hidden).unwrap();
+        self.part.enqueue_mtp_step(&env, hidden).unwrap();
+        if direct {
+            self.part.mtp_follow(&self.stream, self.tables.ptr(), self.pages.ptr()).unwrap();
+        }
+        self.stream.synchronize().unwrap();
+    }
+
+    /// The outcome of the last step's window: `accepted` rows count, and the
+    /// MTP block follows them.
+    fn commit(&mut self, accepted: u32) {
+        self.part.commit_windows([(0, accepted)]);
+        self.part.mtp_follow(&self.stream, self.tables.ptr(), self.pages.ptr()).unwrap();
         self.stream.synchronize().unwrap();
     }
 
@@ -211,7 +223,7 @@ impl Rig {
                 chances: None,
             })
             .unwrap();
-        self.part.enqueue_mtp(&env).unwrap();
+        self.part.enqueue_chains(&env).unwrap();
         self.stream.synchronize().unwrap();
         self.part.flush_profile().unwrap();
 
@@ -335,7 +347,7 @@ fn the_mtp_block_on_the_device_drafts_what_the_reference_drafts() {
             ..Options::default()
         };
         let mut rig = Rig::open(&device, &config, &weights, &placement, &opts);
-        let bytes = rig.part.draft_bytes().unwrap();
+        let bytes = rig.part.mtp_bytes().unwrap();
         println!(
             "{precision:?}: the part holds {:.1} MiB of weights (kept embedding rows, head, MTP block); the \
              MTP block: weights {:.1} MiB, K/V {:.3} MiB per 1000 tokens, kept hidden states \
@@ -374,21 +386,10 @@ fn the_mtp_block_on_the_device_drafts_what_the_reference_drafts() {
                     // The window: the newest token and four more, all accepted.
                     let window_hidden = &h_steps[..WINDOW * d];
                     rig.follow(n as u32, &generated[..WINDOW], window_hidden, false);
-                    // Its commit: the hidden state of the last accepted row
-                    // is the one the next chain starts from.
-                    let segment = Segment {
-                        row0: 0,
-                        n_rows: WINDOW as u32,
-                        slot: 0,
-                        pos0: n as i32,
-                        direct: false,
-                    };
-                    let mut record =
-                        StepRecord::new(&[segment], &generated[..WINDOW], None, &[]).unwrap();
-                    record.set_accepted(0, WINDOW as u32).unwrap();
-                    rig.record.write(0, record.as_bytes()).unwrap();
-                    rig.part.commit_mtp(&rig.stream, rig.record.ptr(), record.dims()).unwrap();
-                    rig.stream.synchronize().unwrap();
+                    // Its outcome: the block follows the accepted rows, and the
+                    // hidden state of the last is the one the next chain starts
+                    // from.
+                    rig.commit(WINDOW as u32);
                 }
                 let want = &wanted[round];
                 let got = rig.chain(pos0 as u32, token, &greedy);

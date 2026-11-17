@@ -496,6 +496,9 @@ pub struct Part {
     rec: Recurrent,
     /// The step whose deferred segments wait for their commit.
     has_deferred: bool,
+    /// The outcome of the last step's draft windows, as (slot, rows that
+    /// count), until the MTP block has followed that step.
+    outcomes: Vec<(u32, u32)>,
     /// Whether every row of the step being enqueued is generated: a single
     /// row or a row of a draft window, none of a prompt.
     generating: bool,
@@ -912,14 +915,15 @@ impl Part {
             mtp::Setup { max_slots, pages, table_stride, main_exact: exact_slots > 0 },
             mtp_sizes,
             mtp_growth,
+            embed.as_ref().map(|stage| stage.table().clone()),
         )?;
         let dflash = dflash::open(c, weights, placement, opts, index, device, ledger, max_slots)?;
         // A checkpoint is the slot's recurrent state and, where the draft
         // block is, one row of its carry.
         let mut checkpoint = Checkpoint { extents: vec![state.extent()], host: 0 };
         if let Some(m) = &mtp {
-            let (base, rows) = m.carry();
-            checkpoint.extents.push(Extent { base, stride: u64::from(rows) * d * 4, bytes: d * 4 });
+            let base = m.driver.carry().ptr();
+            checkpoint.extents.push(Extent { base, stride: d * 4, bytes: d * 4 });
         }
         let places =
             Places::new(device, ram, checkpoint.bytes(), checkpoints, opts.profile.is_some())?;
@@ -954,6 +958,7 @@ impl Part {
             n_pages: pages,
             rec,
             has_deferred: false,
+            outcomes: Vec::new(),
             generating: false,
             table_stride,
             max_slots,
@@ -1028,7 +1033,7 @@ impl Part {
     /// The exact slots of the attention blocks and of the MTP block: how many
     /// there are and how many hold a page now.
     pub fn exact_slots(&self) -> [(u32, u32); 2] {
-        [self.kv.slots(), self.mtp.as_ref().map_or((0, 0), |m| m.kv.slots())]
+        [self.kv.slots(), self.mtp.as_ref().map_or((0, 0), |m| m.layer.kv.slots())]
     }
 
     /// Logits per row this part produces: its slice of the vocabulary.
@@ -1674,15 +1679,17 @@ impl Part {
         let (stream, tables, pages) = (env.stream, env.tables, env.pages);
         if let Some(m) = &mut self.mtp {
             // The MTP block attends a link at a time: no window reads its tiles.
-            m.kv.prepare(kernels, stream, reaches, &self.page_tab, tables, pages, status, false)?;
+            let kv = &mut m.layer.kv;
+            kv.prepare(kernels, stream, reaches, &self.page_tab, tables, pages, status, false)?;
         }
         Ok(())
     }
 
-    /// A step that only drafts: the chains of the MTP block for the windows
-    /// of [`Part::mtp_step`], and nothing of the model. The block's cells of
-    /// the chain are provisional as in any step; the round that verifies the
-    /// drafts writes them from the model's hidden states.
+    /// A step that only drafts: the MTP block follows the last step, and
+    /// makes the chains for the windows of [`Part::mtp_step`]; nothing of the
+    /// model runs. The cells of links after the first are provisional; the
+    /// step after the round that verifies the drafts writes them from the
+    /// model's hidden states.
     pub fn enqueue_chains(&mut self, env: &StepEnv<'_>) -> Result<(), ModelError> {
         self.check(env)?;
         if self.has_deferred {
@@ -1690,9 +1697,10 @@ impl Part {
                 "the draft windows of the last step were not committed before this step",
             ));
         }
+        self.mtp_follow(env.stream, env.tables, env.pages)?;
         let reaches = kv::reaches(env.segments, env.replay);
         self.prepare_mtp_kv(env, &reaches)?;
-        self.mtp_before(env)
+        self.mtp_before(env, true)
     }
 
     /// Tells the part that the pool freed these pages, so it gives back what
@@ -1700,18 +1708,20 @@ impl Part {
     pub fn release_pages(&mut self, pages: impl IntoIterator<Item = u32> + Clone) {
         self.kv.release(pages.clone());
         if let Some(m) = &mut self.mtp {
-            m.kv.release(pages);
+            m.layer.kv.release(pages);
         }
     }
 
     /// Tells the part how the draft windows of the last step ended: for each,
-    /// the slot and the cells of its sequence that are settled now.
+    /// the slot and the rows of its window that count. The cells of its
+    /// sequence up to them are settled, and the MTP block follows those rows.
     pub fn commit_windows(&mut self, accepted: impl IntoIterator<Item = (u32, u32)>) {
         let accepted: Vec<(u32, u32)> = accepted.into_iter().collect();
         self.kv.commit_windows(&accepted, &self.page_tab);
         if let Some(m) = &mut self.mtp {
-            m.kv.commit_windows(&accepted, &self.page_tab);
+            m.layer.kv.commit_windows(&accepted, &self.page_tab);
         }
+        self.outcomes = accepted;
     }
 
     /// Cuts a step into groups of rows, which a layer split hands over one by
@@ -1797,13 +1807,16 @@ impl Part {
     /// before), this device's blocks, and the head or the hand-over to the
     /// next device. Returns where the logits of the wanted rows will be.
     pub fn enqueue(&mut self, env: &StepEnv<'_>) -> Result<Option<Logits>, ModelError> {
+        // The MTP block follows the last step before anything of this one
+        // converts the tiles it writes.
+        self.mtp_follow(env.stream, env.tables, env.pages)?;
         self.begin(env)?;
         self.dflash_begin(env)?;
         self.start_sequences(env)?;
         self.stage_embedding(env)?;
-        // The MTP block's chains come first: the rows that verify their
-        // drafts read them from the step record.
-        self.mtp_before(env)?;
+        // The MTP block's newest cells and chains come first: the rows that
+        // verify drafts read them from the step record.
+        self.mtp_before(env, false)?;
         if self.split == Split::Tensor {
             self.enqueue_tensor(env)?;
         } else if self.groups.is_empty() {
@@ -1901,7 +1914,6 @@ impl Part {
         if !std::mem::take(&mut self.has_deferred) {
             return Err(invalid("there is no draft window to commit"));
         }
-        self.mtp_commit(stream, step, dims)?;
         for (block, at) in self.w.blocks.iter().zip(&self.recurrent_at) {
             let (MixerW::Recurrent(r), Some(at)) = (&block.mixer, at) else { continue };
             // (A part without recurrent blocks keeps no inputs and has

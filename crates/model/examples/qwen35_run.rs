@@ -716,7 +716,7 @@ fn main() {
             report.upload.as_secs_f64(),
             report.state_bytes_per_slot as f64 / MIB,
             report.page_bytes as f64 / 128.0 * 1000.0 / MIB,
-            (report.exact_bytes + report.draft.as_ref().map_or(0, |d| d.exact)) as f64 / MIB,
+            (report.exact_bytes + report.mtp.as_ref().map_or(0, |d| d.exact)) as f64 / MIB,
             report.scratch_bytes as f64 / MIB,
             (*before - free) as f64 / MIB,
             (memory.total - free) as f64 / MIB,
@@ -1003,7 +1003,7 @@ fn engine(args: &Args, spread: &Spread, window: u32) {
         print_embedding(report);
         print_ledger(report, memory.total - memory.free, taken);
         print_layouts(report, args.show_layouts);
-        if let Some(d) = &report.draft {
+        if let Some(d) = &report.mtp {
             println!(
                 "RES device {} MTP block: weights {:.1} MiB, K/V {:.3} MiB per 1000 tokens, exact \
                  K/V entries {:.2} MiB, kept hidden states {:.2} MiB, chain scratch {:.2} MiB, \

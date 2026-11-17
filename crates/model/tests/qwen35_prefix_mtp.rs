@@ -115,8 +115,9 @@ impl Rig {
         (record, u64::from(off_tokens))
     }
 
-    /// Follows `tokens` from `pos0` in `slot` with `hidden` as the model's final
-    /// hidden states of those rows; the rows are a replay if `replay`.
+    /// A step of `tokens` from `pos0` in `slot` whose final hidden states are
+    /// `hidden`, which the MTP block then follows as the next step would; the
+    /// rows are a replay if `replay`.
     fn follow(&mut self, slot: u32, pos0: u32, tokens: &[u32], hidden: &[f32], replay: bool) {
         let n = tokens.len() as u32;
         let segment = Segment { row0: 0, n_rows: n, slot, pos0: pos0 as i32, direct: true };
@@ -135,8 +136,8 @@ impl Rig {
             exchange: None,
             replay: &rows,
         };
-        self.part.enqueue_mtp(&env).unwrap();
-        self.part.enqueue_follow(&env, hidden).unwrap();
+        self.part.enqueue_mtp_step(&env, hidden).unwrap();
+        self.part.mtp_follow(&self.stream, self.tables.ptr(), self.pages.ptr()).unwrap();
         self.stream.synchronize().unwrap();
     }
 
@@ -167,7 +168,7 @@ impl Rig {
                 chances: None,
             })
             .unwrap();
-        self.part.enqueue_mtp(&env).unwrap();
+        self.part.enqueue_chains(&env).unwrap();
         self.stream.synchronize().unwrap();
         let drafted = self.part.drafted().expect("the step drafted");
         let (scratch, _) = self.part.mtp_scratch(0).unwrap();
@@ -188,9 +189,9 @@ impl Rig {
 
     /// The carry row of `slot`.
     fn carry(&self, slot: u32) -> Vec<u8> {
-        let (carry, rows) = self.part.mtp_carry().expect("the part has the block");
+        let carry = self.part.mtp_carry().expect("the part has the block");
         let mut bytes = vec![0u8; self.d * 4];
-        carry.read(u64::from(slot) * u64::from(rows) * self.d as u64 * 4, &mut bytes).unwrap();
+        carry.read(u64::from(slot) * self.d as u64 * 4, &mut bytes).unwrap();
         bytes
     }
 
