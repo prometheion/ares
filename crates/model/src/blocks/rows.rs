@@ -42,7 +42,7 @@ pub(crate) const TOKEN_EMBD: &str = "token_embd.weight";
 /// The table as the file stores it: `n_vocab` rows of `n_embd` values of
 /// type `ty`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct TableShape {
+pub struct TableShape {
     pub ty: GgmlType,
     pub n_vocab: u32,
     pub n_embd: u32,
@@ -69,7 +69,7 @@ enum Home {
 }
 
 /// A token embedding table on the host, which the parts of one model share.
-pub(crate) struct HostTable {
+pub struct HostTable {
     shape: TableShape,
     home: Home,
 }

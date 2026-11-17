@@ -57,6 +57,21 @@ pub enum Error {
         /// The dimensions the configuration gives it.
         expected: Vec<u64>,
     },
+    /// A file given as the MTP block that is none.
+    #[error(
+        "the file is no MTP block of a qwen35 model: its architecture is '{found}', not \
+         'qwen35-mtp'"
+    )]
+    NotAnMtpFile {
+        /// The architecture the file names.
+        found: String,
+    },
+    /// An MTP block of another model.
+    #[error(
+        "the MTP block is of a model of {blocks} blocks (the block included) and width {width}; \
+         this model has {n_layer} blocks and width {n_embd}"
+    )]
+    MtpFileShape { blocks: u64, width: u64, n_layer: usize, n_embd: usize },
     /// A tensor in the file that the architecture has no use for.
     #[error("tensor '{name}' is in the file but is not part of the qwen35 architecture")]
     UnexpectedTensor {

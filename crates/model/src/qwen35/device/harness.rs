@@ -99,6 +99,7 @@ impl Harness {
                 table_stride,
                 checkpoints: 0,
                 ram: &ram,
+                table: None,
             },
         )?;
         let mut harness = Self {

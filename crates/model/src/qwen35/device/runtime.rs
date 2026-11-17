@@ -3,7 +3,7 @@
 //! [`DeviceModel`] that turns the runtime's step into the part's.
 
 use std::ops::Range;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ares_api::{ChatFormat, EngineError, ModelCard, Prompt};
@@ -18,13 +18,13 @@ use ares_state::PageLayout;
 use ares_tokenizer::{ChatOptions, Tokenizer};
 
 use super::choose::{Balance, LayoutReport};
-use super::load::table_shape;
+use super::load::{read_matrix, table_shape};
 use super::part::{
     Exchange, MTP_KV, MtpBytes, MtpChain, MtpStep, Options, PAGE_ENTRY, Part, PartSetup, StepEnv,
     TAILS_PER_SLOT, declared, page_bytes,
 };
 use super::placement::{HalfShares, Placement, PlacementError};
-use crate::blocks::rows::{EmbeddingReport, Stage};
+use crate::blocks::rows::{EmbeddingReport, HostTable, Stage};
 use crate::blocks::slots::{self, Declared};
 use crate::chat;
 use crate::dflash::PassSeq;
@@ -113,6 +113,10 @@ pub struct Qwen35 {
     /// The page-locked host memory the device that embeds holds for the token
     /// embedding: none when it keeps the whole table.
     pinned: u64,
+    /// The token embedding table in page-locked host memory, which the part
+    /// that embeds and the part of the MTP block share; read by the first
+    /// of them to open.
+    table: Mutex<Option<Arc<HostTable>>>,
 }
 
 impl std::fmt::Debug for Qwen35 {
@@ -140,6 +144,10 @@ impl Qwen35 {
         let config = Config::from_gguf(&gguf)?;
         let (placement, table) = {
             let weights = Weights::load(&gguf, &config)?;
+            let weights = match &options.mtp_file {
+                Some(file) => weights.with_mtp_file(file, &config)?,
+                None => weights,
+            };
             let table = table_shape(&weights.token_embd);
             let placement = match spread {
                 Spread::Single => Placement::single(&config),
@@ -151,16 +159,18 @@ impl Qwen35 {
             };
             (placement, table)
         };
-        // A model with a next-token-prediction block drafts with it wherever
-        // it can (and is asked to): when windows may carry drafts, and the
-        // device that embeds has the first rows of the head (not a layer
-        // split). A DFlash drafter needs the same device and head.
-        let drafts = options.window_rows > 1 && placement.split != Split::Layer;
-        let mtp = config.n_nextn == 1 && options.mtp;
+        // A model with an MTP block (in its file or a file of its own) drafts
+        // with it when it is asked to and windows may carry drafts, on the
+        // device with the first rows of the head: the one that embeds, or
+        // the last one of a layer split. A DFlash drafter reads taps of the
+        // model's layers on the device that embeds, which a layer split does
+        // not give it.
+        let drafts = options.window_rows > 1;
+        let mtp = (config.n_nextn == 1 || options.mtp_file.is_some()) && options.mtp;
         let vocabulary = options.draft_vocabulary.as_deref();
         let placement = if drafts && mtp {
             placement.with_mtp(&config, vocabulary)?
-        } else if drafts && options.dflash.is_some() {
+        } else if drafts && options.dflash.is_some() && placement.split != Split::Layer {
             placement.with_head_view(&config, vocabulary, false)?
         } else {
             placement
@@ -197,6 +207,7 @@ impl Qwen35 {
             reports: Mutex::new(Vec::new()),
             balance,
             pinned,
+            table: Mutex::new(None),
         })
     }
 
@@ -269,6 +280,14 @@ impl Qwen35 {
         let mut out = b"qwen35 state 1\0".to_vec();
         for part in 0..self.gguf.n_parts() {
             crate::files::identity(self.gguf.path(part as u16), &mut out);
+        }
+        if let Some(file) =
+            self.options.mtp_file.as_ref().filter(|_| self.placement.mtp().is_some())
+        {
+            out.extend_from_slice(b"mtp block\0");
+            for part in 0..file.n_parts() {
+                crate::files::identity(file.path(part as u16), &mut out);
+            }
         }
         let draft = self.placement.mtp().map(|draft| (draft.device, MTP_KV));
         let settings = format!(
@@ -446,8 +465,28 @@ impl Model for Qwen35 {
             )));
         }
         let weights = Weights::load(&self.gguf, &self.config)
+            .and_then(|w| match &self.options.mtp_file {
+                Some(file) => w.with_mtp_file(file, &self.config),
+                None => Ok(w),
+            })
             .map_err(|e| ModelError::Invalid(e.to_string()))?;
         let index = cx.index;
+        // The table on the host, for a part that stages the rows of a step or
+        // of the tokens its MTP block reads.
+        let plan = &self.placement.devices[index];
+        let mtp_here = self.placement.mtp().is_some_and(|d| d.device == index);
+        let table = if (plan.embedding || mtp_here) && self.placement.stages_rows(&self.config) {
+            let mut shared = self.table.lock().unwrap_or_else(|e| e.into_inner());
+            if shared.is_none() {
+                let m = &weights.token_embd;
+                let shape = table_shape(m);
+                let table = HostTable::pinned(cx.device, shape, |bytes| read_matrix(m, bytes))?;
+                *shared = Some(Arc::new(table));
+            }
+            shared.clone()
+        } else {
+            None
+        };
         let part = Part::open_balanced(
             &self.config,
             &weights,
@@ -463,6 +502,7 @@ impl Model for Qwen35 {
                 table_stride: cx.table_stride,
                 checkpoints: cx.checkpoints,
                 ram: cx.ram,
+                table,
             },
             self.balance.as_ref(),
         )?;

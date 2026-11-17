@@ -390,7 +390,12 @@ impl<'g> Weights<'g> {
             });
         }
 
-        if let Some(extra) = gguf.tensors().iter().find(|t| !loader.used.contains(&t.name)) {
+        // A file that carries the MTP block has its tensors besides the
+        // model's ([`MtpWeights`]).
+        let model = |name: &str| !name.starts_with(MTP_PREFIX);
+        if let Some(extra) =
+            gguf.tensors().iter().find(|t| model(&t.name) && !loader.used.contains(&t.name))
+        {
             return Err(Error::UnexpectedTensor { name: extra.name.clone() });
         }
         Ok(Self { token_embd, output, output_mixer, ngram_table, layers })
@@ -424,18 +429,24 @@ pub struct MtpWeights<'g> {
 /// Strata packs it: the checkpoint's tensor names under `mtp.`, norm weights
 /// as the checkpoint has them, gate and up of the routed experts in one tensor
 /// and the indexer's two projections in one.
-pub const DRAFT_ARCHITECTURE: &str = "qwen4exp-mtp";
+pub const MTP_ARCHITECTURE: &str = "qwen4exp-mtp";
+
+/// The names of the MTP block's tensors begin with this, in its own file and
+/// in a model file that carries it.
+const MTP_PREFIX: &str = "mtp.";
 
 impl<'g> MtpWeights<'g> {
     /// Builds the table from the tensors of `gguf`, a file of the architecture
-    /// [`DRAFT_ARCHITECTURE`], for the model `config` describes: every shape
-    /// must be that of the model's own attention layers.
+    /// [`MTP_ARCHITECTURE`] or a model file that carries its block (the same
+    /// tensors among the model's), for the model `config` describes: every
+    /// shape must be that of the model's own attention layers.
     pub fn load(gguf: &'g Gguf, config: &Config) -> Result<Self> {
         let found = gguf.architecture().unwrap_or_default();
-        if found != DRAFT_ARCHITECTURE {
+        let in_model = found == super::config::ARCHITECTURE;
+        if found != MTP_ARCHITECTURE && !in_model {
             return Err(Error::NotAnMtpBlock {
                 found: found.to_owned(),
-                expected: DRAFT_ARCHITECTURE,
+                expected: MTP_ARCHITECTURE,
             });
         }
         let mut loader = Loader { gguf, used: HashSet::new() };
@@ -514,7 +525,10 @@ impl<'g> MtpWeights<'g> {
             },
             output_mixer,
         };
-        if let Some(extra) = gguf.tensors().iter().find(|t| !loader.used.contains(&t.name)) {
+        let ours = |name: &str| !in_model || name.starts_with(MTP_PREFIX);
+        if let Some(extra) =
+            gguf.tensors().iter().find(|t| ours(&t.name) && !loader.used.contains(&t.name))
+        {
             return Err(Error::UnexpectedTensor { name: extra.name.clone() });
         }
         Ok(weights)

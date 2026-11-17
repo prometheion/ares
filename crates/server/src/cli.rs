@@ -133,9 +133,10 @@ OPTIONS:
                                       else runs in a step
                                [default: fast]
         --drafters <LIST>      The model drafters that take part, such as mtp (the
-                               model's own MTP block) or none; a file name is
-                               a drafter from a file of its own (a DFlash2
-                               drafter, or Flash-Next's MTP block). The
+                               MTP block in the model file) or none; a file
+                               name is a drafter from a file of its own, an
+                               MTP block or a DFlash2 drafter, by the
+                               architecture the file names. The
                                n-gram drafter takes part with them and
                                never alone; with none the
                                server does not speculate. The length of a draft
@@ -148,10 +149,10 @@ OPTIONS:
                                for them is VRAM (about 5 MiB a row for the 27B,
                                for every sequence) [default: 8, the rows one
                                launch of the few-row weight kernels takes]
-        --draft-vocab <FILE>   Token ids (one per line) the model's MTP block may
-                               propose: a shorter list makes a draft cheaper
-                               [default: every token whose head row is on the
-                               block's device]
+        --draft-vocab <FILE>   Token ids (one per line) the model drafters (mtp
+                               and dflash) may propose: a shorter list makes a
+                               draft cheaper [default: every token whose head
+                               row is on the drafters' device]
         --expert-prune <RULE:RANK>
                                For a mixture of experts: what a step does with a
                                pick whose expert only the SSD holds, from the RANK-th

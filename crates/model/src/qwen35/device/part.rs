@@ -115,6 +115,9 @@ pub struct Options {
     /// Whether the next-token-prediction block drafts, when the model has one
     /// and windows may carry drafts.
     pub mtp: bool,
+    /// The MTP block from a file of its own (architecture
+    /// [`crate::qwen35::MTP_ARCHITECTURE`]), in place of the model file's.
+    pub mtp_file: Option<Arc<ares_gguf::Gguf>>,
     /// A DFlash drafter from a file of its own: it drafts when windows may
     /// carry drafts, on the device that embeds (not under a layer split).
     pub dflash: Option<Arc<crate::dflash::File>>,
@@ -148,6 +151,7 @@ impl Default for Options {
             window_rows: 0,
             draft_vocabulary: None,
             mtp: true,
+            mtp_file: None,
             dflash: None,
             pipeline_rows: 256,
             profile: None,
@@ -316,6 +320,9 @@ pub struct PartSetup<'a> {
     /// they are first used.
     pub checkpoints: u32,
     pub ram: &'a PinnedRam,
+    /// The token embedding table on the host, which the parts of a model
+    /// share (`blocks/rows.rs`); `None` and a part that needs it reads one.
+    pub table: Option<Arc<HostTable>>,
 }
 
 /// One step, as a part needs it.
@@ -661,6 +668,7 @@ impl Part {
             table_stride,
             checkpoints,
             ram,
+            table,
         } = setup;
         let plan = placement
             .devices
@@ -792,11 +800,21 @@ impl Part {
         // The rows of the embedding table the host staged (`blocks/rows.rs`).
         // A part that stages none has no such buffer: nothing in front of the
         // others.
-        let embed = match &w.embedding {
-            Some(e) if e.stages() => {
+        // The table on the host is the model's, or read here when a part
+        // needs it alone: to stage the step's rows when it embeds, or the
+        // rows of the tokens the MTP block reads that it does not keep.
+        let needs_table = w.embedding.is_some_and(|e| e.stages());
+        let table = match (table, needs_table, &w.embedding) {
+            (Some(table), true, _) => Some(table),
+            (None, true, Some(e)) => {
                 let m = &weights.token_embd;
-                let table = HostTable::pinned(device, e.table, |bytes| read_matrix(m, bytes))?;
-                Some(Stage::new(device, std::sync::Arc::new(table), opts.max_rows)?)
+                Some(Arc::new(HostTable::pinned(device, e.table, |bytes| read_matrix(m, bytes))?))
+            }
+            _ => None,
+        };
+        let embed = match (&w.embedding, &table) {
+            (Some(e), Some(table)) if e.embeds => {
+                Some(Stage::new(device, table.clone(), opts.max_rows)?)
             }
             _ => None,
         };
@@ -915,7 +933,7 @@ impl Part {
             mtp::Setup { max_slots, pages, table_stride, main_exact: exact_slots > 0 },
             mtp_sizes,
             mtp_growth,
-            embed.as_ref().map(|stage| stage.table().clone()),
+            table,
         )?;
         let dflash = dflash::open(c, weights, placement, opts, index, device, ledger, max_slots)?;
         // A checkpoint is the slot's recurrent state and, where the draft
@@ -2001,7 +2019,7 @@ impl Part {
         let Some(e) = &self.w.embedding else { return EmbeddingReport::default() };
         let kept = e.kept;
         EmbeddingReport {
-            embeds: true,
+            embeds: e.embeds,
             table_bytes: e.table.bytes(),
             host_bytes: self.embed.as_ref().map_or(0, |s| s.locked() + s.table().locked()),
             kept_rows: kept.map_or(0, |k| k.rows.n_out),
@@ -2017,7 +2035,7 @@ impl Part {
     fn enqueue_input(&mut self, env: &StepEnv<'_>) -> Result<(), ModelError> {
         let (stream, dims) = (env.stream, env.dims);
         let x = self.at(self.s.x);
-        if self.w.embedding.is_some() {
+        if self.w.embedding.is_some_and(|e| e.embeds) {
             let source = self.embed_rows()?;
             // SAFETY: the kept rows are in the arena, the staged rows in the
             // scratch, `x` holds the step's rows; the spliced rows are the

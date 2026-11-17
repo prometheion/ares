@@ -117,28 +117,53 @@ pub(crate) fn mtp_takes_part(
     Ok(asked)
 }
 
-/// The drafter from a file of its own that `--drafters` names (DFlash2),
-/// opened and its shape read: one at most. A file that is not a drafter the
-/// engine runs is refused by what it is.
-pub(crate) fn dflash_drafter(
+/// The drafters from files of their own that `--drafters` names, each
+/// recognised by the architecture its file names: an MTP block of the model
+/// (`mtp_architecture`, the block of a model whose file carries none or
+/// another one) and a DFlash drafter (architecture `dflash`), one of each at
+/// most. A file that is no drafter of this model is refused by what it is.
+pub(crate) struct DrafterFiles {
+    pub mtp: Option<(std::path::PathBuf, Gguf)>,
+    pub dflash: Option<std::sync::Arc<ares_model::dflash::File>>,
+}
+
+pub(crate) fn drafter_files(
     options: &LoadOptions,
-) -> Result<Option<std::sync::Arc<ares_model::dflash::File>>, LoadError> {
-    let files: Vec<&std::path::PathBuf> = options
-        .drafters
-        .iter()
-        .flatten()
-        .filter_map(|d| match d {
-            Drafter::File(path) => Some(path),
-            Drafter::Mtp => None,
-        })
-        .collect();
-    match files.as_slice() {
-        [] => Ok(None),
-        [path] => ares_model::dflash::File::open(path)
-            .map(|file| Some(std::sync::Arc::new(file)))
-            .map_err(|e| refuse(format!("--drafters: {e}"))),
-        _ => Err(refuse("--drafters: one drafter from a file at most")),
+    mtp_architecture: &str,
+) -> Result<DrafterFiles, LoadError> {
+    let mut files = DrafterFiles { mtp: None, dflash: None };
+    for drafter in options.drafters.iter().flatten() {
+        let Drafter::File(path) = drafter else { continue };
+        let named = |e: String| refuse(format!("--drafters {}: {e}", path.display()));
+        let gguf = Gguf::open(path).map_err(|e| named(e.to_string()))?;
+        match gguf.architecture() {
+            Some(ares_model::dflash::ARCHITECTURE) if files.dflash.is_none() => {
+                let file =
+                    ares_model::dflash::File::open(path).map_err(|e| named(e.to_string()))?;
+                files.dflash = Some(std::sync::Arc::new(file));
+            }
+            Some(arch) if arch == mtp_architecture && files.mtp.is_none() => {
+                files.mtp = Some((path.clone(), gguf));
+            }
+            Some(arch) if arch == ares_model::dflash::ARCHITECTURE || arch == mtp_architecture => {
+                return Err(refuse("--drafters: one MTP block and one DFlash drafter at most"));
+            }
+            other => {
+                return Err(named(format!(
+                    "a file of architecture '{}' is no drafter of this model (an MTP block is \
+                     '{mtp_architecture}', a DFlash drafter 'dflash')",
+                    other.unwrap_or("none")
+                )));
+            }
+        }
     }
+    if files.mtp.is_some() && options.drafters.iter().flatten().any(|d| *d == Drafter::Mtp) {
+        return Err(refuse(
+            "--drafters: mtp names the MTP block of the model file and a file names another; \
+             the model drafts with one",
+        ));
+    }
+    Ok(files)
 }
 
 /// A device that was opened, and what it had free then.
@@ -594,7 +619,7 @@ fn shares_text(shares: &[f64]) -> String {
 }
 
 /// The token ids of a draft vocabulary file: one per line, `#` for comments.
-fn read_vocabulary(path: &Path) -> Result<Arc<[u32]>, LoadError> {
+pub(crate) fn read_vocabulary(path: &Path) -> Result<Arc<[u32]>, LoadError> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| refuse(format!("cannot read the draft vocabulary {}: {e}", path.display())))?;
     let mut tokens = Vec::new();
@@ -634,11 +659,11 @@ fn place(
         }
         Spread::Layer(shares) => Placement::layer(c, w, shares).map_err(model)?,
     };
-    let drafts = options.window_rows > 1 && placement.split != Split::Layer;
+    let drafts = options.window_rows > 1;
     let vocabulary = options.draft_vocabulary.as_deref();
-    if drafts && c.n_nextn == 1 && options.mtp {
+    if drafts && (c.n_nextn == 1 || options.mtp_file.is_some()) && options.mtp {
         placement.with_mtp(c, vocabulary).map_err(model)
-    } else if drafts && options.dflash.is_some() {
+    } else if drafts && options.dflash.is_some() && placement.split != Split::Layer {
         placement.with_head_view(c, vocabulary, false).map_err(model)
     } else {
         Ok(placement)
@@ -861,27 +886,33 @@ fn load_qwen35(
         return Err(refuse("--parallel must be at least 1"));
     }
     // The model drafters that take part: all the model has unless the operator
-    // names them. Nothing speculates without one, the n-gram drafter
-    // included.
-    let mtp = mtp_takes_part(
-        options,
-        config.n_nextn == 1,
-        "this model file has no MTP block (multi-token prediction)",
-    )?;
-    // The model's MTP block is not built for a layer split (the block, the
-    // device that embeds and the first rows of the head must be one device).
+    // names them, the MTP block of the model file or of a file of its own.
+    // Nothing speculates without one, the n-gram drafter included.
+    let files = drafter_files(options, ares_model::qwen35::MTP_ARCHITECTURE)?;
+    let mtp_file = match files.mtp {
+        Some((path, file)) => {
+            // Read before a device is touched: a block of another model is
+            // refused by name.
+            Weights::load(&gguf, &config)
+                .and_then(|w| w.with_mtp_file(&file, &config))
+                .map_err(|e| refuse(format!("--drafters {}: {e}", path.display())))?;
+            tracing::info!("drafter: the MTP block of {}", path.display());
+            Some(std::sync::Arc::new(file))
+        }
+        None => None,
+    };
+    let mtp = mtp_file.is_some()
+        || mtp_takes_part(
+            options,
+            config.n_nextn == 1,
+            "this model file has no MTP block (multi-token prediction); a file of one is named \
+             by its path",
+        )?;
     let layer = options.split == Some(SplitKind::Layer);
-    if mtp && layer && options.drafters.is_some() {
-        return Err(refuse(
-            "--drafters mtp: the model's MTP block is not built for a layer split; use a \
-             single device or a tensor split",
-        ));
-    }
-    let blocked_by_layer = mtp && layer;
-    let mtp = mtp && !layer;
-    // A DFlash drafter from a file: on the device that embeds and holds the
-    // first rows of the head, as the MTP block.
-    let dflash = dflash_drafter(options)?;
+    // A DFlash drafter from a file: it reads taps of the model's layers on
+    // the device that embeds and holds the first rows of the head, which a
+    // layer split does not give.
+    let dflash = files.dflash;
     if let Some(file) = &dflash {
         if layer {
             return Err(refuse(
@@ -905,12 +936,7 @@ fn load_qwen35(
     let window = options.window.unwrap_or(DEFAULT_WINDOW);
     let drafts = mtp || dflash.is_some();
     if options.window.is_some() && !drafts {
-        return Err(refuse(if blocked_by_layer {
-            "--window: the model's MTP block is not built for a layer split, so no window is \
-             reserved"
-        } else {
-            "--window without a model drafter does nothing"
-        }));
+        return Err(refuse("--window without a model drafter does nothing"));
     }
     let vocabulary = match &options.draft_vocabulary {
         Some(_) if !drafts => {
@@ -938,6 +964,7 @@ fn load_qwen35(
         window_rows,
         draft_vocabulary: vocabulary.clone(),
         mtp,
+        mtp_file,
         dflash: dflash.clone(),
         ..Options::default()
     };
@@ -1171,9 +1198,6 @@ fn load_qwen35(
             ares_cuda::Precision::Exact => "exact (f16 on the tensor cores for every product)",
         },
         match (drafts, &placement.draft) {
-            (false, _) if blocked_by_layer => "no speculation: the model's MTP block is not \
-                 built for a layer split, and earlier text alone is not a drafter"
-                .to_owned(),
             (false, _) => match options.drafters {
                 Some(_) => "no drafters (--drafters none): no speculation".to_owned(),
                 None => "no model drafter (the file has no MTP block): no speculation".to_owned(),

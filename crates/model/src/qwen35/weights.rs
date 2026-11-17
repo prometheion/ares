@@ -181,6 +181,9 @@ pub struct NextnWeights<'g> {
     pub shared_head_head: Option<Matrix<'g>>,
 }
 
+/// The architecture of a file that holds a `qwen35` model's MTP block alone.
+pub const MTP_ARCHITECTURE: &str = "qwen35-mtp";
+
 /// Every weight of a `qwen35` model.
 #[derive(Clone, Debug)]
 pub struct Weights<'g> {
@@ -225,6 +228,34 @@ impl<'g> Weights<'g> {
             return Err(Error::UnexpectedTensor { name: extra.name.clone() });
         }
         Ok(Self { token_embd, output_norm, output, layers, nextn })
+    }
+
+    /// The same weights with the MTP block of `file`, a file of its own
+    /// (architecture [`MTP_ARCHITECTURE`]: the block's tensors under the names
+    /// the model file gives them, `blk.<n_layer>.*`), in place of the model
+    /// file's own block if it has one.
+    pub fn with_mtp_file(mut self, file: &'g Gguf, c: &Config) -> Result<Self> {
+        if file.architecture() != Some(MTP_ARCHITECTURE) {
+            return Err(Error::NotAnMtpFile {
+                found: file.architecture().unwrap_or("none").to_owned(),
+            });
+        }
+        let key = |what: &str| file.u64(&format!("{MTP_ARCHITECTURE}.{what}"));
+        let (blocks, width) = (key("block_count"), key("embedding_length"));
+        if blocks != Some(c.n_layer as u64 + 1) || width != Some(c.n_embd as u64) {
+            return Err(Error::MtpFileShape {
+                blocks: blocks.unwrap_or(0),
+                width: width.unwrap_or(0),
+                n_layer: c.n_layer,
+                n_embd: c.n_embd,
+            });
+        }
+        let mut loader = Loader { gguf: file, used: HashSet::new() };
+        self.nextn = Some(loader.nextn(c, c.n_layer)?);
+        if let Some(extra) = file.tensors().iter().find(|t| !loader.used.contains(&t.name)) {
+            return Err(Error::UnexpectedTensor { name: extra.name.clone() });
+        }
+        Ok(self)
     }
 
     /// The matrix that turns the final hidden state into logits.

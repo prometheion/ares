@@ -57,7 +57,8 @@
 //!   tokens per second, acceptance by draft position, the lengths of the
 //!   drafts and the time of a step by kind.
 //!   `--dflash FILE` drafts with a DFlash2 drafter as well, `--no-mtp`
-//!   without the model's MTP block.
+//!   without the model's MTP block, `--mtp-file FILE` with the MTP block of a
+//!   file of its own (architecture `qwen35-mtp`).
 //! - `--conversation TOKENS`: the prefix cache on the devices. A conversation
 //!   whose history is about `TOKENS` tokens (a slice of `--text`) has a second
 //!   turn, and a conversation of the same size that the engine has never seen
@@ -170,6 +171,7 @@ struct Args {
     /// A DFlash drafter file, and whether the model's MTP block drafts.
     dflash: Option<PathBuf>,
     mtp: bool,
+    mtp_file: Option<PathBuf>,
     out: Option<PathBuf>,
     chat_vars: Vec<(String, String)>,
     layouts: Layouts,
@@ -217,6 +219,7 @@ fn parse() -> Args {
         draft_vocab: None,
         dflash: None,
         mtp: true,
+        mtp_file: None,
         out: None,
         chat_vars: Vec::new(),
         layouts: Layouts::default(),
@@ -274,6 +277,7 @@ fn parse() -> Args {
             "--draft-vocab" => args.draft_vocab = Some(value().into()),
             "--dflash" => args.dflash = Some(value().into()),
             "--no-mtp" => args.mtp = false,
+            "--mtp-file" => args.mtp_file = Some(value().into()),
             "--out" => args.out = Some(value().into()),
             "--layouts" => {
                 args.layouts = match value().as_str() {
@@ -950,6 +954,10 @@ fn engine(args: &Args, spread: &Spread, window: u32) {
         window_rows: if window > 1 { 2 * window } else { 0 },
         draft_vocabulary: vocabulary,
         mtp: args.mtp,
+        mtp_file: args
+            .mtp_file
+            .as_ref()
+            .map(|path| Arc::new(Gguf::open(path).expect("the file of the MTP block"))),
         dflash: args.dflash.as_ref().map(|path| {
             Arc::new(ares_model::dflash::File::open(path).expect("the DFlash drafter"))
         }),

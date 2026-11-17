@@ -93,16 +93,16 @@ pub struct Placement {
     pub draft: Option<DraftPlan>,
 }
 
-/// The place of the next-token-prediction block, with which the model drafts
-/// its own next tokens.
+/// The place of the MTP block, with which the model drafts its own next
+/// tokens, and of the head view every drafter reads.
 ///
-/// The whole block is on one device, the one that embeds: a draft chain reads
-/// the embedding of each token it picks, a row of the table that must be on
-/// that device, and the chain must not cross to another device between its
-/// links. Its head is the first rows of the
-/// output head on that device. A draft vocabulary puts the rows of its tokens
-/// first, so the draft head reads those rows only and takes no memory of its
-/// own.
+/// The whole block is on one device, the one with the first rows of the
+/// output head: the device that embeds alone or under a tensor split, the
+/// last one under a layer split. A chain must not cross to another device
+/// between its links: each reads the row of the embedding table of the token
+/// the link before picked, which that device keeps, and the draft head. A
+/// draft vocabulary puts the rows of its tokens first, so the draft head reads
+/// those rows only and takes no memory of its own.
 #[derive(Clone, Debug, PartialEq)]
 pub struct DraftPlan {
     /// The device that holds the block.
@@ -343,36 +343,30 @@ impl Placement {
         Ok(Self { split: Split::Layer, devices, draft: None })
     }
 
-    /// The same placement with the model's next-token-prediction block as a
+    /// The same placement with the model's MTP block (its next-token
+    /// prediction block, from the model file or a file of its own) as a
     /// drafter. `vocabulary` lists the tokens it may propose (in any order,
     /// each once); without it, it proposes the tokens whose rows of the head
     /// are on its device (all of them unless the head is cut by a tensor
     /// split).
     pub fn with_mtp(self, c: &Config, vocabulary: Option<&[u32]>) -> Result<Self, PlacementError> {
-        if c.n_nextn == 0 {
-            return Err(PlacementError("the model has no next-token-prediction block".into()));
-        }
         self.with_head_view(c, vocabulary, true)
     }
 
-    /// The draft head on the device that embeds, for the next-token-prediction
-    /// block (`mtp`) or for a drafter from a file of its own only: see
-    /// [`Placement::with_mtp`].
+    /// The draft head (the head view, `blocks/head.rs`) on the device with the
+    /// first rows of the output head, for the MTP block (`mtp`) or for a
+    /// drafter from a file of its own only: see [`Placement::with_mtp`].
     pub fn with_head_view(
         mut self,
         c: &Config,
         vocabulary: Option<&[u32]>,
         mtp: bool,
     ) -> Result<Self, PlacementError> {
-        let device = self.embedding_device();
+        let device =
+            self.devices.iter().position(|d| d.head.start == 0 && !d.head.is_empty()).ok_or_else(
+                || PlacementError("no device holds the first rows of the head".into()),
+            )?;
         let on_device = self.devices[device].head.clone();
-        if on_device.start != 0 || on_device.is_empty() {
-            return Err(PlacementError(
-                "the MTP block needs the device that embeds and the first rows of the output \
-                 head on one device, which a layer split does not give"
-                    .into(),
-            ));
-        }
         let view =
             HeadView::new(c.n_vocab as u32, on_device.end, vocabulary).map_err(PlacementError)?;
         let (head_order, head_rows) = (view.order, view.rows);

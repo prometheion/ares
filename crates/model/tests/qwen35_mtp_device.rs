@@ -125,6 +125,7 @@ impl Rig {
                 table_stride,
                 checkpoints: 0,
                 ram: &ram,
+                table: None,
             },
         )
         .unwrap();

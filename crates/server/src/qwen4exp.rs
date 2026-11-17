@@ -27,8 +27,8 @@ use ares_runtime::{GpuConfig, Model, Runtime, RuntimeConfig, SsdConfig, required
 use ares_tokenizer::Tokenizer;
 
 use crate::load::{
-    LoadError, Loaded, VRAM_HEADROOM, describe_links, hold_devices, join, ram_limit_of, refuse,
-    short,
+    LoadError, Loaded, VRAM_HEADROOM, describe_links, drafter_files, hold_devices, join,
+    ram_limit_of, read_vocabulary, refuse, short,
 };
 use crate::models::Site;
 use crate::plan::{self, CELLS_PER_PAGE, DEFAULT_PARALLEL, Drafter, LoadOptions, SplitKind};
@@ -94,55 +94,36 @@ pub(crate) fn load(
              arithmetic",
         ));
     }
-    // The model's MTP block is a file of its own, which --drafters names:
-    // the model file carries none. Without it nothing speculates (the n-gram drafter
-    // in earlier text takes part only next to a model drafter), no window is
-    // reserved, and the options of drafting mean nothing.
-    // A DFlash drafter (a file of architecture `dflash`) may come with it.
-    let mut blocks = Vec::new();
-    let mut dflash = None;
-    for drafter in options.drafters.iter().flatten() {
-        match drafter {
-            Drafter::Mtp => {
+    // The model's MTP block: in the model file (`--drafters mtp`, a file that
+    // carries the `mtp.*` tensors) or a file of its own, which --drafters
+    // names by its path (architecture `qwen4exp-mtp`). A DFlash drafter (a
+    // file of architecture `dflash`) may come with it. Without a model
+    // drafter nothing speculates (the n-gram drafter takes part only next to
+    // one), no window is reserved, and the options of drafting mean nothing.
+    let files = drafter_files(options, "qwen4exp-mtp")?;
+    let dflash = files.dflash;
+    let in_model = options.drafters.iter().flatten().any(|d| *d == Drafter::Mtp);
+    let drafter = match files.mtp {
+        Some(found) => Some(found),
+        None if in_model => {
+            let path = gguf.path(0).to_owned();
+            if gguf.tensor("mtp.fc_embedding.weight").is_none() {
                 return Err(refuse(
-                    "--drafters mtp: this model file carries no MTP block; the block is a \
-                     file of its own, which --drafters names by its path",
+                    "--drafters mtp: this model file carries no MTP block; a file of the block \
+                     is named by its path",
                 ));
             }
-            Drafter::File(path) => {
-                let is_dflash = Gguf::open(path)
-                    .map(|g| g.architecture() == Some(ares_model::dflash::ARCHITECTURE))
-                    .unwrap_or(false);
-                if is_dflash && dflash.is_none() {
-                    let file = ares_model::dflash::File::open(path)
-                        .map_err(|e| refuse(format!("--drafters: {e}")))?;
-                    dflash = Some(std::sync::Arc::new(file));
-                } else {
-                    blocks.push(path.clone());
-                }
-            }
+            let file = Gguf::open(&path).map_err(|e| refuse(format!("--drafters mtp: {e}")))?;
+            Some((path, file))
         }
-    }
-    let drafter = match blocks.as_slice() {
-        [] => None,
-        [path] => Some(path.clone()),
-        _ => {
-            return Err(refuse(
-                "--drafters: this model drafts with one MTP block and one DFlash drafter at \
-                 most",
-            ));
-        }
+        None => None,
     };
-    // The file is read before a device is touched: one that is no MTP block
+    // The block is read before a device is touched: one that is no MTP block
     // of this model is refused by name.
-    let drafter = drafter
-        .map(|path| {
-            let named = |e: String| refuse(format!("--drafters {}: {e}", path.display()));
-            let file = Gguf::open(&path).map_err(|e| named(e.to_string()))?;
-            MtpWeights::load(&file, &config).map_err(|e| named(e.to_string()))?;
-            Ok::<_, LoadError>((path, file))
-        })
-        .transpose()?;
+    if let Some((path, file)) = &drafter {
+        MtpWeights::load(file, &config)
+            .map_err(|e| refuse(format!("--drafters {}: {e}", path.display())))?;
+    }
     let window = options.window.unwrap_or(DRAFT_WINDOW);
     let drafts = drafter.is_some() || dflash.is_some();
     if options.window.is_some() && !drafts {
@@ -154,12 +135,14 @@ pub(crate) fn load(
              rows (a step that verifies drafts has {MAX_ROWS} rows for all sequences together)"
         )));
     }
-    if options.draft_vocabulary.is_some() {
-        return Err(refuse(
-            "--draft-vocab does nothing for this model: its MTP block picks from the whole \
-             output head",
-        ));
-    }
+    // A draft vocabulary is the head view of every drafter of the model.
+    let vocabulary = match &options.draft_vocabulary {
+        Some(_) if !drafts => {
+            return Err(refuse("--draft-vocab without a model drafter does nothing"));
+        }
+        Some(path) => Some(read_vocabulary(path)?),
+        None => None,
+    };
     let parallel = options.parallel.unwrap_or(DEFAULT_PARALLEL);
     if parallel > MAX_ROWS {
         return Err(refuse(format!(
@@ -404,6 +387,11 @@ pub(crate) fn load(
             model.with_usage_profile(&dir, std::sync::Arc::new(|line| tracing::warn!("{line}")));
     }
     let drafting = drafts;
+    if let Some(tokens) = &vocabulary {
+        model = model
+            .with_draft_vocabulary(tokens)
+            .map_err(|e| LoadError::Model(format!("--draft-vocab: {e}")))?;
+    }
     if let Some((path, file)) = drafter {
         model = model
             .with_mtp(file)

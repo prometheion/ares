@@ -279,6 +279,30 @@ The blocks so far:
   2026-11-16 in alternation, three runs each at loads of 6 to 28: a decode
   step at 1000 tokens of the tensor split 25.73 ms before and after, a prompt
   of 2048 tokens 1309 and 1313 tokens/s).
+- **Token rows** (`blocks/rows.rs`): where the rows of a token embedding table
+  come from. The table's home on the host is page-locked memory (the 27B, read
+  once at load and counted in the one RAM limit) or the mapped model file
+  (Flash-Next, whose RAM is the tier of its experts); a step copies the rows
+  of its tokens in the file's form into a stage and uploads them with one
+  copy, and the gather decodes them on the device (`embed_gather`). A device
+  keeps the rows of the tokens a drafter picks there (the head view's), which
+  the host cannot stage. A second source of rows (`splice_rows`: rows another
+  computation leaves in the model's width, the image tower's later) is copied
+  over the gathered ones before the first layer reads them. The 27B moved onto
+  it as it was; Flash-Next no longer decodes and uploads every row as floats
+  (10 240 bytes a row) but stages its IQ4_XS rows (1 360) and gathers them on
+  the device, whose decode is the host's operation for operation (the same
+  bits). Its step inputs no longer upload the section of the rows' values,
+  which only the device writes.
+- **The head view** (`blocks/head.rs`): the order of the output head's rows by
+  a draft vocabulary (its tokens first, ascending) and the rows of the draft
+  head, which every drafter that projects to the vocabulary reads, the MTP
+  block and the DFlash drafter on both models (`--draft-vocab`). The model's
+  logits come in the same order, and a list on the device names each column's
+  token for the sampler.
+- **The MTP driver** (`blocks/mtp.rs`): one for every model, described under
+  "The MTP driver" in [Speculation](#speculation). A model gives it its MTP
+  layer and where its hidden state is tapped.
 
 ## A step
 

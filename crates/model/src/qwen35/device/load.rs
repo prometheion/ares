@@ -541,13 +541,16 @@ pub(crate) struct LoadOptions {
     pub merged: bool,
 }
 
-/// The token embedding on the device that embeds the step's tokens: the
-/// table's shape, and the rows of it that lie on the device.
+/// The token embedding on the device that embeds the step's tokens or holds
+/// the MTP block: the table's shape, and the rows of it that lie on the
+/// device.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct EmbedW {
     pub table: TableShape,
     /// The rows the draft chain can pick; none without an MTP block here.
     pub kept: Option<KeptW>,
+    /// Whether the device embeds the step's tokens.
+    pub embeds: bool,
 }
 
 /// The rows of the embedding table that lie on a device: the rows of the
@@ -628,7 +631,7 @@ impl DeviceWeights {
     /// and the rows staged at `staged` (null for none). `None` on a device
     /// that does not embed.
     pub fn embed_rows(&self, staged: DevicePtr) -> Option<EmbedRows> {
-        let EmbedW { table, kept } = self.embedding?;
+        let EmbedW { table, kept, .. } = self.embedding?;
         let kept = kept.map_or(KeptRows::NONE, |k| KeptRows {
             rows: self.mat(&k.rows),
             tokens: k.tokens.map_or(DevicePtr::NULL, |at| self.at(at)),
@@ -759,15 +762,12 @@ fn tables<'g>(
     // chain picks from, when it drafts; the draft head for any drafter.
     let own_mtp = own_draft.filter(|d| d.mtp);
     let order = draft.and_then(|d| d.head_order.as_deref());
-    // The embedding table stays on the host (`embed.rs`); the device that
-    // embeds keeps the rows of the draft head, the tokens its chain picks.
-    // A model with an head of its own has them as a matrix of their own,
-    // laid out first like the head. A tied model has them in its head
+    // The embedding table stays on the host (`blocks/rows.rs`); the device
+    // of the MTP block keeps the rows of the draft head, the tokens its chain
+    // picks. A model with a head of its own has them as a matrix of their
+    // own, laid out first like the head. A tied model has them in its head
     // (below).
     let tied = w.output.is_none();
-    if own_draft.is_some() && !plan.embedding {
-        return Err(ModelError::Invalid("the MTP block's device does not embed".into()));
-    }
     let chain_tokens = own_mtp.map(|d| match order {
         Some(order) => runs_of(&order[..d.head_rows as usize]),
         None => one(0..d.head_rows as usize),
@@ -827,7 +827,14 @@ fn tables<'g>(
         }
         (None, _) => None,
     };
-    let embedding = plan.embedding.then(|| EmbedW { table: table_shape(&w.token_embd), kept });
+    // The rows of the embedding table for the device that embeds the step's
+    // tokens, and for the MTP block's device (the last one of a layer split),
+    // which keeps the rows its chain picks.
+    let embedding = (plan.embedding || kept.is_some()).then(|| EmbedW {
+        table: table_shape(&w.token_embd),
+        kept,
+        embeds: plan.embedding,
+    });
     let mut blocks = Vec::new();
     for (layer, slice) in plan.blocks.iter().enumerate() {
         let Some(slice) = slice else { continue };

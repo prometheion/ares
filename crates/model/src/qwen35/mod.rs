@@ -13,4 +13,4 @@ pub use error::{Error, Result};
 pub use reference::{
     LogitRows, MtpDraft, MtpRows, MtpState, Reference, SequenceState, StateStorage, Window,
 };
-pub use weights::Weights;
+pub use weights::{MTP_ARCHITECTURE, Weights};
