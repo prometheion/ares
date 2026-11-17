@@ -1152,7 +1152,7 @@ it is how the engine drafts.
 | Part | What it is | State |
 | --- | --- | --- |
 | N-gram drafter | Continues the longest earlier occurrence of the current text, in this request or another: one suffix automaton over a corpus that all sequences share (`NgramCorpus`, `NgramDrafter`; after TensorRT-LLM, SGLang and vLLM's suffix decoding), with a confidence per proposed token and a bound on memory. It replaces a match of the last tokens per sequence; llama.cpp's map and cache variants are not built | Done and measured on text; the conductor uses it, next to a model drafter and never alone |
-| MTP | The model's own draft head or block | Done for `qwen35` on one device and under a tensor split: the block runs on the device with the embedding table, its chain and its picks stay on the device (`device/mtp.rs`); not under a layer split. Done for `qwen4exp` in every placement, from a file of the block (`--drafters FILE`): the block runs on the device with the output head, its experts resident in VRAM, and the host reads every pick (see "Qwen3.8-Flash-Next through the runtime"). Both make their chains, of up to the window's rows less one (7 by default), in a step that only drafts, and the round verifies what pays of them |
+| MTP | The model's own draft block (`mtp`: one more layer of its own kind) | Done for both models on one driver (`blocks/mtp.rs`, see "The MTP driver" below) in every placement, from the model file (`--drafters mtp`) or a file of the block (`--drafters FILE`, architecture `qwen35-mtp` or `qwen4exp-mtp`): the block runs on the device with the first rows of the output head, its chain and its picks stay on the device, and a draft vocabulary is the head view of every drafter. Both make their chains, of up to the window's rows less one (7 by default), in a step that only drafts, and the round verifies what pays of them |
 | DFlash, DSpark, DFlash2 | A small draft model that reads the target's hidden states at a few layers and proposes a block of tokens at once | DFlash2 built as a kind of drafter for both models, chains only (`--drafters FILE` with a file of architecture `dflash`; see "Drafters as kinds" below). DSpark and DFlash 1 files are refused by name |
 | Drafter selection | Per step and for all sequences together, whose drafts go into each window, by expected tokens per millisecond of the whole step, from the price of a step and the acceptance measured per drafter, position and sequence; a proposal that was not taken learns from what turned out right | Done: `ares_sched::choose` |
 | Adaptive draft length | The length that maximises the same number | Done, in the same call; and a chain ends as it is made where one more link does not raise that number, by the probability the drafter gave its drafts (see "The chain is cut by the drafter's own probability") |
@@ -1334,13 +1334,12 @@ trip of the extra step is in it; the price of the round's rows is the round's.
 
 What each drafter does with the bars in the step that only drafts:
 
-- *The 27B's block* enqueues its chain on the device and copies every link's
-  picks to the host. Where a bar can end the chain (the least chance in the
-  table would not carry the reach over it) the device thread waits for those
-  picks before it enqueues the next link; where no pick could end it,
-  nothing is waited for.
-- *The MTP block of Flash-Next* reads every pick on the host as before, so a
-  chain that ends there costs no wait of its own.
+- *The MTP driver* (both models) enqueues its chain on the device and copies
+  every link's picks to the host. Where a bar can end the chain (the least
+  chance in the table would not carry the reach over it) the device thread
+  waits for those picks before it enqueues the next link; where no pick could
+  end it, nothing is waited for. (Until 2026-11-17 Flash-Next's block read every
+  pick on the host.)
 
 Measured 2026-11-15, the build before this work against the build with it,
 back to back, on a machine that other work kept at the load averages given;
@@ -1580,21 +1579,58 @@ microseconds to read and a draft 0.4, eight and thirty times what the match of
 the last three costs; a long prompt is therefore read into the corpus as its rows
 are committed, not at once.
 
-**The model's drafts** (`qwen35`, the next-token-prediction block of the
-27B). The block's chain runs in the step that only drafts (see above), on the
-device that embeds (which keeps the rows of the tokens the chain can pick, see
-"The token embedding of `qwen35`"), each link's pick made by the sampler with
-the settings and the noise of the row that will verify it and written into
-the token array of that step's record on the device, where the next link
-reads it (`Part::enqueue_chains`: the block's K and V entries made ready for
-its cells, then the links). The host learns the drafts at the end of that
-step. The round that verifies them is an ordinary step whose windows carry
-the drafts as tokens; after the model's blocks it computes, for every row of
-the step, the block's own keys and values from the hidden states the model
-just computed, which replaces what the chain wrote in those cells. The
-conductor chooses per sequence and step between an n-gram draft and the
-model's own by expected tokens per millisecond (`ares_sched::choose`), with
-the price of a chain taken from the steps that only draft.
+**The MTP driver** (`blocks/mtp.rs`), one for every model. A model gives it
+its MTP layer (`MtpLayer`: the launch plan of a link, and of rows that only
+write keys and values; the lag between a pair and the block's cell; the
+per-sequence state links change) and the rows where its hidden state is tapped
+(the 27B: the final hidden state, `output_norm` of the residual after the last
+block, in the step's `xn`; Flash-Next: the residual streams after the last
+layer). Everything else is the driver's:
+
+- *Pairs and cells.* The block reads a token and the model's hidden state of
+  the position before it; the pair of the token at position `p` is the block's
+  cell `p - lag` (the 27B 0, Flash-Next 1). The **carry** of a slot is the
+  hidden state of the sequence's last row that counts, with a row of zeros
+  behind the slots for a sequence's first pair.
+- *Following the model.* At the start of a step, before its copies of the
+  prefix cache and before any tile is converted, the rows of the model's last
+  step that count (all rows of a prompt slice or a single row, the accepted rows
+  of a window, which the record tells) give the block their pairs behind the
+  first: rows that only write keys and values, in launches of the layer's size.
+  The hidden state of the last row that counts becomes the carry; a replay's
+  cells are cached, so it moves only the carry. Rows that were rejected are
+  never followed, so nothing the block writes is undone and a layer with state
+  per sequence (Flash-Next's indexer) needs nothing else. Until 2026-11-17 the
+  27B's block followed every row of a step, rejected ones included, in the step
+  itself, and kept every row of a window in its carry until the commit chose
+  one; now its cell of a row is written a step later.
+- *The newest cell* of every sequence of a step that does not draft only writes
+  keys and values; for one that drafts it is link 0 of its chain.
+- *The chain.* Longest chains first, so that the rows of a link are the first
+  rows of the link before; the records of every link (the record, the sampler's
+  settings, where each pick goes, the layer's plan) are uploaded with one copy.
+  Link `j` pairs the pick of link `j - 1` with the block's own output of that
+  link; each pick is made by the device sampler from the draft head (the head
+  view's first rows of the output head) with the settings and the noise of the
+  row that will verify it, and written into the step record's token array, the
+  next link's record (whose rows of the embedding table the device keeps) and
+  the step's list of drafts. The host reads the picks at the end of the step,
+  and before a link only where a bar may end a chain. The cells of links after
+  the first are provisional: the layer's per-sequence state is saved behind
+  link 0 and put back behind the last, and their keys and values are written
+  again when the model has passed them.
+
+The round that verifies the drafts is an ordinary step whose windows carry the
+drafts as tokens. The conductor chooses per sequence and step between an n-gram
+draft and a model drafter's by expected tokens per millisecond
+(`ares_sched::choose`), with the price of a chain taken from the steps that
+only draft. The block is on the device with the first rows of the output head:
+alone or under a tensor split the device that embeds, under a layer split the
+last one (the 27B drafts there too since 2026-11-17), whose final hidden states
+it follows; the table on the host is shared by the parts that stage rows from
+it. Its weights come from the model file (`--drafters mtp`) or a file of its
+own (`--drafters FILE`: `qwen35-mtp` for the 27B, the block's tensors under the
+model file's names `blk.<n_layer>.*`; `qwen4exp-mtp` for Flash-Next).
 
 Measured 2026-11-10 on Qwen3.8-27B (tensor split 0.625 / 0.375, RTX 4070 and
 RTX 3060, at most three drafts, the fork's draft vocabulary of 66 343 tokens,
@@ -1716,18 +1752,28 @@ pay, because the policy drafts what the price and the acceptance say pay.
 
 ### Drafters as kinds
 
-A drafter is a kind the runtime knows, not a feature of one model. The
-n-gram drafter is the runtime's own and has id 0; a model lists the drafters
-it runs on its devices (`Model::drafters`: a kind and the most drafts it makes
-per sequence and step), and the record names them by their place in that list
-plus one. Two kinds exist:
+A drafter is a kind the runtime knows, not a feature of one model. The three
+kinds have one name each everywhere (types, modules, files, options,
+statistics, logs): `ngram`, `mtp` and `dflash`. The n-gram drafter is the
+runtime's own and has id 0 (`ares_sched::NgramCorpus` and `NgramDrafter`: the
+longest earlier occurrence of the text, on a suffix automaton); a model lists
+the drafters it runs on its devices, its model drafters (`Model::drafters`: a
+kind and the most drafts it makes per sequence and step), and the record names
+them by their place in that list plus one. The model drafters' drafts are the
+model drafts (`DeviceModel::model_drafts`). Two kinds of model drafter exist:
 
-- **MTP block** (`DrafterKind::Mtp`): one more layer of the model's own
-  kind, a chain of links, each of which costs device time and can end the
-  chain by the drafter's probability (the draft bars).
-- **DFlash** (`DrafterKind::Dflash`): a drafter model from a file of its own
+- **`mtp`** (`DrafterKind::Mtp`): the MTP block, one more layer of the model's
+  own kind (from the model file, `--drafters mtp`, or a file of its own), a
+  chain of links on the MTP driver, each of which costs device time and can end
+  the chain by the drafter's probability (the draft bars).
+- **`dflash`** (`DrafterKind::Dflash`): a drafter model from a file of its own
   that reads taps of the model; one pass makes every draft of a window, so a
   draft more costs no device time once the pass runs.
+
+`--drafters` names them comma-separated: `mtp`, or a file name, which the
+server takes as an MTP block or a DFlash drafter by the architecture the file
+names (and refuses otherwise); `--draft-vocab` is the head view of every model
+drafter.
 
 A window whose drafts a model drafter makes has the model-drafts flag in its
 segment and the drafter's id in word 6. The conductor keeps per drafter a curve
@@ -1740,7 +1786,7 @@ only drafts makes the drafts of every window that takes a model drafter (a
 step in which two sequences took two drafters prices both curves with the
 step's time). The device part keeps one list of drafts per step, written at
 each window's place in segment order, whichever drafter made them; the
-statistics count drafts by source (ngram, MTP block, DFlash).
+statistics count drafts by source (ngram, mtp, dflash).
 
 ### The DFlash drafter
 
@@ -3959,49 +4005,54 @@ gives way and comes back, several sequences in a step. The model is
 stays as the tool's and the tests' way to step it by hand (and for the probes
 that compare layer by layer).
 
-**It drafts with its MTP block, from a file of the block.** The model's draft
-head is a block of its own (section 4 of the
+**It drafts with its MTP block, from the model file or a file of the block.**
+The model's draft head is a block of its own (section 4 of the
 [specification](reference/qwen4exp-architecture.md)): one layer of the attention
 kind with its own mixture of 512 experts, two projections that make its input
 from the trunk's residual after the last layer and the embedding of the token
-behind it, and its own final mixer in front of the model's output head. The model
-file carries none; `--drafters FILE` names the file Strata packs it in (889 MB for
-Flash-Next: 175 MiB of dense weights, the experts in Q2_0), and the server refuses
-a file that is no block of this model before a device is touched. `--drafters mtp`
-is refused (a block inside the model file, as the llama.cpp fork lays it out, is
-not read: there is no such file here), and so is `--draft-vocab`: the block picks
-from the whole output head. Without a block the model does not speculate: the
-n-gram drafter takes part as soon as a model drafter does and never alone
-(see [Speculation](#speculation)).
+behind it, and its own final mixer in front of the model's output head. The
+IQ2_XS file carries none; `--drafters FILE` names the file Strata packs it in
+(architecture `qwen4exp-mtp`, 889 MB for Flash-Next: 175 MiB of dense weights,
+the experts in Q2_0), and `--drafters mtp` reads the block from a model file
+that carries its `mtp.*` tensors. The server refuses a file that is no block of
+this model before a device is touched. `--draft-vocab` is the head view of
+every drafter of the model (`blocks/head.rs`): the output head's rows of its
+tokens come first, the model's logits in that order. Without a block the model
+does not speculate: the n-gram drafter takes part as soon as a model drafter
+does and never alone (see [Speculation](#speculation)).
 
 - *Where it runs.* On the device that holds the output head, in every placement
   (one card; the last card of a split by layers; the card that mixes when both
-  work on every layer), as a second part of one layer (`device/draft.rs`,
-  `device/part/block.rs`) that reads the model's output head where it is. Its keys,
-  values and indexer keys are pages of its own, addressed through the model's
-  page tables.
-- *What it does in a step.* The block is one token behind the model: its cell `i`
-  pairs the trunk's residual of cell `i` with the token of cell `i + 1`. In front
-  of every step of the model it (1) follows the rows of the step before that
-  count, which the record of this step tells (rows that only write keys and
-  values, eight to a launch), and keeps the residual of the last of them; (2)
-  runs the newest cell of every sequence, whose token is the first row of the
-  step; (3) for the windows that take its drafts goes on from its own residual
-  and its own pick, link after link. The keys of the indexer a sequence carries
-  are saved behind the first link and put back behind the last, and the keys and
-  values of a chain's cells are overwritten when the model has passed them.
-- *The host reads every pick.* The embedding of a row and the rows of the n-gram
-  table are host work in this model, so a link ends with a read of its pick
-  (where the 27B's chain stays on the device). The chains run in the step that
-  only drafts (steps 2 and 3 above, for the sequences that draft; the other
+  work on every layer), as the layer of the shared MTP driver (`blocks/mtp.rs`;
+  the layer is `device/mtp.rs` and a part of one layer, `device/part/mtp.rs`)
+  that reads the model's output head where it is. Its keys, values and indexer
+  keys are pages of its own, addressed through the model's page tables.
+- *What it does in a step* is the driver's (see "The MTP driver" under
+  [Speculation](#speculation)), with a lag of one: its cell `i` pairs the trunk's
+  residual of cell `i` with the token of cell `i + 1`. In front of every step of
+  the model it (1) follows the rows of the step before that count, eight to a
+  launch; (2) writes the newest cell of every sequence; (3) for the windows that
+  take its drafts goes on from its own residual and its own pick, link after
+  link. The keys of the indexer a sequence carries are saved behind the first
+  link and put back behind the last.
+- *The chain stays on the device.* A link's pick is made by the sampler on the
+  device and written into the next link's record, whose embedding the device
+  gathers from the rows of the embedding table it keeps (the head view's
+  tokens: the whole table without a draft vocabulary, 337 MiB; the vocabulary's
+  rows with one); the newest tokens' rows come staged from the mapped file. The
+  part of the block sends its steps' records and plans from a ring of buffers,
+  so the host enqueues a chain whole and reads the drafts once, when the step
+  that only drafts has ended (until 2026-11-17 the host waited for every link's
+  pick, because it decoded the next link's embedding). The chains run in that
+  step (steps 2 and 3 above, for the sequences that draft; the other
   device threads have nothing to do in it), and the round that verifies them
   is the model's ordinary step of up to eight rows with the drafts as tokens;
   the block does not write again the newest cells its chains wrote. The step
   that only drafts is no step of the expert store (its routing is the block's,
-  whose experts are resident, and the work between two steps of the store is
-  counted in the model's steps), and it asks for the rows of the n-gram table
-  that the round's rows will need (the newest token and the drafts made), so
-  that they are read while the conductor decides. The rows
+  whose experts are resident, so the store reads none of its route records),
+  and when it has ended the host asks for the rows of the n-gram table that the
+  round's rows will need (the newest token and the drafts made), so that they
+  are read while the conductor decides. The rows
   that are rejected leave no trace in the recurrent layers, the n-gram
   history and the indexer's keys (`Part::enqueue_commit`, which existed), and
   their keys and values are overwritten.
