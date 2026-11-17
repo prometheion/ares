@@ -94,44 +94,64 @@ static __device__ __forceinline__ float4 ares_q4_load4(const uint8_t* p, uint32_
                        __half2float(__ushort_as_half(static_cast<unsigned short>(b >> 48))));
 }
 
-// How the read kernels find the values of a matrix of rows of `row_values` values: the row
-// `r` starts at `row(m, r, row_values, ty)` and `load4(row, at, ty)` is its values `at` to
-// `at + 3` (`at` a multiple of 4).
+// How the read kernels find the values of a matrix of rows of `row_values` values: `at(m, r,
+// row_values, first, ty)` is a cursor at value `first` of row `r`, and `load4(cursor, k, ty)`
+// gives the values `first + k` to `first + k + 3` (`first` and `k` multiples of 4). The
+// offsets are integers of the caller's width, so that the float reader computes its addresses
+// as the read did before it took other types (the same instructions).
 //
-// The float types, by their type at run time, as the read was written first.
+// The float types, by their type at run time.
 struct AresQ4Float {
-    static __device__ __forceinline__ const uint8_t* row(const uint8_t* m, size_t r, size_t row_values,
-                                                         uint32_t ty) {
-        return m + r * row_values * ares_q4_value_bytes(ty);
+    using Cursor = const uint8_t*;
+    static __device__ __forceinline__ Cursor at(const uint8_t* m, size_t r, size_t row_values, size_t first,
+                                                uint32_t ty) {
+        return m + (r * row_values + first) * ares_q4_value_bytes(ty);
     }
-    static __device__ __forceinline__ float4 load4(const uint8_t* row, size_t at, uint32_t ty) {
-        return ares_q4_load4(row + at * ares_q4_value_bytes(ty), ty);
+    template <class K>
+    static __device__ __forceinline__ float4 load4(Cursor c, K k, uint32_t ty) {
+        return ares_q4_load4(c + k * ares_q4_value_bytes(ty), ty);
     }
 };
 
-// A type of blocks known at compile time (ggml type id `TY`).
+// A type of blocks known at compile time (ggml type id `TY`): the cursor is the row and the
+// first value.
 template <uint32_t TY>
 struct AresQ4Blocks {
-    static __device__ __forceinline__ const uint8_t* row(const uint8_t* m, size_t r, size_t row_values,
-                                                         uint32_t) {
-        return m + r * (row_values / AresWeight<TY>::VALUES) * AresWeight<TY>::BYTES;
+    struct Cursor {
+        const uint8_t* row;
+        uint32_t first;
+    };
+    static __device__ __forceinline__ Cursor at(const uint8_t* m, size_t r, size_t row_values, size_t first,
+                                                uint32_t) {
+        return {m + r * (row_values / AresWeight<TY>::VALUES) * AresWeight<TY>::BYTES,
+                static_cast<uint32_t>(first)};
     }
-    static __device__ __forceinline__ float4 load4(const uint8_t* row, size_t at, uint32_t) {
-        return ares_weight4<TY>(row, static_cast<uint32_t>(at));
+    template <class K>
+    static __device__ __forceinline__ float4 load4(Cursor c, K k, uint32_t) {
+        return ares_weight4<TY>(c.row, c.first + static_cast<uint32_t>(k));
     }
 };
 
-// Any weight type, known at run time: the inject rows, which are few.
+// Any weight type, known at run time.
 struct AresQ4Any {
+    struct Cursor {
+        const uint8_t* row;
+        uint32_t first;
+    };
     static __device__ __forceinline__ bool is_float(uint32_t ty) {
         return ty == ARES_Q4_F32 || ty == ARES_Q4_F16 || ty == ARES_Q4_BF16;
     }
-    static __device__ __forceinline__ const uint8_t* row(const uint8_t* m, size_t r, size_t row_values,
-                                                         uint32_t ty) {
-        return is_float(ty) ? AresQ4Float::row(m, r, row_values, ty) : m + r * ares_weight_row_bytes(ty, row_values);
+    static __device__ __forceinline__ Cursor at(const uint8_t* m, size_t r, size_t row_values, size_t first,
+                                                uint32_t ty) {
+        if (is_float(ty)) {
+            return {AresQ4Float::at(m, r, row_values, first, ty), 0};
+        }
+        return {m + r * ares_weight_row_bytes(ty, row_values), static_cast<uint32_t>(first)};
     }
-    static __device__ __forceinline__ float4 load4(const uint8_t* row, size_t at, uint32_t ty) {
-        return is_float(ty) ? AresQ4Float::load4(row, at, ty) : ares_weight4_any(row, ty, static_cast<uint32_t>(at));
+    template <class K>
+    static __device__ __forceinline__ float4 load4(Cursor c, K k, uint32_t ty) {
+        return is_float(ty) ? AresQ4Float::load4(c.row, k, ty)
+                            : ares_weight4_any(c.row, ty, c.first + static_cast<uint32_t>(k));
     }
 };
 
@@ -278,12 +298,12 @@ static __device__ __forceinline__ void ares_q4_read_down_t(const float* r_src, f
     for (int j = 0; j < ARES_Q4_TILE; j++) {
         float a = 0.0f;
         if (static_cast<uint32_t>(j) < nj) {
-            const uint8_t* w = W::row(down, j0 + j, row_values, down_ty);
+            const auto w = W::at(down, j0 + j, row_values, first, down_ty);
 #pragma unroll
             for (int k = 0; k < ARES_Q4_RESIDENT; k++) {
                 const uint32_t i = threadIdx.x + k * blockDim.x;
                 if (i < chunks) {
-                    a += ares_q4_dot4(W::load4(w, first + static_cast<size_t>(i) * 4, down_ty), v[k]);
+                    a += ares_q4_dot4(W::load4(w, static_cast<size_t>(i) * 4, down_ty), v[k]);
                 }
             }
         }
@@ -293,12 +313,12 @@ static __device__ __forceinline__ void ares_q4_read_down_t(const float* r_src, f
     for (int j = 0; j < ARES_Q4_MAX_STREAMS; j++) {
         float a = 0.0f;
         if (static_cast<uint32_t>(j) < nk) {
-            const uint8_t* w = I::row(inject, j, row_values, inject_ty);
+            const auto w = I::at(inject, j, row_values, first, inject_ty);
 #pragma unroll
             for (int k = 0; k < ARES_Q4_RESIDENT; k++) {
                 const uint32_t i = threadIdx.x + k * blockDim.x;
                 if (i < chunks) {
-                    a += ares_q4_dot4(I::load4(w, first + static_cast<size_t>(i) * 4, inject_ty), v[k]);
+                    a += ares_q4_dot4(I::load4(w, static_cast<size_t>(i) * 4, inject_ty), v[k]);
                 }
             }
         }
@@ -382,11 +402,11 @@ static __device__ __forceinline__ void ares_q4_read_up_t(const float* xn, const 
     const uint32_t c = u >> 5;
     const uint32_t value = group * 32 + i;
     const uint32_t span = rank / tpr;
-    const uint8_t* w = W::row(up, static_cast<size_t>(c) * n + value, rank, up_ty);
+    const auto w = W::at(up, static_cast<size_t>(c) * n + value, rank, part * span, up_ty);
     const float* l = lo + part * span;
     float g = 0.0f;
     for (uint32_t k = 0; k < span; k += 4) {
-        const float4 d = W::load4(w, part * span + k, up_ty);
+        const float4 d = W::load4(w, k, up_ty);
         g += (d.x * l[k] + d.y * l[k + 1]) + (d.z * l[k + 2] + d.w * l[k + 3]);
     }
     for (uint32_t offset = tpr >> 1; offset > 0; offset >>= 1) {
