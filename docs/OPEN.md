@@ -18,8 +18,10 @@ For "CUDA complete", the order in which the items below are taken up; each item 
 section further down.
 1. Pin Claude Code's billing stamp at the start of its system prompt as upstream llama.cpp does
    (the owner, 2026-11-17: on `/v1/messages` the five characters after `cch=` become `fffff`).
-2. A root checkpoint at the end of the system prompt and the tool list, and denser checkpoints
-   inside a long prompt, for both models (prompt cache).
+2. A root checkpoint at the end of the system prompt and the tool list, a checkpoint at every
+   message boundary, and checkpoints at fixed distances inside a long prompt, for both models:
+   a change in the middle of a conversation (an older tool result cut, an edited message) then
+   costs only the rows from the last checkpoint before it (prompt cache; the owner, 2026-11-18).
 3. Large prompt chunks for Flash-Next with expert slots borrowed in VRAM, batch and micro-batch
    adjustable, adaptive when another request waits (experts from the SSD).
 4. Tools, structured output and the Messages and Responses routes on the real Flash-Next, and
@@ -418,8 +420,9 @@ becomes a block is in `ARCHITECTURE.md` ("The shared model layer"). Left, in the
       (the server's plan counts it).
 
 ## Prompt cache (every model; RAM first, then SSD, as in the owner's fork)
-- [ ] A root checkpoint at the end of the system prompt and of the tool list, and denser
-      checkpoints inside a long prompt, for both models: today a new conversation that shares a
+- [ ] A root checkpoint at the end of the system prompt and of the tool list, a checkpoint at
+      every message boundary and at fixed distances inside a long prompt (the owner, 2026-11-18),
+      for both models: today a new conversation that shares a
       12k-token system prompt replays every row (about 10 s on the 27B, a minute on Flash-Next);
       the owner's fork runs `checkpoint-root = 2048` (gap study `/var/tmp/ares-survey/gap-study-2026-11-17.md`).
 - [ ] Claude Code writes a new billing stamp (`x-anthropic-billing-header ... cch=...`) at the
@@ -542,6 +545,10 @@ with fewer slots in VRAM than a step picks"). Left:
 Measured per phase on a quiet machine against the fork and Strata, the largest first. Known levers:
 - [ ] VRAM on loan to the expert tier: K/V pages a conversation does not need yet (Strata's
       `--kv-grow`), the MTP block's 675 MiB while a long prompt runs (gap study `/var/tmp/ares-survey/gap-study-2026-11-17.md`).
+- [ ] Reusing K/V blocks away from the prefix (as CacheBlend does) is not for these models: three
+      layers in four are recurrent, so every token after a change goes through every layer again
+      and the reuse would save little and change the output; dense checkpoints are the exact way
+      (the owner asked, 2026-11-18).
 - [ ] Checkpoints of the recurrent state in int8 (SGLang's `mamba_checkpoint_pool.py`): a quarter
       of Flash-Next's 112 MiB, which matters because a full tier leaves one place; after a KL
       measurement (gap study `/var/tmp/ares-survey/gap-study-2026-11-17.md`).
