@@ -420,6 +420,16 @@ becomes a block is in `ARCHITECTURE.md` ("The shared model layer"). Left, in the
       (the server's plan counts it).
 
 ## Prompt cache (every model; RAM first, then SSD, as in the owner's fork)
+- [ ] Reuse of K/V blocks away from the prefix, as CacheBlend does, opt-in like pruning (the owner,
+      2026-11-18; approximate: the output diverges, measured and bounded by a dial, off by
+      default). For a conversation whose earlier part changed (an older tool result cut, an
+      edited message, a compaction): the attention layers' pages of the unchanged blocks are
+      taken again, K turned to its new position (RoPE is relative); Flash-Next's QSA indexes
+      blocks already, so its pooled keys go with them. The hard part is the recurrent state (three
+      layers in four): take the old checkpoint after the change (the gates forget old tokens),
+      or recompute a bridge of N tokens after the change, or recompute the tokens whose K/V
+      deviate most (CacheBlend: about 15 %). Measure first: an early message changed, exact
+      recompute against each way, KL of the next tokens and how far the reply parts; then a dial.
 - [ ] A root checkpoint at the end of the system prompt and of the tool list, a checkpoint at
       every message boundary and at fixed distances inside a long prompt (the owner, 2026-11-18),
       for both models: today a new conversation that shares a
@@ -545,10 +555,6 @@ with fewer slots in VRAM than a step picks"). Left:
 Measured per phase on a quiet machine against the fork and Strata, the largest first. Known levers:
 - [ ] VRAM on loan to the expert tier: K/V pages a conversation does not need yet (Strata's
       `--kv-grow`), the MTP block's 675 MiB while a long prompt runs (gap study `/var/tmp/ares-survey/gap-study-2026-11-17.md`).
-- [ ] Reusing K/V blocks away from the prefix (as CacheBlend does) is not for these models: three
-      layers in four are recurrent, so every token after a change goes through every layer again
-      and the reuse would save little and change the output; dense checkpoints are the exact way
-      (the owner asked, 2026-11-18).
 - [ ] Checkpoints of the recurrent state in int8 (SGLang's `mamba_checkpoint_pool.py`): a quarter
       of Flash-Next's 112 MiB, which matters because a full tier leaves one place; after a KL
       measurement (gap study `/var/tmp/ares-survey/gap-study-2026-11-17.md`).
