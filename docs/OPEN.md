@@ -397,6 +397,11 @@ becomes a block is in `ARCHITECTURE.md` ("The shared model layer"). Left, in the
       together with other sequences); its cost with three sequences was not measured.
 
 ## Drafters (every model)
+Reference to read (2026-11-18): Basalt, https://github.com/jesdga95/basalt (MIT, a fork of Strata,
+kernels from Infernix; NVIDIA Blackwell only, so it cannot run on these cards): Qwen3.8 Flash-Next
+with MTP, Qwen3.8-27B with DFlash 2 and DeepSeek-V4.1-Flash with DSpark, drafting on by default;
+OpenAI and Anthropic routes, a router, images, documents (PDF, text) and video (NVDEC for
+Flash-Next); experts that do not fit in VRAM in RAM; K/V in int8. Its README gives no speeds.
 - [ ] A classic draft model as a fourth drafter kind (llama.cpp's `-md`): a small model with the
       same vocabulary drafts with its own forward passes and its own K/V; chosen by the same price
       rule as `ngram`, `mtp` and `dflash` (the owner, 2026-11-17). Later (the owner, 2026-11-17).
@@ -528,6 +533,7 @@ becomes a block is in `ARCHITECTURE.md` ("The shared model layer"). Left, in the
         Embedded images only; fetching remote URLs is backlog. At most 4096 rows per image by
         default (as the fork), with a key to lower it.
   - [ ] 8. Caching: cells named by a digest of the resized pixels, 64-bit names through the index and the SSD level.
+- [ ] Documents as input (PDF, text), as Basalt takes them next to images; video stays backlog.
 - [ ] Audio, video and Gemma 4 are backlog: none of them blocks the first release (the owner,
       2026-11-16).
 - [ ] Jev mode: `/v1/systemone` exists and answers 501; `Engine::decide` on the real runtime. Later.
