@@ -93,6 +93,18 @@ between cards stay with the model. Today the two models share almost nothing ins
       Suspected: a page on its way from RAM to the SSD is found in neither while the write runs.
 
 ### Speculation that pays (output unchanged)
+- [ ] Experts read ahead from the drafts (the owner's idea, 2026-11-18; no engine has it:
+      TensorFold's drafts and routing do not interact, Strata and TokenWing predict within one
+      token only). The drafts name the next tokens a round before they are verified; reading
+      their experts ahead (SSD to RAM, RAM to VRAM) during the drafting step and the round
+      makes window rows cheap, and with them trees on a mixture of experts. A token alone does
+      not name its experts, so: (1) route memory: for the `ngram` drafter's copied text, the
+      picks recorded when the copied tokens ran before (about 1 KiB a token); (2) a table of
+      each token's usual experts per layer, kept by decayed counts, for `mtp` and `dflash`
+      drafts; (3) a tree's branches weighted by their chance, within the drive's measured pace
+      (the read-ahead's caps); (4) a tree priced by the tiers its rows' predicted experts are
+      in. Measure first: how many picks (1) and (2) predict, and how much time a round leaves
+      for reads; then decide on trees for Flash-Next again (the gap study put them later).
 The MTP block is in `main` (`--drafters <file>`): exact. Measured 2026-11-16 on two cards
 with `--ram 8G` (the runs are in "What made the MTP block of Flash-Next pay" in
 `ARCHITECTURE.md`): with the block 21 to 35 tokens per second on new text and 27 to 64 the
