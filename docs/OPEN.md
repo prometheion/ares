@@ -537,6 +537,15 @@ Flash-Next); experts that do not fit in VRAM in RAM; K/V in int8. Its README giv
 - [ ] Audio, video and Gemma 4 are backlog: none of them blocks the first release (the owner,
       2026-11-16).
 - [ ] Jev mode: `/v1/systemone` exists and answers 501; `Engine::decide` on the real runtime. Later.
+      Reference (2026-11-18): Flide, https://github.com/OmniJev/Flide (Apache-2.0, Python and
+      Triton, a server for the Jev `/v1/systemone` API, paper arXiv:2610.42148): "exact state
+      forking", one state forked into the questions, each answered in one forward pass, the
+      answer the one the model gives the question alone; a gated delta-rule kernel (from
+      flash-linear-attention), so recurrent state is forked as in our models; Qwen3.5 and Gemma 4
+      chat models and the OneJev / Open-Jev decision models; several requests in one body, up
+      to 256 options a question, a session cache (`--session-cache-gb`), `--batch-invariant`.
+      Its numbers (one H200, OneJev1.6-0.8B): one email of eight questions in 10.0 ms, 10,000
+      in 28 s; "up to 9.5 times faster than vLLM and SGLang".
 - [ ] Turing. Later.
 - [ ] K/V of a running sequence beyond VRAM (P16; an exception, low priority).
 
