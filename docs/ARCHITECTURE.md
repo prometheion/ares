@@ -4314,7 +4314,11 @@ room is short, `fit_shares`). That is how the plan places the heads
 own, and when that does not fit wherever the heads are, the heads go by room
 and the context is what VRAM holds. Shares given (`AttentionShares::Given`)
 are for tests and measurements. `tests/real_devices.rs` loads the 27B three
-ways and compares the planned pages and the text.
+ways and compares the planned pages and the text: two sequences, K and V in
+`q8`, no drafters, 890 pages with the heads following the weights, 1770 with a
+quarter of them on the 4070, and 1946 (248 832 tokens: the model's 262 144 do
+not fit at `q8`, so the heads go by room) by the context; the same German
+answer in all three (2026-11-22).
 
 **Flash-Next: the second card as an expert tier.** With both cards on every
 layer, the card that mixes (`TensorChoice::mixer`) holds the residual streams,
