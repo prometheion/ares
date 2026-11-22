@@ -356,6 +356,45 @@ other differed more by the load than by the drafts.
       tests measure them).
 
 ### Experts from the SSD
+**UD-Q4_K_XL from the SSD against Strata** (2026-11-22, branch `flash/ssd-stream`; the test
+machine, 104 GiB file, `--ram 40G` against `--resident-budget-gib 40`; notes
+`/var/tmp/ares-flash-ssd/notes.md`). Against Strata 0.2.15 (engine 0.1.60) with drafts: decode
+ahead (de 12.9/21.9, en 16.5/26.8, code 11.1/17.5 tokens/s first/second ask against 9.0/10.9,
+9.7/13.0, 11.6/18.7), a 2k prompt ahead (17.3 s against 25.4), 8k 12 % behind, 32k 43 %
+behind (334 against 588 tokens/s), the second ask of a short prompt 3.2 s against 0.5-0.8.
+Strata 0.2.19 (engine 0.1.65, decode +47-59 %, prefill +42 % on this quant by its notes) is
+owed a measurement. Found:
+- [ ] **Prompts are bound by the link.** A wide step uploads every expert it picks that VRAM
+      does not hold (the loan leaves 20-40 a layer), from RAM or staging, once per step: the
+      32k prompt uploaded 428 GB in 96 s (4.46 GB/s, ~0.7 ms an expert; ~363 a layer = the
+      ~250 ms a layer took), and read 170 GB from the drive beside it (1.74 GB/s of 2.4). Steps
+      of 4096 rows make 8 passes; Strata reads it in 2 chunks of 21 248. With the MTP block's
+      675 MiB of resident experts the 16 GB card cannot lend 8192 rows even at the loan's floor
+      of a row's picks (without the block it can). The levers: a CPU share of the experts a
+      wide step picks for few rows (Strata's prefill does this up to 3072-token chunks), less
+      scratch per row (0.67 MiB), or the layer-major pass below; all model work, the owner's.
+- [ ] **A short wide step costs what a long one does.** The cost of a step from the SSD is the
+      experts it touches, not its rows: a prompt of 69 tokens (one step) took 3.2-4.0 s, a
+      replay of 111 rows 18 s. Steps of 8 rows (the CPU serves what RAM holds) may be cheaper
+      for short prompts; the conductor's prices of wide steps are measured at the start on one
+      token repeated and say 270 ms for 64 rows. Being measured (`round6`).
+- [ ] **The second ask replays the prompt.** Checkpoints of recurrent state stand only on page
+      boundaries (128 cells) and a message boundary 1024 cells after the last one, so a prompt
+      of fewer than 129 tokens resumes from 0 (3 cells) and a 623-token one from 512; from the
+      SSD every replayed slice is a wide step (3 to 30 s). Strata resumes 7 tokens before the
+      end (its newest path). A checkpoint at a prompt's exact end, or the newest path kept, is
+      the cache's (`cache/checkpoints`) and the owner's decision.
+- [ ] Strata uses the page cache beyond its budget: 12.2 GiB of the model's pages were cached
+      at the end of its decode session (MemAvailable 12.8 GiB while loaded, Ares 20.7 GiB at
+      `--ram 40G`). Equal budgets are not equal memory; Ares at `--ram 52G` is owed.
+- [ ] Decode waits for the drive: 2-7 % of the picks come from the file (17-25 reads a token
+      at 3.3-4.6 ms each, 27-90 MB a token), and the layers waited 64 ms a token of 77 on
+      German prose. The read-ahead of predictions was used 50-63 % where it read; its odds by
+      place are now in the log.
+- [x] The reader is not the limit: on this drive (btrfs zstd, kyber) it reaches 2.3-2.7 GB/s
+      for random experts at 2 to 64 in flight with any queue depth from 4 to 64 and whole
+      demand reads (pieces of 256 or 128 KiB are slower); file order does not matter.
+
 Reference now in the open (2026-11-17): Run My AI's engine TokenWing, MIT, built on llama.cpp,
 https://github.com/runmyai/tokenwing (`docs/how-it-works.md`, `docs/architecture.md`,
 `docs/settings.md`); it runs Qwen3.8 Flash-Next (IQ3_S and UD-Q4_K_XL). Its README: expert reads
