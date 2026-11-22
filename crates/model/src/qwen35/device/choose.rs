@@ -10,7 +10,10 @@
 //! a card, ahead on others. Which it is depends on the type, the shape and the
 //! card, so it is measured, before the weights are placed:
 //!
-//! - once per type, which kernel of the device layout serves which number of
+//! - once per type, which path of the tile kernels multiplies it in the file's
+//!   layout (`Kernels::measure_prefill_path`, 30 to 80 ms, on a card whose
+//!   tensor cores run f32 accumulation at full rate; a capped card keeps its
+//!   rule), and which kernel of the device layout serves which number of
 //!   rows above those of a decode step (`Kernels::measure_layout`, about 50 ms),
 //!   and once per type and shape how the kernels for a decode step launch
 //!   (`Kernels::tune_layout`, a few milliseconds);
@@ -91,7 +94,7 @@ use std::time::{Duration, Instant};
 use ares_core::GgmlType;
 use ares_cuda::{
     ActivationForm, Device, DeviceBuffer, DevicePtr, Event, Kernels, LayerKernels, MAX_BATCH,
-    OutputGate, Precision, PrefillPath, Stream, WeightLayout,
+    OutputGate, Precision, PrefillChoice, PrefillPath, Stream, WeightLayout,
 };
 use ares_runtime::ModelError;
 
@@ -249,6 +252,10 @@ pub struct LayoutReport {
     pub bytes: [u64; 2],
     /// The bytes the device layout added: rows rounded up to 16.
     pub padding: u64,
+    /// The path of the tile kernels each type takes in the file's layout
+    /// (`Kernels::measure_prefill_path`, measured where the tensor cores run f32
+    /// accumulation at full rate).
+    pub paths: Vec<PrefillChoice>,
     /// How long the tables of the kernels and the probes took.
     pub tables: Duration,
     pub probes_time: Duration,
@@ -553,6 +560,10 @@ impl<'a> Chooser<'a> {
                 balance.exchange(index, Told::default());
             }
         };
+        if let Err(error) = self.measure_paths() {
+            nothing_to_tell();
+            return Err(error);
+        }
         let prompt_weight = match self.policy {
             Layouts::File => {
                 nothing_to_tell();
@@ -711,6 +722,28 @@ impl<'a> Chooser<'a> {
         self.report.decode_ms = decode_ms.map(|ms| ms as f32);
         self.report.prompt_ms = prompt_ms.map(|ms| ms as f32);
         self.decided = Some(decided);
+        Ok(())
+    }
+
+    /// Which path of the tile kernels each type of the groups takes in the
+    /// file's layout, measured once per type before anything is probed (the
+    /// probes of the file's layout run with it). Exact products take the exact
+    /// path and measure nothing.
+    fn measure_paths(&mut self) -> Result<(), ModelError> {
+        if self.precision != Precision::Fast || !self.kernels.has_prefill_kernels() {
+            return Ok(());
+        }
+        let begun = Instant::now();
+        let mut types: Vec<GgmlType> =
+            self.groups.iter().flat_map(|g| g.shapes.iter().map(|s| s.0)).collect();
+        types.sort_by_key(|t| t.name());
+        types.dedup();
+        for ty in types {
+            if self.kernels.has_prefill_path(ty, PrefillPath::F16) {
+                self.report.paths.push(self.kernels.measure_prefill_path(ty)?);
+            }
+        }
+        self.report.tables += begun.elapsed();
         Ok(())
     }
 

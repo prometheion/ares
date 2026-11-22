@@ -1091,6 +1091,56 @@ fn the_path_follows_the_measured_tensor_core_rate() {
     }
 }
 
+/// The path measured per type: on a card whose tensor cores run f32 accumulation at full
+/// rate the most exact of the paths within 5 % of the fastest, kept for the type and taken by
+/// `prefill_path_for`; on a capped card the kept rule, unmeasured. The times are printed.
+#[test]
+fn the_measured_path_is_the_most_exact_of_the_fastest() {
+    let Some(gpus) = gpus() else { return };
+    for device in gpus {
+        let kernels = Kernels::load(device).unwrap();
+        if !kernels.has_prefill_kernels() {
+            continue;
+        }
+        let full = kernels.tensor_cores_full_rate();
+        for ty in [GgmlType::Q4_K, GgmlType::Q8_0, GgmlType::IQ3_S, GgmlType::Q4_0, GgmlType::F16] {
+            let kept = kernels.prefill_path_for(ty, Precision::Fast).unwrap();
+            let choice = kernels.measure_prefill_path(ty).unwrap();
+            eprintln!("{}: {ty} {choice:?}", device.info().name);
+            assert_eq!(choice.ty, ty);
+            assert_eq!(choice.measured, full, "{ty}");
+            assert_eq!(kernels.prefill_path_for(ty, Precision::Fast).unwrap(), choice.path);
+            assert_eq!(kernels.prefill_path_for(ty, Precision::Exact).unwrap(), PrefillPath::F16);
+            assert_eq!(kernels.measure_prefill_path(ty).unwrap(), choice, "measured once");
+            assert_eq!(kernels.prefill_choice(ty).unwrap(), choice);
+            if !full {
+                assert_eq!(choice.path, kept, "{ty}: a capped card keeps its rule");
+                continue;
+            }
+            assert_eq!(kept, PrefillPath::F16, "{ty}: unmeasured, the exact path");
+            let ms = |path: PrefillPath| match path {
+                PrefillPath::Int8 => choice.probe_ms[0],
+                PrefillPath::F16 => choice.probe_ms[1],
+                PrefillPath::F16Flush => choice.probe_ms[2],
+            };
+            for path in PATHS {
+                assert_eq!(
+                    ms(path).is_finite(),
+                    kernels.has_prefill_path(ty, path),
+                    "{ty} {path:?}"
+                );
+            }
+            let fastest = choice.probe_ms.iter().copied().fold(f32::INFINITY, f32::min);
+            assert!(ms(choice.path) <= fastest * 1.05, "{ty} {choice:?}");
+            // Every path more exact than the chosen one is slower by more than 5 %.
+            let order = [PrefillPath::F16, PrefillPath::F16Flush, PrefillPath::Int8];
+            for path in order.iter().take_while(|p| **p != choice.path) {
+                assert!(ms(*path) > fastest * 1.05, "{ty} {path:?} {choice:?}");
+            }
+        }
+    }
+}
+
 /// Refusals happen before anything is launched: a type without a prefill kernel
 /// names the types that have one, and the sizes and alignments the kernels rely
 /// on are checked.

@@ -146,6 +146,22 @@ impl State {
             })?;
         }
         let types = dense_types(w);
+        // The path of the tile kernels each dense type takes, measured where the tensor
+        // cores run f32 accumulation at full rate (a capped card keeps its rule). The
+        // weights are on the device already: where the probe finds no room for its
+        // matrix, the type keeps the rule as well.
+        if opts.precision == Precision::Fast {
+            for ty in &types {
+                if kernels.has_prefill_path(*ty, PrefillPath::F16) {
+                    match kernels.measure_prefill_path(*ty) {
+                        Err(e) if e.is_out_of_memory() => {}
+                        other => {
+                            other?;
+                        }
+                    }
+                }
+            }
+        }
         // One form of activations for every dense matrix, so that each fused kernel writes
         // one: the form the options' precision gives all of them, else the exact one, which
         // is f16 for all.

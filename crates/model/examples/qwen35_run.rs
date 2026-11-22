@@ -608,6 +608,27 @@ fn print_layouts(report: &PartReport, all: bool) {
         l.probe_bytes as f64 / MIB,
         l.tables.as_secs_f64() * 1e3,
     );
+    if !l.paths.is_empty() {
+        let paths: Vec<String> = l
+            .paths
+            .iter()
+            .map(|c| {
+                let ms = c
+                    .probe_ms
+                    .map(|ms| if ms.is_finite() { format!("{ms:.3}") } else { "-".into() });
+                format!(
+                    "{} {:?}{} (int8 {} f16 {} f16 flushed {} ms)",
+                    c.ty.name(),
+                    c.path,
+                    if c.measured { "" } else { " kept" },
+                    ms[0],
+                    ms[1],
+                    ms[2]
+                )
+            })
+            .collect();
+        println!("RES layout device {} tile paths: {}", report.index, paths.join(", "));
+    }
     if !l.probes.is_empty() {
         println!(
             "RES layout device {}: by the probes the weight products of a decode step take \

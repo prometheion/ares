@@ -5,6 +5,8 @@
 //! promise the ranges are right; this layer turns shapes into grid sizes and
 //! keeps the argument lists in one place next to the kernel names.
 
+use std::sync::Arc;
+
 use ares_core::GgmlType;
 
 use crate::device::Device;
@@ -14,10 +16,12 @@ use crate::module::{Args, Function, Module};
 use crate::stream::{Event, Stream};
 
 mod layout;
+mod paths;
 
 pub use layout::{
     ActivationForm, FEW_ROWS, FewPlan, LayoutKernel, LayoutRows, LayoutTable, WeightLayout,
 };
+pub use paths::PrefillChoice;
 
 /// The kernel module `build.rs` compiled from `kernels/module.cu`: every GPU
 /// the toolkit builds for can load it.
@@ -400,14 +404,10 @@ pub struct PrefillShape {
 /// What a caller of the prefill family asks for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Precision {
-    /// The path this device takes by default ([`Kernels::prefill_path`]): f16 where
-    /// the tensor cores run it at full rate, since the direct product is then
-    /// both the more exact and, in principle, as fast, and on GeForce cards with
-    /// the cap the fastest path per type ([`Kernels::prefill_path_for`]): int8, or
+    /// The fastest path per type ([`Kernels::prefill_path_for`]): where the tensor
+    /// cores run f32 accumulation at full rate the one measured on the device, the
+    /// exact f16 path wherever it is as fast; on GeForce cards with the cap int8, or
     /// f16 with f16 accumulation where that is as fast.
-    ///
-    /// The rate of an uncapped card could not be measured on the machine the
-    /// kernels were written on (both its GPUs are capped).
     #[default]
     Fast,
     /// Always the f16 path with f32 accumulation. More exact than int8, and on a
@@ -432,6 +432,8 @@ struct Prefill {
     /// Whether `mma` with f32 accumulation runs as fast as with f16
     /// accumulation (measured at load).
     full_rate: bool,
+    /// The paths measured per type ([`Kernels::measure_prefill_path`]).
+    choices: paths::Choices,
 }
 
 /// The kernels of the engine on one device.
@@ -464,6 +466,7 @@ impl Prefill {
             layouts: layout::Layouts::load(&module, limit)?,
             convert_f16: module.function("ares_convert_f16")?,
             full_rate: probe_full_rate(device, &module)?,
+            choices: Arc::default(),
         })
     }
 
@@ -1037,10 +1040,11 @@ impl Kernels {
     }
 
     /// The path the prefill family takes on this device for the requested
-    /// precision. [`Precision::Exact`] is always [`PrefillPath::F16`].
-    /// [`Precision::Fast`] is f16 where the tensor cores run it at full rate,
-    /// since the direct product is then both fast and the more exact, and int8
-    /// where they do not (measured: [`Kernels::tensor_cores_full_rate`]).
+    /// precision, whatever the type. [`Precision::Exact`] is always
+    /// [`PrefillPath::F16`]. [`Precision::Fast`] is f16 where the tensor cores run it
+    /// at full rate and int8 where they do not
+    /// ([`Kernels::tensor_cores_full_rate`]); the path of a type is
+    /// [`Kernels::prefill_path_for`]'s.
     ///
     /// The path also decides the format the activations are prepared in
     /// ([`Kernels::prepare_prefill_activations`]), so a caller that wants one
@@ -1055,28 +1059,23 @@ impl Kernels {
         })
     }
 
-    /// The path to use for a matrix of `ty` under `precision`: [`Kernels::prefill_path`],
-    /// except that on a capped card [`Precision::Fast`] takes [`PrefillPath::F16Flush`]
-    /// for the types where it is not slower than int8 (measured at 1024 rows on an RTX
-    /// 4070 and an RTX 3060: Q4_K 1.04 and 1.02 times, IQ2_S 1.18 and 1.05, IQ2_XS
-    /// 1.08 and 1.06; for the others 0.74 to 0.91): the same speed with 0.05 % instead
-    /// of 1.1 % rms error. The activations are prepared per path
+    /// The path to use for a matrix of `ty` under `precision`. [`Precision::Exact`] is
+    /// always [`PrefillPath::F16`]. [`Precision::Fast`] is, on a card whose tensor cores
+    /// run f32 accumulation at full rate, the path [`Kernels::measure_prefill_path`]
+    /// measured for the type (the most exact of those as fast as the fastest), and
+    /// [`PrefillPath::F16`] for a type that was not measured. On a capped card it is
+    /// int8, except [`PrefillPath::F16Flush`] for the types where that is not slower
+    /// (measured at 1024 rows on an RTX 4070 and an RTX 3060: Q4_K 1.04 and 1.02 times,
+    /// IQ2_S 1.18 and 1.05, IQ2_XS 1.08 and 1.06; for the others 0.74 to 0.91) and for
+    /// those without an int8 kernel: the same speed with 0.05 % instead of 1.1 % rms
+    /// error. The activations are prepared per path
     /// ([`Kernels::prepare_prefill_activations`]), so a caller with matrices of several
     /// types prepares an input in each format it uses.
     pub fn prefill_path_for(&self, ty: GgmlType, precision: Precision) -> Result<PrefillPath> {
-        let path = self.prefill_path(precision)?;
-        let has_int8 = self
-            .prefill_kernels()?
-            .types
-            .iter()
-            .find(|(t, ..)| *t == ty)
-            .is_none_or(|(.., paths)| paths[0].is_some());
-        Ok(match (precision, path) {
-            (Precision::Fast, PrefillPath::Int8) if FLUSH_AS_FAST.contains(&ty) || !has_int8 => {
-                PrefillPath::F16Flush
-            }
-            _ => path,
-        })
+        match precision {
+            Precision::Exact => self.prefill_path(precision),
+            Precision::Fast => Ok(self.prefill_choice(ty)?.path),
+        }
     }
 
     fn prefill_kernels(&self) -> Result<&Prefill> {
