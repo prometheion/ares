@@ -205,7 +205,7 @@ fn boundaries(
         return Vec::new();
     }
     // The message a reply continues ends the prompt inside its text.
-    let marked_count = messages.len() - usize::from(continue_final);
+    let marked_count = messages.len().saturating_sub(usize::from(continue_final));
     let mut marked = messages.to_vec();
     for (i, message) in marked.iter_mut().enumerate().take(marked_count) {
         let Content::Text(text) = &message.content else { continue };
