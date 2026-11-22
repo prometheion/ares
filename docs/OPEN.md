@@ -1089,6 +1089,16 @@ DSpark drafter `dspark-Inkling-2-Mini-Q8_0.gguf`, 0.4 GB). Notes: `/var/tmp/ares
         take over the page's memory instead.
   - [ ] The share of the room for K and V in VRAM (a thirty-second, `plan::NEAR_SHARE`) is the old
         rule's, not measured against other shares.
+  - [ ] The tokens right after a long prompt decode slower than before (test machine, 65 100
+        tokens: 11.6 to 12.0 tokens/s against 14.2 to 15.5 in three of four runs of the build
+        before), where the same context decodes faster than before once the tiers are warm (16.1
+        and 17.8 against 14.8 and 9.4) and the prompt reads 2.1 times as fast. Not explained;
+        the bench puts the far reads at 2.6 ms a token there. Wanted: the same build with
+        `--context` covering the prompt (all K and V in VRAM) against the default, on a quiet
+        machine.
+  - [ ] Pages are near or far by their number: the newest pages of a long sequence are the far
+        ones, so its newest cells (often picked by the indexer) are read over the link. Keeping the
+        newest pages in VRAM needs pages that move between the pools.
   - [x] Two cards (a split by layers: a far pool per part; both cards on every layer: the mixer's):
         `qwen4exp_runtime k_and_v_beyond_vram_change_no_token` passes on the RTX 4070 + RTX 3060
         (2026-11-22). Not run with the real file on two cards.
