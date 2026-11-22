@@ -62,9 +62,10 @@ Merged 2026-11-22 after the test machine's one card passed every GPU suite (`fix
 | Flash-Next decodes UD-Q3_K_XL at least as fast as Strata on the test machine (the owner, 2026-11-22): CPU kernels for every expert type, then the next lever by measurement | handed back, being verified (`flash/cpu-experts`): with drafts 26 -> 34 to 36 tokens/s at 40G, ahead of Strata 0.1.60 (29.9); Strata 0.1.65 not measured yet |
 | Flash-Next prompts at least as fast as Strata (176 / 250 / 281 against 198 / 787 / 1192 tokens/s at 2k / 8k / 32k), and a nearly cached turn read as if uncached (31 s for 6832 tokens with 6784 cached; Strata 0.4 s) | agent working (`flash/prompt`) |
 | Flash-Next UD-Q4_K_XL (104 GiB, larger than RAM) streamed from the SSD against Strata, then Ares's reading path | agent working on the test machine (`flash/ssd-stream`) |
-| 6: K/V beyond VRAM into RAM, and K/V VRAM nobody uses yet serving the expert tier | agent working on the test machine (`kv/overflow`) |
+| 6: K/V beyond VRAM into RAM (Flash-Next) | handed back, continuing: finished requests' far pages as prompt cache (the owner), the control run for decode after a long prompt (`kv/overflow`) |
 | 7 and the server part of 8: priorities of requests, system messages and efforts on the chat and Responses routes, Messages items, thinking budget, special tokens, truncation, small ones | handed back, being verified (`server/priorities`) |
-| Image input, pieces 4 to 8 (the owner, 2026-11-22: next, for production): the tower as a conductor job, the splices in both models, the routes, caching | agent working (`image/input`) |
+| Image input, pieces 4 to 8 (the owner, 2026-11-22: next, for production): the tower as a conductor job, the splices in both models, the routes, caching | handed back; with the CPU kernels and the priorities in one line of commits (`server/priorities`), being verified on the local cards |
+| Flash-Next's second card measured at load (experts only or a dense share), capped cards measuring their prefill path per type, the MTP test that fails split by layers | agent working on the local cards (`devices/load-choice`) |
 
 ## Shared model layer (the owner's rule, 2026-11-16)
 Generic for Ares, not like llama.cpp: a few models, shared code where it can be, each model
