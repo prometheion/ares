@@ -98,12 +98,12 @@ pub struct LoadOptions {
     pub split: Option<SplitKind>,
     /// Each device's share of the weights under a split.
     pub shares: Option<Vec<f64>>,
-    /// Each device's share of the KV heads of the attention blocks under a
-    /// tensor split, with their K and V and their attention work; the rest
-    /// of the model follows `shares`. `None`: the heads follow `shares` too.
-    /// No option of the command line sets it yet: its name and form are the
-    /// owner's to choose (`docs/OPEN.md`, "Roles of the cards").
-    pub attention_shares: Option<Vec<f64>>,
+    /// Where a tensor split puts the KV heads of the attention blocks, with
+    /// their K and V and their attention work; the rest of the model follows
+    /// `shares`. `None`: the heads follow `shares` too. No option of the
+    /// command line sets it yet: its name and form are the owner's to choose
+    /// (`docs/OPEN.md`, "Roles of the cards").
+    pub attention: Option<AttentionShares>,
     /// Tokens of sequence state the engine holds for all sequences together.
     pub context: Option<u32>,
     /// Sequences that run at once.
@@ -159,7 +159,7 @@ impl LoadOptions {
             devices: None,
             split: None,
             shares: None,
-            attention_shares: None,
+            attention: None,
             context: None,
             parallel: None,
             kv: None,
@@ -178,6 +178,16 @@ impl LoadOptions {
             expert_prune: None,
         }
     }
+}
+
+/// Where a tensor split puts the KV heads of the attention blocks.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AttentionShares {
+    /// Each device's share, as given.
+    Given(Vec<f64>),
+    /// The shares with which the devices hold the most context
+    /// ([`attention_by_room`]).
+    MostContext,
 }
 
 /// Each device's share of the weights when the operator names none: in
@@ -231,6 +241,21 @@ pub fn fit_shares(wanted: &[f64], most: &[f64]) -> Option<Vec<f64>> {
         }
     }
     None
+}
+
+/// Each device's share of the attention heads that lets the devices hold the
+/// most context, from `room[i]`: the bytes device `i` has left once it holds
+/// everything of the model but the attention heads, their weights and their
+/// K and V.
+///
+/// A head's weights and its K and V take the same bytes on every device, so
+/// with `a[i]` of the heads, `w` bytes of all heads' weights and `p` of all
+/// heads' K and V per page, `n` pages fit when `a[i] * (w + p * n) <= room[i]`
+/// on every device. The most pages fit when the heads follow the rooms. `None`
+/// when no device has room.
+pub fn attention_by_room(room: &[u64]) -> Option<Vec<f64>> {
+    let total: u64 = room.iter().sum();
+    (total > 0).then(|| room.iter().map(|r| *r as f64 / total as f64).collect())
 }
 
 /// What a device has to give and what a model takes of it, in bytes: the
@@ -442,6 +467,29 @@ mod tests {
             "--ram 0 B is less than the 1.0 KiB the engine needs to run (1024 bytes): 1.0 KiB \
              for its step buffers"
         );
+    }
+
+    #[test]
+    fn attention_heads_follow_the_room_and_that_holds_the_most_pages() {
+        // Two devices with 2 and 6 GiB left; the heads' weights take 1 GiB,
+        // their K and V 1 MiB a page.
+        let (w, p) = (1u64 << 30, 1u64 << 20);
+        let room = [2u64 << 30, 6 << 30];
+        let shares = attention_by_room(&room).unwrap();
+        assert_eq!(shares, vec![0.25, 0.75]);
+        let pages = |a: &[f64]| {
+            (0..2)
+                .map(|i| ((room[i] as f64 / a[i] - w as f64) / p as f64).floor() as u64)
+                .min()
+                .unwrap()
+        };
+        // (8 GiB - 1 GiB) / 1 MiB: every byte of both devices holds context.
+        assert_eq!(pages(&shares), 7 << 10);
+        for other in [[0.5, 0.5], [0.2, 0.8], [0.3, 0.7]] {
+            assert!(pages(&other) < pages(&shares), "{other:?}");
+        }
+        assert_eq!(attention_by_room(&[0, 0]), None);
+        assert_eq!(attention_by_room(&[0, 5]), Some(vec![0.0, 1.0]));
     }
 
     #[test]

@@ -38,8 +38,8 @@ use ares_tokenizer::ChatOptions;
 
 use crate::models::{LoadFailure, Loader, Site, Unit};
 use crate::plan::{
-    self, CELLS_PER_PAGE, DEFAULT_PARALLEL, DEFAULT_WINDOW, Drafter, LoadOptions, Room,
-    SINGLE_DEVICE_MIN_CONTEXT, SplitKind,
+    self, AttentionShares, CELLS_PER_PAGE, DEFAULT_PARALLEL, DEFAULT_WINDOW, Drafter, LoadOptions,
+    Room, SINGLE_DEVICE_MIN_CONTEXT, SplitKind,
 };
 
 /// Memory of every device that the engine leaves unreserved: for what the
@@ -642,6 +642,35 @@ pub(crate) fn read_vocabulary(path: &Path) -> Result<Arc<[u32]>, LoadError> {
     Ok(tokens.into())
 }
 
+/// The shares of the attention heads with which the devices of a tensor
+/// split by `shares` hold the most context: what each device has left once
+/// it holds everything but the heads, by estimate ([`plan::attention_by_room`]).
+fn attention_for_most_context(
+    c: &Config,
+    w: &Weights<'_>,
+    options: &Options,
+    parallel: u32,
+    held: &[Held],
+    shares: &[f64],
+    headroom: u64,
+) -> Result<Vec<f64>, LoadError> {
+    let n = held.len();
+    let mut room = Vec::with_capacity(n);
+    for (i, device) in held.iter().enumerate() {
+        // A placement in which this device holds no attention head.
+        let mut elsewhere = vec![0.0; n];
+        elsewhere[(i + 1) % n] = 1.0;
+        let placement =
+            place(c, w, &Spread::TensorWithAttention(shares.to_vec(), elsewhere), options)?;
+        let f = footprint(c, w, &placement, options, parallel)[i];
+        let taken = f.weights + f.step + f.exact + f.per_sequence * u64::from(parallel);
+        room.push(device.free.saturating_sub(headroom).saturating_sub(taken));
+    }
+    plan::attention_by_room(&room).ok_or_else(|| {
+        refuse("no device has room for the attention heads next to its share of the weights")
+    })
+}
+
 /// The placement of `spread`, with the MTP block where `Qwen35::new` puts
 /// it, to estimate with.
 fn place(
@@ -1037,7 +1066,7 @@ fn load_qwen35(
             held = vec![keep];
         }
     }
-    if options.attention_shares.is_some() && split != SplitKind::Tensor {
+    if options.attention.is_some() && split != SplitKind::Tensor {
         return Err(refuse(
             "shares of the attention heads are for a tensor split, where every device holds \
              heads of every attention block",
@@ -1096,16 +1125,30 @@ fn load_qwen35(
                     }
                 }
             };
-            match (split, &options.attention_shares) {
-                (SplitKind::Tensor, Some(attention)) if attention.len() != held.len() => {
+            match (split, &options.attention) {
+                (SplitKind::Tensor, Some(AttentionShares::Given(attention)))
+                    if attention.len() != held.len() =>
+                {
                     return Err(refuse(format!(
                         "{} shares of the attention heads for {} devices",
                         attention.len(),
                         held.len()
                     )));
                 }
-                (SplitKind::Tensor, Some(attention)) => {
+                (SplitKind::Tensor, Some(AttentionShares::Given(attention))) => {
                     (Spread::TensorWithAttention(shares, attention.clone()), why)
+                }
+                (SplitKind::Tensor, Some(AttentionShares::MostContext)) => {
+                    let attention = attention_for_most_context(
+                        &config,
+                        &weights,
+                        &part_options,
+                        parallel,
+                        &held,
+                        &shares,
+                        headroom,
+                    )?;
+                    (Spread::TensorWithAttention(shares, attention), why)
                 }
                 (SplitKind::Tensor, None) => (Spread::Tensor(shares), why),
                 _ => (Spread::Layer(shares), why),

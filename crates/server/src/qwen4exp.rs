@@ -95,7 +95,7 @@ pub(crate) fn load(
              layers per device follows what fits; --split names which of the two",
         ));
     }
-    if options.attention_shares.is_some() {
+    if options.attention.is_some() {
         return Err(refuse(
             "shares of the attention heads do nothing for this model: its attention layers, \
              their keys and values are on the device that mixes the streams",
