@@ -113,6 +113,13 @@ between cards stay with the model. Today the two models share almost nothing ins
 ## Qwen3.8 Flash-Next (`qwen4exp`)
 
 ### Found against Strata on the test machine (2026-11-22; RTX 4060 Ti 16 GB, 62 GiB RAM, UD-Q3_K_XL)
+Strata moves fast (0.2.19 / engine 0.1.65 on 2026-11-22, 0.2.20 / 0.1.66 on 2026-11-23): 0.1.66
+names fused expert kernels for all 13 Unsloth type pairs (MoE decode 1.04 to 1.67 times), INT8
+tensor-core dense formats (DFlash2 verify and chunked prefill 1.8 to 3.3 times), faster AVX2 CPU
+kernels for cold experts (Q8_0 +55 %, IQ4_XS +33 %, Q4_K +27 %), host K/V offload from 32k on
+mid-size cards, a GPU+SSD-only mode, and a fix for NaN outputs on prompts of 24k to 45k. The test
+machine's Strata is updated to the newest engine before every comparison; numbers against older
+engines below are history.
 - [x] **Crash** with the MTP block (`--drafters` the q2 block): "writing K and V reported status 0x4
       in the step before" (a row written straight into a converted entry of a tile-mean format;
       only the MTP block's K/V is `q4`) at the end of a long prompt after a few requests, 6 of 6
