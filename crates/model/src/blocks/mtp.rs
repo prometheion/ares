@@ -238,6 +238,9 @@ struct Tail {
     pos0: u32,
     row0: u32,
     tokens: Vec<u32>,
+    /// The rows' rotary positions, where the step's rows are not at their
+    /// cells (a sequence with images); empty otherwise.
+    rotary: Vec<[i32; 4]>,
     direct: bool,
     replay: bool,
     /// The drafts of the block among the rows: 0 for rows that took none.
@@ -254,6 +257,13 @@ struct KeyRow {
     /// The row of the hidden states it starts from: of the model's last step,
     /// or of the carries (a slot; `max_slots` for zeros).
     hidden: u32,
+    /// The rotary position of the cell it writes, where that is not the cell.
+    rotary: Option<[i32; 4]>,
+}
+
+/// A rotary position moved by `by` cells of text.
+fn moved(rotary: [i32; 4], by: i32) -> [i32; 4] {
+    [rotary[0] + by, rotary[1] + by, rotary[2] + by, rotary[3]]
 }
 
 /// A launch that only writes keys, as laid out in the upload.
@@ -337,6 +347,9 @@ pub(crate) struct Driver {
     max_links: u32,
     pending: Option<MtpStep>,
     tails: Vec<Tail>,
+    /// The rotary positions of the rows of the step being enqueued, where they
+    /// are not their cells ([`Driver::set_rotary`]).
+    rotary: Vec<[i32; 4]>,
     /// The newest cells (slot, pair) that a step that only drafted wrote as
     /// link 0: the model's step that verifies the drafts does not write them
     /// again.
@@ -457,6 +470,7 @@ impl Driver {
             max_links: links as u32,
             pending: None,
             tails: Vec::new(),
+            rotary: Vec::new(),
             newest_done: Vec::new(),
             drafted: 0,
             picks_host: PinnedBuffer::new(device, (links * chains) as usize * SamplePick::BYTES)?,
@@ -680,7 +694,15 @@ impl Driver {
             }
         }
         let tokens: Vec<u32> = rows.iter().map(|r| r.token).collect();
-        let mut record = StepRecord::new(&segments, &tokens, None, &[])?;
+        let rotary: Option<Vec<[i32; 4]>> = rows.iter().any(|r| r.rotary.is_some()).then(|| {
+            rows.iter()
+                .map(|r| {
+                    let cell = (r.pair - lag) as i32;
+                    r.rotary.unwrap_or([cell, cell, cell, 0])
+                })
+                .collect()
+        });
+        let mut record = StepRecord::new(&segments, &tokens, rotary.as_deref(), &[])?;
         for (i, s) in segments.iter().enumerate() {
             if replay_rows.iter().any(|r| r.contains(&s.row0)) {
                 record.mark_replay(i)?;
@@ -860,6 +882,8 @@ impl Driver {
                     pair: tail.pos0 + r,
                     token: tail.tokens[r as usize],
                     hidden: tail.row0 + r - 1,
+                    // The cell `lag` before the pair's, a row of this tail.
+                    rotary: tail.rotary.get((r as usize).wrapping_sub(lag as usize)).copied(),
                 }));
             }
             carries.push((tail.slot, tail.row0 + counted - 1));
@@ -890,6 +914,13 @@ impl Driver {
             layer.settle(slot, cells);
         }
         Ok(())
+    }
+
+    /// The rotary positions of the rows of the step enqueued next, a set of
+    /// four per row, or none when every row is at its cell: the keys the block
+    /// writes and the links of its chains are rotated by them.
+    pub fn set_rotary(&mut self, rotary: Vec<[i32; 4]>) {
+        self.rotary = rotary;
     }
 
     /// Steps 2 and 3, after the step's tables are written: the newest cell of
@@ -939,6 +970,8 @@ impl Driver {
                 pair: s.pos0 as u32,
                 token: tokens[s.row0 as usize],
                 hidden: if s.pos0 == 0 { zero } else { s.slot },
+                // The cell before the newest token is text.
+                rotary: self.rotary.get(s.row0 as usize).map(|r| moved(*r, -(lag as i32))),
             })
             .collect();
         self.times.key_rows += quiet.len() as u64;
@@ -990,6 +1023,10 @@ impl Driver {
                 pos0: s.pos0.max(0) as u32,
                 row0: s.row0,
                 tokens: tokens[s.row0 as usize..(s.row0 + s.n_rows) as usize].to_vec(),
+                rotary: self
+                    .rotary
+                    .get(s.row0 as usize..(s.row0 + s.n_rows) as usize)
+                    .map_or_else(Vec::new, <[[i32; 4]]>::to_vec),
                 direct: s.direct,
                 replay: replay.iter().any(|r| r.contains(&s.row0)),
                 // The drafts of the chain that the window verifies.
@@ -1091,7 +1128,21 @@ impl Driver {
                 chains.iter().map(|c| if j == 0 { c.token } else { 0 }).collect();
             // Every row of a link has its logits.
             let wanted: Vec<u32> = (0..n).collect();
-            let record = StepRecord::new(&link_segments, &tokens, None, &wanted)?;
+            // A link's cell is text after the newest token's.
+            let rotary: Option<Vec<[i32; 4]>> = (!self.rotary.is_empty()).then(|| {
+                chains
+                    .iter()
+                    .zip(&link_segments)
+                    .map(|(chain, link)| {
+                        let s = segments[chain.segment as usize];
+                        match self.rotary.get(s.row0 as usize) {
+                            Some(r) => moved(*r, j as i32 - lag as i32),
+                            None => [link.pos0, link.pos0, link.pos0, 0],
+                        }
+                    })
+                    .collect()
+            });
+            let record = StepRecord::new(&link_segments, &tokens, rotary.as_deref(), &wanted)?;
             let bytes = record.as_bytes();
             let at_record = *end;
             let at_params = (at_record + bytes.len() as u64).next_multiple_of(16);

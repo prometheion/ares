@@ -730,7 +730,9 @@ impl Part {
             return Ok(());
         }
         self.mtp_follow(env.stream, env.tables, env.pages)?;
+        let rotary = self.rotary_of_step();
         self.with_mtp(|(driver, layer, layers)| {
+            driver.set_rotary(rotary);
             driver.step(
                 layer,
                 layers,

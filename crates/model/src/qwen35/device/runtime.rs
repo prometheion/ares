@@ -781,6 +781,18 @@ impl DeviceModel for Qwen35Device {
             }
             place += links;
         }
+        // The rows' rotary positions where they are not their cells (a
+        // sequence with images): the records of the part's groups and the MTP
+        // block's take them.
+        let at_cells = (0..record.rows()).all(|i| {
+            let p = record.row(i).position;
+            record.rotary(i) == [p, p, p, 0]
+        });
+        self.part.set_rotary(if at_cells {
+            Vec::new()
+        } else {
+            (0..record.rows()).map(|i| record.rotary(i).map(|p| p as i32)).collect()
+        });
         if self.part.has_mtp() {
             self.part.mtp_step(MtpStep {
                 tokens: step.record_on_device.offset(record.tokens_offset()),
@@ -818,18 +830,8 @@ impl DeviceModel for Qwen35Device {
             return Ok(None);
         }
         // The rows of the step's image cells, which the part that embeds copies
-        // over the rows it gathers, and the rows' rotary positions where they
-        // are not their cells (for the records of the part's groups).
+        // over the rows it gathers.
         self.part.splice_rows(rows::image_splices(record, step.image_stage, self.part.width()));
-        let at_cells = (0..record.rows()).all(|i| {
-            let p = record.row(i).position;
-            record.rotary(i) == [p, p, p, 0]
-        });
-        self.part.set_rotary(if at_cells {
-            Vec::new()
-        } else {
-            (0..record.rows()).map(|i| record.rotary(i).map(|p| p as i32)).collect()
-        });
         self.part.enqueue(&StepEnv {
             stream: step.stream,
             step: step.record_on_device,

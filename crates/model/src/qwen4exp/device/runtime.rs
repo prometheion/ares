@@ -1662,6 +1662,7 @@ impl Qwen4Exp {
         }
         Ok(Box::new(Qwen4ExpDevice {
             tower,
+            rotary: Vec::new(),
             index,
             devices: n,
             by_layers: self.placement.tensor.is_none(),
@@ -1914,6 +1915,8 @@ impl Model for Qwen4Exp {
 struct Qwen4ExpDevice {
     /// The image tower, on the part that runs it.
     tower: Option<TowerAt>,
+    /// The rotary positions of the step's rows, where they are not their cells.
+    rotary: Vec<[i32; 4]>,
     index: usize,
     devices: usize,
     /// Whether the devices hold a range of layers each (and hand the residual
@@ -2035,6 +2038,20 @@ impl Qwen4ExpDevice {
         self.chains.clear();
         self.passes.clear();
         self.replay.clear();
+        // The rows' rotary positions where they are not their cells (a
+        // sequence with images): the step's record and the MTP block's take
+        // them.
+        self.rotary.clear();
+        let at_cells = (0..rows).all(|i| {
+            let p = record.row(i).position;
+            record.rotary(i) == [p, p, p, 0]
+        });
+        if !at_cells {
+            self.rotary.extend((0..rows).map(|i| record.rotary(i).map(|p| p as i32)));
+        }
+        if let Some(block) = &mut self.mtp {
+            block.set_rotary(self.rotary.clone());
+        }
         let (mut bar, mut place) = (0, 0);
         for i in 0..record.segments() {
             let segment = record.segment(i);
@@ -2259,17 +2276,10 @@ impl Qwen4ExpDevice {
         // The residual streams start from the embeddings, which the part that
         // embeds stages and gathers itself (`blocks/rows.rs`).
         // The rows of the step's image cells, copied over the gathered ones by
-        // the part that embeds, and the rows' rotary positions where they are
-        // not their cells (a sequence with images).
+        // the part that embeds.
         self.part.splice_rows(rows::image_splices(record, step.image_stage, self.part.n_embd()));
-        let at_cells = (0..record.rows()).all(|i| {
-            let p = record.row(i).position;
-            record.rotary(i) == [p, p, p, 0]
-        });
-        let rotary: Option<Vec<[i32; 4]>> = (!at_cells)
-            .then(|| (0..record.rows()).map(|i| record.rotary(i).map(|p| p as i32)).collect());
-        let mut host =
-            StepRecord::new(&self.segments, &self.tokens, rotary.as_deref(), &self.out_rows)?;
+        let rotary = (!self.rotary.is_empty()).then_some(self.rotary.as_slice());
+        let mut host = StepRecord::new(&self.segments, &self.tokens, rotary, &self.out_rows)?;
         for (i, s) in self.segments.iter().enumerate() {
             if self.replay.iter().any(|r| r.contains(&s.row0)) {
                 host.mark_replay(i)?;

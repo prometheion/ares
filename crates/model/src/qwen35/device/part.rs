@@ -2037,6 +2037,11 @@ impl Part {
         self.rotary = rotary;
     }
 
+    /// The rotary positions of the step's rows, as [`Part::set_rotary`] gave them.
+    pub(super) fn rotary_of_step(&self) -> Vec<[i32; 4]> {
+        self.rotary.clone()
+    }
+
     /// What the embedding takes on this part and where it lies.
     pub fn embedding_report(&self) -> EmbeddingReport {
         let Some(e) = &self.w.embedding else { return EmbeddingReport::default() };

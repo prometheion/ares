@@ -439,6 +439,12 @@ impl MtpBlock {
     /// replay. `only` is a step that only drafts. Unless `only`, the step's
     /// rows are kept for the next step to follow.
     #[allow(clippy::too_many_arguments)]
+    /// The rotary positions of the rows of the step enqueued next, where they
+    /// are not their cells (see `blocks::mtp::Driver::set_rotary`).
+    pub(super) fn set_rotary(&mut self, rotary: Vec<[i32; 4]>) {
+        self.driver.set_rotary(rotary);
+    }
+
     pub(super) fn step(
         &mut self,
         stream: &Stream,
