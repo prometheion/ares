@@ -684,6 +684,7 @@ fn start_near(
     path: &std::path::Path,
     placement: Placement,
     (rows, own): (u32, u32),
+    kv: CacheFormat,
     near: Option<u32>,
 ) -> (Runtime, Arc<Qwen4Exp>) {
     let devices = open_devices(placement);
@@ -693,6 +694,7 @@ fn start_near(
     let mut opts = options(placement, n_layer, pages, MAX_ROWS, rows);
     opts.part.own_rows = own;
     opts.part.near_pages = near;
+    opts.part.kv = (kv, kv);
     let inner =
         Arc::new(Qwen4Exp::new(gguf, byte_tokenizer(None), "made", &devices, opts, CELLS).unwrap());
     let config =
@@ -710,9 +712,10 @@ fn start_near(
 /// device reads and writes over its link (`blocks/far.rs`): a prompt of three pages answers
 /// with the same tokens as with every page in VRAM, in steps of the decode kernels and in
 /// wide steps, in every placement. The kernels read the same bytes from another address, so
-/// with every expert in a slot the answers are the same token for token. Wide steps on lent
-/// VRAM read a copy of a layer's far entries; their slots lend, so experts are fetched there
-/// and the answer starts as the reference's (as in the test of lent steps).
+/// with every expert in a slot the answers are the same token for token, also with K and V in
+/// `q6`, whose tiles are converted into the far pool as they leave the newest cells. Wide steps
+/// on lent VRAM read a copy of a layer's far entries; their slots lend, so experts are fetched
+/// there and the answer starts as the reference's (as in the test of lent steps).
 #[test]
 fn k_and_v_beyond_vram_change_no_token() {
     if !enabled() {
@@ -724,10 +727,15 @@ fn k_and_v_beyond_vram_change_no_token() {
     let lending = gguf_path_of(1, GgmlType::BF16, GgmlType::Q4_0);
     let reference = reference_answer_at(&lending, &prompt, 16);
     for placement in placements() {
-        for rows in [MAX_ROWS, WIDE_ROWS] {
+        let cases = [
+            (MAX_ROWS, CacheFormat::Q8),
+            (WIDE_ROWS, CacheFormat::Q8),
+            (MAX_ROWS, CacheFormat::Q6),
+        ];
+        for (rows, kv) in cases {
             let mut answers = Vec::new();
             for near in [None, Some(1)] {
-                let (runtime, model) = start_near(&gguf_path(1), placement, (rows, 0), near);
+                let (runtime, model) = start_near(&gguf_path(1), placement, (rows, 0), kv, near);
                 let _ = ask(&runtime, 1, &prompt, 24);
                 warm(&model);
                 let got = ask(&runtime, 2, &prompt, 24);
@@ -736,16 +744,20 @@ fn k_and_v_beyond_vram_change_no_token() {
                 answers.push(got);
             }
             eprintln!(
-                "FAR {placement:?}, steps of {rows} rows: {} of {} tokens as with every page in \
-                 VRAM",
+                "FAR {placement:?}, steps of {rows} rows, K and V {kv:?}: {} of {} tokens as \
+                 with every page in VRAM",
                 leading(&answers[0], &answers[1]),
                 answers[0].len()
             );
-            assert_eq!(answers[1], answers[0], "{placement:?}, {rows} rows: K and V in RAM");
+            assert_eq!(
+                answers[1], answers[0],
+                "{placement:?}, {rows} rows, {kv:?}: K and V in RAM"
+            );
         }
         let mut lent = Vec::new();
         for near in [None, Some(1)] {
-            let (runtime, model) = start_near(&lending, placement, (LENT_ROWS, MAX_ROWS), near);
+            let (runtime, model) =
+                start_near(&lending, placement, (LENT_ROWS, MAX_ROWS), CacheFormat::Q8, near);
             assert_eq!(runtime_rows(&model), (LENT_ROWS, MAX_ROWS));
             lent.push(ask(&runtime, 1, &prompt, 16));
             let stats = model.take_store_stats().expect("the parts are open");

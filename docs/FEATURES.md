@@ -15,6 +15,7 @@ runs yet.
 | Weight types | all 28 GGUF types | all 28 in every tensor: experts, stream mixers and the n-gram block (exact) too |
 | K and V | `f16`, `q8` to `q4`, chosen separately (`--kv`) | `f16`, `q8` to `q4`, chosen separately (`--kv`); the MTP block's in `q4` |
 | Larger than VRAM | no | experts in VRAM slots, a RAM tier and on the SSD; the CPU computes missed ones, and what a step picks beyond a card's slots |
+| Context | `--context`, or the model's own (262 144) as far as VRAM holds it | `--context` (in VRAM), or the model's own (262 144): the indexer's keys and the K and V of the first pages in VRAM, the K and V beyond in page-locked RAM inside `--ram`, read over the link |
 | MTP (one driver) | the block in the model file (`--drafters mtp`) or a file of its own (`--drafters <file>`), every placement, chain and picks on the card, a draft vocabulary; exact | the block from a file of its own or a model file that carries it, its experts resident in VRAM, chain and picks on the card, a draft vocabulary; exact |
 | DFlash2 drafter (`--drafters <file>`) | chains, one card or tensor split, with the draft vocabulary; exact | chains, one card or both cards on every layer, with the draft vocabulary; the mean of the four streams |
 | Prefix cache | yes, with the RAM and SSD levels | yes, with the RAM and SSD levels; its RAM is what the tier of experts leaves |

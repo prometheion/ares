@@ -5102,18 +5102,87 @@ default both cards on every layer when each can write the other's memory), the
 context, and the RAM. The dense parts take 2.9 GiB on the first card and 0.4
 on the second; what the cards have left is slots for experts. The context
 costs slots; without `--context` it is the model's own all the same (the
-owner's rule of 2026-11-22, for both models), as far as VRAM holds it beside
-the fewest slots the store needs of every layer (a row's picks and the free
-slots) and the drafters (`plan::pages_beside_floors`); the plan says what was
-wanted and how much of it is in VRAM (`plan::ContextPlan`), so that K and V
-beyond VRAM can overflow into RAM once that is built. Until 2026-11-22 the K and
-V took a thirty-second of the room for slots (17 408 to 18 432 tokens for two
-sequences on this machine). Options that mean nothing for the
+owner's rule of 2026-11-22, for both models), 262 144 cells, and what of it
+does not fit in VRAM overflows into RAM (see "K and V beyond VRAM" below): the
+indexer's keys of every page stay in VRAM, the K and V of the first pages up
+to a thirty-second of the room for slots (`plan::near_pages`; what the context
+in VRAM cost before 2026-11-22, 17 408 to 18 432 tokens for two sequences on
+this machine), those of the rest in page-locked RAM as sequences grow into
+them. The plan says what was wanted and how much of it is in VRAM
+(`plan::ContextPlan::overflowing`). A context named with `--context` is all in
+VRAM, as before. Options that mean nothing for the
 model are errors that name them: `--shares`, `--precision exact`,
 `--draft-vocab`, more sequences than the eight rows of a
 generating step (`--parallel`), `--drafters mtp` (the model file carries no MTP block;
 `--drafters FILE` names the block's file), and `--window` without a drafter or beyond
 the eight rows of a step that verifies.
+
+**K and V beyond VRAM** (`blocks/far.rs`, 2026-11-22). Flash-Next's attention
+reads what its indexer picks: past 2051 cells a row reads 512 blocks of 4
+cells and its tail, 2.2 MB of K and V a layer with `q8`, whatever the length of
+the context. So the K and V of a long context can lie in RAM and cost a step
+only the cells picked from there, where every page of K and V in VRAM is
+expert slots fewer: the model's own context took 3.56 GiB, a fifth of the
+slots, and decode was 11 to 22 % slower for it ("What the second card is
+for"). One mechanism serves both the context beyond VRAM and the VRAM it gave
+the tier: the K and V of a context never take more VRAM than the plan's share,
+so nothing idle in VRAM needs lending.
+
+- *Where a page is.* The K/V group of the attention layers keeps the converted
+  entries of pages `0..near` in the pool on the device as before, those of the
+  pages from `near` on in a **far pool** in host memory: one range of address
+  space per device part, an array of slots per layer, page `p` in slot
+  `p - near`. The device's table names such a page with bit 30
+  (`ares_cuda::FAR_ENTRY`) and that slot; the conductor's entries stay page
+  numbers, and the part translates them (`kv::Group::device_entry`). The
+  attention, append and convert kernels take the far pool of a layer next to
+  its converted pool and read the same bytes from either (`conv_entry` in
+  `attn_layout.cuh`): the arithmetic is the same, so is the output. The
+  indexer's pooled keys of every page stay in VRAM (the block scores read all
+  of them), and so do the exact entries of the tile formats and the MTP
+  block's K and V (one layer, `q4`).
+- *Which pages are far.* The pool hands out its lowest free page first
+  (`PagePool`), so a short sequence lies in VRAM and a long one overflows from
+  its `near`-th page on. Its newest cells are then written over the link
+  (12 x 1088 bytes a decode row: nothing).
+- *Memory.* The far pool is address space (`MAP_NORESERVE`), of which pieces
+  of about 64 MiB over all layers are locked and mapped for the device
+  (`cuMemHostRegister` with the device map; a device must read registered
+  memory at its host address, which `PinnedRam::context_region` checks) as the
+  sequences reach them, and given back when the pages above a piece are freed,
+  keeping one piece spare. They are booked in `--ram` as required memory ("K/V
+  of the context beyond VRAM"), above the tier of experts: a running sequence
+  cannot do without its cells, and the broker's own rule says so. The device
+  threads keep the books of which pages the tables name (and which a transfer
+  brings in) and the first part to begin a step for the store locks the pieces
+  the step reaches (`Flow::lock_far`) before the store's step begins: when the
+  limit has no room the tier's allowance already leaves it
+  (`PinnedRam::set_context_target`) and the tier gives pieces up then, with no
+  step running.
+- *Prompts.* Every row of a prompt reads the cells of its own pick, so a wide
+  step that read the far pool in place would cross the link once per row. A
+  step on lent VRAM (a prompt read alone, "Large prompt steps on lent VRAM")
+  copies a layer's far entries that its sequences reach into the loan behind
+  the layer's append (`Scratch::far_stage`, up to the far pool's size, which
+  the slots lend with the step's scratch) and reads them there; each byte
+  crosses the link once per layer and step. Steps of the parts' own scratch
+  (pieces of prompt while another request waits, decode) read in place.
+- *The prefix cache.* Pages in the pool are pages, near or far: a copy on
+  write, a page that leaves for RAM or the drive and one that comes back move
+  their far entries with the driver's copy between any two addresses
+  (`Stream::copy_any`). The RAM level copies a far page; adopting its memory
+  without the copy is open.
+
+*Measured* (2026-11-22, `far_attention_bench`, the RTX 4060 Ti of the test
+machine on a PCIe 4.0 x4 link, 6.4 GB/s for a copy; one decode row, one layer,
+K and V `q8`): Flash-Next's 2048 picked cells take 31.5 to 33 us in VRAM and
+428 to 429 us from RAM at 4k to 262k cells (5.2 GB/s, the link): a decode step
+of 12 layers pays at most 4.8 ms when every picked cell is far, about 1.2 ms
+on a x16 link. The 27B's dense layers read every cell: 32 768 cells take 328 us
+in VRAM and 13.7 ms from RAM (220 ms a step of 16 layers), 262 144 cells 2.2
+and 109 ms (1.74 s a step), so its K and V beyond VRAM are not built: its heads
+move to the second card first (`devices/roles`), and with `q4` two cards hold
+482 707 tokens.
 
 **The RAM.** The tier of experts is a user of the one RAM limit (`--ram`,
 `PinnedRam`): elastic, with a priority above the checkpoints, so the limit
@@ -7041,13 +7110,17 @@ without a limit that was named.
 | User | Kind | When memory is short |
 | --- | --- | --- |
 | What the engine needs to run: step buffers, read-back buffers, the token embedding table where it lies on the host; the floor of the prompt cache for a model with recurrent state (one checkpoint place, and with `--cache` 16 pages); with `--cache` the buffers that checkpoints pass through on their way to the drive and back (ordinary memory) | Required | Never gives way. A limit below it is refused at load |
+| K and V of the context beyond VRAM (Flash-Next: the pages from the plan's `near` on, `blocks/far.rs`) | Required, as it is used | Never gives way. It grows in pieces (about 64 MiB over all attention layers) as the sequences reach far pages and shrinks when the pages above a piece are freed; the step that needs a piece makes the tier of experts give it up first (see "K and V beyond VRAM") |
 | RAM tier of MoE experts | Elastic, the highest | Gets all that is not required, as far as it can use it, and is the last to shrink: it gives pieces back only when the prompt cache has nothing left in RAM |
 | Staging of the experts on their way from the file into transit | Part of the tier | The pieces that hold it are never given up |
 | Prompt cache in RAM (checkpoints of recurrent state, and the pages that left the devices) | Elastic, the lowest | Goes first: what the devices or the drive also hold goes at once; what only RAM holds is written to the drive first with `--cache` and goes when it is written, down to the floor above; without `--cache` it goes at once, down to its one checkpoint place |
 
-Nothing is reserved for K/V pages that leave VRAM (KV offload, not built):
-that is an exceptional case, and when it happens it takes from the users
-above like any other need.
+Nothing is reserved for the K and V beyond VRAM: they take their memory when
+a sequence reaches them, from the elastic users, as the broker's own rule for
+required memory says ("a running request must never fail to offload its K/V
+pages because a cache is sitting on memory it could do without"). Pages that a
+finished request leaves in the device pool as prompt cache keep their far
+memory until the pool evicts them (the owner's question in `OPEN.md`).
 
 A broker in `ares-core` keeps the books of the limit: a user asks to grow, a
 grant beyond the limit is refused, and the refusal names who holds what. Below

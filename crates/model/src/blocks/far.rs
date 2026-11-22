@@ -157,7 +157,7 @@ impl FarPool {
 
     /// Locks the pieces that the first `slots` slots lie in, between steps.
     /// `Err(Ok(short))` when the RAM limit has no room for a piece now: the
-    /// owner makes room ([`PinnedRam::context_room`]) and asks again.
+    /// owner makes room (the tier of experts gives pieces up) and asks again.
     pub fn ensure(&mut self, slots: u32) -> Result<(), Result<ContextShort, ModelError>> {
         for piece in 0..self.pieces_for(slots) {
             if self.pieces[piece].is_some() {

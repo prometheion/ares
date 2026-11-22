@@ -167,17 +167,17 @@ mod tests {
         pool.release(b);
         pool.release(c);
         // `a` has an owner again before the devices are told.
-        assert_eq!(pool.alloc(), Some(c), "the last page freed is handed out first");
+        assert_eq!(pool.alloc(), Some(a), "the lowest free page is handed out first");
         pool.take_freed(8, &mut out);
-        assert_eq!(out, [a.0, b.0]);
+        assert_eq!(out, [b.0, c.0]);
         out.clear();
         pool.take_freed(8, &mut out);
         assert!(out.is_empty(), "each page is named once");
 
         // Freed again after being named: named again.
-        pool.release(c);
+        pool.release(a);
         pool.take_freed(8, &mut out);
-        assert_eq!(out, [c.0]);
+        assert_eq!(out, [a.0]);
     }
 
     #[test]

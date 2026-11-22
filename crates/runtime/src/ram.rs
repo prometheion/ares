@@ -377,29 +377,10 @@ impl PinnedRam {
 
     /// The K/V of the context beyond VRAM will hold `bytes` once the pieces
     /// that a step needs are locked: the elastic users' allowances leave that
-    /// much from now on, so that the tier of experts gives it up (see
-    /// [`PinnedRam::context_room`]) and the bookings of the pieces find it free.
+    /// much from now on, so that the tier of experts gives it up and the
+    /// bookings of the pieces find it free.
     pub fn set_context_target(&self, bytes: u64) {
         self.books().context_target = bytes;
-    }
-
-    /// Whether `bytes` more for the context's K/V fit in the limit without
-    /// anyone giving memory up.
-    pub fn context_fits(&self, bytes: u64) -> bool {
-        let books = self.books();
-        books.broker.capacity().saturating_sub(books.broker.used()) >= bytes
-    }
-
-    /// Lets the elastic users give up what the context's target takes from
-    /// their allowances, as far as they can at once: the tier of experts
-    /// through its hook (which gives pieces up when no step runs) and the
-    /// checkpoint places the conductor has no checkpoint in.
-    pub fn context_room(&self) {
-        let hook = self.shared.hooks.lock().unwrap_or_else(|e| e.into_inner()).experts.clone();
-        if let Some(hook) = hook {
-            hook(self, self.experts_allowance());
-        }
-        self.sweep_checkpoints();
     }
 
     /// `len` bytes of address space for the K/V of the context beyond VRAM
@@ -871,7 +852,7 @@ impl ContextRegion {
 
     /// Books, locks and maps `len` bytes at `at` (whole pages of the
     /// region). `Err(Ok(short))` when the limit has no room for them now
-    /// ([`PinnedRam::context_room`] may make it), `Err(Err(_))` when the
+    /// (the tier of experts may give it up), `Err(Err(_))` when the
     /// device cannot take them or reads them at another address than the
     /// host's.
     pub fn lock(
@@ -1212,6 +1193,32 @@ mod tests {
         ram.release_checkpoints(40 * MIB);
         ram.book_experts(90 * MIB).unwrap();
         assert!(ram.book_checkpoints(20 * MIB).is_err());
+    }
+
+    #[test]
+    fn the_context_beyond_vram_takes_its_room_from_the_tier_of_experts() {
+        let ram = PinnedRam::new(100 * MIB);
+        ram.require(10 * MIB).unwrap();
+        ram.want_experts(GIB, 0);
+        ram.book_experts(90 * MIB).unwrap();
+        assert_eq!(ram.experts_allowance(), 90 * MIB);
+        // A step will hold 30 MiB of K and V beyond VRAM: the tier's allowance
+        // leaves them from now on.
+        ram.set_context_target(30 * MIB);
+        assert_eq!(ram.experts_allowance(), 60 * MIB);
+        // Until the tier gives them up the booking finds no room, and says how
+        // much others would have to give.
+        assert_eq!(ram.book_context(30 * MIB), Err(30 * MIB));
+        ram.release_experts(30 * MIB);
+        ram.book_context(30 * MIB).unwrap();
+        assert_eq!(ram.context(), 30 * MIB);
+        // Neither the prompt cache nor the tier takes it back.
+        assert!(ram.book_checkpoints(MIB).is_err());
+        assert!(ram.book_experts(MIB).is_err());
+        // Given back, the room is the tier's again.
+        ram.release_context(30 * MIB);
+        ram.set_context_target(0);
+        assert_eq!((ram.context(), ram.experts_allowance()), (0, 90 * MIB));
     }
 
     #[test]

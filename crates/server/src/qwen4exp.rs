@@ -338,9 +338,9 @@ pub(crate) fn load(
     // for slots, and those of the pages beyond in RAM, as far as the
     // sequences grow into them (`ares_model::blocks::far`). A context that
     // was asked for is all in VRAM.
-    let (context, pages, near, why_context) = match options.context {
+    let (context, pages, near, far_most, why_context) = match options.context {
         Some(context) => {
-            (context, plan::pool_pages(context, parallel), None, "as asked".to_owned())
+            (context, plan::pool_pages(context, parallel), None, 0, "as asked".to_owned())
         }
         None => {
             let trial = TRIAL_CONTEXT.min(model_context);
@@ -396,7 +396,8 @@ pub(crate) fn load(
                     String::new()
                 },
             );
-            (plan.context(), all, plan.overflow.then_some(near), plan.why())
+            let far_most = parts.iter().map(|(kv, _)| kv).sum::<u64>() * u64::from(all - near);
+            (plan.context(), all, plan.overflow.then_some(near), far_most, plan.why())
         }
     };
     let longest = context.min(model_context);
@@ -652,6 +653,15 @@ pub(crate) fn load(
     )?;
     // What the engine may page-lock: the limit less the buffers in transit.
     let lockable = ram - transit;
+    if near.is_some() && required + floor + far_most > lockable {
+        tracing::warn!(
+            "--ram {}: the K and V of the whole context beyond VRAM take up to {}, more than the \
+             limit leaves beside what the engine needs to run; a sequence that grows into the \
+             rest fails its step",
+            Bytes(ram),
+            Bytes(far_most)
+        );
+    }
     let runtime_config = RuntimeConfig {
         pages,
         cells_per_page: CELLS_PER_PAGE,
