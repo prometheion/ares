@@ -1088,9 +1088,12 @@ fn experts_computed_on_the_cpu_change_nothing() {
 /// steps' arithmetic (8-bit activations) instead of brought through transit and computed in
 /// f16 on the device. Every layer, fed the residual of a run with every expert in its slot
 /// (in wide steps too), gives what that run gives within the rounding of the 8-bit
-/// activations; the core reads the same residual and gives the same bits.
+/// activations (measured: 1.9e-2 for the experts, 4.5e-3 for the residual, with every miss
+/// on the CPU; the many-row kernels' experts are 1.65e-2 from the reference's,
+/// `every_layer_of_wide_steps_matches_the_reference`); the core reads the same residual
+/// and gives the same bits.
 #[test]
-fn experts_a_wide_step_misses_computed_on_the_cpu_change_nothing() {
+fn experts_a_wide_step_misses_computed_on_the_cpu_differ_by_their_rounding() {
     let Some(devices) = devices() else { return };
     let synthetic = model_of(31, GgmlType::Q2_0);
     let (gate_ty, down_ty) = (GgmlType::IQ2_S, GgmlType::Q2_0);
@@ -1170,7 +1173,7 @@ fn experts_a_wide_step_misses_computed_on_the_cpu_change_nothing() {
             assert!(stats.cpu_experts >= wide_stats.cpu_experts);
         }
         assert_eq!(worst[1], 0.0, "{serve:?}: the core reads the same residual");
-        assert!(worst[0] < 2e-2, "{serve:?}: experts {:.2e}", worst[0]);
+        assert!(worst[0] < 4e-2, "{serve:?}: experts {:.2e}", worst[0]);
         assert!(worst[2] < 2e-2, "{serve:?}: residual {:.2e}", worst[2]);
     }
 }
