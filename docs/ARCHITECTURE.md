@@ -4276,6 +4276,15 @@ median in ms of 64 steps at 1000 and at 32 000 cells of context.
 | B: 0.7 / 0.3; heads 1 : 3 | 242 228 (both nearly full) | 1474, 1480 | 28.57, 28.52 (+8 %) | 828 (-12 %) | 33.65 (+15 %) |
 | L: layer split 0.62 / 0.38 | 113 742 (the 4070 is full) | 1228, 1232 | 41.17, 41.21 (+56 %) | 855 | 45.26, 45.32 (+55 %) |
 
+The same with peer access, once it was back that afternoon (one run each in
+turn, load average 13 to 24):
+
+| Placement, over the peer route | Context | Prompt 2048 | Decode 1k | Read 32k | Decode 32k |
+| --- | --- | --- | --- | --- | --- |
+| T | 126 729 | 1353 | 24.54 | 948 | 27.39 |
+| A | 234 433 | 1266 | 25.39 (+3.5 %) | 756 (-20 %) | 30.54 (+11.5 %) |
+| M | 265 025 | 1275 | 25.22 (+2.8 %) | 787 (-17 %) | 29.72 (+8.5 %) |
+
 K and V take 20.75 / 12.45 MiB per 1000 tokens on the 4070 / 3060 in T, 8.30 /
 24.90 in A and B, 10.89 / 22.31 in M and 22.83 / 10.38 in L. With K and V in
 `q4` T holds 228 562 tokens and M 482 707: the model's own context of 262 144
