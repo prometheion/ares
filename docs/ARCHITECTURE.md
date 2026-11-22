@@ -4297,10 +4297,13 @@ measured in A, and there both cards had room for 232 000 to 236 000 more
 tokens),
 and for a context that fits with fewer moved, only as many as it needs
 (`plan::attention_for_context`: the weights' shares lowered where a device's
-room is short, `fit_shares`). That is `AttentionShares::ByContext` in the
-server's `LoadOptions`, an internal choice no option sets yet; its test,
-`tests/real_devices.rs`, loads the 27B three ways and compares the planned
-pages and the text.
+room is short, `fit_shares`). That is how the plan places the heads
+(`AttentionShares::ByContext`), with no option of its own (the owner,
+2026-11-22): the context steers it, `--context` or, without it, the model's
+own, and when that does not fit wherever the heads are, the heads go by room
+and the context is what VRAM holds. Shares given (`AttentionShares::Given`)
+are for tests and measurements. `tests/real_devices.rs` loads the 27B three
+ways and compares the planned pages and the text.
 
 **Flash-Next: the second card as an expert tier.** With both cards on every
 layer, the card that mixes (`TensorChoice::mixer`) holds the residual streams,
