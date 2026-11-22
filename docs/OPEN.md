@@ -888,7 +888,7 @@ Measured per phase on a quiet machine against the fork and Strata, the largest f
 - [ ] Before a release: both models against the fork, Strata and TokenWing (Flash-Next), speed,
       VRAM, quality.
 
-## Owed on two cards (the owner's cards are production; run at the next window he gives)
+## Owed on two cards (the owner's cards are production; run when the owner frees them)
 - [ ] `qwen4exp_runtime` `the_mtp_block_follows_wide_steps_that_start_at_any_cell` (new with the
       MTP fix) failed on the RTX 4070 and RTX 3060 in the warm-up ("every expert has a slot",
       line 497), in a placement the failure did not name; it passes with one card (RTX 4060 Ti).
