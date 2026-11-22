@@ -541,13 +541,20 @@ Flash-Next); experts that do not fit in VRAM in RAM; K/V in int8. Its README giv
       Measured 2026-11-22 (`ARCHITECTURE.md`, "What the second card is for"): for the 27B the
       second card is worth most as room for K and V (the attention heads by shares of their own,
       as the fork's `--attn-split`: 2.1 times the context, 3 % slower decode at 1000 cells and
-      9 % at 32 000). Built behind the internal `LoadOptions::attention`
-      (`AttentionShares::ByContext`: heads with the weights as far as the asked context fits,
-      moved only as far as it needs); the proposal of its form went to the owner.
-- [ ] Flash-Next's placements of the second card measured with peer access: both cards on every
-      layer, the second card holding experts only (`TensorChoice` with `core_share` 1 and the
-      shared expert on the mixer), by layers, one card (`/var/tmp/ares-cards/batch4.sh peer`).
-      On 2026-11-22 the machine had no driver library with peer access, so only the last two ran.
+      9 % at 32 000). Built as how the plan works, with no option (the owner, 2026-11-22):
+      `AttentionShares::ByContext`, heads with the weights as far as the wanted context
+      (`--context`, or the model's own) fits, moved only as far as it needs. The rest of the
+      roles item (what the aux card is called, drafters on it) waits for the owner.
+- [ ] Flash-Next's second card (measured 2026-11-22, `ARCHITECTURE.md`, "What the second card is
+      for"): on every layer it is worth most (twice the VRAM tier); as an expert tier only (no
+      dense share, `core_share` 1) it decodes as fast and reads warm prompts 27 % faster than the
+      share chosen today from read times. Proposed: the plan measures at load a wide and a decode
+      step with and without the dense share and keeps the faster; goes to the owner first (it is
+      the card-roles design), not built.
+- [ ] Flash-Next served with the model's own context (262 144 cells, the default since
+      2026-11-22) gives up a fifth of the VRAM slots (3.56 GiB of K/V and keys, all on the mixing
+      card): decode 11 to 22 % slower, warm prompts half as fast. K/V beyond VRAM in RAM (below)
+      would let the slots stay.
 - [ ] Drafters on the second card: not built. A chain that runs on the slower card is slower by
       what that card is slower, and nothing runs beside it in a step that only drafts; it pays
       only with a pipeline that drafts the next window while the main card verifies this one

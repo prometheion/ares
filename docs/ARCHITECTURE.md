@@ -4347,6 +4347,16 @@ slower card no longer computes recurrent heads for 512 rows. The share is
 chosen today from the read time of a stream mixer on each card
 (`session.rs::choose`), which does not see that.
 
+The model's own context (262 144 cells, what the plan serves without
+`--context` since 2026-11-22) costs a fifth of the VRAM slots: its K/V and
+indexer keys take 13.92 MiB per 1000 cells, 3.56 GiB, all on the card that
+mixes when both cards work on every layer (the 4070 keeps 2976 of its 5712
+slots in FT, 2688 of 5424 in FX) and half on each by layers. The same runs
+with 262 144 cells (one round, load average 8 to 16): FT 10 800 slots, a
+decode step of 27.7 ms (median; mean 32.7), prompts 263 tokens/s; FX 10 896
+slots, 24.9 ms (31.5), 333; FL 10 573 slots, 33.1 ms (35.4), 310. Decode is 11
+to 22 % slower and a warm prompt half as fast as with 4096 cells.
+
 **Drafters on the second card** are not built. The step that only drafts runs
 the chain on the card that holds the drafter while every other card waits, so
 a chain on the slower card is slower by what that card is slower and gains
