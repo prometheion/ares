@@ -378,16 +378,18 @@ fn start_drafting_unpriced(
     placement: Placement,
     pages: u32,
 ) -> (Runtime, Arc<Qwen4Exp>) {
+    start_drafting_unpriced_rows(seed, placement, pages, MAX_ROWS)
+}
+
+/// [`start_drafting_unpriced`] with steps of up to `rows` rows.
+fn start_drafting_unpriced_rows(
+    seed: u64,
+    placement: Placement,
+    pages: u32,
+    rows: u32,
+) -> (Runtime, Arc<Qwen4Exp>) {
     let config = RuntimeConfig { window_rows: 8, warm_up: false, ..RuntimeConfig::default() };
-    start_with(
-        &gguf_path(seed),
-        Some(&draft_path(seed)),
-        placement,
-        pages,
-        config,
-        MAX_ROWS,
-        Cache::On,
-    )
+    start_with(&gguf_path(seed), Some(&draft_path(seed)), placement, pages, config, rows, Cache::On)
 }
 
 /// [`start_at`], with the MTP block of the file `draft` when there is one.
@@ -1087,6 +1089,51 @@ fn the_mtp_block_drafts_what_the_reference_drafts_in_every_placement() {
         // model has near ties that the device's arithmetic flips, so one
         // chain in five may part; a block that is wired wrongly agrees by
         // chance, once in a hundred.
+        assert!(compared[0] >= 1, "{placement:?}: no chain to compare");
+        assert!(
+            agreed[0] + compared[0] / 5 + usize::from(compared[0] < 5 && compared[0] > 1)
+                >= compared[0],
+            "{placement:?}: first links agree in {} of {}",
+            agreed[0],
+            compared[0]
+        );
+    }
+}
+
+/// The MTP block follows a prompt read in wide steps whose slices start at
+/// cells where its launches of eight rows do not (in the engine a hit in the
+/// prompt cache leaves such a cell: the first tokens of a chat). Each launch
+/// decides which of its rows write once the launches before it have given
+/// the tiles they write exact slots: every cell of the prompt gets the
+/// block's keys and values, the block's chains draft what the reference's
+/// draft from the same cells, and no row writes into a converted entry (which
+/// ended the request with "writing K and V reported status 0x4" before).
+#[test]
+fn the_mtp_block_follows_wide_steps_that_start_at_any_cell() {
+    if !enabled() {
+        return;
+    }
+    // Slices of 196 rows: the second starts at cell 196, its rows cross the
+    // tiles at 256 and at 384 in the middle of launches.
+    let prompt = prompt(420, 9);
+    for placement in placements() {
+        let (runtime, model) = start_drafting_unpriced_rows(1, placement, 16, 196);
+        warm(&model);
+        model.take_mtp_chains();
+        let rx = submit(&runtime, 1, &prompt, 24);
+        let answer = rx.recv_timeout(Duration::from_secs(300)).expect("an answer in time");
+        let chains = model.take_mtp_chains();
+        let times = model.mtp_times();
+        runtime.shutdown();
+        let answer = answer.unwrap_or_else(|e| panic!("{placement:?}: the request failed: {e}"));
+        let (compared, agreed) = chains_against_the_reference(1, &chains, &prompt, &answer);
+        eprintln!(
+            "RES {placement:?}: {} chains; against the reference per link {agreed:?} of \
+             {compared:?}; {} rows only wrote keys",
+            chains.len(),
+            times.key_rows
+        );
+        assert!(times.key_rows as usize >= prompt.len() - 1, "{placement:?}: {times:?}");
         assert!(compared[0] >= 1, "{placement:?}: no chain to compare");
         assert!(
             agreed[0] + compared[0] / 5 + usize::from(compared[0] < 5 && compared[0] > 1)

@@ -27,6 +27,11 @@
 //!   step names the token the carry is paired with. For a sequence that
 //!   drafts this is link 0 of its chain; for any other it only writes keys
 //!   and values.
+//! - **Launches that only write keys** (following and the newest cells) are
+//!   decided one at a time, each when the ones before it are enqueued: a
+//!   layer may prepare its K/V group in each launch (Flash-Next's does), and
+//!   which rows read a converted tile and write nothing is only known then
+//!   ([`Driver::key_launch`]).
 //! - **The chain.** Link `j` pairs the pick of link `j - 1` with the block's
 //!   own output of that link. Each pick is made on the device by the sampler,
 //!   from the draft head (the head view's rows, see `blocks/head.rs`), with
@@ -44,9 +49,9 @@
 //!   are written again when the model has passed the cells.
 //!
 //! What a step uploads for the block is written on the host and sent with one
-//! copy per phase (following, and the newest cells with the chains); the
-//! layer adds its own bytes for each launch ([`MtpLayer::bytes`]: an
-//! attention plan, the rows of a K/V append).
+//! copy per launch that only writes keys and one for the chains; the layer
+//! adds its own bytes for each launch ([`MtpLayer::bytes`]: an attention
+//! plan, the rows of a K/V append).
 
 use std::ops::Range;
 use std::sync::Arc;
@@ -607,132 +612,195 @@ impl Driver {
         source(&self.setup.table, self.setup.kept, staged)
     }
 
+    /// Which rows of the front of `rows` the next launch that only writes
+    /// keys takes, and which of them are a replay: a row whose tile the block
+    /// holds converted reads its cell and writes nothing
+    /// ([`MtpLayer::writes_converted`]). It is decided when the launches
+    /// before it are enqueued, by the state they left: a launch gives the
+    /// tiles its rows write exact slots and converts the tiles its sequences
+    /// left. A row behind a row of its sequence that writes in the same launch
+    /// writes too, since the launch gives its tiles exact slots; the rows of a
+    /// sequence that write behind rows that do not begin a launch of their
+    /// own, so that each segment is a replay as a whole.
+    fn key_launch(&self, layer: &dyn MtpLayer, rows: &[KeyRow]) -> Vec<bool> {
+        let lag = layer.lag();
+        let mut replay: Vec<bool> = Vec::with_capacity(self.keys_rows as usize);
+        for (i, row) in rows.iter().take(self.keys_rows as usize).enumerate() {
+            // The launch's row before, when it is the sequence's cell before.
+            let before = i
+                .checked_sub(1)
+                .filter(|&j| rows[j].slot == row.slot && rows[j].pair + 1 == row.pair)
+                .map(|j| replay[j]);
+            let replays = match before {
+                Some(false) => false,
+                _ => layer.writes_converted(row.slot, row.pair - lag),
+            };
+            if before == Some(true) && !replays {
+                break;
+            }
+            replay.push(replays);
+        }
+        replay
+    }
+
     /// Writes the record, the staged rows, the hidden-state index and the
-    /// layer's bytes of `rows` into the upload from `end` on, as launches of
-    /// at most the layer's rows; a sequence's rows stay consecutive.
+    /// layer's bytes of one launch of `rows` (at most the layer's rows, of
+    /// which `replay` says which are a replay) into the upload from `end` on;
+    /// a sequence's rows are consecutive cells. Returns the launch and where
+    /// its bytes end.
     fn lay_out_keys(
         &mut self,
         layer: &mut dyn MtpLayer,
         rows: &[KeyRow],
         replay: &[bool],
-        mut end: u64,
+        end: u64,
         limit: u64,
-    ) -> Result<(Vec<KeyLaunch>, u64), ModelError> {
+    ) -> Result<(KeyLaunch, u64), ModelError> {
         let full = || invalid("the MTP block's step records do not fit their buffer");
         let size = self.setup.table.row_bytes() as usize;
         let lag = layer.lag();
-        let mut launches = Vec::new();
-        let per = self.keys_rows as usize;
-        for (chunk, flags) in rows.chunks(per).zip(replay.chunks(per)) {
-            let mut segments: Vec<Segment> = Vec::new();
-            let mut replay_rows = Vec::new();
-            for (i, (row, &replays)) in chunk.iter().zip(flags).enumerate() {
-                let cell = row.pair - lag;
-                match segments.last_mut() {
-                    Some(s) if s.slot == row.slot && s.pos0 as u32 + s.n_rows == cell => {
-                        s.n_rows += 1;
-                    }
-                    _ => segments.push(Segment {
-                        row0: i as u32,
-                        n_rows: 1,
-                        slot: row.slot,
-                        pos0: cell as i32,
-                        direct: true,
-                    }),
+        let mut segments: Vec<Segment> = Vec::new();
+        let mut replay_rows = Vec::new();
+        for (i, (row, &replays)) in rows.iter().zip(replay).enumerate() {
+            let cell = row.pair - lag;
+            match segments.last_mut() {
+                Some(s) if s.slot == row.slot && s.pos0 as u32 + s.n_rows == cell => {
+                    s.n_rows += 1;
                 }
-                if replays {
-                    replay_rows.push(i as u32..i as u32 + 1);
-                }
+                _ => segments.push(Segment {
+                    row0: i as u32,
+                    n_rows: 1,
+                    slot: row.slot,
+                    pos0: cell as i32,
+                    direct: true,
+                }),
             }
-            let tokens: Vec<u32> = chunk.iter().map(|r| r.token).collect();
-            let mut record = StepRecord::new(&segments, &tokens, None, &[])?;
-            for (i, s) in segments.iter().enumerate() {
-                if replay_rows.iter().any(|r| r.contains(&s.row0)) {
-                    record.mark_replay(i)?;
-                }
+            if replays {
+                replay_rows.push(i as u32..i as u32 + 1);
             }
-            let bytes = record.as_bytes();
-            let at_record = end;
-            let at_staged = (at_record + bytes.len() as u64).next_multiple_of(16);
-            let at_index = (at_staged + (chunk.len() * size) as u64).next_multiple_of(16);
-            let at_bytes = (at_index + 4 * chunk.len() as u64).next_multiple_of(16);
-            if at_bytes > limit {
-                return Err(full());
-            }
-            let buf: &mut [u8] = &mut self.host;
-            buf[at_record as usize..at_record as usize + bytes.len()].copy_from_slice(bytes);
-            if let Some(host) = &self.setup.host {
-                let stage = &mut buf[at_staged as usize..at_index as usize];
-                host.stage(&tokens, stage)?;
-            }
-            words(buf, at_index, chunk.iter().map(|r| r.hidden));
-            let written =
-                layer.bytes(&segments, false, &mut buf[at_bytes as usize..limit as usize])?;
-            end = (at_bytes + written as u64).next_multiple_of(64);
-            launches.push(KeyLaunch {
-                segments,
-                record,
-                replay: replay_rows,
-                at_record,
-                at_staged,
-                at_index,
-                at_bytes,
-            });
         }
-        Ok((launches, end))
+        let tokens: Vec<u32> = rows.iter().map(|r| r.token).collect();
+        let mut record = StepRecord::new(&segments, &tokens, None, &[])?;
+        for (i, s) in segments.iter().enumerate() {
+            if replay_rows.iter().any(|r| r.contains(&s.row0)) {
+                record.mark_replay(i)?;
+            }
+        }
+        let bytes = record.as_bytes();
+        let at_record = end;
+        let at_staged = (at_record + bytes.len() as u64).next_multiple_of(16);
+        let at_index = (at_staged + (rows.len() * size) as u64).next_multiple_of(16);
+        let at_bytes = (at_index + 4 * rows.len() as u64).next_multiple_of(16);
+        if at_bytes > limit {
+            return Err(full());
+        }
+        let buf: &mut [u8] = &mut self.host;
+        buf[at_record as usize..at_record as usize + bytes.len()].copy_from_slice(bytes);
+        if let Some(host) = &self.setup.host {
+            let stage = &mut buf[at_staged as usize..at_index as usize];
+            host.stage(&tokens, stage)?;
+        }
+        words(buf, at_index, rows.iter().map(|r| r.hidden));
+        let written = layer.bytes(&segments, false, &mut buf[at_bytes as usize..limit as usize])?;
+        let launch = KeyLaunch {
+            segments,
+            record,
+            replay: replay_rows,
+            at_record,
+            at_staged,
+            at_index,
+            at_bytes,
+        };
+        Ok((launch, (at_bytes + written as u64).next_multiple_of(64)))
     }
 
-    /// Enqueues launches that only write keys, laid out by
-    /// [`Driver::lay_out_keys`]; their hidden states are rows of `hidden`.
+    /// Enqueues `rows` as launches that only write keys, one after the
+    /// other: each is decided ([`Driver::key_launch`]), laid out in the upload
+    /// from `end` on (up to `limit`), sent and enqueued before the next is
+    /// decided. Their hidden states are rows of `hidden`. Returns where the
+    /// upload's bytes end.
+    #[allow(clippy::too_many_arguments)]
+    fn write_keys(
+        &mut self,
+        layer: &mut dyn MtpLayer,
+        layers: &LayerKernels,
+        stream: &Stream,
+        rows: &[KeyRow],
+        hidden: DevicePtr,
+        tables: DevicePtr,
+        pages: DevicePtr,
+        mut end: u64,
+        limit: u64,
+    ) -> Result<u64, ModelError> {
+        let mut at = 0;
+        while at < rows.len() {
+            let replay = self.key_launch(layer, &rows[at..]);
+            let n = replay.len();
+            let (launch, after) =
+                self.lay_out_keys(layer, &rows[at..at + n], &replay, end, limit)?;
+            // SAFETY: the launch's bytes lie in the pinned buffer from `end`
+            // to `after`, which is not written again before the step has run;
+            // the device buffer has the pinned one's size.
+            unsafe {
+                stream.copy_from_host(
+                    self.rec(end),
+                    self.host.as_ptr().add(end as usize),
+                    (after - end) as usize,
+                )?;
+            }
+            self.enqueue_keys(layer, layers, stream, &launch, hidden, tables, pages)?;
+            at += n;
+            end = after;
+        }
+        Ok(end)
+    }
+
+    /// Enqueues a launch that only writes keys, laid out by
+    /// [`Driver::lay_out_keys`] and sent; its hidden states are rows of
+    /// `hidden`.
     #[allow(clippy::too_many_arguments)]
     fn enqueue_keys(
         &self,
         layer: &mut dyn MtpLayer,
         layers: &LayerKernels,
         stream: &Stream,
-        launches: &[KeyLaunch],
+        launch: &KeyLaunch,
         hidden: DevicePtr,
         tables: DevicePtr,
         pages: DevicePtr,
     ) -> Result<(), ModelError> {
         let (e, h) =
             layer.keys_inputs().unwrap_or_else(|| (self.at(self.s.keys_e), self.at(self.s.keys_h)));
-        for launch in launches {
-            let dims = launch.record.dims();
-            let step = self.rec(launch.at_record);
-            let staged = if self.setup.host.is_some() {
-                self.rec(launch.at_staged)
-            } else {
-                DevicePtr::NULL
-            };
-            // SAFETY: the records hold what `lay_out_keys` wrote for this
-            // launch, the inputs `keys_rows` rows, the carries and `hidden`
-            // every row the index names.
-            unsafe {
-                layers.embed_gather(stream, step, dims, &self.rows(staged), e)?;
-                self.sampler.gather_hidden(
-                    stream,
-                    h,
-                    hidden,
-                    self.rec(launch.at_index),
-                    dims.n_rows,
-                    self.setup.width,
-                )?;
-            }
-            layer.keys(&Rows {
+        let dims = launch.record.dims();
+        let step = self.rec(launch.at_record);
+        let staged =
+            if self.setup.host.is_some() { self.rec(launch.at_staged) } else { DevicePtr::NULL };
+        // SAFETY: the records hold what `lay_out_keys` wrote for this launch,
+        // the inputs `keys_rows` rows, the carries and `hidden` every row the
+        // index names.
+        unsafe {
+            layers.embed_gather(stream, step, dims, &self.rows(staged), e)?;
+            self.sampler.gather_hidden(
                 stream,
-                segments: &launch.segments,
-                record: &launch.record,
-                step,
-                replay: &launch.replay,
-                e,
                 h,
-                bytes: self.rec(launch.at_bytes),
-                tables,
-                pages,
-            })?;
+                hidden,
+                self.rec(launch.at_index),
+                dims.n_rows,
+                self.setup.width,
+            )?;
         }
-        Ok(())
+        layer.keys(&Rows {
+            stream,
+            segments: &launch.segments,
+            record: &launch.record,
+            step,
+            replay: &launch.replay,
+            e,
+            h,
+            bytes: self.rec(launch.at_bytes),
+            tables,
+            pages,
+        })
     }
 
     /// Step 1, at the start of a step, before its copies of the prefix cache
@@ -798,13 +866,10 @@ impl Driver {
         }
         self.times.key_rows += rows.len() as u64;
         if !rows.is_empty() {
-            let converted: Vec<bool> =
-                rows.iter().map(|row| layer.writes_converted(row.slot, row.pair - lag)).collect();
-            let (launches, end) = self.lay_out_keys(layer, &rows, &converted, 0, self.half)?;
-            // SAFETY: the first half of the pinned buffer is not written again
-            // before the next step, which is enqueued after this one has run.
-            unsafe { stream.copy_from_host(self.records.ptr(), self.host.as_ptr(), end as usize)? };
-            self.enqueue_keys(layer, layers, stream, &launches, tap, tables, pages)?;
+            // The first half of the pinned buffer is not written again before
+            // the next step, which is enqueued after this one has run.
+            let half = self.half;
+            self.write_keys(layer, layers, stream, &rows, tap, tables, pages, 0, half)?;
         }
         // Behind those rows the carries move on.
         for (slot, row) in carries {
@@ -877,16 +942,16 @@ impl Driver {
             })
             .collect();
         self.times.key_rows += quiet.len() as u64;
+        // The second half of the pinned buffer is not written again before
+        // the next step's records, which are written after this step has run.
         let mut end = self.half;
         let limit = self.host.len() as u64;
-        let mut quiet_launches = Vec::new();
         if !quiet.is_empty() {
-            let converted: Vec<bool> =
-                quiet.iter().map(|row| layer.writes_converted(row.slot, row.pair - lag)).collect();
-            let (launches, after) = self.lay_out_keys(layer, &quiet, &converted, end, limit)?;
-            quiet_launches = launches;
-            end = after;
+            let carry = self.carry.ptr();
+            end =
+                self.write_keys(layer, layers, stream, &quiet, carry, tables, pages, end, limit)?;
         }
+        let chains_at = end;
         let links = self.lay_out_chains(layer, segments, &step, &mut end, limit)?;
         if !only {
             self.keep(segments, tokens, replay);
@@ -897,19 +962,16 @@ impl Driver {
                 self.newest_done.push((s.slot, s.pos0 as u32));
             }
         }
-        // SAFETY: the second half of the pinned buffer is not written again
-        // before the next step's records, which are written after this step
-        // has run; the device buffer has its size.
-        unsafe {
-            stream.copy_from_host(
-                self.rec(self.half),
-                self.host.as_ptr().add(self.half as usize),
-                (end - self.half) as usize,
-            )?;
-        }
-        if !quiet_launches.is_empty() {
-            let carry = self.carry.ptr();
-            self.enqueue_keys(layer, layers, stream, &quiet_launches, carry, tables, pages)?;
+        if end > chains_at {
+            // SAFETY: as for the launches above; the device buffer has the
+            // pinned one's size.
+            unsafe {
+                stream.copy_from_host(
+                    self.rec(chains_at),
+                    self.host.as_ptr().add(chains_at as usize),
+                    (end - chains_at) as usize,
+                )?;
+            }
         }
         if let Some((links, carry_index, newest)) = links {
             self.chains(layer, layers, stream, &step, &links, carry_index, newest, tables, pages)?;

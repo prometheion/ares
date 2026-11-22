@@ -1606,6 +1606,23 @@ layer). Everything else is the driver's:
   one; now its cell of a row is written a step later.
 - *The newest cell* of every sequence of a step that does not draft only writes
   keys and values; for one that drafts it is link 0 of its chain.
+- *Launches that only write keys* (following and the newest cells) are decided
+  one at a time, each when the ones before it are enqueued (`Driver::key_launch`):
+  a launch of Flash-Next's block prepares its K/V group like a step (the tiles
+  its rows write get exact slots, the tiles its sequences left are converted),
+  so whether a row's tile is held converted (and the row a replay that writes
+  nothing) is only known then. A row behind a row of its sequence that writes in
+  the same launch writes too, and the rows of a sequence that write behind rows
+  that do not begin a launch of their own, so that every segment is a replay as
+  a whole: the K/V group prepares a segment by its first row. Until 2026-11-22
+  every row of a step was decided before the first launch: the tiles of a prompt
+  slice that no launch had given a slot yet looked converted, so the block wrote
+  only the first cell of each tile of a prompt, and where a slice started at a
+  cell that is no multiple of eight (behind a hit in the prompt cache) a launch
+  that began in such a tile and reached the next wrote that tile's first row into
+  its converted entry, which the device reported as status `0x4` and the engine
+  ended on. The 27B's block prepares its group once per model step, before it
+  follows, so the order changes nothing there.
 - *The chain.* Longest chains first, so that the rows of a link are the first
   rows of the link before; the records of every link (the record, the sampler's
   settings, where each pick goes, the layer's plan) are uploaded with one copy.

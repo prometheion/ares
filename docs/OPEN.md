@@ -105,12 +105,22 @@ between cards stay with the model. Today the two models share almost nothing ins
 ## Qwen3.8 Flash-Next (`qwen4exp`)
 
 ### Found against Strata on the test machine (2026-11-22; RTX 4060 Ti 16 GB, 62 GiB RAM, UD-Q3_K_XL)
-- [ ] **Crash** with the MTP block (`--drafters` the q2 block): "writing K and V reported status 0x4
+- [x] **Crash** with the MTP block (`--drafters` the q2 block): "writing K and V reported status 0x4
       in the step before" (a row written straight into a converted entry of a tile-mean format;
       only the MTP block's K/V is `q4`) at the end of a long prompt after a few requests, 6 of 6
-      times; the engine reloads (28-51 s). Not with drafts off. Suspected: `blocks/mtp.rs`
-      `follow`/`step` decide `writes_converted` once per batch; the MTP block's exact pool is
-      sized for 8-row steps while it follows the model's 512-row steps.
+      times; the engine reloads (28-51 s). Not with drafts off. Cause: `blocks/mtp.rs` decided
+      which rows of all launches that only write keys are a replay before the first launch, while
+      each launch of Flash-Next's block prepares its K/V group: a prompt slice's tiles that no
+      launch had given an exact slot yet looked converted, so the block wrote only the first cell
+      of each tile of a prompt (its drafts read the rest unwritten), and a slice that starts at a
+      cell that is no multiple of eight (behind the 3 cached tokens of a chat's start) had a launch
+      that began in such a tile, was marked a replay as a whole and still wrote the next tile's
+      first row, into its converted entry. Fixed 2026-11-22: each launch is decided when the ones
+      before it are enqueued (`Driver::key_launch`), and a sequence's rows that write behind rows
+      that do not begin a launch of their own. The exact pool's size was right (each launch is a
+      step of eight rows for the group). The 27B's block prepares once per model step, before it
+      follows: not affected. Test: `qwen4exp_runtime`
+      `the_mtp_block_follows_wide_steps_that_start_at_any_cell`.
 - [ ] Ares is behind: decode with drafts 40-55 % of Strata's (15.9-31.0 against 40.0-43.0
       tokens/s), without 43-51 %; prompts 4 to 10 times slower (Strata 398 / 829 / 1257 tokens/s
       at 2k / 8k / 32k, Ares 94-121); the first token of a short repeated prompt 3 to 15 times
