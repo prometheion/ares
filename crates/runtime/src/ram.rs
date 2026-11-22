@@ -13,6 +13,11 @@
 //!   what keeps a mixture-of-experts model from reading its experts from
 //!   disk, and it gives way to nothing but what is required). It is locked in
 //!   pieces ([`PinnedRam::expert_pieces`]), as many as its allowance holds;
+//! - the K/V of the context beyond VRAM (required: a running sequence cannot
+//!   do without its cells), in a range of address space per device part that
+//!   is locked and mapped for the device in pieces as its pages come into use
+//!   ([`PinnedRam::context_region`]). It takes its memory from the elastic
+//!   users as it grows and gives it back as its pages are freed;
 //! - the prompt cache in RAM (elastic, the lowest rank: a cache gives way to
 //!   whatever needs the memory): the checkpoints of recurrent state, which a
 //!   device part locks in chunks when a place is first used, so the memory
@@ -48,7 +53,7 @@ use std::any::Any;
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 use ares_core::{Broker, Class, Consumer, Growth};
-use ares_cuda::{Device, HostRegistration, PinnedBuffer};
+use ares_cuda::{Device, DevicePtr, HostRegistration, PinnedBuffer};
 use ares_store::Aligned;
 
 pub use machine::{Follow, Look, Machine, Meminfo, MemorySource, Rule, Verdict, high_watermarks};
@@ -69,6 +74,11 @@ struct Books {
     broker: Broker,
     /// The step record and the read-back buffers.
     required: Consumer,
+    /// The K/V of the context beyond VRAM, and what it will hold once the
+    /// pieces of the step that begins are locked: the elastic users make room
+    /// for that much before the pieces are booked.
+    context: Consumer,
+    context_target: u64,
     /// The prompt cache in RAM: checkpoints of recurrent state and pages.
     cache: Consumer,
     /// The bytes of `cache` that are pages; the rest are checkpoints.
@@ -102,7 +112,8 @@ impl Books {
 
     /// What the limit leaves for the elastic users.
     fn elastic_room(&self) -> u64 {
-        self.broker.capacity().saturating_sub(self.usage(&self.required))
+        let context = self.usage(&self.context).max(self.context_target);
+        self.broker.capacity().saturating_sub(self.usage(&self.required) + context)
     }
 
     /// The prompt cache's floor, never more than it can use.
@@ -267,6 +278,9 @@ impl PinnedRam {
         let required = broker
             .register("step record and read-back", Class::Required)
             .expect("a fresh broker takes a consumer");
+        let context = broker
+            .register("K/V of the context beyond VRAM", Class::Required)
+            .expect("a fresh broker takes a consumer");
         let cache = broker
             .register(
                 "prompt cache in RAM: checkpoints of recurrent state and pages",
@@ -279,6 +293,8 @@ impl PinnedRam {
         let books = Books {
             broker,
             required,
+            context,
+            context_target: 0,
             cache,
             pages: 0,
             experts,
@@ -351,6 +367,63 @@ impl PinnedRam {
     pub fn experts(&self) -> u64 {
         let books = self.books();
         books.broker.info(books.experts.id()).map_or(0, |info| info.usage)
+    }
+
+    /// Bytes the K/V of the context beyond VRAM holds now.
+    pub fn context(&self) -> u64 {
+        let books = self.books();
+        books.usage(&books.context)
+    }
+
+    /// The K/V of the context beyond VRAM will hold `bytes` once the pieces
+    /// that a step needs are locked: the elastic users' allowances leave that
+    /// much from now on, so that the tier of experts gives it up (see
+    /// [`PinnedRam::context_room`]) and the bookings of the pieces find it free.
+    pub fn set_context_target(&self, bytes: u64) {
+        self.books().context_target = bytes;
+    }
+
+    /// Whether `bytes` more for the context's K/V fit in the limit without
+    /// anyone giving memory up.
+    pub fn context_fits(&self, bytes: u64) -> bool {
+        let books = self.books();
+        books.broker.capacity().saturating_sub(books.broker.used()) >= bytes
+    }
+
+    /// Lets the elastic users give up what the context's target takes from
+    /// their allowances, as far as they can at once: the tier of experts
+    /// through its hook (which gives pieces up when no step runs) and the
+    /// checkpoint places the conductor has no checkpoint in.
+    pub fn context_room(&self) {
+        let hook = self.shared.hooks.lock().unwrap_or_else(|e| e.into_inner()).experts.clone();
+        if let Some(hook) = hook {
+            hook(self, self.experts_allowance());
+        }
+        self.sweep_checkpoints();
+    }
+
+    /// `len` bytes of address space for the K/V of the context beyond VRAM
+    /// on `device`, of which nothing is locked yet: [`ContextRegion::lock`]
+    /// locks, maps and books pieces of it.
+    pub fn context_region(&self, device: &Device, len: usize) -> Result<ContextRegion, ModelError> {
+        let map = Arc::new(Mapping::new(len).map_err(ModelError::Invalid)?);
+        Ok(ContextRegion { ram: self.clone(), device: device.clone(), map })
+    }
+
+    fn book_context(&self, bytes: u64) -> Result<(), u64> {
+        let mut books = self.books();
+        let Books { broker, context, .. } = &mut *books;
+        match broker.grow(context, bytes) {
+            Ok(Growth::Granted) => Ok(()),
+            Ok(Growth::Reclaim(plan)) => Err(plan.total()),
+            Err(_) => Err(bytes),
+        }
+    }
+
+    fn release_context(&self, bytes: u64) {
+        let mut books = self.books();
+        let Books { broker, context, .. } = &mut *books;
+        let _ = broker.shrink(context, bytes);
     }
 
     /// The most the tier of experts could lock now: what the limit leaves
@@ -711,6 +784,184 @@ impl PinnedRam {
         }
         // Unlocking takes time and books the bytes back: outside the locks.
         freed.iter().map(|chunk| chunk.len() as u64).sum()
+    }
+}
+
+/// Address space of the process, unmapped when the last user of it is gone:
+/// the range of a [`ContextRegion`]. It takes memory only where it is locked.
+struct Mapping {
+    base: *mut libc::c_void,
+    len: usize,
+}
+
+// SAFETY: the mapping is plain memory; who touches which part of it is the
+// business of the region's owner.
+unsafe impl Send for Mapping {}
+// SAFETY: as above; the mapping itself never changes after it is made.
+unsafe impl Sync for Mapping {}
+
+impl Mapping {
+    fn new(len: usize) -> Result<Self, String> {
+        let len = len.max(1).next_multiple_of(4096);
+        // SAFETY: an anonymous mapping of fresh address space.
+        let base = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+                -1,
+                0,
+            )
+        };
+        if base == libc::MAP_FAILED {
+            return Err(format!(
+                "no address space for {len} bytes of K/V beyond VRAM: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        Ok(Self { base, len })
+    }
+}
+
+impl Drop for Mapping {
+    fn drop(&mut self) {
+        // SAFETY: the range is the one `mmap` returned, and every lock on it
+        // is gone: each holds the mapping.
+        unsafe { libc::munmap(self.base, self.len) };
+    }
+}
+
+/// Address space for the K/V of the context beyond VRAM on one device: pages
+/// of K and V that the device reads and writes over its link. Pieces of it
+/// are locked, mapped for the device and booked as they come into use
+/// ([`ContextRegion::lock`]); the rest takes no memory.
+pub struct ContextRegion {
+    ram: PinnedRam,
+    device: Device,
+    map: Arc<Mapping>,
+}
+
+impl std::fmt::Debug for ContextRegion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ContextRegion").field("len", &self.map.len).finish_non_exhaustive()
+    }
+}
+
+/// What a piece of a [`ContextRegion`] lacks: the bytes the limit would have
+/// to take from others before the piece can be booked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ContextShort(pub u64);
+
+impl ContextRegion {
+    /// Where the region starts for the device: the host address, which a
+    /// device with unified addressing reads registered memory at.
+    pub fn base(&self) -> DevicePtr {
+        DevicePtr::NULL.offset(self.map.base as u64)
+    }
+
+    /// The bytes of address space.
+    pub fn len(&self) -> usize {
+        self.map.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.map.len == 0
+    }
+
+    /// Books, locks and maps `len` bytes at `at` (whole pages of the
+    /// region). `Err(Ok(short))` when the limit has no room for them now
+    /// ([`PinnedRam::context_room`] may make it), `Err(Err(_))` when the
+    /// device cannot take them or reads them at another address than the
+    /// host's.
+    pub fn lock(
+        &self,
+        at: usize,
+        len: usize,
+    ) -> Result<ContextLock, Result<ContextShort, ModelError>> {
+        if !at.is_multiple_of(4096) || !len.is_multiple_of(4096) || at + len > self.map.len {
+            return Err(Err(ModelError::Invalid(format!(
+                "a piece of {len} bytes at {at} of a region of {} bytes",
+                self.map.len
+            ))));
+        }
+        self.ram.book_context(len as u64).map_err(|short| Ok(ContextShort(short)))?;
+        // From here on the booking goes back when the lock is dropped, or here.
+        let booking = ContextBooking { ram: self.ram.clone(), bytes: len as u64 };
+        // SAFETY: the range is whole pages inside the mapping, which the lock
+        // keeps alive.
+        let ptr = unsafe { self.map.base.cast::<u8>().add(at) };
+        // SAFETY: as above.
+        let (registration, device) = unsafe { HostRegistration::mapped(&self.device, ptr, len) }
+            .map_err(|e| Err(e.into()))?;
+        if device.as_raw() != ptr as u64 {
+            return Err(Err(ModelError::Invalid(format!(
+                "device {} reads page-locked host memory at another address than the host's: \
+                 K/V beyond VRAM is not built for it",
+                self.device.ordinal()
+            ))));
+        }
+        Ok(ContextLock {
+            registration: Some(registration),
+            _booking: booking,
+            map: self.map.clone(),
+            ptr,
+            len,
+        })
+    }
+}
+
+/// A locked piece of a [`ContextRegion`]: unlocked, returned to the system and
+/// unbooked when dropped. Unlocking waits for the device to finish what it
+/// has, so it is dropped between steps.
+pub struct ContextLock {
+    registration: Option<HostRegistration>,
+    _booking: ContextBooking,
+    map: Arc<Mapping>,
+    ptr: *mut u8,
+    len: usize,
+}
+
+// SAFETY: the lock is a token for memory that only its owner's kernels touch.
+unsafe impl Send for ContextLock {}
+
+impl std::fmt::Debug for ContextLock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ContextLock").field("len", &self.len).finish_non_exhaustive()
+    }
+}
+
+impl ContextLock {
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+impl Drop for ContextLock {
+    fn drop(&mut self) {
+        // Unlocked first: locked pages cannot be given back.
+        drop(self.registration.take());
+        // SAFETY: the range is whole pages inside the mapping, which this
+        // holds, and nothing reads the piece any more.
+        unsafe { libc::madvise(self.ptr.cast(), self.len, libc::MADV_DONTNEED) };
+        let _ = &self.map;
+    }
+}
+
+/// What a piece of the context's K/V gives back to the books when it is
+/// dropped (after its lock: its field comes after the registration's).
+struct ContextBooking {
+    ram: PinnedRam,
+    bytes: u64,
+}
+
+impl Drop for ContextBooking {
+    fn drop(&mut self) {
+        self.ram.release_context(self.bytes);
     }
 }
 

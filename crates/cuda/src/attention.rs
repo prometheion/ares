@@ -15,6 +15,12 @@
 //! and device has its own pair of pools, indexed by the slot, holding only the
 //! KV heads of that device.
 //!
+//! A converted entry whose bit 30 is set ([`FAR_ENTRY`]) lies in the **far pool**:
+//! the same converted slots in page-locked host memory that the device reads and
+//! writes over its link, for the K/V of a context beyond VRAM. Bits 0 to 29 are the
+//! slot there. The kernels take the far pool of a layer next to its converted pool
+//! (null when nothing is far) and read the same bytes from either.
+//!
 //! - An **exact** slot holds, for each KV head, 128 rows of K and 128 rows of V
 //!   as f16 (`2 * D` bytes per row, K first). [`CacheGeometry::exact_entry_bytes`].
 //! - A **converted** slot holds, for each KV head, `[K mean][K rows][V mean][V
@@ -133,6 +139,11 @@ static IMAGE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/attention.fatbin
 
 /// Cells per table entry: one tile.
 pub const ENTRY_CELLS: u32 = 128;
+
+/// The bit of a converted entry that puts it in the far pool (page-locked host
+/// memory), as `ATTN_FAR_BIT` in `kernels/attn_layout.cuh`: bits 0 to 29 are the
+/// slot there.
+pub const FAR_ENTRY: u32 = 1 << 30;
 
 /// Bits of the status word of the writing kernels.
 pub const ATTN_STATUS_NONFINITE: u32 = 1;
@@ -464,6 +475,8 @@ pub struct AttendBuffers {
     pub tables: DevicePtr,
     pub exact_pool: DevicePtr,
     pub converted_pool: DevicePtr,
+    /// The converted slots of entries with [`FAR_ENTRY`] (null when no entry has it).
+    pub far_pool: DevicePtr,
     /// `[row][q_heads_of_model][head_dim]` f32, scaled by nothing (the kernel applies `scale`).
     pub q: DevicePtr,
     /// The gate (same layout as `q`), applied as `out * sigmoid(gate)` when present.
@@ -569,6 +582,7 @@ impl AttentionKernels {
                     .ptr(plan.row_ids)
                     .ptr(buffers.tables)
                     .ptr(buffers.converted_pool)
+                    .ptr(buffers.far_pool)
                     .ptr(buffers.q)
                     .ptr(gate)
                     .ptr(buffers.out)
@@ -607,6 +621,7 @@ impl AttentionKernels {
                 .ptr(buffers.tables)
                 .ptr(buffers.exact_pool)
                 .ptr(buffers.converted_pool)
+                .ptr(buffers.far_pool)
                 .ptr(buffers.q)
                 .ptr(gate)
                 .ptr(buffers.out)
@@ -661,8 +676,9 @@ impl AttentionKernels {
 
     /// Appends the K and V rows of a step. `rows[i]` says where row `i` goes;
     /// `k` and `v` are `[row][kv_total][head_dim]` f32; `tables` is the u32
-    /// entry array the rows' `table` fields index; `status` is one u32 the
-    /// kernel or-s the `ATTN_STATUS_*` bits into.
+    /// entry array the rows' `table` fields index; `far_pool` holds the slots
+    /// of entries with [`FAR_ENTRY`] (null when none has it); `status` is one
+    /// u32 the kernel or-s the `ATTN_STATUS_*` bits into.
     ///
     /// # Safety
     ///
@@ -680,6 +696,7 @@ impl AttentionKernels {
         tables: DevicePtr,
         exact_pool: DevicePtr,
         converted_pool: DevicePtr,
+        far_pool: DevicePtr,
         status: DevicePtr,
     ) -> Result<()> {
         geo.check()?;
@@ -693,6 +710,7 @@ impl AttentionKernels {
             .ptr(tables)
             .ptr(exact_pool)
             .ptr(converted_pool)
+            .ptr(far_pool)
             .u64(geo.config())
             .ptr(status);
         // SAFETY: the caller's contract.
@@ -700,7 +718,7 @@ impl AttentionKernels {
     }
 
     /// Converts exact slots into converted ones: `jobs` is `n_jobs` pairs of u32
-    /// (exact slot, converted slot).
+    /// (exact slot, converted slot; with [`FAR_ENTRY`] a slot of `far_pool`).
     ///
     /// # Safety
     ///
@@ -714,14 +732,20 @@ impl AttentionKernels {
         n_jobs: u32,
         exact_pool: DevicePtr,
         converted_pool: DevicePtr,
+        far_pool: DevicePtr,
         status: DevicePtr,
     ) -> Result<()> {
         geo.check()?;
         if n_jobs == 0 {
             return Ok(());
         }
-        let args =
-            Args::new().ptr(jobs).ptr(exact_pool).ptr(converted_pool).u64(geo.config()).ptr(status);
+        let args = Args::new()
+            .ptr(jobs)
+            .ptr(exact_pool)
+            .ptr(converted_pool)
+            .ptr(far_pool)
+            .u64(geo.config())
+            .ptr(status);
         // SAFETY: the caller's contract.
         unsafe {
             self.convert.launch(

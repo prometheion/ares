@@ -10,11 +10,24 @@
 // where a row is `format.row_bytes(D)` bytes and a mean (only for q7 to q4) is
 // D halves. The rows are the bytes `KvHead` stores. A pool is one array of
 // slots per attention layer and device; the table serves every layer.
+//
+// A converted entry with bit 30 set lies in the far pool: the same slots in
+// page-locked host memory, which the device reads and writes over its link (the
+// K/V of a context beyond VRAM). Bits 0-29 are then the slot in that pool.
 #pragma once
 
 #include "attn_codec.cuh"
 
 #define ATTN_CONVERTED_BIT 0x80000000u
+#define ATTN_FAR_BIT 0x40000000u
+
+// Where converted slot `slot` (bit 31 cleared) starts: in the pool in VRAM, or in
+// the far pool when bit 30 is set.
+template <class T>
+static __device__ __forceinline__ T* conv_entry(T* near, T* far, uint32_t slot, size_t entry_c) {
+    return (slot & ATTN_FAR_BIT) ? far + (size_t)(slot & ~ATTN_FAR_BIT) * entry_c
+                                 : near + (size_t)slot * entry_c;
+}
 
 // One row of a step: the sequence's table, the position of the row's own cell,
 // and where its partial states go.

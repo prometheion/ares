@@ -166,7 +166,8 @@ fn build(
         for st in &steps {
             // SAFETY: the pools hold every slot the tables name.
             unsafe {
-                kernels.append(
+                append_kv(
+                    &kernels,
                     stream,
                     &geo,
                     st.rows.ptr(),
@@ -179,7 +180,8 @@ fn build(
                     status.ptr(),
                 )?;
                 if let Some((jobs, n)) = &st.jobs {
-                    kernels.convert(
+                    convert_kv(
+                        &kernels,
                         stream,
                         &geo,
                         jobs.ptr(),
@@ -244,15 +246,14 @@ fn time_step(
     let scratch = DeviceBuffer::new(device, plan.state_bytes(geo).max(16))?;
     let buffers = plan.upload(device)?;
     let launch = |layer: &Layer| -> Result<()> {
-        let args = AttendBuffers {
-            tables: setup.table_dev.ptr(),
-            exact_pool: layer.exact.ptr(),
-            converted_pool: layer.converted.ptr(),
-            q: q_dev.ptr(),
-            gate: None,
-            out: out.ptr(),
-            scratch: scratch.ptr(),
-        };
+        let args = attend_buffers(
+            setup.table_dev.ptr(),
+            layer.exact.ptr(),
+            layer.converted.ptr(),
+            q_dev.ptr(),
+            out.ptr(),
+            scratch.ptr(),
+        );
         // SAFETY: the buffers were sized from the plan and the geometry.
         unsafe { kernels.attend(stream, geo, &buffers, &args, 1.0 / (D as f32).sqrt()) }
     };

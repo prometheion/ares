@@ -86,8 +86,9 @@ impl Part {
                 opts.max_rows
             )));
         }
-        // The block's K and V are in 4 bits, whatever the model's.
-        let opts = &Options { kv: MTP_KV, prune: None, ..opts.clone() };
+        // The block's K and V are in 4 bits, whatever the model's, and in VRAM:
+        // its attention is one layer.
+        let opts = &Options { kv: MTP_KV, prune: None, near_pages: None, ..opts.clone() };
         let shape = PartShape::whole(c, 0..1, true);
         let f = Frame::new(c, opts, &shape, device.info().multiprocessors)?;
         let weights = DeviceWeights::load_block(device, ledger, c, w, output)?;

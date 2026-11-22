@@ -16,6 +16,9 @@
 //!   its commit says how many of its rows count ([`Group::commit_windows`]).
 //! - **Copy, transfer, release**: a page is copied, and moved to the host and
 //!   back, in the form it has; a page the pool freed gives its exact slot back.
+//! - **Far pages**: a group whose pages do not all fit in VRAM keeps the
+//!   converted entries of the pages from `near` on in host memory
+//!   ([`super::far`]); the device's table names them by their slot there.
 //!
 //! The formats `f16` and `q8` have no exact entries and no pool: the group
 //! reads the step's page table, which names the converted entry of every page.
@@ -37,6 +40,7 @@ use ares_cuda::{
 };
 use ares_runtime::ModelError;
 
+use super::far::{FarLayers, converted_entry};
 use super::forms::{Ahead, Convert, Exhausted, Forms, Reach, exact_slots, window_limit};
 use super::{PAGE_ENTRY, invalid};
 
@@ -190,6 +194,9 @@ pub(crate) struct Group {
     /// The draft windows of the step last prepared: the slot and the position
     /// of the first row.
     windows: Vec<(u32, u32)>,
+    /// Where the converted entries of the pages from `near` on are, when the
+    /// pages do not all fit in VRAM.
+    far: Option<FarLayers>,
 }
 
 impl Group {
@@ -258,7 +265,61 @@ impl Group {
             sent: [Event::new(device)?, Event::new(device)?, Event::new(device)?],
             sending: [false; 3],
             windows: Vec::new(),
+            far: None,
         })
+    }
+
+    /// The converted entries of the pages from `far.near` on lie in a far pool
+    /// ([`super::far::FarPool`]), at `far.layers` for the group's layers in
+    /// their order.
+    pub(crate) fn set_far(&mut self, far: FarLayers) -> Result<(), ModelError> {
+        if far.layers.len() != self.layers.len() {
+            return Err(invalid(format!(
+                "a far pool of {} layers for a group of {}",
+                far.layers.len(),
+                self.layers.len()
+            )));
+        }
+        self.far = Some(far);
+        Ok(())
+    }
+
+    /// The first page whose converted entry is far, when some are.
+    pub(crate) fn near(&self) -> Option<u32> {
+        self.far.as_ref().map(|far| far.near)
+    }
+
+    /// The device's entry of the converted entry of `page`.
+    pub(crate) fn converted_entry(&self, page: u32) -> u32 {
+        converted_entry(self.near(), page)
+    }
+
+    /// The device's entry for an entry the conductor wrote (a page with
+    /// [`PAGE_ENTRY`]).
+    pub(crate) fn device_entry(&self, entry: u32) -> u32 {
+        if entry & PAGE_ENTRY != 0 { self.converted_entry(entry & !PAGE_ENTRY) } else { entry }
+    }
+
+    /// The far pool of `layer` (null when no page is far).
+    fn far_of(&self, layer: &Layer) -> DevicePtr {
+        let Some(far) = &self.far else { return DevicePtr::NULL };
+        self.layers
+            .iter()
+            .position(|l| l.pool == layer.pool && l.exact == layer.exact)
+            .map_or(DevicePtr::NULL, |i| far.layers[i])
+    }
+
+    /// Where the converted entry of `page` lies in `layer` (`i`-th of the
+    /// group), and whether that is in host memory.
+    fn converted_place(&self, i: usize, pages: DevicePtr, page: u32) -> (DevicePtr, bool) {
+        let layer = &self.layers[i];
+        let entry = layer.geo.converted_entry_bytes();
+        match &self.far {
+            Some(far) if page >= far.near => {
+                (far.layers[i].offset(u64::from(page - far.near) * entry), true)
+            }
+            _ => (pages.offset(layer.pool + u64::from(page) * entry), false),
+        }
     }
 
     /// The group has exact entries.
@@ -460,11 +521,12 @@ impl Group {
             let mut tile = 0u32;
             let end = r.tiles().end;
             while tile < end {
+                let near = self.far.as_ref().map(|far| far.near);
                 let want = |tile: u32| {
                     let page = conductor[base + tile as usize] & !PAGE_ENTRY;
-                    match &self.forms {
-                        Some(forms) => forms.entry(page, PAGE_ENTRY),
-                        None => page | PAGE_ENTRY,
+                    match self.forms.as_ref().map(|forms| forms.entry(page, PAGE_ENTRY)) {
+                        Some(exact) if exact & PAGE_ENTRY == 0 => exact,
+                        _ => converted_entry(near, page),
                     }
                 };
                 if self.mirror[base + tile as usize] == want(tile) {
@@ -521,8 +583,8 @@ impl Group {
         let device_jobs = self.upload(stream, jobs, region)?;
         for layer in &self.layers {
             // SAFETY: the jobs name exact slots and pages of the pools of this
-            // layer, which hold `capacity` and `pages` entries; the status word
-            // is in the part's scratch.
+            // layer, which hold `capacity` and `pages` entries, the far ones in
+            // its far pool; the status word is in the part's scratch.
             unsafe {
                 kernels.convert(
                     stream,
@@ -531,6 +593,7 @@ impl Group {
                     jobs.len() as u32,
                     self.exact().offset(layer.exact),
                     pages.offset(layer.pool),
+                    self.far_of(layer),
                     status,
                 )?;
             }
@@ -552,12 +615,20 @@ impl Group {
         to: u32,
     ) -> Result<(), ModelError> {
         let Some(forms) = &mut self.forms else {
-            for layer in &self.layers {
-                let entry = layer.geo.converted_entry_bytes();
-                let place = |page: u32| pages.offset(layer.pool + u64::from(page) * entry);
-                // SAFETY: both entries are in the layer's pool, which has an entry for
-                // every page, and they are different entries (the caller checks).
-                unsafe { stream.copy(place(to), place(from), entry as usize)? };
+            for (i, layer) in self.layers.iter().enumerate() {
+                let entry = layer.geo.converted_entry_bytes() as usize;
+                let ((dst, far_dst), (src, far_src)) =
+                    (self.converted_place(i, pages, to), self.converted_place(i, pages, from));
+                // SAFETY: both entries are in the layer's pools (on the device, or
+                // locked in the far pool for a page the step's tables name), and
+                // they are different entries (the caller checks).
+                unsafe {
+                    if far_dst || far_src {
+                        stream.copy_any(dst, src, entry)?;
+                    } else {
+                        stream.copy(dst, src, entry)?;
+                    }
+                }
             }
             return Ok(());
         };
@@ -609,7 +680,7 @@ impl Group {
                 None => planner.window(table, entries, s.row0, s.n_rows, pos0, None),
                 Some(a) => {
                     let before = a.from - pos0;
-                    let swap = Some((a.tile, a.page | PAGE_ENTRY));
+                    let swap = Some((a.tile, self.converted_entry(a.page)));
                     planner.window(table, entries, s.row0, before, pos0, None);
                     planner.window(
                         table,
@@ -703,6 +774,7 @@ impl Group {
         let geo = &layer.geo;
         let (tables, exact, pool) =
             (self.table(step_table), self.exact_pool(layer), pages.offset(layer.pool));
+        let far = self.far_of(layer);
         let kv_row = u64::from(geo.kv_total) * u64::from(geo.head_dim) * 4;
         for run in writing_rows(replay, first, n) {
             let at = u64::from(run.start);
@@ -719,6 +791,7 @@ impl Group {
                     tables,
                     exact,
                     pool,
+                    far,
                     status,
                 )?;
             }
@@ -753,6 +826,7 @@ impl Group {
             tables: self.table(step_table),
             exact_pool: self.exact_pool(layer),
             converted_pool: pages.offset(layer.pool),
+            far_pool: self.far_of(layer),
             q,
             gate,
             out,
@@ -781,24 +855,36 @@ impl Group {
     ) -> Result<(usize, bool), ModelError> {
         let (slot, exact_pool) = (self.exact_slot(page), self.exact());
         let mut at = 0usize;
-        for layer in &self.layers {
-            let (src, bytes) = match slot {
+        for (i, layer) in self.layers.iter().enumerate() {
+            let (src, bytes, far) = match slot {
                 Some(slot) => {
                     let entry = layer.geo.exact_entry_bytes();
-                    (exact_pool.offset(layer.exact + u64::from(slot) * entry), entry as usize)
+                    (
+                        exact_pool.offset(layer.exact + u64::from(slot) * entry),
+                        entry as usize,
+                        false,
+                    )
                 }
                 None => {
-                    let entry = layer.geo.converted_entry_bytes();
-                    (pages.offset(layer.pool + u64::from(page) * entry), entry as usize)
+                    let (src, far) = self.converted_place(i, pages, page);
+                    (src, layer.geo.converted_entry_bytes() as usize, far)
                 }
             };
             if at + bytes > room {
                 return Err(invalid("a page in transit has less room than its entries"));
             }
             // SAFETY: the entry is in the layer's pool (the page and the slot
-            // are below the pools' sizes) and `dst` has room for it (checked
-            // above); the caller waits for the stream before it reads.
-            unsafe { stream.copy_to_host(dst.add(at), src, bytes)? };
+            // are below the pools' sizes; a far one is locked while the page
+            // is in use) and `dst` has room for it (checked above); the caller
+            // waits for the stream before it reads.
+            unsafe {
+                if far {
+                    let to = DevicePtr::NULL.offset(dst.add(at) as u64);
+                    stream.copy_any(to, src, bytes)?;
+                } else {
+                    stream.copy_to_host(dst.add(at), src, bytes)?;
+                }
+            }
             at += bytes;
         }
         Ok((at, slot.is_some()))
@@ -839,15 +925,19 @@ impl Group {
         };
         let exact_pool = self.exact();
         let mut at = 0usize;
-        for layer in &self.layers {
-            let (dst, bytes) = match slot {
+        for (i, layer) in self.layers.iter().enumerate() {
+            let (dst, bytes, far) = match slot {
                 Some(slot) => {
                     let entry = layer.geo.exact_entry_bytes();
-                    (exact_pool.offset(layer.exact + u64::from(slot) * entry), entry as usize)
+                    (
+                        exact_pool.offset(layer.exact + u64::from(slot) * entry),
+                        entry as usize,
+                        false,
+                    )
                 }
                 None => {
-                    let entry = layer.geo.converted_entry_bytes();
-                    (pages.offset(layer.pool + u64::from(page) * entry), entry as usize)
+                    let (dst, far) = self.converted_place(i, pages, page);
+                    (dst, layer.geo.converted_entry_bytes() as usize, far)
                 }
             };
             if at + bytes > len {
@@ -855,7 +945,14 @@ impl Group {
             }
             // SAFETY: as in `page_out`, the other way; `src` holds `len` bytes
             // and stays as it is until the caller has waited for the stream.
-            unsafe { stream.copy_from_host(dst, src.add(at), bytes)? };
+            unsafe {
+                if far {
+                    let from = DevicePtr::NULL.offset(src.add(at) as u64);
+                    stream.copy_any(dst, from, bytes)?;
+                } else {
+                    stream.copy_from_host(dst, src.add(at), bytes)?;
+                }
+            }
             at += bytes;
         }
         if exact && !keep {
@@ -901,10 +998,12 @@ impl Group {
             )));
         }
         let at = region * slots.room * 8;
+        let near = self.far.as_ref().map(|far| far.near);
         for (i, job) in jobs.iter().enumerate() {
             let word = at + i * 8;
+            let to = converted_entry(near, job.page) & !PAGE_ENTRY;
             slots.host[word..word + 4].copy_from_slice(&job.exact.to_le_bytes());
-            slots.host[word + 4..word + 8].copy_from_slice(&job.page.to_le_bytes());
+            slots.host[word + 4..word + 8].copy_from_slice(&to.to_le_bytes());
         }
         // SAFETY: both buffers hold `room` jobs per region; the pinned one is
         // not written again before the step has run.

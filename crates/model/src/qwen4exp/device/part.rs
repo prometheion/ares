@@ -55,8 +55,8 @@ use ares_cuda::{
     PinnedBuffer, Plan, PlanConfig, Planner, Precision, Q4Kernels, ReadWrite, RecurrentShape,
     RopeParams, Segment, SelectionRule, StateFormat, StepRecord, Stream, WeightLayout,
 };
-use ares_runtime::ModelError;
 use ares_runtime::expert_store::cpu::act_bytes as cpu_act_bytes;
+use ares_runtime::{ModelError, PinnedRam};
 
 mod dflash;
 mod mtp;
@@ -73,6 +73,7 @@ use super::load::{
     Role, SharedW,
 };
 use super::prune::{PartPrune, PruneMask, PruneSetup};
+use crate::blocks::far::FarPool;
 use crate::blocks::kv;
 use crate::blocks::recurrent::{self, Inputs, Recurrent};
 use crate::blocks::rows::{self, HostTable};
@@ -127,6 +128,12 @@ pub struct Options {
     /// out (`StepEnv::pools`); 0 for as many as the page tables have entries,
     /// so that every sequence slot can own pages of its own.
     pub pool_pages: u32,
+    /// The pages whose K and V lie in VRAM, when not all of them do: the
+    /// attention layers keep the converted entries of the pages from this one
+    /// on in page-locked host memory, which the device reads over its link
+    /// (`blocks/far.rs`, [`Part::open_far`]); the indexer's keys of every
+    /// page stay in VRAM. `None`: every page is in VRAM.
+    pub near_pages: Option<u32>,
     /// The precision of the products with the dense weights in wide steps.
     pub precision: Precision,
     /// Whether the logits of the wanted rows are copied to the host
@@ -172,6 +179,7 @@ impl Default for Options {
             max_slots: 1,
             cells: 4096,
             pool_pages: 0,
+            near_pages: None,
             precision: Precision::Fast,
             host_logits: true,
             profile: None,
@@ -213,6 +221,12 @@ impl Options {
     /// Pages of the pools.
     pub fn pages(&self) -> u32 {
         if self.pool_pages == 0 { self.table_entries() } else { self.pool_pages }
+    }
+
+    /// The pages whose K and V lie in VRAM: at least page 0, which a table
+    /// names before a driver writes it.
+    pub fn near_pages(&self) -> u32 {
+        self.near_pages.map_or(self.pages(), |near| near.clamp(1, self.pages()))
     }
 }
 
@@ -606,6 +620,8 @@ pub(crate) struct Frame {
     act_host_stride: u64,
     geo: CacheGeometry,
     ix: IndexerShape,
+    /// How the indexer's pooled keys are stored.
+    keys: KeyFormat,
     ng: Option<NgramShape>,
     plan_config: PlanConfig,
     /// The flags of the exchange with a peer and the bytes of the exchange
@@ -759,6 +775,9 @@ impl Frame {
         let ng = ngram_shape(c);
         let plan_config = PlanConfig::for_multiprocessors(multiprocessors);
         let pages = u64::from(opts.pages());
+        // The converted entries of K and V of the pages in VRAM; the indexer's
+        // keys of every page.
+        let near = u64::from(opts.near_pages());
         // The exact slots of the K/V group, when its formats have a tile mean,
         // with the tails the prefix cache may hold.
         let sizing = kv::Sizing {
@@ -799,7 +818,7 @@ impl Frame {
             } else if c.is_attention(layer) {
                 any_attention = true;
                 let kv_pool = pool_bytes;
-                let key_pool = (kv_pool + pages * geo.converted_entry_bytes()).next_multiple_of(64);
+                let key_pool = (kv_pool + near * geo.converted_entry_bytes()).next_multiple_of(64);
                 pool_bytes = (key_pool + pages * ix.key_slot_bytes(opts.keys)).next_multiple_of(64);
                 let carry = slot.take(ix.carry_len() * 4);
                 let exact = exact_at;
@@ -1052,6 +1071,7 @@ impl Frame {
                 .next_multiple_of(64),
             geo,
             ix,
+            keys: opts.keys,
             ng,
             plan_config,
             x_flags,
@@ -1122,6 +1142,14 @@ impl Frame {
     /// Bytes of the K/V pools and key pools.
     pub(crate) fn pool_bytes(&self) -> u64 {
         self.pool_bytes
+    }
+
+    /// The bytes a page takes in the part's attention layers: the converted
+    /// entries of K and V, which lie in host memory for a page beyond VRAM,
+    /// and the indexer's keys, which are in VRAM for every page.
+    pub(crate) fn page_parts(&self) -> (u64, u64) {
+        let layers = self.attention.iter().flatten().count() as u64;
+        (layers * self.geo.converted_entry_bytes(), layers * self.ix.key_slot_bytes(self.keys))
     }
 
     /// Bytes of everything a step needs besides weights, state and pools:
@@ -2044,12 +2072,14 @@ impl Part {
             }
             let i = at + count;
             self.entries[i] = entry;
-            words[i] = entry;
+            // The device names a page whose K and V are in host memory by its
+            // slot there; the keys of every page are in VRAM.
+            words[i] = self.kv.as_ref().map_or(entry, |kv| kv.device_entry(entry));
             words[total + i] = entry & !PAGE_ENTRY;
             count += 1;
         }
         if let Some(kv) = &mut self.kv {
-            kv.written(at, &self.entries[at..at + count]);
+            kv.written(at, &words[at..at + count]);
         }
         if count > 0 {
             // SAFETY: both ranges are inside the tables and the mirror.
@@ -2078,12 +2108,14 @@ impl Part {
             return Err(invalid("pages of their own need as many pages as table entries"));
         }
         let mut bytes = Vec::with_capacity(8 * total);
+        let mut device = Vec::with_capacity(total);
         for i in 0..total as u32 {
             self.entries[i as usize] = PAGE_ENTRY | i;
-            bytes.extend((PAGE_ENTRY | i).to_le_bytes());
+            device.push(self.kv.as_ref().map_or(PAGE_ENTRY | i, |kv| kv.converted_entry(i)));
+            bytes.extend(device[i as usize].to_le_bytes());
         }
         if let Some(kv) = &mut self.kv {
-            kv.written(0, &self.entries);
+            kv.written(0, &device);
         }
         bytes.extend((0..total as u32).flat_map(u32::to_le_bytes));
         // SAFETY: the mirror is `bytes.len()` long, up to its padding.
@@ -3505,6 +3537,24 @@ impl Part {
     /// The K/V group of the part's attention layers.
     fn group(&self) -> Result<&kv::Group, ModelError> {
         self.kv.as_ref().ok_or_else(|| invalid("no K/V group"))
+    }
+
+    /// The far pool of the part's attention layers, when its options keep the
+    /// K and V of some pages in host memory ([`Options::near_pages`]): booked
+    /// and locked in `ram` as it comes into use. The part's K/V group reads
+    /// and writes it from now on; whoever drives the part locks its pieces
+    /// before a step names a far page ([`FarPool::ensure`]). `None` when every
+    /// page is in VRAM or the part has no attention layer.
+    pub fn open_far(&mut self, ram: &PinnedRam) -> Result<Option<FarPool>, ModelError> {
+        let (near, pages) = (self.opts.near_pages(), self.opts.pages());
+        let Some(kv) = self.kv.as_mut().filter(|_| near < pages) else { return Ok(None) };
+        let layers = self.f.attention.iter().flatten().count();
+        let entries = vec![self.f.geo.converted_entry_bytes(); layers];
+        let pool = FarPool::new(ram, &self.device, near, pages, &entries)?;
+        kv.set_far(pool.layers())?;
+        // The tables name page 0 everywhere until a driver writes them: page 0
+        // is in VRAM whatever the split.
+        Ok(Some(pool))
     }
 
     /// Tells the part that the pool freed these pages, so that the K/V group

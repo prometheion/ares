@@ -1234,6 +1234,7 @@ fn selected_lists_reach_the_attention_kernels() {
                     table_b.ptr(),
                     exact_pool.ptr(),
                     conv_pool.ptr(),
+                    ares_cuda::DevicePtr::NULL,
                     status.ptr(),
                 )
                 .unwrap();
@@ -1379,6 +1380,7 @@ fn selected_lists_reach_the_attention_kernels() {
                         tables: table_b.ptr(),
                         exact_pool: exact_pool.ptr(),
                         converted_pool: conv_pool.ptr(),
+                        far_pool: ares_cuda::DevicePtr::NULL,
                         q: q_b.ptr(),
                         gate: None,
                         out: out.ptr(),

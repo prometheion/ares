@@ -317,6 +317,7 @@ impl<'a> Rig<'a> {
                     self.pages.table(DevicePtr::NULL),
                     self.pages.exact(),
                     self.converted.ptr(),
+                    DevicePtr::NULL,
                     self.status.ptr(),
                 )
                 .unwrap();
@@ -491,6 +492,7 @@ impl<'a> Rig<'a> {
             tables: self.pages.table(DevicePtr::NULL),
             exact_pool: self.pages.exact(),
             converted_pool: self.converted.ptr(),
+            far_pool: DevicePtr::NULL,
             q: q_dev.ptr(),
             gate: None,
             out: out.ptr(),

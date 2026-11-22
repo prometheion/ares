@@ -96,8 +96,8 @@ pub use model::{
     StepContext, TowerJob, TransferContext, Vision,
 };
 pub use ram::{
-    CacheBuffer, Follow, LockedChunk, Look, Machine, Meminfo, MemorySource, PinnedRam, PlaceChunks,
-    Rule, Verdict, high_watermarks,
+    CacheBuffer, ContextLock, ContextRegion, ContextShort, Follow, LockedChunk, Look, Machine,
+    Meminfo, MemorySource, PinnedRam, PlaceChunks, Rule, Verdict, high_watermarks,
 };
 pub use record::{
     Commit, DraftChances, FREED_PER_RECORD, ImageRun, InnerSave, PageCopy, RecordFull, RecordView,

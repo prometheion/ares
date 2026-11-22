@@ -212,6 +212,7 @@ fn build(
                     st.table.ptr(),
                     exact.ptr(),
                     converted.ptr(),
+                    ares_cuda::DevicePtr::NULL,
                     status.ptr(),
                 )?;
                 if let Some((jobs, n)) = &st.jobs {
@@ -222,6 +223,7 @@ fn build(
                         *n,
                         exact.ptr(),
                         converted.ptr(),
+                        ares_cuda::DevicePtr::NULL,
                         status.ptr(),
                     )?;
                 }
@@ -296,6 +298,7 @@ fn time_step(
             tables: setup.table_dev.ptr(),
             exact_pool: layer.exact.ptr(),
             converted_pool: layer.converted.ptr(),
+            far_pool: ares_cuda::DevicePtr::NULL,
             q: q_dev.ptr(),
             gate: None,
             out: out.ptr(),

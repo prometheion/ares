@@ -39,8 +39,8 @@ mod tower;
 
 pub use attention::{
     ATTN_STATUS_DIRECT_MEAN, ATTN_STATUS_NONFINITE, ATTN_STATUS_OVERFLOW, AttendBuffers,
-    AttentionKernels, AttnItem, AttnRow, AttnShape, CacheFormat, CacheGeometry, ENTRY_CELLS, Plan,
-    PlanBuffers, PlanConfig, PlanLayout, Planner,
+    AttentionKernels, AttnItem, AttnRow, AttnShape, CacheFormat, CacheGeometry, ENTRY_CELLS,
+    FAR_ENTRY, Plan, PlanBuffers, PlanConfig, PlanLayout, Planner,
 };
 pub use device::{
     BUILT_CLASSES, Device, DeviceInfo, MemInfo, PciAddress, Wait, device_count, devices,

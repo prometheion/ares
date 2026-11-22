@@ -676,6 +676,97 @@ fn the_runtime_answers_as_the_session_does_in_every_placement() {
     }
 }
 
+/// [`start_with`] without a draft block or the prefix cache, with the K and V of the pages
+/// from `near` on in page-locked host memory (`blocks/far.rs`) when `near` is given.
+fn start_near(placement: Placement, rows: u32, near: Option<u32>) -> (Runtime, Arc<Qwen4Exp>) {
+    let devices = open_devices(placement);
+    let gguf = Gguf::open(gguf_path(1)).unwrap();
+    let n_layer = Config::from_gguf(&gguf).unwrap().n_layer;
+    let pages = 16;
+    let mut opts = options(placement, n_layer, pages, MAX_ROWS, rows);
+    opts.part.near_pages = near;
+    let inner =
+        Arc::new(Qwen4Exp::new(gguf, byte_tokenizer(None), "made", &devices, opts, CELLS).unwrap());
+    let config =
+        RuntimeConfig { pages, cells_per_page: 128, max_slots: SLOTS, ..RuntimeConfig::default() };
+    let model: Arc<dyn Model> = Arc::new(made(&inner, Cache::Off));
+    let mut gpu = GpuConfig::new(&config, &*model);
+    // Room for the tier of experts and the K and V beyond VRAM next to what the
+    // executor needs.
+    gpu.ram_limit += 512 << 20;
+    gpu.vram_headroom = 512 << 20;
+    (Runtime::start_gpu(model, devices, config, gpu).expect("the runtime starts"), inner)
+}
+
+/// The K and V of the pages beyond the first lie in page-locked host memory, which the
+/// device reads and writes over its link (`blocks/far.rs`): a prompt of three pages answers
+/// with the same tokens as with every page in VRAM, in steps of the decode kernels and in
+/// wide steps, in every placement. The kernels read the same bytes from another address, so
+/// with every expert in a slot the answers are the same token for token.
+#[test]
+fn k_and_v_beyond_vram_change_no_token() {
+    if !enabled() {
+        return;
+    }
+    let prompt = prompt(300, 7);
+    for placement in placements() {
+        for rows in [MAX_ROWS, WIDE_ROWS] {
+            let mut answers = Vec::new();
+            for near in [None, Some(1)] {
+                let (runtime, model) = start_near(placement, rows, near);
+                let _ = ask(&runtime, 1, &prompt, 24);
+                warm(&model);
+                let got = ask(&runtime, 2, &prompt, 24);
+                assert_nothing_missed(&model, "the answer with filled tiers");
+                runtime.shutdown();
+                answers.push(got);
+            }
+            eprintln!(
+                "FAR {placement:?}, steps of {rows} rows: {} of {} tokens as with every page in \
+                 VRAM",
+                answers[0].iter().zip(&answers[1]).take_while(|(a, b)| a == b).count(),
+                answers[0].len()
+            );
+            assert_eq!(answers[1], answers[0], "{placement:?}, {rows} rows: K and V in RAM");
+        }
+        // The session with its pages beyond the first in RAM says what the session says.
+        let want = session_answer(1, placement, &prompt, 24);
+        assert_eq!(session_answer_near(placement, &prompt, 24, 1), want, "{placement:?}");
+    }
+}
+
+/// [`session_answer`] with the K and V of the pages from `near` on in host memory.
+fn session_answer_near(placement: Placement, prompt: &[u32], n: usize, near: u32) -> Vec<u32> {
+    let devices = open_devices(placement);
+    let gguf = Gguf::open(gguf_path(1)).unwrap();
+    let c = Config::from_gguf(&gguf).unwrap();
+    let w = Weights::load(&gguf, &c).unwrap();
+    let mut opts = options(placement, c.n_layer, 0, MAX_ROWS, MAX_ROWS);
+    opts.part.pool_pages = 0;
+    opts.part.near_pages = Some(near);
+    opts.ram_tier = Some(64 << 20);
+    let mut session = Session::open(&gguf, &c, &w, devices, opts).expect("the session opens");
+    let n_expert = c.experts.count as u32;
+    session.fill(&mut |_| (0..n_expert).collect()).expect("the tiers fill");
+    let mut pick = 0;
+    let chunks = prompt.chunks(MAX_ROWS as usize).count();
+    for (i, chunk) in prompt.chunks(MAX_ROWS as usize).enumerate() {
+        let wanted = if i + 1 == chunks { Wanted::Last } else { Wanted::None };
+        let picks =
+            session.step(&[Rows { slot: 0, tokens: chunk, direct: true, wanted }]).expect("a step");
+        pick = picks.first().copied().unwrap_or(pick);
+    }
+    let mut answer = vec![pick];
+    while answer.len() < n {
+        let token = [answer[answer.len() - 1]];
+        let picks = session
+            .step(&[Rows { slot: 0, tokens: &token, direct: true, wanted: Wanted::Last }])
+            .expect("a step");
+        answer.push(picks[0]);
+    }
+    answer
+}
+
 /// A prompt read in slices of up to 64 rows, on the many-row kernels, with every expert
 /// fetched (none has a slot when the model starts), in every placement: the answer starts as
 /// the CPU reference's does. (Later tokens of a made-up model's answer follow near ties, which

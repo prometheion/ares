@@ -261,6 +261,32 @@ impl HostRegistration {
         })?;
         Ok(Self { device: device.clone(), ptr })
     }
+
+    /// Page-locks `len` bytes at `ptr` and maps them for the kernels of every
+    /// device: they read and write the memory over their link at the address
+    /// that comes back with it. On a device with unified addressing that can
+    /// use host pointers for registered memory (every 64-bit Linux system
+    /// these engines run on) the address is `ptr` itself.
+    ///
+    /// # Safety
+    ///
+    /// As for [`HostRegistration::new`].
+    pub unsafe fn mapped(device: &Device, ptr: *mut u8, len: usize) -> Result<(Self, DevicePtr)> {
+        let driver = device.bind()?;
+        let flags = CU_MEMHOSTREGISTER_PORTABLE | CU_MEMHOSTREGISTER_DEVICEMAP;
+        let raw = ptr.cast::<c_void>();
+        // SAFETY: the caller guarantees the range is mapped and page-aligned.
+        driver.check("cuMemHostRegister", unsafe {
+            (driver.api.mem_host_register)(raw, len, flags)
+        })?;
+        let registration = Self { device: device.clone(), ptr: raw };
+        let mut at: CUdeviceptr = 0;
+        // SAFETY: the range was registered with the device map flag above.
+        driver.check("cuMemHostGetDevicePointer", unsafe {
+            (driver.api.mem_host_get_device_pointer)(&mut at, raw, 0)
+        })?;
+        Ok((registration, DevicePtr(at)))
+    }
 }
 
 impl Drop for HostRegistration {

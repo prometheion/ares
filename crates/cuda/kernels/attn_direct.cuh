@@ -268,8 +268,8 @@ static __device__ __forceinline__ void direct_scores(
 template <int D, int NV, int W>
 static __device__ void attn_direct_body(
     const AttnItem* items, const uint32_t* ranges, const AttnRow* rows, const uint32_t* row_ids,
-    const uint32_t* tables, const uint8_t* conv_pool, const float* q, const float* gate, float* out,
-    float* st_acc, float* st_lse, uint64_t cfg, float scale_log2) {
+    const uint32_t* tables, const uint8_t* conv_pool, const uint8_t* far_pool, const float* q,
+    const float* gate, float* out, float* st_acc, float* st_lse, uint64_t cfg, float scale_log2) {
     constexpr int GROUPS = D / 32;
     constexpr int CPI = 256 / D;   // cells of a step of the V loop (the lanes of a row hold 8 values each)
     constexpr int LPC = 32 / CPI;  // lanes per cell there
@@ -362,7 +362,7 @@ static __device__ void attn_direct_body(
 
     auto v_mean_flush = [&]() {
         if (v_open == CELL_NONE) return;
-        const uint8_t* mp = conv_pool + (size_t)v_open * g.entry_c + head_c + g.v_mean_off;
+        const uint8_t* mp = conv_entry(conv_pool, far_pool, v_open, g.entry_c) + head_c + g.v_mean_off;
         float mean[8];
         halves8f(mp, vg, vq, mean);
 #pragma unroll
@@ -391,7 +391,7 @@ static __device__ void attn_direct_body(
             n_cell = rg[0] + (lane & (ATTN_SAME_ROWS - 1));  // timing only: every unit reads the same rows
 #endif
             n_ent = attn_entry(it, tables, n_cell) & ~ATTN_CONVERTED_BIT;
-            const uint8_t* head = conv_pool + (size_t)n_ent * g.entry_c + head_c;
+            const uint8_t* head = conv_entry(conv_pool, far_pool, n_ent, g.entry_c) + head_c;
             const uint32_t r = n_cell % ATTN_TILE_CELLS;
             n_kp = head + g.k_rows_off + (size_t)r * g.rbk;
             n_vp = head + g.v_rows_off + (size_t)r * g.rbv;
@@ -440,7 +440,7 @@ static __device__ void attn_direct_body(
                 if (e == 0 && entry == k_cached) {
                     if (lane < 8) mdot[lane] = mlast[lane];
                 } else {
-                    const uint8_t* mp = conv_pool + (size_t)entry * g.entry_c + head_c;
+                    const uint8_t* mp = conv_entry(conv_pool, far_pool, entry, g.entry_c) + head_c;
                     float mean[8], acc[NV];
 #pragma unroll
                     for (int v = 0; v < NV; ++v) acc[v] = 0.0f;
@@ -637,9 +637,10 @@ static __device__ void attn_direct_body(
 #define ARES_ATTN_DIRECT(NAME, D, NV, W, PER_SM)                                                      \
     extern "C" __global__ void __launch_bounds__(32 * (W), PER_SM) NAME(                              \
         const AttnItem* items, const uint32_t* ranges, const AttnRow* rows, const uint32_t* row_ids, \
-        const uint32_t* tables, const uint8_t* conv_pool, const float* q, const float* gate,         \
-        float* out, float* st_acc, float* st_lse, uint64_t cfg, float scale_log2) {                  \
+        const uint32_t* tables, const uint8_t* conv_pool, const uint8_t* far_pool, const float* q,   \
+        const float* gate, float* out, float* st_acc, float* st_lse, uint64_t cfg,                   \
+        float scale_log2) {                                                                           \
         attn_direct_body<D, NV, W>(                                                                   \
-            items, ranges, rows, row_ids, tables, conv_pool, q, gate, out, st_acc, st_lse, cfg,       \
-            scale_log2);                                                                              \
+            items, ranges, rows, row_ids, tables, conv_pool, far_pool, q, gate, out, st_acc, st_lse,  \
+            cfg, scale_log2);                                                                         \
     }

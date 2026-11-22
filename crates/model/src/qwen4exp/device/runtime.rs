@@ -27,12 +27,13 @@
 //!   model.
 
 use std::ops::Range;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, TryLockError};
 use std::time::{Duration, Instant};
 
 use ares_api::{ChatFormat, EngineError, ExpertStats, ModelCard, Prompt};
 use ares_core::Ledger;
+use ares_core::units::Bytes;
 use ares_cuda::{Device, DevicePtr, ENTRY_CELLS, Event, MAX_BATCH, Segment, StepRecord, Stream};
 use ares_gguf::Gguf;
 use ares_io::Reader;
@@ -65,6 +66,7 @@ use super::prune::{self, PruneMask};
 use super::resume::Resume;
 use super::session::{Chosen, Fill, PartReport, SessionOptions, choose};
 use super::usage::{Log, ProfileReport, Usage, UsageStats};
+use crate::blocks::far::FarPool;
 use crate::blocks::head::HeadView;
 use crate::blocks::mtp::{MtpChain, MtpStep};
 use crate::blocks::rows::{self, HostTable, TOKEN_EMBD};
@@ -262,6 +264,8 @@ struct Build {
     lone_rows: u32,
     /// The most rows of a prompt read layer by layer (0: none).
     pass_rows: u32,
+    /// Per part: the K and V of its attention layers beyond VRAM, if any.
+    far: Vec<Option<Arc<Mutex<FarPool>>>>,
 }
 
 /// The plan of the expert store and what it was made from.
@@ -277,6 +281,12 @@ struct PlanBox {
 /// more and no step runs: the thread that watches the machine's memory does
 /// it, it must look again soon, and a step that begins waits for it.
 const GROW_SLICE: Duration = Duration::from_millis(40);
+
+/// How long the start of a step tries to make room in the RAM limit for the
+/// K and V beyond VRAM that it names, and how long each try waits for what
+/// is on its way into the tier of experts before the tier gives pieces up.
+const FAR_WAIT: Duration = Duration::from_secs(10);
+const FAR_SHRINK_WAIT: Duration = Duration::from_millis(200);
 
 // --- what the device threads share in a step --------------------------------
 
@@ -327,6 +337,11 @@ pub(super) struct Flow {
     pass_picks: Mutex<Option<(u64, Arc<SpanPicks>)>>,
     /// The passes that took a loan so far: each is numbered by it.
     pass_count: AtomicU64,
+    /// The far pools of the parts (`blocks/far.rs`), the far slots their
+    /// pieces cover now, and the engine's RAM, which books them.
+    far: Vec<Arc<Mutex<FarPool>>>,
+    far_slots: AtomicU32,
+    ram: PinnedRam,
 }
 
 impl Flow {
@@ -406,12 +421,17 @@ impl Flow {
         step: u64,
         rows: u32,
         windows: Option<StepWindows<'_>>,
+        far_slots: u32,
         index: usize,
         stream: &Stream,
         pass: Option<&PassKey>,
     ) -> Result<(), ModelError> {
         let mut feed = self.lock_feed();
         if self.begun.load(Ordering::Acquire) != step {
+            // The K and V beyond VRAM that the step names are locked before
+            // the store begins it: the tier of experts gives up what they take
+            // while no step runs.
+            self.lock_far(&mut feed, far_slots)?;
             for counter in self.enqueued.iter().chain(&self.followed) {
                 counter.store(0, Ordering::Release);
             }
@@ -435,6 +455,59 @@ impl Flow {
             self.begun.store(step, Ordering::Release);
         }
         feed.store.device_mut(index).fence(stream).map_err(|e| invalid(e.to_string()))
+    }
+
+    /// Locks the pieces of every far pool that its first `slots` slots lie in
+    /// and gives back those above them, between steps, with the store not in
+    /// a step. The tier of experts gives up what the RAM limit has no room
+    /// for: a running sequence's K and V rank above it (see "Host memory" in
+    /// `docs/ARCHITECTURE.md`).
+    fn lock_far(&self, feed: &mut Feed, slots: u32) -> Result<(), ModelError> {
+        if self.far.is_empty() || slots == self.far_slots.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let pools: Vec<_> =
+            self.far.iter().map(|p| p.lock().unwrap_or_else(|e| e.into_inner())).collect();
+        let wanted: u64 = pools.iter().map(|p| p.bytes_for(slots)).sum();
+        let locked: u64 = pools.iter().map(|p| p.locked()).sum();
+        let mut pools = pools;
+        if wanted <= locked {
+            for pool in &mut pools {
+                pool.shrink(slots);
+            }
+            self.ram.set_context_target(pools.iter().map(|p| p.locked()).sum());
+            self.far_slots.store(slots, Ordering::Release);
+            return Ok(());
+        }
+        self.ram.set_context_target(wanted);
+        let started = Instant::now();
+        loop {
+            let short = pools.iter_mut().find_map(|pool| pool.ensure(slots).err());
+            match short {
+                None => break,
+                Some(Err(error)) => return Err(error),
+                Some(Ok(short)) => {
+                    if started.elapsed() > FAR_WAIT {
+                        self.ram.set_context_target(pools.iter().map(|p| p.locked()).sum());
+                        return Err(invalid(format!(
+                            "the RAM limit has no room for {} more of K and V beyond VRAM: the \
+                             tier of experts is at its floor and the prompt cache holds the rest",
+                            Bytes(short.0)
+                        )));
+                    }
+                    // The tier gives up what its allowance no longer has room for.
+                    feed.store.set_ram_target(self.ram.experts_allowance());
+                    feed.store.shrink_ram(FAR_SHRINK_WAIT).map_err(|e| invalid(e.to_string()))?;
+                    drop(feed.store.take_released());
+                    if feed.store.ram_at_floor() {
+                        self.ram.experts_floor(feed.store.ram_bytes().0);
+                    }
+                    self.ram.sweep_checkpoints();
+                }
+            }
+        }
+        self.far_slots.store(slots, Ordering::Release);
+        Ok(())
     }
 
     /// Lends every device the VRAM of a step wider than the parts' own
@@ -790,6 +863,27 @@ pub fn place(
     place_in(gguf, &config, &weights, devices, opts)
 }
 
+/// What a page takes on each device of `placement`: the converted entries of
+/// K and V of its attention layers, and the indexer's keys. The first lies in
+/// host memory for a page beyond VRAM ([`Options::near_pages`]), the second in
+/// VRAM for every page.
+pub fn page_parts(
+    gguf: &Gguf,
+    devices: &[Device],
+    opts: &SessionOptions,
+    placement: &Placement,
+) -> Result<Vec<(u64, u64)>, OpenError> {
+    let config = Config::from_gguf(gguf)?;
+    let mut parts = Vec::with_capacity(devices.len());
+    for (index, device) in devices.iter().enumerate() {
+        let PartPlan { role, first, shares, head } = placement.part(&config, index);
+        let shape = PartShape { role, first, shares, head };
+        let frame = Frame::new(&config, &opts.part, &shape, device.info().multiprocessors)?;
+        parts.push(frame.page_parts());
+    }
+    Ok(parts)
+}
+
 fn place_in(
     gguf: &Gguf,
     config: &Config,
@@ -985,6 +1079,7 @@ impl Qwen4Exp {
                 multiprocessors: vec![0; n],
                 lone_rows: 0,
                 pass_rows: 0,
+                far: vec![None; n],
             }),
             flow: OnceLock::new(),
             reports: Mutex::new(Vec::new()),
@@ -1416,6 +1511,10 @@ impl Qwen4Exp {
             o,
             PartSetup { index, role, first, shares, head, device: cx.device, ledger: cx.ledger },
         )?;
+        // The K and V of the pages beyond VRAM: host memory the store's flow
+        // locks as the pages come into use.
+        let far = part.open_far(cx.ram)?.map(|pool| Arc::new(Mutex::new(pool)));
+        let near = o.near_pages();
         let serve = self.opts.serve;
         let layout = &self.layout;
         // The MTP block, next to the part that holds the head: before the
@@ -1481,6 +1580,7 @@ impl Qwen4Exp {
             n,
             |build| {
                 build.lent[index] = lent_bytes;
+                build.far[index] = far.clone();
                 build.multiprocessors[index] = cx.device.info().multiprocessors;
                 build.room[index] = room;
                 build.ports[index] = ports;
@@ -1755,6 +1855,9 @@ impl Qwen4Exp {
                     pass_go: AtomicU64::new(0),
                     pass_picks: Mutex::new(None),
                     pass_count: AtomicU64::new(0),
+                    far: build.far.iter().flatten().cloned().collect(),
+                    far_slots: AtomicU32::new(0),
+                    ram: ram.clone(),
                     totals: Mutex::new(ExpertStats {
                         ram_tier_bytes: ram_bytes,
                         ..Default::default()
@@ -1899,6 +2002,9 @@ impl Qwen4Exp {
             shape: Vec::new(),
             replay: Vec::new(),
             resume,
+            near: (near < o.pages()).then_some(near),
+            live: Vec::new(),
+            highest: None,
         }))
     }
 }
@@ -2198,6 +2304,40 @@ struct Qwen4ExpDevice {
     replay: Vec<Range<u32>>,
     /// The checkpoints of the prefix cache on this device.
     resume: Resume,
+    /// The first page whose K and V are in host memory, when some are; which
+    /// pages the tables name and the pool has not freed, and the highest of
+    /// them: the far pools are locked up to it (every device keeps the same
+    /// books, any of them may begin a step for the store).
+    near: Option<u32>,
+    live: Vec<bool>,
+    highest: Option<u32>,
+}
+
+impl Qwen4ExpDevice {
+    /// The far slots the step needs locked: up to the highest page the
+    /// tables name after its updates, minus the pages in VRAM.
+    fn far_slots(&mut self, record: &ares_runtime::RecordView<'_>) -> u32 {
+        let Some(near) = self.near else { return 0 };
+        let mut lowered = false;
+        for i in 0..record.freed() {
+            let page = record.freed_page(i) as usize;
+            if let Some(live) = self.live.get_mut(page) {
+                lowered |= std::mem::take(live) && Some(page as u32) == self.highest;
+            }
+        }
+        for k in 0..record.entries() {
+            let page = record.entry(k) & !PAGE_ENTRY;
+            if self.live.len() <= page as usize {
+                self.live.resize(page as usize + 1, false);
+            }
+            self.live[page as usize] = true;
+            self.highest = self.highest.max(Some(page));
+        }
+        if lowered {
+            self.highest = self.live.iter().rposition(|l| *l).map(|p| p as u32);
+        }
+        self.highest.map_or(0, |page| (page + 1).saturating_sub(near))
+    }
 }
 
 impl std::fmt::Debug for Qwen4ExpDevice {
@@ -2381,7 +2521,8 @@ impl Qwen4ExpDevice {
             self.give_up_pass();
         }
         let pass = self.pass_of(step)?;
-        self.flow.begin(number, rows, windows, self.index, stream, pass.as_ref())?;
+        let far_slots = self.far_slots(record);
+        self.flow.begin(number, rows, windows, far_slots, self.index, stream, pass.as_ref())?;
         // What this part keeps of a pass that has ended, or that another pass of the same
         // rows has taken the loan of, goes; a paused pass goes on.
         self.forget_ended_pass();

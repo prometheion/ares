@@ -408,6 +408,7 @@ impl DevSeq {
                     self.table_dev.ptr(),
                     pools.exact.ptr(),
                     pools.converted.ptr(),
+                    ares_cuda::DevicePtr::NULL,
                     status.ptr(),
                 )
                 .unwrap();
@@ -469,6 +470,7 @@ impl DevSeq {
                     (jobs.len() / 2) as u32,
                     pools.exact.ptr(),
                     pools.converted.ptr(),
+                    ares_cuda::DevicePtr::NULL,
                     status.ptr(),
                 )
                 .unwrap();
@@ -804,6 +806,7 @@ fn attend_many_q(
         tables: table_dev.ptr(),
         exact_pool: pools.exact.ptr(),
         converted_pool: pools.converted.ptr(),
+        far_pool: ares_cuda::DevicePtr::NULL,
         q: q_dev.ptr(),
         gate: gated.then(|| gate_dev.ptr()),
         out: out_dev.ptr(),
@@ -1195,6 +1198,7 @@ fn attend_planned(
         tables: table_dev.ptr(),
         exact_pool: pools.exact.ptr(),
         converted_pool: pools.converted.ptr(),
+        far_pool: ares_cuda::DevicePtr::NULL,
         q: q_dev.ptr(),
         gate: Some(gate_dev.ptr()),
         out: out_dev.ptr(),
@@ -1357,6 +1361,7 @@ fn a_window_reads_a_swapped_tile_as_if_the_table_named_it() {
                         1,
                         pools.exact.ptr(),
                         pools.converted.ptr(),
+                        ares_cuda::DevicePtr::NULL,
                         status.ptr(),
                     )
                     .unwrap();

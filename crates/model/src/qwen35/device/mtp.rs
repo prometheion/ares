@@ -490,6 +490,7 @@ impl MtpLayer for PartLayer<'_> {
                 tables,
                 exact,
                 pool,
+                DevicePtr::NULL,
                 part.at(part.s.status),
             )?;
             attention.attend(
@@ -500,6 +501,7 @@ impl MtpLayer for PartLayer<'_> {
                     tables,
                     exact_pool: exact,
                     converted_pool: pool,
+                    far_pool: DevicePtr::NULL,
                     q: layer.at(s.q),
                     gate: Some(layer.at(s.gate)),
                     out: layer.at(s.o),

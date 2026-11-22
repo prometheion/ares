@@ -46,6 +46,7 @@ use super::placement::{DeviceMemory, PartPlan, Placement, TensorChoice, ram_tier
 use super::prune::{self, PruneMask, PruneStats};
 use super::roles;
 use super::usage;
+use crate::blocks::far::FarPool;
 use crate::blocks::rows::{HostTable, TOKEN_EMBD};
 use crate::qwen4exp::Config;
 use crate::qwen4exp::weights::Weights;
@@ -540,8 +541,10 @@ pub struct Session<'g> {
     done: Vec<Event>,
     probe_done: Vec<Event>,
     parts: Vec<Part>,
-    /// The pools of K/V and keys of every part.
+    /// The pools of K/V and keys of every part, and the K and V of the pages
+    /// beyond VRAM.
     pools: Vec<DeviceBuffer>,
+    _far: Vec<FarPool>,
     ledgers: Vec<Ledger>,
     feed: Feed,
     lanes: Vec<Lane>,
@@ -626,11 +629,22 @@ impl<'g> Session<'g> {
             parts[worker].set_peer(to_mixer, mixer_cores, None)?;
         }
 
-        // The pools of K/V and keys, whose pages every sequence slot owns.
+        // The pools of K/V and keys, whose pages every sequence slot owns, and
+        // the K and V of the pages beyond VRAM, locked whole: a session has no
+        // RAM limit to keep.
         let mut pools = Vec::with_capacity(parts.len());
+        let mut far = Vec::new();
+        let ram = ares_runtime::PinnedRam::new(u64::MAX / 4);
         for (index, part) in parts.iter_mut().enumerate() {
             ledgers[index].reserve("qwen4exp K/V and key pools", part.pool_bytes())?;
             pools.push(DeviceBuffer::new(&devices[index], part.pool_bytes())?);
+            if let Some(mut pool) = part.open_far(&ram)? {
+                pool.ensure(u32::MAX).map_err(|short| match short {
+                    Ok(short) => invalid(format!("{} bytes of K and V beyond VRAM", short.0)),
+                    Err(error) => invalid(error.to_string()),
+                })?;
+                far.push(pool);
+            }
             part.own_pages()?;
         }
 
@@ -788,6 +802,7 @@ impl<'g> Session<'g> {
             devices,
             parts,
             pools,
+            _far: far,
             ledgers,
             feed,
             lanes,

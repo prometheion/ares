@@ -1,5 +1,8 @@
 //! The pool of pages.
 
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
+
 /// The number of a page. Devices index their state arrays with it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct PageId(pub u32);
@@ -16,9 +19,11 @@ pub struct PagePool {
     refcount: Vec<u32>,
     /// Whether the prefix index is one of the holders of a page.
     cached: Vec<bool>,
-    /// Free pages; the last entry is handed out next. Low numbers go out
-    /// first, so a pool that is mostly empty stays compact at the front.
-    free: Vec<u32>,
+    /// Free pages; the lowest is handed out next, so a pool that is mostly
+    /// empty stays compact at the front. A model may keep its first pages in
+    /// faster memory than the rest (the K and V of a context beyond VRAM): a
+    /// sequence that starts gets the first free pages whatever was freed last.
+    free: BinaryHeap<Reverse<u32>>,
     /// Pages that were freed since the devices were last told, each once.
     freed: Vec<u32>,
     /// Whether a page is in `freed`.
@@ -37,7 +42,7 @@ impl PagePool {
             cells_per_page,
             refcount: vec![0; n_pages as usize],
             cached: vec![false; n_pages as usize],
-            free: (0..n_pages).rev().collect(),
+            free: (0..n_pages).map(Reverse).collect(),
             freed: Vec::new(),
             unreported: vec![false; n_pages as usize],
         }
@@ -74,7 +79,7 @@ impl PagePool {
 
     /// Takes a free page with one holder, or `None` when the pool is empty.
     pub(crate) fn alloc(&mut self) -> Option<PageId> {
-        let id = self.free.pop()?;
+        let Reverse(id) = self.free.pop()?;
         debug_assert_eq!(self.refcount[id as usize], 0);
         self.refcount[id as usize] = 1;
         Some(PageId(id))
@@ -94,7 +99,7 @@ impl PagePool {
         *count -= 1;
         if *count == 0 {
             debug_assert!(!self.cached[id.0 as usize], "the index let go without saying so");
-            self.free.push(id.0);
+            self.free.push(Reverse(id.0));
             if !std::mem::replace(&mut self.unreported[id.0 as usize], true) {
                 self.freed.push(id.0);
             }
@@ -122,6 +127,17 @@ impl PagePool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_lowest_free_page_goes_out_first() {
+        let mut pool = PagePool::new(8, 4);
+        let pages: Vec<PageId> = (0..6).map(|_| pool.alloc().unwrap()).collect();
+        pool.release(pages[1]);
+        pool.release(pages[4]);
+        assert_eq!(pool.alloc(), Some(PageId(1)), "page 4 was freed last, page 1 is lower");
+        assert_eq!(pool.alloc(), Some(PageId(4)));
+        assert_eq!(pool.alloc(), Some(PageId(6)));
+    }
 
     #[test]
     fn pages_are_free_again_when_the_last_holder_lets_go() {

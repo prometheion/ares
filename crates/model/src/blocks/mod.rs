@@ -15,7 +15,8 @@
 //!
 //! - [`kv`]: the K/V group, attention layers that share a pair of K/V formats,
 //!   with their pages and the pool of exact entries of the formats with a tile
-//!   mean ([`forms`]).
+//!   mean ([`forms`]), and the pages that lie in host memory when the context
+//!   does not fit in VRAM ([`far`]).
 //! - [`recurrent`]: the layers of the gated delta rule, their state in a
 //!   sequence's slot and the inputs a draft window keeps.
 //! - [`slots`]: the slot arena that holds every block's state per sequence,
@@ -28,6 +29,7 @@
 //! - [`mtp`]: the driver of an MTP block, for every model that drafts with
 //!   one.
 
+pub mod far;
 pub(crate) mod forms;
 pub(crate) mod head;
 pub(crate) mod kv;

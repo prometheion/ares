@@ -23,7 +23,7 @@ static __device__ __forceinline__ void encode_row_f32(
 // k_in, v_in: [row][kv_total][D] f32, the row stride being kv_total * D.
 ARES_KERNEL ares_attn_append(
     const AttnRow* rows, const float* k_in, const float* v_in, const uint32_t* tables,
-    uint8_t* exact_pool, uint8_t* conv_pool, uint64_t cfg, uint32_t* status) {
+    uint8_t* exact_pool, uint8_t* conv_pool, uint8_t* far_pool, uint64_t cfg, uint32_t* status) {
     const AttnGeo g = attn_geo(cfg);
     const int row = blockIdx.x, h = blockIdx.y;
     const int side = threadIdx.x >> 5, lane = threadIdx.x & 31;
@@ -37,7 +37,7 @@ ARES_KERNEL ares_attn_append(
             if (threadIdx.x == 0) atomicOr(status, ATTN_STATUS_DIRECT_MEAN);
             return;
         }
-        uint8_t* head = conv_pool + slot * g.entry_c + (size_t)h * g.head_c;
+        uint8_t* head = conv_entry(conv_pool, far_pool, (uint32_t)slot, g.entry_c) + (size_t)h * g.head_c;
         const int fmt = side == 0 ? g.kf : g.vf;
         const int rb = side == 0 ? g.rbk : g.rbv;
         uint8_t* dst = head + (side == 0 ? g.k_rows_off : g.v_rows_off) + (size_t)cell * rb;
@@ -105,17 +105,19 @@ struct F32Src {
 };
 
 // Converts exact entries into converted ones. jobs: pairs (exact slot, converted
-// slot). Grid (n_jobs, H, 2): z = 0 is K, 1 is V. Block 256.
+// slot, with ATTN_FAR_BIT for one in the far pool). Grid (n_jobs, H, 2): z = 0 is K,
+// 1 is V. Block 256.
 ARES_KERNEL ares_attn_convert(
-    const uint32_t* jobs, const uint8_t* exact_pool, uint8_t* conv_pool, uint64_t cfg,
-    uint32_t* status) {
+    const uint32_t* jobs, const uint8_t* exact_pool, uint8_t* conv_pool, uint8_t* far_pool,
+    uint64_t cfg, uint32_t* status) {
     extern __shared__ float mean_s[];
     const AttnGeo g = attn_geo(cfg);
-    const size_t from = jobs[2 * blockIdx.x], to = jobs[2 * blockIdx.x + 1];
+    const size_t from = jobs[2 * blockIdx.x];
+    const uint32_t to = jobs[2 * blockIdx.x + 1];
     const int h = blockIdx.y, side = blockIdx.z;
     const uint8_t* e = exact_pool + from * g.entry_e + (size_t)h * g.head_e +
                        (size_t)side * ATTN_TILE_CELLS * 2 * g.D;
-    uint8_t* head = conv_pool + to * g.entry_c + (size_t)h * g.head_c;
+    uint8_t* head = conv_entry(conv_pool, far_pool, to, g.entry_c) + (size_t)h * g.head_c;
     const int fmt = side == 0 ? g.kf : g.vf;
     ExactSrc src{reinterpret_cast<const unsigned short*>(e), g.D};
     convert_side(

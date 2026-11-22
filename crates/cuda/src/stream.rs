@@ -122,6 +122,24 @@ impl Stream {
         })
     }
 
+    /// Enqueues a copy between any two addresses of the unified address space:
+    /// device memory of this stream's device, or page-locked host memory that
+    /// is mapped for it ([`crate::HostRegistration::mapped`]). The driver
+    /// finds out from the addresses which way the bytes go.
+    ///
+    /// # Safety
+    ///
+    /// Both ranges must be live memory that this stream's device may access
+    /// and must not overlap; host memory must stay valid and unchanged (or
+    /// unread, for the destination) until the copy has run.
+    pub unsafe fn copy_any(&self, dst: DevicePtr, src: DevicePtr, len: usize) -> Result<()> {
+        let driver = self.device.bind()?;
+        // SAFETY: guaranteed by the caller.
+        driver.check("cuMemcpyAsync", unsafe {
+            (driver.api.memcpy_async)(dst.0, src.0, len, self.raw)
+        })
+    }
+
     /// Enqueues a copy from `src` on `src_device` to `dst` on `dst_device`,
     /// ordered by this stream. With peer access enabled between the two
     /// devices the data moves directly between them; without it the driver

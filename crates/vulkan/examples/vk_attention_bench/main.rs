@@ -41,6 +41,54 @@ mod vulkan {
         kernels.plan_config()
     }
 
+    use ares_vulkan::DevicePtr;
+
+    /// The append of the backend, whose pools are in device memory only.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn append_kv(
+        kernels: &AttentionKernels,
+        stream: &Stream,
+        geo: &CacheGeometry,
+        rows: DevicePtr,
+        n: u32,
+        k: DevicePtr,
+        v: DevicePtr,
+        tables: DevicePtr,
+        exact: DevicePtr,
+        converted: DevicePtr,
+        status: DevicePtr,
+    ) -> Result<()> {
+        // SAFETY: the caller's contract.
+        unsafe { kernels.append(stream, geo, rows, n, k, v, tables, exact, converted, status) }
+    }
+
+    /// The conversion of the backend.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn convert_kv(
+        kernels: &AttentionKernels,
+        stream: &Stream,
+        geo: &CacheGeometry,
+        jobs: DevicePtr,
+        n: u32,
+        exact: DevicePtr,
+        converted: DevicePtr,
+        status: DevicePtr,
+    ) -> Result<()> {
+        // SAFETY: the caller's contract.
+        unsafe { kernels.convert(stream, geo, jobs, n, exact, converted, status) }
+    }
+
+    fn attend_buffers(
+        tables: DevicePtr,
+        exact_pool: DevicePtr,
+        converted_pool: DevicePtr,
+        q: DevicePtr,
+        out: DevicePtr,
+        scratch: DevicePtr,
+    ) -> AttendBuffers {
+        AttendBuffers { tables, exact_pool, converted_pool, q, gate: None, out, scratch }
+    }
+
     include!("core.rs");
 }
 
@@ -61,6 +109,57 @@ mod cuda {
 
     fn plan_config(device: &Device, _: &AttentionKernels) -> ares_cuda::PlanConfig {
         ares_cuda::PlanConfig::for_multiprocessors(device.info().multiprocessors)
+    }
+
+    use ares_cuda::DevicePtr;
+
+    /// The append of the backend, with no pages in a far pool.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn append_kv(
+        kernels: &AttentionKernels,
+        stream: &Stream,
+        geo: &CacheGeometry,
+        rows: DevicePtr,
+        n: u32,
+        k: DevicePtr,
+        v: DevicePtr,
+        tables: DevicePtr,
+        exact: DevicePtr,
+        converted: DevicePtr,
+        status: DevicePtr,
+    ) -> Result<()> {
+        let far = DevicePtr::NULL;
+        // SAFETY: the caller's contract.
+        unsafe { kernels.append(stream, geo, rows, n, k, v, tables, exact, converted, far, status) }
+    }
+
+    /// The conversion of the backend, with no pages in a far pool.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn convert_kv(
+        kernels: &AttentionKernels,
+        stream: &Stream,
+        geo: &CacheGeometry,
+        jobs: DevicePtr,
+        n: u32,
+        exact: DevicePtr,
+        converted: DevicePtr,
+        status: DevicePtr,
+    ) -> Result<()> {
+        let far = DevicePtr::NULL;
+        // SAFETY: the caller's contract.
+        unsafe { kernels.convert(stream, geo, jobs, n, exact, converted, far, status) }
+    }
+
+    fn attend_buffers(
+        tables: DevicePtr,
+        exact_pool: DevicePtr,
+        converted_pool: DevicePtr,
+        q: DevicePtr,
+        out: DevicePtr,
+        scratch: DevicePtr,
+    ) -> AttendBuffers {
+        let far_pool = DevicePtr::NULL;
+        AttendBuffers { tables, exact_pool, converted_pool, far_pool, q, gate: None, out, scratch }
     }
 
     include!("core.rs");

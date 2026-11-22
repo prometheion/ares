@@ -66,9 +66,9 @@ struct AttnShape {
 template <int D, int MT, int CG, int CHUNK, int XW, int NVW>
 static __device__ void attn_body(
     const AttnItem* items, const uint32_t* ranges, const AttnRow* rows, const uint32_t* row_ids,
-    const uint32_t* tables, const uint8_t* exact_pool, const uint8_t* conv_pool, const float* q,
-    const float* gate, float* out, float* st_acc, float* st_lse, uint64_t cfg, float scale_log2,
-    uint32_t rawcap) {
+    const uint32_t* tables, const uint8_t* exact_pool, const uint8_t* conv_pool,
+    const uint8_t* far_pool, const float* q, const float* gate, float* out, float* st_acc,
+    float* st_lse, uint64_t cfg, float scale_log2, uint32_t rawcap) {
     constexpr int W = MT * CG;       // warps that run the mma
     constexpr int WT = W + XW;       // all warps: the others only load and decode
     constexpr int NT = WT * 32;
@@ -189,7 +189,7 @@ static __device__ void attn_body(
     auto row_src = [&](uint32_t slot, uint32_t cell, int side) -> const uint8_t* {
         const uint32_t r = cell % ATTN_TILE_CELLS;
         if (conv) {
-            const uint8_t* head = conv_pool + (size_t)slot * g.entry_c + head_c;
+            const uint8_t* head = conv_entry(conv_pool, far_pool, slot, g.entry_c) + head_c;
             return side == 0 ? head + g.k_rows_off + (size_t)r * g.rbk
                              : head + g.v_rows_off + (size_t)r * g.rbv;
         }
@@ -274,7 +274,7 @@ static __device__ void attn_body(
                     const int v = p / nent, e = p - v * nent;
                     float acc = 0.0f;
                     if (lane * 8 < D) {
-                        const uint8_t* mp = conv_pool + (size_t)el[e] * g.entry_c + head_c;
+                        const uint8_t* mp = conv_entry(conv_pool, far_pool, el[e], g.entry_c) + head_c;
                         const uint4 mv = *reinterpret_cast<const uint4*>(mp + lane * 16);
                         const uint4 qv = *reinterpret_cast<const uint4*>(Qs + v * QS + lane * 8);
                         const __half2* mh = reinterpret_cast<const __half2*>(&mv);
@@ -424,7 +424,7 @@ static __device__ void attn_body(
                             }
                         }
                         const unsigned short* mv = reinterpret_cast<const unsigned short*>(
-                            conv_pool + (size_t)el[e] * g.entry_c + head_c + g.v_mean_off);
+                            conv_entry(conv_pool, far_pool, el[e], g.entry_c) + head_c + g.v_mean_off);
 #pragma unroll
                         for (int dt = 0; dt < D / 16; ++dt) {
                             const float m0 = h2f_bits(mv[dt * 16 + gq]), m1 = h2f_bits(mv[dt * 16 + gq + 8]);
@@ -556,7 +556,7 @@ static __device__ void attn_body(
                     wB += __shfl_xor_sync(0xffffffffu, wB, 1);
                     wB += __shfl_xor_sync(0xffffffffu, wB, 2);
                     const __half2* mv = reinterpret_cast<const __half2*>(
-                        conv_pool + (size_t)el[e] * g.entry_c + head_c + g.v_mean_off);
+                        conv_entry(conv_pool, far_pool, el[e], g.entry_c) + head_c + g.v_mean_off);
 #pragma unroll
                     for (int i = 0; i < D / 8; ++i) {
                         const float2 mm = __half22float2(mv[i * 4 + tq]);
@@ -785,12 +785,12 @@ static __device__ void attn_merge_body(
 #define ARES_ATTN_KERNEL(NAME, D, MT, CG, CHUNK, XW, NVW)                                                  \
     extern "C" __global__ void __launch_bounds__(32 * ((MT) * (CG) + (XW)), 1) NAME(                  \
         const AttnItem* items, const uint32_t* ranges, const AttnRow* rows, const uint32_t* row_ids, \
-        const uint32_t* tables, const uint8_t* exact_pool, const uint8_t* conv_pool, const float* q, \
-        const float* gate, float* out, float* st_acc, float* st_lse, uint64_t cfg, float scale_log2, \
-        uint32_t rawcap) {                                                                            \
+        const uint32_t* tables, const uint8_t* exact_pool, const uint8_t* conv_pool,                 \
+        const uint8_t* far_pool, const float* q, const float* gate, float* out, float* st_acc,       \
+        float* st_lse, uint64_t cfg, float scale_log2, uint32_t rawcap) {                             \
         attn_body<D, MT, CG, CHUNK, XW, NVW>(                                                                  \
-            items, ranges, rows, row_ids, tables, exact_pool, conv_pool, q, gate, out, st_acc,        \
-            st_lse, cfg, scale_log2, rawcap);                                                         \
+            items, ranges, rows, row_ids, tables, exact_pool, conv_pool, far_pool, q, gate, out,      \
+            st_acc, st_lse, cfg, scale_log2, rawcap);                                                 \
     }
 
 #define ARES_ATTN_MERGE(NAME, D)                                                                       \

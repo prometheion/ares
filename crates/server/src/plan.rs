@@ -384,6 +384,31 @@ pub fn pool_tokens(pages: u32, parallel: u32) -> u32 {
     pages.saturating_sub(parallel).saturating_mul(CELLS_PER_PAGE)
 }
 
+/// The share of the room for expert slots that the K and V of a mixture of
+/// experts' context may take in VRAM when the rest overflows into RAM: what
+/// the context in VRAM cost before the owner's rule of 2026-11-22.
+pub const NEAR_SHARE: u64 = 32;
+
+/// The pages of a mixture of experts' context whose K and V lie in VRAM, the
+/// rest of its `pages` overflowing into RAM (`ares_model::blocks::far`):
+/// `room[d]` is what device `d` has for expert slots with no context,
+/// `floor[d]` the slots its layers cannot do without, `parts[d]` the bytes a
+/// page takes there in K and V and in the indexer's keys. The keys of every
+/// page stay in VRAM; the K and V of the pages in VRAM take at most a
+/// [`NEAR_SHARE`]th of the room, and at least two pages. `None` when the keys
+/// of all pages do not fit beside the floors.
+pub fn near_pages(room: &[u64], floor: &[u64], parts: &[(u64, u64)], pages: u32) -> Option<u32> {
+    let mut near = pages;
+    for ((room, floor), (kv, keys)) in room.iter().zip(floor).zip(parts) {
+        let left = room.checked_sub(floor + keys * u64::from(pages))?;
+        if *kv > 0 {
+            let share = (room / NEAR_SHARE).min(left) / kv;
+            near = near.min(u32::try_from(share).unwrap_or(u32::MAX));
+        }
+    }
+    Some(near.max(2).min(pages))
+}
+
 /// The context a model is served with: what was wanted and how much of it
 /// the devices hold in VRAM.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -394,11 +419,14 @@ pub struct ContextPlan {
     pub wanted: u32,
     /// The tokens of it whose K and V lie in VRAM. Less than `wanted` only
     /// when no context was named and the model's own does not fit; the rest
-    /// is to overflow into RAM, which is not built, so for now the model is
-    /// served with this much.
+    /// overflows into RAM where the model has that (`overflow`), and the model
+    /// is served with this much where it does not.
     pub in_vram: u32,
     /// Whether the operator named the context.
     pub asked: bool,
+    /// Whether the K and V beyond `in_vram` lie in RAM: the model is served
+    /// with all it wanted.
+    pub overflow: bool,
 }
 
 impl ContextPlan {
@@ -410,7 +438,9 @@ impl ContextPlan {
     /// is not all of it, so that the estimate behind it has a little slack.
     pub fn new(asked: Option<u32>, model_context: u32, pages_fit: u32, parallel: u32) -> Self {
         match asked {
-            Some(context) => Self { wanted: context, in_vram: context, asked: true },
+            Some(context) => {
+                Self { wanted: context, in_vram: context, asked: true, overflow: false }
+            }
             None => {
                 let fits = pool_tokens(pages_fit, parallel);
                 let in_vram = if fits >= model_context {
@@ -420,24 +450,38 @@ impl ContextPlan {
                 } else {
                     fits
                 };
-                Self { wanted: model_context, in_vram, asked: false }
+                Self { wanted: model_context, in_vram, asked: false, overflow: false }
             }
         }
     }
 
-    /// The tokens the pool is made for now: what lies in VRAM.
+    /// The model's own context (`model_context` tokens in `pages` pages for
+    /// `parallel` sequences) of a model whose K and V overflow into RAM,
+    /// `near` of the pages in VRAM ([`near_pages`]).
+    pub fn overflowing(model_context: u32, pages: u32, near: u32, parallel: u32) -> Self {
+        let in_vram = if near >= pages { model_context } else { pool_tokens(near, parallel) };
+        Self { wanted: model_context, in_vram, asked: false, overflow: near < pages }
+    }
+
+    /// The tokens the pool is made for: what was wanted when the rest of it
+    /// overflows into RAM, otherwise what lies in VRAM.
     pub fn context(&self) -> u32 {
-        self.in_vram
+        if self.overflow { self.wanted } else { self.in_vram }
     }
 
     /// Why the context is what it is, for the plan's line in the log.
     pub fn why(&self) -> String {
-        match (self.asked, self.in_vram == self.wanted) {
-            (true, _) => "as asked".into(),
-            (false, true) => "the model's own context, all of it in VRAM".into(),
-            (false, false) => format!(
+        match (self.asked, self.in_vram == self.wanted, self.overflow) {
+            (true, _, _) => "as asked".into(),
+            (false, true, _) => "the model's own context, all of it in VRAM".into(),
+            (false, false, true) => format!(
+                "the model's own context; K and V of the first {} tokens in VRAM, of the rest in \
+                 RAM as sequences grow into it, and the indexer's keys of all of it in VRAM",
+                self.in_vram
+            ),
+            (false, false, false) => format!(
                 "the model's own context is {} tokens and the devices' VRAM holds {} of them; \
-                 K and V beyond VRAM are not moved to RAM yet, so the context is what VRAM holds",
+                 this model's K and V do not move to RAM, so the context is what VRAM holds",
                 self.wanted, self.in_vram
             ),
         }
@@ -691,7 +735,10 @@ mod tests {
         let plan = |pages| ContextPlan::new(None, 262_144, pages, 2);
         // 700 pages for two sequences: 698 * 128 = 89344 tokens, rounded down,
         // of the model's 262144.
-        assert_eq!(plan(700), ContextPlan { wanted: 262_144, in_vram: 89_088, asked: false });
+        assert_eq!(
+            plan(700),
+            ContextPlan { wanted: 262_144, in_vram: 89_088, asked: false, overflow: false }
+        );
         assert!(plan(700).why().contains("262144 tokens and the devices' VRAM holds 89088"));
         // Room for more than the model's own context: the model's own, all in VRAM.
         assert_eq!(plan(10_000).context(), 262_144);
@@ -707,6 +754,38 @@ mod tests {
             (asked.wanted, asked.in_vram, asked.why().as_str()),
             (500_000, 500_000, "as asked")
         );
+    }
+
+    #[test]
+    fn a_context_that_overflows_keeps_its_keys_and_a_share_of_its_k_and_v_in_vram() {
+        let (gib, mib) = (1u64 << 30, 1u64 << 20);
+        // Flash-Next's 262144 cells for one sequence: 2049 pages of 1.67 MB of
+        // K and V and 0.19 MB of keys, on a card with 10 GiB for slots and a
+        // floor of 1 GiB: a thirty-second of the room in K and V.
+        let parts = [(1_671_168, 196_608)];
+        let near = near_pages(&[10 * gib], &[gib], &parts, 2049).unwrap();
+        assert_eq!(near, (10 * gib / NEAR_SHARE / 1_671_168) as u32);
+        let plan = ContextPlan::overflowing(262_144, 2049, near, 1);
+        assert!(plan.overflow && plan.context() == 262_144, "{plan:?}");
+        assert_eq!(plan.in_vram, (near - 1) * CELLS_PER_PAGE);
+        assert!(plan.why().contains("in RAM"), "{}", plan.why());
+        // A worker without attention layers takes no K and V.
+        assert_eq!(
+            near_pages(&[10 * gib, 10 * gib], &[gib, gib], &[parts[0], (0, 0)], 2049),
+            Some(near)
+        );
+        // Room for all of it in a thirty-second: nothing overflows.
+        let all = ContextPlan::overflowing(
+            4096,
+            33,
+            near_pages(&[10 * gib], &[gib], &parts, 33).unwrap(),
+            1,
+        );
+        assert!(!all.overflow && all.context() == 4096 && all.in_vram == 4096, "{all:?}");
+        // The keys of every page do not fit beside the floors.
+        assert_eq!(near_pages(&[gib], &[gib - 100 * mib], &parts, 2049), None);
+        // At least two pages stay in VRAM.
+        assert_eq!(near_pages(&[2 * gib], &[gib], &[(gib, 1)], 2049), Some(2));
     }
 
     #[test]

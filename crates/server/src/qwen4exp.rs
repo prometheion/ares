@@ -19,7 +19,7 @@ use ares_core::units::Bytes;
 use ares_gguf::Gguf;
 use ares_model::qwen4exp::device::{
     Options, ProfileFound, ProfileReport, PruneSetup, Qwen4Exp, SessionOptions, Spread,
-    TensorChoice, batch_rows, place, profile_key, reads_layer_by_layer, step_rows,
+    TensorChoice, batch_rows, page_parts, place, profile_key, reads_layer_by_layer, step_rows,
 };
 use ares_model::qwen4exp::{Config, MtpWeights};
 use ares_runtime::expert_store::ExpertNeighbours;
@@ -300,22 +300,25 @@ pub(crate) fn load(
         )
         .map_err(|e| LoadError::Model(e.to_string()))?,
     };
-    let session = |context: u32, pages: u32, spread: Spread, max_rows: u32| SessionOptions {
-        part: Options {
-            kv,
-            max_rows,
-            own_rows,
-            logit_rows,
-            window_rows,
-            max_slots: parallel,
-            cells: context.min(model_context),
-            pool_pages: pages,
-            prune: prune.clone(),
-            ..Options::default()
-        },
-        headroom: VRAM_HEADROOM,
-        spread,
-        ..SessionOptions::default()
+    let session = |context: u32, pages: u32, near: Option<u32>, spread: Spread, max_rows: u32| {
+        SessionOptions {
+            part: Options {
+                kv,
+                max_rows,
+                own_rows,
+                logit_rows,
+                window_rows,
+                max_slots: parallel,
+                cells: context.min(model_context),
+                pool_pages: pages,
+                near_pages: near,
+                prune: prune.clone(),
+                ..Options::default()
+            },
+            headroom: VRAM_HEADROOM,
+            spread,
+            ..SessionOptions::default()
+        }
     };
     let named_split = |e: String| {
         // A placement that does not fit is, next to other models, no room.
@@ -328,19 +331,24 @@ pub(crate) fn load(
     };
 
     // Context: tokens of state for all sequences together. Without a number
-    // from the operator, the model's own (the owner's rule of 2026-11-22),
-    // as far as VRAM holds it beside the fewest expert slots the store needs
-    // and the drafters: every page of K and V is expert slots fewer.
-    let (context, pages, why_context) = match options.context {
-        Some(context) => (context, plan::pool_pages(context, parallel), "as asked".to_owned()),
+    // from the operator, the model's own (the owner's rule of 2026-11-22).
+    // Every page of K and V in VRAM is expert slots fewer, and a step reads
+    // only the cells the indexer picks, so the indexer's keys of every page
+    // stay in VRAM, the K and V of the first pages up to a share of the room
+    // for slots, and those of the pages beyond in RAM, as far as the
+    // sequences grow into them (`ares_model::blocks::far`). A context that
+    // was asked for is all in VRAM.
+    let (context, pages, near, why_context) = match options.context {
+        Some(context) => {
+            (context, plan::pool_pages(context, parallel), None, "as asked".to_owned())
+        }
         None => {
             let trial = TRIAL_CONTEXT.min(model_context);
-            let (placement, page_bytes) = place(
-                &Gguf::open(&options.model)?,
-                &devices,
-                &session(trial, plan::pool_pages(trial, parallel), spread, own_rows),
-            )
-            .map_err(|e| named_split(e.to_string()))?;
+            let gguf = Gguf::open(&options.model)?;
+            let trial_options =
+                session(trial, plan::pool_pages(trial, parallel), None, spread, own_rows);
+            let (placement, page_bytes) =
+                place(&gguf, &devices, &trial_options).map_err(|e| named_split(e.to_string()))?;
             log_trial(&placement, &held);
             spread = pinned(spread, &placement);
             // The pools of the trial are slots again.
@@ -352,36 +360,52 @@ pub(crate) fn load(
                 .map(|(d, page)| d.slots + page * pages_of_trial)
                 .collect();
             let floors = slot_floors(&config, &placement, drafter_bytes);
-            let fit = plan::pages_beside_floors(&slots, &floors, &page_bytes);
-            let plan = plan::ContextPlan::new(None, model_context, fit, parallel);
-            if plan.context() == 0 {
+            let parts = page_parts(&gguf, &devices, &trial_options, &placement)
+                .map_err(|e| LoadError::Model(e.to_string()))?;
+            let all = plan::pool_pages(model_context, parallel);
+            let Some(near) = plan::near_pages(&slots, &floors, &parts, all) else {
                 let error = refuse(
-                    "the devices have no room for context next to the experts' slots; name one \
-                     with --context to try it anyway",
+                    "the devices have no room for the indexer's keys of the model's context next \
+                     to the experts' slots; name a context with --context",
                 );
                 return Err(short(site, error));
-            }
-            let pool = u64::from(plan::pool_pages(plan.context(), parallel));
+            };
+            let plan = plan::ContextPlan::overflowing(model_context, all, near, parallel);
             tracing::info!(
-                "plan: K and V of the context take {} of the bytes for expert slots (at least \
-                 {} stay for the fewest slots each layer needs and the drafters)",
+                "plan: the context takes {} of the bytes for expert slots (the indexer's keys of \
+                 every page and K and V of {} pages; at least {} stay for the fewest slots each \
+                 layer needs and the drafters){}",
                 join(
-                    page_bytes.iter().zip(&slots).map(|(page, room)| format!(
+                    parts.iter().zip(&slots).map(|((kv, keys), room)| format!(
                         "{} of {}",
-                        Bytes(page * pool),
+                        Bytes(keys * u64::from(all) + kv * u64::from(near)),
                         Bytes(*room)
                     )),
                     " and "
                 ),
+                near,
                 join(floors.iter().map(|b| Bytes(*b).to_string()), " and "),
+                if plan.overflow {
+                    format!(
+                        "; K and V of the other {} pages in RAM as sequences grow into them, {} \
+                         at most",
+                        all - near,
+                        Bytes(parts.iter().map(|(kv, _)| kv).sum::<u64>() * u64::from(all - near))
+                    )
+                } else {
+                    String::new()
+                },
             );
-            (plan.context(), plan::pool_pages(plan.context(), parallel), plan.why())
+            (plan.context(), all, plan.overflow.then_some(near), plan.why())
         }
     };
     let longest = context.min(model_context);
-    let (placement, page_bytes) =
-        place(&Gguf::open(&options.model)?, &devices, &session(longest, pages, spread, own_rows))
-            .map_err(|e| named_split(e.to_string()))?;
+    let (placement, page_bytes) = place(
+        &Gguf::open(&options.model)?,
+        &devices,
+        &session(longest, pages, near, spread, own_rows),
+    )
+    .map_err(|e| named_split(e.to_string()))?;
     log_trial(&placement, &held);
     let spread = pinned(spread, &placement);
     // A prompt read alone runs layer by layer where the model can (`device/runtime/pass.rs`):
@@ -389,8 +413,10 @@ pub(crate) fn load(
     // expert slots lend for the rows they keep, and the parts' steps never take more than
     // their own scratch. Elsewhere it takes steps as many rows wide as asked or the default,
     // as far as the expert slots can lend the scratch for them.
-    let passes =
-        reads_layer_by_layer(&session(longest, pages, spread, own_rows).part, dflash.is_some());
+    let passes = reads_layer_by_layer(
+        &session(longest, pages, near, spread, own_rows).part,
+        dflash.is_some(),
+    );
     let (max_rows, pass_rows) = if passes {
         (own_rows, options.batch.unwrap_or(DEFAULT_PASS).max(own_rows))
     } else {
@@ -398,7 +424,7 @@ pub(crate) fn load(
         let max_rows = batch_rows(
             &Gguf::open(&options.model)?,
             &devices,
-            &session(longest, pages, spread, own_rows),
+            &session(longest, pages, near, spread, own_rows),
             &placement,
             pages,
             &page_bytes,
@@ -430,10 +456,13 @@ pub(crate) fn load(
             String::new()
         }
     );
-    let (placement, page_bytes) =
-        place(&Gguf::open(&options.model)?, &devices, &session(longest, pages, spread, max_rows))
-            .map_err(|e| named_split(e.to_string()))?;
-    let opts = SessionOptions { pass_rows, ..session(longest, pages, spread, max_rows) };
+    let (placement, page_bytes) = place(
+        &Gguf::open(&options.model)?,
+        &devices,
+        &session(longest, pages, near, spread, max_rows),
+    )
+    .map_err(|e| named_split(e.to_string()))?;
+    let opts = SessionOptions { pass_rows, ..session(longest, pages, near, spread, max_rows) };
     if let (Some(dir), None, Some(tensor)) = (&options.cache, &remembered, &placement.tensor) {
         Split::write(dir, &options.model, &devices, &tensor.choice);
     }
@@ -815,10 +844,15 @@ pub(crate) fn load(
             config.experts.count,
         );
     }
-    tracing::info!(
-        "context: {context} tokens of sequence state, all of it in VRAM (state is not moved to \
-         RAM yet, so a context that does not fit is refused at load)"
-    );
+    match near {
+        Some(near) => tracing::info!(
+            "context: {context} tokens of sequence state; K and V of {} tokens in VRAM, of the \
+             rest in page-locked RAM as the sequences grow into it (booked in --ram above the \
+             tier of experts, which gives the memory up), the indexer's keys all in VRAM",
+            plan::pool_tokens(near, parallel)
+        ),
+        None => tracing::info!("context: {context} tokens of sequence state, all of it in VRAM"),
+    }
     Ok(Loaded::new(runtime, name, held, ram))
 }
 

@@ -606,6 +606,7 @@ fn attention_path(
         tables: tables.ptr(),
         exact_pool: exact.ptr(),
         converted_pool: pool.ptr(),
+        far_pool: ares_cuda::DevicePtr::NULL,
         q: q.ptr(),
         gate: None,
         out: out.ptr(),

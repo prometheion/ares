@@ -898,6 +898,7 @@ fn run_attention(
                 tables.ptr(),
                 layer.exact_pool.ptr(),
                 layer.conv_pool.ptr(),
+                ares_cuda::DevicePtr::NULL,
                 status.ptr(),
             )
             .unwrap();
@@ -998,6 +999,7 @@ fn run_attention(
                     tables: tables.ptr(),
                     exact_pool: layer.exact_pool.ptr(),
                     converted_pool: layer.conv_pool.ptr(),
+                    far_pool: ares_cuda::DevicePtr::NULL,
                     q: q.ptr(),
                     gate: Some(gate.ptr()),
                     out: heads.values(),

@@ -47,6 +47,7 @@ pub(crate) const CU_DEVICE_P2P_ATTRIBUTE_ACCESS_SUPPORTED: c_int = 2;
 
 pub(crate) const CU_MEMHOSTALLOC_PORTABLE: c_uint = 1;
 pub(crate) const CU_MEMHOSTREGISTER_PORTABLE: c_uint = 1;
+pub(crate) const CU_MEMHOSTREGISTER_DEVICEMAP: c_uint = 2;
 pub(crate) const CU_MEMHOSTREGISTER_READ_ONLY: c_uint = 8;
 pub(crate) const CU_STREAM_NON_BLOCKING: c_uint = 1;
 pub(crate) const CU_EVENT_DISABLE_TIMING: c_uint = 2;
@@ -115,12 +116,16 @@ driver_api! {
     fn mem_free_host = "cuMemFreeHost"(*mut c_void);
     fn mem_host_register = "cuMemHostRegister_v2"(*mut c_void, usize, c_uint);
     fn mem_host_unregister = "cuMemHostUnregister"(*mut c_void);
+    fn mem_host_get_device_pointer = "cuMemHostGetDevicePointer_v2"(
+        *mut CUdeviceptr, *mut c_void, c_uint
+    );
 
     fn memcpy_htod = "cuMemcpyHtoD_v2"(CUdeviceptr, *const c_void, usize);
     fn memcpy_dtoh = "cuMemcpyDtoH_v2"(*mut c_void, CUdeviceptr, usize);
     fn memcpy_htod_async = "cuMemcpyHtoDAsync_v2"(CUdeviceptr, *const c_void, usize, CUstream);
     fn memcpy_dtoh_async = "cuMemcpyDtoHAsync_v2"(*mut c_void, CUdeviceptr, usize, CUstream);
     fn memcpy_dtod_async = "cuMemcpyDtoDAsync_v2"(CUdeviceptr, CUdeviceptr, usize, CUstream);
+    fn memcpy_async = "cuMemcpyAsync"(CUdeviceptr, CUdeviceptr, usize, CUstream);
     fn memcpy_peer_async = "cuMemcpyPeerAsync"(
         CUdeviceptr, CUcontext, CUdeviceptr, CUcontext, usize, CUstream
     );
