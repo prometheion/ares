@@ -949,8 +949,11 @@ Measured per phase on a quiet machine against the fork and Strata, the largest f
       types' forms differ (a type with no int8 tile kernel, or measured paths that differ) every
       dense matrix runs f16. The owner (2026-11-22): a form per matrix, int8 on a capped card as
       the 27B's ("Decided by the owner").
-- [ ] Capped cards measure their prefill path per type too (the owner, 2026-11-22): one
-      condition in `kernels/paths.rs`, verified on capped cards.
+- [x] Capped cards measure their prefill path per type too (the owner, 2026-11-22; built in
+      `devices/load-choice`): on the 27B the prompt reads as fast as before (1342 to 1358
+      tokens/s against 1346 to 1361, three alternating pairs on the two development cards), the
+      same text, the load 1.0 to 1.1 s longer per device; Q5_K on the RTX 4070 takes F16Flush
+      where the kept rule took int8.
 - [ ] Attention over long contexts: llama.cpp PR 32407 (merged 2026-11-17) rotates the order in
       which blocks read K/V tiles so that blocks sharing K/V hit L2 together: prompts of the 27B
       on an RTX 5090 at 131072 cells 1290 -> 1822 tokens/s (1.41x), 1.25x at 65536, 1.07x at
@@ -1050,8 +1053,8 @@ the agents' builds):
   To build: a form per matrix (both forms prepared where a layer's types differ), as the 27B's
   chooser does.
 - Capped cards measure their prefill path per type as full-rate cards do, in place of the rule
-  kept from the two development cards (`FLUSH_AS_FAST`). To build with the item above; the
-  measurement on capped cards needs the owner's cards.
+  kept from the two development cards (`FLUSH_AS_FAST`). Built (`devices/load-choice`); the
+  rule stays only for a type nobody measured (tests and benches).
 
 ## Questions to the owner
 - None open.

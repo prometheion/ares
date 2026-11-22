@@ -2910,23 +2910,34 @@ which `Kernels::prefill_path_for(ty, precision)` chooses per type and device:
   added to f32 registers. GeForce cards run that at twice the rate of f32
   accumulation. 0.05 % rms, 0.12 % at worst.
 
-On a capped card (below) `Precision::Fast` takes F16Flush for Q4_K, IQ2_S and
-IQ2_XS, where it is as fast as int8 (1.02 to 1.18 times, measured on both
-cards at 1024 rows) and 20 times more exact, and int8 for the other types
-(F16Flush is 0.74 to 0.91 times as fast there); `Precision::Exact` is always
+On a capped card (below) the f16 path runs at half the rate, and F16Flush is as
+fast as int8 for some types and 20 times more exact: on the two development
+cards at 1024 rows for Q4_K, IQ2_S and IQ2_XS (1.02 to 1.18 times), not for the
+others (0.74 to 0.91 times). `Precision::Fast` takes the path measured per type
+on the device at load (below), on every card; `Precision::Exact` is always
 f16. A row gives the same bits alone and inside a batch within a path.
 
 On a card without the cap the f16 path costs the tensor cores no more than int8's
-work, and whether the tile kernels run it as fast depends on the type, so the path
-is measured per type when a model is loaded (`Kernels::measure_prefill_path`,
+work, and whether the tile kernels run it as fast depends on the type; on a capped
+card the same holds for F16Flush. So the path is measured per type, on every card,
+when a model is loaded (`Kernels::measure_prefill_path`,
 `kernels/paths.rs`): a probe matrix of the type with rows of 4096 values, as many rows
 as make it larger than L2, 512 activation rows (a prompt step: four activation tiles of
 the large shape in a group), every path timed in turn, and of the paths within 5 % of
 the fastest the most exact kept for `prefill_path_for` (f16, then F16Flush, then
 int8). 50 to 150 ms per type; the qwen35 chooser measures every type of its groups
 before its probes (so they time the path that will run), Flash-Next's wide steps its
-quantized dense types. A capped card is not measured and keeps the rule above; a type
-that was not measured takes f16. The probe's shape matters: with two activation tiles
+quantized dense types. A type that was not measured (in tests and benches) takes f16
+on a card without the cap and on a capped card the rule kept from the development
+cards (F16Flush for Q4_K, IQ2_S and IQ2_XS, int8 else). Measured on the two capped
+development cards (2026-11-22, Qwen3.8-27B UD-Q4_K_S, tensor split 0.625 / 0.375,
+three alternating pairs at a load average of 26 to 13): the RTX 4070 takes F16Flush for
+IQ2_S, IQ2_XS, Q4_K and Q5_K and int8 for IQ3_S, IQ3_XXS, IQ4_NL, IQ4_XS, Q3_K, Q6_K and
+Q8_0, the RTX 3060 the same but int8 for Q5_K (F16Flush 1.022 ms against 0.919): only
+Q5_K on the 4070 differs from the kept rule, towards the more exact path. A prompt of
+2048 tokens reads at 1342 to 1358 tokens/s against 1346 to 1361 before (the same within
+the noise), the decode step and the text are the same, and the load takes 1.0 s (4070)
+and 1.1 s (3060) longer: eleven types measured on each device, at the same time. The probe's shape matters: with two activation tiles
 the f16 path of Q5_K and Q6_K is 4 to 9 % behind int8 where from four on it is as fast,
 and with rows of 14080 values (the first probe's, sized by its bytes) an f16 activation
 tile holds 3.6 MB, a group two tiles against int8's four, and Q5_K's f16 path was 17 %
@@ -3857,8 +3868,9 @@ milliseconds when the kernels are loaded and the result is reported at start:
   type, the path a probe at load found fastest (`Kernels::measure_prefill_path`,
   "Prefill weight kernels" above), the exact one on ties.
 - **Capped:** the workaround is the default, because it is faster there, and
-  the report says so and names the remedy. The exact path can be chosen
-  instead.
+  the report says so and names the remedy: per type, the path a probe at load
+  found fastest of int8 and f16 with f16 accumulation (the more exact on ties).
+  The exact path can be chosen instead.
 
 The development machine's cards are capped, and the probe shows it exactly:
 f16 `mma` with f32 accumulation runs at 58.6 TFLOPS on the RTX 4070 and 25.6

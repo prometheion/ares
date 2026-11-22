@@ -11,10 +11,9 @@
 //! card, so it is measured, before the weights are placed:
 //!
 //! - once per type, which path of the tile kernels multiplies it in the file's
-//!   layout (`Kernels::measure_prefill_path`, 30 to 80 ms, on a card whose
-//!   tensor cores run f32 accumulation at full rate; a capped card keeps its
-//!   rule), and which kernel of the device layout serves which number of
-//!   rows above those of a decode step (`Kernels::measure_layout`, about 50 ms),
+//!   layout (`Kernels::measure_prefill_path`, 30 to 80 ms), and which kernel
+//!   of the device layout serves which number of rows above those of a
+//!   decode step (`Kernels::measure_layout`, about 50 ms),
 //!   and once per type and shape how the kernels for a decode step launch
 //!   (`Kernels::tune_layout`, a few milliseconds);
 //! - once per type and shape, the product in both layouts with the rows the
@@ -253,8 +252,7 @@ pub struct LayoutReport {
     /// The bytes the device layout added: rows rounded up to 16.
     pub padding: u64,
     /// The path of the tile kernels each type takes in the file's layout
-    /// (`Kernels::measure_prefill_path`, measured where the tensor cores run f32
-    /// accumulation at full rate).
+    /// (`Kernels::measure_prefill_path`).
     pub paths: Vec<PrefillChoice>,
     /// How long the tables of the kernels and the probes took.
     pub tables: Duration,

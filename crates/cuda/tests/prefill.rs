@@ -1091,9 +1091,9 @@ fn the_path_follows_the_measured_tensor_core_rate() {
     }
 }
 
-/// The path measured per type: on a card whose tensor cores run f32 accumulation at full
-/// rate the most exact of the paths within 5 % of the fastest, kept for the type and taken by
-/// `prefill_path_for`; on a capped card the kept rule, unmeasured. The times are printed.
+/// The path measured per type, on every card, capped or not: the most exact of the paths
+/// within 5 % of the fastest, kept for the type and taken by `prefill_path_for`. Before the
+/// measurement the type takes the kept rule. The times are printed.
 #[test]
 fn the_measured_path_is_the_most_exact_of_the_fastest() {
     let Some(gpus) = gpus() else { return };
@@ -1108,16 +1108,14 @@ fn the_measured_path_is_the_most_exact_of_the_fastest() {
             let choice = kernels.measure_prefill_path(ty).unwrap();
             eprintln!("{}: {ty} {choice:?}", device.info().name);
             assert_eq!(choice.ty, ty);
-            assert_eq!(choice.measured, full, "{ty}");
+            assert!(choice.measured, "{ty}");
             assert_eq!(kernels.prefill_path_for(ty, Precision::Fast).unwrap(), choice.path);
             assert_eq!(kernels.prefill_path_for(ty, Precision::Exact).unwrap(), PrefillPath::F16);
             assert_eq!(kernels.measure_prefill_path(ty).unwrap(), choice, "measured once");
             assert_eq!(kernels.prefill_choice(ty).unwrap(), choice);
-            if !full {
-                assert_eq!(choice.path, kept, "{ty}: a capped card keeps its rule");
-                continue;
+            if full {
+                assert_eq!(kept, PrefillPath::F16, "{ty}: unmeasured, the exact path");
             }
-            assert_eq!(kept, PrefillPath::F16, "{ty}: unmeasured, the exact path");
             let ms = |path: PrefillPath| match path {
                 PrefillPath::Int8 => choice.probe_ms[0],
                 PrefillPath::F16 => choice.probe_ms[1],

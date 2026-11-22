@@ -147,10 +147,9 @@ impl State {
         }
         let types = dense_types(w);
         // The path of the tile kernels each quantized dense type takes (the float
-        // matrices take the f16 path of `Part::wide_float`), measured where the tensor
-        // cores run f32 accumulation at full rate (a capped card keeps its rule). The
+        // matrices take the f16 path of `Part::wide_float`), measured on the device. The
         // weights are on the device already: where the probe finds no room for its
-        // matrix, the type keeps the rule as well.
+        // matrix, the type keeps the rule of a type that was not measured.
         if opts.precision == Precision::Fast {
             for ty in &types {
                 if !is_float(*ty) && kernels.has_prefill_path(*ty, PrefillPath::F16) {

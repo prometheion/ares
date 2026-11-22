@@ -1,21 +1,21 @@
 //! Which path of the tile kernels ([`Kernels::matmul`])
-//! [`Precision::Fast`](super::Precision::Fast) takes for each weight type: on a card whose
-//! tensor cores run f16 `mma` with f32 accumulation at full rate, measured per type when a
-//! model is loaded ([`Kernels::measure_prefill_path`]).
+//! [`Precision::Fast`](super::Precision::Fast) takes for each weight type, measured per type
+//! and device when a model is loaded ([`Kernels::measure_prefill_path`]).
 //!
 //! The paths read the same weights in the file's layout and differ in what the tensor
 //! cores multiply: int8 codes with 8-bit activations, or the dequantised weights as f16
 //! with f16 activations, summed in f32 (the exact product of the f16 operands) or in f16
 //! flushed to f32 every 64 values. On a GeForce card with the cap on f32 accumulation the
-//! int8 path is the fast one for most types, and the rule kept from the cards the kernels
-//! were written on decides ([`Kernels::prefill_path_for`]). Where the cap is lifted (or on
-//! a professional card) the f16 path costs the tensor cores no more than int8, but it
-//! moves twice the bytes through the load unit (its tiles and activations hold two bytes a
-//! value), which the loads of the file's layout keep busy (its blocks lie a row apart, so
-//! a load of a warp touches 16 lines): the types with many load instructions per item fall
-//! behind on it (an RTX 4060 Ti at 1024 rows: IQ3_S 23 %, IQ3_XXS 15 %, Q8_0 12 %, IQ4_NL
-//! 10 %, IQ4_XS 9 %), the others are as fast or faster (`kernels/mm.cuh`). Which is which
-//! depends on the type and the card, so it is measured.
+//! exact f16 path runs at half the rate of the other two, and of those int8 is the fast one
+//! for most types; where the cap is lifted (or on a professional card) the f16 path costs
+//! the tensor cores no more than int8, but it moves twice the bytes through the load unit
+//! (its tiles and activations hold two bytes a value), which the loads of the file's layout
+//! keep busy (its blocks lie a row apart, so a load of a warp touches 16 lines): the types
+//! with many load instructions per item fall behind on it (an RTX 4060 Ti at 1024 rows:
+//! IQ3_S 23 %, IQ3_XXS 15 %, Q8_0 12 %, IQ4_NL 10 %, IQ4_XS 9 %), the others are as fast or
+//! faster (`kernels/mm.cuh`). Which is which depends on the type and the card, capped or
+//! not, so it is measured. A type that was not measured takes the rule kept from the cards
+//! the kernels were written on ([`Kernels::prefill_path_for`]).
 
 use std::sync::{Arc, Mutex};
 
@@ -41,7 +41,8 @@ const AS_FAST_WITHIN: f32 = 1.05;
 pub struct PrefillChoice {
     pub ty: GgmlType,
     /// Whether the path was measured on this device ([`Kernels::measure_prefill_path`]);
-    /// otherwise it is the kept rule of [`Kernels::prefill_path_for`].
+    /// otherwise it is the kept rule of [`Kernels::prefill_path_for`], for a type that was
+    /// not measured.
     pub measured: bool,
     pub path: PrefillPath,
     /// The time of the probe product with each path, `[int8, f16, f16 flushed]`, in
@@ -76,16 +77,16 @@ impl Kernels {
     /// memory) and up to 60 MiB for activations and products, freed on return, and 50 to
     /// 150 ms.
     ///
-    /// Only a card whose tensor cores run f32 accumulation at full rate
-    /// ([`Kernels::tensor_cores_full_rate`]) is measured: on a capped card the kept rule
-    /// holds (int8, or f16 with f16 accumulation for the types where that was as fast
-    /// on the cards the kernels were written on), and this returns it.
+    /// Every card is measured, capped ([`Kernels::tensor_cores_full_rate`]) or not: on a
+    /// capped card the exact f16 path runs at half the rate, and which of the other two is
+    /// as fast depends on the type and the card as the f16 path does on a card without the
+    /// cap.
     ///
     /// The device should be idle: a product of another context that runs at the same
     /// time is measured into the choice.
     pub fn measure_prefill_path(&self, ty: GgmlType) -> Result<PrefillChoice> {
         let known = self.prefill_choice(ty)?;
-        if known.measured || !self.tensor_cores_full_rate() {
+        if known.measured {
             return Ok(known);
         }
         let probe_ms = self.probe_paths(ty)?;
@@ -235,10 +236,11 @@ impl Kernels {
         Ok(best)
     }
 
-    /// The path of the rule kept from the cards the kernels were written on: f16 where the
-    /// tensor cores run it at full rate, and on a capped card f16 with f16 accumulation for
-    /// the types where that is as fast as int8 or that have no int8 kernel, int8 for the
-    /// others.
+    /// The path of a type that was not measured, by the rule kept from the cards the kernels
+    /// were written on: f16 where the tensor cores run it at full rate, and on a capped card
+    /// f16 with f16 accumulation for the types where that was as fast as int8 there or that
+    /// have no int8 kernel, int8 for the others. A model's loader measures every type it
+    /// multiplies in the file's layout, so this serves tests and benches.
     fn kept_path(&self, ty: GgmlType) -> Result<PrefillPath> {
         let prefill = self.prefill_kernels()?;
         if prefill.full_rate {
