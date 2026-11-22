@@ -282,22 +282,26 @@ fn system_text(value: &Json) -> Result<String, ApiError> {
 /// whose `cch` is another one in every request. It says nothing to a model,
 /// and left as it is no request of such a client would find a prefix of its
 /// prompt in the cache: the prompts part at their first line. The five
-/// characters are overwritten, as llama-server does it.
+/// bytes after `cch=` become `fffff` when a `;` follows them, exactly as
+/// upstream llama-server does it (`normalize_anthropic_billing_header`,
+/// llama.cpp PR 21793); a stamp of another form is left as it is.
 fn steady_billing_header(text: &str) -> String {
     const HEADER: &str = "x-anthropic-billing-header:";
     const STAMP: usize = 5;
-    let stamp = text
+    let Some(at) = text
         .starts_with(HEADER)
         .then(|| text[HEADER.len()..].find("cch=").map(|at| HEADER.len() + at + 4))
         .flatten()
-        .filter(|&at| {
-            text.as_bytes().get(at + STAMP) == Some(&b';')
-                && text.as_bytes()[at..at + STAMP].iter().all(u8::is_ascii_alphanumeric)
-        });
-    match stamp {
-        Some(at) => format!("{}{}{}", &text[..at], "f".repeat(STAMP), &text[at + STAMP..]),
-        None => text.to_owned(),
+    else {
+        return text.to_owned();
+    };
+    // The byte after the stamp is the ASCII `;`, so both ends of the stamp
+    // lie between characters.
+    if text.as_bytes().get(at + STAMP) != Some(&b';') {
+        tracing::warn!("a billing header of Claude Code whose cch stamp is not of the known form");
+        return text.to_owned();
     }
+    format!("{}{}{}", &text[..at], "f".repeat(STAMP), &text[at + STAMP..])
 }
 
 /// `messages`: the turns of the user, of the assistant and of the system, as

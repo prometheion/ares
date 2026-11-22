@@ -105,13 +105,31 @@ fn the_stamp_of_the_billing_header_is_the_same_in_every_request() {
     };
     assert_eq!(system("a5145"), system("0beef"));
     assert_eq!(system("a5145"), format!("{}\nYou are Claude Code. cch=12345;", header("fffff")));
-    // Only that line, and only a stamp of that form.
+    // A system prompt that is a string, with the text after the stamp on the
+    // same line, as Claude Code sends it.
+    let string = |stamp: &str| {
+        let body = with(json!({"system": format!("{}You are Claude Code.", header(stamp))}));
+        chat(body)["messages"][0]["content"].as_str().unwrap().to_owned()
+    };
+    assert_eq!(string("a5145"), string("e0f9c"));
+    assert_eq!(string("a5145"), format!("{}You are Claude Code.", header("fffff")));
+    // Any five bytes before the `;`, as upstream: also characters of more
+    // than one byte.
+    assert_eq!(string("a-b_c"), string("12345"));
+    assert_eq!(string("\u{e4}\u{f6}a"), string("12345"));
+    // Only that line, and only a stamp of that form; a prompt without the
+    // header is untouched.
     for other in [
         "cch=a5145; is text",
         "x-anthropic-billing-header: cch=a51;",
+        "x-anthropic-billing-header: cch=a5145",
+        "x-anthropic-billing-header: cch=a51456;",
         "x-anthropic-billing-header: none",
+        "You are Claude Code. x-anthropic-billing-header: cch=a5145;",
     ] {
         assert_eq!(chat(with(json!({"system": other})))["messages"][0]["content"], other);
+        let blocks = with(json!({"system": [{"type": "text", "text": other}]}));
+        assert_eq!(chat(blocks)["messages"][0]["content"], other);
     }
 }
 
