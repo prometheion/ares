@@ -72,7 +72,7 @@ fn the_attention_heads_go_where_the_room_is_and_the_context_grows() {
     for (name, attention) in [
         ("with the weights", None),
         ("a quarter on the first card", Some(AttentionShares::Given(vec![1.0, 3.0]))),
-        ("for the most context", Some(AttentionShares::MostContext)),
+        ("for the most context", Some(AttentionShares::ByContext)),
     ] {
         let mut options = LoadOptions::new(PathBuf::from(&model));
         options.devices = Some(vec![0, 1]);

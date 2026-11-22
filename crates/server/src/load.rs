@@ -642,10 +642,13 @@ pub(crate) fn read_vocabulary(path: &Path) -> Result<Arc<[u32]>, LoadError> {
     Ok(tokens.into())
 }
 
-/// The shares of the attention heads with which the devices of a tensor
-/// split by `shares` hold the most context: what each device has left once
-/// it holds everything but the heads, by estimate ([`plan::attention_by_room`]).
-fn attention_for_most_context(
+/// The shares of the attention heads of a tensor split by `shares` for a
+/// context of `pages` pages, or for the most context the devices hold when
+/// `pages` is `None` ([`plan::attention_for_context`],
+/// [`plan::attention_by_room`]), by estimate: what each device has left once
+/// it holds everything but the heads, and what all heads take.
+#[allow(clippy::too_many_arguments)]
+fn attention_for_context(
     c: &Config,
     w: &Weights<'_>,
     options: &Options,
@@ -653,21 +656,39 @@ fn attention_for_most_context(
     held: &[Held],
     shares: &[f64],
     headroom: u64,
+    pages: Option<u32>,
 ) -> Result<Vec<f64>, LoadError> {
     let n = held.len();
-    let mut room = Vec::with_capacity(n);
-    for (i, device) in held.iter().enumerate() {
-        // A placement in which this device holds no attention head.
-        let mut elsewhere = vec![0.0; n];
-        elsewhere[(i + 1) % n] = 1.0;
+    // The footprint of every device with the heads all on device `on`.
+    let with_heads_on = |on: usize| -> Result<Vec<Footprint>, LoadError> {
+        let mut attention = vec![0.0; n];
+        attention[on] = 1.0;
         let placement =
-            place(c, w, &Spread::TensorWithAttention(shares.to_vec(), elsewhere), options)?;
-        let f = footprint(c, w, &placement, options, parallel)[i];
-        let taken = f.weights + f.step + f.exact + f.per_sequence * u64::from(parallel);
+            place(c, w, &Spread::TensorWithAttention(shares.to_vec(), attention), options)?;
+        Ok(footprint(c, w, &placement, options, parallel))
+    };
+    let mut room = Vec::with_capacity(n);
+    let (mut heads, mut page) = (0, 0);
+    for (i, device) in held.iter().enumerate() {
+        let (all, none) = (with_heads_on(i)?[i], with_heads_on((i + 1) % n)?[i]);
+        let taken = none.weights + none.step + none.exact + none.per_sequence * u64::from(parallel);
         room.push(device.free.saturating_sub(headroom).saturating_sub(taken));
+        heads = heads.max((all.weights + all.exact).saturating_sub(none.weights + none.exact));
+        page = page.max(all.per_page.saturating_sub(none.per_page));
     }
-    plan::attention_by_room(&room).ok_or_else(|| {
-        refuse("no device has room for the attention heads next to its share of the weights")
+    let attention = match pages {
+        Some(pages) => plan::attention_for_context(shares, &room, heads, page, pages),
+        None => plan::attention_by_room(&room),
+    };
+    attention.ok_or_else(|| {
+        refuse(format!(
+            "the devices cannot hold the attention heads with {} next to their shares of the \
+             weights, wherever the heads are",
+            match pages {
+                Some(pages) => format!("{pages} pages of context"),
+                None => "any context".into(),
+            }
+        ))
     })
 }
 
@@ -1138,8 +1159,8 @@ fn load_qwen35(
                 (SplitKind::Tensor, Some(AttentionShares::Given(attention))) => {
                     (Spread::TensorWithAttention(shares, attention.clone()), why)
                 }
-                (SplitKind::Tensor, Some(AttentionShares::MostContext)) => {
-                    let attention = attention_for_most_context(
+                (SplitKind::Tensor, Some(AttentionShares::ByContext)) => {
+                    let attention = attention_for_context(
                         &config,
                         &weights,
                         &part_options,
@@ -1147,6 +1168,7 @@ fn load_qwen35(
                         &held,
                         &shares,
                         headroom,
+                        options.context.map(|context| plan::pool_pages(context, parallel)),
                     )?;
                     (Spread::TensorWithAttention(shares, attention), why)
                 }

@@ -185,9 +185,12 @@ impl LoadOptions {
 pub enum AttentionShares {
     /// Each device's share, as given.
     Given(Vec<f64>),
-    /// The shares with which the devices hold the most context
+    /// Where the context finds room: the heads follow the weights as far as
+    /// the context asked for fits that way, and move to the devices with
+    /// room as far as it needs ([`attention_for_context`]); with no context
+    /// asked for, the shares with which the devices hold the most
     /// ([`attention_by_room`]).
-    MostContext,
+    ByContext,
 }
 
 /// Each device's share of the weights when the operator names none: in
@@ -256,6 +259,26 @@ pub fn fit_shares(wanted: &[f64], most: &[f64]) -> Option<Vec<f64>> {
 pub fn attention_by_room(room: &[u64]) -> Option<Vec<f64>> {
     let total: u64 = room.iter().sum();
     (total > 0).then(|| room.iter().map(|r| *r as f64 / total as f64).collect())
+}
+
+/// Each device's share of the attention heads for `pages` pages of context:
+/// `wanted` (the shares of the weights) lowered where a device's `room` (as
+/// for [`attention_by_room`]) cannot hold its heads' weights, `heads` bytes for
+/// all heads, and their K and V, `page` bytes a page for all heads, and the
+/// rest given to the others ([`fit_shares`]). The heads stay with the weights
+/// whenever the context fits that way: attention work on a device that is not
+/// the fastest makes a long sequence slower. `None` when the devices cannot
+/// hold that many pages.
+pub fn attention_for_context(
+    wanted: &[f64],
+    room: &[u64],
+    heads: u64,
+    page: u64,
+    pages: u32,
+) -> Option<Vec<f64>> {
+    let all = heads as f64 + page as f64 * f64::from(pages);
+    let most: Vec<f64> = room.iter().map(|r| (*r as f64 / all.max(1.0)).min(1.0)).collect();
+    fit_shares(wanted, &most)
 }
 
 /// What a device has to give and what a model takes of it, in bytes: the
@@ -490,6 +513,25 @@ mod tests {
         }
         assert_eq!(attention_by_room(&[0, 0]), None);
         assert_eq!(attention_by_room(&[0, 5]), Some(vec![0.0, 1.0]));
+    }
+
+    #[test]
+    fn attention_heads_stay_with_the_weights_until_the_context_needs_room() {
+        // Heads of 1 GiB of weights and 1 MiB of K and V a page; 2 and 6 GiB
+        // of room; the weights 0.625 and 0.375.
+        let (heads, page) = (1u64 << 30, 1u64 << 20);
+        let (room, wanted) = ([2u64 << 30, 6 << 30], [0.625, 0.375]);
+        let fit = |pages| attention_for_context(&wanted, &room, heads, page, pages);
+        // 2 GiB hold 0.625 of 1 GiB + 2048 pages: the heads stay.
+        assert_eq!(fit(2048), Some(wanted.to_vec()));
+        // 4096 pages: the first device holds 2/5 of the heads, the rest moves.
+        let moved = fit(4096).unwrap();
+        assert!((moved[0] - 0.4).abs() < 1e-9 && (moved[1] - 0.6).abs() < 1e-9, "{moved:?}");
+        // The most the devices hold, (8 - 1) GiB / 1 MiB, still fits; one
+        // page more does not.
+        let most = fit(7 << 10).unwrap();
+        assert!((most[0] - 0.25).abs() < 1e-9, "{most:?}");
+        assert_eq!(fit((7 << 10) + 1), None);
     }
 
     #[test]
