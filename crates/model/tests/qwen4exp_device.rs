@@ -36,14 +36,16 @@ use ares_model::qwen4exp::{Config, LogitRows, Recorder, Reference, SequenceState
 use ares_runtime::expert_store::{ExpertNeighbours, Near, ProfileKey, Serve, StoreStats};
 
 /// The spread the tests of two devices ask for: both on every layer when
-/// `ARES_TEST_SPREAD=tensor`.
+/// `ARES_TEST_SPREAD=tensor`. `ARES_TEST_CORE_SHARE` is the mixer's share of
+/// the recurrent heads (0.5 unless given): with 1 and `ARES_TEST_SHARED=mixer`
+/// the worker holds experts and nothing else.
 fn tensor() -> Option<Spread> {
     let var = |name: &str| std::env::var(name).ok();
     (var("ARES_TEST_SPREAD").as_deref() == Some("tensor")
         && var("ARES_TEST_DEVICES").is_some_and(|d| d.contains(',')))
     .then(|| Spread::Tensor {
         mixer: Some(var("ARES_TEST_MIXER").and_then(|m| m.parse().ok()).unwrap_or(0)),
-        core_share: Some(0.5),
+        core_share: Some(var("ARES_TEST_CORE_SHARE").and_then(|m| m.parse().ok()).unwrap_or(0.5)),
         shared_on_mixer: Some(var("ARES_TEST_SHARED").as_deref() == Some("mixer")),
     })
 }

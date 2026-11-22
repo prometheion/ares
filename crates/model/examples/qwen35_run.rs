@@ -3,7 +3,7 @@
 //!
 //! ```text
 //! qwen35_run <model.gguf> [--split single|tensor|layer] [--shares 0.625,0.375]
-//!     [--devices 0,1] [--precision fast|exact] [--max-rows N] [--context 4096]
+//!     [--attention-shares 1,3] [--devices 0,1] [--precision fast|exact] [--max-rows N] [--context 4096]
 //!     [--chat] [--generate 48] [--capture DIR]... [--decode-at 1000,32000]
 //!     [--decode-steps 64] [--prefill 2048] [--text FILE] [--state f32|f16]
 //!     [--pipeline-rows 256] [--no-profile] [--balance FILE] [--balance-out FILE]
@@ -11,6 +11,9 @@
 //!     [--show-layouts] [--kv q8,q8] [--fingerprint FILE]
 //! ```
 //!
+//! - `--attention-shares A,B`: with a tensor split, the devices' shares of
+//!   the KV heads of the attention blocks, with their K and V; the rest
+//!   follows `--shares`. Without it the heads follow `--shares` too.
 //! - `--max-rows N`: the rows of a step (and so the scratch); by default the
 //!   default of the model's options.
 //! - `--kv K,V`: the formats of K and of V of the attention blocks (`f16`, `q8`
@@ -142,6 +145,7 @@ struct Args {
     model: PathBuf,
     split: String,
     shares: Vec<f64>,
+    attention_shares: Option<Vec<f64>>,
     devices: Vec<u32>,
     precision: Precision,
     state: StateFormat,
@@ -191,6 +195,7 @@ fn parse() -> Args {
         model: PathBuf::new(),
         split: "single".into(),
         shares: vec![0.625, 0.375],
+        attention_shares: None,
         devices: vec![0],
         precision: Precision::Fast,
         state: StateFormat::F32,
@@ -234,6 +239,10 @@ fn parse() -> Args {
             "--split" => args.split = value(),
             "--shares" => {
                 args.shares = list(value()).iter().map(|s| s.parse().expect("a share")).collect()
+            }
+            "--attention-shares" => {
+                args.attention_shares =
+                    Some(list(value()).iter().map(|s| s.parse().expect("a share")).collect())
             }
             "--devices" => {
                 args.devices = list(value()).iter().map(|s| s.parse().expect("a device")).collect()
@@ -672,6 +681,38 @@ fn print_layouts(report: &PartReport, all: bool) {
     }
 }
 
+/// The memory a device keeps free when the server plans a context
+/// (`VRAM_HEADROOM` of `ares-server`).
+const HEADROOM_MIB: f64 = 256.0;
+
+/// How much more context the devices' free memory holds beyond the `context`
+/// tokens the model was opened with: K and V of a page lie on every device
+/// that holds heads of the attention blocks, so the device that runs out
+/// first decides. The server keeps [`HEADROOM_MIB`] free on each.
+fn print_room(reports: &[PartReport], devices: &[Device], context: u32) {
+    let mut most = f64::INFINITY;
+    for (report, device) in reports.iter().zip(devices) {
+        let free = device.mem_info().expect("memory").free as f64 / MIB;
+        let per_token = report.page_bytes as f64 / 128.0 / MIB;
+        let room = if per_token > 0.0 {
+            ((free - HEADROOM_MIB).max(0.0) / per_token).floor()
+        } else {
+            f64::INFINITY
+        };
+        most = most.min(room);
+        println!(
+            "RES room device {}: {free:.0} MiB free, K/V {:.2} MiB per 1000 tokens: {room:.0} \
+             more tokens with {HEADROOM_MIB:.0} MiB left free",
+            report.index,
+            per_token * 1000.0
+        );
+    }
+    println!(
+        "RES room: the devices hold about {:.0} tokens of context in all ({context} opened, {most:.0} more)",
+        f64::from(context) + most
+    );
+}
+
 fn median(values: &mut [f64]) -> f64 {
     values.sort_by(f64::total_cmp);
     values.get(values.len() / 2).copied().unwrap_or(f64::NAN)
@@ -682,7 +723,10 @@ fn main() {
     let spread = match (args.split.as_str(), &args.balance) {
         ("single", _) => Spread::Single,
         ("tensor", Some(file)) => Spread::TensorByHalf(args.shares.clone(), read_balance(file)),
-        ("tensor", None) => Spread::Tensor(args.shares.clone()),
+        ("tensor", None) => match &args.attention_shares {
+            Some(attention) => Spread::TensorWithAttention(args.shares.clone(), attention.clone()),
+            None => Spread::Tensor(args.shares.clone()),
+        },
         ("layer", _) => Spread::Layer(args.shares.clone()),
         (other, _) => panic!("unknown split {other}"),
     };
@@ -752,6 +796,7 @@ fn main() {
         print_layouts(report, args.show_layouts);
     }
     print_locked(&model);
+    print_room(&model.reports(), &devices, args.context);
     let tokenizer = model.tokenizer();
     let chunk = args.step_rows.unwrap_or(args.rows() as usize).min(args.rows() as usize);
 

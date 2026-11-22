@@ -651,14 +651,7 @@ fn place(
     options: &Options,
 ) -> Result<Placement, LoadError> {
     let model = |e: ares_model::qwen35::device::PlacementError| LoadError::Model(e.to_string());
-    let placement = match spread {
-        Spread::Single => Placement::single(c),
-        Spread::Tensor(shares) => Placement::tensor(c, shares).map_err(model)?,
-        Spread::TensorByHalf(shares, halves) => {
-            Placement::tensor_by_half(c, shares, halves).map_err(model)?
-        }
-        Spread::Layer(shares) => Placement::layer(c, w, shares).map_err(model)?,
-    };
+    let placement = spread.place(c, w).map_err(model)?;
     let drafts = options.window_rows > 1;
     let vocabulary = options.draft_vocabulary.as_deref();
     if drafts && (c.n_nextn == 1 || options.mtp_file.is_some()) && options.mtp {
@@ -1044,6 +1037,12 @@ fn load_qwen35(
             held = vec![keep];
         }
     }
+    if options.attention_shares.is_some() && split != SplitKind::Tensor {
+        return Err(refuse(
+            "shares of the attention heads are for a tensor split, where every device holds \
+             heads of every attention block",
+        ));
+    }
     let (spread, why_shares) = match split {
         SplitKind::Single => (Spread::Single, ""),
         SplitKind::Tensor | SplitKind::Layer => {
@@ -1097,8 +1096,18 @@ fn load_qwen35(
                     }
                 }
             };
-            match split {
-                SplitKind::Tensor => (Spread::Tensor(shares), why),
+            match (split, &options.attention_shares) {
+                (SplitKind::Tensor, Some(attention)) if attention.len() != held.len() => {
+                    return Err(refuse(format!(
+                        "{} shares of the attention heads for {} devices",
+                        attention.len(),
+                        held.len()
+                    )));
+                }
+                (SplitKind::Tensor, Some(attention)) => {
+                    (Spread::TensorWithAttention(shares, attention.clone()), why)
+                }
+                (SplitKind::Tensor, None) => (Spread::Tensor(shares), why),
                 _ => (Spread::Layer(shares), why),
             }
         }
@@ -1191,6 +1200,11 @@ fn load_qwen35(
         match &spread {
             Spread::Tensor(shares) | Spread::Layer(shares) =>
                 format!(", shares {} ({why_shares})", shares_text(shares)),
+            Spread::TensorWithAttention(shares, attention) => format!(
+                ", shares {} ({why_shares}), of the attention heads with their K and V {}",
+                shares_text(shares),
+                shares_text(attention)
+            ),
             _ => String::new(),
         }
     );

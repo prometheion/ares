@@ -24,6 +24,13 @@
 //!   [`Placement::tensor_by_half`] takes a share per half block instead
 //!   ([`HalfShares`], from measured times) and cuts each half at the unit
 //!   nearest to it.
+//!
+//!   The KV heads of the attention blocks can follow shares of their own
+//!   ([`Placement::tensor_with_attention`]): a head takes its query heads,
+//!   its slice of the four projections, its K and V and its attention work
+//!   to the device that holds it. K and V of every cell lie where the heads
+//!   are, so these shares decide which device's memory a page of context
+//!   takes, apart from where the weights are.
 //! - **Layer split**: each device holds a range of whole blocks, the first one
 //!   embeds the tokens and the last one holds the output head.
 
@@ -206,7 +213,30 @@ impl Placement {
     /// (the shares are normalised to add up to 1). The first device embeds;
     /// the head is cut by tokens.
     pub fn tensor(c: &Config, shares: &[f64]) -> Result<Self, PlacementError> {
-        Self::tensor_cut(c, shares, None)
+        Self::tensor_cut(c, shares, None, None)
+    }
+
+    /// A tensor split whose attention blocks follow shares of their own:
+    /// device `i` holds about `attention[i]` of the KV heads of every
+    /// attention block, with their query heads, their slices of the
+    /// projections and their K and V, and about `shares[i]` of everything
+    /// else. A block's cut is at whole heads; what its rounding leaves is
+    /// carried into the next attention block, so that over all of them a
+    /// device's heads are within one of its share. A share of 0 leaves a
+    /// device without attention heads.
+    pub fn tensor_with_attention(
+        c: &Config,
+        shares: &[f64],
+        attention: &[f64],
+    ) -> Result<Self, PlacementError> {
+        if attention.len() != shares.len() {
+            return Err(PlacementError(format!(
+                "{} shares of the attention heads for {} devices",
+                attention.len(),
+                shares.len()
+            )));
+        }
+        Self::tensor_cut(c, shares, None, Some(attention))
     }
 
     /// A tensor split with a share per half block: device `i` holds about
@@ -228,15 +258,17 @@ impl Placement {
                 shares.len()
             )));
         }
-        Self::tensor_cut(c, shares, Some(halves))
+        Self::tensor_cut(c, shares, Some(halves), None)
     }
 
     fn tensor_cut(
         c: &Config,
         shares: &[f64],
         halves: Option<&HalfShares>,
+        attention: Option<&[f64]>,
     ) -> Result<Self, PlacementError> {
         let cumulative = check_shares(shares)?;
+        let of_attention = attention.map(check_shares).transpose()?;
         let n = shares.len();
         if n == 1 {
             return Ok(Self::single(c));
@@ -281,7 +313,7 @@ impl Placement {
                 None => (cumulative.clone(), cumulative.clone()),
             };
             let heads: Vec<u32> = if c.is_attention(layer) {
-                cuts(a.n_head_kv as u32, &of_mixer, &mut carry_a)
+                cuts(a.n_head_kv as u32, of_attention.as_ref().unwrap_or(&of_mixer), &mut carry_a)
             } else {
                 cuts(r.n_k_heads as u32 / key_unit, &of_mixer, &mut carry_r)
                     .into_iter()
@@ -445,6 +477,119 @@ mod tests {
             assert_eq!((c[0], c[3]), (0, 68));
             assert!(c.windows(2).all(|w| w[0] <= w[1]), "{c:?}");
         }
+    }
+
+    /// The shape of Qwen3.8-27B: 64 blocks, every fourth with attention of 4
+    /// KV heads, recurrent blocks of 16 key heads.
+    fn config_27b() -> Config {
+        use crate::qwen35::config::{Attention, Recurrent, Rope};
+        Config {
+            n_layer: 64,
+            n_embd: 5120,
+            n_ff: 17408,
+            n_vocab: 248_320,
+            n_ctx: 262_144,
+            rms_eps: 1e-6,
+            full_attention_interval: 4,
+            n_nextn: 1,
+            attention: Attention {
+                n_head: 24,
+                n_head_kv: 4,
+                head_dim: 256,
+                rope: Rope { dim: 64, sections: [11, 11, 10, 0], freq_base: 1e7 },
+            },
+            recurrent: Recurrent {
+                conv_kernel: 4,
+                n_k_heads: 16,
+                n_v_heads: 48,
+                head_k_dim: 128,
+                head_v_dim: 128,
+            },
+        }
+    }
+
+    /// Per device: the KV heads of all attention blocks, the key heads of all
+    /// recurrent blocks, the inner rows of all feed-forward parts.
+    fn held(c: &Config, p: &Placement) -> Vec<(u32, u32, u32)> {
+        p.devices
+            .iter()
+            .map(|d| {
+                let mut sums = (0, 0, 0);
+                for (layer, slice) in d.blocks.iter().enumerate() {
+                    let slice = slice.as_ref().unwrap();
+                    if c.is_attention(layer) {
+                        sums.0 += slice.heads.len() as u32;
+                    } else {
+                        sums.1 += slice.heads.len() as u32;
+                    }
+                    sums.2 += slice.ffn.len() as u32;
+                }
+                sums
+            })
+            .collect()
+    }
+
+    #[test]
+    fn attention_heads_follow_their_own_shares_and_the_rest_does_not() {
+        let c = config_27b();
+        let plain = Placement::tensor(&c, &[0.625, 0.375]).unwrap();
+        let split = Placement::tensor_with_attention(&c, &[0.625, 0.375], &[1.0, 3.0]).unwrap();
+        let (plain_held, split_held) = (held(&c, &plain), held(&c, &split));
+        // 16 attention blocks of 4 KV heads: a quarter is one head of each.
+        assert_eq!((split_held[0].0, split_held[1].0), (16, 48));
+        for (layer, slice) in split.devices[0].blocks.iter().enumerate() {
+            if c.is_attention(layer) {
+                assert_eq!(slice.as_ref().unwrap().heads, 0..1, "block {layer}");
+            }
+        }
+        // The recurrent blocks, the feed-forward parts and the head are where
+        // the plain split has them.
+        for i in 0..2 {
+            assert_eq!(
+                (split_held[i].1, split_held[i].2),
+                (plain_held[i].1, plain_held[i].2),
+                "device {i}"
+            );
+            assert_eq!(split.devices[i].head, plain.devices[i].head);
+        }
+        assert_eq!(plain_held[0].0, 40, "the plain split gives 2.5 heads a block");
+        assert_eq!(split.split, Split::Tensor);
+    }
+
+    #[test]
+    fn attention_shares_carry_their_rounding_over_the_blocks() {
+        let c = config_27b();
+        for (share, want) in [(0.3, 19.2), (0.1, 6.4), (0.55, 35.2), (0.9, 57.6)] {
+            let p = Placement::tensor_with_attention(&c, &[0.625, 0.375], &[share, 1.0 - share])
+                .unwrap();
+            let got = held(&c, &p)[0].0;
+            assert!((f64::from(got) - want).abs() <= 1.0, "{share}: {got} heads, {want} wanted");
+            // Every block is cut at whole heads and covers all of them.
+            for layer in (0..c.n_layer).filter(|l| c.is_attention(*l)) {
+                let (a, b) = (
+                    p.devices[0].blocks[layer].clone().unwrap().heads,
+                    p.devices[1].blocks[layer].clone().unwrap().heads,
+                );
+                assert_eq!((a.start, a.end, b.end), (0, b.start, 4), "block {layer}");
+            }
+        }
+    }
+
+    #[test]
+    fn an_attention_share_of_nothing_leaves_a_device_without_heads() {
+        let c = config_27b();
+        let p = Placement::tensor_with_attention(&c, &[0.625, 0.375], &[0.0, 1.0]).unwrap();
+        let held = held(&c, &p);
+        assert_eq!((held[0].0, held[1].0), (0, 64));
+        let opts = crate::qwen35::device::Options::default();
+        assert_eq!(crate::qwen35::device::part::page_bytes(&c, &p, 0, &opts), 0);
+        assert!(crate::qwen35::device::part::page_bytes(&c, &p, 1, &opts) > 0);
+        // Refused: shares for another number of devices, and shares of nothing.
+        assert!(Placement::tensor_with_attention(&c, &[0.625, 0.375], &[1.0]).is_err());
+        assert!(Placement::tensor_with_attention(&c, &[0.625, 0.375], &[0.0, 0.0]).is_err());
+        // One device holds everything, whatever the shares say.
+        let one = Placement::tensor_with_attention(&c, &[1.0], &[1.0]).unwrap();
+        assert_eq!(one.split, Split::Single);
     }
 
     #[test]

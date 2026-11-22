@@ -127,6 +127,14 @@ fn every_placement_of_the_0_8b_agrees_with_the_reference() {
             let mut placements = vec![("single", Spread::Single, vec![0u32])];
             if two {
                 placements.push(("tensor", Spread::Tensor(vec![0.625, 0.375]), vec![0, 1]));
+                // The attention heads by shares of their own: blocks whose
+                // heads are all on the second card, as the rounding is
+                // carried, and blocks with heads on both.
+                placements.push((
+                    "tensor, attention 1:3",
+                    Spread::TensorWithAttention(vec![0.625, 0.375], vec![1.0, 3.0]),
+                    vec![0, 1],
+                ));
                 placements.push(("layer", Spread::Layer(vec![0.5, 0.5]), vec![0, 1]));
             }
             for (name, spread, ordinals) in placements {
@@ -641,6 +649,11 @@ fn a_row_of_a_draft_window_picks_what_it_picks_alone_on_every_placement() {
     let mut placements = vec![("one device", Spread::Single, vec![0u32])];
     if device_count().unwrap() >= 2 {
         placements.push(("tensor split", Spread::Tensor(vec![0.625, 0.375]), vec![0, 1]));
+        placements.push((
+            "tensor split, attention 1:3",
+            Spread::TensorWithAttention(vec![0.625, 0.375], vec![1.0, 3.0]),
+            vec![0, 1],
+        ));
         placements.push(("layer split", Spread::Layer(vec![0.5, 0.5]), vec![0, 1]));
     } else {
         eprintln!("one device: the splits are skipped");

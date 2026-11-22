@@ -98,6 +98,12 @@ pub struct LoadOptions {
     pub split: Option<SplitKind>,
     /// Each device's share of the weights under a split.
     pub shares: Option<Vec<f64>>,
+    /// Each device's share of the KV heads of the attention blocks under a
+    /// tensor split, with their K and V and their attention work; the rest
+    /// of the model follows `shares`. `None`: the heads follow `shares` too.
+    /// No option of the command line sets it yet: its name and form are the
+    /// owner's to choose (`docs/OPEN.md`, "Roles of the cards").
+    pub attention_shares: Option<Vec<f64>>,
     /// Tokens of sequence state the engine holds for all sequences together.
     pub context: Option<u32>,
     /// Sequences that run at once.
@@ -153,6 +159,7 @@ impl LoadOptions {
             devices: None,
             split: None,
             shares: None,
+            attention_shares: None,
             context: None,
             parallel: None,
             kv: None,

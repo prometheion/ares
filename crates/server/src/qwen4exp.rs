@@ -95,6 +95,12 @@ pub(crate) fn load(
              layers per device follows what fits; --split names which of the two",
         ));
     }
+    if options.attention_shares.is_some() {
+        return Err(refuse(
+            "shares of the attention heads do nothing for this model: its attention layers, \
+             their keys and values are on the device that mixes the streams",
+        ));
+    }
     if options.precision == ares_cuda::Precision::Exact {
         return Err(refuse(
             "--precision exact is not a choice for this model: its products have one kind of \

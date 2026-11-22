@@ -39,8 +39,28 @@ pub enum Spread {
     Tensor(Vec<f64>),
     /// A tensor split with shares per half block, and these for the head.
     TensorByHalf(Vec<f64>, HalfShares),
+    /// A tensor split with these shares per device, whose attention blocks
+    /// follow the second shares: the KV heads with their K and V
+    /// ([`Placement::tensor_with_attention`]).
+    TensorWithAttention(Vec<f64>, Vec<f64>),
     /// A layer split with these shares of the weights' bytes per device.
     Layer(Vec<f64>),
+}
+
+impl Spread {
+    /// Where the weights go, without a drafter ([`Placement::with_mtp`] and
+    /// [`Placement::with_head_view`] add one).
+    pub fn place(&self, c: &Config, w: &Weights<'_>) -> Result<Placement, PlacementError> {
+        match self {
+            Spread::Single => Ok(Placement::single(c)),
+            Spread::Tensor(shares) => Placement::tensor(c, shares),
+            Spread::TensorByHalf(shares, halves) => Placement::tensor_by_half(c, shares, halves),
+            Spread::TensorWithAttention(shares, attention) => {
+                Placement::tensor_with_attention(c, shares, attention)
+            }
+            Spread::Layer(shares) => Placement::layer(c, w, shares),
+        }
+    }
 }
 
 /// What one device's part took, for the report at start.
@@ -149,14 +169,7 @@ impl Qwen35 {
                 None => weights,
             };
             let table = table_shape(&weights.token_embd);
-            let placement = match spread {
-                Spread::Single => Placement::single(&config),
-                Spread::Tensor(shares) => Placement::tensor(&config, shares)?,
-                Spread::TensorByHalf(shares, halves) => {
-                    Placement::tensor_by_half(&config, shares, halves)?
-                }
-                Spread::Layer(shares) => Placement::layer(&config, &weights, shares)?,
-            };
+            let placement = spread.place(&config, &weights)?;
             (placement, table)
         };
         // A model with an MTP block (in its file or a file of its own) drafts
