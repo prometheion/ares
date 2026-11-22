@@ -568,7 +568,7 @@ impl Feed {
         let step = self.layout.per_layer;
         for at in (first..self.guessed.len()).step_by(step).take(self.lookahead.distance()) {
             if !std::mem::replace(&mut self.guessed[at], true) && self.has_transit(at) {
-                self.store.transit_guess(at, &self.last_missing[at])?;
+                self.store.transit_guess(at, &self.last_missing[at], None)?;
             }
         }
         Ok(())
@@ -794,7 +794,8 @@ impl Feed {
                     experts.sort_by(|a, b| {
                         counts[*b as usize].cmp(&counts[*a as usize]).then(a.cmp(b))
                     });
-                    self.store.transit_guess(at, &experts)?;
+                    let rows: Vec<u32> = experts.iter().map(|e| counts[*e as usize]).collect();
+                    self.store.transit_guess(at, &experts, Some(&rows))?;
                 }
             }
         }

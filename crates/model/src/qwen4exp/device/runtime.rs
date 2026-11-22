@@ -1246,6 +1246,12 @@ impl Qwen4Exp {
         Some(self.flow.get()?.lock_feed().store.reader_stats())
     }
 
+    /// How often the guesses of wide steps were then named, by class (see
+    /// `ExpertStore::transit_odds`); `None` before the parts are open.
+    pub fn guess_odds(&self) -> Option<[(f32, f32); 9]> {
+        Some(self.flow.get()?.lock_feed().store.transit_odds())
+    }
+
     /// What the expert store counted since the last call; `None` before the
     /// parts are open.
     pub fn take_store_stats(&self) -> Option<StoreStats> {

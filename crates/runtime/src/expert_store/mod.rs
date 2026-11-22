@@ -463,6 +463,9 @@ pub struct StoreStats {
     /// milliseconds from the guess to the bytes being in staging, summed.
     pub transit_ahead_done: u64,
     pub transit_ahead_ms: f64,
+    /// Guesses of wide steps that were not read: their class of guesses is named less
+    /// often than not (`transit.rs`).
+    pub transit_ahead_left: u64,
     /// Experts that came from the file through staging and were kept in the
     /// RAM tier afterwards, by their heat.
     pub transit_admitted: u64,

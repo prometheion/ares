@@ -1975,7 +1975,7 @@ fn a_guess_is_read_ahead_and_the_want_that_names_it_takes_it() {
     let mut rig = transit_rig(2, 4);
     rig.store.begin_step();
     // Guesses take at most half of staging: two of the three are read.
-    rig.store.transit_guess(1, &[3, 4, 5]).unwrap();
+    rig.store.transit_guess(1, &[3, 4, 5], None).unwrap();
     rig.settle();
     assert_eq!(rig.store.stats().transit_ahead_reads, 2);
     assert!(rig.take_transit(1).is_empty(), "a guess is not uploaded");
@@ -2066,7 +2066,7 @@ fn a_store_without_transit_says_so() {
     assert_eq!(rig.store.staging_slots(), 0);
     assert!(rig.store.transit_want(0, &[1]).is_err());
     // A guess is only a hint.
-    rig.store.transit_guess(0, &[1]).unwrap();
+    rig.store.transit_guess(0, &[1], None).unwrap();
 }
 
 #[test]

@@ -118,6 +118,54 @@ struct Entry {
     /// Nobody needs it any more: it leaves when nothing of it is on its way.
     dropped: bool,
     since: Instant,
+    /// For a guess, the class of its odds ([`GuessOdds`]).
+    class: usize,
+}
+
+/// The classes of the guesses of wide steps: what the step before missed at the layer (0),
+/// and what a prediction named, by the rows it named the expert for: 1, 2, 3 to 4, 5 to 8, 9
+/// to 16, 17 to 32, 33 to 64, more (1 to 8).
+pub(super) const GUESS_CLASSES: usize = 9;
+
+/// The samples a class needs before its count decides, and the most it keeps: the counts
+/// are halved beyond that, so that they follow the text and the tiers.
+const GUESS_SAMPLES: f32 = 16.0;
+const GUESS_KEPT: f32 = 512.0;
+
+/// The class of a guess that a prediction named for `rows` rows, or that the step before
+/// missed (`None`).
+fn guess_class(rows: Option<u32>) -> usize {
+    match rows {
+        None => 0,
+        Some(rows) => 1 + (rows.max(1).next_power_of_two().trailing_zeros() as usize).min(7),
+    }
+}
+
+/// How often a guess of each class was then named by the layer's record. A step that reads a
+/// prompt alone is bound by the drive, and a guess read for nothing takes the drive from the
+/// reads that are used: only the classes named at least as often as not are read ahead.
+/// Every guess is counted whether it was read or not, so a class that stopped being read
+/// comes back when its guesses are named again.
+#[derive(Clone, Copy, Debug, Default)]
+struct GuessOdds {
+    named: [f32; GUESS_CLASSES],
+    picked: [f32; GUESS_CLASSES],
+}
+
+impl GuessOdds {
+    fn worth(&self, class: usize) -> bool {
+        let named = self.named[class];
+        named < GUESS_SAMPLES || 2.0 * self.picked[class] >= named
+    }
+
+    fn record(&mut self, class: usize, picked: bool) {
+        self.named[class] += 1.0;
+        self.picked[class] += f32::from(u8::from(picked));
+        if self.named[class] > GUESS_KEPT {
+            self.named[class] /= 2.0;
+            self.picked[class] /= 2.0;
+        }
+    }
 }
 
 /// Transit as the store keeps it.
@@ -131,6 +179,8 @@ pub(super) struct Transit {
     stage_skip: Vec<[u32; 3]>,
     /// Staging slots that guesses hold.
     stage_guessed: usize,
+    /// How often the guesses of each class were named.
+    odds: GuessOdds,
     entries: HashMap<(usize, u32), Entry>,
     /// Named experts that are not on their way into transit yet, in the order
     /// they were asked for; guesses whose read has not started, likewise.
@@ -167,6 +217,7 @@ impl Transit {
             stage_free: (0..plan.stage_slots).rev().collect(),
             stage_skip: vec![[0; 3]; plan.stage_slots as usize],
             stage_guessed: 0,
+            odds: GuessOdds::default(),
             entries: HashMap::new(),
             wanted: VecDeque::new(),
             guesses: VecDeque::new(),
@@ -242,6 +293,7 @@ impl<D: SlotDevice> ExpertStore<D> {
                     entry.dropped = false;
                     entry.since = now;
                     let state = entry.state;
+                    self.transit.odds.record(entry.class, true);
                     self.stats.picks += 1;
                     if matches!(state, State::Reading { .. } | State::Staged { .. }) {
                         self.stats.transit_ahead_used += 1;
@@ -283,7 +335,13 @@ impl<D: SlotDevice> ExpertStore<D> {
                     }
                     self.transit.entries.insert(
                         key,
-                        Entry { state: State::Queued, wanted: true, dropped: false, since: now },
+                        Entry {
+                            state: State::Queued,
+                            wanted: true,
+                            dropped: false,
+                            since: now,
+                            class: 0,
+                        },
                     );
                     self.transit.wanted.push_back(key);
                 }
@@ -294,15 +352,22 @@ impl<D: SlotDevice> ExpertStore<D> {
     }
 
     /// Something expects the record of `layer` to name `experts`, most likely
-    /// first. Those that are in no tier are read ahead into staging, in at
-    /// most half of it and behind every read a record asked for; the others
+    /// first: a prediction that names each for `rows` of the step's rows, or the
+    /// misses of the step before (`None`). Those that are in no tier are read ahead
+    /// into staging, in at most half of it and behind every read a record asked for,
+    /// as far as their class of guesses is named at least as often as not; the others
     /// are an upload away and are left alone.
-    pub fn transit_guess(&mut self, layer: usize, experts: &[u32]) -> Result<(), StoreError> {
+    pub fn transit_guess(
+        &mut self,
+        layer: usize,
+        experts: &[u32],
+        rows: Option<&[u32]>,
+    ) -> Result<(), StoreError> {
         if self.transit_pool(layer).is_none() || self.transit.plan.stage_slots == 0 {
             return Ok(());
         }
         let now = Instant::now();
-        for expert in experts {
+        for (at, expert) in experts.iter().enumerate() {
             let key = (layer, *expert);
             if self.transit.entries.contains_key(&key)
                 || self.vram.sets[layer].contains(*expert)
@@ -312,13 +377,23 @@ impl<D: SlotDevice> ExpertStore<D> {
             {
                 continue;
             }
+            let class = guess_class(rows.and_then(|rows| rows.get(at).copied()));
             self.transit.entries.insert(
                 key,
-                Entry { state: State::Queued, wanted: false, dropped: false, since: now },
+                Entry { state: State::Queued, wanted: false, dropped: false, since: now, class },
             );
             self.transit.guesses.push_back(key);
         }
         self.poll_transit()
+    }
+
+    /// The odds of the guesses of wide steps by class, as (named, picked) with the newer
+    /// counts weighing more: the misses of the step before first, then what a prediction
+    /// named for 1, 2, 3 to 4, 5 to 8, 9 to 16, 17 to 32, 33 to 64 and more rows.
+    pub fn transit_odds(&self) -> [(f32, f32); 9] {
+        std::array::from_fn(|class| {
+            (self.transit.odds.named[class], self.transit.odds.picked[class])
+        })
     }
 
     /// Adds to `out` the experts of `layer` that have arrived in transit since
@@ -548,6 +623,9 @@ impl<D: SlotDevice> ExpertStore<D> {
         for key in keys {
             let Some(entry) = self.transit.entries.get(&key).copied() else { continue };
             let guess = !entry.wanted;
+            if guess {
+                self.transit.odds.record(entry.class, false);
+            }
             match entry.state {
                 State::Queued => {
                     self.transit.entries.remove(&key);
@@ -880,15 +958,18 @@ impl<D: SlotDevice> ExpertStore<D> {
             }
         }
 
-        // Guesses, behind them.
+        // Guesses, behind them: those of a class that is named at least as often as not.
+        // The others stay queued without a read, for their layer's record to count.
         while let Some(key) = self.transit.guesses.front().copied() {
-            let waits = self
-                .transit
-                .entries
-                .get(&key)
-                .is_some_and(|entry| !entry.wanted && entry.state == State::Queued);
-            if waits && !self.transit_read(key, false)? {
-                break;
+            let entry = self.transit.entries.get(&key).copied();
+            let waits = entry.is_some_and(|entry| !entry.wanted && entry.state == State::Queued);
+            if waits {
+                let class = entry.map_or(0, |entry| entry.class);
+                if !self.transit.odds.worth(class) {
+                    self.stats.transit_ahead_left += 1;
+                } else if !self.transit_read(key, false)? {
+                    break;
+                }
             }
             self.transit.guesses.pop_front();
         }

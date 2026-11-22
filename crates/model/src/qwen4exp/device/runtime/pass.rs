@@ -239,13 +239,17 @@ impl Flow {
             .ok_or_else(|| invalid(format!("no rows of the pass on part {index}")))
     }
 
-    /// The next layer of a pass (`layer` of the model, on part `index`): the experts the part
-    /// computes and no tier holds are read ahead into staging, as far as the store's half of
-    /// it for guesses goes, while its micro-batches run.
+    /// The next layer of a pass of `rows` rows (`layer` of the model, on part `index`): the
+    /// experts the part computes and no tier holds are read ahead into staging, as far as the
+    /// store's half of it for guesses goes, while its micro-batches run. They count as a
+    /// prediction's that names each for the rows that pick an expert of the layer on average
+    /// (a row picks `top_k` of them), whose class of guesses (`transit.rs`) the layer's record
+    /// then counts as named or not.
     pub(super) fn guess_layer(
         &self,
         index: usize,
         layer: usize,
+        rows: u32,
         routing: &Routing,
     ) -> Result<(), ModelError> {
         let mut feed = self.lock_feed();
@@ -256,7 +260,9 @@ impl Flow {
         let n = feed.layout().shapes[at].n_experts;
         let owned = |e: &u32| routing.owned.as_ref().is_none_or(|o| o[layer][*e as usize]);
         let experts: Vec<u32> = (0..n).filter(owned).collect();
-        feed.store.transit_guess(at, &experts).map_err(|e| invalid(e.to_string()))
+        let each = (u64::from(rows) * u64::from(self.top_k) / u64::from(n.max(1))).max(1);
+        let named = vec![u32::try_from(each).unwrap_or(u32::MAX); experts.len()];
+        feed.store.transit_guess(at, &experts, Some(&named)).map_err(|e| invalid(e.to_string()))
     }
 
     /// Whether the pass `key` holds its loan and has not read all its rows.
@@ -630,7 +636,7 @@ impl Qwen4ExpDevice {
             // run: what no tier holds of it is read ahead meanwhile.
             if i + 1 < n_layers {
                 let layer = self.part.layer_range().start + i + 1;
-                self.flow.guess_layer(self.index, layer, &self.routing)?;
+                self.flow.guess_layer(self.index, layer, key.rows, &self.routing)?;
             }
             self.flow.pump()?;
             run.layer += 1;

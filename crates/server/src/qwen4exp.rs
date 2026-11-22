@@ -1236,6 +1236,16 @@ fn watch_reads(model: std::sync::Weak<Qwen4Exp>) {
                     s(wide.round_wait),
                     s(wide.layer_time),
                 );
+                if let Some(odds) = model.guess_odds() {
+                    let named = |(n, p): (f32, f32)| format!("{:.0} of {:.0}", p, n);
+                    tracing::info!(
+                        "guesses of wide steps named by their layer's record, newer counts \
+                         weighing more: the step before's misses {}; predicted for 1, 2, 3-4, \
+                         5-8, 9-16, 17-32, 33-64, more rows: {}",
+                        named(odds[0]),
+                        join(odds[1..].iter().map(|o| named(*o)), ", "),
+                    );
+                }
             }
         }
     };
