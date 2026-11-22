@@ -167,7 +167,7 @@ fn build(
             // SAFETY: the pools hold every slot the tables name.
             unsafe {
                 append_kv(
-                    &kernels,
+                    kernels,
                     stream,
                     &geo,
                     st.rows.ptr(),
@@ -181,7 +181,7 @@ fn build(
                 )?;
                 if let Some((jobs, n)) = &st.jobs {
                     convert_kv(
-                        &kernels,
+                        kernels,
                         stream,
                         &geo,
                         jobs.ptr(),
