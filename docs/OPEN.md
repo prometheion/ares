@@ -531,7 +531,11 @@ becomes a block is in `ARCHITECTURE.md` ("The shared model layer"). Left, in the
       together with other sequences); its cost with three sequences was not measured.
 
 ## Drafters (every model)
-- [ ] Blackwell (the owner, 2026-11-22: an RTX 5060 Ti is ordered for the test machine). Ares
+- [ ] Blackwell (the owner, 2026-11-22: an RTX 5060 Ti is ordered for the test machine, next to
+      its RTX 4060 Ti; an MCIO Gen5 splitter makes the x16 slot two x8: the 5060 Ti at Gen5 x8, the
+      4060 Ti at Gen4 x8, twice the link it has today, so the link-bound numbers measured there at
+      x4 must be taken again). Two cards of two generations there: placements across Ada and
+      Blackwell, peer access only if that machine's driver allows it. Ares
       compiles sm_120 code (`crates/cuda/build.rs`) but has never run it. When the card is in: the
       whole GPU suite on it; then Blackwell's own paths where they pay, measured: FP4 tensor cores
       for NVFP4 and MXFP4 weights (Strata 0.1.65 names `dense_fp4_tc` and `moe_fp4_tc`), FP8; the
