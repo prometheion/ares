@@ -34,12 +34,12 @@ impl Rng {
 }
 
 /// The state of the cell that follows `previous` and holds `token`.
-fn cell_state(previous: u64, token: u32) -> u64 {
+fn cell_state(previous: u64, token: u64) -> u64 {
     (previous ^ u64::from(token)).wrapping_mul(0x9e37_79b9_7f4a_7c15).rotate_left(23) ^ 0x51
 }
 
 struct Live {
-    tokens: Vec<u32>,
+    tokens: Vec<u64>,
     seq: Sequence,
 }
 
@@ -60,7 +60,7 @@ impl World {
 
     /// Appends `tokens` to sequence `i` and computes their cells. Returns
     /// false, with nothing changed, when the pool is too small.
-    fn append(&mut self, i: usize, tokens: &[u32]) -> bool {
+    fn append(&mut self, i: usize, tokens: &[u64]) -> bool {
         let Ok(grown) = self.live[i].seq.append(&mut self.pool, tokens.len() as u64) else {
             return false;
         };
@@ -140,7 +140,7 @@ fn sequences_never_see_each_others_state() {
             live: Vec::new(),
         };
         // A small alphabet makes prompts share prefixes by chance as well.
-        let token = |rng: &mut Rng| rng.below(3) as u32;
+        let token = |rng: &mut Rng| rng.below(3);
 
         for _ in 0..4000 {
             let n_live = world.live.len();
@@ -170,7 +170,7 @@ fn sequences_never_see_each_others_state() {
                 // Generation: a few more tokens.
                 15..=49 if n_live > 0 => {
                     let i = rng.below(n_live as u64) as usize;
-                    let tokens: Vec<u32> = (0..1 + rng.below(6)).map(|_| token(&mut rng)).collect();
+                    let tokens: Vec<u64> = (0..1 + rng.below(6)).map(|_| token(&mut rng)).collect();
                     world.append(i, &tokens);
                 }
                 // Rejected drafts: roll back a few cells.

@@ -51,23 +51,23 @@ impl Rng {
 }
 
 /// The state of the cell that follows `previous` and holds `token`.
-fn cell_state(previous: u64, token: u32) -> u64 {
+fn cell_state(previous: u64, token: u64) -> u64 {
     (previous ^ u64::from(token)).wrapping_mul(0x9e37_79b9_7f4a_7c15).rotate_left(23) ^ 0x51
 }
 
 /// The recurrent state after `token`, from the state before it.
-fn recurrent(previous: u64, token: u32) -> u64 {
+fn recurrent(previous: u64, token: u64) -> u64 {
     (previous.rotate_left(11) ^ u64::from(token)).wrapping_mul(0xd6e8_feb8_6659_fd93) ^ 0x1f
 }
 
-fn recurrent_of(tokens: &[u32]) -> u64 {
+fn recurrent_of(tokens: &[u64]) -> u64 {
     tokens.iter().fold(0, |state, token| recurrent(state, *token))
 }
 
 struct Live {
     owner: Owner,
     /// The prompt and what was generated. The first `seq.len()` are computed.
-    tokens: Vec<u32>,
+    tokens: Vec<u64>,
     prompt_len: usize,
     seq: Sequence,
     chain: Chain,
@@ -81,7 +81,7 @@ struct Live {
 
 /// A prompt that waits for a page another sequence computes.
 struct Held {
-    tokens: Vec<u32>,
+    tokens: Vec<u64>,
     chain: Chain,
     awaited: ChainHash,
 }
@@ -89,7 +89,7 @@ struct Held {
 /// What the test stores for a checkpoint: the text it is the state of, the
 /// state, and who published it.
 struct Stored {
-    text: Vec<u32>,
+    text: Vec<u64>,
     state: u64,
     by: Owner,
 }
@@ -104,7 +104,7 @@ struct World {
     live: Vec<Live>,
     held: Vec<Held>,
     /// Texts of sequences that ended, to continue as conversations.
-    ended: Vec<Vec<u32>>,
+    ended: Vec<Vec<u64>>,
     checkpoints: HashMap<CheckpointId, Stored>,
     next_owner: u64,
     next_checkpoint: u64,
@@ -145,7 +145,7 @@ impl World {
 
     /// Keeps `state`, the recurrent state after `text`, at the entry or tail
     /// `hash`, unless there is a checkpoint there already.
-    fn capture(&mut self, hash: ChainHash, text: &[u32], state: u64, by: Owner) {
+    fn capture(&mut self, hash: ChainHash, text: &[u64], state: u64, by: Owner) {
         if self.index.checkpoint(hash).is_some() || self.policy.capacity() == 0 {
             return;
         }
@@ -187,7 +187,7 @@ impl World {
     /// Starts `tokens` as a prompt, or holds it back when the page it misses
     /// first is being computed. `named` is the prompt's chain when it was
     /// named before (a prompt that waited).
-    fn submit(&mut self, tokens: Vec<u32>, named: Option<Chain>, class: Priority) {
+    fn submit(&mut self, tokens: Vec<u64>, named: Option<Chain>, class: Priority) {
         let named = named.unwrap_or_else(|| {
             let mut chain = Chain::new(self.root, PER_PAGE);
             chain.name(&tokens);
@@ -266,7 +266,7 @@ impl World {
         let before = self.live[i].seq.len();
         let prompt_len = self.live[i].prompt_len;
         while (self.live[i].tokens.len() as u64) < before + rows {
-            self.live[i].tokens.push(rng.below(3) as u32);
+            self.live[i].tokens.push(rng.below(3));
         }
         let Ok(grown) = self.live[i].seq.append(&mut self.pool, rows) else {
             self.live[i].tokens.truncate(prompt_len.max(before as usize));
@@ -467,7 +467,7 @@ fn run(seed: u64, budget: u64, stats: &mut Stats) {
         stats: Stats::default(),
     };
     // A small alphabet makes texts share prefixes by chance as well.
-    let token = |rng: &mut Rng| rng.below(3) as u32;
+    let token = |rng: &mut Rng| rng.below(3);
 
     for _ in 0..5000 {
         let n_live = world.live.len();

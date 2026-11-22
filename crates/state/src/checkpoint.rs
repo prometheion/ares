@@ -798,7 +798,7 @@ mod tests {
         pool: &mut PagePool,
         index: &mut PrefixIndex,
         root: ChainHash,
-        tokens: &[u32],
+        tokens: &[u64],
     ) -> (Sequence, crate::Chain) {
         let found = index.lookup(root, tokens, PER_PAGE);
         let mut seq = Sequence::from_shared(pool, &found.table(), found.cells(PER_PAGE));
@@ -814,7 +814,7 @@ mod tests {
         let mut pool = PagePool::new(64, PER_PAGE);
         let mut index = PrefixIndex::new();
         let root = ChainHash::root(b"m");
-        let text: Vec<u32> = (0..23).collect();
+        let text: Vec<u64> = (0..23).collect();
         let (seq, chain) = run(&mut pool, &mut index, root, &text);
         // 5 full pages and a tail of 3 cells; a checkpoint after page 2.
         let tail = seq.pages()[5];
@@ -827,7 +827,7 @@ mod tests {
         // replays 8..23 because the tail has no checkpoint.
         let mut prompt = text.clone();
         prompt.extend([100, 101, 102]);
-        let lookup = |index: &mut PrefixIndex, prompt: &[u32]| {
+        let lookup = |index: &mut PrefixIndex, prompt: &[u64]| {
             index.lookup(root, &prompt[..prompt.len() - 1], PER_PAGE)
         };
         let found = lookup(&mut index, &prompt);
@@ -898,10 +898,10 @@ mod tests {
         root: ChainHash,
         turns: &[(u64, std::ops::Range<u32>, &[u64])],
         next_id: &mut u64,
-    ) -> Vec<u32> {
-        let mut text: Vec<u32> = Vec::new();
+    ) -> Vec<u64> {
+        let mut text: Vec<u64> = Vec::new();
         for (request, tokens, checkpoints) in turns {
-            text.extend(tokens.clone());
+            text.extend(tokens.clone().map(u64::from));
             let (seq, chain) = run(pool, index, root, &text);
             for position in *checkpoints {
                 *next_id += 1;
@@ -987,7 +987,7 @@ mod tests {
         let mut id = 0;
         // One request leaves checkpoints at 8 (its root), 12, 20, 24, 32, 36.
         conversation(&mut pool, &mut index, root, &[(1, 0..40, &[8, 12, 20, 24, 32, 36])], &mut id);
-        let hashes = index.lookup(root, &(0..40).collect::<Vec<u32>>(), PER_PAGE).hashes;
+        let hashes = index.lookup(root, &(0..40).collect::<Vec<u64>>(), PER_PAGE).hashes;
         assert!(index.mark_root(hashes[1]));
         assert!(!index.mark_root(hashes[0]), "no checkpoint there");
         // The newest three are fresh; the root never ages and goes last.
@@ -1010,7 +1010,7 @@ mod tests {
         assert_eq!(left, [32, 24, 8]);
         // A later turn leaves the root behind on its branch: it is still not
         // aged, and not left behind for a level without tails.
-        let text: Vec<u32> = (0..48).collect();
+        let text: Vec<u64> = (0..48).collect();
         let (seq, chain) = run(&mut pool, &mut index, root, &text);
         index.attach_checkpoint(chain.hashes()[10], CheckpointId(90), Owner(2)).unwrap();
         seq.release(&mut pool);
@@ -1040,7 +1040,7 @@ mod tests {
         for (request, len) in [(2u64, 22u32), (3, 23)] {
             let mut seq = Sequence::from_shared(&mut pool, &found.pages, 20);
             seq.append(&mut pool, u64::from(len - 20)).unwrap();
-            let tokens: Vec<u32> = (20..len).collect();
+            let tokens: Vec<u64> = (20..u64::from(len)).collect();
             index.insert_tail(&mut pool, prior, &tokens, seq.pages()[5], Priority::NORMAL);
             let tail = PrefixIndex::tail_hash(prior, &tokens);
             index.attach_checkpoint(tail, CheckpointId(60 + request), Owner(request)).unwrap();

@@ -1,8 +1,11 @@
 //! Finding cached state for the start of a prompt.
 //!
 //! Every full page of a sequence can be named by a hash of everything that
-//! determines its content: the context it was computed in and all tokens up
-//! to its end. The hashes form a chain (each page's hash extends the previous
+//! determines its content: the context it was computed in and the names of
+//! all cells up to its end. A cell's name is 64 bits: a text cell's is its
+//! token, an image cell's has the top bit set and the rest from what the
+//! image is and which of its rows the cell holds (the runtime makes them).
+//! The "tokens" of this module are these names. The hashes form a chain (each page's hash extends the previous
 //! one), so the longest cached prefix of a new prompt is found by walking its
 //! pages from the start until the index has no entry.
 //!
@@ -101,10 +104,9 @@ impl ChainHash {
     }
 
     /// The hash of the page that follows `self` and holds `tokens`.
-    pub fn extend(self, tokens: &[u32]) -> Self {
+    pub fn extend(self, tokens: &[u64]) -> Self {
         let (mut a, mut b) = (self.0 as u64 ^ K[0], (self.0 >> 64) as u64 ^ K[1]);
-        for token in tokens {
-            let token = u64::from(*token);
+        for &token in tokens {
             a = fold(a ^ token ^ K[4], K[2]);
             b = fold(b ^ token.rotate_left(32) ^ K[5], K[3]);
         }
@@ -181,7 +183,7 @@ pub(crate) struct Entry {
 
 pub(crate) struct Tail {
     pub(crate) hash: ChainHash,
-    pub(crate) tokens: Vec<u32>,
+    pub(crate) tokens: Vec<u64>,
     page: PageId,
     pub(crate) last_used: u64,
     class: Priority,
@@ -264,7 +266,7 @@ pub struct Evicted {
     /// number of the page it hangs under (0 under the root).
     pub depth: u32,
     /// A tail's tokens; `None` for a full page.
-    pub tail: Option<Vec<u32>>,
+    pub tail: Option<Vec<u64>>,
 }
 
 /// A cached page as [`PrefixIndex::cached_pages`] lists it.
@@ -310,7 +312,7 @@ impl Chain {
     /// the sequence's text from its start and must begin with the text named
     /// so far. Naming the whole prompt ahead is what [`PrefixIndex::announce`]
     /// needs.
-    pub fn name(&mut self, tokens: &[u32]) {
+    pub fn name(&mut self, tokens: &[u64]) {
         let per_page = self.cells_per_page as usize;
         let mut hash = self.hashes.last().copied().unwrap_or(self.root);
         for page in tokens.chunks_exact(per_page).skip(self.hashes.len()) {
@@ -468,7 +470,7 @@ impl PrefixIndex {
     /// A request needs the logits after its last prompt token, so that row is
     /// always computed: look up the prompt without its last token, and the
     /// match can never cover it.
-    pub fn lookup(&mut self, root: ChainHash, tokens: &[u32], cells_per_page: u32) -> PrefixMatch {
+    pub fn lookup(&mut self, root: ChainHash, tokens: &[u64], cells_per_page: u32) -> PrefixMatch {
         let per_page = cells_per_page as usize;
         let mut found = PrefixMatch::default();
         let mut hash = root;
@@ -491,7 +493,7 @@ impl PrefixIndex {
     /// [`PrefixIndex::lookup`] for a prompt whose pages are named already
     /// (`chain` was given the prompt with [`Chain::name`]), so that looking
     /// again costs no hashing. `tokens` is the same text as for `lookup`.
-    pub fn lookup_chain(&mut self, chain: &Chain, tokens: &[u32]) -> PrefixMatch {
+    pub fn lookup_chain(&mut self, chain: &Chain, tokens: &[u64]) -> PrefixMatch {
         let per_page = chain.cells_per_page as usize;
         let mut found = PrefixMatch::default();
         let mut hash = chain.root;
@@ -512,7 +514,7 @@ impl PrefixIndex {
 
     /// The tail under `prior` that shares the most leading tokens with
     /// `rest`, if any shares one.
-    fn match_tail(&mut self, prior: ChainHash, rest: &[u32]) -> Option<TailMatch> {
+    fn match_tail(&mut self, prior: ChainHash, rest: &[u64]) -> Option<TailMatch> {
         let tails = self.tails.get(&prior)?;
         let (best, cells) = tails
             .iter()
@@ -626,7 +628,7 @@ impl PrefixIndex {
         hash: ChainHash,
         page: PageId,
         class: Priority,
-        tokens: &[u32],
+        tokens: &[u64],
     ) -> Option<PageId> {
         if let Some(entry) = self.entries.get_mut(&hash) {
             let known = entry.page;
@@ -690,7 +692,7 @@ impl PrefixIndex {
         pool: &mut PagePool,
         seq: &mut Sequence,
         chain: &mut Chain,
-        tokens: &[u32],
+        tokens: &[u64],
         settled: u64,
         class: Priority,
     ) -> Range<usize> {
@@ -750,7 +752,7 @@ impl PrefixIndex {
         &mut self,
         pool: &mut PagePool,
         prior: ChainHash,
-        tokens: &[u32],
+        tokens: &[u64],
         page: PageId,
         class: Priority,
     ) -> Option<Evicted> {
@@ -790,7 +792,7 @@ impl PrefixIndex {
     }
 
     /// The name of the tail that holds `tokens` after `prior`.
-    pub fn tail_hash(prior: ChainHash, tokens: &[u32]) -> ChainHash {
+    pub fn tail_hash(prior: ChainHash, tokens: &[u64]) -> ChainHash {
         prior.extend(tokens)
     }
 
@@ -1028,7 +1030,7 @@ mod tests {
         index: &mut PrefixIndex,
         root: ChainHash,
         seq: &mut Sequence,
-        tokens: &[u32],
+        tokens: &[u64],
     ) {
         seq.append(pool, tokens.len() as u64).unwrap();
         let per_page = pool.cells_per_page() as usize;
@@ -1058,7 +1060,7 @@ mod tests {
         let mut pool = PagePool::new(16, PER_PAGE);
         let mut index = PrefixIndex::new();
         let root = ChainHash::root(b"m");
-        let system: Vec<u32> = (100..110).collect();
+        let system: Vec<u64> = (100..110).collect();
 
         let mut first = Sequence::new();
         cache(&mut pool, &mut index, root, &mut first, &system);
@@ -1094,8 +1096,8 @@ mod tests {
         let mut index = PrefixIndex::new();
         let root = ChainHash::root(b"m");
 
-        let old: Vec<u32> = (0..8).collect();
-        let new: Vec<u32> = (50..58).collect();
+        let old: Vec<u64> = (0..8).collect();
+        let new: Vec<u64> = (50..58).collect();
         let (mut a, mut b) = (Sequence::new(), Sequence::new());
         cache(&mut pool, &mut index, root, &mut a, &old);
         cache(&mut pool, &mut index, root, &mut b, &new);
@@ -1124,7 +1126,7 @@ mod tests {
         let mut pool = PagePool::new(16, PER_PAGE);
         let mut index = PrefixIndex::new();
         let root = ChainHash::root(b"m");
-        let tokens: Vec<u32> = (0..12).collect();
+        let tokens: Vec<u64> = (0..12).collect();
         let mut seq = Sequence::new();
         cache(&mut pool, &mut index, root, &mut seq, &tokens);
 
@@ -1156,7 +1158,7 @@ mod tests {
         let mut pool = PagePool::new(16, PER_PAGE);
         let mut index = PrefixIndex::new();
         let root = ChainHash::root(b"m");
-        let tokens: Vec<u32> = (0..4).collect();
+        let tokens: Vec<u64> = (0..4).collect();
         let (mut a, mut b) = (Sequence::new(), Sequence::new());
         cache(&mut pool, &mut index, root, &mut a, &tokens);
         // A second sequence computed the same page on its own.
@@ -1172,7 +1174,7 @@ mod tests {
 
     /// A running sequence with its text and chain, as the conductor keeps it.
     struct Running {
-        tokens: Vec<u32>,
+        tokens: Vec<u64>,
         seq: Sequence,
         chain: Chain,
     }
@@ -1184,7 +1186,7 @@ mod tests {
             pool: &mut PagePool,
             index: &mut PrefixIndex,
             root: ChainHash,
-            prompt: &[u32],
+            prompt: &[u64],
         ) -> Self {
             let found = index.lookup(root, &prompt[..prompt.len() - 1], PER_PAGE);
             let cells = found.cells(PER_PAGE);
@@ -1194,7 +1196,7 @@ mod tests {
         }
 
         /// Computes `tokens` and publishes the pages they fill.
-        fn step(&mut self, pool: &mut PagePool, index: &mut PrefixIndex, tokens: &[u32]) -> Grown {
+        fn step(&mut self, pool: &mut PagePool, index: &mut PrefixIndex, tokens: &[u64]) -> Grown {
             let grown = self.seq.append(pool, tokens.len() as u64).unwrap();
             self.tokens.extend_from_slice(tokens);
             let settled = self.tokens.len() as u64;
@@ -1226,7 +1228,7 @@ mod tests {
         let mut pool = PagePool::new(16, PER_PAGE);
         let mut index = PrefixIndex::new();
         let root = ChainHash::root(b"m");
-        let prompt: Vec<u32> = (0..11).collect();
+        let prompt: Vec<u64> = (0..11).collect();
 
         // The first request has read 5 tokens of its prompt and is running.
         let mut first = Running::start(&mut pool, &mut index, root, &prompt);
@@ -1275,7 +1277,7 @@ mod tests {
         let mut pool = PagePool::new(16, PER_PAGE);
         let mut index = PrefixIndex::new();
         let root = ChainHash::root(b"m");
-        let text: Vec<u32> = (0..9).collect();
+        let text: Vec<u64> = (0..9).collect();
         // Two requests started before either had filled a page, so both
         // compute the first two pages.
         let mut a = Running::start(&mut pool, &mut index, root, &text);
@@ -1307,7 +1309,7 @@ mod tests {
         let root = ChainHash::root(b"m");
         // A conversation's first turn: 6 tokens, so one full page and two
         // cells in the next.
-        let turn: Vec<u32> = (0..6).collect();
+        let turn: Vec<u64> = (0..6).collect();
         let mut first = Running::start(&mut pool, &mut index, root, &turn);
         first.step(&mut pool, &mut index, &turn);
         first.publish_tail(&mut pool, &mut index);
@@ -1352,7 +1354,7 @@ mod tests {
         let mut pool = PagePool::new(16, PER_PAGE);
         let mut index = PrefixIndex::new();
         let root = ChainHash::root(b"m");
-        let prompt: Vec<u32> = (0..6).collect();
+        let prompt: Vec<u64> = (0..6).collect();
         // A tail at the end of the prompt, then the request generates.
         let mut a = Running::start(&mut pool, &mut index, root, &prompt);
         a.step(&mut pool, &mut index, &prompt);
@@ -1391,7 +1393,7 @@ mod tests {
             let mut seq = Sequence::new();
             seq.append(&mut pool, 2).unwrap();
             assert_eq!(
-                index.insert_tail(&mut pool, root, &[1, 100 + i], seq.pages()[0], Priority::NORMAL),
+                index.insert_tail(&mut pool, root, &[1, 100 + u64::from(i)], seq.pages()[0], Priority::NORMAL),
                 None
             );
             pages.push(seq.pages()[0]);
@@ -1466,7 +1468,7 @@ mod tests {
         let mut pool = PagePool::new(16, PER_PAGE);
         let mut index = PrefixIndex::new();
         let root = ChainHash::root(b"m");
-        let prompt: Vec<u32> = (0..13).collect();
+        let prompt: Vec<u64> = (0..13).collect();
 
         // The first request names its prompt's pages and announces them.
         let mut first = Running::start(&mut pool, &mut index, root, &prompt);
@@ -1521,7 +1523,7 @@ mod tests {
         let keep = Priority(200);
         // An old system prompt that was asked to be kept, then two newer
         // prompts of the normal class.
-        let system: Vec<u32> = (0..8).collect();
+        let system: Vec<u64> = (0..8).collect();
         let mut seq = Sequence::new();
         let mut chain = Chain::new(root, PER_PAGE);
         seq.append(&mut pool, 8).unwrap();
@@ -1529,8 +1531,8 @@ mod tests {
         let system_pages = seq.pages().to_vec();
         seq.release(&mut pool);
         let mut newer = Vec::new();
-        for start in [100u32, 200] {
-            let tokens: Vec<u32> = (start..start + 4).collect();
+        for start in [100u64, 200] {
+            let tokens: Vec<u64> = (start..start + 4).collect();
             let mut run = Running::start(&mut pool, &mut index, root, &tokens);
             run.step(&mut pool, &mut index, &tokens);
             newer.push(run.seq.pages()[0]);
@@ -1548,7 +1550,7 @@ mod tests {
         a.step(&mut pool, &mut index, &system);
         assert!(index.set_priority(a.chain.hashes()[1], Priority(1)));
         assert!(!index.set_priority(root, Priority(1)));
-        let other: Vec<u32> = (300..304).collect();
+        let other: Vec<u64> = (300..304).collect();
         let mut b = Running::start(&mut pool, &mut index, root, &other);
         b.step(&mut pool, &mut index, &other);
         // A second sequence computed the same page and publishes it in the
@@ -1575,7 +1577,7 @@ mod tests {
         let mut pool = PagePool::new(32, PER_PAGE);
         let mut index = PrefixIndex::new();
         let root = ChainHash::root(b"m");
-        let long: Vec<u32> = (0..18).collect();
+        let long: Vec<u64> = (0..18).collect();
         let mut a = Running::start(&mut pool, &mut index, root, &long);
         a.step(&mut pool, &mut index, &long);
         a.publish_tail(&mut pool, &mut index);
@@ -1587,7 +1589,7 @@ mod tests {
         // A page inserted by hand under a page that a sequence does not hold:
         // the sequence holds the child and not the parent, and the parent is
         // still not evictable.
-        let other: Vec<u32> = (500..508).collect();
+        let other: Vec<u64> = (500..508).collect();
         let (mut b, mut c) = (Sequence::new(), Sequence::new());
         b.append(&mut pool, 8).unwrap();
         c.append(&mut pool, 8).unwrap();
