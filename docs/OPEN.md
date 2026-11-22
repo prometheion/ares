@@ -787,7 +787,11 @@ DSpark drafter `dspark-Inkling-2-Mini-Q8_0.gguf`, 0.4 GB). Notes: `/var/tmp/ares
       Its numbers (one H200, OneJev1.6-0.8B): one email of eight questions in 10.0 ms, 10,000
       in 28 s; "up to 9.5 times faster than vLLM and SGLang".
 - [ ] Turing. Later.
-- [ ] K/V of a running sequence beyond VRAM (P16; an exception, low priority).
+- [ ] K/V of a running sequence beyond VRAM (P16; an exception, low priority). The owner,
+      2026-11-22: without `--context` a model gets its own context always, and what of it does not
+      fit in VRAM overflows into RAM. The plan says what was wanted and what of it is in VRAM
+      (`plan::ContextPlan { wanted, in_vram }`); until the overflow is built the context is what
+      VRAM holds, with a log line.
 
 ## Weight types (`moe/q4-load`, 2026-11-17)
 Every tensor of both models takes every weight type the shape allows (the audit of every place
