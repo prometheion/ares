@@ -178,6 +178,8 @@ struct EngMmLegacy4 {
         uint32_t dm, qh, q[4];
     };
 
+    // PIECES: the large shape of the tile kernels asks for 16-byte pieces (ares_ld_words_a2).
+    template <bool PIECES = false>
     static __device__ __forceinline__ Raw load(const uint8_t* row, uint32_t chunk, uint32_t item) {
         constexpr int QH_AT = HAS_M ? 4 : 2;
         constexpr int QS_AT = QH_AT + (HAS_QH ? 4 : 0);
@@ -198,7 +200,7 @@ struct EngMmLegacy4 {
             if constexpr (HAS_QH) {
                 r.qh = ares_ld_stream_u32_a2(blk + QH_AT);
             }
-            ares_ld_words_a2<4>(blk + QS_AT, r.q);
+            ares_ld_words_a2<4, PIECES>(blk + QS_AT, r.q);
         }
         return r;
     }

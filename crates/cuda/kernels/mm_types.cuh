@@ -166,13 +166,15 @@ struct EngMmQ6K {
         uint32_t scales, d;
     };
 
+    // PIECES: the large shape of the tile kernels asks for 16-byte pieces (ares_ld_words_a2).
+    template <bool PIECES = false>
     static __device__ __forceinline__ Raw load(const uint8_t* row, uint32_t chunk, uint32_t item) {
         const uint8_t* blk = row + static_cast<size_t>(chunk >> 2) * BLOCK_BYTES;
         const uint32_t hh = (chunk >> 1) & 1;
         const uint32_t k = 2 * (chunk & 1) + item;
         Raw r;
-        ares_ld_words_a2<8>(blk + 64 * hh + 32 * (k & 1), r.ql);
-        ares_ld_words_a2<8>(blk + 128 + 32 * hh, r.qh);
+        ares_ld_words_a2<8, PIECES>(blk + 64 * hh + 32 * (k & 1), r.ql);
+        ares_ld_words_a2<8, PIECES>(blk + 128 + 32 * hh, r.qh);
         r.scales = ares_ld_stream_u16(blk + 192 + 8 * hh + 2 * k);
         r.d = ares_ld_stream_u16(blk + 208);
         return r;
@@ -218,13 +220,15 @@ struct EngMmQ3K {
         uint32_t d;
     };
 
+    // PIECES: the large shape of the tile kernels asks for 16-byte pieces (ares_ld_words_a2).
+    template <bool PIECES = false>
     static __device__ __forceinline__ Raw load(const uint8_t* row, uint32_t chunk, uint32_t item) {
         const uint8_t* blk = row + static_cast<size_t>(chunk >> 2) * BLOCK_BYTES;
         const uint32_t hh = (chunk >> 1) & 1;
         Raw r;
-        ares_ld_words_a2<8>(blk + 32 + 32 * hh, r.qs);
-        ares_ld_words_a2<8>(blk, r.hm);
-        ares_ld_words_a2<3>(blk + 96, r.sw);
+        ares_ld_words_a2<8, PIECES>(blk + 32 + 32 * hh, r.qs);
+        ares_ld_words_a2<8, PIECES>(blk, r.hm);
+        ares_ld_words_a2<3, PIECES>(blk + 96, r.sw);
         r.d = ares_ld_stream_u16(blk + 108);
         return r;
     }
@@ -322,10 +326,12 @@ struct EngMmIQ4NL {
         uint32_t d;
     };
 
+    // PIECES: the large shape of the tile kernels asks for 16-byte pieces (ares_ld_words_a2).
+    template <bool PIECES = false>
     static __device__ __forceinline__ Raw load(const uint8_t* row, uint32_t chunk, uint32_t item) {
         const uint8_t* blk = row + static_cast<size_t>(2 * chunk + item) * BLOCK_BYTES;
         Raw r;
-        ares_ld_words_a2<4>(blk + 2, r.q);
+        ares_ld_words_a2<4, PIECES>(blk + 2, r.q);
         r.d = ares_ld_stream_u16(blk);
         return r;
     }
@@ -363,10 +369,12 @@ struct EngMmQ80 {
         uint32_t d;
     };
 
+    // PIECES: the large shape of the tile kernels asks for 16-byte pieces (ares_ld_words_a2).
+    template <bool PIECES = false>
     static __device__ __forceinline__ Raw load(const uint8_t* row, uint32_t chunk, uint32_t item) {
         const uint8_t* blk = row + static_cast<size_t>(2 * chunk + item) * BLOCK_BYTES;
         Raw r;
-        ares_ld_words_a2<8>(blk + 2, r.q);
+        ares_ld_words_a2<8, PIECES>(blk + 2, r.q);
         r.d = ares_ld_stream_u16(blk);
         return r;
     }
