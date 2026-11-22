@@ -420,9 +420,6 @@ pub struct StoreStats {
     /// that became members like any other by their heat, without a copy.
     pub loans: u64,
     pub loans_kept: u64,
-    /// Of the loans, those uploaded behind a miss the CPU computed for the
-    /// step, which no step waited for.
-    pub loans_behind: u64,
     /// Milliseconds the reads of experts a step waited for took, from their
     /// start to the bytes being in RAM, summed over the experts.
     pub demand_read_ms: f64,
