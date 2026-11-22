@@ -930,7 +930,15 @@ impl<D: SlotDevice> ExpertStore<D> {
         for (_, layer, expert, leaves) in wanted {
             let device = self.layers[layer].device;
             let in_flight = self.hybrid.as_ref().map_or(usize::MAX, |h| h.in_flight[device]);
-            if in_flight >= room[device] || !self.ram.sets[layer].contains(expert) {
+            // A free slot costs nothing to fill: only swaps wait for the link to have room
+            // beside the steps. A loan of VRAM gives its slots back empty by the thousand, and
+            // filled a step's room at a time they left decode with a part of its experts for a
+            // reply's length (13.4 against 36 tokens/s after a prompt of 7227 tokens on the
+            // local cards); filled at once, the split of the steps' misses sees the queue of
+            // the link and gives the CPU what would wait behind it.
+            if (leaves.is_some() && in_flight >= room[device])
+                || !self.ram.sets[layer].contains(expert)
+            {
                 continue;
             }
             // The member that leaves goes on loan first: the upload takes the

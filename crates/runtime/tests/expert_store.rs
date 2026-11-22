@@ -886,6 +886,48 @@ mod hybrid {
         );
     }
 
+    /// The slots a loan of VRAM gives back come back empty, many at once: the step that ends
+    /// after it fills every one of them with a hot expert of RAM, not a step's room on the link
+    /// at a time (which is one here: the link is slow), as long as RAM holds hot experts. Swaps
+    /// still wait for room.
+    #[test]
+    fn the_slots_a_loan_gives_back_fill_at_once() {
+        let mut rig = rig(8, 16, Serve::Measured);
+        {
+            let model = rig.store.cost_model_mut().expect("a CPU half");
+            for _ in 0..64 {
+                model.record_upload(0, Duration::from_secs(1));
+            }
+        }
+        let act = rig.act.clone();
+        // Steps that use twelve experts of every layer, two at a time: the tiers learn them.
+        for step in 0..30u32 {
+            rig.store.begin_step();
+            for layer in 0..LAYERS {
+                let a = (step * 2) % 12;
+                let groups = [group(a, 0.5), group(a + 1, 0.5)];
+                rig.store.routed_rows(layer, step, 1, &groups, &act).unwrap();
+                rig.until("served", |store| store.is_settled() && store.device(0).waiting() == 0);
+            }
+            rig.store.end_step().unwrap();
+            rig.until("settled", |store| store.is_settled() && store.device(0).waiting() == 0);
+        }
+        let lendable = rig.store.lendable_scratch(0);
+        let loan = rig.store.lend_scratch(0, lendable / 2).unwrap().expect("a loan");
+        rig.until("lent", |store| store.is_settled());
+        assert!(rig.store.scratch_ready(0).unwrap());
+        rig.store.return_scratch(0).unwrap();
+        rig.store.take_stats();
+        rig.store.begin_step();
+        rig.store.end_step().unwrap();
+        let promotions = rig.store.stats().promotions;
+        assert!(
+            promotions >= u64::from(loan.slots).min(4),
+            "{promotions} promotions into {} slots given back",
+            loan.slots
+        );
+    }
+
     #[test]
     fn the_cpu_computes_what_a_step_misses() {
         let mut rig = rig(4, 4, Serve::Cpu);
