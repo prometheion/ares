@@ -1152,6 +1152,11 @@ impl Conductor {
         if !images.is_empty() && self.vision.is_none() {
             return refuse(EngineError::InvalidRequest("the model reads no images".into()));
         }
+        if !images.is_empty() && self.stage_rows == 0 {
+            return refuse(EngineError::Internal(
+                "the executor has no image stage for the rows of images".into(),
+            ));
+        }
         // The names of the cells: an image's by the image and its row.
         let mut names: Vec<u64> = prompt.iter().map(|t| u64::from(*t)).collect();
         for span in &images {
