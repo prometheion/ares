@@ -629,7 +629,27 @@ impl<'g> Session<'g> {
         }
         config.cpu_serves = opts.serve != Serve::Stream;
         if opts.part.max_rows > MAX_BATCH {
-            plan_transit(&mut config, &layout, &reader, opts.transit);
+            // What each device has left beside its parts, less what the
+            // store keeps besides its slots: its tables, the host shares and
+            // the margin `Placement` counts.
+            let tables = 4 * layout.specs.len() as u64 * c.experts.count as u64;
+            let shares = if opts.serve == Serve::Stream {
+                0
+            } else {
+                layout.specs.len() as u64
+                    * layout.shapes[0]
+                        .host_share_bytes(opts.part.max_rows.min(MAX_BATCH))
+                        .next_multiple_of(16)
+            };
+            let room: Vec<u64> = ledgers
+                .iter()
+                .map(|l| {
+                    l.free()
+                        .saturating_sub(super::placement::MARGIN + tables + shares)
+                        .min(opts.slot_bytes.unwrap_or(u64::MAX))
+                })
+                .collect();
+            plan_transit(&mut config, &layout, &reader, opts.transit, &room);
         }
         let reserve = config.vram_reserve;
         let plan = StorePlan::new(config, &map, &reader, &layout.specs, None)?;

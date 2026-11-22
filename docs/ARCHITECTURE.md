@@ -4743,7 +4743,12 @@ width (`device/part/wide.rs`, `device/misses.rs`):
   from the bytes for slots: a slot less for every layer), staging twice the experts of a layer that no tier holds (165 to 250
   slots here, by the RAM the tier got), at most an eighth of each tier. A tier that has only the slots a decode step needs has no
   transit: its misses come into the layer's slots in batches, each giving way to the next
-  (`ExpertStore::routed`), as all misses did before transit.
+  (`ExpertStore::routed`), as all misses did before transit. A device with room for a slot
+  for every expert it owns has bytes for slots cut to its experts and a 64th; its transit
+  comes on top of that, as far as its room goes (taken from it, the 64th held three of the
+  six transit slots a split by layers of the test model got, and every layer a slot fewer
+  than its experts: `qwen4exp_runtime`'s test of steps of 196 rows found 376 slots for 384
+  experts on two cards, 2026-11-22).
 - *No read is started on a guess.* The store reads guesses ahead into half of staging as
   prefetches and promotes them when a record names them (`transit_guess`), and `Feed` can
   guess, for the layers ahead (`ares_weights::Lookahead` gives the distance), what the wide

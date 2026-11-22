@@ -214,6 +214,13 @@ impl Layout {
 /// the budgets of the tiers leave outside them. `slots` sets the transit slots of every
 /// device instead (0: none, and the misses go into the tier's slots).
 ///
+/// Transit comes out of a device's budget for slots, which is cut to the bytes of the
+/// experts the device owns and a 64th where it has more room. Where `room[d]` (all that
+/// device `d` can give the store) is above the budget, the budget grows by the transit's
+/// bytes as far as the room goes: a device with room for a slot for every expert keeps it
+/// beside transit (with transit taken from such a budget, a split by layers held a slot
+/// fewer than its experts in every layer).
+///
 /// - A device's transit holds half of the experts of a layer that the device computes and
 ///   that have no slot in VRAM, so that two rounds bring a layer's misses: one batch is
 ///   computed while the next is uploaded. At least two rows' picks, at most an eighth of
@@ -226,6 +233,7 @@ pub(super) fn plan_transit(
     layout: &Layout,
     reader: &Reader,
     slots: Option<u32>,
+    room: &[u64],
 ) {
     let all = layout.expert_bytes.max(1) as f64;
     let vram: u64 = config.vram_bytes.iter().sum();
@@ -269,6 +277,20 @@ pub(super) fn plan_transit(
     if config.staging_slots == 0 || slots == Some(0) {
         config.transit_slots.clear();
         config.staging_slots = 0;
+    }
+    for (device, budget) in config.vram_bytes.iter_mut().enumerate() {
+        let transit = u64::from(config.transit_slots.get(device).copied().unwrap_or(0));
+        let room = room.get(device).copied().unwrap_or(0);
+        if transit > 0 && room > *budget {
+            let stride = layout
+                .specs
+                .iter()
+                .filter(|spec| spec.device == device)
+                .map(|spec| spec.slot_bytes)
+                .max()
+                .unwrap_or(0);
+            *budget = (*budget + transit * stride).min(room);
+        }
     }
 }
 

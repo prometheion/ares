@@ -1009,10 +1009,13 @@ the agents' builds):
 - [x] The MTP block's first links with both cards on every layer: a server session (IQ2_XS,
       `--ram 8G`, MTP) accepted 626 of 1078 drafts, decode 17 to 52 tokens/s; the poor first
       links the server agent saw are not seen again.
-- [ ] `qwen4exp_runtime` `the_mtp_block_follows_wide_steps_that_start_at_any_cell`: passes with one
-      device, fails in the split by layers on two: the warm-up finds 376 VRAM slots for 8 layers x
-      48 experts (steps of 196 rows; the other tests take 8 or 64 rows and pass). Something keeps
-      8 slots from the store in that placement at that step width.
+- [x] `qwen4exp_runtime` `the_mtp_block_follows_wide_steps_that_start_at_any_cell`: passed with one
+      device, failed in the split by layers on two: the warm-up found 376 VRAM slots for 8 layers x
+      48 experts. The cause: the transit slots of wide steps (two rows' picks, six here) came out
+      of a device's bytes for slots, which the plans cut to its experts and a 64th (three slots of
+      192), so each layer had 47 slots for 48 experts (the 64-row tests do not fill every slot).
+      Transit now comes on top of that budget as far as the device's room goes (`plan_transit`,
+      `devices/load-choice`); the test passes in all three placements on the two cards.
 - [ ] The 27B at the owner's production settings (`--split tensor --shares 0.625,0.375 --context
       262144 --parallel 2 --kv q5 --drafters mtp --draft-vocab`, `--ram 16G`): the heads by the
       context planned the RTX 4070 above its free memory (the MTP block's K and V and whole heads

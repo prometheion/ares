@@ -1399,7 +1399,12 @@ impl Qwen4Exp {
                 }
                 config.cpu_serves = serve != Serve::Stream;
                 if o.max_rows > MAX_BATCH {
-                    plan_transit(&mut config, layout, &reader, self.opts.transit);
+                    let room: Vec<u64> = build
+                        .room
+                        .iter()
+                        .map(|r| (*r).min(self.opts.slot_bytes.unwrap_or(u64::MAX)))
+                        .collect();
+                    plan_transit(&mut config, layout, &reader, self.opts.transit, &room);
                 }
                 config.ram_bytes = reach;
                 config.ram_piece = self.opts.ram_piece.unwrap_or(PIECE) as u64;
