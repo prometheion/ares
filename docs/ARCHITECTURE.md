@@ -641,7 +641,12 @@ one array per part, indexed by page number.
     drive, but a prompt asks the drive only for the pages the index does not
     hold, and the index still holds the system prompt's pages, so the second
     conversation replayed 18 304 rows (221 s against 166 s for the cold first
-    one). What would make it pay is in `OPEN.md`.
+    one). What would make it pay is in `OPEN.md`. The one place does keep a
+    request's anchor over its end state now: with Claude Code's rewritten Edit
+    call sent back (a forced call per turn, `"replace_all": false` put in
+    front, Flash-Next without `--cache`, load 16 to 22), the next turns
+    replayed 8146 and 8255 rows before (136 and 64 s) and 82 and 63 after
+    (12.2 and 10.6 s).
 - Admission (`ares_sched::Admission`): nothing is reserved for a request's
   longest possible length. Pages are claimed per step. A reservation covers
   the rest of the running prompts and the output they are expected to
