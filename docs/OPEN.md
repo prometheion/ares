@@ -834,15 +834,12 @@ Measured per phase on a quiet machine against the fork and Strata, the largest f
       (64 rows: 28 against 22 TFLOPS), and in the expert kernels (`expert_types_bench`) they took
       gate and up of Q6_K, Q8_0, Q5_0 and TQ2_0 5 to 17 % faster but down of Q3_K, Q6_K, Q8_0,
       Q4_0, Q5_0 4 to 15 % slower. A choice per kernel, measured on the capped cards as well.
-- [ ] Flash-Next's wide steps take one form of activations for every dense matrix and count the
-      float matrices (alpha, beta: F32) among them, which never read it (`Part::wide_float`):
-      their F16 form makes the forms differ wherever the quantized types take int8, and then every
-      dense matrix runs the exact f16 path, on a capped card at half rate. Whether to leave the
-      floats out of that vote (the dense products would take int8 on a capped card, 1.1 % rms
-      instead of 0.03 %) is the owner's call.
-- [ ] Capped cards could measure their path per type too (`measure_prefill_path` returns the kept
-      rule there, `FLUSH_AS_FAST` from the two development cards): one condition in
-      `kernels/paths.rs`; the owner's call, verified on those cards.
+- [ ] Flash-Next's wide steps take one form of activations for every dense matrix; where the
+      types' forms differ (a type with no int8 tile kernel, or measured paths that differ) every
+      dense matrix runs f16. The owner (2026-11-22): a form per matrix, int8 on a capped card as
+      the 27B's ("Decided by the owner").
+- [ ] Capped cards measure their prefill path per type too (the owner, 2026-11-22): one
+      condition in `kernels/paths.rs`, verified on capped cards.
 - [ ] Attention over long contexts: llama.cpp PR 32407 (merged 2026-11-17) rotates the order in
       which blocks read K/V tiles so that blocks sharing K/V hit L2 together: prompts of the 27B
       on an RTX 5090 at 131072 cells 1290 -> 1822 tokens/s (1.41x), 1.25x at 65536, 1.07x at
