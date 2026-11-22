@@ -389,8 +389,13 @@ owed a measurement. Found:
       `--ram 40G`). Equal budgets are not equal memory; Ares at `--ram 52G` is owed.
 - [ ] Decode waits for the drive: 2-7 % of the picks come from the file (17-25 reads a token
       at 3.3-4.6 ms each, 27-90 MB a token), and the layers waited 64 ms a token of 77 on
-      German prose. The read-ahead of predictions was used 50-63 % where it read; its odds by
-      place are now in the log.
+      German prose. The read-ahead of predictions was used 50-63 % where it read, but few
+      places qualify: of the experts in no tier a prediction named one layer ahead, the first
+      places were picked 64, 58, 48, 39 % of the time (one row) and 55-61 % (windows of
+      drafts), two layers ahead 4-15 %; and with experts of 3 MiB only one was read ahead at
+      a time (two since a7c0375). A drive this slow at one or two reads (1.5 ms an expert
+      alone, 3.7 in decode beside the others) and a lead of one layer (~1.5 ms) hide little;
+      more RAM (see the page cache above) or pruning (opt-in) remove misses.
 - [x] The reader is not the limit: on this drive (btrfs zstd, kyber) it reaches 2.3-2.7 GB/s
       for random experts at 2 to 64 in flight with any queue depth from 4 to 64 and whole
       demand reads (pieces of 256 or 128 KiB are slower); file order does not matter.
