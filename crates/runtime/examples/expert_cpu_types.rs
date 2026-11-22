@@ -6,8 +6,9 @@
 //!
 //! The layer has the widths of Qwen3.8-Flash-Next (2560 and 640; 768 for a type of down whose
 //! block does not divide 640). A job is timed from its creation to its last task, which is
-//! what the cost model of the store times (`CostModel::record_job`); the experts are eight
-//! that take turns, so that a job reads bytes the one before did not leave in the cache.
+//! what the cost model of the store times (`CostModel::record_job`); the experts are 48 that
+//! take turns (about 100 MB, more than the caches of a desktop CPU hold), so that a job reads
+//! its bytes from memory as the engine's jobs do from the RAM tier.
 //!
 //! ```sh
 //! cargo run --release -p ares-runtime --example expert_cpu_types -- [workers] [pairs|layers|alone]
@@ -73,7 +74,7 @@ fn time_layer(
 ) -> Result<(f64, f64), String> {
     let gate_bytes = shape.gate_bytes().ok_or("gate size")? as usize;
     let down_bytes = shape.down_bytes().ok_or("down size")? as usize;
-    let experts: Vec<[Vec<u8>; 3]> = (0..(2 * n_experts).max(8))
+    let experts: Vec<[Vec<u8>; 3]> = (0..(2 * n_experts).max(48))
         .map(|e| {
             [
                 fill(shape.gate_ty, gate_bytes, e),
