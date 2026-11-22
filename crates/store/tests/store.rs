@@ -43,7 +43,7 @@ fn root_hash() -> ChainHash {
 }
 
 /// The contents of page `i` of the conversation `tokens`.
-fn page_bytes(tokens: &[u32], i: usize) -> Vec<u8> {
+fn page_bytes(tokens: &[u64], i: usize) -> Vec<u8> {
     (0..PAGE).map(|b| (tokens[i * PER_PAGE as usize] as usize * 31 + i * 7 + b) as u8).collect()
 }
 
@@ -53,7 +53,7 @@ fn put_page(store: &mut PageStore, hash: ChainHash, parent: ChainHash, depth: u3
 
 /// Stores every full page of `tokens`, a checkpoint on every second page, and
 /// returns the page hashes.
-fn put_conversation(store: &mut PageStore, tokens: &[u32]) -> Vec<ChainHash> {
+fn put_conversation(store: &mut PageStore, tokens: &[u64]) -> Vec<ChainHash> {
     let mut hash = root_hash();
     let mut hashes = Vec::new();
     let per_page = std::hint::black_box(PER_PAGE as usize);
@@ -85,7 +85,7 @@ fn segments(dir: &Path, extension: &str) -> Vec<PathBuf> {
 #[test]
 fn records_survive_a_restart_and_are_found_by_walking_the_prompt() {
     let dir = TempDir::new("restart");
-    let tokens: Vec<u32> = (100..122).collect();
+    let tokens: Vec<u64> = (100..122).collect();
     let fp = fingerprint("a");
 
     let mut store = PageStore::open(&dir.0, fp, Config::default()).unwrap();
@@ -185,7 +185,7 @@ fn the_least_recently_used_segments_go_when_the_limit_is_reached() {
     // Three records per segment, room for four segments.
     let config = Config { max_bytes: 12 * RECORD, segment_bytes: 3 * RECORD };
     let mut store = PageStore::open(&dir.0, fingerprint("a"), config).unwrap();
-    let hash = |i: u32| root_hash().extend(&[i; 4]);
+    let hash = |i: u32| root_hash().extend(&[u64::from(i); 4]);
     let page = vec![0xabu8; PAGE];
     for i in 0..9 {
         put_page(&mut store, hash(i), root_hash(), 1, &page);
@@ -236,8 +236,8 @@ fn what_nothing_can_reach_goes_before_what_was_used_least_recently() {
     let page = vec![1u8; PAGE];
     // Conversation A: pages 1 and 2 in the first segment, 3 and 4 in the
     // second; conversation B: two pages in the third segment.
-    let a: Vec<ChainHash> = (1..=4u32).map(|i| root_hash().extend(&[i; 8])).collect();
-    let b: Vec<ChainHash> = (1..=2u32).map(|i| root_hash().extend(&[50 + i; 8])).collect();
+    let a: Vec<ChainHash> = (1..=4u64).map(|i| root_hash().extend(&[i; 8])).collect();
+    let b: Vec<ChainHash> = (1..=2u64).map(|i| root_hash().extend(&[50 + i; 8])).collect();
     for (i, hash) in a.iter().enumerate() {
         let parent = if i == 0 { root_hash() } else { a[i - 1] };
         put_page(&mut store, *hash, parent, i as u32 + 1, &page);
@@ -262,7 +262,7 @@ fn what_nothing_can_reach_goes_before_what_was_used_least_recently() {
 
     // New pages pass the limit: A's unreachable segment goes although B's was
     // used longer ago.
-    let c: Vec<ChainHash> = (1..=5u32).map(|i| root_hash().extend(&[90 + i; 8])).collect();
+    let c: Vec<ChainHash> = (1..=5u64).map(|i| root_hash().extend(&[90 + i; 8])).collect();
     for (i, hash) in c.iter().enumerate() {
         let parent = if i == 0 { root_hash() } else { c[i - 1] };
         put_page(&mut store, *hash, parent, i as u32 + 1, &page);
@@ -285,7 +285,7 @@ fn the_order_of_use_carries_over_a_restart() {
             SystemTime::UNIX_EPOCH + Duration::from_secs(seconds.load(Ordering::SeqCst))
         })
     };
-    let hash = |i: u32| root_hash().extend(&[i; 4]);
+    let hash = |i: u32| root_hash().extend(&[u64::from(i); 4]);
     let page = vec![3u8; PAGE];
     let mut store = PageStore::open_with(&dir.0, fingerprint("a"), config, clock.clone()).unwrap();
     for i in 0..6 {
@@ -310,7 +310,7 @@ fn the_order_of_use_carries_over_a_restart() {
 fn damage_costs_only_the_damaged_records() {
     let dir = TempDir::new("damage");
     let fp = fingerprint("a");
-    let tokens: Vec<u32> = (0..12).collect();
+    let tokens: Vec<u64> = (0..12).collect();
     let mut store = PageStore::open(&dir.0, fp, Config::default()).unwrap();
     let hashes = put_conversation(&mut store, &tokens);
     drop(store);
@@ -369,7 +369,7 @@ fn damage_costs_only_the_damaged_records() {
 fn fingerprints_do_not_see_each_other_and_old_ones_make_room_first() {
     let dir = TempDir::new("fingerprints");
     let config = Config { max_bytes: 12 * RECORD, segment_bytes: 3 * RECORD };
-    let tokens: Vec<u32> = (0..24).collect();
+    let tokens: Vec<u64> = (0..24).collect();
 
     let mut old = PageStore::open(&dir.0, fingerprint("old quantization"), config).unwrap();
     let hashes = put_conversation(&mut old, &tokens);

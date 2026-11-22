@@ -755,12 +755,12 @@ impl PageStore {
         }
     }
 
-    /// The longest prefix of `tokens` whose pages are all in the store, as
+    /// The longest prefix of `tokens` (the names of cells, `ares_state`) whose pages are all in the store, as
     /// their hashes in order, starting from `root`. The pages count as used.
     pub fn lookup(
         &mut self,
         root: ChainHash,
-        tokens: &[u32],
+        tokens: &[u64],
         cells_per_page: u32,
     ) -> Vec<ChainHash> {
         let mut found = Vec::new();
