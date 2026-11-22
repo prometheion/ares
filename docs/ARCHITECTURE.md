@@ -331,8 +331,13 @@ requests ──► plan ──► upload step record ──► window ──► 
    completes does not wait for the debt of a long one, as long as the debt
    is no more than one whole piece leaves, so the first token of a short
    prompt comes after the step in flight and one step of its own; a burst of
-   short prompts is read in one piece. While nobody generates a prompt takes
-   the widest step. (The scheme is TensorFold's lanes, whose "a long prompt's
+   short prompts is read in one piece. A prompt read alone (nobody generates,
+   no other prompt has started) takes the widest step, `--batch-size` rows,
+   which for a mixture of experts may run on VRAM its expert slots lend (see
+   "Large prompt steps on lent VRAM" under Qwen3.8-Flash-Next); as soon as
+   another request waits, steps of prompt are pieces in the model's own memory
+   (`Model::own_rows`, `--ubatch-size`), halved until the measured price of
+   the piece is at most `RuntimeConfig::piece_ms` (500 ms). (The scheme is TensorFold's lanes, whose "a long prompt's
    step owes the decoders" this takes; it replaces the cap of the rows of a
    prompt next to windows at `prefill_rows_at`, under which a prompt next to
    a drafting sequence trickled in a few rows a step.)
@@ -4422,7 +4427,7 @@ width (`device/part/wide.rs`, `device/misses.rs`):
   per-layer copies of the layer's input rows that the CPU reads, and the store's reserve
   (`StoreConfig::max_rows`). Only the scratch of a step scales with the rows.
 
-`step_rows` decides the rows a model opens with: the largest power of two up to 4096
+`step_rows` decides the rows a model keeps scratch for (`--ubatch-size` says otherwise): the largest power of two up to 4096
 whose scratch (`Frame::step_bytes`) is at most a thirty-second of the smaller device's
 memory, and 8 on a device below compute capability 8.0. The scratch is about 0.7 MiB a
 row for Flash-Next, and every byte of it is a byte less for expert slots, which the
@@ -5504,6 +5509,52 @@ What bounds the prompt now:
   advance chunk by chunk and layer by layer, not row by row through all layers) and
   cancellation must know; and a split by layers must hand the kept rows of all chunks over
   between the devices at the boundary layer, in pieces the link buffers hold.
+
+
+**Large prompt steps on lent VRAM** (`expert_store/lend.rs`, `Part::lay_out`, `Flow::lend`;
+2026-11-22). A step reads every expert its rows pick once, so a long prompt read in steps of
+512 rows reads the experts of the file again for every 512 rows (each slice picks 40 to 80 %
+of every layer). Strata reads prompts in chunks of 8192 and pays the chunk's buffers with
+slots of its expert cache that it lends for the chunk and refills after (Strata
+`DETAILS.md:1330`, `BATCHING.md:241`); Ares does the same:
+
+- *Two sizes of a step.* `--ubatch-size` (`Options::own_rows`, `Model::own_rows`; by default
+  `step_rows`, 512 on two cards of 12 GiB) is what the parts keep scratch for; `--batch-size`
+  (`Options::max_rows`, `Model::max_rows`; 8192 by default, as far as the slots can lend it:
+  `batch_rows`) is the widest step, which only a prompt read alone takes. A wider step's
+  scratch (0.67 MiB a row on the part with the streams, 0.47 on a worker) lies in VRAM the
+  expert slots of the device lend; everything else a step needs (the step's inputs and
+  plans, the exchange of two cards, the predictions: about 50 KiB a row, and 24 KiB a row of
+  page-locked RAM) is sized for the widest step for good. `Part::lay_out` points the scratch
+  of each step at its own buffer or at the loan (the two layouts of `Frame`: `own` and `s`),
+  and writes the zeros and the status word a step reads there.
+- *The loan.* Always the last slots of the device's largest pool, so it lies at the same
+  addresses every time: the mixer knows where the worker's lent scratch takes its input
+  (`Ports::lent_raw`) from the load on. The slots belong to every layer of the pool, so the
+  layers give their coldest slots in proportion to what they have above the floor of a loan
+  (a row's picks and the free slots, 18 for Flash-Next, `ExpertStore::loan_floor`); what
+  those held is evicted as any evicted expert is (copied down to RAM when the RAM tier keeps
+  it), the experts that lie in the lent slots and stay move on the device into the slots
+  given (`SlotDevice::adopt`), and the numbers change hands, as the RAM tier does with the
+  pieces it gives back. A lent number is `Lent` in its `SlotSet`: nothing takes it again
+  until the loan ends. The first part to begin a wide step lends on every device, waits
+  until nothing touches the slots of the device (no read, upload or adoption on its way) and
+  the moves and copies down have run, and only then does the step begin for the store.
+- *The way back.* The slots go back, empty, at the end of the first step that does not run
+  on them: that step's start still reads what the last wide step left there (the MTP block
+  follows the rows of the step before from the part's residual). Empty slots fill the way
+  they always do: the hottest experts of RAM at the end of every step (`promote_hot`), the
+  fill while idle, what steps upload.
+- *Who gets the wide step.* A prompt read alone; a generating sequence never shares a step
+  with a loan (it rides along in pieces of the own scratch only), so nothing it holds in
+  VRAM is lent while it generates. A request that arrives while a wide step runs waits for
+  that step, then for at most one piece.
+- *Exact?* The rows of a wide step are computed by the same kernels as in steps of the own
+  scratch; what differs is the shape of the step: the attention plans' pieces and the order
+  in which a wide step's experts add into a row (`red.add`, which differs from run to run
+  already, see "Wide steps"). The test `a_prompt_read_alone_runs_on_vram_the_expert_slots_lend`
+  (`tests/qwen4exp_runtime.rs`) checks the answer against the CPU reference in every
+  placement, as the other wide-step tests do.
 
 ### Vulkan
 

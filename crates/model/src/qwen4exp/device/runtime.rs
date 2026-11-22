@@ -2184,8 +2184,14 @@ impl Qwen4ExpDevice {
 
     fn wait_step(&mut self, end: &Event) -> Result<(), ModelError> {
         let flow = &self.flow;
-        let started = Instant::now();
+        // A wide step's last layers may take long: it stands still only when
+        // nothing moves.
+        let (mut started, mut seen) = (Instant::now(), flow.progress());
         while !end.is_done()? {
+            let now = flow.progress();
+            if now != seen {
+                (started, seen) = (Instant::now(), now);
+            }
             flow.check(started, "a device ran the step")?;
             flow.pump()?;
             std::hint::spin_loop();

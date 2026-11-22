@@ -23,8 +23,11 @@ the kernels exist; no model runs there yet.
   probability the drafter gave each and the measured price of a step. On the 27B the text
   with drafts is token for token the text without. On Flash-Next a draft row waits for an
   expert from the SSD only while it is worth the wait.
-- Prompts are read in steps of 512 rows, in pieces between rounds of generation, so running
-  requests go on.
+- Prompts are read in steps of up to `--ubatch-size` rows (512 by default), in pieces between
+  rounds of generation, so running requests go on; while another request waits a piece is at
+  most half a second. A prompt read alone takes steps of up to `--batch-size` rows; on
+  Flash-Next (8192 by default, as far as they fit) their scratch lies in VRAM the expert
+  slots lend for the step, so a long prompt reads each expert once per step.
 - On a card whose tensor cores sum in f32 at full rate (a professional card, or a GeForce
   card with the cap lifted) the path of the prompt kernels is measured per weight type at
   load: the most exact of those within 5 % of the fastest.
