@@ -574,6 +574,7 @@ pub(crate) fn load(
         );
     }
     fill_tiers(&runtime, &model, &name)?;
+    log_expert_costs(&model);
 
     // What it took.
     for (h, report) in held.iter().zip(model.reports()) {
@@ -817,11 +818,50 @@ fn fill_tiers(runtime: &Runtime, model: &Qwen4Exp, name: &str) -> Result<(), Loa
         Some(Err(error)) => format!("not written: {error}"),
         None => "not written: the warm-up ran no step".to_owned(),
     };
+    // The warm-up's steps brought what they missed into the slots that were
+    // free; the fill makes every layer's VRAM hold the hottest of what it used.
+    let filled = match model.fill_from_heat() {
+        Some((stats, time)) => format!(
+            "; the tiers were filled from its heat in {:.1} s, {} experts into VRAM and {} into \
+             the RAM tier, {} read",
+            time.as_secs_f64(),
+            stats.vram,
+            stats.ram,
+            Bytes(stats.read_bytes),
+        ),
+        None => String::new(),
+    };
     tracing::info!(
         "expert profile {path}: {why}; the warm-up read a text of German, English and code to \
-         fill the tiers, {took:.1} s; the profile is {written}"
+         fill the tiers, {took:.1} s; the profile is {written}{filled}"
     );
     Ok(())
+}
+
+/// Logs what serving a miss costs on this machine, as the expert store
+/// measured it: a CPU job by the types of the experts, an upload by device.
+fn log_expert_costs(model: &Qwen4Exp) {
+    let Some(costs) = model.expert_costs() else { return };
+    let us = |t: Option<f64>| t.map_or("-".to_owned(), |t| format!("{:.0}", t * 1e6));
+    let cpu = costs
+        .cpu
+        .iter()
+        .map(|((gate, down), one, eight)| {
+            format!("{gate:?}/{down:?} {} and {}", us(*one), us(*eight))
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let upload = costs
+        .upload
+        .iter()
+        .enumerate()
+        .map(|(device, t)| format!("device {device} {}", us(*t)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    tracing::info!(
+        "experts outside VRAM, measured: a CPU job per expert and row in us (one row, and each \
+         of eight) by the types of gate and up and of down: {cpu}; an upload in us: {upload}"
+    );
 }
 
 /// Reads [`WARM_UP`] and writes a few tokens after it, so that the tiers of

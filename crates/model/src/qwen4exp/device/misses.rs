@@ -194,7 +194,12 @@ impl Misses {
                         part.experts_round(env, self.layer, &self.resident, Some(record))?;
                     }
                     let counts = part.picked_counts(self.layer, self.rows, record);
-                    feed.store.record_counts(self.at, &counts, 1.0);
+                    // The heat counts an expert once a step, as a decode step
+                    // does whatever rows pick it: counted by its rows, a prompt
+                    // outweighed every token generated after it, and the tiers
+                    // filled from such heat held what long prompts used.
+                    let once: Vec<u32> = counts.iter().map(|c| u32::from(*c > 0)).collect();
+                    feed.store.record_counts(self.at, &once, 1.0);
                     let picked = |e: &u32| counts[*e as usize] > 0 && owned(*e);
                     let all = 0..counts.len() as u32;
                     self.stats.layers = 1;

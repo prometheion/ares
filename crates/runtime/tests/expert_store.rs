@@ -803,6 +803,16 @@ mod hybrid {
         Rig { store, act: quantize_activations(&x, 256), _dir: dir }
     }
 
+    /// Gives the cost model an upload of a microsecond, many times: the link then has room
+    /// for every promotion a test starts between two steps, whatever the machine's timing
+    /// (the room is what the link does in the time of a step).
+    fn fast_link(rig: &mut Rig) {
+        let model = rig.store.cost_model_mut().expect("a CPU half");
+        for _ in 0..64 {
+            model.record_upload(0, Duration::from_micros(1));
+        }
+    }
+
     fn group(expert: u32, weight: f32) -> RouteGroup {
         let mut weights = [0.0; 8];
         weights[0] = weight;
@@ -879,6 +889,7 @@ mod hybrid {
     #[test]
     fn the_cpu_computes_what_a_step_misses() {
         let mut rig = rig(4, 4, Serve::Cpu);
+        fast_link(&mut rig);
         let act = rig.act.clone();
         let groups = [group(3, 0.25), group(5, 0.75)];
         rig.store.begin_step();
@@ -1150,6 +1161,7 @@ mod hybrid {
     #[test]
     fn a_promotion_whose_ram_copy_gave_way_does_not_start() {
         let mut rig = rig(4, 2, Serve::Cpu);
+        fast_link(&mut rig);
         let act = rig.act.clone();
         // One step that claims two experts and ends; `settled` says whether
         // to let the device and the reads run empty afterwards.
@@ -1167,10 +1179,13 @@ mod hybrid {
         for expert in 1..=4 {
             assert!(rig.store.device(0).entry(0, expert) >= 0, "expert {expert} was not promoted");
         }
-        // Two more, used twice: hot enough to take slots from two of them.
+        // Two more, used three times: hot enough to take slots from two of them (a promotion
+        // needs more than 1.25 times a member's heat and one more use).
         step(&mut rig, 3, [5, 6]);
         assert_eq!(rig.store.stats().evictions, 0, "as hot as the members: no slot yet");
         step(&mut rig, 4, [5, 6]);
+        assert_eq!(rig.store.stats().evictions, 0, "not hotter by the rule: no slot yet");
+        step(&mut rig, 5, [5, 6]);
         let stats = rig.store.stats();
         assert_eq!((stats.evictions, stats.demotions), (1, 1), "{stats:?}");
         let device = rig.store.device(0);
@@ -1180,9 +1195,68 @@ mod hybrid {
         let left = if promoted[0] == 5 { 6 } else { 5 };
         let groups = [group(left, 1.0)];
         rig.store.begin_step();
-        assert_eq!(rig.store.routed_rows(0, 5, 1, &groups, &act).unwrap(), 1);
-        assert_close(&rig.delivered(0, 5), &reference(0, &act, &groups));
+        assert_eq!(rig.store.routed_rows(0, 6, 1, &groups, &act).unwrap(), 1);
+        assert_close(&rig.delivered(0, 6), &reference(0, &act, &groups));
         rig.store.end_step().unwrap();
+    }
+
+    /// The link is made far sooner than the CPU here, so the split gives it every miss; but an
+    /// upload becomes a member only by a free slot or by beating the coldest member as a
+    /// promotion would (`PromoteRule`). The others go up on loan: into the slot of a member on
+    /// loan, or of the coldest member, which is how the slots on loan come to be. The hot
+    /// members keep their slots, and a miss that comes back often enough becomes a member.
+    #[test]
+    fn misses_go_up_on_loan_and_only_heat_makes_a_member() {
+        let mut rig = rig(3, 8, Serve::Measured);
+        let act = rig.act.clone();
+        let types = (SHAPE.gate_ty, SHAPE.down_ty);
+        let model = rig.store.cost_model_mut().expect("a CPU half");
+        for _ in 0..64 {
+            model.record_upload(0, Duration::from_micros(1));
+            for pairs in [1, 2, 4, 8] {
+                model.record_job(types, pairs, Duration::from_millis(10 * pairs as u64));
+            }
+        }
+        let step = |rig: &mut Rig, token: u32, experts: &[u32]| {
+            let groups: Vec<RouteGroup> = experts.iter().map(|e| group(*e, 0.5)).collect();
+            rig.store.begin_step();
+            rig.store.routed_rows(0, token, 1, &groups, &act).unwrap();
+            rig.until("served", |store| {
+                let device = store.device(0);
+                experts.iter().all(|e| device.entry(0, *e) >= 0)
+                    || device.share(0).delivered.as_ref().is_some_and(|(t, _)| *t == token)
+            });
+            rig.store.end_step().unwrap();
+            rig.until("settled", |store| store.is_settled() && store.device(0).waiting() == 0);
+        };
+        let entry = |rig: &Rig, expert: u32| rig.store.device(0).entry(0, expert);
+        // Experts 1, 2 and 3 take the free slots as members; 1 and 2 are used three times.
+        step(&mut rig, 1, &[1, 2, 3]);
+        step(&mut rig, 2, &[1, 2]);
+        step(&mut rig, 3, &[1, 2]);
+        let (one, two) = (entry(&rig, 1), entry(&rig, 2));
+        assert!(one >= 0 && two >= 0 && entry(&rig, 3) >= 0);
+        assert_eq!(rig.store.stats().loans, 0);
+        // Three misses, each once: up on loan, the first into the slot of the coldest member,
+        // the others into the slot on loan.
+        for (token, expert) in [(10, 9), (11, 10), (12, 11)] {
+            step(&mut rig, token, &[expert]);
+            assert!(entry(&rig, expert) >= 0 && rig.store.on_loan(0, expert), "expert {expert}");
+        }
+        assert_eq!(rig.store.stats().loans, 3);
+        assert_eq!((entry(&rig, 1), entry(&rig, 2)), (one, two), "a hot member lost its slot");
+        assert_eq!((entry(&rig, 3), entry(&rig, 9), entry(&rig, 10)), (-1, -1, -1));
+        assert_eq!(rig.store.loans(), 1, "one slot on loan, passed from miss to miss");
+        assert_eq!(rig.store.stats().promotions, 0);
+        // Expert 9 again and again: on loan while it does not beat the members (heat 3 each:
+        // it needs more than 1.25 * 3 + 1); then a member.
+        for token in 13..16 {
+            step(&mut rig, token, &[9]);
+            assert!(rig.store.on_loan(0, 9), "use {}", token - 11);
+        }
+        step(&mut rig, 16, &[9]);
+        assert!(rig.store.in_vram(0, 9) && !rig.store.on_loan(0, 9), "use 5 made no member");
+        assert!(entry(&rig, 1) >= 0 && entry(&rig, 2) >= 0);
     }
 
     #[test]

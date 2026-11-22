@@ -29,8 +29,11 @@ use ares_store::Fingerprint;
 /// The first bytes of every profile.
 const MAGIC: &[u8; 8] = b"ARESHEAT";
 
-/// The format this engine writes and reads.
-pub const PROFILE_FORMAT: u32 = 1;
+/// The format this engine writes and reads. Format 2 (2026-11-22): a wide
+/// step counts each expert it picks once, as a decode step does; in format 1
+/// it counted every row, so the prompts outweighed everything generated, and
+/// such a profile is not used.
+pub const PROFILE_FORMAT: u32 = 2;
 
 /// Bytes before the heat, and after it.
 const HEADER: usize = 8 + 4 + 4 + 4 + 16;

@@ -259,6 +259,8 @@ pub struct SlotSet {
     slots: Vec<Slot>,
     /// Per slot: the expert in it came as a guess and nobody has used it.
     unused_guess: Vec<bool>,
+    /// Per slot: the expert in it is on loan ([`SlotSet::lend`]).
+    loaned: Vec<bool>,
     /// Expert -> how many copies out of its slot are running
     /// ([`SlotSet::hold`]).
     held: Vec<u32>,
@@ -275,6 +277,7 @@ impl SlotSet {
             keeps_picks: false,
             slots: vec![Slot::Empty; n_slots],
             unused_guess: vec![false; n_slots],
+            loaned: vec![false; n_slots],
             held: vec![0; n_experts],
         }
     }
@@ -305,6 +308,28 @@ impl SlotSet {
 
     fn picked(&self, expert: u32, step: u64) -> bool {
         self.picked_until[expert as usize] > step
+    }
+
+    /// What the members a read for step `step` can take the slot of (those
+    /// [`SlotSet::room`] counts) are worth ([`SlotSet::start_read`]'s
+    /// worth), in the order demand reads evict them: what a read that must
+    /// not evict anything worth more than itself would take, one after the
+    /// other.
+    pub fn room_worths(&self, step: u64, heat: &[f32]) -> Vec<f32> {
+        assert_eq!(heat.len(), self.slot_of.len(), "one heat value per expert");
+        let mut members: Vec<(usize, u32)> = self
+            .slots
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, s)| match s {
+                Slot::Holds(e) if self.held[*e as usize] == 0 && !self.picked(*e, step) => {
+                    Some((slot, *e))
+                }
+                _ => None,
+            })
+            .collect();
+        members.sort_by(|a, b| self.eviction_order(*a, *b, step, heat));
+        members.into_iter().map(|(slot, e)| self.worth(slot, e, heat)).collect()
     }
 
     /// The number of slots that hold nothing and wait for nothing.
@@ -390,9 +415,79 @@ impl SlotSet {
     }
 
     /// How much a member is worth when it competes for its slot: its heat,
-    /// or nothing when it came as a guess and nobody used it.
+    /// or nothing when it came as a guess and nobody used it, or is on loan.
     fn worth(&self, slot: usize, expert: u32, heat: &[f32]) -> f32 {
-        if self.unused_guess[slot] { 0.0 } else { heat[expert as usize] }
+        if self.unused_guess[slot] || self.loaned[slot] { 0.0 } else { heat[expert as usize] }
+    }
+
+    /// Puts `expert`, which is in a slot or on its way into one, on loan: it
+    /// serves the steps that pick it, and its slot is the first a read takes
+    /// (it is worth nothing, however hot), also when a step uses it again.
+    /// For an expert a step missed that is uploaded for that step without
+    /// being worth a member's place: the slots of such experts are passed on
+    /// from miss to miss, and the members stay. [`SlotSet::keep_loan`] makes
+    /// it a member.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the expert is in no slot.
+    pub fn lend(&mut self, expert: u32) {
+        let slot = match (self.slot_of[expert as usize], self.loading_in[expert as usize]) {
+            (NO_SLOT, NO_SLOT) => panic!("only an expert in a slot can be lent"),
+            (NO_SLOT, loading) => loading,
+            (held, _) => held,
+        };
+        self.loaned[slot as usize] = true;
+    }
+
+    /// The coldest member that is worth something (not on loan, not a guess
+    /// nobody used), that no copy holds and that step `step` did not pick,
+    /// with its heat: the member a newcomer has to beat.
+    pub fn coldest_member(&self, step: u64, heat: &[f32]) -> Option<(u32, f32)> {
+        assert_eq!(heat.len(), self.slot_of.len(), "one heat value per expert");
+        self.slots
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, s)| match s {
+                Slot::Holds(e)
+                    if self.held[*e as usize] == 0
+                        && !self.picked(*e, step)
+                        && !self.loaned[slot]
+                        && !self.unused_guess[slot] =>
+                {
+                    Some((*e, heat[*e as usize]))
+                }
+                _ => None,
+            })
+            .min_by(|a, b| a.1.total_cmp(&b.1).then(b.0.cmp(&a.0)))
+    }
+
+    /// Whether `expert` is in a slot on loan.
+    pub fn is_loaned(&self, expert: u32) -> bool {
+        self.slot(expert).is_some_and(|slot| self.loaned[slot as usize])
+    }
+
+    /// The members on loan.
+    pub fn loans(&self) -> impl Iterator<Item = u32> + '_ {
+        self.slots.iter().zip(&self.loaned).filter_map(|(s, loaned)| match s {
+            Slot::Holds(e) if *loaned => Some(*e),
+            _ => None,
+        })
+    }
+
+    /// Makes `expert`, a member on loan, a member like any other, and puts
+    /// `instead`, a member, on loan in its place: a promotion that moves no
+    /// bytes.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `expert` is not on loan or `instead` is in no slot.
+    pub fn keep_loan(&mut self, expert: u32, instead: u32) {
+        assert!(self.is_loaned(expert), "only a member on loan can be kept");
+        let (kept, lent) = (self.slot_of[expert as usize], self.slot_of[instead as usize]);
+        assert_ne!(lent, NO_SLOT, "only a member can go on loan");
+        self.loaned[kept as usize] = false;
+        self.loaned[lent as usize] = true;
     }
 
     /// Re-decides who holds the slots from `heat` and returns the swaps to
@@ -467,6 +562,7 @@ impl SlotSet {
         self.slots[slot] = Slot::Loading(expert);
         self.loading_in[expert as usize] = slot as u32;
         self.unused_guess[slot] = guess;
+        self.loaned[slot] = false;
     }
 
     /// Says that the router picked `experts` in this layer in step `step`:
@@ -671,6 +767,7 @@ impl SlotSet {
             self.slot_of[expert as usize] = NO_SLOT;
             self.slots[slot] = Slot::Gone;
             self.unused_guess[slot] = false;
+            self.loaned[slot] = false;
             given.push(Given { slot: slot as u32, evicted: Some(expert) });
         }
         given
@@ -695,6 +792,7 @@ impl SlotSet {
             taken.push(self.slots.len() as u32);
             self.slots.push(Slot::Empty);
             self.unused_guess.push(false);
+            self.loaned.push(false);
         }
         taken
     }
@@ -733,6 +831,7 @@ impl SlotSet {
         *slot = Slot::Empty;
         self.loading_in[swap.load as usize] = NO_SLOT;
         self.unused_guess[swap.slot as usize] = false;
+        self.loaned[swap.slot as usize] = false;
     }
 }
 
@@ -789,6 +888,44 @@ mod tests {
         set.routed(&[5], 3);
         assert_eq!(set.start_read(6, Want::Spare, 4, heat.layer(0)), Start::NoRoom);
         assert!(matches!(set.start_read(6, Want::Guess, 4, heat.layer(0)), Start::Slot(_)));
+    }
+
+    #[test]
+    fn a_member_on_loan_gives_way_first_and_keeping_it_lends_another() {
+        let heat = [0.0, 9.0, 5.0, 7.0, 8.0];
+        let mut set = SlotSet::new(5, 3);
+        for expert in [1, 2, 3] {
+            let Start::Slot(swap) = set.start_read(expert, Want::Demand, 1, &heat) else {
+                unreachable!("free slots");
+            };
+            set.commit(&swap);
+        }
+        // The hottest member goes on loan: a read takes its slot first.
+        set.lend(1);
+        assert!(set.is_loaned(1) && !set.is_loaned(2));
+        assert_eq!(set.room_worths(2, &heat), [0.0, 5.0, 7.0]);
+        let Start::Slot(swap) = set.start_read(4, Want::Demand, 2, &heat) else {
+            unreachable!("a member on loan");
+        };
+        assert_eq!(swap.evict, Some(1));
+        set.lend(4);
+        set.commit(&swap);
+        // A step that uses it leaves it on loan.
+        set.routed(&[4], 3);
+        assert!(set.is_loaned(4));
+        assert_eq!(set.room_worths(4, &heat), [0.0, 5.0, 7.0]);
+        assert_eq!(set.coldest_member(4, &heat), Some((2, 5.0)), "a member on loan is none");
+        // Kept, it is a member, and the member named goes on loan in its place.
+        set.keep_loan(4, 2);
+        assert!(!set.is_loaned(4) && set.is_loaned(2));
+        assert_eq!(set.coldest_member(4, &heat), Some((3, 7.0)));
+        assert_eq!(set.loans().collect::<Vec<_>>(), [2]);
+        let Start::Slot(swap) = set.start_read(1, Want::Demand, 4, &heat) else {
+            unreachable!("a member on loan");
+        };
+        assert_eq!(swap.evict, Some(2));
+        set.commit(&swap);
+        assert!(!set.is_loaned(1), "a new member is not on loan");
     }
 
     #[test]

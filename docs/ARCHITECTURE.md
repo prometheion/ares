@@ -4633,7 +4633,11 @@ model, as Strata's `expert_profile_save` and Run My AI's table of usage do
 (`expert_store/profile.rs`, `expert_store/fill.rs`, `qwen4exp/device/usage.rs`):
 
 - *What it is.* The heat of every expert of every layer of the model as the store
-  has it: one for every pick, the counts of a wide step's rows, times 0.9 every 32
+  has it: one for every expert a step picks, whatever rows pick it (a wide step's
+  as a decode step's; until 2026-11-22 a wide step counted every row, so a prompt
+  outweighed everything generated after it and VRAM filled from such a profile held
+  what long prompts used: 16 to 23 % of a decode's picks on the test machine, see
+  below; profiles of that kind are format 1 and are not used), times 0.9 every 32
   steps and nothing while idle, so a count in which recent picks weigh more (half of
   it is from the last 210 steps or so; the ratios survive the decay, so it ranks by
   the whole history). It is per layer of the model and expert, whatever the
@@ -4659,12 +4663,15 @@ model, as Strata's `expert_profile_save` and Run My AI's table of usage do
   warm-up text, after the runtime measured the price of a step): the heat becomes
   the profile's, so that the steps of the measurement, which route token 0 a
   thousand times, do not enter it, and the tiers are filled from it
-  (`ExpertStore::plan_fill`, `advance_fill`). For every layer: the hottest experts
-  VRAM has room for, and behind them the next hottest as far as the RAM tier has
-  room. Room is a free slot or a member worth nothing there: in VRAM one without heat
-  (the measurement's steps leave some 2 900 of them on two cards), in RAM also a copy
-  of an expert VRAM holds; nothing that is worth something is evicted for a fill, and
-  nothing without heat is brought. The experts are read layer by layer in the order
+  (`ExpertStore::plan_fill`, `advance_fill`). For every layer VRAM is made to hold
+  the hottest experts: every free slot is filled, and a member gives way to an expert
+  hotter than itself (the measurement's steps leave their experts in the slots, and
+  until 2026-11-22 only members without heat gave way, so on the test machine the
+  fill brought 1 267 to 1 862 experts into 3 888 slots and left the rest to what the
+  measurement had brought); behind them the next hottest as far as the RAM tier has
+  room, a free slot or a member worth nothing there (one without heat, a copy of an
+  expert VRAM holds): nothing in RAM that is worth something is evicted for a fill,
+  and nothing without heat is brought. The experts are read layer by layer in the order
   of the file, in each layer those for VRAM before those for RAM (the ones for VRAM
   pass through RAM slots, which those for RAM would otherwise have taken first), each
   group as it lies in the layer's tensors, 32 at a time as demand reads (three reads
@@ -4673,9 +4680,11 @@ model, as Strata's `expert_profile_save` and Run My AI's table of usage do
   first to give way. A filled expert is a member worth its heat, not a guess that
   nobody used. The store's lock is let go between the turns, so the watch of the
   machine's memory can shrink the tier meanwhile. Without a profile the start reads
-  the warm-up text as before and writes the profile at once.
-- *While nothing runs* (no step for a second): the same thread fills what is empty,
-  VRAM's free slots and the RAM tier's room, from the heat, those for VRAM first and
+  the warm-up text as before, writes the profile at once and fills the tiers from
+  the heat the warm-up left in the same way (`Qwen4Exp::fill_from_heat`).
+- *While nothing runs* (no step for a second): the same thread fills what is empty
+  or colder, VRAM's free slots and members colder than an expert outside, and the
+  RAM tier's room, from the heat, those for VRAM first and
   the hottest first over all layers, two experts at a time as prefetches (which the
   reader keeps behind every demand read: a demand read waits at most for the four
   chunks of 512 KiB a drive takes of prefetches, see `ares_io::Config`) and one upload
@@ -4742,6 +4751,33 @@ the higher load in the first pairs):
   chunks of 512 KiB at the drive), and an upload per device; that bound is the store's
   (`tests/expert_fill.rs`) and was not resolved by a measurement here, whose times are those of
   the request's own misses.
+
+**Members, loans and promotions** (`expert_store/hybrid.rs`, `ares_weights::SlotSet`). While
+steps run, what VRAM holds changes slowly and by heat, and the link still serves misses
+beside the CPU where that is sooner:
+
+- *A miss* is served by the CPU or over the link, per layer and step by the measured costs
+  (`CostModel`: a CPU job by the types of the layer's experts and its pairs, timed at load and
+  by every job; an upload by device, timed by every upload), so that the later of the two ends
+  first; on a slow link the CPU takes more. An upload becomes a member only when it takes a
+  free slot or beats the coldest member the step did not pick by the rule of a promotion
+  (`PromoteRule`: more than 1.25 times its heat and one pick more). Otherwise it goes up *on
+  loan* (`SlotSet::lend`): into the slot of a member on loan, or of the coldest member, which
+  is how the slots on loan come to be. A member on loan is worth nothing, also when a step
+  uses it again: its slot is the first any upload takes, so the slots on loan pass from miss
+  to miss and the members stay. Until 2026-11-22 every upload of a miss took the coldest
+  member's slot for good: VRAM followed the last tokens instead of the text (63 to 171 uploads
+  a token on the test machine, a third to a half of the picks in VRAM).
+- *Promotions*, between steps (`ExpertStore::promote_hot`): per layer the hottest experts
+  outside and on loan against the coldest members, as long as the rule holds. A member on
+  loan that beats one becomes a member and that one goes on loan, without a copy
+  (`SlotSet::keep_loan`); an expert in RAM is uploaded into a free slot or the slot that
+  leaves, its entry written when the bytes are there and no step is at the layer. As many may
+  be on the link as it does in the time of a step beside the uploads steps wait for, by the
+  measured times of a step and of an upload (one while either was never measured), where
+  there were eight at most before.
+- *At the start and while nothing runs* the fill makes VRAM the hottest of every layer
+  without that margin (see the usage profile above): no step waits then.
 
 **Reading experts ahead of their router.** A pick that no tier holds is read from the file
 when its layer's record reaches the host, and the layer waits for it. The routers of the

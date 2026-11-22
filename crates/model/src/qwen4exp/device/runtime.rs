@@ -37,7 +37,8 @@ use ares_cuda::{Device, DevicePtr, ENTRY_CELLS, Event, MAX_BATCH, Segment, StepR
 use ares_gguf::Gguf;
 use ares_io::Reader;
 use ares_runtime::expert_store::{
-    CudaSlots, HostRegion, PIECE, Serve, StoreConfig, StoreError, StorePlan, StoreStats,
+    CudaSlots, ExpertTypes, FillStats, HostRegion, PIECE, Serve, StoreConfig, StoreError,
+    StorePlan, StoreStats,
 };
 use ares_runtime::{
     ContextSpec, DeviceContext, DeviceModel, DeviceTransfer, Drafter, DrafterKind, Durable,
@@ -94,6 +95,17 @@ const MEET_LIMIT: Duration = Duration::from_secs(1800);
 /// How long a failed step serves the store so that the kernels that wait for
 /// an expert can end, before the device threads leave it.
 const DRAIN: Duration = Duration::from_secs(5);
+
+/// What the expert store measured of serving a miss on this machine
+/// ([`Qwen4Exp::expert_costs`]).
+#[derive(Clone, Debug, Default)]
+pub struct ExpertCosts {
+    /// Per pair of types of the experts (gate and up, down): the seconds a
+    /// CPU job takes per (expert, row) pair with one row and with eight.
+    pub cpu: Vec<(ExpertTypes, Option<f64>, Option<f64>)>,
+    /// Per device: the seconds of one upload, once one was timed.
+    pub upload: Vec<Option<f64>>,
+}
 
 /// Why a model could not be set up.
 #[derive(Debug, thiserror::Error)]
@@ -770,6 +782,16 @@ impl Qwen4Exp {
         self.usage.save()
     }
 
+    /// Fills the tiers from the heat the steps so far left, in one sweep
+    /// through the file at the pace of a start, as a start from a profile
+    /// does: after a warm-up, so that VRAM holds the hottest experts of every
+    /// layer before the first request. Returns what it brought and how long
+    /// it took; `None` without a usage profile or before the engine serves.
+    /// Call it while no request runs.
+    pub fn fill_from_heat(&self) -> Option<(FillStats, Duration)> {
+        self.usage.fill_from_heat()
+    }
+
     /// What the fill of the empty slots did while nothing ran, and what the
     /// tiers of the model's layers hold; `None` without a usage profile.
     pub fn usage_stats(&self) -> Option<UsageStats> {
@@ -960,6 +982,28 @@ impl Qwen4Exp {
         });
         let ram_bytes = feed.store.ram_bytes().0;
         Some((vram, ram, ram_bytes))
+    }
+
+    /// What the expert store measured of serving a miss on this machine: per
+    /// pair of types of the experts (gate and up, down), the seconds a CPU job
+    /// takes per (expert, row) pair for one row and for eight, and per device
+    /// the seconds of one upload (`None` before one was timed). `None` before
+    /// the parts are open or without a CPU half.
+    pub fn expert_costs(&self) -> Option<ExpertCosts> {
+        let flow = self.flow.get()?;
+        let feed = flow.lock_feed();
+        let model = feed.store.cost_model()?;
+        let cpu = model
+            .timed_types()
+            .into_iter()
+            .map(|types| {
+                let per = |pairs: usize| model.job_time(types, pairs).map(|t| t / pairs as f64);
+                (types, per(1), per(8))
+            })
+            .collect();
+        let devices = self.placement.n_devices();
+        let upload = (0..devices).map(|d| model.upload_time(d)).collect();
+        Some(ExpertCosts { cpu, upload })
     }
 
     /// The slots of the MTP block's experts in VRAM and in the RAM tier;

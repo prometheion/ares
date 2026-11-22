@@ -317,6 +317,20 @@ impl Usage {
         })
     }
 
+    /// Fills the tiers from the store's heat as the start does from a
+    /// profile ([`fill_from`]); `None` before the engine serves.
+    pub(super) fn fill_from_heat(&self) -> Option<(FillStats, Duration)> {
+        let inner = self.0.as_ref()?;
+        let (flow, map) = {
+            let state = inner.lock();
+            if !state.serving {
+                return None;
+            }
+            (state.flow.clone()?, state.map.clone()?)
+        };
+        Some(fill_from(&flow, &map, &inner.log))
+    }
+
     /// Writes the profile now, if steps ran since it was last written.
     pub(super) fn save(&self) -> Option<Result<PathBuf, String>> {
         let inner = self.0.as_ref()?;

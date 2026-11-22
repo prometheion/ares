@@ -39,8 +39,12 @@
 //! first) and writes its table entry, or it claims the expert for the CPU,
 //! whose workers compute it from the bytes in RAM, and delivers the sum of
 //! the claimed experts' outputs for each row, which the device adds where
-//! it would have added theirs. What VRAM holds is decided apart from that,
-//! between steps, from the heat, and never makes a step wait. Whatever
+//! it would have added theirs. An upload becomes a member of the VRAM tier
+//! only when it takes a free slot or beats the coldest member by the rule of
+//! a promotion; otherwise it goes up on loan, into a slot that the next such
+//! upload takes again ([`ares_weights::SlotSet::lend`]). What VRAM holds is
+//! decided apart from that, between steps, from the heat, and never makes a
+//! step wait. Whatever
 //! names experts before their layer runs (the routers of later layers applied
 //! early, the token table) calls [`ExpertStore::predicted`], and the store
 //! starts on them at lower priority. The routers of later layers applied on the
@@ -94,7 +98,7 @@ use ares_weights::{
 pub use device::{CudaSlots, HostShareState, HostSlots, SlotDevice};
 use elastic::{Layout, Pieces};
 pub use fill::{FillOrder, FillPace, FillStats, FillTier, TierFill};
-pub use hybrid::{CostModel, Miss, PromoteRule, Serve};
+pub use hybrid::{CostModel, ExpertTypes, Miss, PromoteRule, Serve};
 pub use near::{ExpertNeighbours, NEAR_FORMAT, Near};
 pub use profile::{ExpertProfile, Ignored, PROFILE_FORMAT, ProfileKey};
 pub use region::{HostRegion, Locker, PIECE, Released};
@@ -317,6 +321,10 @@ struct Wanted {
     /// The CPU computes it once its bytes are in RAM; otherwise it is
     /// uploaded.
     cpu: bool,
+    /// Uploaded on loan ([`ares_weights::SlotSet::lend`]): for the step that
+    /// missed it, into the slot of a member that is worth nothing or the
+    /// coldest one, without being worth a member's place itself.
+    loan: bool,
 }
 
 #[derive(Debug)]
@@ -402,6 +410,10 @@ pub struct StoreStats {
     pub cpu_ms: Vec<f32>,
     /// Experts that took a VRAM slot between steps, by heat.
     pub promotions: u64,
+    /// Experts a step missed that were uploaded on loan, and members on loan
+    /// that became members like any other by their heat, without a copy.
+    pub loans: u64,
+    pub loans_kept: u64,
     /// Milliseconds the reads of experts a step waited for took, from their
     /// start to the bytes being in RAM, summed over the experts.
     pub demand_read_ms: f64,
@@ -926,6 +938,17 @@ impl<D: SlotDevice> ExpertStore<D> {
         self.vram.sets[layer].contains(expert)
     }
 
+    /// Whether `expert` of `layer` is in a VRAM slot on loan: uploaded for a
+    /// step that missed it, its slot the first to be taken again.
+    pub fn on_loan(&self, layer: usize, expert: u32) -> bool {
+        self.vram.sets[layer].is_loaned(expert)
+    }
+
+    /// The experts on loan in VRAM, over all layers.
+    pub fn loans(&self) -> usize {
+        self.vram.sets.iter().map(|set| set.loans().count()).sum()
+    }
+
     /// The slot of the layer's pool (the number the slot table holds, counted
     /// from the first slot of the pool) that `expert` of `layer` is usable in.
     pub fn vram_slot(&self, layer: usize, expert: u32) -> Option<u32> {
@@ -1072,6 +1095,7 @@ impl<D: SlotDevice> ExpertStore<D> {
                 since: now,
                 source,
                 cpu: false,
+                loan: false,
             });
             missing += 1;
         }
@@ -1184,6 +1208,7 @@ impl<D: SlotDevice> ExpertStore<D> {
                     since: now,
                     source: Source::OnItsWay,
                     cpu: false,
+                    loan: false,
                 });
             }
             let ram = &self.ram.sets[layer];
@@ -1207,6 +1232,7 @@ impl<D: SlotDevice> ExpertStore<D> {
     /// The running step has ended on the devices. Guesses for it are over,
     /// heat ages, and every layer gets its free slots back.
     pub fn end_step(&mut self) -> Result<(), StoreError> {
+        self.cpu_end_step();
         self.in_step = false;
         self.phase.fill(Phase::Passed);
         self.ahead_end_step();
@@ -1354,7 +1380,7 @@ impl<D: SlotDevice> ExpertStore<D> {
             }
             if !self.vram.sets[layer].is_loading(expert) {
                 if self.ram.sets[layer].contains(expert) {
-                    self.promote(layer, expert, want.demand)?;
+                    self.promote(layer, expert, want.demand, want.loan)?;
                 } else if self.ram.sets[layer].is_loading(expert) {
                     if want.demand {
                         self.hurry(layer, expert);
@@ -1521,10 +1547,21 @@ impl<D: SlotDevice> ExpertStore<D> {
 
     /// Starts the upload of an expert that is in RAM into a VRAM slot, if a
     /// slot can be had now, with its table entry behind it.
-    fn promote(&mut self, layer: usize, expert: u32, demand: bool) -> Result<(), StoreError> {
+    fn promote(
+        &mut self,
+        layer: usize,
+        expert: u32,
+        demand: bool,
+        loan: bool,
+    ) -> Result<(), StoreError> {
         let want = if demand { Want::Demand } else { Want::Guess };
-        if self.upload(layer, expert, want, true)? && !demand {
+        let started = self.upload(layer, expert, want, true)?;
+        if started && !demand {
             self.stats.early_uploads += 1;
+        }
+        if started && loan {
+            self.vram.sets[layer].lend(expert);
+            self.stats.loans += 1;
         }
         Ok(())
     }

@@ -14,12 +14,22 @@
 //! half ends first.
 //!
 //! Serving a miss and deciding what VRAM holds are separate. An expert the
-//! CPU served stays where it was. What moves into VRAM is decided between
-//! steps, from the heat ([`ExpertStore::promote_hot`]): the bytes are
-//! uploaded into the victim's slot while the next steps run, and the table
-//! entry is written only when the bytes are there and no step is at the
-//! layer. Until then the expert is simply not on the device, and a step that
-//! needs it gets it from the CPU: a promotion never makes a step wait.
+//! CPU served stays where it was. An upload takes a slot of VRAM for good, so
+//! a miss the link would serve sooner is uploaded only into a free slot or in
+//! place of a member that it beats by the rule of a promotion
+//! ([`PromoteRule`]); the CPU takes the others, whatever the link would take.
+//! Otherwise every miss a step uploads evicts a member that later steps
+//! need: a step of a few rows misses tens of experts, and VRAM followed the
+//! last few tokens instead of the text.
+//!
+//! What moves into VRAM is decided between steps, from the heat
+//! ([`ExpertStore::promote_hot`]): the bytes are uploaded into the victim's
+//! slot while the next steps run, and the table entry is written only when
+//! the bytes are there and no step is at the layer. Until then the expert is
+//! simply not on the device, and a step that needs it gets it from the CPU: a
+//! promotion never makes a step wait. How many may be on the link at once
+//! is what the link has time for beside the uploads steps wait for: the
+//! measured time of a step and of an upload say it.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -27,7 +37,7 @@ use std::time::{Duration, Instant};
 
 use ares_core::GgmlType;
 use ares_cuda::{ExpertShape, RouteGroup};
-use ares_weights::{Start, Swap, Want};
+use ares_weights::{SPARE_WORTH, Start, Swap, Want};
 
 use super::cpu::{CpuExpert, CpuPool, LayerJob, MAX_ROWS, act_bytes};
 use super::{DeviceOp, ExpertStore, Phase, SlotDevice, Source, StoreError, Wanted};
@@ -152,6 +162,12 @@ impl CostModel {
         self.upload[device].get()
     }
 
+    /// The pairs of types whose jobs were timed, in the order they were first
+    /// timed.
+    pub fn timed_types(&self) -> Vec<ExpertTypes> {
+        self.cpu.iter().map(|(types, _)| *types).collect()
+    }
+
     /// Divides the experts a layer misses between the CPU (`true`) and the
     /// link (`false`): the split for which the later of the CPU's job and
     /// the last upload ends soonest. `queued` uploads are ahead on the link.
@@ -214,27 +230,32 @@ impl CostModel {
     }
 }
 
-/// When a hot expert takes a VRAM slot from a cold one, and how much of that
-/// may be on the link at once.
+/// When a hot expert takes a VRAM slot from a cold one: by a promotion
+/// between steps, or by the upload of a miss.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PromoteRule {
     /// A promotion needs `heat_in > margin * heat_out + bonus`, so that two
-    /// experts of similar heat do not trade places. Without a bonus an
-    /// expert that was just used takes the slot of one that was not for
-    /// some hundred steps: on recorded routing a third of a token's picks
-    /// are picks of the token before it, and with a bonus of 1 (an expert
-    /// must be used twice) VRAM served 93.9 % of the picks where it serves
-    /// 95.7 % when every miss moves in.
+    /// experts of similar heat do not trade places and an expert must have
+    /// been used more often than the member it replaces, over the window the
+    /// heat's decay gives (half of it is from the last 210 steps or so), and
+    /// once more. Without the bonus an expert that was just used takes the
+    /// slot of one that was not for some hundred steps: on recorded routing a
+    /// third of a token's picks are picks of the token before it.
     pub margin: f32,
     pub bonus: f32,
-    /// The most promotions on their way per device: what bounds the link
-    /// time promotions take from the uploads a step waits for.
-    pub in_flight: usize,
 }
 
 impl Default for PromoteRule {
     fn default() -> Self {
-        Self { margin: 1.25, bonus: 0.0, in_flight: 8 }
+        Self { margin: 1.25, bonus: 1.0 }
+    }
+}
+
+impl PromoteRule {
+    /// Whether an expert of heat `heat_in` takes the slot of a member worth
+    /// `heat_out`.
+    pub fn beats(&self, heat_in: f32, heat_out: f32) -> bool {
+        heat_in > self.margin * heat_out + self.bonus
     }
 }
 
@@ -284,6 +305,13 @@ pub(super) struct Hybrid {
     /// many it has not finished.
     last_upload: Vec<Instant>,
     pub(super) queued_uploads: Vec<usize>,
+    /// When the running step began, the seconds a step takes, and per device
+    /// the uploads a step waited for (those of the running step, and their
+    /// mean): what the link has time for beside them is the promotions'.
+    step_began: Option<Instant>,
+    step_time: Mean,
+    step_uploads: Vec<u32>,
+    demand_uploads: Vec<Mean>,
     /// Sums of the open layer being delivered, kept to reuse the memory.
     sums: Vec<f32>,
 }
@@ -325,6 +353,10 @@ impl<D: SlotDevice> ExpertStore<D> {
             in_flight: vec![0; self.devices.len()],
             last_upload: vec![Instant::now(); self.devices.len()],
             queued_uploads: vec![0; self.devices.len()],
+            step_began: None,
+            step_time: Mean::default(),
+            step_uploads: vec![0; self.devices.len()],
+            demand_uploads: vec![Mean::default(); self.devices.len()],
             sums: Vec::new(),
         });
         Ok(())
@@ -347,6 +379,12 @@ impl<D: SlotDevice> ExpertStore<D> {
     /// The measured costs the split is decided from.
     pub fn cost_model(&self) -> Option<&CostModel> {
         self.hybrid.as_ref().map(|h| &h.model)
+    }
+
+    /// The costs the split is decided from, to add measurements to: for tests
+    /// that need one side much sooner than the other.
+    pub fn cost_model_mut(&mut self) -> Option<&mut CostModel> {
+        self.hybrid.as_mut().map(|h| &mut h.model)
     }
 
     /// The route record of `layer` of the running step has arrived, with
@@ -429,6 +467,7 @@ impl<D: SlotDevice> ExpertStore<D> {
                         since: now,
                         source: Source::OnItsWay,
                         cpu: false,
+                        loan: false,
                     });
                 }
                 continue;
@@ -488,13 +527,43 @@ impl<D: SlotDevice> ExpertStore<D> {
 
         let device = self.layers[layer].device;
         let misses: Vec<Miss> = candidates.iter().map(|c| c.1).collect();
-        let on_cpu = match hybrid.serve {
+        let mut on_cpu = match hybrid.serve {
             Serve::Measured => {
                 let types = (shape.gate_ty, shape.down_ty);
                 hybrid.model.split(types, device, &misses, hybrid.queued_uploads[device])
             }
             _ => vec![true; misses.len()],
         };
+        // What the link would serve sooner becomes a member only where it
+        // takes a free slot or beats the coldest member the step did not pick
+        // as a promotion would, the hottest misses first. The others are
+        // uploaded on loan: into the slot of a member on loan, or of the
+        // coldest member, which leaves the members for the slots on loan. So
+        // the link serves misses beside the CPU as the costs say, and the
+        // members change by heat, not with every miss.
+        let rule = hybrid.rule;
+        let set = &self.vram.sets[layer];
+        let mut free = set.n_free();
+        let worths = set.room_worths(self.step, self.heat.layer(layer));
+        let mut room = worths.len();
+        let mut colder = worths.iter().filter(|w| **w > SPARE_WORTH).peekable();
+        let mut joins = vec![false; misses.len()];
+        let mut by_heat: Vec<usize> = (0..misses.len()).filter(|i| !on_cpu[*i]).collect();
+        by_heat.sort_by(|a, b| misses[*b].heat.total_cmp(&misses[*a].heat));
+        for i in by_heat {
+            if free > 0 {
+                free -= 1;
+                joins[i] = true;
+            } else if room == 0 {
+                on_cpu[i] = true;
+            } else {
+                room -= 1;
+                if colder.peek().is_some_and(|c| rule.beats(misses[i].heat, **c)) {
+                    colder.next();
+                    joins[i] = true;
+                }
+            }
+        }
 
         // What the CPU claims stays in its RAM slot until the layer's sums
         // are delivered, and the sums wait for every claimed expert. So the
@@ -519,7 +588,7 @@ impl<D: SlotDevice> ExpertStore<D> {
         let mut ready: Vec<CpuExpert> = Vec::new();
         let mut held: Vec<u32> = Vec::new();
         let mut late: Vec<Late> = Vec::new();
-        for ((g, _, source), cpu) in candidates.iter().zip(&on_cpu) {
+        for (((g, _, source), cpu), joins) in candidates.iter().zip(&on_cpu).zip(&joins) {
             let group = &groups[*g];
             self.wants.retain(|w| w.layer != layer || w.expert != group.expert);
             let cpu = (*cpu || vram_room == 0) && (*source == Source::Ram || room > 0);
@@ -535,6 +604,7 @@ impl<D: SlotDevice> ExpertStore<D> {
                     since: now,
                     source: *source,
                     cpu: false,
+                    loan: !joins,
                 });
                 continue;
             }
@@ -555,6 +625,7 @@ impl<D: SlotDevice> ExpertStore<D> {
                     since: now,
                     source: *source,
                     cpu: true,
+                    loan: false,
                 });
             }
         }
@@ -732,61 +803,87 @@ impl<D: SlotDevice> ExpertStore<D> {
         }
     }
 
-    /// Between steps: lets the hottest experts that RAM holds take VRAM
-    /// slots from members that are colder by the rule's margin. The bytes go
-    /// up while the next steps run; the entry follows when they are there
-    /// ([`ExpertStore::poll`]). Until then a step that needs the expert gets
-    /// it from the CPU.
+    /// Between steps: lets the hottest experts take VRAM slots from members
+    /// that are colder by the rule ([`PromoteRule`]). A member on loan that
+    /// beats the coldest member becomes a member and that one goes on loan in
+    /// its place, without a copy. An expert that RAM holds is uploaded into a
+    /// free slot or the slot that leaves, while the next steps run; the entry
+    /// follows when the bytes are there ([`ExpertStore::poll`]). Until then a
+    /// step that needs the expert gets it from the CPU. As many uploads may be
+    /// on the link as it has time for beside the uploads steps wait for.
     pub(super) fn promote_hot(&mut self) -> Result<(), StoreError> {
         let Some(hybrid) = self.hybrid.as_ref() else { return Ok(()) };
         let rule = hybrid.rule;
-        // The best promotion of every layer, the largest gain first.
-        let mut wanted: Vec<(f32, usize, u32)> = Vec::new();
+        let room: Vec<usize> = (0..self.devices.len()).map(|d| hybrid.promotion_room(d)).collect();
+        // Per layer, the hottest candidates (members on loan and experts in
+        // RAM) against the coldest members, as long as the rule holds.
+        // Uploads: (gain, layer, expert, the member that leaves).
+        let mut wanted: Vec<(f32, usize, u32, Option<u32>)> = Vec::new();
+        let mut keeps: Vec<(usize, u32, u32)> = Vec::new();
         for layer in 0..self.layers.len() {
-            let device = self.layers[layer].device;
-            if hybrid.in_flight[device] >= rule.in_flight {
-                continue;
-            }
             let (vram, ram) = (&self.vram.sets[layer], &self.ram.sets[layer]);
             let heat = self.heat.layer(layer);
-            let mut members: Vec<f32> = Vec::new();
-            let mut outside: Vec<(f32, u32)> = Vec::new();
+            let mut members: Vec<(f32, u32)> = Vec::new();
+            let mut candidates: Vec<(f32, u32, bool)> = Vec::new();
             for (expert, h) in heat.iter().enumerate() {
                 let expert = expert as u32;
-                if vram.contains(expert) {
-                    members.push(*h);
+                if vram.is_loaned(expert) {
+                    candidates.push((*h, expert, true));
+                } else if vram.contains(expert) {
+                    members.push((*h, expert));
                 } else if *h > 0.0 && !vram.is_loading(expert) && ram.contains(expert) {
-                    outside.push((*h, expert));
+                    candidates.push((*h, expert, false));
                 }
             }
-            if outside.is_empty() {
+            if candidates.is_empty() {
                 continue;
             }
-            outside.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
-            members.sort_by(f32::total_cmp);
-            // Free slots go to the hottest outsiders as they are; behind
-            // them the next hottest take the slots of the coldest members,
-            // each pair as long as the rule holds for it.
-            let free = vram.n_free();
-            for (rank, (h, expert)) in outside.into_iter().enumerate() {
-                if rank < free {
-                    wanted.push((h, layer, expert));
+            candidates.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+            members.sort_by(|a, b| a.0.total_cmp(&b.0).then(b.1.cmp(&a.1)));
+            let mut free = vram.n_free();
+            let mut colder = members.iter();
+            for (h, expert, loaned) in candidates {
+                if !loaned && free > 0 {
+                    // Free slots go to the hottest outsiders as they are.
+                    free -= 1;
+                    wanted.push((h, layer, expert, None));
                     continue;
                 }
-                match members.get(rank - free) {
-                    Some(cold) if h > rule.margin * cold + rule.bonus => {
-                        wanted.push((h - cold, layer, expert));
+                match colder.as_slice().first() {
+                    Some(&(cold, member)) if rule.beats(h, cold) => {
+                        colder.next();
+                        if loaned {
+                            keeps.push((layer, expert, member));
+                        } else {
+                            wanted.push((h - cold, layer, expert, Some(member)));
+                        }
                     }
+                    // Colder candidates beat nobody either; outsiders may still
+                    // have free slots.
+                    _ if free > 0 => continue,
                     _ => break,
                 }
             }
         }
+        for (layer, expert, member) in keeps {
+            self.vram.sets[layer].keep_loan(expert, member);
+            self.stats.loans_kept += 1;
+            self.worth_stale[layer] = true;
+        }
         wanted.sort_by(|a, b| b.0.total_cmp(&a.0));
-        for (_, layer, expert) in wanted {
+        for (_, layer, expert, leaves) in wanted {
             let device = self.layers[layer].device;
             let in_flight = self.hybrid.as_ref().map_or(usize::MAX, |h| h.in_flight[device]);
-            if in_flight >= rule.in_flight {
+            if in_flight >= room[device] || !self.ram.sets[layer].contains(expert) {
                 continue;
+            }
+            // The member that leaves goes on loan first: the upload takes the
+            // slot of a member on loan, this one or another.
+            if let Some(member) = leaves
+                && self.vram.sets[layer].contains(member)
+                && !self.vram.sets[layer].is_loaned(member)
+            {
+                self.vram.sets[layer].lend(member);
             }
             if self.upload(layer, expert, Want::Demand, false)? {
                 self.stats.promotions += 1;
@@ -823,6 +920,7 @@ impl<D: SlotDevice> ExpertStore<D> {
                 since: now,
                 source: Source::Disk,
                 cpu: true,
+                loan: false,
             });
         }
     }
@@ -857,6 +955,21 @@ impl<D: SlotDevice> ExpertStore<D> {
     pub(super) fn cpu_begin_step(&mut self) {
         if let Some(hybrid) = self.hybrid.as_mut() {
             hybrid.claimed.clear();
+            hybrid.step_began = Some(Instant::now());
+            hybrid.step_uploads.fill(0);
+        }
+    }
+
+    /// The running step has ended: its time and the uploads it waited for go
+    /// into the means the room for promotions is taken from.
+    pub(super) fn cpu_end_step(&mut self) {
+        if let Some(hybrid) = self.hybrid.as_mut()
+            && let Some(began) = hybrid.step_began.take()
+        {
+            hybrid.step_time.add(began.elapsed().as_secs_f64());
+            for (mean, uploads) in hybrid.demand_uploads.iter_mut().zip(&hybrid.step_uploads) {
+                mean.add(f64::from(*uploads));
+            }
         }
     }
 
@@ -933,6 +1046,11 @@ impl<D: SlotDevice> ExpertStore<D> {
         }
         let mark = self.devices[g.device].mark(false)?;
         let op = if entry {
+            if self.in_step
+                && let Some(hybrid) = self.hybrid.as_mut()
+            {
+                hybrid.step_uploads[g.device] += 1;
+            }
             DeviceOp::Upload { layer, swap, since: Instant::now() }
         } else {
             DeviceOp::Promotion { layer, swap, since: Instant::now() }
@@ -941,6 +1059,25 @@ impl<D: SlotDevice> ExpertStore<D> {
         self.upload_queued(g.device);
         self.stats.uploads += 1;
         Ok(true)
+    }
+}
+
+impl Hybrid {
+    /// The promotions that may be on the link of `device` at once: as many
+    /// uploads as the link does in the time of a step beside the uploads a
+    /// step waits for, by the measured times of a step and of an upload, and
+    /// at least one. One while either was never measured.
+    fn promotion_room(&self, device: usize) -> usize {
+        let (Some(upload), Some(step)) = (self.model.upload_time(device), self.step_time.get())
+        else {
+            return 1;
+        };
+        let demand = self.demand_uploads[device].get().unwrap_or(0.0);
+        let idle = step - demand * upload;
+        if upload <= 0.0 || idle <= upload {
+            return 1;
+        }
+        (idle / upload) as usize
     }
 }
 

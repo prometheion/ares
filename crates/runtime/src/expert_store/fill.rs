@@ -2,18 +2,23 @@
 //! usage profile that was saved by an earlier run (`profile.rs`), and
 //! whenever the engine is idle, into the slots that are empty.
 //!
-//! **What is brought.** For every layer, the hottest experts that VRAM does
-//! not hold, as many as it has room for, and behind them the next hottest
-//! that RAM does not hold, as many as RAM has room for. Room is a free slot or
-//! a slot whose member is worth nothing there: in VRAM one without heat, in
-//! RAM also a copy of an expert that VRAM holds. Nothing that is worth
-//! something is evicted for a fill, and nothing without heat is brought.
+//! **What is brought.** For every layer, VRAM's slots are made to hold the
+//! layer's hottest experts: every free slot is filled, and a member gives
+//! way to an expert hotter than itself (the hottest outsider takes the
+//! coldest member's slot, and so on while the outsider is the hotter). Behind
+//! them the next hottest that RAM does not hold, as many as RAM has room for:
+//! a free slot or a slot whose member is worth nothing there (one without
+//! heat, or a copy of an expert that VRAM holds); nothing in RAM that is worth
+//! something is evicted for a fill. Nothing without heat is brought.
 //!
 //! **How.** An expert comes from the file into a RAM slot; one meant for VRAM
-//! goes on from there into a free slot of the layer's VRAM tier, its table
-//! entry behind its bytes, and its RAM copy is then the first to give way. A
-//! filled expert is a member like one a step used: it competes with its heat,
-//! not as a guess that nobody used.
+//! goes on from there into a slot of the layer's VRAM tier (a free one, or
+//! the coldest member's, which is copied down to RAM when RAM does not hold
+//! it), its table entry behind its bytes, and its RAM copy is then the first
+//! to give way. A filled expert is a member like one a step used: it
+//! competes with its heat, not as a guess that nobody used. While steps run,
+//! VRAM changes only by promotions (`hybrid.rs`), which ask more of an
+//! expert than being hotter.
 //!
 //! **When.** Only between steps: [`ExpertStore::advance_fill`] does nothing
 //! while a step runs, so the owner stops a fill by beginning a step. What is
@@ -169,12 +174,12 @@ impl<D: SlotDevice> ExpertStore<D> {
     }
 
     /// What a fill of `layers` from the heat would bring now, in `order`: for
-    /// every layer the hottest experts that VRAM does not hold, as many as it
-    /// has room for, and the next hottest that RAM does not hold, as many as
-    /// RAM has room for. Room is a free slot or one whose member is worth
-    /// nothing there (in VRAM one without heat, in RAM also a copy of an
-    /// expert that VRAM holds); nothing without heat is brought. Nothing
-    /// starts before [`ExpertStore::advance_fill`].
+    /// every layer the hottest experts that VRAM does not hold, into its free
+    /// slots and in place of the members colder than they are, and the next
+    /// hottest that RAM does not hold, as many as RAM has room for (a free
+    /// slot or one whose member is worth nothing there: one without heat, or
+    /// a copy of an expert that VRAM holds); nothing without heat is brought.
+    /// Nothing starts before [`ExpertStore::advance_fill`].
     pub fn plan_fill(&mut self, layers: &[usize], order: FillOrder) -> TierFill {
         // Slots that stay free in VRAM for the misses of a step, where the
         // store keeps them free between steps.
@@ -190,13 +195,20 @@ impl<D: SlotDevice> ExpertStore<D> {
                 .collect();
             outsiders
                 .sort_by(|a, b| heat[*b as usize].total_cmp(&heat[*a as usize]).then(a.cmp(b)));
-            // Room in VRAM: free slots (less those kept free) and members
-            // without heat, such as what the steps that measured the price of a
-            // step brought.
-            let cold = (0..heat.len() as u32)
-                .filter(|e| vram.contains(*e) && heat[*e as usize] <= EMPTY_WORTH)
+            // Room in VRAM: free slots (less those kept free), and then the
+            // members, the coldest first, each for an outsider hotter than it
+            // (the hottest outsider first), such as what the steps that
+            // measured the price of a step brought.
+            let members = vram.room_worths(self.step, heat);
+            let free = vram.n_free().saturating_sub(keep);
+            let to_vram = outsiders
+                .iter()
+                .enumerate()
+                .take_while(|(rank, e)| {
+                    *rank < free
+                        || members.get(rank - free).is_some_and(|m| heat[**e as usize] > *m)
+                })
                 .count();
-            let to_vram = (vram.n_free().saturating_sub(keep) + cold).min(outsiders.len());
             // Room in RAM: free slots, members worth nothing there, and the
             // members that go up to VRAM now (their copies are then worth
             // nothing). Those meant for VRAM that are read pass through a slot
@@ -280,7 +292,8 @@ impl<D: SlotDevice> ExpertStore<D> {
             }
         }
 
-        // Uploads into VRAM: a free slot, or one whose member has no heat.
+        // Uploads into VRAM: a free slot, or the slot of a member colder than
+        // the expert.
         let keep = if self.serve() == Serve::Stream { self.config.vram_reserve } else { 0 };
         let mut waiting = VecDeque::new();
         while let Some(item) = fill.ready.pop_front() {
@@ -296,8 +309,10 @@ impl<D: SlotDevice> ExpertStore<D> {
             }
             let (vram, heat) = (&self.vram.sets[layer], self.heat.layer(layer));
             let room = vram.n_free() > keep
-                || (0..heat.len() as u32)
-                    .any(|e| vram.contains(e) && heat[e as usize] <= EMPTY_WORTH);
+                || vram
+                    .room_worths(self.step, heat)
+                    .first()
+                    .is_some_and(|coldest| *coldest < heat[expert as usize]);
             if !room {
                 // Something else took the room: it stays in RAM.
                 fill.stats.ram += 1;

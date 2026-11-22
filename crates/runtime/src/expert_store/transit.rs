@@ -447,10 +447,19 @@ impl<D: SlotDevice> ExpertStore<D> {
             let Some((member, worth, false)) = vram.victim(self.step, heat) else {
                 return Ok(false);
             };
+            // A member on loan leaves first, but the newcomer becomes a member:
+            // it has to beat the coldest member, which goes on loan instead.
+            let (member, worth, lent) = match vram.coldest_member(self.step, heat) {
+                Some((coldest, cold)) if vram.is_loaned(member) => (coldest, cold, Some(coldest)),
+                _ => (member, worth, None),
+            };
             let stays = worth <= 0.0 || self.ram.sets[layer].contains(member);
             let needed = if stays { worth } else { rule.margin * worth + rule.bonus };
             if own <= needed {
                 return Ok(false);
+            }
+            if let Some(coldest) = lent {
+                self.vram.sets[layer].lend(coldest);
             }
         }
         let started = self.vram.sets[layer].start_read(expert, Want::Demand, self.step, heat);
