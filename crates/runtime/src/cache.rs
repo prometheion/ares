@@ -1508,11 +1508,30 @@ mod tests {
     }
 
     #[test]
+    fn a_root_keeps_its_place_while_the_other_checkpoints_take_turns() {
+        let mut pool = PagePool::new(8, PER_PAGE);
+        let mut cache = cache(2);
+        let hashes = three_pages(&mut cache, &mut pool);
+        // The end of a system prompt, then two more checkpoints of the same
+        // request: the budget holds two, and the plain one goes.
+        assert!(cache.save(0, hashes[0], Owner(1), true).taken);
+        assert!(cache.save(0, hashes[1], Owner(1), false).taken);
+        let third = cache.save(0, hashes[2], Owner(1), false);
+        assert_eq!((third.taken, third.dropped), (true, 1));
+        assert!(cache.index.is_root(hashes[0]));
+        assert_eq!(cache.index.checkpoint(hashes[1]), None);
+        // A prompt that finds the root as another text's plain checkpoint
+        // marks it.
+        assert!(!cache.save(1, hashes[2], Owner(2), true).taken);
+        assert!(cache.index.is_root(hashes[2]));
+    }
+
+    #[test]
     fn a_place_whose_checkpoint_is_dropped_waits_for_the_restore_that_reads_it() {
         let mut pool = PagePool::new(8, PER_PAGE);
         let mut cache = cache(1);
         let hashes = three_pages(&mut cache, &mut pool);
-        assert!(cache.save(0, hashes[0], Owner(1)).taken);
+        assert!(cache.save(0, hashes[0], Owner(1), false).taken);
         let (copies, _) = written(&mut cache);
         assert_eq!(copies, [StateCopy { kind: StateCopyKind::Save, slot: 0, place: 0 }]);
 
@@ -1520,14 +1539,14 @@ mod tests {
         // another checkpoint is taken: the budget holds one, so the first is
         // dropped from the index, and its place is not reused yet.
         cache.restore(3, CheckpointId(0));
-        let second = cache.save(1, hashes[1], Owner(2));
+        let second = cache.save(1, hashes[1], Owner(2), false);
         assert_eq!((second.taken, second.dropped), (false, 1), "the only place is still read");
         assert_eq!(cache.index.checkpoint(hashes[0]), None);
         let (copies, _) = written(&mut cache);
         assert_eq!(copies, [StateCopy { kind: StateCopyKind::Restore, slot: 3, place: 0 }]);
 
         // With the record written the place is free for the next checkpoint.
-        assert!(cache.save(1, hashes[1], Owner(2)).taken);
+        assert!(cache.save(1, hashes[1], Owner(2), false).taken);
         let (copies, _) = written(&mut cache);
         assert_eq!(copies, [StateCopy { kind: StateCopyKind::Save, slot: 1, place: 0 }]);
     }
@@ -1537,15 +1556,15 @@ mod tests {
         let mut pool = PagePool::new(8, PER_PAGE);
         let mut cache = cache(1);
         let hashes = three_pages(&mut cache, &mut pool);
-        assert!(cache.save(0, hashes[0], Owner(1)).taken);
+        assert!(cache.save(0, hashes[0], Owner(1), false).taken);
         written(&mut cache);
         cache.restore(3, CheckpointId(0));
-        assert!(!cache.save(1, hashes[1], Owner(2)).taken);
+        assert!(!cache.save(1, hashes[1], Owner(2), false).taken);
         // The sequence that was to restore it ended before the record: the
         // restore is not carried out, and the place is free.
         assert!(cache.cancel_restore(3));
         assert!(!cache.cancel_restore(3));
-        assert!(cache.save(1, hashes[1], Owner(2)).taken);
+        assert!(cache.save(1, hashes[1], Owner(2), false).taken);
         let (copies, _) = written(&mut cache);
         assert_eq!(copies, [StateCopy { kind: StateCopyKind::Save, slot: 1, place: 0 }]);
     }
@@ -1597,14 +1616,14 @@ mod tests {
         let mut pool = PagePool::new(8, PER_PAGE);
         let mut cache = cache(1);
         let hashes = three_pages(&mut cache, &mut pool);
-        assert!(cache.save(0, hashes[2], Owner(1)).taken);
+        assert!(cache.save(0, hashes[2], Owner(1), false).taken);
         written(&mut cache);
         // The chain goes from its end: the last page takes its checkpoint, and
         // its place is free for the next one.
         let given = cache.evict(&mut pool, 1);
         assert_eq!((given.pages, given.checkpoints), (1, 1));
         assert_eq!(cache.evictions, 1);
-        assert!(cache.save(5, hashes[1], Owner(1)).taken);
+        assert!(cache.save(5, hashes[1], Owner(1), false).taken);
         let (copies, _) = written(&mut cache);
         assert_eq!(copies, [StateCopy { kind: StateCopyKind::Save, slot: 5, place: 0 }]);
         assert_eq!(cache.evict(&mut pool, 5).pages, 2, "two pages are left");
@@ -1810,8 +1829,8 @@ mod tests {
         let mut f = f;
         // A checkpoint is still taken, in the one place, and the next one
         // takes the place over.
-        assert!(f.cache.save(0, f.hashes[0], Owner(1)).taken);
-        let second = f.cache.save(1, f.hashes[1], Owner(1));
+        assert!(f.cache.save(0, f.hashes[0], Owner(1), false).taken);
+        let second = f.cache.save(1, f.hashes[1], Owner(1), false);
         assert_eq!((second.taken, second.dropped), (true, 1));
         assert_eq!(f.cache.index.checkpoint(f.hashes[0]), None);
         assert!(f.cache.index.checkpoint(f.hashes[1]).is_some());
@@ -1827,8 +1846,8 @@ mod tests {
             Cache::new("m", &spec, None, &config, PER_PAGE).with_ram(Some(f.ram.clone()));
         assert_eq!(f.ram.cache_allowance(), 100, "one place");
         let hashes = three_pages(&mut plain, &mut f.pool);
-        assert!(plain.save(0, hashes[0], Owner(1)).taken);
-        let second = plain.save(1, hashes[1], Owner(1));
+        assert!(plain.save(0, hashes[0], Owner(1), false).taken);
+        let second = plain.save(1, hashes[1], Owner(1), false);
         assert_eq!((second.taken, second.dropped), (true, 1));
     }
 
@@ -1837,8 +1856,8 @@ mod tests {
         let mut f = Following::new("leave");
         let mut devices = Devices::default();
         // One request's checkpoints: neither is left behind by the other.
-        assert!(f.cache.save(0, f.hashes[1], Owner(1)).taken);
-        assert!(f.cache.save(1, f.hashes[2], Owner(1)).taken);
+        assert!(f.cache.save(0, f.hashes[1], Owner(1), false).taken);
+        assert!(f.cache.save(1, f.hashes[2], Owner(1), false).taken);
         assert_eq!(written(&mut f.cache).0.len(), 2);
         // RAM holds both: nothing goes to the drive.
         let asked = f.pumped(&mut devices);
@@ -1860,8 +1879,8 @@ mod tests {
         // when it goes: a deeper one on its branch is where a prompt resumes.
         let mut f = Following::new("behind");
         let mut devices = Devices::default();
-        assert!(f.cache.save(0, f.hashes[1], Owner(1)).taken);
-        assert!(f.cache.save(1, f.hashes[2], Owner(2)).taken);
+        assert!(f.cache.save(0, f.hashes[1], Owner(1), false).taken);
+        assert!(f.cache.save(1, f.hashes[2], Owner(2), false).taken);
         written(&mut f.cache);
         f.machine_has(0);
         assert_eq!(f.trimmed(&mut devices), 1);
@@ -1876,8 +1895,8 @@ mod tests {
         let mut devices = Devices::default();
         // A sequence reaches two page boundaries in the same step: two saves
         // wait for the next record.
-        assert!(f.cache.save(0, f.hashes[1], Owner(1)).taken);
-        assert!(f.cache.save(1, f.hashes[2], Owner(1)).taken);
+        assert!(f.cache.save(0, f.hashes[1], Owner(1), false).taken);
+        assert!(f.cache.save(1, f.hashes[2], Owner(1), false).taken);
         // The machine runs short before that record is written: the cache
         // keeps the one place of its floor and gives the other checkpoint up.
         f.machine_has(0);
@@ -1894,7 +1913,7 @@ mod tests {
     fn a_page_that_leaves_the_devices_goes_to_ram_and_comes_back_from_there() {
         let mut f = Following::new("pages");
         let mut devices = Devices::default();
-        assert!(f.cache.save(0, f.hashes[2], Owner(1)).taken);
+        assert!(f.cache.save(0, f.hashes[2], Owner(1), false).taken);
         written(&mut f.cache);
         let tokens: Vec<u32> = (0..13).collect();
         let chain = f.cache.chain(&tokens);

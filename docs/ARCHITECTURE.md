@@ -543,13 +543,33 @@ one array per part, indexed by page number.
   The state is `f32` today: 150
   MiB for Qwen3.8-27B over both cards (94 and 56 MiB at shares of 0.625 /
   0.375), plus 20 KiB for the MTP block's carry.
-  - Where: only at page boundaries and at the end of a tail. Inside a prompt
-    at least 32 768 cells apart, while generating at least 2 048, measured
+  - Where: only at page boundaries and at the end of a tail. A prompt of a
+    conversation names where its parts end (`Boundary`): the chat template
+    knows it, and the model reads it off the template
+    (`Model::encode_with_boundaries`, see "Where the parts of a conversation
+    end" below). A later prompt that changes the conversation after such a
+    place (an edited message, an older tool result cut, a new conversation
+    with the same system prompt) shares everything before it. So a checkpoint
+    is kept at the **roots**, the page boundary at or before the end of the
+    tool list and of the system prompt, always (the llama.cpp fork's
+    `--checkpoint-root`); at **every message boundary**, the page boundary at
+    or before it, when it lies at least 1024 cells after the last checkpoint
+    (a conversation of short messages would copy the state at every page
+    otherwise); inside a prompt at least 8192 cells apart (the fork's
+    spacing; ExLlamaV3 has 32 768), while generating at least 2 048, measured
     from the last checkpoint on the sequence's own path; always at the
     prompt's anchor, the last page boundary at least one row before the
     prompt's end, where the next turn of a conversation resumes; and the live
     state at the end of a request becomes the checkpoint of its tail. The
-    commit takes a checkpoint when it crosses one of these positions.
+    commit takes a checkpoint when it crosses one of these positions, and a
+    step ends there. A step cut short costs a pass over the weights (for
+    Flash-Next over its experts), so a prompt step that ends on a page
+    boundary at most a piece of prompt (`Model::prompt_rows`) before a message
+    boundary that is due takes that boundary's checkpoint where it ends: a
+    prompt read from its start in pieces of whole pages is never cut for a
+    message boundary, its checkpoints lie up to a piece before them, and two
+    of them lie a piece apart at least (for the 27B's pieces of 256 rows the
+    1024 cells decide; Flash-Next's pieces are larger).
   - What a prompt replays: K and V are taken from every cached page and from
     a tail, however far the last checkpoint is behind them. The rows between
     that checkpoint and the end of the cached cells run again to rebuild the
@@ -557,14 +577,42 @@ one array per part, indexed by page number.
     shared and saves the writes (and the scale search of the low-bit
     formats), not the rows' time: `Resume` names the checkpoint, the replayed
     rows and the computed rows.
-  - Which go when the byte budget is full: first the checkpoints that later
-    requests have left behind (more than a set number of later requests have
-    checkpoints below them, on one branch; a checkpoint where texts branch
-    is never such), then the one with the least distance to the next
-    checkpoint toward the start of the text, which is the rows a resume
-    replays more without it, then the least recently used. A checkpoint goes
-    without its K/V page; a page evicted from the end of a chain takes its
-    checkpoint along.
+  - Which go when the byte budget is full: first the aged ones. A checkpoint
+    on one branch of the text is aged when a later request has checkpoints
+    below it (TokenSpeed), or when three or more checkpoints lie below it: a
+    conversation keeps its newest three (the fork keeps the newest three of a
+    cached prompt), so a long prompt with many message boundaries does not
+    push the newest checkpoints of other conversations out. A checkpoint where
+    texts branch is never aged. The roots are never aged either and go after
+    every other checkpoint: every new conversation of an agent starts there.
+    Among the rest the one with the least distance to the next checkpoint
+    toward the start of the text goes first, which is the rows a resume
+    replays more without it (the fork's `--checkpoint-spread`: the kept ones
+    thin out evenly), then the least recently used. A checkpoint goes without
+    its K/V page; a page evicted from the end of a chain takes its checkpoint
+    along. A root keeps its mark when its page goes to RAM and comes back, is
+    never "left behind" for the drive (it is written when it leaves RAM, if
+    its text is long enough for the drive), and comes back from the drive as
+    a plain checkpoint.
+- **Where the parts of a conversation end** (`ares-model`, `chat.rs`). The
+  engine renders the template, so it renders a conversation a second time,
+  with a mark (a character of the private use area and the message's number)
+  before and after the text of every message that is not empty, inside the
+  white space at either end of the text, which templates trim. The places of
+  the marks in the text without them are the boundaries, and they count only
+  when that text is the prompt to the byte: a template that reads a message's
+  text otherwise than writing it (a test whether it is empty, a split of it)
+  renders something else with the marks, and such a prompt has no boundaries.
+  A mark the template writes twice is left out. A byte place becomes a token
+  place through the lengths of the tokens' pieces; a place inside a token
+  counts where the token starts. The roots are the start and the end of the
+  system prompt and the start of the first message after it: Qwen3.5's and
+  Qwen3.8's templates write the tools before the system prompt, so its start
+  is the end of the tool list; a template that writes them after it ends them
+  at the first message. Measured on the three model files' templates (a
+  conversation with tools, a call with reasoning, its result, an answer):
+  two boundaries per message, three roots. Plain text (`/completion`) has
+  none.
 - Admission (`ares_sched::Admission`): nothing is reserved for a request's
   longest possible length. Pages are claimed per step. A reservation covers
   the rest of the running prompts and the output they are expected to
@@ -6877,8 +6925,10 @@ a field of a beta is served or refused by its name in the body.
 - **The billing line of Claude Code.** Claude Code begins its system prompt
   with `x-anthropic-billing-header: ...; cch=a5145;`, whose `cch` is another
   one in every request. Left alone it would part every prompt from the cached
-  one at its first line, so its five characters are overwritten, as
-  llama-server does. Nothing else of a prompt is changed.
+  one at its first line, so the five bytes after `cch=` become `fffff` when a
+  `;` follows them, in a system prompt that is a string and in every text
+  block of one, exactly as upstream llama-server does it (PR 21793). Nothing
+  else of a prompt is changed.
 
 A stream is `message_start`, then for every block `content_block_start`, its
 deltas (`thinking_delta`, `text_delta`, `input_json_delta`; a thinking block

@@ -24,7 +24,8 @@
 //!   copy the state at every page. A prompt step that ends a little before the
 //!   boundary (at most [`CheckpointPolicy::boundary_reach`] cells, a page
 //!   boundary) takes it where it ends, so that no step is cut for it: a step
-//!   that is cut costs a pass over the weights;
+//!   that is cut costs a pass over the weights. Two such checkpoints are
+//!   therefore the reach apart at least, too;
 //! - inside a prompt at least [`CheckpointPolicy::prompt_interval`] cells
 //!   apart (the fixed distance), while generating at least
 //!   [`CheckpointPolicy::generation_interval`] apart: measured from the last
@@ -227,7 +228,7 @@ impl CheckpointPolicy {
         // checkpoint, at the end of a step that ends a little before one, or
         // at the boundary.
         let reach = floor(u64::from(self.boundary_reach));
-        let step_end = (to % per_page == 0).then_some(to);
+        let step_end = to.is_multiple_of(per_page).then_some(to);
         let parts = boundaries.iter().filter_map(|boundary| {
             let at = floor(boundary.at);
             if at <= from.max(last) || at >= anchor {
@@ -236,7 +237,9 @@ impl CheckpointPolicy {
             if boundary.root {
                 return (at <= to).then_some(at);
             }
-            if at < last + u64::from(self.boundary_interval) {
+            // Too close to the last checkpoint, or within reach of it: a
+            // step that ended there served the boundary already.
+            if at < last + u64::from(self.boundary_interval).max(reach) {
                 return None;
             }
             match step_end {
@@ -760,6 +763,13 @@ mod tests {
         // No budget, no checkpoints.
         let none = CheckpointPolicy { budget_bytes: 0, ..p };
         assert_eq!(captures_at(&none, 6000, &parts, 0, 0, 6000, 256), []);
+        // Pieces larger than the interval: a boundary is served once, at the
+        // end of the piece before it, and the next boundary that is due lies
+        // a piece further at least; no step is cut.
+        let wide = CheckpointPolicy { boundary_reach: 2048, ..p };
+        let many: Vec<Boundary> = (1..40).map(|i| boundary(i * 300)).collect();
+        let taken = captures_at(&wide, 12_000, &many, 0, 0, 12_000, 2048);
+        assert_eq!(taken, [2048, 4096, 6144, 8192, 10_240, 11_904]);
     }
 
     const PER_PAGE: u32 = 4;

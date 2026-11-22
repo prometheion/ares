@@ -21,12 +21,15 @@ Vulkan parity last.
 ## Next, in this order (the owner, 2026-11-17, after the gap study)
 For "CUDA complete", the order in which the items below are taken up; each item stays in its
 section further down.
-1. Pin Claude Code's billing stamp at the start of its system prompt as upstream llama.cpp does
+1. [x] Pin Claude Code's billing stamp at the start of its system prompt as upstream llama.cpp does
    (the owner, 2026-11-17: on `/v1/messages` the five characters after `cch=` become `fffff`).
-2. A root checkpoint at the end of the system prompt and the tool list, a checkpoint at every
+   Done 2026-11-22 (branch `cache/checkpoints`): it was there since 2026-11-12 with a stricter
+   rule (letters and digits only); now upstream's to the byte.
+2. [x] A root checkpoint at the end of the system prompt and the tool list, a checkpoint at every
    message boundary, and checkpoints at fixed distances inside a long prompt, for both models:
    a change in the middle of a conversation (an older tool result cut, an edited message) then
    costs only the rows from the last checkpoint before it (prompt cache; the owner, 2026-11-18).
+   Done 2026-11-22 (branch `cache/checkpoints`, see "Prompt cache" below for what is left).
 3. Large prompt chunks for Flash-Next with expert slots borrowed in VRAM, batch and micro-batch
    adjustable, adaptive when another request waits (experts from the SSD).
 4. Done 2026-11-22 (`server/flash-api`): tools, structured output and the Messages and Responses
@@ -561,14 +564,20 @@ Flash-Next); experts that do not fit in VRAM in RAM; K/V in int8. Its README giv
       or recompute a bridge of N tokens after the change, or recompute the tokens whose K/V
       deviate most (CacheBlend: about 15 %). Measure first: an early message changed, exact
       recompute against each way, KL of the next tokens and how far the reply parts; then a dial.
-- [ ] A root checkpoint at the end of the system prompt and of the tool list, a checkpoint at
+- [x] A root checkpoint at the end of the system prompt and of the tool list, a checkpoint at
       every message boundary and at fixed distances inside a long prompt (the owner, 2026-11-18),
-      for both models: today a new conversation that shares a
-      12k-token system prompt replays every row (about 10 s on the 27B, a minute on Flash-Next);
-      the owner's fork runs `checkpoint-root = 2048` (gap study `/var/tmp/ares-survey/gap-study-2026-11-17.md`).
-- [ ] Claude Code writes a new billing stamp (`x-anthropic-billing-header ... cch=...`) at the
+      for both models (2026-11-22, branch `cache/checkpoints`; "Sequence state" in
+      `ARCHITECTURE.md`). Open: a root that comes back from the drive is a plain checkpoint
+      again (the store keeps no mark); message checkpoints that later requests left behind are
+      not written to the drive, so with one checkpoint place in RAM (Flash-Next at `--ram 8G`)
+      an edit far back resumes from the root or from the drive's deepest checkpoint before it;
+      a message boundary is 1024 cells from the last checkpoint at least, and a prompt step
+      that ends a piece before it takes it there (not measured: what a cut step costs
+      Flash-Next with the large prompt chunks of item 3).
+- [x] Claude Code writes a new billing stamp (`x-anthropic-billing-header ... cch=...`) at the
       start of its system prompt on every request, so every turn misses the cache from there;
       upstream llama.cpp, the owner's fork and Strata pin it (gap study `/var/tmp/ares-survey/gap-study-2026-11-17.md`).
+      Pinned on `/v1/messages` as upstream does (2026-11-22).
 - [ ] Saving and loading a conversation's state by name (llama.cpp's `slot-save-path`, in the
       owner's preset), and pinning one in the cache (gap study `/var/tmp/ares-survey/gap-study-2026-11-17.md`).
 - [x] RAM level for the K/V state that leaves VRAM; write to SSD when the RAM level evicts

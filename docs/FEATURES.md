@@ -44,6 +44,12 @@ the kernels exist; no model runs there yet.
 ## Caches and memory
 - Prefix cache (both models): automatic, shared by all requests; checkpoints of the state per
   sequence (recurrent state, Flash-Next's indexer keys, n-gram history and feed, MTP block).
+- Checkpoints where conversations part (both models): at the end of the system prompt and of
+  the tool list (kept longest), at every message boundary (1024 tokens apart at least), every
+  8192 tokens of a prompt; a new conversation with the same system prompt, an edited message or
+  a cut tool result replays only from the last one before the change.
+- Claude Code's billing stamp (`cch=` in its system prompt) pinned on `/v1/messages`, as
+  upstream llama.cpp does, so its turns hit the prompt cache.
 - Prompt cache in RAM: what leaves the cards is kept in page-locked RAM inside `--ram`,
   the lowest user of it (below Flash-Next's tier of experts), and comes back from there;
   elastic, without a flag; one checkpoint place is always kept, so a conversation resumes
