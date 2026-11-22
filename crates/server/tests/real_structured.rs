@@ -7,7 +7,9 @@
 //! The server runs in this process over the real engine (requests go through
 //! the router without a socket). Needs `ARES_TEST_CUDA=1` and
 //! `ARES_TEST_QWEN35_MODEL` (the 0.8B); `ARES_TEST_DEVICE` names the device
-//! (default 0).
+//! (default 0). With `ARES_TEST_API_MODEL` the tests run on that file instead,
+//! loaded as `ares --model` loads it (Flash-Next, the 27B: see
+//! `api_model/mod.rs`).
 //!
 //! ```sh
 //! ARES_TEST_CUDA=1 ARES_TEST_QWEN35_MODEL=Qwen3.5-0.8B-Q4_K_M.gguf \
@@ -29,10 +31,16 @@ use axum::http::{Request, header};
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
+mod api_model;
+
 const CHAT: &str = "/v1/chat/completions";
 const COMPLETIONS: &str = "/v1/completions";
 
+/// The 0.8B, or the model of `ARES_TEST_API_MODEL`.
 fn model_path() -> Option<PathBuf> {
+    if let Some(path) = api_model::path() {
+        return Some(path);
+    }
     if std::env::var_os("ARES_TEST_CUDA").is_none() {
         eprintln!("skipped: set ARES_TEST_CUDA=1 to run the tests that open GPUs");
         return None;
@@ -51,12 +59,28 @@ struct Served {
     app: Router,
     engine: Arc<dyn Engine>,
     path: PathBuf,
+    /// Whether a request gives the same tokens every time.
+    repeatable: bool,
+    /// The model loaded as the server loads it, which this keeps loaded.
+    _loaded: Option<api_model::ApiModel>,
 }
 
 impl Served {
-    /// Starts the engine on the 0.8B. With `thinking` the model thinks when a
-    /// request does not say otherwise; without, it does not.
+    /// Starts the engine on the 0.8B, or loads the model of
+    /// `ARES_TEST_API_MODEL`. With `thinking` the model thinks when a request
+    /// does not say otherwise; without, it does not.
     fn start(path: &PathBuf, thinking: bool) -> Self {
+        if api_model::path().is_some() {
+            let model = api_model::ApiModel::load(path, Some(thinking));
+            let engine = model.engine();
+            return Self {
+                app: ares_server::router(engine.clone()),
+                engine,
+                path: path.clone(),
+                repeatable: model.repeatable,
+                _loaded: Some(model),
+            };
+        }
         let options = Options {
             precision: Precision::Exact,
             max_rows: 128,
@@ -85,7 +109,13 @@ impl Served {
         let devices = vec![Device::open(ordinal, Wait::Block).unwrap()];
         let runtime = Arc::new(Runtime::start_gpu(as_model, devices, config, gpu).unwrap());
         let engine: Arc<dyn Engine> = runtime;
-        Self { app: ares_server::router(engine.clone()), engine, path: path.clone() }
+        Self {
+            app: ares_server::router(engine.clone()),
+            engine,
+            path: path.clone(),
+            repeatable: true,
+            _loaded: None,
+        }
     }
 
     /// The token of the tag that closes the thinking, which the chat template
@@ -112,7 +142,8 @@ impl Served {
         (status, serde_json::from_str(&text).unwrap_or(Value::String(text)))
     }
 
-    /// The first choice of a request that is to succeed.
+    /// The first choice of a request that is to succeed, with the hash of its
+    /// tokens (`token_hash`, from the timings).
     async fn chat(&self, question: &str, extra: Value) -> Value {
         let mut body = json!({
             "model": "q",
@@ -123,7 +154,15 @@ impl Served {
         body.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
         let (status, answer) = self.post(CHAT, &body).await;
         assert_eq!(status, 200, "{answer}");
-        answer["choices"][0].clone()
+        let mut choice = answer["choices"][0].clone();
+        choice["token_hash"] = answer["timings"]["token_hash"].clone();
+        choice
+    }
+
+    /// Whether two replies to the same request must be the same.
+    fn must_agree(&self, choice: &Value, other: &Value, what: &str) -> bool {
+        let hash = |choice: &Value| choice["token_hash"].as_str().unwrap_or_default().to_owned();
+        api_model::must_agree(self.repeatable, &hash(choice), &hash(other), what)
     }
 }
 
@@ -300,7 +339,9 @@ async fn with_thinking_on_the_thinking_is_free_and_the_answer_obeys() {
         thinking.len(),
         reasoning_of(&free).len()
     );
-    assert_eq!(thinking, reasoning_of(&free), "the rule changed the thinking");
+    if served.must_agree(&ruled, &free, "thinking with the rule and without") {
+        assert_eq!(thinking, reasoning_of(&free), "the rule changed the thinking");
+    }
     // It is prose, which no JSON value is, and which the schema would have
     // refused from its first character.
     assert!(thinking.len() > 40, "the model did not think: {ruled}");
@@ -347,15 +388,15 @@ async fn with_thinking_on_the_thinking_is_free_and_the_answer_obeys() {
     // all of it.
     assert!(reasoning.len() > 40, "the reply left its thinking at once: {message}");
     let shared = reasoning.len().min(thinking.len());
-    assert!(
-        reasoning.is_char_boundary(shared) && thinking.is_char_boundary(shared),
-        "{reasoning:?}"
-    );
-    assert_eq!(
-        reasoning[..shared].trim_end(),
-        thinking[..shared].trim_end(),
-        "the same thinking up to the tag"
-    );
+    let same = reasoning.is_char_boundary(shared)
+        && thinking.is_char_boundary(shared)
+        && reasoning[..shared].trim_end() == thinking[..shared].trim_end();
+    if served.repeatable {
+        assert!(same, "the same thinking up to the tag: {reasoning:?} and {thinking:?}");
+    } else if !same {
+        // Two runs of a model that is not repeatable, with other tokens.
+        println!("RES the thinking up to the tag is not the free thinking (not repeatable)");
+    }
     // The answer obeys.
     let answer: Value = serde_json::from_str(text).unwrap_or_else(|e| panic!("{text:?}: {e}"));
     let object = answer.as_object().expect("an object");

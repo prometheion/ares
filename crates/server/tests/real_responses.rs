@@ -9,7 +9,9 @@
 //! The server runs in this process over the real engine (requests go through
 //! the router without a socket). Needs `ARES_TEST_CUDA=1` and
 //! `ARES_TEST_QWEN35_MODEL` (the 0.8B); `ARES_TEST_DEVICE` names the device
-//! (default 0).
+//! (default 0). With `ARES_TEST_API_MODEL` the tests run on that file instead,
+//! loaded as `ares --model` loads it (Flash-Next, the 27B: see
+//! `api_model/mod.rs`).
 //!
 //! ```sh
 //! ARES_TEST_CUDA=1 ARES_TEST_QWEN35_MODEL=Qwen3.5-0.8B-Q4_K_M.gguf \
@@ -29,6 +31,8 @@ use axum::http::{Method, Request, header};
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
+mod api_model;
+
 const RESPONSES: &str = "/v1/responses";
 const COUNT: &str = "/v1/responses/input_tokens";
 
@@ -42,6 +46,39 @@ fn small() -> Option<PathBuf> {
         eprintln!("skipped: set ARES_TEST_QWEN35_MODEL to the Qwen3.5-0.8B model file");
     }
     path
+}
+
+/// The server, and what it serves.
+struct Served {
+    app: Router,
+    /// Whether a request gives the same tokens every time.
+    repeatable: bool,
+    /// The model loaded as the server loads it, which this keeps loaded.
+    _loaded: Option<api_model::ApiModel>,
+}
+
+impl Served {
+    /// The model of `ARES_TEST_API_MODEL` if one is named, else the 0.8B;
+    /// `None` (and a note) when neither is.
+    fn any() -> Option<Self> {
+        if let Some(path) = api_model::path() {
+            let model = api_model::ApiModel::load(&path, None);
+            let app = ares_server::router(model.engine());
+            return Some(Self { app, repeatable: model.repeatable, _loaded: Some(model) });
+        }
+        let app = served(&small()?);
+        Some(Self { app, repeatable: true, _loaded: None })
+    }
+
+    /// Checks that a stream put together is the response the same request
+    /// gave whole, where they must be the same (`api_model::must_agree`, by
+    /// the hash of the tokens in the timings).
+    fn agree(&self, streamed: Value, whole: Value, what: &str) {
+        let hash = |r: &Value| r["timings"]["token_hash"].as_str().unwrap_or_default().to_owned();
+        if api_model::must_agree(self.repeatable, &hash(&streamed), &hash(&whole), what) {
+            assert_eq!(anonymous(streamed), anonymous(whole), "{what}");
+        }
+    }
 }
 
 /// The server over the 0.8B on one device.
@@ -210,26 +247,26 @@ async fn counted(app: &Router, body: &Value) -> u64 {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_response_is_items_and_its_stream_is_the_same_response() {
-    let Some(path) = small() else { return };
-    let app = served(&path);
+    let Some(served) = Served::any() else { return };
+    let app = &served.app;
 
     // Thinking off: one message.
     let body = request(json!({"reasoning": no_thinking(), "instructions": "Answer briefly."}));
-    let plain = response(&app, &body).await;
+    let plain = response(app, &body).await;
     println!("RES plain: {plain}");
     assert_eq!(kinds(&plain), ["message"], "{plain}");
     let text = plain["output"][0]["content"][0]["text"].as_str().unwrap();
     assert!(text.contains("Paris"), "{plain}");
     assert_eq!(plain["status"], "completed");
     assert!(plain["usage"]["output_tokens"].as_u64().unwrap() > 0);
-    assert_eq!(counted(&app, &body).await, plain["usage"]["input_tokens"].as_u64().unwrap());
-    assert_eq!(anonymous(streamed(&app, &body).await), anonymous(plain));
+    assert_eq!(counted(app, &body).await, plain["usage"]["input_tokens"].as_u64().unwrap());
+    served.agree(streamed(app, &body).await, plain, "plain");
 
     // Thinking as the template has it: if the model thinks, its reasoning is
     // the first item, with the reasoning itself as its content.
     let body =
         request(json!({"max_output_tokens": 600, "include": ["reasoning.encrypted_content"]}));
-    let thought = response(&app, &body).await;
+    let thought = response(app, &body).await;
     println!("RES thinking: {thought}");
     if kinds(&thought).contains(&"reasoning") {
         assert_eq!(kinds(&thought)[0], "reasoning", "{thought}");
@@ -240,7 +277,7 @@ async fn a_response_is_items_and_its_stream_is_the_same_response() {
     } else {
         println!("RES thinking: the template leaves thinking off without a request for it");
     }
-    assert_eq!(anonymous(streamed(&app, &body).await), anonymous(thought.clone()));
+    served.agree(streamed(app, &body).await, thought.clone(), "thinking");
 
     // The output sent back with the next question: counted, and run with
     // the count as its input. How much of it the cache gave is printed.
@@ -249,8 +286,8 @@ async fn a_response_is_items_and_its_stream_is_the_same_response() {
     input.push(json!({"role": "user", "content": "And of Italy?"}));
     let mut next = body.clone();
     next["input"] = Value::Array(input);
-    let count = counted(&app, &next).await;
-    let second = response(&app, &next).await;
+    let count = counted(app, &next).await;
+    let second = response(app, &next).await;
     println!("RES second turn: {second}");
     assert_eq!(second["usage"]["input_tokens"], count, "{second}");
     println!(
@@ -262,7 +299,7 @@ async fn a_response_is_items_and_its_stream_is_the_same_response() {
     );
 
     // The limit: the response is incomplete and says why.
-    let cut = response(&app, &request(json!({"max_output_tokens": 3}))).await;
+    let cut = response(app, &request(json!({"max_output_tokens": 3}))).await;
     assert_eq!(cut["status"], "incomplete", "{cut}");
     assert_eq!(cut["incomplete_details"], json!({"reason": "max_output_tokens"}));
     assert_eq!(cut["usage"]["output_tokens"], 3);
@@ -271,8 +308,8 @@ async fn a_response_is_items_and_its_stream_is_the_same_response() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_required_call_is_a_function_call_item_and_its_output_is_answered() {
-    let Some(path) = small() else { return };
-    let app = served(&path);
+    let Some(served) = Served::any() else { return };
+    let app = &served.app;
     let question = json!({"role": "user", "content": "How is the weather in Paris, in celsius?"});
     for choice in [json!("required"), json!({"type": "function", "name": "get_weather"})] {
         let body = request(json!({
@@ -281,7 +318,7 @@ async fn a_required_call_is_a_function_call_item_and_its_output_is_answered() {
             "tool_choice": choice,
             "reasoning": no_thinking(),
         }));
-        let called = response(&app, &body).await;
+        let called = response(app, &body).await;
         println!("RES call ({choice}): {called}");
         assert_eq!(called["status"], "completed", "{called}");
         let call = called["output"].as_array().unwrap().last().unwrap().clone();
@@ -293,7 +330,7 @@ async fn a_required_call_is_a_function_call_item_and_its_output_is_answered() {
         let arguments: Value = serde_json::from_str(call["arguments"].as_str().unwrap()).unwrap();
         assert!(arguments["city"].is_string(), "{call}");
         assert!(["celsius", "fahrenheit"].contains(&arguments["unit"].as_str().unwrap()));
-        assert_eq!(anonymous(streamed(&app, &body).await), anonymous(called.clone()));
+        served.agree(streamed(app, &body).await, called.clone(), "a call");
 
         // The output goes back, and the model answers in text.
         let mut input = vec![question.clone()];
@@ -306,8 +343,8 @@ async fn a_required_call_is_a_function_call_item_and_its_output_is_answered() {
         let mut next = body.clone();
         next["tool_choice"] = json!("auto");
         next["input"] = Value::Array(input);
-        let count = counted(&app, &next).await;
-        let answer = response(&app, &next).await;
+        let count = counted(app, &next).await;
+        let answer = response(app, &next).await;
         println!("RES answer: {answer}");
         assert_eq!(answer["usage"]["input_tokens"], count);
         assert!(kinds(&answer).contains(&"message"), "{answer}");
@@ -320,7 +357,7 @@ async fn a_required_call_is_a_function_call_item_and_its_output_is_answered() {
             "tool_choice": choice,
             "reasoning": no_thinking(),
         }));
-        let reply = response(&app, &body).await;
+        let reply = response(app, &body).await;
         println!("RES {choice}: {reply}");
         if choice == "none" {
             assert!(!kinds(&reply).contains(&"function_call"), "{reply}");
@@ -337,7 +374,7 @@ async fn a_required_call_is_a_function_call_item_and_its_output_is_answered() {
     let format =
         json!({"type": "json_schema", "name": "capital", "strict": true, "schema": schema});
     let body = request(json!({"text": {"format": format}, "reasoning": no_thinking()}));
-    let reply = response(&app, &body).await;
+    let reply = response(app, &body).await;
     println!("RES schema: {reply}");
     let text = reply["output"].as_array().unwrap().last().unwrap()["content"][0]["text"].clone();
     let answer: Value = serde_json::from_str(text.as_str().unwrap()).unwrap();
@@ -353,20 +390,20 @@ async fn a_required_call_is_a_function_call_item_and_its_output_is_answered() {
         request(json!({"tools": [{"type": "web_search"}]})),
     ];
     for body in refusals {
-        let (status, text) = post(&app, RESPONSES, &body).await;
+        let (status, text) = post(app, RESPONSES, &body).await;
         assert_eq!(status, 400, "{text}");
         let error: Value = serde_json::from_str(&text).unwrap();
         assert_eq!(error["error"]["type"], "invalid_request_error", "{text}");
     }
     let (status, text) =
-        send(&app, Method::GET, "/v1/responses/resp_0000000000000000", &json!({})).await;
+        send(app, Method::GET, "/v1/responses/resp_0000000000000000", &json!({})).await;
     assert_eq!(status, 404, "{text}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn the_count_of_a_chat_request_is_the_prompt_it_reports() {
-    let Some(path) = small() else { return };
-    let app = served(&path);
+    let Some(served) = Served::any() else { return };
+    let app = &served.app;
     let chat_tools = json!([{"type": "function", "function": weather()[0]}]);
     let bodies = [
         json!({"messages": [{"role": "user", "content": QUESTION}]}),
@@ -383,10 +420,10 @@ async fn the_count_of_a_chat_request_is_the_prompt_it_reports() {
     for extra in bodies {
         let mut body = json!({"model": "q", "max_tokens": 20, "temperature": 0});
         body.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
-        let (status, text) = post(&app, "/v1/chat/completions/input_tokens", &body).await;
+        let (status, text) = post(app, "/v1/chat/completions/input_tokens", &body).await;
         assert_eq!(status, 200, "{text}");
         let counted: Value = serde_json::from_str(&text).unwrap();
-        let (status, text) = post(&app, "/v1/chat/completions", &body).await;
+        let (status, text) = post(app, "/v1/chat/completions", &body).await;
         assert_eq!(status, 200, "{text}");
         let answer: Value = serde_json::from_str(&text).unwrap();
         println!("RES chat count: {counted} for {}", answer["usage"]);

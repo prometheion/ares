@@ -9,7 +9,10 @@
 //! The server runs in this process over the real engine (requests go through
 //! the router without a socket). Needs `ARES_TEST_CUDA=1` and
 //! `ARES_TEST_QWEN35_MODEL` (the 0.8B); `ARES_TEST_DEVICE` names the device
-//! (default 0).
+//! (default 0). With `ARES_TEST_API_MODEL` the tests run on that file instead,
+//! loaded as `ares --model` loads it (Flash-Next, the 27B: see
+//! `api_model/mod.rs`); a message of a model whose replies are not repeatable
+//! is compared with its stream only when the two are the same.
 //!
 //! ```sh
 //! ARES_TEST_CUDA=1 ARES_TEST_QWEN35_MODEL=Qwen3.5-0.8B-Q4_K_M.gguf \
@@ -32,6 +35,8 @@ use axum::body::Body;
 use axum::http::{Request, header};
 use serde_json::{Value, json};
 use tower::ServiceExt;
+
+mod api_model;
 
 const MESSAGES: &str = "/v1/messages";
 const COUNT: &str = "/v1/messages/count_tokens";
@@ -85,6 +90,41 @@ impl Engine for Counting {
 
     fn stats(&self) -> Option<EngineStats> {
         self.runtime.stats()
+    }
+}
+
+/// The server, and what it serves.
+struct Served {
+    app: Router,
+    /// Whether a request gives the same tokens every time.
+    repeatable: bool,
+    /// The model loaded as the server loads it, which this keeps loaded.
+    _loaded: Option<api_model::ApiModel>,
+}
+
+impl Served {
+    /// The model of `ARES_TEST_API_MODEL` if one is named, else the 0.8B;
+    /// `None` (and a note) when neither is.
+    fn any() -> Option<Self> {
+        if let Some(path) = api_model::path() {
+            let model = api_model::ApiModel::load(&path, None);
+            let app = ares_server::router(model.engine());
+            return Some(Self { app, repeatable: model.repeatable, _loaded: Some(model) });
+        }
+        let app = served(&small()?);
+        Some(Self { app, repeatable: true, _loaded: None })
+    }
+
+    /// Checks that a stream put together is the message the same request
+    /// gave whole: always for a repeatable model, and for one that is not
+    /// when they are the same reply (the API has no hash of the tokens).
+    fn agree(&self, streamed: Value, whole: Value, what: &str) {
+        let (streamed, whole) = (anonymous(streamed), anonymous(whole));
+        if self.repeatable {
+            assert_eq!(streamed, whole, "{what}");
+        } else if streamed != whole {
+            println!("RES {what}: the stream is another reply (not repeatable): {streamed}");
+        }
     }
 }
 
@@ -235,12 +275,12 @@ fn weather() -> Value {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_message_is_blocks_and_its_stream_is_the_same_message() {
-    let Some(path) = small() else { return };
-    let app = served(&path);
+    let Some(served) = Served::any() else { return };
+    let app = &served.app;
 
     // Thinking off: one text block.
     let body = request(json!({"thinking": {"type": "disabled"}}));
-    let plain = message(&app, &body).await;
+    let plain = message(app, &body).await;
     println!("RES plain: {plain}");
     let content = plain["content"].as_array().unwrap();
     assert_eq!(content.len(), 1, "{plain}");
@@ -248,18 +288,18 @@ async fn a_message_is_blocks_and_its_stream_is_the_same_message() {
     assert!(content[0]["text"].as_str().unwrap().contains("Paris"), "{plain}");
     assert_eq!(plain["stop_reason"], "end_turn");
     assert!(plain["usage"]["output_tokens"].as_u64().unwrap() > 0);
-    assert_eq!(anonymous(streamed(&app, &body).await), anonymous(plain));
+    served.agree(streamed(app, &body).await, plain, "plain");
 
     // Thinking on: a thinking block first, signed with the fixed text.
     let body =
         request(json!({"thinking": {"type": "enabled", "budget_tokens": 1024}, "max_tokens": 600}));
-    let thought = message(&app, &body).await;
+    let thought = message(app, &body).await;
     println!("RES thinking: {thought}");
     let content = thought["content"].as_array().unwrap();
     assert_eq!(content[0]["type"], "thinking", "{thought}");
     assert!(!content[0]["thinking"].as_str().unwrap().is_empty());
     assert_eq!(content[0]["signature"], "unsigned");
-    assert_eq!(anonymous(streamed(&app, &body).await), anonymous(thought.clone()));
+    served.agree(streamed(app, &body).await, thought.clone(), "thinking");
 
     // The reply sent back with the next question: counted, and run with the
     // count as its prompt. How much of it the cache gave is printed.
@@ -269,10 +309,10 @@ async fn a_message_is_blocks_and_its_stream_is_the_same_message() {
         {"role": "assistant", "content": thought["content"]},
         {"role": "user", "content": "And of Italy?"},
     ]);
-    let (status, counted) = post(&app, COUNT, &next).await;
+    let (status, counted) = post(app, COUNT, &next).await;
     assert_eq!(status, 200, "{counted}");
     let counted: Value = serde_json::from_str(&counted).unwrap();
-    let second = message(&app, &next).await;
+    let second = message(app, &next).await;
     println!("RES second turn: {second}");
     assert_eq!(counted["input_tokens"], prompt_tokens(&second), "{counted} {second}");
     println!(
@@ -284,15 +324,15 @@ async fn a_message_is_blocks_and_its_stream_is_the_same_message() {
     );
 
     // The limit: the reason says so.
-    let cut = message(&app, &request(json!({"max_tokens": 3}))).await;
+    let cut = message(app, &request(json!({"max_tokens": 3}))).await;
     assert_eq!(cut["stop_reason"], "max_tokens", "{cut}");
     assert_eq!(cut["usage"]["output_tokens"], 3);
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_required_call_is_a_tool_use_block_and_its_result_is_answered() {
-    let Some(path) = small() else { return };
-    let app = served(&path);
+    let Some(served) = Served::any() else { return };
+    let app = &served.app;
     let question = json!({"role": "user", "content": "How is the weather in Paris, in celsius?"});
     for choice in [json!({"type": "any"}), json!({"type": "tool", "name": "get_weather"})] {
         let body = request(json!({
@@ -301,7 +341,7 @@ async fn a_required_call_is_a_tool_use_block_and_its_result_is_answered() {
             "tool_choice": choice,
             "thinking": {"type": "disabled"},
         }));
-        let called = message(&app, &body).await;
+        let called = message(app, &body).await;
         println!("RES call ({}): {called}", choice["type"]);
         assert_eq!(called["stop_reason"], "tool_use", "{called}");
         let content = called["content"].as_array().unwrap();
@@ -310,7 +350,7 @@ async fn a_required_call_is_a_tool_use_block_and_its_result_is_answered() {
         assert!(call["id"].as_str().unwrap().starts_with("toolu_"));
         assert!(call["input"]["city"].is_string(), "{call}");
         assert!(["celsius", "fahrenheit"].contains(&call["input"]["unit"].as_str().unwrap()));
-        assert_eq!(anonymous(streamed(&app, &body).await), anonymous(called.clone()));
+        served.agree(streamed(app, &body).await, called.clone(), "a call");
 
         // The result goes back, and the model answers in text.
         let mut next = body.clone();
@@ -322,10 +362,10 @@ async fn a_required_call_is_a_tool_use_block_and_its_result_is_answered() {
                 {"type": "tool_result", "tool_use_id": call["id"], "content": "Sunny, 21 degrees."},
             ]},
         ]);
-        let (status, counted) = post(&app, COUNT, &next).await;
+        let (status, counted) = post(app, COUNT, &next).await;
         assert_eq!(status, 200, "{counted}");
         let counted: Value = serde_json::from_str(&counted).unwrap();
-        let answer = message(&app, &next).await;
+        let answer = message(app, &next).await;
         println!("RES answer: {answer}");
         assert_eq!(counted["input_tokens"], prompt_tokens(&answer));
         assert!(answer["content"].as_array().unwrap().iter().any(|block| block["type"] == "text"));
@@ -338,7 +378,7 @@ async fn a_required_call_is_a_tool_use_block_and_its_result_is_answered() {
             "tool_choice": {"type": choice},
             "thinking": {"type": "disabled"},
         }));
-        let reply = message(&app, &body).await;
+        let reply = message(app, &body).await;
         println!("RES {choice}: {reply}");
         if choice == "none" {
             assert_ne!(reply["stop_reason"], "tool_use", "{reply}");
@@ -348,7 +388,7 @@ async fn a_required_call_is_a_tool_use_block_and_its_result_is_answered() {
     // What is not served is refused in Anthropic's shape.
     let image = json!({"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AA=="}});
     let (status, text) =
-        post(&app, MESSAGES, &request(json!({"messages": [{"role": "user", "content": [image]}]})))
+        post(app, MESSAGES, &request(json!({"messages": [{"role": "user", "content": [image]}]})))
             .await;
     assert_eq!(status, 400, "{text}");
     let error: Value = serde_json::from_str(&text).unwrap();

@@ -10,8 +10,11 @@
 //! The server runs in this process over the real engine (requests go through
 //! the router without a socket). Needs `ARES_TEST_CUDA=1` and
 //! `ARES_TEST_QWEN35_MODEL` (the 0.8B); `ARES_TEST_DEVICE` names the device
-//! (default 0). The tests on the 27B need `ARES_TEST_QWEN35_27B`
-//! (Qwen3.8-27B-UD-Q4_K_S.gguf) and two GPUs.
+//! (default 0). With `ARES_TEST_API_MODEL` the tests that are not about one
+//! model run on that file instead, loaded as `ares --model` loads it
+//! (Flash-Next, the 27B: see `api_model/mod.rs`). The tests on the 27B with
+//! its drafts need `ARES_TEST_QWEN35_27B` (Qwen3.8-27B-UD-Q4_K_S.gguf) and
+//! two GPUs.
 //!
 //! ```sh
 //! ARES_TEST_CUDA=1 ARES_TEST_QWEN35_MODEL=Qwen3.5-0.8B-Q4_K_M.gguf \
@@ -32,6 +35,8 @@ use axum::body::Body;
 use axum::http::{Request, header};
 use serde_json::{Value, json};
 use tower::ServiceExt;
+
+mod api_model;
 
 const CHAT: &str = "/v1/chat/completions";
 
@@ -59,10 +64,35 @@ fn large() -> Option<PathBuf> {
 struct Served {
     app: Router,
     engine: Arc<dyn Engine>,
-    runtime: Arc<Runtime>,
+    /// The runtime, when it was built here (not for a model loaded as the
+    /// server loads it).
+    runtime: Option<Arc<Runtime>>,
+    path: PathBuf,
+    /// Whether a request gives the same tokens every time.
+    repeatable: bool,
+    /// The model loaded as the server loads it, which this keeps loaded.
+    _loaded: Option<api_model::ApiModel>,
 }
 
 impl Served {
+    /// The model of `ARES_TEST_API_MODEL` if one is named, else the 0.8B;
+    /// `None` (and a note) when neither is.
+    fn any() -> Option<Self> {
+        if let Some(path) = api_model::path() {
+            let model = api_model::ApiModel::load(&path, None);
+            let engine = model.engine();
+            return Some(Self {
+                app: ares_server::router(engine.clone()),
+                engine,
+                runtime: None,
+                path,
+                repeatable: model.repeatable,
+                _loaded: Some(model),
+            });
+        }
+        small().map(|path| Self::start(&path))
+    }
+
     /// The 0.8B on one device.
     fn start(path: &PathBuf) -> Self {
         let options = Options {
@@ -83,7 +113,7 @@ impl Served {
         };
         let ordinal =
             std::env::var("ARES_TEST_DEVICE").ok().and_then(|d| d.parse().ok()).unwrap_or(0);
-        Self::serve(model, config, vec![Device::open(ordinal, Wait::Block).unwrap()])
+        Self::serve(model, config, vec![Device::open(ordinal, Wait::Block).unwrap()], path)
     }
 
     /// The 27B over both cards with its MTP block and the n-gram drafter
@@ -109,15 +139,32 @@ impl Served {
         };
         let devices =
             vec![Device::open(0, Wait::Block).unwrap(), Device::open(1, Wait::Block).unwrap()];
-        Self::serve(model, config, devices)
+        Self::serve(model, config, devices, path)
     }
 
-    fn serve(model: Qwen35, config: RuntimeConfig, devices: Vec<Device>) -> Self {
+    fn serve(model: Qwen35, config: RuntimeConfig, devices: Vec<Device>, path: &PathBuf) -> Self {
         let as_model: Arc<dyn Model> = Arc::new(model);
         let gpu = GpuConfig::new(&config, &*as_model);
         let runtime = Arc::new(Runtime::start_gpu(as_model, devices, config, gpu).unwrap());
         let engine: Arc<dyn Engine> = runtime.clone();
-        Self { app: ares_server::router(engine.clone()), engine, runtime }
+        Self {
+            app: ares_server::router(engine.clone()),
+            engine,
+            runtime: Some(runtime),
+            path: path.clone(),
+            repeatable: true,
+            _loaded: None,
+        }
+    }
+
+    /// Checks that two replies to the same request are the same reply, where
+    /// they must be (`api_model::must_agree`), and each on its own.
+    fn agree(&self, reply: &Reply, other: &Reply, what: &str) {
+        check(reply);
+        check(other);
+        if api_model::must_agree(self.repeatable, &reply.hash, &other.hash, what) {
+            assert_eq!(reply, other, "{what}");
+        }
     }
 
     async fn post(&self, body: &Value) -> (u16, String) {
@@ -139,7 +186,8 @@ impl Served {
     /// The drafts of the model's MTP block that the engine has verified
     /// and accepted so far, and those of the n-gram drafter.
     fn drafts(&self) -> [(u64, u64); 2] {
-        let counters = self.runtime.snapshot().expect("the conductor answers").counters;
+        let runtime = self.runtime.as_ref().expect("a runtime built here");
+        let counters = runtime.snapshot().expect("the conductor answers").counters;
         [1, 0].map(|source| {
             let verified: u64 = counters.draft_lengths[source]
                 .iter()
@@ -292,8 +340,7 @@ const WEATHER: &str = "What will the weather be in Paris over the next 3 days?";
 
 #[tokio::test(flavor = "multi_thread")]
 async fn the_template_of_the_model_declares_the_tagged_calls() {
-    let Some(path) = small() else { return };
-    let served = Served::start(&path);
+    let Some(served) = Served::any() else { return };
     let format = served.engine.chat_format("q").expect("a chat format");
     let tools = format.tools.expect("a format for calls");
     assert_eq!(tools.trigger(), "<tool_call>");
@@ -302,8 +349,7 @@ async fn the_template_of_the_model_declares_the_tagged_calls() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_call_that_is_required_or_named_is_a_valid_call() {
-    let Some(path) = small() else { return };
-    let served = Served::start(&path);
+    let Some(served) = Served::any() else { return };
     for (what, extra) in [
         ("required", json!({"tool_choice": "required"})),
         ("required, one call", json!({"tool_choice": "required", "parallel_tool_calls": false})),
@@ -339,8 +385,7 @@ async fn a_call_that_is_required_or_named_is_a_valid_call() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn with_auto_the_model_calls_or_answers_and_a_stream_is_the_same_reply() {
-    let Some(path) = small() else { return };
-    let served = Served::start(&path);
+    let Some(served) = Served::any() else { return };
     let mut called = 0;
     for question in [
         WEATHER,
@@ -355,7 +400,7 @@ async fn with_auto_the_model_calls_or_answers_and_a_stream_is_the_same_reply() {
         assert_eq!(reply.finish, expected, "{reply:?}");
         called += usize::from(!reply.calls.is_empty());
         let streamed = served.stream(&body).await;
-        assert_eq!(streamed, reply, "the stream is the whole reply");
+        served.agree(&streamed, &reply, "the stream is the whole reply");
     }
     println!("RES auto: {called} of 3 questions were answered with calls");
     assert!(called >= 1, "the model never called a tool it was offered for the weather");
@@ -363,8 +408,7 @@ async fn with_auto_the_model_calls_or_answers_and_a_stream_is_the_same_reply() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn with_none_the_reply_is_text() {
-    let Some(path) = small() else { return };
-    let served = Served::start(&path);
+    let Some(served) = Served::any() else { return };
     let reply = served.ask(&request(WEATHER, json!({"tool_choice": "none"}))).await;
     println!("RES none: {reply:?}");
     assert!(reply.calls.is_empty() && reply.finish != "tool_calls", "{reply:?}");
@@ -372,8 +416,7 @@ async fn with_none_the_reply_is_text() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_history_with_calls_and_results_is_answered() {
-    let Some(path) = small() else { return };
-    let served = Served::start(&path);
+    let Some(served) = Served::any() else { return };
     let first = served.ask(&request(WEATHER, json!({"tool_choice": "required"}))).await;
     check(&first);
     let calls: Vec<Value> = first
@@ -401,8 +444,7 @@ async fn a_history_with_calls_and_results_is_answered() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_call_the_limit_cuts_ends_with_length_and_no_markup() {
-    let Some(path) = small() else { return };
-    let served = Served::start(&path);
+    let Some(served) = Served::any() else { return };
     for limit in [3, 8, 14, 20] {
         let body = request(WEATHER, json!({"tool_choice": "required", "max_tokens": limit}));
         let reply = served.ask(&body).await;
@@ -411,7 +453,9 @@ async fn a_call_the_limit_cuts_ends_with_length_and_no_markup() {
         if reply.finish == "length" {
             assert!(reply.calls.len() <= 1, "{reply:?}");
         }
-        assert_eq!(served.stream(&body).await, reply, "cut at {limit}");
+        let streamed = served.stream(&body).await;
+        assert!(!streamed.content.contains('<'), "{streamed:?}");
+        served.agree(&streamed, &reply, &format!("cut at {limit}"));
     }
 }
 
@@ -443,8 +487,7 @@ fn tools_without_text() -> Value {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_call_the_model_opens_inside_its_thinking_is_a_call() {
-    let Some(path) = small() else { return };
-    let served = Served::start(&path);
+    let Some(served) = Served::any() else { return };
     // The model thinks, and the tag that closes its thinking is banned: a
     // call it makes it has to open inside the thinking. The tag and the
     // marker are the template's.
@@ -460,7 +503,8 @@ async fn a_call_the_model_opens_inside_its_thinking_is_a_call() {
     let format = served.engine.chat_format("q").expect("a chat format");
     let close = format.thinking.expect("the model thinks").end_tag().to_owned();
     let marker = format.tools.expect("a format for calls").trigger().to_owned();
-    let tokenizer = ares_tokenizer::Tokenizer::from_gguf(&Gguf::open(&path).unwrap()).unwrap();
+    let tokenizer =
+        ares_tokenizer::Tokenizer::from_gguf(&Gguf::open(&served.path).unwrap()).unwrap();
     let options = ares_tokenizer::EncodeOptions { add_special: false, parse_special: true };
     let closing = tokenizer.encode(&close, options);
     assert_eq!(closing.len(), 1, "{close} is {closing:?}");
@@ -515,29 +559,32 @@ async fn a_call_the_model_opens_inside_its_thinking_is_a_call() {
         let mut raw = body.clone();
         raw["reasoning_format"] = json!("none");
         let raw = served.ask(&raw).await;
-        assert_eq!(raw.hash, reply.hash, "{what}: the same tokens");
         assert!(raw.content.starts_with("<think>"), "{what}: {raw:?}");
-        assert!(
-            !raw.content.contains(&close),
-            "{what}: the model spelled the banned tag out, so no call was inside the thinking"
-        );
-        assert_eq!(raw.calls, reply.calls, "{what}: the raw reply has the same calls");
-        // Nothing of the marker in the text, and no answer: the reasoning up
-        // to the marker and the call after it are the whole reply.
-        assert!(!raw.content.contains(&marker), "{what}: the marker in the content");
-        assert_eq!(raw.content.trim_end(), format!("<think>\n{}", reply.reasoning).trim_end());
+        if api_model::must_agree(served.repeatable, &raw.hash, &reply.hash, what) {
+            assert!(
+                !raw.content.contains(&close),
+                "{what}: the model spelled the banned tag out, so no call was inside the thinking"
+            );
+            assert_eq!(raw.calls, reply.calls, "{what}: the raw reply has the same calls");
+            // Nothing of the marker in the text, and no answer: the reasoning
+            // up to the marker and the call after it are the whole reply.
+            assert!(!raw.content.contains(&marker), "{what}: the marker in the content");
+            let thought = format!("<think>\n{}", reply.reasoning);
+            assert_eq!(raw.content.trim_end(), thought.trim_end());
+        }
         assert_eq!(reply.finish, "tool_calls", "{what}: {reply:?}");
         assert_eq!(reply.calls, [reply.calls[0].clone()], "{what}: one call");
         if what == "named" {
             assert_eq!(reply.calls[0].0, "get_weather");
         }
         thought += usize::from(!reply.reasoning.is_empty());
-        assert_eq!(served.stream(&body).await, reply, "{what}: the stream is the whole reply");
+        let streamed = served.stream(&body).await;
+        served.agree(&streamed, &reply, &format!("{what}: the stream is the whole reply"));
         let mut plain = body.clone();
         plain["draft"] = json!(false);
         let without = served.ask(&plain).await;
-        assert_eq!(without.hash, reply.hash, "{what}: the tokens with drafts are those without");
-        assert_eq!(without, reply, "{what}");
+        let same = format!("{what}: the tokens with drafts are those without");
+        served.agree(&without, &reply, &same);
     }
     println!("RES in the thinking: {thought} of 4 replies thought before the call");
     assert!(thought > 0, "no reply thought before its call: the reasoning before one is not shown");
@@ -559,7 +606,8 @@ async fn a_call_the_model_opens_inside_its_thinking_is_a_call() {
     println!("RES in the thinking, none: {reply:?}");
     assert!(reply.calls.is_empty() && reply.finish != "tool_calls", "{reply:?}");
     assert_eq!(reply.content, "", "the thinking was never closed");
-    assert_eq!(served.stream(&body).await, reply, "none: the stream is the whole reply");
+    let streamed = served.stream(&body).await;
+    served.agree(&streamed, &reply, "none: the stream is the whole reply");
 }
 
 #[tokio::test(flavor = "multi_thread")]
