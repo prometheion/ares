@@ -66,6 +66,7 @@ Merged 2026-11-22 after the test machine's one card passed every GPU suite (`fix
 | 7 and the server part of 8: priorities of requests, system messages and efforts on the chat and Responses routes, Messages items, thinking budget, special tokens, truncation, small ones | handed back, being verified (`server/priorities`) |
 | Image input, pieces 4 to 8 (the owner, 2026-11-22: next, for production): the tower as a conductor job, the splices in both models, the routes, caching | handed back; with the CPU kernels and the priorities in one line of commits (`server/priorities`), being verified on the local cards |
 | Flash-Next's second card measured at load (experts only or a dense share), capped cards measuring their prefill path per type, the MTP test that fails split by layers | agent working on the local cards (`devices/load-choice`) |
+| DFlash2 trees and the experts of a tree's tokens read ahead, phase 1 (the owner, 2026-11-22: pulled forward if it brings a lot): acceptance of trees against chains, the extra experts a tree costs, how well draft tokens predict their experts, the estimate | agent measuring (`flash/trees-study`) |
 
 ## Shared model layer (the owner's rule, 2026-11-16)
 Generic for Ares, not like llama.cpp: a few models, shared code where it can be, each model
