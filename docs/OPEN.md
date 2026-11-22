@@ -215,16 +215,28 @@ Strata kept 0.1.65, which the comparisons use until a newer engine starts there.
       without drafts. The dense weights (3.85 GiB) at the card's 288 GB/s are 14 ms alone: the
       floor of decode on this card is there, not in the experts.
 - [ ] Prompts on the test machine at 40 GiB: 3 to 4 times behind Strata 0.1.60 at 8k and 32k
-      tokens (Ares 250 and 281 tokens/s, Strata 787 and 1192). A prompt read alone takes steps of
+      tokens (Ares 250 and 281 tokens/s, Strata 787 and 1192). A prompt read alone took steps of
       2048 rows on the VRAM the slots lend on this card (Strata: chunks of 8192), and in such a
       step nearly every expert is picked, so the ~20 800 experts without a VRAM slot cross the
       x4 link once per step: about 45 GB at 6.4 GB/s, 7 s per 2048 rows, 290 tokens/s, which is
-      what was measured. The dense part's activation form (one form for all dense matrices in a
-      wide step) is a small part of it. Levers: larger lent steps, or the CPU taking the experts
-      a wide step picks for few rows (Strata's CPU share of prompt chunks up to 3072 tokens).
-- [ ] The agent suite on the test machine (b-a-on, 2026-11-22): a turn whose prompt is almost
-      all cached is read as if it were not (6832 tokens with 6784 cached: 31.2 s, the same as
-      uncached; 622 with 512 cached: 12.0 s); Strata 0.33-0.47 s.
+      what was measured. Built on `flash/prompt` (2026-11-22): loans from every pool of slots in
+      pieces, steps in multiples of 256 rows, the read, core and n-gram buffers in one place on
+      a loan (725 -> 486 KiB a row), the CPU's share of steps of up to 2048 rows, a dense
+      activation form per type. To measure there against Strata 0.1.65. What is left beside
+      them: the uploads of a layer start only with its record, so the link rests while the next
+      layer's dense half runs (read the next layer's experts ahead in a wide step whose rows
+      pick nearly every expert); the CPU takes no part in steps of more than 2048 rows; about 50
+      KiB a row of VRAM (the step's inputs, plans, predictions) is sized for the widest step for
+      good, which bounds `--batch-size` and costs decode its slots.
+- [x] The agent suite on the test machine (b-a-on, 2026-11-22): a turn whose prompt is almost
+      all cached was read as if it were not (6832 tokens with 6784 cached: 31.2 s, the same as
+      uncached; 622 with 512 cached: 12.0 s); Strata 0.33-0.47 s. Two causes: the anchor of the
+      first ask lost its place to its end state where the roots held all places but one (fixed,
+      `flash/prompt` ebe5061, test in `runtime/tests/prefix.rs`), and every small wide step paid
+      a pass of uploads (the CPU's share of wide steps). To measure there.
+- [ ] A cached prompt's replayed rows and its computed rows are steps of their own (and a
+      prompt step is cut at a root): two passes over the experts where one would do; with the
+      CPU's share of small steps cheaper, not built.
 - [ ] Transit adoption (`transit_adopt`, the prompt chunks' experts taking VRAM slots after a
       wide step) asks only "hotter than the coldest member" (with the swap margin when the member
       has to be copied down), not the rule of a promotion; left as it was for the work on prompt
