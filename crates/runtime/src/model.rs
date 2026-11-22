@@ -15,6 +15,7 @@ use ares_sampler::SampleParams;
 use ares_state::{Boundary, PageLayout};
 
 use crate::exec::Pick;
+use crate::image::{ImageInput, ImageSpan};
 use crate::links::Links;
 use crate::ram::PinnedRam;
 use crate::record::RecordView;
@@ -316,6 +317,41 @@ pub struct StepContext<'a> {
     pub bytes_per_page: u64,
     /// The paths to the other devices.
     pub links: &'a Links,
+    /// The image stage: the rows of the step's image cells, `f32` rows of
+    /// [`Vision::width`] values in page-locked memory, which the record's
+    /// image runs name ([`RecordView::image_run`](crate::RecordView)). Null
+    /// for a model without images. Unchanged until the step has ended.
+    pub image_stage: *const f32,
+}
+
+/// What a model that reads images tells the runtime ([`Model::vision`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Vision {
+    /// The `f32` values of an image row: the model's width.
+    pub width: u32,
+    /// The most rows of one image.
+    pub max_rows: u32,
+    /// The device part that runs the image tower.
+    pub device: usize,
+    /// The units of the tower's pass, which a job runs a range of
+    /// ([`TowerJob::units`]).
+    pub units: u32,
+}
+
+/// One piece of work of the image tower, run on the device part that holds it
+/// between steps ([`DeviceModel::tower`]): units `units` of the pass over
+/// `image`. A pass may take several jobs; the part keeps what the pass has
+/// computed between them, and the jobs of one pass come one after the other,
+/// with no other image's in between. The job that runs the last unit reads the
+/// image's rows back into `rows`.
+#[derive(Debug)]
+pub struct TowerJob {
+    pub image: std::sync::Arc<ImageInput>,
+    pub units: std::ops::Range<u32>,
+    /// `image.rows() * width` values, filled by the job that ends the pass.
+    pub rows: Vec<f32>,
+    /// What the job took on the device, in milliseconds.
+    pub ms: f64,
 }
 
 /// Where a device part left the logits of a step.
@@ -343,13 +379,16 @@ pub struct ModelDrafts {
     pub tokens: u32,
 }
 
-/// A prompt as the model's tokens, and where the parts of a conversation end
-/// in them ([`Model::encode_with_boundaries`]).
+/// A prompt as the model's tokens, where the parts of a conversation end in
+/// them ([`Model::encode_with_boundaries`]), and the images in it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct EncodedPrompt {
+    /// An image's cells carry the model's pad token.
     pub tokens: Vec<u32>,
     /// Ascending, each at most the number of tokens; none for plain text.
     pub boundaries: Vec<Boundary>,
+    /// The images, ascending by their first cell.
+    pub images: Vec<ImageSpan>,
 }
 
 /// One device's part of a model.
@@ -409,6 +448,13 @@ pub trait DeviceModel: Send {
         Err(ModelError::Invalid("this model moves no state to the host".into()))
     }
 
+    /// Runs a job of the image tower, between steps, and returns when it has
+    /// run: only the part [`Vision::device`] names is asked. The default is a
+    /// part without a tower.
+    fn tower(&mut self, _stream: &Stream, _job: &mut TowerJob) -> Result<(), ModelError> {
+        Err(ModelError::Invalid("this part has no image tower".into()))
+    }
+
     /// Device milliseconds the part's own drafter took in the step that ran
     /// last. Asked after that step has ended.
     fn model_draft_ms(&mut self) -> f64 {
@@ -456,7 +502,13 @@ pub trait Model: Send + Sync + 'static {
     /// conversation with the same system prompt) replays only the rows from
     /// there. The chat template knows the places; the default knows none.
     fn encode_with_boundaries(&self, prompt: &Prompt) -> Result<EncodedPrompt, EngineError> {
-        Ok(EncodedPrompt { tokens: self.encode(prompt)?, boundaries: Vec::new() })
+        Ok(EncodedPrompt { tokens: self.encode(prompt)?, ..EncodedPrompt::default() })
+    }
+
+    /// The image tower the model reads images through, if it has one: a model
+    /// without one refuses prompts with images in [`Model::encode`].
+    fn vision(&self) -> Option<Vision> {
+        None
     }
 
     /// What the model's chat template declares: how the model marks its

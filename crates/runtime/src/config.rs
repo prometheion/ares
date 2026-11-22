@@ -42,6 +42,12 @@ pub struct RuntimeConfig {
     /// together; the checkpoints and the pages share it, and it follows the
     /// machine (see "Host memory" in `docs/ARCHITECTURE.md`).
     pub cache_ram: u64,
+    /// The most bytes the rows of images take that the image tower has
+    /// computed (ordinary memory, by image; see [`crate::ImageStore`]): a
+    /// prompt that sends an image again, and a replay of cached cells of an
+    /// image, take them from there instead of running the tower again. The
+    /// least recently used image goes first.
+    pub image_rows: u64,
     /// The least distance in cells between checkpoints inside a prompt, and
     /// while generating, and from the last checkpoint to a message boundary
     /// that gets one (`ares_state::CheckpointPolicy`).
@@ -112,6 +118,7 @@ impl Default for RuntimeConfig {
             output_clip: 4096,
             output_ratio: 0.7,
             cache_ram: 0,
+            image_rows: 256 << 20,
             checkpoint_prompt_interval: 8192,
             checkpoint_generation_interval: 2048,
             checkpoint_boundary_interval: 1024,

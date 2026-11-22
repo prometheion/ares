@@ -552,7 +552,7 @@ impl Model for SyntheticModel {
     fn encode_with_boundaries(&self, prompt: &Prompt) -> Result<EncodedPrompt, EngineError> {
         let tokens = self.encode(prompt)?;
         let Prompt::Chat { messages, continue_final, .. } = prompt else {
-            return Ok(EncodedPrompt { tokens, boundaries: Vec::new() });
+            return Ok(EncodedPrompt { tokens, ..EncodedPrompt::default() });
         };
         let count = |text: &str| -> u64 {
             text.chars()
@@ -571,7 +571,7 @@ impl Model for SyntheticModel {
             at += count("\n");
         }
         boundaries.dedup_by_key(|b| b.at);
-        Ok(EncodedPrompt { tokens, boundaries })
+        Ok(EncodedPrompt { tokens, boundaries, images: Vec::new() })
     }
 
     fn piece(&self, token: u32, text: &mut Vec<u8>) {

@@ -271,6 +271,11 @@ pub struct Counters {
     pub model_draft_steps: u64,
     pub model_draft_links: u64,
     pub model_draft_us: u64,
+    /// The image tower: the units of its passes that ran, their device time
+    /// in microseconds, and the images whose rows it computed.
+    pub tower_units: u64,
+    pub tower_us: u64,
+    pub images_computed: u64,
     /// Links the windows asked the model's MTP block for, the links it
     /// did not make of them because it ended a chain at its bar, and the
     /// drafts it made that the round did not verify (the conductor took fewer

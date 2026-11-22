@@ -250,7 +250,7 @@ impl Runtime {
             (None, Some(structure)) => Some(self.grammars.filter(structure)?),
             (None, None) => None,
         };
-        let EncodedPrompt { tokens: prompt, boundaries } =
+        let EncodedPrompt { tokens: prompt, boundaries, images } =
             self.model.encode_with_boundaries(&request.prompt)?;
         if prompt.is_empty() {
             return Err(EngineError::InvalidRequest(
@@ -287,6 +287,7 @@ impl Runtime {
             id: request.id,
             prompt,
             boundaries,
+            images,
             max_tokens: request.max_tokens,
             stop: Watch::new(&request.stop, thinking),
             sampling: request.sampling,

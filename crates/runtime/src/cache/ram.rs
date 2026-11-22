@@ -84,7 +84,7 @@ pub(super) struct Entry {
     /// of the page it hangs under.
     pub depth: u32,
     /// The tokens of a tail; `None` for a full page.
-    pub tail: Option<Vec<u32>>,
+    pub tail: Option<Vec<u64>>,
     /// The bytes, a part per device; `None` while they are in a transfer or
     /// with the writer.
     pub parts: Option<Vec<TransitPart>>,
@@ -104,7 +104,7 @@ type Key = (Class, u64, Item, ChainHash);
 
 impl Entry {
     /// A page or tail with nothing decided yet about its place in the order.
-    pub fn new(parent: ChainHash, depth: u32, tail: Option<Vec<u32>>) -> Self {
+    pub fn new(parent: ChainHash, depth: u32, tail: Option<Vec<u64>>) -> Self {
         Self {
             parent,
             depth,

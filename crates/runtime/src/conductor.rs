@@ -50,6 +50,20 @@
 //! a page table and a row of logits each) and by the pool; the ones that wait
 //! are not bounded.
 //!
+//! # Images
+//!
+//! A prompt's images take cells of their own ([`crate::ImageSpan`]), whose
+//! rows the model's image tower computes. The tower runs between steps, on the
+//! device that holds it, as prompt work: a piece of prompt starts with as many
+//! units of the tower's pass as fit the time of a piece while sequences
+//! generate, and with the whole pass while none does. Its time is charged to
+//! the share like a piece's. A prompt is read up to the first image whose rows
+//! are not in the store ([`crate::ImageStore`]); the step that reaches an
+//! image copies its rows into the image stage, and every row is written at
+//! its rotary position. The prefix cache names an image's cells by the image
+//! and the row ([`crate::cell_name`]), so a conversation with an image resumes
+//! from its pages like any other.
+//!
 //! # The prefix cache
 //!
 //! For a model that takes part ([`Model::prefix_cache`]) the pages and the
@@ -98,8 +112,9 @@ use ares_state::{
 use crate::cache::Cache;
 use crate::config::RuntimeConfig;
 use crate::exec::{Clock, ExecError, Executor, StepMeta, StepOutput};
-use crate::model::{ContextSpec, Drafter, DrafterKind, Model};
-use crate::record::{self, Commit, RecordWriter, Row, TableUpdate};
+use crate::image::{ImageInput, ImageRows, ImageSpan, ImageStore, Spans, cell_name};
+use crate::model::{ContextSpec, Drafter, DrafterKind, Model, TowerJob, Vision};
+use crate::record::{self, Commit, ImageRun, RecordWriter, Row, TableUpdate};
 use crate::sampling::{Context, RequestSampler, StepRows, TokenFilter};
 use crate::timing::{Calibration, DRAFT_POSITIONS, Phase, RequestReport, Snapshot, Stats};
 use crate::watch::Watch;
@@ -200,6 +215,8 @@ pub(crate) struct Submission {
     /// Where the parts of the conversation end in the prompt, for the
     /// checkpoints of the prefix cache.
     pub boundaries: Vec<Boundary>,
+    /// The images of the prompt, ascending.
+    pub images: Vec<ImageSpan>,
     pub max_tokens: Option<u32>,
     /// The stop strings, and what else is watched in the reply's text.
     pub stop: Watch,
@@ -247,8 +264,14 @@ struct Active {
     /// token has no cell until a step computes it. A request that starts from
     /// the prefix cache starts with the cells it shares.
     cells: Sequence,
-    /// The prompt and the output.
+    /// The prompt and the output. An image's cells have the model's pad
+    /// token.
     tokens: Vec<u32>,
+    /// The names of the cells of `tokens` for the prefix cache: a text cell's
+    /// is its token, an image cell's its own ([`cell_name`]).
+    names: Vec<u64>,
+    /// The images of the prompt.
+    spans: Spans,
     /// Per token, the host-side context state (see [`ContextSpec`]).
     states: Vec<u32>,
     prompt_len: u32,
@@ -368,6 +391,53 @@ impl Active {
         self.known.saturating_sub(self.cells.len() as u32) + self.replay_left
     }
 
+    /// The first image of the prompt from where the state is on whose rows
+    /// `store` does not have.
+    fn missing_image(&self, store: &ImageStore) -> Option<Arc<ImageInput>> {
+        let from = self.state_pos() as u32;
+        let i = self.spans.from(from)?;
+        self.spans.spans()[i..]
+            .iter()
+            .take_while(|s| s.first < self.known)
+            .find(|s| !store.contains(&s.image.name))
+            .map(|s| s.image.clone())
+    }
+
+    /// How many of `rows` rows from cell `from` can run now: those before the
+    /// first image whose rows `store` does not have.
+    fn ready_rows(&self, from: u64, rows: u32, store: &ImageStore) -> u32 {
+        let from = from as u32;
+        let Some(i) = self.spans.from(from) else { return rows };
+        for span in &self.spans.spans()[i..] {
+            if span.first >= from + rows {
+                break;
+            }
+            if !store.contains(&span.image.name) {
+                return span.first.saturating_sub(from).min(rows);
+            }
+        }
+        rows
+    }
+
+    /// How many of `rows` rows from cell `from` fit `room` rows of the image
+    /// stage, and the image rows among them.
+    fn rows_within(&self, from: u64, rows: u32, room: u32) -> (u32, u32) {
+        let from = from as u32;
+        let Some(i) = self.spans.from(from) else { return (rows, 0) };
+        let mut used = 0;
+        for span in &self.spans.spans()[i..] {
+            if span.first >= from + rows {
+                break;
+            }
+            let (lo, hi) = (span.first.max(from), span.end().min(from + rows));
+            if used + (hi - lo) > room {
+                return (lo + (room - used) - from, room);
+            }
+            used += hi - lo;
+        }
+        (rows, used)
+    }
+
     /// The most tokens the request may still generate in a context of
     /// `context_length`: its limit, or the room the context leaves.
     fn max_new_tokens(&self, context_length: u32) -> u32 {
@@ -396,6 +466,7 @@ impl Active {
             }
             let previous = self.states.last().copied().unwrap_or_else(|| spec.start());
             self.tokens.push(token);
+            self.names.push(u64::from(token));
             self.states.push(spec.advance(previous, &self.tokens));
             self.drafter.push(corpus, token);
             let piece_at = self.pending.len();
@@ -484,6 +555,17 @@ fn take_characters(pending: &mut Vec<u8>, mut push: impl FnMut(char) -> bool) ->
     stopped
 }
 
+/// A pass of the image tower under way: its image, the next unit and the
+/// buffer its rows come back in.
+#[derive(Debug)]
+struct TowerPass {
+    image: Arc<ImageInput>,
+    next: u32,
+    rows: Vec<f32>,
+    /// What the units run so far took, in milliseconds.
+    ms: f64,
+}
+
 /// One sequence's rows in the step being run.
 #[derive(Clone, Copy, Debug)]
 struct StepPart {
@@ -563,6 +645,18 @@ pub(crate) struct Conductor {
     pool: PagePool,
     /// The prefix cache, for a model that takes part in it.
     cache: Option<Cache>,
+    /// The image tower of a model that reads images, the rows it computed,
+    /// the pass under way, and what a unit of a pass took per row of its
+    /// image the last time (milliseconds).
+    vision: Option<Vision>,
+    images: ImageStore,
+    pass: Option<TowerPass>,
+    unit_ms_per_row: Option<f64>,
+    /// The rows of the image stage, and the image runs of the record being
+    /// written with the rows that go into the stage.
+    stage_rows: u32,
+    image_runs: Vec<ImageRun>,
+    staged: Vec<(Arc<ImageRows>, u32, u32)>,
     /// Who runs, who waits and who gives way.
     admission: Admission,
     /// The running requests, by their slot on the devices.
@@ -641,7 +735,7 @@ impl Conductor {
     pub(crate) fn new(
         model: Arc<dyn Model>,
         config: RuntimeConfig,
-        exec: Box<dyn Executor>,
+        mut exec: Box<dyn Executor>,
         rx: Receiver<Command>,
     ) -> Self {
         let max_rows = match config.max_rows {
@@ -664,7 +758,17 @@ impl Conductor {
             max_running: config.max_slots,
             ..AdmissionConfig::new(config.pages, config.cells_per_page)
         };
+        let vision = model.vision();
+        let stage_rows =
+            vision.map_or(0, |v| (exec.image_stage().len() / v.width.max(1) as usize) as u32);
         Self {
+            vision,
+            images: ImageStore::new(config.image_rows),
+            pass: None,
+            unit_ms_per_row: None,
+            stage_rows,
+            image_runs: Vec::new(),
+            staged: Vec::new(),
             spec: model.context(),
             context_length: model.card().context_length,
             span: model.attention_span(),
@@ -1024,8 +1128,18 @@ impl Conductor {
     /// Puts a new request in line. It starts at the next pass of the
     /// admission accounting in which it fits.
     fn enqueue(&mut self, submission: Submission) {
-        let Submission { id, prompt, boundaries, max_tokens, stop, sampling, draft, filter, sink } =
-            submission;
+        let Submission {
+            id,
+            prompt,
+            boundaries,
+            images,
+            max_tokens,
+            stop,
+            sampling,
+            draft,
+            filter,
+            sink,
+        } = submission;
         let refuse = |error: EngineError| {
             let _ = sink.send(Event::Error(error));
         };
@@ -1035,6 +1149,19 @@ impl Conductor {
         if self.by_id.contains_key(&id) {
             return refuse(EngineError::InvalidRequest(format!("request id {id} is in use")));
         }
+        if !images.is_empty() && self.vision.is_none() {
+            return refuse(EngineError::InvalidRequest("the model reads no images".into()));
+        }
+        // The names of the cells: an image's by the image and its row.
+        let mut names: Vec<u64> = prompt.iter().map(|t| u64::from(*t)).collect();
+        for span in &images {
+            for j in 0..span.image.rows() {
+                if let Some(name) = names.get_mut((span.first + j) as usize) {
+                    *name = cell_name(&span.image.name, j);
+                }
+            }
+        }
+        let spans = Spans::new(images);
         // A request without a seed gets one of its own.
         let seed = (self.clock.now_ns() ^ id.0.rotate_left(32)).wrapping_mul(0x9e37_79b9_7f4a_7c15);
         let sampler = match RequestSampler::new(
@@ -1054,10 +1181,10 @@ impl Conductor {
         // missing page another sequence is computing is held back.
         let (chain, cached, idle, waits_for, brought_back) = match &mut self.cache {
             Some(cache) => {
-                let chain = cache.chain(&prompt);
+                let chain = cache.chain(&names);
                 // What RAM has of it comes back now, before the step is
                 // planned, so that the accounting sees the pages it took.
-                let probe = cache.probe(&mut self.pool, Some(&mut *self.exec), &chain, &prompt);
+                let probe = cache.probe(&mut self.pool, Some(&mut *self.exec), &chain, &names);
                 let waits = probe.found.computing.map(|(hash, _)| hash);
                 (chain, probe.resume.cached_cells as u32, probe.idle, waits, probe.brought > 0)
             }
@@ -1114,6 +1241,8 @@ impl Conductor {
             replayed: 0,
             computed: 0,
             tokens,
+            names,
+            spans,
             states,
             drafter: NgramDrafter::new(),
             model_acceptance: (0..self.drafters.len())
@@ -1150,7 +1279,7 @@ impl Conductor {
         let probe = match &mut self.cache {
             Some(cache) => {
                 let a = &self.waiting[i];
-                Some(cache.probe(&mut self.pool, None, &a.chain, &a.tokens[..a.known as usize]))
+                Some(cache.probe(&mut self.pool, None, &a.chain, &a.names[..a.known as usize]))
             }
             None => None,
         };
@@ -1198,7 +1327,7 @@ impl Conductor {
             let counters = &mut self.stats.counters;
             let Resume { cached_cells: cached, restore, replay, .. } = probe.resume;
             a.cells = Sequence::from_shared(&mut self.pool, &probe.found.table(), cached);
-            a.chain = cache.chain_after(&probe.found, &a.tokens[..a.known as usize]);
+            a.chain = cache.chain_after(&probe.found, &a.names[..a.known as usize]);
             // The pages this sequence will fill are its to announce.
             cache.index.announce(a.owner, a.chain.unpublished());
             a.replay_end = cached as u32;
@@ -1243,13 +1372,13 @@ impl Conductor {
             &mut self.pool,
             &mut a.cells,
             &mut a.chain,
-            &a.tokens,
+            &a.names,
             cells,
             Priority::NORMAL,
         );
         cache.note(a.owner, &a.chain, cells, true);
         let full = (cells / per_page) as usize;
-        let rest = &a.tokens[full * per_page as usize..cells as usize];
+        let rest = &a.names[full * per_page as usize..cells as usize];
         let target = if rest.is_empty() {
             full.checked_sub(1).map(|page| a.chain.hashes()[page])
         } else {
@@ -1299,8 +1428,8 @@ impl Conductor {
         let (rows, idle) = match &mut self.cache {
             Some(cache) => {
                 a.looked_at = cache.evictions;
-                let tokens = &a.tokens[..a.known as usize];
-                let probe = cache.probe(&mut self.pool, None, &a.chain, tokens);
+                let names = &a.names[..a.known as usize];
+                let probe = cache.probe(&mut self.pool, None, &a.chain, names);
                 (
                     probe.resume.compute.end.saturating_sub(probe.resume.compute.start) as u32,
                     probe.idle,
@@ -1459,10 +1588,10 @@ impl Conductor {
             }
             a.looked_at = cache.evictions;
             // Before the step is planned: what RAM has comes back now, once.
-            let tokens = &a.tokens[..a.known as usize];
+            let names = &a.names[..a.known as usize];
             let exec: Option<&mut dyn Executor> =
                 if a.brought_back { None } else { Some(&mut *self.exec) };
-            let probe = cache.probe(&mut self.pool, exec, &a.chain, tokens);
+            let probe = cache.probe(&mut self.pool, exec, &a.chain, names);
             a.brought_back |= probe.brought > 0;
             if a.ran {
                 // It gave way and comes back: the rows the cache does not hold.
@@ -1541,11 +1670,13 @@ impl Conductor {
         for (slot, a) in self.slots.iter_mut().enumerate() {
             let Some(a) = a else { continue };
             if !a.generating() {
-                // Prompts wait for their piece.
-                if !round {
+                // Prompts wait for their piece, and for the rows of an image
+                // the tower has not computed yet.
+                let ready = a.ready_rows(a.state_pos(), a.prefill_left(), &self.images);
+                if !round && ready > 0 {
                     self.requests.push(Request {
                         seq: SeqId(slot as u32),
-                        want: Want::Prefill { tokens: a.prefill_left() },
+                        want: Want::Prefill { tokens: ready },
                         waited_steps: a.waited_steps,
                     });
                 }
@@ -1784,6 +1915,17 @@ impl Conductor {
         let turn = self
             .share
             .next(&pending, |rows| prices.ms(load_of(span, deepest, rows)).unwrap_or(0.0));
+        // A piece starts with the image tower's work for the prompts that wait
+        // for an image's rows, charged as prompt work.
+        if let Turn::Piece { .. } = turn
+            && self.vision.is_some()
+        {
+            match self.run_tower(generating) {
+                Ok(ms) if ms > 0.0 => self.share.spent(turn, ms, generating, true),
+                Ok(_) => {}
+                Err(message) => return self.fail(message),
+            }
+        }
         self.want(turn);
         let drafting =
             self.requests.iter().any(|r| matches!(r.want, Want::Window { drafts } if drafts > 0));
@@ -1805,6 +1947,7 @@ impl Conductor {
                 a.waited_steps = a.waited_steps.saturating_add(1);
             }
         }
+        let mut stage_room = self.stage_rows;
         for part in &planned.parts {
             let Some(a) = &self.slots[part.seq.0 as usize] else { continue };
             let mut step = StepPart {
@@ -1829,6 +1972,17 @@ impl Conductor {
                         cache.capture(a.prompt_len, &a.boundaries, a.checkpoint_at, step.from, to)
                 {
                     step.rows = step.rows.min((at - step.from) as u32);
+                }
+                // Up to an image whose rows are not there, and as many image
+                // rows as the stage has room for.
+                if !a.spans.is_empty() {
+                    step.rows = a.ready_rows(step.from, step.rows, &self.images);
+                    let (rows, image_rows) = a.rows_within(step.from, step.rows, stage_room);
+                    step.rows = rows;
+                    stage_room -= image_rows;
+                    if step.rows == 0 {
+                        continue;
+                    }
                 }
                 let completes =
                     !step.replay && a.cells.len() + u64::from(step.rows) == u64::from(a.known);
@@ -1985,6 +2139,92 @@ impl Conductor {
         self.stats.record(Phase::Events, t_events.elapsed().as_nanos() as u64);
         self.stats.record(Phase::Step, began.elapsed().as_nanos() as u64);
         self.stats.counters.steps += 1;
+    }
+
+    /// Runs the image tower for the prompts that wait for an image's rows:
+    /// the pass under way, or a new one for the first such image of the
+    /// shortest of them. While sequences generate it runs as many units as
+    /// fit the time of a piece (by what the units took before), otherwise the
+    /// rest of the pass. A pass that ends leaves its rows in the store.
+    /// Returns what the tower took, in milliseconds (0 when it had nothing to
+    /// do).
+    fn run_tower(&mut self, generating: u32) -> Result<f64, String> {
+        let Some(vision) = self.vision else { return Ok(0.0) };
+        if self.pass.is_none() {
+            let mut waiting: Vec<&Active> =
+                self.slots.iter().flatten().filter(|a| !a.generating()).collect();
+            waiting.sort_by_key(|a| a.prefill_left());
+            let Some(image) = waiting.iter().find_map(|a| a.missing_image(&self.images)) else {
+                return Ok(0.0);
+            };
+            self.pass = Some(TowerPass { image, next: 0, rows: Vec::new(), ms: 0.0 });
+        }
+        let pass = self.pass.as_mut().expect("a pass");
+        let left = vision.units.saturating_sub(pass.next).max(1);
+        let rows = f64::from(pass.image.rows().max(1));
+        let units = if generating == 0 {
+            left
+        } else {
+            // What a unit takes: of this pass so far, or by the rows of the
+            // last one; four units (the stem and three blocks) to learn it.
+            let per_unit = if pass.next > 0 {
+                Some(pass.ms / f64::from(pass.next))
+            } else {
+                self.unit_ms_per_row.map(|per_row| per_row * rows)
+            };
+            match per_unit.filter(|ms| *ms > 0.0) {
+                Some(ms) => ((self.config.piece_ms / ms) as u32).clamp(1, left),
+                None => left.min(4),
+            }
+        };
+        let mut job = TowerJob {
+            image: pass.image.clone(),
+            units: pass.next..pass.next + units,
+            rows: std::mem::take(&mut pass.rows),
+            ms: 0.0,
+        };
+        self.exec.tower(&mut job).map_err(|error| error.to_string())?;
+        pass.next += units;
+        pass.ms += job.ms;
+        self.unit_ms_per_row = Some(pass.ms / f64::from(pass.next) / rows);
+        let counters = &mut self.stats.counters;
+        counters.tower_units += u64::from(units);
+        counters.tower_us += (job.ms * 1e3) as u64;
+        if pass.next >= vision.units {
+            let image = pass.image.clone();
+            self.pass = None;
+            let rows =
+                ImageRows { nx: image.nx, ny: image.ny, width: vision.width, values: job.rows };
+            if rows.values.len() != (image.rows() * vision.width) as usize {
+                return Err(format!(
+                    "the image tower gave {} values for an image of {} rows of {}",
+                    rows.values.len(),
+                    image.rows(),
+                    vision.width
+                ));
+            }
+            self.images.put(image.name, Arc::new(rows));
+            self.stats.counters.images_computed += 1;
+        } else {
+            pass.rows = job.rows;
+        }
+        Ok(job.ms)
+    }
+
+    /// Copies the rows of the step's image runs into the image stage, in the
+    /// order of the runs.
+    fn fill_stage(&mut self) {
+        if self.staged.is_empty() {
+            return;
+        }
+        let width = self.vision.map_or(0, |v| v.width) as usize;
+        let stage = self.exec.image_stage();
+        let mut at = 0;
+        for (rows, first, count) in self.staged.drain(..) {
+            let values = &rows.values[first as usize * width..(first + count) as usize * width];
+            stage[at..at + values.len()].copy_from_slice(values);
+            at += values.len();
+        }
     }
 
     /// Whether `part` is a window whose drafts one of the model's drafters
@@ -2179,6 +2419,9 @@ impl Conductor {
         self.updates.clear();
         self.bars.clear();
         self.worth.clear();
+        self.image_runs.clear();
+        self.staged.clear();
+        let mut stage_at = 0u32;
         let mut row_index = 0u32;
         let counters = &mut self.stats.counters;
         let window = self.spec.window.max(1) as usize;
@@ -2216,13 +2459,42 @@ impl Conductor {
                     for k in 0..part.rows {
                         let position = first_cell + k;
                         writer
-                            .row(Row {
-                                slot: part.slot,
-                                position,
-                                token: a.tokens[position as usize],
-                                context: self.spec.reduce(a.states[position as usize], position),
-                            })
+                            .row_at(
+                                Row {
+                                    slot: part.slot,
+                                    position,
+                                    token: a.tokens[position as usize],
+                                    context: self
+                                        .spec
+                                        .reduce(a.states[position as usize], position),
+                                },
+                                a.spans.rotary(position),
+                            )
                             .map_err(full)?;
+                    }
+                    // The rows of the images among them come from the store,
+                    // through the stage.
+                    if let Some(first) = a.spans.from(first_cell) {
+                        let end = first_cell + part.rows;
+                        for span in a.spans.spans()[first..].iter() {
+                            if span.first >= end {
+                                break;
+                            }
+                            let (lo, hi) = (span.first.max(first_cell), span.end().min(end));
+                            let Some(rows) = self.images.get(&span.image.name) else {
+                                return Err(format!(
+                                    "the rows of an image of request {} are not in the store",
+                                    a.id
+                                ));
+                            };
+                            self.image_runs.push(ImageRun {
+                                row: row_index + (lo - first_cell),
+                                rows: hi - lo,
+                                stage: stage_at,
+                            });
+                            self.staged.push((rows, lo - span.first, hi - lo));
+                            stage_at += hi - lo;
+                        }
                     }
                     if completes {
                         self.runs.push((row_index + part.rows - 1, 1));
@@ -2283,12 +2555,15 @@ impl Conductor {
                         self.samplers.push(row);
                     }
                     writer
-                        .row(Row {
-                            slot: part.slot,
-                            position: first_cell,
-                            token: a.tokens[newest],
-                            context: self.spec.reduce(a.states[newest], first_cell),
-                        })
+                        .row_at(
+                            Row {
+                                slot: part.slot,
+                                position: first_cell,
+                                token: a.tokens[newest],
+                                context: self.spec.reduce(a.states[newest], first_cell),
+                            },
+                            a.spans.rotary(first_cell),
+                        )
                         .map_err(full)?;
                     // The contexts of the drafts follow from the drafts
                     // themselves, as they will once they are accepted.
@@ -2301,12 +2576,15 @@ impl Conductor {
                         state = self.spec.advance(state, &self.scratch_tokens);
                         let position = first_cell + 1 + k as u32;
                         writer
-                            .row(Row {
-                                slot: part.slot,
-                                position,
-                                token: draft,
-                                context: self.spec.reduce(state, position),
-                            })
+                            .row_at(
+                                Row {
+                                    slot: part.slot,
+                                    position,
+                                    token: draft,
+                                    context: self.spec.reduce(state, position),
+                                },
+                                a.spans.rotary(position),
+                            )
                             .map_err(full)?;
                     }
                     // Every row of a window is picked, in one run with the
@@ -2384,10 +2662,15 @@ impl Conductor {
             self.worth.resize(row_index as usize, 0.0);
             writer.row_worth(&self.worth).map_err(full)?;
         }
+        if !self.image_runs.is_empty() {
+            writer.images(&self.image_runs).map_err(full)?;
+        }
         if let Some(cache) = &mut self.cache {
             cache.write_copies(&mut writer).map_err(full)?;
         }
-        writer.finish().map_err(full)
+        let used = writer.finish().map_err(full)?;
+        self.fill_stage();
+        Ok(used)
     }
 
     /// Accepts or rejects what the devices brought back, sequence by
@@ -2555,7 +2838,7 @@ impl Conductor {
                     &mut self.pool,
                     &mut a.cells,
                     &mut a.chain,
-                    &a.tokens,
+                    &a.names,
                     settled,
                     Priority::NORMAL,
                 );

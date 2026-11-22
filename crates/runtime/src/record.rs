@@ -17,11 +17,11 @@
 //! | section | words | content |
 //! | --- | --- | --- |
 //! | kernel header | 8 | rows, segments, wanted rows, 0, byte offsets of segments, tokens, positions, wanted rows |
-//! | runtime header | 32 | magic, step number, counts of runs, updates, entries, commits, copies, corrections, masks and freed pages, byte offsets of the sections below, the longest segment, the longest commit, the words of a mask, the record's flags (1: drafts only), the rows of the row worth and its offset, 2 unused |
+//! | runtime header | 32 | magic, step number, counts of runs, updates, entries, commits, copies, corrections, masks and freed pages, byte offsets of the sections below, the longest segment, the longest commit, the words of a mask, the record's flags (1: drafts only), the rows of the row worth and its offset, the image runs and their offset |
 //! | segments | 8 each | first row, rows, sequence slot, accepted rows, first position, flags (1: direct), the drafter of a window whose drafts the model makes, 0 |
 //! | tokens | 1 per row | |
-//! | positions | 4 per row | time, height, width, extra: `(p, p, p, 0)` for text |
-//! | row extras | 2 per row | sequence slot, context |
+//! | positions | 4 per row | the rotary position: time, height, width, extra; `(p, p, p, 0)` for text at rotary position `p` (see [Images](#images)) |
+//! | row extras | 3 per row | sequence slot, context, cell (the row's place in its sequence) |
 //! | wanted rows | 1 each | the rows whose logits are wanted, in order |
 //! | runs | 2 each | first row, number of rows: the wanted rows as ranges |
 //! | sampler rows | 32 each | how each wanted row is picked ([`SampleRow`]), in the order of the wanted rows |
@@ -35,6 +35,7 @@
 //! | freed pages | 1 each | pages the pool freed since the last record |
 //! | draft bars | 16 + 1 each | for the windows whose drafts the model makes: the chance of a draft by its probability (16 ranges, `f32`), then for every draft row of those windows, in the order of the segments, the reach its chain needs for that link to be made (`f32`) |
 //! | row worth | 1 per row | what each row is worth in milliseconds (`f32`): for a row of a window past its first, the chance that the window's drafts up to the row's own are all accepted times the milliseconds a token costs; 0 for every other row |
+//! | image runs | 3 each | first row, rows, first row of the image stage: the rows whose values the host staged, in order |
 //!
 //! A segment is **direct** when all of its rows are certain to be accepted (a
 //! slice of a prompt, a generation row without drafts): the recurrent kernels
@@ -120,6 +121,25 @@
 //! rows after it, the sum of their worth. A record without the section leaves
 //! no row.
 //!
+//! # Images
+//!
+//! The rows of an image's cells are not token embeddings: the image tower
+//! computed them, and the conductor copies them into the executor's image
+//! stage (page-locked memory beside the record, `f32` rows of the model's
+//! width) for the step that runs them. An **image run** says that rows
+//! `row..row + rows` of the step take stage rows `stage..stage + rows` in
+//! place of the rows their tokens gather (the token of such a row is the
+//! image's pad token). Only the device that embeds the step's rows reads the
+//! stage.
+//!
+//! A row's **cell** is its place in its sequence (the page table's index);
+//! its **rotary position** is what the rotary kernels read, four numbers.
+//! For text they are one number, the cell less what the images before it
+//! took (an image of `nx x ny` rows advances the rotary position by
+//! `max(nx, ny)`); the rows of an image at rotary position `p` have
+//! `(p, p + j / nx, p + j % nx, 0)` for its row `j`, as llama.cpp's `mtmd`
+//! places Qwen3-VL's images. A sequence without images has the two equal.
+//!
 //! The *context* is a number the host derives from the sequence's tokens up to
 //! and including the row's token. A real model has no use for it (attention
 //! reads the sequence's pages); the synthetic model has no attention kernel,
@@ -173,6 +193,8 @@ const H_OFF_BARS: usize = 34;
 const H_FLAGS: usize = 35;
 const H_WORTH: usize = 36;
 const H_OFF_WORTH: usize = 37;
+const H_IMAGES: usize = 38;
+const H_OFF_IMAGES: usize = 39;
 /// The record's step makes the chains of its own-draft windows and nothing
 /// else.
 const RECORD_DRAFTS_ONLY: u32 = 1;
@@ -187,6 +209,7 @@ pub const FREED_PER_RECORD: usize = 1024;
 pub struct Row {
     /// The sequence's slot, which indexes its page table on the devices.
     pub slot: u32,
+    /// The row's cell: its place in the sequence.
     pub position: u32,
     pub token: u32,
     /// See the module documentation.
@@ -218,6 +241,15 @@ pub struct StateCopy {
     pub kind: StateCopyKind,
     pub slot: u32,
     pub place: u32,
+}
+
+/// Rows `row..row + rows` of a step take the values of the image stage's
+/// rows `stage..stage + rows` (see [Images](self#images)).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ImageRun {
+    pub row: u32,
+    pub rows: u32,
+    pub stage: u32,
 }
 
 /// The first `cells` cells of page `from` go into page `to`.
@@ -259,7 +291,7 @@ pub fn max_bytes(max_rows: u32, max_slots: u32, wanted: u32, vocab: u32) -> usiz
     let segments = slots.min(rows.max(1));
     let bytes = HEADERS
         + SEG_BYTES * segments
-        + rows * (4 + 16 + 8)
+        + rows * (4 + 16 + 12)
         + wanted * (4 + 8 + SampleRow::BYTES + ENTRIES_PER_ROW * Entry::BYTES)
         + wanted * TokenMask::words_for(vocab) * 4
         + KERNEL_HEADER
@@ -271,7 +303,8 @@ pub fn max_bytes(max_rows: u32, max_slots: u32, wanted: u32, vocab: u32) -> usiz
         + 16 * 8
         + FREED_PER_RECORD * 4
         + (BAR_CHANCES + rows) * 4
-        + rows * 4;
+        + rows * 4
+        + rows * 12;
     bytes.next_multiple_of(256)
 }
 
@@ -315,7 +348,7 @@ impl<'a> RecordWriter<'a> {
         let off_tokens = align(off_segs + n_segs as usize * SEG_BYTES);
         let off_pos = align(off_tokens + n_rows as usize * 4);
         let off_extra = align(off_pos + n_rows as usize * 16);
-        let end = align(off_extra + n_rows as usize * 8);
+        let end = align(off_extra + n_rows as usize * 12);
         if end > buf.len() {
             return Err(RecordFull { capacity: buf.len() });
         }
@@ -342,6 +375,7 @@ impl<'a> RecordWriter<'a> {
             H_OFF_FREED,
             H_OFF_BARS,
             H_OFF_WORTH,
+            H_OFF_IMAGES,
         ] {
             header[h] = end as u32;
         }
@@ -423,15 +457,34 @@ impl<'a> RecordWriter<'a> {
         Ok(())
     }
 
-    /// The next row of the segment being written.
+    /// The next row of the segment being written, at the rotary position of
+    /// its cell: text in a sequence without images.
     pub fn row(&mut self, row: Row) -> Result<(), RecordFull> {
+        let p = row.position;
+        self.row_at(row, [p, p, p])
+    }
+
+    /// The next row of the segment being written, at the rotary position
+    /// `(time, height, width)` (see [Images](self#images)).
+    pub fn row_at(&mut self, row: Row, rotary: [u32; 3]) -> Result<(), RecordFull> {
         assert!(self.rows_written < self.n_rows, "more rows than the record was started for");
         let i = self.rows_written as usize;
-        let p = row.position;
+        let [t, h, w] = rotary;
         self.put(self.off_tokens + i * 4, &[row.token])?;
-        self.put(self.off_pos + i * 16, &[p, p, p, 0])?;
-        self.put(self.off_extra + i * 8, &[row.slot, row.context])?;
+        self.put(self.off_pos + i * 16, &[t, h, w, 0])?;
+        self.put(self.off_extra + i * 12, &[row.slot, row.context, row.position])?;
         self.rows_written += 1;
+        Ok(())
+    }
+
+    /// The rows that take staged rows of the image stage, in order.
+    pub fn images(&mut self, runs: &[ImageRun]) -> Result<(), RecordFull> {
+        let off = self.end;
+        let words: Vec<u32> = runs.iter().flat_map(|r| [r.row, r.rows, r.stage]).collect();
+        self.put(off, &words)?;
+        self.header[H_IMAGES] = runs.len() as u32;
+        self.header[H_OFF_IMAGES] = off as u32;
+        self.end = align(off + words.len() * 4);
         Ok(())
     }
 
@@ -705,7 +758,7 @@ impl<'a> RecordView<'a> {
             header[5] as usize + rows * 4,
             header[6] as usize + rows * 16,
             header[7] as usize + header[2] as usize * 4,
-            header[H_OFF_EXTRA] as usize + rows * 8,
+            header[H_OFF_EXTRA] as usize + rows * 12,
             header[H_OFF_RUNS] as usize + header[H_RUNS] as usize * 8,
             header[H_OFF_SAMPLERS] as usize + header[2] as usize * SampleRow::BYTES,
             header[H_OFF_COMMIT] as usize
@@ -725,6 +778,7 @@ impl<'a> RecordView<'a> {
             header[H_OFF_BARS] as usize
                 + if header[H_BARS] > 0 { (BAR_CHANCES + header[H_BARS] as usize) * 4 } else { 0 },
             header[H_OFF_WORTH] as usize + header[H_WORTH] as usize * 4,
+            header[H_OFF_IMAGES] as usize + header[H_IMAGES] as usize * 12,
         ];
         if ends.iter().any(|end| *end > bytes.len()) {
             return Err(RecordError::Truncated);
@@ -745,7 +799,7 @@ impl<'a> RecordView<'a> {
             u32::from_le_bytes(bytes[at..at + 4].try_into().expect("4 bytes")) as usize
         };
         let (tokens, extra) = (word(bytes, 5 * 4), word(bytes, H_OFF_EXTRA * 4));
-        let (at_token, at_context) = (tokens + row as usize * 4, extra + row as usize * 8 + 4);
+        let (at_token, at_context) = (tokens + row as usize * 4, extra + row as usize * 12 + 4);
         bytes[at_token..at_token + 4].copy_from_slice(&token.to_le_bytes());
         bytes[at_context..at_context + 4].copy_from_slice(&context.to_le_bytes());
     }
@@ -895,13 +949,33 @@ impl<'a> RecordView<'a> {
     pub fn row(&self, i: u32) -> Row {
         assert!(i < self.rows(), "row {i} of {}", self.rows());
         let i = i as usize;
-        let extra = self.header[H_OFF_EXTRA] as usize + i * 8;
+        let extra = self.header[H_OFF_EXTRA] as usize + i * 12;
         Row {
             slot: self.word(extra),
-            position: self.word(self.header[6] as usize + i * 16),
+            position: self.word(extra + 8),
             token: self.word(self.header[5] as usize + i * 4),
             context: self.word(extra + 4),
         }
+    }
+
+    /// The rotary position of row `i`: time, height, width and extra.
+    pub fn rotary(&self, i: u32) -> [u32; 4] {
+        assert!(i < self.rows(), "row {i} of {}", self.rows());
+        let at = self.header[6] as usize + i as usize * 16;
+        [self.word(at), self.word(at + 4), self.word(at + 8), self.word(at + 12)]
+    }
+
+    /// The number of image runs: rows that take staged rows of the image
+    /// stage.
+    pub fn image_runs(&self) -> u32 {
+        self.header[H_IMAGES]
+    }
+
+    /// Image run `i`, in the order of the rows.
+    pub fn image_run(&self, i: u32) -> ImageRun {
+        assert!(i < self.image_runs(), "image run {i} of {}", self.image_runs());
+        let at = self.header[H_OFF_IMAGES] as usize + i as usize * 12;
+        ImageRun { row: self.word(at), rows: self.word(at + 4), stage: self.word(at + 8) }
     }
 
     /// `(first row, rows)` of run `i`.
@@ -1219,7 +1293,39 @@ mod tests {
         let pages: Vec<PageCopy> =
             (0..64).map(|i| PageCopy { from: i, to: 64 + i, cells: 3 }).collect();
         w.copies(&states, &pages).unwrap();
+        // Every row an image run of its own.
+        let images: Vec<ImageRun> =
+            (0..64).map(|row| ImageRun { row, rows: 1, stage: row }).collect();
+        w.images(&images).unwrap();
         assert!(w.finish().unwrap() <= bytes);
+    }
+
+    #[test]
+    fn the_rows_of_an_image_carry_their_rotary_positions_and_their_staged_rows() {
+        // A prompt piece of five rows from cell 10: two text cells, then three
+        // rows of an image of 2 x 2 rows at rotary position 7.
+        let mut buf = vec![0x55u8; 2048];
+        let mut w = RecordWriter::new(&mut buf, 9, 1, 5).unwrap();
+        w.segment(4, 10, 5, true).unwrap();
+        let rotary = [[8, 8, 8], [9, 9, 9], [10, 10, 10], [10, 10, 11], [10, 11, 10]];
+        for (k, rotary) in rotary.iter().enumerate() {
+            let row = Row { slot: 4, position: 10 + k as u32, token: 77, context: 0 };
+            w.row_at(row, *rotary).unwrap();
+        }
+        w.images(&[ImageRun { row: 2, rows: 3, stage: 0 }]).unwrap();
+        let used = w.finish().unwrap();
+        let view = RecordView::new(&buf[..used]).unwrap();
+        assert_eq!(view.row(3).position, 13, "the cell stays the row's place");
+        assert_eq!(view.rotary(3), [10, 10, 11, 0]);
+        assert_eq!(view.rotary(0), [8, 8, 8, 0]);
+        assert_eq!(view.image_runs(), 1);
+        assert_eq!(view.image_run(0), ImageRun { row: 2, rows: 3, stage: 0 });
+        // A record without images has none, and text at its cells.
+        let (buf, used) = sample();
+        let view = RecordView::new(&buf[..used]).unwrap();
+        assert_eq!(view.image_runs(), 0);
+        let p = view.row(1).position;
+        assert_eq!(view.rotary(1), [p, p, p, 0]);
     }
 
     #[test]

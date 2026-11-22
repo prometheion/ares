@@ -60,6 +60,7 @@ mod error;
 mod exec;
 pub mod expert_store;
 mod gpu;
+mod image;
 mod links;
 mod model;
 mod ram;
@@ -84,19 +85,22 @@ pub use exec::{
     TransitPart,
 };
 pub use gpu::{GpuConfig, GpuExecutor, required_ram};
+pub use image::{
+    ImageInput, ImageName, ImageRows, ImageSpan, ImageStore, Spans, cell_name, short_name,
+};
 pub use links::{Links, MAX_DEVICES};
 pub use model::{
     ContextSpec, DeviceContext, DeviceModel, DeviceTransfer, Drafter, DrafterKind, Durable,
     EncodedPrompt, LinkSpec, Logits, Model, ModelDrafts, ModelError, PrefixCache, Split,
-    StepContext, TransferContext,
+    StepContext, TowerJob, TransferContext, Vision,
 };
 pub use ram::{
     CacheBuffer, Follow, LockedChunk, Look, Machine, Meminfo, MemorySource, PinnedRam, PlaceChunks,
     Rule, Verdict, high_watermarks,
 };
 pub use record::{
-    Commit, DraftChances, FREED_PER_RECORD, PageCopy, RecordFull, RecordView, RecordWriter, Row,
-    StateCopy, StateCopyKind, TableUpdate, draft_chance,
+    Commit, DraftChances, FREED_PER_RECORD, ImageRun, PageCopy, RecordFull, RecordView,
+    RecordWriter, Row, StateCopy, StateCopyKind, TableUpdate, draft_chance,
 };
 pub use sampling::TokenFilter;
 pub use sync::{WakeCounts, Woke};

@@ -215,6 +215,21 @@ pub trait Executor: Send {
         Ok(())
     }
 
+    /// The image stage: where the conductor writes the rows of the image cells
+    /// of the next step, `f32` rows of the model's width, which the record's
+    /// image runs name. Only valid between [`Executor::collect`] and the next
+    /// [`Executor::dispatch`]. Empty for a model without images.
+    fn image_stage(&mut self) -> &mut [f32] {
+        &mut []
+    }
+
+    /// Runs a job of the image tower on the device that holds it, between
+    /// steps, and returns when it has run (with the image's rows when the job
+    /// ends its pass). The default is an executor without a tower.
+    fn tower(&mut self, _job: &mut crate::model::TowerJob) -> Result<(), ExecError> {
+        Err(ExecError::Device { device: 0, message: "the executor runs no image tower".into() })
+    }
+
     /// The books of the page-locked RAM the checkpoints lie in, which say
     /// how much of it they may hold. An executor without such memory has
     /// none.

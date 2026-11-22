@@ -40,7 +40,7 @@ use crate::exec::Transfer;
 use crate::exec::{Clock, ExecError, Executor, Pick, StepMeta, StepOutput};
 use crate::links::Links;
 use crate::model::{
-    DeviceContext, DeviceModel, DeviceTransfer, Model, ModelError, Split, StepContext,
+    DeviceContext, DeviceModel, DeviceTransfer, Model, ModelError, Split, StepContext, TowerJob,
     TransferContext,
 };
 use crate::ram::{Machine, PinnedRam};
@@ -81,12 +81,26 @@ pub struct GpuConfig {
 }
 
 /// The page-locked RAM an executor over `model` needs to run at all: the step
-/// record and the read-back buffers of every device.
+/// record, the image stage and the read-back buffers of every device.
 pub fn required_ram(model: &dyn Model, max_slots: u32) -> u64 {
     let max_rows = model.max_rows();
     record::max_bytes(max_rows, max_slots, model.logit_rows(), model.vocab()) as u64
+        + image_stage_values(model) as u64 * 4
         + model.devices() as u64 * read_back_bytes(model.logit_rows(), max_rows) as u64
         + model.pinned_ram()
+}
+
+/// The most image rows one step takes: the stage holds that many. A step
+/// with more image rows is cut there by the conductor; the rows a prompt's
+/// kernels reach their rate at are far fewer.
+pub const IMAGE_STAGE_ROWS: u32 = 1024;
+
+/// The `f32` values of the image stage of an executor over `model`: none for
+/// a model without images.
+fn image_stage_values(model: &dyn Model) -> usize {
+    model
+        .vision()
+        .map_or(0, |vision| model.max_rows().min(IMAGE_STAGE_ROWS) as usize * vision.width as usize)
 }
 
 impl GpuConfig {
@@ -134,7 +148,7 @@ unsafe impl Sync for PinnedRecord {}
 
 impl PinnedRecord {
     fn new(device: &Device, len: usize) -> Result<Self, ares_cuda::Error> {
-        let mut owner = PinnedBuffer::new(device, len)?;
+        let mut owner = PinnedBuffer::new(device, len.max(16))?;
         let ptr = owner.as_mut_ptr();
         Ok(Self { _owner: owner, ptr, len })
     }
@@ -148,6 +162,8 @@ enum Job {
     /// This device's shares of the transfers of a batch
     /// ([`Executor::transfer`]).
     Transfer(Vec<DeviceTransfer>),
+    /// A job of the image tower, for the device that holds it.
+    Tower(Box<TowerJob>),
     Quit,
 }
 
@@ -171,6 +187,8 @@ struct DeviceResult {
     /// bytes and the tag of its share, or `None` for one it could not carry
     /// out.
     transfers: Vec<Option<(usize, u32)>>,
+    /// A job of the image tower that has run, or why it could not.
+    tower: Option<Result<Box<TowerJob>, String>>,
 }
 
 /// The hand-over between the conductor and one device thread.
@@ -199,6 +217,11 @@ pub struct GpuExecutor {
     handles: Vec<Handle>,
     shared: Arc<Shared>,
     record: Arc<PinnedRecord>,
+    /// The image stage, as many `f32` values as it holds.
+    stage: Arc<PinnedRecord>,
+    stage_values: usize,
+    /// The device part that runs the image tower, for a model with one.
+    tower_device: Option<usize>,
     links: Arc<Links>,
     seen: u64,
     in_flight: bool,
@@ -222,6 +245,7 @@ struct Init {
     kernels: Kernels,
     links: Arc<Links>,
     record: Arc<PinnedRecord>,
+    stage: Arc<PinnedRecord>,
     mailbox: Arc<Mailbox>,
     shared: Arc<Shared>,
     ram: PinnedRam,
@@ -295,6 +319,9 @@ impl GpuExecutor {
         }
         let links = Arc::new(Links::new(model.split(), &devices, &streams, link_spec)?);
         let record = Arc::new(PinnedRecord::new(&devices[0], record_bytes)?);
+        let stage_values = image_stage_values(&*model);
+        let stage = Arc::new(PinnedRecord::new(&devices[0], stage_values * 4)?);
+        let tower_device = model.vision().map(|vision| vision.device);
         let shared = Arc::new(Shared {
             done: Bell::new(),
             remaining: AtomicUsize::new(0),
@@ -323,6 +350,7 @@ impl GpuExecutor {
                 kernels,
                 links: links.clone(),
                 record: record.clone(),
+                stage: stage.clone(),
                 mailbox: mailbox.clone(),
                 shared: shared.clone(),
                 ram: ram.clone(),
@@ -338,7 +366,18 @@ impl GpuExecutor {
         }
         drop(ready_tx);
 
-        let mut executor = Self { handles, shared, record, links, seen: 0, in_flight: false, ram };
+        let mut executor = Self {
+            handles,
+            shared,
+            record,
+            stage,
+            stage_values,
+            tower_device,
+            links,
+            seen: 0,
+            in_flight: false,
+            ram,
+        };
         let mut failure = None;
         for _ in 0..executor.handles.len() {
             match ready_rx.recv() {
@@ -375,6 +414,50 @@ impl Executor for GpuExecutor {
         // SAFETY: no step is in flight, so no device thread reads the record,
         // and `&mut self` makes this the only access from the conductor.
         unsafe { std::slice::from_raw_parts_mut(self.record.ptr, self.record.len) }
+    }
+
+    fn image_stage(&mut self) -> &mut [f32] {
+        assert!(!self.in_flight, "the image stage is written between collect and dispatch");
+        // SAFETY: as for the record: no step is in flight, so no device thread
+        // reads the stage, and the buffer holds `stage_values` f32, aligned
+        // (page-locked memory starts on a page).
+        unsafe { std::slice::from_raw_parts_mut(self.stage.ptr.cast::<f32>(), self.stage_values) }
+    }
+
+    fn tower(&mut self, job: &mut TowerJob) -> Result<(), ExecError> {
+        assert!(!self.in_flight, "the tower runs between steps");
+        let Some(device) = self.tower_device else {
+            return Err(ExecError::Device {
+                device: 0,
+                message: "the model has no image tower".into(),
+            });
+        };
+        let handle = &self.handles[device];
+        let taken = TowerJob {
+            image: job.image.clone(),
+            units: job.units.clone(),
+            rows: std::mem::take(&mut job.rows),
+            ms: 0.0,
+        };
+        self.shared.remaining.store(1, Ordering::SeqCst);
+        *handle.mailbox.job.lock().expect("job slot") = Some(Job::Tower(Box::new(taken)));
+        handle.mailbox.bell.ring();
+        self.shared.done.bind();
+        let (count, _) = self.shared.done.wait_past(self.seen, Duration::from_millis(1));
+        self.seen = count;
+        let outcome = handle.mailbox.result.lock().expect("result slot").tower.take();
+        match outcome {
+            Some(Ok(done)) => {
+                job.rows = done.rows;
+                job.ms = done.ms;
+                Ok(())
+            }
+            Some(Err(message)) => Err(ExecError::Device { device, message }),
+            None => Err(ExecError::Device {
+                device,
+                message: "the device thread left no outcome of the tower's job".into(),
+            }),
+        }
     }
 
     fn dispatch(&mut self, meta: &StepMeta) -> Result<(), ExecError> {
@@ -562,6 +645,7 @@ struct Worker {
     links: Arc<Links>,
     model: Box<dyn DeviceModel>,
     record: Arc<PinnedRecord>,
+    stage: Arc<PinnedRecord>,
     record_device: DeviceBuffer,
     tables: DeviceBuffer,
     table_stride: u32,
@@ -733,6 +817,24 @@ fn worker_main(init: Init, ready: mpsc::Sender<Result<(), RuntimeError>>) {
                     done.unwrap_or_else(|_| vec![None; shares.len()]);
                 worker.finish();
             }
+            Some(Job::Tower(mut job)) => {
+                let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
+                    let begun = Instant::now();
+                    worker.model.tower(&worker.stream, &mut job)?;
+                    worker.stream.synchronize()?;
+                    job.ms = begun.elapsed().as_secs_f64() * 1e3;
+                    Ok::<_, ModelError>(())
+                }));
+                let outcome = match outcome {
+                    Ok(Ok(())) => Ok(job),
+                    Ok(Err(error)) => Err(format!("{name}: the image tower: {error}")),
+                    Err(payload) => {
+                        Err(format!("{name}: the image tower panicked: {}", panic_text(&*payload)))
+                    }
+                };
+                mailbox.result.lock().expect("result slot").tower = Some(outcome);
+                worker.finish();
+            }
             Some(Job::Quit) => break,
             // A ring whose job was already taken (a quit racing a step).
             None => {}
@@ -752,6 +854,7 @@ impl Worker {
             kernels,
             links,
             record,
+            stage,
             shared,
             ram,
             config,
@@ -870,6 +973,7 @@ impl Worker {
             links,
             model: part,
             record,
+            stage,
         };
         // Page tables are never cleared in normal operation (a table decides
         // what is valid), but a defined start makes a bug show as a wrong
@@ -955,6 +1059,11 @@ impl Worker {
             pages: self.pages.as_ref().map_or(ares_cuda::DevicePtr::NULL, DeviceBuffer::ptr),
             bytes_per_page: self.bytes_per_page,
             links: &self.links,
+            image_stage: if self.stage.len > 0 {
+                self.stage.ptr.cast::<f32>().cast_const()
+            } else {
+                std::ptr::null()
+            },
         })?;
 
         // The picks of the rows whose logits are wanted, made on the device,

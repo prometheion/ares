@@ -122,7 +122,7 @@ struct Leaving {
     hash: ChainHash,
     parent: ChainHash,
     depth: u32,
-    tail: Option<Vec<u32>>,
+    tail: Option<Vec<u64>>,
     checkpoint: Option<Held>,
     /// The page's text was long enough to be written.
     worth: bool,
@@ -399,7 +399,7 @@ impl Cache {
     }
 
     /// The names of the full pages of `tokens`.
-    pub(crate) fn chain(&self, tokens: &[u32]) -> Chain {
+    pub(crate) fn chain(&self, tokens: &[u64]) -> Chain {
         let mut chain = Chain::new(self.root, self.cells_per_page);
         chain.name(tokens);
         chain
@@ -407,7 +407,7 @@ impl Cache {
 
     /// The chain of a sequence that starts from `found`, with the full pages of
     /// `tokens` named.
-    pub(crate) fn chain_after(&self, found: &PrefixMatch, tokens: &[u32]) -> Chain {
+    pub(crate) fn chain_after(&self, found: &PrefixMatch, tokens: &[u64]) -> Chain {
         let mut chain = Chain::resumed(self.root, self.cells_per_page, found);
         chain.name(tokens);
         chain
@@ -425,7 +425,7 @@ impl Cache {
         pool: &mut PagePool,
         exec: Option<&mut dyn Executor>,
         chain: &Chain,
-        tokens: &[u32],
+        tokens: &[u64],
     ) -> Probe {
         let looked = &tokens[..tokens.len() - 1];
         let mut found = self.index.lookup_chain(chain, looked);
@@ -1186,7 +1186,7 @@ impl Cache {
         pool: &mut PagePool,
         exec: &mut dyn Executor,
         chain: &Chain,
-        tokens: &[u32],
+        tokens: &[u64],
         found: &PrefixMatch,
     ) -> u32 {
         let Some(ram) = &self.in_ram else { return 0 };
@@ -1507,7 +1507,7 @@ mod tests {
 
     /// Three pages of one sequence in the index, which has let go of them.
     fn three_pages(cache: &mut Cache, pool: &mut PagePool) -> Vec<ChainHash> {
-        let tokens: Vec<u32> = (0..12).collect();
+        let tokens: Vec<u64> = (0..12).collect();
         let mut chain = cache.chain(&tokens);
         let mut seq = Sequence::new();
         seq.append(pool, 12).unwrap();
@@ -1621,7 +1621,7 @@ mod tests {
         for i in 0..3u32 {
             let mut seq = Sequence::new();
             seq.append(&mut pool, 2).unwrap();
-            let prior = root.extend(&[i]);
+            let prior = root.extend(&[u64::from(i)]);
             dropped.push(cache.index.insert_tail(
                 &mut pool,
                 prior,
@@ -1642,7 +1642,7 @@ mod tests {
             seq.append(&mut pool, 2).unwrap();
             cache.index.insert_tail(
                 &mut pool,
-                root.extend(&[i]),
+                root.extend(&[u64::from(i)]),
                 &[7, 8],
                 seq.pages()[0],
                 Priority::NORMAL,
@@ -1743,7 +1743,7 @@ mod tests {
 
         /// Text `i` of three pages, which the index holds and nobody else.
         fn text(&mut self, i: u32) -> Vec<ChainHash> {
-            let tokens: Vec<u32> = (0..12).map(|t| 1000 * (i + 1) + t).collect();
+            let tokens: Vec<u64> = (0..12).map(|t| 1000 * (u64::from(i) + 1) + t).collect();
             let mut chain = self.cache.chain(&tokens);
             let mut seq = Sequence::new();
             seq.append(&mut self.pool, 12).unwrap();
@@ -1956,7 +1956,7 @@ mod tests {
         let mut devices = Devices::default();
         assert!(f.cache.save(0, f.hashes[2], Owner(1), false).taken);
         written(&mut f.cache);
-        let tokens: Vec<u32> = (0..13).collect();
+        let tokens: Vec<u64> = (0..13).collect();
         let chain = f.cache.chain(&tokens);
         // The pool gives all three pages up: they are copied out before the
         // next record, the last one with its checkpoint, which stays put.
