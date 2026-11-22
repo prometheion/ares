@@ -15,6 +15,7 @@ use ares_io::{Config, ExpertMap, Reader};
 use ares_runtime::expert_store::{
     ExpertStore, HostRegion, HostSlots, LayerSpec, Locker, StoreConfig, StoreError, StorePlan,
 };
+use ares_weights::ExpertHeat;
 
 const LAYERS: usize = 3;
 const EXPERTS: u32 = 16;
@@ -235,6 +236,41 @@ fn a_missing_pick_comes_from_the_file_into_a_slot() {
     rig.store.end_step().unwrap();
     let stats = rig.store.take_stats();
     assert_eq!((stats.picks, stats.hits, stats.demand_reads), (2, 2, 0));
+}
+
+#[test]
+fn a_profile_divides_the_slots_of_both_tiers_between_the_layers_by_their_need() {
+    let dir = Scratch::new();
+    let gguf = model(&dir);
+    let map =
+        ExpertMap::discover(&gguf, &["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"]).unwrap();
+    let reader = Reader::open_gguf(&gguf, Config::default()).unwrap();
+    let layers =
+        [LayerSpec { device: 0, offsets: OFFSETS, slot_bytes: SLOT_BYTES, resident: false };
+            LAYERS];
+    let mut config = StoreConfig::new(1, 2, vec![12 * SLOT_BYTES], u64::MAX / 4);
+    config.vram_reserve = 1;
+    let probe = StorePlan::new(config.clone(), &map, &reader, &layers, None).unwrap();
+    config.ram_bytes = 18 * probe.ram_slot_bytes(0);
+    // Without a profile every layer starts with the same slots in both tiers.
+    let even = StorePlan::new(config.clone(), &map, &reader, &layers, None).unwrap();
+    assert_eq!((0..LAYERS).map(|l| even.slots(l)).collect::<Vec<_>>(), [(4, 6); LAYERS]);
+
+    // Layer 0 uses two experts, layer 1 twelve alike, layer 2 four hot ones and eight
+    // seldom. VRAM goes where the hottest are, RAM where the heat beyond them is.
+    let mut heat = ExpertHeat::new(LAYERS, EXPERTS as usize, 1.0);
+    heat.layer_mut(0)[..2].copy_from_slice(&[50.0, 50.0]);
+    heat.layer_mut(1)[..12].fill(8.0);
+    heat.layer_mut(2)[..4].fill(20.0);
+    heat.layer_mut(2)[4..12].fill(2.0);
+    let plan = StorePlan::new(config.clone(), &map, &reader, &layers, Some(&heat)).unwrap();
+    let (vram, ram): (Vec<usize>, Vec<usize>) = (0..LAYERS).map(|l| plan.slots(l)).unzip();
+    assert_eq!(vram.iter().sum::<usize>(), 12);
+    assert_eq!(ram.iter().sum::<usize>(), 18);
+    assert!(vram[1] > vram[0], "VRAM by the hottest: {vram:?}");
+    assert!(ram[1] > ram[0] && ram[2] > ram[0], "RAM by the heat beyond VRAM's: {ram:?}");
+    // Every layer keeps its floor in both tiers.
+    assert!(vram.iter().chain(&ram).all(|n| *n >= 2), "{vram:?} {ram:?}");
 }
 
 #[test]
