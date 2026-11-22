@@ -505,6 +505,8 @@ struct Scratch {
     /// The sums of the experts the CPU computed for rows of a wide step, f32, for steps
     /// of up to [`Options::cpu_rows`] rows ([`wide`]).
     cpu_sums: u64,
+    /// The bytes of `zeros`, which a step on lent VRAM clears first.
+    zeros_len: u64,
     len: u64,
 }
 
@@ -655,22 +657,27 @@ impl Frame {
         shape: &PartShape,
         multiprocessors: u32,
     ) -> Result<Self, ModelError> {
-        let mut frame = Self::widest(c, opts, shape, multiprocessors)?;
         let own = opts.own_rows();
-        if own < opts.max_rows {
+        let lends = own < opts.max_rows;
+        let mut frame = Self::widest(c, opts, shape, multiprocessors, lends)?;
+        if lends {
             let small = Options { max_rows: own, own_rows: 0, ..opts.clone() };
-            frame.own = Self::widest(c, &small, shape, multiprocessors)?.s;
+            frame.own = Self::widest(c, &small, shape, multiprocessors, false)?.s;
             frame.lends = true;
         }
         Ok(frame)
     }
 
-    /// The sizes of a part whose scratch holds a step of `opts.max_rows` rows.
+    /// The sizes of a part whose scratch holds a step of `opts.max_rows` rows. With
+    /// `overlay` (the scratch of a step on lent VRAM, which verifies no drafts) the buffers
+    /// of the read of a stream mixer, of the recurrent or attention half and of the n-gram
+    /// block share their place: a layer uses them one after the other.
     fn widest(
         c: &Config,
         opts: &Options,
         shape: &PartShape,
         multiprocessors: u32,
+        overlay: bool,
     ) -> Result<Self, ModelError> {
         let head = shape.head;
         let streams = shape.role != Role::Worker;
@@ -763,45 +770,59 @@ impl Frame {
         // The scratch of a step.
         let mut s = Scratch::default();
         let mut len = 0u64;
-        let mut take = |bytes: u64| {
-            let at = len;
-            len = (len + bytes.max(16)).next_multiple_of(64);
-            at
-        };
-        s.r = take(rows * wide * 4);
-        s.r2 = take(u64::from(streams) * rows * wide * 4);
-        s.partials = take(
+        macro_rules! take {
+            ($bytes:expr $(,)?) => {{
+                let at = len;
+                len = (len + ($bytes).max(16)).next_multiple_of(64);
+                at
+            }};
+        }
+        s.r = take!(rows * wide * 4);
+        s.r2 = take!(u64::from(streams) * rows * wide * 4);
+        s.partials = take!(
             Q4Kernels::read_partials(opts.max_rows, c.n_stream as u32, c.mixer_rank as u32) * 4,
         );
-        s.zeros = take(rows * hc * 4);
-        s.xn = take(act_bytes(wide, rows));
-        s.lo = take(act_bytes(rank, rows));
-        s.down = take(rows * rank * 4);
-        s.gate = take(rows * wide * 4);
-        s.inj_a = take(rows * hc * 4);
-        s.inj_f = take(rows * hc * 4);
-        s.m = take(act_bytes(n, rows));
-        s.p = take(rows * n * 4);
-        s.out = take(rows * n * 4);
+        s.zeros = take!(rows * hc * 4);
+        s.zeros_len = rows * hc * 4;
+        s.inj_a = take!(rows * hc * 4);
+        s.inj_f = take!(rows * hc * 4);
+        s.m = take!(act_bytes(n, rows));
+        s.p = take!(rows * n * 4);
+        s.out = take!(rows * n * 4);
         let (rec, att) = (u64::from(any_recurrent), u64::from(any_attention));
-        s.w1 = take(rows * (rec * cd).max(att * 2 * hq) * 4);
-        s.w2 = take(rows * (rec * vd).max(att * hkv) * 4);
-        s.alpha = take(rows * rec * nv * 4);
-        s.beta = take(rows * rec * nv * 4);
-        s.q = take(rows * (rec * kd).max(att * hq) * 4);
-        s.kv = take(rows * rec * (kd + vd) * 4);
-        s.o = take(rows * (rec * vd).max(att * hq) * 4);
-        s.k = take(rows * att * hkv * 4);
-        s.v = take(rows * att * hkv * 4);
-        s.agate = take(rows * att * hq * 4);
-        s.iq = take(rows * att * iq * 4);
-        s.raw = take(rows * att * id * 4);
-        s.rope = take(rows * att * (c.attention.rope.dim as u64 / 2) * 8);
-        let max_blocks = u64::from(opts.cells.div_ceil(ix.block)).max(1);
-        s.scores = take(rows * att * max_blocks * 4);
-        s.counts = take(rows * 16);
+        s.rope = take!(rows * att * (c.attention.rope.dim as u64 / 2) * 8);
         let shared_ff = c.experts.shared_ff as u64;
-        s.act = take(act_bytes((rec * vd).max(att * hq).max(shared_ff), rows));
+        s.act = take!(act_bytes((rec * vd).max(att * hq).max(shared_ff), rows));
+        // Three groups of buffers that a layer uses one after the other: the read of a
+        // stream mixer's, the recurrent or attention half's, and the n-gram block's (which
+        // runs before the read of its layer). On lent VRAM (`overlay`) they lie in
+        // the same place: a step on a loan verifies no drafts, whose windows keep the
+        // n-gram block's `nrm` until their commit. Elsewhere they lie one after the other.
+        let shared_at = len;
+        let mut shared_end = len;
+        s.xn = take!(act_bytes(wide, rows));
+        s.lo = take!(act_bytes(rank, rows));
+        s.down = take!(rows * rank * 4);
+        s.gate = take!(rows * wide * 4);
+        if overlay {
+            shared_end = shared_end.max(len);
+            len = shared_at;
+        }
+        s.w1 = take!(rows * (rec * cd).max(att * 2 * hq) * 4);
+        s.w2 = take!(rows * (rec * vd).max(att * hkv) * 4);
+        s.alpha = take!(rows * rec * nv * 4);
+        s.beta = take!(rows * rec * nv * 4);
+        s.q = take!(rows * (rec * kd).max(att * hq) * 4);
+        s.kv = take!(rows * rec * (kd + vd) * 4);
+        s.o = take!(rows * (rec * vd).max(att * hq) * 4);
+        s.k = take!(rows * att * hkv * 4);
+        s.v = take!(rows * att * hkv * 4);
+        s.agate = take!(rows * att * hq * 4);
+        s.iq = take!(rows * att * iq * 4);
+        s.raw = take!(rows * att * id * 4);
+        let max_blocks = u64::from(opts.cells.div_ceil(ix.block)).max(1);
+        s.scores = take!(rows * att * max_blocks * 4);
+        s.counts = take!(rows * 16);
         // The most partial states a plan makes: the planner's own bound for
         // dense rows (`Planner::finish`) and the pieces of device-made lists
         // (a row has one piece when there are as many rows as the plan has
@@ -815,8 +836,19 @@ impl Frame {
         // A state is, per query head, the weighted V and the log of the sum.
         let state = c.attention.n_head as u64 * (u64::from(geo.head_dim) + 1) * 4;
         let attn_state_bytes = att * state_slots * state;
-        s.attn_state = take(attn_state_bytes);
-        s.status = take(16);
+        s.attn_state = take!(attn_state_bytes);
+        let gram = u64::from(any_ngram);
+        if overlay {
+            shared_end = shared_end.max(len);
+            len = shared_at;
+        }
+        s.emb = take!(gram * act_bytes(n, rows));
+        s.key = take!(gram * rows * wide * 4);
+        s.value = take!(gram * rows * n * 4);
+        s.gated = take!(gram * rows * wide * 4);
+        s.nrm = take!(gram * rows * wide * 4);
+        len = len.max(shared_end);
+        s.status = take!(16);
         let expert_shape = ares_cuda::ExpertShape {
             n_embd: n as u32,
             n_ff: c.experts.ff as u32,
@@ -831,7 +863,7 @@ impl Frame {
         let record_bytes = expert_shape
             .record_bytes(decode_rows)
             .max(wide::record_bytes(&expert_shape, opts.max_rows));
-        s.rec_full = take(record_bytes);
+        s.rec_full = take!(record_bytes);
         let ahead_layers = if shape.role == Role::Worker {
             0
         } else {
@@ -839,23 +871,17 @@ impl Frame {
         };
         // Wide steps predict the next layer's picks as well.
         let wide_ahead = u64::from(ahead_layers > 0 && opts.max_rows > MAX_BATCH);
-        s.logits = take(expert_shape.logits_bytes(opts.max_rows));
-        s.hidden = take(expert_shape.hidden_bytes(decode_rows));
-        s.sg = take(rows * shared_ff * 4);
-        s.su = take(rows * shared_ff * 4);
-        s.ysh = take(rows * n * 4);
-        s.s = take(rows * 4);
-        let gram = u64::from(any_ngram);
-        s.emb = take(gram * act_bytes(n, rows));
-        s.key = take(gram * rows * wide * 4);
-        s.value = take(gram * rows * n * 4);
-        s.gated = take(gram * rows * wide * 4);
-        s.nrm = take(gram * rows * wide * 4);
+        s.logits = take!(expert_shape.logits_bytes(opts.max_rows));
+        s.hidden = take!(expert_shape.hidden_bytes(decode_rows));
+        s.sg = take!(rows * shared_ff * 4);
+        s.su = take!(rows * shared_ff * 4);
+        s.ysh = take!(rows * n * 4);
+        s.s = take!(rows * 4);
         let logit_rows = u64::from(opts.logit_rows);
         let heads = u64::from(head);
-        s.picked = take(heads * logit_rows * n * 4);
-        s.act_p = take(heads * act_bytes(n, logit_rows));
-        s.head = take(heads * logit_rows * c.n_vocab as u64 * 4);
+        s.picked = take!(heads * logit_rows * n * 4);
+        s.act_p = take!(heads * act_bytes(n, logit_rows));
+        s.head = take!(heads * logit_rows * c.n_vocab as u64 * 4);
         if opts.max_rows > MAX_BATCH {
             let f16 = |width: u64| {
                 Kernels::prefill_activation_bytes(
@@ -864,15 +890,15 @@ impl Frame {
                     opts.max_rows,
                 )
             };
-            s.mixed_f16 = take(f16(n));
-            s.m_raw = take(rows * n * 4);
-            s.out_f16 = take(f16((rec * vd).max(att * hq).max(shared_ff)));
-            s.float_f16 = take(wide::float_f16_bytes(streams, wide, n, opts.max_rows));
-            s.addresses = take(wide::ROUNDS * 8 * c.experts.count as u64);
-            s.plan_rows = take(wide::plan_bytes(&expert_shape, opts.max_rows));
-            s.hidden_rows = take(expert_shape.rows_hidden_bytes(opts.max_rows));
-            s.experts_f16 = take(expert_shape.rows_activation_bytes(opts.max_rows));
-            s.cpu_sums = take(u64::from(opts.cpu_rows.min(opts.max_rows)) * n * 4);
+            s.mixed_f16 = take!(f16(n));
+            s.m_raw = take!(rows * n * 4);
+            s.out_f16 = take!(f16((rec * vd).max(att * hq).max(shared_ff)));
+            s.float_f16 = take!(wide::float_f16_bytes(streams, wide, n, opts.max_rows));
+            s.addresses = take!(wide::ROUNDS * 8 * c.experts.count as u64);
+            s.plan_rows = take!(wide::plan_bytes(&expert_shape, opts.max_rows));
+            s.hidden_rows = take!(expert_shape.rows_hidden_bytes(opts.max_rows));
+            s.experts_f16 = take!(expert_shape.rows_activation_bytes(opts.max_rows));
+            s.cpu_sums = take!(u64::from(opts.cpu_rows.min(opts.max_rows)) * n * 4);
         }
         s.len = len;
 
@@ -1760,7 +1786,7 @@ impl Part {
         // SAFETY: both ranges are inside the lent scratch, which the caller
         // keeps lent while the step runs.
         unsafe {
-            stream.fill(self.at(s.zeros), 0, (s.xn - s.zeros) as usize)?;
+            stream.fill(self.at(s.zeros), 0, s.zeros_len as usize)?;
             stream.fill(self.at(s.status), 0, 16)?;
         }
         Ok(())
