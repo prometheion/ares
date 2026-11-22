@@ -1038,6 +1038,7 @@ fn warm_up(runtime: &Runtime, model: &str) -> Result<f64, LoadError> {
         stop: Vec::new(),
         draft: true,
         structure: None,
+        priority: 0,
         id: RequestId(0),
     };
     runtime.submit(request, sink).map_err(|e| LoadError::Start(format!("warm-up: {e}")))?;

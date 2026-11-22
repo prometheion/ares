@@ -677,6 +677,7 @@ fn ask(runtime: &Runtime, id: u64, question: &str, sampling: Sampling, max_token
                 stop: Vec::new(),
                 draft: true,
                 structure: None,
+                priority: 0,
                 id: RequestId(id),
             },
             sink,

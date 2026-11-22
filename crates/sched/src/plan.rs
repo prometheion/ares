@@ -28,6 +28,9 @@ pub struct Request {
     pub want: Want,
     /// How many steps in a row this sequence got nothing.
     pub waited_steps: u32,
+    /// Who goes first, a lower number before a higher one: every order below
+    /// is by priority first.
+    pub priority: i32,
 }
 
 /// The bounds a step is planned within.
@@ -83,7 +86,8 @@ impl Plan {
 
 /// Plans the next step.
 ///
-/// Rows are granted in this order:
+/// Rows are granted in this order, and within each by priority first (a
+/// lower number first; see [`Request::priority`]):
 ///
 /// 1. The newest token of every generating sequence: a person is reading
 ///    their output, and a row of theirs is cheap.
@@ -115,7 +119,7 @@ pub fn plan(requests: &[Request], limits: &Limits) -> Plan {
         .enumerate()
         .map(|(i, (r, drafts))| (i, r, drafts))
         .collect();
-    windows.sort_by_key(|(i, r, _)| (std::cmp::Reverse(r.waited_steps), *i));
+    windows.sort_by_key(|(i, r, _)| (r.priority, std::cmp::Reverse(r.waited_steps), *i));
 
     let first_window = parts.len();
     for (_, request, _) in &windows {
@@ -136,7 +140,7 @@ pub fn plan(requests: &[Request], limits: &Limits) -> Plan {
             _ => None,
         })
         .collect();
-    decisions.sort_by_key(|(r, _)| std::cmp::Reverse(r.waited_steps));
+    decisions.sort_by_key(|(r, _)| (r.priority, std::cmp::Reverse(r.waited_steps)));
     for (request, rows) in decisions {
         if left == 0 {
             break;
@@ -168,9 +172,9 @@ pub fn plan(requests: &[Request], limits: &Limits) -> Plan {
         .collect();
     prompts.sort_by_key(|(r, tokens)| {
         let starved = r.waited_steps >= limits.starvation_steps;
-        // Starved prompts first, the longest wait among them first; then by
-        // remaining length.
-        (!starved, if starved { u32::MAX - r.waited_steps } else { *tokens })
+        // By priority; then starved prompts first, the longest wait among
+        // them first; then by remaining length.
+        (r.priority, !starved, if starved { u32::MAX - r.waited_steps } else { *tokens })
     });
     for (request, tokens) in prompts {
         if budget == 0 {
@@ -195,15 +199,15 @@ mod tests {
         Limits { max_rows: 64, prefill_rows_with_windows: 24, starvation_steps: 8 };
 
     fn window(seq: u32, drafts: u32) -> Request {
-        Request { seq: SeqId(seq), want: Want::Window { drafts }, waited_steps: 0 }
+        Request { seq: SeqId(seq), want: Want::Window { drafts }, waited_steps: 0, priority: 0 }
     }
 
     fn prefill(seq: u32, tokens: u32, waited_steps: u32) -> Request {
-        Request { seq: SeqId(seq), want: Want::Prefill { tokens }, waited_steps }
+        Request { seq: SeqId(seq), want: Want::Prefill { tokens }, waited_steps, priority: 0 }
     }
 
     fn score(seq: u32, rows: u32, waited_steps: u32) -> Request {
-        Request { seq: SeqId(seq), want: Want::Score { rows }, waited_steps }
+        Request { seq: SeqId(seq), want: Want::Score { rows }, waited_steps, priority: 0 }
     }
 
     fn part(seq: u32, rows: u32, kind: PartKind) -> Part {
@@ -374,6 +378,38 @@ mod tests {
     fn a_decision_asking_for_no_rows_is_not_in_the_plan() {
         let plan = plan(&[score(5, 0, 0), prefill(9, 10, 0)], &LIMITS);
         assert_eq!(plan.parts, [part(9, 10, PartKind::Prefill { completes: true })]);
+    }
+
+    #[test]
+    fn a_better_priority_goes_first_in_every_kind_of_row() {
+        let urgent = |mut r: Request| {
+            r.priority = -1;
+            r
+        };
+        // A long prompt of a better priority goes before a short one, and
+        // before a starved one of the default priority.
+        let requests = [prefill(1, 10, 0), urgent(prefill(2, 500, 0)), prefill(3, 30, 9)];
+        let plan = plan(&requests, &LIMITS);
+        assert_eq!(plan.parts, [part(2, 64, PartKind::Prefill { completes: false })]);
+
+        // Too few rows for every newest token: the better priority's first,
+        // whoever waited longer; its drafts too.
+        let limits = Limits { max_rows: 3, ..LIMITS };
+        let mut waited = window(1, 4);
+        waited.waited_steps = 5;
+        let requests = [waited, urgent(window(2, 4)), urgent(score(3, 1, 0))];
+        let plan = super::plan(&requests, &limits);
+        assert_eq!(
+            plan.parts,
+            [
+                part(2, 1, PartKind::Window),
+                part(1, 1, PartKind::Window),
+                part(3, 1, PartKind::Score { completes: true }),
+            ]
+        );
+        let limits = Limits { max_rows: 4, ..LIMITS };
+        let plan = super::plan(&[window(1, 4), urgent(window(2, 4))], &limits);
+        assert_eq!(plan.parts, [part(2, 3, PartKind::Window), part(1, 1, PartKind::Window)]);
     }
 
     #[test]

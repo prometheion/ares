@@ -48,6 +48,7 @@ fn answer(engine: &Arc<dyn Engine>, model: &str, text: &str, max_tokens: u32) ->
         stop: Vec::new(),
         draft: false,
         structure: None,
+        priority: 0,
         id: RequestId(1),
     };
     engine.submit(request, sink).expect("the engine takes the request");

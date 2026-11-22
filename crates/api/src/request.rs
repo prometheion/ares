@@ -70,6 +70,12 @@ pub struct GenerateRequest {
     /// A rule the reply must follow (a grammar, a JSON schema), or `None` for
     /// text that is free.
     pub structure: Option<Structure>,
+    /// Who goes first when the engine is busy: a lower number before a
+    /// higher one (vLLM's numbers), 0 for a request that does not say. A
+    /// request is let in, given rows and read before the requests of a worse
+    /// priority, and those give way to it when it does not fit.
+    #[serde(default)]
+    pub priority: i32,
     pub id: RequestId,
 }
 
@@ -110,6 +116,7 @@ mod tests {
                     shape: Shape::Lark("start: \"a\"".into()),
                 }),
             }),
+            priority: -3,
             id: RequestId(9),
         };
         let text = serde_json::to_string(&request).unwrap();

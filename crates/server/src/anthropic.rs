@@ -118,6 +118,7 @@ use std::time::Duration;
 
 use ares_api::RequestId;
 use axum::extract::{Request, State};
+use axum::http::HeaderValue;
 use axum::response::sse::{Event as SseEvent, KeepAlive};
 use axum::response::{IntoResponse, Response};
 
@@ -164,11 +165,13 @@ pub(crate) async fn method_not_allowed(request: Request) -> Response {
 async fn read(
     app: &App,
     body: &[u8],
+    priority: Option<&HeaderValue>,
     id: RequestId,
     purpose: Purpose,
 ) -> Result<(Parsed, Sorter, Lease), ApiError> {
     let chat = request::to_chat(&wire::read_json(body)?, purpose)?;
     let mut parsed = wire::from_json(Endpoint::Chat, &chat, id).map_err(request::renamed)?;
+    parsed.take_priority(priority)?;
     let (sorter, lease) = routes::prepare(app, &mut parsed, Some(ReasoningFormat::Auto))
         .await
         .map_err(request::renamed)?;
@@ -176,9 +179,10 @@ async fn read(
 }
 
 async fn try_messages(app: App, request: Request) -> Result<Response, ApiError> {
+    let priority = request.headers().get(wire::PRIORITY_HEADER).cloned();
     let body = read_body(request, &app.config).await?;
     let id = next_request_id();
-    let (parsed, sorter, lease) = read(&app, &body, id, Purpose::Reply).await?;
+    let (parsed, sorter, lease) = read(&app, &body, priority.as_ref(), id, Purpose::Reply).await?;
     let head = Head { id: format!("msg_{id}"), model: parsed.request.model.clone() };
     tracing::info!(
         %id,
@@ -186,6 +190,7 @@ async fn try_messages(app: App, request: Request) -> Result<Response, ApiError> 
         endpoint = "Messages",
         stream = parsed.stream,
         max_tokens = ?parsed.request.max_tokens,
+        priority = parsed.request.priority,
         "request"
     );
     let reply = Reply::start(&app, &lease, parsed.request, sorter)?;
@@ -202,7 +207,7 @@ async fn try_messages(app: App, request: Request) -> Result<Response, ApiError> 
 /// it would have been given.
 async fn try_count(app: App, request: Request) -> Result<Response, ApiError> {
     let body = read_body(request, &app.config).await?;
-    let (parsed, _, lease) = read(&app, &body, next_request_id(), Purpose::Count).await?;
+    let (parsed, _, lease) = read(&app, &body, None, next_request_id(), Purpose::Count).await?;
     let tokens = routes::count_prompt(&lease, parsed.request).await?;
     Ok(json_response(format!(r#"{{"input_tokens":{tokens}}}"#)))
 }

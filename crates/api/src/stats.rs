@@ -116,6 +116,12 @@ pub struct EngineStats {
     pub requests_cancelled: u64,
     /// Requests refused for lack of room.
     pub requests_refused: u64,
+    /// Times a running request gave way to a request of a better priority
+    /// (it comes back when there is room).
+    pub requests_outranked: u64,
+    /// Requests in a full line refused as overloaded because a request of a
+    /// better priority came.
+    pub requests_displaced: u64,
     /// Starts of a request from cells the prefix cache held, and the cells
     /// those starts took from it instead of computing them (a request that
     /// gave way and came back counts again).

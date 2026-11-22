@@ -321,6 +321,7 @@ fn log_request(app: &App, parsed: &Parsed) {
         structure = request.structure.is_some(),
         draft = request.draft,
         continues,
+        priority = request.priority,
         "request"
     );
     if app.config.log_text {
@@ -472,9 +473,11 @@ async fn try_completion(
     request: Request,
     endpoint: Endpoint,
 ) -> Result<Response, ApiError> {
+    let priority = request.headers().get(wire::PRIORITY_HEADER).cloned();
     let body = read_body(request, &app.config).await?;
     let id = next_request_id();
     let mut parsed = wire::parse(endpoint, &body, id)?;
+    parsed.take_priority(priority.as_ref())?;
     let (sorter, lease) = prepare(&app, &mut parsed, None).await?;
     let mut head = Head::new(endpoint, id, &parsed.request.model);
     head.logprobs = parsed.logprobs;

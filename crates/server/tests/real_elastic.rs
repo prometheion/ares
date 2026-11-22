@@ -101,6 +101,7 @@ fn generate(
         stop: Vec::new(),
         draft: true,
         structure: None,
+        priority: 0,
         id: RequestId(id),
     };
     engine.submit(request, sink).expect("the engine takes the request");

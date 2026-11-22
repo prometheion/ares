@@ -303,6 +303,11 @@ pub struct Counters {
     /// Times a running request gave way to the others: it let go of its
     /// pages and its slot and came back later.
     pub requests_suspended: u64,
+    /// Of those, the times it gave way to a request of a better priority.
+    pub requests_outranked: u64,
+    /// Requests in line that were refused as overloaded because a request
+    /// of a better priority came while the line was full.
+    pub requests_displaced: u64,
     /// Requests that ended because the pool had no page left for them and
     /// nobody else was left to give way.
     pub requests_exhausted: u64,
@@ -578,7 +583,8 @@ impl fmt::Display for Snapshot {
         )?;
         writeln!(
             f,
-            "pages {}/{} free  active {}  in line {} ({} waited, {} gave way, {} ended by a full pool, \
+            "pages {}/{} free  active {}  in line {} ({} waited, {} gave way ({} to a better \
+             priority), {} refused for a better priority, {} ended by a full pool, \
              {} draft rows cut)  conductor waits for devices: {} spun, {} parked  \
              device threads' waits for work: {} spun, {} parked",
             self.pages_free,
@@ -587,6 +593,8 @@ impl fmt::Display for Snapshot {
             self.waiting,
             c.requests_waited,
             c.requests_suspended,
+            c.requests_outranked,
+            c.requests_displaced,
             c.requests_exhausted,
             c.draft_rows_cut,
             c.conductor_wakes.spun,

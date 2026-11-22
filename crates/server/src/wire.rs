@@ -78,6 +78,55 @@ pub(crate) struct Parsed {
     /// request asked for (the model's `--max-tokens-limit`); set where the
     /// model's defaults are applied.
     pub lowered: Option<u32>,
+    /// The priority the body names (`priority`), which the request has
+    /// unless a header names another ([`Parsed::take_priority`]).
+    pub priority: Option<i32>,
+}
+
+/// The header that gives a request its priority, for a client that cannot
+/// add a member to a body (Claude Code's `ANTHROPIC_CUSTOM_HEADERS`, the
+/// `http_headers` of a provider of Codex).
+pub(crate) const PRIORITY_HEADER: &str = "x-ares-priority";
+
+impl Parsed {
+    /// Gives the request its priority: the body's, or the header's
+    /// ([`PRIORITY_HEADER`]) when the body names none. A request that names
+    /// two different ones is refused.
+    pub(crate) fn take_priority(
+        &mut self,
+        header: Option<&axum::http::HeaderValue>,
+    ) -> Result<(), ApiError> {
+        let header = match header {
+            None => None,
+            Some(value) => {
+                Some(value.to_str().ok().and_then(|v| v.trim().parse::<i32>().ok()).ok_or_else(
+                    || {
+                        ApiError::invalid_param(
+                            PRIORITY_HEADER,
+                            format!(
+                                "the header {PRIORITY_HEADER} is a whole number from {} to {}",
+                                i32::MIN,
+                                i32::MAX
+                            ),
+                        )
+                    },
+                )?)
+            }
+        };
+        self.request.priority = match (self.priority, header) {
+            (Some(body), Some(header)) if body != header => {
+                return Err(ApiError::invalid_param(
+                    "priority",
+                    format!(
+                        "the body asks for priority {body} and the header {PRIORITY_HEADER} for                          {header}: give one"
+                    ),
+                ));
+            }
+            (Some(priority), _) | (None, Some(priority)) => priority,
+            (None, None) => 0,
+        };
+        Ok(())
+    }
 }
 
 /// The most completions one request may ask for.
@@ -149,6 +198,7 @@ const SERVED: &[&str] = &[
     "n_probs",
     "post_sampling_probs",
     "min_keep",
+    "priority",
 ];
 
 /// Fields that carry no instruction for the generation: bookkeeping of the
@@ -269,7 +319,17 @@ pub(crate) fn from_json(
         stop: stop(&fields)?,
         draft: fields.bool("draft")?.unwrap_or(true),
         structure: structured::asked(&fields)?,
+        priority: 0,
         id,
+    };
+    let priority = match fields.int("priority")? {
+        None => None,
+        Some(priority) => Some(i32::try_from(priority).map_err(|_| {
+            ApiError::invalid_param(
+                "priority",
+                format!("priority must be from {} to {}, got {priority}", i32::MIN, i32::MAX),
+            )
+        })?),
     };
     let include_usage = match fields.get("stream_options") {
         None => false,
@@ -286,6 +346,7 @@ pub(crate) fn from_json(
         logprobs: format,
         fresh_seed,
         lowered: None,
+        priority,
     })
 }
 
@@ -1513,7 +1574,7 @@ pub(crate) fn model_list(models: &[crate::models::Listed]) -> serde_json::Value 
 /// The body of `GET /metrics`.
 pub(crate) fn metrics(stats: &ares_api::EngineStats) -> String {
     let (ram, ssd) = (&stats.ram, &stats.ssd);
-    let rows: [(&str, &str, &str, u64); 56] = [
+    let rows: [(&str, &str, &str, u64); 58] = [
         (
             "cache_ram_pages",
             "gauge",
@@ -1629,6 +1690,18 @@ pub(crate) fn metrics(stats: &ares_api::EngineStats) -> String {
             "counter",
             "Requests refused for lack of room",
             stats.requests_refused,
+        ),
+        (
+            "requests_outranked_total",
+            "counter",
+            "Times a running request gave way to a request of a better priority",
+            stats.requests_outranked,
+        ),
+        (
+            "requests_displaced_total",
+            "counter",
+            "Requests in a full line refused because a request of a better priority came",
+            stats.requests_displaced,
         ),
         ("steps_total", "counter", "Steps of the engine", stats.steps),
         ("prompt_tokens_total", "counter", "Prompt tokens computed", stats.prompt_tokens),

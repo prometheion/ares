@@ -127,6 +127,11 @@ impl Watch {
         })
     }
 
+    /// When the request was put in line.
+    pub fn submitted(&self) -> Instant {
+        self.submitted
+    }
+
     /// How long the request waited before it first started.
     pub fn queued(&self) -> Option<Duration> {
         self.started.map(|started| started.duration_since(self.submitted))

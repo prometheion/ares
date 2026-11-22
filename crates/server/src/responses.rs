@@ -128,7 +128,7 @@ use std::time::Duration;
 
 use ares_api::RequestId;
 use axum::extract::{Request, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderValue, StatusCode};
 use axum::response::sse::{Event as SseEvent, KeepAlive};
 use axum::response::{IntoResponse, Response};
 
@@ -188,11 +188,13 @@ pub(crate) async fn stored(request: Request) -> ApiError {
 async fn read(
     app: &App,
     body: &[u8],
+    priority: Option<&HeaderValue>,
     id: RequestId,
     purpose: Purpose,
 ) -> Result<(Parsed, Sorter, Echo, Lease), ApiError> {
     let (chat, mut echo) = request::to_chat(&wire::read_json(body)?, purpose)?;
     let mut parsed = wire::from_json(Endpoint::Chat, &chat, id).map_err(request::renamed)?;
+    parsed.take_priority(priority)?;
     let (sorter, lease) = routes::prepare(app, &mut parsed, Some(ReasoningFormat::Auto))
         .await
         .map_err(request::renamed)?;
@@ -201,9 +203,11 @@ async fn read(
 }
 
 async fn try_create(app: App, request: Request) -> Result<Response, ApiError> {
+    let priority = request.headers().get(wire::PRIORITY_HEADER).cloned();
     let body = read_body(request, &app.config).await?;
     let id = next_request_id();
-    let (parsed, sorter, echo, lease) = read(&app, &body, id, Purpose::Reply).await?;
+    let (parsed, sorter, echo, lease) =
+        read(&app, &body, priority.as_ref(), id, Purpose::Reply).await?;
     let head = Head {
         id: format!("resp_{id}"),
         model: parsed.request.model.clone(),
@@ -216,6 +220,7 @@ async fn try_create(app: App, request: Request) -> Result<Response, ApiError> {
         endpoint = "Responses",
         stream = parsed.stream,
         max_tokens = ?parsed.request.max_tokens,
+        priority = parsed.request.priority,
         "request"
     );
     let reply = Reply::start(&app, &lease, parsed.request, sorter)?;
@@ -232,7 +237,7 @@ async fn try_create(app: App, request: Request) -> Result<Response, ApiError> {
 /// as `/v1/responses` reads it.
 async fn try_count(app: App, request: Request) -> Result<Response, ApiError> {
     let body = read_body(request, &app.config).await?;
-    let (parsed, _, _, lease) = read(&app, &body, next_request_id(), Purpose::Count).await?;
+    let (parsed, _, _, lease) = read(&app, &body, None, next_request_id(), Purpose::Count).await?;
     let tokens = routes::count_prompt(&lease, parsed.request).await?;
     Ok(json_response(wire::input_tokens(tokens)))
 }

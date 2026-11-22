@@ -257,6 +257,7 @@ fn ask(runtime: &Runtime, id: u64, question: &str, max_tokens: u32) -> String {
                 stop: Vec::new(),
                 draft: true,
                 structure: None,
+                priority: 0,
                 id: RequestId(id),
             },
             sink,
@@ -370,6 +371,7 @@ fn ask_with(
         stop: Vec::new(),
         draft: true,
         structure: None,
+        priority: 0,
         id: RequestId(id),
     };
     match filter {

@@ -42,6 +42,7 @@ const SERVED: &[&str] = &[
     "truncation",
     "store",
     "background",
+    "priority",
 ];
 
 /// Bookkeeping of the client or of OpenAI's service that is a string:
@@ -141,7 +142,9 @@ pub(crate) fn to_chat(body: &Json, purpose: Purpose) -> Result<(Json, Echo), Api
     stateless(&fields)?;
 
     let mut chat = Chat::new();
-    for name in ["model", "temperature", "top_p"] {
+    // `priority` is vLLM's and SGLang's member of this route, as of the chat
+    // route, and is checked there.
+    for name in ["model", "temperature", "top_p", "priority"] {
         if let Some(value) = fields.get(name) {
             chat.push((name, value.clone()));
         }

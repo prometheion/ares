@@ -339,6 +339,7 @@ impl Rig {
                     stop: Vec::new(),
                     draft: true,
                     structure: None,
+                    priority: 0,
                     id: RequestId(self.next.fetch_add(1, Ordering::Relaxed)),
                 },
                 sink,

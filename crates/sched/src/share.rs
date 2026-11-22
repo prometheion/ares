@@ -32,6 +32,12 @@
 //!   of short prompts is read in one step (the planner serves the shortest
 //!   first) and then pays once.
 //!
+//! Priorities (see [`Admission`](crate::Admission)): a prompt that has
+//! started and outranks every sequence that generates owes them nothing and
+//! is read in pieces at once, the generating sequences riding along; the
+//! planner gives it the rows of the piece first. Prompts that do not outrank
+//! them, of any priority, take turns with them as above.
+//!
 //! A prompt that is read alone (nobody generates, no other prompt waits)
 //! takes the widest step there is, which may borrow memory for its time (the
 //! expert slots of a mixture of experts lend it VRAM). Once another request
@@ -64,6 +70,9 @@ pub struct Pending<'a> {
     pub piece_rows: u32,
     /// The most rows of a step: what a prompt read alone takes.
     pub max_rows: u32,
+    /// A prompt that has started has a better priority than every sequence
+    /// that generates: it is not held back by what is owed to them.
+    pub ahead: bool,
 }
 
 /// The debt of the prompts to the generating sequences.
@@ -105,7 +114,7 @@ impl Share {
             // the planner gives the shortest prompt first.
             return Turn::Piece { rows: if started == 1 { pending.max_rows } else { piece } };
         }
-        if self.owed_ms <= 0.0 {
+        if self.owed_ms <= 0.0 || pending.ahead {
             return Turn::Piece { rows };
         }
         let completes = pending.prompts.iter().any(|&left| left > 0 && left <= rows);
@@ -147,7 +156,7 @@ mod tests {
     }
 
     fn pending(generating: u32, prompts: &[u32]) -> Pending<'_> {
-        Pending { generating, prompts, piece_rows: 256, max_rows: 512 }
+        Pending { generating, prompts, piece_rows: 256, max_rows: 512, ahead: false }
     }
 
     /// Plays decoders and prompts against each other until the prompts are
@@ -240,6 +249,20 @@ mod tests {
         let mut share = Share::new(2.0);
         share.spent(piece, price(256), 2, true);
         assert_eq!(share.next(&pending(2, &[5000]), price), Turn::Round);
+    }
+
+    #[test]
+    fn a_prompt_that_outranks_every_generating_sequence_does_not_wait_for_the_debt() {
+        let mut share = Share::new(2.0);
+        let piece = Turn::Piece { rows: 254 };
+        share.spent(piece, 900.0, 2, true);
+        let long = pending(2, &[5000]);
+        assert_eq!(share.next(&long, price), Turn::Round);
+        let ahead = Pending { ahead: true, ..long };
+        assert_eq!(share.next(&ahead, price), piece);
+        // Its pieces are owed all the same, to the prompts that come after it.
+        share.spent(piece, 300.0, 2, true);
+        assert_eq!(share.owed_ms(), 1200.0);
     }
 
     #[test]

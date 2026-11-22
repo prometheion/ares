@@ -108,6 +108,7 @@ fn say(runtime: &Runtime, text: &str) -> Result<String, EngineError> {
             stop: Vec::new(),
             draft: true,
             structure: None,
+            priority: 0,
             id: RequestId(1),
         },
         sink,

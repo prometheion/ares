@@ -356,6 +356,8 @@ fn run(seed: u64, capacity: u32, clip: u32, passes: u32, totals: &mut Totals) {
                 cached_cells: cached * PER_PAGE,
                 idle_cached_pages: idle,
                 max_new_tokens: max_new,
+                // The world below plays the rules of one priority.
+                priority: 0,
             };
             let fits_at_all = pages_for(prompt + 1) <= capacity;
             match a.enqueue(arrival) {

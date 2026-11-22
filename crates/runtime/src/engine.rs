@@ -267,13 +267,13 @@ impl Runtime {
             });
         }
         // A full line refuses: the slots are taken and as many wait as may.
+        // The conductor, which knows the line, decides: a request of a better
+        // priority than the worst in line that has not started takes that
+        // one's place, which is refused; else this one is refused, as an
+        // event (a route gives it its status all the same).
         let held = self.held.fetch_add(1, Ordering::AcqRel) + 1;
         let place = Held(self.held.clone());
-        if let Some(queue) = self.queue
-            && held > self.slots.saturating_add(queue)
-        {
-            return Err(EngineError::Overloaded);
-        }
+        let displace = self.queue.is_some_and(|queue| held > self.slots.saturating_add(queue));
         let events = EventSink::new(move |event| {
             let _place = &place;
             events.send(event)
@@ -293,6 +293,8 @@ impl Runtime {
             sampling: request.sampling,
             draft: request.draft,
             filter,
+            priority: request.priority,
+            displace,
             sink: events,
         });
         let sent = match self.commands.lock().expect("commands").as_ref() {
@@ -439,6 +441,8 @@ impl Engine for Runtime {
             requests_cancelled: c.requests_cancelled,
             // Nothing is refused for lack of room: a request waits in line.
             requests_refused: 0,
+            requests_outranked: c.requests_outranked,
+            requests_displaced: c.requests_displaced,
             prefix_hits: c.prefix_hits,
             cached_cells: c.cached_cells,
             replayed_rows: c.replay_rows,

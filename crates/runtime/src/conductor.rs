@@ -226,6 +226,12 @@ pub(crate) struct Submission {
     pub draft: bool,
     /// A rule about which tokens the request may pick, if it has one.
     pub filter: Option<Box<dyn TokenFilter>>,
+    /// Who goes first: a lower number before a higher one.
+    pub priority: i32,
+    /// The line was full when the request came: it takes the place of the
+    /// worst waiting request of a worse priority that has not started, which
+    /// is refused as overloaded, or is refused itself.
+    pub displace: bool,
     pub sink: EventSink,
 }
 
@@ -331,6 +337,8 @@ struct Active {
     max_tokens: Option<u32>,
     completion: u32,
     waited_steps: u32,
+    /// Who goes first: a lower number before a higher one.
+    priority: i32,
     /// Whether the request was counted as one that had to wait.
     counted_waiting: bool,
     /// Drafts for the coming step; cut to the rows the plan grants. When one
@@ -1138,6 +1146,8 @@ impl Conductor {
             sampling,
             draft,
             filter,
+            priority,
+            displace,
             sink,
         } = submission;
         let refuse = |error: EngineError| {
@@ -1156,6 +1166,23 @@ impl Conductor {
             return refuse(EngineError::Internal(
                 "the executor has no image stage for the rows of images".into(),
             ));
+        }
+        if displace {
+            // The line is full: the worst request in it of a worse priority
+            // that has not started (the latest of them) is refused in this
+            // one's place. A request that ran has sent its client text, and
+            // stays.
+            let worst = self
+                .waiting
+                .iter()
+                .enumerate()
+                .filter(|(_, a)| !a.ran && a.priority > priority)
+                .max_by_key(|(_, a)| (a.priority, a.stop.submitted()))
+                .map(|(i, _)| i);
+            let Some(i) = worst else { return refuse(EngineError::Overloaded) };
+            let _ = self.waiting[i].sink.send(Event::Error(EngineError::Overloaded));
+            self.dismiss(i, FinishReason::Cancelled);
+            self.stats.counters.requests_displaced += 1;
         }
         // The names of the cells: an image's by the image and its row.
         let mut names: Vec<u64> = prompt.iter().map(|t| u64::from(*t)).collect();
@@ -1203,6 +1230,7 @@ impl Conductor {
             cached_cells: cached,
             idle_cached_pages: idle,
             max_new_tokens: max_tokens.map_or(room, |max| max.min(room)),
+            priority,
         };
         if self.admission.enqueue(arrival).is_err() {
             // The one refusal: the whole pool cannot hold the prompt and the
@@ -1259,6 +1287,7 @@ impl Conductor {
             max_tokens,
             completion: 0,
             waited_steps: 0,
+            priority,
             counted_waiting: false,
             draft: Vec::with_capacity(self.config.window_rows as usize),
             model_drafter: None,
@@ -1308,6 +1337,7 @@ impl Conductor {
                 cached_cells: probe.resume.cached_cells as u32,
                 idle_cached_pages: probe.idle,
                 max_new_tokens: a.max_new_tokens(self.context_length),
+                priority: a.priority,
             };
             self.admission.remove(seq);
             // It passed the one refusal when it arrived.
@@ -1618,6 +1648,7 @@ impl Conductor {
         for seq in &outcome.spill {
             self.suspend(*seq);
         }
+        self.stats.counters.requests_outranked += u64::from(outcome.outranked);
         for seq in outcome.resume.iter().chain(&outcome.admit) {
             self.start(*seq);
         }
@@ -1683,6 +1714,7 @@ impl Conductor {
                         seq: SeqId(slot as u32),
                         want: Want::Prefill { tokens: ready },
                         waited_steps: a.waited_steps,
+                        priority: a.priority,
                     });
                 }
                 continue;
@@ -1763,6 +1795,7 @@ impl Conductor {
                 seq: SeqId(slot as u32),
                 want: Want::Window { drafts: 0 },
                 waited_steps: a.waited_steps,
+                priority: a.priority,
             });
         }
         if !drafting {
@@ -1911,11 +1944,19 @@ impl Conductor {
         {
             piece = (piece / 2).max(MIN_PIECE);
         }
+        // A prompt of a better priority than every sequence that generates
+        // owes them nothing.
+        let best = |generating: bool| {
+            let slots = self.slots.iter().flatten();
+            slots.filter(|a| a.generating() == generating).map(|a| a.priority).min()
+        };
+        let ahead = matches!((best(false), best(true)), (Some(p), Some(g)) if p < g);
         let pending = Pending {
             generating,
             prompts: &self.prompt_rows,
             piece_rows: piece,
             max_rows: self.max_rows,
+            ahead,
         };
         let turn = self
             .share

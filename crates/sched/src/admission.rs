@@ -36,6 +36,18 @@
 //!   gives way** (SGLang's order; ties: the longest prompt). Here it is
 //!   spilled, not recomputed: its pages go to RAM and it waits at the front of
 //!   the line to come back.
+//! - **A request has a priority, a lower number first** (vLLM's numbers).
+//!   Everything above holds among the requests of one priority; the line is
+//!   taken by priority first, so a request never waits for one of a worse
+//!   priority, and a shortage spills the worst priority first (vLLM's
+//!   victim). A request that does not fit, for want of a place or of pages,
+//!   makes running requests of a worse priority give way, the worst first and
+//!   as many as it needs, or none when all of them would not make it fit
+//!   (SGLang's preemption, which also asks that the victims free enough; it
+//!   has a threshold of the gap between the two priorities, 10 by default,
+//!   where here any gap is enough). They are spilled as for a shortage, so
+//!   that what they computed stays in the prefix cache, and come back when
+//!   there is room for them again.
 //!
 //! This object decides and reports. It moves no page, and it reads the pool
 //! only through the numbers it is given: the free pages at the start of a
@@ -110,6 +122,9 @@ pub struct Arrival {
     /// The most tokens it may generate: its own limit, or the room the
     /// context leaves after the prompt.
     pub max_new_tokens: u32,
+    /// Who goes first: a lower number before a higher one. 0 is the
+    /// priority of a request that names none.
+    pub priority: i32,
 }
 
 /// The prompt alone takes more pages than the pool has. This is the one
@@ -162,6 +177,9 @@ pub struct Outcome {
     pub resume: Vec<SeqId>,
     /// Waiting requests to start, in order.
     pub admit: Vec<SeqId>,
+    /// How many of `spill` gave way to a request of a better priority (the
+    /// rest gave way to a shortage of the pool).
+    pub outranked: u32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -171,6 +189,7 @@ struct Running {
     prompt_rows_left: u32,
     generated: u32,
     max_new_tokens: u32,
+    priority: i32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -185,6 +204,9 @@ struct Waiting {
     /// For a spilled sequence: what it was when it was suspended and the
     /// pages it needs back.
     spilled: Option<(Running, u32)>,
+    /// The pass it was spilled in: it does not come back in the pass that
+    /// made it give way.
+    spilled_in: u64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -206,6 +228,8 @@ pub struct Admission {
     claims: Vec<Claim>,
     order: Vec<usize>,
     shortages: u64,
+    /// Passes settled so far.
+    passes: u64,
 }
 
 impl Admission {
@@ -225,6 +249,7 @@ impl Admission {
             claims: Vec::new(),
             order: Vec::new(),
             shortages: 0,
+            passes: 0,
         }
     }
 
@@ -309,6 +334,7 @@ impl Admission {
             passed: 0,
             held: false,
             spilled: None,
+            spilled_in: 0,
         });
         Ok(())
     }
@@ -390,7 +416,34 @@ impl Admission {
     /// count now.
     pub fn begin(&mut self, free_pages: u32) -> Claims<'_> {
         self.claims.clear();
+        self.passes += 1;
         Claims { admission: self, free: free_pages }
+    }
+
+    /// Takes the running request at index `i` off the pool: it waits at the
+    /// front of the line of its priority with what it needs to come back,
+    /// `freed` pages (what its leaving frees).
+    fn spill(&mut self, i: usize, freed: u32) -> SeqId {
+        let was = self.running.swap_remove(i);
+        self.arrivals += 1;
+        self.waiting.push(Waiting {
+            arrival: Arrival {
+                seq: was.seq,
+                prompt_cells: was.prompt_cells,
+                // A request that comes back from an earlier spill may owe more
+                // rows than its prompt has (`set_recompute`).
+                cached_cells: was.prompt_cells.saturating_sub(was.prompt_rows_left),
+                idle_cached_pages: 0,
+                max_new_tokens: was.max_new_tokens,
+                priority: was.priority,
+            },
+            order: self.arrivals,
+            passed: 0,
+            held: false,
+            spilled: Some((was, freed)),
+            spilled_in: self.passes,
+        });
+        was.seq
     }
 
     /// After a shortage the ratio is at least the share that the running
@@ -410,6 +463,19 @@ impl Admission {
         }
     }
 
+    /// The pages free and evictable for the waiting request `w` in this
+    /// pass, past what the requests admitted before it take: the evictable
+    /// pages are asked for only when `need` is more than the free ones.
+    fn room(&self, w: &Waiting, need: u64, tally: &mut Tally, view: &mut dyn PoolView) -> u64 {
+        let mut room = u64::from(tally.free) + u64::from(tally.released);
+        if need > room {
+            let n = *tally.evictable.get_or_insert_with(|| view.evictable());
+            let usable = n.saturating_sub(tally.taken).saturating_sub(w.arrival.idle_cached_pages);
+            room += u64::from(usable);
+        }
+        room
+    }
+
     /// Tries to admit the waiting request at index `i`: it fits when it is
     /// alone, or when its charge fits in the free and evictable pages next
     /// to this step's claims and everything held back for the others.
@@ -427,20 +493,20 @@ impl Admission {
         let charge = self.charge(&w);
         let mut fits = self.running.is_empty();
         if !fits {
-            // Free pages first; the walk over the cache only if needed.
             let need = u64::from(tally.granted) + u64::from(tally.held_back) + u64::from(charge);
-            fits = need <= u64::from(tally.free);
-            if !fits {
-                let n = *tally.evictable.get_or_insert_with(|| view.evictable());
-                let usable =
-                    n.saturating_sub(tally.taken).saturating_sub(w.arrival.idle_cached_pages);
-                fits = need <= u64::from(tally.free) + u64::from(usable);
-            }
+            fits = need <= self.room(&w, need, tally, view);
         }
         if !fits {
             self.waiting[i].passed = w.passed.saturating_add(1);
             return false;
         }
+        self.seat(i, charge, tally, out);
+        true
+    }
+
+    /// Admits the waiting request at index `i`, whose charge is `charge`.
+    fn seat(&mut self, i: usize, charge: u32, tally: &mut Tally, out: &mut Outcome) {
+        let w = self.waiting[i];
         tally.taken = tally.taken.saturating_add(w.arrival.idle_cached_pages);
         match w.spilled {
             Some((was, restore)) => {
@@ -458,6 +524,7 @@ impl Admission {
                     prompt_rows_left: a.prompt_cells.saturating_sub(a.cached_cells),
                     generated: 0,
                     max_new_tokens: a.max_new_tokens,
+                    priority: a.priority,
                 });
                 out.admit.push(a.seq);
                 tally.held_back = tally.held_back.saturating_add(charge);
@@ -466,33 +533,145 @@ impl Admission {
         // Gone from the line; removed when the pass ends, so that indices
         // stay valid until then.
         self.waiting[i].order = 0;
+    }
+
+    /// Admits the waiting request at index `i`, which does not fit, by
+    /// spilling running requests of a worse priority: the worst first, and
+    /// among those of one priority the one a shortage would spill first, as
+    /// many as it takes. Spills none and returns false when all of them would
+    /// not make it fit.
+    fn make_way(
+        &mut self,
+        i: usize,
+        tally: &mut Tally,
+        view: &mut dyn PoolView,
+        out: &mut Outcome,
+    ) -> bool {
+        use std::cmp::Reverse;
+        let w = self.waiting[i];
+        let mut victims: Vec<usize> = (0..self.running.len())
+            .filter(|&r| self.running[r].priority > w.arrival.priority)
+            .collect();
+        if victims.is_empty() {
+            return false;
+        }
+        victims.sort_by_key(|&r| {
+            let Running { priority, generated, prompt_cells, seq, .. } = self.running[r];
+            (Reverse(priority), generated, Reverse(prompt_cells), Reverse(seq))
+        });
+        let charge = u64::from(self.charge(&w));
+        let mut places = self.config.max_running as usize;
+        places = places.saturating_sub(self.running.len());
+        let mut need = u64::from(tally.granted) + u64::from(tally.held_back) + charge;
+        let mut released = 0u64;
+        let mut chosen: Vec<(usize, u32, u32, u32)> = Vec::new();
+        for r in victims {
+            let room = self.room(&w, need, tally, view) + released;
+            if places > 0 && need <= room {
+                break;
+            }
+            let victim = self.running[r];
+            let freed = view.releasable(victim.seq);
+            // What the step granted it, and what is held back for it.
+            let granted: u32 = self
+                .claims
+                .iter()
+                .filter(|c| c.seq == victim.seq)
+                .map(|c| c.required + if out.cut.contains(&c.seq) { 0 } else { c.optional })
+                .sum();
+            let reserve = self.reserve(&victim);
+            places += 1;
+            need = need.saturating_sub(u64::from(granted) + u64::from(reserve));
+            released += u64::from(freed);
+            chosen.push((r, freed, granted, reserve));
+        }
+        let room = self.room(&w, need, tally, view) + released;
+        if places == 0 || need > room {
+            return false;
+        }
+        // Carry it out, from the highest index down so that the indices of
+        // the others stay valid as each is taken out.
+        chosen.sort_by_key(|&(r, ..)| Reverse(r));
+        for (r, freed, granted, reserve) in chosen {
+            let seq = self.spill(r, freed);
+            out.spill.push(seq);
+            out.outranked += 1;
+            tally.granted = tally.granted.saturating_sub(granted);
+            tally.held_back = tally.held_back.saturating_sub(reserve);
+            tally.released = tally.released.saturating_add(freed);
+        }
+        let charge = self.charge(&w);
+        self.seat(i, charge, tally, out);
         true
     }
 
-    /// The admissions of a pass. Spilled requests come back first (first
-    /// out, first back), then starved ones (the longest wait first); the
-    /// first of these that does not fit ends the pass. Then the others, the
-    /// fewest uncached rows first, each on its own merits.
+    /// Admits the waiting request at index `i` if it fits, or if running
+    /// requests of a worse priority can make room for it.
+    fn admit_or_make_way(
+        &mut self,
+        i: usize,
+        tally: &mut Tally,
+        view: &mut dyn PoolView,
+        out: &mut Outcome,
+    ) -> bool {
+        self.try_admit(i, tally, view, out) || self.make_way(i, tally, view, out)
+    }
+
+    /// The admissions of a pass, by priority, the best first; a priority
+    /// whose request blocks the line ends the pass, so that no request of a
+    /// worse one goes ahead of it.
     fn admit(&mut self, tally: &mut Tally, view: &mut dyn PoolView, out: &mut Outcome) {
-        // With every place taken nobody can start, whatever the pool holds.
-        if self.running.len() >= self.config.max_running as usize {
-            return;
+        let mut priorities: Vec<i32> = self
+            .waiting
+            .iter()
+            .filter(|w| w.order != 0 && !w.held)
+            .map(|w| w.arrival.priority)
+            .collect();
+        priorities.sort_unstable();
+        priorities.dedup();
+        for priority in priorities {
+            if !self.admit_priority(priority, tally, view, out) {
+                break;
+            }
         }
+        self.waiting.retain(|w| w.order != 0);
+    }
+
+    /// The admissions of the requests of one priority. Spilled requests come
+    /// back first (first out, first back), then starved ones (the longest
+    /// wait first); the first of these that does not fit ends the pass
+    /// (returns false). Then the others, the fewest uncached rows first, each
+    /// on its own merits.
+    fn admit_priority(
+        &mut self,
+        priority: i32,
+        tally: &mut Tally,
+        view: &mut dyn PoolView,
+        out: &mut Outcome,
+    ) -> bool {
         let starvation = self.config.starvation_passes;
+        let pass = self.passes;
         let uncached = |w: &Waiting| w.arrival.prompt_cells.saturating_sub(w.arrival.cached_cells);
+        // In line now: not taken in this pass, not held, not made to give way
+        // in it.
+        let in_line = |w: &Waiting| {
+            w.order != 0
+                && !w.held
+                && w.arrival.priority == priority
+                && !(w.spilled.is_some() && w.spilled_in == pass)
+        };
         loop {
             let first = self
                 .waiting
                 .iter()
                 .enumerate()
-                .filter(|(_, w)| w.order != 0 && !w.held)
+                .filter(|(_, w)| in_line(w))
                 .filter(|(_, w)| w.spilled.is_some() || w.passed >= starvation)
                 .min_by_key(|(_, w)| (w.spilled.is_none(), w.order))
                 .map(|(i, _)| i);
             let Some(i) = first else { break };
-            if !self.try_admit(i, tally, view, out) {
-                self.waiting.retain(|w| w.order != 0);
-                return;
+            if !self.admit_or_make_way(i, tally, view, out) {
+                return false;
             }
         }
 
@@ -502,45 +681,25 @@ impl Admission {
                 .waiting
                 .iter()
                 .enumerate()
-                .filter(|(_, w)| w.order != 0 && !w.held)
+                .filter(|(_, w)| in_line(w))
                 .min_by_key(|(_, w)| (uncached(w), w.order))
                 .map(|(i, _)| i);
             if let Some(i) = first {
                 self.try_admit(i, tally, view, out);
             }
         }
-        // What is held back only grows during a pass, so a request that does
-        // not fit now does not fit later in it either: those are passed over
-        // without being put in order.
         self.order.clear();
-        for i in 0..self.waiting.len() {
-            let w = self.waiting[i];
-            if w.order == 0 || w.held {
-                continue;
-            }
-            let need =
-                u64::from(tally.granted) + u64::from(tally.held_back) + u64::from(self.charge(&w));
-            let mut room = u64::from(tally.free);
-            if need > room {
-                let n = *tally.evictable.get_or_insert_with(|| view.evictable());
-                room += u64::from(n.saturating_sub(tally.taken));
-            }
-            if need <= room {
-                self.order.push(i);
-            } else {
-                self.waiting[i].passed = w.passed.saturating_add(1);
-            }
-        }
+        self.order.extend((0..self.waiting.len()).filter(|&i| in_line(&self.waiting[i])));
         let waiting = &self.waiting;
         self.order.sort_by_key(|i| (uncached(&waiting[*i]), waiting[*i].order));
         for k in 0..self.order.len() {
-            if self.running.len() >= self.config.max_running as usize {
-                break;
-            }
             let i = self.order[k];
-            self.try_admit(i, tally, view, out);
+            if !in_line(&self.waiting[i]) {
+                continue;
+            }
+            self.admit_or_make_way(i, tally, view, out);
         }
-        self.waiting.retain(|w| w.order != 0);
+        true
     }
 }
 
@@ -557,6 +716,8 @@ struct Tally {
     taken: u32,
     /// The evictable pages, once they were asked for.
     evictable: Option<u32>,
+    /// Pages that requests made to give way in this pass let go of.
+    released: u32,
 }
 
 /// The accounting of one step: the claims of the running sequences, then the
@@ -604,7 +765,9 @@ impl Claims<'_> {
                     .iter()
                     .filter(|r| !victims.iter().any(|v| v.0 == r.seq))
                     .min_by_key(|r| {
-                        (r.generated, std::cmp::Reverse(r.prompt_cells), std::cmp::Reverse(r.seq))
+                        let Running { priority, generated, prompt_cells, seq, .. } = **r;
+                        use std::cmp::Reverse;
+                        (Reverse(priority), generated, Reverse(prompt_cells), Reverse(seq))
                     })
                     .map(|r| r.seq);
                 let Some(victim) = victim else { break };
@@ -635,24 +798,7 @@ impl Claims<'_> {
             }
             for (victim, freed, _) in victims {
                 let Some(i) = a.running.iter().position(|r| r.seq == victim) else { continue };
-                let was = a.running.swap_remove(i);
-                a.arrivals += 1;
-                a.waiting.push(Waiting {
-                    arrival: Arrival {
-                        seq: victim,
-                        prompt_cells: was.prompt_cells,
-                        // A request that comes back from an earlier spill may owe more
-                        // rows than its prompt has (`set_recompute`).
-                        cached_cells: was.prompt_cells.saturating_sub(was.prompt_rows_left),
-                        idle_cached_pages: 0,
-                        max_new_tokens: was.max_new_tokens,
-                    },
-                    order: a.arrivals,
-                    passed: 0,
-                    held: false,
-                    spilled: Some((was, freed)),
-                });
-                out.spill.push(victim);
+                out.spill.push(a.spill(i, freed));
             }
         }
 
@@ -689,8 +835,14 @@ impl Claims<'_> {
 
         // Admissions, unless this step already had to make room.
         if out.spill.is_empty() && out.exhausted.is_none() && !a.waiting.is_empty() {
-            let mut tally =
-                Tally { free, granted, held_back: a.reserved_pages(), taken: 0, evictable };
+            let mut tally = Tally {
+                free,
+                granted,
+                held_back: a.reserved_pages(),
+                taken: 0,
+                evictable,
+                released: 0,
+            };
             a.admit(&mut tally, view, &mut out);
             out.evict = tally.granted.saturating_sub(free);
         }
@@ -739,7 +891,12 @@ mod tests {
             cached_cells: cached,
             idle_cached_pages: 0,
             max_new_tokens: max_new,
+            priority: 0,
         }
+    }
+
+    fn ranked(priority: i32, arrival: Arrival) -> Arrival {
+        Arrival { priority, ..arrival }
     }
 
     fn pass(a: &mut Admission, free: u32, evictable: u32) -> Outcome {
@@ -871,6 +1028,123 @@ mod tests {
         // hit after it in the same pass if it still fits.
         a.finished(SeqId(1));
         assert_eq!(pass(&mut a, 64, 0).admit, [SeqId(2), SeqId(6)]);
+    }
+
+    #[test]
+    fn the_line_is_taken_by_priority_first() {
+        let mut cfg = config(64);
+        cfg.starvation_passes = 2;
+        let mut a = Admission::new(cfg);
+        a.enqueue(ranked(-1, arrival(1, 30 * PER_PAGE, 0, 256))).unwrap();
+        pass(&mut a, 64, 0);
+        // Held back: 30 + 2. A hit of the default priority and a miss of a
+        // better one, as good as the running one's: the miss does not fit
+        // (40 + 2), the hit does, and goes.
+        a.enqueue(arrival(2, 40 * PER_PAGE, 39 * PER_PAGE, 256)).unwrap();
+        a.enqueue(ranked(-1, arrival(3, 40 * PER_PAGE, 0, 256))).unwrap();
+        assert_eq!(pass(&mut a, 64, 0).admit, [SeqId(2)]);
+        a.finished(SeqId(2));
+        // Of two that fit, the better priority goes first, a miss before a hit.
+        a.finished(SeqId(1));
+        a.enqueue(arrival(4, 2 * PER_PAGE, PER_PAGE, 256)).unwrap();
+        assert_eq!(pass(&mut a, 64, 0).admit, [SeqId(3), SeqId(4)]);
+
+        // A starved request blocks the requests of its priority and of worse
+        // ones, never those of a better one.
+        let mut a = Admission::new(cfg);
+        a.enqueue(arrival(1, 30 * PER_PAGE, 0, 256)).unwrap();
+        pass(&mut a, 64, 0);
+        a.enqueue(arrival(2, 40 * PER_PAGE, 0, 256)).unwrap();
+        for _ in 0..2 {
+            assert!(pass(&mut a, 64, 0).admit.is_empty());
+        }
+        a.enqueue(arrival(3, PER_PAGE, 0, 16)).unwrap();
+        a.enqueue(ranked(1, arrival(4, PER_PAGE, 0, 16))).unwrap();
+        a.enqueue(ranked(-1, arrival(5, PER_PAGE, 0, 16))).unwrap();
+        assert_eq!(pass(&mut a, 64, 0).admit, [SeqId(5)]);
+    }
+
+    #[test]
+    fn a_better_priority_takes_the_place_of_a_worse_one() {
+        let mut a = Admission::new(AdmissionConfig { max_running: 2, ..config(1000) });
+        a.enqueue(ranked(3, arrival(1, PER_PAGE, 0, 256))).unwrap();
+        a.enqueue(ranked(5, arrival(2, PER_PAGE, 0, 256))).unwrap();
+        assert_eq!(pass(&mut a, 1000, 0).admit, [SeqId(1), SeqId(2)]);
+        a.generated(SeqId(1), 100);
+        a.generated(SeqId(2), 100);
+
+        // Both places are taken. A request of the same priority as the worst
+        // waits; one of a better priority than both takes the worst one's
+        // place, which waits at the front of its own line.
+        a.enqueue(ranked(5, arrival(3, PER_PAGE, 0, 256))).unwrap();
+        assert_eq!(pass(&mut a, 1000, 0), Outcome::default());
+        a.enqueue(ranked(0, arrival(4, PER_PAGE, 0, 256))).unwrap();
+        let out = pass(&mut a, 1000, 0);
+        assert_eq!(
+            (out.spill.as_slice(), out.admit.as_slice()),
+            ([SeqId(2)].as_slice(), [SeqId(4)].as_slice())
+        );
+        assert_eq!(out.outranked, 1);
+        assert!(out.resume.is_empty(), "it does not come back in the pass that spilled it");
+        assert!(!a.is_running(SeqId(2)));
+
+        // When a place is free again the one that gave way comes back before
+        // the request of its priority that waited before it.
+        a.finished(SeqId(4));
+        let out = pass(&mut a, 1000, 0);
+        assert_eq!(
+            (out.resume.as_slice(), out.admit.as_slice()),
+            ([SeqId(2)].as_slice(), [].as_slice())
+        );
+    }
+
+    #[test]
+    fn a_better_priority_makes_room_in_the_pool_or_spills_nobody() {
+        // 64 pages. Two requests of priority 2 hold 2 + 3 and 20 + 3 pages.
+        let mut a = Admission::new(config(64));
+        a.enqueue(ranked(2, arrival(1, 2 * PER_PAGE, 0, 256))).unwrap();
+        a.enqueue(ranked(2, arrival(2, 20 * PER_PAGE, 0, 256))).unwrap();
+        assert_eq!(pass(&mut a, 64, 0).admit, [SeqId(1), SeqId(2)]);
+        // A prompt of 40 pages of priority 1 needs 40 + 2 next to the 2 + 2
+        // and 20 + 2 held back (a ratio of 0.7): it does not fit. The one
+        // with the fewest generated tokens gives way, and nobody else.
+        a.generated(SeqId(1), 10);
+        a.generated(SeqId(2), 5);
+        a.enqueue(ranked(1, arrival(3, 40 * PER_PAGE, 0, 256))).unwrap();
+        let mut view = View::new(0);
+        view.releasable = vec![(1, 2), (2, 20)];
+        let out = a.begin(64).settle(&mut view);
+        assert_eq!(out.spill, [SeqId(2)]);
+        assert_eq!(out.admit, [SeqId(3)]);
+
+        // One that would not fit even if everybody gave way spills nobody.
+        let mut a = Admission::new(config(64));
+        a.enqueue(ranked(2, arrival(1, 20 * PER_PAGE, 0, 256))).unwrap();
+        pass(&mut a, 64, 0);
+        a.enqueue(ranked(1, arrival(2, 63 * PER_PAGE, 0, 256))).unwrap();
+        let mut view = View::new(0);
+        view.releasable = vec![(1, 20)];
+        assert_eq!(a.begin(44).settle(&mut view), Outcome::default());
+    }
+
+    #[test]
+    fn a_shortage_spills_the_worst_priority_first() {
+        let mut a = Admission::new(config(8));
+        a.enqueue(ranked(0, arrival(1, PER_PAGE, 0, 16))).unwrap();
+        a.enqueue(ranked(1, arrival(2, PER_PAGE, 0, 16))).unwrap();
+        a.enqueue(ranked(0, arrival(3, PER_PAGE, 0, 16))).unwrap();
+        pass(&mut a, 8, 0);
+        // The worse priority has generated the most: it goes all the same.
+        a.generated(SeqId(2), 1000);
+        let mut claims = a.begin(1);
+        for seq in 1..=3 {
+            claims.claim(SeqId(seq), 1, 0, 0);
+        }
+        let mut view = View::new(0);
+        view.releasable = vec![(1, 2), (2, 2), (3, 2)];
+        let out = claims.settle(&mut view);
+        assert_eq!(out.spill, [SeqId(2)]);
+        assert_eq!(out.outranked, 0);
     }
 
     #[test]
