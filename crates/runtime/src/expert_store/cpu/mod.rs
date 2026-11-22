@@ -678,6 +678,11 @@ impl LayerJob {
         }
     }
 
+    /// When the last task ended; `None` while the job runs.
+    pub fn ended(&self) -> Option<Instant> {
+        self.elapsed().map(|elapsed| self.created + elapsed)
+    }
+
     /// From the creation of the job to the end of its gate and up products
     /// (the rest of [`LayerJob::elapsed`] is the down products).
     pub fn gate_up_elapsed(&self) -> Duration {

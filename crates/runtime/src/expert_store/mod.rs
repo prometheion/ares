@@ -410,6 +410,10 @@ pub struct StoreStats {
     /// For every layer the CPU had a part in: milliseconds from the arrival
     /// of the record to the delivery of the sums.
     pub cpu_ms: Vec<f32>,
+    /// For the same layers: milliseconds from the arrival of the record to
+    /// the end of the last task of its jobs (the rest of `cpu_ms` is the
+    /// time until the store noticed and delivered the sums).
+    pub cpu_done_ms: Vec<f32>,
     /// Experts that took a VRAM slot between steps, by heat.
     pub promotions: u64,
     /// Experts a step missed that were uploaded on loan, and members on loan

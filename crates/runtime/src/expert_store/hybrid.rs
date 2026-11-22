@@ -724,6 +724,11 @@ impl<D: SlotDevice> ExpertStore<D> {
             let mut sums = std::mem::take(&mut hybrid.sums);
             sums.clear();
             sums.resize(claims.n_rows * shape.n_embd as usize, 0.0);
+            let done = claims.jobs.iter().filter_map(|job| job.ended()).max();
+            if let Some(done) = done {
+                let ms = done.saturating_duration_since(claims.since).as_secs_f32() * 1e3;
+                self.stats.cpu_done_ms.push(ms);
+            }
             for job in &claims.jobs {
                 if let Some(part) = job.sums() {
                     sums.iter_mut().zip(part).for_each(|(s, p)| *s += p);

@@ -309,7 +309,7 @@ fn store_line(stats: &StoreStats, steps: usize) -> String {
          the CPU, {:.1} uploaded for the step); where their bytes were: {:.1} in RAM, {:.1} in the \
          file ({:.1} MB read), {:.1} on their way; waiting per step {:.2} ms summed over layers; \
          a miss served from RAM {:.2} ms (median) / {:.2} (99 %), from the file {:.2} / {:.2} ms, a \
-         layer's CPU share {:.2} / {:.2} ms; between steps {:.1} experts promoted to VRAM per step; \
+         layer's CPU share {:.2} / {:.2} ms (its last task ended at {:.3} / {:.2} ms); between steps {:.1} experts promoted to VRAM per step; \
          predicted per step {:.1} experts ({:.1} % of them picked; {:.2} in no tier, {:.1} % of \
          those picked), read ahead {:.2} ({:.1} MB, {:.2} used, {:.2} wasted, {:.2} not read), a \
          pick read ahead waited \
@@ -330,6 +330,8 @@ fn store_line(stats: &StoreStats, steps: usize) -> String {
         percentile(&stats.disk_miss_ms, 0.99),
         percentile(&stats.cpu_ms, 0.5),
         percentile(&stats.cpu_ms, 0.99),
+        percentile(&stats.cpu_done_ms, 0.5),
+        percentile(&stats.cpu_done_ms, 0.99),
         per(stats.promotions),
         per(stats.predicted),
         100.0 * stats.predicted_picked as f64 / stats.predicted.max(1) as f64,

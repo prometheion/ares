@@ -10,13 +10,15 @@
 //! that take turns, so that a job reads bytes the one before did not leave in the cache.
 //!
 //! ```sh
-//! cargo run --release -p ares-runtime --example expert_cpu_types -- [workers] [pairs]
+//! cargo run --release -p ares-runtime --example expert_cpu_types -- [workers] [pairs|layers]
 //! ```
 //!
 //! Without a number the workers are placed as the engine places them; with one, that many
 //! unpinned workers. With `pairs` only the second part runs: the pairs of types of the
 //! Flash-Next files, as the pool computes them and as one thread does (the main thread, which
-//! runs the job's tasks itself; its time over the job's bytes is the kernels' rate).
+//! runs the job's tasks itself; its time over the job's bytes is the kernels' rate). With
+//! `layers` only the third part runs: jobs of several experts of UD-Q3_K_XL's most common
+//! pair, as a layer of a decode step has them.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -57,9 +59,20 @@ enum Runner<'a> {
 
 /// The median time of a job of one expert of `shape` that `rows` rows use, in microseconds.
 fn time(runner: Runner<'_>, shape: &ExpertShape, rows: usize) -> Result<f64, String> {
+    Ok(time_layer(runner, shape, 1, rows)?.0)
+}
+
+/// The median time of a job of `n_experts` experts of `shape` that all `rows` rows use, and
+/// the median time to the end of its gate and up products, in microseconds.
+fn time_layer(
+    runner: Runner<'_>,
+    shape: &ExpertShape,
+    n_experts: usize,
+    rows: usize,
+) -> Result<(f64, f64), String> {
     let gate_bytes = shape.gate_bytes().ok_or("gate size")? as usize;
     let down_bytes = shape.down_bytes().ok_or("down size")? as usize;
-    let experts: Vec<[Vec<u8>; 3]> = (0..8)
+    let experts: Vec<[Vec<u8>; 3]> = (0..(2 * n_experts).max(8))
         .map(|e| {
             [
                 fill(shape.gate_ty, gate_bytes, e),
@@ -75,19 +88,23 @@ fn time(runner: Runner<'_>, shape: &ExpertShape, rows: usize) -> Result<f64, Str
         Runner::Pool(pool) => pool.features(),
         Runner::Alone => Features::detect(),
     };
-    let mut times = Vec::new();
+    let (mut times, mut gate_up) = (Vec::new(), Vec::new());
     for round in 0..40 {
-        let m = &experts[round % experts.len()];
-        let expert = CpuExpert {
-            gate: m[0].as_ptr(),
-            up: m[1].as_ptr(),
-            down: m[2].as_ptr(),
-            rows: (1u32 << rows) - 1,
-            weight: [0.1; MAX_ROWS],
-        };
+        let picked: Vec<CpuExpert> = (0..n_experts)
+            .map(|e| {
+                let m = &experts[(round * n_experts + e) % experts.len()];
+                CpuExpert {
+                    gate: m[0].as_ptr(),
+                    up: m[1].as_ptr(),
+                    down: m[2].as_ptr(),
+                    rows: (1u32 << rows) - 1,
+                    weight: [0.1; MAX_ROWS],
+                }
+            })
+            .collect();
         // SAFETY: the matrices have the sizes of the shape and outlive the job, which is
         // waited for below.
-        let job = unsafe { LayerJob::new(features, shape, rows, &act, &[expert]) }
+        let job = unsafe { LayerJob::new(features, shape, rows, &act, &picked) }
             .map_err(|e| e.to_string())?;
         let job = Arc::new(job);
         match runner {
@@ -108,10 +125,26 @@ fn time(runner: Runner<'_>, shape: &ExpertShape, rows: usize) -> Result<f64, Str
         // The first rounds wake the workers and warm the tables.
         if let (true, Some(time)) = (round >= 8, job.elapsed()) {
             times.push(time.as_secs_f64() * 1e6);
+            gate_up.push(job.gate_up_elapsed().as_secs_f64() * 1e6);
         }
     }
     times.sort_by(f64::total_cmp);
-    Ok(times[times.len() / 2])
+    gate_up.sort_by(f64::total_cmp);
+    Ok((times[times.len() / 2], gate_up[gate_up.len() / 2]))
+}
+
+/// Jobs of several experts of UD-Q3_K_XL's most common pair of types, as a layer of a decode
+/// step has them: the job's time and when its gate and up products ended.
+fn layers(pool: &CpuPool) -> Result<(), String> {
+    let shape = shape(640, GgmlType::IQ3_XXS, GgmlType::Q5_0);
+    println!("| experts x rows (IQ3_XXS / Q5_0) | job, us | gate and up done, us | per pair, us |");
+    println!("| --- | ---: | ---: | ---: |");
+    for (n_experts, rows) in [(1, 1), (2, 1), (3, 1), (6, 1), (10, 1), (3, 4), (6, 4), (10, 8)] {
+        let (total, gate_up) = time_layer(Runner::Pool(pool), &shape, n_experts, rows)?;
+        let pairs = (n_experts * rows) as f64;
+        println!("| {n_experts} x {rows} | {total:.0} | {gate_up:.0} | {:.1} |", total / pairs);
+    }
+    Ok(())
 }
 
 fn shape(n_ff: u32, gate_ty: GgmlType, down_ty: GgmlType) -> ExpertShape {
@@ -187,9 +220,14 @@ fn main() -> Result<(), String> {
     let pool = CpuPool::new(&placement, Duration::from_millis(50)).map_err(|e| e.to_string())?;
     let load = std::fs::read_to_string("/proc/loadavg").unwrap_or_default();
     println!("{} workers, {:?}; load average {}", pool.workers(), pool.features(), load.trim());
+    if args.iter().any(|a| a == "layers") {
+        return layers(&pool);
+    }
     if !args.iter().any(|a| a == "pairs") {
         every_type(&pool)?;
         println!();
     }
-    file_pairs(&pool)
+    file_pairs(&pool)?;
+    println!();
+    layers(&pool)
 }
