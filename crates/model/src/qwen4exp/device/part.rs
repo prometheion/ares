@@ -2906,6 +2906,7 @@ impl Part {
                 self.state.ptr(),
                 self.f.slot_bytes,
             )?;
+            // The forms the products of a wide step read: both where the types differ.
             if self.wide_f16(rows) {
                 self.layers.gated_norm_f16(
                     stream,
@@ -2919,7 +2920,8 @@ impl Part {
                     shape.head_dim,
                     self.eps,
                 )?;
-            } else {
+            }
+            if self.wide_int8(rows) {
                 self.layers.gated_norm_quant(
                     stream,
                     OutputGate::Sigmoid,
@@ -3113,11 +3115,29 @@ impl Part {
             )?;
             self.mark(stream, Phase::Attention)?;
             if Self::is_wide(rows) {
-                let (form, to) = match self.wide_f16(rows) {
-                    true => (ActivationForm::F16, s.out_f16),
-                    false => (ActivationForm::Int8, s.act),
-                };
-                self.kernels.prepare_activations(stream, form, o, self.at(to), hq, rows)?;
+                // The forms the products read: both where the types differ.
+                if self.wide_f16(rows) {
+                    let to = self.at(s.out_f16);
+                    self.kernels.prepare_activations(
+                        stream,
+                        ActivationForm::F16,
+                        o,
+                        to,
+                        hq,
+                        rows,
+                    )?;
+                }
+                if self.wide_int8(rows) {
+                    let to = self.at(s.act);
+                    self.kernels.prepare_activations(
+                        stream,
+                        ActivationForm::Int8,
+                        o,
+                        to,
+                        hq,
+                        rows,
+                    )?;
+                }
             } else {
                 self.kernels.quantize_activations(stream, o, self.at(s.act), hq, rows)?;
             }
@@ -3268,6 +3288,7 @@ impl Part {
         unsafe {
             self.product(stream, &shared.gate, m, self.at(s.sg), rows)?;
             self.product(stream, &shared.up, m, self.at(s.su), rows)?;
+            // The forms the product reads: both where the types differ.
             if self.wide_f16(rows) {
                 self.layers.swiglu_f16(
                     stream,
@@ -3277,7 +3298,8 @@ impl Part {
                     rows,
                     shared.gate.n_out,
                 )?;
-            } else {
+            }
+            if self.wide_int8(rows) {
                 self.layers.swiglu_quant(
                     stream,
                     self.at(s.sg),

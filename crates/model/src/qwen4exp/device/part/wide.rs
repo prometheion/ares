@@ -83,7 +83,11 @@ struct Layer {
 pub(super) struct State {
     kernels: ExpertRowKernels,
     precision: Precision,
-    form: ActivationForm,
+    /// The form of the activations each quantized dense type reads, and whether any reads
+    /// f16 and any int8.
+    forms: Vec<(GgmlType, ActivationForm)>,
+    f16: bool,
+    int8: bool,
     /// The widest input of a float product the scratch for its f16 form holds.
     float_width: u32,
     /// The address tables of a layer as the host wrote them: per layer
@@ -187,21 +191,21 @@ impl State {
                 }
             }
         }
-        // One form of activations for every dense matrix, so that each fused kernel writes
-        // one: the form the options' precision gives all of them, else the exact one, which
-        // is f16 for all.
-        let form_of = |precision: Precision, ty: GgmlType| {
-            kernels
-                .activation_form(ty, WeightLayout::File, precision, opts.max_rows)
-                .map_err(|e| invalid(e.to_string()))
-        };
-        let forms =
-            types.iter().map(|ty| form_of(opts.precision, *ty)).collect::<Result<Vec<_>, _>>()?;
-        let (precision, form) = match forms.first() {
-            Some(first) if forms.iter().all(|f| f == first) => (opts.precision, *first),
-            Some(_) => (Precision::Exact, ActivationForm::F16),
-            None => (opts.precision, ActivationForm::Int8),
-        };
+        // A form of activations per type, the one the options' precision gives it (the
+        // faster path where it is measured, as the 27B's chooser takes per matrix). Where the
+        // types differ, the fused kernels that write the input of a product write both forms
+        // ([`Part::wide_f16`], [`Part::wide_int8`]).
+        let forms = types
+            .iter()
+            .map(|ty| {
+                kernels
+                    .activation_form(*ty, WeightLayout::File, opts.precision, opts.max_rows)
+                    .map(|form| (*ty, form))
+                    .map_err(|e| invalid(e.to_string()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let f16 = forms.iter().any(|(_, form)| *form == ActivationForm::F16);
+        let int8 = forms.iter().any(|(_, form)| *form == ActivationForm::Int8);
         let layers = w.layers.len();
         // The widths the frame sized the scratch of the float products with
         // ([`float_f16_bytes`]): the streams' where the part has the mixers.
@@ -213,6 +217,10 @@ impl State {
         let cpu_rows = opts.cpu_rows.min(opts.max_rows);
         let act_bytes = ares_runtime::expert_store::cpu::act_bytes(n as usize, cpu_rows as usize);
         Ok(Self {
+            precision: opts.precision,
+            forms,
+            f16,
+            int8,
             cpu_rows,
             host_act: PinnedBuffer::new(device, act_bytes.max(16))?,
             host_sums: PinnedBuffer::new(device, (cpu_rows as usize * n as usize * 4).max(16))?,
@@ -222,8 +230,6 @@ impl State {
             act_pending: false,
             sums_pending: false,
             kernels: rows,
-            precision,
-            form,
             float_width,
             staging: PinnedBuffer::new(device, (frame.addr_stage as usize * layers).max(16))?,
             done: Event::new(device)?,
@@ -241,11 +247,17 @@ impl Part {
         rows > MAX_BATCH
     }
 
-    /// Whether the outputs of the recurrent and attention blocks and of the shared expert
-    /// are quantized for their products in f16 instead of int8 (in wide steps).
+    /// Whether a product of a wide step of `rows` rows reads the outputs of the recurrent and
+    /// attention blocks and of the shared expert, and the mixed input, in f16: they are
+    /// prepared in that form too.
     pub(super) fn wide_f16(&self, rows: u32) -> bool {
-        Self::is_wide(rows)
-            && self.wide_state.as_ref().is_some_and(|w| w.form == ActivationForm::F16)
+        Self::is_wide(rows) && self.wide_state.as_ref().is_some_and(|w| w.f16)
+    }
+
+    /// Whether a product of a step of `rows` rows reads those outputs as int8 rows: every
+    /// product of a decode step does, a product of a wide step where its type's form is int8.
+    pub(super) fn wide_int8(&self, rows: u32) -> bool {
+        !Self::is_wide(rows) || self.wide_state.as_ref().is_none_or(|w| w.int8 || !w.f16)
     }
 
     /// `y = m x` for the `rows` rows of a wide step. `act` is the rows in the int8 layout
@@ -271,7 +283,10 @@ impl Part {
             return unsafe { self.wide_float(stream, m, act, y, rows) };
         }
         let s = self.f.s;
-        let input = match wide.form {
+        // A type no dense matrix of the vote has reads what every product can.
+        let fallback = if wide.f16 { ActivationForm::F16 } else { ActivationForm::Int8 };
+        let form = wide.forms.iter().find(|(ty, _)| *ty == m.ty).map_or(fallback, |(_, f)| *f);
+        let input = match form {
             ActivationForm::Int8 => act,
             ActivationForm::F16 if act == self.at(s.m) => self.at(s.mixed_f16),
             ActivationForm::F16 if act == self.at(s.act) => self.at(s.out_f16),
