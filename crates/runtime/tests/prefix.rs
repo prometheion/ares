@@ -1104,3 +1104,44 @@ fn an_edited_message_replays_only_the_rows_from_the_boundary_before_it() {
     assert_eq!((answer.report.cached_tokens, answer.report.replayed_rows), (shared, shared));
     assert_consistent(&e);
 }
+
+#[test]
+fn the_same_prompt_asked_again_resumes_at_its_anchor_while_the_roots_keep_their_places() {
+    use ares_api::Role::{Assistant, System, Tool, User};
+    // The agent suite of the Strata comparison: a system prompt, a task, a
+    // tool call and a long result, asked twice, then a question about the
+    // answer. The roots of the system prompt (the page boundaries at 64 and
+    // 80) keep their places; the conversation has the place left over, which
+    // held the end state of the first ask instead of its anchor, so the
+    // second ask replayed every row after the roots.
+    for places in [2, 3] {
+        let mut rng = Rng(77);
+        let long = |c: &mut SyntheticConfig| c.context_length = 4096;
+        let model = model(Some(CHECKPOINT), long);
+        let config = RuntimeConfig {
+            checkpoint_prompt_interval: 1024,
+            checkpoint_generation_interval: 256,
+            checkpoint_boundary_interval: 128,
+            ..config(1024, places)
+        };
+        let e = engine(&model, config);
+        let mut messages = vec![(System, text_of(&mut rng, 70)), (User, text_of(&mut rng, 20))];
+        let first = e.ask_chat(&messages, 12);
+        messages.push((Assistant, first.run.text.clone()));
+        messages.push((Tool, text_of(&mut rng, 600)));
+        let once = e.ask_chat(&messages, 12);
+        let again = e.ask_chat(&messages, 12);
+        assert_eq!(again.run.text, once.run.text, "{places} places");
+        assert_eq!(again.run.text, fresh(long, &rendered(&messages), 12).text);
+        // 747 cells are looked up: 46 pages of 16, and the anchor at 736.
+        let report = &again.report;
+        assert_eq!((report.cached_tokens, report.replayed_rows), (736, 0), "{places} places");
+        // The next turn continues the second ask's reply from its end state.
+        messages.push((Assistant, again.run.text.clone()));
+        messages.push((User, text_of(&mut rng, 20)));
+        let next = e.ask_chat(&messages, 12);
+        assert_eq!(next.run.text, fresh(long, &rendered(&messages), 12).text);
+        assert_eq!(next.report.replayed_rows, 0, "{places} places: {:?}", next.report);
+        assert_consistent(&e);
+    }
+}

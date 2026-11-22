@@ -590,13 +590,18 @@ one array per part, indexed by page number.
     replays more without it (the fork's `--checkpoint-spread`: the kept ones
     thin out evenly), then the least recently used. A checkpoint goes without
     its K/V page; a page evicted from the end of a chain takes its checkpoint
-    along. With room for one checkpoint (Flash-Next at `--ram 8G`: the tier
-    of experts takes the rest), a request's end state does not push out its
-    own anchor: the next turn often parts from the cache inside the reply
-    (Claude Code sends a call of its Edit tool back with `"replace_all":
-    false` the model never wrote; Qwen's templates leave out an answer's
-    thinking once a new question follows), and from the end state it would
-    replay every row it shares, from the anchor only the reply's.
+    along. With room for one checkpoint besides the roots (Flash-Next at
+    `--ram 8G` or 40G on one card: the tier of experts takes the rest, and
+    the roots, which go last, hold every place but one), a request's end
+    state does not push out its own anchor: the next turn often parts from
+    the cache inside the reply (Claude Code sends a call of its Edit tool
+    back with `"replace_all": false` the model never wrote; Qwen's templates
+    leave out an answer's thinking once a new question follows; a client
+    asks the same prompt again), and from the end state it would replay
+    every row it shares after the roots, from the anchor only the reply's.
+    (Until 2026-11-22 the rule counted the roots as places of their own: with
+    one root and two places, the same prompt of the agent suite asked a
+    second time replayed 6272 of its 6784 cached rows, 31 s on the 4060 Ti.)
     A root keeps its mark when its page goes to RAM and comes back, is
     never "left behind" for the drive (it is written when it leaves RAM, if
     its text is long enough for the drive), and comes back from the drive as

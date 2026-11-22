@@ -770,20 +770,30 @@ impl Cache {
     }
 
     /// Takes the checkpoint of a request's live state at its end, as
-    /// [`Cache::save`], unless the budget holds one checkpoint and that is a
-    /// fresh one of the same request (its anchor). The end state lies less
-    /// than a page and the reply's rows after the anchor, and the next turn of
-    /// a conversation often parts from it inside the reply: Claude Code sends
-    /// back a call of its Edit tool with an argument the model never wrote,
-    /// and Qwen's templates leave out the thinking of an answer once a new
-    /// question follows. With the end state in the one place such a turn
-    /// replays every row it shares; with the anchor, the reply's rows.
+    /// [`Cache::save`], unless the budget holds one checkpoint besides the
+    /// roots and that is a fresh one of the same request (its anchor). The
+    /// end state lies less than a page and the reply's rows after the anchor,
+    /// and the next turn of a conversation often parts from it inside the
+    /// reply: Claude Code sends back a call of its Edit tool with an argument
+    /// the model never wrote, Qwen's templates leave out the thinking of an
+    /// answer once a new question follows, and a client asks the same prompt
+    /// again. With the end state in the one place such a turn replays every
+    /// row it shares after the roots; with the anchor, the reply's rows.
+    ///
+    /// The roots count: they go after every other checkpoint, so once they
+    /// hold all places but one, the conversations have that one place, as
+    /// with a budget of one.
     pub(crate) fn save_end(&mut self, slot: u32, hash: ChainHash, owner: Owner) -> Saved {
         let in_ram = self.in_ram.as_ref().map_or(0, RamLevel::checkpoints);
-        let one = self.policy_now().capacity() == 1;
-        if one && in_ram == 0 && self.index.checkpoints() == 1 {
-            let first = self.index.checkpoint_ranks(&self.policy).first().copied();
-            if first.is_some_and(|rank| rank.by == Some(owner) && !rank.aged) {
+        if in_ram == 0 && self.index.checkpoints() > 0 {
+            let ranks = self.index.checkpoint_ranks(&self.policy);
+            let roots = ranks.iter().filter(|rank| rank.root).count();
+            let mut others = ranks.iter().filter(|rank| !rank.root);
+            let one = self.policy_now().capacity() <= roots + 1;
+            if let (true, Some(only), None) = (one, others.next(), others.next())
+                && only.by == Some(owner)
+                && !only.aged
+            {
                 return Saved::default();
             }
         }
@@ -1565,6 +1575,26 @@ mod tests {
         assert!(roomy.save(0, hashes[1], Owner(1), false).taken);
         let end = roomy.save_end(0, hashes[2], Owner(1));
         assert_eq!((end.taken, end.dropped), (true, 1));
+    }
+
+    #[test]
+    fn with_one_place_besides_the_roots_an_end_state_does_not_push_out_its_own_anchor() {
+        // The agent suite: the roots of the system prompt keep their places,
+        // and the one left over held the end state of a prompt instead of its
+        // anchor, so the same prompt asked again replayed from the roots.
+        let mut pool = PagePool::new(8, PER_PAGE);
+        let mut cache = cache(2);
+        let hashes = three_pages(&mut cache, &mut pool);
+        assert!(cache.save(0, hashes[0], Owner(1), true).taken);
+        assert!(cache.save(0, hashes[1], Owner(1), false).taken);
+        assert!(!cache.save_end(0, hashes[2], Owner(1)).taken);
+        assert!(cache.index.is_root(hashes[0]));
+        assert!(cache.index.checkpoint(hashes[1]).is_some());
+        // Another request's end state takes the place as before; the root stays.
+        let other = cache.save_end(1, hashes[2], Owner(2));
+        assert_eq!((other.taken, other.dropped), (true, 1));
+        assert!(cache.index.checkpoint(hashes[0]).is_some());
+        assert_eq!(cache.index.checkpoint(hashes[1]), None);
     }
 
     #[test]
