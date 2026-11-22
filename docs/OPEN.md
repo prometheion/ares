@@ -620,7 +620,8 @@ DSpark drafter `dspark-Inkling-2-Mini-Q8_0.gguf`, 0.4 GB). Notes: `/var/tmp/ares
 - [ ] Study first: the two layouts, the loop (K/V and recurrent state per pass or shared, how a
       pass is told apart), local and global attention, the expert scales, what of the shared layer
       and Flash-Next's expert store it takes as it is; then the model, its drafter (DSpark), its
-      vision tower. Where in the order: the owner's call.
+      vision tower. In the order (the owner, 2026-11-22): after the Flash-Next pieces in work
+      (CPU kernels, SSD streaming), one piece at a time.
 
 ## Whole features not started
 - [ ] Image input (F11; the owner's preset sets `mmproj`). Design: `/var/tmp/ares-survey/image-input-design.md`
