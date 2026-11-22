@@ -5578,8 +5578,9 @@ file, uploads its copies into VRAM and transit slots):
 
 On one card (the RTX 4070, the same file and `--ram 8G`, load 3.9 to 5.2) the prompt of 8016
 tokens read at 49.1 tokens/s in steps of 512 rows, 148.5 GiB from the file and 151 328 uploads,
-and at 206.2 tokens/s in lent steps of 4096 rows, 42.5 GiB and 39 199 uploads: where the tiers
-hold little, every step of 512 rows reads most of the file again.
+and at 206.2 tokens/s in lent steps of 4096 rows, 42.5 GiB and 39 199 uploads (a second pair,
+lent steps first, at a load of 17 to 33: 199.3 against 40.1 tokens/s, the same bytes): where the
+tiers hold little, every step of 512 rows reads most of the file again.
 
 What a prompt reads from the file by the rows of its lone steps (both cards, a prompt of
 31 992 tokens; the bytes do not depend on the load, the speeds do): 512 rows about 139 GiB,
