@@ -10,6 +10,10 @@ measurements that are owed; what a feature must do in detail is in
 42 partly, 88 not started, 23 outside the frame; its rows K01, K02, K06 and P14 are out
 of date: reasoning is built, and `q7` to `q4` run in the 27B).
 
+GPU work runs on the test machine `admin@test-machine` (RTX 4060 Ti 16 GB, gpu-unlock) from
+2026-11-22 on; the two local cards are production and are used only when a test needs two
+cards, with the owner told first.
+
 Order of work the owner has set: CUDA complete for both models first, then optimising (better
 kernels, better prefetching: measured per phase on a quiet machine against the fork and Strata),
 Vulkan parity last.
@@ -44,10 +48,14 @@ stored responses, TLS.
 
 | Piece | State |
 | --- | --- |
-| 1 and 2: Claude Code's billing stamp as upstream; checkpoints at the system prompt's and tool list's end, at every message boundary and at fixed distances | agent working (`cache/checkpoints`) |
-| 3: large prompt chunks for Flash-Next (TokenWing and Strata read first), batch and micro-batch, adaptive | agent working (`moe/prompt-chunks`) |
+| 1 and 2: Claude Code's billing stamp as upstream; checkpoints at the system prompt's and tool list's end, at every message boundary and at fixed distances | handed back, being verified (`cache/checkpoints`) |
+| 3: large prompt chunks for Flash-Next (TokenWing and Strata read first), batch and micro-batch, adaptive | handed back, being verified (`moe/prompt-chunks`) |
 | The best use of the second card (the fork's attention split, more context there, expert tier only, drafters there): measured, then roles | handed back, being verified (`devices/roles`) |
 | The MTP block's crash with long prompts on Flash-Next (status 0x4) and the expert slots filled at the start, as Strata does | handed back, being verified (`fix/mtp-and-slots`) |
+| Flash-Next decodes UD-Q3_K_XL at least as fast as Strata on the test machine (the owner, 2026-11-22): CPU kernels for every expert type, then the next lever by measurement | agent working on the test machine (`flash/cpu-experts`) |
+| Flash-Next UD-Q4_K_XL (104 GiB, larger than RAM) streamed from the SSD against Strata, then Ares's reading path | agent working on the test machine (`flash/ssd-stream`) |
+| 6: K/V beyond VRAM into RAM, and K/V VRAM nobody uses yet serving the expert tier | agent working on the test machine (`kv/overflow`) |
+| 7 and the server part of 8: priorities of requests, system messages and efforts on the chat and Responses routes, Messages items, thinking budget, special tokens, truncation, small ones | agent working (`server/priorities`) |
 
 ## Shared model layer (the owner's rule, 2026-11-16)
 Generic for Ares, not like llama.cpp: a few models, shared code where it can be, each model
