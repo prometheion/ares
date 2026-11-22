@@ -234,6 +234,11 @@ Strata kept 0.1.65, which the comparisons use until a newer engine starts there.
       first ask lost its place to its end state where the roots held all places but one (fixed,
       `flash/prompt` ebe5061, test in `runtime/tests/prefix.rs`), and every small wide step paid
       a pass of uploads (the CPU's share of wide steps). To measure there.
+- [x] A loan of VRAM after the tier had moved slots between layers (rebalance) could take a
+      layer's given-up number for a slot's owner: the owner kept the slot inside the loan (its
+      expert read lent memory) and a later loan stopped the engine ("as many slots were given
+      as are lent", the base build on the local cards, the third loan of a session). Fixed on
+      `flash/prompt` (d6acafe): a moved slot leaves no number behind.
 - [ ] A cached prompt's replayed rows and its computed rows are steps of their own (and a
       prompt step is cut at a root): two passes over the experts where one would do; with the
       CPU's share of small steps cheaper, not built.
