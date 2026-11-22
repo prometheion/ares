@@ -605,9 +605,9 @@ const WIDE_ROWS: u32 = 4096;
 pub const ROW_GRAIN: u32 = 256;
 
 /// The rows of the widest step from `asked` down to `own` that `fits` holds: `asked`, or the
-/// largest multiple of [`ROW_GRAIN`] below it that fits, or `own` when no more rows do. `fits`
-/// must hold for fewer rows wherever it holds for more (the scratch grows with the rows), so
-/// the rows are found by halving the range between them.
+/// largest multiple of [`ROW_GRAIN`] (of `own` where that is less) below it that fits, or
+/// `own` when no more rows do. `fits` must hold for fewer rows wherever it holds for more (the
+/// scratch grows with the rows), so the rows are found by halving the range between them.
 pub fn widest_rows<E>(
     own: u32,
     asked: u32,
@@ -619,17 +619,18 @@ pub fn widest_rows<E>(
     if fits(asked)? {
         return Ok(asked);
     }
+    let grain = ROW_GRAIN.min(own).max(1);
     // `lo` grains fit (or are no more than `own`), `hi` grains do not.
-    let (mut lo, mut hi) = (own / ROW_GRAIN, asked.div_ceil(ROW_GRAIN));
+    let (mut lo, mut hi) = (own / grain, asked.div_ceil(grain));
     while hi - lo > 1 {
         let mid = lo + (hi - lo) / 2;
-        if mid * ROW_GRAIN <= own || fits(mid * ROW_GRAIN)? {
+        if mid * grain <= own || fits(mid * grain)? {
             lo = mid;
         } else {
             hi = mid;
         }
     }
-    Ok((lo * ROW_GRAIN).max(own))
+    Ok((lo * grain).max(own))
 }
 
 /// The rows of the widest step a prompt read alone takes on `devices` placed as
@@ -2545,6 +2546,8 @@ mod widest_tests {
         assert_eq!(widest_rows(512, 8192, fits(768)), Ok(768));
         assert_eq!(widest_rows(512, 512, fits(0)), Ok(512));
         assert_eq!(widest_rows(512, 1000, fits(999)), Ok(768));
+        // A part that keeps scratch for fewer rows than the grain takes its own as the grain.
+        assert_eq!(widest_rows(8, 32, fits(20)), Ok(16));
     }
 }
 
