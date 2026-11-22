@@ -444,6 +444,10 @@ pub struct StoreStats {
     /// after their read had started.
     pub transit_ahead_used: u64,
     pub transit_ahead_unused: u64,
+    /// Experts brought into transit ahead of their layer's record
+    /// ([`ExpertStore::transit_ahead`]), and of them those the record did not name.
+    pub transit_early: u64,
+    pub transit_early_unnamed: u64,
     /// Milliseconds from asking for an expert to its being usable in
     /// transit, summed over the experts.
     pub transit_ms: f64,
