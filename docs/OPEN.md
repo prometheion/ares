@@ -914,8 +914,10 @@ the agents' builds):
   prompt cache, the lowest user of `--ram`: under pressure they give way before the tier of
   experts (to the SSD level with `--cache`, else dropped); a running sequence's far K/V stays
   required.
-- Large prompt steps stay as built; the interruptible layer-major pass (TokenWing's order: a
-  lone step that a waiting request can cut between layers) is built in the optimising phase.
+- Large prompt steps stay as built. The interruptible layer-major pass (TokenWing's order: the
+  whole prompt through one layer, then the next, so that each expert crosses the link once per
+  prompt; a waiting request can cut in between layers) is moved forward (the owner, 2026-11-22):
+  the next Flash-Next piece after `flash/prompt`, not the optimising phase.
 - Flash-Next on two cards: the plan measures at load whether the second card computes a dense
   share or holds experts only, and keeps the faster; no option. To build; it needs the owner's
   two cards to verify ("Owed on two cards").
