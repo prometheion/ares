@@ -1,7 +1,8 @@
 # What is still open
 
-Updated 2026-11-17, `main` at the shared layer's steps 5 and 6 (one MTP driver, drafter kinds
-`ngram`, `mtp`, `dflash`) and the float path in every type (nothing pushed). What is there is listed in
+Updated 2026-11-22, `main` at the prefill path measured per type on full-rate cards (after the
+shared layer's steps 5 and 6: one MTP driver, drafter kinds `ngram`, `mtp`, `dflash`; nothing
+pushed). What is there is listed in
 [`FEATURES.md`](FEATURES.md).
 This file is brought up to date at every merge into `main`. It lists work, defects and
 measurements that are owed; what a feature must do in detail is in
@@ -47,6 +48,7 @@ stored responses, TLS.
 | 3: large prompt chunks for Flash-Next (TokenWing and Strata read first), batch and micro-batch, adaptive | agent working (`moe/prompt-chunks`) |
 | 4: tools, structured output, Messages and Responses on the real Flash-Next, and Claude Code itself against Ares | agent working (`server/flash-api`) |
 | The best use of the second card (the fork's attention split, more context there, expert tier only, drafters there): measured, then roles | agent working (`devices/roles`) |
+| The MTP block's crash with long prompts on Flash-Next (status 0x4) and the expert slots filled at the start, as Strata does | agent working on the test machine (`fix/mtp-and-slots`) |
 
 ## Shared model layer (the owner's rule, 2026-11-16)
 Generic for Ares, not like llama.cpp: a few models, shared code where it can be, each model
@@ -124,6 +126,11 @@ between cards stay with the model. Today the two models share almost nothing ins
       failed once in the full suite under load (after two other conversations took the pool,
       4096 or fewer of 9851 tokens came from the cache); alone it passes (9728 from SSD).
       Suspected: a page on its way from RAM to the SSD is found in neither while the write runs.
+- [ ] `ares-model --test qwen4exp_runtime` `the_mtp_block_drafts_what_the_reference_drafts_in_every_placement`
+      failed once in the merge check of 2026-11-22 (first links), passed three times alone. In
+      one of those runs the policy kept asking the made-up block for 21 chains (78 drafts, none
+      accepted) where it otherwise stops after one; then the allowance of one parting chain in
+      five is at its edge. Why the policy keeps asking a block that is never right is open.
 
 ### Speculation that pays (output unchanged)
 - [ ] Experts read ahead from the drafts (the owner's idea, 2026-11-18; no engine has it:
@@ -675,4 +682,8 @@ Measured per phase on a quiet machine against the fork and Strata, the largest f
       VRAM, quality.
 
 ## Questions to the owner
-- None open.
+- Flash-Next's float matrices in the vote on the activation form ("Optimising"): leave them out,
+  so that its dense products take int8 on a capped card as the 27B's do (faster, 1.1 % rms in
+  place of 0.03 %, the output changes), or keep the exact f16 path there?
+- Capped cards measuring their prefill path per type as full-rate cards do (in place of the rule
+  kept from the two development cards)?

@@ -1,6 +1,6 @@
 # What Ares can do today
 
-Updated 2026-11-17 for `main`. One line per feature; how it works is in
+Updated 2026-11-22 for `main`. One line per feature; how it works is in
 [`ARCHITECTURE.md`](ARCHITECTURE.md), what is missing in [`OPEN.md`](OPEN.md).
 Everything here runs on CUDA and was tested on an RTX 4070 with an RTX 3060. On Vulkan
 the kernels exist; no model runs there yet.
@@ -25,6 +25,9 @@ the kernels exist; no model runs there yet.
   expert from the SSD only while it is worth the wait.
 - Prompts are read in steps of 512 rows, in pieces between rounds of generation, so running
   requests go on.
+- On a card whose tensor cores sum in f32 at full rate (a professional card, or a GeForce
+  card with the cap lifted) the path of the prompt kernels is measured per weight type at
+  load: the most exact of those within 5 % of the fastest.
 - The token embedding stays in host RAM (27B: page-locked, 380 to 518 MiB of VRAM saved on the
   first card; Flash-Next: the mapped file): a step stages its rows and the card decodes them.
 - Flash-Next: experts a prompt misses pass through transit slots; nothing is evicted for them.
