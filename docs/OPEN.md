@@ -904,24 +904,29 @@ Measured per phase on a quiet machine against the fork and Strata, the largest f
 - [ ] `qwen4exp_runtime` with the default test threads hung for over 18 minutes once (two device
       threads spinning; the `moe/prompt-chunks` agent); with `--test-threads=1` it passes.
 
+## Decided by the owner (2026-11-22)
+- Large prompt steps stay as built; the interruptible layer-major pass (TokenWing's order: a
+  lone step that a waiting request can cut between layers) is built in the optimising phase.
+- Flash-Next on two cards: the plan measures at load whether the second card computes a dense
+  share or holds experts only, and keeps the faster; no option. To build; it needs the owner's
+  two cards to verify ("Owed on two cards").
+- Checkpoints: both rules as built (a message boundary 1024 cells or more after the last; with
+  one place a request's end state does not push out its own anchor).
+- A tool call a client gives back with its schema's defaults added is left as the client sent
+  it; the checkpoint at every message boundary makes that turn cheap (63 to 82 rows on
+  Flash-Next, measured).
+- Flash-Next's dense products take int8 on a capped card as the 27B's do. The cause given in the
+  question was wrong: the float matrices are not in the vote (`dense_types` leaves them out since
+  2026-11-12). What forces the exact f16 path is a quantized type with no int8 tile kernel
+  (Q2_0, Q4_0, Q5_0, Q2_K, IQ2_XXS, IQ1_*; the IQ2_XS file has Q2_0 in three shared-expert
+  downs): one such matrix makes the forms differ and every dense matrix takes f16, at half rate on
+  a capped card. On the full-rate RTX 4060 Ti the measured choices differ by type (Q6_K, Q3_K,
+  Q5_K f16; IQ4_XS, IQ4_NL, IQ3_S, IQ3_XXS, Q8_0 int8), so there too every dense matrix runs f16.
+  To build: a form per matrix (both forms prepared where a layer's types differ), as the 27B's
+  chooser does.
+- Capped cards measure their prefill path per type as full-rate cards do, in place of the rule
+  kept from the two development cards (`FLUSH_AS_FAST`). To build with the item above; the
+  measurement on capped cards needs the owner's cards.
+
 ## Questions to the owner
-- Flash-Next's float matrices in the vote on the activation form ("Optimising"): leave them out,
-  so that its dense products take int8 on a capped card as the 27B's do (faster, 1.1 % rms in
-  place of 0.03 %, the output changes), or keep the exact f16 path there?
-- Capped cards measuring their prefill path per type as full-rate cards do (in place of the rule
-  kept from the two development cards)?
-- Large prompt steps (`moe/prompt-chunks`): a request that comes while a long prompt is read alone
-  waits for the step in flight (first token after 13.5 s against 2.7 s with steps of 512 rows,
-  the long prompt 380 against 241 tokens/s). Keep it, bound the lone step in time (fewer rows,
-  less gain), or build the interruptible layer-major pass next?
-- Flash-Next on two cards (`devices/roles`): measure at load whether the second card computes a
-  dense share or holds experts only (warm prompts +27 %, decode the same on these cards; costs
-  1 to 2 s at load and 0.4 GiB per card for a moment), with no option?
-- Checkpoints (`cache/checkpoints`): a message boundary takes one only 1024 cells or more after
-  the last, so that cold prompts are not cut into many steps; with one checkpoint place a
-  request's end state no longer pushes out its own anchor (robust to replies sent back changed,
-  at the price of the reply's rows on an exact continuation). Both as built?
-- A tool call that a client gives back with its schema's default arguments added (Claude Code's
-  `"replace_all": false`): write it without them, so that the history matches the cache, or
-  leave the client's history as it is and rely on the checkpoint at every message boundary
-  ("Server and API")?
+- None open.
