@@ -216,25 +216,55 @@ static __device__ __forceinline__ void ares_flush_f16(float (&c)[4], const uint3
 }
 
 // N consecutive 32-bit words from an address that is only 2-byte aligned (the
-// blocks of Q6_K, Q3_K, Q8_0 ... start at multiples of 210, 110, 34 bytes):
-// aligned loads plus a funnel shift. The loads stay in L1: the lanes of a warp
-// read 4 bytes each from many rows, so a sector is asked for again by the next
-// word (and Q6_K's 4 steps of a half read the same high bits). The word past the end is only read when
-// the address is not 4-byte aligned, so no load goes beyond the data.
+// blocks of Q6_K, Q3_K, Q8_0 ... start at multiples of 210, 110, 34 bytes): the
+// 16-byte aligned pieces that hold them, then a funnel shift by the offset. What
+// costs in these loads is not their bytes but the lines a load of a warp touches:
+// the lanes read from 16 rows, so every load instruction of a warp is 16 lines or
+// more for the load unit (which `ldmatrix` shares), whether a lane reads 4 bytes or
+// 16. Three 16-byte loads instead of nine 4-byte ones for the 32 codes of an item
+// took the tile kernels of Q8_0 from 44 to 48.5 TFLOPS (f16) and from 50 to 56.5 TOPS
+// (int8) on an RTX 4060 Ti whose tensor cores run f32 accumulation at full rate, Q6_K
+// from 35.5 to 40.6 and 40.8 to 42.3, Q3_K from 40 to 44 and 44.4 to 45.6, IQ4_NL from
+// 50.5 to 52.5 and 56.5 to 59.4. (For the one or two words of the i-quants, which
+// replace two or four 2-byte loads, the same pieces made the f16 path of IQ2_S 14 %
+// slower and of IQ3_XXS 4 %: they keep their 2-byte loads.) The loads stay in L1: the
+// two lanes of a row read the same pieces (and Q6_K's 4 steps of a half the same high
+// bits). Only pieces that hold a wanted byte are read, so no load goes beyond the
+// 16-byte granule of the data's last byte.
 template <int N>
 static __device__ __forceinline__ void ares_ld_words_a2(const uint8_t* p, uint32_t (&out)[N]) {
+    // The pieces the words can reach from an offset of up to 14 bytes into the first.
+    constexpr int PIECES = (14 + 4 * N + 15) / 16;
     const uintptr_t a = reinterpret_cast<uintptr_t>(p);
-    const uint32_t* base = reinterpret_cast<const uint32_t*>(a & ~static_cast<uintptr_t>(3));
-    const uint32_t shift = (a & 2) * 8;
-    uint32_t w[N + 1];
+    const uint4* base = reinterpret_cast<const uint4*>(a & ~static_cast<uintptr_t>(15));
+    const uint32_t off = a & 15;
+    // The words of the pieces, and three more so that every word an offset selects exists.
+    uint32_t win[4 * PIECES + 3];
 #pragma unroll
-    for (int i = 0; i < N; i++) {
-        w[i] = __ldg(base + i);
+    for (int c = 0; c < PIECES; c++) {
+        uint4 v = make_uint4(0, 0, 0, 0);
+        if (c == 0 || 16 * c < off + 4 * N) {
+            v = __ldg(base + c);
+        }
+        win[4 * c] = v.x;
+        win[4 * c + 1] = v.y;
+        win[4 * c + 2] = v.z;
+        win[4 * c + 3] = v.w;
     }
-    w[N] = shift != 0 ? __ldg(base + N) : 0u;
+    win[4 * PIECES] = win[4 * PIECES + 1] = win[4 * PIECES + 2] = 0;
+    // The first word is `off / 4` words in: selected without indexing registers by a
+    // value (which would put them in local memory), then shifted by the odd two bytes.
+    const uint32_t first = off >> 2, shift = (off & 2) * 8;
+    uint32_t v[N + 1];
+#pragma unroll
+    for (int i = 0; i <= N; i++) {
+        const uint32_t lo = (first & 1) != 0 ? win[i + 1] : win[i];
+        const uint32_t hi = (first & 1) != 0 ? win[i + 3] : win[i + 2];
+        v[i] = (first & 2) != 0 ? hi : lo;
+    }
 #pragma unroll
     for (int i = 0; i < N; i++) {
-        out[i] = __funnelshift_r(w[i], w[i + 1], shift);
+        out[i] = __funnelshift_r(v[i], v[i + 1], shift);
     }
 }
 
