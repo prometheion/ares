@@ -1820,6 +1820,56 @@ mod tests {
         ])
     }
 
+    /// A PNG of one pixel, as a data URL.
+    const PIXEL: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=";
+
+    fn parts(parts: Vec<Json>) -> Json {
+        let kind = |kind: &str| ("type", Json::String(kind.into()));
+        let parts = parts
+            .into_iter()
+            .map(|p| match p {
+                Json::String(t) if t == "IMAGE" => object(&[
+                    kind("image_url"),
+                    ("image_url", object(&[("url", Json::String(PIXEL.into()))])),
+                ]),
+                Json::String(t) => object(&[kind("text"), ("text", Json::String(t))]),
+                other => other,
+            })
+            .collect();
+        let message =
+            object(&[("role", Json::String("user".into())), ("content", Json::Array(parts))]);
+        object(&[("model", Json::String("m".into())), ("messages", Json::Array(vec![message]))])
+    }
+
+    fn first_message(json: &Json) -> Message {
+        let parsed = from_json(Endpoint::Chat, json, RequestId(1)).ok().unwrap();
+        let Prompt::Chat { messages, .. } = parsed.request.prompt else { panic!("a chat") };
+        messages.into_iter().next().unwrap()
+    }
+
+    #[test]
+    fn a_message_with_images_is_joined_as_llama_server_joins_it() {
+        let s = |t: &str| Json::String(t.into());
+        // Text parts with a line break between them, none next to an image.
+        let m = first_message(&parts(vec![s("A"), s("IMAGE"), s("B"), s("C"), s("IMAGE")]));
+        assert_eq!(m.content, "AB\nC");
+        assert_eq!(m.images.iter().map(|i| i.at).collect::<Vec<_>>(), [1, 4]);
+        assert_eq!((m.images[0].width, m.images[0].height, m.images[0].pixels.len()), (1, 1, 3));
+        let m = first_message(&parts(vec![s("IMAGE"), s("A"), s("B")]));
+        assert_eq!((m.content.as_str(), m.images[0].at), ("A\nB", 0));
+        // Without images the parts are joined as they are.
+        let m = first_message(&parts(vec![s("A"), s("B")]));
+        assert_eq!((m.content.as_str(), m.images.len()), ("AB", 0));
+        // A part that names an image another way is refused by name.
+        let remote = object(&[
+            ("type", s("image_url")),
+            ("image_url", object(&[("url", s("https://example.com/a.png"))])),
+        ]);
+        let error = from_json(Endpoint::Chat, &parts(vec![remote]), RequestId(1)).unwrap_err();
+        assert_eq!(error.param.as_deref(), Some("messages[0].content[0].image_url"));
+        assert!(error.message.contains("data URL"), "{}", error.message);
+    }
+
     #[test]
     fn values_a_json_parser_cannot_produce_are_still_refused() {
         // JSON text cannot spell NaN or an infinity, but the request is

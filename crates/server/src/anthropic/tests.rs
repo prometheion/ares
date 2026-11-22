@@ -396,8 +396,28 @@ fn a_count_needs_no_limit_and_has_no_stream() {
 }
 
 #[test]
-fn what_is_not_served_is_refused_by_its_name() {
+fn images_become_image_url_parts_of_the_chat_body() {
     let image = json!({"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AA=="}});
+    let part = json!({"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}});
+    let text = |t: &str| json!({"type": "text", "text": t});
+    let body = with(json!({"messages": [{"role": "user", "content": [
+        text("a"), image.clone(), text("b"),
+        {"type": "tool_result", "tool_use_id": "t", "content": [text("c"), image.clone()]},
+        text("d"),
+    ]}]}));
+    let chat = chat(body);
+    assert_eq!(
+        chat["messages"],
+        json!([
+            {"role": "user", "content": [text("a"), part.clone(), text("b")]},
+            {"role": "tool", "tool_call_id": "t", "content": [text("c"), part.clone()]},
+            {"role": "user", "content": "d"},
+        ])
+    );
+}
+
+#[test]
+fn what_is_not_served_is_refused_by_its_name() {
     let user = |block: Value| with(json!({"messages": [{"role": "user", "content": [block]}]}));
     let assistant = |block: Value| {
         with(json!({"messages": [
@@ -412,17 +432,19 @@ fn what_is_not_served_is_refused_by_its_name() {
         with(json!({"tools": [tool]}))
     };
     let cases: Vec<(Value, &str, &str)> = vec![
-        // Input that is not text.
-        (
-            user(image.clone()),
-            "messages[0].content[0]",
-            "'image' is not supported: images and documents",
-        ),
+        // Input that is neither text nor an image, and an image at a URL.
         (user(json!({"type": "document", "source": {}})), "messages[0].content[0]", "'document'"),
         (
-            user(json!({"type": "tool_result", "tool_use_id": "t", "content": [image]})),
-            "messages[0].content[0].content[0]",
-            "'image'",
+            user(json!({"type": "image", "source": {"type": "url", "url": "https://a/b.png"}})),
+            "messages[0].content[0].source",
+            "not fetched from URLs",
+        ),
+        (
+            user(
+                json!({"type": "image", "source": {"type": "base64", "media_type": "text/plain", "data": "AA=="}}),
+            ),
+            "messages[0].content[0].source",
+            "is not an image",
         ),
         // Tools the server would have to run, and what they leave behind.
         (

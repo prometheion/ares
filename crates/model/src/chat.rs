@@ -1028,10 +1028,9 @@ mod tests {
     /// own; the boundaries lie behind the rows; counting gives as many tokens.
     #[test]
     fn an_image_becomes_its_markers_and_a_pad_token_per_row() {
-        let (Some(model), Some(mmproj)) = (
-            std::env::var_os("ARES_TEST_QWEN35_27B"),
-            std::env::var_os("ARES_TEST_QWEN3VL_27B"),
-        ) else {
+        let (Some(model), Some(mmproj)) =
+            (std::env::var_os("ARES_TEST_QWEN35_27B"), std::env::var_os("ARES_TEST_QWEN3VL_27B"))
+        else {
             eprintln!("skipped: set ARES_TEST_QWEN35_27B and ARES_TEST_QWEN3VL_27B");
             return;
         };

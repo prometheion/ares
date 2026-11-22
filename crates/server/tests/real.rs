@@ -775,7 +775,17 @@ fn what_the_engine_cannot_do_is_refused_by_name() {
             {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
         ]}],
     });
-    refused(chat_path, image, 400, &["image_url", "only 'text' parts"]);
+    refused(chat_path, image, 400, &["image_url", "not of a format"]);
+    // A real image, to a model loaded without a projector.
+    let png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=";
+    let image = json!({
+        "model": server.model,
+        "messages": [{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": format!("data:image/png;base64,{png}")}},
+            {"type": "text", "text": "What is this?"},
+        ]}],
+    });
+    refused(chat_path, image, 400, &["projector", "--mmproj"]);
     let error = refused(chat_path, json!({"model": "gpt-4", "messages": []}), 400, &["messages"]);
     assert_eq!(error["param"], "messages");
     let mut other = chat(json!({}));

@@ -229,7 +229,7 @@ mod tests {
         assert!(said("file:///etc/passwd").contains("'file' URLs"));
         assert!(said("data:text/plain;base64,aGk=").contains("not an image"));
         assert!(said("data:image/png,rawbytes").contains("base64"));
-        assert!(said("data:image/png;base64,aGVsbG8=").contains("cannot be read"));
+        assert!(said("data:image/png;base64,aGVsbG8=").contains("not of a format"));
         let mut cut = png();
         cut.truncate(cut.len() - 20);
         assert!(said(&format!("data:image/png;base64,{}", encode64(&cut))).contains("decode"));

@@ -157,6 +157,25 @@ fn messages_are_the_messages_of_the_chat_body_and_their_parts_one_text() {
 }
 
 #[test]
+fn an_image_of_the_user_makes_the_message_parts_of_the_chat_body() {
+    let url = "data:image/png;base64,AA==";
+    assert_eq!(
+        messages(json!([
+            {"role": "user", "content": [
+                {"type": "input_text", "text": "What is this?"},
+                {"type": "input_image", "image_url": url, "detail": "auto"},
+            ]},
+        ])),
+        json!([
+            {"role": "user", "content": [
+                {"type": "text", "text": "What is this?"},
+                {"type": "image_url", "image_url": {"url": url}},
+            ]},
+        ])
+    );
+}
+
+#[test]
 fn the_instructions_before_a_conversation_are_one_system_message() {
     // Codex puts its instructions at the head of the input; the template of
     // Qwen3.5-0.8B takes a system message only as the first message.
@@ -493,11 +512,17 @@ fn what_is_not_served_is_refused_by_its_name() {
             "tool_choice",
             "tool_choice.function",
         ),
-        // Input that is not text, and items of tools the server does not run.
+        // Input that is neither text nor an image, an image that is not
+        // sent, and items of tools the server does not run.
         (
-            part(json!({"type": "input_image", "image_url": "data:"})),
+            part(json!({"type": "input_image", "file_id": "f"})),
             "input[0].content[0]",
-            "images",
+            "files are not kept",
+        ),
+        (
+            part(json!({"type": "input_image", "image_url": "data:", "detail": "max"})),
+            "input[0].content[0]",
+            "detail",
         ),
         (part(json!({"type": "input_file", "file_id": "f"})), "input[0].content[0]", "files"),
         (part(json!({"type": "input_audio"})), "input[0].content[0]", "audio"),
@@ -537,7 +562,7 @@ fn what_is_not_served_is_refused_by_its_name() {
                 {"type": "input_image", "image_url": "data:"},
             ]})),
             "input[0].output[0]",
-            "images",
+            "an image stands in a message of the user",
         ),
         (
             item(json!({"type": "reasoning", "summary": [], "content": [{"type": "image"}]})),
