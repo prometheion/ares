@@ -5134,6 +5134,45 @@ the decode requests from `/metrics`:
   us per expert and row for the types of this file (decoded row by row) and an upload 410 to 490
   us, so neither side is much faster and the cost model keeps both busy (see OPEN.md).
 
+*With kernels for the file's types* (2026-11-22, branch `flash/cpu-experts`; the test machine,
+`--ram 40G`, `--context 40960`, no profile, the same bench; the build of before is `verify/stack`;
+sessions one after the other, load average at their start in the table; tokens per second by the
+client, German / English / code, each asked twice):
+
+| Build, drafts | German 1st/2nd | English 1st/2nd | Code 1st/2nd | Mean | VRAM hit % | CPU % of picks | Uploads a token | Wait ms a token | Load |
+| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | --- |
+| before, MTP block | 18.9/26.7 | 24.3/34.7 | 21.9/29.5 | 26.0 | 61 | 27 | 49.7 | 28.3 | 2.1 |
+| kernels (215eaef), MTP block | 22.6/50.9 | 29.8/40.5 | 30.3/44.3 | 36.4 | 57 | 37 | 24.2 | 18.4 | 4.0 |
+| before, MTP block | 16.2/33.7 | 21.4/33.8 | 21.3/30.0 | 26.1 | 61 | 25 | 57.6 | 30.6 | 8.9 |
+| all of the branch (5aa8aa4), MTP block | 23.5/36.3 | 31.8/39.5 | 30.9/39.5 | 33.6 | 57 | 37 | 25.0 | 18.9 | 6.3 |
+| before, none | 12.4/17.5 | 13.8/17.1 | 12.8/16.5 | 15.0 | 72 | 17 | 55.9 | 41.0 | 2.3 (a build ran beside it) |
+| kernels and job order (1c2dac3), none | 20.4/26.5 | 25.1/27.7 | 22.4/27.1 | 24.9 | 69 | 28 | 21.9 | 18.2 | 5.6 |
+
+- Decode is 29 to 40 % faster with the MTP block and 66 % without it in these sessions; the wait for
+  misses halves (18 against 28 to 41 ms a token) and the uploads halve, the CPU computing nearly
+  every miss. The prompts carry the session's name, so the texts differ from session to session.
+- Where a step's time goes (`qwen4exp_run --decode-at 4000 --decode-steps 256 --breakdown`,
+  `--ram-gib 39.4`, one row a step): 59.7 ms a step before (load 7 to 9), 39.7 to 40.6 ms with
+  the branch (load 5 to 7); the wait for misses summed over the layers 27.5 ms before, 8.2 to 9.4
+  ms now. A layer whose misses the CPU computes (2.9 experts at the median) has its job made 9 to
+  10 us after its route record, the job's last task ends at 160 to 175 us, and the sums are on
+  their way 6 to 10 us later: the job is the wait, and three experts' 7 MB from the RAM tier in
+  about 150 us is close to what the memory gives. On the device, with timed events: dense parts
+  15.6 ms, stream mixers 7.8, exchange 1.1, recurrent layers 1.0, attention 0.9, the experts
+  (with their wait) 15 ms; about 27 ms a token are outside the experts on this card.
+- Without uploads of misses there are no loans, and VRAM's share of the picks is lower: 70 %
+  against 80 % at the start of that decode, 55 % against 80 % later in it (the server's bench:
+  57 against 61 % with the MTP block, 69 against 72 % without). Uploading on loan every miss the
+  CPU computed, behind the step (118 a step as far as the link had room), raised it to 75 % and
+  made the steps slower (42.8 against 40.6 ms at the median, the dense part 19.3 against 15.6
+  ms): on this x4 link the uploads hold up what a step reads from the host and the layers'
+  sums. That is not in the engine (OPEN.md).
+- Against Strata: its baseline at the same budget (0.2.15, engine 0.1.60, 40 GiB) decoded at 24.2 to
+  38.5 tokens/s with drafts (mean 29.9) and read prompts at 198 / 787 / 1192 tokens/s (2k / 8k /
+  32k; Ares 176 / 250 / 281, see OPEN.md); its runs without drafts were disturbed by a build. Strata
+  0.2.19 (engine 0.1.65, decode said to be 20 to 59 % faster on RTX 40 cards) was installed during
+  this work and is still to be measured against this branch.
+
 **Reading experts ahead of their router.** A pick that no tier holds is read from the file
 when its layer's record reaches the host, and the layer waits for it. The routers of the
 next layers applied to the rows the router of this layer reads name most of what those

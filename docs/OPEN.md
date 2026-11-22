@@ -174,7 +174,14 @@ engines below are history.
       products start expert by expert. A job of one expert and row now takes 37-45 us on the test
       machine, three experts of a row 97 us (74 GB/s, near the memory's rate); the cost model
       sends nearly every miss to the CPU. See "The kernels for the types of the Flash-Next files"
-      in ARCHITECTURE.md. Decode against the build of before and against Strata: below.
+      in ARCHITECTURE.md. Decode against the build of before (40G, the bench of the Strata
+      comparison): with the MTP block 33.6 to 36.4 tokens/s against 26.0 to 26.1 (mean of six
+      asks), without it 24.9 against 15.0; the wait for misses 18 ms a token against 28 to 41.
+- [ ] Against Strata 0.2.19 (engine 0.1.65, installed 2026-11-22 evening) at 40 GiB: not measured
+      yet (the test machine switched off at 21:00); the runs are queued to start when it is back
+      (`~/work/flash-cpu/requeue.log`, tables in `results/summary-final.txt`). Strata 0.1.60 at 40
+      GiB decoded at 29.9 tokens/s with drafts (mean); Ares now 33.6 to 36.4. Without drafts the
+      device's 27 ms a token outside the experts (below) bounds Ares near 30 tokens/s here.
 - [ ] Without uploads of misses there are no loans, and the share of picks in VRAM falls (70
       against 80 % at the start of qwen4exp_run's decode at 4000 tokens, 53-56 against 80 %
       later in it). Uploading every miss the CPU computed on loan as well, behind the step
