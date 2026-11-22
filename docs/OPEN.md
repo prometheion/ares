@@ -27,7 +27,11 @@ section further down.
 4. Tools, structured output and the Messages and Responses routes on the real Flash-Next, and
    against Claude Code itself (parity, server).
 5. Flash-Next's draft vocabulary (step 6 of the shared layer, being finished).
-6. K/V of a running sequence beyond VRAM for Flash-Next at long contexts (whole features).
+6. K/V of a running sequence beyond VRAM for Flash-Next at long contexts (whole features). The
+   owner's rule for the context (2026-11-22): without `--context` the model's own maximum (262144
+   for Qwen3.8) on both models; what does not fit in VRAM overflows into RAM. Until the overflow
+   exists, the most that fits, with a log line. On the 27B the attention heads move to the second
+   card as far as the context needs (built on `devices/roles`).
 7. Priorities of requests (server).
 8. Then the rest of CUDA complete: image input pieces 4 to 8, gate and up in two types, the
    roles of the cards, the open defects, the server items.
