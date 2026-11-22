@@ -165,12 +165,39 @@ engines below are history.
       rate is the same, 59 % and 70 %: on this card the size of VRAM, not its filling, bounds it.
       Still behind Strata (40.0/43.0 with drafts, 27.2/28.6 without): the misses cost 26-56 ms a
       token, see the next item.
-- [ ] The CPU computes the types of UD-Q3_K_XL slowly: IQ3_XXS and IQ4_XS as gate and up, Q5_0
-      and IQ4_NL as down have no kernel of their own and are decoded row by row
-      (`cpu/kernels.rs`): a job takes 170-410 us per expert and row on the test machine where an
-      upload takes 410-490 us, so the cost model sends a third to a half of the misses over the
-      link. Strata computes these types with ggml's AVX2 kernels at several times the rate.
-      Kernels for them are the next lever of decode on such a machine.
+- [x] The CPU computed the types of UD-Q3_K_XL slowly (decoded row by row, 170-410 us per
+      expert and row on the test machine, about an upload). Built 2026-11-22 (branch
+      `flash/cpu-experts`): kernels for the types of every Flash-Next file at hand, as gate and
+      up IQ3_XXS, IQ4_XS, Q4_K, Q5_K and Q2_0 (the MTP block), as down Q4_0, Q4_1, Q5_0, Q5_1,
+      Q8_0 and IQ4_NL, with AVX2 and AVX-VNNI picked at run time and the decoded path as the
+      portable fallback (a CPU without x86-64-v3 no longer refuses the CPU half); a job's down
+      products start expert by expert. A job of one expert and row now takes 37-45 us on the test
+      machine, three experts of a row 97 us (74 GB/s, near the memory's rate); the cost model
+      sends nearly every miss to the CPU. See "The kernels for the types of the Flash-Next files"
+      in ARCHITECTURE.md. Decode against the build of before and against Strata: below.
+- [ ] Without uploads of misses there are no loans, and the share of picks in VRAM falls (70
+      against 80 % at the start of qwen4exp_run's decode at 4000 tokens, 53-56 against 80 %
+      later in it). Uploading every miss the CPU computed on loan as well, behind the step
+      (118 a step), won it back only to 75 % and made the steps slower (42.8 against 40.6 ms at
+      the median, the dense part on the device 19.3 against 15.6 ms): on this x4 link the
+      uploads hold up what a step reads from the host and the layers' sums. A policy for the
+      slots that keeps a token's misses for the next tokens without the link: open.
+- [ ] A decode step of UD-Q3_K_XL on the RTX 4060 Ti takes about 27 ms on the device outside
+      the experts (qwen4exp_run --breakdown at 4000 tokens: dense 15.6 ms, stream mixers 7.8,
+      exchange 1.1, recurrent 1.0, attention 0.9); with the CPU's misses about 40 ms a token
+      without drafts. The dense weights (3.85 GiB) at the card's 288 GB/s are 14 ms alone: the
+      floor of decode on this card is there, not in the experts.
+- [ ] Prompts on the test machine at 40 GiB: 3 to 4 times behind Strata 0.1.60 at 8k and 32k
+      tokens (Ares 250 and 281 tokens/s, Strata 787 and 1192). A prompt read alone takes steps of
+      2048 rows on the VRAM the slots lend on this card (Strata: chunks of 8192), and in such a
+      step nearly every expert is picked, so the ~20 800 experts without a VRAM slot cross the
+      x4 link once per step: about 45 GB at 6.4 GB/s, 7 s per 2048 rows, 290 tokens/s, which is
+      what was measured. The dense part's activation form (one form for all dense matrices in a
+      wide step) is a small part of it. Levers: larger lent steps, or the CPU taking the experts
+      a wide step picks for few rows (Strata's CPU share of prompt chunks up to 3072 tokens).
+- [ ] The agent suite on the test machine (b-a-on, 2026-11-22): a turn whose prompt is almost
+      all cached is read as if it were not (6832 tokens with 6784 cached: 31.2 s, the same as
+      uncached; 622 with 512 cached: 12.0 s); Strata 0.33-0.47 s.
 - [ ] Transit adoption (`transit_adopt`, the prompt chunks' experts taking VRAM slots after a
       wide step) asks only "hotter than the coldest member" (with the swap margin when the member
       has to be copied down), not the rule of a promotion; left as it was for the work on prompt
@@ -445,7 +472,10 @@ prompt (0.98 to 1.00 reads per distinct expert). To be read in its code before i
       `experts_of_every_weight_type_on_the_cpu_change_nothing_*` fail now and then under load).
 - [ ] The step scratch starts its buffers on a 128-byte line (as fixed for the 27B).
 - [ ] Float experts beyond the f16 range are not caught in the many-row kernels.
-- [ ] CPU path for the 24 types without a hand-written kernel is 3 to 11 times slower.
+- [ ] CPU path for the types without a written kernel (Q2_K, Q3_K, Q6_K, IQ2_XS, IQ3_S, IQ1_S,
+      IQ4_NL and Q4_0 to Q8_0 as gate and up, the 256-value types as down, TQ*, MXFP4, NVFP4,
+      Q1_0, the floats) is 3 to 8 times slower than the written ones; none is in a Flash-Next
+      file at hand.
 - [ ] NVFP4 many-row gate and up 1.4 times its neighbours on the RTX 4070; IQ2_XXS many-row
       at 8 rows 7 % slower on the RTX 3060 since the kernels for all types.
 
