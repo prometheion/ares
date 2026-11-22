@@ -298,6 +298,10 @@ impl Drop for CancelGuard {
 }
 
 /// A request that the engine has accepted.
+/// How often a request that waits for its engine looks whether the engine
+/// has failed without telling it (a step its watchdog found stuck).
+const FAILURE_LOOK: std::time::Duration = std::time::Duration::from_secs(1);
+
 pub(crate) struct Run {
     rx: mpsc::Receiver<Event>,
     overflow: Arc<Overflow>,
@@ -382,14 +386,25 @@ impl Run {
         // `biased`: events that are already queued come before the overflow
         // notice, so the client receives every piece of text the engine
         // managed to deliver.
-        let event = tokio::select! {
-            biased;
-            event = self.rx.recv() => event,
-            () = self.overflow.wake.notified() => return Err(self.slow()),
-            () = self.stop.raised() => {
-                tracing::info!(id = %self.guard.id, "the server is stopping: ending the request");
-                self.guard.cancel_now();
-                return Err(ApiError::cancelled());
+        let event = loop {
+            tokio::select! {
+                biased;
+                event = self.rx.recv() => break event,
+                () = self.overflow.wake.notified() => return Err(self.slow()),
+                () = self.stop.raised() => {
+                    tracing::info!(id = %self.guard.id, "the server is stopping: ending the request");
+                    self.guard.cancel_now();
+                    return Err(ApiError::cancelled());
+                }
+                // An engine whose watchdog found it stuck sends nothing more:
+                // the request ends with its reason.
+                () = tokio::time::sleep(FAILURE_LOOK) => {
+                    if let Some(why) = self.engine.failure() {
+                        tracing::error!(id = %self.guard.id, %why, "the engine failed: ending the request");
+                        self.guard.cancel_now();
+                        return Err(ApiError::internal(why));
+                    }
+                }
             }
         };
         let Some(event) = event else {

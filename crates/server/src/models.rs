@@ -889,6 +889,15 @@ impl Models {
         }
     }
 
+    /// The preset that answers to `name` (an id or an alias), loaded or not;
+    /// `None` for a server of one engine and for a name no preset has.
+    pub fn preset(&self, name: &str) -> Option<crate::preset::Preset> {
+        let Kind::Presets { shared, .. } = &self.0 else { return None };
+        let state = shared.lock();
+        let index = shared.resolve(&state, name).ok()?;
+        Some((*state.entries[index].preset).clone())
+    }
+
     /// Every model with its state, in the order of the preset file.
     pub fn list(&self) -> Vec<Listed> {
         match &self.0 {

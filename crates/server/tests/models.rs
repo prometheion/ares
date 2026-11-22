@@ -975,3 +975,66 @@ fn the_binary_serves_a_preset_file_lists_a_failed_load_and_stops_in_order() {
     assert!(child.wait().unwrap().success(), "a clean stop: {rest:#?}");
     assert!(rest.last().is_some_and(|line| line.trim_end().ends_with("stopped")), "{rest:#?}");
 }
+
+/// A small model file with a tokenizer and a chat template, and no tensor:
+/// enough for what `/props` reads of a model that is not loaded.
+fn tiny_model_file(dir: &Path) -> std::path::PathBuf {
+    let char_of = |byte: u8| {
+        if matches!(byte, 0x21..=0x7E | 0xA1..=0xAC | 0xAE..=0xFF) {
+            return char::from(byte);
+        }
+        let moved =
+            (0..byte).filter(|b| !matches!(b, 0x21..=0x7E | 0xA1..=0xAC | 0xAE..=0xFF)).count();
+        char::from_u32(0x100 + moved as u32).expect("a character")
+    };
+    let mut tokens: Vec<String> = (0..=255u8).map(|b| char_of(b).to_string()).collect();
+    tokens.extend(["<|im_start|>".to_owned(), "<|im_end|>".to_owned()]);
+    let mut types = vec![1i32; 256];
+    types.extend([3, 3]);
+    let template = "{% for m in messages %}<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>\n\
+                    {% endfor %}{% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}";
+    let file = ares_gguf::GgufBuilder::new()
+        .str("general.architecture", "tiny")
+        .u32("tiny.context_length", 8192)
+        .str("tokenizer.ggml.model", "gpt2")
+        .str("tokenizer.ggml.pre", "qwen35")
+        .str_array("tokenizer.ggml.tokens", &tokens)
+        .i32_array("tokenizer.ggml.token_type", &types)
+        .str_array::<&str>("tokenizer.ggml.merges", &[])
+        .u32("tokenizer.ggml.eos_token_id", 257)
+        .str("tokenizer.chat_template", template)
+        .build();
+    let path = dir.join("tiny.gguf");
+    std::fs::write(&path, file).unwrap();
+    path
+}
+
+#[tokio::test]
+async fn props_of_a_model_that_is_not_loaded_are_read_from_its_preset_and_file() {
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("props-unloaded");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = tiny_model_file(&dir);
+    let ini = format!(
+        "[t]\nmodel = {}\ntemperature = 0.5\n[u]\nmodel = {}\ncontext = 2048\n",
+        path.display(),
+        path.display()
+    );
+    let w = world(&ini, &[10, 10]);
+    let app = router_over(w.models.clone(), Config::default());
+    let (status, props) = json(get(&app, "/props?model=t").await).await;
+    assert_eq!(status, 200, "{props}");
+    assert_eq!(props["model"], "t");
+    assert_eq!(props["loaded"], false);
+    assert_eq!(props["context_length"], 8192, "the file's own");
+    assert_eq!(props["default_generation_settings"]["params"]["temperature"], 0.5);
+    assert!(props["chat_template"].as_str().unwrap().contains("<|im_start|>"), "{props}");
+    assert_eq!(props["chat_template_caps"]["supports_tools"], false);
+    // A context the preset names is what it says.
+    let (_, props) = json(get(&app, "/props?model=u").await).await;
+    assert_eq!(props["context_length"], 2048);
+    // Nothing was loaded for it.
+    assert!(w.is("t", "unloaded") && w.is("u", "unloaded"));
+    // A name no preset has is not found.
+    let (status, _) = json(get(&app, "/props?model=nope").await).await;
+    assert_eq!(status, 404);
+}

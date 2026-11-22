@@ -115,7 +115,10 @@ the kernels exist; no model runs there yet.
   environment, then file).
 - `/tokenize` (a text or a chat request, with pieces) and `/detokenize`, in llama.cpp's shapes;
   a text (there and on `/v1/completions`) reads control tokens such as `<|im_start|>` as llama-server.
-- `/props` (`?model=`): context, chat template, request defaults, what the template can do.
+- `/props` (`?model=`): context, chat template, request defaults, what the template can do; of a
+  model that is not loaded too (read from its preset and file, without a load).
+- A watchdog: a step that runs longer than 600 s fails its engine; its requests end with the
+  reason and the router unloads it.
 - Usage counts the tokens of the thinking (`completion_tokens_details.reasoning_tokens`,
   `output_tokens_details` on `/v1/responses`).
 - A stop string that ends a reply is named: `stop_reason: stop_sequence` and `stop_sequence` on

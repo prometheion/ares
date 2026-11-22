@@ -98,6 +98,15 @@ pub struct RuntimeConfig {
     pub conductor_spin: Duration,
     /// Samples kept per timing series for percentiles.
     pub stats_window: usize,
+    /// The longest one step may take before the engine is taken for stuck
+    /// (SGLang's `--watchdog-timeout`, 300 s there): a device that never
+    /// finishes its step leaves every request waiting for ever. The engine
+    /// then fails as when a device reports an error: its requests end with
+    /// the reason, it accepts no more, and the threads that hang are left
+    /// behind when it is dropped. `None`: no watch. Longer than any step that
+    /// works: the widest step of a prompt of a mixture of experts whose
+    /// experts come from the SSD takes tens of seconds.
+    pub watchdog: Option<Duration>,
     /// Run steps before taking requests: the first ones pay for the lazy
     /// loading of kernels and the first use of each path, so it is not in the
     /// first request's time; and then steps of every row count a window can
@@ -132,6 +141,7 @@ impl Default for RuntimeConfig {
             starvation_steps: 8,
             conductor_spin: Duration::from_millis(100),
             stats_window: crate::timing::DEFAULT_WINDOW,
+            watchdog: Some(Duration::from_secs(600)),
             warm_up: true,
         }
     }

@@ -932,6 +932,33 @@ pub fn load(options: &LoadOptions) -> Result<Loaded, LoadError> {
     load_at(options, &alone(options))
 }
 
+/// What a model is, read from its file and its options without loading it:
+/// for `/props` of a model that is not loaded.
+#[derive(Debug, Clone)]
+pub(crate) struct Described {
+    /// The chat template in effect (the file's, or `--chat-template-file`).
+    pub chat_template: Option<String>,
+    /// What the template declares, with the model's chat variables.
+    pub format: ares_api::ChatFormat,
+    /// The context its options name (`--context`), else the longest the
+    /// model file declares; a load decides what fits the devices.
+    pub context_length: Option<u32>,
+}
+
+/// Reads [`Described`] for the model of `options`: the file's metadata and
+/// its tokenizer, no tensor. Call it where waiting is allowed.
+pub(crate) fn read_described(options: &LoadOptions) -> Result<Described, LoadError> {
+    let gguf = Gguf::open(&options.model)?;
+    let architecture = gguf.architecture().ok_or(LoadError::NoArchitecture)?.to_owned();
+    let tokenizer =
+        ares_tokenizer::Tokenizer::from_gguf(&gguf).map_err(|e| LoadError::Model(e.to_string()))?;
+    let (chat, chat_template) = chat_options(options, &tokenizer)?;
+    let format = ares_model::chat::chat_format(&tokenizer, &chat);
+    let file =
+        gguf.u64(&format!("{architecture}.context_length")).and_then(|n| u32::try_from(n).ok());
+    Ok(Described { chat_template, format, context_length: options.context.or(file) })
+}
+
 /// The settings a model renders conversations with: the variables of the
 /// chat template, and the template of `--chat-template-file` in place of the
 /// file's, compiled with the model's tokenizer. Also the text of the template

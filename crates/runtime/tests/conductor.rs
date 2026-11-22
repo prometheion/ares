@@ -1220,3 +1220,30 @@ fn a_window_of_no_rows_is_refused_at_start() {
     let error = Runtime::start(model.clone(), Box::new(host), config).unwrap_err();
     assert!(error.to_string().contains("at least one row"), "{error}");
 }
+
+#[test]
+fn a_step_that_does_not_end_fails_the_engine_by_its_watchdog() {
+    use ares_api::Engine;
+    let model = model(roomy);
+    let gate = Gate::new();
+    let config = RuntimeConfig { watchdog: Some(Duration::from_secs(1)), ..config(true, 4096) };
+    let rt = runtime_with(&model, config, |e| {
+        e.with_gate(gate.clone()).with_delay(Duration::from_micros(200))
+    });
+    let handle = start(&rt, request("stuck", None)).unwrap();
+    handle.wait_for_text(1);
+    assert_eq!(rt.failure(), None, "a step that ends is no failure");
+    gate.close();
+    let begun = std::time::Instant::now();
+    while rt.failure().is_none() && begun.elapsed() < Duration::from_secs(20) {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let failure = rt.failure().expect("the watchdog failed the engine");
+    assert!(failure.contains("watchdog"), "{failure}");
+    // The engine goes without waiting for the step that hangs.
+    let dropped = std::time::Instant::now();
+    drop(rt);
+    assert!(dropped.elapsed() < Duration::from_secs(5));
+    gate.open();
+    drop(handle);
+}

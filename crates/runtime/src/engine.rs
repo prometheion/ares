@@ -53,6 +53,9 @@ pub struct Runtime {
     running: Arc<AtomicBool>,
     /// Why the engine accepts no more requests, once its devices have failed.
     failure: Arc<OnceLock<String>>,
+    /// Set when the watchdog found a step that does not end: the threads
+    /// that hang are not waited for when the engine goes.
+    stuck: Arc<AtomicBool>,
     /// The requests the engine holds, running and in line: one for every
     /// sink it has not let go of.
     held: Arc<AtomicU32>,
@@ -128,7 +131,7 @@ impl Runtime {
         let (ready_tx, ready_rx) = mpsc::channel();
         let limit = card.context_length.min(config.pages.saturating_mul(config.cells_per_page));
         let warm_up = config.warm_up;
-        let (queue, slots) = (config.queue, config.max_slots);
+        let (queue, slots, watchdog) = (config.queue, config.max_slots, config.watchdog);
         // When the prompt cache must give page-locked memory back, the
         // conductor is woken to give the coldest checkpoints and pages up,
         // also while nothing runs.
@@ -140,7 +143,9 @@ impl Runtime {
         }
         let mut conductor = Conductor::new(model.clone(), config, executor, rx);
         let failure = conductor.failure();
+        let heartbeat = conductor.heartbeat();
         let running = Arc::new(AtomicBool::new(true));
+        let stuck = Arc::new(AtomicBool::new(false));
         let alive = running.clone();
         let thread = thread::Builder::new()
             .name("ares-conductor".to_owned())
@@ -172,11 +177,15 @@ impl Runtime {
                 return Err(RuntimeError::Thread("the conductor ended while starting".into()));
             }
         }
+        if let Some(limit) = watchdog {
+            watch(heartbeat, limit, running.clone(), failure.clone(), stuck.clone())?;
+        }
         Ok(Self {
             model,
             card,
             limit,
             grammars,
+            stuck,
             commands: Mutex::new(Some(tx)),
             conductor_id: thread.thread().id(),
             conductor: Mutex::new(Some(thread)),
@@ -376,6 +385,12 @@ impl Runtime {
             let _ = sender.send(Command::Shutdown);
         }
         let handle = self.conductor.lock().expect("conductor").take();
+        if self.stuck.load(Ordering::Acquire) {
+            // A step that never ended: the conductor waits for it and would
+            // never be joined. It and its devices are left behind, with the
+            // memory they hold, until the process ends (the failure says why).
+            return;
+        }
         // The last handle can be dropped by a sink running on the conductor
         // itself; a thread cannot join itself.
         if let Some(handle) = handle
@@ -384,6 +399,40 @@ impl Runtime {
             let _ = handle.join();
         }
     }
+}
+
+/// Starts the watchdog of an engine: a thread that looks every second at how
+/// long the step in flight has run, and fails the engine when it has run
+/// longer than `limit` (`RuntimeConfig::watchdog`). It ends with the
+/// conductor.
+fn watch(
+    heartbeat: Arc<crate::conductor::Heartbeat>,
+    limit: Duration,
+    running: Arc<AtomicBool>,
+    failure: Arc<OnceLock<String>>,
+    stuck: Arc<AtomicBool>,
+) -> Result<(), RuntimeError> {
+    thread::Builder::new()
+        .name("ares-watchdog".to_owned())
+        .spawn(move || {
+            while running.load(Ordering::Acquire) && failure.get().is_none() {
+                thread::sleep(Duration::from_secs(1).min(limit));
+                let Some(busy) = heartbeat.busy() else { continue };
+                if busy > limit {
+                    let why = format!(
+                        "the engine has been in one step for {} s, longer than its watchdog \
+                         allows ({} s): a device does not finish its work",
+                        busy.as_secs(),
+                        limit.as_secs()
+                    );
+                    stuck.store(true, Ordering::Release);
+                    let _ = failure.set(why);
+                    return;
+                }
+            }
+        })
+        .map(drop)
+        .map_err(|e| RuntimeError::Thread(format!("cannot start the watchdog: {e}")))
 }
 
 impl Drop for Runtime {

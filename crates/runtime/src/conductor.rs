@@ -155,6 +155,36 @@ fn expected_chain_ms(chain: &Curve, passes: &[(f64, f64)], links: u32) -> f64 {
 /// this is a guard against spinning and not a path a request takes.
 const STALLED: Duration = Duration::from_millis(1);
 
+/// When the step in flight was handed to the devices, for the watchdog
+/// (`RuntimeConfig::watchdog`), which reads it from a thread of its own.
+pub(crate) struct Heartbeat {
+    epoch: Instant,
+    /// Nanoseconds after `epoch`, plus one, at which the step in flight was
+    /// dispatched; 0 while no step is in flight.
+    since: std::sync::atomic::AtomicU64,
+}
+
+impl Heartbeat {
+    pub(crate) fn new() -> Self {
+        Self { epoch: Instant::now(), since: std::sync::atomic::AtomicU64::new(0) }
+    }
+
+    fn begin(&self) {
+        let ns = self.epoch.elapsed().as_nanos() as u64 + 1;
+        self.since.store(ns, std::sync::atomic::Ordering::Release);
+    }
+
+    fn end(&self) {
+        self.since.store(0, std::sync::atomic::Ordering::Release);
+    }
+
+    /// How long the step in flight has run, if one is.
+    pub(crate) fn busy(&self) -> Option<Duration> {
+        let since = self.since.load(std::sync::atomic::Ordering::Acquire);
+        (since != 0).then(|| self.epoch.elapsed().saturating_sub(Duration::from_nanos(since - 1)))
+    }
+}
+
 /// What other threads ask of the conductor.
 pub(crate) enum Command {
     Submit(Box<Submission>),
@@ -712,6 +742,8 @@ pub(crate) struct Conductor {
     shutting_down: bool,
     /// Requests wait and the last pass could start none of them.
     stalled: bool,
+    /// When the step in flight began, for the watchdog.
+    heartbeat: Arc<Heartbeat>,
     // Scratch that lives across steps so that a step allocates nothing for it.
     requests: Vec<Request>,
     parts: Vec<StepPart>,
@@ -856,6 +888,7 @@ impl Conductor {
             failure: std::sync::Arc::default(),
             shutting_down: false,
             stalled: false,
+            heartbeat: Arc::new(Heartbeat::new()),
         }
     }
 
@@ -1584,6 +1617,11 @@ impl Conductor {
         self.failure.clone()
     }
 
+    /// When the step in flight began, for the watchdog.
+    pub(crate) fn heartbeat(&self) -> Arc<Heartbeat> {
+        self.heartbeat.clone()
+    }
+
     /// One pass of the admission accounting: the pages the parts in
     /// `self.parts` claim, then who starts.
     fn settle(&mut self) -> Outcome {
@@ -2153,12 +2191,16 @@ impl Conductor {
         let load = self.parts.iter().fold(Load::default(), |load, part| {
             load.plus(load_of(self.span, part.from, part.rows))
         });
+        self.heartbeat.begin();
         if let Err(error) = self.exec.dispatch(&meta) {
+            self.heartbeat.end();
             return self.fail(error.to_string());
         }
         let t_wait = Instant::now();
         self.stats.record(Phase::Dispatch, (t_wait - t_dispatch).as_nanos() as u64);
-        let woke = match self.exec.collect(self.config.conductor_spin, &mut self.output) {
+        let collected = self.exec.collect(self.config.conductor_spin, &mut self.output);
+        self.heartbeat.end();
+        let woke = match collected {
             Ok(woke) => woke,
             Err(error) => return self.fail(error.to_string()),
         };

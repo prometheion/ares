@@ -18,7 +18,7 @@ use futures_util::StreamExt;
 use crate::bridge::{DecisionRun, Item, Run, Stop, Timings};
 use crate::defaults::LIMIT_HEADER;
 use crate::error::ApiError;
-use crate::models::{Lease, Listed, ModelEvent, Models};
+use crate::models::{AcquireError, Lease, Listed, ModelEvent, Models};
 use crate::reasoning::{self, Split};
 use crate::reply::{Piece, Sorter};
 use crate::systemone;
@@ -65,8 +65,18 @@ pub(crate) async fn model_of(app: &App, model: &mut String) -> Result<Lease, Api
         lease = app.models.acquire(model) => lease?,
         () = stop.raised() => return Err(ApiError::cancelled()),
     };
-    if let Some(id) = lease.id() {
-        id.clone_into(model);
+    match lease.id() {
+        Some(id) => id.clone_into(model),
+        None => {
+            // One engine and no presets: a name it does not serve is not found,
+            // before what the request asks of the model's template (tools, an
+            // effort) is looked at, which would refuse it with another reason.
+            let served = lease.engine().models();
+            if !served.iter().any(|card| card.id == *model) {
+                let available = served.into_iter().map(|card| card.id).collect();
+                return Err(AcquireError::NotFound { model: model.clone(), available }.into());
+            }
+        }
     }
     Ok(lease)
 }

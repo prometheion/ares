@@ -7709,8 +7709,13 @@ answers through `Engine::tokenize` and `Engine::pieces` (`Model::encode` and
 `Model::piece` in the runtime). `model` may be left out when the server has one
 model.
 
-`GET /props` (`?model=<id>` with several models; the model must be loaded, as
-for `/metrics`) says what a model is, in llama.cpp's shape where it fits:
+`GET /props` (`?model=<id>` with several models) says what a model is, in
+llama.cpp's shape where it fits, with `"loaded"`; a model that is not loaded is
+not loaded for it (as `/metrics` does not), and is described from its preset
+and its file (`load::read_described`: the metadata and the tokenizer, no
+tensor): its defaults, its chat template and what it declares, and as
+`context_length` the context its preset names or else the longest its file
+declares, since only a load decides what fits the devices. For a loaded model:
 `context_length` (and `default_generation_settings.n_ctx`), what a request
 gets for the fields it leaves out (`default_generation_settings.params`, the
 `defaults` of `/v1/models`, with `max_tokens_limit`), `chat_template` (the
@@ -7861,6 +7866,22 @@ priority 5 waits; the long one comes back and says what it says alone; a full
 line takes a better priority and refuses the worst waiting request) and
 `crates/server/tests/priority.rs` (the member and the header on all four
 routes).
+
+**The watchdog.** A device that never finishes its step leaves every request
+of its engine waiting for ever. The conductor notes when it hands a step to
+the devices and when the step is back (`Heartbeat`), and a thread of the
+runtime looks every second: a step that has run longer than
+`RuntimeConfig::watchdog` (600 s; SGLang's `--watchdog-timeout` is 300 s and
+kills its server) fails the engine as a device error does (`Engine::failure`,
+whose reason names the watchdog). A request that waits for such an engine
+looks at the failure every second (`bridge::Run`) and ends with it, since the
+stuck conductor sends nothing more; the router then unloads the model as a
+broken one, and the runtime, which would wait for ever for the stuck
+conductor, leaves its threads behind, with the memory they hold on the
+devices, until the process ends. The limit is above any step that works: the
+widest step of a prompt of Flash-Next with experts from the SSD takes tens of
+seconds. A step is watched from its dispatch to its collect; the steps of the
+warm-up are not.
 
 **What the server logs and measures.** Every generating request has a line
 with its parameters when it is taken (the model, the limit of tokens, the

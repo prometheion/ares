@@ -732,7 +732,9 @@ Flash-Next); experts that do not fit in VRAM in RAM; K/V in int8. Its README giv
       does not publish its.
 - [ ] Router: load and unload times in the docs; "no room" for Flash-Next is recognised by
       message text; a plan cannot be asked without loading; two elastic models on real devices.
-- [ ] A request with tools or an effort for an unknown model gets a 400 where a 404 belongs.
+- [x] A request with tools or an effort for an unknown model got a 400 where a 404 belongs (a
+      server of one engine without presets): the name is checked before the template is asked
+      (2026-11-22, `server/priorities`).
 - [x] Latency histograms (O01), logs (O03, O04), a bounded queue that says when to retry
       (S04), timeouts (S23).
 - [x] Priorities (S06): `priority` and `x-ares-priority`, the line, the places, the pages, the
@@ -742,10 +744,16 @@ Flash-Next); experts that do not fit in VRAM in RAM; K/V in int8. Its README giv
       next to generation of a better one (the slowdown, not the priority, bounds it); a
       threshold of the gap before a running request gives way (SGLang's, 10 by default) is not
       there (any gap is enough); the randomized test of admission plays one priority.
-- [ ] A watchdog for a silent engine (S23), a VRAM reserve for other
+- [x] A watchdog for a silent engine (S23): a step that runs longer than 600 s fails the engine
+      (`RuntimeConfig::watchdog`), its requests end with the reason, the router unloads it and
+      leaves its stuck threads behind (2026-11-22, `server/priorities`). Open: no option for the
+      limit (a field of `RuntimeConfig`); the steps of the warm-up are not watched; the memory a
+      stuck device holds stays taken until the process ends.
+- [ ] A VRAM reserve for other
       programs (V04), container image and service unit (X09), key roles and a reload of the
       key file (X02), TLS (X03).
-- [ ] `/props` of a model that is not loaded (today: 503 `model_not_loaded`, as `/metrics`).
+- [x] `/props` of a model that is not loaded: read from its preset and its file without a load,
+      with `"loaded": false` (2026-11-22, `server/priorities`); `/metrics` of one is still 503.
 
 ### Claude Code against Ares (2026-11-22, Claude Code 2.1.301, print mode)
 Claude Code in a sandbox of its own (own home, a throwaway project, `ANTHROPIC_BASE_URL` on

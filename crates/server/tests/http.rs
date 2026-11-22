@@ -714,7 +714,8 @@ async fn an_oversized_body_is_refused_with_413() {
 
     assert!(engine.submitted().is_empty());
     // A body that fits is fine.
-    let small = json!({"model": "m", "messages": [{"role": "user", "content": "x"}]}).to_string();
+    let small =
+        json!({"model": "mock", "messages": [{"role": "user", "content": "x"}]}).to_string();
     assert!(small.len() <= 64);
     assert_eq!(post(&app, CHAT, &small).await.status(), StatusCode::OK);
 }
@@ -1190,4 +1191,20 @@ async fn the_default_buffer_takes_a_long_burst_without_cutting_anyone_off() {
     assert_eq!(status, StatusCode::OK);
     let expected: String = (0..1000).map(|i| format!("{i},")).collect();
     assert_eq!(body["choices"][0]["message"]["content"], expected);
+}
+
+#[tokio::test]
+async fn an_unknown_model_is_not_found_whatever_the_request_asks_of_its_template() {
+    let engine = instant();
+    let app = app(&engine);
+    let tools =
+        json!([{"type": "function", "function": {"name": "f", "parameters": {"type": "object"}}}]);
+    for extra in [json!({"tools": tools}), json!({"reasoning_effort": "high"}), json!({})] {
+        let mut body: Value = serde_json::from_str(&chat_body(extra.clone())).unwrap();
+        body["model"] = json!("nope");
+        let (status, answer) = json(post(&app, CHAT, &body.to_string()).await).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{extra}: {answer}");
+        assert_eq!(answer["error"]["code"], "model_not_found", "{answer}");
+    }
+    assert!(engine.submitted().is_empty());
 }

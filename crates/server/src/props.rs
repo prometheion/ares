@@ -28,7 +28,7 @@ use axum::extract::{Request, State};
 use axum::response::{IntoResponse, Response};
 
 use crate::error::ApiError;
-use crate::models::Lease;
+use crate::models::{AcquireError, Lease};
 use crate::routes::{App, json_response, next_request_id, prepare, read_body};
 use crate::wire::{self, Endpoint, Fields};
 
@@ -41,10 +41,9 @@ pub(crate) async fn props(State(app): State<App>, request: Request) -> Response 
     }
 }
 
-/// The loaded model a request names, or the only one of the server, and its
-/// id. A model that is not loaded is not loaded for this.
-async fn loaded(app: &App, asked: Option<String>) -> Result<(Lease, String), ApiError> {
-    let name = match (asked, app.models.offered().as_deref()) {
+/// The name of the model a request names, or of the only one of the server.
+fn wanted(app: &App, asked: Option<String>) -> Result<String, ApiError> {
+    Ok(match (asked, app.models.offered().as_deref()) {
         (Some(name), _) => name,
         (None, Some([only])) => only.clone(),
         (None, None) => String::new(),
@@ -54,8 +53,19 @@ async fn loaded(app: &App, asked: Option<String>) -> Result<(Lease, String), Api
                 "several models are served: name one (model, or ?model=<id>)",
             ));
         }
-    };
+    })
+}
+
+/// The loaded model a request names, or the only one of the server, and its
+/// id. A model that is not loaded is not loaded for this.
+async fn loaded(app: &App, asked: Option<String>) -> Result<(Lease, String), ApiError> {
+    let name = wanted(app, asked)?;
     let lease = app.models.loaded(&name).await?;
+    named_lease(lease, name)
+}
+
+/// The id of the model of `lease`, which a request named `name`.
+fn named_lease(lease: Lease, name: String) -> Result<(Lease, String), ApiError> {
     let id = match lease.id() {
         Some(id) => id.to_owned(),
         None if !name.is_empty() => name,
@@ -72,13 +82,36 @@ async fn loaded(app: &App, asked: Option<String>) -> Result<(Lease, String), Api
 }
 
 async fn describe(app: &App, asked: Option<String>) -> Result<serde_json::Value, ApiError> {
-    let (lease, id) = loaded(app, asked).await?;
+    let name = wanted(app, asked)?;
+    let lease = match app.models.loaded(&name).await {
+        Ok(lease) => lease,
+        Err(AcquireError::NotLoaded { model }) => return unloaded(app, &model).await,
+        Err(error) => return Err(error.into()),
+    };
+    let (lease, id) = named_lease(lease, name)?;
     let engine = lease.engine();
     let card = engine.models().into_iter().find(|card| card.id == id);
-    let format = engine.chat_format(&id);
-    let thinking = format.as_ref().and_then(|format| format.thinking.as_ref());
-    let tools = format.as_ref().is_some_and(|format| format.tools.is_some());
-    let defaults = lease.defaults();
+    let mut body = body_of(&id, lease.defaults(), engine.chat_format(&id).as_ref());
+    body["loaded"] = true.into();
+    if let Some(card) = &card {
+        body["context_length"] = card.context_length.into();
+        body["default_generation_settings"]["n_ctx"] = card.context_length.into();
+    }
+    if let Some(template) = engine.chat_template(&id) {
+        body["chat_template"] = template.into();
+    }
+    Ok(body)
+}
+
+/// The members of `/props` that the model's defaults and what its template
+/// declares give, loaded or not.
+fn body_of(
+    id: &str,
+    defaults: &crate::defaults::Defaults,
+    format: Option<&ares_api::ChatFormat>,
+) -> serde_json::Value {
+    let thinking = format.and_then(|format| format.thinking.as_ref());
+    let tools = format.is_some_and(|format| format.tools.is_some());
     let mut params = defaults.fields();
     if let Some(limit) = defaults.max_tokens_limit {
         params["max_tokens_limit"] = limit.into();
@@ -97,18 +130,35 @@ async fn describe(app: &App, asked: Option<String>) -> Result<serde_json::Value,
             "thinks_by_default": thinking.is_some_and(|t| t.on_by_default),
         },
     });
-    if let Some(card) = &card {
-        body["context_length"] = card.context_length.into();
-        body["default_generation_settings"]["n_ctx"] = card.context_length.into();
-    }
-    if let Some(template) = engine.chat_template(&id) {
-        body["chat_template"] = template.into();
-    }
     if let Some(thinking) = thinking {
         body["reasoning"] = serde_json::json!({
             "start": thinking.start_tag(),
             "end": thinking.end_tag(),
         });
+    }
+    body
+}
+
+/// What `/props` says of a model that is not loaded, read from its preset and
+/// its file without loading it: the same members as for a loaded model, with
+/// `"loaded": false`, and as `context_length` the context its preset names or
+/// else the longest its file declares (a load decides what fits).
+async fn unloaded(app: &App, name: &str) -> Result<serde_json::Value, ApiError> {
+    let preset = app.models.preset(name).ok_or_else(|| ApiError::not_found(name))?;
+    let options = preset.options.load.clone();
+    let described = tokio::task::spawn_blocking(move || crate::load::read_described(&options))
+        .await
+        .map_err(|e| ApiError::internal(format!("the description was lost: {e}")))?
+        .map_err(|e| ApiError::internal(format!("model {}: {e}", preset.id)))?;
+    let defaults = &preset.options.defaults;
+    let mut body = body_of(&preset.id, defaults, Some(&described.format));
+    body["loaded"] = false.into();
+    if let Some(context) = described.context_length {
+        body["context_length"] = context.into();
+        body["default_generation_settings"]["n_ctx"] = context.into();
+    }
+    if let Some(template) = described.chat_template {
+        body["chat_template"] = template.into();
     }
     Ok(body)
 }
