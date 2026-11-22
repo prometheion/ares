@@ -5185,6 +5185,16 @@ in VRAM and 13.7 ms from RAM (220 ms a step of 16 layers), 262 144 cells 2.2
 and 109 ms (1.74 s a step), so its K and V beyond VRAM are not built: its heads
 move to the second card first (`devices/roles`), and with `q4` two cards hold
 482 707 tokens.
+On the development machine's cards (the same bench, 2026-11-22, load 12 to
+16): the RTX 4070 on PCIe 4.0 x16 (19 to 25 GB/s) reads Flash-Next's picked
+cells from RAM in 126 to 147 us a layer (34 to 36 in VRAM, 1.5 to 1.8 ms a
+step), the RTX 3060 on PCIe 3.0 x4 (3.3 GB/s) in 850 us (10.2 ms a step);
+the 27B's dense layers at 32 768 cells take 104.5 ms a step on the 4070 and
+435 ms on the 3060 from RAM, so with the attention split (three quarters of
+the heads on the 3060) every 1000 cells beyond VRAM would cost about 8 ms a
+token. With two cards on every layer Flash-Next's attention is the mixer's.
+The made-up model's test (`k_and_v_beyond_vram_change_no_token`) passes on
+one card, by layers (a far pool per part) and with both cards on every layer.
 
 **The RAM.** The tier of experts is a user of the one RAM limit (`--ram`,
 `PinnedRam`): elastic, with a priority above the checkpoints, so the limit
