@@ -397,8 +397,8 @@ impl Misses {
                 self.cpu_picks.push(WidePick { expert: *expert, rows: Vec::new() });
             }
         }
-        let total = counts.iter().sum::<u32>() as usize;
-        let top_k = (total / self.rows.max(1) as usize).max(1);
+        let top_k = feed.layout().shapes[self.at].top_k as usize;
+        let total = top_k * self.rows as usize;
         let ids = &record[16..16 + 4 * total];
         let weights = &record[16 + 4 * total..16 + 8 * total];
         for (p, (id, weight)) in
