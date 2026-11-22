@@ -99,7 +99,7 @@ use ares_weights::{
 pub use device::{CudaSlots, HostShareState, HostSlots, SlotDevice};
 use elastic::{Layout, Pieces};
 pub use fill::{FillOrder, FillPace, FillStats, FillTier, TierFill};
-pub use hybrid::{CostModel, ExpertTypes, Miss, PromoteRule, Serve};
+pub use hybrid::{CostModel, ExpertTypes, Miss, PromoteRule, Serve, WideCpu, WidePick};
 pub use near::{ExpertNeighbours, NEAR_FORMAT, Near};
 pub use profile::{ExpertProfile, Ignored, PROFILE_FORMAT, ProfileKey};
 pub use region::{HostRegion, Locker, PIECE, Released};

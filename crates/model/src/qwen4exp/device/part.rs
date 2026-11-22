@@ -144,6 +144,11 @@ pub struct Options {
     /// (`blocks/head.rs`): row `r` is token `head_order[r]`, and the logits
     /// come in that order. `None`: row `r` is token `r`.
     pub head_order: Option<Arc<[u32]>>,
+    /// The most rows of a wide step in which the CPU computes experts that the step misses
+    /// and that few rows picked (`wide.rs`); a wider step brings every miss through transit.
+    /// The part keeps the buffers for it: the sums on the device, and the rows' activations
+    /// and the sums in page-locked memory.
+    pub cpu_rows: u32,
 }
 
 impl Default for Options {
@@ -166,6 +171,7 @@ impl Default for Options {
             prune: None,
             predict: 2,
             head_order: None,
+            cpu_rows: wide::CPU_ROWS,
         }
     }
 }
@@ -496,6 +502,9 @@ struct Scratch {
     plan_rows: u64,
     hidden_rows: u64,
     experts_f16: u64,
+    /// The sums of the experts the CPU computed for rows of a wide step, f32, for steps
+    /// of up to [`Options::cpu_rows`] rows ([`wide`]).
+    cpu_sums: u64,
     len: u64,
 }
 
@@ -579,6 +588,10 @@ pub(crate) struct Frame {
     wide_logits_bytes: u64,
     wide_record_bytes: u64,
     wide_ids_bytes: u64,
+    /// Page-locked bytes for the CPU's part of a wide step: the rows' activations the CPU
+    /// reads and the sums it gives back, for steps of up to [`Options::cpu_rows`] rows; 0
+    /// without wide steps.
+    wide_cpu_host: u64,
 }
 
 fn invalid(message: impl Into<String>) -> ModelError {
@@ -859,6 +872,7 @@ impl Frame {
             s.plan_rows = take(wide::plan_bytes(&expert_shape, opts.max_rows));
             s.hidden_rows = take(expert_shape.rows_hidden_bytes(opts.max_rows));
             s.experts_f16 = take(expert_shape.rows_activation_bytes(opts.max_rows));
+            s.cpu_sums = take(u64::from(opts.cpu_rows.min(opts.max_rows)) * n * 4);
         }
         s.len = len;
 
@@ -953,6 +967,11 @@ impl Frame {
             wide_ids_bytes: wide_ahead
                 * (4 * u64::from(expert_shape.top_k) * u64::from(opts.max_rows))
                     .next_multiple_of(64),
+            wide_cpu_host: if opts.max_rows > MAX_BATCH {
+                wide::cpu_host_bytes(n, opts.cpu_rows.min(opts.max_rows))
+            } else {
+                0
+            },
         })
     }
 
@@ -1020,6 +1039,7 @@ impl Frame {
             + self.inbox.host_len
             + self.tables_bytes(opts)
             + self.exact_host
+            + self.wide_cpu_host
             + 16
     }
 

@@ -1083,6 +1083,97 @@ fn experts_computed_on_the_cpu_change_nothing() {
     }
 }
 
+/// The misses of a wide step on the CPU (`hybrid/wide.rs` of the store): the experts few
+/// rows of a slice of a prompt picked are computed from their RAM slots in the decode
+/// steps' arithmetic (8-bit activations) instead of brought through transit and computed in
+/// f16 on the device. Every layer, fed the residual of a run with every expert in its slot
+/// (in wide steps too), gives what that run gives within the rounding of the 8-bit
+/// activations; the core reads the same residual and gives the same bits.
+#[test]
+fn experts_a_wide_step_misses_computed_on_the_cpu_change_nothing() {
+    let Some(devices) = devices() else { return };
+    let synthetic = model_of(31, GgmlType::Q2_0);
+    let (gate_ty, down_ty) = (GgmlType::IQ2_S, GgmlType::Q2_0);
+    let gguf = open("fed-wide", &synthetic.bytes_with_experts(gate_ty, down_ty));
+    let c = Config::from_gguf(&gguf).unwrap();
+    let w = Weights::load(&gguf, &c).unwrap();
+    let text = synthetic.shape.tokens(56, 29);
+    let wide_rows = |mut opts: SessionOptions| {
+        opts.part.max_rows = 64;
+        opts
+    };
+    let mut whole = Session::open(
+        &gguf,
+        &c,
+        &w,
+        devices.clone(),
+        wide_rows(options(devices.len(), c.n_layer, CacheFormat::Q8)),
+    )
+    .unwrap();
+    let n_expert = c.experts.count as u32;
+    whole.fill(&mut |_| (0..n_expert).collect()).unwrap();
+    let shape = ExpertShape {
+        n_embd: c.n_embd as u32,
+        n_ff: c.experts.ff as u32,
+        n_experts: c.experts.count as u32,
+        top_k: c.experts.used as u32,
+        gate_ty,
+        down_ty,
+    };
+    let slots = c.experts.used * 8;
+    let layers_per_device = layers_per_device(c.n_layer, devices.len());
+    for serve in [Serve::Cpu, Serve::Measured] {
+        let opts = SessionOptions {
+            slot_bytes: Some((slots * layers_per_device) as u64 * shape.slot_bytes().unwrap()),
+            serve,
+            ..wide_rows(options(devices.len(), c.n_layer, CacheFormat::Q8))
+        };
+        let mut missing = Session::open(&gguf, &c, &w, devices.to_vec(), opts).unwrap();
+        missing.fill(&mut |_| (0..n_expert).collect()).unwrap();
+        missing.take_store_stats();
+        let (n, wide) = (c.n_embd, c.wide());
+        let mut worst = [0.0f64; 3];
+        // Two wide steps of 25 rows, then one of six (the decode kernels).
+        for tokens in text[..50].chunks(25).chain(text[50..].chunks(6)) {
+            let rows = [Rows { slot: 0, tokens, direct: true, wanted: Wanted::None }];
+            let mut theirs = Kept::default();
+            whole.step_probed(&rows, &mut theirs).unwrap();
+            let mut first = vec![0.0f32; tokens.len() * wide];
+            for (row, &token) in tokens.iter().enumerate() {
+                for stream in first[row * wide..(row + 1) * wide].chunks_exact_mut(n) {
+                    w.token_embd.decode_row(token as usize, stream);
+                }
+            }
+            let mut fed = Fed { first: &first, theirs: &theirs, n, wide, worst };
+            missing.step_probed(&rows, &mut fed).unwrap();
+            worst = fed.worst;
+        }
+        let stats = missing.take_store_stats();
+        let wide_stats = missing.take_wide_stats();
+        eprintln!(
+            "  {} device(s), {serve:?}: {} of {} picks of wide steps had no slot, {} of them \
+             computed on the CPU ({} pairs); a layer's rows differ from the run without misses \
+             by at most {:.2e} (experts), {:.2e} (core), {:.2e} (residual), relative RMS",
+            devices.len(),
+            wide_stats.missing,
+            wide_stats.picked,
+            wide_stats.cpu_experts,
+            wide_stats.cpu_pairs,
+            worst[0],
+            worst[1],
+            worst[2],
+        );
+        assert!(wide_stats.missing > 100, "the wide steps were to miss experts");
+        if serve == Serve::Cpu {
+            assert!(wide_stats.cpu_experts > 0, "the CPU took the misses it could");
+            assert!(stats.cpu_experts >= wide_stats.cpu_experts);
+        }
+        assert_eq!(worst[1], 0.0, "{serve:?}: the core reads the same residual");
+        assert!(worst[0] < 2e-2, "{serve:?}: experts {:.2e}", worst[0]);
+        assert!(worst[2] < 2e-2, "{serve:?}: residual {:.2e}", worst[2]);
+    }
+}
+
 /// Feeds every layer the reference's input and compares what its experts give row by row.
 ///
 /// A row is compared when its experts read what the reference's read and are the

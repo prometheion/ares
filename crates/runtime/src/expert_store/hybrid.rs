@@ -42,6 +42,10 @@ use ares_weights::{SPARE_WORTH, Start, Swap, Want};
 use super::cpu::{CpuExpert, CpuPool, LayerJob, MAX_ROWS, act_bytes};
 use super::{DeviceOp, ExpertStore, Phase, SlotDevice, Source, StoreError, Wanted};
 
+mod wide;
+
+pub use wide::{WideCpu, WidePick};
+
 /// How the store serves an expert a step needs that is in no slot.
 ///
 /// The engine runs [`Serve::Measured`]. The other two exist to measure it
@@ -114,13 +118,44 @@ pub struct CostModel {
     /// layer's experts and by size class, from the creation of the job to its
     /// last task. An entry per pair of types that was timed.
     cpu: Vec<(ExpertTypes, [Mean; SIZES])>,
+    /// Seconds per pair of the CPU's part of a layer of a wide step, by the
+    /// types of the layer's experts: from the creation of its first job to
+    /// the end of its last (`hybrid/wide.rs`).
+    wide: Vec<(ExpertTypes, Mean)>,
     /// Seconds one expert takes on a device's upload stream.
     upload: Vec<Mean>,
 }
 
 impl CostModel {
     pub(super) fn new(devices: usize) -> Self {
-        Self { cpu: Vec::new(), upload: vec![Mean::default(); devices] }
+        Self { cpu: Vec::new(), wide: Vec::new(), upload: vec![Mean::default(); devices] }
+    }
+
+    /// The CPU's part of a layer of a wide step, `pairs` pairs of a layer
+    /// whose experts have the types `types`, took `time`.
+    pub fn record_wide(&mut self, types: ExpertTypes, pairs: usize, time: Duration) {
+        if pairs == 0 {
+            return;
+        }
+        let at = self.wide.iter().position(|(t, _)| *t == types).unwrap_or_else(|| {
+            self.wide.push((types, Mean::default()));
+            self.wide.len() - 1
+        });
+        self.wide[at].1.add(time.as_secs_f64() / pairs as f64);
+    }
+
+    /// The expected time of the CPU's part of a layer of a wide step of
+    /// `pairs` pairs. Before one was timed: as long as that many jobs of one
+    /// pair each, the dearest pairs the CPU has; `None` before those were.
+    pub fn wide_time(&self, types: ExpertTypes, pairs: usize) -> Option<f64> {
+        let per_pair = match self.wide.iter().find(|(t, _)| *t == types) {
+            Some((_, mean)) => mean.get(),
+            None => None,
+        };
+        match per_pair {
+            Some(per_pair) => Some(per_pair * pairs as f64),
+            None => Some(self.job_time(types, 1)? * pairs as f64),
+        }
     }
 
     /// A CPU job of `pairs` pairs of a layer whose experts have the types
@@ -184,6 +219,18 @@ impl CostModel {
         misses: &[Miss],
         queued: usize,
     ) -> Vec<bool> {
+        self.split_by(|pairs| self.job_time(types, pairs), device, misses, queued)
+    }
+
+    /// [`CostModel::split`] with the CPU's time for a number of pairs given
+    /// by `cpu_time` (`None`: never timed).
+    pub fn split_by(
+        &self,
+        cpu_time: impl Fn(usize) -> Option<f64>,
+        device: usize,
+        misses: &[Miss],
+        queued: usize,
+    ) -> Vec<bool> {
         let mut on_cpu = vec![true; misses.len()];
         let mut order: Vec<usize> = (0..misses.len()).filter(|i| !misses[*i].cpu_only).collect();
         order.sort_by(|a, b| {
@@ -200,7 +247,7 @@ impl CostModel {
             }
             return on_cpu;
         };
-        if self.job_time(types, 1).is_none() {
+        if cpu_time(1).is_none() {
             // The CPU was never timed for these types: it gets one expert, the
             // one that costs it least, and the link the rest.
             let cheapest = order.last().copied();
@@ -210,7 +257,7 @@ impl CostModel {
             return on_cpu;
         }
         let end = |on_cpu: &[bool], uploads: usize| -> f64 {
-            let cpu = self.job_time(types, pairs(on_cpu)).unwrap_or(0.0);
+            let cpu = cpu_time(pairs(on_cpu)).unwrap_or(0.0);
             let link = if uploads == 0 { 0.0 } else { (queued + uploads) as f64 * upload };
             cpu.max(link)
         };

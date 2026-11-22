@@ -35,6 +35,18 @@ use super::*;
 /// Address tables alive at once: the round being computed and the one prepared next.
 pub(super) const ROUNDS: u64 = 2;
 
+/// The most rows of a wide step in which the CPU may compute misses, by default
+/// ([`Options::cpu_rows`]). The CPU takes experts that few rows picked; in a step of more
+/// rows than this few experts are, and the buffers grow with the rows.
+pub(crate) const CPU_ROWS: u32 = 2048;
+
+/// Page-locked bytes for the CPU's part of wide steps of up to `rows` rows of `n` values:
+/// the rows' activations as the CPU reads them (int8 codes and their scales) and their sums.
+pub(super) fn cpu_host_bytes(n: u64, rows: u32) -> u64 {
+    let act = ares_runtime::expert_store::cpu::act_bytes(n as usize, rows as usize) as u64;
+    act.next_multiple_of(64) + u64::from(rows) * n * 4
+}
+
 /// Bytes of the record of a wide step: a header, then the ids and the weights of the picks.
 /// It is what the router leaves on the device and what reaches the host.
 pub(super) fn record_bytes(shape: &ExpertShape, rows: u32) -> u64 {
@@ -87,6 +99,19 @@ pub(super) struct State {
     /// its chunks.
     fork: Event,
     joins: Vec<Event>,
+    /// The CPU's part of wide steps of up to `cpu_rows` rows (0: none): the mixed input of
+    /// a layer's rows as the CPU reads it, copied when the layer is enqueued, and the sums
+    /// the host gives back, in page-locked memory; the events behind the copies.
+    cpu_rows: u32,
+    host_act: PinnedBuffer,
+    host_sums: PinnedBuffer,
+    act_ready: Event,
+    act_copied: Event,
+    sums_copied: Event,
+    /// A copy of the mixed input was enqueued for the layer being computed, and sums were
+    /// copied since the host last wrote them.
+    act_pending: bool,
+    sums_pending: bool,
 }
 
 /// Streams the chunks of a float product are spread over.
@@ -185,7 +210,17 @@ impl State {
             w.layers.iter().filter_map(|l| l.mixers.map(|(attn, _)| attn.down.n_in)).max();
         let float_width =
             float_width(streams.is_some(), u64::from(streams.unwrap_or(0)), u64::from(n));
+        let cpu_rows = opts.cpu_rows.min(opts.max_rows);
+        let act_bytes = ares_runtime::expert_store::cpu::act_bytes(n as usize, cpu_rows as usize);
         Ok(Self {
+            cpu_rows,
+            host_act: PinnedBuffer::new(device, act_bytes.max(16))?,
+            host_sums: PinnedBuffer::new(device, (cpu_rows as usize * n as usize * 4).max(16))?,
+            act_ready: Event::new(device)?,
+            act_copied: Event::new(device)?,
+            sums_copied: Event::new(device)?,
+            act_pending: false,
+            sums_pending: false,
             kernels: rows,
             precision,
             form,
@@ -406,6 +441,7 @@ impl Part {
         // input is the fused read's.
         unsafe {
             self.prepare_mixed(stream, rows)?;
+            self.copy_cpu_act(stream, rows)?;
             if self.role == Role::Worker {
                 // The mixer routes. The worker's output starts from zeros (its exchange
                 // cleared it) and the shared expert's is sent on its own, with the gate.
@@ -455,6 +491,99 @@ impl Part {
             }
         }
         self.mark(stream, Phase::Dense)
+    }
+
+    /// Copies the mixed input of a wide step's rows as the CPU reads it (the int8 codes and
+    /// their scales) to page-locked memory, on the side stream behind what wrote it: the
+    /// host reads it once the layer's misses are known ([`Part::cpu_act`]). Nothing for a
+    /// step of more rows than the CPU takes part in.
+    ///
+    /// # Safety
+    ///
+    /// The mixed input of the step's rows must be at `m` in scratch, written by what is
+    /// enqueued on `stream` so far.
+    unsafe fn copy_cpu_act(&mut self, stream: &Stream, rows: u32) -> Result<(), ModelError> {
+        let m = self.at(self.f.s.m);
+        let n = self.n as usize;
+        let wide = self.wide_state.as_mut().ok_or_else(|| invalid("no wide state"))?;
+        wide.act_pending = false;
+        if rows > wide.cpu_rows {
+            return Ok(());
+        }
+        let bytes = ares_runtime::expert_store::cpu::act_bytes(n, rows as usize);
+        wide.act_ready.record(stream)?;
+        self.side.wait_event(&wide.act_ready)?;
+        // SAFETY: the buffer holds the codes and scales of `cpu_rows` rows; the host reads
+        // it only between `act_copied` and the next layer's copy, which is enqueued after
+        // the host is done with this layer.
+        unsafe { self.side.copy_to_host(wide.host_act.as_mut_ptr(), m, bytes)? };
+        wide.act_copied.record(&self.side)?;
+        wide.act_pending = true;
+        Ok(())
+    }
+
+    /// Whether the CPU may compute experts of the layer of the wide step being computed:
+    /// the step has few enough rows, and the rows' mixed input is being copied for it.
+    pub fn cpu_takes_part(&self) -> bool {
+        self.wide_state.as_ref().is_some_and(|w| w.act_pending)
+    }
+
+    /// The mixed input of the `rows` rows of the layer being computed as the CPU reads it
+    /// (`ares_runtime::expert_store::cpu::act_bytes`), once its copy has arrived; `None`
+    /// while it is on its way.
+    pub fn cpu_act(&self, rows: u32) -> Result<Option<&[u8]>, ModelError> {
+        let wide = self.wide_state.as_ref().ok_or_else(|| invalid("no wide state"))?;
+        if !wide.act_pending || rows > wide.cpu_rows {
+            return Err(invalid("no copy of the mixed input for the CPU"));
+        }
+        if !wide.act_copied.is_done()? {
+            return Ok(None);
+        }
+        let bytes = ares_runtime::expert_store::cpu::act_bytes(self.n as usize, rows as usize);
+        // SAFETY: the copy has run, nothing writes the buffer before the next layer is
+        // enqueued, and it holds `bytes`.
+        Ok(Some(unsafe { std::slice::from_raw_parts(wide.host_act.as_ptr(), bytes) }))
+    }
+
+    /// Adds `sums`, what the CPU computed for the rows from `first` on of the wide step (a
+    /// whole number of rows), to the output of the layer being computed, behind the rounds
+    /// enqueued so far. `Ok(false)`: the sums of a layer before are still on their way
+    /// from page-locked memory; ask again.
+    pub fn add_cpu_sums(
+        &mut self,
+        env: &StepEnv<'_>,
+        first: u32,
+        sums: &[f32],
+    ) -> Result<bool, ModelError> {
+        let stream = env.stream;
+        let s = self.f.s;
+        let n = self.n as usize;
+        let (out, device_sums) = (self.at(s.out), self.at(s.cpu_sums));
+        let rows = env.record.dims().n_rows as usize;
+        let wide = self.wide_state.as_mut().ok_or_else(|| invalid("no wide state"))?;
+        if wide.sums_pending && !wide.sums_copied.is_done()? {
+            return Ok(false);
+        }
+        let values = sums.len();
+        if !values.is_multiple_of(n)
+            || values > wide.cpu_rows as usize * n
+            || first as usize + values / n > rows
+        {
+            return Err(invalid(format!("{values} sums from row {first} of {rows}")));
+        }
+        let out = out.offset(u64::from(first) * n as u64 * 4);
+        // SAFETY: the page-locked buffer and the device's hold `cpu_rows` rows, and the copy
+        // that read the page-locked one before has run; the output holds the step's rows.
+        unsafe {
+            let host = wide.host_sums.as_mut_ptr();
+            std::ptr::copy_nonoverlapping(sums.as_ptr().cast::<u8>(), host, values * 4);
+            stream.copy_from_host(device_sums, host, values * 4)?;
+            wide.sums_copied.record(stream)?;
+            self.kernels.add_f32(stream, out, device_sums, values as u32)?;
+        }
+        wide.sums_pending = true;
+        self.mark(stream, Phase::Experts)?;
+        Ok(true)
     }
 
     /// The address of slot `slot` of the pool of layer `i`'s experts.
