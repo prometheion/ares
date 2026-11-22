@@ -1617,7 +1617,7 @@ pub(crate) fn model_list(models: &[crate::models::Listed]) -> serde_json::Value 
 /// The body of `GET /metrics`.
 pub(crate) fn metrics(stats: &ares_api::EngineStats) -> String {
     let (ram, ssd) = (&stats.ram, &stats.ssd);
-    let rows: [(&str, &str, &str, u64); 58] = [
+    let rows: [(&str, &str, &str, u64); 61] = [
         (
             "cache_ram_pages",
             "gauge",
@@ -1850,6 +1850,24 @@ pub(crate) fn metrics(stats: &ares_api::EngineStats) -> String {
             "counter",
             "Bytes of experts read from the model file",
             stats.experts.read_bytes,
+        ),
+        (
+            "expert_reads_total",
+            "counter",
+            "Experts read from the model file, every kind of read",
+            stats.experts.reads,
+        ),
+        (
+            "expert_demand_reads_total",
+            "counter",
+            "Experts read from the model file into the RAM tier that a step waited for",
+            stats.experts.demand_reads,
+        ),
+        (
+            "expert_demand_read_microseconds_total",
+            "counter",
+            "Time the reads a step waited for took from their start to the bytes in RAM, summed",
+            stats.experts.demand_read_us,
         ),
         (
             "expert_wait_microseconds_total",

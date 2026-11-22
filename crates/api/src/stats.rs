@@ -22,6 +22,15 @@ pub struct ExpertStats {
     pub uploads: u64,
     /// Bytes read from the model file for experts.
     pub read_bytes: u64,
+    /// Experts read from the model file (each its matrices, one read of the drive each),
+    /// all kinds together: reads a step waited for, guesses, reads ahead and the reads of
+    /// wide steps into staging.
+    pub reads: u64,
+    /// Of them, the reads into the RAM tier that a step of up to eight rows waited for, and
+    /// the microseconds those took from their start to the bytes being in RAM, summed over
+    /// the reads (a wide step's reads into staging are not among them).
+    pub demand_reads: u64,
+    pub demand_read_us: u64,
     /// Microseconds layers waited for what they missed, summed over layers.
     pub wait_us: u64,
     /// The read-ahead of predicted picks: experts the routers of later layers, applied

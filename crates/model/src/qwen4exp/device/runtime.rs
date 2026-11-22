@@ -1260,6 +1260,12 @@ impl Qwen4Exp {
         totals.uploads += stats.uploads + stats.transit_uploads;
         totals.read_bytes +=
             stats.demand_read_bytes + stats.guess_read_bytes + stats.transit_read_bytes;
+        totals.reads += stats.demand_reads
+            + stats.guess_reads
+            + stats.transit_reads
+            + stats.transit_ahead_reads;
+        totals.demand_reads += stats.demand_reads;
+        totals.demand_read_us += (stats.demand_read_ms * 1e3) as u64;
         totals.wait_us += (stats.wait_ms * 1e3) as u64;
         totals.predicted += stats.predicted;
         totals.predicted_picked += stats.predicted_picked;
