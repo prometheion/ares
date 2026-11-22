@@ -1301,7 +1301,7 @@ Qwen4 handover map as follows.
 | Handover item | In this engine |
 | --- | --- |
 | Sparse attention on index lists (the indexer's selection should be what attention reads, not a mask over all cells) | Attention reads through an id list and the page table by design. The page size is a multiple of the indexer block, and the pooled key of a block is a per-page part of the layout. The selection and attention kernels come with the model. |
-| Sparse KV offload (K/V in pinned RAM, keys and a page cache on the GPU, fetch only missing selected pages) | Pages are the unit of residency. The selection needs only the pooled keys on the GPU (1.5 KB per token for `qwen4exp`), so K/V pages can live in pinned RAM behind a VRAM page cache. The residency layer is the next piece of `ares-state`. |
+| Sparse KV offload (K/V in pinned RAM, keys and a page cache on the GPU, fetch only missing selected pages) | Built for `qwen4exp` (2026-11-22, "K and V beyond VRAM"): the pooled keys of every page stay on the GPU, the K and V of the first pages too, those of the rest lie in page-locked RAM and the attention reads the picked cells there over the link; a wide step reads a copy of a layer's far entries in lent VRAM. No page cache: a page is near or far by its number. |
 | Ragged one-pass verification (drafts of unequal length in one batch) | `plan` puts windows of any lengths in one step. Recurrent kernels take per-sequence segments from the step record. |
 | Graph cache for batch shapes | Not needed: there is no per-shape graph. |
 | Adaptive draft length | `choose` maximises expected tokens per millisecond of the whole step from measured acceptance per position (or the n-gram drafter's confidence) and the measured price of a step by its rows. The same number chooses between drafters and accounts for the rows a draft costs other sequences. |
@@ -4665,7 +4665,9 @@ full-width wide step that warmed up, since replaced by one of sixteen rows); the
 parts, uploads its dense weights (3.4 GiB on the mixer) and runs a wide step of 512 rows.
 
 The model's own context (262 144 cells, what the plan serves without
-`--context` since 2026-11-22) costs a fifth of the VRAM slots: its K/V and
+`--context` since 2026-11-22) cost a fifth of the VRAM slots until its K and
+V overflowed into RAM (see "K and V beyond VRAM"; now the keys and a
+thirty-second of the room stay in VRAM): its K/V and
 indexer keys take 13.92 MiB per 1000 cells, 3.56 GiB, all on the card that
 mixes when both cards work on every layer (the 4070 keeps 2976 of its 5712
 slots in FT, 2688 of 5424 in FX) and half on each by layers. The same runs

@@ -50,11 +50,15 @@ section further down.
 4. Done 2026-11-22 (`server/flash-api`): tools, structured output and the Messages and Responses
    routes on the real Flash-Next, and Claude Code itself against Ares on both models ("Server and API").
 5. [x] Flash-Next's draft vocabulary (step 6 of the shared layer).
-6. K/V of a running sequence beyond VRAM for Flash-Next at long contexts (whole features). The
+6. [x] K/V of a running sequence beyond VRAM for Flash-Next at long contexts (whole features). The
    owner's rule for the context (2026-11-22): without `--context` the model's own maximum (262144
-   for Qwen3.8) on both models; what does not fit in VRAM overflows into RAM. Until the overflow
-   exists, the most that fits, with a log line. On the 27B the attention heads move to the second
-   card as far as the context needs (built on `devices/roles`).
+   for Qwen3.8) on both models; what does not fit in VRAM overflows into RAM. On the 27B the
+   attention heads move to the second card as far as the context needs (built on `devices/roles`).
+   Built 2026-11-22 for Flash-Next (branch `kv/overflow`, "K and V beyond VRAM" in
+   `ARCHITECTURE.md`): the indexer's keys of every page and the K and V of the first pages (a
+   thirty-second of the room for slots) in VRAM, the rest in page-locked RAM read over the link.
+   The 27B's is not built: measured, its dense layers read every cell over the link (220 ms a step
+   at 32k cells on a x4 link), see "Qwen3.8 27B".
 7. [x] Priorities of requests (server). Done 2026-11-22 (branch `server/priorities`): measured on
    the test machine, a request of priority 0 next to busy requests of priority 5 has its first
    token in 21 ms where one of priority 5 waits 382 ms to 10 s (see "Priorities of requests" in
@@ -284,8 +288,9 @@ Strata kept 0.1.65, which the comparisons use until a newer engine starts there.
       wide step) asks only "hotter than the coldest member" (with the swap margin when the member
       has to be copied down), not the rule of a promotion; left as it was for the work on prompt
       chunks that borrow expert slots.
-- [ ] The default context on that card is 23,552 tokens ("a thirty-second of the expert room"):
-      too small for a 32k prompt; the rule needs a floor or the owner's choice.
+- [x] The default context on that card is 23,552 tokens ("a thirty-second of the expert room"):
+      too small for a 32k prompt. Since 2026-11-22 (`kv/overflow`) it is the model's 262 144, the
+      K and V beyond 28 544 tokens in RAM on that card.
 
 ### Defect seen on the local cards (2026-11-22, `flash/ssd-stream`)
 - [ ] `qwen4exp_runtime` `the_mtp_block_follows_wide_steps_that_start_at_any_cell` fails on the
@@ -773,10 +778,11 @@ Flash-Next); experts that do not fit in VRAM in RAM; K/V in int8. Its README giv
       share chosen today from read times. Proposed: the plan measures at load a wide and a decode
       step with and without the dense share and keeps the faster; goes to the owner first (it is
       the card-roles design), not built.
-- [ ] Flash-Next served with the model's own context (262 144 cells, the default since
+- [x] Flash-Next served with the model's own context (262 144 cells, the default since
       2026-11-22) gives up a fifth of the VRAM slots (3.56 GiB of K/V and keys, all on the mixing
-      card): decode 11 to 22 % slower, warm prompts half as fast. K/V beyond VRAM in RAM (below)
-      would let the slots stay.
+      card): decode 11 to 22 % slower, warm prompts half as fast. Since `kv/overflow` the context
+      takes its keys and a thirty-second of the room in VRAM (743 MiB on the test machine's card)
+      and the rest of its K and V in RAM.
 - [ ] Drafters on the second card: not built. A chain that runs on the slower card is slower by
       what that card is slower, and nothing runs beside it in a step that only drafts; it pays
       only with a pipeline that drafts the next window while the main card verifies this one
@@ -1062,11 +1068,28 @@ DSpark drafter `dspark-Inkling-2-Mini-Q8_0.gguf`, 0.4 GB). Notes: `/var/tmp/ares
       and opens only the tested classes, Ampere (8.6) and Ada (8.9) (`cuda/tested-archs`); Turing,
       Pascal, Hopper, data-centre Blackwell, Jetson and every other GPU are to run through the
       Vulkan backend once it runs models. What was not tuned on CUDA goes there too.
-- [ ] K/V of a running sequence beyond VRAM (P16; an exception, low priority). The owner,
-      2026-11-22: without `--context` a model gets its own context always, and what of it does not
-      fit in VRAM overflows into RAM. The plan says what was wanted and what of it is in VRAM
-      (`plan::ContextPlan { wanted, in_vram }`); until the overflow is built the context is what
-      VRAM holds, with a log line.
+- [x] K/V of a running sequence beyond VRAM (P16). The owner, 2026-11-22: without `--context` a
+      model gets its own context always, and what of it does not fit in VRAM overflows into RAM.
+      Built for Flash-Next (2026-11-22, `kv/overflow`; "K and V beyond VRAM" in `ARCHITECTURE.md`).
+      Open:
+  - [ ] The 27B: not built. Its 16 dense layers read every cell, so K and V in RAM cross the link
+        once per token: 5.4 ms per 1000 cells on the test machine's x4 link, about 1.4 ms on a x16
+        link (`far_attention_bench`); its context beyond VRAM would run at a few tokens per second.
+        Its heads move to the second card first, and with `q4` two cards hold 482 707 tokens.
+  - [ ] Pages a finished request leaves in the device pool (the prompt cache on the devices) keep
+        their far memory, booked as required, until the pool evicts them: the owner's question
+        below.
+  - [ ] Steps of the parts' own scratch (pieces of a prompt while another request waits) read the
+        far entries in place, row by row; only steps on lent VRAM read a copy. A copy in the own
+        scratch would cost VRAM for good (the far pool's share of one layer, 254 MiB at 262 144
+        cells).
+  - [ ] The RAM level of the prompt cache copies a far page when it leaves the devices; it could
+        take over the page's memory instead.
+  - [ ] The share of the room for K and V in VRAM (a thirty-second, `plan::NEAR_SHARE`) is the old
+        rule's, not measured against other shares.
+  - [ ] Two cards (a split by layers: a far pool per part; both cards on every layer: the mixer's)
+        were not run: `qwen4exp_runtime k_and_v_beyond_vram_change_no_token` covers them on a
+        machine with two cards.
 
 ## Weight types (`moe/q4-load`, 2026-11-17)
 Every tensor of both models takes every weight type the shape allows (the audit of every place
@@ -1124,8 +1147,11 @@ Measured per phase on a quiet machine against the fork and Strata, the largest f
       Prompts: the new prompt kernel (see "Against the owner's production") is bound by its
       instructions, not by K/V traffic (about 50 GB/s of the RTX 3060's 360 at 98k), so the order
       of reads is not its lever; wide windows (drafts) still run on the decode shapes.
-- [ ] VRAM on loan to the expert tier: K/V pages a conversation does not need yet (Strata's
-      `--kv-grow`), the MTP block's 675 MiB while a long prompt runs (gap study `/var/tmp/ares-survey/gap-study-2026-11-17.md`).
+- [ ] VRAM on loan to the expert tier: the MTP block's 675 MiB while a long prompt runs (gap
+      study `/var/tmp/ares-survey/gap-study-2026-11-17.md`). K/V pages a conversation does not
+      need yet (Strata's `--kv-grow`) need no loan since `kv/overflow`: the K and V of a context
+      take at most a thirty-second of the room for slots in VRAM, the rest lies in RAM and is
+      locked as sequences reach it.
 - [ ] Checkpoints of the recurrent state in int8 (SGLang's `mamba_checkpoint_pool.py`): a quarter
       of Flash-Next's 112 MiB, which matters because a full tier leaves one place; after a KL
       measurement (gap study `/var/tmp/ares-survey/gap-study-2026-11-17.md`).
