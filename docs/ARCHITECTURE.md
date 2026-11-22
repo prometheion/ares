@@ -5196,6 +5196,33 @@ token. With two cards on every layer Flash-Next's attention is the mixer's.
 The made-up model's test (`k_and_v_beyond_vram_change_no_token`) passes on
 one card, by layers (a far pool per part) and with both cards on every layer.
 
+*The real file, A/B* (2026-11-22, the test machine: IQ2_XS on the RTX 4060 Ti, PCIe 4.0 x4,
+`--ram 16G`, no `--context`, no drafters, every run from a fresh usage profile so that the
+warm-up fills the tiers alike; A is the build before, which serves the model's 262 144 cells
+all in VRAM, B this one; runs A1, B1, A2, B3, A3, B4, A4, B5 in that order at a load of 4 to
+19; B1 failed, see below). What the expert tier gets back: A's context took 3.57 GiB of the
+11.24 GiB for slots and left 5376 VRAM slots (21.9 % of the experts), B's takes 743 MiB (the
+keys of 2050 pages and the K and V of 225 pages, 28 544 tokens) and leaves 7440 (30.3 %), 38 %
+more; the RAM tier is the same (11 313 and 11 355 slots of 15.8 GiB).
+
+| | A (all in VRAM) | B (beyond 28 544 tokens in RAM) |
+| --- | --- | --- |
+| short chat (267 tokens), 128 tokens, first time | 15.7, 16.7, 17.1, 17.7 tokens/s | 20.3, 17.1, 19.5 |
+| the same again (from the prefix cache) | 28.1, 31.7, 29.0, 28.0 | 29.5, 24.9, 32.5 |
+| a prompt of 65 100 tokens | 258.8, 258.0, 259.7, 254.9 tokens/s | 555.3, 553.6, 554.6 |
+| 64 tokens right after it | 15.5, 14.2, 15.5, 9.4 tokens/s | 12.0, 11.6, 11.9 |
+| the prompt again (cached) and 192 tokens | 14.8, 9.4 | 16.1, 17.8 |
+
+The prompt reads 2.1 times as fast: with more slots its wide steps upload a third of the
+experts (268 000 against 806 000 in A4 and B5) and wait 76 s instead of 206. Decode with the
+tiers warm at 65 000 cells is as fast or faster (the far K and V cost at most 2.6 ms a token
+there by the bench), and at short contexts B is as fast or faster. The 64 tokens right after the
+long prompt are slower in B in all three runs (11.6 to 12.0 against 14.2 to 15.5 in three of
+four A runs); why is not known (measured next: the same build with `--context 66560`, all of it
+in VRAM, against the default). B1's long prompt failed at the first step past the pages in
+VRAM: the copy of a layer's far entries into the loan crossed from one locked piece to the next,
+which the driver refuses; fixed by copying a piece at a time.
+
 **The RAM.** The tier of experts is a user of the one RAM limit (`--ram`,
 `PinnedRam`): elastic, with a priority above the checkpoints, so the limit
 minus what the engine needs to run (the step buffers and the parts'
