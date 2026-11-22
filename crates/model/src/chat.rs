@@ -153,13 +153,15 @@ fn encode_prompt(
                         .map_err(|e| EngineError::InvalidRequest(format!("chat template: {e}")))
                 }
             };
+            let special = EncodeOptions { add_special: true, parse_special: true };
+            if !with_boundaries {
+                let tokens = tokenizer.encode(render(messages)?, special);
+                return Ok(EncodedPrompt { tokens, boundaries: Vec::new() });
+            }
             let text = render(messages.clone())?;
-            let tokens =
-                tokenizer.encode(&text, EncodeOptions { add_special: true, parse_special: true });
-            let boundaries = match with_boundaries {
-                true => boundaries(tokenizer, &messages, *continue_final, &text, &tokens, render),
-                false => Vec::new(),
-            };
+            let tokens = tokenizer.encode(&text, special);
+            let boundaries =
+                boundaries(tokenizer, &messages, *continue_final, &text, &tokens, render);
             Ok(EncodedPrompt { tokens, boundaries })
         }
     }
