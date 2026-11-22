@@ -25,8 +25,8 @@ section further down.
    costs only the rows from the last checkpoint before it (prompt cache; the owner, 2026-11-18).
 3. Large prompt chunks for Flash-Next with expert slots borrowed in VRAM, batch and micro-batch
    adjustable, adaptive when another request waits (experts from the SSD).
-4. Tools, structured output and the Messages and Responses routes on the real Flash-Next, and
-   against Claude Code itself (parity, server).
+4. Done 2026-11-22 (`server/flash-api`): tools, structured output and the Messages and Responses
+   routes on the real Flash-Next, and Claude Code itself against Ares on both models ("Server and API").
 5. Flash-Next's draft vocabulary (step 6 of the shared layer, being finished).
 6. K/V of a running sequence beyond VRAM for Flash-Next at long contexts (whole features). The
    owner's rule for the context (2026-11-22): without `--context` the model's own maximum (262144
@@ -46,9 +46,8 @@ stored responses, TLS.
 | --- | --- |
 | 1 and 2: Claude Code's billing stamp as upstream; checkpoints at the system prompt's and tool list's end, at every message boundary and at fixed distances | agent working (`cache/checkpoints`) |
 | 3: large prompt chunks for Flash-Next (TokenWing and Strata read first), batch and micro-batch, adaptive | agent working (`moe/prompt-chunks`) |
-| 4: tools, structured output, Messages and Responses on the real Flash-Next, and Claude Code itself against Ares | agent working (`server/flash-api`) |
-| The best use of the second card (the fork's attention split, more context there, expert tier only, drafters there): measured, then roles | agent working (`devices/roles`) |
-| The MTP block's crash with long prompts on Flash-Next (status 0x4) and the expert slots filled at the start, as Strata does | agent working on the test machine (`fix/mtp-and-slots`) |
+| The best use of the second card (the fork's attention split, more context there, expert tier only, drafters there): measured, then roles | handed back, being verified (`devices/roles`) |
+| The MTP block's crash with long prompts on Flash-Next (status 0x4) and the expert slots filled at the start, as Strata does | handed back, being verified (`fix/mtp-and-slots`) |
 
 ## Shared model layer (the owner's rule, 2026-11-16)
 Generic for Ares, not like llama.cpp: a few models, shared code where it can be, each model
@@ -575,7 +574,8 @@ with Bash. Scripts and logs in `/var/tmp/ares-flashapi` (`notes.md`).
       at load 13) and answered at 3 to 6 tokens/s, with 5 of 55 and 7 of 127 drafts accepted;
       the MTP block's first link took 1 of 6 and 3 of 12 where the split by layers took 25 of
       41, 29 of 45 and 56 of 78 on the same prompts. Few samples, but the MTP block looks badly
-      fed in that placement; not looked into.
+      fed in that placement; not looked into. The made-up model's MTP test that failed once in
+      the merge check of 2026-11-22 drafted badly in the same placement (`Shared`).
 - [ ] A new session on Flash-Next reads the whole 16 thousand tokens again: the root checkpoint
       ("Next", item 2). The template writes the tools first (12.7 thousand tokens) and the
       system prompt after them, whose first line is Claude Code's billing line: 2.1.301 writes no
@@ -747,3 +747,7 @@ Measured per phase on a quiet machine against the fork and Strata, the largest f
   place of 0.03 %, the output changes), or keep the exact f16 path there?
 - Capped cards measuring their prefill path per type as full-rate cards do (in place of the rule
   kept from the two development cards)?
+- A tool call that a client gives back with its schema's default arguments added (Claude Code's
+  `"replace_all": false`): write it without them, so that the history matches the cache, or
+  leave the client's history as it is and rely on the checkpoint at every message boundary
+  ("Server and API")?
