@@ -603,6 +603,25 @@ with Bash. Scripts and logs in `/var/tmp/ares-flashapi` (`notes.md`).
       schema's order, would match what a model usually writes; it changes the history the
       client sent, so it is the owner's decision (not built).
 
+## Inkling 2 Mini (`inkling2`; the owner, 2026-11-22: worth supporting, and looped transformers matter more and more)
+Thinking Machines' Inkling-2-Mini (Apache 2.0), GGUF by Unsloth: `unsloth/Inkling-2-Mini-GGUF`
+(UD-IQ1_S 7.2 GB to UD-Q8_K_XL 21.3 GB, UD-Q4_K_XL 16.4 GB; vision tower `mmproj-*`; its own
+DSpark drafter `dspark-Inkling-2-Mini-Q8_0.gguf`, 0.4 GB). Notes: `/var/tmp/ares-survey/inkling/`.
+- What it is: 24 decoder layers with a mixture of experts (8 of 128 per token); the middle 12
+  layers run three times with shared weights (48 layer applications per token); attention a
+  hybrid of local and global layers; 26.2B parameters, 3.4B active (5.4B with the loops); context
+  up to 1M tokens; images through a vision transformer into the same hidden space; NVFP4 and
+  MXFP8 numerics (the experts carry per-expert NVFP4 scales).
+- Two layouts of the same tensors: the root files in Unsloth's looped layout, `Mainline_Support/`
+  in mainline llama.cpp's `inkling2_loop` layout (llama.cpp PR 32694; PR 32704 keeps the
+  per-expert scales on the second and third passes, without it perplexity 130 instead of 7.65).
+- Its drafter is a 3-layer block drafter (block size 8) with a Markov head, in DSpark's format
+  (`general.architecture = dflash`); Ares refuses DSpark by name today (shared layer step 8).
+- [ ] Study first: the two layouts, the loop (K/V and recurrent state per pass or shared, how a
+      pass is told apart), local and global attention, the expert scales, what of the shared layer
+      and Flash-Next's expert store it takes as it is; then the model, its drafter (DSpark), its
+      vision tower. Where in the order: the owner's call.
+
 ## Whole features not started
 - [ ] Image input (F11; the owner's preset sets `mmproj`). Design: `/var/tmp/ares-survey/image-input-design.md`
       (2026-11-15). Both projector files are the same tower (`qwen3vl_merger`: patches of
