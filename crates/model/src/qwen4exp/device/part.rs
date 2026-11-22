@@ -1148,7 +1148,7 @@ pub struct Part {
     /// The token embedding table on the host, for the part that embeds.
     token_rows: Option<Arc<HostTable>>,
     /// Rows of the next step that another source computed (`blocks/rows.rs`).
-    spliced: Vec<(u32, DevicePtr)>,
+    spliced: Vec<rows::Splice>,
     /// The tokens of the head's rows (u32 each) when a draft vocabulary
     /// orders them, on the part with the head.
     head_tokens: Option<DeviceBuffer>,
@@ -1587,7 +1587,7 @@ impl Part {
     /// of the step takes the `n_embd` f32 at the address over its gathered
     /// row (the image tower's rows at an image's positions). The addresses
     /// stay valid until the step has run.
-    pub fn splice_rows(&mut self, rows: Vec<(u32, DevicePtr)>) {
+    pub fn splice_rows(&mut self, rows: Vec<rows::Splice>) {
         self.spliced = rows;
     }
 

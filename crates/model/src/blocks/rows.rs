@@ -20,12 +20,12 @@
 //!   vocabulary, or the head's rows on that device; see [`super::head`]). A
 //!   device that keeps every row needs nothing from the host.
 //!
-//! A step's rows may also come from a **second source**: rows another
-//! computation leaves on the device in the model's width, such as the image
-//! tower's at the positions of an image ([`splice`]). The gather fills every
-//! row first (a row that neither source holds is zeros) and the splice copies
-//! the other rows over theirs, in the step's order, before the first layer
-//! reads them.
+//! A step's rows may also come from a **second source**: rows of the model's
+//! width that another computation made, such as the image tower's for the
+//! cells of an image ([`splice`]), on the device or in page-locked host memory
+//! (the runtime's image stage). The gather fills every row first (an image
+//! cell gathers its pad token's row) and the splice copies the other rows over
+//! theirs, in the step's order, before the first layer reads them.
 
 use std::sync::Arc;
 
@@ -285,26 +285,79 @@ pub(crate) fn source(shape: &TableShape, kept: KeptRows, staged: DevicePtr) -> E
     EmbedRows { ty: shape.ty, n_vocab: shape.n_vocab, n_embd: shape.n_embd, kept, staged }
 }
 
-/// The second row source: copies rows that another computation left on the
-/// device over gathered rows. `rows` lists, for each row of the step that
-/// takes such a row, its index in the step and where its `n_embd` f32 values
-/// are; `out` holds the step's rows (`n_embd` f32 each). The image tower's
-/// rows enter a step here, at the positions of the image's tokens.
+/// Where the rows of a [`Splice`] are.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SpliceFrom {
+    /// On the step's device.
+    Device(DevicePtr),
+    /// In page-locked host memory: the runtime's image stage.
+    Host(HostRows),
+}
+
+/// The address of rows in page-locked host memory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HostRows(pub *const f32);
+
+// SAFETY: an address the runtime keeps valid and unchanged until the step
+// that reads it has run; nothing is read through it on the host.
+unsafe impl Send for HostRows {}
+
+/// Rows `row..row + rows` of a step take the `rows * n_embd` f32 at `from`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Splice {
+    pub row: u32,
+    pub rows: u32,
+    pub from: SpliceFrom,
+}
+
+/// The splices of a step's image runs: the rows the runtime staged for its
+/// image cells, read from the page-locked stage at `stage`.
+pub(crate) fn image_splices(
+    record: &ares_runtime::RecordView<'_>,
+    stage: *const f32,
+    n_embd: u32,
+) -> Vec<Splice> {
+    if stage.is_null() {
+        return Vec::new();
+    }
+    (0..record.image_runs())
+        .map(|i| {
+            let run = record.image_run(i);
+            // The stage holds a row of `n_embd` values per staged row.
+            let from = stage.wrapping_add(run.stage as usize * n_embd as usize);
+            Splice { row: run.row, rows: run.rows, from: SpliceFrom::Host(HostRows(from)) }
+        })
+        .collect()
+}
+
+/// The second row source: copies rows that another computation made over
+/// gathered rows. `out` holds the step's rows (`n_embd` f32 each). The image
+/// tower's rows enter a step here, at the cells of an image.
 ///
 /// # Safety
 ///
-/// `out` must hold every listed row of the step and each source `n_embd` f32
-/// values on the stream's device, alive until the copies have run.
+/// `out` must hold every row the splices name, and each source its rows of
+/// `n_embd` f32 values (on the stream's device, or in page-locked host
+/// memory), alive and unchanged until the copies have run.
 pub(crate) unsafe fn splice(
     stream: &Stream,
     out: DevicePtr,
     n_embd: u32,
-    rows: &[(u32, DevicePtr)],
+    splices: &[Splice],
 ) -> Result<(), ModelError> {
     let bytes = u64::from(n_embd) * 4;
-    for &(row, from) in rows {
+    for s in splices {
+        let to = out.offset(u64::from(s.row) * bytes);
+        let len = (u64::from(s.rows) * bytes) as usize;
         // SAFETY: the caller's guarantee.
-        unsafe { stream.copy(out.offset(u64::from(row) * bytes), from, bytes as usize)? };
+        unsafe {
+            match s.from {
+                SpliceFrom::Device(from) => stream.copy(to, from, len)?,
+                SpliceFrom::Host(HostRows(from)) => {
+                    stream.copy_from_host(to, from.cast::<u8>(), len)?
+                }
+            }
+        }
     }
     Ok(())
 }

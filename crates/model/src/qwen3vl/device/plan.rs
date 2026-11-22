@@ -424,7 +424,9 @@ pub struct ScratchPlan {
     pub heads: Range<u64>,
     /// The attention's output, `f32` rows of the tower's width. Before the
     /// first block it holds the image's patch rows (the input of a pass); in
-    /// the merger the output of its first matrix.
+    /// the merger the output of its first matrix, and after its last hidden
+    /// part the merged rows (the output of a pass that writes into the
+    /// scratch, [`super::Scratch::output`]).
     pub attended: Range<u64>,
     /// A group's input of a product of the tower's width, prepared.
     pub act: Range<u64>,
@@ -475,7 +477,8 @@ impl ScratchPlan {
                 .max(part_out + rows * widest_part * 4),
             (patches * e * 4)
                 .max(patches * config.patch_len() as u64 * 4)
-                .max(rows * group as u64 * 4),
+                .max(rows * group as u64 * 4)
+                .max(rows * config.n_out as u64 * 4),
             f16(config.n_embd, g),
             g * (3 * e).max(config.n_ff as u64) * 4,
             f16(ff_pad, g),

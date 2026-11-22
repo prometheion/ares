@@ -43,7 +43,7 @@ use ares_runtime::expert_store::{
 use ares_runtime::{
     ContextSpec, DeviceContext, DeviceModel, DeviceTransfer, Drafter, DrafterKind, Durable,
     LinkSpec, Logits, Model, ModelDrafts, ModelError, Pick, PinnedRam, PrefixCache, Split,
-    StepContext, TransferContext,
+    StepContext, TowerJob, TransferContext, Vision,
 };
 use ares_state::PageLayout;
 use ares_tokenizer::{ChatOptions, Tokenizer};
@@ -66,9 +66,10 @@ use super::session::{Chosen, Fill, PartReport, SessionOptions, choose};
 use super::usage::{Log, ProfileReport, Usage, UsageStats};
 use crate::blocks::head::HeadView;
 use crate::blocks::mtp::{MtpChain, MtpStep};
-use crate::blocks::rows::{HostTable, TOKEN_EMBD};
+use crate::blocks::rows::{self, HostTable, TOKEN_EMBD};
 use crate::blocks::slots::{self, Declared, TAILS_PER_SLOT};
 use crate::chat;
+use crate::qwen3vl::{Projector, TowerAt};
 use crate::qwen4exp::reference::mtp_config;
 use crate::qwen4exp::weights::{MtpWeights, Weights};
 use crate::qwen4exp::{Config, Error as FileError};
@@ -761,6 +762,9 @@ pub struct Qwen4Exp {
     /// The order of the output head's rows and the draft head's rows, which
     /// every drafter reads (`blocks/head.rs`).
     view: HeadView,
+    /// The projector images are read through, and the device part that runs
+    /// its tower.
+    projector: Option<(Arc<Projector>, usize)>,
 }
 
 impl std::fmt::Debug for Qwen4Exp {
@@ -891,7 +895,52 @@ impl Qwen4Exp {
             rows,
             lone_rows: OnceLock::new(),
             view: HeadView::new(config_vocab, config_vocab, None).map_err(OpenError::Choice)?,
+            projector: None,
         })
+    }
+
+    /// Reads images through `projector`, whose tower runs on device part
+    /// `device`. Refused for a projector whose rows are not the model's width,
+    /// and for a model whose n-gram embedding hashes another token for an image
+    /// cell than the pad token the chat's markers write. Before the runtime
+    /// opens the parts.
+    pub fn with_projector(
+        mut self,
+        projector: Arc<Projector>,
+        device: usize,
+    ) -> Result<Self, OpenError> {
+        if projector.n_out() as usize != self.config.n_embd {
+            return Err(OpenError::Choice(format!(
+                "the projector's rows have {} values and the model's have {}",
+                projector.n_out(),
+                self.config.n_embd
+            )));
+        }
+        if device >= self.placement.n_devices() {
+            return Err(OpenError::Choice(format!(
+                "the image tower is to run on part {device} of {}",
+                self.placement.n_devices()
+            )));
+        }
+        // The n-gram embedding hashes its image token for an image cell; the
+        // record carries the pad token the chat's markers write there.
+        let pad = self.tokenizer.special_token_id("<|image_pad|>");
+        if let Some(ngram) = &self.config.ngram
+            && pad != Some(ngram.image_token)
+        {
+            return Err(OpenError::Choice(format!(
+                "the n-gram embedding hashes token {} for an image cell, and the chat writes \
+                 {pad:?} there",
+                ngram.image_token
+            )));
+        }
+        self.projector = Some((projector, device));
+        Ok(self)
+    }
+
+    /// The projector images are read through, if there is one.
+    pub fn projector(&self) -> Option<&Arc<Projector>> {
+        self.projector.as_ref().map(|(p, _)| p)
     }
 
     /// Gives every drafter of the model a draft vocabulary (`blocks/head.rs`):
@@ -1212,6 +1261,18 @@ impl Qwen4Exp {
                 o.max_rows
             )));
         }
+        // The image tower, on the part that runs it, before the part and its
+        // expert slots take what is left of the device.
+        let tower = match &self.projector {
+            Some((projector, device)) if *device == index => {
+                cx.ledger.reserve("image tower", projector.vram_bytes())?;
+                let tower = projector
+                    .load(cx.device, cx.kernels)
+                    .map_err(|e| invalid(format!("the image tower: {e}")))?;
+                Some(tower)
+            }
+            _ => None,
+        };
         let weights = Weights::load(&self.gguf, c).map_err(|e| invalid(e.to_string()))?;
         let PartPlan { role, first, shares, head } = self.placement.part(c, index);
         let layer_count = shares.len();
@@ -1600,6 +1661,7 @@ impl Qwen4Exp {
             )));
         }
         Ok(Box::new(Qwen4ExpDevice {
+            tower,
             index,
             devices: n,
             by_layers: self.placement.tensor.is_none(),
@@ -1705,14 +1767,23 @@ impl Model for Qwen4Exp {
     }
 
     fn encode(&self, prompt: &Prompt) -> Result<Vec<u32>, EngineError> {
-        chat::encode(&self.tokenizer, &self.chat, prompt)
+        chat::encode(&self.tokenizer, &self.chat, self.projector(), prompt)
     }
 
     fn encode_with_boundaries(
         &self,
         prompt: &Prompt,
     ) -> Result<ares_runtime::EncodedPrompt, EngineError> {
-        chat::encode_with_boundaries(&self.tokenizer, &self.chat, prompt)
+        chat::encode_with_boundaries(&self.tokenizer, &self.chat, self.projector(), prompt)
+    }
+
+    fn vision(&self) -> Option<Vision> {
+        self.projector.as_ref().map(|(projector, device)| Vision {
+            width: self.config.n_embd as u32,
+            max_rows: projector.limits().max_rows as u32,
+            device: *device,
+            units: projector.units(),
+        })
     }
 
     fn chat_format(&self) -> Option<ChatFormat> {
@@ -1760,7 +1831,7 @@ impl Model for Qwen4Exp {
     }
 
     fn pinned_ram(&self) -> u64 {
-        self.pinned
+        self.pinned + self.projector().map_or(0, |p| p.pinned_bytes())
     }
 
     fn expert_stats(&self) -> Option<ExpertStats> {
@@ -1841,6 +1912,8 @@ impl Model for Qwen4Exp {
 
 /// A part behind the runtime's interface.
 struct Qwen4ExpDevice {
+    /// The image tower, on the part that runs it.
+    tower: Option<TowerAt>,
     index: usize,
     devices: usize,
     /// Whether the devices hold a range of layers each (and hand the residual
@@ -2185,7 +2258,18 @@ impl Qwen4ExpDevice {
 
         // The residual streams start from the embeddings, which the part that
         // embeds stages and gathers itself (`blocks/rows.rs`).
-        let mut host = StepRecord::new(&self.segments, &self.tokens, None, &self.out_rows)?;
+        // The rows of the step's image cells, copied over the gathered ones by
+        // the part that embeds, and the rows' rotary positions where they are
+        // not their cells (a sequence with images).
+        self.part.splice_rows(rows::image_splices(record, step.image_stage, self.part.n_embd()));
+        let at_cells = (0..record.rows()).all(|i| {
+            let p = record.row(i).position;
+            record.rotary(i) == [p, p, p, 0]
+        });
+        let rotary: Option<Vec<[i32; 4]>> = (!at_cells)
+            .then(|| (0..record.rows()).map(|i| record.rotary(i).map(|p| p as i32)).collect());
+        let mut host =
+            StepRecord::new(&self.segments, &self.tokens, rotary.as_deref(), &self.out_rows)?;
         for (i, s) in self.segments.iter().enumerate() {
             if self.replay.iter().any(|r| r.contains(&s.row0)) {
                 host.mark_replay(i)?;
@@ -2299,6 +2383,13 @@ impl DeviceModel for Qwen4ExpDevice {
 
     fn logits_per_row(&self) -> u32 {
         if self.part.has_head() { self.n_vocab } else { 0 }
+    }
+
+    fn tower(&mut self, stream: &Stream, job: &mut TowerJob) -> Result<(), ModelError> {
+        match &mut self.tower {
+            Some(tower) => tower.run(stream, job),
+            None => Err(invalid("this part has no image tower")),
+        }
     }
 
     fn enqueue(&mut self, step: &StepContext<'_>) -> Result<Option<Logits>, ModelError> {

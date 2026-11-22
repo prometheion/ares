@@ -29,7 +29,7 @@ impl Rng {
 /// A running sequence.
 struct Live {
     cells: Sequence,
-    tokens: Vec<u32>,
+    tokens: Vec<u64>,
     chain: Chain,
     prompt: usize,
     generate: usize,
@@ -54,7 +54,7 @@ impl Forms {
     }
 }
 
-fn text(rng: &mut Rng, documents: &[Vec<u32>]) -> Vec<u32> {
+fn text(rng: &mut Rng, documents: &[Vec<u64>]) -> Vec<u64> {
     let doc = &documents[rng.below(documents.len() as u64) as usize];
     let len = 20 + rng.below(1400) as usize;
     doc[..len.min(doc.len())].to_vec()
@@ -86,9 +86,9 @@ fn run(seed: u64, newest: u32) -> Stats {
     let mut forms = Forms::new(capacity, pages, newest);
     let mut page_tab = vec![0u32; (slots * stride) as usize];
     // Four documents; two pairs share their first 300 tokens.
-    let documents: Vec<Vec<u32>> = (0..4u32)
+    let documents: Vec<Vec<u64>> = (0..4u64)
         .map(|d| {
-            (0..1500u32)
+            (0..1500u64)
                 .map(|i| if i < 300 { 1000 * (d / 2) + i } else { 100_000 * d + i })
                 .collect()
         })
@@ -150,7 +150,7 @@ fn run(seed: u64, newest: u32) -> Stats {
             }
             if live.tokens.len() < done + rows {
                 let tail = live.tokens.len();
-                live.tokens.extend((tail..done + rows).map(|i| 7_000_000 + i as u32));
+                live.tokens.extend((tail..done + rows).map(|i| 7_000_000 + i as u64));
             }
             reaches.push(Reach {
                 slot: slot as u32,

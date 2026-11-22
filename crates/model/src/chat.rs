@@ -3,11 +3,15 @@
 //! model's tokens, for the architectures that share the Qwen chat template and
 //! tokenizer.
 
+use std::sync::Arc;
+
 use ares_api::{ChatFormat, EngineError, Prompt, Role, ThinkingFormat, ToolFormat};
-use ares_runtime::{Boundary, EncodedPrompt};
+use ares_runtime::{Boundary, EncodedPrompt, ImageInput, ImageSpan};
 use ares_tokenizer::{
     ChatOptions, Content, EncodeOptions, Json, Message, ReasoningFormat, Tokenizer, Tool, ToolCall,
 };
+
+use crate::qwen3vl::Projector;
 
 /// What the chat template of `tokenizer` declares when it is rendered with
 /// `chat`, the options the server started the model with.
@@ -88,29 +92,121 @@ fn template_value(value: &ares_api::Json) -> Json {
 
 /// The tokens of `prompt`: plain text as it is, a conversation through the
 /// chat template of the model file with the variables of the request on top of
-/// `chat`.
+/// `chat`. An image takes as many cells as it has rows, by the size rule of
+/// `projector`, without being resized.
 pub(crate) fn encode(
     tokenizer: &Tokenizer,
     chat: &ChatOptions,
+    projector: Option<&Arc<Projector>>,
     prompt: &Prompt,
 ) -> Result<Vec<u32>, EngineError> {
-    encode_prompt(tokenizer, chat, prompt, false).map(|encoded| encoded.tokens)
+    encode_prompt(tokenizer, chat, projector, prompt, false).map(|encoded| encoded.tokens)
 }
 
-/// The tokens of `prompt` as [`encode`] gives them, and for a conversation
-/// the places where its parts end ([`Boundary`]), read off the chat template
-/// itself (see [`boundaries`]).
+/// The tokens of `prompt` as [`encode`] gives them, for a conversation the
+/// places where its parts end ([`Boundary`]), read off the chat template
+/// itself (see [`boundaries`]), and its images as the tower takes them.
 pub(crate) fn encode_with_boundaries(
     tokenizer: &Tokenizer,
     chat: &ChatOptions,
+    projector: Option<&Arc<Projector>>,
     prompt: &Prompt,
 ) -> Result<EncodedPrompt, EngineError> {
-    encode_prompt(tokenizer, chat, prompt, true)
+    encode_prompt(tokenizer, chat, projector, prompt, true)
+}
+
+/// What stands for an image in a message's text while the template renders
+/// it: a character of the private use area (another one than [`MARK`]'s and
+/// [`BOUNDARY`]'s), which no text of a request has (one that does is refused).
+const IMAGE: char = '\u{f8fd}';
+
+/// The text of the markers around an image's rows, as llama.cpp's `mtmd`
+/// writes them for Qwen3-VL's projector, with one pad token where the rows go.
+const IMAGE_START: &str = "<|vision_start|>";
+const IMAGE_PAD: &str = "<|image_pad|>";
+const IMAGE_END: &str = "<|vision_end|>";
+
+/// A message's text with [`IMAGE`] at the place of each of its images.
+fn with_image_marks(message: &ares_api::Message) -> Result<String, EngineError> {
+    if message.content.contains(IMAGE) {
+        return Err(EngineError::InvalidRequest(
+            "a message holds a character this server marks the places of images with".into(),
+        ));
+    }
+    let mut text = String::with_capacity(message.content.len() + message.images.len() * 3);
+    let mut from = 0;
+    for image in &message.images {
+        let at = image.at.min(message.content.len());
+        if at < from || !message.content.is_char_boundary(at) {
+            return Err(EngineError::InvalidRequest(
+                "the images of a message are not in the order of its text".into(),
+            ));
+        }
+        text.push_str(&message.content[from..at]);
+        text.push(IMAGE);
+        from = at;
+    }
+    text.push_str(&message.content[from..]);
+    Ok(text)
+}
+
+/// The tokens of a rendering with [`IMAGE`] at each image: the text between
+/// the images tokenized piece by piece, as llama.cpp's `mtmd` does, and for
+/// each image its start marker, a pad token per row and its end marker. Also
+/// the tokens with one pad per image (whose text is the rendering with the
+/// markers in place of [`IMAGE`]) and where each such pad is, for the
+/// boundaries.
+struct WithImages {
+    tokens: Vec<u32>,
+    spans: Vec<ImageSpan>,
+    single: Vec<u32>,
+    pads: Vec<(usize, u32)>,
+}
+
+fn tokens_with_images(
+    tokenizer: &Tokenizer,
+    text: &str,
+    images: &[(u32, Option<Arc<ImageInput>>)],
+) -> Result<WithImages, EngineError> {
+    let id = |text: &str| {
+        tokenizer.special_token_id(text).ok_or_else(|| {
+            EngineError::InvalidRequest(format!(
+                "the model's vocabulary has no token {text}, which marks an image"
+            ))
+        })
+    };
+    let (start, pad, end) = (id(IMAGE_START)?, id(IMAGE_PAD)?, id(IMAGE_END)?);
+    let pieces: Vec<&str> = text.split(IMAGE).collect();
+    if pieces.len() != images.len() + 1 {
+        return Err(EngineError::InvalidRequest(
+            "the chat template does not write every image of the conversation once".into(),
+        ));
+    }
+    let mut out =
+        WithImages { tokens: Vec::new(), spans: Vec::new(), single: Vec::new(), pads: Vec::new() };
+    for (i, piece) in pieces.iter().enumerate() {
+        let options = EncodeOptions { add_special: i == 0, parse_special: true };
+        let piece = tokenizer.encode(piece, options);
+        out.tokens.extend_from_slice(&piece);
+        out.single.extend_from_slice(&piece);
+        let Some((rows, image)) = images.get(i) else { continue };
+        out.tokens.push(start);
+        if let Some(image) = image {
+            out.spans.push(ImageSpan { first: out.tokens.len() as u32, image: image.clone() });
+        }
+        out.tokens.extend(std::iter::repeat_n(pad, *rows as usize));
+        out.tokens.push(end);
+        out.single.push(start);
+        out.pads.push((out.single.len(), *rows));
+        out.single.extend([pad, end]);
+    }
+    Ok(out)
 }
 
 fn encode_prompt(
     tokenizer: &Tokenizer,
     chat: &ChatOptions,
+    projector: Option<&Arc<Projector>>,
     prompt: &Prompt,
     with_boundaries: bool,
 ) -> Result<EncodedPrompt, EngineError> {
@@ -118,12 +214,47 @@ fn encode_prompt(
         Prompt::Text(text) => Ok(EncodedPrompt {
             tokens: tokenizer
                 .encode(text, EncodeOptions { add_special: true, parse_special: false }),
-            boundaries: Vec::new(),
+            ..EncodedPrompt::default()
         }),
         Prompt::Chat { messages, tools, variables, continue_final } => {
             let invalid = |what: String| EngineError::InvalidRequest(what);
             let tools: Vec<Tool> =
                 tools.iter().flatten().map(tool).collect::<Result<_, _>>().map_err(invalid)?;
+            // The images, in the order of the conversation, with their rows: by
+            // the size rule only when they are counted, resized and named when
+            // they are to run.
+            let images: Vec<(u32, Option<Arc<ImageInput>>)> = {
+                let all: Vec<&ares_api::Image> = messages.iter().flat_map(|m| &m.images).collect();
+                if !all.is_empty() && projector.is_none() {
+                    return Err(EngineError::InvalidRequest(
+                        "image input needs a projector, and this model was loaded without one                          (--mmproj)"
+                            .into(),
+                    ));
+                }
+                if messages.iter().any(|m| m.role == Role::System && !m.images.is_empty()) {
+                    return Err(EngineError::InvalidRequest(
+                        "a system message cannot hold images".into(),
+                    ));
+                }
+                let image_error = |e: crate::qwen3vl::Error| {
+                    EngineError::InvalidRequest(format!("an image: {e}"))
+                };
+                all.iter()
+                    .map(|image| {
+                        let projector = projector.expect("checked above");
+                        if with_boundaries {
+                            let input = projector
+                                .prepare(&image.pixels, image.width, image.height)
+                                .map_err(image_error)?;
+                            Ok((input.rows(), Some(Arc::new(input))))
+                        } else {
+                            let (nx, ny) =
+                                projector.grid(image.width, image.height).map_err(image_error)?;
+                            Ok((nx * ny, None))
+                        }
+                    })
+                    .collect::<Result<_, EngineError>>()?
+            };
             let messages: Vec<Message> = messages
                 .iter()
                 .map(|m| {
@@ -133,7 +264,12 @@ fn encode_prompt(
                         Role::Assistant => "assistant",
                         Role::Tool => "tool",
                     };
-                    let mut message = Message::new(role, m.content.clone());
+                    let content = if m.images.is_empty() {
+                        m.content.clone()
+                    } else {
+                        with_image_marks(m).map_err(|e| e.to_string())?
+                    };
+                    let mut message = Message::new(role, content);
                     message.name = m.name.clone().unwrap_or_default();
                     message.tool_call_id = m.tool_call_id.clone().unwrap_or_default();
                     message.reasoning_content = m.reasoning_content.clone().unwrap_or_default();
@@ -154,15 +290,54 @@ fn encode_prompt(
                 }
             };
             let special = EncodeOptions { add_special: true, parse_special: true };
+            if !images.is_empty() {
+                let text = render(messages.clone())?;
+                let encoded = tokens_with_images(tokenizer, &text, &images)?;
+                if !with_boundaries {
+                    return Ok(EncodedPrompt {
+                        tokens: encoded.tokens,
+                        ..EncodedPrompt::default()
+                    });
+                }
+                // The boundaries of the rendering with one pad token per image,
+                // moved behind the rows of the images before them.
+                let markers = format!("{IMAGE_START}{IMAGE_PAD}{IMAGE_END}");
+                let with_markers = |messages: Vec<Message>| {
+                    render(messages).map(|text| text.replace(IMAGE, &markers))
+                };
+                let single_text = text.replace(IMAGE, &markers);
+                let mut places = boundaries(
+                    tokenizer,
+                    &messages,
+                    *continue_final,
+                    &single_text,
+                    &encoded.single,
+                    with_markers,
+                );
+                for place in &mut places {
+                    let before: u32 = encoded
+                        .pads
+                        .iter()
+                        .filter(|(at, _)| (*at as u64) < place.at)
+                        .map(|(_, rows)| rows - 1)
+                        .sum();
+                    place.at += u64::from(before);
+                }
+                return Ok(EncodedPrompt {
+                    tokens: encoded.tokens,
+                    boundaries: places,
+                    images: encoded.spans,
+                });
+            }
             if !with_boundaries {
                 let tokens = tokenizer.encode(render(messages)?, special);
-                return Ok(EncodedPrompt { tokens, boundaries: Vec::new() });
+                return Ok(EncodedPrompt { tokens, ..EncodedPrompt::default() });
             }
             let text = render(messages.clone())?;
             let tokens = tokenizer.encode(&text, special);
             let boundaries =
                 boundaries(tokenizer, &messages, *continue_final, &text, &tokens, render);
-            Ok(EncodedPrompt { tokens, boundaries })
+            Ok(EncodedPrompt { tokens, boundaries, images: Vec::new() })
         }
     }
 }
@@ -486,9 +661,9 @@ mod tests {
             (User, " shell\n"),
         ];
         let prompt = conversation(&messages, true);
-        let encoded = encode_with_boundaries(&tokenizer, &chat, &prompt).unwrap();
+        let encoded = encode_with_boundaries(&tokenizer, &chat, None, &prompt).unwrap();
         // The tokens are those of `encode`, and the text is the template's.
-        assert_eq!(encoded.tokens, encode(&tokenizer, &chat, &prompt).unwrap());
+        assert_eq!(encoded.tokens, encode(&tokenizer, &chat, None, &prompt).unwrap());
         let text = String::from_utf8(tokenizer.decode(&encoded.tokens, true).unwrap()).unwrap();
         assert_eq!(
             text,
@@ -518,12 +693,14 @@ mod tests {
         // Without tools and without a system prompt only the first message
         // is a root.
         let plain = conversation(&messages[1..], false);
-        let encoded = encode_with_boundaries(&tokenizer, &chat, &plain).unwrap();
+        let encoded = encode_with_boundaries(&tokenizer, &chat, None, &plain).unwrap();
         let roots: Vec<bool> = encoded.boundaries.iter().map(|b| b.root).collect();
         assert_eq!(roots, [true, false, false, false, false, false]);
         // Plain text has none.
         let text = Prompt::Text("hello".into());
-        assert!(encode_with_boundaries(&tokenizer, &chat, &text).unwrap().boundaries.is_empty());
+        assert!(
+            encode_with_boundaries(&tokenizer, &chat, None, &text).unwrap().boundaries.is_empty()
+        );
 
         // A place inside a token counts where the token starts: `hel` and
         // `lo` are the tokens `he` and `llo`.
@@ -531,7 +708,7 @@ mod tests {
             tokenizer.compile_template("{% for m in messages %}hel{{ m.content }}{% endfor %}");
         let chat = ChatOptions { template: Some(std::sync::Arc::new(glued.unwrap())), ..chat };
         let encoded =
-            encode_with_boundaries(&tokenizer, &chat, &conversation(&[(User, "lo")], false));
+            encode_with_boundaries(&tokenizer, &chat, None, &conversation(&[(User, "lo")], false));
         let encoded = encoded.unwrap();
         assert_eq!(encoded.tokens.len(), 2);
         assert_eq!(
@@ -557,20 +734,20 @@ mod tests {
              !{% endif %}{{ m.content }}<|im_end|>\n{% endfor %}",
         );
         let prompt = conversation(&messages, false);
-        let encoded = encode_with_boundaries(&tokenizer, &peeks, &prompt).unwrap();
+        let encoded = encode_with_boundaries(&tokenizer, &peeks, None, &prompt).unwrap();
         assert!(encoded.boundaries.is_empty());
-        assert_eq!(encoded.tokens, encode(&tokenizer, &peeks, &prompt).unwrap());
+        assert_eq!(encoded.tokens, encode(&tokenizer, &peeks, None, &prompt).unwrap());
         // One that writes a text twice: that message has no boundary, the
         // others do.
         let twice = with(
             "{% for m in messages %}<|im_start|>{{ m.role }}\n{{ m.content }}{% if loop.last %}\
              {{ m.content }}{% endif %}<|im_end|>\n{% endfor %}",
         );
-        let encoded = encode_with_boundaries(&tokenizer, &twice, &prompt).unwrap();
+        let encoded = encode_with_boundaries(&tokenizer, &twice, None, &prompt).unwrap();
         assert_eq!(encoded.boundaries.len(), 2);
         // A message that holds the mark's character has none either.
         let prompt = conversation(&[(User, "he\u{f8fe}llo")], false);
-        let encoded = encode_with_boundaries(&tokenizer, &twice, &prompt).unwrap();
+        let encoded = encode_with_boundaries(&tokenizer, &twice, None, &prompt).unwrap();
         assert!(encoded.boundaries.is_empty());
     }
 
@@ -624,8 +801,12 @@ mod tests {
                 variables: Vec::new(),
                 continue_final: false,
             };
-            let encoded = encode_with_boundaries(&tokenizer, &chat, &prompt).unwrap();
-            assert_eq!(encoded.tokens, encode(&tokenizer, &chat, &prompt).unwrap(), "{variable}");
+            let encoded = encode_with_boundaries(&tokenizer, &chat, None, &prompt).unwrap();
+            assert_eq!(
+                encoded.tokens,
+                encode(&tokenizer, &chat, None, &prompt).unwrap(),
+                "{variable}"
+            );
             let text = String::from_utf8(tokenizer.decode(&encoded.tokens, true).unwrap()).unwrap();
             // Two places per message, the roots first.
             assert_eq!(encoded.boundaries.len(), 2 * messages.len(), "{variable}: {encoded:?}");
@@ -700,7 +881,7 @@ mod tests {
             let chat = ChatOptions::default();
             let format = chat_format(&tokenizer, &chat).tools.expect("a format for calls");
             assert_eq!(format.trigger(), "<tool_call>", "{variable}");
-            let tokens = encode(&tokenizer, &chat, &prompt).unwrap();
+            let tokens = encode(&tokenizer, &chat, None, &prompt).unwrap();
             let text = String::from_utf8(tokenizer.decode(&tokens, true).unwrap()).unwrap();
             assert!(text.contains("<tools>\n{\"type\": \"function\""), "{variable}: {text}");
             let calls = "<tool_call>\n<function=get_weather>\n<parameter=city>\nKöln\n\
@@ -730,7 +911,7 @@ mod tests {
     }
 
     fn rendered(tokenizer: &Tokenizer, chat: &ChatOptions, prompt: &Prompt) -> String {
-        let tokens = encode(tokenizer, chat, prompt).unwrap();
+        let tokens = encode(tokenizer, chat, None, prompt).unwrap();
         String::from_utf8(tokenizer.decode(&tokens, true).unwrap()).unwrap()
     }
 
@@ -779,7 +960,7 @@ mod tests {
                 continue_final: true,
             };
             assert!(matches!(
-                encode(&tokenizer, &chat, &prompt),
+                encode(&tokenizer, &chat, None, &prompt),
                 Err(EngineError::InvalidRequest(_))
             ));
         }

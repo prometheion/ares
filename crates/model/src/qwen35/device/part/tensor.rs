@@ -30,6 +30,7 @@ use ares_cuda::{DevicePtr, MergeNorm, Precision, Wire, partial_wire_bytes};
 use ares_runtime::ModelError;
 
 use super::{Exchange, Group, Normed, Options, Part, Phase, Prepared, StepEnv, invalid};
+use crate::blocks::rows;
 use crate::qwen35::device::load::{BlockW, Mat, MixerW};
 
 /// A half of a block: what a device computes between two merges.
@@ -116,6 +117,7 @@ impl Part {
             if self.w.embedding.is_some() {
                 let source = self.embed_rows()?;
                 self.layers.embed_gather(stream, env.step, dims, &source, p)?;
+                rows::splice(stream, p, self.d, &std::mem::take(&mut self.spliced))?;
             } else {
                 stream.fill(p, 0, bytes)?;
             }

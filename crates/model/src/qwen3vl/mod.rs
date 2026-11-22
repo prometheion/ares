@@ -28,6 +28,7 @@ pub mod config;
 pub mod device;
 mod error;
 pub mod image;
+pub mod projector;
 pub mod reference;
 pub mod weights;
 
@@ -35,5 +36,6 @@ pub use config::Config;
 pub use device::{DeviceTower, Home, Scratch};
 pub use error::{Error, Result};
 pub use image::{Limits, normalize, patch_position, patch_rows, resize_bicubic, target_size};
+pub use projector::{Projector, TowerAt};
 pub use reference::{Arithmetic, Reference, Rows, Stage};
 pub use weights::Weights;

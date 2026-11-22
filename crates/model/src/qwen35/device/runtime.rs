@@ -12,7 +12,7 @@ use ares_gguf::Gguf;
 use ares_runtime::{
     ContextSpec, DeviceContext, DeviceModel, DeviceTransfer, Drafter, DrafterKind, Durable,
     LinkSpec, Links, Logits, Model, ModelDrafts, ModelError, PrefixCache, Split, StepContext,
-    TransferContext,
+    TowerJob, TransferContext, Vision,
 };
 use ares_state::PageLayout;
 use ares_tokenizer::{ChatOptions, Tokenizer};
@@ -24,10 +24,11 @@ use super::part::{
     TAILS_PER_SLOT, declared, page_bytes,
 };
 use super::placement::{HalfShares, Placement, PlacementError};
-use crate::blocks::rows::{EmbeddingReport, HostTable, Stage};
+use crate::blocks::rows::{self, EmbeddingReport, HostTable, Stage};
 use crate::blocks::slots::{self, Declared};
 use crate::chat;
 use crate::dflash::PassSeq;
+use crate::qwen3vl::{Projector, TowerAt};
 use crate::qwen35::{Config, Weights};
 
 /// How to spread the model over the devices.
@@ -109,6 +110,8 @@ pub enum OpenError {
     Placement(#[from] PlacementError),
     #[error("tokenizer: {0}")]
     Tokenizer(String),
+    #[error("the projector: {0}")]
+    Projector(String),
 }
 
 /// A `qwen35` model file, placed.
@@ -137,6 +140,9 @@ pub struct Qwen35 {
     /// that embeds and the part of the MTP block share; read by the first
     /// of them to open.
     table: Mutex<Option<Arc<HostTable>>>,
+    /// The projector images are read through, and the device part that runs
+    /// its tower.
+    projector: Option<(Arc<Projector>, usize)>,
 }
 
 impl std::fmt::Debug for Qwen35 {
@@ -221,7 +227,37 @@ impl Qwen35 {
             balance,
             pinned,
             table: Mutex::new(None),
+            projector: None,
         })
+    }
+
+    /// Reads images through `projector`, whose tower runs on device part
+    /// `device`. Refused for a projector whose rows are not the model's width.
+    pub fn with_projector(
+        mut self,
+        projector: Arc<Projector>,
+        device: usize,
+    ) -> Result<Self, OpenError> {
+        if projector.n_out() as usize != self.config.n_embd {
+            return Err(OpenError::Projector(format!(
+                "its rows have {} values and the model's have {}",
+                projector.n_out(),
+                self.config.n_embd
+            )));
+        }
+        if device >= self.placement.n_devices() {
+            return Err(OpenError::Projector(format!(
+                "its tower is to run on part {device} of {}",
+                self.placement.n_devices()
+            )));
+        }
+        self.projector = Some((projector, device));
+        Ok(self)
+    }
+
+    /// The projector images are read through, if there is one.
+    pub fn projector(&self) -> Option<&Arc<Projector>> {
+        self.projector.as_ref().map(|(p, _)| p)
     }
 
     /// Renders chat prompts with `options`: whether the model thinks, and the
@@ -338,14 +374,23 @@ impl Model for Qwen35 {
     }
 
     fn encode(&self, prompt: &Prompt) -> Result<Vec<u32>, EngineError> {
-        chat::encode(&self.tokenizer, &self.chat, prompt)
+        chat::encode(&self.tokenizer, &self.chat, self.projector(), prompt)
     }
 
     fn encode_with_boundaries(
         &self,
         prompt: &Prompt,
     ) -> Result<ares_runtime::EncodedPrompt, EngineError> {
-        chat::encode_with_boundaries(&self.tokenizer, &self.chat, prompt)
+        chat::encode_with_boundaries(&self.tokenizer, &self.chat, self.projector(), prompt)
+    }
+
+    fn vision(&self) -> Option<Vision> {
+        self.projector.as_ref().map(|(projector, device)| Vision {
+            width: self.config.n_embd as u32,
+            max_rows: projector.limits().max_rows as u32,
+            device: *device,
+            units: projector.units(),
+        })
     }
 
     fn chat_format(&self) -> Option<ChatFormat> {
@@ -403,7 +448,7 @@ impl Model for Qwen35 {
     }
 
     fn pinned_ram(&self) -> u64 {
-        self.pinned
+        self.pinned + self.projector().map_or(0, |p| p.pinned_bytes())
     }
 
     fn max_rows(&self) -> u32 {
@@ -507,6 +552,18 @@ impl Model for Qwen35 {
         } else {
             None
         };
+        // The image tower, on the part that runs it, before the part takes
+        // what is left of the device.
+        let tower = match &self.projector {
+            Some((projector, device)) if *device == index => {
+                cx.ledger.reserve("image tower", projector.vram_bytes())?;
+                let tower = projector
+                    .load(cx.device, cx.kernels)
+                    .map_err(|e| ModelError::Invalid(format!("the image tower: {e}")))?;
+                Some(tower)
+            }
+            _ => None,
+        };
         let part = Part::open_balanced(
             &self.config,
             &weights,
@@ -548,6 +605,7 @@ impl Model for Qwen35 {
         let dflash_id = self.dflash_drafts().map(|_| 1 + u32::from(block_id.is_some()));
         Ok(Box::new(Qwen35Device {
             part,
+            tower,
             tokens: Vec::new(),
             segments: Vec::new(),
             replay: Vec::new(),
@@ -563,6 +621,8 @@ impl Model for Qwen35 {
 #[derive(Debug)]
 struct Qwen35Device {
     part: Part,
+    /// The image tower, on the part that runs it.
+    tower: Option<TowerAt>,
     /// The tokens of the step's rows, read from the record.
     tokens: Vec<u32>,
     /// The segments of the step, read from the record once.
@@ -757,6 +817,19 @@ impl DeviceModel for Qwen35Device {
             }
             return Ok(None);
         }
+        // The rows of the step's image cells, which the part that embeds copies
+        // over the rows it gathers, and the rows' rotary positions where they
+        // are not their cells (for the records of the part's groups).
+        self.part.splice_rows(rows::image_splices(record, step.image_stage, self.part.width()));
+        let at_cells = (0..record.rows()).all(|i| {
+            let p = record.row(i).position;
+            record.rotary(i) == [p, p, p, 0]
+        });
+        self.part.set_rotary(if at_cells {
+            Vec::new()
+        } else {
+            (0..record.rows()).map(|i| record.rotary(i).map(|p| p as i32)).collect()
+        });
         self.part.enqueue(&StepEnv {
             stream: step.stream,
             step: step.record_on_device,
@@ -768,6 +841,13 @@ impl DeviceModel for Qwen35Device {
             exchange: (step.devices > 1).then_some(&exchange as &dyn Exchange),
             replay: &self.replay,
         })
+    }
+
+    fn tower(&mut self, stream: &Stream, job: &mut TowerJob) -> Result<(), ModelError> {
+        match &mut self.tower {
+            Some(tower) => tower.run(stream, job),
+            None => Err(ModelError::Invalid("this part has no image tower".into())),
+        }
     }
 
     fn transfer(

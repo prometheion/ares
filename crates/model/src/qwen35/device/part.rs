@@ -479,7 +479,11 @@ pub struct Part {
     /// host stages rows (`blocks/rows.rs`).
     embed: Option<Stage>,
     /// Rows of the next step that another source computed (`blocks/rows.rs`).
-    spliced: Vec<(u32, DevicePtr)>,
+    spliced: Vec<rows::Splice>,
+    /// The rotary positions of the next step's rows when they are not their
+    /// cells (a sequence with images): what the records of its groups carry.
+    /// Empty for a step whose rows are at their cells.
+    rotary: Vec<[i32; 4]>,
     // Model sizes.
     d: u32,
     eps: f32,
@@ -958,6 +962,7 @@ impl Part {
             w,
             embed,
             spliced: Vec::new(),
+            rotary: Vec::new(),
             d: d as u32,
             eps: c.rms_eps,
             rope: RopeParams {
@@ -1785,8 +1790,15 @@ impl Part {
                     })
                 })
                 .collect();
-            let record =
-                ares_cuda::StepRecord::new(&segments, &vec![0; (end - first) as usize], None, &[])?;
+            // The rows' rotary positions, where they are not their cells.
+            let rotary =
+                (!self.rotary.is_empty()).then(|| &self.rotary[first as usize..end as usize]);
+            let record = ares_cuda::StepRecord::new(
+                &segments,
+                &vec![0; (end - first) as usize],
+                rotary,
+                &[],
+            )?;
             let bytes = record.as_bytes();
             if at as usize + bytes.len() > self.group_host.len() {
                 return Err(invalid("the records of the step's groups do not fit their buffer"));
@@ -2010,8 +2022,19 @@ impl Part {
     /// of the step takes the `d` f32 at the address over its gathered row
     /// (the image tower's rows at an image's positions). The addresses stay
     /// valid until the step has run.
-    pub fn splice_rows(&mut self, rows: Vec<(u32, DevicePtr)>) {
+    pub fn splice_rows(&mut self, rows: Vec<rows::Splice>) {
         self.spliced = rows;
+    }
+
+    /// The model's width: the values of a row of the residual stream.
+    pub fn width(&self) -> u32 {
+        self.d
+    }
+
+    /// The rotary positions of the next step's rows, a set of four per row, or
+    /// none when every row is at its cell (`(p, p, p, 0)` for cell `p`).
+    pub fn set_rotary(&mut self, rotary: Vec<[i32; 4]>) {
+        self.rotary = rotary;
     }
 
     /// What the embedding takes on this part and where it lies.

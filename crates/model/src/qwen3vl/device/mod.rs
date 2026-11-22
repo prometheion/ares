@@ -87,6 +87,24 @@ impl Scratch {
         self.at(&self.plan.attended)
     }
 
+    /// Where a pass may write its merged rows when its caller has no buffer of
+    /// its own for them: `nx * ny` rows of [`Config::n_out`] `f32` values
+    /// over the input, which the merger's units no longer read. They stay
+    /// until the next pass starts.
+    pub fn output(&self) -> DevicePtr {
+        self.at(&self.plan.attended)
+    }
+
+    /// The byte offset of [`Scratch::input`] in the buffer.
+    pub fn input_offset(&self) -> u64 {
+        self.plan.attended.start
+    }
+
+    /// The byte offset of [`Scratch::output`] in the buffer.
+    pub fn output_offset(&self) -> u64 {
+        self.plan.attended.start
+    }
+
     /// The buffer itself, for a caller that writes the input with a copy of its
     /// own (at the offset of [`Scratch::input`]).
     pub fn buffer(&self) -> &DeviceBuffer {
@@ -122,8 +140,6 @@ struct Pass<'a> {
     rows: u32,
     patches: u32,
     out: DevicePtr,
-    /// How many units of the plan run, from the first.
-    units: usize,
 }
 
 /// The tower of one projector on one device.
@@ -345,6 +361,28 @@ impl DeviceTower {
         out: DevicePtr,
         units: usize,
     ) -> Result<()> {
+        // SAFETY: the caller's guarantee.
+        unsafe { self.enqueue_range(stream, scratch, nx, ny, out, 0..units) }
+    }
+
+    /// Units `range` of the pass of an image (see [`Plan::units`]): a pass may
+    /// be enqueued in several ranges, one after the other on the same stream,
+    /// with no other pass in between; the scratch carries what the units
+    /// before computed. The input must be in the scratch before the first
+    /// unit, and `out` takes the rows from the merger's output units on.
+    ///
+    /// # Safety
+    ///
+    /// As [`DeviceTower::enqueue`], for the whole pass.
+    pub unsafe fn enqueue_range(
+        &mut self,
+        stream: &Stream,
+        scratch: &Scratch,
+        nx: u32,
+        ny: u32,
+        out: DevicePtr,
+        range: std::ops::Range<usize>,
+    ) -> Result<()> {
         let rows = nx.checked_mul(ny).filter(|r| *r > 0 && *r <= scratch.max_rows());
         let Some(rows) = rows else {
             return Err(Error::Device {
@@ -363,15 +401,17 @@ impl DeviceTower {
                 problem: "it was made for another device or another projector".to_owned(),
             });
         }
-        let pass = Pass { scratch, nx, ny, rows, patches: 4 * rows, out, units };
+        let end = range.end.min(self.plan.units().len());
+        let range = range.start.min(end)..end;
+        let pass = Pass { scratch, nx, ny, rows, patches: 4 * rows, out };
         match &self.placed {
             Placed::Vram(arena) => {
-                for unit in self.plan.units().iter().take(pass.units) {
+                for unit in &self.plan.units()[range] {
                     self.run_unit(stream, &pass, unit, arena.ptr().offset(unit.at))?;
                 }
             }
             Placed::Ram(s) => {
-                let units = &self.plan.units()[..pass.units.min(self.plan.units().len())];
+                let units = &self.plan.units()[..range.end];
                 let upload = |u: usize| -> Result<()> {
                     let slot = u % 2;
                     let unit = &units[u];
@@ -389,10 +429,10 @@ impl DeviceTower {
                     s.uploaded[slot].record(&s.copy)?;
                     Ok(())
                 };
-                for u in 0..units.len().min(2) {
+                for u in range.start..units.len().min(range.start + 2) {
                     upload(u)?;
                 }
-                for (u, unit) in units.iter().enumerate() {
+                for (u, unit) in units.iter().enumerate().skip(range.start) {
                     let slot = u % 2;
                     stream.wait_event(&s.uploaded[slot])?;
                     // A unit that fails half enqueued still marks its slot, so that the
