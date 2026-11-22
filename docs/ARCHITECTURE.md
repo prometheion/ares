@@ -5470,7 +5470,15 @@ runs), so their reads can start a layer or two before their records
   rows it named the expert for, 1, 2, 3-4, ... 65 and more): such a step is bound by the
   drive, and 24 % of the guesses read through that prompt were not named by their layer's
   record. Every guess is counted when its record comes, read or not, so a class that
-  stopped being read comes back; the server's log says the counts every 20 s.
+  stopped being read comes back; the server's log says the counts every 20 s. On that
+  prompt every class was named 61 to 82 % of the time, so none was left unread, and the
+  drive's rate did not rise: such a step is bound by the link (below). *The guesses that the
+  RAM tier holds go up into transit slots* the layer before leaves free, while nothing named
+  waits for one, in at most half of them (`Transit::upload_guesses`): a layer's misses went
+  over the link only once its record had named them, so from a layer's last upload until the
+  next layer's record (its first kernels for 4096 rows, ~37 ms) and through its last round
+  the link had nothing to do. A record that names an uploaded guess finds it there; a layer
+  done with gives the slots of the others back.
 - *The text is unchanged.* The fingerprint of the tool (`qwen4exp_run --fingerprint`: the
   logits of a prompt of 600 tokens, 24 generated tokens and windows of drafts, bit for bit;
   both cards with the split pinned, `--core-share 0.76 --shared worker`, every miss
