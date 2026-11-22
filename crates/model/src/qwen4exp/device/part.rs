@@ -619,7 +619,7 @@ fn indexer_shape(c: &Config) -> IndexerShape {
     }
 }
 
-fn ngram_shape(c: &Config) -> Option<NgramShape> {
+pub(super) fn ngram_shape(c: &Config) -> Option<NgramShape> {
     c.ngram.as_ref().map(|g| NgramShape {
         n_stream: c.n_stream as u32,
         n_embd: c.n_embd as u32,

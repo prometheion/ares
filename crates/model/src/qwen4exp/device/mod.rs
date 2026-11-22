@@ -11,6 +11,9 @@
 //!   queues the kernels of a step and does not wait.
 //! - `draft.rs` runs the model's MTP block next to the part that holds the
 //!   output head, for a model the runtime drives ([`Qwen4Exp::with_mtp`]).
+//! - `roles.rs` times, when two devices share every layer, the second
+//!   computing a share of the dense parts against it holding experts only,
+//!   and keeps the faster ([`RoleTrial`]).
 //! - `prune.rs` lets the routers leave out, or stand an expert of a tier in
 //!   for, a pick that only the file holds ([`PruneSetup`]; off unless asked).
 //! - [`Session`] drives a whole model, on one device or several, from one
@@ -31,6 +34,7 @@ mod part;
 pub mod placement;
 mod prune;
 mod resume;
+mod roles;
 mod runtime;
 mod session;
 mod usage;
@@ -46,6 +50,7 @@ pub use placement::{
     DeviceMemory, DevicePlan, PartPlan, Placement, TensorChoice, TensorPlan, ram_tier_bytes,
 };
 pub use prune::{PruneMask, PruneSetup, PruneStats};
+pub use roles::{RoleTime, RoleTrial};
 pub use runtime::{ExpertCosts, OpenError, Qwen4Exp, batch_rows, place, step_rows};
 pub use session::{
     Fill, LayerOut, PartReport, Probe, Rows, Session, SessionOptions, Spread, StepTime, Wanted,

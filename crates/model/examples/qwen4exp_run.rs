@@ -703,6 +703,37 @@ fn run() -> Result<(), AnyError> {
             if shared { "mixer" } else { "worker" },
             if tensor.owners.is_some() { "the recorded routing" } else { "the rule" },
         );
+        if let Some(trial) = &tensor.trial {
+            let times: Vec<String> = trial
+                .times
+                .iter()
+                .map(|t| {
+                    format!(
+                        "core share {:.3} with the shared expert on the {}: decode {:.2} ms, \
+                         wide step of {} rows {}",
+                        t.choice.core_share,
+                        if t.choice.shared_on_mixer { "mixer" } else { "worker" },
+                        t.decode.as_secs_f64() * 1e3,
+                        trial.wide_rows,
+                        t.wide.map_or("none".to_owned(), |w| format!(
+                            "{:.1} ms",
+                            w.as_secs_f64() * 1e3
+                        )),
+                    )
+                })
+                .collect();
+            println!(
+                "  role trial in {:.2} s: {}; kept core share {:.3}{}",
+                trial.took.as_secs_f64(),
+                times.join("; "),
+                trial.kept.core_share,
+                trial
+                    .refused
+                    .iter()
+                    .map(|(c, why)| format!("; refused core share {:.3}: {why}", c.core_share))
+                    .collect::<String>(),
+            );
+        }
     }
     for part in session.report() {
         println!(

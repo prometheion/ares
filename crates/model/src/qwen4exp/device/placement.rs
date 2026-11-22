@@ -36,6 +36,7 @@ use ares_runtime::ModelError;
 
 use super::load::{LayerShare, Role, head_bytes, key_head_unit, layer_bytes};
 use super::part::{Frame, Options, PartShape};
+use super::roles::RoleTrial;
 use crate::qwen4exp::Config;
 use crate::qwen4exp::weights::{Mixer, Weights};
 
@@ -97,6 +98,9 @@ pub struct TensorPlan {
     /// were given): another placement of the same choices on the same devices
     /// lays the state out the same way.
     pub choice: TensorChoice,
+    /// What the trial at load measured of the worker's role, when it chose
+    /// `choice` (`roles.rs`); `None` when the choice was given.
+    pub trial: Option<RoleTrial>,
 }
 
 /// The choices of a placement in which two devices work on every layer.
@@ -369,6 +373,7 @@ impl Placement {
                 expert_share,
                 owners: None,
                 choice: *choice,
+                trial: None,
             }),
         })
     }

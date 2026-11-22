@@ -4457,9 +4457,32 @@ it computes a share of the dense part as well hardly matters for decode, which
 the misses decide (the step that misses nothing is 4 % faster with the share);
 without it the 3060 is a pure expert tier, holds 336 experts more, skips the
 exchange of every mixer half, and a wide step is 27 % faster, because the
-slower card no longer computes recurrent heads for 512 rows. The share is
-chosen today from the read time of a stream mixer on each card
-(`session.rs::choose`), which does not see that.
+slower card no longer computes recurrent heads for 512 rows.
+
+**The second card's role is timed at load** (`device/roles.rs`, the owner's rule
+of 2026-11-22: no option). When both cards work on every layer and neither the
+share nor the shared expert is given (`Spread::Tensor` with both `None`, or
+`Spread::Auto`), the placement times the two roles on the cards at hand: the
+worker computing a share of the recurrent heads and the shared experts (the
+mixer's share the worker's read time over the sum of both, as before) and the
+worker holding experts only (`core_share` 1, the shared expert on the mixer).
+Each choice is placed as the load would place it (one that does not fit the
+cards is refused), its parts are opened with a sequence of a few thousand cells
+and every expert in a slot of zeros (slots of four times the card's L2 cache, so
+the experts' kernels read from memory), and a decode step of one row (the median
+of nine after three) and a wide step of the parts' own rows (up to 512, after one
+that is not timed) run as in a model that misses nothing, the exchanges between
+the cards included; then the parts are closed, before anything of the model is
+placed for good. The choice whose decode step times wide step is the least is
+kept: each kind of step counts by how much faster it is, where milliseconds alone
+would let the decode step, some fifty times a prompt row, decide what prompts pay
+for. What the trial does not see is the experts a step misses, which the two
+roles hold about equally (experts only gives the worker the bytes of its dense
+share for slots, and the mixer as many fewer). The trial runs in the first
+placement of a load (`place`, `Session::open`); later placements of the same load
+pin its choice, and with `--cache` the server keeps it next to the stores as
+before. The server's log says what each role took and which was kept;
+`qwen4exp_run` prints it.
 
 The model's own context (262 144 cells, what the plan serves without
 `--context` since 2026-11-22) costs a fifth of the VRAM slots: its K/V and

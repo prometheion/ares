@@ -44,6 +44,7 @@ use super::ngram::NgramFeed;
 use super::part::{Options, Part, PartSetup, StepEnv};
 use super::placement::{DeviceMemory, PartPlan, Placement, TensorChoice, ram_tier_bytes};
 use super::prune::{self, PruneMask, PruneStats};
+use super::roles;
 use super::usage;
 use crate::blocks::rows::{HostTable, TOKEN_EMBD};
 use crate::qwen4exp::Config;
@@ -74,9 +75,13 @@ pub enum Spread {
     Layers,
     /// Both devices on every layer. What is `None` is taken from a
     /// measurement at load: the mixer is the device whose read of a stream
-    /// mixer is faster, and its share of the recurrent heads is the worker's
-    /// read time over the sum of both. The shared expert is the worker's
-    /// unless said otherwise.
+    /// mixer is faster. With neither the share nor the shared expert given, a
+    /// trial at load times the worker computing a share of the recurrent
+    /// heads and the shared expert (the mixer's share the worker's read time
+    /// over the sum of both) against the worker holding experts only (share
+    /// 1, the shared expert on the mixer), and keeps the faster (`roles.rs`).
+    /// With one of them given, the share is that of the read times and the
+    /// shared expert the worker's, unless said otherwise.
     Tensor {
         /// The device that holds the streams and runs the mixers.
         mixer: Option<usize>,
@@ -429,8 +434,11 @@ pub(super) struct Chosen {
 /// Where the layers of the model go on `devices`: a range each, or both
 /// devices on every layer when they can write each other's memory and the
 /// mixers run as fused reads. Measures a read of a stream mixer on each of
-/// two devices that share the layers.
+/// two devices that share the layers, and, unless `spread` gives the
+/// worker's role, times both roles on them (`roles.rs`, a few seconds).
+#[allow(clippy::too_many_arguments)]
 pub(super) fn choose(
+    gguf: &Gguf,
     c: &Config,
     w: &Weights<'_>,
     devices: &[Device],
@@ -487,12 +495,24 @@ pub(super) fn choose(
             let mixer = mixer.unwrap_or(usize::from(times[1] < times[0])).min(1);
             speeds = Some((times, mixer));
             let (fast, slow) = (times[mixer], times[1 - mixer]);
-            let choice = TensorChoice {
+            let share = TensorChoice {
                 mixer,
                 core_share: core_share.unwrap_or(slow / (fast + slow).max(1e-9)),
                 shared_on_mixer: shared_on_mixer.unwrap_or(false),
             };
-            Placement::tensor(c, w, part, &memory, &choice)?
+            let trial = match (core_share, shared_on_mixer) {
+                (None, None) => {
+                    let alone = TensorChoice { mixer, core_share: 1.0, shared_on_mixer: true };
+                    Some(roles::trial(gguf, c, w, devices, part, &memory, &[share, alone])?)
+                }
+                _ => None,
+            };
+            let choice = trial.as_ref().map_or(share, |t| t.kept);
+            let mut placement = Placement::tensor(c, w, part, &memory, &choice)?;
+            if let Some(tensor) = &mut placement.tensor {
+                tensor.trial = trial;
+            }
+            placement
         }
         (None, Some(bounds)) => Placement::at(c, w, part, &memory, bounds)?,
         (None, None) => Placement::plan(c, w, part, &memory)?,
@@ -553,6 +573,7 @@ impl<'g> Session<'g> {
             return Err(invalid("a session needs a device"));
         }
         let Chosen { mut placement, speeds, memory } = choose(
+            gguf,
             c,
             w,
             &devices,

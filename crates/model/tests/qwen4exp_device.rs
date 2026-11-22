@@ -24,7 +24,8 @@ use std::sync::{Arc, OnceLock};
 
 use ares_core::GgmlType;
 use ares_cuda::{
-    CacheFormat, Device, ExpertShape, Precision, Prune, PruneRule, PruneWeights, Wait, device_count,
+    CacheFormat, Device, ExpertShape, Precision, Prune, PruneRule, PruneWeights, Wait,
+    device_count, peer_access,
 };
 use ares_gguf::Gguf;
 use ares_model::qwen4exp::device::{
@@ -495,6 +496,80 @@ fn the_forward_pass_and_greedy_tokens_match_the_reference() {
     );
     assert!(worst < 0.15, "logits {worst:.2e}");
     assert!(same * 10 >= prompt.len() * 9, "{same} of {} rows", prompt.len());
+}
+
+/// Two devices that can write each other's memory and share every layer time the second
+/// device's role at load when the spread names none (`roles.rs`): computing a share of the
+/// recurrent heads and the shared expert, and holding experts only. Each is timed in a
+/// decode step and a wide step, the faster of the two together is kept and placed, and the
+/// model placed that way reads a prompt as the reference does. (Two devices only; the
+/// spread of the other tests is ignored.)
+#[test]
+fn the_second_devices_role_is_timed_at_load() {
+    let Some(devices) = devices() else { return };
+    let peers = devices.len() == 2
+        && peer_access(devices[0].ordinal(), devices[1].ordinal()).unwrap().0
+        && peer_access(devices[1].ordinal(), devices[0].ordinal()).unwrap().0;
+    if !peers {
+        eprintln!("skipped: two devices that can write each other's memory");
+        return;
+    }
+    let synthetic = model(5);
+    let gguf = open("roles", &synthetic.bytes_with_experts(GgmlType::IQ2_XXS, GgmlType::Q2_0));
+    let c = Config::from_gguf(&gguf).unwrap();
+    let w = Weights::load(&gguf, &c).unwrap();
+    let reference = Reference::new(&c, &w);
+    let mut opts = options(2, c.n_layer, CacheFormat::Q8);
+    opts.spread = Spread::Tensor { mixer: None, core_share: None, shared_on_mixer: None };
+    opts.bounds = None;
+    opts.part.max_rows = 64;
+    let mut session = Session::open(&gguf, &c, &w, devices, opts).expect("the model opens");
+    let tensor = session.placement().tensor.clone().expect("both devices on every layer");
+    let trial = tensor.trial.clone().expect("the roles were timed");
+    for time in &trial.times {
+        eprintln!(
+            "  core share {:.3}, the shared expert on the {}: decode {:.3} ms, a step of {} rows \
+             {:.2} ms",
+            time.choice.core_share,
+            if time.choice.shared_on_mixer { "mixer" } else { "worker" },
+            time.decode.as_secs_f64() * 1e3,
+            trial.wide_rows,
+            time.wide.unwrap_or_default().as_secs_f64() * 1e3
+        );
+    }
+    eprintln!(
+        "  kept core share {:.3}, trial {:.2} s",
+        trial.kept.core_share,
+        trial.took.as_secs_f64()
+    );
+    assert_eq!(trial.times.len(), 2, "both roles fit the cards: {trial:?}");
+    assert_eq!(trial.wide_rows, 64);
+    assert!(trial.times.iter().all(|t| t.wide.is_some()), "{trial:?}");
+    assert!(trial.times[0].choice.core_share < 1.0 && !trial.times[0].choice.shared_on_mixer);
+    assert!(trial.times[1].choice.core_share == 1.0 && trial.times[1].choice.shared_on_mixer);
+    let fastest = trial.times.iter().min_by(|a, b| a.cost().total_cmp(&b.cost())).unwrap();
+    assert_eq!(trial.kept, fastest.choice);
+    assert_eq!(tensor.choice, trial.kept);
+    // The model as placed: a prompt in slices of the decode kernels and a wide step.
+    let n_expert = c.experts.count as u32;
+    session.fill(&mut |_| (0..n_expert).collect()).expect("the tiers fill");
+    let mut state = SequenceState::new(&c);
+    let prompt = synthetic.shape.tokens(8 + 40, 9);
+    let mut worst = 0.0f64;
+    for tokens in [&prompt[..8], &prompt[8..]] {
+        let picks = session
+            .step(&[Rows { slot: 0, tokens, direct: true, wanted: Wanted::Last }])
+            .unwrap()
+            .to_vec();
+        let window = reference.window(&state, tokens, LogitRows::All).unwrap();
+        let want = window.logits_of(tokens.len() - 1).unwrap();
+        let error = rel_rms(session.logits(0).unwrap(), want);
+        assert!(is_near_best(picks[0], want, error), "the most likely token after the slice");
+        worst = worst.max(error);
+        reference.commit(&mut state, &window, tokens.len()).unwrap();
+    }
+    eprintln!("  the logits of the last rows differ by at most {worst:.2e} (relative RMS)");
+    assert!(worst < 0.15, "logits {worst:.2e}");
 }
 
 /// The slices of a prompt of 9, 64 and 256 rows run on the many-row kernels, with half of

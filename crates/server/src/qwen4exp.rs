@@ -336,6 +336,7 @@ pub(crate) fn load(
                 &session(trial, plan::pool_pages(trial, parallel), spread, own_rows),
             )
             .map_err(|e| named_split(e.to_string()))?;
+            log_trial(&placement, &held);
             spread = pinned(spread, &placement);
             // The pools of the trial are slots again.
             let pages_of_trial = u64::from(plan::pool_pages(trial, parallel));
@@ -376,6 +377,7 @@ pub(crate) fn load(
     let (placement, page_bytes) =
         place(&Gguf::open(&options.model)?, &devices, &session(longest, pages, spread, own_rows))
             .map_err(|e| named_split(e.to_string()))?;
+    log_trial(&placement, &held);
     let spread = pinned(spread, &placement);
     // The rows of the step a prompt read alone takes: as many as asked or the
     // default, as far as the expert slots can lend the scratch for them.
@@ -814,6 +816,52 @@ fn expert_prune(
         asked.from_rank
     );
     Ok(Some(PruneSetup { prune, near }))
+}
+
+/// Says what the trial of the second device's role measured, when `placement`
+/// made one (both devices on every layer, the role not remembered).
+fn log_trial(placement: &ares_model::qwen4exp::device::Placement, held: &[crate::load::Held]) {
+    let Some((tensor, trial)) =
+        placement.tensor.as_ref().and_then(|t| Some((t, t.trial.as_ref()?)))
+    else {
+        return;
+    };
+    let worker = held[1 - tensor.mixer].device.ordinal();
+    let role = |choice: &TensorChoice| {
+        if choice.core_share >= 1.0 && choice.shared_on_mixer {
+            "experts only".to_owned()
+        } else {
+            format!(
+                "{:.0} % of the recurrent heads{}",
+                100.0 * (1.0 - choice.core_share),
+                if choice.shared_on_mixer { "" } else { " and the shared experts" }
+            )
+        }
+    };
+    tracing::info!(
+        "plan: the role of device {worker}, timed at load in {:.1} s ({}): {}; kept: {}",
+        trial.took.as_secs_f64(),
+        if trial.wide_rows > 0 {
+            format!("a decode step and a step of {} rows each", trial.wide_rows)
+        } else {
+            "a decode step each".to_owned()
+        },
+        join(
+            trial
+                .times
+                .iter()
+                .map(|t| format!(
+                    "{} {:.2} ms{}",
+                    role(&t.choice),
+                    t.decode.as_secs_f64() * 1e3,
+                    t.wide
+                        .map_or(String::new(), |w| format!(" and {:.0} ms", w.as_secs_f64() * 1e3))
+                ))
+                .chain(trial.refused.iter().map(|(c, why)| format!("{} refused: {why}", role(c)))),
+            ", "
+        ),
+        role(&trial.kept),
+    );
 }
 
 /// The spread that places the model again as `placement` does: its split of

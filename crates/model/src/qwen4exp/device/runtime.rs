@@ -684,8 +684,11 @@ pub fn batch_rows(
 
 /// Where the layers of the model in `gguf` would go on `devices` with `opts`,
 /// and the bytes one page of the pools would take on each device. Nothing is
-/// allocated; the placement of two devices that share every layer measures a
-/// read of a stream mixer on each.
+/// kept on the devices; the placement of two devices that share every layer
+/// measures a read of a stream mixer on each and, unless `opts.spread` gives
+/// the worker's role, times both roles with parts opened for the trial and
+/// closed again (`roles.rs`): the placement's `TensorPlan::trial` says what
+/// that found. A caller that places the model again pins the choice.
 pub fn place(
     gguf: &Gguf,
     devices: &[Device],
@@ -693,16 +696,18 @@ pub fn place(
 ) -> Result<(Placement, Vec<u64>), OpenError> {
     let config = Config::from_gguf(gguf)?;
     let weights = Weights::load(gguf, &config)?;
-    place_in(&config, &weights, devices, opts)
+    place_in(gguf, &config, &weights, devices, opts)
 }
 
 fn place_in(
+    gguf: &Gguf,
     config: &Config,
     weights: &Weights<'_>,
     devices: &[Device],
     opts: &SessionOptions,
 ) -> Result<(Placement, Vec<u64>), OpenError> {
     let Chosen { placement, .. } = choose(
+        gguf,
         config,
         weights,
         devices,
@@ -809,7 +814,7 @@ impl Qwen4Exp {
         // The sampler reads the logits on the device.
         opts.part.host_logits = false;
         let weights = Weights::load(&gguf, &config)?;
-        let (placement, page_bytes) = place_in(&config, &weights, devices, &opts)?;
+        let (placement, page_bytes) = place_in(&gguf, &config, &weights, devices, &opts)?;
         let (layout, _map) = Layout::new(&gguf, &config, &weights, &placement, None)?;
         let mut pinned = 0;
         let mut declared = Vec::with_capacity(devices.len());
