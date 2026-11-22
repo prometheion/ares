@@ -735,43 +735,89 @@ pub(crate) fn read_vocabulary(path: &Path) -> Result<Arc<[u32]>, LoadError> {
 /// The shares of the attention heads of a tensor split by `shares` for a
 /// context of `pages` pages ([`plan::attention_for_context`]), or, when the
 /// devices cannot hold that many wherever the heads are, the shares with which
-/// they hold the most ([`plan::attention_by_room`]); by estimate: what each
-/// device has left once it holds everything but the heads, and what all heads
-/// take.
+/// they hold the most ([`plan::attention_by_room`]); by estimate.
+///
+/// What a device takes besides the heads is its footprint with every head on
+/// another device: its share of the weights, the scratch, the recurrent state,
+/// and the K and V of the MTP block, which has heads of its own on the device
+/// that holds it (296 MiB for 262 144 tokens of Qwen3.8-27B with K and V in
+/// `q5`). What the heads take is the difference with all of them on the
+/// device, the scratch that grows with the weights included. A device holds
+/// the heads of each block whole, so it can hold up to a head more than its
+/// share (about 100 MiB of the 27B's at that context): the shares are checked
+/// against the footprint of the placement they make, and a device that is
+/// over gives heads to the others until none is (when a round leaves a device
+/// over, the context that fits is smaller, which the plan says or refuses).
 #[allow(clippy::too_many_arguments)]
 fn attention_for_context(
     c: &Config,
     w: &Weights<'_>,
     options: &Options,
     parallel: u32,
-    held: &[Held],
+    free: &[u64],
     shares: &[f64],
     headroom: u64,
     pages: u32,
 ) -> Result<Vec<f64>, LoadError> {
-    let n = held.len();
-    // The footprint of every device with the heads all on device `on`.
-    let with_heads_on = |on: usize| -> Result<Vec<Footprint>, LoadError> {
-        let mut attention = vec![0.0; n];
-        attention[on] = 1.0;
-        let placement =
-            place(c, w, &Spread::TensorWithAttention(shares.to_vec(), attention), options)?;
-        Ok(footprint(c, w, &placement, options, parallel))
+    /// Rounds of checking the shares against the footprint they make: one
+    /// moves the heads a device is over by, and rounding to whole heads may
+    /// leave it over by one.
+    const ROUNDS: usize = 8;
+    let n = free.len();
+    let footprint_of = |attention: Vec<f64>| -> Result<Vec<Footprint>, LoadError> {
+        let spread = Spread::TensorWithAttention(shares.to_vec(), attention);
+        Ok(footprint(c, w, &place(c, w, &spread, options)?, options, parallel))
     };
-    let mut room = Vec::with_capacity(n);
+    let alone_on =
+        |on: usize| -> Vec<f64> { (0..n).map(|i| f64::from(u8::from(i == on))).collect() };
+    let usable: Vec<u64> = free.iter().map(|f| f.saturating_sub(headroom)).collect();
+    // What a device takes without K and V, and with K and V of the pages.
+    let fixed = |f: &Footprint| f.weights + f.step + f.exact + f.per_sequence * u64::from(parallel);
+    let total = |f: &Footprint| fixed(f) + f.per_page * u64::from(pages);
+    let (mut room, mut room_for_pages) = (Vec::with_capacity(n), Vec::with_capacity(n));
     let (mut heads, mut page) = (0, 0);
-    for (i, device) in held.iter().enumerate() {
-        let (all, none) = (with_heads_on(i)?[i], with_heads_on((i + 1) % n)?[i]);
-        let taken = none.weights + none.step + none.exact + none.per_sequence * u64::from(parallel);
-        room.push(device.free.saturating_sub(headroom).saturating_sub(taken));
-        heads = heads.max((all.weights + all.exact).saturating_sub(none.weights + none.exact));
+    for i in 0..n {
+        let all = footprint_of(alone_on(i))?[i];
+        let none = footprint_of(alone_on((i + 1) % n))?[i];
+        room.push(usable[i].saturating_sub(fixed(&none)));
+        room_for_pages.push(usable[i].saturating_sub(total(&none)));
+        heads = heads.max(fixed(&all).saturating_sub(fixed(&none)));
         page = page.max(all.per_page.saturating_sub(none.per_page));
     }
-    plan::attention_for_context(shares, &room, heads, page, pages)
-        .or_else(|| plan::attention_by_room(&room))
-        .ok_or_else(|| {
+    let by_room = || {
+        plan::attention_by_room(&room).ok_or_else(|| {
             refuse("no device has room for the attention heads next to its share of the weights")
         })
+    };
+    let Some(mut attention) =
+        plan::attention_for_context(shares, &room_for_pages, heads, page, pages)
+    else {
+        return by_room();
+    };
+    let per_share = (heads as f64 + page as f64 * f64::from(pages)).max(1.0);
+    let mut most: Vec<f64> =
+        room_for_pages.iter().map(|r| (*r as f64 / per_share).min(1.0)).collect();
+    for _ in 0..ROUNDS {
+        let planned = footprint_of(attention.clone())?;
+        let over: Vec<u64> = planned
+            .iter()
+            .zip(&usable)
+            .map(|(f, usable)| total(f).saturating_sub(*usable))
+            .collect();
+        if over.iter().all(|o| *o == 0) {
+            break;
+        }
+        for i in 0..n {
+            if over[i] > 0 {
+                most[i] = most[i].min(attention[i] - over[i] as f64 / per_share);
+            }
+        }
+        match plan::fit_shares(shares, &most) {
+            Some(fitted) => attention = fitted,
+            None => return by_room(),
+        }
+    }
+    Ok(attention)
 }
 
 /// The placement of `spread`, with the MTP block where `Qwen35::new` puts
@@ -795,11 +841,11 @@ fn place(
     }
 }
 
-fn rooms(held: &[Held], footprint: &[Footprint], headroom: u64) -> Vec<Room> {
-    held.iter()
+fn rooms(free: &[u64], footprint: &[Footprint], headroom: u64) -> Vec<Room> {
+    free.iter()
         .zip(footprint)
-        .map(|(held, f)| Room {
-            usable: held.free.saturating_sub(headroom),
+        .map(|(free, f)| Room {
+            usable: free.saturating_sub(headroom),
             fixed: f.weights + f.step + f.exact,
             per_sequence: f.per_sequence,
             per_page: f.per_page,
@@ -1155,7 +1201,8 @@ fn load_qwen35(
     let holds = |held: &[Held], spread: &Spread| -> Result<bool, LoadError> {
         let placement = place(&config, &weights, spread, &part_options)?;
         let footprint = footprint(&config, &weights, &placement, &part_options, parallel);
-        let pages = plan::pages_that_fit(&rooms(held, &footprint, headroom), parallel);
+        let free: Vec<u64> = held.iter().map(|h| h.free).collect();
+        let pages = plan::pages_that_fit(&rooms(&free, &footprint, headroom), parallel);
         Ok(pages >= plan::pool_pages(smallest, parallel))
     };
     let split = match options.split {
@@ -1292,7 +1339,7 @@ fn load_qwen35(
                         &weights,
                         &part_options,
                         parallel,
-                        &held,
+                        &held.iter().map(|h| h.free).collect::<Vec<_>>(),
                         &shares,
                         headroom,
                         plan::pool_pages(wanted, parallel),
@@ -1312,7 +1359,8 @@ fn load_qwen35(
         ));
     }
     let footprint = footprint(&config, &weights, &placement, &part_options, parallel);
-    let fit = plan::pages_that_fit(&rooms(&held, &footprint, headroom), parallel);
+    let free: Vec<u64> = held.iter().map(|h| h.free).collect();
+    let fit = plan::pages_that_fit(&rooms(&free, &footprint, headroom), parallel);
 
     // Context: tokens of state for all sequences together.
     let model_context = config.n_ctx as u32;
@@ -1330,13 +1378,33 @@ fn load_qwen35(
         )
     };
     let (context, why_context) = match options.context {
-        // Next to other models the estimate decides before the weights are
-        // read; alone the devices' ledgers do at load, as ever.
-        Some(context) if site.beside && fit < plan::pool_pages(context, parallel) => {
-            return Err(LoadError::NoRoom(format!(
-                "the devices cannot hold the model with its context of {context} tokens next to \
-                 what is loaded (by estimate: {})",
-                taken_text()
+        // The estimate decides before the weights are read: a plan is never
+        // above what the devices have free. Next to other models that is no
+        // room, which one of them makes; alone the context is refused.
+        Some(context) if fit < plan::pool_pages(context, parallel) => {
+            let held_tokens = plan::pool_tokens(fit, parallel);
+            if site.beside {
+                return Err(LoadError::NoRoom(format!(
+                    "the devices cannot hold the model with its context of {context} tokens \
+                     next to what is loaded (by estimate: {})",
+                    taken_text()
+                )));
+            }
+            return Err(refuse(format!(
+                "--context {context}: the devices hold about {held_tokens} tokens of context \
+                 for {parallel} sequence{} with this plan (by estimate: {}; K and V take {} per \
+                 1000 tokens); name a smaller context, fewer sequences with --parallel or K and \
+                 V in fewer bits with --kv",
+                if parallel == 1 { "" } else { "s" },
+                taken_text(),
+                join(
+                    held.iter().zip(&footprint).map(|(h, f)| format!(
+                        "{} on device {}",
+                        Bytes(f.per_page * 1000 / u64::from(CELLS_PER_PAGE)),
+                        h.device.ordinal()
+                    )),
+                    " and "
+                ),
             )));
         }
         Some(context) => (context, "as asked".to_owned()),
@@ -1772,5 +1840,85 @@ fn whole(c: &Config, w: &Weights<'_>, options: &Options, parallel: u32, context:
             + all.per_sequence * u64::from(parallel)
             + all.per_page * u64::from(plan::pool_pages(context, parallel)),
         per_device: all.step - margin,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ares_cuda::CacheFormat;
+
+    /// The owner's production settings on the two development cards, as the
+    /// owner's fork serves them (2026-11-22): Qwen3.8-27B UD-Q4_K_S
+    /// (`ARES_TEST_QWEN35_27B`), a tensor split of the weights 0.625 / 0.375,
+    /// 262 144 tokens of context for two sequences, K and V in `q5`, the MTP
+    /// block drafting with a draft vocabulary (`ARES_TEST_DRAFT_VOCAB`, else the
+    /// head's rows), and the free memory the cards had: 11.52 and 11.57 GiB.
+    /// The heads by the context once left the RTX 4070 planned above its free
+    /// memory (the MTP block's K and V were not counted), and the load died; the
+    /// plan now holds the context on both devices within what they have. A
+    /// context they cannot hold is refused by estimate, before anything is
+    /// loaded (here with K and V in `f16`).
+    #[test]
+    fn the_27b_at_the_owners_settings_plans_within_free_memory() {
+        let Some(path) = std::env::var_os("ARES_TEST_QWEN35_27B") else {
+            eprintln!("skipped: set ARES_TEST_QWEN35_27B");
+            return;
+        };
+        let gguf = Gguf::open(&path).unwrap();
+        let config = Config::from_gguf(&gguf).unwrap();
+        let weights = Weights::load(&gguf, &config).unwrap();
+        let vocabulary = std::env::var_os("ARES_TEST_DRAFT_VOCAB")
+            .map(|p| read_vocabulary(Path::new(&p)).unwrap());
+        let parallel = 2;
+        let window_rows = parallel * DEFAULT_WINDOW;
+        let options = |kv: CacheFormat| Options {
+            kv: (kv, kv),
+            logit_rows: window_rows.max(parallel),
+            window_rows,
+            draft_vocabulary: vocabulary.clone(),
+            mtp: true,
+            ..Options::default()
+        };
+        let free = [11_796 * MIB, 11_847 * MIB];
+        let shares = [0.625, 0.375];
+        let context = 262_144;
+        let pages = plan::pool_pages(context, parallel);
+        for (kv, fits) in [(CacheFormat::Q5, true), (CacheFormat::F16, false)] {
+            let options = options(kv);
+            let attention = attention_for_context(
+                &config,
+                &weights,
+                &options,
+                parallel,
+                &free,
+                &shares,
+                VRAM_HEADROOM,
+                pages,
+            )
+            .unwrap();
+            let spread = Spread::TensorWithAttention(shares.to_vec(), attention.clone());
+            let placement = place(&config, &weights, &spread, &options).unwrap();
+            let footprint = footprint(&config, &weights, &placement, &options, parallel);
+            let fit = plan::pages_that_fit(&rooms(&free, &footprint, VRAM_HEADROOM), parallel);
+            for (device, f) in footprint.iter().enumerate() {
+                let planned = f.weights
+                    + f.step
+                    + f.exact
+                    + f.per_sequence * u64::from(parallel)
+                    + f.per_page * u64::from(pages);
+                eprintln!(
+                    "{kv:?}: device {device}: heads {:.3}, {} MiB planned for {pages} pages of \
+                     {} MiB free; {fit} pages fit",
+                    attention[device],
+                    planned / MIB,
+                    free[device] / MIB
+                );
+                if fits {
+                    assert!(planned + VRAM_HEADROOM <= free[device], "{kv:?}: device {device}");
+                }
+            }
+            assert_eq!(fit >= pages, fits, "{kv:?}: {fit} pages fit, {pages} asked");
+        }
     }
 }

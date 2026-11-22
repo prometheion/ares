@@ -4388,8 +4388,21 @@ room is short, `fit_shares`). That is how the plan places the heads
 (`AttentionShares::ByContext`), with no option of its own (the owner,
 2026-11-22): the context steers it, `--context` or, without it, the model's
 own, and when that does not fit wherever the heads are, the heads go by room
-and the context is what VRAM holds. Shares given (`AttentionShares::Given`)
-are for tests and measurements. `tests/real_devices.rs` loads the 27B three
+and the context is what VRAM holds; a `--context` the devices cannot hold is
+refused by estimate before anything is loaded, with the context they do hold.
+The room of a device is what it has once it holds everything but the heads,
+the K and V of the MTP block included (it has heads of its own, on the device
+with the first rows of the head: 296 MiB for 262 144 tokens in `q5`), and the
+heads' cost counts the scratch that grows with their weights. The heads of a
+block are whole, so a device can hold up to a head more than its share (about
+100 MiB of the 27B's at that context): the plan checks the shares against the
+footprint of the placement they make and moves heads off a device that is
+over until none is. (The owner's production settings, `--shares 0.625,0.375
+--context 262144 --parallel 2 --kv q5` with the MTP block, planned the RTX
+4070 20 MiB above its free memory with 0.363 of the heads before, and the load
+died; the plan now gives it 0.320 and 11 491 of its 11 796 MiB free,
+`load.rs` `the_27b_at_the_owners_settings_plans_within_free_memory`.) Shares
+given (`AttentionShares::Given`) are for tests and measurements. `tests/real_devices.rs` loads the 27B three
 ways and compares the planned pages and the text: two sequences, K and V in
 `q8`, no drafters, 890 pages with the heads following the weights, 1770 with a
 quarter of them on the 4070, and 1946 (248 832 tokens: the model's 262 144 do

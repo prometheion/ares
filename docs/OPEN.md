@@ -1010,6 +1010,12 @@ the agents' builds):
       device, fails in the split by layers on two: the warm-up finds 376 VRAM slots for 8 layers x
       48 experts (steps of 196 rows; the other tests take 8 or 64 rows and pass). Something keeps
       8 slots from the store in that placement at that step width.
+- [ ] The 27B at the owner's production settings (`--split tensor --shares 0.625,0.375 --context
+      262144 --parallel 2 --kv q5 --drafters mtp --draft-vocab`, `--ram 16G`): the heads by the
+      context planned the RTX 4070 above its free memory (the MTP block's K and V and whole heads
+      were not counted) and the load died reserving the recurrent state. Fixed by estimate
+      (`devices/load-choice`, the test in `load.rs`: 0.320 of the heads, 11 491 of 11 796 MiB);
+      an asked context the devices cannot hold is refused by estimate. A load on the cards owed.
 - [ ] Rust 1.100 (stable on the test machine) crashes compiling `ares-model --test
       qwen35_failure` (an internal compiler error); 1.99 builds it, and the test passes there.
 - [ ] `qwen4exp_runtime` with the default test threads hung for over 18 minutes once (two device
