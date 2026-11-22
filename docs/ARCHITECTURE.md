@@ -5228,8 +5228,12 @@ experts (268 000 against 806 000 in A4 and B5) and wait 76 s instead of 206. Dec
 tiers warm at 65 000 cells is as fast or faster (the far K and V cost at most 2.6 ms a token
 there by the bench), and at short contexts B is as fast or faster. The 64 tokens right after the
 long prompt are slower in B in all three runs (11.6 to 12.0 against 14.2 to 15.5 in three of
-four A runs); why is not known (measured next: the same build with `--context 66560`, all of it
-in VRAM, against the default). B1's long prompt failed at the first step past the pages in
+four A runs). It is not the overflow: on the two development cards (2026-11-22, load 9 to 46)
+the same build with `--context 66560`, all K and V in VRAM, decoded the 64 tokens right after the
+prompt at 2.9 and 5.6 tokens/s against the overflow's 12.5 and 8.8. A prompt read alone lends
+expert slots for its steps ("Large prompt steps on lent VRAM") and they come back empty, so the
+tokens right after it miss what they held; that build lent steps of 4096 rows, the overflow of
+2048, and the build before on the test machine fewer than this one. B1's long prompt failed at the first step past the pages in
 VRAM: the copy of a layer's far entries into the loan crossed from one locked piece to the next,
 which the driver refuses; fixed by copying a piece at a time.
 

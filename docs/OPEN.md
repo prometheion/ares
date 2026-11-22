@@ -1095,13 +1095,21 @@ DSpark drafter `dspark-Inkling-2-Mini-Q8_0.gguf`, 0.4 GB). Notes: `/var/tmp/ares
         take over the page's memory instead.
   - [ ] The share of the room for K and V in VRAM (a thirty-second, `plan::NEAR_SHARE`) is the old
         rule's, not measured against other shares.
-  - [ ] The tokens right after a long prompt decode slower than before (test machine, 65 100
+  - [x] The tokens right after a long prompt decode slower than before (test machine, 65 100
         tokens: 11.6 to 12.0 tokens/s against 14.2 to 15.5 in three of four runs of the build
-        before), where the same context decodes faster than before once the tiers are warm (16.1
-        and 17.8 against 14.8 and 9.4) and the prompt reads 2.1 times as fast. Not explained;
-        the bench puts the far reads at 2.6 ms a token there. Wanted: the same build with
-        `--context` covering the prompt (all K and V in VRAM) against the default, on a quiet
-        machine.
+        before) while the same context decodes faster once the tiers are warm. Not the overflow
+        (control run on the two development cards, 2026-11-22, load 9 to 46, the same build
+        with `--context 66560`, all K and V in VRAM, against the overflow, B, C, B, C): right
+        after the 64k prompt B decoded 12.5 and 8.8 tokens/s, C 2.9 and 5.6; again from the
+        cache B 16.5 and 6.2, C 5.2 and 11.1. C lent steps of 4096 rows, B of 2048: a prompt
+        read alone lends expert slots for its steps, and they come back empty, so the tokens
+        right after it miss what the slots held; the bigger the loan, the slower they are.
+        Found with it: the block scores of every row of a wide step took 256 KiB a row at the
+        model's own 262 144 cells, which made B's loans smaller per row than they need be;
+        rows are scored 256 at a time since (`SCORE_ROWS`). Open (for the prompt chunks): the
+        slots a loan gave back filled with the hottest experts of RAM before the first token
+        after the prompt; the same no-loan control (`-b 512`) on a quiet machine; the A/B of the
+        build with the rows scored 256 at a time (scripts in `/var/tmp/ares-kv/scripts`).
   - [ ] Pages are near or far by their number: the newest pages of a long sequence are the far
         ones, so its newest cells (often picked by the indexer) are read over the link. Keeping the
         newest pages in VRAM needs pages that move between the pools.
