@@ -223,11 +223,11 @@ Strata kept 0.1.65, which the comparisons use until a newer engine starts there.
       pieces, steps in multiples of 256 rows, the read, core and n-gram buffers in one place on
       a loan (725 -> 486 KiB a row), the CPU's share of steps of up to 2048 rows, a dense
       activation form per type. To measure there against Strata 0.1.65. What is left beside
-      them: the uploads of a layer start only with its record, so the link rests while the next
-      layer's dense half runs (read the next layer's experts ahead in a wide step whose rows
-      pick nearly every expert); the CPU takes no part in steps of more than 2048 rows; about 50
-      KiB a row of VRAM (the step's inputs, plans, predictions) is sized for the widest step for
-      good, which bounds `--batch-size` and costs decode its slots.
+      them: the uploads of a layer start only with its record (`flash/ssd-stream` uploads the
+      next layer's guesses into free transit slots); the CPU takes no part in steps of more than
+      2048 rows; about 40 KiB a row of VRAM (the step's staged and decoded rows, plans,
+      predictions) and 28 KiB of page-locked RAM are sized for the widest step for good, which
+      bounds `--batch-size` and costs decode its slots.
 - [x] The agent suite on the test machine (b-a-on, 2026-11-22): a turn whose prompt is almost
       all cached was read as if it were not (6832 tokens with 6784 cached: 31.2 s, the same as
       uncached; 622 with 512 cached: 12.0 s); Strata 0.33-0.47 s. Two causes: the anchor of the
