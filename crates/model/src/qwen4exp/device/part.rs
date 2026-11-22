@@ -3251,10 +3251,9 @@ impl Part {
             // A step on lent VRAM reads the layer's K and V beyond VRAM from a
             // copy, made behind the append that wrote this step's cells there.
             let stage = if self.on_loan && s.far_stage_len > 0 && self.far_reach > 0 {
-                let group = self.group()?;
-                let bytes = u64::from(self.far_reach) * geo.converted_entry_bytes();
                 let to = self.at(s.far_stage);
-                stream.copy_any(to, group.far_of(&layer), bytes.min(s.far_stage_len) as usize)?;
+                let slots = (s.far_stage_len / geo.converted_entry_bytes()) as u32;
+                self.group()?.copy_far(stream, &layer, self.far_reach.min(slots), to)?;
                 Some(to)
             } else {
                 None

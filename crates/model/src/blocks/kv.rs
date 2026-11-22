@@ -289,6 +289,33 @@ impl Group {
         self.far.as_ref().map(|far| far.near)
     }
 
+    /// Copies the first `slots` far slots of `layer` to `to` on the device, a
+    /// copy per piece of the far pool (a copy of the driver's cannot cross
+    /// from one locked range to the next).
+    pub(crate) fn copy_far(
+        &self,
+        stream: &Stream,
+        layer: &Layer,
+        slots: u32,
+        to: DevicePtr,
+    ) -> Result<(), ModelError> {
+        let Some(far) = &self.far else { return Ok(()) };
+        let (from, entry) = (self.far_of(layer), layer.geo.converted_entry_bytes());
+        let mut slot = 0;
+        while slot < slots {
+            let n = far.piece_slots.min(slots - slot);
+            let at = u64::from(slot) * entry;
+            // SAFETY: the slots below `slots` lie in pieces the step locked,
+            // `to` holds them all (the caller's stage), and the copy stays
+            // inside one piece.
+            unsafe {
+                stream.copy_any(to.offset(at), from.offset(at), (u64::from(n) * entry) as usize)?
+            };
+            slot += n;
+        }
+        Ok(())
+    }
+
     /// The device's entry of the converted entry of `page`.
     pub(crate) fn converted_entry(&self, page: u32) -> u32 {
         converted_entry(self.near(), page)

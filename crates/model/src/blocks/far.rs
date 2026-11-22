@@ -28,6 +28,9 @@ use super::{PAGE_ENTRY, invalid};
 /// is a stall of a few tens of milliseconds once in many thousand cells.
 const PIECE: u64 = 64 << 20;
 
+/// The fewest pieces a pool is cut into.
+const PIECES_AT_LEAST: u32 = 8;
+
 /// The device's entry of page `page` of a group whose first `near` pages are
 /// in VRAM: the page in the pool on the device, or its slot in the far pool.
 pub(crate) fn converted_entry(near: Option<u32>, page: u32) -> u32 {
@@ -37,12 +40,15 @@ pub(crate) fn converted_entry(near: Option<u32>, page: u32) -> u32 {
     }
 }
 
-/// What a group needs of its far pool: where the pages begin to be far, and
-/// where each of its layers keeps their slots on the device.
+/// What a group needs of its far pool: where the pages begin to be far, where
+/// each of its layers keeps their slots on the device, and the slots of a
+/// piece: a copy of the driver's must not cross from one piece to the next
+/// (each is a registration of its own), a kernel's read may.
 #[derive(Clone, Debug)]
 pub(crate) struct FarLayers {
     pub near: u32,
     pub layers: Vec<DevicePtr>,
+    pub piece_slots: u32,
 }
 
 /// The far pool of one device part.
@@ -85,7 +91,9 @@ impl FarPool {
         let unit =
             entries.iter().map(|e| 4096 / gcd(*e, 4096)).fold(1u64, |a, b| a / gcd(a, b) * b);
         let all: u64 = entries.iter().sum();
-        let piece_slots = (PIECE / all.max(1)).max(1).next_multiple_of(unit);
+        // A small pool still grows in steps: at least eight pieces.
+        let most = (PIECE / all.max(1)).min(u64::from(capacity.div_ceil(PIECES_AT_LEAST)));
+        let piece_slots = most.max(1).next_multiple_of(unit);
         let piece_slots = u32::try_from(piece_slots).unwrap_or(u32::MAX).min(capacity).max(1);
         let mut offsets = Vec::with_capacity(entries.len());
         let mut at = 0usize;
@@ -117,6 +125,7 @@ impl FarPool {
         FarLayers {
             near: self.near,
             layers: self.offsets.iter().map(|at| base.offset(*at as u64)).collect(),
+            piece_slots: self.piece_slots,
         }
     }
 
