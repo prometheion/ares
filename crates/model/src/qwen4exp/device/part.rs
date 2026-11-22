@@ -3592,7 +3592,7 @@ impl Part {
     /// K and V of some pages in host memory ([`Options::near_pages`]): booked
     /// and locked in `ram` as it comes into use. The part's K/V group reads
     /// and writes it from now on; whoever drives the part locks its pieces
-    /// before a step names a far page ([`FarPool::ensure`]). `None` when every
+    /// before a step names a far page (`FarPool::ensure`). `None` when every
     /// page is in VRAM or the part has no attention layer.
     pub fn open_far(&mut self, ram: &PinnedRam) -> Result<Option<FarPool>, ModelError> {
         let (near, pages) = (self.opts.near_pages(), self.opts.pages());
