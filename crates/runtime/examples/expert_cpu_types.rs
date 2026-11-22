@@ -10,7 +10,7 @@
 //! that take turns, so that a job reads bytes the one before did not leave in the cache.
 //!
 //! ```sh
-//! cargo run --release -p ares-runtime --example expert_cpu_types -- [workers] [pairs|layers]
+//! cargo run --release -p ares-runtime --example expert_cpu_types -- [workers] [pairs|layers|alone]
 //! ```
 //!
 //! Without a number the workers are placed as the engine places them; with one, that many
@@ -18,7 +18,8 @@
 //! Flash-Next files, as the pool computes them and as one thread does (the main thread, which
 //! runs the job's tasks itself; its time over the job's bytes is the kernels' rate). With
 //! `layers` only the third part runs: jobs of several experts of UD-Q3_K_XL's most common
-//! pair, as a layer of a decode step has them.
+//! pair, as a layer of a decode step has them. With `alone` no pool is made: the pairs of the
+//! files on the calling thread only.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -211,8 +212,40 @@ fn file_pairs(pool: &CpuPool) -> Result<(), String> {
     Ok(())
 }
 
+/// The pairs of types of the Flash-Next files on the calling thread alone, without a pool:
+/// the kernels' rate on one core.
+fn alone() -> Result<(), String> {
+    use GgmlType::*;
+    println!(
+        "| gate and up / down | one thread, 1 row, us | GB/s | gate and up done, us | 4 rows, us |"
+    );
+    println!("| --- | ---: | ---: | ---: | ---: |");
+    for (gate_ty, down_ty) in [
+        (IQ3_XXS, Q5_0),
+        (IQ3_XXS, IQ4_NL),
+        (IQ4_XS, IQ4_NL),
+        (Q4_K, Q5_1),
+        (IQ2_S, Q2_0),
+        (Q2_0, Q2_0),
+    ] {
+        let shape = shape(640, gate_ty, down_ty);
+        let gate = shape.gate_bytes().ok_or("gate size")?;
+        let bytes = (2 * gate + shape.down_bytes().ok_or("down size")?) as f64;
+        let (one, gate_up) = time_layer(Runner::Alone, &shape, 1, 1)?;
+        let (four, _) = time_layer(Runner::Alone, &shape, 1, 4)?;
+        println!(
+            "| {gate_ty} / {down_ty} | {one:.0} | {:.1} | {gate_up:.0} | {four:.0} |",
+            bytes / one / 1e3
+        );
+    }
+    Ok(())
+}
+
 fn main() -> Result<(), String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.iter().any(|a| a == "alone") {
+        return alone();
+    }
     let placement = match args.iter().find_map(|a| a.parse().ok()) {
         Some(workers) => Placement::unpinned(workers),
         None => Placement::for_machine(&Topology::read(), 1),

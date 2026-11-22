@@ -1418,6 +1418,7 @@ macro_rules! q2_down_row {
         /// `row` must address `blocks` whole Q2_0 blocks (18 bytes each),
         /// and every hidden the arrays of `64 * blocks` values rounded up to
         /// 128, as [`store_hidden`] filled them.
+        #[inline]
         #[target_feature(enable = $features)]
         unsafe fn $name<const R: usize>(
             row: *const u8,
@@ -1604,53 +1605,61 @@ const fn block32_minimum(kind: Block32) -> bool {
 /// sums of four.
 macro_rules! block32_down_row {
     ($name:ident, $features:literal, $dot:ident) => {
+        /// The products of `J` rows of the matrix, side by side: their chains
+        /// of sums are independent, which a single row's are not.
+        ///
         /// # Safety
         ///
-        /// `row` must address `blocks` whole blocks of `K`'s kind, and every
-        /// hidden the arrays of `32 * blocks` values as [`store_hidden`]
+        /// Every row must address `blocks` whole blocks of `K`'s kind, and
+        /// every hidden the arrays of `32 * blocks` values as [`store_hidden`]
         /// filled them in the order [`Order::Values`].
+        #[inline]
         #[target_feature(enable = $features)]
-        unsafe fn $name<const K: u8, const R: usize>(
+        unsafe fn $name<const K: u8, const R: usize, const J: usize>(
             t: &Tables,
-            row: *const u8,
+            rows: [*const u8; J],
             blocks: usize,
             hidden: &[Hidden; R],
-            out: &mut [f32; R],
+            out: &mut [[f32; R]; J],
         ) {
             let kind = Block32::ALL[usize::from(K)];
             let bytes = kind.ty().block_bytes() as usize;
-            let mut acc = [_mm256_setzero_ps(); R];
-            let mut minimum = [0.0f32; R];
+            let mut acc = [[_mm256_setzero_ps(); R]; J];
+            let mut minimum = [[0.0f32; R]; J];
             for b in 0..blocks {
-                // SAFETY: block b of the row, and values `32 b ..` of every
+                // SAFETY: block b of the rows, and values `32 b ..` of every
                 // hidden with their two sums and scales, are inside what the
                 // caller vouches for.
                 unsafe {
-                    let (codes, d, m) = decode_block32::<K>(t, row.add(bytes * b));
-                    let magnitudes =
-                        if block32_signed(kind) { _mm256_abs_epi8(codes) } else { codes };
-                    for r in 0..R {
-                        let h = &hidden[r];
-                        let mut q = _mm256_loadu_si256(h.q.add(32 * b).cast());
-                        if block32_signed(kind) {
-                            q = _mm256_sign_epi8(q, codes);
+                    for j in 0..J {
+                        let (codes, d, m) = decode_block32::<K>(t, rows[j].add(bytes * b));
+                        let magnitudes =
+                            if block32_signed(kind) { _mm256_abs_epi8(codes) } else { codes };
+                        for r in 0..R {
+                            let h = &hidden[r];
+                            let mut q = _mm256_loadu_si256(h.q.add(32 * b).cast());
+                            if block32_signed(kind) {
+                                q = _mm256_sign_epi8(q, codes);
+                            }
+                            let sums = $dot(magnitudes, q);
+                            let dh = *h.scale.add(2 * b);
+                            if block32_minimum(kind) {
+                                let hsum = *h.sum.add(2 * b) + *h.sum.add(2 * b + 1);
+                                minimum[j][r] = (m * dh).mul_add(hsum as f32, minimum[j][r]);
+                            }
+                            acc[j][r] = _mm256_fmadd_ps(
+                                _mm256_cvtepi32_ps(sums),
+                                _mm256_set1_ps(d * dh),
+                                acc[j][r],
+                            );
                         }
-                        let sums = $dot(magnitudes, q);
-                        let dh = *h.scale.add(2 * b);
-                        if block32_minimum(kind) {
-                            let hsum = *h.sum.add(2 * b) + *h.sum.add(2 * b + 1);
-                            minimum[r] = (m * dh).mul_add(hsum as f32, minimum[r]);
-                        }
-                        acc[r] = _mm256_fmadd_ps(
-                            _mm256_cvtepi32_ps(sums),
-                            _mm256_set1_ps(d * dh),
-                            acc[r],
-                        );
                     }
                 }
             }
-            for r in 0..R {
-                out[r] = hsum(acc[r]) + minimum[r];
+            for j in 0..J {
+                for r in 0..R {
+                    out[j][r] = hsum(acc[j][r]) + minimum[j][r];
+                }
             }
         }
     };
@@ -1698,7 +1707,6 @@ pub(super) struct DownExpert<'a> {
 /// address `(n_rows - 1) * stride + count` values (`stride >= count`) of which
 /// nobody else writes these, and every `row` be below `n_rows`.
 #[allow(clippy::too_many_arguments)]
-#[target_feature(enable = "avx2,fma,f16c")]
 pub(super) unsafe fn down_rows(
     t: &Tables,
     vnni: bool,
@@ -1711,89 +1719,143 @@ pub(super) unsafe fn down_rows(
     out: *mut f32,
     stride: usize,
 ) {
-    let (blocks, row_bytes) = match kind {
-        DownKind::Other(ty) => {
-            // SAFETY: the caller's guarantees are the function's.
-            return unsafe {
+    // SAFETY: the caller's guarantees are the functions'; the VNNI form runs
+    // only where the caller says the CPU has it.
+    unsafe {
+        match kind {
+            DownKind::Other(ty) => {
                 down_rows_decoded(true, ty, experts, n_ff, n_rows, first, count, out, stride)
-            };
-        }
-        DownKind::Q2_0 => (n_ff / 64, n_ff / 64 * 18),
-        DownKind::Block32(kind) => (n_ff / 32, n_ff / 32 * kind.ty().block_bytes() as usize),
-    };
-    for j in first..first + count {
-        let mut total = [0.0f32; 8];
-        debug_assert!(n_rows <= total.len());
-        for expert in experts {
-            // SAFETY: row j of the expert's matrix is inside it.
-            let row = unsafe { expert.down.add(j * row_bytes) };
-            let mut at = 0;
-            while at < expert.hidden.len() {
-                let n = (expert.hidden.len() - at).min(4);
-                // Runs the kernel for `N` pairs starting at `at`.
-                macro_rules! batch {
-                    ($n:literal) => {{
-                        let mut batch = [expert.hidden[at]; $n];
-                        batch.copy_from_slice(&expert.hidden[at..at + $n]);
-                        let mut dots = [0.0f32; $n];
-                        // Runs the Block32 kernel of kind `$k` in the form the CPU has.
-                        macro_rules! block32 {
-                            ($k:expr) => {{
-                                const K: u8 = $k.number();
-                                if vnni {
-                                    down_row_block32_vnni::<K, $n>(
-                                        t, row, blocks, &batch, &mut dots,
-                                    );
-                                } else {
-                                    down_row_block32_avx2::<K, $n>(
-                                        t, row, blocks, &batch, &mut dots,
-                                    );
-                                }
-                            }};
-                        }
-                        // SAFETY: the caller's guarantees are the kernels';
-                        // the VNNI form runs only where the caller says the
-                        // CPU has it.
-                        unsafe {
-                            match kind {
-                                DownKind::Q2_0 if vnni => {
-                                    down_row_q2_0_vnni::<$n>(row, blocks, &batch, &mut dots)
-                                }
-                                DownKind::Q2_0 => {
-                                    down_row_q2_0_avx2::<$n>(row, blocks, &batch, &mut dots)
-                                }
-                                DownKind::Block32(Block32::Q4_0) => block32!(Block32::Q4_0),
-                                DownKind::Block32(Block32::Q4_1) => block32!(Block32::Q4_1),
-                                DownKind::Block32(Block32::Q5_0) => block32!(Block32::Q5_0),
-                                DownKind::Block32(Block32::Q5_1) => block32!(Block32::Q5_1),
-                                DownKind::Block32(Block32::Q8_0) => block32!(Block32::Q8_0),
-                                DownKind::Block32(Block32::Iq4Nl) => block32!(Block32::Iq4Nl),
-                                // Taken above.
-                                DownKind::Other(_) => {}
-                            }
-                        }
-                        for (r, dot) in dots.into_iter().enumerate() {
-                            let b = usize::from(expert.row[at + r]);
-                            total[b] = expert.weight[at + r].mul_add(dot, total[b]);
-                        }
-                    }};
-                }
-                match n {
-                    1 => batch!(1),
-                    2 => batch!(2),
-                    3 => batch!(3),
-                    _ => batch!(4),
-                }
-                at += n;
             }
-        }
-        for (b, total) in total.iter().enumerate().take(n_rows) {
-            // SAFETY: value j of row b is inside `out`, and this range of j
-            // is this call's alone.
-            unsafe { *out.add(b * stride + j - first) = *total };
+            _ if vnni => down_rows_vnni(t, kind, experts, n_ff, n_rows, first, count, out, stride),
+            _ => down_rows_avx2(t, kind, experts, n_ff, n_rows, first, count, out, stride),
         }
     }
 }
+
+/// Defines [`down_rows`] for the written kinds in one form of the CPU, so
+/// that the kernel of a row is inlined into the loop over the rows: `$q2`
+/// and `$block32` are the row kernels of Q2_0 and of [`Block32`] in that
+/// form.
+macro_rules! down_rows_in {
+    ($name:ident, $features:literal, $q2:ident, $block32:ident) => {
+        /// [`down_rows`] for a written kind in one form of the CPU.
+        ///
+        /// # Safety
+        ///
+        /// As [`down_rows`], and the CPU must have the features of the form.
+        #[allow(clippy::too_many_arguments)]
+        #[target_feature(enable = $features)]
+        unsafe fn $name(
+            t: &Tables,
+            kind: DownKind,
+            experts: &[DownExpert<'_>],
+            n_ff: usize,
+            n_rows: usize,
+            first: usize,
+            count: usize,
+            out: *mut f32,
+            stride: usize,
+        ) {
+            let (blocks, row_bytes) = match kind {
+                DownKind::Q2_0 => (n_ff / 64, n_ff / 64 * 18),
+                DownKind::Block32(kind) => {
+                    (n_ff / 32, n_ff / 32 * kind.ty().block_bytes() as usize)
+                }
+                // The decoded path is the caller's.
+                DownKind::Other(_) => return,
+            };
+            // Rows of the matrix are taken `J` at a time where the pairs are
+            // few: 4 for one pair, 2 for two, 1 from three on.
+            let mut j = first;
+            while j < first + count {
+                let left = first + count - j;
+                let mut total = [[0.0f32; 8]; 4];
+                debug_assert!(n_rows <= 8);
+                let mut step = 1;
+                for expert in experts {
+                    let pairs = expert.hidden.len();
+                    let rows_at = |j: usize| {
+                        // SAFETY: row j of the expert's matrix is inside it.
+                        unsafe { expert.down.add(j * row_bytes) }
+                    };
+                    let mut at = 0;
+                    while at < pairs {
+                        let n = (pairs - at).min(4);
+                        // Runs the kernel for `$n` pairs starting at `at` and `$j`
+                        // rows starting at `j`.
+                        macro_rules! batch {
+                            ($n:literal, $j:literal) => {{
+                                let mut batch = [expert.hidden[at]; $n];
+                                batch.copy_from_slice(&expert.hidden[at..at + $n]);
+                                let rows: [*const u8; $j] = std::array::from_fn(|i| rows_at(j + i));
+                                let mut dots = [[0.0f32; $n]; $j];
+                                macro_rules! block32 {
+                                    ($k:expr) => {
+                                        $block32::<{ $k.number() }, $n, $j>(
+                                            t, rows, blocks, &batch, &mut dots,
+                                        )
+                                    };
+                                }
+                                // SAFETY: the caller's guarantees are the kernels'.
+                                unsafe {
+                                    match kind {
+                                        DownKind::Q2_0 => {
+                                            for (i, dots) in dots.iter_mut().enumerate() {
+                                                $q2::<$n>(rows[i], blocks, &batch, dots);
+                                            }
+                                        }
+                                        DownKind::Block32(Block32::Q4_0) => block32!(Block32::Q4_0),
+                                        DownKind::Block32(Block32::Q4_1) => block32!(Block32::Q4_1),
+                                        DownKind::Block32(Block32::Q5_0) => block32!(Block32::Q5_0),
+                                        DownKind::Block32(Block32::Q5_1) => block32!(Block32::Q5_1),
+                                        DownKind::Block32(Block32::Q8_0) => block32!(Block32::Q8_0),
+                                        DownKind::Block32(Block32::Iq4Nl) => {
+                                            block32!(Block32::Iq4Nl)
+                                        }
+                                        DownKind::Other(_) => {}
+                                    }
+                                }
+                                for (i, dots) in dots.iter().enumerate() {
+                                    for (r, dot) in dots.iter().enumerate() {
+                                        let b = usize::from(expert.row[at + r]);
+                                        total[i][b] =
+                                            expert.weight[at + r].mul_add(*dot, total[i][b]);
+                                    }
+                                }
+                                step = $j;
+                            }};
+                        }
+                        // The rows of a call are the same for every expert and
+                        // pair of it, so a call takes several rows only where it
+                        // is the only call for them.
+                        let alone = experts.len() == 1 && n == pairs;
+                        match (n, alone && left >= 4, alone && left >= 2) {
+                            (1, true, _) => batch!(1, 4),
+                            (1, _, true) => batch!(1, 2),
+                            (1, ..) => batch!(1, 1),
+                            (2, _, true) => batch!(2, 2),
+                            (2, ..) => batch!(2, 1),
+                            (3, ..) => batch!(3, 1),
+                            _ => batch!(4, 1),
+                        }
+                        at += n;
+                    }
+                }
+                for (i, total) in total.iter().enumerate().take(step) {
+                    for (b, total) in total.iter().enumerate().take(n_rows) {
+                        // SAFETY: value j + i of row b is inside `out`, and this
+                        // range of values is this call's alone.
+                        unsafe { *out.add(b * stride + j + i - first) = *total };
+                    }
+                }
+                j += step;
+            }
+        }
+    };
+}
+
+down_rows_in!(down_rows_avx2, "avx2,fma,f16c", down_row_q2_0_avx2, down_row_block32_avx2);
+down_rows_in!(down_rows_vnni, "avx2,fma,f16c,avxvnni", down_row_q2_0_vnni, down_row_block32_vnni);
 
 #[cfg(test)]
 mod tests {
