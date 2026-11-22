@@ -338,7 +338,11 @@ fn no_layout(ty: GgmlType) -> Error {
 /// The group of activation tiles that take every weight tile in turn: what
 /// [`GROUP_L2_SHARE`] allows of tiles of `tile_bytes` of activations, and a divisor
 /// of the tiles when one is near, so that every wave of blocks works on whole groups.
-fn group_of(l2_cache_bytes: u32, tile_bytes: u64, n_batch_tiles: u32) -> u32 {
+/// The tile kernels of the file's layout ([`Kernels::matmul`]) group the same way: on
+/// an RTX 4060 Ti (32 MiB of L2) their f16 path at 512 rows (4 tiles) took 51, 55 and 57
+/// TFLOPS for Q4_K in groups of 3 (and one tile alone), 2 and 4, and at 1024 rows 57, 55
+/// and 58; a fixed 4 MiB had given groups of 3.
+pub(super) fn group_of(l2_cache_bytes: u32, tile_bytes: u64, n_batch_tiles: u32) -> u32 {
     let fits = u64::from(l2_cache_bytes) / GROUP_L2_SHARE / tile_bytes.max(1);
     let group = (fits.clamp(GROUP_MIN, GROUP_MAX) as u32).min(n_batch_tiles);
     (1..=group)

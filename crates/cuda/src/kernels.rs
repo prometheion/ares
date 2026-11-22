@@ -252,15 +252,6 @@ const DECODE_ROWS: [(GgmlType, u32); 16] = [
 /// ([`Kernels::prefill_path_for`]).
 const FLUSH_AS_FAST: [GgmlType; 3] = [GgmlType::Q4_K, GgmlType::IQ2_S, GgmlType::IQ2_XS];
 
-/// The activation bytes the blocks that run together should be able to keep in
-/// L2: the grid is ordered in groups of activation tiles that take every weight
-/// tile in turn (see `kernels/mm.cuh`), and a group is as many tiles as fit in this
-/// many bytes, at least 2 (a group of 1 costs the RTX 4070 10% on the 128-row
-/// shape) and at most 8. The RTX 3060, whose L2 is 3 MiB, does not care.
-const MM_GROUP_BYTES: u64 = 4 << 20;
-const MM_GROUP_MIN: u64 = 2;
-const MM_GROUP_MAX: u64 = 8;
-
 /// The smallest L2 cache, in bytes, for which the small and medium shapes ask L2 to
 /// prefetch the next group of four steps of every row they read (see
 /// `kernels/mm.cuh`). On an RTX 4070 (36 MiB) it takes the small shape from 0.34 to
@@ -1300,9 +1291,13 @@ impl Kernels {
         let shared = shape_info.shared_bytes(elem, *table);
         let n_weight_tiles = n_out.div_ceil(weight_rows);
         let n_batch_tiles = n_rows.div_ceil(batch_rows);
-        let group = (MM_GROUP_BYTES / (u64::from(batch_rows) * act_row_bytes))
-            .clamp(MM_GROUP_MIN, MM_GROUP_MAX);
-        let group = u32::try_from(group).unwrap_or(2).min(n_batch_tiles);
+        // The grid is ordered in groups of activation tiles that take every weight tile
+        // in turn (`kernels/mm.cuh`), sized as for the kernels of the device layouts.
+        let group = layout::group_of(
+            self.device.info().l2_cache_bytes,
+            u64::from(batch_rows) * act_row_bytes,
+            n_batch_tiles,
+        );
         let blocks = u64::from(n_weight_tiles) * u64::from(n_batch_tiles);
         let blocks = u32::try_from(blocks).map_err(|_| Error::Invalid {
             what: "prefill kernel batch",
