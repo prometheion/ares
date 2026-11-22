@@ -693,9 +693,9 @@ pub fn widest_rows<E>(
 /// V hold, `page_bytes` a page on each device, as [`place`] gave them.
 ///
 /// A device lends what the slots of its pools (each the layers whose experts take
-/// slots of one size) hold above a row's picks and the free slots of each of those
-/// layers (the store's floor for a loan), a piece of each pool, in which the
-/// scratch is laid out without a buffer cut by the end of a piece; a step of more rows also
+/// slots of one size) hold above a row's picks of each of those layers (the store's
+/// floor for a loan), a piece of each pool, in which the scratch is laid out without a
+/// buffer cut by the end of a piece; a step of more rows also
 /// keeps the rest of what it needs (its inputs, its exchange, its predictions,
 /// about 50 KiB a row on Flash-Next against 0.5 to 0.7 MiB of scratch) for
 /// good, which the slots lose, as do the parcels a split by layers hands the
@@ -715,8 +715,8 @@ pub fn batch_rows(
     let weights = Weights::load(gguf, &config)?;
     let (layout, _) = Layout::new(gguf, &config, &weights, placement, None)?;
     let own = opts.part.own_rows();
-    let reserve = opts.reserve.unwrap_or(8) as u64;
-    let floor = config.experts.used as u64 + reserve;
+    // A layer keeps a row's picks while a loan runs (`ExpertStore::scratch_floor`).
+    let floor = config.experts.used as u64;
     // Per device: the bytes of a slot of each of its layers, and of the
     // layers of each of its pools (slots of one size), the largest first: a
     // loan takes a piece of each.

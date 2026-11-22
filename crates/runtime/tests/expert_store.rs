@@ -2543,8 +2543,8 @@ fn give_up_pieces_of_two_pools(
 /// again, empty.
 #[test]
 fn a_loan_of_vram_takes_the_last_slots_of_the_pool_and_gives_them_back_empty() {
-    // Eight slots per layer in VRAM, all of RAM; a loan leaves a layer three:
-    // its top-k of two and the free one.
+    // Eight slots per layer in VRAM, all of RAM; a loan leaves a layer two:
+    // its top-k.
     let mut rig = rig(8, 16, |_| {});
     for step in 0..2 {
         let picks: Vec<Vec<u32>> = (0..LAYERS)
@@ -2556,9 +2556,9 @@ fn a_loan_of_vram_takes_the_last_slots_of_the_pool_and_gives_them_back_empty() {
     let (_, pool) = rig.store.place(0);
     let slots_before: Vec<usize> = (0..LAYERS).map(|l| rig.store.slots(l).0).collect();
     assert_eq!(slots_before, [8, 8, 8]);
-    assert_eq!(rig.store.lendable_scratch(0), (3 * (8 - 3)) as u64 * SLOT_BYTES);
+    assert_eq!(rig.store.lendable_scratch(0), (3 * (8 - 2)) as u64 * SLOT_BYTES);
     assert_eq!(
-        rig.store.lend_scratch(0, 16 * SLOT_BYTES).unwrap(),
+        rig.store.lend_scratch(0, 19 * SLOT_BYTES).unwrap(),
         None,
         "more than the layers have"
     );
@@ -2676,10 +2676,9 @@ fn a_loan_takes_the_last_slots_of_every_pool_it_asks_and_gives_them_back() {
         mixed_step(&mut store, &picks).unwrap();
     }
     // The small pool (four layers) holds more bytes than the large one: it is
-    // the first piece. Each layer keeps three slots: a row's two picks and the
-    // free one.
+    // the first piece. Each layer keeps two slots: a row's two picks.
     let (small_slot, large_slot) = (3 * SMALL as u64, 3 * LARGE as u64);
-    assert_eq!(store.lendable_pieces(0), [4 * 5 * small_slot, 5 * large_slot]);
+    assert_eq!(store.lendable_pieces(0), [4 * 6 * small_slot, 6 * large_slot]);
     let pieces = [7 * small_slot, 3 * large_slot - 10];
     let loans = store.lend_pieces(0, &pieces).unwrap().expect("a loan");
     assert_eq!(loans.len(), 2);

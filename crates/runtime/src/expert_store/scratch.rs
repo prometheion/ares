@@ -10,8 +10,8 @@
 //! Those slots belong to
 //! several layers and hold whatever was read into them, so they are not taken
 //! as they lie: every layer of the pool gives slots in proportion to what it
-//! has above the fewest a layer keeps during a loan (a row's picks and the
-//! free slots, [`ExpertStore::scratch_floor`]), each layer gives its coldest,
+//! has above the fewest a layer keeps during a loan (a row's picks,
+//! [`ExpertStore::scratch_floor`]), each layer gives its coldest,
 //! what they held is evicted as any evicted expert is (copied down to RAM when
 //! the RAM tier keeps it), and the experts that lie in the lent slots and stay
 //! are moved on the device into the slots that were given, whose numbers then
@@ -69,10 +69,17 @@ impl LentScratch {
 }
 
 impl<D: SlotDevice> ExpertStore<D> {
-    /// The fewest slots a layer keeps in VRAM while a loan runs: a row's picks
-    /// and the free slots, or the layer's floor where that is lower.
+    /// The fewest slots a layer keeps in VRAM while a loan runs: a row's picks, or the
+    /// layer's floor where that is lower. Not the free slots a layer keeps for experts that
+    /// arrive before it runs: only a prompt read alone runs on a loan, and the misses of its
+    /// wide steps go through transit, not into the tier's slots; the steps that run beside a
+    /// loan (a generating sequence's while a prompt read layer by layer is paused, or before
+    /// a loan has gone back) upload where a slot their rows did not pick is free and leave the
+    /// others to the CPU, as any step on a layer with fewer slots than it picks does. Every
+    /// slot above that is VRAM a prompt's step can be wider by, and each step reads again from
+    /// the file what the tiers do not hold.
     pub fn scratch_floor(&self, layer: usize) -> usize {
-        (self.config.top_k as usize + self.config.vram_reserve).min(self.vram.floor[layer])
+        (self.config.top_k as usize).min(self.vram.floor[layer])
     }
 
     /// The pools of the tier a loan of `device` takes its slots from, with the
