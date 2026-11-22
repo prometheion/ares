@@ -98,6 +98,8 @@ the kernels exist; no model runs there yet.
 - `--chat-template-file` replaces the model file's chat template.
 - A last assistant message is continued (llama.cpp's prefill, `continue_final_message`,
   Anthropic's prefill), in its answer or in its reasoning.
+- Claude Code (2.1) as a client of `/v1/messages`: `context_management` with
+  `clear_thinking_20251015`, `thinking.display`, system turns between the others, effort `high`.
 - `--queue <N>`: a full line answers 503 with `Retry-After`; `--timeout` for reading a request
   and writing an answer.
 - Router mode: `--models-preset <file.ini>` with one section per model and `[*]` for all;

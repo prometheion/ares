@@ -378,9 +378,14 @@ Everything `FEATURES.md` lists for the 27B and not for Flash-Next is owed:
       (2026-11-17).
 - Not owed (the owner, 2026-11-16): replies that are bit for bit the same from run to run.
   They differ slightly when the CPU computes missed experts, and that is accepted.
-- [ ] Structured output, tool calls and the Messages and Responses routes have never run on
-      the real Flash-Next file (the runtime and server code is shared; a smoke script for
-      tools exists and was not run).
+- [x] Structured output, tool calls and the Messages and Responses routes on the real
+      Flash-Next file (2026-11-22, branch `server/flash-api`): the suites `real_tools`,
+      `real_structured`, `real_messages` and `real_responses` run on any file the server loads
+      (`ARES_TEST_API_MODEL`, flags in `ARES_TEST_API_FLAGS`) and pass on Flash-Next (two
+      cards, `--ram 8G`). Its replies are not repeatable, so two replies to one request (a
+      stream and the whole reply, with drafts and without) are compared where they are the
+      same tokens and checked each on its own otherwise. Claude Code against Ares: see "Claude
+      Code against Ares" under "Server and API".
 
 ## Qwen3.8 27B (`qwen35`)
 - [ ] Seen 2026-11-17 (main 4bec4b9 as well): with `max_tokens` 40 the first greedy reply to
@@ -521,7 +526,15 @@ Flash-Next); experts that do not fit in VRAM in RAM; K/V in int8. Its README giv
       drafts; a guard for `ignore_eos` with a complete grammar; the end-token rule for a
       schema with thinking; llama.cpp's `json.gbnf` costs 6.8 ms per mask.
 - [ ] Responses: stored responses (A05), WebSocket (A06); the chat route's sampler fields
-      are refused there. Messages: never run against Claude Code.
+      are refused there.
+- [ ] Chat and Responses routes: a system or developer message inside a conversation reaches
+      the template, and the templates of Qwen3.8 refuse it (the Messages route gives it to the
+      template as a user turn); `reasoning_effort: high` reaches Flash-Next's template, which
+      knows `xhigh`, `medium` and `low` and refuses it (the Messages route maps Anthropic's
+      `high`, its default, to the template's default).
+- [ ] Messages: `thinking.display: omitted` gets the thinking whole (to omit it and still have
+      it in the next prompt, the signature would have to carry it); a response does not list
+      `context_management.applied_edits`; `clear_tool_uses_20250919` is refused.
 - [ ] Router: load and unload times in the docs; "no room" for Flash-Next is recognised by
       message text; a plan cannot be asked without loading; two elastic models on real devices.
 - [ ] A request with tools or an effort for an unknown model gets a 400 where a 404 belongs.
@@ -531,6 +544,34 @@ Flash-Next); experts that do not fit in VRAM in RAM; K/V in int8. Its README giv
       programs (V04), container image and service unit (X09), key roles and a reload of the
       key file (X02), TLS (X03).
 - [ ] `/props` of a model that is not loaded (today: 503 `model_not_loaded`, as `/metrics`).
+
+### Claude Code against Ares (2026-11-22, Claude Code 2.1.301, print mode)
+Claude Code in a sandbox of its own (own home, a throwaway project, `ANTHROPIC_BASE_URL` on
+Ares), three small tasks: read a file and judge a function, fix it with Edit and run the tests
+with Bash. Scripts and logs in `/var/tmp/ares-flashapi` (`notes.md`).
+- [x] Claude Code could not talk to Ares at all: `context_management`, `thinking.display` and
+      system turns between the others were refused, and effort `high` would have reached
+      Flash-Next's template, which refuses it. Served since (see "The Messages API" in
+      `ARCHITECTURE.md`).
+- [x] A stream's response started only with the first token: Claude Code gave up after six
+      minutes while Flash-Next computed its first prompt and sent it again. It now starts
+      after 10 s without it (`Config::stream_wait`).
+- Flash-Next (two cards, `--ram 8G`, its MTP block, machine load 8 to 27 from other builds):
+  the tasks are done right, in 3 and 4 turns. Claude Code's first prompt is 16.3 thousand
+  tokens (the 20 tools of its default set; 3.5 thousand with `--tools Read,Edit,Bash`), read at
+  25 to 61 tokens/s: 3.5 to 4.5 minutes to the first token. A turn that continues the cached
+  conversation has its first token in 3 to 9 s; replies come at 5 to 9 tokens/s with 50 to 90 %
+  of the drafts accepted.
+- [ ] A new session reads the whole 16 thousand tokens again: the root checkpoint ("Next",
+      item 2). Even with it the sessions part at the first line: Claude Code 2.1.301 writes no
+      `cch=` but `cc_version=2.1.301.<3 hex>` (`66d` for one task, `e64` for another) in its
+      billing line, so a stamp that is pinned must include that suffix (item 1).
+- [ ] Claude Code gives a tool's input back with the defaults of its schema added
+      (`{"replace_all": false, ...}` first, where the model wrote `file_path`, `old_string`,
+      `new_string`), so the history parts from the cached sequence inside the last reply. On
+      Flash-Next with one checkpoint place (`--ram 8G` without `--cache`) that turn replayed all
+      16512 cached rows: 373 s to the first token for 242 new tokens. A checkpoint at every
+      message boundary ("Next", item 2) brings it to the rows of the reply.
 
 ## Whole features not started
 - [ ] Image input (F11; the owner's preset sets `mmproj`). Design: `/var/tmp/ares-survey/image-input-design.md`
