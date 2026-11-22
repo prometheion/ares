@@ -2314,6 +2314,18 @@ struct Qwen4ExpDevice {
 }
 
 impl Qwen4ExpDevice {
+    /// Page `page` is in use until the pool frees it.
+    fn mark_live(&mut self, page: u32) {
+        if self.near.is_none() {
+            return;
+        }
+        if self.live.len() <= page as usize {
+            self.live.resize(page as usize + 1, false);
+        }
+        self.live[page as usize] = true;
+        self.highest = self.highest.max(Some(page));
+    }
+
     /// The far slots the step needs locked: up to the highest page the
     /// tables name after its updates, minus the pages in VRAM.
     fn far_slots(&mut self, record: &ares_runtime::RecordView<'_>) -> u32 {
@@ -2326,12 +2338,7 @@ impl Qwen4ExpDevice {
             }
         }
         for k in 0..record.entries() {
-            let page = record.entry(k) & !PAGE_ENTRY;
-            if self.live.len() <= page as usize {
-                self.live.resize(page as usize + 1, false);
-            }
-            self.live[page as usize] = true;
-            self.highest = self.highest.max(Some(page));
+            self.mark_live(record.entry(k) & !PAGE_ENTRY);
         }
         if lowered {
             self.highest = self.live.iter().rposition(|l| *l).map(|p| p as u32);
@@ -2857,6 +2864,11 @@ impl DeviceModel for Qwen4ExpDevice {
         cx: &TransferContext<'_>,
         item: &mut DeviceTransfer,
     ) -> Result<(), ModelError> {
+        // A page that comes in is in use from now on, before a step's tables
+        // name it: the piece of the far pool it lies in is not given back.
+        if item.kind == ares_runtime::TransferKind::PageIn {
+            self.mark_live(item.object);
+        }
         self.resume.transfer(cx.stream, cx.pages, item, &mut self.part, self.mtp.as_mut())
     }
 

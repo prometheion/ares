@@ -708,25 +708,26 @@ fn start_near(
 
 /// The K and V of the pages beyond the first lie in page-locked host memory, which the
 /// device reads and writes over its link (`blocks/far.rs`): a prompt of three pages answers
-/// with the same tokens as with every page in VRAM, in steps of the decode kernels, in wide
-/// steps, and in wide steps on lent VRAM (which read a copy of a layer's far entries), in
-/// every placement. The kernels read the same bytes from another address, so with every
-/// expert in a slot the answers are the same token for token.
+/// with the same tokens as with every page in VRAM, in steps of the decode kernels and in
+/// wide steps, in every placement. The kernels read the same bytes from another address, so
+/// with every expert in a slot the answers are the same token for token. Wide steps on lent
+/// VRAM read a copy of a layer's far entries; their slots lend, so experts are fetched there
+/// and the answer starts as the reference's (as in the test of lent steps).
 #[test]
 fn k_and_v_beyond_vram_change_no_token() {
     if !enabled() {
         return;
     }
     let prompt = prompt(300, 7);
+    let leading = |a: &[u32], b: &[u32]| a.iter().zip(b).take_while(|(x, y)| x == y).count();
     // Experts in BF16, whose slots lend enough for a few wide steps' scratch.
     let lending = gguf_path_of(1, GgmlType::BF16, GgmlType::Q4_0);
-    let cases =
-        [(gguf_path(1), (MAX_ROWS, 0)), (gguf_path(1), (WIDE_ROWS, 0)), (lending, (LENT_ROWS, 8))];
+    let reference = reference_answer_at(&lending, &prompt, 16);
     for placement in placements() {
-        for (path, rows) in &cases {
+        for rows in [MAX_ROWS, WIDE_ROWS] {
             let mut answers = Vec::new();
             for near in [None, Some(1)] {
-                let (runtime, model) = start_near(path, placement, *rows, near);
+                let (runtime, model) = start_near(&gguf_path(1), placement, (rows, 0), near);
                 let _ = ask(&runtime, 1, &prompt, 24);
                 warm(&model);
                 let got = ask(&runtime, 2, &prompt, 24);
@@ -735,13 +736,30 @@ fn k_and_v_beyond_vram_change_no_token() {
                 answers.push(got);
             }
             eprintln!(
-                "FAR {placement:?}, steps of {rows:?} rows: {} of {} tokens as with every page in \
+                "FAR {placement:?}, steps of {rows} rows: {} of {} tokens as with every page in \
                  VRAM",
-                answers[0].iter().zip(&answers[1]).take_while(|(a, b)| a == b).count(),
+                leading(&answers[0], &answers[1]),
                 answers[0].len()
             );
-            assert_eq!(answers[1], answers[0], "{placement:?}, {rows:?} rows: K and V in RAM");
+            assert_eq!(answers[1], answers[0], "{placement:?}, {rows} rows: K and V in RAM");
         }
+        let mut lent = Vec::new();
+        for near in [None, Some(1)] {
+            let (runtime, model) = start_near(&lending, placement, (LENT_ROWS, MAX_ROWS), near);
+            assert_eq!(runtime_rows(&model), (LENT_ROWS, MAX_ROWS));
+            lent.push(ask(&runtime, 1, &prompt, 16));
+            let stats = model.take_store_stats().expect("the parts are open");
+            runtime.shutdown();
+            assert!(stats.scratch_loans > 0, "{placement:?}: the prompt ran on no loan");
+        }
+        eprintln!(
+            "FAR {placement:?}, lent steps of {LENT_ROWS} rows: {} and {} tokens as the \
+             reference's (every page in VRAM, K and V beyond the first page in RAM), {} alike",
+            leading(&lent[0], &reference),
+            leading(&lent[1], &reference),
+            leading(&lent[0], &lent[1])
+        );
+        assert!(leading(&lent[1], &reference) >= 2, "{placement:?}: {:?}", lent[1]);
         // The session with its pages beyond the first in RAM says what the session says.
         let want = session_answer(1, placement, &prompt, 24);
         assert_eq!(session_answer_near(placement, &prompt, 24, 1), want, "{placement:?}");
