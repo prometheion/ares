@@ -6416,10 +6416,16 @@ context or the expert slots give it up, and the part reserves it in its ledger
 at load. The scratch's last region also takes the image's rows at the end of
 the pass, which are read back to the host from there.
 
-**Not built.** The MTP block and the DFlash drafter read an image cell as the
-pad token's embedding at the cell's position (the main model's rows are
-right; only the acceptance of drafts after an image can suffer). Images are
-not fetched from URLs, and the rows of the store are not kept on SSD.
+**The drafters.** The MTP block writes its keys and runs the links of its
+chains at the rotary positions of the step's rows, as the model's attention
+does (`blocks::mtp::Driver::set_rotary`), but it reads an image cell as the pad
+token's embedding, where llama.cpp hands the draft context the image's rows;
+the DFlash drafter takes the cells as positions. Only the acceptance of drafts
+after an image can suffer: what is accepted is the main model's pick.
+
+**Not built.** Images are not fetched from URLs, and the rows of the store are
+not kept on SSD (a conversation resumed after a restart runs the tower once
+for each image whose cells are replayed).
 
 ## What is taken from where
 

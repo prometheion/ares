@@ -834,9 +834,10 @@ DSpark drafter `dspark-Inkling-2-Mini-Q8_0.gguf`, 0.4 GB). Notes: `/var/tmp/ares
         measured; the share counts a piece with a tower job as one piece.
   - [x] 5. The splice in `qwen35`: the staged rows copied over the gathered ones on the part that
         embeds (one card, layer split, tensor split), the records of a split's groups at the rows'
-        rotary positions. Open: the MTP block and DFlash read an image cell as the pad token's
-        embedding at its cell (drafts after an image may be accepted less often; the output is
-        the main model's).
+        rotary positions, and the MTP block's keys and chain links at them too. Open: the MTP
+        block reads an image cell as the pad token's embedding (llama.cpp gives the draft context
+        the image's rows), DFlash takes cells as positions; drafts after an image may be accepted
+        less often, the output is the main model's.
   - [x] 6. The splice in `qwen4exp`: the same copy on the part that embeds, Flash-Next's own step
         record at the rows' rotary positions; the n-gram feed hashes the pad token, which the
         model checks is `ple.image_token_id`. Not run on Flash-Next yet (see the hand-back).
