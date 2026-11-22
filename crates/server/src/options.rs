@@ -106,6 +106,9 @@ pub fn lookup(name: &str) -> Option<(&'static str, Kind)> {
         "--drafters" => ("--drafters", Kind::Value),
         "--window" => ("--window", Kind::Value),
         "--draft-vocab" => ("--draft-vocab", Kind::Value),
+        "--mmproj" => ("--mmproj", Kind::Value),
+        "--mmproj-weights" => ("--mmproj-weights", Kind::Value),
+        "--image-max-tokens" => ("--image-max-tokens", Kind::Value),
         "--chat-var" => ("--chat-var", Kind::Value),
         "--chat-template-file" => ("--chat-template-file", Kind::Value),
         "--queue" => ("--queue", Kind::Value),
@@ -139,6 +142,9 @@ pub fn names() -> impl Iterator<Item = &'static str> {
         "--drafters",
         "--window",
         "--draft-vocab",
+        "--mmproj",
+        "--mmproj-weights",
+        "--image-max-tokens",
         "--chat-var",
         "--chat-template-file",
         "--queue",
@@ -343,6 +349,26 @@ pub fn set(options: &mut ModelOptions, flag: &'static str, value: &str) -> Resul
             load.window = Some(rows);
         }
         "--draft-vocab" => load.draft_vocabulary = Some(PathBuf::from(value)),
+        "--mmproj" => {
+            if value.trim().is_empty() {
+                return Err(invalid("--mmproj", value, "a projector file"));
+            }
+            load.mmproj = Some(PathBuf::from(value));
+        }
+        "--mmproj-weights" => {
+            load.mmproj_weights = match value {
+                "ram" => plan::ProjectorWeights::Ram,
+                "vram" => plan::ProjectorWeights::Vram,
+                _ => return Err(invalid("--mmproj-weights", value, "ram or vram")),
+            };
+        }
+        "--image-max-tokens" => {
+            let rows: u32 = number("--image-max-tokens", value, "a number of rows, 8 to 4096")?;
+            if !(plan::IMAGE_MIN_TOKENS..=plan::IMAGE_MAX_TOKENS).contains(&rows) {
+                return Err(invalid("--image-max-tokens", value, "a number of rows, 8 to 4096"));
+            }
+            load.image_max_tokens = rows;
+        }
         "--chat-template-file" => {
             if value.trim().is_empty() {
                 return Err(invalid("--chat-template-file", value, "a file"));

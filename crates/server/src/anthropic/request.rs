@@ -231,9 +231,8 @@ fn text_block<'a>(at: &str, value: &'a Json) -> Result<&'a str, ApiError> {
 /// Why a block of a kind that is not served is refused.
 fn refuse_block(at: &str, kind: &str) -> ApiError {
     let why = match kind {
-        "image" | "document" => {
-            "images and documents cannot be read: input other than text is not built"
-        }
+        "document" => "documents cannot be read: input other than text and images is not built",
+        "image" => "an image stands in a turn of the user or in the result of a tool",
         "server_tool_use"
         | "web_search_tool_result"
         | "web_fetch_tool_result"
@@ -244,6 +243,57 @@ fn refuse_block(at: &str, kind: &str) -> ApiError {
         _ => "it is not a kind of block this server reads here",
     };
     refuse(at, format!("{at}: a block of the type '{kind}' is not supported: {why}"))
+}
+
+/// An image block as the part of a chat message the chat route reads
+/// (`image_url` with a data URL): base64 data with its media type. An image
+/// at a URL is not fetched.
+fn image_part(at: &str, value: &Json) -> Result<Json, ApiError> {
+    let fields = block(at, value, &["type", "source", "cache_control"])?;
+    let at_source = format!("{at}.source");
+    let source = fields
+        .get("source")
+        .ok_or_else(|| refuse(at_source.clone(), format!("{at_source} is required")))?;
+    let url = match kind(&at_source, source)? {
+        "base64" => {
+            let source = block(&at_source, source, &["type", "media_type", "data"])?;
+            let media = text_member(&at_source, &source, "media_type")?;
+            if !media.starts_with("image/") {
+                return Err(refuse(
+                    at_source.clone(),
+                    format!("{at_source}.media_type '{media}' is not an image"),
+                ));
+            }
+            format!("data:{media};base64,{}", text_member(&at_source, &source, "data")?)
+        }
+        "url" => {
+            return Err(refuse(
+                at_source.clone(),
+                format!(
+                    "{at_source}: images are not fetched from URLs; send the image itself (a \
+                     source of the type 'base64')"
+                ),
+            ));
+        }
+        other => {
+            return Err(refuse(
+                at_source.clone(),
+                format!("{at_source}: a source of the type '{other}' is not read"),
+            ));
+        }
+    };
+    Ok(object(vec![
+        ("type", string("image_url")),
+        ("image_url", object(vec![("url", string(url))])),
+    ]))
+}
+
+/// The parts of a message with images, as the chat route reads them: every
+/// text block a text part, every image an `image_url` part, in their order.
+/// The chat route joins them as llama-server does (a line break between two
+/// texts, none next to an image).
+fn text_part(text: &str) -> Json {
+    object(vec![("type", string("text")), ("text", string(text))])
 }
 
 /// Appends `text` to the text of a message, after a line break if there is
@@ -514,19 +564,48 @@ fn user(at: &str, content: &Json, chat: &mut Vec<Json>) -> Result<(), ApiError> 
         }
         other => return Err(content_type(at, other)),
     };
+    // The user's blocks up to a result of a tool: their text, and their parts
+    // once an image is among them.
     let mut text: Option<String> = None;
+    let mut parts: Vec<Json> = Vec::new();
+    let flush = |text: &mut Option<String>, parts: &mut Vec<Json>, chat: &mut Vec<Json>| {
+        if parts.is_empty() {
+            chat.extend(text.take().map(message));
+        } else {
+            chat.push(object(vec![
+                ("role", string("user")),
+                ("content", Json::Array(std::mem::take(parts))),
+            ]));
+            *text = None;
+        }
+    };
     for (j, value) in blocks.iter().enumerate() {
         let at = format!("{at}.content[{j}]");
         match kind(&at, value)? {
-            "text" => join(&mut text, text_block(&at, value)?),
+            "text" => {
+                let piece = text_block(&at, value)?;
+                if parts.is_empty() {
+                    join(&mut text, piece);
+                } else {
+                    parts.push(text_part(piece));
+                }
+            }
+            "image" => {
+                if parts.is_empty()
+                    && let Some(before) = text.take()
+                {
+                    parts.push(text_part(&before));
+                }
+                parts.push(image_part(&at, value)?);
+            }
             "tool_result" => {
-                chat.extend(text.take().map(message));
+                flush(&mut text, &mut parts, chat);
                 chat.push(tool_result(&at, value)?);
             }
             other => return Err(refuse_block(&at, other)),
         }
     }
-    chat.extend(text.map(message));
+    flush(&mut text, &mut parts, chat);
     Ok(())
 }
 
@@ -537,6 +616,8 @@ fn tool_result(at: &str, value: &Json) -> Result<Json, ApiError> {
     let known = ["type", "tool_use_id", "content", "is_error", "cache_control"];
     let fields = block(at, value, &known)?;
     let id = text_member(at, &fields, "tool_use_id")?;
+    // A result with images is parts, as a user's turn with images.
+    let mut parts: Vec<Json> = Vec::new();
     let mut text = match fields.get("content") {
         None => String::new(),
         Some(Json::String(text)) => text.clone(),
@@ -545,7 +626,16 @@ fn tool_result(at: &str, value: &Json) -> Result<Json, ApiError> {
             for (k, value) in blocks.iter().enumerate() {
                 let at = format!("{at}.content[{k}]");
                 match kind(&at, value)? {
-                    "text" => join(&mut whole, text_block(&at, value)?),
+                    "text" if parts.is_empty() => join(&mut whole, text_block(&at, value)?),
+                    "text" => parts.push(text_part(text_block(&at, value)?)),
+                    "image" => {
+                        if parts.is_empty()
+                            && let Some(before) = whole.take()
+                        {
+                            parts.push(text_part(&before));
+                        }
+                        parts.push(image_part(&at, value)?);
+                    }
                     other => return Err(refuse_block(&at, other)),
                 }
             }
@@ -564,11 +654,16 @@ fn tool_result(at: &str, value: &Json) -> Result<Json, ApiError> {
             ));
         }
     }
-    Ok(object(vec![
-        ("role", string("tool")),
-        ("tool_call_id", string(id)),
-        ("content", string(text)),
-    ]))
+    let content = if parts.is_empty() {
+        string(text)
+    } else {
+        // The mark of an error goes before the parts.
+        if !text.is_empty() {
+            parts.insert(0, text_part(&text));
+        }
+        Json::Array(parts)
+    };
+    Ok(object(vec![("role", string("tool")), ("tool_call_id", string(id)), ("content", content)]))
 }
 
 /// A turn of the assistant: text, thinking and the calls of tools.

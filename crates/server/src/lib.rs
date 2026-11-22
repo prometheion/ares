@@ -49,6 +49,7 @@ mod anthropic;
 mod bridge;
 pub mod defaults;
 mod error;
+mod images;
 mod latency;
 mod listen;
 pub mod load;

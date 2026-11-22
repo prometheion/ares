@@ -148,6 +148,31 @@ pub struct LoadOptions {
     /// Pruning of the picks of a mixture of experts that only the SSD holds.
     /// `None`: none, the output as the model gives it.
     pub expert_prune: Option<ExpertPrune>,
+    /// The projector the model reads images through (`--mmproj`): the image
+    /// tower's GGUF beside the model's. `None`: the model reads no images.
+    pub mmproj: Option<PathBuf>,
+    /// Where the projector's weights stay between images.
+    pub mmproj_weights: ProjectorWeights,
+    /// The most rows (tokens) one image becomes; a larger image is shrunk to
+    /// fit ([`IMAGE_MAX_TOKENS`] by default, as llama.cpp).
+    pub image_max_tokens: u32,
+}
+
+/// The fewest and the most rows an image becomes: llama.cpp's limits for this
+/// projector. `--image-max-tokens` lowers the most.
+pub const IMAGE_MIN_TOKENS: u32 = 8;
+pub const IMAGE_MAX_TOKENS: u32 = 4096;
+
+/// Where a projector's weights stay between images (`--mmproj-weights`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ProjectorWeights {
+    /// In page-locked RAM, inside `--ram`, uploaded block by block for every
+    /// new image (the owner's choice, 2026-11-16: VRAM is worth more as
+    /// context).
+    #[default]
+    Ram,
+    /// In VRAM, which the context gives up.
+    Vram,
 }
 
 impl LoadOptions {
@@ -176,6 +201,9 @@ impl LoadOptions {
             chat_template: None,
             queue: None,
             expert_prune: None,
+            mmproj: None,
+            mmproj_weights: ProjectorWeights::Ram,
+            image_max_tokens: IMAGE_MAX_TOKENS,
         }
     }
 }

@@ -30,6 +30,8 @@ ares-tokenizer.workspace = true
 
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
 futures-util = { version = "0.3", default-features = false }
+# Decoding the images of requests (JPEG, PNG, GIF, WebP, BMP) to RGB pixels.
+image = { version = "0.25", default-features = false, features = ["bmp", "gif", "jpeg", "png", "webp"] }
 # The connections, with the timeouts of reading a request and of writing an
 # answer (the `listen` module); axum serves on the same.
 hyper = { version = "1", features = ["http1", "server"] }

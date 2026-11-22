@@ -578,6 +578,25 @@ fn message(at: &str, value: &Json, all: &mut Conversation) -> Result<(), ApiErro
             ),
         ));
     }
+    // A message of the user with images: its parts as the chat route reads
+    // them (`text` and `image_url`), joined there as llama-server joins them.
+    if role == "user"
+        && let Some(Json::Array(parts)) = fields.get("content")
+        && parts.iter().any(|p| p.get("type").and_then(Json::as_str) == Some("input_image"))
+    {
+        let mut chat_parts = Vec::with_capacity(parts.len());
+        for (j, part) in parts.iter().enumerate() {
+            let at = format!("{at}.content[{j}]");
+            if part.get("type").and_then(Json::as_str) == Some("input_image") {
+                chat_parts.push(image_part(&at, part)?);
+            } else {
+                let text = text_part(&at, part, role)?;
+                chat_parts.push(object(vec![("type", string("text")), ("text", string(text))]));
+            }
+        }
+        all.push(vec![("role", string("user")), ("content", Json::Array(chat_parts))]);
+        return Ok(());
+    }
     let text = match fields.get("content") {
         Some(Json::String(text)) => text.clone(),
         Some(Json::Array(parts)) => {
@@ -633,11 +652,35 @@ fn text_part<'a>(at: &str, part: &'a Json, role: &str) -> Result<&'a str, ApiErr
     }
 }
 
+/// An `input_image` part as the part of a chat message the chat route reads
+/// (`image_url`): an image given by a data URL. One given by `file_id` or at a
+/// remote URL is not read.
+fn image_part(at: &str, part: &Json) -> Result<Json, ApiError> {
+    let fields = known(at, part, &["type", "image_url", "file_id", "detail"])?;
+    if fields.get("file_id").is_some_and(|v| !v.is_null()) {
+        return Err(refuse(
+            at,
+            format!("{at}.file_id: files are not kept by this server; send the image as image_url"),
+        ));
+    }
+    match fields.get("detail") {
+        None | Some(Json::Null) => {}
+        Some(Json::String(detail)) if ["auto", "low", "high"].contains(&detail.as_str()) => {}
+        Some(_) => {
+            return Err(refuse(at, format!("{at}.detail must be \"auto\", \"low\" or \"high\"")));
+        }
+    }
+    let url = text_member(at, &fields, "image_url")?;
+    Ok(object(vec![
+        ("type", string("image_url")),
+        ("image_url", object(vec![("url", string(url))])),
+    ]))
+}
+
 fn refuse_part(at: &str, kind: &str) -> ApiError {
     let why = match kind {
-        "input_image" | "input_file" => {
-            "images and files cannot be read: input other than text is not built"
-        }
+        "input_image" => "an image stands in a message of the user",
+        "input_file" => "files cannot be read: input other than text and images is not built",
         "input_audio" => "audio cannot be read: input other than text is not built",
         _ => "it is not a kind of part this server reads here",
     };

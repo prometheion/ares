@@ -205,6 +205,7 @@ pub(crate) fn load(
         return Err(refuse("--context must be at least 1"));
     }
     let prune = expert_prune(options, &gguf, &config)?;
+    let projector = crate::load::open_projector(options, config.n_embd)?;
 
     // The devices.
     let (_, mut held) = hold_devices(options)?;
@@ -248,6 +249,18 @@ pub(crate) fn load(
              layers each",
         ),
     };
+    // The image tower runs on the device the rule chooses; its VRAM is held
+    // back there before anything is planned (the expert slots take less).
+    let tower_bytes = projector.as_ref().map_or(0, ares_model::qwen3vl::Projector::vram_bytes);
+    let tower_at = projector.as_ref().map(|p| {
+        crate::load::tower_device(
+            &held.iter().map(|h| h.device.info()).collect::<Vec<_>>(),
+            p.home(),
+        )
+    });
+    if let Some(t) = tower_at {
+        held[t].free = held[t].free.saturating_sub(tower_bytes);
+    }
     describe_links(&held)?;
     let devices: Vec<_> = held.iter().map(|h| h.device.clone()).collect();
     // How two devices share every layer is measured at load, and the state of
@@ -507,6 +520,16 @@ pub(crate) fn load(
             .with_dflash(file)
             .map_err(|e| LoadError::Model(format!("--drafters {}: {e}", path.display())))?;
     }
+    if let (Some(projector), Some(t)) = (projector, tower_at) {
+        tracing::info!(
+            "plan: the image tower on device {}, {} of its VRAM held back for it",
+            held[t].device.ordinal(),
+            Bytes(tower_bytes)
+        );
+        model = model
+            .with_projector(std::sync::Arc::new(projector), t)
+            .map_err(|e| LoadError::Model(format!("--mmproj: {e}")))?;
+    }
     let model = std::sync::Arc::new(model);
 
     // Host RAM: one limit for the engine. What it needs to run is taken from
@@ -522,6 +545,7 @@ pub(crate) fn load(
     // drive and back, next to that place, and buffers of ordinary memory for
     // checkpoints in transit.
     let required = required_ram(&*model, parallel);
+    let tower_ram = model.projector().map_or(0, |p| p.pinned_bytes());
     let checkpoint = model.prefix_cache().map_or(0, |cache| cache.bytes());
     let ssd = options.cache.as_ref().map(|dir| {
         SsdConfig::new(dir, options.cache_size.unwrap_or(crate::plan::DEFAULT_CACHE_SIZE))
@@ -530,7 +554,13 @@ pub(crate) fn load(
     let transit = durable.as_ref().map_or(0, SsdConfig::transit_ram);
     let floor =
         durable.as_ref().map_or(checkpoint, |durable| SsdConfig::floor_ram(durable, checkpoint));
-    let mut needs = vec![("its step buffers", required)];
+    let mut needs = vec![("its step buffers", required - tower_ram)];
+    if tower_ram > 0 {
+        needs.push((
+            "the image tower's weights, which lie in page-locked RAM (--mmproj-weights ram)",
+            tower_ram,
+        ));
+    }
     match (floor, &durable) {
         (0, _) => {}
         (_, Some(_)) => needs.push((

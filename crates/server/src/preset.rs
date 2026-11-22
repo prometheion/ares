@@ -492,6 +492,10 @@ fn other_name(name: &str) -> Option<&'static str> {
             "the room for drafts is 'window', the rows of one sequence's window; how long a \
              draft is, is chosen for every step"
         }
+        "no-mmproj-offload" | "mmproj-offload" => {
+            "where the projector's weights stay is 'mmproj-weights' (ram, the default, or vram)"
+        }
+        "image-min-tokens" => "an image becomes at least 8 rows, as in llama.cpp",
         "cache-ram" => "the RAM the engine may use, its caches included, is 'ram'",
         "cache-disk" => "the directory of the prompt cache on SSD is 'cache'",
         "cache-disk-size" => "the most the prompt cache takes on SSD is 'cache-size'",
@@ -875,8 +879,8 @@ idle-unload = never
         let said = refused("[m]\nmodel = /m.gguf\nmax_tokens = 100\n");
         assert!(said.contains("the key is 'max-tokens'"), "{said}");
         // One that Ares has nothing for is named and not taken.
-        let said = refused("[m]\nmodel = /m.gguf\nmmproj = /p.gguf\n");
-        assert!(said.contains("Ares has no option 'mmproj'") && said.contains("ares --help"));
+        let said = refused("[m]\nmodel = /m.gguf\nmmproj-offload = false\n");
+        assert!(said.contains("'mmproj-weights'"), "{said}");
     }
 
     #[test]

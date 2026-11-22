@@ -12,8 +12,8 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ares_api::{
-    BiasKey, GenerateRequest, Json, LogitBias, LogprobRequest, Message, Prompt, RequestId, Role,
-    SamplerKind, Sampling, TOP_LOGPROBS_MAX, TokenProbs, Usage,
+    BiasKey, GenerateRequest, Image, Json, LogitBias, LogprobRequest, Message, Prompt, RequestId,
+    Role, SamplerKind, Sampling, TOP_LOGPROBS_MAX, TokenProbs, Usage,
 };
 use serde::Serialize;
 
@@ -880,9 +880,11 @@ fn message(index: usize, value: &Json) -> Result<Message, ApiError> {
         }
     };
 
+    let (content, images) = content(index, fields.0)?;
     Ok(Message {
         role,
-        content: content(index, fields.0)?,
+        content,
+        images,
         name: string_field("name")?,
         tool_call_id: string_field("tool_call_id")?,
         tool_calls,
@@ -917,38 +919,77 @@ fn tool_call(at: &str, call: &Json) -> Result<(), ApiError> {
     Ok(())
 }
 
-/// Flattens `content` to text. It is a string, a list of typed parts, or
-/// `null` (an assistant message that only carries tool calls).
-fn content(index: usize, members: &[(String, Json)]) -> Result<String, ApiError> {
+/// Flattens `content` to text and its images. It is a string, a list of
+/// typed parts (`text`, `image_url`), or `null` (an assistant message that
+/// only carries tool calls).
+///
+/// The text parts of a message without images are joined as they are. A
+/// message with images is joined as llama-server joins it: a line break between
+/// two text parts, none before or after an image, which stands at its place
+/// in the text.
+fn content(index: usize, members: &[(String, Json)]) -> Result<(String, Vec<Image>), ApiError> {
     let at = format!("messages[{index}].content");
     match Fields(members).get("content") {
-        None => Ok(String::new()),
-        Some(Json::String(text)) => Ok(text.clone()),
+        None => Ok((String::new(), Vec::new())),
+        Some(Json::String(text)) => Ok((text.clone(), Vec::new())),
         Some(Json::Array(parts)) => {
+            let has_images = parts
+                .iter()
+                .any(|part| part.get("type").and_then(Json::as_str) == Some("image_url"));
             let mut text = String::new();
+            let mut images: Vec<Image> = Vec::new();
+            let mut after_image = false;
             for (j, part) in parts.iter().enumerate() {
                 let kind = part.get("type").and_then(Json::as_str);
                 match (kind, part.get("text").and_then(Json::as_str)) {
-                    (Some("text"), Some(piece)) => text.push_str(piece),
+                    (Some("text"), Some(piece)) => {
+                        if has_images && !after_image && (!text.is_empty() || !images.is_empty()) {
+                            text.push('\n');
+                        }
+                        text.push_str(piece);
+                        after_image = false;
+                    }
                     (Some("text"), None) => {
                         return Err(ApiError::invalid_param(
                             format!("{at}[{j}]"),
                             format!("{at}[{j}] is a text part without a 'text' string"),
                         ));
                     }
+                    (Some("image_url"), _) => {
+                        let place = format!("{at}[{j}].image_url");
+                        let url = match part.get("image_url") {
+                            Some(Json::String(url)) => url.as_str(),
+                            Some(object @ Json::Object(_)) => {
+                                object.get("url").and_then(Json::as_str).ok_or_else(|| {
+                                    ApiError::invalid_param(
+                                        place.clone(),
+                                        format!("{place}.url must be a string"),
+                                    )
+                                })?
+                            }
+                            _ => {
+                                return Err(ApiError::invalid_param(
+                                    place.clone(),
+                                    format!("{place} must be an object with a 'url'"),
+                                ));
+                            }
+                        };
+                        images.push(crate::images::from_url(&place, url)?.at(text.len()));
+                        after_image = true;
+                    }
                     (other, _) => {
                         return Err(ApiError::invalid_param(
                             format!("{at}[{j}]"),
                             format!(
                                 "{at}[{j}]: content parts of type '{}' are not supported, \
-                                 only 'text' parts are",
+                                 only 'text' and 'image_url' parts are",
                                 other.unwrap_or("(none)")
                             ),
                         ));
                     }
                 }
             }
-            Ok(text)
+            Ok((text, images))
         }
         Some(other) => Err(ApiError::invalid_param(
             at.clone(),

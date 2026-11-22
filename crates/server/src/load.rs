@@ -39,8 +39,9 @@ use ares_tokenizer::ChatOptions;
 use crate::models::{LoadFailure, Loader, Site, Unit};
 use crate::plan::{
     self, AttentionShares, CELLS_PER_PAGE, DEFAULT_PARALLEL, DEFAULT_WINDOW, Drafter, LoadOptions,
-    Room, SINGLE_DEVICE_MIN_CONTEXT, SplitKind,
+    ProjectorWeights, Room, SINGLE_DEVICE_MIN_CONTEXT, SplitKind,
 };
+use ares_model::qwen3vl::{self, Projector};
 
 /// Memory of every device that the engine leaves unreserved: for what the
 /// driver takes besides the engine's own buffers (its context, the kernels'
@@ -541,6 +542,95 @@ fn embedding_note(e: &EmbeddingReport) -> String {
     }
 }
 
+/// Opens the projector of `--mmproj` for a model of width `n_embd`, with the
+/// limits and the home of the options; read and checked before a device is
+/// touched.
+pub(crate) fn open_projector(
+    options: &LoadOptions,
+    n_embd: usize,
+) -> Result<Option<Projector>, LoadError> {
+    let Some(path) = &options.mmproj else {
+        if options.mmproj_weights != ProjectorWeights::Ram
+            || options.image_max_tokens != plan::IMAGE_MAX_TOKENS
+        {
+            return Err(refuse(
+                "--mmproj-weights and --image-max-tokens are for a projector, and --mmproj names \
+                 none",
+            ));
+        }
+        return Ok(None);
+    };
+    let failed = |what: String| refuse(format!("--mmproj {}: {what}", path.display()));
+    let gguf = Gguf::open(path).map_err(|e| failed(e.to_string()))?;
+    if gguf.architecture() != Some("clip") {
+        return Err(failed(format!(
+            "the file is not a projector (its architecture is {})",
+            gguf.architecture().unwrap_or("not declared")
+        )));
+    }
+    let limits = qwen3vl::Limits {
+        min_rows: plan::IMAGE_MIN_TOKENS as usize,
+        max_rows: options.image_max_tokens as usize,
+    };
+    let home = match options.mmproj_weights {
+        ProjectorWeights::Ram => qwen3vl::Home::Ram,
+        ProjectorWeights::Vram => qwen3vl::Home::Vram,
+    };
+    let projector = Projector::open(gguf, limits, home).map_err(|e| failed(e.to_string()))?;
+    if projector.n_out() as usize != n_embd {
+        return Err(failed(format!(
+            "its rows have {} values and the model's {n_embd}: it is another model's projector",
+            projector.n_out()
+        )));
+    }
+    tracing::info!(
+        path = %path.display(),
+        "images: the projector's tower ({} blocks), images of {} to {} rows, its weights in {} \
+         ({} of VRAM and {} of page-locked RAM)",
+        projector.config().n_layer,
+        limits.min_rows,
+        limits.max_rows,
+        match home {
+            qwen3vl::Home::Ram => "RAM, uploaded block by block for every new image",
+            qwen3vl::Home::Vram => "VRAM",
+        },
+        Bytes(projector.vram_bytes()),
+        Bytes(projector.pinned_bytes()),
+    );
+    Ok(Some(projector))
+}
+
+/// The device the image tower runs on: in the RAM home, where every new image
+/// uploads its weights, the one with the fastest link to the host, as Linux
+/// reports it, and then the most multiprocessors; in the VRAM home the most
+/// multiprocessors, then the link. Facts the devices report, no measurement:
+/// which device computes a block faster is not measured at load.
+pub(crate) fn tower_device(infos: &[&DeviceInfo], home: qwen3vl::Home) -> usize {
+    let link = |info: &DeviceInfo| link_rate(info).unwrap_or(0.0);
+    let key = |info: &DeviceInfo| match home {
+        qwen3vl::Home::Ram => (link(info), f64::from(info.multiprocessors)),
+        qwen3vl::Home::Vram => (f64::from(info.multiprocessors), link(info)),
+    };
+    (0..infos.len())
+        .max_by(|&a, &b| {
+            key(infos[a])
+                .partial_cmp(&key(infos[b]))
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(b.cmp(&a))
+        })
+        .unwrap_or(0)
+}
+
+/// The rate of a device's link to its slot, as Linux reports it: transfers per
+/// second times lanes (only its ratio between devices is used).
+fn link_rate(info: &DeviceInfo) -> Option<f64> {
+    let base = format!("/sys/bus/pci/devices/{}", info.pci);
+    let read = |name: &str| std::fs::read_to_string(format!("{base}/{name}")).ok();
+    let speed: f64 = read("current_link_speed")?.split_whitespace().next()?.parse().ok()?;
+    let width: f64 = read("current_link_width")?.trim().parse().ok()?;
+    Some(speed * width)
+}
+
 /// The link of a device to its slot, as Linux reports it.
 fn pci_link(info: &DeviceInfo) -> Option<String> {
     let base = format!("/sys/bus/pci/devices/{}", info.pci);
@@ -986,9 +1076,19 @@ fn load_qwen35(
     if options.context == Some(0) {
         return Err(refuse("--context must be at least 1"));
     }
+    let projector = open_projector(options, config.n_embd)?;
 
     // The devices.
     let (ordinals, mut held) = hold_devices(options)?;
+    // The image tower's VRAM is held back on the device that runs it before
+    // anything is planned there.
+    let tower_bytes = projector.as_ref().map_or(0, Projector::vram_bytes);
+    let mut tower_at = projector
+        .as_ref()
+        .map(|p| tower_device(&held.iter().map(|h| h.device.info()).collect::<Vec<_>>(), p.home()));
+    if let Some(t) = tower_at {
+        held[t].free = held[t].free.saturating_sub(tower_bytes);
+    }
 
     // The model's settings that do not depend on the placement.
     let window_rows = if drafts { parallel.saturating_mul(window) } else { 0 };
@@ -1075,7 +1175,14 @@ fn load_qwen35(
                     break;
                 }
             }
-            let keep = held.swap_remove(chosen);
+            let mut keep = held.swap_remove(chosen);
+            // The tower runs on the one device left.
+            if let Some(t) = tower_at
+                && t != chosen
+            {
+                keep.free = keep.free.saturating_sub(tower_bytes);
+            }
+            tower_at = tower_at.map(|_| 0);
             held = vec![keep];
         }
     }
@@ -1327,6 +1434,19 @@ fn load_qwen35(
     drop(weights);
     let model = Qwen35::new(gguf, name.clone(), &spread, part_options, longest)
         .map_err(|e| LoadError::Model(e.to_string()))?;
+    let model = match (projector, tower_at) {
+        (Some(projector), Some(t)) => {
+            tracing::info!(
+                "plan: the image tower on device {}, {} of its VRAM held back for it",
+                held[t].device.ordinal(),
+                Bytes(tower_bytes)
+            );
+            model
+                .with_projector(Arc::new(projector), t)
+                .map_err(|e| LoadError::Model(e.to_string()))?
+        }
+        _ => model,
+    };
     let (chat, template) = chat_options(options, model.tokenizer())?;
     let model = Arc::new(model.with_chat_options(chat));
     if template.is_none() {
@@ -1345,8 +1465,15 @@ fn load_qwen35(
     // far as the machine has the memory, and given back when it gets short.
     // The prompt cache on SSD adds two needs of its own, below.
     let required = required_ram(&*model, parallel);
-    let table = model.pinned_ram();
-    let mut needs = vec![("its step buffers", required - table)];
+    let tower_ram = model.projector().map_or(0, |p| p.pinned_bytes());
+    let table = model.pinned_ram() - tower_ram;
+    let mut needs = vec![("its step buffers", required - table - tower_ram)];
+    if tower_ram > 0 {
+        needs.push((
+            "the image tower's weights, which lie in page-locked RAM (--mmproj-weights ram)",
+            tower_ram,
+        ));
+    }
     if table > 0 {
         needs.push((
             "the token embedding table and the rows of a step, which lie in page-locked RAM \
@@ -1418,7 +1545,7 @@ fn load_qwen35(
          leave the devices and checkpoints are taken, and the coldest are given up when the \
          machine needs it{}",
         Bytes(ram),
-        Bytes(required - table),
+        Bytes(required - table - tower_ram),
         match table {
             0 => String::new(),
             bytes => format!(
