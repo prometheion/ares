@@ -7673,9 +7673,14 @@ tools, as `/v1/chat/completions/input_tokens` counts them. `with_pieces` adds
 the text of every token, a string where its bytes are whole characters, else
 the bytes (llama.cpp's shape). `POST /detokenize` takes `tokens` and gives the
 text they write in a reply. A control token (`<|im_end|>`) writes nothing in
-both, as in a reply; llama-server writes its text. llama-server reads a text
-with switches of its own (`add_special`, `parse_special`); here a text is read
-the one way a prompt is, and the switches are refused by name. The engine
+both, as in a reply; llama-server writes its text. A text is read the one way
+a prompt of `/v1/completions` is: the text of a control token (`<|im_start|>`)
+is that token, as llama-server reads the prompt of a completion and, by
+default (`parse_special: true`, accepted), of `/tokenize` (until 2026-11-22
+the text of a control token was text here); `parse_special: false` and
+`add_special` are refused by name. The same reading applies to the text keys
+of a logit bias and to DRY's breakers, which llama.cpp reads without control
+tokens: a key `<|im_end|>` is the control token here. The engine
 answers through `Engine::tokenize` and `Engine::pieces` (`Model::encode` and
 `Model::piece` in the runtime). `model` may be left out when the server has one
 model.

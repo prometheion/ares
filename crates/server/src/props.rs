@@ -12,9 +12,11 @@
 //! reply (`content`). A token the engine does not write as text (a control
 //! token such as `<|im_end|>`) is the empty text in both.
 //!
-//! llama.cpp reads a text with its own switches (`add_special`,
-//! `parse_special`); here a text is read the one way a prompt is, so that the
-//! tokens are those a request gets, and the switches are refused by name.
+//! A text is read the one way a prompt of `/v1/completions` is, so that the
+//! tokens are those a request gets: the text of a control token
+//! (`<|im_start|>`) is that token, as llama-server reads it by default
+//! (`parse_special: true`, which is accepted); `parse_special: false` and
+//! `add_special`, llama.cpp's other switches, are refused by name.
 //!
 //! `/props` (`?model=<id>` when the server has several) says what a loaded
 //! model is: its context, its chat template, what a request gets for the
@@ -124,6 +126,8 @@ async fn try_tokenize(app: App, request: Request) -> Result<Response, ApiError> 
     let json = wire::read_json(&body)?;
     let mut members = wire::members(&json)?.to_vec();
     let with_pieces = take_bool(&mut members, "with_pieces")?;
+    // llama-server's default, which is what is done.
+    members.retain(|(key, value)| !(key == "parse_special" && *value == Json::Bool(true)));
     for name in ["add_special", "parse_special"] {
         if members.iter().any(|(key, value)| key == name && !value.is_null()) {
             return Err(ApiError::invalid_param(

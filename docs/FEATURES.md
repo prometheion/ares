@@ -110,7 +110,8 @@ the kernels exist; no model runs there yet.
   only to local names and pages (against DNS rebinding), `--allowed-hosts` adds names.
 - Every option is also `ARES_<NAME>` and a line of `--config <FILE>` (command line, then
   environment, then file).
-- `/tokenize` (a text or a chat request, with pieces) and `/detokenize`, in llama.cpp's shapes.
+- `/tokenize` (a text or a chat request, with pieces) and `/detokenize`, in llama.cpp's shapes;
+  a text (there and on `/v1/completions`) reads control tokens such as `<|im_start|>` as llama-server.
 - `/props` (`?model=`): context, chat template, request defaults, what the template can do.
 - Usage counts the tokens of the thinking (`completion_tokens_details.reasoning_tokens`,
   `output_tokens_details` on `/v1/responses`).

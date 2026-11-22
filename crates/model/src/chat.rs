@@ -212,9 +212,12 @@ fn encode_prompt(
     with_boundaries: bool,
 ) -> Result<EncodedPrompt, EngineError> {
     match prompt {
+        // The text of a control token (`<|im_start|>`) is that token, as
+        // llama-server reads the prompt of a completion and of `/tokenize`:
+        // a text prompt is the whole prompt, written by the client.
         Prompt::Text(text) => Ok(EncodedPrompt {
             tokens: tokenizer
-                .encode(text, EncodeOptions { add_special: true, parse_special: false }),
+                .encode(text, EncodeOptions { add_special: true, parse_special: true }),
             ..EncodedPrompt::default()
         }),
         Prompt::Chat { messages, tools, variables, continue_final } => {
@@ -702,6 +705,11 @@ mod tests {
         assert!(
             encode_with_boundaries(&tokenizer, &chat, None, &text).unwrap().boundaries.is_empty()
         );
+        // The text of a control token in a text is the token, as llama-server
+        // reads a prompt.
+        let text = Prompt::Text("<|im_start|>he<|im_end|>".into());
+        let tokens = encode_with_boundaries(&tokenizer, &chat, None, &text).unwrap().tokens;
+        assert_eq!(tokens, [259, 256, 260]);
 
         // A place inside a token counts where the token starts: `hel` and
         // `lo` are the tokens `he` and `llo`.

@@ -47,7 +47,8 @@ pub enum Prompt {
     },
     /// Text to continue as it is: no template, no added roles. Special tokens
     /// the model needs (a beginning-of-text token, say) are still the
-    /// engine's to add.
+    /// engine's to add, and the text of a control token (`<|im_start|>`) is
+    /// read as that token, as llama-server reads the prompt of a completion.
     Text(String),
 }
 

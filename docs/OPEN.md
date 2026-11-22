@@ -701,8 +701,9 @@ Flash-Next); experts that do not fit in VRAM in RAM; K/V in int8. Its README giv
 - [x] Tokenize and detokenize (A09); model properties (A16); template override (F07);
       continuing the last assistant message (F09).
 - [ ] Truncation and context shift (F18).
-- [ ] `/v1/completions` reads the text of special tokens (`<|im_start|>`) as text, where
-      llama-server parses them; `/tokenize` reads a text the same way.
+- [x] `/v1/completions` and `/tokenize` read the text of control tokens (`<|im_start|>`) as
+      those tokens, as llama-server does (2026-11-22, `server/priorities`); `/tokenize` takes
+      `parse_special: true` and refuses `false` and `add_special`.
 - [ ] Thinking budget (K03; Anthropic's `budget_tokens` is accepted and not enforced);
       loop guard (K05).
 - [x] Reasoning tokens in the usage (K07); `stop_reason: stop_sequence` and the stop string

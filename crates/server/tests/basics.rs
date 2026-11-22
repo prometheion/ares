@@ -106,10 +106,16 @@ async fn text_and_conversations_become_the_tokens_a_request_gets() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body, json!({"content": "Hi!"}));
 
+    // llama-server's default for reading control tokens is what is done.
+    let (status, body) =
+        call(&app, "/tokenize", json!({"content": "Hi", "parse_special": true})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["tokens"], json!(bytes("Hi")));
+
     // What is not served is refused by name.
     for (request, param) in [
         (json!({"content": "x", "add_special": false}), "add_special"),
-        (json!({"content": "x", "parse_special": true}), "parse_special"),
+        (json!({"content": "x", "parse_special": false}), "parse_special"),
         (json!({"content": 3}), "content"),
         (json!({}), "content"),
         (json!({"content": "x", "echo": true}), "echo"),
