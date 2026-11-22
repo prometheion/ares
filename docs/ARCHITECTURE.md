@@ -5557,7 +5557,39 @@ slots of its expert cache that it lends for the chunk and refills after (Strata
   in which a wide step's experts add into a row (`red.add`, which differs from run to run
   already, see "Wide steps"). The test `a_prompt_read_alone_runs_on_vram_the_expert_slots_lend`
   (`tests/qwen4exp_runtime.rs`) checks the answer against the CPU reference in every
-  placement, as the other wide-step tests do.
+  placement, as the other wide-step tests do. In one run the lent steps' answer and the own
+  scratch's agreed in all 16 tokens on one card.
+
+*Measured* (2026-11-22, the IQ2_XS file, the server, `--ram 8G`, `--context 40960`, both cards
+on every layer through the driver with peer access; a prompt of 8016 tokens and one of 33 323
+of this document read with `max_tokens` 1, each server started from the same usage profile;
+the old path is the same build with `-b 512`, which takes the steps a prompt took before; each
+pair of runs in one turn of the GPU, the load given; files read are the store's bytes from the
+file, uploads its copies into VRAM and transit slots):
+
+| Pair, load | Path | 8k: tokens/s, read, uploads | 32k: tokens/s, read, uploads |
+| --- | --- | --- | --- |
+| 1, 5.6 to 6 | steps of 512 rows | 191.4, 36.7 GiB, 52 625 | 239.3, 138.6 GiB, 205 885 |
+| 1 | lent steps of 4096 rows | 309.6, 22.9 GiB, 22 901 | 298.2, 84.2 GiB, 92 840 |
+| 2, 4.4 to 4.6 | lent steps of 4096 rows | 342.7, 22.9 GiB, 22 855 | 395.1, 84.4 GiB, 92 794 |
+| 2 | steps of 512 rows | 203.9, 36.8 GiB, 52 712 | 210.8, 139.1 GiB, 205 959 |
+
+The plan's estimate took 4096 rows on these cards (8192 would need 5.7 GiB of the mixer's 8.2
+GiB of slots, more than its largest pool lends above the floors). Prompts read 1.6 to 1.7
+times as fast at 8k and 1.25 to 1.9 times at 32k, with 38 % fewer bytes from the file and 55
+to 57 % fewer uploads; what is still read is what the lent slots held (the loan takes about
+half of the mixer's slots for the prompt) and what a 4096-row step picks that the tiers do not
+hold, again for each step. Without the driver's peer access (the layers split, the run of the
+same morning) the old path read the same prompts at 56 to 125 and 136 to 172 tokens/s,
+reading 37.9 and 145.7 GiB.
+
+*A request behind a prompt read alone* (the 32k prompt; 20 s after it, a request of 40 tokens
+for 8 tokens, streamed; the same server pair, load 4.7 to 5.5): with steps of 512 rows its first
+token came after 2.68 s and the long prompt took 134.6 s (241 tokens/s); with lent steps of 4096
+rows after 13.47 s, the long prompt 85.4 s (380 tokens/s). The request waits for the lent step
+in flight, about 11 s here, and then for a piece of its own; a step cannot be cut, so what the
+owner asked for (no request waits seconds behind a long prompt) needs the interruptible pass
+of "Long prompts layer by layer" in OPEN.md, or a lone step bounded in time.
 
 ### Vulkan
 

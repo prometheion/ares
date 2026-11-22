@@ -256,8 +256,15 @@ prompt (0.98 to 1.00 reads per distinct expert). To be read in its code before i
       scratch), whose scratch lies in VRAM the expert slots lend for the step and take back
       after it (`expert_store/lend.rs`); when another request waits, steps of prompt are pieces
       in the parts' own memory (`--ubatch-size`, 512 here) halved until their price is at most
-      500 ms (`RuntimeConfig::piece_ms`). See "Large prompt steps on lent VRAM" in
-      ARCHITECTURE.md for the measurements. Left: TokenWing's order (each layer over the whole
+      500 ms (`RuntimeConfig::piece_ms`). Measured (both cards, IQ2_XS, `--ram 8G`, 4096-row
+      lent steps, which is what these cards' slots lend): prompts of 8k and 32k tokens 1.6 to
+      1.9 times as fast as in steps of 512 rows (310 to 395 tokens/s against 191 to 239), 38 %
+      fewer bytes read from the file (84 GiB against 139 for 32k). **Not met:** a request that
+      arrives while a prompt is read alone waits for the lent step in flight (its first token
+      after 13.5 s against 2.7 s with steps of 512 rows): see "Large prompt steps on lent VRAM"
+      in ARCHITECTURE.md. **Owner's decision:** keep the large lone step, bound it in time
+      (fewer rows, less gain) until the step can be interrupted, or build the interruptible
+      layer-major pass next. Left: TokenWing's order (each layer over the whole
       prompt, an expert read once per prompt, about 80 KiB a row instead of 0.5 to 0.7 MiB of
       scratch; the item "Long prompts layer by layer" below), a step on loan that a request
       can interrupt, the parcels of a split by layers sized for the widest step (80 KiB a row
