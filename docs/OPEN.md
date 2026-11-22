@@ -571,6 +571,13 @@ with fewer slots in VRAM than a step picks"). Left:
 
 ## Optimising (after CUDA is complete, before Vulkan; the owner, 2026-11-16)
 Measured per phase on a quiet machine against the fork and Strata, the largest first. Known levers:
+- [ ] The prefill path on a card whose tensor cores run f32 accumulation at full rate (the test
+      machine's RTX 4060 Ti with gpu-unlock; `probe_full_rate` detects it, 2026-11-22): today every
+      type takes the exact f16 path there; the owner wants the path chosen per type by measurement
+      at load, as on capped cards. Measured (TOPS, 17408 x 5120, 256 / 1024 rows): q4_K int8
+      59.8 / 60.3 against f16 58.8 / 60.6; iq4_xs 62.2 / 62.5 against 56.4 / 56.5; q8_0 48.5 / 52.2
+      against 42.3 / 45.0. Both far below the tensor cores' rate, so find what bounds the f16 path
+      for iq4_xs and q8_0 (the decode into f16 tiles?) and make it as fast as int8.
 - [ ] Attention over long contexts: llama.cpp PR 32407 (merged 2026-11-17) rotates the order in
       which blocks read K/V tiles so that blocks sharing K/V hit L2 together: prompts of the 27B
       on an RTX 5090 at 131072 cells 1290 -> 1822 tokens/s (1.41x), 1.25x at 65536, 1.07x at
@@ -602,6 +609,9 @@ Measured per phase on a quiet machine against the fork and Strata, the largest f
       than CUDA today); the delta rule's f16 state rounded per row; the sampler's `-0.0`.
 
 ## Measurements owed on a quiet machine
+- [ ] On the test machine `admin@test-machine` (RTX 4060 Ti 16 GB with gpu-unlock, 62 GB RAM, a
+      Samsung 990, Strata 0.2.15 installed, good internet for downloads): Flash-Next against Strata
+      with the same file (UD-Q3_K_XL there), a large RAM tier, one card of another class.
 - [ ] Real models with 1, 2 and 4 concurrent clients against the fork and Strata (Strata saw four
       requests on a 12 GB card with experts outside VRAM 11 to 24 % slower in sum: parallel
       requests buy waiting time there, throughput on the 27B) (gap study `/var/tmp/ares-survey/gap-study-2026-11-17.md`).
