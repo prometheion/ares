@@ -70,8 +70,8 @@ impl Kernels {
     /// the fastest the most exact. A loader calls it once per type its model multiplies
     /// in the file's layout, before the weights are placed; it returns the choice, and
     /// the same without measuring again if it has been measured. It takes a probe matrix
-    /// larger than the L2 cache (16 to 96 MiB of the device's memory, freed on return)
-    /// and 30 to 80 ms.
+    /// larger than the L2 cache (16 to 96 MiB of the device's memory) and up to 40 MiB for
+    /// activations and products, freed on return, and 50 to 150 ms.
     ///
     /// Only a card whose tensor cores run f32 accumulation at full rate
     /// ([`Kernels::tensor_cores_full_rate`]) is measured: on a capped card the kept rule
@@ -114,9 +114,10 @@ impl Kernels {
         /// from memory as they do from a model's matrices, within these bounds.
         const MIN_BYTES: u64 = 16 << 20;
         const MAX_BYTES: u64 = 96 << 20;
-        /// The rows of activations: two tiles of the large shape, which run grouped as
-        /// a prompt's do.
-        const ROWS: u32 = 256;
+        /// The rows of activations: a prompt step of the engine's default, four tiles of
+        /// the large shape that run in a group. (With two tiles the f16 path of Q5_K and
+        /// Q6_K was 4 to 9 % behind int8 on an RTX 4060 Ti, from four on as fast.)
+        const ROWS: u32 = 512;
         /// Every path is timed this many times, in turn with the others, as a run of
         /// `BURST` launches; its fastest run counts. The first round warms the clocks
         /// and the caches up and is not counted.
@@ -177,17 +178,15 @@ impl Kernels {
             unsafe { stream.copy(w.ptr().offset(filled), w.ptr(), len as usize)? };
             filled += len;
         }
-        let x = DeviceBuffer::new(device, u64::from(ROWS) * u64::from(n_in) * 4)?;
-        // SAFETY: the whole buffer of this device; 0x3c3c3c3c is a float near 0.01.
-        unsafe { stream.fill(x.ptr(), 0x3c, (u64::from(ROWS) * u64::from(n_in) * 4) as usize)? };
         let y = DeviceBuffer::new(device, u64::from(ROWS) * u64::from(n_out) * 4)?;
         let mut acts = Vec::with_capacity(paths.len());
         for path in &paths {
-            let act = DeviceBuffer::new(device, Self::prefill_activation_bytes(*path, n_in, ROWS))?;
-            // SAFETY: `x` holds the rows and `act` their prepared form, both on this device.
-            unsafe {
-                self.prepare_prefill_activations(&stream, *path, x.ptr(), act.ptr(), n_in, ROWS)?
-            };
+            let bytes = Self::prefill_activation_bytes(*path, n_in, ROWS);
+            let act = DeviceBuffer::new(device, bytes)?;
+            // Numbers in either form, all of the byte 0x3c: f16 values of 1.06, int8 codes
+            // of 60, f32 factors and scales of 0.0115. No kernel's time depends on them.
+            // SAFETY: the whole buffer of this device.
+            unsafe { stream.fill(act.ptr(), 0x3c, bytes as usize)? };
             acts.push(act);
         }
         stream.synchronize()?;
@@ -198,7 +197,7 @@ impl Kernels {
                 start.record(&stream)?;
                 for _ in 0..BURST {
                     // SAFETY: `w` holds a matrix of n_out rows of n_in values of `ty`,
-                    // `act` ROWS rows prepared for `path` and `y` room for the products.
+                    // `act` ROWS rows in the form of `path` and `y` room for the products.
                     unsafe {
                         self.matmul(
                             &stream,
