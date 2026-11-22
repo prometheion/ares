@@ -852,7 +852,7 @@ async fn what_the_server_does_not_do_is_a_400_that_names_it() {
             json!({"input": [{"role": "user", "content": [
                 {"type": "input_image", "image_url": "https://example.com/a.png"},
             ]}]}),
-            "a part of the type 'input_image'",
+            "images are not fetched from URLs",
         ),
         (json!({"input": [{"type": "item_reference", "id": "msg_1"}]}), "item_reference"),
         (json!({"reasoning": {"summary": "detailed"}}), "reasoning.summary \"detailed\""),

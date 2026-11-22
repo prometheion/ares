@@ -687,7 +687,7 @@ async fn what_the_engine_cannot_do_is_a_400_in_the_shape_of_the_api() {
     let bodies = [
         (
             body(json!({"messages": [{"role": "user", "content": [image]}]})),
-            "'image' is not supported",
+            "images are not fetched from URLs",
         ),
         (
             body(json!({"tools": [{"type": "web_search_20250305", "name": "web_search"}]})),
