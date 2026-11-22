@@ -5230,10 +5230,14 @@ beside the CPU where that is sooner:
   outside and on loan against the coldest members, as long as the rule holds. A member on
   loan that beats one becomes a member and that one goes on loan, without a copy
   (`SlotSet::keep_loan`); an expert in RAM is uploaded into a free slot or the slot that
-  leaves, its entry written when the bytes are there and no step is at the layer. As many may
-  be on the link as it does in the time of a step beside the uploads steps wait for, by the
-  measured times of a step and of an upload (one while either was never measured), where
-  there were eight at most before.
+  leaves, its entry written when the bytes are there and no step is at the layer. As many
+  swaps may be on the link as it does in the time of a step beside the uploads steps wait for,
+  by the measured times of a step and of an upload (one while either was never measured),
+  where there were eight at most before; a free slot evicts nothing and fills at once
+  (2026-11-22: a loan of VRAM gives thousands back empty, and filled a step's room at a time
+  they left the reply after a long prompt at 10 to 13 tokens/s against 36 on the local cards;
+  the split of the steps' misses counts every upload on the link, so it gives the CPU what
+  would wait behind the fill).
 - *At the start and while nothing runs* the fill makes VRAM the hottest of every layer
   without that margin (see the usage profile above): no step waits then.
 
@@ -6050,8 +6054,8 @@ slots of its expert cache that it lends for the chunk and refills after (Strata
 - *The way back.* The slots go back, empty, at the end of the first step that does not run
   on them: that step's start still reads what the last wide step left there (the MTP block
   follows the rows of the step before from the part's residual). Empty slots fill the way
-  they always do: the hottest experts of RAM at the end of every step (`promote_hot`), the
-  fill while idle, what steps upload.
+  they always do: the hottest experts of RAM at the end of every step (`promote_hot`, every
+  free slot at once), the fill while idle, what steps upload.
 - *Who gets the wide step.* A prompt read alone; a generating sequence never shares a step
   with a loan (it rides along in pieces of the own scratch only), so nothing it holds in
   VRAM is lent while it generates. A request that arrives while a wide step runs waits for
