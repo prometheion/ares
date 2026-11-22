@@ -4277,7 +4277,9 @@ median in ms of 64 steps at 1000 and at 32 000 cells of context.
 | L: layer split 0.62 / 0.38 | 113 742 (the 4070 is full) | 1228, 1232 | 41.17, 41.21 (+56 %) | 855 | 45.26, 45.32 (+55 %) |
 
 K and V take 20.75 / 12.45 MiB per 1000 tokens on the 4070 / 3060 in T, 8.30 /
-24.90 in A and B, 10.89 / 22.31 in M and 22.83 / 10.38 in L. The 4070 holds
+24.90 in A and B, 10.89 / 22.31 in M and 22.83 / 10.38 in L. With K and V in
+`q4` T holds 228 562 tokens and M 482 707: the model's own context of 262 144
+fits there with a few heads moved. The 4070 holds
 62.5 % of the weights and, with the heads following them, 62.5 % of K and V:
 it is full with 2.2 GiB to give while the 3060 has 6 GiB nobody uses. Moving
 heads to the 3060 doubles the context (M: 2.1 times), at a price that grows
@@ -4321,7 +4323,29 @@ card over its own link (an expert of the IQ2_XS file in 0.1 ms against 0.4 ms
 over the second card's link), so a copy from the second card would be the
 slowest tier.
 
-*Measured*: by layers and on one card below; both cards on every layer and the second card with experts only need peer access, which the machine did not have on 2026-11-22 (`OPEN.md`).
+*Measured* (2026-11-22, `qwen4exp_run`, the IQ2_XS file, `--ram-gib 8`, 4096
+cells, the peer route, two rounds in turn FT, FX, FL, FO at a load average of
+4 to 7; a decode step at 1000 cells of a technical English text, 128 steps; a
+prompt of 1000 tokens in steps of 512 rows, read the second time, when the RAM
+tier holds its experts):
+
+| Placement | VRAM slots, 4070 + 3060 | Prompt, tokens/s | Decode, median ms | Mean | Fastest | Picks in a slot | Per step from RAM / the file |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| FT: both cards on every layer as measured at load (`core_share` 0.75, the shared expert on the worker) | 5712 + 7872 | 494, 500 | 22.7, 22.9 | 24.2, 28.4 | 17.4, 17.3 | 97.7, 96.4 % | 7.9 / 3.1, 11.8 / 5.3 |
+| FX: the second card holds experts only (`core_share` 1, the shared expert on the mixer) | 5424 + 8208 | 624, 633 | 20.6, 23.4 | 21.9, 28.5 | 18.0, 18.1 | 98.8, 96.7 % | 3.9 / 1.8, 10.7 / 5.1 |
+| FL: a range of layers each (0..25, 25..48) | 6825 + 6578 | 604, 612 | 31.3, 28.2 | 36.9, 31.6 | 23.8, 23.7 | 96.2, 98.0 % | 12.5 / 5.6, 6.8 / 2.6 |
+| FO: the 4070 alone | 5280 | 84, 88 | 43.8, 48.9 | 48.4, 51.7 | 21.3, 23.9 | 80.3, 82.7 % | 80.6 / 13.9, 67.5 / 15.5 |
+
+The second card is worth most on every layer: its VRAM is a tier of 8000
+experts (picks from RAM and the file fall to a seventh) and it computes what it
+holds, where by layers a sequence waits for one card after the other. Whether
+it computes a share of the dense part as well hardly matters for decode, which
+the misses decide (the step that misses nothing is 4 % faster with the share);
+without it the 3060 is a pure expert tier, holds 336 experts more, skips the
+exchange of every mixer half, and a wide step is 27 % faster, because the
+slower card no longer computes recurrent heads for 512 rows. The share is
+chosen today from the read time of a stream mixer on each card
+(`session.rs::choose`), which does not see that.
 
 **Drafters on the second card** are not built. The step that only drafts runs
 the chain on the card that holds the drafter while every other card waits, so
