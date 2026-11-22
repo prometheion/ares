@@ -158,10 +158,9 @@ impl Served {
     }
 
     /// Checks that two replies to the same request are the same reply, where
-    /// they must be (`api_model::must_agree`), and each on its own.
+    /// they must be (`api_model::must_agree`); the caller checks each on its
+    /// own.
     fn agree(&self, reply: &Reply, other: &Reply, what: &str) {
-        check(reply);
-        check(other);
         if api_model::must_agree(self.repeatable, &reply.hash, &other.hash, what) {
             assert_eq!(reply, other, "{what}");
         }
@@ -400,6 +399,7 @@ async fn with_auto_the_model_calls_or_answers_and_a_stream_is_the_same_reply() {
         assert_eq!(reply.finish, expected, "{reply:?}");
         called += usize::from(!reply.calls.is_empty());
         let streamed = served.stream(&body).await;
+        check(&streamed);
         served.agree(&streamed, &reply, "the stream is the whole reply");
     }
     println!("RES auto: {called} of 3 questions were answered with calls");
@@ -455,6 +455,9 @@ async fn a_call_the_limit_cuts_ends_with_length_and_no_markup() {
         }
         let streamed = served.stream(&body).await;
         assert!(!streamed.content.contains('<'), "{streamed:?}");
+        if streamed.finish == "length" {
+            assert!(streamed.calls.len() <= 1, "{streamed:?}");
+        }
         served.agree(&streamed, &reply, &format!("cut at {limit}"));
     }
 }
@@ -579,10 +582,19 @@ async fn a_call_the_model_opens_inside_its_thinking_is_a_call() {
         }
         thought += usize::from(!reply.reasoning.is_empty());
         let streamed = served.stream(&body).await;
+        let without = {
+            let mut plain = body.clone();
+            plain["draft"] = json!(false);
+            served.ask(&plain).await
+        };
+        // A call the limit cut is no whole call (another run of a model that
+        // is not repeatable may be cut where this one was not).
+        for other in [&streamed, &without] {
+            if other.finish != "length" {
+                check(other);
+            }
+        }
         served.agree(&streamed, &reply, &format!("{what}: the stream is the whole reply"));
-        let mut plain = body.clone();
-        plain["draft"] = json!(false);
-        let without = served.ask(&plain).await;
         let same = format!("{what}: the tokens with drafts are those without");
         served.agree(&without, &reply, &same);
     }
