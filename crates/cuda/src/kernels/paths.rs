@@ -9,13 +9,13 @@
 //! flushed to f32 every 64 values. On a GeForce card with the cap on f32 accumulation the
 //! int8 path is the fast one for most types, and the rule kept from the cards the kernels
 //! were written on decides ([`Kernels::prefill_path_for`]). Where the cap is lifted (or on
-//! a professional card) the f16 path runs at the rate of the int8 path's tensor work, but
-//! it moves twice the bytes through shared memory per product (its tiles hold two bytes a
-//! value), and the types whose weights take many load instructions per step (Q6_K, Q3_K,
-//! Q8_0 and the codebook i-quants: the blocks of the file's layout lie a row apart, so a
-//! load of a warp touches 16 lines) leave it 8 to 20 % behind the int8 path; for the
-//! others it is as fast or faster (`kernels/mm.cuh`). Which is which depends on the type
-//! and the card, so it is measured.
+//! a professional card) the f16 path costs the tensor cores no more than int8, but it
+//! moves twice the bytes through the load unit (its tiles and activations hold two bytes a
+//! value), which the loads of the file's layout keep busy (its blocks lie a row apart, so
+//! a load of a warp touches 16 lines): the types with many load instructions per item fall
+//! behind on it (an RTX 4060 Ti at 1024 rows: IQ3_S 23 %, IQ3_XXS 15 %, Q8_0 12 %, IQ4_NL
+//! 10 %, IQ4_XS 9 %), the others are as fast or faster (`kernels/mm.cuh`). Which is which
+//! depends on the type and the card, so it is measured.
 
 use std::sync::{Arc, Mutex};
 

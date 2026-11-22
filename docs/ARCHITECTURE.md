@@ -2808,6 +2808,103 @@ cards at 1024 rows) and 20 times more exact, and int8 for the other types
 (F16Flush is 0.74 to 0.91 times as fast there); `Precision::Exact` is always
 f16. A row gives the same bits alone and inside a batch within a path.
 
+On a card without the cap the f16 path costs the tensor cores no more than int8's
+work, and whether the tile kernels run it as fast depends on the type, so the path
+is measured per type when a model is loaded (`Kernels::measure_prefill_path`,
+`kernels/paths.rs`): a probe matrix of the type with rows of 4096 values, as many rows
+as make it larger than L2, 512 activation rows (a prompt step: four activation tiles of
+the large shape in a group), every path timed in turn, and of the paths within 5 % of
+the fastest the most exact kept for `prefill_path_for` (f16, then F16Flush, then
+int8). 50 to 150 ms per type; the qwen35 chooser measures every type of its groups
+before its probes (so they time the path that will run), Flash-Next's wide steps its
+quantized dense types. A capped card is not measured and keeps the rule above; a type
+that was not measured takes f16. The probe's shape matters: with two activation tiles
+the f16 path of Q5_K and Q6_K is 4 to 9 % behind int8 where from four on it is as fast,
+and with rows of 14080 values (the first probe's, sized by its bytes) an f16 activation
+tile holds 3.6 MB, a group two tiles against int8's four, and Q5_K's f16 path was 17 %
+behind. On the test machine's RTX 4060 Ti with gpu-unlock (2026-11-22, 17408 x 5120,
+TOPS, int8 / f16; the path the probe chose; the f16 path before the changes below):
+
+| type | path | 64 rows | 256 | 512 | 1024 | 4096 | f16 before, 512 / 1024 |
+|---|---|---|---|---|---|---|---|
+| iq4_xs | int8 | 39.4 / 36.8 | 61.4 / 55.6 | 62.2 / 57.9 | 63.2 / 57.6 | 62.5 / 57.7 | 51.4 / 56.3 |
+| q4_K | f16 | 37.5 / 38.1 | 58.5 / 58.1 | 58.5 / 60.6 | 59.7 / 61.0 | 59.0 / 61.3 | 53.6 / 60.4 |
+| q5_K | f16 | 31.9 / 32.6 | 53.8 / 51.5 | 53.5 / 55.4 | 54.4 / 55.7 | 54.5 / 55.9 | 47.1 / 54.1 |
+| q6_K | f16 | 22.9 / 24.5 | 42.8 / 41.4 | 43.4 / 43.4 | 43.9 / 43.6 | 44.3 / 44.1 | 34.8 / 37.0 |
+| q3_K | f16 | 26.4 / 28.0 | 46.4 / 46.1 | 47.2 / 46.3 | 47.8 / 46.4 | 47.9 / 46.6 | 40.2 / 41.4 |
+| iq3_s | int8 | 30.3 / 31.9 | 54.3 / 42.8 | 55.8 / 44.0 | 57.3 / 44.2 | 56.7 / 44.8 | 42.8 / 43.6 |
+| iq4_nl | int8 | 38.3 / 35.4 | 56.4 / 53.8 | 60.8 / 56.3 | 62.8 / 56.7 | 62.1 / 57.5 | 48.4 / 53.5 |
+| iq3_xxs | int8 | 34.5 / 33.2 | 54.5 / 48.1 | 56.0 / 49.6 | 57.5 / 48.9 | 57.4 / 49.0 | 47.2 / 47.9 |
+| iq2_s | f16 | 31.8 / 34.7 | 48.3 / 53.0 | 50.0 / 53.6 | 50.4 / 53.3 | 49.7 / 53.3 | 52.1 / 52.0 |
+| iq2_xs | f16 | 34.6 / 35.8 | 48.7 / 55.4 | 50.0 / 55.9 | 50.6 / 56.1 | 50.2 / 55.9 | 54.9 / 55.5 |
+| q8_0 | int8 | 29.4 / 27.4 | 53.6 / 48.6 | 57.7 / 53.1 | 60.1 / 53.1 | 60.1 / 53.3 | 39.4 / 44.9 |
+| q2_K | f16 | - / 38.7 | - / 59.6 | - / 59.5 | - / 59.3 | - / 59.2 | 58.8 / 59.0 |
+| q4_0 | f16 | - / 36.0 | - / 54.5 | - / 57.6 | - / 57.9 | - / 59.0 | 48.9 / 54.1 |
+| q4_1 | f16 | - / 39.4 | - / 54.5 | - / 55.7 | - / 56.0 | - / 56.3 | 51.7 / 55.5 |
+| q5_0 | f16 | - / 34.3 | - / 50.0 | - / 51.9 | - / 52.4 | - / 52.4 | 43.2 / 47.6 |
+| q5_1 | f16 | - / 37.5 | - / 49.4 | - / 50.7 | - / 51.0 | - / 51.2 | 47.4 / 50.6 |
+| iq2_xxs | f16 | - / 38.2 | - / 50.7 | - / 54.5 | - / 54.5 | - / 54.7 | 52.2 / 53.1 |
+| iq1_s | f16 | - / 27.0 | - / 59.6 | - / 60.4 | - / 60.3 | - / 60.3 | 59.3 / 59.7 |
+| iq1_m | f16 | - / 30.5 | - / 61.0 | - / 61.5 | - / 61.4 | - / 61.4 | 60.8 / 61.1 |
+| q2_0 | f16 | - / 40.7 | - / 58.6 | - / 59.6 | - / 59.4 | - / 59.5 | 58.5 / 58.8 |
+| tq1_0 | f16 | - / 30.7 | - / 50.6 | - / 52.1 | - / 52.2 | - / 53.4 | 51.3 / 51.8 |
+| tq2_0 | f16 | - / 38.7 | - / 59.2 | - / 59.9 | - / 60.1 | - / 59.9 | 59.1 / 59.7 |
+| mxfp4 | f16 | - / 36.7 | - / 52.2 | - / 54.6 | - / 54.9 | - / 54.8 | 50.1 / 53.8 |
+| nvfp4 | f16 | - / 38.6 | - / 54.0 | - / 55.8 | - / 56.2 | - / 56.6 | 50.5 / 55.5 |
+| q1_0 | f16 | - / 43.2 | - / 61.8 | - / 62.5 | - / 62.3 | - / 62.4 | 61.5 / 62.2 |
+| bf16 | f16 | - / 16.1 | - / 49.1 | - / 53.7 | - / 54.0 | - / 54.1 | 45.4 / 51.9 |
+| f16 | f16 | - / 16.1 | - / 49.9 | - / 54.8 | - / 54.7 | - / 55.3 | 46.0 / 52.7 |
+| f32 | f16 | - / 8.3 | - / 26.7 | - / 33.3 | - / 33.5 | - / 33.8 | 25.4 / 30.7 |
+
+The types of the second module have no int8 path; between f16 and F16Flush the probe
+took f16 for every one of them (F16Flush was at most 4 % faster, Q5_0).
+
+What bounds the f16 path there, by ablation in a copy of the kernel (`ncu` needs
+root on that machine; RTX 4060 Ti, Q8_0 / Q6_K / IQ4_XS / Q4_K / IQ3_S at 1024 rows,
+TFLOPS of the copy: 45 / 36 / 50 / 58 / 42): a loop of `mma` alone reaches 92, the
+skeleton of `mma`, `ldmatrix` and barriers 79. Loading the weights once instead of
+every step (the decoding and the tile stores still every step) gives 63 / 65 / 65 /
+66 / 60; leaving the decoding out with the loads in gives 47 / 42 / 54 / 61 / 45. So
+the loads of the file's layout bound it, and not their bytes or latency: the same
+load instructions all hitting L1 (every step reading the bytes of the first) are as
+slow for Q6_K (36) and only partly faster for Q8_0 (55), while every lane of a warp
+reading from the same row (one line per load instruction) gives 59 / 65. A load
+instruction of a warp reads from 16 rows and costs the load unit 16 lines or more
+whatever its width, and `ldmatrix`, the tile stores and the `cp.async` of the
+activations go through the same unit; the f16 path moves twice the bytes the int8
+path moves there (two-byte tiles and activations), which is why the types with many
+load instructions per item (Q6_K 20, Q3_K 23, Q8_0 10, the codebook i-quants 6 to 9;
+Q4_K and IQ4_XS 2 and 3) fall behind on it and the others do not. Reading the
+2-byte aligned words as the 16-byte pieces that hold them (three loads for the 32
+codes of a Q8_0 item instead of nine, `ares_ld_words_a2`) gained the large shape of
+Q8_0 11 %, of Q6_K 14 %, Q3_K 10 %, IQ4_NL 4 % on the f16 path and 3 to 12 % on int8.
+The medium and small shapes, bound by reading the weights from memory, and the expert
+kernels' down products lost with the pieces (Q3_K at 64 rows 28 against 22 TFLOPS)
+and keep the 4-byte loads; so do the one or two words of the i-quants (IQ2_S lost
+14 %). What
+did not help: an L2 prefetch of the next steps' weights (large shape), blocks of 8
+warps with 64 x 32 or 32 x 64 warp tiles (fewer `ldmatrix` per `mma`, 5 to 8 %
+slower: too few warps to hide the loads). The cure for the rest is the device layout
+(below), which reads a tile of 16 rows with one load per lane: on the same card its
+f16 kernels take 66 to 70 TFLOPS for Q4_K, Q6_K, Q8_0 and IQ4_XS at 256 to 1024
+rows. The codebook types (IQ3_S, IQ3_XXS, IQ2_S, IQ2_XS ...) have none yet.
+
+The activation tiles of the tile kernels are grouped as those of the device layout's
+kernels (a quarter of L2, a divisor of the tiles when one is near): a fixed 4 MiB
+made groups of 3 on that card, so the 4 tiles of a prompt step of 512 rows ran as a
+group of 3 and one alone (Q4_K f16 51 TFLOPS against 57 at 1024 rows); in groups of
+4, 57.
+
+On real prompts (2048 tokens in steps of 512 rows, the same card, alternating runs of the
+build before and after, load 1 to 3): Qwen3.8-27B UD-Q4_K_S keeps 38 to 41 of its 497
+matrices in the file's layout (the IQ3_S, IQ3_XXS, IQ2_S and IQ2_XS ones, which have no
+device layout, 1.5 GiB): 2046 and 2048 ms before, 1998 and 1999 after (1000 against 1025
+tokens/s; the weight products 425 against 412 ms), the IQ3 types now on int8. Flash-Next
+UD-Q3_K_XL (`--ram-gib 32`) reads such a prompt in 13.7 s before and after (150 tokens/s):
+its time is that of 69 GiB of expert uploads; of the device's time its dense products
+(Q6_K and Q8_0 on the f16 path, which its wide steps take for all dense matrices) went from
+111 to 96 ms.
+
 Measured 2026-11-10, 17408 x 5120, TOPS (2 * n_out * n_in * rows per
 second), RTX 4070 (peaks: int8 234, f16 with f16 accumulation 117, with f32
 58.6) / RTX 3060 (102, 51.2, 25.6):
@@ -3568,14 +3665,17 @@ with the same silicon do not, and gpu-unlock
 (https://github.com/Zagitta/gpu-unlock) removes the cap on RTX 20, 30 and 40
 at boot. Kernels can work around the cap (integer tiles, or accumulating in
 FP16 and flushing to FP32, as above), at the price of a small loss of
-exactness. Without the cap the direct path is both the fast one and the exact
-one, so the workaround and its divergence are simply gone.
+exactness. Without the cap the direct path is as fast at the tensor cores and the
+exact one; whether it is as fast in the tile kernels of the file's layout depends
+on the type (below), so there it is measured per type.
 
 There is no build option for this. Each device is probed for a few
 milliseconds when the kernels are loaded and the result is reported at start:
 
 - **Tensor cores at full rate:** the direct path (f16, f32 accumulation) is
-  used.
+  used wherever it is as fast; the tile kernels of the file's layout take, per
+  type, the path a probe at load found fastest (`Kernels::measure_prefill_path`,
+  "Prefill weight kernels" above), the exact one on ties.
 - **Capped:** the workaround is the default, because it is faster there, and
   the report says so and names the remedy. The exact path can be chosen
   instead.
@@ -3584,10 +3684,11 @@ The development machine's cards are capped, and the probe shows it exactly:
 f16 `mma` with f32 accumulation runs at 58.6 TFLOPS on the RTX 4070 and 25.6
 on the RTX 3060, with f16 accumulation at 117.0 and 51.2, and int8 at 234 and
 102 TOPS. The probe takes about 10 ms in `Kernels::load`
-(`tensor_cores_full_rate()`). No uncapped card was at hand, so the f16 kernel
-with f32 accumulation could not be timed at the full rate; with f16
-accumulation (the rate an uncapped card has for f32) it is the F16Flush path
-above.
+(`tensor_cores_full_rate()`). The test machine's RTX 4060 Ti with gpu-unlock
+(34 multiprocessors, 32 MiB of L2, a power limit of 165 W) runs a loop of f16
+`mma` at 96.7 TFLOPS with f32 accumulation and 96.9 with f16, int8 at 194 TOPS
+(2790 MHz; under the tile kernels the card sits at its power limit at 2655 MHz),
+and the probe reports full rate.
 
 `ares_matvec_q4_K` stays as the exact f32 reference. It is slow because each
 lane reads activations 256 bytes apart, not because of its arithmetic.

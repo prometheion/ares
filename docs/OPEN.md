@@ -599,13 +599,36 @@ with fewer slots in VRAM than a step picks"). Left:
 
 ## Optimising (after CUDA is complete, before Vulkan; the owner, 2026-11-16)
 Measured per phase on a quiet machine against the fork and Strata, the largest first. Known levers:
-- [ ] The prefill path on a card whose tensor cores run f32 accumulation at full rate (the test
-      machine's RTX 4060 Ti with gpu-unlock; `probe_full_rate` detects it, 2026-11-22): today every
-      type takes the exact f16 path there; the owner wants the path chosen per type by measurement
-      at load, as on capped cards. Measured (TOPS, 17408 x 5120, 256 / 1024 rows): q4_K int8
-      59.8 / 60.3 against f16 58.8 / 60.6; iq4_xs 62.2 / 62.5 against 56.4 / 56.5; q8_0 48.5 / 52.2
-      against 42.3 / 45.0. Both far below the tensor cores' rate, so find what bounds the f16 path
-      for iq4_xs and q8_0 (the decode into f16 tiles?) and make it as fast as int8.
+- [x] The prefill path on a card whose tensor cores run f32 accumulation at full rate (the test
+      machine's RTX 4060 Ti with gpu-unlock; `probe_full_rate` detects it, 2026-11-22): measured
+      per type at load (`Kernels::measure_prefill_path`, the exact path within 5 % of the
+      fastest), by the qwen35 chooser and Flash-Next's wide steps. What bounds the f16 path there is
+      the load unit (the file layout's loads touch 16 lines per instruction, and the f16 path's
+      ldmatrix, tile stores and activations double the int8 path's traffic there), not the
+      decoding; the 2-byte aligned words are now read as 16-byte pieces in the large shape
+      (Q8_0, Q6_K, Q3_K f16 +10 to 14 %) and the activation tiles grouped by L2 (512 rows, the
+      prompt step: +12 to 19 % on the f16 path). Q6_K, Q3_K and Q5_K now take the exact path,
+      IQ4_XS, IQ4_NL, IQ3_S, IQ3_XXS and Q8_0 int8. Qwen3.8-27B UD-Q4_K_S, 2048 tokens: 1000 ->
+      1025 tokens/s. `docs/ARCHITECTURE.md`, "Prefill weight kernels".
+- [ ] A device layout for the codebook i-quants (IQ3_S, IQ3_XXS, IQ2_S, IQ2_XS, IQ2_XXS, IQ1_*):
+      in the file's layout their tile kernels stay bound by the load unit (RTX 4060 Ti, 1024 rows:
+      IQ3_S int8 56 / f16 44 TOPS, IQ3_XXS 58 / 49) where the device layout's kernels take 66 to 70
+      TFLOPS for the types that have one. The 27B UD-Q4_K_S has 0.75 GiB of them, Flash-Next
+      UD-Q3_K_XL 22.7 GiB of IQ3_XXS experts (the expert kernels read the same file layout).
+- [ ] The 16-byte pieces of `ares_ld_words_a2` elsewhere: only the large shape of the tile
+      kernels takes them. On the RTX 4060 Ti they made the medium shape of Q3_K and Q6_K slower
+      (64 rows: 28 against 22 TFLOPS), and in the expert kernels (`expert_types_bench`) they took
+      gate and up of Q6_K, Q8_0, Q5_0 and TQ2_0 5 to 17 % faster but down of Q3_K, Q6_K, Q8_0,
+      Q4_0, Q5_0 4 to 15 % slower. A choice per kernel, measured on the capped cards as well.
+- [ ] Flash-Next's wide steps take one form of activations for every dense matrix and count the
+      float matrices (alpha, beta: F32) among them, which never read it (`Part::wide_float`):
+      their F16 form makes the forms differ wherever the quantized types take int8, and then every
+      dense matrix runs the exact f16 path, on a capped card at half rate. Whether to leave the
+      floats out of that vote (the dense products would take int8 on a capped card, 1.1 % rms
+      instead of 0.03 %) is the owner's call.
+- [ ] Capped cards could measure their path per type too (`measure_prefill_path` returns the kept
+      rule there, `FLUSH_AS_FAST` from the two development cards): one condition in
+      `kernels/paths.rs`; the owner's call, verified on those cards.
 - [ ] Attention over long contexts: llama.cpp PR 32407 (merged 2026-11-17) rotates the order in
       which blocks read K/V tiles so that blocks sharing K/V hit L2 together: prompts of the 27B
       on an RTX 5090 at 131072 cells 1290 -> 1822 tokens/s (1.41x), 1.25x at 65536, 1.07x at

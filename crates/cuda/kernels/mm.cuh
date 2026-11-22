@@ -92,10 +92,11 @@
 //   the tile stores still every step), every lane reading the same row 59 and 65,
 //   the same loads all hitting L1 no faster for Q6_K. Its ldmatrix, tile stores and
 //   activations move twice the int8 path's bytes through that unit, so the types
-//   with many load instructions per item (Q6_K, Q3_K, Q8_0, the codebook i-quants)
-//   are 8 to 22 % slower on it than on int8 there, the others as fast
-//   (docs/ARCHITECTURE.md, "Prefill weight kernels"; the path is measured per type,
-//   src/kernels/paths.rs).
+//   with many load instructions per item are slower on it than on int8 there (1024
+//   rows: IQ3_S 23 %, IQ3_XXS 15 %, Q8_0 12 %, IQ4_NL 10 %, IQ4_XS 9 %; Q6_K and Q3_K
+//   were 12 and 11 % until their words were read as 16-byte pieces, ares_ld_words_a2), the
+//   others as fast (docs/ARCHITECTURE.md, "Prefill weight kernels"; the path is
+//   measured per type, src/kernels/paths.rs).
 //
 // A type `T` provides (mm_types.cuh):
 //   BLOCK_VALUES, BLOCK_BYTES, SMEM_BYTES, init   as in the decode kernels
