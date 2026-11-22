@@ -382,7 +382,9 @@ Everything `FEATURES.md` lists for the 27B and not for Flash-Next is owed:
       Flash-Next file (2026-11-22, branch `server/flash-api`): the suites `real_tools`,
       `real_structured`, `real_messages` and `real_responses` run on any file the server loads
       (`ARES_TEST_API_MODEL`, flags in `ARES_TEST_API_FLAGS`) and pass on Flash-Next (two
-      cards, `--ram 8G`). Its replies are not repeatable, so two replies to one request (a
+      cards, `--ram 8G`; run before the driver with peer access was back, so on a split by
+      layers) and on the 27B (two cards, tensor split, `--precision exact`, where a stream is
+      held to be its whole reply). Flash-Next's replies are not repeatable, so two replies to one request (a
       stream and the whole reply, with drafts and without) are compared where they are the
       same tokens and checked each on its own otherwise. Claude Code against Ares: see "Claude
       Code against Ares" under "Server and API".
