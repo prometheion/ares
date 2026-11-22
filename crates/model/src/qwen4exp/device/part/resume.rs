@@ -67,7 +67,7 @@ impl Part {
             .flatten()
             .map(|at| PageArray { base: pools.offset(at.key_pool), bytes })
             .collect();
-        let status = self.scratch.ptr().offset(self.f.s.status);
+        let status = self.base.offset(self.f.s.status);
         let group = match (&mut self.kv, &self.attention) {
             (Some(group), Some(kernels)) => {
                 Some(PageGroup { group, pages: pools, kernels, status, lags })

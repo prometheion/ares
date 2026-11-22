@@ -72,6 +72,12 @@ pub struct RuntimeConfig {
     /// ([`ares_sched::Share`]). A prompt that is read faster is read at the
     /// cost of the sequences that generate.
     pub prefill_slowdown: f64,
+    /// The longest a step for prompts takes, in milliseconds, while another
+    /// request waits (a prompt next to it, a sequence that generates): the
+    /// piece of prompt is halved until its measured price fits. A prompt read
+    /// alone takes the widest step whatever it costs; a request that comes
+    /// then waits for that step, and then for pieces of at most this long.
+    pub piece_ms: f64,
     /// Steps a prompt may wait before it goes ahead of shorter ones.
     pub starvation_steps: u32,
     /// How long the conductor spins for the devices to finish a step before
@@ -112,6 +118,7 @@ impl Default for RuntimeConfig {
             ngram: NgramConfig::default(),
             draft_prior: 0.6,
             prefill_slowdown: 2.0,
+            piece_ms: 500.0,
             starvation_steps: 8,
             conductor_spin: Duration::from_millis(100),
             stats_window: crate::timing::DEFAULT_WINDOW,

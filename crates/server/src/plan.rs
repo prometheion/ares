@@ -121,6 +121,15 @@ pub struct LoadOptions {
     pub drafters: Option<Vec<Drafter>>,
     /// The most rows of one sequence's window ([`DEFAULT_WINDOW`]).
     pub window: Option<u32>,
+    /// The most rows of the step a prompt read alone takes (llama.cpp's
+    /// logical batch): above `ubatch` only for a mixture of experts, whose
+    /// expert slots lend the VRAM of such a step for its time. `None`: the
+    /// model's default.
+    pub batch: Option<u32>,
+    /// The most rows of a step in the memory the model keeps for good
+    /// (llama.cpp's physical batch), and of a piece of prompt while another
+    /// request waits. `None`: what the devices' memory allows.
+    pub ubatch: Option<u32>,
     /// A file with the token ids the model's MTP block may propose.
     pub draft_vocabulary: Option<PathBuf>,
     /// Variables of the chat template.
@@ -153,6 +162,8 @@ impl LoadOptions {
             precision: Precision::Fast,
             drafters: None,
             window: None,
+            batch: None,
+            ubatch: None,
             draft_vocabulary: None,
             chat_variables: Vec::new(),
             chat_template: None,

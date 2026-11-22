@@ -1,5 +1,7 @@
 //! One tier of the expert store: pools of slots and who holds them.
 
+use std::collections::HashSet;
+
 use ares_weights::{LayerNeed, SlotSet, SplitRule, split_slots};
 
 /// Slots of one size in one place (a device, or host memory).
@@ -170,6 +172,38 @@ impl Tier {
             self.slot[from][local as usize] = other;
         }
         taken
+    }
+
+    /// `layer` takes `slots` of its pool into use again: slots it holds the
+    /// numbers of and had given up. The numbers its set hands out are put in
+    /// front of exactly these slots.
+    pub fn retake(&mut self, layer: usize, slots: &[u32]) {
+        if slots.is_empty() {
+            return;
+        }
+        let wanted: HashSet<u32> = slots.iter().copied().collect();
+        let taken = self.sets[layer].take(slots.len());
+        let taken_numbers: HashSet<u32> = taken.iter().copied().collect();
+        // Numbers that stay given up although one of the slots is behind them.
+        let mut behind: Vec<u32> = self
+            .locals(layer)
+            .iter()
+            .enumerate()
+            .filter(|(number, slot)| {
+                wanted.contains(slot) && !taken_numbers.contains(&(*number as u32))
+            })
+            .map(|(number, _)| number as u32)
+            .collect();
+        for number in taken {
+            let has = self.slot(layer, number);
+            if wanted.contains(&has) {
+                continue;
+            }
+            let other = behind.pop().expect("a slot for every number taken");
+            let slot = self.slot(layer, other);
+            self.remap(layer, number, slot);
+            self.remap(layer, other, has);
+        }
     }
 }
 

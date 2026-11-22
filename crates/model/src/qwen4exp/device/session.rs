@@ -593,8 +593,8 @@ impl<'g> Session<'g> {
             let (to_mixer, to_worker) = (ports(&parts[mixer])?, ports(&parts[worker])?);
             let cores = |part: &Part| (0..c.n_layer).map(|i| part.has_core(i)).collect::<Vec<_>>();
             let (mixer_cores, worker_cores) = (cores(&parts[mixer]), cores(&parts[worker]));
-            parts[mixer].set_peer(to_worker, worker_cores)?;
-            parts[worker].set_peer(to_mixer, mixer_cores)?;
+            parts[mixer].set_peer(to_worker, worker_cores, None)?;
+            parts[worker].set_peer(to_mixer, mixer_cores, None)?;
         }
 
         // The pools of K/V and keys, whose pages every sequence slot owns.

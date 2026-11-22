@@ -106,6 +106,11 @@ pub struct Options {
     /// decode kernels; a wider one (a slice of a prompt) runs the many-row kernels
     /// (see the module `wide`) and needs a device with compute capability 8.0.
     pub max_rows: u32,
+    /// The most rows of a step whose scratch the part keeps for good; 0 for
+    /// `max_rows`. A wider step's scratch lies in VRAM that the expert slots
+    /// lend for it ([`Part::set_lent`], `expert_store/lend.rs`); everything
+    /// else a step needs is sized for `max_rows`.
+    pub own_rows: u32,
     /// The most rows of a step whose logits are wanted.
     pub logit_rows: u32,
     /// The most rows of a step that verifies drafts (a window whose rows may
@@ -149,6 +154,7 @@ impl Default for Options {
             state: StateFormat::F32,
             rule: SelectionRule::CellBudget,
             max_rows: MAX_BATCH,
+            own_rows: 0,
             logit_rows: 1,
             window_rows: 0,
             max_slots: 1,
@@ -165,6 +171,11 @@ impl Default for Options {
 }
 
 impl Options {
+    /// The most rows of a step on the part's own scratch.
+    pub fn own_rows(&self) -> u32 {
+        if self.own_rows == 0 { self.max_rows } else { self.own_rows.min(self.max_rows) }
+    }
+
     /// Table entries per sequence.
     pub fn table_stride(&self) -> u32 {
         self.cells.div_ceil(ENTRY_CELLS).max(1)
@@ -369,6 +380,9 @@ pub struct Ports {
     /// Where each layer's route record arrives, and the bytes between them.
     pub records: DevicePtr,
     pub record_stride: u64,
+    /// Where `raw` lies in a step on VRAM the expert slots lend: its offset
+    /// from the start of the loan ([`Part::set_peer`] takes the start).
+    pub lent_raw: u64,
 }
 
 /// The exchanges of a layer between a mixer and its worker, in the order
@@ -530,6 +544,11 @@ pub(crate) struct Frame {
     /// Bytes of the indexer's kept inputs of a window.
     raw_bytes: u64,
     s: Scratch,
+    /// The scratch the part keeps for good: `s` itself, or the layout of a
+    /// step of [`Options::own_rows`] rows when wider steps run on lent VRAM.
+    own: Scratch,
+    /// Whether steps wider than the own scratch run on lent VRAM.
+    lends: bool,
     inbox: Inbox,
     record_stride: u64,
     /// Bytes from one layer's input of the mixture of experts to the next,
@@ -617,8 +636,27 @@ fn ngram_shape(c: &Config) -> Option<NgramShape> {
 
 impl Frame {
     /// The sizes of a part of `shape` on a device with `multiprocessors`
-    /// multiprocessors (the attention plans are cut by it).
+    /// multiprocessors (the attention plans are cut by it). With
+    /// [`Options::own_rows`] below `max_rows`, the part's own scratch is laid out
+    /// for that many rows and `s` is the layout of a step on lent VRAM.
     pub(crate) fn new(
+        c: &Config,
+        opts: &Options,
+        shape: &PartShape,
+        multiprocessors: u32,
+    ) -> Result<Self, ModelError> {
+        let mut frame = Self::widest(c, opts, shape, multiprocessors)?;
+        let own = opts.own_rows();
+        if own < opts.max_rows {
+            let small = Options { max_rows: own, own_rows: 0, ..opts.clone() };
+            frame.own = Self::widest(c, &small, shape, multiprocessors)?.s;
+            frame.lends = true;
+        }
+        Ok(frame)
+    }
+
+    /// The sizes of a part whose scratch holds a step of `opts.max_rows` rows.
+    fn widest(
         c: &Config,
         opts: &Options,
         shape: &PartShape,
@@ -877,6 +915,8 @@ impl Frame {
             rec: rec_layout,
             raw_bytes,
             s,
+            own: s,
+            lends: false,
             inbox,
             record_stride: record_bytes.next_multiple_of(64),
             act_stride: act_bytes(n, u64::from(decode_rows)).next_multiple_of(64),
@@ -919,6 +959,12 @@ impl Frame {
         })
     }
 
+    /// Bytes of the scratch of a step on lent VRAM; 0 when no step is wider than the part's
+    /// own scratch.
+    pub(crate) fn lent_bytes(&self) -> u64 {
+        if self.lends { self.s.len } else { 0 }
+    }
+
     /// Bytes of the lists of predicted picks of every layer of the part, on the device and
     /// in page-locked memory.
     fn predict_lists_bytes(&self) -> u64 {
@@ -938,7 +984,7 @@ impl Frame {
     /// Bytes of everything a step needs besides weights, state and pools:
     /// scratch, kept window inputs, route records, the step's inputs, tables.
     pub(crate) fn step_bytes(&self, opts: &Options) -> u64 {
-        self.s.len
+        self.own.len
             + self.rec.kept_bytes()
             + self.raw_bytes
             + (self.record_stride + self.act_stride) * self.recurrent.len() as u64
@@ -1019,7 +1065,19 @@ pub struct Part {
     n_vocab: u32,
     rope: RopeParams,
     attn_shape: AttentionShape,
+    /// The scratch the part keeps for good, laid out as `f.own`.
     scratch: DeviceBuffer,
+    /// Where the scratch of the running step starts: `scratch`, or the VRAM
+    /// lent for a step wider than it, laid out as `lent_s` (`f.s` is the
+    /// layout of the running step).
+    base: DevicePtr,
+    lent_s: Scratch,
+    /// The VRAM the expert slots lend for wide steps, when they do.
+    lent: Option<DevicePtr>,
+    /// Whether the running step runs on lent VRAM.
+    on_loan: bool,
+    /// Where the peer's `raw` lies in a step on its lent VRAM.
+    peer_lent_raw: Option<DevicePtr>,
     /// The slot arena: per sequence slot the recurrent state, the carried
     /// keys of the indexer and the n-gram history.
     state: Arena,
@@ -1204,7 +1262,7 @@ impl Part {
                  matrices, a rank that is a multiple of 4 and at most 1024)",
             ));
         }
-        ledger.reserve(format!("{label} step scratch"), f.s.len)?;
+        ledger.reserve(format!("{label} step scratch"), f.own.len)?;
         let records_bytes = (f.record_stride * w.layers.len() as u64).max(64);
         ledger.reserve(format!("{label} route records"), records_bytes)?;
         let acts_bytes = (f.act_stride * w.layers.len() as u64).max(64);
@@ -1237,7 +1295,7 @@ impl Part {
                 predict::State::open(device, &f)
             })
             .transpose()?;
-        let scratch = DeviceBuffer::new(device, f.s.len)?;
+        let scratch = DeviceBuffer::new(device, f.own.len)?;
         // A defined start: the state of a slot is cleared again when a
         // sequence starts in it.
         let state = Arena::new(
@@ -1252,8 +1310,8 @@ impl Part {
         let kept_raw =
             (f.raw_bytes > 0).then(|| DeviceBuffer::new(device, f.raw_bytes)).transpose()?;
         // The zeros stay zeros.
-        scratch.write(f.s.zeros, &vec![0u8; (f.s.xn - f.s.zeros) as usize])?;
-        scratch.write(f.s.status, &[0u8; 16])?;
+        scratch.write(f.own.zeros, &vec![0u8; (f.own.xn - f.own.zeros) as usize])?;
+        scratch.write(f.own.status, &[0u8; 16])?;
         // The page tables start as page 0 everywhere: a row that reads an
         // entry nobody wrote reads a page that exists. A driver writes the
         // entries of the pages its sequences own ([`Part::update_table`], or
@@ -1309,6 +1367,10 @@ impl Part {
             .then(|| wide::State::open(device, &kernels, &w, opts, &f))
             .transpose()?;
         let a = &c.attention;
+        // Steps run on the own scratch until one is wider.
+        let mut f = f;
+        let lent_s = f.s;
+        f.s = f.own;
         Ok(Self {
             index,
             role,
@@ -1339,7 +1401,12 @@ impl Part {
                 n_kv_head: a.n_head_kv as u32,
                 head_dim: a.head_dim as u32,
             },
+            base: scratch.ptr(),
             scratch,
+            lent_s,
+            lent: None,
+            on_loan: false,
+            peer_lent_raw: None,
             state,
             tables,
             tables_host,
@@ -1542,24 +1609,43 @@ impl Part {
             flags: exchange.ptr(),
             record_flag: exchange.ptr().offset(flags - 4),
             partial: exchange.ptr().offset(flags.next_multiple_of(64)),
-            m: self.at(self.f.s.m),
-            raw: self.at(self.f.s.m_raw),
+            m: self.scratch.ptr().offset(self.f.own.m),
+            raw: self.scratch.ptr().offset(self.f.own.m_raw),
             acts: self.acts.ptr(),
             act_stride: self.f.act_stride,
             records: self.records.ptr(),
             record_stride: self.f.record_stride,
+            lent_raw: self.lent_s.m_raw,
         })
     }
 
     /// Tells a mixer or a worker about its peer: the peer's ports (memory of
     /// a device this one has peer access to), and per layer whether the peer
     /// computes a share of the recurrent or attention half.
-    pub fn set_peer(&mut self, ports: Ports, peer_core: Vec<bool>) -> Result<(), ModelError> {
+    ///
+    /// `peer_lent` is where the VRAM the peer's expert slots lend for wide steps
+    /// starts, when the parts run such steps.
+    pub fn set_peer(
+        &mut self,
+        ports: Ports,
+        peer_core: Vec<bool>,
+        peer_lent: Option<DevicePtr>,
+    ) -> Result<(), ModelError> {
         if self.role == Role::Whole || peer_core.len() != self.w.layers.len() {
             return Err(invalid("a peer for a part that shares no layers, or of other layers"));
         }
+        self.peer_lent_raw = peer_lent.map(|at| at.offset(ports.lent_raw));
         self.peer = Some((ports, peer_core));
         Ok(())
+    }
+
+    /// Where a wide step sends the peer the mixed input of a half block: its
+    /// `raw`, on its lent VRAM when the step runs on a loan.
+    fn peer_raw(&self, ports: &Ports) -> Result<DevicePtr, ModelError> {
+        if !self.on_loan {
+            return Ok(ports.raw);
+        }
+        self.peer_lent_raw.ok_or_else(|| invalid("the peer's lent VRAM is not known"))
     }
 
     /// Tells a mixer which experts its worker owns: a byte per layer and
@@ -1578,7 +1664,54 @@ impl Part {
     }
 
     fn at(&self, offset: u64) -> DevicePtr {
-        self.scratch.ptr().offset(offset)
+        self.base.offset(offset)
+    }
+
+    /// Bytes of VRAM a step wider than the part's own scratch runs on: what
+    /// the expert slots of this device lend ([`Part::set_lent`]); 0 when no step
+    /// is wider.
+    pub fn lent_bytes(&self) -> u64 {
+        if self.f.lends { self.lent_s.len } else { 0 }
+    }
+
+    /// The most rows of a step on the part's own scratch.
+    pub fn own_rows(&self) -> u32 {
+        self.opts.own_rows()
+    }
+
+    /// Where the VRAM lent for steps wider than the own scratch starts, at
+    /// least [`Part::lent_bytes`] of it, or `None` when it is given back. The
+    /// memory is the part's until the step after the last one that ran on it
+    /// has ended on the device.
+    pub fn set_lent(&mut self, at: Option<DevicePtr>) {
+        self.lent = at;
+    }
+
+    /// Lays the scratch out for a step of `rows` rows: on the own scratch, or
+    /// on lent VRAM, whose zeros and status word it writes first.
+    fn lay_out(&mut self, stream: &Stream, rows: u32) -> Result<(), ModelError> {
+        if rows <= self.opts.own_rows() {
+            self.on_loan = false;
+            self.base = self.scratch.ptr();
+            self.f.s = self.f.own;
+            return Ok(());
+        }
+        let at = self.lent.ok_or_else(|| {
+            invalid(format!(
+                "a step of {rows} rows runs on VRAM the expert slots lend, and none is lent"
+            ))
+        })?;
+        self.on_loan = true;
+        self.base = at;
+        self.f.s = self.lent_s;
+        let s = self.lent_s;
+        // SAFETY: both ranges are inside the lent scratch, which the caller
+        // keeps lent while the step runs.
+        unsafe {
+            stream.fill(self.at(s.zeros), 0, (s.xn - s.zeros) as usize)?;
+            stream.fill(self.at(s.status), 0, 16)?;
+        }
+        Ok(())
     }
 
     /// The residual buffer that holds the residual, and the other one.
@@ -1630,7 +1763,10 @@ impl Part {
     pub fn write_residual(&self, r: &[f32]) -> Result<(), ModelError> {
         let bytes: Vec<u8> = r.iter().flat_map(|v| v.to_le_bytes()).collect();
         let at = if self.flipped { self.f.s.r2 } else { self.f.s.r };
-        Ok(self.scratch.write(at, &bytes)?)
+        // SAFETY: the residual section holds the rows of a step; the copy
+        // reads `bytes` before the stream is waited for.
+        unsafe { self.side.copy_from_host(self.at(at), bytes.as_ptr(), bytes.len())? };
+        Ok(self.side.synchronize()?)
     }
 
     /// The output of the recurrent or attention part of the layer enqueued
@@ -1658,7 +1794,10 @@ impl Part {
 
     fn read_scratch(&self, offset: u64, n: usize) -> Result<Vec<f32>, ModelError> {
         let mut bytes = vec![0u8; n * 4];
-        self.scratch.read(offset, &mut bytes)?;
+        // SAFETY: the section at `offset` of the running step's scratch holds
+        // `n` values; the stream is waited for before `bytes` is read.
+        unsafe { self.side.copy_to_host(bytes.as_mut_ptr(), self.at(offset), bytes.len())? };
+        self.side.synchronize()?;
         Ok(bytes.as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)).collect())
     }
 
@@ -1989,6 +2128,7 @@ impl Part {
         let stream = env.stream;
         let dims = env.record.dims();
         let n = dims.n_rows;
+        self.lay_out(stream, n)?;
         if let Some(marks) = &mut self.marks {
             marks.phases.clear();
             marks.on = !marks.profile.paused.load(Ordering::Relaxed);
@@ -2022,7 +2162,7 @@ impl Part {
         // and the table names them; the conversions run in front of the step.
         if let Some(kv) = &mut self.kv {
             let reaches = kv::reaches(env.segments, env.replay);
-            let status = self.scratch.ptr().offset(self.f.s.status);
+            let status = self.base.offset(self.f.s.status);
             let (tables, pools) = (self.tables.ptr(), env.pools);
             let kernels = self.attention.as_ref();
             kv.prepare(kernels, stream, &reaches, &self.entries, tables, pools, status, true)?;
@@ -2459,11 +2599,14 @@ impl Part {
         }
         // The recurrent or attention half.
         let write = self.take_write();
-        let push = peer.filter(|(_, core)| *core).map(|(ports, _)| Departure {
-            data: if Self::is_wide(rows) { ports.raw } else { ports.m },
-            flags: ports.flags,
-            token: self.exchange_no(env, i, X_CORE_INPUT),
-        });
+        let push = match peer.filter(|(_, core)| *core) {
+            Some((ports, _)) => Some(Departure {
+                data: if Self::is_wide(rows) { self.peer_raw(&ports)? } else { ports.m },
+                flags: ports.flags,
+                token: self.exchange_no(env, i, X_CORE_INPUT),
+            }),
+            None => None,
+        };
         self.read(stream, &attn_mixer, write, Some(self.at(s.inj_a)), self.at(s.m), push, rows)?;
         // The residual streams before this layer are in place now.
         self.dflash_tap(env, layer.layer)?;
@@ -2488,11 +2631,18 @@ impl Part {
         let m =
             if wide { self.at(s.m) } else { self.acts.ptr().offset(i as u64 * self.f.act_stride) };
         let write = self.take_write();
-        let push = peer.map(|(ports, _)| Departure {
-            data: if wide { ports.raw } else { ports.acts.offset(i as u64 * ports.act_stride) },
-            flags: ports.flags,
-            token: self.exchange_no(env, i, X_MOE_INPUT),
-        });
+        let push = match peer {
+            Some((ports, _)) => Some(Departure {
+                data: if wide {
+                    self.peer_raw(&ports)?
+                } else {
+                    ports.acts.offset(i as u64 * ports.act_stride)
+                },
+                flags: ports.flags,
+                token: self.exchange_no(env, i, X_MOE_INPUT),
+            }),
+            None => None,
+        };
         self.read(stream, &ffn_mixer, write, Some(self.at(s.inj_f)), m, push, rows)?;
         self.moe(env, i, &layer.moe)?;
         self.pending = Some(Pending::Moe {

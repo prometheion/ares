@@ -488,8 +488,18 @@ pub trait Model: Send + Sync + 'static {
         0
     }
 
-    /// The most rows of one step the model's buffers hold.
+    /// The most rows of one step the model's buffers hold. A step of more
+    /// rows than [`Model::own_rows`] borrows memory for its time, which only a
+    /// prompt read alone gets.
     fn max_rows(&self) -> u32;
+
+    /// The most rows of a step that runs in the memory the model keeps for
+    /// good; a wider one, up to [`Model::max_rows`], borrows memory for its time
+    /// (Flash-Next's scratch on VRAM its expert slots lend). At least
+    /// [`Model::prompt_rows`]; [`Model::max_rows`] by default.
+    fn own_rows(&self) -> u32 {
+        self.max_rows()
+    }
 
     /// The rows of a piece of prompt: where the model's prompt kernels reach
     /// their rate. The conductor reads a prompt next to generating sequences

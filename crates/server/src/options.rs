@@ -96,6 +96,8 @@ pub fn lookup(name: &str) -> Option<(&'static str, Kind)> {
         "--shares" => ("--shares", Kind::Value),
         "--context" => ("--context", Kind::Value),
         "--parallel" => ("--parallel", Kind::Value),
+        "-b" | "--batch-size" => ("--batch-size", Kind::Value),
+        "-ub" | "--ubatch-size" => ("--ubatch-size", Kind::Value),
         "--kv" => ("--kv", Kind::Value),
         "--ram" => ("--ram", Kind::Value),
         "--cache" => ("--cache", Kind::Value),
@@ -127,6 +129,8 @@ pub fn names() -> impl Iterator<Item = &'static str> {
         "--shares",
         "--context",
         "--parallel",
+        "--batch-size",
+        "--ubatch-size",
         "--kv",
         "--ram",
         "--cache",
@@ -280,6 +284,18 @@ pub fn set(options: &mut ModelOptions, flag: &'static str, value: &str) -> Resul
                 return Err(invalid("--parallel", value, expected));
             }
             load.parallel = Some(parallel);
+        }
+        "--batch-size" | "--ubatch-size" => {
+            let expected = "a number of rows, at least 8";
+            let rows: u32 = number(flag, value, expected)?;
+            if rows < 8 {
+                return Err(invalid(flag, value, expected));
+            }
+            if flag == "--batch-size" {
+                load.batch = Some(rows);
+            } else {
+                load.ubatch = Some(rows);
+            }
         }
         "--kv" => {
             let expected = "a format (f16, q8, q7, q6, q5, q4) or two, for K and V (q8,f16)";

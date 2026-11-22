@@ -241,6 +241,10 @@ struct Build {
     mtp_place: Option<ExpertAt>,
     /// What the tiers hold, for the routers' pruning.
     prune_mask: Option<Arc<PruneMask>>,
+    /// Per part: the bytes of VRAM a step wider than its own scratch runs on,
+    /// and where the expert slots of its device lend them.
+    lent: Vec<u64>,
+    lent_at: Vec<Option<DevicePtr>>,
 }
 
 /// The plan of the expert store and what it was made from.
@@ -280,6 +284,13 @@ pub(super) struct Flow {
     totals: Mutex<ExpertStats>,
     /// What the wide steps found and waited for, since the engine started.
     wide: Mutex<WideStats>,
+    /// The most rows of a step on the parts' own scratch; a wider step runs on
+    /// VRAM the expert slots lend: per part its bytes and where they lie.
+    own_rows: u32,
+    lent: Vec<u64>,
+    lent_at: Vec<Option<DevicePtr>>,
+    /// Whether the running step runs on the loan.
+    on_loan: AtomicBool,
 }
 
 impl Flow {
@@ -367,6 +378,11 @@ impl Flow {
                 counter.store(0, Ordering::Release);
             }
             self.finished.store(0, Ordering::Release);
+            let wide = rows > self.own_rows && windows.is_some();
+            if wide {
+                self.lend(&mut feed)?;
+            }
+            self.on_loan.store(wide, Ordering::Release);
             if let Some((windows, worth)) = windows {
                 feed.begin_step(rows).map_err(model_error)?;
                 feed.store.set_windows(windows, worth);
@@ -374,6 +390,37 @@ impl Flow {
             self.begun.store(step, Ordering::Release);
         }
         feed.store.device_mut(index).fence(stream).map_err(|e| invalid(e.to_string()))
+    }
+
+    /// Lends every device the VRAM of a step wider than the parts' own
+    /// scratch, if it has not yet, and waits until the memory is free: the
+    /// slots' experts moved out and copied down. Between steps.
+    fn lend(&self, feed: &mut Feed) -> Result<(), ModelError> {
+        let started = Instant::now();
+        for (device, bytes) in self.lent.iter().enumerate().filter(|(_, b)| **b > 0) {
+            while feed
+                .store
+                .lend_vram(device, *bytes)
+                .map_err(|e| invalid(e.to_string()))?
+                .is_none()
+            {
+                self.check(started, "the expert slots lent VRAM")?;
+                feed.store.poll().map_err(|e| invalid(e.to_string()))?;
+                std::hint::spin_loop();
+            }
+            while !feed.store.loan_ready(device).map_err(|e| invalid(e.to_string()))? {
+                self.check(started, "the expert slots lent VRAM")?;
+                feed.store.poll().map_err(|e| invalid(e.to_string()))?;
+                std::hint::spin_loop();
+            }
+        }
+        Ok(())
+    }
+
+    /// Where the VRAM lent to part `index` lies while the expert slots lend it.
+    fn lent(&self, index: usize) -> Option<DevicePtr> {
+        let lent = self.lent_at.get(index).copied().flatten()?;
+        self.lock_feed().store.has_lent(index).then_some(lent)
     }
 
     fn enqueued_layers(&self) -> Vec<usize> {
@@ -486,13 +533,23 @@ impl Flow {
     /// A part has ended its step on the device: the last of them ends it for
     /// the store, unless it only drafted (`store` false).
     fn finish(&self, store: bool) -> Result<(), ModelError> {
-        if self.finished.fetch_add(1, Ordering::AcqRel) + 1 == self.parts() && store {
+        if self.finished.fetch_add(1, Ordering::AcqRel) + 1 == self.parts() {
             let mut feed = self.lock_feed();
-            feed.end_step().map_err(model_error)?;
-            // What the tier gave up at the end of this step is unlocked
-            // here, where every device has ended the step and none has
-            // begun the next.
-            drop(feed.store.take_released());
+            if store {
+                feed.end_step().map_err(model_error)?;
+                // What the tier gave up at the end of this step is unlocked
+                // here, where every device has ended the step and none has
+                // begun the next.
+                drop(feed.store.take_released());
+            }
+            // VRAM lent for wide steps goes back after the first step that did
+            // not run on it: that step's start still read what the last one
+            // left there (the MTP block follows its rows).
+            if !self.on_loan.load(Ordering::Acquire) {
+                for device in 0..self.lent.len() {
+                    feed.store.return_vram(device).map_err(|e| invalid(e.to_string()))?;
+                }
+            }
         }
         Ok(())
     }
@@ -537,6 +594,59 @@ pub fn step_rows(gguf: &Gguf, devices: &[Device], opts: &Options) -> Result<u32,
 
 /// The most rows of a step the model is opened with.
 const WIDE_ROWS: u32 = 4096;
+
+/// The rows of the widest step a prompt read alone takes on `devices` placed as
+/// `placement`: the largest power of two from `asked` down whose scratch the
+/// expert slots of every device can lend (`expert_store/lend.rs`), above
+/// `opts.part.own_rows()`; that if none is. `pages` is what the pools of K and
+/// V hold, `page_bytes` a page on each device, as [`place`] gave them.
+///
+/// A device lends what its slots hold above a row's picks and the free slots of
+/// each of its layers (the store's floor for a loan); a step of more rows also
+/// keeps the rest of what it needs (its inputs, its exchange, its predictions,
+/// about 50 KiB a row on Flash-Next against 0.5 to 0.7 MiB of scratch) for
+/// good, which the slots lose, and what is estimated here leaves a tenth of the
+/// lendable room spare for what the plan of the store takes besides (transit).
+pub fn batch_rows(
+    gguf: &Gguf,
+    devices: &[Device],
+    opts: &SessionOptions,
+    placement: &Placement,
+    pages: u32,
+    page_bytes: &[u64],
+    asked: u32,
+) -> Result<u32, OpenError> {
+    let config = Config::from_gguf(gguf)?;
+    let own = opts.part.own_rows();
+    let reserve = opts.reserve.unwrap_or(8) as u64;
+    let floor = config.experts.used as u64 + reserve;
+    let mut rows = asked.max(own);
+    while rows > own {
+        let wide = Options { max_rows: rows, own_rows: own, ..opts.part.clone() };
+        let narrow = Options { max_rows: own, own_rows: 0, ..opts.part.clone() };
+        let fits = devices.iter().enumerate().all(|(d, device)| {
+            let PartPlan { role, first, shares, head } = placement.part(&config, d);
+            let shape = PartShape { role, first, shares, head };
+            let mp = device.info().multiprocessors;
+            let (Ok(f), Ok(g)) =
+                (Frame::new(&config, &wide, &shape, mp), Frame::new(&config, &narrow, &shape, mp))
+            else {
+                return false;
+            };
+            let plan = &placement.devices[d];
+            let extra = f.step_bytes(&wide).saturating_sub(g.step_bytes(&narrow));
+            let pool = u64::from(pages) * page_bytes.get(d).copied().unwrap_or(0);
+            let room = plan.slots.saturating_sub(pool + extra);
+            let held = floor * plan.experts / config.experts.count as u64;
+            f.lent_bytes() <= room.saturating_sub(held) / 10 * 9
+        });
+        if fits {
+            return Ok(rows);
+        }
+        rows /= 2;
+    }
+    Ok(own)
+}
 
 /// Where the layers of the model in `gguf` would go on `devices` with `opts`,
 /// and the bytes one page of the pools would take on each device. Nothing is
@@ -726,6 +836,8 @@ impl Qwen4Exp {
                 mtp: false,
                 mtp_place: None,
                 prune_mask: None,
+                lent: vec![0; n],
+                lent_at: vec![None; n],
             }),
             flow: OnceLock::new(),
             reports: Mutex::new(Vec::new()),
@@ -1129,9 +1241,11 @@ impl Qwen4Exp {
         let (ports, board) = (part.ports(), part.board());
         let cores: Vec<bool> = (0..layer_count).map(|i| part.has_core(i)).collect();
         let holds_mtp = block.is_some();
+        let lent_bytes = part.lent_bytes();
         self.meeting.meet(
             n,
             |build| {
+                build.lent[index] = lent_bytes;
                 build.room[index] = room;
                 build.ports[index] = ports;
                 build.cores[index] = cores;
@@ -1257,6 +1371,27 @@ impl Qwen4Exp {
                     .map_err(model_error)?;
                 let ram_bytes = store.ram_bytes().0;
                 let ram_fixed = store.ram_fixed_bytes();
+                // Where each device's slots lend the VRAM of a step wider than
+                // the parts' own scratch: always the same slots.
+                for d in 0..n {
+                    let bytes = build.lent[d];
+                    if bytes == 0 {
+                        continue;
+                    }
+                    let Some(loan) = store.loan_at(d, bytes) else {
+                        let mib = |b: u64| b as f64 / f64::from(1u32 << 20);
+                        return Err(invalid(format!(
+                            "a step of {} rows needs {:.0} MiB of VRAM that the expert slots of \
+                             device {d} lend for it, and they can lend {:.0} MiB; name fewer rows \
+                             (--batch-size)",
+                            o.max_rows,
+                            mib(bytes),
+                            mib(store.lendable(d)),
+                        )));
+                    };
+                    let (base, _) = store.device(d).pool(loan.pool);
+                    build.lent_at[d] = Some(base.offset(u64::from(loan.first) * loan.stride));
+                }
                 let mut firsts = Vec::with_capacity(n);
                 for d in 0..n {
                     let part = self.placement.part(c, d);
@@ -1311,6 +1446,10 @@ impl Qwen4Exp {
                     uploads_seen: AtomicU64::new(0),
                     stall: self.opts.stall,
                     wide: Mutex::new(WideStats::default()),
+                    own_rows: o.own_rows(),
+                    lent: build.lent.clone(),
+                    lent_at: build.lent_at.clone(),
+                    on_loan: AtomicBool::new(false),
                     totals: Mutex::new(ExpertStats {
                         ram_tier_bytes: ram_bytes,
                         ..Default::default()
@@ -1342,7 +1481,7 @@ impl Qwen4Exp {
             }
             let peer = self.placement.tensor.as_ref().map(|tensor| {
                 let other = 1 - index;
-                (build.ports[other], build.cores[other].clone(), tensor.mixer)
+                (build.ports[other], build.cores[other].clone(), tensor.mixer, build.lent_at[other])
             });
             (
                 build.places[index].clone(),
@@ -1357,9 +1496,9 @@ impl Qwen4Exp {
         if let Some(mask) = prune_mask {
             part.set_prune_mask(mask);
         }
-        if let Some((ports, cores, mixer)) = peer {
+        if let Some((ports, cores, mixer, peer_lent)) = peer {
             let ports = ports.ok_or_else(|| invalid("a part that shares layers has no ports"))?;
-            part.set_peer(ports, cores)?;
+            part.set_peer(ports, cores, peer_lent)?;
             if index == mixer {
                 let owner: Vec<u8> = (0..c.n_layer)
                     .flat_map(|layer| {
@@ -1562,6 +1701,14 @@ impl Model for Qwen4Exp {
 
     fn max_rows(&self) -> u32 {
         self.opts.part.max_rows
+    }
+
+    fn prompt_rows(&self) -> u32 {
+        self.opts.part.own_rows()
+    }
+
+    fn own_rows(&self) -> u32 {
+        self.opts.part.own_rows()
     }
 
     fn logit_rows(&self) -> u32 {
@@ -1834,6 +1981,7 @@ impl Qwen4ExpDevice {
         self.only_drafts = record.drafts_only();
         let windows = (!self.only_drafts).then_some((windows.as_slice(), worth.as_deref()));
         self.flow.begin(number, rows, windows, self.index, stream)?;
+        self.part.set_lent(self.flow.lent(self.index));
 
         // The draft windows of the step before: how many rows count.
         if self.part.has_deferred() {

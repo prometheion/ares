@@ -78,6 +78,7 @@ mod device;
 mod elastic;
 mod fill;
 mod hybrid;
+mod lend;
 mod near;
 mod profile;
 mod region;
@@ -99,6 +100,7 @@ pub use device::{CudaSlots, HostShareState, HostSlots, SlotDevice};
 use elastic::{Layout, Pieces};
 pub use fill::{FillOrder, FillPace, FillStats, FillTier, TierFill};
 pub use hybrid::{CostModel, ExpertTypes, Miss, PromoteRule, Serve};
+pub use lend::Loan;
 pub use near::{ExpertNeighbours, NEAR_FORMAT, Near};
 pub use profile::{ExpertProfile, Ignored, PROFILE_FORMAT, ProfileKey};
 pub use region::{HostRegion, Locker, PIECE, Released};
@@ -483,6 +485,10 @@ pub struct StoreStats {
     /// For every pick whose read had started ahead and was still on its way when its
     /// record arrived: milliseconds from the record to its bytes being in RAM.
     pub ahead_miss_ms: Vec<f32>,
+    /// VRAM lent by the slots (`lend.rs`): loans made, and experts moved out of
+    /// the lent slots into slots the layers gave.
+    pub loans: u64,
+    pub loan_moves: u64,
 }
 
 /// The expert tiers of a model and the work that feeds them.
@@ -528,6 +534,8 @@ pub struct ExpertStore<D: SlotDevice> {
     read_ms: f64,
     /// The read-ahead of predicted picks of the running step and its bounds.
     ahead: ahead::Ahead,
+    /// Per device, the VRAM its slots have lent (`lend.rs`).
+    loans: Vec<Option<lend::Lent>>,
     stats: StoreStats,
 }
 
@@ -887,6 +895,7 @@ impl<D: SlotDevice> ExpertStore<D> {
             windows: windows::Windows::default(),
             read_ms: 3.0,
             ahead: ahead::Ahead::new(&layers, &reader),
+            loans: devices.iter().map(|_| None).collect(),
             stats: StoreStats::default(),
             block,
             config,

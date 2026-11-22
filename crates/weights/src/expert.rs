@@ -163,6 +163,9 @@ pub struct Given {
 enum Slot {
     /// Given back: the slot's memory belongs to someone else.
     Gone,
+    /// Given back and lent: [`SlotSet::take`] does not take it again, only
+    /// [`SlotSet::end_loan`] does.
+    Lent,
     Empty,
     /// The expert's data is on its way; nobody may use the slot.
     Loading(u32),
@@ -371,7 +374,29 @@ impl SlotSet {
     /// [`SlotSet::give_back`]. Slot numbers are stable, so after slots were
     /// given back the numbers in use have gaps.
     pub fn n_slots(&self) -> usize {
-        self.slots.iter().filter(|s| **s != Slot::Gone).count()
+        self.slots.iter().filter(|s| !matches!(s, Slot::Gone | Slot::Lent)).count()
+    }
+
+    /// Keeps `slot`, which was given back ([`SlotSet::give_back`]), from being
+    /// taken again until [`SlotSet::end_loan`]: its memory is lent for longer
+    /// than the caller's next [`SlotSet::take`]. False when the slot was not
+    /// given back.
+    pub fn lend(&mut self, slot: u32) -> bool {
+        match self.slots.get_mut(slot as usize) {
+            Some(state @ (Slot::Gone | Slot::Lent)) => {
+                *state = Slot::Lent;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Ends the loan of `slot` ([`SlotSet::lend`]): it is given back as before
+    /// and the next [`SlotSet::take`] may take it.
+    pub fn end_loan(&mut self, slot: u32) {
+        if let Some(state @ Slot::Lent) = self.slots.get_mut(slot as usize) {
+            *state = Slot::Gone;
+        }
     }
 
     /// The slot that holds `expert`, if its data is in place.

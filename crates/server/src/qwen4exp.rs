@@ -19,7 +19,7 @@ use ares_core::units::Bytes;
 use ares_gguf::Gguf;
 use ares_model::qwen4exp::device::{
     Options, ProfileFound, ProfileReport, PruneSetup, Qwen4Exp, SessionOptions, Spread,
-    TensorChoice, place, profile_key, step_rows,
+    TensorChoice, batch_rows, place, profile_key, step_rows,
 };
 use ares_model::qwen4exp::{Config, MtpWeights};
 use ares_runtime::expert_store::ExpertNeighbours;
@@ -37,6 +37,13 @@ use crate::plan::{self, CELLS_PER_PAGE, DEFAULT_PARALLEL, Drafter, LoadOptions, 
 /// they verify): what the decode kernels of the experts take. Only the slices of a prompt are
 /// wider.
 const MAX_ROWS: u32 = ares_cuda::MAX_BATCH;
+
+/// The rows of the step a prompt read alone takes unless `--batch-size` says
+/// otherwise, as far as the expert slots can lend its scratch: every expert a
+/// prompt picks is read once a step, so a long prompt reads the experts of
+/// the file once per this many rows (chosen by measurement, see "Large prompt
+/// steps on lent VRAM" in `docs/ARCHITECTURE.md`).
+const DEFAULT_BATCH: u32 = 8192;
 
 /// The rows of a sequence's window unless `--window` says otherwise: the
 /// newest token and three drafts. A row of this model routes to experts of
@@ -223,18 +230,22 @@ pub(crate) fn load(
 
     // The model's settings that do not depend on the context.
     let model_context = config.n_ctx as u32;
-    // The rows of a step: the devices decide, by the memory a step's scratch may take.
-    let max_rows = step_rows(
-        &Gguf::open(&options.model)?,
-        &devices,
-        &Options { kv, logit_rows, window_rows, max_slots: parallel, ..Options::default() },
-    )
-    .map_err(|e| LoadError::Model(e.to_string()))?;
-    tracing::info!("steps of up to {max_rows} rows");
-    let session = |context: u32, pages: u32, spread: Spread| SessionOptions {
+    // The rows of a step in the memory the parts keep: the devices decide, by
+    // the memory a step's scratch may take, unless --ubatch-size says.
+    let own_rows = match options.ubatch {
+        Some(rows) => rows,
+        None => step_rows(
+            &Gguf::open(&options.model)?,
+            &devices,
+            &Options { kv, logit_rows, window_rows, max_slots: parallel, ..Options::default() },
+        )
+        .map_err(|e| LoadError::Model(e.to_string()))?,
+    };
+    let session = |context: u32, pages: u32, spread: Spread, max_rows: u32| SessionOptions {
         part: Options {
             kv,
             max_rows,
+            own_rows,
             logit_rows,
             window_rows,
             max_slots: parallel,
@@ -266,7 +277,7 @@ pub(crate) fn load(
             let (placement, page_bytes) = place(
                 &Gguf::open(&options.model)?,
                 &devices,
-                &session(trial, plan::pool_pages(trial, parallel), spread),
+                &session(trial, plan::pool_pages(trial, parallel), spread, own_rows),
             )
             .map_err(|e| named_split(e.to_string()))?;
             spread = pinned(spread, &placement);
@@ -290,10 +301,43 @@ pub(crate) fn load(
     };
     let longest = context.min(model_context);
     let (placement, page_bytes) =
-        place(&Gguf::open(&options.model)?, &devices, &session(longest, pages, spread))
+        place(&Gguf::open(&options.model)?, &devices, &session(longest, pages, spread, own_rows))
             .map_err(|e| named_split(e.to_string()))?;
     let spread = pinned(spread, &placement);
-    let opts = session(longest, pages, spread);
+    // The rows of the step a prompt read alone takes: as many as asked or the
+    // default, as far as the expert slots can lend the scratch for them.
+    let asked = options.batch.unwrap_or(DEFAULT_BATCH).max(own_rows);
+    let max_rows = batch_rows(
+        &Gguf::open(&options.model)?,
+        &devices,
+        &session(longest, pages, spread, own_rows),
+        &placement,
+        pages,
+        &page_bytes,
+        asked,
+    )
+    .map_err(|e| LoadError::Model(e.to_string()))?;
+    if options.batch.is_some_and(|b| max_rows < b) {
+        return Err(refuse(format!(
+            "--batch-size {asked}: the expert slots can lend the scratch of a step of {max_rows} \
+             rows at most, beside steps of {own_rows} rows in the parts' own memory"
+        )));
+    }
+    tracing::info!(
+        "steps of up to {own_rows} rows in the parts' own memory{}",
+        if max_rows > own_rows {
+            format!(
+                ", and of up to {max_rows} rows for a prompt read alone, on VRAM the expert \
+                 slots lend for the step"
+            )
+        } else {
+            String::new()
+        }
+    );
+    let (placement, page_bytes) =
+        place(&Gguf::open(&options.model)?, &devices, &session(longest, pages, spread, max_rows))
+            .map_err(|e| named_split(e.to_string()))?;
+    let opts = session(longest, pages, spread, max_rows);
     if let (Some(dir), None, Some(tensor)) = (&options.cache, &remembered, &placement.tensor) {
         Split::write(dir, &options.model, &devices, &tensor.choice);
     }

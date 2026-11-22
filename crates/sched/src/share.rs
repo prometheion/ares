@@ -32,7 +32,12 @@
 //!   of short prompts is read in one step (the planner serves the shortest
 //!   first) and then pays once.
 //!
-//! While nobody generates, a prompt takes the widest step there is.
+//! A prompt that is read alone (nobody generates, no other prompt waits)
+//! takes the widest step there is, which may borrow memory for its time (the
+//! expert slots of a mixture of experts lend it VRAM). Once another request
+//! waits, the steps of prompt shrink to a piece, which the caller bounds in
+//! time ([`Pending::piece_rows`]): the request that waits gets its step after
+//! the one in flight and one piece at most.
 
 /// What the next step is for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -54,9 +59,10 @@ pub struct Pending<'a> {
     /// The rows still to read of each prompt that has started.
     pub prompts: &'a [u32],
     /// The rows of a piece of prompt, the newest tokens of the generating
-    /// sequences included.
+    /// sequences included: what a step for prompts takes while another
+    /// request waits.
     pub piece_rows: u32,
-    /// The most rows of a step.
+    /// The most rows of a step: what a prompt read alone takes.
     pub max_rows: u32,
 }
 
@@ -90,11 +96,14 @@ impl Share {
         // ride along: a step of one row more than a piece runs its last row
         // as a step of its own.
         let rows = piece.saturating_sub(pending.generating).max(1);
-        if pending.prompts.iter().all(|&left| left == 0) {
+        let started = pending.prompts.iter().filter(|&&left| left > 0).count();
+        if started == 0 {
             return Turn::Round;
         }
         if pending.generating == 0 {
-            return Turn::Piece { rows: pending.max_rows };
+            // Alone, the widest step; next to another prompt, a piece, which
+            // the planner gives the shortest prompt first.
+            return Turn::Piece { rows: if started == 1 { pending.max_rows } else { piece } };
         }
         if self.owed_ms <= 0.0 {
             return Turn::Piece { rows };
@@ -174,8 +183,15 @@ mod tests {
     fn nobody_generating_gives_a_prompt_the_widest_step() {
         let share = Share::new(2.0);
         assert_eq!(share.next(&pending(0, &[2000]), price), Turn::Piece { rows: 512 });
+        assert_eq!(share.next(&pending(0, &[2000, 0]), price), Turn::Piece { rows: 512 });
         assert_eq!(share.next(&pending(0, &[]), price), Turn::Round);
         assert_eq!(share.next(&pending(3, &[0]), price), Turn::Round);
+    }
+
+    #[test]
+    fn a_prompt_that_waits_next_to_a_long_one_makes_the_steps_pieces() {
+        let share = Share::new(2.0);
+        assert_eq!(share.next(&pending(0, &[20_000, 40]), price), Turn::Piece { rows: 256 });
     }
 
     #[test]

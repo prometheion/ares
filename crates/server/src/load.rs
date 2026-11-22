@@ -957,17 +957,28 @@ fn load_qwen35(
 
     // The model's settings that do not depend on the placement.
     let window_rows = if drafts { parallel.saturating_mul(window) } else { 0 };
+    let defaults = Options::default();
     let part_options = Options {
         precision: options.precision,
         kv,
+        max_rows: options.ubatch.unwrap_or(defaults.max_rows),
         logit_rows: window_rows.max(parallel),
         window_rows,
         draft_vocabulary: vocabulary.clone(),
         mtp,
         mtp_file,
         dflash: dflash.clone(),
-        ..Options::default()
+        ..defaults
     };
+    // A dense model runs every step in its own memory: a step of prompt has
+    // at most the rows of its scratch.
+    if let Some(batch) = options.batch.filter(|b| *b > part_options.max_rows) {
+        return Err(refuse(format!(
+            "--batch-size {batch}: this model runs no step wider than its scratch of {} rows \
+             (--ubatch-size); only a mixture of experts lends VRAM for wider ones",
+            part_options.max_rows
+        )));
+    }
     if part_options.max_rows < window_rows {
         return Err(refuse(format!(
             "{parallel} sequences with windows of {window} rows are {window_rows} rows in a \
@@ -1324,6 +1335,7 @@ fn load_qwen35(
         window_rows: if drafts { window } else { 1 },
         cache_ram: lockable - required,
         ssd: ssd.clone(),
+        max_rows: options.batch.unwrap_or(0),
         ..RuntimeConfig::default()
     };
     let gpu = GpuConfig {

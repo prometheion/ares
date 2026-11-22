@@ -144,6 +144,22 @@ OPTIONS:
                                the price of a step and the acceptance measured
                                [default: all the model has: mtp if the file has
                                an MTP block]
+        -b, --batch-size <ROWS>
+                               Most rows of prompt in one step while a prompt is
+                               read alone. Above --ubatch-size only for a mixture
+                               of experts (Qwen3.8-Flash-Next): its expert slots
+                               in VRAM lend the step's scratch for its time, and
+                               every expert is read once a step, not once per
+                               --ubatch-size rows; a request that arrives waits
+                               for the step in flight [default: 8192 for a mixture
+                               of experts, as far as the slots can lend it, else
+                               --ubatch-size]
+        -ub, --ubatch-size <ROWS>
+                               Most rows of a step in the memory the model keeps
+                               for good, and of a piece of prompt while another
+                               request waits [default: what a thirty-second of the
+                               smaller device's memory holds for a mixture of
+                               experts, 512 for the 27B]
         --window <ROWS>        Most rows of one sequence's window, its newest
                                token and the drafts verified with it. The room
                                for them is VRAM (about 5 MiB a row for the 27B,

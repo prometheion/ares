@@ -488,36 +488,12 @@ impl<D: SlotDevice> ExpertStore<D> {
     }
 
     /// `layer` takes `slots` of its pool into use again: slots it holds the
-    /// numbers of and had given up. The numbers its set hands out are put in
-    /// front of exactly these slots.
+    /// numbers of and had given up ([`Tier::retake`]).
     fn retake(&mut self, layer: usize, slots: &[u32]) {
         if slots.is_empty() {
             return;
         }
-        let wanted: HashSet<u32> = slots.iter().copied().collect();
-        let taken = self.ram.sets[layer].take(slots.len());
-        let taken_numbers: HashSet<u32> = taken.iter().copied().collect();
-        // Numbers that stay given up although one of the slots is behind them.
-        let mut behind: Vec<u32> = self
-            .ram
-            .locals(layer)
-            .iter()
-            .enumerate()
-            .filter(|(number, slot)| {
-                wanted.contains(slot) && !taken_numbers.contains(&(*number as u32))
-            })
-            .map(|(number, _)| number as u32)
-            .collect();
-        for number in taken {
-            let has = self.ram.slot(layer, number);
-            if wanted.contains(&has) {
-                continue;
-            }
-            let other = behind.pop().expect("a slot for every number taken");
-            let slot = self.ram.slot(layer, other);
-            self.ram.remap(layer, number, slot);
-            self.ram.remap(layer, other, has);
-        }
+        self.ram.retake(layer, slots);
         self.worth_stale[layer] = true;
     }
 }

@@ -495,6 +495,11 @@ struct StepPart {
 
 /// The load of `rows` consecutive rows of a sequence that start at position
 /// `context`, for a model whose rows read at most `span` cells each.
+/// The fewest rows a piece of prompt is cut to by its time bound
+/// ([`RuntimeConfig::piece_ms`]): the smallest step of prompt the warm-up
+/// measures.
+const MIN_PIECE: u32 = 16;
+
 fn load_of(span: u32, context: u64, rows: u32) -> Load {
     let span = u64::from(span);
     // The rows that still read less than the span, and the ones at it.
@@ -1748,10 +1753,20 @@ impl Conductor {
             .max()
             .unwrap_or(0);
         let (span, prices) = (self.span, &self.prices);
+        // A piece is what a step for prompts takes while another request
+        // waits: within the model's own memory, and as large as fits the time
+        // bound by the price of a step (halved until it does; a price not yet
+        // measured fits).
+        let mut piece = self.model.prompt_rows().min(self.model.own_rows()).min(self.max_rows);
+        while piece > MIN_PIECE
+            && prices.ms(load_of(span, deepest, piece)).is_some_and(|ms| ms > self.config.piece_ms)
+        {
+            piece = (piece / 2).max(MIN_PIECE);
+        }
         let pending = Pending {
             generating,
             prompts: &self.prompt_rows,
-            piece_rows: self.model.prompt_rows().min(self.max_rows),
+            piece_rows: piece,
             max_rows: self.max_rows,
         };
         let turn = self

@@ -251,6 +251,12 @@ impl Model for Made {
     fn max_rows(&self) -> u32 {
         self.0.max_rows()
     }
+    fn own_rows(&self) -> u32 {
+        self.0.own_rows()
+    }
+    fn prompt_rows(&self) -> u32 {
+        self.0.prompt_rows()
+    }
     fn logit_rows(&self) -> u32 {
         self.0.logit_rows()
     }
@@ -742,6 +748,78 @@ fn a_prompt_read_in_wide_steps_gives_the_reference_answer() {
         assert!(wide.missing > 0, "{placement:?}: no expert was fetched");
         assert!(leading(&got, &reference) >= 2, "{placement:?}: {got:?} against {reference:?}");
     }
+}
+
+/// A prompt read alone runs as one wide step of more rows than the parts' own scratch holds,
+/// on VRAM the expert slots lend for it (`expert_store/lend.rs`), in every placement: it
+/// answers as the same prompt read in steps of the own scratch does (both start as the CPU
+/// reference's answer; later tokens of a made-up model follow near ties, which the order of
+/// the experts' sums in a wide step flips), the slots lend once and take the VRAM back after
+/// the prompt, and the experts that stay in VRAM are where their entries say.
+#[test]
+fn a_prompt_read_alone_runs_on_vram_the_expert_slots_lend() {
+    if !enabled() {
+        return;
+    }
+    let prompt = prompt(200, 5);
+    let reference = reference_answer(1, &prompt, 16);
+    let leading = |a: &[u32], b: &[u32]| a.iter().zip(b).take_while(|(x, y)| x == y).count();
+    for placement in placements() {
+        let (runtime, _) = start_rows(1, placement, 16, RuntimeConfig::default(), WIDE_ROWS);
+        let own = ask(&runtime, 1, &prompt, 16);
+        runtime.shutdown();
+        let (runtime, model) = start_lending(1, placement, 16, 4 * WIDE_ROWS, WIDE_ROWS);
+        assert_eq!(runtime_rows(&model), (4 * WIDE_ROWS, WIDE_ROWS));
+        let lent = ask(&runtime, 1, &prompt, 16);
+        // Asked again, the same conversation reads its prompt from the cache and
+        // the steps run in the parts' own memory.
+        let again = ask(&runtime, 2, &prompt, 16);
+        let stats = model.take_store_stats().expect("the parts are open");
+        runtime.shutdown();
+        eprintln!(
+            "LENT {placement:?}: {} tokens as the reference's before the first difference (own \
+             scratch: {}), {} as the own scratch's; {} loans, {} experts moved out of the lent \
+             slots",
+            leading(&lent, &reference),
+            leading(&own, &reference),
+            leading(&lent, &own),
+            stats.loans,
+            stats.loan_moves
+        );
+        assert_eq!(stats.loans, 1, "{placement:?}: one loan for the one prompt read alone");
+        assert!(leading(&lent, &reference) >= 2, "{placement:?}: {lent:?} against {reference:?}");
+        assert!(leading(&again, &reference) >= 2, "{placement:?}: {again:?} after the loan");
+    }
+}
+
+/// The rows of a step the model takes, and those in its parts' own memory.
+fn runtime_rows(model: &Qwen4Exp) -> (u32, u32) {
+    (model.max_rows(), model.own_rows())
+}
+
+/// [`start_rows`] with steps of up to `rows` rows, of which those wider than `own` run on
+/// VRAM the expert slots lend.
+fn start_lending(
+    seed: u64,
+    placement: Placement,
+    pages: u32,
+    rows: u32,
+    own: u32,
+) -> (Runtime, Arc<Qwen4Exp>) {
+    let devices = open_devices(placement);
+    let gguf = Gguf::open(gguf_path(seed)).unwrap();
+    let n_layer = Config::from_gguf(&gguf).unwrap().n_layer;
+    let mut opts = options(placement, n_layer, pages, MAX_ROWS, rows);
+    opts.part.own_rows = own;
+    let inner =
+        Arc::new(Qwen4Exp::new(gguf, byte_tokenizer(None), "made", &devices, opts, CELLS).unwrap());
+    let config =
+        RuntimeConfig { pages, cells_per_page: 128, max_slots: SLOTS, ..RuntimeConfig::default() };
+    let model: Arc<dyn Model> = Arc::new(Made(inner.clone(), Cache::On));
+    let mut gpu = GpuConfig::new(&config, &*model);
+    gpu.ram_limit += 256 << 20;
+    gpu.vram_headroom = 512 << 20;
+    (Runtime::start_gpu(model, devices, config, gpu).expect("the runtime starts"), inner)
 }
 
 /// Models whose experts are stored in other weight types than the real file's, through the

@@ -2460,3 +2460,67 @@ fn give_up_pieces_of_two_pools(
         mixed_step(&mut store, &picks).unwrap();
     }
 }
+
+/// VRAM lent by the slots: the last slots of the pool leave every layer, what
+/// stays in them moves into slots the layers gave (their coldest), a step
+/// while the loan runs never uses them, and given back they are the layers'
+/// again, empty.
+#[test]
+fn a_loan_of_vram_takes_the_last_slots_of_the_pool_and_gives_them_back_empty() {
+    // Eight slots per layer in VRAM, all of RAM; a loan leaves a layer three:
+    // its top-k of two and the free one.
+    let mut rig = rig(8, 16, |_| {});
+    for step in 0..2 {
+        let picks: Vec<Vec<u32>> = (0..LAYERS)
+            .map(|l| (0..8).map(|e| (e + step * 3 + l as u32) % EXPERTS).collect())
+            .collect();
+        let picks: Vec<&[u32]> = picks.iter().map(Vec::as_slice).collect();
+        rig.step(&picks);
+    }
+    let (_, pool) = rig.store.place(0);
+    let slots_before: Vec<usize> = (0..LAYERS).map(|l| rig.store.slots(l).0).collect();
+    assert_eq!(slots_before, [8, 8, 8]);
+    assert_eq!(rig.store.lendable(0), (3 * (8 - 3)) as u64 * SLOT_BYTES);
+    assert_eq!(rig.store.lend_vram(0, 16 * SLOT_BYTES).unwrap(), None, "more than the layers have");
+    // Ten slots: the last ten of the pool of 24.
+    let loan = rig.store.lend_vram(0, 10 * SLOT_BYTES - 5).unwrap().expect("a loan");
+    assert_eq!((loan.pool, loan.first, loan.slots, loan.stride), (pool, 14, 10, SLOT_BYTES));
+    rig.settle();
+    assert!(rig.store.loan_ready(0).unwrap());
+    assert_eq!(rig.store.loan(0), Some(loan));
+    // No table entry names a lent slot, and every expert VRAM holds is usable
+    // where its entry says.
+    let mut held = 0;
+    for layer in 0..LAYERS {
+        for expert in 0..EXPERTS {
+            let entry = rig.store.device(0).entry(layer, expert);
+            if entry >= 0 {
+                assert!((entry as u32) < loan.first, "layer {layer} expert {expert} in {entry}");
+                rig.assert_usable(layer, expert);
+                held += 1;
+            }
+        }
+    }
+    assert_eq!(held, 24 - 10, "what the layers kept");
+    // A step while the loan runs: what it misses goes into slots outside it.
+    let picks: Vec<Vec<u32>> = (0..LAYERS).map(|l| vec![15 - l as u32, 14 - l as u32]).collect();
+    let picks: Vec<&[u32]> = picks.iter().map(Vec::as_slice).collect();
+    rig.step(&picks);
+    for layer in 0..LAYERS {
+        for expert in 0..EXPERTS {
+            let entry = rig.store.device(0).entry(layer, expert);
+            assert!(entry < loan.first as i32, "layer {layer} expert {expert} in {entry}");
+        }
+    }
+    // Given back: the slots are the layers' again and fill.
+    rig.store.return_vram(0).unwrap();
+    assert_eq!(rig.store.loan(0), None);
+    let slots_after: Vec<usize> = (0..LAYERS).map(|l| rig.store.slots(l).0).collect();
+    assert_eq!(slots_after, slots_before);
+    let picks: Vec<Vec<u32>> = (0..LAYERS).map(|_| (8..16).collect()).collect();
+    let picks: Vec<&[u32]> = picks.iter().map(Vec::as_slice).collect();
+    rig.step(&picks);
+    let stats = rig.store.take_stats();
+    assert_eq!(stats.loans, 1);
+    assert!(stats.loan_moves > 0, "what stayed in the lent slots moved");
+}
