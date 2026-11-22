@@ -888,18 +888,21 @@ Measured per phase on a quiet machine against the fork and Strata, the largest f
       VRAM, quality.
 
 ## Owed on two cards (the owner's cards are production; run when the owner frees them)
-- [ ] `qwen4exp_runtime` `the_mtp_block_follows_wide_steps_that_start_at_any_cell` (new with the
-      MTP fix) failed on the RTX 4070 and RTX 3060 in the warm-up ("every expert has a slot",
-      line 497), in a placement the failure did not name; it passes with one card (RTX 4060 Ti).
-      Run it with `--nocapture`; then two cards or 12 GiB.
-- [ ] The suites that need two devices: `ares-server --test real`
-      (`flash_next_answers_in_both_placements`), `real_cache` (two of four), `real_devices`,
-      `qwen35_device_runtime` with the attention-split placements, `qwen4exp_device` with
-      `ARES_TEST_SPREAD=tensor` (`ARES_TEST_CORE_SHARE=1 ARES_TEST_SHARED=mixer` too), and the
-      MTP block's first links with both cards on every layer ("Server and API").
+Run on 2026-11-22 evening (main c5d27e9, RTX 4070 + RTX 3060, peer access, load about 30 from
+the agents' builds):
+- [x] The two-device suites: `real_cache` 4 of 4, `real_devices`, `qwen35_device_runtime` (the
+      attention-split placements) 4 of 4, `qwen4exp_device` with `ARES_TEST_SPREAD=tensor` 23 of
+      23 and with `ARES_TEST_CORE_SHARE=1 ARES_TEST_SHARED=mixer` 23 of 23; `real` 21 of 22 (the
+      known intermittent `flash_next_drafts_with_its_mtp_block` that verifies no draft at all).
+- [x] The MTP block's first links with both cards on every layer: a server session (IQ2_XS,
+      `--ram 8G`, MTP) accepted 626 of 1078 drafts, decode 17 to 52 tokens/s; the poor first
+      links the server agent saw are not seen again.
+- [ ] `qwen4exp_runtime` `the_mtp_block_follows_wide_steps_that_start_at_any_cell`: passes with one
+      device, fails in the split by layers on two: the warm-up finds 376 VRAM slots for 8 layers x
+      48 experts (steps of 196 rows; the other tests take 8 or 64 rows and pass). Something keeps
+      8 slots from the store in that placement at that step width.
 - [ ] Rust 1.100 (stable on the test machine) crashes compiling `ares-model --test
-      qwen35_failure` (an internal compiler error); 1.99 builds it. Check again with the next
-      stable; the repository asks for `stable`.
+      qwen35_failure` (an internal compiler error); 1.99 builds it, and the test passes there.
 - [ ] `qwen4exp_runtime` with the default test threads hung for over 18 minutes once (two device
       threads spinning; the `moe/prompt-chunks` agent); with `--test-threads=1` it passes.
 
