@@ -4,6 +4,7 @@
 //! tokenizer.
 
 use ares_api::{ChatFormat, EngineError, Prompt, Role, ThinkingFormat, ToolFormat};
+use ares_runtime::{Boundary, EncodedPrompt};
 use ares_tokenizer::{
     ChatOptions, Content, EncodeOptions, Json, Message, ReasoningFormat, Tokenizer, Tool, ToolCall,
 };
@@ -93,10 +94,32 @@ pub(crate) fn encode(
     chat: &ChatOptions,
     prompt: &Prompt,
 ) -> Result<Vec<u32>, EngineError> {
+    encode_prompt(tokenizer, chat, prompt, false).map(|encoded| encoded.tokens)
+}
+
+/// The tokens of `prompt` as [`encode`] gives them, and for a conversation
+/// the places where its parts end ([`Boundary`]), read off the chat template
+/// itself (see [`boundaries`]).
+pub(crate) fn encode_with_boundaries(
+    tokenizer: &Tokenizer,
+    chat: &ChatOptions,
+    prompt: &Prompt,
+) -> Result<EncodedPrompt, EngineError> {
+    encode_prompt(tokenizer, chat, prompt, true)
+}
+
+fn encode_prompt(
+    tokenizer: &Tokenizer,
+    chat: &ChatOptions,
+    prompt: &Prompt,
+    with_boundaries: bool,
+) -> Result<EncodedPrompt, EngineError> {
     match prompt {
-        Prompt::Text(text) => {
-            Ok(tokenizer.encode(text, EncodeOptions { add_special: true, parse_special: false }))
-        }
+        Prompt::Text(text) => Ok(EncodedPrompt {
+            tokens: tokenizer
+                .encode(text, EncodeOptions { add_special: true, parse_special: false }),
+            boundaries: Vec::new(),
+        }),
         Prompt::Chat { messages, tools, variables, continue_final } => {
             let invalid = |what: String| EngineError::InvalidRequest(what);
             let tools: Vec<Tool> =
@@ -121,16 +144,131 @@ pub(crate) fn encode(
                 .collect::<Result<_, String>>()
                 .map_err(invalid)?;
             let options = with_variables(chat, variables);
-            let text = if *continue_final {
-                continued(tokenizer, messages, &tools, options)?
-            } else {
-                tokenizer
-                    .render_chat(&messages, &tools, &options)
-                    .map_err(|e| EngineError::InvalidRequest(format!("chat template: {e}")))?
+            let render = |messages: Vec<Message>| {
+                if *continue_final {
+                    continued(tokenizer, messages, &tools, options.clone())
+                } else {
+                    tokenizer
+                        .render_chat(&messages, &tools, &options)
+                        .map_err(|e| EngineError::InvalidRequest(format!("chat template: {e}")))
+                }
             };
-            Ok(tokenizer.encode(&text, EncodeOptions { add_special: true, parse_special: true }))
+            let text = render(messages.clone())?;
+            let tokens =
+                tokenizer.encode(&text, EncodeOptions { add_special: true, parse_special: true });
+            let boundaries = match with_boundaries {
+                true => boundaries(tokenizer, &messages, *continue_final, &text, &tokens, render),
+                false => Vec::new(),
+            };
+            Ok(EncodedPrompt { tokens, boundaries })
         }
     }
+}
+
+/// What marks where the text of a message starts and ends in a rendering of
+/// a conversation: a character of the private use area (another one than
+/// [`MARK`]'s), the message's number, the character again.
+const BOUNDARY: char = '\u{f8fe}';
+
+/// Where the parts of a conversation end in its prompt `tokens`, rendered as
+/// `text`: the start and the end of the text of every message, and among
+/// them the roots, the start and the end of a system prompt and the start of
+/// the first message after it. A template that writes the tools before the
+/// system prompt (Qwen3.5's and Qwen3.8's) ends the tool list where the
+/// system prompt starts; one that writes them after it, where the first
+/// message starts.
+///
+/// The template itself says where: every message whose text is not empty is
+/// rendered again with a mark before and after its text (inside its white
+/// space at either end, which templates trim), and the marks are found in
+/// that text. Their places count only when the text without them is the
+/// prompt's text to the byte: a template that reads a message's text
+/// otherwise than writing it (a test whether it is empty, a split of it)
+/// renders something else with the marks, and the prompt then has no
+/// boundaries. A mark the template does not write once is left out. A place
+/// inside a token counts as the end of the token before it.
+fn boundaries(
+    tokenizer: &Tokenizer,
+    messages: &[Message],
+    continue_final: bool,
+    text: &str,
+    tokens: &[u32],
+    render: impl Fn(Vec<Message>) -> Result<String, EngineError>,
+) -> Vec<Boundary> {
+    let content = |m: &Message| match &m.content {
+        Content::Text(text) => Some(text.clone()),
+        Content::Parts(_) => None,
+    };
+    if messages.iter().any(|m| content(m).is_none_or(|text| text.contains(BOUNDARY))) {
+        return Vec::new();
+    }
+    // The message a reply continues ends the prompt inside its text.
+    let marked_count = messages.len() - usize::from(continue_final);
+    let mut marked = messages.to_vec();
+    for (i, message) in marked.iter_mut().enumerate().take(marked_count) {
+        let Content::Text(text) = &message.content else { continue };
+        let core = text.trim();
+        if core.is_empty() {
+            continue;
+        }
+        let lead = &text[..text.len() - text.trim_start().len()];
+        let trail = &text[text.trim_end().len()..];
+        message.content = Content::Text(format!(
+            "{lead}{BOUNDARY}{}{BOUNDARY}{core}{BOUNDARY}{}{BOUNDARY}{trail}",
+            2 * i,
+            2 * i + 1
+        ));
+    }
+    let Ok(rendered) = render(marked) else { return Vec::new() };
+    // The text without the marks, and the byte in it where each mark was.
+    let mut plain = String::with_capacity(rendered.len());
+    let mut found: Vec<Option<usize>> = vec![None; 2 * marked_count];
+    let mut twice = vec![false; 2 * marked_count];
+    let mut rest = rendered.as_str();
+    while let Some(at) = rest.find(BOUNDARY) {
+        plain.push_str(&rest[..at]);
+        let after = &rest[at + BOUNDARY.len_utf8()..];
+        let Some(end) = after.find(BOUNDARY) else { return Vec::new() };
+        let Some(number) = after[..end].parse::<usize>().ok().filter(|n| *n < found.len()) else {
+            return Vec::new();
+        };
+        twice[number] |= found[number].is_some();
+        found[number] = Some(plain.len());
+        rest = &after[end + BOUNDARY.len_utf8()..];
+    }
+    plain.push_str(rest);
+    if plain != text {
+        return Vec::new();
+    }
+    // The byte where each token ends.
+    let skip = usize::from(tokenizer.adds_bos() && !tokens.is_empty());
+    let mut ends = Vec::with_capacity(tokens.len() + 1);
+    ends.push(0usize);
+    for &id in &tokens[skip..] {
+        let Ok(piece) = tokenizer.piece(id, true) else { return Vec::new() };
+        ends.push(ends.last().copied().unwrap_or(0) + piece.len());
+    }
+    if *ends.last().unwrap_or(&0) != text.len() {
+        return Vec::new();
+    }
+    let position = |byte: usize| (skip + ends.partition_point(|end| *end <= byte) - 1) as u64;
+    let system = messages.iter().take_while(|m| m.role == "system").count();
+    let mut places: Vec<Boundary> = found
+        .iter()
+        .enumerate()
+        .filter(|(number, at)| at.is_some() && !twice[*number])
+        .map(|(number, at)| {
+            let message = number / 2;
+            let start = number % 2 == 0;
+            Boundary {
+                at: position(at.expect("found")),
+                root: message < system || (message == system && start),
+            }
+        })
+        .collect();
+    places.sort_by_key(|b| (b.at, !b.root));
+    places.dedup_by_key(|b| b.at);
+    places
 }
 
 /// What marks the place where the reply goes on, in a conversation that is
@@ -243,6 +381,271 @@ pub(crate) fn piece(tokenizer: &Tokenizer, token: u32, text: &mut Vec<u8>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A byte-level tokenizer of its own, written as a model file: every byte
+    /// a token, `he` and `llo` merged (so that a token can span a place the
+    /// tests look for), and the two tags of a turn as control tokens.
+    fn tiny_tokenizer() -> Tokenizer {
+        // GPT-2's byte-level alphabet.
+        let char_of = |byte: u8| {
+            if matches!(byte, 0x21..=0x7E | 0xA1..=0xAC | 0xAE..=0xFF) {
+                return char::from(byte);
+            }
+            let moved =
+                (0..byte).filter(|b| !matches!(b, 0x21..=0x7E | 0xA1..=0xAC | 0xAE..=0xFF)).count();
+            char::from_u32(0x100 + moved as u32).expect("a character")
+        };
+        let text = |s: &str| s.bytes().map(char_of).collect::<String>();
+        let mut tokens: Vec<String> = (0..=255u8).map(|b| char_of(b).to_string()).collect();
+        tokens.extend(["he", "ll", "llo"].map(text));
+        tokens.extend(["<|im_start|>".to_owned(), "<|im_end|>".to_owned()]);
+        let mut types = vec![1i32; tokens.len() - 2];
+        types.extend([3, 3]);
+        let merges =
+            [("h", "e"), ("l", "l"), ("ll", "o")].map(|(a, b)| format!("{} {}", text(a), text(b)));
+        let file = ares_gguf::GgufBuilder::new()
+            .str("general.architecture", "tiny")
+            .str("tokenizer.ggml.model", "gpt2")
+            .str("tokenizer.ggml.pre", "qwen35")
+            .str_array("tokenizer.ggml.tokens", &tokens)
+            .i32_array("tokenizer.ggml.token_type", &types)
+            .str_array("tokenizer.ggml.merges", &merges)
+            .u32("tokenizer.ggml.eos_token_id", 260)
+            .build();
+        let dir = std::env::temp_dir().join(format!("ares-model-chat-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("tiny-{:?}.gguf", std::thread::current().id()));
+        std::fs::write(&path, file).unwrap();
+        let tokenizer = Tokenizer::from_gguf(&ares_gguf::Gguf::open(&path).unwrap()).unwrap();
+        let _ = std::fs::remove_file(&path);
+        tokenizer
+    }
+
+    /// What Qwen3.5's and Qwen3.8's templates do with the text of a message,
+    /// in short: the tools first in the system turn, then the system prompt;
+    /// every text trimmed; an empty system prompt left out.
+    const QWEN_LIKE: &str = concat!(
+        r"{%- if tools %}{{ '<|im_start|>system\n# Tools' }}",
+        r"{% for t in tools %}{{ '\n' + t.function.name }}{% endfor %}",
+        r"{% if messages[0].role == 'system' %}{% set c = messages[0].content|trim %}",
+        r"{% if c %}{{ '\n\n' + c }}{% endif %}{% endif %}{{ '<|im_end|>\n' }}",
+        r"{%- elif messages[0].role == 'system' %}",
+        r"{{ '<|im_start|>system\n' + messages[0].content|trim + '<|im_end|>\n' }}{%- endif %}",
+        r"{% for m in messages %}{% if m.role != 'system' %}",
+        r"{{ '<|im_start|>' + m.role + '\n' + m.content|trim + '<|im_end|>\n' }}",
+        r"{% endif %}{% endfor %}",
+        r"{% if add_generation_prompt %}{{ '<|im_start|>assistant\n' }}{% endif %}",
+    );
+
+    fn conversation(messages: &[(Role, &str)], tools: bool) -> Prompt {
+        let tool = ares_api::Json::Object(vec![
+            ("type".into(), ares_api::Json::String("function".into())),
+            (
+                "function".into(),
+                ares_api::Json::Object(vec![(
+                    "name".into(),
+                    ares_api::Json::String("hello_tool".into()),
+                )]),
+            ),
+        ]);
+        Prompt::Chat {
+            messages: messages.iter().map(|(r, t)| ares_api::Message::new(*r, *t)).collect(),
+            tools: tools.then(|| vec![tool]),
+            variables: Vec::new(),
+            continue_final: false,
+        }
+    }
+
+    /// The places the boundaries name, as the text before each of them.
+    fn before(tokenizer: &Tokenizer, encoded: &EncodedPrompt) -> Vec<(String, bool)> {
+        encoded
+            .boundaries
+            .iter()
+            .map(|b| {
+                let head = tokenizer.decode(&encoded.tokens[..b.at as usize], true).unwrap();
+                let head = String::from_utf8(head).unwrap();
+                let tail = head.rfind(['\n', '>']).map_or(head.as_str(), |at| &head[at + 1..]);
+                (tail.to_owned(), b.root)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_parts_of_a_conversation_end_where_the_template_writes_them() {
+        use Role::{Assistant, System, User};
+        let tokenizer = tiny_tokenizer();
+        let template = tokenizer.compile_template(QWEN_LIKE).unwrap();
+        let chat =
+            ChatOptions { template: Some(std::sync::Arc::new(template)), ..Default::default() };
+        let messages = [
+            (System, "  You help.\n"),
+            (User, "hello"),
+            (Assistant, "hello there"),
+            (User, " shell\n"),
+        ];
+        let prompt = conversation(&messages, true);
+        let encoded = encode_with_boundaries(&tokenizer, &chat, &prompt).unwrap();
+        // The tokens are those of `encode`, and the text is the template's.
+        assert_eq!(encoded.tokens, encode(&tokenizer, &chat, &prompt).unwrap());
+        let text = String::from_utf8(tokenizer.decode(&encoded.tokens, true).unwrap()).unwrap();
+        assert_eq!(
+            text,
+            "<|im_start|>system\n# Tools\nhello_tool\n\nYou help.<|im_end|>\n<|im_start|>user\n\
+             hello<|im_end|>\n<|im_start|>assistant\nhello there<|im_end|>\n<|im_start|>user\n\
+             shell<|im_end|>\n<|im_start|>assistant\n"
+        );
+        // The start of the system prompt is the end of the tool list here;
+        // it, the end of the system prompt and the start of the first message
+        // are the roots.
+        assert_eq!(
+            before(&tokenizer, &encoded),
+            [
+                ("".to_owned(), true),             // after "\n\n", before "You help."
+                ("You help.".to_owned(), true),    // the end of the system prompt
+                ("".to_owned(), true),             // the start of the first message
+                ("hello".to_owned(), false),       // its end
+                ("".to_owned(), false),            // the answer's start
+                ("hello there".to_owned(), false), // its end
+                ("".to_owned(), false),
+                ("shell".to_owned(), false),
+            ]
+        );
+        let starts: Vec<u64> = encoded.boundaries.iter().map(|b| b.at).collect();
+        assert!(starts.windows(2).all(|w| w[0] < w[1]), "{starts:?}");
+
+        // Without tools and without a system prompt only the first message
+        // is a root.
+        let plain = conversation(&messages[1..], false);
+        let encoded = encode_with_boundaries(&tokenizer, &chat, &plain).unwrap();
+        let roots: Vec<bool> = encoded.boundaries.iter().map(|b| b.root).collect();
+        assert_eq!(roots, [true, false, false, false, false, false]);
+        // Plain text has none.
+        let text = Prompt::Text("hello".into());
+        assert!(encode_with_boundaries(&tokenizer, &chat, &text).unwrap().boundaries.is_empty());
+
+        // A place inside a token counts where the token starts: `hel` and
+        // `lo` are the tokens `he` and `llo`.
+        let glued =
+            tokenizer.compile_template("{% for m in messages %}hel{{ m.content }}{% endfor %}");
+        let chat = ChatOptions { template: Some(std::sync::Arc::new(glued.unwrap())), ..chat };
+        let encoded =
+            encode_with_boundaries(&tokenizer, &chat, &conversation(&[(User, "lo")], false));
+        let encoded = encoded.unwrap();
+        assert_eq!(encoded.tokens.len(), 2);
+        assert_eq!(
+            encoded.boundaries,
+            [Boundary { at: 1, root: true }, Boundary { at: 2, root: false }]
+        );
+    }
+
+    #[test]
+    fn a_template_that_reads_a_text_otherwise_than_writing_it_gives_no_boundaries() {
+        use Role::{Assistant, User};
+        let tokenizer = tiny_tokenizer();
+        let with = |source: &str| {
+            let template = tokenizer.compile_template(source).unwrap();
+            ChatOptions { template: Some(std::sync::Arc::new(template)), ..Default::default() }
+        };
+        let messages = [(User, "hello"), (Assistant, "hello")];
+        // A template that tests the first characters of a text renders
+        // something else with the marks: the prompt then has no boundaries,
+        // and its tokens are the same.
+        let peeks = with(
+            "{% for m in messages %}<|im_start|>{{ m.role }}\n{% if m.content.startswith('he') %}\
+             !{% endif %}{{ m.content }}<|im_end|>\n{% endfor %}",
+        );
+        let prompt = conversation(&messages, false);
+        let encoded = encode_with_boundaries(&tokenizer, &peeks, &prompt).unwrap();
+        assert!(encoded.boundaries.is_empty());
+        assert_eq!(encoded.tokens, encode(&tokenizer, &peeks, &prompt).unwrap());
+        // One that writes a text twice: that message has no boundary, the
+        // others do.
+        let twice = with(
+            "{% for m in messages %}<|im_start|>{{ m.role }}\n{{ m.content }}{% if loop.last %}\
+             {{ m.content }}{% endif %}<|im_end|>\n{% endfor %}",
+        );
+        let encoded = encode_with_boundaries(&tokenizer, &twice, &prompt).unwrap();
+        assert_eq!(encoded.boundaries.len(), 2);
+        // A message that holds the mark's character has none either.
+        let prompt = conversation(&[(User, "he\u{f8fe}llo")], false);
+        let encoded = encode_with_boundaries(&tokenizer, &twice, &prompt).unwrap();
+        assert!(encoded.boundaries.is_empty());
+    }
+
+    /// The templates of the model files: every message of a conversation with
+    /// tools, tool calls, results and reasoning has its boundaries, and the
+    /// text before each is a prefix of the prompt that ends where a message's
+    /// text starts or ends.
+    #[test]
+    fn the_templates_of_the_model_files_give_the_boundaries_of_every_message() {
+        use Role::{Assistant, System, Tool, User};
+        for (variable, tokenizer) in model_tokenizers() {
+            let chat = ChatOptions::default();
+            let mut call = ares_api::Message::new(Assistant, "Let me look.");
+            call.tool_calls = Some(vec![ares_api::Json::Object(vec![
+                ("id".into(), ares_api::Json::String("call_1".into())),
+                ("type".into(), ares_api::Json::String("function".into())),
+                (
+                    "function".into(),
+                    ares_api::Json::Object(vec![
+                        ("name".into(), ares_api::Json::String("get_weather".into())),
+                        ("arguments".into(), ares_api::Json::String("{\"city\": \"Bonn\"}".into())),
+                    ]),
+                ),
+            ])]);
+            call.reasoning_content = Some("The user wants the weather.".into());
+            let mut result = ares_api::Message::new(Tool, "12 degrees");
+            result.tool_call_id = Some("call_1".into());
+            let mut answer = ares_api::Message::new(Assistant, "It is 12 degrees in Bonn.");
+            answer.reasoning_content = Some("Easy.".into());
+            let messages = vec![
+                ares_api::Message::new(System, "You are a helpful assistant."),
+                ares_api::Message::new(User, "Wie ist das Wetter in Bonn?"),
+                call,
+                result,
+                answer,
+                ares_api::Message::new(User, "Und morgen?"),
+            ];
+            let tool = ares_api::Json::Object(vec![
+                ("type".into(), ares_api::Json::String("function".into())),
+                (
+                    "function".into(),
+                    ares_api::Json::Object(vec![
+                        ("name".into(), ares_api::Json::String("get_weather".into())),
+                        ("description".into(), ares_api::Json::String("The weather.".into())),
+                    ]),
+                ),
+            ]);
+            let prompt = Prompt::Chat {
+                messages: messages.clone(),
+                tools: Some(vec![tool]),
+                variables: Vec::new(),
+                continue_final: false,
+            };
+            let encoded = encode_with_boundaries(&tokenizer, &chat, &prompt).unwrap();
+            assert_eq!(encoded.tokens, encode(&tokenizer, &chat, &prompt).unwrap(), "{variable}");
+            let text = String::from_utf8(tokenizer.decode(&encoded.tokens, true).unwrap()).unwrap();
+            // Two places per message, the roots first.
+            assert_eq!(encoded.boundaries.len(), 2 * messages.len(), "{variable}: {encoded:?}");
+            let roots = encoded.boundaries.iter().filter(|b| b.root).count();
+            assert_eq!(roots, 3, "{variable}");
+            for (boundary, message) in encoded.boundaries.chunks(2).zip(&messages) {
+                let head = |b: &Boundary| {
+                    String::from_utf8(
+                        tokenizer.decode(&encoded.tokens[..b.at as usize], true).unwrap(),
+                    )
+                    .unwrap()
+                };
+                assert!(head(&boundary[1]).ends_with(&message.content), "{variable}: {message:?}");
+                let after = &text[head(&boundary[0]).len()..];
+                assert!(after.starts_with(&message.content), "{variable}: {message:?}");
+            }
+            // The system prompt's end is the first place after the tools.
+            let system_end = encoded.boundaries[1].at as usize;
+            let head = tokenizer.decode(&encoded.tokens[..system_end], true).unwrap();
+            assert!(String::from_utf8(head).unwrap().contains("</tools>"), "{variable}");
+        }
+    }
 
     /// The tools of a request, the calls of an assistant message and their
     /// results come out of the chat template of a model file, when one is

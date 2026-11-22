@@ -1708,6 +1708,13 @@ impl Model for Qwen4Exp {
         chat::encode(&self.tokenizer, &self.chat, prompt)
     }
 
+    fn encode_with_boundaries(
+        &self,
+        prompt: &Prompt,
+    ) -> Result<ares_runtime::EncodedPrompt, EngineError> {
+        chat::encode_with_boundaries(&self.tokenizer, &self.chat, prompt)
+    }
+
     fn chat_format(&self) -> Option<ChatFormat> {
         Some(self.format.clone())
     }
