@@ -945,6 +945,9 @@ fn the_scenarios_of_an_engine_without_a_cache_run_clean_under_the_oracle() {
 struct Pages {
     freed: Vec<u32>,
     tabled: std::collections::HashSet<u32>,
+    /// The pages tabled after the first batch of requests.
+    later: std::collections::HashSet<u32>,
+    after_first: bool,
 }
 
 #[test]
@@ -961,7 +964,11 @@ fn every_page_a_request_used_is_named_as_freed_once_it_ended() {
             for i in 0..record.updates() {
                 let update = record.update(i);
                 for k in 0..update.count {
-                    pages.tabled.insert(record.entry(taken + k));
+                    let page = record.entry(taken + k);
+                    pages.tabled.insert(page);
+                    if pages.after_first {
+                        pages.later.insert(page);
+                    }
                 }
                 taken += update.count;
             }
@@ -976,15 +983,23 @@ fn every_page_a_request_used_is_named_as_freed_once_it_ended() {
         let prompt = text_of(&mut rng, 20 + 25 * n);
         e.ask(&prompt, 12);
         if n == 4 {
-            first_batch = seen.lock().unwrap().tabled.clone();
+            let mut pages = seen.lock().unwrap();
+            first_batch = pages.tabled.clone();
+            pages.after_first = true;
         }
     }
     // One more request, so that a record follows the last of the others.
     e.ask("again", 2);
     let pages = seen.lock().unwrap();
     assert!(!pages.freed.is_empty());
+    // The pool hands out its lowest free page first, so a later request may hold a page
+    // again before a record names it as freed: whatever a device kept for it is then the new
+    // holder's.
     for page in &first_batch {
-        assert!(pages.freed.contains(page), "page {page} was used and never named as freed");
+        assert!(
+            pages.freed.contains(page) || pages.later.contains(page),
+            "page {page} was used, never named as freed and never used again"
+        );
     }
     assert!(pages.freed.iter().all(|p| pages.tabled.contains(p)), "only pages that were used");
     assert_consistent(&e);
