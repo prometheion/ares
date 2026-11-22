@@ -99,6 +99,9 @@ enum Stage {
     Round,
     /// The misses come through transit: a round runs, or the next one waits for experts.
     Transit,
+    /// The record has arrived: the CPU's share of the misses waits for the rows' mixed input,
+    /// the rest goes to transit.
+    Split,
     /// The rounds have ended; the CPU's sums are still to come.
     Cpu,
     /// Every expert the layer's rows picked has been computed.
@@ -140,9 +143,8 @@ pub(super) struct Misses {
     computed: usize,
     begun: Instant,
     stats: WideStats,
-    /// The CPU's part: the misses it takes, until its jobs start; its jobs; the sums of
-    /// the rows from `cpu_first` on, until the part takes them; and when the rounds ended.
-    cpu_picks: Vec<WidePick>,
+    /// The CPU's part: its jobs; their sums with the first row they are for, until the part
+    /// takes them; and when the rounds ended.
     cpu: Option<WideCpu>,
     cpu_sums: Option<(u32, Vec<f32>)>,
     rounds_ended: Option<Instant>,
@@ -192,7 +194,6 @@ impl Misses {
             computed: 0,
             begun: Instant::now(),
             stats: WideStats::default(),
-            cpu_picks: Vec::new(),
             cpu: None,
             cpu_sums: None,
             rounds_ended: None,
@@ -212,7 +213,7 @@ impl Misses {
         owned: &dyn Fn(u32) -> bool,
     ) -> Result<Progress, Error> {
         loop {
-            if !matches!(self.stage, Stage::Record | Stage::Done) {
+            if !matches!(self.stage, Stage::Record | Stage::Split | Stage::Done) {
                 self.serve_cpu(part, env, feed)?;
             }
             match self.stage {
@@ -243,8 +244,25 @@ impl Misses {
                         all.filter(picked).filter(|e| self.resident[*e as usize] == 0).collect();
                     self.missing.sort_by_key(|e| std::cmp::Reverse(counts[*e as usize]));
                     self.stats.missing = self.missing.len() as u64;
+                    self.stage = Stage::Split;
+                }
+                Stage::Split => {
+                    // The CPU's share of the misses: decided and held in their RAM slots at
+                    // once, when the rows' mixed input is on the host (with the record, but
+                    // for a part that does not route).
                     if part.cpu_takes_part() && !self.missing.is_empty() {
-                        self.split_for_cpu(feed, record, &counts);
+                        let Some(act) = part.cpu_act(self.rows)? else {
+                            return Ok(Progress::Waiting);
+                        };
+                        let source = Arc::clone(&self.source);
+                        let record = source.record(self.layer);
+                        let counts = part.picked_counts(self.layer, self.rows, record);
+                        let picks = self.split_for_cpu(feed, record, &counts);
+                        if !picks.is_empty() {
+                            let cpu =
+                                feed.store.wide_cpu(self.at, self.rows as usize, act, &picks)?;
+                            self.cpu = Some(cpu);
+                        }
                     }
                     let transit = feed.has_transit(self.at);
                     if transit {
@@ -380,21 +398,22 @@ impl Misses {
         Ok(Progress::Done)
     }
 
-    /// Takes the misses the cost model gives the CPU out of `self.missing`: their picks
-    /// from the layer's `record` (the ids of the rows' picks after a header of 16 bytes,
-    /// then their weights), `counts` the rows that picked each expert.
-    fn split_for_cpu(&mut self, feed: &Feed, record: &[u8], counts: &[u32]) {
+    /// Takes the misses the cost model gives the CPU out of `self.missing` and returns their
+    /// picks, from the layer's `record` (the ids of the rows' picks after a header of 16 bytes,
+    /// then their weights); `counts` are the rows that picked each expert.
+    fn split_for_cpu(&mut self, feed: &Feed, record: &[u8], counts: &[u32]) -> Vec<WidePick> {
         let misses: Vec<(u32, u32)> =
             self.missing.iter().map(|e| (*e, counts[*e as usize])).collect();
         let on_cpu = feed.store.wide_split(self.at, &misses);
+        let mut picks: Vec<WidePick> = Vec::new();
         if !on_cpu.iter().any(|cpu| *cpu) {
-            return;
+            return picks;
         }
         let mut slot = vec![usize::MAX; counts.len()];
         for (i, (expert, _)) in misses.iter().enumerate() {
             if on_cpu[i] {
-                slot[*expert as usize] = self.cpu_picks.len();
-                self.cpu_picks.push(WidePick { expert: *expert, rows: Vec::new() });
+                slot[*expert as usize] = picks.len();
+                picks.push(WidePick { expert: *expert, rows: Vec::new() });
             }
         }
         let top_k = feed.layout().shapes[self.at].top_k as usize;
@@ -407,31 +426,25 @@ impl Misses {
             let expert = u32::from_le_bytes(*id) as usize;
             if let Some(at) = slot.get(expert).filter(|at| **at != usize::MAX) {
                 let row = (p / top_k) as u32;
-                self.cpu_picks[*at].rows.push((row, f32::from_le_bytes(*weight)));
+                picks[*at].rows.push((row, f32::from_le_bytes(*weight)));
             }
         }
         let mut kept = misses.iter().zip(&on_cpu).filter(|(_, cpu)| !**cpu);
         self.missing = kept.by_ref().map(|((expert, _), _)| *expert).collect();
-        self.stats.cpu_experts = self.cpu_picks.len() as u64;
-        self.stats.cpu_pairs = self.cpu_picks.iter().map(|p| p.rows.len() as u64).sum();
+        self.stats.cpu_experts = picks.len() as u64;
+        self.stats.cpu_pairs = picks.iter().map(|p| p.rows.len() as u64).sum();
+        picks
     }
 
-    /// Moves the CPU's part on without waiting: starts its jobs once the rows' mixed input
-    /// is on the host, takes their sums when they have run and hands them to the part.
-    /// Returns whether the CPU's part is done (or there was none).
+    /// Moves the CPU's part on without waiting: takes the sums of its jobs when they have
+    /// run and hands them to the part. Returns whether the CPU's part is done (or there was
+    /// none).
     fn serve_cpu(
         &mut self,
         part: &mut Part,
         env: &StepEnv<'_>,
         feed: &mut Feed,
     ) -> Result<bool, Error> {
-        if !self.cpu_picks.is_empty() {
-            let Some(act) = part.cpu_act(self.rows)? else {
-                return Ok(false);
-            };
-            let picks = std::mem::take(&mut self.cpu_picks);
-            self.cpu = Some(feed.store.wide_cpu(self.at, self.rows as usize, act, &picks)?);
-        }
         if self.cpu.as_ref().is_some_and(WideCpu::is_done) {
             let cpu = self.cpu.take().expect("the CPU's part");
             let rows = cpu.rows();
