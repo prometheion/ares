@@ -8,17 +8,17 @@
 //! several layers and hold whatever was read into them, so they are not taken
 //! as they lie: every layer of the pool gives slots in proportion to what it
 //! has above the fewest a layer keeps during a loan (a row's picks and the
-//! free slots, [`ExpertStore::loan_floor`]), each layer gives its coldest,
+//! free slots, [`ExpertStore::scratch_floor`]), each layer gives its coldest,
 //! what they held is evicted as any evicted expert is (copied down to RAM when
 //! the RAM tier keeps it), and the experts that lie in the lent slots and stay
 //! are moved on the device into the slots that were given, whose numbers then
 //! change hands (as the RAM tier does when it gives pieces back, `elastic.rs`).
 //!
 //! **When.** Between steps, once no upload, copy or read touches the device's
-//! slots ([`ExpertStore::lend_vram`] says `None` until then), and the memory
-//! is the borrower's when [`ExpertStore::loan_ready`] says so: the moves and
+//! slots ([`ExpertStore::lend_scratch`] says `None` until then), and the memory
+//! is the borrower's when [`ExpertStore::scratch_ready`] says so: the moves and
 //! the copies down have run. Given back between steps as well, when nothing
-//! the borrower enqueued still uses it ([`ExpertStore::return_vram`]): the
+//! the borrower enqueued still uses it ([`ExpertStore::return_scratch`]): the
 //! slots go back to the layers that hold their numbers, empty, and fill again
 //! the way empty slots do (the promotions of hot experts from RAM at the end
 //! of every step, the fill while idle, what a step uploads).
@@ -30,7 +30,7 @@ use super::{ExpertStore, SlotDevice, StoreError};
 /// Slots of a device's pool that are lent: `slots` slots from `first` on, the
 /// last of the pool.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Loan {
+pub struct ScratchLoan {
     /// The pool among the device's pools.
     pub pool: usize,
     pub first: u32,
@@ -39,7 +39,7 @@ pub struct Loan {
     pub stride: u64,
 }
 
-impl Loan {
+impl ScratchLoan {
     /// The bytes the loan holds.
     pub fn bytes(&self) -> u64 {
         u64::from(self.slots) * self.stride
@@ -49,8 +49,8 @@ impl Loan {
 /// A loan of a device and the marks of the device's two kinds of work behind
 /// which its memory is free.
 #[derive(Clone, Copy, Debug)]
-pub(super) struct Lent {
-    loan: Loan,
+pub(super) struct LentScratch {
+    loan: ScratchLoan,
     /// The tier's pool of the loan's slots.
     tier_pool: usize,
     marks: (u64, u64),
@@ -60,14 +60,14 @@ pub(super) struct Lent {
 impl<D: SlotDevice> ExpertStore<D> {
     /// The fewest slots a layer keeps in VRAM while a loan runs: a row's picks
     /// and the free slots, or the layer's floor where that is lower.
-    pub fn loan_floor(&self, layer: usize) -> usize {
+    pub fn scratch_floor(&self, layer: usize) -> usize {
         (self.config.top_k as usize + self.config.vram_reserve).min(self.vram.floor[layer])
     }
 
     /// The pool of the tier a loan of `device` takes its slots from: the one
     /// with the most bytes on that device, with the layers it serves; `None`
     /// when the device has no pool whose layers can give slots.
-    fn loan_pool(&self, device: usize) -> Option<(usize, Vec<usize>)> {
+    fn scratch_pool(&self, device: usize) -> Option<(usize, Vec<usize>)> {
         let pools = &self.vram.pools;
         (0..pools.len())
             .filter(|p| pools[*p].place == device)
@@ -83,34 +83,41 @@ impl<D: SlotDevice> ExpertStore<D> {
 
     /// The most bytes `device` can lend: whole slots of its largest pool above
     /// the floor of a loan of each layer of the pool.
-    pub fn lendable(&self, device: usize) -> u64 {
-        let Some((pool, members)) = self.loan_pool(device) else { return 0 };
-        let spare: usize =
-            members.iter().map(|l| self.vram.slots(*l).saturating_sub(self.loan_floor(*l))).sum();
+    pub fn lendable_scratch(&self, device: usize) -> u64 {
+        let Some((pool, members)) = self.scratch_pool(device) else { return 0 };
+        let spare: usize = members
+            .iter()
+            .map(|l| self.vram.slots(*l).saturating_sub(self.scratch_floor(*l)))
+            .sum();
         spare as u64 * self.vram.pools[pool].stride
     }
 
     /// Where a loan of `bytes` of `device` lies, made or not: always the same
     /// slots for the same bytes. `None` when the layers cannot give that much.
-    pub fn loan_at(&self, device: usize, bytes: u64) -> Option<Loan> {
-        if bytes == 0 || bytes > self.lendable(device) {
+    pub fn scratch_at(&self, device: usize, bytes: u64) -> Option<ScratchLoan> {
+        if bytes == 0 || bytes > self.lendable_scratch(device) {
             return None;
         }
-        let (tier_pool, members) = self.loan_pool(device)?;
+        let (tier_pool, members) = self.scratch_pool(device)?;
         let pool = self.vram.pools[tier_pool];
         let n = bytes.div_ceil(pool.stride) as u32;
         let device_pool = self.layers[members[0]].device_pool;
-        Some(Loan { pool: device_pool, first: pool.slots - n, slots: n, stride: pool.stride })
+        Some(ScratchLoan {
+            pool: device_pool,
+            first: pool.slots - n,
+            slots: n,
+            stride: pool.stride,
+        })
     }
 
     /// Whether `device` has lent VRAM, ready or not.
-    pub fn has_lent(&self, device: usize) -> bool {
-        self.loans.get(device).is_some_and(Option::is_some)
+    pub fn has_scratch(&self, device: usize) -> bool {
+        self.scratch.get(device).is_some_and(Option::is_some)
     }
 
     /// The loan of `device`, once it is ready.
-    pub fn loan(&self, device: usize) -> Option<Loan> {
-        self.loans.get(device).copied().flatten().filter(|l| l.ready).map(|l| l.loan)
+    pub fn loan(&self, device: usize) -> Option<ScratchLoan> {
+        self.scratch.get(device).copied().flatten().filter(|l| l.ready).map(|l| l.loan)
     }
 
     /// Whether nothing touches the VRAM slots of `device` now: no expert is
@@ -126,14 +133,18 @@ impl<D: SlotDevice> ExpertStore<D> {
     /// of its largest pool leave the layers (see "Large prompt steps on lent
     /// VRAM" in `docs/ARCHITECTURE.md`). `None` while something still touches the
     /// device's slots (poll the store and ask again) or when the layers cannot
-    /// give that much ([`ExpertStore::lendable`]). A device lends once at a
+    /// give that much ([`ExpertStore::lendable_scratch`]). A device lends once at a
     /// time; a device that has lent at least `bytes` keeps its loan. The
-    /// memory is the caller's when [`ExpertStore::loan_ready`] says so.
-    pub fn lend_vram(&mut self, device: usize, bytes: u64) -> Result<Option<Loan>, StoreError> {
+    /// memory is the caller's when [`ExpertStore::scratch_ready`] says so.
+    pub fn lend_scratch(
+        &mut self,
+        device: usize,
+        bytes: u64,
+    ) -> Result<Option<ScratchLoan>, StoreError> {
         if self.in_step {
             return Err(StoreError::Plan("VRAM is lent between steps only".into()));
         }
-        if let Some(lent) = self.loans.get(device).copied().flatten() {
+        if let Some(lent) = self.scratch.get(device).copied().flatten() {
             if lent.loan.bytes() >= bytes {
                 return Ok(Some(lent.loan));
             }
@@ -142,20 +153,20 @@ impl<D: SlotDevice> ExpertStore<D> {
                 lent.loan.bytes()
             )));
         }
-        if bytes == 0 || bytes > self.lendable(device) {
+        if bytes == 0 || bytes > self.lendable_scratch(device) {
             return Ok(None);
         }
         if !self.vram_quiet(device) {
             return Ok(None);
         }
-        let Some((tier_pool, members)) = self.loan_pool(device) else { return Ok(None) };
+        let Some((tier_pool, members)) = self.scratch_pool(device) else { return Ok(None) };
         let pool = self.vram.pools[tier_pool];
-        let Loan { first, slots: n, .. } =
-            self.loan_at(device, bytes).expect("a loan the layers can give");
+        let ScratchLoan { first, slots: n, .. } =
+            self.scratch_at(device, bytes).expect("a loan the layers can give");
         let lent: Vec<u32> = (first..pool.slots).collect();
         let spare: Vec<usize> = members
             .iter()
-            .map(|l| self.vram.slots(*l).saturating_sub(self.loan_floor(*l)))
+            .map(|l| self.vram.slots(*l).saturating_sub(self.scratch_floor(*l)))
             .collect();
         let total: usize = spare.iter().sum();
         let mut quota: Vec<usize> = spare.iter().map(|s| s * lent.len() / total).collect();
@@ -233,7 +244,7 @@ impl<D: SlotDevice> ExpertStore<D> {
                     stays,
                     expert,
                 )?;
-                self.stats.loan_moves += 1;
+                self.stats.scratch_moves += 1;
             }
             self.vram.remap(stays, number, home);
             self.vram.remap(gives, given_number, *slot);
@@ -245,26 +256,26 @@ impl<D: SlotDevice> ExpertStore<D> {
                 .filter(|local| in_loan.contains(&self.vram.slot(*layer, *local)))
                 .collect();
             for local in locals {
-                let lent = self.vram.sets[*layer].lend(local);
+                let lent = self.vram.sets[*layer].set_aside(local);
                 debug_assert!(lent, "a lent slot of layer {layer} was not given back");
             }
         }
         let marks = (self.devices[device].mark(false)?, self.devices[device].mark(true)?);
         let device_pool = self.layers[members[0]].device_pool;
-        let loan = Loan { pool: device_pool, first, slots: n, stride: pool.stride };
-        self.loans[device] = Some(Lent { loan, tier_pool, marks, ready: false });
-        self.stats.loans += 1;
+        let loan = ScratchLoan { pool: device_pool, first, slots: n, stride: pool.stride };
+        self.scratch[device] = Some(LentScratch { loan, tier_pool, marks, ready: false });
+        self.stats.scratch_loans += 1;
         Ok(Some(loan))
     }
 
     /// Whether the memory of the loan of `device` is the borrower's: the
     /// moves out of its slots and the copies down have run. Polls the device.
-    pub fn loan_ready(&mut self, device: usize) -> Result<bool, StoreError> {
-        let Some(mut lent) = self.loans.get(device).copied().flatten() else { return Ok(false) };
+    pub fn scratch_ready(&mut self, device: usize) -> Result<bool, StoreError> {
+        let Some(mut lent) = self.scratch.get(device).copied().flatten() else { return Ok(false) };
         if !lent.ready {
             let d = &mut self.devices[device];
             lent.ready = d.passed(lent.marks.0)? && d.passed(lent.marks.1)?;
-            self.loans[device] = Some(lent);
+            self.scratch[device] = Some(lent);
         }
         Ok(lent.ready)
     }
@@ -272,11 +283,11 @@ impl<D: SlotDevice> ExpertStore<D> {
     /// Gives the loan of `device` back: its slots go back to the layers that
     /// hold their numbers, empty. Between steps, once nothing the borrower
     /// enqueued uses the memory any more.
-    pub fn return_vram(&mut self, device: usize) -> Result<(), StoreError> {
+    pub fn return_scratch(&mut self, device: usize) -> Result<(), StoreError> {
         if self.in_step {
             return Err(StoreError::Plan("VRAM is given back between steps only".into()));
         }
-        let Some(lent) = self.loans.get_mut(device).and_then(Option::take) else { return Ok(()) };
+        let Some(lent) = self.scratch.get_mut(device).and_then(Option::take) else { return Ok(()) };
         let loan = lent.loan;
         let back: HashSet<u32> = (loan.first..loan.first + loan.slots).collect();
         for layer in 0..self.layers.len() {
@@ -291,7 +302,7 @@ impl<D: SlotDevice> ExpertStore<D> {
                 continue;
             }
             for (local, _) in &own {
-                self.vram.sets[layer].end_loan(*local);
+                self.vram.sets[layer].bring_back(*local);
             }
             let slots: Vec<u32> = own.iter().map(|(_, slot)| *slot).collect();
             self.vram.retake(layer, &slots);

@@ -108,7 +108,7 @@ pub struct Options {
     pub max_rows: u32,
     /// The most rows of a step whose scratch the part keeps for good; 0 for
     /// `max_rows`. A wider step's scratch lies in VRAM that the expert slots
-    /// lend for it ([`Part::set_lent`], `expert_store/lend.rs`); everything
+    /// lend for it ([`Part::set_lent`], `expert_store/scratch.rs`); everything
     /// else a step needs is sized for `max_rows`.
     pub own_rows: u32,
     /// The most rows of a step whose logits are wanted.

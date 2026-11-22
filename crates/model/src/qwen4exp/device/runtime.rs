@@ -405,7 +405,7 @@ impl Flow {
         for (device, bytes) in self.lent.iter().enumerate().filter(|(_, b)| **b > 0) {
             while feed
                 .store
-                .lend_vram(device, *bytes)
+                .lend_scratch(device, *bytes)
                 .map_err(|e| invalid(e.to_string()))?
                 .is_none()
             {
@@ -413,7 +413,7 @@ impl Flow {
                 feed.store.poll().map_err(|e| invalid(e.to_string()))?;
                 std::hint::spin_loop();
             }
-            while !feed.store.loan_ready(device).map_err(|e| invalid(e.to_string()))? {
+            while !feed.store.scratch_ready(device).map_err(|e| invalid(e.to_string()))? {
                 self.check(started, "the expert slots lent VRAM")?;
                 feed.store.poll().map_err(|e| invalid(e.to_string()))?;
                 std::hint::spin_loop();
@@ -425,7 +425,7 @@ impl Flow {
     /// Where the VRAM lent to part `index` lies while the expert slots lend it.
     fn lent(&self, index: usize) -> Option<DevicePtr> {
         let lent = self.lent_at.get(index).copied().flatten()?;
-        self.lock_feed().store.has_lent(index).then_some(lent)
+        self.lock_feed().store.has_scratch(index).then_some(lent)
     }
 
     fn enqueued_layers(&self) -> Vec<usize> {
@@ -552,7 +552,7 @@ impl Flow {
             // left there (the MTP block follows its rows).
             if !self.on_loan.load(Ordering::Acquire) {
                 for device in 0..self.lent.len() {
-                    feed.store.return_vram(device).map_err(|e| invalid(e.to_string()))?;
+                    feed.store.return_scratch(device).map_err(|e| invalid(e.to_string()))?;
                 }
             }
         }
@@ -602,7 +602,7 @@ const WIDE_ROWS: u32 = 4096;
 
 /// The rows of the widest step a prompt read alone takes on `devices` placed as
 /// `placement`: the largest power of two from `asked` down whose scratch the
-/// expert slots of every device can lend (`expert_store/lend.rs`), above
+/// expert slots of every device can lend (`expert_store/scratch.rs`), above
 /// `opts.part.own_rows()`; that if none is. `pages` is what the pools of K and
 /// V hold, `page_bytes` a page on each device, as [`place`] gave them.
 ///
@@ -613,7 +613,7 @@ const WIDE_ROWS: u32 = 4096;
 /// about 50 KiB a row on Flash-Next against 0.5 to 0.7 MiB of scratch) for
 /// good, which the slots lose, as do the parcels a split by layers hands the
 /// residual over in (80 KiB a row on the receiving device); what is estimated
-/// here leaves a tenth of the lendable room spare for what the plan of the
+/// here leaves a tenth of the lendable_scratch room spare for what the plan of the
 /// store takes besides (transit).
 pub fn batch_rows(
     gguf: &Gguf,
@@ -670,8 +670,8 @@ pub fn batch_rows(
             let pool = u64::from(pages) * page_bytes.get(d).copied().unwrap_or(0);
             let room = plan.slots.saturating_sub(pool + extra);
             let (all, largest) = rounds[d];
-            let lendable = (room / all.max(1)).saturating_sub(floor) * largest;
-            f.lent_bytes() <= lendable / 10 * 9
+            let lendable_scratch = (room / all.max(1)).saturating_sub(floor) * largest;
+            f.lent_bytes() <= lendable_scratch / 10 * 9
         });
         if fits {
             return Ok(rows);
@@ -1429,7 +1429,7 @@ impl Qwen4Exp {
                 while rows > own {
                     let mut fits = true;
                     for d in 0..n {
-                        fits &= lent_of(d, rows)?.0 <= store.lendable(d);
+                        fits &= lent_of(d, rows)?.0 <= store.lendable_scratch(d);
                     }
                     if fits {
                         break;
@@ -1446,7 +1446,7 @@ impl Qwen4Exp {
                         continue;
                     }
                     let loan = store
-                        .loan_at(d, bytes)
+                        .scratch_at(d, bytes)
                         .ok_or_else(|| invalid("the slots lend less than they said"))?;
                     let (base, _) = store.device(d).pool(loan.pool);
                     build.lent_at[d] = Some(base.offset(u64::from(loan.first) * loan.stride));

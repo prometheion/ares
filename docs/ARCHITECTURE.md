@@ -5511,7 +5511,7 @@ What bounds the prompt now:
   between the devices at the boundary layer, in pieces the link buffers hold.
 
 
-**Large prompt steps on lent VRAM** (`expert_store/lend.rs`, `Part::lay_out`, `Flow::lend`;
+**Large prompt steps on lent VRAM** (`expert_store/scratch.rs`, `Part::lay_out`, `Flow::lend`;
 2026-11-22). A step reads every expert its rows pick once, so a long prompt read in steps of
 512 rows reads the experts of the file again for every 512 rows (each slice picks 40 to 80 %
 of every layer). Strata reads prompts in chunks of 8192 and pays the chunk's buffers with
@@ -5539,8 +5539,10 @@ slots of its expert cache that it lends for the chunk and refills after (Strata
   those held is evicted as any evicted expert is (copied down to RAM when the RAM tier keeps
   it), the experts that lie in the lent slots and stay move on the device into the slots
   given (`SlotDevice::adopt`), and the numbers change hands, as the RAM tier does with the
-  pieces it gives back. A lent number is `Lent` in its `SlotSet`: nothing takes it again
-  until the loan ends. The first part to begin a wide step lends on every device, waits
+  pieces it gives back. A lent number is set aside in its `SlotSet` (`SlotSet::set_aside`):
+  nothing takes it again until the loan ends (`bring_back`). (This loan of scratch is not the
+  slot a miss is uploaded into "on loan" of `fix/mtp-and-slots`; the names keep them apart:
+  `ExpertStore::lend_scratch`, `StoreStats::scratch_loans`.) The first part to begin a wide step lends on every device, waits
   until nothing touches the slots of the device (no read, upload or adoption on its way) and
   the moves and copies down have run, and only then does the step begin for the store.
 - *The way back.* The slots go back, empty, at the end of the first step that does not run

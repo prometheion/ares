@@ -751,7 +751,7 @@ fn a_prompt_read_in_wide_steps_gives_the_reference_answer() {
 }
 
 /// A prompt read alone runs in wide steps of more rows than the parts' own scratch holds,
-/// on VRAM the expert slots lend for it (`expert_store/lend.rs`), in every placement: it
+/// on VRAM the expert slots lend for it (`expert_store/scratch.rs`), in every placement: it
 /// answers as the same prompt read in steps of the own scratch does (both start as the CPU
 /// reference's answer; later tokens of a made-up model follow near ties, which the order of
 /// the experts' sums in a wide step flips), and the slots lend for the prompt and take the
@@ -786,16 +786,16 @@ fn a_prompt_read_alone_runs_on_vram_the_expert_slots_lend() {
             leading(&lent, &reference),
             leading(&own, &reference),
             leading(&lent, &own),
-            stats.loans,
-            stats.loan_moves
+            stats.scratch_loans,
+            stats.scratch_moves
         );
         // Each device lends for the first prompt, and again for what the second
         // reads past the cache, if that is more than the own scratch holds.
         let devices = if placement == Placement::One { 1 } else { 2 };
         assert!(
-            (devices..=2 * devices).contains(&stats.loans),
+            (devices..=2 * devices).contains(&stats.scratch_loans),
             "{placement:?}: {} loans",
-            stats.loans
+            stats.scratch_loans
         );
         assert!(leading(&lent, &reference) >= 2, "{placement:?}: {lent:?} against {reference:?}");
         assert!(leading(&again, &reference) >= 2, "{placement:?}: {again:?} after the loan");

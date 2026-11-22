@@ -254,7 +254,7 @@ prompt (0.98 to 1.00 reads per distinct expert). To be read in its code before i
       `--ubatch-size`/`-ub`, 2026-11-22, branch `moe/prompt-chunks`): a prompt read alone takes
       steps of up to `--batch-size` rows (8192 for Flash-Next as far as its slots can lend the
       scratch), whose scratch lies in VRAM the expert slots lend for the step and take back
-      after it (`expert_store/lend.rs`); when another request waits, steps of prompt are pieces
+      after it (`expert_store/scratch.rs`); when another request waits, steps of prompt are pieces
       in the parts' own memory (`--ubatch-size`, 512 here) halved until their price is at most
       500 ms (`RuntimeConfig::piece_ms`). Measured (both cards, IQ2_XS, `--ram 8G`, 4096-row
       lent steps, which is what these cards' slots lend): prompts of 8k and 32k tokens 1.6 to

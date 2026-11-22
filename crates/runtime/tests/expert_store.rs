@@ -2480,13 +2480,17 @@ fn a_loan_of_vram_takes_the_last_slots_of_the_pool_and_gives_them_back_empty() {
     let (_, pool) = rig.store.place(0);
     let slots_before: Vec<usize> = (0..LAYERS).map(|l| rig.store.slots(l).0).collect();
     assert_eq!(slots_before, [8, 8, 8]);
-    assert_eq!(rig.store.lendable(0), (3 * (8 - 3)) as u64 * SLOT_BYTES);
-    assert_eq!(rig.store.lend_vram(0, 16 * SLOT_BYTES).unwrap(), None, "more than the layers have");
+    assert_eq!(rig.store.lendable_scratch(0), (3 * (8 - 3)) as u64 * SLOT_BYTES);
+    assert_eq!(
+        rig.store.lend_scratch(0, 16 * SLOT_BYTES).unwrap(),
+        None,
+        "more than the layers have"
+    );
     // Ten slots: the last ten of the pool of 24.
-    let loan = rig.store.lend_vram(0, 10 * SLOT_BYTES - 5).unwrap().expect("a loan");
+    let loan = rig.store.lend_scratch(0, 10 * SLOT_BYTES - 5).unwrap().expect("a loan");
     assert_eq!((loan.pool, loan.first, loan.slots, loan.stride), (pool, 14, 10, SLOT_BYTES));
     rig.settle();
-    assert!(rig.store.loan_ready(0).unwrap());
+    assert!(rig.store.scratch_ready(0).unwrap());
     assert_eq!(rig.store.loan(0), Some(loan));
     // No table entry names a lent slot, and every expert VRAM holds is usable
     // where its entry says.
@@ -2513,7 +2517,7 @@ fn a_loan_of_vram_takes_the_last_slots_of_the_pool_and_gives_them_back_empty() {
         }
     }
     // Given back: the slots are the layers' again and fill.
-    rig.store.return_vram(0).unwrap();
+    rig.store.return_scratch(0).unwrap();
     assert_eq!(rig.store.loan(0), None);
     let slots_after: Vec<usize> = (0..LAYERS).map(|l| rig.store.slots(l).0).collect();
     assert_eq!(slots_after, slots_before);
@@ -2521,6 +2525,6 @@ fn a_loan_of_vram_takes_the_last_slots_of_the_pool_and_gives_them_back_empty() {
     let picks: Vec<&[u32]> = picks.iter().map(Vec::as_slice).collect();
     rig.step(&picks);
     let stats = rig.store.take_stats();
-    assert_eq!(stats.loans, 1);
-    assert!(stats.loan_moves > 0, "what stayed in the lent slots moved");
+    assert_eq!(stats.scratch_loans, 1);
+    assert!(stats.scratch_moves > 0, "what stayed in the lent slots moved");
 }
