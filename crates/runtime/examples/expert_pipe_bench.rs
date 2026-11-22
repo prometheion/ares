@@ -902,10 +902,13 @@ fn cpu_bench(map: &ExpertMap, reader: &Reader, shapes: &[ExpertShape]) -> Result
         }
     };
 
-    // One layer of each type: the first that has it.
+    // One layer of each pair of types the file has: the first that has it.
     let mut layers: Vec<usize> = Vec::new();
-    for ty in [GgmlType::IQ2_S, GgmlType::IQ2_XXS, GgmlType::IQ1_M] {
-        layers.extend(shapes.iter().position(|s| s.gate_ty == ty));
+    for (layer, shape) in shapes.iter().enumerate() {
+        let types = (shape.gate_ty, shape.down_ty);
+        if !layers.iter().any(|l| (shapes[*l].gate_ty, shapes[*l].down_ty) == types) {
+            layers.push(layer);
+        }
     }
     // Enough experts of each that their bytes are not in the cache when a
     // job comes back to one: 40 experts are 50 to 60 MB.
