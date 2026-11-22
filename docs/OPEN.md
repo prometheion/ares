@@ -832,7 +832,9 @@ DSpark drafter `dspark-Inkling-2-Mini-Q8_0.gguf`, 0.4 GB). Notes: `/var/tmp/ares
         store of image rows (256 MiB of ordinary memory, least recently used first). See "Images in
         a prompt" in `ARCHITECTURE.md`. Open: which device computes a block faster is not
         measured; the share counts a piece with a tower job as one piece.
-  - [x] 5. The splice in `qwen35`: the staged rows copied over the gathered ones on the part that
+  - [x] 5. The splice in `qwen35` (checked against the fork on the 27B on both cards: the same
+        prompt tokens, the same 80 tokens of a reply with f16 K/V and exact products; see
+        "Images in a prompt"): the staged rows copied over the gathered ones on the part that
         embeds (one card, layer split, tensor split), the records of a split's groups at the rows'
         rotary positions, and the MTP block's keys and chain links at them too. Open: the MTP
         block reads an image cell as the pad token's embedding (llama.cpp gives the draft context
@@ -840,7 +842,8 @@ DSpark drafter `dspark-Inkling-2-Mini-Q8_0.gguf`, 0.4 GB). Notes: `/var/tmp/ares
         less often, the output is the main model's.
   - [x] 6. The splice in `qwen4exp`: the same copy on the part that embeds, Flash-Next's own step
         record at the rows' rotary positions; the n-gram feed hashes the pad token, which the
-        model checks is `ple.image_token_id`. Not run on Flash-Next yet (see the hand-back).
+        model checks is `ple.image_token_id`. Run on IQ2_XS on both local cards (right answers
+        on the three routes, a resend from the cache); not compared with a reference engine.
   - [x] 7. Routes: `image_url` (data URL or base64 alone), Anthropic `image` (base64, in user turns
         and tool results), Responses `input_image` (data URL); remote URLs and `file_id` refused
         with a 400 by name; JPEG, PNG, GIF, WebP, BMP; 16384 pixels a side and 64 megapixels at
