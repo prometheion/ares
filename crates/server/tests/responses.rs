@@ -845,7 +845,6 @@ async fn what_the_server_does_not_do_is_a_400_that_names_it() {
         (json!({"conversation": "conv_1"}), "conversation is not supported"),
         (json!({"background": true}), "background: true is not supported"),
         (json!({"prompt": {"id": "pmpt_1"}}), "prompt is not supported"),
-        (json!({"truncation": "auto"}), "truncation \"auto\" is not supported"),
         (json!({"include": ["message.output_text.logprobs"]}), "is not supported"),
         (json!({"tools": [{"type": "web_search"}]}), "a tool of the type 'web_search'"),
         (json!({"tools": [{"type": "custom", "name": "p"}]}), "a tool of the type 'custom'"),
@@ -1203,4 +1202,50 @@ async fn a_count_generates_nothing_and_needs_an_engine_that_counts() {
             refused(&plain, path, &body, StatusCode::NOT_IMPLEMENTED, "not_implemented").await;
         assert!(message.contains("does not count the tokens of a prompt"), "{message}");
     }
+}
+
+/// `truncation: "auto"` drops the oldest turns of a conversation that does
+/// not fit the context (4096 here, counted as the bytes of the prompt), whole
+/// and no more than needed; the instructions and the last turn stay.
+#[tokio::test]
+async fn truncation_auto_drops_the_oldest_turns_until_the_conversation_fits() {
+    let long = "x".repeat(900);
+    let mut input = Vec::new();
+    for n in 0..6 {
+        input.push(json!({"role": "user", "content": format!("question {n} {long}")}));
+        input.push(json!({"role": "assistant", "content": format!("answer {n}")}));
+    }
+    input.push(json!({"role": "user", "content": "the last question"}));
+    let body = |truncation: &str| {
+        json!({"model": "mock", "instructions": "Be brief.", "input": input,
+               "truncation": truncation})
+        .to_string()
+    };
+    let (engine, app) = serve(says("ok", 2, FinishReason::Stop));
+    let (status, response) = json(post(&app, RESPONSES, &body("auto")).await).await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(response["truncation"], "auto");
+    let request = engine.submitted().remove(0);
+    assert!(tokens(&request.prompt) < 4096);
+    let Prompt::Chat { messages, .. } = &request.prompt else { panic!() };
+    assert_eq!(messages[0].content, "Be brief.");
+    assert_eq!(messages.last().unwrap().content, "the last question");
+    let kept: Vec<&str> = messages.iter().map(|m| m.content.as_str()).collect();
+    // Whole turns, the newest: one more would not fit.
+    assert!(kept[1].starts_with("question "), "{kept:?}");
+    assert_eq!(messages.len() % 2, 0, "the system message, whole turns and the last question");
+    let mut one_more = request.clone();
+    let Prompt::Chat { messages: more, .. } = &mut one_more.prompt else { panic!() };
+    let dropped: usize = kept[1]["question ".len()..].split(' ').next().unwrap().parse().unwrap();
+    more.insert(1, ares_api::Message::new(Role::Assistant, format!("answer {}", dropped - 1)));
+    more.insert(1, ares_api::Message::new(Role::User, format!("question {} {long}", dropped - 1)));
+    assert!(tokens(&one_more.prompt) >= 4096);
+
+    // Without it the conversation is what the client sent.
+    let (engine, app) = serve(says("ok", 2, FinishReason::Stop));
+    let (status, response) = json(post(&app, RESPONSES, &body("disabled")).await).await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(response["truncation"], "disabled");
+    let Prompt::Chat { messages, .. } = engine.submitted().remove(0).prompt else { panic!() };
+    assert_eq!(messages.len(), 14);
 }

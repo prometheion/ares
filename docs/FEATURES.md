@@ -128,6 +128,8 @@ the kernels exist; no model runs there yet.
   Anthropic's prefill), in its answer or in its reasoning.
 - Claude Code (2.1) as a client of `/v1/messages`: `context_management` with
   `clear_thinking_20251015`, `thinking.display`, system turns between the others, effort `high`.
+- `/v1/responses` `truncation: "auto"`: the oldest whole turns of a conversation that does not
+  fit the context leave it.
 - `/v1/messages`: `context_management` edits `clear_thinking_20251015` and
   `clear_tool_uses_20250919` as Anthropic's service makes them, listed in
   `context_management.applied_edits`; `thinking.display: "omitted"` (an empty thinking block

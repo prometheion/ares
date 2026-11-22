@@ -87,6 +87,9 @@ pub(crate) struct Echo {
     pub tools: Json,
     pub top_p: Json,
     pub user: Json,
+    /// `truncation`: `"auto"` drops the oldest turns of a conversation that
+    /// does not fit the context (`responses::truncate`).
+    pub truncation: &'static str,
 }
 
 impl Echo {
@@ -140,7 +143,7 @@ pub(crate) fn to_chat(body: &Json, purpose: Purpose) -> Result<(Json, Echo), Api
             _ => return Err(refuse(name, format!("{name} is not supported: {}", unserved(name)))),
         }
     }
-    stateless(&fields)?;
+    let truncation = stateless(&fields)?;
 
     let mut chat = Chat::new();
     // `priority` is vLLM's and SGLang's member of this route, as of the chat
@@ -190,6 +193,7 @@ pub(crate) fn to_chat(body: &Json, purpose: Purpose) -> Result<(Json, Echo), Api
         tools: fields.get("tools").cloned().unwrap_or_else(|| Json::Array(Vec::new())),
         top_p: given("top_p"),
         user: given("user"),
+        truncation,
     };
     Ok((object(chat), echo))
 }
@@ -217,8 +221,10 @@ fn unserved(name: &str) -> &'static str {
 }
 
 /// The members that ask the server to keep something, or to change what it
-/// was given: this route keeps nothing and answers the request it got.
-fn stateless(fields: &Fields<'_>) -> Result<(), ApiError> {
+/// was given: this route keeps nothing and answers the request it got, and a
+/// conversation that does not fit is cut only with `truncation: "auto"`,
+/// which is returned.
+fn stateless(fields: &Fields<'_>) -> Result<&'static str, ApiError> {
     if fields.bool("store")? == Some(true) {
         return Err(refuse(
             "store",
@@ -233,23 +239,16 @@ fn stateless(fields: &Fields<'_>) -> Result<(), ApiError> {
              and none is kept to be fetched later",
         ));
     }
-    match fields.string("truncation")? {
-        None | Some("disabled") => {}
-        Some("auto") => {
-            return Err(refuse(
-                "truncation",
-                "truncation \"auto\" is not supported: the server drops nothing from a \
-                 conversation, and an input that does not fit the context is an error \
-                 (\"disabled\")",
-            ));
-        }
+    let truncation = match fields.string("truncation")? {
+        None | Some("disabled") => "disabled",
+        Some("auto") => "auto",
         Some(other) => {
             return Err(refuse(
                 "truncation",
                 format!("truncation must be \"disabled\" or \"auto\", got \"{other}\""),
             ));
         }
-    }
+    };
     match fields.get("include") {
         None => {}
         Some(Json::Array(values)) => {
@@ -277,7 +276,7 @@ fn stateless(fields: &Fields<'_>) -> Result<(), ApiError> {
             ));
         }
     }
-    Ok(())
+    Ok(truncation)
 }
 
 /// One value of `include`.

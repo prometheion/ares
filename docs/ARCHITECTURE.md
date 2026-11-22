@@ -7482,7 +7482,7 @@ response object with its output items, or as the typed events of the API.
 | `reasoning` | `effort` is the chat route's `reasoning_effort` (`none` switches thinking off, any other value is the template's variable); `summary: "auto"` is accepted and no summary is written |
 | `text.format` | `text`, `json_object`, `json_schema`: the chat route's `response_format` |
 | `include` | `reasoning.encrypted_content` is accepted and adds nothing (below) |
-| `truncation` | `disabled`, which is what the server does |
+| `truncation` | `disabled` (the default): an input that does not fit is an error; `auto`: the oldest turns leave the conversation until it fits (below) |
 | `store`, `background` | `false` (below) |
 | `metadata`, `user`, `safety_identifier`, `service_tier`, `client_metadata` | bookkeeping: accepted, without effect; `metadata` and `user` are said back |
 | `prompt_cache_key`, `prompt_cache_retention`, `prompt_cache_options` | accepted, without effect, as `cache_control` is on `/v1/messages`: the server caches every prefix by itself and drops what it kept by its own budget, so a retention is no promise |
@@ -7513,7 +7513,7 @@ history and a `tool_choice` that names one or a subset (`allowed_tools`),
 ["message.output_text.logprobs"]` (the pieces of a reply are not told apart
 into the tokens of the answer, of the reasoning and of calls),
 `text.verbosity`, `reasoning.summary` `concise` and `detailed`,
-`truncation: "auto"`, `max_tool_calls`, `stream_options.include_obfuscation:
+`max_tool_calls`, `stream_options.include_obfuscation:
 true`, and any member the module does not know. Only members of this API are
 read: the sampler's fields of the chat route (`top_k`, `min_p`, `seed`, `stop`
 and the others) are refused here, as on `/v1/messages`.
@@ -7552,9 +7552,36 @@ and the others) are refused here, as on `/v1/messages`.
   a client without stored responses can send back, and Codex asks for it with
   every request. Every reasoning item of this server is such an item, so the
   value is accepted and adds nothing. The other values are refused by name.
-- **`truncation`.** `disabled` is what the server does: an input that does
-  not fit the context is the error `context_length_exceeded`. `auto` would
-  drop items from the conversation, which the server does not do.
+- **`truncation`.** With `disabled` an input that does not fit the context
+  is the error `context_length_exceeded`. With `auto` (OpenAI: "drop input
+  items in the middle of the conversation") the oldest turns leave it, whole,
+  until the prompt and a token of the reply fit the model's context: a turn is
+  a message of the user and what follows it up to the next (the answer, its
+  calls and their results, so no result is left without its call); the system
+  messages before the conversation and the last turn stay, and a conversation
+  that does not fit with its last turn alone gets the error. The number of
+  turns is found by halving, with a count of the prompt for each try
+  (`responses::truncate`). The cut parts the prompt from a cached one at its
+  first turn.
+
+  *Truncation and context shift elsewhere* (F18 of the feature checklist).
+  llama.cpp's server no longer cuts a prompt that is too long (it answers
+  "exceeds the available context size"), and its context shift
+  (`--context-shift`, off by default, with `n_keep` and `n_discard`) drops
+  tokens after the first `n_keep` from the K/V of a running sequence and moves
+  the rest down. It switches that off for a model whose memory cannot shift
+  (`llama_memory_can_shift`), which is every model with recurrent state: the
+  state of a delta-rule layer holds every token it has read, and nothing can
+  take a token out of it again. Both models here are such models, so context
+  shift is not possible for them without reading the kept tokens again from
+  the start, a prompt as long as the context; a generation that reaches the
+  end of the context ends with `length`, as in llama.cpp. vLLM's
+  `truncate_prompt_tokens` and TGI's `truncate` cut a prompt to its last N
+  tokens, SGLang's `--allow-auto-truncate` cuts one that does not fit; such a
+  cut works on any model, but in a rendered conversation it lands anywhere,
+  the system prompt included, and is not built: a conversation is cut by
+  whole turns (`truncation: "auto"` here, and a client's own choice
+  elsewhere).
 - **The usage.** `input_tokens` is the whole prompt,
   `input_tokens_details.cached_tokens` the part of it the prefix cache gave,
   `output_tokens` what was generated, and for a model that thinks
@@ -7568,7 +7595,8 @@ and the others) are refused here, as on `/v1/messages`.
   `temperature`, `top_p`, `tools`, `tool_choice`, `parallel_tool_calls`,
   `text`, `reasoning`, `metadata` and `user` as the request gave them (`null`
   where it gave nothing: the engine's own defaults are not known to the
-  route), and `store: false`, `background: false`, `truncation: "disabled"`,
+  route), the `truncation` asked for (`disabled` without one), and
+  `store: false`, `background: false`,
   `previous_response_id: null`.
 
 The output is in the order the model wrote it: the reasoning item, the

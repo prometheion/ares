@@ -700,7 +700,12 @@ Flash-Next); experts that do not fit in VRAM in RAM; K/V in int8. Its README giv
       Host and Origin checks (X05).
 - [x] Tokenize and detokenize (A09); model properties (A16); template override (F07);
       continuing the last assistant message (F09).
-- [ ] Truncation and context shift (F18).
+- [x] Truncation and context shift (F18), what fits models with recurrent state:
+      `truncation: "auto"` on `/v1/responses` drops the oldest whole turns until the
+      conversation fits (2026-11-22, `server/priorities`). Context shift is not possible for
+      them (a delta-rule state cannot lose a token; llama.cpp switches it off for such models
+      too); a cut of a prompt to its last N tokens (vLLM, TGI, SGLang) is not built, see
+      "The Responses API" in `ARCHITECTURE.md`.
 - [x] `/v1/completions` and `/tokenize` read the text of control tokens (`<|im_start|>`) as
       those tokens, as llama-server does (2026-11-22, `server/priorities`); `/tokenize` takes
       `parse_special: true` and refuses `false` and `add_special`.

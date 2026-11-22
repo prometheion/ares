@@ -421,7 +421,6 @@ fn what_is_not_served_is_refused_by_its_name() {
         (with(json!({"background": true})), "background", "none is kept"),
         (item(json!({"type": "item_reference", "id": "msg_1"})), "input[0]", "item_reference"),
         (with(json!({"prompt": {"id": "pmpt_1"}})), "prompt", "templates"),
-        (with(json!({"truncation": "auto"})), "truncation", "drops nothing"),
         (with(json!({"truncation": "middle"})), "truncation", "must be"),
         // What the response would have to hold.
         (

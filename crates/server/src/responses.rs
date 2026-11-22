@@ -24,7 +24,7 @@
 //! | `reasoning` | `effort` is the `reasoning_effort` of the chat route (`none` switches thinking off); `summary: "auto"` is accepted and no summary is written |
 //! | `text.format` | `text`, `json_object`, `json_schema`: the `response_format` of the chat route |
 //! | `include` | `reasoning.encrypted_content` is accepted and adds nothing; see below |
-//! | `truncation` | `disabled`, which is what the server does |
+//! | `truncation` | `disabled` (the default), or `auto`: the oldest turns of a conversation that does not fit leave it |
 //! | `store`, `background` | `false` |
 //! | `metadata`, `user`, `safety_identifier`, `service_tier`, `client_metadata` | bookkeeping: accepted, without effect; `metadata` and `user` are said back |
 //! | `prompt_cache_key`, `prompt_cache_retention`, `prompt_cache_options` | accepted, without effect: the server caches every prefix by itself and promises no retention |
@@ -48,7 +48,7 @@
 //! `code_interpreter`, `computer_use`, `mcp`, `local_shell`, `custom` and
 //! the like) and the items they leave in a history, `prompt` templates,
 //! `top_logprobs`, `text.verbosity`, `reasoning.summary` of a given kind,
-//! `truncation: "auto"`, the sampler's fields of the chat route (only
+//! the sampler's fields of the chat route (only
 //! members of this API are read here), and every member this module does not
 //! know.
 //!
@@ -95,9 +95,10 @@
 //! the request named none or more than the model allows (the `defaults`
 //! module).
 //!
-//! **`truncation`.** `disabled` is what the server does: an input that does
-//! not fit the context is an error (`context_length_exceeded`). `auto` would
-//! drop items from a conversation, which the server does not do.
+//! **`truncation`.** With `disabled` an input that does not fit the context
+//! is an error (`context_length_exceeded`). With `auto` the oldest turns of
+//! the conversation leave it, whole, until it fits ([`truncate`]): what
+//! OpenAI describes as dropping items of the conversation to fit.
 //!
 //! **The usage.** `input_tokens` is the whole prompt and
 //! `input_tokens_details.cached_tokens` the part of it the prefix cache gave.
@@ -127,7 +128,7 @@ use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::time::Duration;
 
-use ares_api::RequestId;
+use ares_api::{Prompt, RequestId};
 use axum::extract::{Request, State};
 use axum::http::{HeaderValue, StatusCode};
 use axum::response::sse::{Event as SseEvent, KeepAlive};
@@ -200,7 +201,76 @@ async fn read(
         .await
         .map_err(request::renamed)?;
     echo.applied(&parsed.request);
+    if echo.truncation == "auto" {
+        truncate(&mut parsed, &lease).await?;
+    }
     Ok((parsed, sorter, echo, lease))
+}
+
+/// `truncation: "auto"`: a conversation whose prompt does not fit the context
+/// of the model (the prompt and a token of the reply) loses its oldest turns,
+/// whole, until it does: a turn is a message of the user and everything after
+/// it up to the next one (the assistant's answer, its calls and their
+/// results), so that no result is left without its call. The system messages
+/// before the conversation and the last turn stay. A conversation that does
+/// not fit with its last turn alone is not cut and gets the error it gets
+/// without truncation. The number of turns to drop is found by halving: the
+/// prompt is counted a few times (a rendering and a tokenization each).
+async fn truncate(parsed: &mut Parsed, lease: &Lease) -> Result<(), ApiError> {
+    let id = parsed.request.model.clone();
+    let Some(card) = lease.engine().models().into_iter().find(|card| card.id == id) else {
+        return Ok(());
+    };
+    let fits = |tokens: u32| tokens < card.context_length;
+    let count = |dropped: usize, parsed: &Parsed| {
+        let mut request = parsed.request.clone();
+        if let Prompt::Chat { messages, .. } = &mut request.prompt {
+            drop_turns(messages, dropped);
+        }
+        routes::count_prompt(lease, request)
+    };
+    let turns = match &parsed.request.prompt {
+        Prompt::Chat { messages, .. } => starts(messages).len(),
+        Prompt::Text(_) => return Ok(()),
+    };
+    if turns < 2 || fits(count(0, parsed).await?) {
+        return Ok(());
+    }
+    // The fewest turns to drop that fit, between 1 and all but the last.
+    let (mut low, mut high) = (1, turns - 1);
+    if !fits(count(high, parsed).await?) {
+        return Ok(());
+    }
+    while low < high {
+        let middle = (low + high) / 2;
+        if fits(count(middle, parsed).await?) {
+            high = middle;
+        } else {
+            low = middle + 1;
+        }
+    }
+    tracing::info!(id = %parsed.request.id, dropped = low, of = turns, "truncation dropped turns");
+    if let Prompt::Chat { messages, .. } = &mut parsed.request.prompt {
+        drop_turns(messages, low);
+    }
+    Ok(())
+}
+
+/// Where the turns of a conversation begin: at every message of the user.
+fn starts(messages: &[ares_api::Message]) -> Vec<usize> {
+    let users = messages.iter().enumerate().filter(|(_, m)| m.role == ares_api::Role::User);
+    users.map(|(i, _)| i).collect()
+}
+
+/// Takes the first `n` turns out of `messages`, and with them what stands
+/// between the system messages and the first turn.
+fn drop_turns(messages: &mut Vec<ares_api::Message>, n: usize) {
+    let starts = starts(messages);
+    if n == 0 || n >= starts.len() {
+        return;
+    }
+    let first = messages.iter().take_while(|m| m.role == ares_api::Role::System).count();
+    messages.drain(first..starts[n]);
 }
 
 async fn try_create(app: App, request: Request) -> Result<Response, ApiError> {

@@ -516,7 +516,7 @@ impl Head {
             tool_choice: &echo.tool_choice,
             tools: &echo.tools,
             top_p: &echo.top_p,
-            truncation: "disabled",
+            truncation: echo.truncation,
             usage: ending.map(|ending| ending.usage.into()),
             user: &echo.user,
             metadata: &echo.metadata,
