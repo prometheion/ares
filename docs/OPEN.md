@@ -507,7 +507,9 @@ Flash-Next); experts that do not fit in VRAM in RAM; K/V in int8. Its README giv
       does not depend on the split.
 - [ ] Cache policy: resume point at the prompt's end, memory of reply tokens, marks, warm pass.
 - [ ] On `/v1/responses` a second turn took 1 of 35 prompt tokens from the cache where
-      `/v1/messages` took 18: the history is rendered differently somewhere.
+      `/v1/messages` took 18: the history is rendered differently somewhere. (2026-11-22: on
+      Flash-Next and on the 27B the two routes take the same, 83 of 99 and 89 of 105 in
+      `real_responses` and `real_messages`; the 0.8B was not run again.)
 
 ## Server and API
 - [x] API keys (X01); configuration file and environment variables (M08); CORS (X04);
