@@ -170,7 +170,44 @@ impl Harness {
         tokens: &[u32],
         out_rows: &[u32],
     ) -> Result<Vec<f32>, ModelError> {
-        let record = StepRecord::new(segments, tokens, None, out_rows)?;
+        self.step_with(segments, tokens, None, &[], out_rows)
+    }
+
+    /// [`Harness::step`] with rows that take other values than their tokens'
+    /// embedding (`rows`: the step's row and its `d` values, an image's rows,
+    /// copied over the gathered ones as the runtime's image stage is) and the
+    /// rows' rotary positions (`None`: their cells).
+    pub fn step_with(
+        &mut self,
+        segments: &[Segment],
+        tokens: &[u32],
+        rotary: Option<&[[i32; 4]]>,
+        rows: &[(u32, Vec<f32>)],
+        out_rows: &[u32],
+    ) -> Result<Vec<f32>, ModelError> {
+        let record = StepRecord::new(segments, tokens, rotary, out_rows)?;
+        let staged = if rows.is_empty() {
+            None
+        } else {
+            let values: Vec<f32> = rows.iter().flat_map(|(_, v)| v.iter().copied()).collect();
+            let buffer = ares_cuda::DeviceBuffer::new(&self.device, values.len() as u64 * 4)?;
+            buffer.write(0, &bytes_of(&values))?;
+            let bytes = self.d as u64 * 4;
+            let splices = rows
+                .iter()
+                .enumerate()
+                .map(|(i, (row, _))| crate::blocks::rows::Splice {
+                    row: *row,
+                    rows: 1,
+                    from: crate::blocks::rows::SpliceFrom::Device(
+                        buffer.ptr().offset(i as u64 * bytes),
+                    ),
+                })
+                .collect();
+            self.part.splice_rows(splices);
+            Some(buffer)
+        };
+        self.part.set_rotary(rotary.map_or_else(Vec::new, <[[i32; 4]]>::to_vec));
         let dims = self.upload(&record)?;
         let env = StepEnv {
             stream: &self.stream,
@@ -187,6 +224,7 @@ impl Harness {
         let logits = self.part.enqueue(&env)?;
         self.end.record(&self.stream)?;
         self.stream.synchronize()?;
+        drop(staged);
         self.last_ms = self.end.elapsed_ms_since(&self.start)?;
         self.last = Some(record);
         let Some(logits) = logits else { return Ok(Vec::new()) };

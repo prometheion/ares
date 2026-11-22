@@ -204,6 +204,7 @@ impl Reference<'_, '_> {
     /// An attention block over `n` rows `x` (`[n, n_embd]`, already normed) at
     /// positions `start..start + n`, after `start` committed positions whose
     /// keys and values are `k_cache` and `v_cache` (`[start, n_head_kv * head_dim]`).
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn attention(
         &self,
         w: &AttentionWeights<'_>,
@@ -212,6 +213,7 @@ impl Reference<'_, '_> {
         start: usize,
         x: &[f32],
         n: usize,
+        rotary: Option<&[[usize; 3]]>,
     ) -> (Vec<f32>, LayerRows) {
         let c = self.config;
         let a = &c.attention;
@@ -238,7 +240,10 @@ impl Reference<'_, '_> {
             }
         }
         for t in 0..n {
-            let table = self.rope_table(start + t);
+            let table = match rotary {
+                Some(rotary) => self.rope_table_at(rotary[t]),
+                None => self.rope_table(start + t),
+            };
             for h in 0..a.n_head {
                 rope(&table, &mut q[t * q_dim + h * hd..][..hd]);
             }
@@ -301,6 +306,14 @@ impl Reference<'_, '_> {
     /// equal the token position, in the interleaved layout the sections of
     /// `qwen35` use), and by zero when it belongs to the extra kind.
     fn rope_table(&self, pos: usize) -> Vec<(f64, f64)> {
+        self.rope_table_at([pos; 3])
+    }
+
+    /// `(cos, sin)` of every rotated pair at the rotary position
+    /// `(time, height, width)`: pair `p` takes the kind of position its
+    /// section names, as `rope_table` does for a text token, and zero for the
+    /// extra kind.
+    fn rope_table_at(&self, at: [usize; 3]) -> Vec<(f64, f64)> {
         let rope = &self.config.attention.rope;
         let total: usize = rope.sections.iter().sum();
         (0..rope.dim / 2)
@@ -308,10 +321,10 @@ impl Reference<'_, '_> {
                 let sector = p % total;
                 let s = &rope.sections;
                 let kind = sector % 3;
-                let text_position = (kind == 1 && sector < 3 * s[1])
+                let in_section = (kind == 1 && sector < 3 * s[1])
                     || (kind == 2 && sector < 3 * s[2])
                     || (kind == 0 && sector < 3 * s[0]);
-                let position = if text_position { pos as f64 } else { 0.0 };
+                let position = if in_section { at[kind] as f64 } else { 0.0 };
                 let freq = f64::from(rope.freq_base).powf(-2.0 * p as f64 / rope.dim as f64);
                 let angle = position * freq;
                 (angle.cos(), angle.sin())

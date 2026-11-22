@@ -243,6 +243,17 @@ impl StateStorage {
     }
 }
 
+/// What a window takes besides its tokens ([`Reference::window_with`]).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Inputs {
+    /// Rows of the window whose input is these `n_embd` values in place of
+    /// their token's embedding (an image's rows).
+    pub rows: Vec<(usize, Vec<f32>)>,
+    /// Per row of the window its rotary position `(time, height, width)`;
+    /// `None`: the row's cell for all three.
+    pub rotary: Option<Vec<[usize; 3]>>,
+}
+
 /// The forward pass of a model.
 #[derive(Debug)]
 pub struct Reference<'a, 'g> {
@@ -287,6 +298,19 @@ impl<'a, 'g> Reference<'a, 'g> {
         tokens: &[u32],
         logits: LogitRows,
     ) -> Result<Window> {
+        self.window_with(state, tokens, &Inputs::default(), logits)
+    }
+
+    /// [`Reference::window`] with rows that are not token embeddings and
+    /// rotary positions that are not the rows' cells (an image's rows, and
+    /// the text after an image): see [`Inputs`].
+    pub fn window_with(
+        &self,
+        state: &SequenceState,
+        tokens: &[u32],
+        inputs: &Inputs,
+        logits: LogitRows,
+    ) -> Result<Window> {
         let c = self.config;
         let n = tokens.len();
         if n == 0 {
@@ -306,11 +330,18 @@ impl<'a, 'g> Reference<'a, 'g> {
                 .token_embd
                 .decode_row(token as usize, &mut x[row * c.n_embd..(row + 1) * c.n_embd]);
         }
+        for (row, values) in &inputs.rows {
+            assert!(*row < n && values.len() == c.n_embd, "an input row of the window");
+            x[row * c.n_embd..(row + 1) * c.n_embd].copy_from_slice(values);
+        }
+        if let Some(rotary) = &inputs.rotary {
+            assert_eq!(rotary.len(), n, "a rotary position per row");
+        }
 
         let mut hidden = Vec::with_capacity(c.n_layer);
         let mut rows = Vec::with_capacity(c.n_layer);
         for layer in 0..c.n_layer {
-            let (out, kept) = self.run_block(layer, state, &x, n);
+            let (out, kept) = self.run_block(layer, state, &x, n, inputs.rotary.as_deref());
             x = out;
             hidden.push(x.clone());
             rows.push(kept);
@@ -360,7 +391,7 @@ impl<'a, 'g> Reference<'a, 'g> {
             x.len().is_multiple_of(self.config.n_embd),
             "x must be whole rows of n_embd values"
         );
-        self.run_block(layer, state, x, x.len() / self.config.n_embd).0
+        self.run_block(layer, state, x, x.len() / self.config.n_embd, None).0
     }
 
     fn run_block(
@@ -369,6 +400,7 @@ impl<'a, 'g> Reference<'a, 'g> {
         state: &SequenceState,
         x: &[f32],
         n: usize,
+        rotary: Option<&[[usize; 3]]>,
     ) -> (Vec<f32>, LayerRows) {
         let weights = &self.weights.layers[layer];
         let normed = self.norm_rows(x, &weights.block.attn_norm);
@@ -377,7 +409,7 @@ impl<'a, 'g> Reference<'a, 'g> {
                 self.recurrent(w, conv, delta, &normed, n)
             }
             (Mixer::Attention(w), LayerState::Attention { k, v }) => {
-                self.attention(w, k, v, state.position, &normed, n)
+                self.attention(w, k, v, state.position, &normed, n, rotary)
             }
             _ => unreachable!("the state was built for this configuration"),
         };

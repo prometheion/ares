@@ -149,7 +149,7 @@ impl<'g> Reference<'_, 'g> {
 
         let normed = self.norm_rows(&x, &w.block.attn_norm);
         let (mixed, kept) =
-            self.attention(&w.attention, &state.k, &state.v, state.position, &normed, n);
+            self.attention(&w.attention, &state.k, &state.v, state.position, &normed, n, None);
         let LayerRows::Attention { k, v } = kept else {
             unreachable!("an attention block keeps keys and values")
         };

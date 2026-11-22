@@ -11,6 +11,6 @@ pub mod weights;
 pub use config::Config;
 pub use error::{Error, Result};
 pub use reference::{
-    LogitRows, MtpDraft, MtpRows, MtpState, Reference, SequenceState, StateStorage, Window,
+    Inputs, LogitRows, MtpDraft, MtpRows, MtpState, Reference, SequenceState, StateStorage, Window,
 };
 pub use weights::{MTP_ARCHITECTURE, Weights};
