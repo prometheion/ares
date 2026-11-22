@@ -278,6 +278,13 @@ Strata kept 0.1.65, which the comparisons use until a newer engine starts there.
 - [ ] The default context on that card is 23,552 tokens ("a thirty-second of the expert room"):
       too small for a 32k prompt; the rule needs a floor or the owner's choice.
 
+### Defect seen on the local cards (2026-11-22, `flash/ssd-stream`)
+- [ ] `qwen4exp_runtime` `the_mtp_block_follows_wide_steps_that_start_at_any_cell` fails on the
+      RTX 4070 + RTX 3060 in its second placement (`Layers`): `warm()` asserts "every expert has
+      a slot" (the made-up model's slots with steps of 196 rows do not hold every expert there).
+      The same with `verify/stack` 7816385 itself, so it is the test's or the stack's, not this
+      branch's; the placement `One` passes.
+
 ### Defects seen in the merge check of 2026-11-17 (intermittent, slower but not wrong)
 - [ ] `ares-server --test real` `flash_next_drafts_with_its_mtp_block` sometimes verifies no
       draft at all (0 of 0) for a whole run; passes in other runs. Suspected: the conductor's
