@@ -586,6 +586,9 @@ impl<D: SlotDevice> ExpertStore<D> {
         let mut claimed: Vec<u32> = Vec::new();
         let mut claimed_experts: Vec<u32> = Vec::new();
         let mut ready: Vec<CpuExpert> = Vec::new();
+        // The misses the CPU computes from RAM, with their heat: they may go
+        // up on loan behind the job (`loan_behind`).
+        let mut loanable: Vec<(f32, u32)> = Vec::new();
         let mut held: Vec<u32> = Vec::new();
         let mut late: Vec<Late> = Vec::new();
         for (((g, _, source), cpu), joins) in candidates.iter().zip(&on_cpu).zip(&joins) {
@@ -616,6 +619,7 @@ impl<D: SlotDevice> ExpertStore<D> {
                 ready.push(self.cpu_expert(layer, group.expert, group.rows, group.weight)?);
                 self.ram.sets[layer].hold(group.expert);
                 held.push(group.expert);
+                loanable.push((self.heat.layer(layer)[group.expert as usize], group.expert));
             } else {
                 late.push(Late { expert: group.expert, rows: group.rows, weight: group.weight });
                 self.wants.push(Wanted {
@@ -654,8 +658,44 @@ impl<D: SlotDevice> ExpertStore<D> {
                 hybrid.open.push(claims);
             }
         }
+        self.loan_behind(layer, loanable)?;
         self.poll()?;
         Ok(missing)
+    }
+
+    /// Uploads misses of `layer` that the CPU computes for the running step
+    /// on loan as well, the hottest first, as far as the link has room beside
+    /// what is on it ([`Hybrid::promotion_room`]). The next steps often pick
+    /// the experts of a step again (a third of a token's picks are picks of
+    /// the token before it), which a slot on loan serves; and an upload that
+    /// no step waits for costs a step nothing, where an upload for the step
+    /// itself would make it wait. The bytes land as those of a promotion do:
+    /// the entry is written when the layer has passed ([`ExpertStore::poll`]).
+    /// Only the measured way of serving does this ([`Serve::Measured`]).
+    fn loan_behind(&mut self, layer: usize, mut misses: Vec<(f32, u32)>) -> Result<(), StoreError> {
+        let device = self.layers[layer].device;
+        let Some(hybrid) = self.hybrid.as_ref().filter(|h| h.serve == Serve::Measured) else {
+            return Ok(());
+        };
+        let mut room = hybrid.promotion_room(device).saturating_sub(hybrid.in_flight[device]);
+        misses.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+        for (_, expert) in misses {
+            if room == 0 {
+                break;
+            }
+            if !self.upload(layer, expert, Want::Demand, false)? {
+                continue;
+            }
+            room -= 1;
+            self.vram.sets[layer].lend(expert);
+            self.stats.loans += 1;
+            self.stats.loans_behind += 1;
+            if let Some(hybrid) = self.hybrid.as_mut() {
+                hybrid.in_flight[device] += 1;
+                hybrid.promoting.insert((layer, expert));
+            }
+        }
+        Ok(())
     }
 
     /// Where the matrices of `expert` of `layer` are in the RAM tier.
