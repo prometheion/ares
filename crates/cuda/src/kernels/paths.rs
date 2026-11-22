@@ -1,6 +1,7 @@
-//! Which path of the tile kernels ([`Kernels::matmul`]) [`Precision::Fast`] takes for each
-//! weight type: on a card whose tensor cores run f16 `mma` with f32 accumulation at full
-//! rate, measured per type when a model is loaded ([`Kernels::measure_prefill_path`]).
+//! Which path of the tile kernels ([`Kernels::matmul`])
+//! [`Precision::Fast`](super::Precision::Fast) takes for each weight type: on a card whose
+//! tensor cores run f16 `mma` with f32 accumulation at full rate, measured per type when a
+//! model is loaded ([`Kernels::measure_prefill_path`]).
 //!
 //! The paths read the same weights in the file's layout and differ in what the tensor
 //! cores multiply: int8 codes with 8-bit activations, or the dequantised weights as f16
@@ -34,7 +35,8 @@ const BY_PRECISION: [PrefillPath; 3] = [PrefillPath::F16, PrefillPath::F16Flush,
 /// percent, and a difference of that size is not worth the precision.
 const AS_FAST_WITHIN: f32 = 1.05;
 
-/// Which path [`Precision::Fast`] takes for one weight type on one device.
+/// Which path [`Precision::Fast`](super::Precision::Fast) takes for one weight type on one
+/// device.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PrefillChoice {
     pub ty: GgmlType,
@@ -52,8 +54,8 @@ pub struct PrefillChoice {
 pub(super) type Choices = Arc<Mutex<Vec<PrefillChoice>>>;
 
 impl Kernels {
-    /// The path [`Precision::Fast`] takes for matrices of `ty` in the file's layout:
-    /// the one [`Kernels::measure_prefill_path`] measured, or the kept rule of
+    /// The path [`Precision::Fast`](super::Precision::Fast) takes for matrices of `ty` in the
+    /// file's layout: the one [`Kernels::measure_prefill_path`] measured, or the kept rule of
     /// [`Kernels::prefill_path_for`].
     pub fn prefill_choice(&self, ty: GgmlType) -> Result<PrefillChoice> {
         let prefill = self.prefill_kernels()?;
@@ -70,8 +72,9 @@ impl Kernels {
     /// the fastest the most exact. A loader calls it once per type its model multiplies
     /// in the file's layout, before the weights are placed; it returns the choice, and
     /// the same without measuring again if it has been measured. It takes a probe matrix
-    /// larger than the L2 cache (16 to 96 MiB of the device's memory) and up to 40 MiB for
-    /// activations and products, freed on return, and 50 to 150 ms.
+    /// with rows of 4096 values larger than the L2 cache (up to 96 MiB of the device's
+    /// memory) and up to 60 MiB for activations and products, freed on return, and 50 to
+    /// 150 ms.
     ///
     /// Only a card whose tensor cores run f32 accumulation at full rate
     /// ([`Kernels::tensor_cores_full_rate`]) is measured: on a capped card the kept rule
@@ -107,13 +110,20 @@ impl Kernels {
     /// The time of a product of the probe matrix of `ty` with each path,
     /// `[int8, f16, f16 flushed]`: infinite where the type has no kernel.
     fn probe_paths(&self, ty: GgmlType) -> Result<[f32; 3]> {
-        /// The values of a row of the probe matrix, within which they are chosen.
-        const MIN_COLUMNS: u32 = 2048;
-        const MAX_COLUMNS: u32 = 16384;
+        /// The values of a row of the probe matrix: the width of a model's matrices
+        /// (2560 to 6144 for most of them). It sets the bytes of an activation tile and so
+        /// how many tiles a group of the grid holds; with rows of 14080 values the groups
+        /// of the f16 path were half those of the int8 path, and its Q5_K 17 % behind
+        /// int8 on an RTX 4060 Ti, where with 5120 it is as fast.
+        const COLUMNS: u32 = 4096;
         /// The probe matrix is larger than L2, so that the kernels read their weights
-        /// from memory as they do from a model's matrices, within these bounds.
+        /// from memory as they do from a model's matrices.
         const MIN_BYTES: u64 = 16 << 20;
         const MAX_BYTES: u64 = 96 << 20;
+        /// The most units of weight rows (below) the probe matrix has, which bounds its
+        /// products: for the types of the fewest bits it stays below L2 then (4 x 34 x 128
+        /// rows on an RTX 4060 Ti, as many as Qwen3.8-27B's largest matrix).
+        const MAX_UNITS: u64 = 4;
         /// The rows of activations: a prompt step of the engine's default, four tiles of
         /// the large shape that run in a group. (With two tiles the f16 path of Q5_K and
         /// Q6_K was 4 to 9 % behind int8 on an RTX 4060 Ti, from four on as fast.)
@@ -136,24 +146,22 @@ impl Kernels {
                 detail: format!("{ty} has no prefill kernel"),
             });
         }
-        // The weight rows: as many tiles of the large shape as make every wave of blocks
-        // whole, so that the probe times the kernel and not a last wave of a few blocks.
+        // The weight rows: enough that the matrix is larger than L2, in whole waves of
+        // blocks of the large shape, so that the probe times the kernel and not a last wave
+        // of a few blocks.
         let mut held = 1;
         for path in &paths {
             let large = self.prefill_shapes(ty, *path)?[0];
             held = held.max(large.blocks_per_sm);
         }
-        let n_out = info.multiprocessors * held * 128;
-        // The columns: enough that the matrix is larger than L2.
-        let block_values = ty.block_values().max(32);
+        let n_in = COLUMNS;
         let row_bytes = |n_in: u32| ty.bytes_for(u64::from(n_in)).unwrap_or(u64::MAX);
         let want = (u64::from(info.l2_cache_bytes) * 5 / 4).clamp(MIN_BYTES, MAX_BYTES);
-        let per_column = u64::from(n_out) * row_bytes(256) / 256;
-        let n_in = u32::try_from(want / per_column.max(1))
-            .unwrap_or(u32::MAX)
-            .clamp(MIN_COLUMNS, MAX_COLUMNS)
-            .next_multiple_of(256)
-            .next_multiple_of(block_values);
+        // A unit is a tile of 128 weight rows per block the device holds at once: with any
+        // number of activation tiles, the blocks are whole waves.
+        let unit = info.multiprocessors * held * 128;
+        let units = want.div_ceil(u64::from(unit) * row_bytes(n_in)).clamp(1, MAX_UNITS);
+        let n_out = unit * units as u32;
         let w_bytes = u64::from(n_out) * row_bytes(n_in);
         let w = DeviceBuffer::new(device, w_bytes)?;
         let stream = Stream::new(device, 0)?;
