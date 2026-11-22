@@ -12,6 +12,7 @@
 //!     [--decode-steps 64]
 //!     [--prefill 2048] [--breakdown] [--serve model|stream|cpu] [--transit 32]
 //!     [--read-ahead on|off] [--predict 2] [--fingerprint FILE] [--kv q8,q8]
+//!     [--near-pages N]
 //! ```
 //!
 //! - `--spread`: how two devices share the model: a range of layers each
@@ -57,6 +58,10 @@
 //!   is `q8,q8`). With `q7` to `q4` a second, small pool of exact entries
 //!   holds the first tile of a sequence and its newest cells. The draft
 //!   block's are `q4` whatever this says.
+//! - `--near-pages N`: the K and V of the pages from `N` on lie in page-locked
+//!   host memory, read over the link (the K and V of a context beyond VRAM,
+//!   `blocks/far.rs`); every page of a sequence slot is its own here, so with
+//!   two slots the second's pages are all far.
 //! - `--fingerprint FILE`: the logits of fixed steps over the first 600
 //!   tokens of the text (a prompt, generated tokens, windows of drafts), a line
 //!   per row with the pick, its logit's bits and a hash of the row, to compare
@@ -117,6 +122,7 @@ struct Args {
     predict: u32,
     fingerprint: Option<String>,
     kv: (CacheFormat, CacheFormat),
+    near_pages: Option<u32>,
 }
 
 fn parse() -> Result<Args, AnyError> {
@@ -155,6 +161,7 @@ fn parse() -> Result<Args, AnyError> {
         predict: Options::default().predict,
         fingerprint: None,
         kv: (CacheFormat::Q8, CacheFormat::Q8),
+        near_pages: None,
     };
     let mut it = std::env::args().skip(1);
     let list = |s: String| -> Vec<String> { s.split(',').map(str::to_owned).collect() };
@@ -216,6 +223,7 @@ fn parse() -> Result<Args, AnyError> {
                 };
             }
             "--breakdown" => args.breakdown = true,
+            "--near-pages" => args.near_pages = Some(value()?.parse()?),
             "--stall-s" => args.stall_s = value()?.parse()?,
             "--transit" => args.transit = Some(value()?.parse()?),
             "--read-ahead" => {
@@ -586,6 +594,7 @@ fn run() -> Result<(), AnyError> {
             keys: args.keys,
             max_rows: args.rows,
             kv: args.kv,
+            near_pages: args.near_pages,
             profile: profile.clone(),
             // The fingerprint verifies windows of four rows of drafts.
             logit_rows: if args.fingerprint.is_some() { 4 } else { 1 },

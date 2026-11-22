@@ -92,6 +92,10 @@ pub const MTP_KV: (CacheFormat, CacheFormat) = (CacheFormat::Q4, CacheFormat::Q4
 /// The most pieces a row's device-made list is cut into.
 const MAX_PIECES: u32 = 16;
 
+/// The rows of a step whose block scores one launch holds: a step past the
+/// dense limit scores and selects its rows this many at a time.
+const SCORE_ROWS: u32 = 256;
+
 /// The choices of a device implementation.
 #[derive(Clone, Debug)]
 pub struct Options {
@@ -932,8 +936,11 @@ impl Frame {
         s.agate = take!(rows * att * hq * 4);
         s.iq = take!(rows * att * iq * 4);
         s.raw = take!(rows * att * id * 4);
+        // A row's block scores take 4 bytes per block of the longest sequence
+        // (256 KiB a row at 262 144 cells): a step scores and selects its rows
+        // `SCORE_ROWS` at a time, so the scratch does not grow with the rows.
         let max_blocks = u64::from(opts.cells.div_ceil(ix.block)).max(1);
-        s.scores = take!(rows * att * max_blocks * 4);
+        s.scores = take!(rows.min(u64::from(SCORE_ROWS)) * att * max_blocks * 4);
         s.counts = take!(rows * 16);
         // The most partial states a plan makes: the planner's own bound for
         // dense rows (`Planner::finish`) and the pieces of device-made lists
@@ -3261,36 +3268,44 @@ impl Part {
             if step_plan.hands.is_some() {
                 let (ranges, items) = (base.offset(layout.ranges), base.offset(layout.items));
                 let (scores, counts) = (self.at(s.scores), self.at(s.counts));
-                self.q4.block_scores(
-                    stream,
-                    ix,
-                    self.opts.keys,
-                    plan_rows,
-                    iq,
-                    key_table,
-                    key_pool,
-                    scores,
-                    0,
-                    rows,
-                    step_plan.max_blocks,
-                )?;
                 // Without exact entries every entry is in the pool of stored
                 // formats: one list.
                 let kinds = self.group()?.has_exact().then_some(tables);
-                self.q4.select(
-                    stream,
-                    ix,
-                    self.opts.rule,
-                    plan_rows,
-                    scores,
-                    kinds,
-                    ranges,
-                    counts,
-                    0,
-                    rows,
-                    step_plan.max_blocks,
-                    ix.max_ranges(0),
-                )?;
+                let cap = ix.max_ranges(0);
+                // The rows are scored and selected `SCORE_ROWS` at a time, into
+                // the one buffer of scores; the lists and counts are the rows'.
+                let mut row0 = 0;
+                while row0 < rows {
+                    let n = SCORE_ROWS.min(rows - row0);
+                    self.q4.block_scores(
+                        stream,
+                        ix,
+                        self.opts.keys,
+                        plan_rows,
+                        iq,
+                        key_table,
+                        key_pool,
+                        scores,
+                        row0,
+                        n,
+                        step_plan.max_blocks,
+                    )?;
+                    self.q4.select(
+                        stream,
+                        ix,
+                        self.opts.rule,
+                        plan_rows,
+                        scores,
+                        kinds,
+                        ranges.offset(u64::from(row0) * u64::from(cap) * 12),
+                        counts.offset(u64::from(row0) * 16),
+                        row0,
+                        n,
+                        step_plan.max_blocks,
+                        cap,
+                    )?;
+                    row0 += n;
+                }
                 self.q4.hand_over(stream, self.inbox_at(ib.hands), counts, ranges, items, rows)?;
             }
             self.group()?.attend(

@@ -864,6 +864,31 @@ fn a_prompt_read_in_wide_steps_gives_the_reference_answer() {
     }
 }
 
+/// A step of more rows than one launch of the block scores holds (256) scores and selects them
+/// a few hundred at a time: a prompt of 480 tokens read in one step answers as the CPU
+/// reference does, in every placement (later tokens follow near ties, as in the test above).
+#[test]
+fn a_wide_step_scores_its_rows_a_few_hundred_at_a_time() {
+    if !enabled() {
+        return;
+    }
+    let prompt = prompt(480, 9);
+    let reference = reference_answer(1, &prompt, 16);
+    let leading = |a: &[u32], b: &[u32]| a.iter().zip(b).take_while(|(x, y)| x == y).count();
+    for placement in placements() {
+        let (runtime, model) = start_rows(1, placement, 16, RuntimeConfig::default(), 512);
+        let got = ask(&runtime, 1, &prompt, 16);
+        let wide = model.wide_stats().expect("the parts are open");
+        runtime.shutdown();
+        eprintln!(
+            "SCORES {placement:?}: {} tokens as the reference's before the first difference",
+            leading(&got, &reference)
+        );
+        assert!(wide.layers > 0, "{placement:?}: the prompt ran in no wide step");
+        assert!(leading(&got, &reference) >= 2, "{placement:?}: {got:?} against {reference:?}");
+    }
+}
+
 /// A prompt read alone runs in wide steps of more rows than the parts' own scratch holds,
 /// on VRAM the expert slots lend for it (`expert_store/scratch.rs`), in every placement: it
 /// answers as the same prompt read in steps of the own scratch does (both start as the CPU
