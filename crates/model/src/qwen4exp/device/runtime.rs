@@ -1246,6 +1246,13 @@ impl Qwen4Exp {
         Some(self.flow.get()?.lock_feed().store.reader_stats())
     }
 
+    /// How often the predictions of steps of up to eight rows named an expert that no tier
+    /// held and that was then picked, by kind of step, distance and place (see
+    /// `ExpertStore::ahead_odds`); `None` before the parts are open.
+    pub fn ahead_odds(&self) -> Option<[[(f32, f32); 16]; 4]> {
+        Some(self.flow.get()?.lock_feed().store.ahead_odds())
+    }
+
     /// How often the guesses of wide steps were then named, by class (see
     /// `ExpertStore::transit_odds`); `None` before the parts are open.
     pub fn guess_odds(&self) -> Option<[(f32, f32); 9]> {

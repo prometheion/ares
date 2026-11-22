@@ -168,6 +168,15 @@ impl Ahead {
 }
 
 impl<D: SlotDevice> ExpertStore<D> {
+    /// How often an expert that no tier held was picked after a prediction named it, as
+    /// (named, picked) with the newer counts weighing more: per kind of step and distance
+    /// (one row one layer ahead, one row two, several rows one, several rows two) and place
+    /// in the prediction's list (the last place counts every later one).
+    pub fn ahead_odds(&self) -> [[(f32, f32); PLACES]; 4] {
+        let odds = &self.ahead.odds;
+        std::array::from_fn(|d| std::array::from_fn(|p| (odds.named[d][p], odds.picked[d][p])))
+    }
+
     /// A prediction made `distance` layers ahead (1 or 2) in a step of `rows` rows says that
     /// the router of `layer`, which the running step has not reached, will pick `experts`, the
     /// likeliest first. Those

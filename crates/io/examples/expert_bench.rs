@@ -15,8 +15,8 @@
 //! ```sh
 //! cargo run --release -p ares-io --example expert_bench -- MODEL.gguf \
 //!     [--mib 1024] [--depths 1,4,16,64] [--patterns ffn_gate_exps,ffn_up_exps,ffn_down_exps] \
-//!     [--seed 1] [--buffered] [--queue-depth 32] [--hot N] [--fixed] [--mixed N] \
-//!     [--mirror DIR]...
+//!     [--seed 1] [--buffered] [--queue-depth 32] [--demand-chunk-kib 4096] [--hot N] \
+//!     [--fixed] [--mixed N] [--mirror DIR]...
 //! ```
 //!
 //! `--mirror DIR` names a directory on another drive that holds a copy of every
@@ -46,6 +46,8 @@ struct Args {
     seed: u64,
     direct: bool,
     queue_depth: usize,
+    /// Demand reads longer than this are cut into pieces of it (`Config::demand_chunk`).
+    demand_chunk: usize,
     /// Draw from this many distinct experts instead of all of them.
     hot: Option<usize>,
     /// Register the read buffers with the ring.
@@ -66,6 +68,7 @@ fn parse_args() -> Result<Args, String> {
         seed: 1,
         direct: true,
         queue_depth: Config::default().queue_depth,
+        demand_chunk: Config::default().demand_chunk,
         hot: None,
         fixed: false,
         mixed: None,
@@ -81,6 +84,12 @@ fn parse_args() -> Result<Args, String> {
             "--queue-depth" => {
                 args.queue_depth =
                     value("--queue-depth")?.parse().map_err(|e| format!("--queue-depth: {e}"))?
+            }
+            "--demand-chunk-kib" => {
+                let kib: usize = value("--demand-chunk-kib")?
+                    .parse()
+                    .map_err(|e| format!("--demand-chunk-kib: {e}"))?;
+                args.demand_chunk = kib * 1024;
             }
             "--depths" => {
                 args.depths = value("--depths")?
@@ -175,6 +184,7 @@ fn run() -> Result<(), String> {
         direct: args.direct,
         queue_depth: args.queue_depth,
         prefetch_depth: Config::default().prefetch_depth.min(args.queue_depth),
+        demand_chunk: args.demand_chunk,
         fixed_regions,
         ..Config::default()
     };
