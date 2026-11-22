@@ -560,7 +560,8 @@ with Bash. Scripts and logs in `/var/tmp/ares-flashapi` (`notes.md`).
 - [x] A stream's response started only with the first token: Claude Code gave up after six
       minutes while Flash-Next computed its first prompt and sent it again. It now starts
       after 10 s without it (`Config::stream_wait`).
-- Flash-Next (two cards, `--ram 8G`, its MTP block, machine load 8 to 27 from other builds):
+- Flash-Next (two cards split by layers, the driver with peer access being missing; `--ram
+  8G`, its MTP block, machine load 8 to 27 from other builds):
   the tasks are done right, in 3 and 4 turns. Claude Code's first prompt is 16.3 thousand
   tokens (the 20 tools of its default set; 3.5 thousand with `--tools Read,Edit,Bash`), read at
   25 to 61 tokens/s: 3.5 to 4.5 minutes to the first token. A turn that continues the cached
