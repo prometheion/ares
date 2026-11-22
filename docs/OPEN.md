@@ -412,8 +412,9 @@ prompt (0.98 to 1.00 reads per distinct expert). To be read in its code before i
       (which then misses what RAM would have held).
 - [ ] The MTP block's experts in the usage profile (they are filled in the order of their
       numbers at the start, as before).
-- [ ] The slots per layer from the profile when the store is planned (`StorePlan::new` takes
-      a heat; the runtime passes none, and the slots move between layers by need as it runs).
+- [x] The slots per layer from the profile when the store is planned (2026-11-22,
+      `flash/ssd-stream`: VRAM by the hottest, RAM by the heat beyond VRAM's). Open: RAM's slots
+      still never move between layers while the engine runs (VRAM's every 256 steps).
 - [ ] The heat counts the steps that measure the price of a step at the start (token 0, about a
       thousand rows); the server's start drops it (`Qwen4Exp::serving`), the runtime itself
       still counts it for a model without a profile.
