@@ -70,6 +70,15 @@ the kernels exist; no model runs there yet.
   expert only the SSD holds, or take another expert that VRAM or RAM holds in its place
   (`skip`, `router`, `similar`), instead of waiting for the drive; it changes the output.
 
+## Images
+- Image input on both models with `--mmproj <FILE>` (the model's projector): `image_url` parts on
+  `/v1/chat/completions` (data URLs, or base64 alone), Anthropic `image` blocks on `/v1/messages`
+  (also in tool results), `input_image` on `/v1/responses`; JPEG, PNG, GIF, WebP, BMP. The
+  tower runs on a card, its weights in RAM by default (`--mmproj-weights ram|vram`); an image
+  becomes at most `--image-max-tokens` rows (4096 by default, as llama.cpp), placed as
+  llama.cpp's `mtmd` places them. A conversation with an image resumes from the prompt cache.
+  Remote image URLs are not fetched.
+
 ## Sampling
 - Temperature and dynamic temperature, top-k, top-p, min-p, typical, top-n-sigma, XTC,
   repetition, presence and frequency penalties, DRY, logit bias, mirostat, seed, `n`,
@@ -120,4 +129,4 @@ the kernels exist; no model runs there yet.
   `GET /models/sse`.
 - Main options (all also preset keys; `ares --help` has the list): `--model`, `--devices`,
   `--split`, `--shares`, `--context`, `--parallel`, `--kv`, `--precision`, `--ram`, `--cache`,
-  `--cache-size`, `--drafters`, `--window`, `--draft-vocab`, `--reasoning`.
+  `--cache-size`, `--drafters`, `--window`, `--draft-vocab`, `--reasoning`, `--mmproj`.

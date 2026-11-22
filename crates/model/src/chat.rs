@@ -1020,4 +1020,107 @@ mod tests {
         // The server's options are not touched.
         assert_eq!(chat.variables.len(), 2);
     }
+
+    /// A conversation with an image, on the 27B's tokenizer and projector
+    /// (`ARES_TEST_QWEN35_27B`, `ARES_TEST_QWEN3VL_27B`): the image is its start
+    /// marker, a pad token for each of its rows and its end marker, where the
+    /// template put the message's text; the text after it is tokenized on its
+    /// own; the boundaries lie behind the rows; counting gives as many tokens.
+    #[test]
+    fn an_image_becomes_its_markers_and_a_pad_token_per_row() {
+        let (Some(model), Some(mmproj)) = (
+            std::env::var_os("ARES_TEST_QWEN35_27B"),
+            std::env::var_os("ARES_TEST_QWEN3VL_27B"),
+        ) else {
+            eprintln!("skipped: set ARES_TEST_QWEN35_27B and ARES_TEST_QWEN3VL_27B");
+            return;
+        };
+        let gguf = ares_gguf::Gguf::open(std::path::Path::new(&model)).unwrap();
+        let tokenizer = Tokenizer::from_gguf(&gguf).unwrap();
+        let limits = crate::qwen3vl::Limits::default();
+        let projector = Arc::new(
+            Projector::open(
+                ares_gguf::Gguf::open(std::path::Path::new(&mmproj)).unwrap(),
+                limits,
+                crate::qwen3vl::Home::Ram,
+            )
+            .unwrap(),
+        );
+        let image = ares_api::Image {
+            at: 0,
+            width: 640,
+            height: 480,
+            pixels: Arc::new(vec![200; 640 * 480 * 3]),
+        };
+        let mut first = ares_api::Message::new(Role::User, "What is this?");
+        first.images.push(image.clone());
+        let mut second = ares_api::Message::new(Role::User, "And this?\nIt is here.");
+        second.images.push(ares_api::Image { at: 10, ..image });
+        let prompt = Prompt::Chat {
+            messages: vec![
+                ares_api::Message::new(Role::System, "Be brief."),
+                first,
+                ares_api::Message::new(Role::Assistant, "A gray square."),
+                second,
+            ],
+            tools: None,
+            variables: Vec::new(),
+            continue_final: false,
+        };
+        let chat = ChatOptions::default();
+        let encoded = encode_with_boundaries(&tokenizer, &chat, Some(&projector), &prompt).unwrap();
+        let counted = encode(&tokenizer, &chat, Some(&projector), &prompt).unwrap();
+        assert_eq!(counted, encoded.tokens);
+        let id = |text: &str| tokenizer.special_token_id(text).unwrap();
+        let (start, pad, end) = (id(IMAGE_START), id(IMAGE_PAD), id(IMAGE_END));
+        assert_eq!(encoded.images.len(), 2);
+        for span in &encoded.images {
+            assert_eq!((span.image.nx, span.image.ny), (20, 15));
+            let first = span.first as usize;
+            assert_eq!(encoded.tokens[first - 1], start);
+            assert!(encoded.tokens[first..first + 300].iter().all(|t| *t == pad));
+            assert_eq!(encoded.tokens[first + 300], end);
+        }
+        assert_eq!(encoded.tokens.iter().filter(|t| **t == pad).count(), 600);
+        // The first image opens its message, the second stands after
+        // "And this?\n" and before "It is here."
+        let text = |tokens: &[u32]| {
+            let mut out = Vec::new();
+            for t in tokens {
+                out.extend_from_slice(tokenizer.piece(*t, true).unwrap());
+            }
+            String::from_utf8(out).unwrap()
+        };
+        let one = encoded.images[0].first as usize;
+        assert!(text(&encoded.tokens[..one - 1]).ends_with("<|im_start|>user\n"));
+        assert!(text(&encoded.tokens[one + 301..]).starts_with("What is this?<|im_end|>"));
+        let two = encoded.images[1].first as usize;
+        assert!(text(&encoded.tokens[..two - 1]).ends_with("And this?\n"));
+        assert!(text(&encoded.tokens[two + 301..]).starts_with("It is here.<|im_end|>"));
+        // The boundaries: as many as without the images, each one behind the
+        // rows of the images before it.
+        let plain = Prompt::Chat {
+            messages: match &prompt {
+                Prompt::Chat { messages, .. } => messages
+                    .iter()
+                    .map(|m| ares_api::Message { images: Vec::new(), ..m.clone() })
+                    .collect(),
+                Prompt::Text(_) => unreachable!(),
+            },
+            tools: None,
+            variables: Vec::new(),
+            continue_final: false,
+        };
+        let without = encode_with_boundaries(&tokenizer, &chat, None, &plain).unwrap();
+        assert_eq!(encoded.boundaries.len(), without.boundaries.len());
+        assert!(!encoded.boundaries.is_empty());
+        for (with, without) in encoded.boundaries.iter().zip(&without.boundaries) {
+            let images_before =
+                encoded.images.iter().filter(|s| u64::from(s.first) < with.at).count() as u64;
+            assert_eq!(with.at, without.at + images_before * 302, "{with:?} {without:?}");
+        }
+        // A model without a projector refuses the image by name.
+        let refused = encode(&tokenizer, &chat, None, &prompt).unwrap_err();
+        assert!(refused.to_string().contains("--mmproj"), "{refused}");
+    }
 }

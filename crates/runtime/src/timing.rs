@@ -610,6 +610,15 @@ impl fmt::Display for Snapshot {
             c.checkpoints_restored,
             c.checkpoints_dropped
         )?;
+        if c.tower_units > 0 {
+            writeln!(
+                f,
+                "image tower: {} images computed in {} units of their passes, {:.1} ms",
+                c.images_computed,
+                c.tower_units,
+                c.tower_us as f64 / 1e3
+            )?;
+        }
         if c.ram.enabled {
             let r = &c.ram;
             writeln!(

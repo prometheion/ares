@@ -402,3 +402,60 @@ fn the_27b_tower_on_the_device_gives_the_reference_rows() {
 fn the_flash_next_tower_on_the_device_gives_the_reference_rows() {
     against_the_reference("ARES_TEST_QWEN3VL_FLASH", "flash", 2560);
 }
+
+/// The tower as the runtime drives it ([`ares_model::qwen3vl::TowerAt`]): an
+/// image's pass in ranges of units, one job after the other as the conductor
+/// plans them, gives the rows of a whole pass ([`DeviceTower::encode`]) bit
+/// for bit, in both homes; a second image after a pass that was left half done
+/// starts afresh.
+#[test]
+fn a_pass_in_ranges_of_units_gives_the_rows_of_a_whole_pass() {
+    use std::sync::Arc;
+
+    use ares_model::qwen3vl::Projector;
+    use ares_runtime::TowerJob;
+
+    let (Some(gpus), Some(path)) = (gpus(), env_path("ARES_TEST_QWEN3VL_27B")) else { return };
+    let device = &gpus[0];
+    let kernels = Kernels::load(device).unwrap();
+    let stream = Stream::new(device, 0).unwrap();
+    let limits = Limits { min_rows: 8, max_rows: 300 };
+    // An image of 640 x 480 pixels with no symmetry: 20 x 15 rows.
+    let rgb: Vec<u8> =
+        (0..640 * 480 * 3).map(|i: u32| (i.wrapping_mul(2_654_435_761) >> 13) as u8).collect();
+    for home in [Home::Ram, Home::Vram] {
+        let projector = Projector::open(Gguf::open(&path).unwrap(), limits, home).unwrap();
+        let image = Arc::new(projector.prepare(&rgb, 640, 480).unwrap());
+        assert_eq!((image.nx, image.ny), (20, 15));
+        // The whole pass.
+        let config = projector.config().clone();
+        let weights_file = Gguf::open(&path).unwrap();
+        let weights = Weights::load(&weights_file, &config).unwrap();
+        let mut whole = DeviceTower::load(device, &kernels, &config, &weights, home).unwrap();
+        let scratch = whole.scratch(300).unwrap();
+        let pixels = normalize(&config, &image.pixels);
+        let expected = whole.encode(&stream, &scratch, &pixels, 640, 480).unwrap().data;
+        drop((whole, scratch));
+        // In ranges, after half of another image's pass.
+        let mut tower = projector.load(device, &kernels).unwrap();
+        let units = projector.units();
+        let other = Arc::new(projector.prepare(&rgb[..320 * 240 * 3], 320, 240).unwrap());
+        let mut half = TowerJob { image: other, units: 0..units / 2, rows: Vec::new(), ms: 0.0 };
+        tower.run(&stream, &mut half).unwrap();
+        let mut rows = Vec::new();
+        let mut from = 0;
+        for size in [1, 3, 7, units] {
+            let to = (from + size).min(units);
+            let mut job = TowerJob { image: image.clone(), units: from..to, rows, ms: 0.0 };
+            tower.run(&stream, &mut job).unwrap();
+            rows = job.rows;
+            from = to;
+            if from == units {
+                break;
+            }
+        }
+        assert_eq!(rows.len(), expected.len());
+        let same = rows.iter().zip(&expected).all(|(a, b)| a.to_bits() == b.to_bits());
+        assert!(same, "{home:?}: the rows of a pass in ranges differ from a whole pass");
+    }
+}

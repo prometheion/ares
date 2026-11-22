@@ -194,7 +194,7 @@ OPTIONS:
         --image-max-tokens <ROWS>
                                The most rows (tokens) one image becomes, 8 to 4096;
                                a larger image is shrunk to fit. The VRAM of the
-                               tower's scratch follows it (about 330 MiB at 4096)
+                               tower's scratch follows it (about 340 MiB at 4096)
                                [default: 4096, as llama.cpp]
 
     Prompts.

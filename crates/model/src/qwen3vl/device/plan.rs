@@ -675,8 +675,9 @@ mod tests {
             }
             assert!(s.part_out < s.heads.end - s.heads.start);
         }
-        // Per patch: the residual, query, key and value, the attention's output.
-        let per_patch = 1152 * 4 + 3 * 16 * 80 * 2 + 1152 * 4;
+        // Per patch: the residual, query, key and value, the attention's output
+        // or a quarter of a merged row (5120 values a row, wider than 1152).
+        let per_patch = 1152 * 4 + 3 * 16 * 80 * 2 + 5120;
         let growth = large.bytes - small.bytes;
         let patches = 4 * (4096 - 512);
         assert!(growth >= patches * per_patch && growth < patches * (per_patch + 64), "{growth}");

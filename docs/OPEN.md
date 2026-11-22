@@ -796,7 +796,7 @@ DSpark drafter `dspark-Inkling-2-Mini-Q8_0.gguf`, 0.4 GB). Notes: `/var/tmp/ares
       (CPU kernels, SSD streaming), one piece at a time.
 
 ## Whole features not started
-- [ ] Image input (F11; the owner's preset sets `mmproj`). Design: `/var/tmp/ares-survey/image-input-design.md`
+- [x] Image input (F11; the owner's preset sets `mmproj`). Design: `/var/tmp/ares-survey/image-input-design.md`
       (2026-11-15). Both projector files are the same tower (`qwen3vl_merger`: patches of
       16 x 16, 27 blocks of width 1152, a 2 x 2 merger to the language model's width; 888
       and 866 MiB), with different weights. An image becomes (W/32) x (H/32) rows: 256 for
@@ -823,17 +823,34 @@ DSpark drafter `dspark-Inkling-2-Mini-Q8_0.gguf`, 0.4 GB). Notes: `/var/tmp/ares
         same rows bit for bit. Open: the server's key (with piece 7; the owner chose
         `--mmproj-weights ram|vram`, `ram` by default, 2026-11-16) and adding `DeviceTower::pinned_bytes`
         to the `pinned_ram` of the model that carries the tower (with pieces 5 and 6).
-  - [ ] 4. The tower as a job the conductor plans (between steps, on the device whose link and
-        tensor cores are faster; its scratch reserved in the ledger at load). Cells and positions
-        in the runtime: image spans next to tokens, positions (t, h, w) per row, staging and a
-        store of image rows.
-  - [ ] 5. The splice in `qwen35` (a row source in the embedding gather; positions in the draft chain's links).
-  - [ ] 6. The splice in `qwen4exp` (host rows; the n-gram feed's image token).
-  - [ ] 7. Routes (`image_url`, Anthropic `image`, Responses `input_image`), limits, errors, `--mmproj`,
-        `--mmproj-weights ram|vram` (`ram` by default; the owner, 2026-11-16).
-        Embedded images only; fetching remote URLs is backlog. At most 4096 rows per image by
-        default (as the fork), with a key to lower it.
-  - [ ] 8. Caching: cells named by a digest of the resized pixels, 64-bit names through the index and the SSD level.
+  - [x] 4. The tower as a job the conductor plans (2026-11-22, `image/input`): between steps on
+        the device the server chooses (the fastest link to the host for weights in RAM, the most
+        multiprocessors for weights in VRAM), as prompt work charged to the share, a range of
+        units per job while sequences generate; its VRAM taken off that device before anything is
+        planned. Image spans next to tokens, the rotary position `(t, h, w)` of every row in the
+        record (the cell in the row extras), the image stage (page-locked, 1024 rows at most) and a
+        store of image rows (256 MiB of ordinary memory, least recently used first). See "Images in
+        a prompt" in `ARCHITECTURE.md`. Open: which device computes a block faster is not
+        measured; the share counts a piece with a tower job as one piece.
+  - [x] 5. The splice in `qwen35`: the staged rows copied over the gathered ones on the part that
+        embeds (one card, layer split, tensor split), the records of a split's groups at the rows'
+        rotary positions. Open: the MTP block and DFlash read an image cell as the pad token's
+        embedding at its cell (drafts after an image may be accepted less often; the output is
+        the main model's).
+  - [x] 6. The splice in `qwen4exp`: the same copy on the part that embeds, Flash-Next's own step
+        record at the rows' rotary positions; the n-gram feed hashes the pad token, which the
+        model checks is `ple.image_token_id`. Not run on Flash-Next yet (see the hand-back).
+  - [x] 7. Routes: `image_url` (data URL or base64 alone), Anthropic `image` (base64, in user turns
+        and tool results), Responses `input_image` (data URL); remote URLs and `file_id` refused
+        with a 400 by name; JPEG, PNG, GIF, WebP, BMP; 16384 pixels a side and 64 megapixels at
+        most. `--mmproj`, `--mmproj-weights ram|vram` (`ram` by default), `--image-max-tokens`
+        (8 to 4096, 4096 by default); `DeviceTower::pinned_bytes` in the model's `pinned_ram`.
+        Open: fetching remote URLs (backlog). Images in a system message are refused, as the
+        models' chat template refuses them.
+  - [x] 8. Caching: image cells named by a digest of the resized pixels and the projector
+        (`cell_name`), 64-bit names through the prefix index, the RAM level and the store on SSD
+        (text names unchanged, so text-only pages stay valid). Open: the store of image rows is
+        not kept on SSD (after a restart a resumed conversation runs the tower once per image).
 - [ ] Documents as input (PDF, text), as Basalt takes them next to images; video stays backlog.
 - [ ] Audio, video and Gemma 4 are backlog: none of them blocks the first release (the owner,
       2026-11-16).

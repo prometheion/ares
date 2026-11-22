@@ -180,9 +180,9 @@ machine (RTX 4070 + RTX 3060, Qwen3.8-27B) or read from the engines listed in
 | `ares-sched` | Step planner (generation, decision rows and prompts in one step), admission (pages claimed per step, a reservation that corrects itself, a queue instead of refusals), the order of a pass for long prompts of a model with experts, step time model with a term for the context, draft length choice, the n-gram drafter on a suffix automaton shared by all sequences | Done; unit and model tests; the conductor uses the planner, admission (without spill), the n-gram drafter and the step cost |
 | `ares-weights` | Expert heat, tiers that are elected and fed by reads (admission, protection, guesses bound late, slots given back), slots per layer by need, the waves of experts of a pass, a token table for the first layers, the lookahead distance, which experts a tier holds (for the routers' pruning) | Done, unit tested; the expert store uses the slot sets, the heat, the swap rule and the split of slots; the guess queue, the token table and the waves are not used by a running model yet (the lookahead distance only by a guess of `qwen4exp` that is switched off) |
 | `ares-api` | Request (with every sampling field), event (text and probabilities), decision and error types; the `Engine` trait between HTTP and the runtime (`submit` for generation, `decide` for decisions, `stats`, `chat_format` for what a model's chat template declares about thinking) | Done, unit tested |
-| `ares-server` | The `ares` binary: loads a model on the devices and serves it over an OpenAI-compatible HTTP API, with the plan of devices, split, shares and context made from what the devices report | Serves `qwen35` and `qwen4exp` models (chat and plain completions, streamed and not, every sampling field and the probabilities of the tokens, `n` completions, timings, metrics, staged shutdown, the reasoning of a reply apart from its content and in the history, with llama-server's controls for thinking, tool calls held to the tools' schemas by a grammar, also when the model opens the call inside its thinking); 213 tests without a GPU, 17 that start the real binary (some need the 27B or the files of Flash-Next) and 26 that run the engine in the test's process (the suites of the routes on the 0.8B, or on any file the server loads with `ARES_TEST_API_MODEL`: they pass on Flash-Next); for `qwen35` the prefix cache is on, with `--ram` for the engine's RAM, for `qwen4exp` the RAM is mostly the tier of experts; a router mode that serves several models from a preset file, loads them on request and unloads them for room or when idle (host tests of the preset reader and of the state machine on a scripted loader; its 2 tests on real devices have not been run); no multimodal input, `/v1/systemone` answers 501 |
+| `ares-server` | The `ares` binary: loads a model on the devices and serves it over an OpenAI-compatible HTTP API, with the plan of devices, split, shares and context made from what the devices report | Serves `qwen35` and `qwen4exp` models (chat and plain completions, streamed and not, every sampling field and the probabilities of the tokens, `n` completions, timings, metrics, staged shutdown, the reasoning of a reply apart from its content and in the history, with llama-server's controls for thinking, tool calls held to the tools' schemas by a grammar, also when the model opens the call inside its thinking); 213 tests without a GPU, 17 that start the real binary (some need the 27B or the files of Flash-Next) and 26 that run the engine in the test's process (the suites of the routes on the 0.8B, or on any file the server loads with `ARES_TEST_API_MODEL`: they pass on Flash-Next); for `qwen35` the prefix cache is on, with `--ram` for the engine's RAM, for `qwen4exp` the RAM is mostly the tier of experts; a router mode that serves several models from a preset file, loads them on request and unloads them for room or when idle (host tests of the preset reader and of the state machine on a scripted loader; its 2 tests on real devices have not been run); images through a projector (`--mmproj`, see [Images in a prompt](#images-in-a-prompt)), `/v1/systemone` answers 501 |
 | `ares-runtime` | The conductor thread and one thread per device, the step loop that connects plan, state and kernels, admission, speculation with the n-gram drafter and with a model's drafts, the `Model` trait a model implements, a synthetic model that drives the real kernels, and the expert store (VRAM slots, RAM tier, reads, the CPU computing what is not on a GPU) | Drives `qwen35` on one device, in tensor split and in layer split, with picks made on the device; implements `Engine::submit` (not `decide`); the prefix cache is in the conductor, checked against the host executor as an oracle and carried out by `qwen35` on the devices (checkpoints in page-locked RAM within one RAM limit, `PinnedRam`), and there is no spill of pages to RAM (a request that gives way stays in the pool's cache); the expert store is driven by the device threads of `qwen4exp` (see [Qwen3.8-Flash-Next through the runtime](#qwen38-flash-next-through-the-runtime)) |
-| `ares-model` | Model architectures: configuration and weight table from a GGUF, a CPU reference of the forward pass with explicit state (window and commit) that GPU implementations are compared with block by block, and the implementation on the devices | `qwen35` (Qwen3.5-0.8B, Qwen3.8-27B) runs through the runtime and the server, with the model's MTP block. `qwen4exp` (Qwen3.8-Flash-Next) runs through the runtime and the server on one or two cards, without speculation (it has no draft head built, and the n-gram drafter takes part only next to a model drafter), and through a session of its own that tests and measurements use. See [Several devices](#several-devices). The image tower `qwen3vl` (a CPU reference and the pass on one device, its weights in VRAM or in page-locked RAM) is not spliced into either model yet |
+| `ares-model` | Model architectures: configuration and weight table from a GGUF, a CPU reference of the forward pass with explicit state (window and commit) that GPU implementations are compared with block by block, and the implementation on the devices | `qwen35` (Qwen3.5-0.8B, Qwen3.8-27B) runs through the runtime and the server, with the model's MTP block. `qwen4exp` (Qwen3.8-Flash-Next) runs through the runtime and the server on one or two cards, without speculation (it has no draft head built, and the n-gram drafter takes part only next to a model drafter), and through a session of its own that tests and measurements use. See [Several devices](#several-devices). The image tower `qwen3vl` (a CPU reference and the pass on one device, its weights in VRAM or in page-locked RAM) feeds both models' image cells (see [Images in a prompt](#images-in-a-prompt)) |
 
 Both test architectures are specified under [reference/](reference/):
 [qwen35](reference/qwen35-architecture.md) and
@@ -6149,9 +6149,8 @@ through (`clip.projector_type = qwen3vl_merger`; one file per model, the same
 shape with other weights and another output width): its configuration and
 weight table, the pixel work in front of it, a CPU reference of the pass, and
 the pass on a device (see [On the device](#on-the-device) below). The reference
-is a test oracle, as the references of the language models are. Nothing serves
-with the tower yet: no route takes an image, and neither language model reads
-its rows. It sits in `ares-model` beside `qwen35` and `qwen4exp`, with the same
+is a test oracle, as the references of the language models are. Both language
+models read images through it (see [Images in a prompt](#images-in-a-prompt)). It sits in `ares-model` beside `qwen35` and `qwen4exp`, with the same
 parts (`config`, `weights`, `reference`, `device`).
 
 - **Configuration and weights** are read strictly: a `clip.*` key the
@@ -6217,7 +6216,7 @@ On the 16 threads of the development machine, under other load, the pass takes
 `qwen3vl::DeviceTower` runs the pass on one device: an image's patch rows in
 (`image::patch_rows`, in the merger's order), the merged rows of the language
 model's width out, in a buffer on the device that the language model can read
-(the splice is not built). It needs compute capability 8.0.
+(see [Images in a prompt](#images-in-a-prompt)). It needs compute capability 8.0.
 
 - **Products** are the tile kernels of the language models (`Kernels::matmul`)
   on their f16 path: f16 operands, f32 sums. The activations are prepared in
@@ -6248,8 +6247,10 @@ model's width out, in a buffer on the device that the language model can read
 - **Groups.** A block's work before and after its attention is row by row, so
   it runs for 2048 patches at a time; what grows with the image is the
   residual, query, key and value and the attention's output (16.5 KiB a
-  patch). The scratch of an image of 4096 rows is 328.6 MiB, of 1024 rows
-  131 MiB. Groups of 4096 patches were 1.6 to 3.8 % faster on both cards (68
+  patch). The scratch of an image of 4096 rows is 336.6 MiB, of 1024 rows
+  133 MiB (its region of the attention's output also takes the merged rows at
+  the end of a pass, which are wider: 8 MiB more at 4096 rows; measured before
+  that, 328.6 and 131 MiB). Groups of 4096 patches were 1.6 to 3.8 % faster on both cards (68
   MiB more scratch from 1024 rows on); the VRAM is worth more to the language
   model.
 
@@ -6341,6 +6342,84 @@ images of 256, 1024 and 4096 rows; load average 26 to 36):
   at 1024 rows and 4.5 % at 4096 on both cards, and up to twice as far from the
   exact rows (4.0e-4 to 1.18e-2, at most 60 % of the tolerance). Not taken: the
   output would get worse.
+
+### Images in a prompt
+
+An image goes from a request to the rows of a step in five places, each with
+one job.
+
+- **The routes** (`ares-server`, `images.rs`) decode the image file: an
+  `image_url` part of a chat message (a `data:image/...;base64,` URL, or base64
+  alone, as llama-server takes it), an Anthropic `image` block (base64) in a
+  turn of the user or in the result of a tool, a Responses `input_image` (a data
+  URL). JPEG, PNG, GIF (the first frame), WebP and BMP become 8-bit RGB, alpha
+  dropped and no EXIF orientation applied, as llama.cpp's `stb_image` does; at
+  most 16384 pixels a side and 64 megapixels, read from the header before
+  anything is decoded. A remote URL is refused with a 400 that says to send
+  the image itself (fetching is backlog). The Anthropic and Responses routes turn
+  their images into chat parts, so one parser reads them all. A message with
+  images is joined as llama-server joins it (a line break between two text
+  parts, none next to an image), and each image is kept at its byte in the
+  text (`ares_api::Image`).
+- **The model** (`ares-model::chat`, `qwen3vl::Projector`) writes the prompt as
+  llama.cpp's `mtmd` does: a character of the private use area stands for each
+  image while the chat template renders the conversation, the text is cut
+  there, each piece is tokenized with its special tokens, and an image becomes
+  `<|vision_start|>`, one `<|image_pad|>` per row, `<|vision_end|>`. The
+  projector resizes it by the size rule (`--image-max-tokens`, 8 to 4096 rows,
+  4096 by default) and names it: the SHA-256 of the projector file's identity,
+  the resized size and the pixels. Counting a prompt (`count_tokens`,
+  `/tokenize`) takes the rows from the size rule without resizing. The places
+  where the parts of a conversation end are found on the rendering with one pad
+  per image and moved behind the rows.
+- **The conductor** (`ares-runtime`, see "Images" in its module) keeps each
+  request's images (`ImageSpan`, `Spans`) and the names of its cells. The image
+  tower is a job of the device that holds it (`Executor::tower`,
+  `DeviceModel::tower`), run between steps as prompt work: a piece of prompt
+  starts with as many units of the pass (the stem, the 27 blocks, the merger's
+  parts) as fit the time of a piece while sequences generate, by what the
+  units took before, and with the rest of the pass when none does; its time is
+  charged to the share as a piece's. A prompt is read up to the first image
+  whose rows are not in the store (`ImageStore`, by name, least recently used
+  first, `RuntimeConfig::image_rows`, 256 MiB of ordinary memory), and a step
+  takes at most as many image rows as the image stage holds (page-locked,
+  `min(max_rows, 1024)` rows of the model's width, inside `--ram`). The record
+  says which rows take staged rows (its image runs), and every row carries its
+  rotary position: `(p, p, p)` for text, `(p, p + j / nx, p + j % nx)` for
+  row `j` of an image at `p`, the text after an image `max(nx, ny)` on (the
+  row's cell stays in the record's row extras).
+- **The part that embeds** (`blocks::rows::splice`) copies the staged rows from
+  the page-locked stage over the rows it gathered, before the first layer reads
+  them: on one device, the first device of a layer split, the device that
+  embeds in a tensor split (`qwen35`), and the part that embeds of Flash-Next.
+  The records a part builds itself (the groups of a split, Flash-Next's step
+  record) carry the rows' rotary positions. The n-gram embedding of Flash-Next
+  hashes the pad token of an image cell, which is `ple.image_token_id` (the
+  model refuses a projector when the two differ).
+- **The prefix cache** names an image's cells by the image and the row
+  (`cell_name`: the top bit set, 63 bits mixed from the image's name and the
+  row), in the 64-bit names the chain hashes, the tails, the RAM level and
+  the store on SSD take; a text cell's name is its token, so the pages of text
+  are named as before. A conversation that sends its image again with every
+  turn resumes from the cache, and a replay of cached image cells takes their
+  rows from the store, or runs the tower again when the store let them go.
+
+**Where the tower runs.** On one device, chosen by the server from what the
+devices report: with its weights in RAM (`--mmproj-weights ram`, the default)
+the one with the fastest link to the host (`current_link_speed` times
+`current_link_width` from sysfs), then the most multiprocessors; with its
+weights in VRAM the most multiprocessors first. Which device computes a block
+faster is not measured at load. Its VRAM (`Projector::vram_bytes`: the two
+slots or all the weights, and the scratch of the largest image, 337 MiB at
+4096 rows) is taken off that device before anything is planned there, so the
+context or the expert slots give it up, and the part reserves it in its ledger
+at load. The scratch's last region also takes the image's rows at the end of
+the pass, which are read back to the host from there.
+
+**Not built.** The MTP block and the DFlash drafter read an image cell as the
+pad token's embedding at the cell's position (the main model's rows are
+right; only the acceptance of drafts after an image can suffer). Images are
+not fetched from URLs, and the rows of the store are not kept on SSD.
 
 ## What is taken from where
 
