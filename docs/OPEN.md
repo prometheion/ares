@@ -127,14 +127,38 @@ between cards stay with the model. Today the two models share almost nothing ins
       slower (no checkpoint at the prompt's end: item 2 of the order). Ahead: load 3 times faster
       (35-50 s against 96-149), 12 GiB of RAM left free against Strata's 2-3, a long conversation
       turn asked again 2.7-2.9 s against 9.3 s (Strata keeps only the newest path).
-- [ ] Why, from the logs: GPU hit rate of the experts 37-74 % against Strata's 62-83 % with
+- [x] Why, from the logs: GPU hit rate of the experts 37-74 % against Strata's 62-83 % with
       about the same slots: Ares fills only 1267-1862 of about 4000 slots at the start and then
       moves 63-171 experts a token over the card's x4 link (33-102 ms a token waited); Strata
       fills every slot from a ranked profile, changes them slowly, and computes every expert
       missing from the GPU on the CPU from page-locked RAM (Ares computes 14-42 % there and
       uploads the rest). Strata also skips missed experts of rank 7 and lower by default (not
-      like for like; Ares' `--expert-prune skip:8` is that). To do: fill every slot at the start,
-      move slots slowly, and choose CPU or upload per miss by the link's measured speed.
+      like for like; Ares' `--expert-prune skip:8` is that). Built 2026-11-22 (see "Members,
+      loans and promotions" in ARCHITECTURE.md): the fill makes VRAM the hottest of every layer
+      (at the start, after the warm-up, when idle); members change only by the rule of a
+      promotion, at most what the link does in a step; a miss goes to the CPU or the link by the
+      measured costs, and an upload that is not worth a member's place goes up on loan. Also
+      found: the profile counted every row of a prompt, so it ranked what long prompts used (a
+      decode's hit rate 16-23 % when VRAM was filled from the comparison's profile); a wide step
+      now counts an expert once (profile format 2). Measured against the build of before, both
+      without a profile (ARCHITECTURE.md, after "Members, loans and promotions"): with the MTP
+      block 20.0-37.6 tokens/s against 17.2-34.8 at 56G (mean +11 %), without it the same
+      (16.4-21.9), at 24G +13 to 14 %; VRAM hit 59-72 % in both builds (Strata 62-83 %), 36-53
+      uploads a token against 51-58, the CPU 18-26 % of the picks. Started from a profile of use
+      (format 2) VRAM is full of the profile's hottest (3 473 brought by the fill) and the hit
+      rate is the same, 59 % and 70 %: on this card the size of VRAM, not its filling, bounds it.
+      Still behind Strata (40.0/43.0 with drafts, 27.2/28.6 without): the misses cost 26-56 ms a
+      token, see the next item.
+- [ ] The CPU computes the types of UD-Q3_K_XL slowly: IQ3_XXS and IQ4_XS as gate and up, Q5_0
+      and IQ4_NL as down have no kernel of their own and are decoded row by row
+      (`cpu/kernels.rs`): a job takes 170-410 us per expert and row on the test machine where an
+      upload takes 410-490 us, so the cost model sends a third to a half of the misses over the
+      link. Strata computes these types with ggml's AVX2 kernels at several times the rate.
+      Kernels for them are the next lever of decode on such a machine.
+- [ ] Transit adoption (`transit_adopt`, the prompt chunks' experts taking VRAM slots after a
+      wide step) asks only "hotter than the coldest member" (with the swap margin when the member
+      has to be copied down), not the rule of a promotion; left as it was for the work on prompt
+      chunks that borrow expert slots.
 - [ ] The default context on that card is 23,552 tokens ("a thirty-second of the expert room"):
       too small for a 32k prompt; the rule needs a floor or the owner's choice.
 

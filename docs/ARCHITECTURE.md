@@ -4779,6 +4779,42 @@ beside the CPU where that is sooner:
 - *At the start and while nothing runs* the fill makes VRAM the hottest of every layer
   without that margin (see the usage profile above): no step waits then.
 
+*Measured* (2026-11-22, the test machine: RTX 4060 Ti 16 GB on a PCIe 4.0 x4 link, Core Ultra 5
+235HX, 62 GiB RAM; UD-Q3_K_XL, `--context 40960`, the bench of the Strata comparison: German,
+English and code, 300 tokens greedy, each asked twice; the build of before, 641a8c7, and this
+one alternating, two rounds each, every session from a fresh cache directory without a usage
+profile, so both fill the tiers from the warm-up; load average 4 to 12 at the starts, from the
+engine before). Tokens per second by the client, rounds 1/2; the expert columns are means over
+the decode requests from `/metrics`:
+
+| `--ram`, drafts | Build | German 1st | 2nd | English 1st | 2nd | Code 1st | 2nd | VRAM hit % | Uploads a token | CPU % | Wait ms a token |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 56G, MTP block | before | 20.3/17.2 | 26.5/26.7 | 22.5/23.7 | 26.8/26.8 | 23.3/24.0 | 32.3/34.8 | 61 | 58 | 27 | 28 |
+| 56G, MTP block | loans | 20.0/21.3 | 35.0/32.0 | 24.8/25.9 | 37.6/30.7 | 23.1/23.9 | 32.5/32.6 | 61 | 53 | 26 | 26 |
+| 56G, none | before | 16.1/16.4 | 19.8/21.0 | 18.6/20.2 | 21.2/23.2 | 17.1/18.4 | 20.3/22.4 | 70 | 51 | 21 | 29 |
+| 56G, none | loans | 16.4/16.6 | 21.1/21.9 | 19.3/18.8 | 21.5/21.9 | 17.1/16.8 | 21.5/21.1 | 72 | 50 | 18 | 30 |
+| 24G, MTP block | before | 12.2/11.3 | 16.1/15.4 | 15.3/14.8 | 19.6/25.3 | 13.7/13.2 | 20.9/24.5 | 59 | 56 | 26 | 51 |
+| 24G, MTP block | loans | 13.8/14.0 | 21.0/23.6 | 17.3/16.3 | 21.8/22.0 | 13.6/13.7 | 26.8/26.2 | 62 | 52 | 25 | 45 |
+| 24G, none | before | 10.3/10.3 | 13.9/13.6 | 12.9/12.7 | 16.2/15.8 | 11.1/10.7 | 15.8/15.2 | 71 | 57 | 19 | 56 |
+| 24G, none | loans | 12.3/12.9 | 16.7/17.7 | 13.6/15.5 | 17.2/18.1 | 11.0/12.0 | 17.0/14.6 | 71 | 36 | 22 | 48 |
+| IQ2_XS, 56G, MTP block (one round) | before | 32.6 | 52.2 | 45.9 | 78.2 | 47.1 | 76.7 | 71 | 16 | 25 | 10 |
+| IQ2_XS, 56G, MTP block (one round) | loans | 27.8 | 54.2 | 44.9 | 51.9 | 46.0 | 86.6 | 76 | 18 | 21 | 9 |
+
+- Over the six cells of a row, the mean is 11 % higher with the MTP block at 56G, the same
+  without it, and 13 to 14 % higher at 24G; the second asks gain most. The IQ2_XS file, one round
+  each, is 6 % lower in the mean, most of it one cell (English asked again, where the n-gram
+  drafter's luck decides most; without it 2 % higher).
+- Started without a profile, both builds fill VRAM from the warm-up, and the hit rate is the
+  same (59 to 72 %): what was behind the 37 to 49 % of the comparison was the profile that counted
+  prompts by their rows and the fill that left two thirds of VRAM to the price measurement. Loans
+  keep the members, so a text asked again finds what it used. Started from a profile of use
+  (format 2, written by an earlier session of the same bench) the fill brought 3 473 experts
+  into VRAM and the hit rate was the same, 59 % with the block and 70 % without (21.2 to 32.5
+  and 17.0 to 21.9 tokens/s, one round each): on this card the size of VRAM bounds it.
+- What a token waits for is the misses, 26 to 56 ms: on this machine a CPU job takes 170 to 410
+  us per expert and row for the types of this file (decoded row by row) and an upload 410 to 490
+  us, so neither side is much faster and the cost model keeps both busy (see OPEN.md).
+
 **Reading experts ahead of their router.** A pick that no tier holds is read from the file
 when its layer's record reaches the host, and the layer waits for it. The routers of the
 next layers applied to the rows the router of this layer reads name most of what those
