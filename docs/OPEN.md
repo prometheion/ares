@@ -583,7 +583,11 @@ Flash-Next); experts that do not fit in VRAM in RAM; K/V in int8. Its README giv
 - [x] Claude Code writes a new billing stamp (`x-anthropic-billing-header ... cch=...`) at the
       start of its system prompt on every request, so every turn misses the cache from there;
       upstream llama.cpp, the owner's fork and Strata pin it (gap study `/var/tmp/ares-survey/gap-study-2026-11-17.md`).
-      Pinned on `/v1/messages` as upstream does (2026-11-22).
+      Pinned on `/v1/messages` as upstream does (2026-11-22). Upstream (master, 2026-11-22)
+      pins only `cch=`; Claude Code 2.1.301 writes no `cch=` but a `cc_version=2.1.301.<3 hex>`
+      whose suffix changes with the first message (the server agent's capture), which upstream
+      leaves alone, so Ares does too (the owner: as upstream). The root at the end of the tool
+      list (written before the system prompt) keeps such a session from replaying the tools.
 - [ ] Saving and loading a conversation's state by name (llama.cpp's `slot-save-path`, in the
       owner's preset), and pinning one in the cache (gap study `/var/tmp/ares-survey/gap-study-2026-11-17.md`).
 - [x] RAM level for the K/V state that leaves VRAM; write to SSD when the RAM level evicts

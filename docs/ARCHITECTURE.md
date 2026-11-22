@@ -590,7 +590,14 @@ one array per part, indexed by page number.
     replays more without it (the fork's `--checkpoint-spread`: the kept ones
     thin out evenly), then the least recently used. A checkpoint goes without
     its K/V page; a page evicted from the end of a chain takes its checkpoint
-    along. A root keeps its mark when its page goes to RAM and comes back, is
+    along. With room for one checkpoint (Flash-Next at `--ram 8G`: the tier
+    of experts takes the rest), a request's end state does not push out its
+    own anchor: the next turn often parts from the cache inside the reply
+    (Claude Code sends a call of its Edit tool back with `"replace_all":
+    false` the model never wrote; Qwen's templates leave out an answer's
+    thinking once a new question follows), and from the end state it would
+    replay every row it shares, from the anchor only the reply's.
+    A root keeps its mark when its page goes to RAM and comes back, is
     never "left behind" for the drive (it is written when it leaves RAM, if
     its text is long enough for the drive), and comes back from the drive as
     a plain checkpoint.
