@@ -40,9 +40,12 @@ section further down.
 7. Priorities of requests (server).
 8. Then the rest of CUDA complete: image input pieces 4 to 8, gate and up in two types, the
    roles of the cards, the open defects, the server items.
-Later than their place suggests: the classic draft model (VRAM; better with an aux card), draft
-trees (steps 9 and 10: little gain on a mixture of experts; for the 27B later), Turing, Jev mode,
-stored responses, TLS.
+Later than their place suggests: the classic draft model (VRAM; better with an aux card), Turing,
+Jev mode, stored responses, TLS. DFlash2 trees (steps 9 and 10) with the experts of a tree's
+tokens read ahead ("Speculation that pays"): the owner, 2026-11-22, expects much of them for
+decode; measured first (how many picks a token table and route memory predict, how much longer a
+tree is accepted than a chain), then built; started when the pieces in work leave room, one
+piece at a time.
 
 ## In work now
 
