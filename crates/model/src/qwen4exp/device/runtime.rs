@@ -639,7 +639,7 @@ pub fn widest_rows<E>(
 }
 
 /// The rows of the widest step a prompt read alone takes on `devices` placed as
-/// `placement`: `asked`, or the largest multiple of [`ROW_GRAIN`] below it whose
+/// `placement`: `asked`, or the largest multiple of 256 rows (`ROW_GRAIN`) below it whose
 /// scratch the expert slots of every device can lend (`expert_store/scratch.rs`),
 /// above `opts.part.own_rows()`; that if none is. `pages` is what the pools of K and
 /// V hold, `page_bytes` a page on each device, as [`place`] gave them.
