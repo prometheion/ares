@@ -466,20 +466,16 @@ impl Flow {
         if self.far.is_empty() || slots == self.far_slots.load(Ordering::Acquire) {
             return Ok(());
         }
-        let pools: Vec<_> =
+        let mut pools: Vec<_> =
             self.far.iter().map(|p| p.lock().unwrap_or_else(|e| e.into_inner())).collect();
+        // What lies above the slots goes back first (each pool keeps a spare
+        // piece); what they need is locked in every pool.
+        for pool in &mut pools {
+            pool.shrink(slots);
+        }
         let wanted: u64 = pools.iter().map(|p| p.bytes_for(slots)).sum();
         let locked: u64 = pools.iter().map(|p| p.locked()).sum();
-        let mut pools = pools;
-        if wanted <= locked {
-            for pool in &mut pools {
-                pool.shrink(slots);
-            }
-            self.ram.set_context_target(pools.iter().map(|p| p.locked()).sum());
-            self.far_slots.store(slots, Ordering::Release);
-            return Ok(());
-        }
-        self.ram.set_context_target(wanted);
+        self.ram.set_context_target(wanted.max(locked));
         let started = Instant::now();
         loop {
             let short = pools.iter_mut().find_map(|pool| pool.ensure(slots).err());
@@ -506,6 +502,7 @@ impl Flow {
                 }
             }
         }
+        self.ram.set_context_target(pools.iter().map(|p| p.locked()).sum());
         self.far_slots.store(slots, Ordering::Release);
         Ok(())
     }
