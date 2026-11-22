@@ -121,8 +121,19 @@ the kernels exist; no model runs there yet.
   Anthropic's prefill), in its answer or in its reasoning.
 - Claude Code (2.1) as a client of `/v1/messages`: `context_management` with
   `clear_thinking_20251015`, `thinking.display`, system turns between the others, effort `high`.
-- `--queue <N>`: a full line answers 503 with `Retry-After`; `--timeout` for reading a request
-  and writing an answer.
+- `/v1/messages`: `context_management` edits `clear_thinking_20251015` and
+  `clear_tool_uses_20250919` as Anthropic's service makes them, listed in
+  `context_management.applied_edits`; `thinking.display: "omitted"` (an empty thinking block
+  whose signature carries the thinking back into the next prompt).
+- System and developer messages: the ones first are the system prompt, later ones are turns of
+  the user, on every route; `reasoning_effort` `high` is the template's default where the
+  template refuses it (Flash-Next), on every route.
+- Priorities: `priority` (a lower number first, vLLM's) on the OpenAI routes and the header
+  `x-ares-priority` on every route; the line, the places, the pages and the rows of a step go to
+  the better priority first, and running requests of a worse one give way (to the prefix cache).
+- `--queue <N>`: a full line answers 503 with `Retry-After`, or takes a request of a better
+  priority in place of its worst waiting one; `--timeout` for reading a request and writing an
+  answer.
 - Router mode: `--models-preset <file.ini>` with one section per model and `[*]` for all;
   a model is loaded when a request names it, the least recently used one makes room, idle
   models unload (`idle-unload`), aliases, `POST /models/load` and `/models/unload`,

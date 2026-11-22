@@ -713,20 +713,31 @@ Flash-Next); experts that do not fit in VRAM in RAM; K/V in int8. Its README giv
       schema with thinking; llama.cpp's `json.gbnf` costs 6.8 ms per mask.
 - [ ] Responses: stored responses (A05), WebSocket (A06); the chat route's sampler fields
       are refused there.
-- [ ] Chat and Responses routes: a system or developer message inside a conversation reaches
-      the template, and the templates of Qwen3.8 refuse it (the Messages route gives it to the
-      template as a user turn); `reasoning_effort: high` reaches Flash-Next's template, which
-      knows `xhigh`, `medium` and `low` and refuses it (the Messages route maps Anthropic's
-      `high`, its default, to the template's default).
-- [ ] Messages: `thinking.display: omitted` gets the thinking whole (to omit it and still have
-      it in the next prompt, the signature would have to carry it); a response does not list
-      `context_management.applied_edits`; `clear_tool_uses_20250919` is refused.
+- [x] Chat and Responses routes: a system or developer message inside a conversation is a turn
+      of the user, as on the Messages route (one rule in the reader of the chat body,
+      `wire::place_system_messages`); an effort the template refuses is detected with its
+      thinking (`refused_efforts`: Flash-Next `minimal` and `high`, the 27B `minimal`), `high`
+      is then the template's default and another one a 400 that says so (2026-11-22,
+      `server/priorities`).
+- [x] Messages: `thinking.display: omitted` as Anthropic's API (an empty block whose signature
+      carries the thinking back); `context_management.applied_edits` in the message and the last
+      `message_delta`; `clear_tool_uses_20250919` served with all its members; the turns of
+      `clear_thinking_20251015` counted as Anthropic counts them (2026-11-22,
+      `server/priorities`). The placeholder of a cleared result is Ares' own text: Anthropic
+      does not publish its.
 - [ ] Router: load and unload times in the docs; "no room" for Flash-Next is recognised by
       message text; a plan cannot be asked without loading; two elastic models on real devices.
 - [ ] A request with tools or an effort for an unknown model gets a 400 where a 404 belongs.
 - [x] Latency histograms (O01), logs (O03, O04), a bounded queue that says when to retry
       (S04), timeouts (S23).
-- [ ] Priorities (S06), a watchdog for a silent engine (S23), a VRAM reserve for other
+- [x] Priorities (S06): `priority` and `x-ares-priority`, the line, the places, the pages, the
+      rows of a step and a full `--queue` by priority, preemption of a worse priority to the
+      prefix cache (2026-11-22, `server/priorities`; see "Priorities of requests" in
+      `ARCHITECTURE.md`). Open: a prompt of a worse priority still takes its share of the time
+      next to generation of a better one (the slowdown, not the priority, bounds it); a
+      threshold of the gap before a running request gives way (SGLang's, 10 by default) is not
+      there (any gap is enough); the randomized test of admission plays one priority.
+- [ ] A watchdog for a silent engine (S23), a VRAM reserve for other
       programs (V04), container image and service unit (X09), key roles and a reload of the
       key file (X02), TLS (X03).
 - [ ] `/props` of a model that is not loaded (today: 503 `model_not_loaded`, as `/metrics`).

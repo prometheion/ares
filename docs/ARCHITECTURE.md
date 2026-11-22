@@ -317,8 +317,8 @@ requests ──► plan ──► upload step record ──► window ──► 
    (`ares_sched::Share`). A step is a *round* of generation (the newest
    token of every generating sequence, with the drafts that pay: below) or a
    *piece* of prompt (up to the rows at which the model's prompt kernels
-   reach their rate, 256 for `qwen35`, shortest prompt first and starved ones
-   before that, with the newest token of every generating sequence riding
+   reach their rate, 256 for `qwen35`, the better priority first, then
+   starved ones, then the shortest, with the newest token of every generating sequence riding
    along without drafts, so that they go on at a token a step). A round that
    verifies drafts keeps the inputs of its rows for the commit and has room
    for the rows of windows and no more, which is why prompt rows never share
@@ -660,7 +660,11 @@ one array per part, indexed by page number.
   step's claims are settled against a copy of the counters: cached pages are
   evicted first, draft rows are cut before anyone gives way, then the
   sequence with the fewest generated tokens is spilled, and victims that
-  turn out not to be needed stay. The object decides and reports; the
+  turn out not to be needed stay. All of this holds among the requests of
+  one priority: the line is taken by priority first, a shortage spills the
+  worst priority first, and a request that does not fit makes running ones
+  of a worse priority give way (see "Priorities of requests" under
+  [Server](#server)). The object decides and reports; the
   conductor carries it out.
 - In the conductor (`crates/runtime/src/conductor.rs`, `cache.rs`), for a
   model that takes part (`Model::prefix_cache`):
@@ -7006,7 +7010,7 @@ The controls are llama-server's, under its names and defaults:
 | --- | --- | --- | --- |
 | Thinking on, off or left to the template | `--reasoning on\|off\|auto` (`-rea`) | `chat_template_kwargs.enable_thinking`; `reasoning_effort: "none"` is off | the variable `enable_thinking`; `auto` sets nothing |
 | Format of the reply | `--reasoning-format` (default `auto`) | `reasoning_format` | `none` leaves the text whole in `content`, the end of the prompt from the opening tag on included, as llama-server does; `auto`, `deepseek` and `deepseek-legacy` extract (llama-server parses the three the same way) |
-| Effort | `--reasoning-effort` | `reasoning_effort` | the variable `reasoning_effort`; refused if the template does not read it |
+| Effort | `--reasoning-effort` | `reasoning_effort` | the variable `reasoning_effort`; refused if the template does not read it; of the usual values (`minimal` to `xhigh`) the ones the template raises for are found when the model is set up (`refused_efforts`: Flash-Next `minimal` and `high`, the 27B `minimal`): `high` is then the template's default, as on `/v1/messages`, and another one is refused |
 | Thinking of earlier turns stays in the prompt | `--reasoning-preserve` (default on), `--no-reasoning-preserve` | `chat_template_kwargs.preserve_reasoning` | the variable `preserve_reasoning` |
 | Any other variable of the template | `--chat-var` | `chat_template_kwargs` | the variable; `messages`, `tools`, `add_generation_prompt`, `bos_token` and `eos_token` are the server's |
 | A budget of thinking tokens and the message injected when it is spent | `--reasoning-budget`, `--reasoning-budget-message` | `reasoning_budget_tokens`, `thinking_budget_tokens`, `reasoning_budget_message`, `reasoning_control` | not built: only -1, an empty message and `false` are accepted |
@@ -7280,10 +7284,10 @@ events.
 | `messages` | turns of `user`, `assistant` and `system`, a string or blocks. User: `text`, and `tool_result` (a string or text blocks), which becomes a message of the role `tool` where it stands. Assistant: `text`, `thinking`, `redacted_thinking`, `tool_use`. System: text; before every other turn it joins the system prompt, after one it is a user turn with its text (below) |
 | `tools` | `name`, `description`, `input_schema` (and `type: custom`, `strict`, `eager_input_streaming`, which ask for what is always done) |
 | `tool_choice` | `auto`, `any` (the chat route's `required`), `tool` with a name, `none`; `disable_parallel_tool_use` allows one call |
-| `thinking` | `enabled` and `adaptive` switch thinking on, `disabled` off; a request without it leaves it to `--reasoning`; `display` (`summarized`, `omitted`, `updates`) is accepted and the thinking comes back whole |
+| `thinking` | `enabled` and `adaptive` switch thinking on, `disabled` off; a request without it leaves it to `--reasoning`; `display: "omitted"` gives thinking blocks an empty text and a signature that carries the thinking (below), `summarized` and `updates` the thinking whole |
 | `stop_sequences` | the stop strings |
 | `output_config` | `format` with a JSON schema is the chat route's `response_format`; `effort` is its `reasoning_effort`, except `high`, Anthropic's default, which is the template's default |
-| `context_management` | the edit `clear_thinking_20251015`: the thinking of the turns before the last `keep.value` turns with thinking stays out of the prompt (`keep: "all"` keeps all; without `keep`, the last one) |
+| `context_management` | the edits `clear_thinking_20251015` and `clear_tool_uses_20250919`, as Anthropic's service makes them, and `applied_edits` in the response (below) |
 | `metadata`, `service_tier` | bookkeeping: accepted, without effect |
 | `cache_control` | accepted on the body, on blocks and on tools; without effect (below) |
 
@@ -7294,9 +7298,8 @@ Anthropic's shape of an error (`{"type": "error", "error": {"type",
 "message"}}`, with the status the chat route gives): `image` and `document`
 blocks (input other than text is not built), tools of a `type` that Anthropic's
 service defines or runs (`web_search_...`, `bash_...`) and the blocks they
-leave in a history, `defer_loading`, `mcp_servers`, `container`, the edits of
-`context_management` that would cut results of tools (`clear_tool_uses_20250919`),
-citations, and any member the module does not know. A
+leave in a history, `defer_loading`, `mcp_servers`, `container`, other edits of
+`context_management` (compaction), citations, and any member the module does not know. A
 last message of the assistant is a prefill, which the reply continues (see
 "Continuing a message" below). `x-api-key` is one of the two headers a key
 may come in (see "Who may use the server"); `anthropic-version` and
@@ -7339,11 +7342,49 @@ a field of a beta is served or refused by its name in the body.
   another turn is written as a turn of the user with the same text, which is
   where a model reads what came in between; Flash-Next's template knows the
   efforts `xhigh` (its default), `medium` and `low`, so `high`, which is
-  Anthropic's default, is the template's default. `display` asks for a summary
-  or for updates of the thinking, which the server does not have; the thinking
-  comes back whole, which is also what writes it into the next prompt as the
-  model generated it (with `omitted` it would come back empty, and each turn
-  would part from the cached one there).
+  Anthropic's default, is the template's default. `display: "updates"` asks
+  for notes of progress between calls, which the server does not have; the
+  thinking comes back whole, which is also what writes it into the next prompt
+  as the model generated it. A system turn after another turn is a turn of the
+  user by the rule of every route (`wire::place_system_messages`, see "The
+  Responses API").
+- **`thinking.display: "omitted"`.** Anthropic's API answers it with thinking
+  blocks whose `thinking` is the empty text and whose signature carries the
+  thinking it does not show, so that a client that sends the block back
+  continues the conversation; the server does the same: the signature is
+  `ares-reasoning:` and the reasoning in base64, and a block that comes back
+  with an empty text and such a signature is the reasoning of its turn (a
+  text that is there wins; a broken carried signature is refused). The next
+  prompt is then the one a client that shows the thinking sends, and the
+  prefix cache continues it. A stream has no `thinking_delta`: the block opens
+  empty and its `signature_delta` carries the whole of it before it closes.
+  `summarized` gets the thinking whole: there is no summary, and the thinking
+  shows more than one, never less.
+- **Context edits.** `context_management.edits` are read with the body and
+  carried out on the chat request once its model is known (`anthropic::edits`),
+  because a trigger counts the tokens of the prompt, which only the engine
+  does. `clear_thinking_20251015` takes the thinking out of the turns of the
+  assistant before the last `keep.value` turns; a turn begins with a message
+  of the user that is not only results of tools, the turn in progress and
+  turns without thinking count, a request without `keep` keeps one, `"all"`
+  keeps all, and the edit stands first among several, as at Anthropic.
+  `clear_tool_uses_20250919` replaces the results of the oldest calls with
+  `[tool result cleared to save context]` once the prompt is past `trigger`
+  (`input_tokens`, 100 000 by default, or `tool_uses`), all but the last
+  `keep.value` calls (3) and the calls of the tools in `exclude_tools`; with
+  `clear_tool_inputs` their arguments become `{}`; it changes nothing when it
+  would take fewer than `clear_at_least` tokens away. The response lists what
+  changed the prompt in `context_management.applied_edits`
+  (`cleared_thinking_turns` or `cleared_tool_uses`, and `cleared_input_tokens`),
+  in the message and in the last `message_delta` of a stream, an empty list
+  when nothing did, and no member for a request without edits;
+  `/v1/messages/count_tokens` adds `context_management.original_input_tokens`.
+  The tokens come from counting the prompt before and after an edit that
+  changes it (a rendering and a tokenization each, no device); an edit that
+  changes nothing costs at most the count its trigger needs. A cleared result
+  in the middle of a conversation parts the prompt from the cached one there,
+  as at Anthropic: the checkpoints at message boundaries keep that to the rows
+  after it. Anthropic does not publish its placeholder; this one is Ares' own.
 - **The billing line of Claude Code.** Claude Code begins its system prompt
   with `x-anthropic-billing-header: ...; cch=a5145;`, whose `cch` is another
   one in every request. Left alone it would part every prompt from the cached
@@ -7431,8 +7472,12 @@ system message, joined by an empty line: Codex puts its instructions at the
 head of `input` and sends no `instructions` (read in its source, not tried),
 and the chat template of Qwen3.5-0.8B refuses a system message that is not
 the first one (`System message must be at the beginning.`, read in the model
-file). Such a message inside a conversation stays where it stands, and the
-template decides about it: that template refuses it.
+file). Such a message inside a conversation is a message of the user with its
+text, by the rule of every route: the reader of the chat body
+(`wire::place_system_messages`) makes the system messages before every other
+message one system message (joined by an empty line) and a later one a turn
+of the user, which is where the Messages route always put a system turn
+between the others.
 
 Everything else is refused with a 400 that names it, in OpenAI's shape of an
 error, as on the chat route: `input_image`, `input_file` and `input_audio`
@@ -7711,6 +7756,82 @@ connection that waits for the engine writes nothing and is never cut. The
 server accepts its connections itself (`listen.rs`, hyper's HTTP/1.1 with the
 graceful shutdown of hyper-util) where it used `axum::serve`, which has no
 timeouts.
+
+**Priorities of requests.** A request has a priority, a whole number of 32
+bits, a lower number first, 0 when it says nothing: the member `priority` on
+`/v1/chat/completions`, `/v1/completions` and `/v1/responses` (vLLM's member,
+which SGLang has too), and the header `x-ares-priority` on every route that
+generates, for a client that cannot add a member to a body (Claude Code's
+`ANTHROPIC_CUSTOM_HEADERS`, the `http_headers` of a provider of Codex); the
+Messages API has no such member, so there it is the header alone. Body and
+header that name two different ones are refused. It is always on: a server
+whose requests all say nothing behaves as before (the randomized test of
+admission, which plays one priority, still holds).
+
+What the others do. llama.cpp's server has no priority of requests (it puts
+only its own tasks, cancels and the like, at the front of its queue). vLLM
+(read in its source, `vllm/v1/core/sched`) has `priority`, lower first, only
+with `--scheduling-policy priority`: its line is a heap by priority and
+arrival, and when a running request finds no blocks the victim is the worst
+priority, latest arrival; a waiting request does not make a running one give
+way. SGLang (`--enable-priority-scheduling`, read in its source through a
+fetch) has `priority`, higher first unless `--schedule-low-priority-values-first`;
+its line is sorted by priority and arrival, a waiting request preempts running
+ones whose priority is worse by more than a threshold (10 by default) when
+they free enough tokens, and a full line (`--max-queued-requests`) refuses
+its worst waiting request (503) for a better one, or else the new one.
+
+Here every place where the engine chooses between requests honours it:
+
+- *The line* (`ares_sched::Admission`) is taken by priority first. Among the
+  requests of one priority the old rules hold: a request that gave way comes
+  back first, a starved one goes first and holds back the others of its
+  priority and of worse ones (never a better one), then the fewest uncached
+  rows.
+- *Giving way.* A request that does not fit, for want of a place on the
+  devices (`--parallel`) or of pages, makes running requests of a worse
+  priority give way: the worst priority first, among those the one a
+  shortage would pick (the fewest generated tokens), as many as it takes, or
+  none when all of them would not make it fit (SGLang's rule, its check that
+  the victims free enough included). Any gap of priority is enough; there is
+  no threshold. The victims are spilled as for a shortage: their pages go to
+  the prefix cache and their state becomes a checkpoint, so they come back as
+  a prefix hit, and they do not come back in the pass that made them give
+  way. A shortage of pages spills the worst priority first (vLLM's victim),
+  then by the old rule.
+- *The rows of a step* (`ares_sched::plan`): the newest tokens, the rows of
+  decisions, the drafts and the prompts go to the better priority first; a
+  starved prompt goes before a shorter one only of its own priority.
+- *Prompts and generation* (`ares_sched::Share`): a started prompt that
+  outranks every sequence that generates owes them nothing and is read in
+  pieces at once (the generating sequences ride along with a token each); its
+  pieces are owed all the same, by the prompts after it. A prompt that does
+  not outrank them takes turns with them as before, whatever its priority:
+  the slowdown, not the priority, bounds what a background prompt costs a
+  foreground reply (open).
+- *A full line* (`--queue`): a request that comes when the line is full is
+  decided by the conductor, which knows the line: it takes the place of the
+  worst waiting request of a worse priority that has not started (the latest
+  of them), which is refused as overloaded (503 with `Retry-After`), or is
+  refused itself. A request that ran and gave way has sent its client text
+  and is not refused. The refusal is an event now and no longer the answer of
+  `submit`; the routes give it its 503 all the same.
+
+`/metrics` counts the requests that gave way to a better priority
+(`ares_requests_outranked_total`, counted in the requests that gave way too)
+and the ones a better priority took the place of in a full line
+(`ares_requests_displaced_total`). The log line of a request names its
+priority.
+
+Tests: `ares-sched` (the line, giving way for a place and for pages, nobody
+spilled when it would not do, the shortage's victim, the rows of a step, the
+prompt that does not wait for the debt), `crates/runtime/tests/priority.rs`
+(on the synthetic model through the conductor: a request of priority 0 takes
+the one place of a long request of priority 5 and ends first, while one of
+priority 5 waits; the long one comes back and says what it says alone; a full
+line takes a better priority and refuses the worst waiting request) and
+`crates/server/tests/priority.rs` (the member and the header on all four
+routes).
 
 **What the server logs and measures.** Every generating request has a line
 with its parameters when it is taken (the model, the limit of tokens, the
