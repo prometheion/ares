@@ -4225,6 +4225,111 @@ uploaded, chosen per expert by measured cost. On the recorded routing with
 few slots that took the expert path from 33 to 44 steps per second; with 99
 % of the picks in a slot it makes no measurable difference to the model.
 
+### What the second card is for
+
+The two cards of the development machine differ in speed (479 against 341 GB/s),
+in their link (PCIe 4.0 x16 against 3.0 x4, 3.3 GB/s) and not in memory (12 GiB
+each). How the slower one is used best was measured on 2026-11-22 for both
+models (the owner's question of that day; the roles of 2026-11-17 in
+[`OPEN.md`](OPEN.md)).
+
+**The fork's attention split.** The owner's llama.cpp fork has `--attn-split`
+(`-as`, with `--split-mode tensor` only; commits 553a934 to ff1a44e): every
+tensor whose split is counted in the heads of `blk.N.attn_output.weight`
+follows it instead of `--tensor-split`. Those are the four projections of the
+full-attention layers (query with its gate, key, value, output) and the K/V
+cache of those layers (`cache_k_lN`, `cache_v_lN`); the recurrent layers (whose
+split is counted against `ssm_out`), the feed-forward parts and the head keep
+`--tensor-split`. Each card holds K and V of its heads for every cell, so the
+context is shared by the heads: with `-as 1,3` the 4070 holds a quarter of K/V
+and the 3060 three quarters, and the context ends when the first card is full.
+The rounding to whole heads is carried from layer to layer (`-as 0.3,0.7` gives
+20 of 68 heads). The production preset is `-ts 0.625,0.375 -as 1,3`: the faster
+card holds more weights, the slower one more context, and two sequences of
+131 072 cells fit.
+
+**The same in Ares** (`Placement::tensor_with_attention`,
+`Spread::TensorWithAttention`): the KV heads of every attention block follow
+shares of their own, with their query heads, their slices of the projections,
+their K and V and their attention work; the recurrent blocks, the feed-forward
+parts and the head follow the shares. The cut of a block is at whole heads and
+its rounding is carried into the next attention block, so over all of them a
+device holds its share within one head. A device may hold no heads at all
+(its blocks are then empty mixers, which the parts had already).
+
+**The 27B, measured** (2026-11-22, `qwen35_run --attention-shares`, UD-Q4_K_S,
+K and V in `q8`, no drafts, one sequence opened with 33 024 cells, runs in turn
+T, A, L, B, T, A, L, B, then T, M, T, M; load average 4 to 10 for the rows
+given). *All of it through page-locked host memory*: the machine had no driver
+library with peer access that day, so a decode step of the plain tensor split
+takes 26.3 ms where it took 24.8 ms over the peer route; the differences
+between the rows are what this measures. Context is what the devices' free
+memory holds in all with 256 MiB left on each (`RES room`); a prompt is tokens
+per second (2048 tokens from nothing, and reading 32 000); a decode step is the
+median in ms of 64 steps at 1000 and at 32 000 cells of context.
+
+| Placement (weights; heads) | Context | Prompt 2048 | Decode 1k | Read 32k | Decode 32k |
+| --- | --- | --- | --- | --- | --- |
+| T: tensor split 0.625 / 0.375; heads with the weights | 126 825 (the 4070 is full) | 1349, 1358 | 26.39, 26.28 | 943, 949 | 29.22, 29.17 |
+| A: 0.625 / 0.375; heads 1 : 3, as the fork's production | 234 513 (the 3060 is full) | 1264 | 27.45 (+4 %) | 756 (-20 %) | 32.63 (+12 %) |
+| M: 0.625 / 0.375; heads by room, 0.33 : 0.67 | 265 114 (both full) | 1278 | 27.21 (+3 %) | 787 (-17 %) | 31.81 (+9 %) |
+| B: 0.7 / 0.3; heads 1 : 3 | 242 228 (both nearly full) | 1474, 1480 | 28.57, 28.52 (+8 %) | 828 (-12 %) | 33.65 (+15 %) |
+| L: layer split 0.62 / 0.38 | 113 742 (the 4070 is full) | 1228, 1232 | 41.17, 41.21 (+56 %) | 855 | 45.26, 45.32 (+55 %) |
+
+K and V take 20.75 / 12.45 MiB per 1000 tokens on the 4070 / 3060 in T, 8.30 /
+24.90 in A and B, 10.89 / 22.31 in M and 22.83 / 10.38 in L. The 4070 holds
+62.5 % of the weights and, with the heads following them, 62.5 % of K and V:
+it is full with 2.2 GiB to give while the 3060 has 6 GiB nobody uses. Moving
+heads to the 3060 doubles the context (M: 2.1 times), at a price that grows
+with the length of the sequence, because the 3060 then reads most of K and V
+of every step: 3 to 4 % per decode step at 1000 cells and 9 to 12 % at
+32 000, and 17 to 20 % for reading a long prompt. Shifting weights to the
+4070 as well (B) makes short prompts 10 % faster and decode slower. The layer
+split is no use for one sequence: its decode step is half as fast again and
+its context is the smallest.
+
+So the heads are a choice between context and the speed of long sequences,
+and the room decides how far they must move: with the most context as the
+goal, heads by room (`plan::attention_by_room`: device `i` gets the share of
+the heads that its room without heads is of all rooms, which makes every
+device full at the same page: M's 0.33 is what the rule gives from the rooms
+measured in A, and there both cards had room for 232 000 to 236 000 more
+tokens),
+and for a context that fits with fewer moved, only as many as it needs
+(`plan::attention_for_context`: the weights' shares lowered where a device's
+room is short, `fit_shares`). That is `AttentionShares::ByContext` in the
+server's `LoadOptions`, an internal choice no option sets yet; its test,
+`tests/real_devices.rs`, loads the 27B three ways and compares the planned
+pages and the text.
+
+**Flash-Next: the second card as an expert tier.** With both cards on every
+layer, the card that mixes (`TensorChoice::mixer`) holds the residual streams,
+every stream mixer, the routers, the attention layers with all their keys and
+values, and the head; the worker holds a share of the recurrent heads
+(`core_share`), maybe the shared expert, and the experts it owns, and computes
+them. With `core_share` 1 and the shared expert on the mixer the worker holds
+experts and nothing else: the main card runs the model, the second card is one
+more tier of experts between the main card's slots and RAM, and it computes
+what it holds (the rows of a layer go over, the sums come back, as for any
+worker). Lending the bytes instead (copying an expert from the second card to
+the first when it is picked) is not built: on this machine the second card's
+link (3.3 GB/s) is slower than an upload from page-locked RAM to the first
+card over its own link (an expert of the IQ2_XS file in 0.1 ms against 0.4 ms
+over the second card's link), so a copy from the second card would be the
+slowest tier.
+
+*Measured*: by layers and on one card below; both cards on every layer and the second card with experts only need peer access, which the machine did not have on 2026-11-22 (`OPEN.md`).
+
+**Drafters on the second card** are not built. The step that only drafts runs
+the chain on the card that holds the drafter while every other card waits, so
+a chain on the slower card is slower by what that card is slower and gains
+nothing beside it; what the drafter's memory gives the first card back is room
+for context or slots, which the attention heads (27B) and the expert slots
+(Flash-Next) of the second card give already. A drafter on the second card
+pays only with a pipeline that drafts the next window there while the first
+card verifies this one (Strata's `--pipeline-windows`), which Ares does not
+have.
+
 ### Qwen3.8-Flash-Next through the runtime
 
 `ares --model <first part of the file>` serves Qwen3.8-Flash-Next like the

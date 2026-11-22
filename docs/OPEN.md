@@ -538,6 +538,20 @@ Flash-Next); experts that do not fit in VRAM in RAM; K/V in int8. Its README giv
       cards hold the model and its expert cache; an aux card holds drafters (a draft model, DFlash,
       an MTP block) and, for a mixture of experts, its free VRAM as one more expert tier between
       the main cards and RAM. The option's name and form go to the owner before it is built.
+      Measured 2026-11-22 (`ARCHITECTURE.md`, "What the second card is for"): for the 27B the
+      second card is worth most as room for K and V (the attention heads by shares of their own,
+      as the fork's `--attn-split`: 2.1 times the context, 3 % slower decode at 1000 cells and
+      9 % at 32 000). Built behind the internal `LoadOptions::attention`
+      (`AttentionShares::ByContext`: heads with the weights as far as the asked context fits,
+      moved only as far as it needs); the proposal of its form went to the owner.
+- [ ] Flash-Next's placements of the second card measured with peer access: both cards on every
+      layer, the second card holding experts only (`TensorChoice` with `core_share` 1 and the
+      shared expert on the mixer), by layers, one card (`/var/tmp/ares-cards/batch4.sh peer`).
+      On 2026-11-22 the machine had no driver library with peer access, so only the last two ran.
+- [ ] Drafters on the second card: not built. A chain that runs on the slower card is slower by
+      what that card is slower, and nothing runs beside it in a step that only drafts; it pays
+      only with a pipeline that drafts the next window while the main card verifies this one
+      (Strata's `--pipeline-windows`).
 - [x] DFlash2 as a kind of drafter the runtime knows, chains, for both models (steps 7, 8):
       `ares_model::dflash`, `--drafters <file>`. The 27B's file and Flash-Next's (trained on the
       mean of its four hyper-connection streams, which llama.cpp cannot drive) both draft.
