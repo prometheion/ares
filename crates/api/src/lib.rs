@@ -45,7 +45,7 @@ pub use engine::{Engine, ModelCard};
 pub use error::EngineError;
 pub use event::{Alternative, Event, FinishReason, TokenProbs, Usage};
 pub use json::Json;
-pub use message::{Message, Role};
+pub use message::{Image, Message, Role};
 pub use request::{GenerateRequest, Prompt, RequestId};
 pub use sampling::{
     BiasKey, LOGIT_BIAS_MAX, LogitBias, LogprobRequest, PENALTY_WINDOW_MAX, SamplerKind, Sampling,

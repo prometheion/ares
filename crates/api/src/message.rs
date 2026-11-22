@@ -1,6 +1,7 @@
 //! Chat messages.
 
 use std::fmt;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
@@ -34,11 +35,36 @@ impl fmt::Display for Role {
     }
 }
 
+/// An image in a message: its pixels, decoded, and where it stands in the
+/// message's text.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Image {
+    /// The byte of the message's `content` the image stands at: after the text
+    /// before it and before the text after it. Images at the same byte stand
+    /// in their order.
+    pub at: usize,
+    pub width: u32,
+    pub height: u32,
+    /// Three bytes a pixel (red, green, blue), row by row. Not serialized.
+    #[serde(skip)]
+    pub pixels: Arc<Vec<u8>>,
+}
+
+impl fmt::Debug for Image {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Image")
+            .field("at", &self.at)
+            .field("width", &self.width)
+            .field("height", &self.height)
+            .finish_non_exhaustive()
+    }
+}
+
 /// One message of a conversation.
 ///
 /// `content` is plain text: a front end that accepts richer content (a list
 /// of parts) flattens it before it gets here, or refuses what it cannot
-/// flatten. The other four fields exist for the chat template and are never
+/// flatten. Its images are beside it, each at its place in the text. The other four fields exist for the chat template and are never
 /// interpreted on the way; they are `None` when the client did not send them,
 /// which is not the same as an empty value and templates can tell the
 /// difference.
@@ -62,6 +88,9 @@ pub struct Message {
     /// the model generated and the prefix cache continues at its end.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
+    /// The images of the message, ascending by their place.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<Image>,
 }
 
 impl Message {
@@ -74,6 +103,7 @@ impl Message {
             tool_call_id: None,
             tool_calls: None,
             reasoning_content: None,
+            images: Vec::new(),
         }
     }
 }
