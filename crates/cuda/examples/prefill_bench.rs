@@ -10,7 +10,9 @@
 //! with `rows` activation rows by each path, 10 launches in a row between two
 //! events, over several copies of the matrix that together are larger than any
 //! L2 cache. The decode kernels are timed for comparison at up to `--decode-rows` rows (64
-//! unless said otherwise, in launches of 8). The fast path of the device is marked.
+//! unless said otherwise, in launches of 8). The path `Precision::Fast` takes for the type
+//! is marked: on a card whose tensor cores run f32 accumulation at full rate the one
+//! `Kernels::measure_prefill_path` measures first (its probe times are printed).
 //!
 //! For a type with a device layout (`Kernels::has_device_layout`), `layout` and
 //! `layout-exact` time `Kernels::product` over the rearranged matrix with the kernel
@@ -195,6 +197,20 @@ fn main() -> Result<()> {
             }
         }
         for &ty in &types {
+            let fast = if kernels.has_prefill_path(ty, PrefillPath::F16) {
+                let choice = kernels.measure_prefill_path(ty)?;
+                if choice.measured {
+                    let [int8, f16, flushed] = choice.probe_ms;
+                    println!(
+                        "  {} path of Precision::Fast: {:?} (probe: int8 {int8:.3} ms, f16 {f16:.3}, f16 flushed {flushed:.3})",
+                        ty.name(),
+                        choice.path
+                    );
+                }
+                choice.path
+            } else {
+                fast
+            };
             time_type(&device, &kernels, &stream, ty, &rows, &paths, fast, decode_rows)?;
         }
     }
@@ -466,7 +482,9 @@ fn time_type(
                 Which::Decode => "decode",
             };
             let mark = match (which, fast) {
-                (Which::Int8, PrefillPath::Int8) | (Which::F16, PrefillPath::F16) => "*",
+                (Which::Int8, PrefillPath::Int8)
+                | (Which::F16, PrefillPath::F16)
+                | (Which::F16Flush, PrefillPath::F16Flush) => "*",
                 _ => " ",
             };
             line += &format!(
