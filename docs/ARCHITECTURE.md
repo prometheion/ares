@@ -5233,7 +5233,8 @@ the same build with `--context 66560`, all K and V in VRAM, decoded the 64 token
 prompt at 2.9 and 5.6 tokens/s against the overflow's 12.5 and 8.8. A prompt read alone lends
 expert slots for its steps ("Large prompt steps on lent VRAM") and they come back empty, so the
 tokens right after it miss what they held; that build lent steps of 4096 rows, the overflow of
-2048, and the build before on the test machine fewer than this one. B1's long prompt failed at the first step past the pages in
+2048, and the build before, with 3.57 GiB less room for slots, lent none on those cards (its
+loans on the test machine were not looked at). B1's long prompt failed at the first step past the pages in
 VRAM: the copy of a layer's far entries into the loan crossed from one locked piece to the next,
 which the driver refuses; fixed by copying a piece at a time.
 
