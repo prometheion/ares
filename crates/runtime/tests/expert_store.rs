@@ -886,10 +886,10 @@ mod hybrid {
         );
     }
 
-    /// The slots a loan of VRAM gives back come back empty, many at once: the step that ends
-    /// after it fills every one of them with a hot expert of RAM, not a step's room on the link
-    /// at a time (which is one here: the link is slow), as long as RAM holds hot experts. Swaps
-    /// still wait for room.
+    /// The slots a loan of VRAM gives back come back empty, many at once: they fill with hot
+    /// experts of RAM as they come back, all of them, not a step's room on the link at a time
+    /// (which is one here: the link is slow), as long as RAM holds hot experts. Swaps still
+    /// wait for room.
     #[test]
     fn the_slots_a_loan_gives_back_fill_at_once() {
         let mut rig = rig(8, 16, Serve::Measured);
@@ -916,10 +916,8 @@ mod hybrid {
         let loan = rig.store.lend_scratch(0, lendable / 2).unwrap().expect("a loan");
         rig.until("lent", |store| store.is_settled());
         assert!(rig.store.scratch_ready(0).unwrap());
-        rig.store.return_scratch(0).unwrap();
         rig.store.take_stats();
-        rig.store.begin_step();
-        rig.store.end_step().unwrap();
+        rig.store.return_scratch(0).unwrap();
         let promotions = rig.store.stats().promotions;
         assert!(
             promotions >= u64::from(loan.slots).min(4),

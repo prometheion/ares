@@ -422,6 +422,13 @@ impl<D: SlotDevice> ExpertStore<D> {
                 self.worth_stale[layer] = true;
             }
         }
+        // The slots are empty: they fill with the hottest experts of RAM now, not at the end
+        // of the next step (every free slot at once, `promote_hot`), so that the tokens after
+        // a long prompt find what the prompt's loan took from them as soon as the link has
+        // brought it.
+        if self.hybrid.is_some() {
+            self.promote_hot()?;
+        }
         Ok(())
     }
 }
