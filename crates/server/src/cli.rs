@@ -180,6 +180,23 @@ OPTIONS:
                                profile). Changes the output; similar:8 touches the
                                8th to 10th of ten picks [default: off]
 
+    Images.
+        --mmproj <FILE>        The projector the model reads images through: the
+                               mmproj GGUF of its image tower beside the model file.
+                               Images come in requests as data URLs (image_url,
+                               Anthropic image blocks, input_image); remote URLs
+                               are not fetched [default: none, images are refused]
+        --mmproj-weights <ram|vram>
+                               Where the projector's weights stay between images:
+                               ram, page-locked inside --ram and uploaded block by
+                               block for every new image, or vram, which the
+                               context gives up (about 0.9 GiB) [default: ram]
+        --image-max-tokens <ROWS>
+                               The most rows (tokens) one image becomes, 8 to 4096;
+                               a larger image is shrunk to fit. The VRAM of the
+                               tower's scratch follows it (about 330 MiB at 4096)
+                               [default: 4096, as llama.cpp]
+
     Prompts.
         --chat-var <NAME=VALUE>  A variable of the model's chat template, such as
                                add_vision_id=true; may be given several times
