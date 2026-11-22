@@ -11,11 +11,12 @@
 //! time per pair of this work, which is measured apart from the decode steps' jobs: its jobs
 //! are packed differently). Transit brings the others; the layer ends when both have.
 //!
-//! A job ([`LayerJob`]) takes at most [`MAX_ROWS`] rows, so the rows are packed: each
-//! expert's rows in pieces of at most that many, and the pieces, in the order of their
-//! first row, into jobs whose rows together are at most that many. An expert whose rows
-//! fall into several jobs is read once for each; in a step of a few rows that is rare,
-//! and the cost model learns what it costs.
+//! The CPU's part of a layer is one job ([`LayerJob::with_rows`]) over the rows that picked
+//! one of its experts: its tasks are small (32 hidden values of an expert, 64 values of its
+//! down product), so every worker takes part. A kernel reads at most [`MAX_ROWS`] rows of an
+//! expert at a time, so an expert that more rows picked is given to the job in pieces of
+//! that many, and read once for each; in a step of a few rows that is rare, and the cost
+//! model learns what it costs.
 //!
 //! The arithmetic is the decode steps' CPU half: the int8 codes of the rows' mixed input
 //! and the device's sums per block of 32 (`cpu/mod.rs`).
@@ -26,7 +27,7 @@ use std::ops::Range;
 use std::sync::Arc;
 use std::time::Instant;
 
-use super::super::cpu::{CpuExpert, LayerJob, MAX_ROWS, act_bytes};
+use super::super::cpu::{LayerJob, MAX_ROWS, RowsExpert, act_bytes};
 use super::super::{ExpertStore, SlotDevice, StoreError};
 use super::{Miss, Serve};
 
@@ -77,50 +78,6 @@ impl WideCpu {
     pub fn jobs(&self) -> usize {
         self.jobs.len()
     }
-}
-
-/// A job of [`pack`]: its rows, ascending, and its pieces (the index of a pick and the range
-/// of its rows).
-type Packed = (Vec<u32>, Vec<(usize, Range<usize>)>);
-
-/// Packs the rows of `picks` into jobs of at most [`MAX_ROWS`] rows: the pieces of each
-/// expert's rows, in the order of their first row, into the job before as long as the rows
-/// of the job stay that few. Returns per job its rows, ascending, and its pieces (the index
-/// of the pick and the range of its rows).
-fn pack(picks: &[WidePick]) -> Vec<Packed> {
-    let mut pieces: Vec<(usize, Range<usize>)> = Vec::new();
-    for (p, pick) in picks.iter().enumerate() {
-        let mut at = 0;
-        while at < pick.rows.len() {
-            let end = (at + MAX_ROWS).min(pick.rows.len());
-            pieces.push((p, at..end));
-            at = end;
-        }
-    }
-    let first_row = |(p, range): &(usize, Range<usize>)| picks[*p].rows[range.start].0;
-    pieces.sort_by_key(|piece| (first_row(piece), piece.0));
-    let mut jobs: Vec<Packed> = Vec::new();
-    for (p, range) in pieces {
-        let rows = picks[p].rows[range.clone()].iter().map(|(row, _)| *row);
-        let fits = jobs.last().is_some_and(|(job, _)| {
-            let new = rows.clone().filter(|row| !job.contains(row)).count();
-            job.len() + new <= MAX_ROWS
-        });
-        if !fits {
-            jobs.push((Vec::new(), Vec::new()));
-        }
-        let (job, members) = jobs.last_mut().expect("a job");
-        for row in rows {
-            if !job.contains(&row) {
-                job.push(row);
-            }
-        }
-        members.push((p, range));
-    }
-    for (rows, _) in &mut jobs {
-        rows.sort_unstable();
-    }
-    jobs
 }
 
 /// The activations of `rows` of a step of `n_rows` rows of `n` values (`act`, as
@@ -213,40 +170,42 @@ impl<D: SlotDevice> ExpertStore<D> {
                 pick.expert, pick.rows
             )));
         }
-        let mut jobs = Vec::new();
-        for (rows, members) in pack(picks) {
-            let job_act = gather(act, n, n_rows, &rows);
-            let mut experts = Vec::with_capacity(members.len());
-            for (p, range) in members {
-                let pick = &picks[p];
-                let (mut mask, mut weight) = (0u32, [0.0f32; MAX_ROWS]);
-                for (row, w) in &pick.rows[range] {
-                    let b = rows.binary_search(row).expect("the job has the row");
-                    mask |= 1 << b;
-                    weight[b] = *w;
-                }
-                experts.push(self.cpu_expert(layer, pick.expert, mask, weight)?);
+        // The rows that picked one of the experts, and each expert's in pieces a kernel
+        // takes, by their places among those rows.
+        let mut rows: Vec<u32> =
+            picks.iter().flat_map(|p| p.rows.iter().map(|(r, _)| *r)).collect();
+        rows.sort_unstable();
+        rows.dedup();
+        let job_act = gather(act, n, n_rows, &rows);
+        let mut experts = Vec::with_capacity(picks.len());
+        for pick in picks {
+            let at = self.cpu_expert(layer, pick.expert, 0, [0.0; MAX_ROWS])?;
+            for piece in pick.rows.chunks(MAX_ROWS) {
+                experts.push(RowsExpert {
+                    gate: at.gate,
+                    up: at.up,
+                    down: at.down,
+                    rows: piece
+                        .iter()
+                        .map(|(row, w)| (rows.binary_search(row).expect("a row") as u32, *w))
+                        .collect(),
+                });
             }
-            jobs.push((experts, rows, job_act));
         }
         for pick in picks {
             self.ram.sets[layer].hold(pick.expert);
         }
         let held: Vec<u32> = picks.iter().map(|pick| pick.expert).collect();
         let hybrid = self.hybrid.as_ref().ok_or_else(|| StoreError::Plan("no CPU half".into()))?;
-        let mut started = Vec::with_capacity(jobs.len());
-        for (experts, rows, job_act) in jobs {
-            let experts: &[CpuExpert] = &experts;
-            // SAFETY: the matrices are whole experts of the layer's shape in their RAM slots,
-            // which are held until `wide_cpu_end`, after every job has run.
-            let job = unsafe {
-                LayerJob::new(hybrid.pool.features(), &shape, rows.len(), &job_act, experts)
-            }
-            .map_err(|e| StoreError::Plan(e.to_string()))?;
-            let job = Arc::new(job);
-            hybrid.pool.submit(Arc::clone(&job));
-            started.push((job, rows));
+        // SAFETY: the matrices are whole experts of the layer's shape in their RAM slots,
+        // which are held until `wide_cpu_end`, after the job has run.
+        let job = unsafe {
+            LayerJob::with_rows(hybrid.pool.features(), &shape, rows.len(), &job_act, &experts)
         }
+        .map_err(|e| StoreError::Plan(e.to_string()))?;
+        let job = Arc::new(job);
+        hybrid.pool.submit(Arc::clone(&job));
+        let started = vec![(job, rows)];
         let pairs = picks.iter().map(|pick| pick.rows.len()).sum();
         let rows = match (
             picks.iter().filter_map(|pick| pick.rows.first()).map(|(row, _)| *row).min(),
@@ -310,35 +269,6 @@ impl<D: SlotDevice> ExpertStore<D> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn pick(expert: u32, rows: &[u32]) -> WidePick {
-        WidePick { expert, rows: rows.iter().map(|r| (*r, 0.5)).collect() }
-    }
-
-    #[test]
-    fn rows_are_packed_into_jobs_of_at_most_eight() {
-        // Experts of one row each over twelve rows, one of two rows, and one of eleven: the
-        // pieces go into jobs by their first row while the job's rows stay eight.
-        let mut picks: Vec<WidePick> = (0..12).map(|r| pick(r, &[r])).collect();
-        picks.push(pick(20, &[3, 9]));
-        picks.push(pick(21, &(0..11).collect::<Vec<u32>>()));
-        let jobs = pack(&picks);
-        for (rows, members) in &jobs {
-            assert!(rows.len() <= MAX_ROWS, "{rows:?}");
-            for (p, range) in members {
-                for (row, _) in &picks[*p].rows[range.clone()] {
-                    assert!(rows.contains(row), "row {row} of pick {p} is in its job");
-                }
-            }
-        }
-        // Every pair is in one job exactly.
-        let pairs: usize = jobs.iter().flat_map(|(_, m)| m).map(|(_, range)| range.len()).sum();
-        assert_eq!(pairs, 12 + 2 + 11);
-        // The expert of eleven rows is read twice, its pieces of eight and three rows.
-        let pieces = jobs.iter().flat_map(|(_, m)| m).filter(|(p, _)| *p == 13).count();
-        assert_eq!(pieces, 2);
-        assert!(jobs.len() <= 5, "{} jobs", jobs.len());
-    }
 
     #[test]
     fn the_rows_of_a_job_are_gathered_with_their_scales() {

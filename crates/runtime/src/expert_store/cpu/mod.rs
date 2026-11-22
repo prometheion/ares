@@ -274,10 +274,24 @@ struct JobExpert {
     gate: *const u8,
     up: *const u8,
     down: *const u8,
-    /// The pairs of the expert are `first_pair ..`, one per row in `row`.
+    /// The pairs of the expert are `first_pair ..`, one per row in `row`: the rows of the
+    /// job's activations they read (at most [`MAX_ROWS`]), and their places among the
+    /// expert's pairs, by which the down kernels keep their sums.
     first_pair: usize,
-    row: Vec<u8>,
+    row: Vec<u32>,
+    place: Vec<u8>,
     weight: Vec<f32>,
+}
+
+/// One expert of a job of any number of rows ([`LayerJob::with_rows`]): where its three
+/// matrices are, in the file's bytes, and the rows of the job that use it (at most
+/// [`MAX_ROWS`], each once) with their weights.
+#[derive(Clone, Debug)]
+pub struct RowsExpert {
+    pub gate: *const u8,
+    pub up: *const u8,
+    pub down: *const u8,
+    pub rows: Vec<(u32, f32)>,
 }
 
 /// A task of a job.
@@ -384,6 +398,83 @@ impl LayerJob {
         act: &[u8],
         experts: &[CpuExpert],
     ) -> Result<Self, CpuError> {
+        let (kind, down, q, ds, sum8, planes) = Self::inputs(features, shape, n_rows, act, true)?;
+        let mut list = Vec::with_capacity(experts.len());
+        for expert in experts {
+            let rows: Vec<u32> = (0..n_rows as u32).filter(|b| expert.rows >> b & 1 != 0).collect();
+            if rows.is_empty() || expert.rows >> n_rows != 0 {
+                return Err(CpuError::Job(format!(
+                    "an expert with the row mask {:#x} in a step of {n_rows} rows",
+                    expert.rows
+                )));
+            }
+            list.push(JobExpert {
+                gate: expert.gate,
+                up: expert.up,
+                down: expert.down,
+                first_pair: 0,
+                place: (0..rows.len() as u8).collect(),
+                weight: rows.iter().map(|b| expert.weight[*b as usize]).collect(),
+                row: rows,
+            });
+        }
+        // SAFETY: the caller's guarantee.
+        unsafe { Self::build(kind, down, features, shape, n_rows, q, ds, sum8, planes, list) }
+    }
+
+    /// A job for `experts` of a layer of `shape` and the `n_rows` rows whose activations are
+    /// `act` (as [`LayerJob::new`] reads them), of any number: each expert reads at most
+    /// [`MAX_ROWS`] of them, so an expert that more rows picked is given as several, each
+    /// with some of its rows (and read once for each). What a step of many rows misses that
+    /// few of its rows picked (`hybrid/wide.rs`).
+    ///
+    /// # Safety
+    ///
+    /// As [`LayerJob::new`].
+    pub unsafe fn with_rows(
+        features: Features,
+        shape: &ExpertShape,
+        n_rows: usize,
+        act: &[u8],
+        experts: &[RowsExpert],
+    ) -> Result<Self, CpuError> {
+        let (kind, down, q, ds, sum8, planes) = Self::inputs(features, shape, n_rows, act, false)?;
+        let mut list = Vec::with_capacity(experts.len());
+        for expert in experts {
+            let bad = expert.rows.is_empty()
+                || expert.rows.len() > MAX_ROWS
+                || expert.rows.iter().any(|(row, _)| *row as usize >= n_rows);
+            if bad {
+                return Err(CpuError::Job(format!(
+                    "an expert with the rows {:?} in a job of {n_rows} rows",
+                    expert.rows
+                )));
+            }
+            list.push(JobExpert {
+                gate: expert.gate,
+                up: expert.up,
+                down: expert.down,
+                first_pair: 0,
+                place: (0..expert.rows.len() as u8).collect(),
+                weight: expert.rows.iter().map(|(_, w)| *w).collect(),
+                row: expert.rows.iter().map(|(row, _)| *row).collect(),
+            });
+        }
+        // SAFETY: the caller's guarantee.
+        unsafe { Self::build(kind, down, features, shape, n_rows, q, ds, sum8, planes, list) }
+    }
+
+    /// What a job reads of `act`, the activations of `n_rows` rows: the kinds of its
+    /// matrices, the int8 codes, their scales, the sums of IQ1_M's groups and the planes of
+    /// Q2_0's. `decode` holds the rows to a decode step's.
+    #[allow(clippy::type_complexity)]
+    fn inputs(
+        features: Features,
+        shape: &ExpertShape,
+        n_rows: usize,
+        act: &[u8],
+        decode: bool,
+    ) -> Result<(GateKind, DownKind, Vec<i8>, Vec<u8>, Vec<Lanes16>, Planes), CpuError> {
         let mut kind = GateKind::of(shape.gate_ty)
             .ok_or(CpuError::Type { what: "gate and up", ty: shape.gate_ty })?;
         let mut down = DownKind::of(shape.down_ty)
@@ -395,8 +486,8 @@ impl LayerJob {
         }
         // Whole blocks of both types and whole groups of 32 values.
         shape.check().map_err(|e| CpuError::Job(e.to_string()))?;
-        let (n_in, n_ff) = (shape.n_embd as usize, shape.n_ff as usize);
-        if n_rows == 0 || n_rows > MAX_ROWS {
+        let n_in = shape.n_embd as usize;
+        if n_rows == 0 || (decode && n_rows > MAX_ROWS) {
             return Err(CpuError::Job(format!("{n_rows} rows; a job takes 1 to {MAX_ROWS}")));
         }
         if act.len() < act_bytes(n_in, n_rows) {
@@ -417,25 +508,33 @@ impl LayerJob {
         let planes =
             if kind == GateKind::Q2_0 { Planes::new(&q, &ds, n_in) } else { Planes::default() };
 
-        let mut list = Vec::with_capacity(experts.len());
+        Ok((kind, down, q, ds, sum8, planes))
+    }
+
+    /// The job of the experts `list` (their pairs not counted yet) over the inputs that
+    /// [`LayerJob::inputs`] made.
+    ///
+    /// # Safety
+    ///
+    /// As [`LayerJob::new`].
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn build(
+        kind: GateKind,
+        down: DownKind,
+        features: Features,
+        shape: &ExpertShape,
+        n_rows: usize,
+        q: Vec<i8>,
+        ds: Vec<u8>,
+        sum8: Vec<Lanes16>,
+        planes: Planes,
+        mut list: Vec<JobExpert>,
+    ) -> Result<Self, CpuError> {
+        let (n_in, n_ff) = (shape.n_embd as usize, shape.n_ff as usize);
         let mut pairs = 0;
-        for expert in experts {
-            let rows: Vec<u8> = (0..n_rows as u8).filter(|b| expert.rows >> b & 1 != 0).collect();
-            if rows.is_empty() || expert.rows >> n_rows != 0 {
-                return Err(CpuError::Job(format!(
-                    "an expert with the row mask {:#x} in a step of {n_rows} rows",
-                    expert.rows
-                )));
-            }
-            list.push(JobExpert {
-                gate: expert.gate,
-                up: expert.up,
-                down: expert.down,
-                first_pair: pairs,
-                weight: rows.iter().map(|b| expert.weight[usize::from(*b)]).collect(),
-                row: rows,
-            });
-            pairs += list.last().map_or(0, |e| e.row.len());
+        for expert in &mut list {
+            expert.first_pair = pairs;
+            pairs += expert.row.len();
         }
         let hidden_stride = n_ff.next_multiple_of(128);
         let (tiles, chunks) = (n_ff / TILE, n_in.div_ceil(DOWN_ROWS));
@@ -567,7 +666,7 @@ impl LayerJob {
             }; MAX_ROWS];
             let mut hidden = [self.hidden(0); MAX_ROWS];
             for (n, b) in expert.row.iter().enumerate() {
-                let b = usize::from(*b);
+                let b = *b as usize;
                 // SAFETY: row b's part of the activations the job copied.
                 rows[n] = unsafe {
                     RowIn {
@@ -630,11 +729,12 @@ impl LayerJob {
         let part = DownExpert {
             down: expert.down,
             hidden: &self.hiddens[expert.first_pair..expert.first_pair + expert.row.len()],
-            row: &expert.row,
+            row: &expert.place,
             weight: &expert.weight,
         };
+        // The sums are kept by the pairs' places among the expert's pairs.
         let mut sums = [0.0f32; MAX_ROWS * DOWN_ROWS];
-        let (n_ff, n_rows, out) = (self.n_ff, self.n_rows, sums.as_mut_ptr());
+        let (n_ff, n_rows, out) = (self.n_ff, expert.place.len(), sums.as_mut_ptr());
         // SAFETY: as for the gate and up tasks; the expert's hidden values are
         // complete (the caller waited for its gate and up tasks), and the
         // sums are this task's own, `DOWN_ROWS` per row.
@@ -670,15 +770,15 @@ impl LayerJob {
         while self.chunk_parts[chunk].load(Ordering::Acquire) < e {
             std::hint::spin_loop();
         }
-        for &b in &expert.row {
-            let b = usize::from(b);
+        for (&b, &place) in expert.row.iter().zip(&expert.place) {
+            let b = b as usize;
             // SAFETY: values `first .. first + count` of row b are inside the
             // output, and only the part of this chunk whose turn it is
             // writes them.
             let row = unsafe {
                 std::slice::from_raw_parts_mut(self.out.ptr.add(b * self.n_out + first), count)
             };
-            for (out, part) in row.iter_mut().zip(&sums[b * DOWN_ROWS..]) {
+            for (out, part) in row.iter_mut().zip(&sums[usize::from(place) * DOWN_ROWS..]) {
                 *out += *part;
             }
         }
@@ -1090,6 +1190,82 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(1));
             }
             assert_eq!(job.sums(), alone.sums());
+        }
+    }
+
+    /// A job of many rows gives every row what jobs of at most eight rows give it: the
+    /// expert of eleven rows in two pieces, the others one each, rows in no order.
+    #[test]
+    fn a_job_of_many_rows_gives_what_jobs_of_eight_give() {
+        let mut rng = Rng(91);
+        let (n_in, n_ff, n_rows) = (512, 256, 20);
+        let shape = ExpertShape {
+            n_embd: n_in as u32,
+            n_ff: n_ff as u32,
+            n_experts: 16,
+            top_k: 2,
+            gate_ty: GgmlType::IQ2_S,
+            down_ty: GgmlType::Q2_0,
+        };
+        let experts: Vec<[Vec<u8>; 3]> = (0..3)
+            .map(|_| {
+                [
+                    random_matrix(&mut rng, GgmlType::IQ2_S, n_ff * n_in),
+                    random_matrix(&mut rng, GgmlType::IQ2_S, n_ff * n_in),
+                    random_matrix(&mut rng, GgmlType::Q2_0, n_in * n_ff),
+                ]
+            })
+            .collect();
+        let x: Vec<f32> = (0..n_rows * n_in).map(|_| rng.activation()).collect();
+        let act = quantize_activations(&x, n_in);
+        let rows: [Vec<u32>; 3] =
+            [(0..11).map(|r| (r * 7 + 3) % 20).collect(), vec![19, 2], vec![5]];
+        let weight = |e: usize, row: u32| 0.25 + 0.05 * e as f32 + 0.01 * row as f32;
+        let features = Features::detect();
+        let mut pieces = Vec::new();
+        for (e, m) in experts.iter().enumerate() {
+            for piece in rows[e].chunks(MAX_ROWS) {
+                pieces.push(RowsExpert {
+                    gate: m[0].as_ptr(),
+                    up: m[1].as_ptr(),
+                    down: m[2].as_ptr(),
+                    rows: piece.iter().map(|r| (*r, weight(e, *r))).collect(),
+                });
+            }
+        }
+        // SAFETY: the matrices are whole and outlive the jobs.
+        let wide =
+            unsafe { LayerJob::with_rows(features, &shape, n_rows, &act, &pieces) }.expect("a job");
+        wide.work();
+        let wide = wide.sums().expect("done");
+        // Each row by itself, in a job of one row.
+        for row in 0..n_rows as u32 {
+            let x_row = &x[row as usize * n_in..(row as usize + 1) * n_in];
+            let act_row = quantize_activations(x_row, n_in);
+            let one: Vec<CpuExpert> = experts
+                .iter()
+                .enumerate()
+                .filter(|(e, _)| rows[*e].contains(&row))
+                .map(|(e, m)| CpuExpert {
+                    gate: m[0].as_ptr(),
+                    up: m[1].as_ptr(),
+                    down: m[2].as_ptr(),
+                    rows: 1,
+                    weight: [weight(e, row); MAX_ROWS],
+                })
+                .collect();
+            let got = &wide[row as usize * n_in..(row as usize + 1) * n_in];
+            if one.is_empty() {
+                assert!(got.iter().all(|v| *v == 0.0), "row {row} picked nothing");
+                continue;
+            }
+            // SAFETY: as above.
+            let job = unsafe { LayerJob::new(features, &shape, 1, &act_row, &one) }.expect("a job");
+            job.work();
+            let want = job.sums().expect("done");
+            for (j, (g, w)) in got.iter().zip(want).enumerate() {
+                assert!((g - w).abs() <= 1e-5 * w.abs().max(1.0), "row {row} value {j}: {g} {w}");
+            }
         }
     }
 }
