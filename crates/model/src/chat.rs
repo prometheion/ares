@@ -54,6 +54,7 @@ pub fn thinking_format(format: ReasoningFormat, chat: &ChatOptions) -> ThinkingF
     ThinkingFormat {
         on_by_default,
         effort: format.effort,
+        refused_efforts: format.refused_efforts,
         start: format.start,
         end: format.end,
         prompt_on: format.prompt_on,

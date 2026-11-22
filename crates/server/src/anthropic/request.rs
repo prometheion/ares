@@ -10,6 +10,7 @@
 use ares_api::Json;
 
 use crate::error::ApiError;
+use crate::reasoning::DEFAULT_EFFORT;
 use crate::wire::{Fields, members, wrong_type};
 
 /// What a body is read for.
@@ -359,11 +360,11 @@ fn steady_billing_header(text: &str) -> String {
 /// reply then continues.
 ///
 /// A turn of the system before any other turn joins `system`, the system
-/// prompt. One between other turns (Claude Code sends its environment and the
-/// tokens left that way) is given to the chat template as a turn of the user
-/// with the same text: the chat templates of Qwen refuse a system message
-/// anywhere but first, and a turn of the user is where a model reads what
-/// came in between.
+/// prompt, as its blocks are joined. One between other turns (Claude Code
+/// sends its environment and the tokens left that way) stays a system message
+/// where it stands, which the reader of the chat body gives to the template
+/// as a turn of the user (`wire::place_system_messages`, the rule of every
+/// route).
 ///
 /// `kept` says which turns of the assistant keep their thinking.
 fn conversation(
@@ -416,7 +417,7 @@ fn conversation(
                     }
                     system.push_str(&text);
                 } else {
-                    chat.push(object(vec![("role", string("user")), ("content", string(text))]));
+                    chat.push(object(vec![("role", string("system")), ("content", string(text))]));
                 }
             }
             _ => {
@@ -945,9 +946,6 @@ fn stop_sequences(value: &Json) -> Result<Json, ApiError> {
     Ok(value.clone())
 }
 
-/// The level of effort a request at Anthropic gets when it names none.
-const DEFAULT_EFFORT: &str = "high";
-
 /// `output_config`: `format` is a JSON schema the reply follows (the
 /// `response_format` of a chat request), `effort` is the `reasoning_effort`
 /// of one. `high` is Anthropic's default level, so a request that names it
@@ -989,7 +987,10 @@ fn output_config(fields: &Fields<'_>, callable: bool, chat: &mut Chat) -> Result
     }
     match config.get("effort") {
         None => {}
-        // Anthropic's default level: the chat template's default.
+        // Anthropic's default level, which a request at Anthropic gets when
+        // it names none: the chat template's default, whatever the template
+        // knows (the chat route takes it so only where the template refuses
+        // it).
         Some(Json::String(effort)) if effort == DEFAULT_EFFORT => {}
         Some(Json::String(effort)) if !effort.is_empty() => {
             chat.push(("reasoning_effort", string(effort.as_str())));

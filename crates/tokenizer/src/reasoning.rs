@@ -51,6 +51,11 @@ pub struct ReasoningFormat {
     pub keeps_history: bool,
     /// Whether the template reads `reasoning_effort`.
     pub effort: bool,
+    /// The usual values of `reasoning_effort` (`minimal`, `low`, `medium`,
+    /// `high`, `xhigh`) that the template refuses (raises an error for), when
+    /// it reads the variable: Qwen3.8-Flash-Next's takes `xhigh`, `medium` and
+    /// `low`.
+    pub refused_efforts: Vec<String>,
 }
 
 impl ReasoningFormat {
@@ -71,6 +76,7 @@ impl ReasoningFormat {
             prompt_off: prompt(false)?,
             keeps_history: keeps_history(template),
             effort: reads_effort(template),
+            refused_efforts: refused_efforts(template),
         })
     }
 
@@ -194,6 +200,26 @@ fn keeps_history(template: &ChatTemplate) -> bool {
         ..ChatOptions::default()
     };
     template.render(&conversation, &[], &options).is_ok_and(|text| text.contains(REASONING))
+}
+
+/// The usual values of `reasoning_effort` that a template which reads the
+/// variable refuses; none for a template that does not read it.
+fn refused_efforts(template: &ChatTemplate) -> Vec<String> {
+    if !reads_effort(template) {
+        return Vec::new();
+    }
+    let user = [Message::new("user", "Hi")];
+    EFFORTS
+        .iter()
+        .filter(|effort| {
+            let variables =
+                vec![("reasoning_effort".to_owned(), Json::String((**effort).to_owned()))];
+            template
+                .render(&user, &[], &ChatOptions { variables, ..ChatOptions::default() })
+                .is_err()
+        })
+        .map(|effort| (*effort).to_owned())
+        .collect()
 }
 
 /// Whether some value of `reasoning_effort` changes the prompt. A value the

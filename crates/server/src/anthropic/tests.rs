@@ -227,15 +227,23 @@ fn a_turn_of_the_system_joins_the_system_prompt_or_is_read_as_a_turn_of_the_user
         json!([
             {"role": "system", "content": "You are terse.\nAnswer in German."},
             {"role": "user", "content": "What does calc.py do?"},
-            {"role": "user", "content": "# Environment"},
+            {"role": "system", "content": "# Environment"},
             {"role": "assistant", "content": "", "tool_calls": [
                 {"id": "toolu_1", "type": "function",
                  "function": {"name": "Read", "arguments": {"file_path": "calc.py"}}},
             ]},
             {"role": "tool", "tool_call_id": "toolu_1", "content": "def add(a, b): ..."},
-            {"role": "user", "content": "<total_tokens>999</total_tokens>"},
+            {"role": "system", "content": "<total_tokens>999</total_tokens>"},
         ])
     );
+    // The reader of the chat body, the rule of every route, makes the later
+    // ones turns of the user.
+    let json: Json = serde_json::from_value(got.clone()).unwrap();
+    let parsed =
+        crate::wire::from_json(crate::wire::Endpoint::Chat, &json, ares_api::RequestId(1)).unwrap();
+    let ares_api::Prompt::Chat { messages, .. } = &parsed.request.prompt else { panic!() };
+    let roles: Vec<&str> = messages.iter().map(|m| m.role.as_str()).collect();
+    assert_eq!(roles, ["system", "user", "user", "assistant", "tool", "user"]);
     // The reply is a new turn, not a continuation of the last one.
     assert!(got.get("continue_final_message").is_none(), "{got}");
     // A turn of the system first is the system prompt when there is no other.

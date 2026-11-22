@@ -199,7 +199,8 @@ async fn the_engine_receives_everything_the_client_sent_and_nothing_else() {
         panic!("chat prompt expected")
     };
     let roles: Vec<_> = messages.iter().map(|m| m.role).collect();
-    assert_eq!(roles, [Role::System, Role::User, Role::Assistant, Role::Tool, Role::System]);
+    // A developer message after the others is a message of the user, as on every route.
+    assert_eq!(roles, [Role::System, Role::User, Role::Assistant, Role::Tool, Role::User]);
     assert_eq!(messages[1].content, "Hello", "text parts are joined");
     assert_eq!(messages[1].name.as_deref(), Some("anna"));
     assert_eq!(messages[2].content, "", "null content is empty text");

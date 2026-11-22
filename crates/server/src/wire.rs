@@ -821,8 +821,9 @@ fn chat_prompt(fields: &Fields<'_>) -> Result<Prompt, ApiError> {
     if raw.is_empty() {
         return Err(ApiError::invalid_param("messages", "messages must not be empty"));
     }
-    let messages =
+    let mut messages =
         raw.iter().enumerate().map(|(i, m)| message(i, m)).collect::<Result<Vec<_>, _>>()?;
+    place_system_messages(&mut messages);
 
     let tools = match fields.get("tools") {
         None => None,
@@ -831,6 +832,40 @@ fn chat_prompt(fields: &Fields<'_>) -> Result<Prompt, ApiError> {
     };
     let continue_final = continues(fields, &messages)?;
     Ok(Prompt::Chat { messages, tools, variables: Vec::new(), continue_final })
+}
+
+/// What the system messages of a conversation join: an empty line, as the
+/// Responses route joins `instructions` with them.
+const BETWEEN_SYSTEM_MESSAGES: &str = "\n\n";
+
+/// The messages of the system (and of the developer, which is the system
+/// here) as the chat templates of Qwen take them, which refuse a system
+/// message anywhere but first: the ones that stand before every other message
+/// are one system message, their texts joined by an empty line; one after
+/// another message becomes a message of the user with its text, which is where
+/// a model reads what came in between (Claude Code sends its environment and
+/// the tokens left that way, Codex its instructions of a turn).
+///
+/// Every route that generates comes through here: the Messages and the
+/// Responses routes write their bodies over into a chat body, with a system
+/// turn where it stood.
+pub(crate) fn place_system_messages(messages: &mut Vec<Message>) {
+    let leading = messages.iter().take_while(|m| m.role == Role::System).count();
+    if leading > 1 {
+        let texts: Vec<String> =
+            messages.drain(1..leading).map(|m| m.content).filter(|text| !text.is_empty()).collect();
+        let first = &mut messages[0];
+        for text in texts {
+            if !first.content.is_empty() {
+                first.content.push_str(BETWEEN_SYSTEM_MESSAGES);
+            }
+            first.content.push_str(&text);
+        }
+    }
+    let from = usize::from(leading > 0);
+    for message in messages.iter_mut().skip(from).filter(|m| m.role == Role::System) {
+        message.role = Role::User;
+    }
 }
 
 /// Whether the reply continues the last message of the conversation: when it

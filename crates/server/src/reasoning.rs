@@ -239,6 +239,16 @@ pub(crate) fn apply(
     Ok(Applied { splitter: plan.splitter, start: plan.start })
 }
 
+/// The level of effort that is the template's default when the template
+/// does not know it: what Anthropic's API calls its default, and what OpenAI's
+/// clients send to ask for more than the usual.
+pub(crate) const DEFAULT_EFFORT: &str = "high";
+
+/// Whether the template refuses `effort` as a value of `reasoning_effort`.
+fn refuses(format: &ThinkingFormat, effort: &str) -> bool {
+    format.refused_efforts.iter().any(|refused| refused == effort)
+}
+
 /// What a request comes to once the template's thinking is known.
 #[derive(Debug)]
 struct Plan {
@@ -284,14 +294,31 @@ fn plan(
             asks_thinking = Some(false);
         }
         Some(effort) => {
-            if !thinking.is_some_and(|format| format.effort) {
+            let Some(format) = thinking.filter(|format| format.effort) else {
                 return Err(ApiError::invalid_param(
                     "reasoning_effort",
                     "reasoning_effort is not supported: the chat template of this model does \
                      not use it",
                 ));
+            };
+            match effort {
+                // A level the template does not know, which it would refuse:
+                // `high` is the template's default, as the Messages route
+                // takes Anthropic's `high` (Flash-Next's template knows
+                // `xhigh`, its default, `medium` and `low`).
+                DEFAULT_EFFORT if refuses(format, effort) => {}
+                _ if refuses(format, effort) => {
+                    return Err(ApiError::invalid_param(
+                        "reasoning_effort",
+                        format!(
+                            "reasoning_effort '{effort}' is refused by the chat template of this \
+                             model, which refuses {}",
+                            format.refused_efforts.join(", ")
+                        ),
+                    ));
+                }
+                _ => set("reasoning_effort", Json::String(effort.to_owned())),
             }
-            set("reasoning_effort", Json::String(effort.to_owned()));
         }
     }
     if let Some(on) = asks_thinking {

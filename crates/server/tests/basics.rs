@@ -33,6 +33,7 @@ fn synthetic(close: Option<&str>, queue: Option<u32>) -> Arc<Runtime> {
             prompt_off: format!("<think>{close}"),
             on_by_default: true,
             effort: false,
+            refused_efforts: Vec::new(),
         }),
         tools: None,
     });

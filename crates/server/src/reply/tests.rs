@@ -17,6 +17,7 @@ fn thinking() -> ThinkingFormat {
         prompt_off: "<think>\n\n</think>\n\n".into(),
         on_by_default: true,
         effort: true,
+        refused_efforts: Vec::new(),
     }
 }
 

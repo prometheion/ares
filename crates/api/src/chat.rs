@@ -92,6 +92,10 @@ pub struct ThinkingFormat {
     pub on_by_default: bool,
     /// Whether the template reads `reasoning_effort`.
     pub effort: bool,
+    /// The usual values of `reasoning_effort` (`minimal`, `low`, `medium`,
+    /// `high`, `xhigh`) that the template refuses, when it reads it.
+    #[serde(default)]
+    pub refused_efforts: Vec<String>,
 }
 
 impl ThinkingFormat {

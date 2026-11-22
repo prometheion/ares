@@ -57,6 +57,7 @@ fn served_ending(trigger: Option<&str>, close: Option<&str>, end: u8) -> Router 
             prompt_off: format!("<think>{close}"),
             on_by_default: true,
             effort: false,
+            refused_efforts: Vec::new(),
         }),
         tools: Some(ToolFormat {
             call_open: format!("{trigger} <function="),

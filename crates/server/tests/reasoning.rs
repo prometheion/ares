@@ -56,6 +56,7 @@ fn qwen() -> ThinkingFormat {
         prompt_off: "<think>\n\n</think>\n\n".into(),
         on_by_default: true,
         effort: true,
+        refused_efforts: Vec::new(),
     }
 }
 
@@ -325,4 +326,86 @@ async fn the_completions_endpoint_has_no_thinking_to_ask_for() {
     let body = json!({"model": "mock", "prompt": "Once"}).to_string();
     let (_, body) = json(post(&app, "/v1/completions", &body).await).await;
     assert_eq!(body["choices"][0]["text"], "Two and two.\n</think>\n\nThe answer is 4.");
+}
+
+/// An effort the template refuses: `high` is the template's default, as the
+/// Messages route takes Anthropic's `high` (Flash-Next's template knows
+/// `xhigh`, `medium` and `low`); another one is refused by name.
+#[tokio::test]
+async fn an_effort_the_template_refuses_is_its_default_for_high_and_refused_else() {
+    let flash = ThinkingFormat { refused_efforts: vec!["minimal".into(), "high".into()], ..qwen() };
+    let (engine, app) = serve(reply(), Some(flash.clone()), Config::default());
+    let (status, body) =
+        json(post(&app, CHAT, &chat(json!({"reasoning_effort": "high"}))).await).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let Prompt::Chat { variables, .. } = engine.submitted().remove(0).prompt else { panic!() };
+    assert!(variables.iter().all(|(name, _)| name != "reasoning_effort"), "{variables:?}");
+
+    let (engine, app) = serve(reply(), Some(flash), Config::default());
+    let (status, _) = json(post(&app, CHAT, &chat(json!({"reasoning_effort": "low"}))).await).await;
+    assert_eq!(status, StatusCode::OK);
+    let Prompt::Chat { variables, .. } = engine.submitted().remove(0).prompt else { panic!() };
+    assert!(variables.contains(&("reasoning_effort".to_owned(), Json::String("low".into()))));
+    let error = refused(&app, json!({"reasoning_effort": "minimal"})).await;
+    assert_eq!(error["param"], "reasoning_effort");
+    assert!(error["message"].as_str().unwrap().contains("refuses minimal, high"), "{error}");
+
+    // A template that takes `high` gets it.
+    let (engine, app) = serve(reply(), Some(qwen()), Config::default());
+    let (status, _) =
+        json(post(&app, CHAT, &chat(json!({"reasoning_effort": "high"}))).await).await;
+    assert_eq!(status, StatusCode::OK);
+    let Prompt::Chat { variables, .. } = engine.submitted().remove(0).prompt else { panic!() };
+    assert!(variables.contains(&("reasoning_effort".to_owned(), Json::String("high".into()))));
+}
+
+/// A system or developer message inside a conversation is a message of the
+/// user on the chat and Responses routes, as on the Messages route; the ones
+/// before every other message are one system message.
+#[tokio::test]
+async fn system_and_developer_messages_are_placed_as_on_the_messages_route() {
+    let (engine, app) = serve(reply(), Some(qwen()), Config::default());
+    let body = json!({"model": "mock", "messages": [
+        {"role": "system", "content": "Be brief."},
+        {"role": "developer", "content": "Answer in German."},
+        {"role": "user", "content": "2 + 2?"},
+        {"role": "assistant", "content": "4"},
+        {"role": "developer", "content": "Now in English."},
+        {"role": "user", "content": "3 + 3?"},
+    ]});
+    let (status, body) = json(post(&app, CHAT, &body.to_string()).await).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let Prompt::Chat { messages, .. } = engine.submitted().remove(0).prompt else { panic!() };
+    let turns: Vec<(&str, &str)> =
+        messages.iter().map(|m| (m.role.as_str(), m.content.as_str())).collect();
+    assert_eq!(
+        turns,
+        [
+            ("system", "Be brief.\n\nAnswer in German."),
+            ("user", "2 + 2?"),
+            ("assistant", "4"),
+            ("user", "Now in English."),
+            ("user", "3 + 3?"),
+        ]
+    );
+
+    let (engine, app) = serve(reply(), Some(qwen()), Config::default());
+    let body = json!({"model": "mock", "instructions": "Be brief.", "input": [
+        {"role": "developer", "content": "Answer in German."},
+        {"role": "user", "content": "2 + 2?"},
+        {"role": "system", "content": "Now in English."},
+    ]});
+    let (status, body) = json(post(&app, "/v1/responses", &body.to_string()).await).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let Prompt::Chat { messages, .. } = engine.submitted().remove(0).prompt else { panic!() };
+    let turns: Vec<(&str, &str)> =
+        messages.iter().map(|m| (m.role.as_str(), m.content.as_str())).collect();
+    assert_eq!(
+        turns,
+        [
+            ("system", "Be brief.\n\nAnswer in German."),
+            ("user", "2 + 2?"),
+            ("user", "Now in English.")
+        ]
+    );
 }

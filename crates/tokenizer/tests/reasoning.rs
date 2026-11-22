@@ -121,7 +121,12 @@ fn an_effort_the_template_refuses_does_not_hide_the_ones_it_takes() {
          {{- raise_exception('no such effort') }}{%- endif %}\
          {%- if reasoning_effort|default('xhigh') == 'low' %}",
     );
-    assert!(detect(&source).unwrap().effort);
+    let format = detect(&source).unwrap();
+    assert!(format.effort);
+    assert_eq!(format.refused_efforts, ["minimal", "high", "xhigh"]);
+    // A template that does not read the effort refuses none.
+    let deaf = QWEN_LIKE.replace("reasoning_effort|default('xhigh') == 'low'", "false");
+    assert_eq!(detect(&deaf).unwrap().refused_efforts, Vec::<String>::new());
 }
 
 #[test]
@@ -187,6 +192,7 @@ fn qwen_format() -> ReasoningFormat {
         prompt_off: "<think>\n\n</think>\n\n".into(),
         keeps_history: true,
         effort: true,
+        refused_efforts: Vec::new(),
     }
 }
 
@@ -203,7 +209,9 @@ fn the_template_of_qwen35_0_8b_has_the_same_tags_but_drops_the_thinking_of_earli
 #[test]
 fn the_template_of_qwen38_27b_declares_the_qwen_format() {
     let Some(tokenizer) = tokenizer_of("ARES_TEST_QWEN38_27B", "Qwen3.8-27B") else { return };
-    assert_eq!(tokenizer.reasoning_format(), Some(qwen_format()));
+    // It takes low, medium, high and xhigh.
+    let format = ReasoningFormat { refused_efforts: vec!["minimal".into()], ..qwen_format() };
+    assert_eq!(tokenizer.reasoning_format(), Some(format));
 }
 
 #[test]
@@ -211,5 +219,8 @@ fn the_template_of_qwen38_flash_next_declares_the_qwen_format() {
     let Some(tokenizer) = tokenizer_of("ARES_TEST_FLASH_NEXT", "Qwen3.8-Flash-Next") else {
         return;
     };
-    assert_eq!(tokenizer.reasoning_format(), Some(qwen_format()));
+    // It takes low, medium and xhigh, its default.
+    let refused_efforts = vec!["minimal".into(), "high".into()];
+    let format = ReasoningFormat { refused_efforts, ..qwen_format() };
+    assert_eq!(tokenizer.reasoning_format(), Some(format));
 }
