@@ -949,3 +949,115 @@ async fn a_count_generates_nothing_and_needs_an_engine_that_counts() {
 fn app_of(engine: Arc<MockEngine>) -> Router {
     ares_server::router(engine)
 }
+
+/// A conversation with thinking in two earlier turns and three calls of tools.
+fn long_conversation() -> Value {
+    let thinking =
+        |text: &str| json!({"type": "thinking", "thinking": text, "signature": "unsigned"});
+    let call = |id: &str, name: &str| json!({"type": "tool_use", "id": id, "name": name, "input": {"city": "Köln"}});
+    let result = |id: &str| json!({"type": "tool_result", "tool_use_id": id, "content": "rain, rain and more rain ".repeat(8)});
+    json!([
+        {"role": "user", "content": "How is the weather in Köln?"},
+        {"role": "assistant", "content": [thinking("I should look."), call("t1", "get_weather")]},
+        {"role": "user", "content": [result("t1")]},
+        {"role": "assistant", "content": [thinking("Look again."), call("t2", "now")]},
+        {"role": "user", "content": [result("t2")]},
+        {"role": "assistant", "content": [{"type": "text", "text": "Rain."}]},
+        {"role": "user", "content": "And tomorrow?"},
+        {"role": "assistant", "content": [thinking("Once more."), call("t3", "get_weather")]},
+        {"role": "user", "content": [result("t3")]},
+    ])
+}
+
+/// `context_management` is carried out before the engine reads the prompt,
+/// and the response says what it changed, whole and in the last delta of a
+/// stream; a count says the tokens before the edits.
+#[tokio::test]
+async fn context_edits_clear_thinking_and_results_and_the_response_says_so() {
+    let edits = json!({"edits": [
+        {"type": "clear_thinking_20251015", "keep": {"type": "thinking_turns", "value": 1}},
+        {"type": "clear_tool_uses_20250919", "trigger": {"type": "input_tokens", "value": 10},
+         "keep": {"type": "tool_uses", "value": 1}, "exclude_tools": ["now"]},
+    ]});
+    let extra = json!({"messages": long_conversation(), "context_management": edits});
+    let (engine, app) = serve(says("Dry.", 2, FinishReason::Stop));
+    let (status, message) = json(post(&app, MESSAGES, &body(extra.clone())).await).await;
+    assert_eq!(status, StatusCode::OK, "{message}");
+    let Prompt::Chat { messages, .. } = engine.submitted().remove(0).prompt else { panic!() };
+    // The thinking of the first turn is gone, the turn in progress keeps it.
+    let thoughts: Vec<_> = messages.iter().filter_map(|m| m.reasoning_content.clone()).collect();
+    assert_eq!(thoughts, ["Once more."]);
+    // The oldest result is cleared; `now` is excluded; the last call is kept.
+    let results: Vec<&str> =
+        messages.iter().filter(|m| m.role == Role::Tool).map(|m| m.content.as_str()).collect();
+    assert_eq!(results.len(), 3);
+    assert!(results[0].contains("cleared"), "{results:?}");
+    let rain = "rain, rain and more rain ".repeat(8);
+    assert_eq!(results[1..], [rain.as_str(), rain.as_str()]);
+    let applied = message["context_management"]["applied_edits"].as_array().unwrap().clone();
+    assert_eq!(applied.len(), 2, "{message}");
+    assert_eq!(applied[0]["type"], "clear_thinking_20251015");
+    assert_eq!(applied[0]["cleared_thinking_turns"], 1);
+    assert!(applied[0]["cleared_input_tokens"].as_u64().unwrap() > 0);
+    assert_eq!(applied[1]["type"], "clear_tool_uses_20250919");
+    assert_eq!(applied[1]["cleared_tool_uses"], 1);
+    assert!(applied[1]["cleared_input_tokens"].as_u64().unwrap() > 0);
+
+    // The same in the last delta of a stream.
+    let mut streaming = extra.clone();
+    streaming["stream"] = json!(true);
+    let events = streamed(says("Dry.", 2, FinishReason::Stop), streaming).await;
+    let (name, delta) = &events[events.len() - 2];
+    assert_eq!(name, "message_delta");
+    assert_eq!(delta["context_management"]["applied_edits"], json!(applied));
+
+    // A count says the tokens before the edits too.
+    let (status, counted) = json(post(&app, COUNT, &body(extra)).await).await;
+    assert_eq!(status, StatusCode::OK, "{counted}");
+    let (input, original) = (
+        counted["input_tokens"].as_u64().unwrap(),
+        counted["context_management"]["original_input_tokens"].as_u64().unwrap(),
+    );
+    let cleared: u64 = applied.iter().map(|e| e["cleared_input_tokens"].as_u64().unwrap()).sum();
+    assert_eq!(original - input, cleared);
+
+    // An edit that would clear less than it must is not applied, and the
+    // response says that nothing was.
+    let edits = json!({"edits": [{"type": "clear_tool_uses_20250919",
+        "trigger": {"type": "input_tokens", "value": 10},
+        "clear_at_least": {"type": "input_tokens", "value": 1000000}}]});
+    let extra = json!({"messages": long_conversation(), "context_management": edits});
+    let message = whole(says("Dry.", 2, FinishReason::Stop), extra).await;
+    assert_eq!(message["context_management"], json!({"applied_edits": []}));
+    // Without context_management the member is not there.
+    let message = whole(says("Dry.", 2, FinishReason::Stop), json!({})).await;
+    assert!(message.get("context_management").is_none());
+}
+
+/// `thinking.display: "omitted"`: the thinking block has no text, its
+/// signature carries the thinking, and the block sent back is the reasoning
+/// of its turn in the next prompt.
+#[tokio::test]
+async fn omitted_thinking_comes_back_through_its_signature() {
+    let reply = format!("{THINKS}It rains.");
+    let omitted = json!({"thinking": {"type": "adaptive", "display": "omitted"}});
+    let message = whole(says(&reply, 3, FinishReason::Stop), omitted.clone()).await;
+    let block = &message["content"][0];
+    assert_eq!(block["type"], "thinking");
+    assert_eq!(block["thinking"], "");
+    assert!(block["signature"].as_str().unwrap().starts_with("ares-reasoning:"), "{block}");
+    // A stream has no thinking delta, and the same signature.
+    let mut streaming = omitted.clone();
+    streaming["stream"] = json!(true);
+    let events = streamed(says(&reply, 3, FinishReason::Stop), streaming).await;
+    assert!(!events.iter().any(|(_, data)| data["delta"]["type"] == "thinking_delta"));
+    assert_eq!(assemble(&events)["content"][0]["signature"], block["signature"]);
+
+    let back = json!({"messages": [
+        {"role": "user", "content": "How is the weather in Köln?"},
+        {"role": "assistant", "content": message["content"]},
+        {"role": "user", "content": "And tomorrow?"},
+    ]});
+    let Prompt::Chat { messages, .. } = submitted(back).await.prompt else { panic!() };
+    assert_eq!(messages[1].reasoning_content.as_deref(), Some("The user asks for the weather."));
+}

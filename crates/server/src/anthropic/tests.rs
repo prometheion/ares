@@ -1,8 +1,9 @@
 use ares_api::{Json, Usage};
 use serde_json::{Value, json};
 
+use super::edits::{Edit, Keep, ToolUses, Trigger, Turns};
 use super::reply::{Block, BlockEvent, Blocks, Content, Head, SIGNATURE, block_event, stop_reason};
-use super::request::{Purpose, to_chat};
+use super::request::{Asked, Purpose, to_chat};
 use crate::reasoning::Split;
 use crate::reply::Piece;
 
@@ -12,8 +13,12 @@ fn read(body: Value) -> Json {
 
 /// The chat body a Messages body comes to.
 fn chat(body: Value) -> Value {
-    let chat = to_chat(&read(body), Purpose::Reply).unwrap_or_else(|e| panic!("{}", e.message));
-    serde_json::to_value(chat).unwrap()
+    serde_json::to_value(asked(body).0).unwrap()
+}
+
+/// The chat body and what else a Messages body asks for.
+fn asked(body: Value) -> (Json, Asked) {
+    to_chat(&read(body), Purpose::Reply).unwrap_or_else(|e| panic!("{}", e.message))
 }
 
 fn with(extra: Value) -> Value {
@@ -257,10 +262,11 @@ fn a_turn_of_the_system_joins_the_system_prompt_or_is_read_as_a_turn_of_the_user
     );
 }
 
-/// `clear_thinking_20251015` leaves the thinking of older turns out; Claude
-/// Code sends it with `keep: "all"`, which leaves everything in.
+/// The edits of `context_management` are read with Anthropic's defaults and
+/// carried out once the model is known (the `edits` module); the chat body
+/// keeps every thinking, and the turns are counted as Anthropic counts them.
 #[test]
-fn clearing_thinking_keeps_the_thinking_of_the_last_turns_it_names() {
+fn context_edits_are_read_with_anthropics_defaults_and_the_turns_counted() {
     let turn = |n: u32| {
         json!({"role": "assistant", "content": [
             {"type": "thinking", "thinking": format!("thought {n}"), "signature": SIGNATURE},
@@ -268,46 +274,72 @@ fn clearing_thinking_keeps_the_thinking_of_the_last_turns_it_names() {
         ]})
     };
     let question = json!({"role": "user", "content": "go on"});
+    let results = json!({"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": "t", "content": "r"}]});
     let messages = json!([
-        question, turn(1), question, {"role": "assistant", "content": "plain"},
-        question, turn(2), question, turn(3), question,
+        question, turn(1), results, turn(2), question, {"role": "assistant", "content": "plain"},
+        question,
     ]);
-    let kept = |management: Value| {
+    let edits = |management: Value| {
         let mut body = with(json!({"messages": messages}));
         if !management.is_null() {
             body["context_management"] = management;
         }
-        let got = chat(body);
-        let thoughts: Vec<String> = got["messages"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter_map(|m| m["reasoning_content"].as_str().map(str::to_owned))
-            .collect();
-        // The answers stay whatever happens to the thinking.
-        let answers = got["messages"].as_array().unwrap().iter().filter(|m| {
-            m["role"] == "assistant" && m["content"].as_str().is_some_and(|c| !c.is_empty())
-        });
-        assert_eq!(answers.count(), 4);
-        thoughts
+        let (chat, asked) = asked(body);
+        let chat = serde_json::to_value(chat).unwrap();
+        let thoughts = chat["messages"].as_array().unwrap().iter();
+        assert_eq!(thoughts.filter(|m| m["reasoning_content"].is_string()).count(), 2);
+        assert_eq!(asked.turns, Turns { of_assistant: vec![0, 0, 1], current: 2 });
+        asked.edits
     };
-    let edit = |keep: Value| {
+    assert_eq!(edits(Value::Null), None);
+    assert_eq!(edits(json!({"edits": []})), Some(vec![]));
+    let thinking = |keep: Value| {
         let mut edit = json!({"type": "clear_thinking_20251015"});
         if !keep.is_null() {
             edit["keep"] = keep;
         }
-        json!({"edits": [edit]})
+        edits(json!({"edits": [edit]})).unwrap()
     };
-    let all = ["thought 1", "thought 2", "thought 3"];
-    assert_eq!(kept(Value::Null), all);
-    assert_eq!(kept(json!({"edits": []})), all);
-    assert_eq!(kept(edit(json!("all"))), all);
-    assert_eq!(kept(edit(Value::Null)), ["thought 3"]);
+    assert_eq!(thinking(json!("all")), [Edit::ClearThinking { keep: Keep::All }]);
+    assert_eq!(thinking(Value::Null), [Edit::ClearThinking { keep: Keep::Turns(1) }]);
     assert_eq!(
-        kept(edit(json!({"type": "thinking_turns", "value": 2}))),
-        ["thought 2", "thought 3"]
+        thinking(json!({"type": "thinking_turns", "value": 2})),
+        [Edit::ClearThinking { keep: Keep::Turns(2) }]
     );
-    assert_eq!(kept(edit(json!({"type": "thinking_turns", "value": 9}))), all);
+    assert_eq!(
+        edits(json!({"edits": [{"type": "clear_tool_uses_20250919"}]})).unwrap(),
+        [Edit::ClearToolUses(ToolUses::default())]
+    );
+    let full = json!({"edits": [
+        {"type": "clear_thinking_20251015", "keep": "all"},
+        {"type": "clear_tool_uses_20250919", "trigger": {"type": "tool_uses", "value": 5},
+         "keep": {"type": "tool_uses", "value": 1}, "clear_at_least": {"type": "input_tokens",
+         "value": 500}, "exclude_tools": ["web_search"], "clear_tool_inputs": true},
+    ]});
+    assert_eq!(
+        edits(full).unwrap()[1],
+        Edit::ClearToolUses(ToolUses {
+            trigger: Trigger::ToolUses(5),
+            keep: 1,
+            clear_at_least: Some(500),
+            exclude: vec!["web_search".into()],
+            clear_inputs: true,
+        })
+    );
+    // Anthropic asks for the thinking edit first; values are checked.
+    let late = with(json!({"context_management": {"edits": [
+        {"type": "clear_tool_uses_20250919"}, {"type": "clear_thinking_20251015"}]}}));
+    assert!(refused(late).1.contains("first"));
+    for bad in [
+        json!({"type": "clear_tool_uses_20250919", "trigger": {"type": "turns", "value": 1}}),
+        json!({"type": "clear_tool_uses_20250919", "keep": {"type": "input_tokens", "value": 1}}),
+        json!({"type": "clear_tool_uses_20250919", "exclude_tools": "web_search"}),
+        json!({"type": "clear_thinking_20251015", "keep": {"type": "thinking_turns", "value": 0}}),
+        json!({"type": "compact_20260112"}),
+    ] {
+        refused(with(json!({"context_management": {"edits": [bad]}})));
+    }
 }
 
 #[test]
@@ -395,7 +427,7 @@ fn output_config_is_the_schema_and_the_effort_of_the_chat_body() {
 fn a_count_needs_no_limit_and_has_no_stream() {
     let body =
         json!({"model": "m", "messages": [{"role": "user", "content": "hi"}], "stream": true});
-    let counted = to_chat(&read(body.clone()), Purpose::Count).unwrap();
+    let counted = to_chat(&read(body.clone()), Purpose::Count).unwrap().0;
     assert_eq!(
         serde_json::to_value(counted).unwrap(),
         json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]})
@@ -486,10 +518,10 @@ fn what_is_not_served_is_refused_by_its_name() {
         // Members nobody knows, anywhere.
         (
             with(json!({"context_management": {"edits": [
-                {"type": "clear_tool_uses_20250919", "trigger": {"type": "input_tokens", "value": 30000}},
+                {"type": "clear_tool_results_20990101"},
             ]}})),
             "context_management.edits[0]",
-            "'clear_tool_uses_20250919' is not supported",
+            "'clear_tool_results_20990101' is not supported",
         ),
         (
             with(json!({"context_management": {"edits": [
@@ -639,7 +671,7 @@ fn a_reply_is_its_blocks_in_the_order_the_model_wrote_them() {
     assert_eq!(
         content.0,
         vec![
-            Block::Thinking("The user wants weather.".into()),
+            Block::Thinking("The user wants weather.".into(), SIGNATURE.into()),
             Block::Text("I will look.".into()),
             weather,
             Block::ToolUse { id: "toolu_x_1".into(), name: "now".into(), input: "{}".into() },
@@ -692,9 +724,9 @@ fn a_reply_without_text_has_no_blocks_and_thinking_may_come_again() {
     assert_eq!(
         content.0,
         vec![
-            Block::Thinking("a".into()),
+            Block::Thinking("a".into(), SIGNATURE.into()),
             Block::ToolUse { id: "toolu_x_0".into(), name: "now".into(), input: String::new() },
-            Block::Thinking("b".into()),
+            Block::Thinking("b".into(), SIGNATURE.into()),
             Block::Text("c".into()),
         ]
     );
@@ -709,7 +741,7 @@ fn the_message_has_the_blocks_the_reason_and_the_usage() {
         call(1, "cut"),
         arguments(1, "{\"city\":\"Kö"),
     ]]);
-    let head = Head { id: "msg_1".into(), model: "m".into() };
+    let head = Head { id: "msg_1".into(), model: "m".into(), edits: None };
     let usage = Usage {
         prompt_tokens: 100,
         completion_tokens: 7,
@@ -761,7 +793,7 @@ fn a_reply_sent_back_is_the_turn_the_chat_route_would_get_back() {
         call(0, "add"),
         arguments(0, "{\"a\":2,\"b\":2}"),
     ]]);
-    let head = Head { id: "msg_1".into(), model: "m".into() };
+    let head = Head { id: "msg_1".into(), model: "m".into(), edits: None };
     let message: Value =
         serde_json::from_str(&head.message(&content, "tool_use", None, Usage::default())).unwrap();
     let body = with(json!({"messages": [
@@ -782,4 +814,114 @@ fn a_reply_sent_back_is_the_turn_the_chat_route_would_get_back() {
             {"role": "tool", "tool_call_id": "toolu_x_0", "content": "4"},
         ])
     );
+}
+
+/// `thinking.display: "omitted"`: the block has an empty text and its
+/// signature carries the thinking, which comes back into the prompt when the
+/// block is sent back as it came.
+#[test]
+fn omitted_thinking_is_carried_by_the_signature_and_comes_back() {
+    let reasoning = "Größe: 2 + 2 = 4 🙂\nso the answer is 4.";
+    let mut blocks = Blocks::new(true);
+    let mut events = blocks.push(vec![Piece::Text(Split {
+        reasoning: reasoning[..10].to_owned(),
+        content: String::new(),
+    })]);
+    events.extend(blocks.push(vec![Piece::Text(Split {
+        reasoning: reasoning[10..].to_owned(),
+        content: "4".to_owned(),
+    })]));
+    events.extend(blocks.finish());
+    assert!(!events.iter().any(|e| matches!(e, BlockEvent::ThinkingDelta { .. })), "{events:?}");
+    let mut content = Content::default();
+    content.take(events.clone());
+    let Block::Thinking(text, signature) = &content.0[0] else { panic!("{content:?}") };
+    assert_eq!(text, "");
+    assert!(signature.starts_with(super::reply::CARRIED), "{signature}");
+    // The stream says the same: an empty start and the signature.
+    let written: Vec<_> = events.iter().map(block_event).collect();
+    assert!(written[0].1.contains(r#""thinking":"""#), "{written:?}");
+    assert!(written.iter().any(|(_, data)| data.contains(signature.as_str())));
+
+    // Sent back as it came, the block is the reasoning of its message.
+    let back = with(json!({"messages": [
+        {"role": "user", "content": "2+2?"},
+        {"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "", "signature": signature},
+            {"type": "text", "text": "4"},
+        ]},
+        {"role": "user", "content": "and 3+3?"},
+    ]}));
+    assert_eq!(chat(back)["messages"][1]["reasoning_content"], reasoning);
+    // A text that is there wins; a carried signature that is not base64 is refused.
+    let edited = with(json!({"messages": [
+        {"role": "user", "content": "2+2?"},
+        {"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "mine", "signature": signature},
+        ]},
+        {"role": "user", "content": "go on"},
+    ]}));
+    assert_eq!(chat(edited)["messages"][1]["reasoning_content"], "mine");
+    let broken = with(json!({"messages": [
+        {"role": "user", "content": "2+2?"},
+        {"role": "assistant", "content": [
+            {"type": "thinking", "thinking": "", "signature": "ares-reasoning:***"},
+        ]},
+        {"role": "user", "content": "go on"},
+    ]}));
+    assert!(refused(broken).0.ends_with(".signature"));
+    // Shown thinking keeps the fixed signature.
+    let mut shown = Blocks::default();
+    let mut events =
+        shown.push(vec![Piece::Text(Split { reasoning: "r".into(), content: "a".into() })]);
+    events.extend(shown.finish());
+    assert!(events.contains(&BlockEvent::Signature { index: 0, signature: SIGNATURE.into() }));
+    assert!(
+        asked(with(json!({"thinking": {"type": "adaptive", "display": "omitted"}})))
+            .1
+            .omit_thinking
+    );
+    assert!(
+        !asked(with(json!({"thinking": {"type": "adaptive", "display": "summarized"}})))
+            .1
+            .omit_thinking
+    );
+}
+
+/// The edits that were applied are in the message and in the last
+/// `message_delta` of a stream, for a request that asked for edits.
+#[test]
+fn applied_edits_are_in_the_message_and_the_last_delta() {
+    use super::edits::Applied;
+    let applied = vec![Applied::Thinking { turns: 2, tokens: 40 }];
+    let head = Head { id: "msg_1".into(), model: "m".into(), edits: Some(applied) };
+    let message: Value = serde_json::from_str(&head.message(
+        &Content::default(),
+        "end_turn",
+        None,
+        Usage::default(),
+    ))
+    .unwrap();
+    let expected = json!({"applied_edits": [{"type": "clear_thinking_20251015",
+        "cleared_thinking_turns": 2, "cleared_input_tokens": 40}]});
+    assert_eq!(message["context_management"], expected);
+    let [delta, stop] = head.message_end("end_turn", None, Usage::default());
+    let delta: Value = serde_json::from_str(&delta.1).unwrap();
+    assert_eq!(delta["type"], "message_delta");
+    assert_eq!(delta["context_management"], expected);
+    assert_eq!(stop.0, "message_stop");
+    // None asked: no member; asked and nothing applied: an empty list.
+    let plain = Head { edits: None, ..head.clone() };
+    let message: Value = serde_json::from_str(&plain.message(
+        &Content::default(),
+        "end_turn",
+        None,
+        Usage::default(),
+    ))
+    .unwrap();
+    assert!(message.get("context_management").is_none());
+    let [delta, _] =
+        Head { edits: Some(vec![]), ..head }.message_end("end_turn", None, Usage::default());
+    let delta: Value = serde_json::from_str(&delta.1).unwrap();
+    assert_eq!(delta["context_management"], json!({"applied_edits": []}));
 }

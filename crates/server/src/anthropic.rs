@@ -19,10 +19,10 @@
 //! | `messages` | `user`, `assistant` and `system` turns, a string or blocks; see below |
 //! | `tools` | `name`, `description`, `input_schema`: the tools of the chat request |
 //! | `tool_choice` | `auto`, `any` (a call is required), `tool` (that tool), `none`; `disable_parallel_tool_use` allows one call |
-//! | `thinking` | `enabled` and `adaptive` switch thinking on, `disabled` off; without it the server's setting holds; `display` is accepted and the thinking comes back whole |
+//! | `thinking` | `enabled` and `adaptive` switch thinking on, `disabled` off; without it the server's setting holds; `display: "omitted"` gives the thinking blocks an empty text and a signature that carries it, `summarized` and `updates` the thinking whole |
 //! | `stop_sequences` | the stop strings |
 //! | `output_config` | `format` with a JSON schema is the `response_format` of the chat route, `effort` its `reasoning_effort` (`high`, Anthropic's default, is the template's default) |
-//! | `context_management` | the edit `clear_thinking_20251015`: the thinking of older turns is left out of the prompt |
+//! | `context_management` | the edits `clear_thinking_20251015` and `clear_tool_uses_20250919`, carried out as Anthropic's service does (the [`edits`] module); the response lists what they cleared in `context_management.applied_edits` |
 //! | `metadata`, `service_tier` | bookkeeping: accepted, without effect |
 //! | `cache_control`, on the body and on blocks and tools | accepted, without effect: see below |
 //!
@@ -36,7 +36,7 @@
 //! `tool_use`. The text blocks of one message are joined with a line break.
 //! A system turn (a string or text blocks) before every other turn joins the
 //! system prompt; one between other turns is given to the chat template as a
-//! user turn with its text, since the templates of Qwen refuse a system
+//! user turn with its text (the rule of every route), since the templates of Qwen refuse a system
 //! message anywhere but first (Claude Code sends its environment after the
 //! first question that way, and the tokens it has left as the last turn).
 //!
@@ -44,9 +44,8 @@
 //! blocks (input other than text is not built), tools of a `type` that
 //! Anthropic's service defines or runs (`web_search_...`, `bash_...` and the
 //! like) and the blocks they leave in a history, `defer_loading`,
-//! `mcp_servers`, `container`, the edits of `context_management` that cut
-//! results of tools (`clear_tool_uses_20250919`), citations, and every member
-//! this module does not know. A last message of the assistant is a
+//! `mcp_servers`, `container`, other edits of `context_management`
+//! (compaction), citations, and every member this module does not know. A last message of the assistant is a
 //! prefill, and the reply continues it (`continue_final_message` of the chat
 //! body).
 //!
@@ -62,6 +61,13 @@
 //!
 //! **Signatures.** A thinking block of a reply carries the signature
 //! [`reply::SIGNATURE`], a fixed text: the server has no secret to sign with.
+//! With `thinking.display: "omitted"` the block's text is empty and its
+//! signature is [`reply::CARRIED`] and the thinking in base64, which is what
+//! Anthropic's API does (an empty `thinking` and a signature that carries
+//! the thinking it does not show, so that the block sent back continues the
+//! conversation): a block that comes back with an empty text and such a
+//! signature is the reasoning of its turn, so the next prompt is the one a
+//! client that shows the thinking sends, and the prefix cache continues.
 //! A thinking block that comes back in a history is the reasoning of its
 //! message whatever its signature says, also without one, and several blocks
 //! of one message are joined with a line break. A reply's thinking that comes
@@ -107,6 +113,8 @@
 //! are not looked at: the server has one version of the API, and serves a
 //! field of a beta or refuses it by its name in the body.
 
+mod base64;
+mod edits;
 mod reply;
 mod request;
 #[cfg(test)]
@@ -122,7 +130,7 @@ use axum::http::HeaderValue;
 use axum::response::sse::{Event as SseEvent, KeepAlive};
 use axum::response::{IntoResponse, Response};
 
-use self::reply::{Blocks, Content, Head, Written, block_event, message_end, stop_reason};
+use self::reply::{Blocks, Content, Head, Written, block_event, stop_reason};
 use self::request::Purpose;
 use crate::ReasoningFormat;
 use crate::error::{Anthropic, ApiError};
@@ -168,22 +176,43 @@ async fn read(
     priority: Option<&HeaderValue>,
     id: RequestId,
     purpose: Purpose,
-) -> Result<(Parsed, Sorter, Lease), ApiError> {
-    let chat = request::to_chat(&wire::read_json(body)?, purpose)?;
+) -> Result<Read, ApiError> {
+    let (chat, asked) = request::to_chat(&wire::read_json(body)?, purpose)?;
     let mut parsed = wire::from_json(Endpoint::Chat, &chat, id).map_err(request::renamed)?;
     parsed.take_priority(priority)?;
     let (sorter, lease) = routes::prepare(app, &mut parsed, Some(ReasoningFormat::Auto))
         .await
         .map_err(request::renamed)?;
-    Ok((parsed, sorter.with_call_ids(format!("toolu_{id}_")), lease))
+    let edits = match &asked.edits {
+        Some(edits) => Some(edits::apply(edits, &asked.turns, &mut parsed, &lease).await?),
+        None => None,
+    };
+    let sorter = sorter.with_call_ids(format!("toolu_{id}_"));
+    Ok(Read { parsed, sorter, lease, omit_thinking: asked.omit_thinking, edits })
+}
+
+/// A request as [`read`] reads it.
+struct Read {
+    parsed: Parsed,
+    sorter: Sorter,
+    lease: Lease,
+    omit_thinking: bool,
+    /// What the edits of `context_management` did, for a request that has
+    /// the member.
+    edits: Option<edits::Outcome>,
 }
 
 async fn try_messages(app: App, request: Request) -> Result<Response, ApiError> {
     let priority = request.headers().get(wire::PRIORITY_HEADER).cloned();
     let body = read_body(request, &app.config).await?;
     let id = next_request_id();
-    let (parsed, sorter, lease) = read(&app, &body, priority.as_ref(), id, Purpose::Reply).await?;
-    let head = Head { id: format!("msg_{id}"), model: parsed.request.model.clone() };
+    let Read { parsed, sorter, lease, omit_thinking, edits } =
+        read(&app, &body, priority.as_ref(), id, Purpose::Reply).await?;
+    let head = Head {
+        id: format!("msg_{id}"),
+        model: parsed.request.model.clone(),
+        edits: edits.map(|outcome| outcome.applied),
+    };
     tracing::info!(
         %id,
         model = %parsed.request.model,
@@ -194,10 +223,11 @@ async fn try_messages(app: App, request: Request) -> Result<Response, ApiError> 
         "request"
     );
     let reply = Reply::start(&app, &lease, parsed.request, sorter)?;
+    let blocks = Blocks::new(omit_thinking);
     let response = if parsed.stream {
-        stream(reply, head, app.config.stream_wait).await
+        stream(reply, head, blocks, app.config.stream_wait).await
     } else {
-        whole(reply, head).await
+        whole(reply, head, blocks).await
     };
     Ok(with_limit(response?, parsed.lowered))
 }
@@ -207,14 +237,21 @@ async fn try_messages(app: App, request: Request) -> Result<Response, ApiError> 
 /// it would have been given.
 async fn try_count(app: App, request: Request) -> Result<Response, ApiError> {
     let body = read_body(request, &app.config).await?;
-    let (parsed, _, lease) = read(&app, &body, None, next_request_id(), Purpose::Count).await?;
+    let Read { parsed, lease, edits, .. } =
+        read(&app, &body, None, next_request_id(), Purpose::Count).await?;
     let tokens = routes::count_prompt(&lease, parsed.request).await?;
-    Ok(json_response(format!(r#"{{"input_tokens":{tokens}}}"#)))
+    // With edits, the tokens before them too, as Anthropic counts them.
+    Ok(json_response(match edits {
+        Some(outcome) => format!(
+            r#"{{"input_tokens":{tokens},"context_management":{{"original_input_tokens":{}}}}}"#,
+            outcome.original_tokens.unwrap_or(tokens)
+        ),
+        None => format!(r#"{{"input_tokens":{tokens}}}"#),
+    }))
 }
 
 /// The answer that is not streamed: the events of the blocks, put together.
-async fn whole(mut reply: Reply, head: Head) -> Result<Response, ApiError> {
-    let mut blocks = Blocks::default();
+async fn whole(mut reply: Reply, head: Head, mut blocks: Blocks) -> Result<Response, ApiError> {
     let mut content = Content::default();
     loop {
         match reply.next().await? {
@@ -239,12 +276,18 @@ async fn whole(mut reply: Reply, head: Head) -> Result<Response, ApiError> {
 /// when `wait` has passed without it (`Reply::first`): then `message_start`
 /// and the pings go out while the prompt is computed. A failure after the
 /// start is an `error` event, and the stream ends without `message_stop`.
-async fn stream(mut reply: Reply, head: Head, wait: Duration) -> Result<Response, ApiError> {
+async fn stream(
+    mut reply: Reply,
+    head: Head,
+    blocks: Blocks,
+    wait: Duration,
+) -> Result<Response, ApiError> {
     let first = reply.first(wait).await?;
     let state = Events {
         reply,
-        blocks: Blocks::default(),
+        blocks,
         queue: VecDeque::from([head.message_start()]),
+        head,
         next: first,
         over: false,
     };
@@ -261,6 +304,7 @@ async fn stream(mut reply: Reply, head: Head, wait: Duration) -> Result<Response
 struct Events {
     reply: Reply,
     blocks: Blocks,
+    head: Head,
     /// Events that are ready and have not gone out.
     queue: VecDeque<Written>,
     /// A step of the reply that has come and is not written yet.
@@ -295,7 +339,7 @@ impl Events {
                     events.extend(self.blocks.finish());
                     self.queue.extend(events.iter().map(block_event));
                     let reason = stop_reason(finish, self.blocks.calls(), stop.as_deref());
-                    self.queue.extend(message_end(reason, stop.as_deref(), usage));
+                    self.queue.extend(self.head.message_end(reason, stop.as_deref(), usage));
                     self.over = true;
                 }
                 Err(error) => {

@@ -13,7 +13,8 @@ use serde::Serialize;
 
 use crate::reply::Piece;
 
-/// What every thinking block of a reply carries as its signature.
+/// What every thinking block of a reply carries as its signature, unless the
+/// request asked for the thinking to be omitted.
 ///
 /// Anthropic signs a thinking block so that it can tell its own thinking when
 /// a client sends it back. This server has no secret to sign with and no use
@@ -21,6 +22,22 @@ use crate::reply::Piece;
 /// wrote it. So the signature says that there is none, in a text that is not
 /// empty, because a client may drop a block whose signature is missing.
 pub(crate) const SIGNATURE: &str = "unsigned";
+
+/// What begins the signature of a thinking block whose text is omitted
+/// (`thinking.display: "omitted"`): the reasoning follows in base64, so that
+/// the block that comes back with an empty text still writes the reasoning
+/// into the next prompt, as Anthropic's signature carries the thinking it
+/// does not show.
+pub(crate) const CARRIED: &str = "ares-reasoning:";
+
+/// The signature of a thinking block whose text is omitted: [`CARRIED`] and
+/// `reasoning` in base64.
+pub(crate) fn carried(reasoning: &str) -> String {
+    let mut signature = String::with_capacity(CARRIED.len() + reasoning.len().div_ceil(3) * 4);
+    signature.push_str(CARRIED);
+    super::base64::encode(reasoning.as_bytes(), &mut signature);
+    signature
+}
 
 /// An event of the blocks of a reply.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,6 +69,7 @@ pub(crate) enum BlockEvent {
     /// The signature of a thinking block, before it closes.
     Signature {
         index: usize,
+        signature: String,
     },
     Stop {
         index: usize,
@@ -74,9 +92,20 @@ pub(crate) struct Blocks {
     begun: usize,
     /// The block of each call of the reply.
     calls: Vec<usize>,
+    /// The thinking is omitted: its blocks have no text, and their signature
+    /// carries it ([`carried`]).
+    omit: bool,
+    /// The text of the open thinking block, while it is omitted.
+    held: String,
 }
 
 impl Blocks {
+    /// The blocks of a reply whose thinking is shown, or with `omit`, whose
+    /// thinking blocks have an empty text and carry it in their signature.
+    pub fn new(omit: bool) -> Self {
+        Self { omit, ..Self::default() }
+    }
+
     /// The events of the next pieces.
     pub fn push(&mut self, pieces: Vec<Piece>) -> Vec<BlockEvent> {
         let mut events = Vec::new();
@@ -85,7 +114,11 @@ impl Blocks {
                 Piece::Text(split) => {
                     if !split.reasoning.is_empty() {
                         let index = self.open(Kind::Thinking, &mut events);
-                        events.push(BlockEvent::ThinkingDelta { index, text: split.reasoning });
+                        if self.omit {
+                            self.held.push_str(&split.reasoning);
+                        } else {
+                            events.push(BlockEvent::ThinkingDelta { index, text: split.reasoning });
+                        }
                     }
                     if !split.content.is_empty() {
                         let index = self.open(Kind::Text, &mut events);
@@ -148,7 +181,12 @@ impl Blocks {
         };
         let index = self.begun - 1;
         if kind == Kind::Thinking {
-            events.push(BlockEvent::Signature { index });
+            let signature = if self.omit {
+                carried(&std::mem::take(&mut self.held))
+            } else {
+                SIGNATURE.to_owned()
+            };
+            events.push(BlockEvent::Signature { index, signature });
         }
         events.push(BlockEvent::Stop { index });
     }
@@ -157,7 +195,8 @@ impl Blocks {
 /// A block of content of a message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Block {
-    Thinking(String),
+    /// The text and the signature of a thinking block.
+    Thinking(String, String),
     Text(String),
     /// A call of a tool; `input` is the JSON text of its arguments as far as
     /// the model wrote it.
@@ -176,14 +215,21 @@ impl Content {
     pub fn take(&mut self, events: Vec<BlockEvent>) {
         for event in events {
             match event {
-                BlockEvent::Thinking { .. } => self.0.push(Block::Thinking(String::new())),
+                BlockEvent::Thinking { .. } => {
+                    self.0.push(Block::Thinking(String::new(), String::new()));
+                }
                 BlockEvent::Text { .. } => self.0.push(Block::Text(String::new())),
                 BlockEvent::ToolUse { id, name, .. } => {
                     self.0.push(Block::ToolUse { id, name, input: String::new() });
                 }
                 BlockEvent::ThinkingDelta { index, text: more } => {
-                    if let Some(Block::Thinking(text)) = self.0.get_mut(index) {
+                    if let Some(Block::Thinking(text, _)) = self.0.get_mut(index) {
                         text.push_str(&more);
+                    }
+                }
+                BlockEvent::Signature { index, signature: more } => {
+                    if let Some(Block::Thinking(_, signature)) = self.0.get_mut(index) {
+                        *signature = more;
                     }
                 }
                 BlockEvent::TextDelta { index, text: more } => {
@@ -196,7 +242,7 @@ impl Content {
                         input.push_str(&json);
                     }
                 }
-                BlockEvent::Signature { .. } | BlockEvent::Stop { .. } => {}
+                BlockEvent::Stop { .. } => {}
             }
         }
     }
@@ -220,6 +266,10 @@ pub(crate) fn stop_reason(finish: &str, calls: usize, stop: Option<&str>) -> &'s
 pub(crate) struct Head {
     pub id: String,
     pub model: String,
+    /// The edits of `context_management` that changed the prompt, for a
+    /// request that asked for edits: the message and the last
+    /// `message_delta` of a stream list them (`applied_edits`).
+    pub edits: Option<Vec<super::edits::Applied>>,
 }
 
 /// The token counts of a reply.
@@ -288,10 +338,10 @@ impl Head {
             .0
             .iter()
             .map(|block| match block {
-                Block::Thinking(text) => format!(
+                Block::Thinking(text, signature) => format!(
                     r#"{{"type":"thinking","thinking":{},"signature":{}}}"#,
                     quoted(text),
-                    quoted(SIGNATURE)
+                    quoted(signature)
                 ),
                 Block::Text(text) => format!(r#"{{"type":"text","text":{}}}"#, quoted(text)),
                 Block::ToolUse { id, name, input } => format!(
@@ -303,14 +353,39 @@ impl Head {
             })
             .collect();
         format!(
-            r#"{{"id":{},"type":"message","role":"assistant","model":{},"content":[{}],"stop_reason":{},"stop_sequence":{},"usage":{}}}"#,
+            r#"{{"id":{},"type":"message","role":"assistant","model":{},"content":[{}],"stop_reason":{},"stop_sequence":{},"usage":{}{}}}"#,
             quoted(&self.id),
             quoted(&self.model),
             blocks.join(","),
             quoted(stop_reason),
             stop_sequence(stop_reason, stop),
-            to_json(&UsageBody::from(usage))
+            to_json(&UsageBody::from(usage)),
+            self.context_management()
         )
+    }
+
+    /// `,"context_management":{...}` for a request that asked for edits.
+    fn context_management(&self) -> String {
+        match &self.edits {
+            Some(applied) => {
+                format!(r#","context_management":{}"#, super::edits::response_member(applied))
+            }
+            None => String::new(),
+        }
+    }
+
+    /// The two events that end a stream: why the reply ended and what it
+    /// cost (and the edits that were applied, for a request that asked for
+    /// edits), and the end of the message.
+    pub fn message_end(&self, stop_reason: &str, stop: Option<&str>, usage: Usage) -> [Written; 2] {
+        let [mut delta, stop] = message_end(stop_reason, stop, usage);
+        if self.edits.is_some() {
+            // The object ends with its last brace.
+            delta.1.pop();
+            delta.1.push_str(&self.context_management());
+            delta.1.push('}');
+        }
+        [delta, stop]
     }
 
     /// The first event of a stream: the message, empty. The engine counts
@@ -394,8 +469,8 @@ pub(crate) fn block_event(event: &BlockEvent) -> Written {
         BlockEvent::InputDelta { index, json } => {
             delta(*index, DeltaBody::InputJson { partial_json: json })
         }
-        BlockEvent::Signature { index } => {
-            delta(*index, DeltaBody::Signature { signature: SIGNATURE })
+        BlockEvent::Signature { index, signature } => {
+            delta(*index, DeltaBody::Signature { signature })
         }
         BlockEvent::Stop { index } => {
             ("content_block_stop", EventBody::ContentBlockStop { index: *index })
