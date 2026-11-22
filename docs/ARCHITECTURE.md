@@ -4770,7 +4770,14 @@ width (`device/part/wide.rs`, `device/misses.rs`):
   kernels (`Kernels::product`) in the activation form the device and the type ask for:
   the int8 rows the fused kernels already leave (`mix_quant`, `gated_norm_quant`,
   `swiglu_quant`), or f16 rows (`prepare_mixed`, `gated_norm_f16`, `swiglu_f16`) when the
-  device runs the f16 tensor cores at full rate or `Options::precision` is `Exact`. The
+  device runs the f16 tensor cores at full rate or `Options::precision` is `Exact`. Each
+  quantized type takes its own form (its measured path at the options' precision, as the
+  27B's chooser takes per matrix; the owner's decision of 2026-11-22): where the types of a
+  part's dense matrices differ (a type with no int8 tile kernel, such as the Q2_0 of three
+  shared-expert downs of the IQ2_XS file, or the measured paths of a full-rate card, Q6_K,
+  Q3_K and Q5_K f16 against IQ4_XS, IQ4_NL, IQ3_S, IQ3_XXS and Q8_0 int8 on the RTX 4060
+  Ti), the kernels that write a product's input write both forms (`Part::wide_f16`,
+  `Part::wide_int8`); until then every dense matrix took the exact f16 path there. The
   float matrices (the mixers', the router, the indexer projections, the recurrent gates,
   the n-gram block's projections) go through the float tile kernels (`Part::wide_float`):
   the f32 section of the activations is converted to f16 rows in a scratch of its own,
@@ -4793,9 +4800,25 @@ width (`device/part/wide.rs`, `device/misses.rs`):
   pairs picked it. The experts without a slot are the layer's **misses**, most picked first.
   A step that misses nothing has one round and the host only waits for the record, while the
   first round runs. The plan of the layer is made once, and the host never waits inside a
-  call: the caller serves the store between the steps of `Misses::advance`. The experts are
-  not computed on the CPU in wide steps; the heat of the store gets the layer's counts of
-  rows per expert (`record_counts`).
+  call: the caller serves the store between the steps of `Misses::advance`. The heat of the
+  store gets the layer's counts of rows per expert (`record_counts`).
+- *The CPU takes the misses few rows picked* (`expert_store/hybrid/wide.rs`, 2026-11-22). A
+  step of a few rows (a turn whose prompt the cache holds but for its last rows, the end of
+  a prompt, the rows a replay rebuilds the state with) misses hundreds of experts per layer
+  that one or two rows picked, and an upload costs the same whatever rows use the expert:
+  0.43 ms on the x4 link of the RTX 4060 Ti, where the CPU computes a row of one in tens of
+  microseconds. So in a step of up to `Options::cpu_rows` rows (2048) the part copies the
+  layer's mixed input, its int8 codes and scales, to page-locked memory on the side stream
+  when it enqueues the layer (`Part::cpu_act`); when the record has arrived the store splits
+  the misses in the RAM tier between the CPU and the link by the cost model of the decode
+  steps (`CostModel::split_by`: the fewest rows to the CPU, behind the uploads of the misses
+  only the file holds, with a time per pair measured for this work apart from the decode
+  steps' jobs), the CPU computes its share in one job over the rows that picked one of them
+  (`LayerJob::with_rows`: an expert reads at most eight rows at a time, so one that more
+  rows picked is given in pieces), the experts held in their RAM slots, and the part adds the
+  sums to the layer's output behind the rounds (`Part::add_cpu_sums`). The layer ends when
+  the rounds and the CPU have. The arithmetic of those experts is the decode steps' (8-bit
+  activations), not the f16 of the many-row kernels.
 - *The misses pass through transit* (`expert_store/transit.rs`). A slice of a prompt uses far
   more experts of a layer than the layer has slots, each for all its rows at once and then
   no more, so a missed expert takes no slot: the store uploads it into one of a small pool
@@ -5990,19 +6013,29 @@ slots of its expert cache that it lends for the chunk and refills after (Strata
 - *Two sizes of a step.* `--ubatch-size` (`Options::own_rows`, `Model::own_rows`; by default
   `step_rows`, 512 on two cards of 12 GiB) is what the parts keep scratch for; `--batch-size`
   (`Options::max_rows`, `Model::max_rows`; 8192 by default) is the widest step, which only a
-  prompt read alone takes. The plan sizes it by what the largest pool of each device's slots
-  would lend (`batch_rows`), and once the store is built the parts halve it until every
-  device's slots lend its scratch (a loan comes from one pool, slots of one size); the model's
-  `max_rows` is that, and the server's log says it. A wider step's
-  scratch (0.67 MiB a row on the part with the streams, 0.47 on a worker) lies in VRAM the
-  expert slots of the device lend; everything else a step needs (the step's inputs and
+  prompt read alone takes. The plan sizes it by what the pools of each device's slots would
+  lend (`batch_rows`), and once the store is built the parts take the most rows up to it, in
+  multiples of 256 (`widest_rows`; of the own rows where those are fewer), whose scratch
+  every device's slots lend in pieces (`ExpertStore::lendable_pieces`, `Frame::new_in`); the
+  model's `max_rows` is that, and the server's log says it. (Until 2026-11-22 the rows were
+  halved from 8192 and a loan came from the largest pool only: 2048 rows for UD-Q3_K_XL on the
+  RTX 4060 Ti at 40G, whose largest pool holds 21 of its 48 layers.) A wider step's scratch
+  (486 KiB a row on the part with the streams of the IQ2_XS file: the buffers of the read of
+  a stream mixer, of the recurrent or attention half and of the n-gram block lie in one place
+  on a loan, as a layer uses them one after the other; 725 KiB with them apart, as the own
+  scratch keeps them, where a draft window keeps the n-gram block's `nrm` until its commit)
+  lies in VRAM the expert slots of the device lend; everything else a step needs (the step's inputs and
   plans, the exchange of two cards, the predictions: about 50 KiB a row, and 24 KiB a row of
   page-locked RAM) is sized for the widest step for good. `Part::lay_out` points the scratch
   of each step at its own buffer or at the loan (the two layouts of `Frame`: `own` and `s`),
   and writes the zeros and the status word a step reads there.
-- *The loan.* Always the last slots of the device's largest pool, so it lies at the same
-  addresses every time: the mixer knows where the worker's lent scratch takes its input
-  (`Ports::lent_raw`) from the load on. The slots belong to every layer of the pool, so the
+- *The loan.* Always the last slots of the device's pools, the largest first, a piece of each
+  the scratch needs (the slots of a pool lie in one allocation, the pools apart; the scratch
+  is laid out so that no buffer is cut by the end of a piece, and `Pieces` maps an offset to
+  its piece), so it lies at the same addresses every time: the mixer knows where the worker's
+  lent scratch takes its input (`Ports::lent_raw`) from the load on. The store lends piece by
+  piece (`ExpertStore::lend_pieces`) and keeps what it lent when a slot of a later pool was
+  busy, until the next try. The slots belong to every layer of the pool, so the
   layers give their coldest slots in proportion to what they have above the floor of a loan
   (a row's picks and the free slots, 18 for Flash-Next, `ExpertStore::loan_floor`); what
   those held is evicted as any evicted expert is (copied down to RAM when the RAM tier keeps
