@@ -2564,3 +2564,83 @@ fn loans_one_after_the_other_find_a_home_for_what_stays_in_their_slots() {
         rig.store.return_scratch(0).unwrap();
     }
 }
+
+/// A loan of VRAM in pieces: the last slots of each pool it asks of (the
+/// pools of slots of two sizes lie apart), every layer keeping its floor, no
+/// table entry naming a lent slot of either pool while the loan runs; given
+/// back, every pool's slots are the layers' again.
+#[test]
+fn a_loan_takes_the_last_slots_of_every_pool_it_asks_and_gives_them_back() {
+    let dir = Scratch::new();
+    let gguf = mixed_model(&dir);
+    let map =
+        ExpertMap::discover(&gguf, &["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"]).unwrap();
+    let reader = Reader::open_gguf(&gguf, Config::default()).unwrap();
+    let spec = |len: u64| LayerSpec {
+        device: 0,
+        offsets: [0, len, 2 * len],
+        slot_bytes: 3 * len,
+        resident: false,
+    };
+    let layers: Vec<LayerSpec> =
+        (0..5).map(|layer| spec(if layer < 4 { SMALL } else { LARGE } as u64)).collect();
+    // Eight slots per layer in VRAM, sixteen in RAM.
+    let vram_round = 3 * (4 * SMALL + LARGE) as u64;
+    let mut config = StoreConfig::new(1, 2, vec![8 * vram_round], u64::MAX / 4);
+    config.vram_reserve = 1;
+    config.rebalance_every = 0;
+    let probe = StorePlan::new(config.clone(), &map, &reader, &layers, None).unwrap();
+    let (small, large) = (probe.ram_slot_bytes(0) as usize, probe.ram_slot_bytes(4) as usize);
+    config.ram_bytes = 16 * (4 * small + large) as u64;
+    let plan = StorePlan::new(config, &map, &reader, &layers, None).unwrap();
+    let device = HostSlots::new(&plan.device_pools(0), 5, EXPERTS);
+    let region = HostRegion::unpinned(plan.ram_bytes(), plan.block());
+    let mut store = ExpertStore::new(plan, map, reader, vec![device], region, None).unwrap();
+    for picks in [[0, 1], [2, 3], [4, 5], [6, 7]] {
+        mixed_step(&mut store, &picks).unwrap();
+    }
+    // The small pool (four layers) holds more bytes than the large one: it is
+    // the first piece. Each layer keeps three slots: a row's two picks and the
+    // free one.
+    let (small_slot, large_slot) = (3 * SMALL as u64, 3 * LARGE as u64);
+    assert_eq!(store.lendable_pieces(0), [4 * 5 * small_slot, 5 * large_slot]);
+    let pieces = [7 * small_slot, 3 * large_slot - 10];
+    let loans = store.lend_pieces(0, &pieces).unwrap().expect("a loan");
+    assert_eq!(loans.len(), 2);
+    let (small_pool, large_pool) = (store.place(0).1, store.place(4).1);
+    assert_eq!(
+        loans.iter().map(|l| (l.pool, l.first, l.slots)).collect::<Vec<_>>(),
+        [(small_pool, 32 - 7, 7), (large_pool, 8 - 3, 3)]
+    );
+    while !store.scratch_ready(0).unwrap() {
+        store.poll().unwrap();
+        store.device_mut(0).run(usize::MAX);
+    }
+    assert_eq!(store.scratch_loans(0), Some(loans.clone()));
+    let pools: Vec<usize> = (0..5).map(|layer| store.place(layer).1).collect();
+    let lent = |layer: usize, entry: i32| {
+        loans.iter().any(|l| l.pool == pools[layer] && entry >= 0 && entry as u32 >= l.first)
+    };
+    for layer in 0..5 {
+        for expert in 0..EXPERTS {
+            let entry = store.device(0).entry(layer, expert);
+            assert!(!lent(layer, entry), "layer {layer} expert {expert} in lent slot {entry}");
+        }
+    }
+    // A step while the loan runs uses the slots outside it.
+    store.end_step().ok();
+    mixed_step(&mut store, &[8, 9]).unwrap();
+    for layer in 0..5 {
+        for expert in 0..EXPERTS {
+            let entry = store.device(0).entry(layer, expert);
+            assert!(!lent(layer, entry), "layer {layer} expert {expert} in lent slot {entry}");
+        }
+    }
+    store.return_scratch(0).unwrap();
+    assert_eq!(store.scratch_loans(0), None);
+    let slots: Vec<usize> = (0..5).map(|l| store.slots(l).0).collect();
+    assert_eq!(slots, [8; 5]);
+    for picks in [[10, 11], [12, 13]] {
+        mixed_step(&mut store, &picks).unwrap();
+    }
+}

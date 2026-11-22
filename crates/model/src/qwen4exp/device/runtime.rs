@@ -57,7 +57,8 @@ use super::misses::{Misses, Progress, WideStats};
 use super::mtp::{MtpBlock, MtpDrafted, MtpReport, MtpTimes, Watch};
 use super::ngram::{self, NgramFeed};
 use super::part::{
-    ExpertAt, Frame, MTP_KV, Options, PAGE_ENTRY, Part, PartSetup, PartShape, Ports, StepEnv,
+    ExpertAt, Frame, MTP_KV, Options, PAGE_ENTRY, Part, PartSetup, PartShape, Pieces, Ports,
+    StepEnv,
 };
 use super::placement::{MARGIN, PartPlan, Placement};
 use super::prune::{self, PruneMask};
@@ -247,8 +248,12 @@ struct Build {
     /// a half block lies in them; the multiprocessors of its device; the rows
     /// of the widest step, as far as the slots can lend for it.
     lent: Vec<u64>,
-    lent_at: Vec<Option<DevicePtr>>,
+    lent_at: Vec<Option<Pieces>>,
     lent_raw: Vec<u64>,
+    /// Per part: the bytes each piece of its loan holds, and what each pool of its device can
+    /// lend (what the scratch was laid out in).
+    lent_pieces: Vec<Vec<u64>>,
+    lendable: Vec<Vec<u64>>,
     multiprocessors: Vec<u32>,
     lone_rows: u32,
 }
@@ -293,8 +298,8 @@ pub(super) struct Flow {
     /// The most rows of a step on the parts' own scratch; a wider step runs on
     /// VRAM the expert slots lend: per part its bytes and where they lie.
     own_rows: u32,
-    lent: Vec<u64>,
-    lent_at: Vec<Option<DevicePtr>>,
+    lent: Vec<Vec<u64>>,
+    lent_at: Vec<Option<Pieces>>,
     /// Whether the running step runs on the loan.
     on_loan: AtomicBool,
 }
@@ -403,10 +408,10 @@ impl Flow {
     /// slots' experts moved out and copied down. Between steps.
     fn lend(&self, feed: &mut Feed) -> Result<(), ModelError> {
         let started = Instant::now();
-        for (device, bytes) in self.lent.iter().enumerate().filter(|(_, b)| **b > 0) {
+        for (device, pieces) in self.lent.iter().enumerate().filter(|(_, p)| !p.is_empty()) {
             while feed
                 .store
-                .lend_scratch(device, *bytes)
+                .lend_pieces(device, pieces)
                 .map_err(|e| invalid(e.to_string()))?
                 .is_none()
             {
@@ -424,8 +429,8 @@ impl Flow {
     }
 
     /// Where the VRAM lent to part `index` lies while the expert slots lend it.
-    fn lent(&self, index: usize) -> Option<DevicePtr> {
-        let lent = self.lent_at.get(index).copied().flatten()?;
+    fn lent(&self, index: usize) -> Option<Pieces> {
+        let lent = self.lent_at.get(index).cloned().flatten()?;
         self.lock_feed().store.has_scratch(index).then_some(lent)
     }
 
@@ -639,9 +644,10 @@ pub fn widest_rows<E>(
 /// above `opts.part.own_rows()`; that if none is. `pages` is what the pools of K and
 /// V hold, `page_bytes` a page on each device, as [`place`] gave them.
 ///
-/// A device lends what the slots of its largest pool (the layers whose experts
-/// take slots of one size) hold above a row's picks and the free slots of each of
-/// those layers (the store's floor for a loan); a step of more rows also
+/// A device lends what the slots of its pools (each the layers whose experts take
+/// slots of one size) hold above a row's picks and the free slots of each of those
+/// layers (the store's floor for a loan), a piece of each pool, in which the
+/// scratch is laid out without a buffer cut by the end of a piece; a step of more rows also
 /// keeps the rest of what it needs (its inputs, its exchange, its predictions,
 /// about 50 KiB a row on Flash-Next against 0.5 to 0.7 MiB of scratch) for
 /// good, which the slots lose, as do the parcels a split by layers hands the
@@ -664,8 +670,9 @@ pub fn batch_rows(
     let reserve = opts.reserve.unwrap_or(8) as u64;
     let floor = config.experts.used as u64 + reserve;
     // Per device: the bytes of a slot of each of its layers, and of the
-    // layers of its largest pool (slots of one size), which a loan comes from.
-    let rounds: Vec<(u64, u64)> = (0..devices.len())
+    // layers of each of its pools (slots of one size), the largest first: a
+    // loan takes a piece of each.
+    let rounds: Vec<(u64, Vec<u64>)> = (0..devices.len())
         .map(|d| {
             let mut sizes: Vec<(u64, u64)> = Vec::new();
             for spec in layout.specs.iter().filter(|s| s.device == d && !s.resident) {
@@ -675,7 +682,9 @@ pub fn batch_rows(
                 }
             }
             let all = sizes.iter().map(|(_, sum)| sum).sum();
-            (all, sizes.iter().map(|(_, sum)| *sum).max().unwrap_or(0))
+            let mut pools: Vec<u64> = sizes.iter().map(|(_, sum)| *sum).collect();
+            pools.sort_unstable_by(|a, b| b.cmp(a));
+            (all, pools)
         })
         .collect();
     widest_rows(own, asked.max(own), |rows| {
@@ -701,9 +710,11 @@ pub fn batch_rows(
             let extra = f.step_bytes(&wide).saturating_sub(g.step_bytes(&narrow)) + lanes;
             let pool = u64::from(pages) * page_bytes.get(d).copied().unwrap_or(0);
             let room = plan.slots.saturating_sub(pool + extra);
-            let (all, largest) = rounds[d];
-            let lendable_scratch = (room / all.max(1)).saturating_sub(floor) * largest;
-            f.lent_bytes() <= lendable_scratch / 10 * 9
+            let (all, pools) = &rounds[d];
+            let per_layer = (room / (*all).max(1)).saturating_sub(floor);
+            let pieces: Vec<u64> = pools.iter().map(|sum| per_layer * sum / 10 * 9).collect();
+            Frame::new_in(&config, &wide, &shape, mp, &pieces)
+                .is_ok_and(|f| f.lent_pieces().is_some())
         });
         Ok(fits)
     })
@@ -911,6 +922,8 @@ impl Qwen4Exp {
                 lent: vec![0; n],
                 lent_at: vec![None; n],
                 lent_raw: vec![0; n],
+                lent_pieces: vec![Vec::new(); n],
+                lendable: vec![Vec::new(); n],
                 multiprocessors: vec![0; n],
                 lone_rows: 0,
             }),
@@ -1512,40 +1525,63 @@ impl Qwen4Exp {
                 let ram_fixed = store.ram_fixed_bytes();
                 // The widest step a prompt read alone takes: the rows the
                 // parts were opened for, or the most below them, in multiples
-                // of `ROW_GRAIN`, whose scratch every device's slots can lend
-                // (a loan comes from one pool, so the plan's estimate may hold
-                // more); and where each device's slots lend it: always the
-                // same slots.
+                // of `ROW_GRAIN`, whose scratch every device's slots can lend,
+                // laid out in a piece of each of its pools (the plan's estimate
+                // may hold more); and where each device's slots lend it: always
+                // the same slots.
                 let own = o.own_rows();
-                let lent_of = |d: usize, rows: u32| -> Result<(u64, u64), ModelError> {
-                    let PartPlan { role, first, shares, head } = self.placement.part(c, d);
-                    let shape = PartShape { role, first, shares, head };
-                    let opts = Options { max_rows: rows, own_rows: own, ..o.clone() };
-                    let frame = Frame::new(c, &opts, &shape, build.multiprocessors[d])?;
-                    Ok((frame.lent_bytes(), frame.lent_raw()))
-                };
+                for d in 0..n {
+                    build.lendable[d] = store.lendable_pieces(d);
+                }
+                let lent_of =
+                    |d: usize, rows: u32| -> Result<Option<(Vec<u64>, u64)>, ModelError> {
+                        let PartPlan { role, first, shares, head } = self.placement.part(c, d);
+                        let shape = PartShape { role, first, shares, head };
+                        let opts = Options { max_rows: rows, own_rows: own, ..o.clone() };
+                        let mp = build.multiprocessors[d];
+                        let frame = Frame::new_in(c, &opts, &shape, mp, &build.lendable[d])?;
+                        Ok(frame.lent_pieces().map(|pieces| (pieces, frame.lent_raw())))
+                    };
                 let asked = if build.lent.iter().any(|b| *b > 0) { o.max_rows } else { own };
                 let rows = widest_rows(own, asked, |rows| {
                     let mut fits = true;
                     for d in 0..n {
-                        fits &= lent_of(d, rows)?.0 <= store.lendable_scratch(d);
+                        fits &= lent_of(d, rows)?.is_some();
                     }
                     Ok::<bool, ModelError>(fits)
                 })?;
                 build.lone_rows = rows;
                 for d in 0..n {
-                    let (bytes, raw) = if rows > own { lent_of(d, rows)? } else { (0, 0) };
-                    build.lent[d] = bytes;
+                    let (pieces, raw) = match rows > own {
+                        true => lent_of(d, rows)?
+                            .ok_or_else(|| invalid("the slots lend less than they said"))?,
+                        false => (Vec::new(), 0),
+                    };
+                    build.lent[d] = pieces.iter().sum();
                     build.lent_raw[d] = raw;
                     build.lent_at[d] = None;
-                    if bytes == 0 {
+                    build.lent_pieces[d] = pieces.clone();
+                    if pieces.is_empty() {
                         continue;
                     }
-                    let loan = store
-                        .scratch_at(d, bytes)
+                    let loans = store
+                        .scratch_pieces_at(d, &pieces)
                         .ok_or_else(|| invalid("the slots lend less than they said"))?;
-                    let (base, _) = store.device(d).pool(loan.pool);
-                    build.lent_at[d] = Some(base.offset(u64::from(loan.first) * loan.stride));
+                    // Each piece starts in the layout where the pieces before it
+                    // end as the scratch was laid out: at what each pool can lend.
+                    let mut start = 0;
+                    let mut at = Vec::with_capacity(loans.len());
+                    let mut loans = loans.iter();
+                    for (piece, lendable) in pieces.iter().zip(&build.lendable[d]) {
+                        if *piece > 0 {
+                            let loan =
+                                loans.next().ok_or_else(|| invalid("a piece without its loan"))?;
+                            let (base, _) = store.device(d).pool(loan.pool);
+                            at.push((start, base.offset(u64::from(loan.first) * loan.stride)));
+                        }
+                        start += lendable / 256 * 256;
+                    }
+                    build.lent_at[d] = Some(Pieces(at));
                 }
                 let mut firsts = Vec::with_capacity(n);
                 for d in 0..n {
@@ -1602,7 +1638,7 @@ impl Qwen4Exp {
                     stall: self.opts.stall,
                     wide: Mutex::new(WideStats::default()),
                     own_rows: o.own_rows(),
-                    lent: build.lent.clone(),
+                    lent: build.lent_pieces.clone(),
                     lent_at: build.lent_at.clone(),
                     on_loan: AtomicBool::new(false),
                     totals: Mutex::new(ExpertStats {
@@ -1636,7 +1672,8 @@ impl Qwen4Exp {
             }
             let peer = self.placement.tensor.as_ref().map(|tensor| {
                 let other = 1 - index;
-                let lent_raw = build.lent_at[other].map(|at| at.offset(build.lent_raw[other]));
+                let lent_raw =
+                    build.lent_at[other].as_ref().map(|at| at.address(build.lent_raw[other]));
                 (build.ports[other], build.cores[other].clone(), tensor.mixer, lent_raw)
             });
             let _ = self.lone_rows.set(build.lone_rows);
@@ -1651,7 +1688,8 @@ impl Qwen4Exp {
         };
         part.set_experts(places)?;
         let PartPlan { role, first, shares, head } = self.placement.part(c, index);
-        part.lend_rows(c, &PartShape { role, first, shares, head }, self.max_rows())?;
+        let lendable = self.meeting.lock().value.lendable[index].clone();
+        part.lend_rows(c, &PartShape { role, first, shares, head }, self.max_rows(), &lendable)?;
         if let Some(mask) = prune_mask {
             part.set_prune_mask(mask);
         }

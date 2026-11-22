@@ -510,6 +510,21 @@ struct Scratch {
     len: u64,
 }
 
+/// VRAM lent by the expert slots in pieces (a piece of each pool a loan takes): per piece,
+/// where it starts in the layout of the scratch ([`Frame::new_in`]) and where it lies.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Pieces(pub Vec<(u64, DevicePtr)>);
+
+impl Pieces {
+    /// Where the scratch's offset `offset` lies: in the last piece that starts at or before
+    /// it.
+    pub fn address(&self, offset: u64) -> DevicePtr {
+        let at = self.0.iter().rposition(|(start, _)| *start <= offset).unwrap_or(0);
+        let (start, base) = self.0[at];
+        base.offset(offset - start)
+    }
+}
+
 /// Offsets of what the host sends with a step.
 #[derive(Clone, Copy, Debug, Default)]
 struct Inbox {
@@ -557,6 +572,9 @@ pub(crate) struct Frame {
     own: Scratch,
     /// Whether steps wider than the own scratch run on lent VRAM.
     lends: bool,
+    /// Laid out in pieces ([`Frame::new_in`]): what each piece holds, or `None` when the
+    /// scratch does not fit in them.
+    lent_pieces: Option<Vec<u64>>,
     inbox: Inbox,
     record_stride: u64,
     /// Bytes from one layer's input of the mixture of experts to the next,
@@ -657,12 +675,28 @@ impl Frame {
         shape: &PartShape,
         multiprocessors: u32,
     ) -> Result<Self, ModelError> {
+        Self::new_in(c, opts, shape, multiprocessors, &[])
+    }
+
+    /// [`Frame::new`] whose scratch for steps on lent VRAM lies in pieces of at most
+    /// `pieces` bytes each, in their order (the pieces a loan of several pools of expert
+    /// slots is made of): no buffer is cut by the end of a piece. Empty: one piece as large
+    /// as it needs. [`Frame::lent_pieces`] says what each piece holds, and whether the
+    /// scratch fits.
+    pub(crate) fn new_in(
+        c: &Config,
+        opts: &Options,
+        shape: &PartShape,
+        multiprocessors: u32,
+        pieces: &[u64],
+    ) -> Result<Self, ModelError> {
         let own = opts.own_rows();
         let lends = own < opts.max_rows;
-        let mut frame = Self::widest(c, opts, shape, multiprocessors, lends)?;
+        let mut frame =
+            Self::widest(c, opts, shape, multiprocessors, lends, if lends { pieces } else { &[] })?;
         if lends {
             let small = Options { max_rows: own, own_rows: 0, ..opts.clone() };
-            frame.own = Self::widest(c, &small, shape, multiprocessors, false)?.s;
+            frame.own = Self::widest(c, &small, shape, multiprocessors, false, &[])?.s;
             frame.lends = true;
         }
         Ok(frame)
@@ -672,12 +706,15 @@ impl Frame {
     /// `overlay` (the scratch of a step on lent VRAM, which verifies no drafts) the buffers
     /// of the read of a stream mixer, of the recurrent or attention half and of the n-gram
     /// block share their place: a layer uses them one after the other.
+    ///
+    /// The scratch lies in `pieces` as [`Frame::new_in`] says.
     fn widest(
         c: &Config,
         opts: &Options,
         shape: &PartShape,
         multiprocessors: u32,
         overlay: bool,
+        pieces: &[u64],
     ) -> Result<Self, ModelError> {
         let head = shape.head;
         let streams = shape.role != Role::Worker;
@@ -770,10 +807,36 @@ impl Frame {
         // The scratch of a step.
         let mut s = Scratch::default();
         let mut len = 0u64;
+        // The pieces as ranges of the layout's offsets, and what each holds; a buffer that
+        // the end of a piece would cut goes to the start of the next.
+        let starts: Vec<u64> = pieces
+            .iter()
+            .scan(0u64, |at, bytes| {
+                let start = *at;
+                *at += bytes / 256 * 256;
+                Some(start)
+            })
+            .collect();
+        let ends: Vec<u64> =
+            starts.iter().zip(pieces).map(|(start, bytes)| start + bytes / 256 * 256).collect();
+        let mut held = vec![0u64; pieces.len()];
+        let mut fits = true;
         macro_rules! take {
             ($bytes:expr $(,)?) => {{
-                let at = len;
-                len = (len + ($bytes).max(16)).next_multiple_of(64);
+                let bytes = ($bytes).max(16);
+                let mut at = len;
+                if !ends.is_empty() {
+                    let mut k = ends.iter().position(|end| at < *end).unwrap_or(ends.len());
+                    while k < ends.len() && at + bytes > ends[k] {
+                        k += 1;
+                        at = at.max(ends[k - 1]);
+                    }
+                    match held.get_mut(k) {
+                        Some(held) => *held = (*held).max(at + bytes - starts[k]),
+                        None => fits = false,
+                    }
+                }
+                len = (at + bytes).next_multiple_of(64);
                 at
             }};
         }
@@ -901,6 +964,7 @@ impl Frame {
             s.cpu_sums = take!(u64::from(opts.cpu_rows.min(opts.max_rows)) * n * 4);
         }
         s.len = len;
+        let lent_pieces = (!pieces.is_empty() && fits).then_some(held);
 
         // A flag per block of a read, and one for a route record.
         let x_flags = Q4Kernels::read_flags(opts.max_rows, c.n_embd as u32) + 16;
@@ -954,6 +1018,7 @@ impl Frame {
             s,
             own: s,
             lends: false,
+            lent_pieces,
             inbox,
             record_stride: record_bytes.next_multiple_of(64),
             act_stride: act_bytes(n, u64::from(decode_rows)).next_multiple_of(64),
@@ -1001,10 +1066,15 @@ impl Frame {
         })
     }
 
-    /// Bytes of the scratch of a step on lent VRAM; 0 when no step is wider than the part's
-    /// own scratch.
-    pub(crate) fn lent_bytes(&self) -> u64 {
-        if self.lends { self.s.len } else { 0 }
+    /// Laid out in pieces ([`Frame::new_in`]): the bytes the scratch of a step on lent VRAM
+    /// takes of each piece, without the pieces it does not reach; `None` when it does not fit
+    /// in them or no step is wider than the part's own scratch.
+    pub(crate) fn lent_pieces(&self) -> Option<Vec<u64>> {
+        let mut pieces = self.lent_pieces.clone().filter(|_| self.lends)?;
+        while pieces.last() == Some(&0) {
+            pieces.pop();
+        }
+        Some(pieces)
     }
 
     /// Where the input of a half block lies in the scratch of a step on lent VRAM.
@@ -1122,8 +1192,9 @@ pub struct Part {
     lent_s: Scratch,
     /// The most rows of a step on lent VRAM (`lent_s` is laid out for them).
     lent_rows: u32,
-    /// The VRAM the expert slots lend for wide steps, when they do.
-    lent: Option<DevicePtr>,
+    /// The VRAM the expert slots lend for wide steps, when they do: its pieces, each where
+    /// it starts in the layout `lent_s` and where it lies ([`Pieces`]).
+    lent: Option<Pieces>,
     /// Whether the running step runs on lent VRAM.
     on_loan: bool,
     /// Where the peer's `raw` lies in a step on its lent VRAM.
@@ -1714,7 +1785,10 @@ impl Part {
     }
 
     fn at(&self, offset: u64) -> DevicePtr {
-        self.base.offset(offset)
+        match (&self.lent, self.on_loan) {
+            (Some(pieces), true) => pieces.address(offset),
+            _ => self.base.offset(offset),
+        }
     }
 
     /// Bytes of VRAM a step wider than the part's own scratch runs on: what
@@ -1738,6 +1812,7 @@ impl Part {
         c: &Config,
         shape: &PartShape,
         rows: u32,
+        pieces: &[u64],
     ) -> Result<u64, ModelError> {
         let own = self.opts.own_rows();
         let rows = rows.min(self.opts.max_rows);
@@ -1747,7 +1822,8 @@ impl Part {
             return Ok(0);
         }
         let opts = Options { max_rows: rows, own_rows: own, ..self.opts.clone() };
-        self.lent_s = Frame::new(c, &opts, shape, self.device.info().multiprocessors)?.s;
+        let mp = self.device.info().multiprocessors;
+        self.lent_s = Frame::new_in(c, &opts, shape, mp, pieces)?.s;
         Ok(self.lent_s.len)
     }
 
@@ -1755,7 +1831,7 @@ impl Part {
     /// least [`Part::lent_bytes`] of it, or `None` when it is given back. The
     /// memory is the part's until the step after the last one that ran on it
     /// has ended on the device.
-    pub fn set_lent(&mut self, at: Option<DevicePtr>) {
+    pub fn set_lent(&mut self, at: Option<Pieces>) {
         self.lent = at;
     }
 
@@ -1774,7 +1850,7 @@ impl Part {
                 self.lent_rows
             )));
         }
-        let at = self.lent.ok_or_else(|| {
+        let at = self.lent.as_ref().map(|pieces| pieces.address(0)).ok_or_else(|| {
             invalid(format!(
                 "a step of {rows} rows runs on VRAM the expert slots lend, and none is lent"
             ))
@@ -2239,9 +2315,9 @@ impl Part {
         // The exact K/V entries of the step: tiles that left their sequence's
         // newest cells are converted, the pages the rows write get exact slots,
         // and the table names them; the conversions run in front of the step.
+        let status = self.at(self.f.s.status);
         if let Some(kv) = &mut self.kv {
             let reaches = kv::reaches(env.segments, env.replay);
-            let status = self.base.offset(self.f.s.status);
             let (tables, pools) = (self.tables.ptr(), env.pools);
             let kernels = self.attention.as_ref();
             kv.prepare(kernels, stream, &reaches, &self.entries, tables, pools, status, true)?;
