@@ -37,7 +37,6 @@ use ares_runtime::expert_store::{
     CudaSlots, ExpertProfile, ExpertStore, FillOrder, FillPace, FillStats, ProfileKey, StoreError,
     TierFill,
 };
-use ares_weights::ExpertHeat;
 
 use super::feed::Layout;
 use super::placement::Placement;
@@ -271,33 +270,6 @@ impl Usage {
             state: Mutex::new(state),
             wake: Condvar::new(),
         })))
-    }
-
-    /// The heat of the profile that was found, as the store's layers (`n_layers` of them)
-    /// have it, for the plan of the store to divide the slots of the tiers between the
-    /// layers by; `None` without a profile. A layer of the store that holds no layer of the
-    /// model (the MTP block's) has no heat.
-    pub(super) fn plan_heat(
-        &self,
-        layout: &Layout,
-        placement: &Placement,
-        n_layers: usize,
-    ) -> Option<ExpertHeat> {
-        let inner = self.0.as_ref()?;
-        let state = inner.lock();
-        let profile = state.profile.as_ref()?;
-        let map = LayerMap::new(inner.key, layout, placement);
-        let mut heat = ExpertHeat::new(n_layers, inner.key.experts as usize, 1.0);
-        for (layer, parts) in map.layers.iter().enumerate() {
-            let values = profile.layer(layer);
-            for (at, owned) in parts {
-                let Some(out) = (*at < n_layers).then(|| heat.layer_mut(*at)) else { continue };
-                for (e, (out, value)) in out.iter_mut().zip(values).enumerate() {
-                    *out = if owned.as_ref().is_none_or(|o| o[e]) { *value } else { 0.0 };
-                }
-            }
-        }
-        Some(heat)
     }
 
     /// The runtime's flow, which holds the store, once it is made, and where

@@ -5214,15 +5214,6 @@ model, as Strata's `expert_profile_save` and Run My AI's table of usage do
   machine's memory can shrink the tier meanwhile. Without a profile the start reads
   the warm-up text as before, writes the profile at once and fills the tiers from
   the heat the warm-up left in the same way (`Qwen4Exp::fill_from_heat`).
-- *The plan* (2026-11-22, `flash/ssd-stream`). A profile that is found also divides the slots of
-  each tier between the layers of a pool (`StorePlan::new`, `Usage::plan_heat`), which started
-  even before: VRAM by each layer's hottest experts, RAM by the heat beyond what the layer's VRAM
-  slots hold (`beyond_hottest`), every layer at least at its floor. The layers of Flash-Next
-  differ: 95 % of a layer's picks take 166 (layer 47) to 345 (layer 30) of its experts (the
-  profile of the Strata comparison), and RAM's slots never move between layers while the engine
-  runs (VRAM's do, every 256 steps), so where the experts stream from the SSD an even split
-  leaves some layers reading from the file what others hold unused. Without a profile nothing
-  changes.
 - *While nothing runs* (no step for a second): the same thread fills what is empty
   or colder, VRAM's free slots and members colder than an expert outside, and the
   RAM tier's room, from the heat, those for VRAM first and

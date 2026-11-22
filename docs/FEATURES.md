@@ -76,8 +76,7 @@ runs yet.
   gives page-locked memory back between steps (checkpoints first, the expert tier last) and
   takes it again when the memory is free; the reserve it keeps is derived, not fixed.
 - Flash-Next: a usage profile of the experts (in the `--cache` directory, else `~/.cache/ares`)
-  fills the tiers at the start in place of the warm-up text, and their empty slots while idle;
-  it also divides each tier's slots between the layers by what each layer's experts were used for.
+  fills the tiers at the start in place of the warm-up text, and their empty slots while idle.
 - Flash-Next: `--expert-prune RULE:RANK` (off by default) lets a step leave out a weak pick whose
   expert only the SSD holds, or take another expert that VRAM or RAM holds in its place
   (`skip`, `router`, `similar`), instead of waiting for the drive; it changes the output.

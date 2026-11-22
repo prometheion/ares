@@ -297,18 +297,6 @@ impl StorePlan {
     }
 }
 
-/// `heat` with its `n` hottest experts at nothing: what a tier below one that holds those
-/// is left to hold.
-fn beyond_hottest(heat: &[f32], n: usize) -> Vec<f32> {
-    let mut order: Vec<usize> = (0..heat.len()).collect();
-    order.sort_by(|a, b| heat[*b].total_cmp(&heat[*a]));
-    let mut out = heat.to_vec();
-    for expert in order.into_iter().take(n) {
-        out[expert] = 0.0;
-    }
-    out
-}
-
 /// The RAM slots of a resident layer: what its experts pass through from the
 /// file into VRAM when the store is filled.
 const RESIDENT_PASSAGE: usize = 8;
@@ -831,17 +819,8 @@ impl StorePlan {
                 .ok_or_else(|| {
                     plan_error(floors.vram_short(&config, layers, &vram_budget, n_experts))
                 })?;
-        // The RAM tier holds what VRAM does not: a layer's need there is the heat of its
-        // experts beyond the hottest that its VRAM slots hold.
-        let below: Vec<Vec<f32>> = heat
-            .iter()
-            .enumerate()
-            .map(|(layer, heat)| beyond_hottest(heat, vram.slots(layer)))
-            .collect();
-        let ram_heat: Vec<&[f32]> = below.iter().map(Vec::as_slice).collect();
-        let ram =
-            Tier::plan(n_experts, &ram_layers, &[ram_budget], &floors.ram, &ram_heat, &ram_fixed)
-                .ok_or_else(|| {
+        let ram = Tier::plan(n_experts, &ram_layers, &[ram_budget], &floors.ram, &heat, &ram_fixed)
+            .ok_or_else(|| {
                 plan_error(floors.ram_short(&config, layers, &ram_layers, ram_budget))
             })?;
         let mut vram = vram;

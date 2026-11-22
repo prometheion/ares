@@ -1531,11 +1531,8 @@ impl Qwen4Exp {
                 }
                 config.ram_bytes = reach;
                 config.ram_piece = self.opts.ram_piece.unwrap_or(PIECE) as u64;
-                // A usage profile divides the slots of each tier between the layers by
-                // what each layer's experts were used for; without one they start even.
-                let heat = self.usage.plan_heat(layout, &self.placement, layout.specs.len());
-                let plan = StorePlan::new(config, &map, &reader, &layout.specs, heat.as_ref())
-                    .map_err(|e| {
+                let plan =
+                    StorePlan::new(config, &map, &reader, &layout.specs, None).map_err(|e| {
                         // With both devices on every layer each holds a share of the
                         // experts of every layer, and every one of those needs its slots.
                         let shared = self.placement.tensor.is_some()
