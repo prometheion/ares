@@ -62,7 +62,8 @@ Merged 2026-11-22 after the test machine's one card passed every GPU suite (`fix
 | Flash-Next decodes UD-Q3_K_XL at least as fast as Strata on the test machine (the owner, 2026-11-22): CPU kernels for every expert type, then the next lever by measurement | agent working on the test machine (`flash/cpu-experts`) |
 | Flash-Next UD-Q4_K_XL (104 GiB, larger than RAM) streamed from the SSD against Strata, then Ares's reading path | agent working on the test machine (`flash/ssd-stream`) |
 | 6: K/V beyond VRAM into RAM, and K/V VRAM nobody uses yet serving the expert tier | agent working on the test machine (`kv/overflow`) |
-| 7 and the server part of 8: priorities of requests, system messages and efforts on the chat and Responses routes, Messages items, thinking budget, special tokens, truncation, small ones | agent working (`server/priorities`) |
+| 7 and the server part of 8: priorities of requests, system messages and efforts on the chat and Responses routes, Messages items, thinking budget, special tokens, truncation, small ones | handed back, being verified (`server/priorities`) |
+| Image input, pieces 4 to 8 (the owner, 2026-11-22: next, for production): the tower as a conductor job, the splices in both models, the routes, caching | agent working (`image/input`) |
 
 ## Shared model layer (the owner's rule, 2026-11-16)
 Generic for Ares, not like llama.cpp: a few models, shared code where it can be, each model
