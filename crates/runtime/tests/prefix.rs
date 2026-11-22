@@ -1090,10 +1090,10 @@ fn an_edited_message_replays_only_the_rows_from_the_boundary_before_it() {
     assert_eq!(first.run.text, fresh(|_| {}, &rendered(&messages), 20).text);
     let answer = e.ask_chat(&edited, 20);
     assert_eq!(answer.run.text, fresh(|_| {}, &rendered(&edited), 20).text);
-    // It takes the pages before the change and replays from a checkpoint at
-    // most one boundary interval before it.
+    // It takes the pages before the change and replays from a checkpoint
+    // less than a piece of prompt (64 rows) before it.
     assert_eq!(answer.report.cached_tokens, shared);
-    assert!(answer.report.replayed_rows <= PAGE, "{:?}", answer.report);
+    assert!(answer.report.replayed_rows < 64, "{:?}", answer.report);
     assert_consistent(&e);
 
     // Without boundaries (the same tokens as plain text) the history has a

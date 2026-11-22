@@ -613,6 +613,22 @@ one array per part, indexed by page number.
   conversation with tools, a call with reasoning, its result, an answer):
   two boundaries per message, three roots. Plain text (`/completion`) has
   none.
+  - **Measured** 2026-11-22 on the Messages route (Qwen3.8-27B Q4_K_S, two
+    cards, `--ram 8G`, load 4 to 11; before is `main` without boundaries, A,
+    B, A, B): a conversation with a system prompt of about 12 000 tokens, 12
+    tools (about 3000) and a task of about 1500 tokens goes on for three
+    turns; a second and a third conversation with the same system prompt and
+    tools and other tasks then took 20.3 to 20.6 s to their first token
+    before (18 304 rows replayed: the first conversation's checkpoints lie
+    after its task) and 2.54 to 2.63 s after (nothing replayed; what is left
+    is the new task's rows). The cold first prompt of 19 903 tokens took
+    20.59 and 20.61 s before and 20.77 and 20.88 s after (five saves against
+    two). A conversation of five turns (user messages of about 300 tokens)
+    whose first message is edited replayed 8064 rows (9.13 s) before and none
+    (2.33 s) after; with its second message (the first answer) edited, both
+    restore the first turn's anchor (nothing replayed, 2.3 s). Claude Code's
+    billing stamp: the next turn with another `cch` took 8950 of 8970 tokens
+    from the cache (0.18 s).
 - Admission (`ares_sched::Admission`): nothing is reserved for a request's
   longest possible length. Pages are claimed per step. A reservation covers
   the rest of the running prompts and the output they are expected to
