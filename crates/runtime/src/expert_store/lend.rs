@@ -123,8 +123,8 @@ impl<D: SlotDevice> ExpertStore<D> {
     }
 
     /// Lends `bytes` of VRAM of `device`, between steps: the slots at the end
-    /// of its largest pool leave the layers (see the [module
-    /// documentation](self)). `None` while something still touches the
+    /// of its largest pool leave the layers (see "Large prompt steps on lent
+    /// VRAM" in `docs/ARCHITECTURE.md`). `None` while something still touches the
     /// device's slots (poll the store and ask again) or when the layers cannot
     /// give that much ([`ExpertStore::lendable`]). A device lends once at a
     /// time; a device that has lent at least `bytes` keeps its loan. The
