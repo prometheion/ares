@@ -676,14 +676,22 @@ fn the_runtime_answers_as_the_session_does_in_every_placement() {
     }
 }
 
-/// [`start_with`] without a draft block or the prefix cache, with the K and V of the pages
-/// from `near` on in page-locked host memory (`blocks/far.rs`) when `near` is given.
-fn start_near(placement: Placement, rows: u32, near: Option<u32>) -> (Runtime, Arc<Qwen4Exp>) {
+/// [`start_with`] for the model file at `path` without a draft block or the prefix cache,
+/// with steps of up to `rows` rows of which those wider than `own` run on VRAM the expert
+/// slots lend, and the K and V of the pages from `near` on in page-locked host memory
+/// (`blocks/far.rs`) when `near` is given.
+fn start_near(
+    path: &std::path::Path,
+    placement: Placement,
+    (rows, own): (u32, u32),
+    near: Option<u32>,
+) -> (Runtime, Arc<Qwen4Exp>) {
     let devices = open_devices(placement);
-    let gguf = Gguf::open(gguf_path(1)).unwrap();
+    let gguf = Gguf::open(path).unwrap();
     let n_layer = Config::from_gguf(&gguf).unwrap().n_layer;
     let pages = 16;
     let mut opts = options(placement, n_layer, pages, MAX_ROWS, rows);
+    opts.part.own_rows = own;
     opts.part.near_pages = near;
     let inner =
         Arc::new(Qwen4Exp::new(gguf, byte_tokenizer(None), "made", &devices, opts, CELLS).unwrap());
@@ -700,20 +708,25 @@ fn start_near(placement: Placement, rows: u32, near: Option<u32>) -> (Runtime, A
 
 /// The K and V of the pages beyond the first lie in page-locked host memory, which the
 /// device reads and writes over its link (`blocks/far.rs`): a prompt of three pages answers
-/// with the same tokens as with every page in VRAM, in steps of the decode kernels and in
-/// wide steps, in every placement. The kernels read the same bytes from another address, so
-/// with every expert in a slot the answers are the same token for token.
+/// with the same tokens as with every page in VRAM, in steps of the decode kernels, in wide
+/// steps, and in wide steps on lent VRAM (which read a copy of a layer's far entries), in
+/// every placement. The kernels read the same bytes from another address, so with every
+/// expert in a slot the answers are the same token for token.
 #[test]
 fn k_and_v_beyond_vram_change_no_token() {
     if !enabled() {
         return;
     }
     let prompt = prompt(300, 7);
+    // Experts in BF16, whose slots lend enough for a few wide steps' scratch.
+    let lending = gguf_path_of(1, GgmlType::BF16, GgmlType::Q4_0);
+    let cases =
+        [(gguf_path(1), (MAX_ROWS, 0)), (gguf_path(1), (WIDE_ROWS, 0)), (lending, (LENT_ROWS, 8))];
     for placement in placements() {
-        for rows in [MAX_ROWS, WIDE_ROWS] {
+        for (path, rows) in &cases {
             let mut answers = Vec::new();
             for near in [None, Some(1)] {
-                let (runtime, model) = start_near(placement, rows, near);
+                let (runtime, model) = start_near(path, placement, *rows, near);
                 let _ = ask(&runtime, 1, &prompt, 24);
                 warm(&model);
                 let got = ask(&runtime, 2, &prompt, 24);
@@ -722,12 +735,12 @@ fn k_and_v_beyond_vram_change_no_token() {
                 answers.push(got);
             }
             eprintln!(
-                "FAR {placement:?}, steps of {rows} rows: {} of {} tokens as with every page in \
+                "FAR {placement:?}, steps of {rows:?} rows: {} of {} tokens as with every page in \
                  VRAM",
                 answers[0].iter().zip(&answers[1]).take_while(|(a, b)| a == b).count(),
                 answers[0].len()
             );
-            assert_eq!(answers[1], answers[0], "{placement:?}, {rows} rows: K and V in RAM");
+            assert_eq!(answers[1], answers[0], "{placement:?}, {rows:?} rows: K and V in RAM");
         }
         // The session with its pages beyond the first in RAM says what the session says.
         let want = session_answer(1, placement, &prompt, 24);

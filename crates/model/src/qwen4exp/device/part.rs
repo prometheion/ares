@@ -539,6 +539,11 @@ struct Scratch {
     cpu_sums: u64,
     /// The bytes of `zeros`, which a step on lent VRAM clears first.
     zeros_len: u64,
+    /// Steps on lent VRAM: where the converted entries of a layer's pages in
+    /// host memory are copied before its attention reads them, and the bytes
+    /// for all of them (0 when no page is far or no step is lent for).
+    far_stage: u64,
+    far_stage_len: u64,
     len: u64,
 }
 
@@ -1007,6 +1012,13 @@ impl Frame {
             s.experts_f16 = take!(expert_shape.rows_activation_bytes(opts.max_rows));
             s.cpu_sums = take!(u64::from(opts.wide_cpu_rows()) * n * 4);
         }
+        // A wide step on lent VRAM: every row of a prompt reads the cells of its
+        // own pick, so a layer's K and V beyond VRAM are copied to VRAM once for
+        // all rows, behind the step's append, and read there.
+        if opts.max_rows > opts.own_rows() && any_attention && near < pages {
+            s.far_stage_len = (pages - near) * geo.converted_entry_bytes();
+            s.far_stage = take!(s.far_stage_len);
+        }
         s.len = len;
         let lent_pieces = (!pieces.is_empty() && fits).then_some(held);
 
@@ -1251,6 +1263,9 @@ pub struct Part {
     lent: Option<Pieces>,
     /// Whether the running step runs on lent VRAM.
     on_loan: bool,
+    /// The far slots the sequences of the step reach: the K and V of their
+    /// pages in host memory, up to the highest of them.
+    far_reach: u32,
     /// Where the peer's `raw` lies in a step on its lent VRAM.
     peer_lent_raw: Option<DevicePtr>,
     /// The slot arena: per sequence slot the recurrent state, the carried
@@ -1584,6 +1599,7 @@ impl Part {
             lent_rows: opts.max_rows,
             lent: None,
             on_loan: false,
+            far_reach: 0,
             peer_lent_raw: None,
             state,
             tables,
@@ -2331,6 +2347,26 @@ impl Part {
         Ok(StepPlan { plan, hands: Some(hands), max_blocks })
     }
 
+    /// The far slots that the sequences of the step reach: one more than the
+    /// highest far slot of a page their tables name up to their last row, 0
+    /// when none is far.
+    fn far_reach(&self, env: &StepEnv<'_>) -> u32 {
+        let Some(near) = self.kv.as_ref().and_then(kv::Group::near) else { return 0 };
+        let stride = self.opts.table_stride() as usize;
+        let mut reach = 0;
+        for s in env.segments {
+            let tiles = ((s.pos0 as u32 + s.n_rows).saturating_sub(1) / ENTRY_CELLS + 1) as usize;
+            let base = s.slot as usize * stride;
+            for entry in self.entries.get(base..base + tiles.min(stride)).into_iter().flatten() {
+                let page = entry & !PAGE_ENTRY;
+                if *entry & PAGE_ENTRY != 0 && page >= near {
+                    reach = reach.max(page - near + 1);
+                }
+            }
+        }
+        reach
+    }
+
     /// Whether the partial states of `plan` fit the scratch.
     fn check_states(&self, plan: &Plan) -> Result<(), ModelError> {
         let state = plan.state_bytes(&self.f.geo);
@@ -2353,6 +2389,7 @@ impl Part {
         let dims = env.record.dims();
         let n = dims.n_rows;
         self.lay_out(stream, n)?;
+        self.far_reach = self.far_reach(env);
         if let Some(marks) = &mut self.marks {
             marks.phases.clear();
             marks.on = !marks.profile.paused.load(Ordering::Relaxed);
@@ -3211,6 +3248,17 @@ impl Part {
                 self.plan = Some(step_plan);
                 return self.mark(stream, Phase::Attention);
             }
+            // A step on lent VRAM reads the layer's K and V beyond VRAM from a
+            // copy, made behind the append that wrote this step's cells there.
+            let stage = if self.on_loan && s.far_stage_len > 0 && self.far_reach > 0 {
+                let group = self.group()?;
+                let bytes = u64::from(self.far_reach) * geo.converted_entry_bytes();
+                let to = self.at(s.far_stage);
+                stream.copy_any(to, group.far_of(&layer), bytes.min(s.far_stage_len) as usize)?;
+                Some(to)
+            } else {
+                None
+            };
             if step_plan.hands.is_some() {
                 let (ranges, items) = (base.offset(layout.ranges), base.offset(layout.items));
                 let (scores, counts) = (self.at(s.scores), self.at(s.counts));
@@ -3258,6 +3306,7 @@ impl Part {
                 o,
                 self.at(s.attn_state),
                 1.0 / (geo.head_dim as f32).sqrt(),
+                stage,
             )?;
             self.mark(stream, Phase::Attention)?;
             if Self::is_wide(rows) {

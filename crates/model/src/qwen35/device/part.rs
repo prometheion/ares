@@ -2379,6 +2379,7 @@ impl Part {
                 o,
                 self.at(s.attn_state),
                 1.0 / (self.attn_head_dim as f32).sqrt(),
+                None,
             )?;
             self.mark(stream, Phase::Attention)?;
             self.prepare(stream, o, a.out.n_in, n, &[&a.out], Prepared::default())?;

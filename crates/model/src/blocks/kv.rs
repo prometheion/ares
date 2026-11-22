@@ -301,7 +301,7 @@ impl Group {
     }
 
     /// The far pool of `layer` (null when no page is far).
-    fn far_of(&self, layer: &Layer) -> DevicePtr {
+    pub(crate) fn far_of(&self, layer: &Layer) -> DevicePtr {
         let Some(far) = &self.far else { return DevicePtr::NULL };
         self.layers
             .iter()
@@ -801,7 +801,9 @@ impl Group {
 
     /// The attention of the rows of `plan` over the cells of `layer`, from the
     /// queries `q` into `out` (gated by `gate` where the model has one), with
-    /// `scratch` for the partial states.
+    /// `scratch` for the partial states. `far` is where the kernels read the
+    /// layer's far entries when not in the far pool: a copy of its first slots
+    /// in VRAM.
     ///
     /// # Safety
     ///
@@ -821,12 +823,13 @@ impl Group {
         out: DevicePtr,
         scratch: DevicePtr,
         scale: f32,
+        far: Option<DevicePtr>,
     ) -> Result<(), ModelError> {
         let buffers = AttendBuffers {
             tables: self.table(step_table),
             exact_pool: self.exact_pool(layer),
             converted_pool: pages.offset(layer.pool),
-            far_pool: self.far_of(layer),
+            far_pool: far.unwrap_or_else(|| self.far_of(layer)),
             q,
             gate,
             out,
