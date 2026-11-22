@@ -907,6 +907,8 @@ the agents' builds):
       threads spinning; the `moe/prompt-chunks` agent); with `--test-threads=1` it passes.
 
 ## Decided by the owner (2026-11-22)
+- K/V beyond VRAM for dense attention (the 27B) is not wanted: Qwen4 will not have dense
+  attention and Inkling 2 Mini's K/V is small; the 27B keeps the context its devices hold.
 - K/V beyond VRAM (`kv/overflow`): the far K/V pages a finished request leaves behind rank as
   prompt cache, the lowest user of `--ram`: under pressure they give way before the tier of
   experts (to the SSD level with `--cache`, else dropped); a running sequence's far K/V stays
