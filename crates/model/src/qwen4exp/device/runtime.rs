@@ -601,10 +601,41 @@ pub fn step_rows(gguf: &Gguf, devices: &[Device], opts: &Options) -> Result<u32,
 /// The most rows of a step the model is opened with.
 const WIDE_ROWS: u32 = 4096;
 
+/// The rows of a lent step are a multiple of this ([`widest_rows`]).
+pub const ROW_GRAIN: u32 = 256;
+
+/// The rows of the widest step from `asked` down to `own` that `fits` holds: `asked`, or the
+/// largest multiple of [`ROW_GRAIN`] below it that fits, or `own` when no more rows do. `fits`
+/// must hold for fewer rows wherever it holds for more (the scratch grows with the rows), so
+/// the rows are found by halving the range between them.
+pub fn widest_rows<E>(
+    own: u32,
+    asked: u32,
+    mut fits: impl FnMut(u32) -> Result<bool, E>,
+) -> Result<u32, E> {
+    if asked <= own {
+        return Ok(own);
+    }
+    if fits(asked)? {
+        return Ok(asked);
+    }
+    // `lo` grains fit (or are no more than `own`), `hi` grains do not.
+    let (mut lo, mut hi) = (own / ROW_GRAIN, asked.div_ceil(ROW_GRAIN));
+    while hi - lo > 1 {
+        let mid = lo + (hi - lo) / 2;
+        if mid * ROW_GRAIN <= own || fits(mid * ROW_GRAIN)? {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    Ok((lo * ROW_GRAIN).max(own))
+}
+
 /// The rows of the widest step a prompt read alone takes on `devices` placed as
-/// `placement`: the largest power of two from `asked` down whose scratch the
-/// expert slots of every device can lend (`expert_store/scratch.rs`), above
-/// `opts.part.own_rows()`; that if none is. `pages` is what the pools of K and
+/// `placement`: `asked`, or the largest multiple of [`ROW_GRAIN`] below it whose
+/// scratch the expert slots of every device can lend (`expert_store/scratch.rs`),
+/// above `opts.part.own_rows()`; that if none is. `pages` is what the pools of K and
 /// V hold, `page_bytes` a page on each device, as [`place`] gave them.
 ///
 /// A device lends what the slots of its largest pool (the layers whose experts
@@ -646,8 +677,7 @@ pub fn batch_rows(
             (all, sizes.iter().map(|(_, sum)| *sum).max().unwrap_or(0))
         })
         .collect();
-    let mut rows = asked.max(own);
-    while rows > own {
+    widest_rows(own, asked.max(own), |rows| {
         let wide = Options { max_rows: rows, own_rows: own, ..opts.part.clone() };
         let narrow = Options { max_rows: own, own_rows: 0, ..opts.part.clone() };
         let fits = devices.iter().enumerate().all(|(d, device)| {
@@ -674,12 +704,8 @@ pub fn batch_rows(
             let lendable_scratch = (room / all.max(1)).saturating_sub(floor) * largest;
             f.lent_bytes() <= lendable_scratch / 10 * 9
         });
-        if fits {
-            return Ok(rows);
-        }
-        rows /= 2;
-    }
-    Ok(own)
+        Ok(fits)
+    })
 }
 
 /// Where the layers of the model in `gguf` would go on `devices` with `opts`,
@@ -1484,10 +1510,11 @@ impl Qwen4Exp {
                 let ram_bytes = store.ram_bytes().0;
                 let ram_fixed = store.ram_fixed_bytes();
                 // The widest step a prompt read alone takes: the rows the
-                // parts were opened for, halved until every device's slots can
-                // lend its scratch (a loan comes from one pool, so the plan's
-                // estimate may hold more); and where each device's slots lend
-                // it: always the same slots.
+                // parts were opened for, or the most below them, in multiples
+                // of `ROW_GRAIN`, whose scratch every device's slots can lend
+                // (a loan comes from one pool, so the plan's estimate may hold
+                // more); and where each device's slots lend it: always the
+                // same slots.
                 let own = o.own_rows();
                 let lent_of = |d: usize, rows: u32| -> Result<(u64, u64), ModelError> {
                     let PartPlan { role, first, shares, head } = self.placement.part(c, d);
@@ -1496,17 +1523,14 @@ impl Qwen4Exp {
                     let frame = Frame::new(c, &opts, &shape, build.multiprocessors[d])?;
                     Ok((frame.lent_bytes(), frame.lent_raw()))
                 };
-                let mut rows = if build.lent.iter().any(|b| *b > 0) { o.max_rows } else { own };
-                while rows > own {
+                let asked = if build.lent.iter().any(|b| *b > 0) { o.max_rows } else { own };
+                let rows = widest_rows(own, asked, |rows| {
                     let mut fits = true;
                     for d in 0..n {
                         fits &= lent_of(d, rows)?.0 <= store.lendable_scratch(d);
                     }
-                    if fits {
-                        break;
-                    }
-                    rows = (rows / 2).max(own);
-                }
+                    Ok::<bool, ModelError>(fits)
+                })?;
                 build.lone_rows = rows;
                 for d in 0..n {
                     let (bytes, raw) = if rows > own { lent_of(d, rows)? } else { (0, 0) };
@@ -2505,6 +2529,22 @@ impl DeviceModel for Qwen4ExpDevice {
         }
         let left = self.flow.lock_feed().store.rows_left();
         out.extend((0..32).filter(|row| left >> row & 1 != 0));
+    }
+}
+
+#[cfg(test)]
+mod widest_tests {
+    use super::*;
+
+    #[test]
+    fn the_widest_step_is_a_multiple_of_the_grain_that_fits() {
+        let fits = |most: u32| move |rows: u32| Ok::<bool, ()>(rows <= most);
+        assert_eq!(widest_rows(512, 8192, fits(9000)), Ok(8192));
+        assert_eq!(widest_rows(512, 8192, fits(3700)), Ok(3584));
+        assert_eq!(widest_rows(512, 8192, fits(767)), Ok(512));
+        assert_eq!(widest_rows(512, 8192, fits(768)), Ok(768));
+        assert_eq!(widest_rows(512, 512, fits(0)), Ok(512));
+        assert_eq!(widest_rows(512, 1000, fits(999)), Ok(768));
     }
 }
 
