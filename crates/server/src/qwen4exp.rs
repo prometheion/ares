@@ -797,6 +797,7 @@ pub(crate) fn load(
             100.0 * ram_slots as f64 / all as f64,
         );
     }
+    watch_reads(std::sync::Arc::downgrade(&model));
     if let Some(report) = model.mtp_report() {
         watch_drafts(std::sync::Arc::downgrade(&model));
         let (vram, ram_slots) = model.mtp_slots().unwrap_or((0, 0));
@@ -1177,6 +1178,68 @@ fn watch_drafts(model: std::sync::Weak<Qwen4Exp>) {
     };
     // Without the thread the engine runs all the same.
     let _ = std::thread::Builder::new().name("ares-draft-watch".into()).spawn(watch);
+}
+
+/// Logs, whenever it has changed, what the reads of experts from the model file took since
+/// the engine started (the reader's counters, the latencies of the newest reads) and what the
+/// layers of wide steps waited for. Ends with the model.
+fn watch_reads(model: std::sync::Weak<Qwen4Exp>) {
+    let watch = move || {
+        let (mut requests, mut layers) = (0, 0);
+        loop {
+            std::thread::sleep(DRAFT_WATCH);
+            let Some(model) = model.upgrade() else { return };
+            if let Some(stats) = model.read_stats() {
+                let now = stats.demand.requests + stats.prefetch.requests;
+                if now != requests {
+                    requests = now;
+                    let ms = |d: Duration| d.as_secs_f64() * 1e3;
+                    let (d, p) = (&stats.demand_latency, &stats.prefetch_latency);
+                    tracing::info!(
+                        "reads of the model file: demand {} reads, {}; prefetch {} reads, {}, \
+                         {} cancelled, {} promoted; demand latency median {:.2} ms, p95 {:.2}, \
+                         p99 {:.2}; prefetch median {:.2} ms, p99 {:.2}; at most {} chunks at \
+                         the drive",
+                        stats.demand.requests,
+                        Bytes(stats.demand.device_bytes),
+                        stats.prefetch.requests,
+                        Bytes(stats.prefetch.device_bytes),
+                        stats.cancelled,
+                        stats.promoted,
+                        ms(d.p50),
+                        ms(d.p95),
+                        ms(d.p99),
+                        ms(p.p50),
+                        ms(p.p99),
+                        stats.peak_in_flight,
+                    );
+                }
+            }
+            if let Some(wide) = model.wide_stats()
+                && wide.layers != layers
+            {
+                layers = wide.layers;
+                let s = |d: Duration| d.as_secs_f64();
+                tracing::info!(
+                    "wide steps: {} layers, {} experts picked, {} without a slot, {} rounds \
+                     after the first; waited {:.1} s for route records, {:.1} s for first \
+                     rounds, {:.1} s for misses to arrive, {:.1} s for later rounds; the layers \
+                     took {:.1} s",
+                    wide.layers,
+                    wide.picked,
+                    wide.missing,
+                    wide.extra_rounds,
+                    s(wide.record_wait),
+                    s(wide.compute_wait),
+                    s(wide.bring_wait),
+                    s(wide.round_wait),
+                    s(wide.layer_time),
+                );
+            }
+        }
+    };
+    // Without the thread the engine runs all the same.
+    let _ = std::thread::Builder::new().name("ares-read-watch".into()).spawn(watch);
 }
 
 fn ordinals_of(held: &[crate::load::Held]) -> String {

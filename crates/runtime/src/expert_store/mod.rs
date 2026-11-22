@@ -1452,6 +1452,11 @@ impl<D: SlotDevice> ExpertStore<D> {
         Ok(())
     }
 
+    /// The counters of the reader of the model file: reads, bytes and latencies by class.
+    pub fn reader_stats(&self) -> ares_io::Stats {
+        self.reader.stats()
+    }
+
     /// Whether a slot of `layer` may be emptied now: no kernel can be
     /// reading an expert the step did not pick.
     fn can_evict(&self, layer: usize) -> bool {

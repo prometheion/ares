@@ -1235,6 +1235,12 @@ impl Qwen4Exp {
         Some(*flow.wide.lock().unwrap_or_else(|e| e.into_inner()))
     }
 
+    /// The counters of the reader of the model file (reads by class, bytes, latencies); `None`
+    /// before the parts are open.
+    pub fn read_stats(&self) -> Option<ares_io::Stats> {
+        Some(self.flow.get()?.lock_feed().store.reader_stats())
+    }
+
     /// What the expert store counted since the last call; `None` before the
     /// parts are open.
     pub fn take_store_stats(&self) -> Option<StoreStats> {
