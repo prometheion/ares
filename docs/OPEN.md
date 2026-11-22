@@ -30,11 +30,13 @@ section further down.
    a change in the middle of a conversation (an older tool result cut, an edited message) then
    costs only the rows from the last checkpoint before it (prompt cache; the owner, 2026-11-18).
    Done 2026-11-22 (branch `cache/checkpoints`, see "Prompt cache" below for what is left).
-3. Large prompt chunks for Flash-Next with expert slots borrowed in VRAM, batch and micro-batch
-   adjustable, adaptive when another request waits (experts from the SSD).
+3. [x] Large prompt chunks for Flash-Next with expert slots borrowed in VRAM, batch and micro-batch
+   adjustable, adaptive when another request waits (experts from the SSD). Done 2026-11-22
+   (`moe/prompt-chunks`); a step cannot be cut, so a request that comes during a long lone step
+   waits for it (owner's question below).
 4. Done 2026-11-22 (`server/flash-api`): tools, structured output and the Messages and Responses
    routes on the real Flash-Next, and Claude Code itself against Ares on both models ("Server and API").
-5. Flash-Next's draft vocabulary (step 6 of the shared layer, being finished).
+5. [x] Flash-Next's draft vocabulary (step 6 of the shared layer).
 6. K/V of a running sequence beyond VRAM for Flash-Next at long contexts (whole features). The
    owner's rule for the context (2026-11-22): without `--context` the model's own maximum (262144
    for Qwen3.8) on both models; what does not fit in VRAM overflows into RAM. Until the overflow
@@ -51,13 +53,12 @@ tree is accepted than a chain), then built; started when the pieces in work leav
 piece at a time.
 
 ## In work now
+Merged 2026-11-22 after the test machine's one card passed every GPU suite (`fix/mtp-and-slots`,
+`moe/prompt-chunks`, `cache/checkpoints`, `devices/roles`); what needs two cards is owed below
+("Owed on two cards").
 
 | Piece | State |
 | --- | --- |
-| 1 and 2: Claude Code's billing stamp as upstream; checkpoints at the system prompt's and tool list's end, at every message boundary and at fixed distances | handed back, being verified (`cache/checkpoints`) |
-| 3: large prompt chunks for Flash-Next (TokenWing and Strata read first), batch and micro-batch, adaptive | handed back, being verified (`moe/prompt-chunks`) |
-| The best use of the second card (the fork's attention split, more context there, expert tier only, drafters there): measured, then roles | handed back, being verified (`devices/roles`) |
-| The MTP block's crash with long prompts on Flash-Next (status 0x4) and the expert slots filled at the start, as Strata does | handed back, being verified (`fix/mtp-and-slots`) |
 | Flash-Next decodes UD-Q3_K_XL at least as fast as Strata on the test machine (the owner, 2026-11-22): CPU kernels for every expert type, then the next lever by measurement | agent working on the test machine (`flash/cpu-experts`) |
 | Flash-Next UD-Q4_K_XL (104 GiB, larger than RAM) streamed from the SSD against Strata, then Ares's reading path | agent working on the test machine (`flash/ssd-stream`) |
 | 6: K/V beyond VRAM into RAM, and K/V VRAM nobody uses yet serving the expert tier | agent working on the test machine (`kv/overflow`) |
@@ -887,12 +888,39 @@ Measured per phase on a quiet machine against the fork and Strata, the largest f
 - [ ] Before a release: both models against the fork, Strata and TokenWing (Flash-Next), speed,
       VRAM, quality.
 
+## Owed on two cards (the owner's cards are production; run at the next window he gives)
+- [ ] `qwen4exp_runtime` `the_mtp_block_follows_wide_steps_that_start_at_any_cell` (new with the
+      MTP fix) failed on the RTX 4070 and RTX 3060 in the warm-up ("every expert has a slot",
+      line 497), in a placement the failure did not name; it passes with one card (RTX 4060 Ti).
+      Run it with `--nocapture`; then two cards or 12 GiB.
+- [ ] The suites that need two devices: `ares-server --test real`
+      (`flash_next_answers_in_both_placements`), `real_cache` (two of four), `real_devices`,
+      `qwen35_device_runtime` with the attention-split placements, `qwen4exp_device` with
+      `ARES_TEST_SPREAD=tensor` (`ARES_TEST_CORE_SHARE=1 ARES_TEST_SHARED=mixer` too), and the
+      MTP block's first links with both cards on every layer ("Server and API").
+- [ ] Rust 1.100 (stable on the test machine) crashes compiling `ares-model --test
+      qwen35_failure` (an internal compiler error); 1.99 builds it. Check again with the next
+      stable; the repository asks for `stable`.
+- [ ] `qwen4exp_runtime` with the default test threads hung for over 18 minutes once (two device
+      threads spinning; the `moe/prompt-chunks` agent); with `--test-threads=1` it passes.
+
 ## Questions to the owner
 - Flash-Next's float matrices in the vote on the activation form ("Optimising"): leave them out,
   so that its dense products take int8 on a capped card as the 27B's do (faster, 1.1 % rms in
   place of 0.03 %, the output changes), or keep the exact f16 path there?
 - Capped cards measuring their prefill path per type as full-rate cards do (in place of the rule
   kept from the two development cards)?
+- Large prompt steps (`moe/prompt-chunks`): a request that comes while a long prompt is read alone
+  waits for the step in flight (first token after 13.5 s against 2.7 s with steps of 512 rows,
+  the long prompt 380 against 241 tokens/s). Keep it, bound the lone step in time (fewer rows,
+  less gain), or build the interruptible layer-major pass next?
+- Flash-Next on two cards (`devices/roles`): measure at load whether the second card computes a
+  dense share or holds experts only (warm prompts +27 %, decode the same on these cards; costs
+  1 to 2 s at load and 0.4 GiB per card for a moment), with no option?
+- Checkpoints (`cache/checkpoints`): a message boundary takes one only 1024 cells or more after
+  the last, so that cold prompts are not cut into many steps; with one checkpoint place a
+  request's end state no longer pushes out its own anchor (robust to replies sent back changed,
+  at the price of the reply's rows on an exact continuation). Both as built?
 - A tool call that a client gives back with its schema's default arguments added (Claude Code's
   `"replace_all": false`): write it without them, so that the history matches the cache, or
   leave the client's history as it is and rely on the checkpoint at every message boundary
