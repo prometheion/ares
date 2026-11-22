@@ -27,7 +27,7 @@
 //!   model.
 
 use std::ops::Range;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, TryLockError};
 use std::time::{Duration, Instant};
 
@@ -43,8 +43,8 @@ use ares_runtime::expert_store::{
 };
 use ares_runtime::{
     ContextSpec, DeviceContext, DeviceModel, DeviceTransfer, Drafter, DrafterKind, Durable,
-    LinkSpec, Logits, Model, ModelDrafts, ModelError, Pick, PinnedRam, PrefixCache, Split,
-    StepContext, TowerJob, TransferContext, Vision,
+    FarPages, LinkSpec, Logits, Model, ModelDrafts, ModelError, Pick, PinnedRam, PrefixCache,
+    Split, StepContext, TowerJob, TransferContext, Vision,
 };
 use ares_state::PageLayout;
 use ares_tokenizer::{ChatOptions, Tokenizer};
@@ -340,7 +340,7 @@ pub(super) struct Flow {
     /// The far pools of the parts (`blocks/far.rs`), the far slots their
     /// pieces cover now, and the engine's RAM, which books them.
     far: Vec<Arc<Mutex<FarPool>>>,
-    far_slots: AtomicU32,
+    far_live: Mutex<Vec<bool>>,
     ram: PinnedRam,
 }
 
@@ -421,7 +421,7 @@ impl Flow {
         step: u64,
         rows: u32,
         windows: Option<StepWindows<'_>>,
-        far_slots: u32,
+        far_live: &[bool],
         index: usize,
         stream: &Stream,
         pass: Option<&PassKey>,
@@ -431,7 +431,7 @@ impl Flow {
             // The K and V beyond VRAM that the step names are locked before
             // the store begins it: the tier of experts gives up what they take
             // while no step runs.
-            self.lock_far(&mut feed, far_slots)?;
+            self.lock_far(&mut feed, far_live)?;
             for counter in self.enqueued.iter().chain(&self.followed) {
                 counter.store(0, Ordering::Release);
             }
@@ -457,28 +457,36 @@ impl Flow {
         feed.store.device_mut(index).fence(stream).map_err(|e| invalid(e.to_string()))
     }
 
-    /// Locks the pieces of every far pool that its first `slots` slots lie in
-    /// and gives back those above them, between steps, with the store not in
-    /// a step. The tier of experts gives up what the RAM limit has no room
-    /// for: a running sequence's K and V rank above it (see "Host memory" in
-    /// `docs/ARCHITECTURE.md`).
-    fn lock_far(&self, feed: &mut Feed, slots: u32) -> Result<(), ModelError> {
-        if self.far.is_empty() || slots == self.far_slots.load(Ordering::Acquire) {
+    /// Locks the pieces of every far pool that hold far pages in use (`live`,
+    /// a flag per far slot) and gives back the others, between steps, with
+    /// the store not in a step. The tier of experts gives up what the RAM
+    /// limit has no room for: a running sequence's K and V rank above it
+    /// (see "Host memory" in `docs/ARCHITECTURE.md`).
+    fn lock_far(&self, feed: &mut Feed, live: &[bool]) -> Result<(), ModelError> {
+        if self.far.is_empty() {
+            return Ok(());
+        }
+        let mut last = self.far_live.lock().unwrap_or_else(|e| e.into_inner());
+        if last.as_slice() == live {
             return Ok(());
         }
         let mut pools: Vec<_> =
             self.far.iter().map(|p| p.lock().unwrap_or_else(|e| e.into_inner())).collect();
-        // What lies above the slots goes back first (each pool keeps a spare
-        // piece); what they need is locked in every pool.
-        for pool in &mut pools {
-            pool.shrink(slots);
+        let wanted: Vec<Vec<bool>> = pools.iter().map(|p| p.wanted(live)).collect();
+        // What holds no page in use goes back first; what the pages need is
+        // locked in every pool.
+        for (pool, wanted) in pools.iter_mut().zip(&wanted) {
+            pool.release_unwanted(wanted);
         }
-        let wanted: u64 = pools.iter().map(|p| p.bytes_for(slots)).sum();
+        let bytes: u64 = pools.iter().zip(&wanted).map(|(p, w)| p.bytes_of(w)).sum();
         let locked: u64 = pools.iter().map(|p| p.locked()).sum();
-        self.ram.set_context_target(wanted.max(locked));
+        self.ram.set_context_target(bytes.max(locked));
         let started = Instant::now();
         loop {
-            let short = pools.iter_mut().find_map(|pool| pool.ensure(slots).err());
+            let short = pools
+                .iter_mut()
+                .zip(&wanted)
+                .find_map(|(pool, wanted)| pool.lock_wanted(wanted).err());
             match short {
                 None => break,
                 Some(Err(error)) => return Err(error),
@@ -503,7 +511,8 @@ impl Flow {
             }
         }
         self.ram.set_context_target(pools.iter().map(|p| p.locked()).sum());
-        self.far_slots.store(slots, Ordering::Release);
+        last.clear();
+        last.extend_from_slice(live);
         Ok(())
     }
 
@@ -930,6 +939,8 @@ pub struct Qwen4Exp {
     pinned: u64,
     /// The bytes one page of the pools takes on each device.
     page_bytes: Vec<u64>,
+    /// The pages whose K and V lie in host memory, when some do.
+    far: Option<FarPages>,
     /// What each device keeps of a sequence and of a page, for the prefix
     /// cache (`resume.rs`).
     declared: Vec<Declared>,
@@ -1004,6 +1015,7 @@ impl Qwen4Exp {
         let (placement, page_bytes) = place_in(&gguf, &config, &weights, devices, &opts)?;
         let (layout, _map) = Layout::new(&gguf, &config, &weights, &placement, None)?;
         let mut pinned = 0;
+        let mut far_bytes = 0;
         let mut declared = Vec::with_capacity(devices.len());
         for (index, device) in devices.iter().enumerate() {
             let PartPlan { role, first, shares, head } = placement.part(&config, index);
@@ -1017,6 +1029,7 @@ impl Qwen4Exp {
                     .is_some_and(|g| (first..first + layers).contains(&g.layer));
             let shape = PartShape { role, first, shares, head };
             let frame = Frame::new(&config, &opts.part, &shape, device.info().multiprocessors)?;
+            far_bytes += frame.page_parts().0;
             let mut part = frame.declared(&opts.part);
             if feeds {
                 part.checkpoint += ngram::saved_bytes(config.ngram.as_ref());
@@ -1042,6 +1055,9 @@ impl Qwen4Exp {
         let gguf = Arc::new(gguf);
         let rows = Arc::new(HostTable::mapped(gguf.clone(), TOKEN_EMBD)?);
         let config_vocab = config.n_vocab as u32;
+        let near = opts.part.near_pages();
+        let far =
+            (near < opts.part.pages()).then_some(FarPages { first: near, page_bytes: far_bytes });
         Ok(Self {
             gguf,
             config,
@@ -1082,6 +1098,7 @@ impl Qwen4Exp {
             reports: Mutex::new(Vec::new()),
             pinned,
             page_bytes,
+            far,
             declared,
             mtp: None,
             dflash: None,
@@ -1853,7 +1870,7 @@ impl Qwen4Exp {
                     pass_picks: Mutex::new(None),
                     pass_count: AtomicU64::new(0),
                     far: build.far.iter().flatten().cloned().collect(),
-                    far_slots: AtomicU32::new(0),
+                    far_live: Mutex::new(Vec::new()),
                     ram: ram.clone(),
                     totals: Mutex::new(ExpertStats {
                         ram_tier_bytes: ram_bytes,
@@ -2001,7 +2018,6 @@ impl Qwen4Exp {
             resume,
             near: (near < o.pages()).then_some(near),
             live: Vec::new(),
-            highest: None,
         }))
     }
 }
@@ -2226,6 +2242,10 @@ impl Model for Qwen4Exp {
         page | PAGE_ENTRY
     }
 
+    fn far_pages(&self) -> Option<FarPages> {
+        self.far
+    }
+
     fn page_layout(&self, cells_per_page: u32) -> PageLayout {
         // The attention kernels store 128 cells per entry; `open` refuses any
         // other page size.
@@ -2301,13 +2321,12 @@ struct Qwen4ExpDevice {
     replay: Vec<Range<u32>>,
     /// The checkpoints of the prefix cache on this device.
     resume: Resume,
-    /// The first page whose K and V are in host memory, when some are; which
-    /// pages the tables name and the pool has not freed, and the highest of
-    /// them: the far pools are locked up to it (every device keeps the same
-    /// books, any of them may begin a step for the store).
+    /// The first page whose K and V are in host memory, when some are, and
+    /// which pages the tables name and the pool has not freed: the far pools
+    /// keep the pieces of those locked (every device keeps the same books,
+    /// any of them may begin a step for the store).
     near: Option<u32>,
     live: Vec<bool>,
-    highest: Option<u32>,
 }
 
 impl Qwen4ExpDevice {
@@ -2320,27 +2339,22 @@ impl Qwen4ExpDevice {
             self.live.resize(page as usize + 1, false);
         }
         self.live[page as usize] = true;
-        self.highest = self.highest.max(Some(page));
     }
 
-    /// The far slots the step needs locked: up to the highest page the
-    /// tables name after its updates, minus the pages in VRAM.
-    fn far_slots(&mut self, record: &ares_runtime::RecordView<'_>) -> u32 {
-        let Some(near) = self.near else { return 0 };
-        let mut lowered = false;
+    /// The pages the tables name after the step's updates, less those the
+    /// pool freed: the far pools keep the pieces of the far ones locked.
+    fn update_live(&mut self, record: &ares_runtime::RecordView<'_>) {
+        if self.near.is_none() {
+            return;
+        }
         for i in 0..record.freed() {
-            let page = record.freed_page(i) as usize;
-            if let Some(live) = self.live.get_mut(page) {
-                lowered |= std::mem::take(live) && Some(page as u32) == self.highest;
+            if let Some(live) = self.live.get_mut(record.freed_page(i) as usize) {
+                *live = false;
             }
         }
         for k in 0..record.entries() {
             self.mark_live(record.entry(k) & !PAGE_ENTRY);
         }
-        if lowered {
-            self.highest = self.live.iter().rposition(|l| *l).map(|p| p as u32);
-        }
-        self.highest.map_or(0, |page| (page + 1).saturating_sub(near))
     }
 }
 
@@ -2525,8 +2539,10 @@ impl Qwen4ExpDevice {
             self.give_up_pass();
         }
         let pass = self.pass_of(step)?;
-        let far_slots = self.far_slots(record);
-        self.flow.begin(number, rows, windows, far_slots, self.index, stream, pass.as_ref())?;
+        self.update_live(record);
+        let far_live =
+            self.near.map_or(&[][..], |near| self.live.get(near as usize..).unwrap_or(&[]));
+        self.flow.begin(number, rows, windows, far_live, self.index, stream, pass.as_ref())?;
         // What this part keeps of a pass that has ended, or that another pass of the same
         // rows has taken the loan of, goes; a paused pass goes on.
         self.forget_ended_pass();

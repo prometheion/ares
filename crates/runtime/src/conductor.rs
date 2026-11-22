@@ -860,6 +860,7 @@ impl Conductor {
                 )
                 .with_reach(model.prompt_rows().min(max_rows))
                 .with_ram(exec.ram())
+                .with_far(model.far_pages())
             }),
             admission: Admission::new(admission),
             slots: (0..slots).map(|_| None).collect(),

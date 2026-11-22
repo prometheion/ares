@@ -92,7 +92,7 @@ pub use image::{
 pub use links::{Links, MAX_DEVICES};
 pub use model::{
     ContextSpec, DeviceContext, DeviceModel, DeviceTransfer, Drafter, DrafterKind, Durable,
-    EncodedPrompt, LinkSpec, Logits, Model, ModelDrafts, ModelError, PrefixCache, Split,
+    EncodedPrompt, FarPages, LinkSpec, Logits, Model, ModelDrafts, ModelError, PrefixCache, Split,
     StepContext, TowerJob, TransferContext, Vision,
 };
 pub use ram::{

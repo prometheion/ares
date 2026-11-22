@@ -130,6 +130,10 @@ pub struct SyntheticConfig {
     /// The cells before the start of a step whose pages the model says have
     /// not reached the form they keep ([`crate::Durable::settle_cells`]).
     pub settle_cells: u32,
+    /// The pages from which on the model says it keeps them in host memory
+    /// ([`crate::Model::far_pages`]), with the bytes one takes there. `None`:
+    /// every page is on the devices (the default).
+    pub far_pages: Option<crate::FarPages>,
     /// The links of a chain of drafts the model makes itself, like the draft
     /// block of a real one: 0 for none. The context must read one token
     /// (`context.window == 1`) so that a draft's context follows from the
@@ -178,6 +182,7 @@ impl SyntheticConfig {
             state_bytes_per_cell: 0,
             prefix_cache: None,
             durable: None,
+            far_pages: None,
             settle_cells: 0,
             mtp_links: 0,
             mtp_accuracy: Vec::new(),
@@ -687,6 +692,10 @@ impl Model for SyntheticModel {
 
     fn page_entry(&self, page: u32) -> u32 {
         page
+    }
+
+    fn far_pages(&self) -> Option<crate::FarPages> {
+        self.config.far_pages
     }
 
     fn page_layout(&self, cells_per_page: u32) -> PageLayout {

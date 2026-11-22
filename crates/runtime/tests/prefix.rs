@@ -17,8 +17,8 @@ use std::time::{Duration, Instant};
 use ares_api::Engine;
 use ares_runtime::testing::{Gate, HostExecutor, Problems};
 use ares_runtime::{
-    RequestReport, Runtime, RuntimeConfig, Snapshot, Split, StateCopyKind, SyntheticConfig,
-    SyntheticModel,
+    FarPages, PinnedRam, RequestReport, Runtime, RuntimeConfig, Snapshot, Split, StateCopyKind,
+    SyntheticConfig, SyntheticModel,
 };
 use common::*;
 
@@ -1399,4 +1399,44 @@ fn a_turn_that_restores_an_end_state_still_saved_with_its_record_gets_that_state
     assert_eq!(again.report.replayed_rows, 0, "{:?}", again.report);
     assert_eq!(again.run.text, fresh(shape, &second, 6).text);
     assert_consistent(&e);
+}
+
+/// Pages a model keeps in host memory (from page 4 on, [`FarPages`]: the K and V of a context
+/// beyond VRAM) that only the prompt cache holds once their request ended rank as prompt cache,
+/// the lowest user of the engine's RAM (the owner's rule of 2026-11-22). With a tier of experts
+/// that wants more than the limit leaves, they leave the devices as soon as the request ended,
+/// with nothing below the devices to keep them (no level on SSD here): the next request with
+/// the same prompt finds only the pages in VRAM. With a tier that wants little, they stay. The
+/// answers are the same either way.
+#[test]
+fn far_pages_of_a_finished_request_give_way_when_the_tier_of_experts_wants_the_memory() {
+    let mut rng = Rng(31);
+    let prompt = text_of(&mut rng, 10 * PAGE as usize + 3);
+    let mut texts = Vec::new();
+    for hungry in [true, false] {
+        let model = model(Some(CHECKPOINT), |c| {
+            c.far_pages = Some(FarPages { first: 4, page_bytes: 1 << 20 });
+        });
+        let ram = PinnedRam::new(64 << 20);
+        ram.want_experts(if hungry { 1 << 40 } else { 0 }, 0);
+        let books = ram.clone();
+        let e = engine_with(&model, config(64, 4), move |host| host.with_ram(books));
+        let first = e.ask(&prompt, 4);
+        // One more turn of the conductor's loop, which trims between steps.
+        let _ = e.ask("ab", 1);
+        let cached_far = ram.context_cached();
+        let again = e.ask(&prompt, 4);
+        let found = again.run.usage.cached_prompt_tokens;
+        if hungry {
+            assert_eq!(cached_far, 0, "the far pages went");
+            assert_eq!(found, 4 * PAGE, "only the pages in VRAM stayed cached");
+        } else {
+            assert!(cached_far >= 6 << 20, "the far pages stayed: {cached_far}");
+            assert!(found >= 10 * PAGE, "the whole prompt stayed cached: {found}");
+        }
+        assert_eq!(again.run.text, first.run.text, "hungry {hungry}");
+        texts.push(first.run.text);
+        assert_consistent(&e);
+    }
+    assert_eq!(texts[0], texts[1]);
 }

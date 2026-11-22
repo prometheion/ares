@@ -919,9 +919,22 @@ impl PrefixIndex {
     /// it the least recently used. A leaf goes whole, with its checkpoint.
     /// `None` when every cached page is in use by a sequence.
     pub fn evict(&mut self, pool: &mut PagePool) -> Option<Evicted> {
+        self.evict_where(pool, |_| true)
+    }
+
+    /// [`PrefixIndex::evict`] of the first page in that order whose number
+    /// `which` takes: the pages of a model that keeps some of its pages in
+    /// slower memory than the others, which go first when memory is short.
+    pub fn evict_where(
+        &mut self,
+        pool: &mut PagePool,
+        which: impl Fn(PageId) -> bool,
+    ) -> Option<Evicted> {
         let key = *self.leaves.iter().find(|(_, _, hash)| match self.entries.get(hash) {
-            Some(entry) => pool.refcount(entry.page) == 1,
-            None => self.tail_page(*hash).is_some_and(|page| pool.refcount(page) == 1),
+            Some(entry) => pool.refcount(entry.page) == 1 && which(entry.page),
+            None => {
+                self.tail_page(*hash).is_some_and(|page| pool.refcount(page) == 1 && which(page))
+            }
         })?;
         let hash = key.2;
         let Some(entry) = self.entries.remove(&hash) else {

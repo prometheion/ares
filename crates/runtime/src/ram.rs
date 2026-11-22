@@ -76,9 +76,13 @@ struct Books {
     required: Consumer,
     /// The K/V of the context beyond VRAM, and what it will hold once the
     /// pieces of the step that begins are locked: the elastic users make room
-    /// for that much before the pieces are booked.
+    /// for that much before the pieces are booked. Of it, `context_cached`
+    /// are pages that only the prompt cache holds: they rank as prompt cache
+    /// (the owner's rule of 2026-11-22), so they count in the prompt cache's
+    /// share and not against the tier of experts.
     context: Consumer,
     context_target: u64,
+    context_cached: u64,
     /// The prompt cache in RAM: checkpoints of recurrent state and pages.
     cache: Consumer,
     /// The bytes of `cache` that are pages; the rest are checkpoints.
@@ -110,10 +114,19 @@ impl Books {
         self.broker.info(consumer.id()).map_or(0, |info| info.usage)
     }
 
-    /// What the limit leaves for the elastic users.
+    /// What the limit leaves for the elastic users: the K/V of running
+    /// sequences beyond VRAM is not theirs; that of pages only the prompt
+    /// cache holds is the prompt cache's.
     fn elastic_room(&self) -> u64 {
         let context = self.usage(&self.context).max(self.context_target);
-        self.broker.capacity().saturating_sub(self.usage(&self.required) + context)
+        let running = context.saturating_sub(self.context_cached);
+        self.broker.capacity().saturating_sub(self.usage(&self.required) + running)
+    }
+
+    /// What the prompt cache holds: its own bookings and the K/V beyond
+    /// VRAM of the pages only it holds.
+    fn cache_usage(&self) -> u64 {
+        self.usage(&self.cache) + self.context_cached
     }
 
     /// The prompt cache's floor, never more than it can use.
@@ -184,7 +197,7 @@ impl Shared {
             locked: books.broker.used(),
             experts_held: books.usage(&books.experts).saturating_sub(books.experts_floor),
             experts_want,
-            cache_held: books.usage(&books.cache).saturating_sub(floor_held),
+            cache_held: books.cache_usage().saturating_sub(floor_held),
             cache_want: cache_want.min(room - experts_want),
         }
     }
@@ -230,7 +243,11 @@ impl Shared {
         }
         // The chunk that the floor's place lies in is not more than allowed.
         let allowance = ram.cache_allowance().max(self.floor_held());
-        if ram.prompt_cache() > allowance {
+        let held = {
+            let books = self.books();
+            books.cache_usage()
+        };
+        if held > allowance {
             if let Some(hook) = cache {
                 hook(&ram, allowance);
             }
@@ -295,6 +312,7 @@ impl PinnedRam {
             required,
             context,
             context_target: 0,
+            context_cached: 0,
             cache,
             pages: 0,
             experts,
@@ -352,6 +370,12 @@ impl PinnedRam {
         books.usage(&books.cache)
     }
 
+    /// Bytes of the K/V beyond VRAM that only the prompt cache holds
+    /// ([`PinnedRam::set_context_cached`]).
+    pub fn context_cached(&self) -> u64 {
+        self.books().context_cached
+    }
+
     /// Bytes the prompt cache's checkpoints hold now.
     pub fn checkpoints(&self) -> u64 {
         let books = self.books();
@@ -381,6 +405,14 @@ impl PinnedRam {
     /// bookings of the pieces find it free.
     pub fn set_context_target(&self, bytes: u64) {
         self.books().context_target = bytes;
+    }
+
+    /// Of the K/V of the context beyond VRAM, `bytes` hold pages that only
+    /// the prompt cache holds: they rank as prompt cache, the lowest user,
+    /// and give way first when memory is short (the conductor takes them
+    /// off the devices, to the level on SSD or nowhere).
+    pub fn set_context_cached(&self, bytes: u64) {
+        self.books().context_cached = bytes;
     }
 
     /// `len` bytes of address space for the K/V of the context beyond VRAM
@@ -1219,6 +1251,30 @@ mod tests {
         ram.release_context(30 * MIB);
         ram.set_context_target(0);
         assert_eq!((ram.context(), ram.experts_allowance()), (0, 90 * MIB));
+    }
+
+    #[test]
+    fn far_k_and_v_of_finished_requests_counts_as_prompt_cache_and_not_against_the_tier() {
+        let ram = PinnedRam::new(100 * MIB);
+        ram.require(10 * MIB).unwrap();
+        ram.want_experts(GIB, 0);
+        // The far pools hold 30 MiB of K and V: 10 for running sequences, 20
+        // for pages only the prompt cache holds.
+        ram.book_context(30 * MIB).unwrap();
+        ram.set_context_cached(20 * MIB);
+        // The tier may have all but the running sequences' 10: the cached 20
+        // are the prompt cache's, which ranks below it.
+        assert_eq!(ram.experts_allowance(), 80 * MIB);
+        assert_eq!(ram.cache_allowance(), 0, "the tier wants everything");
+        let wants = ram.shared.wants();
+        assert_eq!(wants.cache_held, 20 * MIB, "the machine sees them as the cache's");
+        // When the cache gives them up (the conductor takes the pages off
+        // the devices) and the pieces are unlocked, the tier gets the memory.
+        ram.set_context_cached(0);
+        ram.release_context(20 * MIB);
+        assert_eq!(ram.experts_allowance(), 80 * MIB);
+        ram.book_experts(80 * MIB).unwrap();
+        assert_eq!(ram.unbooked(), 0);
     }
 
     #[test]

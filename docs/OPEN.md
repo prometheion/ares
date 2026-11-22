@@ -1078,9 +1078,15 @@ DSpark drafter `dspark-Inkling-2-Mini-Q8_0.gguf`, 0.4 GB). Notes: `/var/tmp/ares
         On the development machine 104.5 ms a step at 32 768 cells from RAM on the 4070, 435 ms on
         the 3060. Its heads move to the second card first, and with `q4` two cards hold 482 707
         tokens.
-  - [ ] Pages a finished request leaves in the device pool (the prompt cache on the devices) keep
-        their far memory, booked as required, until the pool evicts them: the owner's question
-        below.
+  - [x] Pages a finished request leaves in the device pool (the prompt cache on the devices): the
+        owner's answer (2026-11-22): their far K and V rank as prompt cache, the lowest user of
+        `--ram`; when memory gets tight they give way first, before the tier of experts, to the
+        level on SSD with `--cache` or nowhere without it. A running sequence's far K and V stay
+        required. Built (`Cache::trim` takes such pages off the devices while the prompt cache
+        holds more than its allowance, `PinnedRam::set_context_cached`; a far piece is unlocked
+        once no page in use lies in it). Tests: `ares-runtime --test prefix
+        far_pages_of_a_finished_request_give_way_when_the_tier_of_experts_wants_the_memory`, the
+        books' `far_k_and_v_of_finished_requests_counts_as_prompt_cache_and_not_against_the_tier`.
   - [ ] Steps of the parts' own scratch (pieces of a prompt while another request waits) read the
         far entries in place, row by row; only steps on lent VRAM read a copy. A copy in the own
         scratch would cost VRAM for good (the far pool's share of one layer, 254 MiB at 262 144

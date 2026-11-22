@@ -5151,10 +5151,14 @@ so nothing idle in VRAM needs lending.
   of about 64 MiB over all layers are locked and mapped for the device
   (`cuMemHostRegister` with the device map; a device must read registered
   memory at its host address, which `PinnedRam::context_region` checks) as the
-  sequences reach them, and given back when the pages above a piece are freed,
+  sequences reach them, and given back when no page in use lies in a piece any more,
   keeping one piece spare. They are booked in `--ram` as required memory ("K/V
   of the context beyond VRAM"), above the tier of experts: a running sequence
-  cannot do without its cells, and the broker's own rule says so. The device
+  cannot do without its cells, and the broker's own rule says so. Far pages
+  that only the prompt cache holds rank as prompt cache, the lowest (the
+  owner's answer of 2026-11-22; see "Host memory"): they leave the devices first
+  when it must give memory back, and a piece is unlocked once no page in use
+  lies in it. The device
   threads keep the books of which pages the tables name (and which a transfer
   brings in) and the first part to begin a step for the store locks the pieces
   the step reaches (`Flow::lock_far`) before the store's step begins: when the
@@ -7149,17 +7153,27 @@ without a limit that was named.
 | User | Kind | When memory is short |
 | --- | --- | --- |
 | What the engine needs to run: step buffers, read-back buffers, the token embedding table where it lies on the host; the floor of the prompt cache for a model with recurrent state (one checkpoint place, and with `--cache` 16 pages); with `--cache` the buffers that checkpoints pass through on their way to the drive and back (ordinary memory) | Required | Never gives way. A limit below it is refused at load |
-| K and V of the context beyond VRAM (Flash-Next: the pages from the plan's `near` on, `blocks/far.rs`) | Required, as it is used | Never gives way. It grows in pieces (about 64 MiB over all attention layers) as the sequences reach far pages and shrinks when the pages above a piece are freed; the step that needs a piece makes the tier of experts give it up first (see "K and V beyond VRAM") |
+| K and V of running sequences beyond VRAM (Flash-Next: the pages from the plan's `near` on, `blocks/far.rs`) | Required, as it is used | Never gives way. It grows in pieces (about 64 MiB over all attention layers) as the sequences reach far pages and shrinks when no page in use lies in a piece; the step that needs a piece makes the tier of experts give it up first (see "K and V beyond VRAM") |
 | RAM tier of MoE experts | Elastic, the highest | Gets all that is not required, as far as it can use it, and is the last to shrink: it gives pieces back only when the prompt cache has nothing left in RAM |
 | Staging of the experts on their way from the file into transit | Part of the tier | The pieces that hold it are never given up |
-| Prompt cache in RAM (checkpoints of recurrent state, and the pages that left the devices) | Elastic, the lowest | Goes first: what the devices or the drive also hold goes at once; what only RAM holds is written to the drive first with `--cache` and goes when it is written, down to the floor above; without `--cache` it goes at once, down to its one checkpoint place |
+| Prompt cache in RAM (checkpoints of recurrent state, the pages that left the devices, and the K and V beyond VRAM of pages that only the prompt cache holds on the devices) | Elastic, the lowest | Goes first: the far pages only it holds leave the devices first (into RAM when its allowance has room, otherwise to the drive with `--cache` or nowhere); what the devices or the drive also hold goes at once; what only RAM holds is written to the drive first with `--cache` and goes when it is written, down to the floor above; without `--cache` it goes at once, down to its one checkpoint place |
 
 Nothing is reserved for the K and V beyond VRAM: they take their memory when
 a sequence reaches them, from the elastic users, as the broker's own rule for
 required memory says ("a running request must never fail to offload its K/V
-pages because a cache is sitting on memory it could do without"). Pages that a
-finished request leaves in the device pool as prompt cache keep their far
-memory until the pool evicts them (the owner's question in `OPEN.md`).
+pages because a cache is sitting on memory it could do without"). The pages a
+finished request leaves in the device pool as prompt cache rank as prompt
+cache with their far K and V (the owner's answer of 2026-11-22): the books
+count those bytes in the prompt cache's share and not against the tier
+(`PinnedRam::set_context_cached`), and while the prompt cache holds more than
+its allowance the conductor takes such pages off the devices first
+(`Cache::trim`, `PrefixIndex::evict_where`): into RAM when the allowance has
+room, on to the drive with `--cache`, or nowhere. The far pool unlocks a piece
+once no page in use lies in it, and the memory goes back to the tier. With a
+tier that wants more than the limit leaves (Flash-Next at any `--ram` below the
+size of its experts), a long conversation's far pages therefore leave the
+devices when its request ends, and its next turn reads them from the drive or
+computes them again; its pages in VRAM stay.
 
 A broker in `ares-core` keeps the books of the limit: a user asks to grow, a
 grant beyond the limit is refused, and the refusal names who holds what. Below

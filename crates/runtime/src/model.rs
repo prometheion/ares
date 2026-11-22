@@ -209,6 +209,15 @@ impl PrefixCache {
     }
 }
 
+/// Pages a model keeps in host memory ([`Model::far_pages`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FarPages {
+    /// The first page in host memory: every page from it on is.
+    pub first: u32,
+    /// Bytes of host memory one such page takes, over all devices.
+    pub page_bytes: u64,
+}
+
 /// What a model offers the level of the prefix cache that is on SSD: its
 /// device side moves pages and checkpoints between the devices and host
 /// memory ([`DeviceModel::transfer`]), in a form that another load of the same
@@ -680,6 +689,17 @@ pub trait Model: Send + Sync + 'static {
     /// cache, for pages of `cells_per_page` cells.
     fn durable(&self, cells_per_page: u32) -> Option<Durable> {
         let _ = cells_per_page;
+        None
+    }
+
+    /// Where the model keeps the state of pool pages from some page on in
+    /// page-locked host memory (the K and V of a context beyond VRAM) and not
+    /// on the devices: the first such page and the bytes of host memory one
+    /// takes over all devices. `None` (the default) when every page is on
+    /// the devices. Such a page that only the prefix cache holds ranks as
+    /// prompt cache in the engine's RAM (the owner's rule of 2026-11-22): it
+    /// leaves the devices first when the prompt cache must give memory back.
+    fn far_pages(&self) -> Option<FarPages> {
         None
     }
 

@@ -129,11 +129,6 @@ impl FarPool {
         }
     }
 
-    /// The pieces that hold the first `slots` slots.
-    fn pieces_for(&self, slots: u32) -> usize {
-        slots.min(self.capacity).div_ceil(self.piece_slots) as usize
-    }
-
     /// The bytes of piece `piece` in layer `layer`, and where they start in
     /// the region.
     fn span(&self, piece: usize, layer: usize) -> (usize, usize) {
@@ -149,10 +144,34 @@ impl FarPool {
         (self.offsets[layer] + start, stop - start)
     }
 
-    /// The bytes the pool holds locked when its first `slots` slots are.
-    pub fn bytes_for(&self, slots: u32) -> u64 {
-        (0..self.pieces_for(slots))
-            .map(|piece| (0..self.entries.len()).map(|l| self.span(piece, l).1 as u64).sum::<u64>())
+    /// The bytes of piece `piece` over all layers.
+    fn piece_bytes(&self, piece: usize) -> u64 {
+        (0..self.entries.len()).map(|l| self.span(piece, l).1 as u64).sum()
+    }
+
+    /// The pieces a pool needs locked when the far slots `live` (one flag per
+    /// slot, from slot 0; slots past its end are free) hold pages in use:
+    /// every piece with a page in use, and the piece after the last of them,
+    /// for the pages the next steps take.
+    pub fn wanted(&self, live: &[bool]) -> Vec<bool> {
+        let mut wanted = vec![false; self.pieces.len()];
+        for (slot, _) in live.iter().enumerate().filter(|(_, l)| **l) {
+            if let Some(piece) = wanted.get_mut(slot / self.piece_slots as usize) {
+                *piece = true;
+            }
+        }
+        let spare = wanted.iter().rposition(|w| *w).map_or(0, |last| last + 1);
+        if let Some(piece) = wanted.get_mut(spare) {
+            *piece = true;
+        }
+        wanted
+    }
+
+    /// The bytes the pool holds locked with the pieces `wanted`.
+    pub fn bytes_of(&self, wanted: &[bool]) -> u64 {
+        (0..self.pieces.len())
+            .filter(|p| wanted.get(*p) == Some(&true))
+            .map(|p| self.piece_bytes(p))
             .sum()
     }
 
@@ -160,16 +179,26 @@ impl FarPool {
     pub fn locked(&self) -> u64 {
         (0..self.pieces.len())
             .filter(|p| self.pieces[*p].is_some())
-            .map(|piece| (0..self.entries.len()).map(|l| self.span(piece, l).1 as u64).sum::<u64>())
+            .map(|p| self.piece_bytes(p))
             .sum()
     }
 
-    /// Locks the pieces that the first `slots` slots lie in, between steps.
-    /// `Err(Ok(short))` when the RAM limit has no room for a piece now: the
-    /// owner makes room (the tier of experts gives pieces up) and asks again.
-    pub fn ensure(&mut self, slots: u32) -> Result<(), Result<ContextShort, ModelError>> {
-        for piece in 0..self.pieces_for(slots) {
-            if self.pieces[piece].is_some() {
+    /// Gives back the pieces that are not `wanted`, between steps: their
+    /// pages are free, and the memory goes back to the system and the books.
+    pub fn release_unwanted(&mut self, wanted: &[bool]) {
+        for (piece, lock) in self.pieces.iter_mut().enumerate() {
+            if wanted.get(piece) != Some(&true) {
+                drop(lock.take());
+            }
+        }
+    }
+
+    /// Locks the pieces `wanted`, between steps. `Err(Ok(short))` when the
+    /// RAM limit has no room for a piece now: the owner makes room (the tier
+    /// of experts gives pieces up) and asks again.
+    pub fn lock_wanted(&mut self, wanted: &[bool]) -> Result<(), Result<ContextShort, ModelError>> {
+        for piece in 0..self.pieces.len() {
+            if wanted.get(piece) != Some(&true) || self.pieces[piece].is_some() {
                 continue;
             }
             let mut locks = Vec::with_capacity(self.entries.len());
@@ -183,13 +212,9 @@ impl FarPool {
         Ok(())
     }
 
-    /// Gives back the pieces above those the first `slots` slots lie in,
-    /// keeping one more, between steps.
-    pub fn shrink(&mut self, slots: u32) {
-        let keep = self.pieces_for(slots) + 1;
-        for piece in self.pieces.iter_mut().skip(keep) {
-            drop(piece.take());
-        }
+    /// Locks every piece: for a driver that keeps no books of its pages.
+    pub fn lock_all(&mut self) -> Result<(), Result<ContextShort, ModelError>> {
+        self.lock_wanted(&vec![true; self.pieces.len()])
     }
 }
 

@@ -69,7 +69,7 @@ use ares_store::Kind;
 
 use crate::config::RuntimeConfig;
 use crate::exec::{Executor, Transfer, TransferKind};
-use crate::model::{Durable, PrefixCache};
+use crate::model::{Durable, FarPages, PrefixCache};
 use crate::ram::PinnedRam;
 use crate::record::{PageCopy, RecordFull, RecordWriter, StateCopy, StateCopyKind};
 
@@ -232,6 +232,13 @@ pub(crate) struct Cache {
     /// The pages the cache keeps in RAM whatever the allowance says, in
     /// bytes: the floor of pages, which checkpoints do not take.
     page_floor: u64,
+    /// The pool pages the model keeps in host memory ([`Model::far_pages`]),
+    /// and the bytes of host memory that those only the index holds take:
+    /// they rank as prompt cache (the owner's rule of 2026-11-22).
+    ///
+    /// [`Model::far_pages`]: crate::Model::far_pages
+    far: Option<FarPages>,
+    far_held: u64,
 }
 
 impl Cache {
@@ -317,7 +324,17 @@ impl Cache {
             page_copies: Vec::new(),
             scratch: Vec::new(),
             evictions: 0,
+            far: None,
+            far_held: 0,
         }
+    }
+
+    /// The model keeps the pool pages from `far.first` on in host memory:
+    /// those only the index holds count as the prompt cache's and leave the
+    /// devices first when it must give memory back ([`Cache::trim`]).
+    pub(crate) fn with_far(mut self, far: Option<FarPages>) -> Self {
+        self.far = far;
+        self
     }
 
     /// Prompts are read in pieces of `rows` rows: a piece that ends this
@@ -374,7 +391,39 @@ impl Cache {
     fn held(&self) -> u64 {
         let places = u64::from(self.next_place) - self.free_places.len() as u64;
         let pages = self.in_ram.as_ref().map_or(0, RamLevel::bytes);
-        places * self.bytes + pages.max(self.page_floor)
+        places * self.bytes + pages.max(self.page_floor) + self.far_held
+    }
+
+    /// Counts the far pages only the index holds and tells the books.
+    fn count_far(&mut self, pool: &PagePool) {
+        let Some(far) = self.far else { return };
+        let cached = (far.first..pool.capacity())
+            .map(PageId)
+            .filter(|page| pool.refcount(*page) == 1 && pool.is_cached(*page))
+            .count() as u64;
+        self.far_held = cached * far.page_bytes;
+        if let Some(books) = &self.books {
+            books.set_context_cached(self.far_held);
+        }
+    }
+
+    /// Gives up a far page that only the index holds, from the end of a
+    /// chain: it leaves the devices as any evicted page does (into RAM when
+    /// the allowance has room, on to the drive with a level on SSD, or
+    /// nowhere). Whether one went.
+    fn evict_far(&mut self, pool: &mut PagePool) -> bool {
+        let Some(far) = self.far else { return false };
+        let left_behind = self.left_behind();
+        let Some(evicted) = self.index.evict_where(pool, |page| page.0 >= far.first) else {
+            return false;
+        };
+        self.leave_cards(evicted, &left_behind);
+        self.evictions += 1;
+        self.far_held = self.far_held.saturating_sub(far.page_bytes);
+        if let Some(books) = &self.books {
+            books.set_context_cached(self.far_held);
+        }
+        true
     }
 
     /// The policy with the budget the checkpoints have now: what the books
@@ -1237,6 +1286,12 @@ impl Cache {
         self.settle_leaving(pool, exec);
         self.settle();
         let target = self.allowance();
+        // Far pages that only the index holds are the prompt cache's lowest:
+        // they leave the devices first, and their memory goes back to the
+        // system once the pages of a piece are all free.
+        self.count_far(pool);
+        while self.held() > target && self.far_held > 0 && self.evict_far(pool) {}
+        self.settle_leaving(pool, exec);
         let mut dropped = 0;
         while self.held() > target && self.give_up_free(&mut dropped) {}
         // What is being written goes once it is: it counts as gone.

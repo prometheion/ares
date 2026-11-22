@@ -639,7 +639,7 @@ impl<'g> Session<'g> {
             ledgers[index].reserve("qwen4exp K/V and key pools", part.pool_bytes())?;
             pools.push(DeviceBuffer::new(&devices[index], part.pool_bytes())?);
             if let Some(mut pool) = part.open_far(&ram)? {
-                pool.ensure(u32::MAX).map_err(|short| match short {
+                pool.lock_all().map_err(|short| match short {
                     Ok(short) => invalid(format!("{} bytes of K and V beyond VRAM", short.0)),
                     Err(error) => invalid(error.to_string()),
                 })?;
