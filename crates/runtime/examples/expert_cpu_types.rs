@@ -187,7 +187,7 @@ fn file_pairs(pool: &CpuPool) -> Result<(), String> {
         (IQ2_S, Q2_0),
         (IQ2_XXS, Q2_0),
         (IQ1_M, Q2_0),
-        (Q4_K, Q5_0),
+        (Q4_K, Q5_1),
         (Q4_K, Q8_0),
         (Q5_K, Q5_1),
         (Q6_K, Q8_0),

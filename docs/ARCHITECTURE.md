@@ -3641,6 +3641,55 @@ decoded type is sooner only against the slower link, and not when several rows u
 expert. The store decides that per layer and step from the times it measured for the layer's
 pair of types and for the device's uploads; nothing in it names a type as slow.
 
+*The kernels for the types of the Flash-Next files* (2026-11-22, the test machine: Core Ultra 5
+235HX, 6 performance and 8 efficiency cores, AVX2 and AVX-VNNI, DDR5; `expert_cpu_types` with 13
+workers as the engine places them, load average 1.6 to 2.8, no engine running; the same shapes as
+the table above; microseconds per job of one expert, the build of before, `verify/stack`, and this
+one one after the other):
+
+| type | as | before: 1 row | 8 rows | now: 1 row | 2 rows | 4 rows | 8 rows |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| iq3_xxs | gate and up | 157 | 306 | 37 | 47 | 75 | 144 |
+| iq4_xs | gate and up | 156 | 307 | 28 | 39 | 68 | 127 |
+| q4_K | gate and up | 108 | 257 | 33 | 40 | 71 | 128 |
+| q5_K | gate and up | 115 | 289 | 32 | 49 | 103 | 170 |
+| q2_0 | gate and up | 261 | 411 | 21 | 24 | 39 | 70 |
+| q5_0 | down | 71 | 176 | 36 | 52 | 80 | 157 |
+| iq4_nl | down | 72 | 189 | 33 | 48 | 79 | 154 |
+| q4_0 | down | 58 | 164 | 32 | 48 | 79 | 153 |
+| q4_1 | down | 62 | 183 | 32 | 48 | 80 | 156 |
+| q5_1 | down | 73 | 178 | 37 | 51 | 85 | 163 |
+| q8_0 | down | 44 | 150 | 33 | 49 | 79 | 150 |
+
+The pairs of types the files have, as their layers do (now; the same run):
+
+| gate and up / down | pool, 1 row | 2 rows | 4 rows | 8 rows | one thread, 1 row | its rate |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| iq3_xxs / q5_0 (UD-Q3_K_XL) | 45 | 57 | 88 | 179 | 282 | 8.4 GB/s |
+| iq3_xxs / iq4_nl (UD-Q3_K_XL) | 44 | 55 | 87 | 169 | 242 | 9.0 GB/s |
+| iq4_xs / iq4_nl (UD-Q3_K_XL) | 37 | 48 | 81 | 152 | 168 | 15.9 GB/s |
+| iq2_s / q2_0 (IQ2_XS) | 30 | 41 | 66 | 128 | 140 | 10.8 GB/s |
+| q4_K / q8_0 (UD-Q4_K_XL) | 39 | 49 | 87 | 151 | 408 | 8.8 GB/s |
+| q5_K / q5_1 (UD-Q4_K_XL) | 49 | 62 | 101 | 189 | 441 | 7.9 GB/s |
+
+- A job of one expert for one row of UD-Q3_K_XL's types took 268 to 373 us at load before
+  (the server's calibration); it takes 37 to 45 now. Jobs of several experts, as a layer of a
+  decode step has them (IQ3_XXS / Q5_0, `expert_cpu_types layers`): 2 experts 63 us, 3 97,
+  6 217, 10 430 for one row; 3 experts of 4 rows 201, 10 of 8 rows 1307. Three experts of one
+  row read 7.2 MB in 97 us, 74 GB/s: the pool is near what the memory gives.
+- On one core the kernels are bound by decoding, not by the bytes: 8 to 16 GB/s on one
+  performance core. Gate and up of IQ3_XXS spend most of it on the codebook (a gather, or
+  eight loads where they are faster on the core); the down products of a single pair were
+  bound by the chain of their 20 block sums, so a down task takes four rows of the matrix at
+  a time for a pair that is alone in its call (on an i5-13400F's performance core the down
+  product of one row went from 185 to 124 us for Q5_0 and from 177 to 104 for IQ4_NL).
+  Computing IQ3_XXS's signs from the parity of their index instead of a table was slower on
+  an efficiency core and is not done.
+- The order of a job's tasks (above): jobs of several rows 16 to 23 % sooner than with every
+  down piece behind all gate and up pieces (3 experts of 4 rows 195 to 206 us against 260 to
+  261, alternating twice at load 15), jobs of one row about the same (7 % slower at 10
+  experts).
+
 **Layer kernels** (`kernels/layers.cu`, `ares_cuda::LayerKernels`).
 Everything a block of `qwen35` does between its matrix products: the
 embedding gather (all 28 weight types), the norms per head, the causal
