@@ -1102,16 +1102,7 @@ fn experts_a_wide_step_misses_computed_on_the_cpu_change_nothing() {
         opts.part.max_rows = 64;
         opts
     };
-    let mut whole = Session::open(
-        &gguf,
-        &c,
-        &w,
-        devices.clone(),
-        wide_rows(options(devices.len(), c.n_layer, CacheFormat::Q8)),
-    )
-    .unwrap();
     let n_expert = c.experts.count as u32;
-    whole.fill(&mut |_| (0..n_expert).collect()).unwrap();
     let shape = ExpertShape {
         n_embd: c.n_embd as u32,
         n_ff: c.experts.ff as u32,
@@ -1123,6 +1114,16 @@ fn experts_a_wide_step_misses_computed_on_the_cpu_change_nothing() {
     let slots = c.experts.used * 8;
     let layers_per_device = layers_per_device(c.n_layer, devices.len());
     for serve in [Serve::Cpu, Serve::Measured] {
+        // A run with every expert in its slot, in wide steps too, from the start of the text.
+        let mut whole = Session::open(
+            &gguf,
+            &c,
+            &w,
+            devices.clone(),
+            wide_rows(options(devices.len(), c.n_layer, CacheFormat::Q8)),
+        )
+        .unwrap();
+        whole.fill(&mut |_| (0..n_expert).collect()).unwrap();
         let opts = SessionOptions {
             slot_bytes: Some((slots * layers_per_device) as u64 * shape.slot_bytes().unwrap()),
             serve,
