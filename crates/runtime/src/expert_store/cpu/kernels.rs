@@ -34,8 +34,8 @@
 //!   [`Block32`]): a block decodes to 32 bytes in the order of its values
 //!   (nibbles, a fifth bit from `qh`, IQ4_NL's levels by a shuffle), which
 //!   multiply the hidden codes stored in that order with `maddubs` (or
-//!   AVX-VNNI's `dpbusd`) into an exact integer sum per block; an offset
-//!   comes off in integers, a minimum is added times the hidden codes' sum.
+//!   AVX-VNNI's `dpbusd`) into an exact integer sum per block; a minimum is
+//!   added times the hidden codes' sum.
 //! - **Every other weight type**, for gate and up and for down, and every type
 //!   on a CPU without x86-64-v3 ([`GateKind::Other`], [`DownKind::Other`]):
 //!   a row of the matrix is decoded
@@ -1539,10 +1539,10 @@ fn bytes_of_bits(bits: u32) -> __m256i {
 }
 
 /// What a block of [`Block32`] decodes to, in the order of its values: the
-/// 32 codes (unsigned for the kinds with an offset or a minimum, signed
-/// levels for the others), the scale `d`, and the minimum `m` (0 where the
-/// kind has none). A weight is `d * (code - offset) + m`
-/// ([`block32_offset`]).
+/// 32 codes (unsigned for the kinds with a minimum, signed for the others:
+/// Q4_0's and Q5_0's codes less their offset of 8 and 16, Q8_0's bytes,
+/// IQ4_NL's levels), the scale `d`, and the minimum `m` (0 where the kind
+/// has none). A weight is `d * code + m`.
 ///
 /// # Safety
 ///
@@ -1556,7 +1556,7 @@ unsafe fn decode_block32<const K: u8>(t: &Tables, blk: *const u8) -> (__m256i, f
     unsafe {
         let d = f16_at(blk);
         match kind {
-            Block32::Q4_0 => (nibbles(blk.add(2)), d, 0.0),
+            Block32::Q4_0 => (_mm256_sub_epi8(nibbles(blk.add(2)), _mm256_set1_epi8(8)), d, 0.0),
             Block32::Q4_1 => (nibbles(blk.add(4)), d, f16_at(blk.add(2))),
             Block32::Q5_0 => {
                 let high = bytes_of_bits(blk.add(2).cast::<u32>().read_unaligned());
@@ -1564,7 +1564,7 @@ unsafe fn decode_block32<const K: u8>(t: &Tables, blk: *const u8) -> (__m256i, f
                     nibbles(blk.add(6)),
                     _mm256_and_si256(high, _mm256_set1_epi8(0x10)),
                 );
-                (codes, d, 0.0)
+                (_mm256_sub_epi8(codes, _mm256_set1_epi8(16)), d, 0.0)
             }
             Block32::Q5_1 => {
                 let high = bytes_of_bits(blk.add(4).cast::<u32>().read_unaligned());
@@ -1583,20 +1583,11 @@ unsafe fn decode_block32<const K: u8>(t: &Tables, blk: *const u8) -> (__m256i, f
     }
 }
 
-/// The offset of the codes of a kind of [`Block32`] with unsigned codes and
-/// no minimum: Q4_0's 8 and Q5_0's 16; 0 for the others.
-const fn block32_offset(kind: Block32) -> i32 {
-    match kind {
-        Block32::Q4_0 => 8,
-        Block32::Q5_0 => 16,
-        _ => 0,
-    }
-}
-
-/// Whether the codes of a kind of [`Block32`] are signed levels: their
-/// magnitudes are multiplied with the hidden codes, which take their signs.
+/// Whether the codes of a kind of [`Block32`] are signed: their magnitudes
+/// are multiplied with the hidden codes, which take their signs (a code of 0
+/// gives 0 either way).
 const fn block32_signed(kind: Block32) -> bool {
-    matches!(kind, Block32::Q8_0 | Block32::Iq4Nl)
+    !block32_minimum(kind)
 }
 
 /// Whether a kind of [`Block32`] has a minimum per block.
@@ -1608,10 +1599,9 @@ const fn block32_minimum(kind: Block32) -> bool {
 /// that share the expert, for a kind of [`Block32`] (`K` its number) and
 /// hidden values in the order [`Order::Values`]: `out[r] = down_row .
 /// hidden_r`. Per block of 32 the integer sum of the codes times the hidden
-/// codes is exact, and the offset comes off it in integers (the offset times
-/// the sum of the hidden codes); a minimum is added as `m` times the hidden
-/// values' sum. `$dot` multiplies 32 unsigned bytes with 32 signed ones and
-/// returns eight sums of four.
+/// codes is exact; a minimum is added as `m` times the hidden values' sum.
+/// `$dot` multiplies 32 unsigned bytes with 32 signed ones and returns eight
+/// sums of four.
 macro_rules! block32_down_row {
     ($name:ident, $features:literal, $dot:ident) => {
         /// # Safety
@@ -1629,7 +1619,6 @@ macro_rules! block32_down_row {
         ) {
             let kind = Block32::ALL[usize::from(K)];
             let bytes = kind.ty().block_bytes() as usize;
-            let offset = block32_offset(kind);
             let mut acc = [_mm256_setzero_ps(); R];
             let mut minimum = [0.0f32; R];
             for b in 0..blocks {
@@ -1646,13 +1635,8 @@ macro_rules! block32_down_row {
                         if block32_signed(kind) {
                             q = _mm256_sign_epi8(q, codes);
                         }
-                        let mut sums = $dot(magnitudes, q);
+                        let sums = $dot(magnitudes, q);
                         let dh = *h.scale.add(2 * b);
-                        if offset != 0 {
-                            let hsum = *h.sum.add(2 * b) + *h.sum.add(2 * b + 1);
-                            let off = _mm256_setr_epi32(offset * hsum, 0, 0, 0, 0, 0, 0, 0);
-                            sums = _mm256_sub_epi32(sums, off);
-                        }
                         if block32_minimum(kind) {
                             let hsum = *h.sum.add(2 * b) + *h.sum.add(2 * b + 1);
                             minimum[r] = (m * dh).mul_add(hsum as f32, minimum[r]);

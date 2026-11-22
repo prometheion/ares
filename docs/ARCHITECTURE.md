@@ -3482,8 +3482,9 @@ the many-row kernels also take the width in steps of 128 and the inner width in 
   activations carry per 32 values; Q2_0 as gate and up runs the down kernel of Q2_0 on the
   activations laid out in the order of its bit planes once per job (`Planes`). The down
   kernels of `Block32` multiply hidden codes stored in the order of their values (Q2_0's in
-  the order of its planes, `Order`), with `maddubs` or AVX-VNNI's `dpbusd`, and take an
-  offset off the integer sum (Q4_0, Q5_0). Every other type and role is decoded row by row
+  the order of its planes, `Order`), with `maddubs` or AVX-VNNI's `dpbusd`, as signed
+  codes (Q4_0 and Q5_0 less their offset) or with the minimum added from the hidden codes'
+  sums (Q4_1, Q5_1). Every other type and role is decoded row by row
   with the reference decoder (`ares_quant::dequantize`) and multiplied in f32 with the same
   rounded activations, once for all the rows of the step that use the expert; the decoding
   is what such an expert costs (table below). The written kernels need x86-64-v3 (AVX2,
