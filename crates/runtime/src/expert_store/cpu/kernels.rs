@@ -64,6 +64,70 @@ pub(super) struct RowIn {
     /// For IQ1_M: per 32 values, the sums of the four groups of 8 codes in
     /// lanes 0, 4, 8 and 12 ([`sum_groups`]).
     pub sum8: *const Lanes16,
+    /// For Q2_0: the codes in the order of Q2_0's bit planes with their
+    /// sums and scales per 16 values ([`Planes`]), which the kernel of Q2_0
+    /// multiplies as it does hidden values.
+    pub planes: Hidden,
+}
+
+/// The activation codes of the rows of a step in the form the Q2_0 kernel
+/// multiplies ([`Order::Planes`], as hidden values are stored for a down
+/// matrix of Q2_0): a row's codes in plane order, the sum of every 16 codes
+/// and the scale of every 16 (that of their 32). A row takes `n_in` rounded
+/// up to 128 values; the rest is zero.
+#[derive(Debug, Default)]
+pub(super) struct Planes {
+    q: Vec<i8>,
+    sum: Vec<i32>,
+    scale: Vec<f32>,
+    stride: usize,
+}
+
+impl Planes {
+    /// The planes of `q`, rows of `n_in` codes with their `(d, s)` pairs per
+    /// 32 values in `ds` (as a job holds them).
+    pub(super) fn new(q: &[i8], ds: &[u8], n_in: usize) -> Self {
+        let stride = n_in.next_multiple_of(128);
+        let n_rows = q.len() / n_in;
+        let mut planes = Self {
+            q: vec![0; n_rows * stride],
+            sum: vec![0; n_rows * stride / 16],
+            scale: vec![0.0; n_rows * stride / 16],
+            stride,
+        };
+        for b in 0..n_rows {
+            for n in 0..n_in {
+                let (pair, rest) = (n / 128, n % 128);
+                let (half, i, k) = (rest / 64, rest % 64 / 4, rest % 4);
+                let code = q[b * n_in + n];
+                planes.q[b * stride + 128 * pair + 32 * k + 16 * half + i] = code;
+                planes.sum[(b * stride + n) / 16] += i32::from(code);
+            }
+            for group in 0..n_in / 32 {
+                let at = 8 * (b * n_in / 32 + group);
+                let d = f32::from_le_bytes([ds[at], ds[at + 1], ds[at + 2], ds[at + 3]]);
+                let first = (b * stride + 32 * group) / 16;
+                planes.scale[first..first + 2].fill(d);
+            }
+        }
+        planes
+    }
+
+    /// Row `b`'s planes as the kernel reads them; null pointers where there
+    /// are none (a job of another kind).
+    pub(super) fn row(&self, b: usize) -> Hidden {
+        if self.q.is_empty() {
+            let null = std::ptr::null_mut();
+            return Hidden { q: null, sum: null.cast(), scale: null.cast() };
+        }
+        let at = b * self.stride;
+        // The arrays are only read through these pointers.
+        Hidden {
+            q: self.q[at..].as_ptr().cast_mut(),
+            sum: self.sum[at / 16..].as_ptr().cast_mut(),
+            scale: self.scale[at / 16..].as_ptr().cast_mut(),
+        }
+    }
 }
 
 /// The quantized hidden values of one (expert, row) pair as the down kernel
@@ -737,13 +801,24 @@ pub(super) enum GateKind {
     Iq4Xs,
     Q4K,
     Q5K,
+    /// Q2_0, the type of the MTP block's experts: the down kernel of Q2_0
+    /// on the activations in plane order ([`Planes`]).
+    Q2_0,
     Other(GgmlType),
 }
 
 impl GateKind {
     /// The kinds with a kernel of their own, in the order of [`GateKind::index`].
-    pub(super) const WRITTEN: [GateKind; 7] =
-        [Self::Iq2S, Self::Iq2Xxs, Self::Iq1M, Self::Iq3Xxs, Self::Iq4Xs, Self::Q4K, Self::Q5K];
+    pub(super) const WRITTEN: [GateKind; 8] = [
+        Self::Iq2S,
+        Self::Iq2Xxs,
+        Self::Iq1M,
+        Self::Iq3Xxs,
+        Self::Iq4Xs,
+        Self::Q4K,
+        Self::Q5K,
+        Self::Q2_0,
+    ];
 
     /// The kind of gate and up matrices of `ty`; `None` for a type that holds
     /// no weights.
@@ -756,6 +831,7 @@ impl GateKind {
             GgmlType::IQ4_XS => Some(Self::Iq4Xs),
             GgmlType::Q4_K => Some(Self::Q4K),
             GgmlType::Q5_K => Some(Self::Q5K),
+            GgmlType::Q2_0 => Some(Self::Q2_0),
             ty => holds_weights(ty).then_some(Self::Other(ty)),
         }
     }
@@ -773,6 +849,7 @@ impl GateKind {
             Self::Iq4Xs => 4,
             Self::Q4K => 5,
             Self::Q5K => 6,
+            Self::Q2_0 => 7,
         }
     }
 
@@ -790,6 +867,7 @@ impl GateKind {
             Self::Iq4Xs => GgmlType::IQ4_XS,
             Self::Q4K => GgmlType::Q4_K,
             Self::Q5K => GgmlType::Q5_K,
+            Self::Q2_0 => GgmlType::Q2_0,
             Self::Other(ty) => ty,
         }
     }
@@ -1123,6 +1201,7 @@ pub(super) unsafe fn gate_up_tile(
     t: &Tables,
     kind: GateKind,
     gather: bool,
+    vnni: bool,
     gate: *const u8,
     up: *const u8,
     n_in: usize,
@@ -1136,6 +1215,10 @@ pub(super) unsafe fn gate_up_tile(
         return unsafe {
             gate_up_tile_decoded(true, ty, gate, up, n_in, tile, rows, hidden, order)
         };
+    }
+    if kind == GateKind::Q2_0 {
+        // SAFETY: the caller's guarantees are the function's.
+        return unsafe { gate_up_tile_q2_0(vnni, gate, up, n_in, tile, rows, hidden, order) };
     }
     let blocks = n_in / 256;
     let row_bytes = blocks * kind.block_bytes();
@@ -1190,11 +1273,78 @@ pub(super) unsafe fn gate_up_tile(
                                 gate_up_row_q5_k::<$n>(g, u, blocks, &batch, &mut out)
                             }
                             // Taken above.
+                            (GateKind::Q2_0, _) => {}
+                            // Taken above.
                             (GateKind::Other(_), _) => {}
                         }
                     }
                     for (r, [gate, up]) in out.into_iter().enumerate() {
                         h[at + r][v] = silu(gate) * up;
+                    }
+                }};
+            }
+            match n {
+                1 => batch!(1),
+                2 => batch!(2),
+                3 => batch!(3),
+                _ => batch!(4),
+            }
+            at += n;
+        }
+    }
+    for (values, hidden) in h.iter().zip(hidden) {
+        // SAFETY: the caller's guarantee for `hidden`.
+        unsafe { store_hidden(values, tile, hidden, order) };
+    }
+}
+
+/// [`gate_up_tile`] for Q2_0: each row of gate and up through the down
+/// kernel of Q2_0, with the rows' activations in plane order as its hidden
+/// values ([`RowIn::planes`]).
+///
+/// # Safety
+///
+/// As [`gate_up_tile`], with every row's planes complete for `n_in` values.
+#[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+#[target_feature(enable = "avx2,fma,f16c")]
+unsafe fn gate_up_tile_q2_0(
+    vnni: bool,
+    gate: *const u8,
+    up: *const u8,
+    n_in: usize,
+    tile: usize,
+    rows: &[RowIn],
+    hidden: &[Hidden],
+    order: Order,
+) {
+    let blocks = n_in / 64;
+    let row_bytes = blocks * 18;
+    let mut h = [[0.0f32; 32]; 8];
+    for (v, j) in (32 * tile..32 * tile + 32).enumerate() {
+        // SAFETY: row j of both matrices is inside them.
+        let (g, u) = unsafe { (gate.add(j * row_bytes), up.add(j * row_bytes)) };
+        let mut at = 0;
+        while at < rows.len() {
+            let n = (rows.len() - at).min(4);
+            // Runs the kernel for `N` rows starting at `at`.
+            macro_rules! batch {
+                ($n:literal) => {{
+                    let batch: [Hidden; $n] = std::array::from_fn(|r| rows[at + r].planes);
+                    let (mut dg, mut du) = ([0.0f32; $n], [0.0f32; $n]);
+                    // SAFETY: the rows of the matrices and the planes are the
+                    // caller's guarantee; the VNNI form runs only where the
+                    // caller says the CPU has it.
+                    unsafe {
+                        if vnni {
+                            down_row_q2_0_vnni::<$n>(g, blocks, &batch, &mut dg);
+                            down_row_q2_0_vnni::<$n>(u, blocks, &batch, &mut du);
+                        } else {
+                            down_row_q2_0_avx2::<$n>(g, blocks, &batch, &mut dg);
+                            down_row_q2_0_avx2::<$n>(u, blocks, &batch, &mut du);
+                        }
+                    }
+                    for r in 0..$n {
+                        h[at + r][v] = silu(dg[r]) * du[r];
                     }
                 }};
             }
@@ -1910,6 +2060,7 @@ mod tests {
             GgmlType::IQ4_XS,
             GgmlType::Q4_K,
             GgmlType::Q5_K,
+            GgmlType::Q2_0,
             GgmlType::IQ2_S,
             GgmlType::IQ2_XXS,
         ];
@@ -1941,6 +2092,7 @@ mod tests {
             (GgmlType::IQ4_XS, GgmlType::IQ4_NL),
             (GgmlType::Q4_K, GgmlType::Q5_1),
             (GgmlType::Q5_K, GgmlType::Q8_0),
+            (GgmlType::Q2_0, GgmlType::Q2_0),
         ] {
             for n_rows in [1, 4] {
                 let error = check_at(gate_ty, down_ty, 2560, 640, n_rows, detected);
@@ -1962,6 +2114,7 @@ mod tests {
             (GgmlType::IQ4_XS, GgmlType::IQ4_NL),
             (GgmlType::Q4_K, GgmlType::Q5_1),
             (GgmlType::Q5_K, GgmlType::Q4_0),
+            (GgmlType::Q2_0, GgmlType::Q2_0),
             (GgmlType::IQ2_S, GgmlType::Q8_0),
         ] {
             let written = sums_of(gate_ty, down_ty, features, false);

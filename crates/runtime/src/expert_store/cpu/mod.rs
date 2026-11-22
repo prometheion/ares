@@ -8,7 +8,7 @@
 //! - the kernels (`kernels.rs`): gate and up of an expert on the same
 //!   input, `silu(gate) * up`, down, for the rows of a step that picked the
 //!   expert, straight on the file's quantized bytes (kernels written for
-//!   IQ2_S, IQ2_XXS, IQ1_M, IQ3_XXS, IQ4_XS, Q4_K and Q5_K gate and up and for Q2_0,
+//!   IQ2_S, IQ2_XXS, IQ1_M, IQ3_XXS, IQ4_XS, Q4_K, Q5_K and Q2_0 gate and up and for Q2_0,
 //!   Q4_0, Q4_1, Q5_0, Q5_1, Q8_0 and IQ4_NL down, and every other weight
 //!   type through the reference decoder). The arithmetic is the device's: the
 //!   same int8 activations, exact integer sums per 32 values, the hidden
@@ -37,7 +37,7 @@ use std::time::{Duration, Instant};
 use ares_core::GgmlType;
 use ares_cuda::ExpertShape;
 
-use kernels::{DownExpert, DownKind, GateKind, Hidden, Order, RowIn};
+use kernels::{DownExpert, DownKind, GateKind, Hidden, Order, Planes, RowIn};
 pub use pool::{CpuPool, Placement, Topology};
 use tables::Lanes16;
 
@@ -130,7 +130,7 @@ pub struct CpuExpert {
 }
 
 /// The gate types a thread measures itself in: those with a kernel written
-/// for them (IQ2_S, IQ2_XXS, IQ1_M, IQ3_XXS, IQ4_XS, Q4_K, Q5_K).
+/// for them (IQ2_S, IQ2_XXS, IQ1_M, IQ3_XXS, IQ4_XS, Q4_K, Q5_K, Q2_0).
 pub const MEASURED: usize = GateKind::WRITTEN.len();
 
 /// What a thread measured of itself, once: which way of fetching codebook
@@ -194,12 +194,18 @@ pub(crate) fn thread_speed(vector: bool) -> ThreadSpeed {
     let q: Vec<i8> = act[..n_in].iter().map(|b| *b as i8).collect();
     kernels::sum_groups(&q, &mut sum8);
     let ds_at = n_in.next_multiple_of(16);
-    let row = RowIn { q: q.as_ptr(), ds: act[ds_at..].as_ptr(), sum8: sum8.as_ptr() };
+    let planes = Planes::new(&q, &act[ds_at..], n_in);
+    let row = RowIn {
+        q: q.as_ptr(),
+        ds: act[ds_at..].as_ptr(),
+        sum8: sum8.as_ptr(),
+        planes: planes.row(0),
+    };
     let (mut hq, mut hsum, mut hscale) = ([0i8; 128], [0i32; 8], [0.0f32; 8]);
     let hidden = Hidden { q: hq.as_mut_ptr(), sum: hsum.as_mut_ptr(), scale: hscale.as_mut_ptr() };
     let mut speed = ThreadSpeed { gather: [true; MEASURED], tile_ns: [u32::MAX; MEASURED] };
     for (k, kind) in GateKind::WRITTEN.into_iter().enumerate() {
-        let bytes = 32 * (n_in / 256) * kind.block_bytes();
+        let bytes = 32 * (n_in / kind.ty().block_values() as usize) * kind.block_bytes();
         // Every byte below 0x40: the scales stay small and finite.
         let fill = |seed: usize| -> Vec<u8> {
             (0..bytes).map(|i| ((i * 31 + seed * 17) ^ (i >> 7)) as u8 & 0x3f).collect()
@@ -218,6 +224,7 @@ pub(crate) fn thread_speed(vector: bool) -> ThreadSpeed {
                         tables,
                         kind,
                         gather,
+                        false,
                         gate.as_ptr(),
                         up.as_ptr(),
                         n_in,
@@ -293,6 +300,8 @@ pub struct LayerJob {
     q: Vec<i8>,
     ds: Vec<u8>,
     sum8: Vec<Lanes16>,
+    /// For a gate type of Q2_0: the activations in plane order.
+    planes: Planes,
     hidden_q: Scratch<i8>,
     hidden_sum: Scratch<i32>,
     hidden_scale: Scratch<f32>,
@@ -380,6 +389,8 @@ impl LayerJob {
             sum8 = vec![Lanes16([0; 16]); codes / 32];
             kernels::sum_groups(&q, &mut sum8);
         }
+        let planes =
+            if kind == GateKind::Q2_0 { Planes::new(&q, &ds, n_in) } else { Planes::default() };
 
         let mut list = Vec::with_capacity(experts.len());
         let mut pairs = 0;
@@ -416,6 +427,7 @@ impl LayerJob {
             q,
             ds,
             sum8,
+            planes,
             hidden_q: Scratch::new(pairs * hidden_stride, 0),
             hidden_sum: Scratch::new(pairs * hidden_stride / 16, 0),
             hidden_scale: Scratch::new(pairs * hidden_stride / 16, 0.0),
@@ -485,9 +497,12 @@ impl LayerJob {
             };
             let tiles = self.n_ff / TILE;
             let expert = &self.experts[index / tiles];
-            let mut rows =
-                [RowIn { q: self.q.as_ptr(), ds: self.ds.as_ptr(), sum8: self.sum8.as_ptr() };
-                    MAX_ROWS];
+            let mut rows = [RowIn {
+                q: self.q.as_ptr(),
+                ds: self.ds.as_ptr(),
+                sum8: self.sum8.as_ptr(),
+                planes: self.planes.row(0),
+            }; MAX_ROWS];
             let mut hidden = [self.hidden(0); MAX_ROWS];
             for (n, b) in expert.row.iter().enumerate() {
                 let b = usize::from(*b);
@@ -497,6 +512,7 @@ impl LayerJob {
                         q: self.q.as_ptr().add(b * self.n_in),
                         ds: self.ds.as_ptr().add(b * self.n_in / 32 * 8),
                         sum8: self.sum8.as_ptr().wrapping_add(b * self.n_in / 32),
+                        planes: self.planes.row(b),
                     }
                 };
                 hidden[n] = self.hidden(expert.first_pair + n);
@@ -524,6 +540,7 @@ impl LayerJob {
                         tables,
                         kind,
                         gather,
+                        self.features.vnni,
                         expert.gate,
                         expert.up,
                         self.n_in,

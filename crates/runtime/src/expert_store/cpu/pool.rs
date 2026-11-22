@@ -275,7 +275,7 @@ impl CpuPool {
     }
 
     /// For each worker, in no particular order: per gate type with a kernel
-    /// of its own (IQ2_S, IQ2_XXS, IQ1_M, IQ3_XXS, IQ4_XS, Q4_K, Q5_K) whether it fetches
+    /// of its own (IQ2_S, IQ2_XXS, IQ1_M, IQ3_XXS, IQ4_XS, Q4_K, Q5_K, Q2_0) whether it fetches
     /// codebook entries by a gather, and the nanoseconds 32 hidden values of
     /// one row take it.
     pub fn speeds(&self) -> Vec<([bool; MEASURED], [u32; MEASURED])> {
