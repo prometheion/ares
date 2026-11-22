@@ -562,10 +562,15 @@ with Bash. Scripts and logs in `/var/tmp/ares-flashapi` (`notes.md`).
   25 to 61 tokens/s: 3.5 to 4.5 minutes to the first token. A turn that continues the cached
   conversation has its first token in 3 to 9 s; replies come at 5 to 9 tokens/s with 50 to 90 %
   of the drafts accepted.
-- [ ] A new session reads the whole 16 thousand tokens again: the root checkpoint ("Next",
-      item 2). Even with it the sessions part at the first line: Claude Code 2.1.301 writes no
-      `cch=` but `cc_version=2.1.301.<3 hex>` (`66d` for one task, `e64` for another) in its
-      billing line, so a stamp that is pinned must include that suffix (item 1).
+- The 27B (two cards, tensor split, its MTP block, peer access): the same tasks in 2 and 4
+  turns, 37 s and 22 s. The first prompt at 1052 tokens/s (15.5 s), a continued turn's first
+  token in 0.2 to 0.5 s, replies at 65 to 120 tokens/s.
+- [ ] A new session on Flash-Next reads the whole 16 thousand tokens again: the root checkpoint
+      ("Next", item 2). The template writes the tools first (12.7 thousand tokens) and the
+      system prompt after them, whose first line is Claude Code's billing line: 2.1.301 writes no
+      `cch=` there but `cc_version=2.1.301.<3 hex>`, another suffix for another first message
+      (`66d`, `e64`), so on the 27B a new session took 12672 of 16287 tokens from the cache and
+      computed the rest. A stamp that is pinned must include that suffix (item 1).
 - [ ] Claude Code gives a tool's input back with the defaults of its schema added
       (`{"replace_all": false, ...}` first, where the model wrote `file_path`, `old_string`,
       `new_string`), so the history parts from the cached sequence inside the last reply. On
