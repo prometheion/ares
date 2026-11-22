@@ -571,7 +571,10 @@ with Bash. Scripts and logs in `/var/tmp/ares-flashapi` (`notes.md`).
       `new_string`), so the history parts from the cached sequence inside the last reply. On
       Flash-Next with one checkpoint place (`--ram 8G` without `--cache`) that turn replayed all
       16512 cached rows: 373 s to the first token for 242 new tokens. A checkpoint at every
-      message boundary ("Next", item 2) brings it to the rows of the reply.
+      message boundary ("Next", item 2) brings it to the rows of the reply. Writing a call
+      that comes back without the arguments that equal their schema's `default`, in the
+      schema's order, would match what a model usually writes; it changes the history the
+      client sent, so it is the owner's decision (not built).
 
 ## Whole features not started
 - [ ] Image input (F11; the owner's preset sets `mmproj`). Design: `/var/tmp/ares-survey/image-input-design.md`
