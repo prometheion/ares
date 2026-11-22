@@ -5520,8 +5520,11 @@ slots of its expert cache that it lends for the chunk and refills after (Strata
 
 - *Two sizes of a step.* `--ubatch-size` (`Options::own_rows`, `Model::own_rows`; by default
   `step_rows`, 512 on two cards of 12 GiB) is what the parts keep scratch for; `--batch-size`
-  (`Options::max_rows`, `Model::max_rows`; 8192 by default, as far as the slots can lend it:
-  `batch_rows`) is the widest step, which only a prompt read alone takes. A wider step's
+  (`Options::max_rows`, `Model::max_rows`; 8192 by default) is the widest step, which only a
+  prompt read alone takes. The plan sizes it by what the largest pool of each device's slots
+  would lend (`batch_rows`), and once the store is built the parts halve it until every
+  device's slots lend its scratch (a loan comes from one pool, slots of one size); the model's
+  `max_rows` is that, and the server's log says it. A wider step's
   scratch (0.67 MiB a row on the part with the streams, 0.47 on a worker) lies in VRAM the
   expert slots of the device lend; everything else a step needs (the step's inputs and
   plans, the exchange of two cards, the predictions: about 50 KiB a row, and 24 KiB a row of
