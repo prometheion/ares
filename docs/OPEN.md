@@ -610,8 +610,8 @@ Flash-Next); experts that do not fit in VRAM in RAM; K/V in int8. Its README giv
       whose suffix changes with the first message (the server agent's capture), which upstream
       leaves alone, so Ares does too (the owner: as upstream). The root at the end of the tool
       list (written before the system prompt) keeps such a session from replaying the tools.
-- [ ] Saving and loading a conversation's state by name (llama.cpp's `slot-save-path`, in the
-      owner's preset), and pinning one in the cache (gap study `/var/tmp/ares-survey/gap-study-2026-11-17.md`).
+- Not wanted (the owner, 2026-11-22): saving and loading a conversation's state by name
+  (llama.cpp's `slot-save-path`); the prompt cache covers it.
 - [x] RAM level for the K/V state that leaves VRAM; write to SSD when the RAM level evicts
       (full or shrinking), at unload and at a clean stop (branch `cache/ram-level`).
 - [x] The same for Flash-Next (2026-11-16: its prefix cache on the shared slot block; no
