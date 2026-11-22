@@ -14,6 +14,11 @@ use ares_core::GgmlType;
 #[repr(C, align(32))]
 pub(super) struct Lanes16(pub [i16; 16]);
 
+/// Thirty-two bytes on a 32-byte boundary, as bytes.
+#[derive(Clone, Copy, Debug)]
+#[repr(C, align(32))]
+pub(super) struct Bytes32(pub [i8; 32]);
+
 /// What the kernels look up.
 #[derive(Debug)]
 pub(super) struct Tables {
@@ -27,6 +32,13 @@ pub(super) struct Tables {
     pub iq2xxs_signs: Box<[u64; 128]>,
     /// IQ1_M: the 8 values (-1, 0 or 1 as `i8`) of each of 2048 entries.
     pub iq1_grid: Box<[u64; 2048]>,
+    /// IQ3_XXS: the 4 magnitudes of each of the 256 codebook entries, one
+    /// per byte, the first value in the low byte. Its signs are IQ2_XXS's
+    /// (`iq2xxs_signs`).
+    pub iq3xxs_grid: Box<[u32; 256]>,
+    /// IQ4_NL and IQ4_XS: the 16 non-linear levels as `i8`, twice, so that
+    /// one shuffle looks up 32 nibbles.
+    pub iq4nl_levels: Bytes32,
     /// IQ2_S: for a scale byte, `2 s + 1` of its low nibble in lanes 0..8
     /// and of its high nibble in lanes 8..16.
     pub iq2s_scales: Box<[Lanes16; 256]>,
@@ -66,6 +78,12 @@ fn pack(values: &[f32], byte: impl Fn(f32) -> u8) -> u64 {
 /// The f16 bits of 8.0: with it and a zero scale field an IQ2 group decodes
 /// to its magnitudes (`d * (0.5 + 0) * 0.25 = 1`).
 const F16_EIGHT: [u8; 2] = 0x4800u16.to_le_bytes();
+
+/// The f16 bits of 4.0 and 1.0: an IQ3_XXS group with a zero scale field
+/// decodes to its magnitudes with the first (`d * (0.5 + 0) * 0.5 = 1`), an
+/// IQ4_NL block to its levels with the second.
+const F16_FOUR: [u8; 2] = 0x4400u16.to_le_bytes();
+const F16_ONE: [u8; 2] = 0x3C00u16.to_le_bytes();
 
 fn build() -> Tables {
     // IQ2_S: { f16 d; u8 qs[64]; u8 qh[8]; u8 scales[8] }, 32 groups a block.
@@ -134,6 +152,33 @@ fn build() -> Tables {
         *entry = pack(group, |v| (v - 0.125).round() as i8 as u8);
     }
 
+    // IQ3_XXS: { f16 d; u8 index[64]; 8 x u32 signs and scale }, one index
+    // per 4 values; zero signs and scales.
+    let mut blocks = vec![0u8; 4 * 98];
+    for (n, block) in blocks.as_chunks_mut::<98>().0.iter_mut().enumerate() {
+        block[..2].copy_from_slice(&F16_FOUR);
+        for group in 0..64 {
+            block[2 + group] = (64 * n + group) as u8;
+        }
+    }
+    let values = decode(GgmlType::IQ3_XXS, &blocks);
+    let mut iq3xxs_grid = Box::new([0u32; 256]);
+    for (entry, group) in iq3xxs_grid.iter_mut().zip(values.as_chunks::<4>().0.iter()) {
+        *entry = u32::from_le_bytes(group.map(|v| v as u8));
+    }
+
+    // IQ4_NL: { f16 d; u8 qs[16] }; the low nibble of byte j is value j.
+    let mut block = [0u8; 18];
+    block[..2].copy_from_slice(&F16_ONE);
+    for (j, byte) in block[2..].iter_mut().enumerate() {
+        *byte = j as u8;
+    }
+    let values = decode(GgmlType::IQ4_NL, &block);
+    let mut iq4nl_levels = Bytes32([0; 32]);
+    for (j, level) in iq4nl_levels.0.iter_mut().enumerate() {
+        *level = values[j % 16] as i8;
+    }
+
     let mut iq2s_scales = Box::new([Lanes16([0; 16]); 256]);
     for (byte, lanes) in iq2s_scales.iter_mut().enumerate() {
         lanes.0[..8].fill(2 * (byte & 15) as i16 + 1);
@@ -151,7 +196,17 @@ fn build() -> Tables {
         }
     }
 
-    Tables { iq2s_grid, iq2xxs_grid, iq2xxs_signs, iq1_grid, iq2s_scales, iq1_scales, iq1_deltas }
+    Tables {
+        iq2s_grid,
+        iq2xxs_grid,
+        iq2xxs_signs,
+        iq1_grid,
+        iq3xxs_grid,
+        iq4nl_levels,
+        iq2s_scales,
+        iq1_scales,
+        iq1_deltas,
+    }
 }
 
 #[cfg(test)]
@@ -177,5 +232,18 @@ mod tests {
         assert_eq!(t.iq2s_scales[0x3A].0[0], 21);
         assert_eq!(t.iq2s_scales[0x3A].0[15], 7);
         assert_eq!(t.iq1_deltas[0b0101].0[..9], [-1, 0, 0, 0, 1, 0, 0, 0, -1]);
+        // IQ3_XXS magnitudes are 4, 12, .. 52 and 62; entry 0 is all 4.
+        assert_eq!(t.iq3xxs_grid[0], 0x0404_0404);
+        assert!(
+            t.iq3xxs_grid
+                .iter()
+                .flat_map(|e| e.to_le_bytes())
+                .all(|b| (4..=62).contains(&b) && b % 2 == 0)
+        );
+        assert_eq!(t.iq4nl_levels.0[..16], t.iq4nl_levels.0[16..]);
+        assert_eq!(
+            t.iq4nl_levels.0[..16],
+            [-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113]
+        );
     }
 }

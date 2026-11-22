@@ -387,7 +387,7 @@ pub fn near(args: &Args) -> Result<(), AnyError> {
     }
     let span = *wanted.iter().min().unwrap_or(&0)..*wanted.iter().max().unwrap_or(&0) + 1;
     let cal = read_calibration(&path, span)?;
-    let features = Features::detect()?;
+    let features = Features::detect();
     let key = profile_key(&gguf, &c);
     let n_experts = c.experts.count;
     let n = c.n_embd;

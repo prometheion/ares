@@ -844,7 +844,7 @@ mod hybrid {
                 weight: g.weight,
             })
             .collect();
-        let features = Features::detect().unwrap();
+        let features = Features::detect();
         // SAFETY: the matrices are whole and outlive the job.
         let job =
             Arc::new(unsafe { LayerJob::new(features, &SHAPE, n_rows, act, &experts) }.unwrap());

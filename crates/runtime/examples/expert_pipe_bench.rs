@@ -882,10 +882,11 @@ fn bench_experts(experts: &[&[Vec<u8>; 3]], rows: usize) -> Vec<CpuExpert> {
 /// arithmetic, their time on one core of each kind, and how a job scales
 /// over cores. No device is opened.
 fn cpu_bench(map: &ExpertMap, reader: &Reader, shapes: &[ExpertShape]) -> Result<(), AnyError> {
-    let features = Features::detect()?;
+    let features = Features::detect();
     let topology = Topology::read();
     println!(
-        "cpu: x86-64-v3 present, AVX-VNNI {}; performance cores {:?}, their second threads {:?}, efficiency cores {:?}",
+        "cpu: x86-64-v3 {}, AVX-VNNI {}; performance cores {:?}, their second threads {:?}, efficiency cores {:?}",
+        if features.vector { "yes" } else { "no" },
         if features.vnni { "yes" } else { "no" },
         topology.performance,
         topology.siblings,

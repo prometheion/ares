@@ -8,8 +8,9 @@
 //! - the kernels (`kernels.rs`): gate and up of an expert on the same
 //!   input, `silu(gate) * up`, down, for the rows of a step that picked the
 //!   expert, straight on the file's quantized bytes (kernels written for
-//!   IQ2_S, IQ2_XXS and IQ1_M gate and up and for Q2_0 down, and every other
-//!   weight type through the reference decoder). The arithmetic is the device's: the
+//!   IQ2_S, IQ2_XXS, IQ1_M, IQ3_XXS, IQ4_XS, Q4_K and Q5_K gate and up and for Q2_0,
+//!   Q4_0, Q4_1, Q5_0, Q5_1, Q8_0 and IQ4_NL down, and every other weight
+//!   type through the reference decoder). The arithmetic is the device's: the
 //!   same int8 activations, exact integer sums per 32 values, the hidden
 //!   values quantized the same way. A row therefore loses nothing when the
 //!   CPU computes one of its experts.
@@ -20,9 +21,11 @@
 //!   they sit on a CPU with cores of two kinds. Workers only compute; they
 //!   own no state of the store.
 //!
-//! The floor is x86-64-v3 (AVX2, FMA, F16C, BMI2): [`Features::detect`] checks it
-//! once, when the pool is built, and nothing here runs on less. AVX-VNNI is
-//! used where the CPU has it.
+//! The written kernels need x86-64-v3 (AVX2, FMA, F16C, BMI2), and their
+//! down products have a second form for AVX-VNNI; [`Features::detect`] says
+//! once, when the pool is built, what the CPU has. A CPU without x86-64-v3
+//! computes every type through the reference decoder with portable code (the
+//! decoded path of `kernels.rs`), which is slower and gives the same sums.
 
 mod kernels;
 mod pool;
@@ -34,7 +37,7 @@ use std::time::{Duration, Instant};
 use ares_core::GgmlType;
 use ares_cuda::ExpertShape;
 
-use kernels::{DownExpert, DownKind, GateKind, Hidden, RowIn};
+use kernels::{DownExpert, DownKind, GateKind, Hidden, Order, RowIn};
 pub use pool::{CpuPool, Placement, Topology};
 use tables::Lanes16;
 
@@ -49,17 +52,18 @@ const DOWN_ROWS: usize = 64;
 /// Why the CPU cannot compute experts.
 #[derive(Debug, thiserror::Error)]
 pub enum CpuError {
-    #[error("the CPU kernels need x86-64-v3 (AVX2, FMA, F16C, BMI2); this CPU lacks {0}")]
-    BelowFloor(&'static str),
     #[error("no CPU kernel for experts with {what} of type {ty}")]
     Type { what: &'static str, ty: GgmlType },
     #[error("expert job: {0}")]
     Job(String),
 }
 
-/// What the CPU kernels may use beyond the floor.
+/// What the CPU kernels may use.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Features {
+    /// x86-64-v3 (AVX2, FMA, F16C, BMI2): the written kernels. Without it
+    /// every type goes through the portable decoded path.
+    pub vector: bool,
     /// AVX-VNNI: the down product sums four byte products in one instruction.
     pub vnni: bool,
     /// How codebook entries are fetched.
@@ -79,26 +83,30 @@ pub enum Decode {
 }
 
 impl Features {
-    /// Checks the floor of the engine's CPU code, x86-64-v3, and says what
-    /// the CPU has beyond it. This is the only place the floor is checked:
-    /// a [`LayerJob`] can only be made with the value it returns.
-    pub fn detect() -> Result<Self, CpuError> {
-        for (name, has) in [
-            ("AVX2", is_x86_feature_detected!("avx2")),
-            ("FMA", is_x86_feature_detected!("fma")),
-            ("F16C", is_x86_feature_detected!("f16c")),
-            ("BMI2", is_x86_feature_detected!("bmi2")),
-        ] {
-            if !has {
-                return Err(CpuError::BelowFloor(name));
-            }
+    /// What this CPU has. This is the only place it is asked: a [`LayerJob`]
+    /// can only be made with the value it returns (or one with less), so no
+    /// kernel runs on a CPU without the instructions it uses.
+    pub fn detect() -> Self {
+        let vector = is_x86_feature_detected!("avx2")
+            && is_x86_feature_detected!("fma")
+            && is_x86_feature_detected!("f16c")
+            && is_x86_feature_detected!("bmi2");
+        Self {
+            vector,
+            vnni: vector && is_x86_feature_detected!("avxvnni"),
+            decode: Decode::Fastest,
         }
-        Ok(Self { vnni: is_x86_feature_detected!("avxvnni"), decode: Decode::Fastest })
     }
 
     /// The same CPU without AVX-VNNI, to measure what it gives.
     pub fn without_vnni(self) -> Self {
         Self { vnni: false, ..self }
+    }
+
+    /// The same CPU with the portable code only: what a CPU without
+    /// x86-64-v3 runs, to test and measure it here.
+    pub fn portable(self) -> Self {
+        Self { vector: false, vnni: false, ..self }
     }
 
     /// The same CPU with one way of fetching codebook entries on every
@@ -121,13 +129,17 @@ pub struct CpuExpert {
     pub weight: [f32; MAX_ROWS],
 }
 
+/// The gate types a thread measures itself in: those with a kernel written
+/// for them (IQ2_S, IQ2_XXS, IQ1_M, IQ3_XXS, IQ4_XS, Q4_K, Q5_K).
+pub const MEASURED: usize = GateKind::WRITTEN.len();
+
 /// What a thread measured of itself, once: which way of fetching codebook
 /// entries is faster on its core for each gate type, and how long 32 hidden
 /// values of one row take it that way, in nanoseconds.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ThreadSpeed {
-    pub(crate) gather: [bool; 3],
-    pub(crate) tile_ns: [u32; 3],
+    pub(crate) gather: [bool; MEASURED],
+    pub(crate) tile_ns: [u32; MEASURED],
 }
 
 /// The speeds of the threads that share jobs: what a slow thread needs to
@@ -135,15 +147,15 @@ pub(crate) struct ThreadSpeed {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Team {
     /// The tile time of the fastest worker, per gate type.
-    fast_tile_ns: [u32; 3],
+    fast_tile_ns: [u32; MEASURED],
     /// How many workers are within half of that time again.
-    fast: [u32; 3],
+    fast: [u32; MEASURED],
 }
 
 impl Team {
     pub(crate) fn of(speeds: &[ThreadSpeed]) -> Self {
-        let mut team = Self { fast_tile_ns: [u32::MAX; 3], fast: [0; 3] };
-        for kind in 0..3 {
+        let mut team = Self { fast_tile_ns: [u32::MAX; MEASURED], fast: [0; MEASURED] };
+        for kind in 0..MEASURED {
             let best = speeds.iter().map(|s| s.tile_ns[kind]).min().unwrap_or(u32::MAX);
             team.fast_tile_ns[kind] = best;
             team.fast[kind] =
@@ -163,9 +175,14 @@ thread_local! {
 }
 
 /// This thread's speed, measured at its first call: a tile of each gate
-/// type both ways, on bytes that vary. A thread bound to a core measures
-/// that core.
-pub(crate) fn thread_speed() -> ThreadSpeed {
+/// type with a kernel of its own, both ways where it fetches codebook
+/// entries, on bytes that vary. A thread bound to a core measures that core.
+/// Without the written kernels (`vector` false) there is nothing to choose
+/// and every thread counts as fast.
+pub(crate) fn thread_speed(vector: bool) -> ThreadSpeed {
+    if !vector {
+        return ThreadSpeed { gather: [false; MEASURED], tile_ns: [1; MEASURED] };
+    }
     if let Some(speed) = SPEED.get() {
         return speed;
     }
@@ -180,20 +197,20 @@ pub(crate) fn thread_speed() -> ThreadSpeed {
     let row = RowIn { q: q.as_ptr(), ds: act[ds_at..].as_ptr(), sum8: sum8.as_ptr() };
     let (mut hq, mut hsum, mut hscale) = ([0i8; 128], [0i32; 8], [0.0f32; 8]);
     let hidden = Hidden { q: hq.as_mut_ptr(), sum: hsum.as_mut_ptr(), scale: hscale.as_mut_ptr() };
-    let mut speed = ThreadSpeed { gather: [true; 3], tile_ns: [u32::MAX; 3] };
-    for (k, kind) in [GateKind::Iq2S, GateKind::Iq2Xxs, GateKind::Iq1M].into_iter().enumerate() {
+    let mut speed = ThreadSpeed { gather: [true; MEASURED], tile_ns: [u32::MAX; MEASURED] };
+    for (k, kind) in GateKind::WRITTEN.into_iter().enumerate() {
         let bytes = 32 * (n_in / 256) * kind.block_bytes();
         // Every byte below 0x40: the scales stay small and finite.
         let fill = |seed: usize| -> Vec<u8> {
             (0..bytes).map(|i| ((i * 31 + seed * 17) ^ (i >> 7)) as u8 & 0x3f).collect()
         };
         let (gate, up) = (fill(1), fill(2));
-        for gather in [true, false] {
+        let ways: &[bool] = if kind.has_codebook() { &[true, false] } else { &[true] };
+        for &gather in ways {
             let mut best = u32::MAX;
             for round in 0..8 {
                 let start = Instant::now();
-                // SAFETY: `Features::detect` has passed before any job or
-                // pool exists, which is what calls this; the matrices are 32
+                // SAFETY: the caller found x86-64-v3 (`vector`); the matrices are 32
                 // rows of `n_in` values, the row and the hidden arrays are
                 // sized for them, and all of it is this thread's own.
                 unsafe {
@@ -207,6 +224,7 @@ pub(crate) fn thread_speed() -> ThreadSpeed {
                         0,
                         &[row],
                         &[hidden],
+                        Order::Values,
                     );
                 }
                 if round >= 3 {
@@ -332,10 +350,15 @@ impl LayerJob {
         act: &[u8],
         experts: &[CpuExpert],
     ) -> Result<Self, CpuError> {
-        let kind = GateKind::of(shape.gate_ty)
+        let mut kind = GateKind::of(shape.gate_ty)
             .ok_or(CpuError::Type { what: "gate and up", ty: shape.gate_ty })?;
-        let down = DownKind::of(shape.down_ty)
+        let mut down = DownKind::of(shape.down_ty)
             .ok_or(CpuError::Type { what: "down", ty: shape.down_ty })?;
+        if !features.vector {
+            // The written kernels need x86-64-v3: the decoded path takes all.
+            kind = GateKind::Other(shape.gate_ty);
+            down = DownKind::Other(shape.down_ty);
+        }
         // Whole blocks of both types and whole groups of 32 values.
         shape.check().map_err(|e| CpuError::Job(e.to_string()))?;
         let (n_in, n_ff) = (shape.n_embd as usize, shape.n_ff as usize);
@@ -414,6 +437,14 @@ impl LayerJob {
         Ok(job)
     }
 
+    /// The same job through the reference decoder for both matrices: for the
+    /// tests that hold the written kernels to it.
+    #[cfg(test)]
+    pub(crate) fn decode_everything(&mut self) {
+        self.kind = GateKind::Other(self.kind.ty());
+        self.down = DownKind::Other(self.down.ty());
+    }
+
     /// The (expert, row) pairs of the job: its work in units of the cost model.
     pub fn pairs(&self) -> usize {
         self.experts.iter().map(|e| e.row.len()).sum()
@@ -470,23 +501,38 @@ impl LayerJob {
                 };
                 hidden[n] = self.hidden(expert.first_pair + n);
             }
-            let n = expert.row.len();
-            // SAFETY: `Features::detect` checked the floor; the matrices are
-            // the creator's guarantee; the rows and hiddens are the job's
-            // own, sized by `new`, and this tile of these pairs is written
-            // by this task only.
+            let (n, tile, order) = (expert.row.len(), index % tiles, self.down.order());
+            // SAFETY: a written kind is only made where `Features::detect`
+            // found x86-64-v3 (`new`); the matrices are the creator's
+            // guarantee; the rows and hiddens are the job's own, sized by
+            // `new`, and this tile of these pairs is written by this task
+            // only.
             unsafe {
-                kernels::gate_up_tile(
-                    tables,
-                    self.kind,
-                    gather,
-                    expert.gate,
-                    expert.up,
-                    self.n_in,
-                    index % tiles,
-                    &rows[..n],
-                    &hidden[..n],
-                );
+                match self.kind {
+                    GateKind::Other(ty) => kernels::gate_up_tile_decoded(
+                        self.features.vector,
+                        ty,
+                        expert.gate,
+                        expert.up,
+                        self.n_in,
+                        tile,
+                        &rows[..n],
+                        &hidden[..n],
+                        order,
+                    ),
+                    kind => kernels::gate_up_tile(
+                        tables,
+                        kind,
+                        gather,
+                        expert.gate,
+                        expert.up,
+                        self.n_in,
+                        tile,
+                        &rows[..n],
+                        &hidden[..n],
+                        order,
+                    ),
+                }
             }
             if self.gate_up_done.fetch_add(1, Ordering::AcqRel) + 1 == self.gate_up_tasks {
                 let ns = self.created.elapsed().as_nanos() as u64;
@@ -506,20 +552,35 @@ impl LayerJob {
                     weight: &e.weight,
                 })
                 .collect();
+            let (n_ff, n_out, n_rows, out) = (self.n_ff, self.n_out, self.n_rows, self.out.ptr);
             // SAFETY: as above; the hidden values are complete, and this
             // range of the output is this task's alone.
             unsafe {
-                kernels::down_rows(
-                    self.features.vnni,
-                    self.down,
-                    &experts,
-                    self.n_ff,
-                    self.n_out,
-                    self.n_rows,
-                    first,
-                    count,
-                    self.out.ptr,
-                );
+                match self.down {
+                    DownKind::Other(ty) => kernels::down_rows_decoded(
+                        self.features.vector,
+                        ty,
+                        &experts,
+                        n_ff,
+                        n_out,
+                        n_rows,
+                        first,
+                        count,
+                        out,
+                    ),
+                    kind => kernels::down_rows(
+                        tables,
+                        self.features.vnni,
+                        kind,
+                        &experts,
+                        n_ff,
+                        n_out,
+                        n_rows,
+                        first,
+                        count,
+                        out,
+                    ),
+                }
             }
         }
     }
@@ -542,7 +603,7 @@ impl LayerJob {
     /// time of its tile, so it leaves them when the fast threads will have
     /// done what is left sooner than it would finish one.
     pub(crate) fn work_in(&self, team: Option<&Team>) {
-        let speed = thread_speed();
+        let speed = thread_speed(self.features.vector);
         let kind = self.kind_index();
         let slow = team.is_some_and(|t| is_slow(speed.tile_ns[kind], t.fast_tile_ns[kind]));
         let mut busy = 0u64;
@@ -859,7 +920,7 @@ mod tests {
 
     #[test]
     fn experts_agree_with_the_reference() {
-        let features = Features::detect().expect("x86-64-v3");
+        let features = Features::detect();
         for ty in [GgmlType::IQ2_S, GgmlType::IQ2_XXS, GgmlType::IQ1_M] {
             for rows in [1, 2, 5, 8] {
                 // 192 is an odd number of Q2_0 blocks.

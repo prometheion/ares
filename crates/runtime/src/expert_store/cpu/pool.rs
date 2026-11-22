@@ -14,7 +14,7 @@ use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use super::{CpuError, Features, LayerJob, Team, ThreadSpeed, thread_speed};
+use super::{CpuError, Features, LayerJob, MEASURED, Team, ThreadSpeed, thread_speed};
 
 /// The logical CPUs this process may run on, by kind.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -166,7 +166,7 @@ impl Shared {
         queue.front().cloned()
     }
 
-    fn worker(&self, cpu: Option<usize>) {
+    fn worker(&self, cpu: Option<usize>, vector: bool) {
         if let Some(cpu) = cpu {
             // SAFETY: an all-zero set is valid, `cpu` is below the set's
             // size (checked when the pool was built), and the call reads
@@ -179,7 +179,7 @@ impl Shared {
             }
         }
         // On its core now: how fast it is there.
-        let speed = thread_speed();
+        let speed = thread_speed(vector);
         self.speeds.lock().unwrap_or_else(PoisonError::into_inner).push(speed);
         let mut idle_since = Instant::now();
         let mut spins = 0u32;
@@ -224,10 +224,10 @@ impl std::fmt::Debug for CpuPool {
 
 impl CpuPool {
     /// Starts a worker per entry of `placement`. An idle worker spins for
-    /// `spin` before it sleeps. Fails on a CPU below x86-64-v3, which is
-    /// where the floor of the engine's CPU code is checked.
+    /// `spin` before it sleeps. What the CPU has is asked here
+    /// ([`Features::detect`]), once for the pool's jobs.
     pub fn new(placement: &Placement, spin: Duration) -> Result<Self, CpuError> {
-        let features = Features::detect()?;
+        let features = Features::detect();
         if let Some(cpu) =
             placement.cpus.iter().flatten().find(|c| **c >= libc::CPU_SETSIZE as usize)
         {
@@ -249,9 +249,10 @@ impl CpuPool {
         let mut threads = Vec::with_capacity(placement.cpus.len());
         for (n, cpu) in placement.cpus.iter().copied().enumerate() {
             let shared = Arc::clone(&shared);
+            let vector = features.vector;
             let thread = std::thread::Builder::new()
                 .name(format!("ares-expert-{n}"))
-                .spawn(move || shared.worker(cpu))
+                .spawn(move || shared.worker(cpu, vector))
                 .map_err(|e| CpuError::Job(format!("cannot start a worker: {e}")))?;
             threads.push(thread);
         }
@@ -273,10 +274,11 @@ impl CpuPool {
         Ok(Self { features, shared, threads })
     }
 
-    /// For each worker, in no particular order: per gate type (IQ2_S,
-    /// IQ2_XXS, IQ1_M) whether it fetches codebook entries by a gather, and
-    /// the nanoseconds 32 hidden values of one row take it.
-    pub fn speeds(&self) -> Vec<([bool; 3], [u32; 3])> {
+    /// For each worker, in no particular order: per gate type with a kernel
+    /// of its own (IQ2_S, IQ2_XXS, IQ1_M, IQ3_XXS, IQ4_XS, Q4_K, Q5_K) whether it fetches
+    /// codebook entries by a gather, and the nanoseconds 32 hidden values of
+    /// one row take it.
+    pub fn speeds(&self) -> Vec<([bool; MEASURED], [u32; MEASURED])> {
         let speeds = self.shared.speeds.lock().unwrap_or_else(PoisonError::into_inner);
         speeds.iter().map(|s| (s.gather, s.tile_ns)).collect()
     }
