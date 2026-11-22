@@ -2925,9 +2925,11 @@ when a model is loaded (`Kernels::measure_prefill_path`,
 as make it larger than L2, 512 activation rows (a prompt step: four activation tiles of
 the large shape in a group), every path timed in turn, and of the paths within 5 % of
 the fastest the most exact kept for `prefill_path_for` (f16, then F16Flush, then
-int8). 50 to 150 ms per type; the qwen35 chooser measures every type of its groups
-before its probes (so they time the path that will run), Flash-Next's wide steps its
-quantized dense types. A type that was not measured (in tests and benches) takes f16
+int8). 50 to 150 ms per type, once per device and process: kernels of a device loaded
+again (Flash-Next's parts opened for the trial of the second card's role and then for
+good, a model loaded again) take the first measurement and the same path. The qwen35
+chooser measures every type of its groups before its probes (so they time the path that
+will run), Flash-Next's wide steps its quantized dense types. A type that was not measured (in tests and benches) takes f16
 on a card without the cap and on a capped card the rule kept from the development
 cards (F16Flush for Q4_K, IQ2_S and IQ2_XS, int8 else). Measured on the two capped
 development cards (2026-11-22, Qwen3.8-27B UD-Q4_K_S, tensor split 0.625 / 0.375,

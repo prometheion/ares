@@ -54,6 +54,12 @@ pub struct PrefillChoice {
 /// The choices measured so far on one device.
 pub(super) type Choices = Arc<Mutex<Vec<PrefillChoice>>>;
 
+/// Every choice measured in this process, with the ordinal of its device: the kernels of a
+/// device loaded again (a part opened for a trial of its placement, then for good, or a
+/// model loaded again) take the first measurement instead of probing once more, and so the
+/// same path.
+static MEASURED: Mutex<Vec<(u32, PrefillChoice)>> = Mutex::new(Vec::new());
+
 impl Kernels {
     /// The path [`Precision::Fast`](super::Precision::Fast) takes for matrices of `ty` in the
     /// file's layout: the one [`Kernels::measure_prefill_path`] measured, or the kept rule of
@@ -82,12 +88,26 @@ impl Kernels {
     /// as fast depends on the type and the card as the f16 path does on a card without the
     /// cap.
     ///
+    /// A type measured on the same device before in this process, by other kernels of it,
+    /// is not measured again: this takes that choice.
+    ///
     /// The device should be idle: a product of another context that runs at the same
     /// time is measured into the choice.
     pub fn measure_prefill_path(&self, ty: GgmlType) -> Result<PrefillChoice> {
         let known = self.prefill_choice(ty)?;
         if known.measured {
             return Ok(known);
+        }
+        let ordinal = self.device.ordinal();
+        let earlier = MEASURED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .find(|(device, choice)| *device == ordinal && choice.ty == ty)
+            .map(|(_, choice)| *choice);
+        if let Some(choice) = earlier {
+            self.keep(choice)?;
+            return Ok(choice);
         }
         let probe_ms = self.probe_paths(ty)?;
         let fastest = probe_ms.iter().copied().fold(f32::INFINITY, f32::min);
@@ -101,11 +121,18 @@ impl Kernels {
             .find(|p| probe_ms[index(*p)] <= fastest * AS_FAST_WITHIN)
             .unwrap_or(known.path);
         let choice = PrefillChoice { ty, measured: true, path, probe_ms };
+        MEASURED.lock().unwrap_or_else(|e| e.into_inner()).push((ordinal, choice));
+        self.keep(choice)?;
+        Ok(choice)
+    }
+
+    /// Keeps `choice` for its type on this device's kernels.
+    fn keep(&self, choice: PrefillChoice) -> Result<()> {
         let prefill = self.prefill_kernels()?;
         let mut choices = prefill.choices.lock().unwrap_or_else(|e| e.into_inner());
-        choices.retain(|c| c.ty != ty);
+        choices.retain(|c| c.ty != choice.ty);
         choices.push(choice);
-        Ok(choice)
+        Ok(())
     }
 
     /// The time of a product of the probe matrix of `ty` with each path,
