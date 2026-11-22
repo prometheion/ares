@@ -5173,6 +5173,12 @@ so nothing idle in VRAM needs lending.
   the slots lend with the step's scratch) and reads them there; each byte
   crosses the link once per layer and step. Steps of the parts' own scratch
   (pieces of prompt while another request waits, decode) read in place.
+- *Scratch.* With the model's own context a row's block scores take 4 bytes
+  per block of 262 144 cells, 256 KiB; the scratch held them for every row of
+  the widest step, so a step on lent VRAM cost a quarter of a GiB more per
+  thousand rows and the slots lent for fewer rows (2048 against 4096 with a
+  context of 66 560 on the two development cards). A step scores and selects
+  its rows 256 at a time (`SCORE_ROWS`) into one buffer since.
 - *The prefix cache.* Pages in the pool are pages, near or far: a copy on
   write, a page that leaves for RAM or the drive and one that comes back move
   their far entries with the driver's copy between any two addresses
