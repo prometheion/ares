@@ -750,26 +750,29 @@ fn a_prompt_read_in_wide_steps_gives_the_reference_answer() {
     }
 }
 
-/// A prompt read alone runs as one wide step of more rows than the parts' own scratch holds,
+/// A prompt read alone runs in wide steps of more rows than the parts' own scratch holds,
 /// on VRAM the expert slots lend for it (`expert_store/lend.rs`), in every placement: it
 /// answers as the same prompt read in steps of the own scratch does (both start as the CPU
 /// reference's answer; later tokens of a made-up model follow near ties, which the order of
-/// the experts' sums in a wide step flips), the slots lend once and take the VRAM back after
-/// the prompt, and the experts that stay in VRAM are where their entries say.
+/// the experts' sums in a wide step flips), and the slots lend for the prompt and take the
+/// VRAM back after it.
 #[test]
 fn a_prompt_read_alone_runs_on_vram_the_expert_slots_lend() {
     if !enabled() {
         return;
     }
     let prompt = prompt(200, 5);
-    let reference = reference_answer(1, &prompt, 16);
+    // Experts in BF16, whose slots lend enough for a few wide steps' scratch.
+    let path = gguf_path_of(1, GgmlType::BF16, GgmlType::Q4_0);
+    let reference = reference_answer_at(&path, &prompt, 16);
     let leading = |a: &[u32], b: &[u32]| a.iter().zip(b).take_while(|(x, y)| x == y).count();
     for placement in placements() {
-        let (runtime, _) = start_rows(1, placement, 16, RuntimeConfig::default(), WIDE_ROWS);
+        let (runtime, _) = start_at(&path, placement, 16, RuntimeConfig::default(), WIDE_ROWS);
         let own = ask(&runtime, 1, &prompt, 16);
         runtime.shutdown();
-        let (runtime, model) = start_lending(1, placement, 16, 4 * WIDE_ROWS, WIDE_ROWS);
-        assert_eq!(runtime_rows(&model), (4 * WIDE_ROWS, WIDE_ROWS));
+        // Steps of 32 rows on the loan, of eight in the parts' own memory.
+        let (runtime, model) = start_lending(&path, placement, 16, LENT_ROWS, MAX_ROWS);
+        assert_eq!(runtime_rows(&model), (LENT_ROWS, MAX_ROWS));
         let lent = ask(&runtime, 1, &prompt, 16);
         // Asked again, the same conversation reads its prompt from the cache and
         // the steps run in the parts' own memory.
@@ -786,28 +789,38 @@ fn a_prompt_read_alone_runs_on_vram_the_expert_slots_lend() {
             stats.loans,
             stats.loan_moves
         );
-        assert_eq!(stats.loans, 1, "{placement:?}: one loan for the one prompt read alone");
+        // Each device lends for the first prompt, and again for what the second
+        // reads past the cache, if that is more than the own scratch holds.
+        let devices = if placement == Placement::One { 1 } else { 2 };
+        assert!(
+            (devices..=2 * devices).contains(&stats.loans),
+            "{placement:?}: {} loans",
+            stats.loans
+        );
         assert!(leading(&lent, &reference) >= 2, "{placement:?}: {lent:?} against {reference:?}");
         assert!(leading(&again, &reference) >= 2, "{placement:?}: {again:?} after the loan");
     }
 }
+
+/// The rows of a step on VRAM the made-up model's expert slots lend.
+const LENT_ROWS: u32 = 32;
 
 /// The rows of a step the model takes, and those in its parts' own memory.
 fn runtime_rows(model: &Qwen4Exp) -> (u32, u32) {
     (model.max_rows(), model.own_rows())
 }
 
-/// [`start_rows`] with steps of up to `rows` rows, of which those wider than `own` run on
+/// [`start_at`] with steps of up to `rows` rows, of which those wider than `own` run on
 /// VRAM the expert slots lend.
 fn start_lending(
-    seed: u64,
+    path: &std::path::Path,
     placement: Placement,
     pages: u32,
     rows: u32,
     own: u32,
 ) -> (Runtime, Arc<Qwen4Exp>) {
     let devices = open_devices(placement);
-    let gguf = Gguf::open(gguf_path(seed)).unwrap();
+    let gguf = Gguf::open(path).unwrap();
     let n_layer = Config::from_gguf(&gguf).unwrap().n_layer;
     let mut opts = options(placement, n_layer, pages, MAX_ROWS, rows);
     opts.part.own_rows = own;
