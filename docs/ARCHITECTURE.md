@@ -4271,8 +4271,8 @@ median in ms of 64 steps at 1000 and at 32 000 cells of context.
 | Placement (weights; heads) | Context | Prompt 2048 | Decode 1k | Read 32k | Decode 32k |
 | --- | --- | --- | --- | --- | --- |
 | T: tensor split 0.625 / 0.375; heads with the weights | 126 825 (the 4070 is full) | 1349, 1358 | 26.39, 26.28 | 943, 949 | 29.22, 29.17 |
-| A: 0.625 / 0.375; heads 1 : 3, as the fork's production | 234 513 (the 3060 is full) | 1264 | 27.45 (+4 %) | 756 (-20 %) | 32.63 (+12 %) |
-| M: 0.625 / 0.375; heads by room, 0.33 : 0.67 | 265 114 (both full) | 1278 | 27.21 (+3 %) | 787 (-17 %) | 31.81 (+9 %) |
+| A: 0.625 / 0.375; heads 1 : 3, as the fork's production | 234 513 (the 3060 is full) | 1264 | 27.57, 27.45 (+4 %) | 753, 756 (-20 %) | 32.69, 32.63 (+12 %) |
+| M: 0.625 / 0.375; heads by room, 0.33 : 0.67 | 265 114 (both full) | 1278, 1270 | 27.21, 27.19 (+3 %) | 787, 782 (-17 %) | 31.81, 31.85 (+9 %) |
 | B: 0.7 / 0.3; heads 1 : 3 | 242 228 (both nearly full) | 1474, 1480 | 28.57, 28.52 (+8 %) | 828 (-12 %) | 33.65 (+15 %) |
 | L: layer split 0.62 / 0.38 | 113 742 (the 4070 is full) | 1228, 1232 | 41.17, 41.21 (+56 %) | 855 | 45.26, 45.32 (+55 %) |
 
@@ -4696,9 +4696,14 @@ answer to the reference's.
 default both cards on every layer when each can write the other's memory), the
 context, and the RAM. The dense parts take 2.9 GiB on the first card and 0.4
 on the second; what the cards have left is slots for experts. The context
-costs slots, so without `--context` the K and V of the pool take a
-thirty-second of the room for slots (17 408 to 18 432 tokens for two sequences
-on this machine) where the 27B gets what is left. Options that mean nothing for the
+costs slots; without `--context` it is the model's own all the same (the
+owner's rule of 2026-11-22, for both models), as far as VRAM holds it beside
+the fewest slots the store needs of every layer (a row's picks and the free
+slots) and the drafters (`plan::pages_beside_floors`); the plan says what was
+wanted and how much of it is in VRAM (`plan::ContextPlan`), so that K and V
+beyond VRAM can overflow into RAM once that is built. Until 2026-11-22 the K and
+V took a thirty-second of the room for slots (17 408 to 18 432 tokens for two
+sequences on this machine). Options that mean nothing for the
 model are errors that name them: `--shares`, `--precision exact`,
 `--draft-vocab`, more sequences than the eight rows of a
 generating step (`--parallel`), `--drafters mtp` (the model file carries no MTP block;
@@ -6552,9 +6557,12 @@ through it are not measured yet.
 names it (see "Several models" below).
 Without options it plans for itself: the first device that holds the weights
 and a context, or else a tensor split over all devices with shares from the
-memory bandwidth each device reports, and a context from the VRAM that is
-left; the start-up report says what was chosen, why, and where the VRAM
-went. Devices, split, shares, context, K/V format, precision, the model
+memory bandwidth each device reports, and the model's own context (its
+file's context length) as far as the VRAM that is left holds it (a tensor
+split moves attention heads with their K and V to the devices with room as
+far as that context needs: see "What the second card is for"); the start-up
+report says what was chosen, why, what context was wanted and how much of it
+is in VRAM, and where the VRAM went. Devices, split, shares, context, K/V format, precision, the model
 drafters that take part (`--drafters`) and the room for their windows
 (`--window`), and the RAM the engine may use (`--ram`) can be given instead. The RAM limit defaults
 to all the machine has, and below any limit the engine holds what the machine
@@ -7275,8 +7283,8 @@ one card) pass.
 For a mixture of experts (`qwen4exp`) the plan is another one: where the
 layers go (`--split tensor`: both devices on every layer, `layer`: a range
 each, by default the first when each device can write the other's memory), the
-context (without `--context`, what a thirty-second of the room for expert slots
-holds), and the RAM (`--ram`, whose limit less what the engine needs is the
+context (without `--context`, the model's own as far as VRAM holds it beside
+the fewest expert slots and the drafters), and the RAM (`--ram`, whose limit less what the engine needs is the
 tier of experts). The server reads a short text of German, English and code
 before it listens, so that the first request does not find every slot empty. It
 has no prefix cache, no `--shares`, no `--precision exact`, no `--draft-vocab`,

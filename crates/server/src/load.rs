@@ -643,10 +643,11 @@ pub(crate) fn read_vocabulary(path: &Path) -> Result<Arc<[u32]>, LoadError> {
 }
 
 /// The shares of the attention heads of a tensor split by `shares` for a
-/// context of `pages` pages, or for the most context the devices hold when
-/// `pages` is `None` ([`plan::attention_for_context`],
-/// [`plan::attention_by_room`]), by estimate: what each device has left once
-/// it holds everything but the heads, and what all heads take.
+/// context of `pages` pages ([`plan::attention_for_context`]), or, when the
+/// devices cannot hold that many wherever the heads are, the shares with which
+/// they hold the most ([`plan::attention_by_room`]); by estimate: what each
+/// device has left once it holds everything but the heads, and what all heads
+/// take.
 #[allow(clippy::too_many_arguments)]
 fn attention_for_context(
     c: &Config,
@@ -656,7 +657,7 @@ fn attention_for_context(
     held: &[Held],
     shares: &[f64],
     headroom: u64,
-    pages: Option<u32>,
+    pages: u32,
 ) -> Result<Vec<f64>, LoadError> {
     let n = held.len();
     // The footprint of every device with the heads all on device `on`.
@@ -676,20 +677,11 @@ fn attention_for_context(
         heads = heads.max((all.weights + all.exact).saturating_sub(none.weights + none.exact));
         page = page.max(all.per_page.saturating_sub(none.per_page));
     }
-    let attention = match pages {
-        Some(pages) => plan::attention_for_context(shares, &room, heads, page, pages),
-        None => plan::attention_by_room(&room),
-    };
-    attention.ok_or_else(|| {
-        refuse(format!(
-            "the devices cannot hold the attention heads with {} next to their shares of the \
-             weights, wherever the heads are",
-            match pages {
-                Some(pages) => format!("{pages} pages of context"),
-                None => "any context".into(),
-            }
-        ))
-    })
+    plan::attention_for_context(shares, &room, heads, page, pages)
+        .or_else(|| plan::attention_by_room(&room))
+        .ok_or_else(|| {
+            refuse("no device has room for the attention heads next to its share of the weights")
+        })
 }
 
 /// The placement of `spread`, with the MTP block where `Qwen35::new` puts
@@ -1087,7 +1079,7 @@ fn load_qwen35(
             held = vec![keep];
         }
     }
-    if options.attention.is_some() && split != SplitKind::Tensor {
+    if options.attention != AttentionShares::ByContext && split != SplitKind::Tensor {
         return Err(refuse(
             "shares of the attention heads are for a tensor split, where every device holds \
              heads of every attention block",
@@ -1147,7 +1139,7 @@ fn load_qwen35(
                 }
             };
             match (split, &options.attention) {
-                (SplitKind::Tensor, Some(AttentionShares::Given(attention)))
+                (SplitKind::Tensor, AttentionShares::Given(attention))
                     if attention.len() != held.len() =>
                 {
                     return Err(refuse(format!(
@@ -1156,10 +1148,11 @@ fn load_qwen35(
                         held.len()
                     )));
                 }
-                (SplitKind::Tensor, Some(AttentionShares::Given(attention))) => {
+                (SplitKind::Tensor, AttentionShares::Given(attention)) => {
                     (Spread::TensorWithAttention(shares, attention.clone()), why)
                 }
-                (SplitKind::Tensor, Some(AttentionShares::ByContext)) => {
+                (SplitKind::Tensor, AttentionShares::ByContext) => {
+                    let wanted = options.context.unwrap_or(config.n_ctx as u32);
                     let attention = attention_for_context(
                         &config,
                         &weights,
@@ -1168,11 +1161,10 @@ fn load_qwen35(
                         &held,
                         &shares,
                         headroom,
-                        options.context.map(|context| plan::pool_pages(context, parallel)),
+                        plan::pool_pages(wanted, parallel),
                     )?;
                     (Spread::TensorWithAttention(shares, attention), why)
                 }
-                (SplitKind::Tensor, None) => (Spread::Tensor(shares), why),
                 _ => (Spread::Layer(shares), why),
             }
         }
@@ -1213,9 +1205,10 @@ fn load_qwen35(
                 taken_text()
             )));
         }
-        Some(context) => (context, "as asked"),
+        Some(context) => (context, "as asked".to_owned()),
         None => {
-            let context = plan::default_context(fit, parallel, model_context);
+            let plan = plan::ContextPlan::new(None, model_context, fit, parallel);
+            let context = plan.context();
             // Next to other models a context below the least a device is
             // chosen for is no room: one of them makes way.
             if site.beside && context < smallest {
@@ -1243,11 +1236,7 @@ fn load_qwen35(
                     )
                 )));
             }
-            if context < model_context.saturating_mul(parallel) {
-                (context, "what the devices' free memory holds, by estimate")
-            } else {
-                (context, "the model's own context for every sequence")
-            }
+            (context, plan.why())
         }
     };
     let longest = context.min(model_context);

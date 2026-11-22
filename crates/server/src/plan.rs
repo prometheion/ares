@@ -100,10 +100,10 @@ pub struct LoadOptions {
     pub shares: Option<Vec<f64>>,
     /// Where a tensor split puts the KV heads of the attention blocks, with
     /// their K and V and their attention work; the rest of the model follows
-    /// `shares`. `None`: the heads follow `shares` too. No option of the
-    /// command line sets it yet: its name and form are the owner's to choose
-    /// (`docs/OPEN.md`, "Roles of the cards").
-    pub attention: Option<AttentionShares>,
+    /// `shares`. The engine's way is [`AttentionShares::ByContext`], which
+    /// `--context` steers (the owner, 2026-11-22: no option of its own);
+    /// shares given are for tests and measurements.
+    pub attention: AttentionShares,
     /// Tokens of sequence state the engine holds for all sequences together.
     pub context: Option<u32>,
     /// Sequences that run at once.
@@ -159,7 +159,7 @@ impl LoadOptions {
             devices: None,
             split: None,
             shares: None,
-            attention: None,
+            attention: AttentionShares::ByContext,
             context: None,
             parallel: None,
             kv: None,
@@ -186,10 +186,10 @@ pub enum AttentionShares {
     /// Each device's share, as given.
     Given(Vec<f64>),
     /// Where the context finds room: the heads follow the weights as far as
-    /// the context asked for fits that way, and move to the devices with
-    /// room as far as it needs ([`attention_for_context`]); with no context
-    /// asked for, the shares with which the devices hold the most
-    /// ([`attention_by_room`]).
+    /// the context wanted (the one asked for, or the model's own) fits that
+    /// way, and move to the devices with room as far as it needs
+    /// ([`attention_for_context`]); when it cannot fit at all, the shares with
+    /// which the devices hold the most ([`attention_by_room`]).
     ByContext,
 }
 
@@ -315,24 +315,22 @@ pub fn pages_that_fit(rooms: &[Room], parallel: u32) -> u32 {
         .unwrap_or(0)
 }
 
-/// How much of the VRAM that could hold experts the K/V of the context may
-/// take when the operator names no context, as a divisor: a thirty-second.
-/// Every page of K/V is slots fewer for experts, and a step that misses an
-/// expert waits for the drive; a mixture-of-experts model gets the context
-/// that costs that little, where a dense model gets what is left.
-pub const KV_SHARE_OF_SLOTS: u64 = 32;
-
-/// The pages of K/V and keys that fit in the share of `slot_bytes[d]`, the
-/// bytes device `d` has for expert slots, that [`KV_SHARE_OF_SLOTS`] gives
-/// them, `page_bytes[d]` being a page's bytes there. A device without
-/// attention blocks (0 bytes a page) does not bound the pool.
-pub fn pages_beside_experts(slot_bytes: &[u64], page_bytes: &[u64]) -> u32 {
+/// The pages of K/V and keys that fit beside the fewest expert slots each
+/// device must keep: `slot_bytes[d]` is what device `d` has for expert slots
+/// with no context, `floor_bytes[d]` the slots its layers cannot do without,
+/// `page_bytes[d]` a page's bytes there. Every page of K and V is slots fewer
+/// for experts, and a step that misses an expert waits for RAM or the drive;
+/// the owner's rule (2026-11-22) is that the context is the model's own all
+/// the same, so a mixture of experts gives its slots up to that floor. A
+/// device without attention blocks (0 bytes a page) does not bound the pool.
+pub fn pages_beside_floors(slot_bytes: &[u64], floor_bytes: &[u64], page_bytes: &[u64]) -> u32 {
     slot_bytes
         .iter()
+        .zip(floor_bytes)
         .zip(page_bytes)
         .filter(|(_, per_page)| **per_page > 0)
-        .map(|(slots, per_page)| {
-            u32::try_from(slots / KV_SHARE_OF_SLOTS / per_page).unwrap_or(u32::MAX)
+        .map(|((slots, floor), per_page)| {
+            u32::try_from(slots.saturating_sub(*floor) / per_page).unwrap_or(u32::MAX)
         })
         .min()
         .unwrap_or(0)
@@ -350,15 +348,64 @@ pub fn pool_tokens(pages: u32, parallel: u32) -> u32 {
     pages.saturating_sub(parallel).saturating_mul(CELLS_PER_PAGE)
 }
 
-/// The context served when the operator names none: what fits, at most what
-/// `parallel` sequences of the model's own context could use, rounded down
-/// to whole thousands of tokens (1024) so that the estimate behind it has a
-/// little slack.
-pub fn default_context(pages_fit: u32, parallel: u32, model_context: u32) -> u32 {
-    let fits = pool_tokens(pages_fit, parallel);
-    let useful = model_context.saturating_mul(parallel);
-    let context = fits.min(useful);
-    if context >= 2048 { context / 1024 * 1024 } else { context }
+/// The context a model is served with: what was wanted and how much of it
+/// the devices hold in VRAM.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContextPlan {
+    /// The tokens of state for all sequences together that were wanted: the
+    /// operator's `--context`, or the model's own context (its file's context
+    /// length, the owner's rule of 2026-11-22) when none was named.
+    pub wanted: u32,
+    /// The tokens of it whose K and V lie in VRAM. Less than `wanted` only
+    /// when no context was named and the model's own does not fit; the rest
+    /// is to overflow into RAM, which is not built, so for now the model is
+    /// served with this much.
+    pub in_vram: u32,
+    /// Whether the operator named the context.
+    pub asked: bool,
+}
+
+impl ContextPlan {
+    /// The plan for `asked` tokens (`None`: the model's own context,
+    /// `model_context`) when `pages_fit` pages fit in VRAM beside the model
+    /// with `parallel` sequences. A context that was asked for is all in VRAM:
+    /// one that does not fit is refused as it was asked. What fits of the
+    /// model's own is rounded down to whole thousands of tokens (1024) when it
+    /// is not all of it, so that the estimate behind it has a little slack.
+    pub fn new(asked: Option<u32>, model_context: u32, pages_fit: u32, parallel: u32) -> Self {
+        match asked {
+            Some(context) => Self { wanted: context, in_vram: context, asked: true },
+            None => {
+                let fits = pool_tokens(pages_fit, parallel);
+                let in_vram = if fits >= model_context {
+                    model_context
+                } else if fits >= 2048 {
+                    fits / 1024 * 1024
+                } else {
+                    fits
+                };
+                Self { wanted: model_context, in_vram, asked: false }
+            }
+        }
+    }
+
+    /// The tokens the pool is made for now: what lies in VRAM.
+    pub fn context(&self) -> u32 {
+        self.in_vram
+    }
+
+    /// Why the context is what it is, for the plan's line in the log.
+    pub fn why(&self) -> String {
+        match (self.asked, self.in_vram == self.wanted) {
+            (true, _) => "as asked".into(),
+            (false, true) => "the model's own context, all of it in VRAM".into(),
+            (false, false) => format!(
+                "the model's own context is {} tokens and the devices' VRAM holds {} of them; \
+                 K and V beyond VRAM are not moved to RAM yet, so the context is what VRAM holds",
+                self.wanted, self.in_vram
+            ),
+        }
+    }
 }
 
 /// The most host RAM the engine may ever use when the operator names no
@@ -574,19 +621,23 @@ mod tests {
     }
 
     #[test]
-    fn the_context_of_a_model_with_experts_takes_a_share_of_what_experts_could_use() {
+    fn the_context_of_a_model_with_experts_leaves_the_slots_the_store_needs() {
         let gib = 1u64 << 30;
-        // 19 GiB of slots on two devices, pages of 1.7 MiB on one of them.
-        let pages = pages_beside_experts(&[8 * gib, 11 * gib], &[1_800_000, 0]);
-        assert_eq!(pages, (8 * gib / 32 / 1_800_000) as u32);
+        // 19 GiB of slots on two devices, a floor of 1 GiB on each, pages of
+        // 1.7 MB on one of them.
+        let floors = [gib, gib];
+        let pages = pages_beside_floors(&[8 * gib, 11 * gib], &floors, &[1_800_000, 0]);
+        assert_eq!(pages, (7 * gib / 1_800_000) as u32);
         // The tighter device decides when both hold pages.
         assert_eq!(
-            pages_beside_experts(&[8 * gib, 11 * gib], &[1_000_000, 4_000_000]),
-            (11 * gib / 32 / 4_000_000) as u32
+            pages_beside_floors(&[8 * gib, 11 * gib], &floors, &[1_000_000, 4_000_000]),
+            (10 * gib / 4_000_000) as u32
         );
+        // Slots below the floor hold no page.
+        assert_eq!(pages_beside_floors(&[gib / 2], &[gib], &[1_000]), 0);
         // No attention anywhere, or no device: nothing bounds, nothing fits.
-        assert_eq!(pages_beside_experts(&[gib], &[0]), 0);
-        assert_eq!(pages_beside_experts(&[], &[]), 0);
+        assert_eq!(pages_beside_floors(&[gib], &[0], &[0]), 0);
+        assert_eq!(pages_beside_floors(&[], &[], &[]), 0);
     }
 
     #[test]
@@ -600,15 +651,26 @@ mod tests {
     }
 
     #[test]
-    fn the_default_context_is_what_fits_and_no_more_than_is_useful() {
-        // 700 pages for two sequences: 698 * 128 = 89344 tokens, rounded down.
-        assert_eq!(default_context(700, 2, 262_144), 89_088);
-        // More room than two sequences of the model's context can use.
-        assert_eq!(default_context(10_000, 2, 4096), 8192);
+    fn the_default_context_is_the_models_own_or_what_of_it_fits() {
+        let plan = |pages| ContextPlan::new(None, 262_144, pages, 2);
+        // 700 pages for two sequences: 698 * 128 = 89344 tokens, rounded down,
+        // of the model's 262144.
+        assert_eq!(plan(700), ContextPlan { wanted: 262_144, in_vram: 89_088, asked: false });
+        assert!(plan(700).why().contains("262144 tokens and the devices' VRAM holds 89088"));
+        // Room for more than the model's own context: the model's own, all in VRAM.
+        assert_eq!(plan(10_000).context(), 262_144);
+        assert_eq!(plan(2050).context(), 262_144);
+        assert_eq!(plan(2049).context(), 261_120);
         // Too little to round.
-        assert_eq!(default_context(10, 2, 262_144), 1024);
-        assert_eq!(default_context(5, 2, 262_144), 384);
-        assert_eq!(default_context(1, 2, 262_144), 0);
+        assert_eq!(plan(10).context(), 1024);
+        assert_eq!(plan(5).context(), 384);
+        assert_eq!(plan(1).context(), 0);
+        // A context that was asked for is what was asked, whatever fits.
+        let asked = ContextPlan::new(Some(500_000), 262_144, 10, 2);
+        assert_eq!(
+            (asked.wanted, asked.in_vram, asked.why().as_str()),
+            (500_000, 500_000, "as asked")
+        );
     }
 
     #[test]

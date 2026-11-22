@@ -65,6 +65,33 @@ const WARM_UP_LIMIT: Duration = Duration::from_secs(1800);
 /// each device, before the context is decided.
 const TRIAL_CONTEXT: u32 = 8192;
 
+/// Free slots the expert store keeps per layer in VRAM (its default).
+const VRAM_RESERVE: u64 = 8;
+
+/// The bytes of expert slots each device of `placement` cannot do without:
+/// a row's picks and the free slots of every layer it holds slots for (what
+/// the store gives a layer when the CPU serves what VRAM cannot take), a
+/// tenth more for the rounding of slots, and on the device with the head
+/// `drafter` bytes for the drafters.
+fn slot_floors(
+    c: &Config,
+    placement: &ares_model::qwen4exp::device::Placement,
+    drafter: u64,
+) -> Vec<u64> {
+    let all: u64 = placement.devices.iter().map(|d| d.experts).sum();
+    let per_slot = (c.experts.used as u64 + VRAM_RESERVE) * 11 / 10;
+    placement
+        .devices
+        .iter()
+        .map(|d| {
+            // One expert of every layer the device holds slots for.
+            let round = if placement.tensor.is_some() { all } else { d.experts };
+            let round = round / c.experts.count.max(1) as u64;
+            per_slot * round + if d.head { drafter } else { 0 }
+        })
+        .collect()
+}
+
 /// Loads the model of `options`, whose file `gguf` is open, and starts the
 /// runtime over it.
 pub(crate) fn load(
@@ -95,7 +122,7 @@ pub(crate) fn load(
              layers per device follows what fits; --split names which of the two",
         ));
     }
-    if options.attention.is_some() {
+    if options.attention != plan::AttentionShares::ByContext {
         return Err(refuse(
             "shares of the attention heads do nothing for this model: its attention layers, \
              their keys and values are on the device that mixes the streams",
@@ -137,6 +164,14 @@ pub(crate) fn load(
         MtpWeights::load(file, &config)
             .map_err(|e| refuse(format!("--drafters {}: {e}", path.display())))?;
     }
+    // What the drafters take on the device with the head, for the plan of the
+    // context: their weights and, for the MTP block, its experts, which stay
+    // resident; a margin for their pools and buffers.
+    let drafter_bytes = drafter.as_ref().map_or(0, |(path, file)| {
+        let in_model = path.as_path() == gguf.path(0);
+        let tensors = file.tensors().iter().filter(|t| !in_model || t.name.starts_with("mtp."));
+        tensors.map(|t| t.size).sum::<u64>() + (128 << 20)
+    }) + dflash.as_ref().map_or(0, |file| file.bytes() + (128 << 20));
     let window = options.window.unwrap_or(DRAFT_WINDOW);
     let drafts = drafter.is_some() || dflash.is_some();
     if options.window.is_some() && !drafts {
@@ -275,9 +310,11 @@ pub(crate) fn load(
     };
 
     // Context: tokens of state for all sequences together. Without a number
-    // from the operator the K/V takes a share of what the experts could use.
+    // from the operator, the model's own (the owner's rule of 2026-11-22),
+    // as far as VRAM holds it beside the fewest expert slots the store needs
+    // and the drafters: every page of K and V is expert slots fewer.
     let (context, pages, why_context) = match options.context {
-        Some(context) => (context, plan::pool_pages(context, parallel), "as asked"),
+        Some(context) => (context, plan::pool_pages(context, parallel), "as asked".to_owned()),
         None => {
             let trial = TRIAL_CONTEXT.min(model_context);
             let (placement, page_bytes) = place(
@@ -287,22 +324,39 @@ pub(crate) fn load(
             )
             .map_err(|e| named_split(e.to_string()))?;
             spread = pinned(spread, &placement);
-            let slots: Vec<u64> = placement.devices.iter().map(|d| d.slots).collect();
-            let fit = plan::pages_beside_experts(&slots, &page_bytes);
-            let context = plan::default_context(fit, parallel, model_context);
-            if context == 0 {
+            // The pools of the trial are slots again.
+            let pages_of_trial = u64::from(plan::pool_pages(trial, parallel));
+            let slots: Vec<u64> = placement
+                .devices
+                .iter()
+                .zip(&page_bytes)
+                .map(|(d, page)| d.slots + page * pages_of_trial)
+                .collect();
+            let floors = slot_floors(&config, &placement, drafter_bytes);
+            let fit = plan::pages_beside_floors(&slots, &floors, &page_bytes);
+            let plan = plan::ContextPlan::new(None, model_context, fit, parallel);
+            if plan.context() == 0 {
                 let error = refuse(
                     "the devices have no room for context next to the experts' slots; name one \
                      with --context to try it anyway",
                 );
                 return Err(short(site, error));
             }
-            (
-                context,
-                plan::pool_pages(context, parallel),
-                "a thirty-second of the room for experts' slots, which every page of K and V \
-                 takes from",
-            )
+            let pool = u64::from(plan::pool_pages(plan.context(), parallel));
+            tracing::info!(
+                "plan: K and V of the context take {} of the bytes for expert slots (at least \
+                 {} stay for the fewest slots each layer needs and the drafters)",
+                join(
+                    page_bytes.iter().zip(&slots).map(|(page, room)| format!(
+                        "{} of {}",
+                        Bytes(page * pool),
+                        Bytes(*room)
+                    )),
+                    " and "
+                ),
+                join(floors.iter().map(|b| Bytes(*b).to_string()), " and "),
+            );
+            (plan.context(), plan::pool_pages(plan.context(), parallel), plan.why())
         }
     };
     let longest = context.min(model_context);

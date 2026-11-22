@@ -70,9 +70,9 @@ fn the_attention_heads_go_where_the_room_is_and_the_context_grows() {
     let question = "Erkläre in drei Sätzen, warum der Himmel blau ist.\n\n";
     let mut results = Vec::new();
     for (name, attention) in [
-        ("with the weights", None),
-        ("a quarter on the first card", Some(AttentionShares::Given(vec![1.0, 3.0]))),
-        ("for the most context", Some(AttentionShares::ByContext)),
+        ("with the weights", AttentionShares::Given(vec![0.625, 0.375])),
+        ("a quarter on the first card", AttentionShares::Given(vec![1.0, 3.0])),
+        ("by the model's own context", AttentionShares::ByContext),
     ] {
         let mut options = LoadOptions::new(PathBuf::from(&model));
         options.devices = Some(vec![0, 1]);
