@@ -250,10 +250,25 @@ Flash); a RAM cache per layer (`--moe-stream-window`), a VRAM cache that follows
 tokens, the lowest leaves first; prompts layer by layer, so each expert is read about once per
 prompt (0.98 to 1.00 reads per distinct expert). To be read in its code before items 3 above
 (large prompt chunks) and the prediction's next step are built.
-- [ ] Prompt batch and micro-batch adjustable as in llama.cpp, and a large micro-batch by
-      default for a mixture of experts (Strata reads prompts in chunks of 8192: each expert is read
-      once per chunk, not once per 512 rows); adaptive: a lone prompt takes the large chunk, and
-      when another request waits the pieces shrink to a bound in time (the owner, 2026-11-17).
+- [x] Prompt batch and micro-batch adjustable as in llama.cpp (`--batch-size`/`-b`,
+      `--ubatch-size`/`-ub`, 2026-11-22, branch `moe/prompt-chunks`): a prompt read alone takes
+      steps of up to `--batch-size` rows (8192 for Flash-Next as far as its slots can lend the
+      scratch), whose scratch lies in VRAM the expert slots lend for the step and take back
+      after it (`expert_store/lend.rs`); when another request waits, steps of prompt are pieces
+      in the parts' own memory (`--ubatch-size`, 512 here) halved until their price is at most
+      500 ms (`RuntimeConfig::piece_ms`). See "Large prompt steps on lent VRAM" in
+      ARCHITECTURE.md for the measurements. Left: TokenWing's order (each layer over the whole
+      prompt, an expert read once per prompt, about 80 KiB a row instead of 0.5 to 0.7 MiB of
+      scratch; the item "Long prompts layer by layer" below), a step on loan that a request
+      can interrupt, the parcels of a split by layers sized for the widest step (80 KiB a row
+      of VRAM on the receiving card and as much page-locked RAM, for good), the step's inputs
+      in page-locked RAM sized for it (about 20 KiB a row a part), a loan that stays while the
+      engine is idle after a request that ended with its prompt, both cards on every layer not
+      measured (the machine had no driver with peer access).
+      What was asked: a large micro-batch by default for a mixture of experts (Strata reads
+      prompts in chunks of 8192: each expert is read once per chunk, not once per 512 rows);
+      adaptive: a lone prompt takes the large chunk, and when another request waits the pieces
+      shrink to a bound in time (the owner, 2026-11-17).
       Several requests at once ("parallel calling") belongs to the optimising phase.
       The large chunks need what Strata pays them with: the prompt borrows expert slots in
       VRAM and refills them afterwards (Strata `DETAILS.md:1383-1385`); Strata reads IQ2_XS
@@ -308,7 +323,19 @@ prompt (0.98 to 1.00 reads per distinct expert). To be read in its code before i
       needs a copy on the step's stream. Not built; the prediction reads the router's input.
 - [ ] Long prompts layer by layer over the whole prompt, interruptible, with read-ahead of
       the most used experts of the next two layers. (Wide steps read the next layer's
-      predicted picks ahead now, within a step.)
+      predicted picks ahead now, within a step.) TokenWing's form, read 2026-11-22
+      (`src/llama-context.cpp` `lm_layer_major_ok`, `src/llama-moe-stream.cpp`
+      `lm_lend_place`): only for a call of one sequence and more than one micro-batch; each
+      micro-batch runs a layer's attention and router (its picks, weights and the normed
+      expert input kept per row), then one expert graph runs the layer's experts for all rows
+      in chunks of the micro-batch, and the layer's K/V is rewound and replayed per micro-batch;
+      what a call keeps lives in places lent by the VRAM expert pool (about 60 KiB a row for
+      qwen4exp's four streams). For Ares that is about 80 KiB a row (the four streams of the
+      residual, the experts' input, their hidden values and output, the picks) against the 0.5
+      to 0.7 MiB of a step's scratch that the lent steps take now, so a loan of the same size
+      would hold eight times the rows; it needs the part's layers to loop over micro-batches
+      with their own records and plans, and the mixer's and worker's exchanges per
+      micro-batch. A step that a request can interrupt between layers needs the same state.
 - [ ] A missed expert waits 2.3 to 3.2 ms for the file where the drive needs 1.4 ms: find
       the rest. Measured 2026-11-16 (`qwen4exp_run --decode-at`, its `drive:` line; two cards
       `--ram-gib 8`, load 7 to 12, the drive shared with other agents' builds and models):
@@ -371,8 +398,11 @@ prompt (0.98 to 1.00 reads per distinct expert). To be read in its code before i
       for speed that a test of quality must know.
 - [ ] The first reading of a short prompt after other texts is slower with transit
       (35 against 86 tokens/s in one run); not understood.
-- [ ] A request that arrives behind a lone long prompt waits for one piece of 512 rows,
-      2 to 2.5 s. Needs a bound in time. **Question to the owner: how long may it wait?**
+- [x] A request that arrives behind a lone long prompt: once it waits, steps of prompt are
+      pieces of at most 500 ms by their measured price (`RuntimeConfig::piece_ms`, 2026-11-22).
+      It still waits for the step in flight, which for a prompt read alone is a step of up to
+      `--batch-size` rows on lent VRAM (see "Large prompt steps on lent VRAM"; measured
+      there).
 
 ### Host memory
 - [ ] A release that does not wait for the running step, so the headroom stays at a few

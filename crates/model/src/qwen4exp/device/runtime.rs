@@ -2194,10 +2194,11 @@ impl Qwen4ExpDevice {
     fn wait_step(&mut self, end: &Event) -> Result<(), ModelError> {
         let flow = &self.flow;
         // A wide step's last layers may take long: it stands still only when
-        // nothing moves.
-        let (mut started, mut seen) = (Instant::now(), flow.progress());
+        // no layer's route record reaches the store.
+        let followed = || flow.followed.iter().map(|n| n.load(Ordering::Acquire)).sum::<usize>();
+        let (mut started, mut seen) = (Instant::now(), followed());
         while !end.is_done()? {
-            let now = flow.progress();
+            let now = followed();
             if now != seen {
                 (started, seen) = (Instant::now(), now);
             }
