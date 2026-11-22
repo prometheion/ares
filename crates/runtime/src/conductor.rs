@@ -1228,8 +1228,9 @@ impl Conductor {
     /// gives way or is cancelled: the pages that are full and not published
     /// yet, the partly used last page as a tail, and the live state as the
     /// checkpoint of that tail (or of the last full page, when the cells end
-    /// on a page boundary). The copy of the state runs with the next record,
-    /// before anything of it writes a slot.
+    /// on a page boundary), unless with one place it would push out the
+    /// request's own anchor ([`Cache::save_end`]). The copy of the state runs
+    /// with the next record, before anything of it writes a slot.
     fn keep(&mut self, a: &mut Active, slot: u32) {
         let Some(cache) = &mut self.cache else { return };
         cache.index.withdraw(a.owner);
@@ -1265,7 +1266,7 @@ impl Conductor {
             && !restored
             && a.state_pos() == cells
         {
-            let saved = cache.save(slot, hash, a.owner, false);
+            let saved = cache.save_end(slot, hash, a.owner);
             self.stats.counters.checkpoints_saved += u64::from(saved.taken);
             self.stats.counters.checkpoints_dropped += u64::from(saved.dropped);
         }

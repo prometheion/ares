@@ -463,7 +463,7 @@ fn a_request_held_for_a_page_that_is_given_up_computes_it_itself() {
 fn rejected_drafts_inside_a_tail_are_cut_and_the_next_turn_takes_exactly_what_was_accepted() {
     let mut rng = Rng(19);
     let model = model(Some(CHECKPOINT), repeating);
-    let cfg = RuntimeConfig { window_rows: 8, ..config(512, 24) };
+    let cfg = RuntimeConfig { window_rows: 8, ..config(512, 64) };
     let e = engine_with(&model, cfg, |host| host.with_delay(Duration::from_micros(100)));
     let mut ended_in_a_window = 0;
     for max_tokens in 20..70u32 {

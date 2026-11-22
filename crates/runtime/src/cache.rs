@@ -769,6 +769,27 @@ impl Cache {
         }
     }
 
+    /// Takes the checkpoint of a request's live state at its end, as
+    /// [`Cache::save`], unless the budget holds one checkpoint and that is a
+    /// fresh one of the same request (its anchor). The end state lies less
+    /// than a page and the reply's rows after the anchor, and the next turn of
+    /// a conversation often parts from it inside the reply: Claude Code sends
+    /// back a call of its Edit tool with an argument the model never wrote,
+    /// and Qwen's templates leave out the thinking of an answer once a new
+    /// question follows. With the end state in the one place such a turn
+    /// replays every row it shares; with the anchor, the reply's rows.
+    pub(crate) fn save_end(&mut self, slot: u32, hash: ChainHash, owner: Owner) -> Saved {
+        let in_ram = self.in_ram.as_ref().map_or(0, RamLevel::checkpoints);
+        let one = self.policy_now().capacity() == 1;
+        if one && in_ram == 0 && self.index.checkpoints() == 1 {
+            let first = self.index.checkpoint_ranks(&self.policy).first().copied();
+            if first.is_some_and(|rank| rank.by == Some(owner) && !rank.aged) {
+                return Saved::default();
+            }
+        }
+        self.save(slot, hash, owner, false)
+    }
+
     /// Queues the restore of `id` into `slot` for the next record.
     pub(crate) fn restore(&mut self, slot: u32, id: CheckpointId) {
         self.restores.push(StateCopy { kind: StateCopyKind::Restore, slot, place: id.0 as u32 });
@@ -1524,6 +1545,26 @@ mod tests {
         // marks it.
         assert!(!cache.save(1, hashes[2], Owner(2), true).taken);
         assert!(cache.index.is_root(hashes[2]));
+    }
+
+    #[test]
+    fn with_one_place_an_end_state_does_not_push_out_its_own_anchor() {
+        let mut pool = PagePool::new(8, PER_PAGE);
+        let mut cache = cache(1);
+        let hashes = three_pages(&mut cache, &mut pool);
+        assert!(cache.save(0, hashes[1], Owner(1), false).taken);
+        assert!(!cache.save_end(0, hashes[2], Owner(1)).taken);
+        assert!(cache.index.checkpoint(hashes[1]).is_some());
+        // Another request's end state takes the place as before.
+        let other = cache.save_end(1, hashes[2], Owner(2));
+        assert_eq!((other.taken, other.dropped), (true, 1));
+        // With room for two the ranking decides as for any checkpoint.
+        let mut roomy = super::tests::cache(2);
+        let hashes = three_pages(&mut roomy, &mut pool);
+        assert!(roomy.save(0, hashes[0], Owner(1), false).taken);
+        assert!(roomy.save(0, hashes[1], Owner(1), false).taken);
+        let end = roomy.save_end(0, hashes[2], Owner(1));
+        assert_eq!((end.taken, end.dropped), (true, 1));
     }
 
     #[test]

@@ -319,6 +319,8 @@ pub struct CheckpointRank {
     pub hash: ChainHash,
     /// The checkpoint.
     pub checkpoint: CheckpointId,
+    /// Who published it, when that is known.
+    pub by: Option<Owner>,
     /// The position in cells of the state it holds.
     pub position: u64,
     /// On its one branch, more than the allowed number of later requests
@@ -416,6 +418,7 @@ impl PrefixIndex {
             rank: CheckpointRank {
                 hash,
                 checkpoint,
+                by,
                 position,
                 aged: false,
                 root,
