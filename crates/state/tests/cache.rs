@@ -168,7 +168,7 @@ impl World {
         loop {
             let live = &mut self.live[i];
             let next =
-                self.policy.next_capture(prompt_len, live.last_checkpoint, live.state_at, to);
+                self.policy.next_capture(prompt_len, &[], live.last_checkpoint, live.state_at, to);
             let stop = next.unwrap_or(to);
             for cell in live.state_at..stop {
                 live.state = recurrent(live.state, live.tokens[cell as usize]);
@@ -411,12 +411,18 @@ impl World {
             if let Some(nearest) = nearest_page {
                 assert!(rank.rows_saved <= nearest as u64, "a nearer checkpoint was overlooked");
             }
-            // Below an aged one there is a later request's checkpoint; one
-            // with nothing below it is not aged.
+            // Below an aged one there is a later request's checkpoint, or as
+            // many checkpoints as stay fresh; one with nothing below it is not
+            // aged.
             let below =
                 |c: &&Stored| c.text.len() > stored.text.len() && c.text.starts_with(&stored.text);
             if rank.aged {
-                assert!(self.checkpoints.values().filter(below).any(|c| c.by != stored.by));
+                let mut under = self.checkpoints.values().filter(below);
+                let count = self.checkpoints.values().filter(below).count();
+                assert!(
+                    under.any(|c| c.by != stored.by)
+                        || count >= self.policy.fresh_checkpoints as usize
+                );
             }
             if !self.checkpoints.values().any(|c| below(&c)) {
                 assert!(!rank.aged, "a checkpoint with nothing below it is aged");
@@ -442,10 +448,13 @@ fn run(seed: u64, budget: u64, stats: &mut Stats) {
             cells_per_page: PER_PAGE,
             prompt_interval: 16,
             generation_interval: 8,
+            boundary_interval: 8,
+            boundary_reach: 0,
             volatile_rows: 1,
             bytes_per_checkpoint: 10,
             budget_bytes: budget * 10,
             fresh_requests: 0,
+            fresh_checkpoints: 3,
         },
         root: ChainHash::root(b"test model"),
         device: vec![u64::MAX; (PAGES * PER_PAGE) as usize],

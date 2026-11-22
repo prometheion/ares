@@ -62,8 +62,8 @@ use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use ares_state::{
-    Chain, ChainHash, CheckpointId, CheckpointPolicy, Evicted, Owner, PageId, PagePool, PageState,
-    PrefixIndex, PrefixMatch, Priority, Resume, Sequence,
+    Boundary, Chain, ChainHash, CheckpointId, CheckpointPolicy, Evicted, Owner, PageId, PagePool,
+    PageState, PrefixIndex, PrefixMatch, Priority, Resume, Sequence,
 };
 use ares_store::Kind;
 
@@ -272,6 +272,7 @@ impl Cache {
         let policy = CheckpointPolicy {
             prompt_interval: config.checkpoint_prompt_interval,
             generation_interval: config.checkpoint_generation_interval,
+            boundary_interval: config.checkpoint_boundary_interval,
             ..CheckpointPolicy::new(cells_per_page, spec.bytes(), config.cache_ram)
         };
         let index = match spec.tails_per_slot {
@@ -313,6 +314,14 @@ impl Cache {
             scratch: Vec::new(),
             evictions: 0,
         }
+    }
+
+    /// Prompts are read in pieces of `rows` rows: a piece that ends this
+    /// close before a message boundary takes the boundary's checkpoint where
+    /// it ends, and is not cut ([`CheckpointPolicy::boundary_reach`]).
+    pub(crate) fn with_reach(mut self, rows: u32) -> Self {
+        self.policy.boundary_reach = rows;
+        self
     }
 
     /// The places and the pages in RAM lie in the page-locked memory of
@@ -455,10 +464,23 @@ impl Cache {
     }
 
     /// The first position in `(from, to]` at which a checkpoint is due for a
-    /// sequence of a prompt of `prompt_len` cells whose last checkpoint is at
-    /// `last`, or `None`.
-    pub(crate) fn capture(&self, prompt_len: u64, last: u64, from: u64, to: u64) -> Option<u64> {
-        self.policy.next_capture(prompt_len, last, from, to)
+    /// sequence of a prompt of `prompt_len` cells, whose parts end at
+    /// `boundaries` and whose last checkpoint is at `last`, or `None`.
+    pub(crate) fn capture(
+        &self,
+        prompt_len: u32,
+        boundaries: &[Boundary],
+        last: u64,
+        from: u64,
+        to: u64,
+    ) -> Option<u64> {
+        self.policy.next_capture(u64::from(prompt_len), boundaries, last, from, to)
+    }
+
+    /// Whether a checkpoint at `at` lies at a root of the prompt whose parts
+    /// end at `boundaries`.
+    pub(crate) fn at_root(&self, boundaries: &[Boundary], at: u64) -> bool {
+        self.policy.at_root(boundaries, at)
     }
 
     /// The place of a new checkpoint, with room made for it, and how many
@@ -715,9 +737,17 @@ impl Cache {
 
     /// Takes a checkpoint of the state in `slot`, which is at the end of the
     /// page named `hash` or of the tail so named, unless the index has one
-    /// there already. The copy runs with the next record.
-    pub(crate) fn save(&mut self, slot: u32, hash: ChainHash, owner: Owner) -> Saved {
-        if !self.recurrent || self.capacity == 0 || self.index.checkpoint(hash).is_some() {
+    /// there already. With `root`, it is at the end of a system prompt or a
+    /// tool list, and kept longest. The copy runs with the next record.
+    pub(crate) fn save(&mut self, slot: u32, hash: ChainHash, owner: Owner, root: bool) -> Saved {
+        if !self.recurrent || self.capacity == 0 {
+            return Saved::default();
+        }
+        if self.index.checkpoint(hash).is_some() {
+            // A root of this prompt that another text keeps as a plain one.
+            if root {
+                self.index.mark_root(hash);
+            }
             return Saved::default();
         }
         let (place, dropped) = self.new_place();
@@ -725,6 +755,9 @@ impl Cache {
         match self.index.attach_checkpoint(hash, CheckpointId(u64::from(place)), owner) {
             Ok(before) => {
                 debug_assert!(before.is_none(), "the entry had no checkpoint");
+                if root {
+                    self.index.mark_root(hash);
+                }
                 self.saves.push(StateCopy { kind: StateCopyKind::Save, slot, place });
                 self.placed.insert(place, hash);
                 Saved { taken: true, dropped }
@@ -793,7 +826,7 @@ impl Cache {
     /// it may lie already. Returns whether a checkpoint went with it, which
     /// happens only without RAM below the devices.
     fn leave_cards(&mut self, evicted: Evicted, left_behind: &HashSet<ChainHash>) -> bool {
-        let Evicted { page, checkpoint, hash, parent, depth, tail, .. } = evicted;
+        let Evicted { page, checkpoint, root, hash, parent, depth, tail, .. } = evicted;
         let full = tail.is_none();
         let deep = full && self.deep(depth);
         let worth = full && (self.worth.remove(&hash) || deep);
@@ -802,6 +835,7 @@ impl Cache {
             place: id.0 as u32,
             worth: deep && !left_behind.contains(&hash),
             stored,
+            root,
         });
         let Some(ram) = &mut self.in_ram else {
             // Nothing below the devices: the checkpoint goes with its page.
@@ -1353,6 +1387,9 @@ impl Cache {
                         let id = CheckpointId(u64::from(held.place));
                         match self.index.attach_checkpoint(hash, id, owner) {
                             Ok(before) => {
+                                if held.root {
+                                    self.index.mark_root(hash);
+                                }
                                 if let Some(before) = before {
                                     self.release(before);
                                 }

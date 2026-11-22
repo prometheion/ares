@@ -43,9 +43,11 @@ pub struct RuntimeConfig {
     /// machine (see "Host memory" in `docs/ARCHITECTURE.md`).
     pub cache_ram: u64,
     /// The least distance in cells between checkpoints inside a prompt, and
-    /// while generating (`ares_state::CheckpointPolicy`).
+    /// while generating, and from the last checkpoint to a message boundary
+    /// that gets one (`ares_state::CheckpointPolicy`).
     pub checkpoint_prompt_interval: u32,
     pub checkpoint_generation_interval: u32,
+    pub checkpoint_boundary_interval: u32,
     /// The level of the prefix cache that is on SSD: where it lies and how
     /// large it may get. `None` keeps the cache in the devices and in RAM
     /// alone. Only a model that says it is [`crate::Model::durable`] uses it.
@@ -110,8 +112,9 @@ impl Default for RuntimeConfig {
             output_clip: 4096,
             output_ratio: 0.7,
             cache_ram: 0,
-            checkpoint_prompt_interval: 32_768,
+            checkpoint_prompt_interval: 8192,
             checkpoint_generation_interval: 2048,
+            checkpoint_boundary_interval: 1024,
             ssd: None,
             max_rows: 0,
             window_rows: 8,

@@ -989,3 +989,118 @@ fn every_page_a_request_used_is_named_as_freed_once_it_ended() {
     assert!(pages.freed.iter().all(|p| pages.tabled.contains(p)), "only pages that were used");
     assert_consistent(&e);
 }
+
+/// A conversation as a request: the synthetic model writes each message as
+/// `role: text` and a line break, and the reply after `assistant: `. The
+/// parts of a conversation end where the text of a message starts and ends;
+/// the system prompt's and the first message's are the roots.
+fn chat(messages: &[(ares_api::Role, String)], max_tokens: u32) -> ares_api::GenerateRequest {
+    let mut request = request("", Some(max_tokens));
+    request.prompt = ares_api::Prompt::Chat {
+        messages: messages
+            .iter()
+            .map(|(role, text)| ares_api::Message::new(*role, text.as_str()))
+            .collect(),
+        tools: None,
+        variables: Vec::new(),
+        continue_final: false,
+    };
+    request
+}
+
+/// The text the synthetic model renders a conversation as, for a request of
+/// plain text that has the same tokens and no boundaries.
+fn rendered(messages: &[(ares_api::Role, String)]) -> String {
+    let mut text: String =
+        messages.iter().map(|(role, content)| format!("{}: {content}\n", role.as_str())).collect();
+    text.push_str("assistant: ");
+    text
+}
+
+impl Rig {
+    fn ask_chat(&self, messages: &[(ares_api::Role, String)], max_tokens: u32) -> Answer {
+        let request = chat(messages, max_tokens);
+        let id = request.id;
+        let run = run_one(&self.rt, request);
+        let report = *snapshot(&self.rt).request(id).expect("the request ended");
+        Answer { run, report }
+    }
+}
+
+/// Checkpoints at message boundaries only: no fixed distance in a prompt or
+/// while generating, a boundary one page past the last checkpoint gets one.
+fn boundary_config() -> RuntimeConfig {
+    RuntimeConfig {
+        checkpoint_prompt_interval: 4096,
+        checkpoint_generation_interval: 4096,
+        checkpoint_boundary_interval: PAGE,
+        ..config(256, 64)
+    }
+}
+
+#[test]
+fn a_new_conversation_with_the_same_system_prompt_starts_from_its_root() {
+    use ares_api::Role::{System, User};
+    let mut rng = Rng(31);
+    let system = text_of(&mut rng, 100);
+    let first = [(System, system.clone()), (User, text_of(&mut rng, 30))];
+    let second = [(System, system.clone()), (User, text_of(&mut rng, 30))];
+    let model = model(Some(CHECKPOINT), |_| {});
+    // The system message is `system: ` and 100 characters: it ends at 108,
+    // and the first message's text starts at 115 after `\nuser: `. The roots
+    // are the page boundaries at 96 and 112.
+    let e = engine(&model, boundary_config());
+    let a = e.ask_chat(&first, 20);
+    assert_eq!(a.report.replayed_rows, 0);
+    let b = e.ask_chat(&second, 20);
+    assert_eq!(b.run.text, fresh(|_| {}, &rendered(&second), 20).text);
+    assert_eq!((b.report.cached_tokens, b.report.replayed_rows), (112, 0));
+    assert_consistent(&e);
+    // The same texts without boundaries (plain text of the same tokens):
+    // nothing is kept at the system prompt's end, every shared row runs again.
+    let e = engine(&model, boundary_config());
+    e.ask(&rendered(&first), 20);
+    let b = e.ask(&rendered(&second), 20);
+    assert_eq!((b.report.cached_tokens, b.report.replayed_rows), (112, 112));
+    assert_consistent(&e);
+}
+
+#[test]
+fn an_edited_message_replays_only_the_rows_from_the_boundary_before_it() {
+    use ares_api::Role::{Assistant, System, User};
+    let mut rng = Rng(32);
+    let model = model(Some(CHECKPOINT), |_| {});
+    // A conversation of five turns that comes whole (a client that sends a
+    // history, a conversation the cache had lost), then again with its
+    // second answer changed.
+    let mut messages = vec![(System, text_of(&mut rng, 40))];
+    for turn in 0..5 {
+        messages.push((User, text_of(&mut rng, 25)));
+        if turn < 4 {
+            messages.push((Assistant, text_of(&mut rng, 30)));
+        }
+    }
+    let mut edited = messages.clone();
+    edited[4].1 = text_of(&mut rng, 30);
+    // The text of the changed answer starts here.
+    let shared = (rendered(&messages[..4]).len() as u32) / PAGE * PAGE;
+
+    let e = engine(&model, boundary_config());
+    let first = e.ask_chat(&messages, 20);
+    assert_eq!(first.run.text, fresh(|_| {}, &rendered(&messages), 20).text);
+    let answer = e.ask_chat(&edited, 20);
+    assert_eq!(answer.run.text, fresh(|_| {}, &rendered(&edited), 20).text);
+    // It takes the pages before the change and replays from a checkpoint at
+    // most one boundary interval before it.
+    assert_eq!(answer.report.cached_tokens, shared);
+    assert!(answer.report.replayed_rows <= PAGE, "{:?}", answer.report);
+    assert_consistent(&e);
+
+    // Without boundaries (the same tokens as plain text) the history has a
+    // checkpoint only at its end: the change replays every shared row.
+    let e = engine(&model, boundary_config());
+    e.ask(&rendered(&messages), 20);
+    let answer = e.ask(&rendered(&edited), 20);
+    assert_eq!((answer.report.cached_tokens, answer.report.replayed_rows), (shared, shared));
+    assert_consistent(&e);
+}

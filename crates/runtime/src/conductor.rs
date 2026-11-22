@@ -92,7 +92,7 @@ use ares_sched::{
     Prices, Request, SeqId, Share, Turn, Want, Wish, choose, plan,
 };
 use ares_state::{
-    Chain, ChainHash, Owner, PagePool, PageState, PrefixIndex, Priority, Resume, Sequence,
+    Boundary, Chain, ChainHash, Owner, PagePool, PageState, PrefixIndex, Priority, Resume, Sequence,
 };
 
 use crate::cache::Cache;
@@ -197,6 +197,9 @@ impl StatsCopy {
 pub(crate) struct Submission {
     pub id: RequestId,
     pub prompt: Vec<u32>,
+    /// Where the parts of the conversation end in the prompt, for the
+    /// checkpoints of the prefix cache.
+    pub boundaries: Vec<Boundary>,
     pub max_tokens: Option<u32>,
     /// The stop strings, and what else is watched in the reply's text.
     pub stop: Watch,
@@ -249,6 +252,10 @@ struct Active {
     /// Per token, the host-side context state (see [`ContextSpec`]).
     states: Vec<u32>,
     prompt_len: u32,
+    /// Where the parts of the conversation end in the prompt: the system
+    /// prompt, the tool list, the messages. The prefix cache keeps
+    /// checkpoints there.
+    boundaries: Vec<Boundary>,
     /// How many of `tokens` are computed as certain rows before the sequence
     /// generates: the prompt, and for a request that gave way and came back
     /// everything it had read and written by then.
@@ -671,6 +678,7 @@ impl Conductor {
                     &config,
                     config.cells_per_page,
                 )
+                .with_reach(model.prompt_rows().min(max_rows))
                 .with_ram(exec.ram())
             }),
             admission: Admission::new(admission),
@@ -1016,7 +1024,8 @@ impl Conductor {
     /// Puts a new request in line. It starts at the next pass of the
     /// admission accounting in which it fits.
     fn enqueue(&mut self, submission: Submission) {
-        let Submission { id, prompt, max_tokens, stop, sampling, draft, filter, sink } = submission;
+        let Submission { id, prompt, boundaries, max_tokens, stop, sampling, draft, filter, sink } =
+            submission;
         let refuse = |error: EngineError| {
             let _ = sink.send(Event::Error(error));
         };
@@ -1089,6 +1098,7 @@ impl Conductor {
             sink,
             cells: Sequence::new(),
             prompt_len,
+            boundaries,
             known: prompt_len,
             chain,
             owner: Owner(u64::from(seq.0)),
@@ -1255,7 +1265,7 @@ impl Conductor {
             && !restored
             && a.state_pos() == cells
         {
-            let saved = cache.save(slot, hash, a.owner);
+            let saved = cache.save(slot, hash, a.owner, false);
             self.stats.counters.checkpoints_saved += u64::from(saved.taken);
             self.stats.counters.checkpoints_dropped += u64::from(saved.dropped);
         }
@@ -1567,7 +1577,8 @@ impl Conductor {
                     Some(cache) => {
                         let from = a.cells.len();
                         let to = from + 1 + cap as u64;
-                        match cache.capture(u64::from(a.prompt_len), a.checkpoint_at, from, to) {
+                        match cache.capture(a.prompt_len, &a.boundaries, a.checkpoint_at, from, to)
+                        {
                             Some(at) => cap.min((at - from - 1) as usize),
                             None => cap,
                         }
@@ -1814,7 +1825,7 @@ impl Conductor {
                 let to = step.from + u64::from(step.rows);
                 if let Some(cache) = &self.cache
                     && let Some(at) =
-                        cache.capture(u64::from(a.prompt_len), a.checkpoint_at, step.from, to)
+                        cache.capture(a.prompt_len, &a.boundaries, a.checkpoint_at, step.from, to)
                 {
                     step.rows = step.rows.min((at - step.from) as u32);
                 }
@@ -2549,11 +2560,13 @@ impl Conductor {
                 );
                 cache.note(a.owner, &a.chain, settled, false);
                 if let Some(at) =
-                    cache.capture(u64::from(a.prompt_len), a.checkpoint_at, part.from, reached)
+                    cache.capture(a.prompt_len, &a.boundaries, a.checkpoint_at, part.from, reached)
                     && at == reached
                 {
                     let page = (at / u64::from(self.pool.cells_per_page())) as usize;
-                    let saved = cache.save(part.slot, a.chain.hashes()[page - 1], a.owner);
+                    let root = cache.at_root(&a.boundaries, at);
+                    let hash = a.chain.hashes()[page - 1];
+                    let saved = cache.save(part.slot, hash, a.owner, root);
                     self.stats.counters.checkpoints_saved += u64::from(saved.taken);
                     self.stats.counters.checkpoints_dropped += u64::from(saved.dropped);
                     a.checkpoint_at = at;

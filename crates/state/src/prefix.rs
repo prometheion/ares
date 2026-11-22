@@ -173,6 +173,8 @@ pub(crate) struct Entry {
     pub(crate) checkpoint: Option<CheckpointId>,
     /// Who published the checkpoint, when that is known.
     pub(crate) checkpoint_by: Option<Owner>,
+    /// The checkpoint is at a root: the end of a system prompt or a tool list.
+    pub(crate) checkpoint_root: bool,
     /// Scratch for walks: the epoch of the walk that last marked the entry.
     mark: u64,
 }
@@ -249,6 +251,8 @@ pub struct Evicted {
     pub page: PageId,
     /// The checkpoint that was attached to the entry and is now unreferenced.
     pub checkpoint: Option<CheckpointId>,
+    /// That checkpoint was at a root ([`PrefixIndex::mark_root`]).
+    pub root: bool,
     /// The class the page had.
     pub class: Priority,
     /// The name of what went: a page's hash, or a tail's.
@@ -652,6 +656,7 @@ impl PrefixIndex {
                 class,
                 checkpoint: None,
                 checkpoint_by: None,
+                checkpoint_root: false,
                 mark: 0,
             },
         );
@@ -805,6 +810,7 @@ impl PrefixIndex {
         Evicted {
             page: tail.page,
             checkpoint: tail.checkpoint,
+            root: false,
             class: tail.class,
             hash,
             parent: prior,
@@ -855,6 +861,7 @@ impl PrefixIndex {
         by: Option<Owner>,
     ) -> Result<Option<CheckpointId>, Option<CheckpointId>> {
         let (slot, slot_by) = if let Some(entry) = self.entries.get_mut(&hash) {
+            entry.checkpoint_root = false;
             (&mut entry.checkpoint, &mut entry.checkpoint_by)
         } else {
             let Some(prior) = self.tail_prior.get(&hash) else { return Err(checkpoint) };
@@ -867,6 +874,26 @@ impl PrefixIndex {
         self.checkpoints =
             self.checkpoints + usize::from(checkpoint.is_some()) - usize::from(before.is_some());
         Ok(before)
+    }
+
+    /// Marks the checkpoint of the cached page `hash` as one at a root: the
+    /// end of a system prompt or a tool list, which every conversation of an
+    /// agent starts from. It is dropped after every other checkpoint and is
+    /// never left behind. `false` when the page is not cached or has no
+    /// checkpoint; a tail's checkpoint is never a root.
+    pub fn mark_root(&mut self, hash: ChainHash) -> bool {
+        match self.entries.get_mut(&hash) {
+            Some(entry) if entry.checkpoint.is_some() => {
+                entry.checkpoint_root = true;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether the checkpoint of the cached page `hash` is at a root.
+    pub fn is_root(&self, hash: ChainHash) -> bool {
+        self.entries.get(&hash).is_some_and(|entry| entry.checkpoint_root)
     }
 
     /// The cached page named `hash`: the page, the hash it follows and its
@@ -911,6 +938,7 @@ impl PrefixIndex {
         Some(Evicted {
             page: entry.page,
             checkpoint: entry.checkpoint,
+            root: entry.checkpoint_root,
             class: entry.class,
             hash,
             parent: entry.parent,
@@ -1382,6 +1410,7 @@ mod tests {
             Some(Evicted {
                 page: pages[0],
                 checkpoint: Some(CheckpointId(3)),
+                root: false,
                 class: Priority::NORMAL,
                 hash: first,
                 parent: root,

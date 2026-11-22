@@ -9,14 +9,27 @@
 //!
 //! **Where they go** ([`CheckpointPolicy::next_capture`]). Only at page
 //! boundaries, where the index has a name to attach them to, and at the end
-//! of a tail:
+//! of a tail. A prompt of a conversation names the places where its parts
+//! end ([`Boundary`]: the chat template knows them), because a later prompt
+//! that changes the conversation (an edited message, an older tool result
+//! cut, a new conversation with the same system prompt) shares the text up to
+//! such a place:
 //!
+//! - at the **roots**, the page boundary at or before the end of the system
+//!   prompt and of the tool list, always: every conversation of an agent
+//!   starts there (llama.cpp fork's `--checkpoint-root`);
+//! - at **every message boundary**: the page boundary at or before it, when
+//!   it lies at least [`CheckpointPolicy::boundary_interval`] cells after the
+//!   last checkpoint, so that a conversation of many short messages does not
+//!   copy the state at every page. A prompt step that ends a little before the
+//!   boundary (at most [`CheckpointPolicy::boundary_reach`] cells, a page
+//!   boundary) takes it where it ends, so that no step is cut for it: a step
+//!   that is cut costs a pass over the weights;
 //! - inside a prompt at least [`CheckpointPolicy::prompt_interval`] cells
-//!   apart (sparse), while generating at least
-//!   [`CheckpointPolicy::generation_interval`] apart (dense): ExLlamaV3's
-//!   intervals, measured from the last checkpoint on the sequence's own path
-//!   and not on a fixed grid, so a sequence that resumed from a checkpoint
-//!   continues the spacing from there;
+//!   apart (the fixed distance), while generating at least
+//!   [`CheckpointPolicy::generation_interval`] apart: measured from the last
+//!   checkpoint on the sequence's own path and not on a fixed grid, so a
+//!   sequence that resumed from a checkpoint continues the spacing from there;
 //! - always at the prompt's anchor, the last page boundary that is at least
 //!   [`CheckpointPolicy::volatile_rows`] before the prompt's end (ExLlamaV3's
 //!   last page boundary, LMDeploy's skip of the volatile end): the next turn
@@ -42,22 +55,29 @@
 //! **Which are dropped** ([`PrefixIndex::make_room_for_checkpoints`]). There
 //! is a budget in bytes. When it is full:
 //!
-//! 1. Aged checkpoints go before fresh ones (TokenSpeed). The checkpoints
-//!    form a tree by their text; a checkpoint is aged when more than
+//! 1. Aged checkpoints go before fresh ones. The checkpoints form a tree by
+//!    their text; a checkpoint on one branch is aged when more than
 //!    [`CheckpointPolicy::fresh_requests`] later requests have published
-//!    checkpoints below it on its one branch. The newest checkpoints of a
-//!    conversation are where its next turn resumes; old ones are passed. A
-//!    checkpoint with checkpoints on two or more branches below it has been
-//!    resumed from more than once and is never aged, and the checkpoints one
-//!    request publishes are no step apart, so a request's anchor is as fresh
-//!    as its end.
-//! 2. Within those, the checkpoint with the least distance to the next
+//!    checkpoints below it (TokenSpeed), or when at least
+//!    [`CheckpointPolicy::fresh_checkpoints`] checkpoints lie below it on
+//!    that branch (the llama.cpp fork keeps the newest three of a cached
+//!    prompt). The newest checkpoints of a conversation are where its next
+//!    turn resumes; old ones are passed, and a long prompt with many message
+//!    boundaries does not push the newest checkpoints of other conversations
+//!    out. A checkpoint with checkpoints on two or more branches below it has
+//!    been resumed from more than once and is never aged, and the checkpoints
+//!    one request publishes are no step apart for the count of requests, so a
+//!    request's anchor is as fresh as its end.
+//! 2. Roots go after every other checkpoint and never age: every new
+//!    conversation of an agent starts from them.
+//! 3. Within those, the checkpoint with the least distance to the next
 //!    checkpoint below it (toward the start of the text) goes first: that
 //!    distance is the rows a resume replays more when it is gone. An end
 //!    state right after an anchor goes before a checkpoint that stands alone
 //!    for 30 000 rows (LMDeploy demotes such a checkpoint the same way), and
-//!    as a dense run thins out, the distances of the ones that are left grow.
-//! 3. Then the least recently used.
+//!    as a dense run thins out, the distances of the ones that are left grow
+//!    (the fork's `--checkpoint-spread`).
+//! 4. Then the least recently used.
 //!
 //! Dropping a checkpoint never takes a K/V page with it, so on entries inside
 //! a chain the checkpoint goes before the page (SGLang's order); a page at
@@ -69,6 +89,17 @@ use std::ops::Range;
 
 use crate::prefix::{ChainHash, CheckpointId, Owner, PrefixIndex, PrefixMatch};
 
+/// A place in a prompt where a part of a conversation ends: what a later
+/// prompt that changes the conversation after it still shares with this one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Boundary {
+    /// The number of the prompt's tokens before it.
+    pub at: u64,
+    /// The end of the system prompt or of the tool list: the start that the
+    /// conversations of an agent share.
+    pub root: bool,
+}
+
 /// The numbers of the checkpoint policy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CheckpointPolicy {
@@ -78,6 +109,15 @@ pub struct CheckpointPolicy {
     pub prompt_interval: u32,
     /// The least distance in cells between checkpoints while generating.
     pub generation_interval: u32,
+    /// The least distance in cells from the last checkpoint to a message
+    /// boundary that gets one.
+    pub boundary_interval: u32,
+    /// How far in cells before a message boundary its checkpoint may lie: a
+    /// prompt step that ends this close before it, on a page boundary, takes
+    /// the checkpoint there instead of a step that is cut at the boundary.
+    /// The size of a piece of prompt is the right reach; 0 cuts at every
+    /// boundary.
+    pub boundary_reach: u32,
     /// How many of a prompt's last rows the next turn of the conversation is
     /// not expected to share (what a chat template puts after the last
     /// message and then renders differently). The anchor is at least this far
@@ -91,15 +131,20 @@ pub struct CheckpointPolicy {
     /// published checkpoints below it. TokenSpeed's default is 0: only the
     /// newest request's checkpoints on a branch are fresh.
     pub fresh_requests: u32,
+    /// A checkpoint stays fresh while fewer than this many checkpoints lie
+    /// below it on its branch: the newest ones of a conversation.
+    pub fresh_checkpoints: u32,
 }
 
 /// Distances beyond this many requests rank alike (TokenSpeed caps at 5 too).
 const MAX_REQUESTS_BELOW: u32 = 5;
 
 impl CheckpointPolicy {
-    /// ExLlamaV3's intervals (every 2048 cells while generating, every 32768
-    /// in a prompt), LMDeploy's one volatile row, for checkpoints of
-    /// `bytes_per_checkpoint` within `budget_bytes`.
+    /// Every 8192 cells in a prompt (the llama.cpp fork's spacing; ExLlamaV3
+    /// has 32768), every 2048 while generating (ExLlamaV3), message
+    /// boundaries 1024 apart at least, LMDeploy's one volatile row, the
+    /// newest three checkpoints of a conversation fresh (the fork), for
+    /// checkpoints of `bytes_per_checkpoint` within `budget_bytes`.
     ///
     /// # Panics
     ///
@@ -108,12 +153,15 @@ impl CheckpointPolicy {
         assert!(cells_per_page > 0, "a page holds at least one cell");
         Self {
             cells_per_page,
-            prompt_interval: 32_768,
+            prompt_interval: 8192,
             generation_interval: 2048,
+            boundary_interval: 1024,
+            boundary_reach: 0,
             volatile_rows: 1,
             bytes_per_checkpoint,
             budget_bytes,
             fresh_requests: 0,
+            fresh_checkpoints: 3,
         }
     }
 
@@ -136,19 +184,31 @@ impl CheckpointPolicy {
     }
 
     /// The first position in `(from, to]` at which a checkpoint is due, for a
-    /// sequence whose prompt is `prompt_len` cells long and whose last
-    /// checkpoint (restored or taken) is at `last` (0: none).
+    /// sequence whose prompt is `prompt_len` cells long with the parts that
+    /// end at `boundaries` (ascending), and whose last checkpoint (restored or
+    /// taken) is at `last` (0: none).
     ///
     /// `from` is where the recurrent state is now and `to` where the rows
     /// about to be committed (or replayed) take it. The caller advances the
     /// state to the returned position, takes the checkpoint unless the index
     /// has one there already, and asks again with `from` and `last` at that
-    /// position. `None`: the rows run through.
-    pub fn next_capture(&self, prompt_len: u64, last: u64, from: u64, to: u64) -> Option<u64> {
+    /// position. `None`: the rows run through. A step that ends at `to` may
+    /// be told `to` for a message boundary a little after it
+    /// ([`CheckpointPolicy::boundary_reach`]); a step cut shorter is asked
+    /// again with its own end.
+    pub fn next_capture(
+        &self,
+        prompt_len: u64,
+        boundaries: &[Boundary],
+        last: u64,
+        from: u64,
+        to: u64,
+    ) -> Option<u64> {
         if self.capacity() == 0 {
             return None;
         }
         let per_page = u64::from(self.cells_per_page);
+        let floor = |x: u64| x / per_page * per_page;
         let boundary_after = |x: u64| (x / per_page + 1) * per_page;
         let boundary_at_or_after = |x: u64| x.div_ceil(per_page) * per_page;
         let anchor = self.anchor(prompt_len);
@@ -163,7 +223,38 @@ impl CheckpointPolicy {
         let dense = boundary_after(from.max(anchor))
             .max(boundary_at_or_after(last + u64::from(self.generation_interval)));
         let dense = (dense <= to).then_some(dense);
-        [sparse, at_anchor, dense].into_iter().flatten().min()
+        // The roots, always; the message boundaries far enough from the last
+        // checkpoint, at the end of a step that ends a little before one, or
+        // at the boundary.
+        let reach = floor(u64::from(self.boundary_reach));
+        let step_end = (to % per_page == 0).then_some(to);
+        let parts = boundaries.iter().filter_map(|boundary| {
+            let at = floor(boundary.at);
+            if at <= from.max(last) || at >= anchor {
+                return None;
+            }
+            if boundary.root {
+                return (at <= to).then_some(at);
+            }
+            if at < last + u64::from(self.boundary_interval) {
+                return None;
+            }
+            match step_end {
+                Some(end) if end > from && end > last && end <= at && end + reach >= at => {
+                    Some(end)
+                }
+                _ => (at <= to).then_some(at),
+            }
+        });
+        [sparse, at_anchor, dense].into_iter().flatten().chain(parts).min()
+    }
+
+    /// Whether a checkpoint at `at` is at a root of the prompt with the parts
+    /// that end at `boundaries`: the page boundary at or before the end of
+    /// its system prompt or of its tool list.
+    pub fn at_root(&self, boundaries: &[Boundary], at: u64) -> bool {
+        let per_page = u64::from(self.cells_per_page);
+        at > 0 && boundaries.iter().any(|b| b.root && b.at / per_page * per_page == at)
     }
 
     /// What a prompt of `prompt_len` cells does with the match `found`.
@@ -227,9 +318,12 @@ pub struct CheckpointRank {
     pub checkpoint: CheckpointId,
     /// The position in cells of the state it holds.
     pub position: u64,
-    /// More than the allowed number of later requests have published
-    /// checkpoints below it, all on one branch.
+    /// On its one branch, more than the allowed number of later requests
+    /// have published checkpoints below it, or more checkpoints than the
+    /// newest that stay fresh lie below it.
     pub aged: bool,
+    /// It is at a root ([`PrefixIndex::mark_root`]): it goes last.
+    pub root: bool,
     /// The distance in cells to the next checkpoint toward the start of the
     /// text (or to the start): the rows a resume replays more without it.
     pub rows_saved: u64,
@@ -245,6 +339,20 @@ struct Node {
     /// The least number of later requests down to a checkpoint with none
     /// below it.
     requests_below: u32,
+    /// The least number of checkpoints down to one with none below it.
+    checkpoints_below: u32,
+}
+
+impl Node {
+    /// Whether later requests or newer checkpoints on its one branch have
+    /// left it behind under `policy`. A root and a checkpoint where texts
+    /// branch never are.
+    fn aged(&self, policy: &CheckpointPolicy) -> bool {
+        self.children == 1
+            && !self.rank.root
+            && (self.requests_below > policy.fresh_requests
+                || self.checkpoints_below >= policy.fresh_checkpoints)
+    }
 }
 
 impl PrefixIndex {
@@ -301,12 +409,13 @@ impl PrefixIndex {
         let per_page = u64::from(cells_per_page);
         let mut nodes: Vec<Node> = Vec::with_capacity(self.checkpoints);
         let mut above: Vec<Option<ChainHash>> = Vec::with_capacity(self.checkpoints);
-        let node = |hash, checkpoint, position, last_used, by| Node {
+        let node = |hash, checkpoint, position, last_used, by, root| Node {
             rank: CheckpointRank {
                 hash,
                 checkpoint,
                 position,
                 aged: false,
+                root,
                 rows_saved: position,
                 last_used,
             },
@@ -314,11 +423,19 @@ impl PrefixIndex {
             parent: None,
             children: 0,
             requests_below: 0,
+            checkpoints_below: 0,
         };
         for (hash, entry) in &self.entries {
             let Some(checkpoint) = entry.checkpoint else { continue };
             let position = u64::from(entry.depth) * per_page;
-            nodes.push(node(*hash, checkpoint, position, entry.last_used, entry.checkpoint_by));
+            nodes.push(node(
+                *hash,
+                checkpoint,
+                position,
+                entry.last_used,
+                entry.checkpoint_by,
+                entry.checkpoint_root,
+            ));
             above.push(self.checkpoint_above(*hash, entry.parent, tails));
         }
         for (prior, tails) in self.tails.iter().filter(|_| tails) {
@@ -332,6 +449,7 @@ impl PrefixIndex {
                     position,
                     tail.last_used,
                     tail.checkpoint_by,
+                    false,
                 ));
                 // A shorter tail of the same page whose text this one
                 // continues is above it; else the page before, or what is
@@ -365,16 +483,22 @@ impl PrefixIndex {
         for i in &order {
             if nodes[*i].children == 0 {
                 nodes[*i].requests_below = 0;
+                nodes[*i].checkpoints_below = 0;
             }
             let Some(parent) = nodes[*i].parent else { continue };
             // The checkpoints one request publishes are no step apart.
             let same_request = nodes[*i].by.is_some() && nodes[*i].by == nodes[parent].by;
             let seen =
                 (nodes[*i].requests_below + u32::from(!same_request)).min(MAX_REQUESTS_BELOW);
+            let below = nodes[*i].checkpoints_below.saturating_add(1);
             let first = nodes[parent].children == 0;
             nodes[parent].children += 1;
-            nodes[parent].requests_below =
-                if first { seen } else { nodes[parent].requests_below.min(seen) };
+            let parent = &mut nodes[parent];
+            (parent.requests_below, parent.checkpoints_below) = if first {
+                (seen, below)
+            } else {
+                (parent.requests_below.min(seen), parent.checkpoints_below.min(below))
+            };
         }
         nodes
     }
@@ -385,12 +509,11 @@ impl PrefixIndex {
         let mut ranks: Vec<CheckpointRank> = self
             .checkpoint_nodes(policy.cells_per_page, true)
             .into_iter()
-            .map(|node| CheckpointRank {
-                aged: node.children == 1 && node.requests_below > policy.fresh_requests,
-                ..node.rank
-            })
+            .map(|node| CheckpointRank { aged: node.aged(policy), ..node.rank })
             .collect();
-        ranks.sort_by_key(|rank| (!rank.aged, rank.rows_saved, rank.last_used, rank.hash));
+        ranks.sort_by_key(|rank| {
+            (!rank.aged, rank.root, rank.rows_saved, rank.last_used, rank.hash)
+        });
         ranks
     }
 
@@ -401,11 +524,13 @@ impl PrefixIndex {
     /// tails (and no state at their ends), where a prompt resumes from the
     /// deepest checkpoint at a page boundary: a checkpoint that later turns
     /// left behind only with the state at the end of their tails is not left
-    /// behind there.
+    /// behind there. A root never is: a new conversation starts from it.
     pub fn left_behind_on_pages(&self, policy: &CheckpointPolicy) -> Vec<ChainHash> {
         self.checkpoint_nodes(policy.cells_per_page, false)
             .into_iter()
-            .filter(|node| node.children == 1 && node.requests_below > policy.fresh_requests)
+            .filter(|node| {
+                node.children == 1 && !node.rank.root && node.requests_below > policy.fresh_requests
+            })
             .map(|node| node.rank.hash)
             .collect()
     }
@@ -442,9 +567,14 @@ mod tests {
 
     const MIB: u64 = 1 << 20;
 
-    /// Qwen3.8-27B: pages of one tile, checkpoints of 75 MiB, 3 GiB for them.
+    /// Qwen3.8-27B: pages of one tile, checkpoints of 75 MiB, 3 GiB for them,
+    /// ExLlamaV3's sparse interval of 32768 in a prompt (the tests below were
+    /// written for it).
     fn policy() -> CheckpointPolicy {
-        CheckpointPolicy::new(128, 75 * MIB, 3072 * MIB)
+        CheckpointPolicy {
+            prompt_interval: 32_768,
+            ..CheckpointPolicy::new(128, 75 * MIB, 3072 * MIB)
+        }
     }
 
     /// The positions at which a sequence takes checkpoints when it runs from
@@ -452,19 +582,38 @@ mod tests {
     fn captures(
         policy: &CheckpointPolicy,
         prompt_len: u64,
+        last: u64,
+        from: u64,
+        to: u64,
+        step: u64,
+    ) -> Vec<u64> {
+        captures_at(policy, prompt_len, &[], last, from, to, step)
+    }
+
+    /// The same for a prompt whose parts end at `boundaries`, as the
+    /// conductor runs it: a step of `step` rows ends where a checkpoint is
+    /// due, and the commit takes it when the step ends there.
+    fn captures_at(
+        policy: &CheckpointPolicy,
+        prompt_len: u64,
+        boundaries: &[Boundary],
         mut last: u64,
         from: u64,
         to: u64,
         step: u64,
     ) -> Vec<u64> {
+        let per_page = u64::from(policy.cells_per_page);
         let mut taken = Vec::new();
         let mut at = from;
         while at < to {
-            let end = (at + step).min(to);
-            while let Some(position) = policy.next_capture(prompt_len, last, at, end) {
-                assert!(position > at && position <= end && position % 128 == 0);
-                taken.push(position);
-                (last, at) = (position, position);
+            let mut end = (at + step).min(to);
+            if let Some(due) = policy.next_capture(prompt_len, boundaries, last, at, end) {
+                assert!(due > at && due <= end && due % per_page == 0);
+                end = due;
+            }
+            if policy.next_capture(prompt_len, boundaries, last, at, end) == Some(end) {
+                taken.push(end);
+                last = end;
             }
             at = end;
         }
@@ -532,6 +681,87 @@ mod tests {
         assert_eq!(captures(&none, 120_000, 0, 0, 120_000, 2048), []);
     }
 
+    fn boundary(at: u64) -> Boundary {
+        Boundary { at, root: false }
+    }
+
+    fn root(at: u64) -> Boundary {
+        Boundary { at, root: true }
+    }
+
+    #[test]
+    fn a_conversation_has_checkpoints_at_its_roots_its_message_boundaries_and_fixed_distances() {
+        // The defaults: 8192 in a prompt, message boundaries 1024 apart.
+        let p = CheckpointPolicy::new(128, 75 * MIB, 3072 * MIB);
+        // A system prompt whose tools end at 3000 and whose text ends at
+        // 12 000, then messages; the prompt is 30 000 tokens long.
+        let parts = [
+            root(3000),
+            root(12_000),
+            boundary(12_010),
+            boundary(12_500),
+            boundary(13_100),
+            boundary(13_300),
+            boundary(15_000),
+            boundary(29_990),
+        ];
+        let prompt = 30_000;
+        // Read in steps of 512 rows from nothing.
+        let taken = captures_at(&p, prompt, &parts, 0, 0, prompt, 512);
+        assert_eq!(
+            taken,
+            [
+                2944,   // the end of the tool list
+                11_136, // 8192 after it
+                11_904, // the end of the system prompt (12 010 is on the same page)
+                13_056, // 13 100: 1024 past the root (12 500 is too close)
+                14_976, // 15 000
+                23_168, // 8192 after the last checkpoint
+                29_952, // 29 990, which is also the anchor
+            ]
+        );
+        let roots: Vec<u64> = taken.iter().copied().filter(|at| p.at_root(&parts, *at)).collect();
+        assert_eq!(roots, [2944, 11_904]);
+        // Without boundaries only the fixed distance and the anchor.
+        assert_eq!(captures(&p, prompt, 0, 0, prompt, 512), [8192, 16_384, 24_576, 29_952]);
+        // A prompt that resumes after the system prompt (a new conversation of
+        // the same agent) goes on from its root.
+        let taken = captures_at(&p, prompt, &parts, 11_904, 11_904, prompt, 512);
+        assert_eq!(taken, [13_056, 14_976, 23_168, 29_952]);
+    }
+
+    #[test]
+    fn a_step_that_ends_a_little_before_a_message_boundary_takes_its_checkpoint() {
+        // Steps of 256 rows reach a page boundary 256 rows before the next
+        // message boundary at most.
+        let p =
+            CheckpointPolicy { boundary_reach: 256, ..CheckpointPolicy::new(128, MIB, 64 * MIB) };
+        let parts = [boundary(1500), boundary(2100), boundary(2700), boundary(5000)];
+        // From nothing in steps of 256: the steps end on page boundaries, and
+        // one ends within reach before each boundary that is due, so no step
+        // is cut: 1280 for 1500 (page 1408), 2560 for 2700 (2688); 2100 is
+        // too close to 1280.
+        let steps = |taken: &[u64]| taken.iter().all(|at| at % 256 == 0);
+        let taken = captures_at(&p, 6000, &parts, 0, 0, 6000, 256);
+        assert_eq!(taken, [1280, 2560, 4864, 5888]);
+        assert!(steps(&taken), "{taken:?}");
+        // Steps that start off a page boundary (a prompt resumed from a
+        // tail) are cut at the boundary's page, and from there on they end
+        // on page boundaries again.
+        let taken = captures_at(&p, 6000, &parts, 0, 1000, 6000, 256);
+        assert_eq!(taken, [1408, 2432, 4736, 5888]);
+        // Without reach every boundary that is due cuts its step.
+        let cut = CheckpointPolicy { boundary_reach: 0, ..p };
+        assert_eq!(captures_at(&cut, 6000, &parts, 0, 0, 6000, 256), [1408, 2688, 4992, 5888]);
+        // A boundary after the anchor counts as generation; one in the first
+        // page has no page boundary before it.
+        let late = [boundary(100), boundary(5990)];
+        assert_eq!(captures_at(&cut, 6000, &late, 0, 0, 6000, 256), [5888]);
+        // No budget, no checkpoints.
+        let none = CheckpointPolicy { budget_bytes: 0, ..p };
+        assert_eq!(captures_at(&none, 6000, &parts, 0, 0, 6000, 256), []);
+    }
+
     const PER_PAGE: u32 = 4;
 
     fn small() -> CheckpointPolicy {
@@ -539,10 +769,13 @@ mod tests {
             cells_per_page: PER_PAGE,
             prompt_interval: 16,
             generation_interval: 8,
+            boundary_interval: 8,
+            boundary_reach: 0,
             volatile_rows: 1,
             bytes_per_checkpoint: 1,
             budget_bytes: 100,
             fresh_requests: 0,
+            fresh_checkpoints: 3,
         }
     }
 
@@ -703,8 +936,9 @@ mod tests {
                 (40, false, 12),
             ]
         );
-        // With one later request allowed, request 2's stay fresh as well.
-        let lenient = CheckpointPolicy { fresh_requests: 1, ..p };
+        // With one later request allowed, request 2's stay fresh as well when
+        // more than three newer checkpoints do not age them.
+        let lenient = CheckpointPolicy { fresh_requests: 1, fresh_checkpoints: 5, ..p };
         let aged: Vec<u64> = index
             .checkpoint_ranks(&lenient)
             .iter()
@@ -727,6 +961,53 @@ mod tests {
         // More coming in than the budget holds: all go.
         assert_eq!(index.make_room_for_checkpoints(&tight, 5).len(), 2);
         assert_eq!(index.checkpoints(), 0);
+        index.clear(&mut pool);
+        assert_eq!(pool.free_pages(), 64);
+    }
+
+    #[test]
+    fn a_conversation_keeps_its_newest_three_and_its_roots_longest() {
+        let p = small();
+        let mut pool = PagePool::new(64, PER_PAGE);
+        let mut index = PrefixIndex::new();
+        let root = ChainHash::root(b"m");
+        let mut id = 0;
+        // One request leaves checkpoints at 8 (its root), 12, 20, 24, 32, 36.
+        conversation(&mut pool, &mut index, root, &[(1, 0..40, &[8, 12, 20, 24, 32, 36])], &mut id);
+        let hashes = index.lookup(root, &(0..40).collect::<Vec<u32>>(), PER_PAGE).hashes;
+        assert!(index.mark_root(hashes[1]));
+        assert!(!index.mark_root(hashes[0]), "no checkpoint there");
+        // The newest three are fresh; the root never ages and goes last.
+        assert_eq!(
+            positions(&index, &p),
+            [
+                (12, true, 4),
+                (20, true, 8),
+                (24, false, 4),
+                (36, false, 4),
+                (32, false, 8),
+                (8, false, 8)
+            ]
+        );
+        // Room for three: the aged go first (20 is aged once 12 is gone),
+        // then the one that saves the fewest rows; the root stays.
+        let tight = CheckpointPolicy { budget_bytes: 3, ..p };
+        index.make_room_for_checkpoints(&tight, 0);
+        let left: Vec<u64> = index.checkpoint_ranks(&p).iter().map(|r| r.position).collect();
+        assert_eq!(left, [32, 24, 8]);
+        // A later turn leaves the root behind on its branch: it is still not
+        // aged, and not left behind for a level without tails.
+        let text: Vec<u32> = (0..48).collect();
+        let (seq, chain) = run(&mut pool, &mut index, root, &text);
+        index.attach_checkpoint(chain.hashes()[10], CheckpointId(90), Owner(2)).unwrap();
+        seq.release(&mut pool);
+        let ranks = index.checkpoint_ranks(&p);
+        assert!(ranks.iter().any(|r| r.position == 8 && r.root && !r.aged), "{ranks:?}");
+        assert!(!index.left_behind_on_pages(&p).contains(&hashes[1]));
+        assert!(index.left_behind_on_pages(&p).contains(&chain.hashes()[7]), "32 is");
+        // Dropping the checkpoint takes the mark with it.
+        index.set_checkpoint(hashes[1], None).unwrap();
+        assert!(!index.is_root(hashes[1]));
         index.clear(&mut pool);
         assert_eq!(pool.free_pages(), 64);
     }

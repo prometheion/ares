@@ -37,12 +37,12 @@ use std::sync::{Arc, Mutex};
 use ares_api::{EngineError, ModelCard, Prompt};
 use ares_core::GgmlType;
 use ares_cuda::{DeviceBuffer, DevicePtr, Kernels, MAX_BATCH, PUSH_MAX_VALUES, PinnedBuffer};
-use ares_state::PageLayout;
+use ares_state::{Boundary, PageLayout};
 
 use crate::exec::Pick;
 use crate::model::{
-    ContextSpec, DeviceContext, DeviceModel, DrafterKind, LinkSpec, Logits, Model, ModelDrafts,
-    ModelError, PrefixCache, Split, StepContext,
+    ContextSpec, DeviceContext, DeviceModel, DrafterKind, EncodedPrompt, LinkSpec, Logits, Model,
+    ModelDrafts, ModelError, PrefixCache, Split, StepContext,
 };
 use crate::text::{printable, unprintable};
 
@@ -543,6 +543,35 @@ impl Model for SyntheticModel {
             }
         }
         Ok(tokens)
+    }
+
+    /// A conversation's boundaries are where the text of each message starts
+    /// and ends; the roots are those of the system messages at the start and
+    /// the start of the first message after them, as for a template that
+    /// writes the tools before the system prompt.
+    fn encode_with_boundaries(&self, prompt: &Prompt) -> Result<EncodedPrompt, EngineError> {
+        let tokens = self.encode(prompt)?;
+        let Prompt::Chat { messages, continue_final, .. } = prompt else {
+            return Ok(EncodedPrompt { tokens, boundaries: Vec::new() });
+        };
+        let count = |text: &str| -> u64 {
+            text.chars()
+                .map(|ch| if unprintable(ch).is_some() { 1 } else { ch.len_utf8() as u64 })
+                .sum()
+        };
+        let listed = messages.len() - usize::from(*continue_final && !messages.is_empty());
+        let system = messages.iter().take_while(|m| m.role == ares_api::Role::System).count();
+        let mut boundaries = Vec::new();
+        let mut at = 0;
+        for (i, message) in messages[..listed].iter().enumerate() {
+            at += count(message.role.as_str()) + count(": ");
+            boundaries.push(Boundary { at, root: i <= system });
+            at += count(&message.content);
+            boundaries.push(Boundary { at, root: i < system });
+            at += count("\n");
+        }
+        boundaries.dedup_by_key(|b| b.at);
+        Ok(EncodedPrompt { tokens, boundaries })
     }
 
     fn piece(&self, token: u32, text: &mut Vec<u8>) {

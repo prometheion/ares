@@ -64,6 +64,8 @@ pub(super) struct Held {
     pub worth: bool,
     /// The drive has it.
     pub stored: bool,
+    /// It lies at a root: the end of a system prompt or a tool list.
+    pub root: bool,
 }
 
 impl Held {
@@ -551,7 +553,7 @@ mod tests {
         let mut level = level(true);
         page(&mut level, 1, |e| {
             e.stored = true;
-            e.checkpoint = Some(Held { place: 7, worth: true, stored: false });
+            e.checkpoint = Some(Held { place: 7, worth: true, stored: false, root: false });
         });
         assert_eq!(level.checkpoints(), 1);
         // The page goes for nothing; its checkpoint must be written.

@@ -12,7 +12,7 @@ use ares_api::{ChatFormat, EngineError, ModelCard, Prompt};
 use ares_core::Ledger;
 use ares_cuda::{Device, DevicePtr, Event, Kernels, Stream};
 use ares_sampler::SampleParams;
-use ares_state::PageLayout;
+use ares_state::{Boundary, PageLayout};
 
 use crate::exec::Pick;
 use crate::links::Links;
@@ -343,6 +343,15 @@ pub struct ModelDrafts {
     pub tokens: u32,
 }
 
+/// A prompt as the model's tokens, and where the parts of a conversation end
+/// in them ([`Model::encode_with_boundaries`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EncodedPrompt {
+    pub tokens: Vec<u32>,
+    /// Ascending, each at most the number of tokens; none for plain text.
+    pub boundaries: Vec<Boundary>,
+}
+
 /// One device's part of a model.
 pub trait DeviceModel: Send {
     /// The number of logits per row this device part produces (0 for a part
@@ -438,6 +447,17 @@ pub trait Model: Send + Sync + 'static {
     /// The tokens of a prompt. Tokenizing is the model's business; refusing
     /// what it cannot tokenize is too.
     fn encode(&self, prompt: &Prompt) -> Result<Vec<u32>, EngineError>;
+
+    /// The tokens of a prompt, with the places where the parts of a
+    /// conversation end in them: the system prompt, the tool list, every
+    /// message. The prefix cache keeps the state of the recurrent layers
+    /// there, so that a later prompt that changes the conversation after such
+    /// a place (an edited message, an older tool result cut, a new
+    /// conversation with the same system prompt) replays only the rows from
+    /// there. The chat template knows the places; the default knows none.
+    fn encode_with_boundaries(&self, prompt: &Prompt) -> Result<EncodedPrompt, EngineError> {
+        Ok(EncodedPrompt { tokens: self.encode(prompt)?, boundaries: Vec::new() })
+    }
 
     /// What the model's chat template declares: how the model marks its
     /// thinking, which the front end needs to tell the reasoning in a reply

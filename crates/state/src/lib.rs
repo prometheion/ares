@@ -41,7 +41,7 @@ mod pool;
 mod prefix;
 mod sequence;
 
-pub use checkpoint::{CheckpointPolicy, CheckpointRank, Resume};
+pub use checkpoint::{Boundary, CheckpointPolicy, CheckpointRank, Resume};
 pub use layout::PageLayout;
 pub use pool::{PageId, PagePool};
 pub use prefix::{

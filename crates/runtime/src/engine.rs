@@ -17,7 +17,7 @@ use crate::config::RuntimeConfig;
 use crate::error::RuntimeError;
 use crate::exec::{ExecError, Executor};
 use crate::gpu::{GpuConfig, GpuExecutor};
-use crate::model::Model;
+use crate::model::{EncodedPrompt, Model};
 use crate::sampling::TokenFilter;
 use crate::structured::Grammars;
 use crate::timing::Snapshot;
@@ -250,7 +250,8 @@ impl Runtime {
             (None, Some(structure)) => Some(self.grammars.filter(structure)?),
             (None, None) => None,
         };
-        let prompt = self.model.encode(&request.prompt)?;
+        let EncodedPrompt { tokens: prompt, boundaries } =
+            self.model.encode_with_boundaries(&request.prompt)?;
         if prompt.is_empty() {
             return Err(EngineError::InvalidRequest(
                 "the prompt is empty: there is nothing to continue".into(),
@@ -285,6 +286,7 @@ impl Runtime {
         let submission = Box::new(Submission {
             id: request.id,
             prompt,
+            boundaries,
             max_tokens: request.max_tokens,
             stop: Watch::new(&request.stop, thinking),
             sampling: request.sampling,

@@ -73,6 +73,7 @@ mod text;
 mod timing;
 mod watch;
 
+pub use ares_state::Boundary;
 pub use cache::{RamCounters, SsdConfig, SsdCounters};
 pub use conductor::{SequenceInfo, token_hash};
 pub use config::RuntimeConfig;
@@ -86,8 +87,8 @@ pub use gpu::{GpuConfig, GpuExecutor, required_ram};
 pub use links::{Links, MAX_DEVICES};
 pub use model::{
     ContextSpec, DeviceContext, DeviceModel, DeviceTransfer, Drafter, DrafterKind, Durable,
-    LinkSpec, Logits, Model, ModelDrafts, ModelError, PrefixCache, Split, StepContext,
-    TransferContext,
+    EncodedPrompt, LinkSpec, Logits, Model, ModelDrafts, ModelError, PrefixCache, Split,
+    StepContext, TransferContext,
 };
 pub use ram::{
     CacheBuffer, Follow, LockedChunk, Look, Machine, Meminfo, MemorySource, PinnedRam, PlaceChunks,
