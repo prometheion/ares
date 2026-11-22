@@ -599,9 +599,11 @@ one array per part, indexed by page number.
     leave out an answer's thinking once a new question follows; a client
     asks the same prompt again), and from the end state it would replay
     every row it shares after the roots, from the anchor only the reply's.
-    (Until 2026-11-22 the rule counted the roots as places of their own: with
-    one root and two places, the same prompt of the agent suite asked a
-    second time replayed 6272 of its 6784 cached rows, 31 s on the 4060 Ti.)
+    (Until 2026-11-22 the rule looked at a budget of one place only: on the
+    agent suite of the Strata comparison, UD-Q3_K_XL at 40G on the 4060 Ti,
+    the same prompt asked a second time, 6784 of its 6832 tokens cached,
+    took 31.2 s against 30.3 s for the first ask: it replayed from the root.
+    The host executor's test of the suite replayed 672 of 736 cached rows.)
     A root keeps its mark when its page goes to RAM and comes back, is
     never "left behind" for the drive (it is written when it leaves RAM, if
     its text is long enough for the drive), and comes back from the drive as
