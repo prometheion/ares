@@ -5579,6 +5579,10 @@ tokens read at 49.1 tokens/s in steps of 512 rows, 148.5 GiB from the file and 1
 and at 206.2 tokens/s in lent steps of 4096 rows, 42.5 GiB and 39 199 uploads: where the tiers
 hold little, every step of 512 rows reads most of the file again.
 
+What a prompt reads from the file by the rows of its lone steps (both cards, a prompt of
+31 992 tokens; the bytes do not depend on the load, the speeds do): 512 rows about 139 GiB,
+2048 rows 98.3 GiB, 4096 rows 81.5 GiB.
+
 The plan's estimate took 4096 rows on these cards (8192 would need 5.7 GiB of the mixer's 8.2
 GiB of slots, more than its largest pool lends above the floors). Prompts read 1.6 to 1.7
 times as fast at 8k and 1.25 to 1.9 times at 32k, with 38 % fewer bytes from the file and 55
