@@ -380,9 +380,6 @@ pub struct Ports {
     /// Where each layer's route record arrives, and the bytes between them.
     pub records: DevicePtr,
     pub record_stride: u64,
-    /// Where `raw` lies in a step on VRAM the expert slots lend: its offset
-    /// from the start of the loan ([`Part::set_peer`] takes the start).
-    pub lent_raw: u64,
 }
 
 /// The exchanges of a layer between a mixer and its worker, in the order
@@ -965,6 +962,11 @@ impl Frame {
         if self.lends { self.s.len } else { 0 }
     }
 
+    /// Where the input of a half block lies in the scratch of a step on lent VRAM.
+    pub(crate) fn lent_raw(&self) -> u64 {
+        self.s.m_raw
+    }
+
     /// Bytes of the lists of predicted picks of every layer of the part, on the device and
     /// in page-locked memory.
     fn predict_lists_bytes(&self) -> u64 {
@@ -1072,6 +1074,8 @@ pub struct Part {
     /// layout of the running step).
     base: DevicePtr,
     lent_s: Scratch,
+    /// The most rows of a step on lent VRAM (`lent_s` is laid out for them).
+    lent_rows: u32,
     /// The VRAM the expert slots lend for wide steps, when they do.
     lent: Option<DevicePtr>,
     /// Whether the running step runs on lent VRAM.
@@ -1404,6 +1408,7 @@ impl Part {
             base: scratch.ptr(),
             scratch,
             lent_s,
+            lent_rows: opts.max_rows,
             lent: None,
             on_loan: false,
             peer_lent_raw: None,
@@ -1615,7 +1620,6 @@ impl Part {
             act_stride: self.f.act_stride,
             records: self.records.ptr(),
             record_stride: self.f.record_stride,
-            lent_raw: self.lent_s.m_raw,
         })
     }
 
@@ -1623,18 +1627,18 @@ impl Part {
     /// a device this one has peer access to), and per layer whether the peer
     /// computes a share of the recurrent or attention half.
     ///
-    /// `peer_lent` is where the VRAM the peer's expert slots lend for wide steps
-    /// starts, when the parts run such steps.
+    /// `peer_lent_raw` is where the peer takes the input of a half block in a
+    /// step on the VRAM its expert slots lend, when the parts run such steps.
     pub fn set_peer(
         &mut self,
         ports: Ports,
         peer_core: Vec<bool>,
-        peer_lent: Option<DevicePtr>,
+        peer_lent_raw: Option<DevicePtr>,
     ) -> Result<(), ModelError> {
         if self.role == Role::Whole || peer_core.len() != self.w.layers.len() {
             return Err(invalid("a peer for a part that shares no layers, or of other layers"));
         }
-        self.peer_lent_raw = peer_lent.map(|at| at.offset(ports.lent_raw));
+        self.peer_lent_raw = peer_lent_raw;
         self.peer = Some((ports, peer_core));
         Ok(())
     }
@@ -1679,6 +1683,28 @@ impl Part {
         self.opts.own_rows()
     }
 
+    /// Lays the scratch of a step on lent VRAM out for steps of up to `rows`
+    /// rows (at most the `max_rows` the part was opened with), when the slots
+    /// cannot lend for wider ones; `shape` is the part's. Returns the bytes the
+    /// slots lend for it, 0 when `rows` is no more than the own scratch holds.
+    pub(crate) fn lend_rows(
+        &mut self,
+        c: &Config,
+        shape: &PartShape,
+        rows: u32,
+    ) -> Result<u64, ModelError> {
+        let own = self.opts.own_rows();
+        let rows = rows.min(self.opts.max_rows);
+        self.lent_rows = rows.max(own);
+        if rows <= own {
+            self.f.lends = false;
+            return Ok(0);
+        }
+        let opts = Options { max_rows: rows, own_rows: own, ..self.opts.clone() };
+        self.lent_s = Frame::new(c, &opts, shape, self.device.info().multiprocessors)?.s;
+        Ok(self.lent_s.len)
+    }
+
     /// Where the VRAM lent for steps wider than the own scratch starts, at
     /// least [`Part::lent_bytes`] of it, or `None` when it is given back. The
     /// memory is the part's until the step after the last one that ran on it
@@ -1695,6 +1721,12 @@ impl Part {
             self.base = self.scratch.ptr();
             self.f.s = self.f.own;
             return Ok(());
+        }
+        if rows > self.lent_rows {
+            return Err(invalid(format!(
+                "a step of {rows} rows; the expert slots lend VRAM for {}",
+                self.lent_rows
+            )));
         }
         let at = self.lent.ok_or_else(|| {
             invalid(format!(

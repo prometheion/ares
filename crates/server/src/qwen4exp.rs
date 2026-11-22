@@ -577,6 +577,17 @@ pub(crate) fn load(
         loading.elapsed().as_secs_f64(),
         begun.elapsed().as_secs_f64()
     );
+    if model.max_rows() > own_rows {
+        tracing::info!(
+            "a prompt read alone takes steps of up to {} rows on VRAM the expert slots lend",
+            model.max_rows()
+        );
+    } else if max_rows > own_rows {
+        tracing::warn!(
+            "the expert slots cannot lend the scratch of a step wider than {own_rows} rows: a \
+             prompt read alone takes steps of {own_rows} rows"
+        );
+    }
     if let (Some(ssd), Some(snapshot)) = (&ssd, runtime.snapshot()) {
         let held = snapshot.counters.ssd;
         match &snapshot.ssd_problem {
