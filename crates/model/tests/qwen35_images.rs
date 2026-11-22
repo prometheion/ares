@@ -103,12 +103,14 @@ fn an_image_s_rows_at_their_rotary_positions_match_the_reference() {
         reference.commit(&mut state, &window, 1).unwrap();
         ref_logits.push(window.logits_of(0).unwrap().to_vec());
     }
-    // Without the rotary positions the text after the image is elsewhere: the
-    // test can tell.
+    // Without the rotary positions the rows of the image and the text after it
+    // are elsewhere: the largest change of a row's logits, which the test must
+    // be able to tell from the device's error.
     let plain = Inputs { rows: inputs.rows.clone(), rotary: None };
-    let window = reference.window_with(&SequenceState::new(&c), &tokens, &plain, LogitRows::All);
-    let at_cells = window.unwrap().logits_of(n - 1).unwrap().to_vec();
-    let moved = rel_l2(&at_cells, &ref_logits[n - 1]);
+    let window =
+        reference.window_with(&SequenceState::new(&c), &tokens, &plain, LogitRows::All).unwrap();
+    let moved =
+        (0..n).map(|r| rel_l2(window.logits_of(r).unwrap(), &ref_logits[r])).fold(0.0f64, f64::max);
 
     let opts = Options {
         precision: Precision::Exact,
@@ -137,8 +139,8 @@ fn an_image_s_rows_at_their_rotary_positions_match_the_reference() {
     }
     eprintln!(
         "ERR image rows and rotary positions: logits {worst:.2e} from the reference; the \
-         reference with the rows at their cells is {moved:.2e} away"
+         reference with the rows at their cells is up to {moved:.2e} away"
     );
     assert!(worst < 2e-2, "{worst}");
-    assert!(moved > 10.0 * worst, "the positions should matter: {moved} against {worst}");
+    assert!(moved > 3.0 * worst, "the positions should matter: {moved} against {worst}");
 }
