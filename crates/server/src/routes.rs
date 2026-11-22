@@ -5,7 +5,7 @@ use std::convert::Infallible;
 use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ares_api::{GenerateRequest, RequestId, TokenProbs, Usage};
 use axum::Json;
@@ -386,6 +386,27 @@ impl Reply {
         Ok(Self { run, sorter, stops, _lease: lease.clone() })
     }
 
+    /// The first step of a reply that is streamed, if the engine produces it
+    /// within `wait`; `None` if it has not by then.
+    ///
+    /// A stream waits for its first step before its response starts, so that
+    /// a request the engine refuses gets an HTTP status: the engine refuses
+    /// at once, when it has read and counted the prompt. A long prompt is
+    /// computed for minutes before the first token, though (16 thousand
+    /// tokens of Claude Code took Flash-Next three and a half), and a client
+    /// that sees no response for that long gives up: Claude Code went away
+    /// after six minutes and sent the request again. So the response starts
+    /// after `wait` without the first step; the keep-alive of the stream
+    /// holds the connection while the prompt is computed, and a failure
+    /// after that is an error in the stream.
+    pub async fn first(&mut self, wait: Duration) -> Result<Option<Step>, ApiError> {
+        // `next` can be dropped while it waits: the events stay queued.
+        match tokio::time::timeout(wait, self.next()).await {
+            Ok(step) => step.map(Some),
+            Err(_) => Ok(None),
+        }
+    }
+
     /// The next step of the reply, or the reason there will be none. After
     /// an `Err` or a [`Step::End`] the reply is over.
     pub async fn next(&mut self) -> Result<Step, ApiError> {
@@ -473,7 +494,7 @@ async fn try_completion(
         runs.push(Reply::start(&app, &lease, request, sorter)?);
     }
     let response = if parsed.stream {
-        stream(runs, head, parsed.include_usage).await
+        stream(runs, head, parsed.include_usage, app.config.stream_wait).await
     } else {
         collect(runs, head).await
     };
@@ -627,18 +648,24 @@ pub(crate) fn json_response(body: String) -> Response {
 
 /// The streaming answer.
 ///
-/// The response is not started before the engine has produced its first event.
-/// A request that is going to fail (the prompt overflows the context, the
-/// model does not exist) fails while the engine is still looking at it, and
-/// that failure then becomes a proper HTTP status instead of an error message
-/// inside a `200`. Clients and proxies handle the two very differently.
+/// The response is not started before the engine has produced its first event
+/// or `wait` has passed ([`Reply::first`]). A request that is going to fail
+/// (the prompt overflows the context, the model does not exist) fails while
+/// the engine is still looking at it, and that failure then becomes a proper
+/// HTTP status instead of an error message inside a `200`. Clients and
+/// proxies handle the two very differently.
 ///
 /// The completions of an `n` above 1 are streamed side by side, their chunks
 /// told apart by `index`; the usage and the end marker come once, after all.
-async fn stream(runs: Vec<Reply>, head: Head, include_usage: bool) -> Result<Response, ApiError> {
+async fn stream(
+    runs: Vec<Reply>,
+    head: Head,
+    include_usage: bool,
+    wait: Duration,
+) -> Result<Response, ApiError> {
     let many = runs.len() > 1;
     let firsts = futures_util::future::try_join_all(runs.into_iter().map(|mut reply| async move {
-        let first = reply.next().await?;
+        let first = reply.first(wait).await?;
         Ok::<_, ApiError>((reply, first))
     }))
     .await?;
@@ -726,8 +753,8 @@ fn add_completion(sum: Usage, more: Usage) -> Usage {
 
 /// Where the SSE state machine is. Every `step` produces one `data:` line.
 enum Phase {
-    /// The first step has arrived but nothing was sent yet.
-    Start(Step),
+    /// Nothing was sent yet; the first step, if it has arrived.
+    Start(Option<Step>),
     /// A step that is ready to be sent.
     Ready(Step),
     /// Waiting for the engine.
@@ -779,7 +806,7 @@ impl Chunks {
             match std::mem::replace(&mut self.phase, Phase::End) {
                 Phase::End => return None,
                 Phase::Start(first) => {
-                    self.phase = Phase::Ready(first);
+                    self.phase = first.map_or(Phase::Pull, Phase::Ready);
                     if self.head.endpoint == Endpoint::Chat {
                         return Some(self.head.role_chunk());
                     }

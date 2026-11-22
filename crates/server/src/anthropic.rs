@@ -114,6 +114,7 @@ mod tests;
 
 use std::collections::VecDeque;
 use std::convert::Infallible;
+use std::time::Duration;
 
 use ares_api::RequestId;
 use axum::extract::{Request, State};
@@ -188,7 +189,11 @@ async fn try_messages(app: App, request: Request) -> Result<Response, ApiError> 
         "request"
     );
     let reply = Reply::start(&app, &lease, parsed.request, sorter)?;
-    let response = if parsed.stream { stream(reply, head).await } else { whole(reply, head).await };
+    let response = if parsed.stream {
+        stream(reply, head, app.config.stream_wait).await
+    } else {
+        whole(reply, head).await
+    };
     Ok(with_limit(response?, parsed.lowered))
 }
 
@@ -225,16 +230,17 @@ async fn whole(mut reply: Reply, head: Head) -> Result<Response, ApiError> {
 /// `message_delta` and `message_stop`.
 ///
 /// As on the chat route the response starts when the engine has produced its
-/// first step, so that a request the engine refuses gets an HTTP status. A
-/// failure after that is an `error` event, and the stream ends without
-/// `message_stop`.
-async fn stream(mut reply: Reply, head: Head) -> Result<Response, ApiError> {
-    let first = reply.next().await?;
+/// first step, so that a request the engine refuses gets an HTTP status, or
+/// when `wait` has passed without it (`Reply::first`): then `message_start`
+/// and the pings go out while the prompt is computed. A failure after the
+/// start is an `error` event, and the stream ends without `message_stop`.
+async fn stream(mut reply: Reply, head: Head, wait: Duration) -> Result<Response, ApiError> {
+    let first = reply.first(wait).await?;
     let state = Events {
         reply,
         blocks: Blocks::default(),
         queue: VecDeque::from([head.message_start()]),
-        next: Some(first),
+        next: first,
         over: false,
     };
     let events = futures_util::stream::unfold(state, |mut state| async move {

@@ -1005,6 +1005,51 @@ async fn a_client_that_leaves_a_stream_cancels_it_in_the_engine() {
     assert_eq!(engine.cancelled(), [engine.submitted()[0].id]);
 }
 
+/// A prompt that the engine computes for long before its first token still
+/// starts its stream: after the server's wait the response and the role chunk
+/// go out, and the tokens follow when the engine has them.
+#[tokio::test]
+async fn a_stream_starts_while_the_engine_computes_a_long_prompt() {
+    let gate = Gate::default();
+    let engine = MockEngine::script(vec![
+        Step::Wait(gate.clone()),
+        text("a"),
+        done(FinishReason::Stop, 3, 1),
+    ]);
+    let config = Config { stream_wait: std::time::Duration::from_millis(50), ..Config::default() };
+    let response =
+        post(&app_with(&engine, config), CHAT, &chat_body(json!({"stream": true}))).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut body = response.into_body().into_data_stream();
+    let role = body.next().await.unwrap().unwrap();
+    assert!(String::from_utf8_lossy(&role).contains("assistant"));
+    gate.open();
+    let mut rest = String::new();
+    while let Some(chunk) = body.next().await {
+        rest.push_str(&String::from_utf8_lossy(&chunk.unwrap()));
+    }
+    assert!(rest.contains("\"a\"") && rest.ends_with("data: [DONE]\n\n"), "{rest}");
+
+    // A failure after the start is an error in the stream.
+    let gate = Gate::default();
+    let engine = MockEngine::script(vec![
+        Step::Wait(gate.clone()),
+        fail(EngineError::Internal("the device fell off".into())),
+    ]);
+    let config = Config { stream_wait: std::time::Duration::from_millis(50), ..Config::default() };
+    let response =
+        post(&app_with(&engine, config), CHAT, &chat_body(json!({"stream": true}))).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut body = response.into_body().into_data_stream();
+    body.next().await.unwrap().unwrap();
+    gate.open();
+    let mut rest = String::new();
+    while let Some(chunk) = body.next().await {
+        rest.push_str(&String::from_utf8_lossy(&chunk.unwrap()));
+    }
+    assert!(rest.contains("the device fell off") && !rest.contains("[DONE]"), "{rest}");
+}
+
 #[tokio::test]
 async fn a_client_that_leaves_before_the_first_event_of_a_stream_cancels_too() {
     let engine = MockEngine::script(vec![Step::UntilCancelled]);

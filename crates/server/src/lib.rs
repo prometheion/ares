@@ -112,6 +112,9 @@ pub struct Config {
     /// Whether the log has the prompt and the reply of every request
     /// (`--log-text`).
     pub log_text: bool,
+    /// How long a streamed reply waits for the engine's first step before
+    /// its response starts without it (see `routes::Reply::first`).
+    pub stream_wait: Duration,
 }
 
 impl Default for Config {
@@ -125,6 +128,7 @@ impl Default for Config {
             access: Access::default(),
             timeout: Duration::from_secs(600),
             log_text: false,
+            stream_wait: Duration::from_secs(10),
         }
     }
 }

@@ -6618,12 +6618,13 @@ events.
 | --- | --- |
 | `model`, `max_tokens` (required), `temperature`, `top_p`, `top_k`, `stream` | as on the chat route |
 | `system` | a string or text blocks: one system message |
-| `messages` | turns of `user` and `assistant`, a string or blocks. User: `text`, and `tool_result` (a string or text blocks), which becomes a message of the role `tool` where it stands. Assistant: `text`, `thinking`, `redacted_thinking`, `tool_use` |
+| `messages` | turns of `user`, `assistant` and `system`, a string or blocks. User: `text`, and `tool_result` (a string or text blocks), which becomes a message of the role `tool` where it stands. Assistant: `text`, `thinking`, `redacted_thinking`, `tool_use`. System: text; before every other turn it joins the system prompt, after one it is a user turn with its text (below) |
 | `tools` | `name`, `description`, `input_schema` (and `type: custom`, `strict`, `eager_input_streaming`, which ask for what is always done) |
 | `tool_choice` | `auto`, `any` (the chat route's `required`), `tool` with a name, `none`; `disable_parallel_tool_use` allows one call |
-| `thinking` | `enabled` and `adaptive` switch thinking on, `disabled` off; a request without it leaves it to `--reasoning` |
+| `thinking` | `enabled` and `adaptive` switch thinking on, `disabled` off; a request without it leaves it to `--reasoning`; `display` (`summarized`, `omitted`, `updates`) is accepted and the thinking comes back whole |
 | `stop_sequences` | the stop strings |
-| `output_config` | `format` with a JSON schema is the chat route's `response_format`; `effort` is its `reasoning_effort` |
+| `output_config` | `format` with a JSON schema is the chat route's `response_format`; `effort` is its `reasoning_effort`, except `high`, Anthropic's default, which is the template's default |
+| `context_management` | the edit `clear_thinking_20251015`: the thinking of the turns before the last `keep.value` turns with thinking stays out of the prompt (`keep: "all"` keeps all; without `keep`, the last one) |
 | `metadata`, `service_tier` | bookkeeping: accepted, without effect |
 | `cache_control` | accepted on the body, on blocks and on tools; without effect (below) |
 
@@ -6634,8 +6635,9 @@ Anthropic's shape of an error (`{"type": "error", "error": {"type",
 "message"}}`, with the status the chat route gives): `image` and `document`
 blocks (input other than text is not built), tools of a `type` that Anthropic's
 service defines or runs (`web_search_...`, `bash_...`) and the blocks they
-leave in a history, `defer_loading`, `mcp_servers`, `container`,
-`context_management`, citations, and any member the module does not know. A
+leave in a history, `defer_loading`, `mcp_servers`, `container`, the edits of
+`context_management` that would cut results of tools (`clear_tool_uses_20250919`),
+citations, and any member the module does not know. A
 last message of the assistant is a prefill, which the reply continues (see
 "Continuing a message" below). `x-api-key` is one of the two headers a key
 may come in (see "Who may use the server"); `anthropic-version` and
@@ -6667,6 +6669,22 @@ a field of a beta is served or refused by its name in the body.
   (`FinishReason::StopString` with its place in the request's list; see "The
   stop string and the thinking of a reply" below). A reply with calls ended to
   call them, also when a stop string cut it.
+- **What Claude Code 2.1 sends.** Every request of Claude Code 2.1.301 has
+  `context_management` with `clear_thinking_20251015` and `keep: "all"`,
+  `thinking: {"type": "adaptive", "display": "updates"}` and `output_config:
+  {"effort": "high"}`, and its messages have turns of the role `system`: its
+  environment after the first question, and `<total_tokens>N tokens
+  left</total_tokens>` after the results of tools (these stay in the history of
+  later requests). Each of them was refused until 2026-11-22. The templates of
+  Qwen3.8 refuse a system message anywhere but first, so a system turn after
+  another turn is written as a turn of the user with the same text, which is
+  where a model reads what came in between; Flash-Next's template knows the
+  efforts `xhigh` (its default), `medium` and `low`, so `high`, which is
+  Anthropic's default, is the template's default. `display` asks for a summary
+  or for updates of the thinking, which the server does not have; the thinking
+  comes back whole, which is also what writes it into the next prompt as the
+  model generated it (with `omitted` it would come back empty, and each turn
+  would part from the cached one there).
 - **The billing line of Claude Code.** Claude Code begins its system prompt
   with `x-anthropic-billing-header: ...; cch=a5145;`, whose `cch` is another
   one in every request. Left alone it would part every prompt from the cached
@@ -6681,8 +6699,13 @@ are in the order the model wrote them and numbered from 0; a whole message is
 the same events put together, so the two cannot differ. The engine counts the
 prompt when the reply ends, so the usage of `message_start` is zeros and
 `message_delta` has all of it. While the engine has nothing to say the stream
-sends `ping`. A failure after the stream began is an `error` event, and the
-stream ends without `message_stop`. The input of a `tool_use` block is the
+sends `ping`. The response starts when the engine has produced its first step,
+so that a request the engine refuses gets an HTTP status, or after
+`Config::stream_wait` (10 s) without it (`Reply::first`, on all three routes
+that stream): Flash-Next computed the 16 thousand tokens of Claude Code's first
+prompt for three and a half minutes, and Claude Code gave up on a response that
+had not started after six and sent the request again. A failure after the
+stream began is an `error` event, and the stream ends without `message_stop`. The input of a `tool_use` block is the
 JSON text the model wrote, byte for byte; a call that `max_tokens` cut has the
 fragments in a stream and `{}` in a whole message. Call ids are `toolu_`, the
 request's id and the place of the call.

@@ -5,6 +5,7 @@
 mod common;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use ares_api::{
     ChatFormat, DecisionRequest, DecisionSink, Engine, EngineError, EngineStats, Event, EventSink,
@@ -811,6 +812,36 @@ async fn a_client_that_leaves_cancels_its_request_in_the_engine() {
     drop(stream);
     eventually("the cancel", || !engine.cancelled().is_empty()).await;
     assert_eq!(engine.cancelled(), [engine.submitted()[0].id]);
+}
+
+/// Claude Code gave up on a stream whose response had not started after about
+/// six minutes, while Flash-Next computed its prompt of 16 thousand tokens,
+/// and sent the request again. After the server's wait the response,
+/// `message_start` and the pings go out, and the message follows.
+#[tokio::test]
+async fn a_stream_starts_while_the_engine_computes_a_long_prompt() {
+    let gate = Gate::default();
+    let inner = MockEngine::script(vec![
+        Step::Wait(gate.clone()),
+        text("Hallo."),
+        done(FinishReason::Stop, 20, 2),
+    ]);
+    let engine = Declaring { inner, format: Some(qwen()) };
+    let config =
+        ares_server::Config { stream_wait: Duration::from_millis(50), ..Default::default() };
+    let app = ares_server::router_with(Arc::new(engine), config);
+    let extra = json!({"stream": true, "thinking": {"type": "disabled"}});
+    let response = post(&app, MESSAGES, &body(extra)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut stream = response.into_body().into_data_stream();
+    let first = stream.next().await.unwrap().unwrap();
+    assert!(String::from_utf8_lossy(&first).contains("message_start"));
+    gate.open();
+    let mut rest = String::new();
+    while let Some(chunk) = stream.next().await {
+        rest.push_str(&String::from_utf8_lossy(&chunk.unwrap()));
+    }
+    assert!(rest.contains("Hallo.") && rest.contains("event: message_stop"), "{rest}");
 }
 
 // --- the count ---------------------------------------------------------------------

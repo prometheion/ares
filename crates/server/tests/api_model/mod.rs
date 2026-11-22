@@ -27,10 +27,11 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use ares_api::{Engine, Json};
+use ares_api::Engine;
 use ares_gguf::Gguf;
 use ares_server::load::{self, Loaded};
 use ares_server::options::{self, Kind, ModelOptions};
+use ares_tokenizer::Json;
 
 /// The model file the suites run on in place of the 0.8B, if one is named
 /// (and the tests that open GPUs are enabled).

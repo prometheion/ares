@@ -124,6 +124,7 @@ mod tests;
 
 use std::collections::VecDeque;
 use std::convert::Infallible;
+use std::time::Duration;
 
 use ares_api::RequestId;
 use axum::extract::{Request, State};
@@ -220,7 +221,7 @@ async fn try_create(app: App, request: Request) -> Result<Response, ApiError> {
     let reply = Reply::start(&app, &lease, parsed.request, sorter)?;
     let output = Output::new(id.to_string());
     let response = if parsed.stream {
-        stream(reply, head, output).await
+        stream(reply, head, output, app.config.stream_wait).await
     } else {
         whole(reply, head, output).await
     };
@@ -260,13 +261,19 @@ async fn whole(mut reply: Reply, head: Head, mut output: Output) -> Result<Respo
 /// with the response as it is returned whole.
 ///
 /// As on the chat route the response starts when the engine has produced its
-/// first step, so that a request the engine refuses gets an HTTP status. A
-/// failure after that is an `error` event, and the stream ends with it.
-async fn stream(mut reply: Reply, head: Head, output: Output) -> Result<Response, ApiError> {
-    let first = reply.next().await?;
+/// first step, so that a request the engine refuses gets an HTTP status, or
+/// when `wait` has passed without it (`Reply::first`). A failure after the
+/// start is an `error` event, and the stream ends with it.
+async fn stream(
+    mut reply: Reply,
+    head: Head,
+    output: Output,
+    wait: Duration,
+) -> Result<Response, ApiError> {
+    let first = reply.first(wait).await?;
     let mut sequence = 0;
     let queue = VecDeque::from(head.begin(&mut sequence));
-    let state = Events { reply, head, output, queue, next: Some(first), sequence, over: false };
+    let state = Events { reply, head, output, queue, next: first, sequence, over: false };
     let events = futures_util::stream::unfold(state, |mut state| async move {
         let (name, data) = state.step().await?;
         Some((Ok::<_, Infallible>(SseEvent::default().event(name).data(data)), state))

@@ -1014,6 +1014,37 @@ async fn a_client_that_leaves_cancels_its_request_in_the_engine() {
     assert_eq!(engine.cancelled(), [engine.submitted()[0].id]);
 }
 
+/// A prompt that the engine computes for long before its first token still
+/// starts its stream after the server's wait.
+#[tokio::test]
+async fn a_stream_starts_while_the_engine_computes_a_long_prompt() {
+    let gate = Gate::default();
+    let inner = MockEngine::script(vec![
+        Step::Wait(gate.clone()),
+        text("Hallo."),
+        done(FinishReason::Stop, 20, 2),
+    ]);
+    let engine = Declaring { inner, format: Some(qwen()) };
+    let config = ares_server::Config {
+        stream_wait: std::time::Duration::from_millis(50),
+        ..ares_server::Config::default()
+    };
+    let app = ares_server::router_with(Arc::new(engine), config);
+    let mut extra = no_thinking();
+    extra["stream"] = json!(true);
+    let response = post(&app, RESPONSES, &body(extra)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut stream = response.into_body().into_data_stream();
+    let first = stream.next().await.unwrap().unwrap();
+    assert!(String::from_utf8_lossy(&first).contains("response.created"));
+    gate.open();
+    let mut rest = String::new();
+    while let Some(chunk) = stream.next().await {
+        rest.push_str(&String::from_utf8_lossy(&chunk.unwrap()));
+    }
+    assert!(rest.contains("Hallo.") && rest.contains("response.completed"), "{rest}");
+}
+
 // --- the counts ------------------------------------------------------------------
 
 /// An engine that reports for a request the count it gives for its prompt.
