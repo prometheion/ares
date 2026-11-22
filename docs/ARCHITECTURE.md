@@ -5469,6 +5469,17 @@ runs), so their reads can start a layer or two before their records
   one layer is lead enough. The prediction is made only at the layers where the wide step
   before read the next layer's experts from the file (the board carries the feed's word to
   the part), so a prompt whose experts are in the tiers pays nothing for it.
+  Since 2026-11-22 (`flash/ssd-stream`) two things differ where the experts stream from
+  the SSD. *While VRAM is lent* (only the steps of a prompt read alone run then) the
+  guesses go as demand reads, behind the misses asked for before them: as prefetches the
+  reader kept them to a few chunks of 512 KiB beside a demand read, and through a 32k prompt
+  on UD-Q4_K_XL the drive read 1.65 to 1.85 GB/s where it gives 2.4, two thirds of it these
+  guesses. And *a guess is read only where its class is named at least as often as not*
+  (`GuessOdds` in `transit.rs`; classes: the step before's misses, and a prediction's by the
+  rows it named the expert for, 1, 2, 3-4, ... 65 and more): such a step is bound by the
+  drive, and 24 % of the guesses read through that prompt were not named by their layer's
+  record. Every guess is counted when its record comes, read or not, so a class that
+  stopped being read comes back; the server's log says the counts every 20 s.
 - *The text is unchanged.* The fingerprint of the tool (`qwen4exp_run --fingerprint`: the
   logits of a prompt of 600 tokens, 24 generated tokens and windows of drafts, bit for bit;
   both cards with the split pinned, `--core-share 0.76 --shared worker`, every miss
@@ -6125,7 +6136,9 @@ slots of its expert cache that it lends for the chunk and refills after (Strata
   piece (`ExpertStore::lend_pieces`) and keeps what it lent when a slot of a later pool was
   busy, until the next try. The slots belong to every layer of the pool, so the
   layers give their coldest slots in proportion to what they have above the floor of a loan
-  (a row's picks and the free slots, 18 for Flash-Next, `ExpertStore::loan_floor`); what
+  (a row's picks, 10 for Flash-Next, `ExpertStore::scratch_floor`; until 2026-11-22 the free
+  slots as well, 18, which only made the loan smaller: the misses of a wide step go through
+  transit, not into the tier's free slots); what
   those held is evicted as any evicted expert is (copied down to RAM when the RAM tier keeps
   it), the experts that lie in the lent slots and stay move on the device into the slots
   given (`SlotDevice::adopt`), and the numbers change hands, as the RAM tier does with the
@@ -6185,6 +6198,11 @@ half of the mixer's slots for the prompt) and what a 4096-row step picks that th
 hold, again for each step. Without the driver's peer access (the layers split, the run of the
 same morning) the old path read the same prompts at 56 to 125 and 136 to 172 tokens/s,
 reading 37.9 and 145.7 GiB.
+
+The estimate (`batch_rows`) counts what the drafters take of the bytes for slots on the
+device with the head (the MTP block's experts stay resident there) since 2026-11-22: without
+it, on the 16 GB card with the MTP block, the parts were opened for 8192 rows (their buffers
+for good 160 MiB larger, 48 slots fewer) and the store then lent 4096 all the same.
 
 *A request behind a prompt read alone* (the 32k prompt; 20 s after it, a request of 40 tokens
 for 8 tokens, streamed; the same server pair, load 4.7 to 5.5): with steps of 512 rows its first
