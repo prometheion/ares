@@ -157,10 +157,10 @@ fn run() -> Result<(), String> {
 
     // With --fixed, all buffers are slices of one region registered when the
     // reader starts. It is declared first so that it outlives the reader.
-    let sample: Vec<_> = map.ranges(first, 0).expect("expert 0 exists").collect();
+    // The layers of a file may store their experts in different types (Unsloth's dynamic
+    // quants do), so a buffer is as large as the matrix is in the largest of them.
     let align = 4096;
-    let sizes: Vec<usize> =
-        sample.iter().map(|r| (r.len + 2 * align).next_multiple_of(align)).collect();
+    let sizes = largest_ranges(&map, &layers, 2 * align, align);
     let per_slot: usize = sizes.iter().sum();
     let max_depth = args.depths.iter().copied().max().unwrap_or(1);
     let mut region = args.fixed.then(|| Buffer::aligned(per_slot * max_depth, align));
@@ -393,12 +393,7 @@ fn mixed(
     rng: &mut Rng,
 ) -> Result<(Vec<Duration>, u64, Duration), String> {
     const BG: u64 = 1 << 62;
-    let first = layers[0];
-    let sizes: Vec<usize> = map
-        .ranges(first, 0)
-        .expect("expert 0 exists")
-        .map(|r| (r.len + 8192).next_multiple_of(4096))
-        .collect();
+    let sizes = largest_ranges(map, layers, 8192, 4096);
     let alloc = || -> Vec<Buffer> { sizes.iter().map(|s| Buffer::aligned(*s, 4096)).collect() };
     let mut free: Vec<Vec<Buffer>> = (0..background + 1).map(|_| alloc()).collect();
     // sequence -> (started, outstanding, buffers); one table for both streams,
@@ -482,7 +477,7 @@ fn mixed(
         }
     }
     latencies.sort();
-    Ok((latencies, bg_done * map.expert_bytes(first).unwrap_or(0), elapsed))
+    Ok((latencies, bg_done * map.expert_bytes(layers[0]).unwrap_or(0), elapsed))
 }
 
 /// The disk under `path`.
@@ -540,4 +535,21 @@ fn locate_disk(path: &str) -> Option<Disk> {
         read("max_sectors_kb")?,
     );
     Some(Disk { name, description })
+}
+
+/// Per matrix of an expert, the bytes a read buffer needs in the layer that stores it
+/// largest, with `margin` bytes for the widening to blocks, rounded up to `align`.
+fn largest_ranges(map: &ExpertMap, layers: &[usize], margin: usize, align: usize) -> Vec<usize> {
+    let mut sizes: Vec<usize> = Vec::new();
+    for &layer in layers {
+        for (part, range) in map.ranges(layer, 0).expect("expert 0 exists").enumerate() {
+            let size = (range.len + margin).next_multiple_of(align);
+            if part == sizes.len() {
+                sizes.push(size);
+            } else {
+                sizes[part] = sizes[part].max(size);
+            }
+        }
+    }
+    sizes
 }
