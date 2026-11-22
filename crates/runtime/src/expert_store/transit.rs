@@ -1007,12 +1007,16 @@ impl<D: SlotDevice> ExpertStore<D> {
         }
 
         // Guesses the RAM tier holds go up into the transit slots that are left while
-        // nothing named waits for one, in at most half of the slots: until a layer's record
+        // nothing named waits for one (from RAM or from staging), in at most half of the
+        // slots: until a layer's record
         // arrives nothing of it would go over the link, which then has nothing to do through
         // the next layer's first kernels and the last round of the layer before.
         let named_waits = self.transit.wanted.iter().any(|key| {
-            self.transit.entries.get(key).is_some_and(|entry| {
-                entry.state == State::Queued && self.ram.sets[key.0].contains(key.1)
+            self.transit.entries.get(key).is_some_and(|entry| match entry.state {
+                State::Queued => self.ram.sets[key.0].contains(key.1),
+                // Read and waiting for a transit slot.
+                State::Staged { .. } => true,
+                _ => false,
             })
         });
         while !named_waits && let Some(key) = self.transit.upload_guesses.front().copied() {
