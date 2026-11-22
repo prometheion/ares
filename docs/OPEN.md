@@ -1075,7 +1075,9 @@ DSpark drafter `dspark-Inkling-2-Mini-Q8_0.gguf`, 0.4 GB). Notes: `/var/tmp/ares
   - [ ] The 27B: not built. Its 16 dense layers read every cell, so K and V in RAM cross the link
         once per token: 5.4 ms per 1000 cells on the test machine's x4 link, about 1.4 ms on a x16
         link (`far_attention_bench`); its context beyond VRAM would run at a few tokens per second.
-        Its heads move to the second card first, and with `q4` two cards hold 482 707 tokens.
+        On the development machine 104.5 ms a step at 32 768 cells from RAM on the 4070, 435 ms on
+        the 3060. Its heads move to the second card first, and with `q4` two cards hold 482 707
+        tokens.
   - [ ] Pages a finished request leaves in the device pool (the prompt cache on the devices) keep
         their far memory, booked as required, until the pool evicts them: the owner's question
         below.
@@ -1087,9 +1089,9 @@ DSpark drafter `dspark-Inkling-2-Mini-Q8_0.gguf`, 0.4 GB). Notes: `/var/tmp/ares
         take over the page's memory instead.
   - [ ] The share of the room for K and V in VRAM (a thirty-second, `plan::NEAR_SHARE`) is the old
         rule's, not measured against other shares.
-  - [ ] Two cards (a split by layers: a far pool per part; both cards on every layer: the mixer's)
-        were not run: `qwen4exp_runtime k_and_v_beyond_vram_change_no_token` covers them on a
-        machine with two cards.
+  - [x] Two cards (a split by layers: a far pool per part; both cards on every layer: the mixer's):
+        `qwen4exp_runtime k_and_v_beyond_vram_change_no_token` passes on the RTX 4070 + RTX 3060
+        (2026-11-22). Not run with the real file on two cards.
 
 ## Weight types (`moe/q4-load`, 2026-11-17)
 Every tensor of both models takes every weight type the shape allows (the audit of every place
