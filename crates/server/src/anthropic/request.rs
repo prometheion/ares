@@ -456,35 +456,35 @@ fn context_management(fields: &Fields<'_>) -> Result<KeptThinking, ApiError> {
                             Ok(Some(n)) if turns && n >= 1 => {
                                 KeptThinking::Last(usize::try_from(n).unwrap_or(usize::MAX))
                             }
-                            _ => {
-                                return Err(refuse(
-                                    at,
-                                    "keep must be \"all\" or {\"type\": \"thinking_turns\", \
-                                     \"value\": n} with n at least 1",
-                                ));
-                            }
+                            _ => return Err(refuse_keep(&at)),
                         }
                     }
-                    Some(_) => {
-                        return Err(refuse(
-                            at,
-                            "keep must be \"all\" or {\"type\": \"thinking_turns\", \"value\": n}",
-                        ));
-                    }
+                    Some(_) => return Err(refuse_keep(&at)),
                 };
             }
             other => {
                 return Err(refuse(
                     at.clone(),
                     format!(
-                        "{at}: an edit of the type '{other}' is not supported: the server leaves \
-                         the results of tools in a conversation as the client sends them"
+                        "{at}: an edit of the type '{other}' is not supported: the server edits \
+                         a conversation only by clearing thinking (clear_thinking_20251015) and \
+                         leaves the results of tools as the client sends them"
                     ),
                 ));
             }
         }
     }
     Ok(kept)
+}
+
+fn refuse_keep(at: &str) -> ApiError {
+    refuse(
+        at,
+        format!(
+            "{at}.keep must be \"all\" or {{\"type\": \"thinking_turns\", \"value\": n}} with \
+             n at least 1"
+        ),
+    )
 }
 
 fn content_type(at: &str, other: &Json) -> ApiError {
