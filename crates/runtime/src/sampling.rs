@@ -73,7 +73,7 @@ pub trait TokenFilter: Send {
     }
 
     /// Whether the rule ends the reply after `reply`, as a limit of tokens
-    /// would (the guard against a loop, [`crate::guard`]): the request ends
+    /// would (the runtime's guard against a loop): the request ends
     /// there with [`FinishReason::Length`](ares_api::FinishReason::Length).
     fn cut(&mut self, _reply: &[u32]) -> bool {
         false
