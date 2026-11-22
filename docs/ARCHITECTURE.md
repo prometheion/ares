@@ -628,7 +628,13 @@ one array per part, indexed by page number.
     (2.33 s) after; with its second message (the first answer) edited, both
     restore the first turn's anchor (nothing replayed, 2.3 s). Claude Code's
     billing stamp: the next turn with another `cch` took 8950 of 8970 tokens
-    from the cache (0.18 s).
+    from the cache (0.18 s). Flash-Next at `--ram 8G` (with `--cache`) has
+    one checkpoint place, and there the roots do not pay yet: the root leaves
+    the place for the later checkpoints of the same prompt and goes to the
+    drive, but a prompt asks the drive only for the pages the index does not
+    hold, and the index still holds the system prompt's pages, so the second
+    conversation replayed 18 304 rows (221 s against 166 s for the cold first
+    one). What would make it pay is in `OPEN.md`.
 - Admission (`ares_sched::Admission`): nothing is reserved for a request's
   longest possible length. Pages are claimed per step. A reservation covers
   the rest of the running prompts and the output they are expected to

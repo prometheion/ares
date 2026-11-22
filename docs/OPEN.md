@@ -571,6 +571,12 @@ Flash-Next); experts that do not fit in VRAM in RAM; K/V in int8. Its README giv
       again (the store keeps no mark); message checkpoints that later requests left behind are
       not written to the drive, so with one checkpoint place in RAM (Flash-Next at `--ram 8G`)
       an edit far back resumes from the root or from the drive's deepest checkpoint before it;
+      with one place (measured 2026-11-22, Flash-Next `--ram 8G --cache`) the roots do not pay
+      yet: the root leaves the place for later checkpoints and goes to the drive, but a prompt
+      asks the drive only for pages the index does not hold, so a new conversation with the
+      same 12k-token system prompt still replayed 18 304 rows (221 s); wanted: a checkpoint
+      brought back from the drive for a page the index holds (`cache/ssd.rs` imports runs of
+      pages with their deepest state only), or more places (int8 checkpoints);
       a message boundary is 1024 cells from the last checkpoint at least, and a prompt step
       that ends a piece before it takes it there (not measured: what a cut step costs
       Flash-Next with the large prompt chunks of item 3).
