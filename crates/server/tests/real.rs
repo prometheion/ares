@@ -762,13 +762,8 @@ fn what_the_engine_cannot_do_is_refused_by_name() {
         400,
         &["tools is not supported", "/v1/completions has no chat template"],
     );
-    // A budget for the thinking is not built.
-    refused(
-        chat_path,
-        chat(json!({"thinking_budget_tokens": 100})),
-        400,
-        &["thinking_budget_tokens", "a budget for thinking is not built"],
-    );
+    // A budget for the thinking is served (`thinking_budget_tokens`, see the
+    // routes' tests), so it is no longer among what is refused.
     let image = json!({
         "model": server.model,
         "messages": [{"role": "user", "content": [
