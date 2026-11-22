@@ -42,7 +42,10 @@ section further down.
    for Qwen3.8) on both models; what does not fit in VRAM overflows into RAM. Until the overflow
    exists, the most that fits, with a log line. On the 27B the attention heads move to the second
    card as far as the context needs (built on `devices/roles`).
-7. Priorities of requests (server).
+7. [x] Priorities of requests (server). Done 2026-11-22 (branch `server/priorities`): measured on
+   the test machine, a request of priority 0 next to busy requests of priority 5 has its first
+   token in 21 ms where one of priority 5 waits 382 ms to 10 s (see "Priorities of requests" in
+   `ARCHITECTURE.md`). The server part of item 8 is on the same branch.
 8. Then the rest of CUDA complete: image input pieces 4 to 8, gate and up in two types, the
    roles of the cards, the open defects, the server items.
 Later than their place suggests: the classic draft model (VRAM; better with an aux card), Turing,
