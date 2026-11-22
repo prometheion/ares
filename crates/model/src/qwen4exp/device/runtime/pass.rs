@@ -241,7 +241,8 @@ impl Flow {
 
     /// The next layer of a pass of `rows` rows (`layer` of the model, on part `index`): the
     /// experts the part computes and no tier holds are read ahead into staging, as far as the
-    /// store's half of it for guesses goes, while its micro-batches run. They count as a
+    /// store's half of it for guesses goes, and those the RAM tier holds go up into the
+    /// transit slots the layer before leaves free, while its micro-batches run. They count as a
     /// prediction's that names each for the rows that pick an expert of the layer on average
     /// (a row picks `top_k` of them), whose class of guesses (`transit.rs`) the layer's record
     /// then counts as named or not.
@@ -633,7 +634,8 @@ impl Qwen4ExpDevice {
             )?;
             // The rows of a pass pick nearly every expert of a layer (a row picks ten of 512),
             // and the next layer's picks reach the host only when all its micro-batches have
-            // run: what no tier holds of it is read ahead meanwhile.
+            // run: what no tier holds of it is read ahead meanwhile, and what RAM holds goes up
+            // into transit slots that are free.
             if i + 1 < n_layers {
                 let layer = self.part.layer_range().start + i + 1;
                 self.flow.guess_layer(self.index, layer, key.rows, &self.routing)?;

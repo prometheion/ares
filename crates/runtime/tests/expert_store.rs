@@ -1994,6 +1994,56 @@ fn full_rig(cold: u32) -> Rig {
 }
 
 #[test]
+fn a_guess_the_ram_tier_holds_goes_up_into_a_free_transit_slot_before_its_record() {
+    // Expert 7 comes from the file in one step and stays in the RAM tier.
+    let mut rig = full_rig(100);
+    let mut counts = [0u32; EXPERTS as usize];
+    counts[7] = 5;
+    rig.store.begin_step();
+    rig.store.transit_want(0, &[7]).unwrap();
+    rig.settle();
+    assert_eq!(rig.take_transit(0), [7]);
+    rig.store.record_counts(0, &counts, 1.0);
+    rig.store.transit_release(0, &[7]).unwrap();
+    rig.store.end_step().unwrap();
+    rig.settle();
+    assert!(rig.store.in_ram(0, 7) && !rig.store.in_vram(0, 7));
+    rig.store.take_stats();
+
+    // Guessed for the layer, it goes up into a transit slot while nothing named waits for
+    // one, and nothing hands it over before a record names it; then it is there at once.
+    rig.store.begin_step();
+    rig.store.transit_guess(0, &[7], None).unwrap();
+    rig.settle();
+    assert_eq!(rig.store.stats().transit_guess_uploads, 1);
+    assert!(rig.take_transit(0).is_empty(), "a guess is not handed over");
+    rig.store.transit_want(0, &[7]).unwrap();
+    assert_eq!(rig.take_transit(0), [7]);
+    rig.store.transit_release(0, &[7]).unwrap();
+    rig.store.end_step().unwrap();
+    rig.settle();
+    let stats = rig.store.take_stats();
+    assert_eq!((stats.transit_uploads, stats.transit_from_ram), (1, 1), "uploaded once");
+    assert_eq!((stats.transit_guess_uploads_used, stats.transit_guess_uploads_unused), (1, 0));
+    assert!(rig.store.in_ram(0, 7), "the RAM copy stays");
+
+    // A guess no record names gives its slot back when its layer is done with.
+    rig.store.begin_step();
+    rig.store.transit_guess(0, &[7], None).unwrap();
+    rig.settle();
+    rig.store.transit_forget(0).unwrap();
+    rig.settle();
+    let stats = rig.store.take_stats();
+    assert_eq!((stats.transit_guess_uploads, stats.transit_guess_uploads_unused), (1, 1));
+    // Both transit slots are free: a record that names two gets both.
+    rig.store.transit_want(1, &[8, 9]).unwrap();
+    rig.settle();
+    assert_eq!(rig.take_transit(1), [8, 9]);
+    rig.store.transit_release(1, &[8, 9]).unwrap();
+    rig.store.end_step().unwrap();
+}
+
+#[test]
 fn an_expert_the_heat_ranks_high_stays_in_ram_after_its_transit() {
     // Every member of the VRAM tier is far hotter than what comes through.
     let mut rig = full_rig(100);

@@ -454,6 +454,11 @@ pub struct StoreStats {
     /// Guesses of wide steps that were not read: their class of guesses is named less
     /// often than not (`transit.rs`).
     pub transit_ahead_left: u64,
+    /// Guesses of wide steps that the RAM tier held and that went up into transit slots
+    /// before their layer's record, and of them those it named and those it did not.
+    pub transit_guess_uploads: u64,
+    pub transit_guess_uploads_used: u64,
+    pub transit_guess_uploads_unused: u64,
     /// Experts that came from the file through staging and were kept in the
     /// RAM tier afterwards, by their heat.
     pub transit_admitted: u64,

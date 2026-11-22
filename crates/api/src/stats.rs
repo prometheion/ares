@@ -54,6 +54,10 @@ pub struct ExpertStats {
     /// slot.
     pub transit_admitted: u64,
     pub transit_adopted: u64,
+    /// Guesses of wide steps that the RAM tier held and that went up into transit slots
+    /// before their layer's record, and of them those it named.
+    pub transit_guess_uploads: u64,
+    pub transit_guess_uploads_used: u64,
 }
 
 /// What the level of the prompt cache on SSD has done since the engine

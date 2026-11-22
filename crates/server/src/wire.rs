@@ -1617,7 +1617,7 @@ pub(crate) fn model_list(models: &[crate::models::Listed]) -> serde_json::Value 
 /// The body of `GET /metrics`.
 pub(crate) fn metrics(stats: &ares_api::EngineStats) -> String {
     let (ram, ssd) = (&stats.ram, &stats.ssd);
-    let rows: [(&str, &str, &str, u64); 63] = [
+    let rows: [(&str, &str, &str, u64); 65] = [
         (
             "cache_ram_pages",
             "gauge",
@@ -1928,6 +1928,18 @@ pub(crate) fn metrics(stats: &ares_api::EngineStats) -> String {
             "counter",
             "Experts that took a VRAM slot from their transit slot",
             stats.experts.transit_adopted,
+        ),
+        (
+            "expert_transit_guess_uploads_total",
+            "counter",
+            "Guesses of wide steps uploaded from the RAM tier before their layer's record",
+            stats.experts.transit_guess_uploads,
+        ),
+        (
+            "expert_transit_guess_uploads_used_total",
+            "counter",
+            "Guesses of wide steps uploaded before their record that the record named",
+            stats.experts.transit_guess_uploads_used,
         ),
         ("expert_vram_experts", "gauge", "Experts in VRAM slots now", stats.experts.vram_experts),
         (

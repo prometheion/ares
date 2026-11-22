@@ -1300,6 +1300,8 @@ impl Qwen4Exp {
         totals.ahead_wasted += stats.ahead_wasted + stats.transit_ahead_unused;
         totals.transit_admitted += stats.transit_admitted;
         totals.transit_adopted += stats.transit_adopted;
+        totals.transit_guess_uploads += stats.transit_guess_uploads;
+        totals.transit_guess_uploads_used += stats.transit_guess_uploads_used;
         Some(stats)
     }
 

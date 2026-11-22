@@ -186,6 +186,11 @@ pub(super) struct Transit {
     /// they were asked for; guesses whose read has not started, likewise.
     wanted: VecDeque<(usize, u32)>,
     guesses: VecDeque<(usize, u32)>,
+    /// Guesses that the RAM tier holds, to be uploaded into transit slots that the
+    /// layers named before them leave free, most likely first.
+    upload_guesses: VecDeque<(usize, u32)>,
+    /// Transit slots that guesses hold (uploading or arrived, not named yet).
+    slot_guessed: usize,
     /// Reads of the file by their number.
     reads: HashMap<u64, (usize, u32)>,
     /// Per device: the uploads on their way, in the order of the stream.
@@ -221,6 +226,8 @@ impl Transit {
             entries: HashMap::new(),
             wanted: VecDeque::new(),
             guesses: VecDeque::new(),
+            upload_guesses: VecDeque::new(),
+            slot_guessed: 0,
             reads: HashMap::new(),
             uploads: plan.pools.iter().map(|_| VecDeque::new()).collect(),
             adoptions: plan.pools.iter().map(|_| VecDeque::new()).collect(),
@@ -295,14 +302,27 @@ impl<D: SlotDevice> ExpertStore<D> {
                     let state = entry.state;
                     self.transit.odds.record(entry.class, true);
                     self.stats.picks += 1;
-                    if matches!(state, State::Reading { .. } | State::Staged { .. }) {
-                        self.stats.transit_ahead_used += 1;
-                        self.stats.miss_on_its_way += 1;
-                        named.guessed += 1;
-                    } else {
-                        // The guess had not got as far as a read.
-                        self.stats.miss_from_disk += 1;
-                        named.unguessed += 1;
+                    match state {
+                        State::Reading { .. } | State::Staged { .. } => {
+                            self.stats.transit_ahead_used += 1;
+                            self.stats.miss_on_its_way += 1;
+                            named.guessed += 1;
+                        }
+                        State::Uploading { .. } | State::Ready { .. } => {
+                            // A guess the RAM tier held, uploaded into a slot the layer
+                            // before left free.
+                            self.stats.miss_on_its_way += 1;
+                            self.transit.slot_guessed = self.transit.slot_guessed.saturating_sub(1);
+                            self.stats.transit_guess_uploads_used += 1;
+                        }
+                        _ if self.ram.sets[layer].contains(*expert) => {
+                            self.stats.miss_from_ram += 1;
+                        }
+                        _ => {
+                            // The guess had not got as far as a read.
+                            self.stats.miss_from_disk += 1;
+                            named.unguessed += 1;
+                        }
                     }
                     match state {
                         State::Reading { read, .. } => {
@@ -372,7 +392,6 @@ impl<D: SlotDevice> ExpertStore<D> {
             if self.transit.entries.contains_key(&key)
                 || self.vram.sets[layer].contains(*expert)
                 || self.vram.sets[layer].is_loading(*expert)
-                || self.ram.sets[layer].contains(*expert)
                 || self.ram.sets[layer].is_loading(*expert)
             {
                 continue;
@@ -382,7 +401,11 @@ impl<D: SlotDevice> ExpertStore<D> {
                 key,
                 Entry { state: State::Queued, wanted: false, dropped: false, since: now, class },
             );
-            self.transit.guesses.push_back(key);
+            if self.ram.sets[layer].contains(*expert) {
+                self.transit.upload_guesses.push_back(key);
+            } else {
+                self.transit.guesses.push_back(key);
+            }
         }
         self.poll_transit()
     }
@@ -649,6 +672,10 @@ impl<D: SlotDevice> ExpertStore<D> {
                     if let Some(entry) = self.transit.entries.get_mut(&key) {
                         entry.dropped = true;
                     }
+                    if guess {
+                        self.transit.slot_guessed = self.transit.slot_guessed.saturating_sub(1);
+                        self.stats.transit_guess_uploads_unused += 1;
+                    }
                 }
                 State::Ready { slot, stage } | State::Taken { slot, stage } => {
                     self.transit.entries.remove(&key);
@@ -656,11 +683,16 @@ impl<D: SlotDevice> ExpertStore<D> {
                     if let Some(stage) = stage {
                         self.transit.free_stage(stage, false);
                     }
+                    if guess {
+                        self.transit.slot_guessed = self.transit.slot_guessed.saturating_sub(1);
+                        self.stats.transit_guess_uploads_unused += 1;
+                    }
                 }
             }
         }
         self.transit.wanted.retain(|key| key.0 != layer);
         self.transit.guesses.retain(|key| key.0 != layer);
+        self.transit.upload_guesses.retain(|key| key.0 != layer);
         self.poll_transit()
     }
 
@@ -972,6 +1004,35 @@ impl<D: SlotDevice> ExpertStore<D> {
                 }
             }
             self.transit.guesses.pop_front();
+        }
+
+        // Guesses the RAM tier holds go up into the transit slots that are left while
+        // nothing named waits for one, in at most half of the slots: until a layer's record
+        // arrives nothing of it would go over the link, which then has nothing to do through
+        // the next layer's first kernels and the last round of the layer before.
+        let named_waits = self.transit.wanted.iter().any(|key| {
+            self.transit.entries.get(key).is_some_and(|entry| {
+                entry.state == State::Queued && self.ram.sets[key.0].contains(key.1)
+            })
+        });
+        while !named_waits && let Some(key) = self.transit.upload_guesses.front().copied() {
+            let slots = self.transit_pool(key.0).map_or(0, |(_, _, slots)| slots as usize);
+            if 2 * (self.transit.slot_guessed + 1) > slots {
+                break;
+            }
+            let waits = self.transit.entries.get(&key).is_some_and(|entry| {
+                !entry.wanted
+                    && entry.state == State::Queued
+                    && self.transit.odds.worth(entry.class)
+            });
+            if waits && self.ram.sets[key.0].contains(key.1) {
+                if !self.transit_upload(key, None)? {
+                    break;
+                }
+                self.transit.slot_guessed += 1;
+                self.stats.transit_guess_uploads += 1;
+            }
+            self.transit.upload_guesses.pop_front();
         }
         Ok(())
     }
