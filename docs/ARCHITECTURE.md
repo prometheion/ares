@@ -7040,7 +7040,11 @@ ends the reply as a limit would (`length`; Strata's guard against a model that
 writes one token for ever, issue 606 there). A cycle of several tokens is not
 cut in an answer: a matrix of zeros is one. The real-model test is
 `real_messages`, `a_budget_ends_the_thinking_and_the_answer_follows` (the chat
-and the Messages route, the budget and `display: "omitted"`).
+and the Messages route, the budget and `display: "omitted"`): with the 0.8B on
+the test machine (2026-11-22) a budget of 24 tokens gave 26 tokens of thinking
+(the budget, a newline and the closing tag) and then the answer (17 primes
+below 60, counted step by step), and the omitted thinking sent back counted the
+same prompt as the thinking shown.
 
 A request is refused, too, for an effort the template does not read, for
 `reasoning_effort: "none"` when `enable_thinking` does not change the prompt, and
