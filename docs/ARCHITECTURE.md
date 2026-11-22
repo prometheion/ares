@@ -5478,7 +5478,12 @@ runs), so their reads can start a layer or two before their records
   over the link only once its record had named them, so from a layer's last upload until the
   next layer's record (its first kernels for 4096 rows, ~37 ms) and through its last round
   the link had nothing to do. A record that names an uploaded guess finds it there; a layer
-  done with gives the slots of the others back.
+  done with gives the slots of the others back. A named miss that waits for a slot, from RAM
+  or read into staging, keeps the guesses out: when only those RAM held did, the guesses took
+  the slots the staged ones waited for, and where the drive is the bound (IQ2_XS, `--ram 8G`,
+  the RTX 3060 on PCIe 3.0 x4, 2026-11-22) a prompt of 8k tokens took 71.0 s against 47.7 and
+  46.6 without the uploads; with the rule, 45.0 s (2k: 29.9 against 29.3 and 30.3), 88 to 93 %
+  of the uploaded guesses named. On the link-bound 16 GB card it is not measured yet.
 - *The text is unchanged.* The fingerprint of the tool (`qwen4exp_run --fingerprint`: the
   logits of a prompt of 600 tokens, 24 generated tokens and windows of drafts, bit for bit;
   both cards with the split pinned, `--core-share 0.76 --shared worker`, every miss
