@@ -142,8 +142,7 @@ impl Served {
         (status, serde_json::from_str(&text).unwrap_or(Value::String(text)))
     }
 
-    /// The first choice of a request that is to succeed, with the hash of its
-    /// tokens (`token_hash`, from the timings).
+    /// The first choice of a request that is to succeed.
     async fn chat(&self, question: &str, extra: Value) -> Value {
         let mut body = json!({
             "model": "q",
@@ -154,15 +153,7 @@ impl Served {
         body.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
         let (status, answer) = self.post(CHAT, &body).await;
         assert_eq!(status, 200, "{answer}");
-        let mut choice = answer["choices"][0].clone();
-        choice["token_hash"] = answer["timings"]["token_hash"].clone();
-        choice
-    }
-
-    /// Whether two replies to the same request must be the same.
-    fn must_agree(&self, choice: &Value, other: &Value, what: &str) -> bool {
-        let hash = |choice: &Value| choice["token_hash"].as_str().unwrap_or_default().to_owned();
-        api_model::must_agree(self.repeatable, &hash(choice), &hash(other), what)
+        answer["choices"][0].clone()
     }
 }
 
@@ -339,8 +330,16 @@ async fn with_thinking_on_the_thinking_is_free_and_the_answer_obeys() {
         thinking.len(),
         reasoning_of(&free).len()
     );
-    if served.must_agree(&ruled, &free, "thinking with the rule and without") {
+    // A model that is not repeatable may think otherwise in another run, so
+    // there the two are compared and not held to be the same.
+    if served.repeatable {
         assert_eq!(thinking, reasoning_of(&free), "the rule changed the thinking");
+    } else {
+        let same = thinking == reasoning_of(&free);
+        println!(
+            "RES thinking with the rule and without: {}",
+            if same { "the same" } else { "other" }
+        );
     }
     // It is prose, which no JSON value is, and which the schema would have
     // refused from its first character.

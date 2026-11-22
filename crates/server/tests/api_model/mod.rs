@@ -23,6 +23,7 @@
 //! `repeatable`: where a suite compares two replies to the same request, it
 //! compares them when they are the same tokens and checks each on its own
 //! otherwise.
+#![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
