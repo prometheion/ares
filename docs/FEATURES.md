@@ -9,7 +9,7 @@ the kernels exist; no model runs there yet.
 
 | | Qwen3.8 27B (`qwen35`, dense) | Qwen3.8 Flash-Next (`qwen4exp`, MoE) |
 | --- | --- | --- |
-| Placements | one card, tensor split, layer split | one card, by layers, both cards on every layer |
+| Placements | one card, tensor split, layer split | one card, by layers, both cards on every layer (the second card's role, a share of the dense parts or experts only, timed at load) |
 | Weight types | all 28 GGUF types | all 28 in every tensor: experts, stream mixers and the n-gram block (exact) too |
 | K and V | `f16`, `q8` to `q4`, chosen separately (`--kv`) | `f16`, `q8` to `q4`, chosen separately (`--kv`); the MTP block's in `q4` |
 | Larger than VRAM | no | experts in VRAM slots, a RAM tier and on the SSD; the CPU computes missed ones, and what a step picks beyond a card's slots |
@@ -28,9 +28,9 @@ the kernels exist; no model runs there yet.
   most half a second. A prompt read alone takes steps of up to `--batch-size` rows; on
   Flash-Next (8192 by default, as far as they fit) their scratch lies in VRAM the expert
   slots lend for the step, so a long prompt reads each expert once per step.
-- On a card whose tensor cores sum in f32 at full rate (a professional card, or a GeForce
-  card with the cap lifted) the path of the prompt kernels is measured per weight type at
-  load: the most exact of those within 5 % of the fastest.
+- The path of the prompt kernels is measured per weight type at load, on every card: the most
+  exact of those within 5 % of the fastest (f16 where the tensor cores sum in f32 at full
+  rate, else f16 summed in f16 or int8).
 - The token embedding stays in host RAM (27B: page-locked, 380 to 518 MiB of VRAM saved on the
   first card; Flash-Next: the mapped file): a step stages its rows and the card decodes them.
 - Flash-Next: experts a prompt misses pass through transit slots; nothing is evicted for them.
