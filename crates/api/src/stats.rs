@@ -49,6 +49,11 @@ pub struct ExpertStats {
     /// VRAM holds among them), over the model's layers.
     pub vram_experts: u64,
     pub ram_experts: u64,
+    /// Experts a wide step read from the file that were kept in the RAM tier afterwards
+    /// (each a copy out of staging), and experts that took a VRAM slot from their transit
+    /// slot.
+    pub transit_admitted: u64,
+    pub transit_adopted: u64,
 }
 
 /// What the level of the prompt cache on SSD has done since the engine

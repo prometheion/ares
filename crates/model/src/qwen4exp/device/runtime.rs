@@ -1298,6 +1298,8 @@ impl Qwen4Exp {
         totals.ahead_read_bytes += stats.ahead_read_bytes;
         totals.ahead_used += stats.ahead_used + stats.transit_ahead_used;
         totals.ahead_wasted += stats.ahead_wasted + stats.transit_ahead_unused;
+        totals.transit_admitted += stats.transit_admitted;
+        totals.transit_adopted += stats.transit_adopted;
         Some(stats)
     }
 
