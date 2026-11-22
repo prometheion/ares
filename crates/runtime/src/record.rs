@@ -244,7 +244,7 @@ pub struct StateCopy {
 }
 
 /// Rows `row..row + rows` of a step take the values of the image stage's
-/// rows `stage..stage + rows` (see [Images](self#images)).
+/// rows `stage..stage + rows` (see "Images" in the module `record`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ImageRun {
     pub row: u32,
@@ -465,7 +465,7 @@ impl<'a> RecordWriter<'a> {
     }
 
     /// The next row of the segment being written, at the rotary position
-    /// `(time, height, width)` (see [Images](self#images)).
+    /// `(time, height, width)` (see "Images" in the module `record`).
     pub fn row_at(&mut self, row: Row, rotary: [u32; 3]) -> Result<(), RecordFull> {
         assert!(self.rows_written < self.n_rows, "more rows than the record was started for");
         let i = self.rows_written as usize;
