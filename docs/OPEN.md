@@ -569,6 +569,12 @@ with Bash. Scripts and logs in `/var/tmp/ares-flashapi` (`notes.md`).
 - The 27B (two cards, tensor split, its MTP block, peer access): the same tasks in 2 and 4
   turns, 37 s and 22 s. The first prompt at 1052 tokens/s (15.5 s), a continued turn's first
   token in 0.2 to 0.5 s, replies at 65 to 120 tokens/s.
+- [ ] Flash-Next with both devices on every layer (the driver with peer access, 2026-11-22
+      14:27, load 2 to 6) read the same first prompt at 40.9 tokens/s (the split by layers 61
+      at load 13) and answered at 3 to 6 tokens/s, with 5 of 55 and 7 of 127 drafts accepted;
+      the MTP block's first link took 1 of 6 and 3 of 12 where the split by layers took 25 of
+      41, 29 of 45 and 56 of 78 on the same prompts. Few samples, but the MTP block looks badly
+      fed in that placement; not looked into.
 - [ ] A new session on Flash-Next reads the whole 16 thousand tokens again: the root checkpoint
       ("Next", item 2). The template writes the tools first (12.7 thousand tokens) and the
       system prompt after them, whose first line is Claude Code's billing line: 2.1.301 writes no
