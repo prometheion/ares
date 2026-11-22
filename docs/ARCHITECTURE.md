@@ -6054,8 +6054,9 @@ slots of its expert cache that it lends for the chunk and refills after (Strata
 - *The way back.* The slots go back, empty, at the end of the first step that does not run
   on them: that step's start still reads what the last wide step left there (the MTP block
   follows the rows of the step before from the part's residual). Empty slots fill the way
-  they always do: the hottest experts of RAM at the end of every step (`promote_hot`, every
-  free slot at once), the fill while idle, what steps upload.
+  they always do: the hottest experts of RAM (`promote_hot`, every free slot at once, started
+  as the slots come back and at the end of every step), the fill while idle, what steps
+  upload.
 - *Who gets the wide step.* A prompt read alone; a generating sequence never shares a step
   with a loan (it rides along in pieces of the own scratch only), so nothing it holds in
   VRAM is lent while it generates. A request that arrives while a wide step runs waits for
