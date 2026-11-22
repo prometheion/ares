@@ -1931,63 +1931,6 @@ fn a_guess_is_read_ahead_and_the_want_that_names_it_takes_it() {
     rig.store.end_step().unwrap();
 }
 
-/// A wide step brings the next layer's hottest experts into transit behind the misses of
-/// the layer before: at most half of the slots, nothing of them handed over before the next
-/// layer's record names them, and what it does not name leaves and frees its slot.
-#[test]
-fn the_next_layers_hottest_come_into_transit_ahead_and_what_its_record_does_not_name_goes() {
-    let mut rig = transit_rig(4, 2);
-    // Layer 1 picks other experts every step: its RAM tier holds some VRAM no longer does.
-    for picks in [[1u32, 2], [3, 4], [5, 6], [7, 8], [9, 10], [11, 12]] {
-        rig.step(&[&[1, 2], &picks, &[1, 2]]);
-    }
-    let in_ram: Vec<u32> =
-        (0..EXPERTS).filter(|e| rig.store.in_ram(1, *e) && !rig.store.in_vram(1, *e)).collect();
-    assert!(in_ram.len() >= 3, "{in_ram:?}");
-    rig.store.take_stats();
-    rig.store.begin_step();
-    rig.store.transit_want(0, &[13, 14]).unwrap();
-    rig.store.transit_ahead(1, 8).unwrap();
-    rig.settle();
-    assert_eq!(rig.store.stats().transit_early, 2, "half of the four transit slots");
-    assert!(rig.take_transit(1).is_empty(), "nothing of layer 1 before its record");
-    assert_eq!(rig.take_transit(0), [13, 14]);
-    rig.store.transit_release(0, &[13, 14]).unwrap();
-    rig.store.transit_forget(0).unwrap();
-    // Layer 1's record names one expert of its RAM tier and one only the file holds.
-    let named = [in_ram[0], 15];
-    rig.store.transit_want(1, &named).unwrap();
-    let mut taken = Vec::new();
-    for _ in 0..4 {
-        rig.settle();
-        let arrived = rig.take_transit(1);
-        rig.store.transit_release(1, &arrived).unwrap();
-        taken.extend(arrived);
-    }
-    taken.sort_unstable();
-    let mut want = named.to_vec();
-    want.sort_unstable();
-    assert_eq!(taken, want);
-    rig.store.transit_forget(1).unwrap();
-    rig.store.end_step().unwrap();
-    rig.settle();
-    let stats = rig.store.take_stats();
-    assert!(stats.transit_early_unnamed >= 1, "{stats:?}");
-    // Nothing was left behind: the next step's wants all come through.
-    rig.store.begin_step();
-    rig.store.transit_want(2, &[3, 4, 5, 6]).unwrap();
-    let mut taken = Vec::new();
-    for _ in 0..8 {
-        rig.settle();
-        let arrived = rig.take_transit(2);
-        rig.store.transit_release(2, &arrived).unwrap();
-        taken.extend(arrived);
-    }
-    taken.sort_unstable();
-    assert_eq!(taken, [3, 4, 5, 6]);
-    rig.store.end_step().unwrap();
-}
-
 /// A store with transit whose four VRAM slots of layer 0 hold experts 1 to 4,
 /// with the heat of 100 rows each but expert 4, which has that of `cold` rows.
 fn full_rig(cold: u32) -> Rig {

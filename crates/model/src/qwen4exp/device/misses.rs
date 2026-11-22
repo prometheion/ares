@@ -39,13 +39,6 @@ use super::board::Board;
 use super::feed::Feed;
 use super::part::{Part, StepEnv};
 
-/// The rows of a wide step from which the next layer's hottest experts are brought into
-/// transit ahead of its record ([`ExpertStore::transit_ahead`]): a step of this many rows picks
-/// most experts of a layer, the hottest surely.
-///
-/// [`ExpertStore::transit_ahead`]: ares_runtime::expert_store::ExpertStore::transit_ahead
-const AHEAD_ROWS: u32 = 1024;
-
 /// What wide steps found and waited for, added up over layers.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct WideStats {
@@ -256,17 +249,6 @@ impl Misses {
                     let transit = feed.has_transit(self.at);
                     if transit {
                         feed.named(self.at, &self.missing)?;
-                        // A step whose rows pick most experts of every layer: the next
-                        // layer's hottest come into transit behind this one's misses, so
-                        // the link does not rest while this layer's last rounds and the
-                        // next one's dense half run.
-                        let whole = (0..counts.len() as u32).all(owned);
-                        if self.rows >= AHEAD_ROWS && whole && self.layer + 1 < part.n_layers() {
-                            let next = part.layer_range().start + self.layer + 1;
-                            let next = feed.layout().store_layer(self.part, next);
-                            let batch = feed.transit_batch(next);
-                            feed.store.transit_ahead(next, batch)?;
-                        }
                     }
                     if self.missing.is_empty() {
                         self.stage = Stage::Cpu;

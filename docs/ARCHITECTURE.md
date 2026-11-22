@@ -4862,16 +4862,6 @@ width (`device/part/wide.rs`, `device/misses.rs`):
   measured". The next layers' routers applied to this layer's input are a better guess;
   the steps of eight rows make it on the device (see "Reading experts ahead of their
   router" below), a wide step does not yet.
-- *The next layer's hottest come early* (`ExpertStore::transit_ahead`, 2026-11-22). The
-  uploads of a layer begin with its record, so the link would rest while the layer before
-  computes its last rounds and this layer runs its dense half and its router. A step of 1024
-  rows or more picks most experts of every layer and its hottest surely, so when a whole
-  part (one that owns every expert of its layers) names a layer's misses, the next layer's
-  hottest experts that the RAM tier holds and VRAM does not come into transit behind them,
-  as if named: at most half of the transit slots (the layer before keeps the other half, and
-  the upload queue serves the layer before first). The next layer's record names what its
-  rows picked; what it does not name leaves and frees its slot at once
-  (`StoreStats::transit_early`, `transit_early_unnamed`).
 - *Both devices on every layer*: the mixer routes. The worker's host thread reads the
   record from the mixer's board (the mixer has enqueued the layer when `Flow::enqueued`
   says so), uploads it, and builds its table from the experts it owns

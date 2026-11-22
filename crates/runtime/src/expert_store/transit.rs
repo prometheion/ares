@@ -115,9 +115,6 @@ struct Entry {
     state: State,
     /// A route record named it. Otherwise it is read ahead on a guess.
     wanted: bool,
-    /// Brought ahead of its layer's record as if named ([`ExpertStore::transit_ahead`]):
-    /// the record names it or it is dropped.
-    ahead: bool,
     /// Nobody needs it any more: it leaves when nothing of it is on its way.
     dropped: bool,
     since: Instant,
@@ -231,12 +228,6 @@ impl<D: SlotDevice> ExpertStore<D> {
             let key = (layer, *expert);
             match self.transit.entries.get_mut(&key) {
                 Some(entry) if entry.wanted => {
-                    // One brought ahead of the record is a pick that found no slot, counted
-                    // as such now.
-                    if std::mem::take(&mut entry.ahead) {
-                        self.stats.picks += 1;
-                        self.stats.miss_from_ram += 1;
-                    }
                     // One that was let go while its read or its upload ran (the layer was
                     // forgotten) is waited for again, with what is on its way.
                     if std::mem::take(&mut entry.dropped) {
@@ -292,77 +283,14 @@ impl<D: SlotDevice> ExpertStore<D> {
                     }
                     self.transit.entries.insert(
                         key,
-                        Entry {
-                            state: State::Queued,
-                            wanted: true,
-                            ahead: false,
-                            dropped: false,
-                            since: now,
-                        },
+                        Entry { state: State::Queued, wanted: true, dropped: false, since: now },
                     );
                     self.transit.wanted.push_back(key);
                 }
             }
         }
-        // What was brought ahead and the record does not name leaves.
-        let device = self.layers[layer].device;
-        let unnamed: Vec<(usize, u32)> = self
-            .transit
-            .entries
-            .iter()
-            .filter(|(key, entry)| key.0 == layer && entry.ahead)
-            .map(|(key, _)| *key)
-            .collect();
-        for key in unnamed {
-            self.transit_drop(device, key)?;
-            self.stats.transit_early_unnamed += 1;
-        }
-        self.transit.wanted.retain(|key| self.transit.entries.contains_key(key));
         self.poll_transit()?;
         Ok(named)
-    }
-
-    /// A wide step whose rows pick most experts of every layer runs `layer` next: its
-    /// `count` hottest experts that the RAM tier holds and VRAM does not are brought into
-    /// transit now, behind everything named before them, as if its record had named them;
-    /// so the link does not rest while the layer before computes its last rounds and this
-    /// one its dense half and its router. The record names what the rows picked:
-    /// [`ExpertStore::transit_want`] keeps those and lets the others go. At most half of the
-    /// transit slots are taken so: the layer before keeps the other half for what it waits
-    /// for.
-    pub fn transit_ahead(&mut self, layer: usize, count: usize) -> Result<(), StoreError> {
-        let Some((_, _, slots)) = self.transit_pool(layer) else { return Ok(()) };
-        if self.transit.plan.stage_slots == 0 {
-            return Ok(());
-        }
-        let count = count.min(slots as usize / 2);
-        let heat = self.heat.layer(layer);
-        let mut order: Vec<u32> = (0..heat.len() as u32)
-            .filter(|e| {
-                !self.transit.entries.contains_key(&(layer, *e))
-                    && !self.vram.sets[layer].contains(*e)
-                    && !self.vram.sets[layer].is_loading(*e)
-                    && self.ram.sets[layer].contains(*e)
-            })
-            .collect();
-        order.sort_by(|a, b| heat[*b as usize].total_cmp(&heat[*a as usize]));
-        let now = Instant::now();
-        for expert in order.into_iter().take(count) {
-            let key = (layer, expert);
-            self.transit.entries.insert(
-                key,
-                Entry {
-                    state: State::Queued,
-                    wanted: true,
-                    ahead: true,
-                    dropped: false,
-                    since: now,
-                },
-            );
-            self.transit.wanted.push_back(key);
-            self.stats.transit_early += 1;
-        }
-        self.poll_transit()
     }
 
     /// Something expects the record of `layer` to name `experts`, most likely
@@ -386,13 +314,7 @@ impl<D: SlotDevice> ExpertStore<D> {
             }
             self.transit.entries.insert(
                 key,
-                Entry {
-                    state: State::Queued,
-                    wanted: false,
-                    ahead: false,
-                    dropped: false,
-                    since: now,
-                },
+                Entry { state: State::Queued, wanted: false, dropped: false, since: now },
             );
             self.transit.guesses.push_back(key);
         }
@@ -406,7 +328,7 @@ impl<D: SlotDevice> ExpertStore<D> {
         let first = out.len();
         for (key, entry) in &mut self.transit.entries {
             if let (true, State::Ready { slot, stage }) =
-                (key.0 == layer && entry.wanted && !entry.ahead, entry.state)
+                (key.0 == layer && entry.wanted, entry.state)
             {
                 entry.state = State::Taken { slot, stage };
                 out.push((key.1, slot));
@@ -624,53 +546,44 @@ impl<D: SlotDevice> ExpertStore<D> {
         let keys: Vec<(usize, u32)> =
             self.transit.entries.keys().filter(|key| key.0 == layer).copied().collect();
         for key in keys {
-            self.transit_drop(device, key)?;
+            let Some(entry) = self.transit.entries.get(&key).copied() else { continue };
+            let guess = !entry.wanted;
+            match entry.state {
+                State::Queued => {
+                    self.transit.entries.remove(&key);
+                }
+                State::Reading { read, .. } => {
+                    for part in 0..3 {
+                        // What is at the drive comes back; the rest is not started.
+                        let _ = self.reader.cancel(read * 4 + part);
+                    }
+                    if let Some(entry) = self.transit.entries.get_mut(&key) {
+                        entry.dropped = true;
+                    }
+                    self.stats.transit_ahead_unused += u64::from(guess);
+                }
+                State::Staged { stage } => {
+                    self.transit.entries.remove(&key);
+                    self.transit.free_stage(stage, guess);
+                    self.stats.transit_ahead_unused += u64::from(guess);
+                }
+                State::Uploading { .. } => {
+                    if let Some(entry) = self.transit.entries.get_mut(&key) {
+                        entry.dropped = true;
+                    }
+                }
+                State::Ready { slot, stage } | State::Taken { slot, stage } => {
+                    self.transit.entries.remove(&key);
+                    self.transit.free[device].push(slot);
+                    if let Some(stage) = stage {
+                        self.transit.free_stage(stage, false);
+                    }
+                }
+            }
         }
         self.transit.wanted.retain(|key| key.0 != layer);
         self.transit.guesses.retain(|key| key.0 != layer);
         self.poll_transit()
-    }
-
-    /// Lets the entry `key` of a layer on `device` go: at once, or once what is on its way
-    /// has arrived.
-    fn transit_drop(&mut self, device: usize, key: (usize, u32)) -> Result<(), StoreError> {
-        let Some(entry) = self.transit.entries.get(&key).copied() else { return Ok(()) };
-        let guess = !entry.wanted;
-        match entry.state {
-            State::Queued => {
-                self.transit.entries.remove(&key);
-            }
-            State::Reading { read, .. } => {
-                for part in 0..3 {
-                    // What is at the drive comes back; the rest is not started.
-                    let _ = self.reader.cancel(read * 4 + part);
-                }
-                if let Some(entry) = self.transit.entries.get_mut(&key) {
-                    entry.dropped = true;
-                    entry.ahead = false;
-                }
-                self.stats.transit_ahead_unused += u64::from(guess);
-            }
-            State::Staged { stage } => {
-                self.transit.entries.remove(&key);
-                self.transit.free_stage(stage, guess);
-                self.stats.transit_ahead_unused += u64::from(guess);
-            }
-            State::Uploading { .. } => {
-                if let Some(entry) = self.transit.entries.get_mut(&key) {
-                    entry.dropped = true;
-                    entry.ahead = false;
-                }
-            }
-            State::Ready { slot, stage } | State::Taken { slot, stage } => {
-                self.transit.entries.remove(&key);
-                self.transit.free[device].push(slot);
-                if let Some(stage) = stage {
-                    self.transit.free_stage(stage, false);
-                }
-            }
-        }
-        Ok(())
     }
 
     /// A step begins: what the step before left in transit (a step that
