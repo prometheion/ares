@@ -5596,7 +5596,9 @@ reading 37.9 and 145.7 GiB.
 for 8 tokens, streamed; the same server pair, load 4.7 to 5.5): with steps of 512 rows its first
 token came after 2.68 s and the long prompt took 134.6 s (241 tokens/s); with lent steps of 4096
 rows after 13.47 s, the long prompt 85.4 s (380 tokens/s). The request waits for the lent step
-in flight, about 11 s here, and then for a piece of its own; a step cannot be cut, so what the
+in flight, about 11 s here, and then for a piece of its own (with lone steps of 1024 and
+2048 rows, measured while other work loaded the machine to 13 to 23, it waited 9.5 and 12.3 s,
+the long prompt read at 147 and 208 tokens/s); a step cannot be cut, so what the
 owner asked for (no request waits seconds behind a long prompt) needs the interruptible pass
 of "Long prompts layer by layer" in OPEN.md, or a lone step bounded in time.
 
