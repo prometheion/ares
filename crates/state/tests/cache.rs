@@ -52,12 +52,12 @@ impl Rng {
 
 /// The state of the cell that follows `previous` and holds `token`.
 fn cell_state(previous: u64, token: u64) -> u64 {
-    (previous ^ u64::from(token)).wrapping_mul(0x9e37_79b9_7f4a_7c15).rotate_left(23) ^ 0x51
+    (previous ^ token).wrapping_mul(0x9e37_79b9_7f4a_7c15).rotate_left(23) ^ 0x51
 }
 
 /// The recurrent state after `token`, from the state before it.
 fn recurrent(previous: u64, token: u64) -> u64 {
-    (previous.rotate_left(11) ^ u64::from(token)).wrapping_mul(0xd6e8_feb8_6659_fd93) ^ 0x1f
+    (previous.rotate_left(11) ^ token).wrapping_mul(0xd6e8_feb8_6659_fd93) ^ 0x1f
 }
 
 fn recurrent_of(tokens: &[u64]) -> u64 {

@@ -35,7 +35,7 @@ impl Rng {
 
 /// The state of the cell that follows `previous` and holds `token`.
 fn cell_state(previous: u64, token: u64) -> u64 {
-    (previous ^ u64::from(token)).wrapping_mul(0x9e37_79b9_7f4a_7c15).rotate_left(23) ^ 0x51
+    (previous ^ token).wrapping_mul(0x9e37_79b9_7f4a_7c15).rotate_left(23) ^ 0x51
 }
 
 struct Live {

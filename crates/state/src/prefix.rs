@@ -1393,7 +1393,13 @@ mod tests {
             let mut seq = Sequence::new();
             seq.append(&mut pool, 2).unwrap();
             assert_eq!(
-                index.insert_tail(&mut pool, root, &[1, 100 + u64::from(i)], seq.pages()[0], Priority::NORMAL),
+                index.insert_tail(
+                    &mut pool,
+                    root,
+                    &[1, 100 + u64::from(i)],
+                    seq.pages()[0],
+                    Priority::NORMAL
+                ),
                 None
             );
             pages.push(seq.pages()[0]);
