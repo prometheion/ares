@@ -920,13 +920,18 @@ fn main() {
         let mut wall: Vec<f64> = times[..args.decode_steps].iter().map(|t| t.0).collect();
         let mut device: Vec<f64> = times[..args.decode_steps].iter().map(|t| t.1).collect();
         let (wall, device) = (median(&mut wall), median(&mut device));
+        // The step a tenth of the steps are faster than: on a busy machine
+        // the median waits for cores, and the fastest step is one sample.
+        let mut sorted: Vec<f64> = times[..args.decode_steps].iter().map(|t| t.0).collect();
+        sorted.sort_by(f64::total_cmp);
+        let tenth = sorted.get(sorted.len() / 10).copied().unwrap_or(f64::NAN);
         // The fastest step is the one the host disturbed least: on a busy
         // machine the device threads lose their cores between kernels.
         let fastest = times[..args.decode_steps].iter().map(|t| t.0).fold(f64::INFINITY, f64::min);
         let fastest_device =
             times[..args.decode_steps].iter().map(|t| t.1).fold(f64::INFINITY, f64::min);
         println!(
-            "RES decode at context {context}: {wall:.2} ms per step wall (median of {}, fastest {fastest:.2}), {device:.2} ms on the slowest device (fastest {fastest_device:.3}), {:.1} tokens/s",
+            "RES decode at context {context}: {wall:.2} ms per step wall (median of {}, fastest {fastest:.2}, tenth {tenth:.2}), {device:.2} ms on the slowest device (fastest {fastest_device:.3}), {:.1} tokens/s",
             args.decode_steps,
             1e3 / wall
         );
