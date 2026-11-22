@@ -568,6 +568,10 @@ with fewer slots in VRAM than a step picks"). Left:
 
 ## Optimising (after CUDA is complete, before Vulkan; the owner, 2026-11-16)
 Measured per phase on a quiet machine against the fork and Strata, the largest first. Known levers:
+- [ ] Attention over long contexts: llama.cpp PR 32407 (merged 2026-11-17) rotates the order in
+      which blocks read K/V tiles so that blocks sharing K/V hit L2 together: prompts of the 27B
+      on an RTX 5090 at 131072 cells 1290 -> 1822 tokens/s (1.41x), 1.25x at 65536, 1.07x at
+      32768, nothing below. Ares' attention for prompts and wide windows at long contexts.
 - [ ] VRAM on loan to the expert tier: K/V pages a conversation does not need yet (Strata's
       `--kv-grow`), the MTP block's 675 MiB while a long prompt runs (gap study `/var/tmp/ares-survey/gap-study-2026-11-17.md`).
 - [ ] Checkpoints of the recurrent state in int8 (SGLang's `mamba_checkpoint_pool.py`): a quarter
