@@ -776,11 +776,11 @@ fn attention_for_context(
     let total = |f: &Footprint| fixed(f) + f.per_page * u64::from(pages);
     let (mut room, mut room_for_pages) = (Vec::with_capacity(n), Vec::with_capacity(n));
     let (mut heads, mut page) = (0, 0);
-    for i in 0..n {
+    for (i, usable) in usable.iter().enumerate() {
         let all = footprint_of(alone_on(i))?[i];
         let none = footprint_of(alone_on((i + 1) % n))?[i];
-        room.push(usable[i].saturating_sub(fixed(&none)));
-        room_for_pages.push(usable[i].saturating_sub(total(&none)));
+        room.push(usable.saturating_sub(fixed(&none)));
+        room_for_pages.push(usable.saturating_sub(total(&none)));
         heads = heads.max(fixed(&all).saturating_sub(fixed(&none)));
         page = page.max(all.per_page.saturating_sub(none.per_page));
     }
@@ -807,9 +807,9 @@ fn attention_for_context(
         if over.iter().all(|o| *o == 0) {
             break;
         }
-        for i in 0..n {
-            if over[i] > 0 {
-                most[i] = most[i].min(attention[i] - over[i] as f64 / per_share);
+        for ((most, over), share) in most.iter_mut().zip(&over).zip(&attention) {
+            if *over > 0 {
+                *most = most.min(share - *over as f64 / per_share);
             }
         }
         match plan::fit_shares(shares, &most) {
@@ -1393,8 +1393,8 @@ fn load_qwen35(
             return Err(refuse(format!(
                 "--context {context}: the devices hold about {held_tokens} tokens of context \
                  for {parallel} sequence{} with this plan (by estimate: {}; K and V take {} per \
-                 1000 tokens); name a smaller context, fewer sequences with --parallel or K and \
-                 V in fewer bits with --kv",
+                 1000 tokens); name a smaller context, fewer sequences with --parallel, K and \
+                 V in fewer bits with --kv{}",
                 if parallel == 1 { "" } else { "s" },
                 taken_text(),
                 join(
@@ -1405,6 +1405,12 @@ fn load_qwen35(
                     )),
                     " and "
                 ),
+                if options.shares.is_some() {
+                    " or other shares of the weights with --shares (the heads of the attention \
+                     blocks are placed for the context already)"
+                } else {
+                    ""
+                },
             )));
         }
         Some(context) => (context, "as asked".to_owned()),
