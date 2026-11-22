@@ -907,6 +907,10 @@ the agents' builds):
       threads spinning; the `moe/prompt-chunks` agent); with `--test-threads=1` it passes.
 
 ## Decided by the owner (2026-11-22)
+- K/V beyond VRAM (`kv/overflow`): the far K/V pages a finished request leaves behind rank as
+  prompt cache, the lowest user of `--ram`: under pressure they give way before the tier of
+  experts (to the SSD level with `--cache`, else dropped); a running sequence's far K/V stays
+  required.
 - Large prompt steps stay as built; the interruptible layer-major pass (TokenWing's order: a
   lone step that a waiting request can cut between layers) is built in the optimising phase.
 - Flash-Next on two cards: the plan measures at load whether the second card computes a dense
