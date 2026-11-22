@@ -2528,3 +2528,39 @@ fn a_loan_of_vram_takes_the_last_slots_of_the_pool_and_gives_them_back_empty() {
     assert_eq!(stats.scratch_loans, 1);
     assert!(stats.scratch_moves > 0, "what stayed in the lent slots moved");
 }
+
+/// Loans one after the other, with steps between them that move experts around: every loan
+/// finds a home for what stays in its slots, and no table entry names a lent slot.
+#[test]
+fn loans_one_after_the_other_find_a_home_for_what_stays_in_their_slots() {
+    // Slots move between layers by their use (as in the engine), between loans and while one
+    // runs.
+    let mut rig = rig(8, 16, |config| config.rebalance_every = 1);
+    let picks_of = |step: u32| -> Vec<Vec<u32>> {
+        (0..LAYERS)
+            .map(|l| (0..8).map(|e| (e * 3 + step * 5 + l as u32) % EXPERTS).collect())
+            .collect()
+    };
+    for round in 0..12u32 {
+        for step in 0..3 {
+            let picks = picks_of(round * 3 + step);
+            let picks: Vec<&[u32]> = picks.iter().map(Vec::as_slice).collect();
+            rig.step(&picks);
+        }
+        let slots = 4 + (round % 3) as u64 * 3;
+        let loan = rig.store.lend_scratch(0, slots * SLOT_BYTES).unwrap().expect("a loan");
+        rig.settle();
+        assert!(rig.store.scratch_ready(0).unwrap());
+        // A step on the loan: its misses go into slots outside it.
+        let picks = picks_of(round * 7 + 1);
+        let picks: Vec<&[u32]> = picks.iter().map(|p| &p[..2]).collect();
+        rig.step(&picks);
+        for layer in 0..LAYERS {
+            for expert in 0..EXPERTS {
+                let entry = rig.store.device(0).entry(layer, expert);
+                assert!(entry < loan.first as i32, "round {round}: layer {layer} expert {expert}");
+            }
+        }
+        rig.store.return_scratch(0).unwrap();
+    }
+}

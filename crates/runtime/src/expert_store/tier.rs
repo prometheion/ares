@@ -33,6 +33,9 @@ pub(crate) struct Tier {
     slot: Vec<Vec<u32>>,
 }
 
+/// What a slot number that a layer gave up for good has behind it: no slot of the pool.
+pub(super) const NO_MEMORY: u32 = u32::MAX;
+
 impl Tier {
     /// A tier for layers of `n_experts` experts: `layers[l]` is the place and
     /// the slot size of layer `l`, `budget[place]` the bytes the tier may
@@ -165,6 +168,12 @@ impl Tier {
         let taken = self.sets[to].take(1)[0];
         if taken as usize == self.slot[to].len() {
             self.slot[to].push(slot);
+            // `from` keeps its number given up, with no memory behind it: a slot is behind
+            // one number of one layer only. (Until 2026-11-22 the number kept the slot, and
+            // a loan of VRAM that came after took the given-up number for the slot's owner:
+            // the layer that held the slot kept it inside the loan, and a later loan found
+            // fewer slots given than lent, "as many slots were given as are lent".)
+            self.slot[from][local as usize] = NO_MEMORY;
         } else {
             // A number `to` had given back earlier: swap the memory behind
             // the two numbers, so `from` keeps one for a later take.
@@ -302,5 +311,18 @@ mod tests {
         let taken = tier.move_slot(0, given[0].slot, 1);
         assert_eq!((tier.slots(0), tier.slots(1)), (3, 5));
         assert_eq!(tier.slot(1, taken), 3, "layer 1 now owns layer 0's last slot");
+        assert_eq!(tier.slot(0, given[0].slot), NO_MEMORY, "and layer 0's number has none");
+        // Every slot of the pool is behind one number of one layer.
+        let mut owners = std::collections::HashMap::new();
+        for layer in 0..2 {
+            for slot in tier.locals(layer).iter().filter(|s| **s != NO_MEMORY) {
+                assert!(owners.insert(*slot, layer).is_none(), "slot {slot} has two numbers");
+            }
+        }
+        // It comes back: layer 0 takes its given-up number again, with layer 1's slot.
+        let given = tier.sets[1].give_back(1, 0, &flat);
+        let back = tier.move_slot(1, given[0].slot, 0);
+        assert_ne!(tier.slot(0, back), NO_MEMORY);
+        assert_eq!((tier.slots(0), tier.slots(1)), (4, 4));
     }
 }
