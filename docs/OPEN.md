@@ -39,7 +39,10 @@ stored responses, TLS.
 
 | Piece | State |
 | --- | --- |
-| (nothing in work: the owner starts the next pieces) | |
+| 1 and 2: Claude Code's billing stamp as upstream; checkpoints at the system prompt's and tool list's end, at every message boundary and at fixed distances | agent working (`cache/checkpoints`) |
+| 3: large prompt chunks for Flash-Next (TokenWing and Strata read first), batch and micro-batch, adaptive | agent working (`moe/prompt-chunks`) |
+| 4: tools, structured output, Messages and Responses on the real Flash-Next, and Claude Code itself against Ares | agent working (`server/flash-api`) |
+| The best use of the second card (the fork's attention split, more context there, expert tier only, drafters there): measured, then roles | agent working (`devices/roles`) |
 
 ## Shared model layer (the owner's rule, 2026-11-16)
 Generic for Ares, not like llama.cpp: a few models, shared code where it can be, each model
