@@ -377,12 +377,13 @@ fn tools_and_the_choice_among_them_are_those_of_the_chat_body() {
 }
 
 #[test]
-fn thinking_is_the_switch_of_the_chat_template_and_the_budget_is_not_a_field() {
+fn thinking_is_the_switch_of_the_chat_template_and_the_budget_the_chat_routes() {
     let variables = |thinking: Value| chat(with(json!({"thinking": thinking})));
     let on = json!({"enable_thinking": true});
     let enabled = variables(json!({"type": "enabled", "budget_tokens": 31999}));
     assert_eq!(enabled["chat_template_kwargs"], on);
-    assert!(enabled.get("thinking_budget_tokens").is_none(), "{enabled}");
+    assert_eq!(enabled["reasoning_budget_tokens"], 31999, "{enabled}");
+    assert!(variables(json!({"type": "adaptive"})).get("reasoning_budget_tokens").is_none());
     assert_eq!(variables(json!({"type": "enabled"}))["chat_template_kwargs"], on);
     assert_eq!(variables(json!({"type": "adaptive"}))["chat_template_kwargs"], on);
     // How the thinking is to be shown: it comes back whole in every case.

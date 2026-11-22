@@ -487,6 +487,13 @@ impl Active {
                 self.finished = Some(self.stop.finish());
                 return;
             }
+            // A reply caught in a loop ends as a limit ends it (`guard`).
+            if self.sampler.cuts(&self.tokens, self.prompt_len as usize) {
+                self.stop.flush(&mut self.emitted);
+                self.sampler.reply_ended();
+                self.finished = Some(FinishReason::Length);
+                return;
+            }
             if self.max_tokens.is_some_and(|max| self.completion >= max)
                 || self.tokens.len() as u32 >= context_length
             {

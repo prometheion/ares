@@ -17,6 +17,7 @@ use crate::config::RuntimeConfig;
 use crate::error::RuntimeError;
 use crate::exec::{ExecError, Executor};
 use crate::gpu::{GpuConfig, GpuExecutor};
+use crate::guard::Guard;
 use crate::model::{EncodedPrompt, Model};
 use crate::sampling::TokenFilter;
 use crate::structured::Grammars;
@@ -278,11 +279,40 @@ impl Runtime {
             let _place = &place;
             events.send(event)
         });
-        let thinking = self
-            .model
-            .chat_format()
-            .and_then(|format| format.thinking)
-            .map(|format| thinking(&*self.model, &prompt, &format, request.structure.as_ref()));
+        let format = self.model.chat_format().and_then(|format| format.thinking);
+        let thinking = format
+            .as_ref()
+            .map(|format| thinking(&*self.model, &prompt, format, request.structure.as_ref()));
+        // Every reply is guarded against a loop; a budget ends the thinking.
+        let forced = match &format {
+            Some(format) => {
+                let message = request.sampling.reasoning_budget_message.clone().unwrap_or_default();
+                let mut forced = self.model.encode(&Prompt::Text(message + &format.end))?;
+                // A token the model adds before a text (one that writes
+                // nothing) is not part of the end of the thinking.
+                let mut piece = Vec::new();
+                while let Some(&first) = forced.first() {
+                    piece.clear();
+                    self.model.piece(first, &mut piece);
+                    if !piece.is_empty() {
+                        break;
+                    }
+                    forced.remove(0);
+                }
+                forced
+            }
+            // A model that does not think has no thinking to end: a budget
+            // (a default of the model, say) has nothing to bound.
+            None => Vec::new(),
+        };
+        let model = self.model.clone();
+        let filter: Option<Box<dyn TokenFilter>> = Some(Box::new(Guard::new(
+            Arc::new(move |token, text: &mut Vec<u8>| model.piece(token, text)),
+            filter,
+            thinking.clone(),
+            request.sampling.reasoning_budget_tokens,
+            forced,
+        )));
         let submission = Box::new(Submission {
             id: request.id,
             prompt,

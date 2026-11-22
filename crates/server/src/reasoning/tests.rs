@@ -459,19 +459,27 @@ fn what_is_wrong_in_the_fields_is_told_by_name() {
 }
 
 #[test]
-fn a_budget_for_the_thinking_is_refused_by_name() {
-    for name in ["reasoning_budget_tokens", "thinking_budget_tokens"] {
-        assert!(refused(&[(name, Json::Int(0))]).contains(name));
-        assert!(refused(&[(name, Json::Int(1024))]).contains("budget"));
-        assert!(refused(&[(name, text("many"))]).contains("must be a number"));
-        // No budget is no refusal.
-        assert!(asked_from(&[(name, Json::Int(-1))]).is_ok());
-        assert!(asked_from(&[(name, Json::Float(-1.0))]).is_ok());
+fn a_budget_for_the_thinking_is_read_under_every_name() {
+    for name in ["reasoning_budget_tokens", "thinking_budget_tokens", "thinking_token_budget"] {
+        assert_eq!(asked_from(&[(name, Json::Int(0))]).unwrap().budget, Some(0));
+        assert_eq!(asked_from(&[(name, Json::Int(1024))]).unwrap().budget, Some(1024));
+        assert!(refused(&[(name, text("many"))]).contains(name));
+        assert!(refused(&[(name, Json::Int(-2))]).contains("-1 for none"));
+        // -1 is none of its own: the model's default holds.
+        assert_eq!(asked_from(&[(name, Json::Int(-1))]).unwrap().budget, None);
+        assert_eq!(asked_from(&[(name, Json::Float(-1.0))]).unwrap().budget, None);
     }
-    assert!(refused(&[("reasoning_budget_message", text("Enough."))]).contains("not supported"));
-    assert!(asked_from(&[("reasoning_budget_message", text(""))]).is_ok());
+    let both = [("reasoning_budget_tokens", Json::Int(8)), ("thinking_token_budget", Json::Int(8))];
+    assert_eq!(asked_from(&both).unwrap().budget, Some(8));
+    let two = [("reasoning_budget_tokens", Json::Int(8)), ("thinking_token_budget", Json::Int(9))];
+    assert!(refused(&two).contains("different budgets"));
+    let message = asked_from(&[("reasoning_budget_message", text("Enough."))]).unwrap();
+    assert_eq!(message.budget_message.as_deref(), Some("Enough."));
     assert!(refused(&[("reasoning_control", Json::Bool(true))]).contains("reasoning_control"));
     assert!(asked_from(&[("reasoning_control", Json::Bool(false))]).is_ok());
+    // A model that does not think has no thinking to bound.
+    let error = planned(&[("reasoning_budget_tokens", Json::Int(8))], None).unwrap_err();
+    assert_eq!(error.param.as_deref(), Some("reasoning_budget_tokens"));
 }
 
 // What it comes to.

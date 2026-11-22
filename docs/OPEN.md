@@ -704,8 +704,12 @@ Flash-Next); experts that do not fit in VRAM in RAM; K/V in int8. Its README giv
 - [x] `/v1/completions` and `/tokenize` read the text of control tokens (`<|im_start|>`) as
       those tokens, as llama-server does (2026-11-22, `server/priorities`); `/tokenize` takes
       `parse_special: true` and refuses `false` and `add_special`.
-- [ ] Thinking budget (K03; Anthropic's `budget_tokens` is accepted and not enforced);
-      loop guard (K05).
+- [x] Thinking budget (K03): `reasoning_budget_tokens` and its other names, Anthropic's
+      `budget_tokens`, model defaults; enforced as llama-server does, by a mask of one token per
+      forced row (2026-11-22, `server/priorities`). Loop guard (K05): a cycle of at most 64
+      tokens over the last 512 of the thinking ends the thinking, one token 256 times ends an
+      answer (`length`). Open: the thresholds are fixed (no option); a passage loop of longer
+      cycles (Strata's opt-in #728) is not looked for; `reasoning_control` is not built.
 - [x] Reasoning tokens in the usage (K07); `stop_reason: stop_sequence` and the stop string
       that ended a reply.
 - [ ] Tool calls: a generic format for other templates; recovery of imperfect calls (T05);

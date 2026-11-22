@@ -7013,13 +7013,36 @@ The controls are llama-server's, under its names and defaults:
 | Effort | `--reasoning-effort` | `reasoning_effort` | the variable `reasoning_effort`; refused if the template does not read it; of the usual values (`minimal` to `xhigh`) the ones the template raises for are found when the model is set up (`refused_efforts`: Flash-Next `minimal` and `high`, the 27B `minimal`): `high` is then the template's default, as on `/v1/messages`, and another one is refused |
 | Thinking of earlier turns stays in the prompt | `--reasoning-preserve` (default on), `--no-reasoning-preserve` | `chat_template_kwargs.preserve_reasoning` | the variable `preserve_reasoning` |
 | Any other variable of the template | `--chat-var` | `chat_template_kwargs` | the variable; `messages`, `tools`, `add_generation_prompt`, `bos_token` and `eos_token` are the server's |
-| A budget of thinking tokens and the message injected when it is spent | `--reasoning-budget`, `--reasoning-budget-message` | `reasoning_budget_tokens`, `thinking_budget_tokens`, `reasoning_budget_message`, `reasoning_control` | not built: only -1, an empty message and `false` are accepted |
+| A budget of thinking tokens and the message injected when it is spent | `--reasoning-budget-tokens` (llama-server's `--reasoning-budget`), `--reasoning-budget-message` | `reasoning_budget_tokens`, `thinking_budget_tokens`, vLLM's `thinking_token_budget` (also on `/v1/responses`), `reasoning_budget_message`; Anthropic's `thinking.budget_tokens` | the guard of the reply (below); `-1` is no budget of the request's own (the model's default holds, as in llama-server); `reasoning_control` (llama-server's route that ends the thinking while it runs) is not built and refused |
 
+*The budget and the guard against loops* (`crates/runtime/src/guard.rs`).
 llama-server keeps the budget in its sampler, which forces the tokens of the
 message and of the closing tag into the sequence once the budget is spent. The
-engine cannot put a token into a sequence that the model did not sample, so a
-request that asks for a budget is refused by name and is not answered without
-one. A request is refused, too, for an effort the template does not read, for
+engine does the same with a rule of the request (`TokenFilter`, around the
+request's own grammar if it has one): every reply gets a `Guard`, which reads
+the reply token by token as text, finds where its thinking opens and closes
+(the tags the template declares; a call the model opens inside its thinking
+ends it too), and counts the thinking's tokens. Once the thinking has taken
+the budget's tokens, after the character a token cut in two is whole, the
+next rows carry a mask of one token each: the tokens of the message and of the
+end of the thinking as the template writes it (`\n</think>\n\n`), which
+the sampler therefore picks whatever it draws; a draft that is not that token
+is cut from the window, and the rows before are free, so the model's drafts
+go on there. The closing tag's tokens are not counted, as in llama.cpp, and
+the usage counts the forced ones with the thinking. A model whose template
+has no thinking has nothing to bound: a request's own budget is refused there
+(`reasoning_budget_tokens`), a model's default does nothing.
+
+The same guard ends a loop, which nothing asks for: the last 512 tokens of
+the thinking going round one cycle of at most 64 tokens end the thinking the
+same way (the answer follows), and in the answer one token 256 times in a row
+ends the reply as a limit would (`length`; Strata's guard against a model that
+writes one token for ever, issue 606 there). A cycle of several tokens is not
+cut in an answer: a matrix of zeros is one. The real-model test is
+`real_messages`, `a_budget_ends_the_thinking_and_the_answer_follows` (the chat
+and the Messages route, the budget and `display: "omitted"`).
+
+A request is refused, too, for an effort the template does not read, for
 `reasoning_effort: "none"` when `enable_thinking` does not change the prompt, and
 for `reasoning_format`, `reasoning_effort` and `chat_template_kwargs` on
 `/v1/completions`, which has no template.
@@ -7306,11 +7329,12 @@ may come in (see "Who may use the server"); `anthropic-version` and
 `anthropic-beta` are not looked at: the server has one version of the API, and
 a field of a beta is served or refused by its name in the body.
 
-- **A budget for thinking** (`thinking.budget_tokens`) is checked and not
-  enforced. The engine has none, and Claude Code sends one with every request
-  that thinks, so a refusal would refuse the client. Thinking is on and as
-  long as the model makes it; `max_tokens` bounds thinking and answer
-  together, as at Anthropic, where the budget is a target too.
+- **A budget for thinking** (`thinking.budget_tokens`) is the chat route's
+  `reasoning_budget_tokens`, as vLLM maps it: the thinking ends there and the
+  answer follows (see the budget under "Thinking"). At Anthropic the budget is
+  a target the model may overshoot; here it is a bound. `max_tokens` bounds
+  thinking and answer together, as at Anthropic. Claude Code 2.1 sends
+  `adaptive` thinking, which has no budget.
 - **Signatures.** A thinking block of a reply carries the fixed signature
   `unsigned`: the server has no secret to sign with, and an empty signature
   may make a client drop the block. A thinking block that comes back is the

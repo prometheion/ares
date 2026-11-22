@@ -311,6 +311,11 @@ pub(crate) fn from_json(
         Endpoint::Chat => (reasoning::asked(&fields)?, tools::asked(&fields)?),
         Endpoint::Completions => (Asked::default(), tools::Asked::default()),
     };
+    let sampling = Sampling {
+        reasoning_budget_tokens: reasoning.budget,
+        reasoning_budget_message: reasoning.budget_message.clone(),
+        ..sampling
+    };
     let request = GenerateRequest {
         model,
         prompt,
@@ -608,6 +613,9 @@ fn sampling(fields: &Fields<'_>) -> Result<Sampling, ApiError> {
         dry_sequence_breakers: breakers(fields)?,
         logit_bias: logit_bias(fields)?,
         ignore_eos: fields.bool("ignore_eos")?.unwrap_or(false),
+        // Read with the rest of thinking (`reasoning::asked`).
+        reasoning_budget_tokens: None,
+        reasoning_budget_message: None,
         samplers: samplers(fields)?,
         logprobs: None,
         seed: seed(fields)?,

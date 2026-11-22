@@ -168,6 +168,17 @@ mod strings {
     }
 }
 
+/// A text, as it is written.
+mod text {
+    pub fn read(text: &str) -> Option<String> {
+        Some(text.to_owned())
+    }
+
+    pub fn show(value: String) -> serde_json::Value {
+        value.into()
+    }
+}
+
 /// The samplers in the order they apply in, by their names.
 mod order {
     use ares_api::SamplerKind;
@@ -269,6 +280,18 @@ pub(crate) const SETTINGS: &[Setting] = &[
         seed,
         seed,
         "a whole number from 0 on (without the option every request draws its own)"
+    ),
+    setting!(
+        "--reasoning-budget-tokens",
+        reasoning_budget_tokens,
+        count,
+        "a number of tokens of thinking, after which the thinking is ended"
+    ),
+    setting!(
+        "--reasoning-budget-message",
+        reasoning_budget_message,
+        text,
+        "a text written before the end of the thinking when its budget is spent"
     ),
 ];
 

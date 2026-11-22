@@ -40,6 +40,8 @@ const VALUES: &[(&str, [&str; 3])] = &[
     ("--mirostat-eta", ["0.1", "0.2", "0.0"]),
     ("--samplers", ["top_k,temperature", "penalties,dry,min_p,temperature", "temperature"]),
     ("--seed", ["42", "7", "0"]),
+    ("--reasoning-budget-tokens", ["1024", "256", "0"]),
+    ("--reasoning-budget-message", ["Time is up.", "Enough, then.", ""]),
 ];
 
 fn setting(flag: &str) -> &'static Setting {
@@ -50,6 +52,9 @@ fn setting(flag: &str) -> &'static Setting {
 fn in_a_request(flag: &str, text: &str) -> Value {
     if flag == "--samplers" {
         return text.split(',').collect::<Vec<_>>().into();
+    }
+    if flag == "--reasoning-budget-message" {
+        return text.into();
     }
     serde_json::from_str(text).expect("the value of an option is JSON")
 }

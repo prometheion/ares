@@ -397,3 +397,85 @@ async fn a_required_call_is_a_tool_use_block_and_its_result_is_answered() {
         (&json!("error"), &json!("invalid_request_error"))
     );
 }
+
+/// A budget of thinking ends the thinking at its number of tokens and the
+/// answer follows: `thinking.budget_tokens` here, `reasoning_budget_tokens`
+/// on the chat route (whose usage counts the tokens of the thinking).
+/// `thinking.display: "omitted"` gives the block an empty text and a
+/// signature the next turn reads it from.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_budget_ends_the_thinking_and_the_answer_follows() {
+    let Some(served) = Served::any() else { return };
+    let app = &served.app;
+    let question = "Think step by step: how many prime numbers are there below 60? \
+                    Then answer with the number.";
+    let budget = 24;
+    let body = json!({
+        "model": "q",
+        "max_tokens": 400,
+        "temperature": 0,
+        "messages": [{"role": "user", "content": question}],
+        "chat_template_kwargs": {"enable_thinking": true},
+        "reasoning_budget_tokens": budget,
+    });
+    let (status, text) = post(app, "/v1/chat/completions", &body).await;
+    assert_eq!(status, 200, "{text}");
+    let reply: Value = serde_json::from_str(&text).unwrap();
+    let thought = reply["usage"]["completion_tokens_details"]["reasoning_tokens"].as_u64().unwrap();
+    let answer = &reply["choices"][0]["message"];
+    println!(
+        "RES a budget of {budget}: {thought} tokens of thinking (the closing tag's among them), \
+         answer {:?}",
+        answer["content"].as_str().unwrap_or_default()
+    );
+    // The budget, then the forced end: a newline and the closing tag.
+    assert!(thought <= budget + 4, "{thought} tokens of thinking: {reply}");
+    assert!(!answer["reasoning_content"].as_str().unwrap_or_default().is_empty(), "{reply}");
+    assert!(!answer["content"].as_str().unwrap_or_default().trim().is_empty(), "{reply}");
+
+    let body = json!({
+        "model": "q",
+        "max_tokens": 400,
+        "temperature": 0,
+        "messages": [{"role": "user", "content": question}],
+        "thinking": {"type": "enabled", "budget_tokens": budget, "display": "omitted"},
+    });
+    let whole = message(app, &body).await;
+    let blocks = whole["content"].as_array().unwrap();
+    assert_eq!(blocks[0]["type"], "thinking", "{whole}");
+    assert_eq!(blocks[0]["thinking"], "");
+    assert!(blocks[0]["signature"].as_str().unwrap().starts_with("ares-reasoning:"));
+    assert!(blocks.iter().any(|b| b["type"] == "text"), "an answer after the thinking: {whole}");
+    // Sent back, the omitted thinking is in the prompt: the count of the
+    // conversation is what it is with the thinking shown.
+    let next = |content: Value| {
+        json!({"model": "q", "messages": [
+            {"role": "user", "content": question},
+            {"role": "assistant", "content": content},
+            {"role": "user", "content": "And below 100?"},
+        ]})
+    };
+    let (_, omitted) = post(app, COUNT, &next(json!(blocks))).await;
+    let mut shown = blocks.clone();
+    let carried = blocks[0]["signature"].as_str().unwrap().trim_start_matches("ares-reasoning:");
+    shown[0] = json!({"type": "thinking", "thinking": decode(carried), "signature": "unsigned"});
+    let (_, counted) = post(app, COUNT, &next(json!(shown))).await;
+    assert_eq!(omitted, counted);
+}
+
+/// Base64 back to text, for the test's own check.
+fn decode(text: &str) -> String {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut bits = 0u32;
+    let mut count = 0;
+    let mut out = Vec::new();
+    for c in text.bytes().filter(|c| *c != b'=') {
+        bits = bits << 6 | ALPHABET.iter().position(|a| *a == c).unwrap() as u32;
+        count += 6;
+        if count >= 8 {
+            count -= 8;
+            out.push((bits >> count) as u8);
+        }
+    }
+    String::from_utf8(out).unwrap()
+}

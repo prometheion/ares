@@ -527,6 +527,10 @@ fn other_name(name: &str) -> Option<&'static str> {
              (penalties,dry,top_k,top_p,min_p,temperature)"
         }
         "s" => "the seed of a request that names none is 'seed'",
+        "reasoning-budget" => {
+            "the budget of thinking tokens of a request that names none is \
+             'reasoning-budget-tokens'"
+        }
         "n" | "predict" | "n-predict" => {
             "the limit of tokens for a request that names none is 'max-tokens'; \
              'max-tokens-limit' is the most any request gets"

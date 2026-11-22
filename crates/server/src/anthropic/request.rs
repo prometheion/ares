@@ -971,9 +971,10 @@ fn tool_choice(fields: &Fields<'_>, tools: &[&str], chat: &mut Chat) -> Result<b
 ///
 /// `enabled` and `adaptive` switch thinking on and `disabled` off; a request
 /// that does not say leaves it to the server's setting. `budget_tokens` is
-/// checked and not enforced: the engine has no budget for thinking, the model
-/// thinks for as long as it does, and `max_tokens` bounds the thinking and
-/// the answer together, as it does at Anthropic.
+/// the budget of thinking tokens of the chat route (`reasoning_budget_tokens`,
+/// as vLLM maps it): the thinking ends there and the answer follows;
+/// `max_tokens` bounds the thinking and the answer together, as it does at
+/// Anthropic.
 fn thinking(fields: &Fields<'_>, chat: &mut Chat) -> Result<bool, ApiError> {
     let at = "thinking";
     let Some(value) = fields.get(at) else {
@@ -1007,7 +1008,9 @@ fn thinking(fields: &Fields<'_>, chat: &mut Chat) -> Result<bool, ApiError> {
     };
     match asked.int("budget_tokens") {
         Ok(None) => {}
-        Ok(Some(budget)) if budget >= 1 => {}
+        Ok(Some(budget)) if budget >= 1 => {
+            chat.push(("reasoning_budget_tokens", Json::Int(budget)))
+        }
         _ => {
             return Err(refuse(at, "thinking.budget_tokens must be a whole number of at least 1"));
         }

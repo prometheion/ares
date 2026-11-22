@@ -60,6 +60,7 @@ mod error;
 mod exec;
 pub mod expert_store;
 mod gpu;
+mod guard;
 mod image;
 mod links;
 mod model;

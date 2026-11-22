@@ -177,6 +177,16 @@ pub struct Sampling {
     pub logprobs: Option<LogprobRequest>,
     /// Makes sampling reproducible. `None` draws a fresh seed.
     pub seed: Option<u64>,
+    /// The most tokens a reply of a model that thinks may think (llama.cpp's
+    /// `reasoning_budget_tokens`, vLLM's `thinking_token_budget`): once its
+    /// thinking has taken this many, the engine has the next rows pick
+    /// [`reasoning_budget_message`](Sampling::reasoning_budget_message) and
+    /// the end of the thinking, and the answer follows. `None`: no budget.
+    pub reasoning_budget_tokens: Option<u32>,
+    /// What is written before the end of the thinking when the budget is
+    /// spent (llama.cpp's `reasoning_budget_message`); `None` or empty:
+    /// nothing.
+    pub reasoning_budget_message: Option<String>,
 }
 
 /// A sampling parameter outside its valid range.

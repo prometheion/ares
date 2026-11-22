@@ -93,6 +93,9 @@ the kernels exist; no model runs there yet.
 ## Output control
 - Reasoning: `reasoning_content` in and out, `--reasoning`, `--reasoning-effort`,
   `--reasoning-preserve`.
+- Thinking budget: `reasoning_budget_tokens` (and llama.cpp's, vLLM's and Anthropic's names),
+  `--reasoning-budget-tokens`, `--reasoning-budget-message`; the thinking ends at the budget and
+  the answer follows. A loop in the thinking ends it; one token repeated 256 times ends a reply.
 - Structured output: `grammar` (GBNF), `response_format` with `json_object` or `json_schema`;
   the thinking stays free.
 - Tool calls: `tools`, `tool_choice` (`auto`, `none`, `required`, a named function),

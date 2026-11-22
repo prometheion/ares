@@ -287,14 +287,19 @@ async fn what_the_template_cannot_do_is_refused_by_name() {
     let error = refused(&app, json!({"reasoning_format": "think"})).await;
     assert_eq!(error["param"], "reasoning_format");
 
-    // A budget for the thinking cannot be kept, and is not answered without.
-    for field in ["reasoning_budget_tokens", "thinking_budget_tokens"] {
-        let error = refused(&app, json!({ field: 256 })).await;
-        assert_eq!(error["param"], field);
-        assert!(error["message"].as_str().unwrap().contains("budget"), "{error}");
+    // A budget for the thinking reaches the engine under every name it has;
+    // the realtime control is not built.
+    for field in ["reasoning_budget_tokens", "thinking_budget_tokens", "thinking_token_budget"] {
+        let (engine, app) = serve(reply(), Some(qwen()), Config::default());
+        let body = chat(json!({ field: 256, "reasoning_budget_message": "Time is up." }));
+        assert_eq!(post(&app, CHAT, &body).await.status(), StatusCode::OK);
+        let sampling = engine.submitted().remove(0).sampling;
+        assert_eq!(sampling.reasoning_budget_tokens, Some(256), "{field}");
+        assert_eq!(sampling.reasoning_budget_message.as_deref(), Some("Time is up."));
     }
-    let error = refused(&app, json!({"reasoning_budget_message": "Time is up."})).await;
-    assert_eq!(error["param"], "reasoning_budget_message");
+    let (_, plain) = serve(reply(), None, Config::default());
+    let error = refused(&plain, json!({"reasoning_budget_tokens": 256})).await;
+    assert!(error["message"].as_str().unwrap().contains("model that thinks"), "{error}");
     let error = refused(&app, json!({"reasoning_control": true})).await;
     assert_eq!(error["param"], "reasoning_control");
     // No budget is not a refusal.

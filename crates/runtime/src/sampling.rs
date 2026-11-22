@@ -72,6 +72,13 @@ pub trait TokenFilter: Send {
         0
     }
 
+    /// Whether the rule ends the reply after `reply`, as a limit of tokens
+    /// would (the guard against a loop, [`crate::guard`]): the request ends
+    /// there with [`FinishReason::Length`](ares_api::FinishReason::Length).
+    fn cut(&mut self, _reply: &[u32]) -> bool {
+        false
+    }
+
     /// Why the rule can no longer be followed, if it cannot (the engine behind
     /// it failed in the middle of the reply). The request ends with an error:
     /// text that goes on without the rule is not what was asked for.
@@ -367,6 +374,15 @@ impl RequestSampler {
         let allowed = filter.admitted(&tokens[prompt_len.min(tokens.len())..], drafts);
         drafts.truncate(allowed);
         chances.truncate(allowed);
+    }
+
+    /// Whether the request's rule ends the reply after `tokens` (the request
+    /// so far, the prompt first).
+    pub fn cuts(&mut self, tokens: &[u32], prompt_len: usize) -> bool {
+        match &mut self.filter {
+            Some(filter) => filter.cut(&tokens[prompt_len.min(tokens.len())..]),
+            None => false,
+        }
     }
 
     /// Why the request's rule failed, if it did.

@@ -22,13 +22,16 @@
 //! | `--reasoning-effort` | start; `reasoning_effort` per request | `reasoning_effort` as a chat variable |
 //! | `--reasoning-preserve` | start (on); `chat_template_kwargs` | `preserve_reasoning` as a chat variable |
 //! | `chat_template_kwargs` | per request | chat variables |
-//! | `--reasoning-budget`, `--reasoning-budget-message` | start; per request | refused: see below |
+//! | `--reasoning-budget-tokens`, `--reasoning-budget-message` | start; `reasoning_budget_tokens`, `thinking_budget_tokens`, vLLM's `thinking_token_budget`, `reasoning_budget_message` per request | the sampler's budget of thinking: see below |
 //!
-//! llama-server enforces a budget of thinking tokens in its sampler, which
-//! forces the tokens of a message and of the closing tag into the sequence once
-//! the budget is spent. This engine has no way to put tokens into a sequence
-//! that the model did not sample, so a request that asks for a budget, or for a
-//! message to be injected, is refused by name and not answered without it.
+//! llama-server enforces a budget of thinking tokens in its sampler: once the
+//! thinking has taken that many tokens it forces the tokens of a message and of
+//! the closing tag into the sequence. The engine does the same with a mask of
+//! one token for each of those rows (`ares-runtime`'s guard), so a request with
+//! a budget is answered with it: `-1` is no budget of its own (the model's
+//! default holds, as in llama-server), and a request whose model does not
+//! think cannot have one. `reasoning_control`, which asks for llama-server's
+//! route that ends the thinking while it runs, is not built and refused.
 //!
 //! # The split
 //!
@@ -60,6 +63,7 @@ pub(crate) const FIELDS: &[&str] = &[
     "chat_template_kwargs",
     "reasoning_budget_tokens",
     "thinking_budget_tokens",
+    "thinking_token_budget",
     "reasoning_budget_message",
     "reasoning_control",
 ];
@@ -108,6 +112,10 @@ pub(crate) struct Asked {
     /// `chat_template_kwargs`, in the order the client wrote them.
     variables: Vec<(String, Json)>,
     effort: Option<String>,
+    /// The budget of thinking tokens the request names, and the message that
+    /// ends the thinking when it is spent.
+    pub budget: Option<u32>,
+    pub budget_message: Option<String>,
 }
 
 /// Reads the fields of a chat request that are about thinking, and refuses
@@ -145,46 +153,55 @@ pub(crate) fn asked(fields: &Fields<'_>) -> Result<Asked, ApiError> {
             ));
         }
     }
-    refuse_budget(fields)?;
-    Ok(Asked { format, variables, effort })
-}
-
-/// A budget of thinking tokens, and what goes with it, cannot be served.
-fn refuse_budget(fields: &Fields<'_>) -> Result<(), ApiError> {
-    let why = "a budget for thinking is not built: the engine cannot put the tokens that end the \
-               thinking into a sequence, so -1 (no budget) is the only value";
-    for name in ["reasoning_budget_tokens", "thinking_budget_tokens"] {
-        match fields.get(name) {
-            None | Some(Json::Int(-1)) => {}
-            Some(Json::Float(f)) if *f == -1.0 => {}
-            Some(Json::Int(_) | Json::Uint(_) | Json::Float(_)) => {
-                return Err(ApiError::invalid_param(
-                    name,
-                    format!("{name} is not supported: {why}"),
-                ));
-            }
-            Some(other) => return Err(wrong_type(name, "a number", other)),
-        }
-    }
-    match fields.get("reasoning_budget_message") {
-        None => {}
-        Some(Json::String(text)) if text.is_empty() => {}
-        Some(Json::String(_)) => {
+    let budget = budget(fields)?;
+    let budget_message = match fields.get("reasoning_budget_message") {
+        None => None,
+        Some(Json::String(text)) => Some(text.clone()),
+        Some(other) => return Err(wrong_type("reasoning_budget_message", "a string", other)),
+    };
+    match fields.get("reasoning_control") {
+        None | Some(Json::Bool(false)) => {}
+        Some(Json::Bool(true)) => {
             return Err(ApiError::invalid_param(
-                "reasoning_budget_message",
-                format!("reasoning_budget_message is not supported: {why}"),
+                "reasoning_control",
+                "reasoning_control is not supported: the route that ends the thinking while it \
+                 runs (llama-server's /v1/chat/completions/control) is not built; a budget \
+                 (reasoning_budget_tokens) ends it at a number of tokens",
             ));
         }
-        Some(other) => return Err(wrong_type("reasoning_budget_message", "a string", other)),
+        Some(other) => return Err(wrong_type("reasoning_control", "a boolean", other)),
     }
-    match fields.get("reasoning_control") {
-        None | Some(Json::Bool(false)) => Ok(()),
-        Some(Json::Bool(true)) => Err(ApiError::invalid_param(
-            "reasoning_control",
-            format!("reasoning_control is not supported: {why}"),
-        )),
-        Some(other) => Err(wrong_type("reasoning_control", "a boolean", other)),
+    Ok(Asked { format, variables, effort, budget, budget_message })
+}
+
+/// The budget of thinking tokens a request names: llama.cpp's
+/// `reasoning_budget_tokens` or `thinking_budget_tokens`, or vLLM's
+/// `thinking_token_budget`, a number of tokens or -1 for none of its own. Two
+/// of them that name different budgets are refused.
+fn budget(fields: &Fields<'_>) -> Result<Option<u32>, ApiError> {
+    let mut found: Option<(&str, Option<u32>)> = None;
+    for name in ["reasoning_budget_tokens", "thinking_budget_tokens", "thinking_token_budget"] {
+        let value = match fields.int(name)? {
+            None => continue,
+            Some(-1) => None,
+            Some(n) => Some(u32::try_from(n).map_err(|_| {
+                ApiError::invalid_param(
+                    name,
+                    format!("{name} must be a number of tokens from 0 on, or -1 for none, got {n}"),
+                )
+            })?),
+        };
+        match found {
+            Some((first, before)) if before != value => {
+                return Err(ApiError::invalid_param(
+                    name,
+                    format!("{first} and {name} name different budgets: give one"),
+                ));
+            }
+            _ => found = Some((name, value)),
+        }
     }
+    Ok(found.and_then(|(_, value)| value))
 }
 
 /// What a request comes to for its reply.
@@ -263,6 +280,13 @@ fn plan(
     thinking: Option<&ThinkingFormat>,
     default: ReasoningFormat,
 ) -> Result<Plan, ApiError> {
+    if asked.budget.is_some() && thinking.is_none() {
+        return Err(ApiError::invalid_param(
+            "reasoning_budget_tokens",
+            "a budget of thinking tokens is for a model that thinks: the chat template of this \
+             model has no thinking",
+        ));
+    }
     let mut variables = asked.variables.clone();
     let mut set = |name: &str, value: Json| {
         variables.retain(|(known, _)| known != name);

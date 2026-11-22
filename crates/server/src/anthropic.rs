@@ -51,13 +51,13 @@
 //!
 //! # Decisions
 //!
-//! **A budget for thinking.** `thinking.budget_tokens` is checked and not
-//! enforced. The engine has no budget for thinking (see the `reasoning`
-//! module), and a client such as Claude Code sends one with every request that
-//! thinks, so refusing it would refuse the client. What the request gets is
-//! thinking that is on and as long as the model makes it; `max_tokens` bounds
-//! the thinking and the answer together, as it does at Anthropic, where the
-//! budget is a target and no hard limit either.
+//! **A budget for thinking.** `thinking.budget_tokens` is the chat route's
+//! `reasoning_budget_tokens` (vLLM maps it the same way): once the thinking
+//! has taken that many tokens the engine ends it, as llama-server's sampler
+//! does (see the `reasoning` module), and the answer follows. At Anthropic the
+//! budget is a target the model may overshoot; here it is a bound, which is
+//! what a client that sets one counts on. `max_tokens` bounds the thinking and
+//! the answer together, as it does at Anthropic.
 //!
 //! **Signatures.** A thinking block of a reply carries the signature
 //! [`reply::SIGNATURE`], a fixed text: the server has no secret to sign with.
