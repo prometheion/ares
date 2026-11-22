@@ -34,6 +34,9 @@ the kernels exist; no model runs there yet.
 - The token embedding stays in host RAM (27B: page-locked, 380 to 518 MiB of VRAM saved on the
   first card; Flash-Next: the mapped file): a step stages its rows and the card decodes them.
 - Flash-Next: experts a prompt misses pass through transit slots; nothing is evicted for them.
+- Flash-Next: the CPU computes a missed expert from its bytes in RAM with kernels for the types of
+  the Flash-Next files (AVX2 and AVX-VNNI, portable code on older CPUs), and uploads it on loan
+  behind that while the link has room.
 - Flash-Next: the routers of the next two layers, applied on the card, predict a step's
   picks; the store reads ahead from the SSD what no tier holds where such predictions have
   been picked more often than not, behind every demand read and into RAM nobody uses.

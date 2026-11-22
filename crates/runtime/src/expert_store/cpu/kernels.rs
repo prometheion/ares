@@ -1141,11 +1141,11 @@ pub(super) unsafe fn down_rows_decoded(
     ty: GgmlType,
     experts: &[DownExpert<'_>],
     n_ff: usize,
-    n_out: usize,
     n_rows: usize,
     first: usize,
     count: usize,
     out: *mut f32,
+    stride: usize,
 ) {
     let pairs: usize = experts.iter().map(|e| e.hidden.len()).sum();
     let mut h = vec![0.0f32; pairs * n_ff];
@@ -1171,7 +1171,7 @@ pub(super) unsafe fn down_rows_decoded(
         for (b, total) in total.iter().enumerate().take(n_rows) {
             // SAFETY: value j of row b is inside `out`, and this range of j
             // is this call's alone.
-            unsafe { *out.add(b * n_out + j) = *total };
+            unsafe { *out.add(b * stride + j - first) = *total };
         }
     }
 }
@@ -1703,7 +1703,7 @@ pub(super) struct DownExpert<'a> {
 
 /// Output values `first .. first + count` of every row of the step: the sum
 /// over `experts`, in their order, of `weight * (down_row . hidden)`, written
-/// to `out[row * n_out + j]`.
+/// to `out[row * stride + j - first]`.
 ///
 /// # Safety
 ///
@@ -1711,8 +1711,8 @@ pub(super) struct DownExpert<'a> {
 /// `down` must address `n_out` rows of `n_ff` values of `kind`'s type with
 /// `first + count <= n_out`; an expert's `hidden`, `row` and `weight` are as long as
 /// each other (1 to 8), the hiddens complete for `n_ff` values; `out` must
-/// address `n_rows * n_out` values of which nobody else writes this range,
-/// and every `row` be below `n_rows`.
+/// address `(n_rows - 1) * stride + count` values (`stride >= count`) of which
+/// nobody else writes these, and every `row` be below `n_rows`.
 #[allow(clippy::too_many_arguments)]
 #[target_feature(enable = "avx2,fma,f16c")]
 pub(super) unsafe fn down_rows(
@@ -1721,17 +1721,17 @@ pub(super) unsafe fn down_rows(
     kind: DownKind,
     experts: &[DownExpert<'_>],
     n_ff: usize,
-    n_out: usize,
     n_rows: usize,
     first: usize,
     count: usize,
     out: *mut f32,
+    stride: usize,
 ) {
     let (blocks, row_bytes) = match kind {
         DownKind::Other(ty) => {
             // SAFETY: the caller's guarantees are the function's.
             return unsafe {
-                down_rows_decoded(true, ty, experts, n_ff, n_out, n_rows, first, count, out)
+                down_rows_decoded(true, ty, experts, n_ff, n_rows, first, count, out, stride)
             };
         }
         DownKind::Q2_0 => (n_ff / 64, n_ff / 64 * 18),
@@ -1806,7 +1806,7 @@ pub(super) unsafe fn down_rows(
         for (b, total) in total.iter().enumerate().take(n_rows) {
             // SAFETY: value j of row b is inside `out`, and this range of j
             // is this call's alone.
-            unsafe { *out.add(b * n_out + j) = *total };
+            unsafe { *out.add(b * stride + j - first) = *total };
         }
     }
 }

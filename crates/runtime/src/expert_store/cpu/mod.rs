@@ -280,14 +280,29 @@ struct JobExpert {
     weight: Vec<f32>,
 }
 
+/// A task of a job.
+#[derive(Clone, Copy, Debug)]
+enum Task {
+    /// Hidden values `32 tile ..` of expert `expert` for the rows that use it.
+    GateUp { expert: u32, tile: u32 },
+    /// Output values `64 chunk ..` of expert `expert`'s down product for the
+    /// rows that use it, added to the job's sums after those of the experts
+    /// before it.
+    Down { expert: u32, chunk: u32 },
+}
+
 /// The experts of one layer that the CPU computes for one step.
 ///
 /// The job owns a copy of the rows' activations and everything it computes;
-/// the weights it only points at. Its work is a list of tasks (first the
-/// gate and up product of every expert in pieces of 32 hidden values, then
-/// the down products in pieces of 64 output values) that threads claim one
-/// by one, so however many take part, each task runs once and the result
-/// does not depend on who ran it.
+/// the weights it only points at. Its work is a list of tasks that threads
+/// claim one by one, so however many take part, each task runs once and the
+/// result does not depend on who ran it: the gate and up product of every
+/// expert in pieces of 32 hidden values, and its down product in pieces of 64
+/// output values, which start when the expert's hidden values are complete.
+/// The down products of an expert come after the gate and up pieces of the
+/// next one: so the reads of down, which the memory bounds, run beside the
+/// decoding of gate and up, which the cores bound. The pieces of a chunk of
+/// the output are added up in the order of the experts.
 pub struct LayerJob {
     kind: GateKind,
     down: DownKind,
@@ -302,12 +317,22 @@ pub struct LayerJob {
     sum8: Vec<Lanes16>,
     /// For a gate type of Q2_0: the activations in plane order.
     planes: Planes,
-    hidden_q: Scratch<i8>,
-    hidden_sum: Scratch<i32>,
-    hidden_scale: Scratch<f32>,
-    /// Hidden values per pair in the arrays above: `n_ff` rounded up to 128.
-    hidden_stride: usize,
+    /// The memory of the hidden values that `hiddens` point into: the codes,
+    /// their sums and scales of every 16 values, `n_ff` rounded up to 128 per
+    /// pair. It is only held here.
+    _hidden_memory: (Scratch<i8>, Scratch<i32>, Scratch<f32>),
     out: Scratch<f32>,
+    /// The hidden values of every pair, as the down kernels read them.
+    hiddens: Vec<Hidden>,
+    /// The tasks in the order they are claimed.
+    schedule: Vec<Task>,
+    /// Per expert, the gate and up tasks that have not ended.
+    tiles_left: Vec<AtomicUsize>,
+    /// Per chunk of the output, how many experts have added their part.
+    chunk_parts: Vec<AtomicUsize>,
+    /// The place in `schedule` after the last gate and up task of the last
+    /// expert: the pieces a slow thread leaves to the fast ones.
+    last_gate_up_end: usize,
     gate_up_tasks: usize,
     tasks: usize,
     next: AtomicUsize,
@@ -413,8 +438,43 @@ impl LayerJob {
             pairs += list.last().map_or(0, |e| e.row.len());
         }
         let hidden_stride = n_ff.next_multiple_of(128);
-        let gate_up_tasks = list.len() * (n_ff / TILE);
-        let tasks = gate_up_tasks + if list.is_empty() { 0 } else { n_in.div_ceil(DOWN_ROWS) };
+        let (tiles, chunks) = (n_ff / TILE, n_in.div_ceil(DOWN_ROWS));
+        let gate_up_tasks_of =
+            |e: usize| (0..tiles).map(move |t| Task::GateUp { expert: e as u32, tile: t as u32 });
+        let down_tasks_of =
+            |e: usize| (0..chunks).map(move |c| Task::Down { expert: e as u32, chunk: c as u32 });
+        let mut schedule = Vec::with_capacity(list.len() * (tiles + chunks));
+        let mut last_gate_up_end = 0;
+        for e in 0..list.len() {
+            schedule.extend(gate_up_tasks_of(e));
+            last_gate_up_end = schedule.len();
+            if e > 0 {
+                schedule.extend(down_tasks_of(e - 1));
+            }
+        }
+        if !list.is_empty() {
+            schedule.extend(down_tasks_of(list.len() - 1));
+        }
+        let n_experts = list.len();
+        let gate_up_tasks = n_experts * tiles;
+        let tasks = schedule.len();
+        let hidden_q = Scratch::new(pairs * hidden_stride, 0);
+        let hidden_sum = Scratch::new(pairs * hidden_stride / 16, 0);
+        let hidden_scale = Scratch::new(pairs * hidden_stride / 16, 0.0);
+        let hiddens = (0..pairs)
+            .map(|p| {
+                let at = p * hidden_stride;
+                // SAFETY: a pair's part of the three arrays, inside them by
+                // how they were sized.
+                unsafe {
+                    Hidden {
+                        q: hidden_q.ptr.add(at),
+                        sum: hidden_sum.ptr.add(at / 16),
+                        scale: hidden_scale.ptr.add(at / 16),
+                    }
+                }
+            })
+            .collect();
         let job = Self {
             kind,
             down,
@@ -428,11 +488,13 @@ impl LayerJob {
             ds,
             sum8,
             planes,
-            hidden_q: Scratch::new(pairs * hidden_stride, 0),
-            hidden_sum: Scratch::new(pairs * hidden_stride / 16, 0),
-            hidden_scale: Scratch::new(pairs * hidden_stride / 16, 0.0),
-            hidden_stride,
+            tiles_left: (0..n_experts).map(|_| AtomicUsize::new(tiles)).collect(),
+            chunk_parts: (0..chunks).map(|_| AtomicUsize::new(0)).collect(),
+            _hidden_memory: (hidden_q, hidden_sum, hidden_scale),
             out: Scratch::new(n_rows * n_in, 0.0),
+            hiddens,
+            schedule,
+            last_gate_up_end,
             gate_up_tasks,
             tasks,
             next: AtomicUsize::new(0),
@@ -468,16 +530,7 @@ impl LayerJob {
     }
 
     fn hidden(&self, pair: usize) -> Hidden {
-        let at = pair * self.hidden_stride;
-        // SAFETY: a pair's part of the three arrays, inside them by how
-        // `new` sized them.
-        unsafe {
-            Hidden {
-                q: self.hidden_q.ptr.add(at),
-                sum: self.hidden_sum.ptr.add(at / 16),
-                scale: self.hidden_scale.ptr.add(at / 16),
-            }
-        }
+        self.hiddens[pair]
     }
 
     /// The index of the job's gate type in a [`ThreadSpeed`].
@@ -486,17 +539,26 @@ impl LayerJob {
     }
 
     /// Runs task `index`, which the caller has claimed. A down task must
-    /// not start before the last gate and up task has ended.
+    /// not start before its expert's gate and up tasks have ended.
     fn run_task(&self, index: usize, speed: &ThreadSpeed) {
         let tables = tables::tables();
-        if index < self.gate_up_tasks {
+        match self.schedule[index] {
+            Task::GateUp { expert, tile } => {
+                self.gate_up(tables, expert as usize, tile as usize, speed);
+            }
+            Task::Down { expert, chunk } => self.down(tables, expert as usize, chunk as usize),
+        }
+    }
+
+    /// Hidden values `32 tile ..` of `expert` for the rows that use it.
+    fn gate_up(&self, tables: &tables::Tables, e: usize, tile: usize, speed: &ThreadSpeed) {
+        {
             let gather = match self.features.decode {
                 Decode::Fastest => speed.gather[self.kind_index()],
                 Decode::Gather => true,
                 Decode::Loads => false,
             };
-            let tiles = self.n_ff / TILE;
-            let expert = &self.experts[index / tiles];
+            let expert = &self.experts[e];
             let mut rows = [RowIn {
                 q: self.q.as_ptr(),
                 ds: self.ds.as_ptr(),
@@ -517,7 +579,7 @@ impl LayerJob {
                 };
                 hidden[n] = self.hidden(expert.first_pair + n);
             }
-            let (n, tile, order) = (expert.row.len(), index % tiles, self.down.order());
+            let (n, order) = (expert.row.len(), self.down.order());
             // SAFETY: a written kind is only made where `Features::detect`
             // found x86-64-v3 (`new`); the matrices are the creator's
             // guarantee; the rows and hiddens are the job's own, sized by
@@ -551,55 +613,76 @@ impl LayerJob {
                     ),
                 }
             }
+            self.tiles_left[e].fetch_sub(1, Ordering::AcqRel);
             if self.gate_up_done.fetch_add(1, Ordering::AcqRel) + 1 == self.gate_up_tasks {
                 let ns = self.created.elapsed().as_nanos() as u64;
                 self.gate_up_finished.store(ns, Ordering::Relaxed);
             }
-        } else {
-            let first = (index - self.gate_up_tasks) * DOWN_ROWS;
-            let count = DOWN_ROWS.min(self.n_out - first);
-            let hiddens: Vec<Hidden> = (0..self.pairs()).map(|p| self.hidden(p)).collect();
-            let experts: Vec<DownExpert<'_>> = self
-                .experts
-                .iter()
-                .map(|e| DownExpert {
-                    down: e.down,
-                    hidden: &hiddens[e.first_pair..e.first_pair + e.row.len()],
-                    row: &e.row,
-                    weight: &e.weight,
-                })
-                .collect();
-            let (n_ff, n_out, n_rows, out) = (self.n_ff, self.n_out, self.n_rows, self.out.ptr);
-            // SAFETY: as above; the hidden values are complete, and this
-            // range of the output is this task's alone.
-            unsafe {
-                match self.down {
-                    DownKind::Other(ty) => kernels::down_rows_decoded(
-                        self.features.vector,
-                        ty,
-                        &experts,
-                        n_ff,
-                        n_out,
-                        n_rows,
-                        first,
-                        count,
-                        out,
-                    ),
-                    kind => kernels::down_rows(
-                        tables,
-                        self.features.vnni,
-                        kind,
-                        &experts,
-                        n_ff,
-                        n_out,
-                        n_rows,
-                        first,
-                        count,
-                        out,
-                    ),
-                }
+        }
+    }
+
+    /// Output values `64 chunk ..` of `expert`'s down product, added to the
+    /// sums after the parts of the experts before it.
+    fn down(&self, tables: &tables::Tables, e: usize, chunk: usize) {
+        let expert = &self.experts[e];
+        let first = chunk * DOWN_ROWS;
+        let count = DOWN_ROWS.min(self.n_out - first);
+        let part = DownExpert {
+            down: expert.down,
+            hidden: &self.hiddens[expert.first_pair..expert.first_pair + expert.row.len()],
+            row: &expert.row,
+            weight: &expert.weight,
+        };
+        let mut sums = [0.0f32; MAX_ROWS * DOWN_ROWS];
+        let (n_ff, n_rows, out) = (self.n_ff, self.n_rows, sums.as_mut_ptr());
+        // SAFETY: as for the gate and up tasks; the expert's hidden values are
+        // complete (the caller waited for its gate and up tasks), and the
+        // sums are this task's own, `DOWN_ROWS` per row.
+        unsafe {
+            match self.down {
+                DownKind::Other(ty) => kernels::down_rows_decoded(
+                    self.features.vector,
+                    ty,
+                    std::slice::from_ref(&part),
+                    n_ff,
+                    n_rows,
+                    first,
+                    count,
+                    out,
+                    DOWN_ROWS,
+                ),
+                kind => kernels::down_rows(
+                    tables,
+                    self.features.vnni,
+                    kind,
+                    std::slice::from_ref(&part),
+                    n_ff,
+                    n_rows,
+                    first,
+                    count,
+                    out,
+                    DOWN_ROWS,
+                ),
             }
         }
+        // The parts of a chunk are added in the order of the experts: the
+        // part before this one is claimed earlier and ends soon.
+        while self.chunk_parts[chunk].load(Ordering::Acquire) < e {
+            std::hint::spin_loop();
+        }
+        for &b in &expert.row {
+            let b = usize::from(b);
+            // SAFETY: values `first .. first + count` of row b are inside the
+            // output, and only the part of this chunk whose turn it is
+            // writes them.
+            let row = unsafe {
+                std::slice::from_raw_parts_mut(self.out.ptr.add(b * self.n_out + first), count)
+            };
+            for (out, part) in row.iter_mut().zip(&sums[b * DOWN_ROWS..]) {
+                *out += *part;
+            }
+        }
+        self.chunk_parts[chunk].store(e + 1, Ordering::Release);
     }
 
     /// Whether every task has been claimed: a thread that finds this has
@@ -616,9 +699,9 @@ impl LayerJob {
 
     /// [`LayerJob::work`] as a member of `team`. Tasks are claimed one at a
     /// time, so threads share a job by their speed; but a slow thread that
-    /// took one of the last gate and up tiles would hold everyone up for the
-    /// time of its tile, so it leaves them when the fast threads will have
-    /// done what is left sooner than it would finish one.
+    /// took one of the last gate and up tiles of the last expert would hold
+    /// everyone up for the time of its tile, so it leaves them when the fast
+    /// threads will have done what is left sooner than it would finish one.
     pub(crate) fn work_in(&self, team: Option<&Team>) {
         let speed = thread_speed(self.features.vector);
         let kind = self.kind_index();
@@ -629,8 +712,10 @@ impl LayerJob {
             if seen >= self.tasks {
                 break;
             }
-            if let (true, Some(team)) = (slow && seen < self.gate_up_tasks, team) {
-                let left = (self.gate_up_tasks - seen) as u64;
+            let last_tiles =
+                seen < self.last_gate_up_end && self.last_gate_up_end - seen <= self.n_ff / TILE;
+            if let (true, Some(team)) = (slow && last_tiles, team) {
+                let left = (self.last_gate_up_end - seen) as u64;
                 let by_the_fast =
                     left * u64::from(team.fast_tile_ns[kind]) / u64::from(team.fast[kind].max(1));
                 if by_the_fast < u64::from(speed.tile_ns[kind]) {
@@ -644,10 +729,10 @@ impl LayerJob {
             if index >= self.tasks {
                 break;
             }
-            if index >= self.gate_up_tasks {
-                // The down products read every hidden value: they start
-                // when the last gate and up task has ended.
-                while self.gate_up_done.load(Ordering::Acquire) < self.gate_up_tasks {
+            if let Task::Down { expert, .. } = self.schedule[index] {
+                // A down product reads every hidden value of its expert: it
+                // starts when the expert's last gate and up task has ended.
+                while self.tiles_left[expert as usize].load(Ordering::Acquire) > 0 {
                     std::hint::spin_loop();
                 }
             }

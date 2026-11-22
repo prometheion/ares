@@ -3471,11 +3471,24 @@ the many-row kernels also take the width in steps of 128 and the inner width in 
   The kernels are in five modules (`expertrows.cu`, `expertrows_{k,i,l,f}.cu`) that compile
   side by side, and whether the sum is atomic or ordered is an argument of the down kernel,
   not a kernel of its own.
-- *On the CPU* (`cpu/kernels.rs`). IQ2_S, IQ2_XXS and IQ1_M as gate and up and Q2_0 as down
-  have kernels that multiply the file's bytes. Every other type and role is decoded row by
-  row with the reference decoder (`ares_quant::dequantize`) and multiplied in f32 with the
-  same rounded activations, once for all the rows of the step that use the expert. The
-  decoding is what such an expert costs (table below).
+- *On the CPU* (`cpu/kernels.rs`). The types of the Flash-Next files have kernels that
+  multiply the file's bytes with exact integer sums per 32 values, as the device does: as
+  gate and up IQ2_S, IQ2_XXS, IQ1_M, IQ3_XXS (UD-Q3_K_XL), IQ4_XS (UD-Q3_K_XL), Q4_K and
+  Q5_K (UD-Q4_K_XL) and Q2_0 (the MTP block); as down Q2_0 and the types of blocks of 32
+  values Q4_0, Q4_1, Q5_0, Q5_1, Q8_0 and IQ4_NL (`Block32`). IQ3_XXS looks its codebook up
+  by a gather or by eight loads (each worker measures which is faster on its core, as for
+  the IQ2 types), IQ4_XS and IQ4_NL their 16 levels by a shuffle; Q4_K and Q5_K multiply
+  their unsigned codes and take the minimum from the sum of the activations, which the
+  activations carry per 32 values; Q2_0 as gate and up runs the down kernel of Q2_0 on the
+  activations laid out in the order of its bit planes once per job (`Planes`). The down
+  kernels of `Block32` multiply hidden codes stored in the order of their values (Q2_0's in
+  the order of its planes, `Order`), with `maddubs` or AVX-VNNI's `dpbusd`, and take an
+  offset off the integer sum (Q4_0, Q5_0). Every other type and role is decoded row by row
+  with the reference decoder (`ares_quant::dequantize`) and multiplied in f32 with the same
+  rounded activations, once for all the rows of the step that use the expert; the decoding
+  is what such an expert costs (table below). The written kernels need x86-64-v3 (AVX2,
+  FMA, F16C, BMI2); on a CPU without it every type goes through the decoded path in
+  portable code (`Features::vector`), which before refused the CPU half altogether.
 - *The cost model* (`CostModel` in `expert_store/hybrid.rs`) times CPU jobs per pair of
   types (gate and up, down): each pair a model has is calibrated by itself when the store
   gets its CPU half, and a job's time is recorded under its layer's pair. Before, every gate
