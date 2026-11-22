@@ -653,6 +653,19 @@ impl<D: SlotDevice> ExpertStore<D> {
         let ranges: Vec<_> = ranges.collect();
         let id = self.next_read;
         self.next_read += 1;
+        // A guess is a prefetch, which the reader keeps behind every read a step waits for
+        // and to a few small chunks at the drive, so that a step of a few rows never waits
+        // long behind one. While VRAM is lent, a prompt is read alone (in lent steps, or
+        // layer by layer, whose pass only steps of other requests interrupt), and it reads
+        // nearly every expert no tier holds, layer after layer: there the guesses of the next
+        // layer are what the drive should read as soon as the layer's own misses are on their
+        // way, at the depth the drive gives, and so they go as demand reads, behind the misses
+        // that were asked for before them.
+        let class = if demand || self.scratch.iter().any(Option::is_some) {
+            Class::Demand
+        } else {
+            Class::Prefetch
+        };
         let mut bytes = 0;
         for (part, range) in ranges.iter().enumerate() {
             let span = self.reader.span(range.file, range.offset, range.len)?;
@@ -666,7 +679,7 @@ impl<D: SlotDevice> ExpertStore<D> {
                 file: range.file,
                 offset: range.offset,
                 len: range.len,
-                class: if demand { Class::Demand } else { Class::Prefetch },
+                class,
                 buffer,
             };
             self.reader.submit(read).map_err(|rejected| StoreError::Io(rejected.error))?;

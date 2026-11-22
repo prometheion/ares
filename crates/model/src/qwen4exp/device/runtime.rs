@@ -701,7 +701,10 @@ pub fn widest_rows<E>(
 /// good, which the slots lose, as do the parcels a split by layers hands the
 /// residual over in (80 KiB a row on the receiving device); what is estimated
 /// here leaves a tenth of the lendable_scratch room spare for what the plan of the
-/// store takes besides (transit).
+/// store takes besides (transit). `drafter` is what the drafters take of the bytes for
+/// slots on the device with the head (the MTP block's experts stay resident there), which
+/// the slots of that device do not have.
+#[allow(clippy::too_many_arguments)]
 pub fn batch_rows(
     gguf: &Gguf,
     devices: &[Device],
@@ -710,6 +713,7 @@ pub fn batch_rows(
     pages: u32,
     page_bytes: &[u64],
     asked: u32,
+    drafter: u64,
 ) -> Result<u32, OpenError> {
     let config = Config::from_gguf(gguf)?;
     let weights = Weights::load(gguf, &config)?;
@@ -757,7 +761,8 @@ pub fn batch_rows(
             };
             let extra = f.step_bytes(&wide).saturating_sub(g.step_bytes(&narrow)) + lanes;
             let pool = u64::from(pages) * page_bytes.get(d).copied().unwrap_or(0);
-            let room = plan.slots.saturating_sub(pool + extra);
+            let drafters = if plan.head { drafter } else { 0 };
+            let room = plan.slots.saturating_sub(pool + extra + drafters);
             let (all, pools) = &rounds[d];
             let per_layer = (room / (*all).max(1)).saturating_sub(floor);
             let pieces: Vec<u64> = pools.iter().map(|sum| per_layer * sum / 10 * 9).collect();

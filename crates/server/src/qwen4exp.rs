@@ -403,6 +403,7 @@ pub(crate) fn load(
             pages,
             &page_bytes,
             asked,
+            drafter_bytes,
         )
         .map_err(|e| LoadError::Model(e.to_string()))?;
         if options.batch.is_some_and(|b| max_rows < b) {
