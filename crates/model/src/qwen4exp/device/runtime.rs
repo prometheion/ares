@@ -605,8 +605,10 @@ const WIDE_ROWS: u32 = 4096;
 /// each of its layers (the store's floor for a loan); a step of more rows also
 /// keeps the rest of what it needs (its inputs, its exchange, its predictions,
 /// about 50 KiB a row on Flash-Next against 0.5 to 0.7 MiB of scratch) for
-/// good, which the slots lose, and what is estimated here leaves a tenth of the
-/// lendable room spare for what the plan of the store takes besides (transit).
+/// good, which the slots lose, as do the parcels a split by layers hands the
+/// residual over in (80 KiB a row on the receiving device); what is estimated
+/// here leaves a tenth of the lendable room spare for what the plan of the
+/// store takes besides (transit).
 pub fn batch_rows(
     gguf: &Gguf,
     devices: &[Device],
@@ -634,7 +636,14 @@ pub fn batch_rows(
                 return false;
             };
             let plan = &placement.devices[d];
-            let extra = f.step_bytes(&wide).saturating_sub(g.step_bytes(&narrow));
+            // A split by layers hands the residual of a step's rows to the next
+            // device in a ring of two parcels, which the receiver holds.
+            let lanes = if placement.tensor.is_none() && d > 0 {
+                2 * u64::from(rows - own) * config.wide() as u64 * 4
+            } else {
+                0
+            };
+            let extra = f.step_bytes(&wide).saturating_sub(g.step_bytes(&narrow)) + lanes;
             let pool = u64::from(pages) * page_bytes.get(d).copied().unwrap_or(0);
             let room = plan.slots.saturating_sub(pool + extra);
             let held = floor * plan.experts / config.experts.count as u64;
