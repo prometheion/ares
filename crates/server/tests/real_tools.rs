@@ -22,7 +22,7 @@
 //!     cargo test --release -p ares-server --test real_tools -- --test-threads=1 --nocapture
 //! ```
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use ares_api::Engine;
@@ -142,7 +142,7 @@ impl Served {
         Self::serve(model, config, devices, path)
     }
 
-    fn serve(model: Qwen35, config: RuntimeConfig, devices: Vec<Device>, path: &PathBuf) -> Self {
+    fn serve(model: Qwen35, config: RuntimeConfig, devices: Vec<Device>, path: &Path) -> Self {
         let as_model: Arc<dyn Model> = Arc::new(model);
         let gpu = GpuConfig::new(&config, &*as_model);
         let runtime = Arc::new(Runtime::start_gpu(as_model, devices, config, gpu).unwrap());
@@ -151,7 +151,7 @@ impl Served {
             app: ares_server::router(engine.clone()),
             engine,
             runtime: Some(runtime),
-            path: path.clone(),
+            path: path.to_path_buf(),
             repeatable: true,
             _loaded: None,
         }
