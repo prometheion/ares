@@ -19,10 +19,13 @@
 //!   read for nothing then costs the drive no more than the reads that are used save the
 //!   steps. Where the tiers hold little (one card, a small RAM tier, a large file) more
 //!   places qualify; where they hold nearly everything few do, and nothing is read.
-//! - **In flight**: at most as many experts as the drives take of prefetches at once
-//!   ([`ares_io::Reader::prefetch_room`]). The reader keeps every prefetch behind every
-//!   demand read and halves the prefetch chunks at a drive while a demand chunk is there, so
-//!   a demand read shares the drive with at most a few chunks of 512 KiB.
+//! - **In flight**: the experts the drives take of prefetches at once
+//!   ([`ares_io::Reader::prefetch_room`]) and one more queued behind them, so that a
+//!   prefetch chunk is there for the drive to take whenever one comes back (with experts of
+//!   3 MiB, as UD-Q4_K_XL has, the room held less than one, and the drive read one expert
+//!   ahead at a time). The reader keeps every prefetch behind every demand read and halves
+//!   the prefetch chunks at a drive while a demand chunk is there, so a demand read shares
+//!   the drive with at most a few chunks of 512 KiB however many are queued.
 //! - **Bytes per step**: at most what the drive could read in the time of a step beside
 //!   what the step reads on demand (the drive's measured pace, a mean of the step's time and
 //!   of its demand bytes over the steps that predicted).
@@ -131,7 +134,7 @@ impl Ahead {
     pub(super) fn new(layers: &[Geometry], reader: &Reader) -> Self {
         let expert_bytes =
             layers.iter().map(|g| g.lens.iter().sum::<usize>() as u64).max().unwrap_or(1).max(1);
-        let lanes = (reader.prefetch_room() as u64).div_ceil(expert_bytes).max(1) as usize;
+        let lanes = (reader.prefetch_room() as u64).div_ceil(expert_bytes) as usize + 1;
         Self {
             named: HashMap::new(),
             odds: Odds::default(),

@@ -616,7 +616,8 @@ fn a_fill_gets_the_expert_whose_read_ahead_was_cancelled_on_its_way() {
 #[test]
 fn reads_ahead_keep_to_what_the_drive_takes_of_prefetches() {
     // The reader takes one chunk of 256 bytes of prefetches at once: less than an expert,
-    // so one read ahead is on its way at a time.
+    // so two reads ahead are on their way at a time, the one at the drive and one queued
+    // behind it.
     let reader = Config { prefetch_depth: 1, prefetch_chunk: 256, ..Config::default() };
     let mut rig = rig_reading(4, 8, None, reader, recent_first);
     rig.predict_steps(2, 17, 3, 3);
@@ -627,9 +628,9 @@ fn reads_ahead_keep_to_what_the_drive_takes_of_prefetches() {
     let named = cold(&rig, 1, 3);
     rig.store.ahead(1, &named, 1, 1);
     rig.store.poll().unwrap();
-    assert_eq!(rig.store.stats().ahead_reads, 1, "one in flight");
+    assert_eq!(rig.store.stats().ahead_reads, 2, "two in flight");
     rig.settle_guesses(|store| named.iter().all(|e| store.in_ram(1, *e)));
-    assert_eq!(rig.store.stats().ahead_reads, 3, "the others follow, one at a time");
+    assert_eq!(rig.store.stats().ahead_reads, 3, "the third follows");
     rig.store.routed(1, &named[1..2]).unwrap();
     rig.settle();
     rig.store.end_step().unwrap();
