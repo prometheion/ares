@@ -16,12 +16,13 @@
 //! |---|---|
 //! | `model`, `max_tokens`, `temperature`, `top_p`, `top_k`, `stream` | as on the chat route; `max_tokens` is required |
 //! | `system` | a string or text blocks: one system message |
-//! | `messages` | `user` and `assistant` turns, a string or blocks; see below |
+//! | `messages` | `user`, `assistant` and `system` turns, a string or blocks; see below |
 //! | `tools` | `name`, `description`, `input_schema`: the tools of the chat request |
 //! | `tool_choice` | `auto`, `any` (a call is required), `tool` (that tool), `none`; `disable_parallel_tool_use` allows one call |
-//! | `thinking` | `enabled` and `adaptive` switch thinking on, `disabled` off; without it the server's setting holds |
+//! | `thinking` | `enabled` and `adaptive` switch thinking on, `disabled` off; without it the server's setting holds; `display` is accepted and the thinking comes back whole |
 //! | `stop_sequences` | the stop strings |
-//! | `output_config` | `format` with a JSON schema is the `response_format` of the chat route, `effort` its `reasoning_effort` |
+//! | `output_config` | `format` with a JSON schema is the `response_format` of the chat route, `effort` its `reasoning_effort` (`high`, Anthropic's default, is the template's default) |
+//! | `context_management` | the edit `clear_thinking_20251015`: the thinking of older turns is left out of the prompt |
 //! | `metadata`, `service_tier` | bookkeeping: accepted, without effect |
 //! | `cache_control`, on the body and on blocks and tools | accepted, without effect: see below |
 //!
@@ -33,13 +34,19 @@
 //! blocks), which becomes a message of the role `tool` where it stands. Blocks
 //! of an assistant turn: `text`, `thinking`, `redacted_thinking` and
 //! `tool_use`. The text blocks of one message are joined with a line break.
+//! A system turn (a string or text blocks) before every other turn joins the
+//! system prompt; one between other turns is given to the chat template as a
+//! user turn with its text, since the templates of Qwen refuse a system
+//! message anywhere but first (Claude Code sends its environment after the
+//! first question that way, and the tokens it has left as the last turn).
 //!
 //! Anything else is refused with a 400 that names it: `image` and `document`
 //! blocks (input other than text is not built), tools of a `type` that
 //! Anthropic's service defines or runs (`web_search_...`, `bash_...` and the
 //! like) and the blocks they leave in a history, `defer_loading`,
-//! `mcp_servers`, `container`, `context_management`, citations, and every
-//! member this module does not know. A last message of the assistant is a
+//! `mcp_servers`, `container`, the edits of `context_management` that cut
+//! results of tools (`clear_tool_uses_20250919`), citations, and every member
+//! this module does not know. A last message of the assistant is a
 //! prefill, and the reply continues it (`continue_final_message` of the chat
 //! body).
 //!

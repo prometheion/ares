@@ -723,7 +723,7 @@ async fn what_the_engine_cannot_do_is_a_400_in_the_shape_of_the_api() {
     )
     .await;
     assert!(message.starts_with("tools are not supported with this model"), "{message}");
-    let effort = body(json!({"output_config": {"effort": "high"}}));
+    let effort = body(json!({"output_config": {"effort": "low"}}));
     let message =
         refused(&app, MESSAGES, &effort, StatusCode::BAD_REQUEST, "invalid_request_error").await;
     assert!(message.starts_with("output_config.effort is not supported"), "{message}");

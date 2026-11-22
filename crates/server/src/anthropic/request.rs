@@ -38,6 +38,7 @@ const SERVED: &[&str] = &[
     "stream",
     "output_config",
     "cache_control",
+    "context_management",
 ];
 
 /// Bookkeeping of the client or of Anthropic's service: accepted, and by
@@ -110,15 +111,18 @@ pub(crate) fn to_chat(body: &Json, purpose: Purpose) -> Result<Json, ApiError> {
         chat.push(("stream", Json::Bool(stream)));
     }
 
-    let mut messages = Vec::new();
-    if let Some(system) = fields.get("system") {
-        let text = system_text(system)?;
-        if !text.is_empty() {
-            messages.push(object(vec![("role", string("system")), ("content", string(text))]));
-        }
-    }
+    let mut system = match fields.get("system") {
+        Some(system) => system_text(system)?,
+        None => String::new(),
+    };
+    let kept = context_management(&fields)?;
     // A last message of the assistant is a prefill: the reply continues it.
-    let prefill = conversation(&fields, &mut messages)?;
+    let (turns, prefill) = conversation(&fields, kept, &mut system)?;
+    let mut messages = Vec::new();
+    if !system.is_empty() {
+        messages.push(object(vec![("role", string("system")), ("content", string(system))]));
+    }
+    messages.extend(turns);
     chat.push(("messages", Json::Array(messages)));
     if prefill {
         chat.push(("continue_final_message", Json::Bool(true)));
@@ -144,7 +148,6 @@ fn unserved(name: &str) -> &'static str {
             "the server runs no tools and connects to no MCP server: the client runs the tools \
              and sends their results"
         }
-        "context_management" => "the server does not edit the history of a conversation",
         "output_format" => "structured output is asked for in output_config.format",
         "stop" => "the stop strings of this API are stop_sequences",
         _ => "it is not a parameter of this route",
@@ -297,16 +300,42 @@ fn steady_billing_header(text: &str) -> String {
     }
 }
 
-/// `messages`: the turns of the user and of the assistant, appended to
-/// `chat` as chat messages. Whether the last turn is the assistant's, which
-/// the reply then continues.
-fn conversation(fields: &Fields<'_>, chat: &mut Vec<Json>) -> Result<bool, ApiError> {
+/// `messages`: the turns of the user, of the assistant and of the system, as
+/// chat messages, and whether the last turn is the assistant's, which the
+/// reply then continues.
+///
+/// A turn of the system before any other turn joins `system`, the system
+/// prompt. One between other turns (Claude Code sends its environment and the
+/// tokens left that way) is given to the chat template as a turn of the user
+/// with the same text: the chat templates of Qwen refuse a system message
+/// anywhere but first, and a turn of the user is where a model reads what
+/// came in between.
+///
+/// `kept` says which turns of the assistant keep their thinking.
+fn conversation(
+    fields: &Fields<'_>,
+    kept: KeptThinking,
+    system: &mut String,
+) -> Result<(Vec<Json>, bool), ApiError> {
+    let mut chat = Vec::new();
     let turns = match fields.get("messages") {
         Some(Json::Array(turns)) if !turns.is_empty() => turns,
         Some(Json::Array(_)) => return Err(refuse("messages", "messages must not be empty")),
         Some(other) => return Err(wrong_type("messages", "an array", other)),
         None => return Err(refuse("messages", "messages is required")),
     };
+    // The turns of the assistant whose thinking goes into the prompt: the
+    // last `n` of those that have thinking, or all.
+    let thinking_turns = turns
+        .iter()
+        .filter(|turn| {
+            matches!(turn.get("role"), Some(Json::String(role)) if role == "assistant")
+                && matches!(turn.get("content"), Some(Json::Array(blocks))
+                    if blocks.iter().any(|b| matches!(b.get("type"),
+                        Some(Json::String(kind)) if kind == "thinking")))
+        })
+        .count();
+    let mut thinking_seen = 0;
     for (i, turn) in turns.iter().enumerate() {
         let at = format!("messages[{i}]");
         let turn = block(&at, turn, &["role", "content"])?;
@@ -314,20 +343,148 @@ fn conversation(fields: &Fields<'_>, chat: &mut Vec<Json>) -> Result<bool, ApiEr
             .get("content")
             .ok_or_else(|| refuse(format!("{at}.content"), format!("{at}.content is required")))?;
         match turn.get("role") {
-            Some(Json::String(role)) if role == "user" => user(&at, content, chat)?,
+            Some(Json::String(role)) if role == "user" => user(&at, content, &mut chat)?,
             Some(Json::String(role)) if role == "assistant" => {
-                chat.push(assistant(&at, content)?);
+                let message = assistant(&at, content)?;
+                let thought = message.get("reasoning_content").is_some();
+                let keep = match kept {
+                    KeptThinking::All => true,
+                    KeptThinking::Last(n) => thinking_seen + n >= thinking_turns,
+                };
+                thinking_seen += usize::from(thought);
+                chat.push(if keep { message } else { without_reasoning(message) });
+            }
+            Some(Json::String(role)) if role == "system" => {
+                let text = system_turn(&at, content)?;
+                if chat.is_empty() {
+                    if !system.is_empty() && !text.is_empty() {
+                        system.push_str(BETWEEN_BLOCKS);
+                    }
+                    system.push_str(&text);
+                } else {
+                    chat.push(object(vec![("role", string("user")), ("content", string(text))]));
+                }
             }
             _ => {
                 return Err(refuse(
                     format!("{at}.role"),
-                    format!("{at}.role must be \"user\" or \"assistant\""),
+                    format!("{at}.role must be \"user\", \"assistant\" or \"system\""),
                 ));
             }
         }
     }
     let last = turns.last().and_then(|turn| turn.get("role"));
-    Ok(matches!(last, Some(Json::String(role)) if role == "assistant"))
+    let prefill = matches!(last, Some(Json::String(role)) if role == "assistant");
+    Ok((chat, prefill))
+}
+
+/// A chat message of the assistant without its reasoning.
+fn without_reasoning(message: Json) -> Json {
+    match message {
+        Json::Object(members) => Json::Object(
+            members.into_iter().filter(|(name, _)| name != "reasoning_content").collect(),
+        ),
+        other => other,
+    }
+}
+
+/// The text of a turn of the system: a string or text blocks, joined as the
+/// blocks of `system` are.
+fn system_turn(at: &str, content: &Json) -> Result<String, ApiError> {
+    match content {
+        Json::String(text) => Ok(text.clone()),
+        Json::Array(blocks) => {
+            let mut whole = None;
+            for (j, value) in blocks.iter().enumerate() {
+                let at = format!("{at}.content[{j}]");
+                match kind(&at, value)? {
+                    "text" => join(&mut whole, text_block(&at, value)?),
+                    other => return Err(refuse_block(&at, other)),
+                }
+            }
+            Ok(whole.unwrap_or_default())
+        }
+        other => Err(content_type(at, other)),
+    }
+}
+
+/// Which turns of the assistant keep their thinking in the prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeptThinking {
+    All,
+    /// The last this many turns that have thinking.
+    Last(usize),
+}
+
+/// `context_management`: the edits a client asks the server to make to the
+/// history before the model reads it.
+///
+/// `clear_thinking_20251015` is served: the thinking of the turns of the
+/// assistant before the last `keep.value` turns that have thinking is left
+/// out of the prompt (`keep: "all"` keeps every one; without `keep` the last
+/// turn keeps its thinking, as at Anthropic). Claude Code sends it with
+/// `keep: "all"`, which changes nothing. The response does not list the
+/// edits that were applied (`applied_edits`).
+///
+/// `clear_tool_uses_20250919` and every other kind is refused by name: the
+/// server does not cut results of tools from a conversation.
+fn context_management(fields: &Fields<'_>) -> Result<KeptThinking, ApiError> {
+    let at = "context_management";
+    let Some(value) = fields.get(at) else {
+        return Ok(KeptThinking::All);
+    };
+    let management = block(at, value, &["edits"])?;
+    let edits = match management.get("edits") {
+        None => return Ok(KeptThinking::All),
+        Some(Json::Array(edits)) => edits,
+        Some(other) => return Err(wrong_type("context_management.edits", "an array", other)),
+    };
+    let mut kept = KeptThinking::All;
+    for (i, edit) in edits.iter().enumerate() {
+        let at = format!("context_management.edits[{i}]");
+        match kind(&at, edit)? {
+            "clear_thinking_20251015" => {
+                let edit = block(&at, edit, &["type", "keep"])?;
+                kept = match edit.get("keep") {
+                    None => KeptThinking::Last(1),
+                    Some(Json::String(all)) if all == "all" => KeptThinking::All,
+                    Some(keep @ Json::Object(_)) => {
+                        let keep = block(&format!("{at}.keep"), keep, &["type", "value"])?;
+                        let turns = matches!(keep.get("type"),
+                            Some(Json::String(kind)) if kind == "thinking_turns");
+                        match keep.int("value") {
+                            Ok(Some(n)) if turns && n >= 1 => {
+                                KeptThinking::Last(usize::try_from(n).unwrap_or(usize::MAX))
+                            }
+                            _ => {
+                                return Err(refuse(
+                                    at,
+                                    "keep must be \"all\" or {\"type\": \"thinking_turns\", \
+                                     \"value\": n} with n at least 1",
+                                ));
+                            }
+                        }
+                    }
+                    Some(_) => {
+                        return Err(refuse(
+                            at,
+                            "keep must be \"all\" or {\"type\": \"thinking_turns\", \"value\": n}",
+                        ));
+                    }
+                };
+            }
+            other => {
+                return Err(refuse(
+                    at.clone(),
+                    format!(
+                        "{at}: an edit of the type '{other}' is not supported: the server leaves \
+                         the results of tools in a conversation as the client sends them"
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(kept)
 }
 
 fn content_type(at: &str, other: &Json) -> ApiError {
@@ -624,8 +781,8 @@ fn thinking(fields: &Fields<'_>, chat: &mut Chat) -> Result<(), ApiError> {
     };
     let kind = kind(at, value)?;
     let (on, known): (bool, &[&str]) = match kind {
-        "enabled" => (true, &["type", "budget_tokens"]),
-        "adaptive" => (true, &["type"]),
+        "enabled" => (true, &["type", "budget_tokens", "display"]),
+        "adaptive" => (true, &["type", "display"]),
         "disabled" => (false, &["type"]),
         other => {
             return Err(refuse(
@@ -638,6 +795,16 @@ fn thinking(fields: &Fields<'_>, chat: &mut Chat) -> Result<(), ApiError> {
         }
     };
     let asked = block(at, value, known)?;
+    match asked.get("display") {
+        None => {}
+        Some(Json::String(display)) if DISPLAYS.contains(&display.as_str()) => {}
+        Some(_) => {
+            return Err(refuse(
+                at,
+                "thinking.display must be \"summarized\", \"omitted\" or \"updates\"",
+            ));
+        }
+    }
     match asked.int("budget_tokens") {
         Ok(None) => {}
         Ok(Some(budget)) if budget >= 1 => {}
@@ -648,6 +815,13 @@ fn thinking(fields: &Fields<'_>, chat: &mut Chat) -> Result<(), ApiError> {
     chat.push(("chat_template_kwargs", object(vec![("enable_thinking", Json::Bool(on))])));
     Ok(())
 }
+
+/// The values of `thinking.display`. Every one gets the thinking whole: the
+/// server has no summary of it and no updates to send, and a thinking block
+/// that comes back with its text is what writes the reasoning into the next
+/// prompt as the model generated it (with `omitted` it would come back
+/// empty, and every turn would part from the cached one there).
+const DISPLAYS: &[&str] = &["summarized", "omitted", "updates"];
 
 /// `stop_sequences`, as the stop strings of a chat request.
 fn stop_sequences(value: &Json) -> Result<Json, ApiError> {
@@ -672,9 +846,14 @@ fn stop_sequences(value: &Json) -> Result<Json, ApiError> {
     Ok(value.clone())
 }
 
+/// The level of effort a request at Anthropic gets when it names none.
+const DEFAULT_EFFORT: &str = "high";
+
 /// `output_config`: `format` is a JSON schema the reply follows (the
 /// `response_format` of a chat request), `effort` is the `reasoning_effort`
-/// of one.
+/// of one. `high` is Anthropic's default level, so a request that names it
+/// gets the default of the chat template (the most for the templates of
+/// Qwen3.8, one of which does not know the name `high`).
 fn output_config(fields: &Fields<'_>, callable: bool, chat: &mut Chat) -> Result<(), ApiError> {
     let at = "output_config";
     let Some(value) = fields.get(at) else {
@@ -711,6 +890,8 @@ fn output_config(fields: &Fields<'_>, callable: bool, chat: &mut Chat) -> Result
     }
     match config.get("effort") {
         None => {}
+        // Anthropic's default level: the chat template's default.
+        Some(Json::String(effort)) if effort == DEFAULT_EFFORT => {}
         Some(Json::String(effort)) if !effort.is_empty() => {
             chat.push(("reasoning_effort", string(effort.as_str())));
         }

@@ -183,6 +183,107 @@ fn the_thinking_of_a_turn_goes_back_as_its_reasoning_whatever_the_signature() {
     assert_eq!(chat(body)["messages"][1], json!({"role": "assistant", "content": "b"}));
 }
 
+/// What Claude Code sends: its environment as a turn of the system after the
+/// first question, and the tokens left as one at the end.
+#[test]
+fn a_turn_of_the_system_joins_the_system_prompt_or_is_read_as_a_turn_of_the_user() {
+    let body = with(json!({
+        "system": [{"type": "text", "text": "You are terse."}],
+        "messages": [
+            {"role": "system", "content": "Answer in German."},
+            {"role": "user", "content": "What does calc.py do?"},
+            {"role": "system", "content": [{"type": "text", "text": "# Environment"}]},
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "toolu_1", "name": "Read", "input": {"file_path": "calc.py"}},
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_1", "content": "def add(a, b): ..."},
+            ]},
+            {"role": "system", "content": [{"type": "text", "text": "<total_tokens>999</total_tokens>",
+                "cache_control": {"type": "ephemeral"}}]},
+        ],
+    }));
+    let got = chat(body);
+    assert_eq!(
+        got["messages"],
+        json!([
+            {"role": "system", "content": "You are terse.\nAnswer in German."},
+            {"role": "user", "content": "What does calc.py do?"},
+            {"role": "user", "content": "# Environment"},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "toolu_1", "type": "function",
+                 "function": {"name": "Read", "arguments": {"file_path": "calc.py"}}},
+            ]},
+            {"role": "tool", "tool_call_id": "toolu_1", "content": "def add(a, b): ..."},
+            {"role": "user", "content": "<total_tokens>999</total_tokens>"},
+        ])
+    );
+    // The reply is a new turn, not a continuation of the last one.
+    assert!(got.get("continue_final_message").is_none(), "{got}");
+    // A turn of the system first is the system prompt when there is no other.
+    let first = with(json!({"messages": [
+        {"role": "system", "content": "Be brief."},
+        {"role": "user", "content": "hi"},
+    ]}));
+    assert_eq!(
+        chat(first)["messages"],
+        json!([{"role": "system", "content": "Be brief."}, {"role": "user", "content": "hi"}])
+    );
+}
+
+/// `clear_thinking_20251015` leaves the thinking of older turns out; Claude
+/// Code sends it with `keep: "all"`, which leaves everything in.
+#[test]
+fn clearing_thinking_keeps_the_thinking_of_the_last_turns_it_names() {
+    let turn = |n: u32| {
+        json!({"role": "assistant", "content": [
+            {"type": "thinking", "thinking": format!("thought {n}"), "signature": SIGNATURE},
+            {"type": "text", "text": format!("answer {n}")},
+        ]})
+    };
+    let question = json!({"role": "user", "content": "go on"});
+    let messages = json!([
+        question, turn(1), question, {"role": "assistant", "content": "plain"},
+        question, turn(2), question, turn(3), question,
+    ]);
+    let kept = |management: Value| {
+        let mut body = with(json!({"messages": messages}));
+        if !management.is_null() {
+            body["context_management"] = management;
+        }
+        let got = chat(body);
+        let thoughts: Vec<String> = got["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|m| m["reasoning_content"].as_str().map(str::to_owned))
+            .collect();
+        // The answers stay whatever happens to the thinking.
+        let answers = got["messages"].as_array().unwrap().iter().filter(|m| {
+            m["role"] == "assistant" && m["content"].as_str().is_some_and(|c| !c.is_empty())
+        });
+        assert_eq!(answers.count(), 4);
+        thoughts
+    };
+    let edit = |keep: Value| {
+        let mut edit = json!({"type": "clear_thinking_20251015"});
+        if !keep.is_null() {
+            edit["keep"] = keep;
+        }
+        json!({"edits": [edit]})
+    };
+    let all = ["thought 1", "thought 2", "thought 3"];
+    assert_eq!(kept(Value::Null), all);
+    assert_eq!(kept(json!({"edits": []})), all);
+    assert_eq!(kept(edit(json!("all"))), all);
+    assert_eq!(kept(edit(Value::Null)), ["thought 3"]);
+    assert_eq!(
+        kept(edit(json!({"type": "thinking_turns", "value": 2}))),
+        ["thought 2", "thought 3"]
+    );
+    assert_eq!(kept(edit(json!({"type": "thinking_turns", "value": 9}))), all);
+}
+
 #[test]
 fn tools_and_the_choice_among_them_are_those_of_the_chat_body() {
     let function = json!({"type": "function", "function": {
@@ -226,6 +327,13 @@ fn thinking_is_the_switch_of_the_chat_template_and_the_budget_is_not_a_field() {
     assert!(enabled.get("thinking_budget_tokens").is_none(), "{enabled}");
     assert_eq!(variables(json!({"type": "enabled"}))["chat_template_kwargs"], on);
     assert_eq!(variables(json!({"type": "adaptive"}))["chat_template_kwargs"], on);
+    // How the thinking is to be shown: it comes back whole in every case.
+    for display in ["summarized", "omitted", "updates"] {
+        let adaptive = variables(json!({"type": "adaptive", "display": display}));
+        assert_eq!(adaptive["chat_template_kwargs"], on);
+        let enabled = variables(json!({"type": "enabled", "budget_tokens": 9, "display": display}));
+        assert_eq!(enabled["chat_template_kwargs"], on);
+    }
     assert_eq!(
         variables(json!({"type": "disabled"}))["chat_template_kwargs"],
         json!({"enable_thinking": false})
@@ -246,6 +354,11 @@ fn output_config_is_the_schema_and_the_effort_of_the_chat_body() {
         json!({"type": "json_schema", "json_schema": {"schema": schema}})
     );
     assert_eq!(got["reasoning_effort"], "low");
+    // Anthropic's default level is the template's default (Claude Code sends
+    // it with every request; the template of Flash-Next does not know it).
+    let high = chat(with(json!({"output_config": {"effort": "high"}})));
+    assert!(high.get("reasoning_effort").is_none(), "{high}");
+    assert_eq!(chat(with(json!({"output_config": {"effort": "max"}})))["reasoning_effort"], "max");
     // With tools that stay in the prompt the schema is the rule.
     let none = json!({"tools": [weather()], "tool_choice": {"type": "none"},
         "output_config": {"format": {"type": "json_schema", "schema": schema}}});
@@ -323,7 +436,20 @@ fn what_is_not_served_is_refused_by_its_name() {
             "tools[0].input_examples is not supported",
         ),
         // Members nobody knows, anywhere.
-        (with(json!({"context_management": {"edits": []}})), "context_management", "does not edit"),
+        (
+            with(json!({"context_management": {"edits": [
+                {"type": "clear_tool_uses_20250919", "trigger": {"type": "input_tokens", "value": 30000}},
+            ]}})),
+            "context_management.edits[0]",
+            "'clear_tool_uses_20250919' is not supported",
+        ),
+        (
+            with(json!({"context_management": {"edits": [
+                {"type": "clear_thinking_20251015", "keep": {"type": "tool_uses", "value": 2}},
+            ]}})),
+            "context_management.edits[0]",
+            "thinking_turns",
+        ),
         (with(json!({"top_a": 0.2})), "top_a", "top_a is not supported"),
         (with(json!({"stop": ["x"]})), "stop", "stop_sequences"),
         (
@@ -337,9 +463,12 @@ fn what_is_not_served_is_refused_by_its_name() {
             ".extra is not supported",
         ),
         (
-            with(
-                json!({"thinking": {"type": "enabled", "budget_tokens": 1024, "display": "omitted"}}),
-            ),
+            with(json!({"thinking": {"type": "adaptive", "display": "loud"}})),
+            "thinking",
+            "thinking.display must be",
+        ),
+        (
+            with(json!({"thinking": {"type": "disabled", "display": "omitted"}})),
             "thinking",
             "thinking.display is not supported",
         ),
@@ -353,9 +482,17 @@ fn what_is_not_served_is_refused_by_its_name() {
         (with(json!({"max_tokens": 0})), "max_tokens", "at least 1"),
         (with(json!({"messages": []})), "messages", "must not be empty"),
         (
-            with(json!({"messages": [{"role": "system", "content": "x"}]})),
+            with(json!({"messages": [{"role": "developer", "content": "x"}]})),
             "messages[0].role",
-            "\"user\" or \"assistant\"",
+            "\"user\", \"assistant\" or \"system\"",
+        ),
+        (
+            with(json!({"messages": [
+                {"role": "user", "content": "x"},
+                {"role": "system", "content": [{"type": "image"}]},
+            ]})),
+            "messages[1].content[0]",
+            "'image'",
         ),
         (with(json!({"messages": [{"role": "user"}]})), "messages[0].content", "is required"),
         (
