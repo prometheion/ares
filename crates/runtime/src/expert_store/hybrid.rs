@@ -729,6 +729,10 @@ impl<D: SlotDevice> ExpertStore<D> {
                 let ms = done.saturating_duration_since(claims.since).as_secs_f32() * 1e3;
                 self.stats.cpu_done_ms.push(ms);
             }
+            if let Some(first) = claims.jobs.iter().map(|job| job.created()).min() {
+                let ms = first.saturating_duration_since(claims.since).as_secs_f32() * 1e3;
+                self.stats.cpu_start_ms.push(ms);
+            }
             for job in &claims.jobs {
                 if let Some(part) = job.sums() {
                     sums.iter_mut().zip(part).for_each(|(s, p)| *s += p);

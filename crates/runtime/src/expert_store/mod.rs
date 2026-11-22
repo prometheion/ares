@@ -414,6 +414,8 @@ pub struct StoreStats {
     /// the end of the last task of its jobs (the rest of `cpu_ms` is the
     /// time until the store noticed and delivered the sums).
     pub cpu_done_ms: Vec<f32>,
+    /// And from the arrival of the record to the creation of its first job.
+    pub cpu_start_ms: Vec<f32>,
     /// Experts that took a VRAM slot between steps, by heat.
     pub promotions: u64,
     /// Experts a step missed that were uploaded on loan, and members on loan

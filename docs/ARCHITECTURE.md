@@ -3489,6 +3489,15 @@ the many-row kernels also take the width in steps of 128 and the inner width in 
   is what such an expert costs (table below). The written kernels need x86-64-v3 (AVX2,
   FMA, F16C, BMI2); on a CPU without it every type goes through the decoded path in
   portable code (`Features::vector`), which before refused the CPU half altogether.
+- *A job* (`LayerJob` in `cpu/mod.rs`) is a layer's experts for one step, cut into tasks
+  that the workers claim in order: the gate and up products of an expert in pieces of 32
+  hidden values, and its down product in pieces of 64 output values, which wait for the
+  expert's hidden values. An expert's down pieces come after the gate and up pieces of the
+  next expert, so the down products, which read their bytes as fast as the memory gives
+  them, run beside the gate and up pieces, which the cores bound (decoding codebooks); the
+  parts of a chunk of the output are added in the order of the experts, so the sums do not
+  depend on which worker ran what. Before 2026-11-22 every down piece waited for the gate
+  and up pieces of all the job's experts.
 - *The cost model* (`CostModel` in `expert_store/hybrid.rs`) times CPU jobs per pair of
   types (gate and up, down): each pair a model has is calibrated by itself when the store
   gets its CPU half, and a job's time is recorded under its layer's pair. Before, every gate

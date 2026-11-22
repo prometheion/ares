@@ -763,6 +763,11 @@ impl LayerJob {
         }
     }
 
+    /// When the job was made.
+    pub fn created(&self) -> Instant {
+        self.created
+    }
+
     /// When the last task ended; `None` while the job runs.
     pub fn ended(&self) -> Option<Instant> {
         self.elapsed().map(|elapsed| self.created + elapsed)
