@@ -88,6 +88,30 @@ between cards stay with the model. Today the two models share almost nothing ins
 
 ## Qwen3.8 Flash-Next (`qwen4exp`)
 
+### Found against Strata on the test machine (2026-11-22; RTX 4060 Ti 16 GB, 62 GiB RAM, UD-Q3_K_XL)
+- [ ] **Crash** with the MTP block (`--drafters` the q2 block): "writing K and V reported status 0x4
+      in the step before" (a row written straight into a converted entry of a tile-mean format;
+      only the MTP block's K/V is `q4`) at the end of a long prompt after a few requests, 6 of 6
+      times; the engine reloads (28-51 s). Not with drafts off. Suspected: `blocks/mtp.rs`
+      `follow`/`step` decide `writes_converted` once per batch; the MTP block's exact pool is
+      sized for 8-row steps while it follows the model's 512-row steps.
+- [ ] Ares is behind: decode with drafts 40-55 % of Strata's (15.9-31.0 against 40.0-43.0
+      tokens/s), without 43-51 %; prompts 4 to 10 times slower (Strata 398 / 829 / 1257 tokens/s
+      at 2k / 8k / 32k, Ares 94-121); the first token of a short repeated prompt 3 to 15 times
+      slower (no checkpoint at the prompt's end: item 2 of the order). Ahead: load 3 times faster
+      (35-50 s against 96-149), 12 GiB of RAM left free against Strata's 2-3, a long conversation
+      turn asked again 2.7-2.9 s against 9.3 s (Strata keeps only the newest path).
+- [ ] Why, from the logs: GPU hit rate of the experts 37-74 % against Strata's 62-83 % with
+      about the same slots: Ares fills only 1267-1862 of about 4000 slots at the start and then
+      moves 63-171 experts a token over the card's x4 link (33-102 ms a token waited); Strata
+      fills every slot from a ranked profile, changes them slowly, and computes every expert
+      missing from the GPU on the CPU from page-locked RAM (Ares computes 14-42 % there and
+      uploads the rest). Strata also skips missed experts of rank 7 and lower by default (not
+      like for like; Ares' `--expert-prune skip:8` is that). To do: fill every slot at the start,
+      move slots slowly, and choose CPU or upload per miss by the link's measured speed.
+- [ ] The default context on that card is 23,552 tokens ("a thirty-second of the expert room"):
+      too small for a 32k prompt; the rule needs a floor or the owner's choice.
+
 ### Defects seen in the merge check of 2026-11-17 (intermittent, slower but not wrong)
 - [ ] `ares-server --test real` `flash_next_drafts_with_its_mtp_block` sometimes verifies no
       draft at all (0 of 0) for a whole run; passes in other runs. Suspected: the conductor's
