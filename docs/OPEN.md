@@ -531,6 +531,12 @@ becomes a block is in `ARCHITECTURE.md` ("The shared model layer"). Left, in the
       together with other sequences); its cost with three sequences was not measured.
 
 ## Drafters (every model)
+- [ ] Blackwell (the owner, 2026-11-22: an RTX 5060 Ti is ordered for the test machine). Ares
+      compiles sm_120 code (`crates/cuda/build.rs`) but has never run it. When the card is in: the
+      whole GPU suite on it; then Blackwell's own paths where they pay, measured: FP4 tensor cores
+      for NVFP4 and MXFP4 weights (Strata 0.1.65 names `dense_fp4_tc` and `moe_fp4_tc`), FP8; the
+      prefill path per type measured there as on every card; and Ares against Basalt (Blackwell
+      only, so the first chance to compare) and Strata on the same card.
 Reference to read (2026-11-18): Basalt, https://github.com/jesdga95/basalt (MIT, a fork of Strata,
 kernels from Infernix; NVIDIA Blackwell only, so it cannot run on these cards): Qwen3.8 Flash-Next
 with MTP, Qwen3.8-27B with DFlash 2 and DeepSeek-V4.1-Flash with DSpark, drafting on by default;
