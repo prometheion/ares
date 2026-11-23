@@ -331,12 +331,19 @@ impl Misses {
                         part.experts_round(env, self.layer, &self.resident, Some(record))?;
                     }
                     let counts = part.picked_counts(self.layer, self.rows, record);
-                    // The heat counts an expert once a step, as a decode step
-                    // does whatever rows pick it: counted by its rows, a prompt
-                    // outweighed every token generated after it, and the tiers
-                    // filled from such heat held what long prompts used.
-                    let once: Vec<u32> = counts.iter().map(|c| u32::from(*c > 0)).collect();
-                    feed.store.record_counts(self.at, &once, 1.0);
+                    // The heat counts an expert once a step of the part's own
+                    // rows, as a decode step does whatever rows pick it: counted
+                    // by its rows, a prompt outweighed every token generated
+                    // after it, and the tiers filled from such heat held what
+                    // long prompts used. A wider step (a prompt read alone on
+                    // lent VRAM, or layer by layer in a pass) counts as the steps
+                    // of own rows it stands for, at most once a row that picked
+                    // the expert: counted once, a pass of a whole prompt weighed
+                    // as a token, the tiers kept what came before it, and the next
+                    // turn, which replays the prompt's last rows, missed them.
+                    let steps = self.rows.div_ceil(part.own_rows().max(1)).max(1);
+                    let heat: Vec<u32> = counts.iter().map(|c| (*c).min(steps)).collect();
+                    feed.store.record_counts(self.at, &heat, 1.0);
                     let picked = |e: &u32| counts[*e as usize] > 0 && owned(*e);
                     let all = 0..counts.len() as u32;
                     self.stats.layers = 1;

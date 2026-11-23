@@ -4801,7 +4801,13 @@ width (`device/part/wide.rs`, `device/misses.rs`):
   A step that misses nothing has one round and the host only waits for the record, while the
   first round runs. The plan of the layer is made once, and the host never waits inside a
   call: the caller serves the store between the steps of `Misses::advance`. The heat of the
-  store gets the layer's counts of rows per expert (`record_counts`).
+  store counts an expert once a step of the part's own rows (`record_counts`), as a decode step
+  does: a wider step (a prompt read alone on lent VRAM, or a pass) counts as the steps of own
+  rows it stands for, at most once a row that picked the expert. (Counted once a step, a pass
+  of a whole prompt weighed as one token, the tiers kept what came before it, and the next turn
+  of the conversation, which replays the prompt's last rows, missed them: 4.4 to 4.9 s to its
+  first token on the local cards against main's 2.8 to 3.3 s, see "Long prompts layer by
+  layer".)
 - *The CPU takes the misses few rows picked* (`expert_store/hybrid/wide.rs`, 2026-11-22). A
   step of a few rows (a turn whose prompt the cache holds but for its last rows, the end of
   a prompt, the rows a replay rebuilds the state with) misses hundreds of experts per layer
