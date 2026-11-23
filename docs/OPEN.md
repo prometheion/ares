@@ -56,6 +56,7 @@ tree is accepted than a chain), then built; started when the pieces in work leav
 piece at a time.
 
 ## In work now
+Merged 2026-11-23 (the two local cards): the second card's role timed at load, capped cards measuring their prefill path, the transit budget (the 196-row test), the 27B at the owner's production settings planned and run (the attention's partial states bounded by the planner).
 Merged 2026-11-23 (verified on the two local cards): the CPU kernels for every expert type, image input pieces 4 to 8, request priorities and the server items, the slot-number crash fix.
 Merged 2026-11-22 after the test machine's one card passed every GPU suite (`fix/mtp-and-slots`,
 `moe/prompt-chunks`, `cache/checkpoints`, `devices/roles`); what needs two cards is owed below
@@ -67,7 +68,6 @@ Merged 2026-11-22 after the test machine's one card passed every GPU suite (`fix
 | The layer-major prompt pass (TokenWing's order; the owner moved it forward), interruptible between layers | handed back (`flash/layer-major`, on `flash/prompt`): a 17k prompt 2.1 times as fast on two cards and 3.0 times on one, a short request during it first token 0.8 s against 20.7 s; Strata not yet compared; being moved onto main by an integration agent (conflicts with images and priorities in the runtime) |
 | Flash-Next UD-Q4_K_XL (104 GiB, larger than RAM) streamed from the SSD against Strata, then Ares's reading path | agent working on the test machine (`flash/ssd-stream`) |
 | 6: K/V beyond VRAM into RAM (Flash-Next) | handed back, continuing: finished requests' far pages as prompt cache (the owner), the control run for decode after a long prompt (`kv/overflow`) |
-| Flash-Next's second card timed at load (experts only kept on these cards, +3.2 to 3.7 s at load), capped cards measuring their prefill path, the 196-row MTP test, and the 27B at the owner's production settings planned within free memory (it did not load before) | handed back, being verified on the local cards (`devices/load-choice`) |
 | DFlash2 trees and the experts of a tree's tokens read ahead, phase 1 | measured (`flash/trees-study`, instruments only, not merged): Flash-Next +1 to 3 % with a tree of 4, larger trees lose, reading ahead from token tables or route memory +1 % (they name 1.4 to 6 % of a round's missing experts); 27B +9 % with trees of at most 8 rows; the MTP chain with its own candidates as siblings is as good as a DFlash tree of 8 nodes. The lever the data point at: a distinct expert in a few-row step costs 16.5 µs (about 80 GB/s of the cards' 360 / 500); at 5 µs chains reach about 120 tokens/s and trees then pay +15 %. Owner's decision on what to build |
 
 ## Shared model layer (the owner's rule, 2026-11-16)
@@ -998,6 +998,24 @@ Measured per phase on a quiet machine against the fork and Strata, the largest f
 - [ ] Flash-Next with its MTP block once speculation pays; target above 56 tokens/s.
 - [ ] Before a release: both models against the fork, Strata and TokenWing (Flash-Next), speed,
       VRAM, quality.
+
+## Against the owner's production (2026-11-23, the 27B UD-Q4_K_S on the RTX 4070 + RTX 3060)
+The fork's preset (`models.ini`, `-ts 0.625,0.375 -as 1,3`, 262144 cells, 2 slots, q5_1 K/V, MTP
+and n-gram drafts) against Ares at the same settings (`--shares 0.625,0.375 --context 262144
+--parallel 2 --kv q5 --drafters mtp --draft-vocab`, heads by context 0.300 / 0.700), peer
+access, greedy, the bench of `/var/tmp/ares-tools/prod-ab/` (fork 2 rounds, Ares 3):
+| | fork | Ares |
+| --- | --- | --- |
+| Decode, first ask, German / English / code, tokens/s | 61-63 / 67-68 / 76-77 | 71-74 / 78-86 / 103-104 |
+| Decode, the same ask again | 62-63 / 67-68 / 76-77 | 251-252 (the n-gram drafter copies its last answer) |
+| Prompt 2k / 8k / 32k / 98k, tokens/s | 840 / 994 / 944 / 752 | 1135 / 1030 / 654 / 325 |
+| Agent turns, first token, first / second ask | 0.5-7.2 s / 0.1-0.5 s | 0.2-5.9 s / 0.1-0.2 s |
+| VRAM at the end | 11.6 / 11.7 GiB | 11.5 / 10.1 GiB |
+- [ ] Long prompts: 32k 31 % and 98k 57 % behind the fork. About 70 % of the heads sit on the RTX
+      3060; the fork puts 75 % there and still reads 98k at 752 tokens/s, so Ares' attention over
+      long contexts on that card is the gap (its flash attention against ours; llama.cpp PR 32407 is
+      in "Optimising").
+- [ ] Images on these settings, and a day of the owner's own use as a second llama-swap entry.
 
 ## Owed on two cards (the owner's cards are production; run when the owner frees them)
 Run on 2026-11-22 evening (main c5d27e9, RTX 4070 + RTX 3060, peer access, load about 30 from
