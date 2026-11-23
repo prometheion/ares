@@ -27,14 +27,15 @@ Scope decisions:
   has everything: what the llama.cpp fork it replaces has and what the other
   engines have, inside the limits listed here, ready for use, with the same
   features on CUDA and on Vulkan. That includes drafts from block drafters
-  with draft trees, image input, the decision endpoint, a path for Turing
-  cards and the prompt cache on SSD. The list of features, who has each and
+  with draft trees, image input, the decision endpoint and the prompt cache
+  on SSD. The list of features, who has each and
   how far Ares is, is
   [reference/feature-checklist.md](reference/feature-checklist.md); a
   release date is not a reason to leave a row out.
 
-- **Nothing is tuned to one machine.** The CUDA backend serves every GPU
-  that CUDA 13 supports, the Vulkan backend every other. Which kernel, block
+- **Nothing is tuned to one machine.** The CUDA backend serves the GPU
+  classes it was tested on (today Ampere 8.6 and Ada 8.9, see
+  [Devices](#devices)), the Vulkan backend every other. Which kernel, block
   shape or row-count boundary a device gets may depend on its class (its
   compute capability on CUDA: "Ampere and Ada use this"; what the device
   reports on Vulkan) or on something measured on the device at load (the
@@ -42,8 +43,8 @@ Scope decisions:
   bandwidth, the link to another device), never on a device name, a vendor
   string, an ordinal, or a constant that is only the result of a measurement
   on the development machine. The numbers in this document come from an RTX
-  4070 and an RTX 3060; a class that could not be run there is compiled and
-  marked untested.
+  4070, an RTX 3060 and an RTX 4060 Ti; a class that was not run is not
+  built.
 
 - **Current models have recurrent layers.** Every architecture the engine
   targets mixes recurrent layers with attention that is either dense (Spark)
@@ -2806,9 +2807,31 @@ pages) and comes with the runtime.
 
 `ares-cuda` binds the driver API (`libcuda.so.1`) at run time, so the CUDA
 toolkit is needed to build the kernels and not to run. Kernels are compiled by
-`build.rs` into two fat binaries embedded in the binary: the decode kernels
-and everything else with machine code for Turing, Ampere, Ada and Blackwell
-and PTX as the baseline, and the prefill kernels for Ampere and newer only.
+`build.rs` into fat binaries embedded in the binary, one per module, with
+machine code for the GPU classes the engine was tested and tuned on and for
+nothing else.
+
+**GPU classes.** CUDA runs only on tested classes (the owner, 2026-11-23):
+today Ampere (8.6, RTX 30) and Ada (8.9, RTX 40); Blackwell (12.0, RTX 50)
+joins after the RTX 5060 Ti's tests. Every other GPU is to run through the
+Vulkan backend. A build has machine code for its classes only and no PTX, so
+no other GPU compiles the kernels on its first load and runs code nobody ran.
+`ARES_CUDA_ARCHS` (for example `86,89,120`) builds other classes on purpose:
+each named class is built, the build warns about every untested one, and a
+class below 8.0 (the kernels use the `mma` shapes, `cp.async` and `ldmatrix`
+of Ampere) or one the toolkit does not list is a build error. The classes a
+build has are `ares_cuda::BUILT_CLASSES`, which `build.rs` writes.
+
+A device is run only if its compute capability is one of those exactly:
+`Device::open` refuses any other (`DeviceInfo::check_class`), also an 8.7
+Jetson Orin, which could run the 8.6 machine code but was never tested. The
+refusal names the device, its capability and the classes of the build, and
+says that other GPUs are to run through the Vulkan backend. The server's
+device choice (`--devices`, or every device the driver reports) skips such a
+device with a log line while another remains and refuses with the refusal
+when none does. Since every built class is Ampere or newer, every device that
+opens has the tensor-core kernels (prefill, attention, many-row experts, the
+image tower); there is no path for a device without them.
 
 - `devices()` and `peer_access()` describe the hardware without opening it.
 - `Device` holds the primary context; `DeviceBuffer`, `PinnedBuffer` and
@@ -3352,9 +3375,6 @@ counted in the plan (`missing_pairs`) and the expert is flagged, so the caller
 knows what to fetch. One plan serves several calls with different tables, which is
 how the waves of a layer run.
 
-Needs compute capability 8.0 (the module is built like the prefill module; a
-Turing card has no tile kernels for experts either).
-
 These kernels do not wait for an expert on the device and have no host share: they skip
 an expert without an address and report it. The decode kernels therefore stay for the
 steps of a generating sequence, which depend on both, and for the windows below the
@@ -3889,8 +3909,8 @@ At 262144 cells `f16` reads at 77 % of the memory limit, `q8` at 52 % and
 by memory, so they are not yet faster than `f16` although they read a half
 or a quarter of the bytes. Open: that decode work, accumulation in `f16`
 with a flush to `f32` on capped cards (every path accumulates in `f32`
-now, at half the rate), the item for a prefix that several sequences share,
-and a Turing path.
+now, at half the rate), and the item for a prefix that several sequences
+share.
 
 **The tensor-core cap of GeForce cards.** GeForce cards run FP16, BF16 and
 TF32 tensor-core math with FP32 accumulation at half rate; professional cards
@@ -4916,7 +4936,7 @@ width (`device/part/wide.rs`, `device/misses.rs`):
 
 `step_rows` decides the rows a model keeps scratch for (`--ubatch-size` says otherwise): the largest power of two up to 4096
 whose scratch (`Frame::step_bytes`) is at most a thirty-second of the smaller device's
-memory, and 8 on a device below compute capability 8.0. The scratch is about 0.7 MiB a
+memory. The scratch is about 0.7 MiB a
 row for Flash-Next, and every byte of it is a byte less for expert slots, which the
 generating steps miss.
 
@@ -6571,7 +6591,7 @@ On the 16 threads of the development machine, under other load, the pass takes
 `qwen3vl::DeviceTower` runs the pass on one device: an image's patch rows in
 (`image::patch_rows`, in the merger's order), the merged rows of the language
 model's width out, in a buffer on the device that the language model can read
-(see [Images in a prompt](#images-in-a-prompt)). It needs compute capability 8.0.
+(see [Images in a prompt](#images-in-a-prompt)).
 
 - **Products** are the tile kernels of the language models (`Kernels::matmul`)
   on their f16 path: f16 operands, f32 sums. The activations are prepared in
@@ -8510,8 +8530,6 @@ is always on; an unknown flag or preset key is an error that names it.
 - **Indexer cut-off.** Strata's two engines differ in which cells the sparse
   attention keeps at the cut-off. This must be settled against the real
   Qwen4.
-- **Pascal cards (GTX 10xx).** Settled: the CUDA backend covers what a CUDA
-  13 toolkit builds for, which starts at Turing (GTX 16, RTX 20). Older cards
-  go through the Vulkan backend. (A driver of the 13 level does run on
-  Pascal, but only with kernels built by a 12.x toolkit, which is outside the
-  engine's scope.)
+- **Pascal and Turing cards (GTX 10, GTX 16, RTX 20).** Settled: CUDA runs
+  only on the tested classes (see [Devices](#devices)); these and every other
+  untested GPU go through the Vulkan backend.

@@ -42,9 +42,14 @@ cargo run --release --bin ares -- --model model.gguf
 
 Without further options the server chooses the devices, the split and the
 context from what the GPUs report and says what it chose; `--help` lists
-the options. A build for one machine can name its GPU generations, for
-example `ARES_CUDA_ARCHS=86,89`, instead of building the kernels for all
-eight.
+the options.
+
+CUDA runs on the GPU classes the engine was tested on: Ampere (8.6, RTX 30)
+and Ada (8.9, RTX 40). The build has machine code for those two only, and a
+GPU of another class is refused; such GPUs are to run through the Vulkan
+backend, which does not run models yet. A developer can build other classes
+on purpose with `ARES_CUDA_ARCHS`, for example `ARES_CUDA_ARCHS=86,89,120`;
+the build then warns that they are untested.
 
 ## Tests
 

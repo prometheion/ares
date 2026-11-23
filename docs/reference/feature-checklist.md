@@ -283,7 +283,7 @@ or no-op options; Ares may do a thing differently as long as the result is not w
 
 | ID | Feature | Engines | What it is | Ares | Frame | Need |
 | --- | --- | --- | --- | --- | --- | --- |
-| H01 | CUDA | llama, fork, ik, kobold, ollama, vllm, sglang, tgi, trt, lmdeploy, tabby, mistralrs, mlc, sonar, strata, avalon, tfold | every card CUDA 13 supports | partly: Ampere and Ada measured; other classes compiled and untested; Turing has no prompt and no attention path | yes | essential |
+| H01 | CUDA | llama, fork, ik, kobold, ollama, vllm, sglang, tgi, trt, lmdeploy, tabby, mistralrs, mlc, sonar, strata, avalon, tfold | every card CUDA 13 supports | partly: the tested classes only, Ampere (8.6) and Ada (8.9); Blackwell (12.0) after the RTX 5060 Ti's tests; every other GPU is refused and is to run through Vulkan (H02; the owner, 2026-11-23) | yes | essential |
 | H02 | Vulkan | kobold, mlc, llama? | the same features on any GPU with Vulkan | partly: weight and layer kernels at CUDA's speed, attention kernels slower than CUDA's, the sampler's kernels equal to CUDA's bit for bit (they need `shaderFloat64`); no expert or qwen4exp kernels, no model | yes | essential |
 | H03 | Several GPUs on Vulkan | llama? | a model split over Vulkan devices | partly: sums go through host pages; no direct route works on the test driver | yes | common |
 | H04 | Pure CPU inference, dense layers on the CPU | llama, ik, kobold, ollama, mistralrs, localai | a model or part of a dense model runs on the CPU (`-ngl`) | not started | no: no CPU inference | - |

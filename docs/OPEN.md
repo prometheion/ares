@@ -61,7 +61,7 @@ section further down.
    `ARCHITECTURE.md`). The server part of item 8 is on the same branch.
 8. Then the rest of CUDA complete: image input pieces 4 to 8, gate and up in two types, the
    roles of the cards, the open defects, the server items.
-Later than their place suggests: the classic draft model (VRAM; better with an aux card), Turing,
+Later than their place suggests: the classic draft model (VRAM; better with an aux card),
 Jev mode, stored responses, TLS. DFlash2 trees (steps 9 and 10) with the experts of a tree's
 tokens read ahead ("Speculation that pays"): the owner, 2026-11-22, expects much of them for
 decode; measured first (how many picks a token table and route memory predict, how much longer a
@@ -657,9 +657,12 @@ becomes a block is in `ARCHITECTURE.md` ("The shared model layer"). Left, in the
       4060 Ti at Gen4 x8, twice the link it has today, so the link-bound numbers measured there at
       x4 must be taken again). Two cards of two generations there: placements across Ada and
       Blackwell, peer access only if that machine's driver allows it. Both in place in about a
-      month; until then the owner can swap the 5060 Ti in for the 4060 Ti for a while to test. Ares
-      compiles sm_120 code (`crates/cuda/build.rs`) but has never run it. When the card is in: the
-      whole GPU suite on it; then Blackwell's own paths where they pay, measured: FP4 tensor cores
+      month; until then the owner can swap the 5060 Ti in for the 4060 Ti for a while to test. A
+      default build has no sm_120 code and refuses the card (only tested classes, 2026-11-23). When
+      the card is in: a build with `ARES_CUDA_ARCHS=89,120` there and the whole GPU suite on it;
+      when it passes, 120 joins `TESTED` in `crates/cuda/build.rs` (and the names in
+      `ARCHITECTURE.md` "GPU classes", `FEATURES.md`, `README.md`); then Blackwell's own paths
+      where they pay, measured: FP4 tensor cores
       for NVFP4 and MXFP4 weights (Strata 0.1.65 names `dense_fp4_tc` and `moe_fp4_tc`), FP8; the
       prefill path per type measured there as on every card; and Ares against Basalt (Blackwell
       only, so the first chance to compare) and Strata on the same card.
@@ -973,7 +976,10 @@ DSpark drafter `dspark-Inkling-2-Mini-Q8_0.gguf`, 0.4 GB). Notes: `/var/tmp/ares
       to 256 options a question, a session cache (`--session-cache-gb`), `--batch-invariant`.
       Its numbers (one H200, OneJev1.6-0.8B): one email of eight questions in 10.0 ms, 10,000
       in 28 s; "up to 9.5 times faster than vLLM and SGLang".
-- [ ] Turing. Later.
+- [ ] Untested GPU classes go to Vulkan (the owner, 2026-11-23; was "Turing. Later."). CUDA builds
+      and opens only the tested classes, Ampere (8.6) and Ada (8.9) (`cuda/tested-archs`); Turing,
+      Pascal, Hopper, data-centre Blackwell, Jetson and every other GPU are to run through the
+      Vulkan backend once it runs models. What was not tuned on CUDA goes there too.
 - [ ] K/V of a running sequence beyond VRAM (P16; an exception, low priority). The owner,
       2026-11-22: without `--context` a model gets its own context always, and what of it does not
       fit in VRAM overflows into RAM. The plan says what was wanted and what of it is in VRAM
