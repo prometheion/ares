@@ -779,7 +779,7 @@ fn assistant(at: &str, content: &Json) -> Result<Json, ApiError> {
                             // A block whose thinking was omitted: the signature
                             // carries it.
                             Some(carried) if text.is_empty() => {
-                                let reasoning_of = super::base64::decode(carried)
+                                let reasoning_of = crate::base64::decode(carried)
                                     .and_then(|bytes| String::from_utf8(bytes).ok());
                                 let Some(carried) = reasoning_of else {
                                     return Err(refuse(

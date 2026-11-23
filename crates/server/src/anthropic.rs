@@ -113,7 +113,6 @@
 //! are not looked at: the server has one version of the API, and serves a
 //! field of a beta or refuses it by its name in the body.
 
-mod base64;
 mod edits;
 mod reply;
 mod request;

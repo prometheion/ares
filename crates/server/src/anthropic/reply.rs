@@ -35,7 +35,7 @@ pub(crate) const CARRIED: &str = "ares-reasoning:";
 pub(crate) fn carried(reasoning: &str) -> String {
     let mut signature = String::with_capacity(CARRIED.len() + reasoning.len().div_ceil(3) * 4);
     signature.push_str(CARRIED);
-    super::base64::encode(reasoning.as_bytes(), &mut signature);
+    crate::base64::encode(reasoning.as_bytes(), &mut signature);
     signature
 }
 

@@ -80,7 +80,8 @@ pub fn from_url(at: &str, url: &str) -> Result<Decoded, ApiError> {
 /// The image of base64 data (Anthropic's `source.data`).
 pub fn from_base64(at: &str, data: &str) -> Result<Decoded, ApiError> {
     let refuse = |message: String| ApiError::invalid_param(at, format!("{at}: {message}"));
-    let bytes = base64(data).ok_or_else(|| refuse("the image's base64 does not decode".into()))?;
+    let bytes = crate::base64::decode_lenient(data)
+        .ok_or_else(|| refuse("the image's base64 does not decode".into()))?;
     decode(&bytes).map_err(refuse)
 }
 
@@ -118,46 +119,6 @@ pub fn decode(bytes: &[u8]) -> Result<Decoded, String> {
     Ok(Decoded { width: rgb.width(), height: rgb.height(), pixels: rgb.into_raw() })
 }
 
-/// Standard base64, with or without padding; white space is skipped (a data
-/// URL broken into lines).
-fn base64(text: &str) -> Option<Vec<u8>> {
-    let value = |c: u8| -> Option<u32> {
-        Some(match c {
-            b'A'..=b'Z' => c - b'A',
-            b'a'..=b'z' => c - b'a' + 26,
-            b'0'..=b'9' => c - b'0' + 52,
-            b'+' | b'-' => 62,
-            b'/' | b'_' => 63,
-            _ => return None,
-        } as u32)
-    };
-    let mut out = Vec::with_capacity(text.len() / 4 * 3);
-    let (mut acc, mut bits) = (0u32, 0u32);
-    let mut ended = false;
-    for &c in text.as_bytes() {
-        if c.is_ascii_whitespace() {
-            continue;
-        }
-        if c == b'=' {
-            ended = true;
-            continue;
-        }
-        if ended {
-            return None;
-        }
-        acc = (acc << 6) | value(c)?;
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            out.push((acc >> bits) as u8);
-            acc &= (1 << bits) - 1;
-        }
-    }
-    // Leftover bits are padding and must be zero; one character alone is not
-    // a byte.
-    (bits < 6 && acc == 0).then_some(out)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -183,29 +144,9 @@ mod tests {
     }
 
     fn encode64(bytes: &[u8]) -> String {
-        const DIGITS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
         let mut out = String::new();
-        for chunk in bytes.chunks(3) {
-            let n =
-                chunk.iter().enumerate().fold(0u32, |n, (i, b)| n | u32::from(*b) << (16 - 8 * i));
-            for i in 0..4 {
-                if i <= chunk.len() {
-                    out.push(DIGITS[(n >> (18 - 6 * i) & 63) as usize] as char);
-                } else {
-                    out.push('=');
-                }
-            }
-        }
+        crate::base64::encode(bytes, &mut out);
         out
-    }
-
-    #[test]
-    fn base64_decodes_with_and_without_padding() {
-        assert_eq!(base64("aGVsbG8=").unwrap(), b"hello");
-        assert_eq!(base64("aGVsbG8").unwrap(), b"hello");
-        assert_eq!(base64("aGVs\nbG8=").unwrap(), b"hello");
-        assert!(base64("aGVsbG8=x").is_none());
-        assert!(base64("a*==").is_none());
     }
 
     #[test]

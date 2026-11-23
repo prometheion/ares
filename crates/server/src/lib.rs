@@ -46,6 +46,7 @@
 
 mod access;
 mod anthropic;
+mod base64;
 mod bridge;
 pub mod defaults;
 mod error;
