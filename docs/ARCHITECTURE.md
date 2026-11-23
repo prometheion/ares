@@ -435,6 +435,7 @@ load 2 to 33; the fork's numbers from the parallel comparison in `OPEN.md`):
 | a 32k prompt, first token | 124.7-127.5 s | 82-100 s (71-73 s with pieces of up to 1 s) | 59.8-59.9 s |
 | the generating request meanwhile | 26-35 tokens/s | 17-20 tokens/s | 21-26 tokens/s |
 | its longest gap | 0.38-0.56 s | 0.49-0.94 s (0.56-1.04 s) | 0.51-0.66 s |
+| on main ae836d2 (the new prompt attention), 8k / 32k | 18.8 / 87.2 s | 15.2 / 59.9 s | |
 
 The prompt and the generation used 0.99 of their two rates alone (the fork 0.96
 to 0.97; its own measurement of concurrent prefill: 0.40 of the decode rate and

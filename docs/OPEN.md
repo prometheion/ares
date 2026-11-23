@@ -1262,7 +1262,13 @@ them), cached turns, one request alone. What it does worse, and why:
       33): 8k beside a generating request 21.0-21.5 s before, 10.6-12.9 s now (fork 15.2-15.5);
       32k 124.7-127.5 s before, 70.9-73.3 s with pieces of up to a second (82-100 s with half a
       second); the generation keeps 17-20 tokens/s (fork 21-26), its longest gap 0.5-1.0 s (fork
-      0.5-0.6 at 32k). On main with the new prompt attention: being measured (`/var/tmp/ares-share/plan2.txt`).
+      0.5-0.6 at 32k). On main ae836d2 with the new prompt attention
+      (load 10 to 42): 8k 18.8 s before, 15.2 s now (fork 15.2-15.5), 32k 87.2 s before, 59.9 s now
+      (fork 59.8-59.9), the generation 30-31 tokens/s before and 18-20 now, its longest gap 0.31-0.40
+      s before and 0.51-0.62 now (fork 0.51-0.66). Priorities stay: a short request of priority 0
+      beside a generation and a 32k prompt 0.18-0.30 s (before 0.29-0.40), of the same priority
+      40.9-41.0 s (before 37-47: it waits for a place, and while a request waits generation gets half,
+      `prompts_ran`'s `crowded`; at the floor it waited 68-73 s on the old attention).
 - [x] The floor by setting (27B UD-IQ2_XXS on one RTX 4060 Ti, no drafter, generation alone 31
       tokens/s, a 16k prompt alone 21.5 s, beside a generating request): floor 0 23.2 s
       (generation 3.0 tokens/s, the token a piece), 10: 30.5 s (10.1), 20 and 30: 45.4 s (17.2: 31
@@ -1270,7 +1276,9 @@ them), cached turns, one request alone. What it does worse, and why:
       The default of 20 is the fork's generation beside a prompt; the owner's call.
 - [ ] Two prompts at once are read one after the other (shortest first, the order that gives the
       lower mean wait); the second then takes turns with the first's generation, now at the
-      floor and not at half (the agents scenario on main: being measured). Sharing a piece between two prompts would delay the first
+      floor and not at half. The agents' turn with a 5.8k tool result sent at once (main ae836d2):
+      the second agent's first token 17.0 / 17.4 s before, 16.6 / 14.7 s now (fork 9-17), the first
+      agent's turn ends later (13.7 -> 17.4 s cold), its 200 tokens now at the floor. Sharing a piece between two prompts would delay the first
       without bringing the second forward.
 - [ ] A turn that continues at 17-23k reads 576 tokens/s (fork 880; Ares 1020 from the start of a
       prompt): the attention at depth (the long-context piece).
