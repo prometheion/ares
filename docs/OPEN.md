@@ -1142,6 +1142,10 @@ the agents' builds):
       threads spinning; the `moe/prompt-chunks` agent); with `--test-threads=1` it passes.
 
 ## Decided by the owner (2026-11-22)
+- Inkling 2 Mini on Strata is set aside (the owner, 2026-11-23): Strata serves it with thinking
+  forced off (and without prefix reuse for requests with tools), so its quality against the 27B
+  there (code 80 against 91 %, harder agent tasks 8/12 against 12/12) says little about the model.
+  Inkling in Ares stays after the 27B and Flash-Next are on par.
 - CUDA runs only on tested classes (the owner, 2026-11-23): today Ampere (8.6) and Ada (8.9);
   Blackwell (12.0) after the RTX 5060 Ti's tests. Every other GPU goes through the Vulkan backend
   once it runs models; no untested machine code and no PTX fallback (`cuda/tested-archs`).
