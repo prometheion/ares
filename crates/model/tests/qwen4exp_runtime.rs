@@ -891,13 +891,18 @@ fn a_prompt_read_layer_by_layer_gives_the_reference_answer() {
             // Asked again, the prompt comes from the cache: its last rows run as a step.
             let again = ask(&runtime, 2, &prompt, 16);
             let stats = model.take_store_stats().expect("the parts are open");
+            let wide = model.wide_stats().expect("the parts are open");
             runtime.shutdown();
             eprintln!(
-                "PASS {placement:?} own {own}: {} tokens as the reference's before the first                  difference (steps of {own} rows: {}), {} as those steps'; {} loans",
+                "PASS {placement:?} own {own}: {} tokens as the reference's before the first \
+                 difference (steps of {own} rows: {}), {} as those steps'; {} loans; {} experts \
+                 missed, {} of them on the CPU",
                 leading(&passed, &reference),
                 leading(&steps, &reference),
                 leading(&passed, &steps),
                 stats.scratch_loans,
+                wide.missing,
+                wide.cpu_experts,
             );
             assert!(stats.scratch_loans >= 1, "{placement:?}: no pass lent VRAM");
             assert!(
@@ -1019,6 +1024,52 @@ fn submit_timed(
     (rx, first)
 }
 
+/// A prompt read layer by layer with few enough rows has the CPU compute the experts it misses
+/// that are in RAM (`Serve::Cpu`: every one it can): the micro-batches' mixed input reaches the
+/// host in the layout of all the pass's rows, and the CPU's sums go into their chunks' rows.
+/// The prompt's token is the reference's in every placement.
+#[test]
+fn a_prompt_read_layer_by_layer_has_the_cpu_compute_its_misses() {
+    if !enabled() {
+        return;
+    }
+    let warm_up = prompt(400, 9);
+    let prompt = prompt(400, 5);
+    let path = gguf_path_of(1, GgmlType::BF16, GgmlType::Q4_0);
+    let reference = reference_answer_at(&path, &prompt, 16);
+    let leading = |a: &[u32], b: &[u32]| a.iter().zip(b).take_while(|(x, y)| x == y).count();
+    for placement in placements() {
+        // The same in steps of the own rows, whose misses the CPU takes as well.
+        let (runtime, _) = start_serving(&path, placement, 16, 0, 32, Serve::Cpu, Some(16 << 20));
+        let _ = ask(&runtime, 1, &warm_up, 4);
+        let steps = ask(&runtime, 2, &prompt, 16);
+        runtime.shutdown();
+        let (runtime, model) =
+            start_serving(&path, placement, 16, 512, 32, Serve::Cpu, Some(16 << 20));
+        // A first prompt brings experts into RAM, whose misses the CPU takes.
+        let _ = ask(&runtime, 1, &warm_up, 4);
+        let passed = ask(&runtime, 2, &prompt, 16);
+        let wide = model.wide_stats().expect("the parts are open");
+        runtime.shutdown();
+        eprintln!(
+            "PASS-CPU {placement:?}: {} tokens as the reference's (in steps: {}), {} as the \
+             steps'; {} experts missed, {} on the CPU for {} pairs; {passed:?} {steps:?} \
+             {reference:?}",
+            leading(&passed, &reference),
+            leading(&steps, &reference),
+            leading(&passed, &steps),
+            wide.missing,
+            wide.cpu_experts,
+            wide.cpu_pairs,
+        );
+        assert!(wide.cpu_experts > 0, "{placement:?}: the CPU computed nothing");
+        // Which misses the CPU takes depends on the times it measures, and its 8-bit rows
+        // flip a made-up model's near ties after the prompt from run to run (in steps too):
+        // the prompt's own token is the reference's.
+        assert!(leading(&passed, &reference) >= 1, "{placement:?}: {passed:?}");
+    }
+}
+
 /// [`start_at`] whose prompts read alone run layer by layer in steps of up to `pass_rows`
 /// rows (0: in steps of the own scratch), in micro-batches of `own` rows.
 fn start_passing(
@@ -1028,11 +1079,30 @@ fn start_passing(
     pass_rows: u32,
     own: u32,
 ) -> (Runtime, Arc<Qwen4Exp>) {
+    start_serving(path, placement, pages, pass_rows, own, Serve::Measured, None)
+}
+
+/// [`start_passing`] whose misses are served as `serve` says, with `slot_bytes` bytes of
+/// expert slots in VRAM per device when given.
+fn start_serving(
+    path: &std::path::Path,
+    placement: Placement,
+    pages: u32,
+    pass_rows: u32,
+    own: u32,
+    serve: Serve,
+    slot_bytes: Option<u64>,
+) -> (Runtime, Arc<Qwen4Exp>) {
     let devices = open_devices(placement);
     let gguf = Gguf::open(path).unwrap();
     let n_layer = Config::from_gguf(&gguf).unwrap().n_layer;
     let mut opts = options(placement, n_layer, pages, MAX_ROWS, own);
     opts.pass_rows = pass_rows;
+    opts.serve = serve;
+    if slot_bytes.is_some() {
+        opts.slot_bytes = slot_bytes;
+        opts.reserve = None;
+    }
     let inner =
         Arc::new(Qwen4Exp::new(gguf, byte_tokenizer(None), "made", &devices, opts, CELLS).unwrap());
     let config =

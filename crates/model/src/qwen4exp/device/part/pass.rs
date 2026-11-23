@@ -707,6 +707,22 @@ impl Part {
         Some((c.record, row0, c.rows))
     }
 
+    /// In a pass, while a micro-batch runs: its first row among the pass's rows, and the
+    /// pass's rows.
+    pub(super) fn pass_rows(&self) -> Option<(u32, u32)> {
+        let state = self.pass.as_ref()?;
+        let (chunk, row0, _) = state.micro[state.running?];
+        let all = state.at.chunks.iter().map(|c| c.rows).sum();
+        Some((state.at.chunks[chunk].first + row0, all))
+    }
+
+    /// While a pass runs: where the outputs of its rows lie, per chunk its first row among
+    /// the pass's, its rows and its output.
+    pub(super) fn pass_outputs(&self) -> Option<Vec<(u32, u32, DevicePtr)>> {
+        let state = self.pass.as_ref().filter(|p| p.active)?;
+        Some(state.at.chunks.iter().map(|c| (c.first, c.rows, c.out)).collect())
+    }
+
     /// In a pass: copies the experts' f16 input of the running micro-batch's `rows` rows,
     /// prepared at `prepared` in the form of a step of its rows, into its chunk's.
     ///

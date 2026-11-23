@@ -556,20 +556,32 @@ impl Part {
     unsafe fn copy_cpu_act(&mut self, stream: &Stream, rows: u32) -> Result<(), ModelError> {
         let m = self.at(self.f.s.m);
         let n = self.n as usize;
-        let in_pass = self.pass_record().is_some();
+        // A micro-batch of a pass copies its rows where they are among the pass's, whose
+        // experts the CPU takes part in when the pass has few enough rows.
+        let (first, all) = self.pass_rows().unwrap_or((0, rows));
         let wide = self.wide_state.as_mut().ok_or_else(|| invalid("no wide state"))?;
         wide.act_pending = false;
-        // A pass computes no expert on the CPU: its layers' experts run for all its rows.
-        if rows > wide.cpu_rows || in_pass {
+        if all > wide.cpu_rows {
             return Ok(());
         }
-        let bytes = ares_runtime::expert_store::cpu::act_bytes(n, rows as usize);
         wide.act_ready.record(stream)?;
         self.side.wait_event(&wide.act_ready)?;
+        // The codes of the rows, then their scales, each in the layout of all the rows
+        // (`ares_runtime::expert_store::cpu::act_bytes`).
+        let codes = rows as usize * n;
+        let codes_all = all as usize * n;
+        let host = wide.host_act.as_mut_ptr();
         // SAFETY: the buffer holds the codes and scales of `cpu_rows` rows; the host reads
         // it only between `act_copied` and the next layer's copy, which is enqueued after
         // the host is done with this layer.
-        unsafe { self.side.copy_to_host(wide.host_act.as_mut_ptr(), m, bytes)? };
+        unsafe {
+            self.side.copy_to_host(host.add(first as usize * n), m, codes)?;
+            self.side.copy_to_host(
+                host.add(codes_all.next_multiple_of(16) + first as usize * n / 32 * 8),
+                m.offset(codes.next_multiple_of(16) as u64),
+                codes / 32 * 8,
+            )?;
+        }
         wide.act_copied.record(&self.side)?;
         wide.act_pending = true;
         Ok(())
@@ -613,6 +625,8 @@ impl Part {
         let n = self.n as usize;
         let (out, device_sums) = (self.at(s.out), self.at(s.cpu_sums));
         let rows = env.record.dims().n_rows as usize;
+        // In a pass the rows' outputs lie in its chunks.
+        let chunks = self.pass_outputs();
         let wide = self.wide_state.as_mut().ok_or_else(|| invalid("no wide state"))?;
         if wide.sums_pending && !wide.sums_copied.is_done()? {
             return Ok(false);
@@ -624,15 +638,32 @@ impl Part {
         {
             return Err(invalid(format!("{values} sums from row {first} of {rows}")));
         }
-        let out = out.offset(u64::from(first) * n as u64 * 4);
         // SAFETY: the page-locked buffer and the device's hold `cpu_rows` rows, and the copy
-        // that read the page-locked one before has run; the output holds the step's rows.
+        // that read the page-locked one before has run; the output holds the step's rows (a
+        // chunk of a pass its own).
         unsafe {
             let host = wide.host_sums.as_mut_ptr();
             std::ptr::copy_nonoverlapping(sums.as_ptr().cast::<u8>(), host, values * 4);
             stream.copy_from_host(device_sums, host, values * 4)?;
             wide.sums_copied.record(stream)?;
-            self.kernels.add_f32(stream, out, device_sums, values as u32)?;
+            let end = first + (values / n) as u32;
+            match chunks {
+                Some(chunks) => {
+                    for (start, len, at) in chunks {
+                        let (from, to) = (first.max(start), end.min(start + len));
+                        if from >= to {
+                            continue;
+                        }
+                        let dst = at.offset(u64::from(from - start) * n as u64 * 4);
+                        let src = device_sums.offset(u64::from(from - first) * n as u64 * 4);
+                        self.kernels.add_f32(stream, dst, src, (to - from) * n as u32)?;
+                    }
+                }
+                None => {
+                    let out = out.offset(u64::from(first) * n as u64 * 4);
+                    self.kernels.add_f32(stream, out, device_sums, values as u32)?;
+                }
+            }
         }
         wide.sums_pending = true;
         self.mark(stream, Phase::Experts)?;

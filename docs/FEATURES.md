@@ -25,9 +25,12 @@ the kernels exist; no model runs there yet.
   expert from the SSD only while it is worth the wait.
 - Prompts are read in steps of up to `--ubatch-size` rows (512 by default), in pieces between
   rounds of generation, so running requests go on; while another request waits a piece is at
-  most half a second. A prompt read alone takes steps of up to `--batch-size` rows; on
-  Flash-Next (8192 by default, as far as they fit) their scratch lies in VRAM the expert
-  slots of every pool lend for the step, so a long prompt reads each expert once per step.
+  most half a second. A prompt read alone takes steps of up to `--batch-size` rows: on
+  Flash-Next (32 768 by default, as far as they fit) layer by layer, every micro-batch of the
+  own rows through a layer and then the layer's experts once for all rows, about 56 KiB a row
+  kept on VRAM the expert slots lend for the step; such a step pauses between two
+  micro-batches when a request comes, which then runs at once. (With K/V of a tile mean or a
+  DFlash drafter: lent steps of up to 8192 rows, their scratch on VRAM the slots lend.)
 - Flash-Next: in a prompt step of up to 2048 rows the CPU computes the experts few rows
   picked that are in RAM, beside the uploads, as the cost model splits them: a turn whose
   prompt is cached but for its last rows does not wait for a pass of uploads.

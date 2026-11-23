@@ -152,6 +152,10 @@ pub struct Options {
     /// The part keeps the buffers for it: the sums on the device, and the rows' activations
     /// and the sums in page-locked memory.
     pub cpu_rows: u32,
+    /// The most rows of a prompt the part reads layer by layer (`part/pass.rs`); 0 for none.
+    /// The buffers of the CPU's share are sized for passes of up to [`Options::cpu_rows`] rows
+    /// too.
+    pub pass_rows: u32,
 }
 
 impl Default for Options {
@@ -175,16 +179,20 @@ impl Default for Options {
             predict: 2,
             head_order: None,
             cpu_rows: wide::CPU_ROWS,
+            pass_rows: 0,
         }
     }
 }
 
 impl Options {
-    /// The most rows of a wide step in which the CPU takes part ([`Options::cpu_rows`]): none
-    /// with [`Precision::Exact`], whose wide steps multiply the experts' f16 rows, where the
-    /// CPU's are 8-bit.
+    /// The most rows of a wide step or a pass in which the CPU takes part
+    /// ([`Options::cpu_rows`]): none with [`Precision::Exact`], whose wide steps multiply the
+    /// experts' f16 rows, where the CPU's are 8-bit.
     pub fn wide_cpu_rows(&self) -> u32 {
-        if self.precision == Precision::Exact { 0 } else { self.cpu_rows.min(self.max_rows) }
+        match self.precision {
+            Precision::Exact => 0,
+            _ => self.cpu_rows.min(self.max_rows.max(self.pass_rows)),
+        }
     }
 
     /// The most rows of a step on the part's own scratch.

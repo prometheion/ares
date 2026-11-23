@@ -356,7 +356,11 @@ impl Misses {
                             return Ok(Progress::Waiting);
                         };
                         let source = Arc::clone(&self.source);
-                        let record = source.record(self.layer);
+                        let span = self.span.clone();
+                        let record = match &span {
+                            Some(span) => span.record(),
+                            None => source.record(self.layer),
+                        };
                         let counts = part.picked_counts(self.layer, self.rows, record);
                         let picks = self.split_for_cpu(feed, record, &counts);
                         if !picks.is_empty() {

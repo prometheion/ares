@@ -903,6 +903,8 @@ impl Qwen4Exp {
         }
         // The sampler reads the logits on the device.
         opts.part.host_logits = false;
+        // The parts read prompts layer by layer up to this many rows.
+        opts.part.pass_rows = opts.pass_rows;
         let weights = Weights::load(&gguf, &config)?;
         let (placement, page_bytes) = place_in(&gguf, &config, &weights, devices, &opts)?;
         let (layout, _map) = Layout::new(&gguf, &config, &weights, &placement, None)?;
