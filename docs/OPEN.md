@@ -1268,7 +1268,20 @@ them), cached turns, one request alone. What it does worse, and why:
       s before and 0.51-0.62 now (fork 0.51-0.66). Priorities stay: a short request of priority 0
       beside a generation and a 32k prompt 0.18-0.30 s (before 0.29-0.40), of the same priority
       40.9-41.0 s (before 37-47: it waits for a place, and while a request waits generation gets half,
-      `prompts_ran`'s `crowded`; at the floor it waited 68-73 s on the old attention).
+      `prompts_ran`'s `crowded`; at the floor it waited 68-73 s on the old attention). A 98k prompt
+      beside a generating request 233 s (old main 754-763 s, fork 209-219), the generation at 20.8
+      tokens/s, its longest gap 0.52 s. Two at once and 3 / 4 at once unchanged within one round
+      each (pair sums 110.6 / 111.7 / 124.6 against 108.5 / 108.3 / 127.9; many 3 106.0 against 106.2;
+      many 4 97.7 against 115.1, whose queued requests' texts differ run to run and copy by n-grams
+      differently).
+- [ ] `--parallel` (the owner's call; measured with this branch on main ae836d2, 262144 cells): at 4,
+      3 / 4 / 8 at once 133 / 127 / 125 tokens/s at load 37 to 45 (the parallel comparison at 4: 117-120
+      / 139-149 / 143-150), every first token of 4 within 0.33 s, a 32k prompt beside generation
+      56.7 s; VRAM 11 523 / 10 523 MiB (+80 / +440 over 2). At 8: 136 / 150 / 210 tokens/s, every first
+      token of 8 within 0.51 s, the 32k prompt 57.3 s; VRAM 11 617 / 11 425 MiB (+170 / +1 340). At 2
+      a third request waits for a place (5 to 8 s here, 19-55 s beside long work), and while it waits
+      generation gets half of the time. Recommended for agents with sub-agents: 4 (the third and
+      fourth get places at once for 0.5 GiB of the RTX 3060); 8 when the 3060's last GiB is free.
 - [x] The floor by setting (27B UD-IQ2_XXS on one RTX 4060 Ti, no drafter, generation alone 31
       tokens/s, a 16k prompt alone 21.5 s, beside a generating request): floor 0 23.2 s
       (generation 3.0 tokens/s, the token a piece), 10: 30.5 s (10.1), 20 and 30: 45.4 s (17.2: 31
