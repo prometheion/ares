@@ -1148,6 +1148,14 @@ them), cached turns, one request alone. What it does worse, and why:
   for two at once, the fork 12 to 24 % (its step grows from 33.6 to 40 ms: its samplers and host
   work). One Ares round during heavy builds (load 13 to 28) lost more (4 at once 83 against 108
   tokens/s); not repeated.
+- [ ] Flash-Next (IQ2_XS, both cards, `--ram 8G`, 40960 cells; the fork has none): two at once
+      give 44 to 54 tokens/s in sum (alone 19 to 40), but 3 or 4 at once stay at 32 to 35 with
+      `--parallel 2` and with `--parallel 4` (more sequences pick more experts that RAM and the SSD
+      bring). An 8k prompt beside a generating request takes 295 s against 25.6 s alone (11.5
+      times), the generation keeps 20.6 of 28.1 tokens/s, its longest gap 3.0 s: alone the prompt
+      runs in 9 wide steps on lent VRAM, beside it in pieces in the model's own memory that each
+      read the experts again (5.3 million expert picks against 51 thousand, 240 s of expert waits
+      against 32). The layer-major pass (handed back) is the lever.
 - Seen of the fork: a short request sent 0.5 s before a 32k prompt had its first token after 34 s
   (three of four runs): its prompt went into the same batches as the long one, since concurrent
   prefill starts only once a slot generates. Ares in the same spot: 0.15-0.75 s.
