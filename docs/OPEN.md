@@ -1083,6 +1083,10 @@ the agents' builds):
       threads spinning; the `moe/prompt-chunks` agent); with `--test-threads=1` it passes.
 
 ## Decided by the owner (2026-11-22)
+- Order from 2026-11-23 (the owner): 1 prefill (the 27B's long prompts, Flash-Next's prompts and
+  cached agent turns), 2 the fixes the parallel-request comparison finds, 3 large mixtures of
+  experts from the SSD (UD-Q4_K_XL and UD-Q5_K_XL against the newest Strata), 4 Jev mode, 5 the
+  few-row expert kernels; then Inkling 2 Mini and trees.
 - Inkling 2 Mini in Ares comes after the 27B and Flash-Next are at least as fast as the fork and
   Strata in everything (the owner, 2026-11-23); the test of Inkling on Strata goes on only as a
   judgement of the model.
