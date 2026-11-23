@@ -1142,6 +1142,9 @@ the agents' builds):
       threads spinning; the `moe/prompt-chunks` agent); with `--test-threads=1` it passes.
 
 ## Decided by the owner (2026-11-22)
+- CUDA runs only on tested classes (the owner, 2026-11-23): today Ampere (8.6) and Ada (8.9);
+  Blackwell (12.0) after the RTX 5060 Ti's tests. Every other GPU goes through the Vulkan backend
+  once it runs models; no untested machine code and no PTX fallback (`cuda/tested-archs`).
 - Order from 2026-11-23 (the owner): 1 prefill (the 27B's long prompts, Flash-Next's prompts and
   cached agent turns), 2 the fixes the parallel-request comparison finds, 3 large mixtures of
   experts from the SSD (UD-Q4_K_XL and UD-Q5_K_XL against the newest Strata), 4 Jev mode, 5 a pass over
