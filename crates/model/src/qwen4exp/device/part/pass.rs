@@ -182,8 +182,7 @@ impl PassLayout {
         let mut buffers: Vec<u64> = rows.iter().flat_map(|r| sizes.chunk(*r)).collect();
         buffers.push(sizes.hidden(rows.iter().copied().max().unwrap_or(0)));
         let (offsets, held) = lay_out_in(pieces, &buffers)?;
-        let chunks =
-            offsets.chunks_exact(BUFFERS).map(|c| c.try_into().expect("whole chunks")).collect();
+        let chunks = offsets.as_chunks::<BUFFERS>().0.to_vec();
         Some(Self { chunks, rows: rows.to_vec(), hidden: *offsets.last()?, held })
     }
 

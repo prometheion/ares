@@ -967,13 +967,16 @@ fn a_request_cuts_in_between_the_pieces_of_a_long_prompt() {
     }
 }
 
+/// When a request's first text arrived, once it has.
+type FirstText = Arc<Mutex<Option<std::time::Instant>>>;
+
 /// [`submit`], which also notes when the request's first text arrived.
 fn submit_timed(
     runtime: &Runtime,
     id: u64,
     prompt: &[u32],
     max_tokens: u32,
-) -> (mpsc::Receiver<Result<Vec<u32>, String>>, Arc<Mutex<Option<std::time::Instant>>>) {
+) -> (mpsc::Receiver<Result<Vec<u32>, String>>, FirstText) {
     let (tx, rx) = mpsc::channel();
     let first = Arc::new(Mutex::new(None));
     let text = Arc::new(Mutex::new(String::new()));

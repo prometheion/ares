@@ -931,6 +931,7 @@ impl Oracle {
         Ok(poisoned)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn step(
         &mut self,
         model: &crate::SyntheticModel,

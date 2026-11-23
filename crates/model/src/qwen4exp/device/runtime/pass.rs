@@ -648,7 +648,8 @@ impl Qwen4ExpDevice {
             if replay {
                 record.mark_replay(0)?;
             }
-            let replay = if replay { vec![0..rows] } else { Vec::new() };
+            let replay: Vec<std::ops::Range<u32>> =
+                if replay { std::iter::once(0..rows).collect() } else { Vec::new() };
             let env = StepEnv {
                 stream,
                 record: &record,
