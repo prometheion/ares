@@ -1182,7 +1182,10 @@ fn a_request_runs_between_the_pieces_of_a_paused_step() {
     let shape = |c: &mut SyntheticConfig| c.own_rows = 16;
     let model = model(Some(CHECKPOINT), shape);
     let pieces = 40;
-    let e = engine_with(&model, paused_config(), |host| {
+    // A floor of generation that the rounds cannot reach: the short request gets half of
+    // the time, a round for each piece of the long prompt.
+    let config = RuntimeConfig { generation_floor: 1e6, ..paused_config() };
+    let e = engine_with(&model, config, |host| {
         host.with_pauses(16, pieces).with_delay(Duration::from_millis(2))
     });
     let long_run = start(&e.rt, request(&long, Some(20))).unwrap();
@@ -1201,6 +1204,48 @@ fn a_request_runs_between_the_pieces_of_a_paused_step() {
     assert!(paused < u64::from(pieces) / 2, "{paused} pauses while the short request ran");
     assert_eq!(short_done.text, fresh(shape, &short, 5).text);
     assert_eq!(long_done.text, fresh(shape, &long, 20).text);
+    assert_consistent(&e);
+}
+
+/// A model that pauses its wide steps reads a long prompt that comes while another
+/// sequence generates in such steps too: a step of the prompt's rows alone, as wide as a
+/// prompt read alone, whose pieces the generating sequence's rounds run between; both
+/// answer as they do alone.
+#[test]
+fn a_long_prompt_beside_generation_is_read_in_wide_steps_that_pause() {
+    let mut rng = Rng(14);
+    let first = text_of(&mut rng, 10);
+    let long = text_of(&mut rng, 240);
+    let shape = |c: &mut SyntheticConfig| {
+        c.own_rows = 16;
+        c.pauses_wide_steps = true;
+    };
+    let model = model(Some(CHECKPOINT), shape);
+    // Per step: the rows of its widest segment and its segments.
+    let seen: Arc<Mutex<Vec<(u32, u32)>>> = Arc::default();
+    let observed = seen.clone();
+    let e = engine_with(&model, paused_config(), |host| {
+        host.with_pauses(16, 4).with_delay(Duration::from_millis(1)).with_observer(move |view| {
+            let widest = (0..view.segments()).map(|i| view.segment(i).n_rows).max().unwrap_or(0);
+            observed.lock().unwrap().push((widest, view.segments()));
+        })
+    });
+    let generating = start(&e.rt, request(&first, Some(400))).unwrap();
+    let head = generating.wait_for_text(20);
+    let before = seen.lock().unwrap().len();
+    let long_done = run_one(&e.rt, request(&long, Some(20)));
+    let after = seen.lock().unwrap().len();
+    let generated = generating.finish();
+    let steps: Vec<(u32, u32)> = seen.lock().unwrap()[before..after].to_vec();
+    let wide: Vec<usize> = (0..steps.len()).filter(|&i| steps[i].0 > 16).collect();
+    assert!(wide.len() >= 4, "the prompt's wide step ran in pieces: {steps:?}");
+    assert!(wide.iter().all(|&i| steps[i].1 == 1), "a wide step has the prompt's rows alone");
+    assert!(
+        wide.windows(2).any(|pair| pair[1] > pair[0] + 1),
+        "rounds ran between the pieces: {steps:?}"
+    );
+    assert_eq!(long_done.text, fresh(shape, &long, 20).text);
+    assert_eq!(format!("{head}{}", generated.text), fresh(shape, &first, 400).text);
     assert_consistent(&e);
 }
 

@@ -2142,7 +2142,7 @@ impl Conductor {
         self.want(turn);
         let drafting =
             self.requests.iter().any(|r| matches!(r.want, Want::Window { drafts } if drafts > 0));
-        let limits = Limits {
+        let mut limits = Limits {
             max_rows: if drafting {
                 self.max_rows.min(self.model.draft_rows())
             } else {
@@ -2154,6 +2154,38 @@ impl Conductor {
             },
             starvation_steps: self.config.starvation_steps,
         };
+        // A long prompt next to generating sequences, for a model that pauses its
+        // wide steps (a prompt read layer by layer): the prompt's step is as wide
+        // as when it is read alone and has its rows alone, and it pauses once the
+        // time of a piece has passed; the rounds run between its pieces. Every
+        // expert is then read once for all its rows, and not once a piece.
+        let wide =
+            Limits { max_rows: self.max_rows, prefill_rows_with_windows: self.max_rows, ..limits };
+        let pass = matches!(turn, Turn::Piece { .. })
+            && generating > 0
+            && paused.is_none()
+            && self.max_rows > piece
+            && self.model.pauses_wide_steps()
+            && {
+                let prompts: Vec<Request> = self
+                    .requests
+                    .iter()
+                    .filter(|r| matches!(r.want, Want::Prefill { .. }))
+                    .copied()
+                    .collect();
+                // The prompt the planner reads first, when it has more than a
+                // piece left.
+                match plan(&prompts, &wide).parts.first() {
+                    Some(first) if first.rows > piece => {
+                        self.requests.retain(|r| r.seq == first.seq);
+                        true
+                    }
+                    _ => false,
+                }
+            };
+        if pass {
+            limits = wide;
+        }
         let planned = plan(&self.requests, &limits);
         for request in &self.requests {
             if let Some(a) = self.slots[request.seq.0 as usize].as_mut() {
@@ -2332,7 +2364,12 @@ impl Conductor {
         } else {
             0.0
         };
-        let used = match self.write_record(false) {
+        if pass {
+            self.pause_ms = self.config.piece_ms.max(1.0) as u32;
+        }
+        let used = self.write_record(false);
+        self.pause_ms = 0;
+        let used = match used {
             Ok(used) => used,
             Err(message) => return self.fail(message),
         };

@@ -95,6 +95,10 @@ pub struct SyntheticConfig {
     /// Whether the model saves states inside a prompt step wider than its own
     /// rows ([`Model::saves_inside_steps`]).
     pub inner_saves: bool,
+    /// Whether the model says that it pauses a prompt step wider than its own
+    /// rows between pieces ([`Model::pauses_wide_steps`]); the executor plays
+    /// the pauses (`HostExecutor::with_pauses`).
+    pub pauses_wide_steps: bool,
     /// For a layer split: how many layers each device holds. Empty: even.
     pub layers_per_device: Vec<u32>,
     /// For a tensor split: each device's share of the rows of every block, as
@@ -168,6 +172,7 @@ impl SyntheticConfig {
             max_rows: 64,
             own_rows: 0,
             inner_saves: false,
+            pauses_wide_steps: false,
             layers_per_device: Vec::new(),
             tensor_shares: Vec::new(),
             state_bytes_per_cell: 0,
@@ -624,6 +629,10 @@ impl Model for SyntheticModel {
 
     fn saves_inside_steps(&self) -> u32 {
         if self.config.inner_saves { 4 } else { 0 }
+    }
+
+    fn pauses_wide_steps(&self) -> bool {
+        self.config.pauses_wide_steps
     }
 
     fn own_rows(&self) -> u32 {

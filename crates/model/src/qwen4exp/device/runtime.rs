@@ -2048,6 +2048,12 @@ impl Model for Qwen4Exp {
         true
     }
 
+    fn pauses_wide_steps(&self) -> bool {
+        // A pass pauses between two micro-batches once the record's time has
+        // passed.
+        self.pass_span.get().is_some_and(|&span| span > 0)
+    }
+
     fn pinned_ram(&self) -> u64 {
         self.pinned + self.projector().map_or(0, |p| p.pinned_bytes())
     }

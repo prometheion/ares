@@ -585,6 +585,17 @@ pub trait Model: Send + Sync + 'static {
         false
     }
 
+    /// Whether the model runs a step of one prompt wider than
+    /// [`Model::own_rows`] in pieces that it pauses between when the record's
+    /// time for it has passed ([`DeviceModel::paused`]): a prompt read layer by
+    /// layer. The conductor then reads a long prompt in such steps also while
+    /// other sequences generate, their rounds running between the pieces, so
+    /// that the wide step's economy (every expert read once for all its rows)
+    /// holds next to generation. The default does not pause.
+    fn pauses_wide_steps(&self) -> bool {
+        false
+    }
+
     /// The page-locked RAM the model's device parts hold besides what the
     /// runtime books for the step record and the read-back (the buffers a
     /// step needs, whatever the cache of checkpoints or a tier of experts
