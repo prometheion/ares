@@ -1308,6 +1308,13 @@ the agents' builds):
       with `--test-threads=1` passes, 25 of 25 in 183 s.
 
 ## Decided by the owner (2026-11-22)
+- Greedy output need not be the same from run to run (the owner, 2026-11-23): Strata's is not
+  either; a divergence for speed is fine as long as the output is not wrong. So the expert rows
+  keep their atomic sums, and the unused ordered sum (`Accumulate::Ordered`, `rows_combine`) goes
+  in the cleanup. Tests that compare greedy text with a reference must accept a different token
+  at a near tie (the reference's logits rank both close) and fail only on a token the reference
+  ranks clearly worse: `flash_next_writes_with_drafts_what_it_writes_without`, the MTP links
+  after a pass and the wide-step bound fail now at such ties.
 - Inkling 2 Mini on Strata is set aside (the owner, 2026-11-23): Strata serves it with thinking
   forced off (and without prefix reuse for requests with tools), so its quality against the 27B
   there (code 80 against 91 %, harder agent tasks 8/12 against 12/12) says little about the model.
