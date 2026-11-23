@@ -98,26 +98,6 @@ fn decodes_the_corpus_to_the_text_it_came_from() {
 }
 
 #[test]
-fn encodes_on_threads_to_the_same_tokens() {
-    let Some((_, tokenizer)) = model() else { return };
-    let mut text = Vec::new();
-    while text.len() < 400_000 {
-        for (_, file) in corpus() {
-            text.extend_from_slice(&file);
-            text.push(b'\n');
-        }
-    }
-    let serial = tokenizer.encode(&text, options(true));
-    for threads in [2, 5, 16] {
-        assert_eq!(
-            tokenizer.encode_parallel(&text, options(true), threads),
-            serial,
-            "{threads} threads"
-        );
-    }
-}
-
-#[test]
 fn knows_the_vocabulary_of_the_qwen_models() {
     let Some((gguf, tokenizer)) = model() else { return };
     assert_eq!(gguf.str("tokenizer.ggml.pre"), Some("qwen35"));

@@ -76,22 +76,6 @@ fn main() {
         mb / median(&mut warm)
     );
 
-    let serial = ids.clone();
-    for threads in [2, 4, 8] {
-        let mut times = Vec::new();
-        for _ in 0..repeats {
-            let start = Instant::now();
-            ids = tokenizer.encode_parallel(&text, options, threads);
-            times.push(start.elapsed().as_secs_f64());
-        }
-        assert_eq!(ids, serial, "{threads} threads give the same tokens");
-        println!(
-            "  {threads} threads: best {:.1} MB/s, median {:.1} MB/s",
-            mb / best(&times),
-            mb / median(&mut times)
-        );
-    }
-
     let mut decode = Vec::new();
     let mut bytes = Vec::new();
     for _ in 0..repeats {

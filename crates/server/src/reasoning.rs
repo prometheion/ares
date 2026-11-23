@@ -652,6 +652,6 @@ fn skip(text: &str, layout: &str, finished: bool) -> Option<usize> {
 }
 
 #[cfg(test)]
-mod templates;
+pub(crate) mod templates;
 #[cfg(test)]
 mod tests;

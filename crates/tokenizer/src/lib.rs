@@ -25,14 +25,6 @@
 //! let messages = [Message::new("system", "Be brief."), Message::new("user", "Hi")];
 //! let prompt = tokenizer.render_chat(&messages, &[], &ChatOptions::default())?;
 //! let ids = tokenizer.encode(&prompt, EncodeOptions { add_special: true, parse_special: true });
-//!
-//! // Tokens of a reply, as they arrive.
-//! let mut detokenizer = tokenizer.detokenizer(false);
-//! let mut text = Vec::new();
-//! for id in [9419, 1814] {
-//!     detokenizer.push(id, &mut text)?;
-//! }
-//! detokenizer.finish(&mut text);
 //! # Ok(())
 //! # }
 //! ```
@@ -69,9 +61,8 @@
 //! # Speed
 //!
 //! Encoding runs at tens of megabytes per second on one core, more than an order
-//! of magnitude faster than llama.cpp's tokenizer, and
-//! [`Tokenizer::encode_parallel`] scales that with the cores. What bounds it is the
-//! lookup of merges: most of the time goes into probing a hash table of several
+//! of magnitude faster than llama.cpp's tokenizer. What bounds it is the lookup
+//! of merges: most of the time goes into probing a hash table of several
 //! megabytes for pairs of tokens.
 
 #![forbid(unsafe_code)]
@@ -79,7 +70,6 @@
 mod bpe;
 mod cache;
 mod chat;
-mod decode;
 mod error;
 mod jinja;
 mod json;
@@ -93,7 +83,6 @@ mod unicode_table;
 mod vocab;
 
 pub use chat::{ChatError, ChatOptions, ChatTemplate, Content, Message, Tool, ToolCall};
-pub use decode::Detokenizer;
 pub use error::{Error, Result};
 pub use json::{Json, JsonError};
 pub use reasoning::ReasoningFormat;

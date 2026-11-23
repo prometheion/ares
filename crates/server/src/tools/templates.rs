@@ -18,6 +18,7 @@ use ares_tokenizer::{ChatOptions, EncodeOptions, Message, Tokenizer, ToolCall};
 
 use super::*;
 use crate::reasoning::Splitter;
+use crate::reasoning::templates::streamed;
 use crate::reply::{Piece, Sorter};
 
 const FILES: [(&str, &str); 3] = [
@@ -74,15 +75,9 @@ impl Rig {
         let mut sorter =
             Sorter::new(Splitter::extracting(thinking, &thinking.prompt_on), Some(calls));
         let mut pieces = Vec::new();
-        let mut detokenizer = self.tokenizer.detokenizer(false);
-        for id in generated {
-            let mut bytes = Vec::new();
-            detokenizer.push(*id, &mut bytes).unwrap();
-            pieces.extend(sorter.push(&String::from_utf8(bytes).unwrap()));
+        for text in streamed(&self.tokenizer, generated) {
+            pieces.extend(sorter.push(&text));
         }
-        let mut bytes = Vec::new();
-        detokenizer.finish(&mut bytes);
-        pieces.extend(sorter.push(&String::from_utf8(bytes).unwrap()));
         pieces.extend(sorter.finish());
         let mut sorted = Sorted::default();
         for piece in pieces {

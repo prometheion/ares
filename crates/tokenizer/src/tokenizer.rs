@@ -1,7 +1,6 @@
-use std::borrow::Cow;
 use std::cell::RefCell;
 use std::ops::Range;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use ares_gguf::Gguf;
 
@@ -12,8 +11,7 @@ use crate::error::{Error, Result};
 use crate::pretok;
 use crate::reasoning::ReasoningFormat;
 use crate::tools::ToolFormat;
-use crate::unicode::{classes, cpt_at, sanitize};
-use crate::unicode_table::SPACE;
+use crate::unicode::{classes, sanitize};
 use crate::vocab::{Pre, SpecialTokens, Vocab, attr};
 
 /// How [`Tokenizer::encode`] treats the text.
@@ -72,15 +70,6 @@ enum Piece {
     Text(Range<usize>),
     Token(u32),
 }
-
-/// One unit of work of [`Tokenizer::encode_parallel`].
-enum Job<'a> {
-    Text(&'a [u8]),
-    Token(u32),
-}
-
-/// Texts shorter than this are not cut up for threads.
-const PARALLEL_FROM: usize = 64 * 1024;
 
 /// Turns text into token ids and back, as llama.cpp does for the model it was
 /// built from.
@@ -231,118 +220,6 @@ impl Tokenizer {
         let mut out = Vec::with_capacity(text.len() / 3 + 4);
         self.encode_into(text, options, &mut out);
         out
-    }
-
-    /// Like [`encode`](Self::encode), on up to `threads` threads, with the same
-    /// result. For prompts of hundreds of kilobytes; a text of less than 64 KiB
-    /// is encoded on the calling thread.
-    ///
-    /// The text is cut where the pre-tokenizer is certain to cut it too: after a
-    /// line break that is followed by something other than white space. A text
-    /// without such places is not split.
-    pub fn encode_parallel(
-        &self,
-        text: impl AsRef<[u8]>,
-        options: EncodeOptions,
-        threads: usize,
-    ) -> Vec<u32> {
-        let text = text.as_ref();
-        if threads <= 1 || text.len() < PARALLEL_FROM {
-            return self.encode(text, options);
-        }
-        let pieces = self
-            .pieces(text, options.parse_special)
-            .unwrap_or_else(|| vec![Piece::Text(0..text.len())]);
-        // Text is cleaned of malformed UTF-8 piece by piece, as in `encode_into`.
-        let cleaned: Vec<Option<Cow<'_, [u8]>>> = pieces
-            .iter()
-            .map(|piece| match piece {
-                Piece::Text(range) => Some(sanitize(&text[range.clone()])),
-                Piece::Token(_) => None,
-            })
-            .collect();
-        let mut jobs: Vec<Job<'_>> = Vec::new();
-        for (piece, cleaned) in pieces.iter().zip(&cleaned) {
-            match (piece, cleaned) {
-                (Piece::Token(id), _) => jobs.push(Job::Token(*id)),
-                (_, Some(text)) => {
-                    let mut from = 0;
-                    for cut in self.cut_points(text, threads) {
-                        jobs.push(Job::Text(&text[from..cut]));
-                        from = cut;
-                    }
-                    jobs.push(Job::Text(&text[from..]));
-                }
-                (Piece::Text(_), None) => unreachable!("every text piece was cleaned"),
-            }
-        }
-
-        let next = AtomicUsize::new(0);
-        let mut done: Vec<(usize, Vec<u32>)> = std::thread::scope(|scope| {
-            let workers: Vec<_> = (0..threads.min(jobs.len()))
-                .map(|_| {
-                    scope.spawn(|| {
-                        let mut mine = Vec::new();
-                        loop {
-                            let index = next.fetch_add(1, Ordering::Relaxed);
-                            let Some(job) = jobs.get(index) else { break };
-                            let mut tokens = Vec::new();
-                            match job {
-                                Job::Token(id) => tokens.push(*id),
-                                // Already clean, so `encode_text` finds nothing to change.
-                                Job::Text(text) => self.encode_text(text, &mut tokens),
-                            }
-                            mine.push((index, tokens));
-                        }
-                        mine
-                    })
-                })
-                .collect();
-            workers
-                .into_iter()
-                .flat_map(|w| w.join().expect("an encoder thread does not panic"))
-                .collect()
-        });
-        done.sort_unstable_by_key(|(index, _)| *index);
-
-        let mut out = Vec::with_capacity(done.iter().map(|(_, t)| t.len()).sum::<usize>() + 2);
-        if options.add_special && self.vocab.add_bos {
-            out.extend(self.vocab.special.bos);
-        }
-        for (_, tokens) in done {
-            out.extend(tokens);
-        }
-        if options.add_special && self.vocab.add_eos {
-            out.extend(self.vocab.special.eos);
-        }
-        out
-    }
-
-    /// Where `text` (clean) can be cut into about `parts` pieces of the same
-    /// size: after a line break, before something that is not white space. At
-    /// such a place the pre-tokenizer always ends a word, whatever came before,
-    /// so the pieces encode on their own to what the whole text does.
-    fn cut_points(&self, text: &[u8], parts: usize) -> Vec<usize> {
-        if text.len() < PARALLEL_FROM {
-            return Vec::new();
-        }
-        let classes = classes();
-        let mut cuts = Vec::new();
-        let mut at = 0;
-        for part in 1..parts {
-            at = at.max(part * text.len() / parts);
-            let found = (at.max(1)..text.len()).find(|&i| {
-                matches!(text[i - 1], b'\n' | b'\r') && classes.class(cpt_at(text, i).0) != SPACE
-            });
-            match found {
-                Some(cut) => {
-                    cuts.push(cut);
-                    at = cut;
-                }
-                None => break,
-            }
-        }
-        cuts
     }
 
     /// Like [`encode`](Self::encode), appending to `out`.
@@ -516,11 +393,6 @@ impl Tokenizer {
             out.extend_from_slice(self.piece(id, special)?);
         }
         Ok(out)
-    }
-
-    /// A decoder for tokens that arrive one at a time.
-    pub fn detokenizer(&self, special: bool) -> crate::Detokenizer<'_> {
-        crate::Detokenizer::new(self, special)
     }
 }
 

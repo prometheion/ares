@@ -27,6 +27,23 @@ struct Rig {
     tokenizer: Tokenizer,
 }
 
+/// The text of the tokens `ids` in the pieces the engine hands it on in: the
+/// text of each token, with the start of a character held back until its
+/// other bytes arrive. (What the tests generate is valid UTF-8.)
+pub(crate) fn streamed(tokenizer: &Tokenizer, ids: &[u32]) -> Vec<String> {
+    let mut held = Vec::new();
+    ids.iter()
+        .map(|&id| {
+            held.extend_from_slice(tokenizer.piece(id, false).unwrap());
+            let whole = match std::str::from_utf8(&held) {
+                Ok(text) => text.len(),
+                Err(error) => error.valid_up_to(),
+            };
+            String::from_utf8(held.drain(..whole).collect()).unwrap()
+        })
+        .collect()
+}
+
 fn rig(variable: &str, name: &'static str) -> Option<Rig> {
     let Some(path) = std::env::var_os(variable) else {
         eprintln!("skipped: set {variable} to the model file of {name}");
@@ -109,22 +126,14 @@ impl Rig {
         let asked = asked(&Fields(&kwargs)).unwrap();
         let mut splitter = plan(&asked, Some(&format), ReasoningFormat::Auto).unwrap().splitter;
         let mut sorted = Split::default();
-        let mut detokenizer = self.tokenizer.detokenizer(false);
-        for id in ids {
-            let mut bytes = Vec::new();
-            detokenizer.push(*id, &mut bytes).unwrap();
-            let piece = splitter.push(&String::from_utf8(bytes).unwrap());
+        for text in streamed(&self.tokenizer, ids) {
+            let piece = splitter.push(&text);
             sorted.reasoning.push_str(&piece.reasoning);
             sorted.content.push_str(&piece.content);
         }
-        let mut bytes = Vec::new();
-        detokenizer.finish(&mut bytes);
-        let mut rest = splitter.push(&String::from_utf8(bytes).unwrap());
         let last = splitter.finish();
-        rest.reasoning.push_str(&last.reasoning);
-        rest.content.push_str(&last.content);
-        sorted.reasoning.push_str(&rest.reasoning);
-        sorted.content.push_str(&rest.content);
+        sorted.reasoning.push_str(&last.reasoning);
+        sorted.content.push_str(&last.content);
         sorted
     }
 
