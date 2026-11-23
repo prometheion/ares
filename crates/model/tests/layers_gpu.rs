@@ -30,33 +30,20 @@
 // the same shapes; a comment on each of the launches would repeat that.
 #![allow(clippy::undocumented_unsafe_blocks)]
 
-use std::sync::OnceLock;
-
 use ares_cuda as backend;
 use ares_model::qwen35::reference::pieces::l2_norm;
 use backend::{
     Device, DeviceBuffer, DevicePtr, EmbedRows, KeptRows, Kernels, LayerKernels, Precision,
-    PrefillPath, RecurrentShape, Segment, StateFormat, StepDims, StepRecord, Stream, Wait,
-    device_count, quantized_activation_bytes,
+    PrefillPath, RecurrentShape, Segment, StateFormat, StepDims, StepRecord, Stream,
+    quantized_activation_bytes,
 };
-use layers::{DeviceMatrix, Rng, random, rel_max};
+use common::gpu::gpus;
+use common::helpers::{Rng, rel_max};
+use layers::DeviceMatrix;
+
+mod common;
 
 mod layers;
-
-fn gpus() -> Option<&'static [Device]> {
-    static DEVICES: OnceLock<Option<Vec<Device>>> = OnceLock::new();
-    DEVICES
-        .get_or_init(|| {
-            if std::env::var_os("ARES_TEST_CUDA").is_none() {
-                eprintln!("skipped: set ARES_TEST_CUDA=1 to run the tests that open GPUs");
-                return None;
-            }
-            let count = device_count().expect("the CUDA driver");
-            assert!(count > 0, "ARES_TEST_CUDA is set but the driver reports no device");
-            Some((0..count).map(|i| Device::open(i, Wait::Block).expect("open device")).collect())
-        })
-        .as_deref()
-}
 
 struct Gpu {
     device: Device,
@@ -230,7 +217,7 @@ fn the_fork_design_baseline_computes_the_same_delta_rule() {
         let record = StepRecord::new(&segments, &vec![0; n], None, &[]).unwrap();
         let step = gpu.bytes(record.as_bytes());
         let unit = |rng: &mut Rng, rows: usize, width: usize| -> Vec<f32> {
-            let raw = random(rng, rows * width, 1.0);
+            let raw = rng.floats(rows * width, 1.0);
             let mut out = vec![0.0f32; raw.len()];
             for (src, dst) in raw.chunks(128).zip(out.chunks_mut(128)) {
                 l2_norm(src, 1e-6, dst);
@@ -244,11 +231,11 @@ fn the_fork_design_baseline_computes_the_same_delta_rule() {
                 *v *= 3.0;
             }
         }
-        let alpha = random(&mut rng, n * nv, 2.0);
-        let beta = random(&mut rng, n * nv, 2.0);
-        let dt = random(&mut rng, nv, 1.0);
-        let a: Vec<f32> = random(&mut rng, nv, 1.5).iter().map(|v| -v.exp()).collect();
-        let state = random(&mut rng, 2 * nv * dk * dk, 0.3);
+        let alpha = rng.floats(n * nv, 2.0);
+        let beta = rng.floats(n * nv, 2.0);
+        let dt = rng.floats(nv, 1.0);
+        let a: Vec<f32> = rng.floats(nv, 1.5).iter().map(|v| -v.exp()).collect();
+        let state = rng.floats(2 * nv * dk * dk, 0.3);
         let (qb, kvb, ab, bb, dtb, aab) = (
             gpu.floats(&q),
             gpu.floats(&kv),

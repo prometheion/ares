@@ -16,8 +16,8 @@
 //!
 //! Lines that start with `ERR` or `RES` are the measurements.
 
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock, mpsc};
+use std::path::Path;
+use std::sync::{Arc, Mutex, mpsc};
 
 use ares_api::{
     Engine, Event, EventSink, GenerateRequest, Message, Prompt, RequestId, Role, Sampling,
@@ -30,31 +30,10 @@ use ares_gguf::Gguf;
 use ares_model::qwen35::device::{Harness, Layouts, Options, Qwen35, Spread};
 use ares_model::qwen35::{Config, LogitRows, Reference, SequenceState, Weights};
 use ares_runtime::{GpuConfig, Runtime, RuntimeConfig};
+use common::gpu::{download, gpu, upload};
+use common::helpers::{argmax, argmax_lead, env_path, rel_l2};
 
-fn gpu() -> Option<&'static Device> {
-    static DEVICE: OnceLock<Option<Device>> = OnceLock::new();
-    DEVICE
-        .get_or_init(|| {
-            if std::env::var_os("ARES_TEST_CUDA").is_none() {
-                eprintln!("skipped: set ARES_TEST_CUDA=1 to run the tests that open GPUs");
-                return None;
-            }
-            let ordinal =
-                std::env::var("ARES_TEST_DEVICE").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
-            Some(Device::open(ordinal, Wait::Block).expect("open device"))
-        })
-        .as_ref()
-}
-
-fn env_path(name: &str) -> Option<PathBuf> {
-    match std::env::var_os(name) {
-        Some(path) => Some(path.into()),
-        None => {
-            eprintln!("skipped: set {name} to run this test");
-            None
-        }
-    }
-}
+mod common;
 
 /// Values in (-`scale`, `scale`) from a fixed sequence.
 fn noise(seed: u64, n: usize, scale: f32) -> Vec<f32> {
@@ -67,19 +46,6 @@ fn noise(seed: u64, n: usize, scale: f32) -> Vec<f32> {
             ((state >> 40) as f32 / (1u64 << 23) as f32 - 1.0) * scale
         })
         .collect()
-}
-
-fn upload(device: &Device, values: &[f32]) -> DeviceBuffer {
-    let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
-    let buffer = DeviceBuffer::new(device, bytes.len().max(64) as u64).unwrap();
-    buffer.write(0, &bytes).unwrap();
-    buffer
-}
-
-fn download(buffer: &DeviceBuffer, bytes: u64) -> Vec<u8> {
-    let mut raw = vec![0u8; bytes as usize];
-    buffer.read(0, &mut raw).unwrap();
-    raw
 }
 
 /// The bytes that count of `n` rows of `n_in` f16 activations: the values of
@@ -448,34 +414,6 @@ fn read_ids(path: &Path) -> Vec<u32> {
     text.split_whitespace().map(|t| t.parse().unwrap()).collect()
 }
 
-/// `|got - want| / |want|` over all values (L2).
-fn rel_l2(got: &[f32], want: &[f32]) -> f64 {
-    assert_eq!(got.len(), want.len());
-    let (mut d, mut n) = (0.0f64, 0.0f64);
-    for (g, w) in got.iter().zip(want) {
-        d += (f64::from(*g) - f64::from(*w)).powi(2);
-        n += f64::from(*w).powi(2);
-    }
-    (d / n.max(1e-300)).sqrt()
-}
-
-/// The largest value of `x`, its index, and its lead over the second.
-fn argmax(x: &[f32]) -> (u32, f32) {
-    let mut best = 0;
-    for (i, v) in x.iter().enumerate() {
-        if *v > x[best] {
-            best = i;
-        }
-    }
-    let second = x
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| *i != best)
-        .map(|(_, v)| *v)
-        .fold(f32::NEG_INFINITY, f32::max);
-    (best as u32, x[best] - second)
-}
-
 fn direct(n: usize, pos0: usize) -> [Segment; 1] {
     [Segment { row0: 0, n_rows: n as u32, slot: 0, pos0: pos0 as i32, direct: true }]
 }
@@ -599,7 +537,8 @@ fn the_0_8b_in_either_layout_matches_the_reference() {
         let n = ids.len();
         let mut state = SequenceState::new(&c);
         let window = reference.forward(&mut state, &ids, LogitRows::All).unwrap();
-        let want: Vec<(u32, f32)> = (0..n).map(|r| argmax(window.logits_of(r).unwrap())).collect();
+        let want: Vec<(u32, f32)> =
+            (0..n).map(|r| argmax_lead(window.logits_of(r).unwrap())).collect();
         let last = window.logits_of(n - 1).unwrap().to_vec();
         for (p, (name, layouts, precision)) in policies.into_iter().enumerate() {
             let mut harness =
@@ -610,7 +549,7 @@ fn the_0_8b_in_either_layout_matches_the_reference() {
                 let logits =
                     harness.step(&direct(tokens.len(), chunk * 16), tokens, &rows).unwrap();
                 let vocab = logits.len() / tokens.len();
-                picks.extend(logits.chunks_exact(vocab).map(|row| argmax(row).0));
+                picks.extend(logits.chunks_exact(vocab).map(argmax));
                 got_last = logits[logits.len() - vocab..].to_vec();
             }
             let agree = picks.iter().zip(&want).filter(|(p, w)| **p == w.0).count();

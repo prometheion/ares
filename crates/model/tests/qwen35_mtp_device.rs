@@ -37,21 +37,9 @@ use ares_model::qwen35::device::{
 use ares_model::qwen35::{Config, MtpState, Reference, Weights};
 use ares_runtime::{DraftChances, PinnedRam};
 use ares_sampler::{SAMPLE_CANDIDATES, SampleParams, SamplePick, SampleRow, sample_reference};
+use common::helpers::{env_path, floats, read_f32};
 
-fn env_path(name: &str) -> Option<PathBuf> {
-    match std::env::var_os(name) {
-        Some(path) => Some(path.into()),
-        None => {
-            eprintln!("skipped: set {name} to run this test");
-            None
-        }
-    }
-}
-
-fn read_f32(path: &Path) -> Vec<f32> {
-    let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-    bytes.as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)).collect()
-}
+mod common;
 
 fn read_i32(path: &Path) -> Vec<u32> {
     let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
@@ -83,10 +71,6 @@ fn rel(a: &[f32], b: &[f32]) -> f64 {
 
 fn bits(x: &[f32]) -> Vec<u32> {
     x.iter().map(|v| v.to_bits()).collect()
-}
-
-fn floats(bytes: &[u8]) -> Vec<f32> {
-    bytes.as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)).collect()
 }
 
 /// The MTP block on a device, with the buffers the runtime would own.

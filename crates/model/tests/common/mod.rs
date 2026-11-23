@@ -6,8 +6,14 @@
 //! generated as, recomputes whole sequences in `f64` with the formulas of the
 //! architecture document written out literally (dense matrices, a zero-padded
 //! convolution, a recurrence from the empty state), and keeps no state.
+//!
+//! Beside it: what the tests that open GPUs share (`gpu`) and the small
+//! helpers of all tests (`helpers`).
 
 #![allow(dead_code)]
+
+pub mod gpu;
+pub mod helpers;
 
 use std::path::PathBuf;
 

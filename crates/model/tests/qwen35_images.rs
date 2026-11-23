@@ -8,31 +8,15 @@
 
 use std::sync::Arc;
 
-use ares_cuda::{CacheFormat, Device, Precision, Segment, Wait};
+use ares_cuda::{CacheFormat, Precision, Segment};
 use ares_gguf::Gguf;
 use ares_model::qwen35::device::{Harness, Options};
 use ares_model::qwen35::{Config, Inputs, LogitRows, Reference, SequenceState, Weights};
 use ares_runtime::{ImageInput, ImageSpan, Spans};
+use common::gpu::gpu;
+use common::helpers::rel_l2;
 
-fn gpu() -> Option<Device> {
-    if std::env::var_os("ARES_TEST_CUDA").is_none() {
-        eprintln!("skipped: set ARES_TEST_CUDA=1 to run the tests that open GPUs");
-        return None;
-    }
-    let ordinal = std::env::var("ARES_TEST_DEVICE").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
-    Some(Device::open(ordinal, Wait::Block).expect("open device"))
-}
-
-/// `|got - want| / |want|` over all values (L2).
-fn rel_l2(got: &[f32], want: &[f32]) -> f64 {
-    assert_eq!(got.len(), want.len());
-    let (mut d, mut n) = (0.0f64, 0.0f64);
-    for (g, w) in got.iter().zip(want) {
-        d += (f64::from(*g) - f64::from(*w)).powi(2);
-        n += f64::from(*w).powi(2);
-    }
-    (d / n.max(1e-300)).sqrt()
-}
+mod common;
 
 /// The prompt: text, an image of 3 x 2 rows between its markers, text; then
 /// rows of text one at a time after it.
@@ -120,7 +104,7 @@ fn an_image_s_rows_at_their_rotary_positions_match_the_reference() {
         window_rows: 16,
         ..Options::default()
     };
-    let mut harness = Harness::open(&device, &c, &w, &opts, 1, 512).unwrap();
+    let mut harness = Harness::open(device, &c, &w, &opts, 1, 512).unwrap();
     let all: Vec<u32> = (0..n as u32).collect();
     let segment = [Segment { row0: 0, n_rows: n as u32, slot: 0, pos0: 0, direct: true }];
     let logits =

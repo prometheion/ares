@@ -18,6 +18,9 @@ use ares_gguf::Gguf;
 use ares_model::dflash::{
     Cells, Config, Drafter, DrafterSetup, Error, PassSeq, Reference, Weights,
 };
+use common::gpu::upload;
+
+mod common;
 
 fn file(name: &str) -> Option<PathBuf> {
     let path = std::env::var_os(name).map(PathBuf::from);
@@ -99,13 +102,6 @@ fn read_f32(buf: &DeviceBuffer, at: u64, n: usize) -> Vec<f32> {
     let mut bytes = vec![0u8; n * 4];
     buf.read(at, &mut bytes).unwrap();
     bytes.as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)).collect()
-}
-
-fn upload(device: &Device, values: &[f32]) -> DeviceBuffer {
-    let buf = DeviceBuffer::new(device, (values.len() * 4).max(16) as u64).unwrap();
-    let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
-    buf.write(0, &bytes).unwrap();
-    buf
 }
 
 /// One drafter on the device against the reference: a prompt of 50 rows, a

@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 
 use ares_gguf::Gguf;
 use ares_model::qwen35::{Config, LogitRows, MtpState, Reference, SequenceState, Weights};
+use common::helpers::{argmax, read_f32};
 use common::{Spec, Synth, TempDir};
 
 fn rel(a: &[f32], b: &[f32]) -> f64 {
@@ -27,16 +28,6 @@ fn rel(a: &[f32], b: &[f32]) -> f64 {
         n += f64::from(*y).powi(2);
     }
     (d / n).sqrt()
-}
-
-fn argmax(x: &[f32]) -> u32 {
-    let mut best = 0;
-    for i in 1..x.len() {
-        if x[i] > x[best] {
-            best = i;
-        }
-    }
-    best as u32
 }
 
 #[test]
@@ -149,11 +140,6 @@ fn env_path(name: &str) -> Option<PathBuf> {
             None
         }
     }
-}
-
-fn read_f32(path: &Path) -> Vec<f32> {
-    let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-    bytes.as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)).collect()
 }
 
 fn read_i32(path: &Path) -> Vec<u32> {

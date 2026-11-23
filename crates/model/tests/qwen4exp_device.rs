@@ -20,12 +20,11 @@
 //! costs; the bounds they assert are those numbers with room.
 
 use std::path::PathBuf;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use ares_core::GgmlType;
 use ares_cuda::{
-    CacheFormat, Device, ExpertShape, Precision, Prune, PruneRule, PruneWeights, Wait,
-    device_count, peer_access,
+    CacheFormat, Device, ExpertShape, Precision, Prune, PruneRule, PruneWeights, peer_access,
 };
 use ares_gguf::Gguf;
 use ares_model::qwen4exp::device::{
@@ -35,6 +34,9 @@ use ares_model::qwen4exp::device::{
 use ares_model::qwen4exp::synthetic::{NgramShape, Shape, Synthetic, Types};
 use ares_model::qwen4exp::{Config, LogitRows, Recorder, Reference, SequenceState, Weights};
 use ares_runtime::expert_store::{ExpertNeighbours, Near, ProfileKey, Serve, StoreStats};
+use common::gpu::devices;
+
+mod common;
 
 /// The spread the tests of two devices ask for: both on every layer when
 /// `ARES_TEST_SPREAD=tensor`. `ARES_TEST_CORE_SHARE` is the mixer's share of
@@ -55,26 +57,6 @@ fn tensor() -> Option<Spread> {
 /// devices work on every layer.
 fn layers_per_device(n_layer: usize, devices: usize) -> usize {
     if tensor().is_some() { n_layer } else { n_layer / devices }
-}
-
-fn devices() -> Option<Vec<Device>> {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    if !*ENABLED.get_or_init(|| std::env::var_os("ARES_TEST_CUDA").is_some()) {
-        eprintln!("skipped: set ARES_TEST_CUDA=1 to run the tests that open GPUs");
-        return None;
-    }
-    let wanted = std::env::var("ARES_TEST_DEVICES").unwrap_or_else(|_| "0".into());
-    let count = device_count().expect("the CUDA driver");
-    Some(
-        wanted
-            .split(',')
-            .map(|d| {
-                let ordinal: u32 = d.trim().parse().expect("ARES_TEST_DEVICES: a list of numbers");
-                assert!(ordinal < count, "device {ordinal} of {count}");
-                Device::open(ordinal, Wait::Spin).expect("open device")
-            })
-            .collect(),
-    )
 }
 
 /// Three streams of 256, attention heads and indexer keys of 128, a selection

@@ -22,34 +22,7 @@ use super::{
     Chain, F16_OUTPUT_LIMIT, Gpu, Mode, ROUNDED_EVERY_ROW, add_residual, embed_gather,
     f16_delta_variants, gpus,
 };
-
-fn model_path() -> Option<PathBuf> {
-    match std::env::var_os("ARES_TEST_QWEN35_MODEL") {
-        Some(p) => Some(p.into()),
-        None => {
-            eprintln!("skipped: set ARES_TEST_QWEN35_MODEL to run this test");
-            None
-        }
-    }
-}
-
-pub(super) struct Rng(pub(super) u64);
-
-impl Rng {
-    pub(super) fn next(&mut self) -> u64 {
-        self.0 ^= self.0 << 13;
-        self.0 ^= self.0 >> 7;
-        self.0 ^= self.0 << 17;
-        self.0
-    }
-    pub(super) fn unit(&mut self) -> f32 {
-        ((self.next() >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
-    }
-}
-
-pub(super) fn random(rng: &mut Rng, n: usize, scale: f32) -> Vec<f32> {
-    (0..n).map(|_| rng.unit() * scale).collect()
-}
+use crate::common::helpers::{Rng, model_path, rel_l2, rel_max};
 
 impl Gpu {
     pub(super) fn bytes(&self, data: &[u8]) -> DeviceBuffer {
@@ -84,24 +57,6 @@ impl Gpu {
             .map(|b| ares_quant::f16_to_f32(u16::from_le_bytes(*b)))
             .collect()
     }
-}
-
-/// Largest absolute difference relative to the largest value of the reference.
-pub(super) fn rel_max(got: &[f32], want: &[f32]) -> f64 {
-    assert_eq!(got.len(), want.len());
-    let scale = want.iter().fold(0.0f64, |m, v| m.max(f64::from(*v).abs())).max(1e-30);
-    got.iter().zip(want).fold(0.0f64, |m, (g, w)| m.max((f64::from(*g) - f64::from(*w)).abs()))
-        / scale
-}
-
-/// `|got - want| / |want|` over all values (L2).
-fn rel_l2(got: &[f32], want: &[f32]) -> f64 {
-    let (mut d, mut n) = (0.0f64, 0.0f64);
-    for (g, w) in got.iter().zip(want) {
-        d += (f64::from(*g) - f64::from(*w)).powi(2);
-        n += f64::from(*w).powi(2);
-    }
-    (d / n.max(1e-300)).sqrt()
 }
 
 pub(super) fn report(name: &str, value: f64) {
@@ -272,9 +227,9 @@ fn recurrent_protocol(format: StateFormat, variant: &str, gpu: &Gpu) -> (f64, f6
     let mut rng = Rng(0xDE17A + variant.len() as u64);
     let p = Params {
         shape,
-        taps: random(&mut rng, cd * 4, 0.6),
-        dt_bias: random(&mut rng, nv, 1.0),
-        ssm_a: random(&mut rng, nv, 1.5).iter().map(|v| -v.exp()).collect(),
+        taps: rng.floats(cd * 4, 0.6),
+        dt_bias: rng.floats(nv, 1.0),
+        ssm_a: rng.floats(nv, 1.5).iter().map(|v| -v.exp()).collect(),
     };
     // Five sequences, slots permuted and strided: sequence 0 is at position 0.
     let slots = [3u32, 0, 4, 1, 2];
@@ -291,8 +246,8 @@ fn recurrent_protocol(format: StateFormat, variant: &str, gpu: &Gpu) -> (f64, f6
                 HostSeq { window: vec![0.0; cd * kk], s: vec![0.0; delta_len] }
             } else {
                 HostSeq {
-                    window: random(&mut rng, cd * kk, 1.0),
-                    s: random(&mut rng, delta_len, 0.3).into_iter().map(round_state).collect(),
+                    window: rng.floats(cd * kk, 1.0),
+                    s: rng.floats(delta_len, 0.3).into_iter().map(round_state).collect(),
                 }
             }
         })
@@ -364,9 +319,9 @@ fn recurrent_protocol(format: StateFormat, variant: &str, gpu: &Gpu) -> (f64, f6
             row0 += s.rows as u32;
         }
         let n = row0 as usize;
-        let qkv = random(&mut rng, n * cd, 1.5);
-        let alpha = random(&mut rng, n * nv, 2.0);
-        let beta_in = random(&mut rng, n * nv, 2.0);
+        let qkv = rng.floats(n * cd, 1.5);
+        let alpha = rng.floats(n * nv, 2.0);
+        let beta_in = rng.floats(n * nv, 2.0);
         let mut record = StepRecord::new(&segments, &vec![0; n], None, &[]).unwrap();
         let dims = record.dims();
         let step_buf = gpu.bytes(record.as_bytes());

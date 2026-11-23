@@ -23,6 +23,9 @@ use ares_gguf::Gguf;
 use ares_model::qwen35::device::{Options, Qwen35, Spread};
 use ares_runtime::{GpuConfig, Runtime, RuntimeConfig};
 use ares_tokenizer::ChatOptions;
+use common::helpers::env_path;
+
+mod common;
 
 fn enabled() -> bool {
     if std::env::var_os("ARES_TEST_CUDA").is_none() {
@@ -30,16 +33,6 @@ fn enabled() -> bool {
         return false;
     }
     true
-}
-
-fn env_path(name: &str) -> Option<PathBuf> {
-    match std::env::var_os(name) {
-        Some(path) => Some(path.into()),
-        None => {
-            eprintln!("skipped: set {name} to run this test");
-            None
-        }
-    }
 }
 
 /// What a request came to.

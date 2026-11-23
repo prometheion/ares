@@ -26,46 +26,18 @@
 //! and without (`Arithmetic::Exact`); the device may be a few times that far
 //! from the exact rows.
 
-use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
 use std::time::Instant;
 
-use ares_cuda::{Device, Kernels, Stream, Wait, device_count};
+use ares_cuda::{Device, Kernels, Stream};
 use ares_gguf::Gguf;
 use ares_model::qwen3vl::{
     Arithmetic, Config, DeviceTower, Home, Limits, Reference, Stage, Weights, normalize,
     resize_bicubic, target_size,
 };
+use common::gpu::gpus;
+use common::helpers::{env_path, read_f32};
 
-fn gpus() -> Option<&'static [Device]> {
-    static DEVICES: OnceLock<Option<Vec<Device>>> = OnceLock::new();
-    DEVICES
-        .get_or_init(|| {
-            if std::env::var_os("ARES_TEST_CUDA").is_none() {
-                eprintln!("skipped: set ARES_TEST_CUDA=1 to run the tests that open GPUs");
-                return None;
-            }
-            let count = device_count().expect("the CUDA driver");
-            assert!(count > 0, "ARES_TEST_CUDA is set but the driver reports no device");
-            Some((0..count).map(|i| Device::open(i, Wait::Block).expect("open device")).collect())
-        })
-        .as_deref()
-}
-
-fn env_path(name: &str) -> Option<PathBuf> {
-    match std::env::var_os(name) {
-        Some(path) => Some(path.into()),
-        None => {
-            eprintln!("skipped: set {name} to run this test");
-            None
-        }
-    }
-}
-
-fn read_f32(path: &Path) -> Vec<f32> {
-    let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-    bytes.as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)).collect()
-}
+mod common;
 
 /// One image of the tests: normalised pixels whose sides are multiples of 32.
 struct Case {

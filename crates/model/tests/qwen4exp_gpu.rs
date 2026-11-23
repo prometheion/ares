@@ -24,14 +24,13 @@
 #![allow(clippy::undocumented_unsafe_blocks)]
 
 use std::path::PathBuf;
-use std::sync::OnceLock;
 
 use ares_core::GgmlType;
 use ares_cuda::{
     AttendBuffers, AttentionKernels, AttentionShape, AttnItem, AttnRow, AttnShape, CacheFormat,
     CacheGeometry, CommitSet, Device, DeviceBuffer, DevicePtr, IndexerShape, Kernels, KeyFormat,
     LayerKernels, ListHandOver, NgramShape, Plan, Q4Kernels, RopeParams, Segment,
-    SelectionRule as DeviceRule, StepDims, StepRecord, Stream, Wait, device_count,
+    SelectionRule as DeviceRule, StepDims, StepRecord, Stream,
 };
 use ares_gguf::Gguf;
 use ares_model::qwen4exp::reference::pieces;
@@ -40,21 +39,10 @@ use ares_model::qwen4exp::weights::{AttentionWeights, Matrix, Mixer, NgramWeight
 use ares_model::qwen4exp::{
     Config, LogitRows, Recorder, Reference, SelectionRule, SequenceState, Weights,
 };
+use common::gpu::gpus;
+use common::helpers::{Rng, rel_max};
 
-fn gpus() -> Option<&'static [Device]> {
-    static DEVICES: OnceLock<Option<Vec<Device>>> = OnceLock::new();
-    DEVICES
-        .get_or_init(|| {
-            if std::env::var_os("ARES_TEST_CUDA").is_none() {
-                eprintln!("skipped: set ARES_TEST_CUDA=1 to run the tests that open GPUs");
-                return None;
-            }
-            let count = device_count().expect("the CUDA driver");
-            assert!(count > 0, "ARES_TEST_CUDA is set but the driver reports no device");
-            Some((0..count).map(|i| Device::open(i, Wait::Block).expect("open device")).collect())
-        })
-        .as_deref()
-}
+mod common;
 
 /// A model with every part of the architecture at sizes the kernels take: three streams of
 /// 256, attention heads and indexer keys of 128, a selection budget of two blocks (so that
@@ -94,22 +82,6 @@ fn open(name: &str, bytes: &[u8]) -> Gguf {
     let path = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("q4gpu-{name}.gguf"));
     std::fs::write(&path, bytes).expect("the test directory is writable");
     Gguf::open(&path).expect("the writer makes a valid file")
-}
-
-struct Rng(u64);
-
-impl Rng {
-    fn next(&mut self) -> u64 {
-        self.0 ^= self.0 << 13;
-        self.0 ^= self.0 >> 7;
-        self.0 ^= self.0 << 17;
-        self.0
-    }
-    fn floats(&mut self, n: usize, scale: f32) -> Vec<f32> {
-        (0..n)
-            .map(|_| (((self.next() >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0) * scale)
-            .collect()
-    }
 }
 
 struct Gpu {
@@ -170,13 +142,6 @@ impl Gpu {
         buffer.read(offset, &mut bytes).unwrap();
         bytes.as_chunks::<4>().0.iter().map(|b| u32::from_le_bytes(*b)).collect()
     }
-}
-
-/// Largest absolute difference, relative to the largest value of `want`.
-fn rel_max(got: &[f32], want: &[f32]) -> f64 {
-    assert_eq!(got.len(), want.len());
-    let scale = want.iter().fold(0.0f64, |m, v| m.max(f64::from(v.abs()))).max(1e-30);
-    got.iter().zip(want).fold(0.0f64, |m, (g, w)| m.max(f64::from((g - w).abs()))) / scale
 }
 
 fn report(name: &str, value: f64) {

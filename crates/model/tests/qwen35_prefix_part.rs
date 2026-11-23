@@ -32,6 +32,9 @@ use ares_model::qwen35::device::{
 use ares_model::qwen35::{Config, Weights};
 use ares_runtime::PinnedRam;
 use ares_tokenizer::{EncodeOptions, Tokenizer};
+use common::helpers::floats;
+
+mod common;
 
 const PAGE: u32 = ENTRY_CELLS;
 
@@ -182,10 +185,6 @@ impl Rig {
         self.part.copy_page(&self.stream, self.pages.ptr(), from, to).unwrap();
         self.stream.synchronize().unwrap();
     }
-}
-
-fn floats(bytes: &[u8]) -> Vec<f32> {
-    bytes.as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)).collect()
 }
 
 /// The first position where two byte strings part, or `None`.

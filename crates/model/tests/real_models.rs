@@ -7,25 +7,13 @@
 //! - `ARES_TEST_QWEN35_27B`: Qwen3.8-27B-UD-Q4_K_S.gguf (configuration and
 //!   table only; the reference is not run on it).
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use ares_gguf::Gguf;
 use ares_model::qwen35::{Config, LogitRows, Reference, SequenceState, Weights};
+use common::helpers::{argmax_lead, env_path, read_f32};
 
-fn env_path(name: &str) -> Option<PathBuf> {
-    match std::env::var_os(name) {
-        Some(path) => Some(path.into()),
-        None => {
-            eprintln!("skipped: set {name} to run this test");
-            None
-        }
-    }
-}
-
-fn read_f32(path: &Path) -> Vec<f32> {
-    let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-    bytes.as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)).collect()
-}
+mod common;
 
 fn read_ids(path: &Path) -> Vec<u32> {
     let text = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
@@ -39,20 +27,6 @@ fn rel(a: &[f32], b: &[f32]) -> f64 {
         n += f64::from(*y).powi(2);
     }
     (d / n).sqrt()
-}
-
-fn argmax(x: &[f32]) -> (usize, f32) {
-    let mut best = 0;
-    let mut second = f32::NEG_INFINITY;
-    for i in 1..x.len() {
-        if x[i] > x[best] {
-            second = x[best];
-            best = i;
-        } else if x[i] > second {
-            second = x[i];
-        }
-    }
-    (best, x[best] - second)
 }
 
 #[test]
@@ -154,16 +128,16 @@ fn the_small_model_stays_within_the_measured_distance_of_llama_cpp() {
         let n_vocab = c.n_vocab;
         let mut next = logits.to_vec();
         for (step, &theirs) in llama_tokens.iter().enumerate() {
-            let (pick, _) = argmax(&next);
-            if pick as u32 != theirs {
-                let (_, margin) = argmax(&llama_logits[step * n_vocab..(step + 1) * n_vocab]);
+            let (pick, _) = argmax_lead(&next);
+            if pick != theirs {
+                let (_, margin) = argmax_lead(&llama_logits[step * n_vocab..(step + 1) * n_vocab]);
                 assert!(
                     margin < 0.1,
                     "{prompt_name}: step {step}: token {pick} against {theirs}, llama.cpp's margin is {margin}"
                 );
                 break;
             }
-            next = reference.forward(&mut state, &[pick as u32], LogitRows::Last).unwrap().logits;
+            next = reference.forward(&mut state, &[pick], LogitRows::Last).unwrap().logits;
         }
     }
 }

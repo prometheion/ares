@@ -14,6 +14,9 @@ use ares_gguf::Gguf;
 use ares_model::qwen4exp::{
     Config, LogitRows, MtpState, MtpWeights, Reference, SequenceState, Weights,
 };
+use common::helpers::argmax;
+
+mod common;
 
 /// `<|im_start|>user\nErkläre in drei Sätzen, warum der Himmel blau
 /// ist.<|im_end|>\n<|im_start|>assistant\n`
@@ -26,16 +29,6 @@ const PROMPT: [u32; 22] = [
 /// Strata 0.1.48 gives the same tokens for this prompt (and the same 64
 /// tokens after it; `docs/reference/qwen4exp-architecture.md`, section 10).
 const CONTINUATION: [u32; 4] = [248068, 198, 760, 1156];
-
-fn argmax(x: &[f32]) -> u32 {
-    let mut best = 0;
-    for (i, &v) in x.iter().enumerate() {
-        if v > x[best] {
-            best = i;
-        }
-    }
-    best as u32
-}
 
 #[test]
 fn flash_next_continues_a_german_prompt_as_strata_does() {

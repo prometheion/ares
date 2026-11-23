@@ -6,7 +6,7 @@
 //! `ARES_TEST_QWEN35_CAPTURE`; the split tests need two GPUs. Lines that start
 //! with `RES` are the measurements.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, Mutex, mpsc};
 
 use ares_api::{
@@ -19,6 +19,9 @@ use ares_model::qwen35::device::{Options, Qwen35, Rows, Session, Spread, Wanted}
 use ares_model::qwen35::{Config, LogitRows, Reference, SequenceState, Weights};
 use ares_runtime::{GpuConfig, Runtime, RuntimeConfig, TokenFilter};
 use ares_sampler::TokenMask;
+use common::helpers::{argmax_lead, env_path};
+
+mod common;
 
 #[path = "common/kv_env.rs"]
 mod kv_env;
@@ -31,33 +34,9 @@ fn enabled() -> bool {
     true
 }
 
-fn env_path(name: &str) -> Option<PathBuf> {
-    match std::env::var_os(name) {
-        Some(path) => Some(path.into()),
-        None => {
-            eprintln!("skipped: set {name} to run this test");
-            None
-        }
-    }
-}
-
 fn read_ids(path: &Path) -> Vec<u32> {
     let text = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
     text.split_whitespace().map(|t| t.parse().unwrap()).collect()
-}
-
-fn argmax(x: &[f32]) -> (u32, f32) {
-    let mut best = 0;
-    let mut second = f32::NEG_INFINITY;
-    for i in 1..x.len() {
-        if x[i] > x[best] {
-            second = x[best];
-            best = i;
-        } else if x[i] > second {
-            second = x[i];
-        }
-    }
-    (best as u32, x[best] - second)
 }
 
 fn options(precision: Precision) -> Options {
@@ -121,7 +100,8 @@ fn every_placement_of_the_0_8b_agrees_with_the_reference() {
         let n = ids.len();
         let mut state = SequenceState::new(&c);
         let window = reference.forward(&mut state, &ids, LogitRows::All).unwrap();
-        let want: Vec<(u32, f32)> = (0..n).map(|r| argmax(window.logits_of(r).unwrap())).collect();
+        let want: Vec<(u32, f32)> =
+            (0..n).map(|r| argmax_lead(window.logits_of(r).unwrap())).collect();
         for precision in [Precision::Exact, Precision::Fast] {
             let mut texts: Vec<(String, Vec<u32>)> = Vec::new();
             let mut placements = vec![("single", Spread::Single, vec![0u32])];

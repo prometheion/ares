@@ -22,29 +22,14 @@
 
 mod common;
 
-use std::sync::OnceLock;
-
 use ares_core::GgmlType;
-use ares_cuda::{CacheFormat, Device, Precision, Segment, StateFormat, Wait};
+use ares_cuda::{CacheFormat, Device, Precision, Segment, StateFormat};
 use ares_gguf::Gguf;
 use ares_model::qwen35::device::{Harness, Options};
 use ares_model::qwen35::{Config, Weights};
+use common::gpu::gpu;
+use common::helpers::Rng;
 use common::{Spec, Synth, TempDir};
-
-fn gpu() -> Option<&'static Device> {
-    static DEVICE: OnceLock<Option<Device>> = OnceLock::new();
-    DEVICE
-        .get_or_init(|| {
-            if std::env::var_os("ARES_TEST_CUDA").is_none() {
-                eprintln!("skipped: set ARES_TEST_CUDA=1 to run the tests that open GPUs");
-                return None;
-            }
-            let ordinal =
-                std::env::var("ARES_TEST_DEVICE").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
-            Some(Device::open(ordinal, Wait::Block).expect("open device"))
-        })
-        .as_ref()
-}
 
 /// Which blocks a made-up model has.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -78,20 +63,6 @@ fn model(blocks: Blocks, matrix_type: GgmlType) -> Vec<u8> {
         ..Spec::default()
     };
     Synth::new(spec).builder().build()
-}
-
-struct Rng(u64);
-
-impl Rng {
-    fn next(&mut self) -> u64 {
-        self.0 ^= self.0 << 13;
-        self.0 ^= self.0 >> 7;
-        self.0 ^= self.0 << 17;
-        self.0
-    }
-    fn below(&mut self, n: u64) -> u64 {
-        (self.next() >> 20) % n
-    }
 }
 
 fn bits(x: &[f32]) -> Vec<u32> {

@@ -19,28 +19,16 @@
 //! `ARES_TEST_QWEN3VL_STAGES` every stage's sum beside llama.cpp's.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Instant;
 
 use ares_gguf::Gguf;
 use ares_model::qwen3vl::{
     Arithmetic, Config, Limits, Reference, Stage, Weights, resize_bicubic, target_size,
 };
+use common::helpers::{env_path, read_f32};
 
-fn env_path(name: &str) -> Option<PathBuf> {
-    match std::env::var_os(name) {
-        Some(path) => Some(path.into()),
-        None => {
-            eprintln!("skipped: set {name} to run this test");
-            None
-        }
-    }
-}
-
-fn read_f32(path: &Path) -> Vec<f32> {
-    let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-    bytes.as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)).collect()
-}
+mod common;
 
 /// A dump of `MTMD_DEBUG_EMBEDDINGS`: (rows, width, values).
 fn read_dump(path: &Path) -> (usize, usize, Vec<f32>) {

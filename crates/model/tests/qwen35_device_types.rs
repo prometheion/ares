@@ -12,40 +12,14 @@
 
 mod common;
 
-use std::sync::OnceLock;
-
 use ares_core::GgmlType;
-use ares_cuda::{Device, Precision, Segment, Wait};
+use ares_cuda::{Device, Precision, Segment};
 use ares_gguf::Gguf;
 use ares_model::qwen35::device::{Harness, Options};
 use ares_model::qwen35::{Config, LogitRows, Reference, SequenceState, Weights};
+use common::gpu::gpu;
+use common::helpers::{Rng, rel_l2};
 use common::{Spec, Synth, TempDir};
-
-fn gpu() -> Option<&'static Device> {
-    static DEVICE: OnceLock<Option<Device>> = OnceLock::new();
-    DEVICE
-        .get_or_init(|| {
-            if std::env::var_os("ARES_TEST_CUDA").is_none() {
-                eprintln!("skipped: set ARES_TEST_CUDA=1 to run the tests that open GPUs");
-                return None;
-            }
-            let ordinal =
-                std::env::var("ARES_TEST_DEVICE").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
-            Some(Device::open(ordinal, Wait::Block).expect("open device"))
-        })
-        .as_ref()
-}
-
-struct Rng(u64);
-
-impl Rng {
-    fn next(&mut self) -> u64 {
-        self.0 ^= self.0 << 13;
-        self.0 ^= self.0 >> 7;
-        self.0 ^= self.0 << 17;
-        self.0
-    }
-}
 
 /// `n_blocks` blocks of `ty` of random bytes with small, finite f16 scales: any other byte
 /// is valid in these types.
@@ -135,16 +109,6 @@ const FLOAT_BOUND: f64 = 0.02;
 /// The same with the two small matrices of the recurrent blocks in Q8_0, whose kernels
 /// quantize the activations to int8: 1.3e-2 measured.
 const MIXED_BOUND: f64 = 0.04;
-
-fn rel_l2(got: &[f32], want: &[f32]) -> f64 {
-    assert_eq!(got.len(), want.len());
-    let (mut d, mut n) = (0.0f64, 0.0f64);
-    for (g, w) in got.iter().zip(want) {
-        d += (f64::from(*g) - f64::from(*w)).powi(2);
-        n += f64::from(*w).powi(2);
-    }
-    (d / n).sqrt()
-}
 
 fn direct(n: usize, pos0: usize) -> [Segment; 1] {
     [Segment { row0: 0, n_rows: n as u32, slot: 0, pos0: pos0 as i32, direct: true }]

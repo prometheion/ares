@@ -38,6 +38,7 @@ use backend::{
 };
 use layers::DeviceMatrix;
 
+mod common;
 mod layers;
 
 /// The devices every test shares, opened once and never closed: the process leaves through

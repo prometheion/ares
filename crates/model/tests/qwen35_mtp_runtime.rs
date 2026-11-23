@@ -24,19 +24,12 @@ use ares_cuda::{Device, Precision, Wait, device_count};
 use ares_gguf::Gguf;
 use ares_model::qwen35::device::{Options, Qwen35, Spread};
 use ares_runtime::{Counters, GpuConfig, Runtime, RuntimeConfig};
+use common::helpers::env_path;
+
+mod common;
 
 #[path = "common/kv_env.rs"]
 mod kv_env;
-
-fn env_path(name: &str) -> Option<PathBuf> {
-    match std::env::var_os(name) {
-        Some(path) => Some(path.into()),
-        None => {
-            eprintln!("skipped: set {name} to run this test");
-            None
-        }
-    }
-}
 
 fn ask(runtime: &Runtime, id: u64, question: &str, sampling: Sampling, max_tokens: u32) -> String {
     let (tx, rx) = mpsc::channel();

@@ -8,29 +8,14 @@
 
 mod common;
 
-use std::sync::OnceLock;
-
 use ares_core::GgmlType;
-use ares_cuda::{Device, Precision, Segment, Wait};
+use ares_cuda::{Precision, Segment};
 use ares_gguf::Gguf;
 use ares_model::qwen35::device::{EmbeddingReport, Harness, Options, Placement};
 use ares_model::qwen35::{Config, LogitRows, Reference, SequenceState, Weights};
+use common::gpu::gpu;
+use common::helpers::rel_l2;
 use common::{Spec, Synth, TempDir};
-
-fn gpu() -> Option<&'static Device> {
-    static DEVICE: OnceLock<Option<Device>> = OnceLock::new();
-    DEVICE
-        .get_or_init(|| {
-            if std::env::var_os("ARES_TEST_CUDA").is_none() {
-                eprintln!("skipped: set ARES_TEST_CUDA=1 to run the tests that open GPUs");
-                return None;
-            }
-            let ordinal =
-                std::env::var("ARES_TEST_DEVICE").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
-            Some(Device::open(ordinal, Wait::Block).expect("open device"))
-        })
-        .as_ref()
-}
 
 /// What the MTP block may propose in a case.
 #[derive(Clone, Debug)]
@@ -117,16 +102,6 @@ fn reference_logits(c: &Config, w: &Weights<'_>, ids: &[u32]) -> Vec<f32> {
     let mut state = SequenceState::new(c);
     let window = Reference::new(c, w).forward(&mut state, ids, LogitRows::All).unwrap();
     (0..ids.len()).flat_map(|row| window.logits_of(row).unwrap().to_vec()).collect()
-}
-
-fn rel_l2(got: &[f32], want: &[f32]) -> f64 {
-    assert_eq!(got.len(), want.len());
-    let (mut d, mut n) = (0.0f64, 0.0f64);
-    for (g, w) in got.iter().zip(want) {
-        d += (f64::from(*g) - f64::from(*w)).powi(2);
-        n += f64::from(*w).powi(2);
-    }
-    (d / n.max(1e-300)).sqrt()
 }
 
 /// What the embedding of a part should be in a case.

@@ -6,86 +6,25 @@
 //! says so when it skips. `ARES_TEST_DEVICE` picks the GPU (default 0). Lines
 //! that start with `ERR` or `RES` are the measurements.
 
-use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::path::Path;
 
-use ares_cuda::{CacheFormat, Device, Precision, Segment, StateFormat, Wait};
+use ares_cuda::{CacheFormat, Precision, Segment, StateFormat};
 use ares_gguf::Gguf;
 use ares_model::qwen35::device::{Harness, Options};
 use ares_model::qwen35::{Config, LogitRows, Reference, SequenceState, Weights};
+use common::gpu::gpu;
+use common::helpers::{argmax, argmax_lead, env_path, read_f32, rel_l2, rel_max};
 
-fn gpu() -> Option<&'static Device> {
-    static DEVICE: OnceLock<Option<Device>> = OnceLock::new();
-    DEVICE
-        .get_or_init(|| {
-            if std::env::var_os("ARES_TEST_CUDA").is_none() {
-                eprintln!("skipped: set ARES_TEST_CUDA=1 to run the tests that open GPUs");
-                return None;
-            }
-            let ordinal =
-                std::env::var("ARES_TEST_DEVICE").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
-            Some(Device::open(ordinal, Wait::Block).expect("open device"))
-        })
-        .as_ref()
-}
-
-fn env_path(name: &str) -> Option<PathBuf> {
-    match std::env::var_os(name) {
-        Some(path) => Some(path.into()),
-        None => {
-            eprintln!("skipped: set {name} to run this test");
-            None
-        }
-    }
-}
+mod common;
 
 fn read_ids(path: &Path) -> Vec<u32> {
     let text = std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
     text.split_whitespace().map(|t| t.parse().unwrap()).collect()
 }
 
-fn read_f32(path: &Path) -> Vec<f32> {
-    let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-    bytes.as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)).collect()
-}
-
 fn read_i32(path: &Path) -> Vec<u32> {
     let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
     bytes.as_chunks::<4>().0.iter().map(|b| i32::from_le_bytes(*b) as u32).collect()
-}
-
-/// `|got - want| / |want|` over all values (L2).
-fn rel_l2(got: &[f32], want: &[f32]) -> f64 {
-    assert_eq!(got.len(), want.len());
-    let (mut d, mut n) = (0.0f64, 0.0f64);
-    for (g, w) in got.iter().zip(want) {
-        d += (f64::from(*g) - f64::from(*w)).powi(2);
-        n += f64::from(*w).powi(2);
-    }
-    (d / n.max(1e-300)).sqrt()
-}
-
-/// Largest absolute difference relative to the largest value of the reference.
-fn rel_max(got: &[f32], want: &[f32]) -> f64 {
-    assert_eq!(got.len(), want.len());
-    let scale = want.iter().fold(0.0f64, |m, v| m.max(f64::from(*v).abs())).max(1e-30);
-    got.iter().zip(want).fold(0.0f64, |m, (g, w)| m.max((f64::from(*g) - f64::from(*w)).abs()))
-        / scale
-}
-
-/// The largest value's index and its lead over the second largest.
-fn argmax(x: &[f32]) -> (u32, f32) {
-    let mut best = 0;
-    let mut second = f32::NEG_INFINITY;
-    for i in 1..x.len() {
-        if x[i] > x[best] {
-            second = x[best];
-            best = i;
-        } else if x[i] > second {
-            second = x[i];
-        }
-    }
-    (best as u32, x[best] - second)
 }
 
 fn options(precision: Precision) -> Options {
@@ -216,7 +155,7 @@ fn feed(
         let logits = harness.step(&direct(n, pos0 + at), &tokens[at..at + n], &out).unwrap();
         if !out.is_empty() {
             let vocab = logits.len() / out.len();
-            picks.extend(logits.chunks_exact(vocab).map(|row| argmax(row).0));
+            picks.extend(logits.chunks_exact(vocab).map(argmax));
             last = logits[logits.len() - vocab..].to_vec();
         }
         at += n;
@@ -250,14 +189,14 @@ fn the_forward_pass_agrees_with_the_reference_and_llama_cpp() {
         let mut state = SequenceState::new(&c);
         let window = reference.forward(&mut state, &ids, LogitRows::All).unwrap();
         let ref_rows: Vec<(u32, f32)> =
-            (0..n).map(|r| argmax(window.logits_of(r).unwrap())).collect();
+            (0..n).map(|r| argmax_lead(window.logits_of(r).unwrap())).collect();
         let ref_last = window.logits_of(n - 1).unwrap().to_vec();
         let mut ref_generated = vec![ref_rows[n - 1].0];
         let mut ref_margins = vec![ref_rows[n - 1].1];
         while ref_generated.len() < 40 {
             let token = *ref_generated.last().unwrap();
             let window = reference.forward(&mut state, &[token], LogitRows::Last).unwrap();
-            let (pick, margin) = argmax(window.logits_of(0).unwrap());
+            let (pick, margin) = argmax_lead(window.logits_of(0).unwrap());
             ref_generated.push(pick);
             ref_margins.push(margin);
         }
@@ -294,12 +233,12 @@ fn the_forward_pass_agrees_with_the_reference_and_llama_cpp() {
                 assert!(agree_ref * 100 >= n * 90, "{tag}: top-1 {agree_ref}/{n}");
 
                 // 40 greedy tokens, one row per step.
-                let mut generated = vec![argmax(&last).0];
+                let mut generated = vec![argmax(&last)];
                 while generated.len() < 40 {
                     let token = *generated.last().unwrap();
                     let position = n + generated.len() - 1;
                     let logits = harness.step(&direct(1, position), &[token], &[0]).unwrap();
-                    generated.push(argmax(&logits).0);
+                    generated.push(argmax(&logits));
                 }
                 let same_ref =
                     generated.iter().zip(&ref_generated).take_while(|(a, b)| a == b).count();
