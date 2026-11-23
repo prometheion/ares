@@ -1095,19 +1095,31 @@ access, greedy, the bench of `/var/tmp/ares-tools/prod-ab/` (fork 2 rounds, Ares
       long contexts on that card is the gap (its flash attention against ours; llama.cpp PR 32407 is
       in "Optimising").
       Built (`attn/long-context`): a prompt kernel of 128 vectors (`kernels/attn_prompt.cuh`) with
-      integer scores over quantized K, P V summed in f16 per chunk of 32 cells, the tile mean's dot
-      products by the same int8 products, phases in which decode and the tensor cores overlap, and
-      the converted cells shared out over one wave of blocks. One attention layer, a step of 256
-      rows at the end of 98 304 cells, K and V in `q5` (the fork `q5_1`): RTX 3060 with 3 KV heads
-      79.9 ms before, about 24 ms now, the fork 13.5 ms; RTX 4070 with 1 head 11.3 ms, 3.4 ms, the
-      fork 2.1 ms. At 32 768 cells 26.6, 8.3 and 4.6 ms on the 3060. Output closer to the
-      reference than before (integer scores). What is left: the kernel reaches about 40 % of the
-      int8/f16 tensor rate of the capped cards, the fork about 67 % (its O in f16 over the whole
-      range and the query in registers; Ares keeps O in f32 and so 128 of 255 registers, two warps
-      per scheduler with latencies that do not overlap). End to end at these settings (the bench of
-      `/var/tmp/ares-tools/prod-ab/`, prompt suite, alternating with main, load about 2): 2k / 32k /
-      98k 1132 / 979 / 675 tokens/s against main's 1082 / 655 / 324 and the fork's 840 / 944 / 752:
-      32k is reached, 98k is 10 % short.
+      integer scores over quantized K (and the tile mean's dot products from the same int8
+      products), P V summed in f16 per chunk of 32 cells, and phases in which decode and the tensor
+      cores overlap; the planner cuts a prompt's tiles into pieces that fill the kernel's waves and
+      orders them so the blocks running at once share K/V in the L2 cache. One attention layer, a
+      step of 256 rows at the end of 98 304 cells, K and V in `q5` (the fork `q5_1`): RTX 3060 with
+      3 KV heads 79.9 ms before, 21.0 ms now, the fork 13.5 ms; RTX 4070 with 1 head 11.3, 3.0 and
+      2.1 ms. At 32 768 cells 26.6, 7.4 and 4.6 ms on the 3060. Output closer to the reference
+      than before (integer scores). What is left: the kernel reaches about 45 % of the int8/f16
+      tensor rate of the capped cards, the fork about 67 % (its O in f16 over the whole range and
+      the query in registers; Ares keeps O in f32, 128 of 255 registers, two warps per scheduler
+      whose latencies do not overlap). O in f16 over the whole range was measured: 7 % faster, 8 to
+      10 times the error already at 1.4k cells, growing with the length (the owner's call, not
+      built). Tried and dropped: a single K tile (2.5 % slower), the decode's lanes on rows (q8
+      3 %), cells shared out over one wave of blocks reading several pieces (15 % slower: no L2
+      sharing), P V with f32 sums (11 % slower), 8 vectors per warp in 16 warps (no faster).
+      End to end at these settings (the bench of `/var/tmp/ares-tools/prod-ab/`, prompt suite, two
+      rounds alternating with main, load 1 to 5): 2k / 32k / 98k 1131 / 1000-1002 / 709-710 tokens/s
+      against main's 1082-1103 / 653-655 / 324 and the fork's 840 / 944 / 752: 32k is reached, 98k is
+      6 % short. The state slots of the longer prompt tiles cost about 10 MB of VRAM on the 4070 and
+      6.5 MB on the 3060 (the 27B three ways: 874 / 1754 / 1938 pages against 890 / 1770 / 1946).
+      Levers left, the owner's call: the 3060's 78 pieces run in 2.8 waves; 5 pieces a tile (7.0
+      waves) would save about 6 % of its attention for some 25 MB of state slots on each card, the
+      VRAM-tight 4070 included; heads by speed need room on the 4070 these settings do not leave
+      (other `--shares`); O in f16 (above). Within the kernel: a design with warps that only decode
+      and the others only multiply (more warps than the f32 accumulator leaves registers for today).
 - [ ] Images on these settings, and a day of the owner's own use as a second llama-swap entry.
 
 ## Parallel requests against the owner's production (2026-11-23, `bench/parallel`)

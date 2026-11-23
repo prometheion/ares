@@ -49,6 +49,9 @@ the kernels exist; no model runs there yet.
 - Measured (2026-11-12 to 15): 27B Q4_K_S on two cards reads prompts at about 1350 tokens/s
   and decodes a step in 24.5 ms; Flash-Next IQ2_XS on two cards generates 45 to 49 tokens/s
   without drafts.
+- Long prompts: the attention of a prompt's rows has a kernel of its own (integer scores over
+  quantized K); the 27B at the owner's settings (`q5`, 262144 cells, 2 sequences) reads 32k at
+  about 1000 tokens/s and 98k at about 710 (2026-11-23; before 655 and 324).
 
 ## Caches and memory
 - Prefix cache (both models): automatic, shared by all requests; checkpoints of the state per
