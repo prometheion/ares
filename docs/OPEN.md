@@ -251,6 +251,15 @@ Strata kept 0.1.65, which the comparisons use until a newer engine starts there.
       state keeps its anchor only from a plain one); and the conversation asked again replays
       6784 rows from the start (15 s against Strata's 0.33 to 0.47 s): the one place holds
       another state, and the tail at 648 that has one lies off a path through full pages.
+      Locally (IQ2_XS, `--ram 8G`) main failed the same way on the RTX 4070 alone and on both
+      cards, and the fix passed all six turns on each; `real_cache` passed on both cards.
+- [ ] `qwen4exp_runtime`'s `flash_next_writes_with_drafts_what_it_writes_without` fails on the two
+      local cards in some runs (2026-11-23, IQ2_XS with the MTP block): the greedy reply with
+      drafts parts from the one without at a near tie (token 16, "," against "."), with the whole
+      head or with the draft vocabulary. Main failed it in one of two runs, `fix/turn-cell` in
+      three of three, whose change is not reached there (the test keeps no checkpoints); it
+      passed on the test machine's one card. A test of one arithmetic for both replies would
+      need the step shapes of both to be the same.
 - [x] A loan of VRAM after the tier had moved slots between layers (rebalance) could take a
       layer's given-up number for a slot's owner: the owner kept the slot inside the loan (its
       expert read lent memory) and a later loan stopped the engine ("as many slots were given
