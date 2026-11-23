@@ -265,6 +265,15 @@ impl Places {
         Ok(pointer)
     }
 
+    /// Locks the chunk place `place` lies in, if it is not locked, so that the
+    /// place's later copies (the saves inside a pass) take no new memory.
+    pub(crate) fn hold(&mut self, place: u32) -> Result<(), ModelError> {
+        if self.bytes == 0 {
+            return Ok(());
+        }
+        self.pointer(place).map(drop)
+    }
+
     /// Where place `place` is when it holds memory: `None` after its chunk
     /// was given back, and before it was ever locked.
     fn held(&self, place: u32) -> Option<*mut u8> {

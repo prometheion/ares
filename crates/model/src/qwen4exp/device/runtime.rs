@@ -2412,6 +2412,11 @@ impl Qwen4ExpDevice {
             self.mtp.as_mut(),
             &self.flow,
         )?;
+        // The places of the saves inside a pass are locked here, where a step's saves lock
+        // theirs: not between the pass's micro-batches (`Resume::hold`).
+        for i in 0..record.inner_saves() {
+            self.resume.hold(record.inner_save(i).place)?;
+        }
 
         // A step that only drafts: the chains, and nothing of the model. It
         // leaves no window for the next record to commit.

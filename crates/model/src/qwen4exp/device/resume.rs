@@ -71,6 +71,13 @@ impl Resume {
         self.checkpoint.bytes()
     }
 
+    /// Locks the memory of `place` now, before a pass saves into it between its micro-batches:
+    /// a lock of page-locked memory waits for the device's work, and in a pass on both devices
+    /// that work waits for the other device's exchanges, which wait for this thread.
+    pub(super) fn hold(&mut self, place: u32) -> Result<(), ModelError> {
+        self.places.hold(place)
+    }
+
     /// A save inside a pass: copies the state of layer `i` of `part` in `slot` into `place`,
     /// as the pass goes past the save's position in that layer.
     pub(super) fn save_layer(
