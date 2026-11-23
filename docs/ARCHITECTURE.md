@@ -710,7 +710,10 @@ one array per part, indexed by page number.
     held before, the first turn's anchor, and Flash-Next failed the step:
     "the rows of slot 0 start at cell 650 and its sequence is at cell 512".
     `tests/prefix.rs`
-    `a_turn_that_restores_an_end_state_still_saved_with_its_record_gets_that_state`.)
+    `a_turn_that_restores_an_end_state_still_saved_with_its_record_gets_that_state`, and on
+    the GPU `qwen4exp_runtime`'s
+    `a_turn_read_layer_by_layer_from_an_end_state_saved_with_its_record_answers_as_the_reference`,
+    which failed the same way before.)
   - Per request the runtime reports the prompt tokens that came from the
     cache (`Usage::cached_prompt_tokens`) and the rows it replayed and
     computed (`Snapshot::requests`); the counters add them up.

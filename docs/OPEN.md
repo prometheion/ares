@@ -240,10 +240,17 @@ Strata kept 0.1.65, which the comparisons use until a newer engine starts there.
       that record, and the places for the checkpoints inside its pass, taken before the record
       was written, gave the end state up: its save was dropped and the restore read the first
       turn's anchor (fixed on `fix/turn-cell`: the save stays while a restore of the record reads
-      the place; host test in `runtime/tests/prefix.rs`). Seen on the way: with one place the
-      second turn's checkpoints inside its pass find none (the place waits for the restore), so
-      the turn keeps only its end state; and the first turn's anchor at 512 was a root as well,
-      so its end state pushed it out (the end state keeps its anchor only from a plain one).
+      the place; tests in `runtime/tests/prefix.rs`, `cache.rs` and `qwen4exp_runtime`, the last
+      failing as the suite did before the fix). With the fix, two sessions on the test machine
+      passed all six turns (first ask 622/1 cached 5.5 and 6.5 s, 6832/648 12.6 and 12.8 s, the
+      third turn from the second's end state 1.8 s; asked again 622/512 4.3 and 4.8 s, 6832/6784
+      15.3 and 15.5 s, 6915 or 6974 tokens 1.5 and 2.0 s). Seen on the way: with one place the
+      second turn's checkpoints inside its pass find none (the place waits for the restore), and
+      the end state it restores is given up for nothing, so the turn keeps only its end state;
+      the first turn's anchor at 512 was a root as well, so its end state pushed it out (the end
+      state keeps its anchor only from a plain one); and the conversation asked again replays
+      6784 rows from the start (15 s against Strata's 0.33 to 0.47 s): the one place holds
+      another state, and the tail at 648 that has one lies off a path through full pages.
 - [x] A loan of VRAM after the tier had moved slots between layers (rebalance) could take a
       layer's given-up number for a slot's owner: the owner kept the slot inside the loan (its
       expert read lent memory) and a later loan stopped the engine ("as many slots were given
