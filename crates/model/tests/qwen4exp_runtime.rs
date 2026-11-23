@@ -24,12 +24,13 @@ use ares_model::qwen4exp::device::{
 };
 use ares_model::qwen4exp::synthetic::{NgramShape, Shape, Synthetic, Types};
 use ares_model::qwen4exp::{
-    Config, LogitRows, MtpState, MtpWeights, Reference, SequenceState, Weights,
+    Config, Inputs, LogitRows, MtpState, MtpWeights, Reference, SequenceState, Weights,
 };
 use ares_runtime::expert_store::Serve;
 use ares_runtime::{
-    ContextSpec, DeviceContext, DeviceModel, GpuConfig, LinkSpec, Machine, Model, ModelError,
-    PrefixCache, Rule, Runtime, RuntimeConfig, Split,
+    ContextSpec, DeviceContext, DeviceModel, DeviceTransfer, EncodedPrompt, GpuConfig, ImageInput,
+    ImageSpan, LinkSpec, Logits, Machine, Model, ModelDrafts, ModelError, Pick, PrefixCache, Rule,
+    Runtime, RuntimeConfig, Spans, Split, StepContext, TowerJob, TransferContext, Vision,
 };
 use ares_state::PageLayout;
 use ares_tokenizer::{ChatOptions, Json, Tokenizer};
@@ -272,6 +273,9 @@ impl Model for Made {
     }
     fn prefix_cache(&self) -> Option<PrefixCache> {
         self.0.prefix_cache().filter(|_| self.1 == Cache::On)
+    }
+    fn saves_inside_steps(&self) -> u32 {
+        self.0.saves_inside_steps()
     }
     fn page_entry(&self, page: u32) -> u32 {
         self.0.page_entry(page)
@@ -584,6 +588,17 @@ fn submit(
     prompt: &[u32],
     max_tokens: u32,
 ) -> mpsc::Receiver<Result<Vec<u32>, String>> {
+    let words: Vec<String> = prompt.iter().map(|t| format!("t{t}")).collect();
+    submit_text(runtime, id, words.join(" "), max_tokens)
+}
+
+/// [`submit`] of a prompt written out: `t5 t9 ...`, and `img` for [`Pictured`]'s image.
+fn submit_text(
+    runtime: &Runtime,
+    id: u64,
+    prompt: String,
+    max_tokens: u32,
+) -> mpsc::Receiver<Result<Vec<u32>, String>> {
     let (tx, rx) = mpsc::channel();
     let text = Arc::new(Mutex::new(String::new()));
     let sink = {
@@ -602,12 +617,11 @@ fn submit(
             true
         })
     };
-    let words: Vec<String> = prompt.iter().map(|t| format!("t{t}")).collect();
     runtime
         .submit(
             GenerateRequest {
                 model: "made".into(),
-                prompt: Prompt::Text(words.join(" ")),
+                prompt: Prompt::Text(prompt),
                 sampling: Sampling::default(),
                 max_tokens: Some(max_tokens),
                 stop: Vec::new(),
@@ -910,6 +924,316 @@ fn a_prompt_read_layer_by_layer_gives_the_reference_answer() {
                 "{placement:?}: {passed:?} against {reference:?}"
             );
             assert!(leading(&again, &reference) >= 2, "{placement:?}: {again:?} after the pass");
+        }
+    }
+}
+
+/// The image of [`Pictured`]: `IMAGE.0` rows across and `IMAGE.1` down, its cells the
+/// n-gram block's image token.
+const IMAGE: (u32, u32) = (8, 5);
+const PAD: u32 = 9;
+
+/// The made-up model with images: the word `img` of a prompt is an image of [`IMAGE`]'s
+/// rows, which the tower of its first device part gives from `rows` (made up, as a
+/// projector would compute them).
+struct Pictured {
+    made: Made,
+    width: u32,
+    rows: Arc<Vec<f32>>,
+}
+
+impl Pictured {
+    fn image() -> Arc<ImageInput> {
+        let (nx, ny) = IMAGE;
+        Arc::new(ImageInput {
+            name: [7; 32],
+            width: nx * 32,
+            height: ny * 32,
+            pixels: Vec::new(),
+            nx,
+            ny,
+        })
+    }
+}
+
+impl Model for Pictured {
+    fn card(&self) -> ModelCard {
+        self.made.card()
+    }
+    fn vocab(&self) -> u32 {
+        self.made.vocab()
+    }
+    fn ends(&self, token: u32) -> bool {
+        self.made.ends(token)
+    }
+    fn encode(&self, prompt: &Prompt) -> Result<Vec<u32>, EngineError> {
+        Ok(self.encode_with_boundaries(prompt)?.tokens)
+    }
+    fn encode_with_boundaries(&self, prompt: &Prompt) -> Result<EncodedPrompt, EngineError> {
+        let Prompt::Text(text) = prompt else {
+            return Err(EngineError::Unsupported("the made-up model has no chat template".into()));
+        };
+        let mut out = EncodedPrompt::default();
+        for word in text.split_whitespace() {
+            if word == "img" {
+                let first = out.tokens.len() as u32;
+                out.images.push(ImageSpan { first, image: Self::image() });
+                out.tokens.extend(std::iter::repeat_n(PAD, (IMAGE.0 * IMAGE.1) as usize));
+            } else {
+                out.tokens.extend(self.made.encode(&Prompt::Text(word.into()))?);
+            }
+        }
+        Ok(out)
+    }
+    fn vision(&self) -> Option<Vision> {
+        Some(Vision { width: self.width, max_rows: 64, device: 0, units: 1 })
+    }
+    fn piece(&self, token: u32, text: &mut Vec<u8>) {
+        self.made.piece(token, text)
+    }
+    fn context(&self) -> ContextSpec {
+        self.made.context()
+    }
+    fn split(&self) -> Split {
+        self.made.split()
+    }
+    fn devices(&self) -> usize {
+        self.made.devices()
+    }
+    fn links(&self) -> LinkSpec {
+        self.made.links()
+    }
+    fn pinned_ram(&self) -> u64 {
+        self.made.pinned_ram()
+    }
+    fn max_rows(&self) -> u32 {
+        self.made.max_rows()
+    }
+    fn own_rows(&self) -> u32 {
+        self.made.own_rows()
+    }
+    fn prompt_rows(&self) -> u32 {
+        self.made.prompt_rows()
+    }
+    fn logit_rows(&self) -> u32 {
+        self.made.logit_rows()
+    }
+    fn draft_rows(&self) -> u32 {
+        self.made.draft_rows()
+    }
+    fn drafters(&self) -> Vec<ares_runtime::Drafter> {
+        self.made.drafters()
+    }
+    fn attention_span(&self) -> u32 {
+        self.made.attention_span()
+    }
+    fn prefix_cache(&self) -> Option<PrefixCache> {
+        self.made.prefix_cache()
+    }
+    fn saves_inside_steps(&self) -> u32 {
+        self.made.saves_inside_steps()
+    }
+    fn page_entry(&self, page: u32) -> u32 {
+        self.made.page_entry(page)
+    }
+    fn page_layout(&self, cells_per_page: u32) -> PageLayout {
+        self.made.page_layout(cells_per_page)
+    }
+    fn open(&self, cx: DeviceContext<'_>) -> Result<Box<dyn DeviceModel>, ModelError> {
+        Ok(Box::new(Towered { part: self.made.open(cx)?, rows: self.rows.clone() }))
+    }
+}
+
+/// A device part of [`Pictured`]: the model's, with a tower that gives the made-up rows.
+struct Towered {
+    part: Box<dyn DeviceModel>,
+    rows: Arc<Vec<f32>>,
+}
+
+impl DeviceModel for Towered {
+    fn logits_per_row(&self) -> u32 {
+        self.part.logits_per_row()
+    }
+    fn enqueue(&mut self, step: &StepContext<'_>) -> Result<Option<Logits>, ModelError> {
+        self.part.enqueue(step)
+    }
+    fn wait(&mut self, end: &ares_cuda::Event) -> Result<(), ModelError> {
+        self.part.wait(end)
+    }
+    fn picked(&mut self, picks: &[Pick]) {
+        self.part.picked(picks)
+    }
+    fn logit_tokens(&self) -> ares_cuda::DevicePtr {
+        self.part.logit_tokens()
+    }
+    fn model_drafts(&self) -> Option<ModelDrafts> {
+        self.part.model_drafts()
+    }
+    fn transfer(
+        &mut self,
+        cx: &TransferContext<'_>,
+        item: &mut DeviceTransfer,
+    ) -> Result<(), ModelError> {
+        self.part.transfer(cx, item)
+    }
+    fn tower(&mut self, _stream: &ares_cuda::Stream, job: &mut TowerJob) -> Result<(), ModelError> {
+        job.rows = self.rows.to_vec();
+        job.ms = 0.1;
+        Ok(())
+    }
+    fn model_draft_ms(&mut self) -> f64 {
+        self.part.model_draft_ms()
+    }
+    fn model_draft_probs(&mut self, out: &mut Vec<f32>) {
+        self.part.model_draft_probs(out)
+    }
+    fn rows_not_exact(&mut self, out: &mut Vec<u32>) {
+        self.part.rows_not_exact(out)
+    }
+    fn paused(&self) -> bool {
+        self.part.paused()
+    }
+}
+
+/// The greedy tokens of the CPU reference after `prompt`, whose rows `inputs.rows` are an
+/// image's at the rotary positions `spans` gives every cell.
+fn reference_answer_with(
+    path: &std::path::Path,
+    prompt: &[u32],
+    rows: &[(usize, Vec<f32>)],
+    spans: Option<&Spans>,
+    n: usize,
+) -> Vec<u32> {
+    let gguf = Gguf::open(path).unwrap();
+    let c = Config::from_gguf(&gguf).unwrap();
+    let w = Weights::load(&gguf, &c).unwrap();
+    let reference = Reference::new(&c, &w);
+    let mut state = SequenceState::new(&c);
+    let arg_max = |row: &[f32]| {
+        row.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map_or(0, |(i, _)| i as u32)
+    };
+    let rotary = |cells: std::ops::Range<usize>| {
+        spans.map(|s| cells.map(|cell| s.rotary(cell as u32).map(|p| p as usize)).collect())
+    };
+    let inputs = Inputs { rows: rows.to_vec(), rotary: rotary(0..prompt.len()) };
+    let mut window = reference.window_with(&state, prompt, &inputs, LogitRows::All).unwrap();
+    reference.commit(&mut state, &window, prompt.len()).unwrap();
+    let mut answer = vec![arg_max(window.logits_of(prompt.len() - 1).unwrap())];
+    while answer.len() < n {
+        let token = [answer[answer.len() - 1]];
+        let cell = state.position();
+        let one = Inputs { rows: Vec::new(), rotary: rotary(cell..cell + 1) };
+        window = reference.window_with(&state, &token, &one, LogitRows::Last).unwrap();
+        reference.commit(&mut state, &window, 1).unwrap();
+        answer.push(arg_max(window.logits_of(0).unwrap()));
+    }
+    answer
+}
+
+/// A prompt with an image read layer by layer: the micro-batches that hold the image's cells
+/// take the rows the runtime staged (the made-up tower's) over their gathered rows, and every
+/// row its rotary position (the image's rows `(p, p + j / nx, p + j % nx)`, the text after it
+/// `max(nx, ny)` on). It answers as the CPU reference given the same rows and positions does,
+/// and as the same prompt read in steps of the own scratch; asked again, it comes from the
+/// cache with the image's cells replayed from the store's rows.
+#[test]
+fn a_prompt_with_an_image_read_layer_by_layer_gives_the_reference_answer() {
+    if !enabled() {
+        return;
+    }
+    let path = gguf_path_of(1, GgmlType::BF16, GgmlType::Q4_0);
+    let (nx, ny) = IMAGE;
+    let (first, image_rows) = (150usize, (nx * ny) as usize);
+    let text = prompt(360, 7);
+    let mut tokens = text[..first].to_vec();
+    tokens.extend(std::iter::repeat_n(PAD, image_rows));
+    tokens.extend_from_slice(&text[first..]);
+    let words: Vec<String> = text.iter().map(|t| format!("t{t}")).collect();
+    let words = format!("{} img {}", words[..first].join(" "), words[first..].join(" "));
+    // The image's rows: two token embeddings mixed, so that their size is a token's.
+    let gguf = Gguf::open(&path).unwrap();
+    let c = Config::from_gguf(&gguf).unwrap();
+    let w = Weights::load(&gguf, &c).unwrap();
+    let embedding = |t: u32| {
+        let mut row = vec![0.0f32; c.n_embd];
+        w.token_embd.decode_row(t as usize, &mut row);
+        row
+    };
+    let rows: Vec<(usize, Vec<f32>)> = (0..image_rows as u32)
+        .map(|j| {
+            let (a, b) = (embedding(10 + 3 * j % 80), embedding(12 + 7 * j % 78));
+            (first + j as usize, a.iter().zip(&b).map(|(x, y)| 0.7 * x + 0.9 * y).collect())
+        })
+        .collect();
+    let tower_rows = Arc::new(rows.iter().flat_map(|(_, r)| r.iter().copied()).collect::<Vec<_>>());
+    let width = c.n_embd as u32;
+    drop(w);
+    let spans = Spans::new(vec![ImageSpan { first: first as u32, image: Pictured::image() }]);
+    let reference = reference_answer_with(&path, &tokens, &rows, Some(&spans), 16);
+    // What the test tells apart: the pad token's embedding at the image's cells, and the
+    // image's rows at their cells.
+    let plain = reference_answer_with(&path, &tokens, &[], None, 16);
+    let at_cells = reference_answer_with(&path, &tokens, &rows, None, 16);
+    let leading = |a: &[u32], b: &[u32]| a.iter().zip(b).take_while(|(x, y)| x == y).count();
+    eprintln!(
+        "IMAGE reference {reference:?}; without the rows {} tokens alike, without the \
+         positions {}",
+        leading(&plain, &reference),
+        leading(&at_cells, &reference)
+    );
+    assert!(leading(&plain, &reference) < 2, "the image's rows should matter");
+    let start = |placement: Placement, pass_rows: u32, own: u32| {
+        let devices = open_devices(placement);
+        let mut opts = options(placement, c.n_layer, 16, MAX_ROWS, own);
+        opts.pass_rows = pass_rows;
+        opts.serve = Serve::Measured;
+        let gguf = Gguf::open(&path).unwrap();
+        let inner = Arc::new(
+            Qwen4Exp::new(gguf, byte_tokenizer(None), "made", &devices, opts, CELLS).unwrap(),
+        );
+        let config = RuntimeConfig {
+            pages: 16,
+            cells_per_page: 128,
+            max_slots: SLOTS,
+            ..RuntimeConfig::default()
+        };
+        let made = Made(inner.clone(), Cache::On);
+        let model: Arc<dyn Model> = Arc::new(Pictured { made, width, rows: tower_rows.clone() });
+        let mut gpu = GpuConfig::new(&config, &*model);
+        gpu.ram_limit += 256 << 20;
+        gpu.vram_headroom = 512 << 20;
+        (Runtime::start_gpu(model, devices, config, gpu).expect("the runtime starts"), inner)
+    };
+    let ask_words = |runtime: &Runtime, id: u64| {
+        let rx = submit_text(runtime, id, words.clone(), 16);
+        rx.recv_timeout(Duration::from_secs(300)).expect("an answer in time").unwrap()
+    };
+    for placement in placements() {
+        for own in [32, 16] {
+            let (runtime, _) = start(placement, 0, own);
+            let steps = ask_words(&runtime, 1);
+            runtime.shutdown();
+            let (runtime, model) = start(placement, 512, own);
+            let passed = ask_words(&runtime, 1);
+            let again = ask_words(&runtime, 2);
+            let stats = model.take_store_stats().expect("the parts are open");
+            runtime.shutdown();
+            eprintln!(
+                "IMAGE PASS {placement:?} own {own}: {} tokens as the reference's (steps of \
+                 {own} rows: {}), {} as those steps'; again from the cache {}; {} loans",
+                leading(&passed, &reference),
+                leading(&steps, &reference),
+                leading(&passed, &steps),
+                leading(&again, &reference),
+                stats.scratch_loans,
+            );
+            assert!(stats.scratch_loans >= 1, "{placement:?}: no pass lent VRAM");
+            assert!(
+                leading(&passed, &reference) >= 2,
+                "{placement:?}: {passed:?} against {reference:?}"
+            );
+            assert!(leading(&steps, &reference) >= 2, "{placement:?}: {steps:?} in steps");
+            assert!(leading(&again, &reference) >= 2, "{placement:?}: {again:?} from the cache");
         }
     }
 }

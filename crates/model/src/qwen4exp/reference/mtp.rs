@@ -29,6 +29,7 @@ use crate::qwen4exp::weights::{Mixer, MtpWeights};
 use super::ops::matmul;
 use super::{
     LayerRows, LayerState, LogitRows, Observer, Reference, Routing, commit_attention, pieces,
+    text_position,
 };
 
 /// The cells of the MTP block of one sequence.
@@ -223,8 +224,16 @@ impl Reference<'_, '_> {
         let mut r = input.clone();
         let (m, inj) = self.read(&head.layer.attn_mixer, &r, n);
         observer.tensor(Some(layer), "attn_in", n, &m);
-        let (out, rows) =
-            self.attention(attention, &state.layer, state.position, &m, n, layer, observer);
+        let (out, rows) = self.attention(
+            attention,
+            &state.layer,
+            state.position,
+            &text_position,
+            &m,
+            n,
+            layer,
+            observer,
+        );
         observer.tensor(Some(layer), "attn_out", n, &out);
         self.write(&mut r, &out, &inj, n);
 

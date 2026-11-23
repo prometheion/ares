@@ -28,8 +28,11 @@
 //! others, or after a commit of the rows before it, because every sum has one
 //! fixed order.
 //!
-//! Only text is implemented: the rotary position of a cell is its index, and
-//! every cell hashes its own token. The MTP MTP block (section 4) is in
+//! A window takes rows that are not token embeddings and rotary positions
+//! that are not the rows' cells (an image's rows and the text after an image:
+//! [`Inputs`], [`Reference::window_with`]); otherwise the rotary position of a
+//! cell is its index. Every cell hashes its own token (an image's cells their
+//! pad token). The MTP MTP block (section 4) is in
 //! `draft.rs`: the mixer, attention and expert functions of this module with
 //! the block's own weights, on what [`Window::trunk_out`] holds.
 
@@ -37,6 +40,7 @@ mod blocks;
 mod mtp;
 mod ops;
 
+pub use crate::qwen35::reference::Inputs;
 pub(crate) use mtp::mtp_config;
 pub use mtp::{MtpState, MtpWindow};
 
@@ -77,6 +81,9 @@ pub struct SequenceState {
     /// first; zero before the start of the sequence.
     ngram_history: Vec<f32>,
     layers: Vec<LayerState>,
+    /// The rotary position of the first cell of the incomplete block of the
+    /// indexer, which rotates the block's pooled key once it is complete.
+    block_rotary: [usize; 3],
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -112,7 +119,13 @@ impl SequenceState {
             })
             .collect();
         let history = config.ngram.as_ref().map_or(0, |g| g.history() * config.wide());
-        Self { position: 0, recent: Vec::new(), ngram_history: vec![0.0; history], layers }
+        Self {
+            position: 0,
+            recent: Vec::new(),
+            ngram_history: vec![0.0; history],
+            layers,
+            block_rotary: [0; 3],
+        }
     }
 
     /// The number of cells the state holds: the cell of the next token.
@@ -300,6 +313,8 @@ pub struct Window {
     layers: Vec<LayerRows>,
     /// Per row the normed gated value of the n-gram block (`D`).
     ngram: Vec<f32>,
+    /// Per row its rotary position.
+    rotary: Vec<[usize; 3]>,
     wide: usize,
     n_vocab: usize,
 }
@@ -407,6 +422,31 @@ impl<'a, 'g> Reference<'a, 'g> {
         logits: LogitRows,
         observer: &mut dyn Observer,
     ) -> Result<Window> {
+        self.window_with_observed(state, tokens, &Inputs::default(), logits, observer)
+    }
+
+    /// [`Reference::window`] with rows that are not token embeddings and
+    /// rotary positions that are not the rows' cells (an image's rows, and the
+    /// text after an image): see [`Inputs`].
+    pub fn window_with(
+        &self,
+        state: &SequenceState,
+        tokens: &[u32],
+        inputs: &Inputs,
+        logits: LogitRows,
+    ) -> Result<Window> {
+        self.window_with_observed(state, tokens, inputs, logits, &mut ())
+    }
+
+    /// [`Reference::window_with`] with a hook.
+    pub fn window_with_observed(
+        &self,
+        state: &SequenceState,
+        tokens: &[u32],
+        inputs: &Inputs,
+        logits: LogitRows,
+        observer: &mut dyn Observer,
+    ) -> Result<Window> {
         let c = self.config;
         let n = tokens.len();
         if n == 0 {
@@ -428,6 +468,17 @@ impl<'a, 'g> Reference<'a, 'g> {
                 .token_embd
                 .decode_row(token as usize, &mut x[row * n_embd..(row + 1) * n_embd]);
         }
+        for (row, values) in &inputs.rows {
+            assert!(*row < n && values.len() == n_embd, "an input row of the window");
+            x[row * n_embd..(row + 1) * n_embd].copy_from_slice(values);
+        }
+        let rotary: Vec<[usize; 3]> = match &inputs.rotary {
+            Some(rotary) => {
+                assert_eq!(rotary.len(), n, "a rotary position per row");
+                rotary.clone()
+            }
+            None => (state.position..end).map(|cell| [cell; 3]).collect(),
+        };
         observer.tensor(None, "embedding", n, &x);
         let mut r = vec![0.0f32; n * wide];
         for (row, streams) in r.chunks_exact_mut(wide).enumerate() {
@@ -441,7 +492,7 @@ impl<'a, 'g> Reference<'a, 'g> {
         let mut routing = Vec::with_capacity(c.n_layer);
         let mut ngram = Vec::new();
         for layer in 0..c.n_layer.min(self.depth) {
-            let kept = self.run_layer(layer, state, tokens, &mut r, observer);
+            let kept = self.run_layer(layer, state, tokens, &rotary, &mut r, observer);
             if self.keep_residual {
                 residual.push(r.clone());
             }
@@ -481,6 +532,7 @@ impl<'a, 'g> Reference<'a, 'g> {
             routing,
             layers,
             ngram,
+            rotary,
             wide,
             n_vocab: c.n_vocab,
         })
@@ -523,7 +575,9 @@ impl<'a, 'g> Reference<'a, 'g> {
         assert!(layer < self.config.n_layer, "the model has {} layers", self.config.n_layer);
         assert_eq!(r.len(), tokens.len() * self.config.wide(), "r must be one row per token");
         let mut out = r.to_vec();
-        self.run_layer(layer, state, tokens, &mut out, observer);
+        let rotary: Vec<[usize; 3]> =
+            (state.position..state.position + tokens.len()).map(|cell| [cell; 3]).collect();
+        self.run_layer(layer, state, tokens, &rotary, &mut out, observer);
         out
     }
 
@@ -574,6 +628,7 @@ impl<'a, 'g> Reference<'a, 'g> {
         layer: usize,
         state: &SequenceState,
         tokens: &[u32],
+        rotary: &[[usize; 3]],
         r: &mut [f32],
         observer: &mut dyn Observer,
     ) -> LayerKept {
@@ -594,7 +649,14 @@ impl<'a, 'g> Reference<'a, 'g> {
                 self.recurrent(w, conv, delta, &m, n)
             }
             (Mixer::Attention(w), layer_state @ LayerState::Attention { .. }) => {
-                self.attention(w, layer_state, state.position, &m, n, layer, observer)
+                // The rows' rotary positions, and before them the first cell of the
+                // incomplete block's, which the state carries.
+                let start = state.position;
+                let at = |cell: usize| {
+                    let p = if cell >= start { rotary[cell - start] } else { state.block_rotary };
+                    p.map(|p| p as f64)
+                };
+                self.attention(w, layer_state, start, &at, &m, n, layer, observer)
             }
             _ => unreachable!("the state was built for this configuration"),
         };
@@ -668,6 +730,12 @@ impl<'a, 'g> Reference<'a, 'g> {
                 }
                 _ => unreachable!("the window was run on a state of this configuration"),
             }
+        }
+        // The rotary position of the first cell of the incomplete block, when
+        // the accepted rows begin it.
+        let first = end / c.indexer.block * c.indexer.block;
+        if first >= start && first < end {
+            state.block_rotary = window.rotary[first - start];
         }
         if let Some(ngram) = &c.ngram {
             let (wide, history) = (c.wide(), ngram.history());
@@ -903,13 +971,16 @@ impl<'a, 'g> Reference<'a, 'g> {
     }
 
     /// 3.6, an attention layer over `n` rows `x` (`[n, N]`) at cells
-    /// `start .. start + n`, after `start` committed cells.
+    /// `start .. start + n`, after `start` committed cells. `rotary` is the
+    /// rotary position of a cell: of the rows, and of the first cell of the
+    /// incomplete block before them.
     #[allow(clippy::too_many_arguments)]
     fn attention(
         &self,
         w: &AttentionWeights<'_>,
         state: &LayerState,
         start: usize,
+        rotary: &dyn Fn(usize) -> [f64; 3],
         x: &[f32],
         n: usize,
         layer: usize,
@@ -939,7 +1010,7 @@ impl<'a, 'g> Reference<'a, 'g> {
         let mut k = vec![0.0f32; n * kv_dim];
         let mut u = vec![0.0f32; n * u_dim];
         for t in 0..n {
-            let table = pieces::rope_table(&a.rope, text_position(start + t));
+            let table = pieces::rope_table(&a.rope, rotary(start + t));
             for h in 0..a.n_head {
                 let src = &qg[t * 2 * q_dim + h * 2 * hd..][..2 * hd];
                 let at = t * q_dim + h * hd;
@@ -978,7 +1049,7 @@ impl<'a, 'g> Reference<'a, 'g> {
             for (i, member) in members.chunks_exact_mut(id).enumerate() {
                 member.copy_from_slice(raw_key(raw_tail, &raw, start, block, id, j * block + i));
             }
-            let table = pieces::rope_table(&a.rope, text_position(j * block));
+            let table = pieces::rope_table(&a.rope, rotary(j * block));
             let at = (j - known) * id;
             pieces::pool_key(
                 &members,
