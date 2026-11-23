@@ -189,14 +189,15 @@ curl http://127.0.0.1:8000/v1/chat/completions -H 'Content-Type: application/jso
 }'
 ```
 
-The settings of the measurements above, for two 12 GiB cards:
+The command line of the measurements above, for two 12 GiB cards:
 
 ```sh
-ares --model Qwen3.8-27B-UD-Q4_K_S.gguf \
+ares --model Qwen3.8-27B-UD-Q4_K_S.gguf --devices 0,1 \
   --split tensor --shares 0.625,0.375 \
   --context 262144 --parallel 2 --kv q5 \
   --drafters mtp --draft-vocab draft-vocab.txt \
-  --ram 16G --cache ~/.cache/ares-prompts --cache-size 64G
+  --ram 16G --cache ~/.cache/ares-prompts --cache-size 48G \
+  --reasoning-effort medium
 ```
 
 Flash-Next with its MTP block from a file of its own, and 40 GiB of RAM for the
