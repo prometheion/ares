@@ -517,7 +517,8 @@ static __device__ void attn_prompt_body(
         }
         cur_ent = ent;
     };
-    // S = Q K^T for 16 vectors x 32 cells (four tiles of 8), from K tile `kbuf`
+    // S = Q K^T for 16 vectors x 32 cells (four tiles of 8), from K tile `kbuf`; with I8 still
+    // without the scale of the queries, which `weights_and_pv` applies
     auto scores = [&](float (&s)[4][4], int kbuf) {
 #pragma unroll
         for (int i = 0; i < 4; ++i) s[i][0] = s[i][1] = s[i][2] = s[i][3] = 0.0f;
@@ -548,13 +549,6 @@ static __device__ void attn_prompt_body(
                     s[nt][3] = fmaf((float)acc[3], ks.y, s[nt][3]);
                 }
             }
-#pragma unroll
-            for (int nt = 0; nt < 4; ++nt) {
-                s[nt][0] *= qsA;
-                s[nt][1] *= qsA;
-                s[nt][2] *= qsB;
-                s[nt][3] *= qsB;
-            }
         } else {
 #pragma unroll
             for (int ks = 0; ks < D / 16; ++ks) {
@@ -578,7 +572,8 @@ static __device__ void attn_prompt_body(
         for (int nt = 0; nt < 4; ++nt) {
 #pragma unroll
             for (int j = 0; j < 2; ++j) {
-                float a = s[nt][j] + mdA, b = s[nt][2 + j] + mdB;
+                // the scale of the integer queries (1 for f16) and the mean term in one step
+                float a = fmaf(s[nt][j], qsA, mdA), b = fmaf(s[nt][2 + j], qsB, mdB);
                 if (mask) {
                     const uint32_t cell = c0 + nt * 8 + 2 * tq + j;
                     a = (cell < end && cell <= limA) ? a : -INFINITY;
@@ -662,7 +657,12 @@ static __device__ void attn_prompt_body(
 
     if constexpr (I8) {
         // unit 0 .. PER-1: side 0 units decode K one chunk ahead (into tile (c + 1) & 1), side 1
-        // units decode V of their chunk; each prefetches the chunk after the one it decodes
+        // units decode V of their chunk; each prefetches the chunk after the one it decodes.
+        // A chunk has two phases between barriers, each with work for the tensor cores and work
+        // for the other pipes: the scores and the decode of V, then the weights with P V and
+        // the decode of the next K. Warps 4 to 7 compute first and decode after, warps 0 to 3
+        // the other way round, so the two warps of a scheduler (w and w + 4) keep the tensor
+        // cores and the other pipes busy at once.
 #pragma unroll
         for (int i = 0; i < PER; ++i) prefetch(i, 0);
 #pragma unroll
@@ -674,30 +674,53 @@ static __device__ void attn_prompt_body(
                 if (n_chunks > 1) prefetch(i, 1);
             }
         }
+        const bool compute_first = (warp & 4) != 0;
         for (int c = 0; c < n_chunks; ++c) {
             const uint32_t c0 = start + (uint32_t)c * C;
-            __syncthreads();  // K tile c & 1 is complete; every warp is done with the V tile
+            // the V tile of chunk c, the next chunk's stored V, and a new tile's mean terms
+            auto decode_v = [&]() {
 #pragma unroll
-            for (int i = 0; i < PER; ++i) {
-                int side, row, grp;
-                unit_of(i, side, row, grp);
-                if (side == 0) {
-                    if (c + 1 < n_chunks) {
+                for (int i = 0; i < PER; ++i) {
+                    int side, row, grp;
+                    unit_of(i, side, row, grp);
+                    if (side == 1) {
+                        fill(i, c, 0);
+                        if (c + 1 < n_chunks) prefetch(i, c + 1);
+                    }
+                }
+                if (vf == FMT_F16) cp_async_commit();
+                if (c == 0 || c0 % ATTN_TILE_CELLS == 0) new_tile(entry_of(c0));
+            };
+            // the K tile of chunk c + 1 and the stored K of chunk c + 2
+            auto decode_k = [&]() {
+#pragma unroll
+                for (int i = 0; i < PER; ++i) {
+                    int side, row, grp;
+                    unit_of(i, side, row, grp);
+                    if (side == 0 && c + 1 < n_chunks) {
                         fill(i, c + 1, (c + 1) & 1);
                         if (c + 2 < n_chunks) prefetch(i, c + 2);
                     }
-                } else {
-                    fill(i, c, 0);
-                    if (c + 1 < n_chunks) prefetch(i, c + 1);
                 }
-            }
-            if (vf == FMT_F16) cp_async_commit();
-            if (c == 0 || c0 % ATTN_TILE_CELLS == 0) new_tile(entry_of(c0));
+            };
+            __syncthreads();  // K tile c & 1 is complete; every warp is done with the V tile
             float s[4][4];
-            if (warp_active) scores(s, c & 1);
+            if (compute_first) {
+                if (warp_active) scores(s, c & 1);
+                decode_v();
+            } else {
+                decode_v();
+                if (warp_active) scores(s, c & 1);
+            }
             if (vf == FMT_F16) cp_async_wait<0>();
-            __syncthreads();  // the V tile is complete, and the next K tile
-            if (warp_active) weights_and_pv(s, c0);
+            __syncthreads();  // the V tile is complete
+            if (compute_first) {
+                if (warp_active) weights_and_pv(s, c0);
+                decode_k();
+            } else {
+                decode_k();
+                if (warp_active) weights_and_pv(s, c0);
+            }
         }
     } else {
         for (int i = 0; i < PER; ++i) prefetch(i, 0);

@@ -709,7 +709,9 @@ impl Planner {
             prompt_cells,
             h,
             self.cfg.prompt_blocks,
-            ((budget as u32) / prompt_tiles.max(1)).clamp(1, max_pieces),
+            // their share of the budget, as `pieces_for` would give it to them in all
+            ((budget * prompt_cells / work.max(1)) as u32 / prompt_tiles.max(1))
+                .clamp(1, max_pieces),
         );
         for (i, d) in self.dense.iter().enumerate().filter(|(_, d)| !d.alone) {
             let from = shares.iter().find(|s| s.members.contains(&i)).map_or(0, |s| s.cells);
@@ -859,7 +861,10 @@ impl Builder {
             } else if prompt {
                 4
             } else {
-                assert!(vecs <= AttnShape::Wide64.max_vecs(), "at most 64 vectors per item of ranges");
+                assert!(
+                    vecs <= AttnShape::Wide64.max_vecs(),
+                    "at most 64 vectors per item of ranges"
+                );
                 3
             };
             let ranges_off = self.plan.ranges.len() as u32;
@@ -967,7 +972,7 @@ mod tests {
                     if !list.contains(&(row as u32)) {
                         continue;
                     }
-                    assert!(item.n_rows * geo.q_per_kv <= 64);
+                    assert!(item.n_rows * geo.q_per_kv <= AttnShape::Prompt128.max_vecs());
                     slots.push(item.slot);
                     assert_eq!(item.flags & ITEM_FINAL != 0, plan.rows[row].n_slots == 0);
                     let ranges = &plan.ranges[item.ranges_off as usize..];
