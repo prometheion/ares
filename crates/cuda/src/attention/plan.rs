@@ -112,12 +112,21 @@ pub enum AttnShape {
     /// Up to 48 vectors (eight rows of 6 heads): three warps share the vectors.
     Decode48,
     /// Up to 64 vectors, for wide steps: the vectors are the rows, 4 warps, 16 cells per chunk.
+    /// Items of a list of ranges; an item of one range runs on [`AttnShape::Prompt128`].
     Wide64,
+    /// Up to 128 vectors over one range of cells that starts at a multiple of 32, for the rows
+    /// of a prompt: 8 warps of 16 vectors, 32 cells per chunk (`kernels/attn_prompt.cuh`).
+    Prompt128,
 }
 
 impl AttnShape {
-    pub const ALL: [AttnShape; 4] =
-        [AttnShape::Decode8, AttnShape::Decode16, AttnShape::Decode48, AttnShape::Wide64];
+    pub const ALL: [AttnShape; 5] = [
+        AttnShape::Decode8,
+        AttnShape::Decode16,
+        AttnShape::Decode48,
+        AttnShape::Wide64,
+        AttnShape::Prompt128,
+    ];
 
     pub const fn max_vecs(self) -> u32 {
         match self {
@@ -125,6 +134,7 @@ impl AttnShape {
             AttnShape::Decode16 => 16,
             AttnShape::Decode48 => 48,
             AttnShape::Wide64 => 64,
+            AttnShape::Prompt128 => 128,
         }
     }
 
@@ -144,6 +154,7 @@ impl AttnShape {
             AttnShape::Decode16 => (1, 2, 32, 6, 2),
             AttnShape::Decode48 => (3, 2, 32, 2, 2),
             AttnShape::Wide64 => (4, 1, 16, 4, 0),
+            AttnShape::Prompt128 => (8, 1, 32, 0, 0),
         }
     }
 
@@ -158,6 +169,7 @@ impl AttnShape {
             AttnShape::Decode16 => "s16",
             AttnShape::Decode48 => "s48",
             AttnShape::Wide64 => "w64",
+            AttnShape::Prompt128 => "p128",
         };
         format!("ares_attn_d{head_dim}_{suffix}")
     }
@@ -175,6 +187,10 @@ impl AttnShape {
     /// `kernels/attn_kernel.cuh`.
     pub const fn smem_bytes(self, head_dim: u32) -> u32 {
         let (mt, cg, chunk, _, nvw) = self.layout();
+        if let AttnShape::Prompt128 = self {
+            // the queries, the K and V tiles of a chunk (f16), the limits and the mean dots
+            return (128 + 2 * chunk) * head_dim * 2 + 128 * 4 * 2;
+        }
         let rows = if nvw > 0 {
             let r = mt * nvw * 8;
             if r < 16 { 16 } else { r }
@@ -242,7 +258,7 @@ impl PlanConfig {
         mean: bool,
     ) -> u64 {
         let budget = u64::from((self.target_blocks / kv_heads.max(1)).max(1));
-        let per = u64::from((64 / q_per_kv.max(1)).max(1)).min(u64::from(rows.max(1)));
+        let per = u64::from((128 / q_per_kv.max(1)).max(1)).min(u64::from(rows.max(1)));
         let (row_pieces, extra) = if mean { (5, 2) } else { (2, 0) };
         let prompts = per * (budget + 2 * u64::from(sequences)) + row_pieces * u64::from(rows);
         let alone_pieces = budget.min(u64::from(self.max_pieces)) + extra;
@@ -723,7 +739,7 @@ struct Builder {
     g: u32,
     h: u32,
     plan: Plan,
-    groups: [Vec<AttnItem>; 4],
+    groups: [Vec<AttnItem>; 5],
     next_slot: u32,
 }
 
@@ -783,8 +799,19 @@ impl Builder {
         let shape = AttnShape::ALL
             .iter()
             .position(|s| vecs <= s.max_vecs())
-            .expect("at most 64 vectors per item");
+            .expect("at most 128 vectors per item");
         for (slot, piece) in pieces.iter().enumerate() {
+            // More vectors than the decode shapes hold: the prompt kernel takes an item of
+            // one range that starts at a multiple of its chunk, the wide kernel any other.
+            let prompt = piece.ranges.len() == 1 && piece.ranges[0].start.is_multiple_of(32);
+            let shape = if vecs <= AttnShape::Decode48.max_vecs() {
+                shape
+            } else if prompt {
+                4
+            } else {
+                assert!(vecs <= AttnShape::Wide64.max_vecs(), "at most 64 vectors per item of ranges");
+                3
+            };
             let ranges_off = self.plan.ranges.len() as u32;
             let mut before = 0;
             for r in &piece.ranges {
@@ -814,10 +841,14 @@ impl Builder {
     }
 }
 
-/// Rows per tile of a window: all of them while the vectors fit one launch shape
-/// (up to 48), otherwise as many as fit 64 vectors.
+/// Rows per tile of a window: all of them while the vectors fit a decode shape (up to 48),
+/// otherwise tiles of up to 128 vectors (the prompt kernel), as equal as they can be.
 fn rows_per_tile(n_rows: u32, g: u32) -> u32 {
-    if n_rows * g <= 48 { n_rows } else { (64 / g).max(1) }
+    if n_rows * g <= 48 {
+        return n_rows;
+    }
+    let most = (128 / g).max(1);
+    n_rows.div_ceil(n_rows.div_ceil(most))
 }
 
 #[cfg(test)]

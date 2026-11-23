@@ -9,6 +9,7 @@
 #include "attn_write.cuh"
 #include "attn_kernel.cuh"
 #include "attn_direct.cuh"
+#include "attn_prompt.cuh"
 
 // The tensor-core attention kernels (kernels/attn_kernel.cuh). Per head size: s8, s16 and s48
 // are the decode shapes (up to 8, 16 and 48 vectors, i.e. query heads of the rows of a window), w64 the wide
@@ -25,6 +26,10 @@ ARES_ATTN_KERNEL(ares_attn_d128_s8, 128, 1, 2, 32, 6, 1)
 ARES_ATTN_KERNEL(ares_attn_d128_s16, 128, 1, 2, 32, 6, 2)
 ARES_ATTN_KERNEL(ares_attn_d128_s48, 128, 3, 2, 32, 2, 2)
 ARES_ATTN_KERNEL(ares_attn_d128_w64, 128, 4, 1, 16, 4, 0)
+// The prompt kernel (kernels/attn_prompt.cuh): items of up to 128 vectors over one range of
+// cells that starts at a multiple of 32, 8 warps.
+ARES_ATTN_PROMPT(ares_attn_d256_p128, 256)
+ARES_ATTN_PROMPT(ares_attn_d128_p128, 128)
 ARES_ATTN_MERGE(ares_attn_merge_d256, 256)
 ARES_ATTN_MERGE(ares_attn_merge_d128, 128)
 

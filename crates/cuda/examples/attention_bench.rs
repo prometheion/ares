@@ -350,6 +350,16 @@ fn main() -> Result<()> {
     let iters: usize = arg("--iters").map_or(30, |x| x.parse().unwrap());
     // `--views N`: every decode case also with N sequences that share their prefix.
     let views: usize = arg("--views").map_or(1, |x| x.parse().unwrap());
+    // `--long H,..`: a prompt step of `--step` rows (256) at the end of a history of H cells,
+    // converted as the policy says, as the step of a long prompt reads it.
+    let long: Vec<usize> = arg("--long")
+        .map(|l| l.split(',').map(|x| x.parse().unwrap()).collect())
+        .unwrap_or_default();
+    let step: usize = arg("--step").map_or(256, |x| x.parse().unwrap());
+    // `--heads N`: the KV heads this device holds (of 4), as a placement gives them.
+    let heads: usize = arg("--heads").map_or(KV, |x| x.parse().unwrap());
+    // With `--long` only those steps run.
+    let (hist, prompts) = if long.is_empty() { (hist, prompts) } else { (Vec::new(), Vec::new()) };
 
     for info in devices()? {
         if only.is_some_and(|d| d != info.ordinal) {
@@ -375,7 +385,7 @@ fn main() -> Result<()> {
                 k,
                 v,
                 head_dim: D as u32,
-                kv_heads: KV as u32,
+                kv_heads: heads as u32,
                 kv_total: KV as u32,
                 first_kv_head: 0,
                 q_per_kv: G as u32,
@@ -437,6 +447,31 @@ fn main() -> Result<()> {
                         );
                     }
                 }
+            }
+            for &h in &long {
+                let len = h + step;
+                let per_layer = len as f64
+                    * heads as f64
+                    * f64::from(k.row_bytes(D as u32) + v.row_bytes(D as u32));
+                let free = device.mem_info()?.free as f64 * 0.6;
+                let n_layers = ((free / per_layer).floor() as usize).clamp(1, 2);
+                let setup = build(&device, &kernels, &stream, geo, 1, len, n_layers, true)?;
+                let t = time_step(&device, &kernels, &stream, &setup, step, 1, iters.min(8))?;
+                // Causal: row i sees h + i + 1 cells; 4 * D flops per cell and query head.
+                let flops = (0..step).map(|i| (h + i + 1) as f64).sum::<f64>()
+                    * 4.0
+                    * D as f64
+                    * (G * heads) as f64;
+                println!(
+                    "| long | {}/{} | {step} | {heads} heads | {h} | {} | {:.0} | {:.2} | {:.0} | {:.1} TFLOPS |",
+                    name(k),
+                    name(v),
+                    t.pieces,
+                    t.us,
+                    t.us * 16.0 / 1e3,
+                    t.gbps,
+                    flops / t.us / 1e6
+                );
             }
             for &p in &prompts {
                 let setup = build(&device, &kernels, &stream, geo, 1, p, 2, false)?;
