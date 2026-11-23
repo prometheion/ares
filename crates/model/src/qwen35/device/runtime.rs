@@ -642,55 +642,6 @@ struct Qwen35Device {
     dflash_id: Option<u32>,
 }
 
-/// The runtime's links as a part uses them.
-struct LinkExchange<'a> {
-    links: &'a Links,
-    index: usize,
-    stream: &'a Stream,
-}
-
-impl Exchange for LinkExchange<'_> {
-    fn push_bytes(&self) -> u64 {
-        self.links.push_bytes()
-    }
-
-    fn push(&self) -> Result<PushSlot, ModelError> {
-        self.links.push(self.index)
-    }
-
-    fn slot_bytes(&self) -> u64 {
-        self.links.slot_bytes()
-    }
-
-    fn outbox(&self, slot: u32) -> Result<DevicePtr, ModelError> {
-        self.links.outbox(self.index, slot)
-    }
-
-    fn post(&self, slot: u32, bytes: u64) -> Result<(), ModelError> {
-        self.links.post(self.index, slot, bytes)
-    }
-
-    fn arrive(&self, slot: u32) -> Result<DevicePtr, ModelError> {
-        self.links.arrive(self.index, slot)
-    }
-
-    fn consumed(&self, slot: u32) -> Result<(), ModelError> {
-        self.links.consumed(self.index, slot)
-    }
-
-    fn send(&self, src: DevicePtr, n: u32) -> Result<(), ModelError> {
-        self.links.send(self.index, self.stream, src, n)
-    }
-
-    fn receive(&self) -> Result<DevicePtr, ModelError> {
-        self.links.receive(self.index - 1, self.stream)
-    }
-
-    fn release(&self) -> Result<(), ModelError> {
-        self.links.release(self.index - 1, self.stream)
-    }
-}
-
 impl DeviceModel for Qwen35Device {
     fn logits_per_row(&self) -> u32 {
         self.part.logits_per_row()
@@ -807,7 +758,7 @@ impl DeviceModel for Qwen35Device {
         if self.part.has_dflash() && self.passes.is_empty() {
             self.part.dflash_no_pass();
         }
-        let exchange = LinkExchange { links: step.links, index: step.index, stream: step.stream };
+        let exchange = Exchange { links: step.links, index: step.index, stream: step.stream };
         if record.drafts_only() {
             // The drafts and nothing of the model: the round that verifies
             // them is the next record. The MTP block's chains first, then
@@ -844,7 +795,7 @@ impl DeviceModel for Qwen35Device {
             segments: &self.segments,
             tables: step.tables,
             pages: step.pages,
-            exchange: (step.devices > 1).then_some(&exchange as &dyn Exchange),
+            exchange: (step.devices > 1).then_some(&exchange),
             replay: &self.replay,
         })
     }

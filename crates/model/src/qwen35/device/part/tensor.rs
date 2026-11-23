@@ -58,7 +58,7 @@ impl Options {
     }
 }
 
-fn paths<'a>(env: &StepEnv<'a>) -> Result<&'a dyn Exchange, ModelError> {
+fn paths<'a>(env: &StepEnv<'a>) -> Result<&'a Exchange<'a>, ModelError> {
     env.exchange.ok_or_else(|| invalid("a tensor split needs the paths between devices"))
 }
 
@@ -201,7 +201,7 @@ impl Part {
     }
 
     /// Whether a sum of `n` rows is pushed by its merge kernel.
-    fn pushes(&self, exchange: &dyn Exchange, n: u32) -> bool {
+    fn pushes(&self, exchange: &Exchange<'_>, n: u32) -> bool {
         n <= self.push_rows
             && partial_wire_bytes(self.opts.wire(), n, self.d) <= exchange.push_bytes()
     }
@@ -314,7 +314,7 @@ impl Part {
                     x,
                     own,
                     peers,
-                    exchange.slot_bytes(),
+                    exchange.links.slot_bytes(),
                     self.n_devices as u32 - 1,
                     self.index as u32,
                     n,

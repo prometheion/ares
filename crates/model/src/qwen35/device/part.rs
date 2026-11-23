@@ -22,7 +22,7 @@ use ares_cuda::{
     PrefillPath, RopeParams, Segment, StateFormat, StepDims, Stream, WeightLayout, WeightRange,
 };
 use ares_cuda::{PUSH_MAX_ROWS, PushSlot};
-use ares_runtime::{Logits, ModelError, PinnedRam, Split};
+use ares_runtime::{Links, Logits, ModelError, PinnedRam, Split};
 
 use super::choose::{Balance, LayoutReport, Layouts, decode_in_batches, file_path};
 use super::load::{
@@ -273,32 +273,65 @@ struct Marks {
     phases: Vec<Phase>,
 }
 
-/// The paths to the other devices, as a part uses them.
-pub trait Exchange {
+/// The paths to the other devices, as a part uses them: the runtime's links
+/// seen from device `index`, whose stream waits for them.
+#[derive(Clone, Copy)]
+pub struct Exchange<'a> {
+    pub links: &'a Links,
+    pub index: usize,
+    pub stream: &'a Stream,
+}
+
+impl Exchange<'_> {
     /// The bytes one pushed sum may write, or 0 when the devices have no
     /// push path.
-    fn push_bytes(&self) -> u64;
+    fn push_bytes(&self) -> u64 {
+        self.links.push_bytes()
+    }
+
     /// The next pushed sum of this device, for its merge kernel.
-    fn push(&self) -> Result<PushSlot, ModelError>;
-    /// The bytes between the regions [`Exchange::arrive`] returns.
-    fn slot_bytes(&self) -> u64;
+    fn push(&self) -> Result<PushSlot, ModelError> {
+        self.links.push(self.index)
+    }
+
     /// Where this device writes its next parcel of `slot`.
-    fn outbox(&self, slot: u32) -> Result<DevicePtr, ModelError>;
+    fn outbox(&self, slot: u32) -> Result<DevicePtr, ModelError> {
+        self.links.outbox(self.index, slot)
+    }
+
     /// Sends `bytes` bytes of this device's parcel of `slot` to the other
     /// devices; the stream does not wait for it.
-    fn post(&self, slot: u32, bytes: u64) -> Result<(), ModelError>;
+    fn post(&self, slot: u32, bytes: u64) -> Result<(), ModelError> {
+        self.links.post(self.index, slot, bytes)
+    }
+
     /// Makes the stream wait for the other devices' parcels of `slot` and
     /// returns where they are, in device order, until [`Exchange::consumed`].
-    fn arrive(&self, slot: u32) -> Result<DevicePtr, ModelError>;
+    /// They are [`Links::slot_bytes`] apart.
+    fn arrive(&self, slot: u32) -> Result<DevicePtr, ModelError> {
+        self.links.arrive(self.index, slot)
+    }
+
     /// Ends the use of the parcels of `slot` that arrived.
-    fn consumed(&self, slot: u32) -> Result<(), ModelError>;
+    fn consumed(&self, slot: u32) -> Result<(), ModelError> {
+        self.links.consumed(self.index, slot)
+    }
+
     /// Hands `n` f32 values at `src` to the next device.
-    fn send(&self, src: DevicePtr, n: u32) -> Result<(), ModelError>;
+    fn send(&self, src: DevicePtr, n: u32) -> Result<(), ModelError> {
+        self.links.send(self.index, self.stream, src, n)
+    }
+
     /// Where the values the previous device handed over are, until
     /// [`Exchange::release`].
-    fn receive(&self) -> Result<DevicePtr, ModelError>;
+    fn receive(&self) -> Result<DevicePtr, ModelError> {
+        self.links.receive(self.index - 1, self.stream)
+    }
+
     /// Ends the use of the received values.
-    fn release(&self) -> Result<(), ModelError>;
+    fn release(&self) -> Result<(), ModelError> {
+        self.links.release(self.index - 1, self.stream)
+    }
 }
 
 /// What a part is built from.
@@ -343,7 +376,7 @@ pub struct StepEnv<'a> {
     /// memory of the pages.
     pub tables: DevicePtr,
     pub pages: DevicePtr,
-    pub exchange: Option<&'a dyn Exchange>,
+    pub exchange: Option<&'a Exchange<'a>>,
     /// The rows of the step that are a replay (rows of the whole step): they
     /// read the cells their sequence has cached already and append none.
     pub replay: &'a [Range<u32>],
