@@ -423,10 +423,11 @@ prompt (0.98 to 1.00 reads per distinct expert). To be read in its code before i
       or a cancellation comes (or its time as a piece is up) and goes on where it stopped.
       Tested against the reference in every placement and for a request that cuts in (its
       first token after 16 ms where the prompt took 61 to 78 ms, made-up model).
-      Measured locally (IQ2_XS, `--ram 8G`, 17k prompt, A/B against `flash/prompt`): the prompt
-      1.2 times as fast on two cards and 1.2 to 1.6 on one, the tokens after it 1.2 to 1.4
-      times, a request that comes during it its first token after 0.9 to 2.5 s instead of 20
-      to 58 s (ARCHITECTURE.md). Built with it: the CPU's share of a pass of up to 2048 rows;
+      Measured locally (IQ2_XS, `--ram 8G`, 17k prompt, A/B against `flash/prompt`, with the
+      checkpoints inside the pass): the prompt 2.1 times as fast on two cards and 3.0 on one,
+      the tokens after it 1.2 to 1.3 times, a request that comes during it its first token
+      after 0.8 to 1.8 s instead of 21 to 49 s (ARCHITECTURE.md). **Not measured yet:** the
+      test machine against Strata (2k/8k/32k, UD-Q3_K_XL and UD-Q4_K_XL; it was off). Built with it: the CPU's share of a pass of up to 2048 rows;
       the next layer's experts that no tier holds read into staging while a layer's
       micro-batches run.
       Checkpoints due inside a pass are saved there layer by layer (the step is no longer cut

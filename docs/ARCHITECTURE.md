@@ -6225,11 +6225,22 @@ cards), both built alike; alternating, the load 2 to 6):
 | One, 2 | passes | 54.9 s | 73.5 GiB | 58 186 | 8.7, 12.7, 9.4 | 1.72 s | 55.4 s |
 | One, 2 | base | 67.1 s | 79.0 GiB | 63 873 | 5.9, 10.5, 9.3 | 27.4 s | 65.9 s |
 
-On these cards the prompt is bound by the drive (54 GiB in 45 s); a pass reads 6 to 16 % less
-of it here because the 16 384-row cut and the anchor make two more steps that read most experts
-again. The tokens right after the prompt are 1.2 to 1.4 times as fast (the loan of a pass of
-16 384 rows is 0.9 GiB where a lent step of 4096 rows took 2 GiB of slots), and a request that
-comes during the prompt gets its first token after 0.9 to 2.5 s instead of 20 to 58 s.
+These passes were still cut where checkpoints were due (16 384 and the anchor), and the two
+steps after the cuts read most experts again. With the checkpoints saved inside the pass (the
+same day, one round each, the load 1.5 to 3.6):
+
+| Cards | Build | 17k prompt | Read from the file | Uploads | Tokens/s after it (2-16, 17-32, 33-64) | The short request's first token | The long prompt meanwhile |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Two | passes | 26.0 s | 13.3 GiB | 13 420 | 15.2, 18.6, 16.4 | 0.77 s | 35.5 s |
+| Two | base | 54.6 s | 63.5 GiB | 50 277 | 9.4, 14.1, 13.7 | 20.7 s | 68.5 s |
+| One | passes | 20.9 s | 25.5 GiB | 22 797 | 9.7, 11.0, 9.8 | 1.76 s | 23.0 s |
+| One | base | 62.2 s | 79.4 GiB | 64 861 | 5.3, 10.3, 9.3 | 48.8 s | 136.2 s |
+
+The prompt reads 2.1 times as fast on two cards and 3.0 times on one, with a fifth to a third
+of the reads on demand (the reads ahead of the next layer are not in that column) and of the
+uploads; the tokens right after it are 1.2 to 1.3 times as fast (the loan of a pass of 17 000
+rows is about 0.9 GiB where a lent step of 4096 rows took 2 GiB of slots), and a request that
+comes during the prompt gets its first token after 0.8 to 1.8 s instead of 21 to 49 s.
 
 ### Vulkan
 
