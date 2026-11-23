@@ -69,6 +69,7 @@ tree is accepted than a chain), then built; started when the pieces in work leav
 piece at a time.
 
 ## In work now
+Merged 2026-11-23 (verified on the two local cards): CUDA built and run only on the tested classes (Ampere 8.6 and Ada 8.9; a device of another class is refused and is to run through Vulkan), the Flash-Next agent-turn failure at turn 2 (a checkpoint given up while its restore waits keeps its save of the same record), the public README with the thanks, THIRD-PARTY-NOTICES and the index of the documents.
 Merged 2026-11-23: the prompt attention kernel (scores over quantized K in integers, L2-shared tile order); at the owner's production settings the 27B reads 2k / 8k / 32k / 98k at about 1130 / 1130 / 990 / 705 tokens/s against the fork's 840 / 994 / 944 / 752.
 Merged 2026-11-23: Flash-Next's prompts layer by layer (TokenWing's order, interruptible between micro-batches, two devices, checkpoints inside a pass, images in passes), the CPU share of wide steps, forms per dense type, loans in pieces, the anchor fix for cached turns, the heat of a pass counted per row; a 17k prompt 2.6 times as fast locally, a short request during it first token 0.8 s against 13 to 16 s.
 Merged 2026-11-23 (the two local cards): the second card's role timed at load, capped cards measuring their prefill path, the transit budget (the 196-row test), the 27B at the owner's production settings planned and run (the attention's partial states bounded by the planner).
@@ -79,10 +80,11 @@ Merged 2026-11-22 after the test machine's one card passed every GPU suite (`fix
 
 | Piece | State |
 | --- | --- |
-| Parallel requests against the owner's fork at production settings (the owner, 2026-11-23: "the whole reason I am making the engine"): two generating, one generating beside a long prompt, two agent sessions, 3 to 8 at once, priorities | agent measuring (`bench/parallel`) |
-| Inkling 2 Mini and Flash-Next on the newest Strata on the test machine (the owner, 2026-11-23: Inkling could replace the 27B), with Inkling's quality against the 27B for the owner's use | agent measuring (`strata-eval`) |
-| Flash-Next UD-Q4_K_XL (104 GiB, larger than RAM) streamed from the SSD against Strata, then Ares's reading path | handed back, waiting for verification (`flash/ssd-stream`): decode ahead of Strata 0.1.60 on prose, prompts behind (the x4 link); measurement tools, a lower loan floor, RAM-held guesses into free transit slots |
-| 6: K/V beyond VRAM into RAM (Flash-Next) | handed back, waiting for verification (`kv/overflow`): 38 % more expert slots at the model's own context, 64k prompts 2.1 times; finished requests' far pages rank as prompt cache (the owner); the slower decode after a long prompt is the loan's, not the overflow's |
+| Parallel requests against the owner's fork at production settings (the owner, 2026-11-23: "the whole reason I am making the engine"): two generating, one generating beside a long prompt, two agent sessions, 3 to 8 at once, priorities | measured (see "Parallel requests against the owner's production"); the fixes in work (`sched/parallel`): a long prompt beside generation, two prompts sharing the pieces of a step, Flash-Next's pass beside generation, the watchdog inside a pass |
+| Cleanup phase 1, server and model (see "Cleanup") | agent working (`cleanup/server-model`) |
+| Inkling 2 Mini and Flash-Next on the newest Strata on the test machine (the owner, 2026-11-23: Inkling could replace the 27B), with Inkling's quality against the 27B for the owner's use | done: Flash-Next under "Found against Strata"; Inkling on Strata set aside (the owner: Strata forces its thinking off) |
+| Flash-Next UD-Q4_K_XL (104 GiB, larger than RAM) streamed from the SSD against Strata, then Ares's reading path | handed back, being rebased onto main with `kv/overflow` (`flash/ssd-stream`): decode ahead of Strata 0.1.60 on prose, prompts behind (the x4 link); measurement tools, a lower loan floor, RAM-held guesses into free transit slots |
+| 6: K/V beyond VRAM into RAM (Flash-Next) | handed back, being rebased onto main (`kv/overflow`): 38 % more expert slots at the model's own context, 64k prompts 2.1 times; finished requests' far pages rank as prompt cache (the owner); the slower decode after a long prompt is the loan's, not the overflow's |
 | DFlash2 trees and the experts of a tree's tokens read ahead, phase 1 | measured (`flash/trees-study`, instruments only, not merged): Flash-Next +1 to 3 % with a tree of 4, larger trees lose, reading ahead from token tables or route memory +1 % (they name 1.4 to 6 % of a round's missing experts); 27B +9 % with trees of at most 8 rows; the MTP chain with its own candidates as siblings is as good as a DFlash tree of 8 nodes. The lever the data point at: a distinct expert in a few-row step costs 16.5 µs (about 80 GB/s of the cards' 360 / 500); at 5 µs chains reach about 120 tokens/s and trees then pay +15 %. Owner's decision on what to build |
 
 ## Shared model layer (the owner's rule, 2026-11-16)
@@ -580,6 +582,12 @@ prompt (0.98 to 1.00 reads per distinct expert). To be read in its code before i
       (`steps_wider_than_eight_rows_match_the_reference`,
       `every_layer_of_wide_steps_matches_the_reference`,
       `experts_of_every_weight_type_on_the_cpu_change_nothing_*` fail now and then under load).
+      2026-11-23, RTX 4070 alone at load 12 to 17: `steps_wider_than_eight_rows_match_the_reference`
+      failed in 2 of 4 runs, on main's build as often as on the merged branches': in the Fast
+      precision the last row's logits after the 256-row step differ by 0.13 to 0.215 (relative
+      RMS) from run to run against the bound 0.2, with 882 or 883 experts picked and 50 to 61
+      more rounds. The spread is the step's own, not the load's; whether the integer prompt
+      kernel raised it is not measured. The bound or the spread is to be settled.
 - [ ] The step scratch starts its buffers on a 128-byte line (as fixed for the 27B).
 - [ ] Float experts beyond the f16 range are not caught in the many-row kernels.
 - [ ] CPU path for the types without a written kernel (Q2_K, Q3_K, Q6_K, IQ2_XS, IQ3_S, IQ1_S,
