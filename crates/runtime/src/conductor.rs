@@ -761,6 +761,13 @@ pub(crate) struct Conductor {
     /// one when it has been asked more since.
     asks: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
     asked: u32,
+    /// Checkpoints due inside the rows of the step being planned, for a model that saves
+    /// them there ([`Model::saves_inside_steps`]): (slot, position); then the places taken
+    /// for them, which the record names and the commit attaches; and those of the paused
+    /// step.
+    inner_due: Vec<(u32, u64)>,
+    inner: Vec<crate::InnerSave>,
+    paused_inner: Vec<crate::InnerSave>,
     // Scratch that lives across steps so that a step allocates nothing for it.
     requests: Vec<Request>,
     parts: Vec<StepPart>,
@@ -907,6 +914,9 @@ impl Conductor {
             resuming: false,
             asks,
             asked: 0,
+            inner_due: Vec::new(),
+            inner: Vec::new(),
+            paused_inner: Vec::new(),
             step_no: 0,
             after_idle: true,
             last_done_ns: None,
@@ -1571,6 +1581,8 @@ impl Conductor {
                 self.paused = None;
                 self.paused_images.clear();
                 self.give_up = true;
+                let saves = std::mem::take(&mut self.paused_inner);
+                self.release_inner(saves);
                 false
             }
             _ => keep,
@@ -2002,6 +2014,7 @@ impl Conductor {
         // Those who wait come in before the plan, so that a request that
         // fits shares this step.
         self.parts.clear();
+        self.inner_due.clear();
         if !self.waiting.is_empty() {
             self.refresh_waiting();
             let outcome = self.settle();
@@ -2138,23 +2151,39 @@ impl Conductor {
                 if step.replay {
                     step.rows = step.rows.min(a.replay_left);
                 }
-                let to = step.from + u64::from(step.rows);
-                if let Some(cache) = &self.cache
-                    && let Some(at) =
-                        cache.capture(a.prompt_len, &a.boundaries, a.checkpoint_at, step.from, to)
-                {
-                    step.rows = step.rows.min((at - step.from) as u32);
-                }
                 // Up to an image whose rows are not there, and as many image
-                // rows as the stage has room for.
+                // rows as the stage has room for; before the checkpoints, so
+                // that those due inside the step lie inside the rows it keeps.
                 if !a.spans.is_empty() {
                     step.rows = a.ready_rows(step.from, step.rows, &self.images);
-                    let (rows, image_rows) = a.rows_within(step.from, step.rows, stage_room);
-                    step.rows = rows;
-                    stage_room -= image_rows;
+                    step.rows = a.rows_within(step.from, step.rows, stage_room).0;
                     if step.rows == 0 {
                         continue;
                     }
+                }
+                let to = step.from + u64::from(step.rows);
+                // A model that saves the state inside a step wider than its own rows (a
+                // prompt read layer by layer) takes the checkpoints due inside its rows there,
+                // and the step goes on.
+                let inside = !step.replay
+                    && step.rows > self.model.own_rows()
+                    && self.model.saves_inside_steps();
+                if let Some(cache) = &self.cache {
+                    let (mut last, mut from) = (a.checkpoint_at, step.from);
+                    while let Some(at) = cache.capture(a.prompt_len, &a.boundaries, last, from, to)
+                    {
+                        if inside && at < to {
+                            self.inner_due.push((step.slot, at));
+                            (last, from) = (at, at);
+                            continue;
+                        }
+                        step.rows = step.rows.min((at - step.from) as u32);
+                        break;
+                    }
+                }
+                // The image rows the step stages, of the stage's room.
+                if !a.spans.is_empty() {
+                    stage_room -= a.rows_within(step.from, step.rows, stage_room).1;
                 }
                 let completes =
                     !step.replay && a.cells.len() + u64::from(step.rows) == u64::from(a.known);
@@ -2258,12 +2287,38 @@ impl Conductor {
         } else {
             0.0
         };
+        self.reserve_inner();
         let used = match self.write_record(false) {
             Ok(used) => used,
             Err(message) => return self.fail(message),
         };
         self.stats.record(Phase::Write, t_write.elapsed().as_nanos() as u64);
         self.run_record(began, used, turn, generating, chain_ms, true);
+    }
+
+    /// Takes places for the checkpoints due inside the rows of the planned parts.
+    fn reserve_inner(&mut self) {
+        self.inner.clear();
+        let Some(cache) = &mut self.cache else { return };
+        for &(slot, position) in &self.inner_due {
+            if !self.parts.iter().any(|p| p.slot == slot) {
+                continue;
+            }
+            let (place, dropped) = cache.reserve();
+            self.stats.counters.checkpoints_dropped += u64::from(dropped);
+            if let Some(place) = place {
+                self.inner.push(crate::InnerSave { slot, place, position: position as u32 });
+            }
+        }
+    }
+
+    /// Gives back the places taken for checkpoints inside a step that will not run.
+    fn release_inner(&mut self, saves: Vec<crate::InnerSave>) {
+        if let Some(cache) = &mut self.cache {
+            for save in saves {
+                cache.unreserve(save.place);
+            }
+        }
     }
 
     /// Runs the step whose record (`used` bytes) is written, for `turn`, with
@@ -2338,6 +2393,7 @@ impl Conductor {
             let part = self.parts[0];
             self.paused = Some(part);
             self.hold_images(part);
+            self.paused_inner = std::mem::take(&mut self.inner);
             self.commits.clear();
             self.stats.counters.steps_paused += 1;
             self.stats.record(Phase::Step, began.elapsed().as_nanos() as u64);
@@ -2486,8 +2542,12 @@ impl Conductor {
         if !self.slots[part.slot as usize].as_ref().is_some_and(|a| a.seq == part.seq) {
             self.paused_images.clear();
             self.give_up = true;
+            let saves = std::mem::take(&mut self.paused_inner);
+            self.release_inner(saves);
             return;
         }
+        // The checkpoints inside its rows were named when it began; the model keeps them.
+        self.inner = std::mem::take(&mut self.paused_inner);
         let t_write = Instant::now();
         self.parts.clear();
         self.parts.push(part);
@@ -2708,6 +2768,9 @@ impl Conductor {
             writer.give_up_paused();
         }
         writer.asked(self.asked);
+        if !self.resuming && !drafts_only {
+            writer.inner_saves(&self.inner).map_err(full)?;
+        }
         self.runs.clear();
         self.samplers.clear();
         self.step_rows.clear();
@@ -3148,20 +3211,40 @@ impl Conductor {
                     Priority::NORMAL,
                 );
                 cache.note(a.owner, &a.chain, settled, false);
-                if let Some(at) =
-                    cache.capture(a.prompt_len, &a.boundaries, a.checkpoint_at, part.from, reached)
-                    && at == reached
+                // The checkpoints the model saved inside the rows, then the one at their
+                // end.
+                let (mut last, mut from) = (a.checkpoint_at, part.from);
+                while let Some(at) = cache.capture(a.prompt_len, &a.boundaries, last, from, reached)
                 {
                     let page = (at / u64::from(self.pool.cells_per_page())) as usize;
                     let root = cache.at_root(&a.boundaries, at);
                     let hash = a.chain.hashes()[page - 1];
-                    let saved = cache.save(part.slot, hash, a.owner, root);
+                    let saved = if at == reached {
+                        cache.save(part.slot, hash, a.owner, root)
+                    } else {
+                        let Some(k) = self
+                            .inner
+                            .iter()
+                            .position(|s| s.slot == part.slot && u64::from(s.position) == at)
+                        else {
+                            break;
+                        };
+                        let save = self.inner.swap_remove(k);
+                        cache.attach(save.place, hash, a.owner, root)
+                    };
                     self.stats.counters.checkpoints_saved += u64::from(saved.taken);
                     self.stats.counters.checkpoints_dropped += u64::from(saved.dropped);
                     a.checkpoint_at = at;
+                    if at == reached {
+                        break;
+                    }
+                    (last, from) = (at, at);
                 }
             }
         }
+        // A place taken for a checkpoint inside the rows that the commit did not name.
+        let left = std::mem::take(&mut self.inner);
+        self.release_inner(left);
     }
 
     /// Sends the text of the step to the sinks, ends the requests that are

@@ -92,6 +92,9 @@ pub struct SyntheticConfig {
     /// ([`Model::own_rows`]); 0: `max_rows`. A prompt read alone takes up to
     /// `max_rows`, a piece of prompt while others run up to this.
     pub own_rows: u32,
+    /// Whether the model saves states inside a prompt step wider than its own
+    /// rows ([`Model::saves_inside_steps`]).
+    pub inner_saves: bool,
     /// For a layer split: how many layers each device holds. Empty: even.
     pub layers_per_device: Vec<u32>,
     /// For a tensor split: each device's share of the rows of every block, as
@@ -164,6 +167,7 @@ impl SyntheticConfig {
             context_length: 4096,
             max_rows: 64,
             own_rows: 0,
+            inner_saves: false,
             layers_per_device: Vec::new(),
             tensor_shares: Vec::new(),
             state_bytes_per_cell: 0,
@@ -616,6 +620,10 @@ impl Model for SyntheticModel {
 
     fn max_rows(&self) -> u32 {
         self.config.max_rows
+    }
+
+    fn saves_inside_steps(&self) -> bool {
+        self.config.inner_saves
     }
 
     fn own_rows(&self) -> u32 {

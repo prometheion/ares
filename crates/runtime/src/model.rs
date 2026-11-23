@@ -565,6 +565,16 @@ pub trait Model: Send + Sync + 'static {
         None
     }
 
+    /// Whether the model saves a sequence's state at positions inside a step of
+    /// one prompt wider than [`Model::own_rows`] (a prompt read layer by layer
+    /// saves each layer's state as it goes past the position): the conductor
+    /// then does not end such a step where a checkpoint of the prefix cache is
+    /// due, and names the checkpoint in the record
+    /// ([`RecordWriter::inner_saves`](crate::RecordWriter::inner_saves)).
+    fn saves_inside_steps(&self) -> bool {
+        false
+    }
+
     /// Whether a step of the model can wait for what it fetches while it
     /// runs (experts that no tier in VRAM holds). The dearest of its steps is
     /// then the step's own cost and not other work on the machine, and the

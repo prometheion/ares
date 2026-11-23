@@ -178,11 +178,13 @@ pub struct HostExecutor {
 /// step of one prompt wider than `rows` rows runs in `pieces` dispatches, of which every one
 /// but the last is paused; the rows of the one it runs (`at`: slot, first position, rows) and
 /// the dispatches it has had.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct Pauses {
     rows: u32,
     pieces: u32,
     at: Option<((u32, u32, u32), u32)>,
+    /// The saves inside the paused step, which its first record named.
+    inner: Vec<crate::InnerSave>,
 }
 
 impl std::fmt::Debug for HostExecutor {
@@ -346,7 +348,7 @@ impl HostExecutor {
     /// paused sequence's state.
     pub fn with_pauses(mut self, rows: u32, pieces: u32) -> Self {
         assert!(pieces >= 1, "a step is at least one piece");
-        self.pauses = Some(Pauses { rows, pieces, at: None });
+        self.pauses = Some(Pauses { rows, pieces, at: None, inner: Vec::new() });
         self
     }
 
@@ -455,9 +457,12 @@ impl Executor for HostExecutor {
                 (None, false) => self.delay,
             };
         self.picks.clear();
-        // A step the model runs in pieces: every piece but the last pauses it.
+        // A step the model runs in pieces: every piece but the last pauses it. Its saves
+        // inside its rows are in its first record.
         self.paused = false;
         let mut rows_run = true;
+        let mut inner: Vec<crate::InnerSave> =
+            (0..view.inner_saves()).map(|i| view.inner_save(i)).collect();
         if let Some(pauses) = &mut self.pauses {
             if view.gives_up_paused() {
                 pauses.at = None;
@@ -474,9 +479,15 @@ impl Executor for HostExecutor {
                 self.paused = done < pauses.pieces;
                 pauses.at = self.paused.then_some((key, done));
                 rows_run = !self.paused;
+                if done == 1 {
+                    pauses.inner = std::mem::take(&mut inner);
+                }
+                if rows_run {
+                    inner = std::mem::take(&mut pauses.inner);
+                }
             }
         }
-        let paused_slot = self.pauses.and_then(|p| p.at).map(|((slot, ..), _)| slot);
+        let paused_slot = self.pauses.as_ref().and_then(|p| p.at).map(|((slot, ..), _)| slot);
         let mut tables = self.tables.lock().expect("tables");
         // The page-table updates, as the device copies them.
         let mut taken = 0;
@@ -500,6 +511,7 @@ impl Executor for HostExecutor {
                     self.ram.as_ref(),
                     &self.problems,
                     (rows_run, paused_slot),
+                    &inner,
                 )
             }
             None if view.drafts_only() || !rows_run => {}
@@ -941,6 +953,7 @@ impl Oracle {
         ram: Option<&PinnedRam>,
         problems: &Problems,
         (rows, paused): (bool, Option<u32>),
+        inner: &[crate::InnerSave],
     ) {
         let complain = |what: String| note(problems, what);
         // The sequence of a paused step has a state the step's rows have half
@@ -1129,6 +1142,13 @@ impl Oracle {
                 }
                 results[(seg.row0 + k) as usize] = (token, logit);
                 state = after;
+                // A save inside the step: the state when the rows have reached its position.
+                for save in inner.iter().filter(|s| {
+                    s.slot as usize == slot && s.position == row.position + 1 && seg.direct
+                }) {
+                    self.take(save.place, "a save inside a step writes", ram, problems);
+                    self.places.insert(save.place, state.clone());
+                }
                 if !seg.direct {
                     after_each.push(state.clone());
                 }

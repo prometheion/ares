@@ -1230,3 +1230,32 @@ fn a_cancelled_request_gives_its_paused_step_up() {
     assert_eq!(again.run.text, fresh(shape, &long, 20).text);
     assert_consistent(&e);
 }
+
+/// A model that saves the state inside a step wider than its own rows (a prompt read layer
+/// by layer) gets the checkpoints due inside the step's rows named in its record, and the
+/// step is not cut there: they serve a later prompt as checkpoints at the end of steps do,
+/// also when the step was paused between its pieces.
+#[test]
+fn checkpoints_inside_a_step_serve_a_later_prompt() {
+    let mut rng = Rng(21);
+    let prompt = text_of(&mut rng, 200);
+    let later = format!("{}{}", head(&prompt, 150), text_of(&mut rng, 30));
+    let shape = |c: &mut SyntheticConfig| {
+        c.own_rows = 16;
+        c.inner_saves = true;
+    };
+    for pieces in [1, 3] {
+        let model = model(Some(CHECKPOINT), shape);
+        let e = engine_with(&model, config(256, 16), |host| host.with_pauses(16, pieces));
+        let first = e.ask(&prompt, 20);
+        assert_eq!(first.run.text, fresh(shape, &prompt, 20).text, "pieces {pieces}");
+        let c = e.snapshot().counters;
+        // Steps of 64 rows with a checkpoint every 16 cells: three inside each.
+        assert!(c.checkpoints_saved >= 9, "pieces {pieces}: {} checkpoints", c.checkpoints_saved);
+        assert!(c.prefill_rows <= 200, "pieces {pieces}: {} rows", c.prefill_rows);
+        let second = e.ask(&later, 20);
+        assert_eq!(second.run.text, fresh(shape, &later, 20).text, "pieces {pieces}");
+        assert!(second.report.cached_tokens >= 128, "{:?}", second.report);
+        assert_consistent(&e);
+    }
+}

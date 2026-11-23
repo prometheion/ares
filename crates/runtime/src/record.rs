@@ -17,7 +17,7 @@
 //! | section | words | content |
 //! | --- | --- | --- |
 //! | kernel header | 8 | rows, segments, wanted rows, 0, byte offsets of segments, tokens, positions, wanted rows |
-//! | runtime header | 36 | magic, step number, counts of runs, updates, entries, commits, copies, corrections, masks and freed pages, byte offsets of the sections below, the longest segment, the longest commit, the words of a mask, the record's flags (1: drafts only, 2: the paused step is given up), the rows of the row worth and its offset, the image runs and their offset, the milliseconds a step that pauses may run before it pauses (0: no bound), what the engine had been asked when the conductor last took its commands (the low 32 bits), 2 unused |
+//! | runtime header | 36 | magic, step number, counts of runs, updates, entries, commits, copies, corrections, masks and freed pages, byte offsets of the sections below, the longest segment, the longest commit, the words of a mask, the record's flags (1: drafts only, 2: the paused step is given up), the rows of the row worth and its offset, the image runs and their offset, the milliseconds a step that pauses may run before it pauses (0: no bound), what the engine had been asked when the conductor last took its commands (the low 32 bits), the count and the offset of the saves inside the step |
 //! | segments | 8 each | first row, rows, sequence slot, accepted rows, first position, flags (1: direct), the drafter of a window whose drafts the model makes, 0 |
 //! | tokens | 1 per row | |
 //! | positions | 4 per row | the rotary position: time, height, width, extra; `(p, p, p, 0)` for text at rotary position `p` (see [Images](#images)) |
@@ -31,6 +31,7 @@
 //! | updates | 3 each | sequence slot, first page-table entry, number of entries |
 //! | entries | 1 each | page-table entries, for the updates in order |
 //! | state copies | 3 each | 0 save or 1 restore, sequence slot, checkpoint place |
+//! | saves inside the step | 3 each | sequence slot, checkpoint place, position: the slot's state when its rows have reached the position, which lies inside the step's rows of the slot |
 //! | page copies | 3 each | page to copy from, page to copy to, cells to copy |
 //! | freed pages | 1 each | pages the pool freed since the last record |
 //! | draft bars | 16 + 1 each | for the windows whose drafts the model makes: the chance of a draft by its probability (16 ranges, `f32`), then for every draft row of those windows, in the order of the segments, the reach its chain needs for that link to be made (`f32`) |
@@ -197,6 +198,8 @@ const H_IMAGES: usize = 38;
 const H_OFF_IMAGES: usize = 39;
 const H_PAUSE_MS: usize = 40;
 const H_ASKED: usize = 41;
+const H_INNER: usize = 42;
+const H_OFF_INNER: usize = 43;
 /// The record's step makes the chains of its own-draft windows and nothing
 /// else.
 const RECORD_DRAFTS_ONLY: u32 = 1;
@@ -256,6 +259,16 @@ pub struct ImageRun {
     pub stage: u32,
 }
 
+/// A save of a slot's state at a position its rows reach inside the step (a model that
+/// reads a long prompt layer by layer saves each layer's state as it goes past it), not
+/// before the step as a [`StateCopy`] does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InnerSave {
+    pub slot: u32,
+    pub place: u32,
+    pub position: u32,
+}
+
 /// The first `cells` cells of page `from` go into page `to`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PageCopy {
@@ -291,7 +304,8 @@ pub fn max_bytes(max_rows: u32, max_slots: u32, wanted: u32, vocab: u32) -> usiz
     // a save at a position it reached, a save of the state it ends with and
     // the restore of the sequence that takes it next, between two records; a
     // sequence copies at most one page. Every wanted row may have the most
-    // corrections and a mask.
+    // corrections and a mask. A save inside the step lies on a page boundary of
+    // 16 cells or more.
     let segments = slots.min(rows.max(1));
     let bytes = HEADERS
         + SEG_BYTES * segments
@@ -308,7 +322,8 @@ pub fn max_bytes(max_rows: u32, max_slots: u32, wanted: u32, vocab: u32) -> usiz
         + FREED_PER_RECORD * 4
         + (BAR_CHANCES + rows) * 4
         + rows * 4
-        + rows * 12;
+        + rows * 12
+        + (rows / 16 + slots) * 12;
     bytes.next_multiple_of(256)
 }
 
@@ -380,6 +395,7 @@ impl<'a> RecordWriter<'a> {
             H_OFF_BARS,
             H_OFF_WORTH,
             H_OFF_IMAGES,
+            H_OFF_INNER,
         ] {
             header[h] = end as u32;
         }
@@ -688,6 +704,21 @@ impl<'a> RecordWriter<'a> {
         Ok(())
     }
 
+    /// The saves of slots' state at positions inside the step's rows ([`InnerSave`]), for a
+    /// model that takes them ([`Model::saves_inside_steps`](crate::Model::saves_inside_steps)).
+    pub fn inner_saves(&mut self, saves: &[InnerSave]) -> Result<(), RecordFull> {
+        let off = self.end;
+        let mut at = off;
+        for save in saves {
+            self.put(at, &[save.slot, save.place, save.position])?;
+            at += 12;
+        }
+        self.header[H_INNER] = saves.len() as u32;
+        self.header[H_OFF_INNER] = off as u32;
+        self.end = align(at);
+        Ok(())
+    }
+
     /// The pages the pool freed since the last record.
     ///
     /// # Panics
@@ -803,6 +834,7 @@ impl<'a> RecordView<'a> {
                 + if header[H_BARS] > 0 { (BAR_CHANCES + header[H_BARS] as usize) * 4 } else { 0 },
             header[H_OFF_WORTH] as usize + header[H_WORTH] as usize * 4,
             header[H_OFF_IMAGES] as usize + header[H_IMAGES] as usize * 12,
+            header[H_OFF_INNER] as usize + header[H_INNER] as usize * 12,
         ];
         if ends.iter().any(|end| *end > bytes.len()) {
             return Err(RecordError::Truncated);
@@ -1073,6 +1105,18 @@ impl<'a> RecordView<'a> {
         StateCopy { kind, slot: self.word(at + 4), place: self.word(at + 8) }
     }
 
+    /// The number of saves inside the step.
+    pub fn inner_saves(&self) -> u32 {
+        self.header[H_INNER]
+    }
+
+    /// Save inside the step `i`, by position.
+    pub fn inner_save(&self, i: u32) -> InnerSave {
+        assert!(i < self.inner_saves(), "save inside the step {i} of {}", self.inner_saves());
+        let at = self.header[H_OFF_INNER] as usize + i as usize * 12;
+        InnerSave { slot: self.word(at), place: self.word(at + 4), position: self.word(at + 8) }
+    }
+
     /// The number of page copies this step starts with.
     pub fn page_copies(&self) -> u32 {
         self.header[H_PAGE_COPIES]
@@ -1339,6 +1383,41 @@ mod tests {
             (0..64).map(|row| ImageRun { row, rows: 1, stage: row }).collect();
         w.images(&images).unwrap();
         assert!(w.finish().unwrap() <= bytes);
+    }
+
+    #[test]
+    fn images_pauses_and_saves_inside_a_step_each_read_back_their_own_words() {
+        // A record with all of them: image runs, the pause's time, what the engine was
+        // asked, the give-up flag and saves inside the step.
+        let mut buf = vec![0x33u8; 4096];
+        let mut w = RecordWriter::new(&mut buf, 9, 1, 40).unwrap();
+        w.pause_after(500);
+        w.asked(0xdead_beef);
+        w.give_up_paused();
+        w.segment(2, 100, 40, true).unwrap();
+        for k in 0..40 {
+            w.row(Row { slot: 2, position: 100 + k, token: 5, context: 0 }).unwrap();
+        }
+        let images =
+            [ImageRun { row: 3, rows: 6, stage: 0 }, ImageRun { row: 20, rows: 4, stage: 6 }];
+        w.images(&images).unwrap();
+        let saves = [InnerSave { slot: 2, place: 7, position: 116 }];
+        w.inner_saves(&saves).unwrap();
+        let used = w.finish().unwrap();
+        let view = RecordView::new(&buf[..used]).unwrap();
+        assert_eq!(view.pause_after(), 500);
+        assert_eq!(view.asked(), 0xdead_beef);
+        assert!(view.gives_up_paused() && !view.drafts_only());
+        assert_eq!((0..view.image_runs()).map(|i| view.image_run(i)).collect::<Vec<_>>(), images);
+        assert_eq!((0..view.inner_saves()).map(|i| view.inner_save(i)).collect::<Vec<_>>(), saves);
+        // And one with none of them.
+        let (buf, used) = sample();
+        let view = RecordView::new(&buf[..used]).unwrap();
+        assert_eq!(
+            (view.pause_after(), view.asked(), view.image_runs(), view.inner_saves()),
+            (0, 0, 0, 0)
+        );
+        assert!(!view.gives_up_paused());
     }
 
     #[test]

@@ -100,7 +100,7 @@ pub use ram::{
     Rule, Verdict, high_watermarks,
 };
 pub use record::{
-    Commit, DraftChances, FREED_PER_RECORD, ImageRun, PageCopy, RecordFull, RecordView,
+    Commit, DraftChances, FREED_PER_RECORD, ImageRun, InnerSave, PageCopy, RecordFull, RecordView,
     RecordWriter, Row, StateCopy, StateCopyKind, TableUpdate, draft_chance,
 };
 pub use sampling::TokenFilter;

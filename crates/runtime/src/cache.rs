@@ -735,6 +735,54 @@ impl Cache {
         self.settling.push(place);
     }
 
+    /// A place for a checkpoint that a step saves inside its rows
+    /// ([`crate::InnerSave`]), before the step: what it holds is named at the
+    /// commit ([`Cache::attach`]), or the place goes back ([`Cache::unreserve`]).
+    /// `None` without a model that keeps recurrent state or without room.
+    pub(crate) fn reserve(&mut self) -> (Option<u32>, u32) {
+        if !self.recurrent || self.capacity == 0 {
+            return (None, 0);
+        }
+        self.new_place()
+    }
+
+    /// The checkpoint a step saved inside its rows into `place` (reserved by
+    /// [`Cache::reserve`]) is of the page named `hash`: as [`Cache::save`],
+    /// with the copy done already.
+    pub(crate) fn attach(
+        &mut self,
+        place: u32,
+        hash: ChainHash,
+        owner: Owner,
+        root: bool,
+    ) -> Saved {
+        if self.index.checkpoint(hash).is_some() {
+            if root {
+                self.index.mark_root(hash);
+            }
+            self.unreserve(place);
+            return Saved::default();
+        }
+        match self.index.attach_checkpoint(hash, CheckpointId(u64::from(place)), owner) {
+            Ok(_) => {
+                if root {
+                    self.index.mark_root(hash);
+                }
+                self.placed.insert(place, hash);
+                Saved { taken: true, dropped: 0 }
+            }
+            Err(id) => {
+                self.free(id.0 as u32);
+                Saved::default()
+            }
+        }
+    }
+
+    /// A place reserved for a save inside a step that holds nothing after all.
+    pub(crate) fn unreserve(&mut self, place: u32) {
+        self.free(place);
+    }
+
     /// Takes a checkpoint of the state in `slot`, which is at the end of the
     /// page named `hash` or of the tail so named, unless the index has one
     /// there already. With `root`, it is at the end of a system prompt or a
