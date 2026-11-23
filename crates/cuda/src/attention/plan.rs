@@ -222,7 +222,7 @@ impl PlanConfig {
     /// and a row reads the exact first tile, converted tiles and the exact newest ones.
     ///
     /// A row with more than one piece takes a slot per piece. The rows of a prompt are cut
-    /// into tiles of `per` rows ([`rows_per_tile`]), and a tile gets pieces in proportion
+    /// into tiles of `per` rows (64 vectors of queries), and a tile gets pieces in proportion
     /// to its cells, at least one: over all tiles at most the budget (`target_blocks` over
     /// the heads) and one per tile. A tile whose cells are of two or three runs of kinds
     /// has a piece more for every run after the first (one more for the cells of a prefix
@@ -230,7 +230,8 @@ impl PlanConfig {
     /// and a row whose sequence reads a prefix with others has the pieces of both its
     /// tiles: so `per` times the budget and two tiles per sequence, and two (with a tile
     /// mean five) slots a row. A row alone has the budget (at most `max_pieces`) and two
-    /// more with a tile mean. Measured against random steps in `tests::the_state_slots_stay_in_their_bound`.
+    /// more with a tile mean. Checked against random steps
+    /// (`bound_tests::the_state_slots_stay_in_their_bound`).
     pub fn state_slots_bound(
         &self,
         kv_heads: u32,
@@ -1192,7 +1193,8 @@ mod bound_tests {
                     worst = worst.max(planner.finish().state_slots);
                 }
                 eprintln!(
-                    "{kv_heads} KV heads of {q_per_kv}, {sms} SMs, tile mean {mean}: worst {worst} of {bound}"
+                    "{kv_heads} KV heads of {q_per_kv}, {sms} SMs, tile mean {mean}: worst \
+                     {worst} of {bound}"
                 );
                 assert!(
                     u64::from(worst) <= bound,
