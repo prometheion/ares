@@ -23,22 +23,18 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
-use ares_api::{
-    Engine, EngineError, Event, EventSink, GenerateRequest, ModelCard, Prompt, RequestId, Sampling,
-    Usage,
-};
+use ares_api::{Engine, Event, EventSink, GenerateRequest, Prompt, RequestId, Sampling, Usage};
 use ares_core::GgmlType;
 use ares_cuda::{CacheFormat, Device, Wait, device_count};
-use ares_gguf::{Gguf, GgufBuilder};
+use ares_gguf::Gguf;
 use ares_model::qwen4exp::Config;
 use ares_model::qwen4exp::device::{Options, Qwen4Exp, SessionOptions, Spread};
 use ares_model::qwen4exp::synthetic::{NgramShape, Shape, Synthetic, Types};
-use ares_runtime::{
-    ContextSpec, DeviceContext, DeviceModel, Durable, GpuConfig, LinkSpec, Model, ModelError,
-    PrefixCache, Runtime, RuntimeConfig, Snapshot, Split, SsdConfig,
-};
-use ares_state::PageLayout;
-use ares_tokenizer::Tokenizer;
+use ares_runtime::{GpuConfig, Model, Runtime, RuntimeConfig, Snapshot, SsdConfig};
+use common::gpu::enabled;
+use common::model::{Wrapped, byte_tokenizer};
+
+mod common;
 
 const MAX_ROWS: u32 = 8;
 const PAGE: u32 = 128;
@@ -47,14 +43,6 @@ const SLOTS: u32 = 2;
 /// Pages of the pool unless a test says otherwise: room for the sequences of
 /// a test and for what the cache keeps of them on the cards.
 const PAGES: u32 = 24;
-
-fn enabled() -> bool {
-    if std::env::var_os("ARES_TEST_CUDA").is_none() {
-        eprintln!("skipped: set ARES_TEST_CUDA=1 to run the tests that open GPUs");
-        return false;
-    }
-    true
-}
 
 /// A made-up model with every part of the architecture at sizes the kernels
 /// take (the one of `qwen4exp_runtime.rs`).
@@ -171,114 +159,6 @@ fn options(
     }
 }
 
-/// A tokenizer of the 256 bytes alone, which the model needs to exist and the
-/// tests do not use: their prompts are token ids.
-fn byte_tokenizer() -> Tokenizer {
-    // The characters of GPT-2's byte-level alphabet.
-    let tokens: Vec<String> = (0..=255u8)
-        .map(|byte| {
-            let printable = matches!(byte, 0x21..=0x7E | 0xA1..=0xAC | 0xAE..=0xFF);
-            let moved =
-                (0..byte).filter(|b| !matches!(b, 0x21..=0x7E | 0xA1..=0xAC | 0xAE..=0xFF)).count();
-            let at = if printable { u32::from(byte) } else { 0x100 + moved as u32 };
-            char::from_u32(at).unwrap().to_string()
-        })
-        .collect();
-    let bytes = GgufBuilder::new()
-        .str("general.architecture", "qwen4exp")
-        .str("tokenizer.ggml.model", "gpt2")
-        .str("tokenizer.ggml.pre", "qwen35")
-        .str_array("tokenizer.ggml.tokens", &tokens)
-        .i32_array("tokenizer.ggml.token_type", &vec![1; 256])
-        .str_array::<&str>("tokenizer.ggml.merges", &[])
-        .build();
-    let path = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("q4px-tokenizer.gguf");
-    std::fs::write(&path, bytes).unwrap();
-    Tokenizer::from_gguf(&Gguf::open(&path).unwrap()).expect("a tokenizer of bytes")
-}
-
-/// The model of the runtime with the vocabulary of the made-up file (a prompt
-/// is `t5 t9 ...`, a token prints as `t5 `), with its prefix cache or without.
-struct Made {
-    inner: Arc<Qwen4Exp>,
-    cached: bool,
-}
-
-impl Model for Made {
-    fn card(&self) -> ModelCard {
-        self.inner.card()
-    }
-    fn vocab(&self) -> u32 {
-        self.inner.vocab()
-    }
-    fn ends(&self, _token: u32) -> bool {
-        false
-    }
-    fn encode(&self, prompt: &Prompt) -> Result<Vec<u32>, EngineError> {
-        let Prompt::Text(text) = prompt else {
-            return Err(EngineError::Unsupported("the made-up model has no chat template".into()));
-        };
-        text.split_whitespace()
-            .map(|word| {
-                word.strip_prefix('t')
-                    .and_then(|n| n.parse().ok())
-                    .ok_or_else(|| EngineError::InvalidRequest(format!("{word:?} is no token")))
-            })
-            .collect()
-    }
-    fn piece(&self, token: u32, text: &mut Vec<u8>) {
-        text.extend_from_slice(format!("t{token} ").as_bytes());
-    }
-    fn context(&self) -> ContextSpec {
-        self.inner.context()
-    }
-    fn split(&self) -> Split {
-        self.inner.split()
-    }
-    fn devices(&self) -> usize {
-        self.inner.devices()
-    }
-    fn links(&self) -> LinkSpec {
-        self.inner.links()
-    }
-    fn steps_wait_for_fetches(&self) -> bool {
-        self.inner.steps_wait_for_fetches()
-    }
-    fn pinned_ram(&self) -> u64 {
-        self.inner.pinned_ram()
-    }
-    fn max_rows(&self) -> u32 {
-        self.inner.max_rows()
-    }
-    fn logit_rows(&self) -> u32 {
-        self.inner.logit_rows()
-    }
-    fn draft_rows(&self) -> u32 {
-        self.inner.draft_rows()
-    }
-    fn drafters(&self) -> Vec<ares_runtime::Drafter> {
-        self.inner.drafters()
-    }
-    fn attention_span(&self) -> u32 {
-        self.inner.attention_span()
-    }
-    fn prefix_cache(&self) -> Option<PrefixCache> {
-        self.inner.prefix_cache().filter(|_| self.cached)
-    }
-    fn durable(&self, cells_per_page: u32) -> Option<Durable> {
-        self.inner.durable(cells_per_page).filter(|_| self.cached)
-    }
-    fn page_entry(&self, page: u32) -> u32 {
-        self.inner.page_entry(page)
-    }
-    fn page_layout(&self, cells_per_page: u32) -> PageLayout {
-        self.inner.page_layout(cells_per_page)
-    }
-    fn open(&self, cx: DeviceContext<'_>) -> Result<Box<dyn DeviceModel>, ModelError> {
-        self.inner.open(cx)
-    }
-}
-
 /// How an engine of a test is made.
 #[derive(Clone)]
 struct Setup {
@@ -329,7 +209,8 @@ fn rig(setup: &Setup) -> Rig {
     let gguf = Gguf::open(gguf_path(setup.seed)).unwrap();
     let n_layer = Config::from_gguf(&gguf).unwrap().n_layer;
     let opts = options(setup.placement, n_layer, setup.kv, setup.pages);
-    let mut inner = Qwen4Exp::new(gguf, byte_tokenizer(), "made", &devices, opts, CELLS).unwrap();
+    let mut inner =
+        Qwen4Exp::new(gguf, byte_tokenizer(None), "made", &devices, opts, CELLS).unwrap();
     if setup.draft {
         inner = inner
             .with_mtp(Gguf::open(draft_path(setup.seed)).unwrap())
@@ -351,7 +232,7 @@ fn rig(setup: &Setup) -> Rig {
         ssd: setup.ssd.clone(),
         ..RuntimeConfig::default()
     };
-    let model: Arc<dyn Model> = Arc::new(Made { inner: inner.clone(), cached: setup.cached });
+    let model: Arc<dyn Model> = Arc::new(Wrapped::new(inner.clone()).words().cache(setup.cached));
     let mut gpu = GpuConfig::new(&config, &*model);
     if setup.tier_takes_all {
         // Less than the tier wants (at least 64 MiB) next to what the

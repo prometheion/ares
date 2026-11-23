@@ -14,11 +14,11 @@ use std::time::Duration;
 
 use ares_api::{
     BiasKey, ChatFormat, Engine, EngineError, Event, EventSink, GenerateRequest, LogitBias,
-    LogprobRequest, ModelCard, Prompt, RequestId, Sampling, TokenProbs,
+    LogprobRequest, Prompt, RequestId, Sampling, TokenProbs,
 };
 use ares_core::GgmlType;
 use ares_cuda::{CacheFormat, Device, Wait, device_count};
-use ares_gguf::{Gguf, GgufBuilder};
+use ares_gguf::Gguf;
 use ares_model::qwen4exp::device::{
     Options, Qwen4Exp, Rows, Session, SessionOptions, Spread, Wanted,
 };
@@ -28,26 +28,21 @@ use ares_model::qwen4exp::{
 };
 use ares_runtime::expert_store::Serve;
 use ares_runtime::{
-    ContextSpec, DeviceContext, DeviceModel, DeviceTransfer, EncodedPrompt, GpuConfig, ImageInput,
-    ImageSpan, LinkSpec, Logits, Machine, Model, ModelDrafts, ModelError, Pick, PrefixCache, Rule,
-    Runtime, RuntimeConfig, Spans, Split, StepContext, TowerJob, TransferContext, Vision,
+    DeviceModel, DeviceTransfer, EncodedPrompt, GpuConfig, ImageInput, ImageSpan, Logits, Machine,
+    Model, ModelDrafts, ModelError, Pick, Rule, Runtime, RuntimeConfig, Spans, StepContext,
+    TowerJob, TransferContext, Vision,
 };
-use ares_state::PageLayout;
-use ares_tokenizer::{ChatOptions, Json, Tokenizer};
+use ares_tokenizer::{ChatOptions, Json};
+use common::gpu::enabled;
+use common::model::{Wrapped, byte_tokenizer, words};
+
+mod common;
 
 const MAX_ROWS: u32 = 8;
 /// The rows of a step that reads a slice of a prompt on the many-row kernels.
 const WIDE_ROWS: u32 = 64;
 const CELLS: u32 = 512;
 const SLOTS: u32 = 2;
-
-fn enabled() -> bool {
-    if std::env::var_os("ARES_TEST_CUDA").is_none() {
-        eprintln!("skipped: set ARES_TEST_CUDA=1 to run the tests that open GPUs");
-        return false;
-    }
-    true
-}
 
 /// A made-up model with every part of the architecture at sizes the kernels
 /// take.
@@ -164,128 +159,17 @@ fn options(
     }
 }
 
-/// A tokenizer of the 256 bytes alone, which the model needs to exist and the
-/// tests do not use: their prompts are token ids. It has the chat template
-/// `template`, if any.
-fn byte_tokenizer(template: Option<&str>) -> Tokenizer {
-    // The characters of GPT-2's byte-level alphabet.
-    let tokens: Vec<String> = (0..=255u8)
-        .map(|byte| {
-            let printable = matches!(byte, 0x21..=0x7E | 0xA1..=0xAC | 0xAE..=0xFF);
-            let moved =
-                (0..byte).filter(|b| !matches!(b, 0x21..=0x7E | 0xA1..=0xAC | 0xAE..=0xFF)).count();
-            let at = if printable { u32::from(byte) } else { 0x100 + moved as u32 };
-            char::from_u32(at).unwrap().to_string()
-        })
-        .collect();
-    let mut file = GgufBuilder::new()
-        .str("general.architecture", "qwen4exp")
-        .str("tokenizer.ggml.model", "gpt2")
-        .str("tokenizer.ggml.pre", "qwen35")
-        .str_array("tokenizer.ggml.tokens", &tokens)
-        .i32_array("tokenizer.ggml.token_type", &vec![1; 256])
-        .str_array::<&str>("tokenizer.ggml.merges", &[]);
-    if let Some(template) = template {
-        file = file.str("tokenizer.chat_template", template);
-    }
-    let bytes = file.build();
-    let path = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(if template.is_some() {
-        "q4rt-tokenizer-chat.gguf"
-    } else {
-        "q4rt-tokenizer.gguf"
-    });
-    std::fs::write(&path, bytes).unwrap();
-    Tokenizer::from_gguf(&Gguf::open(&path).unwrap()).expect("a tokenizer of bytes")
+/// The model of the runtime with the made-up words (a prompt is `t5 t9 ...`, a token
+/// prints as `t5 `), with its prefix cache or without.
+fn made(inner: &Arc<Qwen4Exp>, cache: Cache) -> Wrapped {
+    Wrapped::new(inner.clone()).words().cache(cache == Cache::On)
 }
 
-/// The model of the runtime with the vocabulary of the made-up file: a
-/// prompt is `t5 t9 ...`, a token prints as `t5 `.
-struct Made(Arc<Qwen4Exp>, Cache);
-
-/// Whether the engine over [`Made`] has the model's prefix cache.
+/// Whether the engine over [`made`] has the model's prefix cache.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Cache {
     On,
     Off,
-}
-
-impl Model for Made {
-    fn card(&self) -> ModelCard {
-        self.0.card()
-    }
-    fn vocab(&self) -> u32 {
-        self.0.vocab()
-    }
-    fn ends(&self, _token: u32) -> bool {
-        false
-    }
-    fn encode(&self, prompt: &Prompt) -> Result<Vec<u32>, EngineError> {
-        let Prompt::Text(text) = prompt else {
-            return Err(EngineError::Unsupported("the made-up model has no chat template".into()));
-        };
-        text.split_whitespace()
-            .map(|word| {
-                word.strip_prefix('t')
-                    .and_then(|n| n.parse().ok())
-                    .ok_or_else(|| EngineError::InvalidRequest(format!("{word:?} is no token")))
-            })
-            .collect()
-    }
-    fn piece(&self, token: u32, text: &mut Vec<u8>) {
-        text.extend_from_slice(format!("t{token} ").as_bytes());
-    }
-    fn context(&self) -> ContextSpec {
-        self.0.context()
-    }
-    fn split(&self) -> Split {
-        self.0.split()
-    }
-    fn devices(&self) -> usize {
-        self.0.devices()
-    }
-    fn links(&self) -> LinkSpec {
-        self.0.links()
-    }
-    fn pinned_ram(&self) -> u64 {
-        self.0.pinned_ram()
-    }
-    fn max_rows(&self) -> u32 {
-        self.0.max_rows()
-    }
-    fn own_rows(&self) -> u32 {
-        self.0.own_rows()
-    }
-    fn prompt_rows(&self) -> u32 {
-        self.0.prompt_rows()
-    }
-    fn logit_rows(&self) -> u32 {
-        self.0.logit_rows()
-    }
-    fn draft_rows(&self) -> u32 {
-        self.0.draft_rows()
-    }
-
-    fn drafters(&self) -> Vec<ares_runtime::Drafter> {
-        self.0.drafters()
-    }
-    fn attention_span(&self) -> u32 {
-        self.0.attention_span()
-    }
-    fn prefix_cache(&self) -> Option<PrefixCache> {
-        self.0.prefix_cache().filter(|_| self.1 == Cache::On)
-    }
-    fn saves_inside_steps(&self) -> u32 {
-        self.0.saves_inside_steps()
-    }
-    fn page_entry(&self, page: u32) -> u32 {
-        self.0.page_entry(page)
-    }
-    fn page_layout(&self, cells_per_page: u32) -> PageLayout {
-        self.0.page_layout(cells_per_page)
-    }
-    fn open(&self, cx: DeviceContext<'_>) -> Result<Box<dyn DeviceModel>, ModelError> {
-        self.0.open(cx)
-    }
 }
 
 /// The runtime over the made-up model on `placement`, with `pages` pages of
@@ -328,7 +212,7 @@ fn start_following(
         Arc::new(Qwen4Exp::new(gguf, byte_tokenizer(None), "made", &devices, opts, CELLS).unwrap());
     let config =
         RuntimeConfig { pages, cells_per_page: 128, max_slots: SLOTS, ..RuntimeConfig::default() };
-    let model: Arc<dyn Model> = Arc::new(Made(inner.clone(), Cache::On));
+    let model: Arc<dyn Model> = Arc::new(made(&inner, Cache::On));
     let mut gpu = GpuConfig::new(&config, &*model);
     gpu.ram_limit += 256 << 20;
     gpu.vram_headroom = 512 << 20;
@@ -423,7 +307,7 @@ fn start_with(
     }
     let inner = Arc::new(inner);
     let config = RuntimeConfig { pages, cells_per_page: 128, max_slots: SLOTS, ..config };
-    let model: Arc<dyn Model> = Arc::new(Made(inner.clone(), cache));
+    let model: Arc<dyn Model> = Arc::new(made(&inner, cache));
     let mut gpu = GpuConfig::new(&config, &*model);
     // Room for the tier of experts next to what the executor needs.
     gpu.ram_limit += 256 << 20;
@@ -452,7 +336,7 @@ fn start_drafting_experts_only(seed: u64) -> (Runtime, Arc<Qwen4Exp>) {
         window_rows: 8,
         ..RuntimeConfig::default()
     };
-    let model: Arc<dyn Model> = Arc::new(Made(inner.clone(), Cache::On));
+    let model: Arc<dyn Model> = Arc::new(made(&inner, Cache::On));
     let mut gpu = GpuConfig::new(&config, &*model);
     gpu.ram_limit += 256 << 20;
     gpu.vram_headroom = 512 << 20;
@@ -592,7 +476,7 @@ fn submit(
     submit_text(runtime, id, words.join(" "), max_tokens)
 }
 
-/// [`submit`] of a prompt written out: `t5 t9 ...`, and `img` for [`Pictured`]'s image.
+/// [`submit`] of a prompt written out: `t5 t9 ...`, and `img` for [`pictured`]'s image.
 fn submit_text(
     runtime: &Runtime,
     id: u64,
@@ -928,123 +812,53 @@ fn a_prompt_read_layer_by_layer_gives_the_reference_answer() {
     }
 }
 
-/// The image of [`Pictured`]: `IMAGE.0` rows across and `IMAGE.1` down, its cells the
+/// The image of [`pictured`]: `IMAGE.0` rows across and `IMAGE.1` down, its cells the
 /// n-gram block's image token.
 const IMAGE: (u32, u32) = (8, 5);
 const PAD: u32 = 9;
 
+/// The image the word `img` stands for.
+fn image() -> Arc<ImageInput> {
+    let (nx, ny) = IMAGE;
+    Arc::new(ImageInput {
+        name: [7; 32],
+        width: nx * 32,
+        height: ny * 32,
+        pixels: Vec::new(),
+        nx,
+        ny,
+    })
+}
+
 /// The made-up model with images: the word `img` of a prompt is an image of [`IMAGE`]'s
 /// rows, which the tower of its first device part gives from `rows` (made up, as a
 /// projector would compute them).
-struct Pictured {
-    made: Made,
-    width: u32,
-    rows: Arc<Vec<f32>>,
-}
-
-impl Pictured {
-    fn image() -> Arc<ImageInput> {
-        let (nx, ny) = IMAGE;
-        Arc::new(ImageInput {
-            name: [7; 32],
-            width: nx * 32,
-            height: ny * 32,
-            pixels: Vec::new(),
-            nx,
-            ny,
-        })
-    }
-}
-
-impl Model for Pictured {
-    fn card(&self) -> ModelCard {
-        self.made.card()
-    }
-    fn vocab(&self) -> u32 {
-        self.made.vocab()
-    }
-    fn ends(&self, token: u32) -> bool {
-        self.made.ends(token)
-    }
-    fn encode(&self, prompt: &Prompt) -> Result<Vec<u32>, EngineError> {
-        Ok(self.encode_with_boundaries(prompt)?.tokens)
-    }
-    fn encode_with_boundaries(&self, prompt: &Prompt) -> Result<EncodedPrompt, EngineError> {
-        let Prompt::Text(text) = prompt else {
-            return Err(EngineError::Unsupported("the made-up model has no chat template".into()));
-        };
-        let mut out = EncodedPrompt::default();
-        for word in text.split_whitespace() {
-            if word == "img" {
-                let first = out.tokens.len() as u32;
-                out.images.push(ImageSpan { first, image: Self::image() });
-                out.tokens.extend(std::iter::repeat_n(PAD, (IMAGE.0 * IMAGE.1) as usize));
-            } else {
-                out.tokens.extend(self.made.encode(&Prompt::Text(word.into()))?);
+fn pictured(inner: &Arc<Qwen4Exp>, width: u32, rows: Arc<Vec<f32>>) -> Wrapped {
+    let part = inner.clone();
+    made(inner, Cache::On)
+        .encode(|prompt| {
+            let Prompt::Text(text) = prompt else {
+                return Err(EngineError::Unsupported(
+                    "the made-up model has no chat template".into(),
+                ));
+            };
+            let mut out = EncodedPrompt::default();
+            for word in text.split_whitespace() {
+                if word == "img" {
+                    let first = out.tokens.len() as u32;
+                    out.images.push(ImageSpan { first, image: image() });
+                    out.tokens.extend(std::iter::repeat_n(PAD, (IMAGE.0 * IMAGE.1) as usize));
+                } else {
+                    out.tokens.extend(words(&Prompt::Text(word.into()))?);
+                }
             }
-        }
-        Ok(out)
-    }
-    fn vision(&self) -> Option<Vision> {
-        Some(Vision { width: self.width, max_rows: 64, device: 0, units: 1 })
-    }
-    fn piece(&self, token: u32, text: &mut Vec<u8>) {
-        self.made.piece(token, text)
-    }
-    fn context(&self) -> ContextSpec {
-        self.made.context()
-    }
-    fn split(&self) -> Split {
-        self.made.split()
-    }
-    fn devices(&self) -> usize {
-        self.made.devices()
-    }
-    fn links(&self) -> LinkSpec {
-        self.made.links()
-    }
-    fn pinned_ram(&self) -> u64 {
-        self.made.pinned_ram()
-    }
-    fn max_rows(&self) -> u32 {
-        self.made.max_rows()
-    }
-    fn own_rows(&self) -> u32 {
-        self.made.own_rows()
-    }
-    fn prompt_rows(&self) -> u32 {
-        self.made.prompt_rows()
-    }
-    fn logit_rows(&self) -> u32 {
-        self.made.logit_rows()
-    }
-    fn draft_rows(&self) -> u32 {
-        self.made.draft_rows()
-    }
-    fn drafters(&self) -> Vec<ares_runtime::Drafter> {
-        self.made.drafters()
-    }
-    fn attention_span(&self) -> u32 {
-        self.made.attention_span()
-    }
-    fn prefix_cache(&self) -> Option<PrefixCache> {
-        self.made.prefix_cache()
-    }
-    fn saves_inside_steps(&self) -> u32 {
-        self.made.saves_inside_steps()
-    }
-    fn page_entry(&self, page: u32) -> u32 {
-        self.made.page_entry(page)
-    }
-    fn page_layout(&self, cells_per_page: u32) -> PageLayout {
-        self.made.page_layout(cells_per_page)
-    }
-    fn open(&self, cx: DeviceContext<'_>) -> Result<Box<dyn DeviceModel>, ModelError> {
-        Ok(Box::new(Towered { part: self.made.open(cx)?, rows: self.rows.clone() }))
-    }
+            Ok(out)
+        })
+        .vision(Vision { width, max_rows: 64, device: 0, units: 1 })
+        .open(move |cx| Ok(Box::new(Towered { part: part.open(cx)?, rows: rows.clone() })))
 }
 
-/// A device part of [`Pictured`]: the model's, with a tower that gives the made-up rows.
+/// A device part of [`pictured`]: the model's, with a tower that gives the made-up rows.
 struct Towered {
     part: Box<dyn DeviceModel>,
     rows: Arc<Vec<f32>>,
@@ -1168,7 +982,7 @@ fn a_prompt_with_an_image_read_layer_by_layer_gives_the_reference_answer() {
     let tower_rows = Arc::new(rows.iter().flat_map(|(_, r)| r.iter().copied()).collect::<Vec<_>>());
     let width = c.n_embd as u32;
     drop(w);
-    let spans = Spans::new(vec![ImageSpan { first: first as u32, image: Pictured::image() }]);
+    let spans = Spans::new(vec![ImageSpan { first: first as u32, image: image() }]);
     let reference = reference_answer_with(&path, &tokens, &rows, Some(&spans), 16);
     // What the test tells apart: the pad token's embedding at the image's cells, and the
     // image's rows at their cells.
@@ -1197,8 +1011,7 @@ fn a_prompt_with_an_image_read_layer_by_layer_gives_the_reference_answer() {
             max_slots: SLOTS,
             ..RuntimeConfig::default()
         };
-        let made = Made(inner.clone(), Cache::On);
-        let model: Arc<dyn Model> = Arc::new(Pictured { made, width, rows: tower_rows.clone() });
+        let model: Arc<dyn Model> = Arc::new(pictured(&inner, width, tower_rows.clone()));
         let mut gpu = GpuConfig::new(&config, &*model);
         gpu.ram_limit += 256 << 20;
         gpu.vram_headroom = 512 << 20;
@@ -1546,7 +1359,7 @@ fn start_serving_with(
     let inner =
         Arc::new(Qwen4Exp::new(gguf, byte_tokenizer(None), "made", &devices, opts, CELLS).unwrap());
     let config = RuntimeConfig { pages, cells_per_page: 128, max_slots: SLOTS, ..config };
-    let model: Arc<dyn Model> = Arc::new(Made(inner.clone(), Cache::On));
+    let model: Arc<dyn Model> = Arc::new(made(&inner, Cache::On));
     let mut gpu = GpuConfig::new(&config, &*model);
     gpu.ram_limit += 256 << 20;
     gpu.vram_headroom = 512 << 20;
@@ -1579,7 +1392,7 @@ fn start_lending(
         Arc::new(Qwen4Exp::new(gguf, byte_tokenizer(None), "made", &devices, opts, CELLS).unwrap());
     let config =
         RuntimeConfig { pages, cells_per_page: 128, max_slots: SLOTS, ..RuntimeConfig::default() };
-    let model: Arc<dyn Model> = Arc::new(Made(inner.clone(), Cache::On));
+    let model: Arc<dyn Model> = Arc::new(made(&inner, Cache::On));
     let mut gpu = GpuConfig::new(&config, &*model);
     gpu.ram_limit += 256 << 20;
     gpu.vram_headroom = 512 << 20;
@@ -1975,11 +1788,12 @@ fn the_mtp_block_follows_a_prompt_read_layer_by_layer() {
             warm_up: false,
             ..RuntimeConfig::default()
         };
-        let made: Arc<dyn Model> = Arc::new(Made(model.clone(), Cache::On));
-        let mut gpu = GpuConfig::new(&config, &*made);
+        let wrapped: Arc<dyn Model> = Arc::new(made(&model, Cache::On));
+        let mut gpu = GpuConfig::new(&config, &*wrapped);
         gpu.ram_limit += 256 << 20;
         gpu.vram_headroom = 512 << 20;
-        let runtime = Runtime::start_gpu(made, devices, config, gpu).expect("the runtime starts");
+        let runtime =
+            Runtime::start_gpu(wrapped, devices, config, gpu).expect("the runtime starts");
         model.take_mtp_chains();
         let answer = ask(&runtime, 1, &prompt, 40);
         let chains = model.take_mtp_chains();
@@ -2256,7 +2070,7 @@ fn start_flash_with(
         warm_up: false,
         ..RuntimeConfig::default()
     };
-    let model: Arc<dyn Model> = Arc::new(Made(inner.clone(), Cache::On));
+    let model: Arc<dyn Model> = Arc::new(made(&inner, Cache::On));
     let mut gpu = GpuConfig::new(&config, &*model);
     // A small tier in RAM: what has no slot in VRAM is read from the file.
     gpu.ram_limit += 1 << 30;
@@ -2500,7 +2314,7 @@ fn start_profiled(placement: Placement, dir: &std::path::Path) -> (Runtime, Arc<
         max_slots: SLOTS,
         ..RuntimeConfig::default()
     };
-    let model: Arc<dyn Model> = Arc::new(Made(inner.clone(), Cache::On));
+    let model: Arc<dyn Model> = Arc::new(made(&inner, Cache::On));
     let mut gpu = GpuConfig::new(&config, &*model);
     gpu.ram_limit += 256 << 20;
     gpu.vram_headroom = 512 << 20;
@@ -2625,7 +2439,7 @@ fn the_mtp_block_of_the_model_file_and_a_draft_vocabulary_change_no_token() {
         window_rows: 8,
         ..config
     };
-    let model: Arc<dyn Model> = Arc::new(Made(inner.clone(), Cache::On));
+    let model: Arc<dyn Model> = Arc::new(made(&inner, Cache::On));
     let mut gpu = GpuConfig::new(&config, &*model);
     gpu.ram_limit += 256 << 20;
     gpu.vram_headroom = 512 << 20;

@@ -7,13 +7,15 @@
 //! architecture document written out literally (dense matrices, a zero-padded
 //! convolution, a recurrence from the empty state), and keeps no state.
 //!
-//! Beside it: what the tests that open GPUs share (`gpu`) and the small
-//! helpers of all tests (`helpers`).
+//! Beside it: what the tests that open GPUs share (`gpu`), the small helpers
+//! of all tests (`helpers`), and a model in front of the engine that forwards
+//! everything a test does not change (`model`).
 
 #![allow(dead_code)]
 
 pub mod gpu;
 pub mod helpers;
+pub mod model;
 
 use std::path::PathBuf;
 

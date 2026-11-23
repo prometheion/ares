@@ -33,20 +33,20 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ares_api::{
-    Engine as _, EngineError, Event, EventSink, FinishReason, GenerateRequest, Message, ModelCard,
-    Prompt, RequestId, Role, Sampling, Usage,
+    Engine as _, Event, EventSink, FinishReason, GenerateRequest, Message, Prompt, RequestId, Role,
+    Sampling, Usage,
 };
 use ares_cuda::{Device, Precision, Wait, device_count};
 use ares_gguf::Gguf;
 use ares_model::qwen35::device::{Options, Qwen35, Rows, Session, Spread, Wanted};
 use ares_runtime::{
-    Clock, ContextSpec, DeviceContext, DeviceModel, ExecError, Executor, GpuConfig, GpuExecutor,
-    LinkSpec, Model, ModelError, Pick, PrefixCache, Runtime, RuntimeConfig, Snapshot, Split,
-    StepMeta, StepOutput, WakeCounts, Woke,
+    Clock, ExecError, Executor, GpuConfig, GpuExecutor, Model, Pick, Runtime, RuntimeConfig,
+    Snapshot, StepMeta, StepOutput, WakeCounts, Woke,
 };
-use ares_sampler::SampleParams;
-use ares_state::PageLayout;
 use ares_tokenizer::ChatOptions;
+use common::model::Wrapped;
+
+mod common;
 
 #[path = "common/kv_env.rs"]
 mod kv_env;
@@ -103,70 +103,6 @@ fn layouts() -> Vec<Layout> {
         eprintln!("one GPU: the second card and the splits are not tested");
     }
     all
-}
-
-/// A model that is another one without its prefix cache: the engine on top of
-/// it computes every prompt from its first token.
-struct Uncached(Arc<Qwen35>);
-
-impl Model for Uncached {
-    fn card(&self) -> ModelCard {
-        self.0.card()
-    }
-    fn vocab(&self) -> u32 {
-        self.0.vocab()
-    }
-    fn ends(&self, token: u32) -> bool {
-        self.0.ends(token)
-    }
-    fn encode(&self, prompt: &Prompt) -> Result<Vec<u32>, EngineError> {
-        self.0.encode(prompt)
-    }
-    fn piece(&self, token: u32, text: &mut Vec<u8>) {
-        self.0.piece(token, text);
-    }
-    fn context(&self) -> ContextSpec {
-        self.0.context()
-    }
-    fn split(&self) -> Split {
-        self.0.split()
-    }
-    fn devices(&self) -> usize {
-        self.0.devices()
-    }
-    fn links(&self) -> LinkSpec {
-        self.0.links()
-    }
-    fn max_rows(&self) -> u32 {
-        self.0.max_rows()
-    }
-    fn logit_rows(&self) -> u32 {
-        self.0.logit_rows()
-    }
-    fn draft_rows(&self) -> u32 {
-        self.0.draft_rows()
-    }
-    fn sampling(&self) -> SampleParams {
-        self.0.sampling()
-    }
-    fn attention_span(&self) -> u32 {
-        self.0.attention_span()
-    }
-    fn drafters(&self) -> Vec<ares_runtime::Drafter> {
-        self.0.drafters()
-    }
-    fn prefix_cache(&self) -> Option<PrefixCache> {
-        None
-    }
-    fn page_entry(&self, page: u32) -> u32 {
-        self.0.page_entry(page)
-    }
-    fn page_layout(&self, cells_per_page: u32) -> PageLayout {
-        self.0.page_layout(cells_per_page)
-    }
-    fn open(&self, cx: DeviceContext<'_>) -> Result<Box<dyn DeviceModel>, ModelError> {
-        self.0.open(cx)
-    }
 }
 
 /// No drafts: a request's steps are then the same whatever else runs, so that
@@ -278,7 +214,8 @@ fn rig_following(
         ..RuntimeConfig::default()
     };
     tweak(&mut config, checkpoint);
-    let model: Arc<dyn Model> = if cached { model } else { Arc::new(Uncached(model)) };
+    let model: Arc<dyn Model> =
+        if cached { model } else { Arc::new(Wrapped::new(model).cache(false)) };
     let gpu = GpuConfig::new(&config, &*model);
     let devices = layout
         .ordinals()
