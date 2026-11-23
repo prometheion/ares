@@ -14,8 +14,3 @@ pub use cursor::Cursor;
 pub use error::Error;
 pub use guide::Guide;
 pub use vocab::Vocabulary;
-
-/// Whether the mask `words` allows `token`.
-pub fn mask_allows(words: &[u32], token: u32) -> bool {
-    words.get((token / 32) as usize).is_some_and(|w| w >> (token % 32) & 1 != 0)
-}

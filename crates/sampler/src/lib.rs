@@ -20,6 +20,6 @@ pub mod penalties;
 mod reference;
 mod row;
 
-pub use mask::TokenMask;
+pub use mask::{TokenMask, mask_allows};
 pub use reference::{Kept, Reference, sample_reference};
 pub use row::*;

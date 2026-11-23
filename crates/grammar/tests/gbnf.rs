@@ -136,7 +136,7 @@ fn tokens_are_named_by_number_or_by_text() {
     // Every token but one.
     let mut g = toy.grammar(Source::Gbnf("root ::= !<[97]>"));
     let mask = g.start().mask().unwrap();
-    assert!(!allowed(&mask, 97) && allowed(&mask, 98) && allowed(&mask, 0));
+    assert!(!mask_allows(&mask, 97) && mask_allows(&mask, 98) && mask_allows(&mask, 0));
 }
 
 #[test]

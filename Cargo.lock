@@ -80,6 +80,7 @@ version = "0.0.1"
 dependencies = [
  "ares-api",
  "ares-gguf",
+ "ares-sampler",
  "ares-tokenizer",
  "llguidance",
  "serde_json",

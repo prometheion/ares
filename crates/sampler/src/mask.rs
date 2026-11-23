@@ -92,7 +92,7 @@ impl TokenMask {
 
 /// Whether the mask `words` allows `token`; a token beyond the words is not
 /// allowed.
-pub fn allows(words: &[u32], token: u32) -> bool {
+pub fn mask_allows(words: &[u32], token: u32) -> bool {
     words.get((token / 32) as usize).is_some_and(|w| w >> (token % 32) & 1 != 0)
 }
 
@@ -113,7 +113,7 @@ mod tests {
         assert_eq!(all.count(), 70, "the bits past the end stay clear");
         assert!(all.allowed(69) && !all.allowed(70));
         assert_eq!(TokenMask::only(70, [3, 5]).count(), 2);
-        assert!(allows(TokenMask::only(70, [3]).words(), 3) && !allows(&[], 3));
+        assert!(mask_allows(TokenMask::only(70, [3]).words(), 3) && !mask_allows(&[], 3));
         let mut m = TokenMask::none(33);
         m.fill(true);
         assert_eq!(m.count(), 33);

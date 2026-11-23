@@ -76,12 +76,10 @@ impl Toy {
     }
 }
 
-pub fn allowed(words: &[u32], token: u32) -> bool {
-    words.get((token / 32) as usize).is_some_and(|w| w >> (token % 32) & 1 != 0)
-}
+pub use ares_sampler::mask_allows;
 
 pub fn allowed_tokens(words: &[u32]) -> Vec<u32> {
-    (0..words.len() as u32 * 32).filter(|&t| allowed(words, t)).collect()
+    (0..words.len() as u32 * 32).filter(|&t| mask_allows(words, t)).collect()
 }
 
 /// A walk through the grammar that picks among the allowed tokens by a seed,
@@ -100,7 +98,7 @@ pub fn walk(toy: &Toy, grammar: &mut Grammar, seed: u64, limit: usize) -> (Vec<u
         let mask = cursor.mask().expect("a mask");
         let options = allowed_tokens(&mask);
         assert!(!options.is_empty(), "a step with nothing allowed after {:?}", toy.text(&tokens));
-        let can_end = allowed(&mask, toy.eos);
+        let can_end = mask_allows(&mask, toy.eos);
         if can_end && next().is_multiple_of(4) {
             return (tokens, true);
         }

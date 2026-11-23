@@ -274,7 +274,7 @@ impl Guide {
             self.cursor.goto(&[]);
             self.start = Some(self.cursor.mask()?);
         }
-        Ok(self.start.as_deref().is_some_and(|words| crate::mask_allows(words, token)))
+        Ok(self.start.as_deref().is_some_and(|words| ares_sampler::mask_allows(words, token)))
     }
 
     /// The tokens a reply may continue with when it has `matched` bytes of the
@@ -335,7 +335,7 @@ impl Guide {
         for (i, &token) in drafts.iter().enumerate() {
             let refused = match phase {
                 Phase::Lead(matched) if self.trigger.is_empty() => {
-                    !crate::mask_allows(&self.lead_words(matched)?, token)
+                    !ares_sampler::mask_allows(&self.lead_words(matched)?, token)
                 }
                 Phase::Reasoning(_) => !self.may_end_thinking && self.vocab.ends().contains(&token),
                 _ => false,

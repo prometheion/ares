@@ -107,7 +107,7 @@ fn an_opening_tag_in_several_tokens_is_followed_token_by_token() {
     let mut g = guide(&toy, Shape::Gbnf(YES_NO.into()), after_reasoning(Some("<think>")));
     let reply = bytes("<thi");
     let mask = g.mask(&reply, &[]).unwrap().expect("still in the tag");
-    assert!(allowed(&mask, b'n' as u32) && !allowed(&mask, b'y' as u32));
+    assert!(mask_allows(&mask, b'n' as u32) && !mask_allows(&mask, b'y' as u32));
     let mut reply = bytes("<think>");
     assert!(g.mask(&reply, &[]).unwrap().is_none(), "thinking");
     reply.extend(toy.tokens("</think>"));
@@ -154,7 +154,7 @@ fn a_walk_through_thinking_and_a_schema_ends_in_valid_json() {
         let mask = g.mask(&reply, &[]).unwrap().expect("bound");
         let options: Vec<u32> =
             allowed_tokens(&mask).into_iter().filter(|&t| t != toy.eos).collect();
-        if allowed(&mask, toy.eos) && (options.is_empty() || seed.is_multiple_of(3)) {
+        if mask_allows(&mask, toy.eos) && (options.is_empty() || seed.is_multiple_of(3)) {
             break;
         }
         seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);

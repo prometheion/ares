@@ -59,7 +59,7 @@ use std::collections::HashMap;
 use crate::arith::{
     KEY_MAX, Sums, exp_d, ln_d, ln_fixed, pack, pow_d, share, unsortable, weight_fixed, xtc_draw,
 };
-use crate::mask::allows;
+use crate::mask::mask_allows;
 use crate::row::*;
 
 /// The tokens a draw was made from and the temperature it was made at.
@@ -316,7 +316,7 @@ pub fn sample_reference(
         .map(|(i, &raw)| {
             let token = token_of(i);
             let mut l = by_token.get(&token).map_or(raw, |e| e.apply(raw));
-            if masked && !allows(mask.expect("checked"), token) {
+            if masked && !mask_allows(mask.expect("checked"), token) {
                 l = f32::NEG_INFINITY;
             }
             let l = l + 0.0;

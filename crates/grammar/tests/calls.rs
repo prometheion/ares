@@ -393,7 +393,7 @@ fn the_marker_inside_the_reasoning_ends_it_and_the_call_is_bound() {
         assert_eq!(allowed_tokens(&mask), vec![u32::from(b't')], "only another call");
         // A second call follows by the same rule.
         reply.extend(toy.tokens(&format!("\n{one}")));
-        assert!(allowed(&g.mask(&reply, &[]).unwrap().unwrap(), toy.eos));
+        assert!(mask_allows(&g.mask(&reply, &[]).unwrap().unwrap(), toy.eos));
     }
 }
 
@@ -517,9 +517,9 @@ fn a_reply_that_must_call_cannot_end_while_it_thinks() {
     for piece in ["I ", "think ", "and ", "never ", "close."] {
         reply.extend(toy.tokens(piece));
         let mask = g.mask(&reply, &[]).unwrap().expect("a mask while it thinks");
-        assert!(!allowed(&mask, toy.eos), "no end after {piece:?}");
-        assert!(allowed(&mask, u32::from(b'x')) && allowed(&mask, toy.control));
-        assert!(allowed(&mask, toy.token(MARKER)) && allowed(&mask, toy.token("</think>")));
+        assert!(!mask_allows(&mask, toy.eos), "no end after {piece:?}");
+        assert!(mask_allows(&mask, u32::from(b'x')) && mask_allows(&mask, toy.control));
+        assert!(mask_allows(&mask, toy.token(MARKER)) && mask_allows(&mask, toy.token("</think>")));
     }
     // A draft that ends the reply there is cut, with what follows it.
     assert_eq!(g.admitted(&reply, &[u32::from(b'a'), toy.eos, u32::from(b'b')]).unwrap(), 1);
