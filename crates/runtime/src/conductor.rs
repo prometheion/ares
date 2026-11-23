@@ -1053,18 +1053,40 @@ impl Conductor {
         if shape == Probe::Window && rows > 1 {
             self.pending_probe = Some(Commit { row0: 0, rows, slot: 0, accepted: 1 });
         }
-        self.step_no += 1;
-        let begun = Instant::now();
-        self.exec.dispatch(&StepMeta {
-            step: self.step_no,
-            record_bytes: used,
-            after_idle: true,
-        })?;
-        self.exec.collect(self.config.conductor_spin, &mut self.output)?;
-        let ms = begun.elapsed().as_secs_f64() * 1e3;
-        // An executor that knows the time of its steps without a clock says so.
-        let ms = self.output.step_ms.take().unwrap_or(ms);
+        // The devices waited for the warm-up and not for the host between its steps.
+        self.after_idle = true;
+        let ms = self.run_on_devices(used)?;
         Ok((ms, self.output.draft_ms))
+    }
+
+    /// Hands the record of `used` bytes to the devices and waits for them to
+    /// run it: the one round trip of every step (a step of rows, the step that
+    /// only drafts, a step of the warm-up), which the watchdog sees
+    /// ([`Heartbeat`]). Returns what the step took in milliseconds: the
+    /// executor's own time when it knows it, else the host's from the dispatch
+    /// to the end of the wait.
+    fn run_on_devices(&mut self, used: usize) -> Result<f64, ExecError> {
+        let t_dispatch = Instant::now();
+        self.step_no += 1;
+        let meta = StepMeta { step: self.step_no, record_bytes: used, after_idle: self.after_idle };
+        if let (false, Some(done)) = (self.after_idle, self.last_done_ns) {
+            self.stats.record(Phase::Turnaround, self.clock.now_ns().saturating_sub(done));
+        }
+        self.after_idle = false;
+        self.heartbeat.begin();
+        let dispatched = self.exec.dispatch(&meta);
+        let t_wait = Instant::now();
+        let collected = dispatched
+            .and_then(|()| self.exec.collect(self.config.conductor_spin, &mut self.output));
+        self.heartbeat.end();
+        let woke = collected?;
+        let t_back = Instant::now();
+        self.stats.record(Phase::Dispatch, (t_wait - t_dispatch).as_nanos() as u64);
+        self.stats.record(Phase::Wait, (t_back - t_wait).as_nanos() as u64);
+        self.stats.counters.conductor_wakes.record(woke);
+        self.last_done_ns = self.output.devices.iter().map(|d| d.finished_at_ns).max();
+        let step_ms = (t_back - t_dispatch).as_secs_f64() * 1e3;
+        Ok(self.output.step_ms.take().unwrap_or(step_ms))
     }
 
     /// The loop. Returns after a shutdown, when every request has ended.
@@ -2357,37 +2379,15 @@ impl Conductor {
         chain_ms: f64,
         observe: bool,
     ) {
-        // The devices.
-        let t_dispatch = Instant::now();
-        self.step_no += 1;
-        let meta = StepMeta { step: self.step_no, record_bytes: used, after_idle: self.after_idle };
-        if let (false, Some(done)) = (self.after_idle, self.last_done_ns) {
-            self.stats.record(Phase::Turnaround, self.clock.now_ns().saturating_sub(done));
-        }
-        self.after_idle = false;
         // What the step carries: every row and the cells it reads.
         let load = self.parts.iter().fold(Load::default(), |load, part| {
             load.plus(load_of(self.span, part.from, part.rows))
         });
-        self.heartbeat.begin();
-        if let Err(error) = self.exec.dispatch(&meta) {
-            self.heartbeat.end();
-            return self.fail(error.to_string());
-        }
-        let t_wait = Instant::now();
-        self.stats.record(Phase::Dispatch, (t_wait - t_dispatch).as_nanos() as u64);
-        let collected = self.exec.collect(self.config.conductor_spin, &mut self.output);
-        self.heartbeat.end();
-        let woke = match collected {
-            Ok(woke) => woke,
+        // The devices.
+        let step_ms = match self.run_on_devices(used) {
+            Ok(ms) => ms,
             Err(error) => return self.fail(error.to_string()),
         };
-        let t_back = Instant::now();
-        self.stats.record(Phase::Wait, (t_back - t_wait).as_nanos() as u64);
-        self.stats.counters.conductor_wakes.record(woke);
-        let step_ms = (t_back - t_dispatch).as_secs_f64() * 1e3;
-        // An executor that knows the time of its steps without a clock says so.
-        let step_ms = self.output.step_ms.take().unwrap_or(step_ms);
         // A step the model paused, or one that went on where it was paused, did
         // part of its rows' work.
         if observe && !self.output.paused {
@@ -2396,8 +2396,7 @@ impl Conductor {
         // The round took its chains and its rows.
         let step_ms = step_ms + chain_ms;
         self.share.spent(turn, step_ms, generating, self.prompt_rows.iter().any(|rows| *rows > 0));
-        let last_done = self.output.devices.iter().map(|d| d.finished_at_ns).max().unwrap_or(0);
-        self.last_done_ns = Some(last_done);
+        let last_done = self.last_done_ns.unwrap_or(0);
         for (device, times) in self.output.devices.iter().enumerate() {
             let notice = if times.finished_at_ns == last_done {
                 self.clock.now_ns().saturating_sub(last_done)
@@ -2490,7 +2489,11 @@ impl Conductor {
             rows: std::mem::take(&mut pass.rows),
             ms: 0.0,
         };
-        self.exec.tower(&mut job).map_err(|error| error.to_string())?;
+        // The tower's job is a wait on a device like a step's: the watchdog sees it.
+        self.heartbeat.begin();
+        let ran = self.exec.tower(&mut job);
+        self.heartbeat.end();
+        ran.map_err(|error| error.to_string())?;
         pass.next += units;
         pass.ms += job.ms;
         self.unit_ms_per_row = Some(pass.ms / f64::from(pass.next) / rows);
@@ -2617,26 +2620,7 @@ impl Conductor {
     /// took, in milliseconds: the price of the drafts.
     fn chains_first(&mut self) -> Result<f64, String> {
         let used = self.write_record(true)?;
-        let t_dispatch = Instant::now();
-        self.step_no += 1;
-        let meta = StepMeta { step: self.step_no, record_bytes: used, after_idle: self.after_idle };
-        if let (false, Some(done)) = (self.after_idle, self.last_done_ns) {
-            self.stats.record(Phase::Turnaround, self.clock.now_ns().saturating_sub(done));
-        }
-        self.after_idle = false;
-        self.exec.dispatch(&meta).map_err(|error| error.to_string())?;
-        let t_wait = Instant::now();
-        self.stats.record(Phase::Dispatch, (t_wait - t_dispatch).as_nanos() as u64);
-        let woke = self
-            .exec
-            .collect(self.config.conductor_spin, &mut self.output)
-            .map_err(|error| error.to_string())?;
-        let t_back = Instant::now();
-        self.stats.record(Phase::Wait, (t_back - t_wait).as_nanos() as u64);
-        self.stats.counters.conductor_wakes.record(woke);
-        self.last_done_ns = self.output.devices.iter().map(|d| d.finished_at_ns).max();
-        let step_ms = (t_back - t_dispatch).as_secs_f64() * 1e3;
-        let step_ms = self.output.step_ms.take().unwrap_or(step_ms);
+        let step_ms = self.run_on_devices(used).map_err(|error| error.to_string())?;
 
         // The drafts of every chain, in the order of the windows: those of the
         // links that were made, and what the drafter said of them.
