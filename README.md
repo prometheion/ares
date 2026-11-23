@@ -94,9 +94,9 @@ Flash-Next models larger than RAM streamed from the SSD.
 
 ## Measured
 
-Every number here comes from runs of both engines in the same session on the
-same machine, alternating, with the setup named. They are measurements of two
-cards and two models, not general claims.
+The two tables come from runs of both engines in the same session on the same
+machine, alternating, with the setup named. They are measurements of two cards
+and one model, not general claims.
 
 **The 27B against llama.cpp at production settings.** Qwen3.8 27B UD-Q4_K_S on
 an RTX 4070 and an RTX 3060 (12 GiB each) with peer access, 2026-11-23. The
@@ -127,18 +127,21 @@ the row says otherwise. Two rounds each, alternating.
 | | llama.cpp fork | Ares |
 | --- | --- | --- |
 | One request alone, German / English / code, tokens/s | 58-65 / 60-64 / 73-76 | 72-74 / 63-75 / 91-103 |
-| Two at once, sum while both run, tokens/s | 98 / 104-108 / 116-129 | 105-111 / 93-116 / 106-134 |
+| Two at once, sum while both run, German / English / code, tokens/s | 98 / 104-108 / 116-129 | 105-111 / 93-116 / 106-134 |
 | 3 / 4 / 8 at once, sum, tokens/s | 86-87 / 100-109 / 95-97 | 115 / 107 / 110 (the round on a quiet machine; 70 / 83 / 81 during other builds) |
 | 8 at once with `--parallel 8`, sum, tokens/s | | 204-206 |
 | 8 at once, slowest first token | 19.3 s | 17.6 s; 0.51 s with `--parallel 8` |
 | A short request beside two generations, first token | 24.5-25.8 s | 0.15-0.22 s with priority 0; 18-21 s at the same priority |
 | Two agents with the same 16.6k tokens of system prompt and tools, cold, first turns | 22.3 / 47.7 s | 19.9 / 19.9 s |
 | Small cached turns of an agent | 0.23-1.1 s | 0.15-0.25 s |
+| An agent turn with a 5.8k-token tool result at 17k tokens, alone / both agents at once | 6.6-7.6 s / 9-17 s | 10.0-10.2 s / 12.1 and 26-29 s |
 | A prompt beside a generating request, first token: 8k / 32k / 98k tokens | 15.2-15.5 / 59.8-59.9 / 209-219 s | 20.4 / 124.1-124.4 / 754-763 s |
 
-The last row is where Ares is behind: it gives a long prompt and a generating
-request turns, where the fork runs both at the same time. The work on this is
-listed in [`docs/OPEN.md`](docs/OPEN.md).
+The last two rows are where Ares is behind. It gives a long prompt and a
+generating request turns, where the fork runs both at the same time; it reads
+two prompts one after the other; and before the attention kernel it read deep
+in a long context more slowly. The work on this is listed in
+[`docs/OPEN.md`](docs/OPEN.md).
 
 Comparisons of Flash-Next with Strata, the engine it is measured against, are
 not listed until they have been run in the same session.
