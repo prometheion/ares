@@ -1729,6 +1729,35 @@ mod tests {
     }
 
     #[test]
+    fn a_checkpoint_dropped_before_its_save_ran_keeps_the_save_a_restore_of_its_record_reads() {
+        let mut pool = PagePool::new(8, PER_PAGE);
+        let mut cache = cache(1);
+        let hashes = three_pages(&mut cache, &mut pool);
+        // A request's end state is saved with the next record, and the next turn restores it
+        // in that record; a place for a save inside that turn's step then drops it. The save
+        // stays, before the restore.
+        assert!(cache.save(0, hashes[0], Owner(1), false).taken);
+        cache.restore(0, CheckpointId(0));
+        assert_eq!(cache.reserve(), (None, 1), "the only place is still read");
+        assert_eq!(cache.index.checkpoint(hashes[0]), None);
+        let (copies, _) = written(&mut cache);
+        assert_eq!(
+            copies,
+            [
+                StateCopy { kind: StateCopyKind::Save, slot: 0, place: 0 },
+                StateCopy { kind: StateCopyKind::Restore, slot: 0, place: 0 },
+            ]
+        );
+        // When the restore is cancelled instead, its save has nothing to save.
+        assert!(cache.save(1, hashes[1], Owner(2), false).taken);
+        cache.restore(3, CheckpointId(0));
+        assert_eq!(cache.reserve(), (None, 1));
+        assert!(cache.cancel_restore(3));
+        let (copies, _) = written(&mut cache);
+        assert!(copies.is_empty(), "{copies:?}");
+    }
+
+    #[test]
     fn a_model_that_keeps_state_per_tail_limits_the_tails_per_slot() {
         let config = RuntimeConfig { max_slots: 2, ..RuntimeConfig::default() };
         let spec = PrefixCache { checkpoint_bytes: vec![100], tails_per_slot: Some(1) };
