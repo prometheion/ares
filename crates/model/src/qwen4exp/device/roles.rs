@@ -46,8 +46,9 @@ use crate::qwen4exp::weights::Weights;
 const DECODE_WARM: u32 = 3;
 const DECODE_TIMED: u32 = 9;
 
-/// Wide steps of a trial: one that is not timed, then the timed ones, of which
-/// the fastest counts.
+/// Wide steps of a trial: one of a few rows that is not timed (the first launches of
+/// the many-row kernels), then the timed ones, of which the fastest counts.
+const WIDE_WARM_ROWS: u32 = 16;
 const WIDE_TIMED: u32 = 1;
 
 /// The most rows of the trial's wide step: a step of the parts' own scratch
@@ -67,6 +68,9 @@ pub struct RoleTime {
     pub decode: Duration,
     /// The fastest timed wide step; `None` when the model runs no wide step.
     pub wide: Option<Duration>,
+    /// How long opening the choice's parts took, and the whole of its trial.
+    pub opened: Duration,
+    pub took: Duration,
 }
 
 impl RoleTime {
@@ -108,9 +112,9 @@ pub(super) fn trial(
 ) -> Result<RoleTrial, Error> {
     let started = Instant::now();
     let wide_rows = if part.own_rows() > MAX_BATCH { part.own_rows().min(WIDE_ROWS) } else { 0 };
-    // A sequence of a wide step and the decode steps, then the timed wide
-    // steps after them.
-    let cells = (wide_rows * (1 + WIDE_TIMED) + DECODE_WARM + DECODE_TIMED + 1).max(256);
+    // A sequence of a short wide step and the decode steps, then the timed
+    // wide steps after them.
+    let cells = (WIDE_WARM_ROWS + wide_rows * WIDE_TIMED + DECODE_WARM + DECODE_TIMED + 1).max(256);
     let opts = Options {
         max_rows: wide_rows.max(1),
         own_rows: 0,
@@ -139,7 +143,7 @@ pub(super) fn trial(
             }
         };
         match time_choice(gguf, c, w, devices, &opts, memory, &placement, &table, wide_rows) {
-            Ok((decode, wide)) => times.push(RoleTime { choice: *choice, decode, wide }),
+            Ok(time) => times.push(RoleTime { choice: *choice, ..time }),
             Err(e) if is_out_of_memory(&e) => refused.push((*choice, e.to_string())),
             Err(e) => return Err(e),
         }
@@ -176,7 +180,8 @@ fn time_choice(
     placement: &Placement,
     table: &Arc<HostTable>,
     wide_rows: u32,
-) -> Result<(Duration, Option<Duration>), Error> {
+) -> Result<RoleTime, Error> {
+    let started = Instant::now();
     let tensor = placement.tensor.as_ref().ok_or_else(|| invalid("a trial of no tensor split"))?;
     let (mixer, worker) = (tensor.mixer, 1 - tensor.mixer);
     let mut ledgers: Vec<Ledger> = devices
@@ -281,10 +286,11 @@ fn time_choice(
         step: 0,
         ngram: ngram_shape(c).map_or(0, |g| g.fetched_row_bytes()),
     };
+    let opened = started.elapsed();
     let mut decode = Vec::with_capacity(DECODE_TIMED as usize);
     let mut wide = None;
     if wide_rows > 0 {
-        run.step(wide_rows)?;
+        run.step(WIDE_WARM_ROWS.min(wide_rows))?;
     }
     for _ in 0..DECODE_WARM {
         run.step(1)?;
@@ -299,7 +305,13 @@ fn time_choice(
         }
     }
     decode.sort();
-    Ok((decode[decode.len() / 2], wide))
+    Ok(RoleTime {
+        choice: tensor.choice,
+        decode: decode[decode.len() / 2],
+        wide,
+        opened,
+        took: started.elapsed(),
+    })
 }
 
 /// The steps of a trial on the parts of one choice.
@@ -407,6 +419,8 @@ mod tests {
             choice: TensorChoice { mixer: 0, core_share, shared_on_mixer: core_share >= 1.0 },
             decode: Duration::from_secs_f64(decode_ms / 1e3),
             wide: wide_ms.map(|ms| Duration::from_secs_f64(ms / 1e3)),
+            opened: Duration::ZERO,
+            took: Duration::ZERO,
         }
     }
 

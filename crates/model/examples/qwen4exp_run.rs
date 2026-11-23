@@ -710,7 +710,7 @@ fn run() -> Result<(), AnyError> {
                 .map(|t| {
                     format!(
                         "core share {:.3} with the shared expert on the {}: decode {:.2} ms, \
-                         wide step of {} rows {}",
+                         wide step of {} rows {} (parts opened in {:.2} s, all {:.2} s)",
                         t.choice.core_share,
                         if t.choice.shared_on_mixer { "mixer" } else { "worker" },
                         t.decode.as_secs_f64() * 1e3,
@@ -719,6 +719,8 @@ fn run() -> Result<(), AnyError> {
                             "{:.1} ms",
                             w.as_secs_f64() * 1e3
                         )),
+                        t.opened.as_secs_f64(),
+                        t.took.as_secs_f64(),
                     )
                 })
                 .collect();
