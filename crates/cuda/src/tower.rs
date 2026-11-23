@@ -15,8 +15,7 @@
 //!   (`kernels/tower_attention.cuh`).
 //!
 //! Patches are in the merger's order (the 2 x 2 groups row by row, inside a
-//! group (0,0), (0,1), (1,0), (1,1)). The module needs compute capability 8.0,
-//! as the tile kernels do.
+//! group (0,0), (0,1), (1,0), (1,1)).
 //!
 //! [`Kernels`]: crate::Kernels
 
@@ -120,18 +119,8 @@ fn blocks_of(values: u64, threads: u32, what: &'static str) -> Result<u32> {
 }
 
 impl TowerKernels {
-    /// Loads the module on `device`. Refused below compute capability 8.0.
+    /// Loads the module on `device`.
     pub fn load(device: &Device) -> Result<Self> {
-        let (major, minor) = device.info().compute_capability;
-        if major < 8 {
-            return Err(invalid(
-                "image tower kernels",
-                format!(
-                    "they need compute capability 8.0 or newer, {} has {major}.{minor}",
-                    device.info().name
-                ),
-            ));
-        }
         let module = Module::load(device, IMAGE)?;
         Ok(Self {
             device: device.clone(),

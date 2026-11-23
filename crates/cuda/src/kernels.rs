@@ -23,16 +23,15 @@ pub use layout::{
 };
 pub use paths::PrefillChoice;
 
-/// The kernel module `build.rs` compiled from `kernels/module.cu`: every GPU
-/// the toolkit builds for can load it.
+/// The kernel module `build.rs` compiled from `kernels/module.cu`.
 static IMAGE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/kernels.fatbin"));
 
 /// The module of the weight kernels that multiply unquantized activations with a quantized
 /// matrix, compiled from `kernels/mmv_exact.cu`.
 static EXACT_IMAGE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mmv_exact.fatbin"));
 
-/// The prefill module, compiled from `kernels/prefill.cu` for compute
-/// capability 8.0 and newer (the tensor-core weight kernels).
+/// The prefill module, compiled from `kernels/prefill.cu`: the tensor-core
+/// weight kernels.
 static PREFILL_IMAGE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/prefill.fatbin"));
 
 /// The second prefill module, from `kernels/prefill_more.cu`: the tensor-core weight
@@ -441,8 +440,8 @@ pub struct Kernels {
     fast: Vec<(GgmlType, u64, Function)>,
     /// The kernels of [`Kernels::matvec_exact`] for the quantized types.
     exact: Vec<(GgmlType, u64, Function)>,
-    /// `None` on a GPU below compute capability 8.0.
-    prefill: Option<Prefill>,
+    /// The tensor-core weight kernels.
+    prefill: Prefill,
 }
 
 impl Prefill {
@@ -549,18 +548,12 @@ fn probe_full_rate(device: &Device, module: &Module) -> Result<bool> {
 }
 
 impl Kernels {
-    /// Loads the kernel modules on `device`. On a GPU generation without
-    /// precompiled code the driver compiles the modules here, once; it caches
-    /// the result on disk. On a GPU of compute capability 8.0 or newer this
-    /// also measures, in a few milliseconds, whether its tensor cores run `mma`
-    /// with f32 accumulation at full rate ([`Kernels::tensor_cores_full_rate`]).
+    /// Loads the kernel modules on `device`. This also measures, in a few
+    /// milliseconds, whether its tensor cores run `mma` with f32 accumulation
+    /// at full rate ([`Kernels::tensor_cores_full_rate`]).
     pub fn load(device: &Device) -> Result<Self> {
         let module = Module::load(device, IMAGE)?;
-        let prefill = if device.info().compute_capability.0 >= 8 {
-            Some(Prefill::load(device)?)
-        } else {
-            None
-        };
+        let prefill = Prefill::load(device)?;
         let fast = FAST_TYPES
             .iter()
             .map(|(ty, name, align)| Ok((*ty, *align, module.function(name)?)))
@@ -960,10 +953,9 @@ impl Kernels {
     /// accumulation at the same rate as with f16 accumulation, measured when the
     /// kernels were loaded. GeForce cards halve the first (and not the integer
     /// `mma`) unless the cap has been lifted; there the int8 variant of the
-    /// prefill kernels is the fast one. `false` also on a GPU without prefill
-    /// kernels.
+    /// prefill kernels is the fast one.
     pub fn tensor_cores_full_rate(&self) -> bool {
-        self.prefill.as_ref().is_some_and(|p| p.full_rate)
+        self.prefill.full_rate
     }
 
     /// The rule for which weight kernel family to use at which number of
@@ -1009,25 +1001,16 @@ impl Kernels {
             .map(|(_, _, _, table)| *table)
     }
 
-    /// Whether this device has the prefill kernels at all: they need compute
-    /// capability 8.0 (Ampere) or newer.
-    pub fn has_prefill_kernels(&self) -> bool {
-        self.prefill.is_some()
-    }
-
     /// Whether [`Kernels::matmul`] has a kernel of `path` for weights of type `ty` on this
     /// device: every type of [`Kernels::has_fast_matvec`] has the two f16 variants, those
-    /// that are not in the first module (the float types among them) have no int8 one. `false`
-    /// on a GPU without prefill kernels.
+    /// that are not in the first module (the float types among them) have no int8 one.
     pub fn has_prefill_path(&self, ty: GgmlType, path: PrefillPath) -> bool {
         let index = match path {
             PrefillPath::Int8 => 0,
             PrefillPath::F16 => 1,
             PrefillPath::F16Flush => 2,
         };
-        self.prefill.as_ref().is_some_and(|p| {
-            p.types.iter().any(|(t, .., paths)| *t == ty && paths[index].is_some())
-        })
+        self.prefill.types.iter().any(|(t, .., paths)| *t == ty && paths[index].is_some())
     }
 
     /// The path the prefill family takes on this device for the requested
@@ -1040,12 +1023,10 @@ impl Kernels {
     /// The path also decides the format the activations are prepared in
     /// ([`Kernels::prepare_prefill_activations`]), so a caller that wants one
     /// kernel family for several matrices asks once and passes the result on.
-    /// Refused on a GPU below compute capability 8.0.
     pub fn prefill_path(&self, precision: Precision) -> Result<PrefillPath> {
-        let prefill = self.prefill_kernels()?;
         Ok(match precision {
             Precision::Exact => PrefillPath::F16,
-            Precision::Fast if prefill.full_rate => PrefillPath::F16,
+            Precision::Fast if self.prefill.full_rate => PrefillPath::F16,
             Precision::Fast => PrefillPath::Int8,
         })
     }
@@ -1069,23 +1050,11 @@ impl Kernels {
         }
     }
 
-    fn prefill_kernels(&self) -> Result<&Prefill> {
-        self.prefill.as_ref().ok_or_else(|| Error::Invalid {
-            what: "prefill kernel",
-            detail: format!(
-                "the tensor-core weight kernels need compute capability 8.0 or newer, {} has {}.{}",
-                self.device.info().name,
-                self.device.info().compute_capability.0,
-                self.device.info().compute_capability.1
-            ),
-        })
-    }
-
     /// The shapes the prefill kernels of `ty` come in for `path`, largest first: what
     /// each needs and how it sits on this device, and up to how many activation rows
     /// [`Kernels::matmul`] uses it.
     pub fn prefill_shapes(&self, ty: GgmlType, path: PrefillPath) -> Result<Vec<PrefillShape>> {
-        let prefill = self.prefill_kernels()?;
+        let prefill = &self.prefill;
         let Some((_, _, table, kernels)) = prefill.types.iter().find(|(t, ..)| *t == ty) else {
             return Err(Error::Invalid {
                 what: "prefill kernel type",
@@ -1172,7 +1141,7 @@ impl Kernels {
         n_in: u32,
         n_rows: u32,
     ) -> Result<()> {
-        let prefill = self.prefill_kernels()?;
+        let prefill = &self.prefill;
         if n_in == 0 || !n_in.is_multiple_of(32) || n_rows == 0 {
             return Err(Error::Invalid {
                 what: "prefill activations",
@@ -1218,7 +1187,7 @@ impl Kernels {
     /// outputs that read it are infinite or NaN, and one below 6.1e-5 keeps what an f16
     /// subnormal holds (error at most 2^-25); [`WeightRange`] tells a loader which
     /// path holds the weights of a matrix. A type without a prefill kernel is
-    /// refused with an error, as is a device below compute capability 8.0.
+    /// refused with an error.
     ///
     /// # Safety
     ///
@@ -1243,7 +1212,7 @@ impl Kernels {
         n_out: u32,
         n_rows: u32,
     ) -> Result<()> {
-        let prefill = self.prefill_kernels()?;
+        let prefill = &self.prefill;
         let Some((_, align, table, kernels)) = prefill.types.iter().find(|(t, ..)| *t == ty) else {
             return Err(Error::Invalid {
                 what: "prefill kernel type",

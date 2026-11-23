@@ -151,7 +151,7 @@ fn is_float(ty: GgmlType) -> bool {
 }
 
 impl State {
-    /// The state for wide steps of a part, or an error naming what the device lacks.
+    /// The state for wide steps of a part.
     pub(super) fn open(
         device: &Device,
         kernels: &Kernels,
@@ -162,13 +162,6 @@ impl State {
         let rows = ExpertRowKernels::load(device).map_err(|e| {
             invalid(format!("steps of {} rows need the many-row kernels: {e}", opts.max_rows))
         })?;
-        if !kernels.has_prefill_kernels() {
-            return Err(invalid(format!(
-                "steps of {} rows need the tile kernels, which {} lacks",
-                opts.max_rows,
-                device.info().name
-            )));
-        }
         for layer in &w.layers {
             layer.moe.shape.check_rows().map_err(|e| {
                 invalid(format!("steps of {} rows, layer {}: {e}", opts.max_rows, layer.layer))

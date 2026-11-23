@@ -107,7 +107,7 @@ pub struct Options {
     pub rule: SelectionRule,
     /// The most rows of a step. A step of up to [`MAX_BATCH`] rows runs the
     /// decode kernels; a wider one (a slice of a prompt) runs the many-row kernels
-    /// (see the module `wide`) and needs a device with compute capability 8.0.
+    /// (see the module `wide`).
     pub max_rows: u32,
     /// The most rows of a step whose scratch the part keeps for good; 0 for
     /// `max_rows`. A wider step's scratch lies in VRAM that the expert slots

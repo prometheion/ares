@@ -38,10 +38,7 @@ fn gpus() -> Option<&'static [Device]> {
             }
             let count = device_count().expect("the CUDA driver");
             assert!(count > 0, "ARES_TEST_CUDA is set but the driver reports no device");
-            let all: Vec<Device> =
-                (0..count).map(|i| Device::open(i, Wait::Block).expect("open device")).collect();
-            // The many-row kernels need compute capability 8.0.
-            Some(all.into_iter().filter(|d| d.info().compute_capability.0 >= 8).collect())
+            Some((0..count).map(|i| Device::open(i, Wait::Block).expect("open device")).collect())
         })
         .as_deref()
 }

@@ -728,7 +728,7 @@ impl<'a> Chooser<'a> {
     /// probes of the file's layout run with it). Exact products take the exact
     /// path and measure nothing.
     fn measure_paths(&mut self) -> Result<(), ModelError> {
-        if self.precision != Precision::Fast || !self.kernels.has_prefill_kernels() {
+        if self.precision != Precision::Fast {
             return Ok(());
         }
         let begun = Instant::now();
@@ -896,7 +896,6 @@ impl<'a> Chooser<'a> {
         }
         let begun = Instant::now();
         let (device, kernels, layers) = (self.device, self.kernels, self.layers);
-        let f16_kernels = kernels.has_prefill_kernels();
         let probe = Self::probe(&mut self.probe, device, room, &mut self.report)?;
         let x_bytes = u64::from(n) * u64::from(n_in) * 4;
         let fresh = probe.x.len() < x_bytes;
@@ -961,9 +960,6 @@ impl<'a> Chooser<'a> {
         let mut best = [f32::INFINITY; 2];
         for round in 0..=ROUNDS {
             for (i, as_f16) in [false, true].into_iter().enumerate() {
-                if as_f16 && !f16_kernels {
-                    continue;
-                }
                 let ms = probe.run(BURST_FEW, |probe| launch(&probe.stream, as_f16))?;
                 if round > 0 {
                     best[i] = best[i].min(ms);
@@ -1003,7 +999,6 @@ impl<'a> Chooser<'a> {
             .min((PROBE_RESULT_BYTES / (4 * u64::from(most_rows))) as u32)
             .max(16);
         let w_bytes = u64::from(n_out.next_multiple_of(16)) * row_bytes;
-        let f16_kernels = kernels.has_prefill_kernels();
         let probe = Self::probe(&mut self.probe, device, room, &mut self.report)?;
         if eligible {
             // How the few-row kernels launch for this shape and for the probe matrix, which
@@ -1048,8 +1043,7 @@ impl<'a> Chooser<'a> {
                     (b * per, per.min(n - b * per), act_q.offset(u64::from(b) * stride))
                 })
             };
-            let file_runs =
-                if batched || path.is_none() { Kernels::has_fast_matvec(ty) } else { f16_kernels };
+            let file_runs = (path.is_some() && !batched) || Kernels::has_fast_matvec(ty);
             // SAFETY: the probe's buffers hold `most_rows` rows of `n_in`
             // values in every form and their products with `n_out` rows.
             unsafe {
@@ -1074,9 +1068,7 @@ impl<'a> Chooser<'a> {
                         Some(PrefillPath::F16 | PrefillPath::F16Flush) => {}
                     }
                 }
-                if f16_kernels {
-                    kernels.prepare_activations(stream, ActivationForm::F16, x, act_h, n_in, n)?;
-                }
+                kernels.prepare_activations(stream, ActivationForm::F16, x, act_h, n_in, n)?;
             }
             let file = |stream: &Stream, w: DevicePtr| -> Result<(), ModelError> {
                 // SAFETY: as above; the activations were prepared for the path.

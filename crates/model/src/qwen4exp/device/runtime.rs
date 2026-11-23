@@ -613,8 +613,8 @@ type StepWindows<'a> = (&'a [(u32, u32)], Option<&'a [f32]>);
 
 /// The rows of a step to open the model with on `devices`: as many as the scratch of a step
 /// may take of the smaller device's memory (a thirty-second; the rest is slots for experts and
-/// the pools of K and V), as a power of two between eight (the decode kernels' limit, which
-/// is all that a device without the tile kernels runs) and 4096.
+/// the pools of K and V), as a power of two between eight (the decode kernels' limit) and
+/// 4096.
 ///
 /// A step of more rows reads the experts of a layer once for more of them, and every byte of
 /// the scratch is a byte less for expert slots, which the generating steps miss: measured on
@@ -624,9 +624,6 @@ type StepWindows<'a> = (&'a [(u32, u32)], Option<&'a [f32]>);
 /// ignored.
 pub fn step_rows(gguf: &Gguf, devices: &[Device], opts: &Options) -> Result<u32, OpenError> {
     let config = Config::from_gguf(gguf)?;
-    if devices.iter().any(|d| d.info().compute_capability.0 < 8) {
-        return Ok(MAX_BATCH);
-    }
     let room = devices.iter().map(|d| d.info().total_memory / 32).min().unwrap_or(0);
     let mut rows = WIDE_ROWS;
     while rows > MAX_BATCH {

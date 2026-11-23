@@ -105,10 +105,6 @@ fn f16_rows(raw: &[u8], n_in: u32, n: u32) -> Vec<u8> {
 fn the_fused_kernels_write_the_f16_activations_of_a_conversion() {
     let Some(device) = gpu() else { return };
     let kernels = Kernels::load(device).unwrap();
-    if !kernels.has_prefill_kernels() {
-        eprintln!("skipped: the device has no tensor-core kernels to read f16 activations");
-        return;
-    }
     let layers = LayerKernels::load(device).unwrap();
     let stream = Stream::new(device, 0).unwrap();
     let f16_bytes = |n_in: u32, n: u32| Kernels::activation_bytes(ActivationForm::F16, n_in, n);
@@ -313,10 +309,6 @@ fn rows_of_parts_are_put_in_their_place() {
 #[test]
 fn the_fused_kernels_by_form() {
     let Some(device) = gpu() else { return };
-    let kernels = Kernels::load(device).unwrap();
-    if !kernels.has_prefill_kernels() {
-        return;
-    }
     let layers = LayerKernels::load(device).unwrap();
     let stream = Stream::new(device, 0).unwrap();
     let (start, end) =

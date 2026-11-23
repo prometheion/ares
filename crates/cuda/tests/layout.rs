@@ -62,14 +62,9 @@ fn gpus() -> Option<&'static [Device]> {
         .as_deref()
 }
 
-/// The kernels of the devices that have the tensor-core family.
+/// The kernels of the devices.
 fn loaded() -> Vec<(&'static Device, Kernels)> {
-    gpus()
-        .unwrap_or(&[])
-        .iter()
-        .map(|d| (d, Kernels::load(d).unwrap()))
-        .filter(|(_, k)| k.has_prefill_kernels())
-        .collect()
+    gpus().unwrap_or(&[]).iter().map(|d| (d, Kernels::load(d).unwrap())).collect()
 }
 
 /// A small deterministic generator, so failures reproduce.

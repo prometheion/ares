@@ -65,7 +65,7 @@ impl Kernels {
     /// file's layout: the one [`Kernels::measure_prefill_path`] measured, or the kept rule of
     /// [`Kernels::prefill_path_for`].
     pub fn prefill_choice(&self, ty: GgmlType) -> Result<PrefillChoice> {
-        let prefill = self.prefill_kernels()?;
+        let prefill = &self.prefill;
         let choices = prefill.choices.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(choice) = choices.iter().find(|c| c.ty == ty) {
             return Ok(*choice);
@@ -128,7 +128,7 @@ impl Kernels {
 
     /// Keeps `choice` for its type on this device's kernels.
     fn keep(&self, choice: PrefillChoice) -> Result<()> {
-        let prefill = self.prefill_kernels()?;
+        let prefill = &self.prefill;
         let mut choices = prefill.choices.lock().unwrap_or_else(|e| e.into_inner());
         choices.retain(|c| c.ty != choice.ty);
         choices.push(choice);
@@ -269,7 +269,7 @@ impl Kernels {
     /// have no int8 kernel, int8 for the others. A model's loader measures every type it
     /// multiplies in the file's layout, so this serves tests and benches.
     fn kept_path(&self, ty: GgmlType) -> Result<PrefillPath> {
-        let prefill = self.prefill_kernels()?;
+        let prefill = &self.prefill;
         if prefill.full_rate {
             return Ok(PrefillPath::F16);
         }

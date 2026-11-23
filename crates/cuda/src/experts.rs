@@ -1548,8 +1548,6 @@ fn tile_index(tile: u32) -> Result<usize> {
 /// these kernels (`kernels/expertrows_types.cuh`); every other type and role decodes with
 /// the item decoder of the dense tile kernels (`kernels/expertrows_mm.cuh`), which holds
 /// more in registers per step. `docs/ARCHITECTURE.md` has the measured times of each.
-///
-/// Needs compute capability 8.0 or newer (the `mma` shape and `cp.async` of Ampere).
 #[derive(Debug, Clone)]
 pub struct ExpertRowKernels {
     device: Device,
@@ -1565,18 +1563,8 @@ pub struct ExpertRowKernels {
 }
 
 impl ExpertRowKernels {
-    /// Loads the kernels on `device`. Fails on a device below compute capability 8.0.
+    /// Loads the kernels on `device`.
     pub fn load(device: &Device) -> Result<Self> {
-        let (major, minor) = device.info().compute_capability;
-        if major < 8 {
-            return Err(invalid(
-                "many-row experts",
-                format!(
-                    "{} has compute capability {major}.{minor}; the tensor-core kernels need 8.0",
-                    device.info().name
-                ),
-            ));
-        }
         let limit = u64::from(device.info().max_shared_per_block_optin);
         // The kernels of one type by tile, each allowed the shared memory `shared` gives.
         let tiled = |module: &Module, name: &str, shared: &dyn Fn(u32) -> u64| {

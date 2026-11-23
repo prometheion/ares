@@ -1,9 +1,9 @@
 //! Attention on the device: writing K and V into the cache in the engine's own
 //! formats, and attention that reads them natively.
 //!
-//! The kernels are in `kernels/attention.cu` (a module of its own, compute
-//! capability 8.0 and newer, like the prefill kernels) and the formats they
-//! write are the ones of `ares_quant::kv`, byte for byte. `ares_quant::kvhead`
+//! The kernels are in `kernels/attention.cu` (a module of its own, on the
+//! tensor cores like the prefill kernels) and the formats they write are the
+//! ones of `ares_quant::kv`, byte for byte. `ares_quant::kvhead`
 //! is the reference both are held to.
 //!
 //! # The stored sequence on the device

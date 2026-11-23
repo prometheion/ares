@@ -355,22 +355,14 @@ pub(super) fn group_of(l2_cache_bytes: u32, tile_bytes: u64, n_batch_tiles: u32)
 impl Kernels {
     /// Whether a matrix of `ty` with rows of `n_in` values has a device layout
     /// ([`WeightLayout::Device`]): the type has one and the rows are whole steps of it.
-    /// On a device without the tensor-core kernels
-    /// ([`Kernels::has_prefill_kernels`]) nothing reads it; [`Kernels::layout_for`]
-    /// asks both.
     pub fn has_device_layout(ty: GgmlType, n_in: u32) -> bool {
         TYPES.iter().any(|(t, _)| *t == ty) && n_in != 0 && n_in.is_multiple_of(COLUMNS_MULTIPLE)
     }
 
     /// The layout a loader should give a matrix of `ty` with rows of `n_in` values
-    /// on this device: the device layout where the type has one and the device the
-    /// kernels for it, the file's otherwise.
+    /// on this device: the device layout where the type has one, the file's otherwise.
     pub fn layout_for(&self, ty: GgmlType, n_in: u32) -> WeightLayout {
-        if self.prefill.is_some() && Self::has_device_layout(ty, n_in) {
-            WeightLayout::Device
-        } else {
-            WeightLayout::File
-        }
+        if Self::has_device_layout(ty, n_in) { WeightLayout::Device } else { WeightLayout::File }
     }
 
     /// The bytes of a matrix of `n_out` rows of `n_in` values in `layout`; `None` when
@@ -424,7 +416,7 @@ impl Kernels {
         n_out: u32,
         n_in: u32,
     ) -> Result<()> {
-        let kernels = self.prefill_kernels()?.layouts.of(ty)?;
+        let kernels = self.prefill.layouts.of(ty)?;
         let Some(bytes) = Self::layout_bytes(ty, WeightLayout::Device, n_out, n_in) else {
             return Err(Error::Invalid {
                 what: "weight matrix",
@@ -452,7 +444,7 @@ impl Kernels {
     /// Which kernel serves which number of rows for matrices of `ty` in the device
     /// layout: the table [`Kernels::measure_layout`] measured, or the kept one.
     pub fn layout_table(&self, ty: GgmlType) -> Result<LayoutTable> {
-        let prefill = self.prefill_kernels()?;
+        let prefill = &self.prefill;
         prefill.layouts.of(ty)?;
         let tables = prefill.layouts.tables.lock().unwrap_or_else(|e| e.into_inner());
         Ok(tables
@@ -474,7 +466,7 @@ impl Kernels {
     /// The device should be idle: a product of another context that runs at the same
     /// time is measured into the table.
     pub fn measure_layout(&self, ty: GgmlType) -> Result<LayoutTable> {
-        let prefill = self.prefill_kernels()?;
+        let prefill = &self.prefill;
         let kernels = prefill.layouts.of(ty)?;
         let table = measure(&self.device, kernels)?;
         let mut tables = prefill.layouts.tables.lock().unwrap_or_else(|e| e.into_inner());
@@ -494,7 +486,7 @@ impl Kernels {
     ) -> Result<ActivationForm> {
         match layout {
             WeightLayout::Device => {
-                self.prefill_kernels()?.layouts.of(ty)?;
+                self.prefill.layouts.of(ty)?;
                 Ok(ActivationForm::F16)
             }
             WeightLayout::File => Ok(match self.file_path(ty, precision, n_rows)? {
@@ -549,23 +541,12 @@ impl Kernels {
         precision: Precision,
         n_rows: u32,
     ) -> Result<Option<PrefillPath>> {
-        let tile = self.prefill.is_some();
         let decode = Self::has_fast_matvec(ty) && n_rows <= MAX_BATCH;
         let decode_rows = Self::decode_kernel_rows(ty).unwrap_or(MAX_BATCH).min(MAX_BATCH);
         match precision {
-            Precision::Exact if tile => Ok(Some(PrefillPath::F16)),
-            Precision::Fast if decode && (n_rows <= decode_rows || !tile) => Ok(None),
-            Precision::Fast if tile => Ok(Some(self.prefill_path_for(ty, Precision::Fast)?)),
-            // No tile kernels on this device (before compute capability 8.0): the decode
-            // kernels are all there is.
-            _ if decode => Ok(None),
-            _ => Err(Error::Invalid {
-                what: "weight kernel",
-                detail: format!(
-                    "{ty} in the file's layout has no kernel for {n_rows} rows on {}",
-                    self.device.info().name
-                ),
-            }),
+            Precision::Exact => Ok(Some(PrefillPath::F16)),
+            Precision::Fast if decode && n_rows <= decode_rows => Ok(None),
+            Precision::Fast => Ok(Some(self.prefill_path_for(ty, Precision::Fast)?)),
         }
     }
 
@@ -635,7 +616,7 @@ impl Kernels {
         n_in: u32,
         n_rows: u32,
     ) -> Result<&TypeKernels> {
-        let kernels = self.prefill_kernels()?.layouts.of(ty)?;
+        let kernels = self.prefill.layouts.of(ty)?;
         if !Self::has_device_layout(ty, n_in) || n_rows == 0 || n_in.checked_mul(n_rows).is_none() {
             return Err(Error::Invalid {
                 what: "layout kernel batch",
@@ -745,13 +726,13 @@ impl Kernels {
     }
 
     fn prefill_tuned_at(&self) -> Result<Arc<Mutex<Option<Instant>>>> {
-        Ok(self.prefill_kernels()?.layouts.tuned_at.clone())
+        Ok(self.prefill.layouts.tuned_at.clone())
     }
 
     /// The launch a few-row product of a matrix of `n_out` rows of `n_in` values takes:
     /// the one [`Kernels::tune_layout`] measured for the shape, or [`FewPlan::untuned`].
     pub fn few_plan(&self, ty: GgmlType, n_out: u32, n_in: u32) -> Result<FewPlan> {
-        let prefill = self.prefill_kernels()?;
+        let prefill = &self.prefill;
         let kernels = prefill.layouts.of(ty)?;
         let plans = prefill.layouts.plans.lock().unwrap_or_else(|e| e.into_inner());
         Ok(plans.get(&(ty, n_out, n_in)).copied().unwrap_or_else(|| {
@@ -804,7 +785,7 @@ impl Kernels {
         n_in: u32,
         region: Option<&DeviceBuffer>,
     ) -> Result<FewPlan> {
-        let prefill = self.prefill_kernels()?;
+        let prefill = &self.prefill;
         prefill.layouts.of(ty)?;
         let Some(bytes) = Self::layout_bytes(ty, WeightLayout::Device, n_out, n_in) else {
             return Err(Error::Invalid {

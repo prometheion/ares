@@ -451,9 +451,6 @@ fn prefill_matmul_computes_the_emulated_product_on_every_type() {
     let mut rng = Rng(0x2545f4914f6cdd1d);
     for device in gpus {
         let kernels = Kernels::load(device).unwrap();
-        if !kernels.has_prefill_kernels() {
-            continue;
-        }
         for (ty, _) in all_types() {
             let bv = ty.block_values() as usize;
             let step = unit(ty);
@@ -504,9 +501,6 @@ fn prefill_matmul_is_right_around_every_shape_boundary() {
     let mut rng = Rng(0x5851f42d4c957f2d);
     for device in gpus {
         let kernels = Kernels::load(device).unwrap();
-        if !kernels.has_prefill_kernels() {
-            continue;
-        }
         for (ty, _) in all_types() {
             let bv = ty.block_values() as usize;
             let n_in = 512usize;
@@ -591,9 +585,6 @@ fn prefill_matmul_on_real_tensors() {
                 let x: Vec<f32> = (0..n_in * n_rows).map(|_| rng.activation()).collect();
                 for device in gpus {
                     let kernels = Kernels::load(device).unwrap();
-                    if !kernels.has_prefill_kernels() {
-                        continue;
-                    }
                     for path in paths_of(&kernels, ty) {
                         let have =
                             run_matmul(device, &kernels, ty, path, w, &x, n_in, rows, n_rows);
@@ -642,9 +633,6 @@ fn the_int8_path_agrees_with_the_decode_kernels() {
     let mut rng = Rng(0xa076_1d64_78bd_642f);
     for device in gpus {
         let kernels = Kernels::load(device).unwrap();
-        if !kernels.has_prefill_kernels() {
-            continue;
-        }
         let stream = Stream::new(device, 0).unwrap();
         for (ty, _) in TYPES {
             let bv = ty.block_values() as usize;
@@ -718,9 +706,6 @@ fn a_row_gives_the_same_result_alone_and_in_a_batch() {
     let mut rng = Rng(0xda942042e4dd58b5);
     for device in gpus {
         let kernels = Kernels::load(device).unwrap();
-        if !kernels.has_prefill_kernels() {
-            continue;
-        }
         for (ty, _) in all_types() {
             let bv = ty.block_values() as usize;
             let (n_in, n_out, n_rows) = (unit(ty) * 8, 150usize, 130usize);
@@ -779,9 +764,6 @@ fn a_float_weight_beyond_f16_makes_its_outputs_infinite_and_no_others_wrong() {
     let (n_in, n_out, n_rows, bad_row) = (256usize, 70usize, 40usize, 7usize);
     for device in gpus {
         let kernels = Kernels::load(device).unwrap();
-        if !kernels.has_prefill_kernels() {
-            continue;
-        }
         for ty in [GgmlType::F32, GgmlType::BF16] {
             let mut values: Vec<f32> = (0..n_in * n_out).map(|_| rng.activation() * 0.05).collect();
             values[bad_row * n_in + 100] = -7.0e4;
@@ -836,9 +818,6 @@ fn the_f16_sums_take_weights_up_to_their_limit_and_overflow_above() {
     let (n_in, n_out, n_rows, large_row) = (256usize, 70usize, 40usize, 7usize);
     for device in gpus {
         let kernels = Kernels::load(device).unwrap();
-        if !kernels.has_prefill_kernels() {
-            continue;
-        }
         for ty in [GgmlType::F32, GgmlType::BF16] {
             for (weight, range) in [(8000.0, WeightRange::F32Sums), (512.0, WeightRange::Any)] {
                 let mut values: Vec<f32> =
@@ -942,9 +921,6 @@ fn tiny_float_weights_are_off_by_at_most_the_spacing_of_f16_subnormals() {
     let (weight_step, f32_step) = (2f64.powi(-25), 2f64.powi(-23));
     for device in gpus {
         let kernels = Kernels::load(device).unwrap();
-        if !kernels.has_prefill_kernels() {
-            continue;
-        }
         for ty in [GgmlType::F32, GgmlType::BF16] {
             // From 1e-7 to 1e-4, the range where f16 stops being exact for a bf16.
             let values: Vec<f32> = (0..n_in * n_out)
@@ -1044,9 +1020,6 @@ fn the_shapes_fit_the_device() {
     let Some(gpus) = gpus() else { return };
     for device in gpus {
         let kernels = Kernels::load(device).unwrap();
-        if !kernels.has_prefill_kernels() {
-            continue;
-        }
         for (ty, _) in all_types() {
             for path in paths_of(&kernels, ty) {
                 let shapes = kernels.prefill_shapes(ty, path).unwrap();
@@ -1071,12 +1044,6 @@ fn the_path_follows_the_measured_tensor_core_rate() {
     let Some(gpus) = gpus() else { return };
     for device in gpus {
         let kernels = Kernels::load(device).unwrap();
-        if !kernels.has_prefill_kernels() {
-            assert!(device.info().compute_capability.0 < 8);
-            assert!(!kernels.tensor_cores_full_rate());
-            assert!(kernels.prefill_path(Precision::Fast).is_err());
-            continue;
-        }
         let full = kernels.tensor_cores_full_rate();
         eprintln!("{}: f16 mma with f32 accumulation at full rate: {full}", device.info().name);
         assert_eq!(kernels.prefill_path(Precision::Exact).unwrap(), PrefillPath::F16);
@@ -1099,9 +1066,6 @@ fn the_measured_path_is_the_most_exact_of_the_fastest() {
     let Some(gpus) = gpus() else { return };
     for device in gpus {
         let kernels = Kernels::load(device).unwrap();
-        if !kernels.has_prefill_kernels() {
-            continue;
-        }
         let full = kernels.tensor_cores_full_rate();
         for ty in [GgmlType::Q4_K, GgmlType::Q8_0, GgmlType::IQ3_S, GgmlType::Q4_0, GgmlType::F16] {
             let kept = kernels.prefill_path_for(ty, Precision::Fast).unwrap();
@@ -1147,9 +1111,6 @@ fn bad_arguments_are_refused() {
     let Some(gpus) = gpus() else { return };
     let device = &gpus[0];
     let kernels = Kernels::load(device).unwrap();
-    if !kernels.has_prefill_kernels() {
-        return;
-    }
     let stream = Stream::new(device, 0).unwrap();
     let buffer = DeviceBuffer::new(device, 1 << 20).unwrap();
     let p = buffer.ptr();
