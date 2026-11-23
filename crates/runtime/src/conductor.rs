@@ -2159,12 +2159,16 @@ impl Conductor {
         // as when it is read alone and has its rows alone, and it pauses once the
         // time of a piece has passed; the rounds run between its pieces. Every
         // expert is then read once for all its rows, and not once a piece.
-        let wide =
-            Limits { max_rows: self.max_rows, prefill_rows_with_windows: self.max_rows, ..limits };
+        // The step borrows VRAM for its rows from the expert slots, which the rounds
+        // between its pieces then do without: it is half as wide as the widest, so
+        // that the slots keep at least half of what they could lend (a pass of all the
+        // rows they can lend for stalled Flash-Next's rounds on one card).
+        let wide_rows = self.max_rows / 2;
+        let wide = Limits { max_rows: wide_rows, prefill_rows_with_windows: wide_rows, ..limits };
         let pass = matches!(turn, Turn::Piece { .. })
             && generating > 0
             && paused.is_none()
-            && self.max_rows > piece
+            && wide_rows > piece
             && self.model.pauses_wide_steps()
             && {
                 let prompts: Vec<Request> = self
