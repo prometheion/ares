@@ -27,7 +27,10 @@ runs yet.
   expert from the SSD only while it is worth the wait.
 - Prompts are read in steps of up to `--ubatch-size` rows (512 by default), in pieces between
   rounds of generation, so running requests go on; while another request waits a piece is at
-  most half a second. A prompt read alone takes steps of up to `--batch-size` rows: on
+  most half a second. Every generating request keeps `--generation-floor` tokens per second
+  (20 by default) while a prompt is read beside it, the prompt gets the rest of the time and at
+  least half; on Flash-Next a long prompt beside generation is read layer by layer as when it is
+  alone, paused for the rounds. A prompt read alone takes steps of up to `--batch-size` rows: on
   Flash-Next (32 768 by default, as far as they fit) layer by layer, every micro-batch of the
   own rows through a layer and then the layer's experts once for all rows, about 56 KiB a row
   kept on VRAM the expert slots lend for the step; such a step pauses between two

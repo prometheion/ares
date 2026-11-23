@@ -81,6 +81,7 @@ Merged 2026-11-22 after the test machine's one card passed every GPU suite (`fix
 | Piece | State |
 | --- | --- |
 | Parallel requests against the owner's fork at production settings (the owner, 2026-11-23: "the whole reason I am making the engine"): two generating, one generating beside a long prompt, two agent sessions, 3 to 8 at once, priorities | measured (see "Parallel requests against the owner's production"); the fixes in work (`sched/parallel`): a long prompt beside generation, two prompts sharing the pieces of a step, Flash-Next's pass beside generation, the watchdog inside a pass |
+| Parallel requests, the fixes: the split of a prompt and generation, two prompts at once, Flash-Next's prompt beside generation, the watchdog's blind waits (audit 1) | handed back (`sched/parallel`): generation keeps `--generation-floor` (20 tokens/s), pieces of two groups on the 27B (32k beside generation 125 -> 82-100 s on the old attention, 71-73 with pieces of 1 s), Flash-Next's long prompt as a paused pass (8k beside generation 62 -> 16.7 s on one card), `run_on_devices`; a found stall of the expert store under a full loan (open) |
 | Cleanup phase 1, server and model (see "Cleanup") | agent working (`cleanup/server-model`) |
 | Inkling 2 Mini and Flash-Next on the newest Strata on the test machine (the owner, 2026-11-23: Inkling could replace the 27B), with Inkling's quality against the 27B for the owner's use | done: Flash-Next under "Found against Strata"; Inkling on Strata set aside (the owner: Strata forces its thinking off) |
 | Flash-Next UD-Q4_K_XL (104 GiB, larger than RAM) streamed from the SSD against Strata, then Ares's reading path | handed back, being rebased onto main with `kv/overflow` (`flash/ssd-stream`): decode ahead of Strata 0.1.60 on prose, prompts behind (the x4 link); measurement tools, a lower loan floor, RAM-held guesses into free transit slots |
@@ -918,7 +919,7 @@ Flash-Next); experts that do not fit in VRAM in RAM; K/V in int8. Its README giv
       rows of a step and a full `--queue` by priority, preemption of a worse priority to the
       prefix cache (2026-11-22, `server/priorities`; see "Priorities of requests" in
       `ARCHITECTURE.md`). Open: a prompt of a worse priority still takes its share of the time
-      next to generation of a better one (the slowdown, not the priority, bounds it); a
+      next to generation of a better one (the floor of generation, not the priority, bounds it); a
       threshold of the gap before a running request gives way (SGLang's, 10 by default) is not
       there (any gap is enough); the randomized test of admission plays one priority.
 - [x] A watchdog for a silent engine (S23): a step that runs longer than 600 s fails the engine
@@ -1252,17 +1253,25 @@ alternated, two rounds each, machine load 2 to 5 unless named.
 What Ares does better: three or more requests (a place each, at the same context), priorities, the
 system prompt two agents send at once (the second waits for the first's announced pages and shares
 them), cached turns, one request alone. What it does worse, and why:
-- [ ] A long prompt next to a generating sequence takes 2.5 times its time alone (the fork 1.6 to
-      1.8): `Share` gives generation half of the time (the slowdown of 2, not an option) and the
-      prompt runs in pieces of 256 rows; the fork runs the prompt in a second context at the same
-      time and the generating slot on high-priority streams, and its generation drops to 35-40 %
-      (Ares 50 %). Both use about the same share of the cards (fork 0.96-0.97 of the two rates
-      alone, Ares 0.87-0.93). With the slower attention at depth (the long-context piece) the 98k
-      prompt waits 12.6 min against 3.5. Levers: the split (a smaller slowdown, or one by the
-      prompt's length), then the attention.
-- [ ] Two prompts at once are read one after the other (shortest first); the first then generates
-      and the second takes turns with it: the second agent's 5.8k turn waits 26-29 s (fork 9-17,
-      both prompts in the same batches). The rows of two prompts could share a piece.
+- [x] A long prompt next to a generating sequence took 2.5 times its time alone (the fork 1.6 to
+      1.8): `Share` gave generation half of the time (the slowdown of 2) and the prompt ran in
+      pieces of 256 rows, one group of the tensor split, which runs without the overlap of a second
+      (2026-11-23, `sched/parallel`). Now generation keeps a floor rate (`--generation-floor`, 20
+      tokens/s by default, measured from its rounds, at most half of the time) and a piece of the
+      27B under a split is two groups (512 rows). Measured (old main fa0c0db, alternating, load 2 to
+      33): 8k beside a generating request 21.0-21.5 s before, 10.6-12.9 s now (fork 15.2-15.5);
+      32k 124.7-127.5 s before, 70.9-73.3 s with pieces of up to a second (82-100 s with half a
+      second); the generation keeps 17-20 tokens/s (fork 21-26), its longest gap 0.5-1.0 s (fork
+      0.5-0.6 at 32k). On main with the new prompt attention: being measured (`/var/tmp/ares-share/plan2.txt`).
+- [x] The floor by setting (27B UD-IQ2_XXS on one RTX 4060 Ti, no drafter, generation alone 31
+      tokens/s, a 16k prompt alone 21.5 s, beside a generating request): floor 0 23.2 s
+      (generation 3.0 tokens/s, the token a piece), 10: 30.5 s (10.1), 20 and 30: 45.4 s (17.2: 31
+      tokens/s alone cannot keep 20 in half of the time, so half), the old split 45.5 s (17.2).
+      The default of 20 is the fork's generation beside a prompt; the owner's call.
+- [ ] Two prompts at once are read one after the other (shortest first, the order that gives the
+      lower mean wait); the second then takes turns with the first's generation, now at the
+      floor and not at half (the agents scenario on main: being measured). Sharing a piece between two prompts would delay the first
+      without bringing the second forward.
 - [ ] A turn that continues at 17-23k reads 576 tokens/s (fork 880; Ares 1020 from the start of a
       prompt): the attention at depth (the long-context piece).
 - [ ] Two generating sequences share a step's draft rows by their chance (`window::choose`) up to
@@ -1287,6 +1296,24 @@ them), cached turns, one request alone. What it does worse, and why:
       against 26.6 (same machine state) but not beside a generating request (523 s against 496 s,
       machine load 20 to 55 from builds; Flash-Next's decode fell to 9 to 15 tokens/s under it):
       the pieces next to generation are still narrow and read the experts again.
+      Done for the prompt (2026-11-23, `sched/parallel`): a long prompt beside generation is read as
+      a pass that pauses for the rounds (`Model::pauses_wide_steps`), at most half as wide as the
+      slots can lend for. On the test machine (one RTX 4060 Ti, IQ2_XS, `--ram 24G`): 8k beside a
+      generating request 61.8 / 62.1 s before, 16.6 / 16.8 s now (alone 10.2); 16k 113 / 117 s
+      before, 29 / 31 s now; the generation keeps 14 to 19.5 tokens/s (26 before), its longest gap
+      0.7 to 1.2 s. On the two cards at `--ram 8G`: not measured (the local cards were busy).
+- [ ] Flash-Next: rounds between the pieces of a paused pass can stall the expert store when the
+      pass borrows all the slots can lend ("a step stood still for 30s while the host held back the
+      next layer ... the store waits for 7 to 9 experts and is not settled": a 21k-row pass opened
+      beside a generating request, 3 runs of 4 on one card; a pass opened alone and then joined by
+      generation did not stall in 2 runs). A loan leaves a layer `top_k + vram_reserve` slots
+      (`scratch_floor`); windows of 4 rows and the MTP chain then need more distinct experts than
+      that. The conductor now lends a pass beside generation at most half; the store itself should
+      bring a step's experts through transit or the CPU whatever the loan holds.
+- [ ] Flash-Next's greedy text differs from run to run of the same binary (test machine, IQ2_XS: 4
+      requests of 4 differed between two runs of main, alone and beside), so a change's text cannot
+      be compared by hash on this model; presumably the CPU and GPU paths of the experts, which
+      timing chooses.
 - Seen of the fork: a short request sent 0.5 s before a 32k prompt had its first token after 34 s
   (three of four runs): its prompt went into the same batches as the long one, since concurrent
   prefill starts only once a slot generates. Ares in the same spot: 0.15-0.75 s.

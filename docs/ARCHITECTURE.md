@@ -318,27 +318,48 @@ requests ──► plan ──► upload step record ──► window ──► 
    (`ares_sched::Share`). A step is a *round* of generation (the newest
    token of every generating sequence, with the drafts that pay: below) or a
    *piece* of prompt (up to the rows at which the model's prompt kernels
-   reach their rate, 256 for `qwen35`, the better priority first, then
+   reach their rate, `Model::prompt_rows`: for `qwen35` under a split two
+   groups of `pipeline_rows`, 512, since a step of one group runs without the
+   overlap of a second; the better priority first, then
    starved ones, then the shortest, with the newest token of every generating sequence riding
    along without drafts, so that they go on at a token a step). A round that
    verifies drafts keeps the inputs of its rows for the commit and has room
    for the rows of windows and no more, which is why prompt rows never share
-   a step with draft rows. The one setting is the *slowdown* `s`
-   (`prefill_slowdown`, 2 by default): while prompts and generation both
-   wait, generation gets `1 / s` of the time. A step of prompt that takes `t`
-   ms leaves `t / (s - 1)` ms of rounds owed before the next one, and a round
-   pays back what it takes; a round that overshoots is a credit, so the
-   share holds over time whatever the size of a round. A prompt that a piece
-   completes does not wait for the debt of a long one, as long as the debt
-   is no more than one whole piece leaves, so the first token of a short
-   prompt comes after the step in flight and one step of its own; a burst of
-   short prompts is read in one piece. A prompt read alone (nobody generates,
-   no other prompt has started) takes the widest step, `--batch-size` rows,
-   which for a mixture of experts may run on VRAM its expert slots lend (see
-   "Large prompt steps on lent VRAM" under Qwen3.8-Flash-Next); as soon as
-   another request waits, steps of prompt are pieces in the model's own memory
-   (`Model::own_rows`, `--ubatch-size`), halved until the measured price of
-   the piece is at most `RuntimeConfig::piece_ms` (500 ms). (The scheme is TensorFold's lanes, whose "a long prompt's
+   a step with draft rows. The one setting is the *floor* of generation
+   (`--generation-floor`, `RuntimeConfig::generation_floor`, 20 tokens per
+   second by default): while prompts wait, every generating sequence keeps
+   that rate and the prompts get the rest of the time. The share measures what
+   rounds give a generating sequence (`r` tokens per millisecond of rounds, the
+   mean over the sequences, each round weighing 0.95 of the one after it), and
+   a step of prompt that takes `t` ms leaves `(f t - riding) / (r - f)` ms of
+   rounds owed (`riding`: the token each sequence got in the step), never more
+   than `t`: generation gets at most half of the time, which is what a floor
+   the rounds cannot reach (a slow model, many sequences) and a share that has
+   measured no round yet leave. While a request waits in line for a place,
+   generation gets half of the time whatever the floor: the generating requests
+   give places back, and a prompt's request does not end before its reply (at
+   the floor a request waiting beside a generation and a 32k prompt got its
+   first token after 68 to 73 s, at half after 39 to 41). A round pays back what it takes; a round that
+   overshoots is a credit, so the share holds over time whatever the size of a
+   round. A prompt that a piece completes does not wait for the debt of a long
+   one, as long as the debt is no more than one whole piece leaves, so the
+   first token of a short prompt comes after the step in flight and one step of
+   its own; a burst of short prompts is read in one piece. A prompt read alone
+   (nobody generates, no other prompt has started) takes the widest step,
+   `--batch-size` rows, which for a mixture of experts may run on VRAM its
+   expert slots lend (see "Large prompt steps on lent VRAM" under
+   Qwen3.8-Flash-Next); as soon as another request waits, steps of prompt are
+   pieces in the model's own memory (`Model::own_rows`, `--ubatch-size`),
+   halved until the measured price of the piece is at most
+   `RuntimeConfig::piece_ms` (500 ms). A model that pauses its wide steps
+   (`Model::pauses_wide_steps`: Flash-Next reading a prompt layer by layer)
+   reads a long prompt beside generating sequences in such a step as well: the
+   prompt's rows alone, paused once the time of a piece has passed, the rounds
+   running between its pieces, so that every expert is read once for the step's
+   rows and not once a piece. Such a step is at most half of `Model::max_rows`
+   (the most rows the expert slots can lend for): the rounds between its pieces
+   do without the slots it borrows, and a loan of all of them stalled them.
+   (The scheme is TensorFold's lanes, whose "a long prompt's
    step owes the decoders" this takes; it replaces the cap of the rows of a
    prompt next to windows at `prefill_rows_at`, under which a prompt next to
    a drafting sequence trickled in a few rows a step.)
@@ -403,6 +424,26 @@ pieces of a long one. Their rate while a long prompt is read fell to 48 and
 (before: 75 and 69 % of it, for six and seven times as long), and to 41 and 47 % on
 one card. A long prompt takes 2.4 to 2.5 times what it takes alone on two
 cards and 1.7 to 1.8 times on one.
+
+With the floor of generation and pieces of two groups (2026-11-23, the 27B at
+the owner's production settings, main fa0c0db, before and after alternating,
+load 2 to 33; the fork's numbers from the parallel comparison in `OPEN.md`):
+
+| Beside a generating request | before | now | fork |
+| --- | --- | --- | --- |
+| an 8k prompt, first token | 21.0-21.5 s | 10.6-12.9 s | 15.2-15.5 s |
+| a 32k prompt, first token | 124.7-127.5 s | 82-100 s (71-73 s with pieces of up to 1 s) | 59.8-59.9 s |
+| the generating request meanwhile | 26-35 tokens/s | 17-20 tokens/s | 21-26 tokens/s |
+| its longest gap | 0.38-0.56 s | 0.49-0.94 s (0.56-1.04 s) | 0.51-0.66 s |
+
+The prompt and the generation used 0.99 of their two rates alone (the fork 0.96
+to 0.97; its own measurement of concurrent prefill: 0.40 of the decode rate and
+0.61 of the prompt rate), so running a piece and a round at once on two
+streams, as the fork's concurrent prefill does, has at most a few per cent to
+give over taking turns: not built. Steps of 512 rows (two groups) cost 0.96,
+1.36, 1.77 and 2.16 ms a row at 0, 8, 16 and 24k cells, one group of 256 1.55,
+1.74 and 2.21: with `piece_ms` at 500 ms the pieces fall to one group from about
+8k cells on that attention, which is where the pieces of up to 1 s gain.
 
 ### Threads
 
@@ -4810,9 +4851,26 @@ running. What was chosen:
   row routes to experts of its own; 0.9 s of it is the layers before any
   expert. So the token that rides along with a piece comes after that time, a
   request that arrives while a lone prompt is read waits that long for its
-  first step, and the rounds owed between pieces go at a token each; whether
-  generation gets the half of the time that the share promises was not
-  measured for this model.
+  first step, and the rounds owed between pieces go at a token each.
+  Where the model reads a prompt layer by layer (`Model::pauses_wide_steps`),
+  a long prompt beside generating sequences is read as such a pass instead of
+  in pieces: the prompt's rows alone, at most half as many as the slots can
+  lend for, paused between two micro-batches once `RuntimeConfig::piece_ms`
+  has passed, the rounds owed to the generating sequences running between its
+  pieces (the pass keeps its loan of VRAM meanwhile, so the rounds find fewer
+  expert slots: a loan leaves a layer a row's picks and the free slots,
+  `ExpertStore::scratch_floor`). A pass of all the rows the slots could lend
+  for (21k) stalled the rounds between its pieces in 3 runs of 4 ("a step
+  stood still ... the store waits for 7 to 9 experts"), half as wide in none
+  of 4, the prompt of 21k rows in 38.5 to 40 s beside the generating request. Measured on the test machine (one RTX 4060 Ti, IQ2_XS, `--ram 24G`,
+  2026-11-23, load below 8, two rounds each): an 8k prompt beside a generating
+  request 61.8 and 62.1 s before (alone 10.2 s; pieces that read the experts
+  again each), 16.6 and 16.8 s with the pass (alone 10.4 and 9.8 s), the
+  generation keeping 19.4 and 19.5 tokens/s (the floor of 20; 26 before, of
+  40 to 53 alone), its longest gap 1.0 to 1.2 s; a 16k prompt 113 s before,
+  29 to 31 s with it. The pass's pieces took 510 to 560 ms, the rounds between
+  them 330 to 500 ms; the rounds' rate fell from 0.059 to 0.040 tokens a
+  millisecond while the pass held its loan.
   Taking the missing experts of a step's rows apart, to let the rows that have
   theirs run first, is not built.
 
@@ -8338,8 +8396,8 @@ Here every place where the engine chooses between requests honours it:
   pieces at once (the generating sequences ride along with a token each); its
   pieces are owed all the same, by the prompts after it. A prompt that does
   not outrank them takes turns with them as before, whatever its priority:
-  the slowdown, not the priority, bounds what a background prompt costs a
-  foreground reply (open).
+  the floor of generation, not the priority, bounds what a background prompt
+  costs a foreground reply (open).
 - *A full line* (`--queue`): a request that comes when the line is full is
   decided by the conductor, which knows the line: it takes the place of the
   worst waiting request of a worse priority that has not started (the latest
