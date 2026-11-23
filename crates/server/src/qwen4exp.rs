@@ -422,9 +422,20 @@ pub(crate) fn load(
         match &placement.tensor {
             Some(tensor) => format!(
                 "both devices on every layer: device {} holds the streams and runs the mixers, \
-                 the other computes its share of every layer's recurrent heads and the experts \
-                 it owns",
-                held[tensor.mixer].device.ordinal()
+                 the other {}",
+                held[tensor.mixer].device.ordinal(),
+                match (tensor.choice.core_share >= 1.0, tensor.choice.shared_on_mixer) {
+                    (true, true) => "holds and computes the experts it owns, nothing else",
+                    (true, false) => "computes the shared experts and the experts it owns",
+                    (false, true) => {
+                        "computes its share of every layer's recurrent heads and the experts it \
+                         owns"
+                    }
+                    (false, false) => {
+                        "computes its share of every layer's recurrent heads, the shared experts \
+                         and the experts it owns"
+                    }
+                }
             ),
             None if held.len() == 1 => format!("all layers on device {}", ordinals_of(&held)),
             None => join(
