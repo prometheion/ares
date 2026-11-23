@@ -631,6 +631,9 @@ pub(crate) fn load(
         window_rows: if drafting { window } else { 1 },
         cache_ram: lockable - required,
         ssd: ssd.clone(),
+        generation_floor: options
+            .generation_floor
+            .unwrap_or(RuntimeConfig::default().generation_floor),
         ..RuntimeConfig::default()
     };
     let gpu = GpuConfig {

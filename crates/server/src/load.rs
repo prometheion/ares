@@ -1680,6 +1680,9 @@ fn load_qwen35(
         cache_ram: lockable - required,
         ssd: ssd.clone(),
         max_rows: options.batch.unwrap_or(0),
+        generation_floor: options
+            .generation_floor
+            .unwrap_or(RuntimeConfig::default().generation_floor),
         ..RuntimeConfig::default()
     };
     let gpu = GpuConfig {

@@ -728,6 +728,8 @@ pub(crate) struct Conductor {
     /// The rows of each prompt that has started and is not read yet, for the
     /// share's decision.
     prompt_rows: Vec<u32>,
+    /// The tokens the windows of the step that committed last produced.
+    round_tokens: u32,
     /// The text of all sequences, which drafts are looked up in.
     corpus: NgramCorpus,
     stats: Stats,
@@ -817,7 +819,7 @@ impl Conductor {
             n => n.min(model.max_rows()),
         };
         let slots = config.max_slots as usize;
-        let share = Share::new(config.prefill_slowdown);
+        let share = Share::new(config.generation_floor);
         let drafters = model.drafters();
         let engines =
             drafters.iter().map(|_| Acceptance::new(config.window_rows as usize, 0.999)).collect();
@@ -909,6 +911,7 @@ impl Conductor {
             needs,
             share,
             prompt_rows: Vec::with_capacity(slots),
+            round_tokens: 0,
             paused: None,
             paused_images: Vec::new(),
             give_up: false,
@@ -2120,7 +2123,7 @@ impl Conductor {
             && self.vision.is_some()
         {
             match self.run_tower(generating) {
-                Ok(ms) if ms > 0.0 => self.share.spent(turn, ms, generating, true),
+                Ok(ms) if ms > 0.0 => self.share.prompts_ran(ms, 0.0, generating),
                 Ok(_) => {}
                 Err(message) => return self.fail(message),
             }
@@ -2395,7 +2398,13 @@ impl Conductor {
         }
         // The round took its chains and its rows.
         let step_ms = step_ms + chain_ms;
-        self.share.spent(turn, step_ms, generating, self.prompt_rows.iter().any(|rows| *rows > 0));
+        let waiting = self.prompt_rows.iter().any(|rows| *rows > 0);
+        if let Turn::Piece { .. } = turn {
+            // The generating sequences that rode along got a token each.
+            let riders = self.parts.iter().filter(|p| matches!(p.kind, PartKind::Window)).count();
+            let riding = if generating > 0 { riders as f64 / f64::from(generating) } else { 0.0 };
+            self.share.prompts_ran(step_ms, riding, generating);
+        }
         let last_done = self.last_done_ns.unwrap_or(0);
         for (device, times) in self.output.devices.iter().enumerate() {
             let notice = if times.finished_at_ns == last_done {
@@ -2431,6 +2440,13 @@ impl Conductor {
         let t_commit = Instant::now();
         self.commit();
         self.stats.record(Phase::Commit, t_commit.elapsed().as_nanos() as u64);
+        if turn == Turn::Round {
+            // What the round gave each generating sequence teaches the share
+            // the rate of rounds.
+            let windows = self.parts.iter().filter(|p| matches!(p.kind, PartKind::Window)).count();
+            let tokens = f64::from(self.round_tokens) / windows.max(1) as f64;
+            self.share.round_ran(step_ms, tokens, generating, waiting);
+        }
 
         let t_events = Instant::now();
         self.deliver();
@@ -3056,6 +3072,7 @@ impl Conductor {
         let mut cursor = 0usize;
         let mut row0 = 0u32;
         self.commits.clear();
+        self.round_tokens = 0;
         for part in &self.parts {
             let first_row = row0;
             row0 += part.rows;
@@ -3202,6 +3219,9 @@ impl Conductor {
                 }
             }
             let produced = a.completion - before;
+            if let PartKind::Window = part.kind {
+                self.round_tokens += produced;
+            }
             if produced > 0 {
                 self.stats.counters.tokens += u64::from(produced);
                 self.admission.generated(a.seq, produced);

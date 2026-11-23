@@ -211,6 +211,12 @@ OPTIONS:
                                --parallel run; one more is refused with 503 and
                                Retry-After [default: no limit, a request waits
                                until it runs]
+        --generation-floor <TOKENS/S>
+                               The rate every generating request keeps while a
+                               prompt is read beside it; the prompt gets the rest
+                               of the devices' time, and at least half. 0 reads
+                               prompts at once (a request that generates then gets
+                               a token per step of prompt) [default: 20]
 
     Thinking, under the names llama-server gives these. A request can change
     each of them for itself: enable_thinking and the other variables in

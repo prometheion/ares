@@ -113,10 +113,11 @@ impl Runtime {
                 "a window has at least one row, its newest token (1: no drafts)".into(),
             ));
         }
-        if !(config.prefill_slowdown > 1.0 && config.prefill_slowdown.is_finite()) {
+        if !(config.generation_floor >= 0.0 && config.generation_floor.is_finite()) {
             return Err(RuntimeError::Config(format!(
-                "the slowdown of generation while a prompt is read must be above 1, got {}",
-                config.prefill_slowdown
+                "the rate generation keeps while a prompt is read must be 0 or more tokens a \
+                 second, got {}",
+                config.generation_floor
             )));
         }
         if let Some(cache) = model.prefix_cache()

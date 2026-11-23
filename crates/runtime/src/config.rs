@@ -74,12 +74,15 @@ pub struct RuntimeConfig {
     /// The chance that a draft is accepted before the engine has seen any of
     /// that drafter at that position: where every estimate starts from.
     pub draft_prior: f64,
-    /// How much slower generating sequences may get while a prompt is read,
-    /// above 1 (2.0: they get half of the time, the prompt the other half):
-    /// the one setting of how prompts and generation take turns
-    /// ([`ares_sched::Share`]). A prompt that is read faster is read at the
-    /// cost of the sequences that generate.
-    pub prefill_slowdown: f64,
+    /// The rate in tokens per second that every generating sequence keeps
+    /// while prompts are read: the one setting of how prompts and generation
+    /// take turns ([`ares_sched::Share`]). The rounds of generation get the
+    /// time that keeps it, measured from what the last rounds gave, and the
+    /// prompts the rest; at most half of the time goes to generation (what a
+    /// floor the rounds cannot reach leaves). 0: generation keeps only the
+    /// token every sequence gets in each step of prompt. A prompt that is read
+    /// faster is read at the cost of the sequences that generate.
+    pub generation_floor: f64,
     /// The longest a step for prompts takes, in milliseconds, while another
     /// request waits (a prompt next to it, a sequence that generates): the
     /// piece of prompt is halved until its measured price fits. A prompt read
@@ -136,7 +139,7 @@ impl Default for RuntimeConfig {
             window_rows: 8,
             ngram: NgramConfig::default(),
             draft_prior: 0.6,
-            prefill_slowdown: 2.0,
+            generation_floor: 20.0,
             piece_ms: 500.0,
             starvation_steps: 8,
             conductor_spin: Duration::from_millis(100),

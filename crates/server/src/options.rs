@@ -112,6 +112,7 @@ pub fn lookup(name: &str) -> Option<(&'static str, Kind)> {
         "--chat-var" => ("--chat-var", Kind::Value),
         "--chat-template-file" => ("--chat-template-file", Kind::Value),
         "--queue" => ("--queue", Kind::Value),
+        "--generation-floor" => ("--generation-floor", Kind::Value),
         "--expert-prune" => ("--expert-prune", Kind::Value),
         "-rea" | "--reasoning" => ("--reasoning", Kind::Value),
         "--reasoning-format" => ("--reasoning-format", Kind::Value),
@@ -148,6 +149,7 @@ pub fn names() -> impl Iterator<Item = &'static str> {
         "--chat-var",
         "--chat-template-file",
         "--queue",
+        "--generation-floor",
         "--expert-prune",
         "--reasoning",
         "--reasoning-format",
@@ -377,6 +379,14 @@ pub fn set(options: &mut ModelOptions, flag: &'static str, value: &str) -> Resul
         }
         "--queue" => {
             load.queue = Some(number("--queue", value, "a number of requests, 0 or more")?);
+        }
+        "--generation-floor" => {
+            let expected = "a rate in tokens per second, 0 or more";
+            let floor: f64 = number("--generation-floor", value, expected)?;
+            if !(floor >= 0.0 && floor.is_finite()) {
+                return Err(invalid("--generation-floor", value, expected));
+            }
+            load.generation_floor = Some(floor);
         }
         "--expert-prune" => load.expert_prune = expert_prune(value)?,
         "--chat-var" => {

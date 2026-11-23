@@ -707,14 +707,16 @@ fn watch(steps: &Steps) -> impl FnMut(&ares_runtime::RecordView<'_>) + Send + 's
 /// prompts of a test arrive while the sequence generates. The sequence has no
 /// limit but the pool, which it would take twenty seconds of steps to fill:
 /// it generates for as long as a test goes on, and [`end`] checks that it did.
-fn generating(steps: &Steps) -> (Runtime, Handle) {
+/// Prompts leave it `floor` tokens a second.
+fn generating(steps: &Steps, floor: f64) -> (Runtime, Handle) {
     let model = model(|c| {
         repeating(c);
         roomy(c);
         c.max_rows = 128;
     });
     let observer = watch(steps);
-    let rt = runtime_with(&model, config(true, 4096), |e| {
+    let config = RuntimeConfig { generation_floor: floor, ..config(true, 4096) };
+    let rt = runtime_with(&model, config, |e| {
         e.with_row_cost(Duration::from_micros(3000), Duration::from_micros(30))
             .with_observer(observer)
     });
@@ -733,7 +735,7 @@ fn end(rt: Runtime, generating: Handle) {
 #[test]
 fn a_prompt_next_to_a_drafting_sequence_is_read_in_pieces_without_draft_rows() {
     let steps: Steps = Arc::default();
-    let (rt, generating) = generating(&steps);
+    let (rt, generating) = generating(&steps, 20.0);
     let before = steps.lock().unwrap().len();
     let long = start(&rt, request(&Rng(5).prompt(1000), Some(1))).unwrap();
     long.finish();
@@ -755,27 +757,36 @@ fn a_prompt_next_to_a_drafting_sequence_is_read_in_pieces_without_draft_rows() {
 }
 
 #[test]
-fn a_long_prompt_takes_half_of_the_time_next_to_a_sequence_that_generates() {
-    let steps: Steps = Arc::default();
-    let (rt, generating) = generating(&steps);
-    let before = steps.lock().unwrap().len();
-    start(&rt, request(&Rng(6).prompt(2400), Some(1))).unwrap().finish();
-    let after = steps.lock().unwrap().len();
+fn a_long_prompt_leaves_generation_its_floor_and_at_most_half_of_the_time() {
     // The cost the executor charges, which is what the conductor books.
     let ms = |s: &Seen| 3.0 + 0.03 * f64::from(s.rows);
-    let ours: Vec<Seen> = steps.lock().unwrap()[before..after].to_vec();
-    let prompt: f64 = ours.iter().filter(|s| s.prompt_rows > 0).map(ms).sum();
-    let rounds: f64 = ours.iter().filter(|s| s.prompt_rows == 0).map(ms).sum();
-    // The default slowdown is 2: the sequence gets as much time as the prompt.
-    let owed = rounds / prompt;
-    assert!((0.8..1.25).contains(&owed), "the sequence had {rounds:.0} ms, the prompt {prompt:.0}");
-    end(rt, generating);
+    // The time of the rounds against the prompt's while a prompt is read.
+    let owed = |floor: f64| {
+        let steps: Steps = Arc::default();
+        let (rt, generating) = generating(&steps, floor);
+        let before = steps.lock().unwrap().len();
+        start(&rt, request(&Rng(6).prompt(2400), Some(1))).unwrap().finish();
+        let after = steps.lock().unwrap().len();
+        let ours: Vec<Seen> = steps.lock().unwrap()[before..after].to_vec();
+        let prompt: f64 = ours.iter().filter(|s| s.prompt_rows > 0).map(ms).sum();
+        let rounds: f64 = ours.iter().filter(|s| s.prompt_rows == 0).map(ms).sum();
+        end(rt, generating);
+        rounds / prompt
+    };
+    // A floor the rounds cannot reach: generation gets as much time as the
+    // prompt, and no more.
+    let half = owed(1e6);
+    assert!((0.8..1.25).contains(&half), "the sequence had {half:.2} of the prompt's time");
+    // No floor: the prompt's pieces come one after the other, the sequence
+    // riding along (a round or two at the start and the end).
+    let none = owed(0.0);
+    assert!(none < 0.1, "the sequence had {none:.2} of the prompt's time");
 }
 
 #[test]
 fn a_short_prompt_next_to_a_drafting_sequence_is_read_whole_in_the_next_step() {
     let steps: Steps = Arc::default();
-    let (rt, generating) = generating(&steps);
+    let (rt, generating) = generating(&steps, 20.0);
     for round in 0..4 {
         let before = steps.lock().unwrap().len();
         let short = start(&rt, request(&Rng(7 + round).prompt(60), Some(2))).unwrap();
@@ -789,13 +800,13 @@ fn a_short_prompt_next_to_a_drafting_sequence_is_read_whole_in_the_next_step() {
 }
 
 #[test]
-fn a_slowdown_that_leaves_generation_no_time_is_refused_at_start() {
+fn a_floor_of_generation_that_is_no_rate_is_refused_at_start() {
     let model = model(|_| {});
-    for slowdown in [1.0, 0.5, f64::NAN, f64::INFINITY] {
+    for floor in [-1.0, f64::NAN, f64::INFINITY] {
         let host = HostExecutor::new(model.clone(), model.config().max_rows, 4);
-        let config = RuntimeConfig { max_slots: 4, prefill_slowdown: slowdown, ..config(true, 64) };
+        let config = RuntimeConfig { max_slots: 4, generation_floor: floor, ..config(true, 64) };
         let error = Runtime::start(model.clone(), Box::new(host), config).unwrap_err();
-        assert!(error.to_string().contains("must be above 1"), "{slowdown}: {error}");
+        assert!(error.to_string().contains("must be 0 or more"), "{floor}: {error}");
     }
 }
 

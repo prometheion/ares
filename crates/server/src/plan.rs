@@ -145,6 +145,10 @@ pub struct LoadOptions {
     /// The most requests that may wait for a sequence while every sequence
     /// runs. `None`: a request waits until it runs.
     pub queue: Option<u32>,
+    /// The rate in tokens per second every generating sequence keeps while
+    /// prompts are read (`RuntimeConfig::generation_floor`). `None`: the
+    /// runtime's default.
+    pub generation_floor: Option<f64>,
     /// Pruning of the picks of a mixture of experts that only the SSD holds.
     /// `None`: none, the output as the model gives it.
     pub expert_prune: Option<ExpertPrune>,
@@ -200,6 +204,7 @@ impl LoadOptions {
             chat_variables: Vec::new(),
             chat_template: None,
             queue: None,
+            generation_floor: None,
             expert_prune: None,
             mmproj: None,
             mmproj_weights: ProjectorWeights::Ram,

@@ -14,8 +14,9 @@
 //!   generating sequences their newest token first, then the option rows of
 //!   decisions, then drafts, and prompts the rest.
 //! - [`Share`] decides whether the next step is a round of generation or a
-//!   piece of prompt, so that a long prompt slows generation by a chosen
-//!   factor and no more, and a short one is read at once.
+//!   piece of prompt, so that generation keeps a chosen rate while a long
+//!   prompt is read and the prompt gets the rest of the time, and a short one
+//!   is read at once.
 //! - [`Pass`] is the other order for long prompts of a model whose experts
 //!   are fetched: all rows up to a layer's router, then that layer's experts
 //!   for all rows, then on, so that a prompt fetches each expert once.
