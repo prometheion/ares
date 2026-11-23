@@ -14,6 +14,17 @@ GPU work runs on the test machine `admin@test-machine` (RTX 4060 Ti 16 GB, gpu-u
 2026-11-22 on; the two local cards are production and are used only when a test needs two
 cards, with the owner told first.
 
+## Why Ares (the owner, 2026-11-23)
+1. Control over the features: the engine does what the owner wants (Jev mode, for example, is a
+   feature the owner values highly).
+2. Speed, always.
+3. Parallel requests: llama.cpp is very poor at them and vLLM needs a lot of VRAM.
+4. Efficient use of VRAM and RAM.
+5. Large mixtures of experts streamed from the SSD, better than Strata: a Q4 or Q5 of a model
+   larger than RAM without a large loss of speed.
+6. Room for experiments: new prefetchers, drafting and prefill tricks, dynamic pruning.
+Every piece is weighed against these.
+
 Order of work the owner has set: CUDA complete for both models first, then optimising (better
 kernels, better prefetching: measured per phase on a quiet machine against the fork and Strata),
 Vulkan parity last.
