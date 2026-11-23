@@ -123,6 +123,8 @@ pub(super) fn trial(
         max_slots: 1,
         cells,
         pool_pages: 0,
+        // The trial's few cells are all in VRAM: its parts open no far pool.
+        near_pages: None,
         host_logits: false,
         profile: None,
         prune: None,
