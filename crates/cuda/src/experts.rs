@@ -828,8 +828,14 @@ impl ExpertKernels {
             return unsafe { self.select.launch(stream, [1, 1, 1], [threads, 1, 1], 0, args) };
         }
         // Several rows: a block per row picks, then one block makes the groups.
-        let args =
-            Args::new().ptr(logits).ptr(record).u32(shape.n_experts).u32(shape.top_k).u32(n_rows);
+        let args = Args::new()
+            .ptr(logits)
+            .ptr(record)
+            .u32(shape.n_experts)
+            .u32(shape.top_k)
+            .u32(n_rows)
+            .u32(0)
+            .u32(n_rows);
         // SAFETY: the argument list matches ares_expert_pick.
         unsafe { self.pick.launch(stream, [n_rows, 1, 1], [threads, 1, 1], 0, args)? };
         let args = Args::new()
@@ -990,14 +996,51 @@ impl ExpertKernels {
         record: DevicePtr,
         n_rows: u32,
     ) -> Result<()> {
+        // SAFETY: the caller's guarantee, for a record of the step's rows.
+        unsafe { self.pick_rows_into(stream, shape, logits, record, n_rows, 0, n_rows) }
+    }
+
+    /// [`ExpertKernels::pick_rows`] into a record of `record_rows` rows, of which the
+    /// `n_rows` rows of `logits` are the rows from `row0` on: their ids and weights go where
+    /// those rows' go in the larger record. A prompt read layer by layer routes its
+    /// micro-batches one after the other into the record of their chunk this way.
+    ///
+    /// # Safety
+    ///
+    /// `logits` must address `n_rows` rows of `n_experts` f32 and `record`
+    /// `16 + 8 * record_rows * top_k` bytes, 4-byte aligned, on the stream's device,
+    /// overlapping neither, alive until the launch has run.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn pick_rows_into(
+        &self,
+        stream: &Stream,
+        shape: &ExpertShape,
+        logits: DevicePtr,
+        record: DevicePtr,
+        n_rows: u32,
+        row0: u32,
+        record_rows: u32,
+    ) -> Result<()> {
         shape.check()?;
         if n_rows == 0 {
             return Err(invalid("expert kernels", "a pick of no rows".into()));
         }
+        if row0.checked_add(n_rows).is_none_or(|end| end > record_rows) {
+            return Err(invalid(
+                "expert kernels",
+                format!("rows {row0}..+{n_rows} of a record of {record_rows} rows"),
+            ));
+        }
         check_align("router logits", logits, 4)?;
         check_align("route record", record, 4)?;
-        let args =
-            Args::new().ptr(logits).ptr(record).u32(shape.n_experts).u32(shape.top_k).u32(n_rows);
+        let args = Args::new()
+            .ptr(logits)
+            .ptr(record)
+            .u32(shape.n_experts)
+            .u32(shape.top_k)
+            .u32(n_rows)
+            .u32(row0)
+            .u32(record_rows);
         let threads = shape.n_experts.next_multiple_of(32);
         // SAFETY: the argument list matches ares_expert_pick.
         unsafe { self.pick.launch(stream, [n_rows, 1, 1], [threads, 1, 1], 0, args) }

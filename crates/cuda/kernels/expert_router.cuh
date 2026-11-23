@@ -174,13 +174,20 @@ ARES_KERNEL ares_expert_select(
 // The selection of each row of a larger step: a block per row. The row's ids
 // and weights go into the record, and every expert's weight for the row (-1
 // when the row did not pick it) replaces its logit, for ares_expert_group.
-ARES_KERNEL ares_expert_pick(float* logits, uint8_t* record, uint32_t n_experts, uint32_t k, uint32_t n_rows) {
+// The record holds `record_rows` rows and the step's rows are its rows from
+// `row0` on (a micro-batch of a prompt read layer by layer writes into the
+// record of its chunk); a step's own record has `row0` 0 and `record_rows`
+// `n_rows`.
+ARES_KERNEL ares_expert_pick(
+    float* logits, uint8_t* record, uint32_t n_experts, uint32_t k, uint32_t n_rows, uint32_t row0,
+    uint32_t record_rows) {
     __shared__ AresPickShared sh;
     const uint32_t b = blockIdx.x;
-    const uint32_t cap = n_rows * k;
-    uint32_t* ids = reinterpret_cast<uint32_t*>(record + sizeof(AresRouteHeader)) + b * k;
+    const uint32_t cap = record_rows * k;
+    const size_t at = static_cast<size_t>(row0 + b) * k;
+    uint32_t* ids = reinterpret_cast<uint32_t*>(record + sizeof(AresRouteHeader)) + at;
     float* weights =
-        reinterpret_cast<float*>(record + sizeof(AresRouteHeader) + 4 * static_cast<size_t>(cap)) + b * k;
+        reinterpret_cast<float*>(record + sizeof(AresRouteHeader) + 4 * static_cast<size_t>(cap)) + at;
     float* row = logits + static_cast<size_t>(b) * n_experts;
     const float w = ares_expert_pick_row(row, ids, weights, n_experts, k, sh);
     if (threadIdx.x < n_experts) {
