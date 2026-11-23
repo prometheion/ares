@@ -5461,8 +5461,9 @@ runs), so their reads can start a layer or two before their records
   before read the next layer's experts from the file (the board carries the feed's word to
   the part), so a prompt whose experts are in the tiers pays nothing for it.
   Since 2026-11-22 (`flash/ssd-stream`) two things differ where the experts stream from
-  the SSD. *While VRAM is lent* (only the steps of a prompt read alone run then) the
-  guesses go as demand reads, behind the misses asked for before them: as prefetches the
+  the SSD. *While VRAM is lent* (a prompt is read alone then, whose pass only other
+  requests' steps interrupt) the guesses go as demand reads, behind the misses asked for
+  before them: as prefetches the
   reader kept them to a few chunks of 512 KiB beside a demand read, and through a 32k prompt
   on UD-Q4_K_XL the drive read 1.65 to 1.85 GB/s where it gives 2.4, two thirds of it these
   guesses. And *a guess is read only where its class is named at least as often as not*
@@ -5484,6 +5485,11 @@ runs), so their reads can start a layer or two before their records
   the RTX 3060 on PCIe 3.0 x4, 2026-11-22) a prompt of 8k tokens took 71.0 s against 47.7 and
   46.6 without the uploads; with the rule, 45.0 s (2k: 29.9 against 29.3 and 30.3), 88 to 93 %
   of the uploaded guesses named. On the link-bound 16 GB card it is not measured yet.
+  *A pass* (a prompt read layer by layer) guesses the whole next layer of the part while its
+  micro-batches run (`Flow::guess_layer`): every expert counts as a prediction's for the rows
+  that pick one of the layer's experts on average (the pass's rows times `top_k` over the
+  experts, the top class at the widths of a pass), so its record counts those odds, what no
+  tier holds is read into staging and what RAM holds goes up into the free transit slots.
 - *The text is unchanged.* The fingerprint of the tool (`qwen4exp_run --fingerprint`: the
   logits of a prompt of 600 tokens, 24 generated tokens and windows of drafts, bit for bit;
   both cards with the split pinned, `--core-share 0.76 --shared worker`, every miss
@@ -6378,6 +6384,7 @@ of the reads on demand (the reads ahead of the next layer are not in that column
 uploads; the tokens right after it are 1.2 to 1.3 times as fast (the loan of a pass of 17 000
 rows is about 0.9 GiB where a lent step of 4096 rows took 2 GiB of slots), and a request that
 comes during the prompt gets its first token after 0.8 to 1.8 s instead of 21 to 49 s.
+
 **UD-Q4_K_XL from the SSD on one 16 GB card** (2026-11-22, branch `flash/ssd-stream`; the test
 machine: RTX 4060 Ti 16 GB on PCIe 4.0 x4, 62 GiB RAM, Samsung 990 1 TB under btrfs; the 104 GiB
 file with `--ram 40G` and Strata 0.2.15 (engine 0.1.60) with `--resident-budget-gib 40`, both with
