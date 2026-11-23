@@ -4473,7 +4473,7 @@ cards is refused), its parts are opened with a sequence of a few thousand cells
 and every expert in a slot of zeros (slots of four times the card's L2 cache, so
 the experts' kernels read from memory), and a decode step of one row (the median
 of nine after three) and a wide step of the parts' own rows (up to 512, after one
-that is not timed) run as in a model that misses nothing, the exchanges between
+of sixteen rows that warms the kernels up) run as in a model that misses nothing, the exchanges between
 the cards included; then the parts are closed, before anything of the model is
 placed for good. The choice whose decode step times wide step is the least is
 kept: each kind of step counts by how much faster it is, where milliseconds alone
@@ -4485,6 +4485,32 @@ placement of a load (`place`, `Session::open`); later placements of the same loa
 pin its choice, and with `--cache` the server keeps it next to the stores as
 before. The server's log says what each role took and which was kept;
 `qwen4exp_run` prints it.
+
+*Measured* on the two development cards (2026-11-23, `qwen4exp_run`, the IQ2_XS file,
+`--ram-gib 8`, 4096 cells, the peer route, as in the table above; R lets the trial choose,
+FT and FX give the roles; two rounds in turn, the load average in brackets):
+
+| Run | Trial: decode, wide step of 512 rows (the share; experts only) | Opened | Prompt, warm | Decode median / mean / fastest | In a slot |
+| --- | --- | --- | --- | --- | --- |
+| R (3.5) | 16.43 ms, 604.5 ms; 17.24 ms, 494.9 ms: experts only kept | 8.8 s | 607 | 22.8 / 24.2 / 18.1 | 98.0 % |
+| FT (3.5) | | 2.7 s | 488 | 22.5 / 26.4 / 17.3 | 97.5 % |
+| FX (3.7) | | 3.8 s | 603 | 23.6 / 26.4 / 18.0 | 97.8 % |
+| R (8 to 6) | 16.30 ms, 704.8 ms; 17.07 ms, 486.6 ms: experts only kept | 5.9 s | 595 | 22.9 / 24.4 / 18.1 | 98.3 % |
+| FT (6 to 4) | | 4.8 s | 480 | 24.6 / 31.7 / 17.3 | 96.6 % |
+| FX (4) | | 2.2 s | 621 | 22.6 / 26.1 / 18.0 | 97.7 % |
+
+The trial sees what the runs show: with the share a decode step that misses nothing is 5 %
+faster (16.3 against 17.1 to 17.2 ms; the runs' fastest steps 17.3 against 18.0), and a
+wide step 22 to 45 % slower; experts only reads a warm prompt 24 to 29 % faster, and its
+decode is as fast (medians within a millisecond either way, which the misses decide), so the
+choice is right on these cards. Every trial so far kept experts only, also two at a load
+average of 20 to 28 whose times were 20 to 70 % longer. *What it costs:* 4.1 s in the
+quiet round (the first role 2.6 s, of which 1.6 s opening its parts with the paths of the
+prefill kernels measured on both cards, which the load's parts then take without measuring
+again; the second role 1.4 s), 7.0 s in the first round (with the full-width wide step
+that warmed up, since replaced by one of sixteen rows); the load opens about 3.7 s later
+than with the role given. That is more than the second or two expected: each role opens its
+parts, uploads its dense weights (3.4 GiB on the mixer) and runs a wide step of 512 rows.
 
 The model's own context (262 144 cells, what the plan serves without
 `--context` since 2026-11-22) costs a fifth of the VRAM slots: its K/V and

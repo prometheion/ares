@@ -1016,12 +1016,23 @@ the agents' builds):
       192), so each layer had 47 slots for 48 experts (the 64-row tests do not fill every slot).
       Transit now comes on top of that budget as far as the device's room goes (`plan_transit`,
       `devices/load-choice`); the test passes in all three placements on the two cards.
-- [ ] The 27B at the owner's production settings (`--split tensor --shares 0.625,0.375 --context
+- [x] The 27B at the owner's production settings (`--split tensor --shares 0.625,0.375 --context
       262144 --parallel 2 --kv q5 --drafters mtp --draft-vocab`, `--ram 16G`): the heads by the
       context planned the RTX 4070 above its free memory (the MTP block's K and V and whole heads
-      were not counted) and the load died reserving the recurrent state. Fixed by estimate
-      (`devices/load-choice`, the test in `load.rs`: 0.320 of the heads, 11 491 of 11 796 MiB);
-      an asked context the devices cannot hold is refused by estimate. A load on the cards owed.
+      were not counted) and the load died reserving the recurrent state. Fixed
+      (`devices/load-choice`, the test in `load.rs`); an asked context the devices cannot hold is
+      refused by estimate. On the cards (2026-11-23): 0.319 of the heads on the 4070, the plan
+      11.22 of 11.52 GiB there; loaded in 8 to 16 s and answered, the 4070 at 11 523 MiB with
+      177 MiB free beyond the 256 MiB left unreserved, the 3060 at 9 931 MiB.
+- [x] Flash-Next's second card: the role timed at load (`devices/load-choice`): on the two cards
+      the trial keeps experts only, and the runs agree (warm prompts 24 to 29 % faster than
+      with the share, decode as fast; ARCHITECTURE "The second card's role is timed at load").
+- [ ] The trial of the second card's role costs about 3.7 s at load (4.1 s of trial, of which
+      1.6 s opening the first role's parts with the prefill paths measured): each role opens its
+      parts and runs a wide step of 512 rows. Cheaper: a narrower wide step, the parts of the
+      kept role handed to the load, or the choice remembered per model and cards without
+      `--cache` as with it (the owner to decide whether a remembered choice is still "measured
+      at load").
 - [ ] Rust 1.100 (stable on the test machine) crashes compiling `ares-model --test
       qwen35_failure` (an internal compiler error); 1.99 builds it, and the test passes there.
 - [ ] `qwen4exp_runtime` with the default test threads hung for over 18 minutes once (two device
@@ -1039,8 +1050,9 @@ the agents' builds):
   prompt; a waiting request can cut in between layers) is moved forward (the owner, 2026-11-22):
   the next Flash-Next piece after `flash/prompt`, not the optimising phase.
 - Flash-Next on two cards: the plan measures at load whether the second card computes a dense
-  share or holds experts only, and keeps the faster; no option. To build; it needs the owner's
-  two cards to verify ("Owed on two cards").
+  share or holds experts only, and keeps the faster; no option. Built (`devices/load-choice`,
+  `device/roles.rs`): on the two development cards it keeps experts only (see "Owed on two
+  cards" for the runs and what the trial costs at load).
 - Checkpoints: both rules as built (a message boundary 1024 cells or more after the last; with
   one place a request's end state does not push out its own anchor).
 - A tool call a client gives back with its schema's defaults added is left as the client sent
