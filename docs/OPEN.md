@@ -1155,7 +1155,10 @@ them), cached turns, one request alone. What it does worse, and why:
       times), the generation keeps 20.6 of 28.1 tokens/s, its longest gap 3.0 s: alone the prompt
       runs in 9 wide steps on lent VRAM, beside it in pieces in the model's own memory that each
       read the experts again (5.3 million expert picks against 51 thousand, 240 s of expert waits
-      against 32). The layer-major pass (handed back) is the lever.
+      against 32). The layer-major passes now on main (574d741) read that prompt alone in 17.7 s
+      against 26.6 (same machine state) but not beside a generating request (523 s against 496 s,
+      machine load 20 to 55 from builds; Flash-Next's decode fell to 9 to 15 tokens/s under it):
+      the pieces next to generation are still narrow and read the experts again.
 - Seen of the fork: a short request sent 0.5 s before a 32k prompt had its first token after 34 s
   (three of four runs): its prompt went into the same batches as the long one, since concurrent
   prefill starts only once a slot generates. Ares in the same spot: 0.15-0.75 s.
