@@ -100,8 +100,9 @@ and one model, not general claims.
 
 **The 27B against llama.cpp at production settings.** Qwen3.8 27B UD-Q4_K_S on
 an RTX 4070 and an RTX 3060 (12 GiB each) with peer access, 2026-11-23. The
-other engine is a llama.cpp fork with quantized flash attention, tensor split
-with peer-to-peer sums and MTP drafts, run with its production preset. Both
+other engine is the author's llama.cpp fork
+([Piggidragon/llama.cpp](https://github.com/Piggidragon/llama.cpp)), with quantized flash
+attention, tensor split with peer-to-peer sums and MTP drafts, run with its production preset. Both
 engines at the same settings: tensor split 0.625 / 0.375, 262144 cells of K and
 V for 2 sequences, K and V in 5 bits (`q5_1` in the fork, `q5` in Ares), MTP and
 n-gram drafts, greedy sampling. The fork ran 2 rounds, Ares 3.
