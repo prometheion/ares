@@ -1071,6 +1071,11 @@ the agents' builds):
       threads spinning; the `moe/prompt-chunks` agent); with `--test-threads=1` it passes.
 
 ## Decided by the owner (2026-11-22)
+- Ares stays (the owner, 2026-11-23, after the comparison with Strata 0.1.65 on the test machine:
+  Flash-Next UD-Q3_K_XL at 40 GiB decodes 34.4 / 25.3 tokens/s with / without drafts against
+  Strata's 22.0 / 20.2, but reads prompts at 178 / 260 / 291 against 241 / 796 / 1159 tokens/s and
+  takes 6 to 31 s for a cached agent turn against 0.3 to 0.5 s). Prefill is the problem to solve
+  first, for both models; Inkling 2 Mini and Flash-Next are tested on the newest Strata meanwhile.
 - K/V beyond VRAM for dense attention (the 27B) is not wanted: Qwen4 will not have dense
   attention and Inkling 2 Mini's K/V is small; the 27B keeps the context its devices hold.
 - K/V beyond VRAM (`kv/overflow`): the far K/V pages a finished request leaves behind rank as
