@@ -69,6 +69,7 @@ tree is accepted than a chain), then built; started when the pieces in work leav
 piece at a time.
 
 ## In work now
+Merged 2026-11-23: Flash-Next's prompts layer by layer (TokenWing's order, interruptible between micro-batches, two devices, checkpoints inside a pass, images in passes), the CPU share of wide steps, forms per dense type, loans in pieces, the anchor fix for cached turns, the heat of a pass counted per row; a 17k prompt 2.6 times as fast locally, a short request during it first token 0.8 s against 13 to 16 s.
 Merged 2026-11-23 (the two local cards): the second card's role timed at load, capped cards measuring their prefill path, the transit budget (the 196-row test), the 27B at the owner's production settings planned and run (the attention's partial states bounded by the planner).
 Merged 2026-11-23 (verified on the two local cards): the CPU kernels for every expert type, image input pieces 4 to 8, request priorities and the server items, the slot-number crash fix.
 Merged 2026-11-22 after the test machine's one card passed every GPU suite (`fix/mtp-and-slots`,
@@ -77,9 +78,7 @@ Merged 2026-11-22 after the test machine's one card passed every GPU suite (`fix
 
 | Piece | State |
 | --- | --- |
-| Flash-Next prompts and cached agent turns against Strata (the anchor fix, the CPU share of wide steps, forms per type, loans in pieces) | in the line of commits of `flash/layer-major` |
-| The layer-major prompt pass (TokenWing's order), interruptible between layers, with the prompt work under it | being integrated onto main (`flash/layer-major`): a 17k prompt 2.6 times as fast locally, a short request during it first token 0.8 s against 13 to 16 s; one regression left (a cached turn 10.0 s against 2.6 s) |
-| Attention over long contexts as fast as the owner's fork at production settings (32k 654 against 944, 98k 325 against 752 tokens/s; the owner, 2026-11-23: next, then the few-row expert kernels, trees after) | agent working on the local cards (`attn/long-context`) |
+| Attention over long contexts as fast as the owner's fork at production settings | handed back, being verified (`attn/long-context`): a new prompt kernel (scores over quantized K in integers, L2-shared tile order as in llama.cpp PR 32407); 32k 1000 against the fork's 944, 98k 710 against 752 tokens/s (main 654 / 325) |
 | Parallel requests against the owner's fork at production settings (the owner, 2026-11-23: "the whole reason I am making the engine"): two generating, one generating beside a long prompt, two agent sessions, 3 to 8 at once, priorities | agent measuring (`bench/parallel`) |
 | Inkling 2 Mini and Flash-Next on the newest Strata on the test machine (the owner, 2026-11-23: Inkling could replace the 27B), with Inkling's quality against the 27B for the owner's use | agent measuring (`strata-eval`) |
 | Flash-Next UD-Q4_K_XL (104 GiB, larger than RAM) streamed from the SSD against Strata, then Ares's reading path | handed back, waiting for verification (`flash/ssd-stream`): decode ahead of Strata 0.1.60 on prose, prompts behind (the x4 link); measurement tools, a lower loan floor, RAM-held guesses into free transit slots |
