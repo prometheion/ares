@@ -53,8 +53,9 @@ yet. Ares was tested with one card and with two. Between cards, data goes
 directly from device to device when the driver allows peer access, and through
 host memory otherwise.
 
-**System.** Linux only. The engine reads weights and the prompt cache with
-io_uring and direct I/O, and loads the driver's `libcuda.so.1` at run time.
+**System.** Linux only. The engine reads weights with io_uring and direct I/O,
+keeps the prompt cache on disk with direct I/O, and loads the driver's
+`libcuda.so.1` at run time.
 
 ## What it does
 
