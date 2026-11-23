@@ -1116,6 +1116,21 @@ DSpark drafter `dspark-Inkling-2-Mini-Q8_0.gguf`, 0.4 GB). Notes: `/var/tmp/ares
   - [x] Two cards (a split by layers: a far pool per part; both cards on every layer: the mixer's):
         `qwen4exp_runtime k_and_v_beyond_vram_change_no_token` passes on the RTX 4070 + RTX 3060
         (2026-11-22). Not run with the real file on two cards.
+  - [ ] **Defect, seen in the merge check (2026-11-23, `integrate2`)**: on the two local cards with
+        IQ2_XS, `--ram 8G`, no `--context`, a prompt of 80 507 tokens (483 far pages) and then an
+        unrelated short request: the short request hung in its first step until the watchdog took
+        the model down (600 s; both cards at 100 %, the device threads asleep, so the experts' kernels
+        waited for a store nobody served) in 2 of 2 runs of the rebased branch with the bench's flow
+        (`/var/tmp/ares-integrate2/bench.py prompt 64000`), and was slow in two more (its prompt of 5
+        rows 5 to 6 s, 2 to 3 tokens/s, almost no uploads; the conductor did not answer `/metrics`
+        for 30 s right after the long request). Main never (2 runs); the branch's own head before the
+        rebase (ea94d5f, lent steps) once: no hang, the short request's first token after 4.5 s; a
+        prompt of 31 000 tokens (100 far pages): no stall; the same 80 507 tokens without the bench's
+        `/metrics` calls and the short request before: no stall. Suspected: the finished request's far
+        pages, which rank as prompt cache, leaving through a RAM level that has no room at `--ram 8G`
+        (page by page to the drive, the conductor waiting) while the next request runs. Not found yet;
+        notes, logs and a gdb harness (`hangdbg.sh`, the server under gdb because ptrace_scope is 1) in
+        `/var/tmp/ares-integrate2/`.
 
 ## Weight types (`moe/q4-load`, 2026-11-17)
 Every tensor of both models takes every weight type the shape allows (the audit of every place
