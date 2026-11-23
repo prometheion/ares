@@ -3834,7 +3834,11 @@ work on this one.
   applied in f32. On GeForce cards f16 products with f32 sums run at half rate; the int8 ones
   run at four times that, so the scores cost what f16 sums would, and they are closer to the
   reference than f16 operands (the wide window of 300 rows: `q8`/`q8` 5e-4 to 8e-4 of the largest
-  output against 1.9e-3 to 3.3e-3).
+  output against 1.9e-3 to 3.3e-3). The tile mean's dot products with the queries come from the
+  same products: the K mean as a 15-bit integer per value (a scale per group) in two rows of a
+  small tile whose other rows read a row of zeros, built by one warp per group in the phase before
+  the tile begins and read where the warps decode (as f32 sums over the integer queries' bytes they
+  took 15 % of the kernel with `q5`; they now take about 1 %).
 - *P V* in f16 with f16 sums over the 32 cells of a chunk, added to the f32 accumulator after each
   chunk (one rounding of a sum of 32 products, the size of the weights' own f16 rounding; summing
   in f16 over the whole range, as llama.cpp does, would grow with the length).

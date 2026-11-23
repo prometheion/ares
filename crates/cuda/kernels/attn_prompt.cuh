@@ -248,11 +248,11 @@ static __device__ __forceinline__ void ldsm_x4_trans(uint32_t (&r)[4], uint32_t 
 
 // Shared memory of the prompt kernel, in bytes (src/attention/plan.rs repeats it): the
 // queries (f16, or the high and low bytes of the integers), the tiles of a chunk (K twice for
-// the integer scores, whose next tile is decoded while the tensor cores read this one), the
-// scales of K and of the queries, the limits of the vectors.
+// the integer scores, whose next tile is decoded while the tensor cores read this one), and
+// for the integer scores the scales of K and the tile mean of K as codes with their scales.
 __host__ __device__ constexpr int prompt_smem_bytes(int d, bool i8) {
-    return i8 ? 128 * d * 2 + 2 * PROMPT_CHUNK * d + PROMPT_CHUNK * d * 2 + 2 * (d / 32) * PROMPT_CHUNK * 4 + 128 * 4 + 128 * 4
-              : 128 * d * 2 + 2 * PROMPT_CHUNK * d * 2 + 128 * 4;
+    return i8 ? 128 * d * 2 + 2 * PROMPT_CHUNK * d + PROMPT_CHUNK * d * 2 + 2 * (d / 32) * PROMPT_CHUNK * 4 + 3 * d + (d / 32) * 4
+              : 128 * d * 2 + 2 * PROMPT_CHUNK * d * 2;
 }
 
 // I8: the scores in integers (converted entries with K in q8 to q4): the codes of K against
@@ -284,8 +284,10 @@ static __device__ void attn_prompt_body(
     uint8_t* Kraw = smem + PROMPT_VECS * D * 2;               // K tile(s)
     __half* Vt = reinterpret_cast<__half*>(Kraw + (I8 ? 2 : 1) * KTILE);
     float* ksc = reinterpret_cast<float*>(Vt + C * D);           // [2][GROUPS][C] (I8)
-    float* qsc = ksc + (I8 ? 2 * GROUPS * C : 0);                // [128] (I8)
-    uint32_t* vec_lim = reinterpret_cast<uint32_t*>(qsc + (I8 ? PROMPT_VECS : 0));  // [128]
+    // (I8) the K mean of the current tile as codes: rows mh, ml and a row of zeros, and the
+    // scales of its groups
+    int8_t* Mt = reinterpret_cast<int8_t*>(ksc + (I8 ? 2 * GROUPS * C : 0));  // [3][D]
+    float* msc = reinterpret_cast<float*>(Mt + (I8 ? 3 * D : 0));          // [GROUPS]
 
     const AttnItem it = items[blockIdx.x];
     const AttnGeo g = attn_geo(cfg);
@@ -300,13 +302,19 @@ static __device__ void attn_prompt_body(
     const size_t head_e = (size_t)it.kv_head * g.head_e;
     const uint32_t start = ranges[it.ranges_off], end = start + it.total;
 
-    // ---- vectors: limits and the scaled, possibly rotated, queries
-    for (int v = tid; v < PROMPT_VECS; v += NT) {
-        uint32_t lim = 0xffffffffu;
-        if (v < nvec && (it.flags & ITEM_CAUSAL)) lim = rows[row_ids[it.row0 + v / G]].pos;
-        vec_lim[v] = lim;
-    }
-    for (int v = warp; v < PROMPT_VECS; v += PROMPT_WARPS) {
+    // ---- vectors: the warp's 16 (A: 16 warp + gq, B: + 8), their limits, and the scaled,
+    // possibly rotated, queries with (I8) their scales
+    const int vA = warp * 16 + gq, vB = vA + 8;
+    auto lim_of = [&](int v) -> uint32_t {
+        return v < nvec && (it.flags & ITEM_CAUSAL) ? rows[row_ids[it.row0 + v / G]].pos : 0xffffffffu;
+    };
+    const uint32_t limA = lim_of(vA), limB = lim_of(vB);
+    // the smallest limit of the warp's vectors: no cell of a chunk before it needs the mask
+    uint32_t lim_min = min(limA, limB);
+#pragma unroll
+    for (int h = 4; h < 32; h <<= 1) lim_min = min(lim_min, __shfl_xor_sync(0xffffffffu, lim_min, h));
+    float qsA = 1.0f, qsB = 1.0f;  // the scales of the integer queries (I8)
+    for (int v = warp * 16; v < warp * 16 + 16; ++v) {
         float x[GROUPS];
 #pragma unroll
         for (int gi = 0; gi < GROUPS; ++gi) {
@@ -331,17 +339,14 @@ static __device__ void attn_prompt_body(
                 Qh[swzb<D>(v, gi * 32 + lane)] = (int8_t)(qi >> 7);
                 Ql[swzb<D>(v, gi * 32 + lane)] = (uint8_t)(qi & 127);
             }
-            if (lane == 0) qsc[v] = amax / PROMPT_Q_MAX;
+            if (v == vA) qsA = amax / PROMPT_Q_MAX;
+            if (v == vB) qsB = amax / PROMPT_Q_MAX;
         } else {
 #pragma unroll
             for (int gi = 0; gi < GROUPS; ++gi) Qs[swz<D>(v, gi * 32 + lane)] = __float2half_rn(x[gi]);
         }
     }
     __syncthreads();
-    uint32_t lim_min = 0xffffffffu;
-    for (int v = lane; v < nvec; v += 32) lim_min = min(lim_min, vec_lim[v]);
-#pragma unroll
-    for (int h = 16; h > 0; h >>= 1) lim_min = min(lim_min, __shfl_xor_sync(0xffffffffu, lim_min, h));
 
     // ---- the addresses of the ldmatrix reads: piece pair t (16 halves or 32 bytes) of a
     // row is at bytes 128 (t / 4) + off[t % 4] of it, the swizzle of the lane's rows
@@ -440,14 +445,7 @@ static __device__ void attn_prompt_body(
     float wA = 0.0f, wB = 0.0f;  // summed weights of the current tile's cells (V mean)
     float mdA = 0.0f, mdB = 0.0f;  // the K mean's dot products of the current tile
     uint32_t cur_ent = 0xffffffffu;
-    const int vA = warp * 16 + gq, vB = vA + 8;
-    const uint32_t limA = vec_lim[vA], limB = vec_lim[vB];
     const bool warp_active = warp * 16 < nvec;
-    float qsA = 1.0f, qsB = 1.0f;  // the scales of the integer queries (I8)
-    if constexpr (I8) {
-        qsA = qsc[vA];
-        qsB = qsc[vB];
-    }
     const bool f16_sides = kf == FMT_F16 || vf == FMT_F16;
 
     // adds the weighted V mean of the tile `ent` to the accumulator
@@ -470,51 +468,57 @@ static __device__ void attn_prompt_body(
         wA = wB = 0.0f;
     };
     // a new tile at chunk c: the V mean of the one before, the K mean's dot products of this one
+    // (I8) the K mean of the tile `ent` into the mean tile: per group a scale (the largest
+    // magnitude over 16383) and the 15-bit codes as high (signed) and low bytes in rows 0 and 1;
+    // warp w takes group w (row 2 is zero from the start)
+    auto build_mean = [&](uint32_t ent) {
+        if constexpr (I8) {
+            if (warp >= GROUPS) return;
+            const __half* mk = reinterpret_cast<const __half*>(
+                conv_pool + (size_t)(ent & ~ATTN_CONVERTED_BIT) * g.entry_c + head_c);
+            const float m = __half2float(mk[warp * 32 + lane]);
+            const float amax = warp_max32(fabsf(m));
+            const float inv = amax > 0.0f ? PROMPT_Q_MAX / amax : 0.0f;
+            const int mi = (int)fminf(fmaxf(rintf(m * inv), -PROMPT_Q_MAX), PROMPT_Q_MAX);
+            Mt[swzb<D>(0, warp * 32 + lane)] = (int8_t)(mi >> 7);
+            Mt[swzb<D>(1, warp * 32 + lane)] = (int8_t)(mi & 127);
+            if (lane == 0) msc[warp] = amax / PROMPT_Q_MAX;
+        }
+    };
+    // (I8) the dot products of the warp's vectors with the K mean of the mean tile, into mdA and
+    // mdB: the mean's rows (high and low codes) are the columns 0 and 1 of a tile of 8 cells
+    // whose other six read the zero row
+    auto mean_dots = [&]() {
+        if constexpr (I8) {
+            float md0 = 0.0f, md1 = 0.0f;  // rows gq and gq + 8, at the lanes of tq 0
+            const int mrow = min(lane & 7, 2);
+            const uint32_t mbase = smem_addr(Mt) + (uint32_t)(mrow * D);
+#pragma unroll
+            for (int gi = 0; gi < GROUPS; ++gi) {
+                uint32_t ah[4], al[4], mb[4];
+                const uint32_t at = (uint32_t)(128 * (gi / 4));
+                ldsm_x4(ah, qa[gi % 4] + at);
+                ldsm_x4(al, qa[gi % 4] + at + PROMPT_VECS * D);
+                const int piece = 2 * gi + ((lane >> 3) & 1);
+                ldsm_x4(mb, mbase + (uint32_t)((piece ^ mrow) * 16));
+                int ch[4] = {0, 0, 0, 0}, cl[4] = {0, 0, 0, 0};
+                mma_s8(ch, ah, mb[0], mb[1]);
+                mma_u8s8(cl, al, mb[0], mb[1]);
+                const float ms = msc[gi];
+                // q (128 qh + ql) . m (128 mh + ml), the high and low bytes of both
+                md0 = fmaf(ms, fmaf(16384.0f, (float)ch[0], fmaf(128.0f, (float)(ch[1] + cl[0]), (float)cl[1])), md0);
+                md1 = fmaf(ms, fmaf(16384.0f, (float)ch[2], fmaf(128.0f, (float)(ch[3] + cl[2]), (float)cl[3])), md1);
+            }
+            // from the lane of tq 0 of the quad, times the query's scale
+            mdA = __shfl_sync(0xffffffffu, md0, lane & ~3) * qsA;
+            mdB = __shfl_sync(0xffffffffu, md1, lane & ~3) * qsB;
+        }
+    };
+    // a new tile: the V mean of the one before, the K mean's dot products of this one (a K mean
+    // means K in q7 to q4, so the integer kernel; its mean tile was built before the barrier)
     auto new_tile = [&](uint32_t ent) {
         if (v_mean && cur_ent != 0xffffffffu) flush_mean(cur_ent);
-        if (k_mean) {
-            const __half2* mk = reinterpret_cast<const __half2*>(
-                conv_pool + (size_t)(ent & ~ATTN_CONVERTED_BIT) * g.entry_c + head_c);
-            // lane l takes values 8 l .. 8 l + 7 (D / 8 lanes)
-            float2 mean[4];
-            if (lane * 8 < D) {
-#pragma unroll
-                for (int i = 0; i < 4; ++i) mean[i] = __half22float2(mk[lane * 4 + i]);
-            }
-            for (int v = 0; v < 16; ++v) {
-                float acc = 0.0f;
-                if (lane * 8 < D) {
-                    float qv[8];
-                    if constexpr (I8) {
-                        // the integer query of the scores, times its scale
-                        const uint2 hb = *reinterpret_cast<const uint2*>(Qh + swzb<D>(warp * 16 + v, lane * 8));
-                        const uint2 lb = *reinterpret_cast<const uint2*>(Ql + swzb<D>(warp * 16 + v, lane * 8));
-                        const float sc = qsc[warp * 16 + v];
-#pragma unroll
-                        for (int i = 0; i < 8; ++i) {
-                            const uint32_t hw = i < 4 ? hb.x : hb.y, lw = i < 4 ? lb.x : lb.y;
-                            const int hi = (int)(int8_t)((hw >> (8 * (i & 3))) & 0xffu);
-                            const int lo = (int)((lw >> (8 * (i & 3))) & 0xffu);
-                            qv[i] = (float)(hi * 128 + lo) * sc;
-                        }
-                    } else {
-                        const uint4 hv = *reinterpret_cast<const uint4*>(Qs + swz<D>(warp * 16 + v, lane * 8));
-                        const __half2* qh = reinterpret_cast<const __half2*>(&hv);
-#pragma unroll
-                        for (int i = 0; i < 4; ++i) {
-                            const float2 b = __half22float2(qh[i]);
-                            qv[2 * i] = b.x;
-                            qv[2 * i + 1] = b.y;
-                        }
-                    }
-#pragma unroll
-                    for (int i = 0; i < 4; ++i) acc = fmaf(mean[i].x, qv[2 * i], fmaf(mean[i].y, qv[2 * i + 1], acc));
-                }
-                acc = ares_warp_sum(acc);
-                if (v == gq) mdA = acc;
-                if (v == gq + 8) mdB = acc;
-            }
-        }
+        if (k_mean && warp_active) mean_dots();
         cur_ent = ent;
     };
     // S = Q K^T for 16 vectors x 32 cells (four tiles of 8), from K tile `kbuf`; with I8 still
@@ -675,6 +679,9 @@ static __device__ void attn_prompt_body(
             }
         }
         const bool compute_first = (warp & 4) != 0;
+        // the mean tile's row of zeros, and the first tile's mean
+        for (int p = tid; p < D / 16; p += NT) *reinterpret_cast<uint4*>(Mt + 2 * D + p * 16) = make_uint4(0, 0, 0, 0);
+        if (k_mean) build_mean(entry_of(start));
         for (int c = 0; c < n_chunks; ++c) {
             const uint32_t c0 = start + (uint32_t)c * C;
             // the V tile of chunk c, the next chunk's stored V, and a new tile's mean terms
@@ -702,6 +709,9 @@ static __device__ void attn_prompt_body(
                         if (c + 2 < n_chunks) prefetch(i, c + 2);
                     }
                 }
+                // the mean tile of the tile that the next chunk begins (this chunk's was read in
+                // its first phase)
+                if (k_mean && c + 1 < n_chunks && (c0 + C) % ATTN_TILE_CELLS == 0) build_mean(entry_of(c0 + C));
             };
             __syncthreads();  // K tile c & 1 is complete; every warp is done with the V tile
             float s[4][4];

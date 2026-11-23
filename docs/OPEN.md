@@ -1104,7 +1104,10 @@ access, greedy, the bench of `/var/tmp/ares-tools/prod-ab/` (fork 2 rounds, Ares
       reference than before (integer scores). What is left: the kernel reaches about 40 % of the
       int8/f16 tensor rate of the capped cards, the fork about 67 % (its O in f16 over the whole
       range and the query in registers; Ares keeps O in f32 and so 128 of 255 registers, two warps
-      per scheduler with latencies that do not overlap); end-to-end numbers below.
+      per scheduler with latencies that do not overlap). End to end at these settings (the bench of
+      `/var/tmp/ares-tools/prod-ab/`, prompt suite, alternating with main, load about 2): 2k / 32k /
+      98k 1132 / 979 / 675 tokens/s against main's 1082 / 655 / 324 and the fork's 840 / 944 / 752:
+      32k is reached, 98k is 10 % short.
 - [ ] Images on these settings, and a day of the owner's own use as a second llama-swap entry.
 
 ## Parallel requests against the owner's production (2026-11-23, `bench/parallel`)
