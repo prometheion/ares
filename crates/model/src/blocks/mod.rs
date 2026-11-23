@@ -21,6 +21,12 @@
 //! - [`slots`]: the slot arena that holds every block's state per sequence,
 //!   its checkpoints in host memory, the copies and transfers of the prefix
 //!   cache over all K/V groups, and what the prefix cache is told.
+//! - [`rows`]: where the rows of a token embedding table come from: the
+//!   device, or host memory staged for a step.
+//! - [`head`]: the output head's rows ordered by a draft vocabulary, which
+//!   every drafter that projects to the vocabulary reads.
+//! - [`mtp`]: the driver of an MTP block, for every model that drafts with
+//!   one.
 
 pub(crate) mod forms;
 pub(crate) mod head;

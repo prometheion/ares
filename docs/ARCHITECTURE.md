@@ -4161,7 +4161,7 @@ file of the 27B, 521 MiB in its UD-Q4_K_S file, whose table is Q3_K) does not
 lie on the device. A step needs the rows of
 its own tokens, a few kilobytes each in the file's form, and the gather kernel
 decodes them wherever they lie (`kernels/layer_embed.cuh`: all 28 weight
-types). Where they come from (`device/embed.rs`):
+types). Where they come from (`blocks/rows.rs`):
 
 - **The host.** The table lies in page-locked host memory of the device that
   embeds (the first one), booked as required memory of the engine's one RAM

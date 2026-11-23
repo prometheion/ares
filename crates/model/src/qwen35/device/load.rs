@@ -12,7 +12,7 @@
 //! tensor cores with the rows rounded up to 16. Which one is chosen per matrix
 //! by timing both on the device (`choose.rs`). A matrix that something else
 //! than a product reads keeps the file's layout: the rows of the embedding
-//! table that the draft chain's gather decodes (see `embed.rs`: the rest of
+//! table that the draft chain's gather decodes (see `blocks/rows.rs`: the rest of
 //! the table lies in host memory) and a head whose rows they are. A slice is cut
 //! in the file's layout and then rearranged, because the device layout mixes
 //! 16 rows; for the same reason a head whose first rows the MTP block reads

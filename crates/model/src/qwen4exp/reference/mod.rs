@@ -32,8 +32,8 @@
 //! that are not the rows' cells (an image's rows and the text after an image:
 //! [`Inputs`], [`Reference::window_with`]); otherwise the rotary position of a
 //! cell is its index. Every cell hashes its own token (an image's cells their
-//! pad token). The MTP MTP block (section 4) is in
-//! `draft.rs`: the mixer, attention and expert functions of this module with
+//! pad token). The MTP block (section 4) is in
+//! `mtp.rs`: the mixer, attention and expert functions of this module with
 //! the block's own weights, on what [`Window::trunk_out`] holds.
 
 mod blocks;

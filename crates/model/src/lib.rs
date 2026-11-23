@@ -1,9 +1,12 @@
 //! Model architectures of the engine: for each, the configuration read from a
-//! GGUF file, the table of its weights, and a CPU reference of the forward pass
-//! that the GPU implementations are held to.
+//! GGUF file, the table of its weights, a CPU reference of the forward pass,
+//! and the implementation on devices that is held to it.
 //!
-//! `qwen35` (dense) and `qwen4exp` (a mixture of experts) exist so far, and
-//! `qwen3vl`, the image tower and merger that both read images through.
+//! `qwen35` (dense) and `qwen4exp` (a mixture of experts) exist so far, with
+//! `qwen3vl`, the image tower and merger that both read images through, and
+//! `dflash`, the drafter both can draft with. `chat` is the way from a
+//! request's prompt to a model's tokens; the blocks (`blocks/`) are the parts
+//! of a step every model is built from.
 
 mod blocks;
 pub mod chat;

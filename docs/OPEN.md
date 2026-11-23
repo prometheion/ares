@@ -93,9 +93,10 @@ Generic for Ares, not like llama.cpp: a few models, shared code where it can be,
 still at its maximum through its own launch plan. A part becomes a shared block when it owns
 state the runtime touches (pages, slot state, checkpoints, windows, commits, replays, trees)
 or when it drafts; products, norms, kernel choice per row count, fused launches and exchanges
-between cards stay with the model. Today the two models share almost nothing inside
-`crates/model`, which is why every parity item below is owed twice. Design study:
-`/var/tmp/ares-survey/shared-model-layer.md`. Each step lands green on its own.
+between cards stay with the model. Steps 0 to 8 made the K/V group, the recurrent block, the
+slot arena with its checkpoints, the token rows, the head view and the MTP driver shared
+(`crates/model/src/blocks`; the rule is in `ARCHITECTURE.md`, "The shared model layer"). Design
+study: `/var/tmp/ares-survey/shared-model-layer.md`. Each step lands green on its own.
 - [x] 0. A `blocks` module; the 27B's K/V code moved into it as it is.
 - [x] 1. The K/V group as a block, the 27B onto it (bit for bit, same launches).
 - [x] 2. The recurrent (delta-rule) block, both models onto it (bit for bit).
@@ -129,6 +130,13 @@ between cards stay with the model. Today the two models share almost nothing ins
   (a rejected branch's rows are never read, as now).
 - [ ] 9. Trees in the blocks, verified once for every drafter and both models. Later (the owner, 2026-11-17).
 - [ ] 10. Tree fill from the DFlash lattice, MTP links mixed into a tree. Later.
+- [ ] Flash-Next past the dense limit: a draft window's row that reaches across the point where
+      a tile leaves the newest cells reads that tile exact, the row alone reads it converted
+      (`Group::ahead` is planned for rows within the limit only; the lists are made on the
+      device from the table, which still names the exact entry). A shadow row of the table for
+      such rows would close it.
+- [ ] Flash-Next with several sequences: a generated row is planned alone now (no prefix read
+      together with other sequences); its cost with three sequences was not measured.
 
 ## Qwen3.8 Flash-Next (`qwen4exp`)
 
@@ -724,26 +732,6 @@ Everything `FEATURES.md` lists for the 27B and not for Flash-Next is owed:
       infinity; deciding a level got slower (35 to 42 us); a list of the set's tokens after
       the first cut; on two cards most of the sampler's time on the RTX 3060 is the exchange.
 - [ ] F32 tile kernel is 2.5 times slower than BF16 (untuned).
-
-## Shared model layer (every model; the study `shared-model-layer.md`, steps 0 to 8 done)
-The K/V group, the recurrent block and the slot arena with its checkpoints are shared
-(`crates/model/src/blocks`); the rule for what
-becomes a block is in `ARCHITECTURE.md` ("The shared model layer"). Left, in the study's order:
-- [x] Slot arena and checkpoints as a block (extents from the blocks, save, restore, transfer,
-      page copy over all groups); then the prefix cache of Flash-Next on it (2026-11-16).
-- [x] Token rows (table at home on the host, in the mapped file or on the device; kept rows of
-      a head view; a second row source for images); Flash-Next's embedding from staged rows.
-- [x] One MTP driver for both models (chain on the device, picks by the sampler); the
-      27B's drafts under a layer split; Flash-Next's draft vocabulary and `--drafters mtp`.
-- [x] Drafter kinds in the runtime, taps and DFlash (chains).
-- [ ] Trees in the blocks, tree fill.
-- [ ] Flash-Next past the dense limit: a draft window's row that reaches across the point where
-      a tile leaves the newest cells reads that tile exact, the row alone reads it converted
-      (`Group::ahead` is planned for rows within the limit only; the lists are made on the
-      device from the table, which still names the exact entry). A shadow row of the table for
-      such rows would close it.
-- [ ] Flash-Next with several sequences: a generated row is planned alone now (no prefix read
-      together with other sequences); its cost with three sequences was not measured.
 
 ## Drafters (every model)
 - [ ] Blackwell (the owner, 2026-11-22: an RTX 5060 Ti is ordered for the test machine, next to

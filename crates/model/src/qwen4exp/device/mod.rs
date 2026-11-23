@@ -9,7 +9,12 @@
 //!   recurrent state of every sequence slot, the K/V and key pools of its
 //!   attention layers, the scratch of a step, and [`Part::enqueue`], which
 //!   queues the kernels of a step and does not wait.
-//! - `draft.rs` runs the model's MTP block next to the part that holds the
+//! - [`Qwen4Exp`] (`runtime.rs`) is the model as the runtime and the server
+//!   drive it: a thread per device steps its part, with the expert store's
+//!   tiers behind it (`feed.rs`, `misses.rs`, `board.rs`, `usage.rs`), the
+//!   n-gram rows (`ngram.rs`), the prefix cache's checkpoints (`resume.rs`)
+//!   and a long prompt run layer by layer (`runtime/pass.rs`).
+//! - `mtp.rs` runs the model's MTP block next to the part that holds the
 //!   output head, for a model the runtime drives ([`Qwen4Exp::with_mtp`]).
 //! - `roles.rs` times, when two devices share every layer, the second
 //!   computing a share of the dense parts against it holding experts only,
