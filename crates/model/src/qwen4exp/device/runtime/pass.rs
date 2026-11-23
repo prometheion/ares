@@ -612,6 +612,10 @@ impl Qwen4ExpDevice {
             let direct = |_: u32, _: u32| None;
             for (m, micro) in run.micro.iter().enumerate() {
                 if m > 0 {
+                    // The block sends its records from page-locked buffers that a step's
+                    // following and its newest cells use once each: the micro-batch before
+                    // has to have taken them.
+                    stream.synchronize()?;
                     block.follow(stream, &direct, self.part.pass_residual(m - 1)?)?;
                 }
                 block.step(stream, &micro.segments, &micro.tokens, &micro.replay, None, false)?;

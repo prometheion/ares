@@ -1434,6 +1434,67 @@ fn the_mtp_block_drafts_what_the_reference_drafts_in_every_placement() {
     }
 }
 
+/// The MTP block follows a prompt read layer by layer micro-batch by micro-batch, after the
+/// pass (its last micro-batch at the next step's start, from the residual the pass copies to
+/// the own scratch): its chains after the prompt draft what the reference's draft from the same
+/// cells, in every placement.
+#[test]
+fn the_mtp_block_follows_a_prompt_read_layer_by_layer() {
+    if !enabled() {
+        return;
+    }
+    let prompt = prompt(300, 3);
+    for placement in placements() {
+        let devices = open_devices(placement);
+        let gguf = Gguf::open(gguf_path(1)).unwrap();
+        let n_layer = Config::from_gguf(&gguf).unwrap().n_layer;
+        let mut opts = options(placement, n_layer, 16, MAX_ROWS, 16);
+        opts.pass_rows = 512;
+        let inner = Qwen4Exp::new(gguf, byte_tokenizer(None), "made", &devices, opts, CELLS)
+            .unwrap()
+            .with_mtp(Gguf::open(draft_path(1)).unwrap())
+            .expect("the MTP block fits");
+        let model = Arc::new(inner);
+        let config = RuntimeConfig {
+            pages: 16,
+            cells_per_page: 128,
+            max_slots: SLOTS,
+            window_rows: 8,
+            warm_up: false,
+            ..RuntimeConfig::default()
+        };
+        let made: Arc<dyn Model> = Arc::new(Made(model.clone(), Cache::On));
+        let mut gpu = GpuConfig::new(&config, &*made);
+        gpu.ram_limit += 256 << 20;
+        gpu.vram_headroom = 512 << 20;
+        let runtime = Runtime::start_gpu(made, devices, config, gpu).expect("the runtime starts");
+        model.take_mtp_chains();
+        let answer = ask(&runtime, 1, &prompt, 40);
+        let chains = model.take_mtp_chains();
+        let counters = runtime.snapshot().expect("the runtime is running").counters;
+        let loans = model.take_store_stats().expect("the parts are open").scratch_loans;
+        runtime.shutdown();
+        let (compared, agreed) = chains_against_the_reference(1, &chains, &prompt, &answer);
+        eprintln!(
+            "MTP-PASS {placement:?}: a pass of up to {} rows, {loans} loans; {} chains; against \
+             the reference per link {agreed:?} of {compared:?}; draft rows {}, accepted {}",
+            model.max_rows(),
+            chains.len(),
+            counters.draft_rows,
+            counters.drafts_accepted,
+        );
+        assert!(model.max_rows() > 16 && loans >= 1, "{placement:?}: no pass ran");
+        assert!(compared[0] >= 1, "{placement:?}: no chain to compare");
+        assert!(
+            agreed[0] + compared[0] / 5 + usize::from(compared[0] < 5 && compared[0] > 1)
+                >= compared[0],
+            "{placement:?}: first links agree in {} of {}",
+            agreed[0],
+            compared[0]
+        );
+    }
+}
+
 /// The MTP block follows a prompt read in wide steps whose slices start at
 /// cells where its launches of eight rows do not (in the engine a hit in the
 /// prompt cache leaves such a cell: the first tokens of a chat). Each launch
