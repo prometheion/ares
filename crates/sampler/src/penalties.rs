@@ -177,12 +177,6 @@ impl Corrections {
         }
     }
 
-    /// Whether a row's corrections depend on the tokens before it, as the
-    /// penalties and DRY do and a bias does not.
-    pub fn path_dependent(&self) -> bool {
-        self.penalties.is_on() || self.dry.is_on()
-    }
-
     /// Whether any row has anything to correct.
     pub fn is_on(&self) -> bool {
         self.penalties.is_on() || self.dry.is_on() || !self.bias.is_empty()
