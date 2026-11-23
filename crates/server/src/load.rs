@@ -866,7 +866,8 @@ fn rooms(free: &[u64], footprint: &[Footprint], headroom: u64) -> Vec<Room> {
 }
 
 /// Opens the devices the operator named, or all the driver reports, and says
-/// in the log what each is.
+/// in the log what each is. A device of a class this build does not run
+/// ([`runnable`]) is skipped.
 pub(crate) fn hold_devices(options: &LoadOptions) -> Result<(Vec<u32>, Vec<Held>), LoadError> {
     let known = ares_cuda::devices()?;
     if known.is_empty() {
@@ -903,6 +904,7 @@ pub(crate) fn hold_devices(options: &LoadOptions) -> Result<(Vec<u32>, Vec<Held>
     if ordinals.is_empty() {
         return Err(refuse("--devices names no device"));
     }
+    let ordinals = runnable(&known, &ordinals)?;
     let mut held = Vec::new();
     for ordinal in &ordinals {
         let device = Device::open(*ordinal, Wait::Block)?;
@@ -911,6 +913,29 @@ pub(crate) fn hold_devices(options: &LoadOptions) -> Result<(Vec<u32>, Vec<Held>
         describe(&held[held.len() - 1]);
     }
     Ok((ordinals, held))
+}
+
+/// The devices of `ordinals` (all in `known`) this build runs
+/// ([`DeviceInfo::check_class`]): CUDA runs only on the GPU classes it was tested
+/// on. A device of another class is skipped with a log line while others remain;
+/// when none remains, the load is refused with the reason of each.
+fn runnable(known: &[DeviceInfo], ordinals: &[u32]) -> Result<Vec<u32>, LoadError> {
+    let mut runs = Vec::new();
+    let mut refused = Vec::new();
+    for ordinal in ordinals {
+        let info = known.iter().find(|info| info.ordinal == *ordinal).expect("a known device");
+        match info.check_class() {
+            Ok(()) => runs.push(*ordinal),
+            Err(error) => refused.push(error.to_string()),
+        }
+    }
+    if runs.is_empty() {
+        return Err(refuse(refused.join("\n")));
+    }
+    for reason in &refused {
+        tracing::warn!("skipped: {reason}");
+    }
+    Ok(runs)
 }
 
 static WATCH: OnceLock<Arc<Machine>> = OnceLock::new();
@@ -2042,5 +2067,38 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A device of a class this build does not run is skipped while another
+    /// remains and refused when none does, for every device and for `--devices`.
+    #[test]
+    fn devices_of_a_class_this_build_does_not_run_are_skipped() {
+        let card = |ordinal, compute_capability| DeviceInfo {
+            ordinal,
+            name: format!("Card {ordinal}"),
+            uuid: [0; 16],
+            compute_capability,
+            total_memory: 12 << 30,
+            pci: ares_cuda::PciAddress { domain: 0, bus: ordinal + 1, device: 0 },
+            multiprocessors: 28,
+            memory_bus_width_bits: 192,
+            memory_clock_khz: 7_501_000,
+            max_shared_per_block_optin: 101_376,
+            l2_cache_bytes: 3 << 20,
+        };
+        // No build has code for 7.5 or 6.1: `build.rs` builds nothing below 8.0.
+        let runs = ares_cuda::BUILT_CLASSES[0];
+        let known = [card(0, (7, 5)), card(1, runs), card(2, (6, 1)), card(3, runs)];
+        assert_eq!(runnable(&known, &[0, 1, 2, 3]).unwrap(), [1, 3]);
+        assert_eq!(runnable(&known, &[2, 3]).unwrap(), [3]);
+        assert_eq!(runnable(&known, &[1]).unwrap(), [1]);
+        let refused = runnable(&known, &[0]).unwrap_err().to_string();
+        assert!(refused.starts_with("device 0 (Card 0) has compute capability 7.5"), "{refused}");
+        assert!(refused.contains("through the Vulkan backend"), "{refused}");
+        let refused = runnable(&known, &[2, 0]).unwrap_err().to_string();
+        let lines: Vec<&str> = refused.lines().collect();
+        assert_eq!(lines.len(), 2, "{refused}");
+        assert!(lines[0].starts_with("device 2 (Card 2) has compute capability 6.1"), "{refused}");
+        assert!(lines[1].starts_with("device 0 (Card 0) has compute capability 7.5"), "{refused}");
     }
 }

@@ -66,7 +66,8 @@ OPTIONS:
 
     Where the model goes. What is left out is decided from the devices and the
     model, and the log says how.
-        --devices <LIST>       CUDA devices to use, by the driver's index: 0,1
+        --devices <LIST>       CUDA devices to use, by the driver's index: 0,1; a
+                               GPU of a class this build does not run is skipped
                                [default: all]
         --split <KIND>         single: one device holds the model
                                tensor: every device holds a slice of every block
