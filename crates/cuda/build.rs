@@ -147,10 +147,11 @@ fn classes(nvcc: &Path) -> Vec<u32> {
             );
         }
         if !supported.contains(arch) {
+            let listed: Vec<String> = supported.iter().map(|arch| class_of(*arch)).collect();
             panic!(
-                "{} does not list compute capability {class} (`--list-gpu-arch`); CUDA 13.0 or \
-                 newer is needed",
-                nvcc.display()
+                "{} does not build for compute capability {class}; it lists {}",
+                nvcc.display(),
+                listed.join(", ")
             );
         }
         if !TESTED.contains(arch) {
