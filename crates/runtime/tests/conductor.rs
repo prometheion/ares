@@ -735,7 +735,10 @@ fn end(rt: Runtime, generating: Handle) {
 #[test]
 fn a_prompt_next_to_a_drafting_sequence_is_read_in_pieces_without_draft_rows() {
     let steps: Steps = Arc::default();
-    let (rt, generating) = generating(&steps, 20.0);
+    // A floor the rounds cannot reach: half of the time goes to rounds (at 20
+    // tokens a second the token that rides along in a piece of a few
+    // milliseconds keeps the floor on its own).
+    let (rt, generating) = generating(&steps, 1e6);
     let before = steps.lock().unwrap().len();
     let long = start(&rt, request(&Rng(5).prompt(1000), Some(1))).unwrap();
     long.finish();
