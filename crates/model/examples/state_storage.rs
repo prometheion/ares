@@ -5,16 +5,16 @@
 //! format (`Reference::state_storage`), which is exactly what a state held in
 //! that format does. The exact run keeps them in f32.
 //!
-//! Needs `ARES_TEST_QWEN35_MODEL` (Qwen3.5-0.8B-Q4_K_M.gguf) and
-//! `ARES_TEST_QWEN35_CAPTURE` (the directory of the model crate's capture tool,
-//! for the token ids of three real prompts) and reports itself skipped without
-//! them. It is slow (the CPU reference decodes every weight at every call), so it
-//! runs only with `ARES_TEST_STATE_STORAGE=1`; `ARES_STATE_TOKENS` sets the length
-//! of the sequence (default 1000). Results are printed as `ERR` lines.
+//! It reads the model (Qwen3.5-0.8B-Q4_K_M.gguf) and the directory of the model
+//! crate's capture tool (for the token ids of three real prompts). It is slow
+//! (the CPU reference decodes every weight at every call); `ARES_STATE_TOKENS`
+//! sets the length of the sequence (default 1000), `ARES_STATE_ROWS` the rows
+//! of a step (default 1), and `ARES_STATE_MODE=checkpoint` rounds the state
+//! only every `ARES_STATE_CKPT` tokens (default 250) instead of after every
+//! step.
 //!
 //! ```sh
-//! ARES_TEST_STATE_STORAGE=1 ARES_TEST_QWEN35_MODEL=... ARES_TEST_QWEN35_CAPTURE=/var/tmp/ares-model-capture \
-//!     cargo test --release -p ares-model --test state_storage -- --nocapture
+//! cargo run --release -p ares-model --example state_storage -- MODEL.gguf /var/tmp/ares-model-capture
 //! ```
 
 use std::path::PathBuf;
@@ -62,17 +62,11 @@ struct Bucket {
     agree: usize,
 }
 
-#[test]
-fn state_storage_error_over_a_long_sequence() {
-    if std::env::var_os("ARES_TEST_STATE_STORAGE").is_none() {
-        eprintln!("skipped: set ARES_TEST_STATE_STORAGE=1 (slow)");
-        return;
-    }
-    let (Some(model), Some(capture)) =
-        (std::env::var_os("ARES_TEST_QWEN35_MODEL"), std::env::var_os("ARES_TEST_QWEN35_CAPTURE"))
-    else {
-        eprintln!("skipped: set ARES_TEST_QWEN35_MODEL and ARES_TEST_QWEN35_CAPTURE");
-        return;
+fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let [model, capture] = args.as_slice() else {
+        eprintln!("usage: state_storage MODEL.gguf CAPTURE_DIR");
+        std::process::exit(2);
     };
     let capture = PathBuf::from(capture);
     let total: usize =
@@ -158,8 +152,8 @@ fn state_storage_error_over_a_long_sequence() {
         }
     }
 
-    eprintln!(
-        "ERR state-storage tokens={total} rows_per_step={rows_per_step} mode={}",
+    println!(
+        "state-storage tokens={total} rows_per_step={rows_per_step} mode={}",
         if checkpoint_mode { format!("checkpoint every {ckpt}") } else { "every step".into() }
     );
     for (i, (name, _)) in formats.iter().enumerate() {
@@ -168,8 +162,8 @@ fn state_storage_error_over_a_long_sequence() {
                 continue;
             }
             let n = bucket.logit_samples.max(1) as f64;
-            eprintln!(
-                "ERR {name} tokens {:4}..{:4}: hidden rel_l2 mean {:.2e} max {:.2e}; logits rel_l2 {:.2e}, KL mean {:.2e} max {:.2e}, top-1 agree {}/{}",
+            println!(
+                "{name} tokens {:4}..{:4}: hidden rel_l2 mean {:.2e} max {:.2e}; logits rel_l2 {:.2e}, KL mean {:.2e} max {:.2e}, top-1 agree {}/{}",
                 b * bucket_len,
                 ((b + 1) * bucket_len).min(total),
                 bucket.hidden / bucket.steps as f64,
@@ -193,8 +187,8 @@ fn state_storage_error_over_a_long_sequence() {
                 count += 1;
             }
         }
-        eprintln!(
-            "ERR {name} final matrices rel_l2 vs exact: mean {:.2e} max over blocks {:.2e}",
+        println!(
+            "{name} final matrices rel_l2 vs exact: mean {:.2e} max over blocks {:.2e}",
             mean / count as f64,
             worst
         );
