@@ -423,10 +423,20 @@ prompt (0.98 to 1.00 reads per distinct expert). To be read in its code before i
       or a cancellation comes (or its time as a piece is up) and goes on where it stopped.
       Tested against the reference in every placement and for a request that cuts in (its
       first token after 16 ms where the prompt took 61 to 78 ms, made-up model).
-- [ ] Passes, what is left: read-ahead of the next layer's experts while a layer's
-      micro-batches run (TokenWing's window); a checkpoint of the prefix cache inside a pass
-      (the conductor ends a step where a checkpoint is due, so prompts longer than 16 384
-      fresh tokens are read in passes of at most that); the CPU's share of a pass's misses;
+      Measured locally (IQ2_XS, `--ram 8G`, 17k prompt, A/B against `flash/prompt`): the prompt
+      1.2 times as fast on two cards and 1.2 to 1.6 on one, the tokens after it 1.2 to 1.4
+      times, a request that comes during it its first token after 0.9 to 2.5 s instead of 20
+      to 58 s (ARCHITECTURE.md). Built with it: the CPU's share of a pass of up to 2048 rows;
+      the next layer's experts that no tier holds read into staging while a layer's
+      micro-batches run.
+- [ ] Passes, what is left: **owner's decision:** a checkpoint every 16 384 fresh tokens cuts a
+      prompt, and the anchor cuts its last page off: the rows after a cut are a step that reads
+      nearly every expert again (32k: two passes; 17k: a pass and two steps). Either the pass
+      copies each layer's state into the checkpoint as it goes past the position (to build:
+      a save inside a step in the record, per-layer copies of the slot, the MTP block's and the
+      n-gram history's state there), or the 16 384-token checkpoints go to the end of the pass
+      that passes them (replays from them up to a pass long). Also left: uploads of the next
+      layer's RAM-held experts while a layer's micro-batches run (only file reads go ahead now);
       a pause inside a layer's experts (a request waits for at most one layer's experts);
       the lent wide steps are still there for tile-mean K/V and DFlash, which passes do not
       take. TokenWing's form, read 2026-11-22

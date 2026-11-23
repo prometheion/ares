@@ -6187,6 +6187,40 @@ wider than the parts' own scratch runs as a **pass**:
   (`tests/prefix.rs`: a paused step runs again until its rows are done; a request runs between
   the pieces; a cancelled request gives its paused step up), and the oracle checks that no step
   between reads, saves or restores the paused sequence's state.
+- *The CPU's share* of a pass of up to `cpu_rows` rows (2048): each micro-batch copies its
+  rows' mixed input to the host where they lie among the pass's rows, the misses are split
+  between the CPU and the link from the pass's picks as a wide step's are, and the CPU's sums
+  go into their chunks' rows (`a_prompt_read_layer_by_layer_has_the_cpu_compute_its_misses`).
+- *Where the conductor cuts a pass.* A step ends where a checkpoint is due: every 16 384 fresh
+  tokens and at the anchor (the last page boundary before a prompt's end, or its last
+  `<|im_start|>`). The rows after a cut are a step of their own that picks nearly every expert
+  again: a prompt of 17 000 tokens is a pass of 16 384 rows, a step of 512 and one of 104, and
+  one of 32 768 two passes. A checkpoint inside a pass (each layer's state copied as the pass
+  goes past the position) or checkpoints at the end of a pass instead of every 16 384 tokens
+  would read the experts once for such prompts (see OPEN.md).
+
+*Measured* (2026-11-23, local, the IQ2_XS file through the server, `--ram 8G`, `--context
+40960`, a fresh cache and no usage profile; a prompt of 17 000 tokens of this document with 64
+tokens after it, then the same length of other text with a request of about 40 tokens for 8
+tokens sent 10 s after it; the base is `flash/prompt` (a44474e, lent steps of 4096 rows on two
+cards), both built alike; alternating, the load 2 to 6):
+
+| Cards, round | Build | 17k prompt | Read from the file | Uploads | Tokens/s after it (2-16, 17-32, 33-64) | The short request's first token | The long prompt meanwhile |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Two, 1 | passes | 45.5 s | 53.8 GiB | 43 151 | 11.9, 17.6, 15.5 | 2.45 s | 60.9 s |
+| Two, 1 | base | 55.7 s | 64.2 GiB | 50 628 | 7.5, 9.2, 13.9 | 20.7 s | 51.2 s |
+| Two, 2 | passes | 44.6 s | 54.1 GiB | 43 335 | 11.8, 17.2, 15.0 | 0.91 s | 42.0 s |
+| Two, 2 | base | 52.3 s | 60.2 GiB | 47 171 | 9.9, 15.8, 12.9 | 58.0 s | 104.1 s |
+| One, 1 | passes | 53.5 s | 72.9 GiB | 57 517 | 8.8, 13.3, 9.8 | 1.68 s | 55.9 s |
+| One, 1 | base | 83.8 s | 78.8 GiB | 63 992 | 4.8, 9.9, 8.9 | 27.7 s | 66.2 s |
+| One, 2 | passes | 54.9 s | 73.5 GiB | 58 186 | 8.7, 12.7, 9.4 | 1.72 s | 55.4 s |
+| One, 2 | base | 67.1 s | 79.0 GiB | 63 873 | 5.9, 10.5, 9.3 | 27.4 s | 65.9 s |
+
+On these cards the prompt is bound by the drive (54 GiB in 45 s); a pass reads 6 to 16 % less
+of it here because the 16 384-row cut and the anchor make two more steps that read most experts
+again. The tokens right after the prompt are 1.2 to 1.4 times as fast (the loan of a pass of
+16 384 rows is 0.9 GiB where a lent step of 4096 rows took 2 GiB of slots), and a request that
+comes during the prompt gets its first token after 0.9 to 2.5 s instead of 20 to 58 s.
 
 ### Vulkan
 
