@@ -105,8 +105,8 @@ runs yet.
   cap (a request above it is cut and the reply says so). `/v1/models` shows what is in effect.
 
 ## Output control
-- Reasoning: `reasoning_content` in and out, `--reasoning`, `--reasoning-effort`,
-  `--reasoning-preserve`.
+- Reasoning: `reasoning_content` in and out, `--reasoning`, `--reasoning-format`,
+  `--reasoning-effort`, `--reasoning-preserve`.
 - Thinking budget: `reasoning_budget_tokens` (and llama.cpp's, vLLM's and Anthropic's names),
   `--reasoning-budget-tokens`, `--reasoning-budget-message`; the thinking ends at the budget and
   the answer follows. A loop in the thinking ends it; one token repeated 256 times ends a reply.

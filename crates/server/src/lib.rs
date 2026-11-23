@@ -6,7 +6,9 @@
 //!
 //! [`router`] turns any [`Engine`] into an OpenAI-compatible server:
 //! `/v1/chat/completions`, `/v1/completions` (plain and streamed), `/v1/models`,
-//! `/health` and `/metrics`, into a server of Anthropic's Messages API on
+//! `/health` and `/metrics`, llama-server's `/props`, `/tokenize` and
+//! `/detokenize`, and the routes of router mode (`/models/load`,
+//! `/models/unload`, `/models/sse`), into a server of Anthropic's Messages API on
 //! `POST /v1/messages` and `/v1/messages/count_tokens` (the `anthropic`
 //! module: a Messages request runs as the chat request that asks the same),
 //! into a server of OpenAI's Responses API without state on
@@ -34,10 +36,11 @@
 //!
 //! `/v1/systemone` has the request and response of llama.cpp's endpoint of
 //! that name (the TypeSafe System One API): typed questions about a `state`,
-//! answered by choosing among options. It is served for every model ("Jev
-//! mode"), and the `systemone` module says how the options that only a native
-//! decision model has are handled. Decisions and generation requests run at
-//! the same time and neither waits for the other.
+//! answered by choosing among options. It is meant for every model ("Jev
+//! mode"); the runtime does not decide yet, so it answers 501 today. The
+//! `systemone` module says how the options that only a native decision model
+//! has are handled. Decisions and generation requests run at the same time
+//! and neither waits for the other.
 //!
 //! The one non-obvious piece is the hand-over between the engine's threads
 //! and the async handlers, documented in the `bridge` module: what happens

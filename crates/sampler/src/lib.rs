@@ -12,7 +12,7 @@
 //! - the penalties and the DRY penalty ([`penalties`]), which the host turns
 //!   into corrections of the logits before the device picks.
 //!
-//! The kernels themselves are in `ares-cuda`.
+//! The kernels themselves are in `ares-cuda` and `ares-vulkan`.
 
 pub mod arith;
 pub mod mask;

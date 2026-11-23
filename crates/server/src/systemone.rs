@@ -7,8 +7,9 @@
 //! this reads the request from a generic [`Json`] value, to name the field in
 //! every error (`questions.route.criteria must be an object ...`).
 //!
-//! Any model answers here ("Jev mode"), so the options that only make sense
-//! for native decision models are accepted and handled as follows:
+//! Any model is meant to answer here ("Jev mode"; the runtime does not decide
+//! yet and the route answers 501), so the options that only make sense for
+//! native decision models are accepted and handled as follows:
 //!
 //! * **No model is needed in the request.** llama.cpp serves one model and
 //!   ignores `model` (a router reads it). Here `model` selects the model as

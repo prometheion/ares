@@ -1342,10 +1342,15 @@ copied into every file. About 4,000 to 5,000 lines can go without changing behav
 - [ ] Defects first: the watchdog's blind device waits (in `sched/parallel`); a server test that
       writes the user's `~/.cache/ares`; a type list that must match a kernel by hand; Flash-Next
       tests scheduling with another price estimate than production; two options missing in `--help`.
+      Done on `cleanup/server-model`: the cache, the Flash-Next tests' estimate, `--help`.
 - [ ] Phase 1 (no conflict with the branches in flight): server test helpers and handler copies,
       `Models::Fixed`, dead code; one table of weight types in `ares-cuda`, dead kernels, test
       helpers; the replaced "pass in waves" design, copied quota code, unused public API in the
       runtime; the file layer written four times and test copies in `ares-model`. System One stays.
+      Server and model part done on `cleanup/server-model`; moved to phase 2 from it:
+      `Models::Fixed` (mock engines answer to several names, which a router of one preset does
+      not: decide the names first), `plan::default_ram` and `parse_available_ram` (`plan.rs`,
+      `load.rs`), one segmenter for the blocks of Messages and the items of Responses.
 - [ ] Phase 2 (after `kv/overflow`, `flash/ssd-stream`, `attn/long-context`, `sched/parallel`):
       one driver of Flash-Next's parts, the step record decoded once, one memory policy, budgets in
       one place, the conductor split, the two model loaders of the server, shared device helpers.

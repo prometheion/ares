@@ -46,9 +46,11 @@
 //!
 //! - llama.cpp invents a beginning-of-text token (id 11) for a model that has
 //!   none; here there is none.
-//! - A conversation is rendered, not continued: llama.cpp's `continue_final_message`
-//!   and the prefilling of an assistant message, images in messages, and the
-//!   variables `datetime` and `date_string` are not supported.
+//! - A conversation is rendered, not continued, and its messages are text:
+//!   llama.cpp's `continue_final_message`, the prefilling of an assistant
+//!   message and images are built above this crate (`ares-model`'s chat code
+//!   marks where a prompt ends and where an image's rows go); the variables
+//!   `datetime` and `date_string` are not supported.
 //! - In templates, a few things follow MiniJinja where llama.cpp does something
 //!   else: `~` and `+` write floats, lists and mappings their own way; an index
 //!   into a string (`s[0]`, `s[-1]`) is by character where llama.cpp indexes
