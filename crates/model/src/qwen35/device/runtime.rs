@@ -7,12 +7,12 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ares_api::{ChatFormat, EngineError, ModelCard, Prompt};
-use ares_cuda::{DevicePtr, ENTRY_CELLS, PushSlot, Segment, Stream};
+use ares_cuda::{DevicePtr, ENTRY_CELLS, Segment, Stream};
 use ares_gguf::Gguf;
 use ares_runtime::{
     ContextSpec, DeviceContext, DeviceModel, DeviceTransfer, Drafter, DrafterKind, Durable,
-    LinkSpec, Links, Logits, Model, ModelDrafts, ModelError, PrefixCache, Split, StepContext,
-    TowerJob, TransferContext, Vision,
+    LinkSpec, Logits, Model, ModelDrafts, ModelError, PrefixCache, Split, StepContext, TowerJob,
+    TransferContext, Vision,
 };
 use ares_state::PageLayout;
 use ares_tokenizer::{ChatOptions, Tokenizer};

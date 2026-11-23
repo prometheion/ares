@@ -275,7 +275,7 @@ struct Marks {
 
 /// The paths to the other devices, as a part uses them: the runtime's links
 /// seen from device `index`, whose stream waits for them.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct Exchange<'a> {
     pub links: &'a Links,
     pub index: usize,
