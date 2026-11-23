@@ -123,6 +123,9 @@ kernels for cold experts (Q8_0 +55 %, IQ4_XS +33 %, Q4_K +27 %), host K/V offloa
 mid-size cards, a GPU+SSD-only mode, and a fix for NaN outputs on prompts of 24k to 45k. The test
 machine's Strata is updated to the newest engine before every comparison; numbers against older
 engines below are history.
+On 2026-11-23 engine 0.1.66 failed Strata's own test start on the test machine ("verify: layer 0
+never rang (operation not supported on global/shared address space)", its CUDA graph capture);
+Strata kept 0.1.65, which the comparisons use until a newer engine starts there.
 - [x] **Crash** with the MTP block (`--drafters` the q2 block): "writing K and V reported status 0x4
       in the step before" (a row written straight into a converted entry of a tile-mean format;
       only the MTP block's K/V is `q4`) at the end of a long prompt after a few requests, 6 of 6
