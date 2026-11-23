@@ -1163,6 +1163,23 @@ them), cached turns, one request alone. What it does worse, and why:
   (three of four runs): its prompt went into the same batches as the long one, since concurrent
   prefill starts only once a slot generates. Ares in the same spot: 0.15-0.75 s.
 
+## Cleanup (the owner, 2026-11-23: the code must be clean although agents wrote it)
+Audit of main e6d7676 by area, reports and the plan in `/var/tmp/ares-audit/` (`PLAN.md`). The core
+designs are sound (the shared blocks, one reader and core for all routes, one record writer and
+reader, an independent host oracle); the debt is where the code grew: copied bookkeeping beside
+each new path, replaced designs left behind for a bench or a test, hand-kept lists, test helpers
+copied into every file. About 4,000 to 5,000 lines can go without changing behaviour.
+- [ ] Defects first: the watchdog's blind device waits (in `sched/parallel`); a server test that
+      writes the user's `~/.cache/ares`; a type list that must match a kernel by hand; Flash-Next
+      tests scheduling with another price estimate than production; two options missing in `--help`.
+- [ ] Phase 1 (no conflict with the branches in flight): server test helpers and handler copies,
+      `Models::Fixed`, dead code; one table of weight types in `ares-cuda`, dead kernels, test
+      helpers; the replaced "pass in waves" design, copied quota code, unused public API in the
+      runtime; the file layer written four times and test copies in `ares-model`. System One stays.
+- [ ] Phase 2 (after `kv/overflow`, `flash/ssd-stream`, `attn/long-context`, `sched/parallel`):
+      one driver of Flash-Next's parts, the step record decoded once, one memory policy, budgets in
+      one place, the conductor split, the two model loaders of the server, shared device helpers.
+
 ## Owed on two cards (the owner's cards are production; run when the owner frees them)
 Run on 2026-11-22 evening (main c5d27e9, RTX 4070 + RTX 3060, peer access, load about 30 from
 the agents' builds):
