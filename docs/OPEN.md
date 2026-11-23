@@ -1072,6 +1072,9 @@ the agents' builds):
       threads spinning; the `moe/prompt-chunks` agent); with `--test-threads=1` it passes.
 
 ## Decided by the owner (2026-11-22)
+- Inkling 2 Mini in Ares comes after the 27B and Flash-Next are at least as fast as the fork and
+  Strata in everything (the owner, 2026-11-23); the test of Inkling on Strata goes on only as a
+  judgement of the model.
 - Ares stays (the owner, 2026-11-23, after the comparison with Strata 0.1.65 on the test machine:
   Flash-Next UD-Q3_K_XL at 40 GiB decodes 34.4 / 25.3 tokens/s with / without drafts against
   Strata's 22.0 / 20.2, but reads prompts at 178 / 260 / 291 against 241 / 796 / 1159 tokens/s and
