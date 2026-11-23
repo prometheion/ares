@@ -5157,8 +5157,15 @@ so nothing idle in VRAM needs lending.
   cannot do without its cells, and the broker's own rule says so. Far pages
   that only the prompt cache holds rank as prompt cache, the lowest (the
   owner's answer of 2026-11-22; see "Host memory"): they leave the devices first
-  when it must give memory back, and a piece is unlocked once no page in use
-  lies in it. The device
+  when it must give memory back, into RAM where it has room and otherwise
+  nowhere, and a piece is unlocked once no page in use lies in it. Such a page
+  never waits for the drive: a long request leaves hundreds of them at once
+  (490 after a prompt of 80 507 tokens), and with a wait for the writer to free
+  a buffer of RAM for each (up to a quarter of a second) the conductor ran no
+  step and answered no command for half a minute while the next request
+  waited (seen in the merge check of 2026-11-23; `cache.rs`
+  `far_pages_that_find_no_room_in_ram_are_dropped_without_waiting_for_the_drive`).
+  The device
   threads keep the books of which pages the tables name (and which a transfer
   brings in) and the first part to begin a step for the store locks the pieces
   the step reaches (`Flow::lock_far`) before the store's step begins: when the
@@ -7178,7 +7185,7 @@ without a limit that was named.
 | K and V of running sequences beyond VRAM (Flash-Next: the pages from the plan's `near` on, `blocks/far.rs`) | Required, as it is used | Never gives way. It grows in pieces (about 64 MiB over all attention layers) as the sequences reach far pages and shrinks when no page in use lies in a piece; the step that needs a piece makes the tier of experts give it up first (see "K and V beyond VRAM") |
 | RAM tier of MoE experts | Elastic, the highest | Gets all that is not required, as far as it can use it, and is the last to shrink: it gives pieces back only when the prompt cache has nothing left in RAM |
 | Staging of the experts on their way from the file into transit | Part of the tier | The pieces that hold it are never given up |
-| Prompt cache in RAM (checkpoints of recurrent state, the pages that left the devices, and the K and V beyond VRAM of pages that only the prompt cache holds on the devices) | Elastic, the lowest | Goes first: the far pages only it holds leave the devices first (into RAM when its allowance has room, otherwise to the drive with `--cache` or nowhere); what the devices or the drive also hold goes at once; what only RAM holds is written to the drive first with `--cache` and goes when it is written, down to the floor above; without `--cache` it goes at once, down to its one checkpoint place |
+| Prompt cache in RAM (checkpoints of recurrent state, the pages that left the devices, and the K and V beyond VRAM of pages that only the prompt cache holds on the devices) | Elastic, the lowest | Goes first: the far pages only it holds leave the devices first (into RAM when its allowance has room, otherwise nowhere: they never wait for the drive); what the devices or the drive also hold goes at once; what only RAM holds is written to the drive first with `--cache` and goes when it is written, down to the floor above; without `--cache` it goes at once, down to its one checkpoint place |
 
 Nothing is reserved for the K and V beyond VRAM: they take their memory when
 a sequence reaches them, from the elastic users, as the broker's own rule for
