@@ -7,78 +7,18 @@ mod common;
 
 use std::sync::Arc;
 
-use ares_api::{
-    ChatFormat, DecisionRequest, DecisionSink, Engine, EngineError, EngineStats, EventSink,
-    FinishReason, GenerateRequest, ModelCard, Prompt, RequestId, Role, Shape, Start,
-    ThinkingFormat, ToolFormat,
-};
+use ares_api::{ChatFormat, FinishReason, GenerateRequest, Prompt, Role, Shape, Start};
 use axum::http::StatusCode;
 use common::*;
 use serde_json::{Value, json};
 
 const CHAT: &str = "/v1/chat/completions";
 
-/// The scripted engine, with a model that declares `format`.
-struct Declaring {
-    inner: Arc<MockEngine>,
-    format: ChatFormat,
-}
-
-impl Engine for Declaring {
-    fn models(&self) -> Vec<ModelCard> {
-        self.inner.models()
-    }
-
-    fn chat_format(&self, model: &str) -> Option<ChatFormat> {
-        (model == "mock").then(|| self.format.clone())
-    }
-
-    fn submit(&self, request: GenerateRequest, events: EventSink) -> Result<(), EngineError> {
-        self.inner.submit(request, events)
-    }
-
-    fn decide(&self, request: DecisionRequest, outcome: DecisionSink) -> Result<(), EngineError> {
-        self.inner.decide(request, outcome)
-    }
-
-    fn cancel(&self, id: RequestId) {
-        self.inner.cancel(id);
-    }
-
-    fn stats(&self) -> Option<EngineStats> {
-        self.inner.stats()
-    }
-}
-
-/// What the template of Qwen3.8 declares.
-fn qwen() -> ChatFormat {
-    ChatFormat {
-        thinking: Some(ThinkingFormat {
-            start: "<think>\n".into(),
-            end: "\n</think>\n\n".into(),
-            prompt_on: "<think>\n".into(),
-            prompt_off: "<think>\n\n</think>\n\n".into(),
-            on_by_default: true,
-            effort: true,
-            refused_efforts: Vec::new(),
-        }),
-        tools: Some(ToolFormat {
-            call_open: "<tool_call>\n<function=".into(),
-            name_close: ">\n".into(),
-            param_open: "<parameter=".into(),
-            key_close: ">\n".into(),
-            param_close: "\n</parameter>\n".into(),
-            call_close: "</function>\n</tool_call>".into(),
-            before_calls: "\n\n".into(),
-            between_calls: "\n".into(),
-        }),
-    }
-}
-
 fn serve(steps: Vec<Step>, format: ChatFormat) -> (Arc<MockEngine>, axum::Router) {
-    let inner = MockEngine::script(steps);
-    let engine = Declaring { inner: inner.clone(), format };
-    (inner, ares_server::router_with(Arc::new(engine), ares_server::Config::default()))
+    let engine = MockEngine::script(steps);
+    engine.set_chat_format(format);
+    let app = app(&engine);
+    (engine, app)
 }
 
 fn tools() -> Value {
@@ -98,27 +38,15 @@ fn tools() -> Value {
 }
 
 fn chat(extra: Value) -> String {
-    let mut body = json!({
-        "model": "mock",
-        "messages": [{"role": "user", "content": "How is the weather in Köln?"}],
-        "tools": tools(),
-    });
-    body.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
-    body.to_string()
+    merged(
+        json!({
+            "model": "mock",
+            "messages": [{"role": "user", "content": "How is the weather in Köln?"}],
+            "tools": tools(),
+        }),
+        extra,
+    )
 }
-
-/// The reply of a model in pieces of `size` characters, ended by `finish`.
-fn says(reply: &str, size: usize, finish: FinishReason) -> Vec<Step> {
-    let chars: Vec<char> = reply.chars().collect();
-    let mut steps: Vec<Step> =
-        chars.chunks(size).map(|piece| text(&piece.iter().collect::<String>())).collect();
-    steps.push(done(finish, 20, chars.len() as u32));
-    steps
-}
-
-const THINKS: &str = "The user asks for the weather.\n</think>\n\n";
-const CALL: &str = "<tool_call>\n<function=get_weather>\n<parameter=city>\nKöln\n</parameter>\n<parameter=days>\n3\n</parameter>\n</function>\n</tool_call>";
-const NOW: &str = "<tool_call>\n<function=now>\n</function>\n</tool_call>";
 
 /// A reply as a client puts it together.
 #[derive(Debug, Default, PartialEq)]

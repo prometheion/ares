@@ -7,9 +7,7 @@ mod common;
 use std::sync::Arc;
 
 use ares_api::{
-    ChatFormat, DecisionRequest, DecisionSink, Engine, EngineError, EngineStats, Event, EventSink,
-    FinishReason, GenerateRequest, Json, ModelCard, Prompt, RequestId, Role, Shape, Start,
-    ThinkingFormat, ToolFormat, Usage,
+    ChatFormat, EngineError, FinishReason, GenerateRequest, Json, Prompt, Role, Shape, Start,
 };
 use axum::Router;
 use axum::body::Body;
@@ -24,80 +22,14 @@ const COUNT: &str = "/v1/responses/input_tokens";
 const CHAT: &str = "/v1/chat/completions";
 const CHAT_COUNT: &str = "/v1/chat/completions/input_tokens";
 
-/// What stands for the tokens of a prompt in these tests: the bytes of the
-/// prompt as the engine was given it.
-fn tokens(prompt: &Prompt) -> u32 {
-    serde_json::to_string(prompt).unwrap().len() as u32
-}
-
-/// The scripted engine, with a model that declares `format` and counts.
-struct Declaring {
-    inner: Arc<MockEngine>,
-    format: Option<ChatFormat>,
-}
-
-impl Engine for Declaring {
-    fn models(&self) -> Vec<ModelCard> {
-        self.inner.models()
-    }
-
-    fn chat_format(&self, model: &str) -> Option<ChatFormat> {
-        (model == "mock").then(|| self.format.clone()).flatten()
-    }
-
-    fn count_tokens(&self, model: &str, prompt: &Prompt) -> Result<u32, EngineError> {
-        if model != "mock" {
-            return Err(EngineError::ModelNotFound(model.to_owned()));
-        }
-        Ok(tokens(prompt))
-    }
-
-    fn submit(&self, request: GenerateRequest, events: EventSink) -> Result<(), EngineError> {
-        self.inner.submit(request, events)
-    }
-
-    fn decide(&self, request: DecisionRequest, outcome: DecisionSink) -> Result<(), EngineError> {
-        self.inner.decide(request, outcome)
-    }
-
-    fn cancel(&self, id: RequestId) {
-        self.inner.cancel(id);
-    }
-
-    fn stats(&self) -> Option<EngineStats> {
-        self.inner.stats()
-    }
-}
-
-/// What the template of Qwen3.8 declares.
-fn qwen() -> ChatFormat {
-    ChatFormat {
-        thinking: Some(ThinkingFormat {
-            start: "<think>\n".into(),
-            end: "\n</think>\n\n".into(),
-            prompt_on: "<think>\n".into(),
-            prompt_off: "<think>\n\n</think>\n\n".into(),
-            on_by_default: true,
-            effort: true,
-            refused_efforts: Vec::new(),
-        }),
-        tools: Some(ToolFormat {
-            call_open: "<tool_call>\n<function=".into(),
-            name_close: ">\n".into(),
-            param_open: "<parameter=".into(),
-            key_close: ">\n".into(),
-            param_close: "\n</parameter>\n".into(),
-            call_close: "</function>\n</tool_call>".into(),
-            before_calls: "\n\n".into(),
-            between_calls: "\n".into(),
-        }),
-    }
-}
-
 fn serve_with(steps: Vec<Step>, format: Option<ChatFormat>) -> (Arc<MockEngine>, Router) {
-    let inner = MockEngine::script(steps);
-    let engine = Declaring { inner: inner.clone(), format };
-    (inner, ares_server::router_with(Arc::new(engine), ares_server::Config::default()))
+    let engine = MockEngine::script(steps);
+    if let Some(format) = format {
+        engine.set_chat_format(format);
+    }
+    engine.set_counting();
+    let app = app(&engine);
+    (engine, app)
 }
 
 fn serve(steps: Vec<Step>) -> (Arc<MockEngine>, Router) {
@@ -122,23 +54,8 @@ fn tools() -> Value {
 }
 
 fn body(extra: Value) -> String {
-    let mut body = json!({"model": "mock", "input": "How is the weather in Köln?"});
-    body.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
-    body.to_string()
+    merged(json!({"model": "mock", "input": "How is the weather in Köln?"}), extra)
 }
-
-/// The reply of a model in pieces of `size` characters, ended by `finish`.
-fn says(reply: &str, size: usize, finish: FinishReason) -> Vec<Step> {
-    let chars: Vec<char> = reply.chars().collect();
-    let mut steps: Vec<Step> =
-        chars.chunks(size).map(|piece| text(&piece.iter().collect::<String>())).collect();
-    steps.push(done(finish, 20, chars.len() as u32));
-    steps
-}
-
-const THINKS: &str = "The user asks for the weather.\n</think>\n\n";
-const CALL: &str = "<tool_call>\n<function=get_weather>\n<parameter=city>\nKöln\n</parameter>\n<parameter=days>\n3\n</parameter>\n</function>\n</tool_call>";
-const NOW: &str = "<tool_call>\n<function=now>\n</function>\n</tool_call>";
 
 /// What switches the thinking of a request off.
 fn no_thinking() -> Value {
@@ -586,13 +503,12 @@ async fn reasoning_is_switched_by_the_request_and_comes_back_as_an_item() {
 #[tokio::test]
 async fn the_reasoning_is_an_item_whatever_the_format_of_the_chat_route() {
     // `--reasoning-format none` is about reasoning_content.
-    let inner = MockEngine::script(says(&format!("{THINKS}Mild."), 7, FinishReason::Stop));
-    let engine = Declaring { inner, format: Some(qwen()) };
+    let engine = MockEngine::script(says(&format!("{THINKS}Mild."), 7, FinishReason::Stop)).qwen();
     let config = ares_server::Config {
         reasoning_format: ares_server::ReasoningFormat::None,
         ..ares_server::Config::default()
     };
-    let app = ares_server::router_with(Arc::new(engine), config);
+    let app = app_with(&engine, config);
     let (status, response) = json(post(&app, RESPONSES, &body(json!({}))).await).await;
     assert_eq!(status, StatusCode::OK, "{response}");
     let kinds: Vec<&str> = response["output"]
@@ -945,9 +861,7 @@ async fn failures_have_the_status_and_the_shape_of_the_chat_route() {
         // has not started then, and gets the status too.
         for plan in [Plan::Reject(error.clone()), Plan::Script(vec![fail(error.clone())])] {
             for stream in [false, true] {
-                let engine =
-                    Declaring { inner: MockEngine::new(plan.clone()), format: Some(qwen()) };
-                let app = ares_server::router(Arc::new(engine));
+                let app = common::app(&MockEngine::new(plan.clone()).qwen());
                 refused(&app, RESPONSES, &body(json!({"stream": stream})), status, code).await;
             }
         }
@@ -1019,17 +933,17 @@ async fn a_client_that_leaves_cancels_its_request_in_the_engine() {
 #[tokio::test]
 async fn a_stream_starts_while_the_engine_computes_a_long_prompt() {
     let gate = Gate::default();
-    let inner = MockEngine::script(vec![
+    let engine = MockEngine::script(vec![
         Step::Wait(gate.clone()),
         text("Hallo."),
         done(FinishReason::Stop, 20, 2),
-    ]);
-    let engine = Declaring { inner, format: Some(qwen()) };
+    ])
+    .qwen();
     let config = ares_server::Config {
         stream_wait: std::time::Duration::from_millis(50),
         ..ares_server::Config::default()
     };
-    let app = ares_server::router_with(Arc::new(engine), config);
+    let app = app_with(&engine, config);
     let mut extra = no_thinking();
     extra["stream"] = json!(true);
     let response = post(&app, RESPONSES, &body(extra)).await;
@@ -1047,42 +961,6 @@ async fn a_stream_starts_while_the_engine_computes_a_long_prompt() {
 
 // --- the counts ------------------------------------------------------------------
 
-/// An engine that reports for a request the count it gives for its prompt.
-struct Counting;
-
-impl Engine for Counting {
-    fn models(&self) -> Vec<ModelCard> {
-        vec![ModelCard { id: "mock".into(), context_length: 4096, created: 0 }]
-    }
-
-    fn chat_format(&self, _: &str) -> Option<ChatFormat> {
-        Some(qwen())
-    }
-
-    fn count_tokens(&self, _: &str, prompt: &Prompt) -> Result<u32, EngineError> {
-        Ok(tokens(prompt))
-    }
-
-    fn submit(&self, request: GenerateRequest, events: EventSink) -> Result<(), EngineError> {
-        let usage = Usage {
-            prompt_tokens: tokens(&request.prompt),
-            completion_tokens: 1,
-            ..Usage::default()
-        };
-        std::thread::spawn(move || {
-            events.send(Event::Text("ok".into()));
-            events.send(Event::Done { finish: FinishReason::Stop, usage });
-        });
-        Ok(())
-    }
-
-    fn decide(&self, _: DecisionRequest, _: DecisionSink) -> Result<(), EngineError> {
-        Err(EngineError::Unsupported("no decisions".into()))
-    }
-
-    fn cancel(&self, _: RequestId) {}
-}
-
 /// The answer of a count: its one number.
 async fn counted(app: &Router, path: &str, body: &str) -> u64 {
     let (status, counted) = json(post(app, path, body).await).await;
@@ -1094,7 +972,7 @@ async fn counted(app: &Router, path: &str, body: &str) -> u64 {
 
 #[tokio::test]
 async fn the_count_of_a_request_is_the_input_the_same_request_reports_when_run() {
-    let app = ares_server::router(Arc::new(Counting));
+    let app = common::app(&counting());
     let conversation = json!([
         {"role": "developer", "content": "You are a coding agent."},
         {"role": "user", "content": [{"type": "input_text", "text": "Weather in Köln?"}]},
@@ -1135,7 +1013,7 @@ async fn the_count_of_a_request_is_the_input_the_same_request_reports_when_run()
 
 #[tokio::test]
 async fn the_count_of_a_chat_request_is_the_prompt_the_same_request_reports_when_run() {
-    let app = ares_server::router(Arc::new(Counting));
+    let app = common::app(&counting());
     let chat_tools = json!([{"type": "function", "function": {
         "name": "get_weather",
         "parameters": {"type": "object", "properties": {"city": {"type": "string"}}},
@@ -1196,7 +1074,7 @@ async fn a_count_generates_nothing_and_needs_an_engine_that_counts() {
     refused(&app, COUNT, &unknown, StatusCode::NOT_FOUND, "model_not_found").await;
 
     // The scripted engine alone does not count.
-    let plain = ares_server::router(MockEngine::script(vec![done(FinishReason::Stop, 1, 0)]));
+    let plain = common::app(&instant());
     for (path, body) in [(COUNT, body(json!({}))), (CHAT_COUNT, chat.to_string())] {
         let message =
             refused(&plain, path, &body, StatusCode::NOT_IMPLEMENTED, "not_implemented").await;

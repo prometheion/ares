@@ -447,7 +447,7 @@ async fn metrics_have_the_times_of_the_requests() {
 
 #[tokio::test]
 async fn a_body_that_does_not_come_is_given_up() {
-    let engine = MockEngine::script(vec![done(FinishReason::Stop, 1, 0)]);
+    let engine = instant();
     let config = ares_server::Config { timeout: Duration::from_millis(100), ..Default::default() };
     let app = app_with(&engine, config);
     let never = futures_util::stream::pending::<Result<axum::body::Bytes, std::io::Error>>();

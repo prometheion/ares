@@ -40,9 +40,7 @@ fn routes() -> [(&'static str, Value); 4] {
 }
 
 fn body(base: &Value, extra: Value) -> String {
-    let mut body = base.clone();
-    body.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
-    body.to_string()
+    merged(base.clone(), extra)
 }
 
 /// The defaults that the options `given` set, as the command line reads them.

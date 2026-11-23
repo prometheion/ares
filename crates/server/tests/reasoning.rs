@@ -5,10 +5,7 @@ mod common;
 
 use std::sync::Arc;
 
-use ares_api::{
-    ChatFormat, DecisionRequest, DecisionSink, Engine, EngineError, EngineStats, EventSink,
-    FinishReason, GenerateRequest, Json, ModelCard, Prompt, RequestId, ThinkingFormat,
-};
+use ares_api::{ChatFormat, FinishReason, Json, Prompt, ThinkingFormat};
 use ares_server::{Config, ReasoningFormat};
 use axum::http::StatusCode;
 use common::*;
@@ -16,58 +13,15 @@ use serde_json::{Value, json};
 
 const CHAT: &str = "/v1/chat/completions";
 
-/// The scripted engine, with a model that declares `format`.
-struct Declaring {
-    inner: Arc<MockEngine>,
-    format: ChatFormat,
-}
-
-impl Engine for Declaring {
-    fn models(&self) -> Vec<ModelCard> {
-        self.inner.models()
-    }
-
-    fn chat_format(&self, model: &str) -> Option<ChatFormat> {
-        (model == "mock").then(|| self.format.clone())
-    }
-
-    fn submit(&self, request: GenerateRequest, events: EventSink) -> Result<(), EngineError> {
-        self.inner.submit(request, events)
-    }
-
-    fn decide(&self, request: DecisionRequest, outcome: DecisionSink) -> Result<(), EngineError> {
-        self.inner.decide(request, outcome)
-    }
-
-    fn cancel(&self, id: RequestId) {
-        self.inner.cancel(id);
-    }
-
-    fn stats(&self) -> Option<EngineStats> {
-        self.inner.stats()
-    }
-}
-
-fn qwen() -> ThinkingFormat {
-    ThinkingFormat {
-        start: "<think>\n".into(),
-        end: "\n</think>\n\n".into(),
-        prompt_on: "<think>\n".into(),
-        prompt_off: "<think>\n\n</think>\n\n".into(),
-        on_by_default: true,
-        effort: true,
-        refused_efforts: Vec::new(),
-    }
-}
-
 fn serve(
     steps: Vec<Step>,
     thinking: Option<ThinkingFormat>,
     config: Config,
 ) -> (Arc<MockEngine>, axum::Router) {
-    let inner = MockEngine::script(steps);
-    let engine = Declaring { inner: inner.clone(), format: ChatFormat { thinking, tools: None } };
-    (inner, ares_server::router_with(Arc::new(engine), config))
+    let engine = MockEngine::script(steps);
+    engine.set_chat_format(ChatFormat { thinking, tools: None });
+    let app = app_with(&engine, config);
+    (engine, app)
 }
 
 /// What a model that thinks says: the reasoning, the end of it, the answer.
@@ -83,9 +37,7 @@ fn reply() -> Vec<Step> {
 }
 
 fn chat(extra: Value) -> String {
-    let mut body = json!({"model": "mock", "messages": [{"role": "user", "content": "2 + 2?"}]});
-    body.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
-    body.to_string()
+    merged(json!({"model": "mock", "messages": [{"role": "user", "content": "2 + 2?"}]}), extra)
 }
 
 async fn refused(app: &axum::Router, extra: Value) -> Value {
@@ -96,7 +48,7 @@ async fn refused(app: &axum::Router, extra: Value) -> Value {
 
 #[tokio::test]
 async fn the_reasoning_of_an_answer_is_returned_apart_from_the_content() {
-    let (_, app) = serve(reply(), Some(qwen()), Config::default());
+    let (_, app) = serve(reply(), Some(qwen_thinking()), Config::default());
     let (status, body) = json(post(&app, CHAT, &chat(json!({}))).await).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let message = &body["choices"][0]["message"];
@@ -107,7 +59,7 @@ async fn the_reasoning_of_an_answer_is_returned_apart_from_the_content() {
 
 #[tokio::test]
 async fn the_reasoning_of_a_stream_comes_in_deltas_of_its_own() {
-    let (_, app) = serve(reply(), Some(qwen()), Config::default());
+    let (_, app) = serve(reply(), Some(qwen_thinking()), Config::default());
     let body = chat(json!({"stream": true, "stream_options": {"include_usage": true}}));
     let stream = parse_sse(&body_text(post(&app, CHAT, &body).await).await);
     assert!(stream.done);
@@ -132,7 +84,7 @@ async fn the_reasoning_of_a_stream_comes_in_deltas_of_its_own() {
 async fn text_that_may_be_a_tag_waits_for_the_next_piece() {
     let steps =
         vec![text("Fine\n</th"), text("ink>\n"), text("\nSo."), done(FinishReason::Stop, 1, 5)];
-    let (_, app) = serve(steps, Some(qwen()), Config::default());
+    let (_, app) = serve(steps, Some(qwen_thinking()), Config::default());
     let stream =
         parse_sse(&body_text(post(&app, CHAT, &chat(json!({"stream": true}))).await).await);
     let deltas: Vec<&Value> =
@@ -144,7 +96,7 @@ async fn text_that_may_be_a_tag_waits_for_the_next_piece() {
 #[tokio::test]
 async fn a_reply_cut_inside_the_thinking_has_reasoning_and_an_empty_content() {
     let steps = vec![text("Still "), text("thinking\n"), done(FinishReason::Length, 5, 3)];
-    let (_, app) = serve(steps, Some(qwen()), Config::default());
+    let (_, app) = serve(steps, Some(qwen_thinking()), Config::default());
     let (_, body) = json(post(&app, CHAT, &chat(json!({}))).await).await;
     assert_eq!(body["choices"][0]["finish_reason"], "length");
     assert_eq!(body["choices"][0]["message"]["content"], "");
@@ -152,7 +104,7 @@ async fn a_reply_cut_inside_the_thinking_has_reasoning_and_an_empty_content() {
 
     // The same streamed: what was held back comes before the finish chunk.
     let steps = vec![text("Still "), text("thinking\n"), done(FinishReason::Length, 5, 3)];
-    let (_, app) = serve(steps, Some(qwen()), Config::default());
+    let (_, app) = serve(steps, Some(qwen_thinking()), Config::default());
     let stream =
         parse_sse(&body_text(post(&app, CHAT, &chat(json!({"stream": true}))).await).await);
     let deltas: Vec<&Value> =
@@ -166,7 +118,7 @@ async fn a_reply_cut_inside_the_thinking_has_reasoning_and_an_empty_content() {
 #[tokio::test]
 async fn an_answer_without_thinking_has_no_reasoning_field() {
     let steps = vec![text("Four."), done(FinishReason::Stop, 5, 2)];
-    let (_, app) = serve(steps.clone(), Some(qwen()), Config::default());
+    let (_, app) = serve(steps.clone(), Some(qwen_thinking()), Config::default());
     let kwargs = json!({"chat_template_kwargs": {"enable_thinking": false}});
     let (_, body) = json(post(&app, CHAT, &chat(kwargs)).await).await;
     assert_eq!(body["choices"][0]["message"], json!({"role": "assistant", "content": "Four."}));
@@ -181,7 +133,7 @@ async fn an_answer_without_thinking_has_no_reasoning_field() {
 async fn reasoning_format_none_leaves_the_thinking_in_the_content_tags_and_all() {
     let raw = "<think>\nTwo and two.\n</think>\n\nThe answer is 4.";
     // Per request.
-    let (_, app) = serve(reply(), Some(qwen()), Config::default());
+    let (_, app) = serve(reply(), Some(qwen_thinking()), Config::default());
     let (_, body) = json(post(&app, CHAT, &chat(json!({"reasoning_format": "none"}))).await).await;
     let message = &body["choices"][0]["message"];
     assert_eq!(message["content"], raw);
@@ -189,14 +141,14 @@ async fn reasoning_format_none_leaves_the_thinking_in_the_content_tags_and_all()
 
     // As the default of the server, and the request wins over it.
     let config = Config { reasoning_format: ReasoningFormat::None, ..Config::default() };
-    let (_, app) = serve(reply(), Some(qwen()), config.clone());
+    let (_, app) = serve(reply(), Some(qwen_thinking()), config.clone());
     let (_, body) = json(post(&app, CHAT, &chat(json!({}))).await).await;
     assert_eq!(body["choices"][0]["message"]["content"], raw);
     let (_, body) = json(post(&app, CHAT, &chat(json!({"reasoning_format": "auto"}))).await).await;
     assert_eq!(body["choices"][0]["message"]["reasoning_content"], "Two and two.");
 
     // Streamed, the raw text is the content deltas.
-    let (_, app) = serve(reply(), Some(qwen()), config);
+    let (_, app) = serve(reply(), Some(qwen_thinking()), config);
     let stream =
         parse_sse(&body_text(post(&app, CHAT, &chat(json!({"stream": true}))).await).await);
     let content: String = stream
@@ -209,7 +161,7 @@ async fn reasoning_format_none_leaves_the_thinking_in_the_content_tags_and_all()
 
 #[tokio::test]
 async fn the_variables_of_a_request_reach_the_chat_template() {
-    let (engine, app) = serve(reply(), Some(qwen()), Config::default());
+    let (engine, app) = serve(reply(), Some(qwen_thinking()), Config::default());
     let body = chat(json!({
         "chat_template_kwargs": {"enable_thinking": true, "depth": 3},
         "reasoning_effort": "low",
@@ -223,7 +175,7 @@ async fn the_variables_of_a_request_reach_the_chat_template() {
     assert_eq!(get("reasoning_effort"), Some(Json::String("low".into())));
 
     // `reasoning_effort: none` switches thinking off and is not an effort.
-    let (engine, app) = serve(reply(), Some(qwen()), Config::default());
+    let (engine, app) = serve(reply(), Some(qwen_thinking()), Config::default());
     assert_eq!(
         post(&app, CHAT, &chat(json!({"reasoning_effort": "none"}))).await.status(),
         StatusCode::OK
@@ -232,7 +184,7 @@ async fn the_variables_of_a_request_reach_the_chat_template() {
     assert_eq!(variables, vec![("enable_thinking".to_owned(), Json::Bool(false))]);
 
     // A request that says nothing adds nothing.
-    let (engine, app) = serve(reply(), Some(qwen()), Config::default());
+    let (engine, app) = serve(reply(), Some(qwen_thinking()), Config::default());
     post(&app, CHAT, &chat(json!({}))).await;
     let Prompt::Chat { variables, .. } = engine.submitted().remove(0).prompt else { panic!() };
     assert!(variables.is_empty());
@@ -240,7 +192,7 @@ async fn the_variables_of_a_request_reach_the_chat_template() {
 
 #[tokio::test]
 async fn the_reasoning_of_an_earlier_answer_goes_back_into_the_prompt() {
-    let (engine, app) = serve(reply(), Some(qwen()), Config::default());
+    let (engine, app) = serve(reply(), Some(qwen_thinking()), Config::default());
     let body = json!({
         "model": "mock",
         "messages": [
@@ -267,18 +219,21 @@ async fn the_reasoning_of_an_earlier_answer_goes_back_into_the_prompt() {
 
 #[tokio::test]
 async fn what_the_template_cannot_do_is_refused_by_name() {
-    let (engine, app) =
-        serve(reply(), Some(ThinkingFormat { effort: false, ..qwen() }), Config::default());
+    let (engine, app) = serve(
+        reply(),
+        Some(ThinkingFormat { effort: false, ..qwen_thinking() }),
+        Config::default(),
+    );
     let error = refused(&app, json!({"reasoning_effort": "low"})).await;
     assert_eq!(error["param"], "reasoning_effort");
     assert!(error["message"].as_str().unwrap().contains("does not use it"), "{error}");
 
-    let stuck = ThinkingFormat { prompt_off: "<think>\n".into(), ..qwen() };
+    let stuck = ThinkingFormat { prompt_off: "<think>\n".into(), ..qwen_thinking() };
     let (_, app) = serve(reply(), Some(stuck), Config::default());
     let error = refused(&app, json!({"reasoning_effort": "none"})).await;
     assert!(error["message"].as_str().unwrap().contains("cannot switch"), "{error}");
 
-    let (_, app) = serve(reply(), Some(qwen()), Config::default());
+    let (_, app) = serve(reply(), Some(qwen_thinking()), Config::default());
     let error = refused(&app, json!({"chat_template_kwargs": {"enable_thinking": "no"}})).await;
     assert!(error["message"].as_str().unwrap().contains("must be a boolean"), "{error}");
     let error = refused(&app, json!({"chat_template_kwargs": {"messages": []}})).await;
@@ -289,7 +244,7 @@ async fn what_the_template_cannot_do_is_refused_by_name() {
     // A budget for the thinking reaches the engine under every name it has;
     // the realtime control is not built.
     for field in ["reasoning_budget_tokens", "thinking_budget_tokens", "thinking_token_budget"] {
-        let (engine, app) = serve(reply(), Some(qwen()), Config::default());
+        let (engine, app) = serve(reply(), Some(qwen_thinking()), Config::default());
         let body = chat(json!({ field: 256, "reasoning_budget_message": "Time is up." }));
         assert_eq!(post(&app, CHAT, &body).await.status(), StatusCode::OK);
         let sampling = engine.submitted().remove(0).sampling;
@@ -313,7 +268,7 @@ async fn what_the_template_cannot_do_is_refused_by_name() {
 
 #[tokio::test]
 async fn the_completions_endpoint_has_no_thinking_to_ask_for() {
-    let (engine, app) = serve(reply(), Some(qwen()), Config::default());
+    let (engine, app) = serve(reply(), Some(qwen_thinking()), Config::default());
     for field in
         ["reasoning_format", "reasoning_effort", "chat_template_kwargs", "reasoning_budget_tokens"]
     {
@@ -326,7 +281,7 @@ async fn the_completions_endpoint_has_no_thinking_to_ask_for() {
     assert!(engine.submitted().is_empty());
 
     // A text is a text: the tags in it are not looked at.
-    let (_, app) = serve(reply(), Some(qwen()), Config::default());
+    let (_, app) = serve(reply(), Some(qwen_thinking()), Config::default());
     let body = json!({"model": "mock", "prompt": "Once"}).to_string();
     let (_, body) = json(post(&app, "/v1/completions", &body).await).await;
     assert_eq!(body["choices"][0]["text"], "Two and two.\n</think>\n\nThe answer is 4.");
@@ -337,7 +292,10 @@ async fn the_completions_endpoint_has_no_thinking_to_ask_for() {
 /// `xhigh`, `medium` and `low`); another one is refused by name.
 #[tokio::test]
 async fn an_effort_the_template_refuses_is_its_default_for_high_and_refused_else() {
-    let flash = ThinkingFormat { refused_efforts: vec!["minimal".into(), "high".into()], ..qwen() };
+    let flash = ThinkingFormat {
+        refused_efforts: vec!["minimal".into(), "high".into()],
+        ..qwen_thinking()
+    };
     let (engine, app) = serve(reply(), Some(flash.clone()), Config::default());
     let (status, body) =
         json(post(&app, CHAT, &chat(json!({"reasoning_effort": "high"}))).await).await;
@@ -355,7 +313,7 @@ async fn an_effort_the_template_refuses_is_its_default_for_high_and_refused_else
     assert!(error["message"].as_str().unwrap().contains("refuses minimal, high"), "{error}");
 
     // A template that takes `high` gets it.
-    let (engine, app) = serve(reply(), Some(qwen()), Config::default());
+    let (engine, app) = serve(reply(), Some(qwen_thinking()), Config::default());
     let (status, _) =
         json(post(&app, CHAT, &chat(json!({"reasoning_effort": "high"}))).await).await;
     assert_eq!(status, StatusCode::OK);
@@ -368,7 +326,7 @@ async fn an_effort_the_template_refuses_is_its_default_for_high_and_refused_else
 /// before every other message are one system message.
 #[tokio::test]
 async fn system_and_developer_messages_are_placed_as_on_the_messages_route() {
-    let (engine, app) = serve(reply(), Some(qwen()), Config::default());
+    let (engine, app) = serve(reply(), Some(qwen_thinking()), Config::default());
     let body = json!({"model": "mock", "messages": [
         {"role": "system", "content": "Be brief."},
         {"role": "developer", "content": "Answer in German."},
@@ -393,7 +351,7 @@ async fn system_and_developer_messages_are_placed_as_on_the_messages_route() {
         ]
     );
 
-    let (engine, app) = serve(reply(), Some(qwen()), Config::default());
+    let (engine, app) = serve(reply(), Some(qwen_thinking()), Config::default());
     let body = json!({"model": "mock", "instructions": "Be brief.", "input": [
         {"role": "developer", "content": "Answer in German."},
         {"role": "user", "content": "2 + 2?"},

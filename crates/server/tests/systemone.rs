@@ -21,25 +21,20 @@ const CHAT: &str = "/v1/chat/completions";
 
 /// A valid request with one choice question.
 fn decision_body(extra: Value) -> String {
-    let mut body = json!({
-        "model": "mock",
-        "state": "Customer message: I was charged twice.",
-        "questions": {
-            "route": {
-                "type": "choice",
-                "instructions": "Which team should handle this?",
-                "criteria": {"billing": null, "shipping": null, "technical": null}
+    merged(
+        json!({
+            "model": "mock",
+            "state": "Customer message: I was charged twice.",
+            "questions": {
+                "route": {
+                    "type": "choice",
+                    "instructions": "Which team should handle this?",
+                    "criteria": {"billing": null, "shipping": null, "technical": null}
+                }
             }
-        }
-    });
-    body.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
-    body.to_string()
-}
-
-fn chat_body(extra: Value) -> String {
-    let mut body = json!({"model": "mock", "messages": [{"role": "user", "content": "hi"}]});
-    body.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
-    body.to_string()
+        }),
+        extra,
+    )
 }
 
 fn usage(prompt_tokens: u32) -> Usage {
@@ -577,82 +572,9 @@ async fn the_endpoint_is_on_v1_systemone_and_nowhere_else() {
 
 // --- errors from the engine -----------------------------------------------------
 
-struct Case {
-    error: EngineError,
-    status: StatusCode,
-    kind: &'static str,
-    code: &'static str,
-    /// Words the message must contain.
-    mentions: &'static [&'static str],
-}
-
-fn cases() -> Vec<Case> {
-    vec![
-        Case {
-            error: EngineError::ModelNotFound("nope".into()),
-            status: StatusCode::NOT_FOUND,
-            kind: "invalid_request_error",
-            code: "model_not_found",
-            mentions: &["'nope'", "mock, mock-2"],
-        },
-        Case {
-            error: EngineError::InvalidRequest("questions.q has too many options".into()),
-            status: StatusCode::BAD_REQUEST,
-            kind: "invalid_request_error",
-            code: "invalid_request",
-            mentions: &["questions.q has too many options"],
-        },
-        Case {
-            error: EngineError::ContextOverflow { prompt_tokens: 9000, limit: 4096 },
-            status: StatusCode::BAD_REQUEST,
-            kind: "invalid_request_error",
-            code: "context_length_exceeded",
-            mentions: &["9000", "4096"],
-        },
-        Case {
-            error: EngineError::Overloaded,
-            status: StatusCode::SERVICE_UNAVAILABLE,
-            kind: "server_error",
-            code: "overloaded",
-            mentions: &["capacity"],
-        },
-        Case {
-            error: EngineError::Unsupported("no such architecture".into()),
-            status: StatusCode::NOT_IMPLEMENTED,
-            kind: "server_error",
-            code: "not_implemented",
-            mentions: &["no such architecture"],
-        },
-        Case {
-            error: EngineError::Internal("kernel exploded".into()),
-            status: StatusCode::INTERNAL_SERVER_ERROR,
-            kind: "server_error",
-            code: "internal_error",
-            mentions: &["kernel exploded"],
-        },
-    ]
-}
-
-async fn assert_error(case: &Case, response: axum::http::Response<axum::body::Body>, how: &str) {
-    let retry_after = response.headers().get(header::RETRY_AFTER).cloned();
-    let (status, body) = json(response).await;
-    assert_eq!(status, case.status, "{how}: {body}");
-    let error = &body["error"];
-    assert_eq!(error["type"], case.kind, "{how}");
-    assert_eq!(error["code"], case.code, "{how}");
-    let message = error["message"].as_str().unwrap();
-    for word in case.mentions {
-        assert!(message.contains(word), "{how}: '{message}' should mention {word}");
-    }
-    assert!(error.get("param").is_some(), "{how}: the error format always has a param");
-    assert_eq!(body.as_object().unwrap().len(), 1, "{how}: nothing but the error object");
-    let expected_retry = (case.status == StatusCode::SERVICE_UNAVAILABLE).then_some("1");
-    assert_eq!(retry_after.as_ref().and_then(|v| v.to_str().ok()), expected_retry, "{how}");
-}
-
 #[tokio::test]
 async fn an_error_returned_by_decide_maps_to_the_status_of_every_other_endpoint() {
-    for case in cases() {
+    for case in error_cases("questions.q has too many options") {
         let engine = MockEngine::deciding(DecisionPlan::Reject(case.error.clone()));
         let response = post(&app(&engine), SYSTEMONE, &decision_body(json!({}))).await;
         assert_error(&case, response, "rejected at decide").await;
@@ -661,7 +583,7 @@ async fn an_error_returned_by_decide_maps_to_the_status_of_every_other_endpoint(
 
 #[tokio::test]
 async fn a_failure_delivered_as_the_outcome_maps_the_same_way() {
-    for case in cases() {
+    for case in error_cases("questions.q has too many options") {
         let engine = MockEngine::deciding(DecisionPlan::Script(vec![failing(case.error.clone())]));
         let response = post(&app(&engine), SYSTEMONE, &decision_body(json!({}))).await;
         assert_error(&case, response, "failed outcome").await;

@@ -6,13 +6,15 @@ use std::thread;
 use std::time::Duration;
 
 use ares_api::{
-    DecisionOutcome, DecisionRequest, DecisionSink, Engine, EngineError, EngineStats, Event,
-    EventSink, FinishReason, GenerateRequest, ModelCard, RequestId, Usage,
+    ChatFormat, DecisionOutcome, DecisionRequest, DecisionSink, Engine, EngineError, EngineStats,
+    Event, EventSink, FinishReason, GenerateRequest, ModelCard, Prompt, RequestId, ThinkingFormat,
+    ToolFormat, Usage,
 };
 use ares_server::Config;
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, Response, StatusCode, header};
+use serde_json::json;
 use tower::ServiceExt;
 
 pub mod process;
@@ -31,7 +33,7 @@ impl Gate {
         self.0.1.notify_all();
     }
 
-    fn wait(&self) {
+    pub fn wait(&self) {
         let (lock, condvar) = &*self.0;
         let (_open, timeout) =
             condvar.wait_timeout_while(lock.lock().unwrap(), WAIT_LIMIT, |open| !*open).unwrap();
@@ -51,6 +53,9 @@ pub enum Step {
     UntilCancelled,
     /// Give up the sink without a terminal event.
     Abandon,
+    /// End the request with `finish` and the usage of its prompt as
+    /// [`tokens`] counts it.
+    DoneCounted { finish: FinishReason, completion: u32 },
 }
 
 pub fn text(piece: &str) -> Step {
@@ -71,6 +76,21 @@ pub fn done(finish: FinishReason, prompt: u32, completion: u32) -> Step {
 
 pub fn fail(error: EngineError) -> Step {
     Step::Send(Event::Error(error))
+}
+
+/// The reply of a model in pieces of `size` characters, ended by `finish`.
+pub fn says(reply: &str, size: usize, finish: FinishReason) -> Vec<Step> {
+    let chars: Vec<char> = reply.chars().collect();
+    let mut steps: Vec<Step> =
+        chars.chunks(size).map(|piece| text(&piece.iter().collect::<String>())).collect();
+    steps.push(done(finish, 20, chars.len() as u32));
+    steps
+}
+
+/// What stands for the tokens of a prompt in these tests: the bytes of the
+/// prompt as the engine was given it.
+pub fn tokens(prompt: &Prompt) -> u32 {
+    serde_json::to_string(prompt).unwrap().len() as u32
 }
 
 /// What `submit` does.
@@ -127,6 +147,12 @@ struct Book {
     sends: Vec<bool>,
     /// What `stats` answers; `None` for an engine that keeps none.
     stats: Option<EngineStats>,
+    /// What the chat template of `mock` declares.
+    format: Option<ChatFormat>,
+    /// Whether the engine counts the tokens of a prompt.
+    counting: bool,
+    /// Why the engine serves no more requests, once a test broke it.
+    failure: Option<String>,
 }
 
 /// The part of the engine its threads share with the test.
@@ -152,9 +178,14 @@ impl Shared {
         assert!(!timeout.timed_out(), "the front end never cancelled the request");
     }
 
-    fn run(&self, id: RequestId, steps: Vec<Step>, sink: EventSink) {
+    fn run(&self, id: RequestId, prompt_tokens: u32, steps: Vec<Step>, sink: EventSink) {
         for step in steps {
             match step {
+                Step::DoneCounted { finish, completion } => {
+                    let usage =
+                        Usage { prompt_tokens, completion_tokens: completion, ..Usage::default() };
+                    sink.send(Event::Done { finish, usage });
+                }
                 Step::Send(event) => {
                     let delivered = sink.send(event);
                     self.record(|book| book.sends.push(delivered));
@@ -265,6 +296,31 @@ impl MockEngine {
     pub fn set_stats(&self, stats: EngineStats) {
         self.shared.book.lock().unwrap().stats = Some(stats);
     }
+
+    /// Makes `mock` a model whose chat template declares `format`.
+    pub fn set_chat_format(&self, format: ChatFormat) {
+        self.shared.book.lock().unwrap().format = Some(format);
+    }
+
+    /// Makes the engine count the tokens of a prompt of `mock` as [`tokens`]
+    /// does.
+    pub fn set_counting(&self) {
+        self.shared.book.lock().unwrap().counting = true;
+    }
+
+    /// The engine as the Messages and Responses tests serve it: `mock`
+    /// declares Qwen3.8's format ([`qwen`]) and the tokens of a prompt are
+    /// counted.
+    pub fn qwen(self: Arc<Self>) -> Arc<Self> {
+        self.set_chat_format(qwen());
+        self.set_counting();
+        self
+    }
+
+    /// Breaks the engine: it reports `why` as its failure.
+    pub fn set_failure(&self, why: &str) {
+        self.shared.book.lock().unwrap().failure = Some(why.to_owned());
+    }
 }
 
 impl Engine for MockEngine {
@@ -272,8 +328,23 @@ impl Engine for MockEngine {
         self.models.clone()
     }
 
+    fn chat_format(&self, model: &str) -> Option<ChatFormat> {
+        (model == "mock").then(|| self.shared.book.lock().unwrap().format.clone()).flatten()
+    }
+
+    fn count_tokens(&self, model: &str, prompt: &Prompt) -> Result<u32, EngineError> {
+        if !self.shared.book.lock().unwrap().counting {
+            let what = "the scripted engine does not count the tokens of a prompt";
+            return Err(EngineError::Unsupported(what.into()));
+        }
+        if model != "mock" {
+            return Err(EngineError::ModelNotFound(model.to_owned()));
+        }
+        Ok(tokens(prompt))
+    }
+
     fn submit(&self, request: GenerateRequest, events: EventSink) -> Result<(), EngineError> {
-        let id = request.id;
+        let (id, prompt_tokens) = (request.id, tokens(&request.prompt));
         self.shared.record(|book| book.submitted.push(request));
         match &self.plan {
             Plan::Reject(error) => Err(error.clone()),
@@ -283,7 +354,7 @@ impl Engine for MockEngine {
                 let (shared, steps) = (self.shared.clone(), steps.clone());
                 thread::Builder::new()
                     .name("mock-engine".into())
-                    .spawn(move || shared.run(id, steps, events))
+                    .spawn(move || shared.run(id, prompt_tokens, steps, events))
                     .unwrap();
                 Ok(())
             }
@@ -313,6 +384,181 @@ impl Engine for MockEngine {
     fn stats(&self) -> Option<EngineStats> {
         self.shared.book.lock().unwrap().stats
     }
+
+    fn failure(&self) -> Option<String> {
+        self.shared.book.lock().unwrap().failure.clone()
+    }
+}
+
+// --- what the models declare ------------------------------------------------
+
+/// What the template of Qwen3.8 declares.
+pub fn qwen() -> ChatFormat {
+    ChatFormat { thinking: Some(qwen_thinking()), tools: Some(qwen_tools()) }
+}
+
+/// How the template of Qwen3.8 thinks.
+pub fn qwen_thinking() -> ThinkingFormat {
+    ThinkingFormat {
+        start: "<think>\n".into(),
+        end: "\n</think>\n\n".into(),
+        prompt_on: "<think>\n".into(),
+        prompt_off: "<think>\n\n</think>\n\n".into(),
+        on_by_default: true,
+        effort: true,
+        refused_efforts: Vec::new(),
+    }
+}
+
+/// How the template of Qwen3.8 writes calls of tools.
+pub fn qwen_tools() -> ToolFormat {
+    ToolFormat {
+        call_open: "<tool_call>\n<function=".into(),
+        name_close: ">\n".into(),
+        param_open: "<parameter=".into(),
+        key_close: ">\n".into(),
+        param_close: "\n</parameter>\n".into(),
+        call_close: "</function>\n</tool_call>".into(),
+        before_calls: "\n\n".into(),
+        between_calls: "\n".into(),
+    }
+}
+
+/// What a model that thinks about a call says before it.
+pub const THINKS: &str = "The user asks for the weather.\n</think>\n\n";
+/// A call of `get_weather` as Qwen3.8 writes it.
+pub const CALL: &str = "<tool_call>\n<function=get_weather>\n<parameter=city>\nKöln\n</parameter>\n<parameter=days>\n3\n</parameter>\n</function>\n</tool_call>";
+/// A call of `now`, which takes no arguments.
+pub const NOW: &str = "<tool_call>\n<function=now>\n</function>\n</tool_call>";
+
+// --- requests ---------------------------------------------------------------
+
+/// `base` with the members of `extra` set over it, as a body.
+pub fn merged(mut base: serde_json::Value, extra: serde_json::Value) -> String {
+    base.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+    base.to_string()
+}
+
+/// A chat request to `mock` that says hi, with `extra` set over it.
+pub fn chat_body(extra: serde_json::Value) -> String {
+    merged(json!({"model": "mock", "messages": [{"role": "user", "content": "hi"}]}), extra)
+}
+
+/// A completion request to `mock`, with `extra` set over it.
+pub fn completion_body(extra: serde_json::Value) -> String {
+    merged(json!({"model": "mock", "prompt": "Once upon"}), extra)
+}
+
+/// An engine that answers `ok` to every request and reports the count of
+/// its prompt as [`tokens`] counts it, as [`MockEngine::qwen`] counts it
+/// too.
+pub fn counting() -> Arc<MockEngine> {
+    let ok = vec![text("ok"), Step::DoneCounted { finish: FinishReason::Stop, completion: 1 }];
+    MockEngine::script(ok).qwen()
+}
+
+/// An engine that ends every request at once, for tests that look at what
+/// it received.
+pub fn instant() -> Arc<MockEngine> {
+    MockEngine::script(vec![done(FinishReason::Stop, 1, 0)])
+}
+
+/// The request the engine got for `body` on `path`, which is answered with 200.
+pub async fn submitted(
+    engine: &MockEngine,
+    app: &Router,
+    path: &str,
+    body: &str,
+) -> GenerateRequest {
+    let (status, value) = json(post(app, path, body).await).await;
+    assert_eq!(status, StatusCode::OK, "{path}: {value}");
+    engine.submitted().pop().expect("the request reached the engine")
+}
+
+/// The request a fresh [`instant`] engine got for `body` on `path`.
+pub async fn received(path: &str, body: &str) -> GenerateRequest {
+    let engine = instant();
+    submitted(&engine, &app(&engine), path, body).await
+}
+
+// --- errors -----------------------------------------------------------------
+
+/// An error of the engine and what every route of the OpenAI format makes of it.
+pub struct ErrorCase {
+    pub error: EngineError,
+    pub status: StatusCode,
+    pub kind: &'static str,
+    pub code: &'static str,
+    /// Words the message must contain.
+    pub mentions: Vec<&'static str>,
+}
+
+/// Every kind of error the engine can return; `invalid` is the text of its
+/// invalid request.
+pub fn error_cases(invalid: &'static str) -> Vec<ErrorCase> {
+    vec![
+        ErrorCase {
+            error: EngineError::ModelNotFound("nope".into()),
+            status: StatusCode::NOT_FOUND,
+            kind: "invalid_request_error",
+            code: "model_not_found",
+            mentions: vec!["'nope'", "mock, mock-2"],
+        },
+        ErrorCase {
+            error: EngineError::InvalidRequest(invalid.into()),
+            status: StatusCode::BAD_REQUEST,
+            kind: "invalid_request_error",
+            code: "invalid_request",
+            mentions: vec![invalid],
+        },
+        ErrorCase {
+            error: EngineError::ContextOverflow { prompt_tokens: 9000, limit: 4096 },
+            status: StatusCode::BAD_REQUEST,
+            kind: "invalid_request_error",
+            code: "context_length_exceeded",
+            mentions: vec!["9000", "4096"],
+        },
+        ErrorCase {
+            error: EngineError::Overloaded,
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            kind: "server_error",
+            code: "overloaded",
+            mentions: vec!["capacity"],
+        },
+        ErrorCase {
+            error: EngineError::Unsupported("no such architecture".into()),
+            status: StatusCode::NOT_IMPLEMENTED,
+            kind: "server_error",
+            code: "not_implemented",
+            mentions: vec!["no such architecture"],
+        },
+        ErrorCase {
+            error: EngineError::Internal("kernel exploded".into()),
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            kind: "server_error",
+            code: "internal_error",
+            mentions: vec!["kernel exploded"],
+        },
+    ]
+}
+
+/// Checks that `response` is the error `case` in the OpenAI format: its
+/// status, its type and code, its words, and Retry-After on 503 only.
+pub async fn assert_error(case: &ErrorCase, response: Response<Body>, how: &str) {
+    let retry_after = response.headers().get(header::RETRY_AFTER).cloned();
+    let (status, body) = json(response).await;
+    assert_eq!(status, case.status, "{how}: {body}");
+    let error = &body["error"];
+    assert_eq!(error["type"], case.kind, "{how}");
+    assert_eq!(error["code"], case.code, "{how}");
+    let message = error["message"].as_str().unwrap();
+    for word in &case.mentions {
+        assert!(message.contains(word), "{how}: '{message}' should mention {word}");
+    }
+    assert!(error.get("param").is_some(), "{how}: the error format always has a param");
+    assert_eq!(body.as_object().unwrap().len(), 1, "{how}: nothing but the error object");
+    let expected_retry = (case.status == StatusCode::SERVICE_UNAVAILABLE).then_some("1");
+    assert_eq!(retry_after.as_ref().and_then(|v| v.to_str().ok()), expected_retry, "{how}");
 }
 
 // --- driving the router -----------------------------------------------------

@@ -138,12 +138,6 @@ async fn read_until(stream: &mut TcpStream, needle: &str) -> Vec<u8> {
     seen
 }
 
-fn chat(extra: Value) -> String {
-    let mut body = json!({"model": "mock", "messages": [{"role": "user", "content": "hi"}]});
-    body.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
-    body.to_string()
-}
-
 #[tokio::test]
 async fn serves_plain_and_streamed_requests_over_a_socket() {
     let pieces = ["Grüße ", "🦀 ", "日本語"];
@@ -157,13 +151,18 @@ async fn serves_plain_and_streamed_requests_over_a_socket() {
     assert_eq!(health.json(), json!({"status": "ok"}));
     assert_eq!(call(server.addr, "GET", "/v1/models", None).await.json()["data"][0]["id"], "mock");
 
-    let plain = call(server.addr, "POST", "/v1/chat/completions", Some(&chat(json!({})))).await;
+    let plain =
+        call(server.addr, "POST", "/v1/chat/completions", Some(&chat_body(json!({})))).await;
     assert_eq!(plain.status, 200);
     assert_eq!(plain.json()["choices"][0]["message"]["content"], pieces.concat());
 
-    let streamed =
-        call(server.addr, "POST", "/v1/chat/completions", Some(&chat(json!({"stream": true}))))
-            .await;
+    let streamed = call(
+        server.addr,
+        "POST",
+        "/v1/chat/completions",
+        Some(&chat_body(json!({"stream": true}))),
+    )
+    .await;
     assert_eq!(streamed.status, 200);
     assert!(streamed.headers.to_ascii_lowercase().contains("content-type: text/event-stream"));
     let stream = parse_sse(&streamed.text());
@@ -186,7 +185,7 @@ async fn a_connection_that_closes_during_a_plain_request_cancels_it() {
 
     let mut client = TcpStream::connect(server.addr).await.unwrap();
     client
-        .write_all(&request_bytes("POST", "/v1/chat/completions", Some(&chat(json!({})))))
+        .write_all(&request_bytes("POST", "/v1/chat/completions", Some(&chat_body(json!({})))))
         .await
         .unwrap();
     eventually("the request to reach the engine", || engine.submitted().len() == 1).await;
@@ -212,7 +211,7 @@ async fn a_connection_that_closes_during_a_stream_cancels_it() {
         .write_all(&request_bytes(
             "POST",
             "/v1/chat/completions",
-            Some(&chat(json!({"stream": true}))),
+            Some(&chat_body(json!({"stream": true}))),
         ))
         .await
         .unwrap();
@@ -258,7 +257,7 @@ async fn shutdown_lets_a_running_stream_finish() {
         .write_all(&request_bytes(
             "POST",
             "/v1/chat/completions",
-            Some(&chat(json!({"stream": true}))),
+            Some(&chat_body(json!({"stream": true}))),
         ))
         .await
         .unwrap();
@@ -289,7 +288,7 @@ async fn shutdown_gives_up_on_a_stuck_request_after_the_grace_period() {
 
     let mut client = TcpStream::connect(server.addr).await.unwrap();
     client
-        .write_all(&request_bytes("POST", "/v1/chat/completions", Some(&chat(json!({})))))
+        .write_all(&request_bytes("POST", "/v1/chat/completions", Some(&chat_body(json!({})))))
         .await
         .unwrap();
     eventually("the request to reach the engine", || engine.submitted().len() == 1).await;
@@ -330,7 +329,7 @@ async fn a_second_signal_ends_running_requests_and_tells_their_clients() {
         .write_all(&request_bytes(
             "POST",
             "/v1/chat/completions",
-            Some(&chat(json!({"stream": true}))),
+            Some(&chat_body(json!({"stream": true}))),
         ))
         .await
         .unwrap();
@@ -361,29 +360,34 @@ async fn an_error_status_line_reaches_a_real_client() {
     let engine =
         MockEngine::reject(EngineError::ContextOverflow { prompt_tokens: 9000, limit: 4096 });
     let server = start(&engine, Config::default()).await;
-    let reply =
-        call(server.addr, "POST", "/v1/chat/completions", Some(&chat(json!({"stream": true}))))
-            .await;
+    let reply = call(
+        server.addr,
+        "POST",
+        "/v1/chat/completions",
+        Some(&chat_body(json!({"stream": true}))),
+    )
+    .await;
     assert_eq!(reply.status, 400);
     assert_eq!(reply.json()["error"]["code"], "context_length_exceeded");
     server.stop().await.unwrap();
 }
 
 fn decision(extra: Value) -> String {
-    let mut body = json!({
-        "model": "mock",
-        "state": "Customer message: I was charged twice.",
-        "questions": {
-            "route": {
-                "type": "choice",
-                "instructions": "Which team should handle this?",
-                "criteria": {"billing": null, "shipping": null}
-            },
-            "angry": {"type": "noul", "instructions": "Is the customer angry?"}
-        }
-    });
-    body.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
-    body.to_string()
+    merged(
+        json!({
+            "model": "mock",
+            "state": "Customer message: I was charged twice.",
+            "questions": {
+                "route": {
+                    "type": "choice",
+                    "instructions": "Which team should handle this?",
+                    "criteria": {"billing": null, "shipping": null}
+                },
+                "angry": {"type": "noul", "instructions": "Is the customer angry?"}
+            }
+        }),
+        extra,
+    )
 }
 
 /// Every option of every question equally likely.
@@ -419,7 +423,7 @@ async fn a_decision_is_answered_on_its_own_connection_while_a_stream_is_open() {
         .write_all(&request_bytes(
             "POST",
             "/v1/chat/completions",
-            Some(&chat(json!({"stream": true}))),
+            Some(&chat_body(json!({"stream": true}))),
         ))
         .await
         .unwrap();

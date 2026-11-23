@@ -5,8 +5,7 @@
 mod common;
 
 use ares_api::{
-    Alternative, BiasKey, Event, FinishReason, GenerateRequest, LogprobRequest, SamplerKind,
-    TokenProbs,
+    Alternative, BiasKey, Event, FinishReason, LogprobRequest, SamplerKind, TokenProbs,
 };
 use axum::http::StatusCode;
 use common::*;
@@ -16,29 +15,9 @@ use serde_json::{Value, json};
 const CHAT: &str = "/v1/chat/completions";
 const COMPLETIONS: &str = "/v1/completions";
 
-fn chat_body(extra: Value) -> String {
-    let mut body = json!({"model": "mock", "messages": [{"role": "user", "content": "hi"}]});
-    body.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
-    body.to_string()
-}
-
-fn completion_body(extra: Value) -> String {
-    let mut body = json!({"model": "mock", "prompt": "Once upon"});
-    body.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
-    body.to_string()
-}
-
-async fn submitted(path: &str, body: &str) -> GenerateRequest {
-    let engine = MockEngine::script(vec![done(FinishReason::Stop, 1, 0)]);
-    let response = post(&app(&engine), path, body).await;
-    let (status, value) = json(response).await;
-    assert_eq!(status, StatusCode::OK, "{value}");
-    engine.submitted().remove(0)
-}
-
 /// The refusal of a request: its status and the field it names.
 async fn refused(path: &str, body: &str) -> (StatusCode, Option<String>, String) {
-    let engine = MockEngine::script(vec![done(FinishReason::Stop, 1, 0)]);
+    let engine = instant();
     let (status, value) = json(post(&app(&engine), path, body).await).await;
     assert!(engine.submitted().is_empty(), "a refused request reaches the engine: {value}");
     let error = &value["error"];
@@ -51,7 +30,7 @@ async fn refused(path: &str, body: &str) -> (StatusCode, Option<String>, String)
 
 #[tokio::test]
 async fn the_sampler_fields_of_llama_cpp_reach_the_engine() {
-    let r = submitted(
+    let r = received(
         CHAT,
         &chat_body(json!({
             "temperature": 0.7, "top_k": 30, "top_p": 0.9, "min_p": 0.05,
@@ -89,21 +68,19 @@ async fn the_sampler_fields_of_llama_cpp_reach_the_engine() {
 
 #[tokio::test]
 async fn nothing_set_is_nothing_sent() {
-    let r = submitted(CHAT, &chat_body(json!({}))).await;
+    let r = received(CHAT, &chat_body(json!({}))).await;
     assert_eq!(r.sampling, ares_api::Sampling::default());
 }
 
 #[tokio::test]
 async fn the_names_other_servers_use_are_understood() {
     // vLLM, TGI and TabbyAPI write the repetition penalty differently.
-    let r = submitted(
-        COMPLETIONS,
-        &completion_body(json!({"repetition_penalty": 1.2, "typical": 0.9})),
-    )
-    .await;
+    let r =
+        received(COMPLETIONS, &completion_body(json!({"repetition_penalty": 1.2, "typical": 0.9})))
+            .await;
     assert_eq!((r.sampling.repeat_penalty, r.sampling.typical_p), (Some(1.2), Some(0.9)));
     // Two names for one value must agree.
-    let same = submitted(
+    let same = received(
         COMPLETIONS,
         &completion_body(json!({"repeat_penalty": 1.2, "repetition_penalty": 1.2})),
     )
@@ -118,7 +95,7 @@ async fn the_names_other_servers_use_are_understood() {
     assert!(message.contains("repeat_penalty"), "{message}");
     // The limit of tokens by any of its names.
     for field in ["max_tokens", "max_completion_tokens", "n_predict"] {
-        let r = submitted(CHAT, &chat_body(json!({ field: 12 }))).await;
+        let r = received(CHAT, &chat_body(json!({ field: 12 }))).await;
         assert_eq!(r.max_tokens, Some(12), "{field}");
     }
 }
@@ -126,11 +103,11 @@ async fn the_names_other_servers_use_are_understood() {
 #[tokio::test]
 async fn a_logit_bias_comes_in_the_form_of_openai_or_of_llama_cpp() {
     // OpenAI: an object from a token (a string of digits) to a number.
-    let r = submitted(CHAT, &chat_body(json!({"logit_bias": {"15043": 1.5, "7": -100}}))).await;
+    let r = received(CHAT, &chat_body(json!({"logit_bias": {"15043": 1.5, "7": -100}}))).await;
     let keys: Vec<_> = r.sampling.logit_bias.iter().map(|b| (b.key.clone(), b.bias)).collect();
     assert_eq!(keys, [(BiasKey::Token(15043), Some(1.5)), (BiasKey::Token(7), Some(-100.0))]);
     // llama.cpp: pairs, false for a ban, a string for the tokens of a text.
-    let r = submitted(
+    let r = received(
         CHAT,
         &chat_body(json!({"logit_bias": [[15043, -1.0], [99, false], ["Hello, World!", -0.5]]})),
     )
@@ -145,10 +122,10 @@ async fn a_logit_bias_comes_in_the_form_of_openai_or_of_llama_cpp() {
         ]
     );
     // A string key of the object form is a text too.
-    let r = submitted(CHAT, &chat_body(json!({"logit_bias": {"Hello": false}}))).await;
+    let r = received(CHAT, &chat_body(json!({"logit_bias": {"Hello": false}}))).await;
     assert_eq!(r.sampling.logit_bias[0].key, BiasKey::Text("Hello".into()));
     // Empty is nothing.
-    let r = submitted(CHAT, &chat_body(json!({"logit_bias": {}}))).await;
+    let r = received(CHAT, &chat_body(json!({"logit_bias": {}}))).await;
     assert!(r.sampling.logit_bias.is_empty());
     for bad in [
         json!({"logit_bias": [[1]]}),
@@ -168,7 +145,7 @@ async fn a_logit_bias_comes_in_the_form_of_openai_or_of_llama_cpp() {
 
 #[tokio::test]
 async fn the_order_of_the_samplers_is_names_or_letters() {
-    let r = submitted(
+    let r = received(
         CHAT,
         &chat_body(json!({"samplers": ["penalties", "Top-K", "typ_p", "top_p", "min_p", "temp"]})),
     )
@@ -184,9 +161,9 @@ async fn the_order_of_the_samplers_is_names_or_letters() {
             SamplerKind::Temperature,
         ])
     );
-    let r = submitted(CHAT, &chat_body(json!({"samplers": "edkypmxt"}))).await;
+    let r = received(CHAT, &chat_body(json!({"samplers": "edkypmxt"}))).await;
     assert_eq!(r.sampling.samplers.as_ref().map(Vec::len), Some(8));
-    let r = submitted(CHAT, &chat_body(json!({"samplers": []}))).await;
+    let r = received(CHAT, &chat_body(json!({"samplers": []}))).await;
     assert_eq!(r.sampling.samplers, Some(Vec::new()));
     for bad in [
         json!({"samplers": ["top_k", "nonsense"]}),
@@ -310,10 +287,10 @@ async fn top_logprobs_needs_logprobs_and_has_a_limit() {
         assert!(matches!(param.as_deref(), Some("top_logprobs" | "logprobs")), "{bad}: {param:?}");
     }
     // `logprobs: false` asks for nothing.
-    let r = submitted(CHAT, &chat_body(json!({"logprobs": false}))).await;
+    let r = received(CHAT, &chat_body(json!({"logprobs": false}))).await;
     assert_eq!(r.sampling.logprobs, None);
     // `logprobs: true` alone is the probability of each token, no alternatives.
-    let r = submitted(CHAT, &chat_body(json!({"logprobs": true}))).await;
+    let r = received(CHAT, &chat_body(json!({"logprobs": true}))).await;
     assert_eq!(r.sampling.logprobs, Some(LogprobRequest { top: 0, after_chain: false }));
 }
 
@@ -363,7 +340,7 @@ async fn llama_cpp_asks_for_probabilities_with_n_probs() {
         refused(COMPLETIONS, &completion_body(json!({"post_sampling_probs": true}))).await;
     assert_eq!(param.as_deref(), Some("post_sampling_probs"));
     // n_probs wins over logprobs, as in llama-server.
-    let r = submitted(COMPLETIONS, &completion_body(json!({"n_probs": 3, "logprobs": 1}))).await;
+    let r = received(COMPLETIONS, &completion_body(json!({"n_probs": 3, "logprobs": 1}))).await;
     assert_eq!(r.sampling.logprobs, Some(LogprobRequest { top: 3, after_chain: false }));
 }
 
@@ -444,7 +421,7 @@ async fn a_request_that_allows_no_drafts_says_so_with_every_sampler_field_and_fo
         assert_eq!(request.sampling.logprobs, Some(LogprobRequest { top: 2, after_chain: false }));
     }
     // Without the field a request allows drafts.
-    let request = submitted(CHAT, &chat_body(json!({"repeat_penalty": 1.2}))).await;
+    let request = received(CHAT, &chat_body(json!({"repeat_penalty": 1.2}))).await;
     assert!(request.draft);
 }
 

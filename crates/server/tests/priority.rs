@@ -5,7 +5,6 @@
 
 mod common;
 
-use ares_api::FinishReason;
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use common::*;
@@ -17,7 +16,7 @@ const HEADER: &str = "x-ares-priority";
 /// Posts `body` to `path` with the header of the priority if one is given,
 /// and returns the status, the body and the priority the engine got.
 async fn priority_of(path: &str, body: Value, header: Option<&str>) -> (StatusCode, Value, i32) {
-    let engine = MockEngine::script(vec![done(FinishReason::Stop, 1, 0)]);
+    let engine = instant();
     let mut request = Request::post(path).header(header::CONTENT_TYPE, "application/json");
     if let Some(value) = header {
         request = request.header(HEADER, value);

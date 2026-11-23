@@ -14,17 +14,14 @@ use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use ares_api::{
-    DecisionRequest, DecisionSink, Engine, EngineError, EngineStats, EventSink, FinishReason,
-    GenerateRequest, ModelCard, RequestId,
-};
+use ares_api::{Engine, EngineError, FinishReason, ModelCard};
 use ares_server::models::{AcquireError, Clock, Lease, LoadFailure, Loader, Models, Site, Unit};
 use ares_server::preset::{Preset, Presets};
 use ares_server::{Config, router_over};
-use common::{DecisionPlan, MockEngine, Plan, Step, done, eventually, get, json, post, text};
+use common::{DecisionPlan, Gate, MockEngine, Plan, Step, done, eventually, get, json, post, text};
 use futures_util::StreamExt;
 use tokio::sync::watch;
 
@@ -57,57 +54,6 @@ impl Clock for ManualClock {
 
 // --- the machine ------------------------------------------------------------
 
-/// A latch a test opens to let a load go on.
-#[derive(Clone, Default)]
-struct Latch(Arc<(Mutex<bool>, Condvar)>);
-
-impl Latch {
-    fn open(&self) {
-        *self.0.0.lock().unwrap() = true;
-        self.0.1.notify_all();
-    }
-
-    fn wait(&self) {
-        let (lock, condvar) = &*self.0;
-        let limit = Duration::from_secs(20);
-        let (_open, timeout) =
-            condvar.wait_timeout_while(lock.lock().unwrap(), limit, |open| !*open).unwrap();
-        assert!(!timeout.timed_out(), "the test never let the load go on");
-    }
-}
-
-/// An engine that says it has failed once a test breaks it.
-struct Served {
-    inner: Arc<MockEngine>,
-    broken: Mutex<Option<String>>,
-}
-
-impl Engine for Served {
-    fn models(&self) -> Vec<ModelCard> {
-        self.inner.models()
-    }
-
-    fn submit(&self, request: GenerateRequest, events: EventSink) -> Result<(), EngineError> {
-        self.inner.submit(request, events)
-    }
-
-    fn decide(&self, request: DecisionRequest, outcome: DecisionSink) -> Result<(), EngineError> {
-        self.inner.decide(request, outcome)
-    }
-
-    fn cancel(&self, id: RequestId) {
-        self.inner.cancel(id);
-    }
-
-    fn stats(&self) -> Option<EngineStats> {
-        self.inner.stats()
-    }
-
-    fn failure(&self) -> Option<String> {
-        self.broken.lock().unwrap().clone()
-    }
-}
-
 /// The least a model without a named context is loaded with next to others.
 const LEAST: u64 = 2;
 
@@ -118,13 +64,13 @@ struct Machine {
     /// What the loader was asked to do, in order.
     log: Mutex<Vec<String>>,
     /// Loads that wait for the test.
-    latches: Mutex<HashMap<String, Latch>>,
+    latches: Mutex<HashMap<String, Gate>>,
     /// Models whose file is broken.
     broken_files: Mutex<HashSet<String>>,
     /// What every load found.
     sites: Mutex<Vec<(String, Site)>>,
     /// The engine of every model, as last loaded.
-    engines: Mutex<HashMap<String, Arc<Served>>>,
+    engines: Mutex<HashMap<String, Arc<MockEngine>>>,
     /// What a model's engine does with a request, where it is not the usual.
     scripts: Mutex<HashMap<String, Vec<Step>>>,
 }
@@ -142,13 +88,13 @@ impl Machine {
         self.free.lock().unwrap().clone()
     }
 
-    fn latch(&self, model: &str) -> Latch {
-        let latch = Latch::default();
+    fn latch(&self, model: &str) -> Gate {
+        let latch = Gate::default();
         self.latches.lock().unwrap().insert(model.to_owned(), latch.clone());
         latch
     }
 
-    fn engine(&self, model: &str) -> Arc<Served> {
+    fn engine(&self, model: &str) -> Arc<MockEngine> {
         self.engines.lock().unwrap()[model].clone()
     }
 
@@ -163,7 +109,7 @@ struct Loads(Arc<Machine>);
 struct Running {
     machine: Arc<Machine>,
     id: String,
-    engine: Arc<Served>,
+    engine: Arc<MockEngine>,
     taken: Vec<(usize, u64)>,
     ram: u64,
 }
@@ -231,14 +177,11 @@ impl Loader for Loads {
         });
         let card = ModelCard { id: id.clone(), context_length: 4096, created: 1_700_000_000 };
         let refusal = EngineError::Unsupported("no decisions here".into());
-        let engine = Arc::new(Served {
-            inner: MockEngine::with_models(
-                vec![card],
-                Plan::Script(script),
-                DecisionPlan::Reject(refusal),
-            ),
-            broken: Mutex::new(None),
-        });
+        let engine = MockEngine::with_models(
+            vec![card],
+            Plan::Script(script),
+            DecisionPlan::Reject(refusal),
+        );
         machine.engines.lock().unwrap().insert(id.clone(), engine.clone());
         let ram = site.ram.unwrap_or(0);
         Ok(Box::new(Running { machine: machine.clone(), id, engine, taken, ram }))
@@ -618,7 +561,7 @@ async fn an_engine_that_fails_takes_its_model_down_and_no_other() {
     let w = world(THREE, &[10, 10]);
     let on_a = w.models.acquire("a").await.unwrap();
     drop(w.models.acquire("d").await.unwrap());
-    *w.machine.engine("a").broken.lock().unwrap() = Some("device 0 failed: Xid 79".into());
+    w.machine.engine("a").set_failure("device 0 failed: Xid 79");
 
     // It gets no new request, and is unloaded when the ones it failed have ended.
     let next = w.request("a");
@@ -730,7 +673,7 @@ async fn the_routes_list_load_and_unload_models_and_a_request_loads_its_own() {
     assert_eq!(status, 200, "{answer}");
     assert_eq!(answer["model"], "a");
     assert_eq!(answer["choices"][0]["message"]["content"], "hello from a");
-    assert_eq!(w.machine.engine("a").inner.submitted()[0].model, "a");
+    assert_eq!(w.machine.engine("a").submitted()[0].model, "a");
     let (_, list) = json(get(&app, "/v1/models").await).await;
     assert_eq!(list["data"][0]["status"]["value"], "loaded");
     assert_eq!(list["data"][0]["context_length"], 4096);
@@ -808,7 +751,7 @@ async fn a_request_waits_for_its_load_and_a_client_that_leaves_gives_the_wait_up
     let stream = common::parse_sse(&common::body_text(response).await);
     assert!(stream.done);
     assert_eq!(stream.chunks[0]["choices"][0]["text"], "hello from a");
-    assert_eq!(w.machine.engine("a").inner.submitted().len(), 1, "the one who left asked nothing");
+    assert_eq!(w.machine.engine("a").submitted().len(), 1, "the one who left asked nothing");
 }
 
 #[tokio::test]

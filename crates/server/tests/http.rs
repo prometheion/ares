@@ -3,10 +3,7 @@
 
 mod common;
 
-use ares_api::{
-    EngineError, EngineStats, Event, ExpertStats, FinishReason, GenerateRequest, Prompt, Role,
-    Usage,
-};
+use ares_api::{EngineError, EngineStats, Event, ExpertStats, FinishReason, Prompt, Role, Usage};
 use ares_server::Config;
 use axum::http::{StatusCode, header};
 use common::*;
@@ -15,31 +12,6 @@ use serde_json::{Value, json};
 
 const CHAT: &str = "/v1/chat/completions";
 const COMPLETIONS: &str = "/v1/completions";
-
-fn chat_body(extra: Value) -> String {
-    let mut body = json!({"model": "mock", "messages": [{"role": "user", "content": "hi"}]});
-    body.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
-    body.to_string()
-}
-
-fn completion_body(extra: Value) -> String {
-    let mut body = json!({"model": "mock", "prompt": "Once upon"});
-    body.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
-    body.to_string()
-}
-
-/// A request that finishes at once, for tests that look at what the engine received.
-fn instant() -> std::sync::Arc<MockEngine> {
-    MockEngine::script(vec![done(FinishReason::Stop, 1, 0)])
-}
-
-async fn submitted_from(path: &str, body: &str) -> GenerateRequest {
-    let engine = instant();
-    let response = post(&app(&engine), path, body).await;
-    let (status, value) = json(response).await;
-    assert_eq!(status, StatusCode::OK, "{value}");
-    engine.submitted().remove(0)
-}
 
 // --- the small endpoints -----------------------------------------------------
 
@@ -180,7 +152,7 @@ async fn the_engine_receives_everything_the_client_sent_and_nothing_else() {
         "stop": ["\n\n", "END"],
         "response_format": {"type": "text"}, "user": "u"
     }"#;
-    let request = submitted_from(CHAT, body).await;
+    let request = received(CHAT, body).await;
 
     assert_eq!(request.model, "mock");
     assert_eq!(request.max_tokens, Some(50), "max_completion_tokens replaces max_tokens");
@@ -219,7 +191,7 @@ async fn the_engine_receives_everything_the_client_sent_and_nothing_else() {
 
 #[tokio::test]
 async fn unset_means_unset_so_the_model_default_applies() {
-    let request = submitted_from(CHAT, &chat_body(json!({}))).await;
+    let request = received(CHAT, &chat_body(json!({}))).await;
     assert_eq!(request.sampling, Default::default());
     assert_eq!(request.max_tokens, None);
     assert!(request.stop.is_empty());
@@ -229,7 +201,7 @@ async fn unset_means_unset_so_the_model_default_applies() {
     // `null` is how many clients write "not set".
     let nulls = json!({"temperature": null, "top_p": null, "max_tokens": null, "stop": null,
                        "seed": null, "tools": null, "stream": null, "n": null});
-    let request = submitted_from(CHAT, &chat_body(nulls)).await;
+    let request = received(CHAT, &chat_body(nulls)).await;
     assert_eq!(request.sampling, Default::default());
     assert_eq!(request.max_tokens, None);
 }
@@ -237,23 +209,21 @@ async fn unset_means_unset_so_the_model_default_applies() {
 #[tokio::test]
 async fn conventions_of_other_servers_are_understood() {
     let body = chat_body(json!({"stop": "###", "max_tokens": -1, "top_k": -1, "seed": -1, "n": 1}));
-    let request = submitted_from(CHAT, &body).await;
+    let request = received(CHAT, &body).await;
     assert_eq!(request.stop, ["###"], "stop may be one string");
     assert_eq!(request.max_tokens, None, "-1 means no limit");
     assert_eq!(request.sampling.top_k, Some(0), "-1 switches top-k off");
     assert_eq!(request.sampling.seed, None, "-1 means a random seed");
 
-    let request = submitted_from(CHAT, &chat_body(json!({"seed": 18446744073709551615u64}))).await;
+    let request = received(CHAT, &chat_body(json!({"seed": 18446744073709551615u64}))).await;
     assert_eq!(request.sampling.seed, Some(u64::MAX));
-    let request = submitted_from(CHAT, &chat_body(json!({"max_tokens": 100.0}))).await;
+    let request = received(CHAT, &chat_body(json!({"max_tokens": 100.0}))).await;
     assert_eq!(request.max_tokens, Some(100));
 
     // The plain completions endpoint takes `max_tokens`, and a one-element prompt list.
-    let request = submitted_from(
-        COMPLETIONS,
-        &completion_body(json!({"prompt": ["only one"], "stop": ["x"]})),
-    )
-    .await;
+    let request =
+        received(COMPLETIONS, &completion_body(json!({"prompt": ["only one"], "stop": ["x"]})))
+            .await;
     assert_eq!(request.prompt, Prompt::Text("only one".into()));
     assert_eq!(request.stop, ["x"]);
 }
@@ -354,7 +324,7 @@ async fn completion_stream_carries_text_without_a_role_chunk() {
 
 #[tokio::test]
 async fn a_stream_without_text_still_has_role_finish_and_marker() {
-    let engine = MockEngine::script(vec![done(FinishReason::Stop, 1, 0)]);
+    let engine = instant();
     let stream = parse_sse(
         &body_text(post(&app(&engine), CHAT, &chat_body(json!({"stream": true}))).await).await,
     );
@@ -400,82 +370,9 @@ async fn multibyte_text_passes_through_a_plain_response_intact() {
 
 // --- errors ------------------------------------------------------------------
 
-struct Case {
-    error: EngineError,
-    status: StatusCode,
-    kind: &'static str,
-    code: &'static str,
-    /// Words the message must contain.
-    mentions: &'static [&'static str],
-}
-
-fn cases() -> Vec<Case> {
-    vec![
-        Case {
-            error: EngineError::ModelNotFound("nope".into()),
-            status: StatusCode::NOT_FOUND,
-            kind: "invalid_request_error",
-            code: "model_not_found",
-            mentions: &["'nope'", "mock, mock-2"],
-        },
-        Case {
-            error: EngineError::InvalidRequest("max_tokens is silly".into()),
-            status: StatusCode::BAD_REQUEST,
-            kind: "invalid_request_error",
-            code: "invalid_request",
-            mentions: &["max_tokens is silly"],
-        },
-        Case {
-            error: EngineError::ContextOverflow { prompt_tokens: 9000, limit: 4096 },
-            status: StatusCode::BAD_REQUEST,
-            kind: "invalid_request_error",
-            code: "context_length_exceeded",
-            mentions: &["9000", "4096"],
-        },
-        Case {
-            error: EngineError::Overloaded,
-            status: StatusCode::SERVICE_UNAVAILABLE,
-            kind: "server_error",
-            code: "overloaded",
-            mentions: &["capacity"],
-        },
-        Case {
-            error: EngineError::Unsupported("no such architecture".into()),
-            status: StatusCode::NOT_IMPLEMENTED,
-            kind: "server_error",
-            code: "not_implemented",
-            mentions: &["no such architecture"],
-        },
-        Case {
-            error: EngineError::Internal("kernel exploded".into()),
-            status: StatusCode::INTERNAL_SERVER_ERROR,
-            kind: "server_error",
-            code: "internal_error",
-            mentions: &["kernel exploded"],
-        },
-    ]
-}
-
-async fn assert_error(case: &Case, response: axum::http::Response<axum::body::Body>, how: &str) {
-    let retry_after = response.headers().get(header::RETRY_AFTER).cloned();
-    let (status, body) = json(response).await;
-    assert_eq!(status, case.status, "{how}: {body}");
-    let error = &body["error"];
-    assert_eq!(error["type"], case.kind, "{how}");
-    assert_eq!(error["code"], case.code, "{how}");
-    let message = error["message"].as_str().unwrap();
-    for word in case.mentions {
-        assert!(message.contains(word), "{how}: '{message}' should mention {word}");
-    }
-    assert!(error.get("param").is_some(), "{how}: the OpenAI format always has a param");
-    assert_eq!(body.as_object().unwrap().len(), 1, "{how}: nothing but the error object");
-    let expected_retry = (case.status == StatusCode::SERVICE_UNAVAILABLE).then_some("1");
-    assert_eq!(retry_after.as_ref().and_then(|v| v.to_str().ok()), expected_retry, "{how}");
-}
-
 #[tokio::test]
 async fn an_error_returned_by_submit_maps_to_its_status() {
-    for case in cases() {
+    for case in error_cases("max_tokens is silly") {
         for (path, body) in
             [(CHAT, chat_body(json!({}))), (COMPLETIONS, completion_body(json!({})))]
         {
@@ -487,7 +384,7 @@ async fn an_error_returned_by_submit_maps_to_its_status() {
 
 #[tokio::test]
 async fn an_error_event_before_any_text_maps_to_its_status() {
-    for case in cases() {
+    for case in error_cases("max_tokens is silly") {
         let engine = MockEngine::script(vec![fail(case.error.clone())]);
         let response = post(&app(&engine), CHAT, &chat_body(json!({}))).await;
         assert_error(&case, response, "error event").await;
@@ -498,7 +395,7 @@ async fn an_error_event_before_any_text_maps_to_its_status() {
 async fn a_streaming_request_that_fails_first_gets_the_status_and_not_a_200() {
     // The prompt overflows the context: the engine finds out only after
     // tokenizing, which is after the request was accepted.
-    for case in cases() {
+    for case in error_cases("max_tokens is silly") {
         let engine = MockEngine::script(vec![fail(case.error.clone())]);
         let body = chat_body(json!({"stream": true}));
         assert_error(&case, post(&app(&engine), CHAT, &body).await, "streaming, error first").await;
@@ -660,16 +557,16 @@ async fn a_field_that_asks_for_nothing_is_not_a_reason_to_refuse() {
         "grammar": null, "json_schema": null, "typical_p": null, "something_new": null,
         "user": "u", "metadata": {"k": "v"}, "store": false, "service_tier": "auto",
     });
-    let request = submitted_from(CHAT, &chat_body(quiet)).await;
+    let request = received(CHAT, &chat_body(quiet)).await;
     assert_eq!(request.sampling, Default::default());
 
     let quiet = json!({"best_of": 1, "echo": false, "suffix": null, "logprobs": null, "user": "u"});
-    let request = submitted_from(COMPLETIONS, &completion_body(quiet)).await;
+    let request = received(COMPLETIONS, &completion_body(quiet)).await;
     assert_eq!(request.sampling, Default::default());
 
     // Penalties cross to the engine, which knows whether its sampler has them.
     let request =
-        submitted_from(CHAT, &chat_body(json!({"presence_penalty": 0, "repeat_penalty": 1}))).await;
+        received(CHAT, &chat_body(json!({"presence_penalty": 0, "repeat_penalty": 1}))).await;
     assert_eq!(request.sampling.presence_penalty, Some(0.0));
     assert_eq!(request.sampling.repeat_penalty, Some(1.0));
 }
